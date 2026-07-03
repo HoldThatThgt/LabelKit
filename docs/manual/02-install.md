@@ -24,7 +24,7 @@ cd LabelKit
 uv sync            # 创建虚拟环境（Python 3.12）并安装全部依赖
 ```
 
-`uv sync` 会读取 `pyproject.toml` 与锁文件 `uv.lock`，装出一个完全可复现的环境。全部第三方依赖只有 7 个，都很轻：
+`uv sync` 依据 `pyproject.toml` 解析依赖、生成本地锁文件并装好虚拟环境。全部第三方依赖只有 7 个，都很轻：
 
 | 依赖 | 用途 |
 |---|---|
