@@ -668,7 +668,10 @@ async def test_process_interrupt_stops_taking_new_batches(tmp_path):
 
 # ── tests: circuit breaker ──────────────────────────────────────────────────
 
-async def test_circuit_breaker_exit_4_part_not_renamed(tmp_path):
+async def test_circuit_breaker_exit_4_partial_delivery(tmp_path):
+    """v1.6 熔断交付 (spec 3.10.3, decision 1.6 ②): a circuit break DELIVERS
+    the completed batches — .part renamed, report marks partial_delivery=true,
+    counts gains the balancing residual `unprocessed`. Exit code stays 4."""
     cfg = make_cfg(tmp_path, batch_size=4, fatal_threshold=3, annotate=True)
     orch, metrics, emitter, _ = build(cfg, [BreakerStage()],
                                       [rec(i) for i in range(1, 11)])
@@ -676,13 +679,33 @@ async def test_circuit_breaker_exit_4_part_not_renamed(tmp_path):
 
     assert summary.exit_code == 4
     assert summary.interrupted is False
-    assert emitter.deliver is False
-    assert emitter.part.exists() and not emitter.output.exists()
+    assert emitter.deliver is True
+    assert emitter.output.exists() and not emitter.part.exists()
     assert emitter.report is not None              # report still written
     assert emitter.report["run"]["exit_code"] == 4
+    assert emitter.report["run"]["circuit_broken"] is True
+    assert emitter.report["run"]["partial_delivery"] is True
+    counts = emitter.report["counts"]
+    # Invariant extension (spec 6.4): emitted + dropped_* + failed + bad_input
+    # + unprocessed = scanned + generated.
+    assert "unprocessed" in counts
+    assert (counts["emitted"] + counts["dropped_dup"] + counts["dropped_lowq"]
+            + counts["dropped_verify"] + counts["failed"] + counts["bad_input"]
+            + counts["unprocessed"]) == counts["scanned"] + counts["generated"]
     assert emitter.report_path.exists()
     run_end = metrics.events[-1]
     assert run_end[0] == "run.end" and run_end[4]["exit_code"] == 4
+
+
+async def test_clean_run_report_has_no_partial_delivery_fields(tmp_path):
+    """partial_delivery / counts.unprocessed are 只增 fields present ONLY on
+    breaker-trip runs (spec 6.4) — healthy runs keep the v1.5 report shape."""
+    cfg = make_cfg(tmp_path, batch_size=4)
+    orch, _, emitter, _ = build(cfg, [], [rec(1), rec(2)])
+    summary = await orch.run()
+    assert summary.exit_code == 0
+    assert "partial_delivery" not in emitter.report["run"]
+    assert "unprocessed" not in emitter.report["counts"]
 
 
 async def test_breaker_streak_resets_on_success(tmp_path):
@@ -1028,7 +1051,8 @@ async def test_finalize_honors_sink_breaker_even_without_escape(tmp_path):
     """The breaker can open on a batch's tail calls while every coroutine fails
     record-level (queued calls never re-enter complete()) — CircuitBreakerTripped
     then never escapes a stage. finalize must still read the sink flag: exit 4,
-    circuit_broken=true, .part not delivered."""
+    circuit_broken=true — and (v1.6 熔断交付) still deliver completed batches
+    with the partial_delivery marker."""
     cfg = make_cfg(tmp_path, batch_size=4, dedup=False, fatal_threshold=1,
                    quality_cfg=QualityConfig(enabled=True, mode="pointwise"))
 
@@ -1042,4 +1066,6 @@ async def test_finalize_honors_sink_breaker_even_without_escape(tmp_path):
     assert metrics.circuit_broken
     assert summary.exit_code == 4
     assert emitter.report["run"]["circuit_broken"] is True
-    assert emitter.deliver is False
+    assert emitter.deliver is True                 # v1.6: trip delivers
+    assert emitter.report["run"]["partial_delivery"] is True
+    assert "unprocessed" in emitter.report["counts"]

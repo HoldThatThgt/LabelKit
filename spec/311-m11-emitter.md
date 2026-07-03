@@ -9,7 +9,7 @@
 
 | 通道 | 规格 |
 |---|---|
-| 主输出 | 运行期写 `{output}.part`，每批 flush；finalize 时 fsync + 原子 rename 为目标名。行格式见 6.3。仅 `status="active"` 且（annotate 启用时）标注成功的记录写入。 |
+| 主输出 | 运行期写 `{output}.part`，每批 flush；finalize 时 fsync + 原子 rename 为目标名。行格式见 6.3。仅 `status="active"` 且（annotate 启用时）标注成功的记录写入。v1.6：熔断中止（退出码 4）的 finalize 同样执行交付（3.10.3 熔断交付）——已交付文件中每一行恒完整合法，运行是否完整处理了全部输入以 report.run 判定（interrupted=false 且 circuit_broken=false，3.11.3 ④）。 |
 | rejects | `output.rejects = "none" \| "refs"（默认）\| "full"`。refs：每行仅 `{"_meta": {id, source, stage, reason, errors}}`——不含数据内容（source 亦不含 `passthrough_fields`，其值属数据内容），贴合不存储原则；full：额外含记录内容与最后一版非法输出（调试用，用户显式选择）。文件名 `{output_stem}.rejects.jsonl`。 |
 | report.json | `{output_stem}.report.json`。结构见 6.4：运行参数摘要（脱敏，无 key）、各阶段计数、分数分布直方图、去重簇统计、结构引擎各层命中、token/成本、耗时、失败分类计数。 |
 
@@ -79,4 +79,4 @@
 
 #### ④ 原子改名交付时间线
 
-运行全程只向 `out/ime-intent-0630.jsonl.part` 追加（每批 flush）；finalize 时 fsync 后一次 rename 为 `out/ime-intent-0630.jsonl`。因此目录中任一时刻要么只有 `.part`（运行中或异常终止），要么只有最终文件——消费方以目标文件名出现作为「运行完整结束」的唯一信号，永远不会读到半截的主输出（3.11.2）。
+运行全程只向 `out/ime-intent-0630.jsonl.part` 追加（每批 flush）；finalize 时 fsync 后一次 rename 为 `out/ime-intent-0630.jsonl`。因此目录中任一时刻要么只有 `.part`（运行中，或未走到 finalize 的硬崩溃 / 输出路径不可写），要么只有最终文件——目标文件名出现即保证**已交付的每一行完整且合法**，永远不会读到半截行。v1.6 起熔断中止同样交付（3.10.3 熔断交付），「目标文件出现」因此不再等价「全部输入处理完毕」：消费方判定运行完整性须看 report.run：`interrupted=false` **且** `circuit_broken=false`（退出码 0/1 不足——被 SIGINT 优雅中断的运行同样交付且以 0 退出，3.10.3 中断行）；熔断交付的主输出是「已完成批的完整前缀」，缺口可由 counts.unprocessed 核对（6.4 不变量扩展）。

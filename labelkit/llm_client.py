@@ -18,7 +18,7 @@ import json
 import os
 import random
 import time
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping
@@ -36,11 +36,18 @@ from labelkit.types import ImageRef, Usage
 if TYPE_CHECKING:
     from labelkit.obslog import MetricsSink
 
-from labelkit.obslog import EV_LLM_CALL
+from labelkit.obslog import (
+    EV_LLM_CALL,
+    EV_LLM_KEY_COOLDOWN,
+    EV_LLM_KEY_DISABLED,
+    EV_LLM_POOL_PARKED,
+)
 
 ANTHROPIC_VERSION = "2023-06-01"          # [FROZEN in CONTRACTS.md §7.8]
 STRUCTURED_TOOL_NAME = "emit"             # [FROZEN in CONTRACTS.md §7.8]
-_MAX_BACKOFF_S = 60.0                     # backoff cap (spec 3.9.3)
+_MAX_BACKOFF_S = 60.0                     # backoff cap (spec 3.9.3) — v1.6: non-429 retryables only
+_MAX_KEY_COOLDOWN_S = 300.0               # no-Retry-After per-key 429 cooldown cap (spec 3.9.3)
+_PARK_SLICE_S = 60.0                      # park sleep slice; breaker re-checked per slice (v1.6)
 
 
 # ── public dataclasses (CONTRACTS.md §7.8, verbatim shapes) ────────────────
@@ -73,6 +80,13 @@ class LLMResponse:
     latency_ms: int
 
 
+@dataclass                                          # v1.6 per-key accumulator (CONTRACTS §7.8)
+class KeyUsage:
+    calls: int = 0                                 # successful logical calls on this key
+    rate_limited: int = 0                          # 429s observed on this key
+    disabled: bool = False                         # auth-disabled during this run
+
+
 @dataclass                                          # mutable per-profile accumulator
 class ProfileUsage:
     calls: int = 0
@@ -80,6 +94,11 @@ class ProfileUsage:
     completion_tokens: int = 0
     retries: int = 0
     est_cost_usd: float | None = None              # only when prices configured
+    keys: dict[str, KeyUsage] = field(default_factory=dict)
+                                                   # v1.6: by env-var name; report emits the
+                                                   # sub-object only for pools > 1 (§9.3)
+    parked_calls: int = 0                          # v1.6: logical calls that parked ≥ once
+    parked_ms: int = 0                             # v1.6: total parked wall-clock
 
 
 @dataclass(frozen=True)
@@ -89,6 +108,75 @@ class ProbeResult:
     model: str
     latency_ms: int
     error: str | None = None
+    key_env: str | None = None                     # v1.6: set by probe_all() on pooled
+                                                   # profiles; None on single-key profiles
+
+
+# ── v1.6 key pool (spec 3.9.3 密钥池行) ────────────────────────────────────
+
+@dataclass
+class _KeyState:
+    index: int                     # declaration order (tie-break)
+    env: str                       # env-var NAME — the only identity ever logged
+    key: str = field(repr=False, default="")
+    in_flight: int = 0             # HTTP requests currently on the wire
+    cooldown_until: float = 0.0    # time.monotonic() deadline (429 cooldown)
+    consec_429: int = 0            # cross-call; reset by a success ON THIS KEY
+    disabled: bool = False         # 401/403: auth-dead for the rest of the run
+
+
+class _KeyPool:
+    """Per-(kind, profile) in-memory key-pool state. Pure logic — callers
+    inject ``now`` so selection/park arithmetic is unit-testable offline."""
+
+    def __init__(self, members: list[tuple[str, str]]):
+        self.states = [_KeyState(index=i, env=env, key=key)
+                       for i, (env, key) in enumerate(members)]
+
+    @property
+    def size(self) -> int:
+        return len(self.states)
+
+    def live(self) -> list[_KeyState]:
+        return [s for s in self.states if not s.disabled]
+
+    def select(self, now: float) -> _KeyState | None:
+        """Least-in-flight eligible key, ties broken by declaration order —
+        deterministic, no RNG (timing-only, seed-exempt; spec 3.9.3)."""
+        eligible = [s for s in self.states
+                    if not s.disabled and s.cooldown_until <= now]
+        if not eligible:
+            return None
+        return min(eligible, key=lambda s: (s.in_flight, s.index))
+
+    def earliest_wake(self, now: float) -> float:
+        """Seconds until the earliest live key leaves cooldown (≥ 0). Callers
+        guarantee at least one live key."""
+        return max(0.0, min(s.cooldown_until for s in self.live()) - now)
+
+
+def _key_cooldown_upper(base_delay_s: float, consec_429: int) -> float:
+    """Upper bound of the no-Retry-After per-key 429 cooldown: full-jitter
+    random(0, base × 2^c) with the upper bound capped at 300 s (spec 3.9.3;
+    c = the key's cross-call consecutive-429 count)."""
+    return min(_MAX_KEY_COOLDOWN_S, base_delay_s * (2.0 ** consec_429))
+
+
+def _pool_members(prof: "LLMProfile | EmbeddingProfile") -> list[tuple[str, str]]:
+    """(env-var name, resolved key) pairs for the profile's key pool (v1.6).
+    M1-normalized profiles carry aligned api_key_envs/api_keys; directly
+    constructed profiles (tests, probe children) fall back to api_key / the
+    environment, mirroring the pre-v1.6 single-key behavior."""
+    envs = tuple(prof.api_key_envs) or ((prof.api_key_env,) if prof.api_key_env else ())
+    if not envs:
+        return [("", prof.api_key or "")]
+    keys = tuple(prof.api_keys)
+    if len(keys) != len(envs):
+        if len(envs) == 1:
+            keys = (prof.api_key or os.environ.get(envs[0], ""),)
+        else:
+            keys = tuple(os.environ.get(e, "") for e in envs)
+    return list(zip(envs, keys))
 
 
 # ── pure helpers: retry math and classification ───────────────────────────
@@ -355,6 +443,9 @@ class LLMClient:
         # verify, probe). Keyed by (kind, name) so an llm and an embedding
         # profile with the same name never share a limiter.
         self._semaphores: dict[tuple[str, str], asyncio.Semaphore] = {}
+        # v1.6 key-pool state, keyed like the semaphores (in-memory only,
+        # spec §2.6 — no persistence).
+        self._pools: dict[tuple[str, str], _KeyPool] = {}
         # Jitter RNG is intentionally NOT seed-derived — timing only [FROZEN §7.8].
         self._jitter_rng = random.Random()
         self._http_client: httpx.AsyncClient | None = None
@@ -382,7 +473,6 @@ class LLMClient:
             build_body = lambda: _build_openai_body(prof, prompt, response_schema)
             parse = lambda data: _parse_openai_response(data, prof.model)
 
-        headers = _build_headers(prof.provider, self._api_key(prof))
         full_trace = self._full_content_trace_enabled()
         extra = {"gen_ai.input.messages": _render_trace_messages(prompt)} if full_trace else {}
         # On success the llm.call event must ALSO carry the response content at
@@ -395,7 +485,7 @@ class LLMClient:
             if full_trace else None)
 
         (text, structured, usage, model), latency_ms, retries = await self._post_with_retries(
-            kind="llm", prof=prof, url=url, headers=headers,
+            kind="llm", prof=prof, url=url,
             build_body=build_body, parse=parse, trace_extra=extra,
             finalize_extra=finalize)
 
@@ -420,10 +510,9 @@ class LLMClient:
         self._check_breaker()
 
         url = prof.base_url.rstrip("/") + "/embeddings"
-        headers = _build_headers(prof.provider, self._api_key(prof))
         n = len(texts)
         (result,), _latency_ms, retries = await self._post_with_retries(
-            kind="embedding", prof=prof, url=url, headers=headers,
+            kind="embedding", prof=prof, url=url,
             build_body=lambda: _build_embeddings_body(prof, texts),
             parse=lambda data: _split_embed(data, n, prof),
             operation="embedding")
@@ -434,38 +523,65 @@ class LLMClient:
 
     async def probe(self, profile: str) -> ProbeResult:
         """validate --probe: minimal 1-token live call (llm profiles) or 1-text
-        embed (embedding profiles). Never raises; failures land in .error."""
+        embed (embedding profiles). Never raises; failures land in .error.
+        Pooled profiles probe the FIRST key (v1.6) — probe_all covers the rest."""
+        return (await self._probe_keys(profile, first_only=True))[0]
+
+    async def probe_all(self, profile: str) -> list[ProbeResult]:
+        """v1.6: one probe per pool key in declaration order, for llm AND
+        embedding profiles — results carry key_env for pooled (>1 key)
+        profiles. Single-key profiles degenerate to [await probe(profile)]
+        with key_env=None. Used by ``validate --probe``. Never raises."""
+        return await self._probe_keys(profile, first_only=False)
+
+    async def _probe_keys(self, profile: str, *, first_only: bool) -> list[ProbeResult]:
+        is_llm = profile in self._llm_profiles
+        if not is_llm and profile not in self._embedding_profiles:
+            return [ProbeResult(profile=profile, ok=False, model="", latency_ms=0,
+                                error=f"unknown profile: {profile!r}")]
+        prof = (self._llm_profiles[profile] if is_llm
+                else self._embedding_profiles[profile])
+        members = _pool_members(prof)
+        pooled = len(members) > 1 and not first_only
+        if first_only:
+            members = members[:1]
+        return [await self._probe_one(profile, prof, is_llm, env, key,
+                                      key_env=env if pooled else None)
+                for env, key in members]
+
+    async def _probe_one(self, profile: str, prof, is_llm: bool,
+                         env: str, key: str, *, key_env: str | None) -> ProbeResult:
+        """Probe a single pool key via a throwaway sub-client whose profile is
+        narrowed to that key (shares the connection pool and semaphores, so the
+        per-profile aggregate concurrency cap still applies)."""
         start = time.monotonic()
-        if profile in self._llm_profiles:
-            prof = self._llm_profiles[profile]
-            probe_prof = replace(prof, max_output_tokens=1)
-            client = LLMClient({profile: probe_prof}, {}, self._metrics)
-            client._http_client = self._http()  # share the connection pool
-            client._semaphores = self._semaphores
-            try:
+        mod = replace(prof, api_key_env=env, api_key=key,
+                      api_key_envs=(env,), api_keys=(key,))
+        if is_llm:
+            mod = replace(mod, max_output_tokens=1)
+            client = LLMClient({profile: mod}, {}, self._metrics)
+        else:
+            client = LLMClient({}, {profile: mod}, self._metrics)
+        client._http_client = self._http()  # share the connection pool
+        client._semaphores = self._semaphores
+        try:
+            if is_llm:
                 prompt = PromptBundle(messages=(
                     Message(role="user", parts=(Part(kind="text", text="ping"),)),))
                 resp = await client.complete(profile, prompt)
                 self._merge_usage(client._usage)
                 return ProbeResult(profile=profile, ok=True, model=resp.model,
-                                   latency_ms=resp.latency_ms)
-            except Exception as exc:  # noqa: BLE001 — probe never raises
-                self._merge_usage(client._usage)
-                return ProbeResult(profile=profile, ok=False, model=prof.model,
-                                   latency_ms=int((time.monotonic() - start) * 1000),
-                                   error=str(exc))
-        if profile in self._embedding_profiles:
-            prof_e = self._embedding_profiles[profile]
-            try:
-                await self.embed(profile, ["ping"])
-                return ProbeResult(profile=profile, ok=True, model=prof_e.model,
-                                   latency_ms=int((time.monotonic() - start) * 1000))
-            except Exception as exc:  # noqa: BLE001
-                return ProbeResult(profile=profile, ok=False, model=prof_e.model,
-                                   latency_ms=int((time.monotonic() - start) * 1000),
-                                   error=str(exc))
-        return ProbeResult(profile=profile, ok=False, model="", latency_ms=0,
-                           error=f"unknown profile: {profile!r}")
+                                   latency_ms=resp.latency_ms, key_env=key_env)
+            await client.embed(profile, ["ping"])
+            self._merge_usage(client._usage)
+            return ProbeResult(profile=profile, ok=True, model=prof.model,
+                               latency_ms=int((time.monotonic() - start) * 1000),
+                               key_env=key_env)
+        except Exception as exc:  # noqa: BLE001 — probe never raises
+            self._merge_usage(client._usage)
+            return ProbeResult(profile=profile, ok=False, model=prof.model,
+                               latency_ms=int((time.monotonic() - start) * 1000),
+                               error=str(exc), key_env=key_env)
 
     @property
     def usage_by_profile(self) -> dict[str, ProfileUsage]:
@@ -479,10 +595,29 @@ class LLMClient:
 
     # -- internals ----------------------------------------------------------
 
-    def _api_key(self, prof: LLMProfile | EmbeddingProfile) -> str:
-        # M1 resolves api_key from api_key_env; fall back to the env var for
-        # directly-constructed profiles (never logged anywhere).
-        return prof.api_key or os.environ.get(prof.api_key_env, "")
+    def _pool(self, kind: str, prof: LLMProfile | EmbeddingProfile) -> _KeyPool:
+        key = (kind, prof.name)
+        pool = self._pools.get(key)
+        if pool is None:
+            pool = _KeyPool(_pool_members(prof))
+            self._pools[key] = pool
+            if pool.size > 1:
+                # Pre-seed one KeyUsage per member: report.llm_usage must list
+                # EVERY key of a pooled profile (zeros for unused members) and
+                # the keys-sub-object gate reflects pool SIZE, not traffic shape
+                # — least-in-flight selection picks key 0 for serialized traffic,
+                # which must not make a pool look single-key (§9.3, review fix).
+                acc = self._usage.setdefault(prof.name, ProfileUsage())
+                for s in pool.states:
+                    acc.keys.setdefault(s.env, KeyUsage())
+        return pool
+
+    def _max_park_s(self) -> float:
+        """run.max_park_s (v1.6, spec 5.2) via the metrics sink's cfg; default
+        3600 for directly-constructed clients (tests, probe children)."""
+        cfg = getattr(self._metrics, "cfg", None)
+        run = getattr(cfg, "run", None)
+        return float(getattr(run, "max_park_s", 3600))
 
     def _semaphore(self, kind: str, name: str, max_concurrency: int) -> asyncio.Semaphore:
         key = (kind, name)
@@ -550,26 +685,73 @@ class LLMClient:
             acc.retries += src.retries
             if src.est_cost_usd is not None:
                 acc.est_cost_usd = (acc.est_cost_usd or 0.0) + src.est_cost_usd
+            acc.parked_calls += src.parked_calls
+            acc.parked_ms += src.parked_ms
+            for env, ku in src.keys.items():
+                dst = acc.keys.setdefault(env, KeyUsage())
+                dst.calls += ku.calls
+                dst.rate_limited += ku.rate_limited
+                dst.disabled = dst.disabled or ku.disabled
+
+    def _emit_event(self, ev: str, payload: dict) -> None:
+        """Emit a v1.6 key-pool event (llm.key_cooldown / llm.key_disabled /
+        llm.pool_parked). Payloads carry env-var NAMES only — key values never
+        enter any log path (spec 7.2/7.4)."""
+        if self._metrics is None:
+            return
+        emit = getattr(self._metrics, "event", None)
+        if emit is not None:
+            emit(ev, stage="llm", batch_no=0, record_ids=(), payload=payload)
 
     async def _post_with_retries(self, *, kind: str,
                                  prof: LLMProfile | EmbeddingProfile,
-                                 url: str, headers: dict[str, str],
+                                 url: str,
                                  build_body: Callable[[], dict],
                                  parse: Callable[[Mapping], tuple],
                                  operation: str | None = None,
                                  trace_extra: Mapping | None = None,
                                  finalize_extra: Callable[[tuple], Mapping] | None = None,
                                  ) -> tuple[tuple, int, int]:
-        """Shared engine: semaphore → attempt loop with full-jitter backoff →
-        metering hooks + llm.call trace on every outcome. Returns
+        """Shared engine: semaphore → per-attempt key selection (v1.6 pool) →
+        attempt loop → metering hooks + llm.call trace on every outcome. Returns
         (parse(...) result tuple, latency_ms of the final attempt, retries used).
         ``finalize_extra`` (success only) renders extra trace payload fields from
         the parse result — e.g. gen_ai.output.messages at trace.content="full" —
-        merged over ``trace_extra`` before the llm.call event is emitted."""
+        merged over ``trace_extra`` before the llm.call event is emitted.
+
+        v1.6 key pool (spec 3.9.3 密钥池行): headers are built PER ATTEMPT from
+        the least-in-flight eligible key. A 429 cools THAT KEY (Retry-After in
+        full, else full-jitter capped 300 s on the key's cross-call 429 counter)
+        and the next attempt rotates immediately — zero wait while another key
+        is live. 401/403 disables the key: absorbed silently while siblings
+        live (no retry consumed, nothing fed to the breaker); disabling the
+        LAST live key hard-trips, preserving v1.5 semantics for pools of 1.
+        All live keys cooling → park inside the held semaphore slot, in ≤ 60 s
+        slices with a breaker re-check per slice, bounded per logical call by
+        run.max_park_s — overrun takes the retry-exhaustion path (P1-1).
+        400/404 and fatal-parse stay key-independent: no rotation, immediate
+        fatal, exactly as v1.5."""
         sem = self._semaphore(kind, prof.name, prof.max_concurrency)
+        pool = self._pool(kind, prof)
+        pooled = pool.size > 1
+        acc = self._usage.setdefault(prof.name, ProfileUsage())
         client = self._http()
         retries_used = 0
         latency_ms = 0
+        park_budget = self._max_park_s()
+        park_spent = 0.0
+        parked_this_call = False
+        last_env: str | None = None
+
+        def key_extra() -> Mapping | None:
+            # llm.call payload + key_env (pools > 1 only): env-var NAME of the
+            # key used by the LAST attempt; absent on zero-attempt calls.
+            if pooled and last_env is not None:
+                merged = dict(trace_extra or {})
+                merged["key_env"] = last_env
+                return merged
+            return trace_extra
+
         async with sem:
             attempt = 0
             while True:
@@ -585,13 +767,77 @@ class LLMClient:
                         # This logical call DID hit the wire before the breaker
                         # opened mid-backoff — its attempts must not vanish from
                         # report.llm_usage / the llm.call trace (review finding).
-                        self._usage.setdefault(prof.name, ProfileUsage()
-                                               ).retries += retries_used
+                        acc.retries += retries_used
                         self._emit_llm_call(prof, latency_ms=latency_ms, usage=Usage(),
                                             retries=retries_used,
                                             status="breaker_aborted",
-                                            operation=operation, extra=trace_extra)
+                                            operation=operation, extra=key_extra())
                     raise
+
+                now = time.monotonic()
+                ks = pool.select(now)
+                if ks is None:
+                    live = pool.live()
+                    if not live:
+                        # Whole pool auth-dead. The call that disabled the last
+                        # key already hard-tripped the breaker, so the entry /
+                        # per-attempt checks normally catch this first —
+                        # defensive terminal fatal (feeds the streak).
+                        self._record_provider_result(fatal=True)
+                        if retries_used:
+                            acc.retries += retries_used
+                        self._emit_llm_call(prof, latency_ms=latency_ms, usage=Usage(),
+                                            retries=retries_used, status="fatal",
+                                            operation=operation, extra=key_extra())
+                        raise ProviderFatalError(
+                            "all keys of the pool are auth-disabled",
+                            profile=prof.name, key_env=last_env)
+                    wait = pool.earliest_wake(now)
+                    if park_budget <= 0 or park_spent + wait > park_budget:
+                        # Park overrun — incl. the provably-hopeless case (the
+                        # earliest cooldown end exceeds the remaining budget:
+                        # fail now, no dead wall-clock) and max_park_s = 0 (no
+                        # parking). Retry-exhaustion path: record failed, feeds
+                        # the breaker window (spec 3.9.3, 1.6 decision ③).
+                        self._record_provider_result(fatal=True)
+                        if retries_used:
+                            acc.retries += retries_used
+                        self._emit_llm_call(prof, latency_ms=latency_ms, usage=Usage(),
+                                            retries=retries_used,
+                                            status="retryable_exhausted",
+                                            operation=operation, extra=key_extra())
+                        raise ProviderRetryableError(
+                            f"park budget exhausted ({park_spent:.0f}s parked, next "
+                            f"key eligible in {wait:.0f}s, run.max_park_s="
+                            f"{park_budget:.0f}): all live keys cooling",
+                            profile=prof.name, retries=retries_used, key_env=last_env)
+                    if not parked_this_call:
+                        parked_this_call = True
+                        acc.parked_calls += 1
+                    self._emit_event(EV_LLM_POOL_PARKED,
+                                     {"profile": prof.name, "wait_s": round(wait, 3),
+                                      "live_keys": len(live)})
+                    end = now + wait
+                    while True:
+                        # Breaker re-check per ≤60s slice (v1.5 hardening kept):
+                        # an open breaker breaks out; the loop top then raises
+                        # CircuitBreakerTripped with breaker_aborted accounting.
+                        if self._metrics is not None and getattr(
+                                self._metrics, "circuit_broken", False):
+                            break
+                        remaining = end - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        await asyncio.sleep(min(_PARK_SLICE_S, remaining))
+                    elapsed = time.monotonic() - now
+                    park_spent += elapsed
+                    acc.parked_ms += int(elapsed * 1000)
+                    continue
+
+                last_env = ks.env
+                ku = acc.keys.setdefault(ks.env, KeyUsage())
+                headers = _build_headers(prof.provider, ks.key)
+
                 failure_msg = ""
                 status_code: int | None = None
                 retry_after: float | None = None
@@ -600,6 +846,7 @@ class LLMClient:
                 # right after the request completes (lazy-load contract, spec §2.6).
                 body = build_body()
                 start = time.monotonic()
+                ks.in_flight += 1
                 try:
                     resp = await client.post(url, json=body, headers=headers,
                                              timeout=httpx.Timeout(prof.timeout_s))
@@ -619,12 +866,11 @@ class LLMClient:
                             except ProviderFatalError:
                                 self._record_provider_result(fatal=True)
                                 if retries_used:
-                                    self._usage.setdefault(prof.name, ProfileUsage()
-                                                           ).retries += retries_used
+                                    acc.retries += retries_used
                                 self._emit_llm_call(prof, latency_ms=latency_ms,
                                                     usage=Usage(), retries=retries_used,
                                                     status="fatal", operation=operation,
-                                                    extra=trace_extra)
+                                                    extra=key_extra())
                                 raise
                             except Exception as exc:  # noqa: BLE001 — malformed 2xx body
                                 # A 2xx whose JSON parses but has an unexpected
@@ -635,10 +881,12 @@ class LLMClient:
                                                f"{type(exc).__name__}: {exc}")
                             else:
                                 usage = _result_usage(result)
-                                success_extra: Mapping | None = trace_extra
+                                success_extra: Mapping | None = key_extra()
                                 if finalize_extra is not None:
-                                    success_extra = dict(trace_extra or {})
+                                    success_extra = dict(success_extra or {})
                                     success_extra.update(finalize_extra(result))
+                                ks.consec_429 = 0     # per-key success resets c
+                                ku.calls += 1
                                 self._record_provider_result(fatal=False)
                                 self._emit_llm_call(prof, latency_ms=latency_ms, usage=usage,
                                                     retries=retries_used, status="ok",
@@ -651,39 +899,82 @@ class LLMClient:
                         if status_code == 429:
                             retry_after = _parse_retry_after(resp.headers.get("retry-after"))
                 finally:
+                    ks.in_flight -= 1
                     del body   # release request bytes (incl. base64 images)
 
-                if not retryable:
-                    # 401/403 are credential/permission failures: they will fail
-                    # identically on every subsequent call, so trip the breaker
-                    # immediately instead of counting a streak (spec 3.9.3).
-                    self._record_provider_result(fatal=True,
-                                                 hard=status_code in (401, 403))
+                if status_code in (401, 403):
+                    # Auth is a KEY-level deterministic failure (v1.6): disable
+                    # the key for the run. Concurrent in-flight calls can all
+                    # observe the same key's 401 — the event/WARN fires at most
+                    # once per key per run (spec 7.2 cardinality); every
+                    # observer still rotates or hard-trips below.
+                    if not ks.disabled:
+                        ks.disabled = True
+                        ku.disabled = True
+                        self._emit_event(EV_LLM_KEY_DISABLED,
+                                         {"profile": prof.name, "key_env": ks.env,
+                                          "status_code": status_code})
+                    if pool.live():
+                        # Absorbed: the SAME attempt re-dispatches on the next
+                        # key — no retry budget consumed, nothing fed to the
+                        # breaker (each key can auth-fail at most once, so the
+                        # rotation is bounded by the pool size).
+                        continue
+                    # Last live key disabled → v1.5 auth semantics: immediate
+                    # hard trip (credentials never self-heal, spec 3.9.3).
+                    self._record_provider_result(fatal=True, hard=True)
                     if retries_used:
-                        self._usage.setdefault(prof.name, ProfileUsage()).retries += retries_used
+                        acc.retries += retries_used
                     self._emit_llm_call(prof, latency_ms=latency_ms, usage=Usage(),
                                         retries=retries_used, status="fatal",
-                                        operation=operation, extra=trace_extra)
+                                        operation=operation, extra=key_extra())
                     raise ProviderFatalError(failure_msg, profile=prof.name,
-                                             status_code=status_code)
+                                             status_code=status_code, key_env=ks.env)
+                if not retryable:
+                    # 400/404: request-shape errors are key-independent — no
+                    # rotation, immediate fatal feeding the streak (spec 3.9.3).
+                    self._record_provider_result(fatal=True)
+                    if retries_used:
+                        acc.retries += retries_used
+                    self._emit_llm_call(prof, latency_ms=latency_ms, usage=Usage(),
+                                        retries=retries_used, status="fatal",
+                                        operation=operation, extra=key_extra())
+                    raise ProviderFatalError(failure_msg, profile=prof.name,
+                                             status_code=status_code, key_env=ks.env)
+                if status_code == 429:
+                    # v1.6: ALL 429 waiting is expressed as per-key cooldown —
+                    # Retry-After honored in full, else full-jitter capped 300 s
+                    # on the key's cross-call consecutive-429 counter.
+                    ks.consec_429 += 1
+                    ku.rate_limited += 1
+                    cooldown = (retry_after if retry_after is not None
+                                else self._jitter_rng.uniform(
+                                    0.0, _key_cooldown_upper(prof.retry_base_delay_s,
+                                                             ks.consec_429)))
+                    ks.cooldown_until = time.monotonic() + cooldown
+                    self._emit_event(EV_LLM_KEY_COOLDOWN,
+                                     {"profile": prof.name, "key_env": ks.env,
+                                      "cooldown_s": round(cooldown, 3),
+                                      "retry_after": retry_after is not None})
                 if attempt >= prof.max_retries:
                     # Retry exhaustion counts toward the breaker window too
                     # (spec 7.6 provider_retryable_exhausted:「计入熔断窗口」).
                     self._record_provider_result(fatal=True)
                     if retries_used:
-                        self._usage.setdefault(prof.name, ProfileUsage()).retries += retries_used
+                        acc.retries += retries_used
                     self._emit_llm_call(prof, latency_ms=latency_ms, usage=Usage(),
                                         retries=retries_used, status="retryable_exhausted",
-                                        operation=operation, extra=trace_extra)
+                                        operation=operation, extra=key_extra())
                     raise ProviderRetryableError(
                         f"retries exhausted ({retries_used}): {failure_msg}",
-                        profile=prof.name, retries=retries_used)
+                        profile=prof.name, retries=retries_used, key_env=ks.env)
                 attempt += 1
                 retries_used += 1
-                if retry_after is not None:            # Retry-After takes precedence on 429
-                    wait = retry_after
-                else:
-                    wait = _backoff_delay(attempt, prof.retry_base_delay_s, self._jitter_rng)
+                if status_code == 429:
+                    # No inline sleep: the 429 wait lives on the key's cooldown —
+                    # the next attempt rotates to a live key or parks (v1.6).
+                    continue
+                wait = _backoff_delay(attempt, prof.retry_base_delay_s, self._jitter_rng)
                 await asyncio.sleep(wait)
 
 

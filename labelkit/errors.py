@@ -23,19 +23,26 @@ class InputError(LabelKitError):
 
 
 class ProviderRetryableError(LabelKitError):
-    """M9: retryable provider error with retries exhausted. Record-level → status='failed'."""
-    def __init__(self, message: str, profile: str, retries: int):
+    """M9: retryable provider error with retries exhausted (v1.6: incl. park-budget
+    overrun, run.max_park_s). Record-level → status='failed'."""
+    def __init__(self, message: str, profile: str, retries: int,
+                 key_env: str | None = None):
         self.profile = profile
         self.retries = retries
+        self.key_env = key_env                # v1.6: env-var NAME of the last key tried (pools)
         super().__init__(message)
 
 
 class ProviderFatalError(LabelKitError):
     """M9: non-retryable provider error (401/403/400/404, dims mismatch). Feeds the circuit
-    breaker; a streak >= run.fatal_error_threshold ends the run with exit code 4."""
-    def __init__(self, message: str, profile: str, status_code: int | None = None):
+    breaker; a streak >= run.fatal_error_threshold ends the run with exit code 4.
+    v1.6 pools: an auth failure absorbed by key rotation raises nothing — for auth this is
+    raised only when the LAST live key gets disabled (spec 3.9.3)."""
+    def __init__(self, message: str, profile: str, status_code: int | None = None,
+                 key_env: str | None = None):
         self.profile = profile
         self.status_code = status_code
+        self.key_env = key_env                # v1.6: env-var NAME of the failing key (pools)
         super().__init__(message)
 
 

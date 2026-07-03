@@ -42,6 +42,9 @@ EV_ANNOTATE_DONE = "annotate.done"
 EV_VERIFY_VERDICT = "verify.verdict"
 EV_SCHEMA_REPAIR = "schema.repair"
 EV_LLM_CALL = "llm.call"
+EV_LLM_KEY_COOLDOWN = "llm.key_cooldown"     # v1.6 key pool (spec 7.2)
+EV_LLM_KEY_DISABLED = "llm.key_disabled"     # v1.6
+EV_LLM_POOL_PARKED = "llm.pool_parked"       # v1.6
 EV_ERROR = "error"
 
 TRACE_SCHEMA_VERSION = 1
@@ -250,6 +253,10 @@ _STDERR_LEVELS: dict[str, int] = {
     # EV_INGEST_INDEX_CONFLICT: warn, but error when input.on_index_conflict="fail"
     # (spec 7.2 / CONTRACTS §8.1) — resolved dynamically in _mirror().
     EV_LLM_CALL: logging.DEBUG,
+    # v1.6 key-pool events (spec 7.2): key_cooldown is trace-only ("—"),
+    # key_disabled / pool_parked mirror at warn.
+    EV_LLM_KEY_DISABLED: logging.WARNING,
+    EV_LLM_POOL_PARKED: logging.WARNING,
     # EV_ERROR: warn (record-level) / error (run-level) — resolved in event()
 }
 

@@ -33,6 +33,15 @@ class LLMProfile:
     price_per_mtok_out: float | None = None
     api_key: str = field(default="", repr=False)  # resolved from env by M1; NEVER logged
                                                   # [FROZEN HERE]
+    api_key_envs: tuple[str, ...] = ()            # v1.6 key pool (spec 3.9.3): TOML accepts
+                                                  # exactly one of api_key_env/api_key_envs;
+                                                  # M1 normalizes BOTH forms into this tuple
+                                                  # (scalar → 1-tuple); api_key_env mirrors
+                                                  # element 0
+    api_keys: tuple[str, ...] = field(default=(), repr=False)
+                                                  # v1.6: resolved values aligned with
+                                                  # api_key_envs; NEVER logged; api_key
+                                                  # mirrors element 0
 
 
 @dataclass(frozen=True)
@@ -48,6 +57,9 @@ class EmbeddingProfile:
     retry_base_delay_s: float = 1.0               # same backoff mechanism as llm.* [FROZEN HERE]
     dims: int | None = None                       # if set, embed() validates returned dims
     api_key: str = field(default="", repr=False)  # resolved from env by M1
+    api_key_envs: tuple[str, ...] = ()            # v1.6 key pool — same normalization as
+                                                  # LLMProfile.api_key_envs
+    api_keys: tuple[str, ...] = field(default=(), repr=False)   # v1.6; NEVER logged
 
 
 # ── project.toml side ──────────────────────────────────────────────────────
@@ -62,6 +74,9 @@ class RunConfig:
     batch_size: int = 256                         # = QuRating comparison-pool size
     seed: int = 0
     fatal_error_threshold: int = 20
+    max_park_s: int = 3600                        # v1.6 (spec 3.9.3/5.2): park budget per logical
+                                                  # LLM call while a whole key pool is cooling;
+                                                  # 0 = no parking; overrun → retry-exhaustion path
 
 
 @dataclass(frozen=True)

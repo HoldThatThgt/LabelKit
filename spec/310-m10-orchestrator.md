@@ -28,7 +28,7 @@ class RunContext:      # 传入每个 stage.run 的上下文
 |---|---|
 | 跨批存活状态 | 仅三项：① DedupIndex（scope=global 时）；② MetricsSink 计数器；③ M9 用量累计。均不含数据内容本体（哈希/签名/计数），运行结束随进程销毁。 |
 | 尾批 | 最后一批不足 batch_size 照常处理；批内仅 1 条时 M4 不发裁决调用，各 criterion score 固定 0.5（3.4.3 归一化行）。 |
-| 熔断 | MetricsSink 维护连续致命计数（ProviderFatalError 与重试耗尽 provider_retryable_exhausted 均计入，7.6），达 `run.fatal_error_threshold`（默认 20），或 401/403 认证类首错**立即**（v1.5，3.9.3）⇒ 取消在飞任务、写出已完成批的报告（run.circuit_broken=true）、退出码 4、.part 不交付。 |
+| 熔断 | MetricsSink 维护连续致命计数（ProviderFatalError 与重试耗尽 provider_retryable_exhausted 均计入，7.6），达 `run.fatal_error_threshold`（默认 20），或 401/403 认证类首错**立即**（v1.5，3.9.3；v1.6 密钥池下「认证首错」= 该 profile 最后一把存活密钥被认证禁用——池内尚有存活密钥时单密钥认证失败仅禁用该密钥、不计入熔断）⇒ 取消在飞任务、finalize。**熔断交付（v1.6，1.6 对齐决策 ②）**：已完成批的主输出与 rejects 照常 fsync + 原子改名交付（v1.5 及以前为「.part 不交付」——长跑末段配额死亡不再丢弃全部已完成产出），报告写 run.circuit_broken=true 与 run.partial_delivery=true、counts 增列 unprocessed（6.4），退出码 4 不变。「运行完整处理了全部输入」的判定信号由此从「目标文件名出现」改为「report.run.interrupted=false 且 circuit_broken=false」——退出码 0/1 不足以判定：被 SIGINT 优雅中断的运行同样交付且以 0 退出（本表中断行）（3.11.2 主输出行、3.11.3 ④、6.4）。 |
 | 中断（SIGINT/SIGTERM） | 停止取新批 → 等待当前批完成或 30s 超时取消 → finalize（报告标记 `interrupted=true`）。已 flush 的输出行有效。 |
 | --limit N | M2 流截断在前 N 条记录，其余全流程不变（试跑）；generate_only 模式下作用于生成样本流的前 N 条：仅执行预抽序前 ⌈N / generate.num_per_call⌉ 次生成调用（(llm, style) 预抽不受影响），产出再截断到 N 条——本表下行「执行全部生成调用」带 --limit 时按此截断。 |
 | 纯生成模式（v1.4） | `run.mode="generate_only"` 时跳过 M2（IngestReport 全零）：启动后先按 3.6.2 的量公式执行全部生成调用（并发受 profile 信号量限流，(llm, style) 组合按调用序号预抽保证可复现——生成先于切批、尚无批号，预抽 PRNG 固定取 Random(f"{run.seed}:0:generate")，即 3.10.3 派生式中 batch_no 恒取 0），产出构造为 Record 后按 `run.batch_size` 切批，逐批走 M3→M4→M5→M7→M11，批生命周期与内存释放同 process 模式；不触发二次生成（单遍）。规模建议同 2.6（≤ 50 万条）。 |

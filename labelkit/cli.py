@@ -264,14 +264,21 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         client = LLMClient(cfg.llm_profiles, cfg.embedding_profiles, None)
 
         async def _probe_all() -> list:
-            return [await client.probe(name) for name in (*llm_names, *emb_names)]
+            # v1.6: one probe per pool key (spec 3.9.2 probe_all) — pooled
+            # profiles print one line per key; single-key lines are unchanged.
+            results: list = []
+            for name in (*llm_names, *emb_names):
+                results.extend(await client.probe_all(name))
+            return results
 
         for result in asyncio.run(_probe_all()):
+            label = (f"{result.profile}[{result.key_env}]"
+                     if result.key_env else result.profile)
             if result.ok:
-                print(f"probe {result.profile}: ok model={result.model} "
+                print(f"probe {label}: ok model={result.model} "
                       f"latency_ms={result.latency_ms}")
             else:
-                print(f"probe {result.profile}: FAIL {result.error}")
+                print(f"probe {label}: FAIL {result.error}")
         # Probe failures do not change the exit code (CONTRACTS §7.12, frozen).
     return EXIT_OK
 

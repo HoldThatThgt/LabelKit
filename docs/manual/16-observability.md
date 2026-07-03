@@ -30,10 +30,15 @@
 | `annotate.done` | 每条标注成功 | attempts；self-consistency 的 n 与一致率 |
 | `verify.verdict` | 每轮评审 | verdict、round、critiques 全文 |
 | `schema.repair` | 每次非清洁路径 | 在哪层解决（l1/l3_1/l3_2/rejected）、违规清单（JSON Pointer，不含数据值） |
-| `llm.call` | 每次 API 调用 | profile、延迟、input/output token、重试数、状态（命名对齐 OpenTelemetry GenAI 约定）；语义去重的 embedding 调用另带 `operation="embedding"`（缺省即对话补全） |
+| `llm.call` | 每次 API 调用 | profile、延迟、input/output token、重试数、状态（命名对齐 OpenTelemetry GenAI 约定）；语义去重的 embedding 调用另带 `operation="embedding"`（缺省即对话补全）；密钥池 >1 的 profile 另带 `key_env`（v1.6）——本调用**最后一次尝试**所用密钥的环境变量名，成功失败同义；零尝试即中止的调用（如入口即驻留超限、熔断中止）不带 |
+| `llm.key_cooldown` | 密钥进入 429 冷却时（v1.6；任意池大小含 1——单密钥的 429 等待亦走冷却路径）。仅 trace，不上 stderr | profile、`key_env`、`cooldown_s`（本次冷却秒数）、`retry_after`（bool，时长是否来自 `Retry-After` 头） |
+| `llm.key_disabled` | 密钥 401/403 被本运行永久禁用时（v1.6；每密钥每运行至多一次）。同时发 stderr WARN 一次 | profile、`key_env`、`status_code` |
+| `llm.pool_parked` | 某 profile 全部存活密钥均在冷却、调用开始驻留时（v1.6；每次驻留一事件）。同时发 stderr WARN | profile、`wait_s`（预计驻留秒数）、`live_keys`（存活密钥数） |
 | `error` | 每次 StageError | stage、错误码 kind（第 18 章）、message、是否可重试 |
 
 内容脱敏四档（`trace.content`）回顾：`none`（只有结构化字段）→ `refs`（+LLM 产出的理由文本，默认）→ `excerpt`（+输入内容前 200 字）→ `full`（+完整提示词与响应，需订阅 `llm` 通道；**等于存了一份数据副本，短期调试用完即清**）。
+
+一条与脱敏档位无关的恒定规则（v1.6）：`llm.key_*` / `llm.pool_*` 事件与 `llm.call` 的 `key_env` 字段里，密钥恒以**环境变量名**标识——密钥值本身在任何档位（含 `full`）都不写入 trace、运行日志与报告。
 
 ## 16.3 rubric 调优闭环：让准则跟着证据迭代
 
@@ -110,6 +115,15 @@ jq -c 'select(.ev=="quality.judgment" and (.record_ids | index("6e60ce3c2d59f04d
 ```
 
 想要完整的调用审计（每次请求的 token、延迟、重试、状态），订阅 trace 的 `llm` 通道即可——`llm.call` 事件字段命名对齐 OpenTelemetry GenAI 语义约定（`gen_ai.usage.input_tokens` 等），现成的 OTel 生态分析工具可以直接吃。
+
+### 密钥池的分密钥视角（v1.6）
+
+profile 配置了密钥池（`api_key_envs`，第 6 章）后，调用级观测多出一层**分密钥**读数：
+
+- **trace 侧**：三个 `llm.key_*` / `llm.pool_*` 事件（16.2 表）回答限流落在哪把密钥、有没有密钥被 401/403 禁用、全池冷却导致的驻留发生了几次多久（驻留上限 `run.max_park_s`，第 7 章）；`llm.call` 的 `key_env` 字段则把每次调用归到具体密钥。
+- **报告侧**：`report.json` 的 `llm_usage.<profile>` 增列 `keys`（仅密钥池 >1 时出现）——按环境变量名分密钥给出 `calls` / `rate_limited` / `disabled`，一眼看出流量与限流是否集中在某把密钥、有没有密钥中途被禁；另有驻留统计 `parked_calls` / `parked_ms`（池 >1 或数值非零时出现——单密钥配置发生过驻留同样留痕）。
+
+诊断口诀：某密钥 `rate_limited` 独高 ⇒ 该密钥配额偏小，限流被轮换吸收、不必动手；`disabled: 1` ⇒ 该密钥凭据坏了，查对应环境变量；`parked_ms` 持续非零 ⇒ 整池都在限流里打转，加密钥或降 `max_concurrency`（第 17 章）。
 
 ## 16.5 日志的可靠性契约
 

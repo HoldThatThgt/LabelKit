@@ -10,7 +10,8 @@
 | `llm.*.provider` | str | 必填 | "openai_compatible" \| "anthropic"。 |
 | `llm.*.base_url` | str | 必填 | API 根地址。 |
 | `llm.*.model` | str | 必填 | 模型名，原样透传。 |
-| `llm.*.api_key_env` | str | 必填 | 持有 API Key 的环境变量名（唯一的环境变量用途）。 |
+| `llm.*.api_key_env` | str | 必填* | 持有 API Key 的环境变量名（API Key 是唯一的环境变量用途，2.5）。* v1.6：与 `api_key_envs` 恰提供其一（互斥，M1 校验 3.1.4）。 |
+| `llm.*.api_key_envs` | array | 无 | v1.6 密钥池（3.9.3）：持有 API Key 的环境变量名数组（≥1 项，逐项非空且互异），与 `api_key_env` 互斥。池内密钥共享本 profile 其余全部字段（同 base_url、同 model——同构池，密钥选择不改变产出数据内容）；被引用 profile 的**每个**列出变量都须存在且非空（M1 校验）。单元素数组与 `api_key_env` 等价；`max_concurrency` 仍为池内总在途上限。 |
 | `llm.*.max_concurrency` | int | 8 | 该 profile 并发上限（信号量）。 |
 | `llm.*.timeout_s` | int | 120 | 单次请求超时。 |
 | `llm.*.max_retries` | int | 5 | 可重试错误的最大重试次数。 |
@@ -25,7 +26,8 @@
 | `embedding.*.provider` | str | "openai_compatible" | 本版唯一取值：POST `{base_url}/embeddings`（3.9.3）。 |
 | `embedding.*.base_url` | str | 必填 | API 根地址。 |
 | `embedding.*.model` | str | 必填 | embedding 模型名，原样透传。 |
-| `embedding.*.api_key_env` | str | 必填 | 持有 API Key 的环境变量名；被 `dedup.semantic_embedding` 引用时须存在且非空（M1 校验，3.1.4）。 |
+| `embedding.*.api_key_env` | str | 必填* | 持有 API Key 的环境变量名；被 `dedup.semantic_embedding` 引用时须存在且非空（M1 校验，3.1.4）。* v1.6：与 `embedding.*.api_key_envs` 恰提供其一。 |
+| `embedding.*.api_key_envs` | array | 无 | v1.6：同 `llm.*.api_key_envs`——embedding profile 的密钥池，机制一致（3.9.3 密钥池行）。 |
 | `embedding.*.max_concurrency` | int | 8 | 该 profile 并发上限（信号量，与 llm.* 同机制，3.9.3）。 |
 | `embedding.*.timeout_s` | int | 60 | 单次请求超时。 |
 | `embedding.*.max_retries` | int | 5 | 可重试错误的最大重试次数（重试规则同 3.9.3）。 |
@@ -45,6 +47,7 @@ provider = "openai_compatible"
 base_url = "https://llm-gw.example.com/v1"
 model = "qwen2.5-vl-72b-instruct"
 api_key_env = "LABELKIT_KEY_DEFAULT"
+# api_key_envs = ["LABELKIT_KEY_DEFAULT", "LABELKIT_KEY_DEFAULT_2"]   # v1.6 密钥池：与上行互斥（3.9.3）
 max_concurrency = 8
 timeout_s = 120
 max_retries = 5
@@ -85,6 +88,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `run.batch_size` | int | 256 | 批大小 = QuRating 比较池大小（3.4.3）。 |
 | `run.seed` | int | 0 | PRNG 种子（配对采样/顺序随机/种子抽样）。 |
 | `run.fatal_error_threshold` | int | 20 | 熔断阈值（3.10.3）。 |
+| `run.max_park_s` | int | 3600 | v1.6 驻留上限（3.9.3 密钥池行）：单次逻辑 LLM 调用因「所引 profile 全部存活密钥均在冷却」而驻留等待的累计秒数上限；超限按重试耗尽处理（记录 failed、计入熔断窗口，1.6 对齐决策 ③）。0 = 不驻留（全池冷却即按重试耗尽失败）——注意：0 与单密钥 profile 组合意味着**任何 429（含短 Retry-After）都立即按重试耗尽失败**，仅建议在多密钥池上设 0。运维容忍度参数，不影响产出内容；单密钥配置下亦约束超长 `Retry-After` 等待（3.9.3 重试行）。 |
 | `input.text_field` | str | "text" | 文本模态取文内容的点路径（3.2.5）。 |
 | `input.on_bad_line / on_missing_pair / on_index_conflict` | str | skip / skip / fail | "skip" \| "fail"（3.2.4–3.2.5）。 |
 | `input.max_image_mb` | int | 20 | 单图大小上限。 |
@@ -97,7 +101,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `dedup.ui_dup_requires` | str | "both" | "both" \| "tree" \| "image"（3.3.3）。 |
 | `dedup.bounds_quantize_px` | int | 4 | 树去重时坐标量化粒度。 |
 | `dedup.semantic` | bool | false | v1.2 新增：可选第④级语义去重开关（3.3.3；SemDeDup [26]）。默认关——零 embedding 依赖，默认行为与 v1.0 一致（8.3 O1）。 |
-| `dedup.semantic_embedding` | str | 必填† | † `dedup.semantic = true` 时必填：引用 config.toml `[embedding.<name>]` profile（5.1）；存在性与 api_key_env 非空由 M1 校验（3.1.4）。 |
+| `dedup.semantic_embedding` | str | 必填† | † `dedup.semantic = true` 时必填：引用 config.toml `[embedding.<name>]` profile（5.1）；存在性与密钥配置（`api_key_env` / `api_key_envs` 恰其一且逐项非空，v1.6）由 M1 校验（3.1.4）。 |
 | `dedup.semantic_threshold` | float | 0.95 | 余弦相似度判重阈值（SemDeDup 论文的高相似区间 [26]；3.3.3 第④级）。 |
 | `quality.enabled` | bool | true | — |
 | `quality.mode` | str | "pairwise" | "pairwise" \| "pointwise"（1.6 对齐决策）。 |

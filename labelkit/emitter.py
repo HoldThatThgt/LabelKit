@@ -163,7 +163,9 @@ class Emitter:
 
     def finalize(self, report: Mapping, deliver: bool = True) -> None:
         """fsync + atomic rename when deliver=True; always write report.json.
-        deliver=False (circuit break, exit 4) leaves the .part files in place.
+        deliver=False is dry-run-only (no .part was ever opened); v1.6: a
+        circuit-break finalize passes deliver=True — completed batches ARE
+        delivered, the report marking run.partial_delivery (spec 3.10.3 熔断交付).
         A prior channel-write failure forces deliver=False: a possibly-corrupted
         .part is never renamed to the final name (spec 3.11.3 ④)."""
         self._end_progress()

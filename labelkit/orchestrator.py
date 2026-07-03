@@ -358,9 +358,13 @@ class Orchestrator:
         else:
             exit_code = 0
         report = self._build_report(exit_code=exit_code, wall_s=wall_s)
-        # Circuit break: report written, .part NOT renamed. Everything else
-        # (incl. graceful SIGINT) delivers normally.
-        self.emitter.finalize(report, deliver=not self._circuit_broken)
+        # v1.6 熔断交付 (spec 3.10.3, stakeholder decision 1.6 ②): a circuit
+        # break ALSO delivers the completed batches — fsync + atomic rename,
+        # report marked run.partial_delivery=true with counts.unprocessed as
+        # the balancing residual. deliver=True here is unconditional; the
+        # emitter still refuses to rename after a channel-write failure
+        # (_undeliverable), and dry-run passes deliver=False elsewhere.
+        self.emitter.finalize(report, deliver=True)
         self.metrics.event(_EV_RUN_END, stage="run", batch_no=0,
                            payload={"counts": report["counts"], "exit_code": exit_code})
         self.metrics.flush()
@@ -391,21 +395,35 @@ class Orchestrator:
             "emitted": c("counts.emitted"),
         }
 
+        run_block: dict = {
+            "tool_version": __version__,
+            "started_at": self.run_started_at.isoformat(),
+            "finished_at": datetime.now().astimezone().isoformat(),
+            "interrupted": self._interrupted,
+            # Explicit breaker flag (E2E finding P4-10): interrupted stays
+            # false on a circuit break — exit_code=4 alone was easy to misread.
+            "circuit_broken": self._circuit_broken,
+            "exit_code": exit_code,
+            "modality": cfg.run.modality,
+            "seed": cfg.run.seed,
+            "config_digest": cfg.config_digest,
+            "project_digest": cfg.project_digest,
+        }
+        if self._circuit_broken:
+            # v1.6 熔断交付 (spec 6.4, 只增): partial_delivery present only on
+            # breaker-trip delivery; counts.unprocessed = balancing residual so
+            # the invariant extends to emitted + dropped_* + failed + bad_input
+            # + unprocessed = scanned + generated (records that entered the
+            # pipeline but reached no terminal count, incl. generated-but-
+            # never-batched records in generate_only).
+            run_block["partial_delivery"] = True
+            residual = (counts["scanned"] + counts["generated"]
+                        - counts["emitted"] - counts["dropped_dup"]
+                        - counts["dropped_lowq"] - counts["dropped_verify"]
+                        - counts["failed"] - counts["bad_input"])
+            counts["unprocessed"] = max(0, residual)
         report: dict = {
-            "run": {
-                "tool_version": __version__,
-                "started_at": self.run_started_at.isoformat(),
-                "finished_at": datetime.now().astimezone().isoformat(),
-                "interrupted": self._interrupted,
-                # Explicit breaker flag (E2E finding P4-10): interrupted stays
-                # false on a circuit break — exit_code=4 alone was easy to misread.
-                "circuit_broken": self._circuit_broken,
-                "exit_code": exit_code,
-                "modality": cfg.run.modality,
-                "seed": cfg.run.seed,
-                "config_digest": cfg.config_digest,
-                "project_digest": cfg.project_digest,
-            },
+            "run": run_block,
             "counts": counts,
         }
 
@@ -497,6 +515,22 @@ class Orchestrator:
         usage_by_profile = getattr(self.llm, "usage_by_profile", None) if self.llm else None
         llm_usage: dict[str, dict] = {}
         for name, usage in (usage_by_profile or {}).items():
+            # v1.6 key pool (spec 6.4, 只增): keys sub-object only for pools > 1
+            # (M9 pre-seeds every member, so len == pool size; key identity =
+            # env-var NAME, decision 1.6 ⑤); parked stats for pools > 1 or
+            # whenever nonzero — single-key parking must leave report evidence.
+            key_usages = getattr(usage, "keys", None) or {}
+            parked_calls = getattr(usage, "parked_calls", 0)
+            parked_ms = getattr(usage, "parked_ms", 0)
+            emit_keys = len(key_usages) > 1
+            emit_parked = emit_keys or bool(parked_calls) or bool(parked_ms)
+            if (usage.calls == 0 and usage.retries == 0
+                    and usage.prompt_tokens == 0 and usage.completion_tokens == 0
+                    and usage.est_cost_usd is None
+                    and not emit_keys and not emit_parked):
+                # Zero-activity profile (e.g. its only call was breaker-aborted
+                # before any attempt): keep the v1.5 report shape — omit.
+                continue
             entry = {
                 "calls": usage.calls,
                 "prompt_tokens": usage.prompt_tokens,
@@ -505,6 +539,15 @@ class Orchestrator:
             }
             if usage.est_cost_usd is not None:
                 entry["est_cost_usd"] = usage.est_cost_usd
+            if emit_keys:
+                entry["keys"] = {
+                    env: {"calls": ku.calls, "rate_limited": ku.rate_limited,
+                          "disabled": ku.disabled}
+                    for env, ku in sorted(key_usages.items())
+                }
+            if emit_parked:
+                entry["parked_calls"] = parked_calls
+                entry["parked_ms"] = parked_ms
             llm_usage[name] = entry
         report["llm_usage"] = llm_usage
 

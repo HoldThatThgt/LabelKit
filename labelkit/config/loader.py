@@ -275,15 +275,57 @@ def _parse_tool(col: _Collector, file: str, data: Any) -> ToolConfig:
     return tool
 
 
+def _parse_key_envs(col: _Collector, t: _Tbl, data: dict) -> tuple[str, ...]:
+    """v1.6 key pool (spec 3.1.4 API-Key row / 5.1): exactly one of
+    ``api_key_env`` / ``api_key_envs`` is provided; both forms normalize to a
+    non-empty tuple of distinct, non-empty env-var names (scalar → 1-tuple).
+    Returns () when the declaration is invalid (errors already collected)."""
+    has_single = "api_key_env" in data
+    has_multi = "api_key_envs" in data
+    # Always consume both keys so finish() never flags them as unknown.
+    single = t.get_str("api_key_env", None, nonempty=True)
+    multi = t.get_str_tuple("api_key_envs", ())
+    if has_single and has_multi:
+        col.error(f"{t.loc('api_key_envs')}: 与 api_key_env 互斥（恰提供其一，v1.6）")
+        return ()
+    if not has_single and not has_multi:
+        col.error(f"{t.loc('api_key_env')}: 缺失必填键——api_key_env 与 api_key_envs "
+                  f"须恰提供其一（v1.6）")
+        return ()
+    if has_single:
+        return (single,) if single else ()
+    if not multi:
+        raw = data.get("api_key_envs")
+        if isinstance(raw, list) and not raw:
+            col.error(f"{t.loc('api_key_envs')}: 期望非空的环境变量名数组（≥1 项）")
+        # non-list / bad-element cases: get_str_tuple already collected the
+        # per-element errors — no second, misleading error line (review fix).
+        return ()
+    ok = True
+    seen: set[str] = set()
+    for i, env in enumerate(multi, 1):
+        if not env.strip():
+            col.error(f"{t.loc('api_key_envs')}[{i}]: 期望非空字符串，得到 {_fmt(env)}")
+            ok = False
+        elif env in seen:
+            col.error(f"{t.loc('api_key_envs')}[{i}]: 环境变量名 {_fmt(env)} 重复"
+                      f"（池内名称须互异）")
+            ok = False
+        seen.add(env)
+    return multi if ok else ()
+
+
 def _parse_llm_profile(col: _Collector, file: str, name: str, data: dict) -> LLMProfile:
     t = _Tbl(col, file, f"[llm.{name}]", data)
+    key_envs = _parse_key_envs(col, t, data)
     prof = LLMProfile(
         name=name,
         provider=t.get_str("provider", "openai_compatible", required=True,
                            enum=("openai_compatible", "anthropic")),
         base_url=t.get_str("base_url", "", required=True, nonempty=True) or "",
         model=t.get_str("model", "", required=True, nonempty=True) or "",
-        api_key_env=t.get_str("api_key_env", "", required=True, nonempty=True) or "",
+        api_key_env=key_envs[0] if key_envs else "",
+        api_key_envs=key_envs,
         max_concurrency=t.get_int("max_concurrency", 8, minimum=1),
         timeout_s=t.get_int("timeout_s", 120, minimum=1),
         max_retries=t.get_int("max_retries", 5, minimum=0),
@@ -302,12 +344,14 @@ def _parse_llm_profile(col: _Collector, file: str, name: str, data: dict) -> LLM
 
 def _parse_embedding_profile(col: _Collector, file: str, name: str, data: dict) -> EmbeddingProfile:
     t = _Tbl(col, file, f"[embedding.{name}]", data)
+    key_envs = _parse_key_envs(col, t, data)
     prof = EmbeddingProfile(
         name=name,
         provider=t.get_str("provider", "openai_compatible", enum=("openai_compatible",)),
         base_url=t.get_str("base_url", "", required=True, nonempty=True) or "",
         model=t.get_str("model", "", required=True, nonempty=True) or "",
-        api_key_env=t.get_str("api_key_env", "", required=True, nonempty=True) or "",
+        api_key_env=key_envs[0] if key_envs else "",
+        api_key_envs=key_envs,
         max_concurrency=t.get_int("max_concurrency", 8, minimum=1),
         timeout_s=t.get_int("timeout_s", 60, minimum=1),
         max_retries=t.get_int("max_retries", 5, minimum=0),
@@ -468,6 +512,7 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
         batch_size=t.get_int("batch_size", 256, minimum=1),
         seed=t.get_int("seed", 0),
         fatal_error_threshold=t.get_int("fatal_error_threshold", 20, minimum=1),
+        max_park_s=t.get_int("max_park_s", 3600, minimum=0),
     )
     t.finish()
 
@@ -938,26 +983,39 @@ def load(config_path: Path, project_path: Path,
     if output.repair_llm is not None:
         referenced.add(output.repair_llm)
 
+    def _resolve_keys(kind: str, prof_name: str,
+                      envs: tuple[str, ...]) -> tuple[str, ...] | None:
+        """Resolve EVERY listed env var of a referenced profile (v1.6 pools:
+        one aggregated error line per missing variable). Returns the aligned
+        key tuple, or None when at least one variable is missing/empty."""
+        pooled = len(envs) > 1
+        keys: list[str] = []
+        ok = True
+        for i, env in enumerate(envs, 1):
+            key = os.environ.get(env, "")
+            if not key:
+                loc = (f"{fc}:[{kind}.{prof_name}].api_key_envs[{i}]" if pooled
+                       else f"{fc}:[{kind}.{prof_name}].api_key_env")
+                col.error(f"{loc}: 环境变量 {_fmt(env)} 未设置或为空")
+                ok = False
+            keys.append(key)
+        return tuple(keys) if ok else None
+
     for name in sorted(referenced):
         prof = llm_profiles.get(name)
-        if prof is None or not prof.api_key_env:
-            continue  # missing profile / missing api_key_env already reported
-        key = os.environ.get(prof.api_key_env, "")
-        if not key:
-            col.error(f"{fc}:[llm.{name}].api_key_env: 环境变量 "
-                      f"{_fmt(prof.api_key_env)} 未设置或为空")
-        else:
-            llm_profiles[name] = replace(prof, api_key=key)
+        if prof is None or not prof.api_key_envs:
+            continue  # missing profile / invalid key declaration already reported
+        keys = _resolve_keys("llm", name, prof.api_key_envs)
+        if keys is not None:
+            llm_profiles[name] = replace(prof, api_key=keys[0], api_keys=keys)
 
     if dedup.semantic and dedup.semantic_embedding in embedding_profiles:
         prof_e = embedding_profiles[dedup.semantic_embedding]
-        if prof_e.api_key_env:
-            key = os.environ.get(prof_e.api_key_env, "")
-            if not key:
-                col.error(f"{fc}:[embedding.{prof_e.name}].api_key_env: 环境变量 "
-                          f"{_fmt(prof_e.api_key_env)} 未设置或为空")
-            else:
-                embedding_profiles[prof_e.name] = replace(prof_e, api_key=key)
+        if prof_e.api_key_envs:
+            keys = _resolve_keys("embedding", prof_e.name, prof_e.api_key_envs)
+            if keys is not None:
+                embedding_profiles[prof_e.name] = replace(
+                    prof_e, api_key=keys[0], api_keys=keys)
 
     # ── rules 13–15 — user schema + few-shot examples ─────────────────────
     user_schema, schema_ok = _load_user_schema(col, fp, output)
@@ -1137,6 +1195,7 @@ def load(config_path: Path, project_path: Path,
             batch_size=run["batch_size"],
             seed=run["seed"],
             fatal_error_threshold=run["fatal_error_threshold"],
+            max_park_s=run["max_park_s"],
         ),
         input=input_cfg,
         dedup=dedup,

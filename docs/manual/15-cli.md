@@ -55,6 +55,19 @@ probe judge: FAIL HTTP 401: {"error":{"message":"token expired or incorrect",...
 
 **注意：probe 失败不改变退出码**（仍为 0）——它是诊断信息，不是判决。脚本里要判 probe 结果得 grep 输出。为什么仍然值得写进 checklist：密钥错误（401/403）如今会立即熔断（退出码 4），但模型名拼错这类 400/404 错误在小数据量下仍可能「静默失败 + 退出码 0」（第 2 章）——probe 一次把两类问题都免费暴露。
 
+**密钥池逐密钥探测（v1.6）**：profile 以 `api_key_envs` 声明了密钥池（第 6 章）时，`--probe` 会按声明序**对池内每把密钥各发一次** 1-token 试调用，每把密钥打一行——profile 名后以方括号标注该密钥的环境变量名（永远是变量**名**，密钥值不会出现在任何输出里）。单密钥 profile 的输出行格式不变：
+
+```
+probe <profile>: ok model=... latency_ms=...             # 单密钥 profile，同上例
+probe <profile>[<ENV名>]: ok model=... latency_ms=...    # 池化 profile，每密钥一行
+probe <profile>[<ENV名>]: FAIL <错误信息>
+```
+
+相应地，探测成本 = **各被引用 profile 的池大小之和**次试调用。两个判读提醒：
+
+- **FAIL ≠ 密钥失效**。正被限流的密钥并没有「死」——运行期的 429 只会让该密钥进入冷却、由池内其余密钥顶上（第 6 章），但 probe 恰好打在冷却窗口里时照样是一行 FAIL。脚本 grep FAIL 时请区分错误内容：401/403 是密钥级确定性故障，429 只是暂时限流。probe 失败从不改变退出码的约定对逐密钥行同样成立——哪怕整池 FAIL，validate 仍以 0 结束；
+- 密钥池下 401/403 的熔断语义也随之变化：运行期先按密钥禁用，仅当被禁用的是**最后一把**存活密钥才立即熔断（第 6 章）——所以「probe 里一把密钥 401、其余 ok」的池仍然能跑，只是白白少了一把密钥，建议开跑前修好。
+
 ## 15.3 `labelkit rubric`：导出内置评价准则
 
 ```
@@ -81,13 +94,14 @@ uv run labelkit rubric --show default:text > my-rubric.toml
 | **1** | 完成但违反 `--strict`，或报告写出失败 | 有 rejects 且开了 strict；主输出成功但 report.json 写不出 |
 | **2** | 配置错误 | TOML 语法错、字段非法、引用的 profile 不存在、Schema/rubric 非法、环境变量缺失、非法 CLI 参数组合 |
 | **3** | 输入错误（仅 process 模式） | 输入路径不存在、目录下没有候选文件（无 `.jsonl` / 无 `uitree_*`+`image_*`）、**无任何合法记录**（读完输入 `ingested=0`，如 text_field 全员未命中）、UI index 冲突且策略为 fail、坏行/缺对且策略为 fail |
-| **4** | 致命运行错误 | 熔断触发（连续 `fatal_error_threshold` 次不可恢复 API 错误）、运行期输出写入失败、未预期异常、Ctrl-C 打在启动/收尾阶段（stderr 打印 `interrupted`；运行中的 Ctrl-C 则走优雅中断、正常交付并按 strict 规则返回 0/1） |
+| **4** | 致命运行错误 | 熔断触发（连续 `fatal_error_threshold` 次不可恢复 API 错误；v1.6 起熔断中止**交付**已完成批，见下方判读要点）、运行期输出写入失败、未预期异常、Ctrl-C 打在启动/收尾阶段（stderr 打印 `interrupted`；运行中的 Ctrl-C 则走优雅中断、正常交付并按 strict 规则返回 0/1） |
 
 判读要点：
 
 - **0 不等于「全部记录都成功」**——它只承诺流程走完、账目写清。生产脚本请用 `--strict` 或解析 report.counts；
 - 2 与 3 的分界：**还没碰数据**的错都是 2（包括「输出父目录不存在或不可写」——忘了 `mkdir -p out` 是退出码 2，不是 4）；**数据本身**的错才是 3；
-- 4 的几种触发里，只有**熔断**会走完收尾：报告照常写出（特征是 `run.exit_code: 4`；注意 `interrupted` 仍为 `false`——该字段只在 SIGINT/SIGTERM 中断时为 true），但已完成批次的主输出**不会**交付改名（`.part` 残骸留在原地）；运行期写盘失败与未预期异常则在收尾之前就抛出，连报告都不会写出。
+- 4 的几种触发里，只有**熔断**会走完收尾：报告照常写出（特征是 `run.exit_code: 4`；注意 `interrupted` 仍为 `false`——该字段只在 SIGINT/SIGTERM 中断时为 true），且 **v1.6 起已完成批次的主输出与 rejects 照常 fsync + 原子改名交付**（v1.5 及以前是「`.part` 残骸留在原地、不交付」——长跑末段配额死亡不再丢弃全部已完成产出）。此时 report.json 的 run 节带 `partial_delivery: true`（仅熔断交付时出现），counts 增列 `unprocessed` 补齐守恒等式（第 8 章）；运行期写盘失败与未预期异常则在收尾之前就抛出，连报告都不会写出；
+- （v1.6）**最终文件名出现不再等价「全部输入处理完毕」**：它仍然保证已交付的每一行完整且合法，但熔断中止与优雅中断如今都会交付。判定一次运行是否完整处理了全部输入，要看 report.run 的 `interrupted=false` **且** `circuit_broken=false`——退出码本身不够用：被 SIGINT 优雅中断的运行同样交付且按 strict 规则以 0/1 退出（第 8、18 章）。
 
 ## 15.5 标准工作流：从零到全量
 

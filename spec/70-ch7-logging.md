@@ -35,10 +35,13 @@
 | `annotate.done` | annotate / — | M5 标注经 M8 通过后。 | `attempts`（同 Annotation.attempts，4.2）；v1.2 增可选字段 `sc` = {n, agreement_ratio}（self-consistency 启用时，3.5.2）。 |
 | `verify.verdict` | verify / — | M7 每轮评审后（round 从 1 计，repair 策略下每轮一事件）。 | `verdict`、`round`、`critiques`[]{`aspect`, `opinion`}；v1.2 增可选字段 `judge`（`verify.judges` 非空时每 judge 一事件，3.7.2）。 |
 | `schema.repair` | schema / — | M8 任何非 clean 路径出结果时（L1 修复命中 / L3 各轮 / 拒绝）。 | `resolved_at`（"l1"\|"l3_1"\|"l3_2"\|"rejected"，同 6.4 命名）、`violations`（JSON Pointer 路径 + 违反的 Schema 关键字摘要，不含数据值）；违规清单中来自 `output.validator` 回调的条目以 `(validator) ` 前缀标识（v1.5，3.8.2 L2.5）；v1.5 增可选字段 `l1_lossy`（=true，仅当 L1 修复疑似截断内容——json-repair 对未转义内引号的截断故障启发式，命中时另发 stderr warn，payload 只增不改）。 |
-| `llm.call` | llm / debug（stderr 摘要行恒有） | M9 每次调用返回后（含失败）。不含提示词与响应内容（full 档例外，7.4）。 | `profile`、`gen_ai.request.model`、`latency_ms`、`gen_ai.usage.input_tokens`、`gen_ai.usage.output_tokens`、`retries`、`status`（"ok"\|"retryable_exhausted"\|"fatal"\|"breaker_aborted"——v1.5 只增：重试退避途中熔断打开、该逻辑调用被中止时发出，retries 携带已消耗次数）；v1.2 增可选字段 `operation`（="embedding"，仅 M9 `embed()` 调用携带，缺省即对话补全；payload 只增不改）。 |
+| `llm.call` | llm / debug（stderr 摘要行恒有） | M9 每次调用返回后（含失败）。不含提示词与响应内容（full 档例外，7.4）。 | `profile`、`gen_ai.request.model`、`latency_ms`、`gen_ai.usage.input_tokens`、`gen_ai.usage.output_tokens`、`retries`、`status`（"ok"\|"retryable_exhausted"\|"fatal"\|"breaker_aborted"——v1.5 只增：重试退避途中熔断打开、该逻辑调用被中止时发出，retries 携带已消耗次数）；v1.2 增可选字段 `operation`（="embedding"，仅 M9 `embed()` 调用携带，缺省即对话补全；payload 只增不改）；v1.6 增可选字段 `key_env`（= 本次逻辑调用**最后一次尝试**所用密钥的环境变量名，成功失败同义；零尝试即终止的调用——如入口即驻留超限/breaker_aborted——不携带；仅密钥池 >1 的 profile 携带；payload 只增不改）。 |
+| `llm.key_cooldown` | llm / — | v1.6：M9 密钥进入 429 冷却时（每次冷却一事件，3.9.3 密钥池行）。任意池大小（含 1）均发出——单密钥 429 的等待在 v1.6 亦经冷却/驻留路径。 | `profile`、`key_env`、`cooldown_s`（本次冷却秒数）、`retry_after`（bool，冷却时长是否来自 `Retry-After` 头）。 |
+| `llm.key_disabled` | llm / warn | v1.6：M9 密钥 401/403 认证禁用时（每密钥每运行至多一次；任意池大小含 1——单密钥场景该事件先于立即熔断发出）。 | `profile`、`key_env`、`status_code`。 |
+| `llm.pool_parked` | llm / warn | v1.6：M9 某 profile 全部存活密钥均在冷却、调用开始驻留时（每次驻留一事件；任意池大小含 1）。 | `profile`、`wait_s`（预计驻留秒数）、`live_keys`（存活密钥数）。 |
 | `error` | 随产生 stage 的通道 / warn（记录级）· error（运行级） | StageError 构造时。 | `stage`、`kind`（取值见 7.6）、`message`、`retryable`——即 StageError 全字段（4.2）。 |
 
-† `reason` 仅当 `quality.judgment_reasons` 生效时存在（5.2）。全部自由文本字段（reason / critiques / violations 文本）受 7.4 脱敏档位控制。
+† `reason` 仅当 `quality.judgment_reasons` 生效时存在（5.2）。全部自由文本字段（reason / critiques / violations 文本）受 7.4 脱敏档位控制。密钥相关事件（v1.6）只携环境变量**名**——密钥值在任何档位、任何通道均不落日志（7.4 规则不变）。
 
 ## 7.3 记录格式规范
 
@@ -110,8 +113,8 @@ jq -s '[.[] | select(.ev=="quality.judgment") | .payload.judgments[]
 | `judgment_invalid` | 比较级 | M4；按 tie 计入 BT（3.4.3）。 |
 | `schema_violation` | 记录级 | M8 L3 耗尽；记录 failed → rejects。 |
 | `callback_violation` | 记录级 | v1.5：M8 L3 耗尽且剩余违规全部来自 `output.validator` 回调（3.8.2 L2.5）；记录 failed → rejects。 |
-| `provider_retryable_exhausted` | 记录级 | M9 重试耗尽；记录 failed，计入熔断窗口。 |
-| `provider_fatal` | 运行级 | M9 不可重试错误。400/404 等计入连续熔断计数，连续达阈值 ⇒ 退出码 4；**401/403 认证类立即熔断**（v1.5，3.9.3）。 |
+| `provider_retryable_exhausted` | 记录级 | M9 重试耗尽（v1.6 含驻留超限 `run.max_park_s`，3.9.3 密钥池行）；记录 failed，计入熔断窗口。 |
+| `provider_fatal` | 运行级 | M9 不可重试错误。400/404 等计入连续熔断计数，连续达阈值 ⇒ 退出码 4；**401/403 认证类立即熔断**（v1.5，3.9.3）。v1.6 密钥池：认证失败先按密钥禁用（`llm.key_disabled`），池内尚有存活密钥时不产生本错误、不计入熔断——仅当禁用的是该 profile 最后一把存活密钥时才抛出并立即熔断（3.9.3 密钥池行）。 |
 | `internal_error` | 记录级 | 任何未预期异常（含 M11 终检失败）；记录 failed，堆栈入日志（debug 级）。 |
 
 ## 7.7 进度显示与结束摘要

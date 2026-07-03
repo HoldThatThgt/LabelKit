@@ -1,7 +1,8 @@
 # LabelKit — Cross-Module Interface Contract (CONTRACTS.md)
 
 **Status: FROZEN.** This document is the single interface contract for parallel implementation of
-M1–M12 + CLI by independent engineers. It is derived from the design spec v1.4 (`spec/*.md`), which
+M1–M12 + CLI by independent engineers. It is derived from the design spec v1.4 base with the
+inline v1.5/v1.6 revisions (`spec/*.md`), which
 remains the authority for *algorithms and behavior*; this document is the authority for *names,
 signatures, types, defaults, file formats, and prompt text*. Where the spec left a signature or
 format implicit, the decision is frozen here and tagged **[FROZEN HERE]** (all such decisions are
@@ -298,19 +299,26 @@ class InputError(LabelKitError):
 
 
 class ProviderRetryableError(LabelKitError):
-    """M9: retryable provider error with retries exhausted. Record-level → status='failed'."""
-    def __init__(self, message: str, profile: str, retries: int):
+    """M9: retryable provider error with retries exhausted (v1.6: incl. park-budget overrun,
+    run.max_park_s). Record-level → status='failed'."""
+    def __init__(self, message: str, profile: str, retries: int,
+                 key_env: str | None = None):
         self.profile = profile
         self.retries = retries
+        self.key_env = key_env                # v1.6: env-var NAME of the last key tried (pools)
         super().__init__(message)
 
 
 class ProviderFatalError(LabelKitError):
     """M9: non-retryable provider error (401/403/400/404, dims mismatch). Feeds the circuit
-    breaker; a streak >= run.fatal_error_threshold ends the run with exit code 4."""
-    def __init__(self, message: str, profile: str, status_code: int | None = None):
+    breaker; a streak >= run.fatal_error_threshold ends the run with exit code 4.
+    v1.6 pools: an auth failure absorbed by key rotation raises nothing — this exception is
+    raised for auth only when the LAST live key gets disabled (spec 3.9.3)."""
+    def __init__(self, message: str, profile: str, status_code: int | None = None,
+                 key_env: str | None = None):
         self.profile = profile
         self.status_code = status_code
+        self.key_env = key_env                # v1.6: env-var NAME of the failing key (pools)
         super().__init__(message)
 
 
@@ -465,6 +473,15 @@ class LLMProfile:
     price_per_mtok_out: float | None = None
     api_key: str = field(default="", repr=False)  # resolved from env by M1; NEVER logged
                                                   # [FROZEN HERE]
+    api_key_envs: tuple[str, ...] = ()            # v1.6 key pool (spec 3.9.3): TOML accepts
+                                                  # exactly one of api_key_env/api_key_envs;
+                                                  # M1 normalizes BOTH forms into this tuple
+                                                  # (scalar → 1-tuple) — always non-empty after
+                                                  # load; api_key_env mirrors element 0
+    api_keys: tuple[str, ...] = field(default=(), repr=False)
+                                                  # v1.6: resolved values aligned with
+                                                  # api_key_envs; NEVER logged; api_key mirrors
+                                                  # element 0 for single-key readers
 
 
 @dataclass(frozen=True)
@@ -480,6 +497,9 @@ class EmbeddingProfile:
     retry_base_delay_s: float = 1.0               # same backoff mechanism as llm.* [FROZEN HERE]
     dims: int | None = None                       # if set, embed() validates returned dims
     api_key: str = field(default="", repr=False)  # resolved from env by M1
+    api_key_envs: tuple[str, ...] = ()            # v1.6 key pool — same normalization as
+                                                  # LLMProfile.api_key_envs
+    api_keys: tuple[str, ...] = field(default=(), repr=False)   # v1.6, NEVER logged
 
 
 # ── project.toml side ──────────────────────────────────────────────────────
@@ -494,6 +514,10 @@ class RunConfig:
     batch_size: int = 256                         # = QuRating comparison-pool size
     seed: int = 0
     fatal_error_threshold: int = 20
+    max_park_s: int = 3600                        # v1.6 (spec 3.9.3/5.2): park budget per logical
+                                                  # LLM call while a profile's whole key pool is
+                                                  # cooling; 0 = no parking; overrun → the normal
+                                                  # retry-exhaustion path (feeds the breaker)
 
 
 @dataclass(frozen=True)
@@ -677,7 +701,9 @@ spec 3.1.2's "typed mirror of ALL keys" wording. **[FROZEN HERE, see §12]**
 Resolution duties of M1 (beyond merging): resolve `quality.rubric` default by modality
 (`"default:text"` / `"default:ui"`); resolve `trace.path` default; resolve `run.input`/`run.output`
 CLI overrides; parse `output.schema_inline`/`schema_path` into `user_schema`; read every
-*referenced* profile's `api_key_env` into `LLMProfile.api_key`; `tool.log_level` overridden by
+*referenced* profile's declared key env vars (`api_key_env`, or each element of
+`api_key_envs`) into `LLMProfile.api_keys`, mirroring element 0 into `api_key` (v1.6
+normalization, §6.3 rule 12); `tool.log_level` overridden by
 `--log-level`. Precedence: CLI > project.toml > config.toml/built-in defaults.
 
 ### 6.2 `config/loader.py` — API (spec 3.1.3, verbatim)
@@ -712,7 +738,8 @@ Profile references:
 3. `quality.judges` / `verify.judges`: when non-empty, length must be odd.
 4. UI modality: every profile used by quality/annotate/verify must have `supports_vision = true`.
 5. `dedup.semantic = true` ⇒ `dedup.semantic_embedding` set, exists in `[embedding.*]`, and that
-   profile's `api_key_env` is non-empty.
+   profile passes rule 12's key check (exactly one of `api_key_env`/`api_key_envs`, every
+   listed variable set and non-empty; v1.6).
 
 Cross-field constraints (v1.2):
 6. `quality.selection = "top_ratio"` ⇒ `quality.top_ratio` required, ∈ (0,1], and
@@ -732,7 +759,12 @@ Run mode (v1.4):
 
 API keys:
 12. For every *referenced* profile, the `api_key_env` environment variable exists and is
-    non-empty. Unreferenced profiles are not checked.
+    non-empty. Unreferenced profiles are not checked. v1.6 key pool (spec 3.1.4/5.1): exactly
+    one of `api_key_env` / `api_key_envs` is provided (both or neither → error);
+    `api_key_envs` must be a non-empty array of non-empty, distinct env-var names; for a
+    referenced profile EVERY listed variable must exist and be non-empty (one aggregated
+    error line per missing variable). M1 normalizes the scalar form to a 1-tuple so
+    `api_key_envs`/`api_keys` are always populated after load (§6.1).
 
 User schema:
 13. Valid JSON; passes `Draft202012Validator.check_schema`; top-level `"type": "object"`;
@@ -1129,6 +1161,13 @@ class LLMResponse:
     latency_ms: int
 
 
+@dataclass                                          # v1.6, per-key accumulator [FROZEN HERE]
+class KeyUsage:
+    calls: int = 0
+    rate_limited: int = 0                          # 429s observed on this key
+    disabled: bool = False                         # auth-disabled during this run
+
+
 @dataclass                                          # mutable per-profile accumulator [FROZEN HERE]
 class ProfileUsage:
     calls: int = 0
@@ -1136,6 +1175,11 @@ class ProfileUsage:
     completion_tokens: int = 0
     retries: int = 0
     est_cost_usd: float | None = None              # only when prices configured
+    keys: dict[str, KeyUsage] = field(default_factory=dict)
+                                                   # v1.6: by env-var name; stays empty for
+                                                   # single-key profiles (report omits it then)
+    parked_calls: int = 0                          # v1.6: logical calls that parked ≥ once
+    parked_ms: int = 0                             # v1.6: total parked wall-clock
 
 
 @dataclass(frozen=True)                             # [FROZEN HERE]
@@ -1145,6 +1189,8 @@ class ProbeResult:
     model: str
     latency_ms: int
     error: str | None = None
+    key_env: str | None = None                     # v1.6: set by probe_all() on pooled
+                                                   # profiles; None on single-key profiles
 
 
 class LLMClient:
@@ -1169,7 +1215,14 @@ class LLMClient:
 
     async def probe(self, profile: str) -> ProbeResult:
         """validate --probe: minimal 1-token live call (llm profiles) or 1-text embed
-        (embedding profiles). Never raises; failures land in ProbeResult.error."""
+        (embedding profiles). Never raises; failures land in ProbeResult.error.
+        Pooled profiles: probes the first key."""
+
+    async def probe_all(self, profile: str) -> list[ProbeResult]:
+        """v1.6: one probe per pool key, declaration order, for llm AND embedding profiles
+        (each result carries key_env). Single-key profiles → 1-element list equal to
+        [await probe(profile)] with key_env=None. Used by `validate --probe` (§7.12);
+        cost = pool size probes per referenced profile. Never raises."""
 
     @property
     def usage_by_profile(self) -> dict[str, ProfileUsage]: ...
@@ -1184,19 +1237,53 @@ images `{"type":"image_url","image_url":{"url":"data:<media>;base64,<b64>"}}`; s
 as `input_schema` and `tool_choice={"type":"tool","name":"emit"}` **[FROZEN HERE: tool name
 "emit"]**, result surfaced in `LLMResponse.structured`. Retries: retryable = network error,
 timeout, HTTP 408/409/429/5xx; wait for attempt i = `random.uniform(0, retry_base_delay_s * 2**i)`
-capped at 60 s (this jitter RNG is NOT seed-derived — timing only **[FROZEN HERE]**); honor
-`Retry-After` on 429; at most `max_retries`; 401/403/400/404 → ProviderFatalError immediately
-(401/403 additionally open the circuit breaker at once — auth-class failures never self-heal;
-v1.5). Retry exhaustion feeds the breaker window too (`record_provider_result(fatal=True)`).
+capped at 60 s (this jitter RNG is NOT seed-derived — timing only **[FROZEN HERE]**) — v1.6:
+this inter-attempt backoff applies to network errors/timeouts/408/409/5xx ONLY; ALL 429 waiting
+(with or without `Retry-After`) is expressed as per-key cooldown per the key-pool paragraph
+below, which is the single normative statement of 429 timing. At most
+`max_retries`; 400/404 → ProviderFatalError immediately, no rotation (request-shape errors are
+key-independent).
+
+Key pool (v1.6, spec 3.9.3 密钥池行; single-key profiles are pools of size 1 and keep v1.5
+retry accounting, data output and breaker/exit semantics — the 429 WAIT PATH is a v1.6 behavior
+revision: `run.max_park_s` bounds Retry-After waits, no-Retry-After cooldown is 300s-capped and
+key-scoped, and parking emits WARN + events): request headers are built PER ATTEMPT from the key
+selected by least-in-flight, ties broken by declaration order (deterministic, no RNG —
+seed-exempt like the retry jitter). A 429 sets a cooldown on the KEY — `Retry-After` honored in
+full when present, else full-jitter `random.uniform(0, retry_base_delay_s * 2**c)` capped at
+300 s where c = that key's consecutive-429 count (accumulated ACROSS logical calls, reset by a
+success ON THAT KEY) — consumes one retry unit, and the next
+attempt re-selects immediately: zero wait while another key is live (`llm.key_cooldown` event).
+401/403 permanently disables the key for the run (one stderr WARN + `llm.key_disabled`, env-var
+NAME only); with live keys remaining, the SAME attempt re-dispatches on the next key consuming
+NO retry budget and feeding NOTHING to the breaker (auth failure is deterministic per key, at
+most once each); disabling the LAST live key → ProviderFatalError +
+`record_provider_result(fatal=True, hard=True)` (immediate open — pools of 1 reproduce the v1.5
+first-401 behavior exactly). Quota signaled as 403 is treated as auth (no body sniffing —
+spec 1.6 decision). When ALL live keys are cooling, the call PARKS until the earliest cooldown
+end (sleeping in ≤ 60 s slices, re-checking the breaker each slice — preserving the v1.5
+post-semaphore re-check; emits `llm.pool_parked` + stderr WARN); parking consumes no retry
+budget but is capped per logical call by `run.max_park_s` (default 3600; 0 = no parking —
+NOTE: 0 on a single-key profile makes every 429 an immediate retry-exhaustion failure) —
+overrun → the normal retry-exhaustion path; when the earliest cooldown end provably exceeds the
+remaining park budget, fail immediately via the same path (no dead wall-clock). Parking happens
+INSIDE the acquired semaphore slot and holds it (throughput is zero anyway while a whole pool
+cools); `run.max_park_s` counts park time only, never semaphore queueing. Retry exhaustion
+feeds the breaker window (`record_provider_result(fatal=True)`), unchanged (P1-1).
+
 One `asyncio.Semaphore(max_concurrency)` per profile shared by ALL calls (incl. repairs,
-verify, probe). Image bytes loaded/scaled/encoded per call and released. Metering: accumulate
+verify, probe) — for pools this is the AGGREGATE in-flight cap across all keys of the profile
+(v1.6). Image bytes loaded/scaled/encoded per call and released. Metering: accumulate
 usage from response; cost = `prompt_tokens/1e6*price_in + completion_tokens/1e6*price_out` when
-both prices set. Breaker interplay: every ProviderFatalError → `metrics.record_provider_result
-(fatal=True)` — with `hard=True` when status is 401/403 (immediate open, v1.5); retry
-exhaustion also records `fatal=True`; any success → `record_provider_result(fatal=False)`; when
-`metrics.circuit_broken`, `complete`/`embed` raise `CircuitBreakerTripped` at entry. Trace:
-`llm.call` after every call (incl. failures) with the §8.2 payload; API keys never enter any log
-path.
+both prices set; v1.6 adds per-key `KeyUsage` and `parked_calls`/`parked_ms` to `ProfileUsage`
+(report emits them only for pools > 1). Breaker interplay: every ProviderFatalError →
+`metrics.record_provider_result(fatal=True)` — with `hard=True` for auth only when the failing
+key was the profile's last live key (v1.6; absorbed per-key auth failures raise nothing and feed
+nothing); retry exhaustion also records `fatal=True`; any success →
+`record_provider_result(fatal=False)`; when `metrics.circuit_broken`, `complete`/`embed` raise
+`CircuitBreakerTripped` at entry. Trace: `llm.call` after every call (incl. failures) with the
+§8.2 payload (+ `key_env` for pools > 1, v1.6); API keys never enter any log path — key
+identity is always the env-var NAME.
 
 ### 7.9 M10 — `labelkit/orchestrator.py`
 
@@ -1239,8 +1326,11 @@ then drop the batch. Emit events `batch.start`/`batch.end` (stage="run"). genera
 ingestor; call `GenerateStage.generate_all(ctx0)` first, batch the records, run the reduced
 chain. Stage timing: wall-clock per stage accumulated into `metrics` for `report.timing`
 (`metrics.add_stage_time(stage_name, seconds)` **[FROZEN HERE]**). Circuit breaker: catch
-`CircuitBreakerTripped` escaping a stage → cancel remaining work, finalize (report written,
-`.part` NOT renamed **[FROZEN HERE]**), `RunSummary.exit_code=4`. SIGINT/SIGTERM: stop taking new
+`CircuitBreakerTripped` escaping a stage → cancel remaining work, finalize WITH delivery
+(v1.6 revision of the frozen rule, spec 3.10.3 熔断交付: `.part` IS fsync'd and renamed —
+completed batches are delivered; report gains `run.partial_delivery=true` and the balancing
+`counts.unprocessed`, §9.3), `RunSummary.exit_code=4`. Unwritable output (exit 4 at `open()`)
+still delivers nothing. SIGINT/SIGTERM: stop taking new
 batches, wait current batch ≤ 30 s then cancel, finalize normally (rename happens; report
 `interrupted=true` **[FROZEN HERE]**). Tail batch processed as-is. Report assembly is owned by
 the orchestrator: it builds the §9.3 dict from `ingestor.report`, `metrics`, `schema_engine.stats`,
@@ -1286,7 +1376,9 @@ class Emitter:                                     # signatures [FROZEN HERE]
         """fsync + atomic os.rename {output}.part → {output} (and sidecar) when deliver=True;
         always writes {output_stem}.report.json (cfg.dry_run diverts to {output_stem}.dryrun.report.json,
         v1.5 P2-4); prints the final stderr summary table matching
-        report['counts']. deliver=False (circuit break, exit 4) leaves .part in place.
+        report['counts']. deliver=False is used by dry-run only (no .part was opened);
+        v1.6: a circuit-break finalize passes deliver=True — completed batches are renamed
+        and delivered, the report marking run.partial_delivery=true (spec 3.10.3 熔断交付).
         Report write failure → CLI exit 1 (raise LabelKitError('report write failed')).
         [FROZEN HERE]"""
 ```
@@ -1366,7 +1458,9 @@ Event-name constants (module level, exact strings): `EV_RUN_START = "run.start"`
 `EV_QUALITY_JUDGMENT = "quality.judgment"`, `EV_QUALITY_POINTWISE = "quality.pointwise"`,
 `EV_QUALITY_BT_FIT = "quality.bt_fit"`, `EV_QUALITY_GATE = "quality.gate"`,
 `EV_ANNOTATE_DONE = "annotate.done"`, `EV_VERIFY_VERDICT = "verify.verdict"`,
-`EV_SCHEMA_REPAIR = "schema.repair"`, `EV_LLM_CALL = "llm.call"`, `EV_ERROR = "error"`.
+`EV_SCHEMA_REPAIR = "schema.repair"`, `EV_LLM_CALL = "llm.call"`, `EV_ERROR = "error"`,
+and (v1.6) `EV_LLM_KEY_COOLDOWN = "llm.key_cooldown"`, `EV_LLM_KEY_DISABLED = "llm.key_disabled"`,
+`EV_LLM_POOL_PARKED = "llm.pool_parked"`.
 
 ### 7.12 CLI — `labelkit/cli.py`
 
@@ -1390,7 +1484,8 @@ constructed here, passed to `DedupStage`) → `Ingestor` (process mode) → `Emi
 fatal (`RunSummary.exit_code==4` / unwritable output / auth failure)→4, `--strict` and
 rejects>0 → 1 (already folded into `RunSummary.exit_code` by M10, §7.9), report write
 failure → 1, else 0. `validate`: `config.load()` only (+`--probe`:
-`LLMClient.probe` on every referenced profile, print results; any probe failure does not change
+`LLMClient.probe_all` on every referenced profile (v1.6 — one line per key for pooled
+profiles; single-key output format unchanged), print results; any probe failure does not change
 the exit code unless config itself is invalid **[FROZEN HERE]**). `rubric`: no flag → list
 available names; `--show <name>` → print the packaged TOML verbatim.
 
@@ -1417,7 +1512,10 @@ available names; `--show <name>` → print the packaged TOML verbatim.
 | `annotate.done` | annotate / — | M5 after M8 pass | (id,) | `attempts`[, `sc` {n, agreement_ratio}] |
 | `verify.verdict` | verify / — | M7 per round (per judge when judges set) | (id,) | `verdict`, `round`, `critiques`[]{`aspect`, `opinion`}[, `judge`] |
 | `schema.repair` | schema / — | M8 any non-clean resolution | (record ids if known) | `resolved_at` ("l1"\|"l3_1"\|"l3_2"\|"rejected"), `violations` (JSON-Pointer + violated keyword summary, NO data values)[, `l1_lossy`=true — v1.5, only on a suspected content-dropping L1 repair] |
-| `llm.call` | llm / debug (summary always) | M9 after every call incl. failures | () | `profile`, `gen_ai.request.model`, `latency_ms`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `retries`, `status` ("ok"\|"retryable_exhausted"\|"fatal")[, `operation`="embedding"][, `gen_ai.input.messages`, `gen_ai.output.messages` — content="full" + llm channel only] |
+| `llm.call` | llm / debug (summary always) | M9 after every call incl. failures | () | `profile`, `gen_ai.request.model`, `latency_ms`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `retries`, `status` ("ok"\|"retryable_exhausted"\|"fatal")[, `operation`="embedding"][, `key_env` — env-var name of the key used by the LAST attempt (success or failure); absent on zero-attempt calls; pooled profiles (>1 key) only, v1.6][, `gen_ai.input.messages`, `gen_ai.output.messages` — content="full" + llm channel only] |
+| `llm.key_cooldown` | llm / — | M9 when a key enters 429 cooldown (v1.6, spec 3.9.3); fires for ANY pool size incl. 1 | () | `profile`, `key_env`, `cooldown_s`, `retry_after` (bool: duration came from the Retry-After header) |
+| `llm.key_disabled` | llm / warn | M9 when a key is auth-disabled — at most once per key per run; any pool size incl. 1 (single-key: precedes the hard trip) (v1.6) | () | `profile`, `key_env`, `status_code` |
+| `llm.pool_parked` | llm / warn | M9 when a call starts parking — all live keys cooling; any pool size incl. 1 (v1.6) | () | `profile`, `wait_s`, `live_keys` |
 | `error` | channel of producing stage / warn (record-level) · error (run-level) | On StageError construction | per case | `stage`, `kind` (§7.6 codes), `message`, `retryable` |
 
 `reason` present only when `quality.judgment_reasons` is effective. `run.*`/`batch.*` bypass the
@@ -1547,6 +1645,10 @@ schema_violation). `rejects="none"`: no file.
               "aggregate_histogram": {"0.0-0.1": 0, "0.1-0.2": 0, ..., "0.9-1.0": 0},  // 10 buckets
               "per_criterion_mean": {"<criterion>": 0.0, ...}},
   // run block also carries "circuit_broken": false (v1.5, always present);
+  // run block: + "partial_delivery": true (v1.6, present ONLY on a breaker-trip delivery,
+  //            always alongside circuit_broken=true);
+  // counts: + "unprocessed" (v1.6, present ONLY on a breaker-trip run — the balancing residual,
+  //         see the invariant note below);
 // pairwise quality additionally carries "per_criterion_tie_rate" (v1.5, judged comparisons only)
   "schema_engine": {"resolved_at": {"l0_or_clean": 0, "l1": 0, "l3_1": 0, "l3_2": 0,
                                     "rejected": 0}},
@@ -1556,7 +1658,13 @@ schema_violation). `rejects="none"`: no file.
   //                                                 "survived_dedup": 0}}} (generate enabled)
   "trace": {"enabled": true, "path": "...", "events": 0, "dropped_events": 0},
   "llm_usage": {"<profile>": {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
-                              "est_cost_usd": 0.0, "retries": 0}, ...},
+                              "est_cost_usd": 0.0, "retries": 0
+                              /* v1.6: + "keys": {"<api_key_env name>": {"calls": 0,
+                                            "rate_limited": 0, "disabled": false}}
+                                 (pools >1 only; ONE entry per pool member — unused
+                                 keys appear zeroed); + "parked_calls": 0, "parked_ms": 0
+                                 (pools >1, or whenever nonzero — single-key parking
+                                 must leave report evidence) */}, ...},
   "timing": {"wall_s": 0, "per_stage_s": {"dedup": 0, "quality": 0, "annotate": 0,
                                           "verify": 0 /* enabled stages only */}}
 }
@@ -1565,6 +1673,11 @@ schema_violation). `rejects="none"`: no file.
 **Counts invariant (test-asserted):**
 `emitted + dropped_dup + dropped_lowq + dropped_verify + failed + bad_input = scanned + generated`.
 generate_only degenerates to `emitted + dropped_* + failed = generated` (scanned = bad_input = 0).
+Breaker-trip runs (v1.6 partial delivery) extend it with `+ unprocessed` on the left side;
+`counts.unprocessed` is computed by M10 at finalize as the balancing residual — records scanned
+or generated that reached no terminal count (emitted/dropped_*/failed/bad_input) when the run
+tripped, which includes generated-but-never-batched records in generate_only — it is NOT a
+MetricsSink counter and appears only on tripped runs.
 `schema_engine.resolved_at` counts ONLY user-schema annotate calls; its sum = records entering M5.
 `est_cost_usd` present only for profiles with both prices configured. Histogram bucket labels are
 exactly `"0.0-0.1"` … `"0.9-1.0"` (upper bound inclusive on the last) **[FROZEN HERE]**. The
@@ -1597,9 +1710,13 @@ records on re-flow).
 
 Main output (and sidecar) is appended to `<name>.part` with per-batch flush; finalize = fsync +
 `os.rename` to the target name. At any instant the directory holds either the `.part` or the
-final file, never a half-written final file. Consumers treat the appearance of the final name as
-the completion signal. Exit-4 (circuit break) and unhandled crashes leave `.part`; graceful
-SIGINT finalize renames.
+final file, never a half-written final file — every delivered line is complete and valid.
+v1.6: a circuit-break finalize ALSO renames (partial delivery of completed batches, spec 3.10.3
+熔断交付), so the final name appearing no longer implies the whole input was processed —
+consumers judge run completeness by `report.run`: `interrupted=false` AND `circuit_broken=false`
+(the exit code alone is insufficient — a graceful-SIGINT run delivers and exits 0), with
+`counts.unprocessed` quantifying the breaker-trip gap. Unwritable output
+(exit 4 at open) and unhandled crashes leave `.part`; graceful SIGINT finalize renames.
 
 ---
 
@@ -1790,7 +1907,8 @@ All four are **[FROZEN HERE]** (spec fixes the shapes, not the exact schema JSON
 4. **Determinism.** All sampling RNGs derive from `run.seed` exactly as §5; temperature default
    0.0; generate pre-draws its (llm, style, seeds) plan in call-index order before dispatch;
    top_ratio ties broken by record id ascending; same input + same seed ⇒ byte-identical pairing
-   plan and selection decisions. Retry jitter is exempt (timing only).
+   plan and selection decisions. Retry jitter and key-pool selection are exempt (timing only;
+   key selection is deterministic least-in-flight and never changes what data is produced, v1.6).
 5. **No data persistence**: no temp files beyond the declared output channels (`.part` files are
    part of output delivery); no caches, checkpoints, or cross-run state; only DedupIndex,
    MetricsSink counters and M9 usage survive across batches, all content-free.
@@ -1856,7 +1974,9 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     payload shape for UI; sidecar lines wrapped as `{"_meta": {...}}`; compact
     `ensure_ascii=False` JSON everywhere in outputs.
 15. Finalize semantics: SIGINT → rename + `interrupted=true`; circuit break (exit 4) → report
-    written, `.part` NOT renamed.
+    written and — v1.6 revision (stakeholder decision, spec 1.6 ②) — `.part` IS renamed:
+    completed batches are delivered with `run.partial_delivery=true` + `counts.unprocessed`
+    (pre-v1.6 rule was ".part NOT renamed").
 16. `_meta.run.rubric` = configured selector string (inline → rubric name); disabled stages →
     `null` in `_meta`; histogram bucket labels `"0.0-0.1"`…`"0.9-1.0"`; report `quality.mode`
     uses the `pairwise_bt`/`pointwise` strings; MetricsSink counter-key vocabulary.
@@ -1895,5 +2015,23 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     bucketing is unsound for Hamming ≤ 8 (two hashes within distance 8 can differ
     inside the prefix), and the same spec row declares linear-scan latency acceptable
     at the ≤ 500k scale target. Correctness wins over the suggested optimization.
+25. v1.6 key pool (spec 3.9.3, decisions spec 1.6 2026-07-03): `api_key_envs`/`api_keys`
+    are normalized tuples (scalar form → 1-tuple; `api_key_env`/`api_key` mirror element 0);
+    per-attempt least-in-flight key selection, declaration-order tie-break (deterministic,
+    seed-exempt); per-key 429 cooldown (Retry-After in full, else jittered exponential capped
+    at 300 s); auth failure disables the key and is absorbed silently by rotation (no retry
+    consumed, nothing fed to the breaker) unless it is the LAST live key — then hard-trip,
+    preserving v1.5 P2-3 semantics for pools of 1; quota-as-403 treated as auth (no body
+    sniffing); parking bounded by `run.max_park_s`, overrun → retry-exhaustion path (P1-1
+    preserved); `probe_all()` additive beside the frozen `probe()`; `ProbeResult.key_env`,
+    `KeyUsage`, `ProfileUsage.keys/parked_calls/parked_ms`, exception `key_env` fields all
+    additive; per-key observability (events, report) carries env-var NAMES only, never values.
+26. v1.6 breaker-trip delivery (spec 3.10.3/3.11.2, decision spec 1.6 ②): `Emitter.finalize`
+    delivers on circuit break (`deliver=True`); `deliver=False` remains dry-run-only;
+    `run.partial_delivery` present only when true; `counts.unprocessed` = balancing residual
+    computed by M10 at finalize, only on tripped runs; the consumer signal for "run processed
+    all input" moves from "final filename exists" to "report.run.interrupted=false AND
+    circuit_broken=false" (exit code alone is insufficient: graceful SIGINT delivers and
+    exits 0).
 
 — End of contract. —

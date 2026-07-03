@@ -68,9 +68,11 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
   "run": {"tool_version": "1.0.0", "started_at": "...", "finished_at": "...",
            "interrupted": false, "circuit_broken": false, "exit_code": 0,   // circuit_broken：v1.5 只增 "modality": "ui", "seed": 42,
            "config_digest": "sha256:...", "project_digest": "sha256:..."},   // 配置指纹（脱敏后）
+  // run 节 v1.6 只增："partial_delivery": true —— 仅熔断交付（3.10.3）时出现，恒伴随 circuit_broken=true
   "counts": {"scanned": 5000, "ingested": 4987, "bad_input": 13,
               "dropped_dup": 412, "dropped_lowq": 305, "dropped_verify": 41,
               "failed": 9, "generated": 0, "emitted": 4220},
+  // counts v1.6 只增：熔断中止时增列 "unprocessed"（已入流水线但因中止未走完的记录数，见本节尾注不变量扩展）
   "dedup": {"exact": 118, "near_text": 201, "near_image": 46, "near_both": 47,
              "clusters": 366, "image_decode_failures": 2},   // v1.2：dedup.semantic 开启时另含 near_semantic 与 embedding_failures
   "quality": {"mode": "pairwise_bt", "rounds": 4, "judgment_failures": 17,
@@ -86,9 +88,12 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
   "llm_usage": {"default": {"calls": 31240, "prompt_tokens": 8.1e7,
                  "completion_tokens": 3.2e6, "est_cost_usd": 54.3, "retries": 210},
                 "judge": {"...": 0}},
+  // llm_usage v1.6 只增：profile 对象另含
+  //   "keys": {"<api_key_env 名>": {"calls", "rate_limited", "disabled"}}（仅密钥池 >1 时出现；池内每把密钥各一项，未用到的密钥为零计数；密钥以环境变量名标识，1.6 对齐决策 ⑤）
+  //   与 "parked_calls" / "parked_ms"（驻留统计，3.9.3 密钥池行；池 >1 或数值非零时出现——单密钥驻留亦须留痕）
   "timing": {"wall_s": 5400, "per_stage_s": {"dedup": 40, "quality": 2900,
               "annotate": 1800, "verify": 620}}
 }
 ```
 
-不变量：`emitted + dropped_* + failed + bad_input = scanned + generated`。`schema_engine.resolved_at` 仅统计用户 Schema 的标注调用，加总 = 进入 M5 的记录数（4141+87+30+3+9 = 4270 = ingested 4987 − dropped_dup 412 − dropped_lowq 305）；裁决/评审/生成等内部 Schema 解析不计入。报告中无任何数据内容字段。
+不变量：`emitted + dropped_* + failed + bad_input = scanned + generated`。熔断中止（v1.6 熔断交付，3.10.3）时扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`——`unprocessed` 仅此时出现，= 已扫描/已生成但因中止未走完流水线的记录数（M10 在 finalize 时按差额计算）。`schema_engine.resolved_at` 仅统计用户 Schema 的标注调用，加总 = 进入 M5 的记录数（4141+87+30+3+9 = 4270 = ingested 4987 − dropped_dup 412 − dropped_lowq 305）；裁决/评审/生成等内部 Schema 解析不计入。报告中无任何数据内容字段。

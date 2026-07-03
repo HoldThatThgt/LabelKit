@@ -9,7 +9,7 @@
 
 | 方向 | 内容 |
 |---|---|
-| 输入 | config.toml 路径、project.toml 路径、CLI 参数字典（input/output/limit/strict/log_level/dry_run）、进程环境（仅读取 profile 声明的 `api_key_env` 变量）。 |
+| 输入 | config.toml 路径、project.toml 路径、CLI 参数字典（input/output/limit/strict/log_level/dry_run）、进程环境（仅读取 profile 声明的 `api_key_env` / `api_key_envs`（v1.6）所列变量）。 |
 | 输出 | `ResolvedConfig`（frozen dataclass 树：第 5 章两文件全部键的类型化镜像，另含 CLI 专属项 limit/strict/dry_run 与 log_level 覆盖），或抛出 `ConfigError`（附带全部而非首个校验错误，一次性反馈）。 |
 
 ### 3.1.3 API
@@ -27,10 +27,10 @@ def default_rubric(name: Literal["default:text", "default:ui"]) -> Rubric:
 | 类别 | 规则 |
 |---|---|
 | TOML 结构 | 两文件均须含 `schema_version = 1`；未知键报 warning（前向兼容）、缺失必填键报 error；类型逐字段核对（第 5 章字段表即校验依据）。 |
-| Profile 引用 | `quality.llm / annotate.llm / generate.llms（数组，逐元素校验）/ verify.llm / output.repair_llm`，以及 `quality.judges / verify.judges`（数组，非空时须为奇数个）引用的 profile 必须存在于 config.toml `[llm.*]`；启用视觉输入的阶段（UI 模态的 quality/annotate/verify）要求其 profile `supports_vision = true`。v1.2：`dedup.semantic = true` 时 `dedup.semantic_embedding` 必须存在于 config.toml `[embedding.*]` 且其 `api_key_env` 非空（5.1）。 |
+| Profile 引用 | `quality.llm / annotate.llm / generate.llms（数组，逐元素校验）/ verify.llm / output.repair_llm`，以及 `quality.judges / verify.judges`（数组，非空时须为奇数个）引用的 profile 必须存在于 config.toml `[llm.*]`；启用视觉输入的阶段（UI 模态的 quality/annotate/verify）要求其 profile `supports_vision = true`。v1.2：`dedup.semantic = true` 时 `dedup.semantic_embedding` 必须存在于 config.toml `[embedding.*]` 且其密钥配置通过本表「API Key」行校验（v1.6：`api_key_env` / `api_key_envs` 恰其一；5.1）。 |
 | 交叉字段约束（v1.2） | `quality.selection = "top_ratio"` 时 `quality.top_ratio` 必填且 ∈ (0,1]，且不得再设 `quality.threshold`（互斥，报 CONFIG_ERROR）；`annotate.self_consistency` 为 0 或 ≥3 的奇数；`generate.mixture = "weighted"` 时 `generate.weights` 必填、逐项为正且长度 = `generate.llms`；`[[generate.styles]]` 各项 name 表内唯一、prompt 非空（5.2 各行标注的 M1 校验在此汇总执行）。 |
 | 运行模式（v1.4） | `run.mode="generate_only"` 时：`run.input` 必须缺省、`run.modality` 必须 "text"、`generate.enabled` 必须 true；`generate.seed_examples`（非空字符串数组，逐项非空）与 `generate.standalone_count`（≥ 1）恰好提供其一（互斥，分别对应种子池 / 无种子形态）。process 模式下这两键均不得设置。 |
-| API Key | 每个被引用 profile 的 `api_key_env` 环境变量必须存在且非空。 |
+| API Key | 每个被引用 profile 的 `api_key_env` 环境变量必须存在且非空。v1.6 密钥池：`api_key_env` 与 `api_key_envs`（5.1）恰提供其一（两者皆有或皆无均报错）；`api_key_envs` 须为非空数组、逐项非空且互异；被引用 profile 的**每个**列出变量均须存在且非空（逐个缺失逐条聚合报错）。M1 归一化：标量形式解析为长度 1 的密钥池，运行时只有一条代码路径（3.9.3 密钥池行）。 |
 | 用户 Schema | 必须是合法 JSON 且通过 JSON Schema draft 2020-12 元 Schema 校验（jsonschema 库 `Draft202012Validator.check_schema`）；顶层 type 必须为 object；顶层不得声明保留键 `_meta`。 |
 | Rubric | criteria 非空、key 唯一且为 `[a-z0-9_]+`、weight > 0；pointwise 模式要求每条 criterion 提供 `pointwise_levels`（恰好 6 级，0–5）。 |
 | 阶段组合 | 2.3.1 节的四条组合约束（①–④；④ 与本表「运行模式」行联动）。 |

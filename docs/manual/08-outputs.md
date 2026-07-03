@@ -14,7 +14,9 @@
 | `labels.report.json` | 恒有 | 运行报告：纯统计，无数据内容 |
 | `labels.trace.jsonl` | `trace.enabled = true` | 事件流（第 16 章专讲） |
 
-主输出的交付是**原子**的：运行中写 `labels.jsonl.part`，全部完成后 fsync + 改名。运行结束后仍看到 `.part` 文件，说明那次运行没走到交付——熔断（报告 `exit_code: 4`）或进程崩溃留下的残骸。注意：Ctrl-C 的**优雅中断**会正常收尾交付（`.part` 被改名、报告标记 `interrupted: true`），不留残骸。
+主输出的交付是**原子**的：运行中写 `labels.jsonl.part`，全部完成后 fsync + 改名。运行结束后仍看到 `.part` 文件，说明那次运行没走到交付——进程硬崩溃或输出路径不可写留下的残骸。注意：Ctrl-C 的**优雅中断**会正常收尾交付（`.part` 被改名、报告标记 `interrupted: true`），不留残骸；v1.6 起**熔断中止也交付**——已完成批的 `.part` 同样 fsync + 原子改名，退出码仍是 4（此前版本熔断直接丢弃 `.part`，长跑末段一次配额死亡就赔掉全部已完成产出）。
+
+> **消费方判定规则变了（v1.6）**：最终文件名出现，仍然保证**已交付的每一行完整且合法**——永远读不到半截行；但它**不再等价于「全部输入处理完毕」**。判定一次运行是否完整，唯一可靠的信号是报告里的 `run.interrupted = false` **且** `run.circuit_broken = false`。退出码不充分：优雅中断的运行同样交付且以 0 退出，熔断交付则以 4 退出但文件照样出现。熔断交付的主输出是「已完成批的完整前缀」，缺了多少可拿 `counts.unprocessed` 对账（见 8.4 节）。下游若有自动消费流水线，把这条判定写进去。
 
 ## 8.2 主输出与 `_meta`：每行的完整履历
 
@@ -163,6 +165,12 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
 3. **最后看 `llm_usage` 和 `timing`**——哪个阶段最烧钱/最耗时（几乎总是 quality），是否要换模式、调并发（第 17 章）。
 
 另有两个按需出现的块：`annotate.sc_disagreements`（开 self-consistency 时：全体分歧、回退首样本的次数）与 `generate.buckets`（开生成时：每个「模型×风格」桶的调用数 / 产出数 / 去重存活数，配置 `sample_validator` 时另有回调剔除数 `rejected_by_validator`——某桶存活率明显低说明它在产重复货或不合规货，第 12 章）。
+
+v1.6 增补了三处按需出现的字段（不出现时语义同旧版，已有的报告解析脚本不受影响）：
+
+- **`run.partial_delivery`**：仅熔断交付时出现且恒为 `true`（恒伴随 `circuit_broken: true`）——标记这份主输出是**部分交付**，消费方完整性判定见 8.1 节的警告框；
+- **`counts.unprocessed`**：仅熔断中止时增列——已扫描/已生成但因中止没走完流水线的记录数。守恒等式相应扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`（第 4 章的原式是它在 `unprocessed = 0` 时的特例）；
+- **`llm_usage` 的密钥池明细**（profile 用第 6 章的 `api_key_envs` 配了多把密钥时）：profile 对象增 `"keys": {"<环境变量名>": {"calls", "rate_limited", "disabled"}}`，按密钥拆分调用数、被限流（429）次数与是否被认证禁用——密钥一律以**环境变量名**标识，密钥值不会出现在任何日志或报告里；另有 `parked_calls` / `parked_ms`（池 >1 或数值非零时出现——单密钥驻留也留痕）：因「全部存活密钥都在限流冷却」而**驻留**等待的逻辑调用数与累计毫秒数。`disabled` 非零该换密钥，`parked_ms` 持续走高说明并发压过了密钥池的配额承受力——该加密钥或降 `max_concurrency`（驻留上限 `run.max_park_s` 见第 7 章；对应的 `llm.key_cooldown` / `llm.key_disabled` / `llm.pool_parked` 事件见第 16 章）。
 
 > **报告写失败怎么办**：主输出成功、报告写失败时，进程以退出码 1 结束——产物可用但账本缺失，别当成功处理。
 

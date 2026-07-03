@@ -14,8 +14,9 @@
 | `llm.*.provider` | str | 必填 | "openai_compatible" \| "anthropic" | 6 |
 | `llm.*.base_url` | str | 必填 | API 根地址（不带 /chat/completions） | 6 |
 | `llm.*.model` | str | 必填 | 模型名，原样透传 | 6 |
-| `llm.*.api_key_env` | str | 必填 | 密钥的**环境变量名**（被引用才检查存在性） | 2/6 |
-| `llm.*.max_concurrency` | int | 8 | 并发信号量（该档全部调用共享） | 6/17 |
+| `llm.*.api_key_env` | str | 必填* | 密钥的**环境变量名**（被引用才检查存在性）；* v1.6 起与 `api_key_envs` **恰设其一** | 2/6 |
+| `llm.*.api_key_envs` | array | 不设 | v1.6 密钥池：环境变量名数组，与 `api_key_env` **互斥（恰设其一）**；池内共享该档其余字段（同 base_url、同 model），被引用时**每个**变量都须存在非空 | 6/17 |
+| `llm.*.max_concurrency` | int | 8 | 并发信号量（该档全部调用共享；**密钥池仍是全池总在途上限**） | 6/17 |
 | `llm.*.timeout_s` | int | 120 | 单请求超时；超时可重试 | 6 |
 | `llm.*.max_retries` | int | 5 | 可重试错误（网络/408/409/429/5xx）上限 | 6 |
 | `llm.*.retry_base_delay_s` | float | 1.0 | 全抖动退避基数：random(0, 基数×2^i)，封顶 60s | 6 |
@@ -28,6 +29,7 @@
 | `embedding.<name>` | table | 可选 | 语义去重向量档 | 6/9 |
 | `embedding.*.provider` | str | "openai_compatible" | **唯一取值**；POST {base_url}/embeddings | 6 |
 | `embedding.*.base_url/model/api_key_env` | str | 必填 | 同 LLM 档 | 6 |
+| `embedding.*.api_key_envs` | array | 不设 | v1.6 密钥池，机制同 `llm.*.api_key_envs`（与 `api_key_env` 恰设其一） | 6/17 |
 | `embedding.*.max_concurrency/timeout_s/max_retries/retry_base_delay_s` | — | 8/60/5/1.0 | 同一套重试限流机制 | 6 |
 | `embedding.*.dims` | int | 不设 | 设了则校验返回维度，不符判致命 | 6 |
 
@@ -43,6 +45,7 @@
 | `run.batch_size` | 256 | 批大小 = **pairwise 比较池大小（质量口径参数）** | 7/10 |
 | `run.seed` | 0 | 全部随机行为的种子；同 seed 可复现 | 7 |
 | `run.fatal_error_threshold` | 20 | 熔断：**连续**致命 API 错误数达标 ⇒ 退出码 4（401/403 认证类首错即熔断，不计连续数；重试耗尽也计窗） | 7/17 |
+| `run.max_park_s` | 3600 | v1.6 驻留上限：所引档**全部存活密钥均在冷却**时，单次逻辑调用累计等待秒数上限，超限按重试耗尽处理（记录 failed、计入熔断窗）；**0=不驻留，单密钥档下任何 429 都立即失败**，仅建议多密钥池设 0 | 7/17 |
 | `input.text_field` | "text" | 正文字段点路径；**写错=全员坏行** | 5 |
 | `input.on_bad_line` | "skip" | \| "fail"（退出码 3） | 5 |
 | `input.on_missing_pair` | "skip" | UI 缺对策略 | 5 |
