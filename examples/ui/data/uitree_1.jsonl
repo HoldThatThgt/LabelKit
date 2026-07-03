@@ -1,0 +1,8 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.demo"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "登录", "bounds": [24, 20, 120, 48], "visible": true, "package": "com.example.demo"}
+{"id": "2", "parent": "0", "class": "EditText", "text": "", "bounds": [32, 160, 368, 216], "visible": true, "package": "com.example.demo", "content_desc": "手机号输入框"}
+{"id": "3", "parent": "0", "class": "EditText", "text": "", "bounds": [32, 240, 368, 296], "visible": true, "package": "com.example.demo", "content_desc": "验证码输入框"}
+{"id": "4", "parent": "0", "class": "Button", "text": "获取验证码", "bounds": [240, 248, 360, 288], "visible": true, "package": "com.example.demo"}
+{"id": "5", "parent": "0", "class": "Button", "text": "登录", "bounds": [32, 340, 368, 396], "visible": true, "package": "com.example.demo"}
+{"id": "6", "parent": "0", "class": "CheckBox", "text": "", "bounds": [32, 420, 50, 438], "visible": true, "package": "com.example.demo", "content_desc": "同意用户协议"}
+{"id": "7", "parent": "0", "class": "TextView", "text": "我已阅读并同意《用户协议》", "bounds": [60, 420, 340, 440], "visible": true, "package": "com.example.demo"}

@@ -1,0 +1,55 @@
+# Text-modality E2E project (spec §5.2): dedup → pointwise quality → annotate.
+schema_version = 1
+
+[run]
+input = "./data/input.jsonl"
+output = "./out/text-labels.jsonl"
+modality = "text"
+batch_size = 16
+seed = 42
+
+[input]
+text_field = "instruction"
+
+[dedup]
+enabled = true
+
+[quality]
+enabled = true
+mode = "pointwise"
+llm = "default"
+threshold = 0.25
+rubric = "default:text"
+
+[annotate]
+enabled = true
+llm = "default"
+instruction = """
+你是输入法用户请求的标注员。根据用户输入的一句话请求，标注其意图类别
+（writing_assist 写作协助 / qa 问答 / translation 翻译 / chitchat 闲聊 / other 其他）、
+主题（简短名词短语）与完成该请求的难度（easy / medium / hard）。
+"""
+
+[trace]
+enabled = true
+channels = ["quality", "schema"]
+content = "refs"
+
+[output]
+meta_mode = "inline"
+rejects = "refs"
+passthrough_fields = ["source"]
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "intent": {"type": "string",
+      "enum": ["writing_assist", "qa", "translation", "chitchat", "other"]},
+    "topic": {"type": "string"},
+    "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]}
+  },
+  "required": ["intent", "topic", "difficulty"],
+  "additionalProperties": false
+}
+"""

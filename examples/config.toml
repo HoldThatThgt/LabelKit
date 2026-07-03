@@ -1,0 +1,32 @@
+# Tool-level static config (spec §5.1) — z.ai Anthropic-compatible endpoint, glm-5.2 only.
+schema_version = 1
+
+[tool]
+log_level = "info"
+log_format = "text"
+
+[llm.default]
+provider = "anthropic"
+base_url = "https://api.z.ai/api/anthropic"
+model = "glm-5.2"
+api_key_env = "LABELKIT_ZAI_KEY"
+max_concurrency = 4
+timeout_s = 120
+max_retries = 5
+supports_structured_output = true
+supports_vision = true
+max_output_tokens = 4096
+temperature = 0.0
+
+[llm.judge]
+provider = "anthropic"
+base_url = "https://api.z.ai/api/anthropic"
+model = "glm-5.2"
+api_key_env = "LABELKIT_ZAI_KEY"
+max_concurrency = 4
+timeout_s = 120
+max_retries = 5
+supports_structured_output = true
+supports_vision = true
+max_output_tokens = 2048
+temperature = 0.0

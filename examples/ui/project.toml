@@ -1,0 +1,63 @@
+# UI-modality E2E project (spec §5.2): pairing → dedup (pHash+tree) → pairwise quality → annotate → verify.
+schema_version = 1
+
+[run]
+input = "./data"
+output = "./out/ui-labels.jsonl"
+modality = "ui"
+batch_size = 8
+seed = 42
+
+[dedup]
+enabled = true
+ui_dup_requires = "both"
+
+[quality]
+enabled = true
+mode = "pairwise"
+rounds = 2
+llm = "default"
+rubric = "default:ui"
+
+[annotate]
+enabled = true
+llm = "default"
+instruction = """
+你是移动端 UI 理解标注员。根据屏幕截图与 UI 控件树，
+标注该屏幕的功能类别、页面标题、可交互元素列表与一句话页面描述。
+"""
+
+[verify]
+enabled = true
+llm = "judge"
+policy = "repair"
+max_repair_rounds = 1
+
+[trace]
+enabled = true
+channels = ["quality", "verify", "schema"]
+content = "refs"
+
+[output]
+meta_mode = "inline"
+rejects = "refs"
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "screen_category": {"type": "string",
+      "enum": ["login", "home", "list", "detail", "form", "settings", "dialog", "other"]},
+    "page_title": {"type": "string"},
+    "interactive_elements": {"type": "array", "items": {
+      "type": "object",
+      "properties": {"role": {"type": "string"}, "label": {"type": "string"},
+                     "bounds": {"type": "array", "items": {"type": "integer"},
+                                "minItems": 4, "maxItems": 4}},
+      "required": ["role", "label", "bounds"], "additionalProperties": false}},
+    "description": {"type": "string", "maxLength": 200}
+  },
+  "required": ["screen_category", "page_title", "interactive_elements", "description"],
+  "additionalProperties": false
+}
+"""

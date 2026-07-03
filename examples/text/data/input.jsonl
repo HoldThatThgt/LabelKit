@@ -1,0 +1,14 @@
+{"instruction": "帮我写一条请假条，明天上午要去医院复查，下午回来上班", "source": "ime-log", "ts": "2026-06-30T10:12:00Z"}
+{"instruction": "把这句话翻译成英文：项目进度符合预期，本周五前可以交付第一版", "source": "ime-log", "ts": "2026-06-30T10:13:41Z"}
+{"instruction": "写一份周报模板，包含本周工作、下周计划、风险与求助三个部分", "source": "app-feedback", "ts": "2026-06-30T10:15:21Z"}
+{"instruction": "光合作用的暗反应发生在叶绿体的哪个部位？请简要说明卡尔文循环的三个阶段", "source": "ime-log", "ts": "2026-06-30T10:18:02Z"}
+{"instruction": "哈哈哈哈哈哈哈", "source": "ime-log", "ts": "2026-06-30T10:19:15Z"}
+{"instruction": "帮我写一条请假条，明天上午要去医院复查，下午回来上班", "source": "ime-log", "ts": "2026-06-30T10:21:44Z"}
+{"instruction": "帮我写一条请假条，明天上午要去医院做复查，下午回来上班。", "source": "ime-log", "ts": "2026-06-30T10:22:10Z"}
+{"instruction": "解释一下二分查找为什么时间复杂度是 O(log n)，最好举一个 8 个元素的例子", "source": "app-feedback", "ts": "2026-06-30T10:25:33Z"}
+{"instruction": "在吗", "source": "ime-log", "ts": "2026-06-30T10:26:01Z"}
+{"instruction": "用鲁迅的口吻写一段 100 字左右的文字，讽刺开会太多耽误干活的现象", "source": "ime-log", "ts": "2026-06-30T10:28:47Z"}
+{"instruction": "把『山重水复疑无路，柳暗花明又一村』翻译成英文，保留意境", "source": "ime-log", "ts": "2026-06-30T10:30:12Z"}
+{"instruction": "帮我算一下如果每月定投 3000 元、年化收益 6%，坚持 10 年最后大概有多少钱，列出计算过程", "source": "app-feedback", "ts": "2026-06-30T10:32:55Z"}
+{"instruction": "随便聊聊，今天心情不太好", "source": "ime-log", "ts": "2026-06-30T10:34:20Z"}
+{"instruction": "写一个 Python 函数，输入一个整数列表，返回其中所有质数的和，要求有类型注解和 docstring", "source": "app-feedback", "ts": "2026-06-30T10:36:08Z"}

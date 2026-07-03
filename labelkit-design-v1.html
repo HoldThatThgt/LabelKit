@@ -1,0 +1,2404 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>LabelKit 采集数据自动标注工具 — 产品设计说明书 v1.4</title>
+<style>
+  @page { size: A4; margin: 18mm 16mm; }
+  * { box-sizing: border-box; }
+  html { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  body {
+    font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", sans-serif;
+    font-size: 10.5pt; line-height: 1.7; color: #1a1a1a; margin: 0;
+  }
+  h1 { font-size: 17pt; border-bottom: 3px solid #2456a6; padding-bottom: 6px; margin-top: 0; page-break-before: always; }
+  h1.no-break { page-break-before: avoid; }
+  h2 { font-size: 13.5pt; color: #2456a6; margin-top: 28px; border-bottom: 1px solid #c9d6ea; padding-bottom: 3px; }
+  h3 { font-size: 11.5pt; margin-top: 20px; color: #163a75; }
+  h4 { font-size: 10.5pt; margin-top: 16px; color: #333; }
+  p { margin: 8px 0; text-align: justify; }
+  table { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 9pt; page-break-inside: auto; }
+  th, td { border: 1px solid #b9c6d8; padding: 4px 7px; vertical-align: top; text-align: left; }
+  th { background: #e8eef7; font-weight: 600; }
+  tr { page-break-inside: avoid; }
+  code { font-family: "Menlo", "SF Mono", monospace; font-size: 8.5pt; background: #f0f3f8; padding: 1px 4px; border-radius: 3px; }
+  pre { font-family: "Menlo", "SF Mono", monospace; font-size: 8.2pt; background: #f6f8fa; border: 1px solid #dbe2ea;
+        border-radius: 4px; padding: 10px 12px; overflow-x: hidden; white-space: pre-wrap; word-break: break-all;
+        line-height: 1.5; page-break-inside: avoid; }
+  pre code { background: none; padding: 0; }
+  figure { margin: 14px 0; text-align: center; page-break-inside: avoid; }
+  figure svg { max-width: 100%; height: auto; }
+  figcaption { font-size: 9pt; color: #555; margin-top: 6px; }
+  .backing { border-left: 4px solid #2e8b57; background: #f0f8f2; padding: 8px 12px; margin: 10px 0;
+             font-size: 9.5pt; page-break-inside: avoid; }
+  .backing b { color: #1f6b40; }
+  .note { border-left: 4px solid #c9861a; background: #fdf6e9; padding: 8px 12px; margin: 10px 0; font-size: 9.5pt; page-break-inside: avoid; }
+  .boundary { border-left: 4px solid #7a4fb5; background: #f6f1fb; padding: 8px 12px; margin: 10px 0; font-size: 9.5pt; page-break-inside: avoid; }
+  .cover { height: 250mm; display: flex; flex-direction: column; justify-content: center; text-align: center; }
+  .cover h1 { border: none; font-size: 26pt; page-break-before: avoid; }
+  .cover .sub { font-size: 14pt; color: #444; margin-top: 8px; }
+  .cover .meta-table { width: 60%; margin: 40px auto 0; font-size: 10pt; }
+  .toc { font-size: 10pt; }
+  .toc a { text-decoration: none; color: #1a1a1a; }
+  .toc ul { list-style: none; padding-left: 18px; line-height: 2; }
+  .toc > ul { padding-left: 0; }
+  .toc .l1 { font-weight: 600; }
+  .small { font-size: 9pt; color: #555; }
+  .ref-list { font-size: 9pt; line-height: 1.8; }
+  .ref-list li { margin-bottom: 4px; }
+  .kv td:first-child { width: 28%; font-weight: 600; background: #f4f7fb; }
+  .cfg th:nth-child(1) { width: 22%; } .cfg th:nth-child(2) { width: 12%; } .cfg th:nth-child(3) { width: 14%; }
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════ 封面 ═══════════════════ -->
+<div class="cover">
+  <h1 class="no-break">LabelKit<br>采集数据自动标注工具</h1>
+  <div class="sub">产品设计说明书（Product Design Specification）</div>
+  <table class="meta-table kv">
+    <tr><td>文档版本</td><td>v1.4</td></tr>
+    <tr><td>日期</td><td>2026-07-02</td></tr>
+    <tr><td>状态</td><td>评审修订稿</td></tr>
+    <tr><td>目标读者</td><td>开发工程师、算法工程师、测试工程师</td></tr>
+    <tr><td>文档定位</td><td>实现级设计规格 —— 开发者依据本文档即可完成实现，无需自行补全任何设计决策</td></tr>
+  </table>
+  <table class="meta-table" style="width:76%; margin-top:24px; font-size:9pt;">
+    <tr><th style="width:12%">版本</th><th style="width:20%">日期</th><th>修订内容</th></tr>
+    <tr><td>v1.0</td><td>2026-07-02</td><td>初版（评审稿）</td></tr>
+    <tr><td>v1.1</td><td>2026-07-02</td><td>按评审意见修订：① 各模块新增报文级输入/输出示例（3.1.6–3.11.3）并补全打分归一化公式等细节；② 新增日志系统设计——M12 日志模块（3.12）、第 7 章重写为「日志系统与可观测性」、trace 追踪日志与 rubric 优化闭环（7.5）、<code>[trace]</code> 配置（5.2）</td></tr>
+    <tr><td>v1.2</td><td>2026-07-02</td><td>按第二轮评审意见修订：① 新增「算子对输出集的影响分析」（2.3.2）；② 质量打分新增批内定量优选 <code>quality.selection = "top_ratio"</code>（3.4.3），全局精确定量与生成补齐回路列入演进路线（8.3 O6）；③ 生成算子支持多 LLM 混合与风格模板（3.6.2）；④ 算子级算法增强：多评审团投票、双顺序裁决、self-consistency 标注、SemDeDup 语义去重可选级（8.4 演进路线总表）</td></tr>
+    <tr><td>v1.3</td><td>2026-07-02</td><td>按第三轮评审意见修订：标注与生成拆分为两个独立模块——生成独立为 <b>M6 generate</b>（3.6，配置键 / Stage 类 / API 零变更），原 M6–M11 按流水线位置全量重编号为 M7–M12（全部交叉引用、图 2-1/2-2、目录同步更新）</td></tr>
+    <tr><td>v1.4</td><td>2026-07-02</td><td>新增<b>纯生成模式</b>（<code>run.mode = "generate_only"</code>）：无输入数据从零合成——配置种子池（Self-Instruct 形态）或无种子条件化（Persona Hub / Cosmopedia 形态）两种形态，单遍执行，产出照常走治理/标注管线（3.6.2、3.10.3、2.3.1 ④）；合成样本统一标记修正为 <code>generator ≠ null</code></td></tr>
+  </table>
+</div>
+
+<!-- ═══════════════════ 目录 ═══════════════════ -->
+<h1>目录</h1>
+<div class="toc">
+<ul>
+  <li class="l1"><a href="#s1">1. 概述</a>
+    <ul>
+      <li><a href="#s1-1">1.1 背景与目标</a></li>
+      <li><a href="#s1-2">1.2 术语与缩写</a></li>
+      <li><a href="#s1-3">1.3 设计原则</a></li>
+      <li><a href="#s1-4">1.4 需求映射表</a></li>
+      <li><a href="#s1-5">1.5 算法与工程背书总表</a></li>
+      <li><a href="#s1-6">1.6 已对齐的设计决策</a></li>
+    </ul>
+  </li>
+  <li class="l1"><a href="#s2">2. 总体设计</a>
+    <ul>
+      <li><a href="#s2-1">2.1 系统定位与总体规格</a></li>
+      <li><a href="#s2-2">2.2 总体架构与模块清单</a></li>
+      <li><a href="#s2-3">2.3 端到端数据流与阶段开关</a></li>
+      <li><a href="#s2-4">2.4 CLI 规格</a></li>
+      <li><a href="#s2-5">2.5 配置体系总览</a></li>
+      <li><a href="#s2-6">2.6 非功能约束</a></li>
+    </ul>
+  </li>
+  <li class="l1"><a href="#s3">3. 模块详细设计</a>
+    <ul>
+      <li><a href="#m1">3.1 M1 配置管理 config</a></li>
+      <li><a href="#m2">3.2 M2 数据接入 ingest</a></li>
+      <li><a href="#m3">3.3 M3 去重 dedup</a></li>
+      <li><a href="#m4">3.4 M4 质量打分 quality（QuRating）</a></li>
+      <li><a href="#m5">3.5 M5 标注 annotate</a></li>
+      <li><a href="#m6">3.6 M6 生成 generate</a></li>
+      <li><a href="#m7">3.7 M7 二次校验 verify</a></li>
+      <li><a href="#m8">3.8 M8 结构引擎 schema-engine</a></li>
+      <li><a href="#m9">3.9 M9 LLM 客户端 llm-client</a></li>
+      <li><a href="#m10">3.10 M10 编排器 orchestrator</a></li>
+      <li><a href="#m11">3.11 M11 输出器 emitter</a></li>
+      <li><a href="#m12">3.12 M12 日志 logging</a></li>
+    </ul>
+  </li>
+  <li class="l1"><a href="#s4">4. 核心数据结构与内部 API</a></li>
+  <li class="l1"><a href="#s5">5. 配置文件完整规格</a></li>
+  <li class="l1"><a href="#s6">6. 输入 / 输出格式规格</a></li>
+  <li class="l1"><a href="#s7">7. 日志系统与可观测性</a></li>
+  <li class="l1"><a href="#s8">8. 非目标、设计假设与演进路线</a></li>
+  <li class="l1"><a href="#s9">9. 参考文献</a></li>
+  <li class="l1"><a href="#sA">附录 A. 系统默认 Rubric 全文</a></li>
+</ul>
+</div>
+
+<!-- ═══════════════════ 1. 概述 ═══════════════════ -->
+<h1 id="s1">1. 概述</h1>
+
+<h2 id="s1-1">1.1 背景与目标</h2>
+<p>数据采集系统持续产出两类原始数据：<b>纯文本数据</b>（对话、指令、文档等）与<b>设备屏幕数据</b>（屏幕截图 + UI 控件树文件对）。这些数据在进入下游（模型训练、评测集构建、数据资产入库）之前，需要完成四类加工操作：<b>去重</b>、<b>质量打分</b>、<b>自动标注</b>、<b>（可选）数据生成与二次校验</b>。人工完成这些操作成本高、吞吐低、标准不一致。</p>
+<p><b>LabelKit</b> 是一个基于 LLM API 的<b>无状态批处理命令行工具</b>，目标是把上述加工操作固化为一条可配置的流水线：输入一批 JSONL 数据（或截图+UI树文件对），输出一批结构由用户定义、经代码规则引擎保证结构正确性的 JSONL 标注结果；v1.4 起另支持<b>纯生成模式</b>（<code>run.mode="generate_only"</code>）——无输入数据时从配置种子池或条件化提示从零合成数据集，产物照常经过全套治理与结构保证（3.6.2）。工具本身<b>不存储任何数据</b>：每一批数据的全部中间态只存在于进程内存中，运行结束即丢弃，落盘的只有显式声明的输出通道：用户输出文件、rejects 文件、不含数据内容的运行报告，以及显式启用时的 trace 追踪日志（2.6、7.1；<code>rejects="full"</code> 与 <code>trace.content="full"</code> 档含数据内容，属用户显式选择并自担保留与清理责任）。</p>
+<p>本文档是 LabelKit 的实现级设计规格，采用总分结构：第 2 章给出工具整体的规格、约束、架构与数据流；第 3 章逐模块给出职责、边界、输入输出、数据结构、API、算法流程与配置项；第 4–6 章给出跨模块的公共数据结构、配置文件与输入/输出格式的完整字段级定义；第 7 章定义日志系统与可观测性（含错误分类码规范，7.6）。所有功能点与算法均有顶会论文或工业级项目背书（见 1.5 节总表），不含凭空构思。</p>
+
+<h2 id="s1-2">1.2 术语与缩写</h2>
+<table>
+<tr><th style="width:22%">术语</th><th>定义</th></tr>
+<tr><td>记录（Record）</td><td>流水线处理的最小数据单元。文本模态下为输入 JSONL 的一行；UI 模态下为一个「UI 树文件 + 截图文件」对。</td></tr>
+<tr><td>批（Batch）</td><td>一次流水线调度处理的记录集合，大小由 <code>run.batch_size</code> 决定；也是 QuRating 成对比较的采样池。</td></tr>
+<tr><td>运行（Run）</td><td>一次 <code>labelkit run</code> 进程的完整生命周期，处理一个输入路径的全部记录。</td></tr>
+<tr><td>Rubric</td><td>质量评价准则集：若干条 criterion（准则），每条含 key、权重、描述、成对比较提示词与单点打分等级说明。</td></tr>
+<tr><td>QuRating</td><td>Wettig et al., ICML 2024 提出的数据质量评估算法：LLM 成对比较 + Bradley-Terry 模型拟合标量质量分 [1]。</td></tr>
+<tr><td>BT 模型</td><td>Bradley-Terry 配对比较概率模型 [2]：P(i 胜 j) = θ<sub>i</sub>/(θ<sub>i</sub>+θ<sub>j</sub>)。</td></tr>
+<tr><td>MinHash-LSH</td><td>基于最小哈希签名与局部敏感哈希的近似 Jaccard 相似检索，文本近似去重的方法学标准 [3]。</td></tr>
+<tr><td>pHash</td><td>感知哈希（perceptual hash），对图像内容生成 64-bit 指纹，汉明距离度量视觉相似度（工业标准，imagehash 库实现）。</td></tr>
+<tr><td>结构引擎</td><td>本工具中保证 LLM 输出符合用户 JSON Schema 的代码规则引擎（M8），含确定性修复与有界 LLM 修复环。</td></tr>
+<tr><td>Profile</td><td>config.toml 中定义的一套 LLM API 接入参数（provider/base_url/model/并发/重试等），以名字被各阶段引用。</td></tr>
+<tr><td>UI 树</td><td>设备屏幕的控件层级结构（accessibility tree / view hierarchy）导出文件，JSONL 格式，每行一个控件节点。</td></tr>
+<tr><td>纯生成模式</td><td><code>run.mode = "generate_only"</code>（v1.4）：无输入数据，M6 从配置种子池（<code>generate.seed_examples</code>）或无种子条件化提示从零产出样本，再走常规治理 / 标注管线（3.6.2、3.10.3）。默认模式为 <code>"process"</code>（加工既有数据）。</td></tr>
+</table>
+
+<h2 id="s1-3">1.3 设计原则</h2>
+<table>
+<tr><th style="width:18%">原则</th><th>含义</th><th style="width:30%">来源 / 背书</th></tr>
+<tr><td>无状态批处理</td><td>工具不持有跨运行状态，不落盘中间态；一次运行 = 读入 → 处理 → 写出 → 进程退出，内存即全部状态。</td><td>产品需求「工具不存储数据」；Unix 过滤器模型</td></tr>
+<tr><td>算子化流水线</td><td>每个处理阶段是签名统一、可独立开关的算子（Stage），编排器只做组合与调度，不含业务逻辑。</td><td>Data-Juicer 算子体系（SIGMOD 2024）[4]；distilabel Step/DAG [5]；Dolma toolkit [6]</td></tr>
+<tr><td>LLM 输出不可信</td><td>一切 LLM 输出必须经代码校验后才能进入下游：结构由 JSON Schema 校验，数值由解析器白名单校验。</td><td>结构化输出工业实践（OpenAI Structured Outputs、instructor 修复环）[7][8]</td></tr>
+<tr><td>配置即契约</td><td>工具级配置（config.toml）与工程级配置（project.toml）在启动时全量校验、快速失败；运行期不再出现配置错误。</td><td>十二要素应用配置原则的文件化变体（按需求不使用环境变量，API Key 除外）</td></tr>
+<tr><td>记录级隔离</td><td>单条记录的任何失败不影响其余记录：失败记录进入 rejects 通道并计入报告，运行继续。</td><td>Dolma / NeMo Curator 大规模管线的容错惯例 [6][9]</td></tr>
+<tr><td>可复现</td><td>相同输入 + 相同配置 + 固定 seed + temperature=0 时，除 LLM 服务端非确定性外，配对采样、去重判定、流程路径完全可复现。</td><td>QuRating 开源实现的实验可复现要求 [1]</td></tr>
+</table>
+
+<h2 id="s1-4">1.4 需求映射表</h2>
+<p>下表将原始需求逐条映射到本文档的承载章节，供评审时核对完整性。</p>
+<table>
+<tr><th style="width:52%">原始需求</th><th>承载章节</th></tr>
+<tr><td>使用 LLM 对采集数据进行自动标注 / 去重 / 打分 / 生成</td><td>M5（标注）、M6（生成）、M3（去重）、M4（打分）；总流程 2.3</td></tr>
+<tr><td>输入数据为纯语言 / 设备截图+UI树 两种</td><td>M2 数据接入；输入格式规格 6.1–6.2</td></tr>
+<tr><td>质量分类器使用 QuRating 算法；Rubric 用户提供 + 系统默认</td><td>M4；默认 Rubric 附录 A</td></tr>
+<tr><td>LLM API 信息作为工具静态配置</td><td>M1、M9；config.toml 规格 5.1</td></tr>
+<tr><td>工具不存储数据，批中间态标注完成后丢弃</td><td>2.1 / 2.6 非功能约束；M10 批生命周期</td></tr>
+<tr><td>输出结构用户定义；LLM 输出 + 代码规则引擎保证结构正确</td><td>M8 结构引擎；输出格式 6.3</td></tr>
+<tr><td>生成 / 二次校验可选，由 LLM 完成</td><td>M6 生成模式、M7 二次校验</td></tr>
+<tr><td>工具配置 config.toml；Rubric 与单次工程配置 project.toml；不用环境变量（API Key 除外）</td><td>2.5 配置体系；5.1–5.2 完整规格</td></tr>
+<tr><td>输出统一 JSONL；输入为 JSONL 路径；UI 模态为 uitree_&lt;index&gt;.jsonl + image_&lt;index&gt;.jpg/png 文件对（可不同子目录）</td><td>M2 配对算法；6.1–6.3</td></tr>
+<tr><td>模块职责/功能/边界清晰</td><td>2.2 模块清单；第 3 章每模块「职责与边界」小节</td></tr>
+<tr><td>功能点/算法需顶刊论文或工业项目背书</td><td>1.5 背书总表；各模块「背书」框</td></tr>
+<tr><td>不清晰/多方案点与用户对齐</td><td>1.6 已对齐决策记录</td></tr>
+<tr><td>（v1.1 评审补充）日志系统：行为记录/格式/打分思考支撑 rubric 优化与质量分析</td><td>M12（3.12）；第 7 章；<code>[trace]</code> 配置 5.2</td></tr>
+
+<tr><td>（v1.2 评审补充）算子对输出集的影响分析；定量优选；多模型/多品味生成；算子算法增强</td><td>2.3.2；3.4.3 选择机制；3.6.2；8.4 演进路线总表</td></tr>
+<tr><td>（v1.4 评审补充）无输入数据场景下直接生成数据（纯生成模式）</td><td><code>run.mode</code>（5.2）；3.6.2 种子来源分支；3.10.3 纯生成行；2.3.1 组合④</td></tr>
+</table>
+
+<h2 id="s1-5">1.5 算法与工程背书总表</h2>
+<table>
+<tr><th style="width:20%">功能点</th><th style="width:36%">采用方案</th><th>背书（论文 / 工业项目）</th></tr>
+<tr><td>质量打分（主模式）</td><td>LLM 成对比较 + Bradley-Terry 拟合标量分</td><td>QuRating, ICML 2024, arXiv:2402.09739 [1]；BT 模型 [2]；MM 拟合算法 Hunter 2004 [10]</td></tr>
+<tr><td>质量打分（低成本模式）</td><td>单点加性 rubric 打分（0–5 逐条累加）</td><td>FineWeb-Edu, NeurIPS 2024 D&amp;B, arXiv:2406.17557 [11]</td></tr>
+<tr><td>精确去重</td><td>规范化内容 SHA-256 哈希</td><td>Dolma toolkit 去重设计 [6]；业界通行做法</td></tr>
+<tr><td>近似去重</td><td>MinHash-LSH（字符 n-gram shingle，Jaccard 阈值）</td><td>Lee et al., ACL 2022, arXiv:2107.06499 [3]；内置于 Dolma [6]、Data-Juicer [4]、NeMo Curator [9]</td></tr>
+<tr><td>图像去重</td><td>pHash 感知哈希 + 汉明距离阈值</td><td>imagehash（工业标准库）；数据集治理通行做法 [9]</td></tr>
+<tr><td>LLM 自动标注</td><td>提示词组装 + 结构化输出 + 多模态（截图+序列化UI树）</td><td>distilabel（Argilla，工业）[5]；Autolabel（Refuel，工业）[12]；GUI 数据 LLM 标注管线：ScreenAI [13]、GUI-360 [14]、AgentTrek, ICLR 2025 [15]</td></tr>
+<tr><td>标注自一致（可选，v1.2）</td><td>self-consistency：同一记录 n 次独立采样（n≥3 奇数，<code>annotate.sc_temperature</code>）+ 字段级多数投票，全体分歧回退首样本并计数</td><td>Self-Consistency, Wang et al., ICLR 2023, arXiv:2203.12171 [33]</td></tr>
+<tr><td>UI 树 + 截图输入表示</td><td>截图图像 + accessibility-tree 线性化文本同时输入 VLM</td><td>ScreenAI screen-schema 线性化 [13]；OS-Atlas [16]；Ferret-UI [17]</td></tr>
+<tr><td>数据生成（可选）</td><td>以种子记录为示例的自举生成 + 相似度过滤</td><td>Self-Instruct, ACL 2023, arXiv:2212.10560 [18]；Evol-Instruct / WizardLM, ICLR 2024 [19]；distilabel 任务库 [5]</td></tr>
+<tr><td>多样性生成（可选，v1.2）</td><td>多 LLM 混合（round_robin 轮转 / weighted 加权抽样）+ <code>[[generate.styles]]</code> 风格模板条件化提示</td><td>Persona Hub, arXiv:2406.20094 [34]；Cosmopedia（HuggingFace，工业）[35]；model collapse 缓解：Shumailov et al., Nature 631, 2024 [36]；distilabel 任务级 LLM 绑定 [5]</td></tr>
+<tr><td>二次校验（可选）</td><td>LLM-as-a-Judge 独立评审 + 有界修复回路</td><td>Zheng et al., NeurIPS 2023, arXiv:2306.05685 [20]；Self-Refine, NeurIPS 2023 [21]；Constitutional AI 批评-修订 [22]</td></tr>
+<tr><td>结构正确性保证</td><td>JSON Schema (draft 2020-12) 校验 + 确定性修复 + 有界 LLM 修复环 + 供应商原生结构化输出</td><td>OpenAI Structured Outputs（工业）[7]；Outlines 约束解码 [23]；JSONSchemaBench [24]；instructor / json-repair（工业）[8]</td></tr>
+<tr><td>流水线架构</td><td>统一签名算子 + 声明式配置组合</td><td>Data-Juicer, SIGMOD 2024 [4]；distilabel DAG [5]；Dolma toolkit [6]</td></tr>
+<tr><td>评审偏差缓解</td><td>成对比较随机顺序、判分与理由分离、平局处理</td><td>LLM-as-a-Judge 位置偏差/冗长偏差分析 [20]；QuRating 提示设计 [1]</td></tr>
+<tr><td>API 调用容错</td><td>指数退避 + 抖动重试、并发信号量限流</td><td>AWS/Google SRE 重试规范（工业标准）；distilabel/NeMo Curator 客户端实现 [5][9]</td></tr>
+<tr><td>LLM 调用追踪与结构化事件日志</td><td>双通道日志：stderr 运行日志 + trace JSONL 事件流（一行一事件、通道过滤、四档脱敏）；LLM 调用事件字段命名对齐 OTel GenAI 语义约定（仅命名对齐，非实现依赖）</td><td>OpenTelemetry GenAI 语义约定（Development 状态，非 stable）[27]；LangSmith（LangChain，工业）[28]；W&amp;B Weave（工业）[29]</td></tr>
+<tr><td>评审驱动的 rubric 迭代</td><td>trace 记录逐次 pairwise 裁决与理由 → 人工审阅与指标诊断 → 修订准则 → 小样本重跑对比（7.5 闭环）</td><td>EvalGen 的 criteria drift 结论, UIST 2024, arXiv:2404.12272 [30]；CritiQ 从偏好挖掘质量准则, ACL 2025, arXiv:2502.19279 [31]</td></tr>
+<tr><td>纯生成模式（无输入合成）</td><td>配置种子池自举（单遍）/ 无种子 instruction×style 条件化 + 显式量目标</td><td>Self-Instruct 以 175 条人工种子自举 [18]（种子池形态）；Persona Hub [34]、Cosmopedia [35]（无种子条件化形态）</td></tr>
+<tr><td>评审鲁棒性增强</td><td>多评审团多数票（奇数个异构评审 per-criterion 投票）+ 双顺序裁决（正反两序一致才记胜）</td><td>PoLL（Verga et al., 2024）, arXiv:2404.18796 [32]；LLM-as-a-Judge 位置偏差分析, Zheng et al., NeurIPS 2023 [20]</td></tr>
+</table>
+
+<h2 id="s1-6">1.6 已对齐的设计决策</h2>
+<p>以下多方案设计点已于 2026-07-02 与需求方沟通对齐，本文档按对齐结论展开：</p>
+<table>
+<tr><th style="width:24%">设计点</th><th style="width:38%">候选方案</th><th>对齐结论</th></tr>
+<tr><td>QuRating 实现形态</td><td>仅 pairwise+BT / 仅 pointwise / 双模式</td><td><b>双模式可配</b>：默认 pairwise+Bradley-Terry（忠实 QuRating [1]），提供 pointwise 加性打分（FineWeb-Edu [11]）作为低成本模式，project.toml 一键切换，共用同一套 rubric。</td></tr>
+<tr><td>去重层级</td><td>仅精确 / 精确+MinHash / 三级含语义去重</td><td><b>精确 + MinHash-LSH</b>（纯本地零 API 成本），图像走 pHash；语义级重复交由质量打分环节间接处理。SemDeDup 列为开放问题（8.3）。<b>v1.2 更新：</b>用户决策推翻本结论，SemDeDup 落地为可选第④级（默认关，3.3.3）；决策溯源见 8.3 O1。</td></tr>
+<tr><td>形态与语言</td><td>Python CLI / Python 库+CLI / 其他语言</td><td><b>Python 3.11+ 单一 CLI 工具</b>，与 distilabel/Data-Juicer/Dolma/NeMo Curator 同栈 [4][5][6][9]。</td></tr>
+<tr><td>输出结构描述格式</td><td>JSON Schema / TOML 简化 DSL / 两者</td><td><b>标准 JSON Schema (draft 2020-12)</b>，内嵌于 project.toml 或引用外部 .json 文件；LLM 侧直接作为结构化输出约束，规则引擎侧用 jsonschema 库校验，零转换层 [7][23][24]。</td></tr>
+
+<tr><td>定量优选（v1.2 对齐，2026-07-02）</td><td>流式批内 top_ratio / 全局两阶段精确 top-K / 双支持</td><td><b>仅批内 top_ratio</b>：<code>quality.selection = "top_ratio"</code>（<code>quality.top_ratio</code> ∈ (0,1]，与 threshold 互斥，M1 校验，3.4.3）提供流式近似定量；全局精确定量列入演进路线 O6（8.3）。</td></tr>
+<tr><td>生成补齐回路（v1.2 对齐，2026-07-02）</td><td>本版实现 / 列入演进路线</td><td><b>列入演进路线 O6</b>（8.3）：设计草案已给出补齐环与三重停止条件（含本轮合格率下限——防 model collapse [36]），与全局定量一并立项。</td></tr>
+<tr><td>多 LLM / 多品味生成（v1.2 对齐，2026-07-02）</td><td>单 LLM（v1.1 现状）/ 多 profile 混合 + 风格模板</td><td><b>进规格</b>：<code>generate.llms</code> 数组（取代 v1.1 单值键 generate.llm）+ <code>generate.mixture</code>（"round_robin" | "weighted"，weighted 配 <code>generate.weights</code>）+ <code>[[generate.styles]]</code> 风格模板（name、prompt），规格见 3.6.2；多样性思想背书 [34][35]。</td></tr>
+<tr><td>算子算法增强（v1.2 对齐，2026-07-02）</td><td>① 多评审团投票 ② 双顺序裁决 ③ self-consistency 标注 ④ SemDeDup 语义去重</td><td><b>①②③④ 全部收录为默认关闭的可选配置</b>（总表见 8.4；背书 [32][20][33][26]）；其中 ④ 修订 v1.0「语义去重不做」的对齐结论（见上文去重层级行尾注），经 <code>[embedding.&lt;name&gt;]</code> profile 落地为 dedup 可选第④级。</td></tr>
+<tr><td>模块拆分与重编号（v1.3 对齐，2026-07-02）</td><td>保持 M5 复合模块 / 拆分且编号稳定（生成 = M12）/ 拆分且按流水线位置全量重编号</td><td><b>拆分且全量重编号</b>：标注与生成职责正交（基数保持的增列 vs 基数增加的合成），按 2.2 模块边界准则应各自独立；生成独立为 M6（3.6），原 M6–M11 顺移为 M7–M12。配置键、数据结构与 API 零变更，属纯文档结构调整。</td></tr>
+<tr><td>纯生成模式（v1.4 对齐，2026-07-02）</td><td>支持两种形态 / 仅种子池 / 演进路线 / 明确非目标</td><td><b>支持，两种形态进规格</b>：配置种子池 <code>seed_examples</code>（Self-Instruct 形态 [18]）与无种子条件化 + <code>standalone_count</code>（Persona Hub / Cosmopedia 形态 [34][35]），单遍执行不引入 O6 循环；工具定位由「数据加工器」扩展为「亦可从零起步的数据生产器」（1.1、2.1 同步修订）。</td></tr>
+</table>
+
+<!-- ═══════════════════ 2. 总体设计 ═══════════════════ -->
+<h1 id="s2">2. 总体设计</h1>
+
+<h2 id="s2-1">2.1 系统定位与总体规格</h2>
+<p>LabelKit 是一个<b>单机、单进程、无状态</b>的 Python CLI 批处理工具。一次运行按 project.toml 声明的阶段组合执行流水线，向一个输出路径写出 JSONL：<code>run.mode = "process"</code>（默认）读取一个输入路径、加工既有数据；<code>"generate_only"</code>（v1.4）无输入，由 M6 从零生成后走同一条治理管线（3.10.3）。工具对外只有三个交互面：<b>CLI 参数</b>、<b>两个 TOML 配置文件</b>、<b>输入/输出文件</b>；对内只有一类外部依赖：<b>配置中声明的 LLM API</b>。</p>
+
+<h3>2.1.1 功能规格总表</h3>
+<table>
+<tr><th style="width:14%">能力</th><th style="width:10%">可选性</th><th>规格</th></tr>
+<tr><td>数据接入</td><td>必选</td><td>文本模态：读取 <code>.jsonl</code> 文件（或含多个 .jsonl 的目录），每行一条记录。UI 模态：递归扫描目录，按文件名中的 index 配对 <code>uitree_&lt;index&gt;.jsonl</code> 与 <code>image_&lt;index&gt;.jpg/.jpeg/.png</code>，允许跨子目录配对。坏行/缺对按策略跳过并计入报告。</td></tr>
+<tr><td>去重</td><td>可选，默认开</td><td>两级：① 规范化内容 SHA-256 精确去重；② MinHash-LSH 近似去重（默认字符 5-gram、128 permutation、Jaccard 阈值 0.85）。UI 模态额外做截图 pHash（默认汉明距离 ≤ 8），树/图判定关系可配。作用域可选全局或批内。v1.2 增可选第④级语义去重（SemDeDup [26]，需 embedding profile，默认关；余弦相似度阈值 0.95，3.3.3）。</td></tr>
+<tr><td>质量打分</td><td>可选，默认开</td><td>QuRating 双模式：pairwise（批内 k 轮随机配对 → LLM 判胜负 → BT 拟合 → 百分位归一化到 [0,1]）与 pointwise（0–5 加性 rubric 打分归一化）。Rubric 用户提供或用系统默认（文本/UI 各一套）。可按聚合分阈值过滤。</td></tr>
+<tr><td>自动标注</td><td>可选，默认开</td><td>按 project.toml 的任务指令 + few-shot 示例组装提示词；UI 模态附截图（base64）与序列化 UI 树；输出受用户 JSON Schema 约束，经结构引擎（M8）保证合法。v1.2 增可选 self-consistency：同一记录以 <code>annotate.sc_temperature</code> 独立采样 n 次（<code>annotate.self_consistency</code>，n≥3 奇数）后字段级多数投票，成本 ×n（3.5.2）。</td></tr>
+<tr><td>数据生成</td><td>可选，默认关</td><td>仅文本模态。以通过质量门的记录为种子示例，按生成指令产出新样本（每种子 m 条），新样本与种子及彼此做 MinHash 相似度过滤后，回流经打分、标注、校验（Self-Instruct 流程 [18]）。v1.2 增多 LLM 混合（<code>generate.llms</code> 数组 + round_robin 轮转 / weighted 加权）与风格模板条件化（<code>[[generate.styles]]</code>），提升产出多样性并按 llm×style 桶统计（3.6.2）。v1.4 增<b>纯生成模式</b>：<code>run.mode="generate_only"</code> 时无输入数据，种子来自配置种子池 <code>generate.seed_examples</code> 或无种子条件化（<code>instruction × styles</code> + <code>generate.standalone_count</code>），产出照常走去重 →（打分）→（标注）→ 校验（quality 与 annotate 至少一个启用，约束①，2.3.1）。</td></tr>
+<tr><td>二次校验</td><td>可选，默认关</td><td>LLM-as-a-Judge 用独立 profile 评审 (记录, 标注) 是否合格，产出 verdict + 批评意见；失败策略可选丢弃或有界修复（批评意见回喂标注模型，最多 N 轮）。</td></tr>
+<tr><td>结构保证</td><td>必选</td><td>输出每行必然通过用户 JSON Schema 校验，四层防线：供应商原生结构化输出 → 确定性修复 → jsonschema 校验 → 有界 LLM 修复环；仍失败则该记录进 rejects 通道，绝不写入主输出。</td></tr>
+<tr><td>输出</td><td>必选</td><td>主输出 JSONL（用户结构 + 可配置 <code>_meta</code> 元信息）；<code>report.json</code> 运行报告（仅统计，无数据内容）；可选 rejects 通道。</td></tr>
+<tr><td>日志与追踪</td><td>运行日志恒有；trace 可选，默认关</td><td>双通道（第 7 章）：stderr 运行日志（<code>tool.log_format = "text"</code>｜<code>"jsonl"</code>，仅运维事件，绝不含数据内容与提示词）；trace 追踪日志（<code>trace.enabled=true</code> 时写 <code>{output_stem}.trace.jsonl</code>，一行一事件，记录去重判定、逐次质量裁决与理由、评审结论等，供 rubric 优化与标注质量分析，内容量按 <code>trace.content</code> 四档脱敏）。日志写失败绝不中断运行。</td></tr>
+</table>
+
+<h3>2.1.2 不做什么（工具级负边界）</h3>
+<div class="boundary">
+<b>工具级边界：</b>① 不训练/托管任何本地模型（QuRater 分类器训练不在范围内，打分全部运行时经 API 完成）；② 不做数据存储、缓存、断点续跑与跨运行状态（无数据库、无 checkpoint 文件）；③ 不做数据采集与数据版本管理；④ 不提供服务化/长驻进程形态；⑤ 不做人工标注界面（人工复核请将输出导入 Argilla 等外部平台 [5]）；⑥ 不做训练数据配比/混合（属下游职责）；⑦ 除配置声明的 LLM API 外不发起任何网络请求，无遥测。
+</div>
+
+<h2 id="s2-2">2.2 总体架构与模块清单</h2>
+<p>系统分四层：<b>入口层</b>（CLI）、<b>编排层</b>（M10）、<b>算子层</b>（M2–M7、M11，签名统一的流水线阶段）、<b>服务层</b>（M1 配置、M8 结构引擎、M9 LLM 客户端、M12 日志，被各算子共享调用）。算子层内部互不依赖，只依赖服务层与公共数据结构（第 4 章），这保证了阶段可独立开关、独立测试。</p>
+
+<figure>
+<svg viewBox="0 0 1000 610" xmlns="http://www.w3.org/2000/svg" font-family="PingFang SC, sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+    </marker>
+    <marker id="arrp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7a4fb5"/>
+    </marker>
+  </defs>
+  <rect x="20" y="20" width="960" height="70" rx="6" fill="#eef3fa" stroke="#2456a6"/>
+  <text x="40" y="45" font-size="15" font-weight="bold" fill="#2456a6">入口层</text>
+  <rect x="200" y="32" width="600" height="46" rx="4" fill="#fff" stroke="#2456a6"/>
+  <text x="500" y="60" font-size="14" text-anchor="middle">CLI：labelkit run / validate / rubric（参数解析、退出码、进度显示）</text>
+  <rect x="20" y="110" width="960" height="70" rx="6" fill="#eef8f0" stroke="#2e8b57"/>
+  <text x="40" y="135" font-size="15" font-weight="bold" fill="#2e8b57">编排层</text>
+  <rect x="200" y="122" width="600" height="46" rx="4" fill="#fff" stroke="#2e8b57"/>
+  <text x="500" y="150" font-size="14" text-anchor="middle">M10 编排器：批切分 · 阶段组合与调度 · 生成回流 · 生命周期与内存丢弃</text>
+  <rect x="20" y="200" width="960" height="235" rx="6" fill="#fdf7ee" stroke="#c9861a"/>
+  <text x="40" y="225" font-size="15" font-weight="bold" fill="#a06a10">算子层（统一 Stage 签名，可独立开关）</text>
+  <g font-size="13.5" text-anchor="middle">
+    <rect x="55"  y="245" width="135" height="52" rx="4" fill="#fff" stroke="#c9861a"/><text x="122" y="266">M2 数据接入</text><text x="122" y="284" font-size="11" fill="#666">ingest</text>
+    <rect x="206" y="245" width="135" height="52" rx="4" fill="#fff" stroke="#c9861a"/><text x="273" y="266">M3 去重</text><text x="273" y="284" font-size="11" fill="#666">dedup</text>
+    <rect x="357" y="245" width="135" height="52" rx="4" fill="#fff" stroke="#c9861a"/><text x="424" y="266">M4 质量打分</text><text x="424" y="284" font-size="11" fill="#666">quality (QuRating)</text>
+    <rect x="508" y="245" width="135" height="52" rx="4" fill="#fff" stroke="#c9861a"/><text x="575" y="266">M5 标注</text><text x="575" y="284" font-size="11" fill="#666">annotate</text>
+    <rect x="659" y="245" width="135" height="52" rx="4" fill="#fff" stroke="#c9861a"/><text x="726" y="266">M7 二次校验</text><text x="726" y="284" font-size="11" fill="#666">verify</text>
+    <rect x="810" y="245" width="135" height="52" rx="4" fill="#fff" stroke="#c9861a"/><text x="877" y="266">M11 输出器</text><text x="877" y="284" font-size="11" fill="#666">emitter</text>
+  </g>
+  <g stroke="#555" stroke-width="1.6" marker-end="url(#arr)">
+    <line x1="190" y1="271" x2="204" y2="271"/>
+    <line x1="341" y1="271" x2="355" y2="271"/>
+    <line x1="492" y1="271" x2="506" y2="271"/>
+    <line x1="643" y1="271" x2="657" y2="271"/>
+    <line x1="794" y1="271" x2="808" y2="271"/>
+  </g>
+  <text x="500" y="322" font-size="12" text-anchor="middle" fill="#666">PipelineItem 流（第 4 章定义的统一信封结构，携带记录、去重信息、分数、标注、状态）</text>
+  <line x1="60" y1="336" x2="940" y2="336" stroke="#c9861a" stroke-dasharray="5,4"/>
+  <g text-anchor="middle">
+    <rect x="357" y="352" width="150" height="48" rx="4" fill="#fff" stroke="#7a4fb5" stroke-dasharray="6,4"/>
+    <text x="432" y="373" font-size="13.5" fill="#7a4fb5">M6 生成</text>
+    <text x="432" y="391" font-size="11" fill="#666">generate · 旁路算子 · 默认关</text>
+  </g>
+  <g stroke="#7a4fb5" stroke-width="1.6" stroke-dasharray="5,4" marker-end="url(#arrp)" fill="none">
+    <line x1="424" y1="299" x2="424" y2="350"/>
+    <path d="M 355 376 L 273 376 L 273 300"/>
+  </g>
+  <text x="540" y="372" font-size="11.5" fill="#7a4fb5" text-anchor="start">以 M4 过质量门记录为种子产出新样本子批，</text>
+  <text x="540" y="390" font-size="11.5" fill="#7a4fb5" text-anchor="start">经 M10 调度回流至 M3（图 2-2 虚线路径）；仅文本模态</text>
+  <rect x="20" y="455" width="960" height="140" rx="6" fill="#f6f1fb" stroke="#7a4fb5"/>
+  <text x="40" y="480" font-size="15" font-weight="bold" fill="#7a4fb5">服务层（被上层共享）</text>
+  <g font-size="12.5" text-anchor="middle">
+    <rect x="35"  y="500" width="220" height="72" rx="4" fill="#fff" stroke="#7a4fb5"/>
+    <text x="145" y="525">M1 配置管理 config</text>
+    <text x="145" y="547" font-size="10.5" fill="#666">双 TOML 装载/校验/合并</text>
+    <rect x="272" y="500" width="220" height="72" rx="4" fill="#fff" stroke="#7a4fb5"/>
+    <text x="382" y="525">M8 结构引擎 schema-engine</text>
+    <text x="382" y="547" font-size="10.5" fill="#666">Schema 校验 · 确定性/LLM 修复</text>
+    <rect x="509" y="500" width="220" height="72" rx="4" fill="#fff" stroke="#7a4fb5"/>
+    <text x="619" y="525">M9 LLM 客户端 llm-client</text>
+    <text x="619" y="547" font-size="10.5" fill="#666">Profile · 多模态 · 重试/限流/计量</text>
+    <rect x="746" y="500" width="220" height="72" rx="4" fill="#fff" stroke="#7a4fb5"/>
+    <text x="856" y="525">M12 日志 logging</text>
+    <text x="856" y="547" font-size="10.5" fill="#666">运行日志 · trace 事件流</text>
+  </g>
+</svg>
+<figcaption>图 2-1 LabelKit 总体架构（四层）。实线为算子层主链数据流；紫色虚线为 M6 生成的旁路（取种子 / 子批回流，v1.3 拆分为独立模块）。</figcaption>
+</figure>
+
+<h3>2.2.1 模块清单与职责边界一览</h3>
+<table>
+<tr><th style="width:16%">模块</th><th style="width:34%">职责（做什么）</th><th style="width:34%">边界（不做什么）</th><th>依赖</th></tr>
+<tr><td>M1 config</td><td>装载、校验、合并两个 TOML 与 CLI 覆盖项，产出不可变 <code>ResolvedConfig</code>；解析 API Key 环境变量。</td><td>不读输入数据；不做业务默认值以外的推断；运行期不再被写。</td><td>—</td></tr>
+<tr><td>M2 ingest</td><td>解析输入路径 → 记录流；UI 文件对扫描与配对；构造 <code>Record</code>（含确定性 id）；输入级合法性校验。</td><td>不做去重/打分；不加载图像字节（懒加载引用）；不修改原始内容。</td><td>M1</td></tr>
+<tr><td>M3 dedup</td><td>精确哈希 + MinHash-LSH + pHash 判重，v1.2 增可选第④级语义判重（经 M9 embed() 取句向量，默认关，3.3.3）；标记重复项并给出簇信息。</td><td>不调用对话 LLM；语义判重仅 dedup.semantic=true 时启用（默认零 embedding 依赖）；不物理删除（只标记状态）。</td><td>M1（语义级开启时另需 M9）</td></tr>
+<tr><td>M4 quality</td><td>QuRating 双模式打分：配对采样、LLM 裁决、BT 拟合、归一化；按阈值标记低质。</td><td>不定义 rubric 内容（来自配置/默认包）；不做标注。</td><td>M1, M8, M9</td></tr>
+<tr><td>M5 annotate</td><td>组装标注提示词（含多模态与 few-shot）；调用 LLM 获得符合用户 Schema 的标注；可选 self-consistency 字段级投票。</td><td>不校验结构（委托 M8）；不评审质量（M4/M7 职责）；不产出新记录（M6 职责）。</td><td>M1, M8, M9</td></tr>
+<tr><td>M6 generate</td><td>以种子（process 模式：过质量门记录；generate_only 模式：配置种子池或无种子条件化，3.6.2）按 llms × styles 组合产出新样本 Record（含 generator 溯源），交 M10 回流。</td><td>仅文本模态；单轮回流不递归；不去重/打分/标注（回流后 M3/M4/M5 职责）。</td><td>M1, M8, M9</td></tr>
+<tr><td>M7 verify</td><td>LLM-as-a-Judge 评审标注；失败按策略丢弃或驱动有界修复。</td><td>不直接改标注（修复仍由 M5 重新标注、M8 校验）。</td><td>M1, M8, M9</td></tr>
+<tr><td>M8 schema-engine</td><td>用户 Schema 装载与预校验；LLM 原始输出 → 合法 JSON 对象的四层保证；裁决输出等内部小结构的校验。</td><td>不组装业务提示词；不发起首次 LLM 调用（只驱动修复调用）。</td><td>M1, M9</td></tr>
+<tr><td>M9 llm-client</td><td>Profile 化的统一 LLM 访问：OpenAI 兼容/Anthropic 两类 provider、多模态消息、结构化输出参数、指数退避重试、并发信号量、token/成本计量。</td><td>不理解业务语义；不解析业务结构（返回原始文本/原生结构化结果）。</td><td>M1</td></tr>
+<tr><td>M10 orchestrator</td><td>批切分、阶段组合（按开关）、生成回流调度、运行级统计聚合、生命周期与中间态丢弃。</td><td>不含任何阶段业务逻辑；不直接调用 LLM。</td><td>全部</td></tr>
+<tr><td>M11 emitter</td><td>主输出/rejects/报告三通道写出；<code>_meta</code> 组装；增量落盘。</td><td>不校验结构（到达此处的标注已合法）；报告不含数据内容。</td><td>M1</td></tr>
+<tr><td>M12 logging</td><td>进程内唯一日志设施：stderr 运行日志（标准 logging，text|jsonl 两种格式）；trace 事件流 <code>EventLog</code>（JSONL，行缓冲，每批随 M11 flush 同步 flush），由 MetricsSink 持有、各 Stage 经 <code>RunContext.metrics</code> 发事件。</td><td>不做跨运行聚合分析（后续 analyze 工具职责，8.3 O5）；不上传遥测；写失败不中断运行（warn 一次并关闭通道，计入 report）；API Key 永不落日志。</td><td>M1</td></tr>
+</table>
+
+<h2 id="s2-3">2.3 端到端数据流与阶段开关</h2>
+
+<figure>
+<svg viewBox="0 0 1000 430" xmlns="http://www.w3.org/2000/svg" font-family="PingFang SC, sans-serif">
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <!-- 输入 -->
+  <g font-size="13" text-anchor="middle">
+    <rect x="20" y="40" width="130" height="70" rx="8" fill="#eef3fa" stroke="#2456a6"/>
+    <text x="85" y="68">输入路径</text>
+    <text x="85" y="88" font-size="11" fill="#666">.jsonl / UI 文件对目录</text>
+
+    <rect x="185" y="40" width="110" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="240" y="68">M2 接入</text>
+    <text x="240" y="88" font-size="11" fill="#666">必选</text>
+
+    <rect x="330" y="40" width="110" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="385" y="68">M3 去重</text>
+    <text x="385" y="88" font-size="11" fill="#2e8b57">默认开</text>
+
+    <rect x="475" y="40" width="110" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="530" y="62">M4 打分</text>
+    <text x="530" y="80" font-size="11" fill="#2e8b57">默认开</text>
+    <text x="530" y="96" font-size="11" fill="#666">阈值过滤</text>
+
+    <rect x="620" y="40" width="110" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="675" y="68">M5 标注</text>
+    <text x="675" y="88" font-size="11" fill="#2e8b57">默认开</text>
+
+    <rect x="765" y="40" width="110" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="820" y="62">M7 校验</text>
+    <text x="820" y="80" font-size="11" fill="#a04010">默认关</text>
+    <text x="820" y="96" font-size="11" fill="#666">drop/repair</text>
+
+    <rect x="20" y="180" width="130" height="70" rx="8" fill="#eef8f0" stroke="#2e8b57"/>
+    <text x="85" y="205">输出 .jsonl</text>
+    <text x="85" y="225" font-size="11" fill="#666">+ report.json</text>
+    <text x="85" y="241" font-size="11" fill="#666">+ rejects（可选）</text>
+
+    <rect x="185" y="180" width="110" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="240" y="210">M11 输出</text>
+    <text x="240" y="228" font-size="11" fill="#666">必选</text>
+
+    <!-- 生成回流 -->
+    <rect x="620" y="300" width="110" height="70" rx="4" fill="#fff" stroke="#7a4fb5" stroke-dasharray="6,4"/>
+    <text x="675" y="326">M6 生成</text>
+    <text x="675" y="344" font-size="11" fill="#a04010">默认关</text>
+    <text x="675" y="360" font-size="11" fill="#666">仅文本模态</text>
+  </g>
+  <!-- 主流箭头 -->
+  <g stroke="#555" stroke-width="1.8" marker-end="url(#arr2)" fill="none">
+    <line x1="150" y1="75" x2="183" y2="75"/>
+    <line x1="295" y1="75" x2="328" y2="75"/>
+    <line x1="440" y1="75" x2="473" y2="75"/>
+    <line x1="585" y1="75" x2="618" y2="75"/>
+    <line x1="730" y1="75" x2="763" y2="75"/>
+    <path d="M 875 75 L 940 75 L 940 215 L 297 215"/>
+    <line x1="185" y1="215" x2="152" y2="215"/>
+  </g>
+  <!-- 回流虚线 -->
+  <g stroke="#7a4fb5" stroke-width="1.8" stroke-dasharray="6,4" marker-end="url(#arr2)" fill="none">
+    <path d="M 530 112 L 530 335 L 618 335"/>
+    <path d="M 730 335 L 985 335 L 985 20 L 385 20 L 385 38"/>
+  </g>
+  <text x="565" y="250" font-size="11.5" fill="#7a4fb5">过质量门的记录作为种子</text>
+  <text x="560" y="14" font-size="11.5" fill="#7a4fb5" text-anchor="middle">生成样本回流：从 M3 起重新去重、打分、标注（仅回流一轮，不递归）</text>
+  <!-- 淘汰通道 -->
+  <g stroke="#b04a4a" stroke-width="1.4" marker-end="url(#arr2)" fill="none">
+    <path d="M 385 112 L 385 158 L 240 158 L 240 178"/>
+    <path d="M 820 112 L 820 158 L 240 158" stroke-dasharray="2,3"/>
+  </g>
+  <text x="420" y="150" font-size="11.5" fill="#b04a4a">重复 / 低质 / 校验失败 → rejects 通道（可配置）</text>
+</svg>
+<figcaption>图 2-2 端到端数据流（process 模式）。实线为主路径；紫色虚线为可选的生成回流；红线为淘汰通道。generate_only 模式（v1.4）无输入与 M2：M6 为链路起点，生成样本按 batch_size 切批后自 M3 起走同一主路径（3.10.3）。</figcaption>
+</figure>
+
+<h3>2.3.1 阶段开关矩阵</h3>
+<p>阶段组合由 project.toml 各节的 <code>enabled</code> 决定。合法组合与典型用法：</p>
+<table>
+<tr><th>dedup</th><th>quality</th><th>generate</th><th>annotate</th><th>verify</th><th>典型用法</th></tr>
+<tr><td>✓</td><td>✓</td><td>—</td><td>✓</td><td>—</td><td><b>默认</b>：清洗 + 打分 + 标注</td></tr>
+<tr><td>✓</td><td>✓</td><td>—</td><td>—</td><td>—</td><td>纯数据治理：只去重打分，输出过滤后的原始数据 + 分数</td></tr>
+<tr><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>✓</td><td>全流程：治理 + 扩充生成 + 标注 + 评审（成本最高，质量最高）</td></tr>
+<tr><td>—</td><td>—</td><td>—</td><td>✓</td><td>✓</td><td>纯标注：数据已治理过，只做标注与评审</td></tr>
+<tr><td>✓</td><td>可选</td><td>✓</td><td>可选</td><td>—</td><td><b>纯生成</b>（<code>run.mode="generate_only"</code>，v1.4）：无输入从零合成 → 治理 →（标注）→ 输出</td></tr>
+</table>
+<p class="small">约束：① <code>annotate</code> 与 <code>quality</code> 至少启用一个，否则运行无产出意义，M1 在启动时报 <code>CONFIG_ERROR</code>；② <code>verify.enabled=true</code> 要求 <code>annotate.enabled=true</code>；③ <code>generate.enabled=true</code> 要求 <code>run.modality="text"</code>；process 模式下另要求 <code>quality.enabled=true</code>（种子来自质量门），generate_only 模式下 quality 可选（种子来自配置，3.6.2）；④ <code>run.mode="generate_only"</code>（v1.4）要求 <code>generate.enabled=true</code> 且 <code>run.input</code> 缺省（提供即报 CONFIG_ERROR，3.1.4），annotate 可选。</p>
+
+<h3>2.3.2 算子对输出集的影响分析</h3>
+<p>设某批进入流水线的存活记录数为 N（全流程视角对应 6.4 的 counts 不变量 <code>emitted + dropped_* + failed + bad_input = scanned + generated</code>）。每个算子对最终输出集的影响从四个维度刻画：<b>基数</b>（条数如何变）、<b>内容/构成</b>（行内容与数据分布如何变）、<b>判定依据的落点</b>（决策证据写入哪个 <code>_meta</code> 字段 / 哪个 trace 事件，事后可审计）、<b>被淘汰记录的去向</b>。总原则先行：<b>主输出只含存活记录；<code>dropped_dup</code> / <code>dropped_lowq</code> / <code>dropped_verify</code> / <code>failed</code> 一律不入主输出、按 <code>output.rejects</code> 进拒绝通道</b>（"none" | "refs"（默认）| "full"，写出规格见 3.11.2）。</p>
+<table>
+<tr><th style="width:9%">算子</th><th style="width:21%">基数影响（N→?）</th><th style="width:30%">对内容/构成的影响</th><th style="width:23%">判定依据落点（_meta / trace）</th><th>淘汰去向</th></tr>
+<tr><td><b>M2 接入</b></td><td>scanned → ingested = scanned − bad_input；只减不改。</td><td>按 <code>input.text_field</code> 抽取文本 / 配对 UI 文件构造 Record（3.2.4–3.2.5），不改动数据内容。</td><td><code>_meta.source</code>{file, line_no | pair_index}；trace <code>ingest.bad_line / ingest.missing_pair / ingest.index_conflict</code>。</td><td>坏行/缺对未构成 Record，<b>不走</b> rejects 通道——仅计 <code>report.counts.bad_input</code>（策略为 fail 时直接退出码 3）。</td></tr>
+<tr><td><b>M3 去重</b></td><td>N → N − dup；<b>只减不改</b>（存活行内容不变）。</td><td>簇内仅留首见记录（first-writer-wins，3.3.3），压缩高冗余来源、改变数据分布；<code>dedup.semantic = true</code>（默认 false）时判重面扩至改写型语义近重（嵌入余弦相似度 ≥ <code>dedup.semantic_threshold</code>，默认 0.95，SemDeDup [26]），dup 增大、输出集单位条数的多样性提高。</td><td>存活者 <code>_meta.dedup.kind="unique"</code>；被淘汰者 <code>DedupInfo</code>{kind, cluster_key, kept_id}（4.2）；trace <code>dedup.duplicate</code>。</td><td><code>dropped_dup</code> ⇒ rejects（refs 档仅 _meta 引用行，3.11.2）。</td></tr>
+<tr><td><b>M4 打分</b></td><td><b>打分本身不减</b>：每条 active 记录写入分数（各 criterion + <code>__aggregate__</code>），基数不变；<b>门控/选择才减</b>——配置 <code>quality.threshold</code>（聚合分低于线 ⇒ dropped_lowq）或 <code>quality.selection = "top_ratio"</code>（保留批内前 <code>quality.top_ratio</code> 比例）时 N → N − lowq。两者互斥（M1 校验），均缺省 = 只打分不过滤（5.2）。</td><td>不改记录内容；对质量分布截尾，直接改变输出集组成（机制见下方三路径）。pairwise 模式下淘汰按批内相对位次进行（见本节 note）。</td><td><code>_meta.scores</code>（per-criterion + <code>__aggregate__</code> + mode + batch_no，6.3）；trace <code>quality.judgment / quality.pointwise / quality.bt_fit / quality.gate</code>。</td><td><code>dropped_lowq</code> ⇒ rejects。</td></tr>
+<tr><td><b>M5 标注</b></td><td>成功路径<b>基数不变</b>；失败减（L3 耗尽 ⇒ failed，3.8.2）。</td><td><b>内容增列</b>：主输出行由原始数据变为用户 Schema 标注对象（原文仅经 <code>_meta.source</code> 溯源与 <code>output.passthrough_fields</code> 透传）；<code>annotate.self_consistency</code> ≥ 3 时标注取多数票 [33]，只增调用次数、不改基数。</td><td><code>_meta.annotation</code>{model, attempts}；trace <code>annotate.done</code>、<code>schema.repair</code>。</td><td><code>failed</code>（如 schema_violation，7.6）⇒ rejects。</td></tr>
+<tr><td><b>M6 生成</b></td><td><b>增</b>：N → N + G（G ≤ 调用次数 × <code>generate.num_per_call</code>，3.6.2）；生成子批回流 M3 起再过滤（图 2-2），实际净增 ≤ G。</td><td>引入合成样本、改变输出集的「真实 : 合成」构成比；<code>generate.llms</code> / <code>generate.mixture</code> / <code>[[generate.styles]]</code> 决定合成子集的模型与风格分布（3.6.2）；合成占比过高有 model collapse 风险 [36]——合成样本的统一标记为 <code>_meta.source.generator ≠ null</code>（v1.4 起：generate_only 模式下 <code>generated_from</code> 恒为空，不可作合成判据），可按其用路径二同法后筛控制比例。</td><td><code>_meta.source.generator</code>（≠ null 即合成，v1.4，{"llm","style"}，6.3）；<code>generated_from</code> 补充种子溯源（process 模式为种子 id 列表，generate_only 恒为空）；回流后各算子事件照常落点。</td><td>回流中被淘汰者按所在算子的去向进 rejects。</td></tr>
+<tr><td><b>M7 校验</b></td><td><b>减</b>：<code>verify.policy="drop"</code> 直接减；<code>"repair"</code> 先修复（≤ <code>verify.max_repair_rounds</code> 轮，默认 1）仍 fail 再减（3.7.3）。</td><td>repair 路径会<b>改写标注内容</b>（批评意见回喂 M5 重标注 + M8 重校验）——M5 之后唯一还会改动主输出行内容的算子。</td><td><code>_meta.verification</code>{verdict, rounds}；trace <code>verify.verdict</code>（每轮一事件）。</td><td><code>dropped_verify</code> ⇒ rejects。</td></tr>
+<tr><td><b>M11 输出</b></td><td><b>通道分发</b>，不新增淘汰判定（写出前 <code>validate_only</code> 终检失败属 bug 兜底，记 internal_error 转 rejects，3.11.1）。</td><td>按 status 分发三通道：<code>status="active"</code>（annotate 启用时且标注成功）→ 主输出；dropped_* / failed → rejects；计数/分布 → report.json。组装 <code>_meta</code>（<code>output.meta_mode = "inline" | "sidecar" | "none"</code>，6.3）。</td><td>分发依据即 status 本身；trace <code>batch.end / run.end</code> 携带各状态计数。</td><td>——（三通道即去向本身）。</td></tr>
+</table>
+<p><b>分数如何影响输出——三条独立路径。</b>M4 产出的分数经由三条彼此独立的路径作用于输出集，约束力递减：</p>
+<p><b>路径一：门控与选择（硬路径，直接改变输出集组成）。</b><code>quality.threshold</code> 将聚合分低于线的记录置 <code>dropped_lowq</code>（3.4.3 质量门）；v1.2 新增的 <code>quality.selection = "top_ratio"</code> 改为保留批内聚合分排名靠前的 <code>quality.top_ratio</code>（取值 (0,1]，selection="top_ratio" 时必填）比例——该机制的精确定义（含排序、并列与取整规则）由 3.4.3 给出，此处仅作引用。两种方式互斥（<code>quality.selection = "threshold"</code> 为默认，M1 启动时校验互斥性）。这是分数影响输出的唯一「硬」路径：直接决定哪些行存在于主输出。</p>
+<p><b>路径二：<code>_meta.scores</code> 随行落盘（软路径，供下游后筛）。</b><code>output.meta_mode = "inline"</code>（默认）时分数随主输出每行落盘（6.3），因此门控可以留宽、由下游按需收紧——一行 jq 即可从主输出筛出聚合分 ≥ 0.6 的行（剥离或保留 <code>_meta</code> 自便）：</p>
+<pre><code># inline 模式；要保留 _meta 则删去 "| del(._meta)" 一段
+jq -c 'select(._meta.scores["__aggregate__"] &gt;= 0.6) | del(._meta)' \
+   out/ime-intent-0630.jsonl &gt; out/ime-intent-0630.hq.jsonl</code></pre>
+<p class="small"><code>meta_mode = "sidecar"</code> 时 <code>_meta</code> 在 <code>{output_stem}.meta.jsonl</code> 且与主输出行序对齐（6.3），可用 <code>paste</code> 或 <code>jq --slurpfile</code> 按行号连接后同法筛选；<code>meta_mode = "none"</code> 丢弃分数，本路径不可用（6.3 已注明不推荐）。</p>
+<p><b>路径三：trace <code>quality.*</code> 事件（诊断路径，跨运行起效）。</b><code>quality.judgment / quality.gate</code> 等事件（7.2）不改变本次输出的任何一行，但它们是 7.5 rubric 优化闭环的原料：据其修订 rubric 后重跑，改变的是「下一次运行」的输出集。分数对输出的影响由此分三种时效——当次硬淘汰（路径一）、当次可后筛（路径二）、跨次可调优（路径三）。</p>
+<div class="note"><b>关键限制——pairwise 分数是批内相对量：</b>pairwise 主模式下 score = log θ 的批内百分位（3.4.3「归一化与聚合」行），每批最低恒为 0、最高恒为 1。因此 <code>quality.threshold</code> 在 pairwise 下的语义是「<b>批内百分位线</b>」而非全局绝对质量线：threshold = 0.3 ≈ 每批淘汰相对最差的约 30%——即使某批整体质量极高，仍会淘汰其相对靠后的部分；两批各自的 0.53 也不可直接比较（3.4.3「比较池」行）。需要跨批绝对可比（例如路径二想用统一分数线做全局后筛）时应选 <code>quality.mode = "pointwise"</code>（绝对刻度）；而 <code>quality.selection = "top_ratio"</code> 本就是批内相对选择，与 pairwise 语义天然一致（精确定义见 3.4.3）。理解这一限制是理解「打分如何影响输出」的前提。</div>
+
+
+<h2 id="s2-4">2.4 CLI 规格</h2>
+<pre><code>labelkit run      --config &lt;config.toml&gt; --project &lt;project.toml&gt;
+                  [--input PATH] [--output PATH]        # 覆盖 project.toml 中 run.input / run.output
+                  [--limit N]                           # 只处理前 N 条（试跑）
+                  [--dry-run]                           # 走完 M1/M2 校验与成本估算，不调用 LLM；generate_only 无 M2，成本按 3.6.2 调用次数公式静态估算
+                  [--strict]                            # 任何记录被拒绝即以退出码 1 结束
+                  [--log-level debug|info|warn|error]   # 默认 info
+labelkit validate --config &lt;config.toml&gt; --project &lt;project.toml&gt;
+                  # 仅执行 M1 全量校验（含用户 Schema 预校验、rubric 校验、profile 连通性探测可选 --probe）
+labelkit rubric   [--show default:text | default:ui]   # 打印系统默认 rubric 的 TOML 全文，便于用户复制修改</code></pre>
+<table>
+<tr><th style="width:16%">退出码</th><th>含义</th></tr>
+<tr><td>0</td><td>运行完成。可能存在被拒绝记录（详见 report.json 与 stderr 摘要）。</td></tr>
+<tr><td>1</td><td>运行完成但违反 <code>--strict</code>（存在 rejects），或报告写出失败。</td></tr>
+<tr><td>2</td><td>配置错误（TOML 语法/字段/引用的 profile 不存在/Schema 非法/rubric 非法/环境变量缺失）。</td></tr>
+<tr><td>3</td><td>输入错误，仅 process 模式（路径不存在、无任何合法记录、UI 模态 index 冲突且策略为 fail）；generate_only 无输入不触发本码——生成产出 0 条时照常 finalize（counts.generated = 0），以退出码 0 结束。</td></tr>
+<tr><td>4</td><td>致命运行错误（LLM 认证失败、连续不可恢复的 provider 错误超过熔断阈值、输出路径不可写）。</td></tr>
+</table>
+
+<h2 id="s2-5">2.5 配置体系总览</h2>
+<p>配置分两层两个文件，职责严格分离；除 API Key（以环境变量<b>名</b>在 config.toml 中声明、值从环境读取）外，不使用任何环境变量：</p>
+<table>
+<tr><th style="width:20%">文件</th><th style="width:26%">性质</th><th>内容</th></tr>
+<tr><td><code>config.toml</code></td><td>工具级静态配置。随部署环境变化，跨工程复用。</td><td>LLM API profile 列表（provider、base_url、model、api_key_env、并发、超时、重试、能力声明）、全局日志级别。见 5.1。</td></tr>
+<tr><td><code>project.toml</code></td><td>工程级单次配置。随一次标注任务变化。</td><td>输入/输出路径与模态、批大小与 seed、各阶段开关与参数、Rubric（内联或选默认）、任务指令与 few-shot、用户输出 JSON Schema（内联或引用外部文件）。见 5.2。</td></tr>
+</table>
+<p>参数优先级（高覆盖低）：<b>CLI 参数 &gt; project.toml &gt; config.toml 内的全局默认</b>。M1 在启动时完成三源合并并冻结为 <code>ResolvedConfig</code>，运行期只读。</p>
+
+<h2 id="s2-6">2.6 非功能约束</h2>
+<table>
+<tr><th style="width:16%">维度</th><th>约束与设计</th></tr>
+<tr><td>数据不落盘</td><td>全部中间态（Record、签名、LSH 索引、比较结果、BT 参数、未定稿标注）仅存于进程内存；进程退出即销毁。工具不创建任何临时文件；唯一写盘对象为显式声明的输出通道：用户输出文件、rejects 文件、report.json，以及显式启用（<code>trace.enabled=true</code>）时的 trace 日志（7.1——trace 是与主输出同级的输出通道而非中间态落盘，其保留与清理为用户责任）。报告只含计数/分布/耗时/token 统计，<b>不含任何数据内容片段</b>。</td></tr>
+<tr><td>隐私与网络</td><td>数据只发送至 config.toml 显式声明的 LLM API 端点；无遥测、无自动更新检查。API Key 只经环境变量进入内存，不写日志、不入报告。</td></tr>
+<tr><td>规模与内存</td><td>设计目标：单次运行 ≤ 50 万条记录（默认配置下全局 LSH 索引 + 信封对象约占 2–4 GB RSS）。图像字节懒加载：仅在构造该记录的 LLM 请求时读盘并编码，用后即弃，不常驻。超过规模建议按目录分次运行，或设 <code>dedup.scope="batch"</code> 降低索引内存。<code>dedup.semantic=true</code> 且 scope=global 时另需常驻向量索引，约增加 条数 × 向量维度 × 4 字节（50 万条 × 1024 维 ≈ 2 GB），须计入 RSS 预算。</td></tr>
+<tr><td>吞吐</td><td>瓶颈为 LLM API。并发由每 profile 的 <code>max_concurrency</code> 信号量控制；同一阶段内记录级并发，阶段之间在批内串行（屏障），保证 pairwise 打分所需的批完整性与实现简单性。</td></tr>
+<tr><td>幂等与可复现</td><td>无跨运行状态 ⇒ 重跑同一输入产生独立完整输出。配对采样、生成采样均使用 <code>run.seed</code> 播种的 PRNG；temperature 默认 0。输出文件以「写临时名 + 完成后原子改名」保证不产生半截主输出（临时名位于输出同目录，属输出交付的一部分，不违反不落盘约束）。</td></tr>
+<tr><td>容错</td><td>记录级隔离（1.3 节）；LLM 调用按 profile 配置重试（指数退避+全抖动）；连续 <code>fatal_error_threshold</code>（默认 20）次不可恢复 provider 错误触发熔断，以退出码 4 终止并写出已完成部分的报告。</td></tr>
+<tr><td>依赖面</td><td>Python ≥ 3.11（tomllib 标准库）。第三方仅：<code>httpx</code>（异步 HTTP）、<code>jsonschema</code>（校验）、<code>datasketch</code>（MinHash-LSH）、<code>Pillow</code>+<code>imagehash</code>（pHash）、<code>json-repair</code>（确定性 JSON 修复）、<code>numpy</code>（BT 拟合）。无框架级依赖。</td></tr>
+</table>
+
+<!-- ═══════════════════ 3. 模块详细设计 ═══════════════════ -->
+<h1 id="s3">3. 模块详细设计</h1>
+<p>本章每个模块按统一模板描述：<b>职责与边界 → 输入/输出 → 数据结构与 API → 算法与流程 → 配置项 → 错误处理 → 背书</b>。所有代码签名为 Python 3.11+，公共数据结构（<code>Record</code>、<code>PipelineItem</code> 等）的完整定义集中在第 4 章。</p>
+
+<!-- ─────────── M1 ─────────── -->
+<h2 id="m1">3.1 M1 配置管理 config</h2>
+<h3>3.1.1 职责与边界</h3>
+<div class="boundary"><b>做：</b>装载并语法/语义校验 config.toml 与 project.toml；合并 CLI 覆盖项；解析 rubric（内联或默认包）；装载并预校验用户 JSON Schema；读取 API Key 环境变量；产出全局唯一的不可变 <code>ResolvedConfig</code>。<br>
+<b>不做：</b>不接触输入数据；不发起网络请求（<code>--probe</code> 连通性探测委托 M9）；运行期不提供任何可变配置。</div>
+<h3>3.1.2 输入 / 输出</h3>
+<table>
+<tr><th style="width:12%">方向</th><th>内容</th></tr>
+<tr><td>输入</td><td>config.toml 路径、project.toml 路径、CLI 参数字典（input/output/limit/strict/log_level/dry_run）、进程环境（仅读取 profile 声明的 <code>api_key_env</code> 变量）。</td></tr>
+<tr><td>输出</td><td><code>ResolvedConfig</code>（frozen dataclass 树：第 5 章两文件全部键的类型化镜像，另含 CLI 专属项 limit/strict/dry_run 与 log_level 覆盖），或抛出 <code>ConfigError</code>（附带全部而非首个校验错误，一次性反馈）。</td></tr>
+</table>
+<h3>3.1.3 API</h3>
+<pre><code>def load(config_path: Path, project_path: Path, cli_overrides: CliOverrides) -> ResolvedConfig:
+    """三源合并 + 全量校验。失败抛 ConfigError(errors: list[str])，CLI 以退出码 2 结束。"""
+
+def default_rubric(name: Literal["default:text", "default:ui"]) -> Rubric:
+    """从包内数据文件（labelkit/data/rubrics/*.toml）装载系统默认 rubric。"""</code></pre>
+<h3>3.1.4 校验规则（启动时全量执行）</h3>
+<table>
+<tr><th style="width:24%">类别</th><th>规则</th></tr>
+<tr><td>TOML 结构</td><td>两文件均须含 <code>schema_version = 1</code>；未知键报 warning（前向兼容）、缺失必填键报 error；类型逐字段核对（第 5 章字段表即校验依据）。</td></tr>
+<tr><td>Profile 引用</td><td><code>quality.llm / annotate.llm / generate.llms（数组，逐元素校验）/ verify.llm / output.repair_llm</code>，以及 <code>quality.judges / verify.judges</code>（数组，非空时须为奇数个）引用的 profile 必须存在于 config.toml <code>[llm.*]</code>；启用视觉输入的阶段（UI 模态的 quality/annotate/verify）要求其 profile <code>supports_vision = true</code>。v1.2：<code>dedup.semantic = true</code> 时 <code>dedup.semantic_embedding</code> 必须存在于 config.toml <code>[embedding.*]</code> 且其 <code>api_key_env</code> 非空（5.1）。</td></tr>
+<tr><td>交叉字段约束（v1.2）</td><td><code>quality.selection = "top_ratio"</code> 时 <code>quality.top_ratio</code> 必填且 ∈ (0,1]，且不得再设 <code>quality.threshold</code>（互斥，报 CONFIG_ERROR）；<code>annotate.self_consistency</code> 为 0 或 ≥3 的奇数；<code>generate.mixture = "weighted"</code> 时 <code>generate.weights</code> 必填、逐项为正且长度 = <code>generate.llms</code>；<code>[[generate.styles]]</code> 各项 name 表内唯一、prompt 非空（5.2 各行标注的 M1 校验在此汇总执行）。</td></tr>
+<tr><td>运行模式（v1.4）</td><td><code>run.mode="generate_only"</code> 时：<code>run.input</code> 必须缺省、<code>run.modality</code> 必须 "text"、<code>generate.enabled</code> 必须 true；<code>generate.seed_examples</code>（非空字符串数组，逐项非空）与 <code>generate.standalone_count</code>（≥ 1）恰好提供其一（互斥，分别对应种子池 / 无种子形态）。process 模式下这两键均不得设置。</td></tr>
+<tr><td>API Key</td><td>每个被引用 profile 的 <code>api_key_env</code> 环境变量必须存在且非空。</td></tr>
+<tr><td>用户 Schema</td><td>必须是合法 JSON 且通过 JSON Schema draft 2020-12 元 Schema 校验（jsonschema 库 <code>Draft202012Validator.check_schema</code>）；顶层 type 必须为 object；顶层不得声明保留键 <code>_meta</code>。</td></tr>
+<tr><td>Rubric</td><td>criteria 非空、key 唯一且为 <code>[a-z0-9_]+</code>、weight &gt; 0；pointwise 模式要求每条 criterion 提供 <code>pointwise_levels</code>（恰好 6 级，0–5）。</td></tr>
+<tr><td>阶段组合</td><td>2.3.1 节的四条组合约束（①–④；④ 与本表「运行模式」行联动）。</td></tr>
+<tr><td>路径</td><td>process 模式：input 存在且可读，且 output 不得位于 input 目录内部（防止自吞）；generate_only 模式无 input，本行仅执行 output 检查（见「运行模式」行）。两种模式均要求 output 父目录存在且可写。</td></tr>
+</table>
+<h3>3.1.5 错误处理</h3>
+<p>所有校验错误聚合为一个 <code>ConfigError</code>，逐条打印（格式 <code>config.toml:[llm.default].timeout_s: 期望正整数，得到 "abc"</code>；数组表元素定位写作 <code>[[rubric.criteria]][N]</code>，N 为 1 起序号），退出码 2。不存在运行期配置错误——这是 M1 对其他模块的契约。</p>
+<div class="backing"><b>背书：</b>「声明式配置 + 启动期全量校验 + 运行期只读」是 Data-Juicer 配方（recipe）体系 [4] 与 distilabel Pipeline 先验校验（在任何推理发生前校验 DAG 与列契约）[5] 的共同设计；TOML 双文件分层对应其「系统配置 / 数据配方」分离。</div>
+
+<h3>3.1.6 输入 / 输出示例</h3>
+<p>贯穿示例（文本模态）：对输入法采集的中文指令做意图标注，输入数据行形如 <code>{"instruction": "帮我写一条请假条，明天上午要去医院", "source": "ime-log", "ts": "2026-06-30T10:12:00Z"}</code>（格式规格见 6.1）。注意：M1 不读取数据内容，仅按 3.1.4 校验 input 路径存在且可读。</p>
+
+<h4>示例 ①：一次成功装载 —— 三源合并与优先级生效</h4>
+<pre><code>$ export LABELKIT_KEY_DEFAULT=sk-********
+$ labelkit run --config config.toml --project project.toml --limit 100</code></pre>
+<p>config.toml 沿用 5.1 完整示例（含 <code>[llm.default]</code> 与 <code>[llm.judge]</code> 两个 profile），并在 <code>[llm.default]</code> 中显式写入 <code>temperature = 0.0</code>；project.toml 节选：</p>
+<pre><code># ─── project.toml（意图标注工程，节选）───
+schema_version = 1
+
+[run]
+input = "./ime-logs/2026-06-30.jsonl"
+output = "./out/intent-0630.jsonl"
+modality = "text"
+batch_size = 128                    # 覆盖内置默认 256
+
+[input]
+text_field = "instruction"
+
+[annotate]
+llm = "default"
+instruction = "你是输入法指令理解标注员。判断每条用户指令的意图类别、话题与完成难度。"
+
+[output]
+schema_inline = """
+{"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+ "properties": {
+   "intent": {"type": "string", "enum": ["writing_assist", "qa", "translation", "chitchat", "other"]},
+   "topic": {"type": "string"},
+   "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]}},
+ "required": ["intent", "topic", "difficulty"], "additionalProperties": false}
+"""</code></pre>
+<p>三源合并后的 <code>ResolvedConfig</code> 摘录（冻结后运行期只读；<code># ←</code> 标注每项的生效来源）：</p>
+<pre><code>run.batch_size              = 128             # ← project.toml [run]（覆盖内置默认 256）
+run.seed                    = 0               # ← 内置默认（两文件与 CLI 均未提供）
+limit                       = 100             # ← CLI --limit（最高优先级：CLI 参数 &gt; project.toml &gt; config.toml）
+tool.log_level              = "info"          # ← config.toml [tool]（CLI 未传 --log-level，不触发覆盖）
+llm.default.temperature     = 0.0             # ← config.toml [llm.default]（project.toml 无对应覆盖键）
+llm.default.max_concurrency = 8               # ← config.toml [llm.default]
+annotate.llm                = "default"       # ← 内置默认（已校验 profile 存在于 config.toml [llm.*]）
+quality.rubric              = "default:text"  # ← 内置默认（缺省按 run.modality = "text" 自动选定）</code></pre>
+<p class="small">API Key 校验按「被引用 profile」收敛：本工程 generate/verify 均未启用、quality 与 annotate 均引用 default，故 M1 只要求 <code>LABELKIT_KEY_DEFAULT</code> 存在且非空；<code>[llm.judge]</code> 未被引用，<code>LABELKIT_KEY_JUDGE</code> 缺失不报错（3.1.4）。</p>
+
+<h4>示例 ②：聚合校验失败 —— 3 个典型错误一次性反馈</h4>
+<p>在示例 ① 的 project.toml 上引入 3 处错误（节选，其余内容不变）：</p>
+<pre><code>[quality]
+llm = "fast"                        # 错误①：config.toml 只声明了 [llm.default] 与 [llm.judge]
+rubric = "inline"
+
+[[rubric.criteria]]
+key = "intent_clarity"
+weight = 2.0
+description = "指令意图是否清晰可辨"
+pairwise_prompt = "哪条指令的意图更清晰？"
+
+[[rubric.criteria]]
+key = "Topic-Match"                 # 错误③：含大写与连字符，违反 [a-z0-9_]+
+weight = 1.0
+description = "话题是否明确可归类"
+pairwise_prompt = "哪条指令的话题更明确、更易归类？"
+
+[output]
+schema_inline = """
+{"type": "object",
+ "properties": {
+   "intent": {"type": "string", "enum": ["writing_assist", "qa", "translation", "chitchat", "other"]},
+   "topic": {"type": "string"},
+   "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]},
+   "_meta": {"type": "object"}},
+ "required": ["intent", "topic", "difficulty"], "additionalProperties": false}
+"""
+# ↑ 错误②：properties 顶层声明了保留键 _meta（3.1.4 禁止；该键为 6.3 输出信封，由工具写入）</code></pre>
+<p>M1 按 3.1.5 规定聚合为单个 <code>ConfigError</code> 逐条打印（不在首错即停，且未发起任何网络请求）：</p>
+<pre><code>$ labelkit run --config config.toml --project project.toml --limit 100
+ConfigError: 3 个配置错误（全量聚合反馈）
+project.toml:[quality].llm: 引用的 profile "fast" 不存在于 config.toml [llm.*]，可用：default、judge
+project.toml:[output].schema_inline: 用户 Schema 顶层不得声明保留键 "_meta"（6.3 信封字段由工具写入），得到 properties 含 "_meta"
+project.toml:[[rubric.criteria]][2].key: 期望匹配 [a-z0-9_]+，得到 "Topic-Match"
+$ echo $?
+2</code></pre>
+<div class="note">三条错误分属 3.1.4 校验表的「Profile 引用」「用户 Schema」「Rubric」三类，按该表行序输出。<code>labelkit validate --config config.toml --project project.toml</code> 会产生完全相同的错误清单与退出码 2（2.4），适合在提交长任务前做零成本的纯本地检查。</div>
+
+<!-- ─────────── M2 ─────────── -->
+<h2 id="m2">3.2 M2 数据接入 ingest</h2>
+<h3>3.2.1 职责与边界</h3>
+<div class="boundary"><b>做：</b>把输入路径物化为 <code>Record</code> 迭代器：文本模态逐行解析 JSONL 并抽取文本字段；UI 模态递归扫描、按 index 配对文件、解析 UI 树节点并构造惰性图像引用；为每条记录计算确定性 id；对坏数据执行跳过策略并计数。<br>
+<b>不做：</b>不加载图像像素（只 stat 文件并记录路径/尺寸）；不截断/清洗文本（原样保留，序列化截断是消费方在构造提示词时的职责）；不判重、不打分；<code>run.mode="generate_only"</code> 时本模块整体不参与（3.10.3）。</div>
+<h3>3.2.2 输入 / 输出</h3>
+<table>
+<tr><th style="width:12%">方向</th><th>内容</th></tr>
+<tr><td>输入</td><td><code>run.input</code> 路径。文本模态：单个 <code>.jsonl</code> 文件，或目录（取其下所有 <code>*.jsonl</code>，按文件名字典序）。UI 模态：目录（递归扫描）。</td></tr>
+<tr><td>输出</td><td><code>Iterator[Record]</code>（生成器，按需产出，供 M10 切批）；<code>IngestReport</code>（总行数、坏行数、缺对数、index 冲突数及其文件位置列表）。</td></tr>
+</table>
+<h3>3.2.3 API</h3>
+<pre><code>class Ingestor:
+    def __init__(self, cfg: ResolvedConfig): ...
+    def scan(self) -> IngestPlan:
+        """只扫描不解析：返回文件清单、配对表、预估记录数。--dry-run 与 validate 用。"""
+    def records(self) -> Iterator[Record]:
+        """惰性产出 Record。解析错误按 input.on_bad_line / input.on_missing_pair 策略处理。"""
+    @property
+    def report(self) -> IngestReport: ...</code></pre>
+<h3>3.2.4 算法：UI 模态文件配对</h3>
+<figure>
+<svg viewBox="0 0 1000 300" xmlns="http://www.w3.org/2000/svg" font-family="PingFang SC, sans-serif">
+  <defs>
+    <marker id="arr3" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <g font-size="12.5" text-anchor="middle">
+    <rect x="20" y="30" width="180" height="220" rx="6" fill="#f6f8fa" stroke="#888"/>
+    <text x="110" y="52" font-weight="bold">输入目录（递归）</text>
+    <text x="110" y="80" font-family="Menlo" font-size="10.5">a/uitree_1.jsonl</text>
+    <text x="110" y="100" font-family="Menlo" font-size="10.5">a/image_1.png</text>
+    <text x="110" y="120" font-family="Menlo" font-size="10.5">b/uitree_2.jsonl</text>
+    <text x="110" y="140" font-family="Menlo" font-size="10.5">c/image_2.jpg</text>
+    <text x="110" y="160" font-family="Menlo" font-size="10.5">c/uitree_7.jsonl</text>
+    <text x="110" y="180" font-family="Menlo" font-size="10.5">d/image_9.png</text>
+    <text x="110" y="205" font-size="10.5" fill="#666">跨子目录允许配对</text>
+
+    <rect x="260" y="60" width="200" height="150" rx="6" fill="#fff" stroke="#c9861a"/>
+    <text x="360" y="85" font-weight="bold">① 正则提取 index</text>
+    <text x="360" y="110" font-family="Menlo" font-size="10">uitree_(\d+)\.jsonl</text>
+    <text x="360" y="128" font-family="Menlo" font-size="10">image_(\d+)\.(png|jpe?g)</text>
+    <text x="360" y="155" font-size="11" fill="#666">建两张 index → 路径映射表</text>
+    <text x="360" y="175" font-size="11" fill="#b04a4a">同 index 多文件 ⇒ 冲突</text>
+
+    <rect x="520" y="60" width="200" height="150" rx="6" fill="#fff" stroke="#c9861a"/>
+    <text x="620" y="85" font-weight="bold">② 按 index 求交集</text>
+    <text x="620" y="112" font-size="11">交集 {1, 2} → 文件对</text>
+    <text x="620" y="134" font-size="11">仅树 {7} / 仅图 {9}</text>
+    <text x="620" y="156" font-size="11">⇒ on_missing_pair 策略</text>
+    <text x="620" y="178" font-size="11" fill="#666">skip（默认）| fail</text>
+
+    <rect x="780" y="60" width="200" height="150" rx="6" fill="#eef8f0" stroke="#2e8b57"/>
+    <text x="880" y="85" font-weight="bold">③ 构造 Record</text>
+    <text x="880" y="112" font-size="11">解析 uitree 节点行 → UITree</text>
+    <text x="880" y="134" font-size="11">图像仅 stat → ImageRef</text>
+    <text x="880" y="156" font-size="11">id = sha256(树字节+图字节)</text>
+    <text x="880" y="178" font-size="11">按 index 升序产出</text>
+  </g>
+  <g stroke="#555" stroke-width="1.8" marker-end="url(#arr3)">
+    <line x1="200" y1="135" x2="258" y2="135"/>
+    <line x1="460" y1="135" x2="518" y2="135"/>
+    <line x1="720" y1="135" x2="778" y2="135"/>
+  </g>
+</svg>
+<figcaption>图 3-1 UI 模态文件对扫描与配对流程</figcaption>
+</figure>
+<p>配对规则的精确定义：</p>
+<table>
+<tr><th style="width:24%">规则</th><th>定义</th></tr>
+<tr><td>index 命名空间</td><td>整个输入目录（含全部子目录）共享一个 index 空间；index 为文件名正则捕获组按十进制解析的整数（允许前导零，<code>image_007.png</code> 的 index 为 7）。</td></tr>
+<tr><td>冲突</td><td>同一 index 出现 ≥2 个 uitree 文件或 ≥2 个 image 文件 ⇒ 该 index 记为冲突。<code>input.on_index_conflict = "fail"</code>（默认，退出码 3）或 <code>"skip"</code>（整个 index 跳过并计数）。同 index 同时存在 .png 与 .jpg 亦视为冲突。</td></tr>
+<tr><td>缺对</td><td>index 只有单侧文件 ⇒ <code>input.on_missing_pair = "skip"</code>（默认）或 <code>"fail"</code>。</td></tr>
+<tr><td>UI 树文件格式</td><td>JSONL，每行一个控件节点对象（字段映射见 6.2）。空文件或全坏行 ⇒ 该记录按坏记录跳过。单文件也允许仅一行（整树作为一个节点对象给出、含 children 嵌套）——两种导出风格都支持，解析器先探测：若首行对象含 <code>children</code> 数组则按嵌套树解析，否则按平铺节点行解析。</td></tr>
+<tr><td>图像约束</td><td>PNG/JPEG；单文件 ≤ <code>input.max_image_mb</code>（默认 20）；超限按坏记录跳过。仅校验魔数与尺寸，不解码全图。</td></tr>
+</table>
+<h3>3.2.5 文本模态解析</h3>
+<p>每行必须是 JSON object（非 object 的合法 JSON 视为坏行）。标注/打分所用文本由 <code>input.text_field</code>（支持点路径，如 <code>"conversation.turns"</code>；默认 <code>"text"</code>）抽取：命中字符串则直接使用；命中数组/对象则按 canonical JSON（<code>sort_keys=True, ensure_ascii=False</code>，紧凑分隔符）序列化为文本；未命中字段 ⇒ 坏行。原始对象完整保留在 <code>Record.raw</code>，输出时可按 <code>output.passthrough_fields</code> 透传（见 6.3）。记录 id = <code>sha256(canonical_json(raw))[:16]</code>。坏行策略 <code>input.on_bad_line = "skip"</code>（默认）| <code>"fail"</code>。</p>
+<h3>3.2.6 配置项</h3>
+<p>见 5.2 <code>[input]</code> 节字段表（本模块消费其全部字段）。</p>
+<div class="backing"><b>背书：</b>「截图 + accessibility tree/视图层级」文件对是 GUI 智能体数据集的标准物理形态：ScreenAI 的 screen schema 即截图与线性化控件树的配对 [13]，OS-Atlas 跨 5 平台的 1300 万控件语料同样以截图+树组织 [16]，AMEX/AndroidControl 等移动端数据集亦然。逐行 JSONL、按文件名索引的组织方式与 Dolma toolkit 的分片 JSONL 惯例一致 [6]。</div>
+
+<h3>3.2.7 输入 / 输出示例</h3>
+<h4>① 文本模态（<code>run.modality = "text"</code>，<code>input.text_field = "instruction"</code>）</h4>
+<p><code>run.input = "./ime-logs"</code>，目录下仅一个文件 <code>ime-2026-06-30.jsonl</code>（输入法采集的中文指令数据），共 3 行；第 3 行不含 <code>instruction</code> 字段，按 3.2.5 判为坏行：</p>
+<pre><code>{"instruction": "帮我写一条请假条，明天上午要去医院", "source": "ime-log", "ts": "2026-06-30T10:12:00Z"}
+{"instruction": "把这句话翻译成英文：会议改到周五下午三点", "source": "ime-log", "ts": "2026-06-30T10:15:21Z"}
+{"query": "今天天气怎么样", "source": "ime-log", "ts": "2026-06-30T10:20:05Z"}   ← text_field 未命中 ⇒ 坏行</code></pre>
+<p><code>records()</code> 产出 2 个 <code>Record</code>（字段见 4.1；id 按 3.2.5 = <code>sha256(canonical_json(raw))[:16]</code>，下列值为对 canonical JSON 实际计算的结果，可复算验证）：</p>
+<pre><code>// Record #1（第 1 行）
+{
+  "id": "1cda030abc565f17",
+  "modality": "text",
+  "text": "帮我写一条请假条，明天上午要去医院",
+  "raw": {"instruction": "帮我写一条请假条，明天上午要去医院",
+          "source": "ime-log", "ts": "2026-06-30T10:12:00Z"},
+  "ui_tree": null, "image": null,
+  "ref": {"source_file": "ime-2026-06-30.jsonl", "line_no": 1,
+          "pair_index": null, "generated_from": []}
+}
+// Record #2（第 2 行）
+{
+  "id": "a9bbd04dca155b52",
+  "modality": "text",
+  "text": "把这句话翻译成英文：会议改到周五下午三点",
+  "raw": {"instruction": "把这句话翻译成英文：会议改到周五下午三点",
+          "source": "ime-log", "ts": "2026-06-30T10:15:21Z"},
+  "ui_tree": null, "image": null,
+  "ref": {"source_file": "ime-2026-06-30.jsonl", "line_no": 2,
+          "pair_index": null, "generated_from": []}
+}</code></pre>
+<p>第 3 行按默认 <code>input.on_bad_line = "skip"</code> 跳过并计数，迭代结束后 <code>report</code> 属性给出 <code>IngestReport</code>（计数口径与 6.4 <code>report.json</code> 的 counts 一致）：</p>
+<pre><code>{
+  "scanned": 3, "ingested": 2, "bad_input": 1,
+  "missing_pair": 0, "index_conflict": 0,        // 仅 UI 模态会非零
+  "bad_locations": [
+    {"file": "ime-2026-06-30.jsonl", "line_no": 3,
+     "reason": "input.text_field \"instruction\" 未命中"}
+  ]
+}</code></pre>
+<h4>② UI 模态（<code>run.input = "./capture/2026-07-01"</code>，即 5.2 示例工程）</h4>
+<p><code>b/uitree_2.jsonl</code> 为平铺节点行风格（首行无 <code>children</code> 数组，3.2.4 探测规则）。字段名取 6.2 映射表的源字段名：<code>id/parent/class/text/bounds/visible</code>；根节点省略 <code>parent</code> ⇒ <code>parent_id = null</code>；<code>hint</code> 不在白名单 ⇒ 值转字符串后入 <code>extra</code>：</p>
+<pre><code>{"id": "0", "class": "FrameLayout", "bounds": [0, 0, 1080, 2340], "visible": true}
+{"id": "1", "parent": "0", "class": "TextView", "text": "登录", "bounds": [72, 296, 264, 392], "visible": true}
+{"id": "2", "parent": "0", "class": "EditText", "bounds": [72, 520, 1008, 664], "visible": true, "hint": "请输入手机号"}
+{"id": "3", "parent": "0", "class": "EditText", "bounds": [72, 712, 672, 856], "visible": true, "hint": "请输入验证码"}
+{"id": "4", "parent": "0", "class": "Button", "text": "获取验证码", "bounds": [704, 712, 1008, 856], "visible": true}
+{"id": "5", "parent": "0", "class": "Button", "text": "登录", "bounds": [72, 952, 1008, 1096], "visible": true}</code></pre>
+<p>正则从 <code>b/uitree_2.jsonl</code> 与 <code>c/image_2.png</code> 各提取 index = 2，跨子目录求交集配对成功（图 3-1），构造的 <code>Record</code>：</p>
+<pre><code>{
+  "id": "9f2c31ab52e08d17",                  // sha256(树字节 + 图字节)[:16]，与 6.3 _meta 示例同源
+  "modality": "ui",
+  "text": null, "raw": null,
+  "ui_tree": UITree(nodes = 6 × UINode，深度优先序，序列化见下),
+  "image": {"path": "capture/2026-07-01/c/image_2.png", "format": "png", "size_bytes": 483112},
+  "ref": {"source_file": "b/uitree_2.jsonl", "line_no": null,
+          "pair_index": 2, "generated_from": []}
+}</code></pre>
+<p><code>UITree.serialize()</code> 按 4.3 规范（深度缩进 + role + 引号 text + [l,t,r,b] + 非空 extra 的 k=v；此处 <code>quantize_px = 0</code>，即 M5 组装提示词时的形态，3.5.2 示例复用本输出）：</p>
+<pre><code>FrameLayout [0,0,1080,2340]
+  TextView "登录" [72,296,264,392]
+  EditText [72,520,1008,664] hint=请输入手机号
+  EditText [72,712,672,856] hint=请输入验证码
+  Button "获取验证码" [704,712,1008,856]
+  Button "登录" [72,952,1008,1096]</code></pre>
+<div class="note"><b>提示：</b>两处 id 规则不同——文本模态对 <code>raw</code> 的 canonical JSON 取哈希（与行号、文件名无关，内容相同即 id 相同，为 M3 精确判重的基础）；UI 模态对树文件字节与图像文件字节拼接取哈希。图像此时仅 stat（<code>size_bytes = 483112</code>，远小于 <code>input.max_image_mb = 20</code> 上限），像素到 M5 组装提示词时才经 <code>ImageRef.load_base64()</code> 加载。</div>
+
+<!-- ─────────── M3 ─────────── -->
+<h2 id="m3">3.3 M3 去重 dedup</h2>
+<h3>3.3.1 职责与边界</h3>
+<div class="boundary"><b>做：</b>对批内（或全局作用域）记录执行精确去重与近似去重，UI 模态叠加图像 pHash；为重复记录标记 <code>dropped_dup</code> 状态并记录簇归属；维护运行内存中的去重索引。<br>
+<b>不做：</b>默认配置下不调用任何 LLM/Embedding API、不做语义级判重（v1.2 例外：<code>dedup.semantic = true</code> 时经 M9 <code>embed()</code> 调用 embedding API 执行可选第④级语义判重，3.3.3——仍不调用对话补全 LLM）；不物理删除记录（状态标记，由 M10/M11 决定去向）；不跨运行持久化索引（无状态约束）。</div>
+<h3>3.3.2 输入 / 输出</h3>
+<table>
+<tr><th style="width:12%">方向</th><th>内容</th></tr>
+<tr><td>输入</td><td><code>list[PipelineItem]</code>（一个批）；运行级 <code>DedupIndex</code>（scope=global 时跨批共享，进程内存）。</td></tr>
+<tr><td>输出</td><td>同一列表，重复项 <code>status="dropped_dup"</code>、<code>item.dedup = DedupInfo(kind, cluster_key, kept_id)</code>；非重复项 <code>DedupInfo(kind="unique")</code> 并入索引。</td></tr>
+</table>
+<h3>3.3.3 算法</h3>
+<table>
+<tr><th style="width:18%">层</th><th style="width:52%">算法</th><th>判重条件</th></tr>
+<tr><td>① 精确</td><td>去重键 = <code>sha256(dedup_text)</code>。<code>dedup_text</code>：文本模态为抽取文本经 NFC 规范化、连续空白折叠为单空格、strip 后的字节；UI 模态为 UI 树规范序列化（4.3 节 <code>UITree.serialize()</code>，不含坐标抖动位——坐标按 <code>dedup.bounds_quantize_px</code>（默认 4px）量化后参与序列化）。哈希入 <code>set</code>，O(1) 查询。</td><td>哈希相等</td></tr>
+<tr><td>② 近似</td><td>MinHash：<code>dedup_text</code> 的字符 n-gram（默认 n=5，对中英混合文本鲁棒；空白折叠后取滑窗）shingle 集合 → 128-permutation 签名 → <code>datasketch.MinHashLSH(threshold=0.85)</code> 查询候选 → 对候选精算签名估计 Jaccard，≥ 阈值判重。首见者入索引（first-writer-wins，保留簇内最早记录，与 Lee et al. 的 cluster-keep-one 策略一致 [3]）。</td><td>估计 Jaccard ≥ <code>dedup.minhash_threshold</code></td></tr>
+<tr><td>③ 图像（仅 UI 模态）</td><td>截图缩放解码 → 64-bit pHash（imagehash 默认 DCT 实现）→ 与索引中全部已保留 pHash 求汉明距离（64-bit 异或 popcount，50 万条线性扫描 &lt; 100ms/查询，可接受；实现里按 16-bit 前缀分桶加速）。</td><td>汉明距离 ≤ <code>dedup.image_phash_max_distance</code>（默认 8）</td></tr>
+
+<tr><td>④ 语义（可选）</td><td><code>dedup.semantic = true</code> 时启用（默认 false，5.2）：<code>dedup_text</code> → 经 config.toml <code>[embedding.&lt;name&gt;]</code> profile（由 <code>dedup.semantic_embedding</code> 引用，5.1）取句向量（M9 <code>embed()</code>，3.9.2；向量 L2 归一化后余弦 = 点积）→ 与索引中全部已保留向量求余弦相似度（批内与全局索引通查，实现为向量矩阵化点积的线性扫描（pHash 的 16-bit 前缀分桶依赖汉明位结构，不适用于稠密向量），规模上限见 2.6 注）→ 达阈判重，kind=<code>"near_semantic"</code>（4.2）；未判重者向量入索引（first-writer-wins，同②）。执行序在①②③之后，仅当前级已构成判重（含 UI 模态合成判定成立）时才短路——UI 模态 <code>ui_dup_requires="both"</code> 下③单独命中不构成判重、不短路④；仅对尚未判重的记录发起 embedding。UI 模态：作用于树规范序列化文本（与①②同一 <code>dedup_text</code>），在合成判定中视同 tree 层命中（见下段）。成本：每条参检记录 1 次 embedding 调用（走 M9 计量与重试，3.9.3）。</td><td>余弦相似度 ≥ <code>dedup.semantic_threshold</code>（默认 0.95，SemDeDup 论文的高相似区间 [26]）</td></tr>
+</table>
+<p>UI 模态合成判定：<code>dedup.ui_dup_requires = "both"</code>（默认，树近似重 <b>且</b> 图近似重才判重——最保守，避免同一界面模板不同内容被误杀）| <code>"tree"</code> | <code>"image"</code>。精确层（①）命中则无条件判重。生成样本回流批同样经过本模块，天然实现 Self-Instruct 的「新样本与已有样本相似度过滤」[18]（以 MinHash-Jaccard 替代其 ROUGE-L，二者同为 n-gram 重叠度量，MinHash 可索引化）。</p>
+
+<p>第④级（语义，v1.2）与合成判定的关系：UI 模态下④作用于树规范序列化文本，在 <code>ui_dup_requires</code> 合成判定中<b>视同 tree 层命中</b>——"both" 下需（②或④）与③同时命中才判重；"tree" 下④单独命中即判重；"image" 下④不参与判定。判重由④贡献时记 <code>kind="near_semantic"</code>（④与③同时命中仍记 <code>near_both</code>）。④ 与 ② 的分工：② 抓 n-gram 重叠的表层改写，④ 抓措辞不同语义相同的深层重复（[26] 的动机），两级独立可关。</p>
+<h3>3.3.4 API 与配置</h3>
+<pre><code>class DedupStage(Stage):
+    name = "dedup"
+    def __init__(self, cfg: DedupConfig, index: DedupIndex): ...
+    async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]: ...
+
+class DedupIndex:
+    """运行内存索引：exact set[bytes] + MinHashLSH + list[(id, phash)]
+       （+ dedup.semantic=true 时 list[(id, unit_vec)]，v1.2）。scope=batch 时每批重建。"""
+    def probe_and_add(self, rec: Record) -> DedupInfo: ...</code></pre>
+<p>配置见 5.2 <code>[dedup]</code>。错误处理：图像解码失败 ⇒ 该记录跳过 pHash 层（按树判定）并计入 <code>report.dedup.image_decode_failures</code>；embedding 调用失败（重试耗尽，3.9.3）⇒ 该记录跳过第④级（按①—③判定）并计入 <code>report.dedup.embedding_failures</code>（仅 <code>dedup.semantic = true</code> 时可能非零，v1.2）。</p>
+<div class="backing"><b>背书：</b>MinHash 近似去重由 Lee et al.（ACL 2022）确立为 LLM 训练数据方法学标准并证明可提升模型质量 [3]；Dolma [6]、Data-Juicer [4]、NeMo Curator [9] 的内置去重算子均为「精确哈希 + MinHash-LSH」两级结构，阈值 0.8–0.9 为通行区间。pHash 图像判重为 imagehash 库承载的工业标准做法 [9]。</div>
+
+<h3>3.3.5 输入 / 输出示例</h3>
+<p>设定：文本模态第一批共 4 条（<code>DedupIndex</code> 为空），<code>[dedup]</code> 全部取 5.2 默认值：<code>dedup.scope</code>="global"、<code>dedup.minhash_threshold</code>=0.85、<code>dedup.minhash_num_perm</code>=128、<code>dedup.ngram</code>=5；<code>input.text_field</code>="instruction"。输入 4 行 JSONL，依行序记为 r1–r4：</p>
+<pre><code>{"instruction": "帮我写一条请假条，明天上午要去医院复诊，大概十点到医院，下午两点前能回公司，请按半天事假写，语气客气一点，落款写研发部小李，谢谢", "source": "ime-log", "ts": "2026-06-30T10:12:00Z"}
+{"instruction": " 帮我写一条请假条，明天上午要去医院复诊，大概十点到医院，下午两点前能回公司，请按半天事假写，语气客气一点，落款写研发部小李，谢谢　", "source": "ime-log", "ts": "2026-06-30T10:12:07Z"}
+{"instruction": "帮我写一条请假条，明天上午要去医院复诊，大概十点到医院，下午两点前能回公司，请按半天事假写，语气客气一点，落款写研发部小李，谢谢 10:12", "source": "ime-log", "ts": "2026-06-30T10:14:33Z"}
+{"instruction": "把这段会议纪要翻译成英文，术语保留原文", "source": "ime-log", "ts": "2026-06-30T10:15:21Z"}</code></pre>
+<p class="small">记录 id 按 3.2.5 规则 = <code>sha256(canonical_json(raw))[:16]</code>：r1=<code>ff21d1c3963d17db</code>、r2=<code>350d516a359a6174</code>、r3=<code>6cd63faf65b8cfb7</code>、r4=<code>08363dbb4cd11f29</code>。r2 的 raw 与 r1 不同（空白、ts），id 不同——判重依据是 <code>dedup_text</code>，与 id 无关。</p>
+<table>
+<tr><th style="width:6%">记录</th><th style="width:26%">dedup_text（NFC + 空白折叠 + strip）</th><th style="width:17%">sha256(dedup_text) 前 16 hex</th><th style="width:20%">命中层</th><th style="width:21%">DedupInfo</th><th>status</th></tr>
+<tr><td>r1</td><td>原文已是规范形，无改动（64 字）</td><td><code>57e3f858bc013a54</code></td><td>无（首见：精确键 + MinHash 签名入索引）</td><td><code>kind="unique"<br>cluster_key="57e3f858bc013a54"<br>kept_id=null</code></td><td><code>active</code></td></tr>
+<tr><td>r2</td><td>去掉行首半角空格与句尾 <code>　</code>（全角空格）后，与 r1 逐字节相同</td><td><code>57e3f858bc013a54</code>（与 r1 相同）</td><td>① 精确（哈希已在 <code>set</code> 中，无条件判重）</td><td><code>kind="exact"<br>cluster_key="57e3f858bc013a54"<br>kept_id="ff21d1c3963d17db"</code></td><td><code>dropped_dup</code></td></tr>
+<tr><td>r3</td><td>仅句尾多出 " 10:12"（70 字），空白已是单空格，无改动</td><td><code>07aaef398c499831</code> ≠ r1，① 未中</td><td>② 近似：LSH 候选 = {r1}，签名估计 Jaccard = 0.91 ≥ 0.85</td><td><code>kind="near_text"<br>cluster_key="57e3f858bc013a54"<br>kept_id="ff21d1c3963d17db"</code></td><td><code>dropped_dup</code></td></tr>
+<tr><td>r4</td><td>原文已是规范形，无改动（19 字）</td><td><code>e49758a83ce5efec</code></td><td>无（① ② 均未中，入索引）</td><td><code>kind="unique"<br>cluster_key="e49758a83ce5efec"<br>kept_id=null</code></td><td><code>active</code></td></tr>
+</table>
+<p class="small">r3 的真实字符 5-gram Jaccard 可精确验算：r1 折叠后 64 字 → 60 个 shingle，r3 70 字 → 66 个；交集 60、并集 66，J = 60/66 ≈ 0.909。128-permutation 签名估计值的标准差约 √(0.909×0.091/128) ≈ 0.025，本例估计值取 0.91，与阈值关系稳定。约定：<code>cluster_key</code> 取簇首（首见保留记录）的精确去重键前 16 hex，unique 记录填自身键。本批计入 <code>report.dedup</code>：<code>{"exact": 1, "near_text": 1, "clusters": 1}</code>（其余计数为 0）；r2、r3 由 M10 按 <code>output.rejects</code> 策略落 rejects 通道，不进主输出。</p>
+<h4>UI 模态合成判定示例（<code>dedup.ui_dup_requires</code> = "both"，默认）</h4>
+<p>待判记录：<code>capture/2026-07-01/b/uitree_2.jsonl</code> + <code>c/image_2.png</code>（pair_index=2，登录页，即 6.3 主输出示例中 <code>_meta.id="9f2c31ab52e08d17"</code> 那条）；索引中已保留同一 App 的登录页 pair_index=1（<code>a/uitree_1.jsonl</code> + <code>a/image_1.png</code>）。</p>
+<table>
+<tr><th style="width:14%">层</th><th style="width:56%">计算</th><th>结果</th></tr>
+<tr><td>① 精确</td><td><code>sha256(UITree.serialize(quantize_px=4))</code> = <code>1c7a0d93e2b6f458</code>，索引中 pair_index=1 的键为 <code>b2e49c05d7a1f36e</code></td><td>不相等，未中</td></tr>
+<tr><td>② 树近似</td><td>序列化树的 MinHash 签名估计 Jaccard = 0.95 ≥ 0.85（同一登录模板，控件树几乎一致）</td><td><b>命中</b></td></tr>
+<tr><td>③ 图像</td><td>pHash(<code>c/image_2.png</code>) = <code>5181a9e2bc40fcca</code>，簇首 pHash = <code>c3a5e17098d2b46f</code>，汉明距离 = 21 &gt; 8（输入框已填入手机号、软键盘弹出，画面差异大）</td><td>未命中</td></tr>
+<tr><td>合成</td><td>"both" 要求 ② 且 ③ 同时命中；仅 ② 命中 ⇒ <b>不判重</b></td><td><code>DedupInfo(kind="unique", cluster_key="1c7a0d93e2b6f458", kept_id=null)</code>，<code>status="active"</code></td></tr>
+</table>
+<div class="note"><b>设计意图：</b>若配置 <code>ui_dup_requires="tree"</code>，本条将因 ② 命中被判 <code>near_text</code> 丢弃——同一界面模板承载不同内容（不同账号、不同输入状态）的屏幕会被大量误杀。默认 "both" 即为规避该风险（3.3.3）；反之，树与图同时命中时记 <code>kind="near_both"</code>。</div>
+
+<!-- ─────────── M4 ─────────── -->
+<h2 id="m4">3.4 M4 质量打分 quality（QuRating）</h2>
+<h3>3.4.1 职责与边界</h3>
+<div class="boundary"><b>做：</b>按 rubric 对批内存活记录打质量分：pairwise 模式执行「k 轮随机配对 → LLM 裁决 → Bradley-Terry 拟合 → 批内百分位归一化」；pointwise 模式执行 0–5 加性打分归一化。计算加权聚合分，按阈值标记 <code>dropped_lowq</code>。<br>
+<b>不做：</b>不定义 rubric 内容；不决定被过滤记录的物理去向；不做标注语义正确性评审（那是 M7）。</div>
+<h3>3.4.2 输入 / 输出</h3>
+<table>
+<tr><th style="width:12%">方向</th><th>内容</th></tr>
+<tr><td>输入</td><td>批内 <code>status="active"</code> 的 PipelineItem；Rubric；LLM profile。</td></tr>
+<tr><td>输出</td><td>每条记录 <code>item.scores: dict[str, QualityScore]</code>（每 criterion 一项 + <code>"__aggregate__"</code>）；低于阈值者 <code>status="dropped_lowq"</code>。</td></tr>
+</table>
+<h3>3.4.3 算法：pairwise + Bradley-Terry（主模式）</h3>
+<figure>
+<svg viewBox="0 0 1000 330" xmlns="http://www.w3.org/2000/svg" font-family="PingFang SC, sans-serif">
+  <defs>
+    <marker id="arr4" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <g font-size="12.5" text-anchor="middle">
+    <rect x="20" y="40" width="170" height="90" rx="6" fill="#f6f8fa" stroke="#888"/>
+    <text x="105" y="70" font-weight="bold">批内存活记录</text>
+    <text x="105" y="92" font-size="11">N 条（N≥2）</text>
+    <text x="105" y="110" font-size="11" fill="#666">N=1 时不发裁决调用，score 固定 0.5</text>
+
+    <rect x="240" y="40" width="180" height="90" rx="6" fill="#fff" stroke="#c9861a"/>
+    <text x="330" y="64" font-weight="bold">① 配对采样</text>
+    <text x="330" y="86" font-size="11">k 轮；每轮 seed-PRNG 洗牌</text>
+    <text x="330" y="104" font-size="11">相邻两两成对（完美匹配）</text>
+    <text x="330" y="122" font-size="11">奇数条时末位轮空</text>
+
+    <rect x="470" y="40" width="200" height="90" rx="6" fill="#fff" stroke="#c9861a"/>
+    <text x="570" y="64" font-weight="bold">② LLM 裁决（并发）</text>
+    <text x="570" y="86" font-size="11">A/B 呈现顺序随机（防位置偏差）</text>
+    <text x="570" y="104" font-size="11">一次调用裁决全部 criteria</text>
+    <text x="570" y="122" font-size="11">输出经 M8 校验：winner∈{A,B,tie}</text>
+
+    <rect x="720" y="40" width="180" height="90" rx="6" fill="#fff" stroke="#c9861a"/>
+    <text x="810" y="64" font-weight="bold">③ BT 拟合（每 criterion）</text>
+    <text x="810" y="86" font-size="11">MM 迭代求 θ（Hunter 2004）</text>
+    <text x="810" y="104" font-size="11">正则化伪计数 λ=0.1</text>
+    <text x="810" y="122" font-size="11">tie 记 0.5 胜 / 0.5 负</text>
+
+    <rect x="470" y="200" width="200" height="90" rx="6" fill="#eef8f0" stroke="#2e8b57"/>
+    <text x="570" y="228" font-weight="bold">④ 归一化与聚合</text>
+    <text x="570" y="250" font-size="11">score = log θ 的批内百分位 [0,1]</text>
+    <text x="570" y="268" font-size="11">聚合 = Σ wᵢ·scoreᵢ / Σ wᵢ</text>
+
+    <rect x="720" y="200" width="180" height="90" rx="6" fill="#fff" stroke="#b04a4a"/>
+    <text x="810" y="228" font-weight="bold">⑤ 质量门</text>
+    <text x="810" y="250" font-size="11">threshold / top_ratio 判定</text>
+    <text x="810" y="268" font-size="11">⇒ status = dropped_lowq</text>
+  </g>
+  <g stroke="#555" stroke-width="1.8" marker-end="url(#arr4)" fill="none">
+    <line x1="190" y1="85" x2="238" y2="85"/>
+    <line x1="420" y1="85" x2="468" y2="85"/>
+    <line x1="670" y1="85" x2="718" y2="85"/>
+    <path d="M 810 130 L 810 160 L 570 160 L 570 198"/>
+    <line x1="670" y1="245" x2="718" y2="245"/>
+  </g>
+  <text x="330" y="170" font-size="11.5" fill="#666" text-anchor="middle">成本：每 criteria-组 N·k/2 次调用（k 默认 4）</text>
+</svg>
+<figcaption>图 3-2 QuRating pairwise 模式流程</figcaption>
+</figure>
+<p>关键设计的精确定义：</p>
+<table>
+<tr><th style="width:22%">设计点</th><th>定义</th></tr>
+<tr><td>比较池</td><td>= 当前批（<code>run.batch_size</code>）。QuRating 原文在语料分片内采样成对比较 [1]；批即本工具的采样域。批间分数不可直接比较（百分位为批内相对量），报告中按批记录分布。需要跨批可比时使用 pointwise 模式（绝对刻度）。</td></tr>
+<tr><td>配对方案</td><td>k 轮独立随机完美匹配（洗牌后相邻配对）。每记录恰好参与 k 次比较；k 轮随机匹配的并图为随机 k-正则图，k≥3 即高概率连通，默认 k=4 兼顾成本与 BT 可辨识性；孤立分量由正则化伪计数兜底。</td></tr>
+<tr><td>裁决提示词</td><td>系统提示 = rubric 全部 criteria 的 pairwise_prompt 拼接；用户消息 = 记录 A、B 内容（UI 模态为两组「截图+序列化树」，需 profile 支持多图）；要求输出 JSON：<code>{"judgments": [{"criterion": key, "winner": "A"|"B"|"tie", "reason": str}]}</code>（<code>reason</code> 仅当 <code>quality.judgment_reasons</code> 生效时要求——一句话裁决理由，写入 trace 日志供 rubric 优化使用，见 7.5），经 M8 内部 Schema 校验。单次调用裁决全部 criteria（QuRating 为每 criterion 独立询问 [1]；合并询问是成本优化，<code>quality.criteria_per_call = "all"</code>（默认）| <code>"single"</code> 可切回原文行为）。</td></tr>
+<tr><td>位置偏差</td><td>每次比较 A/B 呈现顺序由 PRNG 随机；k 轮聚合平均化残余偏差（Zheng et al. 位置偏差缓解 [20]）。</td></tr>
+<tr><td>BT 拟合</td><td>每 criterion 独立：极大似然 MM 迭代 θᵢ ← Wᵢ / Σ_j nᵢⱼ/(θᵢ+θⱼ)（Hunter 2004 [10]），每轮后归一化 Πθ=1；收敛条件 max|Δlogθ| &lt; 1e-6 或 200 轮。正则化：每记录附加 λ=0.1 次对虚拟对手（θ=1）的半胜半负，保证全胜/全负与孤立分量下 θ 有限且唯一。</td></tr>
+<tr><td>归一化与聚合</td><td>每 criterion 独立：将批内全部 log θ 升序排名（并列取平均秩 rank），<code>score = (rank − 1)/(N − 1)</code>；N=1 时 score=0.5。得分域 [0,1]，批内最低 0、最高 1。聚合分 <code>__aggregate__</code> = Σ wᵢ·scoreᵢ / Σ wᵢ（wᵢ 为 rubric 权重；score 为 null 的 criterion 不计入分子分母）。</td></tr>
+<tr><td>选择机制</td><td><code>quality.selection = "threshold"</code>（默认，现行为：聚合分 &lt; <code>quality.threshold</code> ⇒ <code>status="dropped_lowq"</code>；threshold 缺省则只打分不筛）| <code>"top_ratio"</code>（批内按聚合分降序保留 ceil(<code>top_ratio</code> × 批内存活数) 条，其余 <code>dropped_lowq</code>；<code>quality.top_ratio</code> ∈ (0,1] 必填，与 threshold 互斥，M1 校验）。排序与并列规则：按聚合分降序，聚合分相同时按记录 id 字典序升序作确定性平局裁决（同输入同 seed 可复现）；名额基数「批内存活数」= 批内 score 非 null 的存活记录数（score=null 的 on_unscored 保留记录不计入基数、也不占名额）。top_ratio 在 pairwise 与 pointwise 下均定义良好——两种模式的质量门输入同为批内聚合分排序，是流式场景做定量筛选的推荐姿势；需要「恰好全局 N 条」时须两阶段方案，见 8.3 O6。按 <code>on_unscored="keep"</code> 保留的未打分记录（score=null）不占名额、直接保留。</td></tr>
+<tr><td>裁决失败</td><td>单次比较经 M8 修复仍非法 ⇒ 该比较按 tie 计（对 BT 中性），计入 <code>report.quality.judgment_failures</code>；某记录全部比较失败 ⇒ 该记录 score 置 null 并按 <code>quality.on_unscored = "keep"</code>（默认）| <code>"drop"</code> 处理。</td></tr>
+<tr><td>多评审团（可选）</td><td><code>quality.judges</code> 配置奇数个 LLM profile（默认 <code>[]</code> = 单评审，用 <code>quality.llm</code>）。每次比较由各 judge 以<b>同一呈现顺序</b>独立裁决；per-criterion 取多数票——A/B/tie 三类计票，某类得票过半 ⇒ 取该类，无类别过半 ⇒ tie；BT 拟合取多数结果。trace 中每 judge 各写一条 <code>quality.judgment</code> 事件（payload 增加 <code>judge</code> 字段 = profile 名；7.2 契约只增不改）。成本 = 单评审 × |judges|。背书：PoLL [32]——异构小模型评审团在三种评审设置、六个数据集上优于单一大评审，且显著降低模型内偏差。</td></tr>
+<tr><td>双顺序裁决（可选）</td><td><code>quality.both_orders = true</code>（默认 false）时，同一对记录以正反两种呈现顺序各裁决一次（多评审团下每 judge 各判两次）；per-criterion 两次结果一致（换序后仍指向同一记录）⇒ 记该 winner，不一致 ⇒ tie。合成次序固定：先 per-judge 做双顺序一致性合成，再跨 judge 取多数票。相对「位置偏差」行的随机化缓解，本机制将位置偏差系统性消除（Zheng et al. 的位置一致性判定 [20]）。trace：正反两序各为一次独立裁决，每 judge 各写两条 <code>quality.judgment</code> 事件（以 <code>order</code> 字段区分两序）。成本 ×2。</td></tr>
+</table>
+<h3>3.4.4 算法：pointwise 加性打分（低成本模式）</h3>
+<p>每记录 1 次调用：提示词呈现该 criterion 的 6 级加性量表（0–5，逐级累加式描述，附录 A 给出全文），要求模型先给两句理由再给整数分（判分与理由分离缓解冗长偏差 [20]；加性量表为 FineWeb-Edu 验证的最优形式 [11]）。输出 <code>{"scores": [{"criterion": key, "reason": str, "score": 0..5}]}</code> 经 M8 校验；score 归一化为 /5。聚合与质量门同 pairwise。两种模式共用同一 rubric 的不同字段（pairwise_prompt / pointwise_levels），切换零迁移成本。</p>
+<h3>3.4.5 API 与配置</h3>
+<pre><code>class QualityStage(Stage):
+    name = "quality"
+    async def run(self, batch, ctx) -> list[PipelineItem]: ...
+
+def fit_bradley_terry(n_items: int, comparisons: list[tuple[int, int, float]],
+                      l2_pseudo: float = 0.1, tol: float = 1e-6, max_iter: int = 200) -> np.ndarray:
+    """comparisons: (winner_idx, loser_idx, weight)；tie 拆为两条 weight=0.5。返回 log-theta 数组。"""</code></pre>
+<p>配置见 5.2 <code>[quality]</code>。</p>
+<div class="backing"><b>背书：</b>算法主体逐点对应 QuRating（ICML 2024）[1]：成对判断优于绝对打分的结论、BT 标量化、rubric 四维度均出自该文；本工具以「运行时 API 裁决」替代其「训练 QuRater 分类器离线打分」（无状态约束所致，1.6 节已对齐）。pointwise 模式为 FineWeb-Edu（NeurIPS 2024 D&amp;B）验证的加性量表方案 [11]。BT 拟合采用 Hunter 的 MM 算法 [10]，为该模型的标准数值方法。多评审团为 PoLL [32] 的评审团方案；双顺序一致性判定为 [20] 的位置偏差消除做法。</div>
+
+<h3>3.4.6 输入 / 输出示例</h3>
+<p>以下用一个可手工核对的最小批完整走查 pairwise 主模式。设定：<code>run.modality = "text"</code>、<code>input.text_field = "instruction"</code>、<code>run.seed = 42</code>；<code>quality.mode = "pairwise"</code>、<code>quality.rounds = 2</code>（k=2，演示用，默认为 4）、<code>quality.threshold = 0.3</code>、<code>quality.rubric = "inline"</code>——rubric 仅含一条 criterion：<code>educational_value</code>（weight=1.0，<code>pairwise_prompt</code> 与 <code>description</code> 取自附录 A.1）。批内存活记录 N=4，调用成本 = N·k/2 = <b>4 次</b>（单 criterion 下 <code>criteria_per_call</code> 取值不影响次数）。本例另设 <code>trace.enabled = true</code>（channels 默认含 quality），故 <code>quality.judgment_reasons = "auto"</code> 档生效，裁决输出携带 reason（5.2、7.5）。</p>
+<p><b>① 输入记录</b>（输入法采集的中文指令 JSONL，四行，M2 摄取后按 3.2.5 规则生成 id）：</p>
+<pre><code>{"instruction": "帮我写一条请假条，明天上午要去医院", "source": "ime-log", "ts": "2026-06-30T10:12:00Z"}
+{"instruction": "哈哈哈哈哈哈", "source": "ime-log", "ts": "2026-06-30T10:14:05Z"}
+{"instruction": "解释一下二分查找为什么是 O(log n)，能不能举个在通讯录里找人的例子", "source": "ime-log", "ts": "2026-06-30T10:15:47Z"}
+{"instruction": "把“会议改到周五下午三点”翻译成英文", "source": "ime-log", "ts": "2026-06-30T10:18:22Z"}</code></pre>
+<p class="small">依次记为 r1–r4，id（sha256 前 16 hex）：r1=<code>1cda030abc565f17</code>，r2=<code>91eaaa968c26ab62</code>，r3=<code>fd97f67330e81315</code>，r4=<code>03dddff294e481c8</code>。</p>
+<p><b>② 配对与裁决结果</b>（seed=42 的 PRNG 每轮洗牌后相邻配对；A/B 呈现顺序同样由 PRNG 随机）：</p>
+<table>
+<tr><th>比较</th><th>轮</th><th>呈现 A</th><th>呈现 B</th><th>winner</th><th>BT 折算</th></tr>
+<tr><td>c1</td><td>1</td><td>r3</td><td>r1</td><td>"A"</td><td>r3 胜 r1（权重 1.0）</td></tr>
+<tr><td>c2</td><td>1</td><td>r2</td><td>r4</td><td>"B"</td><td>r4 胜 r2（权重 1.0）</td></tr>
+<tr><td>c3</td><td>2</td><td>r3</td><td>r2</td><td>"A"</td><td>r3 胜 r2（权重 1.0）</td></tr>
+<tr><td>c4</td><td>2</td><td>r1</td><td>r4</td><td>"tie"</td><td>双向各记 0.5 胜（3.4.3）</td></tr>
+</table>
+<p><b>③ 单次比较的报文</b>（以 c1 为例；提示词按 3.4.3 组装，输出经 M8 内部 Schema 校验）：</p>
+<pre><code>system:
+  你将对两条记录进行成对质量比较。准则如下：
+  - educational_value: 教育/训练价值：作为模型训练数据能带来多少可学习的能力。
+    比较两段文本，哪一段更有教育价值、更值得用于训练语言模型？
+  对每条准则给出裁决。输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
+  {"judgments": [{"criterion": &lt;准则 key&gt;, "winner": "A"|"B"|"tie", "reason": &lt;一句话理由&gt;}]}
+user:
+  [记录 A] 解释一下二分查找为什么是 O(log n)，能不能举个在通讯录里找人的例子
+  [记录 B] 帮我写一条请假条，明天上午要去医院
+
+← 响应:
+{"judgments": [{"criterion": "educational_value", "winner": "A",
+                "reason": "A 要求讲解算法复杂度并配实例，覆盖推理与解释能力，可学习内容明显多于 B 的日常写作请求。"}]}</code></pre>
+<p><b>④ BT 拟合（MM 算法，3.4.3）</b>：胜场计入 W 后，每记录再附加 λ=0.1 次对虚拟对手（θ=1）的半胜半负（W 各 +0.05，分母各加 0.1/(θᵢ+1)）；迭代 θᵢ ← Wᵢ / Σⱼ nᵢⱼ/(θᵢ+θⱼ)，每轮归一化 Πθ=1。本例在 200 轮上限处终止（此时 max|Δlogθ| 约 4×10⁻⁶，尚未达 1×10⁻⁶ 收敛线，log θ 前 3 位小数早已稳定）。</p>
+<p><b>⑤ 归一化与 ⑥ 质量门</b>：score = (rank−1)/(N−1)，rank 为 log θ 升序排名（并列取平均秩）；单准则 weight=1.0 时聚合分 = 该准则分：</p>
+<table>
+<tr><th>记录</th><th>comparisons</th><th>wins / ties</th><th>log θ</th><th>升序 rank</th><th>score</th><th>__aggregate__</th><th>质量门（threshold=0.3）</th></tr>
+<tr><td>r2</td><td>2</td><td>0 / 0</td><td>-3.021</td><td>1</td><td>0.000</td><td>0.000</td><td>&lt; 0.3 ⇒ <code>status="dropped_lowq"</code></td></tr>
+<tr><td>r1</td><td>2</td><td>0 / 1</td><td>-0.082</td><td>2</td><td>0.333</td><td>0.333</td><td>active</td></tr>
+<tr><td>r4</td><td>2</td><td>1 / 1</td><td>0.082</td><td>3</td><td>0.667</td><td>0.667</td><td>active</td></tr>
+<tr><td>r3</td><td>2</td><td>2 / 0</td><td>3.021</td><td>4</td><td>1.000</td><td>1.000</td><td>active</td></tr>
+</table>
+<p>r1 写入 <code>item.scores</code> 的内容（4.2 <code>QualityScore</code> 的 JSON 形态）：</p>
+<pre><code>"scores": {
+  "educational_value": {"criterion": "educational_value", "score": 0.333, "mode": "pairwise_bt",
+                        "detail": {"comparisons": 2, "wins": 0, "ties": 1, "log_theta": -0.082}},
+  "__aggregate__":     {"criterion": "__aggregate__", "score": 0.333, "mode": "pairwise_bt",
+                        "detail": {}}
+}</code></pre>
+<p>r2 被标记 <code>dropped_lowq</code>，按 <code>output.rejects</code> 策略进入 rejects 通道并计入 <code>report.counts.dropped_lowq</code>；r1、r3、r4 保持 active 进入 M5。</p>
+<p><b>⑦ pointwise 低成本模式对照</b>（<code>quality.mode = "pointwise"</code>，对 r1 仅 1 次调用；量表取附录 A.1 <code>educational_value</code> 的 <code>pointwise_levels</code>）：</p>
+<pre><code>system:
+  按以下 0–5 加性量表为记录的 educational_value（教育/训练价值）打分，先给两句理由再给整数分：
+  0: 无学习价值（噪声、纯广告、无意义重复）。
+  1: 学习价值极低，内容浅表。
+  2: 在 1 的基础上，有一定可学习内容但组织松散。
+  3: 在 2 的基础上，内容系统、有清晰的知识或任务示范价值。
+  4: 在 3 的基础上，示范性强，覆盖推理/解释/结构化表达等能力。
+  5: 在 4 的基础上，训练价值突出，属稀缺的高质量样本。
+  输出 JSON：{"scores": [{"criterion": &lt;准则 key&gt;, "reason": &lt;两句理由&gt;, "score": 0..5}]}
+user:
+  [记录内容] 帮我写一条请假条，明天上午要去医院
+
+← 响应:
+{"scores": [{"criterion": "educational_value",
+             "reason": "该指令是意图明确的写作示范任务，包含时间与事由等具体要素。但任务简单，不涉及推理或专业知识，可学习内容有限。",
+             "score": 3}]}
+
+→ 归一化 3/5 = 0.6：{"criterion": "educational_value", "score": 0.6, "mode": "pointwise",
+                     "detail": {"raw_score": 3, "reason": "该指令是意图明确的写作示范任务……"}}</code></pre>
+<div class="note"><b>提示：</b>r1 在 pairwise 下得 0.333、在 pointwise 下得 0.6，二者不矛盾——前者是批内相对百分位（本批恰有 r3 这类强样本压秩），后者是绝对刻度（3.4.3「比较池」行）。需要跨批可比时选 pointwise。</div>
+<h4>⑧ top_ratio 选择示范</h4>
+<p>沿用本例 4 条记录的最终得分（r2=0.000、r1=0.333、r4=0.667、r3=1.000），改设 <code>quality.selection = "top_ratio"</code>、<code>quality.top_ratio = 0.5</code>（此时不设 <code>quality.threshold</code>，二者互斥，M1 校验）：批内按聚合分降序保留 ceil(0.5 × 4) = 2 条 ⇒ r3、r4 保持 active，r1、r2 置 <code>status="dropped_lowq"</code>。对比 ⑥ 中 <code>threshold = 0.3</code> 只丢 r2 一条：threshold 按绝对分数线筛、每批淘汰数随分布浮动，top_ratio 按批内名次筛、每批保留比例恒定。</p>
+
+<!-- ─────────── M5 ─────────── -->
+<h2 id="m5">3.5 M5 标注 annotate</h2>
+<h3>3.5.1 职责与边界</h3>
+<div class="boundary"><b>做：</b>为每条存活记录组装标注提示词（任务指令 + few-shot + 记录内容，UI 模态含截图与序列化树），经 M9 调用 LLM、经 M8 获得符合用户 Schema 的标注对象；可选 self-consistency 多次采样字段级投票（3.5.2）。<br>
+<b>不做：</b>不校验结构（全部委托 M8）；不评审标注质量（M4/M7 职责）；不产出新记录（生成属 M6）；不做提示词内容的「智能改写」——提示词组装是确定性模板拼接。</div>
+<h3>3.5.2 标注提示词组装（确定性模板）</h3>
+<pre><code>system:
+  {annotate.instruction}                        # project.toml，必填
+  输出必须是符合以下 JSON Schema 的单个 JSON 对象，不输出任何其他内容：
+  {user_schema_json}                            # M8 提供的规范化 Schema 文本
+user (对每条 few-shot 示例，依次):
+  [示例输入] {example.input}
+  [示例输出] {example.output}                    # M1 启动时已校验示例输出符合用户 Schema
+user (当前记录):
+  文本模态: [待标注数据] {record.text}
+  UI 模态:  [屏幕截图] &lt;image: base64&gt;
+           [UI 控件树] {record.ui_tree.serialize(max_chars=input.ui_tree_max_chars)}</code></pre>
+<p>UI 树序列化格式（<code>UITree.serialize()</code>，4.3 节）：深度缩进的每节点一行 <code>&lt;role&gt; "text" [l,t,r,b] {关键属性}</code>，只保留可见节点与非空属性，超出 <code>ui_tree_max_chars</code> 时按深度优先截断并追加 <code>…(truncated N nodes)</code> 标记。此「图 + 线性化结构文本」双通道输入是 ScreenAI 的 screen-schema 表示 [13] 与 GUI 智能体输入惯例 [16][17]。</p>
+<div class="note"><b>标注鲁棒性：self-consistency（可选，v1.2）。</b><code>annotate.self_consistency = n</code>（默认 0 = 关；启用须 n ≥ 3 且为奇数，5.2）时，M5 对每条记录按本节模板独立采样 n 次（temperature 统一取 <code>annotate.sc_temperature</code>，默认 0.7——采样多样性的来源），每次输出都各自经 M8 走完整结构保证后才参与投票。<b>字段级投票</b>：enum / boolean / integer 字段逐字段取 n 个样本中的众数；自由文本 / 数组字段不逐字投票，取「与众数字段组合一致的样本」中第一个的对应字段值。其余类型字段（number、嵌套 object 等）与自由文本/数组同法处理（不逐字段投票，随众数字段组合整体取值）。全体分歧（众数组合不存在或无样本与其完全一致）时整体采用第一个样本，并计入 <code>report.annotate.sc_disagreements</code>。某次采样经 M8 修复仍失败（SchemaViolation）⇒ 该样本弃权、由其余合法样本投票（agreement_ratio 分母仍为 n）；n 次全部失败才置 <code>status="failed"</code>。<code>_meta.annotation.attempts</code> 记 n 次采样 attempts 之和。<code>_meta.annotation</code> 增 <code>sc = {n, agreement_ratio}</code>（agreement_ratio = 与最终众数字段组合完全一致的样本数 / n；6.3 只增字段）；trace <code>annotate.done</code> 事件 payload 增同构 <code>sc</code> 字段（7.2「只增不改」契约内扩展）。该机制对分类型 Schema 收益最大——如统一示例的 <code>intent</code> / <code>difficulty</code> 枚举字段：多路径采样 + 多数投票显著优于单次贪心解码（Self-Consistency，Wang et al., ICLR 2023 [33]，GSM9K +17.9%）。成本：标注调用与 token ×n。</div>
+<h3>3.5.3 API 与错误处理</h3>
+<pre><code>class AnnotateStage(Stage):
+    name = "annotate"
+    async def run(self, batch, ctx) -> list[PipelineItem]:
+        """对每条 active 记录: prompt = build_prompt(rec); item.annotation = await ctx.schema_engine
+           .complete_validated(profile, prompt, user_schema)  # M8 全责保证结构
+           SchemaViolation(不可修复) ⇒ item.status='failed', 错误入 item.errors。"""</code></pre>
+<div class="backing"><b>背书：</b>「指令 + few-shot + 结构化输出」的 LLM 标注器是 distilabel（Argilla）[5] 与 Autolabel（Refuel）[12] 两个工业框架的核心抽象；UI 模态输入表示见 3.5.2 背书 [13][16][17]；self-consistency 字段级投票为 Wang et al.（ICLR 2023）的多路径采样多数决 [33]。</div>
+
+<h3>3.5.4 输入 / 输出示例</h3>
+<h4>① 文本模态标注（输入法中文指令 → 意图标注）</h4>
+<p>工程配置：<code>input.text_field = "instruction"</code>，<code>annotate.llm = "default"</code>，<code>annotate.examples</code> 含 1 条 few-shot 示例，用户 Schema 经 <code>output.schema_inline</code> 内嵌（M1 启动时已校验示例输出符合该 Schema）。输入记录（id 规则见 3.2.5）：</p>
+<pre><code>{"instruction": "帮我写一条请假条，明天上午要去医院", "source": "ime-log", "ts": "2026-06-30T10:12:00Z"}
+    ⇒ Record(id="1cda030abc565f17", modality="text", text="帮我写一条请假条，明天上午要去医院", ...)</code></pre>
+<p>按 3.5.2 模板逐字组装的完整提示词（<code>{user_schema_json}</code> 为 M8 提供的规范化 Schema 文本）：</p>
+<pre><code>system:
+  你是输入法中文用户指令的意图标注员。判断给定指令属于哪类意图、其主题是什么、
+  以及完成该指令对语言模型的难度。
+  输出必须是符合以下 JSON Schema 的单个 JSON 对象，不输出任何其他内容：
+  {"type": "object",
+   "properties": {
+     "intent": {"type": "string", "enum": ["writing_assist", "qa", "translation", "chitchat", "other"]},
+     "topic": {"type": "string"},
+     "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]}},
+   "required": ["intent", "topic", "difficulty"], "additionalProperties": false}
+user (few-shot 示例 1):
+  [示例输入] NBA 总决赛什么时候开始
+  [示例输出] {"intent": "qa", "topic": "体育赛事时间查询", "difficulty": "easy"}
+user (当前记录):
+  [待标注数据] 帮我写一条请假条，明天上午要去医院</code></pre>
+<p>LLM 响应文本经 M8（L1 直得平衡花括号子串，L2 一次通过，无 L3 修复）返回合法对象，M5 构造 <code>Annotation</code>（4.2 节）：</p>
+<pre><code>响应: {"intent": "writing_assist", "topic": "请假条代写", "difficulty": "easy"}
+
+item.annotation = Annotation(
+    output   = {"intent": "writing_assist", "topic": "请假条代写", "difficulty": "easy"},
+    model    = "qwen2.5-vl-72b-instruct",       # llm.default 的 model
+    attempts = 1,                               # 1 + 0 次 L3 修复
+    usage    = Usage(prompt_tokens=312, completion_tokens=31))</code></pre>
+<h4>② UI 模态标注（§5.2 登录页工程）</h4>
+<p>提示词骨架与 ① 完全相同（system = §5.2 的 <code>annotate.instruction</code> + 规范化用户 Schema），差别仅在「当前记录」user 消息由两个 Part 组成（3.9.2）：<code>[屏幕截图]</code> 为 <code>kind="image"</code> 的 Part（<code>capture/2026-07-01/c/image_2.png</code>，M9 调用时缩放并 base64 编码）；<code>[UI 控件树]</code> 为 <code>kind="text"</code> 的 Part，内容即 <code>record.ui_tree.serialize(max_chars=30000)</code> 的输出——实例见 3.2.7，此处不重复。对 <code>capture/2026-07-01/b/uitree_2.jsonl</code> 该记录（id <code>9f2c31ab52e08d17</code>）的响应 JSON（即 §6.3 主输出行剥除 <code>_meta</code> 后的用户结构，<code>annotation.model / attempts</code> 与该行 <code>_meta.annotation</code> 一致）：</p>
+<pre><code>{"screen_category": "login",
+ "page_title": "登录",
+ "interactive_elements": [
+   {"role": "EditText", "label": "请输入手机号",   "bounds": [72, 520, 1008, 664]},
+   {"role": "EditText", "label": "请输入验证码",   "bounds": [72, 712, 672, 856]},
+   {"role": "Button",   "label": "获取验证码",     "bounds": [704, 712, 1008, 856]},
+   {"role": "Button",   "label": "登录",           "bounds": [72, 952, 1008, 1096]}],
+ "description": "手机号+验证码登录页"}</code></pre>
+
+
+<!-- ─────────── M6 ─────────── -->
+<h2 id="m6">3.6 M6 生成 generate</h2>
+<h3>3.6.1 职责与边界</h3>
+<div class="boundary"><b>做：</b>组装生成提示词——种子按运行模式取自：process 模式 = 当前批过质量门的记录；generate_only 模式（v1.4）= 配置种子池 <code>generate.seed_examples</code>，或无种子（仅 instruction × style 条件化）。按 <code>generate.llms</code> ×（可选）<code>[[generate.styles]]</code> 组合产出新样本文本，构造为携带 <code>generated_from</code> 与 <code>generator</code> 溯源的新 Record，组成生成子批交 M10 回流调度。提示词组装同为确定性模板拼接（含「[风格要求]」追加）。<br>
+<b>不做：</b>仅文本模态（无法生成截图，2.3.1 约束③）；单轮回流、不递归；不去重 / 不打分 / 不标注 / 不校验（回流后由 M3 / M4 / M5 / M7 完成）；生成调用失败仅损失该调用的样本，不产生 failed 记录（种子记录状态不变，记录级隔离，1.3）。</div>
+<h3>3.6.2 生成模式</h3>
+<table>
+<tr><th style="width:22%">步骤</th><th>定义</th></tr>
+<tr><td>种子选取</td><td>当前批内 <code>status="active"</code> 且聚合分 ≥ <code>generate.seed_min_score</code>（默认取 quality.threshold，未设阈值时取批内中位数）的记录（process 模式）。<b>generate_only 模式（v1.4）</b>：种子 = <code>generate.seed_examples</code> 字符串数组——Self-Instruct 的人工种子池形态（原文以 175 条人工种子自举 [18]）；数组缺省则为<b>无种子条件化</b>，提示词不含示例段、仅由 <code>generate.instruction</code> ×（可选）styles 驱动（Persona Hub / Cosmopedia 形态 [34][35]），须显式给出量目标 <code>generate.standalone_count</code>。</td></tr>
+<tr><td>生成调用</td><td>每次调用随机<b>不放回</b>抽 min(<code>generate.seeds_per_call</code>（默认 3）, 可用种子数) 条种子作为示例（种子池小于抽样数时取全池）（Self-Instruct 的 in-context 自举结构 [18]），system = <code>generate.instruction</code>，要求输出 <code>{"samples": [str, ...]}</code>（恰 <code>generate.num_per_call</code> 条，默认 4），经 M8 校验。调用次数 = ⌈种子数 × generate.num_per_record / num_per_call⌉（generate_only 种子池形态同式，种子数 = len(seed_examples)，seeds_per_call 从种子池抽；无种子形态 = ⌈standalone_count / num_per_call⌉，提示词省去示例段）。</td></tr>
+<tr><td>多模型混合（v1.2）</td><td><code>generate.llms</code> 为 profile 引用数组（默认 <code>["default"]</code>，取代 v1.1 的单值键 <code>generate.llm</code>，5.2 配置表已同步修订）。每次生成调用按 <code>generate.mixture</code> 选定 1 个 profile：<code>"round_robin"</code>（默认）按调用序轮转；<code>"weighted"</code> 按 <code>generate.weights</code> 加权随机抽样。抽样 PRNG 用 <code>ctx.rng</code>（3.10.3，随 run.seed 派生）；实现须在并发派发前按调用序号 0..C−1 一次性预抽全部 (llm, style) 对（round_robin 的轮转序同样以调用序号为准），使结果与并发调度顺序无关，逐调用可复现。动机：单一模型自生成会使产出分布收窄、尾部逐渐消失（model collapse，Shumailov et al., Nature 2024 [36]），异构生成器混合是公认缓解；distilabel 的「任务级绑定任意 LLM」为同构工业设计 [5]。</td></tr>
+<tr><td>风格条件化（可选）</td><td><code>[[generate.styles]]</code> 子表（每项 <code>name</code> + <code>prompt</code>）非空时，每次生成调用经 <code>ctx.rng</code> 均匀抽取 1 个 style，其 prompt 以「<code>[风格要求] …</code>」格式追加在 <code>generate.instruction</code> 之后（仍为确定性模板拼接，3.6.1 边界不变）。persona / 受众条件化提升合成多样性的背书：Persona Hub 以 10 亿 persona 条件化提示 [34]；Cosmopedia 按受众 × 风格分桶派生提示 [35]。溯源与可观测（v1.2 只增）：新记录 <code>_meta.source</code> 增 <code>generator = {"llm": &lt;profile&gt;, "style": &lt;name&gt;|null}</code>（未配置 styles 时 style 为 null；6.3 信封只增字段）；<code>report.generate</code> 增 <code>buckets</code> 统计——每 llm×style 桶的调用数 / 产出条数 / 去重存活数，令多样性可观测：某桶去重命中率显著偏高 ⇒ 该桶贡献的多样性低，应调整其权重或 style prompt。</td></tr>
+<tr><td>新记录构造</td><td>每条样本文本构造 Record：<code>raw = {input.text_field: sample}</code>，id 规则同 M2，<code>ref.generated_from = [种子id列表]</code>；generate_only 模式下 <code>generated_from = []</code>（种子非记录、无记录 id，种子本身在 project.toml 中可审计），<code>generator</code> 照常携带。</td></tr>
+<tr><td>回流</td><td>新记录组成「生成子批」交回 M10，从 M3 起走 <b>去重 →打分 → 标注 →校验</b>；去重索引含全部原始记录与先前生成样本，即 Self-Instruct 的相似度过滤 [18]（3.3.3 节）。子批不再触发生成（<b>单轮回流，不递归</b>）。generate_only 模式下生成子批即唯一数据来源：按 <code>run.batch_size</code> 切批走同一链路 M3→M4→M5→M7→M11（3.10.3），单遍不递归同样适用。</td></tr>
+</table>
+
+<h3>3.6.3 API</h3>
+<pre><code>class GenerateStage(Stage):
+    name = "generate"
+    async def run(self, batch, ctx) -> list[PipelineItem]:
+        """返回值为新生成记录的子批（原批不修改）；M10 负责回流调度。
+           单次生成调用经 M8 修复仍非法或重试耗尽 ⇒ 该调用作废并计入
+           report.generate.buckets（calls 计入、produced 为 0），不影响其他调用与原批。"""</code></pre>
+<div class="backing"><b>背书：</b>生成模式为 Self-Instruct（ACL 2023）的种子自举 + 相似度过滤流程 [18]，指令可按 Evol-Instruct 风格写深化/扩展变体 [19]；多模型混合与风格条件化的多样性背书：Persona Hub [34]、Cosmopedia [35]、model collapse 的多生成器缓解 [36]；「任务级绑定任意 LLM」为 distilabel 的同构工业设计 [5]。</div>
+
+<h3>3.6.4 输入 / 输出示例</h3>
+<p>沿用统一文本示例（意图标注工程，仅文本模态），project.toml 追加：</p>
+<pre><code>[generate]                                  # project.toml 追加片段
+enabled = true
+llm = "default"
+instruction = """你是中文输入法的真实用户。模仿示例指令的口吻与场景，生成全新的一句话中文指令：
+日常场景、口语化、诉求明确；只借鉴风格与题材范围，不得复述示例内容。"""
+num_per_record = 2
+seeds_per_call = 3
+num_per_call = 4                            # temperature 取默认 0.9</code></pre>
+<p>v1.2 键名迁移与多样性设定补充：上述片段中的单值键 <code>llm = "default"</code> 在 v1.2 写作数组键 <code>llms</code>（5.2 配置表），本示例取双模型轮转 + 两个风格模板（种子选取、调用次数与下方样本文本均不变）：</p>
+<pre><code>llms = ["default", "judge"]                 # v1.2：取代 llm = "default"；元素须为 [llm.*] profile
+mixture = "round_robin"                     # 第 1 次调用走 llms[0]="default"，第 2 次走 llms[1]="judge"
+
+[[generate.styles]]                         # 可选；每次调用经 ctx.rng 均匀抽 1 个 style
+name = "concise"
+prompt = "指令务求简短口语化，一句话直接给出诉求，不加铺垫。"
+
+[[generate.styles]]
+name = "scenario"
+prompt = "指令中须带出一个具体的生活或工作场景（对象、事由或时间）。"</code></pre>
+<p class="small">抽中 style 的 prompt 以「[风格要求] …」追加在 <code>generate.instruction</code> 之后（3.6.2 风格条件化行）。本示例第 1 次调用轮转到 <code>"default"</code>、<code>ctx.rng</code> 抽中 <code>"concise"</code>，system 末尾追加「[风格要求] 指令务求简短口语化，一句话直接给出诉求，不加铺垫。」；第 2 次调用走 <code>"judge"</code>。</p>
+<p>设 <code>quality.threshold = 0.5</code>（故 <code>generate.seed_min_score</code> 默认取 0.5），本批过门槛种子恰 3 条；调用次数 = ⌈3 × 2 / 4⌉ = 2。第 1 次调用抽全部 3 条种子入提示词（system = <code>generate.instruction</code> + M8 持有的内部生成输出 Schema，要求 <code>{"samples": [str, ...]}</code> 恰 4 条）：</p>
+<pre><code>种子: 1cda030abc565f17 "帮我写一条请假条，明天上午要去医院"
+      d5ad41d6357f8a55 "写一份周报模板"
+      7ed3a60f4714c33f "帮我把这段话翻译成英文……"
+
+响应(经 M8 校验): {"samples": [
+  "帮我写一段给客户的道歉话术，快递发错货了",
+  "把'会议改到下周三下午三点'翻译成英文",
+  "帮我编一条朋友圈文案，晒周末爬山的照片",
+  "写一个辞职信的开头，语气委婉一点"]}</code></pre>
+<p>每条样本按 3.6.2 构造新 Record（<code>raw = {input.text_field: sample}</code>，id 规则同 M2）。第 1 条：</p>
+<pre><code>Record(
+    id       = "31dae67e9b295e34",          # sha256(canonical_json(raw))[:16]
+    modality = "text",
+    text     = "帮我写一段给客户的道歉话术，快递发错货了",
+    raw      = {"instruction": "帮我写一段给客户的道歉话术，快递发错货了"},
+    ui_tree  = None, image = None,
+    ref      = RecordRef(source_file="", line_no=None, pair_index=None,
+                         generated_from=("1cda030abc565f17", "d5ad41d6357f8a55", "7ed3a60f4714c33f"),
+                         generator={"llm": "default", "style": "concise"}))</code></pre>
+<p>v1.2 设定下，该 Record 出自第 1 次生成调用（<code>"default"</code> × style <code>"concise"</code>），主输出中其 <code>_meta.source</code> 片段（6.3；<code>generator</code> 为 v1.2 只增字段，计入 <code>report.generate.buckets</code> 的 <code>default×concise</code> 桶）：</p>
+<pre><code>"source": {"file": "", "pair_index": null,
+           "generated_from": ["1cda030abc565f17", "d5ad41d6357f8a55", "7ed3a60f4714c33f"],
+           "fields": {},
+           "generator": {"llm": "default", "style": "concise"}}   // 未配置 styles 时 style 为 null</code></pre>
+<p class="small">4 条新 Record 组成生成子批交回 M10，从 M3 起回流（单轮，不递归）：与全部原始记录及先前生成样本做去重，MinHash-Jaccard ≥ 0.85 者标记 <code>dropped_dup</code>（3.3.3 的 Self-Instruct 相似度过滤）。</p>
+<h4>纯生成模式变体（v1.4，无输入数据）</h4>
+<pre><code># project.toml（纯生成工程；无 [run].input）
+[run]
+mode = "generate_only"
+output = "./out/synth-ime-0702.jsonl"
+modality = "text"
+
+[generate]
+enabled = true
+llms = ["default", "judge"]
+mixture = "round_robin"
+instruction = """（同上例生成指令）"""
+seed_examples = [                    # 种子池形态：调用次数 = ⌈3 × 2 / 4⌉ = 2，与上例同式
+  "帮我写一条请假条，明天上午要去医院",
+  "写一份周报模板",
+  "帮我把这段话翻译成英文……"]
+num_per_record = 2
+# 无种子形态则改为：省去 seed_examples，设 standalone_count = 500（调用数 = ⌈500/4⌉ = 125）</code></pre>
+<p class="small">与上例（process 模式）的差异仅在入口与种子来源：无 M2 接入（IngestReport 全零、<code>report.counts.scanned = 0</code>），生成样本按 <code>run.batch_size</code> 切批走 M3→M4→M5→M7→M11；新 Record 的 <code>generated_from = []</code>、<code>generator</code> 照常携带（如 <code>{"llm": "default", "style": null}</code>）。6.4 计数不变量退化为 emitted + dropped_* + failed = generated，仍成立。</p>
+
+
+<!-- ─────────── M7 ─────────── -->
+<h2 id="m7">3.7 M7 二次校验 verify</h2>
+<h3>3.7.1 职责与边界</h3>
+<div class="boundary"><b>做：</b>用独立 judge profile 对每条 (记录, 标注) 评审：输出 verdict（pass/fail）+ 逐项批评意见；fail 时按策略丢弃，或将批评意见回喂 M5 重新标注（有界修复环）。<br>
+<b>不做：</b>不自己改写标注（修复 = M5 重标注 + M8 重校验，M7 只供给批评意见）；不评审结构合法性（到达此处的标注必已合法）；不做打分（M4 职责）。</div>
+<h3>3.7.2 评审调用</h3>
+<pre><code>system: 你是标注质量审核员。给定任务指令、原始数据与标注结果，独立判断标注是否合格。
+        评审维度: ① 是否遵循任务指令 ② 与原始数据的事实一致性 ③ 字段语义是否正确填写
+        {verify.extra_criteria}                       # 可选，用户追加维度
+        先逐维度给出简短意见，再给结论。
+user:   [任务指令] {annotate.instruction}
+        [原始数据] {record 内容，UI 模态含截图+树}
+        [标注结果] {annotation.output 的 JSON}
+输出(经 M8 校验): {"critiques": [{"aspect": str, "opinion": str}], "verdict": "pass"|"fail"}</code></pre>
+<p>「先意见后结论」的顺序固定，利用自回归生成让结论以意见为条件（chain-of-thought 评审，Zheng et al. [20]）。judge profile 应配置为与标注 profile 不同的模型（自我评审存在自增强偏差 [20]），M1 在两 profile 的 model 字段相同时打印 warning（不阻断）。</p>
+
+<div class="note"><b>多评审团（可选，v1.2）：</b><code>verify.judges</code>（array，默认 <code>[]</code>，与 <code>quality.judges</code> 语义一致）非空时启用评审团：空 = 单评审走 <code>verify.llm</code>，本节既有行为完全不变；非空须为<b>奇数个</b> profile 引用（M1 校验，不满足报错退出码 2）。各 judge 按本节同一模板<b>各自独立</b>评审（互不可见对方意见），最终 <code>verdict</code> 取多数票；各方 <code>critiques</code> 全部合并保留进 <code>VerificationResult.critiques</code>（4.2），每条标注来源——条目增加 <code>judge</code> 字段（= profile 名）。trace 事件 <code>verify.verdict</code> 相应改为<b>每 judge 一条</b>，payload 新增 <code>judge</code> 字段（字段只增不改，7.2 事件契约向后兼容）。<code>policy = "repair"</code> 回喂 M5 时，[审核意见] 段 = 全部投 fail 的 judge 的 critiques 合并（各条前缀来源 judge 名）。成本为单评审的 |judges| 倍，宜配置 3 个异构小模型 profile 而非加倍调用同一大模型。<b>背书：</b>多个较小模型组成的评审团（PoLL）在三种评审设置、六个数据集上优于单一大模型评审，因跨模型家族的多样性显著降低单模型自增强偏差，且成本比单一大评审低 7 倍以上（Verga et al. [32]）——与本节「judge 独立于标注模型」是同一去偏原则的推广。</div>
+<h3>3.7.3 失败策略与修复环</h3>
+<table>
+<tr><th style="width:26%">策略</th><th>行为</th></tr>
+<tr><td><code>verify.policy = "drop"</code>（默认）</td><td>fail ⇒ <code>status="dropped_verify"</code>，批评意见摘要入 <code>_meta.verification</code> 与 rejects 通道。</td></tr>
+<tr><td><code>verify.policy = "repair"</code></td><td>fail ⇒ 将批评意见追加进标注提示词（<code>[上一版标注] ... [审核意见] ...  请修正后重新输出</code>），M5 重标注、M8 重校验、M7 重评审；最多 <code>verify.max_repair_rounds</code>（默认 1）轮，仍 fail 按 drop 处理。评审轮数记入 <code>_meta.verification.rounds</code>（含首评，一次通过 =1；修复后复评 =2），各轮意见按序累积于 <code>VerificationResult.critiques</code>（4.2），实例见 3.7.4。</td></tr>
+</table>
+<div class="backing"><b>背书：</b>LLM-as-a-Judge 的可靠性、偏差类型（位置/冗长/自增强）与缓解手段出自 Zheng et al.（NeurIPS 2023）[20]；「批评意见回喂原模型迭代修正」是 Self-Refine（NeurIPS 2023）的 FEEDBACK→REFINE 循环 [21]，有界轮数与其停机设定一致；批评-修订两阶段结构同 Constitutional AI [22]。GUI-360 以同构的「LLM 质量过滤」环节筛选 GUI 轨迹数据 [14]。</div>
+
+<h3>3.7.4 输入 / 输出示例</h3>
+<p>沿用全文文本模态贯穿示例（输入法中文指令意图标注工程，<code>input.text_field = "instruction"</code>）。配置：<code>verify.enabled = true</code>、<code>verify.llm = "judge"</code>、<code>verify.policy = "repair"</code>、<code>verify.max_repair_rounds = 1</code>（默认）、<code>verify.extra_criteria = ""</code>（默认，未追加维度）。记录 <code>id = "1cda030abc565f17"</code>，原始行 <code>{"instruction": "帮我写一条请假条，明天上午要去医院", "source": "ime-log", "ts": "2026-06-30T10:12:00Z"}</code>，M5 首版标注（已过用户 Schema）为 <code>{"intent": "writing_assist", "topic": "请假条写作", "difficulty": "easy"}</code>。</p>
+
+<h4>① 首次评审调用（第 1 轮）</h4>
+<p>按 3.7.2 模板组装，judge 走 <code>[llm.judge]</code> profile（claude-sonnet-5，独立于标注模型）：</p>
+<pre><code>system: 你是标注质量审核员。给定任务指令、原始数据与标注结果，独立判断标注是否合格。
+        评审维度: ① 是否遵循任务指令 ② 与原始数据的事实一致性 ③ 字段语义是否正确填写
+        先逐维度给出简短意见，再给结论。        # extra_criteria 为空，无追加行
+user:   [任务指令] 你是输入法中文指令的意图标注员。判断每条用户指令的意图类别（intent）、
+        主题（topic）与完成难度（difficulty）。
+        [原始数据] 帮我写一条请假条，明天上午要去医院        # 文本模态 = record.text
+        [标注结果] {"intent": "writing_assist", "topic": "请假条写作", "difficulty": "easy"}</code></pre>
+<p>judge 响应（经 M8 按评审内部 Schema 校验合法）：</p>
+<pre><code>{"critiques": [{"aspect": "字段语义",
+                "opinion": "difficulty 标为 easy，但该指令涉及正式文书格式与措辞得体性，应为 medium"}],
+ "verdict": "fail"}</code></pre>
+
+<h4>② 修复轮：批评意见回喂 M5</h4>
+<p><code>verdict = "fail"</code> 且 <code>policy = "repair"</code>、已用修复轮数 0 &lt; <code>max_repair_rounds</code> = 1，触发修复。按 3.7.3 格式将下述片段追加进 3.5.2 组装的标注提示词末尾（system / few-shot / 当前记录各段与首次标注调用逐字相同）：</p>
+<pre><code>[上一版标注] {"intent": "writing_assist", "topic": "请假条写作", "difficulty": "easy"}
+[审核意见] 字段语义: difficulty 标为 easy，但该指令涉及正式文书格式与措辞得体性，应为 medium
+请修正后重新输出</code></pre>
+<p>M5（<code>[llm.default]</code>，qwen2.5-vl-72b-instruct）重新输出，经 M8 通过用户 Schema（L0 直出即合法，<code>attempts = 1</code>）：</p>
+<pre><code>{"intent": "writing_assist", "topic": "请假条写作", "difficulty": "medium"}</code></pre>
+
+<h4>③ 二次评审（第 2 轮）</h4>
+<p>以修正版标注按 ① 相同模板重新组装（仅 <code>[标注结果]</code> 段更换），judge 响应：</p>
+<pre><code>{"critiques": [{"aspect": "字段语义",
+                "opinion": "difficulty = medium 与正式文书的格式及措辞要求相符，intent 与 topic 填写正确"}],
+ "verdict": "pass"}</code></pre>
+<p><code>verdict = "pass"</code>，记录保持 <code>status = "active"</code>，流转至 M11 写出。</p>
+
+<h4>④ 最终结果对象</h4>
+<p><code>PipelineItem.verification</code>（4.2 <code>VerificationResult</code>；<code>critiques</code> 为各评审轮意见按轮次顺序累积）：</p>
+<pre><code>VerificationResult(
+  verdict   = "pass",
+  rounds    = 2,    # 评审轮数：首评 fail + 修复后复评 pass；一次通过时为 1（对照 6.3 示例）
+  critiques = ({"aspect": "字段语义",
+                "opinion": "difficulty 标为 easy，但该指令涉及正式文书格式与措辞得体性，应为 medium"},
+               {"aspect": "字段语义",
+                "opinion": "difficulty = medium 与正式文书的格式及措辞要求相符，intent 与 topic 填写正确"}))</code></pre>
+<p>主输出行中 <code>_meta</code> 的相关片段（形态见 6.3）：</p>
+<pre><code>"_meta": {
+  "id": "1cda030abc565f17", ...,
+  "annotation":   {"model": "qwen2.5-vl-72b-instruct", "attempts": 1},   // 修复轮的 M5 输出，结构一次合法
+  "verification": {"verdict": "pass", "rounds": 2}
+}</code></pre>
+<div class="note"><b>对照分支：</b>若二次评审仍 fail，此时已达 <code>max_repair_rounds</code>（默认 1），按 drop 收尾——<code>status = "dropped_verify"</code>，批评意见摘要入 <code>_meta.verification</code> 与 rejects 通道（3.7.3）；rejects 行（<code>output.rejects = "refs"</code>）不含数据内容本体。</div>
+
+<!-- ─────────── M8 ─────────── -->
+<h2 id="m8">3.8 M8 结构引擎 schema-engine</h2>
+<h3>3.8.1 职责与边界</h3>
+<div class="boundary"><b>做：</b>持有经预校验的用户 Schema 与各内部小 Schema（裁决、评分、评审、生成输出）；提供「LLM 调用 → 合法 JSON 对象」的唯一入口 <code>complete_validated()</code>，内部实现四层结构保证；统计各层修复命中率。<br>
+<b>不做：</b>不组装业务提示词（调用方传入完整 prompt）；不解释业务语义；不放行任何未通过校验的对象——这是它对全系统的硬契约。</div>
+<h3>3.8.2 四层保证与修复环</h3>
+<figure>
+<svg viewBox="0 0 1000 360" xmlns="http://www.w3.org/2000/svg" font-family="PingFang SC, sans-serif">
+  <defs>
+    <marker id="arr5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <g font-size="12.5" text-anchor="middle">
+    <rect x="20" y="130" width="150" height="70" rx="6" fill="#f6f8fa" stroke="#888"/>
+    <text x="95" y="153">LLM 调用 (M9)</text>
+    <text x="95" y="174" font-size="11" fill="#666">L0: 若 profile 支持</text>
+    <text x="95" y="190" font-size="11" fill="#666">带原生结构化输出参数</text>
+
+    <rect x="220" y="130" width="180" height="70" rx="6" fill="#fff" stroke="#c9861a"/>
+    <text x="310" y="152" font-weight="bold">L1 确定性修复</text>
+    <text x="310" y="172" font-size="11">剥 ```json 围栏 / 提取首个平衡 {}</text>
+    <text x="310" y="190" font-size="11">json-repair 补断尾/引号/逗号</text>
+
+    <rect x="450" y="130" width="180" height="70" rx="6" fill="#fff" stroke="#c9861a"/>
+    <text x="540" y="152" font-weight="bold">L2 Schema 校验</text>
+    <text x="540" y="172" font-size="11">jsonschema Draft 2020-12</text>
+    <text x="540" y="190" font-size="11">收集全部违规路径与原因</text>
+
+    <rect x="680" y="30" width="180" height="70" rx="6" fill="#fff" stroke="#7a4fb5"/>
+    <text x="770" y="55" font-weight="bold">L3 LLM 修复环</text>
+    <text x="770" y="75" font-size="11">违规清单 + 原输出回喂</text>
+    <text x="770" y="91" font-size="11">≤ max_repair_attempts 次（默认 2）</text>
+
+    <rect x="680" y="230" width="180" height="70" rx="6" fill="#eef8f0" stroke="#2e8b57"/>
+    <text x="770" y="258" font-weight="bold">通过 ✓</text>
+    <text x="770" y="278" font-size="11">返回合法 JSON 对象</text>
+
+    <rect x="450" y="270" width="150" height="60" rx="6" fill="#fbeeee" stroke="#b04a4a"/>
+    <text x="525" y="295" font-weight="bold" fill="#b04a4a">拒绝 ✗</text>
+    <text x="525" y="315" font-size="11">SchemaViolation → rejects</text>
+  </g>
+  <g stroke="#555" stroke-width="1.8" marker-end="url(#arr5)" fill="none">
+    <line x1="170" y1="165" x2="218" y2="165"/>
+    <line x1="400" y1="165" x2="448" y2="165"/>
+    <path d="M 630 150 L 655 150 L 655 65 L 678 65"/>
+    <path d="M 630 180 L 655 180 L 655 260 L 678 260"/>
+    <path d="M 770 100 L 770 115 L 310 115 L 310 128" stroke="#7a4fb5" stroke-dasharray="5,4"/>
+    <path d="M 860 65 L 930 65 L 930 300 L 602 300" stroke="#b04a4a"/>
+  </g>
+  <text x="648" y="130" font-size="11" fill="#b04a4a">未过</text>
+  <text x="648" y="205" font-size="11" fill="#2e8b57">通过</text>
+  <text x="540" y="108" font-size="11" fill="#7a4fb5">修复输出重走 L1→L2</text>
+  <text x="900" y="180" font-size="11" fill="#b04a4a">次数耗尽</text>
+</svg>
+<figcaption>图 3-3 结构引擎四层保证。任何写入主输出的对象必然经过 L2 通过分支。</figcaption>
+</figure>
+<table>
+<tr><th style="width:10%">层</th><th>精确行为</th></tr>
+<tr><td>L0</td><td>profile <code>supports_structured_output=true</code> 时：OpenAI 兼容 provider 传 <code>response_format={"type":"json_schema", "json_schema":{...strict:true}}</code>；Anthropic provider 以单工具 <code>tool_choice</code> 强制工具调用、Schema 作为工具入参。L0 只是「使 L1/L3 少触发」的优化，<b>不豁免 L2</b>——供应商实现存在覆盖缺口（JSONSchemaBench 实测各引擎均有不支持的 Schema 特性 [24]），校验永远执行。</td></tr>
+<tr><td>L1</td><td>顺序执行：① 剥离 Markdown 代码围栏；② 取首个花括号平衡子串；③ <code>json_repair.loads()</code>（工业库，处理截断/单引号/尾逗号/裸换行 [8]）。全部失败 ⇒ 直接进 L3。L1 为纯函数，无副作用、可单测穷举。</td></tr>
+<tr><td>L2</td><td><code>Draft202012Validator.iter_errors()</code> 收集<b>全部</b>违规（非首个），每条含 JSON Pointer 路径、期望与实际。通过 ⇒ 返回；未通过 ⇒ L3。</td></tr>
+<tr><td>L3</td><td>修复提示词 = 单条 user 消息，按 <code>[原始输出]</code> / <code>[违规清单]</code> 分节标签组织，末尾指令「只输出修正后的 JSON」（逐字实例见 3.8.4）。使用 <code>output.repair_llm</code>（默认同调用方 profile）。每次修复输出重走 L1→L2。尝试次数耗尽 ⇒ 抛 <code>SchemaViolation(errors, raw_last_output)</code>。修复调用计入 token 计量，命中层级分布计入报告（<code>report.schema_engine.resolved_at = {l0_or_clean, l1, l3_1, l3_2, rejected}</code>）。</td></tr>
+</table>
+<h3>3.8.3 API</h3>
+<pre><code>class SchemaEngine:
+    def __init__(self, user_schema: dict, llm: LLMClient, cfg: OutputConfig): ...
+    async def complete_validated(self, profile: str, prompt: PromptBundle,
+                                 schema: dict | None = None) -> dict:
+        """schema=None 时用用户 Schema；内部 Schema（裁决/评分/评审/生成）由各 Stage 传入。
+           成功返回已通过 L2 的 dict；失败抛 SchemaViolation。"""
+    def validate_only(self, obj: dict, schema: dict | None = None) -> list[str]:
+        """M1 校验 few-shot 示例输出、M11 写出前终检用。"""</code></pre>
+<div class="note"><b>设计考量：</b>“Let Me Speak Freely?”（arXiv:2408.02442）报告了严格格式约束可能损失推理质量 [25]。缓解：内部 Schema 一律带自由文本字段（reason/opinion）置于结论字段<b>之前</b>，让模型先推理后作答；用户 Schema 若需同类缓解，可自行加 reasoning 字段并在下游忽略。</div>
+<div class="backing"><b>背书：</b>「Schema 约束生成 + 机器校验 + 修复重试」为工业标准三件套：OpenAI Structured Outputs [7]、约束解码框架 Outlines [23]、JSONSchemaBench 对 6 家引擎的评测 [24]、instructor 的 validation-retry 循环与 json-repair 库 [8]。四层纵深（供应商能力不被信任、校验不可豁免）是对 [24] 所示覆盖缺口的直接工程回应。</div>
+
+<h3>3.8.4 输入 / 输出示例</h3>
+<p>以贯穿示例的文本模态工程为例：输入行 <code>{"instruction": "帮我写一条请假条，明天上午要去医院", "source": "ime-log", "ts": "2026-06-30T10:12:00Z"}</code>（<code>input.text_field = "instruction"</code>，记录 id = <code>1cda030abc565f17</code>）。M5 组装标注提示词后调用 <code>complete_validated(profile="default", prompt, user_schema)</code>。用户 Schema（<code>output.schema_inline</code>）：</p>
+<pre><code>{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "intent": {"type": "string",
+      "enum": ["writing_assist", "qa", "translation", "chitchat", "other"]},
+    "topic": {"type": "string"},
+    "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]}
+  },
+  "required": ["intent", "topic", "difficulty"],
+  "additionalProperties": false
+}</code></pre>
+<p><b>① L0（本例未启用）：</b>本走查假设该 profile 未声明 <code>supports_structured_output</code>（默认 false，5.1），M9 <code>complete()</code> 忽略 <code>response_schema</code> 参数（3.9.2），不注入任何原生结构化输出参数——结构保证完全落在 L1–L3。</p>
+<p><b>② LLM 原始输出</b>（<code>LLMResponse.text</code>，原文照贴；叠加三个问题：Markdown 围栏、尾逗号、<code>intent</code> 取值在枚举之外）：</p>
+<pre><code>```json
+{
+  "intent": "writing",
+  "topic": "请假条写作",
+  "difficulty": "easy",
+}
+```</code></pre>
+<p><b>③ L1 确定性修复：</b>按 3.8.2 顺序执行——① 剥离 <code>```json</code> 围栏；② 取首个花括号平衡子串；③ <code>json_repair.loads()</code> 修掉 <code>"easy"</code> 后的尾逗号。解析成功，得到对象 <code>{"intent": "writing", "topic": "请假条写作", "difficulty": "easy"}</code>。L1 只保证「可解析」、不看 Schema——枚举违规原样进入 L2。</p>
+<p><b>④ L2 校验：</b><code>Draft202012Validator.iter_errors()</code> 收集<b>全部</b>违规，本例共 1 条：</p>
+<pre><code>JSON Pointer: /intent
+期望: 枚举 ["writing_assist", "qa", "translation", "chitchat", "other"] 之一
+实际: "writing"
+(jsonschema 原始消息: 'writing' is not one of ['writing_assist', 'qa',
+ 'translation', 'chitchat', 'other'])</code></pre>
+<p>违规清单非空 ⇒ 进入 L3。</p>
+<p><b>⑤ L3 修复调用（第 1 次，预算 <code>output.max_repair_attempts = 2</code>）：</b>本工程未配置 <code>output.repair_llm</code> ⇒ 使用调用方 profile <code>default</code>。修复提示词按 3.8.2 逐字组装 = 原始输出全文 + 违规清单 + 「只输出修正后的 JSON」，作为单条 user 消息发出：</p>
+<pre><code>[原始输出]
+```json
+{
+  "intent": "writing",
+  "topic": "请假条写作",
+  "difficulty": "easy",
+}
+```
+
+[违规清单]
+1. /intent: 期望为枚举 ["writing_assist", "qa", "translation", "chitchat",
+   "other"] 之一，实际值为 "writing"
+
+只输出修正后的 JSON。</code></pre>
+<p>修复响应：</p>
+<pre><code>{"intent": "writing_assist", "topic": "请假条写作", "difficulty": "easy"}</code></pre>
+<p><b>⑥ 重走 L1→L2：</b>L1 无围栏可剥、直接解析成功；L2 <code>iter_errors()</code> 返回空清单 ⇒ 通过。<code>complete_validated()</code> 返回该对象，M5 写入 <code>item.annotation</code>：<code>Annotation.attempts = 2</code>（= 1 + 1 次 L3 修复，4.2 定义），首次调用与修复调用的 token 均计入 <code>Annotation.usage</code> 与 profile 计量（3.9.3）；本次解决计入 <code>report.schema_engine.resolved_at</code> 的 <code>l3_1</code> 桶（首次 L3 修复即通过），主输出 <code>_meta.annotation.attempts = 2</code>。</p>
+<table>
+<tr><th style="width:15%">层</th><th style="width:26%">输入</th><th style="width:28%">动作</th><th>输出</th></tr>
+<tr><td>L0</td><td><code>supports_structured_output = false</code></td><td>不注入原生结构化输出参数</td><td>提示词原样发出，保证责任交给 L1–L3</td></tr>
+<tr><td>L1</td><td>带围栏 + 尾逗号的原始文本</td><td>剥围栏 → 平衡花括号子串 → <code>json_repair.loads()</code></td><td>可解析对象（<code>intent</code> 仍为 <code>"writing"</code>）</td></tr>
+<tr><td>L2（第 1 次）</td><td>L1 产物</td><td><code>iter_errors()</code> 全量收集违规</td><td>1 条违规（<code>/intent</code> 枚举）⇒ 转 L3</td></tr>
+<tr><td>L3（第 1 次）</td><td>原始输出全文 + 违规清单</td><td>经 <code>output.repair_llm</code>（默认同调用方）发起修复调用</td><td>修正后的 JSON 文本</td></tr>
+<tr><td>L1→L2（重走）</td><td>修复输出</td><td>同 L1 / L2</td><td>通过 ⇒ 返回对象；<code>attempts = 2</code>；<code>resolved_at.l3_1</code> 计 1</td></tr>
+</table>
+<p class="small">若第 2 次 L3 修复后仍未通过 L2，则预算耗尽，抛 <code>SchemaViolation(errors, raw_last_output)</code>：该记录 <code>status = "failed"</code>、错误码 <code>schema_violation</code>（7.6）入 rejects 通道，并计入 <code>resolved_at.rejected</code>。</p>
+
+<!-- ─────────── M9 ─────────── -->
+<h2 id="m9">3.9 M9 LLM 客户端 llm-client</h2>
+<h3>3.9.1 职责与边界</h3>
+<div class="boundary"><b>做：</b>按 profile 提供统一异步调用接口：消息构造（文本/多图多模态）、provider 适配（OpenAI 兼容 / Anthropic 原生）、结构化输出参数透传、超时/重试/限流、token 与成本计量、<code>--probe</code> 连通性探测。<br>
+<b>不做：</b>不解析业务结构（返回原始文本或原生结构化载荷，解析归 M8）；不缓存响应（无状态）；不做模型路由/降级等「智能」行为——profile 选择完全由配置决定。</div>
+<h3>3.9.2 API 与数据结构</h3>
+<pre><code>@dataclass(frozen=True)
+class Part:      kind: Literal["text", "image"]; text: str | None; image: ImageRef | None
+@dataclass(frozen=True)
+class Message:   role: Literal["system", "user", "assistant"]; parts: tuple[Part, ...]
+@dataclass(frozen=True)
+class PromptBundle: messages: tuple[Message, ...]; temperature: float | None = None
+@dataclass(frozen=True)
+class LLMResponse:  text: str; structured: dict | None; usage: Usage; model: str; latency_ms: int
+
+class LLMClient:
+    def __init__(self, profiles: dict[str, ProfileConfig]): ...
+    async def complete(self, profile: str, prompt: PromptBundle,
+                       response_schema: dict | None = None) -> LLMResponse:
+        """response_schema 仅在 profile 声明 supports_structured_output 时转为 L0 参数，否则忽略。
+           重试后仍失败: 抛 ProviderRetryableError / ProviderFatalError。"""
+    async def embed(self, profile: str, texts: list[str]) -> list[list[float]]:
+        """v1.2 新增。profile 须为 config.toml [embedding.*] 子表名（5.1），不接受 [llm.*]。
+           openai_compatible：POST {base_url}/embeddings（3.9.3）。返回向量与 texts 顺序一一对应；
+           profile 配置了 dims 时逐条校验返回维度，不匹配抛 ProviderFatalError。
+           token 计量入 usage_by_profile（键 = embedding profile 名）；每次调用发 llm.call
+           trace 事件，payload 增可选字段 operation="embedding"（事件目录只增不改，7.2）。
+           重试/限流/超时规则与 complete 一致（3.9.3）。"""
+
+    async def probe(self, profile: str) -> ProbeResult   # validate --probe：1-token 试调用
+    @property
+    def usage_by_profile(self) -> dict[str, Usage]        # 报告用累计计量</code></pre>
+<h3>3.9.3 行为规格</h3>
+<table>
+<tr><th style="width:22%">机制</th><th>定义</th></tr>
+<tr><td>Provider 适配</td><td><code>openai_compatible</code>：POST <code>{base_url}/chat/completions</code>，图像为 <code>image_url: data:image/png;base64,...</code>；<code>anthropic</code>：POST <code>{base_url}/v1/messages</code>，图像为 <code>source.type="base64"</code>。两者的结构化输出映射见 3.8.2 L0。v1.2 embedding：<code>embed()</code> 仅支持 <code>openai_compatible</code>：POST <code>{base_url}/embeddings</code>，请求体含 <code>model</code> 与 <code>input</code>（texts 数组），响应取 <code>data[*].embedding</code>（顺序与输入对齐）；<code>[embedding.*]</code> profile 的 provider 无 "anthropic" 取值（5.1）。</td></tr>
+<tr><td>重试</td><td>可重试错误 = 网络错误、超时、HTTP 408/409/429/5xx。第 i 次等待 = <code>random(0, retry_base_delay_s × 2^i)</code>（全抖动指数退避，工业标准），封顶 60s，最多 <code>max_retries</code> 次。429 响应含 <code>Retry-After</code> 时优先遵从。不可重试错误（401/403/400/404）直接抛 <code>ProviderFatalError</code>。</td></tr>
+<tr><td>限流</td><td>每 profile 一个 <code>asyncio.Semaphore(max_concurrency)</code>；全部调用（含修复、评审）共享该信号量。</td></tr>
+<tr><td>图像编码</td><td>调用时读盘 → 若长边 &gt; <code>profile.max_image_px</code>（默认 2048）按比例缩小再编码（Pillow）→ base64 → 请求发出后即释放字节（懒加载契约，2.6 节）。</td></tr>
+<tr><td>计量</td><td>从响应 usage 字段累计 prompt/completion token；<code>profile.price_per_mtok_in/out</code>（可选配置）存在时折算成本入报告。</td></tr>
+</table>
+<div class="backing"><b>背书：</b>「统一多 provider 异步客户端 + 信号量并发 + 指数退避」与 distilabel 的 LLM 抽象层 [5]、NeMo Curator 的服务客户端 [9] 同构；全抖动退避为 AWS 架构规范确立的工业标准。</div>
+
+<h3>3.9.4 输入 / 输出示例</h3>
+<p>以统一 UI 示例贯穿：5.1 的 <code>[llm.default]</code> profile + 5.2 的 project.toml，记录为文件对 <code>capture/2026-07-01/b/uitree_2.jsonl</code> + <code>c/image_2.png</code>（<code>pair_index=2</code>，即 6.3 中 id 为 <code>9f2c31ab52e08d17</code> 的登录页记录）。M5 按 3.5.2 模板组装 <code>PromptBundle</code>，M8 因 <code>supports_structured_output=true</code> 启用 L0，M9 适配为如下 <code>openai_compatible</code> 请求。</p>
+<h4>① 标注请求报文（openai_compatible）与响应要点</h4>
+<pre><code>POST https://llm-gw.example.com/v1/chat/completions HTTP/1.1
+Authorization: Bearer ${LABELKIT_KEY_DEFAULT}      ← api_key_env 所指环境变量的值
+Content-Type: application/json
+
+{
+  "model": "qwen2.5-vl-72b-instruct",
+  "temperature": 0.0,
+  "max_tokens": 4096,
+  "messages": [
+    {"role": "system",
+     "content": "你是移动端 UI 理解标注员。根据屏幕截图与 UI 控件树，\n标注该屏幕的功能类别、页面标题、可交互元素列表与一句话页面描述。\n输出必须是符合以下 JSON Schema 的单个 JSON 对象，不输出任何其他内容：\n{…5.2 用户 Schema 全文，与下方 response_format.json_schema.schema 相同，此处从略…}"},
+    {"role": "user", "content": [
+      {"type": "text", "text": "[屏幕截图]"},
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAA…（截断示意；c/image_2.png 读盘后长边≤2048px 等比缩放再编码，3.9.3）"}},
+      {"type": "text", "text": "[UI 控件树]\nFrameLayout [0,0,1080,2340]\n  TextView \"登录\" [72,296,264,392]\n  EditText [72,520,1008,664] hint=请输入手机号\n  EditText [72,712,672,856] hint=请输入验证码\n  Button \"获取验证码\" [704,712,1008,856]\n  Button \"登录\" [72,952,1008,1096]"}
+    ]}
+  ],
+  "response_format": {"type": "json_schema", "json_schema": {"name": "user_schema", "strict": true,
+    "schema": {"$schema": "https://json-schema.org/draft/2020-12/schema", "type": "object",
+      "properties": {
+        "screen_category": {"type": "string", "enum": ["login","home","list","detail","form","settings","dialog","other"]},
+        "page_title": {"type": "string"},
+        "interactive_elements": {"type": "array", "items": {"type": "object",
+          "properties": {"role": {"type": "string"}, "label": {"type": "string"},
+                         "bounds": {"type": "array", "items": {"type": "integer"}, "minItems": 4, "maxItems": 4}},
+          "required": ["role","label","bounds"], "additionalProperties": false}},
+        "description": {"type": "string", "maxLength": 200}},
+      "required": ["screen_category","page_title","interactive_elements","description"],
+      "additionalProperties": false}}}
+}
+
+HTTP/1.1 200 OK（要点字段）
+{
+  "id": "chatcmpl-7d31a9c04b5e82f6",
+  "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant",
+    "content": "{\"screen_category\":\"login\",\"page_title\":\"登录\",\"interactive_elements\":[{\"role\":\"EditText\",\"label\":\"请输入手机号\",\"bounds\":[72,520,1008,664]},{\"role\":\"EditText\",\"label\":\"请输入验证码\",\"bounds\":[72,712,672,856]},{\"role\":\"Button\",\"label\":\"获取验证码\",\"bounds\":[704,712,1008,856]},{\"role\":\"Button\",\"label\":\"登录\",\"bounds\":[72,952,1008,1096]}],\"description\":\"手机号+验证码登录页\"}"}}],
+  "usage": {"prompt_tokens": 3184, "completion_tokens": 156, "total_tokens": 3340}
+}</code></pre>
+<h4>② M9 返回的 LLMResponse（3.9.2）</h4>
+<pre><code>{
+  "text": "{\"screen_category\":\"login\",\"page_title\":\"登录\",…（与上方 message.content 逐字相同）}",
+  "structured": null,
+  "usage": {"prompt_tokens": 3184, "completion_tokens": 156},
+  "model": "qwen2.5-vl-72b-instruct",
+  "latency_ms": 4820
+}</code></pre>
+<p class="small"><code>structured</code> 仅在 anthropic provider 以 <code>tool_choice</code> 强制工具调用（3.8.2 L0）返回原生结构化载荷时非空；openai_compatible 的 json_schema 模式产物是文本，M9 原样放入 <code>text</code> 不做解析（3.9.1 负边界），解析与校验由 M8 L1→L2 完成——本例 content 已是纯 JSON，将计入 <code>report.schema_engine.resolved_at.l0_or_clean</code>。</p>
+<h4>③ 重试时间线（同一次 complete() 调用，profile 默认值：timeout_s=120，max_retries=5，retry_base_delay_s=1.0）</h4>
+<table>
+<tr><th style="width:10%">尝试</th><th style="width:14%">时刻</th><th style="width:26%">结果</th><th style="width:12%">等待</th><th>依据（3.9.3 重试规则）</th></tr>
+<tr><td>attempt 1</td><td>t=0.0s 发出</td><td>HTTP 429，响应头 <code>Retry-After: 5</code></td><td>5.0s</td><td>429 属可重试错误集（408/409/429/5xx）；「429 响应含 <code>Retry-After</code> 时优先遵从」，直接等 5s，退避公式不参与。</td></tr>
+<tr><td>attempt 2</td><td>t=5.0s 重发</td><td>t=125.0s 达 timeout_s=120 超时</td><td>2.3s</td><td>超时属可重试错误；全抖动指数退避「第 i 次等待 = <code>random(0, retry_base_delay_s × 2^i)</code>」，i=2：random(0, 1.0×2^2)=random(0, 4.0)，本次抽得 2.3s（&lt; 60s，封顶不生效）。</td></tr>
+<tr><td>attempt 3</td><td>t=127.3s 重发</td><td>t=132.1s 收到 HTTP 200（即 ① 的响应，耗时 4.82s → latency_ms=4820）</td><td>—</td><td>成功返回 LLMResponse。已用重试 2 次 &lt; max_retries=5；若第 5 次重试后仍失败则抛 <code>ProviderRetryableError</code>（3.9.2）；本次调用 retries+=2 计入该 profile 计量。</td></tr>
+</table>
+<h4>④ usage_by_profile 累计结果示例</h4>
+<pre><code>&gt;&gt;&gt; client.usage_by_profile        # 快照：完成 3 次标注调用（含上表那次）与 1 次评审调用后
+{
+  "default": {"calls": 3, "prompt_tokens": 9552, "completion_tokens": 486,
+              "retries": 2, "est_cost_usd": 0.0066},
+  "judge":   {"calls": 1, "prompt_tokens": 2210, "completion_tokens": 118, "retries": 0}
+}</code></pre>
+<p class="small">数值自洽性：3 次标注请求 prompt 各 3184 token，3×3184=9552；completion 为 156+162+168=486。<code>[llm.default]</code> 配置了 price_per_mtok_in=0.6 / price_per_mtok_out=1.8，故 est_cost_usd = 9552÷10<sup>6</sup>×0.6 + 486÷10<sup>6</sup>×1.8 = 0.0057312 + 0.0008748 = 0.006606 ≈ 0.0066；<code>[llm.judge]</code> 未配置单价，不产生成本字段（3.9.3 计量）。retries=2 来自上表时间线。该字典在 finalize 时由 M10/M11 落入 <code>report.json</code> 的 <code>llm_usage</code>（6.4）。</p>
+
+<!-- ─────────── M10 ─────────── -->
+<h2 id="m10">3.10 M10 编排器 orchestrator</h2>
+<h3>3.10.1 职责与边界</h3>
+<div class="boundary"><b>做：</b>把 M2 记录流切批；按配置组装阶段链并逐批驱动；调度生成子批回流；聚合运行级统计；控制批生命周期——批完成（其输出行已写盘）后释放该批全部中间态；熔断监测。<br>
+<b>不做：</b>零业务逻辑（不知道任何算法细节）；不直接调用 LLM；不写文件（M11 职责）。</div>
+<h3>3.10.2 主循环与批生命周期</h3>
+<figure>
+<svg viewBox="0 0 1000 400" xmlns="http://www.w3.org/2000/svg" font-family="PingFang SC, sans-serif">
+  <defs>
+    <marker id="arr6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <g font-size="12" text-anchor="middle">
+    <!-- lifelines -->
+    <rect x="40"  y="20" width="120" height="34" rx="4" fill="#eef3fa" stroke="#2456a6"/><text x="100" y="42">CLI / main</text>
+    <rect x="230" y="20" width="120" height="34" rx="4" fill="#eef8f0" stroke="#2e8b57"/><text x="290" y="42">M10 编排器</text>
+    <rect x="430" y="20" width="120" height="34" rx="4" fill="#fdf7ee" stroke="#c9861a"/><text x="490" y="42">阶段链 M3→M7</text>
+    <rect x="630" y="20" width="120" height="34" rx="4" fill="#fdf7ee" stroke="#c9861a"/><text x="690" y="42">M11 输出器</text>
+    <rect x="830" y="20" width="130" height="34" rx="4" fill="#f6f1fb" stroke="#7a4fb5"/><text x="895" y="42">进程内存</text>
+  </g>
+  <g stroke="#999" stroke-dasharray="4,4">
+    <line x1="100" y1="54" x2="100" y2="380"/><line x1="290" y1="54" x2="290" y2="380"/>
+    <line x1="490" y1="54" x2="490" y2="380"/><line x1="690" y1="54" x2="690" y2="380"/><line x1="895" y1="54" x2="895" y2="380"/>
+  </g>
+  <g font-size="11.5">
+    <g stroke="#555" stroke-width="1.5" marker-end="url(#arr6)"><line x1="100" y1="80" x2="288" y2="80"/></g>
+    <text x="150" y="74">run(ResolvedConfig)</text>
+    <g stroke="#555" stroke-width="1.5" marker-end="url(#arr6)"><line x1="290" y1="115" x2="893" y2="115"/></g>
+    <text x="480" y="109">取下一批 batch_size 条 Record（M2 惰性流）→ 构造 PipelineItem[]</text>
+    <g stroke="#555" stroke-width="1.5" marker-end="url(#arr6)"><line x1="290" y1="150" x2="488" y2="150"/></g>
+    <text x="368" y="144">依次 await stage.run(batch, ctx)</text>
+    <g stroke="#7a4fb5" stroke-width="1.5" marker-end="url(#arr6)" stroke-dasharray="5,3"><line x1="490" y1="185" x2="292" y2="185"/></g>
+    <text x="400" y="179" fill="#7a4fb5">generate 子批（如启用）</text>
+    <g stroke="#7a4fb5" stroke-width="1.5" marker-end="url(#arr6)" stroke-dasharray="5,3"><line x1="290" y1="212" x2="488" y2="212"/></g>
+    <text x="392" y="206" fill="#7a4fb5">子批走 M3→M7（不再生成）</text>
+    <g stroke="#555" stroke-width="1.5" marker-end="url(#arr6)"><line x1="290" y1="250" x2="688" y2="250"/></g>
+    <text x="470" y="244">emit(batch + 子批)：主输出/rejects 增量追加，flush</text>
+    <g stroke="#b04a4a" stroke-width="1.5" marker-end="url(#arr6)"><line x1="290" y1="290" x2="893" y2="290"/></g>
+    <text x="560" y="284" fill="#b04a4a">批完成 ⇒ 释放该批全部 PipelineItem / 比较结果 / 图像引用（中间态丢弃）</text>
+    <text x="290" y="318" font-size="11" fill="#666">循环直至记录流耗尽</text>
+    <g stroke="#555" stroke-width="1.5" marker-end="url(#arr6)"><line x1="290" y1="345" x2="688" y2="345"/></g>
+    <text x="470" y="339">finalize()：主输出原子改名 + 写 report.json</text>
+    <g stroke="#555" stroke-width="1.5" marker-end="url(#arr6)"><line x1="290" y1="372" x2="102" y2="372"/></g>
+    <text x="180" y="366">RunSummary → 退出码</text>
+  </g>
+</svg>
+<figcaption>图 3-4 批生命周期时序。全局仅去重索引与统计计数器跨批存活，其余中间态随批释放。</figcaption>
+</figure>
+<h3>3.10.3 API 与行为规格</h3>
+<pre><code>class Orchestrator:
+    def __init__(self, cfg: ResolvedConfig, stages: list[Stage],
+                 ingestor: Ingestor, emitter: Emitter, llm: LLMClient): ...
+    async def run(self) -> RunSummary: ...
+
+@dataclass
+class RunContext:      # 传入每个 stage.run 的上下文
+    cfg: ResolvedConfig; llm: LLMClient; schema_engine: SchemaEngine
+    rng: random.Random          # seed 派生: Random(f"{run.seed}:{batch_no}:{stage.name}")
+    batch_no: int; metrics: MetricsSink</code></pre>
+<table>
+<tr><th style="width:22%">规格</th><th>定义</th></tr>
+<tr><td>跨批存活状态</td><td>仅三项：① DedupIndex（scope=global 时）；② MetricsSink 计数器；③ M9 用量累计。均不含数据内容本体（哈希/签名/计数），运行结束随进程销毁。</td></tr>
+<tr><td>尾批</td><td>最后一批不足 batch_size 照常处理；批内仅 1 条时 M4 不发裁决调用，各 criterion score 固定 0.5（3.4.3 归一化行）。</td></tr>
+<tr><td>熔断</td><td>MetricsSink 维护连续 ProviderFatalError 计数，达 <code>run.fatal_error_threshold</code>（默认 20）⇒ 取消在飞任务、写出已完成批的报告、退出码 4。</td></tr>
+<tr><td>中断（SIGINT/SIGTERM）</td><td>停止取新批 → 等待当前批完成或 30s 超时取消 → finalize（报告标记 <code>interrupted=true</code>）。已 flush 的输出行有效。</td></tr>
+<tr><td>--limit N</td><td>M2 流截断在前 N 条记录，其余全流程不变（试跑）；generate_only 模式下作用于生成样本流的前 N 条：仅执行预抽序前 ⌈N / generate.num_per_call⌉ 次生成调用（(llm, style) 预抽不受影响），产出再截断到 N 条——本表下行「执行全部生成调用」带 --limit 时按此截断。</td></tr>
+<tr><td>纯生成模式（v1.4）</td><td><code>run.mode="generate_only"</code> 时跳过 M2（IngestReport 全零）：启动后先按 3.6.2 的量公式执行全部生成调用（并发受 profile 信号量限流，(llm, style) 组合按调用序号预抽保证可复现——生成先于切批、尚无批号，预抽 PRNG 固定取 Random(f"{run.seed}:0:generate")，即 3.10.3 派生式中 batch_no 恒取 0），产出构造为 Record 后按 <code>run.batch_size</code> 切批，逐批走 M3→M4→M5→M7→M11，批生命周期与内存释放同 process 模式；不触发二次生成（单遍）。规模建议同 2.6（≤ 50 万条）。</td></tr>
+</table>
+<div class="backing"><b>背书：</b>「编排器只做组合调度、算子无相互依赖」是 Data-Juicer 配方执行器 [4] 与 distilabel Pipeline 运行时 [5] 的共同架构；批式流转 + 增量写出与 Dolma toolkit 的并行分片处理模型一致 [6]。</div>
+
+<h3>3.10.4 运行走查示例</h3>
+<p>走查前提（贯穿示例·文本模态）：输入为输入法采集的中文指令 JSONL 共 1000 行、无坏行（首行 <code>{"instruction": "帮我写一条请假条，明天上午要去医院", "source": "ime-log", "ts": "2026-06-30T10:12:00Z"}</code>），<code>input.text_field = "instruction"</code>；<code>run.output = "./out/ime-intent-0630.jsonl"</code>；<code>run.batch_size = 256</code>、<code>run.seed = 0</code>；阶段为 2.3.1 的<b>默认组合</b>（<code>dedup.enabled</code> ✓、<code>quality.enabled</code> ✓、<code>annotate.enabled</code> ✓，<code>generate.enabled = false</code>、<code>verify.enabled = false</code>）。quality 取默认 <code>mode="pairwise"</code>、<code>rounds=4</code>、<code>criteria_per_call="all"</code>、<code>rubric="default:text"</code>（4 条 criteria，附录 A.1），并显式设 <code>quality.threshold = 0.3</code>；annotate 输出用户 Schema 为意图标注对象 <code>{intent, topic, difficulty}</code>（<code>additionalProperties:false</code>、三字段全 required）；<code>output.rejects = "refs"</code>（默认）、<code>dedup.scope = "global"</code>（默认）。M2 惰性流被 M10 切为 4 个批：256 / 256 / 256 / 232（尾批不足 batch_size 照常处理，3.10.3）。</p>
+<table>
+<tr><th>批</th><th>取入→PipelineItem</th><th>M3 dropped_dup</th><th>M4 dropped_lowq</th><th>M5 failed</th><th>写出 emitted</th><th>批末释放的中间态</th><th>DedupIndex 签名累计</th></tr>
+<tr><td>1</td><td>256</td><td>18</td><td>21</td><td>3</td><td>214</td><td>256 个 PipelineItem；476 次裁决 / 1904 条比较结果</td><td>238</td></tr>
+<tr><td>2</td><td>256</td><td>24</td><td>19</td><td>4</td><td>209</td><td>256 个 PipelineItem；464 次裁决 / 1856 条比较结果</td><td>470</td></tr>
+<tr><td>3</td><td>256</td><td>27</td><td>20</td><td>5</td><td>204</td><td>256 个 PipelineItem；456 次裁决 / 1824 条比较结果</td><td>699</td></tr>
+<tr><td>4（尾批）</td><td>232</td><td>28</td><td>18</td><td>2</td><td>184</td><td>232 个 PipelineItem；408 次裁决 / 1632 条比较结果</td><td>903</td></tr>
+<tr><td><b>合计</b></td><td><b>1000</b></td><td><b>97</b></td><td><b>78</b></td><td><b>14</b></td><td><b>811</b></td><td>—</td><td><b>903</b></td></tr>
+</table>
+<p class="small">口径与自洽性：每批 emitted = 取入 − dropped_dup − dropped_lowq − failed（批 1：256 − 18 − 21 − 3 = 214）。M4 比较池 N = 去重后存活数（批 1 为 238），裁决调用数 = k·⌊N/2⌋ = 4×119 = 476，<code>criteria_per_call="all"</code> 下每次调用裁决 4 条 criteria ⇒ 1904 条 criterion 级比较结果；批 3 的 N=229 为奇数，每轮末位轮空（3.4.3），故为 4×114 = 456 而非 458。进入 annotate 的记录数 = N − dropped_lowq：217 / 213 / 209 / 186（合计 825 = 811 emitted + 14 failed；14 条 failed 中 <code>schema_violation</code> 11 条、<code>provider_retryable_exhausted</code> 3 条）。批 1 quality 阶段的 <code>ctx.rng = Random("0:1:quality")</code>（3.10.3 派生式代入 run.seed=0、batch_no=1）。</p>
+<p>批生命周期（图 3-4 的逐批实例）：每批 <code>emit()</code> 后 M11 向 <code>ime-intent-0630.jsonl.part</code> 追加 214 / 209 / 204 / 184 行并 flush，同时向 <code>ime-intent-0630.rejects.jsonl</code> 追加 42 / 47 / 52 / 48 行（= 该批 dup+lowq+failed，refs 模式每行仅 <code>_meta</code> 引用）；随后 M10 释放该批全部中间态——上表「批末释放」列的 PipelineItem 与比较结果，外加 4 组 BT log θ 数组（每 criterion 一组、长度 N）；文本模态无图像引用，释放数为 0。跨批存活的仅 3.10.3 所列三项，其规模变化：</p>
+<table>
+<tr><th style="width:22%">跨批状态</th><th>批 1 → 2 → 3 → 4 末的规模</th></tr>
+<tr><td>① DedupIndex</td><td>签名条目 238 → 470 → 699 → 903（= 1000 − 97；每条目为 exact sha256 + 128-perm MinHash 签名，文本模态无 pHash 表）。注意被 lowq/failed 淘汰的记录也已入索引——M3 在先，first-writer-wins。</td></tr>
+<tr><td>② MetricsSink 计数器</td><td>emitted 214 → 423 → 627 → 811；dropped_dup 18 → 42 → 69 → 97；dropped_lowq 21 → 40 → 60 → 78；failed 3 → 7 → 12 → 14。仅整数计数，无数据内容。</td></tr>
+<tr><td>③ M9 用量累计</td><td>LLM 调用 693 → 1370 → 2035 → 2629（每批 = 裁决 + 标注调用，不含重试与 L3 修复）。</td></tr>
+</table>
+<p>流耗尽后 <code>finalize()</code>：<code>.part</code> fsync 并原子改名为 <code>ime-intent-0630.jsonl</code>（811 行），写 <code>ime-intent-0630.report.json</code>，其 <code>counts</code> 节：</p>
+<pre><code>"counts": {"scanned": 1000, "ingested": 1000, "bad_input": 0,
+           "dropped_dup": 97, "dropped_lowq": 78, "dropped_verify": 0,
+           "failed": 14, "generated": 0, "emitted": 811}</code></pre>
+<p>按 6.4 不变量 <code>emitted + dropped_* + failed + bad_input = scanned + generated</code> 验算：811 + (97 + 78 + 0) + 14 + 0 = 1000 = 1000 + 0，等式成立。<code>run()</code> 返回的 <code>RunSummary</code> 与上述 counts 一致：4 批全部完成、主输出 811 行、rejects 189 行（97+78+14）、<code>interrupted = false</code>——CLI 以<b>退出码 0</b> 结束（2.4：存在被拒绝记录不影响退出码；若本次带 <code>--strict</code>，则因 189 条 rejects 返回退出码 1）。</p>
+<div class="note"><b>提示：</b>本走查中 dropped_lowq = 78 依赖显式设置 <code>quality.threshold = 0.3</code>；该键默认<b>缺省 = 不过滤只打分</b>（5.2），若不设阈值则 dropped_lowq = 0，903 条唯一记录将全部进入标注，emitted 相应变为 903 − failed。</div>
+
+<!-- ─────────── M11 ─────────── -->
+<h2 id="m11">3.11 M11 输出器 emitter</h2>
+<h3>3.11.1 职责与边界</h3>
+<div class="boundary"><b>做：</b>三通道写出——主输出 JSONL（增量追加、终检、原子改名交付）、rejects 通道、report.json；组装 <code>_meta</code>；stderr 进度与结束摘要。<br>
+<b>不做：</b>不修改标注内容；不做结构校验之外的任何数据加工（写出前调用 <code>SchemaEngine.validate_only</code> 做最后一道终检，失败即 bug——fail loudly，转 rejects 并记 <code>internal_error</code>）；报告不含数据内容。</div>
+<h3>3.11.2 写出规格</h3>
+<table>
+<tr><th style="width:22%">通道</th><th>规格</th></tr>
+<tr><td>主输出</td><td>运行期写 <code>{output}.part</code>，每批 flush；finalize 时 fsync + 原子 rename 为目标名。行格式见 6.3。仅 <code>status="active"</code> 且（annotate 启用时）标注成功的记录写入。</td></tr>
+<tr><td>rejects</td><td><code>output.rejects = "none" | "refs"（默认）| "full"</code>。refs：每行仅 <code>{"_meta": {id, source, stage, reason, errors}}</code>——不含数据内容（source 亦不含 <code>passthrough_fields</code>，其值属数据内容），贴合不存储原则；full：额外含记录内容与最后一版非法输出（调试用，用户显式选择）。文件名 <code>{output_stem}.rejects.jsonl</code>。</td></tr>
+<tr><td>report.json</td><td><code>{output_stem}.report.json</code>。结构见 6.4：运行参数摘要（脱敏，无 key）、各阶段计数、分数分布直方图、去重簇统计、结构引擎各层命中、token/成本、耗时、失败分类计数。</td></tr>
+</table>
+<div class="backing"><b>背书：</b>「主数据 + 拒绝通道 + 统计报告」三分法是 NeMo Curator / Dolma 管线产物的通行组织 [6][9]；原子改名交付为数据工程防半截文件的标准手法。</div>
+
+<h3>3.11.3 输出示例</h3>
+<p>贯穿示例沿用 6.1 的输入法中文指令数据（<code>input.text_field = "instruction"</code>，用户 Schema 为意图标注三字段：<code>intent</code> / <code>topic</code> / <code>difficulty</code>，全部 required、<code>additionalProperties:false</code>），运行设定与数字全部沿用 3.10.4 走查（<code>run.output = "./out/ime-intent-0630.jsonl"</code>、<code>run.batch_size = 256</code>、<code>run.seed = 0</code>、<code>quality.threshold = 0.3</code>、<code>verify.enabled = false</code>；其 1000 行输入文件此处记为 <code>ime-2026-06.jsonl</code>）。</p>
+<h4>① 主输出：meta_mode = "sidecar" 的一对行</h4>
+<p><code>meta_mode = "inline"</code> 的完整行示例见 6.3，此处不重复。当 <code>output.meta_mode = "sidecar"</code> 且 <code>output.passthrough_fields = ["source"]</code> 时，主输出行为纯用户结构，<code>_meta</code> 逐行写入 <code>out/ime-intent-0630.meta.jsonl</code>，两文件以 <code>_meta.id</code> 与行序对齐（主输出第 k 行 ↔ meta 第 k 行）。下例对应输入 <code>ime-2026-06.jsonl</code> 首行 <code>{"instruction": "帮我写一条请假条，明天上午要去医院", "source": "ime-log", "ts": "2026-06-30T10:12:00Z"}</code>；每行写出前均经 <code>SchemaEngine.validate_only</code> 终检（3.11.1）。</p>
+<pre><code># ── out/ime-intent-0630.jsonl 第 1 行（纯用户结构，无 _meta 键，剥无可剥）──
+{"intent": "writing_assist", "topic": "请假条", "difficulty": "easy"}
+
+# ── out/ime-intent-0630.meta.jsonl 第 1 行（实际为单行 JSONL，此处折行排版）──
+{"_meta": {
+  "id": "1cda030abc565f17",
+  "run": {"tool": "labelkit/1.0.0", "started_at": "2026-07-02T10:27:41+08:00",
+          "project_file": "project.toml", "rubric": "default:text", "seed": 0},
+  "source": {"file": "ime-2026-06.jsonl", "line_no": 1,
+             "generated_from": [], "fields": {"source": "ime-log"}},  // passthrough_fields 落点
+  "scores": {"writing_style": 0.72, "facts_trivia": 0.44, "educational_value": 0.61,
+             "required_expertise": 0.35, "__aggregate__": 0.53,       // 等权均值 = 2.12/4
+             "mode": "pairwise_bt", "batch_no": 1},
+  "dedup": {"kind": "unique"},
+  "annotation": {"model": "qwen2.5-vl-72b-instruct", "attempts": 1},  // attempts=1：未触发 L3
+  "verification": null                                                // verify 未启用
+}}</code></pre>
+<h4>② rejects = "refs"（默认）的一行</h4>
+<p>场景：第 213 行的标注输出经 L3 两次修复（<code>output.max_repair_attempts = 2</code>）仍未通过用户 Schema，M8 抛 <code>SchemaViolation</code>，记录置 <code>failed</code>（kind = <code>schema_violation</code>，7.6）转入 <code>out/ime-intent-0630.rejects.jsonl</code>。<code>errors</code> 即 M8 L2 <code>iter_errors()</code> 收集的全部违规（JSON Pointer 路径 + 期望 + 实际，3.8.2）；行内无任何数据内容——记录原文与 <code>raw_last_output</code> 仅在 <code>rejects = "full"</code> 时才写出。</p>
+<pre><code># ── out/ime-intent-0630.rejects.jsonl 中的一行（折行排版）──
+{"_meta": {
+  "id": "c47d09e2b8a1f350",
+  "source": {"file": "ime-2026-06.jsonl", "line_no": 213, "generated_from": []},
+  "stage": "annotate",
+  "reason": "schema_violation",
+  "errors": [
+    "/difficulty: 期望枚举 [\"easy\",\"medium\",\"hard\"] 之一，实际为 \"非常难\"",
+    "/: 存在 Schema 未声明的字段 \"confidence\"（additionalProperties=false）"
+  ]
+}}</code></pre>
+<h4>③ 运行结束 stderr 摘要（逐字样例）</h4>
+<p>非 TTY、<code>--log-level info</code> 下的运行尾部。行格式为 7.3 的 <code>ts level stage batch msg</code>；数字即 3.10.4 走查：1000 条无坏行入流水线（4 批：256×3 + 232），尾批写出 184 行、失败 2 条；rejects 通道含重复 / 低质 / 失败三类（<code>output.rejects = "refs"</code>，3.11.2）。</p>
+<pre><code>2026-07-02T10:41:22+08:00 INFO  emitter batch=4 批 4/4 落盘：主输出 +184 行（累计 811），rejects +48（累计 189）
+2026-07-02T10:41:23+08:00 INFO  emitter batch=- finalize：fsync + rename  out/ime-intent-0630.jsonl.part → out/ime-intent-0630.jsonl（811 行）
+2026-07-02T10:41:23+08:00 INFO  emitter batch=- 已写出 out/ime-intent-0630.rejects.jsonl（189 行）与 out/ime-intent-0630.report.json
+2026-07-02T10:41:23+08:00 INFO  orchestrator batch=- 运行结束：exit_code=0，wall=822s
+   ── 终版摘要（与 report.counts 逐项一致）──
+   scanned=1000  ingested=1000  bad_input=0  generated=0
+   dropped_dup=97  dropped_lowq=78  dropped_verify=0  failed=14  emitted=811</code></pre>
+<p class="small">不变量自查（6.4）：emitted 811 + dropped (97+78+0) + failed 14 + bad_input 0 = 1000 = scanned 1000 + generated 0。尾批自查：184 + 28(dup) + 18(lowq) + 2(failed) = 232；尾批 rejects = 28+18+2 = 48，四批累计 189 = 97+78+14。</p>
+<h4>④ 原子改名交付时间线</h4>
+<p>运行全程只向 <code>out/ime-intent-0630.jsonl.part</code> 追加（每批 flush）；finalize 时 fsync 后一次 rename 为 <code>out/ime-intent-0630.jsonl</code>。因此目录中任一时刻要么只有 <code>.part</code>（运行中或异常终止），要么只有最终文件——消费方以目标文件名出现作为「运行完整结束」的唯一信号，永远不会读到半截的主输出（3.11.2）。</p>
+
+<!-- ─────────── M12 ─────────── -->
+<h2 id="m12">3.12 M12 日志 logging</h2>
+<h3>3.12.1 职责与边界</h3>
+<div class="boundary"><b>做：</b>进程内<b>唯一</b>日志设施，承载两条通道：① <b>运行日志</b>——写 stderr，级别 debug/info/warn/error，行格式由 <code>tool.log_format = "text"</code>（默认）| <code>"jsonl"</code> 决定，只记运维事件，<b>绝不含数据内容与提示词</b>；② <b>trace 追踪日志</b>（可选，<code>trace.enabled=true</code> 时）——JSONL 文件（默认 <code>{output_stem}.trace.jsonl</code>），一行一事件的结构化事件流，供 rubric 优化（7.5）与标注质量分析。事件目录与格式规范见第 7 章。<br>
+<b>不做：</b>不做跨运行聚合分析（下游 / 后续 <code>labelkit analyze</code> 工具职责，8.3 O5）；不上传任何遥测（2.1.2 边界⑦）；写失败<b>绝不中断运行</b>——首次失败 warn 一次并关闭该通道，此后事件丢弃并计入 <code>report.trace.dropped_events</code>；API Key 永不落日志（任一通道、任一脱敏档位）。进度条不属于日志（7.7）。</div>
+<h3>3.12.2 输入 / 输出</h3>
+<table>
+<tr><th style="width:12%">方向</th><th>内容</th></tr>
+<tr><td>输入</td><td>各模块经标准 <code>logging</code> 记录器提交的运行日志；各 Stage 经 <code>EventLog.emit()</code> 提交的 TraceEvent；ResolvedConfig 中的 <code>tool.log_level / tool.log_format</code> 与 <code>[trace]</code> 节。</td></tr>
+<tr><td>输出</td><td>stderr 字节流；<code>trace.path</code> JSONL 文件（首行恒为 <code>run.start</code> header 事件）；report.json 的 <code>"trace"</code> 统计块（6.4）。</td></tr>
+</table>
+<h3>3.12.3 API 与数据结构</h3>
+<pre><code>@dataclass(frozen=True)
+class TraceEvent:
+    ts: str                        # ISO8601，毫秒精度，含时区
+    run_id: str                    # 本次运行标识：启动时 secrets.token_hex(6) 生成的随机 12 hex
+    batch_no: int                  # 运行级事件（run.*）为 0
+    stage: str                     # 发出事件的 stage 名；run.*/batch.* 固定 "run"
+    ev: str                        # 事件名（7.2 事件目录）
+    record_ids: tuple[str, ...]    # 涉及的记录 id（0/1/2 条）
+    payload: Mapping               # 事件负载：7.2 逐事件定义，经 7.4 脱敏
+
+class EventLog:
+    def emit(self, ev: TraceEvent) -> None:
+        """行缓冲写入 trace 文件；通道未启用或已因写失败关闭时为 no-op（调用方无需判断）。"""</code></pre>
+<p>接入方式：<code>EventLog</code> 由 <code>MetricsSink</code> 持有并转发——各 Stage 通过既有的 <code>RunContext.metrics</code>（3.10.3）发事件，<b>不改 RunContext 签名</b>。stderr 侧直接使用标准 <code>logging</code> 模块，handler 由 M12 在启动时按 <code>log_format</code> 安装。</p>
+<h3>3.12.4 行为规格</h3>
+<table>
+<tr><th style="width:20%">机制</th><th>定义</th></tr>
+<tr><td>通道过滤</td><td>事件按 7.2 归属通道，不在 <code>trace.channels</code> 中的事件不写；<code>run.* / batch.*</code> 生命周期事件不受过滤。</td></tr>
+<tr><td>schema 版本</td><td><code>trace_schema_version = 1</code> 只写在文件首行 <code>run.start</code> header 事件的 payload 中（避免每行冗余）；事件目录即稳定契约，后续版本只增不改。</td></tr>
+<tr><td>flush</td><td>行缓冲；每批随 M11 flush（3.11.2）同步 flush——保证主输出已落盘的行，其 trace 事件必已落盘。</td></tr>
+<tr><td>写失败</td><td>首次 <code>OSError</code> ⇒ stderr warn 一次 + 关闭该通道 + 后续事件计入 <code>report.trace.dropped_events</code>；运行绝不因日志中断。</td></tr>
+<tr><td>run_id</td><td>启动时生成、写入本次运行全部事件；用于多次运行的 trace 文件合并分析时区分来源。</td></tr>
+<tr><td>文件语义</td><td>启动时若 <code>trace.path</code> 已存在则截断覆盖并 stderr warn 一次（保留历史请改名或另配 trace.path）。trace 不做 .part 原子改名——它是逐批 flush 的流式日志，异常终止时已 flush 的行即有效前缀（首行仍为本次 run.start）。</td></tr>
+</table>
+<h3>3.12.5 配置项</h3>
+<p>见 5.1 <code>tool.log_format</code> 与 5.2 <code>[trace]</code> 节、<code>quality.judgment_reasons</code>。</p>
+<div class="backing"><b>背书：</b>对每次 LLM 调用与判定做结构化追踪（trace）并以其驱动评测迭代，是 LLM 工程的工业标准形态：LangSmith（LangChain）[28] 与 W&amp;B Weave [29] 均以「逐步 trace LLM 调用 + 数据集评测」为核心能力。<code>llm.call</code> 等事件的字段命名对齐 OpenTelemetry GenAI 语义约定 [27]——该约定截至 2026-07 处于 Development（实验性、非 stable）状态，本工具仅做命名对齐、不依赖其 SDK 实现（7.3）。</div>
+
+<!-- ═══════════════════ 4. 数据结构 ═══════════════════ -->
+<h1 id="s4">4. 核心数据结构与内部 API</h1>
+<p>本章是全部模块共享的类型契约。除 <code>PipelineItem</code> 的状态字段外全部为不可变（frozen dataclass）；模块间只通过这些类型与第 3 章列出的类签名交互。</p>
+
+<h2>4.1 记录与信封</h2>
+<pre><code>Status = Literal["active",        # 存活，继续流转
+                 "dropped_dup",   # M3 判重
+                 "dropped_lowq",  # M4 低于质量门
+                 "dropped_verify",# M7 评审失败且策略为 drop
+                 "failed"]        # 处理异常（结构不可修复 / provider 错误耗尽重试等）
+
+@dataclass(frozen=True)
+class RecordRef:
+    source_file: str                  # 相对 run.input 的路径
+    line_no: int | None               # 文本模态：1-based 行号
+    pair_index: int | None            # UI 模态：文件对 index
+    generated_from: tuple[str, ...]   # process 模式生成样本：种子记录 id 列表；其余（含 generate_only 生成样本）为空元组——合成判据用 generator（v1.4）
+    generator: Mapping | None = None  # v1.2：生成记录的 {"llm": profile 名, "style": name|None} 溯源（3.6.2）；非生成记录为 None
+
+@dataclass(frozen=True)
+class ImageRef:
+    path: Path; format: Literal["png", "jpeg"]; size_bytes: int
+    def load_base64(self, max_px: int) -> tuple[str, str]:   # (media_type, b64) 用后即弃
+
+@dataclass(frozen=True)
+class UINode:
+    node_id: str; parent_id: str | None; depth: int
+    role: str                         # class/type 归一后的控件角色
+    text: str; content_desc: str
+    bounds: tuple[int, int, int, int] # (l, t, r, b) 像素
+    visible: bool; extra: Mapping[str, str]   # 白名单外字段原样保留
+
+@dataclass(frozen=True)
+class UITree:
+    nodes: tuple[UINode, ...]         # 深度优先序
+    def serialize(self, max_chars: int | None = None, quantize_px: int = 0) -> str
+
+@dataclass(frozen=True)
+class Record:
+    id: str                           # sha256 前 16 hex（M2 定义的确定性规则）
+    modality: Literal["text", "ui"]
+    text: str | None                  # 文本模态：抽取文本；UI 模态：None
+    raw: Mapping | None               # 文本模态：原始行对象
+    ui_tree: UITree | None; image: ImageRef | None
+    ref: RecordRef
+
+@dataclass
+class PipelineItem:                   # 唯一可变信封；生命周期 = 一个批
+    record: Record
+    status: Status = "active"
+    dedup: DedupInfo | None = None
+    scores: dict[str, QualityScore] = field(default_factory=dict)
+    annotation: Annotation | None = None
+    verification: VerificationResult | None = None
+    errors: list[StageError] = field(default_factory=list)</code></pre>
+
+<h2>4.2 阶段结果类型</h2>
+<pre><code>@dataclass(frozen=True)
+class DedupInfo:  kind: Literal["unique","exact","near_text","near_image","near_both","near_semantic"]
+                  cluster_key: str; kept_id: str | None    # 重复时指向被保留记录
+
+@dataclass(frozen=True)
+class QualityScore: criterion: str; score: float           # [0,1] 归一化
+                    mode: Literal["pairwise_bt","pointwise"]
+                    detail: Mapping    # pairwise: {comparisons, wins, ties, log_theta}
+                                       # pointwise: {raw_score(0-5), reason}
+
+@dataclass(frozen=True)
+class Annotation: output: Mapping     # 已通过用户 Schema (L2) 的对象
+                  model: str; attempts: int                # 1 + L3 修复次数
+                  usage: Usage
+
+@dataclass(frozen=True)
+class VerificationResult: verdict: Literal["pass","fail"]
+                          rounds: int; critiques: tuple[Mapping, ...]
+
+@dataclass(frozen=True)
+class StageError: stage: str; kind: str                    # 错误分类码（7.6）
+                  message: str; retryable: bool</code></pre>
+
+<h2>4.3 Stage 协议与异常层级</h2>
+<pre><code>class Stage(Protocol):
+    name: str
+    async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]:
+        """契约：① 只处理 status=='active' 的项；② 不删除列表元素（只改 status）；
+           ③ generate 例外——返回新增子批（原批元素不修改）；④ 单条失败不得抛出到批层面，
+           必须落入 item.errors 并置 status='failed'。"""
+
+LabelKitError
+ ├─ ConfigError(errors: list[str])            # M1，退出码 2
+ ├─ InputError                                 # M2 fail 策略触发，退出码 3
+ ├─ ProviderRetryableError / ProviderFatalError# M9
+ ├─ SchemaViolation(errors, raw_last_output)   # M8，记录级
+ └─ InternalError                              # 不变量破坏（如 M11 终检失败）</code></pre>
+<p><code>UITree.serialize()</code> 的规范定义（M3 去重与 M5 提示词共用，M3 传 <code>quantize_px=dedup.bounds_quantize_px</code>）：深度优先遍历可见节点；每行 = <code>"  "*depth + role + (' "'+text+'"' if text) + (' desc="'+content_desc+'"' if content_desc) + ' ['+l,t,r,b+']' + 非空 extra 的 k=v 列表</code>；坐标除以 quantize_px 取整（0 = 不量化）；超长截断规则见 3.5.2。该线性化即 ScreenAI 的 screen-schema 表示思想 [13]。</p>
+
+<!-- ═══════════════════ 5. 配置规格 ═══════════════════ -->
+<h1 id="s5">5. 配置文件完整规格</h1>
+
+<h2 id="s5-1">5.1 config.toml（工具级静态配置）</h2>
+<table class="cfg">
+<tr><th>键</th><th>类型</th><th>默认</th><th>说明</th></tr>
+<tr><td><code>schema_version</code></td><td>int</td><td>必填</td><td>本版本固定 1。</td></tr>
+<tr><td><code>tool.log_level</code></td><td>str</td><td>"info"</td><td>debug | info | warn | error；被 CLI --log-level 覆盖。</td></tr>
+<tr><td><code>llm.&lt;name&gt;</code></td><td>table</td><td>≥1 个</td><td>每个子表定义一个 profile，&lt;name&gt; 为被 project.toml 引用的名字。</td></tr>
+<tr><td><code>llm.*.provider</code></td><td>str</td><td>必填</td><td>"openai_compatible" | "anthropic"。</td></tr>
+<tr><td><code>llm.*.base_url</code></td><td>str</td><td>必填</td><td>API 根地址。</td></tr>
+<tr><td><code>llm.*.model</code></td><td>str</td><td>必填</td><td>模型名，原样透传。</td></tr>
+<tr><td><code>llm.*.api_key_env</code></td><td>str</td><td>必填</td><td>持有 API Key 的环境变量<b>名</b>（唯一的环境变量用途）。</td></tr>
+<tr><td><code>llm.*.max_concurrency</code></td><td>int</td><td>8</td><td>该 profile 并发上限（信号量）。</td></tr>
+<tr><td><code>llm.*.timeout_s</code></td><td>int</td><td>120</td><td>单次请求超时。</td></tr>
+<tr><td><code>llm.*.max_retries</code></td><td>int</td><td>5</td><td>可重试错误的最大重试次数。</td></tr>
+<tr><td><code>llm.*.retry_base_delay_s</code></td><td>float</td><td>1.0</td><td>全抖动指数退避基数（3.9.3）。</td></tr>
+<tr><td><code>llm.*.supports_structured_output</code></td><td>bool</td><td>false</td><td>true 时结构引擎启用 L0（3.8.2）。</td></tr>
+<tr><td><code>llm.*.supports_vision</code></td><td>bool</td><td>false</td><td>UI 模态所引用 profile 必须为 true（M1 校验）。</td></tr>
+<tr><td><code>llm.*.max_output_tokens</code></td><td>int</td><td>4096</td><td>透传给 API。</td></tr>
+<tr><td><code>llm.*.temperature</code></td><td>float</td><td>0.0</td><td>profile 级默认；生成阶段建议在 project.toml 用 generate.temperature 调高。</td></tr>
+<tr><td><code>llm.*.max_image_px</code></td><td>int</td><td>2048</td><td>图像长边上限，超出等比缩小（3.9.3）。</td></tr>
+<tr><td><code>llm.*.price_per_mtok_in / _out</code></td><td>float</td><td>可选</td><td>每百万 token 单价；配置后报告输出成本估算。</td></tr>
+
+<tr><td><code>embedding.&lt;name&gt;</code></td><td>table</td><td>可选</td><td>v1.2 新增：每个子表定义一个 embedding profile，&lt;name&gt; 为被 project.toml <code>dedup.semantic_embedding</code> 引用的名字（5.2；3.3.3 第④级）。</td></tr>
+<tr><td><code>embedding.*.provider</code></td><td>str</td><td>"openai_compatible"</td><td>本版唯一取值：POST <code>{base_url}/embeddings</code>（3.9.3）。</td></tr>
+<tr><td><code>embedding.*.base_url</code></td><td>str</td><td>必填</td><td>API 根地址。</td></tr>
+<tr><td><code>embedding.*.model</code></td><td>str</td><td>必填</td><td>embedding 模型名，原样透传。</td></tr>
+<tr><td><code>embedding.*.api_key_env</code></td><td>str</td><td>必填</td><td>持有 API Key 的环境变量<b>名</b>；被 <code>dedup.semantic_embedding</code> 引用时须存在且非空（M1 校验，3.1.4）。</td></tr>
+<tr><td><code>embedding.*.max_concurrency</code></td><td>int</td><td>8</td><td>该 profile 并发上限（信号量，与 llm.* 同机制，3.9.3）。</td></tr>
+<tr><td><code>embedding.*.timeout_s</code></td><td>int</td><td>60</td><td>单次请求超时。</td></tr>
+<tr><td><code>embedding.*.max_retries</code></td><td>int</td><td>5</td><td>可重试错误的最大重试次数（重试规则同 3.9.3）。</td></tr>
+<tr><td><code>embedding.*.dims</code></td><td>int</td><td>可选</td><td>返回向量维度校验：配置后 <code>embed()</code> 逐条比对返回维度，不匹配抛 ProviderFatalError（3.9.2）。</td></tr>
+<tr><td><code>tool.log_format</code></td><td>str</td><td>"text"</td><td>"text" | "jsonl"：stderr 运行日志行格式（7.3）；"jsonl" 时禁用进度条以保证 stderr 逐行可解析（7.7）。</td></tr>
+</table>
+<pre><code># ─── config.toml 完整示例 ───
+schema_version = 1
+
+[tool]
+log_level = "info"
+log_format = "text"                 # "jsonl" 供日志采集系统消费（7.3）
+
+[llm.default]                       # 多模态主力模型
+provider = "openai_compatible"
+base_url = "https://llm-gw.example.com/v1"
+model = "qwen2.5-vl-72b-instruct"
+api_key_env = "LABELKIT_KEY_DEFAULT"
+max_concurrency = 8
+timeout_s = 120
+max_retries = 5
+supports_structured_output = true
+supports_vision = true
+price_per_mtok_in = 0.6
+price_per_mtok_out = 1.8
+
+[llm.judge]                         # 独立评审模型（避免自增强偏差, 3.7.2）
+provider = "anthropic"
+base_url = "https://api.anthropic.com"
+model = "claude-sonnet-5"
+api_key_env = "LABELKIT_KEY_JUDGE"
+max_concurrency = 4
+supports_structured_output = true
+supports_vision = true
+
+[embedding.default_emb]             # v1.2：语义去重句向量 profile（被 dedup.semantic_embedding 引用，5.2）
+provider = "openai_compatible"      # 本版唯一取值：POST {base_url}/embeddings（3.9.3）
+base_url = "https://llm-gw.example.com/v1"
+model = "bge-m3"
+api_key_env = "LABELKIT_KEY_EMB"
+max_concurrency = 8
+timeout_s = 60
+max_retries = 5
+dims = 1024                         # 可选：返回向量维度校验</code></pre>
+
+<h2 id="s5-2">5.2 project.toml（工程级单次配置：运行参数 + Rubric + 输出 Schema）</h2>
+<table class="cfg">
+<tr><th>键</th><th>类型</th><th>默认</th><th>说明</th></tr>
+<tr><td><code>schema_version</code></td><td>int</td><td>必填</td><td>固定 1。</td></tr>
+<tr><td><code>run.input</code></td><td>str</td><td>process 必填*</td><td>输入路径（* 可被 CLI --input 覆盖）；<code>run.mode="generate_only"</code> 时必须缺省，提供（含 --input）即报 CONFIG_ERROR（3.1.4）。</td></tr>
+<tr><td><code>run.output</code></td><td>str</td><td>必填*</td><td>主输出 .jsonl 路径（* 可被 CLI --output 覆盖）。</td></tr>
+<tr><td><code>run.modality</code></td><td>str</td><td>必填</td><td>"text" | "ui"。</td></tr>
+<tr><td><code>run.mode</code></td><td>str</td><td>"process"</td><td>"process"（读取 run.input 加工既有数据）| "generate_only"（v1.4 纯生成：无输入从零合成，3.6.2 / 3.10.3；组合与互斥约束见 2.3.1 ④、3.1.4）。</td></tr>
+<tr><td><code>run.batch_size</code></td><td>int</td><td>256</td><td>批大小 = QuRating 比较池大小（3.4.3）。</td></tr>
+<tr><td><code>run.seed</code></td><td>int</td><td>0</td><td>PRNG 种子（配对采样/顺序随机/种子抽样）。</td></tr>
+<tr><td><code>run.fatal_error_threshold</code></td><td>int</td><td>20</td><td>熔断阈值（3.10.3）。</td></tr>
+<tr><td><code>input.text_field</code></td><td>str</td><td>"text"</td><td>文本模态取文内容的点路径（3.2.5）。</td></tr>
+<tr><td><code>input.on_bad_line / on_missing_pair / on_index_conflict</code></td><td>str</td><td>skip / skip / fail</td><td>"skip" | "fail"（3.2.4–3.2.5）。</td></tr>
+<tr><td><code>input.max_image_mb</code></td><td>int</td><td>20</td><td>单图大小上限。</td></tr>
+<tr><td><code>input.ui_tree_max_chars</code></td><td>int</td><td>30000</td><td>提示词中树序列化长度上限。</td></tr>
+<tr><td><code>dedup.enabled</code></td><td>bool</td><td>true</td><td>—</td></tr>
+<tr><td><code>dedup.scope</code></td><td>str</td><td>"global"</td><td>"global" | "batch"（2.6 内存权衡）。</td></tr>
+<tr><td><code>dedup.minhash_threshold</code></td><td>float</td><td>0.85</td><td>Jaccard 判重阈值（工业通行 0.8–0.9 [3][6]）。</td></tr>
+<tr><td><code>dedup.minhash_num_perm / ngram</code></td><td>int</td><td>128 / 5</td><td>签名精度 / 字符 shingle 宽度。</td></tr>
+<tr><td><code>dedup.image_phash_max_distance</code></td><td>int</td><td>8</td><td>64-bit pHash 汉明距离阈值。</td></tr>
+<tr><td><code>dedup.ui_dup_requires</code></td><td>str</td><td>"both"</td><td>"both" | "tree" | "image"（3.3.3）。</td></tr>
+<tr><td><code>dedup.bounds_quantize_px</code></td><td>int</td><td>4</td><td>树去重时坐标量化粒度。</td></tr>
+
+<tr><td><code>dedup.semantic</code></td><td>bool</td><td>false</td><td>v1.2 新增：可选第④级语义去重开关（3.3.3；SemDeDup [26]）。默认关——零 embedding 依赖，默认行为与 v1.0 一致（8.3 O1）。</td></tr>
+<tr><td><code>dedup.semantic_embedding</code></td><td>str</td><td>必填†</td><td>† <code>dedup.semantic = true</code> 时必填：引用 config.toml <code>[embedding.&lt;name&gt;]</code> profile（5.1）；存在性与 api_key_env 非空由 M1 校验（3.1.4）。</td></tr>
+<tr><td><code>dedup.semantic_threshold</code></td><td>float</td><td>0.95</td><td>余弦相似度判重阈值（SemDeDup 论文的高相似区间 [26]；3.3.3 第④级）。</td></tr>
+<tr><td><code>quality.enabled</code></td><td>bool</td><td>true</td><td>—</td></tr>
+<tr><td><code>quality.mode</code></td><td>str</td><td>"pairwise"</td><td>"pairwise" | "pointwise"（1.6 对齐决策）。</td></tr>
+<tr><td><code>quality.llm</code></td><td>str</td><td>"default"</td><td>profile 引用。</td></tr>
+<tr><td><code>quality.rounds</code></td><td>int</td><td>4</td><td>pairwise 轮数 k。</td></tr>
+<tr><td><code>quality.criteria_per_call</code></td><td>str</td><td>"all"</td><td>"all" | "single"（3.4.3）。</td></tr>
+<tr><td><code>quality.threshold</code></td><td>float</td><td>无</td><td>聚合分过滤线 [0,1]；缺省 = 不过滤只打分。</td></tr>
+<tr><td><code>quality.selection</code></td><td>str</td><td>"threshold"</td><td>"threshold" | "top_ratio"（3.4.3 选择机制行）。"threshold" = 现行为：聚合分 &lt; <code>quality.threshold</code> ⇒ dropped_lowq，threshold 缺省则只打分不筛；"top_ratio" = 批内按聚合分降序保留 ceil(top_ratio × 批内存活数) 条。selection="top_ratio" 时不得再设 <code>quality.threshold</code>（互斥，M1 报 <code>CONFIG_ERROR</code>）。</td></tr>
+<tr><td><code>quality.top_ratio</code></td><td>float</td><td>无</td><td>(0,1]；<code>selection="top_ratio"</code> 时必填，与 <code>threshold</code> 互斥（M1 校验）。保留条数 = ceil(top_ratio × 批内存活数)；<code>on_unscored="keep"</code> 保留的未打分记录不占名额（3.4.3）。</td></tr>
+<tr><td><code>quality.judges</code></td><td>array</td><td>[]</td><td>评审团 profile 引用数组。空 = 单评审（用 <code>quality.llm</code>）；非空须为奇数个且每项存在于 config.toml <code>[llm.*]</code>（M1 校验），每次比较各 judge 独立裁决、per-criterion 多数票（3.4.3 多评审团行，PoLL [32]）。成本 ×|judges|。</td></tr>
+<tr><td><code>quality.both_orders</code></td><td>bool</td><td>false</td><td>true 时同一对正反两种呈现顺序各裁决一次（每 judge），两次一致才记 winner、不一致按 tie（3.4.3 双顺序裁决行 [20]）。成本 ×2。</td></tr>
+<tr><td><code>quality.on_unscored</code></td><td>str</td><td>"keep"</td><td>"keep" | "drop"（3.4.3 裁决失败行）。</td></tr>
+<tr><td><code>quality.rubric</code></td><td>str</td><td>自动</td><td>"default:text" | "default:ui" | "inline"。缺省按模态选默认；写 inline 时必须提供 [[rubric.criteria]]。</td></tr>
+<tr><td><code>quality.judgment_reasons</code></td><td>str/bool</td><td>"auto"</td><td>"auto" | true | false。生效时 pairwise 裁决 Schema 增加 <code>reason</code> 字段（3.4.3），写入 trace 供 rubric 优化（7.5）；"auto" = <code>trace.enabled=true</code> 且 <code>trace.channels</code> 含 "quality" 时开（trace 关闭则不请求 reason，零额外 token）。成本：每次裁决约增加 30–60 输出 token。</td></tr>
+<tr><td><code>rubric.criteria</code></td><td>array</td><td>可选</td><td>内联 rubric，字段见 5.3。</td></tr>
+<tr><td><code>generate.enabled</code></td><td>bool</td><td>false</td><td>仅文本模态（2.3.1 约束）。</td></tr>
+<tr><td><code>generate.llms / instruction</code></td><td>array/str</td><td>["default"] / 必填†</td><td>† enabled 时必填。<code>llms</code> 为 profile 引用数组（v1.2，取代 v1.1 单值键 <code>generate.llm</code>），每个元素须存在于 config.toml <code>[llm.*]</code>；每次生成调用按 <code>generate.mixture</code> 从中选 1 个（3.6.2 多模型混合行）。</td></tr>
+<tr><td><code>generate.mixture</code></td><td>str</td><td>"round_robin"</td><td>"round_robin"（按调用序轮转）| "weighted"（按 <code>generate.weights</code> 加权抽样，PRNG 用 <code>ctx.rng</code>，随 run.seed 可复现）。llms 仅 1 个元素时二者等价（即 v1.1 行为）。</td></tr>
+<tr><td><code>generate.weights</code></td><td>array</td><td>[]</td><td>正数权重；<code>mixture = "weighted"</code> 时必填且长度须等于 llms（M1 校验），round_robin 下忽略。</td></tr>
+<tr><td><code>[[generate.styles]]</code></td><td>array</td><td>[]</td><td>风格子表（可选）：每项含 <code>name</code>（str，表内唯一）与 <code>prompt</code>（str，非空）；非空时每次生成调用经 <code>ctx.rng</code> 均匀抽 1 个 style，其 prompt 追加进生成指令（3.6.2 风格条件化行）。</td></tr>
+<tr><td><code>generate.num_per_record</code></td><td>int</td><td>2</td><td>每种子期望产出条数。</td></tr>
+<tr><td><code>generate.seeds_per_call / num_per_call</code></td><td>int</td><td>3 / 4</td><td>3.6.2。</td></tr>
+<tr><td><code>generate.seed_min_score</code></td><td>float</td><td>自动</td><td>种子门槛，默认取 quality.threshold 或批中位数。</td></tr>
+<tr><td><code>generate.temperature</code></td><td>float</td><td>0.9</td><td>生成需要多样性，覆盖 profile 默认。</td></tr>
+<tr><td><code>generate.seed_examples</code></td><td>array</td><td>[]</td><td>generate_only 专用（process 模式不得设置，3.1.4）：字符串数组种子池，非空即种子池形态（3.6.2）。</td></tr>
+<tr><td><code>generate.standalone_count</code></td><td>int</td><td>无</td><td>generate_only 无种子形态必填（与 seed_examples 互斥）：目标产出条数，调用数 = ⌈standalone_count / num_per_call⌉。</td></tr>
+<tr><td><code>annotate.enabled</code></td><td>bool</td><td>true</td><td>—</td></tr>
+<tr><td><code>annotate.llm / instruction</code></td><td>str</td><td>default / 必填†</td><td>† enabled 时必填。</td></tr>
+<tr><td><code>annotate.examples</code></td><td>array</td><td>[]</td><td>few-shot：[{input, output}]，output 须过用户 Schema（M1 校验）。</td></tr>
+<tr><td><code>annotate.self_consistency</code></td><td>int</td><td>0</td><td>0 = 关（单次标注，v1.1 行为）；启用须 ≥3 且为奇数（M1 校验）：每条记录独立采样 n 次后字段级投票（3.5.2 note 框）。成本：标注调用与 token ×n。</td></tr>
+<tr><td><code>annotate.sc_temperature</code></td><td>float</td><td>0.7</td><td>self-consistency 各次采样的 temperature（采样多样性来源 [33]），覆盖 profile 默认；仅 <code>self_consistency ≥ 3</code> 时生效。</td></tr>
+<tr><td><code>verify.enabled</code></td><td>bool</td><td>false</td><td>—</td></tr>
+<tr><td><code>verify.llm</code></td><td>str</td><td>"judge"†</td><td>† <code>verify.enabled = true</code> 时该 profile 须存在于 config.toml <code>[llm.*]</code>；建议独立于 annotate.llm（3.7.2）。</td></tr>
+
+<tr><td><code>verify.judges</code></td><td>array</td><td>[]</td><td>多评审团 profile 列表（v1.2，3.7.2；与 quality.judges 语义一致）：空 = 单评审用 verify.llm；非空须为奇数个（M1 校验），verdict 取多数票，critiques 合并并标注来源 judge，成本 ×|judges|。背书 PoLL [32]。</td></tr>
+<tr><td><code>verify.policy / max_repair_rounds</code></td><td>str/int</td><td>"drop" / 1</td><td>3.7.3。</td></tr>
+<tr><td><code>verify.extra_criteria</code></td><td>str</td><td>""</td><td>追加评审维度的自由文本。</td></tr>
+<tr><td><code>output.schema_path</code></td><td>str</td><td>二选一</td><td>外部 .json 的用户 Schema；与 schema_inline 恰一。</td></tr>
+<tr><td><code>output.schema_inline</code></td><td>str</td><td>二选一</td><td>TOML 多行字符串内嵌的 Schema JSON 文本。</td></tr>
+<tr><td><code>output.max_repair_attempts</code></td><td>int</td><td>2</td><td>结构引擎 L3 次数（3.8.2）。</td></tr>
+<tr><td><code>output.repair_llm</code></td><td>str</td><td>同调用方</td><td>L3 修复用 profile。</td></tr>
+<tr><td><code>output.meta_mode</code></td><td>str</td><td>"inline"</td><td>"inline" | "sidecar" | "none"（6.3）。</td></tr>
+<tr><td><code>output.passthrough_fields</code></td><td>array</td><td>[]</td><td>从 Record.raw 透传进 _meta.source.fields 的字段名列表。</td></tr>
+<tr><td><code>output.rejects</code></td><td>str</td><td>"refs"</td><td>"none" | "refs" | "full"（3.11.2）。</td></tr>
+<tr><td><code>trace.enabled</code></td><td>bool</td><td>false</td><td>启用 trace 追踪日志（第 7 章）。</td></tr>
+<tr><td><code>trace.path</code></td><td>str</td><td>自动</td><td>默认 <code>{output_stem}.trace.jsonl</code>，与主输出同目录。</td></tr>
+<tr><td><code>trace.channels</code></td><td>array</td><td>["quality","verify","schema"]</td><td>可选值 ingest | dedup | quality | annotate | verify | schema | llm（7.2 事件目录）；run.*/batch.* 生命周期事件不受此过滤。</td></tr>
+<tr><td><code>trace.content</code></td><td>str</td><td>"refs"</td><td>"none" | "refs" | "excerpt" | "full" 内容脱敏四档（7.4）。</td></tr>
+</table>
+
+<pre><code># ─── project.toml 完整示例（UI 模态标注工程）───
+schema_version = 1
+
+[run]
+input = "./capture/2026-07-01"
+output = "./out/ui-labels-0701.jsonl"
+modality = "ui"
+batch_size = 128
+seed = 42
+
+[dedup]
+ui_dup_requires = "both"
+
+[quality]
+mode = "pairwise"
+rounds = 4
+threshold = 0.3
+rubric = "default:ui"
+
+[annotate]
+llm = "default"
+instruction = """
+你是移动端 UI 理解标注员。根据屏幕截图与 UI 控件树，
+标注该屏幕的功能类别、页面标题、可交互元素列表与一句话页面描述。
+"""
+
+[verify]
+enabled = true
+llm = "judge"
+policy = "repair"
+max_repair_rounds = 1
+
+[trace]                             # 追踪日志（第 7 章）：调优期开启，用于 rubric 诊断（7.5）
+enabled = true
+channels = ["quality", "verify"]
+
+[output]
+meta_mode = "inline"
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "screen_category": {"type": "string",
+      "enum": ["login", "home", "list", "detail", "form", "settings", "dialog", "other"]},
+    "page_title": {"type": "string"},
+    "interactive_elements": {"type": "array", "items": {
+      "type": "object",
+      "properties": {"role": {"type": "string"}, "label": {"type": "string"},
+                     "bounds": {"type": "array", "items": {"type": "integer"},
+                                "minItems": 4, "maxItems": 4}},
+      "required": ["role", "label", "bounds"], "additionalProperties": false}},
+    "description": {"type": "string", "maxLength": 200}
+  },
+  "required": ["screen_category", "page_title", "interactive_elements", "description"],
+  "additionalProperties": false
+}
+"""</code></pre>
+
+<h2 id="s5-3">5.3 Rubric 结构（内联或默认包文件，同一 TOML 结构）</h2>
+<table class="cfg">
+<tr><th>键</th><th>类型</th><th>默认</th><th>说明</th></tr>
+<tr><td><code>rubric.name</code></td><td>str</td><td>必填</td><td>rubric 标识，入 _meta 与报告。</td></tr>
+<tr><td><code>rubric.criteria[].key</code></td><td>str</td><td>必填</td><td><code>[a-z0-9_]+</code>，全局唯一。</td></tr>
+<tr><td><code>rubric.criteria[].weight</code></td><td>float</td><td>1.0</td><td>聚合权重（&gt;0）。</td></tr>
+<tr><td><code>rubric.criteria[].description</code></td><td>str</td><td>必填</td><td>准则含义（进入两种模式的提示词）。</td></tr>
+<tr><td><code>rubric.criteria[].pairwise_prompt</code></td><td>str</td><td>必填</td><td>成对比较问句，如「哪段文本的写作水平更高？」。</td></tr>
+<tr><td><code>rubric.criteria[].pointwise_levels</code></td><td>array[6]</td><td>pointwise 必填</td><td>0–5 六级加性描述（附录 A 示例）。</td></tr>
+</table>
+
+<!-- ═══════════════════ 6. 输入/输出格式 ═══════════════════ -->
+<h1 id="s6">6. 输入 / 输出格式规格</h1>
+
+<h2 id="s6-1">6.1 输入：文本模态</h2>
+<p>UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 <code>\n</code>；空行跳过（不计坏行）。示例（<code>input.text_field = "instruction"</code>）：</p>
+<pre><code>{"instruction": "帮我把这段话翻译成英文……", "source": "app-feedback", "ts": "2026-06-30T10:12:00Z"}
+{"instruction": "写一份周报模板", "source": "ime-log", "ts": "2026-06-30T10:15:21Z"}</code></pre>
+
+<h2 id="s6-2">6.2 输入：UI 模态</h2>
+<p>目录递归扫描与配对规则见 3.2.4。<code>uitree_&lt;index&gt;.jsonl</code> 节点行的字段映射（平铺风格；嵌套风格为同字段 + <code>children</code> 数组）：</p>
+<table>
+<tr><th style="width:18%">Record 字段</th><th>接受的源字段名（按序取首个存在者）</th><th style="width:18%">缺省行为</th></tr>
+<tr><td>node_id</td><td><code>id</code>, <code>node_id</code></td><td>行号字符串</td></tr>
+<tr><td>parent_id</td><td><code>parent</code>, <code>parent_id</code></td><td>null（根）</td></tr>
+<tr><td>role</td><td><code>class</code>, <code>className</code>, <code>type</code>, <code>role</code></td><td>"unknown"</td></tr>
+<tr><td>text</td><td><code>text</code>, <code>label</code></td><td>""</td></tr>
+<tr><td>content_desc</td><td><code>content_desc</code>, <code>contentDescription</code>, <code>desc</code></td><td>""</td></tr>
+<tr><td>bounds</td><td><code>bounds</code>（[l,t,r,b] 数组或 "[l,t][r,b]" 字符串两种形式）</td><td>[0,0,0,0]</td></tr>
+<tr><td>visible</td><td><code>visible</code>, <code>visible_to_user</code></td><td>true</td></tr>
+<tr><td>extra</td><td>其余全部字段（值转字符串）</td><td>—</td></tr>
+</table>
+<p class="small">该映射覆盖 Android uiautomator dump、accessibility 服务导出与主流 GUI 数据集（AndroidControl/AMEX 风格）的常见字段名；不匹配的导出格式可在采集侧做一次字段重命名。</p>
+
+<h2 id="s6-3">6.3 主输出 JSONL</h2>
+<p>每行一个 JSON object。<code>meta_mode</code> 三种形态：</p>
+<table>
+<tr><th style="width:16%">meta_mode</th><th>行结构</th></tr>
+<tr><td>inline（默认）</td><td>用户 Schema 的全部字段平铺在顶层 + 保留键 <code>_meta</code>。校验语义：剥除 <code>_meta</code> 后的对象必须通过用户 Schema（M1 已禁止用户 Schema 声明 _meta，3.1.4）。</td></tr>
+<tr><td>sidecar</td><td>主输出行 = 纯用户结构；<code>_meta</code> 逐行写入 <code>{output_stem}.meta.jsonl</code>，以 <code>_meta.id</code> 与行序对齐。</td></tr>
+<tr><td>none</td><td>只写用户结构，不产出元信息（丢弃分数与溯源，不推荐）。</td></tr>
+</table>
+<p><code>_meta</code> 的完整结构：</p>
+<pre><code>{
+  "screen_category": "login",                   // ← 用户 Schema 字段（示例）
+  "page_title": "登录",
+  "interactive_elements": [ ... ],
+  "description": "手机号+验证码登录页",
+  "_meta": {
+    "id": "9f2c31ab52e08d17",
+    "run": {"tool": "labelkit/1.0.0", "started_at": "2026-07-02T09:30:00+08:00",
+             "project_file": "project.toml", "rubric": "default:ui", "seed": 42},
+    "source": {"file": "capture/2026-07-01/b/uitree_2.jsonl", "pair_index": 2,
+               "generated_from": [], "fields": {},           // passthrough_fields 落点
+               "generator": null},   // v1.2 只增：生成记录为 {"llm", "style"}（3.6.2），否则 null
+    "scores": {"screenshot_readability": 0.81, "tree_screen_consistency": 0.66,
+               "state_completeness": 0.74, "interaction_richness": 0.52,
+               "__aggregate__": 0.68, "mode": "pairwise_bt", "batch_no": 3},
+    "dedup": {"kind": "unique"},
+    "annotation": {"model": "qwen2.5-vl-72b-instruct", "attempts": 1},   // v1.2 只增：self-consistency 启用时另含 "sc": {"n", "agreement_ratio"}（3.5.2）
+    "verification": {"verdict": "pass", "rounds": 1}          // verify 未启用则为 null
+  }
+}</code></pre>
+
+<h2 id="s6-4">6.4 report.json 结构</h2>
+<pre><code>{
+  "run": {"tool_version": "1.0.0", "started_at": "...", "finished_at": "...",
+           "interrupted": false, "exit_code": 0, "modality": "ui", "seed": 42,
+           "config_digest": "sha256:...", "project_digest": "sha256:..."},   // 配置指纹（脱敏后）
+  "counts": {"scanned": 5000, "ingested": 4987, "bad_input": 13,
+              "dropped_dup": 412, "dropped_lowq": 305, "dropped_verify": 41,
+              "failed": 9, "generated": 0, "emitted": 4220},
+  "dedup": {"exact": 118, "near_text": 201, "near_image": 46, "near_both": 47,
+             "clusters": 366, "image_decode_failures": 2},   // v1.2：dedup.semantic 开启时另含 near_semantic 与 embedding_failures
+  "quality": {"mode": "pairwise_bt", "rounds": 4, "judgment_failures": 17,
+               "aggregate_histogram": {"0.0-0.1": 12, "...": 0},               // 10 桶
+               "per_criterion_mean": {"screenshot_readability": 0.61}},
+  "schema_engine": {"resolved_at": {"l0_or_clean": 4141, "l1": 87, "l3_1": 30,
+                     "l3_2": 3, "rejected": 9}},
+  // v1.2 可选块："annotate": {"sc_disagreements": 0}（self-consistency 启用时）；
+  //             "generate": {"buckets": {"default×concise": {"calls", "produced", "survived_dedup"}}}（generate 启用时）
+  "trace": {"enabled": true, "path": "./out/ui-labels-0701.trace.jsonl",
+             "events": 18342, "dropped_events": 0},
+  "llm_usage": {"default": {"calls": 31240, "prompt_tokens": 8.1e7,
+                 "completion_tokens": 3.2e6, "est_cost_usd": 54.3, "retries": 210},
+                "judge": {"...": 0}},
+  "timing": {"wall_s": 5400, "per_stage_s": {"dedup": 40, "quality": 2900,
+              "annotate": 1800, "verify": 620}}
+}</code></pre>
+<p class="small">不变量：<code>emitted + dropped_* + failed + bad_input = scanned + generated</code>。<code>schema_engine.resolved_at</code> 仅统计用户 Schema 的标注调用，加总 = 进入 M5 的记录数（4141+87+30+3+9 = 4270 = ingested 4987 − dropped_dup 412 − dropped_lowq 305）；裁决/评审/生成等内部 Schema 解析不计入。报告中无任何数据内容字段。</p>
+
+<!-- ═══════════════════ 7. 日志系统 ═══════════════════ -->
+<h1 id="s7">7. 日志系统与可观测性</h1>
+<p>本章定义 LabelKit 的日志体系（承载模块为 M12，见 3.12）：两条相互独立的输出通道，外加一个不属于日志的进度显示面。本章核心是 7.2 的<b>事件目录</b>——它与第 5 章配置表、第 6 章输出格式同级，属对外稳定契约。</p>
+
+<h2>7.1 日志体系总览</h2>
+<table>
+<tr><th style="width:14%">输出面</th><th style="width:30%">形态与开关</th><th style="width:32%">内容</th><th>消费方</th></tr>
+<tr><td>① 运行日志</td><td>stderr，恒开。级别 debug/info/warn/error（<code>tool.log_level</code> / <code>--log-level</code>）；行格式 <code>tool.log_format = "text"</code>（默认）| <code>"jsonl"</code>（7.3）。</td><td>仅运维事件：生命周期、警告、错误、LLM 调用摘要（debug 级）。<b>绝不含数据内容与提示词</b>。</td><td>人工排障；日志采集系统。</td></tr>
+<tr><td>② trace 追踪日志</td><td>JSONL 文件，默认 <code>{output_stem}.trace.jsonl</code>（<code>trace.path</code>）；默认关（<code>trace.enabled = false</code>）。</td><td>结构化事件流，一行一事件（7.2）；按 <code>trace.channels</code> 过滤通道，按 <code>trace.content</code> 控制内容量（7.4）。</td><td>rubric 优化（7.5）；标注质量分析与审计；后续 <code>labelkit analyze</code>（8.3 O5）。</td></tr>
+<tr><td>③ 进度显示</td><td>TTY 进度条 / 非 TTY 批摘要，恒开。</td><td>当前批号/总批数、各状态计数、瞬时成本累计。</td><td>交互终端前的人。<b>不属于日志</b>（7.7）。</td></tr>
+</table>
+<div class="note"><b>与「工具不存储数据」原则的关系：</b>trace 是用户<b>显式启用</b>的输出通道，与主输出、rejects 同级（2.6「数据不落盘」行已将其列入唯一写盘对象），而非中间态落盘——它记录的是「处理判定及其依据」而非批中间态本身。trace 文件的保留、脱敏档位选择（7.4）与清理均为用户责任；<code>content="full"</code> 档含数据内容，风险见 7.4 明示。</div>
+<figure>
+<svg viewBox="0 0 1000 260" xmlns="http://www.w3.org/2000/svg" font-family="PingFang SC, sans-serif">
+  <defs>
+    <marker id="arr8" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <g font-size="12.5" text-anchor="middle">
+    <rect x="20" y="70" width="210" height="120" rx="6" fill="#f6f8fa" stroke="#888"/>
+    <text x="125" y="100" font-weight="bold">产生方</text>
+    <text x="125" y="124" font-size="11">M2–M7 算子 · M9 · M10</text>
+    <text x="125" y="144" font-size="11" fill="#666">经 RunContext.metrics 旁挂的</text>
+    <text x="125" y="162" font-size="11" fill="#666">EventLog 发事件（3.12.3）</text>
+
+    <rect x="290" y="70" width="190" height="120" rx="6" fill="#f6f1fb" stroke="#7a4fb5"/>
+    <text x="385" y="100" font-weight="bold" fill="#7a4fb5">M12 日志 logging</text>
+    <text x="385" y="124" font-size="11">标准 logging + EventLog</text>
+    <text x="385" y="144" font-size="11" fill="#666">写失败 ⇒ warn 一次</text>
+    <text x="385" y="162" font-size="11" fill="#666">并关闭该通道，绝不中断运行</text>
+
+    <rect x="545" y="25" width="230" height="90" rx="6" fill="#eef3fa" stroke="#2456a6"/>
+    <text x="660" y="52" font-weight="bold" fill="#2456a6">① stderr 运行日志</text>
+    <text x="660" y="74" font-size="11">text | jsonl · debug…error</text>
+    <text x="660" y="92" font-size="11" fill="#666">不含数据内容与提示词</text>
+
+    <rect x="545" y="145" width="230" height="90" rx="6" fill="#eef8f0" stroke="#2e8b57"/>
+    <text x="660" y="172" font-weight="bold" fill="#2e8b57">② trace 追踪日志</text>
+    <text x="660" y="194" font-size="11" font-family="Menlo">{output_stem}.trace.jsonl</text>
+    <text x="660" y="212" font-size="11" fill="#666">channels 过滤 · content 脱敏</text>
+
+    <rect x="820" y="25" width="160" height="90" rx="6" fill="#fff" stroke="#2456a6"/>
+    <text x="900" y="60">运维排障</text>
+    <text x="900" y="82" font-size="11" fill="#666">日志采集系统</text>
+
+    <rect x="820" y="145" width="160" height="90" rx="6" fill="#fff" stroke="#2e8b57"/>
+    <text x="900" y="174">rubric 优化（7.5）</text>
+    <text x="900" y="196" font-size="11" fill="#666">质量分析 / 审计</text>
+    <text x="900" y="214" font-size="11" fill="#666">labelkit analyze（O5）</text>
+  </g>
+  <g stroke="#555" stroke-width="1.8" marker-end="url(#arr8)" fill="none">
+    <line x1="230" y1="130" x2="288" y2="130"/>
+    <path d="M 480 105 L 512 105 L 512 70 L 543 70"/>
+    <path d="M 480 155 L 512 155 L 512 190 L 543 190"/>
+    <line x1="775" y1="70" x2="818" y2="70"/>
+    <line x1="775" y1="190" x2="818" y2="190"/>
+  </g>
+</svg>
+<figcaption>图 7-1 双通道日志架构。进度显示走 stderr 但不经日志设施（7.7）。</figcaption>
+</figure>
+
+<h2>7.2 事件目录</h2>
+<p>通道归属规则：<b>事件名前缀即通道名</b>（<code>ingest. / dedup. / quality. / annotate. / verify. / schema. / llm.</code>，对应 <code>trace.channels</code> 的七个可选值）；<code>run.*</code> 与 <code>batch.*</code> 生命周期事件由 M10 发出、<code>stage="run"</code>、<code>record_ids</code> 为空，<b>不受 channels 过滤</b>（<code>trace.enabled=true</code> 即写）；<code>error</code> 事件按产生它的 stage 归属通道。本目录为稳定契约：<code>trace_schema_version = 1</code>，后续版本<b>只增不改</b>（可新增事件与 payload 字段，不改既有字段语义）。</p>
+<table>
+<tr><th style="width:15%">事件名</th><th style="width:15%">通道 / stderr 级别</th><th style="width:24%">触发点</th><th>payload 字段</th></tr>
+<tr><td><code>run.start</code></td><td>恒写 / info</td><td>M1 校验通过、首批开始前；trace 文件<b>首行</b> header 事件。</td><td><code>tool_version</code>、<code>config_digest</code>、<code>project_digest</code>（同 6.4 run 节）、<code>trace_schema_version</code>（=1，仅此事件携带，避免逐行冗余）。</td></tr>
+<tr><td><code>run.end</code></td><td>恒写 / info</td><td>finalize 完成后（trace 末行）。</td><td><code>counts</code>（与 report.json counts 同构的摘要对象）、<code>exit_code</code>。</td></tr>
+<tr><td><code>batch.start</code></td><td>恒写 / debug</td><td>批构造完成（PipelineItem[] 就绪）。</td><td><code>size</code>。</td></tr>
+<tr><td><code>batch.end</code></td><td>恒写 / info</td><td>批 emit 并释放中间态后。</td><td><code>active</code>、<code>dropped_dup</code>、<code>dropped_lowq</code>、<code>dropped_verify</code>、<code>failed</code>、<code>duration_ms</code>。</td></tr>
+<tr><td><code>ingest.bad_line</code></td><td>ingest / warn</td><td>M2 坏行跳过（3.2.5）。</td><td><code>file</code>、<code>line_no</code>、<code>reason</code>。</td></tr>
+<tr><td><code>ingest.missing_pair</code></td><td>ingest / warn</td><td>M2 缺对跳过（3.2.4）。</td><td><code>index</code>、<code>present</code>（"tree"|"image"，实际存在的一侧）、<code>file</code>。</td></tr>
+<tr><td><code>ingest.index_conflict</code></td><td>ingest / warn（fail 策略时 error）</td><td>M2 index 冲突（3.2.4）。</td><td><code>index</code>、<code>files</code>（冲突文件路径列表）。</td></tr>
+<tr><td><code>dedup.duplicate</code></td><td>dedup / —</td><td>M3 判重时；<code>record_ids</code> = [被判重记录 id]。</td><td><code>kind</code>、<code>cluster_key</code>、<code>kept_id</code>（同 DedupInfo，4.2）、<code>jaccard</code>（near_text：实测估计值）或 <code>hamming</code>（near_image：实测距离）或 <code>cosine</code>（near_semantic：实测余弦相似度，v1.2 增）；精确重复三者皆无。</td></tr>
+<tr><td><code>quality.judgment</code></td><td>quality / —</td><td>M4 每次 pairwise 裁决经 M8 校验通过后；<code>record_ids</code> = [记录甲, 记录乙]（采样顺序）。<b>rubric 优化的核心事件。</b></td><td><code>order</code>（{"A": id, "B": id}，随机化后的呈现顺序）、<code>model</code>、<code>judgments</code>[]{<code>criterion</code>, <code>winner</code>("A"|"B"|"tie"), <code>reason</code>†}；v1.2 增可选字段 <code>judge</code>（= 评审 profile 名，仅 <code>quality.judges</code> 非空时携带，3.4.3）。</td></tr>
+<tr><td><code>quality.pointwise</code></td><td>quality / —</td><td>M4 pointwise 每记录每 criterion 打分后。</td><td><code>criterion</code>、<code>score</code>（0–5 原始分）、<code>reason</code>。</td></tr>
+<tr><td><code>quality.bt_fit</code></td><td>quality / —</td><td>M4 每批每 criterion BT 拟合结束（批级，record_ids 为空）。</td><td><code>criterion</code>、<code>iterations</code>、<code>converged</code>、<code>comparisons</code>（参与拟合的比较数）。</td></tr>
+<tr><td><code>quality.gate</code></td><td>quality / —</td><td>M4 质量门判定（配置了 <code>quality.threshold</code>，或 <code>quality.selection = "top_ratio"</code> 时，3.4.3）。</td><td><code>aggregate</code>、<code>decision</code>（"keep"|"drop"）、<code>threshold</code>（threshold 选择时）；v1.2 增可选字段 <code>selection</code>、<code>top_ratio</code>、<code>rank</code>（top_ratio 选择时携带，payload 只增不改）。</td></tr>
+<tr><td><code>annotate.done</code></td><td>annotate / —</td><td>M5 标注经 M8 通过后。</td><td><code>attempts</code>（同 Annotation.attempts，4.2）；v1.2 增可选字段 <code>sc</code> = {n, agreement_ratio}（self-consistency 启用时，3.5.2）。</td></tr>
+<tr><td><code>verify.verdict</code></td><td>verify / —</td><td>M7 每轮评审后（round 从 1 计，repair 策略下每轮一事件）。</td><td><code>verdict</code>、<code>round</code>、<code>critiques</code>[]{<code>aspect</code>, <code>opinion</code>}；v1.2 增可选字段 <code>judge</code>（<code>verify.judges</code> 非空时每 judge 一事件，3.7.2）。</td></tr>
+<tr><td><code>schema.repair</code></td><td>schema / —</td><td>M8 任何非 clean 路径出结果时（L1 修复命中 / L3 各轮 / 拒绝）。</td><td><code>resolved_at</code>（"l1"|"l3_1"|"l3_2"|"rejected"，同 6.4 命名）、<code>violations</code>（JSON Pointer 路径 + 违反的 Schema 关键字摘要，不含数据值）。</td></tr>
+<tr><td><code>llm.call</code></td><td>llm / debug（stderr 摘要行恒有）</td><td>M9 每次调用返回后（含失败）。<b>不含提示词与响应内容</b>（full 档例外，7.4）。</td><td><code>profile</code>、<code>gen_ai.request.model</code>、<code>latency_ms</code>、<code>gen_ai.usage.input_tokens</code>、<code>gen_ai.usage.output_tokens</code>、<code>retries</code>、<code>status</code>（"ok"|"retryable_exhausted"|"fatal"）；v1.2 增可选字段 <code>operation</code>（="embedding"，仅 M9 <code>embed()</code> 调用携带，缺省即对话补全；payload 只增不改）。</td></tr>
+<tr><td><code>error</code></td><td>随产生 stage 的通道 / warn（记录级）· error（运行级）</td><td>StageError 构造时。</td><td><code>stage</code>、<code>kind</code>（取值见 7.6）、<code>message</code>、<code>retryable</code>——即 StageError 全字段（4.2）。</td></tr>
+</table>
+<p class="small">† <code>reason</code> 仅当 <code>quality.judgment_reasons</code> 生效时存在（5.2）。全部自由文本字段（reason / critiques / violations 文本）受 7.4 脱敏档位控制。</p>
+
+<h2>7.3 记录格式规范</h2>
+<p>stderr 两种格式承载同一信息，由 <code>tool.log_format</code> 选择；trace 事件行是 TraceEvent（3.12.3）的 JSON 序列化，恒为 UTF-8 单行（下例因排版自动折行）。</p>
+<pre><code># ── stderr, tool.log_format = "text"（行格式: ts level stage batch msg）──
+2026-07-02T09:31:04+08:00 INFO  quality batch=3 pairwise 完成 items=128 comparisons=256 judgment_failures=1
+2026-07-02T09:31:12+08:00 WARN  ingest  batch=4 bad_line file=ime-2026-06-30.jsonl line=217 reason=missing_text_field
+
+# ── stderr, tool.log_format = "jsonl"（同一事件）──
+{"ts":"2026-07-02T09:31:04+08:00","level":"info","stage":"quality","batch":3,"msg":"pairwise 完成 items=128 comparisons=256 judgment_failures=1"}</code></pre>
+<pre><code># ── trace 事件一：quality.judgment（文本模态意图标注工程；content="refs"，judgment_reasons 生效）──
+# 记录甲 1cda030abc565f17 = {"instruction": "帮我写一条请假条，明天上午要去医院", ...}
+# 记录乙 d5ad41d6357f8a55 = {"instruction": "写一份周报模板", ...}；本次呈现顺序随机为 A=乙, B=甲
+{"ts":"2026-07-02T09:31:04.482+08:00","run_id":"f3a9c04b7d21","batch_no":3,"stage":"quality","ev":"quality.judgment","record_ids":["1cda030abc565f17","d5ad41d6357f8a55"],"payload":{"order":{"A":"d5ad41d6357f8a55","B":"1cda030abc565f17"},"model":"qwen2.5-vl-72b-instruct","judgments":[{"criterion":"writing_style","winner":"tie","reason":"两条指令表达均通顺完整，写作水平相当。"},{"criterion":"facts_trivia","winner":"B","reason":"B 含明确时间与事由（明天上午去医院），具体信息更多。"},{"criterion":"educational_value","winner":"B","reason":"B 是带场景约束的写作任务，示范价值更高。"},{"criterion":"required_expertise","winner":"tie","reason":"两者均为日常任务，无专业门槛差异。"}]}}
+
+# ── trace 事件二：verify.verdict（UI 模态登录页工程；content="refs"）──
+{"ts":"2026-07-02T10:02:17.905+08:00","run_id":"0c47d9e2b8a5","batch_no":3,"stage":"verify","ev":"verify.verdict","record_ids":["9f2c31ab52e08d17"],"payload":{"verdict":"pass","round":1,"critiques":[{"aspect":"任务指令遵循","opinion":"四个字段均按指令填写，screen_category=login 与截图一致。"},{"aspect":"事实一致性","opinion":"interactive_elements 与控件树可交互节点逐一对应，bounds 未见编造。"},{"aspect":"字段语义","opinion":"page_title 取自屏幕顶部标题控件文本，正确。"}]}}</code></pre>
+<p>LLM 相关 payload 的字段命名（<code>gen_ai.request.model</code>、<code>gen_ai.usage.input_tokens / output_tokens</code>，full 档的 <code>gen_ai.input.messages / gen_ai.output.messages</code>）对齐 OpenTelemetry GenAI 语义约定 [27]，便于 OTel 生态的采集与分析工具直接消费。注意两点：这是<b>命名对齐而非实现依赖</b>（不引入 OTel SDK）；且该约定截至本文档日期处于 Development（实验性、非 stable）状态 [27]——若其后续更名，本工具事件目录按「只增不改」原则保持自身稳定。</p>
+
+<h2>7.4 内容脱敏策略</h2>
+<p><code>project.toml</code> 的 <code>trace.content</code> 四档决定 trace 中的内容量，逐档递增；<b>API Key 在任何档位、任何通道都不落日志</b>（M9 不将认证头传入日志路径）：</p>
+<table>
+<tr><th style="width:14%">档位</th><th>trace 事件 payload 中出现的内容</th><th style="width:26%">典型用途</th></tr>
+<tr><td><code>"none"</code></td><td>仅记录 id、枚举与数值等结构化字段；<code>reason</code>、<code>critiques</code>、<code>violations</code> 等 LLM 产出文本一律不写。</td><td>最严格合规场景；7.5 的全部比率类指标仍可计算。</td></tr>
+<tr><td><code>"refs"</code>（默认）</td><td>另含 LLM 产出的 reason / critique / violations 文本，但<b>不含任何输入数据内容</b>（与 <code>output.rejects="refs"</code> 同一语义，3.11.2）。</td><td>rubric 优化常规档（7.5）。</td></tr>
+<tr><td><code>"excerpt"</code></td><td>另含输入内容前 200 字符：<code>quality.judgment / quality.pointwise / annotate.done / verify.verdict</code> 的 payload 增加 <code>excerpt</code> 字段（<code>{record_id: 前 200 字符}</code> 逐条给出，quality.judgment 含两条；文本模态取 <code>Record.text</code>、UI 模态取 <code>UITree.serialize()</code> 输出，不含图像）。</td><td>免于回原始文件比对的快速人工审查。</td></tr>
+<tr><td><code>"full"</code></td><td>另含完整提示词与响应：<code>llm.call</code> 事件 payload 增加 <code>gen_ai.input.messages / gen_ai.output.messages</code>（须同时启用 <code>llm</code> 通道）。</td><td>调试与审计。</td></tr>
+</table>
+<div class="note"><b>风险明示：</b><code>content="full"</code> 时 trace 文件包含全部经手数据与模型输出，体积可达主输出的数十倍，且构成一份完整的数据副本——仅在调试/审计时短期启用，用后由用户负责清理。</div>
+
+<h2>7.5 rubric 优化闭环</h2>
+<p>trace 的首要用途：把「LLM 依据 rubric 做出的每一次裁决及其理由」暴露给人，驱动准则迭代。流程：① <code>project.toml</code> 设 <code>trace.enabled=true</code>、<code>channels</code> 含 <code>"quality"</code>、<code>quality.judgment_reasons=true</code>（或保持 "auto"）；② <code>--limit</code> 小样本运行；③ 从 trace 计算下表诊断指标并抽读 reason；④ 修订 rubric（改写 pairwise_prompt、合并/删除/新增 criterion、调 weight）；⑤ 同一 <code>run.seed</code> 小样本重跑，对比指标是否收敛；⑥ 定稿后全量运行（可关 judgment_reasons 省 token）。</p>
+<table>
+<tr><th style="width:17%">信号</th><th style="width:33%">计算（基于 7.2 事件）</th><th style="width:22%">诊断</th><th>处置</th></tr>
+<tr><td>tie 率过高</td><td>某 criterion 的 <code>winner="tie"</code> 占比（quality.judgment）；参考线 &gt; 0.4。</td><td>准则区分度不足。</td><td>把 pairwise_prompt 的比较问句改为更具体的判据；或降低该 criterion 权重。</td></tr>
+<tr><td>同 seed 重跑翻转率</td><td>同一 <code>run.seed</code>、同一输入重跑两次（配对方案逐对相同，1.3 可复现性——流程 ⑤ 的重跑天然产生第二份 trace），按无序对对齐两次 quality.judgment，统计 winner 相反的对占比；参考线 &gt; 0.3。</td><td>准则表述含糊 / 模型不稳定。</td><td>细化 description 与判据；确认 temperature=0；必要时更换裁决 profile。</td></tr>
+<tr><td>criteria 间胜负相关性过高</td><td>两 criterion 在同一次比较中 winner 一致的占比；参考线 &gt; 0.9。</td><td>准则冗余，可合并。</td><td>合并为一条（权重相加）或删除其一。</td></tr>
+<tr><td>reason 关键词缺口</td><td>reason 文本聚类/高频词中反复出现 rubric 未覆盖的评价维度（需 judgment_reasons 生效且 content ≥ refs）。</td><td>准则缺口。</td><td>新增 criterion——这正是 criteria drift 的预期表现 [30]。</td></tr>
+<tr><td>judgment_failures 率</td><td><code>error</code> 事件中 <code>kind="judgment_invalid"</code> 数 / 总比较数（亦见 report.quality.judgment_failures）；参考线 &gt; 0.05。</td><td>裁决提示词或内部 Schema 问题。</td><td>缩短/消歧 rubric 文案；确认 profile 的结构化输出能力（L0）。</td></tr>
+</table>
+<p>jq 单行示例——统计文本工程中 <code>facts_trivia</code> 准则的 tie 率：</p>
+<pre><code>jq -s '[.[] | select(.ev=="quality.judgment") | .payload.judgments[]
+        | select(.criterion=="facts_trivia")]
+       | (map(select(.winner=="tie")) | length) / length' ./out/ime-labels-0630.trace.jsonl
+# 输出示例: 0.4375  → 高于 0.4 参考线，该准则对输入法指令数据区分度不足，应改写判据</code></pre>
+<div class="backing"><b>背书：</b>EvalGen（UIST 2024）通过混合主动式实验确认了 <b>criteria drift</b>：评估准则无法先验完全确定——人需要看到 LLM 评审的具体输出才能修订、新增准则，准则部分依赖于观察到的输出 [30]；因此评审的中间产物（逐次裁决与理由）必须暴露给人，这正是 quality.judgment 事件的存在理由。CritiQ（ACL 2025）进一步证明「成对偏好信号 → 自然语言质量准则」方向可行：约 30 对人工偏好即可自动挖掘出可解释准则 [31]。本节闭环即两文献结论的工程化：trace 承担 EvalGen 的对齐界面职责，人工（或后续 <code>labelkit analyze</code>，8.3 O5）承担 CritiQ 的准则挖掘角色。</div>
+
+<h2>7.6 错误分类码（StageError.kind）</h2>
+<table>
+<tr><th style="width:26%">kind</th><th style="width:14%">级别</th><th>产生点与处置</th></tr>
+<tr><td><code>bad_input_line</code> / <code>missing_pair</code> / <code>index_conflict</code> / <code>image_too_large</code></td><td>记录级</td><td>M2；按 input.* 策略 skip（计数）或 fail（退出码 3）。</td></tr>
+<tr><td><code>image_decode_error</code></td><td>记录级</td><td>M3 跳过 pHash 层；M5/M7 遇到时该记录 failed。</td></tr>
+<tr><td><code>judgment_invalid</code></td><td>比较级</td><td>M4；按 tie 计入 BT（3.4.3）。</td></tr>
+<tr><td><code>schema_violation</code></td><td>记录级</td><td>M8 L3 耗尽；记录 failed → rejects。</td></tr>
+<tr><td><code>provider_retryable_exhausted</code></td><td>记录级</td><td>M9 重试耗尽；记录 failed，计入熔断窗口。</td></tr>
+<tr><td><code>provider_fatal</code></td><td>运行级</td><td>M9 401/403 等；直接计入熔断计数，连续达阈值 ⇒ 退出码 4。</td></tr>
+<tr><td><code>internal_error</code></td><td>记录级</td><td>任何未预期异常（含 M11 终检失败）；记录 failed，堆栈入日志（debug 级）。</td></tr>
+</table>
+
+<h2>7.7 进度显示与结束摘要</h2>
+<p>TTY 环境显示批级进度条：当前批号/总批数、各状态计数、瞬时成本累计；非 TTY 环境每批一行摘要（即 <code>batch.end</code> 的 stderr info 行）。运行结束向 stderr 打印与 report.json <code>counts</code> 完全一致的终版摘要表。进度显示<b>不属于日志</b>：直接写 stderr 而不经 logging 模块、无级别概念；唯一交互是 <code>tool.log_format="jsonl"</code> 时禁用进度条，以保证 stderr 每行可被 <code>json.loads</code> 解析（此时 <code>batch.end</code> 行即进度）。</p>
+
+<h2>7.8 测试要求（验收级）</h2>
+<table>
+<tr><th style="width:22%">层</th><th>要求</th></tr>
+<tr><td>单元</td><td>L1 确定性修复穷举样例集（围栏/截断/单引号/尾逗号/前后缀噪声）；BT 拟合对已知解析解（两元素、全胜、tie-only）误差 &lt; 1e-4；配对采样在固定 seed 下逐字节可复现；UI 配对表（图 3-1）全分支：冲突/缺对/跨目录/前导零。</td></tr>
+<tr><td>集成</td><td>以 mock provider（录制响应）跑通 2.3.1 全部组合矩阵；断言 report 不变量、主输出全行过用户 Schema、rejects=refs 时文件不含任何输入内容子串。</td></tr>
+<tr><td>契约</td><td>对真实 API 的 probe 冒烟（CI 可选）；结构化输出 L0 关闭/开启两态等价性（最终输出结构一致）。</td></tr>
+<tr><td>日志（v1.1 新增）</td><td>trace 每行可被 <code>json.loads</code> 解析且恰含 ts / run_id / batch_no / stage / ev / record_ids / payload 七字段；对 7.2 事件目录逐事件断言 payload 字段齐全；首行为 run.start 且携带 trace_schema_version=1；<code>trace.content="refs"</code> 时 trace 文件不含任何输入内容子串（与 rejects=refs 同法断言）；注入写失败（不可写路径 / mock OSError）断言运行不中断、warn 恰打印一次、<code>report.trace.dropped_events</code> 计数正确。</td></tr>
+</table>
+
+<!-- ═══════════════════ 8. 非目标与开放问题 ═══════════════════ -->
+<h1 id="s8">8. 非目标、设计假设与演进路线</h1>
+<h2>8.1 非目标</h2>
+<p>见 2.1.2 工具级负边界；另注：不承诺跨批分数可比性（pairwise 为批内相对分，3.4.3）；不做多机分布式（单机并发已被 API 限速主导）。</p>
+<h2>8.2 设计假设（若不成立需回到设计层）</h2>
+<table>
+<tr><th style="width:6%">#</th><th>假设</th><th style="width:30%">若不成立的影响</th></tr>
+<tr><td>A1</td><td>UI 树导出为 6.2 可映射的 JSONL（平铺节点行或单行嵌套树）。</td><td>需在 M2 增加导出格式适配器（新增子模块，不影响其他模块）。</td></tr>
+<tr><td>A2</td><td>一个 uitree 文件 = 一屏（与一张截图对应）。</td><td>若一文件含多屏序列，需引入「屏内行号」扩展 index 语义（影响 3.2.4 与 6.2）。</td></tr>
+<tr><td>A3</td><td>所配 VLM 支持单请求多图（pairwise 比较需两组截图）。</td><td>不支持时 M4 在 UI 模态自动改用 criteria_per_call="single" + 两图拼接（Pillow 纵向拼接）——已在 M4 留有实现开关，默认不启用。</td></tr>
+<tr><td>A4</td><td>单次运行 ≤ 50 万条（2.6 内存模型）。</td><td>超出需 dedup.scope="batch" 或分目录多次运行。</td></tr>
+</table>
+<h2>8.3 开放问题（后续版本议题）</h2>
+<table>
+<tr><th style="width:6%">#</th><th>议题</th><th style="width:34%">现状与触发条件</th></tr>
+<tr><td>O1</td><td>语义去重（SemDeDup [26]，需 Embedding API）</td><td>已于 v1.2 落地为可选第④级（3.3.3，<code>dedup.semantic</code>），本行保留作决策溯源；默认仍关闭（<code>dedup.semantic = false</code>），零 embedding 依赖的默认行为与 v1.0 一致。</td></tr>
+<tr><td>O2</td><td>跨批可比的 pairwise 分数（锚点样本法：每批混入固定锚点记录参与比较）</td><td>QuRating 原文以全局训练分类器回避该问题；运行时替代方案需实验验证后再纳入规格。</td></tr>
+<tr><td>O3</td><td>UI 模态生成（以现有截图为底、仅生成指令/任务侧文本，AgentTrek 式轨迹合成 [15]）</td><td>本版生成仅文本模态；有明确需求后单独立项。</td></tr>
+<tr><td>O4</td><td>断点续跑</td><td>与「不存储中间态」冲突，明确排除；超大任务靠分目录运行缓解。</td></tr>
+<tr><td>O5</td><td><code>labelkit analyze</code> 子命令：读 trace.jsonl 产出标注质量分析 / rubric 诊断报告（自动计算 7.5 诊断指标、reason 关键词聚类）</td><td>本版仅提供 jq 级手工分析（7.5）；trace 事件契约（7.2）稳定运行一个版本后立项。</td></tr>
+
+<tr><td>O6</td><td>全局精确定量与生成补齐回路（<code>output.target_count</code>，输出恰好 N 条）</td><td>设计草案：<b>两阶段流水线</b>——第一阶段全量接入 + 去重 + 打分并缓存分数；第二阶段全局 top-K 选出恰好 target_count 条，再仅对选中集执行标注与输出。前提：分数具全局可比性——pointwise 绝对刻度，或 pairwise 经 O2 锚点法校准后方可全局排序。配<b>生成补齐回路</b>：target 未达时从高分种子生成 → 去重 → pointwise 质量门 → 计入，停止条件 = 达标 ∨ max_backfill_rounds ∨ 本轮合格率 &lt; 下限（生成器饱和时合格率持续衰减，即递归自生成数据的 model collapse 现象 [36]，故合格率下限停止条件必不可少）。现状：2026-07-02 评审对齐为演进路线——本版以 <code>quality.selection = "top_ratio"</code> 提供流式批内近似定量（3.4.3），不承诺全局恰好 N 条。触发条件：出现「必须恰好 N 条」的下游需求。</td></tr>
+</table>
+
+<h2>8.4 算子算法演进路线（robustness &amp; diversity）</h2>
+<p>按模块汇总「现行算法 → v1.2 已收录的可选增强 → 演进候选」。v1.2 可选增强均默认关闭、不改变各模块默认行为（配置键规格见 5.1–5.2）；演进候选仅收录有顶刊论文或工业项目背书者，待触发条件出现后立项。</p>
+<table>
+<tr><th style="width:8%">模块</th><th style="width:24%">现行算法（默认）</th><th style="width:32%">v1.2 已收录的可选增强</th><th>演进候选（背书 / 触发条件）</th></tr>
+<tr><td>M3 去重</td><td>规范化 SHA-256 精确 + MinHash-LSH 近似（3.3）；UI 模态加 pHash</td><td>SemDeDup 语义级可选第④级 [26]：<code>dedup.semantic</code>（默认 false），开启后经 <code>dedup.semantic_embedding</code> 引用的 <code>[embedding.&lt;name&gt;]</code> profile 取向量，余弦相似度 ≥ <code>dedup.semantic_threshold</code>（默认 0.95）判重</td><td>子串级精确去重（Lee et al. [3] 的 suffix-array 变体，捕获行内重复长片段）；MinHash 参数自适应（按批内文本长度分布自动调 ngram / num_perm）。触发：短文本上 MinHash 误杀/漏杀率超预期。</td></tr>
+<tr><td>M4 打分</td><td>pairwise+BT 与 pointwise 双模式（3.4），threshold 过滤</td><td>多评审团 <code>quality.judges</code>（默认 []；奇数个 profile 多数票 [32]）；双顺序裁决 <code>quality.both_orders</code>（默认 false，开启后每对正反两序各裁决一次以对消位置偏差 [20]，细节见 3.4.3）；批内定量优选 <code>quality.selection = "top_ratio"</code>（3.4.3）</td><td>O2 锚点跨批校准（每批混入固定锚点记录）；rubric 自动挖掘（CritiQ [31]，约 30 对人工偏好即可挖出可解释准则）；评审漂移监测（固定校准集定期回归，比对裁决一致率）。触发：需要跨批可比分数，或 rubric 迭代频繁。</td></tr>
+<tr><td>M5 标注</td><td>提示词组装单次标注（3.5.2）</td><td>self-consistency 标注 <code>annotate.self_consistency</code>（默认 0=关；n≥3 且为奇数，以 <code>annotate.sc_temperature</code> = 0.7 采样 n 次、字段级多数票聚合 [33]）</td><td>best-of-n 拒绝采样（同一记录标注 n 条取评审 top-1，打分器思想同 FineWeb-Edu [11]）。触发：标注一致性仍不达标。</td></tr>
+<tr><td>M6 生成</td><td>Self-Instruct 式种子自举生成 [18]（3.6.2）</td><td>多 LLM 混合 <code>generate.llms</code>（数组，<code>generate.mixture</code> = round_robin | weighted）+ <code>[[generate.styles]]</code> 风格模板（3.6.2；persona / 受众×风格分桶的多样性思想 [34][35]）</td><td>Evol-Instruct 自动深化/扩展算子 [19]（对种子指令做复杂化与广度改写）。触发：生成多样性或难度分布不足。</td></tr>
+<tr><td>M7 校验</td><td>单 judge 独立评审 + 有界修复环 [20][21]（3.7）</td><td>多评审团 <code>verify.judges</code>（默认 []；奇数个 profile 多数票，critiques 合并并标注来源 judge [32]，3.7.2）</td><td>评审团分歧驱动的人工抽检队列（多数票非全票一致的记录进抽检清单，人机对齐界面思想出自 EvalGen [30]）。触发：评审团分歧率持续偏高。</td></tr>
+<tr><td>M8 结构</td><td>L0–L3 四层防线：供应商结构化输出 + 确定性修复 + 有界 LLM 修复环（3.8）</td><td>—（v1.2 无新增）</td><td>约束解码引擎本地化（Outlines / XGrammar 类 grammar 引擎 [23][24]）：自托管推理时以解码期硬约束替代当前面向 API 场景的四层防线。触发：迁移至自托管/本地推理栈。</td></tr>
+</table>
+
+
+<!-- ═══════════════════ 9. 参考文献 ═══════════════════ -->
+<h1 id="s9">9. 参考文献</h1>
+<ol class="ref-list">
+<li>[1] Wettig, A., Gupta, A., Malik, S., Chen, D. <i>QuRating: Selecting High-Quality Data for Training Language Models.</i> ICML 2024. arXiv:2402.09739. 开源：github.com/princeton-nlp/QuRating</li>
+<li>[2] Bradley, R. A., Terry, M. E. <i>Rank Analysis of Incomplete Block Designs: The Method of Paired Comparisons.</i> Biometrika 39, 1952.</li>
+<li>[3] Lee, K. et al. <i>Deduplicating Training Data Makes Language Models Better.</i> ACL 2022. arXiv:2107.06499.</li>
+<li>[4] Chen, D. et al. <i>Data-Juicer: A One-Stop Data Processing System for Large Language Models.</i> SIGMOD 2024 (Industrial). arXiv:2309.02033.</li>
+<li>[5] Argilla. <i>distilabel: Synthetic Data and AI Feedback Framework.</i> 工业开源项目。github.com/argilla-io/distilabel</li>
+<li>[6] Soldaini, L. et al. <i>Dolma: an Open Corpus of Three Trillion Tokens for Language Model Pretraining Research.</i> ACL 2024. arXiv:2402.00159. 工具链：github.com/allenai/dolma</li>
+<li>[7] OpenAI. <i>Structured Outputs.</i> 平台能力文档（工业）。platform.openai.com/docs/guides/structured-outputs</li>
+<li>[8] Liu, J. <i>instructor: Structured Outputs with Validation-Retry.</i>；<i>json-repair</i>。工业开源库。github.com/jxnl/instructor / github.com/mangiucugna/json_repair</li>
+<li>[9] NVIDIA. <i>NeMo Curator: Scalable Data Curation for LLMs.</i> 工业开源项目。github.com/NVIDIA/NeMo-Curator</li>
+<li>[10] Hunter, D. R. <i>MM Algorithms for Generalized Bradley-Terry Models.</i> Annals of Statistics 32(1), 2004.</li>
+<li>[11] Penedo, G. et al. <i>The FineWeb Datasets: Decanting the Web for the Finest Text Data at Scale.</i> NeurIPS 2024 Datasets &amp; Benchmarks. arXiv:2406.17557.</li>
+<li>[12] Refuel AI. <i>Autolabel: Label, Clean and Enrich Datasets with LLMs.</i> 工业开源项目。github.com/refuel-ai/autolabel</li>
+<li>[13] Baechler, G. et al. <i>ScreenAI: A Vision-Language Model for UI and Infographics Understanding.</i> IJCAI 2024. arXiv:2402.04615.</li>
+<li>[14] <i>GUI-360°: A Comprehensive Dataset and Benchmark for Computer-Using Agents.</i> arXiv:2511.04307.（LLM 驱动的 GUI 数据质量过滤管线）</li>
+<li>[15] Xu, Y. et al. <i>AgentTrek: Agent Trajectory Synthesis via Guiding Replay with Web Tutorials.</i> ICLR 2025. arXiv:2412.09605.</li>
+<li>[16] Wu, Z. et al. <i>OS-ATLAS: A Foundation Action Model for Generalist GUI Agents.</i> ICLR 2025. arXiv:2410.23218.</li>
+<li>[17] You, K. et al. <i>Ferret-UI: Grounded Mobile UI Understanding with Multimodal LLMs.</i> ECCV 2024. arXiv:2404.05719.</li>
+<li>[18] Wang, Y. et al. <i>Self-Instruct: Aligning Language Models with Self-Generated Instructions.</i> ACL 2023. arXiv:2212.10560.</li>
+<li>[19] Xu, C. et al. <i>WizardLM: Empowering Large Language Models to Follow Complex Instructions (Evol-Instruct).</i> ICLR 2024. arXiv:2304.12244.</li>
+<li>[20] Zheng, L. et al. <i>Judging LLM-as-a-Judge with MT-Bench and Chatbot Arena.</i> NeurIPS 2023 Datasets &amp; Benchmarks. arXiv:2306.05685.</li>
+<li>[21] Madaan, A. et al. <i>Self-Refine: Iterative Refinement with Self-Feedback.</i> NeurIPS 2023. arXiv:2303.17651.</li>
+<li>[22] Bai, Y. et al. <i>Constitutional AI: Harmlessness from AI Feedback.</i> Anthropic, 2022. arXiv:2212.08073.</li>
+<li>[23] Willard, B., Louf, R. <i>Efficient Guided Generation for Large Language Models (Outlines).</i> arXiv:2307.09702. 工业开源：github.com/dottxt-ai/outlines</li>
+<li>[24] Geng, S. et al. <i>JSONSchemaBench: Evaluating Constrained Decoding with LLMs on Efficiency, Coverage and Quality.</i> 2025. openreview.net/forum?id=FKOaJqKoio</li>
+<li>[25] Tam, Z. R. et al. <i>Let Me Speak Freely? A Study on the Impact of Format Restrictions on Performance of LLMs.</i> EMNLP 2024 Industry. arXiv:2408.02442.</li>
+<li>[26] Abbas, A. et al. <i>SemDeDup: Data-Efficient Learning at Web-Scale through Semantic Deduplication.</i> 2023. arXiv:2303.09540.</li>
+<li>[27] OpenTelemetry Community. <i>OpenTelemetry GenAI Semantic Conventions.</i>（生成式 AI spans/metrics/events 语义约定；Status: Development，实验性、非 stable）github.com/open-telemetry/semantic-conventions-genai（2026-07-02 访问）</li>
+<li>[28] LangChain. <i>LangSmith: AI Agent &amp; LLM Observability and Evals Platform.</i> 工业平台。docs.langchain.com/langsmith/observability（2026-07-02 访问）</li>
+<li>[29] Weights &amp; Biases. <i>W&amp;B Weave: Observability and Evaluation Platform for LLM Applications.</i> 工业平台。docs.wandb.ai/weave（2026-07-02 访问）</li>
+<li>[30] Shankar, S., Zamfirescu-Pereira, J.D., Hartmann, B., Parameswaran, A. G., Arawjo, I. <i>Who Validates the Validators? Aligning LLM-Assisted Evaluation of LLM Outputs with Human Preferences.</i> UIST 2024. arXiv:2404.12272.</li>
+<li>[31] Guo, H., Lv, K., Guo, Q. et al. <i>CritiQ: Mining Data Quality Criteria from Human Preferences.</i> ACL 2025 (Long Papers). arXiv:2502.19279.</li>
+
+<li>[32] Verga, P., Hofstätter, S., Althammer, S., Su, Y., Piktus, A., Arkhangorodsky, A., Xu, M., White, N., Lewis, P. <i>Replacing Judges with Juries: Evaluating LLM Generations with a Panel of Diverse Models (PoLL).</i> 2024. arXiv:2404.18796.</li>
+<li>[33] Wang, X., Wei, J., Schuurmans, D., Le, Q., Chi, E. H., Narang, S., Chowdhery, A., Zhou, D. <i>Self-Consistency Improves Chain of Thought Reasoning in Language Models.</i> ICLR 2023. arXiv:2203.12171.</li>
+<li>[34] Ge, T., Chan, X., Wang, X., Yu, D., Mi, H., Yu, D. (Tencent AI Lab). <i>Scaling Synthetic Data Creation with 1,000,000,000 Personas (Persona Hub).</i> arXiv:2406.20094.（截至 2026-07 仍为 arXiv 预印本，未正式发表）</li>
+<li>[35] Ben Allal, L., Lozhkov, A., van Strien, D. <i>Cosmopedia: how to create large-scale synthetic data for pre-training Large Language Models.</i> Hugging Face Blog（工业），2024-03-20。huggingface.co/blog/cosmopedia；数据集 huggingface.co/datasets/HuggingFaceTB/cosmopedia</li>
+<li>[36] Shumailov, I., Shumaylov, Z., Zhao, Y., Papernot, N., Anderson, R., Gal, Y. <i>AI models collapse when trained on recursively generated data.</i> Nature 631 (8022), 755–759, 2024. DOI: 10.1038/s41586-024-07566-y.（2025 年有一则 Author Correction，不影响主结论）</li>
+
+</ol>
+
+<!-- ═══════════════════ 附录 A ═══════════════════ -->
+<h1 id="sA">附录 A. 系统默认 Rubric 全文</h1>
+<p>以下为随包分发的两套默认 rubric（<code>labelkit/data/rubrics/default_text.toml</code>、<code>default_ui.toml</code>）完整内容。用户可用 <code>labelkit rubric --show</code> 导出为起点。文本 rubric 的四个维度直接取自 QuRating [1]（提示词为其开源提示的中文化改写）；pointwise 等级采用 FineWeb-Edu 的加性量表形式 [11]。UI rubric 维度综合 GUI 数据管线的质量过滤实践 [13][14][15]。</p>
+
+<h2>A.1 default:text</h2>
+<pre><code>name = "default-text-v1"
+
+[[criteria]]
+key = "writing_style"
+weight = 1.0
+description = "写作水平：表达是否流畅、结构是否清晰、用词是否准确得体。"
+pairwise_prompt = "比较两段文本，哪一段的写作水平更高（表达流畅、结构清晰、用词准确）？"
+pointwise_levels = [
+  "0: 语句不通或大量乱码/模板噪声，基本不可读。",
+  "1: 勉强可读，但错漏频繁、结构混乱。",
+  "2: 在 1 的基础上，句子基本通顺，但表达平庸、有明显冗余或口水内容。",
+  "3: 在 2 的基础上，结构清晰、表达准确，接近正式成文水平。",
+  "4: 在 3 的基础上，行文精炼、逻辑连贯，几乎无可挑剔的表达问题。",
+  "5: 在 4 的基础上，写作水平出色，可作为高质量语料范例。"]
+
+[[criteria]]
+key = "facts_trivia"
+weight = 1.0
+description = "事实与知识含量：包含多少可核验的事实、知识点或具体信息。"
+pairwise_prompt = "比较两段文本，哪一段包含更多具体、可核验的事实与知识？"
+pointwise_levels = [
+  "0: 无任何事实信息（纯情绪/寒暄/占位内容）。",
+  "1: 只有零星、模糊的事实性陈述。",
+  "2: 在 1 的基础上，含少量具体信息，但密度低。",
+  "3: 在 2 的基础上，事实信息明确且多处出现。",
+  "4: 在 3 的基础上，信息密度高、具体且相互支撑。",
+  "5: 在 4 的基础上，知识含量丰富准确，具有参考价值。"]
+
+[[criteria]]
+key = "educational_value"
+weight = 1.0
+description = "教育/训练价值：作为模型训练数据能带来多少可学习的能力。"
+pairwise_prompt = "比较两段文本，哪一段更有教育价值、更值得用于训练语言模型？"
+pointwise_levels = [
+  "0: 无学习价值（噪声、纯广告、无意义重复）。",
+  "1: 学习价值极低，内容浅表。",
+  "2: 在 1 的基础上，有一定可学习内容但组织松散。",
+  "3: 在 2 的基础上，内容系统、有清晰的知识或任务示范价值。",
+  "4: 在 3 的基础上，示范性强，覆盖推理/解释/结构化表达等能力。",
+  "5: 在 4 的基础上，训练价值突出，属稀缺的高质量样本。"]
+
+[[criteria]]
+key = "required_expertise"
+weight = 1.0
+description = "所需专业度：理解该文本所需的领域专业知识深度。"
+pairwise_prompt = "比较两段文本，理解哪一段需要更深的领域专业知识？"
+pointwise_levels = [
+  "0: 无任何专业门槛（日常寒暄级）。",
+  "1: 常识即可理解。",
+  "2: 在 1 的基础上，涉及少量领域术语。",
+  "3: 在 2 的基础上，需要相关领域的系统背景知识。",
+  "4: 在 3 的基础上，需要较深的专业训练才能完全理解。",
+  "5: 在 4 的基础上，属专家级内容。"]</code></pre>
+
+<h2>A.2 default:ui</h2>
+<pre><code>name = "default-ui-v1"
+
+[[criteria]]
+key = "screenshot_readability"
+weight = 1.0
+description = "截图可读性：图像清晰、无遮挡/花屏/过度压缩，界面元素可辨认。"
+pairwise_prompt = "比较两组屏幕数据，哪一组的截图更清晰可读（无花屏、遮挡、严重压缩伪影）？"
+pointwise_levels = [
+  "0: 图像损坏或几乎不可辨认。", "1: 严重模糊/遮挡，仅能辨认轮廓。",
+  "2: 在 1 的基础上，主要元素可辨认但细节文字难以阅读。",
+  "3: 在 2 的基础上，界面文字基本可读。",
+  "4: 在 3 的基础上，全部元素清晰锐利。",
+  "5: 在 4 的基础上，截图质量无可挑剔。"]
+
+[[criteria]]
+key = "tree_screen_consistency"
+weight = 1.5
+description = "树-图一致性：UI 树节点（角色/文本/边界框）与截图内容相互吻合。"
+pairwise_prompt = "比较两组屏幕数据，哪一组的 UI 控件树与截图内容更一致（节点文本、位置与画面吻合）？"
+pointwise_levels = [
+  "0: 树与截图明显不是同一屏。", "1: 大量节点在截图中找不到对应。",
+  "2: 在 1 的基础上，主要控件能对应但坐标/文本多处不符。",
+  "3: 在 2 的基础上，绝大多数节点与画面吻合。",
+  "4: 在 3 的基础上，逐节点核对仅个别偏差。",
+  "5: 在 4 的基础上，树与截图完全一致。"]
+
+[[criteria]]
+key = "state_completeness"
+weight = 1.0
+description = "界面状态完整性：页面加载完成、无骨架屏/空白区/被弹层意外遮挡。"
+pairwise_prompt = "比较两组屏幕数据，哪一组的界面状态更完整（加载完成、无骨架屏或异常空白）？"
+pointwise_levels = [
+  "0: 空白页或全骨架屏。", "1: 大面积未加载/报错区域。",
+  "2: 在 1 的基础上，主体内容呈现但有局部缺失。",
+  "3: 在 2 的基础上，页面完整呈现。",
+  "4: 在 3 的基础上，状态稳定（无加载中痕迹、toast 残影）。",
+  "5: 在 4 的基础上，界面状态可作为标准样本。"]
+
+[[criteria]]
+key = "interaction_richness"
+weight = 1.0
+description = "信息与交互丰富度：界面包含的信息量与可交互元素的多样性（对训练 GUI 理解/操作模型的价值）。"
+pairwise_prompt = "比较两组屏幕数据，哪一组的界面信息量与可交互元素更丰富、更有训练价值？"
+pointwise_levels = [
+  "0: 空屏/纯壁纸/锁屏等无信息界面。", "1: 元素极少（如单按钮启动页）。",
+  "2: 在 1 的基础上，有少量信息或控件。",
+  "3: 在 2 的基础上，信息与控件种类中等偏上。",
+  "4: 在 3 的基础上，界面信息密集、控件类型多样。",
+  "5: 在 4 的基础上，属高价值复杂界面样本。"]</code></pre>
+
+<p class="small" style="margin-top:24px; border-top:1px solid #ccc; padding-top:8px;">— 文档结束。LabelKit 产品设计说明书 v1.4 · 2026-07-02 —</p>
+</body>
+</html>

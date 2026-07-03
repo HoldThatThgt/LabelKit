@@ -1,0 +1,7 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.demo"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "首页", "bounds": [24, 20, 120, 48], "visible": true, "package": "com.example.demo"}
+{"id": "2", "parent": "0", "class": "ImageView", "text": "", "bounds": [24, 100, 376, 280], "visible": true, "package": "com.example.demo", "content_desc": "轮播图"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "今日推荐", "bounds": [24, 300, 160, 326], "visible": true, "package": "com.example.demo"}
+{"id": "4", "parent": "0", "class": "ImageView", "text": "", "bounds": [24, 340, 190, 470], "visible": true, "package": "com.example.demo", "content_desc": "推荐卡片一"}
+{"id": "5", "parent": "0", "class": "ImageView", "text": "", "bounds": [210, 340, 376, 470], "visible": true, "package": "com.example.demo", "content_desc": "推荐卡片二"}
+{"id": "6", "parent": "0", "class": "Button", "text": "换一批", "bounds": [150, 500, 250, 540], "visible": true, "package": "com.example.demo"}

@@ -1,0 +1,661 @@
+"""M10 orchestrator (spec 3.10, CONTRACTS.md §7.9).
+
+Pure composition/scheduling — zero business logic, no direct LLM calls, no file
+writes (M11 owns the output channels). Responsibilities:
+
+- slice the M2 record stream (or the M6 generate_all output in generate_only
+  mode) into batches of ``run.batch_size``;
+- compose the per-batch stage chain from the config switches (2.3.1 matrix) in
+  the canonical order dedup → quality → generate → annotate → verify;
+- schedule the single-round generation re-flow (sub-batches re-enter at M3,
+  never at M6 — no recursion);
+- drive per-batch lifecycle: fresh RunContext per (batch, stage), emit via M11,
+  flush trace, then drop every batch intermediate (memory release);
+- aggregate run-level stats into the §9.3 report structure and hand it to
+  ``Emitter.finalize``;
+- circuit-breaker handling (``CircuitBreakerTripped`` → exit code 4, report
+  written, ``.part`` NOT renamed) and SIGINT/SIGTERM graceful interruption;
+- ``--limit`` truncation and ``--dry-run`` (M1/M2 + static call/cost estimate
+  on stderr, no LLM calls, no main output/rejects — report and, when
+  ``trace.enabled``, the trace channel only).
+"""
+from __future__ import annotations
+
+import asyncio
+import random
+import signal as _signal
+import sys
+import time
+from collections import deque
+from dataclasses import dataclass
+from datetime import datetime
+from itertools import islice
+from typing import TYPE_CHECKING, Mapping, Sequence
+
+from labelkit import TOOL_VERSION, __version__
+from labelkit.errors import CircuitBreakerTripped, InternalError
+from labelkit.stage import RunContext, Stage
+from labelkit.types import PipelineItem, Record
+
+if TYPE_CHECKING:
+    from labelkit.config.model import ResolvedConfig
+    from labelkit.emitter import Emitter
+    from labelkit.ingest import Ingestor
+    from labelkit.llm_client import LLMClient
+    from labelkit.obslog import MetricsSink
+    from labelkit.schema_engine import SchemaEngine
+
+# Event names — exact strings per CONTRACTS.md §7.11/§8.1 (mirrors the
+# labelkit.obslog constants; literals here keep this module importable before
+# obslog.py lands and are test-asserted against the contract).
+_EV_RUN_START = "run.start"
+_EV_RUN_END = "run.end"
+_EV_BATCH_START = "batch.start"
+_EV_BATCH_END = "batch.end"
+
+# Canonical pipeline order (spec §2.2 / CONTRACTS.md §2).
+_CHAIN_ORDER = ("dedup", "quality", "generate", "annotate", "verify")
+
+# report.json quality.aggregate_histogram bucket labels — frozen (§9.3).
+_HIST_LABELS = tuple(f"{i / 10:.1f}-{(i + 1) / 10:.1f}" for i in range(10))
+
+_SCHEMA_STATS_ZERO = {"l0_or_clean": 0, "l1": 0, "l3_1": 0, "l3_2": 0, "rejected": 0}
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b) if b > 0 else 0
+
+
+@dataclass(frozen=True)                            # [FROZEN in CONTRACTS.md §7.9]
+class RunSummary:
+    counts: Mapping                                # same keys as report.json "counts" (§9.3)
+    interrupted: bool
+    exit_code: int                                 # 4 (circuit break) | 1 (strict + rejects) | 0
+    wall_s: float
+    output_lines: int
+    rejects_lines: int
+
+
+class Orchestrator:
+    """Drives the whole run. Constructor signature frozen in CONTRACTS.md §7.9."""
+
+    def __init__(self, cfg: ResolvedConfig, stages: list[Stage],
+                 ingestor: Ingestor | None, emitter: Emitter, llm: LLMClient,
+                 schema_engine: SchemaEngine, metrics: MetricsSink,
+                 run_id: str, run_started_at: datetime):
+        self.cfg = cfg
+        self.stages = stages
+        self.ingestor = ingestor
+        self.emitter = emitter
+        self.llm = llm
+        self.schema_engine = schema_engine
+        self.metrics = metrics
+        self.run_id = run_id
+        self.run_started_at = run_started_at
+
+        # Run-level aggregation state (content-free, spec 3.10.3).
+        self._stage_time: dict[str, float] = {}
+        self._agg_hist = [0] * 10
+        self._crit_sum: dict[str, float] = {}
+        self._crit_n: dict[str, int] = {}
+        self._output_lines = 0
+        self._rejects_lines = 0
+        self._batch_no = 0
+        self._pending: deque[list[PipelineItem]] = deque()  # generation re-flow queue
+
+        # Control flow.
+        self._stop = False
+        self._interrupted = False
+        self._circuit_broken = False
+        self._current_task: asyncio.Task | None = None
+        self._installed_signals: list[int] = []
+        self._timer_handles: list[asyncio.TimerHandle] = []
+        self._t0 = 0.0
+
+    # ── public entry ───────────────────────────────────────────────────────
+
+    async def run(self) -> RunSummary:
+        self._t0 = time.perf_counter()
+        if self.cfg.dry_run:
+            return self._run_dry()
+
+        if self.cfg.run.mode == "process" and self.ingestor is not None:
+            # Fail fast on path/candidate/pairing errors BEFORE the first trace
+            # emit — which is what opens (and truncates) the trace file — so a
+            # dead-on-arrival run never destroys the previous run's trace
+            # (E2E finding P2-4). Detach metrics so the rehearsal scan emits
+            # nothing; the real records() pass re-emits everything in order.
+            saved_metrics = getattr(self.ingestor, "metrics", None)
+            self.ingestor.metrics = None
+            try:
+                # estimate=False: the fail-fast checks only — the text-modality
+                # line count reads every input byte and its result is unused
+                # here (that would double the input I/O of every run).
+                self.ingestor.scan(estimate=False)
+            finally:
+                self.ingestor.metrics = saved_metrics
+
+        self._install_signal_handlers()
+        try:
+            self.metrics.event(_EV_RUN_START, stage="run", batch_no=0,
+                               payload={"tool_version": TOOL_VERSION,
+                                        "config_digest": self.cfg.config_digest,
+                                        "project_digest": self.cfg.project_digest,
+                                        "trace_schema_version": 1})
+            self.emitter.open()
+            try:
+                if self.cfg.run.mode == "generate_only":
+                    await self._run_generate_only()
+                else:
+                    await self._run_process()
+            except CircuitBreakerTripped:
+                # Fatal-error streak >= run.fatal_error_threshold: remaining
+                # work abandoned, report still written, .part NOT renamed.
+                self._circuit_broken = True
+        finally:
+            self._remove_signal_handlers()
+        return self._finalize()
+
+    # ── mode drivers ───────────────────────────────────────────────────────
+
+    async def _run_process(self) -> None:
+        assert self.ingestor is not None, "process mode requires an Ingestor"
+        if getattr(self.ingestor, "metrics", None) is None:
+            self.ingestor.metrics = self.metrics  # trace wiring (CONTRACTS §7.1)
+        stream = iter(self.ingestor.records())
+        if self.cfg.limit is not None:
+            stream = islice(stream, self.cfg.limit)
+
+        main_chain = self._compose_chain(include_generate=True)
+        reflow_chain = self._compose_chain(include_generate=False)
+
+        while not self._stop:
+            if self._pending:
+                # Generation sub-batches run right after their parent batch,
+                # with consecutive batch numbers, and never re-generate.
+                batch = self._pending.popleft()
+                chain = reflow_chain
+            else:
+                records = list(islice(stream, self.cfg.run.batch_size))
+                if not records:
+                    break
+                batch = [PipelineItem(record=r) for r in records]
+                chain = main_chain
+            self._batch_no += 1
+            await self._guarded_batch(batch, self._batch_no, chain)
+            del batch  # per-batch memory lifecycle: no reference survives emit
+
+    async def _run_generate_only(self) -> None:
+        gen = next((s for s in self.stages if s.name == "generate"), None)
+        if gen is None:
+            raise InternalError("generate_only mode requires a generate stage")
+        # Pre-draw PRNG fixed at batch_no=0 (spec 3.10.3): Random(f"{seed}:0:generate").
+        ctx0 = self._make_ctx(0, "generate")
+        # The generation phase runs as a guarded task — same pattern as
+        # _guarded_batch — so a SIGINT/SIGTERM can stop it: _request_stop's
+        # 30 s timer cancels `self._current_task` (spec 3.10.3 中断 row;
+        # CONTRACTS §7.9 "wait current batch ≤ 30 s then cancel"). Its
+        # wall-clock feeds report.timing.per_stage_s like any enabled stage.
+        task = asyncio.ensure_future(gen.generate_all(ctx0))
+        self._current_task = task
+        t_gen = time.perf_counter()
+        records: list[Record] = []
+        try:
+            records = list(await task)
+        except asyncio.CancelledError:
+            if not self._stop:
+                raise                              # external cancellation, not ours
+            # interrupted mid-generation: a cancelled generate_all yields no
+            # records; finalize still runs normally (interrupted=true).
+        finally:
+            self._current_task = None
+            elapsed = time.perf_counter() - t_gen
+            self._stage_time["generate"] = self._stage_time.get("generate", 0.0) + elapsed
+            self.metrics.add_stage_time("generate", elapsed)
+        if self.cfg.limit is not None:
+            records = records[: self.cfg.limit]  # generate_all already truncates; belt & braces
+        if records:
+            self.metrics.count("counts.generated", len(records))
+        # 0 generated → loop is a no-op → normal finalize, exit 0.
+        chain = self._compose_chain(include_generate=False)
+        bs = self.cfg.run.batch_size
+        for i in range(0, len(records), bs):
+            if self._stop:
+                break
+            batch = [PipelineItem(record=r) for r in records[i:i + bs]]
+            self._batch_no += 1
+            await self._guarded_batch(batch, self._batch_no, chain)
+            del batch
+
+    # ── batch lifecycle ────────────────────────────────────────────────────
+
+    async def _guarded_batch(self, batch: list[PipelineItem], batch_no: int,
+                             chain: Sequence[Stage]) -> None:
+        """Run one batch as a task so a SIGINT 30 s timeout can cancel it."""
+        task = asyncio.ensure_future(self._process_batch(batch, batch_no, chain))
+        self._current_task = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            if not self._stop:
+                raise                              # external cancellation, not ours
+            # interrupted mid-batch: already-flushed lines stay valid
+        finally:
+            self._current_task = None
+
+    async def _process_batch(self, batch: list[PipelineItem], batch_no: int,
+                             chain: Sequence[Stage]) -> None:
+        t_batch = time.perf_counter()
+        self.metrics.event(_EV_BATCH_START, stage="run", batch_no=batch_no,
+                           payload={"size": len(batch)})
+        for stage in chain:
+            ctx = self._make_ctx(batch_no, stage.name)
+            t_stage = time.perf_counter()
+            try:
+                result = await stage.run(batch, ctx)
+            finally:
+                elapsed = time.perf_counter() - t_stage
+                self._stage_time[stage.name] = self._stage_time.get(stage.name, 0.0) + elapsed
+                self.metrics.add_stage_time(stage.name, elapsed)
+            if stage.name == "generate":
+                # Off-path stage: returns a NEW sub-batch; enqueue it split at
+                # batch_size. Sub-batches re-enter at M3 (single round).
+                sub = list(result) if result is not None else []
+                if sub:
+                    self.metrics.count("counts.generated", len(sub))
+                    bs = self.cfg.run.batch_size
+                    for i in range(0, len(sub), bs):
+                        self._pending.append(sub[i:i + bs])
+
+        if self.cfg.quality.enabled:
+            self._collect_quality_stats(batch)
+
+        emit = self.emitter.emit_batch(batch, batch_no)
+        self._output_lines += emit.emitted
+        self._rejects_lines += emit.rejected
+
+        # Status tally (post-emit; emitter may have diverted internal errors).
+        tally: dict[str, int] = {}
+        for item in batch:
+            tally[item.status] = tally.get(item.status, 0) + 1
+        dropped_dup = tally.get("dropped_dup", 0)
+        dropped_lowq = tally.get("dropped_lowq", 0)
+        dropped_verify = tally.get("dropped_verify", 0)
+        # counts invariant: whatever was neither emitted nor dropped is failed
+        # (covers emitter-diverted internal_error items too).
+        failed = max(len(batch) - emit.emitted - dropped_dup - dropped_lowq - dropped_verify, 0)
+        self.metrics.count("counts.emitted", emit.emitted)
+        self.metrics.count("counts.dropped_dup", dropped_dup)
+        self.metrics.count("counts.dropped_lowq", dropped_lowq)
+        self.metrics.count("counts.dropped_verify", dropped_verify)
+        self.metrics.count("counts.failed", failed)
+
+        self.metrics.event(_EV_BATCH_END, stage="run", batch_no=batch_no,
+                           payload={"active": tally.get("active", 0),
+                                    "dropped_dup": dropped_dup,
+                                    "dropped_lowq": dropped_lowq,
+                                    "dropped_verify": dropped_verify,
+                                    "failed": tally.get("failed", 0),
+                                    "duration_ms": int((time.perf_counter() - t_batch) * 1000)})
+        self.metrics.flush()                       # trace flush follows output flush
+
+    def _make_ctx(self, batch_no: int, stage_name: str) -> RunContext:
+        """Fresh RunContext per (batch, stage); rng derivation frozen (spec 3.10.3)."""
+        return RunContext(cfg=self.cfg, llm=self.llm, schema_engine=self.schema_engine,
+                          metrics=self.metrics,
+                          rng=random.Random(f"{self.cfg.run.seed}:{batch_no}:{stage_name}"),
+                          batch_no=batch_no)
+
+    def _compose_chain(self, include_generate: bool) -> list[Stage]:
+        """Stage composition per the 2.3.1 switch matrix, canonical order.
+
+        The CLI hands in the constructed enabled stages; composition here
+        re-orders them canonically and drops anything the config disables.
+        `generate` only ever runs on main process-mode batches (never on
+        re-flow sub-batches, never in generate_only where it is the chain head).
+        """
+        cfg = self.cfg
+        enabled = {
+            "dedup": cfg.dedup.enabled,
+            "quality": cfg.quality.enabled,
+            "generate": (cfg.generate.enabled and include_generate
+                         and cfg.run.mode == "process"),
+            "annotate": cfg.annotate.enabled,
+            "verify": cfg.verify.enabled,
+        }
+        by_name = {s.name: s for s in self.stages}
+        return [by_name[n] for n in _CHAIN_ORDER if enabled[n] and n in by_name]
+
+    # ── run-level stats aggregation ────────────────────────────────────────
+
+    def _collect_quality_stats(self, batch: list[PipelineItem]) -> None:
+        """Aggregate quality scores into the report histogram/means (M10 owns
+        report assembly; only counts, never data content)."""
+        for item in batch:
+            agg = item.scores.get("__aggregate__")
+            if agg is not None and agg.score is not None:
+                self._agg_hist[min(int(agg.score * 10), 9)] += 1
+            for key, qs in item.scores.items():
+                if key == "__aggregate__" or qs.score is None:
+                    continue
+                self._crit_sum[key] = self._crit_sum.get(key, 0.0) + qs.score
+                self._crit_n[key] = self._crit_n.get(key, 0) + 1
+
+    # ── finalize / report ──────────────────────────────────────────────────
+
+    def _finalize(self) -> RunSummary:
+        wall_s = time.perf_counter() - self._t0
+        # Source of truth is the MetricsSink flag: the breaker can open on the
+        # tail calls of a batch without CircuitBreakerTripped ever escaping a
+        # stage (every in-flight call fails record-level first) — the run must
+        # still end 4 / undelivered.
+        self._circuit_broken = (self._circuit_broken
+                                or bool(getattr(self.metrics, "circuit_broken", False)))
+        if self._circuit_broken:
+            exit_code = 4
+        elif self.cfg.strict and self._rejects_lines > 0:
+            exit_code = 1
+        else:
+            exit_code = 0
+        report = self._build_report(exit_code=exit_code, wall_s=wall_s)
+        # Circuit break: report written, .part NOT renamed. Everything else
+        # (incl. graceful SIGINT) delivers normally.
+        self.emitter.finalize(report, deliver=not self._circuit_broken)
+        self.metrics.event(_EV_RUN_END, stage="run", batch_no=0,
+                           payload={"counts": report["counts"], "exit_code": exit_code})
+        self.metrics.flush()
+        return RunSummary(counts=report["counts"], interrupted=self._interrupted,
+                          exit_code=exit_code, wall_s=wall_s,
+                          output_lines=self._output_lines,
+                          rejects_lines=self._rejects_lines)
+
+    def _build_report(self, exit_code: int, wall_s: float) -> dict:
+        """Assemble the §9.3 report dict from ingestor.report, metrics counters,
+        schema_engine.stats, llm.usage_by_profile and stage timing."""
+        cfg = self.cfg
+        counters = dict(getattr(self.metrics, "counters", {}) or {})
+
+        def c(key: str) -> int:
+            return int(counters.get(key, 0))
+
+        ingest_report = getattr(self.ingestor, "report", None) if self.ingestor else None
+        counts = {
+            "scanned": int(getattr(ingest_report, "scanned", 0)),
+            "ingested": int(getattr(ingest_report, "ingested", 0)),
+            "bad_input": int(getattr(ingest_report, "bad_input", 0)),
+            "dropped_dup": c("counts.dropped_dup"),
+            "dropped_lowq": c("counts.dropped_lowq"),
+            "dropped_verify": c("counts.dropped_verify"),
+            "failed": c("counts.failed"),
+            "generated": c("counts.generated"),
+            "emitted": c("counts.emitted"),
+        }
+
+        report: dict = {
+            "run": {
+                "tool_version": __version__,
+                "started_at": self.run_started_at.isoformat(),
+                "finished_at": datetime.now().astimezone().isoformat(),
+                "interrupted": self._interrupted,
+                # Explicit breaker flag (E2E finding P4-10): interrupted stays
+                # false on a circuit break — exit_code=4 alone was easy to misread.
+                "circuit_broken": self._circuit_broken,
+                "exit_code": exit_code,
+                "modality": cfg.run.modality,
+                "seed": cfg.run.seed,
+                "config_digest": cfg.config_digest,
+                "project_digest": cfg.project_digest,
+            },
+            "counts": counts,
+        }
+
+        if cfg.dedup.enabled:
+            dedup_block = {
+                "exact": c("dedup.exact"),
+                "near_text": c("dedup.near_text"),
+                "near_image": c("dedup.near_image"),
+                "near_both": c("dedup.near_both"),
+                "clusters": c("dedup.clusters"),
+                "image_decode_failures": c("dedup.image_decode_failures"),
+            }
+            if cfg.dedup.semantic:
+                dedup_block["near_semantic"] = c("dedup.near_semantic")
+                dedup_block["embedding_failures"] = c("dedup.embedding_failures")
+            report["dedup"] = dedup_block
+
+        if cfg.quality.enabled:
+            report["quality"] = {
+                "mode": "pairwise_bt" if cfg.quality.mode == "pairwise" else "pointwise",
+                "rounds": cfg.quality.rounds,
+                "judgment_failures": c("quality.judgment_failures"),
+                "aggregate_histogram": {label: self._agg_hist[i]
+                                        for i, label in enumerate(_HIST_LABELS)},
+                "per_criterion_mean": {key: self._crit_sum[key] / self._crit_n[key]
+                                       for key in sorted(self._crit_sum)
+                                       if self._crit_n.get(key)},
+            }
+            if cfg.quality.mode == "pairwise":
+                # Pairwise percentile means are ~0.5 by construction; the tie
+                # rate is the discriminative per-criterion signal (E2E P4-9;
+                # same metric as the 7.5 rubric-diagnosis loop, no jq needed).
+                prefix = "quality.tie_outcomes."
+                tie_rate: dict[str, float] = {}
+                for key, ties in sorted(self.metrics.counters.items()):
+                    if not key.startswith(prefix):
+                        continue
+                    crit = key[len(prefix):]
+                    comps = self.metrics.counters.get(
+                        f"quality.tie_comparisons.{crit}", 0)
+                    if comps:
+                        tie_rate[crit] = ties / comps
+                report["quality"]["per_criterion_tie_rate"] = tie_rate
+
+        stats = getattr(self.schema_engine, "stats", None) if self.schema_engine else None
+        report["schema_engine"] = {"resolved_at": dict(stats) if stats else dict(_SCHEMA_STATS_ZERO)}
+
+        if cfg.annotate.enabled and cfg.annotate.self_consistency >= 3:
+            report["annotate"] = {"sc_disagreements": c("annotate.sc_disagreements")}
+
+        if cfg.generate.enabled:
+            buckets: dict[str, dict] = {}
+            prefix = "generate.buckets."
+            for key, value in counters.items():
+                if not key.startswith(prefix):
+                    continue
+                bucket, _, field_name = key[len(prefix):].rpartition(".")
+                if not bucket or field_name not in ("calls", "produced", "survived_dedup"):
+                    continue
+                buckets.setdefault(bucket, {"calls": 0, "produced": 0,
+                                            "survived_dedup": 0})[field_name] = int(value)
+            report["generate"] = {"buckets": buckets}
+
+        event_log = (getattr(self.metrics, "event_log", None)
+                     or getattr(self.metrics, "_event_log", None))
+        trace_events = int(getattr(event_log, "events_written", 0) or 0)
+        trace_dropped = int(getattr(event_log, "dropped_events", 0) or 0)
+        if cfg.trace.enabled:
+            # The terminal run.end event is emitted only after this report is
+            # assembled (its payload carries the report counts, and §8.1 makes
+            # it the trace's last line, written after finalize). Account for it
+            # here so report.trace matches the final trace file: one more
+            # written line while the channel is open, one more dropped event
+            # once a write failure closed it.
+            if getattr(event_log, "closed", False):
+                trace_dropped += 1
+            else:
+                trace_events += 1
+        report["trace"] = {
+            "enabled": cfg.trace.enabled,
+            # The EventLog may be writing to a diverted path (dry-run uses
+            # "<name>.dryrun<suffix>", P2-4) — report the ACTUAL file.
+            "path": (getattr(getattr(event_log, "cfg", None), "path", None)
+                     or cfg.trace.path),
+            "events": trace_events,
+            "dropped_events": trace_dropped,
+        }
+
+        usage_by_profile = getattr(self.llm, "usage_by_profile", None) if self.llm else None
+        llm_usage: dict[str, dict] = {}
+        for name, usage in (usage_by_profile or {}).items():
+            entry = {
+                "calls": usage.calls,
+                "prompt_tokens": usage.prompt_tokens,
+                "completion_tokens": usage.completion_tokens,
+                "retries": usage.retries,
+            }
+            if usage.est_cost_usd is not None:
+                entry["est_cost_usd"] = usage.est_cost_usd
+            llm_usage[name] = entry
+        report["llm_usage"] = llm_usage
+
+        report["timing"] = {
+            "wall_s": round(wall_s, 3),
+            "per_stage_s": {name: round(seconds, 3)
+                            for name, seconds in self._stage_time.items()},
+        }
+        return report
+
+    # ── dry-run ────────────────────────────────────────────────────────────
+
+    def _run_dry(self) -> RunSummary:
+        """--dry-run: M1 already passed; run the M2 scan (process mode) or the
+        3.6.2 static call-count formula (generate_only), print the call/cost
+        estimate to stderr, write the report, make NO LLM calls, produce NO
+        main output/rejects (Emitter.open is never called). The trace channel
+        — an opt-in first-class output channel (spec 2.6) that carries only
+        operational events, never data content — still receives its run.start
+        / run.end lifecycle events when trace.enabled."""
+        cfg = self.cfg
+        self.metrics.event(_EV_RUN_START, stage="run", batch_no=0,
+                           payload={"tool_version": TOOL_VERSION,
+                                    "config_digest": cfg.config_digest,
+                                    "project_digest": cfg.project_digest,
+                                    "trace_schema_version": 1})
+        est = self._estimate()
+        print(f"dry-run: mode={cfg.run.mode} estimated_records={est['records']} "
+              f"batches={est['batches']}", file=sys.stderr)
+        print(f"dry-run: estimated LLM calls — generate_calls={est['generate_calls']} "
+              f"quality_calls={est['quality_calls']} annotate_calls={est['annotate_calls']} "
+              f"verify_calls={est['verify_calls']} total={est['total_calls']} "
+              f"(excludes retries and repair calls)", file=sys.stderr)
+        side_channels = "report and trace only" if cfg.trace.enabled else "report only"
+        print(f"dry-run: no LLM calls made, no output written ({side_channels})",
+              file=sys.stderr)
+
+        wall_s = time.perf_counter() - self._t0
+        report = self._build_report(exit_code=0, wall_s=wall_s)
+        self.emitter.finalize(report, deliver=False)   # report only; no .part exists
+        self.metrics.event(_EV_RUN_END, stage="run", batch_no=0,
+                           payload={"counts": report["counts"], "exit_code": 0})
+        self.metrics.flush()
+        return RunSummary(counts=report["counts"], interrupted=False, exit_code=0,
+                          wall_s=wall_s, output_lines=0, rejects_lines=0)
+
+    def _estimate(self) -> dict:
+        """Static record / LLM-call estimate. generate_only follows the 3.6.2
+        call-count formulas; process mode uses the M2 scan estimate. All
+        estimates assume no drops (upper bound) and exclude retries/repairs."""
+        cfg = self.cfg
+        g = cfg.generate
+        if cfg.run.mode == "generate_only":
+            n_ingested = 0
+            if g.seed_examples:
+                gen_calls = _ceil_div(len(g.seed_examples) * g.num_per_record, g.num_per_call)
+            else:
+                gen_calls = _ceil_div(g.standalone_count or 0, g.num_per_call)
+            if cfg.limit is not None:
+                gen_calls = min(gen_calls, _ceil_div(cfg.limit, g.num_per_call))
+            gen_records = gen_calls * g.num_per_call
+            if cfg.limit is not None:
+                gen_records = min(gen_records, cfg.limit)
+        else:
+            assert self.ingestor is not None, "process mode requires an Ingestor"
+            plan = self.ingestor.scan()
+            n_ingested = plan.estimated_records
+            if cfg.limit is not None:
+                n_ingested = min(n_ingested, cfg.limit)
+            if g.enabled:
+                gen_calls = _ceil_div(n_ingested * g.num_per_record, g.num_per_call)
+                gen_records = gen_calls * g.num_per_call
+            else:
+                gen_calls = gen_records = 0
+
+        total_records = n_ingested + gen_records
+        bs = cfg.run.batch_size
+        sizes = [bs] * (total_records // bs)
+        if total_records % bs:
+            sizes.append(total_records % bs)
+
+        quality_calls = 0
+        if cfg.quality.enabled:
+            n_criteria = len(cfg.rubric.criteria)
+            if cfg.quality.mode == "pairwise":
+                judges = max(1, len(cfg.quality.judges))
+                orders = 2 if cfg.quality.both_orders else 1
+                per_call = n_criteria if cfg.quality.criteria_per_call == "single" else 1
+                quality_calls = (sum(cfg.quality.rounds * (b // 2) for b in sizes)
+                                 * per_call * judges * orders)
+            else:
+                quality_calls = total_records * n_criteria
+
+        annotate_calls = 0
+        if cfg.annotate.enabled:
+            sc = cfg.annotate.self_consistency
+            annotate_calls = total_records * (sc if sc >= 3 else 1)
+
+        verify_calls = 0
+        if cfg.verify.enabled:
+            verify_calls = total_records * max(1, len(cfg.verify.judges))
+
+        return {
+            "records": total_records,
+            "batches": len(sizes),
+            "generate_calls": gen_calls,
+            "quality_calls": quality_calls,
+            "annotate_calls": annotate_calls,
+            "verify_calls": verify_calls,
+            "total_calls": gen_calls + quality_calls + annotate_calls + verify_calls,
+        }
+
+    # ── signals ────────────────────────────────────────────────────────────
+
+    def _install_signal_handlers(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        for sig in (_signal.SIGINT, _signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, self._request_stop)
+                self._installed_signals.append(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+
+    def _remove_signal_handlers(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        for sig in self._installed_signals:
+            try:
+                loop.remove_signal_handler(sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                pass
+        self._installed_signals.clear()
+        for handle in self._timer_handles:
+            handle.cancel()
+        self._timer_handles.clear()
+
+    def _request_stop(self) -> None:
+        """SIGINT/SIGTERM: stop taking new batches; give the in-flight batch
+        30 s before cancelling it. Finalize still runs normally (rename happens,
+        report carries interrupted=true)."""
+        self._stop = True
+        self._interrupted = True
+        task = self._current_task
+        if task is not None and not task.done():
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                return
+            self._timer_handles.append(loop.call_later(30.0, task.cancel))

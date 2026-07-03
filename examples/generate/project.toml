@@ -1,0 +1,74 @@
+# Pure-generation E2E project (spec v1.4, run.mode = "generate_only"):
+# seed-pool form (Self-Instruct style) — synthesize from scratch, then dedup → score → annotate.
+schema_version = 1
+
+[run]
+output = "./out/generated.jsonl"
+modality = "text"
+mode = "generate_only"
+batch_size = 8
+seed = 7
+
+[dedup]
+enabled = true
+
+[quality]
+enabled = true
+mode = "pointwise"
+llm = "default"
+rubric = "default:text"
+
+[generate]
+enabled = true
+llms = ["default"]
+instruction = """
+生成中文输入法用户可能向 AI 助手提出的一句话请求。要求贴近真实使用场景、
+类型多样（写作协助、翻译、问答、闲聊等），长度 10–60 字。
+"""
+num_per_call = 4
+num_per_record = 2
+temperature = 0.9
+seed_examples = [
+  "帮我写一条请假条，明天上午要去医院复查",
+  "把这句话翻译成英文：项目进度符合预期",
+  "解释一下什么是复利，举个例子",
+]
+
+[[generate.styles]]
+name = "concise"
+prompt = "请求应当简短直接，一句话说清诉求。"
+
+[[generate.styles]]
+name = "detailed"
+prompt = "请求应包含具体的背景与约束条件（时间、对象、格式要求等）。"
+
+[annotate]
+enabled = true
+llm = "default"
+instruction = """
+你是输入法用户请求的标注员。根据用户输入的一句话请求，标注其意图类别
+（writing_assist / qa / translation / chitchat / other）、主题与难度（easy / medium / hard）。
+"""
+
+[trace]
+enabled = true
+channels = ["quality", "schema"]
+content = "refs"
+
+[output]
+meta_mode = "inline"
+rejects = "refs"
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "intent": {"type": "string",
+      "enum": ["writing_assist", "qa", "translation", "chitchat", "other"]},
+    "topic": {"type": "string"},
+    "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]}
+  },
+  "required": ["intent", "topic", "difficulty"],
+  "additionalProperties": false
+}
+"""

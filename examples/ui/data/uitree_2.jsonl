@@ -1,0 +1,8 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.demo"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "设置", "bounds": [24, 20, 120, 48], "visible": true, "package": "com.example.demo"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "账号与安全", "bounds": [24, 120, 200, 144], "visible": true, "package": "com.example.demo"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "消息通知", "bounds": [24, 180, 200, 204], "visible": true, "package": "com.example.demo"}
+{"id": "4", "parent": "0", "class": "TextView", "text": "隐私", "bounds": [24, 240, 200, 264], "visible": true, "package": "com.example.demo"}
+{"id": "5", "parent": "0", "class": "TextView", "text": "通用", "bounds": [24, 300, 200, 324], "visible": true, "package": "com.example.demo"}
+{"id": "6", "parent": "0", "class": "TextView", "text": "关于", "bounds": [24, 360, 200, 384], "visible": true, "package": "com.example.demo"}
+{"id": "7", "parent": "0", "class": "Button", "text": "退出登录", "bounds": [32, 700, 368, 756], "visible": true, "package": "com.example.demo"}
