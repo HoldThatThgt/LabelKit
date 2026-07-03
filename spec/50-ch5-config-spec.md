@@ -122,6 +122,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `generate.seeds_per_call / num_per_call` | int | 3 / 4 | 3.6.2。 |
 | `generate.seed_min_score` | float | 自动 | 种子门槛，默认取 quality.threshold 或批中位数。 |
 | `generate.temperature` | float | 0.9 | 生成需要多样性，覆盖 profile 默认。 |
+| `generate.sample_validator` | str | 无 | v1.5 校验回调（方案 A）：`"module:function"`，签名 `fn(text: str) -> list[str]`（空 = 通过）。对每条生成样本在相似度过滤**之前**执行，违规样本剔除（过滤语义，不触发重试、不产生 failed 记录），计入桶统计 `rejected_by_validator`（3.6.2/6.4）。M1 校验同 output.validator（无 few-shot 干跑）。回调抛异常 ⇒ 该样本按违规剔除并 stderr warn（过滤器不失败）。 |
 | `generate.seed_examples` | array | [] | generate_only 专用（process 模式不得设置，3.1.4）：字符串数组种子池，非空即种子池形态（3.6.2）。 |
 | `generate.standalone_count` | int | 无 | generate_only 无种子形态必填（与 seed_examples 互斥）：目标产出条数，调用数 = ⌈standalone_count / num_per_call⌉。 |
 | `annotate.enabled` | bool | true | — |
@@ -138,6 +139,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `output.schema_inline` | str | 二选一 | TOML 多行字符串内嵌的 Schema JSON 文本。 |
 | `output.max_repair_attempts` | int | 2 | 结构引擎 L3 次数（3.8.2）。 |
 | `output.repair_llm` | str | 同调用方 | L3 修复用 profile。 |
+| `output.validator` | str | 无 | v1.5 校验回调（方案 A）：`"module:function"` 形式的 Python 可调用引用，签名 `fn(obj: dict, record: dict | None) -> list[str]`（返回违规描述列表，空 = 通过；record = Record.raw：文本/生成记录为该行原始对象，UI 记录为 None）。挂接为结构引擎 **L2.5**（3.8.2）：仅作用于用户 Schema 的标注调用，违规并入 L3 修复环、共享 max_repair_attempts 预算，耗尽 ⇒ 记录 failed（kind = `callback_violation`，7.6）。M1 启动校验：格式、可导入、可调用，且逐条 few-shot 示例 output 须过回调（干跑）。回调以运行者同权限执行任意用户代码（信任边界与配置文件一致）；回调内抛异常按记录级 `internal_error` 处理。 |
 | `output.meta_mode` | str | "inline" | "inline" \| "sidecar" \| "none"（6.3）。 |
 | `output.passthrough_fields` | array | [] | 从 Record.raw 透传进 _meta.source.fields 的字段名列表。 |
 | `output.rejects` | str | "refs" | "none" \| "refs" \| "full"（3.11.2）。 |

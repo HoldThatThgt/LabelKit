@@ -120,7 +120,7 @@ instruction = """
 
 ## 11.6 失败与去向
 
-- 结构修复预算耗尽（`schema_violation`）⇒ 记录 `failed` 进拒绝通道——**永远不会有非法结构混进主输出**；
+- 结构修复预算耗尽 ⇒ 记录 `failed` 进拒绝通道（错误码 `schema_violation`；注册了 `output.validator` 回调且剩余违规全部来自回调时为 `callback_violation`，见 14.5）——**永远不会有非法结构或违反你业务规则的对象混进主输出**；
 - API 重试耗尽 / 致命错误 ⇒ 同样 `failed`，错误码进拒绝通道的 `_meta.reason`（如 `provider_retryable_exhausted`），具体错误信息进 `errors` 列表；
 - 成功 ⇒ `_meta.annotation = {model, attempts}`（开 self-consistency 时另含 `sc`）。单次标注（`self_consistency = 0`）时 attempts = 1 + 结构修复轮数，>1 即说明结构引擎修过；开 self-consistency 时 attempts 是各合法样本尝试次数之**和**（零修复时就等于合法样本数），要与 `sc.n` 对照：attempts 明显超过 n 才说明发生过修复（第 14 章解读修复分布）。
 

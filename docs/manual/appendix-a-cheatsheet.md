@@ -99,6 +99,7 @@
 | `num_per_call` | 4 | 每次调用要求产出条数 | 12 |
 | `seed_min_score` | 自动 | 种子门槛：默认 quality.threshold，再缺省批中位数 | 12 |
 | `temperature` | 0.9 | 生成温度（覆盖档默认） | 12 |
+| `sample_validator` | 不设 | 样本级代码回调 "module:function"：过滤语义，剔除计入桶 rejected_by_validator | 12 |
 | `seed_examples` | [] | generate_only 种子池形态（process 不得设） | 12/22 |
 | `standalone_count` | 不设 | generate_only 无种子形态目标条数（与 seed_examples 互斥；process 不得设） | 12/22 |
 | `[[generate.styles]]` | [] | 风格子表 {name, prompt}；每调用均匀抽 1 个追加为 [风格要求] | 12 |
@@ -127,6 +128,7 @@
 | `output.schema_path` / `schema_inline` | 恰一 | 用户 Schema（draft 2020-12，顶层 object，禁 _meta） | 14 |
 | `output.max_repair_attempts` | 2 | 结构引擎 L3 轮数预算 | 14 |
 | `output.repair_llm` | 同调用方 | 修复专用档（可指便宜小模型） | 14 |
+| `output.validator` | 不设 | L2.5 代码回调 "module:function"：业务级硬校验，违规回喂修复环；启动校验含 few-shot 干跑 | 14 |
 | `output.meta_mode` | "inline" | \| "sidecar"（{stem}.meta.jsonl）\| "none"（丢分数溯源，不推荐） | 8 |
 | `output.passthrough_fields` | [] | 输入字段透传至 _meta.source.fields | 8 |
 | `output.rejects` | "refs" | "none" \| "refs"（无数据内容）\| "full"（含原文=数据副本） | 8 |
@@ -148,3 +150,4 @@
 9. `weighted` ⇒ weights 正数且长度=len(llms)
 10. `self_consistency` ∈ {0} ∪ {≥3 奇数}
 11. `dedup.semantic = true` ⇒ `semantic_embedding` 必填，且引用的档名须存在于 config.toml `[embedding.*]`
+12. `output.validator` / `generate.sample_validator` ⇒ 须为可导入、可调用的 `"module:function"`；前者还须让全部 few-shot 示例 output 干跑通过

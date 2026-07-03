@@ -41,10 +41,13 @@ class ProviderFatalError(LabelKitError):
 
 class SchemaViolation(LabelKitError):
     """M8: L3 budget exhausted, object still invalid. Record-level → status='failed',
-    kind='schema_violation'."""
-    def __init__(self, errors: list[str], raw_last_output: str):
+    kind='schema_violation' — or 'callback_violation' when the remaining violations
+    all come from the output.validator hook (callback_only=True, spec 3.8.2 L2.5)."""
+    def __init__(self, errors: list[str], raw_last_output: str, *,
+                 callback_only: bool = False):
         self.errors = errors                  # rendered violations: "<json-pointer>: <message>"
         self.raw_last_output = raw_last_output
+        self.callback_only = callback_only
         super().__init__("; ".join(errors))
 
 
@@ -75,6 +78,8 @@ class ErrorKind(str, enum.Enum):
     IMAGE_DECODE_ERROR = "image_decode_error"                # M3 skip pHash; M5/M7 → failed
     JUDGMENT_INVALID = "judgment_invalid"                    # M4, comparison-level → counts as tie
     SCHEMA_VIOLATION = "schema_violation"                    # M8 L3 exhausted → failed → rejects
+    CALLBACK_VIOLATION = "callback_violation"                # v1.5: L3 exhausted, remaining
+                                                             # violations all from output.validator
     PROVIDER_RETRYABLE_EXHAUSTED = "provider_retryable_exhausted"  # M9 → failed, feeds breaker window
     PROVIDER_FATAL = "provider_fatal"                        # M9 run-level, feeds breaker directly
     INTERNAL_ERROR = "internal_error"                        # any unexpected exception

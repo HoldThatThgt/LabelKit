@@ -14,6 +14,7 @@
 | L0 | profile `supports_structured_output=true` 时：OpenAI 兼容 provider 传 `response_format={"type":"json_schema", "json_schema":{...strict:true}}`；Anthropic provider 以单工具 `tool_choice` 强制工具调用、Schema 作为工具入参。L0 只是「使 L1/L3 少触发」的优化，不豁免 L2——供应商实现存在覆盖缺口（JSONSchemaBench 实测各引擎均有不支持的 Schema 特性 [24]），校验永远执行。 |
 | L1 | 顺序执行：① 剥离 Markdown 代码围栏；② 取首个花括号平衡子串；③ `json_repair.loads()`（工业库，处理截断/单引号/尾逗号/裸换行 [8]）。全部失败 ⇒ 直接进 L3。L1 为纯函数，无副作用、可单测穷举。 |
 | L2 | `Draft202012Validator.iter_errors()` 收集全部违规（非首个），每条含 JSON Pointer 路径、期望与实际。通过 ⇒ 返回；未通过 ⇒ L3。 |
+| L2.5（v1.5，可选） | `output.validator` 配置时、且仅对用户 Schema 调用：L2 通过后执行用户回调 `fn(obj, record)`。返回非空违规列表 ⇒ 违规以 `(validator) <消息>` 形式并入违规清单、与 Schema 违规同路进入 L3 修复环（回调意见回喂模型自我修正——回调既是门卫也是修复环的教练）；返回空 ⇒ 通过。L3 每轮修复输出重走 L1→L2→L2.5。预算耗尽且剩余违规**全部**来自回调 ⇒ `SchemaViolation(callback_only=True)`，记录 kind = `callback_violation`（7.6），否则仍为 `schema_violation`。回调抛异常不吞：向上传播、按记录级 `internal_error` 收敛（3.5.3）。内部 Schema（裁决/评分/评审/生成）不经过 L2.5。 |
 | L3 | 修复提示词 = 单条 user 消息，按 `[原始输出]` / `[违规清单]` 分节标签组织，末尾指令「只输出修正后的 JSON」（逐字实例见 3.8.4）。使用 `output.repair_llm`（默认同调用方 profile）。每次修复输出重走 L1→L2。尝试次数耗尽 ⇒ 抛 `SchemaViolation(errors, raw_last_output)`。修复调用计入 token 计量，命中层级分布计入报告（`report.schema_engine.resolved_at = {l0_or_clean, l1, l3_1, l3_2, rejected}`）。 |
 
 ### 3.8.3 API

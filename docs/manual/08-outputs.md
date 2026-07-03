@@ -162,7 +162,7 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
 2. **再看 `quality.aggregate_histogram`**——分布形状决定阈值画哪里。比如上面这份：0.25 的线落在 0.2-0.3 桶内，被淘汰的五条恰是 0~0.2 两桶的全部（3+2）；0.2-0.3 桶的两条聚合分正好等于 0.25，质量门按「< 阈值才淘汰」放行，都留下了。如果直方图整体右移，同一条线就几乎不淘汰东西；
 3. **最后看 `llm_usage` 和 `timing`**——哪个阶段最烧钱/最耗时（几乎总是 quality），是否要换模式、调并发（第 17 章）。
 
-另有两个按需出现的块：`annotate.sc_disagreements`（开 self-consistency 时：全体分歧、回退首样本的次数）与 `generate.buckets`（开生成时：每个「模型×风格」桶的调用数 / 产出数 / 去重存活数——某桶存活率明显低说明它在产重复货，第 12 章）。
+另有两个按需出现的块：`annotate.sc_disagreements`（开 self-consistency 时：全体分歧、回退首样本的次数）与 `generate.buckets`（开生成时：每个「模型×风格」桶的调用数 / 产出数 / 去重存活数，配置 `sample_validator` 时另有回调剔除数 `rejected_by_validator`——某桶存活率明显低说明它在产重复货或不合规货，第 12 章）。
 
 > **报告写失败怎么办**：主输出成功、报告写失败时，进程以退出码 1 结束——产物可用但账本缺失，别当成功处理。
 

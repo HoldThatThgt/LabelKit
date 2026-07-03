@@ -210,7 +210,8 @@ async def annotate_record(record: Record, ctx: "RunContext",
         prompt = build_annotate_prompt(record, cfg, schema_text, repair=repair,
                                        temperature=None)
         obj, usage, attempts, model = await ctx.schema_engine.complete_validated(
-            profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no)
+            profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
+            record=record.raw)
         return Annotation(output=obj, model=model, attempts=attempts, usage=usage)
 
     # Self-consistency: n independent samples at sc_temperature, each through the full
@@ -219,7 +220,8 @@ async def annotate_record(record: Record, ctx: "RunContext",
         prompt = build_annotate_prompt(record, cfg, schema_text, repair=None,
                                        temperature=cfg.annotate.sc_temperature)
         return await ctx.schema_engine.complete_validated(
-            profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no)
+            profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
+            record=record.raw)
 
     results = await asyncio.gather(*(one_sample() for _ in range(n)),
                                    return_exceptions=True)
@@ -273,7 +275,9 @@ class AnnotateStage:
             # Transport the raw last model output to M11 for the rejects "full"
             # tier (§9.2) via the duck-typed channel the emitter reads.
             item.raw_last_output = e.raw_last_output  # type: ignore[attr-defined]
-            self._fail(item, ctx, ErrorKind.SCHEMA_VIOLATION.value, str(e), retryable=False)
+            kind = (ErrorKind.CALLBACK_VIOLATION if getattr(e, "callback_only", False)
+                    else ErrorKind.SCHEMA_VIOLATION)
+            self._fail(item, ctx, kind.value, str(e), retryable=False)
         except ProviderRetryableError as e:
             self._fail(item, ctx, ErrorKind.PROVIDER_RETRYABLE_EXHAUSTED.value, str(e),
                        retryable=True)

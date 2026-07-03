@@ -350,6 +350,8 @@ class ErrorKind(str, enum.Enum):
     IMAGE_DECODE_ERROR = "image_decode_error"                # M3 skip pHash; M5/M7 → failed
     JUDGMENT_INVALID = "judgment_invalid"                    # M4, comparison-level → counts as tie
     SCHEMA_VIOLATION = "schema_violation"                    # M8 L3 exhausted → failed → rejects
+    CALLBACK_VIOLATION = "callback_violation"                # v1.5: L3 exhausted, remaining
+                                                             # violations all from output.validator
     PROVIDER_RETRYABLE_EXHAUSTED = "provider_retryable_exhausted"  # M9 → failed, feeds breaker window
     PROVIDER_FATAL = "provider_fatal"                        # M9 run-level, feeds breaker directly
     INTERNAL_ERROR = "internal_error"                        # any unexpected exception
@@ -556,6 +558,9 @@ class GenerateConfig:
     num_per_call: int = 4
     seed_min_score: float | None = None           # None = auto (quality.threshold, else batch median)
     temperature: float = 0.9
+    sample_validator: str | None = None           # v1.5 plan-A hook: "module:function",
+                                                  # fn(text) -> list[str]; per-sample filter
+                                                  # BEFORE the similarity filter (spec 3.6.2)
     seed_examples: tuple[str, ...] = ()           # generate_only seed-pool form only
     standalone_count: int | None = None           # generate_only seedless form only; mutually
                                                   # exclusive with seed_examples
@@ -596,6 +601,9 @@ class OutputConfig:
     meta_mode: Literal["inline", "sidecar", "none"] = "inline"
     passthrough_fields: tuple[str, ...] = ()
     rejects: Literal["none", "refs", "full"] = "refs"
+    validator: str | None = None                  # v1.5 plan-A hook: "module:function",
+                                                  # fn(obj, record|None) -> list[str];
+                                                  # engine L2.5, user schema only (spec 3.8.2)
 
 
 @dataclass(frozen=True)
@@ -1042,9 +1050,15 @@ class SchemaEngine:
     async def complete_validated(self, profile: str, prompt: PromptBundle,
                                  schema: dict | None = None, *,
                                  record_ids: tuple[str, ...] = (),
-                                 batch_no: int = 0) -> tuple[dict, Usage, int, str]:
+                                 batch_no: int = 0,
+                                 record: Mapping | None = None) -> tuple[dict, Usage, int, str]:
         """schema=None → user schema; internal schemas (judgment/pointwise/verdict/samples)
-        passed in by stages. Runs L0→L1→L2→L3 (spec 3.8.2). Success: returns
+        passed in by stages. Runs L0→L1→L2[→L2.5]→L3 (spec 3.8.2). ``record`` (v1.5,
+        additive kwarg) is the raw input mapping handed to the output.validator hook
+        at L2.5 — user-schema calls only; callback violations are rendered
+        "(validator) <msg>", join the L3 repair prompt, and share the repair budget;
+        exhaustion with ONLY callback violations left raises
+        SchemaViolation(callback_only=True) → record kind callback_violation. Success: returns
         (validated_obj, total_usage, attempts, model) where attempts = 1 + L3 repair calls
         and total_usage sums the first call + repairs. Failure: raises SchemaViolation.
         Counts resolved_at buckets ONLY when schema is None (user-schema annotate calls,
@@ -1569,7 +1583,8 @@ MetricsSink counter keys **[FROZEN HERE]**, mapped 1:1 onto the above: `counts.*
 (`scanned/ingested/bad_input/dropped_dup/dropped_lowq/dropped_verify/failed/generated/emitted`),
 `dedup.exact/near_text/near_image/near_both/near_semantic/clusters/image_decode_failures/
 embedding_failures`, `quality.judgment_failures`, `annotate.sc_disagreements`,
-`generate.buckets.<key>.calls/produced/survived_dedup`.
+`generate.buckets.<key>.calls/produced/survived_dedup` (+ `.rejected_by_validator` when
+`generate.sample_validator` is set, v1.5).
 
 Counter OWNERSHIP (normative): `counts.*` keys are incremented ONLY by M10 (orchestrator),
 derived from batch tallies / EmitResult — stages must never touch them (double-count).

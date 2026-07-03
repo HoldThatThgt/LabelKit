@@ -976,3 +976,50 @@ def test_pointwise_judges_key_checked_on_quality_llm(env, tmp_path, monkeypatch)
     errors = env.errors(project_text=env.project(
         body='[quality]\nmode = "pointwise"\njudges = ["judge", "judge", "judge"]'))
     has(errors, "[llm.default].api_key_env")
+
+
+# ── v1.5 plan A: validation hooks (rule 17) ─────────────────────────────────
+
+def _output_with(extra: str) -> str:
+    return f"[output]\n{extra}\nschema_inline = \'\'\'\n{SCHEMA}\n\'\'\'"
+
+
+def test_output_validator_loads_and_dryruns_examples(env):
+    cfg = env.load(project_text=env.project(
+        annotate_body=('instruction = "标注意图"\n'
+                       'examples = [{input = "问路", '
+                       'output = {intent = "qa", topic = "问路"}}]'),
+        body=_output_with('validator = "tests.hook_samples:topic_max6"'),
+        include_output=False,
+    ))
+    assert cfg.output.validator == "tests.hook_samples:topic_max6"
+
+
+def test_output_validator_bad_ref_is_config_error(env):
+    errors = env.errors(project_text=env.project(
+        body=_output_with('validator = "no_such_module_xyz:fn"'),
+        include_output=False,
+    ))
+    has(errors, "[output].validator")
+    has(errors, "无法导入模块")
+
+
+def test_output_validator_rejecting_fewshot_is_config_error(env):
+    errors = env.errors(project_text=env.project(
+        annotate_body=('instruction = "标注意图"\n'
+                       'examples = [{input = "问", '
+                       'output = {intent = "qa", topic = "这是一个特别长的主题短语"}}]'),
+        body=_output_with('validator = "tests.hook_samples:topic_max6"'),
+        include_output=False,
+    ))
+    has(errors, "未通过 output.validator 回调")
+
+
+def test_sample_validator_checked_when_generate_enabled(env):
+    errors = env.errors(project_text=env.project(
+        body=('[quality]\nthreshold = 0.5\n\n'
+              '[generate]\nenabled = true\ninstruction = "生成"\n'
+              'sample_validator = "tests.hook_samples:NOT_CALLABLE"'),
+    ))
+    has(errors, "[generate].sample_validator")
+    has(errors, "不是可调用对象")

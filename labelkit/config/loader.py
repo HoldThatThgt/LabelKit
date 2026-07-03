@@ -51,6 +51,7 @@ from labelkit.config.model import (
     VerifyConfig,
 )
 from labelkit.errors import ConfigError
+from labelkit.hooks import normalize_violations, resolve_hook
 
 __all__ = ["load", "default_rubric"]
 
@@ -530,6 +531,7 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
         num_per_call=t.get_int("num_per_call", 4, minimum=1),
         seed_min_score=t.get_float("seed_min_score", None, ge=0, le=1),
         temperature=t.get_float("temperature", 0.9, ge=0),
+        sample_validator=t.get_str("sample_validator", None, nonempty=True),
         seed_examples=t.get_str_tuple("seed_examples", ()),
         standalone_count=t.get_int("standalone_count", None, minimum=1),
     )
@@ -572,6 +574,7 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
         meta_mode=t.get_str("meta_mode", "inline", enum=("inline", "sidecar", "none")),
         passthrough_fields=t.get_str_tuple("passthrough_fields", ()),
         rejects=t.get_str("rejects", "refs", enum=("none", "refs", "full")),
+        validator=t.get_str("validator", None, nonempty=True),
     )
     t.finish()
 
@@ -981,6 +984,33 @@ def load(config_path: Path, project_path: Path,
                 ptr = "/" + "/".join(str(x) for x in e0.absolute_path)
                 col.error(f"{fp}:[[annotate.examples]][{i}].output: 未通过用户 Schema："
                           f"{ptr}: {e0.message}")
+
+    # ── rule 17 — validation hooks (v1.5 plan A, spec 3.8.2/3.6.2) ────────
+    output_hook = None
+    if output.validator is not None:
+        try:
+            output_hook = resolve_hook(output.validator)
+        except ValueError as e:
+            col.error(f"{fp}:[output].validator: {e}")
+    if generate.enabled and generate.sample_validator is not None:
+        try:
+            resolve_hook(generate.sample_validator)
+        except ValueError as e:
+            col.error(f"{fp}:[generate].sample_validator: {e}")
+    if output_hook is not None and schema_ok and annotate.examples:
+        # Dry-run every few-shot output through the hook: an example the
+        # user's own validator rejects is a config error, caught at startup.
+        for i, ex in enumerate(annotate.examples, 1):
+            try:
+                violations = normalize_violations(output_hook(dict(ex.output), None),
+                                                  output.validator)
+            except Exception as e:  # hook bug — surface as config error, not exit 4
+                col.error(f"{fp}:[output].validator: few-shot 干跑第 {i} 条示例时"
+                          f"回调抛出异常：{type(e).__name__}: {e}")
+                break
+            if violations:
+                col.error(f"{fp}:[[annotate.examples]][{i}].output: 未通过 "
+                          f"output.validator 回调：{violations[0]}")
 
     # ── rule 16 — rubric resolution + validation ──────────────────────────
     selector = quality.rubric or ("default:ui" if modality == "ui" else "default:text")

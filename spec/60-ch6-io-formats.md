@@ -80,7 +80,7 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
   "schema_engine": {"resolved_at": {"l0_or_clean": 4141, "l1": 87, "l3_1": 30,
                      "l3_2": 3, "rejected": 9}},
   // v1.2 可选块："annotate": {"sc_disagreements": 0}（self-consistency 启用时）；
-  //             "generate": {"buckets": {"default×concise": {"calls", "produced", "survived_dedup"}}}（generate 启用时）
+  //             "generate": {"buckets": {"default×concise": {"calls", "produced", "survived_dedup"[, "rejected_by_validator" — v1.5，仅配置 generate.sample_validator 时]}}}（generate 启用时）
   "trace": {"enabled": true, "path": "./out/ui-labels-0701.trace.jsonl",
              "events": 18342, "dropped_events": 0},
   "llm_usage": {"default": {"calls": 31240, "prompt_tokens": 8.1e7,

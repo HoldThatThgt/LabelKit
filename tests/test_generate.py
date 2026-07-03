@@ -346,3 +346,43 @@ def test_select_seeds_empty_when_nothing_scored():
     cfg = mk_cfg()
     batch = [mk_item("id1", "t1", None), mk_item("id2", "t2", 0.9, status="failed")]
     assert select_seeds(batch, cfg) == []
+
+
+def test_postprocess_sample_validator_filters_and_counts():
+    from dataclasses import replace
+    cfg = mk_cfg()
+    cfg = replace(cfg, generate=replace(
+        cfg.generate, sample_validator="tests.hook_samples:sample_min10"))
+    metrics = Recorder()
+    plans = [_plan(0, "a", "s1")]
+    results = [["太短", "这一条样本足够长可以通过回调校验器的长度要求"]]
+    records = postprocess_samples(plans, results, [], cfg, metrics)
+    assert len(records) == 1                                   # 短样本被回调剔除
+    assert metrics.counters["generate.buckets.a×s1.rejected_by_validator"] == 1
+    assert metrics.counters["generate.buckets.a×s1.produced"] == 2
+    assert metrics.counters["generate.buckets.a×s1.survived_dedup"] == 1
+
+
+def test_postprocess_sample_validator_zero_touch_and_exception(caplog):
+    import logging
+    from dataclasses import replace
+    cfg = mk_cfg()
+    cfg = replace(cfg, generate=replace(
+        cfg.generate, sample_validator="tests.hook_samples:boom"))
+    metrics = Recorder()
+    plans = [_plan(0, "a", None)]
+    results = [["这一条样本足够长但回调会爆炸把它当违规剔除"]]
+    with caplog.at_level(logging.WARNING, logger="labelkit"):
+        records = postprocess_samples(plans, results, [], cfg, metrics)
+    assert records == []                                        # 异常 ⇒ 按违规剔除
+    assert metrics.counters["generate.buckets.a×null.rejected_by_validator"] == 1
+    assert sum("sample_validator 回调抛出异常" in r.message for r in caplog.records) == 1
+
+
+def test_postprocess_without_validator_has_no_bucket_field():
+    cfg = mk_cfg()
+    metrics = Recorder()
+    records = postprocess_samples([_plan(0, "a", None)],
+                                  [["这一条样本足够长可以通过所有过滤器"]], [], cfg, metrics)
+    assert len(records) == 1
+    assert not any("rejected_by_validator" in k for k in metrics.counters)

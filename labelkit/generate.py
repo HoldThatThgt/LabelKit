@@ -278,14 +278,41 @@ def postprocess_samples(plans: Sequence[CallPlan],
                             num_perm=d.minhash_num_perm, ngram=d.ngram)
     for text in seed_texts:
         filt.add(text)
+    # v1.5 plan A (spec 3.6.2): optional per-sample user hook, applied BEFORE
+    # the similarity filter. Filter semantics: a violating sample is dropped
+    # (no retry, no failed record), counted per bucket.
+    sample_hook = None
+    hook_ref = cfg.generate.sample_validator
+    if hook_ref:
+        from labelkit.hooks import resolve_hook
+        sample_hook = resolve_hook(hook_ref)
+    hook_error_warned = False
     records: list[Record] = []
     for plan, samples in zip(plans, results):
         key = bucket_key(plan.llm, plan.style_name)
         metrics.count(f"generate.buckets.{key}.calls")
+        if sample_hook is not None:
+            metrics.count(f"generate.buckets.{key}.rejected_by_validator", 0)
         if samples is None:
             continue
         metrics.count(f"generate.buckets.{key}.produced", len(samples))
         for sample in samples:
+            if sample_hook is not None:
+                from labelkit.hooks import normalize_violations
+                try:
+                    violations = normalize_violations(sample_hook(sample), hook_ref)
+                except Exception as exc:  # hook bug: drop the sample, never the run
+                    if not hook_error_warned:
+                        hook_error_warned = True
+                        logging.getLogger("labelkit.generate").warning(
+                            "generate.sample_validator 回调抛出异常，命中样本按违规剔除"
+                            "（本条提示仅打印一次）：%s: %s",
+                            type(exc).__name__, exc,
+                            extra={"stage": "generate", "batch": 0})
+                    violations = ["callback raised"]
+                if violations:
+                    metrics.count(f"generate.buckets.{key}.rejected_by_validator")
+                    continue
             if not filt.probe_and_add(sample):
                 continue
             rec = make_generated_record(sample, cfg.input.text_field,

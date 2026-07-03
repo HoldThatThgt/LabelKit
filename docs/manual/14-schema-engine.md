@@ -27,9 +27,10 @@
 | **L0** | 供应商原生结构化输出 | 请求时就把 Schema 塞给 API，让模型「戴着镣铐生成」 | 零（一个请求参数） |
 | **L1** | 确定性修复 | 纯代码修文本：剥围栏 → 取花括号平衡子串 → `json_repair` 修尾逗号/单引号/截断 | 零 |
 | **L2** | jsonschema 校验 | `Draft 2020-12` 全量校验，收集**全部**违规（不是只报第一条） | 零 |
+| **L2.5** | 代码回调校验（可选） | 你注册的 Python 函数对已过 Schema 的对象做**业务级硬校验**（跨字段、外部词表、坐标合法性……），违规意见与 Schema 违规同路进修复环 | 零（跑你的代码） |
 | **L3** | 有界 LLM 修复环 | 把原始输出 + 违规清单发回给模型：「只输出修正后的 JSON」 | 每轮一次调用 |
 
-流转规则：L0 只是让 L1/L3 少触发的优化——**它不豁免 L2**（各家供应商的 Schema 特性覆盖都有缺口，校验永远执行）。L1 修完过 L2；不过就进 L3；L3 每轮修复的输出重走 L1→L2；`output.max_repair_attempts`（默认 2）轮耗尽仍不过 ⇒ 该记录 `failed`（错误码 `schema_violation`）进拒绝通道。
+流转规则：L0 只是让 L1/L3 少触发的优化——**它不豁免 L2**（各家供应商的 Schema 特性覆盖都有缺口，校验永远执行）。L1 修完过 L2；L2 通过后若注册了回调再过 L2.5（见 14.5）；不过就进 L3；L3 每轮修复的输出重走 L1→L2→L2.5；`output.max_repair_attempts`（默认 2）轮耗尽仍不过 ⇒ 该记录 `failed`（错误码 `schema_violation`，若剩余违规全部来自回调则为 `callback_violation`）进拒绝通道。
 
 ## 14.2 一次真实的抢救过程
 
@@ -93,20 +94,57 @@
 
 **⑦ 版本纪律。**Schema 必须是合法 draft 2020-12、顶层 object、不声明 `_meta`。启动时元校验，写错退出码 2，不会浪费一次调用。
 
-## 14.5 配置参考
+## 14.5 代码回调校验（L2.5）：把你的业务规则接进防线
+
+JSON Schema 说不清的约束——跨字段关系（`bounds` 必须 l<r、t<b）、外部一致性（label 必须在动态词表里）、业务规则（日期真实存在）——可以注册一个 **Python 回调**来把关：
+
+```toml
+[output]
+validator = "my_validators:check_annotation"   # "module:function"，importlib 加载
+```
+
+```python
+# my_validators.py —— 放在 PYTHONPATH 可达的位置
+def check_annotation(obj: dict, record: dict | None) -> list[str]:
+    """返回违规描述列表，空列表 = 通过。
+    obj    = 已通过 Schema 校验的标注对象（防御性副本，改了不影响流水线）；
+    record = 该记录的原始行对象（文本/生成记录），UI 记录为 None。"""
+    problems = []
+    if obj["difficulty"] == "hard" and len(obj["topic"]) < 4:
+        problems.append("hard 难度的 topic 不应如此空泛，请给出具体主题")
+    if record is not None and obj["topic"] == record.get("instruction"):
+        problems.append("topic 不得整句复述原文，请压缩为名词短语")
+    return problems
+```
+
+工作机制的关键在于：**回调不只是门卫，还是修复环的教练**。它返回的违规文本会以 `(validator) 你的消息` 的形式并入 L3 修复提示词的违规清单——LLM 拿着你的意见自我修正，所以违规消息要写成「给模型看的改进指示」（说清楚错在哪、该怎么改），而不是只给人看的错误码。
+
+规则速览：
+
+- 只作用于**用户 Schema 的标注调用**（quality/verify/generate 的内部结构不经过它）；
+- 与 Schema 违规**共享** `max_repair_attempts` 预算；预算耗尽且剩余违规全部来自回调 ⇒ 记录 `failed`、错误码 `callback_violation`（第 18 章）；
+- **启动即体检**：M1 校验引用格式、可导入、可调用，并把每条 few-shot 示例的 output 干跑一遍——示例过不了你自己的回调，是配置错误（退出码 2），不会浪费一次调用；
+- **回调抛异常不吞**：该记录按 `internal_error` 失败，运行继续（记录级隔离）；
+- 回调以运行者同权限执行任意代码——信任边界与你亲手写的配置文件一致；建议保持纯函数（幂等、无 IO 副作用），它会被每条记录、每轮修复调用；
+- 回调模块须位于**可导入路径**——LabelKit 不会隐式把工程目录塞进 `sys.path`。最省事的做法：把 `my_validators.py` 放在工程目录并在运行前 `export PYTHONPATH=.`（或做成已安装的包）。
+
+生成侧有一个孪生钩子 `generate.sample_validator`（签名 `fn(text) -> list[str]`），语义是**过滤器**而非修复环：违规样本直接剔除、计入桶统计，详见第 12 章。
+
+## 14.6 配置参考
 
 ```toml
 [output]
 schema_path = "./schema.json"     # 与 schema_inline 恰好二选一
 # schema_inline = """{...}"""
-max_repair_attempts = 2           # L3 轮数预算
+max_repair_attempts = 2           # L3 轮数预算（L2.5 回调违规同样消耗此预算）
 # repair_llm = "fixer"           # 省略此键 = 同调用方；可指定便宜小模型专职修 JSON
                                   # （注意：显式写空字符串会报配置错误，退出码 2）
+# validator = "mod:fn"           # 可选：L2.5 代码回调（见 14.5；同样禁止空字符串）
 ```
 
 `repair_llm` 的使用时机：主力模型很贵、而 `l3_*` 又降不下来时，把修复外包给小模型——修 JSON 不需要智力，需要的是服从。注意小模型也要能把你的 Schema 看明白，太复杂的 Schema 外包修复反而修不动。
 
-## 14.6 内部结构也走同一个引擎
+## 14.7 内部结构也走同一个引擎
 
 一个容易忽略的事实：不只你的标注 Schema，**LabelKit 自己的内部输出**——质量裁决 `{"judgments": [...]}`、pointwise 评分、评审结论 `{"critiques": [...], "verdict"}`、生成样本 `{"samples": [...]}`——全部经由同一个 `complete_validated()` 入口、同一套四层防线。所以：
 

@@ -126,6 +126,9 @@ class GenerateConfig:
     num_per_call: int = 4
     seed_min_score: float | None = None           # None = auto (quality.threshold, else batch median)
     temperature: float = 0.9
+    sample_validator: str | None = None           # v1.5 plan-A hook "module:function":
+                                                  # fn(text) -> list[str]，样本级过滤
+                                                  # （相似度过滤之前，spec 3.6.2）
     seed_examples: tuple[str, ...] = ()           # generate_only seed-pool form only
     standalone_count: int | None = None           # generate_only seedless form only; mutually
                                                   # exclusive with seed_examples
@@ -166,6 +169,9 @@ class OutputConfig:
     meta_mode: Literal["inline", "sidecar", "none"] = "inline"
     passthrough_fields: tuple[str, ...] = ()
     rejects: Literal["none", "refs", "full"] = "refs"
+    validator: str | None = None                  # v1.5 plan-A hook "module:function":
+                                                  # fn(obj, record|None) -> list[str]，
+                                                  # engine L2.5（仅用户 Schema，spec 3.8.2）
 
 
 @dataclass(frozen=True)

@@ -353,3 +353,61 @@ def test_vote_no_voted_fields_takes_first_sample_without_disagreement():
     assert not disagreed
     assert chosen == samples[0]
     assert matches == 3        # empty voted combination matches every sample
+
+
+# ── v1.5 plan A: SchemaViolation(callback_only) → kind=callback_violation ────
+
+def test_callback_violation_kind_mapping(tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+    from labelkit.errors import SchemaViolation
+    from labelkit.types import PipelineItem
+
+    cfg = make_cfg()
+
+    class RaisingEngine:
+        user_schema_text = "{}"
+        async def complete_validated(self, *a, **k):
+            raise SchemaViolation(["(validator) topic 太长"], "{}", callback_only=True)
+
+    class Metrics:
+        def __init__(self):
+            self.events = []
+        def event(self, ev, **kw):
+            self.events.append((ev, kw.get("payload") or {}))
+        def count(self, key, n=1):
+            pass
+
+    ctx = SimpleNamespace(cfg=cfg, schema_engine=RaisingEngine(), metrics=Metrics(),
+                          batch_no=1)
+    stage = AnnotateStage(cfg)
+    item = PipelineItem(record=text_record())
+    asyncio.run(stage._annotate_item(item, ctx))
+    assert item.status == "failed"
+    assert item.errors and item.errors[0].kind == "callback_violation"
+
+
+def test_schema_violation_kind_unchanged_without_flag(tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+    from labelkit.errors import SchemaViolation
+    from labelkit.types import PipelineItem
+
+    cfg = make_cfg()
+
+    class RaisingEngine:
+        user_schema_text = "{}"
+        async def complete_validated(self, *a, **k):
+            raise SchemaViolation(["/intent: 枚举违规"], "{}")
+
+    class Metrics:
+        def event(self, ev, **kw): pass
+        def count(self, key, n=1): pass
+
+    ctx = SimpleNamespace(cfg=cfg, schema_engine=RaisingEngine(), metrics=Metrics(),
+                          batch_no=1)
+    stage = AnnotateStage(cfg)
+    item = PipelineItem(record=text_record())
+    asyncio.run(stage._annotate_item(item, ctx))
+    assert item.status == "failed"
+    assert item.errors and item.errors[0].kind == "schema_violation"

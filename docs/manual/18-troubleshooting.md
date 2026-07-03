@@ -17,6 +17,7 @@
 | `image_decode_error` | dedup / annotate / verify | 图解码失败：dedup 跳过图像层按树判；标注/评审阶段遇到则该记录 failed |
 | `judgment_invalid` | quality | 单次裁决修复后仍非法 ⇒ 按平局计入 BT（不失败记录），计 `report.quality.judgment_failures`。率 >5% 见第 16 章诊断 |
 | `schema_violation` | schema 引擎 | L3 修复预算耗尽 ⇒ 记录 failed。批量出现 ⇒ 第 14 章（Schema 太难/输出被截断） |
+| `callback_violation` | schema 引擎 | L3 耗尽且剩余违规全部来自 `output.validator` 回调（14.5）⇒ 记录 failed。批量出现 ⇒ 回调规则模型学不会——把违规消息改写成更明确的改进指示，或放宽规则 |
 | `provider_retryable_exhausted` | llm-client | 重试 max_retries 次仍失败（网络/超时/429/5xx）⇒ 记录 failed。批量出现 ⇒ 端点在持续故障或限流 |
 | `provider_fatal` | llm-client | 不可重试错误（401/403/400/404）⇒ 记录立即 failed 并计入熔断窗口。批量出现 ⇒ 密钥/权限/模型名问题 |
 | `internal_error` | 任意 | 未预期异常（含输出前终检兜底）⇒ 记录 failed，堆栈在 debug 级日志。理论上不该出现，出现请留存日志报告 |

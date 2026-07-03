@@ -274,6 +274,25 @@ class SchemaEngine:
         self._cfg = cfg
         self._metrics = metrics
         self._stats = {"l0_or_clean": 0, "l1": 0, "l3_1": 0, "l3_2": 0, "rejected": 0}
+        # L2.5 (v1.5 plan A): the output.validator hook, resolved once. M1 has
+        # already validated the reference at startup; a late failure here is a
+        # deployment race and surfaces as the ValueError it is.
+        self._validator = None
+        self._validator_ref = getattr(cfg, "validator", None)
+        if self._validator_ref:
+            from labelkit.hooks import resolve_hook
+            self._validator = resolve_hook(self._validator_ref)
+
+    _CB_PREFIX = "(validator) "
+
+    def _callback_violations(self, obj: dict, record) -> list[str]:
+        """L2.5: run the user hook; violations rendered '(validator) <msg>'.
+        Hook exceptions propagate — the stage's record-level isolation turns
+        them into internal_error (spec 3.8.2)."""
+        from labelkit.hooks import normalize_violations
+        raw = self._validator(dict(obj), record)          # defensive copy
+        return [self._CB_PREFIX + v
+                for v in normalize_violations(raw, self._validator_ref)]
 
     @property
     def user_schema_text(self) -> str:
@@ -316,13 +335,18 @@ class SchemaEngine:
     async def complete_validated(self, profile: str, prompt: "PromptBundle",
                                  schema: dict | None = None, *,
                                  record_ids: tuple[str, ...] = (),
-                                 batch_no: int = 0) -> tuple[dict, Usage, int, str]:
-        """L0 -> L1 -> L2 -> L3 (spec 3.8.2). schema=None -> user schema (and the call
-        counts toward the resolved_at buckets). Returns (validated_obj, total_usage,
-        attempts, model) where attempts = 1 + L3 repair calls. Raises SchemaViolation
-        once the L3 budget is exhausted."""
+                                 batch_no: int = 0,
+                                 record: "Mapping | None" = None,
+                                 ) -> tuple[dict, Usage, int, str]:
+        """L0 -> L1 -> L2 [-> L2.5] -> L3 (spec 3.8.2). schema=None -> user schema (and
+        the call counts toward the resolved_at buckets; the output.validator hook, when
+        configured, runs as L2.5 with ``record`` = the raw input mapping). Returns
+        (validated_obj, total_usage, attempts, model) where attempts = 1 + L3 repair
+        calls. Raises SchemaViolation once the L3 budget is exhausted — with
+        callback_only=True when every remaining violation came from the hook."""
         is_user_schema = schema is None
         active = self._user_schema if schema is None else schema
+        use_hook = is_user_schema and self._validator is not None
 
         # L0: always hand the schema to the client; it applies vendor structured-output
         # mechanics only when the profile declares supports_structured_output.
@@ -334,6 +358,9 @@ class SchemaEngine:
         obj, l1_fixed, raw = _extract_object(response)
         if obj is not None:
             rendered, summaries = self._validate_full(obj, active)
+            if not rendered and use_hook:
+                cb = self._callback_violations(obj, record)     # L2.5
+                rendered, summaries = cb, list(cb)
             if not rendered:
                 bucket = _bucket_for(l1_fixed, 0)
                 lossy = l1_fixed and l1_repair_is_lossy(obj, raw)
@@ -366,6 +393,9 @@ class SchemaEngine:
             obj, _, raw = _extract_object(response)
             if obj is not None:
                 new_rendered, new_summaries = self._validate_full(obj, active)
+                if not new_rendered and use_hook:
+                    cb = self._callback_violations(obj, record)  # L2.5 (each round)
+                    new_rendered, new_summaries = cb, list(cb)
                 if not new_rendered:
                     bucket = _bucket_for(False, repair_round)
                     self._resolve(bucket, is_user_schema=is_user_schema,
@@ -378,4 +408,7 @@ class SchemaEngine:
 
         self._resolve("rejected", is_user_schema=is_user_schema,
                       record_ids=record_ids, batch_no=batch_no, violations=summaries)
-        raise SchemaViolation(rendered, raw)
+        raise SchemaViolation(
+            rendered, raw,
+            callback_only=bool(rendered) and all(
+                v.startswith(self._CB_PREFIX) for v in rendered))

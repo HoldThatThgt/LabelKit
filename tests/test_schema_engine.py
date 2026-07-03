@@ -410,3 +410,57 @@ def test_l1_lossy_not_flagged_for_ascii_escaped_json():
            "verdict": "pass"}
     raw = "```json\n" + _json.dumps(obj, ensure_ascii=True) + "\n```"
     assert l1_repair_is_lossy(obj, raw) is False
+
+
+# ── v1.5 plan A: L2.5 hook plumbing (pure paths; full loop → integration) ────
+
+class TestL25Hook:
+    def _engine(self, ref="tests.hook_samples:topic_max6"):
+        return make_engine(cfg=OutputConfig(validator=ref))
+
+    def test_hook_resolved_at_init_and_renders_prefix(self):
+        eng = self._engine()
+        out = eng._callback_violations({"topic": "这是一个很长很长的主题"}, None)
+        assert len(out) == 1 and out[0].startswith("(validator) ")
+
+    def test_hook_pass_returns_empty(self):
+        eng = self._engine()
+        assert eng._callback_violations({"topic": "请假条"}, None) == []
+
+    def test_hook_receives_record_context(self):
+        eng = self._engine("tests.hook_samples:needs_record")
+        obj = {"topic": "帮我写一条请假条"}
+        assert eng._callback_violations(obj, None) == ["(validator) record 缺失"]
+        assert eng._callback_violations(
+            obj, {"instruction": "帮我写一条请假条"}
+        ) == ["(validator) topic 不得整句复述原文"]
+        assert eng._callback_violations(obj, {"instruction": "其他原文"}) == []
+
+    def test_hook_gets_defensive_copy(self):
+        seen = {}
+
+        def spy(obj, record):
+            seen["obj"] = obj
+            obj["mutated"] = True
+            return []
+
+        eng = make_engine(cfg=OutputConfig(validator="tests.hook_samples:ok"))
+        eng._validator = spy                     # direct injection for the copy check
+        original = {"topic": "请假条"}
+        eng._callback_violations(original, None)
+        assert "mutated" not in original         # hook saw a copy, not the object
+
+    def test_hook_exception_propagates(self):
+        eng = self._engine("tests.hook_samples:boom")
+        import pytest as _pytest
+        with _pytest.raises(RuntimeError, match="hook exploded"):
+            eng._callback_violations({"topic": "x"}, None)
+
+    def test_hook_bad_return_raises_type_error(self):
+        eng = self._engine("tests.hook_samples:bad_return")
+        import pytest as _pytest
+        with _pytest.raises(TypeError, match="应返回 list"):
+            eng._callback_violations({"topic": "x"}, None)
+
+    def test_no_hook_configured_attribute_is_none(self):
+        assert make_engine()._validator is None
