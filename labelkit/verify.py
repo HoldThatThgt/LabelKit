@@ -239,12 +239,29 @@ class VerifyStage:
                     batch_no=ctx.batch_no,
                 )
                 for judge in judges
-            )
+            ),
+            return_exceptions=True,
         )
         merged: list[dict] = []
         fail_critiques: list[dict] = []
         verdicts: list[str] = []
-        for judge, (obj, _usage, _attempts, _model) in zip(judges, results):
+        for judge, result in zip(judges, results):
+            if isinstance(result, BaseException):
+                # 单个 judge 崩溃（SchemaViolation / ProviderError 等）→ 视为 fail，
+                # 记入 fail_critiques，不丢失其他 judge 的裁决（对标 quality.py:503-518）
+                if isinstance(result, (KeyboardInterrupt, asyncio.CancelledError,
+                                       CircuitBreakerTripped)):
+                    raise result
+                if not multi:
+                    raise result  # 单 judge：让 _verify_item 的 _classify_error 分类错误类型
+                verdicts.append("fail")
+                entry = {"aspect": "judge_error", "opinion": str(result)}
+                if multi:
+                    entry["judge"] = judge
+                merged.append(entry)
+                fail_critiques.append(entry)
+                continue
+            obj, _usage, _attempts, _model = result
             verdict = obj["verdict"]
             verdicts.append(verdict)
             entries = []

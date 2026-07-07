@@ -366,3 +366,119 @@ def test_verdict_event_excerpt_truncated_to_200_chars():
 def test_verdict_event_judge_field_for_panel():
     _, (_, _, _, _, payload) = _emit(content="refs", verdict="fail", judge="judge_a")
     assert payload["judge"] == "judge_a" and payload["verdict"] == "fail"
+
+
+# ── multi-judge gather exception safety (§7.6 / asyncio.gather bug) ──────────
+
+def test_multi_judge_schema_violation_preserves_majority():
+    """When one judge in a 3-judge panel raises SchemaViolation before returning,
+    the other two judges' majority verdict (pass) must be preserved — the gather
+    must NOT discard sibling verdicts when one judge fails."""
+    PASS_OBJ = {
+        "verdict": "pass",
+        "critiques": [{"aspect": "正确性", "opinion": "标注正确"}],
+    }
+    USAGE = Usage(10, 5)
+
+    cfg = ResolvedConfig(
+        tool=ToolConfig(),
+        llm_profiles={},
+        embedding_profiles={},
+        run=RunConfig(output="out.jsonl", modality="text", input="in"),
+        input=InputConfig(),
+        dedup=DedupConfig(),
+        quality=QualityConfig(),
+        generate=GenerateConfig(),
+        annotate=AnnotateConfig(enabled=True, llm="default", instruction="测试指令"),
+        verify=VerifyConfig(judges=("j1", "j2", "j3")),
+        output=OutputConfig(schema_inline=json.dumps(USER_SCHEMA)),
+        trace=TraceConfig(enabled=False),
+        rubric=Rubric(name="default:text", criteria=()),
+        user_schema=USER_SCHEMA,
+        limit=None, strict=False, dry_run=False,
+        config_path="config.toml", project_path="project.toml",
+        config_digest="sha256:0", project_digest="sha256:0",
+    )
+
+    stage = VerifyStage(cfg)
+    rec = _record(text="你好")
+    ann = _annotation()
+
+    call_idx = [0]  # mutable counter for closure
+    async def mock_complete_validated(judge, prompt, *, schema, record_ids,
+                                      batch_no):
+        idx = call_idx[0]
+        call_idx[0] += 1
+        if idx == 1:  # judge 2 (j2) raises SchemaViolation
+            raise SchemaViolation(["违反 schema 约束"], '{"raw": "bad"}')
+        return (PASS_OBJ, USAGE, 1, "mock-model")
+
+    class MockEngine:
+        pass
+    engine = MockEngine()
+    engine.complete_validated = mock_complete_validated
+
+    ctx = SimpleNamespace(
+        cfg=cfg,
+        schema_engine=engine,
+        batch_no=1,
+        metrics=_CapturingMetrics(),
+    )
+
+    verdict, merged, fail_critiques = asyncio.run(
+        stage._judge_round(rec, ann, 1, ctx)
+    )
+    assert verdict == "pass", f"Expected pass (majority 2/3), got {verdict}"
+    # j2's exception should appear as a fail critique with aspect="judge_error"
+    judge_errors = [c for c in fail_critiques if c.get("aspect") == "judge_error"]
+    assert len(judge_errors) >= 1, (
+        f"Expected at least one judge_error critique, got fail_critiques={fail_critiques}"
+    )
+
+
+def test_single_judge_schema_violation_propagates_to_classify():
+    """In single-judge mode, SchemaViolation (and other non-critical exceptions)
+    must be re-raised from _judge_round so that _verify_item's _classify_error
+    can map it to the correct ErrorKind (schema_violation, not judge_error)."""
+    cfg = ResolvedConfig(
+        tool=ToolConfig(),
+        llm_profiles={},
+        embedding_profiles={},
+        run=RunConfig(output="out.jsonl", modality="text", input="in"),
+        input=InputConfig(),
+        dedup=DedupConfig(),
+        quality=QualityConfig(),
+        generate=GenerateConfig(),
+        annotate=AnnotateConfig(enabled=True, llm="default", instruction="测试指令"),
+        verify=VerifyConfig(),  # no judges → single-judge mode
+        output=OutputConfig(schema_inline=json.dumps(USER_SCHEMA)),
+        trace=TraceConfig(enabled=False),
+        rubric=Rubric(name="default:text", criteria=()),
+        user_schema=USER_SCHEMA,
+        limit=None, strict=False, dry_run=False,
+        config_path="config.toml", project_path="project.toml",
+        config_digest="sha256:0", project_digest="sha256:0",
+    )
+
+    stage = VerifyStage(cfg)
+    rec = _record(text="你好")
+    ann = _annotation()
+
+    async def mock_complete_validated(judge, prompt, *, schema, record_ids,
+                                      batch_no):
+        raise SchemaViolation(["违反 schema 约束"], '{"raw": "bad"}')
+
+    class MockEngine:
+        pass
+    engine = MockEngine()
+    engine.complete_validated = mock_complete_validated
+
+    ctx = SimpleNamespace(
+        cfg=cfg,
+        schema_engine=engine,
+        batch_no=1,
+        metrics=_CapturingMetrics(),
+    )
+
+    with pytest.raises(SchemaViolation):
+        asyncio.run(stage._judge_round(rec, ann, 1, ctx))
