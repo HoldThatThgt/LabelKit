@@ -1,0 +1,95 @@
+# Classify E2E project (spec §3.13, v1.7): dedup → classify → per-class quality
+# (pointwise) → per-class annotate. Demonstrates the class table with a fallback
+# class, per-class quality thresholds and per-class annotation instructions.
+schema_version = 1
+
+[run]
+input = "./data/input.jsonl"
+output = "./out/classify-labels.jsonl"
+modality = "text"
+batch_size = 16
+seed = 42
+
+[input]
+text_field = "instruction"
+
+[dedup]
+enabled = true
+
+[classify]
+enabled = true
+llm = "default"
+assignment = "single"          # 锁定一条一类；multi 变体见手册第 24 章
+fallback_class = "other"
+
+[[classify.classes]]
+name = "writing"
+description = "写作协助类请求：代写、改写、模板、文案等需要模型产出一段文本的请求"
+examples = ["帮我写一条请假条，明天上午要去医院"]
+
+[[classify.classes]]
+name = "qa"
+description = "知识问答与解释类请求：询问事实、原理或要求讲解概念"
+
+[[classify.classes]]
+name = "other"
+description = "不属于以上任何一类的请求"
+
+[quality]
+enabled = true
+mode = "pointwise"
+llm = "default"
+threshold = 0.3
+rubric = "default:text"
+
+# ── 按类覆盖：未出现的键一律继承全局 ──
+[class.writing.quality]
+threshold = 0.2                # 写作类门槛放宽
+
+[class.qa.quality]
+threshold = 0.4                # 问答类门槛收严
+
+[class.writing.annotate]
+instruction = """
+你是写作协助类请求的意图标注员。这条请求已被判定为写作协助类：
+标注 intent（通常为 writing_assist）、主题（要写什么）与写作难度。
+"""
+
+[class.qa.annotate]
+instruction = """
+你是知识问答类请求的意图标注员。这条请求已被判定为知识问答类：
+标注 intent（通常为 qa）、主题（问的是什么知识点）与回答难度。
+"""
+
+[annotate]
+enabled = true
+llm = "default"
+instruction = """
+你是输入法用户请求的标注员。标注该请求的意图类别
+（writing_assist 写作协助 / qa 问答 / translation 翻译 / chitchat 闲聊 / other 其他）、
+主题（简短名词短语）与完成该请求的难度（easy / medium / hard）。
+"""
+
+[trace]
+enabled = true
+channels = ["classify", "quality"]
+content = "refs"
+
+[output]
+meta_mode = "inline"
+rejects = "refs"
+passthrough_fields = ["source"]
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "intent": {"type": "string",
+      "enum": ["writing_assist", "qa", "translation", "chitchat", "other"]},
+    "topic": {"type": "string"},
+    "difficulty": {"type": "string", "enum": ["easy", "medium", "hard"]}
+  },
+  "required": ["intent", "topic", "difficulty"],
+  "additionalProperties": false
+}
+"""
