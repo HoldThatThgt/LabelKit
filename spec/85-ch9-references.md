@@ -71,3 +71,11 @@
 - [35] Ben Allal, L., Lozhkov, A., van Strien, D. Cosmopedia: how to create large-scale synthetic data for pre-training Large Language Models. Hugging Face Blog（工业），2024-03-20。huggingface.co/blog/cosmopedia；数据集 huggingface.co/datasets/HuggingFaceTB/cosmopedia
 
 - [36] Shumailov, I., Shumaylov, Z., Zhao, Y., Papernot, N., Anderson, R., Gal, Y. AI models collapse when trained on recursively generated data. Nature 631 (8022), 755–759, 2024. DOI: 10.1038/s41586-024-07566-y.（2025 年有一则 Author Correction，不影响主结论）
+
+- [37] Su, D. et al. Nemotron-CC: Transforming Common Crawl into a Refined Long-Horizon Pretraining Dataset. arXiv:2412.02595.（质量分类 → 分档路由不同合成管线，产品化于 NeMo Curator [40]）
+
+- [38] Lu, K. et al. #InsTag: Instruction Tagging for Analyzing Supervised Fine-tuning of Large Language Models. ICLR 2024. arXiv:2308.07074.（LLM 指令语义打标 + 据标签驱动数据决策）
+
+- [39] Lambert, N. et al. Tülu 3: Pushing Frontiers in Open Language Model Post-Training. arXiv:2411.15124.（按核心技能分治的数据构造与 per-skill 合成管线）
+
+- [40] NVIDIA. NeMo Curator: Distributed Data Classification（Domain / Quality / Multilingual 分类器作为管线阶段，记录级标签字段驱动路由）。工业文档。docs.nvidia.com/nemo/curator（2026-07-07 访问；工具链主引用见 [9]，此处为分类能力面）

@@ -33,6 +33,10 @@ class Stage(Protocol):
 
     async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]:
         """契约：① 只处理 status=='active' 的项；② 不删除列表元素（只改 status）；
+           ②a classify 例外（仅 assignment="multi"）——可向传入列表尾部追加派生信封；
+           追加物视同批内普通元素、同受 ①③④ 约束；不得删除、重排或替换任何既有元素对象
+           （既有元素的 status / classification / errors 字段写入属 ①④ 的正常行为）；
+           返回值仍须是传入的同一列表对象（调用方依赖列表身份）；
            ③ generate 例外——返回新增子批（原批元素不修改）；④ 单条失败不得抛出到批层面，
            必须落入 item.errors 并置 status='failed'。"""
         ...

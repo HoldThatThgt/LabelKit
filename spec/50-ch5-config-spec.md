@@ -103,6 +103,16 @@ dims = 1024                         # 可选：返回向量维度校验
 | `dedup.semantic` | bool | false | v1.2 新增：可选第④级语义去重开关（3.3.3；SemDeDup [26]）。默认关——零 embedding 依赖，默认行为与 v1.0 一致（8.3 O1）。 |
 | `dedup.semantic_embedding` | str | 必填† | † `dedup.semantic = true` 时必填：引用 config.toml `[embedding.<name>]` profile（5.1）；存在性与密钥配置（`api_key_env` / `api_key_envs` 恰其一且逐项非空，v1.6）由 M1 校验（3.1.4）。 |
 | `dedup.semantic_threshold` | float | 0.95 | 余弦相似度判重阈值（SemDeDup 论文的高相似区间 [26]；3.3.3 第④级）。 |
+| `classify.enabled` | bool | false | v1.7 新增：分类算子开关（3.13）。默认关——工具行为与 v1.6 完全一致（`_meta.classification: null` 除外，6.3）。 |
+| `classify.llm` | str | "default" | profile 引用；UI 模态须 supports_vision（M1 校验）；计入密钥解析 / vision 校验 / `--probe` 三处 profile 引用集（3.1.4 分类行）。 |
+| `classify.assignment` | str | "single" | "single"（锁定一条一类）\| "multi"（允许多类命中并按标签扇出，3.13.4）。 |
+| `classify.max_labels` | int | 类别数 | 仅 multi 可设；∈ [2, 类别数]；缺省由 M1 解析后回填为类别数（扇出成本上界旋钮）。 |
+| `classify.instruction` | str | "" | 可选补充说明，追加进 system 类别表之后（3.13.3 模板）。 |
+| `classify.fallback_class` | str | 必填† | † enabled 时必填且 ∈ classes（3.13.4 失败与兜底行；LLM 亦可主动选择它）。 |
+| `classify.self_consistency` | int | 0 | 0 或 ≥3 的奇数（M1 校验）；sc 投票语义见 3.13.4（single 多数票 / multi 逐标签投票，无过半归兜底类）。 |
+| `classify.sc_temperature` | float | 0.7 | sc 各次采样的 temperature，仅 `self_consistency ≥ 3` 生效（与 `annotate.sc_temperature` 同机制）。 |
+| `classify.on_error` | str | "fallback" | "fallback"（结构修复耗尽归兜底类，记录存活）\| "fail"（记录 failed → rejects）（3.13.4）。 |
+| `[[classify.classes]]` | array | 必填† | † enabled 时 ≥ 2 项。每项：`name`（`[a-z0-9_]+`，表内唯一）、`description`（非空）、`examples`（字符串数组，可选，仅输入侧，3.13.3）。 |
 | `quality.enabled` | bool | true | — |
 | `quality.mode` | str | "pairwise" | "pairwise" \| "pointwise"（1.6 对齐决策）。 |
 | `quality.llm` | str | "default" | profile 引用。 |
@@ -149,8 +159,20 @@ dims = 1024                         # 可选：返回向量维度校验
 | `output.rejects` | str | "refs" | "none" \| "refs" \| "full"（3.11.2）。 |
 | `trace.enabled` | bool | false | 启用 trace 追踪日志（第 7 章）。 |
 | `trace.path` | str | 自动 | 默认 `{output_stem}.trace.jsonl`，与主输出同目录。 |
-| `trace.channels` | array | ["quality","verify","schema"] | 可选值 ingest \| dedup \| quality \| annotate \| verify \| schema \| llm（7.2 事件目录）；run.*/batch.* 生命周期事件不受此过滤。 |
+| `trace.channels` | array | ["quality","verify","schema"] | 可选值 ingest \| dedup \| classify（v1.7 增）\| quality \| annotate \| verify \| schema \| llm（八个，7.2 事件目录）；默认值不变——分类事件须用户显式加 "classify" 才写；run.*/batch.* 生命周期事件不受此过滤。 |
 | `trace.content` | str | "refs" | "none" \| "refs" \| "excerpt" \| "full" 内容脱敏四档（7.4）。 |
+
+**`[class.<name>.<section>]` 按类覆盖（v1.7）。**classify 启用时可按类覆盖下游算子参数：`<name>` 必须 ∈ classes；未出现的键一律继承全局节（不配任何覆盖即纯打标模式）。可覆盖键白名单（M1 强校验，白名单外的键报 `CONFIG_ERROR`——3.1.4「未知键报 warning」行的显式例外；白名单后续只增）：
+
+| 节 | 可覆盖键 | 不可覆盖（保持全局）及理由 |
+|---|---|---|
+| `[class.*.quality]` | mode, rounds, rubric（含 `[class.*.rubric]` 内联子表，结构同 5.3）, threshold, selection, top_ratio | llm / judges / both_orders / criteria_per_call / on_unscored——LLM 绑定属部署与成本面，类差异先用 rubric 表达（1.6 v1.7 对齐决策 ④） |
+| `[class.*.annotate]` | instruction, examples | llm / self_consistency / sc_temperature |
+| `[class.*.generate]` | instruction, styles, num_per_record, temperature | llms / mixture / weights / seeds_per_call / num_per_call / sample_validator |
+| `[class.*.verify]` | extra_criteria | llm / judges / policy / max_repair_rounds |
+| —— | —— | run.* / input.* / dedup.* / classify.* / output.*（含 schema 与 validator——输出 Schema 全局唯一）/ trace.* 全部不可按类 |
+
+合并优先级：`[class.<name>].<sect>.<key>` > project.toml `[<sect>].<key>` > 内置默认——这是 project.toml **内部**的条件化合并，不改变「CLI > project.toml > config.toml」三源优先级（2.5）。M1 启动时按逐键 provenance 静态合并、冻结为 `class_views`，运行期零查找成本；选择组互斥对剔除、per-class rubric 重解析、类 examples 干跑等精确语义见 3.1.4 按类覆盖合并行。
 
 ```
 # ─── project.toml 完整示例（UI 模态标注工程）───

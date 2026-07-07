@@ -57,6 +57,7 @@
 | （v1.1 评审补充）日志系统：行为记录/格式/打分思考支撑 rubric 优化与质量分析 | M12（3.12）；第 7 章；`[trace]` 配置 5.2 |
 | （v1.2 评审补充）算子对输出集的影响分析；定量优选；多模型/多品味生成；算子算法增强 | 2.3.2；3.4.3 选择机制；3.6.2；8.4 演进路线总表 |
 | （v1.4 评审补充）无输入数据场景下直接生成数据（纯生成模式） | `run.mode`（5.2）；3.6.2 种子来源分支；3.10.3 纯生成行；2.3.1 组合④ |
+| （v1.7 评审补充）分类与按类条件化路由：加入分类算子，根据分类执行不同的打分、标注与生成；多类命中可流向多个管线（单/多分类开关锁定） | M13 分类（3.13）；按类条件化 3.4.3 / 3.5.2 / 3.6.2 / 3.7.2；multi 扇出 3.13.4 与契约 ②a（4.3）；`[classify]` / `[class.*]` 配置 5.2 |
 
 ## 1.5 算法与工程背书总表
 
@@ -81,6 +82,10 @@
 | 评审驱动的 rubric 迭代 | trace 记录逐次 pairwise 裁决与理由 → 人工审阅与指标诊断 → 修订准则 → 小样本重跑对比（7.5 闭环） | EvalGen 的 criteria drift 结论, UIST 2024, arXiv:2404.12272 [30]；CritiQ 从偏好挖掘质量准则, ACL 2025, arXiv:2502.19279 [31] |
 | 纯生成模式（无输入合成） | 配置种子池自举（单遍）/ 无种子 instruction×style 条件化 + 显式量目标 | Self-Instruct 以 175 条人工种子自举 [18]（种子池形态）；Persona Hub [34]、Cosmopedia [35]（无种子条件化形态） |
 | 评审鲁棒性增强 | 多评审团多数票（奇数个异构评审 per-criterion 投票）+ 双顺序裁决（正反两序一致才记胜） | PoLL（Verga et al., 2024）, arXiv:2404.18796 [32]；LLM-as-a-Judge 位置偏差分析, Zheng et al., NeurIPS 2023 [20] |
+| 数据分类（可选，v1.7） | LLM 封闭集分类：类别表词表经内部 Schema enum 硬校验 + 可选 self-consistency 投票 + 兜底类 | Autolabel classification / multilabel 任务的 labels 词表校验（工业）[12]；InsTag LLM 指令语义打标, ICLR 2024 [38]；NeMo Curator 分类器管线阶段（工业）[40]；Self-Consistency [33] |
+| 按类条件化路由（v1.7） | 分类结果落记录级属性（`item.classification` / `_meta.classification`），下游算子按类取有效配置，管线拓扑不变 | Nemotron-CC 质量分档路由不同合成管线, arXiv:2412.02595 [37]；NeMo Curator `bucketed_results` 标签字段路由（工业）[40]；Dolma tagger→attributes→mixer 解耦 [6] |
+| 按类数据构造（v1.7） | 按类种子池 + 按类生成指令/风格（`[class.<name>.generate]`），配按类 rubric 与标注指令 | Tülu 3 按核心技能分治的数据构造与 per-skill 合成, arXiv:2411.15124 [39]；Nemotron-CC 每档不同改写 prompt [37]；类内配套沿用 Persona Hub [34] / Cosmopedia [35] |
+| 多标签扇出（可选，v1.7） | `classify.assignment = "multi"`：命中 k 类扇出 k 个单标签兄弟信封，各自独立走按类管线并各产出一行 | InsTag 指令多意图的多标签打标形态 [38]；distilabel 路由函数的一批多下游并行产出（`sample_n_steps`）[5]；Autolabel multilabel 的「标签集合 ⊆ 词表」输出契约 [12] |
 
 ## 1.6 已对齐的设计决策
 
@@ -99,3 +104,4 @@
 | 模块拆分与重编号（v1.3 对齐，2026-07-02） | 保持 M5 复合模块 / 拆分且编号稳定（生成 = M12）/ 拆分且按流水线位置全量重编号 | 拆分且全量重编号：标注与生成职责正交（基数保持的增列 vs 基数增加的合成），按 2.2 模块边界准则应各自独立；生成独立为 M6（3.6），原 M6–M11 顺移为 M7–M12。配置键、数据结构与 API 零变更，属纯文档结构调整。 |
 | 纯生成模式（v1.4 对齐，2026-07-02） | 支持两种形态 / 仅种子池 / 演进路线 / 明确非目标 | 支持，两种形态进规格：配置种子池 `seed_examples`（Self-Instruct 形态 [18]）与无种子条件化 + `standalone_count`（Persona Hub / Cosmopedia 形态 [34][35]），单遍执行不引入 O6 循环；工具定位由「数据加工器」扩展为「亦可从零起步的数据生产器」（1.1、2.1 同步修订）。 |
 | 多 API Key 负载均衡（v1.6 对齐，2026-07-03） | ① 范围：仅同 profile 多 key / 端点镜像池；② 熔断中止时 .part 交付与否；③ 全池冷却驻留超限的处置：直接硬熔断 / 记录失败累积；④ 配额型 403 的归类：密钥禁用 / 冷却 / 错误体嗅探；⑤ 报表中密钥身份：环境变量名 / 位置别名 | ① 仅**同 profile 多 key、单 endpoint**（密钥池，3.9.3）——端点镜像池明确排除：同模型不同部署在 temperature=0 下仍有数值漂移，会翻转 pairwise 裁决与语义去重边界判定、污染 7.5 同种子翻转率指标（决策溯源见 8.3 O7）；② 熔断中止**交付**已完成批（熔断交付，3.10.3、3.11.2、6.4）；③ 驻留超限（`run.max_park_s`，默认 3600s）按重试耗尽**记录失败并计入熔断窗口**，不直接硬熔断；④ 配额以 403 形态出现按认证禁用该密钥处理，不做 provider 特定的错误体嗅探；⑤ 报表 / trace 以**环境变量名**标识密钥（密钥值任何情况不落盘，7.4）。 |
+| 分类算子与按类条件化（v1.7 对齐，2026-07-07） | ① 模块编号：追加 M13 / 按流水线位置全量重编号；② fallback 语义：普通类成员且必填 / 隐式 `_unclassified` 特殊类；③ generate_only 按类配比：本版做 / 单独立项；④ 白名单是否放开 per-class `quality.llm` / `annotate.llm`；⑤ 纯打标模式：显式开关 / 零覆盖自然退化；⑥ 多标签中间档（仅打标不扇出）：本版加 / 留扩展位；⑦ dry-run multi 估算口径：乘数 1 下界 / `max_labels` 上界；⑧ `enabled=false` 而类配置在场：CONFIG_ERROR / warning；⑨ 手册新章编号：追加制 / 链序插入全书重排 | ① **追加 M13**（3.13，纯新增零重排成本，v1.3 重编号先例限于模块拆分）；② `classify.fallback_class` 为**普通类成员、enabled 时必填**（可配 per-class 参数，5.2）；③ **不做** generate_only 按类配比——generate_only 用全局指令、产物回流被分类后按类打分/标注（3.6.2），按类量目标与 8.3 O6 一并立项；④ v1 **不放开**（LLM 绑定属部署与成本面，白名单后续只增，5.2）；⑤ **不加开关**——不配任何 `[class.*]` 覆盖即自然退化为纯打标；⑥ **暂不加**，`assignment` 枚举留扩展位（8.4 演进候选）；⑦ 按标签**乘数 1 报下界** + stderr 注明（诚实不虚高，3.10.3 估算行）；⑧ **warning**（一次、点名被忽略的表——偏离提案的 CONFIG_ERROR，对齐 top_ratio 未生效等 no-op 键分级惯例，3.1.4）；⑨ **追加制** `docs/manual/24-classify.md`。另记评审改判三则：内部 Schema **不写 uniqueItems**（OpenAI strict 模式与部分约束解码网关硬拒该关键字，重复标签由 classify 代码在 M8 验证后确定性归一化，3.13.3）；fallback 留痕**不写 `item.errors`**（rejects 归因取 `errors[0]`，写入会在记录后续失败时污染归因——改放 `Classification.detail` + error 事件 + 计数器，3.13.4）；防呆分级由提案的 CONFIG_ERROR 改 **warning**（即 ⑧）。 |

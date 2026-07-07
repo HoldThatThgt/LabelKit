@@ -12,6 +12,7 @@ import pytest
 
 from labelkit.config.model import (
     AnnotateConfig,
+    ClassifyConfig,
     Criterion,
     DedupConfig,
     GenerateConfig,
@@ -129,6 +130,7 @@ def _full_trace_cfg(tmp_path, profile: LLMProfile) -> ResolvedConfig:
                       input=str(tmp_path), fatal_error_threshold=3),
         input=InputConfig(),
         dedup=DedupConfig(),
+        classify=ClassifyConfig(),
         quality=QualityConfig(),
         generate=GenerateConfig(),
         annotate=AnnotateConfig(),
@@ -138,6 +140,7 @@ def _full_trace_cfg(tmp_path, profile: LLMProfile) -> ResolvedConfig:
                           channels=("llm",), content="full"),
         rubric=Rubric(name="t", criteria=(
             Criterion(key="clarity", description="d", pairwise_prompt="p"),)),
+        class_views={},
         user_schema={"type": "object"},
         limit=None,
         strict=False,

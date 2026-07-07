@@ -20,6 +20,7 @@ import pytest
 from labelkit.annotate import AnnotateStage
 from labelkit.config.model import (
     AnnotateConfig,
+    ClassifyConfig,
     DedupConfig,
     GenerateConfig,
     InputConfig,
@@ -75,6 +76,7 @@ def make_cfg(trace: TraceConfig | None = None) -> ResolvedConfig:
         run=RunConfig(output="out.jsonl", modality="text", input="in"),
         input=InputConfig(),
         dedup=DedupConfig(),
+        classify=ClassifyConfig(),
         quality=QualityConfig(),
         generate=GenerateConfig(),
         annotate=AnnotateConfig(
@@ -87,6 +89,7 @@ def make_cfg(trace: TraceConfig | None = None) -> ResolvedConfig:
         output=OutputConfig(schema_inline=json.dumps(USER_SCHEMA)),
         trace=trace or TraceConfig(),
         rubric=Rubric(name="default:text", criteria=()),
+        class_views={},
         user_schema=USER_SCHEMA,
         limit=None,
         strict=False,

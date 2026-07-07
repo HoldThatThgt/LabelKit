@@ -13,6 +13,7 @@ from labelkit.annotate import (
 )
 from labelkit.config.model import (
     AnnotateConfig,
+    ClassifyConfig,
     DedupConfig,
     FewShotExample,
     GenerateConfig,
@@ -53,6 +54,7 @@ def make_cfg(*, modality="text", instruction="你是意图标注员。", example
         run=RunConfig(output="out.jsonl", modality=modality, input="in"),
         input=InputConfig(ui_tree_max_chars=ui_tree_max_chars),
         dedup=DedupConfig(),
+        classify=ClassifyConfig(),
         quality=QualityConfig(),
         generate=GenerateConfig(),
         annotate=AnnotateConfig(enabled=True, llm="default", instruction=instruction,
@@ -62,6 +64,7 @@ def make_cfg(*, modality="text", instruction="你是意图标注员。", example
         output=OutputConfig(schema_inline=json.dumps(user_schema)),
         trace=trace or TraceConfig(),
         rubric=Rubric(name="default:text", criteria=()),
+        class_views={},
         user_schema=user_schema,
         limit=None,
         strict=False,

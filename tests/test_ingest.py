@@ -8,6 +8,7 @@ import pytest
 
 from labelkit.config.model import (
     AnnotateConfig,
+    ClassifyConfig,
     DedupConfig,
     GenerateConfig,
     InputConfig,
@@ -37,6 +38,7 @@ def make_cfg(tmp_path: Path, modality: str = "text", **input_kw) -> ResolvedConf
                       input=str(tmp_path / "in")),
         input=InputConfig(**input_kw),
         dedup=DedupConfig(),
+        classify=ClassifyConfig(),
         quality=QualityConfig(),
         generate=GenerateConfig(),
         annotate=AnnotateConfig(),
@@ -44,6 +46,7 @@ def make_cfg(tmp_path: Path, modality: str = "text", **input_kw) -> ResolvedConf
         output=OutputConfig(schema_inline="{}"),
         trace=TraceConfig(),
         rubric=Rubric(name="t", criteria=()),
+        class_views={},
         user_schema={"type": "object"},
         limit=None,
         strict=False,

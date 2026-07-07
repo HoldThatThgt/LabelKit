@@ -243,6 +243,26 @@ def samples_schema(num_per_call: int) -> dict:
             "required": ["samples"], "additionalProperties": False}
 
 
+def classification_schema(class_names: list[str], assignment: str,
+                          max_labels: int, with_reason: bool) -> dict:
+    # v1.7 R1: deliberately NO uniqueItems (OpenAI strict mode rejects it; L0 passes the
+    # schema through unconditionally) — duplicate labels are deterministically de-duplicated
+    # by classify-side normalization AFTER M8 validation.
+    if assignment == "single":
+        props: dict = {"class": {"type": "string", "enum": list(class_names)}}
+        required = ["class"]
+    else:
+        props = {"classes": {"type": "array",
+                             "items": {"type": "string", "enum": list(class_names)},
+                             "minItems": 1, "maxItems": max_labels}}
+        required = ["classes"]
+    if with_reason:
+        props["reason"] = {"type": "string"}
+        required += ["reason"]
+    return {"type": "object", "properties": props,
+            "required": required, "additionalProperties": False}
+
+
 # ── The engine ───────────────────────────────────────────────────────────────
 
 def _extract_object(response: Any) -> tuple[dict | None, bool, str]:

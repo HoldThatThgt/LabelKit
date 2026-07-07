@@ -17,6 +17,7 @@ import pytest
 from labelkit import cli
 from labelkit.config.model import (
     AnnotateConfig,
+    ClassifyConfig,
     Criterion,
     DedupConfig,
     EmbeddingProfile,
@@ -183,6 +184,7 @@ def _cfg(**kw) -> ResolvedConfig:
         run=RunConfig(output="out.jsonl", modality="text", input="in.jsonl"),
         input=InputConfig(),
         dedup=DedupConfig(),
+        classify=ClassifyConfig(),
         quality=QualityConfig(),
         generate=GenerateConfig(),
         annotate=AnnotateConfig(instruction="标注"),
@@ -191,6 +193,7 @@ def _cfg(**kw) -> ResolvedConfig:
         trace=TraceConfig(),
         rubric=Rubric(name="r", criteria=(
             Criterion(key="c1", description="d", pairwise_prompt="p"),)),
+        class_views={},
         user_schema={"type": "object"},
         limit=None, strict=False, dry_run=False,
         config_path="config.toml", project_path="project.toml",

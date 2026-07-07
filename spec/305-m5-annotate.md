@@ -23,6 +23,8 @@ user (当前记录):
 
 UI 树序列化格式（`UITree.serialize()`，4.3 节）：深度缩进的每节点一行 `<role> "text" [l,t,r,b] {关键属性}`，只保留可见节点与非空属性，超出 `ui_tree_max_chars` 时按深度优先截断并追加 `…(truncated N nodes)` 标记。此「图 + 线性化结构文本」双通道输入是 ScreenAI 的 screen-schema 表示 [13] 与 GUI 智能体输入惯例 [16][17]。
 
+**按类取值（v1.7）。**classify 启用且记录带类标签时，本节模板的 `{annotate.instruction}` 与 few-shot `examples` 取该类有效配置（`class_views[label].annotate`，3.1.4 按类覆盖合并行）——模板结构不变，仅取值来源变化。为此 `build_annotate_prompt` 与 `annotate_record` 各增末位可选形参 `label: str | None = None`（默认 None = 现行为，旧调用点零改动）；stage 层传 `item.classification.label if item.classification else None`。trace `annotate.done` 事件 payload 增 `label` 字段（仅 classify 启用时携带，7.2 只增不改）。
+
 **标注鲁棒性：self-consistency（可选，v1.2）。**`annotate.self_consistency = n`（默认 0 = 关；启用须 n ≥ 3 且为奇数，5.2）时，M5 对每条记录按本节模板独立采样 n 次（temperature 统一取 `annotate.sc_temperature`，默认 0.7——采样多样性的来源），每次输出都各自经 M8 走完整结构保证后才参与投票。**字段级投票**：enum / boolean / integer 字段逐字段取 n 个样本中的众数；自由文本 / 数组字段不逐字投票，取「与众数字段组合一致的样本」中第一个的对应字段值。其余类型字段（number、嵌套 object 等）与自由文本/数组同法处理（不逐字段投票，随众数字段组合整体取值）。全体分歧（众数组合不存在或无样本与其完全一致）时整体采用第一个样本，并计入 `report.annotate.sc_disagreements`。某次采样经 M8 修复仍失败（SchemaViolation）⇒ 该样本弃权、由其余合法样本投票（agreement_ratio 分母仍为 n）；n 次全部失败才置 `status="failed"`。`_meta.annotation.attempts` 记 n 次采样 attempts 之和。`_meta.annotation` 增 `sc = {n, agreement_ratio}`（agreement_ratio = 与最终众数字段组合完全一致的样本数 / n；6.3 只增字段）；trace `annotate.done` 事件 payload 增同构 `sc` 字段（7.2「只增不改」契约内扩展）。该机制对分类型 Schema 收益最大——如统一示例的 `intent` / `difficulty` 枚举字段：多路径采样 + 多数投票显著优于单次贪心解码（Self-Consistency，Wang et al., ICLR 2023 [33]，GSM9K +17.9%）。成本：标注调用与 token ×n。
 
 ### 3.5.3 API 与错误处理

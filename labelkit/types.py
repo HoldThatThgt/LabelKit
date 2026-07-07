@@ -145,6 +145,15 @@ class Record:
 
 
 @dataclass(frozen=True)
+class Classification:                      # v1.7: M13 classify verdict (spec 3.13, §4.1)
+    label: str                             # routing label of THIS envelope
+    labels: tuple[str, ...]                # the record's full hit set (declaration order;
+                                           # single assignment: always one element)
+    source: Literal["llm", "fallback", "inherited"]
+    detail: Mapping                        # reason / sc stats / fallback trace (kind, message)
+
+
+@dataclass(frozen=True)
 class DedupInfo:
     kind: Literal["unique", "exact", "near_text", "near_image", "near_both", "near_semantic"]
     cluster_key: str                       # exact-dedup key ([:16] hex) of the cluster head;
@@ -209,6 +218,7 @@ class StageError:
 class PipelineItem:                        # the ONLY mutable envelope; lifetime = one batch
     record: Record
     status: Status = "active"
+    classification: Classification | None = None   # v1.7: written by M13 classify (or inherited)
     dedup: DedupInfo | None = None
     scores: dict[str, QualityScore] = field(default_factory=dict)
     annotation: Annotation | None = None

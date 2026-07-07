@@ -11,9 +11,9 @@ from jsonschema import Draft202012Validator
 
 from labelkit import TOOL_VERSION
 from labelkit.config.model import (
-    AnnotateConfig, Criterion, DedupConfig, GenerateConfig, InputConfig,
-    OutputConfig, QualityConfig, ResolvedConfig, Rubric, RunConfig, ToolConfig,
-    TraceConfig, VerifyConfig,
+    AnnotateConfig, ClassifyConfig, Criterion, DedupConfig, GenerateConfig,
+    InputConfig, OutputConfig, QualityConfig, ResolvedConfig, Rubric, RunConfig,
+    ToolConfig, TraceConfig, VerifyConfig,
 )
 from labelkit.emitter import EmitResult, Emitter
 from labelkit.errors import LabelKitError
@@ -70,6 +70,7 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
         run=RunConfig(output=output, modality=modality, seed=7),
         input=InputConfig(),
         dedup=DedupConfig(),
+        classify=ClassifyConfig(),
         quality=QualityConfig(
             selection=selection,
             threshold=0.3 if selection == "threshold" else None,
@@ -90,6 +91,7 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
             name="my_inline_rubric",
             criteria=(Criterion(key="clarity", description="d", pairwise_prompt="p"),),
         ),
+        class_views={},
         user_schema=USER_SCHEMA,
         limit=None,
         strict=False,

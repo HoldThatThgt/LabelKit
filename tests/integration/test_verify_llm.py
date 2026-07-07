@@ -25,6 +25,7 @@ import pytest
 
 from labelkit.config.model import (
     AnnotateConfig,
+    ClassifyConfig,
     Criterion,
     DedupConfig,
     GenerateConfig,
@@ -200,6 +201,7 @@ def _cfg(trace: TraceConfig | None = None) -> ResolvedConfig:
         run=RunConfig(output="out.jsonl", modality="text", input="in"),
         input=InputConfig(),
         dedup=DedupConfig(),
+        classify=ClassifyConfig(),
         quality=QualityConfig(),
         generate=GenerateConfig(),
         annotate=AnnotateConfig(enabled=True, llm="judge", instruction=_INSTRUCTION),
@@ -208,6 +210,7 @@ def _cfg(trace: TraceConfig | None = None) -> ResolvedConfig:
         trace=trace or TraceConfig(),
         rubric=Rubric(name="t", criteria=(Criterion(key="c", description="d",
                                                     pairwise_prompt="p"),)),
+        class_views={},
         user_schema=_USER_SCHEMA,
         limit=None, strict=False, dry_run=False,
         config_path="config.toml", project_path="project.toml",

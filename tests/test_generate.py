@@ -7,6 +7,7 @@ import pytest
 
 from labelkit.config.model import (
     AnnotateConfig,
+    ClassifyConfig,
     DedupConfig,
     GenerateConfig,
     GenerateStyle,
@@ -64,6 +65,7 @@ def mk_cfg(generate: GenerateConfig | None = None, quality: QualityConfig | None
         run=RunConfig(output="out.jsonl", modality="text", mode=mode),
         input=InputConfig(),
         dedup=dedup or DedupConfig(),
+        classify=ClassifyConfig(),
         quality=quality or QualityConfig(),
         generate=generate or GenerateConfig(enabled=True, instruction="gen"),
         annotate=AnnotateConfig(),
@@ -71,6 +73,7 @@ def mk_cfg(generate: GenerateConfig | None = None, quality: QualityConfig | None
         output=OutputConfig(schema_inline="{}"),
         trace=TraceConfig(),
         rubric=Rubric(name="r", criteria=()),
+        class_views={},
         user_schema={"type": "object"},
         limit=limit,
         strict=False,

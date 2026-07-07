@@ -16,32 +16,33 @@
 
 ## 7.2 事件目录
 
-通道归属规则：**事件名前缀即通道名**（`ingest. / dedup. / quality. / annotate. / verify. / schema. / llm.`，对应 `trace.channels` 的七个可选值）；`run.*` 与 `batch.*` 生命周期事件由 M10 发出、`stage="run"`、`record_ids` 为空，**不受 channels 过滤**（`trace.enabled=true` 即写）；`error` 事件按产生它的 stage 归属通道。本目录为稳定契约：`trace_schema_version = 1`，后续版本**只增不改**（可新增事件与 payload 字段，不改既有字段语义）。
+通道归属规则：**事件名前缀即通道名**（`ingest. / dedup. / classify.（v1.7）/ quality. / annotate. / verify. / schema. / llm.`，对应 `trace.channels` 的八个可选值——v1.7 增 `"classify"`，默认值不变，5.2）；`run.*` 与 `batch.*` 生命周期事件由 M10 发出、`stage="run"`、`record_ids` 为空，**不受 channels 过滤**（`trace.enabled=true` 即写）；`error` 事件按产生它的 stage 归属通道。本目录为稳定契约：`trace_schema_version = 1`，后续版本**只增不改**（可新增事件与 payload 字段，不改既有字段语义）。
 
 | 事件名 | 通道 / stderr 级别 | 触发点 | payload 字段 |
 |---|---|---|---|
 | `run.start` | 恒写 / info | M1 校验通过、首批开始前；trace 文件首行 header 事件。 | `tool_version`、`config_digest`、`project_digest`（同 6.4 run 节）、`trace_schema_version`（=1，仅此事件携带，避免逐行冗余）。 |
 | `run.end` | 恒写 / info | finalize 完成后（trace 末行）。 | `counts`（与 report.json counts 同构的摘要对象）、`exit_code`。 |
 | `batch.start` | 恒写 / debug | 批构造完成（PipelineItem[] 就绪）。 | `size`。 |
-| `batch.end` | 恒写 / info | 批 emit 并释放中间态后。 | `active`、`dropped_dup`、`dropped_lowq`、`dropped_verify`、`failed`、`duration_ms`。 |
+| `batch.end` | 恒写 / info | 批 emit 并释放中间态后。 | `active`、`dropped_dup`、`dropped_lowq`、`dropped_verify`、`failed`、`duration_ms`；v1.7 增可选字段 `fanout`（仅 classify 启用时携带；`batch.start.size` 语义 = 批入口信封数即扇出前基数，扇出后各状态计数和 = size + fanout，3.10.3 分类与扇出行）。 |
 | `ingest.bad_line` | ingest / warn | M2 坏行跳过（3.2.5）。 | `file`、`line_no`、`reason`。 |
 | `ingest.missing_pair` | ingest / warn | M2 缺对跳过（3.2.4）。 | `index`、`present`（"tree"\|"image"，实际存在的一侧）、`file`。 |
 | `ingest.index_conflict` | ingest / warn（fail 策略时 error） | M2 index 冲突（3.2.4）。 | `index`、`files`（冲突文件路径列表）。 |
 | `dedup.duplicate` | dedup / — | M3 判重时；`record_ids` = [被判重记录 id]。 | `kind`、`cluster_key`、`kept_id`（同 DedupInfo，4.2）、`jaccard`（near_text：实测估计值）或 `hamming`（near_image：实测距离）或 `cosine`（near_semantic：实测余弦相似度，v1.2 增）；精确重复三者皆无。 |
-| `quality.judgment` | quality / — | M4 每次 pairwise 裁决经 M8 校验通过后；`record_ids` = [记录甲, 记录乙]（采样顺序）。rubric 优化的核心事件。 | `order`（{"A": id, "B": id}，随机化后的呈现顺序）、`model`、`judgments`[]{`criterion`, `winner`("A"\|"B"\|"tie"), `reason`†}；v1.2 增可选字段 `judge`（= 评审 profile 名，仅 `quality.judges` 非空时携带，3.4.3）。 |
+| `classify.decision` | classify / —（trace-only，无 stderr 镜像，同 quality.judgment；v1.7） | M13 每记录分类定案后（3.13.4）；`record_ids` = [记录 id]。 | `label`（本信封路由标签）、`labels`（multi 时携带命中全集）、`source`（"llm"\|"fallback"\|"inherited"）、`reason`†、`sc`（= {n, agreement_ratio}，仅 `classify.self_consistency` 启用时携带）。 |
+| `quality.judgment` | quality / — | M4 每次 pairwise 裁决经 M8 校验通过后；`record_ids` = [记录甲, 记录乙]（采样顺序）。rubric 优化的核心事件。 | `order`（{"A": id, "B": id}，随机化后的呈现顺序）、`model`、`judgments`[]{`criterion`, `winner`("A"\|"B"\|"tie"), `reason`†}；v1.2 增可选字段 `judge`（= 评审 profile 名，仅 `quality.judges` 非空时携带，3.4.3）；v1.7 增可选字段 `pool`（= 类名，仅 classify 启用时携带，3.4.3 按类分池行）。 |
 | `quality.pointwise` | quality / — | M4 pointwise 每记录每 criterion 打分后。 | `criterion`、`score`（0–5 原始分）、`reason`。 |
-| `quality.bt_fit` | quality / — | M4 每批每 criterion BT 拟合结束（批级，record_ids 为空）。 | `criterion`、`iterations`、`converged`、`comparisons`（参与拟合的比较数）。 |
-| `quality.gate` | quality / — | M4 质量门判定（配置了 `quality.threshold`，或 `quality.selection = "top_ratio"` 时，3.4.3）。 | `aggregate`、`decision`（"keep"\|"drop"）、`threshold`（threshold 选择时）；v1.2 增可选字段 `selection`、`top_ratio`、`rank`（top_ratio 选择时携带，payload 只增不改）。 |
-| `annotate.done` | annotate / — | M5 标注经 M8 通过后。 | `attempts`（同 Annotation.attempts，4.2）；v1.2 增可选字段 `sc` = {n, agreement_ratio}（self-consistency 启用时，3.5.2）。 |
-| `verify.verdict` | verify / — | M7 每轮评审后（round 从 1 计，repair 策略下每轮一事件）。 | `verdict`、`round`、`critiques`[]{`aspect`, `opinion`}；v1.2 增可选字段 `judge`（`verify.judges` 非空时每 judge 一事件，3.7.2）。 |
+| `quality.bt_fit` | quality / — | M4 每批每 criterion BT 拟合结束（批级，record_ids 为空）。 | `criterion`、`iterations`、`converged`、`comparisons`（参与拟合的比较数）；v1.7 增可选字段 `pool`（= 类名，仅 classify 启用时携带——分池后拟合可归因，3.4.3 按类分池行）。 |
+| `quality.gate` | quality / — | M4 质量门判定（配置了 `quality.threshold`，或 `quality.selection = "top_ratio"` 时，3.4.3）。 | `aggregate`、`decision`（"keep"\|"drop"）、`threshold`（threshold 选择时）；v1.2 增可选字段 `selection`、`top_ratio`、`rank`（top_ratio 选择时携带，payload 只增不改）；v1.7 增可选字段 `pool`（= 类名，仅 classify 启用时携带，3.4.3 按类分池行）。 |
+| `annotate.done` | annotate / — | M5 标注经 M8 通过后。 | `attempts`（同 Annotation.attempts，4.2）；v1.2 增可选字段 `sc` = {n, agreement_ratio}（self-consistency 启用时，3.5.2）；v1.7 增可选字段 `label`（= 信封路由标签，仅 classify 启用时携带，3.5.2 按类取值段）。 |
+| `verify.verdict` | verify / — | M7 每轮评审后（round 从 1 计，repair 策略下每轮一事件）。 | `verdict`、`round`、`critiques`[]{`aspect`, `opinion`}；v1.2 增可选字段 `judge`（`verify.judges` 非空时每 judge 一事件，3.7.2）；v1.7 增可选字段 `label`（仅 classify 启用时携带，3.7.2 按类取值段）。 |
 | `schema.repair` | schema / — | M8 任何非 clean 路径出结果时（L1 修复命中 / L3 各轮 / 拒绝）。 | `resolved_at`（"l1"\|"l3_1"\|"l3_2"\|"rejected"，同 6.4 命名）、`violations`（JSON Pointer 路径 + 违反的 Schema 关键字摘要，不含数据值）；违规清单中来自 `output.validator` 回调的条目以 `(validator) ` 前缀标识（v1.5，3.8.2 L2.5）；v1.5 增可选字段 `l1_lossy`（=true，仅当 L1 修复疑似截断内容——json-repair 对未转义内引号的截断故障启发式，命中时另发 stderr warn，payload 只增不改）。 |
 | `llm.call` | llm / debug（stderr 摘要行恒有） | M9 每次调用返回后（含失败）。不含提示词与响应内容（full 档例外，7.4）。 | `profile`、`gen_ai.request.model`、`latency_ms`、`gen_ai.usage.input_tokens`、`gen_ai.usage.output_tokens`、`retries`、`status`（"ok"\|"retryable_exhausted"\|"fatal"\|"breaker_aborted"——v1.5 只增：重试退避途中熔断打开、该逻辑调用被中止时发出，retries 携带已消耗次数）；v1.2 增可选字段 `operation`（="embedding"，仅 M9 `embed()` 调用携带，缺省即对话补全；payload 只增不改）；v1.6 增可选字段 `key_env`（= 本次逻辑调用**最后一次尝试**所用密钥的环境变量名，成功失败同义；零尝试即终止的调用——如入口即驻留超限/breaker_aborted——不携带；仅密钥池 >1 的 profile 携带；payload 只增不改）。 |
 | `llm.key_cooldown` | llm / — | v1.6：M9 密钥进入 429 冷却时（每次冷却一事件，3.9.3 密钥池行）。任意池大小（含 1）均发出——单密钥 429 的等待在 v1.6 亦经冷却/驻留路径。 | `profile`、`key_env`、`cooldown_s`（本次冷却秒数）、`retry_after`（bool，冷却时长是否来自 `Retry-After` 头）。 |
 | `llm.key_disabled` | llm / warn | v1.6：M9 密钥 401/403 认证禁用时（每密钥每运行至多一次；任意池大小含 1——单密钥场景该事件先于立即熔断发出）。 | `profile`、`key_env`、`status_code`。 |
 | `llm.pool_parked` | llm / warn | v1.6：M9 某 profile 全部存活密钥均在冷却、调用开始驻留时（每次驻留一事件；任意池大小含 1）。 | `profile`、`wait_s`（预计驻留秒数）、`live_keys`（存活密钥数）。 |
-| `error` | 随产生 stage 的通道 / warn（记录级）· error（运行级） | StageError 构造时。 | `stage`、`kind`（取值见 7.6）、`message`、`retryable`——即 StageError 全字段（4.2）。 |
+| `error` | 随产生 stage 的通道 / warn（记录级）· error（运行级） | StageError 构造时。 | `stage`、`kind`（取值见 7.6）、`message`、`retryable`——即 StageError 全字段（4.2）；v1.7 增可选字段 `label`（仅 classify 启用时携带——multi 扇出下消歧同 id 兄弟信封，3.13.4）。 |
 
-† `reason` 仅当 `quality.judgment_reasons` 生效时存在（5.2）。全部自由文本字段（reason / critiques / violations 文本）受 7.4 脱敏档位控制。密钥相关事件（v1.6）只携环境变量**名**——密钥值在任何档位、任何通道均不落日志（7.4 规则不变）。
+† `reason` 仅当 `quality.judgment_reasons` 生效时存在（5.2）；`classify.decision` 的 `reason` 条件独立（v1.7）= `trace.enabled = true` 且 `trace.channels` 含 `"classify"`（零额外 token 原则，3.13.4 调用与校验行）。全部自由文本字段（reason / critiques / violations 文本）受 7.4 脱敏档位控制。密钥相关事件（v1.6）只携环境变量**名**——密钥值在任何档位、任何通道均不落日志（7.4 规则不变）。
 
 ## 7.3 记录格式规范
 
@@ -110,6 +111,7 @@ jq -s '[.[] | select(.ev=="quality.judgment") | .payload.judgments[]
 |---|---|---|
 | `bad_input_line` / `missing_pair` / `index_conflict` / `image_too_large` | 记录级 | M2；按 input.* 策略 skip（计数）或 fail（退出码 3）。 |
 | `image_decode_error` | 记录级 | M3 跳过 pHash 层；M5/M7 遇到时该记录 failed。 |
+| `classification_invalid` | 记录级 | v1.7：M13 分类输出经 M8 修复耗尽——`classify.on_error="fallback"`（默认）时归兜底类并留痕于 `Classification.detail`（不入 rejects，记录存活）；`"fail"` 时记录 failed → rejects（3.13.4 失败与兜底行）。 |
 | `judgment_invalid` | 比较级 | M4；按 tie 计入 BT（3.4.3）。 |
 | `schema_violation` | 记录级 | M8 L3 耗尽；记录 failed → rejects。 |
 | `callback_violation` | 记录级 | v1.5：M8 L3 耗尽且剩余违规全部来自 `output.validator` 回调（3.8.2 L2.5）；记录 failed → rejects。 |

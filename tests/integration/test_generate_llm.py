@@ -172,10 +172,11 @@ SEEDS = ("帮我写一条请假条，明天上午要去医院", "写一份周报
 
 
 def _mk_cfg():
-    from labelkit.config.model import (AnnotateConfig, DedupConfig, GenerateConfig,
-                                       InputConfig, OutputConfig, QualityConfig,
-                                       ResolvedConfig, Rubric, RunConfig, ToolConfig,
-                                       TraceConfig, VerifyConfig)
+    from labelkit.config.model import (AnnotateConfig, ClassifyConfig, DedupConfig,
+                                       GenerateConfig, InputConfig, OutputConfig,
+                                       QualityConfig, ResolvedConfig, Rubric,
+                                       RunConfig, ToolConfig, TraceConfig,
+                                       VerifyConfig)
     generate = GenerateConfig(
         enabled=True,
         llms=("glm",),
@@ -190,10 +191,12 @@ def _mk_cfg():
         tool=ToolConfig(), llm_profiles={}, embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="text", mode="generate_only", seed=0),
         input=InputConfig(text_field="instruction"),
-        dedup=DedupConfig(), quality=QualityConfig(), generate=generate,
+        dedup=DedupConfig(), classify=ClassifyConfig(),
+        quality=QualityConfig(), generate=generate,
         annotate=AnnotateConfig(), verify=VerifyConfig(),
         output=OutputConfig(schema_inline="{}"), trace=TraceConfig(),
-        rubric=Rubric(name="r", criteria=()), user_schema={"type": "object"},
+        rubric=Rubric(name="r", criteria=()), class_views={},
+        user_schema={"type": "object"},
         limit=None, strict=False, dry_run=False,
         config_path="config.toml", project_path="project.toml",
         config_digest="sha256:0", project_digest="sha256:0",

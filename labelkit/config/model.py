@@ -105,6 +105,27 @@ class DedupConfig:
 
 
 @dataclass(frozen=True)
+class ClassSpec:
+    name: str                                     # [a-z0-9_]+, unique within the table
+    description: str                              # non-empty
+    examples: tuple[str, ...] = ()                # optional input-side few-shot lines
+
+
+@dataclass(frozen=True)
+class ClassifyConfig:
+    enabled: bool = False                         # off = v1.6 behavior (spec 5.2 v1.7)
+    llm: str = "default"                          # UI modality requires supports_vision
+    assignment: Literal["single", "multi"] = "single"
+    max_labels: int | None = None                 # multi only; M1 backfills to len(classes)
+    instruction: str = ""                         # appended after the class table in system
+    fallback_class: str = ""                      # required iff enabled; must be in classes
+    self_consistency: int = 0                     # 0 = off; else odd, >= 3
+    sc_temperature: float = 0.7                   # only effective when sc >= 3 (R21)
+    on_error: Literal["fallback", "fail"] = "fallback"
+    classes: tuple[ClassSpec, ...] = ()           # >= 2 entries required iff enabled
+
+
+@dataclass(frozen=True)
 class QualityConfig:
     enabled: bool = True
     mode: Literal["pairwise", "pointwise"] = "pairwise"
@@ -194,7 +215,8 @@ class TraceConfig:
     enabled: bool = False
     path: str = ""                                # M1 resolves "" → "{output_stem}.trace.jsonl"
     channels: tuple[str, ...] = ("quality", "verify", "schema")
-                                                  # allowed: ingest|dedup|quality|annotate|verify|schema|llm
+                                                  # allowed: ingest|dedup|classify|quality|
+                                                  # annotate|verify|schema|llm
     content: Literal["none", "refs", "excerpt", "full"] = "refs"
 
 
@@ -213,6 +235,21 @@ class Criterion:
 class Rubric:
     name: str
     criteria: tuple[Criterion, ...]
+
+
+@dataclass(frozen=True)
+class ClassView:
+    """v1.7: one class's effective configuration — the global sections merged
+    with its [class.<name>.*] overrides (per-key provenance; R6 selection-group
+    semantics; R7 rubric re-resolution). Frozen by M1 at load time; when
+    classify is disabled, ResolvedConfig.class_views == {}."""
+    name: str
+    quality: QualityConfig                        # selection group merged (R6); the rubric
+                                                  # field holds the class's effective selector
+    rubric: Rubric                                # re-resolved product (R7)
+    annotate: AnnotateConfig
+    generate: GenerateConfig
+    verify: VerifyConfig
 
 
 # ── CLI overrides and the aggregate ────────────────────────────────────────
@@ -235,6 +272,7 @@ class ResolvedConfig:
     run: RunConfig
     input: InputConfig
     dedup: DedupConfig
+    classify: ClassifyConfig                      # v1.7; max_labels backfilled by M1
     quality: QualityConfig
     generate: GenerateConfig
     annotate: AnnotateConfig
@@ -242,6 +280,8 @@ class ResolvedConfig:
     output: OutputConfig
     trace: TraceConfig
     rubric: Rubric                                # resolved (default pkg or inline)
+    class_views: Mapping[str, ClassView]          # v1.7: key = class name; {} unless
+                                                  # classify.enabled (R23: still no defaults)
     user_schema: Mapping                          # parsed dict, meta-schema pre-validated
     limit: int | None                             # CLI --limit
     strict: bool

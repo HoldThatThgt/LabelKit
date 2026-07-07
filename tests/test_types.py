@@ -1,5 +1,5 @@
 """Unit tests for labelkit/types.py (contract §3: UITree.serialize, ImageRef.load_base64,
-PipelineItem defaults, frozen-ness)."""
+PipelineItem defaults, Classification (v1.7), frozen-ness)."""
 from __future__ import annotations
 
 import base64
@@ -11,6 +11,7 @@ import pytest
 from PIL import Image
 
 from labelkit.types import (
+    Classification,
     ImageRef,
     PipelineItem,
     Record,
@@ -186,6 +187,7 @@ class TestPipelineItem:
     def test_defaults(self):
         item = PipelineItem(record=_record())
         assert item.status == "active"
+        assert item.classification is None
         assert item.dedup is None
         assert item.scores == {}
         assert item.annotation is None
@@ -197,12 +199,33 @@ class TestPipelineItem:
         b = PipelineItem(record=_record("b" * 16))
         a.scores["__aggregate__"] = object()  # type: ignore[assignment]
         a.errors.append(object())             # type: ignore[arg-type]
+        a.classification = Classification(label="faq", labels=("faq",),
+                                          source="llm", detail={})
         assert b.scores == {} and b.errors == []
+        assert b.classification is None       # v1.7: new field not shared either
 
     def test_item_is_mutable(self):
         item = PipelineItem(record=_record())
         item.status = "dropped_dup"
         assert item.status == "dropped_dup"
+
+
+class TestClassification:
+    def test_is_frozen(self):
+        c = Classification(label="faq", labels=("faq",), source="llm", detail={})
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            c.label = "other"  # type: ignore[misc]
+
+    def test_all_four_fields_required_no_defaults(self):
+        # Spec §4.1 shape: label / labels / source / detail, none defaulted.
+        with pytest.raises(TypeError):
+            Classification(label="faq", labels=("faq",), source="llm")  # type: ignore[call-arg]
+
+    def test_field_values_round_trip(self):
+        c = Classification(label="faq", labels=("faq", "chitchat"), source="inherited",
+                           detail={"reason": "既问且聊"})
+        assert (c.label, c.labels, c.source, c.detail) == (
+            "faq", ("faq", "chitchat"), "inherited", {"reason": "既问且聊"})
 
 
 class TestFrozen:

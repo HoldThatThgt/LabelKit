@@ -10,8 +10,8 @@
 | 通道 | 规格 |
 |---|---|
 | 主输出 | 运行期写 `{output}.part`，每批 flush；finalize 时 fsync + 原子 rename 为目标名。行格式见 6.3。仅 `status="active"` 且（annotate 启用时）标注成功的记录写入。v1.6：熔断中止（退出码 4）的 finalize 同样执行交付（3.10.3 熔断交付）——已交付文件中每一行恒完整合法，运行是否完整处理了全部输入以 report.run 判定（interrupted=false 且 circuit_broken=false，3.11.3 ④）。 |
-| rejects | `output.rejects = "none" \| "refs"（默认）\| "full"`。refs：每行仅 `{"_meta": {id, source, stage, reason, errors}}`——不含数据内容（source 亦不含 `passthrough_fields`，其值属数据内容），贴合不存储原则；full：额外含记录内容与最后一版非法输出（调试用，用户显式选择）。文件名 `{output_stem}.rejects.jsonl`。 |
-| report.json | `{output_stem}.report.json`。结构见 6.4：运行参数摘要（脱敏，无 key）、各阶段计数、分数分布直方图、去重簇统计、结构引擎各层命中、token/成本、耗时、失败分类计数。 |
+| rejects | `output.rejects = "none" \| "refs"（默认）\| "full"`。refs：每行仅 `{"_meta": {id, source, stage, reason, errors}}`——不含数据内容（source 亦不含 `passthrough_fields`，其值属数据内容），贴合不存储原则；full：额外含记录内容与最后一版非法输出（调试用，用户显式选择）。文件名 `{output_stem}.rejects.jsonl`。v1.7：classify 启用时 `_meta` 增 `label` 键（= 该信封路由标签；multi 扇出下同 `id` 的兄弟信封由此消歧，行唯一键 (`_meta.id`, label)，6.3），refs / full 两档均携带。 |
+| report.json | `{output_stem}.report.json`。结构见 6.4：运行参数摘要（脱敏，无 key）、各阶段计数、分数分布直方图、去重簇统计、结构引擎各层命中、token/成本、耗时、失败分类计数。v1.7：classify 启用时增 `classify` 节（assignment / 逐类分布 / fallback_count / failures，multi 另含 multi_label_records）与 `quality.by_class` 按池视图，multi 时 counts 增 `fanout`（6.4）。 |
 
 **背书：**「主数据 + 拒绝通道 + 统计报告」三分法是 NeMo Curator / Dolma 管线产物的通行组织 [6][9]；原子改名交付为数据工程防半截文件的标准手法。
 
@@ -60,6 +60,8 @@
   ]
 }}
 ```
+
+v1.7：classify 启用的工程中该 `_meta` 另含 `"label"` 键（3.11.2 rejects 行）；本例工程未启用 classify，无此键。
 
 #### ③ 运行结束 stderr 摘要（逐字样例）
 

@@ -23,6 +23,7 @@ from jsonschema import Draft202012Validator
 
 from labelkit.config.model import (
     AnnotateConfig,
+    ClassifyConfig,
     Criterion,
     DedupConfig,
     GenerateConfig,
@@ -175,6 +176,7 @@ def make_cfg(quality: QualityConfig) -> ResolvedConfig:
         run=RunConfig(output="out.jsonl", modality="text", seed=7),
         input=InputConfig(),
         dedup=DedupConfig(),
+        classify=ClassifyConfig(),
         quality=quality,
         generate=GenerateConfig(),
         annotate=AnnotateConfig(instruction="x"),
@@ -182,6 +184,7 @@ def make_cfg(quality: QualityConfig) -> ResolvedConfig:
         output=OutputConfig(schema_inline="{}"),
         trace=TraceConfig(),
         rubric=Rubric(name="itest-rubric", criteria=(EDU,)),
+        class_views={},
         user_schema={"type": "object"},
         limit=None,
         strict=False,

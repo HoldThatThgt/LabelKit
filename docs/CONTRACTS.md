@@ -1,8 +1,8 @@
 # LabelKit — Cross-Module Interface Contract (CONTRACTS.md)
 
 **Status: FROZEN.** This document is the single interface contract for parallel implementation of
-M1–M12 + CLI by independent engineers. It is derived from the design spec v1.4 base with the
-inline v1.5/v1.6 revisions (`spec/*.md`), which
+M1–M13 + CLI by independent engineers. It is derived from the design spec v1.4 base with the
+inline v1.5/v1.6/v1.7 revisions (`spec/*.md`), which
 remains the authority for *algorithms and behavior*; this document is the authority for *names,
 signatures, types, defaults, file formats, and prompt text*. Where the spec left a signature or
 format implicit, the decision is frozen here and tagged **[FROZEN HERE]** (all such decisions are
@@ -19,7 +19,7 @@ Ground rules for every implementer:
   `config/model.py` imports nothing from `labelkit` except `types` if needed; `llm_client.py`
   imports `types`, `errors`, `config.model`, `obslog`; `schema_engine.py` imports `llm_client`,
   `errors`, `obslog`; `stage.py` imports the above under `typing.TYPE_CHECKING` only; operator
-  modules (`ingest/dedup/quality/annotate/generate/verify/emitter`) import service modules and
+  modules (`ingest/dedup/classify/quality/annotate/generate/verify/emitter`) import service modules and
   `types`/`stage`, **never each other** — with the single sanctioned exception that
   `verify.py` imports the public repair hooks from `annotate.py` (§7.4; used per §7.6).
 
@@ -52,6 +52,8 @@ labelkit/
   emitter.py                  # M11: Emitter, meta assembly, report writer   → E11
   obslog.py                   # M12: TraceEvent, EventLog, MetricsSink,
                               #     setup_logging, event-name constants      → E12
+  classify.py                 # M13 (v1.7): ClassifyStage, build_classify_prompt,
+                              #     classify_record                          → E14
   data/rubrics/
     default_text.toml         # already written — do not modify
     default_ui.toml           # already written — do not modify
@@ -66,18 +68,20 @@ afterwards without updating this file.
 
 ## 2. Architecture recap (normative)
 
-Four layers (spec §2.2): CLI → M10 orchestrator → operator stages (M2 ingest, M3 dedup, M4 quality,
-M5 annotate, M6 generate, M7 verify, M11 emitter) → services (M1 config, M8 schema engine, M9 LLM
-client, M12 obslog). Operators depend only on services and the shared types — never on each other
-(exception: verify→annotate repair hook, §7.4/§7.6).
+Four layers (spec §2.2): CLI → M10 orchestrator → operator stages (M2 ingest, M3 dedup, M13
+classify — v1.7, M4 quality, M5 annotate, M6 generate, M7 verify, M11 emitter) → services (M1
+config, M8 schema engine, M9 LLM client, M12 obslog). Operators depend only on services and the
+shared types — never on each other (exception: verify→annotate repair hook, §7.4/§7.6).
 
-Pipeline order per batch (process mode):
-`dedup → quality → generate(off-path, returns sub-batch) → annotate → verify → emit`.
+Pipeline order per batch (process mode, v1.7 chain):
+`dedup → classify → quality → generate(off-path, returns sub-batch) → annotate → verify → emit`.
 Generation sub-batches re-enter the queue as new batches and run
-`dedup → quality → annotate → verify → emit` (no generate; single-pass, no recursion).
+`dedup → classify → quality → annotate → verify → emit` (no generate; single-pass, no recursion;
+generated records enter carrying an `"inherited"` Classification, which the idempotent classify
+stage skips — §7.13).
 `generate_only` mode (v1.4): no M2; `GenerateStage.generate_all()` produces all Records up front,
-they are split by `run.batch_size`, and each batch runs `dedup → quality → annotate → verify → emit`
-(quality/annotate individually optional per switches).
+they are split by `run.batch_size`, and each batch runs `dedup → classify → quality → annotate →
+verify → emit` (classify/quality/annotate individually optional per switches).
 
 Statuses: `active | dropped_dup | dropped_lowq | dropped_verify | failed`. Stages never delete list
 elements; they flip `status` and attach evidence.
@@ -190,6 +194,15 @@ class Record:
 
 ```python
 @dataclass(frozen=True)
+class Classification:                      # v1.7: M13 classify verdict (spec 3.13, §4.1)
+    label: str                             # routing label of THIS envelope
+    labels: tuple[str, ...]                # the record's full hit set (declaration order;
+                                           # single assignment: always one element)
+    source: Literal["llm", "fallback", "inherited"]
+    detail: Mapping                        # reason / sc stats / fallback trace (kind, message)
+
+
+@dataclass(frozen=True)
 class DedupInfo:
     kind: Literal["unique", "exact", "near_text", "near_image", "near_both", "near_semantic"]
     cluster_key: str                       # exact-dedup key ([:16] hex) of the cluster head;
@@ -254,6 +267,7 @@ class StageError:
 class PipelineItem:                        # the ONLY mutable envelope; lifetime = one batch
     record: Record
     status: Status = "active"
+    classification: Classification | None = None   # v1.7: written by M13 classify (or inherited)
     dedup: DedupInfo | None = None
     scores: dict[str, QualityScore] = field(default_factory=dict)
     annotation: Annotation | None = None
@@ -267,6 +281,9 @@ Notes binding on all implementers:
   "score = null" (spec 3.4.3 判定失败 row, §6.3 example semantics). **[FROZEN HERE]**
 - `Annotation.sc` is an additive v1.2 field needed to carry `{n, agreement_ratio}` from M5 to M11
   (`_meta.annotation.sc`, spec 3.5.2/6.3). **[FROZEN HERE]**
+- `Classification` / `PipelineItem.classification` are additive v1.7 fields (M13, spec §4.1).
+  Multi-assignment fan-out clones share `record` and `dedup` **by reference** with their
+  original envelope; all other containers are fresh defaults (§7.13).
 - Everything except `PipelineItem` is `frozen=True`. No module mutates a `Record`.
 
 ---
@@ -324,10 +341,13 @@ class ProviderFatalError(LabelKitError):
 
 class SchemaViolation(LabelKitError):
     """M8: L3 budget exhausted, object still invalid. Record-level → status='failed',
-    kind='schema_violation'."""
-    def __init__(self, errors: list[str], raw_last_output: str):
+    kind='schema_violation' — or 'callback_violation' when the remaining violations
+    all come from the output.validator hook (callback_only=True, spec 3.8.2 L2.5)."""
+    def __init__(self, errors: list[str], raw_last_output: str, *,
+                 callback_only: bool = False):
         self.errors = errors                  # rendered violations: "<json-pointer>: <message>"
         self.raw_last_output = raw_last_output
+        self.callback_only = callback_only
         super().__init__("; ".join(errors))
 
 
@@ -356,6 +376,8 @@ class ErrorKind(str, enum.Enum):
     INDEX_CONFLICT = "index_conflict"                        # M2, record-level
     IMAGE_TOO_LARGE = "image_too_large"                      # M2, record-level
     IMAGE_DECODE_ERROR = "image_decode_error"                # M3 skip pHash; M5/M7 → failed
+    CLASSIFICATION_INVALID = "classification_invalid"        # v1.7: M13, M8 repair exhausted —
+                                                             # fallback keeps record; "fail" → rejects
     JUDGMENT_INVALID = "judgment_invalid"                    # M4, comparison-level → counts as tie
     SCHEMA_VIOLATION = "schema_violation"                    # M8 L3 exhausted → failed → rejects
     CALLBACK_VIOLATION = "callback_violation"                # v1.5: L3 exhausted, remaining
@@ -408,6 +430,10 @@ class Stage(Protocol):
 
     async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]:
         """契约：① 只处理 status=='active' 的项；② 不删除列表元素（只改 status）；
+           ②a classify 例外（仅 assignment="multi"）——可向传入列表尾部追加派生信封；
+           追加物视同批内普通元素、同受 ①③④ 约束；不得删除、重排或替换任何既有元素对象
+           （既有元素的 status / classification / errors 字段写入属 ①④ 的正常行为）；
+           返回值仍须是传入的同一列表对象（调用方依赖列表身份）；
            ③ generate 例外——返回新增子批（原批元素不修改）；④ 单条失败不得抛出到批层面，
            必须落入 item.errors 并置 status='failed'。"""
         ...
@@ -422,6 +448,8 @@ Binding rules:
   `random.Random(f"{seed}:0:generate")` (batch_no fixed at 0, spec 3.10.3).
 - All stages except `generate` return the same list object they received. `generate.run` returns a
   **new** list of new `PipelineItem`s (the sub-batch) and does not touch the input list.
+  v1.7 (contract ②a): classify may grow that list in place (tail-append only); identity of the
+  returned list is unchanged.
 - Non-generate stages: return value must be the input list (callers may rely on identity).
 - A stage must catch every per-record exception, append
   `StageError(stage=self.name, kind=..., message=..., retryable=...)` to `item.errors`, set
@@ -635,7 +663,9 @@ class TraceConfig:
     enabled: bool = False
     path: str = ""                                # M1 resolves "" → "{output_stem}.trace.jsonl"
     channels: tuple[str, ...] = ("quality", "verify", "schema")
-                                                  # allowed: ingest|dedup|quality|annotate|verify|schema|llm
+                                                  # allowed: ingest|dedup|classify|quality|
+                                                  # annotate|verify|schema|llm (v1.7 adds
+                                                  # "classify"; the default stays unchanged)
     content: Literal["none", "refs", "excerpt", "full"] = "refs"
 
 
@@ -654,6 +684,39 @@ class Criterion:
 class Rubric:
     name: str
     criteria: tuple[Criterion, ...]
+
+
+# ── classify (v1.7, spec §5.2 [classify] + [class.*]) ──────────────────────
+
+@dataclass(frozen=True)
+class ClassSpec:
+    name: str                                     # [a-z0-9_]+, unique within the table
+    description: str                              # non-empty
+    examples: tuple[str, ...] = ()                # optional, input-side only
+
+@dataclass(frozen=True)
+class ClassifyConfig:
+    enabled: bool = False
+    llm: str = "default"
+    assignment: Literal["single", "multi"] = "single"
+    max_labels: int | None = None                 # M1 back-fills to len(classes)
+    instruction: str = ""
+    fallback_class: str = ""                      # required iff enabled; must be in classes
+    self_consistency: int = 0                     # 0 = off; else odd, >= 3
+    sc_temperature: float = 0.7                   # effective only when sc >= 3 (R21)
+    on_error: Literal["fallback", "fail"] = "fallback"
+    classes: tuple[ClassSpec, ...] = ()           # >= 2 entries iff enabled
+
+@dataclass(frozen=True)
+class ClassView:                                  # one class's effective config;
+                                                  # class_views = {} when enabled=false
+    name: str
+    quality: QualityConfig                        # selection-GROUP merge semantics (R6);
+                                                  # rubric selector already back-filled
+    rubric: Rubric                                # re-parse product (R7)
+    annotate: AnnotateConfig
+    generate: GenerateConfig
+    verify: VerifyConfig
 
 
 # ── CLI overrides and the aggregate ────────────────────────────────────────
@@ -676,6 +739,7 @@ class ResolvedConfig:
     run: RunConfig
     input: InputConfig
     dedup: DedupConfig
+    classify: ClassifyConfig                      # v1.7 — required, no default (R23)
     quality: QualityConfig
     generate: GenerateConfig
     annotate: AnnotateConfig
@@ -683,6 +747,9 @@ class ResolvedConfig:
     output: OutputConfig
     trace: TraceConfig
     rubric: Rubric                                # resolved (default pkg or inline)
+    class_views: Mapping[str, ClassView]          # v1.7 — required, no default (R23);
+                                                  # frozen per-class merged views, keyed by
+                                                  # class name; {} when classify disabled
     user_schema: Mapping                          # parsed dict, meta-schema pre-validated
     limit: int | None                             # CLI --limit
     strict: bool
@@ -705,6 +772,11 @@ CLI overrides; parse `output.schema_inline`/`schema_path` into `user_schema`; re
 `api_key_envs`) into `LLMProfile.api_keys`, mirroring element 0 into `api_key` (v1.6
 normalization, §6.3 rule 12); `tool.log_level` overridden by
 `--log-level`. Precedence: CLI > project.toml > config.toml/built-in defaults.
+v1.7: statically merge every `[class.<name>.*]` override family into the frozen
+`class_views` mapping (per-key provenance; selection-group and rubric re-parse semantics of
+§6.3 rules 26–27) and back-fill `classify.max_labels` to `len(classes)` when absent. The
+per-class merge is project.toml-INTERNAL conditionalization; the three-source precedence
+above is unchanged.
 
 ### 6.2 `config/loader.py` — API (spec 3.1.3, verbatim)
 
@@ -798,8 +870,45 @@ Paths:
     at run start is M2's job (`Ingestor.scan()`/`records()` raise `InputError` → exit 3,
     spec §2.4), never a `ConfigError` (exit 2).
 
+Classify (v1.7, spec 3.1.4 分类/按类覆盖合并 rows + 5.2 whitelist table; all checks below
+apply only when `classify.enabled = true` unless stated):
+22. `[[classify.classes]]` has ≥ 2 entries; each `name` matches `[a-z0-9_]+` and is unique
+    within the table; each `description` is non-empty; `examples`, when present, is an array
+    of strings (input-side only). `classify.fallback_class` is required and must be one of
+    the class names.
+23. `classify.llm` must exist in `[llm.*]`; UI modality ⇒ that profile has
+    `supports_vision = true`. The classify profile joins ALL THREE reference sets (R24):
+    the loader's referenced set (rule 12 key resolution), the vision-check set (rule 4),
+    and `cli.referenced_profiles()` (`validate --probe`).
+24. `classify.assignment` ∈ {"single", "multi"}; `classify.max_labels` may be set ONLY when
+    `assignment = "multi"` and must be ∈ [2, len(classes)] — when absent M1 back-fills it to
+    `len(classes)`. `classify.self_consistency` is 0 or an odd integer ≥ 3;
+    `classify.on_error` ∈ {"fallback", "fail"}.
+25. `[class.<name>.*]`: `<name>` must be a declared class name. Override keys must be inside
+    the per-section whitelist — `quality`: mode, rounds, rubric (incl. the `[class.*.rubric]`
+    inline table), threshold, selection, top_ratio; `annotate`: instruction, examples;
+    `generate`: instruction, styles, num_per_record, temperature; `verify`: extra_criteria.
+    Any key outside the whitelist → CONFIG_ERROR (R25 exception to rule 1's unknown-key
+    warning: `[classify]` / `[class.*]` are explicitly owned namespaces).
+26. Per-class merge builds the frozen `class_views` (per-key provenance: keys the class
+    provides override the global section, all others inherit). Selection GROUP (R6): a class
+    providing ANY of selection/threshold/top_ratio evicts the global side's mutually-
+    exclusive counterpart keys from the merged view; the rule-6 exclusivity check runs on
+    each class's MERGED view (never on the raw key union).
+27. Per-class rubric (R7): merge the selector, then RE-PARSE via the `_resolve_rubric`
+    helper; the rule-16 pointwise 6-level check runs on every (class-effective mode ×
+    class-effective rubric) combination; `[class.X.rubric]` present while that class's
+    effective selector is not `"inline"` → table ignored + warning (same convention as the
+    global rubric).
+28. Every `[[class.<name>.annotate.examples]]` output dry-runs against the GLOBAL user
+    schema and `output.validator` (rule 15 semantics; error locations rendered
+    `[[class.<name>.annotate.examples]][N]`, N 1-based).
+
 Warnings (non-blocking): `verify` enabled and `verify.llm`'s `model` equals `annotate.llm`'s
-`model` → warn about self-enhancement bias (spec 3.7.2).
+`model` → warn about self-enhancement bias (spec 3.7.2). v1.7 (R8): `classify.enabled = false`
+while `[[classify.classes]]` and/or `[class.*]` tables are present → ONE warning naming the
+ignored tables, never a CONFIG_ERROR ("keep the config, flip the switch" is legal — same
+family as the ineffective-top_ratio warning).
 
 ---
 
@@ -943,7 +1052,9 @@ def fit_bradley_terry(n_items: int, comparisons: list[tuple[int, int, float]],
     length n_items."""
 ```
 
-Normative behavior (spec 3.4.3/3.4.4): comparison pool = the batch; k = `rounds` independent
+Normative behavior (spec 3.4.3/3.4.4): comparison pool = the per-class pool within the batch —
+active items partitioned by `item.classification.label` (v1.7; classify disabled ⇒ ONE anonymous
+pool = the whole batch, byte-identical to pre-v1.7 behavior); k = `rounds` independent
 random perfect matchings (shuffle via `ctx.rng`, then pair adjacent; odd survivor sits the round
 out); A/B presentation order randomized via `ctx.rng`; judging prompt per §10.2; response
 validated by M8 against the judgment schema (§10.7); invalid judgment after repair → tie, count
@@ -965,6 +1076,24 @@ judgment, per judge, per order), `quality.pointwise`, `quality.bt_fit` (per crit
 `quality.gate` (per gated record). `judgment_reasons` "auto" = on iff `trace.enabled` and
 `"quality" in trace.channels`.
 
+v1.7 per-class pooling (classify enabled; spec 3.4.3 按类分池 row):
+
+- **Two-phase execution (R13).** Phase 1, synchronous: iterate the pools in class-name
+  lexicographic order and pre-draw each pool's full pairing plan (this is the only `ctx.rng`
+  consumption — the consumption ORDER is therefore pool-order-deterministic); phase 2: merge
+  every pool's LLM judging calls into ONE `asyncio.gather` (full cross-pool concurrency).
+  Internally `_run_pairwise` splits into plan/dispatch phases.
+- **Per-pool effective config.** Each pool reads `class_views[label]`'s (QualityConfig, Rubric):
+  mode/rounds/rubric/threshold/selection/top_ratio take the class-effective values;
+  judges/both_orders/criteria_per_call/llm/on_unscored always stay global.
+- **Pool-level isolation (R15).** The batch-level internal-error fallback wraps EACH pool
+  (try/except inside the pool loop): pool A's failure never voids pool B's finished scores.
+- The batch-of-1 rule above applies PER POOL (a pairwise pool of 1 scores 0.5 with no calls);
+  `top_ratio` quota base = scored survivors WITHIN the pool; normalization ranks within the pool.
+- Counters and events gain the pool dimension: tie counters become
+  `quality.tie_outcomes.<pool>.<crit>` / `quality.tie_comparisons.<pool>.<crit>` (R12, §9.3);
+  `quality.judgment` / `quality.bt_fit` / `quality.gate` payloads gain `pool` (R16, §8.1).
+
 ### 7.4 M5 — `labelkit/annotate.py`
 
 ```python
@@ -977,17 +1106,22 @@ class RepairContext:
 
 def build_annotate_prompt(record: Record, cfg: ResolvedConfig, schema_text: str,
                           repair: RepairContext | None = None,
-                          temperature: float | None = None) -> PromptBundle:
+                          temperature: float | None = None,
+                          label: str | None = None) -> PromptBundle:
     """Deterministic template assembly per §10.1. schema_text = SchemaEngine.user_schema_text.
-    repair != None appends the repair suffix (§10.5). [FROZEN HERE]"""
+    repair != None appends the repair suffix (§10.5). [FROZEN HERE; label is a v1.7 ADDITIVE
+    trailing kwarg (R2): non-None → instruction/examples come from
+    cfg.class_views[label].annotate; None = global config — pre-v1.7 call sites unchanged]"""
 
 
 async def annotate_record(record: Record, ctx: RunContext,
-                          repair: RepairContext | None = None) -> Annotation:
+                          repair: RepairContext | None = None,
+                          label: str | None = None) -> Annotation:
     """One record's full annotation path incl. self-consistency (skipped when repair != None:
     repair re-annotation is always a single call at profile-default temperature [FROZEN HERE]).
     Raises SchemaViolation / ProviderRetryableError / ProviderFatalError. This is the hook M7
-    uses for verify.policy='repair'. [FROZEN HERE]"""
+    uses for verify.policy='repair'. [FROZEN HERE; label is a v1.7 ADDITIVE trailing kwarg
+    (R2), same semantics as build_annotate_prompt — None = global config]"""
 
 
 class AnnotateStage(Stage):
@@ -1010,6 +1144,11 @@ through `complete_validated` — its attempts are unrecoverable by design); `Ann
 likewise sums successful samples only; `Annotation.sc = {"n": n, "agreement_ratio": matches/n}`. Trace: `annotate.done` with
 payload `{attempts[, sc]}`. Concurrency: records within the stage run concurrently via
 `asyncio.gather` (bounded by the profile semaphore in M9).
+
+v1.7 label semantics (R2): `label = None` ⇒ globally configured instruction/examples (exactly
+the pre-v1.7 behavior); `label` non-None ⇒ both are read from `class_views[label].annotate`.
+The stage layer passes `item.classification.label if item.classification else None`. The
+`annotate.done` payload gains `label` (classify enabled only, §8.1).
 
 ### 7.5 M6 — `labelkit/generate.py`
 
@@ -1043,7 +1182,31 @@ call-index order before dispatch so results are schedule-independent. Prompt per
 `ref = RecordRef(source_file="", line_no=None, pair_index=None, generated_from=<seed ids tuple —
 process mode> | () <generate_only>, generator={"llm": name, "style": style_name_or_None})`.
 Bucket stats to metrics: key `f"{llm}×{style or 'None'}"` **[FROZEN HERE: bucket key format
-`<llm>×<style>` with literal `×`; style absent → the string `null` in report** — see §9.3].
+`<llm>×<style>` with literal `×`; style absent → the string `null` in report; v1.7 — when
+classify is enabled the key gains a class prefix, `<class>×<llm>×<style>` (three segments,
+same literal `×`); classify disabled keeps the two-segment form byte-identical** — see §9.3].
+
+v1.7 per-class generation (classify enabled, process mode; spec 3.6.2 按类种子池 row):
+
+- **Seeds & thresholds (R19).** `select_seeds` groups the seed pool by
+  `item.classification.label`. Per-class threshold chain: global `seed_min_score` → absent:
+  the CLASS-effective `quality.threshold` → absent: the median aggregate of that class's own
+  seed pool.
+- **Lexicographic segment concatenation (R18).** Participating classes (those with seeds)
+  occupy consecutive GLOBAL call-index ranges in class-name lexicographic order; per-class
+  budget `C_c = ceil(len(seeds_c) × num_per_record_c / num_per_call)`. ONE pass over
+  i = 0..C−1 pre-draws the plan: llm by global index exactly as before (round_robin consumes
+  zero rng; weighted consumes one `choices` per i); style drawn uniformly from the effective
+  styles OF THE CLASS OWNING index i; seed sampling per call in ascending global index order.
+  Classify disabled ⇒ a single anonymous segment = the pre-v1.7 behavior, byte-identical.
+- **Planner & records (R17).** The internal `CallPlan` gains a `class_name` field; each call
+  uses the class-effective `instruction`/`temperature` (`class_views[class_name].generate`);
+  `postprocess_samples` returns `list[tuple[Record, str | None]]` (record, class);
+  `GenerateStage.run` wraps new records in PipelineItems carrying
+  `Classification(label, (label,), "inherited", {})` — the chain's classify stage skips them
+  (idempotency, §7.13).
+- **generate_only:** the `generate_all` flat path is UNCHANGED (global instruction, no class
+  segments); its products are classified normally by the chain's classify stage.
 
 ### 7.6 M7 — `labelkit/verify.py`
 
@@ -1065,6 +1228,14 @@ annotation replaces `item.annotation`; re-verify; still fail at budget → drop 
 `VerificationResult.rounds` counts review rounds incl. the first; `critiques` accumulate over
 rounds in order. Verify errors on a record (provider exhausted etc.) → `failed` per stage
 contract.
+
+v1.7 label threading (R3): the internal prompt builder `build_verify_prompt` (NOT part of the
+frozen surface) gains a `label` parameter — the `[任务指令]` section and `extra_criteria` both
+take the class-effective values (`class_views[label].annotate.instruction` /
+`class_views[label].verify.extra_criteria`); `_judge_round`/`_reannotate` thread the label
+through, and repair re-annotation calls `annotate_record(..., label=...)` (§7.4). The stage
+passes `item.classification.label if item.classification else None`; `verify.verdict` payloads
+gain `label` (classify enabled only, §8.1).
 
 ### 7.7 M8 — `labelkit/schema_engine.py`
 
@@ -1128,6 +1299,8 @@ def judgment_schema(criteria_keys: list[str], with_reason: bool) -> dict: ...
 def pointwise_schema(criterion_key: str) -> dict: ...
 VERDICT_SCHEMA: dict
 def samples_schema(num_per_call: int) -> dict: ...
+def classification_schema(class_names: list[str], assignment: str,
+                          max_labels: int, with_reason: bool) -> dict: ...   # v1.7 (M13), §10.7
 ```
 
 ### 7.8 M9 — `labelkit/llm_client.py`
@@ -1318,8 +1491,10 @@ class Orchestrator:
 
 Normative behavior: split `ingestor.records()` into batches of `run.batch_size` (`--limit`
 truncates the stream to the first N records); wrap into `PipelineItem`s; per batch, per enabled
-stage in order dedup → quality → generate → annotate → verify: build a fresh `RunContext` (rng
-derived per §5) and `await stage.run(batch, ctx)`; `generate.run`'s return value is enqueued as
+stage in order dedup → classify → quality → generate → annotate → verify (v1.7 chain,
+`_CHAIN_ORDER`; `_compose_chain` includes classify in the main, re-flow AND generate_only
+chains — items already classified rely on M13's idempotent skip): build a fresh `RunContext`
+(rng derived per §5) and `await stage.run(batch, ctx)`; `generate.run`'s return value is enqueued as
 new batch(es) (split at `batch_size`, consecutive `batch_no`, no generate stage); after stages,
 `emitter.emit_batch(batch, batch_no)`, then `metrics.flush()` (trace flush follows output flush),
 then drop the batch. Emit events `batch.start`/`batch.end` (stage="run"). generate_only: no
@@ -1344,6 +1519,22 @@ called; `finalize(report, deliver=False)`), but `report.json` is still written a
 trace is a first-class opt-in output channel (spec 2.6) and carries no data content. The dry-run
 stderr summary line reflects this: `(report and trace only)` when `trace.enabled`, else
 `(report only)`.
+
+v1.7 classify orchestration (spec 3.10.3 分类与扇出 row):
+
+- **Fan-out metering (R9).** `counts.fanout` is measured by M10 in the `_process_batch` chain
+  loop as the `len(batch)` delta across the classify stage invocation (same construction as
+  deriving `counts.generated` from generate's return value) — M13 never touches `counts.*`
+  (§9.3 ownership). `batch.start.size` stays "envelope count at batch ENTRY" (pre-fan-out);
+  `batch.end` payload gains `fanout` (R20, §8.1).
+- **Breaker residual (R10).** The `counts.unprocessed` balancing residual adds `+ fanout` to
+  its source side (scanned + generated + fanout, minus the terminal counts); the `fanout`
+  counts key itself appears only when `classify.assignment = "multi"` (§9.3).
+- **Dry-run estimate (R11/R28).** `_estimate` gains `classify_calls` — process mode:
+  `ingested × max(1, classify.self_consistency)`; generate_only: `<generated records> ×
+  max(1, sc)`. quality/annotate/verify estimates use the globally-inherited config; when
+  `[class.*]` overrides exist or assignment is "multi", stderr notes "estimated on the global
+  config / multi reported as a lower bound (label multiplier 1)".
 
 ### 7.10 M11 — `labelkit/emitter.py`
 
@@ -1387,6 +1578,13 @@ File names: main `run.output`; temp `run.output + ".part"` (same directory); sid
 `{output_stem}.meta.jsonl` (temp `+ ".part"`); rejects `{output_stem}.rejects.jsonl` (streamed,
 no .part — it is an append log like trace **[FROZEN HERE]**); report `{output_stem}.report.json`.
 `output_stem` = output path minus final suffix. Line formats: §9.
+
+v1.7: `_assemble_meta` gains the ALWAYS-PRESENT `classification` key (`null` when classify is
+disabled, else `{label, labels, source}` — §9.1); the `_meta.scores` block gains `pool`
+(classify enabled only); rejects refs lines gain the `label` key (classify enabled only —
+the §9.2 closed five-key enumeration becomes six keys, R5). The rejects attribution rule
+(`stage`/`reason` from `item.errors[0]`) is UNCHANGED — guaranteed safe because fallback
+classification writes no `item.errors` entry (R4, §7.13).
 
 ### 7.11 M12 — `labelkit/obslog.py`
 
@@ -1460,7 +1658,8 @@ Event-name constants (module level, exact strings): `EV_RUN_START = "run.start"`
 `EV_ANNOTATE_DONE = "annotate.done"`, `EV_VERIFY_VERDICT = "verify.verdict"`,
 `EV_SCHEMA_REPAIR = "schema.repair"`, `EV_LLM_CALL = "llm.call"`, `EV_ERROR = "error"`,
 and (v1.6) `EV_LLM_KEY_COOLDOWN = "llm.key_cooldown"`, `EV_LLM_KEY_DISABLED = "llm.key_disabled"`,
-`EV_LLM_POOL_PARKED = "llm.pool_parked"`.
+`EV_LLM_POOL_PARKED = "llm.pool_parked"`, and (v1.7)
+`EV_CLASSIFY_DECISION = "classify.decision"`.
 
 ### 7.12 CLI — `labelkit/cli.py`
 
@@ -1489,6 +1688,78 @@ profiles; single-key output format unchanged), print results; any probe failure 
 the exit code unless config itself is invalid **[FROZEN HERE]**). `rubric`: no flag → list
 available names; `--show <name>` → print the packaged TOML verbatim.
 
+### 7.13 M13 — `labelkit/classify.py` (v1.7)
+
+(New module, spec 3.13. Numbered AFTER the pre-existing 7.12 CLI section so every
+frozen §7.x anchor in code and docs stays valid; chain position is dedup → **classify** →
+quality, §2.)
+
+Responsibilities: closed-set LLM classification of batch items with `status == "active"` and
+`classification is None` against the user's class table (single/multi assignment, optional
+self-consistency voting); result written to `item.classification`; multi assignment fans
+sibling envelopes out to the batch tail per label. Boundaries: never drops records; does not
+define class semantics; does not annotate; does not change the chain structure (fan-out only
+changes envelope cardinality within the batch). Depends on M1, M8, M9 only.
+
+```python
+class ClassifyStage(Stage):
+    name = "classify"
+    def __init__(self, cfg: ResolvedConfig): ...
+    async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]: ...
+        # returns the SAME list object it received (multi may tail-append, contract ②a §5)
+
+
+def build_classify_prompt(record: Record, cfg: ResolvedConfig,
+                          with_reason: bool) -> PromptBundle:
+    """Deterministic assembly of the §10.8 template (class table in declaration order;
+    per-class examples; text/UI record parts)."""
+
+
+async def classify_record(record: Record, ctx: RunContext) -> Classification:
+    """One record's full classification path incl. self-consistency voting and
+    normalization; the on_error policy is applied by the stage layer."""
+```
+
+Normative behavior:
+
+- **Call & validation.** One call per record (× n under self-consistency), through
+  `SchemaEngine.complete_validated(schema=classification_schema(...))` (§10.7) — an INTERNAL
+  schema: no `resolved_at` bucket counting, no L2.5 hook. Temperature 0; sc samples use
+  `classify.sc_temperature`. `reason` is requested iff `trace.enabled` and `"classify"` in
+  `trace.channels` (R29). Record-level concurrency via `asyncio.gather` bounded by the
+  profile semaphore (skeleton mirrors M5 — own voting code, NOT `annotate._majority_vote`,
+  R26).
+- **Normalization (after M8, deterministic, fixed order).** ① map labels onto class-table
+  declaration order and DE-DUPLICATE; ② the fallback class co-occurring with concrete
+  classes ⇒ drop the fallback class (a pure-fallback result is kept). Normalization only
+  narrows an already-validated set (schema-side `uniqueItems` deliberately absent, R1/§10.7).
+- **sc voting.** `self_consistency = n` (0 = off; ≥ 3 odd): n independent samples; a
+  SchemaViolation sample abstains, the denominator stays n. single: majority vote, no
+  majority ⇒ fallback class; multi: keep each label appearing in > n/2 sample sets, none
+  survive ⇒ fallback class. `detail.sc = {"n", "agreement_ratio"}` (single = winning-class
+  vote share; multi = lowest vote share among kept labels).
+- **Failure & fallback — two paths (R4).** M8 repair exhausted: `on_error="fallback"`
+  (default) ⇒ fallback class with `source="fallback"`, evidence recorded in
+  `Classification.detail` (kind + message) — **never in `item.errors`** (keeps §9.2 rejects
+  attribution via `errors[0]` unpolluted) — plus an `error` trace event
+  (kind=`classification_invalid`) and the `classify.fallback` counter;
+  `on_error="fail"` ⇒ `status="failed"`, StageError appended to `item.errors` → rejects.
+- **Multi fan-out.** Normalized hit set of k ≥ 2: the original envelope takes the FIRST
+  label (declaration order); each remaining label clones one sibling `PipelineItem`
+  appended IN PLACE to the tail of the passed-in batch list. Clones share `record` and
+  `dedup` BY REFERENCE (sibling rows' `_meta.dedup` stay consistent); `classification`
+  swaps `label` (`labels` = the same full set); `status="active"`;
+  scores/annotation/verification/errors are fresh default containers. Append order =
+  (original element's batch position → label declaration order), byte-reproducible. Return
+  value = the same list object passed in.
+- **Idempotency.** Items with `classification is not None` are skipped (covers generated
+  records' `"inherited"` Classification on re-flow, §7.5, and any re-entry).
+- **Events & counters (ownership).** One `classify.decision` per record (payload: `label`,
+  `labels` — multi carries the full set, `source`[, `reason`][, `sc`], §8.1; trace-only,
+  R29). Counters OWNED BY M13: `classify.classes.<name>` (counted per label),
+  `classify.fallback`, `classify.failures`, `classify.multi_label_records`. `counts.fanout`
+  is counted by M10 (len-delta metering, R9/§7.9) — M13 never increments `counts.*`.
+
 ---
 
 ## 8. Observability contract (M12 + ch.7)
@@ -1500,25 +1771,27 @@ available names; `--show <name>` → print the packaged TOML verbatim.
 | `run.start` | always / info | M10, after M1 passes, before first batch; trace header line | () | `tool_version`, `config_digest`, `project_digest`, `trace_schema_version` (=1, only here) |
 | `run.end` | always / info | M10 after finalize; last trace line | () | `counts` (report-shaped summary), `exit_code` |
 | `batch.start` | always / debug | M10 when PipelineItem[] ready | () | `size` |
-| `batch.end` | always / info | M10 after batch emit + release | () | `active`, `dropped_dup`, `dropped_lowq`, `dropped_verify`, `failed`, `duration_ms` |
+| `batch.end` | always / info | M10 after batch emit + release | () | `active`, `dropped_dup`, `dropped_lowq`, `dropped_verify`, `failed`, `duration_ms`[, `fanout` — v1.7, classify enabled only (R20)] |
 | `ingest.bad_line` | ingest / warn | M2 bad line skipped | () | `file`, `line_no`, `reason` |
 | `ingest.missing_pair` | ingest / warn | M2 missing pair skipped | () | `index`, `present` ("tree"\|"image"), `file` |
 | `ingest.index_conflict` | ingest / warn (error if policy=fail) | M2 index conflict | () | `index`, `files` (list) |
 | `dedup.duplicate` | dedup / — | M3 duplicate verdict | (dup id,) | `kind`, `cluster_key`, `kept_id`, plus exactly one of `jaccard` (near_text) / `hamming` (near_image) / `cosine` (near_semantic); exact dups carry none |
-| `quality.judgment` | quality / — | M4 per pairwise judgment after M8 pass | (first-sampled record, second-sampled record) — SAMPLING order, NOT the presented A/B order; the A/B mapping lives in `payload.order` (spec 7.2/7.3) | `order` ({"A": id, "B": id} presented), `model`, `judgments`[]{`criterion`, `winner` "A"\|"B"\|"tie"[, `reason`]}[, `judge`] |
+| `classify.decision` | classify / — (trace-only, R29) | M13 per record once the classification is final (v1.7) | (id,) | `label`, `labels` (multi: full hit set), `source` ("llm"\|"fallback"\|"inherited")[, `reason`][, `sc` {n, agreement_ratio}] |
+| `quality.judgment` | quality / — | M4 per pairwise judgment after M8 pass | (first-sampled record, second-sampled record) — SAMPLING order, NOT the presented A/B order; the A/B mapping lives in `payload.order` (spec 7.2/7.3) | `order` ({"A": id, "B": id} presented), `model`, `judgments`[]{`criterion`, `winner` "A"\|"B"\|"tie"[, `reason`]}[, `judge`][, `pool` — v1.7, classify enabled only (R16)] |
 | `quality.pointwise` | quality / — | M4 per record per criterion | (id,) | `criterion`, `score` (raw 0–5), `reason` |
-| `quality.bt_fit` | quality / — | M4 per batch per criterion | () | `criterion`, `iterations`, `converged`, `comparisons` |
-| `quality.gate` | quality / — | M4 gate decision per record (threshold set or top_ratio) | (id,) | `aggregate`, `decision` ("keep"\|"drop")[, `threshold`][, `selection`, `top_ratio`, `rank`] |
-| `annotate.done` | annotate / — | M5 after M8 pass | (id,) | `attempts`[, `sc` {n, agreement_ratio}] |
-| `verify.verdict` | verify / — | M7 per round (per judge when judges set) | (id,) | `verdict`, `round`, `critiques`[]{`aspect`, `opinion`}[, `judge`] |
+| `quality.bt_fit` | quality / — | M4 per batch per criterion (v1.7: per pool per criterion) | () | `criterion`, `iterations`, `converged`, `comparisons`[, `pool` — v1.7, classify enabled only (R16)] |
+| `quality.gate` | quality / — | M4 gate decision per record (threshold set or top_ratio) | (id,) | `aggregate`, `decision` ("keep"\|"drop")[, `threshold`][, `selection`, `top_ratio`, `rank`][, `pool` — v1.7, classify enabled only (R16)] |
+| `annotate.done` | annotate / — | M5 after M8 pass | (id,) | `attempts`[, `sc` {n, agreement_ratio}][, `label` — v1.7, classify enabled only (R5)] |
+| `verify.verdict` | verify / — | M7 per round (per judge when judges set) | (id,) | `verdict`, `round`, `critiques`[]{`aspect`, `opinion`}[, `judge`][, `label` — v1.7, classify enabled only (R5)] |
 | `schema.repair` | schema / — | M8 any non-clean resolution | (record ids if known) | `resolved_at` ("l1"\|"l3_1"\|"l3_2"\|"rejected"), `violations` (JSON-Pointer + violated keyword summary, NO data values)[, `l1_lossy`=true — v1.5, only on a suspected content-dropping L1 repair] |
 | `llm.call` | llm / debug (summary always) | M9 after every call incl. failures | () | `profile`, `gen_ai.request.model`, `latency_ms`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `retries`, `status` ("ok"\|"retryable_exhausted"\|"fatal")[, `operation`="embedding"][, `key_env` — env-var name of the key used by the LAST attempt (success or failure); absent on zero-attempt calls; pooled profiles (>1 key) only, v1.6][, `gen_ai.input.messages`, `gen_ai.output.messages` — content="full" + llm channel only] |
 | `llm.key_cooldown` | llm / — | M9 when a key enters 429 cooldown (v1.6, spec 3.9.3); fires for ANY pool size incl. 1 | () | `profile`, `key_env`, `cooldown_s`, `retry_after` (bool: duration came from the Retry-After header) |
 | `llm.key_disabled` | llm / warn | M9 when a key is auth-disabled — at most once per key per run; any pool size incl. 1 (single-key: precedes the hard trip) (v1.6) | () | `profile`, `key_env`, `status_code` |
 | `llm.pool_parked` | llm / warn | M9 when a call starts parking — all live keys cooling; any pool size incl. 1 (v1.6) | () | `profile`, `wait_s`, `live_keys` |
-| `error` | channel of producing stage / warn (record-level) · error (run-level) | On StageError construction | per case | `stage`, `kind` (§7.6 codes), `message`, `retryable` |
+| `error` | channel of producing stage / warn (record-level) · error (run-level) | On StageError construction | per case | `stage`, `kind` (§7.6 codes), `message`, `retryable`[, `label` — v1.7, classify enabled only (R5)] |
 
-`reason` present only when `quality.judgment_reasons` is effective. `run.*`/`batch.*` bypass the
+`reason` present only when `quality.judgment_reasons` is effective (`classify.decision`: only
+when requested per R29, §7.13). `run.*`/`batch.*` bypass the
 `trace.channels` filter and use `stage="run"`, `batch_no` = current batch (0 for run.*).
 
 ### 8.2 Trace line format
@@ -1589,8 +1862,13 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
              "fields": {<output.passthrough_fields from Record.raw>},   // {} when none
              "generator": null | {"llm": "<profile>", "style": "<name>"|null}},
   "scores": null | {"<criterion>": <float|null>, ..., "__aggregate__": <float|null>,
-                    "mode": "pairwise_bt"|"pointwise", "batch_no": <int>},
+                    "mode": "pairwise_bt"|"pointwise", "batch_no": <int>
+                    [, "pool": "<label>"]},        // v1.7: pool key ONLY when classify enabled
   "dedup": null | {"kind": "unique"},
+  // v1.7 — ALWAYS-PRESENT key (null when classify is disabled, like other disabled stages);
+  // key position between "dedup" and "annotation" per the spec §6.3 example (chain order):
+  "classification": null | {"label": "<class>", "labels": ["<class>", ...],
+                            "source": "llm"|"fallback"|"inherited"},
   "annotation": null | {"model": "<model>", "attempts": <int>
                         [, "sc": {"n": <int>, "agreement_ratio": <float>}]},
   "verification": null | {"verdict": "pass"|"fail", "rounds": <int>}
@@ -1598,14 +1876,19 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
 ```
 
 `_meta.run.rubric` = the configured selector (`"default:text"`/`"default:ui"`) or, for inline,
-the rubric's `name` **[FROZEN HERE]**. A disabled stage → `null` for its key.
+the rubric's `name` **[FROZEN HERE]**. A disabled stage → `null` for its key. v1.7: under
+multi fan-out the main-output line key is (`_meta.id`, `classification.label`) — sibling rows
+share the record id (spec §6.3).
 
 ### 9.2 Rejects channel (spec 3.11.2)
 
 `{output_stem}.rejects.jsonl`. `rejects="refs"` (default) — one line per rejected item, no data
 content whatsoever (no passthrough fields either). Per spec 3.11.2 the refs line carries
 **exactly** the five `_meta` keys `{id, source, stage, reason, errors}` (a closed enumeration:
-每行仅 …) — no status-specific evidence keys. Duplicate-cluster / quality-gate / verdict
+每行仅 …) — v1.7 revision (R5): **six** keys when classify is enabled, adding `label` (the
+envelope's routing label; disambiguates fanned-out siblings that share a record id; classify
+disabled keeps the five-key form byte-identical) — no status-specific evidence keys.
+Duplicate-cluster / quality-gate / verdict
 evidence is auditable via the trace events instead (`dedup.duplicate`, `quality.gate`,
 `verify.verdict`, §8.1):
 
@@ -1616,8 +1899,10 @@ evidence is auditable via the trace events instead (`dedup.duplicate`, `quality.
              "generated_from": [...] [, "generator": {...}]},   // NO "fields"
   "stage": "<stage that rejected>",         // dedup | quality | verify | annotate | emitter ...
   "reason": "<see table>",
-  "errors": [ "<pointer>: <violation>", ... ]   // always present; [] when item.errors is empty
+  "errors": [ "<pointer>: <violation>", ... ],  // always present; [] when item.errors is empty
                                                 // [FROZEN HERE: [] rather than omission]
+  "label": "<class>"                        // v1.7: ONLY when classify enabled (R5);
+                                            // null when the item was never classified
 }}
 ```
 
@@ -1656,6 +1941,17 @@ schema_violation). `rejects="none"`: no file.
   // "annotate": {"sc_disagreements": 0}                       (self-consistency enabled)
   // "generate": {"buckets": {"<llm>×<style|null>": {"calls": 0, "produced": 0,
   //                                                 "survived_dedup": 0}}} (generate enabled)
+  // v1.7, ONLY when classify.enabled:
+  // "classify": {"assignment": "single"|"multi", "classes": {"<name>": 0, ...},
+  //              "fallback_count": 0, "failures": 0
+  //              [, "multi_label_records": 0]}                (multi only)
+  // counts: + "fanout" (multi only — feeds the invariant below, R9/R10/R20);
+  // quality: + "by_class": {"<pool>": {"mode": ..., "rounds": ..., "aggregate_histogram":
+  //              {...}, "per_criterion_mean": {...}, "per_criterion_tie_rate": {...}}}
+  //   — top-level quality.mode/rounds keep the globally-inherited base values; by_class
+  //     carries each pool's EFFECTIVE mode/rounds; tie_rate emission is gated on "at least
+  //     one pairwise pool exists" instead of the global mode (R12/R14);
+  // generate.buckets keys gain the class prefix "<class>×<llm>×<style|null>" (§7.5)
   "trace": {"enabled": true, "path": "...", "events": 0, "dropped_events": 0},
   "llm_usage": {"<profile>": {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
                               "est_cost_usd": 0.0, "retries": 0
@@ -1671,8 +1967,10 @@ schema_violation). `rejects="none"`: no file.
 ```
 
 **Counts invariant (test-asserted):**
-`emitted + dropped_dup + dropped_lowq + dropped_verify + failed + bad_input = scanned + generated`.
-generate_only degenerates to `emitted + dropped_* + failed = generated` (scanned = bad_input = 0).
+`emitted + dropped_dup + dropped_lowq + dropped_verify + failed + bad_input = scanned + generated
+[+ fanout]` (the `fanout` term is v1.7: present only under `classify.assignment = "multi"`).
+generate_only degenerates to `emitted + dropped_* + failed = generated [+ fanout]`
+(scanned = bad_input = 0).
 Breaker-trip runs (v1.6 partial delivery) extend it with `+ unprocessed` on the left side;
 `counts.unprocessed` is computed by M10 at finalize as the balancing residual — records scanned
 or generated that reached no terminal count (emitted/dropped_*/failed/bad_input) when the run
@@ -1697,14 +1995,22 @@ MetricsSink counter keys **[FROZEN HERE]**, mapped 1:1 onto the above: `counts.*
 `dedup.exact/near_text/near_image/near_both/near_semantic/clusters/image_decode_failures/
 embedding_failures`, `quality.judgment_failures`, `annotate.sc_disagreements`,
 `generate.buckets.<key>.calls/produced/survived_dedup` (+ `.rejected_by_validator` when
-`generate.sample_validator` is set, v1.5).
+`generate.sample_validator` is set, v1.5). v1.7 additions: `counts.fanout` (owner M10, R9);
+`classify.classes.<name>` / `classify.fallback` / `classify.failures` /
+`classify.multi_label_records` (owner M13, §7.13; `classify.fallback` surfaces as the report
+key `classify.fallback_count`); tie-rate inputs
+`quality.tie_outcomes.<crit>` / `quality.tie_comparisons.<crit>` (v1.5 report drivers) become
+pool-dimensioned `quality.tie_outcomes.<pool>.<crit>` / `quality.tie_comparisons.<pool>.<crit>`
+when classify is enabled (R12; classify disabled keeps the flat `<crit>` key form unchanged).
 
 Counter OWNERSHIP (normative): `counts.*` keys are incremented ONLY by M10 (orchestrator),
 derived from batch tallies / EmitResult — stages must never touch them (double-count).
+v1.7: this includes `counts.fanout` — M10 meters it as the len-delta around the classify
+stage (§7.9); M13 never increments any `counts.*` key.
 Stage-scoped keys are incremented only by their stage: `dedup.*` by M3, `quality.judgment_failures`
 by M4, `annotate.sc_disagreements` by M5, `generate.buckets.*` by M6 (`survived_dedup` = records
 surviving M6's own MinHash novelty filter against seeds + siblings; M3 still dedups generated
-records on re-flow).
+records on re-flow), `classify.*` by M13 (v1.7), `quality.tie_*` by M4.
 
 ### 9.4 Atomic delivery
 
@@ -1894,6 +2200,59 @@ def samples_schema(num_per_call):
 
 All four are **[FROZEN HERE]** (spec fixes the shapes, not the exact schema JSON).
 
+v1.7 adds a fifth internal schema (M13; verbatim from spec 3.13.3):
+
+```python
+def classification_schema(class_names: list[str], assignment: str,
+                          max_labels: int, with_reason: bool) -> dict:
+    if assignment == "single":
+        props: dict = {"class": {"type": "string", "enum": list(class_names)}}
+        required = ["class"]
+    else:
+        props = {"classes": {"type": "array",
+                             "items": {"type": "string", "enum": list(class_names)},
+                             "minItems": 1, "maxItems": max_labels}}
+        required = ["classes"]
+    if with_reason:
+        props["reason"] = {"type": "string"}
+        required += ["reason"]
+    return {"type": "object", "properties": props,
+            "required": required, "additionalProperties": False}
+```
+
+NOTE (R1, normative): the multi form deliberately carries **NO `uniqueItems`** — OpenAI strict
+structured output and some constrained-decoding gateways hard-reject it, and L0 passes the
+schema through unconditionally. Duplicate labels are removed by M13's code-side normalization
+AFTER M8 validation (a narrowing of an already-validated set, §7.13); the internal-schema
+keyword set stays at zero growth.
+
+### 10.8 M13 classification prompt (spec 3.13.3, verbatim)
+
+```
+system:
+  single: 你是数据分类员。阅读待分类数据，判断它属于以下类别中的哪一类。类别表：
+  multi:  你是数据分类员。阅读待分类数据，判断它适用于以下哪些类别（至少 1 类，至多 {max_labels} 类）。类别表：
+  - {name}: {description}                       ← 按 [[classify.classes]] 声明序逐类一行
+  {classify.instruction}                        ← 可选补充说明；缺省省略此行
+  输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
+  single: {"class": <类名>[, "reason": <一句话理由>]}
+  multi:  {"classes": [<类名>, ...][, "reason": <一句话理由>]}   ← reason 仅请求时出现于两式
+user (对每条配置了 examples 的类，按声明序；类内按数组序):
+  [类别示例·{name}] {example}
+user (当前记录):
+  文本模态: [待分类数据] {record.text}
+  UI 模态:  [屏幕截图] <image: base64>
+           [UI 控件树] {record.ui_tree.serialize(max_chars=input.ui_tree_max_chars)}
+```
+
+`single:` / `multi:` prefixes select the `classify.assignment` variant of that line — exactly
+one is emitted. `reason` is requested iff `trace.enabled` and `"classify"` in `trace.channels`
+(R29, §7.13); when not requested, the structure line carries no reason fragment in either
+variant. UI modality: the current-record user message is THREE parts — text `[屏幕截图]`, the
+image part (encoded by M9 at call time), text `[UI 控件树]\n{serialize(...)}` — the same
+single-record assembly shape as §10.1 (R27). Deterministic string concatenation throughout;
+class table and per-class examples follow `[[classify.classes]]` declaration order.
+
 ---
 
 ## 11. Cross-cutting conventions (binding)
@@ -2033,5 +2392,21 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     all input" moves from "final filename exists" to "report.run.interrupted=false AND
     circuit_broken=false" (exit code alone is insufficient: graceful SIGINT delivers and
     exits 0).
+27. v1.7 classify (feature spec `docs/dev/SPEC-classify-operator.md`, rulings R1–R30;
+    2026-07-07). Key frozen points: `build_annotate_prompt` / `annotate_record` gain a
+    TRAILING optional `label: str | None = None` — an additive revision of the §7.4 frozen
+    signatures whose `None` default reproduces pre-v1.7 behavior with zero changes at old
+    call sites (R2); `counts.fanout` is OWNED BY M10, metered as the `len(batch)` delta
+    around the classify stage — M13 never touches `counts.*` (R9); `on_error="fallback"`
+    writes NO entry into `item.errors` — evidence goes to `Classification.detail` + the
+    `error` trace event + `classify.fallback`, keeping the §9.2 rejects attribution
+    (`errors[0]`) unpolluted (R4); `classification_schema` carries NO `uniqueItems`
+    (L0 strict-mode pass-through compatibility) — duplicate-label dedupe is code-side
+    normalization after M8 validation (R1). Additive-only surface elsewhere: rejects refs
+    lines grow to six keys (`label`), bucket keys gain the `<class>×` prefix, and events
+    gain `pool`/`label`/`fanout` payload fields ONLY when classify is enabled — classify
+    disabled is byte-identical to v1.6 output except `_meta.classification: null`. The new
+    module section is numbered §7.13 AFTER the pre-existing §7.12 CLI section so frozen
+    §7.x anchors in code and docs stay valid.
 
 — End of contract. —

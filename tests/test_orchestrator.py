@@ -20,9 +20,9 @@ from types import SimpleNamespace
 import pytest
 
 from labelkit.config.model import (
-    AnnotateConfig, Criterion, DedupConfig, GenerateConfig, InputConfig,
-    OutputConfig, QualityConfig, ResolvedConfig, Rubric, RunConfig, ToolConfig,
-    TraceConfig, VerifyConfig,
+    AnnotateConfig, ClassifyConfig, Criterion, DedupConfig, GenerateConfig,
+    InputConfig, OutputConfig, QualityConfig, ResolvedConfig, Rubric, RunConfig,
+    ToolConfig, TraceConfig, VerifyConfig,
 )
 from labelkit.errors import CircuitBreakerTripped
 from labelkit.obslog import EventLog, MetricsSink, TraceEvent
@@ -68,6 +68,7 @@ def make_cfg(tmp_path: Path, *, mode: str = "process", batch_size: int = 4,
                       fatal_error_threshold=fatal_threshold),
         input=InputConfig(),
         dedup=DedupConfig(enabled=dedup),
+        classify=ClassifyConfig(),
         quality=quality_cfg if quality_cfg is not None else QualityConfig(enabled=quality),
         generate=generate if generate is not None else GenerateConfig(),
         annotate=AnnotateConfig(enabled=annotate, instruction="标注" if annotate else ""),
@@ -78,6 +79,7 @@ def make_cfg(tmp_path: Path, *, mode: str = "process", batch_size: int = 4,
             Criterion(key="clarity", description="d", pairwise_prompt="p"),
             Criterion(key="usefulness", description="d", pairwise_prompt="p"),
         )),
+        class_views={},
         user_schema={"type": "object"},
         limit=limit,
         strict=strict,

@@ -3,7 +3,8 @@
 load(): three-source merge — CLI overrides > project.toml > config.toml/built-in
 defaults — plus FULL startup validation. Every validation error is aggregated into
 a single ConfigError (never first-error-only); unknown keys produce stderr
-warnings only (forward compatibility).
+warnings only (forward compatibility) — EXCEPT inside the v1.7 [class.*] override
+namespace, which M1 explicitly owns: keys outside the whitelist are errors (R25).
 
 default_rubric(): loads a packaged default rubric from labelkit/data/rubrics/.
 
@@ -32,6 +33,9 @@ from referencing.jsonschema import DRAFT202012
 
 from labelkit.config.model import (
     AnnotateConfig,
+    ClassifyConfig,
+    ClassSpec,
+    ClassView,
     CliOverrides,
     Criterion,
     DedupConfig,
@@ -64,7 +68,26 @@ _RUBRIC_PKG_FILES: dict[str, str] = {
     "default:ui": "default_ui.toml",
 }
 
-_TRACE_CHANNELS = ("ingest", "dedup", "quality", "annotate", "verify", "schema", "llm")
+_TRACE_CHANNELS = ("ingest", "dedup", "classify", "quality", "annotate", "verify",
+                   "schema", "llm")
+
+# v1.7 [class.<name>.<section>] override whitelist (spec 5.2 / R25): sections and
+# keys OUTSIDE this table are CONFIG_ERRORs, not forward-compat warnings — the
+# [class.*] namespace is explicitly owned by M1. "rubric" is the per-class inline
+# rubric sub-table companion of quality.rubric = "inline" (R7).
+_CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
+    "quality": ("mode", "rounds", "rubric", "threshold", "selection", "top_ratio"),
+    "annotate": ("instruction", "examples"),
+    "generate": ("instruction", "styles", "num_per_record", "temperature"),
+    "verify": ("extra_criteria",),
+}
+_CLASS_SECTIONS = ("quality", "rubric", "annotate", "generate", "verify")
+
+# The quality selection group (R6): the class providing ANY of these keys takes
+# over the whole group — the global side's values are dropped (back to built-in
+# defaults) before the class overrides apply, so a global threshold and a class
+# top_ratio (or vice versa) never spuriously coexist in the merged view.
+_SELECTION_GROUP = ("selection", "threshold", "top_ratio")
 
 
 # ── low-level helpers ──────────────────────────────────────────────────────
@@ -436,16 +459,19 @@ def _parse_criteria(col: _Collector, file: str, raw: Any,
     return tuple(criteria)
 
 
-def _parse_styles(col: _Collector, file: str, raw: Any) -> tuple[GenerateStyle, ...]:
+def _parse_styles(col: _Collector, file: str, raw: Any,
+                  section: str = "generate") -> tuple[GenerateStyle, ...]:
+    """`section` shifts error locations for the v1.7 per-class styles override
+    ("class.<name>.generate"); the default keeps the global [generate] wording."""
     if raw is _MISSING:
         return ()
     if not isinstance(raw, list):
-        col.error(f"{file}:[generate].styles: 期望表数组，得到 {_fmt(raw)}")
+        col.error(f"{file}:[{section}].styles: 期望表数组，得到 {_fmt(raw)}")
         return ()
     styles: list[GenerateStyle] = []
     seen: set[str] = set()
     for i, sub in enumerate(raw, 1):
-        label = f"[[generate.styles]][{i}]"
+        label = f"[[{section}.styles]][{i}]"
         if not isinstance(sub, dict):
             col.error(f"{file}:{label}: 期望表（table），得到 {_fmt(sub)}")
             continue
@@ -462,15 +488,18 @@ def _parse_styles(col: _Collector, file: str, raw: Any) -> tuple[GenerateStyle, 
     return tuple(styles)
 
 
-def _parse_examples(col: _Collector, file: str, raw: Any) -> tuple[FewShotExample, ...]:
+def _parse_examples(col: _Collector, file: str, raw: Any,
+                    section: str = "annotate") -> tuple[FewShotExample, ...]:
+    """`section` shifts error locations for the v1.7 per-class examples override
+    ("class.<name>.annotate"); the default keeps the global [annotate] wording."""
     if raw is _MISSING:
         return ()
     if not isinstance(raw, list):
-        col.error(f"{file}:[annotate].examples: 期望表数组，得到 {_fmt(raw)}")
+        col.error(f"{file}:[{section}].examples: 期望表数组，得到 {_fmt(raw)}")
         return ()
     examples: list[FewShotExample] = []
     for i, sub in enumerate(raw, 1):
-        label = f"[[annotate.examples]][{i}]"
+        label = f"[[{section}.examples]][{i}]"
         if not isinstance(sub, dict):
             col.error(f"{file}:{label}: 期望表（table），得到 {_fmt(sub)}")
             continue
@@ -487,6 +516,40 @@ def _parse_examples(col: _Collector, file: str, raw: Any) -> tuple[FewShotExampl
         if inp is not None and out is not None:
             examples.append(FewShotExample(input=inp, output=out))
     return tuple(examples)
+
+
+def _parse_classes(col: _Collector, file: str, raw: Any) -> tuple[ClassSpec, ...]:
+    """Parse the [[classify.classes]] array of tables (spec 5.2 v1.7): name
+    matches [a-z0-9_]+ and is unique within the table, description is non-empty,
+    examples is an optional string array (input-side few-shot lines only)."""
+    if raw is _MISSING:
+        return ()
+    if not isinstance(raw, list):
+        col.error(f"{file}:[classify].classes: 期望表数组，得到 {_fmt(raw)}")
+        return ()
+    classes: list[ClassSpec] = []
+    seen: set[str] = set()
+    for i, sub in enumerate(raw, 1):
+        label = f"[[classify.classes]][{i}]"
+        if not isinstance(sub, dict):
+            col.error(f"{file}:{label}: 期望表（table），得到 {_fmt(sub)}")
+            continue
+        t = _Tbl(col, file, label, sub)
+        name = t.get_str("name", None, required=True, nonempty=True)
+        if name is not None and not _KEY_RE.fullmatch(name):
+            col.error(f"{file}:{label}.name: 期望匹配 [a-z0-9_]+，得到 {_fmt(name)}")
+            name = None
+        description = t.get_str("description", None, required=True, nonempty=True)
+        examples = t.get_str_tuple("examples", ())
+        t.finish()
+        if name is not None:
+            if name in seen:
+                col.error(f"{file}:{label}.name: 表内 name 须唯一，得到重复的 {_fmt(name)}")
+            seen.add(name)
+        if name is not None and description is not None:
+            classes.append(ClassSpec(name=name, description=description,
+                                     examples=examples))
+    return tuple(classes)
 
 
 def _parse_judgment_reasons(col: _Collector, t: _Tbl) -> bool | str:
@@ -541,6 +604,28 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
         semantic_embedding=t.get_str("semantic_embedding", None, nonempty=True),
         semantic_threshold=t.get_float("semantic_threshold", 0.95, gt=0, le=1),
     )
+    t.finish()
+
+    classify_section = _section(col, top, "classify")
+    t = _Tbl(col, file, "[classify]", classify_section)
+    classify = ClassifyConfig(
+        enabled=t.get_bool("enabled", False),
+        llm=t.get_str("llm", "default", nonempty=True),
+        assignment=t.get_str("assignment", "single", enum=("single", "multi")),
+        max_labels=t.get_int("max_labels", None),      # range [2, len(classes)] checked in load()
+        instruction=t.get_str("instruction", "") or "",
+        fallback_class=t.get_str("fallback_class", "") or "",
+        self_consistency=t.get_int("self_consistency", 0, minimum=0),
+        sc_temperature=t.get_float("sc_temperature", 0.7, ge=0),
+        on_error=t.get_str("on_error", "fallback", enum=("fallback", "fail")),
+        classes=_parse_classes(col, file, t.take("classes")),
+    )
+    # distinguish "explicitly set" from "dataclass default" (same pattern as
+    # gen_provided below): max_labels is multi-only, classes drives R8
+    classify_provided = {
+        "classes": isinstance(classify_section, dict) and "classes" in classify_section,
+        "max_labels": isinstance(classify_section, dict) and "max_labels" in classify_section,
+    }
     t.finish()
 
     quality_section = _section(col, top, "quality")
@@ -638,9 +723,16 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
     # parses it lazily during rubric resolution.
     rubric_raw = _section(col, top, "rubric")
 
+    # [class.<name>.<section>] (v1.7) is likewise passed through raw: the
+    # whitelist check and per-class merge need the resolved global sections
+    # AND the resolved global rubric, so load() owns them.
+    class_raw = _section(col, top, "class")
+
     top.finish()
     return dict(
-        run=run, input=input_cfg, dedup=dedup, quality=quality, generate=generate,
+        run=run, input=input_cfg, dedup=dedup, classify=classify,
+        classify_provided=classify_provided, class_raw=class_raw,
+        quality=quality, generate=generate,
         gen_provided=gen_provided, top_ratio_provided=top_ratio_provided,
         annotate=annotate, verify=verify, output=output,
         trace=trace, rubric_raw=rubric_raw,
@@ -749,6 +841,231 @@ def _load_user_schema(col: _Collector, file: str, output: OutputConfig) -> tuple
     return schema, ok
 
 
+# ── rubric resolution / few-shot dry-run / per-class merge (v1.7 helpers) ──
+
+
+def _resolve_rubric(col: _Collector, file: str, selector: str, raw: Any,
+                    modality: str, scope: str = "") -> tuple[Rubric, bool]:
+    """Resolve one effective rubric from its (already-defaulted, non-empty)
+    selector plus the optional inline table `raw` (None when absent) — the
+    load()-tail inline-rubric logic factored out so per-class views can
+    re-resolve with merged selectors (R7). `scope` is "" for the global rubric
+    or "class.<name>" for a class view; it only shifts error/warning locations
+    ([rubric] ↔ [class.<name>.rubric]). Returns (rubric, is_inline)."""
+    prefix = f"{scope}." if scope else ""
+    if selector == "inline":
+        if raw is None:
+            col.error(f'{file}:[{prefix}quality].rubric: rubric = "inline" '
+                      f'但未提供 [[{prefix}rubric.criteria]]')
+            return _fallback_default_rubric(col, modality), False
+        t = _Tbl(col, file, f"[{prefix}rubric]", raw)
+        name = t.get_str("name", None, required=True, nonempty=True)
+        raw_criteria = t.take("criteria")
+        t.finish()
+        if raw_criteria is _MISSING or (isinstance(raw_criteria, list) and not raw_criteria):
+            col.error(f"{file}:[{prefix}rubric].criteria: criteria 不得为空，期望非空表数组")
+            criteria: tuple[Criterion, ...] = ()
+        else:
+            criteria = _parse_criteria(col, file, raw_criteria,
+                                       label=f"{prefix}rubric.criteria")
+        return Rubric(name=name or "inline", criteria=criteria), True
+    try:
+        rubric = default_rubric(selector)  # type: ignore[arg-type]
+    except Exception as e:  # pragma: no cover — packaged files are shipped valid
+        col.error(f"{selector}: 默认 rubric 装载失败：{e}")
+        rubric = Rubric(name=selector, criteria=())
+    if raw is not None:
+        col.warn(f"{file}:[[{prefix}rubric.criteria]]: quality.rubric = {_fmt(selector)}，"
+                 f"内联 rubric 未生效，已忽略")
+    return rubric, False
+
+
+def _check_pointwise_rubric(col: _Collector, file: str, rubric: Rubric, *,
+                            is_inline: bool, selector: str, scope: str = "") -> None:
+    """Pointwise mode requires exactly 6 levels per criterion (spec 3.1.4 rubric
+    row). v1.7 runs this on every distinct (effective mode × effective rubric)
+    combination — global and per-class (R7); the caller dedupes rubrics already
+    checked so shared tables are flagged once."""
+    prefix = f"{scope}." if scope else ""
+    for i, c in enumerate(rubric.criteria, 1):
+        if len(c.pointwise_levels) != 6:
+            loc = (f"{file}:[[{prefix}rubric.criteria]][{i}].pointwise_levels" if is_inline
+                   else f"{selector}:criteria[{i}].pointwise_levels")
+            col.error(f"{loc}: pointwise 模式要求恰好 6 级（0–5），"
+                      f"得到 {len(c.pointwise_levels)} 级")
+
+
+def _dryrun_fewshot(col: _Collector, file: str, examples: tuple[FewShotExample, ...],
+                    elem_label: str, *, validator: Any, schema_key: str,
+                    hook: Any, hook_ref: str | None) -> tuple[bool, bool]:
+    """Dry-run few-shot example outputs through the user schema (rule 14) and
+    the output.validator hook (rule 17) — shared by the global [[annotate.
+    examples]] and the v1.7 per-class [[class.<name>.annotate.examples]] sets
+    (`elem_label` carries the location). Either part is skipped when its
+    `validator` / `hook` argument is None. Returns (schema_alive, hook_alive):
+    a False flag tells the caller to stop dry-running FURTHER example sets on
+    that layer — the cause (unresolvable schema $ref / hook raising) lies in
+    the schema or hook itself, so one error line suffices."""
+    schema_alive = True
+    if validator is not None:
+        for i, ex in enumerate(examples, 1):
+            try:
+                errs = sorted(validator.iter_errors(ex.output),
+                              key=lambda e: list(e.absolute_path))
+            except Exception as e:
+                # Backstop for resolution failures the rule-13 walk cannot see
+                # (e.g. $dynamicRef): iter_errors raises a referencing error
+                # (jsonschema.exceptions._WrappedReferencingError /
+                # referencing.exceptions.Unresolvable). Per spec 3.1.5 this must
+                # join the aggregated ConfigError (exit 2), never escape as an
+                # unhandled crash (exit 4). One error suffices — the cause is
+                # the schema itself, not any individual example.
+                col.error(f"{file}:[output].{schema_key}: 用户 Schema 引用无法解析，"
+                          f"无法校验 [[{elem_label}]] 示例输出：{e}")
+                schema_alive = False
+                break
+            if errs:
+                e0 = errs[0]
+                ptr = "/" + "/".join(str(x) for x in e0.absolute_path)
+                col.error(f"{file}:[[{elem_label}]][{i}].output: 未通过用户 Schema："
+                          f"{ptr}: {e0.message}")
+    hook_alive = True
+    if hook is not None:
+        # Dry-run every few-shot output through the hook: an example the
+        # user's own validator rejects is a config error, caught at startup.
+        for i, ex in enumerate(examples, 1):
+            try:
+                violations = normalize_violations(hook(dict(ex.output), None), hook_ref)
+            except Exception as e:  # hook bug — surface as config error, not exit 4
+                col.error(f"{file}:[output].validator: few-shot 干跑第 {i} 条示例时"
+                          f"回调抛出异常：{type(e).__name__}: {e}")
+                hook_alive = False
+                break
+            if violations:
+                col.error(f"{file}:[[{elem_label}]][{i}].output: 未通过 "
+                          f"output.validator 回调：{violations[0]}")
+    return schema_alive, hook_alive
+
+
+def _merge_class_sections(
+        col: _Collector, file: str, cname: str, sections: dict,
+        base_quality: QualityConfig, base_annotate: AnnotateConfig,
+        base_generate: GenerateConfig, base_verify: VerifyConfig,
+) -> tuple[QualityConfig, AnnotateConfig, GenerateConfig, VerifyConfig, dict]:
+    """Merge one class's [class.<name>.*] override sections onto the resolved
+    global configs (spec 5.2 v1.7). Per-key provenance: a key the class provides
+    overrides the global value, everything else is inherited. `base_quality`
+    carries the defaulted global rubric selector in its `rubric` field.
+
+    - Whitelist (R25): sections outside _CLASS_SECTIONS and keys outside
+      _CLASS_SECTION_KEYS are CONFIG_ERRORs — the [class.*] namespace is owned
+      by M1, so the forward-compat unknown-key warning does NOT apply here.
+    - Selection group (R6): providing ANY of selection/threshold/top_ratio makes
+      the class take over the whole group — the unprovided group keys restart
+      from the BUILT-IN defaults (not the global values), so a global threshold
+      and a class top_ratio (or vice versa) never spuriously coexist. The
+      rule-6 family (required-iff / mutual exclusion / no-op warning) then runs
+      on the merged view.
+    - The [class.<name>.rubric] table is NOT consumed here: rubric re-resolution
+      (R7) needs the merged selector, so it is returned raw via `info`.
+
+    Returns (quality, annotate, generate, verify, info) with info =
+    {"rubric_raw", "examples_provided"}."""
+    for sect, sub in sections.items():
+        if sect not in _CLASS_SECTIONS:
+            col.error(f"{file}:[class.{cname}.{sect}]: [class.*] 覆盖节不在白名单内"
+                      f"（可用：{'、'.join(_CLASS_SECTIONS)}）")
+            continue
+        if not isinstance(sub, dict):
+            col.error(f"{file}:[class.{cname}.{sect}]: 期望表（table），得到 {_fmt(sub)}")
+            continue
+        if sect == "rubric":
+            continue  # structure validated by _resolve_rubric (same as global [rubric])
+        allowed = _CLASS_SECTION_KEYS[sect]
+        for k in sub:
+            if k not in allowed:
+                col.error(f"{file}:[class.{cname}.{sect}].{k}: [class.*.{sect}] "
+                          f"不可覆盖该键（白名单：{'、'.join(allowed)}）")
+
+    def _sect(name: str) -> dict:
+        sub = sections.get(name)
+        return sub if isinstance(sub, dict) else {}
+
+    # ── quality: selection-group takeover (R6), then per-key overrides ────
+    q_over = _sect("quality")
+    group_taken = any(k in q_over for k in _SELECTION_GROUP)
+    base_q = (replace(base_quality, selection="threshold", threshold=None, top_ratio=None)
+              if group_taken else base_quality)
+    t = _Tbl(col, file, f"[class.{cname}.quality]", q_over)
+    quality = replace(
+        base_q,
+        mode=t.get_str("mode", base_q.mode, enum=("pairwise", "pointwise")),
+        rounds=t.get_int("rounds", base_q.rounds, minimum=1),
+        rubric=t.get_str("rubric", base_q.rubric,
+                         enum=("default:text", "default:ui", "inline")),
+        threshold=t.get_float("threshold", base_q.threshold, ge=0, le=1),
+        selection=t.get_str("selection", base_q.selection,
+                            enum=("threshold", "top_ratio")),
+        top_ratio=t.get_float("top_ratio", base_q.top_ratio, gt=0, le=1),
+    )
+    if group_taken:
+        # Rule-6 family on the MERGED view (an untouched group was already
+        # validated globally, so re-checking would only duplicate errors).
+        if quality.selection == "top_ratio":
+            if quality.top_ratio is None and "top_ratio" not in q_over:
+                col.error(f'{file}:[class.{cname}.quality].top_ratio: selection = '
+                          f'"top_ratio" 时必填，期望 (0,1] 内的数值')
+            if quality.threshold is not None:
+                col.error(f'{file}:[class.{cname}.quality].threshold: 与 '
+                          f'quality.top_ratio 互斥（selection = "top_ratio" 时不得设置）')
+        elif "top_ratio" in q_over:
+            # Same silent-footgun guard as the global P3-7 warning.
+            col.warn(f'{file}:[class.{cname}.quality].top_ratio: selection 仍为默认 '
+                     f'"threshold"，该键不会生效——要按比例定量保留请同时设 '
+                     f'selection = "top_ratio"')
+
+    # ── annotate ───────────────────────────────────────────────────────────
+    a_over = _sect("annotate")
+    t = _Tbl(col, file, f"[class.{cname}.annotate]", a_over)
+    examples_provided = "examples" in a_over
+    annotate = replace(
+        base_annotate,
+        instruction=t.get_str("instruction", base_annotate.instruction, nonempty=True),
+        examples=(_parse_examples(col, file, t.take("examples"),
+                                  section=f"class.{cname}.annotate")
+                  if examples_provided else base_annotate.examples),
+    )
+
+    # ── generate ───────────────────────────────────────────────────────────
+    g_over = _sect("generate")
+    t = _Tbl(col, file, f"[class.{cname}.generate]", g_over)
+    generate = replace(
+        base_generate,
+        instruction=t.get_str("instruction", base_generate.instruction, nonempty=True),
+        styles=(_parse_styles(col, file, t.take("styles"),
+                              section=f"class.{cname}.generate")
+                if "styles" in g_over else base_generate.styles),
+        num_per_record=t.get_int("num_per_record", base_generate.num_per_record,
+                                 minimum=1),
+        temperature=t.get_float("temperature", base_generate.temperature, ge=0),
+    )
+
+    # ── verify ─────────────────────────────────────────────────────────────
+    v_over = _sect("verify")
+    t = _Tbl(col, file, f"[class.{cname}.verify]", v_over)
+    verify = replace(
+        base_verify,
+        extra_criteria=t.get_str("extra_criteria", base_verify.extra_criteria),
+    )
+
+    rubric_raw = sections.get("rubric")
+    info = {
+        "rubric_raw": rubric_raw if isinstance(rubric_raw, dict) else None,
+        "examples_provided": examples_provided,
+    }
+    return quality, annotate, generate, verify, info
+
+
 # ── public API ─────────────────────────────────────────────────────────────
 
 
@@ -820,6 +1137,9 @@ def load(config_path: Path, project_path: Path,
     run: dict[str, Any] = p["run"]
     input_cfg: InputConfig = p["input"]
     dedup: DedupConfig = p["dedup"]
+    classify: ClassifyConfig = p["classify"]
+    classify_provided: dict[str, bool] = p["classify_provided"]
+    class_raw: Any = p["class_raw"]
     quality: QualityConfig = p["quality"]
     generate: GenerateConfig = p["generate"]
     gen_provided: dict[str, bool] = p["gen_provided"]
@@ -843,6 +1163,10 @@ def load(config_path: Path, project_path: Path,
             col.error(f"{loc}: 引用的 profile {_fmt(name)} 不存在于 config.toml [llm.*]，"
                       f"可用：{avail}")
 
+    if classify.enabled:
+        # like verify below: the default reference ("default") need not exist
+        # while the stage is disabled (v1.7, R24 reference-set point ①)
+        _check_llm_ref(f"{fp}:[classify].llm", classify.llm)
     _check_llm_ref(f"{fp}:[quality].llm", quality.llm)
     _check_llm_ref(f"{fp}:[annotate].llm", annotate.llm)
     for i, name in enumerate(generate.llms, 1):
@@ -863,6 +1187,8 @@ def load(config_path: Path, project_path: Path,
 
     if modality == "ui":
         vision_users: dict[str, set[str]] = {}
+        if classify.enabled:
+            vision_users.setdefault(classify.llm, set()).add("classify")
         if quality.enabled:
             quality_refs = (quality.judges
                             if quality.judges and quality.mode == "pairwise"
@@ -972,6 +1298,8 @@ def load(config_path: Path, project_path: Path,
     # cli.referenced_profiles) — the reference sets must agree with runtime.
     quality_judges_active = bool(quality.judges) and quality.mode == "pairwise"
     referenced: set[str] = set()
+    if classify.enabled:
+        referenced.add(classify.llm)     # v1.7, R24 reference-set point ②
     if quality.enabled:
         referenced |= set(quality.judges) if quality_judges_active else {quality.llm}
     if annotate.enabled:
@@ -1019,29 +1347,13 @@ def load(config_path: Path, project_path: Path,
 
     # ── rules 13–15 — user schema + few-shot examples ─────────────────────
     user_schema, schema_ok = _load_user_schema(col, fp, output)
-    if schema_ok and annotate.examples:
-        skey = "schema_inline" if output.schema_inline is not None else "schema_path"
-        validator = Draft202012Validator(user_schema)
-        for i, ex in enumerate(annotate.examples, 1):
-            try:
-                errs = sorted(validator.iter_errors(ex.output),
-                              key=lambda e: list(e.absolute_path))
-            except Exception as e:
-                # Backstop for resolution failures the rule-13 walk cannot see
-                # (e.g. $dynamicRef): iter_errors raises a referencing error
-                # (jsonschema.exceptions._WrappedReferencingError /
-                # referencing.exceptions.Unresolvable). Per spec 3.1.5 this must
-                # join the aggregated ConfigError (exit 2), never escape as an
-                # unhandled crash (exit 4). One error suffices — the cause is
-                # the schema itself, not any individual example.
-                col.error(f"{fp}:[output].{skey}: 用户 Schema 引用无法解析，"
-                          f"无法校验 [[annotate.examples]] 示例输出：{e}")
-                break
-            if errs:
-                e0 = errs[0]
-                ptr = "/" + "/".join(str(x) for x in e0.absolute_path)
-                col.error(f"{fp}:[[annotate.examples]][{i}].output: 未通过用户 Schema："
-                          f"{ptr}: {e0.message}")
+    skey = "schema_inline" if output.schema_inline is not None else "schema_path"
+    schema_validator = Draft202012Validator(user_schema) if schema_ok else None
+    schema_alive = True                  # False once a $ref-resolution backstop fired
+    if schema_validator is not None and annotate.examples:
+        schema_alive, _ = _dryrun_fewshot(
+            col, fp, annotate.examples, "annotate.examples",
+            validator=schema_validator, schema_key=skey, hook=None, hook_ref=None)
 
     # ── rule 17 — validation hooks (v1.5 plan A, spec 3.8.2/3.6.2) ────────
     output_hook = None
@@ -1055,58 +1367,137 @@ def load(config_path: Path, project_path: Path,
             resolve_hook(generate.sample_validator)
         except ValueError as e:
             col.error(f"{fp}:[generate].sample_validator: {e}")
+    hook_alive = True                    # False once the hook itself raised
     if output_hook is not None and schema_ok and annotate.examples:
-        # Dry-run every few-shot output through the hook: an example the
-        # user's own validator rejects is a config error, caught at startup.
-        for i, ex in enumerate(annotate.examples, 1):
-            try:
-                violations = normalize_violations(output_hook(dict(ex.output), None),
-                                                  output.validator)
-            except Exception as e:  # hook bug — surface as config error, not exit 4
-                col.error(f"{fp}:[output].validator: few-shot 干跑第 {i} 条示例时"
-                          f"回调抛出异常：{type(e).__name__}: {e}")
-                break
-            if violations:
-                col.error(f"{fp}:[[annotate.examples]][{i}].output: 未通过 "
-                          f"output.validator 回调：{violations[0]}")
+        _, hook_alive = _dryrun_fewshot(
+            col, fp, annotate.examples, "annotate.examples",
+            validator=None, schema_key=skey, hook=output_hook,
+            hook_ref=output.validator)
 
     # ── rule 16 — rubric resolution + validation ──────────────────────────
     selector = quality.rubric or ("default:ui" if modality == "ui" else "default:text")
-    rubric: Rubric
-    rubric_is_inline = False
-    if selector == "inline":
-        if rubric_raw is None:
-            col.error(f'{fp}:[quality].rubric: rubric = "inline" 但未提供 [[rubric.criteria]]')
-            rubric = _fallback_default_rubric(col, modality)
-        else:
-            t = _Tbl(col, fp, "[rubric]", rubric_raw)
-            name = t.get_str("name", None, required=True, nonempty=True)
-            raw_criteria = t.take("criteria")
-            t.finish()
-            if raw_criteria is _MISSING or (isinstance(raw_criteria, list) and not raw_criteria):
-                col.error(f"{fp}:[rubric].criteria: criteria 不得为空，期望非空表数组")
-                criteria: tuple[Criterion, ...] = ()
-            else:
-                criteria = _parse_criteria(col, fp, raw_criteria)
-            rubric = Rubric(name=name or "inline", criteria=criteria)
-            rubric_is_inline = True
-    else:
-        try:
-            rubric = default_rubric(selector)  # type: ignore[arg-type]
-        except Exception as e:  # pragma: no cover — packaged files are shipped valid
-            col.error(f"{selector}: 默认 rubric 装载失败：{e}")
-            rubric = Rubric(name=selector, criteria=())
-        if rubric_raw is not None:
-            col.warn(f"{fp}:[[rubric.criteria]]: quality.rubric = {_fmt(selector)}，"
-                     f"内联 rubric 未生效，已忽略")
-
+    rubric, rubric_is_inline = _resolve_rubric(col, fp, selector, rubric_raw, modality)
     if quality.mode == "pointwise":
-        for i, c in enumerate(rubric.criteria, 1):
-            if len(c.pointwise_levels) != 6:
-                loc = (f"{fp}:[[rubric.criteria]][{i}].pointwise_levels" if rubric_is_inline
-                       else f"{selector}:criteria[{i}].pointwise_levels")
-                col.error(f"{loc}: pointwise 模式要求恰好 6 级（0–5），"
-                          f"得到 {len(c.pointwise_levels)} 级")
+        _check_pointwise_rubric(col, fp, rubric, is_inline=rubric_is_inline,
+                                selector=selector)
+
+    # ── v1.7 — classify + per-class views (spec 5.2; R6/R7/R8/R24/R25) ────
+    sc_c = classify.self_consistency
+    if sc_c != 0 and (sc_c < 3 or sc_c % 2 == 0):
+        col.error(f"{fp}:[classify].self_consistency: 期望 0 或 ≥3 的奇数，得到 {sc_c}")
+    if classify_provided["max_labels"] and classify.assignment != "multi":
+        col.error(f'{fp}:[classify].max_labels: 仅 assignment = "multi" 时可设置')
+
+    class_views: dict[str, ClassView] = {}
+    class_names = tuple(c.name for c in classify.classes)
+    if not classify.enabled:
+        # R8: parked class config is legal — warn once, naming the ignored
+        # tables (aligned with the top_ratio no-op family, NOT an error).
+        ignored = (["[[classify.classes]]"] if classify_provided["classes"] else [])
+        if isinstance(class_raw, dict):
+            ignored += [f"[class.{n}]" for n in class_raw]
+        if ignored:
+            col.warn(f"{fp}:[classify].enabled: classify.enabled = false，"
+                     f"{'、'.join(ignored)} 不会生效，已忽略（留配置、关开关合法）")
+    else:
+        avail = "、".join(class_names) if class_names else "（无）"
+        if len(classify.classes) < 2:
+            col.error(f"{fp}:[classify].classes: classify.enabled = true 时须声明 "
+                      f"≥ 2 个类别（[[classify.classes]] 表数组），"
+                      f"得到 {len(classify.classes)} 个")
+        if not classify.fallback_class:
+            col.error(f"{fp}:[classify].fallback_class: classify.enabled = true 时必填，"
+                      f"期望 [[classify.classes]] 中的类名")
+        elif class_names and classify.fallback_class not in class_names:
+            col.error(f"{fp}:[classify].fallback_class: 引用的类名 "
+                      f"{_fmt(classify.fallback_class)} 不在 [[classify.classes]] 中，"
+                      f"可用：{avail}")
+        if (classify.max_labels is not None and len(class_names) >= 2
+                and not 2 <= classify.max_labels <= len(class_names)):
+            col.error(f"{fp}:[classify].max_labels: 期望 [2, {len(class_names)}] "
+                      f"内的整数（上界 = 类别数），得到 {classify.max_labels}")
+        if classify.max_labels is None:
+            classify = replace(classify, max_labels=len(class_names))  # spec 5.2 backfill
+
+        if isinstance(class_raw, dict):
+            for cname in class_raw:
+                if cname not in class_names:
+                    col.error(f"{fp}:[class.{cname}]: 类名 {_fmt(cname)} 不在 "
+                              f"[[classify.classes]] 中，可用：{avail}")
+
+        # Materialize one merged view PER DECLARED CLASS (zero-override classes
+        # included) so downstream operators never fall back at runtime.
+        base_q = replace(quality, rubric=selector)
+        global_rubric_key = "[[rubric.criteria]]" if rubric_is_inline else selector
+        pointwise_checked: set[str] = (
+            {global_rubric_key} if quality.mode == "pointwise" else set())
+        for cspec in classify.classes:
+            cname = cspec.name
+            sections = class_raw.get(cname) if isinstance(class_raw, dict) else None
+            if sections is not None and not isinstance(sections, dict):
+                col.error(f"{fp}:[class.{cname}]: 期望表（table），得到 {_fmt(sections)}")
+                sections = None
+            if sections:
+                q_c, a_c, g_c, v_c, info = _merge_class_sections(
+                    col, fp, cname, sections, base_q, annotate, generate, verify)
+            else:
+                q_c, a_c, g_c, v_c = base_q, annotate, generate, verify
+                info = {"rubric_raw": None, "examples_provided": False}
+
+            # rubric (R7): merged selector → re-resolve; per-key provenance for
+            # the inline table ([class.<name>.rubric] beats the global [rubric])
+            raw_c = info["rubric_raw"]
+            if q_c.rubric == "inline":
+                if raw_c is not None:
+                    rubric_c, inline_c = _resolve_rubric(
+                        col, fp, "inline", raw_c, modality, scope=f"class.{cname}")
+                    rkey, rscope = f"[[class.{cname}.rubric.criteria]]", f"class.{cname}"
+                elif selector == "inline":
+                    # inherited global inline product (incl. its fallback path)
+                    rubric_c, inline_c = rubric, rubric_is_inline
+                    rkey, rscope = global_rubric_key, ""
+                else:
+                    # class switched to inline without providing its table —
+                    # same rule as global: inline requires the companion table
+                    col.error(f'{fp}:[class.{cname}.quality].rubric: rubric = '
+                              f'"inline" 但未提供 [[class.{cname}.rubric.criteria]]')
+                    rubric_c = _fallback_default_rubric(col, modality)
+                    inline_c, rkey, rscope = False, None, ""
+            else:
+                if raw_c is not None:
+                    col.warn(f"{fp}:[[class.{cname}.rubric.criteria]]: quality.rubric = "
+                             f"{_fmt(q_c.rubric)}，内联 rubric 未生效，已忽略")
+                if q_c.rubric == selector and not rubric_is_inline:
+                    rubric_c = rubric    # same packaged default as the global one
+                else:
+                    try:
+                        rubric_c = default_rubric(q_c.rubric)  # type: ignore[arg-type]
+                    except Exception as e:  # pragma: no cover — shipped valid
+                        col.error(f"{q_c.rubric}: 默认 rubric 装载失败：{e}")
+                        rubric_c = Rubric(name=q_c.rubric, criteria=())
+                inline_c, rkey, rscope = False, q_c.rubric, ""
+
+            # pointwise 6-level check on the (class mode × class rubric)
+            # combination; rubrics already checked are skipped (dedup).
+            if q_c.mode == "pointwise" and rkey is not None and rkey not in pointwise_checked:
+                pointwise_checked.add(rkey)
+                _check_pointwise_rubric(col, fp, rubric_c, is_inline=inline_c,
+                                        selector=rkey, scope=rscope)
+
+            # class-provided examples dry-run against the GLOBAL user schema and
+            # validator hook (inherited examples were already dry-run above)
+            if info["examples_provided"] and a_c.examples:
+                v_arg = schema_validator if schema_alive else None
+                h_arg = output_hook if (hook_alive and schema_ok) else None
+                s_ok, h_ok = _dryrun_fewshot(
+                    col, fp, a_c.examples, f"class.{cname}.annotate.examples",
+                    validator=v_arg, schema_key=skey, hook=h_arg,
+                    hook_ref=output.validator)
+                schema_alive = schema_alive and s_ok
+                hook_alive = hook_alive and h_ok
+
+            class_views[cname] = ClassView(name=cname, quality=q_c, rubric=rubric_c,
+                                           annotate=a_c, generate=g_c, verify=v_c)
 
     # ── rules 17–19 — stage combination matrix (spec 2.3.1 ①–③) ───────────
     if not annotate.enabled and not quality.enabled:
@@ -1199,6 +1590,7 @@ def load(config_path: Path, project_path: Path,
         ),
         input=input_cfg,
         dedup=dedup,
+        classify=classify,               # max_labels already backfilled when enabled
         quality=replace(quality, rubric=selector),
         generate=generate,
         annotate=annotate,
@@ -1206,6 +1598,7 @@ def load(config_path: Path, project_path: Path,
         output=output,
         trace=replace(trace, path=trace_path),
         rubric=rubric,
+        class_views=class_views,
         user_schema=user_schema,
         limit=cli.limit,
         strict=cli.strict,

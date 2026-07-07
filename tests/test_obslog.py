@@ -11,6 +11,7 @@ import pytest
 from labelkit import obslog
 from labelkit.config.model import (
     AnnotateConfig,
+    ClassifyConfig,
     Criterion,
     DedupConfig,
     GenerateConfig,
@@ -48,6 +49,7 @@ def make_cfg(tmp_path, *, tool: ToolConfig | None = None,
                       input=str(tmp_path), fatal_error_threshold=3),
         input=input_cfg or InputConfig(),
         dedup=DedupConfig(),
+        classify=ClassifyConfig(),
         quality=QualityConfig(),
         generate=GenerateConfig(),
         annotate=AnnotateConfig(),
@@ -56,6 +58,7 @@ def make_cfg(tmp_path, *, tool: ToolConfig | None = None,
         trace=trace or TraceConfig(),
         rubric=Rubric(name="t", criteria=(
             Criterion(key="clarity", description="d", pairwise_prompt="p"),)),
+        class_views={},
         user_schema={"type": "object"},
         limit=None,
         strict=False,

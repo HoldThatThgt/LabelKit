@@ -1023,3 +1023,468 @@ def test_sample_validator_checked_when_generate_enabled(env):
     ))
     has(errors, "[generate].sample_validator")
     has(errors, "不是可调用对象")
+
+
+# ── v1.7: [classify] parsing + validation (spec 5.2; R8/R21/R24) ────────────
+
+CLASSIFY_BODY = """\
+[classify]
+enabled = true
+fallback_class = "other"
+
+[[classify.classes]]
+name = "writing"
+description = "写作协助类指令"
+
+[[classify.classes]]
+name = "qa"
+description = "知识问答类指令"
+examples = ["世界上最高的山峰是哪座？"]
+
+[[classify.classes]]
+name = "other"
+description = "不属于以上任何一类的指令"
+"""
+
+
+def test_classify_defaults_when_absent(env):
+    cfg = env.load()
+    assert cfg.classify.enabled is False
+    assert cfg.classify.llm == "default"
+    assert cfg.classify.assignment == "single"
+    assert cfg.classify.max_labels is None        # backfill happens only when enabled
+    assert cfg.classify.fallback_class == ""
+    assert cfg.classify.self_consistency == 0
+    assert cfg.classify.sc_temperature == 0.7
+    assert cfg.classify.on_error == "fallback"
+    assert cfg.classify.classes == ()
+    assert cfg.class_views == {}
+
+
+def test_classify_happy_path_materializes_all_views(env):
+    body = CLASSIFY_BODY + """
+[class.writing.quality]
+threshold = 0.25
+[class.writing.annotate]
+instruction = "你是写作类指令的意图标注员。"
+"""
+    cfg = env.load(project_text=env.project(body=body))
+    assert [c.name for c in cfg.classify.classes] == ["writing", "qa", "other"]
+    assert cfg.classify.classes[1].examples == ("世界上最高的山峰是哪座？",)
+    assert cfg.classify.fallback_class == "other"
+    assert cfg.classify.max_labels == 3           # backfilled to len(classes)
+    # every declared class gets a view — zero-override classes included
+    assert set(cfg.class_views) == {"writing", "qa", "other"}
+    w = cfg.class_views["writing"]
+    assert w.quality.threshold == 0.25            # override applied
+    assert w.quality.mode == "pairwise"           # everything else inherited
+    assert w.annotate.instruction == "你是写作类指令的意图标注员。"
+    assert w.annotate.examples == cfg.annotate.examples
+    q = cfg.class_views["qa"]                     # zero-override view = global
+    assert q.quality.threshold is None
+    assert q.quality.rubric == "default:text"     # selector backfilled per view
+    assert q.annotate.instruction == cfg.annotate.instruction
+    assert q.rubric is cfg.rubric                 # same resolved rubric object
+    assert q.generate == cfg.generate
+    assert q.verify == cfg.verify
+    # the global sections themselves are untouched by per-class overrides
+    assert cfg.quality.threshold is None
+    assert cfg.annotate.instruction == "标注意图"
+
+
+def test_classify_trace_channel_accepted(env):
+    body = CLASSIFY_BODY + '\n[trace]\nenabled = true\nchannels = ["classify", "quality"]'
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.trace.channels == ("classify", "quality")
+
+
+def test_classify_requires_two_classes(env):
+    body = """\
+[classify]
+enabled = true
+fallback_class = "solo"
+
+[[classify.classes]]
+name = "solo"
+description = "唯一类"
+"""
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[classify].classes: classify.enabled = true 时须声明 ≥ 2 个类别")
+
+
+def test_classify_fallback_required_and_member(env):
+    body = CLASSIFY_BODY.replace('fallback_class = "other"\n', "")
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[classify].fallback_class: classify.enabled = true 时必填")
+
+    body = CLASSIFY_BODY.replace('fallback_class = "other"', 'fallback_class = "ghost"')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[classify].fallback_class: 引用的类名 "ghost" 不在 [[classify.classes]] 中，'
+                "可用：writing、qa、other")
+
+
+def test_classify_assignment_and_on_error_enums(env):
+    body = CLASSIFY_BODY.replace("enabled = true", 'enabled = true\nassignment = "both"')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[classify].assignment: 期望 "single" | "multi"，得到 "both"')
+
+    body = CLASSIFY_BODY.replace("enabled = true", 'enabled = true\non_error = "skip"')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[classify].on_error: 期望 "fallback" | "fail"，得到 "skip"')
+
+
+def test_classify_max_labels_multi_only(env):
+    body = CLASSIFY_BODY.replace("enabled = true", "enabled = true\nmax_labels = 2")
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[classify].max_labels: 仅 assignment = "multi" 时可设置')
+
+
+@pytest.mark.parametrize("value", [1, 4])
+def test_classify_max_labels_range(env, value):
+    body = CLASSIFY_BODY.replace(
+        "enabled = true", f'enabled = true\nassignment = "multi"\nmax_labels = {value}')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, f"[classify].max_labels: 期望 [2, 3] 内的整数（上界 = 类别数），得到 {value}")
+
+
+def test_classify_max_labels_multi_valid_and_backfill(env):
+    body = CLASSIFY_BODY.replace(
+        "enabled = true", 'enabled = true\nassignment = "multi"\nmax_labels = 2')
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.classify.max_labels == 2           # explicit value kept
+
+    body = CLASSIFY_BODY.replace("enabled = true", 'enabled = true\nassignment = "multi"')
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.classify.max_labels == 3           # absent → backfilled to len(classes)
+
+
+@pytest.mark.parametrize("value", [1, 2, 4])
+def test_classify_self_consistency_rejects_bad_values(env, value):
+    body = CLASSIFY_BODY.replace("enabled = true",
+                                 f"enabled = true\nself_consistency = {value}")
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, f"[classify].self_consistency: 期望 0 或 ≥3 的奇数，得到 {value}")
+
+
+def test_classify_self_consistency_accepts_valid(env):
+    body = CLASSIFY_BODY.replace("enabled = true",
+                                 "enabled = true\nself_consistency = 3\nsc_temperature = 0.5")
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.classify.self_consistency == 3
+    assert cfg.classify.sc_temperature == 0.5
+
+
+def test_classes_name_pattern_uniqueness_description(env):
+    body = """\
+[classify]
+enabled = true
+fallback_class = "qa"
+
+[[classify.classes]]
+name = "Q-A"
+description = "坏名字"
+
+[[classify.classes]]
+name = "qa"
+description = "问答"
+
+[[classify.classes]]
+name = "qa"
+description = "重复"
+
+[[classify.classes]]
+name = "empty_desc"
+"""
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[[classify.classes]][1].name: 期望匹配 [a-z0-9_]+，得到 "Q-A"')
+    has(errors, '[[classify.classes]][3].name: 表内 name 须唯一，得到重复的 "qa"')
+    has(errors, "[[classify.classes]][4].description: 缺失必填键")
+
+
+def test_classify_llm_profile_checked_when_enabled(env):
+    body = CLASSIFY_BODY.replace("enabled = true", 'enabled = true\nllm = "ghost"')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[classify].llm: 引用的 profile "ghost" 不存在于 config.toml [llm.*]')
+
+
+def test_classify_llm_not_checked_when_disabled(env):
+    cfg = env.load(project_text=env.project(body='[classify]\nllm = "ghost"'))
+    assert cfg.classify.llm == "ghost"            # inert reference, like verify.llm
+
+
+def test_classify_llm_key_resolved_when_enabled(env, monkeypatch):
+    monkeypatch.delenv("LK_TEST_KEY_JUDGE")
+    body = CLASSIFY_BODY.replace("enabled = true", 'enabled = true\nllm = "judge"')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '环境变量 "LK_TEST_KEY_JUDGE" 未设置或为空')
+
+
+def test_classify_ui_modality_requires_vision(env):
+    config = BASE_CONFIG + """
+[llm.novision]
+provider = "openai_compatible"
+base_url = "https://example.com/v1"
+model = "blind-model"
+api_key_env = "LK_TEST_KEY_DEFAULT"
+"""
+    body = CLASSIFY_BODY.replace("enabled = true", 'enabled = true\nllm = "novision"')
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    errors = env.errors(config_text=config, project_text=project)
+    has(errors, "[llm.novision].supports_vision: UI 模态被 classify 阶段引用")
+
+
+def test_classify_disabled_with_tables_warns_once(env, capsys):
+    """R8: parked class config (enabled=false + tables present) is a warning
+    naming the ignored tables — NOT a config error."""
+    body = (CLASSIFY_BODY.replace("enabled = true", "enabled = false")
+            + "\n[class.writing.quality]\nthreshold = 0.25\n")
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.classify.enabled is False
+    assert cfg.class_views == {}                  # views only materialize when enabled
+    err = capsys.readouterr().err
+    assert err.count("[classify].enabled") == 1   # one warning line, not one per table
+    assert "[[classify.classes]]" in err
+    assert "[class.writing]" in err
+    assert "不会生效" in err
+
+
+# ── v1.7: [class.*] whitelist + per-class merge (R6/R7/R25) ────────────────
+
+
+def test_class_unknown_name_rejected(env):
+    body = CLASSIFY_BODY + "\n[class.ghost.quality]\nthreshold = 0.5\n"
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[class.ghost]: 类名 "ghost" 不在 [[classify.classes]] 中，'
+                "可用：writing、qa、other")
+
+
+def test_class_section_whitelist_enforced(env):
+    body = CLASSIFY_BODY + """
+[class.qa.dedup]
+enabled = false
+[class.qa.quality]
+llm = "judge"
+threshold = 0.5
+[class.qa.generate]
+num_per_call = 8
+"""
+    errors = env.errors(project_text=env.project(body=body))
+    # section outside the whitelist → error (R25), not a forward-compat warning
+    has(errors, "[class.qa.dedup]: [class.*] 覆盖节不在白名单内"
+                "（可用：quality、rubric、annotate、generate、verify）")
+    # key outside a section's whitelist → error
+    has(errors, "[class.qa.quality].llm: [class.*.quality] 不可覆盖该键"
+                "（白名单：mode、rounds、rubric、threshold、selection、top_ratio）")
+    has(errors, "[class.qa.generate].num_per_call: [class.*.generate] 不可覆盖该键")
+    # whitelisted keys in the same tables merge fine (no error about them)
+    assert not any(".threshold" in e for e in errors)
+
+
+def test_class_selection_group_merge_not_spuriously_exclusive(env):
+    """R6 regression: a global threshold plus a class-side top_ratio selection
+    (or the reverse) must NOT trip the mutual-exclusion check — the class takes
+    over the whole selection group, dropping the global side's pair keys."""
+    # forward: global threshold=0.3, class switches to top_ratio selection
+    body = ("[quality]\nthreshold = 0.3\n\n" + CLASSIFY_BODY
+            + '\n[class.qa.quality]\nselection = "top_ratio"\ntop_ratio = 0.5\n')
+    cfg = env.load(project_text=env.project(body=body))
+    qa = cfg.class_views["qa"].quality
+    assert qa.selection == "top_ratio" and qa.top_ratio == 0.5
+    assert qa.threshold is None                   # global pair key dropped from the view
+    assert cfg.quality.threshold == 0.3           # global section itself untouched
+    other = cfg.class_views["other"].quality      # untouched group inherits globally
+    assert other.threshold == 0.3 and other.top_ratio is None
+
+    # reverse: global top_ratio selection, class switches back to a threshold
+    body = ('[quality]\nselection = "top_ratio"\ntop_ratio = 0.5\n\n' + CLASSIFY_BODY
+            + "\n[class.qa.quality]\nthreshold = 0.3\n")
+    cfg = env.load(project_text=env.project(body=body))
+    qa = cfg.class_views["qa"].quality
+    assert qa.threshold == 0.3 and qa.top_ratio is None
+    assert qa.selection == "threshold"            # group restarts from built-in defaults
+    assert cfg.class_views["other"].quality.top_ratio == 0.5
+
+
+def test_class_selection_group_still_exclusive_within_class(env):
+    body = (CLASSIFY_BODY
+            + '\n[class.qa.quality]\nselection = "top_ratio"\ntop_ratio = 0.5\nthreshold = 0.3\n')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[class.qa.quality].threshold: 与 quality.top_ratio 互斥")
+
+
+def test_class_selection_top_ratio_required_on_merged_view(env):
+    # the class asks for top_ratio selection but provides no ratio — the global
+    # pair keys were dropped by the group takeover, so this is incomplete
+    body = ("[quality]\ntop_ratio = 0.5\nselection = \"top_ratio\"\n\n" + CLASSIFY_BODY
+            + '\n[class.qa.quality]\nselection = "top_ratio"\n')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[class.qa.quality].top_ratio: selection = "top_ratio" 时必填')
+
+
+def test_class_top_ratio_noop_warns(env, capsys):
+    body = CLASSIFY_BODY + "\n[class.qa.quality]\ntop_ratio = 0.5\n"
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.class_views["qa"].quality.top_ratio == 0.5
+    err = capsys.readouterr().err
+    assert "[class.qa.quality].top_ratio" in err and "不会生效" in err
+
+
+CLASS_INLINE_RUBRIC = """
+[class.qa.quality]
+mode = "pointwise"
+rubric = "inline"
+
+[class.qa.rubric]
+name = "qa-rubric"
+
+[[class.qa.rubric.criteria]]
+key = "factual_density"
+description = "事实密度与可核查性"
+pairwise_prompt = "哪段问答指令的事实含量更高？"
+pointwise_levels = ["0", "1", "2", "3", "4", "5"]
+"""
+
+
+def test_class_inline_rubric_resolved_per_class(env):
+    cfg = env.load(project_text=env.project(body=CLASSIFY_BODY + CLASS_INLINE_RUBRIC))
+    qa = cfg.class_views["qa"]
+    assert qa.quality.mode == "pointwise"
+    assert qa.quality.rubric == "inline"
+    assert qa.rubric.name == "qa-rubric"
+    assert qa.rubric.criteria[0].key == "factual_density"
+    # global rubric unaffected; other classes keep the global default
+    assert cfg.rubric.name == "default-text-v1"
+    assert cfg.class_views["writing"].rubric is cfg.rubric
+
+
+def test_class_pointwise_six_level_check_on_class_rubric(env):
+    body = CLASSIFY_BODY + CLASS_INLINE_RUBRIC.replace(
+        'pointwise_levels = ["0", "1", "2", "3", "4", "5"]',
+        'pointwise_levels = ["0", "1", "2"]')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[[class.qa.rubric.criteria]][1].pointwise_levels: "
+                "pointwise 模式要求恰好 6 级（0–5），得到 3 级")
+
+
+def test_class_pointwise_with_inherited_default_rubric_ok(env):
+    # (class effective mode × class effective rubric): pointwise mode from the
+    # class, rubric inherited from the global default — defaults carry 6 levels
+    body = CLASSIFY_BODY + '\n[class.qa.quality]\nmode = "pointwise"\n'
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.class_views["qa"].quality.mode == "pointwise"
+    assert all(len(c.pointwise_levels) == 6
+               for c in cfg.class_views["qa"].rubric.criteria)
+
+
+def test_class_rubric_table_ignored_when_selector_not_inline(env, capsys):
+    body = CLASSIFY_BODY + """
+[class.qa.rubric]
+name = "unused"
+[[class.qa.rubric.criteria]]
+key = "x"
+description = "d"
+pairwise_prompt = "p"
+"""
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.class_views["qa"].rubric.name == "default-text-v1"
+    err = capsys.readouterr().err
+    assert "[[class.qa.rubric.criteria]]" in err and "内联 rubric 未生效" in err
+
+
+def test_class_inline_selector_without_table_errors(env):
+    body = CLASSIFY_BODY + '\n[class.qa.quality]\nrubric = "inline"\n'
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[class.qa.quality].rubric: rubric = "inline" 但未提供 '
+                "[[class.qa.rubric.criteria]]")
+
+
+def test_class_inherits_global_inline_rubric(env):
+    body = INLINE_RUBRIC + "\n" + CLASSIFY_BODY + "\n[class.qa.quality]\nrounds = 6\n"
+    cfg = env.load(project_text=env.project(body=body))
+    qa = cfg.class_views["qa"]
+    assert qa.quality.rounds == 6
+    assert qa.quality.rubric == "inline"          # selector inherited
+    assert qa.rubric is cfg.rubric                # global inline product reused
+    assert qa.rubric.name == "intent-rubric"
+
+
+def test_class_annotate_examples_dryrun_against_global_schema(env):
+    body = CLASSIFY_BODY + """
+[class.qa.annotate]
+instruction = "你是问答类指令的标注员。"
+examples = [{input = "问路", output = {intent = "nope", topic = "问路"}}]
+"""
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[[class.qa.annotate.examples]][1].output: 未通过用户 Schema")
+
+
+def test_class_annotate_examples_dryrun_through_validator_hook(env):
+    body = CLASSIFY_BODY + """
+[output]
+validator = "tests.hook_samples:topic_max6"
+schema_inline = '''
+""" + SCHEMA + """
+'''
+
+[class.qa.annotate]
+examples = [{input = "问", output = {intent = "qa", topic = "这是一个特别长的主题短语"}}]
+"""
+    errors = env.errors(project_text=env.project(body=body, include_output=False))
+    has(errors, "[[class.qa.annotate.examples]][1].output: 未通过 output.validator 回调")
+
+
+def test_class_annotate_and_verify_overrides(env):
+    body = CLASSIFY_BODY + """
+[class.qa.annotate]
+examples = [{input = "问路", output = {intent = "qa", topic = "问路"}}]
+[class.qa.verify]
+extra_criteria = "问答类须核对事实性。"
+"""
+    cfg = env.load(project_text=env.project(body=body))
+    qa = cfg.class_views["qa"]
+    assert qa.annotate.instruction == cfg.annotate.instruction   # inherited
+    assert qa.annotate.examples[0].output == {"intent": "qa", "topic": "问路"}
+    assert qa.verify.extra_criteria == "问答类须核对事实性。"
+    assert cfg.verify.extra_criteria == ""        # global untouched
+
+
+def test_class_annotate_instruction_must_be_nonempty(env):
+    body = CLASSIFY_BODY + '\n[class.qa.annotate]\ninstruction = " "\n'
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[class.qa.annotate].instruction: 期望非空字符串")
+
+
+def test_class_generate_overrides_with_styles(env):
+    body = ("[quality]\nthreshold = 0.5\n\n"
+            '[generate]\nenabled = true\ninstruction = "生成中文指令"\n\n'
+            + CLASSIFY_BODY + """
+[class.qa.generate]
+instruction = "模仿示例生成全新的中文知识问答指令。"
+num_per_record = 3
+temperature = 0.7
+[[class.qa.generate.styles]]
+name = "colloquial"
+prompt = "口语化提问"
+""")
+    cfg = env.load(project_text=env.project(body=body))
+    qa = cfg.class_views["qa"].generate
+    assert qa.instruction == "模仿示例生成全新的中文知识问答指令。"
+    assert qa.num_per_record == 3 and qa.temperature == 0.7
+    assert qa.styles[0].name == "colloquial"
+    assert cfg.generate.styles == () and cfg.generate.num_per_record == 2
+    # non-overridable keys stay global on the view
+    assert qa.llms == cfg.generate.llms and qa.num_per_call == cfg.generate.num_per_call
+
+
+def test_class_generate_style_errors_use_class_labels(env):
+    body = CLASSIFY_BODY + """
+[[class.qa.generate.styles]]
+name = "dup"
+prompt = "p"
+[[class.qa.generate.styles]]
+name = "dup"
+prompt = ""
+"""
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[[class.qa.generate.styles]][2].name: 表内 name 须唯一，得到重复的 "dup"')
+    has(errors, "[[class.qa.generate.styles]][2].prompt: 期望非空字符串")

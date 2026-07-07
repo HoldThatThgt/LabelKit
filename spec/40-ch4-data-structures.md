@@ -46,10 +46,18 @@ class Record:
     ui_tree: UITree | None; image: ImageRef | None
     ref: RecordRef
 
+@dataclass(frozen=True)
+class Classification:                 # v1.7：M13 分类结果（3.13）
+    label: str                            # 本信封路由标签
+    labels: tuple[str, ...]               # 该记录命中全集（声明序；single 恒单元素）
+    source: Literal["llm", "fallback", "inherited"]
+    detail: Mapping                       # reason / sc 统计 / fallback 留痕（kind, message）
+
 @dataclass
 class PipelineItem:                   # 唯一可变信封；生命周期 = 一个批
     record: Record
     status: Status = "active"
+    classification: Classification | None = None   # v1.7：未启用 classify 恒为 None
     dedup: DedupInfo | None = None
     scores: dict[str, QualityScore] = field(default_factory=dict)
     annotation: Annotation | None = None
@@ -91,6 +99,10 @@ class Stage(Protocol):
     name: str
     async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]:
         """契约：① 只处理 status=='active' 的项；② 不删除列表元素（只改 status）；
+           ②a（v1.7）classify 例外（仅 assignment="multi"）——可向传入列表尾部追加派生信封；
+           追加物视同批内普通元素、同受 ①③④ 约束；不得删除、重排或替换任何既有元素对象
+           （既有元素的 status / classification / errors 字段写入属 ①④ 的正常行为）；
+           返回值仍须是传入的同一列表对象（调用方依赖列表身份）；
            ③ generate 例外——返回新增子批（原批元素不修改）；④ 单条失败不得抛出到批层面，
            必须落入 item.errors 并置 status='failed'。"""
 

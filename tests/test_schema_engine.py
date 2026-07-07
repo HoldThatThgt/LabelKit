@@ -18,6 +18,7 @@ from labelkit.schema_engine import (
     _extract_object,
     _first_balanced_braces,
     _strip_markdown_fences,
+    classification_schema,
     deterministic_repair,
     judgment_schema,
     pointwise_schema,
@@ -352,6 +353,113 @@ class TestInternalSchemas:
         assert v.is_valid({"samples": ["a", "b", "c", "d"]})
         assert not v.is_valid({"samples": ["a", "b", "c"]})
         assert not v.is_valid({"samples": ["a", "b", "c", "d", "e"]})
+
+
+# ── v1.7: classification_schema (§10.7 / spec 3.13, R1) ─────────────────────
+
+NAMES = ["faq", "chitchat", "other"]
+
+# The frozen keyword vocabulary of the internal schemas — classification_schema must
+# not grow it (R1: strict-mode gateways hard-reject e.g. uniqueItems, L0 passes
+# schemas through unconditionally).
+ALLOWED_KEYWORDS = {"type", "properties", "required", "additionalProperties",
+                    "enum", "items", "minItems", "maxItems"}
+
+
+def _schema_keywords(schema: dict) -> set[str]:
+    """All JSON-Schema keywords used anywhere in the tree (property NAMES excluded)."""
+    kws = set(schema)
+    for key, value in schema.items():
+        if key == "properties":
+            for sub in value.values():
+                kws |= _schema_keywords(sub)
+        elif key == "items":
+            kws |= _schema_keywords(value)
+    return kws
+
+
+def _all_dict_keys(node) -> set[str]:
+    """Every dict key in the full tree, property names included — the uniqueItems sweep."""
+    keys: set[str] = set()
+    if isinstance(node, dict):
+        keys |= set(node)
+        for value in node.values():
+            keys |= _all_dict_keys(value)
+    elif isinstance(node, list):
+        for value in node:
+            keys |= _all_dict_keys(value)
+    return keys
+
+
+class TestClassificationSchema:
+    def test_single_shape(self):
+        s = classification_schema(NAMES, "single", max_labels=3, with_reason=False)
+        Draft202012Validator.check_schema(s)
+        assert s["required"] == ["class"]
+        assert s["additionalProperties"] is False
+        assert list(s["properties"]) == ["class"]
+        assert s["properties"]["class"] == {"type": "string", "enum": NAMES}
+        v = Draft202012Validator(s)
+        assert v.is_valid({"class": "faq"})
+        assert not v.is_valid({"class": "unknown"})         # enum-locked to the class table
+        assert not v.is_valid({"class": "faq", "reason": "r"})
+
+    def test_single_with_reason(self):
+        s = classification_schema(NAMES, "single", max_labels=3, with_reason=True)
+        Draft202012Validator.check_schema(s)
+        assert s["required"] == ["class", "reason"]
+        assert s["additionalProperties"] is False
+        assert s["properties"]["reason"] == {"type": "string"}
+        v = Draft202012Validator(s)
+        assert v.is_valid({"class": "faq", "reason": "一句话理由"})
+        assert not v.is_valid({"class": "faq"})             # reason required when requested
+
+    def test_multi_shape(self):
+        s = classification_schema(NAMES, "multi", max_labels=2, with_reason=False)
+        Draft202012Validator.check_schema(s)
+        assert s["required"] == ["classes"]
+        assert s["additionalProperties"] is False
+        arr = s["properties"]["classes"]
+        assert arr["items"] == {"type": "string", "enum": NAMES}
+        assert arr["minItems"] == 1
+        assert arr["maxItems"] == 2
+        v = Draft202012Validator(s)
+        assert v.is_valid({"classes": ["faq"]})
+        assert v.is_valid({"classes": ["faq", "chitchat"]})
+        assert not v.is_valid({"classes": []})                        # minItems 1
+        assert not v.is_valid({"classes": ["faq", "chitchat", "other"]})  # maxItems
+        assert not v.is_valid({"classes": ["unknown"]})
+
+    def test_multi_with_reason(self):
+        s = classification_schema(NAMES, "multi", max_labels=3, with_reason=True)
+        assert s["required"] == ["classes", "reason"]
+        assert s["additionalProperties"] is False
+        assert s["properties"]["classes"]["minItems"] == 1
+        assert s["properties"]["classes"]["maxItems"] == 3
+        v = Draft202012Validator(s)
+        assert v.is_valid({"classes": ["faq", "other"], "reason": "理由"})
+        assert not v.is_valid({"classes": ["faq"]})
+
+    def test_multi_accepts_duplicate_labels_at_schema_level(self):
+        # R1: duplicates pass the SCHEMA (no uniqueItems); de-duplication is the
+        # classify stage's post-validation normalization, not M8's job.
+        s = classification_schema(NAMES, "multi", max_labels=3, with_reason=False)
+        assert Draft202012Validator(s).is_valid({"classes": ["faq", "faq"]})
+
+    def test_no_unique_items_anywhere_and_keyword_set_frozen(self):
+        # R1 regression anchor over every mode combination.
+        for assignment in ("single", "multi"):
+            for with_reason in (False, True):
+                s = classification_schema(NAMES, assignment, max_labels=2,
+                                          with_reason=with_reason)
+                assert "uniqueItems" not in _all_dict_keys(s)
+                assert _schema_keywords(s) <= ALLOWED_KEYWORDS
+
+    def test_enum_copies_input_list(self):
+        names = ["a", "b"]
+        s = classification_schema(names, "single", max_labels=2, with_reason=False)
+        names.append("c")                    # caller mutation must not leak into the schema
+        assert s["properties"]["class"]["enum"] == ["a", "b"]
 
 
 def test_usage_summing_shape():
