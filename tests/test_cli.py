@@ -18,6 +18,7 @@ from labelkit import cli
 from labelkit.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ClassSpec,
     Criterion,
     DedupConfig,
     EmbeddingProfile,
@@ -267,6 +268,46 @@ def test_referenced_profiles_verify_judges_replace_verify_llm():
     )
     llms, _ = cli.referenced_profiles(cfg)
     assert llms == ["default", "judge"]  # verify.llm ("fixer") is NOT referenced
+
+
+# ── v1.7 classify (R24 reference-set point ③ + chain position) ──────────────
+
+
+def _classify_cfg(llm: str = "default") -> ClassifyConfig:
+    return ClassifyConfig(
+        enabled=True, llm=llm, max_labels=2, fallback_class="other",
+        classes=(ClassSpec(name="qa", description="问答"),
+                 ClassSpec(name="other", description="其余")),
+    )
+
+
+def test_referenced_profiles_classify_enabled():
+    cfg = _cfg(classify=_classify_cfg(llm="judge"))
+    llms, _ = cli.referenced_profiles(cfg)
+    # classify precedes quality/annotate (chain order); "default" deduplicated
+    assert llms == ["judge", "default"]
+
+
+def test_referenced_profiles_classify_disabled_not_referenced():
+    # Loader rule-12 semantics: the guard is `classify.enabled`, so a disabled
+    # stage's profile reference ("fixer") is never keyed nor probed.
+    cfg = _cfg(classify=ClassifyConfig(enabled=False, llm="fixer"))
+    llms, _ = cli.referenced_profiles(cfg)
+    assert llms == ["default"]
+
+
+def test_build_stages_inserts_classify_after_dedup_before_quality():
+    from labelkit.classify import ClassifyStage
+
+    cfg = _cfg(classify=_classify_cfg())
+    stages = cli._build_stages(cfg)
+    assert [s.name for s in stages] == ["dedup", "classify", "quality", "annotate"]
+    assert isinstance(stages[1], ClassifyStage)
+
+
+def test_build_stages_without_classify_unchanged():
+    stages = cli._build_stages(_cfg())
+    assert [s.name for s in stages] == ["dedup", "quality", "annotate"]
 
 
 # ── validate / run end-to-end (skip until sibling modules land) ────────────

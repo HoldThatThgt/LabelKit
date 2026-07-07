@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import random
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,14 +21,17 @@ from types import SimpleNamespace
 import pytest
 
 from labelkit.config.model import (
-    AnnotateConfig, ClassifyConfig, Criterion, DedupConfig, GenerateConfig,
-    InputConfig, OutputConfig, QualityConfig, ResolvedConfig, Rubric, RunConfig,
-    ToolConfig, TraceConfig, VerifyConfig,
+    AnnotateConfig, ClassifyConfig, ClassSpec, ClassView, Criterion, DedupConfig,
+    GenerateConfig, InputConfig, OutputConfig, QualityConfig, ResolvedConfig,
+    Rubric, RunConfig, ToolConfig, TraceConfig, VerifyConfig,
 )
 from labelkit.errors import CircuitBreakerTripped
 from labelkit.obslog import EventLog, MetricsSink, TraceEvent
 from labelkit.orchestrator import Orchestrator, RunSummary
-from labelkit.types import DedupInfo, PipelineItem, QualityScore, Record, RecordRef, StageError
+from labelkit.types import (
+    Classification, DedupInfo, PipelineItem, QualityScore, Record, RecordRef,
+    StageError,
+)
 
 RUN_ID = "abcdef012345"
 
@@ -57,6 +61,7 @@ def make_cfg(tmp_path: Path, *, mode: str = "process", batch_size: int = 4,
              dedup: bool = True, quality: bool = False, annotate: bool = False,
              verify: bool = False, generate: GenerateConfig | None = None,
              quality_cfg: QualityConfig | None = None,
+             classify: ClassifyConfig | None = None,
              trace: TraceConfig | None = None) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
@@ -68,7 +73,7 @@ def make_cfg(tmp_path: Path, *, mode: str = "process", batch_size: int = 4,
                       fatal_error_threshold=fatal_threshold),
         input=InputConfig(),
         dedup=DedupConfig(enabled=dedup),
-        classify=ClassifyConfig(),
+        classify=classify if classify is not None else ClassifyConfig(),
         quality=quality_cfg if quality_cfg is not None else QualityConfig(enabled=quality),
         generate=generate if generate is not None else GenerateConfig(),
         annotate=AnnotateConfig(enabled=annotate, instruction="标注" if annotate else ""),
@@ -89,6 +94,30 @@ def make_cfg(tmp_path: Path, *, mode: str = "process", batch_size: int = 4,
         config_digest="sha256:c",
         project_digest="sha256:p",
     )
+
+
+def classify_cfg(assignment: str = "single", classes: tuple[str, ...] = ("faq", "chat"),
+                 sc: int = 0) -> ClassifyConfig:
+    """Enabled ClassifyConfig with a declared class table (M1-shaped: max_labels
+    backfilled under multi, fallback = last declared class)."""
+    specs = tuple(ClassSpec(name=n, description="d") for n in classes)
+    return ClassifyConfig(enabled=True, assignment=assignment,
+                          max_labels=len(specs) if assignment == "multi" else None,
+                          fallback_class=classes[-1], self_consistency=sc,
+                          classes=specs)
+
+
+def with_views(cfg: ResolvedConfig, overrides: dict[str, dict] | None = None) -> ResolvedConfig:
+    """Attach class_views like M1 does: one merged view PER DECLARED CLASS
+    (zero-override classes mirror the global sections); `overrides` swaps
+    individual ClassView fields per class name."""
+    views = {}
+    for spec in cfg.classify.classes:
+        kw = dict(quality=cfg.quality, rubric=cfg.rubric, annotate=cfg.annotate,
+                  generate=cfg.generate, verify=cfg.verify)
+        kw.update((overrides or {}).get(spec.name, {}))
+        views[spec.name] = ClassView(name=spec.name, **kw)
+    return replace(cfg, class_views=views)
 
 
 # ── contract-shaped test doubles (observability / IO, not LLMs) ─────────────
@@ -322,6 +351,50 @@ class BlockingGenerateStage:
         return [gen_rec(i) for i in range(1, self.total + 1)]
 
 
+class StubClassifyStage:
+    """Pure classify stand-in (labelkit.classify belongs to a parallel work
+    order — deliberately NOT imported). Labels active, still-unclassified items
+    round-robin over `labels`, feeds the M13-owned per-label counters, and —
+    for record ids listed in `fan` — appends sibling clones IN PLACE to the
+    tail of the passed-in list (contract ②a shape: same list object returned,
+    clones share record/dedup by reference, fresh default containers)."""
+
+    name = "classify"
+
+    def __init__(self, labels: tuple[str, ...] = ("faq",),
+                 fan: dict[str, tuple[str, ...]] | None = None):
+        self._labels = labels
+        self._fan = fan or {}
+        self._i = 0
+        self.calls: list[tuple[int, int]] = []     # (batch_no, entry size)
+
+    async def run(self, batch, ctx):
+        self.calls.append((ctx.batch_no, len(batch)))
+        appended = []
+        for item in batch:
+            if item.status != "active" or item.classification is not None:
+                continue                            # idempotent skip (M13 rule)
+            label = self._labels[self._i % len(self._labels)]
+            self._i += 1
+            extra = self._fan.get(item.record.id, ())
+            all_labels = (label, *extra)
+            item.classification = Classification(
+                label=label, labels=all_labels, source="llm", detail={})
+            for lbl in all_labels:
+                ctx.metrics.count(f"classify.classes.{lbl}")
+            if len(all_labels) >= 2:
+                ctx.metrics.count("classify.multi_label_records")
+            for sib_label in extra:
+                appended.append(PipelineItem(
+                    record=item.record, status="active",
+                    classification=Classification(
+                        label=sib_label, labels=all_labels, source="llm",
+                        detail={}),
+                    dedup=item.dedup))
+        batch.extend(appended)
+        return batch
+
+
 class BreakerStage:
     """Deterministically feeds the breaker with REAL ProviderFatalError
     semantics: per active item a fatal provider result; raises the real
@@ -356,9 +429,11 @@ def build(cfg, stages, records=None, *, ingestor=None, llm=None, schema_engine=N
 
 
 def counts_invariant(counts):
+    # v1.7: the fanout term joins the source side under multi assignment
+    # (absent key = 0 keeps the pre-classify form).
     lhs = (counts["emitted"] + counts["dropped_dup"] + counts["dropped_lowq"]
            + counts["dropped_verify"] + counts["failed"] + counts["bad_input"])
-    rhs = counts["scanned"] + counts["generated"]
+    rhs = counts["scanned"] + counts["generated"] + counts.get("fanout", 0)
     return lhs == rhs
 
 
@@ -1004,6 +1079,339 @@ async def test_stage_timing_recorded(tmp_path):
     assert "dedup" in metrics.stage_times
     assert metrics.stage_times["dedup"] >= 0.0
     assert "dedup" in emitter.report["timing"]["per_stage_s"]
+
+
+# ── tests: v1.7 classify orchestration (chain / fanout / report / dry-run) ──
+
+async def test_chain_order_includes_classify_after_dedup(tmp_path):
+    """v1.7 canonical order: dedup → classify → quality → annotate → verify
+    regardless of the supplied stage list order."""
+    order: list[str] = []
+
+    class Probe:
+        def __init__(self, name):
+            self.name = name
+
+        async def run(self, batch, ctx):
+            order.append(self.name)
+            return batch
+
+    cfg = make_cfg(tmp_path, batch_size=8, dedup=True, annotate=True, verify=True,
+                   quality_cfg=QualityConfig(enabled=True), classify=classify_cfg())
+    stages = [Probe("verify"), Probe("classify"), Probe("annotate"),
+              Probe("quality"), Probe("dedup")]
+    orch, _, _, _ = build(cfg, stages, [rec(1), rec(2)])
+    await orch.run()
+    assert order == ["dedup", "classify", "quality", "annotate", "verify"]
+
+
+async def test_classify_runs_on_reflow_sub_batches(tmp_path):
+    """The re-flow chain includes classify (§7.9): generation sub-batches pass
+    through it (already-classified inherited items rely on M13's idempotent
+    skip — exercised here via the stub's classification-is-None guard)."""
+    gen_cfg = GenerateConfig(enabled=True, instruction="生成")
+    cfg = make_cfg(tmp_path, batch_size=4, quality=True, generate=gen_cfg,
+                   quality_cfg=QualityConfig(enabled=True), classify=classify_cfg())
+    stub = StubClassifyStage()
+    gen = PureGenerateStage(per_batch=3)
+    orch, metrics, emitter, _ = build(
+        cfg, [ExactDedupStage(), stub, ScoreStage({}), gen],
+        [rec(i) for i in range(1, 5)])
+    await orch.run()
+
+    # batch 1 = main, batch 2 = re-flow sub-batch — classify saw BOTH.
+    assert [bn for bn, _ in stub.calls] == [1, 2]
+    # pre-classified items are skipped on re-entry, unclassified ones labeled:
+    # 4 main + 3 generated all emitted with a classification counter fed.
+    assert metrics.counters["classify.classes.faq"] == 7
+
+
+async def test_generate_only_chain_includes_classify(tmp_path):
+    gen_cfg = GenerateConfig(enabled=True, instruction="生成", standalone_count=5)
+    cfg = make_cfg(tmp_path, mode="generate_only", batch_size=4, generate=gen_cfg,
+                   classify=classify_cfg())
+    gen = PureGenerateStage(total=5)
+    stub = StubClassifyStage()
+    orch, metrics, emitter, _ = build(cfg, [ExactDedupStage(), stub, gen])
+    summary = await orch.run()
+
+    assert summary.exit_code == 0
+    assert [bn for bn, _ in stub.calls] == [1, 2]  # 5 records → batches of 4 + 1
+    assert metrics.counters["classify.classes.faq"] == 5
+
+
+async def test_fanout_metered_counts_key_and_extended_invariant(tmp_path):
+    """R9/R20: M10 meters counts.fanout as the len-delta across classify;
+    batch.start.size stays the batch-ENTRY count; batch.end carries the
+    per-batch fanout; the counts invariant gains the fanout term."""
+    ccfg = classify_cfg(assignment="multi", classes=("faq", "chat", "other"))
+    fan = {f"{1:016x}": ("chat", "other"), f"{3:016x}": ("chat",)}
+    cfg = make_cfg(tmp_path, batch_size=4, classify=ccfg)
+    stub = StubClassifyStage(labels=("faq",), fan=fan)
+    orch, metrics, emitter, _ = build(cfg, [ExactDedupStage(), stub],
+                                      [rec(i) for i in range(1, 5)])
+    summary = await orch.run()
+
+    assert metrics.counters["counts.fanout"] == 3
+    counts = emitter.report["counts"]
+    assert counts["fanout"] == 3
+    assert counts["scanned"] == 4
+    assert counts["emitted"] == 7                  # 4 originals + 3 siblings
+    assert counts_invariant(counts)
+    assert summary.output_lines == 7
+
+    starts = [e for e in metrics.events if e[0] == "batch.start"]
+    assert [e[4]["size"] for e in starts] == [4]   # entry size, pre-fan-out
+    ends = [e for e in metrics.events if e[0] == "batch.end"]
+    assert [e[4]["fanout"] for e in ends] == [3]
+    assert metrics.counters["classify.multi_label_records"] == 2
+
+
+async def test_single_assignment_no_fanout_counts_key_but_batch_end_zero(tmp_path):
+    """counts.fanout appears ONLY under multi (§9.3); batch.end carries fanout
+    whenever classify is enabled (0 under single)."""
+    cfg = make_cfg(tmp_path, batch_size=4, classify=classify_cfg())
+    orch, metrics, emitter, _ = build(cfg, [ExactDedupStage(), StubClassifyStage()],
+                                      [rec(1), rec(2)])
+    await orch.run()
+
+    assert "fanout" not in emitter.report["counts"]
+    assert "counts.fanout" not in metrics.counters
+    ends = [e for e in metrics.events if e[0] == "batch.end"]
+    assert all(e[4]["fanout"] == 0 for e in ends)
+    assert counts_invariant(emitter.report["counts"])
+
+
+async def test_classify_disabled_batch_end_has_no_fanout_key(tmp_path):
+    cfg = make_cfg(tmp_path, batch_size=4)
+    orch, metrics, emitter, _ = build(cfg, [ExactDedupStage()], [rec(1)])
+    await orch.run()
+    ends = [e for e in metrics.events if e[0] == "batch.end"]
+    assert ends and all("fanout" not in e[4] for e in ends)
+    assert "classify" not in emitter.report
+
+
+async def test_breaker_residual_includes_fanout(tmp_path):
+    """R10: the unprocessed balancing residual adds + fanout to its source
+    side — fanned-out siblings are envelopes that must be accounted for."""
+    ccfg = classify_cfg(assignment="multi", classes=("faq", "chat"))
+    fan = {f"{1:016x}": ("chat",)}
+    cfg = make_cfg(tmp_path, batch_size=2, fatal_threshold=1, annotate=True,
+                   classify=ccfg)
+    stub = StubClassifyStage(labels=("faq",), fan=fan)
+    orch, metrics, emitter, _ = build(cfg, [stub, BreakerStage()],
+                                      [rec(i) for i in range(1, 7)])
+    summary = await orch.run()
+
+    assert summary.exit_code == 4
+    assert emitter.report["run"]["partial_delivery"] is True
+    counts = emitter.report["counts"]
+    assert counts["fanout"] == 1
+    assert "unprocessed" in counts
+    lhs = (counts["emitted"] + counts["dropped_dup"] + counts["dropped_lowq"]
+           + counts["dropped_verify"] + counts["failed"] + counts["bad_input"]
+           + counts["unprocessed"])
+    assert lhs == counts["scanned"] + counts["generated"] + counts["fanout"]
+
+
+async def test_report_classify_block_shape_zero_based_classes(tmp_path):
+    """§9.3 classify block: classes histogram zero-based over ALL declared
+    classes; single assignment carries no multi_label_records key."""
+    ccfg = classify_cfg(classes=("faq", "chat", "other"))
+    cfg = make_cfg(tmp_path, batch_size=4, classify=ccfg)
+    stub = StubClassifyStage(labels=("faq",))      # nothing ever hits chat/other
+    orch, metrics, emitter, _ = build(cfg, [ExactDedupStage(), stub],
+                                      [rec(i) for i in range(1, 5)])
+    metrics.counters["classify.fallback"] = 2      # M13-owned counters, pre-fed
+    metrics.counters["classify.failures"] = 1
+    await orch.run()
+
+    block = emitter.report["classify"]
+    assert block == {"assignment": "single",
+                     "classes": {"faq": 4, "chat": 0, "other": 0},
+                     "fallback_count": 2, "failures": 1}
+    assert "multi_label_records" not in block
+
+
+async def test_report_classify_block_multi_has_multi_label_records(tmp_path):
+    ccfg = classify_cfg(assignment="multi", classes=("faq", "chat"))
+    fan = {f"{2:016x}": ("chat",)}
+    cfg = make_cfg(tmp_path, batch_size=4, classify=ccfg)
+    orch, _, emitter, _ = build(cfg, [StubClassifyStage(labels=("faq",), fan=fan)],
+                                [rec(1), rec(2)])
+    await orch.run()
+    block = emitter.report["classify"]
+    assert block["assignment"] == "multi"
+    assert block["multi_label_records"] == 1
+    assert block["classes"] == {"faq": 2, "chat": 1}
+
+
+class PoolTieScoreStage(ScoreStage):
+    """ScoreStage that also feeds the POOL-DIMENSIONED tie counters the real
+    per-pool pairwise composition uses when classify is enabled (R12)."""
+
+    async def run(self, batch, ctx):
+        ctx.metrics.count("quality.tie_outcomes.faq.clarity", 2)
+        ctx.metrics.count("quality.tie_comparisons.faq.clarity", 8)
+        return await super().run(batch, ctx)
+
+
+async def test_report_quality_by_class_shape_and_top_level_preserved(tmp_path):
+    """R12/R14: by_class carries per-pool effective mode/rounds + stats keyed
+    by the pool-dimensioned counters; the TOP-LEVEL mode/rounds keep the
+    globally-inherited base values and tie_rate aggregates across pools."""
+    ccfg = classify_cfg(classes=("chat", "faq"))
+    cfg = make_cfg(tmp_path, batch_size=4, dedup=False,
+                   quality_cfg=QualityConfig(enabled=True, mode="pairwise", rounds=4),
+                   classify=ccfg)
+    cfg = with_views(cfg, overrides={
+        "chat": {"quality": QualityConfig(enabled=True, mode="pointwise", rounds=2)}})
+    # round-robin faq/chat → records 1,3 → faq; 2,4 → chat
+    stub = StubClassifyStage(labels=("faq", "chat"))
+    scores = {f"{1:016x}": 0.05, f"{2:016x}": 0.95,
+              f"{3:016x}": 0.55, f"{4:016x}": 0.75}
+    orch, _, emitter, _ = build(cfg, [stub, PoolTieScoreStage(scores)],
+                                [rec(i) for i in range(1, 5)])
+    await orch.run()
+
+    q = emitter.report["quality"]
+    # top level: globally-inherited base values, cross-pool tie aggregate
+    assert q["mode"] == "pairwise_bt" and q["rounds"] == 4
+    assert q["per_criterion_tie_rate"] == {"clarity": 0.25}
+    assert q["aggregate_histogram"]["0.0-0.1"] == 1     # flat totals unchanged
+    assert q["aggregate_histogram"]["0.9-1.0"] == 1
+
+    by_class = q["by_class"]
+    assert set(by_class) == {"faq", "chat"}
+    for pool_block in by_class.values():
+        assert set(pool_block) == {"mode", "rounds", "aggregate_histogram",
+                                   "per_criterion_mean", "per_criterion_tie_rate"}
+    assert by_class["faq"]["mode"] == "pairwise_bt" and by_class["faq"]["rounds"] == 4
+    assert by_class["chat"]["mode"] == "pointwise" and by_class["chat"]["rounds"] == 2
+    assert by_class["faq"]["aggregate_histogram"]["0.0-0.1"] == 1
+    assert by_class["faq"]["aggregate_histogram"]["0.5-0.6"] == 1
+    assert by_class["chat"]["aggregate_histogram"]["0.9-1.0"] == 1
+    assert by_class["chat"]["aggregate_histogram"]["0.7-0.8"] == 1
+    assert by_class["faq"]["per_criterion_mean"]["clarity"] == pytest.approx(0.3)
+    assert by_class["chat"]["per_criterion_mean"]["clarity"] == pytest.approx(0.85)
+    assert by_class["faq"]["per_criterion_tie_rate"] == {"clarity": 0.25}
+    assert by_class["chat"]["per_criterion_tie_rate"] == {}
+
+
+async def test_tie_rate_gate_any_pairwise_pool_with_global_pointwise(tmp_path):
+    """R14: tie_rate emission is gated on 'a pairwise pool exists OR the global
+    mode is pairwise' — a pointwise global with one pairwise pool still emits."""
+    ccfg = classify_cfg(classes=("chat", "faq"))
+    cfg = make_cfg(tmp_path, batch_size=4, dedup=False,
+                   quality_cfg=QualityConfig(enabled=True, mode="pointwise", rounds=1),
+                   classify=ccfg)
+    cfg = with_views(cfg, overrides={
+        "faq": {"quality": QualityConfig(enabled=True, mode="pairwise", rounds=4)}})
+    stub = StubClassifyStage(labels=("faq",))
+    orch, _, emitter, _ = build(cfg, [stub, PoolTieScoreStage({})],
+                                [rec(1), rec(2)])
+    await orch.run()
+
+    q = emitter.report["quality"]
+    assert q["mode"] == "pointwise"                # top level keeps the global
+    assert q["per_criterion_tie_rate"] == {"clarity": 0.25}
+    assert q["by_class"]["faq"]["per_criterion_tie_rate"] == {"clarity": 0.25}
+
+
+async def test_classify_disabled_quality_report_shape_unchanged(tmp_path):
+    """Zero-change anchor: classify off keeps the flat tie counters, no
+    by_class key, and the pointwise mode emits no tie_rate at all."""
+    cfg = make_cfg(tmp_path, batch_size=4, dedup=False,
+                   quality_cfg=QualityConfig(enabled=True, mode="pointwise"))
+    orch, _, emitter, _ = build(cfg, [ScoreStage({})], [rec(1)])
+    await orch.run()
+    assert "by_class" not in emitter.report["quality"]
+    assert "per_criterion_tie_rate" not in emitter.report["quality"]
+
+
+async def test_generate_bucket_whitelist_includes_rejected_by_validator(tmp_path):
+    """Bug fix regression (spec v1.7 §6): the report bucket field whitelist
+    dropped rejected_by_validator — the M6 counter must now reach report.json;
+    zero-init keeps three fields, the fourth appears only when counted."""
+
+    class BucketGenStage(PureGenerateStage):
+        async def run(self, batch, ctx):
+            ctx.metrics.count("generate.buckets.default×concise.calls", 1)
+            ctx.metrics.count("generate.buckets.default×concise.produced", 3)
+            ctx.metrics.count("generate.buckets.default×concise.survived_dedup", 2)
+            ctx.metrics.count("generate.buckets.default×concise.rejected_by_validator", 1)
+            ctx.metrics.count("generate.buckets.default×plain.calls", 1)
+            ctx.metrics.count("generate.buckets.default×plain.produced", 2)
+            ctx.metrics.count("generate.buckets.default×plain.survived_dedup", 2)
+            return await super().run(batch, ctx)
+
+    gen_cfg = GenerateConfig(enabled=True, instruction="生成")
+    cfg = make_cfg(tmp_path, batch_size=8, quality=True, generate=gen_cfg,
+                   quality_cfg=QualityConfig(enabled=True))
+    orch, _, emitter, _ = build(cfg, [ExactDedupStage(), ScoreStage({}),
+                                      BucketGenStage(per_batch=1)],
+                                [rec(1), rec(2)])
+    await orch.run()
+
+    buckets = emitter.report["generate"]["buckets"]
+    assert buckets["default×concise"] == {"calls": 1, "produced": 3,
+                                          "survived_dedup": 2,
+                                          "rejected_by_validator": 1}
+    # validator not configured for this bucket → three-field zero-init shape
+    assert buckets["default×plain"] == {"calls": 1, "produced": 2,
+                                        "survived_dedup": 2}
+
+
+async def test_dry_run_process_classify_calls_formula(tmp_path, capsys):
+    """R11 process mode: classify_calls = ingested × max(1, sc); single
+    assignment with zero-override views prints NO R28 note."""
+    cfg = make_cfg(tmp_path, batch_size=4, dry_run=True, annotate=True,
+                   classify=classify_cfg(sc=3))
+    cfg = with_views(cfg)                          # zero-override views
+    orch, _, _, _ = build(cfg, [], [rec(i) for i in range(1, 11)])
+    summary = await orch.run()
+
+    assert summary.exit_code == 0
+    err = capsys.readouterr().err
+    assert "classify_calls=30" in err              # 10 ingested × sc 3
+    assert "annotate_calls=10" in err
+    assert "total=40" in err                       # classify counted into total
+    assert "按全局配置估算" not in err               # no overrides, no multi
+
+
+async def test_dry_run_generate_only_classify_calls_and_multi_note(tmp_path, capsys):
+    """R11 generate_only: classify_calls = <generated records> × max(1, sc);
+    multi assignment triggers the R28 lower-bound note."""
+    gen_cfg = GenerateConfig(enabled=True, instruction="生成",
+                             seed_examples=("a", "b", "c"),
+                             num_per_record=2, num_per_call=4)
+    cfg = make_cfg(tmp_path, mode="generate_only", batch_size=4, dry_run=True,
+                   annotate=True, generate=gen_cfg,
+                   classify=classify_cfg(assignment="multi"))
+    cfg = with_views(cfg)
+    orch, _, _, _ = build(cfg, [])
+    await orch.run()
+
+    err = capsys.readouterr().err
+    assert "generate_calls=2" in err               # ceil(3×2/4)
+    assert "classify_calls=8" in err               # 8 generated × max(1, 0)
+    assert "annotate_calls=8" in err
+    assert "total=18" in err
+    assert "按全局配置估算 / multi 按标签乘数 1 报下界" in err
+
+
+async def test_dry_run_class_override_triggers_note_without_multi(tmp_path, capsys):
+    """R28: a [class.*] override alone (single assignment) also flags the
+    estimate as computed on the global config."""
+    cfg = make_cfg(tmp_path, batch_size=4, dry_run=True, annotate=True,
+                   classify=classify_cfg())
+    cfg = with_views(cfg, overrides={
+        "chat": {"annotate": AnnotateConfig(enabled=True, instruction="按类标注")}})
+    orch, _, _, _ = build(cfg, [], [rec(1), rec(2)])
+    await orch.run()
+    err = capsys.readouterr().err
+    assert "classify_calls=2" in err
+    assert "按全局配置估算 / multi 按标签乘数 1 报下界" in err
 
 
 # ── E2E-finding fixes: P4-9 tie rate / P4-10 circuit_broken flag ─────────────

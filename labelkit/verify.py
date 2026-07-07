@@ -81,14 +81,26 @@ def render_critiques_text(critiques: Sequence[Mapping]) -> str:
     return "\n".join(lines)
 
 
-def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig") -> "PromptBundle":
+def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
+                        label: str | None = None) -> "PromptBundle":
     """Assemble the §10.5 judge prompt for one (record, annotation-output) pair.
-    UI modality carries screenshot + serialized tree parts as in §10.1/§10.2."""
+    UI modality carries screenshot + serialized tree parts as in §10.1/§10.2.
+    v1.7 (R3): label non-None → the [任务指令] section and extra_criteria take the
+    class-effective values (class_views[label].annotate.instruction /
+    class_views[label].verify.extra_criteria); None = global config."""
     from labelkit.llm_client import Message, Part, PromptBundle
+
+    if label is not None:
+        view = cfg.class_views[label]
+        instruction = view.annotate.instruction
+        extra_criteria = view.verify.extra_criteria
+    else:
+        instruction = cfg.annotate.instruction
+        extra_criteria = cfg.verify.extra_criteria
 
     system = Message(
         role="system",
-        parts=(Part(kind="text", text=verify_system_text(cfg.verify.extra_criteria)),),
+        parts=(Part(kind="text", text=verify_system_text(extra_criteria)),),
     )
     if record.modality == "text":
         user = Message(
@@ -96,12 +108,12 @@ def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig") 
             parts=(
                 Part(
                     kind="text",
-                    text=verify_user_text(cfg.annotate.instruction, record.text or "", output),
+                    text=verify_user_text(instruction, record.text or "", output),
                 ),
             ),
         )
     else:
-        head = f"[任务指令] {cfg.annotate.instruction}\n[原始数据]\n[屏幕截图]"
+        head = f"[任务指令] {instruction}\n[原始数据]\n[屏幕截图]"
         tree = record.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars)
         tail = f"[UI 控件树]\n{tree}\n[标注结果] {json.dumps(output, ensure_ascii=False)}"
         user = Message(
@@ -180,11 +192,14 @@ class VerifyStage:
 
     async def _verify_item(self, item: PipelineItem, ctx: "RunContext") -> None:
         vcfg = self.cfg.verify
+        label = item.classification.label if item.classification else None  # v1.7 R3
         try:
             verdict, rounds, critiques, annotation = await run_verify_loop(
                 item.annotation,
-                judge_round=lambda ann, rnd: self._judge_round(item.record, ann, rnd, ctx),
-                reannotate=lambda ann, fc: self._reannotate(item.record, ann, fc, ctx),
+                judge_round=lambda ann, rnd: self._judge_round(
+                    item.record, ann, rnd, ctx, label=label),
+                reannotate=lambda ann, fc: self._reannotate(
+                    item.record, ann, fc, ctx, label=label),
                 policy=vcfg.policy,
                 max_repair_rounds=vcfg.max_repair_rounds,
             )
@@ -221,14 +236,15 @@ class VerifyStage:
     # ── one review round (all judges, majority) ────────────────────────────
 
     async def _judge_round(
-        self, record: Record, annotation: Annotation, round_no: int, ctx: "RunContext"
+        self, record: Record, annotation: Annotation, round_no: int, ctx: "RunContext",
+        label: str | None = None,
     ) -> tuple[str, list[dict], list[dict]]:
         from labelkit.schema_engine import VERDICT_SCHEMA
 
         vcfg = self.cfg.verify
         judges = list(vcfg.judges) or [vcfg.llm]
         multi = bool(vcfg.judges)
-        prompt = build_verify_prompt(record, annotation.output, ctx.cfg)
+        prompt = build_verify_prompt(record, annotation.output, ctx.cfg, label=label)
         results = await asyncio.gather(
             *(
                 ctx.schema_engine.complete_validated(
@@ -274,7 +290,7 @@ class VerifyStage:
             if verdict == "fail":
                 fail_critiques.extend(entries)
             self._emit_verdict_event(record, verdict, round_no, obj["critiques"],
-                                     judge if multi else None, ctx)
+                                     judge if multi else None, ctx, label=label)
         return majority_verdict(verdicts), merged, fail_critiques
 
     def _emit_verdict_event(
@@ -285,6 +301,7 @@ class VerifyStage:
         critiques: Sequence[Mapping],
         judge: str | None,
         ctx: "RunContext",
+        label: str | None = None,
     ) -> None:
         content = ctx.cfg.trace.content
         payload: dict = {"verdict": verdict, "round": round_no}
@@ -294,6 +311,8 @@ class VerifyStage:
             ]
         if judge is not None:
             payload["judge"] = judge
+        if ctx.cfg.classify.enabled and label is not None:  # v1.7 R5
+            payload["label"] = label
         if ctx.cfg.trace.enabled and content in ("excerpt", "full"):
             # §7.4: the four trace.content tiers are cumulative ("逐档递增") — "full"
             # includes everything from "excerpt", so the excerpt is attached at both
@@ -312,7 +331,8 @@ class VerifyStage:
     # ── repair hook into M5 (sanctioned cross-operator import, §7.4/§7.6) ──
 
     async def _reannotate(
-        self, record: Record, annotation: Annotation, fail_critiques: list[dict], ctx: "RunContext"
+        self, record: Record, annotation: Annotation, fail_critiques: list[dict],
+        ctx: "RunContext", label: str | None = None,
     ) -> Annotation:
         from labelkit.annotate import RepairContext, annotate_record
 
@@ -320,4 +340,4 @@ class VerifyStage:
             previous_output=annotation.output,
             critiques_text=render_critiques_text(fail_critiques),
         )
-        return await annotate_record(record, ctx, repair)
+        return await annotate_record(record, ctx, repair, label=label)

@@ -3,17 +3,21 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 
 from labelkit.annotate import (
     AnnotateStage,
     RepairContext,
     _majority_vote,
     _voted_keys,
+    annotate_record,
     build_annotate_prompt,
 )
 from labelkit.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ClassSpec,
+    ClassView,
     DedupConfig,
     FewShotExample,
     GenerateConfig,
@@ -27,7 +31,7 @@ from labelkit.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.types import ImageRef, Record, RecordRef, UINode, UITree
+from labelkit.types import Classification, ImageRef, Record, RecordRef, UINode, UITree
 
 USER_SCHEMA = {
     "type": "object",
@@ -414,3 +418,151 @@ def test_schema_violation_kind_unchanged_without_flag(tmp_path):
     asyncio.run(stage._annotate_item(item, ctx))
     assert item.status == "failed"
     assert item.errors and item.errors[0].kind == "schema_violation"
+
+
+# ── v1.7 label threading (R2/R5): class-effective instruction/examples ───────
+
+CLASS_INSTRUCTION = "你是写作类指令的意图标注员。"
+CLASS_EXAMPLE = FewShotExample(
+    input="以春天为题写一首短诗",
+    output={"intent": "writing_assist", "topic": "诗歌创作", "difficulty": "medium"})
+
+
+def make_classified_cfg(**kw) -> ResolvedConfig:
+    """make_cfg + classify enabled + two class views: 'writing' overrides the
+    annotate instruction/examples, 'qa' is a zero-override view (= global)."""
+    base = make_cfg(**kw)
+    class_annotate = replace(base.annotate, instruction=CLASS_INSTRUCTION,
+                             examples=(CLASS_EXAMPLE,))
+    views = {
+        "writing": ClassView(name="writing", quality=base.quality, rubric=base.rubric,
+                             annotate=class_annotate, generate=base.generate,
+                             verify=base.verify),
+        "qa": ClassView(name="qa", quality=base.quality, rubric=base.rubric,
+                        annotate=base.annotate, generate=base.generate,
+                        verify=base.verify),
+    }
+    classify = ClassifyConfig(
+        enabled=True, fallback_class="qa", max_labels=None,
+        classes=(ClassSpec(name="writing", description="写作协助类指令"),
+                 ClassSpec(name="qa", description="知识问答类指令")))
+    return replace(base, classify=classify, class_views=views)
+
+
+def _classification(label="writing"):
+    return Classification(label=label, labels=(label,), source="llm", detail={})
+
+
+def test_label_takes_class_effective_instruction_and_examples():
+    global_examples = (FewShotExample(input="全局示例",
+                                      output={"intent": "qa", "topic": "全局主题",
+                                              "difficulty": "easy"}),)
+    cfg = make_classified_cfg(examples=global_examples)
+    bundle = build_annotate_prompt(text_record(), cfg, SCHEMA_TEXT, label="writing")
+
+    # template structure unchanged: system, one message per class example, record
+    assert [m.role for m in bundle.messages] == ["system", "user", "user"]
+    assert bundle.messages[0].parts[0].text == (
+        CLASS_INSTRUCTION + "\n"
+        "输出必须是符合以下 JSON Schema 的单个 JSON 对象，不输出任何其他内容：\n"
+        + SCHEMA_TEXT
+    )
+    example_text = bundle.messages[1].parts[0].text
+    assert example_text == (
+        "[示例输入] 以春天为题写一首短诗\n[示例输出] "
+        '{"intent": "writing_assist", "topic": "诗歌创作", "difficulty": "medium"}'
+    )
+    assert "全局示例" not in example_text
+
+
+def test_label_none_falls_back_to_global_config():
+    global_examples = (FewShotExample(input="全局示例",
+                                      output={"intent": "qa", "topic": "全局主题",
+                                              "difficulty": "easy"}),)
+    cfg = make_classified_cfg(examples=global_examples)
+    plain = make_cfg(examples=global_examples)
+    # label omitted → byte-identical to the pre-v1.7 global assembly
+    assert (build_annotate_prompt(text_record(), cfg, SCHEMA_TEXT)
+            == build_annotate_prompt(text_record(), plain, SCHEMA_TEXT))
+    # zero-override view ('qa') also equals the global assembly
+    assert (build_annotate_prompt(text_record(), cfg, SCHEMA_TEXT, label="qa")
+            == build_annotate_prompt(text_record(), plain, SCHEMA_TEXT))
+
+
+class _CapturingEngine:
+    user_schema_text = SCHEMA_TEXT
+
+    def __init__(self):
+        self.prompts = []
+
+    async def complete_validated(self, profile, prompt, *, record_ids, batch_no,
+                                 record=None):
+        from labelkit.types import Usage
+        self.prompts.append(prompt)
+        return ({"intent": "writing_assist", "topic": "诗歌创作", "difficulty": "easy"},
+                Usage(1, 1), 1, "m")
+
+
+class _CapturingMetrics:
+    def __init__(self):
+        self.events = []
+
+    def event(self, ev, **kw):
+        self.events.append((ev, dict(kw.get("payload") or {})))
+
+    def count(self, key, n=1):
+        pass
+
+
+def test_stage_passes_classification_label_and_event_carries_it():
+    import asyncio
+    from types import SimpleNamespace
+    from labelkit.types import PipelineItem
+
+    cfg = make_classified_cfg()
+    engine, metrics = _CapturingEngine(), _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    item = PipelineItem(record=text_record(), classification=_classification("writing"))
+    asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
+
+    assert item.status == "active" and item.annotation is not None
+    # the prompt reaching M8 was assembled from the class view
+    assert engine.prompts[0].messages[0].parts[0].text.startswith(CLASS_INSTRUCTION + "\n")
+    # annotate.done carries the label (R5: classify enabled + classified item)
+    ((ev, payload),) = metrics.events
+    assert ev == "annotate.done"
+    assert payload["label"] == "writing"
+
+
+def test_annotate_done_without_classification_has_no_label():
+    import asyncio
+    from types import SimpleNamespace
+    from labelkit.types import PipelineItem
+
+    cfg = make_classified_cfg()
+    engine, metrics = _CapturingEngine(), _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    item = PipelineItem(record=text_record())          # classification is None
+    asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
+
+    # falls back to the global prompt and omits the payload field
+    assert engine.prompts[0].messages[0].parts[0].text.startswith("你是意图标注员。\n")
+    ((ev, payload),) = metrics.events
+    assert ev == "annotate.done"
+    assert "label" not in payload
+
+
+def test_annotate_record_threads_label_through_sc_path():
+    import asyncio
+    from types import SimpleNamespace
+
+    cfg = make_classified_cfg(self_consistency=3)
+    engine, metrics = _CapturingEngine(), _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ann = asyncio.run(annotate_record(text_record(), ctx, label="writing"))
+
+    assert ann.sc == {"n": 3, "agreement_ratio": 1.0}
+    assert len(engine.prompts) == 3
+    for prompt in engine.prompts:                      # every sample uses the class view
+        assert prompt.messages[0].parts[0].text.startswith(CLASS_INSTRUCTION + "\n")
+        assert prompt.temperature == cfg.annotate.sc_temperature

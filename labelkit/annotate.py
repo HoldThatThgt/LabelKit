@@ -56,21 +56,25 @@ def _dumps(obj: object) -> str:
 
 def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: str,
                           repair: RepairContext | None = None,
-                          temperature: float | None = None) -> PromptBundle:
+                          temperature: float | None = None,
+                          label: str | None = None) -> PromptBundle:
     """Deterministic template assembly per CONTRACTS.md §10.1 (+ §10.5 repair suffix).
 
     schema_text = SchemaEngine.user_schema_text. Section order is fixed: system (task
     instruction + schema constraint), one user message per few-shot example in configured
     order, then the current-record user message (text part, or UI screenshot + tree parts).
+    v1.7 (R2): label non-None → instruction/examples come from
+    cfg.class_views[label].annotate; None = global config (pre-v1.7 behavior).
     """
+    acfg = cfg.class_views[label].annotate if label is not None else cfg.annotate
     messages: list[Message] = []
 
-    system_text = (f"{cfg.annotate.instruction}\n"
+    system_text = (f"{acfg.instruction}\n"
                    f"{_SCHEMA_SENTENCE}\n"
                    f"{schema_text}")
     messages.append(Message(role="system", parts=(Part(kind="text", text=system_text),)))
 
-    for example in cfg.annotate.examples:
+    for example in acfg.examples:
         example_text = (f"{_LABEL_EXAMPLE_IN} {example.input}\n"
                         f"{_LABEL_EXAMPLE_OUT} {_dumps(example.output)}")
         messages.append(Message(role="user", parts=(Part(kind="text", text=example_text),)))
@@ -197,10 +201,13 @@ def _majority_vote(samples: Sequence[Mapping],
 # ── record-level annotation path (public repair hook for M7) ────────────────
 
 async def annotate_record(record: Record, ctx: "RunContext",
-                          repair: RepairContext | None = None) -> Annotation:
+                          repair: RepairContext | None = None,
+                          label: str | None = None) -> Annotation:
     """One record's full annotation path incl. self-consistency (skipped when repair is
     not None: repair re-annotation is always a single call at profile-default temperature).
-    Raises SchemaViolation / ProviderRetryableError / ProviderFatalError."""
+    Raises SchemaViolation / ProviderRetryableError / ProviderFatalError.
+    v1.7 (R2): label is passed through to build_annotate_prompt (class-effective
+    instruction/examples); llm/self_consistency/sc_temperature stay global (whitelist)."""
     cfg = ctx.cfg
     profile = cfg.annotate.llm
     schema_text = ctx.schema_engine.user_schema_text
@@ -208,7 +215,7 @@ async def annotate_record(record: Record, ctx: "RunContext",
 
     if repair is not None or n == 0:
         prompt = build_annotate_prompt(record, cfg, schema_text, repair=repair,
-                                       temperature=None)
+                                       temperature=None, label=label)
         obj, usage, attempts, model = await ctx.schema_engine.complete_validated(
             profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
             record=record.raw)
@@ -218,7 +225,8 @@ async def annotate_record(record: Record, ctx: "RunContext",
     # M8 guarantee; a SchemaViolation sample abstains (denominator stays n).
     async def one_sample() -> tuple[dict, Usage, int, str]:
         prompt = build_annotate_prompt(record, cfg, schema_text, repair=None,
-                                       temperature=cfg.annotate.sc_temperature)
+                                       temperature=cfg.annotate.sc_temperature,
+                                       label=label)
         return await ctx.schema_engine.complete_validated(
             profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
             record=record.raw)
@@ -269,8 +277,9 @@ class AnnotateStage:
 
     async def _annotate_item(self, item: PipelineItem, ctx: "RunContext") -> None:
         record = item.record
+        label = item.classification.label if item.classification else None
         try:
-            item.annotation = await annotate_record(record, ctx)
+            item.annotation = await annotate_record(record, ctx, label=label)
         except SchemaViolation as e:
             # Transport the raw last model output to M11 for the rejects "full"
             # tier (§9.2) via the duck-typed channel the emitter reads.
@@ -295,6 +304,8 @@ class AnnotateStage:
             payload: dict = {"attempts": item.annotation.attempts}
             if item.annotation.sc is not None:
                 payload["sc"] = dict(item.annotation.sc)
+            if self.cfg.classify.enabled and label is not None:  # v1.7 R5
+                payload["label"] = label
             excerpt = self._excerpt_payload(record)
             if excerpt is not None:
                 payload["excerpt"] = excerpt

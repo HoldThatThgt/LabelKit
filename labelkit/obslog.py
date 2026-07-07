@@ -34,6 +34,7 @@ EV_INGEST_BAD_LINE = "ingest.bad_line"
 EV_INGEST_MISSING_PAIR = "ingest.missing_pair"
 EV_INGEST_INDEX_CONFLICT = "ingest.index_conflict"
 EV_DEDUP_DUPLICATE = "dedup.duplicate"
+EV_CLASSIFY_DECISION = "classify.decision"   # v1.7 M13 (spec 7.2); trace-only, R29
 EV_QUALITY_JUDGMENT = "quality.judgment"
 EV_QUALITY_POINTWISE = "quality.pointwise"
 EV_QUALITY_BT_FIT = "quality.bt_fit"

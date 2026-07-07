@@ -26,6 +26,7 @@ from labelkit.config.model import (
     VerifyConfig,
 )
 from labelkit.obslog import (
+    EV_CLASSIFY_DECISION,
     EV_ERROR,
     EV_RUN_START,
     EventLog,
@@ -287,6 +288,78 @@ def test_error_event_channel_is_the_producing_stage(tmp_path):
     lines = [json.loads(l) for l in path.read_text().splitlines()]
     assert len(lines) == 1
     assert lines[0]["stage"] == "quality"
+
+
+# ── v1.7 classify channel (spec 7.2 / CONTRACTS §7.11, §8.1) ────────────────
+
+
+def test_classify_decision_routes_through_classify_channel(tmp_path):
+    """classify.decision follows the prefix rule: written only when "classify"
+    is among trace.channels (NOT in the default set — user opt-in, R29)."""
+    assert EV_CLASSIFY_DECISION == "classify.decision"    # §7.11 exact string
+    # default channels (quality/verify/schema): filtered out
+    log, path = open_log(tmp_path)
+    log.emit(ev(EV_CLASSIFY_DECISION, stage="classify", record_ids=("r1",),
+                payload={"label": "faq", "source": "llm"}))
+    log.close()
+    assert not path.exists()                    # nothing ever written
+    assert log.dropped_events == 0              # filtered ≠ dropped
+
+    # explicit "classify" channel: written with the payload intact
+    log2, path2 = open_log(tmp_path, channels=("classify",))
+    log2.emit(ev(EV_CLASSIFY_DECISION, stage="classify", record_ids=("r1",),
+                 payload={"label": "faq", "labels": ["faq", "chat"],
+                          "source": "llm", "sc": {"n": 3, "agreement_ratio": 1.0}}))
+    log2.close()
+    lines = [json.loads(l) for l in path2.read_text().splitlines()]
+    assert len(lines) == 1
+    assert lines[0]["ev"] == "classify.decision"
+    assert lines[0]["stage"] == "classify"
+    assert lines[0]["payload"]["label"] == "faq"
+    assert lines[0]["payload"]["labels"] == ["faq", "chat"]
+
+
+def test_classify_stage_error_event_belongs_to_classify_channel(tmp_path):
+    """error events route by PRODUCING STAGE: a classify-stage error passes a
+    channels=("classify",) filter and is excluded by a quality-only filter."""
+    payload = {"stage": "classify", "kind": "classification_invalid",
+               "message": "m", "retryable": False}
+    log, path = open_log(tmp_path, channels=("classify",))
+    log.emit(ev(EV_ERROR, stage="classify", record_ids=("r1",), payload=payload))
+    log.emit(ev(EV_ERROR, stage="quality",
+                payload={"stage": "quality", "kind": "judgment_invalid",
+                         "message": "m", "retryable": False}))    # filtered
+    log.close()
+    lines = [json.loads(l) for l in path.read_text().splitlines()]
+    assert len(lines) == 1
+    assert lines[0]["stage"] == "classify"
+    assert lines[0]["payload"]["kind"] == "classification_invalid"
+
+    path2 = tmp_path / "quality_only.trace.jsonl"
+    log2 = EventLog(TraceConfig(enabled=True, path=str(path2),
+                                channels=("quality",)), "f3a9c04b7d21")
+    log2.emit(ev(EV_ERROR, stage="classify", record_ids=("r1",), payload=payload))
+    log2.close()
+    assert not path2.exists()                   # filtered by the quality-only set
+
+
+def test_classify_decision_is_trace_only_no_stderr_mirror(tmp_path, capsys):
+    """R29: classify.decision has no stderr level (like quality.judgment) —
+    the sink writes it to the trace but never mirrors it to the run log."""
+    cfg = make_cfg(tmp_path, tool=ToolConfig(log_level="debug"),
+                   trace=TraceConfig(enabled=True,
+                                     path=str(tmp_path / "t.trace.jsonl"),
+                                     channels=("classify",)))
+    setup_logging(cfg)
+    log = EventLog(cfg.trace, "abc")
+    sink = MetricsSink(cfg, "abc", log)
+    sink.event(EV_CLASSIFY_DECISION, stage="classify", batch_no=1,
+               record_ids=("r1",), payload={"label": "faq", "source": "llm"})
+    sink.flush()
+    log.close()
+    assert capsys.readouterr().err == ""        # no mirror line at any level
+    lines = (tmp_path / "t.trace.jsonl").read_text(encoding="utf-8").splitlines()
+    assert [json.loads(l)["ev"] for l in lines] == ["classify.decision"]
 
 
 # ── write-failure policy ───────────────────────────────────────────────────

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
@@ -15,6 +16,8 @@ import pytest
 from labelkit.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ClassSpec,
+    ClassView,
     DedupConfig,
     GenerateConfig,
     InputConfig,
@@ -34,6 +37,7 @@ from labelkit.errors import (
 )
 from labelkit.types import (
     Annotation,
+    Classification,
     PipelineItem,
     Record,
     RecordRef,
@@ -43,6 +47,7 @@ from labelkit.types import (
 from labelkit.verify import (
     VerifyStage,
     _classify_error,
+    build_verify_prompt,
     majority_verdict,
     render_critiques_text,
     run_verify_loop,
@@ -489,3 +494,157 @@ def test_single_judge_schema_violation_propagates_to_classify():
 
     with pytest.raises(SchemaViolation):
         asyncio.run(stage._judge_round(rec, ann, 1, ctx))
+
+
+# ── v1.7 label threading (R3/R5): class-effective [任务指令] + extra_criteria ─
+
+CLASS_INSTRUCTION = "写作类专用标注指令。"
+CLASS_EXTRA = "④ 写作风格是否得体"
+
+
+def _classified_cfg(*, policy="drop", max_repair_rounds=1) -> ResolvedConfig:
+    """trace_cfg + classify enabled + two class views: 'writing' overrides the
+    annotate instruction and verify extra_criteria, 'qa' is zero-override."""
+    base = trace_cfg()
+    gverify = VerifyConfig(enabled=True, policy=policy,
+                           max_repair_rounds=max_repair_rounds)
+    views = {
+        "writing": ClassView(
+            name="writing", quality=base.quality, rubric=base.rubric,
+            annotate=replace(base.annotate, instruction=CLASS_INSTRUCTION),
+            generate=base.generate,
+            verify=replace(gverify, extra_criteria=CLASS_EXTRA)),
+        "qa": ClassView(
+            name="qa", quality=base.quality, rubric=base.rubric,
+            annotate=base.annotate, generate=base.generate, verify=gverify),
+    }
+    classify = ClassifyConfig(
+        enabled=True, fallback_class="qa",
+        classes=(ClassSpec(name="writing", description="写作协助类指令"),
+                 ClassSpec(name="qa", description="知识问答类指令")))
+    return replace(base, classify=classify, class_views=views, verify=gverify)
+
+
+def test_verify_prompt_label_takes_class_effective_values():
+    cfg = _classified_cfg()
+    bundle = build_verify_prompt(_record(text="写一首诗"), {"intent": "写作"}, cfg,
+                                 label="writing")
+    assert bundle.messages[0].parts[0].text == (
+        "你是标注质量审核员。给定任务指令、原始数据与标注结果，独立判断标注是否合格。\n"
+        "评审维度: ① 是否遵循任务指令 ② 与原始数据的事实一致性 ③ 字段语义是否正确填写\n"
+        f"{CLASS_EXTRA}\n"
+        "先逐维度给出简短意见，再给结论。"
+    )
+    assert bundle.messages[1].parts[0].text == (
+        f"[任务指令] {CLASS_INSTRUCTION}\n"
+        "[原始数据] 写一首诗\n"
+        '[标注结果] {"intent": "写作"}'
+    )
+
+
+def test_verify_prompt_label_none_falls_back_to_global():
+    cfg = _classified_cfg()
+    bundle = build_verify_prompt(_record(text="hello"), {"intent": "x"}, cfg)
+    # global verify.extra_criteria is empty → the line is omitted entirely
+    assert CLASS_EXTRA not in bundle.messages[0].parts[0].text
+    # global annotate.instruction (trace_cfg) fills [任务指令]
+    assert bundle.messages[1].parts[0].text.startswith("[任务指令] 给指令分类。\n")
+    # zero-override view behaves exactly like the global config
+    qa_bundle = build_verify_prompt(_record(text="hello"), {"intent": "x"}, cfg,
+                                    label="qa")
+    assert qa_bundle == bundle
+
+
+def test_verify_prompt_ui_branch_head_uses_class_instruction():
+    from pathlib import Path
+    from labelkit.types import ImageRef, UINode, UITree
+
+    nodes = (
+        UINode("1", None, 0, "FrameLayout", "", "", (0, 0, 1080, 1920), True, {}),
+        UINode("2", "1", 1, "Button", "登录", "", (72, 952, 1008, 1096), True, {}),
+    )
+    rec = Record(id="9" * 16, modality="ui", text=None, raw=None,
+                 ui_tree=UITree(nodes),
+                 image=ImageRef(path=Path("image_1.png"), format="png", size_bytes=1),
+                 ref=RecordRef("a/uitree_1.jsonl", None, 1, ()))
+    cfg = _classified_cfg()
+    bundle = build_verify_prompt(rec, {"intent": "x"}, cfg, label="writing")
+    assert CLASS_EXTRA in bundle.messages[0].parts[0].text
+    head = bundle.messages[1].parts[0].text
+    assert head == f"[任务指令] {CLASS_INSTRUCTION}\n[原始数据]\n[屏幕截图]"
+
+
+def test_verdict_event_label_only_when_classify_enabled():
+    # classify disabled: a label arg must NOT surface in the payload
+    cfg = trace_cfg()
+    metrics = _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, metrics=metrics, batch_no=1)
+    VerifyStage(cfg)._emit_verdict_event(_record(), "pass", 1, [C1], None, ctx,
+                                         label="writing")
+    (_, _, _, _, payload) = metrics.events[0]
+    assert "label" not in payload
+
+    # classify enabled + labeled item → payload carries it (R5)
+    cfg2 = _classified_cfg()
+    metrics2 = _CapturingMetrics()
+    ctx2 = SimpleNamespace(cfg=cfg2, metrics=metrics2, batch_no=1)
+    VerifyStage(cfg2)._emit_verdict_event(_record(), "pass", 1, [C1], None, ctx2,
+                                          label="writing")
+    (_, _, _, _, payload2) = metrics2.events[0]
+    assert payload2["label"] == "writing"
+
+
+def test_verify_item_threads_label_through_judges_and_repair(monkeypatch):
+    """_verify_item injects item.classification.label into both closures: every
+    judge prompt is class-effective, repair re-annotation gets label=..., and
+    verify.verdict events carry the label."""
+    cfg = _classified_cfg(policy="repair", max_repair_rounds=1)
+    stage = VerifyStage(cfg)
+    item = PipelineItem(
+        record=_record(text="帮我写一首诗"),
+        annotation=_annotation({"intent": "写作"}),
+        classification=Classification(label="writing", labels=("writing",),
+                                      source="llm", detail={}),
+    )
+
+    prompts = []
+    script = iter([
+        {"verdict": "fail", "critiques": [{"aspect": "字段语义", "opinion": "有误"}]},
+        {"verdict": "pass", "critiques": [{"aspect": "字段语义", "opinion": "已修正"}]},
+    ])
+
+    async def mock_complete_validated(judge, prompt, *, schema, record_ids, batch_no):
+        prompts.append(prompt)
+        return (next(script), Usage(1, 1), 1, "m")
+
+    engine = SimpleNamespace(complete_validated=mock_complete_validated)
+
+    captured = {}
+
+    async def fake_annotate_record(record, ctx, repair=None, label=None):
+        captured["label"] = label
+        captured["repair"] = repair
+        return _annotation({"intent": "修正后"})
+
+    monkeypatch.setattr("labelkit.annotate.annotate_record", fake_annotate_record)
+
+    metrics = _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    asyncio.run(stage._verify_item(item, ctx))
+
+    assert item.status == "active"
+    assert item.verification.verdict == "pass" and item.verification.rounds == 2
+    # repair path threaded the label into annotate_record (R3)
+    assert captured["label"] == "writing"
+    assert captured["repair"].critiques_text == "字段语义: 有误"
+    # both judge rounds used the class-effective prompt
+    assert len(prompts) == 2
+    for prompt in prompts:
+        assert CLASS_EXTRA in prompt.messages[0].parts[0].text
+        assert prompt.messages[1].parts[0].text.startswith(
+            f"[任务指令] {CLASS_INSTRUCTION}\n")
+    # every verify.verdict event carries the label
+    verdict_payloads = [p for (ev, _, _, _, p) in metrics.events
+                        if ev == "verify.verdict"]
+    assert len(verdict_payloads) == 2
+    assert all(p["label"] == "writing" for p in verdict_payloads)

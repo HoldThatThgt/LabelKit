@@ -263,6 +263,16 @@ class Emitter:
             "source": self._source_block(rec, with_fields=True),
             "scores": self._scores_block(item, batch_no),
             "dedup": {"kind": item.dedup.kind} if item.dedup is not None else None,
+            # v1.7 ALWAYS-PRESENT key (§9.1): null when the item carries no
+            # classification (classify disabled, or never reached) — same
+            # convention as the other stage keys; position dedup → annotation
+            # mirrors the chain order.
+            "classification": (
+                {"label": item.classification.label,
+                 "labels": list(item.classification.labels),
+                 "source": item.classification.source}
+                if item.classification is not None else None
+            ),
             "annotation": self._annotation_block(item),
             "verification": (
                 {"verdict": item.verification.verdict, "rounds": item.verification.rounds}
@@ -321,6 +331,10 @@ class Emitter:
             "pairwise_bt" if self._cfg.quality.mode == "pairwise" else "pointwise"
         )
         block["batch_no"] = batch_no
+        if self._cfg.classify.enabled and item.classification is not None:
+            # v1.7 (§9.1): the scoring pool this envelope was ranked in —
+            # present only when classify is enabled.
+            block["pool"] = item.classification.label
         return block
 
     def _annotation_block(self, item: PipelineItem) -> dict | None:
@@ -368,6 +382,15 @@ class Emitter:
             "reason": reason,
             "errors": [e.message for e in item.errors],  # [] when none (frozen)
         }
+        if self._cfg.classify.enabled:
+            # v1.7 R5 (§9.2): the closed five-key enumeration becomes SIX keys
+            # when classify is enabled — `label` disambiguates fanned-out
+            # siblings sharing a record id; null when the item was rejected
+            # before ever being classified. Both refs and full tiers carry it
+            # (full extends refs). Classify disabled keeps the five-key form
+            # byte-identical.
+            meta["label"] = (item.classification.label
+                             if item.classification is not None else None)
         row: dict = {"_meta": meta}
         if self._cfg.output.rejects == "full":
             row["record"] = _raw_payload(item.record)

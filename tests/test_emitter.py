@@ -11,15 +11,15 @@ from jsonschema import Draft202012Validator
 
 from labelkit import TOOL_VERSION
 from labelkit.config.model import (
-    AnnotateConfig, ClassifyConfig, Criterion, DedupConfig, GenerateConfig,
-    InputConfig, OutputConfig, QualityConfig, ResolvedConfig, Rubric, RunConfig,
-    ToolConfig, TraceConfig, VerifyConfig,
+    AnnotateConfig, ClassifyConfig, ClassSpec, Criterion, DedupConfig,
+    GenerateConfig, InputConfig, OutputConfig, QualityConfig, ResolvedConfig,
+    Rubric, RunConfig, ToolConfig, TraceConfig, VerifyConfig,
 )
 from labelkit.emitter import EmitResult, Emitter
 from labelkit.errors import LabelKitError
 from labelkit.types import (
-    Annotation, DedupInfo, ImageRef, PipelineItem, QualityScore, Record,
-    RecordRef, StageError, UINode, UITree, Usage, VerificationResult,
+    Annotation, Classification, DedupInfo, ImageRef, PipelineItem, QualityScore,
+    Record, RecordRef, StageError, UINode, UITree, Usage, VerificationResult,
 )
 
 USER_SCHEMA = {
@@ -62,6 +62,7 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
     modality = kw.pop("modality", "text")
     quality_rubric = kw.pop("quality_rubric", "default:text")
     log_format = kw.pop("log_format", "text")
+    classify = kw.pop("classify", ClassifyConfig())
     assert not kw, f"unknown overrides: {kw}"
     return ResolvedConfig(
         tool=ToolConfig(log_format=log_format),
@@ -70,7 +71,7 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
         run=RunConfig(output=output, modality=modality, seed=7),
         input=InputConfig(),
         dedup=DedupConfig(),
-        classify=ClassifyConfig(),
+        classify=classify,
         quality=QualityConfig(
             selection=selection,
             threshold=0.3 if selection == "threshold" else None,
@@ -103,6 +104,14 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
     )
 
 
+def classify_cfg(assignment="single", classes=("faq", "chat")) -> ClassifyConfig:
+    return ClassifyConfig(
+        enabled=True, assignment=assignment,
+        max_labels=len(classes) if assignment == "multi" else None,
+        fallback_class=classes[-1],
+        classes=tuple(ClassSpec(name=n, description="d") for n in classes))
+
+
 def make_record(rec_id="a" * 16, line_no=1, raw=None, generated=False):
     if raw is None:
         raw = {"instruction": "帮我写一条请假条", "source": "ime-log", "ts": "t"}
@@ -129,9 +138,10 @@ def make_ui_record(rec_id="c" * 16):
 
 
 def make_item(status="active", record=None, annotated=True, scores=False,
-              verified=False, dedup=True, errors=(), output=None):
+              verified=False, dedup=True, errors=(), output=None,
+              classification=None):
     record = record or make_record()
-    item = PipelineItem(record=record, status=status)
+    item = PipelineItem(record=record, status=status, classification=classification)
     if dedup:
         item.dedup = DedupInfo(kind="unique", cluster_key="k" * 16, kept_id=None)
     if scores:
@@ -180,9 +190,10 @@ def test_inline_meta_mode_structure(tmp_path):
     # stripping _meta must yield an object passing the user schema
     Draft202012Validator(USER_SCHEMA).validate(row)
     assert row == {"intent": "writing_assist", "topic": "请假条", "difficulty": "easy"}
-    # exact _meta structure per §6.3 — all keys always present
+    # exact _meta structure per §6.3 — all keys always present (v1.7 adds the
+    # ALWAYS-PRESENT classification key between dedup and annotation)
     assert list(meta) == ["id", "run", "source", "scores", "dedup",
-                          "annotation", "verification"]
+                          "classification", "annotation", "verification"]
     assert meta["id"] == "a" * 16
     assert meta["run"] == {"tool": TOOL_VERSION,
                            "started_at": RUN_STARTED_AT.isoformat(),
@@ -194,6 +205,7 @@ def test_inline_meta_mode_structure(tmp_path):
     assert meta["scores"] == {"clarity": 0.72, "__aggregate__": 0.72,
                               "mode": "pairwise_bt", "batch_no": 1}
     assert meta["dedup"] == {"kind": "unique"}
+    assert meta["classification"] is None          # classify disabled → null
     assert meta["annotation"] == {"model": "glm-5.2", "attempts": 1}
     assert meta["verification"] == {"verdict": "pass", "rounds": 1}
 
@@ -205,7 +217,94 @@ def test_inline_disabled_stages_are_null(tmp_path):
     meta = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]
     assert meta["scores"] is None
     assert meta["dedup"] is None
+    assert meta["classification"] is None
     assert meta["verification"] is None
+
+
+# ── v1.7 classification meta / scores.pool / rejects label ─────────────────
+
+def test_meta_classification_three_states(tmp_path):
+    """§9.1 classification key tri-state: null (unclassified), single-label,
+    multi-label — {label, labels, source} with labels always a list."""
+    cfg = make_cfg(tmp_path, classify=classify_cfg(assignment="multi"))
+    unclassified = make_item(record=make_record("1" * 16, 1))
+    single = make_item(
+        record=make_record("2" * 16, 2),
+        classification=Classification(label="faq", labels=("faq",),
+                                      source="llm", detail={}))
+    multi = make_item(
+        record=make_record("3" * 16, 3),
+        classification=Classification(label="chat", labels=("faq", "chat"),
+                                      source="inherited", detail={}))
+    run_emitter(cfg, [unclassified, single, multi])
+
+    by_id = {r["_meta"]["id"]: r["_meta"]
+             for r in read_jsonl(tmp_path / "out" / "res.jsonl")}
+    assert by_id["1" * 16]["classification"] is None
+    assert by_id["2" * 16]["classification"] == {
+        "label": "faq", "labels": ["faq"], "source": "llm"}
+    assert by_id["3" * 16]["classification"] == {
+        "label": "chat", "labels": ["faq", "chat"], "source": "inherited"}
+    # detail never reaches _meta (three-key closed shape, §9.1)
+    for meta in by_id.values():
+        if meta["classification"] is not None:
+            assert set(meta["classification"]) == {"label", "labels", "source"}
+
+
+def test_scores_pool_only_when_classify_enabled(tmp_path):
+    """§9.1: scores.pool = the envelope's routing label, present ONLY when
+    classify is enabled; the disabled scores block stays byte-identical."""
+    cls = Classification(label="faq", labels=("faq",), source="llm", detail={})
+    cfg_on = make_cfg(tmp_path, classify=classify_cfg())
+    item = make_item(scores=True, classification=cls)
+    run_emitter(cfg_on, [item])
+    scores = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["scores"]
+    assert scores == {"clarity": 0.72, "__aggregate__": 0.72,
+                      "mode": "pairwise_bt", "batch_no": 1, "pool": "faq"}
+
+    out2 = tmp_path / "off" / "res.jsonl"
+    out2.parent.mkdir(parents=True)
+    cfg_off = make_cfg(tmp_path, output=str(out2))
+    # even a (stray) classification must not leak pool when classify is off
+    run_emitter(cfg_off, [make_item(scores=True, classification=cls)])
+    scores_off = read_jsonl(out2)[0]["_meta"]["scores"]
+    assert "pool" not in scores_off
+    assert scores_off == {"clarity": 0.72, "__aggregate__": 0.72,
+                          "mode": "pairwise_bt", "batch_no": 1}
+
+
+def test_rejects_label_key_when_classify_enabled_refs_and_full(tmp_path):
+    """R5 (§9.2): classify enabled turns the closed five-key refs enumeration
+    into six keys — label = routing label, null when never classified; the
+    full tier carries it too."""
+    cls_a = Classification(label="faq", labels=("faq", "chat"), source="llm",
+                           detail={})
+    cfg = make_cfg(tmp_path, classify=classify_cfg(assignment="multi"))
+    classified = make_item(status="dropped_lowq", annotated=False,
+                           record=make_record("1" * 16, 1), classification=cls_a)
+    unclassified = make_item(status="dropped_dup", annotated=False,
+                             record=make_record("2" * 16, 2))
+    run_emitter(cfg, [classified, unclassified])
+
+    rows = {r["_meta"]["id"]: r["_meta"]
+            for r in read_jsonl(tmp_path / "out" / "res.rejects.jsonl")}
+    for meta in rows.values():
+        assert list(meta) == ["id", "source", "stage", "reason", "errors", "label"]
+    assert rows["1" * 16]["label"] == "faq"
+    assert rows["2" * 16]["label"] is None         # dropped before classify
+
+    # full tier: label present alongside the record payload
+    out2 = tmp_path / "full" / "res.jsonl"
+    out2.parent.mkdir(parents=True)
+    cfg_full = make_cfg(tmp_path, output=str(out2), rejects="full",
+                        classify=classify_cfg())
+    item = make_item(status="dropped_verify", record=make_record("3" * 16, 3),
+                     classification=Classification(label="chat", labels=("chat",),
+                                                   source="fallback", detail={}))
+    run_emitter(cfg_full, [item])
+    row = read_jsonl(tmp_path / "full" / "res.rejects.jsonl")[0]
+    assert row["_meta"]["label"] == "chat"
+    assert "record" in row
 
 
 def test_sidecar_meta_mode_alignment(tmp_path):

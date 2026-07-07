@@ -6,7 +6,9 @@ writes (M11 owns the output channels). Responsibilities:
 - slice the M2 record stream (or the M6 generate_all output in generate_only
   mode) into batches of ``run.batch_size``;
 - compose the per-batch stage chain from the config switches (2.3.1 matrix) in
-  the canonical order dedup → quality → generate → annotate → verify;
+  the canonical order dedup → classify → quality → generate → annotate → verify;
+- meter ``counts.fanout`` as the len-delta across the classify stage (v1.7 R9 —
+  ``counts.*`` ownership stays with M10; M13 appends siblings in place);
 - schedule the single-round generation re-flow (sub-batches re-enter at M3,
   never at M6 — no recursion);
 - drive per-batch lifecycle: fresh RunContext per (batch, stage), emit via M11,
@@ -53,8 +55,9 @@ _EV_RUN_END = "run.end"
 _EV_BATCH_START = "batch.start"
 _EV_BATCH_END = "batch.end"
 
-# Canonical pipeline order (spec §2.2 / CONTRACTS.md §2).
-_CHAIN_ORDER = ("dedup", "quality", "generate", "annotate", "verify")
+# Canonical pipeline order (spec §2.2 / CONTRACTS.md §2; v1.7 inserts classify
+# right after dedup, §7.9).
+_CHAIN_ORDER = ("dedup", "classify", "quality", "generate", "annotate", "verify")
 
 # report.json quality.aggregate_histogram bucket labels — frozen (§9.3).
 _HIST_LABELS = tuple(f"{i / 10:.1f}-{(i + 1) / 10:.1f}" for i in range(10))
@@ -98,6 +101,11 @@ class Orchestrator:
         self._agg_hist = [0] * 10
         self._crit_sum: dict[str, float] = {}
         self._crit_n: dict[str, int] = {}
+        # v1.7 R12: pool-dimensioned mirrors of the three accumulators above,
+        # fed only when classify is enabled (pool = item.classification.label).
+        self._pool_agg_hist: dict[str, list[int]] = {}
+        self._pool_crit_sum: dict[str, dict[str, float]] = {}
+        self._pool_crit_n: dict[str, dict[str, int]] = {}
         self._output_lines = 0
         self._rejects_lines = 0
         self._batch_no = 0
@@ -248,8 +256,10 @@ class Orchestrator:
         t_batch = time.perf_counter()
         self.metrics.event(_EV_BATCH_START, stage="run", batch_no=batch_no,
                            payload={"size": len(batch)})
+        batch_fanout = 0
         for stage in chain:
             ctx = self._make_ctx(batch_no, stage.name)
+            size_before = len(batch)
             t_stage = time.perf_counter()
             try:
                 result = await stage.run(batch, ctx)
@@ -257,6 +267,15 @@ class Orchestrator:
                 elapsed = time.perf_counter() - t_stage
                 self._stage_time[stage.name] = self._stage_time.get(stage.name, 0.0) + elapsed
                 self.metrics.add_stage_time(stage.name, elapsed)
+            if stage.name == "classify":
+                # v1.7 R9: counts.fanout is METERED HERE — the len-delta across
+                # the classify invocation (M13 tail-appends siblings in place
+                # and never touches counts.*; same construction as deriving
+                # counts.generated from generate's return value).
+                delta = len(batch) - size_before
+                if delta > 0:
+                    self.metrics.count("counts.fanout", delta)
+                    batch_fanout += delta
             if stage.name == "generate":
                 # Off-path stage: returns a NEW sub-batch; enqueue it split at
                 # batch_size. Sub-batches re-enter at M3 (single round).
@@ -290,13 +309,18 @@ class Orchestrator:
         self.metrics.count("counts.dropped_verify", dropped_verify)
         self.metrics.count("counts.failed", failed)
 
+        end_payload: dict = {"active": tally.get("active", 0),
+                             "dropped_dup": dropped_dup,
+                             "dropped_lowq": dropped_lowq,
+                             "dropped_verify": dropped_verify,
+                             "failed": tally.get("failed", 0),
+                             "duration_ms": int((time.perf_counter() - t_batch) * 1000)}
+        if self.cfg.classify.enabled:
+            # v1.7 R20 (§8.1): batch.start.size stays the batch-ENTRY envelope
+            # count; batch.end carries the fan-out delta (classify enabled only).
+            end_payload["fanout"] = batch_fanout
         self.metrics.event(_EV_BATCH_END, stage="run", batch_no=batch_no,
-                           payload={"active": tally.get("active", 0),
-                                    "dropped_dup": dropped_dup,
-                                    "dropped_lowq": dropped_lowq,
-                                    "dropped_verify": dropped_verify,
-                                    "failed": tally.get("failed", 0),
-                                    "duration_ms": int((time.perf_counter() - t_batch) * 1000)})
+                           payload=end_payload)
         self.metrics.flush()                       # trace flush follows output flush
 
     def _make_ctx(self, batch_no: int, stage_name: str) -> RunContext:
@@ -313,10 +337,13 @@ class Orchestrator:
         re-orders them canonically and drops anything the config disables.
         `generate` only ever runs on main process-mode batches (never on
         re-flow sub-batches, never in generate_only where it is the chain head).
+        `classify` is included in the main, re-flow AND generate_only chains
+        (v1.7, §7.9) — already-classified items rely on M13's idempotent skip.
         """
         cfg = self.cfg
         enabled = {
             "dedup": cfg.dedup.enabled,
+            "classify": cfg.classify.enabled,
             "quality": cfg.quality.enabled,
             "generate": (cfg.generate.enabled and include_generate
                          and cfg.run.mode == "process"),
@@ -330,16 +357,30 @@ class Orchestrator:
 
     def _collect_quality_stats(self, batch: list[PipelineItem]) -> None:
         """Aggregate quality scores into the report histogram/means (M10 owns
-        report assembly; only counts, never data content)."""
+        report assembly; only counts, never data content). v1.7 R12: with
+        classify enabled the accumulators additionally split by pool
+        (= item.classification.label); classify disabled is byte-identical
+        to the flat v1.6 path."""
+        classify_on = self.cfg.classify.enabled
         for item in batch:
+            pool = (item.classification.label
+                    if classify_on and item.classification is not None else None)
             agg = item.scores.get("__aggregate__")
             if agg is not None and agg.score is not None:
-                self._agg_hist[min(int(agg.score * 10), 9)] += 1
+                bucket = min(int(agg.score * 10), 9)
+                self._agg_hist[bucket] += 1
+                if pool is not None:
+                    self._pool_agg_hist.setdefault(pool, [0] * 10)[bucket] += 1
             for key, qs in item.scores.items():
                 if key == "__aggregate__" or qs.score is None:
                     continue
                 self._crit_sum[key] = self._crit_sum.get(key, 0.0) + qs.score
                 self._crit_n[key] = self._crit_n.get(key, 0) + 1
+                if pool is not None:
+                    psum = self._pool_crit_sum.setdefault(pool, {})
+                    pn = self._pool_crit_n.setdefault(pool, {})
+                    psum[key] = psum.get(key, 0.0) + qs.score
+                    pn[key] = pn.get(key, 0) + 1
 
     # ── finalize / report ──────────────────────────────────────────────────
 
@@ -394,6 +435,11 @@ class Orchestrator:
             "generated": c("counts.generated"),
             "emitted": c("counts.emitted"),
         }
+        if cfg.classify.enabled and cfg.classify.assignment == "multi":
+            # v1.7 R9/R10: the fanout key appears only under multi assignment
+            # (§9.3) — single assignment never fans out; the counter is fed by
+            # the _process_batch len-delta metering (M10-owned).
+            counts["fanout"] = c("counts.fanout")
 
         run_block: dict = {
             "tool_version": __version__,
@@ -413,11 +459,13 @@ class Orchestrator:
             # v1.6 熔断交付 (spec 6.4, 只增): partial_delivery present only on
             # breaker-trip delivery; counts.unprocessed = balancing residual so
             # the invariant extends to emitted + dropped_* + failed + bad_input
-            # + unprocessed = scanned + generated (records that entered the
-            # pipeline but reached no terminal count, incl. generated-but-
-            # never-batched records in generate_only).
+            # + unprocessed = scanned + generated [+ fanout] (records that
+            # entered the pipeline but reached no terminal count, incl.
+            # generated-but-never-batched records in generate_only; the fanout
+            # term is v1.7 R10 — fanned-out siblings are envelopes too).
             run_block["partial_delivery"] = True
             residual = (counts["scanned"] + counts["generated"]
+                        + counts.get("fanout", 0)
                         - counts["emitted"] - counts["dropped_dup"]
                         - counts["dropped_lowq"] - counts["dropped_verify"]
                         - counts["failed"] - counts["bad_input"])
@@ -442,6 +490,9 @@ class Orchestrator:
             report["dedup"] = dedup_block
 
         if cfg.quality.enabled:
+            # Top-level mode/rounds keep the globally-inherited base values
+            # even under per-class overrides (v1.7 R14); by_class carries each
+            # pool's effective values.
             report["quality"] = {
                 "mode": "pairwise_bt" if cfg.quality.mode == "pairwise" else "pointwise",
                 "rounds": cfg.quality.rounds,
@@ -452,12 +503,31 @@ class Orchestrator:
                                        for key in sorted(self._crit_sum)
                                        if self._crit_n.get(key)},
             }
-            if cfg.quality.mode == "pairwise":
-                # Pairwise percentile means are ~0.5 by construction; the tie
-                # rate is the discriminative per-criterion signal (E2E P4-9;
-                # same metric as the 7.5 rubric-diagnosis loop, no jq needed).
-                prefix = "quality.tie_outcomes."
-                tie_rate: dict[str, float] = {}
+            # v1.7 R12: with classify enabled the tie counters are
+            # pool-dimensioned (quality.tie_outcomes.<pool>.<crit>); parse them
+            # once for both the per-pool rates and the cross-pool aggregate.
+            prefix = "quality.tie_outcomes."
+            tie_rate: dict[str, float] = {}
+            pool_tie_rate: dict[str, dict[str, float]] = {}
+            if cfg.classify.enabled:
+                crit_ties: dict[str, int] = {}
+                crit_comps: dict[str, int] = {}
+                for key, ties in sorted(self.metrics.counters.items()):
+                    if not key.startswith(prefix):
+                        continue
+                    rest = key[len(prefix):]
+                    if "." not in rest:            # malformed / flat key: skip
+                        continue
+                    pool, _, crit = rest.partition(".")
+                    comps = self.metrics.counters.get(
+                        f"quality.tie_comparisons.{pool}.{crit}", 0)
+                    if comps:
+                        pool_tie_rate.setdefault(pool, {})[crit] = ties / comps
+                        crit_ties[crit] = crit_ties.get(crit, 0) + ties
+                        crit_comps[crit] = crit_comps.get(crit, 0) + comps
+                tie_rate = {crit: crit_ties[crit] / crit_comps[crit]
+                            for crit in sorted(crit_ties) if crit_comps.get(crit)}
+            else:
                 for key, ties in sorted(self.metrics.counters.items()):
                     if not key.startswith(prefix):
                         continue
@@ -466,7 +536,36 @@ class Orchestrator:
                         f"quality.tie_comparisons.{crit}", 0)
                     if comps:
                         tie_rate[crit] = ties / comps
+            # Tie-rate emission gate (v1.7 R14): global pairwise, or — classify
+            # enabled — at least one pairwise pool exists. Pairwise percentile
+            # means are ~0.5 by construction; the tie rate is the
+            # discriminative per-criterion signal (E2E P4-9).
+            any_pairwise_pool = cfg.classify.enabled and any(
+                view.quality.mode == "pairwise" for view in cfg.class_views.values())
+            if cfg.quality.mode == "pairwise" or any_pairwise_pool:
                 report["quality"]["per_criterion_tie_rate"] = tie_rate
+            if cfg.classify.enabled:
+                # v1.7 R12/R14 quality.by_class: one entry per DECLARED class
+                # (zero-count based, like report.classify.classes); mode/rounds
+                # are the pool's EFFECTIVE values from cfg.class_views.
+                by_class: dict[str, dict] = {}
+                for pool in sorted(cfg.class_views):
+                    view_q = cfg.class_views[pool].quality
+                    hist = self._pool_agg_hist.get(pool, [0] * 10)
+                    psum = self._pool_crit_sum.get(pool, {})
+                    pn = self._pool_crit_n.get(pool, {})
+                    by_class[pool] = {
+                        "mode": ("pairwise_bt" if view_q.mode == "pairwise"
+                                 else "pointwise"),
+                        "rounds": view_q.rounds,
+                        "aggregate_histogram": {label: hist[i]
+                                                for i, label in enumerate(_HIST_LABELS)},
+                        "per_criterion_mean": {key: psum[key] / pn[key]
+                                               for key in sorted(psum)
+                                               if pn.get(key)},
+                        "per_criterion_tie_rate": pool_tie_rate.get(pool, {}),
+                    }
+                report["quality"]["by_class"] = by_class
 
         stats = getattr(self.schema_engine, "stats", None) if self.schema_engine else None
         report["schema_engine"] = {"resolved_at": dict(stats) if stats else dict(_SCHEMA_STATS_ZERO)}
@@ -477,15 +576,35 @@ class Orchestrator:
         if cfg.generate.enabled:
             buckets: dict[str, dict] = {}
             prefix = "generate.buckets."
+            # rejected_by_validator joined the whitelist (bug fix, spec v1.7 §6:
+            # M6 counts it since v1.5 but the report parse silently dropped it);
+            # zero-init keeps the three always-present fields — the fourth is
+            # written only when its counter appears (validator configured).
             for key, value in counters.items():
                 if not key.startswith(prefix):
                     continue
                 bucket, _, field_name = key[len(prefix):].rpartition(".")
-                if not bucket or field_name not in ("calls", "produced", "survived_dedup"):
+                if not bucket or field_name not in ("calls", "produced", "survived_dedup",
+                                                    "rejected_by_validator"):
                     continue
                 buckets.setdefault(bucket, {"calls": 0, "produced": 0,
                                             "survived_dedup": 0})[field_name] = int(value)
             report["generate"] = {"buckets": buckets}
+
+        if cfg.classify.enabled:
+            # v1.7 §9.3 classify block: the classes histogram is zero-based
+            # over ALL declared classes (declaration order); counters are
+            # M13-owned (classify.fallback surfaces as fallback_count).
+            classify_block: dict = {
+                "assignment": cfg.classify.assignment,
+                "classes": {spec.name: c(f"classify.classes.{spec.name}")
+                            for spec in cfg.classify.classes},
+                "fallback_count": c("classify.fallback"),
+                "failures": c("classify.failures"),
+            }
+            if cfg.classify.assignment == "multi":
+                classify_block["multi_label_records"] = c("classify.multi_label_records")
+            report["classify"] = classify_block
 
         event_log = (getattr(self.metrics, "event_log", None)
                      or getattr(self.metrics, "_event_log", None))
@@ -578,9 +697,17 @@ class Orchestrator:
         print(f"dry-run: mode={cfg.run.mode} estimated_records={est['records']} "
               f"batches={est['batches']}", file=sys.stderr)
         print(f"dry-run: estimated LLM calls — generate_calls={est['generate_calls']} "
+              f"classify_calls={est['classify_calls']} "
               f"quality_calls={est['quality_calls']} annotate_calls={est['annotate_calls']} "
               f"verify_calls={est['verify_calls']} total={est['total_calls']} "
               f"(excludes retries and repair calls)", file=sys.stderr)
+        if cfg.classify.enabled and (cfg.classify.assignment == "multi"
+                                     or self._class_overrides_exist()):
+            # v1.7 R28: per-class overrides make the static estimate inexact,
+            # and multi fan-out multiplies downstream calls by the (unknowable)
+            # label count — flag both with the fixed wording.
+            print("dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界",
+                  file=sys.stderr)
         side_channels = "report and trace only" if cfg.trace.enabled else "report only"
         print(f"dry-run: no LLM calls made, no output written ({side_channels})",
               file=sys.stderr)
@@ -594,10 +721,23 @@ class Orchestrator:
         return RunSummary(counts=report["counts"], interrupted=False, exit_code=0,
                           wall_s=wall_s, output_lines=0, rejects_lines=0)
 
+    def _class_overrides_exist(self) -> bool:
+        """True when at least one [class.*] override diverges from the global
+        sections (class_views holds one merged view per DECLARED class, so
+        non-emptiness alone says nothing — compare against the global base)."""
+        cfg = self.cfg
+        return any(view.quality != cfg.quality or view.rubric != cfg.rubric
+                   or view.annotate != cfg.annotate or view.generate != cfg.generate
+                   or view.verify != cfg.verify
+                   for view in cfg.class_views.values())
+
     def _estimate(self) -> dict:
         """Static record / LLM-call estimate. generate_only follows the 3.6.2
         call-count formulas; process mode uses the M2 scan estimate. All
-        estimates assume no drops (upper bound) and exclude retries/repairs."""
+        estimates assume no drops (upper bound) and exclude retries/repairs.
+        v1.7 R11: classify_calls = ingested × max(1, sc) in process mode
+        (re-flow sub-batches inherit their classification and skip M13),
+        <generated records> × max(1, sc) in generate_only."""
         cfg = self.cfg
         g = cfg.generate
         if cfg.run.mode == "generate_only":
@@ -629,6 +769,12 @@ class Orchestrator:
         if total_records % bs:
             sizes.append(total_records % bs)
 
+        classify_calls = 0
+        if cfg.classify.enabled:
+            sc_c = cfg.classify.self_consistency
+            base = gen_records if cfg.run.mode == "generate_only" else n_ingested
+            classify_calls = base * max(1, sc_c)
+
         quality_calls = 0
         if cfg.quality.enabled:
             n_criteria = len(cfg.rubric.criteria)
@@ -654,10 +800,12 @@ class Orchestrator:
             "records": total_records,
             "batches": len(sizes),
             "generate_calls": gen_calls,
+            "classify_calls": classify_calls,
             "quality_calls": quality_calls,
             "annotate_calls": annotate_calls,
             "verify_calls": verify_calls,
-            "total_calls": gen_calls + quality_calls + annotate_calls + verify_calls,
+            "total_calls": (gen_calls + classify_calls + quality_calls
+                            + annotate_calls + verify_calls),
         }
 
     # ── signals ────────────────────────────────────────────────────────────

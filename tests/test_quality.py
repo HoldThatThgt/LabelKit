@@ -4,11 +4,18 @@ Covers: Bradley-Terry MM fit on synthetic win matrices, percentile normalization
 pairing determinism under a fixed seed, top_ratio arithmetic (ties, on_unscored),
 weighted aggregation, gate behavior, batch-of-1, byte-exact prompt assembly, and
 judging-call failure classification / data-free failure messages (spec 7.6 / 7.1).
+
+v1.7 per-class pooling (spec 3.4.3, CONTRACTS §7.3): pool lexicographic pre-draw and
+rng-consumption determinism, per-pool top_ratio quotas, mixed per-pool modes, the N=1
+pool rule, pool-dimensioned tie-counter keys, "pool" payload fields on the four quality
+events, pool-level failure isolation (R15), and the classify-disabled single-pool
+zero-change regression anchor.
 """
 from __future__ import annotations
 
 import math
 import random
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -16,6 +23,8 @@ import pytest
 from labelkit.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ClassSpec,
+    ClassView,
     Criterion,
     DedupConfig,
     GenerateConfig,
@@ -47,7 +56,7 @@ from labelkit.quality import (
     fit_bradley_terry,
 )
 from labelkit.stage import RunContext
-from labelkit.types import PipelineItem, QualityScore, Record, RecordRef
+from labelkit.types import Classification, PipelineItem, QualityScore, Record, RecordRef
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -131,8 +140,8 @@ def make_item(rec_id: str, aggregate: float | None,
 
 
 def make_ctx(cfg: ResolvedConfig, metrics: Recorder | None = None,
-             seed: str = "0:1:quality") -> RunContext:
-    return RunContext(cfg=cfg, llm=None, schema_engine=None,
+             seed: str = "0:1:quality", engine=None) -> RunContext:
+    return RunContext(cfg=cfg, llm=None, schema_engine=engine,
                       metrics=metrics or Recorder(),
                       rng=random.Random(seed), batch_no=1)
 
@@ -567,3 +576,284 @@ def test_majority_vote():
     assert majority([None, 1, 1], 1, 2) == 1           # failed judge counts as tie
     assert majority([None, None, 1], 1, 2) == "tie"
     assert majority([2], 1, 2) == 2
+
+
+# ── v1.7 per-class pooling (spec 3.4.3 按类分池, CONTRACTS §7.3) ──────────────
+
+class StubEngine:
+    """Offline complete_validated stand-in — same convention as the stub engine objects
+    in test_verify.py (MockEngine) / test_annotate.py (RaisingEngine): a contract-shaped
+    SchemaEngine surface, not a mock LLM server/transport. Pairwise judgments: presented
+    A wins; pairs touching `tie_ids` tie. Pointwise: per-record raw score from
+    `pointwise_scores` (default 3). Ids in `poison_ids` get a schema-shaped but broken
+    object, driving an internal error PAST the per-call handlers (the R15 pool-poisoning
+    path — the per-call try only wraps the engine await)."""
+
+    def __init__(self, pointwise_scores: dict[str, int] | None = None,
+                 tie_ids: frozenset[str] = frozenset(),
+                 poison_ids: frozenset[str] = frozenset()):
+        self.pointwise_scores = dict(pointwise_scores or {})
+        self.tie_ids = tie_ids
+        self.poison_ids = poison_ids
+
+    async def complete_validated(self, profile, prompt, schema=None, *,
+                                 record_ids=(), batch_no=0):
+        props = schema["properties"]
+        if "judgments" in props:  # pairwise judgment call
+            if set(record_ids) & self.poison_ids:
+                return {"judgments": [{}]}, None, 1, "stub-model"
+            keys = props["judgments"]["items"]["properties"]["criterion"]["enum"]
+            winner = "tie" if set(record_ids) & self.tie_ids else "A"
+            return ({"judgments": [{"criterion": k, "winner": winner} for k in keys]},
+                    None, 1, "stub-model")
+        # pointwise scoring call
+        if set(record_ids) & self.poison_ids:
+            return {"scores": []}, None, 1, "stub-model"
+        crit = props["scores"]["items"]["properties"]["criterion"]["enum"][0]
+        raw = self.pointwise_scores.get(record_ids[0], 3)
+        return ({"scores": [{"criterion": crit, "reason": "理由", "score": raw}]},
+                None, 1, "stub-model")
+
+
+def make_pooled_cfg(views: dict[str, QualityConfig],
+                    rubrics: dict[str, Rubric] | None = None,
+                    quality: QualityConfig | None = None) -> ResolvedConfig:
+    """classify-enabled ResolvedConfig with one ClassView per label. Direct dataclass
+    construction in make_cfg style — the cheapest form of the wave-1 loader-built views
+    exercised in test_config.py: the stage only reads classify.enabled and
+    class_views[label].(quality, rubric)."""
+    base = make_cfg(quality or QualityConfig())
+    class_views = {
+        label: ClassView(name=label, quality=q,
+                         rubric=(rubrics or {}).get(label, base.rubric),
+                         annotate=base.annotate, generate=base.generate,
+                         verify=base.verify)
+        for label, q in views.items()}
+    classify = ClassifyConfig(
+        enabled=True, fallback_class=sorted(views)[0], max_labels=len(views),
+        classes=tuple(ClassSpec(name=n, description=f"{n} 类") for n in sorted(views)))
+    return replace(base, classify=classify, class_views=class_views)
+
+
+def make_classified(rec_id: str, label: str, text: str = "样例文本") -> PipelineItem:
+    return PipelineItem(record=make_record(rec_id, text),
+                        classification=Classification(label=label, labels=(label,),
+                                                      source="llm", detail={}))
+
+
+async def test_pool_lexicographic_predraw_and_rng_determinism():
+    # R13 phase 1: pairing plans are pre-drawn per pool in class-name LEXICOGRAPHIC
+    # order (regardless of batch order), consuming ctx.rng synchronously — so the draw
+    # sequence is reproducible on an independent rng consumed pool-by-pool in that
+    # order, and two runs under the same seed produce identical plans.
+    cfg = make_pooled_cfg({"b": QualityConfig(mode="pairwise", rounds=1),
+                           "a": QualityConfig(mode="pairwise", rounds=2)})
+
+    async def run_once():
+        rec = Recorder()
+        batch = [make_classified("b1", "b"), make_classified("a1", "a"),
+                 make_classified("b2", "b"), make_classified("a2", "a"),
+                 make_classified("a3", "a")]
+        await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=StubEngine()))
+        by_pool: dict[str, list] = {"a": [], "b": []}
+        for p in rec.of("quality.judgment"):
+            by_pool[p["payload"]["pool"]].append(p["payload"]["order"])
+        return by_pool
+
+    first = await run_once()
+    second = await run_once()
+    assert first == second  # same seed -> identical pairing + presentation plans
+
+    # Replicate the draws: pool "a" (3 items, rounds=2) FIRST, then "b" (2 items,
+    # rounds=1) on the SAME rng stream. A "b"-first order would consume differently.
+    rng = random.Random("0:1:quality")
+    ids_a, ids_b = ["a1", "a2", "a3"], ["b1", "b2"]
+    exp_a = [{"A": ids_a[i] if f else ids_a[j], "B": ids_a[j] if f else ids_a[i]}
+             for _r, i, j, f in _pairing_plan(3, 2, rng)]
+    exp_b = [{"A": ids_b[i] if f else ids_b[j], "B": ids_b[j] if f else ids_b[i]}
+             for _r, i, j, f in _pairing_plan(2, 1, rng)]
+    assert first["a"] == exp_a
+    assert first["b"] == exp_b
+
+
+async def test_top_ratio_quota_is_pool_internal():
+    q = QualityConfig(mode="pointwise", selection="top_ratio", top_ratio=0.5)
+    cfg = make_pooled_cfg({"a": q, "b": q})
+    scores = {"a1": 5, "a2": 4, "a3": 3,
+              "b1": 5, "b2": 4, "b3": 3, "b4": 2, "b5": 1}
+    batch = [make_classified(rec_id, rec_id[0]) for rec_id in scores]
+    rec = Recorder()
+    await QualityStage(cfg).run(
+        batch, make_ctx(cfg, rec, engine=StubEngine(pointwise_scores=scores)))
+    # Quota base = the POOL's scored survivors: a keeps ceil(0.5*3)=2, b keeps
+    # ceil(0.5*5)=3 — five keeps in total, where a merged base of 8 would allow 4.
+    assert {it.record.id: it.status for it in batch} == {
+        "a1": "active", "a2": "active", "a3": "dropped_lowq",
+        "b1": "active", "b2": "active", "b3": "active",
+        "b4": "dropped_lowq", "b5": "dropped_lowq"}
+    # gate ranks restart at 1 within each pool
+    ranks = {p["record_ids"][0]: p["payload"]["rank"] for p in rec.of("quality.gate")}
+    assert ranks == {"a1": 1, "a2": 2, "a3": 3,
+                     "b1": 1, "b2": 2, "b3": 3, "b4": 4, "b5": 5}
+
+
+async def test_mixed_pool_modes_coexist():
+    cfg = make_pooled_cfg({"a": QualityConfig(mode="pairwise", rounds=1, threshold=0.4),
+                           "b": QualityConfig(mode="pointwise", threshold=0.5)})
+    batch = [make_classified("a1", "a"), make_classified("a2", "a"),
+             make_classified("b1", "b"), make_classified("b2", "b")]
+    engine = StubEngine(pointwise_scores={"b1": 4, "b2": 1})
+    await QualityStage(cfg).run(batch, make_ctx(cfg, engine=engine))
+    a1, a2, b1, b2 = batch
+    # pairwise pool: BT percentiles under mode pairwise_bt, gated at ITS threshold
+    assert {a1.scores["educational_value"].mode,
+            a2.scores["educational_value"].mode} == {"pairwise_bt"}
+    assert sorted([a1.scores[AGGREGATE_KEY].score,
+                   a2.scores[AGGREGATE_KEY].score]) == [0.0, 1.0]
+    assert sorted([a1.status, a2.status]) == ["active", "dropped_lowq"]
+    # pointwise pool: absolute /5 scores under mode pointwise, gated at ITS threshold
+    assert b1.scores["educational_value"].mode == "pointwise"
+    assert b1.scores[AGGREGATE_KEY].score == pytest.approx(0.8)
+    assert b2.scores[AGGREGATE_KEY].score == pytest.approx(0.2)
+    assert b1.status == "active" and b2.status == "dropped_lowq"
+
+
+async def test_pool_of_one_scores_fixed_half_with_no_calls():
+    cfg = make_pooled_cfg({"a": QualityConfig(mode="pairwise", threshold=0.6),
+                           "b": QualityConfig(mode="pairwise", rounds=1, threshold=0.3)})
+    solo = make_classified("solo", "a")
+    batch = [solo, make_classified("b1", "b"), make_classified("b2", "b")]
+    rec = Recorder()
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=StubEngine()))
+    # N=1 rule applies PER POOL: the solo pool makes no judging calls, fixed 0.5
+    assert solo.scores["educational_value"].score == 0.5
+    assert solo.scores["educational_value"].detail == {
+        "comparisons": 0, "wins": 0, "ties": 0, "log_theta": 0.0}
+    assert solo.scores[AGGREGATE_KEY].score == 0.5
+    assert solo.status == "dropped_lowq"  # gated by ITS pool's threshold 0.6
+    judgments = rec.of("quality.judgment")
+    assert len(judgments) == 1  # only pool b judged
+    assert all("solo" not in p["record_ids"] for p in judgments)
+    assert sorted(it.status for it in batch[1:]) == ["active", "dropped_lowq"]
+
+
+async def test_tie_counters_pool_dimensioned_keys():
+    # R12: the same criterion key lives in both pools' rubrics — tallies must not mix.
+    q = QualityConfig(mode="pairwise", rounds=1)
+    cfg = make_pooled_cfg({"a": q, "b": q})
+    batch = [make_classified("a1", "a"), make_classified("a2", "a"),
+             make_classified("b1", "b"), make_classified("b2", "b")]
+    rec = Recorder()
+    engine = StubEngine(tie_ids=frozenset({"a1", "a2"}))
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=engine))
+    assert rec.counters == {
+        "quality.tie_outcomes.a.educational_value": 1,
+        "quality.tie_comparisons.a.educational_value": 1,
+        "quality.tie_outcomes.b.educational_value": 0,
+        "quality.tie_comparisons.b.educational_value": 1,
+    }
+
+
+async def test_events_carry_pool_when_classify_enabled():
+    # R16: quality.judgment / quality.pointwise / quality.bt_fit / quality.gate all
+    # carry their pool label when classify is enabled.
+    cfg = make_pooled_cfg({"a": QualityConfig(mode="pairwise", rounds=1, threshold=0.4),
+                           "b": QualityConfig(mode="pointwise", threshold=0.4)})
+    batch = [make_classified("a1", "a"), make_classified("a2", "a"),
+             make_classified("b1", "b"), make_classified("b2", "b")]
+    rec = Recorder()
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=StubEngine()))
+    assert [p["payload"]["pool"] for p in rec.of("quality.judgment")] == ["a"]
+    assert [p["payload"]["pool"] for p in rec.of("quality.bt_fit")] == ["a"]
+    assert {p["payload"]["pool"] for p in rec.of("quality.pointwise")} == {"b"}
+    assert {p["record_ids"][0]: p["payload"]["pool"] for p in rec.of("quality.gate")} == {
+        "a1": "a", "a2": "a", "b1": "b", "b2": "b"}
+
+
+async def test_pool_isolation_one_pool_poisoned_other_survives():
+    # R15: an internal error inside pool a (escaping the per-call handlers) fails ONLY
+    # pool a's active items; pool b scores and gates as if a never existed.
+    cfg = make_pooled_cfg({"a": QualityConfig(mode="pointwise", threshold=0.4),
+                           "b": QualityConfig(mode="pointwise", threshold=0.4)})
+    batch = [make_classified("a1", "a"), make_classified("a2", "a"),
+             make_classified("b1", "b"), make_classified("b2", "b")]
+    rec = Recorder()
+    engine = StubEngine(pointwise_scores={"b1": 4, "b2": 1},
+                        poison_ids=frozenset({"a1", "a2"}))
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=engine))
+    a1, a2, b1, b2 = batch
+    for it in (a1, a2):
+        assert it.status == "failed"
+        assert it.errors[0].kind == "internal_error"
+        assert "quality stage internal error" in it.errors[0].message
+        assert AGGREGATE_KEY not in it.scores
+    assert {rid for p in rec.of("error") for rid in p["record_ids"]} == {"a1", "a2"}
+    assert b1.status == "active"
+    assert b1.scores[AGGREGATE_KEY].score == pytest.approx(0.8)
+    assert b2.status == "dropped_lowq"
+    assert b2.scores[AGGREGATE_KEY].score == pytest.approx(0.2)
+
+
+async def test_classify_disabled_single_pool_zero_change_regression():
+    # Zero-change anchor (spec 3.4.3): classify disabled -> ONE anonymous pool whose
+    # observable surface is field-for-field the pre-v1.7 shape — flat tie-counter keys,
+    # no "pool" key in any event payload, identical score/gate structures.
+    q = QualityConfig(mode="pairwise", rounds=1, threshold=0.4)
+    cfg = make_cfg(q)
+    rec = Recorder()
+    batch = [PipelineItem(record=make_record("r1")),
+             PipelineItem(record=make_record("r2"))]
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=StubEngine()))
+
+    # replicate the anonymous pool's single draw to resolve the presented order
+    (_round, i, j, first_is_a), = _pairing_plan(2, 1, random.Random("0:1:quality"))
+    ids = ["r1", "r2"]
+    a_id, b_id = (ids[i], ids[j]) if first_is_a else (ids[j], ids[i])
+
+    judgment, = rec.of("quality.judgment")
+    assert judgment["payload"] == {  # exact payload: no pool / judge / excerpt keys
+        "order": {"A": a_id, "B": b_id}, "model": "stub-model",
+        "judgments": [{"criterion": "educational_value", "winner": "A"}]}
+    assert judgment["record_ids"] == (ids[i], ids[j])  # sampling order
+
+    bt_fit, = rec.of("quality.bt_fit")
+    assert set(bt_fit["payload"]) == {"criterion", "iterations", "converged",
+                                      "comparisons"}
+    assert bt_fit["payload"]["criterion"] == "educational_value"
+    assert bt_fit["payload"]["comparisons"] == 1
+
+    assert rec.counters == {"quality.tie_outcomes.educational_value": 0,
+                            "quality.tie_comparisons.educational_value": 1}
+
+    winner = next(it for it in batch if it.record.id == a_id)
+    loser = next(it for it in batch if it.record.id == b_id)
+    assert winner.scores["educational_value"].score == 1.0
+    assert winner.scores["educational_value"].mode == "pairwise_bt"
+    assert winner.scores["educational_value"].detail["comparisons"] == 1
+    assert winner.scores["educational_value"].detail["wins"] == 1
+    assert winner.scores["educational_value"].detail["ties"] == 0
+    assert winner.scores[AGGREGATE_KEY].score == 1.0
+    assert winner.status == "active"
+    assert loser.scores["educational_value"].score == 0.0
+    assert loser.scores[AGGREGATE_KEY].score == 0.0
+    assert loser.status == "dropped_lowq"
+    gate_by_id = {p["record_ids"][0]: p["payload"] for p in rec.of("quality.gate")}
+    assert gate_by_id[a_id] == {"aggregate": 1.0, "decision": "keep", "threshold": 0.4}
+    assert gate_by_id[b_id] == {"aggregate": 0.0, "decision": "drop", "threshold": 0.4}
+
+
+async def test_classify_enabled_unclassified_items_form_anonymous_pool():
+    # Defensive path (spec: classify 关闭或项无分类 ⇒ 单一匿名池): classify enabled but
+    # items carry no classification -> ONE anonymous pool under the GLOBAL config with
+    # the pre-v1.7 byte shape (flat counter keys, no pool payload field).
+    cfg = make_pooled_cfg({"a": QualityConfig(mode="pairwise", rounds=1)},
+                          quality=QualityConfig(mode="pairwise", rounds=1))
+    batch = [PipelineItem(record=make_record("r1")),
+             PipelineItem(record=make_record("r2"))]
+    rec = Recorder()
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=StubEngine()))
+    judgment, = rec.of("quality.judgment")
+    assert "pool" not in judgment["payload"]
+    assert set(rec.counters) == {"quality.tie_outcomes.educational_value",
+                                 "quality.tie_comparisons.educational_value"}
+    assert all(it.scores[AGGREGATE_KEY].score is not None for it in batch)

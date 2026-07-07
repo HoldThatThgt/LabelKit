@@ -154,6 +154,8 @@ def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
     "Referenced" follows M1's definition (spec 3.1.4 API-Key row, 3.1.6 example
     ①: an unreferenced profile needs no key and is never probed):
 
+    * classify — referenced iff enabled (v1.7, R24 reference-set point ③;
+      guard mirrors loader rule 12).
     * quality — in ``pointwise`` mode every scoring call uses ``quality.llm``
       and the judges panel is never consulted (spec §3.4.4; judges are defined
       over pairwise comparisons only); in ``pairwise`` mode a non-empty
@@ -161,6 +163,8 @@ def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
     * verify — a non-empty ``judges`` panel replaces ``verify.llm``.
     """
     llm_names: list[str] = []
+    if cfg.classify.enabled:
+        llm_names.append(cfg.classify.llm)
     if cfg.quality.enabled:
         if cfg.quality.mode == "pointwise" or not cfg.quality.judges:
             llm_names.append(cfg.quality.llm)
@@ -186,6 +190,7 @@ def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
 def _build_stages(cfg: "ResolvedConfig") -> list["Stage"]:
     """Instantiate enabled operator stages in pipeline order (CONTRACTS §2)."""
     from labelkit.annotate import AnnotateStage
+    from labelkit.classify import ClassifyStage
     from labelkit.dedup import DedupIndex, DedupStage
     from labelkit.generate import GenerateStage
     from labelkit.quality import QualityStage
@@ -194,6 +199,8 @@ def _build_stages(cfg: "ResolvedConfig") -> list["Stage"]:
     stages: list[Stage] = []
     if cfg.dedup.enabled:
         stages.append(DedupStage(cfg.dedup, DedupIndex(cfg.dedup, cfg.run.modality)))
+    if cfg.classify.enabled:
+        stages.append(ClassifyStage(cfg))
     if cfg.quality.enabled:
         stages.append(QualityStage(cfg))
     if cfg.generate.enabled:

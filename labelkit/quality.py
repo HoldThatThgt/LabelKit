@@ -9,11 +9,21 @@ pointwise mode: 0-5 additive rubric scoring per record per criterion, normalized
 
 Aggregate = weighted mean over non-null criterion scores per rubric weights. Gate: threshold
 or top_ratio selection; unscored records handled per quality.on_unscored.
+
+v1.7 per-class pooling (spec 3.4.3 按类分池, CONTRACTS.md §7.3): with classify enabled, the
+batch's active items are partitioned into per-class pools by item.classification.label, each
+scored and gated under its class-effective (QualityConfig, Rubric) from cfg.class_views.
+Two-phase execution (R13): every pool's pairing plan is pre-drawn synchronously in class-name
+lexicographic order (the only ctx.rng consumption — draw order depends on pool order alone),
+then all pools' LLM judging calls run under one merged gather (full cross-pool concurrency).
+Pools are failure-isolated (R15). Classify disabled = ONE anonymous pool, byte-identical to
+pre-v1.7 behavior (flat counter keys, no "pool" payload field).
 """
 from __future__ import annotations
 
 import asyncio
 import math
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Literal, Mapping, Sequence
 
 import numpy as np
@@ -28,7 +38,7 @@ from labelkit.errors import (
 from labelkit.types import PipelineItem, QualityScore, Record, StageError
 
 if TYPE_CHECKING:
-    from labelkit.config.model import Criterion, ResolvedConfig
+    from labelkit.config.model import Criterion, QualityConfig, ResolvedConfig
     from labelkit.stage import RunContext
 
 # M9 (llm_client) / M8 (schema_engine) public surface per CONTRACTS.md §7.8 / §7.7.
@@ -258,6 +268,26 @@ def _build_pointwise_prompt(record: Record, criterion: "Criterion",
 
 # ── the stage ─────────────────────────────────────────────────────────────────
 
+@dataclass
+class _Pool:
+    """One scoring pool (spec 3.4.3 按类分池): a subset of the batch's active items plus
+    the effective (QualityConfig, criteria) it is scored under. pool=None is the anonymous
+    pool — classify disabled (= the whole batch), or the defensive catch-all for an active
+    item carrying no classification — which keeps the pre-v1.7 byte shape: global config,
+    flat counter keys, no "pool" payload field."""
+    pool: str | None
+    items: list[PipelineItem]
+    q: "QualityConfig"
+    criteria: tuple["Criterion", ...]
+    plan: list[tuple[int, int, int, bool]] | None = None  # pairwise pools of >= 2 only
+    results: list = field(default_factory=list)           # phase-2 pairwise call results
+    dead: bool = False                                     # poisoned by internal error (R15)
+
+    @property
+    def mode(self) -> Literal["pairwise_bt", "pointwise"]:
+        return "pairwise_bt" if self.q.mode == "pairwise" else "pointwise"
+
+
 class QualityStage:
     name = "quality"
 
@@ -268,27 +298,130 @@ class QualityStage:
         items = [it for it in batch if it.status == "active"]
         if not items:
             return batch
-        mode: Literal["pairwise_bt", "pointwise"] = (
-            "pairwise_bt" if self.cfg.quality.mode == "pairwise" else "pointwise")
         try:
-            if mode == "pairwise_bt":
-                await self._run_pairwise(items, ctx)
-            else:
-                await self._run_pointwise(items, ctx)
+            pools = self._build_pools(items)
         except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
             raise
-        except Exception as exc:  # invariant breakage — fail the batch's records, not the run
-            for it in items:
-                if it.status == "active":
-                    err = StageError(stage=self.name, kind=ErrorKind.INTERNAL_ERROR.value,
-                                     message=f"quality stage internal error: {exc}",
-                                     retryable=False)
-                    it.errors.append(err)
-                    it.status = "failed"
-                    self._emit_error(ctx, (it.record.id,), err)
+        except Exception as exc:
+            # Partition breakage (e.g. a label missing from class_views — an M1/M13
+            # invariant violation) precedes any pool, so the pre-v1.7 batch-level
+            # fallback applies: fail the batch's records, not the run (contract ④).
+            self._fail_pool(_Pool(pool=None, items=items, q=self.cfg.quality,
+                                  criteria=self.cfg.rubric.criteria), ctx, exc)
             return batch
-        self._apply_gate(items, ctx)
+
+        # Phase 1 (R13): pre-draw every pairwise pool's pairing + presentation plan
+        # SYNCHRONOUSLY, pools in class-name lexicographic order — the stage's only
+        # ctx.rng consumption, so the draw sequence is fixed by pool order alone and
+        # never by call scheduling. Pools of 1 draw nothing (N=1 rule, no calls).
+        for pool in pools:
+            if pool.mode != "pairwise_bt" or len(pool.items) <= 1:
+                continue
+            try:
+                pool.plan = _pairing_plan(len(pool.items), pool.q.rounds, ctx.rng)
+            except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception as exc:
+                self._fail_pool(pool, ctx, exc)
+
+        # Phase 2 (R13): merge ALL pools' LLM judging calls into ONE gather (full
+        # cross-pool concurrency). Each call is tagged with its pool so an internal
+        # error escaping the per-call handlers poisons that pool only (R15); pointwise
+        # pools consume no rng and simply contribute their calls in pool order.
+        tagged: list[tuple[_Pool, object]] = []
+        for pool in pools:
+            if pool.dead:
+                continue
+            try:
+                if pool.mode == "pairwise_bt":
+                    calls = self._pairwise_calls(pool.items, ctx, pool.q, pool.criteria,
+                                                 pool.plan, pool.pool)
+                else:
+                    calls = self._pointwise_calls(pool.items, ctx, pool.q, pool.criteria,
+                                                  pool.pool)
+            except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception as exc:
+                self._fail_pool(pool, ctx, exc)
+                continue
+            tagged.extend((pool, call) for call in calls)
+        for pool, result, exc in await asyncio.gather(
+                *(self._guarded_call(pool, call) for pool, call in tagged)):
+            if exc is not None:
+                if not pool.dead:
+                    self._fail_pool(pool, ctx, exc)
+            elif result is not None:
+                pool.results.append(result)
+
+        # Phase 3: per-pool post-processing (verdict composition / BT fit / percentile
+        # normalization for pairwise; aggregation for both) and the per-pool gate —
+        # top_ratio quota base is automatically the pool's scored survivors.
+        for pool in pools:
+            if pool.dead:
+                continue
+            try:
+                if pool.mode == "pairwise_bt":
+                    self._pairwise_finish(pool.items, ctx, pool.q, pool.criteria,
+                                          pool.plan, pool.results, pool.pool)
+                else:
+                    self._set_aggregates(pool.items, "pointwise", pool.criteria)
+                self._apply_gate(pool.items, ctx, pool.q, pool.pool)
+            except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception as exc:
+                self._fail_pool(pool, ctx, exc)
         return batch
+
+    # ── pool plumbing (v1.7 spec 3.4.3) ────────────────────────────────────
+
+    def _build_pools(self, items: list[PipelineItem]) -> list["_Pool"]:
+        """Partition active items into scoring pools. Classify disabled -> ONE anonymous
+        pool = the whole batch (pre-v1.7 behavior, zero-change anchor). Classify enabled
+        -> one pool per classification label in class-name lexicographic order, each under
+        class_views[label]'s effective (QualityConfig, Rubric); an active item without a
+        classification (not producible by M13, defensive) joins an anonymous pool ordered
+        before the named ones."""
+        if not self.cfg.classify.enabled:
+            return [_Pool(pool=None, items=list(items), q=self.cfg.quality,
+                          criteria=self.cfg.rubric.criteria)]
+        grouped: dict[str | None, list[PipelineItem]] = {}
+        for it in items:
+            label = it.classification.label if it.classification is not None else None
+            grouped.setdefault(label, []).append(it)
+        pools: list[_Pool] = []
+        if None in grouped:
+            pools.append(_Pool(pool=None, items=grouped[None], q=self.cfg.quality,
+                               criteria=self.cfg.rubric.criteria))
+        for label in sorted(k for k in grouped if k is not None):
+            view = self.cfg.class_views[label]
+            pools.append(_Pool(pool=label, items=grouped[label], q=view.quality,
+                               criteria=view.rubric.criteria))
+        return pools
+
+    def _fail_pool(self, pool: "_Pool", ctx: "RunContext", exc: Exception) -> None:
+        """Pool-level isolation (R15): the pre-v1.7 batch-level internal-error fallback
+        applied to ONE pool — its still-active items fail, other pools proceed."""
+        pool.dead = True
+        for it in pool.items:
+            if it.status == "active":
+                err = StageError(stage=self.name, kind=ErrorKind.INTERNAL_ERROR.value,
+                                 message=f"quality stage internal error: {exc}",
+                                 retryable=False)
+                it.errors.append(err)
+                it.status = "failed"
+                self._emit_error(ctx, (it.record.id,), err)
+
+    async def _guarded_call(self, pool: "_Pool", call) -> tuple["_Pool", object, Exception | None]:
+        """Tags a phase-2 call with its pool and captures non-fatal escapes: _judge_once /
+        _pointwise_once absorb per-call provider/schema failures themselves, so anything
+        escaping here is pool-internal breakage that must poison only this pool (R15).
+        Fatal control-flow exceptions keep propagating and abort the merged gather."""
+        try:
+            return pool, await call, None
+        except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            return pool, None, exc
 
     # ── shared plumbing ────────────────────────────────────────────────────
 
@@ -342,23 +475,17 @@ class QualityStage:
             it.status = "failed"
         self._emit_error(ctx, tuple(it.record.id for it in items), err)
 
-    # ── pairwise mode ──────────────────────────────────────────────────────
+    # ── pairwise mode (split into plan/dispatch/finish phases, R13) ─────────
 
-    async def _run_pairwise(self, items: list[PipelineItem], ctx: "RunContext") -> None:
-        q = self.cfg.quality
-        criteria = self.cfg.rubric.criteria
-        n = len(items)
-
-        if n == 1:  # batch of 1: no judging calls, every criterion score fixed 0.5
-            item = items[0]
-            for crit in criteria:
-                item.scores[crit.key] = QualityScore(
-                    criterion=crit.key, score=0.5, mode="pairwise_bt",
-                    detail={"comparisons": 0, "wins": 0, "ties": 0, "log_theta": 0.0})
-            item.scores[AGGREGATE_KEY] = QualityScore(
-                criterion=AGGREGATE_KEY, score=0.5, mode="pairwise_bt", detail={})
-            return
-
+    def _pairwise_calls(self, items: list[PipelineItem], ctx: "RunContext",
+                        q: "QualityConfig", criteria: Sequence["Criterion"],
+                        plan: list[tuple[int, int, int, bool]] | None,
+                        pool: str | None) -> list:
+        """Dispatch phase of the former _run_pairwise: the judging coroutines for one
+        pool's pre-drawn plan — one call per (comparison, judge, order, criterion-group).
+        A pool of 1 makes no calls (its N=1 rule is applied in _pairwise_finish)."""
+        if len(items) == 1:
+            return []
         with_reason = self._reasons_effective()
         judges: tuple[str, ...] = q.judges if q.judges else (q.llm,)
         orders = (False, True) if q.both_orders else (False,)
@@ -367,10 +494,6 @@ class QualityStage:
         else:
             crit_groups = [(c,) for c in criteria]
 
-        # Pre-draw the full pairing + presentation plan before any dispatch (determinism).
-        plan = _pairing_plan(n, q.rounds, ctx.rng)
-
-        # One judgment call per (comparison, judge, order, criterion-group).
         calls = []
         for comp_idx, (_round_no, i, j, first_is_a) in enumerate(plan):
             for judge in judges:
@@ -380,8 +503,29 @@ class QualityStage:
                         calls.append(self._judge_once(
                             ctx, items, comp_idx, i, j, a_idx, b_idx,
                             judge, flipped, group, with_reason,
-                            multi_judge=len(judges) > 1))
-        raw_results = await asyncio.gather(*calls)
+                            multi_judge=len(judges) > 1, pool=pool))
+        return calls
+
+    def _pairwise_finish(self, items: list[PipelineItem], ctx: "RunContext",
+                         q: "QualityConfig", criteria: Sequence["Criterion"],
+                         plan: list[tuple[int, int, int, bool]] | None,
+                         raw_results: list, pool: str | None) -> None:
+        """Post-processing phase of the former _run_pairwise: verdict composition, BT fit,
+        pool-relative percentile normalization, aggregates."""
+        n = len(items)
+
+        if n == 1:  # pool of 1: no judging calls, every criterion score fixed 0.5
+            item = items[0]
+            for crit in criteria:
+                item.scores[crit.key] = QualityScore(
+                    criterion=crit.key, score=0.5, mode="pairwise_bt",
+                    detail={"comparisons": 0, "wins": 0, "ties": 0, "log_theta": 0.0})
+            item.scores[AGGREGATE_KEY] = QualityScore(
+                criterion=AGGREGATE_KEY, score=0.5, mode="pairwise_bt", detail={})
+            return
+
+        judges: tuple[str, ...] = q.judges if q.judges else (q.llm,)
+        orders = (False, True) if q.both_orders else (False,)
 
         # results[comp_idx][criterion][judge][flipped] = winner idx | "tie" | None (failed)
         results: dict[int, dict[str, dict[str, dict[bool, int | str | None]]]] = {}
@@ -435,19 +579,27 @@ class QualityStage:
             # rate and send the user chasing rubric wording when the endpoint
             # is the culprit — call failures show up in counts.failed and
             # judgment_failures instead.
-            ctx.metrics.count(f"quality.tie_outcomes.{crit.key}", n_tie_judged)
-            ctx.metrics.count(f"quality.tie_comparisons.{crit.key}", n_judged)
+            # v1.7 (R12): pool-dimensioned key when classify is enabled — same-named
+            # criteria in different class rubrics must not share a tally; classify
+            # disabled keeps the flat key byte-identical.
+            suffix = f"{pool}.{crit.key}" if pool is not None else crit.key
+            ctx.metrics.count(f"quality.tie_outcomes.{suffix}", n_tie_judged)
+            ctx.metrics.count(f"quality.tie_comparisons.{suffix}", n_judged)
 
             log_theta, iterations, converged = _fit_bradley_terry_details(n, entries)
+            bt_payload: dict = {"criterion": crit.key, "iterations": iterations,
+                                "converged": converged, "comparisons": len(plan)}
+            if pool is not None:  # v1.7 (R16): attribute the fit to its pool
+                bt_payload["pool"] = pool
             ctx.metrics.event(_EV_BT_FIT, stage=self.name, batch_no=ctx.batch_no,
-                              payload={"criterion": crit.key, "iterations": iterations,
-                                       "converged": converged, "comparisons": len(plan)})
+                              payload=bt_payload)
 
             # A record is unscored on this criterion iff it participated in >= 1 comparison
             # and every one of them failed; zero-participation records are covered by the
             # BT regularization pseudo-counts (spec 3.4.3) and stay scored. The percentile
-            # ranking spans ALL n batch records (spec 3.4.3『将批内全部 log θ 升序排名』);
-            # unscored records only get their OWN score nulled.
+            # ranking spans ALL n pool records (spec 3.4.3『将批内全部 log θ 升序排名』,
+            # v1.7: the pool is the ranking universe); unscored records only get their
+            # OWN score nulled.
             unscored = {k for k in range(n) if comp_count[k] > 0 and success[k] == 0}
             scores = _criterion_percentiles([float(v) for v in log_theta], unscored)
             for k, item in enumerate(items):
@@ -456,7 +608,7 @@ class QualityStage:
                     detail={"comparisons": comp_count[k], "wins": wins[k],
                             "ties": ties[k], "log_theta": float(log_theta[k])})
 
-        self._set_aggregates(items, "pairwise_bt")
+        self._set_aggregates(items, "pairwise_bt", criteria)
 
     @staticmethod
     def _compose_orders(outcomes: list[int | str | None]) -> int | str | None:
@@ -488,7 +640,7 @@ class QualityStage:
     async def _judge_once(self, ctx: "RunContext", items: list[PipelineItem], comp_idx: int,
                           first_idx: int, second_idx: int, a_idx: int, b_idx: int,
                           judge: str, flipped: bool, group: tuple["Criterion", ...],
-                          with_reason: bool, multi_judge: bool
+                          with_reason: bool, multi_judge: bool, pool: str | None = None
                           ) -> tuple[int, str, bool, dict[str, int | str | None]]:
         """One LLM judgment call. Returns (comp_idx, judge, flipped,
         {criterion: winner idx | 'tie' | None-on-failure})."""
@@ -525,6 +677,8 @@ class QualityStage:
                          "judgments": [dict(by_key[k]) for k in keys if k in by_key]}
         if multi_judge:
             payload["judge"] = judge
+        if pool is not None:  # v1.7 (R16): classify enabled only
+            payload["pool"] = pool
         excerpt = self._excerpt_payload((rec_first, rec_second))
         if excerpt is not None:
             payload["excerpt"] = excerpt
@@ -546,21 +700,23 @@ class QualityStage:
 
     # ── pointwise mode ─────────────────────────────────────────────────────
 
-    async def _run_pointwise(self, items: list[PipelineItem], ctx: "RunContext") -> None:
-        criteria = self.cfg.rubric.criteria
-        calls = [self._pointwise_once(ctx, item, crit)
-                 for item in items for crit in criteria]
-        await asyncio.gather(*calls)
-        self._set_aggregates(items, "pointwise")
+    def _pointwise_calls(self, items: list[PipelineItem], ctx: "RunContext",
+                         q: "QualityConfig", criteria: Sequence["Criterion"],
+                         pool: str | None) -> list:
+        """One pool's pointwise scoring coroutines (no rng consumption); aggregation
+        happens per pool in the finish phase."""
+        return [self._pointwise_once(ctx, item, crit, q, pool)
+                for item in items for crit in criteria]
 
     async def _pointwise_once(self, ctx: "RunContext", item: PipelineItem,
-                              criterion: "Criterion") -> None:
+                              criterion: "Criterion", q: "QualityConfig",
+                              pool: str | None = None) -> None:
         rec = item.record
         prompt = _build_pointwise_prompt(rec, criterion, self.cfg.input.ui_tree_max_chars)
         schema = pointwise_schema(criterion.key)
         try:
             obj, _usage, _attempts, _model = await ctx.schema_engine.complete_validated(
-                self.cfg.quality.llm, prompt, schema,
+                q.llm, prompt, schema,
                 record_ids=(rec.id,), batch_no=ctx.batch_no)
         except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
             raise
@@ -587,6 +743,8 @@ class QualityStage:
             detail={"raw_score": raw, "reason": reason})
 
         payload: dict = {"criterion": criterion.key, "score": raw}
+        if pool is not None:  # v1.7 (R16): classify enabled only
+            payload["pool"] = pool
         if self._reasons_effective():
             payload["reason"] = reason
         excerpt = self._excerpt_payload((rec,))
@@ -598,8 +756,10 @@ class QualityStage:
     # ── aggregation + gate ─────────────────────────────────────────────────
 
     def _set_aggregates(self, items: Sequence[PipelineItem],
-                        mode: Literal["pairwise_bt", "pointwise"]) -> None:
-        criteria = self.cfg.rubric.criteria
+                        mode: Literal["pairwise_bt", "pointwise"],
+                        criteria: Sequence["Criterion"] | None = None) -> None:
+        if criteria is None:
+            criteria = self.cfg.rubric.criteria
         for item in items:
             per_crit = {key: qs.score for key, qs in item.scores.items()
                         if key != AGGREGATE_KEY}
@@ -607,13 +767,23 @@ class QualityStage:
             item.scores[AGGREGATE_KEY] = QualityScore(
                 criterion=AGGREGATE_KEY, score=agg, mode=mode, detail={})
 
-    def _apply_gate(self, items: Sequence[PipelineItem], ctx: "RunContext") -> None:
-        q = self.cfg.quality
+    def _apply_gate(self, items: Sequence[PipelineItem], ctx: "RunContext",
+                    q: "QualityConfig | None" = None, pool: str | None = None) -> None:
+        """Applied per pool (v1.7): q = the pool's effective QualityConfig
+        (threshold / selection / top_ratio; on_unscored is always global but rides the
+        same object), so the top_ratio quota base is the pool's scored survivors."""
+        if q is None:
+            q = self.cfg.quality
         active = [it for it in items if it.status == "active"]
 
         def agg_of(it: PipelineItem) -> float | None:
             qs = it.scores.get(AGGREGATE_KEY)
             return qs.score if qs is not None else None
+
+        def pooled(payload: dict) -> dict:
+            if pool is not None:  # v1.7 (R16): classify enabled only
+                payload["pool"] = pool
+            return payload
 
         scored = [(it, agg_of(it)) for it in active if agg_of(it) is not None]
         unscored = [it for it in active if agg_of(it) is None]
@@ -626,11 +796,11 @@ class QualityStage:
                 keep = it.record.id in kept
                 ctx.metrics.event(_EV_GATE, stage=self.name, batch_no=ctx.batch_no,
                                   record_ids=(it.record.id,),
-                                  payload={"aggregate": agg,
-                                           "decision": "keep" if keep else "drop",
-                                           "selection": "top_ratio",
-                                           "top_ratio": q.top_ratio,
-                                           "rank": ranks[it.record.id]})
+                                  payload=pooled({"aggregate": agg,
+                                                  "decision": "keep" if keep else "drop",
+                                                  "selection": "top_ratio",
+                                                  "top_ratio": q.top_ratio,
+                                                  "rank": ranks[it.record.id]}))
                 if not keep:
                     it.status = "dropped_lowq"
         elif q.threshold is not None:
@@ -638,9 +808,9 @@ class QualityStage:
                 keep = agg >= q.threshold
                 ctx.metrics.event(_EV_GATE, stage=self.name, batch_no=ctx.batch_no,
                                   record_ids=(it.record.id,),
-                                  payload={"aggregate": agg,
-                                           "decision": "keep" if keep else "drop",
-                                           "threshold": q.threshold})
+                                  payload=pooled({"aggregate": agg,
+                                                  "decision": "keep" if keep else "drop",
+                                                  "threshold": q.threshold}))
                 if not keep:
                     it.status = "dropped_lowq"
 
@@ -656,6 +826,6 @@ class QualityStage:
                 elif q.threshold is not None:
                     payload["threshold"] = q.threshold
                 ctx.metrics.event(_EV_GATE, stage=self.name, batch_no=ctx.batch_no,
-                                  record_ids=(it.record.id,), payload=payload)
+                                  record_ids=(it.record.id,), payload=pooled(payload))
             if not keep:
                 it.status = "dropped_lowq"
