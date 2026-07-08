@@ -31,7 +31,7 @@
     "id": "a8aa181766eebd97",                        ← 记录的确定性 id（第 4 章）
     "run": {                                         ← 这次运行的指纹
       "tool": "labelkit/1.0.0",
-      "started_at": "2026-07-03T01:17:35.699878+08:00",
+      "started_at": "2026-07-07T23:07:54.213290+08:00",
       "project_file": "project.toml",
       "rubric": "default:text",
       "seed": 42
@@ -44,15 +44,16 @@
       "generator": null                              ← 若是合成样本：{"llm": "...", "style": "..."}
     },
     "scores": {                                      ← 质量分（quality 开启时）
-      "educational_value": 0.6,                      ← 每条准则一个 [0,1] 分
-      "facts_trivia": 0.8,
-      "writing_style": 0.4,
+      "writing_style": 0.4,                          ← 每条准则一个 [0,1] 分
       "required_expertise": 0.6,
-      "__aggregate__": 0.6000000000000001,           ← 加权聚合分（质量门用的就是它；浮点尾数正常）
+      "educational_value": 0.8,
+      "facts_trivia": 1.0,
+      "__aggregate__": 0.7000000000000001,           ← 加权聚合分（质量门用的就是它；浮点尾数正常）
       "mode": "pointwise",                           ← 打分模式；pairwise 时为 "pairwise_bt"
       "batch_no": 1                                  ← 在第几批打的分（pairwise 下跨批不可比）
     },
     "dedup": {"kind": "unique"},                     ← 去重判定（存活者恒为 unique）
+    "classification": null,                          ← 分类结果（v1.7 恒在键；classify 未启用恒为 null）
     "annotation": {"model": "glm-5.2", "attempts": 1},  ← 标注用的模型与尝试次数
     "verification": null                             ← verify 未启用为 null；启用后 {"verdict","rounds"}
   }
@@ -63,6 +64,7 @@
 
 - **`annotation.attempts`**：1 = 一次通过；2 = 经过一轮结构修复才合法（第 14 章）。批量看这个字段能感知「模型输出结构的稳定性」。开了 self-consistency 时另含 `sc: {n, agreement_ratio}`，此时 attempts 是各合法样本尝试次数之和（与 `sc.n` 对照才有意义，见第 11 章）。
 - **`scores.batch_no`**：pairwise 模式下分数是批内相对量，跨批比较分数时先看这个字段是不是同一批（第 10 章反复强调）。
+- **`classification`**（v1.7 恒在键）：分类算子未启用时恒为 `null`；启用后为 `{"label", "labels", "source"}`——`label` 是本行的路由类别，`labels` 是该记录命中的类别全集（multi 模式下同一 `id` 可产多行，行唯一键变为 (`id`, `label`)），`source` 标记标签来源（`llm` / `fallback` / `inherited`）。启用时 `scores` 里另出现 `pool` 键（= 类名，自述这行分数是在哪个类池里打的）。详见第 24 章。
 - **`generator` / `generated_from`**：区分真实与合成数据的**唯一可靠判据**是 `generator ≠ null`（`generated_from` 在纯生成模式下恒为空数组，不可作判据）。
 - **校验语义**：inline 模式下「剥除 `_meta` 后的对象」保证通过你的 Schema。启动时已禁止用户 Schema 声明 `_meta`，不会撞名。
 
@@ -109,8 +111,8 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
 {
   "run": {
     "tool_version": "1.0.0",
-    "started_at": "2026-07-03T01:17:35.699878+08:00",
-    "finished_at": "2026-07-03T01:19:03.331413+08:00",
+    "started_at": "2026-07-07T23:07:54.213290+08:00",
+    "finished_at": "2026-07-07T23:09:41.179786+08:00",
     "interrupted": false,                ← 仅 SIGINT/SIGTERM 优雅中断时为 true
     "circuit_broken": false,             ← 熔断的显式标志（触发时为 true，exit_code 同为 4）
     "exit_code": 0,
@@ -121,8 +123,8 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
   },
   "counts": {                            ← 过磅单（守恒等式见第 4 章）
     "scanned": 14, "ingested": 14, "bad_input": 0,
-    "dropped_dup": 1, "dropped_lowq": 5, "dropped_verify": 0,
-    "failed": 0, "generated": 0, "emitted": 8
+    "dropped_dup": 1, "dropped_lowq": 6, "dropped_verify": 0,
+    "failed": 0, "generated": 0, "emitted": 7
   },
   "dedup": {                             ← 去重明细：各层各拦了几条
     "exact": 1, "near_text": 0, "near_image": 0, "near_both": 0,
@@ -134,25 +136,25 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
     "rounds": 4,
     "judgment_failures": 0,              ← 裁决输出不合法的次数（>5% 要警惕，见第 16 章）
     "aggregate_histogram": {             ← 聚合分 10 桶直方图：
-      "0.0-0.1": 3, "0.1-0.2": 2, "0.2-0.3": 2, "0.3-0.4": 0,
-      "0.4-0.5": 3, "0.6-0.7": 2, "0.7-0.8": 1, "…": 0
+      "0.0-0.1": 3, "0.1-0.2": 3, "0.2-0.3": 1, "0.3-0.4": 1,
+      "0.4-0.5": 3, "0.5-0.6": 0, "0.6-0.7": 0, "0.7-0.8": 2, "…": 0
     },                                       画质量线之前先看它！
     "per_criterion_mean": {              ← 每条准则的均值：哪条准则在拖后腿一目了然
-      "educational_value": 0.308, "facts_trivia": 0.215,
-      "required_expertise": 0.323, "writing_style": 0.400
+      "educational_value": 0.3538461538461538, "facts_trivia": 0.16923076923076924,
+      "required_expertise": 0.2615384615384615, "writing_style": 0.3692307692307692
     }                                    ← pairwise 模式下均值恒 ≈0.5，另有 per_criterion_tie_rate
   },                                        （每准则平局率，只统计拿到裁决的比较——rubric 区分度的直接读数）
   "schema_engine": {                     ← 结构引擎四层的命中分布（第 14 章）
-    "resolved_at": {"l0_or_clean": 7, "l1": 1, "l3_1": 0, "l3_2": 0, "rejected": 0}
+    "resolved_at": {"l0_or_clean": 4, "l1": 3, "l3_1": 0, "l3_2": 0, "rejected": 0}
   },
   "trace": {"enabled": true, "path": "out/text-labels.trace.jsonl",
-             "events": 71, "dropped_events": 0},
+             "events": 74, "dropped_events": 0},
   "llm_usage": {                         ← 分 profile 的用量账单
-    "default": {"calls": 61, "prompt_tokens": 21683,
-                 "completion_tokens": 6831, "retries": 0}
+    "default": {"calls": 61, "prompt_tokens": 23550,
+                 "completion_tokens": 6053, "retries": 0}
   },                                     ← 配了单价时另有 est_cost_usd
-  "timing": {"wall_s": 87.4,
-              "per_stage_s": {"dedup": 0.004, "quality": 76.1, "annotate": 11.3}}
+  "timing": {"wall_s": 106.755,
+              "per_stage_s": {"dedup": 0.004, "quality": 93.425, "annotate": 13.319}}
 }
 ```
 
@@ -161,7 +163,7 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
 读报告的三板斧：
 
 1. **先看 `counts` 对不对账**——各状态数量符合预期吗？`failed` 非零就去拒绝通道翻 `errors`；
-2. **再看 `quality.aggregate_histogram`**——分布形状决定阈值画哪里。比如上面这份：0.25 的线落在 0.2-0.3 桶内，被淘汰的五条恰是 0~0.2 两桶的全部（3+2）；0.2-0.3 桶的两条聚合分正好等于 0.25，质量门按「< 阈值才淘汰」放行，都留下了。如果直方图整体右移，同一条线就几乎不淘汰东西；
+2. **再看 `quality.aggregate_histogram`**——分布形状决定阈值画哪里。比如上面这份：0.25 的线落在 0.2-0.3 桶内，被淘汰的六条恰是 0~0.2 两桶的全部（3+3）；0.2-0.3 桶的那一条聚合分正好等于 0.25，质量门按「< 阈值才淘汰」放行，留下了。如果直方图整体右移，同一条线就几乎不淘汰东西；
 3. **最后看 `llm_usage` 和 `timing`**——哪个阶段最烧钱/最耗时（几乎总是 quality），是否要换模式、调并发（第 17 章）。
 
 另有两个按需出现的块：`annotate.sc_disagreements`（开 self-consistency 时：全体分歧、回退首样本的次数）与 `generate.buckets`（开生成时：每个「模型×风格」桶的调用数 / 产出数 / 去重存活数，配置 `sample_validator` 时另有回调剔除数 `rejected_by_validator`——某桶存活率明显低说明它在产重复货或不合规货，第 12 章）。
@@ -171,6 +173,12 @@ v1.6 增补了三处按需出现的字段（不出现时语义同旧版，已有
 - **`run.partial_delivery`**：仅熔断交付时出现且恒为 `true`（恒伴随 `circuit_broken: true`）——标记这份主输出是**部分交付**，消费方完整性判定见 8.1 节的警告框；
 - **`counts.unprocessed`**：仅熔断中止时增列——已扫描/已生成但因中止没走完流水线的记录数。守恒等式相应扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`（第 4 章的原式是它在 `unprocessed = 0` 时的特例）；
 - **`llm_usage` 的密钥池明细**（profile 用第 6 章的 `api_key_envs` 配了多把密钥时）：profile 对象增 `"keys": {"<环境变量名>": {"calls", "rate_limited", "disabled"}}`，按密钥拆分调用数、被限流（429）次数与是否被认证禁用——密钥一律以**环境变量名**标识，密钥值不会出现在任何日志或报告里；另有 `parked_calls` / `parked_ms`（池 >1 或数值非零时出现——单密钥驻留也留痕）：因「全部存活密钥都在限流冷却」而**驻留**等待的逻辑调用数与累计毫秒数。`disabled` 非零该换密钥，`parked_ms` 持续走高说明并发压过了密钥池的配额承受力——该加密钥或降 `max_concurrency`（驻留上限 `run.max_park_s` 见第 7 章；对应的 `llm.key_cooldown` / `llm.key_disabled` / `llm.pool_parked` 事件见第 16 章）。
+
+v1.7（分类算子，第 24 章）再增三处按需出现的字段（未启用时报告形状与旧版逐字段一致）：
+
+- **`classify` 节**（仅 `classify.enabled = true` 时出现）：`assignment`、逐类命中计数 `classes`、兜底归类数 `fallback_count` 与失败数 `failures`（multi 模式另有 `multi_label_records`）；`quality` 节同时增 `by_class` 分池统计——各池独立的直方图与准则均值；
+- **`counts.fanout`**（仅 `assignment = "multi"` 时增列）：多标签扇出净增的行数，守恒等式右侧相应 `+ fanout`（第 4 章）；
+- **`generate.buckets` 的桶 key**：classify 启用时由「`<llm>×<style>`」两段扩展为「`<class>×<llm>×<style>`」三段（关闭时格式不变，第 12 章）。
 
 > **报告写失败怎么办**：主输出成功、报告写失败时，进程以退出码 1 结束——产物可用但账本缺失，别当成功处理。
 

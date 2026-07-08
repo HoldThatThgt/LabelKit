@@ -146,9 +146,10 @@ max_repair_attempts = 2           # L3 轮数预算（L2.5 回调违规同样消
 
 ## 14.7 内部结构也走同一个引擎
 
-一个容易忽略的事实：不只你的标注 Schema，**LabelKit 自己的内部输出**——质量裁决 `{"judgments": [...]}`、pointwise 评分、评审结论 `{"critiques": [...], "verdict"}`、生成样本 `{"samples": [...]}`——全部经由同一个 `complete_validated()` 入口、同一套四层防线。所以：
+一个容易忽略的事实：不只你的标注 Schema，**LabelKit 自己的内部输出**——质量裁决 `{"judgments": [...]}`、pointwise 评分、评审结论 `{"critiques": [...], "verdict"}`、生成样本 `{"samples": [...]}`、分类结果 `{"class": ...}` / multi 模式的 `{"classes": [...]}`（v1.7）——全部经由同一个 `complete_validated()` 入口、同一套四层防线。所以：
 
 - 裁决输出偶尔非法不会炸：修不好按平局计（`judgment_invalid`，对 BT 中性），计入 `report.quality.judgment_failures`；
-- 内部修复调用同样计入 token 计量与 `llm.call` trace 事件——账一分不少。
+- 内部修复调用同样计入 token 计量与 `llm.call` trace 事件——账一分不少；
+- 分类结果的内部 Schema（v1.7）用 enum 封闭集锁死类名词表——标签不可能落在你的类别表之外；multi 模式刻意**不写** `uniqueItems`（部分供应商的结构化输出实现会硬拒该关键字），重复标签由 classify 算子在校验通过后做确定性去重归一化。
 
 这就是「LLM 输出不可信」原则的完整落地：**没有任何一条 LLM 文本能绕过校验进入任何下游**。

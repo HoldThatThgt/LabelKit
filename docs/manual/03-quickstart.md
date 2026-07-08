@@ -135,11 +135,11 @@ uv run labelkit run --config ../config.toml --project project.toml --dry-run
 
 ```
 dry-run: mode=process estimated_records=14 batches=1
-dry-run: estimated LLM calls — generate_calls=0 quality_calls=56 annotate_calls=14 verify_calls=0 total=70 (excludes retries and repair calls)
+dry-run: estimated LLM calls — generate_calls=0 classify_calls=0 quality_calls=56 annotate_calls=14 verify_calls=0 total=70 (excludes retries and repair calls)
 dry-run: no LLM calls made, no output written (report and trace only)
 ```
 
-它告诉你：14 条记录、1 个批，预计约 70 次 LLM 调用（质量打分 56 次 = 14 条 × 4 条准则；标注 14 次）。对大任务，这一步是你估算成本和时长的依据。
+它告诉你：14 条记录、1 个批，预计约 70 次 LLM 调用（质量打分 56 次 = 14 条 × 4 条准则；标注 14 次；`classify_calls=0` 是 v1.7 新增的分类算子——默认关闭，第 24 章）。对大任务，这一步是你估算成本和时长的依据。
 
 **第三步：正式运行**：
 
@@ -151,24 +151,24 @@ stderr 上会看到（省略时间戳）：
 
 ```
 INFO  run     batch=0 run.start tool_version=labelkit/1.0.0 config_digest=sha256:9c92... project_digest=sha256:fbf4... trace_schema_version=1
-INFO  emitter batch=1 批 1 落盘：主输出 +8 行（累计 8），rejects +6（累计 6）
-INFO  run     batch=1 batch.end active=8 dropped_dup=1 dropped_lowq=5 dropped_verify=0 failed=0 duration_ms=87434
-INFO  emitter batch=- finalize：fsync + rename  out/text-labels.jsonl.part → out/text-labels.jsonl（8 行）
-INFO  emitter batch=- 已写出 out/text-labels.rejects.jsonl（6 行）与 out/text-labels.report.json
+INFO  emitter batch=1 批 1 落盘：主输出 +7 行（累计 7），rejects +7（累计 7）
+INFO  run     batch=1 batch.end active=7 dropped_dup=1 dropped_lowq=6 dropped_verify=0 failed=0 duration_ms=106749
+INFO  emitter batch=- finalize：fsync + rename  out/text-labels.jsonl.part → out/text-labels.jsonl（7 行）
+INFO  emitter batch=- 已写出 out/text-labels.rejects.jsonl（7 行）与 out/text-labels.report.json
    ── 终版摘要（与 report.counts 逐项一致）──
    scanned=14  ingested=14  bad_input=0  generated=0
-   dropped_dup=1  dropped_lowq=5  dropped_verify=0  failed=0  emitted=8
+   dropped_dup=1  dropped_lowq=6  dropped_verify=0  failed=0  emitted=7
 INFO  run     batch=0 run.end exit_code=0
 ```
 
-一分半钟，退出码 0。读一下这份摘要，它就是流水线的「过磅单」：
+一分四十多秒，退出码 0。读一下这份摘要，它就是流水线的「过磅单」：
 
 - 14 条进来（`scanned=14`，全部合法 `ingested=14`）；
 - 去重工位拦下 1 条（`dropped_dup=1`——那条一字不差的重复；只多一个「做」字的那条为什么**没**被去重拦下？我们在 3.5 节看账）；
-- 质量工位拦下 5 条（`dropped_lowq=5`——「哈哈哈哈哈」「在吗」们，以及所有聚合分低于 0.25 的）；
-- 8 条通过全部工位、完成标注、写入主输出（`emitted=8`）。
+- 质量工位拦下 6 条（`dropped_lowq=6`——「哈哈哈哈哈」「在吗」们，以及所有聚合分低于 0.25 的）；
+- 7 条通过全部工位、完成标注、写入主输出（`emitted=7`）。
 
-注意守恒：`8 + 1 + 5 + 0 + 0 = 14`。**每一次运行这个等式都必须成立**——这是 LabelKit 的账目不变量。
+注意守恒：`7 + 1 + 6 + 0 + 0 = 14`。**每一次运行这个等式都必须成立**——这是 LabelKit 的账目不变量。
 
 > 你本机的具体拦截数可能与这里略有出入：LLM 服务端存在非确定性，聚合分恰在 0.25 阈值附近的两三条记录逐次运行可能进出浮动——但守恒等式永远成立。
 
@@ -177,13 +177,13 @@ INFO  run     batch=0 run.end exit_code=0
 `out/` 下出现四个文件：
 
 ```
-text-labels.jsonl           # 主输出（8 行）
-text-labels.rejects.jsonl   # 拒绝通道（6 行）
+text-labels.jsonl           # 主输出（7 行）
+text-labels.rejects.jsonl   # 拒绝通道（7 行）
 text-labels.report.json     # 运行报告
 text-labels.trace.jsonl     # 追踪日志（因为开了 trace.enabled）
 ```
 
-**主输出**每行 = 你的 Schema 字段 + `_meta` 元信息（格式化展示其中一行，文件里的第 3 行）：
+**主输出**每行 = 你的 Schema 字段 + `_meta` 元信息（格式化展示其中一行，文件里的第 2 行）：
 
 ```json
 {
@@ -192,21 +192,22 @@ text-labels.trace.jsonl     # 追踪日志（因为开了 trace.enabled）
   "difficulty": "medium",
   "_meta": {
     "id": "a8aa181766eebd97",
-    "run": {"tool": "labelkit/1.0.0", "started_at": "2026-07-03T01:17:35.699878+08:00",
+    "run": {"tool": "labelkit/1.0.0", "started_at": "2026-07-07T23:07:54.213290+08:00",
             "project_file": "project.toml", "rubric": "default:text", "seed": 42},
     "source": {"file": "input.jsonl", "line_no": 4, "generated_from": [],
                "fields": {"source": "ime-log"}, "generator": null},
-    "scores": {"educational_value": 0.6, "facts_trivia": 0.8, "writing_style": 0.4,
-               "required_expertise": 0.6, "__aggregate__": 0.6000000000000001,
+    "scores": {"writing_style": 0.4, "required_expertise": 0.6, "educational_value": 0.8,
+               "facts_trivia": 1.0, "__aggregate__": 0.7000000000000001,
                "mode": "pointwise", "batch_no": 1},
     "dedup": {"kind": "unique"},
+    "classification": null,
     "annotation": {"model": "glm-5.2", "attempts": 1},
     "verification": null
   }
 }
 ```
 
-顶层三个字段就是你在 Schema 里声明的标注结果；`_meta` 里则是这条记录的「完整履历」：它来自输入文件第 4 行（`source.line_no`）、四条质量准则各得几分、聚合分 0.6（浮点尾数是加权平均的正常产物）、不是重复（`dedup.kind="unique"`）、标注一次成功（`attempts: 1`）。`fields.source` 是被透传的原始字段。不想要 `_meta`？`output.meta_mode` 可以改成 `sidecar`（旁车文件）或 `none`（第 8 章）。
+顶层三个字段就是你在 Schema 里声明的标注结果；`_meta` 里则是这条记录的「完整履历」：它来自输入文件第 4 行（`source.line_no`）、四条质量准则各得几分、聚合分 0.7（浮点尾数是加权平均的正常产物）、不是重复（`dedup.kind="unique"`）、没做分类（`classification: null`——v1.7 的分类算子未启用时恒为 null，第 24 章）、标注一次成功（`attempts: 1`）。`fields.source` 是被透传的原始字段。不想要 `_meta`？`output.meta_mode` 可以改成 `sidecar`（旁车文件）或 `none`（第 8 章）。
 
 **拒绝通道**记录每条被淘汰记录的去向（`rejects = "refs"` 档不含原文，只有引用）：
 
@@ -220,11 +221,13 @@ text-labels.trace.jsonl     # 追踪日志（因为开了 trace.enabled）
 
 ```json
 "quality": {
-  "per_criterion_mean": {"educational_value": 0.31, "facts_trivia": 0.22,
-                          "required_expertise": 0.32, "writing_style": 0.40}
+  "per_criterion_mean": {"educational_value": 0.3538461538461538,
+                          "facts_trivia": 0.16923076923076924,
+                          "required_expertise": 0.2615384615384615,
+                          "writing_style": 0.3692307692307692}
 },
 "llm_usage": {
-  "default": {"calls": 61, "prompt_tokens": 21683, "completion_tokens": 6831, "retries": 0}
+  "default": {"calls": 61, "prompt_tokens": 23550, "completion_tokens": 6053, "retries": 0}
 }
 ```
 

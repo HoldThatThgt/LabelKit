@@ -9,6 +9,7 @@
 
 | 来源 | 次数 | 说明 |
 |---|---|---|
+| classify（v1.7） | N × max(1, sc) | sc = `classify.self_consistency`；生成样本继承种子类，回流不重分类 |
 | quality pairwise | N × k / 2（默认 k=4 ⇒ 2N） | × 评审数 × 双序(2) ×（single 模式再 ×C） |
 | quality pointwise | N × C | 与 C 成正比是它比 pairwise 贵的原因（C=4 时 4N vs 2N） |
 | annotate | N | × self_consistency 的 n |
@@ -16,6 +17,8 @@
 | verify | N 左右 | × 评审数；每轮 repair 追加 1 标注 + 1 复审 |
 | 结构修复（L3） | 按需 | 健康工程接近 0；`resolved_at.l3_*` 高说明 Schema 有问题（第 14 章） |
 | 重试 | 按需 | 报告 `llm_usage.*.retries` 可见 |
+
+分类算子开 `assignment = "multi"` 时另记一笔扇出账：一条记录命中几类就变成几个信封，下游 quality / annotate / verify 的 N 实际乘上平均标签数——multi 工程做预算时按这个乘数打提前量（`--dry-run` 的估算按乘数 1 报下界）。
 
 **先验预算**：`--dry-run` 直接给出估算调用数（不含修复与重试）。**后验核账**：报告 `llm_usage` 分 profile 给出 calls / tokens / retries，配了单价还有 `est_cost_usd`。
 

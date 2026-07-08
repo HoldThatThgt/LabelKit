@@ -25,11 +25,11 @@ labelkit run --config <config.toml> --project <project.toml>
 
 ```
 dry-run: mode=process estimated_records=14 batches=1
-dry-run: estimated LLM calls — generate_calls=0 quality_calls=56 annotate_calls=14 verify_calls=0 total=70 (excludes retries and repair calls)
+dry-run: estimated LLM calls — generate_calls=0 classify_calls=0 quality_calls=56 annotate_calls=14 verify_calls=0 total=70 (excludes retries and repair calls)
 dry-run: no LLM calls made, no output written (report and trace only)
 ```
 
-注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。
+注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），未启用恒为 0；`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。两种情况 stderr 都会多打一行注记（`dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界`）。
 
 ## 15.2 `labelkit validate`：只体检不跑车
 
@@ -138,7 +138,7 @@ uv run labelkit run ... --strict; echo "exit=$?"
 ```
    ── 终版摘要（与 report.counts 逐项一致）──
    scanned=14  ingested=14  bad_input=0  generated=0
-   dropped_dup=1  dropped_lowq=5  dropped_verify=0  failed=0  emitted=8
+   dropped_dup=1  dropped_lowq=6  dropped_verify=0  failed=0  emitted=7
 ```
 
 **stderr 永远不含数据内容与提示词**——可以放心接入任何日志采集系统。

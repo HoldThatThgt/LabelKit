@@ -77,6 +77,8 @@ sc_temperature = 0.7          # self-consistency 各次采样的温度
 | `self_consistency` | 0 | 见 11.5 |
 | `sc_temperature` | 0.7 | 仅 self_consistency ≥ 3 时生效——多样性靠温度，投票靠多数 |
 
+**按类覆盖（v1.7）**：开启分类算子后，`instruction` 与 `examples` 可以按类换一套——在 `[class.X.annotate]` 里为 X 类单独写任务指令与 few-shot 示例，该类记录标注时取类内值，未覆盖的类继承全局（类示例同样在启动时逐条过你的用户 Schema 校验）。提示词模板结构不变（11.2 的模板一字不动），变的只是往里填的内容。详见第 24 章。
+
 ## 11.4 instruction 写作指南
 
 instruction 是你对贴标员的「岗前培训」。有效的写法：

@@ -34,17 +34,17 @@ id 贯穿一切：主输出的 `_meta.id`、拒绝通道、trace 事件里的 `r
 三条铁律：
 
 1. **算子只处理 `active` 的记录**——被前面工位淘汰的，后面工位看都不看（也就不再为它花钱）；
-2. **算子永远不从批里删除元素，只改状态**——账目因此永远算得平；
+2. **算子永远不从批里删除元素，只改状态**——账目因此永远算得平。v1.7 起有一个**只增不删**的例外：分类算子在 `classify.assignment = "multi"` 下可向批**尾部**追加扇出的兄弟信封（一条记录命中多个类别时每类一个信封），既有元素仍一个不动（第 24 章）；
 3. **单条记录的失败绝不升级为整批失败**——异常被收进该记录的 `errors` 列表，状态置 `failed`，运行继续。
 
 最终去向：`active` → 主输出；`dropped_*` / `failed` → 拒绝通道（按 `output.rejects` 档位落盘）；所有状态计数 → 报告。于是有了那条**守恒等式**：
 
 ```
 emitted + dropped_dup + dropped_lowq + dropped_verify + failed + bad_input
-  = scanned + generated
+  = scanned + generated [+ fanout]
 ```
 
-（`bad_input` 是 ingest 阶段就不成记录的坏行/缺对，没有 id，不走拒绝通道，只计数。）
+（`bad_input` 是 ingest 阶段就不成记录的坏行/缺对，没有 id，不走拒绝通道，只计数。`fanout` 仅在 `classify.assignment = "multi"` 时出现于 `counts`——multi 扇出净增的信封数，右侧随之补平，第 24 章。）
 
 ## 4.3 批（Batch）：流动与屏障
 
@@ -70,7 +70,7 @@ emitted + dropped_dup + dropped_lowq + dropped_verify + failed + bad_input
 
 ## 4.5 算子开关：合法组合与约束
 
-五个可开关算子（dedup / quality / generate / annotate / verify）由 `project.toml` 各节的 `enabled` 控制。但 M1 配置校验会拦下无意义或矛盾的组合：
+六个可开关算子（dedup / classify / quality / generate / annotate / verify）由 `project.toml` 各节的 `enabled` 控制。但 M1 配置校验会拦下无意义或矛盾的组合：
 
 | 约束 | 理由 |
 |---|---|
@@ -81,15 +81,18 @@ emitted + dropped_dup + dropped_lowq + dropped_verify + failed + bad_input
 | `mode = "generate_only"` ⇒ `generate` 必须开，且 `run.input` 必须**不设** | 纯生成模式没有输入 |
 | `quality.threshold` 与 `quality.selection="top_ratio"` **互斥** | 两种淘汰机制不能同时生效 |
 
+`classify`（v1.7，默认关）与上表各开关**正交**：分类不改变组合合法性，任意合法组合都可以叠加分类——multi 扇出后的每个信封走同一套阶段组合（第 24 章）。
+
 几个常用组合的「菜谱」：
 
-| dedup | quality | generate | annotate | verify | 这是什么玩法 |
-|:-:|:-:|:-:|:-:|:-:|---|
-| ✓ | ✓ | — | ✓ | — | **默认套餐**：清洗 + 打分 + 标注 |
-| ✓ | ✓ | — | — | — | **纯治理**：只去重打分，输出原始数据 + 分数，标签以后再说 |
-| — | — | — | ✓ | ✓ | **纯标注**：数据已经治理过，只标注 + 复核 |
-| ✓ | ✓ | ✓ | ✓ | ✓ | **全流程**：治理 + 扩充生成 + 标注 + 复核（成本最高，质量最高） |
-| ✓ | 可选 | ✓ | 可选 | — | **纯生成**（`generate_only`）：无中生有 → 治理 →（标注）→ 输出 |
+| dedup | classify | quality | generate | annotate | verify | 这是什么玩法 |
+|:-:|:-:|:-:|:-:|:-:|:-:|---|
+| ✓ | — | ✓ | — | ✓ | — | **默认套餐**：清洗 + 打分 + 标注 |
+| ✓ | — | ✓ | — | — | — | **纯治理**：只去重打分，输出原始数据 + 分数，标签以后再说 |
+| — | — | — | — | ✓ | ✓ | **纯标注**：数据已经治理过，只标注 + 复核 |
+| ✓ | — | ✓ | ✓ | ✓ | ✓ | **全流程**：治理 + 扩充生成 + 标注 + 复核（成本最高，质量最高） |
+| ✓ | — | 可选 | ✓ | 可选 | — | **纯生成**（`generate_only`）：无中生有 → 治理 →（标注）→ 输出 |
+| ✓ | ✓ | ✓ | — | ✓ | — | **按类分治**（v1.7）：先分类，再按类 rubric 打分、按类指令标注（第 24 章） |
 
 ## 4.6 两份配置文件：为什么是两份
 

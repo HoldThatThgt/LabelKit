@@ -35,6 +35,8 @@ user:   [任务指令] {annotate.instruction}
 extra_criteria = "④ topic 是否为名词短语而非整句复述 ⑤ 涉及金额/日期的字段是否与原文逐字一致"
 ```
 
+**按类取值（v1.7）**：开启分类算子后，模板里的 `[任务指令]` 段与 `extra_criteria` 都按记录所属类取有效值——该类在 `[class.X.annotate]` 覆盖了 instruction，评审看到的 `[任务指令]` 就是类内那套；`extra_criteria` 则可在 `[class.X.verify]` 按类追加（按类标注、按类评审，口径自动对齐；见第 24 章）。
+
 ## 13.3 drop 还是 repair
 
 | 策略 | 行为 | 适用 |

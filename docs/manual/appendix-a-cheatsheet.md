@@ -137,7 +137,7 @@
 | `output.rejects` | "refs" | "none" \| "refs"（无数据内容）\| "full"（含原文=数据副本） | 8 |
 | `trace.enabled` | false | 事件流开关 | 16 |
 | `trace.path` | {stem}.trace.jsonl | 首个事件写出时截断（速败运行不再触碰；dry-run 写 `{名}.dryrun{后缀}` 独立文件） | 16 |
-| `trace.channels` | ["quality","verify","schema"] | 七通道：ingest/dedup/quality/annotate/verify/schema/llm | 16 |
+| `trace.channels` | ["quality","verify","schema"] | 八通道：ingest/dedup/classify（v1.7）/quality/annotate/verify/schema/llm；默认值不变，分类判决须显式订阅 "classify" | 16/24 |
 | `trace.content` | "refs" | none→refs→excerpt→full 四档脱敏；full=完整数据副本 | 16 |
 
 ## A.8 组合约束（启动即查，违反=退出码 2）
@@ -154,3 +154,33 @@
 10. `self_consistency` ∈ {0} ∪ {≥3 奇数}
 11. `dedup.semantic = true` ⇒ `semantic_embedding` 必填，且引用的档名须存在于 config.toml `[embedding.*]`
 12. `output.validator` / `generate.sample_validator` ⇒ 须为可导入、可调用的 `"module:function"`；前者还须让全部 few-shot 示例 output 干跑通过
+13. `classify.enabled = true` ⇒ `[[classify.classes]]` ≥ 2 项，且 `classify.fallback_class` 必填并 ∈ classes（v1.7）
+14. `classify.max_labels` 仅 `assignment = "multi"` 可设，∈ [2, 类别数]（缺省回填为类别数）
+15. `classify.enabled = false` 而 `[[classify.classes]]` / `[class.*]` 在场 ⇒ 仅 **warning**（一次、点名被忽略的表——「留配置、关开关」合法，不触发退出码 2）
+
+## A.9 project.toml — [classify] 与 [class.<name>.*] 按类覆盖（v1.7 追加）
+
+| 键 | 默认 | 一句话 | 章 |
+|---|---|---|---|
+| `classify.enabled` | false | 默认关；关闭时与 v1.6 行为一致（唯一可见差异：`_meta.classification` 恒在、值为 null） | 24 |
+| `classify.llm` | "default" | profile 引用；UI 模态须 supports_vision；计入密钥/vision/probe 三处引用集 | 24 |
+| `classify.assignment` | "single" | 锁定一条一类 \| "multi"（多类命中按标签扇出：**行唯一键变 (_meta.id, label)**，counts 增 fanout） | 24 |
+| `classify.max_labels` | 类别数 | 仅 multi 可设；∈ [2, 类别数]；扇出成本（×m 份打分/标注/评审）的封顶旋钮 | 24 |
+| `classify.instruction` | "" | 可选补充说明，追加在 system 类别表之后；横跨多类的裁决规则（「拿不准选 X」）写这里 | 24 |
+| `classify.fallback_class` | enabled 必填 | 兜底类：须 ∈ classes；分类失败归它，LLM 亦可主动选它 | 24 |
+| `classify.self_consistency` | 0 | 0=关；≥3 奇数：n 次采样投票，**无过半归兜底类**（不回退首样本），成本 ×n | 24 |
+| `classify.sc_temperature` | 0.7 | sc 各次采样温度；仅 self_consistency ≥ 3 生效 | 24 |
+| `classify.on_error` | "fallback" | 结构修复耗尽：归兜底类、记录存活（不写 errors，不污染 rejects 归因）\| "fail"：记录 failed → rejects | 24 |
+| `[[classify.classes]]` | enabled 必填 | ≥2 项；每项 {name：`[a-z0-9_]+` 表内唯一, description：非空（LLM 可见的全部类语义）, examples：可选 few-shot（仅输入侧）} | 24 |
+
+`[class.<name>.<节>]` 按类覆盖白名单（`<name>` 须 ∈ classes；未提供的键继承全局；**白名单外键报 CONFIG_ERROR**——「未知键仅 warning」惯例的显式例外）：
+
+| 节 | 可按类覆盖 | 锁定全局 |
+|---|---|---|
+| `[class.*.quality]` | mode / rounds / rubric（含 `[class.*.rubric]` 内联子表）/ threshold / selection / top_ratio | llm、judges、both_orders、criteria_per_call、on_unscored |
+| `[class.*.annotate]` | instruction / examples | llm、self_consistency、sc_temperature |
+| `[class.*.generate]` | instruction / styles / num_per_record / temperature | llms、mixture、weights、seeds_per_call、num_per_call、sample_validator |
+| `[class.*.verify]` | extra_criteria | llm、judges、policy、max_repair_rounds |
+| —— | —— | `run.*` / `input.*` / `dedup.*` / `classify.*` / `output.*`（输出 Schema 全局唯一）/ `trace.*` 从不按类 |
+
+合并细则：优先级 `[class.<name>].<节>.<键>` > `[<节>].<键>` > 内置默认；threshold/selection/top_ratio 按**选择组**整组合并（全局 threshold + 类 top_ratio 合法，互斥校验跑在合并后视图上）；类 rubric 换 selector 后重解析，6 级量表校验按（类有效 mode × 类有效 rubric）执行；类 examples 启动时干跑全局 Schema。详见第 24 章。

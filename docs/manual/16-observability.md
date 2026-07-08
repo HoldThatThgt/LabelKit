@@ -23,6 +23,7 @@
 | `batch.start` / `batch.end` | 每批 | 各状态计数、耗时 |
 | `ingest.bad_line` / `missing_pair` / `index_conflict` | 接入跳过时 | 文件、行号/index、原因 |
 | `dedup.duplicate` | 每次判重（判为 unique 不发事件） | kind、簇键、kept_id；近似重复另带**恰一项实测相似度**（文本 jaccard / 图像 hamming / 语义 cosine），exact 精确重复无相似度字段 |
+| `classify.decision` | 每条记录分类定案时（v1.7）。仅 trace、无 stderr 镜像；通道为 `"classify"`——v1.7 新增的第八个通道值，不在默认订阅里，要看它须在 `trace.channels` 显式加入 | label（本信封的路由标签）、labels（multi 时的命中全集）、source（llm / fallback / inherited）；**reason** 仅当订阅了 classify 通道时才请求并携带（零额外 token 原则）；self-consistency 启用时另带 sc（n 与一致率） |
 | `quality.judgment` | 每次成对裁决 | 呈现顺序、每准则 winner + **reason**（评审团时每评审一条，带 judge 字段） |
 | `quality.pointwise` | 每次单点打分 | criterion、0–5 原始分、reason |
 | `quality.bt_fit` | 每批每准则拟合完 | 是否收敛、迭代数、比较数 |

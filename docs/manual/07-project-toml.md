@@ -2,7 +2,7 @@
 
 > `project.toml` 是工程级配置：一次标注任务的全部意图都写在这里。
 > 本章精讲 `[run]` `[input]` `[output]` `[trace]` 四节的每个参数；
-> 五个算子节（`[dedup]` `[quality]` `[generate]` `[annotate]` `[verify]`）在此给出速览，深度解读见第 9–13 章。
+> 六个算子节（`[dedup]` `[classify]` `[quality]` `[generate]` `[annotate]` `[verify]`）在此给出速览，深度解读见第 9–13、24 章。
 
 ## 7.1 文件骨架与最小可用配置
 
@@ -26,7 +26,7 @@ schema_inline = """
 """
 ```
 
-没写的节全部取默认：dedup 开、quality 开（只打分不过滤）、generate 关、verify 关、trace 关。**从最小配置出发按需添加**，比一开始就抄一份全量配置更不容易犯错。
+没写的节全部取默认：dedup 开、quality 开（只打分不过滤）、classify 关、generate 关、verify 关、trace 关。**从最小配置出发按需添加**，比一开始就抄一份全量配置更不容易犯错。
 
 ## 7.2 `[run]`：这次运行的骨骼
 
@@ -54,17 +54,20 @@ schema_inline = """
 | `max_image_mb` | 20 | 单张截图大小上限，超限按坏记录跳过 |
 | `ui_tree_max_chars` | 30000 | 控件树序列化文本进提示词的长度上限，超出按深度优先截断并附 `…(truncated N nodes)` 标记。树特别深的 App（嵌套 WebView 等）可调大，代价是每次调用的输入 token 变多 |
 
-## 7.4 五个算子节速览
+## 7.4 六个算子节速览
 
 每节详情见对应章。这里给一张「开关 + 最常调的三个参数」速查：
 
 | 节 | 开关默认 | 最常调的参数 | 去哪深入 |
 |---|---|---|---|
 | `[dedup]` | **开** | `minhash_threshold`（0.85 近似判重线）、`scope`（global/batch）、`ui_dup_requires`（UI 判重口径） | 第 9 章 |
+| `[classify]` | 关（v1.7） | `[[classify.classes]]`（类别表，启用必填）、`fallback_class`（兜底类，启用必填）、`assignment`（single/multi 单多标签） | 第 24 章 |
 | `[quality]` | **开** | `mode`（pairwise/pointwise）、`threshold` 或 `selection="top_ratio"`（淘汰机制）、`rubric`（评价准则） | 第 10 章 |
 | `[generate]` | 关 | `instruction`（生成指令）、`num_per_record`（每种子产几条）、`llms`/`styles`（多样性来源） | 第 12 章 |
 | `[annotate]` | **开** | `instruction`（标注指令，开了就必填）、`examples`（few-shot）、`self_consistency`（多次采样投票） | 第 11 章 |
 | `[verify]` | 关 | `llm`（评审档，建议独立模型）、`policy`（drop/repair）、`extra_criteria`（追加评审维度） | 第 13 章 |
+
+`[classify]` 是 v1.7 新增的分类算子节：按你声明的类别表对每条存活记录做 LLM 封闭集分类，类标签写进 `_meta.classification` 并驱动下游「按类条件化」。启用后另有一族按类覆盖节 **`[class.<name>.<section>]`**——对某个类别单独覆盖 quality / annotate / generate / verify 的白名单参数（按类 rubric、按类标注指令等），类未覆盖的键继承全局。完整键表、白名单与合并语义见第 24 章与 spec §5.2。
 
 开关组合的合法性约束见 4.5 节（M1 启动时强制检查）。
 

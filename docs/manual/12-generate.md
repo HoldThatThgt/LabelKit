@@ -25,6 +25,8 @@
 
 调用失败（修复耗尽/重试耗尽）只损失**那一次调用**的样本——种子不受影响，也不产生 failed 记录；该次调用计入报告桶统计（calls 计入、produced 为 0）。
 
+**按类种子池（v1.7）**：开启分类算子后，选种与预算按类独立——每类有自己的门槛链（全局 `seed_min_score` → 缺省取该类有效的 `quality.threshold` → 再缺省取该类种子池的聚合分中位数）与调用预算 `⌈该类种子数 × 该类有效 num_per_record / num_per_call⌉`；instruction / styles / num_per_record / temperature 均可在 `[class.X.generate]` 按类覆盖。生成样本**继承种子的类**（`_meta.classification.source = "inherited"`），回流时不再消耗分类调用；报告的桶统计（12.5）key 相应升为三段 `类×模型×风格`（仅启用分类时）。注意 `generate_only` 模式不支持按类配比——它走全局指令的扁平路径，产物由链上的 classify 正常分类。详见第 24 章。
+
 ## 12.3 generate_only 模式：无中生有
 
 `run.mode = "generate_only"` 时没有输入数据（`run.input` 必须不设），generate 成为链路起点，产出按 `batch_size` 切批走 dedup → (quality) → (annotate) → (verify) → 输出。两种形态二选一：
