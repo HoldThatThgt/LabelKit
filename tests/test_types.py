@@ -1,11 +1,13 @@
 """Unit tests for labelkit/types.py (contract §3: UITree.serialize, ImageRef.load_base64,
-PipelineItem defaults, Classification (v1.7), frozen-ness)."""
+PipelineItem defaults, Classification (v1.7), stream types + frame helpers (v1.8),
+frozen-ness)."""
 from __future__ import annotations
 
 import base64
 import dataclasses
 import io
 from pathlib import Path
+from typing import get_args
 
 import pytest
 from PIL import Image
@@ -16,9 +18,15 @@ from labelkit.types import (
     PipelineItem,
     Record,
     RecordRef,
+    Status,
+    Transition,
     UINode,
     UITree,
     Usage,
+    VerificationResult,
+    digest_is_poor,
+    frame_digest,
+    tree_diff,
 )
 
 
@@ -244,3 +252,243 @@ class TestFrozen:
 
     def test_usage_add(self):
         assert Usage(1, 2) + Usage(10, 20) == Usage(11, 22)
+
+
+# ── v1.8: Status full set / Transition / sequence Record / stream envelopes ─
+
+class TestStatusEnum:
+    def test_status_literal_full_set(self):
+        # spec §4.1 (v1.8): exactly seven values — absorbed / dropped_noise joined
+        assert frozenset(get_args(Status)) == frozenset({
+            "active", "dropped_dup", "dropped_lowq", "dropped_verify",
+            "failed", "absorbed", "dropped_noise"})
+        assert len(get_args(Status)) == 7
+
+
+class TestTransition:
+    def test_is_frozen(self):
+        t = Transition(index=0, action={"action_type": "click"}, model="m",
+                       attempts=1, detail={})
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            t.index = 1  # type: ignore[misc]
+
+    def test_all_five_fields_required_no_defaults(self):
+        with pytest.raises(TypeError):
+            Transition(index=0, action={}, model="m", attempts=1)  # type: ignore[call-arg]
+
+    def test_field_values_round_trip(self):
+        t = Transition(index=2,
+                       action={"action_type": "other", "target": None,
+                               "value": None, "description": "未知动作"},
+                       model="glm-5.2", attempts=3,
+                       detail={"kind": "extraction_invalid", "message": "L3 耗尽"})
+        assert (t.index, t.model, t.attempts) == (2, "glm-5.2", 3)
+        assert t.action["action_type"] == "other"
+        assert t.detail["kind"] == "extraction_invalid"
+
+
+class TestRecordSequenceFields:
+    def test_defaults_are_single_and_empty(self):
+        rec = _record()
+        assert rec.kind == "single"
+        assert rec.members == ()
+
+    def test_sequence_record_construction(self):
+        m1, m2 = _record("a" * 16), _record("b" * 16)
+        seq = Record(id="c" * 16, modality="text", text=None, raw=None,
+                     ui_tree=None, image=None, ref=m1.ref,
+                     kind="sequence", members=(m1, m2))
+        assert seq.kind == "sequence"
+        assert seq.members == (m1, m2)
+        assert seq.text is None and seq.raw is None
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            seq.members = ()  # type: ignore[misc]
+
+
+class TestStreamEnvelopeFields:
+    def test_pipeline_item_stream_defaults(self):
+        item = PipelineItem(record=_record())
+        assert item.transitions is None
+        assert item.session_id is None
+
+    def test_pipeline_item_stream_fields_writable(self):
+        item = PipelineItem(record=_record())
+        item.session_id = "s-0001"
+        item.transitions = (Transition(index=0, action={}, model="m",
+                                       attempts=1, detail={}),)
+        assert item.session_id == "s-0001"
+        assert len(item.transitions) == 1
+
+    def test_verification_result_defects_default(self):
+        vr = VerificationResult(verdict="pass", rounds=1, critiques=())
+        assert vr.defects == ()
+        vr2 = VerificationResult(verdict="fail", rounds=2, critiques=(),
+                                 defects=({"kind": "missing_tail", "members": None,
+                                           "position": "tail", "detail": "缺尾帧"},))
+        assert vr2.defects[0]["kind"] == "missing_tail"
+
+
+# ── v1.8 shared frame helpers: frame_digest / digest_is_poor / tree_diff ────
+
+def _ui_record(*nodes: UINode, rec_id: str = "d" * 16) -> Record:
+    return Record(id=rec_id, modality="ui", text=None, raw=None,
+                  ui_tree=UITree(nodes=tuple(nodes)), image=None,
+                  ref=RecordRef("a/uitree_1.jsonl", None, 1, ()))
+
+
+class TestFrameDigest:
+    def test_ui_with_package_title_and_salient(self):
+        rec = _ui_record(
+            _node("1", 0, "FrameLayout", extra={"package": "com.example.mail"}),
+            _node("2", 1, "TextView", text="收件箱"),
+            _node("3", 1, "Button", text="写邮件"),
+            _node("4", 1, "TextView", text="隐藏", visible=False),
+        )
+        assert frame_digest(rec, 400) == "[com.example.mail] 收件箱｜收件箱、*写邮件"
+
+    def test_ui_with_activity_inserted_after_app(self):
+        rec = _ui_record(
+            _node("1", 0, "FrameLayout",
+                  extra={"package": "com.foo", "activity": "MainActivity"}),
+            _node("2", 1, "TextView", text="首页"),
+        )
+        assert frame_digest(rec, 400) == "[com.foo activity=MainActivity] 首页｜首页"
+
+    def test_ui_without_package_omits_head_segment(self):
+        rec = _ui_record(
+            _node("1", 0, "FrameLayout"),
+            _node("2", 1, "TextView", text="标题"),
+        )
+        assert frame_digest(rec, 400) == "标题｜标题"
+
+    def test_alternate_app_keys_and_interactive_star(self):
+        rec = _ui_record(
+            _node("1", 0, "FrameLayout", extra={"pkg": "com.bar"}),
+            _node("2", 1, "ImageButton", content_desc="返回"),
+            _node("3", 1, "EditText", text="请输入手机号"),
+        )
+        # no visible non-empty text before EditText → title = EditText's text
+        assert frame_digest(rec, 400) == "[com.bar] 请输入手机号｜*返回、*请输入手机号"
+
+    def test_salient_deduplicates_in_order(self):
+        rec = _ui_record(
+            _node("1", 0, "TextView", text="确定"),
+            _node("2", 0, "TextView", text="确定"),
+            _node("3", 0, "TextView", text="取消"),
+        )
+        assert frame_digest(rec, 400) == "确定｜确定、取消"
+
+    def test_barren_tree_digest_empty(self):
+        rec = _ui_record(_node("1", 0, "FrameLayout"), _node("2", 1, "View"))
+        assert frame_digest(rec, 400) == ""
+
+    def test_text_modality_truncates_plain(self):
+        rec = _record()                            # text = "hello"
+        assert frame_digest(rec, 400) == "hello"
+        assert frame_digest(rec, 3) == "hel"
+
+    def test_ui_truncation_appends_ellipsis_within_budget(self):
+        rec = _ui_record(_node("1", 0, "TextView", text="x" * 50))
+        digest = frame_digest(rec, 20)
+        assert len(digest) == 20
+        assert digest.endswith("…")
+
+
+class TestDigestIsPoor:
+    def test_barren_ui_tree_is_poor(self):
+        rec = _ui_record(_node("1", 0, "FrameLayout", extra={"package": "com.foo"}))
+        assert digest_is_poor(rec) is True
+
+    def test_visible_text_or_desc_not_poor(self):
+        assert digest_is_poor(
+            _ui_record(_node("1", 0, "TextView", text="登录页面标题"))) is False
+        assert digest_is_poor(
+            _ui_record(_node("1", 0, "View", content_desc="用户头像图标按钮"))) is False
+
+    def test_short_digest_is_poor(self):
+        # Second disjunct (spec §4 poverty judgment): a visible text node exists
+        # but the rendered digest is < 8 chars — still poor.
+        assert digest_is_poor(_ui_record(_node("1", 0, "TextView", text="hi"))) is True
+
+    def test_invisible_text_still_poor(self):
+        rec = _ui_record(_node("1", 0, "TextView", text="hi", visible=False))
+        assert digest_is_poor(rec) is True
+
+    def test_text_modality_never_poor(self):
+        assert digest_is_poor(_record()) is False
+
+
+def _tree(*nodes: UINode) -> UITree:
+    return UITree(nodes=tuple(nodes))
+
+
+class TestTreeDiff:
+    def test_identical_structure_zero_changes(self):
+        # node_id differs on purpose — it is NOT a cross-frame identity (S13)
+        a = _tree(_node("1", 0, "Frame"), _node("2", 1, "TextView", text="hi"))
+        b = _tree(_node("9", 0, "Frame"), _node("8", 1, "TextView", text="hi"))
+        assert tree_diff(a, b, 0) == {
+            "added": 0, "removed": 0, "text_changed": 0,
+            "change_ratio": 0.0, "app_changed": False, "title_changed": False}
+
+    def test_full_screen_replacement_counts_both_sides(self):
+        a = _tree(_node("1", 0, "ListView", text="列表", bounds=(0, 0, 100, 100)))
+        b = _tree(_node("1", 0, "WebView", text="网页", bounds=(0, 0, 200, 200)),
+                  _node("2", 1, "Button", text="确定", bounds=(0, 0, 50, 50)))
+        d = tree_diff(a, b, 0)
+        assert (d["removed"], d["added"], d["text_changed"]) == (1, 2, 0)
+        assert d["change_ratio"] == pytest.approx(3 / 2)
+        assert d["title_changed"] is True
+
+    def test_text_changed_and_ratio(self):
+        a = _tree(_node("1", 0, "Frame"), _node("2", 1, "EditText", text=""),
+                  _node("3", 1, "Button", text="登录"))
+        b = _tree(_node("1", 0, "Frame"),
+                  _node("2", 1, "EditText", text="13800138000"),
+                  _node("3", 1, "Button", text="登录"))
+        d = tree_diff(a, b, 0)
+        assert (d["added"], d["removed"], d["text_changed"]) == (0, 0, 1)
+        assert d["change_ratio"] == pytest.approx(1 / 3)
+
+    def test_swapped_texts_within_key_are_multiset_matched(self):
+        # lower-bound semantics: identical (text, desc) multisets pair up fully
+        a = _tree(_node("1", 0, "TextView", text="A"), _node("2", 0, "TextView", text="B"))
+        b = _tree(_node("1", 0, "TextView", text="B"), _node("2", 0, "TextView", text="A"))
+        d = tree_diff(a, b, 0)
+        assert (d["added"], d["removed"], d["text_changed"]) == (0, 0, 0)
+
+    def test_none_boundaries_count_as_all_added_or_removed(self):
+        b = _tree(_node("1", 0, "Frame"), _node("2", 1, "TextView", text="hi"))
+        d = tree_diff(None, b, 0)
+        assert (d["added"], d["removed"]) == (2, 0)
+        assert d["change_ratio"] == pytest.approx(1.0)
+        d2 = tree_diff(b, None, 0)
+        assert (d2["added"], d2["removed"]) == (0, 2)
+        assert d2["change_ratio"] == pytest.approx(1.0)
+        d3 = tree_diff(None, None, 0)
+        assert d3 == {"added": 0, "removed": 0, "text_changed": 0,
+                      "change_ratio": 0.0, "app_changed": False,
+                      "title_changed": False}
+
+    def test_quantization_merges_nearby_bounds(self):
+        a = _tree(_node("1", 0, "Button", text="OK", bounds=(10, 20, 110, 60)))
+        b = _tree(_node("1", 0, "Button", text="OK", bounds=(11, 21, 111, 61)))
+        exact = tree_diff(a, b, 0)
+        assert exact["added"] == 1 and exact["removed"] == 1
+        quantized = tree_diff(a, b, 16)
+        assert (quantized["added"], quantized["removed"],
+                quantized["text_changed"]) == (0, 0, 0)
+
+    def test_app_changed_via_extra_keys(self):
+        a = _tree(_node("1", 0, "Frame", extra={"package": "com.a"}))
+        b = _tree(_node("1", 0, "Frame", extra={"package": "com.b"}))
+        d = tree_diff(a, b, 0)
+        assert d["app_changed"] is True
+        assert (d["added"], d["removed"], d["text_changed"]) == (0, 0, 0)
+
+    def test_invisible_nodes_ignored(self):
+        a = _tree(_node("1", 0, "Frame"))
+        b = _tree(_node("1", 0, "Frame"),
+                  _node("2", 1, "TextView", text="ghost", visible=False))
+        d = tree_diff(a, b, 0)
+        assert d["added"] == 0 and d["change_ratio"] == 0.0

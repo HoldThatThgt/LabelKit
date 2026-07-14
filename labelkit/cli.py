@@ -41,6 +41,7 @@ if TYPE_CHECKING:
 _RUBRIC_FILES: dict[str, str] = {
     "default:text": "default_text.toml",
     "default:ui": "default_ui.toml",
+    "default:trajectory": "default_trajectory.toml",   # v1.8 (S29, §7.12)
 }
 
 # The one exit-1 LabelKitError, per CONTRACTS.md §7.10 (Emitter.finalize contract).
@@ -154,6 +155,10 @@ def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
     "Referenced" follows M1's definition (spec 3.1.4 API-Key row, 3.1.6 example
     ①: an unreferenced profile needs no key and is never probed):
 
+    * segment — referenced iff enabled AND strategy ∈ {llm, hybrid} (v1.8, S30:
+      the rules strategy makes zero segment LLM calls; guard mirrors the loader).
+    * extract — referenced whenever enabled (v1.8, S30; chain slot classify →
+      extract → quality).
     * classify — referenced iff enabled (v1.7, R24 reference-set point ③;
       guard mirrors loader rule 12).
     * quality — in ``pointwise`` mode every scoring call uses ``quality.llm``
@@ -163,8 +168,12 @@ def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
     * verify — a non-empty ``judges`` panel replaces ``verify.llm``.
     """
     llm_names: list[str] = []
+    if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
+        llm_names.append(cfg.segment.llm)
     if cfg.classify.enabled:
         llm_names.append(cfg.classify.llm)
+    if cfg.extract.enabled:
+        llm_names.append(cfg.extract.llm)
     if cfg.quality.enabled:
         if cfg.quality.mode == "pointwise" or not cfg.quality.judges:
             llm_names.append(cfg.quality.llm)
@@ -197,10 +206,19 @@ def _build_stages(cfg: "ResolvedConfig") -> list["Stage"]:
     from labelkit.verify import VerifyStage
 
     stages: list[Stage] = []
+    if cfg.segment.enabled:
+        # v1.8: imported inside the switch (deferred, function-top import form) —
+        # non-stream runs never touch the module. Chain slot: head, before dedup.
+        from labelkit.segment import SegmentStage
+        stages.append(SegmentStage(cfg))
     if cfg.dedup.enabled:
         stages.append(DedupStage(cfg.dedup, DedupIndex(cfg.dedup, cfg.run.modality)))
     if cfg.classify.enabled:
         stages.append(ClassifyStage(cfg))
+    if cfg.extract.enabled:
+        # v1.8: chain slot after classify / before quality (§7.9).
+        from labelkit.extract import ExtractStage
+        stages.append(ExtractStage(cfg))
     if cfg.quality.enabled:
         stages.append(QualityStage(cfg))
     if cfg.generate.enabled:

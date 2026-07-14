@@ -6,6 +6,10 @@ Three channels:
 - rejects channel ``{output_stem}.rejects.jsonl`` (streamed append log, no ``.part``);
 - ``{output_stem}.report.json`` (always written on finalize).
 
+Distribution by status (v1.8 three routes, spec 3.11.2): ``active`` → main output;
+``absorbed`` → NEITHER channel, counted only (the member content lives inside its
+episode's sequence record); every other non-active status → rejects.
+
 The emitter never crashes on a bad record: a failed pre-write ``validate_only`` check
 (an internal invariant break) diverts the item to rejects with kind ``internal_error``
 and the run continues. Record-level isolation covers meta assembly / serialization
@@ -96,9 +100,11 @@ class Emitter:
             raise LabelKitError(f"output path unwritable: {exc}") from exc
 
     def emit_batch(self, batch: list[PipelineItem], batch_no: int) -> EmitResult:
-        """Distribute the batch by status; append + flush. Never raises for a record —
-        but a channel-write OSError is a run-level failure and propagates as
-        LabelKitError (spec 3.11.3 ④: the .part may now hold a truncated line)."""
+        """Distribute the batch by status — three routes (v1.8, spec 3.11.2):
+        active → main output; absorbed → counted only (neither channel); every
+        other non-active status → rejects. Appends + flush. Never raises for a
+        record — but a channel-write OSError is a run-level failure and propagates
+        as LabelKitError (spec 3.11.3 ④: the .part may now hold a truncated line)."""
         emitted = 0
         rejected = 0
         annotate_on = self._cfg.annotate.enabled
@@ -130,6 +136,12 @@ class Emitter:
                             continue
                     self._write_main(item, user_obj, batch_no)
                     emitted += 1
+                elif item.status == "absorbed":
+                    # v1.8 third route (spec 3.11.2 / §7.10): the member content
+                    # lives inside its episode's sequence record — neither main
+                    # output nor rejects; the generic _status_totals tally below
+                    # covers the count.
+                    continue
                 else:
                     self._write_reject(item, batch_no)
                     rejected += 1
@@ -261,6 +273,9 @@ class Emitter:
                 "seed": self._cfg.run.seed,
             },
             "source": self._source_block(rec, with_fields=True),
+            # v1.8 ALWAYS-PRESENT key (§9.1): null whenever segment is disabled;
+            # position source → scores mirrors the chain order.
+            "stream": self._stream_block(item),
             "scores": self._scores_block(item, batch_no),
             "dedup": {"kind": item.dedup.kind} if item.dedup is not None else None,
             # v1.7 ALWAYS-PRESENT key (§9.1): null when the item carries no
@@ -274,19 +289,20 @@ class Emitter:
                 if item.classification is not None else None
             ),
             "annotation": self._annotation_block(item),
-            "verification": (
-                {"verdict": item.verification.verdict, "rounds": item.verification.rounds}
-                if item.verification is not None else None
-            ),
+            "verification": self._verification_block(item),
         }
 
     def _rubric_selector(self) -> str:
         sel = self._cfg.quality.rubric
         if sel == "inline":
             return self._cfg.rubric.name
-        if sel in ("default:text", "default:ui"):
+        if sel in ("default:text", "default:ui", "default:trajectory"):
             return sel
-        # "" should have been resolved by M1; fall back to modality default.
+        # "" should have been resolved by M1; mirror the loader's resolution
+        # rule (v1.8 S29: stream mode resolves the empty selector to the
+        # trajectory rubric for both modalities).
+        if self._cfg.segment.enabled:
+            return "default:trajectory"
         return f"default:{self._cfg.run.modality}"
 
     def _source_block(self, rec: Record, *, with_fields: bool) -> dict:
@@ -337,6 +353,30 @@ class Emitter:
             block["pool"] = item.classification.label
         return block
 
+    def _stream_block(self, item: PipelineItem) -> dict | None:
+        """The v1.8 `_meta.stream` value (§9.1 / spec §6.3): null whenever segment
+        is disabled. In stream mode every main-output row is an episode (sequence
+        record) — a non-sequence record here is defensive and also yields null.
+        session_split / stream_repaired / segment_degraded travel as duck-typed
+        envelope marks written by M10/M7/M14 (S21/S26, §7.6)."""
+        rec = item.record
+        if not self._cfg.segment.enabled or rec.kind != "sequence":
+            return None
+        members = rec.members
+        return {
+            "episode_id": rec.id,
+            "session_id": item.session_id,
+            "order_span": [_order_key_repr(members[0]), _order_key_repr(members[-1])],
+            "member_count": len(members),
+            "member_ids": [m.id for m in members],
+            "member_sources": [_member_source(m) for m in members],
+            "session_split": bool(getattr(item, "session_split", False)),
+            "repaired": bool(getattr(item, "stream_repaired", False)),
+            "degraded": getattr(item, "segment_degraded", None),
+            "steps": (None if item.transitions is None
+                      else [{"index": t.index, **t.action} for t in item.transitions]),
+        }
+
     def _annotation_block(self, item: PipelineItem) -> dict | None:
         ann = item.annotation
         if ann is None:
@@ -344,6 +384,17 @@ class Emitter:
         block: dict = {"model": ann.model, "attempts": ann.attempts}
         if ann.sc is not None:
             block["sc"] = dict(ann.sc)
+        return block
+
+    def _verification_block(self, item: PipelineItem) -> dict | None:
+        ver = item.verification
+        if ver is None:
+            return None
+        block: dict = {"verdict": ver.verdict, "rounds": ver.rounds}
+        if self._cfg.segment.enabled:
+            # v1.8 (§9.1): stream mode carries the ALWAYS-PRESENT defects key
+            # ([] when none); non-stream verification blocks never carry it.
+            block["defects"] = list(ver.defects)
         return block
 
     # ── rejects channel ───────────────────────────────────────────────────
@@ -411,6 +462,13 @@ class Emitter:
             return "quality", reason
         if item.status == "dropped_verify":
             return "verify", "verify_fail"
+        if item.status == "dropped_noise":
+            # v1.8 (§9.2): these frames carry no item.errors entry — attribution
+            # reads the duck-typed mark left by the flipping stage (M14/M7):
+            # ("segment", "noise") | ("segment", "below_min_len") |
+            # ("verify", "off_task_member").
+            attribution = getattr(item, "noise_attribution", None)
+            return attribution if attribution else ("segment", "noise")
         # failed (incl. emitter-diverted internal errors)
         if item.errors:
             first = item.errors[0]
@@ -493,11 +551,39 @@ class Emitter:
 
 
 def _raw_payload(rec: Record) -> Mapping:
-    """Record content payload: text → Record.raw; UI → serialized tree + image path.
-    Shared by the annotate-disabled main output and the rejects `full` tier (§9.1/§9.2)."""
+    """Record content payload: text → Record.raw; UI → serialized tree + image path;
+    v1.8 sequence records (S25, §9.2) → member id/source references (the frozen
+    single-record shapes stay for kind="single"). Shared by the annotate-disabled
+    main output and the rejects `full` tier (§9.1/§9.2)."""
+    if rec.kind == "sequence":
+        return {
+            "kind": "sequence",
+            "member_ids": [m.id for m in rec.members],
+            "member_sources": [_member_source(m) for m in rec.members],
+        }
     if rec.modality == "text":
         return rec.raw or {}
     return {
         "ui_tree": rec.ui_tree.serialize() if rec.ui_tree is not None else "",
         "image_path": str(rec.image.path) if rec.image is not None else "",
     }
+
+
+def _member_source(member: Record) -> dict:
+    """One `_meta.stream.member_sources` entry (§9.1): {"file", ...} plus exactly
+    one of line_no / pair_index — the §9.1 source-block convention per member."""
+    src: dict = {"file": member.ref.source_file}
+    if member.ref.line_no is not None:
+        src["line_no"] = member.ref.line_no
+    else:
+        src["pair_index"] = member.ref.pair_index
+    return src
+
+
+def _order_key_repr(member: Record) -> str | int | None:
+    """`_meta.stream.order_span` element (spec §6.3): the member's order-key
+    presentation — text = "file:line_no", UI = pair_index."""
+    ref = member.ref
+    if ref.line_no is not None:
+        return f"{ref.source_file}:{ref.line_no}"
+    return ref.pair_index

@@ -105,6 +105,48 @@ class DedupConfig:
 
 
 @dataclass(frozen=True)
+class StreamConfig:                               # v1.8 (spec 5.2 [stream]): input-side ordering +
+                                                  # sessionization declaration, consumed by M2;
+                                                  # present while segment.enabled=false -> no-op warning
+    order_by: str = "input_order"                 # "input_order" | "meta:<field>" (text modality only)
+    on_disorder: Literal["skip", "fail"] = "skip" # disorder / timestamp-parse failure policy
+    key: tuple[str, ...] = ()                     # partition keys: "meta:<field>" (text) | "source_dir";
+                                                  # groupby semantics — a key change closes the session
+    gap_s: int = 300                              # time-gap split; only order_by="meta:*" (explicit set
+                                                  # without meta:* ordering -> M1 warning); default biased
+                                                  # large: under-segmentation is recoverable by the LLM
+                                                  # refinement pass, over-segmentation is not
+    gap_steps: int = 0                            # ordinal-gap split (any order key); 0 = off; gap_s and
+                                                  # gap_steps may combine — either trigger splits
+    session_max_len: int = 200                    # hard length cap (frames); > run.batch_size -> M1 WARN
+    session_max_span_s: int = 0                   # hard span cap (only meta:*); 0 = off
+
+
+@dataclass(frozen=True)
+class SegmentConfig:                              # v1.8 (spec 5.2 [segment]): M14, stream master switch
+    enabled: bool = False                         # off = v1.7 behavior (except _meta.stream: null)
+    strategy: Literal["rules", "llm", "hybrid"] = "hybrid"
+    llm: str = "default"                          # in the reference sets only when
+                                                  # strategy in {llm, hybrid} (S30)
+    window: int = 20                              # sliding-window frames/call; M1: >= 2
+    digest_max_chars: int = 400                   # per-frame digest cap
+    noise_filter: bool = True                     # llm/hybrid only; rules + true -> no-op warning
+    min_len: int = 2                              # applies to LLM-refined segments only (S11)
+    use_vision: bool = False                      # attach per-frame screenshots to window calls
+    context: str = ""                             # optional domain context — NOT a boundary definition
+    on_error: Literal["keep", "fail"] = "keep"
+
+
+@dataclass(frozen=True)
+class ExtractConfig:                              # v1.8 (spec 5.2 [extract]): M15, UI sequences only
+    enabled: bool = False                         # requires segment.enabled + modality="ui"
+    llm: str = "default"                          # always in the vision reference set (S30)
+    instruction: str = ""                         # only key overridable via [class.<name>.extract]
+    include_diff: bool = True                     # inject [树变更摘要] (ablatable, S14)
+    on_error: Literal["fallback", "fail"] = "fallback"
+
+
+@dataclass(frozen=True)
 class ClassSpec:
     name: str                                     # [a-z0-9_]+, unique within the table
     description: str                              # non-empty
@@ -184,6 +226,10 @@ class AnnotateConfig:
     examples: tuple[FewShotExample, ...] = ()
     self_consistency: int = 0                     # 0 = off; else odd, >= 3
     sc_temperature: float = 0.7
+    sequence_frames: int = 20                     # v1.8: keyframe cap for sequence annotation
+                                                  # (first/last always kept, middle uniformly
+                                                  # downsampled); M1: 2 <= v <= 100 (CONFIG_ERROR),
+                                                  # > 20 with max_image_px > 2000 -> WARN (S28)
 
 
 @dataclass(frozen=True)
@@ -215,8 +261,8 @@ class TraceConfig:
     enabled: bool = False
     path: str = ""                                # M1 resolves "" → "{output_stem}.trace.jsonl"
     channels: tuple[str, ...] = ("quality", "verify", "schema")
-                                                  # allowed: ingest|dedup|classify|quality|
-                                                  # annotate|verify|schema|llm
+                                                  # allowed (v1.8: 10 values): ingest|dedup|segment|
+                                                  # extract|classify|quality|annotate|verify|schema|llm
     content: Literal["none", "refs", "excerpt", "full"] = "refs"
 
 
@@ -250,6 +296,9 @@ class ClassView:
     annotate: AnnotateConfig
     generate: GenerateConfig
     verify: VerifyConfig
+    extract: ExtractConfig                        # v1.8 (S3): only `instruction` is whitelisted;
+                                                  # segment has no per-class view (runs before
+                                                  # classify — labels do not exist yet)
 
 
 # ── CLI overrides and the aggregate ────────────────────────────────────────
@@ -271,7 +320,10 @@ class ResolvedConfig:
     embedding_profiles: Mapping[str, EmbeddingProfile]
     run: RunConfig
     input: InputConfig
+    stream: StreamConfig                          # v1.8
     dedup: DedupConfig
+    segment: SegmentConfig                        # v1.8
+    extract: ExtractConfig                        # v1.8
     classify: ClassifyConfig                      # v1.7; max_labels backfilled by M1
     quality: QualityConfig
     generate: GenerateConfig

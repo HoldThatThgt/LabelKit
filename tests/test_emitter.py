@@ -12,14 +12,16 @@ from jsonschema import Draft202012Validator
 from labelkit import TOOL_VERSION
 from labelkit.config.model import (
     AnnotateConfig, ClassifyConfig, ClassSpec, Criterion, DedupConfig,
-    GenerateConfig, InputConfig, OutputConfig, QualityConfig, ResolvedConfig,
-    Rubric, RunConfig, ToolConfig, TraceConfig, VerifyConfig,
+    ExtractConfig, GenerateConfig, InputConfig, OutputConfig, QualityConfig,
+    ResolvedConfig, Rubric, RunConfig, SegmentConfig, StreamConfig, ToolConfig,
+    TraceConfig, VerifyConfig,
 )
 from labelkit.emitter import EmitResult, Emitter
 from labelkit.errors import LabelKitError
 from labelkit.types import (
     Annotation, Classification, DedupInfo, ImageRef, PipelineItem, QualityScore,
-    Record, RecordRef, StageError, UINode, UITree, Usage, VerificationResult,
+    Record, RecordRef, StageError, Transition, UINode, UITree, Usage,
+    VerificationResult,
 )
 
 USER_SCHEMA = {
@@ -63,6 +65,7 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
     quality_rubric = kw.pop("quality_rubric", "default:text")
     log_format = kw.pop("log_format", "text")
     classify = kw.pop("classify", ClassifyConfig())
+    segment = kw.pop("segment", SegmentConfig())
     assert not kw, f"unknown overrides: {kw}"
     return ResolvedConfig(
         tool=ToolConfig(log_format=log_format),
@@ -70,7 +73,10 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
         embedding_profiles={},
         run=RunConfig(output=output, modality=modality, seed=7),
         input=InputConfig(),
+        stream=StreamConfig(),
         dedup=DedupConfig(),
+        segment=segment,
+        extract=ExtractConfig(),
         classify=classify,
         quality=QualityConfig(
             selection=selection,
@@ -126,15 +132,28 @@ def make_record(rec_id="a" * 16, line_no=1, raw=None, generated=False):
                   raw=raw, ui_tree=None, image=None, ref=ref)
 
 
-def make_ui_record(rec_id="c" * 16):
+def make_ui_record(rec_id="c" * 16, pair_index=2, source_file="b/uitree_2.jsonl"):
     tree = UITree(nodes=(UINode(node_id="1", parent_id=None, depth=0, role="Button",
                                 text="登录", content_desc="", bounds=(0, 0, 10, 10),
                                 visible=True, extra={}),))
-    ref = RecordRef(source_file="b/uitree_2.jsonl", line_no=None, pair_index=2,
+    ref = RecordRef(source_file=source_file, line_no=None, pair_index=pair_index,
                     generated_from=())
     return Record(id=rec_id, modality="ui", text=None, raw=None, ui_tree=tree,
                   image=ImageRef(path=Path("b/image_2.png"), format="png", size_bytes=9),
                   ref=ref)
+
+
+def make_seq_record(members, rec_id="e" * 16):
+    """A v1.8 sequence Record per the S24 field convention: text/raw/ui_tree/
+    image None, ref inherited from the FIRST member, members in order."""
+    first = members[0]
+    return Record(
+        id=rec_id, modality=first.modality, text=None, raw=None, ui_tree=None,
+        image=None,
+        ref=RecordRef(source_file=first.ref.source_file, line_no=first.ref.line_no,
+                      pair_index=first.ref.pair_index, generated_from=(),
+                      generator=None),
+        kind="sequence", members=tuple(members))
 
 
 def make_item(status="active", record=None, annotated=True, scores=False,
@@ -191,8 +210,9 @@ def test_inline_meta_mode_structure(tmp_path):
     Draft202012Validator(USER_SCHEMA).validate(row)
     assert row == {"intent": "writing_assist", "topic": "请假条", "difficulty": "easy"}
     # exact _meta structure per §6.3 — all keys always present (v1.7 adds the
-    # ALWAYS-PRESENT classification key between dedup and annotation)
-    assert list(meta) == ["id", "run", "source", "scores", "dedup",
+    # ALWAYS-PRESENT classification key between dedup and annotation; v1.8 adds
+    # the ALWAYS-PRESENT stream key between source and scores)
+    assert list(meta) == ["id", "run", "source", "stream", "scores", "dedup",
                           "classification", "annotation", "verification"]
     assert meta["id"] == "a" * 16
     assert meta["run"] == {"tool": TOOL_VERSION,
@@ -202,12 +222,31 @@ def test_inline_meta_mode_structure(tmp_path):
     assert meta["source"] == {"file": "ime-2026-06.jsonl", "line_no": 1,
                               "generated_from": [], "fields": {"source": "ime-log"},
                               "generator": None}
+    assert meta["stream"] is None                  # segment disabled → null (v1.8)
     assert meta["scores"] == {"clarity": 0.72, "__aggregate__": 0.72,
                               "mode": "pairwise_bt", "batch_no": 1}
     assert meta["dedup"] == {"kind": "unique"}
     assert meta["classification"] is None          # classify disabled → null
     assert meta["annotation"] == {"model": "glm-5.2", "attempts": 1}
+    # non-stream verification block: no defects key (v1.8, §9.1)
     assert meta["verification"] == {"verdict": "pass", "rounds": 1}
+
+
+def test_rubric_selector_trajectory(tmp_path):
+    """v1.8 (S29): _meta.run.rubric must report the trajectory selector — both
+    for an explicit "default:trajectory" and for the empty selector resolved
+    under stream mode (loader rule 16 mirror). Regression: the pre-v1.8
+    whitelist fell through to the modality default ("default:ui")."""
+    cfg = make_cfg(tmp_path, quality_rubric="default:trajectory")
+    run_emitter(cfg, [make_item()])
+    meta = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]
+    assert meta["run"]["rubric"] == "default:trajectory"
+
+    cfg = make_cfg(tmp_path, quality_rubric="",
+                   segment=SegmentConfig(enabled=True))
+    run_emitter(cfg, [make_item()])
+    meta = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]
+    assert meta["run"]["rubric"] == "default:trajectory"
 
 
 def test_inline_disabled_stages_are_null(tmp_path):
@@ -215,6 +254,7 @@ def test_inline_disabled_stages_are_null(tmp_path):
     item = make_item(scores=False, verified=False, dedup=False)
     run_emitter(cfg, [item])
     meta = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]
+    assert meta["stream"] is None
     assert meta["scores"] is None
     assert meta["dedup"] is None
     assert meta["classification"] is None
@@ -305,6 +345,187 @@ def test_rejects_label_key_when_classify_enabled_refs_and_full(tmp_path):
     row = read_jsonl(tmp_path / "full" / "res.rejects.jsonl")[0]
     assert row["_meta"]["label"] == "chat"
     assert "record" in row
+
+
+# ── v1.8 stream: absorbed route / dropped_noise attribution / _meta.stream ──
+
+def test_absorbed_third_route_neither_channel_but_counted(tmp_path):
+    """§7.10 v1.8 third route: absorbed goes to NEITHER the main output NOR
+    rejects — counted only (the generic per-status tally feeds M10's post-emit
+    accounting)."""
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
+    absorbed = [make_item(status="absorbed", record=make_record(f"{i:016x}", i),
+                          annotated=False) for i in (1, 2, 3)]
+    active = make_item(record=make_record("a" * 16, 9))
+    em, result = run_emitter(cfg, absorbed + [active])
+    assert result == EmitResult(emitted=1, rejected=0)
+    assert len(read_jsonl(tmp_path / "out" / "res.jsonl")) == 1
+    rejects = tmp_path / "out" / "res.rejects.jsonl"
+    assert not rejects.exists() or read_jsonl(rejects) == []
+    assert em._status_totals["absorbed"] == 3          # counted, not routed
+
+
+def test_dropped_noise_rejects_attribution_three_forms(tmp_path):
+    """§9.2 v1.8: dropped_noise rows read the flipping stage's duck-typed
+    noise_attribution mark — exactly three (stage, reason) combinations; these
+    frames write no item.errors, so `errors` stays []."""
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
+    noise = make_item(status="dropped_noise", record=make_record("1" * 16, 1),
+                      annotated=False)
+    noise.noise_attribution = ("segment", "noise")
+    short = make_item(status="dropped_noise", record=make_record("2" * 16, 2),
+                      annotated=False)
+    short.noise_attribution = ("segment", "below_min_len")
+    shrunk = make_item(status="dropped_noise", record=make_record("3" * 16, 3),
+                       annotated=False)
+    shrunk.noise_attribution = ("verify", "off_task_member")
+    unmarked = make_item(status="dropped_noise", record=make_record("4" * 16, 4),
+                         annotated=False)                # mark-less fallback
+    _, result = run_emitter(cfg, [noise, short, shrunk, unmarked])
+    assert result == EmitResult(emitted=0, rejected=4)
+
+    rows = {r["_meta"]["id"]: r["_meta"]
+            for r in read_jsonl(tmp_path / "out" / "res.rejects.jsonl")}
+    assert (rows["1" * 16]["stage"], rows["1" * 16]["reason"]) == ("segment", "noise")
+    assert (rows["2" * 16]["stage"], rows["2" * 16]["reason"]) == ("segment", "below_min_len")
+    assert (rows["3" * 16]["stage"], rows["3" * 16]["reason"]) == ("verify", "off_task_member")
+    assert (rows["4" * 16]["stage"], rows["4" * 16]["reason"]) == ("segment", "noise")
+    for meta in rows.values():
+        assert meta["errors"] == []
+
+
+def test_meta_stream_episode_full_structure_text(tmp_path):
+    """§9.1 v1.8 `_meta.stream` episode shape (text modality): order_span in
+    "file:line_no" presentation, per-member sources carrying line_no, default
+    marks false/null, steps null while extract is off."""
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
+    members = [make_record("1" * 16, 3), make_record("2" * 16, 5),
+               make_record("3" * 16, 8)]
+    item = make_item(record=make_seq_record(members))
+    item.session_id = "ime-log/0"
+    run_emitter(cfg, [item])
+
+    meta = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]
+    # key position: after source, before scores (chain-order mirror)
+    keys = list(meta)
+    assert keys.index("stream") == keys.index("source") + 1
+    assert keys.index("scores") == keys.index("stream") + 1
+    stream = meta["stream"]
+    assert list(stream) == ["episode_id", "session_id", "order_span",
+                            "member_count", "member_ids", "member_sources",
+                            "session_split", "repaired", "degraded", "steps"]
+    assert stream == {
+        "episode_id": "e" * 16,
+        "session_id": "ime-log/0",
+        "order_span": ["ime-2026-06.jsonl:3", "ime-2026-06.jsonl:8"],
+        "member_count": 3,
+        "member_ids": ["1" * 16, "2" * 16, "3" * 16],
+        "member_sources": [{"file": "ime-2026-06.jsonl", "line_no": 3},
+                           {"file": "ime-2026-06.jsonl", "line_no": 5},
+                           {"file": "ime-2026-06.jsonl", "line_no": 8}],
+        "session_split": False,
+        "repaired": False,
+        "degraded": None,
+        "steps": None,
+    }
+
+
+def test_meta_stream_ui_order_span_marks_and_steps(tmp_path):
+    """UI episode: order_span = pair_index values, member_sources carry
+    pair_index (exactly one of line_no/pair_index per entry); the duck-typed
+    session_split / stream_repaired / segment_degraded marks and the rendered
+    transitions all surface."""
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True), modality="ui",
+                   quality_rubric="default:ui")
+    members = [make_ui_record("1" * 16, pair_index=2, source_file="a/uitree_2.jsonl"),
+               make_ui_record("2" * 16, pair_index=5, source_file="b/uitree_5.jsonl")]
+    item = make_item(record=make_seq_record(members, rec_id="f" * 16))
+    item.session_id = "capture/0"
+    item.session_split = True
+    item.stream_repaired = True
+    item.segment_degraded = {"kind": "segmentation_invalid", "windows_failed": 1}
+    item.transitions = (
+        Transition(index=0,
+                   action={"action_type": "click", "target": "登录",
+                           "value": None, "description": "点击登录按钮"},
+                   model="glm-5.2", attempts=1, detail={}),
+    )
+    run_emitter(cfg, [item])
+
+    stream = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"]
+    assert stream["episode_id"] == "f" * 16
+    assert stream["session_id"] == "capture/0"
+    assert stream["order_span"] == [2, 5]
+    assert stream["member_sources"] == [{"file": "a/uitree_2.jsonl", "pair_index": 2},
+                                        {"file": "b/uitree_5.jsonl", "pair_index": 5}]
+    for entry in stream["member_sources"]:          # exactly one of the two keys
+        assert set(entry) & {"line_no", "pair_index"} == {"pair_index"}
+    assert stream["session_split"] is True
+    assert stream["repaired"] is True
+    assert stream["degraded"] == {"kind": "segmentation_invalid", "windows_failed": 1}
+    assert stream["steps"] == [{"index": 0, "action_type": "click", "target": "登录",
+                                "value": None, "description": "点击登录按钮"}]
+
+
+def test_meta_stream_null_for_single_record_even_in_stream_mode(tmp_path):
+    """Frame records never reach the main output under stream — a single record
+    getting there yields the defensive null, never a broken episode block."""
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
+    run_emitter(cfg, [make_item()])
+    assert read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"] is None
+
+
+def test_meta_verification_defects_stream_only(tmp_path):
+    """§9.1 v1.8: in stream mode _meta.verification carries the ALWAYS-PRESENT
+    defects key ([] when none); non-stream blocks never carry it — even against
+    a stray defects value."""
+    defect = {"kind": "off_task_members", "members": ["2" * 16], "position": None,
+              "detail": "成员 2 偏离任务"}
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
+    clean = make_item(record=make_record("1" * 16, 1), verified=True)
+    flagged = make_item(record=make_record("2" * 16, 2))
+    flagged.verification = VerificationResult(verdict="pass", rounds=2,
+                                              critiques=(), defects=(defect,))
+    run_emitter(cfg, [clean, flagged])
+    by_id = {r["_meta"]["id"]: r["_meta"]
+             for r in read_jsonl(tmp_path / "out" / "res.jsonl")}
+    assert by_id["1" * 16]["verification"] == {"verdict": "pass", "rounds": 1,
+                                               "defects": []}
+    assert by_id["2" * 16]["verification"] == {"verdict": "pass", "rounds": 2,
+                                               "defects": [defect]}
+
+    out2 = tmp_path / "nostream" / "res.jsonl"
+    out2.parent.mkdir(parents=True)
+    cfg_off = make_cfg(tmp_path, output=str(out2))
+    item = make_item()
+    item.verification = VerificationResult(verdict="pass", rounds=1,
+                                           critiques=(), defects=(defect,))
+    run_emitter(cfg_off, [item])
+    assert read_jsonl(out2)[0]["_meta"]["verification"] == {
+        "verdict": "pass", "rounds": 1}
+
+
+def test_rejects_full_sequence_record_payload(tmp_path):
+    """S25 (§9.2): the rejects full tier renders a sequence record as
+    {"kind","member_ids","member_sources"}; a segmentation_invalid failure line
+    carries no raw_last_output (known accepted gap since v1.7)."""
+    cfg = make_cfg(tmp_path, rejects="full", segment=SegmentConfig(enabled=True))
+    members = [make_record("1" * 16, 1), make_record("2" * 16, 4)]
+    item = make_item(
+        status="failed", record=make_seq_record(members), annotated=False,
+        errors=[StageError(stage="segment", kind="segmentation_invalid",
+                           message="窗口修复耗尽", retryable=False)])
+    run_emitter(cfg, [item])
+    row = read_jsonl(tmp_path / "out" / "res.rejects.jsonl")[0]
+    assert (row["_meta"]["stage"], row["_meta"]["reason"]) == (
+        "segment", "segmentation_invalid")
+    assert row["record"] == {
+        "kind": "sequence",
+        "member_ids": ["1" * 16, "2" * 16],
+        "member_sources": [{"file": "ime-2026-06.jsonl", "line_no": 1},
+                           {"file": "ime-2026-06.jsonl", "line_no": 4}],
+    }
+    assert "raw_last_output" not in row
 
 
 def test_sidecar_meta_mode_alignment(tmp_path):

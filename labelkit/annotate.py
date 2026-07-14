@@ -4,6 +4,16 @@ Deterministic prompt assembly (task instruction + few-shot + record content; UI 
 adds screenshot + serialized UI tree), delegation of the structure guarantee to M8
 (SchemaEngine.complete_validated), optional self-consistency sampling with field-level
 majority vote (spec 3.5.2), and the public repair hooks used by M7 verify.
+
+v1.8 sequence annotation (S5/S6/S28, CONTRACTS §10.1 sequence variant): episode envelopes
+(record.kind == "sequence") swap the current-record user message for ① [动作序列] step
+lines (omitted entirely when transitions is None) → ② per kept keyframe
+[关键帧 {i}/{k}·成员 {m}] text + image (deterministic uniform downsample to
+annotate.sequence_frames; text-modality sequences skip ②) → ③ the ALWAYS-PRESENT closing
+[成员帧摘要] text part. Template invariant (S6): the final part is ALWAYS the ③ text
+section — the repair suffix concatenates onto parts[-1].text with zero repair-code
+changes. transitions is the second additive trailing kwarg on the two frozen signatures
+(after v1.7's label); None keeps every pre-v1.8 call site byte-identical.
 """
 from __future__ import annotations
 
@@ -19,7 +29,15 @@ from labelkit.errors import (
     ProviderRetryableError,
     SchemaViolation,
 )
-from labelkit.types import Annotation, PipelineItem, Record, StageError, Usage
+from labelkit.types import (
+    Annotation,
+    PipelineItem,
+    Record,
+    StageError,
+    Transition,
+    Usage,
+    frame_digest,
+)
 
 from labelkit.llm_client import Message, Part, PromptBundle
 
@@ -42,6 +60,58 @@ _LABEL_PREV_OUTPUT = "[上一版标注]"
 _LABEL_CRITIQUES = "[审核意见]"
 _REPAIR_TAIL = "请修正后重新输出"
 
+# v1.8 sequence-variant fragments (CONTRACTS §10.1 sequence variant, S5/S6).
+_LABEL_ACTION_SEQUENCE = "[动作序列]"
+_LABEL_MEMBER_DIGESTS = "[成员帧摘要]"
+
+# Operator modules never depend on each other (spec §2.2): M4 quality carries its own
+# same-format step-line template (plus the （摘取兜底） fallback suffix); this copy is M5's.
+_MEMBER_DIGEST_MAX_CHARS = 400   # per-member frame_digest cap (segment.digest_max_chars default)
+
+
+def _step_line(transition: Transition) -> str:
+    """One [动作序列] line in the §10.1 frozen format
+    `{index}. {action_type}（对象: {target|—}；值: {value|—}）{description}`; null
+    target/value render as "—". Annotation evidence does NOT carry the （摘取兜底）
+    fallback suffix — that S16 separation marker belongs to M4's scoring sections only."""
+    action = transition.action
+    target = action.get("target")
+    value = action.get("value")
+    return (f"{transition.index}. {action.get('action_type')}"
+            f"（对象: {'—' if target is None else target}；"
+            f"值: {'—' if value is None else value}）"
+            f"{action.get('description')}")
+
+
+def _keyframe_indexes(n: int, k: int) -> list[int]:
+    """S28 deterministic uniform downsample over n members with cap k
+    (annotate.sequence_frames): n <= k keeps every member; otherwise
+    idx_i = i*(n-1)//(k-1) for i = 0..k-1 — pure integer arithmetic, zero rng, first and
+    last always kept, strictly increasing (no duplicates for n > k)."""
+    if n <= k:
+        return list(range(n))
+    return [i * (n - 1) // (k - 1) for i in range(k)]
+
+
+def _member_digest_lines(members: tuple[Record, ...], max_total_chars: int) -> list[str]:
+    """[成员帧摘要] lines — per member `{m}. {frame_digest(member, 400)}` (m 1-based, member
+    order). Total bounded by max_total_chars (input.ui_tree_max_chars): the first and last
+    lines are ALWAYS kept; middle entries are dropped WHOLE and replaced in place by one
+    `…(truncated N members)` marker line (serialize/§10.8 truncation convention)."""
+    lines = [f"{m}. {frame_digest(member, _MEMBER_DIGEST_MAX_CHARS)}"
+             for m, member in enumerate(members, start=1)]
+    if len(lines) <= 2 or len("\n".join(lines)) <= max_total_chars:
+        return lines
+    last = lines[-1]
+    keep = 1                 # first line survives even if the floor exceeds the budget
+    for k in range(len(lines) - 2, 0, -1):
+        marker = f"…(truncated {len(lines) - k - 1} members)"
+        if len("\n".join(lines[:k] + [marker, last])) <= max_total_chars:
+            keep = k
+            break
+    marker = f"…(truncated {len(lines) - keep - 1} members)"
+    return lines[:keep] + [marker, last]
+
 
 @dataclass(frozen=True)
 class RepairContext:
@@ -57,7 +127,8 @@ def _dumps(obj: object) -> str:
 def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: str,
                           repair: RepairContext | None = None,
                           temperature: float | None = None,
-                          label: str | None = None) -> PromptBundle:
+                          label: str | None = None,
+                          transitions: tuple[Transition, ...] | None = None) -> PromptBundle:
     """Deterministic template assembly per CONTRACTS.md §10.1 (+ §10.5 repair suffix).
 
     schema_text = SchemaEngine.user_schema_text. Section order is fixed: system (task
@@ -65,6 +136,13 @@ def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: st
     order, then the current-record user message (text part, or UI screenshot + tree parts).
     v1.7 (R2): label non-None → instruction/examples come from
     cfg.class_views[label].annotate; None = global config (pre-v1.7 behavior).
+    v1.8 (S5, second additive trailing-kwarg revision of this frozen signature):
+    transitions non-None → the §10.1 sequence variant renders the [动作序列] section from
+    it; None = section omitted / pre-v1.8 behavior byte-identical. Sequence records
+    (record.kind == "sequence") follow the S6 segment order ① [动作序列] → ② kept
+    keyframes (text label + image; S28 downsample to annotate.sequence_frames; skipped in
+    text modality) → ③ ALWAYS-PRESENT closing [成员帧摘要] text part, so parts[-1] is
+    guaranteed text and the repair concatenation below needs zero changes.
     """
     acfg = cfg.class_views[label].annotate if label is not None else cfg.annotate
     messages: list[Message] = []
@@ -79,8 +157,25 @@ def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: st
                         f"{_LABEL_EXAMPLE_OUT} {_dumps(example.output)}")
         messages.append(Message(role="user", parts=(Part(kind="text", text=example_text),)))
 
-    if record.modality == "text":
-        parts: tuple[Part, ...] = (
+    if record.kind == "sequence":  # v1.8 sequence variant (checked BEFORE modality)
+        seq_parts: list[Part] = []
+        if transitions is not None:  # ① omitted entirely when transitions is None
+            steps = "\n".join(_step_line(t) for t in transitions)
+            seq_parts.append(Part(kind="text", text=f"{_LABEL_ACTION_SEQUENCE}\n{steps}"))
+        if record.modality == "ui":  # ② text sequences degrade to ① + ③
+            kept = _keyframe_indexes(len(record.members), cfg.annotate.sequence_frames)
+            k = len(kept)
+            for i, m_idx in enumerate(kept, start=1):
+                member = record.members[m_idx]
+                seq_parts.append(Part(kind="text",
+                                      text=f"[关键帧 {i}/{k}·成员 {m_idx + 1}]"))
+                seq_parts.append(Part(kind="image", image=member.image))
+        digests = "\n".join(
+            _member_digest_lines(record.members, cfg.input.ui_tree_max_chars))
+        seq_parts.append(Part(kind="text", text=f"{_LABEL_MEMBER_DIGESTS}\n{digests}"))
+        parts: tuple[Part, ...] = tuple(seq_parts)
+    elif record.modality == "text":
+        parts = (
             Part(kind="text", text=f"{_LABEL_TEXT_RECORD} {record.text}"),
         )
     else:  # UI modality: three parts in one user message
@@ -202,12 +297,18 @@ def _majority_vote(samples: Sequence[Mapping],
 
 async def annotate_record(record: Record, ctx: "RunContext",
                           repair: RepairContext | None = None,
-                          label: str | None = None) -> Annotation:
+                          label: str | None = None,
+                          transitions: tuple[Transition, ...] | None = None) -> Annotation:
     """One record's full annotation path incl. self-consistency (skipped when repair is
     not None: repair re-annotation is always a single call at profile-default temperature).
     Raises SchemaViolation / ProviderRetryableError / ProviderFatalError.
     v1.7 (R2): label is passed through to build_annotate_prompt (class-effective
-    instruction/examples); llm/self_consistency/sc_temperature stay global (whitelist)."""
+    instruction/examples); llm/self_consistency/sc_temperature stay global (whitelist).
+    v1.8 (S5, additive trailing kwarg): transitions is passed through to
+    build_annotate_prompt on every path (single call, each self-consistency sample, and
+    repair re-annotation — M7 threads the REBUILT value after member surgery); None =
+    pre-v1.8 behavior. Sequence records carry raw = None, so the L2.5 callback receives
+    record=None (documented limitation)."""
     cfg = ctx.cfg
     profile = cfg.annotate.llm
     schema_text = ctx.schema_engine.user_schema_text
@@ -215,7 +316,8 @@ async def annotate_record(record: Record, ctx: "RunContext",
 
     if repair is not None or n == 0:
         prompt = build_annotate_prompt(record, cfg, schema_text, repair=repair,
-                                       temperature=None, label=label)
+                                       temperature=None, label=label,
+                                       transitions=transitions)
         obj, usage, attempts, model = await ctx.schema_engine.complete_validated(
             profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
             record=record.raw)
@@ -226,7 +328,7 @@ async def annotate_record(record: Record, ctx: "RunContext",
     async def one_sample() -> tuple[dict, Usage, int, str]:
         prompt = build_annotate_prompt(record, cfg, schema_text, repair=None,
                                        temperature=cfg.annotate.sc_temperature,
-                                       label=label)
+                                       label=label, transitions=transitions)
         return await ctx.schema_engine.complete_validated(
             profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
             record=record.raw)
@@ -279,7 +381,8 @@ class AnnotateStage:
         record = item.record
         label = item.classification.label if item.classification else None
         try:
-            item.annotation = await annotate_record(record, ctx, label=label)
+            item.annotation = await annotate_record(record, ctx, label=label,
+                                                    transitions=item.transitions)
         except SchemaViolation as e:
             # Transport the raw last model output to M11 for the rejects "full"
             # tier (§9.2) via the duck-typed channel the emitter reads.

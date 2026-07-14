@@ -1,14 +1,23 @@
 """Offline unit tests for M5 annotate: prompt assembly (spec 3.5.2 / CONTRACTS §10.1,
-§10.5) and the self-consistency field-level majority vote. Pure logic only — no LLM."""
+§10.5) and the self-consistency field-level majority vote. Pure logic only — no LLM.
+
+v1.8 sequence annotation (S5/S6/S28, CONTRACTS §10.1 sequence variant): the deterministic
+keyframe downsample formula, the ①②③ segment order with the ALWAYS-text final part
+(repair suffix never swallows the last image), the transitions trailing kwarg threading
+through the single/self-consistency/repair paths and the stage layer, and the
+single-record default-kwarg regression anchor."""
 from __future__ import annotations
 
 import json
 from dataclasses import replace
+from pathlib import Path
 
 from labelkit.annotate import (
     AnnotateStage,
     RepairContext,
+    _keyframe_indexes,
     _majority_vote,
+    _member_digest_lines,
     _voted_keys,
     annotate_record,
     build_annotate_prompt,
@@ -19,6 +28,7 @@ from labelkit.config.model import (
     ClassSpec,
     ClassView,
     DedupConfig,
+    ExtractConfig,
     FewShotExample,
     GenerateConfig,
     InputConfig,
@@ -27,11 +37,22 @@ from labelkit.config.model import (
     ResolvedConfig,
     Rubric,
     RunConfig,
+    SegmentConfig,
+    StreamConfig,
     ToolConfig,
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.types import Classification, ImageRef, Record, RecordRef, UINode, UITree
+from labelkit.types import (
+    Classification,
+    ImageRef,
+    Record,
+    RecordRef,
+    Transition,
+    UINode,
+    UITree,
+    frame_digest,
+)
 
 USER_SCHEMA = {
     "type": "object",
@@ -57,7 +78,10 @@ def make_cfg(*, modality="text", instruction="你是意图标注员。", example
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality=modality, input="in"),
         input=InputConfig(ui_tree_max_chars=ui_tree_max_chars),
+        stream=StreamConfig(),
         dedup=DedupConfig(),
+        segment=SegmentConfig(),
+        extract=ExtractConfig(),
         classify=ClassifyConfig(),
         quality=QualityConfig(),
         generate=GenerateConfig(),
@@ -437,10 +461,10 @@ def make_classified_cfg(**kw) -> ResolvedConfig:
     views = {
         "writing": ClassView(name="writing", quality=base.quality, rubric=base.rubric,
                              annotate=class_annotate, generate=base.generate,
-                             verify=base.verify),
+                             verify=base.verify, extract=ExtractConfig()),
         "qa": ClassView(name="qa", quality=base.quality, rubric=base.rubric,
                         annotate=base.annotate, generate=base.generate,
-                        verify=base.verify),
+                        verify=base.verify, extract=ExtractConfig()),
     }
     classify = ClassifyConfig(
         enabled=True, fallback_class="qa", max_labels=None,
@@ -566,3 +590,255 @@ def test_annotate_record_threads_label_through_sc_path():
     for prompt in engine.prompts:                      # every sample uses the class view
         assert prompt.messages[0].parts[0].text.startswith(CLASS_INSTRUCTION + "\n")
         assert prompt.temperature == cfg.annotate.sc_temperature
+
+
+# ── v1.8 sequence annotation (S5/S6/S28, CONTRACTS §10.1 sequence variant) ───
+
+def ui_member(i: int) -> Record:
+    nodes = (
+        UINode("1", None, 0, "FrameLayout", "", "", (0, 0, 1080, 1920), True,
+               {"package": "com.demo.app"}),
+        UINode("2", "1", 1, "TextView", f"屏幕{i}", "", (0, 0, 1080, 200), True, {}),
+        UINode("3", "1", 1, "Button", "下一步", "", (72, 952, 1008, 1096), True, {}),
+    )
+    return Record(id=f"frame{i:04d}", modality="ui", text=None, raw=None,
+                  ui_tree=UITree(nodes),
+                  image=ImageRef(path=Path(f"image_{i}.png"), format="png", size_bytes=1),
+                  ref=RecordRef("frames/x.jsonl", None, i, ()))
+
+
+def text_member(i: int) -> Record:
+    return Record(id=f"line{i:04d}", modality="text", text=f"步骤文本{i}",
+                  raw={"text": f"步骤文本{i}"}, ui_tree=None, image=None,
+                  ref=RecordRef("frames.jsonl", i + 1, None, ()))
+
+
+def make_episode(members: tuple[Record, ...], ep_id: str = "ep0001") -> Record:
+    first = members[0]
+    return Record(id=ep_id, modality=first.modality, text=None, raw=None, ui_tree=None,
+                  image=None, ref=first.ref, kind="sequence", members=members)
+
+
+def ui_episode(n: int = 3, ep_id: str = "ep0001") -> Record:
+    return make_episode(tuple(ui_member(i) for i in range(n)), ep_id)
+
+
+SEQ_TRANSITIONS = (
+    Transition(index=0, action={"action_type": "click", "target": "登录", "value": None,
+                                "description": "点击登录按钮"},
+               model="m", attempts=1, detail={}),
+    Transition(index=1, action={"action_type": "other", "target": None, "value": None,
+                                "description": "两帧间变化无法归因"},
+               model="m", attempts=2,
+               detail={"kind": "extraction_invalid", "message": "repair exhausted"}),
+)
+
+# Annotation evidence renders WITHOUT the （摘取兜底） fallback suffix (S16 marks
+# fallback steps only in M4's scoring sections).
+ACTION_SECTION = ("[动作序列]\n"
+                  "0. click（对象: 登录；值: —）点击登录按钮\n"
+                  "1. other（对象: —；值: —）两帧间变化无法归因")
+
+
+def digest_section(record: Record) -> str:
+    return "[成员帧摘要]\n" + "\n".join(
+        f"{m}. {frame_digest(member, 400)}"
+        for m, member in enumerate(record.members, start=1))
+
+
+# ── S28 keyframe downsample formula ──────────────────────────────────────────
+
+def test_keyframe_downsample_formula_n25_k20():
+    assert _keyframe_indexes(25, 20) == [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13,
+                                         15, 16, 17, 18, 20, 21, 22, 24]
+
+
+def test_keyframe_downsample_keeps_all_when_n_le_k():
+    assert _keyframe_indexes(3, 20) == [0, 1, 2]
+    assert _keyframe_indexes(20, 20) == list(range(20))
+    assert _keyframe_indexes(1, 2) == [0]
+
+
+def test_keyframe_downsample_endpoints_monotonic_no_rng():
+    for n, k in ((100, 20), (21, 20), (50, 3), (2, 2), (101, 7), (1000, 100)):
+        idx = _keyframe_indexes(n, k)
+        assert idx[0] == 0                       # first ALWAYS kept
+        assert idx[-1] == n - 1                  # last ALWAYS kept
+        assert idx == sorted(set(idx))           # strictly increasing, no duplicates
+        assert len(idx) == min(n, k)
+
+
+# ── sequence template: ①②③ order + text-final invariant (S6) ────────────────
+
+def test_sequence_template_three_sections_in_order():
+    cfg = make_cfg(modality="ui")
+    ep = ui_episode(3)
+    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT, transitions=SEQ_TRANSITIONS)
+    parts = bundle.messages[-1].parts
+
+    assert [p.kind for p in parts] == [
+        "text", "text", "image", "text", "image", "text", "image", "text"]
+    assert parts[0].text == ACTION_SECTION                     # ①
+    assert "摘取兜底" not in parts[0].text
+    assert parts[1].text == "[关键帧 1/3·成员 1]"               # ② labels: 1-based i/k, m
+    assert parts[3].text == "[关键帧 2/3·成员 2]"
+    assert parts[5].text == "[关键帧 3/3·成员 3]"
+    assert parts[2].image is ep.members[0].image
+    assert parts[4].image is ep.members[1].image
+    assert parts[6].image is ep.members[2].image
+    assert parts[-1].kind == "text"                            # ③ ALWAYS-text final part
+    assert parts[-1].text == digest_section(ep)
+
+
+def test_sequence_template_transitions_none_omits_action_section():
+    cfg = make_cfg(modality="ui")
+    ep = ui_episode(2)
+    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT)       # transitions omitted
+    parts = bundle.messages[-1].parts
+    assert [p.kind for p in parts] == ["text", "image", "text", "image", "text"]
+    assert "[动作序列]" not in "".join(p.text or "" for p in parts)
+    assert parts[0].text == "[关键帧 1/2·成员 1]"
+    assert parts[-1].kind == "text"                            # still closes with ③
+    assert parts[-1].text == digest_section(ep)
+
+
+def test_sequence_template_downsamples_25_members_to_20_keyframes():
+    cfg = make_cfg(modality="ui")                              # sequence_frames default 20
+    ep = ui_episode(25)
+    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT, transitions=SEQ_TRANSITIONS)
+    parts = bundle.messages[-1].parts
+
+    images = [p for p in parts if p.kind == "image"]
+    assert len(images) == 20
+    kept = [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18, 20, 21, 22, 24]
+    assert [p.image for p in images] == [ep.members[m].image for m in kept]
+    labels = [p.text for p in parts[1:-1] if p.kind == "text"]
+    assert labels == [f"[关键帧 {i}/20·成员 {m + 1}]"
+                      for i, m in enumerate(kept, start=1)]
+    assert parts[-1].kind == "text"
+    # ③ still digests EVERY member, not just the kept keyframes
+    assert parts[-1].text == digest_section(ep)
+
+
+def test_text_sequence_degrades_to_steps_plus_digest():
+    cfg = make_cfg()
+    ep = make_episode(tuple(text_member(i) for i in range(4)))
+    with_steps = build_annotate_prompt(ep, cfg, SCHEMA_TEXT, transitions=SEQ_TRANSITIONS)
+    parts = with_steps.messages[-1].parts
+    assert [p.kind for p in parts] == ["text", "text"]         # ① + ③, no image
+    assert parts[0].text == ACTION_SECTION
+    assert parts[1].text == digest_section(ep)
+
+    bare = build_annotate_prompt(ep, cfg, SCHEMA_TEXT)
+    assert [p.kind for p in bare.messages[-1].parts] == ["text"]   # ③ alone
+    assert bare.messages[-1].parts[0].text == digest_section(ep)
+
+
+def test_member_digest_lines_bounded_first_last_kept():
+    members = tuple(
+        replace(text_member(i), text=f"帧{i:02d}" + "长" * 80) for i in range(8))
+    full = _member_digest_lines(members, 100000)
+    assert len(full) == 8
+
+    bounded = _member_digest_lines(members, 350)
+    assert len("\n".join(bounded)) <= 350
+    assert bounded[0] == full[0]
+    assert bounded[-1] == full[-1]
+    dropped = 8 - (len(bounded) - 2) - 1
+    assert dropped >= 1
+    assert bounded[-2] == f"…(truncated {dropped} members)"
+
+
+# ── repair suffix on the sequence branch (S6: never swallows the last image) ─
+
+def test_sequence_repair_suffix_lands_on_digest_part_keeps_images():
+    cfg = make_cfg(modality="ui")
+    ep = ui_episode(3)
+    repair = RepairContext(previous_output={"a": 1}, critiques_text="x: y")
+    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT, repair=repair,
+                                   transitions=SEQ_TRANSITIONS)
+    parts = bundle.messages[-1].parts
+    # every keyframe image survives; the suffix concatenates onto the ③ text part
+    assert [p.kind for p in parts] == [
+        "text", "text", "image", "text", "image", "text", "image", "text"]
+    assert parts[-2].kind == "image"
+    assert parts[-1].text == (digest_section(ep)
+                              + '\n[上一版标注] {"a": 1}\n[审核意见] x: y\n请修正后重新输出')
+    assert "None" not in parts[-1].text
+
+
+# ── transitions kwarg threading (S5) ─────────────────────────────────────────
+
+def test_annotate_record_threads_transitions_through_sc_path():
+    import asyncio
+    from types import SimpleNamespace
+
+    cfg = make_cfg(modality="ui", self_consistency=3)
+    engine, metrics = _CapturingEngine(), _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ann = asyncio.run(annotate_record(ui_episode(3), ctx, transitions=SEQ_TRANSITIONS))
+
+    assert ann.sc == {"n": 3, "agreement_ratio": 1.0}
+    assert len(engine.prompts) == 3
+    for prompt in engine.prompts:                      # every sample carries ① and ③
+        parts = prompt.messages[-1].parts
+        assert parts[0].text == ACTION_SECTION
+        assert parts[-1].kind == "text"
+        assert parts[-1].text.startswith("[成员帧摘要]\n")
+
+
+def test_annotate_record_threads_transitions_through_repair_path():
+    import asyncio
+    from types import SimpleNamespace
+
+    cfg = make_cfg(modality="ui")
+    engine, metrics = _CapturingEngine(), _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    repair = RepairContext(previous_output={"intent": "qa"}, critiques_text="a: b")
+    asyncio.run(annotate_record(ui_episode(2), ctx, repair=repair,
+                                transitions=SEQ_TRANSITIONS))
+
+    (prompt,) = engine.prompts                         # repair skips self-consistency
+    parts = prompt.messages[-1].parts
+    assert parts[0].text == ACTION_SECTION
+    assert parts[-1].kind == "text"
+    assert parts[-1].text.endswith(
+        '[上一版标注] {"intent": "qa"}\n[审核意见] a: b\n请修正后重新输出')
+    assert prompt.temperature is None                  # profile-default temperature
+
+
+def test_stage_passes_item_transitions():
+    import asyncio
+    from types import SimpleNamespace
+    from labelkit.types import PipelineItem
+
+    cfg = make_cfg(modality="ui")
+    engine, metrics = _CapturingEngine(), _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    item = PipelineItem(record=ui_episode(2), transitions=SEQ_TRANSITIONS)
+    asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
+
+    assert item.status == "active" and item.annotation is not None
+    assert engine.prompts[0].messages[-1].parts[0].text == ACTION_SECTION
+    ((ev, _payload),) = metrics.events
+    assert ev == "annotate.done"
+
+
+# ── single-record regression anchor (pre-v1.8 byte-identical) ────────────────
+
+def test_single_record_transitions_default_none_regression():
+    cfg = make_cfg()
+    rec = text_record()
+    assert (build_annotate_prompt(rec, cfg, SCHEMA_TEXT)
+            == build_annotate_prompt(rec, cfg, SCHEMA_TEXT, transitions=None))
+    # a single record IGNORES passed transitions — no sequence sections leak in
+    with_steps = build_annotate_prompt(rec, cfg, SCHEMA_TEXT,
+                                       transitions=SEQ_TRANSITIONS)
+    assert with_steps == build_annotate_prompt(rec, cfg, SCHEMA_TEXT)
+    joined = "".join(p.text or "" for m in with_steps.messages for p in m.parts)
+    assert "[动作序列]" not in joined and "[成员帧摘要]" not in joined
+
+    ui_cfg = make_cfg(modality="ui")
+    ui_rec = ui_record()
+    assert (build_annotate_prompt(ui_rec, ui_cfg, SCHEMA_TEXT)
+            == build_annotate_prompt(ui_rec, ui_cfg, SCHEMA_TEXT, transitions=None))

@@ -4,11 +4,17 @@ Pure composition/scheduling — zero business logic, no direct LLM calls, no fil
 writes (M11 owns the output channels). Responsibilities:
 
 - slice the M2 record stream (or the M6 generate_all output in generate_only
-  mode) into batches of ``run.batch_size``;
+  mode) into batches of ``run.batch_size``; in stream mode (v1.8,
+  ``segment.enabled``) consume the M2 session-stream view instead and pack
+  WHOLE sessions per batch by next-fit — one open bin, oversized sessions
+  hard-split (S21) — stamping ``session_id`` on frame envelopes (S4);
 - compose the per-batch stage chain from the config switches (2.3.1 matrix) in
-  the canonical order dedup → classify → quality → generate → annotate → verify;
-- meter ``counts.fanout`` as the len-delta across the classify stage (v1.7 R9 —
-  ``counts.*`` ownership stays with M10; M13 appends siblings in place);
+  the canonical order segment → dedup → classify → extract → quality →
+  generate → annotate → verify (the v1.8 single superset tuple; segment and
+  extract default off, degrading byte-identically to the v1.7 chain);
+- meter ``counts.fanout`` / ``counts.episodes`` as the len-delta across the
+  classify / segment stage (v1.7 R9 / v1.8 §7.9 — ``counts.*`` ownership stays
+  with M10; M13/M14 append siblings/episodes in place);
 - schedule the single-round generation re-flow (sub-batches re-enter at M3,
   never at M6 — no recursion);
 - drive per-batch lifecycle: fresh RunContext per (batch, stage), emit via M11,
@@ -24,6 +30,7 @@ writes (M11 owns the output channels). Responsibilities:
 from __future__ import annotations
 
 import asyncio
+import logging
 import random
 import signal as _signal
 import sys
@@ -55,9 +62,24 @@ _EV_RUN_END = "run.end"
 _EV_BATCH_START = "batch.start"
 _EV_BATCH_END = "batch.end"
 
-# Canonical pipeline order (spec §2.2 / CONTRACTS.md §2; v1.7 inserts classify
-# right after dedup, §7.9).
-_CHAIN_ORDER = ("dedup", "classify", "quality", "generate", "annotate", "verify")
+# Canonical pipeline order (spec §2.2 / CONTRACTS.md §2/§7.9): the v1.8 SINGLE
+# SUPERSET TUPLE — v1.7 inserted classify right after dedup; v1.8 prepends
+# segment and slots extract between classify and quality. segment/extract are
+# default OFF, so the effective chain degrades byte-identically to the v1.7
+# six-name form (generate and segment are mutually exclusive per M1, so the two
+# never co-occupy the chain).
+_CHAIN_ORDER = ("segment", "dedup", "classify", "extract", "quality", "generate",
+                "annotate", "verify")
+
+# v1.8 closed vocabularies (§9.3 report zero-based histograms) — must equal the
+# schema_engine enums: action_schema() action_type 11 values (S15) and
+# defect_verdict_schema() defect kind 5 values (S31).
+_ACTION_TYPES = ("click", "long_press", "input_text", "scroll", "drag", "open_app",
+                 "app_switch", "navigate_back", "navigate_home", "wait", "other")
+_DEFECT_KINDS = ("label_mismatch", "off_task_members", "missing_head",
+                 "missing_tail", "missing_members")
+
+_log = logging.getLogger("labelkit.orchestrator")
 
 # report.json quality.aggregate_histogram bucket labels — frozen (§9.3).
 _HIST_LABELS = tuple(f"{i / 10:.1f}-{(i + 1) / 10:.1f}" for i in range(10))
@@ -67,6 +89,41 @@ _SCHEMA_STATS_ZERO = {"l0_or_clean": 0, "l1": 0, "l3_1": 0, "l3_2": 0, "rejected
 
 def _ceil_div(a: int, b: int) -> int:
     return -(-a // b) if b > 0 else 0
+
+
+def _pack_next_fit(session_lens: Sequence[int],
+                   batch_size: int) -> tuple[list[int], list[int]]:
+    """Next-fit packing simulation over session lengths — mirrors
+    ``_run_process_stream`` exactly, so the dry-run batch count is EXACT
+    (S21/S22). Returns (frames per batch, session pieces per batch); an
+    oversized session hard-splits into ``batch_size`` slices, each its own
+    batch."""
+    frames: list[int] = []
+    pieces: list[int] = []
+    open_frames = open_pieces = 0
+    for length in session_lens:
+        if length > batch_size:
+            if open_frames:
+                frames.append(open_frames)
+                pieces.append(open_pieces)
+                open_frames = open_pieces = 0
+            full, rest = divmod(length, batch_size)
+            frames.extend([batch_size] * full)
+            pieces.extend([1] * full)
+            if rest:
+                frames.append(rest)
+                pieces.append(1)
+            continue
+        if open_frames and open_frames + length > batch_size:
+            frames.append(open_frames)
+            pieces.append(open_pieces)
+            open_frames = open_pieces = 0
+        open_frames += length
+        open_pieces += 1
+    if open_frames:
+        frames.append(open_frames)
+        pieces.append(open_pieces)
+    return frames, pieces
 
 
 @dataclass(frozen=True)                            # [FROZEN in CONTRACTS.md §7.9]
@@ -170,6 +227,12 @@ class Orchestrator:
         assert self.ingestor is not None, "process mode requires an Ingestor"
         if getattr(self.ingestor, "metrics", None) is None:
             self.ingestor.metrics = self.metrics  # trace wiring (CONTRACTS §7.1)
+        if self.cfg.segment.enabled:
+            # v1.8 stream mode: whole-session next-fit packing over the M2
+            # session-stream view (generate is mutually exclusive with segment
+            # per M1, so the re-flow queue can never fill here).
+            await self._run_process_stream()
+            return
         stream = iter(self.ingestor.records())
         if self.cfg.limit is not None:
             stream = islice(stream, self.cfg.limit)
@@ -192,6 +255,62 @@ class Orchestrator:
             self._batch_no += 1
             await self._guarded_batch(batch, self._batch_no, chain)
             del batch  # per-batch memory lifecycle: no reference survives emit
+
+    async def _run_process_stream(self) -> None:
+        """v1.8 stream batching (S21/S4, CONTRACTS §7.9): consume
+        ``ingestor.sessions()`` (the --limit islice lives INSIDE M2, between
+        parse stream and assembler — S17) and pack WHOLE sessions into batches
+        by next-fit: exactly one open bin; a session that no longer fits closes
+        the current batch and opens the next. Batch capacity = run.batch_size
+        FRAMES. A session longer than batch_size is HARD-SPLIT into
+        batch_size slices, each dispatched as its own batch, with ONE WARN per
+        run and a duck-typed ``session_split`` mark on the split session's
+        frame envelopes (M7's missing-frame downgrade evidence,
+        ``_meta.stream.session_split``). M10 stamps ``PipelineItem.session_id``
+        at envelope construction (S4); the residual open bin ships as-is once
+        the session stream is exhausted. On SIGINT/SIGTERM no NEW batch is
+        dispatched — buffered frames strand into the interrupted residual
+        (S18)."""
+        assert self.ingestor is not None, "process mode requires an Ingestor"
+        chain = self._compose_chain(include_generate=True)
+        bs = self.cfg.run.batch_size
+        open_batch: list[PipelineItem] = []
+        split_warned = False
+
+        async def dispatch(batch: list[PipelineItem]) -> None:
+            self._batch_no += 1
+            await self._guarded_batch(batch, self._batch_no, chain)
+
+        for sess in self.ingestor.sessions():
+            if self._stop:
+                break
+            frames = [PipelineItem(record=r, session_id=sess.session_id)
+                      for r in sess.records]
+            if len(frames) > bs:
+                # Hard split (S21): slice at batch_size, each slice its own
+                # batch, dispatched in order. Mark every frame of the session.
+                if not split_warned:
+                    split_warned = True
+                    _log.warning("会话超 batch_size 被硬切（本条提示仅打印一次）",
+                                 extra={"stage": "run", "batch": self._batch_no})
+                for item in frames:
+                    item.session_split = True      # duck-typed mark (S21)
+                if open_batch:
+                    await dispatch(open_batch)
+                    open_batch = []
+                for i in range(0, len(frames), bs):
+                    if self._stop:
+                        break
+                    await dispatch(frames[i:i + bs])
+                continue
+            if open_batch and len(open_batch) + len(frames) > bs:
+                # The one pending overflow session — the only new cross-batch
+                # survivor (§11 ⑤), released as soon as it is packed.
+                await dispatch(open_batch)
+                open_batch = []
+            open_batch.extend(frames)
+        if open_batch and not self._stop:
+            await dispatch(open_batch)             # residual open bin ships as-is
 
     async def _run_generate_only(self) -> None:
         gen = next((s for s in self.stages if s.name == "generate"), None)
@@ -257,6 +376,7 @@ class Orchestrator:
         self.metrics.event(_EV_BATCH_START, stage="run", batch_no=batch_no,
                            payload={"size": len(batch)})
         batch_fanout = 0
+        batch_episodes = 0
         for stage in chain:
             ctx = self._make_ctx(batch_no, stage.name)
             size_before = len(batch)
@@ -267,6 +387,15 @@ class Orchestrator:
                 elapsed = time.perf_counter() - t_stage
                 self._stage_time[stage.name] = self._stage_time.get(stage.name, 0.0) + elapsed
                 self.metrics.add_stage_time(stage.name, elapsed)
+            if stage.name == "segment":
+                # v1.8 §7.9: counts.episodes is METERED HERE — the len-delta
+                # across the segment invocation (M14 tail-appends episode
+                # envelopes in place and never touches counts.*; fanout-
+                # isomorphic R9 construction).
+                delta = len(batch) - size_before
+                if delta > 0:
+                    self.metrics.count("counts.episodes", delta)
+                    batch_episodes += delta
             if stage.name == "classify":
                 # v1.7 R9: counts.fanout is METERED HERE — the len-delta across
                 # the classify invocation (M13 tail-appends siblings in place
@@ -300,13 +429,20 @@ class Orchestrator:
         dropped_dup = tally.get("dropped_dup", 0)
         dropped_lowq = tally.get("dropped_lowq", 0)
         dropped_verify = tally.get("dropped_verify", 0)
+        absorbed = tally.get("absorbed", 0)        # v1.8: episode members (third route)
+        dropped_noise = tally.get("dropped_noise", 0)
         # counts invariant: whatever was neither emitted nor dropped is failed
-        # (covers emitter-diverted internal_error items too).
-        failed = max(len(batch) - emit.emitted - dropped_dup - dropped_lowq - dropped_verify, 0)
+        # (covers emitter-diverted internal_error items too). v1.8: without the
+        # absorbed/dropped_noise terms, episode members would be miscounted
+        # as failed (§7.9).
+        failed = max(len(batch) - emit.emitted - dropped_dup - dropped_lowq
+                     - dropped_verify - absorbed - dropped_noise, 0)
         self.metrics.count("counts.emitted", emit.emitted)
         self.metrics.count("counts.dropped_dup", dropped_dup)
         self.metrics.count("counts.dropped_lowq", dropped_lowq)
         self.metrics.count("counts.dropped_verify", dropped_verify)
+        self.metrics.count("counts.absorbed", absorbed)
+        self.metrics.count("counts.dropped_noise", dropped_noise)
         self.metrics.count("counts.failed", failed)
 
         end_payload: dict = {"active": tally.get("active", 0),
@@ -319,6 +455,12 @@ class Orchestrator:
             # v1.7 R20 (§8.1): batch.start.size stays the batch-ENTRY envelope
             # count; batch.end carries the fan-out delta (classify enabled only).
             end_payload["fanout"] = batch_fanout
+        if self.cfg.segment.enabled:
+            # v1.8 (same R20 form): carried only when segment is enabled; the
+            # stderr progress/summary line gains NO new keys (§7.9).
+            end_payload["episodes"] = batch_episodes
+            end_payload["absorbed"] = absorbed
+            end_payload["dropped_noise"] = dropped_noise
         self.metrics.event(_EV_BATCH_END, stage="run", batch_no=batch_no,
                            payload=end_payload)
         self.metrics.flush()                       # trace flush follows output flush
@@ -342,8 +484,10 @@ class Orchestrator:
         """
         cfg = self.cfg
         enabled = {
+            "segment": cfg.segment.enabled,
             "dedup": cfg.dedup.enabled,
             "classify": cfg.classify.enabled,
+            "extract": cfg.extract.enabled,
             "quality": cfg.quality.enabled,
             "generate": (cfg.generate.enabled and include_generate
                          and cfg.run.mode == "process"),
@@ -440,6 +584,13 @@ class Orchestrator:
             # (§9.3) — single assignment never fans out; the counter is fed by
             # the _process_batch len-delta metering (M10-owned).
             counts["fanout"] = c("counts.fanout")
+        if cfg.segment.enabled:
+            # v1.8 只增 (§9.3): the three stream counts appear only when
+            # segment is enabled — episodes from the len-delta metering,
+            # absorbed/dropped_noise from the post-emit tallies (all M10-owned).
+            counts["episodes"] = c("counts.episodes")
+            counts["absorbed"] = c("counts.absorbed")
+            counts["dropped_noise"] = c("counts.dropped_noise")
 
         run_block: dict = {
             "tool_version": __version__,
@@ -457,23 +608,69 @@ class Orchestrator:
         }
         if self._circuit_broken:
             # v1.6 熔断交付 (spec 6.4, 只增): partial_delivery present only on
-            # breaker-trip delivery; counts.unprocessed = balancing residual so
-            # the invariant extends to emitted + dropped_* + failed + bad_input
-            # + unprocessed = scanned + generated [+ fanout] (records that
-            # entered the pipeline but reached no terminal count, incl.
-            # generated-but-never-batched records in generate_only; the fanout
-            # term is v1.7 R10 — fanned-out siblings are envelopes too).
+            # breaker-trip delivery.
             run_block["partial_delivery"] = True
+        if self._circuit_broken or (cfg.segment.enabled and self._interrupted):
+            # counts.unprocessed = balancing residual so the invariant extends
+            # to emitted + dropped_* + failed + bad_input + unprocessed =
+            # scanned + generated [+ fanout] [+ episodes] (records that entered
+            # the pipeline but reached no terminal count, incl. generated-but-
+            # never-batched records in generate_only; the fanout term is v1.7
+            # R10 — fanned-out siblings are envelopes too). v1.8 (S18): in
+            # STREAM MODE the key also appears on interrupted runs (SIGINT over
+            # the session buffer strands in-flight records) with the expanded
+            # sides — + episodes on the source side, + absorbed + dropped_noise
+            # among the terminal counts. Non-stream interrupted runs keep a
+            # provably zero residual and never emit the key (regression anchor).
             residual = (counts["scanned"] + counts["generated"]
                         + counts.get("fanout", 0)
+                        + counts.get("episodes", 0)
                         - counts["emitted"] - counts["dropped_dup"]
                         - counts["dropped_lowq"] - counts["dropped_verify"]
-                        - counts["failed"] - counts["bad_input"])
+                        - counts["failed"] - counts["bad_input"]
+                        - counts.get("absorbed", 0)
+                        - counts.get("dropped_noise", 0))
             counts["unprocessed"] = max(0, residual)
         report: dict = {
             "run": run_block,
             "counts": counts,
         }
+
+        if cfg.segment.enabled:
+            # v1.8 stream block (§9.3/spec §6.4: placed right after counts).
+            # sessions data source = IngestReport (M2 owner, §7.1);
+            # below_min_len / digest_poor_frames / segment_failures surface the
+            # M14 counters; the sub-blocks surface the M15/M7 counters over the
+            # closed vocabularies (zero-based like report.classify.classes).
+            episodes = counts["episodes"]
+            absorbed = counts["absorbed"]
+            stream_block: dict = {
+                "sessions": int(getattr(ingest_report, "sessions", 0)),
+                "episodes": episodes,
+                "mean_episode_len": (round(absorbed / episodes, 2)
+                                     if episodes else 0.0),
+                "absorbed": absorbed,
+                "dropped_noise": counts["dropped_noise"],
+                "below_min_len": c("segment.below_min_len"),
+                "digest_poor_frames": c("segment.digest_poor_frames"),
+                "segment_failures": c("segment.failures"),
+            }
+            if cfg.extract.enabled:
+                stream_block["extract"] = {
+                    "transitions": c("extract.transitions"),
+                    "fallback_steps": c("extract.fallback_steps"),
+                    "failures": c("extract.failures"),
+                    "by_type": {t: c(f"extract.by_type.{t}")
+                                for t in _ACTION_TYPES},
+                }
+            if cfg.verify.enabled:
+                stream_block["verify"] = {
+                    "membership_repairs": c("verify.membership_repairs"),
+                    "boundary_flags": c("verify.boundary_flags"),
+                    "defects": {k: c(f"verify.defects.{k}")
+                                for k in _DEFECT_KINDS},
+                }
+            report["stream"] = stream_block
 
         if cfg.dedup.enabled:
             dedup_block = {
@@ -697,7 +894,9 @@ class Orchestrator:
         print(f"dry-run: mode={cfg.run.mode} estimated_records={est['records']} "
               f"batches={est['batches']}", file=sys.stderr)
         print(f"dry-run: estimated LLM calls — generate_calls={est['generate_calls']} "
+              f"segment_calls={est['segment_calls']} "
               f"classify_calls={est['classify_calls']} "
+              f"extract_calls={est['extract_calls']} "
               f"quality_calls={est['quality_calls']} annotate_calls={est['annotate_calls']} "
               f"verify_calls={est['verify_calls']} total={est['total_calls']} "
               f"(excludes retries and repair calls)", file=sys.stderr)
@@ -708,6 +907,12 @@ class Orchestrator:
             # label count — flag both with the fixed wording.
             print("dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界",
                   file=sys.stderr)
+        if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
+            # v1.8 S22 (R28-style note): downstream estimates use
+            # episodes ≈ sessions — LLM boundary refinement can only ADD
+            # segments, so the numbers are a lower bound.
+            print("dry-run: 注：stream 估算：下游按 episodes≈sessions 报下界"
+                  "（LLM 精化只增段数）", file=sys.stderr)
         side_channels = "report and trace only" if cfg.trace.enabled else "report only"
         print(f"dry-run: no LLM calls made, no output written ({side_channels})",
               file=sys.stderr)
@@ -728,7 +933,7 @@ class Orchestrator:
         cfg = self.cfg
         return any(view.quality != cfg.quality or view.rubric != cfg.rubric
                    or view.annotate != cfg.annotate or view.generate != cfg.generate
-                   or view.verify != cfg.verify
+                   or view.verify != cfg.verify or view.extract != cfg.extract
                    for view in cfg.class_views.values())
 
     def _estimate(self) -> dict:
@@ -737,11 +942,21 @@ class Orchestrator:
         estimates assume no drops (upper bound) and exclude retries/repairs.
         v1.7 R11: classify_calls = ingested × max(1, sc) in process mode
         (re-flow sub-batches inherit their classification and skip M13),
-        <generated records> × max(1, sc) in generate_only."""
+        <generated records> × max(1, sc) in generate_only.
+        v1.8 S22 (stream mode): the session table comes from
+        ``plan.session_lens``; ``segment_calls = Σ ceil((L−1)/(window−1))``
+        over sessions of length L ≥ 2 (L = 1 or strategy="rules" counts 0);
+        ``extract_calls = Σ (L−1)`` (extract enabled; UPPER bound); the
+        classify/quality/annotate/verify record base is ``len(session_lens)``
+        (episodes ≈ sessions, LOWER bound — stderr note in _run_dry); the batch
+        count comes EXACTLY from a next-fit packing simulation of the session
+        sizes, and the pairwise-quality per-batch pool sizes are the packed
+        sessions per batch. The non-stream branch is unchanged."""
         cfg = self.cfg
         g = cfg.generate
         if cfg.run.mode == "generate_only":
             n_ingested = 0
+            plan = None
             if g.seed_examples:
                 gen_calls = _ceil_div(len(g.seed_examples) * g.num_per_record, g.num_per_call)
             else:
@@ -769,10 +984,35 @@ class Orchestrator:
         if total_records % bs:
             sizes.append(total_records % bs)
 
+        # v1.8 stream mode (segment × generate_only is M1-forbidden, so plan
+        # is always the process-mode scan here): sessions → exact batches,
+        # episodes ≈ sessions as the downstream record base.
+        segment_calls = 0
+        extract_calls = 0
+        stream = cfg.segment.enabled and cfg.run.mode == "process"
+        if stream:
+            session_lens = tuple(getattr(plan, "session_lens", ()) or ())
+            frame_sizes, piece_sizes = _pack_next_fit(session_lens, bs)
+            n_batches = len(frame_sizes)
+            sizes = piece_sizes                    # pairwise pools are episodes
+            downstream_base = len(session_lens)
+            if cfg.segment.strategy in ("llm", "hybrid"):
+                w = cfg.segment.window
+                segment_calls = sum(_ceil_div(length - 1, w - 1)
+                                    for length in session_lens if length >= 2)
+            if cfg.extract.enabled:
+                extract_calls = sum(length - 1 for length in session_lens)
+        else:
+            n_batches = len(sizes)
+            downstream_base = total_records
+
         classify_calls = 0
         if cfg.classify.enabled:
             sc_c = cfg.classify.self_consistency
-            base = gen_records if cfg.run.mode == "generate_only" else n_ingested
+            if cfg.run.mode == "generate_only":
+                base = gen_records
+            else:
+                base = downstream_base if stream else n_ingested
             classify_calls = base * max(1, sc_c)
 
         quality_calls = 0
@@ -785,26 +1025,29 @@ class Orchestrator:
                 quality_calls = (sum(cfg.quality.rounds * (b // 2) for b in sizes)
                                  * per_call * judges * orders)
             else:
-                quality_calls = total_records * n_criteria
+                quality_calls = downstream_base * n_criteria
 
         annotate_calls = 0
         if cfg.annotate.enabled:
             sc = cfg.annotate.self_consistency
-            annotate_calls = total_records * (sc if sc >= 3 else 1)
+            annotate_calls = downstream_base * (sc if sc >= 3 else 1)
 
         verify_calls = 0
         if cfg.verify.enabled:
-            verify_calls = total_records * max(1, len(cfg.verify.judges))
+            verify_calls = downstream_base * max(1, len(cfg.verify.judges))
 
         return {
             "records": total_records,
-            "batches": len(sizes),
+            "batches": n_batches,
             "generate_calls": gen_calls,
+            "segment_calls": segment_calls,
             "classify_calls": classify_calls,
+            "extract_calls": extract_calls,
             "quality_calls": quality_calls,
             "annotate_calls": annotate_calls,
             "verify_calls": verify_calls,
-            "total_calls": (gen_calls + classify_calls + quality_calls
+            "total_calls": (gen_calls + segment_calls + classify_calls
+                            + extract_calls + quality_calls
                             + annotate_calls + verify_calls),
         }
 

@@ -14,6 +14,7 @@ from labelkit.config.model import (
     ClassifyConfig,
     Criterion,
     DedupConfig,
+    ExtractConfig,
     GenerateConfig,
     InputConfig,
     OutputConfig,
@@ -21,6 +22,8 @@ from labelkit.config.model import (
     ResolvedConfig,
     Rubric,
     RunConfig,
+    SegmentConfig,
+    StreamConfig,
     ToolConfig,
     TraceConfig,
     VerifyConfig,
@@ -49,7 +52,10 @@ def make_cfg(tmp_path, *, tool: ToolConfig | None = None,
         run=RunConfig(output=str(tmp_path / "out.jsonl"), modality="text",
                       input=str(tmp_path), fatal_error_threshold=3),
         input=input_cfg or InputConfig(),
+        stream=StreamConfig(),
         dedup=DedupConfig(),
+        segment=SegmentConfig(),
+        extract=ExtractConfig(),
         classify=ClassifyConfig(),
         quality=QualityConfig(),
         generate=GenerateConfig(),
@@ -360,6 +366,119 @@ def test_classify_decision_is_trace_only_no_stderr_mirror(tmp_path, capsys):
     assert capsys.readouterr().err == ""        # no mirror line at any level
     lines = (tmp_path / "t.trace.jsonl").read_text(encoding="utf-8").splitlines()
     assert [json.loads(l)["ev"] for l in lines] == ["classify.decision"]
+
+
+# ── v1.8 stream events + _DATA_KEYS redaction (S27; spec 7.2/7.4) ──────────
+
+EXTRACT_STEP_PAYLOAD = {
+    "episode_id": "e" * 16,
+    "index": 3,
+    "action_type": "input_text",
+    "description": "在搜索框键入关键词",       # LLM-produced text (refs 起)
+    "target": "搜索框",                        # input-data-derived (excerpt 起)
+    "value": "明天上午去医院",                 # input-data-derived (excerpt 起)
+}
+
+VERDICT_DEFECTS_PAYLOAD = {
+    "verdict": "fail",
+    "round": 1,
+    "critiques": [{"aspect": "boundary", "opinion": "缺少末帧"}],
+    "defects": [{"kind": "missing_tail", "members": None, "position": "tail",
+                 "detail": "末尾缺一帧收尾"}],
+}
+
+
+def test_v18_event_constants_exact_strings():
+    """§7.11: module-level event-name constants, exact strings."""
+    assert obslog.EV_INGEST_DISORDER == "ingest.disorder"
+    assert obslog.EV_SEGMENT_SESSION == "segment.session"
+    assert obslog.EV_SEGMENT_BOUNDARY == "segment.boundary"
+    assert obslog.EV_EXTRACT_STEP == "extract.step"
+
+
+def test_data_keys_redaction_matrix():
+    """S27 (§8.3): target/value are INPUT-DATA-DERIVED — stripped at BOTH none
+    and refs (the refs tier's "no input data content" red line), carried from
+    excerpt; description is LLM free text — stripped at none only; the
+    verify.verdict defects table is dropped whole-key at none (critiques level)
+    and carried from refs."""
+    none_out = redact_payload(EXTRACT_STEP_PAYLOAD, "none")
+    assert set(none_out) == {"episode_id", "index", "action_type"}
+    refs_out = redact_payload(EXTRACT_STEP_PAYLOAD, "refs")
+    assert set(refs_out) == {"episode_id", "index", "action_type", "description"}
+    assert refs_out["description"] == "在搜索框键入关键词"
+    assert redact_payload(EXTRACT_STEP_PAYLOAD, "excerpt") == EXTRACT_STEP_PAYLOAD
+    assert redact_payload(EXTRACT_STEP_PAYLOAD, "full") == EXTRACT_STEP_PAYLOAD
+
+    assert "defects" not in redact_payload(VERDICT_DEFECTS_PAYLOAD, "none")
+    assert "critiques" not in redact_payload(VERDICT_DEFECTS_PAYLOAD, "none")
+    refs_verdict = redact_payload(VERDICT_DEFECTS_PAYLOAD, "refs")
+    assert refs_verdict["defects"] == VERDICT_DEFECTS_PAYLOAD["defects"]
+
+
+def test_ingest_disorder_has_no_stderr_mirror(tmp_path, capsys):
+    """§8.1 v1.8 (D1): ingest.disorder is trace-only — it fires once PER
+    RECORD and its reason embeds timestamp/cursor values, so a per-event
+    stderr mirror would both break the "one WARN per run" contract and leak
+    input-derived values. M2 itself logs the single data-free WARN per run."""
+    cfg = make_cfg(tmp_path, tool=ToolConfig(log_format="jsonl"))
+    setup_logging(cfg)
+    sink = MetricsSink(cfg, "abc", EventLog(cfg.trace, "abc"))
+    sink.event(obslog.EV_INGEST_DISORDER, stage="ingest", batch_no=0,
+               payload={"file": "a.jsonl", "line_no": 10,
+                        "reason": "乱序：时间戳 90.0 小于分区游标 100.0"})
+    assert capsys.readouterr().err == ""
+
+
+def test_segment_and_extract_channel_routing(tmp_path):
+    """S1: channel = event-name prefix — segment.*/extract.* pass the filter
+    only when their channel is subscribed (both absent from the default set);
+    segment.session is EMITTED by M2 (stage="ingest") yet prefix-routes to the
+    segment channel."""
+    # default channels (quality/verify/schema): all three filtered out
+    log, path = open_log(tmp_path)
+    log.emit(ev(obslog.EV_SEGMENT_SESSION, stage="ingest", batch_no=0,
+                payload={"session_id": "s0", "first": "a.jsonl:1",
+                         "last": "a.jsonl:9", "len": 9, "cause": "gap"}))
+    log.emit(ev(obslog.EV_SEGMENT_BOUNDARY, stage="segment",
+                payload={"session_id": "s0", "window": [0, 7]}))
+    log.emit(ev(obslog.EV_EXTRACT_STEP, stage="extract", record_ids=("a", "b"),
+                payload={"episode_id": "e", "index": 0, "action_type": "click"}))
+    log.close()
+    assert not path.exists()                    # nothing ever written
+    assert log.dropped_events == 0              # filtered ≠ dropped
+
+    # subscribed: all three routed through their channels
+    log2, path2 = open_log(tmp_path, channels=("segment", "extract"))
+    log2.emit(ev(obslog.EV_SEGMENT_SESSION, stage="ingest", batch_no=0,
+                 payload={"session_id": "s0", "cause": "eof"}))
+    log2.emit(ev(obslog.EV_SEGMENT_BOUNDARY, stage="segment",
+                 payload={"session_id": "s0", "window": [0, 7]}))
+    log2.emit(ev(obslog.EV_EXTRACT_STEP, stage="extract", record_ids=("a", "b"),
+                 payload={"episode_id": "e", "index": 0, "action_type": "click"}))
+    log2.emit(ev("quality.gate", record_ids=("a",),
+                 payload={"decision": "keep"}))          # filtered this time
+    log2.close()
+    events = [json.loads(l)["ev"] for l in path2.read_text().splitlines()]
+    assert events == ["segment.session", "segment.boundary", "extract.step"]
+
+
+def test_segment_and_extract_stage_errors_route_by_stage(tmp_path):
+    """S1: error events keep routing by their producing stage — segment/extract
+    stage errors reach their channels with zero routing changes."""
+    log, path = open_log(tmp_path, channels=("segment", "extract"))
+    log.emit(ev(EV_ERROR, stage="segment",
+                payload={"stage": "segment", "kind": "segmentation_invalid",
+                         "message": "m", "retryable": False}))
+    log.emit(ev(EV_ERROR, stage="extract",
+                payload={"stage": "extract", "kind": "extraction_invalid",
+                         "message": "m", "retryable": False}))
+    log.emit(ev(EV_ERROR, stage="quality",
+                payload={"stage": "quality", "kind": "judgment_invalid",
+                         "message": "m", "retryable": False}))    # filtered
+    log.close()
+    lines = [json.loads(l) for l in path.read_text().splitlines()]
+    assert [l["stage"] for l in lines] == ["segment", "extract"]
 
 
 # ── write-failure policy ───────────────────────────────────────────────────

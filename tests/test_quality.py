@@ -10,12 +10,20 @@ rng-consumption determinism, per-pool top_ratio quotas, mixed per-pool modes, th
 pool rule, pool-dimensioned tie-counter keys, "pool" payload fields on the four quality
 events, pool-level failure isolation (R15), and the classify-disabled single-pool
 zero-change regression anchor.
+
+v1.8 sequence scoring (spec 3.4.3 sequence row, CONTRACTS §10.2/§10.3): pure-text episode
+rendering (no image parts), the frozen step-line format with the （摘取兜底） fallback
+suffix listed separately from LLM-confirmed "other" (S16), bounded member-digest lines
+(first/last always kept, in-place middle truncation marker), transitions threading through
+the pairwise/pointwise judging calls, the _excerpt_payload sequence branch, and the
+single-record default-kwarg regression anchor.
 """
 from __future__ import annotations
 
 import math
 import random
 from dataclasses import replace
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -27,6 +35,7 @@ from labelkit.config.model import (
     ClassView,
     Criterion,
     DedupConfig,
+    ExtractConfig,
     GenerateConfig,
     InputConfig,
     OutputConfig,
@@ -34,6 +43,8 @@ from labelkit.config.model import (
     ResolvedConfig,
     Rubric,
     RunConfig,
+    SegmentConfig,
+    StreamConfig,
     ToolConfig,
     TraceConfig,
     VerifyConfig,
@@ -47,16 +58,29 @@ from labelkit.quality import (
     _classify_call_error,
     _criterion_percentiles,
     _fit_bradley_terry_details,
+    _member_digest_lines,
     _pairing_plan,
     _percentile_scores,
     _pointwise_label,
+    _record_parts,
     _top_ratio_selection,
     _violation_summary,
     _weighted_aggregate,
     fit_bradley_terry,
 )
 from labelkit.stage import RunContext
-from labelkit.types import Classification, PipelineItem, QualityScore, Record, RecordRef
+from labelkit.types import (
+    Classification,
+    ImageRef,
+    PipelineItem,
+    QualityScore,
+    Record,
+    RecordRef,
+    Transition,
+    UINode,
+    UITree,
+    frame_digest,
+)
 
 
 # ── helpers ───────────────────────────────────────────────────────────────────
@@ -84,7 +108,10 @@ def make_cfg(quality: QualityConfig, criteria: tuple[Criterion, ...] = (EDU,),
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="text"),
         input=InputConfig(),
+        stream=StreamConfig(),
         dedup=DedupConfig(),
+        segment=SegmentConfig(),
+        extract=ExtractConfig(),
         classify=ClassifyConfig(),
         quality=quality,
         generate=GenerateConfig(),
@@ -627,7 +654,7 @@ def make_pooled_cfg(views: dict[str, QualityConfig],
         label: ClassView(name=label, quality=q,
                          rubric=(rubrics or {}).get(label, base.rubric),
                          annotate=base.annotate, generate=base.generate,
-                         verify=base.verify)
+                         verify=base.verify, extract=ExtractConfig())
         for label, q in views.items()}
     classify = ClassifyConfig(
         enabled=True, fallback_class=sorted(views)[0], max_labels=len(views),
@@ -857,3 +884,208 @@ async def test_classify_enabled_unclassified_items_form_anonymous_pool():
     assert set(rec.counters) == {"quality.tie_outcomes.educational_value",
                                  "quality.tie_comparisons.educational_value"}
     assert all(it.scores[AGGREGATE_KEY].score is not None for it in batch)
+
+
+# ── v1.8 sequence scoring (spec 3.4.3 sequence row, CONTRACTS §10.2/§10.3) ────
+
+def make_ui_frame(rec_id: str, title: str) -> Record:
+    nodes = (
+        UINode("1", None, 0, "FrameLayout", "", "", (0, 0, 1080, 1920), True,
+               {"package": "com.demo.app"}),
+        UINode("2", "1", 1, "TextView", title, "", (0, 0, 1080, 200), True, {}),
+        UINode("3", "1", 1, "Button", "下一步", "", (72, 952, 1008, 1096), True, {}),
+    )
+    return Record(id=rec_id, modality="ui", text=None, raw=None, ui_tree=UITree(nodes),
+                  image=ImageRef(path=Path(f"{rec_id}.png"), format="png", size_bytes=1),
+                  ref=RecordRef("frames/x.jsonl", None, 1, ()))
+
+
+def make_text_frame(rec_id: str, text: str) -> Record:
+    return Record(id=rec_id, modality="text", text=text, raw={"text": text},
+                  ui_tree=None, image=None,
+                  ref=RecordRef("frames.jsonl", 1, None, ()))
+
+
+def make_episode(members: tuple[Record, ...], ep_id: str = "ep0001") -> Record:
+    first = members[0]
+    return Record(id=ep_id, modality=first.modality, text=None, raw=None, ui_tree=None,
+                  image=None, ref=first.ref, kind="sequence", members=members)
+
+
+def make_ui_episode(n: int = 5, ep_id: str = "ep0001", title: str = "屏幕") -> Record:
+    return make_episode(tuple(make_ui_frame(f"{ep_id}f{i}", f"{title}{i}")
+                              for i in range(n)), ep_id)
+
+
+SEQ_TRANSITIONS = (
+    Transition(index=0, action={"action_type": "click", "target": "下一步", "value": None,
+                                "description": "点击下一步按钮"},
+               model="m", attempts=1, detail={}),
+    Transition(index=1, action={"action_type": "input_text", "target": "搜索框",
+                                "value": "咖啡", "description": "输入搜索词"},
+               model="m", attempts=1, detail={}),
+    Transition(index=2, action={"action_type": "other", "target": None, "value": None,
+                                "description": "两帧间变化无法归因"},
+               model="m", attempts=2,
+               detail={"kind": "extraction_invalid", "message": "repair exhausted"}),
+    Transition(index=3, action={"action_type": "other", "target": None, "value": None,
+                                "description": "用户在等待加载"},
+               model="m", attempts=1, detail={}),
+)
+
+STEP_LINES = (
+    "0. click（对象: 下一步；值: —）点击下一步按钮",
+    "1. input_text（对象: 搜索框；值: 咖啡）输入搜索词",
+    "2. other（对象: —；值: —）两帧间变化无法归因（摘取兜底）",
+    "3. other（对象: —；值: —）用户在等待加载",
+)
+
+
+class CapturingStubEngine(StubEngine):
+    """StubEngine that additionally records every PromptBundle it receives."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.prompts = []
+
+    async def complete_validated(self, profile, prompt, schema=None, *,
+                                 record_ids=(), batch_no=0):
+        self.prompts.append(prompt)
+        return await super().complete_validated(profile, prompt, schema,
+                                                record_ids=record_ids, batch_no=batch_no)
+
+
+def test_sequence_record_parts_pure_text_sections_and_step_lines():
+    # §10.2 sequence sections in ONE text part, no image even in UI modality (S30);
+    # step lines in the frozen §10.1 format; the fallback step (detail.kind ==
+    # "extraction_invalid") carries the （摘取兜底） suffix while the LLM-confirmed
+    # "other" does not (S16 separate listing).
+    ep = make_ui_episode(5)
+    parts = _record_parts(ep, "记录 A", 30000, SEQ_TRANSITIONS)
+    assert [p.kind for p in parts] == ["text"]
+    lines = parts[0].text.split("\n")
+    assert lines[0] == "[记录 A·操作序列]"
+    assert lines[1] == "[步骤序列]"
+    assert tuple(lines[2:6]) == STEP_LINES
+    assert lines[6] == "[成员帧摘要]"
+    assert lines[7:] == [f"{m}. {frame_digest(member, 400)}"
+                         for m, member in enumerate(ep.members, start=1)]
+
+
+def test_sequence_record_parts_omit_steps_when_transitions_none():
+    ep = make_ui_episode(3)
+    parts = _record_parts(ep, "记录 B", 30000)
+    assert [p.kind for p in parts] == ["text"]
+    lines = parts[0].text.split("\n")
+    assert lines[0] == "[记录 B·操作序列]"
+    assert lines[1] == "[成员帧摘要]"          # [步骤序列] omitted ENTIRELY
+    assert "[步骤序列]" not in parts[0].text
+
+
+def test_member_digest_lines_bounded_with_middle_truncation():
+    members = tuple(make_text_frame(f"f{i}", f"帧{i:02d}" + "内" * 60)
+                    for i in range(10))
+    full = _member_digest_lines(members, 100000)
+    assert len(full) == 10
+    assert full[0] == f"1. {members[0].text}"
+    assert full[-1] == f"10. {members[9].text}"
+
+    bounded = _member_digest_lines(members, 300)
+    assert len("\n".join(bounded)) <= 300
+    assert bounded[0] == full[0]               # first ALWAYS kept
+    assert bounded[-1] == full[-1]             # last ALWAYS kept
+    dropped = 10 - (len(bounded) - 2) - 1
+    assert dropped >= 1
+    assert bounded[-2] == f"…(truncated {dropped} members)"  # in-place middle marker
+    assert bounded[:-2] == full[:len(bounded) - 2]           # kept prefix untruncated
+
+
+async def test_pairwise_sequence_prompt_pure_text_and_transitions_threaded():
+    # Stage-level: both envelopes' item.transitions reach the pairwise prompt (their
+    # step lines appear under the respective [记录 X] slots) and the user message is
+    # pure text — no image part despite UI modality.
+    cfg = make_cfg(QualityConfig(mode="pairwise", rounds=1))
+    other = (Transition(index=0, action={"action_type": "open_app", "target": None,
+                                         "value": "打车", "description": "打开打车应用"},
+                        model="m", attempts=1, detail={}),)
+    batch = [PipelineItem(record=make_ui_episode(5, "ep0001"),
+                          transitions=SEQ_TRANSITIONS),
+             PipelineItem(record=make_ui_episode(3, "ep0002", "行程"),
+                          transitions=other)]
+    engine = CapturingStubEngine()
+    await QualityStage(cfg).run(batch, make_ctx(cfg, engine=engine))
+    (prompt,) = engine.prompts
+    user = prompt.messages[1]
+    assert all(p.kind == "text" for p in user.parts)
+    joined = "\n".join(p.text for p in user.parts)
+    assert "[记录 A·操作序列]" in joined and "[记录 B·操作序列]" in joined
+    for line in STEP_LINES:
+        assert line in joined
+    assert "0. open_app（对象: —；值: 打车）打开打车应用" in joined
+    assert all(it.scores[AGGREGATE_KEY].score is not None for it in batch)
+
+
+def test_text_modality_sequence_skips_text_fast_path():
+    # A text-modality episode must NOT take the "[记录 A] {record.text}" fast path
+    # (record.text is None for sequences).
+    ep_a = make_episode(tuple(make_text_frame(f"a{i}", f"甲步骤{i}") for i in range(3)),
+                        "ep000a")
+    ep_b = make_episode(tuple(make_text_frame(f"b{i}", f"乙步骤{i}") for i in range(2)),
+                        "ep000b")
+    bundle = _build_pairwise_prompt(ep_a, ep_b, (EDU,), with_reason=False,
+                                    ui_tree_max_chars=30000,
+                                    transitions_a=SEQ_TRANSITIONS, transitions_b=None)
+    user = bundle.messages[1]
+    assert [p.kind for p in user.parts] == ["text", "text"]
+    assert user.parts[0].text.startswith("[记录 A·操作序列]\n[步骤序列]\n")
+    assert user.parts[1].text.startswith("[记录 B·操作序列]\n[成员帧摘要]\n")
+    assert "None" not in user.parts[0].text and "None" not in user.parts[1].text
+
+
+async def test_pointwise_sequence_prompt_transitions_threaded():
+    cfg = make_cfg(QualityConfig(mode="pointwise"))
+    item = PipelineItem(record=make_ui_episode(4), transitions=SEQ_TRANSITIONS)
+    engine = CapturingStubEngine(pointwise_scores={"ep0001": 4})
+    await QualityStage(cfg).run([item], make_ctx(cfg, engine=engine))
+    (prompt,) = engine.prompts
+    user = prompt.messages[1]
+    assert [p.kind for p in user.parts] == ["text"]
+    lines = user.parts[0].text.split("\n")
+    assert lines[0] == "[记录内容·操作序列]"
+    assert lines[1] == "[步骤序列]"
+    assert tuple(lines[2:6]) == STEP_LINES
+    assert lines[6] == "[成员帧摘要]"
+    assert item.scores[AGGREGATE_KEY].score == pytest.approx(0.8)
+
+
+def test_excerpt_payload_sequence_branch_first_member_digest():
+    trace = TraceConfig(enabled=True, channels=("quality",), content="excerpt")
+    stage = QualityStage(make_cfg(QualityConfig(), trace=trace))
+    long_first = make_text_frame("f0", "长" * 500)
+    ep = make_episode((long_first, make_text_frame("f1", "短")), "ep0001")
+    payload = stage._excerpt_payload((ep,))
+    assert payload == {"ep0001": frame_digest(long_first, 400)[:200]}
+    assert len(payload["ep0001"]) == 200
+
+    ui_ep = make_ui_episode(2, "ep0002")
+    assert stage._excerpt_payload((ui_ep,)) == {
+        "ep0002": frame_digest(ui_ep.members[0], 400)[:200]}
+
+
+def test_single_record_paths_unchanged_by_default_kwargs():
+    # Regression anchor: the trailing transitions kwargs default to None and leave the
+    # single-record prompts byte-identical; a single record IGNORES passed transitions.
+    rec_a, rec_b = make_record("a1", "文本甲"), make_record("b1", "文本乙")
+    assert _build_pairwise_prompt(rec_a, rec_b, (EDU,), True, 30000) == (
+        _build_pairwise_prompt(rec_a, rec_b, (EDU,), True, 30000,
+                               transitions_a=None, transitions_b=None))
+    assert _build_pointwise_prompt(rec_a, EDU, 30000) == (
+        _build_pointwise_prompt(rec_a, EDU, 30000, transitions=None))
+    with_steps = _build_pointwise_prompt(rec_a, EDU, 30000, transitions=SEQ_TRANSITIONS)
+    assert with_steps == _build_pointwise_prompt(rec_a, EDU, 30000)
+    assert "[步骤序列]" not in with_steps.messages[1].parts[0].text
+
+    ui_single = make_ui_frame("u1", "登录页")
+    parts = _record_parts(ui_single, "记录 A", 30000, transitions=None)
+    assert [p.kind for p in parts] == ["text", "image", "text"]
+    assert parts[1].image is ui_single.image

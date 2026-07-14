@@ -33,8 +33,12 @@ EV_BATCH_END = "batch.end"
 EV_INGEST_BAD_LINE = "ingest.bad_line"
 EV_INGEST_MISSING_PAIR = "ingest.missing_pair"
 EV_INGEST_INDEX_CONFLICT = "ingest.index_conflict"
+EV_INGEST_DISORDER = "ingest.disorder"       # v1.8 M2 stream monotonicity (spec 7.2)
+EV_SEGMENT_SESSION = "segment.session"       # v1.8 M2 session close (spec 7.2); trace-only
+EV_SEGMENT_BOUNDARY = "segment.boundary"     # v1.8 M14 window verdict (spec 7.2); trace-only
 EV_DEDUP_DUPLICATE = "dedup.duplicate"
 EV_CLASSIFY_DECISION = "classify.decision"   # v1.7 M13 (spec 7.2); trace-only, R29
+EV_EXTRACT_STEP = "extract.step"             # v1.8 M15 (spec 7.2); trace-only, S27
 EV_QUALITY_JUDGMENT = "quality.judgment"
 EV_QUALITY_POINTWISE = "quality.pointwise"
 EV_QUALITY_BT_FIT = "quality.bt_fit"
@@ -68,8 +72,16 @@ class TraceEvent:
 
 # ── Redaction (§8.3) ───────────────────────────────────────────────────────
 
-# LLM-produced free text, dropped at tier "none".
-_FREE_TEXT_KEYS = frozenset({"reason", "critiques", "violations"})
+# LLM-produced free text, dropped at tier "none". v1.8 (S27, §8.3):
+# + "description" (extract.step LLM text, same tier as reason/critiques) and
+# + "defects" (the verify.verdict stream defect table carries LLM free text in
+#   `detail` — dropped whole-key at "none", critiques level).
+_FREE_TEXT_KEYS = frozenset({"reason", "critiques", "violations",
+                             "description", "defects"})
+# v1.8 (S27, §8.3): INPUT-DATA-DERIVED payload fields (extract.step's widget
+# text reference / typed-in text) — stripped at BOTH "none" and "refs" (the
+# refs tier's "no input data content" red line), carried from "excerpt".
+_DATA_KEYS = frozenset({"target", "value"})
 # Full prompt/response messages, present only at tier "full".
 _MESSAGE_KEYS = frozenset({"gen_ai.input.messages", "gen_ai.output.messages"})
 _EXCERPT_MAX_CHARS = 200
@@ -87,12 +99,14 @@ def _strip(value, drop: frozenset[str] | set[str]):
 def redact_payload(payload: Mapping, content: str) -> Mapping:
     """Apply the trace.content tier (§8.3) to an event payload.
 
-    - "none":    ids/enums/numbers only — reason/critiques/violations dropped,
-                 no excerpt, no gen_ai messages.
-    - "refs":    + LLM-produced text (reason/critiques/violations); still no
-                 input data content (no excerpt, no gen_ai messages).
+    - "none":    ids/enums/numbers only — reason/critiques/violations/
+                 description/defects dropped, no excerpt, no target/value,
+                 no gen_ai messages.
+    - "refs":    + LLM-produced text (reason/critiques/violations/description/
+                 defects); still no input data content (no excerpt, no
+                 target/value — _DATA_KEYS, v1.8 S27 —, no gen_ai messages).
     - "excerpt": + ``excerpt`` field, each value truncated to its first
-                 200 characters.
+                 200 characters; + the _DATA_KEYS fields (target/value).
     - "full":    + gen_ai.input.messages / gen_ai.output.messages verbatim.
                  Tiers are cumulative — "full" keeps the (truncated) excerpt too.
     """
@@ -101,6 +115,9 @@ def redact_payload(payload: Mapping, content: str) -> Mapping:
         drop |= _MESSAGE_KEYS
     if content in ("none", "refs"):
         drop.add("excerpt")
+        # v1.8 (S27, §8.3): input-data-derived fields never leak below the
+        # excerpt tier — the refs tier carries LLM text but NO input content.
+        drop |= _DATA_KEYS
     if content == "none":
         drop |= _FREE_TEXT_KEYS
     out = _strip(payload, drop)
@@ -253,6 +270,14 @@ _STDERR_LEVELS: dict[str, int] = {
     EV_INGEST_MISSING_PAIR: logging.WARNING,
     # EV_INGEST_INDEX_CONFLICT: warn, but error when input.on_index_conflict="fail"
     # (spec 7.2 / CONTRACTS §8.1) — resolved dynamically in _mirror().
+    # v1.8 ingest.disorder is trace-only here (D1): its reason embeds
+    # timestamp/cursor values and fires once PER RECORD — mirroring would both
+    # break the "one stderr WARN per run" contract and flood stderr with
+    # input-derived values under a systematically bad timestamp field. M2
+    # itself logs the single data-free WARN per run (spec 7.2); the fail
+    # policy surfaces through InputError (exit 3). The three segment/extract
+    # events (segment.session / segment.boundary / extract.step) are likewise
+    # trace-only ("—", §8.1) and stay out of this table.
     EV_LLM_CALL: logging.DEBUG,
     # v1.6 key-pool events (spec 7.2): key_cooldown is trace-only ("—"),
     # key_disabled / pool_parked mirror at warn.

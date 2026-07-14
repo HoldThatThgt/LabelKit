@@ -22,7 +22,14 @@ from labelkit.errors import (
     ProviderRetryableError,
     SchemaViolation,
 )
-from labelkit.types import Classification, PipelineItem, Record, StageError, Usage
+from labelkit.types import (
+    Classification,
+    PipelineItem,
+    Record,
+    StageError,
+    Usage,
+    frame_digest,
+)
 
 from labelkit.llm_client import Message, Part, PromptBundle
 from labelkit.schema_engine import classification_schema
@@ -55,11 +62,50 @@ _LABEL_EXAMPLE_TMPL = "[类别示例·{name}] {example}"
 _LABEL_RECORD = "[待分类数据]"
 _LABEL_SCREENSHOT = "[屏幕截图]"
 _LABEL_UI_TREE = "[UI 控件树]"
+# v1.8 sequence variant labels + truncation marker (CONTRACTS §10.8 [FROZEN HERE]).
+_LABEL_RECORD_SEQ = "[待分类数据·序列]"
+_LABEL_FIRST_FRAME = "[首帧截图]"
+_SEQ_TRUNCATION_MARKER = "…(truncated {n} members)"
 
 
 def _reason_requested(cfg: "ResolvedConfig") -> bool:
     """R29: reason is requested iff trace.enabled and "classify" ∈ trace.channels."""
     return cfg.trace.enabled and "classify" in cfg.trace.channels
+
+
+def _sequence_digest_block(record: Record, cfg: "ResolvedConfig") -> str:
+    """Episode digest body of the §10.8 sequence variant (spec 3.13.3 sequence row).
+
+    One line per member in member order — "{m}. {frame_digest(member,
+    segment.digest_max_chars)}" with a 1-based ordinal — TOTAL capped at
+    input.ui_tree_max_chars. Over the cap, whole MIDDLE lines are dropped (first and
+    last members always kept, the surviving ordinals expose the gap) and the capped
+    output ends with the frozen marker line "…(truncated N members)" where N = number
+    of member lines omitted (UITree.serialize truncation convention)."""
+    max_chars = cfg.input.ui_tree_max_chars
+    lines = [f"{m}. {frame_digest(member, cfg.segment.digest_max_chars)}"
+             for m, member in enumerate(record.members, start=1)]
+    full = "\n".join(lines)
+    if len(full) <= max_chars:
+        return full
+
+    n = len(lines)
+    # prefix_len[k] = len("\n".join(lines[:k])) — serialize's prefix-sum scheme.
+    prefix_len = [0] * (n + 1)
+    for i, line in enumerate(lines):
+        prefix_len[i + 1] = prefix_len[i] + (1 if i else 0) + len(line)
+    last_len = len(lines[-1])
+    # Keep the first line, the longest possible prefix of middle lines, and the last
+    # line; at least one middle line must go (we are over the cap), so the kept middle
+    # count ranges over [0, n-3] and the marker always closes the block.
+    for keep_middle in range(n - 3, -1, -1):
+        marker = _SEQ_TRUNCATION_MARKER.format(n=n - 2 - keep_middle)
+        total = (prefix_len[1 + keep_middle] + 1 + last_len + 1 + len(marker))
+        if total <= max_chars:
+            return "\n".join(lines[: 1 + keep_middle] + [lines[-1], marker])
+    # Degenerate cap (not even first + last + marker fits, or n <= 2): serialize's
+    # final tier — the marker alone stands in for every member.
+    return _SEQ_TRUNCATION_MARKER.format(n=n)
 
 
 def build_classify_prompt(record: Record, cfg: "ResolvedConfig",
@@ -71,6 +117,12 @@ def build_classify_prompt(record: Record, cfg: "ResolvedConfig",
     without the reason fragment), one user message per configured class example
     (class declaration order, then array order), then the current-record user
     message — text part, or the §10.1-shaped three-part screenshot + tree form (R27).
+
+    v1.8 sequence records (record.kind == "sequence", spec 3.13.3 sequence row):
+    system and few-shot messages unchanged; the current-record message becomes the
+    §10.8 sequence variant — the [待分类数据·序列] episode digest block, plus (UI
+    modality only — classify stays in the vision reference set) the [首帧截图] label
+    and the first member's screenshot image part.
     """
     c = cfg.classify
     lines: list[str] = []
@@ -96,8 +148,21 @@ def build_classify_prompt(record: Record, cfg: "ResolvedConfig",
             text = _LABEL_EXAMPLE_TMPL.format(name=spec.name, example=example)
             messages.append(Message(role="user", parts=(Part(kind="text", text=text),)))
 
-    if record.modality == "text":
+    if record.kind == "sequence":
+        # v1.8 sequence variant (§10.8): digest text part first; UI modality appends
+        # the [首帧截图] label + the FIRST member's image (encoded by M9 at call time).
+        # Text-modality sequences carry the digest part only.
+        digest_block = _sequence_digest_block(record, cfg)
         parts: tuple[Part, ...] = (
+            Part(kind="text", text=f"{_LABEL_RECORD_SEQ}\n{digest_block}"),
+        )
+        if record.modality == "ui":
+            parts += (
+                Part(kind="text", text=_LABEL_FIRST_FRAME),
+                Part(kind="image", image=record.members[0].image),
+            )
+    elif record.modality == "text":
+        parts = (
             Part(kind="text", text=f"{_LABEL_RECORD} {record.text}"),
         )
     else:  # UI modality: three parts in one user message (same shape as §10.1, R27)
@@ -309,17 +374,28 @@ class ClassifyStage:
     def _fan_out(batch: list[PipelineItem], processed: list[PipelineItem]) -> None:
         """Normalized hit set of k ≥ 2: the original envelope already carries the
         first label; each remaining label clones one sibling appended to the batch
-        tail. Clones share record and dedup BY REFERENCE; classification swaps
-        label (labels = same full set); scores/annotation/verification/errors are
-        fresh default containers (spec 3.13.4)."""
+        tail. Clones share record and dedup BY REFERENCE and inherit session_id
+        (v1.8: sibling episodes stay addressable for the M7 boundary-margin /
+        neighborhood queries, spec 3.13.4); classification swaps label (labels =
+        same full set); scores/annotation/verification/errors are fresh default
+        containers (spec 3.13.4)."""
         for item in processed:
             classification = item.classification
             if classification is None or len(classification.labels) < 2:
                 continue
             for label in classification.labels[1:]:
-                batch.append(PipelineItem(
+                clone = PipelineItem(
                     record=item.record,
                     status="active",
                     classification=replace(classification, label=label),
                     dedup=item.dedup,
-                ))
+                    session_id=item.session_id,
+                )
+                # v1.8 (D6): session_split / segment_degraded describe the
+                # EPISODE's session and segmentation, not the envelope —
+                # sibling rows must not contradict the original's _meta.stream.
+                for mark in ("session_split", "segment_degraded"):
+                    value = getattr(item, mark, None)
+                    if value is not None:
+                        setattr(clone, mark, value)
+                batch.append(clone)

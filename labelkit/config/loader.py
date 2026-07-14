@@ -40,6 +40,7 @@ from labelkit.config.model import (
     Criterion,
     DedupConfig,
     EmbeddingProfile,
+    ExtractConfig,
     FewShotExample,
     GenerateConfig,
     GenerateStyle,
@@ -50,6 +51,8 @@ from labelkit.config.model import (
     ResolvedConfig,
     Rubric,
     RunConfig,
+    SegmentConfig,
+    StreamConfig,
     ToolConfig,
     TraceConfig,
     VerifyConfig,
@@ -66,22 +69,32 @@ _KEY_RE = re.compile(r"[a-z0-9_]+")
 _RUBRIC_PKG_FILES: dict[str, str] = {
     "default:text": "default_text.toml",
     "default:ui": "default_ui.toml",
+    "default:trajectory": "default_trajectory.toml",   # v1.8 (S29)
 }
 
-_TRACE_CHANNELS = ("ingest", "dedup", "classify", "quality", "annotate", "verify",
-                   "schema", "llm")
+# v1.8: 10 values — "segment"/"extract" joined (S1: channel = stage name; the
+# event-name first segment routes automatically, classify precedent).
+_TRACE_CHANNELS = ("ingest", "dedup", "segment", "extract", "classify", "quality",
+                   "annotate", "verify", "schema", "llm")
+
+# rubric selectors accepted at both selector sites (global [quality].rubric and
+# per-class [class.<name>.quality].rubric): the packaged defaults + "inline".
+_RUBRIC_SELECTORS = ("default:text", "default:ui", "default:trajectory", "inline")
 
 # v1.7 [class.<name>.<section>] override whitelist (spec 5.2 / R25): sections and
 # keys OUTSIDE this table are CONFIG_ERRORs, not forward-compat warnings — the
 # [class.*] namespace is explicitly owned by M1. "rubric" is the per-class inline
-# rubric sub-table companion of quality.rubric = "inline" (R7).
+# rubric sub-table companion of quality.rubric = "inline" (R7). v1.8 adds
+# "extract" (instruction only, S2); segment stays OUT of the whitelist — it runs
+# before classify, so class labels do not exist yet (chain-order causality).
 _CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "quality": ("mode", "rounds", "rubric", "threshold", "selection", "top_ratio"),
     "annotate": ("instruction", "examples"),
     "generate": ("instruction", "styles", "num_per_record", "temperature"),
     "verify": ("extra_criteria",),
+    "extract": ("instruction",),
 }
-_CLASS_SECTIONS = ("quality", "rubric", "annotate", "generate", "verify")
+_CLASS_SECTIONS = ("quality", "rubric", "annotate", "generate", "verify", "extract")
 
 # The quality selection group (R6): the class providing ANY of these keys takes
 # over the whole group — the global side's values are dropped (back to built-in
@@ -590,6 +603,19 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
     )
     t.finish()
 
+    stream_section = _section(col, top, "stream")
+    t = _Tbl(col, file, "[stream]", stream_section)
+    stream = StreamConfig(
+        order_by=t.get_str("order_by", "input_order", nonempty=True) or "input_order",
+        on_disorder=t.get_str("on_disorder", "skip", enum=("skip", "fail")),
+        key=t.get_str_tuple("key", ()),
+        gap_s=t.get_int("gap_s", 300, minimum=0),
+        gap_steps=t.get_int("gap_steps", 0, minimum=0),
+        session_max_len=t.get_int("session_max_len", 200, minimum=1),
+        session_max_span_s=t.get_int("session_max_span_s", 0, minimum=0),
+    )
+    t.finish()
+
     t = _Tbl(col, file, "[dedup]", _section(col, top, "dedup"))
     dedup = DedupConfig(
         enabled=t.get_bool("enabled", True),
@@ -605,6 +631,51 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
         semantic_threshold=t.get_float("semantic_threshold", 0.95, gt=0, le=1),
     )
     t.finish()
+
+    segment_section = _section(col, top, "segment")
+    t = _Tbl(col, file, "[segment]", segment_section)
+    segment = SegmentConfig(
+        enabled=t.get_bool("enabled", False),
+        strategy=t.get_str("strategy", "hybrid", enum=("rules", "llm", "hybrid")),
+        llm=t.get_str("llm", "default", nonempty=True),
+        window=t.get_int("window", 20, minimum=1),   # >= 2 checked in load() (§3.6)
+        digest_max_chars=t.get_int("digest_max_chars", 400, minimum=1),
+        noise_filter=t.get_bool("noise_filter", True),
+        min_len=t.get_int("min_len", 2, minimum=1),
+        use_vision=t.get_bool("use_vision", False),
+        context=t.get_str("context", "") or "",
+        on_error=t.get_str("on_error", "keep", enum=("keep", "fail")),
+    )
+    t.finish()
+
+    extract_section = _section(col, top, "extract")
+    t = _Tbl(col, file, "[extract]", extract_section)
+    extract = ExtractConfig(
+        enabled=t.get_bool("enabled", False),
+        llm=t.get_str("llm", "default", nonempty=True),
+        instruction=t.get_str("instruction", "") or "",
+        include_diff=t.get_bool("include_diff", True),
+        on_error=t.get_str("on_error", "fallback", enum=("fallback", "fail")),
+    )
+    t.finish()
+
+    # v1.8 provided-ness probes (classify_provided pattern): section presence
+    # drives the no-op warnings, explicit keys drive intent-sensitive checks.
+    # "non_switch_keys" = the section carries parked payload beyond its own
+    # enabled switch (naming "[segment]" as ignored because of the switch that
+    # ignores it would be self-referential).
+    stream_provided = {
+        "section": stream_section is not None,
+        "gap_s": isinstance(stream_section, dict) and "gap_s" in stream_section,
+    }
+    segment_provided = {
+        "non_switch_keys": (isinstance(segment_section, dict)
+                            and any(k != "enabled" for k in segment_section)),
+    }
+    extract_provided = {
+        "non_switch_keys": (isinstance(extract_section, dict)
+                            and any(k != "enabled" for k in extract_section)),
+    }
 
     classify_section = _section(col, top, "classify")
     t = _Tbl(col, file, "[classify]", classify_section)
@@ -642,7 +713,7 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
         judges=t.get_str_tuple("judges", ()),
         both_orders=t.get_bool("both_orders", False),
         on_unscored=t.get_str("on_unscored", "keep", enum=("keep", "drop")),
-        rubric=t.get_str("rubric", "", enum=("default:text", "default:ui", "inline")) or "",
+        rubric=t.get_str("rubric", "", enum=_RUBRIC_SELECTORS) or "",
         judgment_reasons=_parse_judgment_reasons(col, t),
     )
     t.finish()
@@ -673,7 +744,8 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
     top_ratio_provided = isinstance(quality_section, dict) and "top_ratio" in quality_section
     t.finish()
 
-    t = _Tbl(col, file, "[annotate]", _section(col, top, "annotate"))
+    annotate_section = _section(col, top, "annotate")
+    t = _Tbl(col, file, "[annotate]", annotate_section)
     annotate = AnnotateConfig(
         enabled=t.get_bool("enabled", True),
         llm=t.get_str("llm", "default", nonempty=True),
@@ -681,7 +753,10 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
         examples=_parse_examples(col, file, t.take("examples")),
         self_consistency=t.get_int("self_consistency", 0, minimum=0),
         sc_temperature=t.get_float("sc_temperature", 0.7, ge=0),
+        sequence_frames=t.get_int("sequence_frames", 20, minimum=1),  # [2,100] in load()
     )
+    sequence_frames_provided = (isinstance(annotate_section, dict)
+                                and "sequence_frames" in annotate_section)
     t.finish()
 
     t = _Tbl(col, file, "[verify]", _section(col, top, "verify"))
@@ -730,8 +805,12 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
 
     top.finish()
     return dict(
-        run=run, input=input_cfg, dedup=dedup, classify=classify,
+        run=run, input=input_cfg, stream=stream, dedup=dedup,
+        segment=segment, extract=extract, classify=classify,
         classify_provided=classify_provided, class_raw=class_raw,
+        stream_provided=stream_provided, segment_provided=segment_provided,
+        extract_provided=extract_provided,
+        sequence_frames_provided=sequence_frames_provided,
         quality=quality, generate=generate,
         gen_provided=gen_provided, top_ratio_provided=top_ratio_provided,
         annotate=annotate, verify=verify, output=output,
@@ -951,11 +1030,14 @@ def _merge_class_sections(
         col: _Collector, file: str, cname: str, sections: dict,
         base_quality: QualityConfig, base_annotate: AnnotateConfig,
         base_generate: GenerateConfig, base_verify: VerifyConfig,
-) -> tuple[QualityConfig, AnnotateConfig, GenerateConfig, VerifyConfig, dict]:
+        base_extract: ExtractConfig,
+) -> tuple[QualityConfig, AnnotateConfig, GenerateConfig, VerifyConfig,
+           ExtractConfig, dict]:
     """Merge one class's [class.<name>.*] override sections onto the resolved
-    global configs (spec 5.2 v1.7). Per-key provenance: a key the class provides
-    overrides the global value, everything else is inherited. `base_quality`
-    carries the defaulted global rubric selector in its `rubric` field.
+    global configs (spec 5.2 v1.7; v1.8 adds the extract section, S2). Per-key
+    provenance: a key the class provides overrides the global value, everything
+    else is inherited. `base_quality` carries the defaulted global rubric
+    selector in its `rubric` field.
 
     - Whitelist (R25): sections outside _CLASS_SECTIONS and keys outside
       _CLASS_SECTION_KEYS are CONFIG_ERRORs — the [class.*] namespace is owned
@@ -969,7 +1051,7 @@ def _merge_class_sections(
     - The [class.<name>.rubric] table is NOT consumed here: rubric re-resolution
       (R7) needs the merged selector, so it is returned raw via `info`.
 
-    Returns (quality, annotate, generate, verify, info) with info =
+    Returns (quality, annotate, generate, verify, extract, info) with info =
     {"rubric_raw", "examples_provided"}."""
     for sect, sub in sections.items():
         if sect not in _CLASS_SECTIONS:
@@ -1001,8 +1083,7 @@ def _merge_class_sections(
         base_q,
         mode=t.get_str("mode", base_q.mode, enum=("pairwise", "pointwise")),
         rounds=t.get_int("rounds", base_q.rounds, minimum=1),
-        rubric=t.get_str("rubric", base_q.rubric,
-                         enum=("default:text", "default:ui", "inline")),
+        rubric=t.get_str("rubric", base_q.rubric, enum=_RUBRIC_SELECTORS),
         threshold=t.get_float("threshold", base_q.threshold, ge=0, le=1),
         selection=t.get_str("selection", base_q.selection,
                             enum=("threshold", "top_ratio")),
@@ -1058,25 +1139,35 @@ def _merge_class_sections(
         extra_criteria=t.get_str("extra_criteria", base_verify.extra_criteria),
     )
 
+    # ── extract (v1.8, S2: instruction is the whole whitelist) ────────────
+    e_over = _sect("extract")
+    t = _Tbl(col, file, f"[class.{cname}.extract]", e_over)
+    extract = replace(
+        base_extract,
+        instruction=t.get_str("instruction", base_extract.instruction),
+    )
+
     rubric_raw = sections.get("rubric")
     info = {
         "rubric_raw": rubric_raw if isinstance(rubric_raw, dict) else None,
         "examples_provided": examples_provided,
     }
-    return quality, annotate, generate, verify, info
+    return quality, annotate, generate, verify, extract, info
 
 
 # ── public API ─────────────────────────────────────────────────────────────
 
 
-def default_rubric(name: Literal["default:text", "default:ui"]) -> Rubric:
+def default_rubric(
+        name: Literal["default:text", "default:ui", "default:trajectory"]) -> Rubric:
     """Load a packaged default rubric from labelkit/data/rubrics/*.toml
     (importlib.resources)."""
     try:
         fname = _RUBRIC_PKG_FILES[name]
     except KeyError:
         raise ValueError(
-            f'unknown default rubric {name!r}; expected "default:text" or "default:ui"'
+            f'unknown default rubric {name!r}; expected "default:text", '
+            f'"default:ui" or "default:trajectory"'
         ) from None
     text = (resources.files("labelkit") / "data" / "rubrics" / fname).read_text(encoding="utf-8")
     data = tomllib.loads(text)
@@ -1136,10 +1227,17 @@ def load(config_path: Path, project_path: Path,
 
     run: dict[str, Any] = p["run"]
     input_cfg: InputConfig = p["input"]
+    stream: StreamConfig = p["stream"]
     dedup: DedupConfig = p["dedup"]
+    segment: SegmentConfig = p["segment"]
+    extract: ExtractConfig = p["extract"]
     classify: ClassifyConfig = p["classify"]
     classify_provided: dict[str, bool] = p["classify_provided"]
     class_raw: Any = p["class_raw"]
+    stream_provided: dict[str, bool] = p["stream_provided"]
+    segment_provided: dict[str, bool] = p["segment_provided"]
+    extract_provided: dict[str, bool] = p["extract_provided"]
+    sequence_frames_provided: bool = p["sequence_frames_provided"]
     quality: QualityConfig = p["quality"]
     generate: GenerateConfig = p["generate"]
     gen_provided: dict[str, bool] = p["gen_provided"]
@@ -1163,10 +1261,16 @@ def load(config_path: Path, project_path: Path,
             col.error(f"{loc}: 引用的 profile {_fmt(name)} 不存在于 config.toml [llm.*]，"
                       f"可用：{avail}")
 
+    if segment.enabled and segment.strategy in ("llm", "hybrid"):
+        # v1.8 S30: rules strategy makes zero LLM calls — segment.llm joins the
+        # reference sets only when a strategy actually dials out
+        _check_llm_ref(f"{fp}:[segment].llm", segment.llm)
     if classify.enabled:
         # like verify below: the default reference ("default") need not exist
         # while the stage is disabled (v1.7, R24 reference-set point ①)
         _check_llm_ref(f"{fp}:[classify].llm", classify.llm)
+    if extract.enabled:
+        _check_llm_ref(f"{fp}:[extract].llm", extract.llm)   # v1.8 S30: always when enabled
     _check_llm_ref(f"{fp}:[quality].llm", quality.llm)
     _check_llm_ref(f"{fp}:[annotate].llm", annotate.llm)
     for i, name in enumerate(generate.llms, 1):
@@ -1187,9 +1291,16 @@ def load(config_path: Path, project_path: Path,
 
     if modality == "ui":
         vision_users: dict[str, set[str]] = {}
+        if segment.enabled and segment.strategy in ("llm", "hybrid") and segment.use_vision:
+            vision_users.setdefault(segment.llm, set()).add("segment")   # v1.8 S30
         if classify.enabled:
             vision_users.setdefault(classify.llm, set()).add("classify")
-        if quality.enabled:
+        if extract.enabled:
+            # v1.8 S30: extraction reads adjacent screenshots — vision always
+            vision_users.setdefault(extract.llm, set()).add("extract")
+        if quality.enabled and not segment.enabled:
+            # v1.8 S30 relaxation: stream-mode quality scores sequences as pure
+            # text (transitions + frame digests, no images)
             quality_refs = (quality.judges
                             if quality.judges and quality.mode == "pairwise"
                             else (quality.llm,))
@@ -1298,8 +1409,12 @@ def load(config_path: Path, project_path: Path,
     # cli.referenced_profiles) — the reference sets must agree with runtime.
     quality_judges_active = bool(quality.judges) and quality.mode == "pairwise"
     referenced: set[str] = set()
+    if segment.enabled and segment.strategy in ("llm", "hybrid"):
+        referenced.add(segment.llm)      # v1.8, S30 reference-set point ②
     if classify.enabled:
         referenced.add(classify.llm)     # v1.7, R24 reference-set point ②
+    if extract.enabled:
+        referenced.add(extract.llm)      # v1.8, S30 reference-set point ②
     if quality.enabled:
         referenced |= set(quality.judges) if quality_judges_active else {quality.llm}
     if annotate.enabled:
@@ -1375,7 +1490,16 @@ def load(config_path: Path, project_path: Path,
             hook_ref=output.validator)
 
     # ── rule 16 — rubric resolution + validation ──────────────────────────
-    selector = quality.rubric or ("default:ui" if modality == "ui" else "default:text")
+    # v1.8 S29: in stream mode the empty selector resolves to the trajectory
+    # rubric for BOTH modalities (per-frame default:ui criteria are meaningless
+    # for imageless sequence scoring); an explicit selector always wins, and
+    # per-class views inherit through the backfilled base selector.
+    if quality.rubric:
+        selector = quality.rubric
+    elif segment.enabled:
+        selector = "default:trajectory"
+    else:
+        selector = "default:ui" if modality == "ui" else "default:text"
     rubric, rubric_is_inline = _resolve_rubric(col, fp, selector, rubric_raw, modality)
     if quality.mode == "pointwise":
         _check_pointwise_rubric(col, fp, rubric, is_inline=rubric_is_inline,
@@ -1438,10 +1562,11 @@ def load(config_path: Path, project_path: Path,
                 col.error(f"{fp}:[class.{cname}]: 期望表（table），得到 {_fmt(sections)}")
                 sections = None
             if sections:
-                q_c, a_c, g_c, v_c, info = _merge_class_sections(
-                    col, fp, cname, sections, base_q, annotate, generate, verify)
+                q_c, a_c, g_c, v_c, e_c, info = _merge_class_sections(
+                    col, fp, cname, sections, base_q, annotate, generate, verify,
+                    extract)
             else:
-                q_c, a_c, g_c, v_c = base_q, annotate, generate, verify
+                q_c, a_c, g_c, v_c, e_c = base_q, annotate, generate, verify, extract
                 info = {"rubric_raw": None, "examples_provided": False}
 
             # rubric (R7): merged selector → re-resolve; per-key provenance for
@@ -1497,7 +1622,8 @@ def load(config_path: Path, project_path: Path,
                 hook_alive = hook_alive and h_ok
 
             class_views[cname] = ClassView(name=cname, quality=q_c, rubric=rubric_c,
-                                           annotate=a_c, generate=g_c, verify=v_c)
+                                           annotate=a_c, generate=g_c, verify=v_c,
+                                           extract=e_c)
 
     # ── rules 17–19 — stage combination matrix (spec 2.3.1 ①–③) ───────────
     if not annotate.enabled and not quality.enabled:
@@ -1514,6 +1640,108 @@ def load(config_path: Path, project_path: Path,
             col.error(f"{fp}:[generate].enabled: process 模式下 generate.enabled = true "
                       f"要求 quality.enabled = true（种子来自质量门，2.3.1 约束③）")
     # constraint ④ is the generate_only block above (rule 10)
+
+    # ── v1.8 §3.6 — stream / segment / extract constraints ────────────────
+    if segment.enabled:
+        if mode != "process":
+            col.error(f'{fp}:[segment].enabled: segment.enabled = true 要求 '
+                      f'run.mode = "process"，得到 {_fmt(mode)}')
+        if generate.enabled:
+            col.error(f"{fp}:[segment].enabled: segment.enabled = true 与 "
+                      f"generate.enabled = true 互斥（stream 模式不做生成扩增）")
+        if not annotate.enabled:
+            col.error(f"{fp}:[segment].enabled: segment.enabled = true 要求 "
+                      f"annotate.enabled = true（约束⑭：episode 须经标注落用户 Schema）")
+    if extract.enabled:
+        if not segment.enabled:
+            col.error(f"{fp}:[extract].enabled: extract.enabled = true 要求 "
+                      f"segment.enabled = true（转移摘取仅作用于序列记录）")
+        if modality != "ui":
+            col.error(f'{fp}:[extract].enabled: extract.enabled = true 要求 '
+                      f'run.modality = "ui"，得到 {_fmt(modality)}（文本序列 v1 不适用）')
+
+    order_is_meta = stream.order_by.startswith("meta:")
+    if stream.order_by != "input_order" and not (order_is_meta
+                                                 and stream.order_by[len("meta:"):]):
+        col.error(f'{fp}:[stream].order_by: 期望 "input_order" | "meta:<field>"，'
+                  f"得到 {_fmt(stream.order_by)}")
+    elif order_is_meta and modality != "text":
+        col.error(f'{fp}:[stream].order_by: "meta:<field>" 仅文本模态可用'
+                  f'（run.modality = "text"），得到 modality {_fmt(modality)}')
+    if stream.session_max_span_s > 0 and not order_is_meta:
+        # necessarily explicit (default 0 disables) — a hard error
+        col.error(f'{fp}:[stream].session_max_span_s: > 0 要求 order_by = '
+                  f'"meta:<field>"（时间跨度需时间序键），得到 order_by '
+                  f"{_fmt(stream.order_by)}")
+    if stream_provided["gap_s"] and not order_is_meta:
+        # gap_s carries a non-zero default (300) — only an EXPLICIT value states
+        # user intent, and the miss is advisory, not fatal (spec §3.6)
+        col.warn(f'{fp}:[stream].gap_s: 显式设置了 gap_s 但 order_by 非 "meta:<field>"，'
+                 f'时间差断开不会生效——要按时间断开请设 order_by = "meta:<字段名>"')
+    for i, k in enumerate(stream.key, 1):
+        if k == "source_dir":
+            continue
+        if k.startswith("meta:") and k[len("meta:"):]:
+            if modality != "text":
+                col.error(f'{fp}:[stream].key[{i}]: "meta:<field>" 分区键仅文本模态'
+                          f"可用，得到 {_fmt(k)}")
+        else:
+            col.error(f'{fp}:[stream].key[{i}]: 期望 "meta:<field>"（仅文本）| '
+                      f'"source_dir"，得到 {_fmt(k)}')
+    if segment.window < 2:
+        col.error(f"{fp}:[segment].window: 期望 ≥ 2 的整数（滑窗须含至少一对相邻帧），"
+                  f"得到 {segment.window}")
+    if not 2 <= annotate.sequence_frames <= 100:
+        col.error(f"{fp}:[annotate].sequence_frames: 期望 [2, 100] 内的整数，"
+                  f"得到 {annotate.sequence_frames}")
+
+    if segment.enabled:
+        if annotate.sequence_frames > 20:
+            prof_a = llm_profiles.get(annotate.llm)
+            if prof_a is not None and prof_a.max_image_px > 2000:
+                # S28: Anthropic hard-rejects >20-image requests carrying any
+                # image with an edge > 2000px (400, NOT auto-downscaled)
+                col.warn(f"{fp}:[annotate].sequence_frames: sequence_frames = "
+                         f"{annotate.sequence_frames} > 20 且被 annotate 引用的 "
+                         f"profile [llm.{annotate.llm}] max_image_px = "
+                         f"{prof_a.max_image_px} > 2000——Anthropic 对 >20 图请求"
+                         f"硬拒任一边 >2000px 的图（400，非自动缩放），请将 "
+                         f"max_image_px 改为 ≤ 2000 或降回 sequence_frames ≤ 20")
+        if stream.session_max_len > run["batch_size"]:
+            col.warn(f"{fp}:[stream].session_max_len: session_max_len = "
+                     f"{stream.session_max_len} > run.batch_size = "
+                     f"{run['batch_size']}，超长会话将被 M10 硬切并打 "
+                     f"session_split 标（S21）")
+        if segment.strategy == "rules" and segment.noise_filter:
+            col.warn(f'{fp}:[segment].noise_filter: strategy = "rules" 时 '
+                     f"noise_filter 不生效（噪声标记与 min_len 仅 llm/hybrid 策略"
+                     f"生效）——要过滤噪声帧请切 strategy")
+        # S29 combo advisory: only when the EFFECTIVE rubric is the trajectory
+        # rubric (incl. the empty-selector stream resolution) — an explicit
+        # default:text/ui/inline choice scores by its own criteria and must
+        # not be told it is doing trajectory scoring.
+        if (quality.enabled and not extract.enabled
+                and selector == "default:trajectory"):
+            col.warn(f"{fp}:[quality].enabled: segment.enabled = true 且 "
+                     f"extract.enabled = false，轨迹打分（default:trajectory）将按"
+                     f"帧摘要评估「帧间变化」而非结构化动作序列——要按动作序列打分"
+                     f"请启用 [extract]")
+    else:
+        # no-op warnings (R8 family): parked stream-family config is legal —
+        # warn once, naming the ignored tables
+        parked = []
+        if stream_provided["section"]:
+            parked.append("[stream]")
+        if segment_provided["non_switch_keys"]:
+            parked.append("[segment]")
+        if extract_provided["non_switch_keys"] and not extract.enabled:
+            parked.append("[extract]")
+        if parked:
+            col.warn(f"{fp}:[segment].enabled: segment.enabled = false，"
+                     f"{'、'.join(parked)} 不会生效，已忽略（留配置、关开关合法）")
+        if sequence_frames_provided:
+            col.warn(f"{fp}:[annotate].sequence_frames: segment.enabled = false，"
+                     f"sequence_frames 仅序列标注（stream 模式）生效，不会生效")
 
     # ── required-when-enabled instructions (spec §5.2 †) ──────────────────
     if annotate.enabled and not annotate.instruction.strip():
@@ -1589,7 +1817,10 @@ def load(config_path: Path, project_path: Path,
             max_park_s=run["max_park_s"],
         ),
         input=input_cfg,
+        stream=stream,
         dedup=dedup,
+        segment=segment,
+        extract=extract,
         classify=classify,               # max_labels already backfilled when enabled
         quality=replace(quality, rubric=selector),
         generate=generate,

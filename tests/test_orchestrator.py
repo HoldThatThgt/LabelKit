@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import random
 from dataclasses import replace
 from datetime import datetime
@@ -22,8 +23,9 @@ import pytest
 
 from labelkit.config.model import (
     AnnotateConfig, ClassifyConfig, ClassSpec, ClassView, Criterion, DedupConfig,
-    GenerateConfig, InputConfig, OutputConfig, QualityConfig, ResolvedConfig,
-    Rubric, RunConfig, ToolConfig, TraceConfig, VerifyConfig,
+    ExtractConfig, GenerateConfig, InputConfig, OutputConfig, QualityConfig,
+    ResolvedConfig, Rubric, RunConfig, SegmentConfig, StreamConfig, ToolConfig,
+    TraceConfig, VerifyConfig,
 )
 from labelkit.errors import CircuitBreakerTripped
 from labelkit.obslog import EventLog, MetricsSink, TraceEvent
@@ -62,6 +64,8 @@ def make_cfg(tmp_path: Path, *, mode: str = "process", batch_size: int = 4,
              verify: bool = False, generate: GenerateConfig | None = None,
              quality_cfg: QualityConfig | None = None,
              classify: ClassifyConfig | None = None,
+             segment: SegmentConfig | None = None,
+             extract: ExtractConfig | None = None,
              trace: TraceConfig | None = None) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
@@ -72,7 +76,10 @@ def make_cfg(tmp_path: Path, *, mode: str = "process", batch_size: int = 4,
                       mode=mode, batch_size=batch_size, seed=seed,
                       fatal_error_threshold=fatal_threshold),
         input=InputConfig(),
+        stream=StreamConfig(),
         dedup=DedupConfig(enabled=dedup),
+        segment=segment if segment is not None else SegmentConfig(),
+        extract=extract if extract is not None else ExtractConfig(),
         classify=classify if classify is not None else ClassifyConfig(),
         quality=quality_cfg if quality_cfg is not None else QualityConfig(enabled=quality),
         generate=generate if generate is not None else GenerateConfig(),
@@ -114,7 +121,7 @@ def with_views(cfg: ResolvedConfig, overrides: dict[str, dict] | None = None) ->
     views = {}
     for spec in cfg.classify.classes:
         kw = dict(quality=cfg.quality, rubric=cfg.rubric, annotate=cfg.annotate,
-                  generate=cfg.generate, verify=cfg.verify)
+                  generate=cfg.generate, verify=cfg.verify, extract=cfg.extract)
         kw.update((overrides or {}).get(spec.name, {}))
         views[spec.name] = ClassView(name=spec.name, **kw)
     return replace(cfg, class_views=views)
@@ -183,6 +190,8 @@ class FakeEmitter:
                 if item.status == "active":
                     fh.write(json.dumps(item.record.raw, ensure_ascii=False) + "\n")
                     emitted += 1
+                elif item.status == "absorbed":
+                    continue                       # v1.8 third route: counted only
                 else:
                     rejected += 1
         self.batches.append((batch_no, emitted, rejected))
@@ -217,6 +226,46 @@ class FakeIngestor:
             self.report.scanned += 1
             self.report.ingested += 1
             yield r
+
+
+def sess(sid: str, start: int, n: int, cause: str = "eof") -> SimpleNamespace:
+    """CONTRACTS §7.1 Session shape stand-in: {session_id, records, cause}."""
+    return SimpleNamespace(session_id=sid,
+                           records=tuple(rec(start + j) for j in range(n)),
+                           cause=cause)
+
+
+class FakeSessionIngestor:
+    """Ingestor stand-in exposing the v1.8 session-stream view (the real M2
+    sessions() belongs to a parallel work order — consumption side written
+    against the CONTRACTS §7.1 frozen shape: Session {session_id, records,
+    cause}, --limit applied INSIDE M2, IngestPlan.session_lens for dry-run)."""
+
+    def __init__(self, sessions=(), session_lens=None):
+        self._sessions = list(sessions)
+        self.metrics = None
+        self.scan_called = False
+        self.report = SimpleNamespace(scanned=0, ingested=0, bad_input=0,
+                                      sessions=0)
+        self._session_lens = (tuple(session_lens) if session_lens is not None
+                              else tuple(len(s.records) for s in self._sessions))
+
+    def scan(self, *, estimate=True):
+        self.scan_called = True
+        return SimpleNamespace(files=("in.jsonl",), pairs=(),
+                               estimated_records=sum(self._session_lens),
+                               session_lens=self._session_lens)
+
+    def records(self):
+        raise AssertionError("stream mode must consume sessions(), not records()")
+
+    def sessions(self):
+        for s in self._sessions:
+            for _ in s.records:
+                self.report.scanned += 1
+                self.report.ingested += 1
+            self.report.sessions += 1
+            yield s
 
 
 # ── tiny REAL stages (pure logic; unit fixtures for scheduling) ─────────────
@@ -392,6 +441,42 @@ class StubClassifyStage:
                         detail={}),
                     dedup=item.dedup))
         batch.extend(appended)
+        return batch
+
+
+class StubSegmentStage:
+    """Pure segment stand-in (labelkit.segment belongs to a parallel work
+    order — deliberately NOT imported). Groups the batch's active frames by
+    session_id, absorbs the members (record ids listed in `noise` become
+    dropped_noise instead) and tail-appends ONE episode envelope per session —
+    the contract ②b shape: same list object returned, sequence Record over the
+    member records, session_id stamped on the episode envelope."""
+
+    name = "segment"
+
+    def __init__(self, noise: tuple[str, ...] = ()):
+        self._noise = set(noise)
+        self.calls: list[tuple[int, tuple[str | None, ...]]] = []
+
+    async def run(self, batch, ctx):
+        self.calls.append((ctx.batch_no, tuple(it.session_id for it in batch)))
+        groups: dict[str | None, list[PipelineItem]] = {}
+        for item in batch:
+            if item.status != "active":
+                continue
+            if item.record.id in self._noise:
+                item.status = "dropped_noise"
+                continue
+            groups.setdefault(item.session_id, []).append(item)
+        for sid, members in groups.items():
+            for m in members:
+                m.status = "absorbed"
+            episode = Record(id=f"ep:{sid}:{ctx.batch_no}"[:16], modality="text",
+                             text=None, raw={"episode": sid}, ui_tree=None,
+                             image=None, ref=members[0].record.ref,
+                             kind="sequence",
+                             members=tuple(m.record for m in members))
+            batch.append(PipelineItem(record=episode, session_id=sid))
         return batch
 
 
@@ -1479,3 +1564,450 @@ async def test_finalize_honors_sink_breaker_even_without_escape(tmp_path):
     assert emitter.deliver is True                 # v1.6: trip delivers
     assert emitter.report["run"]["partial_delivery"] is True
     assert "unprocessed" in emitter.report["counts"]
+
+
+# ── tests: v1.8 stream orchestration (chain / packing / metering / report) ──
+
+def stream_counts_invariant(counts):
+    # v1.8 fully expanded form (spec 6.4): emitted + dropped_dup + dropped_lowq
+    # + dropped_verify + dropped_noise + failed + bad_input + absorbed
+    # [+ unprocessed] = scanned + generated [+ fanout] + episodes.
+    lhs = (counts["emitted"] + counts["dropped_dup"] + counts["dropped_lowq"]
+           + counts["dropped_verify"] + counts["dropped_noise"] + counts["failed"]
+           + counts["bad_input"] + counts["absorbed"]
+           + counts.get("unprocessed", 0))
+    rhs = (counts["scanned"] + counts["generated"] + counts.get("fanout", 0)
+           + counts["episodes"])
+    return lhs == rhs
+
+
+def stream_cfg(tmp_path, **kw):
+    """make_cfg with segment enabled (defaults: hybrid strategy, window 20)."""
+    kw.setdefault("segment", SegmentConfig(enabled=True))
+    return make_cfg(tmp_path, **kw)
+
+
+class Probe:
+    """Named pass-through stage recording execution order."""
+
+    def __init__(self, name, order):
+        self.name = name
+        self._order = order
+
+    async def run(self, batch, ctx):
+        self._order.append(self.name)
+        return batch
+
+
+async def test_chain_order_v18_superset_segment_and_extract_enabled(tmp_path):
+    """v1.8 canonical order: segment → dedup → classify → extract → quality →
+    annotate → verify regardless of the supplied stage list order (generate is
+    mutually exclusive with segment and never co-occupies the chain)."""
+    order: list[str] = []
+    cfg = stream_cfg(tmp_path, batch_size=8, dedup=True, annotate=True,
+                     verify=True, quality_cfg=QualityConfig(enabled=True),
+                     classify=classify_cfg(),
+                     extract=ExtractConfig(enabled=True))
+    stages = [Probe(n, order) for n in ("verify", "extract", "annotate",
+                                        "quality", "classify", "dedup",
+                                        "segment")]
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
+    orch, _, _, _ = build(cfg, stages, ingestor=ingestor)
+    await orch.run()
+    assert order == ["segment", "dedup", "classify", "extract", "quality",
+                     "annotate", "verify"]
+
+
+async def test_chain_order_v18_degrades_to_v17_when_disabled(tmp_path):
+    """segment/extract off: even with segment/extract stages SUPPLIED, the
+    composed chain is the byte-identical v1.7 six-name form (minus generate)."""
+    order: list[str] = []
+    cfg = make_cfg(tmp_path, batch_size=8, dedup=True, annotate=True,
+                   verify=True, quality_cfg=QualityConfig(enabled=True),
+                   classify=classify_cfg())
+    stages = [Probe(n, order) for n in ("verify", "extract", "annotate",
+                                        "quality", "classify", "dedup",
+                                        "segment")]
+    orch, _, _, _ = build(cfg, stages, [rec(1), rec(2)])
+    await orch.run()
+    assert order == ["dedup", "classify", "quality", "annotate", "verify"]
+
+
+async def test_stream_next_fit_packing_whole_sessions(tmp_path):
+    """S21 next-fit: sessions [5, 3, 4] frames at batch_size=8 pack as
+    [5+3][4] — one open bin, a session that no longer fits closes the batch."""
+    cfg = stream_cfg(tmp_path, batch_size=8)
+    stage = RecordingStage("dedup")
+    ingestor = FakeSessionIngestor([sess("s1", 1, 5), sess("s2", 11, 3),
+                                    sess("s3", 21, 4)])
+    orch, metrics, emitter, _ = build(cfg, [stage], ingestor=ingestor)
+    summary = await orch.run()
+
+    assert [len(ids) for _, ids in stage.calls] == [8, 4]
+    # whole sessions, arrival order: batch 1 = s1 then s2 frames, batch 2 = s3
+    assert stage.calls[0][1] == tuple(f"{i:016x}" for i in (1, 2, 3, 4, 5,
+                                                            11, 12, 13))
+    assert stage.calls[1][1] == tuple(f"{i:016x}" for i in (21, 22, 23, 24))
+    starts = [e for e in metrics.events if e[0] == "batch.start"]
+    assert [e[4]["size"] for e in starts] == [8, 4]
+    assert summary.exit_code == 0
+    assert stream_counts_invariant(emitter.report["counts"])
+
+
+async def test_stream_oversized_session_hard_split_and_marks(tmp_path, caplog):
+    """S21 hard split: a session longer than batch_size is sliced at
+    batch_size, each slice its own batch; every frame envelope of the split
+    session carries the duck-typed session_split mark; ONE WARN per run even
+    with several oversized sessions."""
+
+    class SplitProbe:
+        name = "dedup"
+
+        def __init__(self):
+            self.batches: list[list[tuple[str | None, bool]]] = []
+
+        async def run(self, batch, ctx):
+            self.batches.append([(it.session_id,
+                                  getattr(it, "session_split", False))
+                                 for it in batch])
+            return batch
+
+    cfg = stream_cfg(tmp_path, batch_size=8)
+    probe = SplitProbe()
+    ingestor = FakeSessionIngestor([sess("s1", 1, 10), sess("s2", 21, 9)])
+    with caplog.at_level(logging.WARNING, logger="labelkit.orchestrator"):
+        orch, _, emitter, _ = build(cfg, [probe], ingestor=ingestor)
+        summary = await orch.run()
+
+    assert [len(b) for b in probe.batches] == [8, 2, 8, 1]
+    for b in probe.batches:
+        assert all(split is True for _, split in b)
+    assert probe.batches[0][0][0] == "s1" and probe.batches[3][0][0] == "s2"
+    assert sum("硬切" in r.message for r in caplog.records) == 1
+    assert summary.output_lines == 19
+    assert stream_counts_invariant(emitter.report["counts"])
+
+
+async def test_stream_no_split_mark_without_oversize(tmp_path):
+    """Sessions within batch_size never carry the session_split mark."""
+
+    class MarkProbe:
+        name = "dedup"
+
+        def __init__(self):
+            self.marks: list[bool] = []
+
+        async def run(self, batch, ctx):
+            self.marks.extend(getattr(it, "session_split", False)
+                              for it in batch)
+            return batch
+
+    cfg = stream_cfg(tmp_path, batch_size=8)
+    probe = MarkProbe()
+    ingestor = FakeSessionIngestor([sess("s1", 1, 3), sess("s2", 11, 5)])
+    orch, _, _, _ = build(cfg, [probe], ingestor=ingestor)
+    await orch.run()
+    assert probe.marks == [False] * 8
+
+
+async def test_stream_session_id_stamped_on_frame_envelopes(tmp_path):
+    """S4: M10 stamps PipelineItem.session_id at envelope construction."""
+    cfg = stream_cfg(tmp_path, batch_size=8)
+    stub = StubSegmentStage()
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2), sess("s2", 11, 1)])
+    orch, _, _, _ = build(cfg, [stub], ingestor=ingestor)
+    await orch.run()
+    # captured at segment ENTRY: the three frame envelopes, stamped in order
+    assert stub.calls == [(1, ("s1", "s1", "s2"))]
+
+
+async def test_stream_episodes_metered_as_segment_len_delta(tmp_path):
+    """§7.9: counts.episodes = len(batch) delta across the segment stage
+    (fanout-isomorphic R9 construction) — the stub absorbs two sessions'
+    frames and tail-appends 2 episode envelopes."""
+    cfg = stream_cfg(tmp_path, batch_size=8)
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2), sess("s2", 11, 2)])
+    orch, metrics, emitter, _ = build(cfg, [StubSegmentStage()],
+                                      ingestor=ingestor)
+    summary = await orch.run()
+
+    assert metrics.counters["counts.episodes"] == 2
+    counts = emitter.report["counts"]
+    assert counts["episodes"] == 2
+    assert counts["absorbed"] == 4
+    assert counts["dropped_noise"] == 0
+    assert counts["emitted"] == 2                  # the two episode envelopes
+    assert summary.output_lines == 2
+    assert stream_counts_invariant(counts)
+
+
+async def test_stream_failed_fallback_formula_excludes_absorbed_and_noise(tmp_path):
+    """§7.9 failed fallback: without the absorbed/dropped_noise terms the
+    absorbed members would be miscounted as failed."""
+    cfg = stream_cfg(tmp_path, batch_size=8)
+    noise_id = f"{3:016x}"
+    ingestor = FakeSessionIngestor([sess("s1", 1, 4)])
+    orch, _, emitter, _ = build(cfg, [StubSegmentStage(noise=(noise_id,))],
+                                ingestor=ingestor)
+    await orch.run()
+
+    counts = emitter.report["counts"]
+    assert counts["failed"] == 0                   # not 4 (absorbed misread)
+    assert counts["absorbed"] == 3
+    assert counts["dropped_noise"] == 1
+    assert counts["episodes"] == 1
+    assert counts["emitted"] == 1
+    assert stream_counts_invariant(counts)
+
+
+async def test_stream_batch_end_carries_three_keys_only_when_enabled(tmp_path):
+    """batch.end gains episodes/absorbed/dropped_noise ONLY when segment is
+    enabled (R20 form) — the disabled path keeps the v1.7 payload byte-shape."""
+    cfg = stream_cfg(tmp_path, batch_size=8)
+    noise_id = f"{3:016x}"
+    ingestor = FakeSessionIngestor([sess("s1", 1, 4)])
+    orch, metrics, _, _ = build(cfg, [StubSegmentStage(noise=(noise_id,))],
+                                ingestor=ingestor)
+    await orch.run()
+    ends = [e for e in metrics.events if e[0] == "batch.end"]
+    assert [(e[4]["episodes"], e[4]["absorbed"], e[4]["dropped_noise"])
+            for e in ends] == [(1, 3, 1)]
+
+    cfg_off = make_cfg(tmp_path, batch_size=8)
+    orch2, metrics2, _, _ = build(cfg_off, [ExactDedupStage()], [rec(1)])
+    await orch2.run()
+    ends2 = [e for e in metrics2.events if e[0] == "batch.end"]
+    assert ends2 and all(
+        k not in e[4] for e in ends2
+        for k in ("episodes", "absorbed", "dropped_noise"))
+
+
+async def test_stream_report_block_shape_and_counts_gating(tmp_path):
+    """§9.3: with segment enabled counts gains the three keys and the report
+    gains the stream block right after counts — base eight keys, extract/verify
+    sub-blocks only when those stages are enabled, zero-based closed
+    vocabularies fed from the M15/M7 counters."""
+    cfg = stream_cfg(tmp_path, batch_size=8, verify=True,
+                     extract=ExtractConfig(enabled=True))
+    ingestor = FakeSessionIngestor([sess("s1", 1, 3), sess("s2", 11, 2)])
+    orch, metrics, emitter, _ = build(cfg, [StubSegmentStage()],
+                                      ingestor=ingestor)
+    # stage-owned counters (M14/M15/M7), pre-fed like the classify block test
+    metrics.counters["segment.below_min_len"] = 2
+    metrics.counters["segment.digest_poor_frames"] = 1
+    metrics.counters["segment.failures"] = 1
+    metrics.counters["extract.transitions"] = 3
+    metrics.counters["extract.fallback_steps"] = 1
+    metrics.counters["extract.failures"] = 0
+    metrics.counters["extract.by_type.click"] = 2
+    metrics.counters["extract.by_type.scroll"] = 1
+    metrics.counters["verify.membership_repairs"] = 1
+    metrics.counters["verify.boundary_flags"] = 2
+    metrics.counters["verify.defects.off_task_members"] = 1
+    await orch.run()
+
+    report = emitter.report
+    counts = report["counts"]
+    assert counts["episodes"] == 2 and counts["absorbed"] == 5
+    assert counts["dropped_noise"] == 0
+    keys = list(report)
+    assert keys.index("stream") == keys.index("counts") + 1
+    stream = report["stream"]
+    assert set(stream) == {"sessions", "episodes", "mean_episode_len",
+                           "absorbed", "dropped_noise", "below_min_len",
+                           "digest_poor_frames", "segment_failures",
+                           "extract", "verify"}
+    assert stream["sessions"] == 2
+    assert stream["episodes"] == 2
+    assert stream["mean_episode_len"] == 2.5       # absorbed/episodes, round 2
+    assert stream["absorbed"] == 5
+    assert stream["dropped_noise"] == 0
+    assert stream["below_min_len"] == 2
+    assert stream["digest_poor_frames"] == 1
+    assert stream["segment_failures"] == 1
+    assert stream["extract"] == {
+        "transitions": 3, "fallback_steps": 1, "failures": 0,
+        "by_type": {"click": 2, "long_press": 0, "input_text": 0, "scroll": 1,
+                    "drag": 0, "open_app": 0, "app_switch": 0,
+                    "navigate_back": 0, "navigate_home": 0, "wait": 0,
+                    "other": 0}}
+    assert stream["verify"] == {
+        "membership_repairs": 1, "boundary_flags": 2,
+        "defects": {"label_mismatch": 0, "off_task_members": 1,
+                    "missing_head": 0, "missing_tail": 0,
+                    "missing_members": 0}}
+
+
+async def test_stream_report_block_base_form_and_disabled_gating(tmp_path):
+    """extract/verify off → no sub-blocks (eight base keys exactly);
+    segment off → no stream block, no counts trio (regression anchor)."""
+    cfg = stream_cfg(tmp_path, batch_size=8)
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
+    orch, _, emitter, _ = build(cfg, [StubSegmentStage()], ingestor=ingestor)
+    await orch.run()
+    stream = emitter.report["stream"]
+    assert set(stream) == {"sessions", "episodes", "mean_episode_len",
+                           "absorbed", "dropped_noise", "below_min_len",
+                           "digest_poor_frames", "segment_failures"}
+    assert stream["mean_episode_len"] == 2.0
+
+    cfg_off = make_cfg(tmp_path, batch_size=8)
+    orch2, _, emitter2, _ = build(cfg_off, [ExactDedupStage()], [rec(1)])
+    await orch2.run()
+    assert "stream" not in emitter2.report
+    for key in ("episodes", "absorbed", "dropped_noise"):
+        assert key not in emitter2.report["counts"]
+
+
+async def test_stream_breaker_residual_includes_episodes_and_absorbed(tmp_path):
+    """S18/R10: the breaker residual carries the expanded sides — + episodes
+    on the source side, + absorbed + dropped_noise among the terminal counts.
+    Batch 1 completes (absorbed tallied), batch 2 trips before emit."""
+    cfg = stream_cfg(tmp_path, batch_size=4, fatal_threshold=2, annotate=True)
+    ingestor = FakeSessionIngestor([sess("s1", 1, 3), sess("s2", 11, 2)])
+    orch, _, emitter, _ = build(cfg, [StubSegmentStage(), BreakerStage()],
+                                ingestor=ingestor)
+    summary = await orch.run()
+
+    assert summary.exit_code == 4
+    assert emitter.report["run"]["partial_delivery"] is True
+    counts = emitter.report["counts"]
+    assert counts["episodes"] == 2                 # metered in BOTH batches
+    assert counts["absorbed"] == 3                 # batch 1 only (batch 2 no emit)
+    assert counts["failed"] == 1                   # batch 1's failed episode
+    assert "unprocessed" in counts
+    assert counts["unprocessed"] == 3              # s2's 2 frames + its episode
+    lhs = (counts["emitted"] + counts["dropped_dup"] + counts["dropped_lowq"]
+           + counts["dropped_verify"] + counts["dropped_noise"]
+           + counts["failed"] + counts["bad_input"] + counts["absorbed"]
+           + counts["unprocessed"])
+    assert lhs == (counts["scanned"] + counts["generated"]
+                   + counts["episodes"])
+
+
+async def test_stream_interrupted_run_gains_unprocessed(tmp_path):
+    """S18: in stream mode counts.unprocessed appears on 'breaker trip OR
+    interrupted' — SIGINT over the session buffer strands in-flight records."""
+
+    class StopDuringFirstBatch:
+        name = "dedup"
+
+        def __init__(self, orch_ref):
+            self._orch_ref = orch_ref
+
+        async def run(self, batch, ctx):
+            if ctx.batch_no == 1:
+                self._orch_ref[0]._request_stop()
+            return batch
+
+    cfg = stream_cfg(tmp_path, batch_size=2)
+    orch_ref: list = [None]
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2), sess("s2", 11, 2),
+                                    sess("s3", 21, 2)])
+    orch, _, emitter, _ = build(cfg, [StopDuringFirstBatch(orch_ref)],
+                                ingestor=ingestor)
+    orch_ref[0] = orch
+    summary = await orch.run()
+
+    assert summary.interrupted is True
+    assert summary.exit_code == 0                  # graceful: finalize + rename
+    assert emitter.report["run"]["interrupted"] is True
+    assert "partial_delivery" not in emitter.report["run"]
+    counts = emitter.report["counts"]
+    assert counts["emitted"] == 2                  # batch 1 only
+    # s2 (buffered in the open bin) + s3 (pulled, never packed) stranded
+    assert counts["unprocessed"] == 4
+    assert stream_counts_invariant(counts)
+
+
+async def test_non_stream_interrupted_run_has_no_unprocessed(tmp_path):
+    """Regression anchor (S18): non-stream interrupted runs keep a zero
+    residual and never emit the unprocessed key."""
+
+    class StopDuringFirstBatch:
+        name = "dedup"
+
+        def __init__(self, orch_ref):
+            self._orch_ref = orch_ref
+
+        async def run(self, batch, ctx):
+            if ctx.batch_no == 1:
+                self._orch_ref[0]._request_stop()
+            return batch
+
+    cfg = make_cfg(tmp_path, batch_size=4)
+    orch_ref: list = [None]
+    orch, _, emitter, _ = build(cfg, [StopDuringFirstBatch(orch_ref)],
+                                [rec(i) for i in range(1, 11)])
+    orch_ref[0] = orch
+    summary = await orch.run()
+
+    assert summary.interrupted is True
+    assert emitter.report["run"]["interrupted"] is True
+    assert "unprocessed" not in emitter.report["counts"]
+    assert "stream" not in emitter.report
+
+
+async def test_dry_run_stream_estimate_formulas_and_note(tmp_path, capsys):
+    """S22: segment_calls = Σ ceil((L−1)/(window−1)) over sessions with L ≥ 2;
+    extract_calls = Σ (L−1); downstream bases use len(session_lens); the batch
+    count comes from the exact next-fit packing simulation; the lower-bound
+    note prints for the LLM-refining strategies."""
+    cfg = stream_cfg(tmp_path, batch_size=8, dry_run=True, annotate=True,
+                     segment=SegmentConfig(enabled=True, strategy="hybrid",
+                                           window=20),
+                     extract=ExtractConfig(enabled=True))
+    ingestor = FakeSessionIngestor(session_lens=(21, 5))
+    orch, _, emitter, _ = build(cfg, [], ingestor=ingestor)
+    summary = await orch.run()
+
+    assert summary.exit_code == 0
+    err = capsys.readouterr().err
+    assert "estimated_records=26" in err
+    # next-fit simulation: 21 hard-splits to [8][8][5], then [5] → 4 batches
+    assert "batches=4" in err
+    assert "segment_calls=3" in err                # ceil(20/19) + ceil(4/19)
+    assert "extract_calls=24" in err               # 20 + 4 (upper bound)
+    assert "annotate_calls=2" in err               # episodes ≈ sessions
+    assert "total=29" in err
+    assert "stream 估算：下游按 episodes≈sessions 报下界（LLM 精化只增段数）" in err
+
+
+async def test_dry_run_stream_rules_strategy_zero_segment_calls(tmp_path, capsys):
+    """strategy='rules' costs zero segment calls and prints no lower-bound
+    note (episodes == sessions exactly under rules)."""
+    cfg = stream_cfg(tmp_path, batch_size=8, dry_run=True, annotate=True,
+                     segment=SegmentConfig(enabled=True, strategy="rules"))
+    ingestor = FakeSessionIngestor(session_lens=(21, 5))
+    orch, _, _, _ = build(cfg, [], ingestor=ingestor)
+    await orch.run()
+    err = capsys.readouterr().err
+    assert "segment_calls=0" in err
+    assert "extract_calls=0" in err                # extract disabled
+    assert "报下界（LLM 精化只增段数）" not in err
+
+
+async def test_dry_run_non_stream_prints_zero_segment_and_extract_calls(tmp_path, capsys):
+    """The two new estimate keys print unconditionally (classify precedent):
+    0 with segment/extract disabled, non-stream branch otherwise unchanged."""
+    cfg = make_cfg(tmp_path, batch_size=4, dry_run=True, annotate=True)
+    orch, _, _, _ = build(cfg, [], [rec(i) for i in range(1, 11)])
+    await orch.run()
+    err = capsys.readouterr().err
+    assert "segment_calls=0" in err
+    assert "extract_calls=0" in err
+    assert "annotate_calls=10" in err
+    assert "total=10" in err
+
+
+async def test_dry_run_extract_class_override_triggers_note(tmp_path, capsys):
+    """S2 tie-in: a [class.<name>.extract] override alone counts as a per-class
+    override — _class_overrides_exist compares view.extract too."""
+    cfg = make_cfg(tmp_path, batch_size=4, dry_run=True, annotate=True,
+                   classify=classify_cfg())
+    cfg = with_views(cfg, overrides={
+        "chat": {"extract": ExtractConfig(instruction="按类摘取")}})
+    orch, _, _, _ = build(cfg, [], [rec(1), rec(2)])
+    await orch.run()
+    err = capsys.readouterr().err
+    assert "按全局配置估算 / multi 按标签乘数 1 报下界" in err

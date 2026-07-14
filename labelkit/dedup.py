@@ -44,7 +44,16 @@ def _normalize_text(text: str) -> str:
 
 def _dedup_text(rec: Record, cfg: "DedupConfig") -> str:
     """The text every dedup level operates on. Text modality: normalized extracted text;
-    UI modality: canonical UITree serialization with quantized bounds (spec 3.3.3 ①)."""
+    UI modality: canonical UITree serialization with quantized bounds (spec 3.3.3 ①).
+
+    Sequence records (v1.8, S10 — this branch takes precedence over the modality
+    branch): each member's own single-record recipe, concatenated in member order with
+    separator "\\x1e" (ASCII Record Separator, 0x1E). The separator is whitespace to
+    Python (isspace() == True), so the whitespace-collapsed text recipe can never emit
+    it — the joined string is structurally collision-free against any single-record
+    recipe output (spec 3.3.3 sequence row)."""
+    if rec.kind == "sequence":
+        return "\x1e".join(_dedup_text(m, cfg) for m in rec.members)
     if rec.modality == "ui":
         if rec.ui_tree is None:
             return ""
@@ -101,6 +110,7 @@ class _ProbeDetail:
     dedup_text: str
     digest: bytes
     own_key: str                                        # digest.hex()[:16]
+    is_sequence: bool = False                           # v1.8: rec.kind == "sequence" (S10)
     minhash: MinHash | None = None
     tree_hit: tuple[str, str, float] | None = None      # (kept_id, cluster_key, est. Jaccard)
     phash: int | None = None
@@ -150,7 +160,8 @@ class DedupIndex:
         index (first-writer-wins). Returns the DedupInfo for the record."""
         text = _dedup_text(rec, self.cfg)
         digest = hashlib.sha256(text.encode("utf-8")).digest()
-        detail = _ProbeDetail(dedup_text=text, digest=digest, own_key=digest.hex()[:16])
+        detail = _ProbeDetail(dedup_text=text, digest=digest, own_key=digest.hex()[:16],
+                              is_sequence=rec.kind == "sequence")
         self._last_probe = detail
 
         # ① exact — a hit is an unconditional duplicate in both modalities.
@@ -206,7 +217,11 @@ class DedupIndex:
 
     def _compose(self, detail: _ProbeDetail) -> DedupInfo:
         """Composite ②③ verdict (spec 3.3.3/3.3.5): text modality = level ② alone;
-        UI modality per dedup.ui_dup_requires. Both levels hitting → kind='near_both'."""
+        UI modality per dedup.ui_dup_requires. Both levels hitting → kind='near_both'.
+
+        Sequence records (v1.8, spec 3.3.3 sequence row): image is None ⇒ image_hit is
+        always None, so the composite verdict degrades to "tree" semantics — the same
+        degradation shape as an image decode failure (spec 3.3.4)."""
         tree, image = detail.tree_hit, detail.image_hit
         unique = DedupInfo(kind="unique", cluster_key=detail.own_key, kept_id=None)
 
@@ -217,10 +232,11 @@ class DedupIndex:
             return DedupInfo(kind="near_text", cluster_key=tree[1], kept_id=tree[0])
 
         requires = self.cfg.ui_dup_requires
-        if detail.image_decode_failed:
+        if detail.image_decode_failed or detail.is_sequence:
             # Image decode failure ⇒ this record skips the pHash layer and is judged by
             # the tree alone (spec 3.3.4 "跳过 pHash 层（按树判定）", CONTRACTS.md §7.2):
-            # "both" and "image" degrade to "tree" for this record.
+            # "both" and "image" degrade to "tree" for this record. Sequence records
+            # take the isomorphic degradation (spec 3.3.3 sequence row, S10).
             requires = "tree"
         if requires == "both":
             is_dup = tree is not None and image is not None
@@ -393,21 +409,26 @@ class DedupStage:
         # ④ counts as a tree-level hit; under ui_dup_requires="image" it does not take part
         # in the verdict (spec 3.3.3), so no embedding is spent there — unless this record's
         # image failed to decode, in which case the record is judged by the tree alone
-        # (spec 3.3.4) and ④ participates as it would under "tree".
+        # (spec 3.3.4) and ④ participates as it would under "tree". Sequence records (v1.8,
+        # S10) likewise still participate under "image": their dedup face IS the concatenated
+        # member text (spec 3.3.3 sequence row).
         if self.index.modality == "text" or self.cfg.ui_dup_requires != "image":
             return True
-        return detail.image_decode_failed
+        return detail.image_decode_failed or detail.is_sequence
 
     def _semantic_verdict_kind(self, detail: _ProbeDetail) -> str | None:
         """Composite kind for a level-④ hit (spec 3.3.3: ④ counts as a tree-level hit).
         None → the hit alone does not constitute a duplicate (record stays unique)."""
         if self.index.modality == "text":
             return "near_semantic"
-        if self.cfg.ui_dup_requires == "both" and not detail.image_decode_failed:
+        if (self.cfg.ui_dup_requires == "both" and not detail.image_decode_failed
+                and not detail.is_sequence):
             # ④ is a tree-level hit: "both" additionally needs the image level.
             return "near_both" if detail.image_hit is not None else None
         # "tree" — including "both"/"image" degraded to tree-only when this record's
-        # image failed to decode (spec 3.3.4). ④+③ together still records near_both.
+        # image failed to decode (spec 3.3.4) or the record is a sequence (v1.8, S10:
+        # image_hit is always None and must not block a near_semantic verdict).
+        # ④+③ together still records near_both.
         return "near_both" if detail.image_hit is not None else "near_semantic"
 
     async def _semantic_level(

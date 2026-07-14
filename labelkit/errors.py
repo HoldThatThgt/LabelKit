@@ -85,6 +85,15 @@ class ErrorKind(str, enum.Enum):
     IMAGE_DECODE_ERROR = "image_decode_error"                # M3 skip pHash; M5/M7 → failed
     CLASSIFICATION_INVALID = "classification_invalid"        # v1.7: M13, M8 repair exhausted —
                                                              # fallback keeps record; "fail" → rejects
+    SEGMENTATION_INVALID = "segmentation_invalid"            # v1.8: M14, M8 repair exhausted —
+                                                             # "keep" = whole session survives as one
+                                                             # episode (trace in _meta.stream.degraded);
+                                                             # "fail" = session members failed → rejects
+    EXTRACTION_INVALID = "extraction_invalid"                # v1.8: M15, M8 repair exhausted —
+                                                             # "fallback" = step records
+                                                             # action_type="other" (trace in
+                                                             # Transition.detail, not item.errors);
+                                                             # "fail" = episode failed → rejects
     JUDGMENT_INVALID = "judgment_invalid"                    # M4, comparison-level → counts as tie
     SCHEMA_VIOLATION = "schema_violation"                    # M8 L3 exhausted → failed → rejects
     CALLBACK_VIOLATION = "callback_violation"                # v1.5: L3 exhausted, remaining

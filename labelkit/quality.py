@@ -18,6 +18,14 @@ lexicographic order (the only ctx.rng consumption — draw order depends on pool
 then all pools' LLM judging calls run under one merged gather (full cross-pool concurrency).
 Pools are failure-isolated (R15). Classify disabled = ONE anonymous pool, byte-identical to
 pre-v1.7 behavior (flat counter keys, no "pool" payload field).
+
+v1.8 sequence scoring (spec 3.4.3 sequence row, CONTRACTS §7.3 / §10.2 / §10.3): episode
+envelopes (record.kind == "sequence") render as PURE TEXT even in UI modality (the single
+rule-34 vision relaxation, S30) — [步骤序列] (item.transitions as step lines; fallback steps
+carry the （摘取兜底） suffix so they stay distinguishable from LLM-confirmed "other", S16) +
+[成员帧摘要] (bounded per-member frame_digest). transitions travel through NEW trailing
+parameters of the private prompt builders (non-frozen surface); single-record paths with the
+default None are byte-identical to v1.7.
 """
 from __future__ import annotations
 
@@ -35,7 +43,14 @@ from labelkit.errors import (
     ProviderRetryableError,
     SchemaViolation,
 )
-from labelkit.types import PipelineItem, QualityScore, Record, StageError
+from labelkit.types import (
+    PipelineItem,
+    QualityScore,
+    Record,
+    StageError,
+    Transition,
+    frame_digest,
+)
 
 if TYPE_CHECKING:
     from labelkit.config.model import Criterion, QualityConfig, ResolvedConfig
@@ -217,10 +232,70 @@ def _violation_summary(exc: SchemaViolation) -> str:
     return f"{len(exc.errors)} violation(s) at {pointers}"
 
 
+# ── v1.8 sequence rendering (spec 3.4.3 sequence row, CONTRACTS §10.2/§10.3) ──
+# Operator modules never depend on each other (spec §2.2): annotate carries its own
+# same-format step-line template; this copy is M4's.
+
+_MEMBER_DIGEST_MAX_CHARS = 400   # per-member frame_digest cap (segment.digest_max_chars default)
+_FALLBACK_STEP_SUFFIX = "（摘取兜底）"
+
+
+def _step_line(transition: Transition) -> str:
+    """One [步骤序列] line in the §10.1 frozen format
+    `{index}. {action_type}（对象: {target|—}；值: {value|—}）{description}`; null
+    target/value render as "—". Fallback steps (Transition.detail.kind ==
+    "extraction_invalid") get the trailing （摘取兜底） suffix — listed SEPARATELY from an
+    LLM-confirmed "other" so fallback noise cannot pollute the coherence anchor (S16;
+    M5 annotate renders WITHOUT the suffix)."""
+    action = transition.action
+    target = action.get("target")
+    value = action.get("value")
+    line = (f"{transition.index}. {action.get('action_type')}"
+            f"（对象: {'—' if target is None else target}；"
+            f"值: {'—' if value is None else value}）"
+            f"{action.get('description')}")
+    if transition.detail.get("kind") == "extraction_invalid":
+        line += _FALLBACK_STEP_SUFFIX
+    return line
+
+
+def _member_digest_lines(members: Sequence[Record], max_total_chars: int) -> list[str]:
+    """[成员帧摘要] lines — per member `{m}. {frame_digest(member, 400)}` (m 1-based, member
+    order). Total bounded by max_total_chars (input.ui_tree_max_chars): the first and last
+    lines are ALWAYS kept; middle entries are dropped WHOLE and replaced in place by one
+    `…(truncated N members)` marker line (serialize/§10.8 truncation convention)."""
+    lines = [f"{m}. {frame_digest(member, _MEMBER_DIGEST_MAX_CHARS)}"
+             for m, member in enumerate(members, start=1)]
+    if len(lines) <= 2 or len("\n".join(lines)) <= max_total_chars:
+        return lines
+    last = lines[-1]
+    keep = 1                 # first line survives even if the floor exceeds the budget
+    for k in range(len(lines) - 2, 0, -1):
+        marker = f"…(truncated {len(lines) - k - 1} members)"
+        if len("\n".join(lines[:k] + [marker, last])) <= max_total_chars:
+            keep = k
+            break
+    marker = f"…(truncated {len(lines) - keep - 1} members)"
+    return lines[:keep] + [marker, last]
+
+
 # ── prompt assembly (CONTRACTS.md §10.2 / §10.3, byte-exact Chinese) ──────────
 
-def _record_parts(record: Record, label: str, ui_tree_max_chars: int) -> list[Part]:
-    """Text modality: one '[label] text' line; UI modality: three parts per §10.2."""
+def _record_parts(record: Record, label: str, ui_tree_max_chars: int,
+                  transitions: tuple[Transition, ...] | None = None) -> list[Part]:
+    """Text modality: one '[label] text' line; UI modality: three parts per §10.2.
+    v1.8 sequence records (record.kind == "sequence", checked BEFORE modality) render as
+    ONE pure-text part — `[{label}·操作序列]` head line, then the §10.2/§10.3 sequence
+    subsections [步骤序列] (omitted entirely when transitions is None) + [成员帧摘要] —
+    with NO image part even in UI modality (rule-34 vision relaxation, S30)."""
+    if record.kind == "sequence":
+        lines = [f"[{label}·操作序列]"]
+        if transitions is not None:
+            lines.append("[步骤序列]")
+            lines.extend(_step_line(t) for t in transitions)
+        lines.append("[成员帧摘要]")
+        lines.extend(_member_digest_lines(record.members, ui_tree_max_chars))
+        return [Part(kind="text", text="\n".join(lines))]
     if record.modality == "text":
         return [Part(kind="text", text=f"[{label}] {record.text}")]
     tree = record.ui_tree.serialize(max_chars=ui_tree_max_chars) if record.ui_tree else ""
@@ -230,7 +305,10 @@ def _record_parts(record: Record, label: str, ui_tree_max_chars: int) -> list[Pa
 
 
 def _build_pairwise_prompt(rec_a: Record, rec_b: Record, criteria: Sequence["Criterion"],
-                           with_reason: bool, ui_tree_max_chars: int) -> PromptBundle:
+                           with_reason: bool, ui_tree_max_chars: int,
+                           transitions_a: tuple[Transition, ...] | None = None,
+                           transitions_b: tuple[Transition, ...] | None = None
+                           ) -> PromptBundle:
     lines = ["你将对两条记录进行成对质量比较。准则如下："]
     for crit in criteria:
         lines.append(f"- {crit.key}: {crit.description}")
@@ -243,7 +321,12 @@ def _build_pairwise_prompt(rec_a: Record, rec_b: Record, criteria: Sequence["Cri
         lines.append('{"judgments": [{"criterion": <准则 key>, "winner": "A"|"B"|"tie"}]}')
     system = Message(role="system", parts=(Part(kind="text", text="\n".join(lines)),))
 
-    if rec_a.modality == "text":
+    if rec_a.kind == "sequence" or rec_b.kind == "sequence":
+        # v1.8: the sequence subsections sit inside each [记录 X] content slot; a text
+        # sequence must NOT take the plain-text fast path (record.text is None).
+        user_parts = (_record_parts(rec_a, "记录 A", ui_tree_max_chars, transitions_a)
+                      + _record_parts(rec_b, "记录 B", ui_tree_max_chars, transitions_b))
+    elif rec_a.modality == "text":
         user_parts = [Part(kind="text",
                            text=f"[记录 A] {rec_a.text}\n[记录 B] {rec_b.text}")]
     else:
@@ -254,7 +337,9 @@ def _build_pairwise_prompt(rec_a: Record, rec_b: Record, criteria: Sequence["Cri
 
 
 def _build_pointwise_prompt(record: Record, criterion: "Criterion",
-                            ui_tree_max_chars: int) -> PromptBundle:
+                            ui_tree_max_chars: int,
+                            transitions: tuple[Transition, ...] | None = None
+                            ) -> PromptBundle:
     label = _pointwise_label(criterion.description)
     lines = [f"按以下 0–5 加性量表为记录的 {criterion.key}（{label}）打分，"
              "先给两句理由再给整数分："]
@@ -262,7 +347,9 @@ def _build_pointwise_prompt(record: Record, criterion: "Criterion",
     lines.append('输出 JSON：{"scores": [{"criterion": <准则 key>, "reason": <两句理由>, '
                  '"score": 0..5}]}')
     system = Message(role="system", parts=(Part(kind="text", text="\n".join(lines)),))
-    user = Message(role="user", parts=tuple(_record_parts(record, "记录内容", ui_tree_max_chars)))
+    user = Message(role="user",
+                   parts=tuple(_record_parts(record, "记录内容", ui_tree_max_chars,
+                                             transitions)))
     return PromptBundle(messages=(system, user))
 
 
@@ -432,13 +519,20 @@ class QualityStage:
         return bool(jr)
 
     def _excerpt_payload(self, records: Sequence[Record]) -> dict | None:
-        """`excerpt` payload addition for the excerpt/full trace.content tiers (§8.3)."""
+        """`excerpt` payload addition for the excerpt/full trace.content tiers (§8.3).
+        v1.8 sequence branch: the excerpt for an episode = the first 200 chars of the
+        first member's frame_digest (the head of the member-digest rendering, §7.3)."""
         if not (self.cfg.trace.enabled and self.cfg.trace.content in ("excerpt", "full")):
             return None
         out: dict[str, str] = {}
         for rec in records:
-            content = rec.text if rec.modality == "text" else (
-                rec.ui_tree.serialize() if rec.ui_tree else "")
+            if rec.kind == "sequence":
+                content = (frame_digest(rec.members[0], _MEMBER_DIGEST_MAX_CHARS)
+                           if rec.members else "")
+            elif rec.modality == "text":
+                content = rec.text
+            else:
+                content = rec.ui_tree.serialize() if rec.ui_tree else ""
             out[rec.id] = (content or "")[:200]
         return out
 
@@ -649,8 +743,12 @@ class QualityStage:
         rec_a = items[a_idx].record
         rec_b = items[b_idx].record
         keys = [c.key for c in group]
+        # v1.8 (S5-adjacent): the envelopes' transitions ride down to the sequence
+        # rendering; single records carry None and the prompt is byte-identical.
         prompt = _build_pairwise_prompt(rec_a, rec_b, group, with_reason,
-                                        self.cfg.input.ui_tree_max_chars)
+                                        self.cfg.input.ui_tree_max_chars,
+                                        transitions_a=items[a_idx].transitions,
+                                        transitions_b=items[b_idx].transitions)
         schema = judgment_schema(keys, with_reason)
         try:
             obj, _usage, _attempts, model = await ctx.schema_engine.complete_validated(
@@ -712,7 +810,8 @@ class QualityStage:
                               criterion: "Criterion", q: "QualityConfig",
                               pool: str | None = None) -> None:
         rec = item.record
-        prompt = _build_pointwise_prompt(rec, criterion, self.cfg.input.ui_tree_max_chars)
+        prompt = _build_pointwise_prompt(rec, criterion, self.cfg.input.ui_tree_max_chars,
+                                         transitions=item.transitions)
         schema = pointwise_schema(criterion.key)
         try:
             obj, _usage, _attempts, _model = await ctx.schema_engine.complete_validated(

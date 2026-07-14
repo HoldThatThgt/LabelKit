@@ -22,6 +22,7 @@ from labelkit.config.model import (
     Criterion,
     DedupConfig,
     EmbeddingProfile,
+    ExtractConfig,
     GenerateConfig,
     InputConfig,
     LLMProfile,
@@ -30,6 +31,8 @@ from labelkit.config.model import (
     ResolvedConfig,
     Rubric,
     RunConfig,
+    SegmentConfig,
+    StreamConfig,
     ToolConfig,
     TraceConfig,
     VerifyConfig,
@@ -142,7 +145,8 @@ def test_limit_accepts_positive_int(good, expected):
 
 @pytest.mark.parametrize(
     "name,filename",
-    [("default:text", "default_text.toml"), ("default:ui", "default_ui.toml")],
+    [("default:text", "default_text.toml"), ("default:ui", "default_ui.toml"),
+     ("default:trajectory", "default_trajectory.toml")],   # v1.8 (S29, §7.12)
 )
 def test_rubric_show_prints_packaged_toml_verbatim(capsys, name, filename):
     rc = cli.main(["rubric", "--show", name])
@@ -165,7 +169,7 @@ def test_rubric_without_show_lists_names(capsys):
     rc = cli.main(["rubric"])
     out = capsys.readouterr().out.splitlines()
     assert rc == EXIT_OK
-    assert set(out) == {"default:text", "default:ui"}
+    assert set(out) == {"default:text", "default:ui", "default:trajectory"}
 
 
 # ── referenced_profiles (validate --probe helper) ──────────────────────────
@@ -184,7 +188,10 @@ def _cfg(**kw) -> ResolvedConfig:
             name="emb", base_url="https://x", model="e", api_key_env="K")},
         run=RunConfig(output="out.jsonl", modality="text", input="in.jsonl"),
         input=InputConfig(),
+        stream=StreamConfig(),
         dedup=DedupConfig(),
+        segment=SegmentConfig(),
+        extract=ExtractConfig(),
         classify=ClassifyConfig(),
         quality=QualityConfig(),
         generate=GenerateConfig(),
@@ -308,6 +315,55 @@ def test_build_stages_inserts_classify_after_dedup_before_quality():
 def test_build_stages_without_classify_unchanged():
     stages = cli._build_stages(_cfg())
     assert [s.name for s in stages] == ["dedup", "quality", "annotate"]
+
+
+# ── v1.8 stream (S30 reference sets + chain slots §7.9/§7.12) ───────────────
+
+
+def test_referenced_profiles_segment_strategy_gate():
+    """S30: segment.llm joins the probe set ONLY when segment is enabled AND
+    strategy ∈ {llm, hybrid} — the rules strategy makes zero segment LLM calls,
+    so its profile is never probed; chain position: segment heads the list."""
+    hybrid = _cfg(segment=SegmentConfig(enabled=True, strategy="hybrid", llm="judge"))
+    assert cli.referenced_profiles(hybrid)[0] == ["judge", "default"]
+
+    llm_only = _cfg(segment=SegmentConfig(enabled=True, strategy="llm", llm="judge"))
+    assert cli.referenced_profiles(llm_only)[0] == ["judge", "default"]
+
+    rules = _cfg(segment=SegmentConfig(enabled=True, strategy="rules", llm="judge"))
+    assert cli.referenced_profiles(rules)[0] == ["default"]
+
+    disabled = _cfg(segment=SegmentConfig(enabled=False, strategy="hybrid",
+                                          llm="judge"))
+    assert cli.referenced_profiles(disabled)[0] == ["default"]
+
+
+def test_referenced_profiles_extract_always_when_enabled():
+    """S30: extract.llm is referenced whenever extract is enabled; slot follows
+    the chain order — after classify, before quality."""
+    cfg = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+               extract=ExtractConfig(enabled=True, llm="fixer"),
+               classify=_classify_cfg(llm="judge"))
+    llms, _ = cli.referenced_profiles(cfg)
+    assert llms == ["judge", "fixer", "default"]
+
+
+def test_build_stages_stream_inserts_segment_and_extract():
+    """v1.8 (§7.12): segment heads the chain (before dedup); extract slots after
+    classify / before quality (§7.9). Gated on the sibling modules landing."""
+    pytest.importorskip("labelkit.segment")
+    pytest.importorskip("labelkit.extract")
+    from labelkit.extract import ExtractStage
+    from labelkit.segment import SegmentStage
+
+    cfg = _cfg(segment=SegmentConfig(enabled=True),
+               extract=ExtractConfig(enabled=True),
+               classify=_classify_cfg())
+    stages = cli._build_stages(cfg)
+    assert [s.name for s in stages] == ["segment", "dedup", "classify", "extract",
+                                        "quality", "annotate"]
+    assert isinstance(stages[0], SegmentStage)
+    assert isinstance(stages[3], ExtractStage)
 
 
 # ── validate / run end-to-end (skip until sibling modules land) ────────────

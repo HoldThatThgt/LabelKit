@@ -21,6 +21,7 @@ from labelkit.config.model import (
     ClassifyConfig,
     ClassSpec,
     DedupConfig,
+    ExtractConfig,
     GenerateConfig,
     InputConfig,
     OutputConfig,
@@ -28,6 +29,8 @@ from labelkit.config.model import (
     ResolvedConfig,
     Rubric,
     RunConfig,
+    SegmentConfig,
+    StreamConfig,
     ToolConfig,
     TraceConfig,
     VerifyConfig,
@@ -44,6 +47,7 @@ from labelkit.types import (
     UINode,
     UITree,
     Usage,
+    frame_digest,
 )
 
 # Class table mirroring the spec 3.13.6 worked example (declaration order matters).
@@ -75,7 +79,10 @@ def make_cfg(*, modality="text", assignment="single", max_labels=None,
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality=modality, input="in"),
         input=InputConfig(ui_tree_max_chars=ui_tree_max_chars),
+        stream=StreamConfig(),
         dedup=DedupConfig(),
+        segment=SegmentConfig(),
+        extract=ExtractConfig(),
         classify=ClassifyConfig(enabled=True, llm="default", assignment=assignment,
                                 max_labels=max_labels, instruction=instruction,
                                 fallback_class=fallback_class,
@@ -263,6 +270,94 @@ def test_ui_prompt_three_parts_in_one_user_message():
                                  + rec.ui_tree.serialize(max_chars=30000))
 
 
+# ── v1.8 sequence prompt variant (§10.8, spec 3.13.3 sequence row) ───────────
+
+def seq_member_ui(idx: int) -> Record:
+    nodes = (
+        UINode("1", None, 0, "FrameLayout", "", "", (0, 0, 1080, 1920), True,
+               {"package": "com.demo.food"}),
+        UINode("2", "1", 1, "Button", f"步骤{idx}", "", (72, 952, 1008, 1096), True, {}),
+    )
+    image = ImageRef(path=__import__("pathlib").Path(f"image_{idx}.png"),
+                     format="png", size_bytes=100 + idx)
+    return Record(id=f"frame{idx:02d}", modality="ui", text=None, raw=None,
+                  ui_tree=UITree(nodes), image=image,
+                  ref=RecordRef(f"a/uitree_{idx}.jsonl", None, idx, ()))
+
+
+def seq_record(members, rid="a3f1c2d4e5b60718") -> Record:
+    """S24 sequence-record convention: text/raw/ui_tree/image = None, modality =
+    the members' modality, ref inherited from the first member."""
+    first = members[0]
+    return Record(id=rid, modality=first.modality, text=None, raw=None, ui_tree=None,
+                  image=None,
+                  ref=RecordRef(first.ref.source_file, first.ref.line_no,
+                                first.ref.pair_index, ()),
+                  kind="sequence", members=tuple(members))
+
+
+def test_sequence_prompt_ui_digest_lines_and_first_frame_screenshot():
+    cfg = make_cfg(modality="ui")
+    members = [seq_member_ui(1), seq_member_ui(2), seq_member_ui(3)]
+    rec = seq_record(members)
+    bundle = build_classify_prompt(rec, cfg, with_reason=False)
+    # system and few-shot messages keep the single-record shape (spec 3.13.3)
+    assert [m.role for m in bundle.messages] == ["system", "user", "user"]
+    assert bundle.messages[1].parts[0].text.startswith("[类别示例·writing] ")
+    msg = bundle.messages[-1]
+    assert [p.kind for p in msg.parts] == ["text", "text", "image"]
+    expected_lines = [f"{m}. {frame_digest(member, cfg.segment.digest_max_chars)}"
+                      for m, member in enumerate(members, start=1)]
+    assert msg.parts[0].text == "[待分类数据·序列]\n" + "\n".join(expected_lines)
+    assert "truncated" not in msg.parts[0].text            # under the cap: no marker
+    assert msg.parts[1].text == "[首帧截图]"
+    assert msg.parts[2].image is members[0].image          # FIRST member's screenshot
+
+
+def test_sequence_prompt_text_modality_digest_only():
+    cfg = make_cfg()                                       # text modality
+    members = [text_record("打开外卖应用", rid="s1"), text_record("搜索奶茶", rid="s2")]
+    rec = seq_record(members)
+    bundle = build_classify_prompt(rec, cfg, with_reason=False)
+    msg = bundle.messages[-1]
+    assert [p.kind for p in msg.parts] == ["text"]         # digest part only, no image
+    assert msg.parts[0].text == "[待分类数据·序列]\n1. 打开外卖应用\n2. 搜索奶茶"
+
+
+def test_sequence_prompt_truncation_keeps_first_and_last_members():
+    cfg = make_cfg(ui_tree_max_chars=1000)
+    texts = [f"m{i}" + "步" * (400 - len(f"m{i}")) for i in range(1, 6)]
+    members = [text_record(t, rid=f"s{i}") for i, t in enumerate(texts, start=1)]
+    rec = seq_record(members)
+    bundle = build_classify_prompt(rec, cfg, with_reason=False)
+    part = bundle.messages[-1].parts[0].text
+    assert part.startswith("[待分类数据·序列]\n")
+    body = part.removeprefix("[待分类数据·序列]\n")
+    lines = body.splitlines()
+    # First/last member lines always kept, whole middle lines dropped, the frozen
+    # marker closes the block, and the body respects the ui_tree_max_chars cap.
+    assert lines[0] == f"1. {texts[0]}"
+    assert lines[-2] == f"5. {texts[4]}"
+    assert lines[-1] == "…(truncated 3 members)"
+    assert len(lines) == 3                                 # no middle member survived
+    assert len(body) <= 1000
+
+
+def test_stage_classifies_sequence_record_without_crash():
+    # Zero-crash guarantee (spec 3.13.3): an episode rides the normal stage path —
+    # the v1.7 UI branch would have raised AttributeError on ui_tree=None.
+    cfg = make_cfg(modality="ui")
+    rec = seq_record([seq_member_ui(1), seq_member_ui(2)])
+    item = PipelineItem(record=rec)
+    batch = [item]
+    out, ctx = run_stage(cfg, batch, MapEngine({rec.id: {"class": "qa"}}))
+    assert out is batch and len(batch) == 1
+    assert item.status == "active"
+    assert item.classification == Classification(label="qa", labels=("qa",),
+                                                 source="llm", detail={})
+    assert ctx.metrics.counters == {"classify.classes.qa": 1}
+
+
 # ── reason request condition (R29) ──────────────────────────────────────────
 
 def test_reason_requested_iff_trace_enabled_and_classify_channel():
@@ -423,7 +518,7 @@ def test_stage_single_writes_classification_and_never_fans_out():
 def test_stage_multi_fan_out_k3_clones_share_refs_with_fresh_containers():
     cfg = make_cfg(assignment="multi", classes=CLASSES4, max_labels=4)
     rec = text_record()
-    item = PipelineItem(record=rec,
+    item = PipelineItem(record=rec, session_id="sess-0042",
                         dedup=DedupInfo(kind="unique", cluster_key="k1", kept_id=None))
     batch = [item]
     # raw order scrambled: normalization maps onto declaration order
@@ -438,6 +533,7 @@ def test_stage_multi_fan_out_k3_clones_share_refs_with_fresh_containers():
     for clone in clones:
         assert clone.record is item.record             # shared by reference
         assert clone.dedup is item.dedup
+        assert clone.session_id == "sess-0042"         # inherited (v1.8, spec 3.13.4)
         assert clone.status == "active"
         assert clone.classification.labels == ("writing", "qa", "code")
         assert clone.classification.source == "llm"
@@ -456,6 +552,30 @@ def test_stage_multi_fan_out_k3_clones_share_refs_with_fresh_containers():
     assert ev == "classify.decision" and record_ids == (rec.id,)
     assert payload == {"label": "writing", "labels": ["writing", "qa", "code"],
                        "source": "llm"}
+
+
+def test_stage_multi_fan_out_clones_inherit_episode_marks():
+    """D6: session_split / segment_degraded describe the EPISODE's session and
+    segmentation, not the envelope — sibling rows must not contradict the
+    original's _meta.stream."""
+    cfg = make_cfg(assignment="multi", classes=CLASSES4, max_labels=4)
+    rec = text_record()
+    item = PipelineItem(record=rec, session_id="sess-0042")
+    item.session_split = True
+    item.segment_degraded = {"kind": "segmentation_invalid", "windows_failed": 1}
+    batch = [item]
+    run_stage(cfg, batch, MapEngine({rec.id: {"classes": ["code", "qa"]}}))
+    (clone,) = batch[1:]
+    assert clone.session_split is True
+    assert clone.segment_degraded == {"kind": "segmentation_invalid",
+                                      "windows_failed": 1}
+    # unmarked originals stay unmarked on the clone (getattr default path)
+    plain = PipelineItem(record=text_record(rid="rec9", text="另一条"))
+    batch2 = [plain]
+    run_stage(cfg, batch2, MapEngine({"rec9": {"classes": ["code", "qa"]}}))
+    (clone2,) = batch2[1:]
+    assert not hasattr(clone2, "session_split")
+    assert not hasattr(clone2, "segment_degraded")
 
 
 def test_stage_multi_append_order_batch_position_then_declaration():

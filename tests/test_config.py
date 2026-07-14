@@ -1271,7 +1271,7 @@ num_per_call = 8
     errors = env.errors(project_text=env.project(body=body))
     # section outside the whitelist → error (R25), not a forward-compat warning
     has(errors, "[class.qa.dedup]: [class.*] 覆盖节不在白名单内"
-                "（可用：quality、rubric、annotate、generate、verify）")
+                "（可用：quality、rubric、annotate、generate、verify、extract）")
     # key outside a section's whitelist → error
     has(errors, "[class.qa.quality].llm: [class.*.quality] 不可覆盖该键"
                 "（白名单：mode、rounds、rubric、threshold、selection、top_ratio）")
@@ -1488,3 +1488,479 @@ prompt = ""
     errors = env.errors(project_text=env.project(body=body))
     has(errors, '[[class.qa.generate.styles]][2].name: 表内 name 须唯一，得到重复的 "dup"')
     has(errors, "[[class.qa.generate.styles]][2].prompt: 期望非空字符串")
+
+
+# ── v1.8: [stream]/[segment]/[extract] parsing + defaults ───────────────────
+
+SEG_ON = "[segment]\nenabled = true\n"
+
+
+def test_stream_sections_default_when_absent(env):
+    cfg = env.load()
+    assert cfg.stream.order_by == "input_order"
+    assert cfg.stream.on_disorder == "skip"
+    assert cfg.stream.key == ()
+    assert cfg.stream.gap_s == 300
+    assert cfg.stream.gap_steps == 0
+    assert cfg.stream.session_max_len == 200
+    assert cfg.stream.session_max_span_s == 0
+    assert cfg.segment.enabled is False
+    assert cfg.segment.strategy == "hybrid"
+    assert cfg.segment.llm == "default"
+    assert cfg.segment.window == 20
+    assert cfg.segment.digest_max_chars == 400
+    assert cfg.segment.noise_filter is True
+    assert cfg.segment.min_len == 2
+    assert cfg.segment.use_vision is False
+    assert cfg.segment.context == ""
+    assert cfg.segment.on_error == "keep"
+    assert cfg.extract.enabled is False
+    assert cfg.extract.llm == "default"
+    assert cfg.extract.instruction == ""
+    assert cfg.extract.include_diff is True
+    assert cfg.extract.on_error == "fallback"
+    assert cfg.annotate.sequence_frames == 20
+
+
+def test_stream_and_segment_sections_parse_explicit_values(env):
+    body = """\
+[stream]
+order_by = "meta:ts"
+on_disorder = "fail"
+key = ["meta:device", "source_dir"]
+gap_s = 600
+gap_steps = 5
+session_max_len = 100
+session_max_span_s = 3600
+
+[segment]
+enabled = true
+strategy = "llm"
+llm = "judge"
+window = 8
+digest_max_chars = 200
+noise_filter = false
+min_len = 3
+use_vision = false
+context = "外卖 App 采集流"
+on_error = "fail"
+"""
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.stream.order_by == "meta:ts"
+    assert cfg.stream.on_disorder == "fail"
+    assert cfg.stream.key == ("meta:device", "source_dir")
+    assert cfg.stream.gap_s == 600 and cfg.stream.gap_steps == 5
+    assert cfg.stream.session_max_len == 100
+    assert cfg.stream.session_max_span_s == 3600
+    assert cfg.segment.enabled is True
+    assert cfg.segment.strategy == "llm"
+    assert cfg.segment.llm == "judge"
+    assert cfg.segment.window == 8
+    assert cfg.segment.digest_max_chars == 200
+    assert cfg.segment.noise_filter is False
+    assert cfg.segment.min_len == 3
+    assert cfg.segment.context == "外卖 App 采集流"
+    assert cfg.segment.on_error == "fail"
+
+
+def test_extract_section_parses_explicit_values(env):
+    body = SEG_ON + """
+[extract]
+enabled = true
+llm = "judge"
+instruction = "遵循动作词表。"
+include_diff = false
+on_error = "fail"
+"""
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    cfg = env.load(project_text=project)
+    assert cfg.extract.enabled is True
+    assert cfg.extract.llm == "judge"
+    assert cfg.extract.instruction == "遵循动作词表。"
+    assert cfg.extract.include_diff is False
+    assert cfg.extract.on_error == "fail"
+
+
+def test_stream_family_enum_errors(env):
+    errors = env.errors(project_text=env.project(body='[segment]\nstrategy = "auto"'))
+    has(errors, '[segment].strategy: 期望 "rules" | "llm" | "hybrid"，得到 "auto"')
+    errors = env.errors(project_text=env.project(body='[segment]\non_error = "skip"'))
+    has(errors, '[segment].on_error: 期望 "keep" | "fail"，得到 "skip"')
+    errors = env.errors(project_text=env.project(body='[stream]\non_disorder = "drop"'))
+    has(errors, '[stream].on_disorder: 期望 "skip" | "fail"，得到 "drop"')
+    errors = env.errors(project_text=env.project(body='[extract]\non_error = "keep"'))
+    has(errors, '[extract].on_error: 期望 "fallback" | "fail"，得到 "keep"')
+
+
+def test_stream_trace_channels_accepted(env):
+    body = '[trace]\nenabled = true\nchannels = ["segment", "extract", "quality"]'
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.trace.channels == ("segment", "extract", "quality")
+
+
+# ── v1.8 §3.6: stage-combination constraints ────────────────────────────────
+
+
+def test_segment_requires_process_mode(env):
+    project = env.project(input_path=None, run_extra='mode = "generate_only"',
+                          body=GEN_BODY + "standalone_count = 10\n\n" + SEG_ON)
+    errors = env.errors(project_text=project)
+    has(errors, '[segment].enabled: segment.enabled = true 要求 run.mode = "process"')
+
+
+def test_segment_generate_mutually_exclusive(env):
+    errors = env.errors(project_text=env.project(body=GEN_BODY + "\n" + SEG_ON))
+    has(errors, "[segment].enabled: segment.enabled = true 与 generate.enabled = true 互斥")
+
+
+def test_segment_requires_annotate(env):
+    errors = env.errors(project_text=env.project(
+        annotate_body="enabled = false", body=SEG_ON))
+    has(errors, "[segment].enabled: segment.enabled = true 要求 annotate.enabled = true")
+
+
+def test_segment_happy_path_loads(env):
+    cfg = env.load(project_text=env.project(body=SEG_ON))
+    assert cfg.segment.enabled is True
+
+
+def test_extract_requires_segment_and_ui_modality(env):
+    errors = env.errors(project_text=env.project(body="[extract]\nenabled = true"))
+    has(errors, "[extract].enabled: extract.enabled = true 要求 segment.enabled = true")
+    has(errors, '[extract].enabled: extract.enabled = true 要求 run.modality = "ui"')
+
+
+def test_extract_happy_on_ui_stream(env):
+    body = SEG_ON + "\n[extract]\nenabled = true"
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    cfg = env.load(project_text=project)
+    assert cfg.extract.enabled is True
+
+
+def test_stream_order_by_domain(env):
+    errors = env.errors(project_text=env.project(body='[stream]\norder_by = "timestamp"'))
+    has(errors, '[stream].order_by: 期望 "input_order" | "meta:<field>"，得到 "timestamp"')
+    errors = env.errors(project_text=env.project(body='[stream]\norder_by = "meta:"'))
+    has(errors, '[stream].order_by: 期望 "input_order" | "meta:<field>"，得到 "meta:"')
+
+
+def test_stream_meta_order_text_only(env):
+    project = env.project(input_path=env.input_dir, modality="ui",
+                          body='[stream]\norder_by = "meta:ts"')
+    errors = env.errors(project_text=project)
+    has(errors, '[stream].order_by: "meta:<field>" 仅文本模态可用')
+
+
+def test_stream_meta_order_ok_on_text(env):
+    cfg = env.load(project_text=env.project(body='[stream]\norder_by = "meta:ts"'))
+    assert cfg.stream.order_by == "meta:ts"
+
+
+def test_session_max_span_requires_meta_order(env):
+    errors = env.errors(project_text=env.project(
+        body="[stream]\nsession_max_span_s = 60"))
+    has(errors, '[stream].session_max_span_s: > 0 要求 order_by = "meta:<field>"')
+    cfg = env.load(project_text=env.project(
+        body='[stream]\norder_by = "meta:ts"\nsession_max_span_s = 60'))
+    assert cfg.stream.session_max_span_s == 60
+
+
+def test_gap_s_explicit_without_meta_warns_not_errors(env, capsys):
+    cfg = env.load(project_text=env.project(body="[stream]\ngap_s = 60"))
+    assert cfg.stream.gap_s == 60                 # loads — a warning, not an error
+    err = capsys.readouterr().err
+    assert "warning:" in err
+    assert "[stream].gap_s" in err and "不会生效" in err
+
+
+def test_gap_s_default_not_treated_as_intent(env, capsys):
+    # gap_s stays at its default (300) — no warning even without meta:* ordering
+    env.load(project_text=env.project(body="[stream]\ngap_steps = 5"))
+    assert "[stream].gap_s" not in capsys.readouterr().err
+
+
+def test_gap_s_explicit_with_meta_order_no_warning(env, capsys):
+    env.load(project_text=env.project(
+        body='[stream]\norder_by = "meta:ts"\ngap_s = 60'))
+    assert "[stream].gap_s" not in capsys.readouterr().err
+
+
+def test_stream_key_element_domain(env):
+    errors = env.errors(project_text=env.project(body='[stream]\nkey = ["device"]'))
+    has(errors, '[stream].key[1]: 期望 "meta:<field>"（仅文本）| "source_dir"，得到 "device"')
+
+
+def test_stream_key_meta_text_only(env):
+    project = env.project(input_path=env.input_dir, modality="ui",
+                          body='[stream]\nkey = ["source_dir", "meta:device"]')
+    errors = env.errors(project_text=project)
+    has(errors, '[stream].key[2]: "meta:<field>" 分区键仅文本模态可用')
+    assert not any(".key[1]" in e for e in errors)   # source_dir legal on UI
+
+
+def test_segment_window_minimum(env):
+    errors = env.errors(project_text=env.project(body="[segment]\nwindow = 1"))
+    has(errors, "[segment].window: 期望 ≥ 2 的整数")
+    cfg = env.load(project_text=env.project(body="[segment]\nwindow = 2"))
+    assert cfg.segment.window == 2
+
+
+@pytest.mark.parametrize("value", [1, 101])
+def test_sequence_frames_range_rejected(env, value):
+    errors = env.errors(project_text=env.project(
+        annotate_body=f'instruction = "标注"\nsequence_frames = {value}'))
+    has(errors, f"[annotate].sequence_frames: 期望 [2, 100] 内的整数，得到 {value}")
+
+
+@pytest.mark.parametrize("value", [2, 100])
+def test_sequence_frames_accepts_bounds(env, value):
+    cfg = env.load(project_text=env.project(
+        annotate_body=f'instruction = "标注"\nsequence_frames = {value}',
+        body=SEG_ON))
+    assert cfg.annotate.sequence_frames == value
+
+
+def test_sequence_frames_image_px_warning(env, capsys):
+    # default max_image_px = 2048 > 2000 — the S28 hazard fires past 20 frames
+    cfg = env.load(project_text=env.project(
+        annotate_body='instruction = "标注"\nsequence_frames = 25', body=SEG_ON))
+    assert cfg.annotate.sequence_frames == 25
+    err = capsys.readouterr().err
+    assert "warning:" in err
+    assert "[annotate].sequence_frames" in err and "max_image_px" in err
+
+
+def test_sequence_frames_image_px_no_warning_at_2000(env, capsys):
+    config = BASE_CONFIG.replace(
+        "supports_structured_output = true",
+        "supports_structured_output = true\nmax_image_px = 2000")
+    env.load(config_text=config, project_text=env.project(
+        annotate_body='instruction = "标注"\nsequence_frames = 25', body=SEG_ON))
+    assert "max_image_px" not in capsys.readouterr().err
+
+
+def test_session_max_len_exceeds_batch_warns(env, capsys):
+    env.load(project_text=env.project(run_extra="batch_size = 100", body=SEG_ON))
+    err = capsys.readouterr().err
+    assert "[stream].session_max_len" in err and "硬切" in err
+
+
+def test_session_max_len_within_batch_no_warning(env, capsys):
+    env.load(project_text=env.project(body=SEG_ON))    # 200 <= 256
+    assert "[stream].session_max_len" not in capsys.readouterr().err
+
+
+# ── v1.8 no-op warnings (R8 family) ─────────────────────────────────────────
+
+
+def test_stream_family_parked_warns_once_naming_tables(env, capsys):
+    body = ('[stream]\ngap_steps = 5\n\n[segment]\nstrategy = "rules"\n\n'
+            '[extract]\ninstruction = "x"\n')
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.segment.enabled is False
+    err = capsys.readouterr().err
+    assert err.count("[segment].enabled") == 1    # one warning line, not one per table
+    assert "[stream]" in err and "[segment]" in err and "[extract]" in err
+    assert "不会生效" in err
+
+
+def test_segment_enabled_false_alone_no_parked_warning(env, capsys):
+    env.load(project_text=env.project(body="[segment]\nenabled = false"))
+    assert "不会生效" not in capsys.readouterr().err
+
+
+def test_rules_strategy_noise_filter_noop_warns(env, capsys):
+    cfg = env.load(project_text=env.project(
+        body=SEG_ON + 'strategy = "rules"'))
+    assert cfg.segment.strategy == "rules"
+    err = capsys.readouterr().err
+    assert "[segment].noise_filter" in err and "不生效" in err
+
+
+def test_hybrid_strategy_no_noise_filter_warning(env, capsys):
+    env.load(project_text=env.project(body=SEG_ON))
+    assert "[segment].noise_filter" not in capsys.readouterr().err
+
+
+def test_sequence_frames_noop_without_stream_warns(env, capsys):
+    cfg = env.load(project_text=env.project(
+        annotate_body='instruction = "标注"\nsequence_frames = 10'))
+    assert cfg.annotate.sequence_frames == 10
+    err = capsys.readouterr().err
+    assert "[annotate].sequence_frames" in err and "不会生效" in err
+
+
+def test_stream_quality_without_extract_hints_frame_digest_scoring(env, capsys):
+    env.load(project_text=env.project(body=SEG_ON))
+    assert "帧摘要" in capsys.readouterr().err
+
+
+def test_stream_quality_with_extract_no_hint(env, capsys):
+    body = SEG_ON + "\n[extract]\nenabled = true"
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    env.load(project_text=project)
+    assert "帧摘要" not in capsys.readouterr().err
+
+
+def test_stream_explicit_non_trajectory_rubric_no_hint(env, capsys):
+    # S29 advisory fires only when the EFFECTIVE rubric is default:trajectory —
+    # an explicit default:text choice scores by its own criteria and must not
+    # be told it is doing trajectory scoring.
+    body = SEG_ON + '\n[quality]\nrubric = "default:text"'
+    env.load(project_text=env.project(body=body))
+    assert "帧摘要" not in capsys.readouterr().err
+
+
+# ── v1.8 rubric: default:trajectory + stream empty-selector resolution ─────
+
+
+def test_default_trajectory_rubric_loads_from_package():
+    tr = default_rubric("default:trajectory")
+    assert tr.name == "default-trajectory-v1"
+    assert [c.key for c in tr.criteria] == [
+        "completion", "coherence", "purposefulness", "noise_residue"]
+    assert all(len(c.pointwise_levels) == 6 for c in tr.criteria)
+    assert all(c.weight == 1.0 for c in tr.criteria)
+    assert all(c.description and c.pairwise_prompt for c in tr.criteria)
+
+
+def test_stream_empty_rubric_resolves_trajectory_text(env):
+    cfg = env.load(project_text=env.project(body=SEG_ON))
+    assert cfg.quality.rubric == "default:trajectory"
+    assert cfg.rubric.name == "default-trajectory-v1"
+
+
+def test_stream_empty_rubric_resolves_trajectory_ui_too(env):
+    body = SEG_ON + 'strategy = "rules"'
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    cfg = env.load(project_text=project)
+    assert cfg.quality.rubric == "default:trajectory"
+    assert cfg.rubric.name == "default-trajectory-v1"
+
+
+def test_stream_explicit_selector_beats_trajectory_default(env):
+    body = SEG_ON + '\n[quality]\nrubric = "default:text"'
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.rubric.name == "default-text-v1"
+
+
+def test_trajectory_selector_explicit_without_stream(env):
+    cfg = env.load(project_text=env.project(
+        body='[quality]\nrubric = "default:trajectory"'))
+    assert cfg.rubric.name == "default-trajectory-v1"
+
+
+def test_stream_pointwise_trajectory_passes_six_level_check(env):
+    body = SEG_ON + '\n[quality]\nmode = "pointwise"'
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.rubric.name == "default-trajectory-v1"
+    assert all(len(c.pointwise_levels) == 6 for c in cfg.rubric.criteria)
+
+
+def test_stream_classify_views_inherit_trajectory_selector(env):
+    body = SEG_ON + "\n" + CLASSIFY_BODY
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.class_views["qa"].quality.rubric == "default:trajectory"
+    assert cfg.class_views["qa"].rubric is cfg.rubric
+
+
+# ── v1.8 reference sets (S30): segment/extract × existence/keys/vision ─────
+
+
+def test_segment_llm_existence_only_for_llm_strategies(env):
+    errors = env.errors(project_text=env.project(body=SEG_ON + 'llm = "ghost"'))
+    has(errors, '[segment].llm: 引用的 profile "ghost" 不存在于 config.toml [llm.*]')
+    # rules strategy makes zero LLM calls — the same reference is inert
+    cfg = env.load(project_text=env.project(
+        body=SEG_ON + 'strategy = "rules"\nllm = "ghost"'))
+    assert cfg.segment.llm == "ghost"
+
+
+def test_segment_llm_key_required_only_for_llm_strategies(env, monkeypatch):
+    monkeypatch.delenv("LK_TEST_KEY_JUDGE")
+    errors = env.errors(project_text=env.project(body=SEG_ON + 'llm = "judge"'))
+    has(errors, '环境变量 "LK_TEST_KEY_JUDGE" 未设置或为空')
+    cfg = env.load(project_text=env.project(
+        body=SEG_ON + 'strategy = "rules"\nllm = "judge"'))
+    assert cfg.llm_profiles["judge"].api_key == ""    # unreferenced, key not resolved
+
+
+def test_segment_llm_not_referenced_when_disabled(env, monkeypatch):
+    monkeypatch.delenv("LK_TEST_KEY_JUDGE")
+    cfg = env.load(project_text=env.project(body='[segment]\nllm = "judge"'))
+    assert cfg.llm_profiles["judge"].api_key == ""
+
+
+def test_extract_llm_existence_and_key_when_enabled(env, monkeypatch):
+    monkeypatch.delenv("LK_TEST_KEY_JUDGE")
+    body = SEG_ON + 'strategy = "rules"\n\n[extract]\nenabled = true\nllm = "judge"'
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    errors = env.errors(project_text=project)
+    has(errors, '环境变量 "LK_TEST_KEY_JUDGE" 未设置或为空')
+
+
+NOVISION_PROFILE = """
+[llm.novision]
+provider = "openai_compatible"
+base_url = "https://example.com/v1"
+model = "blind-model"
+api_key_env = "LK_TEST_KEY_DEFAULT"
+"""
+
+
+def test_extract_llm_always_needs_vision(env):
+    body = SEG_ON + '\n[extract]\nenabled = true\nllm = "novision"'
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    errors = env.errors(config_text=BASE_CONFIG + NOVISION_PROFILE,
+                        project_text=project)
+    has(errors, "[llm.novision].supports_vision: UI 模态被 extract 阶段引用")
+
+
+def test_segment_llm_needs_vision_only_when_use_vision(env):
+    body = SEG_ON + 'llm = "novision"\nuse_vision = true'
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    errors = env.errors(config_text=BASE_CONFIG + NOVISION_PROFILE,
+                        project_text=project)
+    has(errors, "[llm.novision].supports_vision: UI 模态被 segment 阶段引用")
+    # use_vision = false (default): pure-text window calls, no vision demand
+    body = SEG_ON + 'llm = "novision"'
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    cfg = env.load(config_text=BASE_CONFIG + NOVISION_PROFILE, project_text=project)
+    assert cfg.segment.llm == "novision"
+
+
+def test_stream_quality_vision_relaxed(env):
+    # S30: stream-mode quality scores sequences as pure text — a vision-less
+    # quality profile is legal exactly when segment.enabled
+    body = SEG_ON + 'strategy = "rules"\n\n[quality]\nllm = "novision"'
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    cfg = env.load(config_text=BASE_CONFIG + NOVISION_PROFILE, project_text=project)
+    assert cfg.quality.llm == "novision"
+
+
+def test_nonstream_quality_vision_still_required(env):
+    project = env.project(input_path=env.input_dir, modality="ui",
+                          body='[quality]\nllm = "novision"')
+    errors = env.errors(config_text=BASE_CONFIG + NOVISION_PROFILE,
+                        project_text=project)
+    has(errors, "[llm.novision].supports_vision: UI 模态被 quality 阶段引用")
+
+
+# ── v1.8 [class.<name>.extract] whitelist (S2) ─────────────────────────────
+
+
+def test_class_extract_instruction_override(env):
+    body = CLASSIFY_BODY + '\n[class.qa.extract]\ninstruction = "问答类摘取指令。"\n'
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.class_views["qa"].extract.instruction == "问答类摘取指令。"
+    # untouched classes carry the global extract; the global section is untouched
+    assert cfg.class_views["writing"].extract == cfg.extract
+    assert cfg.extract.instruction == ""
+
+
+def test_class_extract_whitelist_rejects_other_keys(env):
+    body = CLASSIFY_BODY + '\n[class.qa.extract]\nllm = "judge"\nenabled = true\n'
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[class.qa.extract].llm: [class.*.extract] 不可覆盖该键"
+                "（白名单：instruction）")
+    has(errors, "[class.qa.extract].enabled: [class.*.extract] 不可覆盖该键")

@@ -243,6 +243,69 @@ def samples_schema(num_per_call: int) -> dict:
             "required": ["samples"], "additionalProperties": False}
 
 
+def segment_window_schema(frame_count: int, with_reason: bool) -> dict:
+    # v1.8 M14 (spec §3.2.2 / CONTRACTS §10.7): per-frame closed-set relation verdicts
+    # for one sliding window. minItems=maxItems pins the array length (judgment_schema
+    # precedent); index alignment is enforced code-side (first-wins, default "continues")
+    # — schemas cannot express a permutation (R1: no uniqueItems).
+    relations = ["continues", "advances", "returns_to_entry", "context_switch", "interruption"]
+    item_props: dict = {"index": {"type": "integer", "minimum": 0, "maximum": frame_count - 1},
+                        "relation": {"type": "string", "enum": relations}}
+    required = ["index", "relation"]
+    if with_reason:
+        item_props["reason"] = {"type": "string"}
+        required = ["index", "relation", "reason"]
+    return {"type": "object",
+            "properties": {"frames": {"type": "array",
+                "items": {"type": "object", "properties": item_props,
+                          "required": required, "additionalProperties": False},
+                "minItems": frame_count, "maxItems": frame_count}},
+            "required": ["frames"], "additionalProperties": False}
+
+
+def action_schema() -> dict:
+    # v1.8 M15 (spec 3.15.3 / CONTRACTS §10.7): one adjacent-pair action verdict.
+    # All keys required with nullable unions — OpenAI strict mode rejects optional
+    # properties (S7, same lesson as R1); ["string","null"] is the sanctioned form.
+    # Enum order is frozen (S15: AndroidControl full set ∪ UI-TARS-mobile + other).
+    actions = ["click", "long_press", "input_text", "scroll", "drag", "open_app",
+               "app_switch", "navigate_back", "navigate_home", "wait", "other"]
+    return {"type": "object",
+            "properties": {"action_type": {"type": "string", "enum": actions},
+                           "target": {"type": ["string", "null"]},
+                           "value": {"type": ["string", "null"]},
+                           "description": {"type": "string"}},
+            "required": ["action_type", "target", "value", "description"],
+            "additionalProperties": False}
+
+
+def defect_verdict_schema() -> dict:
+    # v1.8 M7 stream variant (spec 3.7.2 / CONTRACTS §10.7): critiques kept verbatim
+    # (the repair feed-back loop is built on them) + typed defect table; opinions/defects
+    # before verdict (reason-then-conclusion, VERDICT_SCHEMA precedent). All keys
+    # required, members/position nullable (strict-safe, S7). "fail" with an empty
+    # defects array is normalized code-side to a default label_mismatch entry.
+    kinds = ["label_mismatch", "off_task_members", "missing_head", "missing_tail",
+             "missing_members"]
+    return {"type": "object",
+            "properties": {
+                "critiques": {"type": "array", "items": {"type": "object",
+                    "properties": {"aspect": {"type": "string"},
+                                   "opinion": {"type": "string"}},
+                    "required": ["aspect", "opinion"], "additionalProperties": False}},
+                "defects": {"type": "array", "items": {"type": "object",
+                    "properties": {"kind": {"type": "string", "enum": kinds},
+                                   "members": {"type": ["array", "null"],
+                                               "items": {"type": "string"}},
+                                   "position": {"type": ["string", "null"]},
+                                   "detail": {"type": "string"}},
+                    "required": ["kind", "members", "position", "detail"],
+                    "additionalProperties": False}},
+                "verdict": {"type": "string", "enum": ["pass", "fail"]}},
+            "required": ["critiques", "defects", "verdict"],
+            "additionalProperties": False}
+
+
 def classification_schema(class_names: list[str], assignment: str,
                           max_labels: int, with_reason: bool) -> dict:
     # v1.7 R1: deliberately NO uniqueItems (OpenAI strict mode rejects it; L0 passes the

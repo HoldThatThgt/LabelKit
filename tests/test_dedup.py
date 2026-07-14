@@ -535,9 +535,11 @@ def ui_semantic_stage(requires: str) -> DedupStage:
     return DedupStage(cfg, DedupIndex(cfg, "ui"))
 
 
-def probe_detail(*, decode_failed: bool = False, image_hit=None) -> "_ProbeDetail":
+def probe_detail(*, decode_failed: bool = False, image_hit=None,
+                 is_sequence: bool = False) -> "_ProbeDetail":
     return _ProbeDetail(dedup_text="t", digest=b"\x00" * 32, own_key="0" * 16,
-                        image_decode_failed=decode_failed, image_hit=image_hit)
+                        image_decode_failed=decode_failed, image_hit=image_hit,
+                        is_sequence=is_sequence)
 
 
 def test_semantic_verdict_kind_ui_matrix():
@@ -610,3 +612,170 @@ def test_probe_does_not_index_duplicates():
     # against the head only (first-writer-wins keeps only the head in the index).
     info = idx.probe_and_add(text_record(R3, "again"))
     assert info.kept_id == "head"
+
+
+# ── v1.8 sequence records (S10, spec 3.3.3 sequence row) ────────────────────
+
+def seq_record(rid: str, members: list[Record]) -> Record:
+    """S24 sequence-record convention: text/raw/ui_tree/image = None, modality =
+    the members' modality, ref inherited from the first member."""
+    first = members[0]
+    return Record(id=rid, modality=first.modality, text=None, raw=None, ui_tree=None,
+                  image=None,
+                  ref=RecordRef(source_file=first.ref.source_file,
+                                line_no=first.ref.line_no,
+                                pair_index=first.ref.pair_index, generated_from=()),
+                  kind="sequence", members=tuple(members))
+
+
+def ui_frame(rid: str, tree: UITree, pair_index: int, *, image=None) -> Record:
+    return Record(id=rid, modality="ui", text=None, raw=None, ui_tree=tree,
+                  image=image,
+                  ref=RecordRef(f"{rid}.jsonl", None, pair_index, ()))
+
+
+def test_sequence_dedup_text_joins_member_recipes_with_rs():
+    cfg = DedupConfig()
+    # Member lines recurse into the single-record recipe: R2 normalizes to R1.
+    seq = seq_record("epA", [text_record(R2, "m1"), text_record(R4, "m2")])
+    joined = _dedup_text(seq, cfg)
+    assert joined == _normalize_text(R1) + "\x1e" + _normalize_text(R4)
+    # Separator invariants (spec 3.3.3 sequence row): ASCII RS is whitespace to
+    # Python, so the whitespace-collapsed single-record recipe can never emit it.
+    assert "\x1e".isspace() is True
+    assert "\x1e" not in _dedup_text(text_record(R1, "x"), cfg)
+    # Deterministic: same member content (different ids) → identical joined text.
+    again = seq_record("epB", [text_record(R2, "m3"), text_record(R4, "m4")])
+    assert _dedup_text(again, cfg) == joined
+
+
+def test_sequence_dedup_text_ui_members_use_quantized_serialization():
+    cfg = DedupConfig(bounds_quantize_px=4)
+    m1 = ui_frame("f1", make_tree(["登录"]), 1)
+    m2 = ui_frame("f2", make_tree(["首页"]), 2)
+    seq = seq_record("ep", [m1, m2])
+    assert _dedup_text(seq, cfg) == (m1.ui_tree.serialize(quantize_px=4) + "\x1e"
+                                     + m2.ui_tree.serialize(quantize_px=4))
+
+
+def test_sequence_episodes_same_members_exact_dup():
+    cfg = DedupConfig()
+    stage = DedupStage(cfg, DedupIndex(cfg, "text"))
+    ctx = make_ctx()
+    a = PipelineItem(record=seq_record("epA", [text_record(R1, "m1"),
+                                               text_record(R4, "m2")]))
+    b = PipelineItem(record=seq_record("epB", [text_record(R1, "m3"),
+                                               text_record(R4, "m4")]))
+    run_stage(stage, [a, b], ctx)
+    assert a.status == "active" and a.dedup.kind == "unique"
+    assert b.status == "dropped_dup"
+    assert b.dedup.kind == "exact"
+    assert b.dedup.kept_id == "epA"
+    assert ctx.metrics.counters == {"dedup.exact": 1, "dedup.clusters": 1}
+
+
+def test_sequence_episodes_different_members_stay_unique():
+    cfg = DedupConfig()
+    stage = DedupStage(cfg, DedupIndex(cfg, "text"))
+    ctx = make_ctx()
+    a = PipelineItem(record=seq_record("epA", [text_record(R1, "m1"),
+                                               text_record(R4, "m2")]))
+    b = PipelineItem(record=seq_record("epB", [
+        text_record("帮我把下周的项目评审会改到周三下午三点", "m3"),
+        text_record("查一下从公司到虹桥机场的打车预估价", "m4")]))
+    run_stage(stage, [a, b], ctx)
+    assert a.status == "active" and a.dedup.kind == "unique"
+    assert b.status == "active" and b.dedup.kind == "unique"
+    assert ctx.metrics.events == [] and ctx.metrics.counters == {}
+
+
+def test_sequence_ui_requires_both_degrades_to_tree():
+    # Sequence records carry image=None ⇒ the image level can never fire; under
+    # "both" the composite verdict degrades to tree semantics (spec 3.3.3 sequence
+    # row, image_decode_failed-isomorphic): a tree near-hit ALONE drops the episode.
+    cfg = DedupConfig(ui_dup_requires="both")
+    stage = DedupStage(cfg, DedupIndex(cfg, "ui"))
+    ctx = make_ctx()
+    head = PipelineItem(record=seq_record("epA", [
+        ui_frame("f1", make_tree(LABELS_A), 1),
+        ui_frame("f2", make_tree(LABELS_FAR), 2)]))
+    probe = PipelineItem(record=seq_record("epB", [
+        ui_frame("f3", make_tree(LABELS_NEAR), 3),
+        ui_frame("f4", make_tree(LABELS_FAR), 4)]))
+    run_stage(stage, [head, probe], ctx)
+    assert head.status == "active" and head.dedup.kind == "unique"
+    assert probe.status == "dropped_dup"
+    assert probe.dedup.kind == "near_text"                 # tree-only hit, no image level
+    assert probe.dedup.kept_id == "epA"
+    payload = ctx.metrics.events[0][4]
+    assert "jaccard" in payload and "hamming" not in payload
+    assert ctx.metrics.counters == {"dedup.near_text": 1, "dedup.clusters": 1}
+
+
+def test_sequence_ui_requires_both_tree_miss_stays_unique():
+    # Degradation must not over-drop: no tree hit → the episode stays unique.
+    cfg = DedupConfig(ui_dup_requires="both")
+    stage = DedupStage(cfg, DedupIndex(cfg, "ui"))
+    ctx = make_ctx()
+    head = PipelineItem(record=seq_record("epA", [ui_frame("f1", make_tree(LABELS_A), 1)]))
+    probe = PipelineItem(record=seq_record("epB", [ui_frame("f2", make_tree(LABELS_FAR), 2)]))
+    run_stage(stage, [head, probe], ctx)
+    assert probe.status == "active" and probe.dedup.kind == "unique"
+    assert ctx.metrics.events == []
+
+
+def test_sequence_phash_never_called(monkeypatch):
+    # Level ③ auto-skips sequences through the existing `rec.image is not None` gate —
+    # even when the member frames themselves carry images — and the skip must not
+    # mis-set the image_decode_failed path (no image_decode_failures counted).
+    import labelkit.dedup as dedup_module
+    from pathlib import Path
+
+    calls: list = []
+    monkeypatch.setattr(dedup_module, "_phash_int",
+                        lambda path: calls.append(path) or 0)
+    cfg = DedupConfig(ui_dup_requires="both")
+    stage = DedupStage(cfg, DedupIndex(cfg, "ui"))
+    ctx = make_ctx()
+    fake_img = ImageRef(path=Path("never_opened.png"), format="png", size_bytes=1)
+    a = PipelineItem(record=seq_record("epA", [
+        ui_frame("f1", make_tree(LABELS_A), 1, image=fake_img)]))
+    b = PipelineItem(record=seq_record("epB", [
+        ui_frame("f2", make_tree(LABELS_A), 2, image=fake_img)]))
+    run_stage(stage, [a, b], ctx)
+    assert calls == []                                     # pHash never computed
+    assert a.status == "active"
+    assert b.status == "dropped_dup" and b.dedup.kind == "exact"   # judged without ③
+    assert "dedup.image_decode_failures" not in ctx.metrics.counters
+    assert a.record.members[0].image is fake_img           # member images untouched
+
+
+def test_semantic_participates_sequence_cases():
+    # Under "image" a sequence still participates in ④: its dedup face IS the
+    # concatenated member text (S10) — unlike a plain record, which sits ④ out.
+    image = ui_semantic_stage("image")
+    assert image._semantic_participates(probe_detail(is_sequence=True)) is True
+    assert image._semantic_participates(probe_detail()) is False   # non-sequence control
+    assert ui_semantic_stage("both")._semantic_participates(
+        probe_detail(is_sequence=True)) is True
+    assert ui_semantic_stage("tree")._semantic_participates(
+        probe_detail(is_sequence=True)) is True
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    text_stage = DedupStage(cfg, DedupIndex(cfg, "text"))
+    assert text_stage._semantic_participates(probe_detail(is_sequence=True)) is True
+
+
+def test_semantic_verdict_kind_sequence_cases():
+    # "both" walks the tree-only branch for sequences: the always-absent image hit
+    # must not block a near_semantic verdict (S10).
+    both = ui_semantic_stage("both")
+    assert both._semantic_verdict_kind(probe_detail(is_sequence=True)) == "near_semantic"
+    assert both._semantic_verdict_kind(probe_detail()) is None     # non-sequence control
+    tree = ui_semantic_stage("tree")
+    assert tree._semantic_verdict_kind(probe_detail(is_sequence=True)) == "near_semantic"
+    image = ui_semantic_stage("image")
+    assert image._semantic_verdict_kind(probe_detail(is_sequence=True)) == "near_semantic"
+    # Text-member episodes ride the text-modality branch: plain near_semantic.
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    text_stage = DedupStage(cfg, DedupIndex(cfg, "text"))
+    assert text_stage._semantic_verdict_kind(probe_detail(is_sequence=True)) == "near_semantic"

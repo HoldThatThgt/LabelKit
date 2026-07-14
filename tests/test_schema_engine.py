@@ -18,11 +18,14 @@ from labelkit.schema_engine import (
     _extract_object,
     _first_balanced_braces,
     _strip_markdown_fences,
+    action_schema,
     classification_schema,
+    defect_verdict_schema,
     deterministic_repair,
     judgment_schema,
     pointwise_schema,
     samples_schema,
+    segment_window_schema,
 )
 from labelkit.types import Usage
 
@@ -353,6 +356,102 @@ class TestInternalSchemas:
         assert v.is_valid({"samples": ["a", "b", "c", "d"]})
         assert not v.is_valid({"samples": ["a", "b", "c"]})
         assert not v.is_valid({"samples": ["a", "b", "c", "d", "e"]})
+
+    def test_segment_window_schema_two_states(self):
+        # v1.8 M14 (spec 3.14.3): minItems == maxItems == frame_count pins the
+        # array length; index range pinned to the window; NO uniqueItems —
+        # index de-duplication is judge_window's first-wins post-validation.
+        s = segment_window_schema(3, with_reason=False)
+        Draft202012Validator.check_schema(s)
+        assert s["required"] == ["frames"] and s["additionalProperties"] is False
+        arr = s["properties"]["frames"]
+        assert arr["minItems"] == 3 and arr["maxItems"] == 3
+        item = arr["items"]
+        assert item["required"] == ["index", "relation"]
+        assert item["additionalProperties"] is False
+        assert item["properties"]["index"] == {"type": "integer",
+                                               "minimum": 0, "maximum": 2}
+        assert item["properties"]["relation"]["enum"] == [
+            "continues", "advances", "returns_to_entry", "context_switch",
+            "interruption"]
+        assert "reason" not in item["properties"]
+        assert "uniqueItems" not in _all_dict_keys(s)
+        v = Draft202012Validator(s)
+        rows = [{"index": 0, "relation": "continues"},
+                {"index": 1, "relation": "advances"},
+                {"index": 2, "relation": "interruption"}]
+        assert v.is_valid({"frames": rows})
+        assert not v.is_valid({"frames": rows[:2]})              # minItems pins N
+        assert not v.is_valid({"frames": rows + rows[:1]})       # maxItems pins N
+        assert not v.is_valid({"frames": rows[:2] + [{"index": 3,
+                                                      "relation": "continues"}]})
+        assert not v.is_valid({"frames": rows[:2] + [{"index": 2,
+                                                      "relation": "boundary"}]})
+        # duplicate indices are schema-legal (first-wins is code-side)
+        assert v.is_valid({"frames": [rows[0]] * 3})
+        s2 = segment_window_schema(3, with_reason=True)
+        Draft202012Validator.check_schema(s2)
+        item2 = s2["properties"]["frames"]["items"]
+        assert item2["required"] == ["index", "relation", "reason"]
+        assert item2["properties"]["reason"] == {"type": "string"}
+        assert not Draft202012Validator(s2).is_valid({"frames": rows})  # reason required
+
+    def test_action_schema_shape(self):
+        # v1.8 M15 (S15/S7): frozen 11-value enum ORDER; all four keys required
+        # with nullable unions (OpenAI strict rejects optional properties).
+        s = action_schema()
+        Draft202012Validator.check_schema(s)
+        assert s["properties"]["action_type"]["enum"] == [
+            "click", "long_press", "input_text", "scroll", "drag", "open_app",
+            "app_switch", "navigate_back", "navigate_home", "wait", "other"]
+        assert s["required"] == ["action_type", "target", "value", "description"]
+        assert s["additionalProperties"] is False
+        assert s["properties"]["target"]["type"] == ["string", "null"]
+        assert s["properties"]["value"]["type"] == ["string", "null"]
+        assert s["properties"]["description"] == {"type": "string"}
+        assert "uniqueItems" not in _all_dict_keys(s)
+        v = Draft202012Validator(s)
+        assert v.is_valid({"action_type": "click", "target": "登录",
+                           "value": None, "description": "点击登录按钮"})
+        assert v.is_valid({"action_type": "wait", "target": None,
+                           "value": None, "description": "等待加载"})
+        assert not v.is_valid({"action_type": "tap", "target": None,
+                               "value": None, "description": "d"})
+        assert not v.is_valid({"action_type": "click", "value": None,
+                               "description": "d"})     # target key required
+
+    def test_defect_verdict_schema_shape(self):
+        # v1.8 M7 stream variant (S7): all three top keys required; defect
+        # members is a nullable STRING array; critiques byte-identical to
+        # VERDICT_SCHEMA's (the feed-back/merge chain consumes them unchanged).
+        s = defect_verdict_schema()
+        Draft202012Validator.check_schema(s)
+        assert list(s["properties"]) == ["critiques", "defects", "verdict"]
+        assert s["required"] == ["critiques", "defects", "verdict"]
+        assert s["additionalProperties"] is False
+        assert s["properties"]["critiques"] == VERDICT_SCHEMA["properties"]["critiques"]
+        defect = s["properties"]["defects"]["items"]
+        assert defect["required"] == ["kind", "members", "position", "detail"]
+        assert defect["properties"]["kind"]["enum"] == [
+            "label_mismatch", "off_task_members", "missing_head",
+            "missing_tail", "missing_members"]
+        assert defect["properties"]["members"] == {"type": ["array", "null"],
+                                                   "items": {"type": "string"}}
+        assert defect["properties"]["position"]["type"] == ["string", "null"]
+        assert s["properties"]["verdict"]["enum"] == ["pass", "fail"]
+        assert "uniqueItems" not in _all_dict_keys(s)
+        v = Draft202012Validator(s)
+        assert v.is_valid({"critiques": [{"aspect": "边界", "opinion": "缺尾帧"}],
+                           "defects": [{"kind": "missing_tail", "members": None,
+                                        "position": "tail", "detail": "缺下单确认页"}],
+                           "verdict": "fail"})
+        assert v.is_valid({"critiques": [], "defects": [], "verdict": "pass"})
+        assert not v.is_valid({"critiques": [], "verdict": "pass"})  # defects required
+        assert not v.is_valid({"critiques": [],
+                               "defects": [{"kind": "off_task_members",
+                                            "members": [123], "position": None,
+                                            "detail": "d"}],
+                               "verdict": "fail"})       # members items are strings
 
 
 # ── v1.7: classification_schema (§10.7 / spec 3.13, R1) ─────────────────────
