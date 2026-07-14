@@ -25,11 +25,11 @@ labelkit run --config <config.toml> --project <project.toml>
 
 ```
 dry-run: mode=process estimated_records=14 batches=1
-dry-run: estimated LLM calls — generate_calls=0 classify_calls=0 quality_calls=56 annotate_calls=14 verify_calls=0 total=70 (excludes retries and repair calls)
+dry-run: estimated LLM calls — generate_calls=0 segment_calls=0 classify_calls=0 extract_calls=0 quality_calls=56 annotate_calls=14 verify_calls=0 total=70 (excludes retries and repair calls)
 dry-run: no LLM calls made, no output written (report and trace only)
 ```
 
-注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），未启用恒为 0；`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。两种情况 stderr 都会多打一行注记（`dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界`）。
+注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），`segment_calls` / `extract_calls` 是 v1.8 新增字段（时序流，第 25 章），未启用恒为 0；stream 模式下 quality/annotate/verify 的估算以「episode 数 ≈ 会话数」报**下界**、extract 按剔噪前帧数报**上界**（估算公式与真实对账见第 25 章）。`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。后两种情况 stderr 都会多打一行注记（`dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界`）。
 
 ## 15.2 `labelkit validate`：只体检不跑车
 
@@ -73,6 +73,14 @@ probe <profile>[<ENV名>]: FAIL <错误信息>
 ```
 labelkit rubric                        # 列出可用的默认 rubric 名
 labelkit rubric --show default:text    # 打印该 rubric 的 TOML 全文到 stdout
+```
+
+不带参数运行列出全部可用名（真实输出；`default:trajectory` 是 v1.8 随时序流新增的轨迹准则，第 25 章）：
+
+```
+default:text
+default:ui
+default:trajectory
 ```
 
 标准用法是「导出为起点，改成自己的」：

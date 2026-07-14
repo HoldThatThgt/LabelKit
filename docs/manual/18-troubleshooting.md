@@ -15,7 +15,9 @@
 | `index_conflict` | ingest | UI 同编号多文件。默认退出码 3——回去整理目录（第 5 章） |
 | `image_too_large` | ingest | 超过 `max_image_mb`，该记录跳过 |
 | `image_decode_error` | dedup / annotate / verify | 图解码失败：dedup 跳过图像层按树判；标注/评审阶段遇到则该记录 failed |
+| `segmentation_invalid` | segment | 单窗边界裁决修复耗尽（v1.8），两种形态：默认 `on_error="keep"` ⇒ 该会话**整体成一个 episode 存活**（不精化、不剔噪），留痕在 `_meta.stream.degraded`（含失败窗数）、trace segment 通道的 error 事件与 report 的 `stream.segment_failures`——不写记录 errors；`on_error="fail"` ⇒ 会话成员全部 failed 进 rejects。批量出现 ⇒ segment.llm 结构化输出能力不足或 window 过大 |
 | `classification_invalid` | classify | 分类输出修复耗尽（v1.7），两种形态：默认 `on_error="fallback"` ⇒ 归兜底类、记录**存活不进 rejects**（痕迹在 `_meta.classification.source="fallback"`、trace classify 通道的 error 事件与 report 的 `classify.fallback_count`）；`on_error="fail"` ⇒ 记录 failed 进 rejects。fallback_count 偏高 ⇒ 类别表描述区分度不足，第 24 章 |
+| `extraction_invalid` | extract | 单个转移的动作摘取修复耗尽（v1.8），两种形态：默认 `on_error="fallback"` ⇒ 该步记 `action_type="other"` 并留痕于该步 detail（episode **存活不进 rejects**，不写记录 errors，计 `stream.extract.fallback_steps`）；`on_error="fail"` ⇒ episode failed 进 rejects。fallback_steps 偏高 ⇒ 截图不可读或摘取指令需要补域说明，第 25 章 |
 | `judgment_invalid` | quality | 单次裁决修复后仍非法 ⇒ 按平局计入 BT（不失败记录），计 `report.quality.judgment_failures`。率 >5% 见第 16 章诊断 |
 | `schema_violation` | schema 引擎 | L3 修复预算耗尽 ⇒ 记录 failed。批量出现 ⇒ 第 14 章（Schema 太难/输出被截断） |
 | `callback_violation` | schema 引擎 | L3 耗尽且剩余违规全部来自 `output.validator` 回调（14.5）⇒ 记录 failed。批量出现 ⇒ 回调规则模型学不会——把违规消息改写成更明确的改进指示，或放宽规则 |
@@ -90,6 +92,18 @@ jq -e '.run.interrupted == false and .run.circuit_broken == false' out/report.js
 ### 「跑得比 dry-run 估的贵」
 
 估算不含重试与修复。查 `llm_usage.retries`（限流？）与 `schema_engine.resolved_at.l3_*`（修复环烧钱？）。
+
+### 「开了分段，会话被切得粉碎 / episode 只有两三帧」（v1.8）
+
+病根多半在会话化阈值：`stream.gap_s`（默认 300 秒）对你的采集节奏偏小——用户盯着屏幕想了一分钟没操作，时间差就把一次任务硬切成两截。**调大 gap_s**（方向感：欠分割不可怕，LLM 边界精化还能再切；过分割不可逆）；按编号断开的工程同理调 `gap_steps`。判断依据：trace 订阅 `"segment"` 看 `segment.session` 事件的 `cause` 分布——大量 `"gap"` 断开、且相邻两个会话明显本属同一流程，就是阈值偏小。
+
+### 「dropped_noise 率不对劲（异常高，或明明有弹窗却是零）」（v1.8）
+
+先抽读裁决：`trace.channels` 加 `"segment"`，逐条看 `segment.boundary` 事件里每帧的 relation 判决（订阅该通道后事件自带 reason，能看到判噪理由）。正常推进帧被大量判 `interruption` ⇒ 给 `segment.context` 补一句域上下文，或换更强的 `segment.llm`；确知采集里有弹窗误触却一帧没剔 ⇒ 查 `strategy` 是否是 `"rules"`（规则层不做噪声标记）、`noise_filter` 是否被关。
+
+### 「stream 工程配 --strict 总以退出码 1 结束」（v1.8）
+
+**预期行为，不是故障**。工程噪声帧（弹窗、误触、短段丢弃）是 stream 模式的正常产物，它们进拒绝通道（reason 为 `noise` / `below_min_len`），而 `--strict` 的语义是「有任何拒绝即退出 1」。stream 工程要么不配 `--strict`，要么让脚本改读 report 计数（如 `failed` 与 `dropped_verify`）判断健康度。
 
 ### 「运行频繁被 429 限流拖慢 / 中断」
 

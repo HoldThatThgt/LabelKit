@@ -24,27 +24,31 @@ id 贯穿一切：主输出的 `_meta.id`、拒绝通道、trace 事件里的 `r
 每条记录在流水线上背着一个状态牌，从 `active` 出发，只会发生这些变迁：
 
 ```
-                    ┌─ dedup 判重 ──────▶ dropped_dup      （重复，簇内非首见）
-                    ├─ quality 门控 ────▶ dropped_lowq     （聚合分不过线 / 未入选）
-     active ────────┼─ verify 终裁 ────▶ dropped_verify    （评审不合格且修不好）
-   （存活，继续走）  ├─ 任何环节不可恢复失败 ▶ failed         （如结构修复耗尽、API 致命错误）
+                    ┌─ segment 吸收 ────▶ absorbed         （v1.8：帧被并入某个 episode）
+                    ├─ segment 判噪 ────▶ dropped_noise    （v1.8：噪声帧 / 不足最短段长）
+                    ├─ dedup 判重 ──────▶ dropped_dup      （重复，簇内非首见）
+     active ────────┼─ quality 门控 ────▶ dropped_lowq     （聚合分不过线 / 未入选）
+   （存活，继续走）  ├─ verify 终裁 ────▶ dropped_verify    （评审不合格且修不好）
+                    ├─ 任何环节不可恢复失败 ▶ failed         （如结构修复耗尽、API 致命错误）
                     └─ 走完全部工位 ─────▶ 仍为 active ⇒ 写入主输出
 ```
+
+两个 v1.8 新状态只在开启分段算子（stream 模式，第 25 章）时出现：`absorbed` 表示这条帧记录被吸收为某个 episode（序列信封）的成员——它不进主输出也不进拒绝通道，账记在序列信封名下；`dropped_noise` 表示这一帧被判为噪声（弹窗、误触等插入帧）或所在段不足最短段长而被剔除，进拒绝通道。
 
 三条铁律：
 
 1. **算子只处理 `active` 的记录**——被前面工位淘汰的，后面工位看都不看（也就不再为它花钱）；
-2. **算子永远不从批里删除元素，只改状态**——账目因此永远算得平。v1.7 起有一个**只增不删**的例外：分类算子在 `classify.assignment = "multi"` 下可向批**尾部**追加扇出的兄弟信封（一条记录命中多个类别时每类一个信封），既有元素仍一个不动（第 24 章）；
+2. **算子永远不从批里删除元素，只改状态**——账目因此永远算得平。v1.7 起有一个**只增不删**的例外：分类算子在 `classify.assignment = "multi"` 下可向批**尾部**追加扇出的兄弟信封（一条记录命中多个类别时每类一个信封），既有元素仍一个不动（第 24 章）。v1.8 又添一个同族例外（②b）：分段算子可把批内成员帧信封置为 `absorbed` / `dropped_noise`，并向批尾追加以这些成员拼装的序列信封（每帧至多被一个 episode 吸收）；verify 的缺陷修复路径还可在本批内把成员帧状态在 `absorbed` 与 `dropped_noise` 之间**双向**改写（回收误杀帧 / 剔除混入帧）——这是「状态只进不退」的唯一反向豁免，且永远不会把成员翻回 `active`（第 25 章）；
 3. **单条记录的失败绝不升级为整批失败**——异常被收进该记录的 `errors` 列表，状态置 `failed`，运行继续。
 
 最终去向：`active` → 主输出；`dropped_*` / `failed` → 拒绝通道（按 `output.rejects` 档位落盘）；所有状态计数 → 报告。于是有了那条**守恒等式**：
 
 ```
-emitted + dropped_dup + dropped_lowq + dropped_verify + failed + bad_input
-  = scanned + generated [+ fanout]
+emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed + bad_input [+ absorbed]
+  = scanned + generated [+ fanout] [+ episodes]
 ```
 
-（`bad_input` 是 ingest 阶段就不成记录的坏行/缺对，没有 id，不走拒绝通道，只计数。`fanout` 仅在 `classify.assignment = "multi"` 时出现于 `counts`——multi 扇出净增的信封数，右侧随之补平，第 24 章。）
+（`bad_input` 是 ingest 阶段就不成记录的坏行/缺对，没有 id，不走拒绝通道，只计数。`fanout` 仅在 `classify.assignment = "multi"` 时出现于 `counts`——multi 扇出净增的信封数，右侧随之补平，第 24 章。`absorbed` / `dropped_noise` / `episodes` 是 v1.8 的 stream 三项，仅 `segment.enabled = true` 时出现：分段吸收的帧与剔除的噪声帧记在左侧，净增的 episode 信封数记在右侧补平，第 25 章。未启用的项恒为 0，等式退化回原形。另注意残差项 `unprocessed`：熔断中止时左侧另加它；stream 模式下**优雅中断（SIGINT/SIGTERM）也会**产生该项——会话缓冲让中断时可能有已扫描但未走完流水线的帧；非 stream 模式的中断残差恒为 0、不出现此键。）
 
 ## 4.3 批（Batch）：流动与屏障
 
@@ -70,7 +74,7 @@ emitted + dropped_dup + dropped_lowq + dropped_verify + failed + bad_input
 
 ## 4.5 算子开关：合法组合与约束
 
-六个可开关算子（dedup / classify / quality / generate / annotate / verify）由 `project.toml` 各节的 `enabled` 控制。但 M1 配置校验会拦下无意义或矛盾的组合：
+八个可开关算子（segment / dedup / classify / extract / quality / generate / annotate / verify）由 `project.toml` 各节的 `enabled` 控制。但 M1 配置校验会拦下无意义或矛盾的组合：
 
 | 约束 | 理由 |
 |---|---|
@@ -80,6 +84,9 @@ emitted + dropped_dup + dropped_lowq + dropped_verify + failed + bad_input
 | `generate` 开 + process 模式 ⇒ `quality` 必须开 | 生成的种子来自「过质量门」的记录 |
 | `mode = "generate_only"` ⇒ `generate` 必须开，且 `run.input` 必须**不设** | 纯生成模式没有输入 |
 | `quality.threshold` 与 `quality.selection="top_ratio"` **互斥** | 两种淘汰机制不能同时生效 |
+| `segment` 开 ⇒ `mode = "process"` 且 `generate` 必须关且 `annotate` 必须开（v1.8） | 分段加工的是既有时序流，与生成互斥（序列合成属路线图）；episode 的产出物就是标注 |
+| `extract` 开 ⇒ `segment` 必须开且模态必须是 `ui`（v1.8） | 动作摘取的对象是屏幕帧序列——没有分段就没有 episode，文本序列 v1 不适用 |
+| `segment` 开 ⇒ `quality.llm` **免除** `supports_vision` 要求（v1.8，唯一放宽项） | 序列打分是纯文本（步骤序列 + 帧摘要，无图），UI 模态也不需要视觉能力 |
 
 `classify`（v1.7，默认关）与上表各开关**正交**：分类不改变组合合法性，任意合法组合都可以叠加分类——multi 扇出后的每个信封走同一套阶段组合（第 24 章）。
 
@@ -93,6 +100,7 @@ emitted + dropped_dup + dropped_lowq + dropped_verify + failed + bad_input
 | ✓ | — | ✓ | ✓ | ✓ | ✓ | **全流程**：治理 + 扩充生成 + 标注 + 复核（成本最高，质量最高） |
 | ✓ | — | 可选 | ✓ | 可选 | — | **纯生成**（`generate_only`）：无中生有 → 治理 →（标注）→ 输出 |
 | ✓ | ✓ | ✓ | — | ✓ | — | **按类分治**（v1.7）：先分类，再按类 rubric 打分、按类指令标注（第 24 章） |
+| ✓ | — | ✓ | — | ✓ | 可选 | **时序流分段标注**（v1.8）：另开 `[segment]`（UI 下可再开 `[extract]`），把连续采集的帧流切成 episode、摘出动作序列，再整段打分与标注（第 25 章） |
 
 ## 4.6 两份配置文件：为什么是两份
 

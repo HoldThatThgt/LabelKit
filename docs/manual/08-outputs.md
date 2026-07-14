@@ -31,7 +31,7 @@
     "id": "a8aa181766eebd97",                        ← 记录的确定性 id（第 4 章）
     "run": {                                         ← 这次运行的指纹
       "tool": "labelkit/1.0.0",
-      "started_at": "2026-07-07T23:07:54.213290+08:00",
+      "started_at": "2026-07-14T04:56:31.624648+08:00",
       "project_file": "project.toml",
       "rubric": "default:text",
       "seed": 42
@@ -43,12 +43,13 @@
       "fields": {"source": "ime-log"},               ← passthrough_fields 透传的原始字段
       "generator": null                              ← 若是合成样本：{"llm": "...", "style": "..."}
     },
+    "stream": null,                                  ← 时序流元信息（v1.8 恒在键；stream 模式未启用恒为 null，第 25 章）
     "scores": {                                      ← 质量分（quality 开启时）
       "writing_style": 0.4,                          ← 每条准则一个 [0,1] 分
-      "required_expertise": 0.6,
+      "facts_trivia": 0.6,
       "educational_value": 0.8,
-      "facts_trivia": 1.0,
-      "__aggregate__": 0.7000000000000001,           ← 加权聚合分（质量门用的就是它；浮点尾数正常）
+      "required_expertise": 0.6,
+      "__aggregate__": 0.6,                          ← 加权聚合分（质量门用的就是它）
       "mode": "pointwise",                           ← 打分模式；pairwise 时为 "pairwise_bt"
       "batch_no": 1                                  ← 在第几批打的分（pairwise 下跨批不可比）
     },
@@ -111,8 +112,8 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
 {
   "run": {
     "tool_version": "1.0.0",
-    "started_at": "2026-07-07T23:07:54.213290+08:00",
-    "finished_at": "2026-07-07T23:09:41.179786+08:00",
+    "started_at": "2026-07-14T04:56:31.624648+08:00",
+    "finished_at": "2026-07-14T04:57:51.322560+08:00",
     "interrupted": false,                ← 仅 SIGINT/SIGTERM 优雅中断时为 true
     "circuit_broken": false,             ← 熔断的显式标志（触发时为 true，exit_code 同为 4）
     "exit_code": 0,
@@ -136,34 +137,34 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
     "rounds": 4,
     "judgment_failures": 0,              ← 裁决输出不合法的次数（>5% 要警惕，见第 16 章）
     "aggregate_histogram": {             ← 聚合分 10 桶直方图：
-      "0.0-0.1": 3, "0.1-0.2": 3, "0.2-0.3": 1, "0.3-0.4": 1,
-      "0.4-0.5": 3, "0.5-0.6": 0, "0.6-0.7": 0, "0.7-0.8": 2, "…": 0
+      "0.0-0.1": 3, "0.1-0.2": 1, "0.2-0.3": 3, "0.3-0.4": 1,
+      "0.4-0.5": 1, "0.5-0.6": 0, "0.6-0.7": 4, "…": 0
     },                                       画质量线之前先看它！
     "per_criterion_mean": {              ← 每条准则的均值：哪条准则在拖后腿一目了然
-      "educational_value": 0.3538461538461538, "facts_trivia": 0.16923076923076924,
-      "required_expertise": 0.2615384615384615, "writing_style": 0.3692307692307692
+      "educational_value": 0.35384615384615387, "facts_trivia": 0.24615384615384617,
+      "required_expertise": 0.2769230769230769, "writing_style": 0.4
     }                                    ← pairwise 模式下均值恒 ≈0.5，另有 per_criterion_tie_rate
   },                                        （每准则平局率，只统计拿到裁决的比较——rubric 区分度的直接读数）
   "schema_engine": {                     ← 结构引擎四层的命中分布（第 14 章）
-    "resolved_at": {"l0_or_clean": 4, "l1": 3, "l3_1": 0, "l3_2": 0, "rejected": 0}
+    "resolved_at": {"l0_or_clean": 5, "l1": 2, "l3_1": 0, "l3_2": 0, "rejected": 0}
   },
   "trace": {"enabled": true, "path": "out/text-labels.trace.jsonl",
-             "events": 74, "dropped_events": 0},
+             "events": 73, "dropped_events": 0},
   "llm_usage": {                         ← 分 profile 的用量账单
-    "default": {"calls": 61, "prompt_tokens": 23550,
-                 "completion_tokens": 6053, "retries": 0}
+    "default": {"calls": 61, "prompt_tokens": 22887,
+                 "completion_tokens": 5676, "retries": 0}
   },                                     ← 配了单价时另有 est_cost_usd
-  "timing": {"wall_s": 106.755,
-              "per_stage_s": {"dedup": 0.004, "quality": 93.425, "annotate": 13.319}}
+  "timing": {"wall_s": 79.491,
+              "per_stage_s": {"dedup": 0.004, "quality": 70.044, "annotate": 9.436}}
 }
 ```
 
-（分数与耗时是真实运行的快照，逐次运行会有浮动；计数守恒与字段结构不变。）
+（分数与耗时是真实运行的快照，逐次运行会有浮动；计数守恒与字段结构不变。这份 text 报告里**没有** `stream` 节——它与 `counts` 里的 `episodes` / `absorbed` / `dropped_noise` 一样，仅 stream 模式（segment 启用）时出现，第 25 章。）
 
 读报告的三板斧：
 
 1. **先看 `counts` 对不对账**——各状态数量符合预期吗？`failed` 非零就去拒绝通道翻 `errors`；
-2. **再看 `quality.aggregate_histogram`**——分布形状决定阈值画哪里。比如上面这份：0.25 的线落在 0.2-0.3 桶内，被淘汰的六条恰是 0~0.2 两桶的全部（3+3）；0.2-0.3 桶的那一条聚合分正好等于 0.25，质量门按「< 阈值才淘汰」放行，留下了。如果直方图整体右移，同一条线就几乎不淘汰东西；
+2. **再看 `quality.aggregate_histogram`**——分布形状决定阈值画哪里。比如上面这份：0.25 的线落在 0.2-0.3 桶内，被淘汰的六条 = 0~0.2 两桶的全部（3+1）加 0.2-0.3 桶里两条 0.2 的；桶里剩下那条聚合分正好等于 0.25，质量门按「< 阈值才淘汰」放行，留下了。如果直方图整体右移，同一条线就几乎不淘汰东西；
 3. **最后看 `llm_usage` 和 `timing`**——哪个阶段最烧钱/最耗时（几乎总是 quality），是否要换模式、调并发（第 17 章）。
 
 另有两个按需出现的块：`annotate.sc_disagreements`（开 self-consistency 时：全体分歧、回退首样本的次数）与 `generate.buckets`（开生成时：每个「模型×风格」桶的调用数 / 产出数 / 去重存活数，配置 `sample_validator` 时另有回调剔除数 `rejected_by_validator`——某桶存活率明显低说明它在产重复货或不合规货，第 12 章）。
@@ -179,6 +180,8 @@ v1.7（分类算子，第 24 章）再增三处按需出现的字段（未启用
 - **`classify` 节**（仅 `classify.enabled = true` 时出现）：`assignment`、逐类命中计数 `classes`、兜底归类数 `fallback_count` 与失败数 `failures`（multi 模式另有 `multi_label_records`）；`quality` 节同时增 `by_class` 分池统计——各池独立的直方图与准则均值；
 - **`counts.fanout`**（仅 `assignment = "multi"` 时增列）：多标签扇出净增的行数，守恒等式右侧相应 `+ fanout`（第 4 章）；
 - **`generate.buckets` 的桶 key**：classify 启用时由「`<llm>×<style>`」两段扩展为「`<class>×<llm>×<style>`」三段（关闭时格式不变，第 12 章）。
+
+v1.8（时序流，第 25 章）再增两处按需出现的块（未启用时报告形状与旧版逐字段一致）：`counts` 增列 `episodes` / `absorbed` / `dropped_noise`，且 `counts` 之后新增顶层 `stream` 节（会话数、段长均值、`below_min_len`、摘要贫瘠帧数，extract / verify 各一个子块）——两者都仅 segment 启用时出现。守恒等式相应扩展为全展开形：左侧另加 `dropped_noise + absorbed`、右侧另加 `episodes`（未启用项恒 0 时退化回第 4 章原式；真实验算见第 25 章）；且 stream 模式下 `counts.unprocessed` 的出现条件从「仅熔断」扩为「熔断或优雅中断」。
 
 > **报告写失败怎么办**：主输出成功、报告写失败时，进程以退出码 1 结束——产物可用但账本缺失，别当成功处理。
 

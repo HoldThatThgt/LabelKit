@@ -84,7 +84,7 @@
 | `judges` | [] | 评审团（奇数个档名）；非空**替代** quality.llm；成本× | 10 |
 | `both_orders` | false | 正反双序一致才记胜负；成本 ×2 | 10 |
 | `on_unscored` | "keep" | 全部比较失败的记录去留；keep 不占 top_ratio 名额 | 10 |
-| `rubric` | 按模态自动 | "default:text" \| "default:ui" \| "inline"（须配 [[rubric.criteria]]） | 10/B |
+| `rubric` | 按模态自动 | "default:text" \| "default:ui" \| "default:trajectory"（v1.8 轨迹四准则）\| "inline"（须配 [[rubric.criteria]]）；缺省按模态选，**segment 开启时缺省解析为 default:trajectory** | 10/B |
 | `judgment_reasons` | "auto" | 裁决附理由；auto=开了 quality trace 才要 | 10/16 |
 | `rubric.name` / `criteria[].key/weight/description/pairwise_prompt/pointwise_levels[6]` | — | 内联 rubric 结构 | 7/10 |
 
@@ -117,6 +117,7 @@
 | `annotate.examples` | [] | few-shot {input, output}；output 启动时过 Schema 校验 | 11 |
 | `annotate.self_consistency` | 0 | 0=关；≥3 奇数：n 次采样字段级投票，成本 ×n | 11 |
 | `annotate.sc_temperature` | 0.7 | SC 各次采样温度（多样性来源） | 11 |
+| `annotate.sequence_frames` | 20 | v1.8 序列标注单请求最大关键帧数，∈ **[2, 100]**；超员按等距降采样（首末帧恒含）；**>20 且所引档 max_image_px>2000 ⇒ WARN**（Anthropic 多图请求硬拒）；非 stream 显式设置 ⇒ no-op warning | 11/25 |
 | `verify.enabled` | false | 开则要求 annotate 开 | 13 |
 | `verify.llm` | "judge" | enabled 且 judges 为空时须存在于 [llm.*]（judges 非空即被替代、免校验）；建议独立于标注模型 | 13 |
 | `verify.judges` | [] | 评审团（奇数个）；非空替代 verify.llm | 13 |
@@ -137,7 +138,7 @@
 | `output.rejects` | "refs" | "none" \| "refs"（无数据内容）\| "full"（含原文=数据副本） | 8 |
 | `trace.enabled` | false | 事件流开关 | 16 |
 | `trace.path` | {stem}.trace.jsonl | 首个事件写出时截断（速败运行不再触碰；dry-run 写 `{名}.dryrun{后缀}` 独立文件） | 16 |
-| `trace.channels` | ["quality","verify","schema"] | 八通道：ingest/dedup/classify（v1.7）/quality/annotate/verify/schema/llm；默认值不变，分类判决须显式订阅 "classify" | 16/24 |
+| `trace.channels` | ["quality","verify","schema"] | 十通道：ingest/segment（v1.8）/dedup/classify（v1.7）/extract（v1.8）/quality/annotate/verify/schema/llm；默认值不变，分类/分段/摘取判决须显式订阅对应通道 | 16/24/25 |
 | `trace.content` | "refs" | none→refs→excerpt→full 四档脱敏；full=完整数据副本 | 16 |
 
 ## A.8 组合约束（启动即查，违反=退出码 2）
@@ -157,6 +158,10 @@
 13. `classify.enabled = true` ⇒ `[[classify.classes]]` ≥ 2 项，且 `classify.fallback_class` 必填并 ∈ classes（v1.7）
 14. `classify.max_labels` 仅 `assignment = "multi"` 可设，∈ [2, 类别数]（缺省回填为类别数）
 15. `classify.enabled = false` 而 `[[classify.classes]]` / `[class.*]` 在场 ⇒ 仅 **warning**（一次、点名被忽略的表——「留配置、关开关」合法，不触发退出码 2）
+16. `segment.enabled = true` ⇒ `run.mode = "process"` ∧ `generate.enabled = false` ∧ `annotate.enabled = true`（v1.8）
+17. `extract.enabled = true` ⇒ `segment.enabled = true` ∧ `run.modality = "ui"`（v1.8）
+18. stream 的 vision 校验逐阶段（v1.8）：`extract.llm` **恒**须 supports_vision；`segment.llm` 仅 `use_vision = true` 时须；`quality.llm` **免除**（唯一放宽）；`stream.gap_s` / `session_max_span_s` 仅 `order_by = "meta:*"` 可设（meta:* 仅文本模态）
+19. `[stream]` / `[segment]` / `[extract]` 任一节在场而 `segment.enabled = false` ⇒ 仅 **warning**（同第 15 条形制）；`segment.window` ≥ 2；`annotate.sequence_frames` ∈ [2, 100]
 
 ## A.9 project.toml — [classify] 与 [class.<name>.*] 按类覆盖（v1.7 追加）
 
@@ -181,6 +186,36 @@
 | `[class.*.annotate]` | instruction / examples | llm、self_consistency、sc_temperature |
 | `[class.*.generate]` | instruction / styles / num_per_record / temperature | llms、mixture、weights、seeds_per_call、num_per_call、sample_validator |
 | `[class.*.verify]` | extra_criteria | llm、judges、policy、max_repair_rounds |
-| —— | —— | `run.*` / `input.*` / `dedup.*` / `classify.*` / `output.*`（输出 Schema 全局唯一）/ `trace.*` 从不按类 |
+| `[class.*.extract]`（v1.8） | instruction | llm、include_diff、on_error |
+| —— | —— | `run.*` / `input.*` / `stream.*`（v1.8）/ `dedup.*` / `segment.*`（v1.8，链序在 classify 之前，类标签尚不存在）/ `classify.*` / `output.*`（输出 Schema 全局唯一）/ `trace.*` 从不按类 |
 
 合并细则：优先级 `[class.<name>].<节>.<键>` > `[<节>].<键>` > 内置默认；threshold/selection/top_ratio 按**选择组**整组合并（全局 threshold + 类 top_ratio 合法，互斥校验跑在合并后视图上）；类 rubric 换 selector 后重解析，6 级量表校验按（类有效 mode × 类有效 rubric）执行；类 examples 启动时干跑全局 Schema。详见第 24 章。
+
+## A.10 project.toml — [stream] / [segment] / [extract]（v1.8 追加）
+
+`[stream]` 是输入侧声明（排序与会话化，随 `segment.enabled` 生效）；`[segment]` 是 stream 模式总开关；`[extract]` 仅 UI 序列可开。三节任一在场而 segment 关 ⇒ 仅 warning（A.8 第 19 条）。详见第 25 章。
+
+| 键 | 默认 | 一句话 | 章 |
+|---|---|---|---|
+| `stream.order_by` | "input_order" | 文本=文件名字典序→行号、UI=配对编号升序 \| "meta:<field>"（**仅文本模态**）：按行内时间戳定序，数值自动判秒/毫秒、ISO 字符串（含 Z）可解析 | 5/25 |
+| `stream.on_disorder` | "skip" | 乱序/时间戳解析失败的记录跳过并计数 \| "fail"（退出码 3）；单调性游标按分区键各自维护 | 25 |
+| `stream.key` | [] | 分区键列表："meta:<field>"（文本）\| "source_dir"（UI，= 文件父目录）；**键变即断**（groupby 语义，输入须按键成组） | 5/25 |
+| `stream.gap_s` | 300 | 相邻记录时间差 > 阈值即断会话；**仅 order_by="meta:*" 可设**；默认偏大——欠分割可由 LLM 精化拯救、过分割不可逆 | 25 |
+| `stream.gap_steps` | 0 | 序号差断会话（0=不启用）；与 gap_s 可并用，任一触发即断 | 25 |
+| `stream.session_max_len` | 200 | 会话硬上限（帧）；**> batch_size ⇒ 启动 WARN**（超批会话将被硬切 + session_split 标） | 25 |
+| `stream.session_max_span_s` | 0 | 会话时间跨度硬上限（秒，0=不启用）；仅 order_by="meta:*" 可设 | 25 |
+| `segment.enabled` | false | stream 模式总开关；默认关 = 行为与 v1.7 逐字节一致（`_meta.stream` 恒在 = null 除外）；启用要求见 A.8 第 16 条 | 25 |
+| `segment.strategy` | "hybrid" | "rules"（候选会话原样成 episode，零 LLM；noise_filter/min_len 不生效）\| "llm" \| "hybrid"（单帧会话自动走 rules 退化） | 25 |
+| `segment.llm` | "default" | **仅 strategy ∈ {llm, hybrid} 时**计入密钥/vision（仅 use_vision）/probe/存在性四处引用集——rules 零调用不强制配键 | 25 |
+| `segment.window` | 20 | 滑窗帧数/调用，**≥ 2**；步长 = window−1（重叠 1 帧）；窗 ≥ 会话长时天然退化为整段单调用 | 17/25 |
+| `segment.digest_max_chars` | 400 | 单帧文字摘要长度上限 | 25 |
+| `segment.noise_filter` | true | 逐帧噪声标记（判噪帧 → dropped_noise）；仅 llm/hybrid 生效——rules 下设 true 为 no-op warning | 25 |
+| `segment.min_len` | 2 | 段最短帧数；**仅作用于 LLM 精化切出的段**（规则层孤帧/短会话不受约束）；被弃帧 reason="below_min_len"（≠ noise），独立计数 | 25 |
+| `segment.use_vision` | false | true 时窗内逐帧附截图（所引档须 supports_vision）；默认纯文本（仅帧摘要） | 25 |
+| `segment.context` | "" | 可选域上下文注入判据模板；**非边界定义**——边界判据内置，零配置可用 | 25 |
+| `segment.on_error` | "keep" | 单窗修复耗尽：该会话整体成一个 episode 存活 + 留痕 `_meta.stream.degraded`（**不写记录 errors**）\| "fail"（会话成员全部 failed → rejects） | 18/25 |
+| `extract.enabled` | false | 启用要求 `segment.enabled` ∧ `modality="ui"`（A.8 第 17 条；文本序列 v1 不适用） | 25 |
+| `extract.llm` | "default" | **恒**计入四处引用集且**恒**须 supports_vision（每转移一请求 2 图） | 25 |
+| `extract.instruction` | "" | 摘取补充说明，追加进 system 摘取指令后；`[class.<name>.extract]` 可按类覆盖（白名单仅此键） | 24/25 |
+| `extract.include_diff` | true | `[树变更摘要]` 注入开关（结构化树 diff 证据）；可关做 A/B 消融对比摘取质量 | 17/25 |
+| `extract.on_error` | "fallback" | 单转移修复耗尽：该步记 action_type="other" 留痕（episode 存活，**不写记录 errors**）\| "fail"（episode failed → rejects） | 18/25 |

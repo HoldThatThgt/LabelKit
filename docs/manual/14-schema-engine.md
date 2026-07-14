@@ -146,7 +146,7 @@ max_repair_attempts = 2           # L3 轮数预算（L2.5 回调违规同样消
 
 ## 14.7 内部结构也走同一个引擎
 
-一个容易忽略的事实：不只你的标注 Schema，**LabelKit 自己的内部输出**——质量裁决 `{"judgments": [...]}`、pointwise 评分、评审结论 `{"critiques": [...], "verdict"}`、生成样本 `{"samples": [...]}`、分类结果 `{"class": ...}` / multi 模式的 `{"classes": [...]}`（v1.7）——全部经由同一个 `complete_validated()` 入口、同一套四层防线。所以：
+一个容易忽略的事实：不只你的标注 Schema，**LabelKit 自己的内部输出**——质量裁决 `{"judgments": [...]}`、pointwise 评分、评审结论 `{"critiques": [...], "verdict"}`、生成样本 `{"samples": [...]}`、分类结果 `{"class": ...}` / multi 模式的 `{"classes": [...]}`（v1.7），以及 v1.8 stream 一族的三个：分段的**窗口关系表** `{"frames": [{index, relation}]}`（逐帧关系用封闭五词表枚举锁死，LLM 答不出词表外的边界判断）、摘取的**动作对象** `{"action_type", "target", "value", "description"}`（动作类型用 11 值词表锁死，target/value 是可空联合）、序列评审的**缺陷表** `{"critiques", "defects", "verdict"}`（缺陷种类用五值枚举锁死，意见与缺陷在前、结论在后）——全部经由同一个 `complete_validated()` 入口、同一套四层防线。所以：
 
 - 裁决输出偶尔非法不会炸：修不好按平局计（`judgment_invalid`，对 BT 中性），计入 `report.quality.judgment_failures`；
 - 内部修复调用同样计入 token 计量与 `llm.call` trace 事件——账一分不少；

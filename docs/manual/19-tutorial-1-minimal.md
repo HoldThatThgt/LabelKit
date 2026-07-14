@@ -114,7 +114,7 @@ jq -c 'del(._meta)' out/labels.jsonl
 
 （你的 topic 措辞可能略有不同——那是模型的自由发挥空间；`kind` 则被枚举锁死，只可能是三者之一。）
 
-再看一条完整的 `_meta`：`scores` 是 `null`（quality 关了）、`dedup` 是 `null`（dedup 关了）、`verification` 同理，`classification` 也是 `null`（v1.7 起恒有此键，分类工位默认关），`annotation.attempts` 大概率是 1。**`_meta` 的键始终齐全，关掉的工位一律置 `null`——哪些值非空，忠实反映你开了哪些工位。**（给 jq 用户提个醒：`._meta.scores` 会取到 null 而不是报缺键，判断工位是否开启要比较 `!= null`。）
+再看一条完整的 `_meta`：`scores` 是 `null`（quality 关了）、`dedup` 是 `null`（dedup 关了）、`verification` 同理，`classification` 也是 `null`（v1.7 起恒有此键，分类工位默认关），`stream` 也是 `null`（v1.8 起恒有此键，分段工位默认关），`annotation.attempts` 大概率是 1。**`_meta` 的键始终齐全，关掉的工位一律置 `null`——哪些值非空，忠实反映你开了哪些工位。**（给 jq 用户提个醒：`._meta.scores` 会取到 null 而不是报缺键，判断工位是否开启要比较 `!= null`。）
 
 ## 19.6 三个一分钟实验
 

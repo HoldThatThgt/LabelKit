@@ -22,8 +22,12 @@
 | `run.start` / `run.end` | 首行 / 末行 | 配置指纹；终版 counts 与 exit_code |
 | `batch.start` / `batch.end` | 每批 | 各状态计数、耗时 |
 | `ingest.bad_line` / `missing_pair` / `index_conflict` | 接入跳过时 | 文件、行号/index、原因 |
+| `ingest.disorder` | 流式单调性校验拒绝一条记录时（乱序或时间戳解析失败，v1.8 stream 模式）；skip 策略下每记录一事件、stderr 全运行只 WARN 一次 | 文件、行号（文本）/ index（UI）、原因（乱序 \| 时间戳解析失败） |
+| `segment.session` | 会话装配器闭合一个候选会话时（v1.8）。仅 trace、无 stderr 镜像；通道为 `"segment"`（发出方是接入层，但按事件名前缀归 segment 通道），不在默认订阅里 | session_id、首末帧、长度、断开原因（gap / key / max_len / max_span / eof / limit） |
+| `segment.boundary` | 每个滑窗边界裁决经校验通过后（v1.8）。仅 trace、无 stderr 镜像；通道 `"segment"` | session_id、窗口区间、成员 id、逐帧关系判决（封闭五词表）；**reason** 仅当订阅了 segment 通道时才请求并携带（零额外 token 原则，同 classify） |
 | `dedup.duplicate` | 每次判重（判为 unique 不发事件） | kind、簇键、kept_id；近似重复另带**恰一项实测相似度**（文本 jaccard / 图像 hamming / 语义 cosine），exact 精确重复无相似度字段 |
-| `classify.decision` | 每条记录分类定案时（v1.7）。仅 trace、无 stderr 镜像；通道为 `"classify"`——v1.7 新增的第八个通道值，不在默认订阅里，要看它须在 `trace.channels` 显式加入 | label（本信封的路由标签）、labels（multi 时的命中全集）、source（llm / fallback / inherited）；**reason** 仅当订阅了 classify 通道时才请求并携带（零额外 token 原则）；self-consistency 启用时另带 sc（n 与一致率） |
+| `classify.decision` | 每条记录分类定案时（v1.7）。仅 trace、无 stderr 镜像；通道为 `"classify"`——独立通道值（通道全集 v1.8 起共**十**个），不在默认订阅里，要看它须在 `trace.channels` 显式加入 | label（本信封的路由标签）、labels（multi 时的命中全集）、source（llm / fallback / inherited）；**reason** 仅当订阅了 classify 通道时才请求并携带（零额外 token 原则）；self-consistency 启用时另带 sc（n 与一致率） |
+| `extract.step` | 每对相邻帧的动作摘取定案后（含 fallback 兜底步，v1.8）。仅 trace、无 stderr 镜像；通道 `"extract"` | episode_id、步序号、action_type；description 自 `refs` 档起携带；target / value 自 `excerpt` 档起（见下方分级细则） |
 | `quality.judgment` | 每次成对裁决 | 呈现顺序、每准则 winner + **reason**（评审团时每评审一条，带 judge 字段） |
 | `quality.pointwise` | 每次单点打分 | criterion、0–5 原始分、reason |
 | `quality.bt_fit` | 每批每准则拟合完 | 是否收敛、迭代数、比较数 |
@@ -37,7 +41,7 @@
 | `llm.pool_parked` | 某 profile 全部存活密钥均在冷却、调用开始驻留时（v1.6；每次驻留一事件）。同时发 stderr WARN | profile、`wait_s`（预计驻留秒数）、`live_keys`（存活密钥数） |
 | `error` | 每次 StageError | stage、错误码 kind（第 18 章）、message、是否可重试 |
 
-内容脱敏四档（`trace.content`）回顾：`none`（只有结构化字段）→ `refs`（+LLM 产出的理由文本，默认）→ `excerpt`（+输入内容前 200 字）→ `full`（+完整提示词与响应，需订阅 `llm` 通道；**等于存了一份数据副本，短期调试用完即清**）。
+内容脱敏四档（`trace.content`）回顾：`none`（只有结构化字段）→ `refs`（+LLM 产出的理由文本，默认）→ `excerpt`（+输入内容前 200 字）→ `full`（+完整提示词与响应，需订阅 `llm` 通道；**等于存了一份数据副本，短期调试用完即清**）。v1.8 补一条分级细则：`extract.step` 的 `target` / `value` 是**输入数据派生**字段（目标控件文本、用户键入文本），归入专门的数据键剥除集——`none` 与 `refs` 档一律剥除、自 `excerpt` 档起才携带，守住 refs 档「不含任何输入数据内容」的红线；`description` 是 LLM 产出文本，与 reason / critiques 同级（`refs` 档起携带）。
 
 一条与脱敏档位无关的恒定规则（v1.6）：`llm.key_*` / `llm.pool_*` 事件与 `llm.call` 的 `key_env` 字段里，密钥恒以**环境变量名**标识——密钥值本身在任何档位（含 `full`）都不写入 trace、运行日志与报告。
 

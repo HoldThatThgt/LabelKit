@@ -9,7 +9,9 @@
 
 | 来源 | 次数 | 说明 |
 |---|---|---|
+| segment（v1.8） | Σ ceil((L−1)/(window−1))，L = 各会话帧数 | 滑窗重叠 1 帧故步长 = window−1；`strategy="rules"` 与单帧会话为 0；window ≥ 会话长时整段一次调用 |
 | classify（v1.7） | N × max(1, sc) | sc = `classify.self_consistency`；生成样本继承种子类，回流不重分类 |
+| extract（v1.8） | Σ (L−1)，L = 各 episode 成员数 | 每对相邻帧一次调用、每次带 2 张图——**stream 工程的调用大头几乎总是它**（帧数远多于 episode 数） |
 | quality pairwise | N × k / 2（默认 k=4 ⇒ 2N） | × 评审数 × 双序(2) ×（single 模式再 ×C） |
 | quality pointwise | N × C | 与 C 成正比是它比 pairwise 贵的原因（C=4 时 4N vs 2N） |
 | annotate | N | × self_consistency 的 n |
@@ -19,6 +21,8 @@
 | 重试 | 按需 | 报告 `llm_usage.*.retries` 可见 |
 
 分类算子开 `assignment = "multi"` 时另记一笔扇出账：一条记录命中几类就变成几个信封，下游 quality / annotate / verify 的 N 实际乘上平均标签数——multi 工程做预算时按这个乘数打提前量（`--dry-run` 的估算按乘数 1 报下界）。
+
+stream 工程（v1.8）另有两条成本注记：`annotate.sequence_frames`（默认 20）决定每个 episode 的标注请求携带几张关键帧图——序列标注的 token 开销与它近似线性，降帧最省钱但会丢视觉证据；`extract.include_diff` 默认开（向摘取提示词注入结构化树变更摘要，工程实践正面），怀疑它对你的数据没有增益时可关掉跑一次 A/B（对比 `report.stream.extract.by_type` 分布与 verify 缺陷率），确认后再定去留。
 
 **先验预算**：`--dry-run` 直接给出估算调用数（不含修复与重试）。**后验核账**：报告 `llm_usage` 分 profile 给出 calls / tokens / retries，配了单价还有 `est_cost_usd`。
 

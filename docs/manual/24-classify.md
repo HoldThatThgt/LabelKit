@@ -120,17 +120,17 @@ stderr 尾部的终版摘要（真实运行，退出码 0）：
 读法：去重放行的 11 条里，6 条分进 writing、4 条 qa、1 条 other（6+4+1=11，分类不淘汰、账必对齐）；`fallback_count=0` 说明没有一条是「分不出来兜底」的——那条「哈哈哈哈哈哈哈」是 LLM **主动**归入 other 的。trace 里能看到它的判决理由（`classify.decision` 事件，本次运行共 11 条，每条存活记录一条；`…` 处省略 `run_id`/`batch_no` 字段）：
 
 ```json
-{"ts": "2026-07-07T23:04:50.929+08:00", …, "stage": "classify", "ev": "classify.decision",
+{"ts": "2026-07-14T04:59:31.708+08:00", …, "stage": "classify", "ev": "classify.decision",
  "record_ids": ["f4450df8817e7a88"],
  "payload": {"label": "other", "source": "llm",
-             "reason": "这是一条无意义的笑声，不属于写作、知识问答或解释类请求。"}}
+             "reason": "这是一条无意义的笑声，不属于写作协助、知识问答或解释类请求。"}}
 ```
 
 分拣之后，质量工位**按类分池**打分、按各自的线门控。trace 的 `quality.gate` 事件多了个 `pool` 字段，三条线同场执法一目了然（从真实 trace 的 11 条门控事件里各池摘一条；`…` 处省略 `ts`/`run_id`/`batch_no`/`stage` 字段）：
 
 ```json
 {…, "ev": "quality.gate", "record_ids": ["1578daea3bf1050d"],
- "payload": {"aggregate": 0.65, "decision": "keep", "threshold": 0.4, "pool": "qa"}}
+ "payload": {"aggregate": 0.55, "decision": "keep", "threshold": 0.4, "pool": "qa"}}
 {…, "ev": "quality.gate", "record_ids": ["01733049bee5182d"],
  "payload": {"aggregate": 0.2, "decision": "keep", "threshold": 0.2, "pool": "writing"}}
 {…, "ev": "quality.gate", "record_ids": ["f4450df8817e7a88"],
@@ -139,7 +139,7 @@ stderr 尾部的终版摘要（真实运行，退出码 0）：
 
 最终账目：writing 池 0.2 的线拦 3 条、qa 池 0.4 的线拦 2 条、other 池全局 0.3 的线拦 1 条（合计 `dropped_lowq=6`），活下来的 5 条按各自类的指令完成标注。
 
-**这次运行最值得咂摸的数字**：writing 池六条记录的聚合分是 0.1、0.15、0.15、0.2、0.2、0.2——**全部 ≤ 0.2**。如果没有按类覆盖、全局一条 0.3 的线，写作类会被整锅端掉，产出只剩 2 条 qa。这正是第 20 章亲手诊断过的现象（`default:text` 的口径天然压低日常写作请求）；当时的解法是换 rubric，现在你多了一个更轻的选项：**先分拣，再按类画线**——问答类继续用高标准，写作类按自己的分布单独定线。
+**这次运行最值得咂摸的数字**：writing 池六条记录的聚合分是 0.1、0.1、0.15、0.2、0.25、0.55——**六条里五条压在 0.3 以下**。如果没有按类覆盖、全局一条 0.3 的线，写作类只有那篇 0.55 的科普短文能活；0.2 的类内线把贴线的周报模板（0.2）与翻译请求（0.25）捞了回来。这正是第 20 章亲手诊断过的现象（`default:text` 的口径天然压低日常写作请求）；当时的解法是换 rubric，现在你多了一个更轻的选项：**先分拣，再按类画线**——问答类继续用高标准，写作类按自己的分布单独定线。
 
 ## 24.3 单标签与多标签：assignment 开关
 
@@ -209,13 +209,14 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/c
   "difficulty": "easy",
   "_meta": {
     "id": "01733049bee5182d",
-    "run": {"tool": "labelkit/1.0.0", "started_at": "2026-07-07T23:04:38.325441+08:00",
+    "run": {"tool": "labelkit/1.0.0", "started_at": "2026-07-14T04:59:17.299124+08:00",
              "project_file": "project.toml", "rubric": "default:text", "seed": 42},
     "source": {"file": "input.jsonl", "line_no": 2, "generated_from": [],
                 "fields": {"source": "app-feedback"}, "generator": null},
+    "stream": null,                      ← v1.8 恒在键（stream 模式未启用恒为 null，第 25 章）
     "scores": {
-      "writing_style": 0.4, "facts_trivia": 0.0,
-      "educational_value": 0.2, "required_expertise": 0.2,
+      "writing_style": 0.6, "educational_value": 0.2,
+      "facts_trivia": 0.0, "required_expertise": 0.0,
       "__aggregate__": 0.2,              ← 贴着 writing 类 0.2 的线存活（门控规则是 < 才淘汰）
       "mode": "pointwise", "batch_no": 1,
       "pool": "writing"                  ← 新增：这条记录在哪个类池里打的分
@@ -250,11 +251,11 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/c
   "other": {…}, "qa": {…},
   "writing": {
     "mode": "pointwise", "rounds": 4,
-    "aggregate_histogram": {"0.1-0.2": 3, "0.2-0.3": 3, …其余 8 桶均为 0},
-    "per_criterion_mean": {"educational_value": 0.19999999999999998,
-                            "facts_trivia": 0.10000000000000002,
-                            "required_expertise": 0.10000000000000002,
-                            "writing_style": 0.26666666666666666},
+    "aggregate_histogram": {"0.1-0.2": 3, "0.2-0.3": 2, "0.5-0.6": 1, …其余 7 桶均为 0},
+    "per_criterion_mean": {"educational_value": 0.3333333333333333,
+                            "facts_trivia": 0.03333333333333333,
+                            "required_expertise": 0.06666666666666667,
+                            "writing_style": 0.46666666666666673},
     "per_criterion_tie_rate": {}
   }
 }
@@ -284,7 +285,7 @@ jq -r '._meta | "\(.label)\t\(.stage)/\(.reason)"' out/classify-labels.rejects.j
 
 **sc 投票：给分拣员上三个臭皮匠。**`classify.self_consistency = n`（≥3 奇数）时每条记录采样 n 次（温度取 `classify.sc_temperature`，默认 0.7），single 按多数票、multi 逐标签按「出现于过半采样」保留；**无过半不回退首样本，归兜底类**——分不出来就该进兜底，这是它与 annotate 字段级投票语义上的不同。票型统计（n 与 agreement_ratio）随 `classify.decision` 事件的 `sc` 字段落 trace。成本 ×n，先确认 fallback_count 和边界类的翻转率真的成问题再上。
 
-**类描述是分类质量的第一杠杆。**本次真跑有个现成展品：那条「把『会议改到周五下午三点』翻译成英文」被分进了 writing——trace 里分拣员的理由是「用户要求将一句中文翻译成英文，属于需要模型产出一段文本的请求。」回头看 writing 的 description 结尾：「……**需要模型产出一段文本的请求**」——这个尾巴写得太宽，几乎所有请求都要模型产出文本，翻译就这样被兜进来了。写类别表的四条纪律：
+**类描述是分类质量的第一杠杆。**本次真跑有个现成展品：那条「把『会议改到周五下午三点』翻译成英文」被分进了 writing——trace 里分拣员的理由是「用户要求将一句中文翻译成英文，本质上是产出一段目标语言的文本，属于写作协助类请求。」回头看 writing 的 description 结尾：「……**需要模型产出一段文本的请求**」——这个尾巴写得太宽，几乎所有请求都要模型产出文本，翻译就这样被兜进来了。写类别表的四条纪律：
 
 1. **描述写判据，不写口号**——「代写、改写、模板、文案」是判据，「高质量写作类」是口号；结尾的兜底性短语（「等」「之类」）尤其危险，宽语义会吸走边界样本；
 2. **类间互斥靠描述互相「让地盘」**——想让翻译独立成类，就给它立类；封闭集分类**不会发明新类**，你没声明的意图只会被塞进语义最近的类或兜底类；
@@ -296,9 +297,9 @@ jq -r '._meta | "\(.label)\t\(.stage)/\(.reason)"' out/classify-labels.rejects.j
 **成本账。**分类给每条存活记录追加 1 次调用（sc 时 ×n），dry-run 估算按 ingested 计上界。它通常是流水线里较轻的一环——本次真跑的分账（`report.timing`，真实产物）：
 
 ```json
-"per_stage_s": {"dedup": 0.003, "classify": 17.15, "quality": 75.713, "annotate": 16.577}
+"per_stage_s": {"dedup": 0.003, "classify": 17.144, "quality": 56.616, "annotate": 8.026}
 ```
 
-12 条数据全程约 109 秒、61 次调用，quality 仍是大头（第 10 章的结论不因分类而变）。multi 模式的钱花在扇出的**下游**（m 份打分/标注/评审），不在分类调用本身——控成本先控 `max_labels`。
+12 条数据全程约 82 秒、60 次调用，quality 仍是大头（第 10 章的结论不因分类而变）。multi 模式的钱花在扇出的**下游**（m 份打分/标注/评审），不在分类调用本身——控成本先控 `max_labels`。
 
 最后一份检查清单，开 classify 前过一遍：类别表 ≥ 2 项且 name 全小写下划线；fallback_class 在表内、description 是排他形态；边界意图要么有自己的类、要么在 instruction 里写了裁决规则；trace.channels 加了 `"classify"`（调优期必开，判决理由全靠它）；multi 的话——下游知道行唯一键变成 (`_meta.id`, `label`) 了吗？
