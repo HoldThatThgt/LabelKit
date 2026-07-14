@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.taxi"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "快捷出行", "bounds": [24, 20, 200, 56], "visible": true, "package": "com.example.taxi"}
+{"id": "2", "parent": "0", "class": "EditText", "text": "输入目的地", "bounds": [24, 90, 376, 140], "visible": true, "package": "com.example.taxi"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "当前位置：人民广场", "bounds": [24, 150, 280, 180], "visible": true, "package": "com.example.taxi"}
+{"id": "4", "parent": "0", "class": "Button", "text": "预约用车", "bounds": [24, 620, 180, 668], "visible": true, "package": "com.example.taxi"}
+{"id": "5", "parent": "0", "class": "Button", "text": "代人叫车", "bounds": [220, 620, 376, 668], "visible": true, "package": "com.example.taxi"}

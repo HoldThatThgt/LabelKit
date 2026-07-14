@@ -1,0 +1,8 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.food"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "搜索", "bounds": [24, 20, 120, 56], "visible": true, "package": "com.example.food"}
+{"id": "2", "parent": "0", "class": "EditText", "text": "麻辣烫", "bounds": [24, 80, 296, 128], "visible": true, "package": "com.example.food"}
+{"id": "3", "parent": "0", "class": "Button", "text": "搜索", "bounds": [308, 80, 376, 128], "visible": true, "package": "com.example.food"}
+{"id": "4", "parent": "0", "class": "TextView", "text": "热门搜索", "bounds": [24, 160, 160, 188], "visible": true, "package": "com.example.food"}
+{"id": "5", "parent": "0", "class": "Button", "text": "火锅", "bounds": [24, 200, 100, 240], "visible": true, "package": "com.example.food"}
+{"id": "6", "parent": "0", "class": "Button", "text": "烧烤", "bounds": [112, 200, 188, 240], "visible": true, "package": "com.example.food"}
+{"id": "7", "parent": "0", "class": "Button", "text": "奶茶", "bounds": [200, 200, 276, 240], "visible": true, "package": "com.example.food"}

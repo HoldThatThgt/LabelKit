@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.social"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "新消息", "bounds": [24, 20, 160, 56], "visible": true, "package": "com.example.social"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "小李：周末一起打球吗？", "bounds": [24, 90, 376, 130], "visible": true, "package": "com.example.social"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "妈妈：记得周末回家吃饭", "bounds": [24, 140, 376, 180], "visible": true, "package": "com.example.social"}
+{"id": "4", "parent": "0", "class": "Button", "text": "全部已读", "bounds": [24, 700, 180, 748], "visible": true, "package": "com.example.social"}
+{"id": "5", "parent": "0", "class": "Button", "text": "设置", "bounds": [220, 700, 376, 748], "visible": true, "package": "com.example.social"}

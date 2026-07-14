@@ -1,0 +1,7 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.food"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "确认订单", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.food"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "收货地址：上海市浦东新区世纪大道 100 号", "bounds": [24, 90, 376, 150], "visible": true, "package": "com.example.food"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "招牌麻辣烫 ×1", "bounds": [24, 160, 250, 196], "visible": true, "package": "com.example.food"}
+{"id": "4", "parent": "0", "class": "TextView", "text": "配送费 ¥0", "bounds": [24, 204, 180, 232], "visible": true, "package": "com.example.food"}
+{"id": "5", "parent": "0", "class": "TextView", "text": "预计送达 13:30", "bounds": [24, 240, 250, 268], "visible": true, "package": "com.example.food"}
+{"id": "6", "parent": "0", "class": "Button", "text": "提交订单 ¥32", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.food"}

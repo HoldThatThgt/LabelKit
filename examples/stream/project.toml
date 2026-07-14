@@ -1,0 +1,68 @@
+# Stream-UI E2E project (spec §5.2, v1.8): 会话化 → segment(hybrid 滑窗) → dedup
+# → extract(动作摘取) → pointwise trajectory 打分 → 序列标注 → verify+repair。
+# fixture：任务 A 点外卖 8 帧（帧 5 无关屏，预期 dropped_noise）+ 任务 B 打车 5 帧
+# + 帧 14 桌面屏；data/ 由 tools/gen_fixtures.py 一次性生成。
+schema_version = 1
+
+[run]
+input = "./data"
+output = "./out/stream-labels.jsonl"
+modality = "ui"
+batch_size = 32
+seed = 42
+
+[stream]
+order_by = "input_order"          # UI 模态 = pair_index 升序（meta:* 仅文本模态）
+# gap_steps = 3                   # 变体示范：pair_index 序号差 > 3 即断开会话（0 = 不启用）
+
+[segment]
+enabled = true                    # stream 模式总开关
+strategy = "hybrid"               # 滑窗 LLM 边界精化 + 逐帧噪声标记
+window = 8                        # 14 帧会话 → 2 窗（重叠 1 帧）
+min_len = 2                       # 仅作用于 LLM 精化切出的段
+context = "手机屏幕操作录屏流；通知面板、弹窗等与前后操作无关的短暂插入屏属于干扰帧"
+
+[extract]
+enabled = true                    # 逐相邻帧对摘取动作，写入 _meta.stream.steps
+llm = "default"
+
+[quality]
+enabled = true
+mode = "pointwise"
+rubric = "default:trajectory"     # 轨迹四准则；无 threshold——只打分不筛
+
+[annotate]
+enabled = true
+llm = "default"
+instruction = """
+你是移动端操作序列标注员。根据动作序列与关键帧，
+标注该操作序列的任务标签（用户在做什么）、所属应用与一句话摘要。
+"""
+
+[verify]
+enabled = true
+llm = "judge"
+policy = "repair"                 # 缺陷表路由：成员手术 + 重摘取 + 重标注
+max_repair_rounds = 1
+
+[trace]
+enabled = true
+channels = ["segment", "extract", "verify", "schema"]
+content = "refs"
+
+[output]
+meta_mode = "inline"
+rejects = "full"                  # 噪声帧 rejects 行携带完整载荷（序列 = 成员清单）
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "task_label": {"type": "string"},
+    "app": {"type": "string"},
+    "summary": {"type": "string", "maxLength": 100}
+  },
+  "required": ["task_label", "app", "summary"],
+  "additionalProperties": false
+}
+"""

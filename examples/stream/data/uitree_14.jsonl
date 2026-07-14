@@ -1,0 +1,8 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.launcher"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "主屏幕", "bounds": [24, 20, 150, 56], "visible": true, "package": "com.example.launcher"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "美食外卖", "bounds": [32, 120, 128, 200], "visible": true, "package": "com.example.launcher"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "快捷出行", "bounds": [152, 120, 248, 200], "visible": true, "package": "com.example.launcher"}
+{"id": "4", "parent": "0", "class": "TextView", "text": "消息", "bounds": [272, 120, 368, 200], "visible": true, "package": "com.example.launcher"}
+{"id": "5", "parent": "0", "class": "TextView", "text": "相机", "bounds": [32, 240, 128, 320], "visible": true, "package": "com.example.launcher"}
+{"id": "6", "parent": "0", "class": "TextView", "text": "设置", "bounds": [152, 240, 248, 320], "visible": true, "package": "com.example.launcher"}
+{"id": "7", "parent": "0", "class": "TextView", "text": "相册", "bounds": [272, 240, 368, 320], "visible": true, "package": "com.example.launcher"}

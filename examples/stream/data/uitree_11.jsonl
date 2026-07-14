@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.taxi"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "选择车型", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.taxi"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "目的地：虹桥机场", "bounds": [24, 80, 300, 110], "visible": true, "package": "com.example.taxi"}
+{"id": "3", "parent": "0", "class": "Button", "text": "经济型 ¥58", "bounds": [24, 140, 376, 210], "visible": true, "package": "com.example.taxi"}
+{"id": "4", "parent": "0", "class": "Button", "text": "舒适型 ¥78", "bounds": [24, 226, 376, 296], "visible": true, "package": "com.example.taxi"}
+{"id": "5", "parent": "0", "class": "TextView", "text": "预计 35 分钟到达", "bounds": [24, 320, 260, 350], "visible": true, "package": "com.example.taxi"}

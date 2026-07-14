@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.food"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "麻辣烫 搜索结果", "bounds": [24, 20, 280, 56], "visible": true, "package": "com.example.food"}
+{"id": "2", "parent": "0", "class": "Button", "text": "川味麻辣烫", "bounds": [24, 80, 376, 150], "visible": true, "package": "com.example.food"}
+{"id": "3", "parent": "0", "class": "Button", "text": "张记麻辣烫", "bounds": [24, 166, 376, 236], "visible": true, "package": "com.example.food"}
+{"id": "4", "parent": "0", "class": "Button", "text": "蜀香麻辣烫", "bounds": [24, 252, 376, 322], "visible": true, "package": "com.example.food"}
+{"id": "5", "parent": "0", "class": "TextView", "text": "共 3 家餐厅", "bounds": [24, 340, 200, 368], "visible": true, "package": "com.example.food"}

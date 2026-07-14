@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.food"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "下单成功", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.food"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "订单号：FD20260713001", "bounds": [24, 100, 340, 136], "visible": true, "package": "com.example.food"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "预计 30 分钟内送达", "bounds": [24, 144, 280, 172], "visible": true, "package": "com.example.food"}
+{"id": "4", "parent": "0", "class": "Button", "text": "查看订单", "bounds": [24, 700, 190, 760], "visible": true, "package": "com.example.food"}
+{"id": "5", "parent": "0", "class": "Button", "text": "返回首页", "bounds": [210, 700, 376, 760], "visible": true, "package": "com.example.food"}
