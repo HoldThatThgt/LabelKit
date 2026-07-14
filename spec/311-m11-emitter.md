@@ -9,9 +9,9 @@
 
 | 通道 | 规格 |
 |---|---|
-| 主输出 | 运行期写 `{output}.part`，每批 flush；finalize 时 fsync + 原子 rename 为目标名。行格式见 6.3。仅 `status="active"` 且（annotate 启用时）标注成功的记录写入。v1.6：熔断中止（退出码 4）的 finalize 同样执行交付（3.10.3 熔断交付）——已交付文件中每一行恒完整合法，运行是否完整处理了全部输入以 report.run 判定（interrupted=false 且 circuit_broken=false，3.11.3 ④）。 |
-| rejects | `output.rejects = "none" \| "refs"（默认）\| "full"`。refs：每行仅 `{"_meta": {id, source, stage, reason, errors}}`——不含数据内容（source 亦不含 `passthrough_fields`，其值属数据内容），贴合不存储原则；full：额外含记录内容与最后一版非法输出（调试用，用户显式选择）。文件名 `{output_stem}.rejects.jsonl`。v1.7：classify 启用时 `_meta` 增 `label` 键（= 该信封路由标签；multi 扇出下同 `id` 的兄弟信封由此消歧，行唯一键 (`_meta.id`, label)，6.3），refs / full 两档均携带。 |
-| report.json | `{output_stem}.report.json`。结构见 6.4：运行参数摘要（脱敏，无 key）、各阶段计数、分数分布直方图、去重簇统计、结构引擎各层命中、token/成本、耗时、失败分类计数。v1.7：classify 启用时增 `classify` 节（assignment / 逐类分布 / fallback_count / failures，multi 另含 multi_label_records）与 `quality.by_class` 按池视图，multi 时 counts 增 `fanout`（6.4）。 |
+| 主输出 | 运行期写 `{output}.part`，每批 flush；finalize 时 fsync + 原子 rename 为目标名。行格式见 6.3。仅 `status="active"` 且（annotate 启用时）标注成功的记录写入。v1.6：熔断中止（退出码 4）的 finalize 同样执行交付（3.10.3 熔断交付）——已交付文件中每一行恒完整合法，运行是否完整处理了全部输入以 report.run 判定（interrupted=false 且 circuit_broken=false，3.11.3 ④）。v1.8：`status = "absorbed"`（成员帧已并入 episode，3.14）为**第三路由**——主输出与 rejects 均不写、**仅计数**（成员内容以 `members` 引用随其 episode 的序列行落盘）；分发规则变为 active → 主输出、absorbed → 仅计数、其余非 active 状态 → rejects。`_meta` 增**恒在键** `stream`（未启用 segment = null；键位在 source 之后、scores 之前——链序镜像；结构见 6.3）；stream 模式下 `_meta.verification` 另含恒在 `defects` 键（无缺陷 = []，6.3）。stderr 进度与结束摘要**不增键**（fanout 先例——episodes / absorbed / dropped_noise 经 report 与 batch.end 事件可见，3.10.3）。 |
+| rejects | `output.rejects = "none" \| "refs"（默认）\| "full"`。refs：每行仅 `{"_meta": {id, source, stage, reason, errors}}`——不含数据内容（source 亦不含 `passthrough_fields`，其值属数据内容），贴合不存储原则；full：额外含记录内容与最后一版非法输出（调试用，用户显式选择）。文件名 `{output_stem}.rejects.jsonl`。v1.7：classify 启用时 `_meta` 增 `label` 键（= 该信封路由标签；multi 扇出下同 `id` 的兄弟信封由此消歧，行唯一键 (`_meta.id`, label)，6.3），refs / full 两档均携带。v1.8：`dropped_noise` 行按翻转方留下的 duck-typed reason 标记归因分流（此类帧**不写 `item.errors`**，「归因取 `item.errors[0]`」规则无从服务），(stage, reason) 组合恰增**三种**——(`"segment"`, `"noise"`)（LLM 判噪声帧）、(`"segment"`, `"below_min_len"`)（短段丢弃帧，独立于 noise，S11）、(`"verify"`, `"off_task_member"`)（修复收缩弃帧，S31）；absorbed 信封永不入本文件（第三路由）。`--strict` 交互：stream 工程的噪声帧属预期产物，会因 rejects 非空退出 1（6.4）。full 档对序列 Record 的 `record` 载荷输出 `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}`（S25；`kind="single"` 载荷形态不变）；`raw_last_output` 仍仅 `schema_violation` 行携带——classification_invalid / segmentation_invalid / extraction_invalid 失败行不带原始输出（classify 起的既有缺口，明文接受）。 |
+| report.json | `{output_stem}.report.json`。结构见 6.4：运行参数摘要（脱敏，无 key）、各阶段计数、分数分布直方图、去重簇统计、结构引擎各层命中、token/成本、耗时、失败分类计数。v1.7：classify 启用时增 `classify` 节（assignment / 逐类分布 / fallback_count / failures，multi 另含 multi_label_records）与 `quality.by_class` 按池视图，multi 时 counts 增 `fanout`（6.4）。v1.8：segment 启用时 counts 增 `episodes` / `absorbed` / `dropped_noise`，counts 之后新增 `stream` 节（sessions / episodes / mean_episode_len / absorbed / dropped_noise / below_min_len / digest_poor_frames / segment_failures + extract / verify 可选子块，6.4）。 |
 
 **背书：**「主数据 + 拒绝通道 + 统计报告」三分法是 NeMo Curator / Dolma 管线产物的通行组织 [6][9]；原子改名交付为数据工程防半截文件的标准手法。
 
@@ -34,6 +34,7 @@
           "project_file": "project.toml", "rubric": "default:text", "seed": 0},
   "source": {"file": "ime-2026-06.jsonl", "line_no": 1,
              "generated_from": [], "fields": {"source": "ime-log"}},  // passthrough_fields 落点
+  "stream": null,                                                     // v1.8 恒在键：未启用 segment = null（6.3）
   "scores": {"writing_style": 0.72, "facts_trivia": 0.44, "educational_value": 0.61,
              "required_expertise": 0.35, "__aggregate__": 0.53,       // 等权均值 = 2.12/4
              "mode": "pairwise_bt", "batch_no": 1},
@@ -42,6 +43,8 @@
   "verification": null                                                // verify 未启用
 }}
 ```
+
+v1.8 序列行说明：stream 工程（`segment.enabled = true`）的主输出行以 episode 为单位，其 `_meta.stream` 携带完整成员溯源与步骤序列（episode_id / session_id / member_ids / member_sources / steps 等，结构与样例见 6.3），行仍以 `_meta.id`（= 序列 Record id）对齐。
 
 #### ② rejects = "refs"（默认）的一行
 
@@ -61,7 +64,7 @@
 }}
 ```
 
-v1.7：classify 启用的工程中该 `_meta` 另含 `"label"` 键（3.11.2 rejects 行）；本例工程未启用 classify，无此键。
+v1.7：classify 启用的工程中该 `_meta` 另含 `"label"` 键（3.11.2 rejects 行）；本例工程未启用 classify，无此键。v1.8：stream 工程另见三种 (stage, reason) 组合的 rejects 行——segment/noise、segment/below_min_len、verify/off_task_member（3.11.2）——refs 档形态同本例（仅 `_meta` 引用行；此类帧不写 item.errors，`errors` 恒 []）。
 
 #### ③ 运行结束 stderr 摘要（逐字样例）
 

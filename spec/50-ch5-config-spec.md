@@ -93,6 +93,23 @@ dims = 1024                         # 可选：返回向量维度校验
 | `input.on_bad_line / on_missing_pair / on_index_conflict` | str | skip / skip / fail | "skip" \| "fail"（3.2.4–3.2.5）。 |
 | `input.max_image_mb` | int | 20 | 单图大小上限。 |
 | `input.ui_tree_max_chars` | int | 30000 | 提示词中树序列化长度上限。 |
+| `stream.order_by` | str | "input_order" | v1.8 新增（`[stream]` 节 = stream 模式输入侧排序与会话化声明，M2 消费，3.2/3.14；仅 `segment.enabled = true` 时生效）。"input_order"（默认：文本 = 文件名字典序→行号，UI = pair_index 升序）\| "meta:<field>"（**仅文本模态**，M1 校验；时间戳解析规格见 6.1——数值秒/毫秒判定、ISO 字符串、时区归一；解析失败与乱序同走 on_disorder）。 |
+| `stream.on_disorder` | str | "skip" | v1.8："skip"（默认：乱序/时间戳解析失败记录跳过——计 bad_input + IngestReport.disorder 子计数 + `ingest.disorder` 事件 + WARN 一次）\| "fail"（InputError，退出码 3）。单调性游标**按分区键各自维护**（S19；键变即断语义保留，输入须按键成组，6.1）。 |
+| `stream.key` | array | [] | v1.8：分区键列表，键变即断会话（groupby 语义非 keyBy）。元素 = "meta:<field>"（仅文本模态）\| "source_dir"（= ref.source_file 父目录派生，UI 模态可用——一次采集一目录惯例，S19）；元素合法性 M1 校验（3.1.4）。 |
+| `stream.gap_s` | int | 300 | v1.8：相邻记录时间差 > gap_s 秒即断开会话；**仅 `order_by="meta:*"` 时可设**（M1 校验）。默认偏大的结构性论证：欠分割可由 LLM 边界精化拯救、过分割不可逆（3.14）。 |
+| `stream.gap_steps` | int | 0 | v1.8：相邻记录序号差 > gap_steps 即断开（0 = 不启用）；与 gap_s 可并用，任一触发即断。 |
+| `stream.session_max_len` | int | 200 | v1.8：会话硬上限（帧），到限即断。`session_max_len > run.batch_size` ⇒ M1 静态 WARN（S21：单会话超批容量将被 M10 硬切 + `session_split` 标，3.10.3）。 |
+| `stream.session_max_span_s` | int | 0 | v1.8：会话时间跨度硬上限（秒，0 = 不启用）；**仅 `order_by="meta:*"` 时可设**（M1 校验）。 |
+| `segment.enabled` | bool | false | v1.8 新增：语义分段算子 / stream 模式总开关（M14，3.14）。默认关——工具行为与 v1.7 逐字节一致（`_meta.stream: null` 除外，6.3）。启用要求（3.1.4）：`run.mode = "process"` ∧ `generate.enabled = false`（generate_only 经 2.3.1 ④ 传递闭合）∧ `annotate.enabled = true`。no-op warning（R8 家族）：`[stream]`/`[segment]`/`[extract]` 任一节在场而 `segment.enabled = false`。 |
+| `segment.strategy` | str | "hybrid" | "rules"（候选会话原样成 episode，零 LLM；noise_filter / min_len 不生效）\| "llm" \| "hybrid"（默认：滑窗 LLM 边界精化 + 逐帧噪声标记；len(session)==1 走 rules 退化，3.14）。 |
+| `segment.llm` | str | "default" | profile 引用；**仅 `strategy ∈ {llm, hybrid}` 时**计入密钥解析 / vision（仅 use_vision = true 时）/ `--probe` / 存在性四处引用集（S30，3.1.4）——rules 策略零调用不强制配键。 |
+| `segment.window` | int | 20 | 滑窗帧数/调用；M1 校验 **≥ 2**。步长 = window−1（重叠 1 帧，接缝帧整帧判决归后窗）；window ≥ 会话长时天然退化为整段单调用（S32）。 |
+| `segment.digest_max_chars` | int | 400 | 单帧摘要（frame_digest，4.3）长度上限。 |
+| `segment.noise_filter` | bool | true | 逐帧噪声标记（interruption → dropped_noise，reason="noise"）；仅 llm/hybrid 生效——`strategy = "rules"` ∧ noise_filter = true ⇒ no-op warning（3.1.4）。 |
+| `segment.min_len` | int | 2 | 段最短帧数；**仅作用于 LLM 边界精化切出的段**（S11）——规则层孤帧/短会话（含 strategy="rules"）原样成 episode、不受本键约束；被丢弃帧 reason = "below_min_len"（≠ "noise"），独立计数 `report.stream.below_min_len`（6.4）。 |
+| `segment.use_vision` | bool | false | true 时窗内逐帧附截图（所引 profile 须 supports_vision 且入 vision 引用集，S30）；默认纯文本（仅帧摘要）。 |
+| `segment.context` | str | "" | 可选域上下文，注入判据模板；**非边界定义**——边界判据内置于模板（3.14），零配置可用。 |
+| `segment.on_error` | str | "keep" | 单窗结构修复耗尽的处置："keep"（默认：该会话整体成一个 episode 存活 + 留痕三件套 `_meta.stream.degraded = {kind:"segmentation_invalid", windows_failed}` / error 事件 / `segment.failures` 计数，**不写 item.errors**——S26 归因防污染）\| "fail"（会话成员全部 failed → rejects，kind = segmentation_invalid，7.6）。 |
 | `dedup.enabled` | bool | true | — |
 | `dedup.scope` | str | "global" | "global" \| "batch"（2.6 内存权衡）。 |
 | `dedup.minhash_threshold` | float | 0.85 | Jaccard 判重阈值（工业通行 0.8–0.9 [3][6]）。 |
@@ -113,9 +130,14 @@ dims = 1024                         # 可选：返回向量维度校验
 | `classify.sc_temperature` | float | 0.7 | sc 各次采样的 temperature，仅 `self_consistency ≥ 3` 生效（与 `annotate.sc_temperature` 同机制）。 |
 | `classify.on_error` | str | "fallback" | "fallback"（结构修复耗尽归兜底类，记录存活）\| "fail"（记录 failed → rejects）（3.13.4）。 |
 | `[[classify.classes]]` | array | 必填† | † enabled 时 ≥ 2 项。每项：`name`（`[a-z0-9_]+`，表内唯一）、`description`（非空）、`examples`（字符串数组，可选，仅输入侧，3.13.3）。 |
+| `extract.enabled` | bool | false | v1.8 新增：转移/动作摘取算子开关（M15，3.15；链序位于 classify 之后、quality 之前，3.10.3）。启用要求 `segment.enabled = true` ∧ `run.modality = "ui"`（M1 校验，3.1.4；文本序列 v1 不适用）。 |
+| `extract.llm` | str | "default" | profile 引用；**恒**计入密钥解析 / vision / `--probe` / 存在性四处引用集且恒入 vision 校验集（每转移一请求 2 图，S30，3.15）。 |
+| `extract.instruction` | str | "" | 可选摘取补充说明，追加进 system 摘取指令之后（3.15 模板）；`[class.<name>.extract]` 可按类覆盖（白名单**仅此键**，见按类覆盖表）。 |
+| `extract.include_diff` | bool | true | `[树变更摘要]` 注入开关（S14）：true（默认）时向摘取提示词注入 tree_diff（4.3）输出的文字化——结构化树 diff 证据（≠ 像素 diff，工程实践正面）；false 关闭注入，供 A/B 消融对比摘取质量（`report.stream.extract.by_type` 可观测，6.4）。 |
+| `extract.on_error` | str | "fallback" | 单转移结构修复耗尽的处置："fallback"（默认，S16：该步记 `action_type="other"` + `Transition.detail = {kind:"extraction_invalid", message}` 留痕，**不写 item.errors**；quality 副读数注入时 fallback 步与 LLM 确证的 other **分列**——防污染连贯性锚点）\| "fail"（episode failed → rejects，kind = extraction_invalid，7.6）。 |
 | `quality.enabled` | bool | true | — |
 | `quality.mode` | str | "pairwise" | "pairwise" \| "pointwise"（1.6 对齐决策）。 |
-| `quality.llm` | str | "default" | profile 引用。 |
+| `quality.llm` | str | "default" | profile 引用。v1.8 只增注：stream 模式下序列打分为纯文本（`[步骤序列]` + 帧摘要，无图，3.4.3 序列行）——UI 模态亦**不**因 stream 要求本 profile supports_vision（vision 逐阶段表的唯一放宽项，S30，3.1.4）。 |
 | `quality.rounds` | int | 4 | pairwise 轮数 k。 |
 | `quality.criteria_per_call` | str | "all" | "all" \| "single"（3.4.3）。 |
 | `quality.threshold` | float | 无 | 聚合分过滤线 [0,1]；缺省 = 不过滤只打分。 |
@@ -124,7 +146,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `quality.judges` | array | [] | 评审团 profile 引用数组。空 = 单评审（用 `quality.llm`）；非空须为奇数个且每项存在于 config.toml `[llm.*]`（M1 校验），每次比较各 judge 独立裁决、per-criterion 多数票（3.4.3 多评审团行，PoLL [32]）。成本 ×\|judges\|。 |
 | `quality.both_orders` | bool | false | true 时同一对正反两种呈现顺序各裁决一次（每 judge），两次一致才记 winner、不一致按 tie（3.4.3 双顺序裁决行 [20]）。成本 ×2。 |
 | `quality.on_unscored` | str | "keep" | "keep" \| "drop"（3.4.3 裁决失败行）。 |
-| `quality.rubric` | str | 自动 | "default:text" \| "default:ui" \| "inline"。缺省按模态选默认；写 inline 时必须提供 [[rubric.criteria]]。 |
+| `quality.rubric` | str | 自动 | "default:text" \| "default:ui" \| "default:trajectory"（v1.8 增：轨迹四准则 rubric，包数据 `default_trajectory.toml`，附录 A.3）\| "inline"。缺省（空串）按模态选默认；**v1.8 空串解析规则：`segment.enabled = true` ⇒ 解析为 "default:trajectory"**（两模态一致；用户显式选择器恒优先；按类视图经 base selector 自动继承，S29）。trajectory rubric 与 `extract.enabled = false` 组合 ⇒ M1 warning 提示（rubric 模态中立、不预设 steps 在场——「步骤」退化读作「帧间变化」，S29）。写 inline 时必须提供 [[rubric.criteria]]。 |
 | `quality.judgment_reasons` | str/bool | "auto" | "auto" \| true \| false。生效时 pairwise 裁决 Schema 增加 `reason` 字段（3.4.3），写入 trace 供 rubric 优化（7.5）；"auto" = `trace.enabled=true` 且 `trace.channels` 含 "quality" 时开（trace 关闭则不请求 reason，零额外 token）。成本：每次裁决约增加 30–60 输出 token。 |
 | `rubric.criteria` | array | 可选 | 内联 rubric，字段见 5.3。 |
 | `generate.enabled` | bool | false | 仅文本模态（2.3.1 约束）。 |
@@ -144,6 +166,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `annotate.examples` | array | [] | few-shot：[{input, output}]，output 须过用户 Schema（M1 校验）。 |
 | `annotate.self_consistency` | int | 0 | 0 = 关（单次标注，v1.1 行为）；启用须 ≥3 且为奇数（M1 校验）：每条记录独立采样 n 次后字段级投票（3.5.2 note 框）。成本：标注调用与 token ×n。 |
 | `annotate.sc_temperature` | float | 0.7 | self-consistency 各次采样的 temperature（采样多样性来源 [33]），覆盖 profile 默认；仅 `self_consistency ≥ 3` 时生效。 |
+| `annotate.sequence_frames` | int | 20 | v1.8 新增：序列（episode）标注单请求最大关键帧数，∈ **[2, 100]**（越界 CONFIG_ERROR，M1 校验）。成员数 n > k 时确定性均匀降采样 `idx_i = ⌊i·(n−1)/(k−1)⌋, i=0..k−1`（首末帧恒含、严格递增、纯整数零 rng；n ≤ k 取全量，3.5.2 序列行）。**`sequence_frames > 20` 且所引 profile `max_image_px > 2000` ⇒ M1 WARN**（S28：Anthropic 对 >20 图请求单图 >2000px 为 400 硬拒非缩放，现默认 max_image_px=2048 恰撞拒——指引改 ≤ 2000 或降帧；20 图阈值按请求内全部 image block 计）。非 stream 模式显式设置 ⇒ no-op warning（3.1.4）。 |
 | `verify.enabled` | bool | false | — |
 | `verify.llm` | str | "judge"† | † `verify.enabled = true` 且 `verify.judges` 为空时该 profile 须存在于 config.toml `[llm.*]`（judges 非空时被评审团替代、不参与运行也不要求存在，v1.5）；建议独立于 annotate.llm（3.7.2）。 |
 | `verify.judges` | array | [] | 多评审团 profile 列表（v1.2，3.7.2；与 quality.judges 语义一致）：空 = 单评审用 verify.llm；非空须为奇数个（M1 校验），verdict 取多数票，critiques 合并并标注来源 judge，成本 ×\|judges\|。背书 PoLL [32]。 |
@@ -159,7 +182,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `output.rejects` | str | "refs" | "none" \| "refs" \| "full"（3.11.2）。 |
 | `trace.enabled` | bool | false | 启用 trace 追踪日志（第 7 章）。 |
 | `trace.path` | str | 自动 | 默认 `{output_stem}.trace.jsonl`，与主输出同目录。 |
-| `trace.channels` | array | ["quality","verify","schema"] | 可选值 ingest \| dedup \| classify（v1.7 增）\| quality \| annotate \| verify \| schema \| llm（八个，7.2 事件目录）；默认值不变——分类事件须用户显式加 "classify" 才写；run.*/batch.* 生命周期事件不受此过滤。 |
+| `trace.channels` | array | ["quality","verify","schema"] | 可选值 ingest \| segment（v1.8 增）\| dedup \| classify（v1.7 增）\| extract（v1.8 增）\| quality \| annotate \| verify \| schema \| llm（十个，7.2 事件目录；通道 = stage 名，S1）；默认值不变——分类事件须用户显式加 "classify"、分段/摘取事件须显式加 "segment" / "extract" 才写；run.*/batch.* 生命周期事件不受此过滤。 |
 | `trace.content` | str | "refs" | "none" \| "refs" \| "excerpt" \| "full" 内容脱敏四档（7.4）。 |
 
 **`[class.<name>.<section>]` 按类覆盖（v1.7）。**classify 启用时可按类覆盖下游算子参数：`<name>` 必须 ∈ classes；未出现的键一律继承全局节（不配任何覆盖即纯打标模式）。可覆盖键白名单（M1 强校验，白名单外的键报 `CONFIG_ERROR`——3.1.4「未知键报 warning」行的显式例外；白名单后续只增）：
@@ -170,7 +193,10 @@ dims = 1024                         # 可选：返回向量维度校验
 | `[class.*.annotate]` | instruction, examples | llm / self_consistency / sc_temperature |
 | `[class.*.generate]` | instruction, styles, num_per_record, temperature | llms / mixture / weights / seeds_per_call / num_per_call / sample_validator |
 | `[class.*.verify]` | extra_criteria | llm / judges / policy / max_repair_rounds |
-| —— | —— | run.* / input.* / dedup.* / classify.* / output.*（含 schema 与 validator——输出 Schema 全局唯一）/ trace.* 全部不可按类 |
+| `[class.*.extract]` | instruction（v1.8 增） | llm / include_diff / on_error——LLM 绑定与失败策略属部署与成本面（与 quality 行同理） |
+| —— | —— | run.* / input.* / stream.*（v1.8）/ dedup.* / segment.*（v1.8）/ classify.* / output.*（含 schema 与 validator——输出 Schema 全局唯一）/ trace.* 全部不可按类 |
+
+v1.8 注：`segment.*` 不入白名单是**链序因果**而非取舍——链序为 segment → dedup → classify → extract →…（3.10.3），segment 在 classify **之前**执行，成段时类标签尚不存在，「按类分段」无从谈起；extract 在 classify 之后，故其 `instruction` 可按类覆盖（multi 扇出下兄弟信封各按其标签的有效 instruction 摘取，S9，3.15）。
 
 合并优先级：`[class.<name>].<sect>.<key>` > project.toml `[<sect>].<key>` > 内置默认——这是 project.toml **内部**的条件化合并，不改变「CLI > project.toml > config.toml」三源优先级（2.5）。M1 启动时按逐键 provenance 静态合并、冻结为 `class_views`，运行期零查找成本；选择组互斥对剔除、per-class rubric 重解析、类 examples 干跑等精确语义见 3.1.4 按类覆盖合并行。
 

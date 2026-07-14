@@ -25,6 +25,12 @@ UI 模态合成判定：`dedup.ui_dup_requires = "both"`（默认，树近似重
 
 第④级（语义，v1.2）与合成判定的关系：UI 模态下④作用于树规范序列化文本，在 `ui_dup_requires` 合成判定中**视同 tree 层命中**——"both" 下需（②或④）与③同时命中才判重；"tree" 下④单独命中即判重；"image" 下④不参与判定。判重由④贡献时记 `kind="near_semantic"`（④与③同时命中仍记 `near_both`）。④ 与 ② 的分工：② 抓 n-gram 重叠的表层改写，④ 抓措辞不同语义相同的深层重复（[26] 的动机），两级独立可关。
 
+**序列记录（v1.8，S10）。**stream 模式下抵达本模块的判重单元是 episode（`record.kind = "sequence"`，3.14）——episode 级重复 =「同样的操作流程」；成员帧不会单独抵达（链序 segment 在 dedup 之前，成员帧已置 absorbed / dropped_noise，3.10.3），帧级判重语义在 stream 模式下有意留空（连续 UI 帧上帧级判重本就失效）。四处适配，其余零改动：
+
+- **①② dedup_text**：配方增 `kind == "sequence"` 分支（优先于模态分支）——成员逐条按其单记录配方（文本规则 / 树规范序列化，随成员模态）产出后按成员序拼接，分隔符 `"\x1e"`（ASCII Record Separator，0x1E：`isspace() == True`，而成员配方输出的规范化文本已将空白折叠为单空格、不可能含该字符——拼接串与任何单记录配方输出结构性零碰撞）；①精确与②近似两级在拼接文本上照常执行。
+- **③ pHash**：对序列记录自动跳过（序列 Record 的 `image is None`——既有跳过门，零新增代码路径）；`ui_dup_requires = "both"` 下序列记录的合成判定**降级按 `"tree"` 处理**（与图像解码失败的降级路径同款，3.3.4）。
+- **④ 语义**：参检判定与判种归类两处逻辑（实现为 `_semantic_participates` / `_semantic_verdict_kind`）各增序列 case——"both" 对序列走 tree-only 分支（与③的降级一致）；序列拼接文本超长导致 embedding 重试耗尽时，走既有 `embedding_failures` 跳过路径（3.3.4——该记录按①—③判定，不增新失败通道）。
+
 ### 3.3.4 API 与配置
 
 ```

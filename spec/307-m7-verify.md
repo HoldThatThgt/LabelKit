@@ -24,12 +24,33 @@ user:   [任务指令] {annotate.instruction}
 
 **多评审团（可选，v1.2）：**`verify.judges`（array，默认 `[]`，与 `quality.judges` 语义一致）非空时启用评审团：空 = 单评审走 `verify.llm`，本节既有行为完全不变；非空须为**奇数个** profile 引用（M1 校验，不满足报错退出码 2）。各 judge 按本节同一模板**各自独立**评审（互不可见对方意见），最终 `verdict` 取多数票；各方 `critiques` 全部合并保留进 `VerificationResult.critiques`（4.2），每条标注来源——条目增加 `judge` 字段（= profile 名）。trace 事件 `verify.verdict` 相应改为**每 judge 一条**，payload 新增 `judge` 字段（字段只增不改，7.2 事件契约向后兼容）。`policy = "repair"` 回喂 M5 时，[审核意见] 段 = 全部投 fail 的 judge 的 critiques 合并（各条前缀来源 judge 名）。成本为单评审的 |judges| 倍，宜配置 3 个异构小模型 profile 而非加倍调用同一大模型。**背书：**多个较小模型组成的评审团（PoLL）在三种评审设置、六个数据集上优于单一大模型评审，因跨模型家族的多样性显著降低单模型自增强偏差，且成本比单一大评审低 7 倍以上（Verga et al. [32]）——与本节「judge 独立于标注模型」是同一去偏原则的推广。
 
+**stream 序列评审与缺陷表（v1.8，S7）。**stream 模式下序列信封（episode，`record.kind = "sequence"`，3.14）的评审改走序列变体；**非 stream 路径零改动**——本节既有模板与评审 Schema 是回归锚，序列信封由 stage 层旁路驱动器承载。输出经 `schema_engine.defect_verdict_schema()` 校验（3.8.1 内部 Schema 清单；与既有评审 Schema **并存**，S7）：三顶键 `{critiques, defects, verdict}` **全 required**（意见/缺陷在前、结论在后——本节「先意见后结论」同理）；`critiques` 形态与既有评审 Schema 逐字节一致（原样走既有合并/回喂链路）；`defects` 逐项 `{kind, members, position, detail}` 四子键全 required，可选性以可空联合 `["array","null"]` / `["string","null"]` 表达（OpenAI strict 兼容，3.8.1）。缺陷 `kind` 五值封闭词表：
+
+| kind | 语义 |
+|---|---|
+| `label_mismatch` | 标注的任务标签与序列证据不符。 |
+| `off_task_members` | 段内混入与任务无关的成员帧（`members` 列出这些成员帧 id）。 |
+| `missing_head` / `missing_tail` | 段首缺少任务起点帧 / 段尾缺少任务终点帧（结合边界余量判断）。 |
+| `missing_members` | 段中缺失成员帧（`members` 列出可指认的帧 id，无从指认则为 null）。 |
+
+评审证据为单条 user 消息**六段序**（system 含五类缺陷说明；全文逐字冻结于 CONTRACTS §10.5 序列变体）：`[任务指令]`（classify 启用时取类有效值，同本节按类取值段）→ `[动作序列]`（`item.transitions` 按 3.5.2 步骤行格式渲染；transitions 为 None 时整段省略）→ `[边界余量]`（段边界外前后 **k = 2** 帧的 `frame_digest`（4.3）及其去向标注：noise / 相邻段序数 / 无——防切头切尾的证据段，零额外 LLM 调用，语音端点检测 hangover 惯例的移植 [54]）→ `[首帧截图]` → `[末帧截图]`（judge profile 须 supports_vision，3.1.4 vision 逐阶段表）→ `[标注结果]`。产物增量：`VerificationResult` 增 additive 字段 `defects`（4.2，非 stream 恒 `()`）；`_meta.verification` 在 stream 模式下携带恒在 `defects` 键（无缺陷 = []，6.3）；缺陷摘要随 `verify.verdict` 事件 payload（受 trace.content 分级，7.4，S31）。`verdict = "fail"` 而 defects 为空数组 ⇒ 代码侧归一化为一条默认 `label_mismatch` 缺陷（S7——修复路由建立在缺陷表之上，fail 必有路由依据）。
+
 ### 3.7.3 失败策略与修复环
 
 | 策略 | 行为 |
 |---|---|
 | `verify.policy = "drop"`（默认） | fail ⇒ `status="dropped_verify"`，批评意见摘要入 `_meta.verification` 与 rejects 通道。 |
 | `verify.policy = "repair"` | fail ⇒ 将批评意见追加进标注提示词（`[上一版标注] ... [审核意见] ... 请修正后重新输出`），M5 重标注、M8 重校验、M7 重评审；最多 `verify.max_repair_rounds`（默认 1）轮，仍 fail 按 drop 处理。评审轮数记入 `_meta.verification.rounds`（含首评，一次通过 =1；修复后复评 =2），各轮意见按序累积于 `VerificationResult.critiques`（4.2），实例见 3.7.4。 |
+
+**stream 修复路由：两阶段批级成员手术（v1.8，S8/S31）。**`policy = "repair"` 下序列信封的修复不止重标注——按缺陷表（3.7.2）路由三类动作：**标签重标**（label_mismatch：常规批评意见回喂重标注）、**成员收缩**（off_task_members）与**成员回收**（missing_head / missing_tail / missing_members）。为保证并发 gather 下的确定性（相邻 episode 争抢同一噪声帧、multi 兄弟互撕共享成员集），每轮修复为**两阶段批级结构**（classify 扇出「先同步后并发」先例）：
+
+1. **并发评审**全部待审 episode；
+2. **同步按批位置序执行全部成员手术**（「先到先得」变为确定性「位次得」）——**收缩**：`defect.members` 指认帧 `absorbed → dropped_noise` + duck-typed `off_task_member` 标（rejects 归因 stage="verify"、reason="off_task_member"，3.11.2）；**回收**（三级判定）：同 `session_id` 的批内 `dropped_noise` 噪声池帧经 `segment.judge_window` 直调复裁（3.14.3；relation ∈ {continues, advances} 即回收 `dropped_noise → absorbed`、按序键插回 `members`）→ 缺帧在相邻 episode 手中：**只标记、不跨段夺帧**（boundary_flags 计数）→ 无处可寻：缺陷条目增顶层键 `suspected = "capture_gap"`（代码侧标注，非 LLM 输出——`detail` 在 Schema 中为字符串，故 suspected 以兄弟键落在缺陷条目上；所属会话曾被 batch_size 硬切的帧改标 `"session_split"`——判定依据即 `_meta.stream.session_split`，S21，3.10.3）；
+3. **并发接缝重摘取**：手术触点经 `extract.extract_transition` 直调重摘（3.15.3；1–2 次/手术，重建 Transition 带 `detail.reseamed = true` 溯源）；
+4. **同步重建**：record 以新成员集重建（替换 `members`；序列 **id 不重算**，3.14.4 拼装行）、transitions 重编号——`Transition.index` 恒 = 元组下标、不变量 `len(transitions) = len(members) − 1` 恒真（4.2，S31）；
+5. **并发重标注与复审**：`annotate_record(..., transitions=重建值)`（3.5.2 transitions 形参段）→ 下一轮评审。
+
+修复轮数计入 `verify.max_repair_rounds`（含首评，与本节非 stream 语义一致）。状态改写授权：手术在 `absorbed` 与 `dropped_noise` 间**双向**改写成员信封状态——4.3 契约 ②b 的 M7 修复路径豁免（契约①的唯一反向豁免），**禁止翻回 `active`**（帧与其 episode 不得双写主输出）。其余裁决：multi 扇出克隆兄弟的 membership 类手术**只标记**——仅原信封（首标签）可执行（S8，3.13.4 multi × episode 行）；多评审团下 defects = 投 fail 的 judge 的**并集**，按 (kind 枚举序, position, members) 确定性去重排序，同成员的互斥手术取先序（S31）；修复后**不重打分**——沿用修复前质量分 + `_meta.stream.repaired = true` 标记（6.3；multi 下亦用于消歧同 id 兄弟行）。观测面（M7 属主，`report.stream.verify` 子块，6.4）：`verify.membership_repairs`（执行的手术数）、`verify.boundary_flags`（只标记的边界判定数）、`verify.defects.<kind>`（逐缺陷类型计数）。
 
 **背书：**LLM-as-a-Judge 的可靠性、偏差类型（位置/冗长/自增强）与缓解手段出自 Zheng et al.（NeurIPS 2023）[20]；「批评意见回喂原模型迭代修正」是 Self-Refine（NeurIPS 2023）的 FEEDBACK→REFINE 循环 [21]，有界轮数与其停机设定一致；批评-修订两阶段结构同 Constitutional AI [22]。GUI-360 以同构的「LLM 质量过滤」环节筛选 GUI 轨迹数据 [14]。
 

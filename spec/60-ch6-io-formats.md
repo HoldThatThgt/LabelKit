@@ -9,6 +9,14 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 {"instruction": "写一份周报模板", "source": "ime-log", "ts": "2026-06-30T10:15:21Z"}
 ```
 
+**时间戳字段语义（v1.8 只增：stream 模式 `stream.order_by = "meta:<field>"` 的解析规格，仅文本模态，S20）**——`<field>` 为原始行对象上的点路径字段（上例 `ts`），M2 按以下规则解析（3.2）：
+
+- 数值：`v < 0 ∨ v ≥ 1e14` ⇒ 解析失败；`v < 1e11` 判 epoch **秒**；`1e11 ≤ v < 1e14` 判 epoch **毫秒**（÷1000）。
+- 字符串：先试纯数字 → 按上述数值规则；再试 `datetime.fromisoformat`（Python 3.11 起原生接受 `Z` 后缀）；均败 = 解析失败。
+- 时区：aware 值换算为 UTC epoch；naive 值**按 UTC 解释**。内部序键 = float 秒。
+- 解析失败与乱序**同走 `stream.on_disorder`**（"skip" 默认：跳过并计 bad_input + `IngestReport.disorder`；"fail"：InputError，退出码 3；5.2）。
+- 流式单调性校验不做全量重排：单调性游标**按 `stream.key` 分区键各自维护**（S19，内存 = 键基数）——逐设备/逐来源拼接的输入不会被整体判乱序；键变即断会话，**输入须按分区键成组**（交错流为演进候选，8.4）。
+
 ## 6.2 输入：UI 模态
 
 目录递归扫描与配对规则见 3.2.4。`uitree_<index>.jsonl` 节点行的字段映射（平铺风格；嵌套风格为同字段 + `children` 数组）：
@@ -51,6 +59,16 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
     "source": {"file": "capture/2026-07-01/b/uitree_2.jsonl", "pair_index": 2,
                "generated_from": [], "fields": {},           // passthrough_fields 落点
                "generator": null},   // v1.2 只增：生成记录为 {"llm", "style"}（3.6.2），否则 null
+    "stream": null,                  // v1.8 恒在键（位置：source 之后、scores 之前——链序镜像）；
+                                     // 未启用 segment = null。启用时（3.14/3.10.3）：
+                                     // {"episode_id", "session_id", "order_span": [first, last], "member_count",
+                                     //  "member_ids": [...], "member_sources": [{file, pair_index|line_no}, ...],
+                                     //  "session_split": false,   // 所属会话曾被 batch_size 硬切（S21，M7 缺帧判定降级依据）
+                                     //  "repaired": false,        // verify 缺陷修复改写过成员集（3.7 stream 分支；
+                                     //                            //   multi 扇出下消歧同 id 兄弟行的成员分叉，3.13）
+                                     //  "degraded": null | {kind, windows_failed},   // segment.on_error="keep" 留痕（S26）
+                                     //  "steps": null | [{index, action_type, target, value, description}, ...]}
+                                     //                            // extract 关闭时恒 null；启用 = transitions 逐步摘要（3.15）
     "scores": {"screenshot_readability": 0.81, "tree_screen_consistency": 0.66,
                "state_completeness": 0.74, "interaction_richness": 0.52,
                "__aggregate__": 0.68, "mode": "pairwise_bt", "batch_no": 3},
@@ -60,6 +78,9 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
                                        // 未启用 = null。multi 模式下行唯一键 = (_meta.id, classification.label)——同 id 可有多行（3.13.4 扇出行）
     "annotation": {"model": "qwen2.5-vl-72b-instruct", "attempts": 1},   // v1.2 只增：self-consistency 启用时另含 "sc": {"n", "agreement_ratio"}（3.5.2）
     "verification": {"verdict": "pass", "rounds": 1}          // verify 未启用则为 null
+                                       // verification v1.8 只增：stream 模式下另含 "defects"（该键恒在，
+                                       //   无缺陷 = []；缺陷项 {kind, members, position, detail}，S7，3.7 stream 分支）；
+                                       //   非 stream 行不携带该键
   }
 }
 ```
@@ -77,6 +98,17 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
               "failed": 9, "generated": 0, "emitted": 4220},
   // counts v1.6 只增：熔断中止时增列 "unprocessed"（已入流水线但因中止未走完的记录数，见本节尾注不变量扩展）
   // counts v1.7 只增：classify.assignment="multi" 时增列 "fanout"（扇出净增信封数，M10 计量，3.10.3；见尾注不变量扩展）
+  // counts v1.8 只增：segment 启用时增列 "episodes"（segment 阶段 len 差，M10 计量，fanout 同构）/
+  //             "absorbed" / "dropped_noise"（post-emit tally，3.10.3）；且 stream 模式下 "unprocessed"
+  //             的出现条件扩为「熔断 ∨ interrupted」（S18；见尾注不变量扩展）
+  // v1.8 可选节（segment 启用时出现，位于 counts 之后）：
+  //   "stream": {"sessions", "episodes", "mean_episode_len", "absorbed", "dropped_noise",
+  //              "below_min_len", "digest_poor_frames", "segment_failures",
+  //    [extract 启用] "extract": {"transitions", "fallback_steps", "failures", "by_type": {<action_type>: n, ...}},
+  //    [verify 启用]  "verify": {"membership_repairs", "boundary_flags", "defects": {<kind>: n, ...}}}
+  //   —— sessions 数据源 = IngestReport（M2 属主，3.2）；below_min_len 独立于 noise 计数（S11）；
+  //      digest_poor_frames = 摘要贫瘠帧数（4.3 frame_digest 贫瘠判定）；extract.by_type 为按动作类型分布
+  //      （系统性劣化可观测，S14）；verify 子块见 3.7 stream 分支（S31）
   "dedup": {"exact": 118, "near_text": 201, "near_image": 46, "near_both": 47,
              "clusters": 366, "image_decode_failures": 2},   // v1.2：dedup.semantic 开启时另含 near_semantic 与 embedding_failures
   // v1.7 可选块（classify 启用时出现）："classify": {"assignment": "single", "classes": {<name>: n, ...}, // 逐标签计数（multi 下多标签记录逐标签计）
@@ -105,4 +137,10 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 }
 ```
 
-不变量：`emitted + dropped_* + failed + bad_input = scanned + generated`。熔断中止（v1.6 熔断交付，3.10.3）时扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`——`unprocessed` 仅此时出现，= 已扫描/已生成但因中止未走完流水线的记录数（M10 在 finalize 时按差额计算）。v1.7：`classify.assignment="multi"` 时右侧另加 `fanout`——`emitted + dropped_* + failed + bad_input = scanned + generated + fanout`；与熔断中止叠加时两项扩展并存（左侧 `+ unprocessed`、右侧 `+ fanout`，熔断残差公式同步，3.10.3 分类与扇出行）。`schema_engine.resolved_at` 仅统计用户 Schema 的标注调用，加总 = 进入 M5 的记录数（4141+87+30+3+9 = 4270 = ingested 4987 − dropped_dup 412 − dropped_lowq 305）；裁决/评审/生成等内部 Schema 解析不计入。报告中无任何数据内容字段。
+不变量：`emitted + dropped_* + failed + bad_input = scanned + generated`。熔断中止（v1.6 熔断交付，3.10.3）时扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`——`unprocessed` 仅此时出现，= 已扫描/已生成但因中止未走完流水线的记录数（M10 在 finalize 时按差额计算）。v1.7：`classify.assignment="multi"` 时右侧另加 `fanout`——`emitted + dropped_* + failed + bad_input = scanned + generated + fanout`；与熔断中止叠加时两项扩展并存（左侧 `+ unprocessed`、右侧 `+ fanout`，熔断残差公式同步，3.10.3 分类与扇出行）。v1.8：segment 启用时守恒式为全展开形（3.10.3）——
+
+`emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed + bad_input + absorbed = scanned + generated + fanout + episodes`
+
+（左侧新增 `dropped_noise` 与 `absorbed`、右侧新增 `episodes`；未启用的项恒 0，退化为上式）。且 **stream 模式下 `counts.unprocessed` 的出现条件扩为「熔断 ∨ interrupted」**（S18：SIGINT 中断叠加会话缓冲会产生未走完流水线的残差；此时左侧另加 `unprocessed`，残差公式右侧 `+ episodes`、左侧 `+ absorbed + dropped_noise` 同步扩展）；非 stream 模式中断残差恒 0、不加键（回归锚不动）。`schema_engine.resolved_at` 仅统计用户 Schema 的标注调用，加总 = 进入 M5 的记录数（4141+87+30+3+9 = 4270 = ingested 4987 − dropped_dup 412 − dropped_lowq 305）；裁决/评审/生成等内部 Schema 解析不计入。报告中无任何数据内容字段。
+
+**rejects 通道 v1.8 增量**（完整格式规范属 3.11.2，此处登记 IO 面变化）：rejects 行的 (stage, reason) 组合新增三种——`segment / noise`（LLM 判噪声帧）、`segment / below_min_len`（短段丢弃帧，独立于 noise，S11）、`verify / off_task_member`（修复收缩弃帧，S31）；`--strict` 交互注意：stream 工程下噪声帧属预期产物，会触发退出码 1。`output.rejects = "full"` 档对序列 Record 的原始载荷输出 `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}`（S25——单记录 `_raw_payload` 假设的序列分支；`raw_last_output` 的 reason 门维持 schema_violation 现状，既有缺口明文接受）。

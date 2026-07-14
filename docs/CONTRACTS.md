@@ -1,8 +1,8 @@
 # LabelKit — Cross-Module Interface Contract (CONTRACTS.md)
 
 **Status: FROZEN.** This document is the single interface contract for parallel implementation of
-M1–M13 + CLI by independent engineers. It is derived from the design spec v1.4 base with the
-inline v1.5/v1.6/v1.7 revisions (`spec/*.md`), which
+M1–M15 + CLI by independent engineers. It is derived from the design spec v1.4 base with the
+inline v1.5/v1.6/v1.7/v1.8 revisions (`spec/*.md`), which
 remains the authority for *algorithms and behavior*; this document is the authority for *names,
 signatures, types, defaults, file formats, and prompt text*. Where the spec left a signature or
 format implicit, the decision is frozen here and tagged **[FROZEN HERE]** (all such decisions are
@@ -19,9 +19,11 @@ Ground rules for every implementer:
   `config/model.py` imports nothing from `labelkit` except `types` if needed; `llm_client.py`
   imports `types`, `errors`, `config.model`, `obslog`; `schema_engine.py` imports `llm_client`,
   `errors`, `obslog`; `stage.py` imports the above under `typing.TYPE_CHECKING` only; operator
-  modules (`ingest/dedup/classify/quality/annotate/generate/verify/emitter`) import service modules and
-  `types`/`stage`, **never each other** — with the single sanctioned exception that
-  `verify.py` imports the public repair hooks from `annotate.py` (§7.4; used per §7.6).
+  modules (`ingest/segment/dedup/classify/extract/quality/annotate/generate/verify/emitter`)
+  import service modules and `types`/`stage`, **never each other** — with the sanctioned
+  exceptions that `verify.py` imports the public repair hooks from `annotate.py` (§7.4; used per
+  §7.6) and, v1.8, the public direct-call surfaces `segment.judge_window` /
+  `extract.extract_transition` (§7.14/§7.15; used by the stream repair driver, §7.6).
 
 ---
 
@@ -54,9 +56,14 @@ labelkit/
                               #     setup_logging, event-name constants      → E12
   classify.py                 # M13 (v1.7): ClassifyStage, build_classify_prompt,
                               #     classify_record                          → E14
+  segment.py                  # M14 (v1.8): SegmentStage, build_segment_prompt,
+                              #     judge_window                              → E15
+  extract.py                  # M15 (v1.8): ExtractStage, build_extract_prompt,
+                              #     extract_transition                        → E16
   data/rubrics/
     default_text.toml         # already written — do not modify
     default_ui.toml           # already written — do not modify
+    default_trajectory.toml   # v1.8 (spec Appendix A.3) — already written — do not modify
 tests/                        # pytest; each owner ships tests for their module
 ```
 
@@ -68,23 +75,33 @@ afterwards without updating this file.
 
 ## 2. Architecture recap (normative)
 
-Four layers (spec §2.2): CLI → M10 orchestrator → operator stages (M2 ingest, M3 dedup, M13
-classify — v1.7, M4 quality, M5 annotate, M6 generate, M7 verify, M11 emitter) → services (M1
-config, M8 schema engine, M9 LLM client, M12 obslog). Operators depend only on services and the
-shared types — never on each other (exception: verify→annotate repair hook, §7.4/§7.6).
+Four layers (spec §2.2): CLI → M10 orchestrator → operator stages (M2 ingest, M14 segment —
+v1.8, default off, M3 dedup, M13 classify — v1.7, M15 extract — v1.8, default off, M4 quality,
+M5 annotate, M6 generate, M7 verify, M11 emitter) → services (M1 config, M8 schema engine,
+M9 LLM client, M12 obslog). Operators depend only on services and the shared types — never on
+each other (exceptions: verify→annotate repair hook, §7.4/§7.6; v1.8 verify→segment/extract
+direct calls, §7.14/§7.15/§7.6).
 
-Pipeline order per batch (process mode, v1.7 chain):
-`dedup → classify → quality → generate(off-path, returns sub-batch) → annotate → verify → emit`.
+Pipeline order per batch (process mode, v1.8 chain — the single superset tuple, §7.9):
+`segment → dedup → classify → extract → quality → generate(off-path, returns sub-batch) →
+annotate → verify → emit`. segment and extract are DEFAULT OFF; with both disabled the chain
+degrades byte-identically to the v1.7 chain
+`dedup → classify → quality → generate → annotate → verify → emit`. `generate.enabled` and
+`segment.enabled` are mutually exclusive (M1, §6.3 rule 29), so the generate slot never
+coexists with the stream stages.
 Generation sub-batches re-enter the queue as new batches and run
 `dedup → classify → quality → annotate → verify → emit` (no generate; single-pass, no recursion;
 generated records enter carrying an `"inherited"` Classification, which the idempotent classify
 stage skips — §7.13).
 `generate_only` mode (v1.4): no M2; `GenerateStage.generate_all()` produces all Records up front,
 they are split by `run.batch_size`, and each batch runs `dedup → classify → quality → annotate →
-verify → emit` (classify/quality/annotate individually optional per switches).
+verify → emit` (classify/quality/annotate individually optional per switches; segment/extract
+never participate — segment requires process mode, §6.3).
 
-Statuses: `active | dropped_dup | dropped_lowq | dropped_verify | failed`. Stages never delete list
-elements; they flip `status` and attach evidence.
+Statuses: `active | dropped_dup | dropped_lowq | dropped_verify | failed | absorbed |
+dropped_noise` (the last two are v1.8: `absorbed` = member frame absorbed into an episode
+envelope by M14, `dropped_noise` = noise/below-min-len frame dropped by M14 or shrunk out by
+M7 member surgery). Stages never delete list elements; they flip `status` and attach evidence.
 
 ---
 
@@ -106,6 +123,12 @@ Status = Literal[
     "dropped_lowq",    # M4 below quality gate
     "dropped_verify",  # M7 verdict fail with policy=drop (or repair budget exhausted)
     "failed",          # processing error (irreparable schema / provider retries exhausted ...)
+    "absorbed",        # v1.8 additive: member frame absorbed into a sequence envelope
+                       #   (M14 contract ②b, §5/§7.14); THIRD ROUTE — written to neither
+                       #   main output nor rejects, counted only (§7.10/§9.3)
+    "dropped_noise",   # v1.8 additive: noise/short-segment frame (M14: reason "noise" /
+                       #   "below_min_len", §7.14) or verify repair shrink
+                       #   (M7: "off_task_member", §7.6) → rejects (§9.2)
 ]
 
 
@@ -184,13 +207,32 @@ class Record:
     ui_tree: UITree | None
     image: ImageRef | None
     ref: RecordRef
+    kind: Literal["single", "sequence"] = "single"
+                                           # v1.8 additive (appended with a default — every
+                                           # pre-v1.8 construction site stays unchanged):
+                                           # "sequence" = an M14-assembled episode record (§7.14)
+    members: tuple["Record", ...] = ()     # v1.8 additive: sequence → member frames in order-key
+                                           # ascending order; single → always ().
+                                           # Sequence-record field convention (S24, spec §4.1):
+                                           # text/raw/ui_tree/image = None; modality = the
+                                           # members' modality; id = the sequence rule below
+                                           # (fixed at formation — member surgery never
+                                           # recomputes it); ref = RecordRef(source_file=first
+                                           # member's source, line_no=first member's line_no,
+                                           # pair_index=first member's pair_index,
+                                           # generated_from=(), generator=None) — full member
+                                           # provenance travels in _meta.stream.member_sources
+                                           # (§9.1), not in ref
 ```
 
-**Record id rules (M2/M6, normative):**
+**Record id rules (M2/M6/M14, normative):**
 - text modality: `sha256(canonical_json(raw).encode("utf-8")).hexdigest()[:16]` where
   `canonical_json(x) = json.dumps(x, sort_keys=True, ensure_ascii=False, separators=(",", ":"))`.
 - UI modality: `sha256(uitree_file_bytes + image_file_bytes).hexdigest()[:16]`.
 - generated records (M6): `raw = {input.text_field: sample_text}`, then the text rule.
+- sequence records (M14, v1.8): `sha256("\n".join(member_ids).encode("utf-8")).hexdigest()[:16]`
+  over the member ids in order-key ascending order, fixed at episode formation — M7 member
+  surgery never recomputes it (spec 3.14.4 step ④).
 
 ```python
 @dataclass(frozen=True)
@@ -208,6 +250,23 @@ class DedupInfo:
     cluster_key: str                       # exact-dedup key ([:16] hex) of the cluster head;
                                            # unique records carry their own key
     kept_id: str | None                    # duplicates: id of the retained record; unique: None
+
+
+@dataclass(frozen=True)
+class Transition:                          # v1.8: one M15 extract verdict for an adjacent member
+                                           # pair (spec §4.2), carried by PipelineItem.transitions
+    index: int                             # rebuilt ordinal — ALWAYS equals the position in the
+                                           # transitions tuple; renumbered after member surgery so
+                                           # the invariant len(transitions) == len(members) - 1
+                                           # stays true (S31)
+    action: Mapping                        # object that passed action_schema (§10.7):
+                                           # {action_type, target, value, description} —
+                                           # field semantics per the §10.10 table
+    model: str                             # provider model string of the extracting profile
+    attempts: int                          # 1 + number of L3 repair calls
+    detail: Mapping                        # fallback trace: {kind: "extraction_invalid", message}
+                                           # (S16); surgery re-seam: {reseamed: True} (S31);
+                                           # {} for a clean extraction
 
 
 @dataclass(frozen=True)
@@ -253,6 +312,11 @@ class VerificationResult:
     rounds: int                            # judged rounds incl. the first (pass on first review = 1)
     critiques: tuple[Mapping, ...]         # accumulated over rounds, in order:
                                            # {"aspect": str, "opinion": str[, "judge": str]}
+    defects: tuple[Mapping, ...] = ()      # v1.8 additive (S7): stream defect-table entries
+                                           # {"kind", "members", "position", "detail"} — kind is
+                                           # the five-value enum of defect_verdict_schema (§10.7);
+                                           # non-stream paths: always (); travels to
+                                           # _meta.verification.defects (§9.1)
 
 
 @dataclass(frozen=True)
@@ -273,6 +337,51 @@ class PipelineItem:                        # the ONLY mutable envelope; lifetime
     annotation: Annotation | None = None
     verification: VerificationResult | None = None
     errors: list[StageError] = field(default_factory=list)
+    transitions: tuple[Transition, ...] | None = None
+                                           # v1.8 additive: written by M15 extract (§7.15);
+                                           # None = extract disabled / not reached (idempotency
+                                           # gate: `transitions is not None` → skip)
+    session_id: str | None = None          # v1.8 additive: in-batch carrier of the session
+                                           # boundary (S4) — stamped by M10 on frame envelopes at
+                                           # batching, by M14 on the appended episode envelopes
+                                           # (bookkeeping, not business logic); M7's repair
+                                           # neighborhood query = session_id filter + batch list
+                                           # position order
+
+
+# ── v1.8 shared frame helpers (spec §4.3, S12/S13) ──────────────────────────
+# Module-level functions in types.py, next to UITree.serialize — the shared
+# rendering layer used by M14 segment, M15 extract, M13 classify (sequence
+# branch) and M4 quality (sequence branch). Operator modules never depend on
+# each other; shared rendering always sinks to this types layer.
+
+def frame_digest(record: Record, max_chars: int) -> str:
+    """Best-effort deterministic frame digest (S12 — UINode is a closed nine-field
+    type; package/activity names are reachable only via `extra`):
+    - UI modality:
+        app      = first non-empty `extra` value among package|package_name|pkg
+                   (visible nodes);
+        activity = first non-empty `extra` value among
+                   activity|activity_name|window_title (may be absent);
+        title    = first visible non-empty text in DFS order;
+        salient  = visible text/content_desc de-duplicated in encounter order;
+                   Button/EditText/CheckBox-class interactive roles get a "*" prefix;
+      the whole digest is truncated to max_chars (serialize truncation convention).
+    - text modality: record.text truncated to max_chars.
+    Poverty judgment: zero visible text nodes, or digest length < 8 ⇒ poor — the
+    CALLER counts digest_poor_frames (report.stream, §9.3) and WARNs at most once
+    per run, pointing at segment.use_vision."""
+    ...
+
+
+def tree_diff(a: UITree | None, b: UITree | None, quantize_px: int) -> Mapping:
+    """Structural-key MULTISET matching over (role, bounds // quantize_px, depth)
+    (S13 — node_id is NOT a cross-frame identity and must not be used as a match
+    key); visible nodes only; O(n1 + n2); pure statistics, no semantic attribution
+    (attribution belongs to M15). Returns:
+    {added: int, removed: int, text_changed: int, change_ratio: float,
+     app_changed: bool, title_changed: bool}."""
+    ...
 ```
 
 Notes binding on all implementers:
@@ -284,6 +393,15 @@ Notes binding on all implementers:
 - `Classification` / `PipelineItem.classification` are additive v1.7 fields (M13, spec §4.1).
   Multi-assignment fan-out clones share `record` and `dedup` **by reference** with their
   original envelope; all other containers are fresh defaults (§7.13).
+- v1.8 additive fields (spec §4.1/§4.2, all appended with defaults — zero changes at
+  pre-v1.8 construction sites): `Record.kind`/`Record.members`, `Transition`,
+  `VerificationResult.defects`, `PipelineItem.transitions`/`PipelineItem.session_id`, and the
+  two `Status` values `absorbed`/`dropped_noise`. Sequence records hold their members **by
+  reference** (frozen objects shared, zero copy) — episode formation does not change the
+  batch's memory order of magnitude (spec §2.6).
+- `frame_digest`/`tree_diff` are v1.8 module-level helpers whose docstrings above are the
+  behavior contract (spec §4.3 末段); M14/M15/M13/M4 consume them — never re-implement
+  digest/diff logic inside an operator module.
 - Everything except `PipelineItem` is `frozen=True`. No module mutates a `Record`.
 
 ---
@@ -376,8 +494,22 @@ class ErrorKind(str, enum.Enum):
     INDEX_CONFLICT = "index_conflict"                        # M2, record-level
     IMAGE_TOO_LARGE = "image_too_large"                      # M2, record-level
     IMAGE_DECODE_ERROR = "image_decode_error"                # M3 skip pHash; M5/M7 → failed
+    SEGMENTATION_INVALID = "segmentation_invalid"            # v1.8: M14, window-level — M8 repair
+                                                             # exhausted; "keep" (default) keeps the
+                                                             # session alive as ONE whole episode
+                                                             # (evidence in _meta.stream.degraded +
+                                                             # error event + segment.failures, NEVER
+                                                             # in item.errors — S26); "fail" → all
+                                                             # session members failed → rejects
     CLASSIFICATION_INVALID = "classification_invalid"        # v1.7: M13, M8 repair exhausted —
                                                              # fallback keeps record; "fail" → rejects
+    EXTRACTION_INVALID = "extraction_invalid"                # v1.8: M15, transition-level — M8 repair
+                                                             # exhausted; "fallback" (default) records
+                                                             # the step as action_type="other"
+                                                             # (evidence in Transition.detail =
+                                                             # {kind, message}, episode stays alive,
+                                                             # NEVER in item.errors — S16); "fail" →
+                                                             # episode failed → rejects
     JUDGMENT_INVALID = "judgment_invalid"                    # M4, comparison-level → counts as tie
     SCHEMA_VIOLATION = "schema_violation"                    # M8 L3 exhausted → failed → rejects
     CALLBACK_VIOLATION = "callback_violation"                # v1.5: L3 exhausted, remaining
@@ -430,10 +562,17 @@ class Stage(Protocol):
 
     async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]:
         """契约：① 只处理 status=='active' 的项；② 不删除列表元素（只改 status）；
-           ②a classify 例外（仅 assignment="multi"）——可向传入列表尾部追加派生信封；
+           ②a（v1.7）classify 例外（仅 assignment="multi"）——可向传入列表尾部追加派生信封；
            追加物视同批内普通元素、同受 ①③④ 约束；不得删除、重排或替换任何既有元素对象
            （既有元素的 status / classification / errors 字段写入属 ①④ 的正常行为）；
            返回值仍须是传入的同一列表对象（调用方依赖列表身份）；
+           ②b（v1.8）segment 例外（仅 stream 模式）——segment 可将批内既有 active 成员信封的
+           status 置为 `absorbed` 或 `dropped_noise`（属①④的正常状态写入），并向传入列表
+           **尾部**追加以这些成员拼装的序列信封；追加物视同批内普通元素、同受①③④约束；
+           每个成员信封至多被一个序列信封吸收；不得删除、重排或替换任何既有元素对象；
+           返回值仍须是传入的同一列表对象。**M7 修复路径豁免**：verify 的缺陷修复可在本批内
+           将成员信封状态在 `absorbed` 与 `dropped_noise` 间双向改写（成员回收/收缩），
+           此为契约①的唯一反向豁免；禁止将成员信封翻回 `active`；
            ③ generate 例外——返回新增子批（原批元素不修改）；④ 单条失败不得抛出到批层面，
            必须落入 item.errors 并置 status='failed'。"""
         ...
@@ -450,6 +589,13 @@ Binding rules:
   **new** list of new `PipelineItem`s (the sub-batch) and does not touch the input list.
   v1.7 (contract ②a): classify may grow that list in place (tail-append only); identity of the
   returned list is unchanged.
+- v1.8 (contract ②b): segment may flip existing active member envelopes to
+  `absorbed`/`dropped_noise` and tail-append sequence envelopes assembled from them; each member
+  envelope is absorbed by AT MOST one sequence envelope. The M7 repair-path exemption is the
+  ONLY sanctioned reverse status write in the whole contract: verify's defect repair may rewrite
+  member envelopes bidirectionally between `absorbed` and `dropped_noise` (member reclaim /
+  shrink) WITHIN the current batch; flipping a member back to `active` is forbidden — a frame
+  and its episode must never both reach the main output.
 - Non-generate stages: return value must be the input list (callers may rely on identity).
 - A stage must catch every per-record exception, append
   `StageError(stage=self.name, kind=..., message=..., retryable=...)` to `item.errors`, set
@@ -586,8 +732,13 @@ class QualityConfig:
     judges: tuple[str, ...] = ()                  # empty = single judge (quality.llm); else odd count
     both_orders: bool = False
     on_unscored: Literal["keep", "drop"] = "keep"
-    rubric: str = ""                              # "default:text"|"default:ui"|"inline";
-                                                  # "" = auto by modality (M1 resolves)
+    rubric: str = ""                              # "default:text"|"default:ui"|
+                                                  # "default:trajectory" (v1.8)|"inline";
+                                                  # "" = auto by modality (M1 resolves);
+                                                  # v1.8 (S29): "" under segment.enabled = true
+                                                  # resolves to "default:trajectory" instead
+                                                  # (both modalities; an explicit selector always
+                                                  # wins; class views inherit via base selector)
     judgment_reasons: bool | str = "auto"         # "auto" | True | False
 
 
@@ -632,6 +783,16 @@ class AnnotateConfig:
     examples: tuple[FewShotExample, ...] = ()
     self_consistency: int = 0                     # 0 = off; else odd, >= 3
     sc_temperature: float = 0.7
+    sequence_frames: int = 20                     # v1.8: max keyframes per sequence-annotation
+                                                  # request, ∈ [2, 100] (M1; outside → CONFIG_
+                                                  # ERROR). n members > k → deterministic uniform
+                                                  # downsample idx_i = ⌊i·(n−1)/(k−1)⌋, i=0..k−1
+                                                  # (first/last always kept, strictly increasing,
+                                                  # pure integer zero-rng; n <= k takes all —
+                                                  # S28). > 20 while the annotate profile's
+                                                  # max_image_px > 2000 → M1 WARN (§6.3);
+                                                  # explicitly set while non-stream → no-op
+                                                  # warning
 
 
 @dataclass(frozen=True)
@@ -663,9 +824,11 @@ class TraceConfig:
     enabled: bool = False
     path: str = ""                                # M1 resolves "" → "{output_stem}.trace.jsonl"
     channels: tuple[str, ...] = ("quality", "verify", "schema")
-                                                  # allowed: ingest|dedup|classify|quality|
-                                                  # annotate|verify|schema|llm (v1.7 adds
-                                                  # "classify"; the default stays unchanged)
+                                                  # allowed: ingest|segment|dedup|classify|
+                                                  # extract|quality|annotate|verify|schema|llm —
+                                                  # TEN values (v1.7 adds "classify"; v1.8 adds
+                                                  # "segment"/"extract": channel = stage name,
+                                                  # S1); the default stays unchanged
     content: Literal["none", "refs", "excerpt", "full"] = "refs"
 
 
@@ -717,6 +880,113 @@ class ClassView:                                  # one class's effective config
     annotate: AnnotateConfig
     generate: GenerateConfig
     verify: VerifyConfig
+    extract: ExtractConfig                        # v1.8 (S2) — REQUIRED sixth field, no default:
+                                                  # per-class effective extract config (whitelist:
+                                                  # only `instruction` may differ from global,
+                                                  # §6.3 rule 35); `_merge_class_sections` grows
+                                                  # from a four- to a five-section tuple. segment
+                                                  # has NO per-class view: it runs BEFORE classify,
+                                                  # labels do not exist yet (chain-order causality,
+                                                  # spec §5.2)
+
+
+# ── stream (v1.8, spec §5.2 [stream] + [segment] + [extract]) ───────────────
+
+@dataclass(frozen=True)
+class StreamConfig:                               # input-side ordering + sessionization
+                                                  # declaration, consumed by M2 (§7.1); effective
+                                                  # only under segment.enabled (presence while
+                                                  # disabled → no-op warning, §6.3)
+    order_by: str = "input_order"                 # "input_order" (text: filename lexicographic →
+                                                  # line_no; UI: pair_index ascending) |
+                                                  # "meta:<field>" (TEXT MODALITY ONLY; timestamp
+                                                  # parsing per spec §6.1 / S20 — see §7.1)
+    on_disorder: Literal["skip", "fail"] = "skip" # skip: record skipped, counts bad_input +
+                                                  # IngestReport.disorder + ingest.disorder event
+                                                  # + ONE stderr WARN per run; fail: InputError →
+                                                  # exit 3. Monotonicity cursors are maintained
+                                                  # PER PARTITION KEY (S19)
+    key: tuple[str, ...] = ()                     # partition keys; key change = session break
+                                                  # (groupby semantics, NOT keyBy — input must
+                                                  # arrive grouped by key); elements:
+                                                  # "meta:<field>" (text only) | "source_dir"
+                                                  # (= ref.source_file parent dir, UI-capable,
+                                                  # S19)
+    gap_s: int = 300                              # break when adjacent time delta > gap_s seconds;
+                                                  # may be SET only under order_by="meta:*" (M1).
+                                                  # Default is deliberately large: under-splitting
+                                                  # is recoverable by LLM refinement,
+                                                  # over-splitting is not (spec §5.2)
+    gap_steps: int = 0                            # break when adjacent ordinal delta > gap_steps;
+                                                  # 0 = off; combinable with gap_s (either fires)
+    session_max_len: int = 200                    # hard cap (frames), break at limit;
+                                                  # > run.batch_size → M1 static WARN (S21)
+    session_max_span_s: int = 0                   # hard time-span cap (seconds; 0 = off); may be
+                                                  # SET only under order_by="meta:*" (M1)
+
+
+@dataclass(frozen=True)
+class SegmentConfig:                              # M14 (§7.14) — the stream-mode master switch
+    enabled: bool = False                         # false = stage not in chain; output
+                                                  # byte-identical to v1.7 except the always-
+                                                  # present _meta.stream: null (§9.1). Enabling
+                                                  # requires process mode + generate off +
+                                                  # annotate on (§6.3 rule 29)
+    strategy: Literal["rules", "llm", "hybrid"] = "hybrid"
+                                                  # rules: candidate sessions become episodes
+                                                  # as-is, ZERO LLM (noise_filter/min_len
+                                                  # ineffective); llm/hybrid: sliding-window
+                                                  # refinement — identical behavior inside M14
+                                                  # (rule-layer sessionization is always on in M2;
+                                                  # "hybrid" names the rules+LLM composition)
+    llm: str = "default"                          # joins the four reference sets ONLY when
+                                                  # strategy ∈ {llm, hybrid} (S30, §6.3 rule 33)
+    window: int = 20                              # sliding-window frames per call; M1: >= 2;
+                                                  # step = window − 1 (1-frame overlap; window >=
+                                                  # session length degrades to one whole-session
+                                                  # call, S32)
+    digest_max_chars: int = 400                   # frame_digest truncation cap (§3)
+    noise_filter: bool = True                     # llm/hybrid only; rules + explicit true →
+                                                  # no-op warning (§6.3)
+    min_len: int = 2                              # segment length floor; applies ONLY to LLM-
+                                                  # refined segments (S11) — rule-layer lone-frame/
+                                                  # short sessions become episodes untouched;
+                                                  # dropped frames get reason "below_min_len"
+                                                  # (≠ "noise"), counted separately (§9.3)
+    use_vision: bool = False                      # true: attach per-frame screenshots inside
+                                                  # window calls (profile joins the vision set,
+                                                  # S30); default = pure-text verdicts
+    context: str = ""                             # optional domain context injected into the
+                                                  # §10.9 template — NOT a boundary definition
+                                                  # (the criteria are built in; zero-config works)
+    on_error: Literal["keep", "fail"] = "keep"    # keep (default): whole session degrades to ONE
+                                                  # episode + _meta.stream.degraded evidence
+                                                  # (never item.errors — S26); fail: session
+                                                  # members failed → rejects (§4
+                                                  # segmentation_invalid)
+
+
+@dataclass(frozen=True)
+class ExtractConfig:                              # M15 (§7.15); UI-modality sequences only
+    enabled: bool = False                         # requires segment.enabled AND
+                                                  # run.modality = "ui" (§6.3 rule 30)
+    llm: str = "default"                          # when enabled: ALWAYS in all four reference
+                                                  # sets AND always in the vision set — every
+                                                  # request carries 2 images, no text-only tier
+                                                  # (S30)
+    instruction: str = ""                         # optional domain hint appended to the §10.10
+                                                  # system message; the ONLY key overridable via
+                                                  # [class.<name>.extract] (§6.3 rule 35)
+    include_diff: bool = True                     # inject [树变更摘要] (tree_diff rendering) into
+                                                  # the extract prompt (S14: structural tree diff,
+                                                  # NOT pixel diff); false = A/B ablation
+                                                  # (observable via extract.by_type, §9.3)
+    on_error: Literal["fallback", "fail"] = "fallback"
+                                                  # fallback (default, S16): the step records
+                                                  # action_type="other" + Transition.detail =
+                                                  # {kind, message} (never item.errors); fail:
+                                                  # episode failed → rejects (§4
+                                                  # extraction_invalid)
 
 
 # ── CLI overrides and the aggregate ────────────────────────────────────────
@@ -738,7 +1008,11 @@ class ResolvedConfig:
     embedding_profiles: Mapping[str, EmbeddingProfile]
     run: RunConfig
     input: InputConfig
+    stream: StreamConfig                          # v1.8 — required, no default (R23 convention;
+                                                  # every construction site passes keywords)
     dedup: DedupConfig
+    segment: SegmentConfig                        # v1.8 — required, no default
+    extract: ExtractConfig                        # v1.8 — required, no default
     classify: ClassifyConfig                      # v1.7 — required, no default (R23)
     quality: QualityConfig
     generate: GenerateConfig
@@ -766,7 +1040,9 @@ this version and carries no runtime information. This is a conscious, recorded d
 spec 3.1.2's "typed mirror of ALL keys" wording. **[FROZEN HERE, see §12]**
 
 Resolution duties of M1 (beyond merging): resolve `quality.rubric` default by modality
-(`"default:text"` / `"default:ui"`); resolve `trace.path` default; resolve `run.input`/`run.output`
+(`"default:text"` / `"default:ui"`) — v1.8 (S29): when `segment.enabled = true` the empty
+selector resolves to `"default:trajectory"` instead, both modalities, explicit selectors
+untouched; resolve `trace.path` default; resolve `run.input`/`run.output`
 CLI overrides; parse `output.schema_inline`/`schema_path` into `user_schema`; read every
 *referenced* profile's declared key env vars (`api_key_env`, or each element of
 `api_key_envs`) into `LLMProfile.api_keys`, mirroring element 0 into `api_key` (v1.6
@@ -776,7 +1052,10 @@ v1.7: statically merge every `[class.<name>.*]` override family into the frozen
 `class_views` mapping (per-key provenance; selection-group and rubric re-parse semantics of
 §6.3 rules 26–27) and back-fill `classify.max_labels` to `len(classes)` when absent. The
 per-class merge is project.toml-INTERNAL conditionalization; the three-source precedence
-above is unchanged.
+above is unchanged. v1.8: the merge covers the fifth section `extract` (whitelist:
+`instruction` only, §6.3 rule 35) and every `ClassView` carries the required `extract` field
+(S2); per-class rubric re-resolution inherits the S29 empty-selector rule through the base
+selector automatically.
 
 ### 6.2 `config/loader.py` — API (spec 3.1.3, verbatim)
 
@@ -785,9 +1064,11 @@ def load(config_path: Path, project_path: Path, cli_overrides: CliOverrides) -> 
     """Three-source merge + full validation. On failure raises ConfigError(errors: list[str])
     carrying ALL errors (never first-only); CLI exits 2."""
 
-def default_rubric(name: Literal["default:text", "default:ui"]) -> Rubric:
+def default_rubric(name: Literal["default:text", "default:ui",
+                                 "default:trajectory"]) -> Rubric:
     """Load a packaged default rubric from labelkit/data/rubrics/*.toml
-    (importlib.resources)."""
+    (importlib.resources). "default:trajectory" is v1.8 (default_trajectory.toml,
+    spec Appendix A.3, rubric name "default-trajectory-v1")."""
 ```
 
 Error message format (spec 3.1.5): `"<file>:[section].key: <expected>, got <actual>"`, e.g.
@@ -809,6 +1090,8 @@ Profile references:
    `quality.judges` and `verify.judges` must exist in `[llm.*]`.
 3. `quality.judges` / `verify.judges`: when non-empty, length must be odd.
 4. UI modality: every profile used by quality/annotate/verify must have `supports_vision = true`.
+   v1.8: under `segment.enabled = true` this rule is superseded by the per-stage vision table
+   of rule 34 (quality is exempted there; classify/extract/segment join per their own rows).
 5. `dedup.semantic = true` ⇒ `dedup.semantic_embedding` set, exists in `[embedding.*]`, and that
    profile passes rule 12's key check (exactly one of `api_key_env`/`api_key_envs`, every
    listed variable set and non-empty; v1.6).
@@ -904,11 +1187,59 @@ apply only when `classify.enabled = true` unless stated):
     schema and `output.validator` (rule 15 semantics; error locations rendered
     `[[class.<name>.annotate.examples]][N]`, N 1-based).
 
+Stream (v1.8, spec §5.2 [stream]/[segment]/[extract] rows + spec 2.3.1; all checks below
+apply only when the named switch is on unless stated):
+29. `segment.enabled = true` requires ALL of: `run.mode = "process"`, `generate.enabled =
+    false` (generate_only is excluded transitively — rule 10 requires `generate.enabled =
+    true` there, so stream × generate_only can never co-validate), and
+    `annotate.enabled = true` (sequence records have no passthrough output form).
+30. `extract.enabled = true` requires `segment.enabled = true` AND `run.modality = "ui"`
+    (text sequences are out of scope in v1).
+31. `[stream]` fields: `stream.order_by` ∈ {`"input_order"`, `"meta:<field>"`};
+    `order_by = "meta:*"` is TEXT-MODALITY-ONLY; explicitly setting `stream.gap_s` or
+    `stream.session_max_span_s` requires `order_by = "meta:*"`; every `stream.key` element
+    is `"meta:<field>"` (text modality only) or `"source_dir"` (either modality).
+32. `segment.window >= 2`; `2 <= annotate.sequence_frames <= 100` (outside the range →
+    CONFIG_ERROR).
+33. Reference sets (S30 — the "three sets" of rule 23 are FOUR for v1.8 profiles:
+    key resolution (rule 12) / vision (rule 4/34) / `validate --probe`
+    (`cli.referenced_profiles()`) / existence): `segment.llm` joins them ONLY when
+    `segment.enabled` AND `segment.strategy ∈ {llm, hybrid}` (the rules strategy makes zero
+    LLM calls — no key may be demanded), and joins the vision set only when
+    `segment.use_vision = true`; `extract.llm`, when `extract.enabled`, ALWAYS joins all
+    four sets and ALWAYS the vision set (every extract request carries 2 images).
+34. Stream-mode per-stage vision table (S30; UI modality, `segment.enabled = true`):
+    classify ✓ (first-frame screenshot, §10.8), annotate ✓ (multi-image, §10.1),
+    verify ✓ (first/last-frame screenshots, §10.5), extract ✓ (always), segment — only when
+    `use_vision = true`, **quality ✗** — sequence scoring is pure text (§10.2/§10.3 sequence
+    variants); `quality.llm` is the single vision relaxation of rule 4.
+35. `[class.<name>.extract]` whitelist: `instruction` ONLY (extends rule 25's table; any
+    other key → CONFIG_ERROR). `[class.<name>.segment]` does NOT exist as a section:
+    segment runs BEFORE classify, class labels do not exist at segmentation time
+    (chain-order causality, spec §5.2 note) — it is outside rule 25's section list, so any
+    such table falls to the whitelist CONFIG_ERROR.
+36. Rubric selector enumeration is `"default:text" | "default:ui" | "default:trajectory"
+    (v1.8, packaged default_trajectory.toml) | "inline"`; empty-selector resolution per S29:
+    `segment.enabled = true` ⇒ `""` → `"default:trajectory"` (both modalities; explicit
+    selectors always win; class views inherit through the base selector). Rules 16/26/27
+    apply to the trajectory rubric unchanged.
+
 Warnings (non-blocking): `verify` enabled and `verify.llm`'s `model` equals `annotate.llm`'s
 `model` → warn about self-enhancement bias (spec 3.7.2). v1.7 (R8): `classify.enabled = false`
 while `[[classify.classes]]` and/or `[class.*]` tables are present → ONE warning naming the
 ignored tables, never a CONFIG_ERROR ("keep the config, flip the switch" is legal — same
-family as the ineffective-top_ratio warning).
+family as the ineffective-top_ratio warning). v1.8 additions (same R8 family, all
+non-blocking): any of `[stream]`/`[segment]`/`[extract]` present while `segment.enabled =
+false` → ONE warning naming the ignored tables; `segment.strategy = "rules"` with explicit
+`noise_filter = true` → no-op warning; `annotate.sequence_frames` explicitly set while
+`segment.enabled = false` → no-op warning; effective trajectory rubric while
+`extract.enabled = false` → warning (the rubric is modality-neutral and does not presuppose
+steps — "步骤" degrades to "帧间变化", S29); `stream.session_max_len > run.batch_size` →
+static WARN (S21: such sessions will be hard-split by M10 + `session_split` mark);
+`annotate.sequence_frames > 20` while the annotate profile's `max_image_px > 2000` → WARN
+(S28: Anthropic hard-rejects >20-image requests containing any image over 2000 px — HTTP
+400, not a resize; the default max_image_px=2048 hits it. Guide: set `max_image_px <= 2000`
+or lower `sequence_frames`; the 20-image threshold counts ALL image blocks in the request).
 
 ---
 
@@ -930,6 +1261,11 @@ class IngestPlan:
                                                    # (index, tree_path, image_path), ascending
                                                    # by index; text modality: ()
     estimated_records: int                         # text: total lines (cheap count); UI: len(pairs)
+    session_lens: tuple[int, ...] = ()             # v1.8 (S23): session dry-run lengths, filled by
+                                                   # scan(estimate=True) only when segment.enabled
+                                                   # (single read pass fused with the line count);
+                                                   # estimate=False or non-stream: () — feeds the
+                                                   # M10 _estimate stream formulas (§7.9)
 
 
 @dataclass                                         # mutable counters   [FROZEN HERE]
@@ -937,11 +1273,29 @@ class IngestReport:
     scanned: int = 0                               # lines seen / pair indexes seen
     ingested: int = 0
     bad_input: int = 0                             # bad lines + skipped conflicts + missing pairs
+                                                   # (v1.8: + skipped disorder records)
     missing_pair: int = 0                          # UI only
     index_conflict: int = 0                        # UI only
+    sessions: int = 0                              # v1.8: candidate sessions closed by the
+                                                   # assembler (stream mode only; data source of
+                                                   # report.stream.sessions, §9.3)
+    disorder: int = 0                              # v1.8: records skipped by the monotonicity
+                                                   # check (out-of-order or timestamp parse
+                                                   # failure; a SUBSET of bad_input, S20)
     bad_locations: list[dict] = field(default_factory=list)
                                                    # {"file": str, "line_no": int|None,
                                                    #  "index": int|None, "reason": str}
+
+
+@dataclass(frozen=True)                            # v1.8 [FROZEN HERE]
+class Session:
+    session_id: str                                # sha256("\n".join(record ids))[:16] over the
+                                                   # session's records in session order
+                                                   # [FROZEN HERE, see §12]
+    records: tuple[Record, ...]                    # session members in session (order-key) order
+    cause: Literal["gap", "key", "max_len", "max_span", "eof", "limit"]
+                                                   # what closed the session (spec 3.2/S17
+                                                   # vocabulary; = segment.session payload cause)
 
 
 class Ingestor:
@@ -950,13 +1304,35 @@ class Ingestor:
     def scan(self) -> IngestPlan:
         """Scan only, no parsing: file list, pairing table, estimated record count.
         Used by --dry-run and `validate`. Raises InputError if run.input is missing/unreadable
-        or (UI, on_index_conflict='fail') a conflict is found."""
+        or (UI, on_index_conflict='fail') a conflict is found. v1.8 (S23): in stream mode,
+        text-modality estimate=True fuses line counting and the session dry-run into a
+        SINGLE pass (no second full read)."""
 
     def records(self) -> Iterator[Record]:
         """Lazy Record stream. Parse errors follow input.on_bad_line / on_missing_pair /
         on_index_conflict ('skip' → count + trace event; 'fail' → raise InputError).
         Emits trace events ingest.bad_line / ingest.missing_pair / ingest.index_conflict via
-        the metrics sink handed to it (see below)."""
+        the metrics sink handed to it (see below). Non-stream entry point — unchanged."""
+
+    def sessions(self) -> Iterator[Session]:
+        """v1.8 (stream mode): the SESSION-STREAM VIEW consumed by M10 instead of records().
+        Pipeline: parse stream (= records() semantics, incl. ordering per stream.order_by
+        and the per-partition-key monotonicity check with stream.on_disorder, S19/S20) →
+        frame-level --limit islice HERE, between the parse stream and the assembler (S17;
+        the limit unit stays FRAMES, never sessions) → rule-layer session assembler
+        (stream.key change / gap_s / gap_steps / session_max_len / session_max_span_s —
+        any trigger closes the session). Emits one `segment.session` trace event per closed
+        session (owner M2; the segment.* prefix routes it to the segment channel, S1) and
+        counts IngestReport.sessions. --limit truncation is treated as EOF: the unclosed
+        tail session is flushed with cause="limit" + ONE stderr WARN (S17). cause="limit"
+        means "closed WHERE the --limit budget ran out" — budget exhaustion exactly
+        at EOF is indistinguishable from real truncation without pulling (and
+        parsing) one extra record, which would perturb the scanned/bad_input
+        ledger; the tool does not disambiguate, and the WARN states budget
+        exhaustion rather than claiming truncation (v1.8 D3). A source-FILE
+        change under text input_order ALSO closes the session with cause="key"
+        (line_no ordering does not extend across files; under meta:* ordering
+        file boundaries are transparent — v1.8 D7)."""
 
     @property
     def report(self) -> IngestReport: ...
@@ -979,7 +1355,23 @@ Text parsing (3.2.5): non-object JSON line = bad line; `input.text_field` dotted
 used as-is; array/object hit serialized with canonical JSON; miss = bad line; empty lines skipped
 silently (not counted as bad).
 
-### 7.2 M3 — `labelkit/dedup.py`
+v1.8 stream ordering & monotonicity (spec §6.1, S19/S20 — active only when `segment.enabled`):
+
+- **Ordering.** `stream.order_by = "input_order"` (default): text = filename lexicographic →
+  line number; UI = pair_index ascending. `"meta:<field>"` (text only): `<field>` is a dotted
+  path on the raw line object; timestamp parsing — numeric: `v < 0 ∨ v >= 1e14` ⇒ parse
+  failure, `v < 1e11` ⇒ epoch SECONDS, `1e11 <= v < 1e14` ⇒ epoch MILLISECONDS (÷1000);
+  string: try pure-number → numeric rules, then `datetime.fromisoformat` (Python 3.11 accepts
+  the `Z` suffix), both fail = parse failure; timezone-aware values convert to UTC epoch,
+  naive values are INTERPRETED AS UTC; the internal sort key is float seconds (S20).
+- **Streaming monotonicity check** (no full re-sort): one cursor PER `stream.key` partition
+  key (memory = key cardinality, S19) — per-device/per-source concatenated inputs are not
+  falsely flagged; key change = session break (groupby semantics: input must arrive grouped
+  by key). Out-of-order records and parse failures BOTH follow `stream.on_disorder`:
+  `"skip"` (default) = skip + count `bad_input` + `IngestReport.disorder` + one
+  `ingest.disorder` event per record (trace-only; M2 itself logs ONE data-free stderr
+  WARN per run — the reason carries timestamp values and never reaches stderr, §8.1);
+  `"fail"` = InputError → exit 3.
 
 ```python
 class DedupIndex:
@@ -1033,6 +1425,25 @@ tree-only (`ui_dup_requires` treated as `"tree"` for that record, spec 3.3.4)
 **[FROZEN HERE]**; embedding failure after retries →
 skip level ④ for that record, count `embedding_failures`. Duplicates: `status="dropped_dup"`,
 `item.dedup=DedupInfo(...)`, trace `dedup.duplicate`; survivors get `DedupInfo(kind="unique",...)`.
+
+v1.8 sequence records (S10 — episode-level duplicate = "the same operation flow"; four
+adaptation points, all others unchanged):
+
+- **Dedup text.** The dedup-text recipe gains a `kind == "sequence"` branch that takes
+  precedence over the modality branch: the MEMBERS' single-record recipes (text rule / tree
+  serialization, per modality) concatenated in member order with separator `"\x1e"` (ASCII
+  Record Separator — `isspace() == True`, structurally collision-free against
+  whitespace-collapsed normalized text) **[FROZEN HERE: the separator]**. Levels ①② run on
+  that concatenation.
+- **Level ③ (pHash)** auto-skips sequence records (their `image is None` — the existing
+  gate); with `ui_dup_requires = "both"` the composite verdict degrades to tree-only for
+  sequence records (the image_decode_failed degradation path, spec 3.3.4).
+- **Level ④ (semantic)** participation/verdict-kind logic gains the sequence case ("both"
+  walks the tree-only branch); an over-long embedding input that fails after retries takes
+  the EXISTING `embedding_failures` skip path (spec 3.3.3 — no new failure route).
+- Member frames never reach M3 individually (they are `absorbed`/`dropped_noise` before
+  dedup in the chain, §7.9) — frame-level dedup semantics are intentionally void in stream
+  mode.
 
 ### 7.3 M4 — `labelkit/quality.py`
 
@@ -1094,7 +1505,22 @@ v1.7 per-class pooling (classify enabled; spec 3.4.3 按类分池 row):
   `quality.tie_outcomes.<pool>.<crit>` / `quality.tie_comparisons.<pool>.<crit>` (R12, §9.3);
   `quality.judgment` / `quality.bt_fit` / `quality.gate` payloads gain `pool` (R16, §8.1).
 
-### 7.4 M5 — `labelkit/annotate.py`
+v1.8 sequence scoring (`record.kind == "sequence"`; spec 3.4.3 sequence row):
+
+- **Record rendering** switches to the §10.2/§10.3 sequence variant: `[步骤序列]` (the
+  transitions rendered as text; a fallback step — `Transition.detail.kind ==
+  "extraction_invalid"` — is listed SEPARATELY from an LLM-confirmed `other` by the
+  `（摘取兜底）` line suffix, S16, so fallback noise cannot pollute the coherence anchor) +
+  `[成员帧摘要]` (bounded per-member `frame_digest`), **NO images** — sequence scoring is
+  pure text even in UI modality (the rule-34 vision relaxation, §6.3). transitions and the
+  pre-rendered text reach the judging calls via NEW PRIVATE parameters of
+  `_judge_once`/`_pointwise_once` (private signatures — not part of the frozen surface);
+  the `excerpt` tier payload for sequences = first 200 chars of the member-digest rendering.
+- **Rubric**: the stream default is `default:trajectory` (S29, §6.3 rule 36); the rubric is
+  consumed by the EXISTING machinery with zero changes. With `extract.enabled = false` the
+  steps section is absent and "步骤" degrades to "帧间变化" (M1 warns, §6.3).
+- **Gate**: stream mode keeps the existing default of "score only, no filtering" when
+  `quality.threshold` is absent — deliberately so (TRM ablation + E2E #6, spec §1.6).
 
 ```python
 @dataclass(frozen=True)                            # [FROZEN HERE]
@@ -1107,21 +1533,28 @@ class RepairContext:
 def build_annotate_prompt(record: Record, cfg: ResolvedConfig, schema_text: str,
                           repair: RepairContext | None = None,
                           temperature: float | None = None,
-                          label: str | None = None) -> PromptBundle:
+                          label: str | None = None,
+                          transitions: tuple[Transition, ...] | None = None) -> PromptBundle:
     """Deterministic template assembly per §10.1. schema_text = SchemaEngine.user_schema_text.
     repair != None appends the repair suffix (§10.5). [FROZEN HERE; label is a v1.7 ADDITIVE
     trailing kwarg (R2): non-None → instruction/examples come from
-    cfg.class_views[label].annotate; None = global config — pre-v1.7 call sites unchanged]"""
+    cfg.class_views[label].annotate; None = global config — pre-v1.7 call sites unchanged.
+    transitions is the SECOND additive trailing-kwarg revision of this frozen signature
+    (v1.8, S5 — same R2 construction): non-None → the §10.1 sequence variant renders the
+    [动作序列] section from it; None = section omitted / pre-v1.8 behavior byte-identical]"""
 
 
 async def annotate_record(record: Record, ctx: RunContext,
                           repair: RepairContext | None = None,
-                          label: str | None = None) -> Annotation:
+                          label: str | None = None,
+                          transitions: tuple[Transition, ...] | None = None) -> Annotation:
     """One record's full annotation path incl. self-consistency (skipped when repair != None:
     repair re-annotation is always a single call at profile-default temperature [FROZEN HERE]).
     Raises SchemaViolation / ProviderRetryableError / ProviderFatalError. This is the hook M7
     uses for verify.policy='repair'. [FROZEN HERE; label is a v1.7 ADDITIVE trailing kwarg
-    (R2), same semantics as build_annotate_prompt — None = global config]"""
+    (R2), same semantics as build_annotate_prompt — None = global config. transitions is the
+    v1.8 ADDITIVE trailing kwarg (S5): the stage layer passes item.transitions; the M7 repair
+    path threads the REBUILT value through after member surgery — None = pre-v1.8 behavior]"""
 
 
 class AnnotateStage(Stage):
@@ -1149,6 +1582,19 @@ v1.7 label semantics (R2): `label = None` ⇒ globally configured instruction/ex
 the pre-v1.7 behavior); `label` non-None ⇒ both are read from `class_views[label].annotate`.
 The stage layer passes `item.classification.label if item.classification else None`. The
 `annotate.done` payload gains `label` (classify enabled only, §8.1).
+
+v1.8 sequence annotation (S5/S6/S28; `record.kind == "sequence"` only): the user message
+follows the §10.1 sequence variant — `[动作序列]` text (omitted entirely when
+`transitions is None`) → per kept keyframe `[关键帧 {i}/{k}·成员 {m}]` text + image →
+ALWAYS-CLOSING `[成员帧摘要]` text. **Template invariant: the final part of the user message
+is ALWAYS text** — the M8 repair loop concatenates onto `parts[-1].text`, an image-final
+message would silently produce "None\n…" and drop the last image (S6); the closing digest
+section exists to guarantee this with zero repair-code changes. Keyframe selection: n members
+> `annotate.sequence_frames` = k → deterministic uniform downsample
+`idx_i = ⌊i·(n−1)/(k−1)⌋, i = 0..k−1` (first/last always kept, strictly increasing, zero
+rng; n ≤ k takes all members). Self-consistency and the L2.5 hook paths are UNCHANGED (the
+L2.5 callback receives `record=None` for sequence records — documented limitation; a richer
+payload is a roadmap candidate).
 
 ### 7.5 M6 — `labelkit/generate.py`
 
@@ -1237,6 +1683,50 @@ through, and repair re-annotation calls `annotate_record(..., label=...)` (§7.4
 passes `item.classification.label if item.classification else None`; `verify.verdict` payloads
 gain `label` (classify enabled only, §8.1).
 
+v1.8 stream branch (sequence envelopes only; spec 3.7 stream branch, S7/S8/S31). The
+non-stream path is a REGRESSION ANCHOR — `run_verify_loop` and `VERDICT_SCHEMA` are
+byte-unchanged; sequence envelopes are driven by a stage-layer bypass driver:
+
+- **Schema & verdict.** Reviews validate against `defect_verdict_schema()` (§10.7) — three
+  top-level keys `{critiques, defects, verdict}`, ALL required (S7). `critiques` flow through
+  the existing merge/feed-back chain unchanged; `defects` land in
+  `VerificationResult.defects` and `_meta.verification.defects` (§9.1). A `fail` verdict with
+  an EMPTY defects array is normalized code-side to one default `label_mismatch` entry (S7).
+  Multi-judge: defects = the UNION over judges that voted fail, deterministically
+  de-duplicated and sorted by (kind enum order, position, members) (S31).
+- **Evidence** (§10.5 sequence variant): `[任务指令]` + `[动作序列]` + `[边界余量]` (the
+  frame_digest of the k=2 frames beyond each segment boundary plus each frame's fate:
+  noise / adjacent-episode ordinal / none) + `[首帧截图]` + `[末帧截图]` + `[标注结果]`.
+- **Two-phase batch-level repair round (S8** — determinism under concurrent gather;
+  `policy="repair"` only): ① concurrent review of ALL pending episodes; ② SYNCHRONOUS
+  member surgery executed in batch position order (first-come becomes
+  deterministic-position-come): shrink — frames named by `defect.members` flip
+  `absorbed → dropped_noise` + duck-typed `off_task_member` mark (→ §9.2 rejects); reclaim
+  (missing_head/tail/members) — three-level determination: same-`session_id`
+  `dropped_noise` frames in the batch noise pool are RE-JUDGED via a direct
+  `segment.judge_window` call (§7.14; relation ∈ {continues, advances} ⇒ reclaim,
+  `dropped_noise → absorbed`, inserted into `members` by order key) → frames held by an
+  ADJACENT episode: mark only, no cross-episode theft → nowhere to be found: the defect
+  entry gains a code-side SIBLING key `suspected = "capture_gap"` (`detail` is
+  string-typed in the schema, so the annotation cannot nest under it; frames of a
+  batch_size-split session get `"session_split"` instead); ③ concurrent seam re-extraction via direct
+  `extract.extract_transition` calls (§7.15; 1–2 per surgery, `detail.reseamed = true`);
+  ④ synchronous record rebuild (`dataclasses.replace(record, members=...)`; the record
+  **id is NOT recomputed**) and transitions rebuild (renumbered so
+  `len(transitions) == len(members) − 1` holds); ⑤ concurrent re-annotation via
+  `annotate_record(..., transitions=<rebuilt>)` (§7.4); → next-round re-review. Repair
+  rounds count against `max_repair_rounds` INCLUDING the first review.
+- **Multi fan-out interplay (S8).** Membership-class surgery may execute ONLY on the
+  original envelope (first label); cloned siblings downgrade to mark-only. After a repair
+  the sibling envelopes' `record` may diverge (shared-by-reference no longer holds for the
+  repaired one); same-id output rows are disambiguated by `_meta.stream.repaired` (§7.13).
+- **No re-scoring.** Post-repair episodes keep their pre-repair quality scores;
+  `_meta.stream.repaired = true` is the marker.
+- **Counters (owner M7, §9.3):** `verify.membership_repairs` (surgeries executed),
+  `verify.boundary_flags` (mark-only boundary determinations), `verify.defects.<kind>`
+  (per defect kind) → `report.stream.verify`. Defect summaries ride the `verify.verdict`
+  event payload (content-tiered, §8.1).
+
 ### 7.7 M8 — `labelkit/schema_engine.py`
 
 ```python
@@ -1301,7 +1791,17 @@ VERDICT_SCHEMA: dict
 def samples_schema(num_per_call: int) -> dict: ...
 def classification_schema(class_names: list[str], assignment: str,
                           max_labels: int, with_reason: bool) -> dict: ...   # v1.7 (M13), §10.7
+def segment_window_schema(frame_count: int, with_reason: bool) -> dict: ...  # v1.8 (M14), §10.7
+def action_schema() -> dict: ...                                             # v1.8 (M15), §10.7
+def defect_verdict_schema() -> dict: ...                                     # v1.8 (M7 stream),
+                                                                             # §10.7
 ```
+
+The three v1.8 builders are INTERNAL schemas like the rest: no `resolved_at` bucket
+counting, no L2.5 hook, keyword set ⊆ the frozen internal-schema keyword set, and NO
+`uniqueItems` anywhere (R1 lesson — L0 strict-mode pass-through). The non-stream verify
+path keeps using the frozen `VERDICT_SCHEMA`; `defect_verdict_schema()` exists ALONGSIDE it
+(two verdict schemas co-exist, S7).
 
 ### 7.8 M9 — `labelkit/llm_client.py`
 
@@ -1491,9 +1991,14 @@ class Orchestrator:
 
 Normative behavior: split `ingestor.records()` into batches of `run.batch_size` (`--limit`
 truncates the stream to the first N records); wrap into `PipelineItem`s; per batch, per enabled
-stage in order dedup → classify → quality → generate → annotate → verify (v1.7 chain,
-`_CHAIN_ORDER`; `_compose_chain` includes classify in the main, re-flow AND generate_only
-chains — items already classified rely on M13's idempotent skip): build a fresh `RunContext`
+stage in chain order — the SINGLE SUPERSET TUPLE (v1.8)
+`_CHAIN_ORDER = ("segment", "dedup", "classify", "extract", "quality", "generate",
+"annotate", "verify")` **[FROZEN HERE: the eight-name tuple]** — with segment/extract DEFAULT
+OFF, so the effective v1.7 chain dedup → classify → quality → generate → annotate → verify is
+a byte-identical degradation (`generate` and `segment` are mutually exclusive per §6.3 rule
+29, so the two never co-occupy the chain; `_compose_chain` includes classify in the main,
+re-flow AND generate_only chains — items already classified rely on M13's idempotent skip):
+build a fresh `RunContext`
 (rng derived per §5) and `await stage.run(batch, ctx)`; `generate.run`'s return value is enqueued as
 new batch(es) (split at `batch_size`, consecutive `batch_no`, no generate stage); after stages,
 `emitter.emit_batch(batch, batch_no)`, then `metrics.flush()` (trace flush follows output flush),
@@ -1535,6 +2040,46 @@ v1.7 classify orchestration (spec 3.10.3 分类与扇出 row):
   max(1, sc)`. quality/annotate/verify estimates use the globally-inherited config; when
   `[class.*]` overrides exist or assignment is "multi", stderr notes "estimated on the global
   config / multi reported as a lower bound (label multiplier 1)".
+
+v1.8 stream orchestration (spec 3.10.3 stream rows; active only when `segment.enabled`):
+
+- **Whole-session batching — next-fit (S21).** M10 consumes `ingestor.sessions()` (§7.1)
+  instead of `records()` and packs WHOLE sessions into batches by next-fit (sequential
+  packing, exactly ONE open bin): sessions ship in arrival order, a session that no longer
+  fits closes the current batch and opens the next. Batch capacity = `run.batch_size`
+  FRAMES. A single session longer than `batch_size` is HARD-SPLIT by M10 + ONE stderr WARN
+  + a duck-typed `session_split` mark on the split session's frame envelopes (M7's
+  missing-frame downgrade evidence and `_meta.stream.session_split`, §9.1). The one pending
+  overflow session is the ONLY new cross-batch survivor (released as soon as it is packed —
+  it joins the §11 ⑤ closed list).
+- **session_id stamping (S4).** M10 stamps `PipelineItem.session_id` on frame envelopes at
+  envelope construction (bookkeeping, not business logic); M14 stamps the episode envelopes
+  it appends.
+- **Episode metering (fanout-isomorphic, R9 construction).** `counts.episodes` = the
+  `len(batch)` delta across the SEGMENT stage invocation, metered by M10 — M14 never touches
+  `counts.*`.
+- **Status tally.** The post-emit tally gains `absorbed`/`dropped_noise`; the `failed`
+  fallback formula extends to
+  `failed = max(len(batch) − emitted − dropped_dup − dropped_lowq − dropped_verify −
+  absorbed − dropped_noise, 0)` — without the new terms, absorbed members would be
+  miscounted as failed. `batch.end` payload gains `episodes`/`absorbed`/`dropped_noise`
+  (carried only when segment is enabled, R20 form, §8.1); the stderr progress/summary line
+  gains NO new keys (fanout precedent — the report carries them).
+- **Conservation & interrupted residual (S18).** The full v1.8 invariant is §9.3's
+  `emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed +
+  bad_input + absorbed = scanned + generated + fanout + episodes`. In stream mode the
+  `counts.unprocessed` residual appears on "breaker trip **OR** interrupted" (SIGINT over a
+  session buffer strands in-flight records); the residual computation extends both sides
+  (`+ episodes` on the source side, `+ absorbed + dropped_noise` on the terminal side).
+  Non-stream interrupted runs keep a zero residual and NO `unprocessed` key (regression
+  anchor).
+- **Dry-run (S22/S23).** `_estimate` gains, unconditionally printed (classify precedent;
+  0 when disabled): `segment_calls = Σ ceil((L−1)/(window−1))` over sessions of length
+  L ≥ 2 (L = 1 or `strategy="rules"` counts 0) and `extract_calls = Σ (L−1)` reported as an
+  UPPER bound; quality/annotate/verify estimates use episodes ≈ sessions as a LOWER bound +
+  a stderr note; the batch count is computed EXACTLY by dry-run next-fit packing of the
+  session sizes; text-modality line counting and the session dry-run fuse into a single
+  read pass (S23, §7.1).
 
 ### 7.10 M11 — `labelkit/emitter.py`
 
@@ -1585,6 +2130,25 @@ disabled, else `{label, labels, source}` — §9.1); the `_meta.scores` block ga
 the §9.2 closed five-key enumeration becomes six keys, R5). The rejects attribution rule
 (`stage`/`reason` from `item.errors[0]`) is UNCHANGED — guaranteed safe because fallback
 classification writes no `item.errors` entry (R4, §7.13).
+
+v1.8 (spec 3.11.2 stream rows):
+
+- **Third route.** `status == "absorbed"` goes to NEITHER the main output NOR rejects —
+  counted only (the member content lives inside its episode's sequence record). `emit_batch`
+  distribution becomes: active → main; absorbed → counted; every other non-active status →
+  rejects.
+- **Rejects attribution for `dropped_noise`.** `_reject_stage_reason` gains a
+  `dropped_noise` branch that reads the duck-typed reason mark left by the flipping stage:
+  `("segment", "noise")` | `("segment", "below_min_len")` | `("verify", "off_task_member")`
+  (§9.2 — these frames carry no `item.errors` entry, so the `errors[0]` rule cannot serve
+  them).
+- **`_assemble_meta`** gains the ALWAYS-PRESENT `stream` key (`null` whenever segment is
+  disabled), positioned after `source` and before `scores` (chain-order mirror, §9.1); in
+  stream mode `_meta.verification` additionally carries the always-present `defects` key
+  (`[]` when none — §9.1); non-stream verification blocks do NOT carry the key.
+- **`_raw_payload`** (rejects `full` tier) gains a `kind == "sequence"` branch emitting
+  `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}` (S25, §9.2) instead
+  of the single-record payload shape.
 
 ### 7.11 M12 — `labelkit/obslog.py`
 
@@ -1659,7 +2223,18 @@ Event-name constants (module level, exact strings): `EV_RUN_START = "run.start"`
 `EV_SCHEMA_REPAIR = "schema.repair"`, `EV_LLM_CALL = "llm.call"`, `EV_ERROR = "error"`,
 and (v1.6) `EV_LLM_KEY_COOLDOWN = "llm.key_cooldown"`, `EV_LLM_KEY_DISABLED = "llm.key_disabled"`,
 `EV_LLM_POOL_PARKED = "llm.pool_parked"`, and (v1.7)
-`EV_CLASSIFY_DECISION = "classify.decision"`.
+`EV_CLASSIFY_DECISION = "classify.decision"`, and (v1.8)
+`EV_INGEST_DISORDER = "ingest.disorder"`, `EV_SEGMENT_SESSION = "segment.session"`,
+`EV_SEGMENT_BOUNDARY = "segment.boundary"`, `EV_EXTRACT_STEP = "extract.step"`.
+
+v1.8 redaction constants (S27, §8.3): `_FREE_TEXT_KEYS` gains `"description"` (LLM-produced
+free text — stripped at `none`, carried from `refs`); NEW module constant
+`_DATA_KEYS = {"target", "value"}` — INPUT-DATA-DERIVED payload fields (widget text
+references, typed-in text), stripped at BOTH `none` and `refs` (the refs tier's
+"no input data content" red line), carried from `excerpt`. The channel enumeration
+`_TRACE_CHANNELS` (owned by `config/loader.py`) grows 8 → 10 with `"segment"`/`"extract"`
+(S1: channel = stage name; the `error` event auto-routes by its `stage` field — zero routing
+code changes).
 
 ### 7.12 CLI — `labelkit/cli.py`
 
@@ -1668,7 +2243,7 @@ labelkit run      --config <config.toml> --project <project.toml>
                   [--input PATH] [--output PATH] [--limit N] [--dry-run] [--strict]
                   [--log-level debug|info|warn|error]
 labelkit validate --config <config.toml> --project <project.toml> [--probe]
-labelkit rubric   [--show default:text|default:ui]
+labelkit rubric   [--show default:text|default:ui|default:trajectory]
 ```
 
 ```python
@@ -1686,7 +2261,14 @@ failure → 1, else 0. `validate`: `config.load()` only (+`--probe`:
 `LLMClient.probe_all` on every referenced profile (v1.6 — one line per key for pooled
 profiles; single-key output format unchanged), print results; any probe failure does not change
 the exit code unless config itself is invalid **[FROZEN HERE]**). `rubric`: no flag → list
-available names; `--show <name>` → print the packaged TOML verbatim.
+available names; `--show <name>` → print the packaged TOML verbatim (`_RUBRIC_FILES` /
+argparse choices gain `default:trajectory` → `default_trajectory.toml`, v1.8).
+
+v1.8: `_build_stages` constructs `SegmentStage` and `ExtractStage` per their switches at
+their `_CHAIN_ORDER` slots (§7.9). `referenced_profiles()` (the `validate --probe` set)
+gains `segment.llm` ONLY when `segment.enabled` and `segment.strategy ∈ {llm, hybrid}`, and
+`extract.llm` whenever `extract.enabled` (S30, §6.3 rule 33 — the same conditions govern all
+four reference sets).
 
 ### 7.13 M13 — `labelkit/classify.py` (v1.7)
 
@@ -1747,7 +2329,9 @@ Normative behavior:
 - **Multi fan-out.** Normalized hit set of k ≥ 2: the original envelope takes the FIRST
   label (declaration order); each remaining label clones one sibling `PipelineItem`
   appended IN PLACE to the tail of the passed-in batch list. Clones share `record` and
-  `dedup` BY REFERENCE (sibling rows' `_meta.dedup` stay consistent); `classification`
+  `dedup` BY REFERENCE (sibling rows' `_meta.dedup` stay consistent) and inherit
+  `session_id` (v1.8: sibling episodes stay addressable for the M7
+  boundary-margin/neighborhood queries); `classification`
   swaps `label` (`labels` = the same full set); `status="active"`;
   scores/annotation/verification/errors are fresh default containers. Append order =
   (original element's batch position → label declaration order), byte-reproducible. Return
@@ -1759,6 +2343,166 @@ Normative behavior:
   R29). Counters OWNED BY M13: `classify.classes.<name>` (counted per label),
   `classify.fallback`, `classify.failures`, `classify.multi_label_records`. `counts.fanout`
   is counted by M10 (len-delta metering, R9/§7.9) — M13 never increments `counts.*`.
+- **v1.8 sequence branch** (`record.kind == "sequence"`; spec 3.13.3 sequence row —
+  zero-crash guarantee for episodes): the current-record user message follows the §10.8
+  sequence variant — `[待分类数据·序列]` episode digest (per-member `frame_digest` in member
+  order, TOTAL capped at `input.ui_tree_max_chars` with first/last members always kept and
+  whole middle entries truncated + an `…(truncated N members)` marker) + the FIRST member's
+  screenshot (UI modality; classify stays in the rule-34 vision set).
+- **v1.8 multi × episode semantics (S9).** Fan-out clones always carry
+  `transitions = None` (extract runs AFTER classify in the chain — each sibling extracts
+  independently under its own label's effective `[class.<label>.extract]` instruction;
+  ×k extract cost is accepted, per-label whitelist promise honored). SHARED-RECORD BOUNDARY:
+  the v1.7 "clones share `record` by reference" invariant holds only until M7 member
+  surgery — a repaired sibling's `record` diverges (same `_meta.id` output rows may then
+  carry different `member_ids`), disambiguated by `_meta.stream.repaired` (§7.6/§9.1).
+
+### 7.14 M14 — `labelkit/segment.py` (v1.8)
+
+(New module, spec 3.14 / `spec/314-m14-segment.md`. Numbered AFTER §7.13 so every frozen
+§7.x anchor stays valid; chain position is the HEAD of the chain — before dedup, §7.9/§2.)
+
+Responsibilities: refine the batch's candidate sessions into episodes — regroup active
+frame envelopes (`kind == "single"`) by `session_id` (batch position order = session order,
+guaranteed by M10's whole-session packing, §7.9); optional LLM sliding-window boundary
+verdicts + per-frame noise marking (§10.9); flip members to `absorbed` / noise frames to
+`dropped_noise`, assemble sequence Records (member order-key ascending) and tail-append
+episode envelopes per contract ②b (§5). Boundaries: no ordering/sessionization (M2, §7.1);
+no dedup (M3); no action inference (M15); no task labels (M5); no chain-structure changes.
+Depends on M1, M8, M9 only. Envelopes with `kind == "sequence"` never enter its processing
+face — naturally idempotent.
+
+```python
+class SegmentStage(Stage):
+    name = "segment"
+    def __init__(self, cfg: ResolvedConfig): ...
+    async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]: ...
+        # returns the SAME list object it received (contract ②b tail-append, §5)
+
+
+def build_segment_prompt(frames: Sequence[Record], diffs: Sequence[Mapping | None],
+                         cfg: ResolvedConfig, with_reason: bool) -> PromptBundle:
+    """Deterministic assembly of the §10.9 template; frame digests and adjacent-frame
+    diffs are pre-assembled code-side (frame_digest/tree_diff, §3)."""
+
+
+async def judge_window(frames: Sequence[Record], ctx: RunContext) -> list[str]:
+    """One window, one call — through complete_validated(schema=
+    segment_window_schema(len(frames), with_reason), §10.7). Post-validation is INSIDE this
+    function: build the index table FIRST-WINS (duplicate index keeps the first occurrence),
+    absent frames default to "continues" (conservative-neutral — the quality
+    "absent criterion → tie" precedent); returns the per-frame relation list ALIGNED with
+    `frames`. Emits one segment.boundary event per window (§8.1). PUBLIC DIRECT-CALL
+    SURFACE: M7's member-reclaim re-judgment calls this function directly (§7.6) — the
+    sanctioned import exception registered in the ground rules."""
+```
+
+Normative behavior (spec 3.14.4):
+
+- **Strategy** (`segment.strategy`): `"rules"` — candidate sessions become episodes as-is,
+  zero LLM (noise_filter/min_len ineffective); `"llm"`/`"hybrid"` (default hybrid) —
+  sliding-window refinement, identical behavior inside M14 (rule-layer sessionization is
+  always on in M2; "hybrid" names the composition). Window length `segment.window` (≥ 2);
+  step = window − 1 (1-frame overlap; the seam frame's WHOLE verdict belongs to the LATER
+  window — unconditional overwrite during stitching); `len(session) == 1` degrades to rules
+  (zero LLM).
+- **Calls & stitching.** One call per window; ALL windows across ALL sessions of the batch
+  join ONE `asyncio.gather` (profile semaphore bound); stitching is a synchronous pass after
+  all verdicts arrive, positioned by window index — schedule-independent; zero rng.
+- **Deductive mapping (code-side lookup — the LLM never answers the boundary question):**
+  `continues`/`advances` → non-boundary; `returns_to_entry`/`context_switch` → boundary
+  (THAT frame is the first frame of a new segment); `interruption` → noise. The session's
+  FIRST frame is always a segment head (rel[0]'s boundary value is ignored; noise[0] still
+  applies).
+- **Segment assembly (deterministic, per session):** ① noise removal (`noise_filter=true`:
+  `interruption` frames → `dropped_noise`, duck-typed reason `"noise"`, incl. frame 0);
+  ② split remaining frames at boundary frames; ③ `min_len` check — applies ONLY to the
+  segments cut in step ② (S11): a segment shorter than `segment.min_len` flips ALL its
+  frames to `dropped_noise` with reason `"below_min_len"` (≠ "noise"; independent counter,
+  §9.3); rule-layer lone-frame/short sessions never pass through min_len; ④ per segment:
+  members order-key ascending → members `absorbed` → build the sequence Record (§3 id rule;
+  ref inherits the first member, S24) → tail-append the episode envelope (`active`,
+  `kind="sequence"`) + stamp `session_id`.
+- **Failure (`segmentation_invalid`, §4):** a window whose M8 repair budget is exhausted —
+  `on_error="keep"` (default): the session abandons ALL window verdicts and becomes ONE
+  whole episode (zero noise removal, zero splitting); evidence triple =
+  `_meta.stream.degraded = {kind: "segmentation_invalid", windows_failed: k}` + `error`
+  event + `segment.failures` counter, **never `item.errors`** (S26 — rejects attribution
+  reads `errors[0]`, §9.2); `on_error="fail"`: all session members `failed` → rejects.
+- **Digest-poverty guard (S12).** A frame whose `frame_digest` judges poor (zero visible
+  text nodes / digest < 8 chars) counts `digest_poor_frames` (§9.3) + at most ONE stderr
+  WARN per run pointing at `segment.use_vision`.
+- **Events:** `segment.boundary` per window (§8.1). `segment.session` is emitted by M2's
+  assembler (§7.1), not by this module. Counter owned by M14: `segment.failures`;
+  `below_min_len`/`digest_poor_frames` report fields are M14-owned (§9.3);
+  `counts.episodes`/`absorbed`/`dropped_noise` are M10's (§7.9).
+
+### 7.15 M15 — `labelkit/extract.py` (v1.8)
+
+(New module, spec 3.15 / `spec/315-m15-extract.md`. Chain position: after classify, before
+quality, §7.9 — labels are in place so `[class.<label>.extract]` per-class instructions
+apply.)
+
+Responsibilities: for every active sequence envelope (episode), infer one structured action
+per adjacent member pair ⟨s_i, s_{i+1}⟩ via LLM (internal schema §10.7) and write
+`item.transitions`; **transition count = member count − 1**. UI-modality sequences only
+(§6.3 rule 30). Boundaries: no re-segmentation (M14 upstream — the member set is given
+input); no user-schema fields (the step sequence is tool-internal structure — it reaches
+`_meta.stream.steps` and downstream prompts; user-schema output belongs to M5); no record
+elimination (the default failure path is fallback evidence, not dropping); no scoring, no
+review. Depends on M1, M8, M9 only.
+
+```python
+class ExtractStage(Stage):
+    name = "extract"
+    def __init__(self, cfg: ResolvedConfig): ...
+    async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]: ...
+        # returns the SAME list object (no additions, no removals; §5 contract ②)
+
+
+def build_extract_prompt(prev: Record, curr: Record, cfg: ResolvedConfig,
+                         label: str | None) -> PromptBundle:
+    """Deterministic assembly of the §10.10 template; label non-None → instruction takes
+    class_views[label].extract's effective value (§6.3 rule 35)."""
+
+
+async def extract_transition(prev: Record, curr: Record, index: int,
+                             ctx: RunContext, label: str | None = None) -> Transition:
+    """One transition, one call — through complete_validated(schema=action_schema(),
+    §10.7); repair exhaustion follows extract.on_error (fallback Transition / raise).
+    PUBLIC DIRECT-CALL SURFACE: M7's post-surgery seam re-extraction calls this function
+    directly (1–2 calls per surgery; rebuilt Transitions carry detail.reseamed=true and
+    renumbered index so len(transitions) == len(members) − 1 stays true, §7.6) — the
+    sanctioned import exception registered in the ground rules."""
+```
+
+Normative behavior (spec 3.15.4):
+
+- **Selection & idempotency.** Processes envelopes with `status == "active"`,
+  `record.kind == "sequence"` AND `transitions is None`; `transitions is not None` skips
+  (any re-entry costs zero calls). The M7 repair path never re-runs this stage — it uses
+  the `extract_transition` direct call.
+- **Output invariant.** `item.transitions` length == `len(record.members) − 1`, ascending
+  by pair ordinal; a single failed transition never breaks the invariant (fallback
+  placeholder, §4 extraction_invalid). Batch cardinality unchanged.
+- **Concurrency.** ALL transitions across ALL episodes of the batch join ONE
+  `asyncio.gather` (M4 pairwise phase-2 skeleton); results written back by (episode batch
+  position, pair ordinal) — schedule-independent, zero rng. Temperature 0. One request
+  carries exactly 2 images.
+- **Multi fan-out (S9).** Each sibling extracts independently under its own label
+  (per-label `instruction`); `transitions` is per-envelope self-contained; dry-run reports
+  the ×1 lower bound + stderr note (R28 convention, §7.9).
+- **Fallback semantics (S16).** On repair exhaustion with `on_error="fallback"` (default):
+  the step records the code-side fallback
+  `action = {"action_type": "other", "target": None, "value": None, "description": ""}` +
+  `detail = {kind: "extraction_invalid", message}`; the episode stays alive, later
+  transitions extract normally; **never `item.errors`**; the evidence keeps fallback steps
+  distinguishable from LLM-confirmed `other` downstream (detail.kind presence).
+  `on_error="fail"`: episode `failed` → rejects (+ `extract.failures`).
+- **Events & counters (owner M15, §9.3):** one `extract.step` per transition incl. fallback
+  steps (§8.1); `extract.transitions` (total incl. fallback), `extract.fallback_steps`,
+  `extract.failures`, `extract.by_type.<action_type>` (per-type distribution — systematic
+  degradation observable, S14; feeds `include_diff` A/B).
 
 ---
 
@@ -1771,12 +2515,16 @@ Normative behavior:
 | `run.start` | always / info | M10, after M1 passes, before first batch; trace header line | () | `tool_version`, `config_digest`, `project_digest`, `trace_schema_version` (=1, only here) |
 | `run.end` | always / info | M10 after finalize; last trace line | () | `counts` (report-shaped summary), `exit_code` |
 | `batch.start` | always / debug | M10 when PipelineItem[] ready | () | `size` |
-| `batch.end` | always / info | M10 after batch emit + release | () | `active`, `dropped_dup`, `dropped_lowq`, `dropped_verify`, `failed`, `duration_ms`[, `fanout` — v1.7, classify enabled only (R20)] |
+| `batch.end` | always / info | M10 after batch emit + release | () | `active`, `dropped_dup`, `dropped_lowq`, `dropped_verify`, `failed`, `duration_ms`[, `fanout` — v1.7, classify enabled only (R20)][, `episodes`, `absorbed`, `dropped_noise` — v1.8, segment enabled only (same R20 form)] |
 | `ingest.bad_line` | ingest / warn | M2 bad line skipped | () | `file`, `line_no`, `reason` |
 | `ingest.missing_pair` | ingest / warn | M2 missing pair skipped | () | `index`, `present` ("tree"\|"image"), `file` |
 | `ingest.index_conflict` | ingest / warn (error if policy=fail) | M2 index conflict | () | `index`, `files` (list) |
+| `ingest.disorder` | ingest / — (trace-only, no per-event stderr mirror) (v1.8) | M2 when the streaming monotonicity check rejects a record (out-of-order or timestamp parse failure, `stream.on_disorder`, §7.1); skip policy: one event PER RECORD, plus ONE data-free stderr WARN per run logged by M2 itself (the reason embeds timestamp/cursor values and never reaches stderr — spec §7.1 ①); fail policy terminates via InputError (exit 3) | () | `file`, `line_no` (text) \| `index` (UI), `reason` ("乱序" \| "时间戳解析失败"-class wording, carries the offending values — trace channel only) |
+| `segment.session` | segment / — (trace-only, no stderr mirror) (v1.8) | M2's session assembler closing a candidate session (§7.1; `--limit` truncation treated as EOF flushes the tail session, S17) — emitted by M2 but prefix-routed to the segment channel (S1) | () | `session_id`, `first` / `last` (first/last order keys), `len`, `cause` ("gap"\|"key"\|"max_len"\|"max_span"\|"eof"\|"limit") |
+| `segment.boundary` | segment / — (trace-only, no stderr mirror) (v1.8) | M14 per sliding window once the verdict passes M8 (§7.14); member provenance lives in the payload | () | `session_id`, `window` (= [s, e] frame-ordinal span), `member_ids`, `relations`[]{`index`, `relation` (five-value closed vocabulary, §10.9)}, `model`[, `reason`†] |
 | `dedup.duplicate` | dedup / — | M3 duplicate verdict | (dup id,) | `kind`, `cluster_key`, `kept_id`, plus exactly one of `jaccard` (near_text) / `hamming` (near_image) / `cosine` (near_semantic); exact dups carry none |
 | `classify.decision` | classify / — (trace-only, R29) | M13 per record once the classification is final (v1.7) | (id,) | `label`, `labels` (multi: full hit set), `source` ("llm"\|"fallback"\|"inherited")[, `reason`][, `sc` {n, agreement_ratio}] |
+| `extract.step` | extract / — (trace-only, no stderr mirror) (v1.8) | M15 per adjacent-pair transition finalized, incl. fallback steps (§7.15) | (s_i id, s_{i+1} id) | `episode_id`, `index`, `action_type`, `description`‡, `target`§, `value`§ |
 | `quality.judgment` | quality / — | M4 per pairwise judgment after M8 pass | (first-sampled record, second-sampled record) — SAMPLING order, NOT the presented A/B order; the A/B mapping lives in `payload.order` (spec 7.2/7.3) | `order` ({"A": id, "B": id} presented), `model`, `judgments`[]{`criterion`, `winner` "A"\|"B"\|"tie"[, `reason`]}[, `judge`][, `pool` — v1.7, classify enabled only (R16)] |
 | `quality.pointwise` | quality / — | M4 per record per criterion | (id,) | `criterion`, `score` (raw 0–5), `reason` |
 | `quality.bt_fit` | quality / — | M4 per batch per criterion (v1.7: per pool per criterion) | () | `criterion`, `iterations`, `converged`, `comparisons`[, `pool` — v1.7, classify enabled only (R16)] |
@@ -1791,8 +2539,15 @@ Normative behavior:
 | `error` | channel of producing stage / warn (record-level) · error (run-level) | On StageError construction | per case | `stage`, `kind` (§7.6 codes), `message`, `retryable`[, `label` — v1.7, classify enabled only (R5)] |
 
 `reason` present only when `quality.judgment_reasons` is effective (`classify.decision`: only
-when requested per R29, §7.13). `run.*`/`batch.*` bypass the
+when requested per R29, §7.13; † `segment.boundary`: the same construction — requested iff
+`trace.enabled` and `"segment"` in `trace.channels`, = the schema's `with_reason`, §7.14).
+‡/§ are `extract.step` content-tier marks (S27, §8.3): `description` carried from `"refs"`,
+`target`/`value` carried from `"excerpt"`. `run.*`/`batch.*` bypass the
 `trace.channels` filter and use `stage="run"`, `batch_no` = current batch (0 for run.*).
+Channel enumeration (v1.8): 8 → 10 — `trace.channels` accepts
+ingest|segment|dedup|classify|extract|quality|annotate|verify|schema|llm (channel = stage
+name, S1); the `error` event keeps routing by its `stage` field, so segment/extract stage
+errors reach their channels with zero routing changes.
 
 ### 8.2 Trace line format
 
@@ -1804,10 +2559,24 @@ milliseconds and timezone offset, e.g. `2026-07-02T09:31:04.482+08:00`.
 
 | Tier | Payload content |
 |---|---|
-| `"none"` | ids, enums, numbers only; NO LLM-produced free text (`reason`/`critiques`/`violations` omitted) |
-| `"refs"` (default) | + LLM-produced text (reason / critiques / violations), NO input data content |
-| `"excerpt"` | + `excerpt` field on `quality.judgment` / `quality.pointwise` / `annotate.done` / `verify.verdict`: `{record_id: first 200 chars}` (text: `Record.text`; UI: `UITree.serialize()` output; never images) |
+| `"none"` | ids, enums, numbers only; NO LLM-produced free text (`reason`/`critiques`/`violations`/`description` omitted) |
+| `"refs"` (default) | + LLM-produced text (reason / critiques / violations / description), NO input data content |
+| `"excerpt"` | + `excerpt` field on `quality.judgment` / `quality.pointwise` / `annotate.done` / `verify.verdict`: `{record_id: first 200 chars}` (text: `Record.text`; UI: `UITree.serialize()` output; never images); + the `_DATA_KEYS` fields (v1.8, below) |
 | `"full"` | + `gen_ai.input.messages` / `gen_ai.output.messages` on `llm.call` (requires "llm" in channels) |
+
+v1.8 (S27): two redaction key sets in `obslog.py` (§7.11) — `_FREE_TEXT_KEYS` gains
+`"defects"` (the verify.verdict stream defect table carries LLM free text in `detail`;
+dropped whole-key at tier "none", same level as critiques) and
+`"description"` (LLM-produced text: stripped at `none`, carried from `refs`, same tier as
+reason/critiques); NEW `_DATA_KEYS = {"target", "value"}` — these `extract.step` payload
+fields are INPUT-DATA-DERIVED (widget text references, typed-in text) and are stripped at
+BOTH `none` and `refs` (preserving the refs tier's "no input data content" red line),
+carried from `excerpt`. Per-event tier quick reference: `extract.step` none =
+{episode_id, index, action_type}, refs = + description, excerpt = + target/value;
+`segment.boundary` none = structural fields (session_id/window/member_ids/per-frame
+relations/model), refs = + reason (the key is already in `_FREE_TEXT_KEYS`). The three
+v1.8 events (`segment.session`/`segment.boundary`/`extract.step`) have NO stderr mirror
+(trace-only, §8.1).
 
 API keys appear at no tier, in no channel.
 
@@ -1861,6 +2630,27 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
              "generated_from": [<seed ids>],          // [] unless process-mode generated
              "fields": {<output.passthrough_fields from Record.raw>},   // {} when none
              "generator": null | {"llm": "<profile>", "style": "<name>"|null}},
+  // v1.8 — ALWAYS-PRESENT key (null whenever segment is disabled); key position AFTER
+  // "source" and BEFORE "scores" — chain-order mirror (spec §6.3):
+  "stream": null | {
+      "episode_id": "<sequence record id>",
+      "session_id": "<session id>",
+      "order_span": [<first order key>, <last order key>],
+      "member_count": <int>,
+      "member_ids": ["<member record id>", ...],
+      "member_sources": [{"file": ..., "pair_index"|"line_no": ...}, ...],
+      "session_split": false,      // the owning session was hard-split at batch_size
+                                   // (S21; M7's missing-frame downgrade evidence)
+      "repaired": false,           // verify defect repair rewrote the member set
+                                   // (§7.6; disambiguates same-id sibling rows under
+                                   // multi fan-out, §7.13)
+      "degraded": null | {"kind": "segmentation_invalid", "windows_failed": <int>},
+                                   // segment.on_error="keep" evidence (S26)
+      "steps": null | [{"index": <int>, "action_type": "<enum>", "target": <str|null>,
+                        "value": <str|null>, "description": "<str>"}, ...]
+                                   // extract disabled → always null; enabled = the
+                                   // transitions rendered verbatim, step by step (§7.15)
+  },
   "scores": null | {"<criterion>": <float|null>, ..., "__aggregate__": <float|null>,
                     "mode": "pairwise_bt"|"pointwise", "batch_no": <int>
                     [, "pool": "<label>"]},        // v1.7: pool key ONLY when classify enabled
@@ -1871,14 +2661,23 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
                             "source": "llm"|"fallback"|"inherited"},
   "annotation": null | {"model": "<model>", "attempts": <int>
                         [, "sc": {"n": <int>, "agreement_ratio": <float>}]},
-  "verification": null | {"verdict": "pass"|"fail", "rounds": <int>}
+  "verification": null | {"verdict": "pass"|"fail", "rounds": <int>
+                          [, "defects": [{"kind": ..., "members": ..., "position": ...,
+                                          "detail": ...}, ...]]}
+                          // v1.8: "defects" is carried in STREAM MODE ONLY and is then
+                          // ALWAYS present ([] when no defects, spec §6.3); non-stream
+                          // verification blocks never carry the key
 }
 ```
 
-`_meta.run.rubric` = the configured selector (`"default:text"`/`"default:ui"`) or, for inline,
-the rubric's `name` **[FROZEN HERE]**. A disabled stage → `null` for its key. v1.7: under
+`_meta.run.rubric` = the configured selector (`"default:text"`/`"default:ui"`/
+`"default:trajectory"` — v1.8, incl. as the resolved product of an empty selector under
+stream, S29) or, for inline, the rubric's `name` **[FROZEN HERE]**. A disabled stage →
+`null` for its key. v1.7: under
 multi fan-out the main-output line key is (`_meta.id`, `classification.label`) — sibling rows
-share the record id (spec §6.3).
+share the record id (spec §6.3). v1.8: `stream` is the SOLE new always-present key — with
+segment disabled every v1.7-era line differs from v1.7 output ONLY by `"stream": null`
+(spec §6.3; the four pre-existing example projects re-verify this byte-diff).
 
 ### 9.2 Rejects channel (spec 3.11.2)
 
@@ -1909,9 +2708,19 @@ evidence is auditable via the trace events instead (`dedup.duplicate`, `quality.
 `reason` values **[FROZEN HERE]**: `dropped_dup` → the DedupInfo kind (`"exact"`,
 `"near_text"`, `"near_image"`, `"near_both"`, `"near_semantic"`); `dropped_lowq` →
 `"below_threshold"` or `"top_ratio"`; `dropped_verify` → `"verify_fail"`; `failed` → the first
-`StageError.kind`. `rejects="full"` adds `"record"` (text: `Record.raw`; UI:
-`{"ui_tree": serialize(), "image_path": str}` **[FROZEN HERE]**) and `"raw_last_output"` (for
-schema_violation). `rejects="none"`: no file.
+`StageError.kind`; v1.8 — `dropped_noise` → by duck-typed mark (§7.10), adding exactly
+THREE new (stage, reason) combinations: (`"segment"`, `"noise"`) — LLM-judged noise frame,
+(`"segment"`, `"below_min_len"`) — short-segment frame (independent of noise, S11),
+(`"verify"`, `"off_task_member"`) — repair-shrunk member frame (S31). `absorbed` items never
+reach this file (third route, §7.10). `--strict` note: stream-mode noise frames are EXPECTED
+engineering rejects — `--strict` will exit 1 on them (spec 3.11.2/manual). `rejects="full"`
+adds `"record"` — text: `Record.raw`; UI:
+`{"ui_tree": serialize(), "image_path": str}`; v1.8 sequence records:
+`{"kind": "sequence", "member_ids": [...], "member_sources": [...]}` (S25 — the frozen
+single-record payload shapes stay for `kind="single"`) **[FROZEN HERE, v1.8-revised]** —
+and `"raw_last_output"` (for schema_violation ONLY: classification_invalid /
+segmentation_invalid / extraction_invalid failure lines carry no raw output — a known,
+accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
 
 ### 9.3 `report.json` (spec §6.4)
 
@@ -1952,6 +2761,25 @@ schema_violation). `rejects="none"`: no file.
   //     carries each pool's EFFECTIVE mode/rounds; tie_rate emission is gated on "at least
   //     one pairwise pool exists" instead of the global mode (R12/R14);
   // generate.buckets keys gain the class prefix "<class>×<llm>×<style|null>" (§7.5)
+  // v1.8, ONLY when segment.enabled:
+  // counts: + "episodes" (segment-stage len delta, M10-metered — fanout-isomorphic, §7.9),
+  //         + "absorbed", + "dropped_noise" (post-emit status tallies, §7.9);
+  //         "unprocessed" appearance condition widens in stream mode to
+  //         "breaker trip OR interrupted" (S18 — see the invariant note below);
+  // "stream" block (placed after "counts", spec §6.4):
+  // "stream": {"sessions": 0, "episodes": 0, "mean_episode_len": 0.0, "absorbed": 0,
+  //            "dropped_noise": 0, "below_min_len": 0, "digest_poor_frames": 0,
+  //            "segment_failures": 0
+  //   [, "extract": {"transitions": 0, "fallback_steps": 0, "failures": 0,
+  //                  "by_type": {"<action_type>": 0, ...}}]      (extract enabled only)
+  //   [, "verify": {"membership_repairs": 0, "boundary_flags": 0,
+  //                 "defects": {"<kind>": 0, ...}}]}             (verify enabled only)
+  //   — stream.sessions data source = IngestReport.sessions (M2 owner, §7.1);
+  //     IngestReport.disorder is a SUB-COUNT of counts.bad_input (audited via the
+  //     ingest.disorder events; NO separate report key — spec §6.4); below_min_len is
+  //     counted independently of noise (S11); digest_poor_frames per the §3 poverty
+  //     judgment; extract.by_type = per-action-type distribution (S14);
+  //     verify sub-block per §7.6 (S31)
   "trace": {"enabled": true, "path": "...", "events": 0, "dropped_events": 0},
   "llm_usage": {"<profile>": {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
                               "est_cost_usd": 0.0, "retries": 0
@@ -1971,11 +2799,23 @@ schema_violation). `rejects="none"`: no file.
 [+ fanout]` (the `fanout` term is v1.7: present only under `classify.assignment = "multi"`).
 generate_only degenerates to `emitted + dropped_* + failed = generated [+ fanout]`
 (scanned = bad_input = 0).
+v1.8 — with segment enabled the FULLY EXPANDED form (spec §6.4) is:
+
+`emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed + bad_input
++ absorbed = scanned + generated + fanout + episodes`
+
+(new on the left: `dropped_noise`, `absorbed`; new on the right: `episodes`; disabled
+features contribute 0 and the form degrades to the previous line byte-identically).
 Breaker-trip runs (v1.6 partial delivery) extend it with `+ unprocessed` on the left side;
 `counts.unprocessed` is computed by M10 at finalize as the balancing residual — records scanned
 or generated that reached no terminal count (emitted/dropped_*/failed/bad_input) when the run
 tripped, which includes generated-but-never-batched records in generate_only — it is NOT a
-MetricsSink counter and appears only on tripped runs.
+MetricsSink counter and appears only on tripped runs. v1.8 (S18): in STREAM MODE the
+`unprocessed` key appears on "breaker trip **OR** `interrupted = true`" (SIGINT over the
+session buffer strands in-flight records); the residual computation carries the expanded
+sides (`+ episodes` on the source side, `+ absorbed + dropped_noise` among the terminal
+counts). Non-stream interrupted runs keep a PROVABLY ZERO residual and never emit the key
+(regression anchor).
 `schema_engine.resolved_at` counts ONLY user-schema annotate calls; its sum = records entering M5.
 `est_cost_usd` present only for profiles with both prices configured. Histogram bucket labels are
 exactly `"0.0-0.1"` … `"0.9-1.0"` (upper bound inclusive on the last) **[FROZEN HERE]**. The
@@ -2002,15 +2842,30 @@ key `classify.fallback_count`); tie-rate inputs
 `quality.tie_outcomes.<crit>` / `quality.tie_comparisons.<crit>` (v1.5 report drivers) become
 pool-dimensioned `quality.tie_outcomes.<pool>.<crit>` / `quality.tie_comparisons.<pool>.<crit>`
 when classify is enabled (R12; classify disabled keeps the flat `<crit>` key form unchanged).
+v1.8 additions: `counts.episodes` / `counts.absorbed` / `counts.dropped_noise` (owner M10,
+§7.9); `segment.failures` and the report-only M14 fields `segment.below_min_len` /
+`segment.digest_poor_frames` (surfacing as `report.stream.below_min_len` /
+`.digest_poor_frames` / `.segment_failures` — counter key names **[FROZEN HERE]**);
+`extract.transitions` / `extract.fallback_steps` / `extract.failures` /
+`extract.by_type.<action_type>` (owner M15, §7.15); `verify.membership_repairs` /
+`verify.boundary_flags` / `verify.defects.<kind>` (owner M7, §7.6 — surfacing as the
+`report.stream.verify` sub-block); `report.stream.sessions` maps from `IngestReport.sessions`
+(owner M2, §7.1 — not a MetricsSink counter), `report.stream.episodes`/`mean_episode_len`/
+`absorbed`/`dropped_noise` derive from the M10 tallies.
 
 Counter OWNERSHIP (normative): `counts.*` keys are incremented ONLY by M10 (orchestrator),
 derived from batch tallies / EmitResult — stages must never touch them (double-count).
 v1.7: this includes `counts.fanout` — M10 meters it as the len-delta around the classify
 stage (§7.9); M13 never increments any `counts.*` key.
+v1.8: likewise `counts.episodes` (len-delta around the segment stage) and
+`counts.absorbed`/`counts.dropped_noise` (post-emit tallies) belong to M10 — M14 never
+increments any `counts.*` key.
 Stage-scoped keys are incremented only by their stage: `dedup.*` by M3, `quality.judgment_failures`
 by M4, `annotate.sc_disagreements` by M5, `generate.buckets.*` by M6 (`survived_dedup` = records
 surviving M6's own MinHash novelty filter against seeds + siblings; M3 still dedups generated
-records on re-flow), `classify.*` by M13 (v1.7), `quality.tie_*` by M4.
+records on re-flow), `classify.*` by M13 (v1.7), `quality.tie_*` by M4, `segment.*` by M14,
+`extract.*` by M15, `verify.membership_repairs`/`verify.boundary_flags`/`verify.defects.<kind>`
+by M7 (v1.8).
 
 ### 9.4 Atomic delivery
 
@@ -2052,6 +2907,28 @@ user (current record):
                   {record.ui_tree.serialize(max_chars=input.ui_tree_max_chars)}
 ```
 
+v1.8 sequence variant (`record.kind == "sequence"`, S5/S6 — segment ORDER and the step-line
+format are frozen verbatim; system message unchanged):
+
+```
+user (current record, sequence form — one user message, parts in this exact order):
+  ① text part:  [动作序列]                    ← section omitted ENTIRELY when
+                                                item.transitions is None
+                {index}. {action_type}（对象: {target|—}；值: {value|—}）{description}
+                                              ← one line per Transition, index ascending;
+                                                null target/value render as the char "—"
+  ② per kept keyframe (keyframe ordinal i of k, member ordinal m; selection per §7.4):
+     text part:  [关键帧 {i}/{k}·成员 {m}]
+     image part: member.image                 (encoded by M9 at call time)
+  ③ text part:  [成员帧摘要]                  ← ALWAYS-PRESENT closing section
+                {frame_digest of EVERY member, one per line, member order, total bounded}
+```
+
+**Template invariant (S6): the final part is ALWAYS the ③ text section** — the M7 repair
+suffix (§10.5) concatenates onto `parts[-1].text`; an image-final message would silently
+render "None\n…" and drop the last frame. The `[动作序列]` line format
+`{index}. {action_type}（对象: {target|—}；值: {value|—}）{description}` is **[FROZEN HERE]**.
+
 ### 10.2 M4 pairwise judging prompt (spec 3.4.3 / worked example 3.4.6 ③)
 
 ```
@@ -2074,6 +2951,28 @@ UI modality: the user message replaces each `[记录 X] ...` line with three par
 text `[记录 A 屏幕截图]`, the image part, text `[记录 A UI 控件树]\n{serialize(max_chars=
 input.ui_tree_max_chars)}` (same for B) **[FROZEN HERE labels]**. Record content for text
 modality = `record.text`.
+
+v1.8 sequence records (spec 3.4.3 sequence row — applies to the record-content section of
+BOTH this template and §10.3): a `kind == "sequence"` record renders as TEXT ONLY (no image
+parts even in UI modality — the §6.3 rule-34 quality relaxation), two subsections in order
+**[FROZEN HERE]**:
+
+```
+[步骤序列]                                    ← omitted entirely when transitions is None
+{index}. {action_type}（对象: {target|—}；值: {value|—}）{description}（摘取兜底）
+                                              ← same line format as §10.1; the trailing
+                                                「（摘取兜底）」 suffix appears ONLY on
+                                                fallback steps (Transition.detail.kind ==
+                                                "extraction_invalid", S16) so fallback
+                                                steps stay distinguishable from
+                                                LLM-confirmed "other"
+[成员帧摘要]
+{frame_digest of every member, one per line, member order, total bounded}
+```
+
+In pairwise judging the two subsections sit inside the `[记录 X]` content slot (labels
+unchanged); in §10.3 pointwise they replace `{record content}`. The `excerpt` trace tier for
+sequences carries the first 200 chars of the member-digest rendering (§7.3).
 
 ### 10.3 M4 pointwise prompt (spec 3.4.4 / 3.4.6 ⑦) — one call per record per criterion
 
@@ -2137,6 +3036,46 @@ annotation prompt when re-annotating (`RepairContext`):
                                               multi-judge: "judge_name/aspect: opinion" [FROZEN HERE]
 请修正后重新输出
 ```
+
+v1.8 stream variant (sequence envelopes only, spec 3.7 stream branch — structure per SPEC
+§3.5: five-kind defect explanation in system, the six-section user order; wording
+**[FROZEN HERE]**; validated against `defect_verdict_schema()` §10.7, NOT `VERDICT_SCHEMA`):
+
+```
+system:
+  你是标注质量审核员。给定任务指令、动作序列、边界余量与首末帧截图，独立判断该序列
+  （episode）的标注是否合格。
+  评审维度: ① 是否遵循任务指令 ② 与动作序列及首末帧证据的事实一致性 ③ 字段语义是否正确填写
+  ④ 段边界与成员构成是否成立（对照下列缺陷类型）
+  {verify.extra_criteria}                   ← line omitted when empty
+  缺陷类型（发现即列入 defects，可为空数组）:
+  - label_mismatch: 标注的任务标签与序列证据不符
+  - off_task_members: 段内混入与任务无关的成员帧（members 列出这些成员帧 id）
+  - missing_head: 段首缺少任务起点帧（结合边界余量判断）
+  - missing_tail: 段尾缺少任务终点帧（结合边界余量判断）
+  - missing_members: 段中缺失成员帧（members 列出可指认的帧 id，无从指认则为 null）
+  先逐维度给出简短意见，再列缺陷表，最后给结论。
+  输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
+  {"critiques": [{"aspect": <维度>, "opinion": <一句话意见>}, ...],
+   "defects": [{"kind": <缺陷类型>, "members": <帧 id 数组|null>,
+                "position": <位置说明|null>, "detail": <一句话>}, ...],
+   "verdict": "pass"|"fail"}
+user (one message, six sections IN THIS ORDER):
+  text part:  [任务指令] {annotate.instruction — class-effective value under classify}
+  text part:  [动作序列] {item.transitions rendered per the §10.1 line format;
+                          section omitted when transitions is None}
+  text part:  [边界余量] {frame_digest of the k=2 frames beyond EACH segment boundary,
+                          each annotated with its fate: noise / 相邻段序数 / 无}
+  text part:  [首帧截图]
+  image part: first member's image
+  text part:  [末帧截图]
+  image part: last member's image
+  text part:  [标注结果] {json.dumps(annotation.output, ensure_ascii=False)}
+```
+
+A `fail` verdict with an empty defects array is normalized code-side to one default
+`label_mismatch` entry (S7, §7.6). The non-stream template above is byte-unchanged
+(regression anchor).
 
 ### 10.6 M8 L3 repair prompt (spec 3.8.2 / 3.8.4, verbatim) — single user message
 
@@ -2226,6 +3165,76 @@ schema through unconditionally. Duplicate labels are removed by M13's code-side 
 AFTER M8 validation (a narrowing of an already-validated set, §7.13); the internal-schema
 keyword set stays at zero growth.
 
+v1.8 adds three internal schemas (M14/M15/M7-stream; the first two verbatim from spec
+3.14.3 / 3.15.3, the third per the v1.8 dev spec §3.5/S7):
+
+```python
+def segment_window_schema(frame_count: int, with_reason: bool) -> dict:
+    relations = ["continues", "advances", "returns_to_entry", "context_switch", "interruption"]
+    item_props = {"index": {"type": "integer", "minimum": 0, "maximum": frame_count - 1},
+                  "relation": {"type": "string", "enum": relations}}
+    required = ["index", "relation"]
+    if with_reason:
+        item_props["reason"] = {"type": "string"}
+        required = ["index", "relation", "reason"]
+    return {"type": "object",
+            "properties": {"frames": {"type": "array",
+                "items": {"type": "object", "properties": item_props,
+                          "required": required, "additionalProperties": False},
+                "minItems": frame_count, "maxItems": frame_count}},
+            "required": ["frames"], "additionalProperties": False}
+
+
+def action_schema() -> dict:
+    actions = ["click", "long_press", "input_text", "scroll", "drag", "open_app",
+               "app_switch", "navigate_back", "navigate_home", "wait", "other"]   # 11 值（S15）
+    return {"type": "object",
+            "properties": {"action_type": {"type": "string", "enum": actions},
+                           "target": {"type": ["string", "null"]},
+                           "value": {"type": ["string", "null"]},
+                           "description": {"type": "string"}},
+            "required": ["action_type", "target", "value", "description"],
+            "additionalProperties": False}
+
+
+def defect_verdict_schema() -> dict:
+    kinds = ["label_mismatch", "off_task_members", "missing_head", "missing_tail",
+             "missing_members"]
+    return {"type": "object",
+            "properties": {
+                "critiques": {"type": "array",
+                    "items": {"type": "object",
+                              "properties": {"aspect": {"type": "string"},
+                                             "opinion": {"type": "string"}},
+                              "required": ["aspect", "opinion"],
+                              "additionalProperties": False}},
+                "defects": {"type": "array",
+                    "items": {"type": "object",
+                              "properties": {"kind": {"type": "string", "enum": kinds},
+                                             "members": {"type": ["array", "null"],
+                                                         "items": {"type": "string"}},
+                                             "position": {"type": ["string", "null"]},
+                                             "detail": {"type": "string"}},
+                              "required": ["kind", "members", "position", "detail"],
+                              "additionalProperties": False}},
+                "verdict": {"type": "string", "enum": ["pass", "fail"]}},
+            "required": ["critiques", "defects", "verdict"],
+            "additionalProperties": False}
+```
+
+Notes binding on the three (S7 / R1 family): ALL top-level keys and ALL defect sub-keys are
+`required` — optionality is expressed ONLY via the nullable unions `["array","null"]` /
+`["string","null"]` (OpenAI strict mode hard-rejects optional properties; L0 passes schemas
+through unconditionally); **no `uniqueItems` anywhere** (index/label de-duplication is
+code-side post-validation — first-wins in §7.14, set-narrowing in §7.13); `minItems ==
+maxItems == frame_count` pins the window array length (judgment_schema construction). All
+three are INTERNAL schemas: never counted in `schema_engine.resolved_at`, never passed
+through the L2.5 `output.validator` hook. `defect_verdict_schema`'s critiques shape is
+byte-identical to `VERDICT_SCHEMA`'s (the feed-back/merge chain consumes them unchanged);
+critiques/defects precede verdict — reason-then-conclusion, same rationale as
+`VERDICT_SCHEMA`. The non-stream verify path keeps `VERDICT_SCHEMA`; the two verdict
+schemas co-exist (S7).
+
 ### 10.8 M13 classification prompt (spec 3.13.3, verbatim)
 
 ```
@@ -2253,6 +3262,112 @@ image part (encoded by M9 at call time), text `[UI 控件树]\n{serialize(...)}`
 single-record assembly shape as §10.1 (R27). Deterministic string concatenation throughout;
 class table and per-class examples follow `[[classify.classes]]` declaration order.
 
+v1.8 sequence variant (`record.kind == "sequence"`, spec 3.13.3 sequence row — system and
+few-shot messages unchanged; the current-record user message becomes):
+
+```
+user (current record, sequence form):
+  text part:  [待分类数据·序列]
+              {frame_digest of the members, one per line, member order — TOTAL capped at
+               input.ui_tree_max_chars: first/last members always kept, middle entries
+               truncated WHOLE, capped output ends with the marker line
+               "…(truncated N members)"}
+  (UI modality only — classify stays in the §6.3 rule-34 vision set:)
+  text part:  [首帧截图]
+  image part: first member's image             (encoded by M9 at call time)
+```
+
+Section label `[待分类数据·序列]`, the `[首帧截图]` label and the truncation-marker line
+are **[FROZEN HERE]**. Text-modality sequences carry the digest part only.
+
+### 10.9 M14 segment window-verdict prompt (spec 3.14.4, verbatim)
+
+```
+system:
+  你是屏幕操作流的分段审核员。下面给出同一会话中按时间顺序排列的 {N} 帧状态摘要
+  （含相邻帧的确定性变更提示）。按三步作业：
+  一、双向上下文概括：通读全窗，把握每帧之前若干帧正在进行的活动与之后若干帧的走向，再判断该帧。
+  二、逐帧关系分类：对每一帧，判断它相对进行中活动的功能角色，只能从以下封闭词表中取恰一值：
+  - continues: 同一流程的推进。
+  - advances: 屏幕或 App 变了，但可见的任务实体延续（验证码、订单号、餐厅名等跨屏出现）——
+    跨 App 的同一任务属此值，不是边界。
+  - returns_to_entry: 回到入口/搜索/桌面后开启新流程（同 App 背靠背任务的断点）。
+  - context_switch: 交互对象与环境不连续且无实体延续——相关但无实体延续的新流程也取此值。
+  - interruption: 与前后活动均无关的短暂插入（通知、弹窗、误触）。
+  三、只输出逐帧关系，不判断边界（边界由既定规则从关系推导）。
+  锚定约定：分段粒度取「完整任务」层级（整段录屏之下一层）；只看前台 App/前台窗口，
+  忽略状态栏、后台通知等背景变化。
+  {segment.context}                              ← 可选域上下文；缺省省略此行
+  输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
+  {"frames": [{"index": <窗内帧序号>, "relation": <词表值>[, "reason": <一句话理由>]}, ...]}（恰 {N} 项）
+user（窗内逐帧，一帧一段）:
+  [帧 {i}] {frame_digest(frame_i, segment.digest_max_chars)}
+  [帧 {i} 变更] {tree_diff(frame_{i-1}, frame_i) 的文字化摘要}      ← i ≥ 1；窗首帧无此行
+  （segment.use_vision = true 时：每帧摘要 text Part 前附该帧 kind="image" 的 Part，3.9.2）
+```
+
+Both anchors are hard-coded in the template text and never vary with configuration:
+granularity = the "complete task" level (GEBD "1 level deeper"), attention = foreground
+App/window only (GEBD dominant subject). The five-value relation vocabulary is fixed and
+domain-independent; the `advances`/`context_switch` divide is pinned to VISIBLE-ENTITY
+CONTINUITY — a related new flow without entity continuity is `context_switch` (a boundary,
+S32). The LLM never answers the boundary question directly; boundary/noise are code-side
+lookups (deductive mapping table, §7.14; the `reason` fragment appears in the structure line
+only under `with_reason`, §8.1 †). Response validated against
+`segment_window_schema(N, with_reason)` (§10.7).
+
+### 10.10 M15 extract prompt (spec 3.15.4, verbatim)
+
+```
+system:
+  你是屏幕操作流的动作摘取员。给定同一操作流中相邻的前后两帧屏幕状态，推断用户在两帧之间
+  执行的动作。action_type 只能取以下值：
+  - click / long_press / drag: 点击 / 长按 / 拖拽某控件
+  - input_text: 在输入框键入文本
+  - scroll: 滚动屏幕或列表
+  - open_app: 打开一个应用；app_switch: 切换到另一已打开的应用
+  - navigate_back / navigate_home: 系统返回 / 回到桌面
+  - wait: 无用户交互，仅等待界面加载或变化
+  - other: 无法归入以上任何一类（把语义写进 description）
+  锚定约定：前一帧是动作发生前最后一个稳定状态，后一帧是动作完成后的首个稳定状态；推断
+  二者之间发生的单个语义动作；若变化由多个低层事件构成（连续滚动、连续键入），归并为一个
+  语义动作。
+  {instruction}                                 ← 可选补充说明（per-label 有效值）；缺省省略此行
+  输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
+  {"action_type": <词表值>, "target": <目标控件文本引用或 null>,
+   "value": <动作参数或 null>, "description": <一句话动作描述>}
+user（单条消息多 Part——「text 标签 + image」组装惯例同 3.5.2/3.13.3；一请求 2 图）:
+  text part:  [前一帧截图]
+  image part: s_i.image                          （M9 调用时编码，3.9.2）
+  text part:  [后一帧截图]
+  image part: s_{i+1}.image
+  text part:  [树变更摘要] {tree_diff(s_i.ui_tree, s_{i+1}.ui_tree) 的文字化}
+                                                 ← include_diff = true 时；false 整段省略
+              [前后帧树摘要] {frame_digest(s_i)} → {frame_digest(s_{i+1})}
+```
+
+Field semantics (verbatim-frozen table; vocabulary legality is enforced by the schema enum,
+field semantics are anchored by the template wording):
+
+| action_type | `target` semantics | `value` semantics |
+|---|---|---|
+| `click` / `long_press` / `drag` | the target widget's **text reference**, precedence text → content_desc → 类名+序号; null when unidentifiable | null |
+| `input_text` | text reference of the input box being typed into (same precedence) | the typed text — **aggregation semantics**: a "focus click + typing" within one adjacent pair merges into ONE input_text step; the focus click is never a separate step |
+| `scroll` | scroll-container reference; null when unidentifiable | direction, limited to `up` / `down` / `left` / `right` (template-anchored four values; code-side lowercase normalization) |
+| `open_app` / `app_switch` | null | the application name |
+| `navigate_back` / `navigate_home` / `wait` | null | null |
+| `other` | best-effort object reference or null | null (all semantics go into description) |
+
+Two binding design notes (spec 3.15.4): ① `target` uses TEXT REFERENCES, never coordinates —
+extract is post-hoc annotation, not an executor; text references and center coordinates are
+equivalent to an LLM, and `max_image_px` downscaling would break the coordinate
+correspondence with the original screenshot; ② the `[树变更摘要]` section injects the
+STRUCTURAL tree diff (never a pixel diff — pixel-diff injection is a reported negative
+result): deterministic evidence that shortens the visual inference distance
+(`extract.include_diff`, default on, ablatable — S14). The final part is the always-present
+text section (S6 invariant holds here too). Response validated against `action_schema()`
+(§10.7); the closing `[前后帧树摘要]` line is ALWAYS present.
+
 ---
 
 ## 11. Cross-cutting conventions (binding)
@@ -2260,7 +3375,9 @@ class table and per-class examples follow `[[classify.classes]]` declaration ord
 1. **Async everywhere LLM is involved.** `Stage.run`, `complete_validated`, `complete`, `embed`,
    `probe`, `Orchestrator.run` are `async def`. Record-level concurrency inside a stage via
    `asyncio.gather`; stages are serial within a batch (barrier); batches are serial.
-2. **Stages never remove items** — status flips only; `generate` returns a new list instead.
+2. **Stages never remove items** — status flips only; `generate` returns a new list instead
+   (v1.7 ②a: classify multi may tail-append; v1.8 ②b: segment may tail-append sequence
+   envelopes and absorb members, with the M7 bidirectional repair exemption — §5).
 3. **Single-record failures never escape**: `item.errors.append(StageError(...))` +
    `status="failed"` + `error` trace event; the run continues. Record-level isolation is absolute.
 4. **Determinism.** All sampling RNGs derive from `run.seed` exactly as §5; temperature default
@@ -2269,8 +3386,12 @@ class table and per-class examples follow `[[classify.classes]]` declaration ord
    plan and selection decisions. Retry jitter and key-pool selection are exempt (timing only;
    key selection is deterministic least-in-flight and never changes what data is produced, v1.6).
 5. **No data persistence**: no temp files beyond the declared output channels (`.part` files are
-   part of output delivery); no caches, checkpoints, or cross-run state; only DedupIndex,
-   MetricsSink counters and M9 usage survive across batches, all content-free.
+   part of output delivery); no caches, checkpoints, or cross-run state; the closed list of
+   cross-batch survivors is: DedupIndex, MetricsSink counters, M9 usage — all content-free —
+   plus, v1.8 stream mode only, M2's unclosed-session buffer (≤ `session_max_len` Record
+   metadata entries, images still lazy) and M10's single pending overflow session (next-fit's
+   open bin, §7.9) — both process-memory only, released as soon as they are packed/consumed;
+   neither is a new disk surface (spec §2.6).
 6. **Atomic delivery**: main output/sidecar via `.part` + fsync + rename (§9.4).
 7. **Privacy**: data goes only to configured endpoints; API keys only via env → memory
    (`repr=False` fields), never in logs, traces, reports, or exceptions; stderr never carries
@@ -2408,5 +3529,67 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     disabled is byte-identical to v1.6 output except `_meta.classification: null`. The new
     module section is numbered §7.13 AFTER the pre-existing §7.12 CLI section so frozen
     §7.x anchors in code and docs stay valid.
+28. v1.8 stream segmentation & action extraction (feature spec
+    `docs/dev/SPEC-stream-segmentation.md`, rulings S1–S32; 2026-07-13). Key frozen points,
+    in ruling order:
+    - contract ②b (S3): segment absorbs members / tail-appends sequence envelopes; the M7
+      repair path may rewrite member status BIDIRECTIONALLY between `absorbed` and
+      `dropped_noise` — the contract's only reverse exemption; flipping back to `active` is
+      forbidden; each member is absorbed by at most one sequence envelope (§5);
+    - trace channels grow 8 → 10 (`"segment"`, `"extract"`; channel = stage name, S1);
+      event names stay `segment.session`/`segment.boundary`/`extract.step`; the
+      `ingest.disorder` event (S19/S20 monotonicity rejects) joins the catalog with
+      constant `EV_INGEST_DISORDER` (§7.11/§8.1);
+    - `judge_window` / `extract_transition` are PUBLIC direct-call surfaces for M7's stream
+      repair driver — the second and third sanctioned operator-to-operator imports after
+      the verify→annotate hook (§7.14/§7.15, ground rules);
+    - PER-LABEL extraction under multi fan-out (S9): every sibling envelope extracts
+      independently under its own label's effective `[class.<label>.extract]` instruction
+      (×k cost accepted — the whitelist promise is honored; `transitions` is per-envelope;
+      clones start with `transitions = None`); dry-run reports the ×1 lower bound;
+    - two-phase batch-level member surgery (S8): concurrent review → SYNCHRONOUS surgery in
+      batch position order → concurrent seam re-extraction → synchronous rebuild →
+      concurrent re-annotation; multi siblings get mark-only membership handling; no
+      re-scoring after repair (`_meta.stream.repaired`);
+    - whole-session NEXT-FIT batching (S21; one open bin; oversized sessions hard-split
+      with the `session_split` duck-typed mark); `Session.session_id =
+      sha256("\n".join(record ids))[:16]` and the `Session` dataclass shape are frozen in
+      §7.1 [FROZEN HERE];
+    - sequence records inherit `ref` from their FIRST member (S24; line_no/pair_index
+      convention preserved; full provenance in `_meta.stream.member_sources`); sequence id
+      = sha256 over member ids, fixed at formation (§3);
+    - redaction: `_DATA_KEYS = {"target","value"}` stripped at none/refs;
+      `_FREE_TEXT_KEYS += "description"` (S27, §8.3); the three segment/extract events are
+      trace-only (no stderr mirror);
+    - trajectory rubric (S29): empty `quality.rubric` under `segment.enabled` resolves to
+      `"default:trajectory"` (packaged `default_trajectory.toml`, rubric name
+      `default-trajectory-v1`); trajectory + `extract.enabled=false` → warning
+      ("步骤" degrades to "帧间变化");
+    - `annotate.sequence_frames` ∈ [2, 100] with the `> 20 ∧ max_image_px > 2000` WARN
+      linkage (S28: Anthropic 400 hard-reject, not a resize) and the zero-rng downsample
+      formula `idx_i = ⌊i·(n−1)/(k−1)⌋` (§6.1/§6.3);
+    - action vocabulary fixed at ELEVEN values (S15: AndroidControl full set ∪
+      UI-TARS-mobile increment + `other`); `extract.include_diff` toggle defaults ON
+      (structural tree diff, never pixel diff — S14); `extract.on_error =
+      "fallback"|"fail"` (S16 — never "unknown"); fallback steps carry `Transition.detail`
+      evidence and render with the 「（摘取兜底）」 suffix in quality prompts (§10.2);
+    - `segment.min_len` applies ONLY to LLM-refined segments (S11); its casualties get
+      reason `"below_min_len"` ≠ `"noise"` and an independent counter;
+    - timestamp parsing thresholds (S20): numeric `v < 0 ∨ v ≥ 1e14` = failure, `v < 1e11`
+      = seconds, `[1e11, 1e14)` = milliseconds; ISO strings via `fromisoformat`; naive =
+      UTC; failures walk `stream.on_disorder`;
+    - `counts.unprocessed` appearance widens to "breaker ∨ interrupted" in STREAM MODE ONLY
+      (S18); the conservation identity gains `absorbed`/`dropped_noise`/`episodes` terms
+      (§9.3); non-stream interrupted runs keep zero residual (regression anchor);
+    - sequence dedup separator `"\x1e"` (ASCII RS, S10, §7.2); sequence quality scoring is
+      pure text — the single rule-4 vision relaxation (S30, §6.3 rule 34);
+    - prompt wording frozen here where the spec fixed only structure: the §10.1 sequence
+      segment order and step-line format (S6 — text-final invariant), the §10.2/§10.3
+      sequence record sections, the §10.5 stream verify system/user wording (five-kind
+      defect explanation + six-section order), the §10.8 `[待分类数据·序列]`/`[首帧截图]`
+      labels and member-truncation marker;
+    - the new module sections are numbered §7.14/§7.15 AFTER the pre-existing §7.13 (same
+      anchor-stability rationale as v1.7). Segment/extract disabled is byte-identical to
+      v1.7 output except `_meta.stream: null`.
 
 — End of contract. —

@@ -2,7 +2,7 @@
 
 ### 3.2.1 职责与边界
 
-**做：**把输入路径物化为 `Record` 迭代器：文本模态逐行解析 JSONL 并抽取文本字段；UI 模态递归扫描、按 index 配对文件、解析 UI 树节点并构造惰性图像引用；为每条记录计算确定性 id；对坏数据执行跳过策略并计数。 
+**做：**把输入路径物化为 `Record` 迭代器：文本模态逐行解析 JSONL 并抽取文本字段；UI 模态递归扫描、按 index 配对文件、解析 UI 树节点并构造惰性图像引用；为每条记录计算确定性 id；对坏数据执行跳过策略并计数。（v1.8）stream 模式（`segment.enabled = true`）下另担 `[stream]` 声明的输入侧排序、流式单调性校验与规则层会话化，向 M10 暴露会话流视图（3.2.8）。 
 **不做：**不加载图像像素（只 stat 文件并记录路径/尺寸）；不截断/清洗文本（原样保留，序列化截断是消费方在构造提示词时的职责）；不判重、不打分；`run.mode="generate_only"` 时本模块整体不参与（3.10.3）。
 
 ### 3.2.2 输入 / 输出
@@ -10,7 +10,7 @@
 | 方向 | 内容 |
 |---|---|
 | 输入 | `run.input` 路径。文本模态：单个 `.jsonl` 文件，或目录（取其下所有 `*.jsonl`，按文件名字典序）。UI 模态：目录（递归扫描）。 |
-| 输出 | `Iterator[Record]`（生成器，按需产出，供 M10 切批）；`IngestReport`（总行数、坏行数、缺对数、index 冲突数及其文件位置列表）。 |
+| 输出 | `Iterator[Record]`（生成器，按需产出，供 M10 切批；v1.8 stream 模式下 M10 改消费 `sessions()` 会话流视图——整会话装箱，3.2.8/3.10.3）；`IngestReport`（总行数、坏行数、缺对数、index 冲突数及其文件位置列表；v1.8 只增会话数 `sessions` 与乱序跳过数 `disorder` 两计数，3.2.8）。 |
 
 ### 3.2.3 API
 
@@ -18,9 +18,14 @@
 class Ingestor:
     def __init__(self, cfg: ResolvedConfig): ...
     def scan(self) -> IngestPlan:
-        """只扫描不解析：返回文件清单、配对表、预估记录数。--dry-run 与 validate 用。"""
+        """只扫描不解析：返回文件清单、配对表、预估记录数。--dry-run 与 validate 用。
+           v1.8（S23）：stream 启用时文本模态的行数统计与会话空跑单遍融合（3.2.8）。"""
     def records(self) -> Iterator[Record]:
-        """惰性产出 Record。解析错误按 input.on_bad_line / input.on_missing_pair 策略处理。"""
+        """惰性产出 Record。解析错误按 input.on_bad_line / input.on_missing_pair 策略处理。
+           非 stream 入口，v1.8 零改动。"""
+    def sessions(self) -> Iterator[Session]:
+        """v1.8：stream 模式的会话流视图，M10 以之取代 records() 消费（3.2.8）；产出
+           Session(session_id, records, cause)——形态冻结于 CONTRACTS §7.1。"""
     @property
     def report(self) -> IngestReport: ...
 ```
@@ -140,3 +145,28 @@ FrameLayout [0,0,1080,2340]
 ```
 
 **提示：**两处 id 规则不同——文本模态对 `raw` 的 canonical JSON 取哈希（与行号、文件名无关，内容相同即 id 相同，为 M3 精确判重的基础）；UI 模态对树文件字节与图像文件字节拼接取哈希。图像此时仅 stat（`size_bytes = 483112`，远小于 `input.max_image_mb = 20` 上限），像素到 M5 组装提示词时才经 `ImageRef.load_base64()` 加载。
+
+### 3.2.8 时序流排序与会话化（v1.8）
+
+`segment.enabled = true`（stream 模式，2.3.1）时本模块承担 `[stream]` 节声明的输入侧排序、流式单调性校验与**规则层**会话化（配置键表见 5.2；边界的语义精化属 M14，3.14——会话化留 M2、装箱留 M10 的分工见 3.10.3）。产出面变化：M10 改消费 `sessions()` 会话流视图（3.2.3）而非 `records()`，切批改整会话装箱。
+
+**排序键（`stream.order_by`）。**`"input_order"`（默认）：文本 = 文件名字典序 → 行号，UI = pair_index 升序（即现行 `records()` 顺序）。`"meta:<field>"`（仅文本模态，M1 校验 3.1.4）：`<field>` 为原始行对象上的点路径字段，时间戳解析规格见 6.1（S20）——数值 `v < 0 ∨ v ≥ 1e14` 解析失败、`v < 1e11` 判 epoch 秒、`[1e11, 1e14)` 判毫秒（÷1000）；字符串先试纯数字（走数值规则）再试 `datetime.fromisoformat`（3.11 起原生接受 `Z` 后缀），均败 = 解析失败；aware 值换算 UTC epoch、naive 值按 UTC 解释；内部序键 = float 秒。
+
+**流式单调性校验（S19/S20）。**不做全量重排：单调性游标**按 `stream.key` 分区键各自维护**（dict，内存 = 键基数）——逐设备/逐来源拼接的输入不会被整体判乱序；键变即断会话（groupby 语义非 keyBy，**输入须按分区键成组**；交错流列演进候选，8.4）。乱序记录与时间戳解析失败**同走** `stream.on_disorder`：`"skip"`（默认）= 跳过 + 计 `bad_input` + `IngestReport.disorder` 子计数 + 每记录一条 `ingest.disorder` 事件（7.2；stderr WARN 每运行仅镜像一次）；`"fail"` = InputError，退出码 3。
+
+**会话装配器（规则层，纯代码零 LLM）。**在（已 `--limit` 截断的）解析流上按下列条件闭合候选会话，任一触发即断（键表 5.2）：
+
+- `stream.key` 键变即断（`"meta:<field>"` 仅文本模态；`"source_dir"` = ref.source_file 父目录派生，UI 模态可用——一次采集一目录惯例，S19）；**文本模态 `order_by = "input_order"` 下源文件变更恒闭合会话（cause = "key"，即使 `stream.key = []`）**——line_no 的顺序语义不跨文件成立、无时间戳可桥接文件边界；`order_by = "meta:*"` 时文件边界透明（轮转日志场景）（v1.8 D7 登记）；
+- `stream.gap_s`（相邻记录时间差 > gap_s 秒即断；仅 order_by="meta:*"）/ `stream.gap_steps`（序号差断开，0 = 不启用）——两者可并用，任一触发即断；
+- `stream.session_max_len`（默认 200，硬上限）/ `stream.session_max_span_s`（时间跨度硬上限，0 = 不启用；仅 meta:*）；
+- 流耗尽（eof）或 `--limit` 截断（limit）。
+
+会话闭合时发一条 `segment.session` trace 事件（**属主 M2**；事件名冠 segment 前缀、按前缀归 segment 通道，S1，7.2）——payload 含 `session_id`、`first` / `last`（首末序键）、`len`、`cause`（∈ `gap`\|`key`\|`max_len`\|`max_span`\|`eof`\|`limit`），并计 `IngestReport.sessions`。会话对象 `Session(session_id, records, cause)` 的形态冻结于 CONTRACTS §7.1：`session_id = sha256("\n".join(会话内记录 id))[:16]`（会话序）、`records` 为按会话序的成员 Record 元组、`cause` 即上述闭合词表。
+
+**--limit 帧级截断（S17）。**`--limit` 的单位不变、仍是**帧**（记录）：islice 位于解析流与会话装配器**之间**；截断视同 EOF——尾部未闭合会话按会话闭合下发（cause = "limit"）+ WARN 一次。`cause = "limit"` 的精确语义是「**该会话在 --limit 预算耗尽处闭合**」：预算恰好在流末耗尽（无真截断）与真截断不可区分——消歧需要多拉取并解析一条记录，会扰动 scanned/bad_input 台账，工具不做（v1.8 D3 裁决）；WARN 文案据此陈述预算耗尽而非断言截断（2.4 --limit 行 stream 子句）。
+
+**IngestReport（v1.8 只增两字段）。**`sessions` = 装配器闭合的候选会话数（stream 模式；`report.stream.sessions` 的数据源，6.4）；`disorder` = 单调性校验跳过的记录数——`bad_input` 的**子计数**，经逐条 `ingest.disorder` 事件可审计，report 不另设键（6.4）。
+
+**dry-run 单遍融合（S23）。**文本模态 stream 启用时，`scan()` 的行数统计与会话空跑**单遍融合**——一次读同时产出预估记录数与会话尺寸序列（供 3.10.3 dry-run 的 next-fit 装箱与调用量估算），不做第二次全量读。
+
+**背书：**规则层会话化是流处理 session window 原语的对应物（Apache Flink `EventTimeSessionWindows` / Apache Beam `Sessions` [55]，1.5）——inactivity gap + 分区键 + 硬上限三件套照抄，纯代码零 LLM 成本；`gap_s` 默认偏大的结构性论证（欠分割可由 M14 的 LLM 边界精化拯救、过分割不可逆）见 5.2 gap_s 行。
