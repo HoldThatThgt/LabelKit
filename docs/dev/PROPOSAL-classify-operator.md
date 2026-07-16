@@ -10,7 +10,7 @@
 
 **可行，且与现有架构高度兼容。**推荐方案：
 
-1. **新增一个算子 `classify`**（建议编号 M13，canonical 文件现为 `labelkit/operators/classify.py`），位于链序 **dedup 之后、quality 之前**：对每条存活记录做 LLM 封闭集（closed-set）分类，类别表由用户在 project.toml 声明，输出经 M8 内部 Schema（enum 硬约束）保证合法。标签基数由开关 `classify.assignment = "single" | "multi"`（默认 single）控制：single 锁定一条一类；multi 允许一条数据命中多类并**按标签扇出**到多条按类管线（§4.3）。
+1. **新增一个算子 `classify`**（建议编号 M13，文件 `labelkit/classify.py`），位于链序 **dedup 之后、quality 之前**：对每条存活记录做 LLM 封闭集（closed-set）分类，类别表由用户在 project.toml 声明，输出经 M8 内部 Schema（enum 硬约束）保证合法。标签基数由开关 `classify.assignment = "single" | "multi"`（默认 single）控制：single 锁定一条一类；multi 允许一条数据命中多类并**按标签扇出**到多条按类管线（§4.3）。
 2. **路由采用「类条件参数化」而非「物理拆链」**：管线拓扑不变，下游算子（quality / annotate / generate / verify）按记录所属类选择参数——每类可覆盖 rubric、质量门、标注指令与 few-shot、生成指令与风格、评审维度；未覆盖的键继承全局配置。这正是 Dolma「tagger 打属性、mixer 按属性决策」与 NeMo Curator「`bucketed_results` 字段路由」的同构做法（§3 调研）。
 3. **默认关闭，零行为变化**：`classify.enabled = false`（默认）时工具行为与 v1.6 完全一致。只开分类不配任何按类覆盖 = 纯打标模式（类标签进 `_meta.classification` 供下游使用，InsTag / NeMo Curator DomainClassifier 用法）。
 

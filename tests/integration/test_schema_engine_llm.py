@@ -1,7 +1,7 @@
 """M8 integration tests — REAL endpoint (glm-5.2 via api.z.ai, anthropic protocol).
 
 No mock LLMs (project policy). SchemaEngine is exercised end-to-end through
-complete_validated against the live endpoint. Uses the real labelkit.common.runtime.llm_client once
+complete_validated against the live endpoint. Uses the real labelkit.llm_client once
 M9 lands; until then a minimal REAL-HTTP client implementing the exact contract
 surface M8 needs (async complete(profile, prompt, response_schema) -> LLMResponse-shaped
 object, Anthropic tool_choice structured output with tool name "emit") stands in, so
@@ -16,9 +16,9 @@ from dataclasses import dataclass
 import httpx
 import pytest
 
-from labelkit.common.runtime.schema_engine import Message, Part, PromptBundle, SchemaEngine
-from labelkit.common.config.model import LLMProfile, OutputConfig
-from labelkit.common.contracts.types import Usage
+from labelkit.schema_engine import Message, Part, PromptBundle, SchemaEngine
+from labelkit.config.model import LLMProfile, OutputConfig
+from labelkit.types import Usage
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 
@@ -55,7 +55,7 @@ def make_profile(name: str, structured: bool) -> LLMProfile:
 
 
 try:
-    from labelkit.common.runtime.llm_client import LLMClient as _RealLLMClient
+    from labelkit.llm_client import LLMClient as _RealLLMClient
 
     def make_client(profiles: dict[str, LLMProfile]):
         return _RealLLMClient(profiles, {})
@@ -212,7 +212,7 @@ async def test_l25_hook_violation_repaired_by_loop():
 
 
 async def test_l25_unsatisfiable_hook_exhausts_as_callback_violation():
-    from labelkit.common.errors import SchemaViolation
+    from labelkit.errors import SchemaViolation
     prof = make_profile("default", structured=False)
     engine = SchemaEngine(USER_SCHEMA, make_client({"default": prof}),
                           OutputConfig(max_repair_attempts=1,

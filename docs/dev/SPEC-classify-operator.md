@@ -18,7 +18,7 @@
 | M5/M7/M11/M12 | feasible_with_frictions | 6 | 以只增为主；M5/M7 需先修 CONTRACTS §7.4 签名（提案量级「小」上调为「中」）；multi 下 rejects/trace 需 label 消歧 |
 | 文档盘点 | — | — | 盘点 67 文件；与其余五域清单合并去重后共 **70**（spec 18、CONTRACTS 1、手册 18、代码 15、测试 13、examples 2、根 3——盘点域漏了 `cli.py` 与 `test_cli.py`/`test_obslog.py`，由 M1/M13/M5 域补齐）；提案 §5 有 8 类遗漏，已并入 §4 |
 
-编排者 inline 复核过的承重事实：`counts.*` 仅 M10 可增（CONTRACTS §11 冻结，docs/CONTRACTS.md 约 1702 行）；rejects 归因取 `item.errors[0]`（现位于 `labelkit/operators/emitter.py`）；openai_compatible L0 无条件 `strict: true` 透传 Schema（现位于 `labelkit/common/runtime/llm_client.py`）；trace 通道合法值唯一硬编码于 `labelkit/common/config/loader.py`；report 桶字段白名单漏 `rejected_by_validator`（现涉及 `labelkit/orchestration/orchestrator.py` 与 `labelkit/operators/generate.py`，既有问题见 §6）。
+编排者 inline 复核过的承重事实：`counts.*` 仅 M10 可增（CONTRACTS §11 冻结，docs/CONTRACTS.md 约 1702 行）；rejects 归因取 `item.errors[0]`（`labelkit/emitter.py:392-394`）；openai_compatible L0 无条件 `strict: true` 透传 Schema（`labelkit/llm_client.py:254-258`）；trace 通道合法值唯一硬编码于 `labelkit/config/loader.py:67`；report 桶字段白名单漏 `rejected_by_validator`（`labelkit/orchestrator.py:484` vs `labelkit/generate.py:295/314`，现存 bug，见 §6）。
 
 ## 2. 设计裁决记录（对提案的修正与细化；终审后并入 spec §1.6）
 
