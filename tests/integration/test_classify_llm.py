@@ -14,8 +14,8 @@ import random
 
 import pytest
 
-from labelkit.classify import ClassifyStage
-from labelkit.config.model import (
+from labelkit.operators.classify import ClassifyStage
+from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
     ClassSpec,
@@ -35,10 +35,10 @@ from labelkit.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.llm_client import LLMClient
-from labelkit.schema_engine import SchemaEngine
-from labelkit.stage import RunContext
-from labelkit.types import PipelineItem, Record, RecordRef
+from labelkit.common.runtime.llm_client import LLMClient
+from labelkit.common.runtime.schema_engine import SchemaEngine
+from labelkit.common.contracts.stage import RunContext
+from labelkit.common.contracts.types import PipelineItem, Record, RecordRef
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 

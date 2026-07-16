@@ -21,7 +21,7 @@ import json_repair
 import pytest
 from jsonschema import Draft202012Validator
 
-from labelkit.config.model import (
+from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
     Criterion,
@@ -41,10 +41,10 @@ from labelkit.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.errors import ProviderFatalError, SchemaViolation
-from labelkit.quality import AGGREGATE_KEY, QualityStage
-from labelkit.stage import RunContext
-from labelkit.types import PipelineItem, Record, RecordRef, Usage
+from labelkit.common.errors import ProviderFatalError, SchemaViolation
+from labelkit.operators.quality import AGGREGATE_KEY, QualityStage
+from labelkit.common.contracts.stage import RunContext
+from labelkit.common.contracts.types import PipelineItem, Record, RecordRef, Usage
 
 pytestmark = pytest.mark.integration
 
