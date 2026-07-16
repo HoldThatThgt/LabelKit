@@ -138,6 +138,34 @@ class SegmentConfig:                              # v1.8 (spec 5.2 [segment]): M
 
 
 @dataclass(frozen=True)
+class StitchConfig:                               # v1.9 (spec 5.2 [stitch]): M16 thread stitching
+    enabled: bool = False                         # true => segment.enabled (M1 constraint, T17)
+    llm: str = "default"                          # judgment profile; joins the reference sets when
+                                                  # enabled — pure-text evidence, NEVER in any
+                                                  # vision-required set (T16)
+    max_open: int = 4                             # open-thread pool capacity (suspension-window
+                                                  # mean 3 + 1 active, N-13 anchor)
+    bias: Literal["conservative", "llm"] = "conservative"
+                                                  # conservative = LLM resume AND mechanical prior
+                                                  # (T9 conjunction); llm = pure LLM verdict
+    rescue_short: bool = True                     # below_min_len short runs join the candidate
+                                                  # stream (T11); rescue never opens threads (B-2)
+    repass: bool = True                           # bounded second pass over single-fragment
+                                                  # threads (T19); false = pure one-pass greedy
+    stale_gap_steps: int = 0                      # ordinal-gap decay threshold; 0 = leg off;
+                                                  # double duty: T9 prior downgrade + T8 pool-full
+                                                  # eviction priority (distinct from stream.gap_steps)
+    digest_max_chars: int = 400                   # per-frame digest cap inside summary cards
+                                                  # (segment key-name semantics, m-9)
+    context: str = ""                             # optional domain hint (what "same task" means)
+    votes: int = 1                                # T18: 1 = single call; >1 = n samples with a
+                                                  # strict (verdict, thread_ref) majority (M-4;
+                                                  # even = CONFIG_ERROR)
+    on_error: Literal["keep", "fail"] = "keep"    # fail applies to episode-candidate envelopes
+                                                  # only (B-2)
+
+
+@dataclass(frozen=True)
 class ExtractConfig:                              # v1.8 (spec 5.2 [extract]): M15, UI sequences only
     enabled: bool = False                         # requires segment.enabled + modality="ui"
     llm: str = "default"                          # always in the vision reference set (S30)
@@ -261,8 +289,9 @@ class TraceConfig:
     enabled: bool = False
     path: str = ""                                # M1 resolves "" → "{output_stem}.trace.jsonl"
     channels: tuple[str, ...] = ("quality", "verify", "schema")
-                                                  # allowed (v1.8: 10 values): ingest|dedup|segment|
-                                                  # extract|classify|quality|annotate|verify|schema|llm
+                                                  # allowed (v1.9: 11 values): ingest|dedup|segment|
+                                                  # stitch|extract|classify|quality|annotate|verify|
+                                                  # schema|llm
     content: Literal["none", "refs", "excerpt", "full"] = "refs"
 
 
@@ -323,6 +352,7 @@ class ResolvedConfig:
     stream: StreamConfig                          # v1.8
     dedup: DedupConfig
     segment: SegmentConfig                        # v1.8
+    stitch: StitchConfig                          # v1.9
     extract: ExtractConfig                        # v1.8
     classify: ClassifyConfig                      # v1.7; max_labels backfilled by M1
     quality: QualityConfig

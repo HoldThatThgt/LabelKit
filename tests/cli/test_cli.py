@@ -34,6 +34,7 @@ from labelkit.common.config.model import (
     Rubric,
     RunConfig,
     SegmentConfig,
+    StitchConfig,
     StreamConfig,
     ToolConfig,
     TraceConfig,
@@ -83,6 +84,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/operators/ingest.py",
     "labelkit/operators/quality.py",
     "labelkit/operators/segment.py",
+    "labelkit/operators/stitch.py",
     "labelkit/operators/verify.py",
     "labelkit/orchestration/__init__.py",
     "labelkit/orchestration/factory.py",
@@ -110,6 +112,7 @@ EXPECTED_TEST_PY = {
     "tests/integration/test_llm_client_llm.py",
     "tests/integration/test_quality_llm.py",
     "tests/integration/test_schema_engine_llm.py",
+    "tests/integration/test_stitch_llm.py",
     "tests/integration/test_stream_llm.py",
     "tests/integration/test_verify_llm.py",
     "tests/operators/test_annotate.py",
@@ -121,6 +124,7 @@ EXPECTED_TEST_PY = {
     "tests/operators/test_ingest.py",
     "tests/operators/test_quality.py",
     "tests/operators/test_segment.py",
+    "tests/operators/test_stitch.py",
     "tests/operators/test_verify.py",
     "tests/orchestration/test_orchestrator.py",
 }
@@ -357,6 +361,7 @@ def _cfg(**kw) -> ResolvedConfig:
         stream=StreamConfig(),
         dedup=DedupConfig(),
         segment=SegmentConfig(),
+        stitch=StitchConfig(),
         extract=ExtractConfig(),
         classify=ClassifyConfig(),
         quality=QualityConfig(),
@@ -530,6 +535,46 @@ def test_build_stages_stream_inserts_segment_and_extract():
                                         "quality", "annotate"]
     assert isinstance(stages[0], SegmentStage)
     assert isinstance(stages[3], ExtractStage)
+
+
+# ── v1.9 stitch (T16/T17 reference set + §7.12 chain slot) ───────────────────
+
+
+def test_referenced_profiles_stitch_enabled_only():
+    """v1.9: stitch.llm joins the probe set iff stitch is enabled (pure-text
+    judgment — referenced regardless of strategy/vision); slot follows the
+    chain order — after segment, before classify."""
+    on = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+              stitch=StitchConfig(enabled=True, llm="judge"))
+    assert referenced_profiles(on)[0] == ["judge", "default"]
+
+    chain = _cfg(segment=SegmentConfig(enabled=True, strategy="hybrid",
+                                       llm="fixer"),
+                 stitch=StitchConfig(enabled=True, llm="judge"),
+                 classify=_classify_cfg(llm="default"))
+    assert referenced_profiles(chain)[0] == ["fixer", "judge", "default"]
+
+    off = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+               stitch=StitchConfig(enabled=False, llm="judge"))
+    assert referenced_profiles(off)[0] == ["default"]
+
+
+def test_build_stages_inserts_stitch_between_segment_and_dedup():
+    """v1.9 (§7.12): StitchStage instantiates between segment and dedup when
+    enabled; disabled keeps the v1.8 list byte-identical."""
+    from labelkit.operators.stitch import StitchStage
+
+    cfg = _cfg(segment=SegmentConfig(enabled=True),
+               stitch=StitchConfig(enabled=True),
+               extract=ExtractConfig(enabled=True))
+    stages = build_stages(cfg)
+    assert [s.name for s in stages] == ["segment", "stitch", "dedup", "extract",
+                                        "quality", "annotate"]
+    assert isinstance(stages[1], StitchStage)
+
+    off = _cfg(segment=SegmentConfig(enabled=True))
+    assert [s.name for s in build_stages(off)] == ["segment", "dedup", "quality",
+                                                   "annotate"]
 
 
 # ── validate / run end-to-end (skip until sibling modules land) ────────────

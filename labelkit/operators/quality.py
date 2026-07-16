@@ -246,7 +246,10 @@ def _step_line(transition: Transition) -> str:
     target/value render as "—". Fallback steps (Transition.detail.kind ==
     "extraction_invalid") get the trailing （摘取兜底） suffix — listed SEPARATELY from an
     LLM-confirmed "other" so fallback noise cannot pollute the coherence anchor (S16;
-    M5 annotate renders WITHOUT the suffix)."""
+    M5 annotate renders WITHOUT the suffix). v1.9 (T14): thread-seam placeholder steps
+    (detail.kind == "thread_seam") get the parallel 「（线索接缝：被 X 打断）」 suffix —
+    without it the trajectory rubric's noise_residue/coherence criteria would score the
+    seam as noise residue or an unexplained jump."""
     action = transition.action
     target = action.get("target")
     value = action.get("value")
@@ -256,6 +259,9 @@ def _step_line(transition: Transition) -> str:
             f"{action.get('description')}")
     if transition.detail.get("kind") == "extraction_invalid":
         line += _FALLBACK_STEP_SUFFIX
+    elif transition.detail.get("kind") == "thread_seam":
+        names = "、".join(transition.detail.get("interrupted_by") or ())
+        line += f"（线索接缝：被{names}打断）"
     return line
 
 

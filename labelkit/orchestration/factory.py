@@ -24,6 +24,10 @@ def build_stages(cfg: "ResolvedConfig") -> list["Stage"]:
         from labelkit.operators.segment import SegmentStage
 
         stages.append(SegmentStage(cfg))
+    if cfg.stitch.enabled:
+        from labelkit.operators.stitch import StitchStage
+
+        stages.append(StitchStage(cfg))
     if cfg.dedup.enabled:
         stages.append(DedupStage(cfg.dedup, DedupIndex(cfg.dedup, cfg.run.modality)))
     if cfg.classify.enabled:

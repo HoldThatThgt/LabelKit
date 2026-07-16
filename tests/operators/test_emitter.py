@@ -13,7 +13,8 @@ from labelkit import TOOL_VERSION
 from labelkit.common.config.model import (
     AnnotateConfig, ClassifyConfig, ClassSpec, Criterion, DedupConfig,
     ExtractConfig, GenerateConfig, InputConfig, OutputConfig, QualityConfig,
-    ResolvedConfig, Rubric, RunConfig, SegmentConfig, StreamConfig, ToolConfig,
+    ResolvedConfig, Rubric, RunConfig, SegmentConfig, StitchConfig, StreamConfig,
+    ToolConfig,
     TraceConfig, VerifyConfig,
 )
 from labelkit.operators.emitter import EmitResult, Emitter
@@ -66,6 +67,7 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
     log_format = kw.pop("log_format", "text")
     classify = kw.pop("classify", ClassifyConfig())
     segment = kw.pop("segment", SegmentConfig())
+    stitch = kw.pop("stitch", StitchConfig())
     assert not kw, f"unknown overrides: {kw}"
     return ResolvedConfig(
         tool=ToolConfig(log_format=log_format),
@@ -76,6 +78,7 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
         stream=StreamConfig(),
         dedup=DedupConfig(),
         segment=segment,
+        stitch=stitch,
         extract=ExtractConfig(),
         classify=classify,
         quality=QualityConfig(
@@ -473,6 +476,81 @@ def test_meta_stream_null_for_single_record_even_in_stream_mode(tmp_path):
     cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
     run_emitter(cfg, [make_item()])
     assert read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"] is None
+
+
+# ── v1.9 stitch: fourth route + _meta.stream thread keys (T21/T16/m-11) ─────
+
+def test_stitched_fourth_route_neither_channel_but_counted(tmp_path):
+    """§7.10 v1.9 fourth route (T21): a stitched shell goes to NEITHER the main
+    output NOR rejects — counted only; it must never hit the else→rejects
+    fallback (which would pollute rejects and trip --strict)."""
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+                   stitch=StitchConfig(enabled=True))
+    members = [make_record("1" * 16, 1), make_record("2" * 16, 4)]
+    shell = make_item(status="stitched", record=make_seq_record(members),
+                      annotated=False)
+    active = make_item(record=make_record("a" * 16, 9))
+    em, result = run_emitter(cfg, [shell, active])
+    assert result == EmitResult(emitted=1, rejected=0)
+    assert len(read_jsonl(tmp_path / "out" / "res.jsonl")) == 1
+    rejects = tmp_path / "out" / "res.rejects.jsonl"
+    assert not rejects.exists() or read_jsonl(rejects) == []
+    assert em._status_totals["stitched"] == 1          # counted, not routed
+
+
+def test_meta_stream_stitch_keys_present_only_when_enabled(tmp_path):
+    """T16/m-11: thread_id (after episode_id) / fragments (before steps) / the
+    per-step resumed flag appear ONLY when stitch is enabled; the resumed flag
+    derives from detail.kind == "thread_seam", never from action_type."""
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+                   stitch=StitchConfig(enabled=True))
+    members = [make_record("1" * 16, 3), make_record("2" * 16, 5),
+               make_record("3" * 16, 8)]
+    item = make_item(record=make_seq_record(members))
+    item.session_id = "ime-log/0"
+    item.thread_id = "e" * 16
+    item.stitch_fragments = (
+        {"order_span": ["ime-2026-06.jsonl:3", "ime-2026-06.jsonl:5"],
+         "member_count": 2, "cause": "origin", "source_episode": "e" * 16},
+        {"order_span": ["ime-2026-06.jsonl:8", "ime-2026-06.jsonl:8"],
+         "member_count": 1, "cause": "rescued", "source_episode": None},
+    )
+    item.transitions = (
+        Transition(index=0, action={"action_type": "click", "target": "登录",
+                                    "value": None, "description": "点击"},
+                   model="glm-5.2", attempts=1, detail={}),
+        Transition(index=1, action={"action_type": "app_switch", "target": None,
+                                    "value": None,
+                                    "description": "线索接缝：被打车打断后恢复"},
+                   model="", attempts=0,
+                   detail={"kind": "thread_seam", "interrupted_by": ["打车"]}),
+    )
+    run_emitter(cfg, [item])
+
+    stream = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"]
+    assert list(stream) == ["episode_id", "thread_id", "session_id",
+                            "order_span", "member_count", "member_ids",
+                            "member_sources", "session_split", "repaired",
+                            "degraded", "fragments", "steps"]
+    assert stream["thread_id"] == "e" * 16             # == episode_id (T22)
+    assert stream["fragments"] == [dict(f) for f in item.stitch_fragments]
+    # top-level order_span stays the envelope span (§6.3 包络 rule)
+    assert stream["order_span"] == ["ime-2026-06.jsonl:3", "ime-2026-06.jsonl:8"]
+    assert [row["resumed"] for row in stream["steps"]] == [False, True]
+
+    # stitch OFF: the v1.8 key set byte-identical — none of the three appear
+    out2 = tmp_path / "off" / "res.jsonl"
+    out2.parent.mkdir(parents=True)
+    cfg_off = make_cfg(tmp_path, output=str(out2),
+                       segment=SegmentConfig(enabled=True))
+    item_off = make_item(record=make_seq_record(members))
+    item_off.transitions = item.transitions
+    run_emitter(cfg_off, [item_off])
+    stream_off = read_jsonl(out2)[0]["_meta"]["stream"]
+    assert list(stream_off) == ["episode_id", "session_id", "order_span",
+                                "member_count", "member_ids", "member_sources",
+                                "session_split", "repaired", "degraded", "steps"]
+    assert all("resumed" not in row for row in stream_off["steps"])
 
 
 def test_meta_verification_defects_stream_only(tmp_path):

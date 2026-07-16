@@ -7,7 +7,11 @@ always-present frame-digest tail), the M8 internal-schema guarantee
 (schema_engine.action_schema — no resolved_at counting, no L2.5), and the
 on_error fallback/fail policy (S16: fallback evidence lives in Transition.detail,
 never in item.errors — R4 family). Transition count == member count − 1, always
-(a failed step becomes a fallback placeholder, never a hole). Chain position:
+(a failed step becomes a fallback placeholder, never a hole). v1.9 (T10/T20):
+pairs at M16 ``seam_indexes`` never reach the LLM — they take the mechanical
+thread-seam placeholder (detail.kind == "thread_seam") and stay OUT of the
+extract counters; adjacent-rescue splices are real transitions and extract
+normally. Chain position:
 classify → extract → quality (labels are in place so [class.<label>.extract]
 per-class instructions apply); multi fan-out siblings each extract independently
 under their own label (S9 — never de-duplicated by record id). UI-modality
@@ -96,6 +100,21 @@ _DIGEST_MAX_CHARS = 400
 # by the presence of Transition.detail["kind"] == "extraction_invalid".
 _FALLBACK_ACTION: Mapping = {"action_type": "other", "target": None,
                              "value": None, "description": ""}
+
+
+def _seam_placeholder(index: int, interrupted_by: tuple[str, ...]) -> Transition:
+    """v1.9 (T10, four keys pinned): the zero-LLM mechanical placeholder written
+    at a thread-seam step. action_type="app_switch" promises NO semantics (M-1
+    备注: same-app interleavings land here too) — downstream discriminates by
+    detail.kind == "thread_seam". interrupted_by = the distinct interrupting
+    threads' task_names in gap order (M-1 guarantees ≥ 1); model=""/attempts=0:
+    no call was ever made."""
+    names = "、".join(interrupted_by)
+    action = {"action_type": "app_switch", "target": None, "value": None,
+              "description": f"线索接缝：被{names}打断后恢复"}
+    return Transition(index=index, action=action, model="", attempts=0,
+                      detail={"kind": "thread_seam",
+                              "interrupted_by": list(interrupted_by)})
 
 
 def _diff_text(diff: Mapping) -> str:
@@ -216,17 +235,25 @@ class ExtractStage:
         if not todo:
             return batch
 
-        # ONE flat gather over every (episode, adjacent pair) of the batch;
-        # coroutine order = (episode batch position, pair ordinal), and gather
-        # preserves it, so the write-back below is schedule-independent.
-        spans: list[tuple[PipelineItem, int]] = []
+        # ONE flat gather over every JUDGED (episode, adjacent pair) of the
+        # batch; coroutine order = (episode batch position, pair ordinal), and
+        # gather preserves it, so the write-back below is schedule-independent.
+        # v1.9 (T20): pairs at seam indexes are SKIPPED — they never join the
+        # gather (zero LLM) and take the mechanical T10 placeholder in the
+        # finalize below; the pre-v1.9 one-coroutine-per-pair slicing is
+        # replaced by per-episode judged-pair accounting for exactly this.
+        spans: list[tuple[PipelineItem, int, frozenset[int]]] = []
         coros = []
         for item in todo:
             members = item.record.members
             label = item.classification.label if item.classification else None
             pairs = max(0, len(members) - 1)
-            spans.append((item, pairs))
+            seams = frozenset(i for i in getattr(item, "seam_indexes", ()) or ()
+                              if 0 <= i < pairs)
+            spans.append((item, pairs, seams))
             for i in range(pairs):
+                if i in seams:
+                    continue
                 coros.append(extract_transition(members[i], members[i + 1], i,
                                                 ctx, label=label))
         results = await asyncio.gather(*coros, return_exceptions=True)
@@ -239,16 +266,29 @@ class ExtractStage:
         # Synchronous finalize in batch position order: an episode with any
         # escaped step exception fails whole (its other step results are
         # discarded — the invariant tuple is all-or-nothing); otherwise
-        # len(transitions) == len(members) − 1 with fallback placeholders.
+        # len(transitions) == len(members) − 1 with fallback placeholders and,
+        # v1.9, the seam placeholders spliced in at their pinned indexes.
         pos = 0
-        for item, pairs in spans:
-            row = results[pos:pos + pairs]
-            pos += pairs
+        for item, pairs, seams in spans:
+            judged = pairs - len(seams)
+            row = results[pos:pos + judged]
+            pos += judged
             exc = next((r for r in row if isinstance(r, BaseException)), None)
             if exc is not None:
                 self._fail(item, ctx, exc)
                 continue
-            item.transitions = tuple(row)
+            interrupted = tuple(getattr(item, "seam_interrupted_by", ()) or ())
+            seam_order = sorted(seams)
+            transitions: list[Transition] = []
+            judged_iter = iter(row)
+            for i in range(pairs):
+                if i in seams:
+                    names = (interrupted[seam_order.index(i)]
+                             if seam_order.index(i) < len(interrupted) else ())
+                    transitions.append(_seam_placeholder(i, tuple(names)))
+                else:
+                    transitions.append(next(judged_iter))
+            item.transitions = tuple(transitions)
             self._register(item, ctx)
         return batch                            # the SAME list object (contract ②)
 
@@ -256,9 +296,15 @@ class ExtractStage:
         """Counters + one extract.step event per finalized step, fallback steps
         included (§8.1): extract.transitions / extract.by_type.<action_type>
         count EVERY final step (fallback lands in by_type.other). Payload fields
-        go in raw — the S27 redaction (_DATA_KEYS/_FREE_TEXT_KEYS) is M12's."""
+        go in raw — the S27 redaction (_DATA_KEYS/_FREE_TEXT_KEYS) is M12's.
+        v1.9 (T20 计数器口径): thread-seam placeholders are NOT extraction
+        products — they skip the counters (their zero-LLM app_switch must not
+        pollute by_type) and the extract.step event alike; the seam's single
+        metering point is stream.stitch.seams."""
         members = item.record.members
         for t in item.transitions:
+            if t.detail.get("kind") == "thread_seam":
+                continue
             action_type = t.action["action_type"]
             ctx.metrics.count(_COUNTER_TRANSITIONS)
             ctx.metrics.count(_COUNTER_BY_TYPE_PREFIX + action_type)

@@ -9,12 +9,15 @@ writes (M11 owns the output channels). Responsibilities:
   WHOLE sessions per batch by next-fit — one open bin, oversized sessions
   hard-split (S21) — stamping ``session_id`` on frame envelopes (S4);
 - compose the per-batch stage chain from the config switches (2.3.1 matrix) in
-  the canonical order segment → dedup → classify → extract → quality →
-  generate → annotate → verify (the v1.8 single superset tuple; segment and
-  extract default off, degrading byte-identically to the v1.7 chain);
+  the canonical order segment → stitch → dedup → classify → extract →
+  quality → generate → annotate → verify (the v1.9 single superset tuple;
+  segment, stitch and extract default off, degrading byte-identically to the
+  v1.7 chain);
 - meter ``counts.fanout`` / ``counts.episodes`` as the len-delta across the
   classify / segment stage (v1.7 R9 / v1.8 §7.9 — ``counts.*`` ownership stays
-  with M10; M13/M14 append siblings/episodes in place);
+  with M10; M13/M14 append siblings/episodes in place); tally
+  ``counts.stitched`` post-emit and derive ``counts.threads`` as
+  episodes − stitched (v1.9 T7 single-point derivation);
 - schedule the single-round generation re-flow (sub-batches re-enter at M3,
   never at M6 — no recursion);
 - drive per-batch lifecycle: fresh RunContext per (batch, stage), emit via M11,
@@ -62,22 +65,24 @@ _EV_RUN_END = "run.end"
 _EV_BATCH_START = "batch.start"
 _EV_BATCH_END = "batch.end"
 
-# Canonical pipeline order (spec §2.2 / CONTRACTS.md §2/§7.9): the v1.8 SINGLE
-# SUPERSET TUPLE — v1.7 inserted classify right after dedup; v1.8 prepends
-# segment and slots extract between classify and quality. segment/extract are
-# default OFF, so the effective chain degrades byte-identically to the v1.7
-# six-name form (generate and segment are mutually exclusive per M1, so the two
-# never co-occupy the chain).
-_CHAIN_ORDER = ("segment", "dedup", "classify", "extract", "quality", "generate",
-                "annotate", "verify")
+# Canonical pipeline order (spec §2.2 / CONTRACTS.md §2/§7.9): the v1.9 SINGLE
+# SUPERSET TUPLE — v1.7 inserted classify right after dedup; v1.8 prepended
+# segment and slotted extract between classify and quality; v1.9 slots stitch
+# between segment and dedup (T5). segment/stitch/extract are default OFF, so
+# the effective chain degrades byte-identically to the v1.7 six-name form
+# (generate and segment are mutually exclusive per M1, so the two never
+# co-occupy the chain).
+_CHAIN_ORDER = ("segment", "stitch", "dedup", "classify", "extract", "quality",
+                "generate", "annotate", "verify")
 
 # v1.8 closed vocabularies (§9.3 report zero-based histograms) — must equal the
 # schema_engine enums: action_schema() action_type 11 values (S15) and
-# defect_verdict_schema() defect kind 5 values (S31).
+# defect_verdict_schema() defect kind 6 values (S31; v1.9 T15 appends
+# wrong_stitch).
 _ACTION_TYPES = ("click", "long_press", "input_text", "scroll", "drag", "open_app",
                  "app_switch", "navigate_back", "navigate_home", "wait", "other")
 _DEFECT_KINDS = ("label_mismatch", "off_task_members", "missing_head",
-                 "missing_tail", "missing_members")
+                 "missing_tail", "missing_members", "wrong_stitch")
 
 _log = logging.getLogger("labelkit.orchestrator")
 
@@ -431,18 +436,21 @@ class Orchestrator:
         dropped_verify = tally.get("dropped_verify", 0)
         absorbed = tally.get("absorbed", 0)        # v1.8: episode members (third route)
         dropped_noise = tally.get("dropped_noise", 0)
+        stitched = tally.get("stitched", 0)        # v1.9: merged-fragment shells (fourth route)
         # counts invariant: whatever was neither emitted nor dropped is failed
         # (covers emitter-diverted internal_error items too). v1.8: without the
         # absorbed/dropped_noise terms, episode members would be miscounted
-        # as failed (§7.9).
+        # as failed (§7.9); v1.9 (T7 blocker-1): the stitched term joins for the
+        # same reason — shells are terminal, not failed.
         failed = max(len(batch) - emit.emitted - dropped_dup - dropped_lowq
-                     - dropped_verify - absorbed - dropped_noise, 0)
+                     - dropped_verify - absorbed - dropped_noise - stitched, 0)
         self.metrics.count("counts.emitted", emit.emitted)
         self.metrics.count("counts.dropped_dup", dropped_dup)
         self.metrics.count("counts.dropped_lowq", dropped_lowq)
         self.metrics.count("counts.dropped_verify", dropped_verify)
         self.metrics.count("counts.absorbed", absorbed)
         self.metrics.count("counts.dropped_noise", dropped_noise)
+        self.metrics.count("counts.stitched", stitched)
         self.metrics.count("counts.failed", failed)
 
         end_payload: dict = {"active": tally.get("active", 0),
@@ -461,6 +469,11 @@ class Orchestrator:
             end_payload["episodes"] = batch_episodes
             end_payload["absorbed"] = absorbed
             end_payload["dropped_noise"] = dropped_noise
+        if self.cfg.stitch.enabled:
+            # v1.9 (T16, same R20 form): present only when stitch is enabled —
+            # the m-11 off-mode byte-equivalence condition.
+            end_payload["stitched"] = stitched
+            end_payload["threads"] = batch_episodes - stitched
         self.metrics.event(_EV_BATCH_END, stage="run", batch_no=batch_no,
                            payload=end_payload)
         self.metrics.flush()                       # trace flush follows output flush
@@ -485,6 +498,7 @@ class Orchestrator:
         cfg = self.cfg
         enabled = {
             "segment": cfg.segment.enabled,
+            "stitch": cfg.stitch.enabled,
             "dedup": cfg.dedup.enabled,
             "classify": cfg.classify.enabled,
             "extract": cfg.extract.enabled,
@@ -591,6 +605,12 @@ class Orchestrator:
             counts["episodes"] = c("counts.episodes")
             counts["absorbed"] = c("counts.absorbed")
             counts["dropped_noise"] = c("counts.dropped_noise")
+        if cfg.stitch.enabled:
+            # v1.9 只增 (§9.3/T7): stitched from the post-emit tally; threads is
+            # the SINGLE-POINT derivation threads = episodes − stitched (no
+            # second counter — the T16 double-landing guard).
+            counts["stitched"] = c("counts.stitched")
+            counts["threads"] = counts["episodes"] - counts["stitched"]
 
         run_block: dict = {
             "tool_version": __version__,
@@ -629,7 +649,8 @@ class Orchestrator:
                         - counts["dropped_lowq"] - counts["dropped_verify"]
                         - counts["failed"] - counts["bad_input"]
                         - counts.get("absorbed", 0)
-                        - counts.get("dropped_noise", 0))
+                        - counts.get("dropped_noise", 0)
+                        - counts.get("stitched", 0))   # v1.9 (T7): shells are terminal
             counts["unprocessed"] = max(0, residual)
         report: dict = {
             "run": run_block,
@@ -655,6 +676,17 @@ class Orchestrator:
                 "digest_poor_frames": c("segment.digest_poor_frames"),
                 "segment_failures": c("segment.failures"),
             }
+            if cfg.stitch.enabled:
+                # v1.9 (T16, chain-order slot before extract): stitched mirrors
+                # counts.stitched; the other five surface the M16 counters.
+                stream_block["stitch"] = {
+                    "stitched": c("counts.stitched"),
+                    "rescued_short": c("stitch.rescued_short"),
+                    "seams": c("stitch.seams"),
+                    "judgments": c("stitch.judgments"),
+                    "repass_judgments": c("stitch.repass_judgments"),
+                    "failures": c("stitch.failures"),
+                }
             if cfg.extract.enabled:
                 stream_block["extract"] = {
                     "transitions": c("extract.transitions"),
@@ -895,6 +927,7 @@ class Orchestrator:
               f"batches={est['batches']}", file=sys.stderr)
         print(f"dry-run: estimated LLM calls — generate_calls={est['generate_calls']} "
               f"segment_calls={est['segment_calls']} "
+              f"stitch_calls={est['stitch_calls']} "
               f"classify_calls={est['classify_calls']} "
               f"extract_calls={est['extract_calls']} "
               f"quality_calls={est['quality_calls']} annotate_calls={est['annotate_calls']} "
@@ -988,6 +1021,7 @@ class Orchestrator:
         # is always the process-mode scan here): sessions → exact batches,
         # episodes ≈ sessions as the downstream record base.
         segment_calls = 0
+        stitch_calls = 0
         extract_calls = 0
         stream = cfg.segment.enabled and cfg.run.mode == "process"
         if stream:
@@ -1000,6 +1034,12 @@ class Orchestrator:
                 w = cfg.segment.window
                 segment_calls = sum(_ceil_div(length - 1, w - 1)
                                     for length in session_lens if length >= 2)
+            if cfg.stitch.enabled:
+                # v1.9 (T16 estimate, S22 culture): one judgment per episode
+                # candidate over the episodes ≈ sessions lower-bound base,
+                # × votes samples, doubled when the repass is on.
+                stitch_calls = (len(session_lens) * cfg.stitch.votes
+                                * (2 if cfg.stitch.repass else 1))
             if cfg.extract.enabled:
                 extract_calls = sum(length - 1 for length in session_lens)
         else:
@@ -1041,13 +1081,14 @@ class Orchestrator:
             "batches": n_batches,
             "generate_calls": gen_calls,
             "segment_calls": segment_calls,
+            "stitch_calls": stitch_calls,
             "classify_calls": classify_calls,
             "extract_calls": extract_calls,
             "quality_calls": quality_calls,
             "annotate_calls": annotate_calls,
             "verify_calls": verify_calls,
-            "total_calls": (gen_calls + segment_calls + classify_calls
-                            + extract_calls + quality_calls
+            "total_calls": (gen_calls + segment_calls + stitch_calls
+                            + classify_calls + extract_calls + quality_calls
                             + annotate_calls + verify_calls),
         }
 

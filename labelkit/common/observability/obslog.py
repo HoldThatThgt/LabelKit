@@ -36,6 +36,8 @@ EV_INGEST_INDEX_CONFLICT = "ingest.index_conflict"
 EV_INGEST_DISORDER = "ingest.disorder"       # v1.8 M2 stream monotonicity (spec 7.2)
 EV_SEGMENT_SESSION = "segment.session"       # v1.8 M2 session close (spec 7.2); trace-only
 EV_SEGMENT_BOUNDARY = "segment.boundary"     # v1.8 M14 window verdict (spec 7.2); trace-only
+EV_STITCH_JUDGE = "stitch.judge"             # v1.9 M16 candidate verdict (spec 7.2); trace-only
+EV_STITCH_THREAD = "stitch.thread"           # v1.9 M16 fragments span table (spec 7.2); trace-only
 EV_DEDUP_DUPLICATE = "dedup.duplicate"
 EV_CLASSIFY_DECISION = "classify.decision"   # v1.7 M13 (spec 7.2); trace-only, R29
 EV_EXTRACT_STEP = "extract.step"             # v1.8 M15 (spec 7.2); trace-only, S27
@@ -76,8 +78,10 @@ class TraceEvent:
 # + "description" (extract.step LLM text, same tier as reason/critiques) and
 # + "defects" (the verify.verdict stream defect table carries LLM free text in
 #   `detail` — dropped whole-key at "none", critiques level).
+# v1.9 (T16): + "task_name" (stitch.judge/stitch.thread rolling thread task
+#   name — LLM free text, same tier as reason).
 _FREE_TEXT_KEYS = frozenset({"reason", "critiques", "violations",
-                             "description", "defects"})
+                             "description", "defects", "task_name"})
 # v1.8 (S27, §8.3): INPUT-DATA-DERIVED payload fields (extract.step's widget
 # text reference / typed-in text) — stripped at BOTH "none" and "refs" (the
 # refs tier's "no input data content" red line), carried from "excerpt".

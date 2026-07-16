@@ -11,8 +11,9 @@ judge per round.
 v1.8 stream branch (S7/S8/S31, spec 3.7 stream branch): sequence envelopes
 (``record.kind == "sequence"``) under ``segment.enabled`` bypass into a stage-layer
 driver — the §10.5 sequence-variant review (defect-table system text, six-section user
-evidence incl. the ``[边界余量]`` boundary-margin section, validated against
-``defect_verdict_schema()``) plus, under ``policy = "repair"``, two-phase batch-level
+evidence incl. the ``[边界余量]`` boundary-margin section — seven sections under
+stitch (v1.9 T15): ``[片段结构]`` slots between the action sequence and the margin —
+validated against ``defect_verdict_schema()``) plus, under ``policy = "repair"``, two-phase batch-level
 member surgery per round: concurrent review → synchronous defect routing in batch
 position order (shrink / reclaim-claim / mark-only) → concurrent reclaim re-judgment
 (``segment.judge_window`` direct calls) → concurrent seam re-extraction
@@ -77,7 +78,8 @@ _SEQ_SYSTEM_DEFECT_TYPES = (
     "- off_task_members: 段内混入与任务无关的成员帧（members 列出这些成员帧 id）\n"
     "- missing_head: 段首缺少任务起点帧（结合边界余量判断）\n"
     "- missing_tail: 段尾缺少任务终点帧（结合边界余量判断）\n"
-    "- missing_members: 段中缺失成员帧（members 列出可指认的帧 id，无从指认则为 null）")
+    "- missing_members: 段中缺失成员帧（members 列出可指认的帧 id，无从指认则为 null）\n"
+    "- wrong_stitch: 线索缝合错误——各碎片并非同一任务的延续（结合片段结构判断）")
 _SEQ_SYSTEM_TAIL = "先逐维度给出简短意见，再列缺陷表，最后给结论。"
 _SEQ_SYSTEM_STRUCTURE = (
     "输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：\n"
@@ -90,15 +92,16 @@ _SEQ_SYSTEM_STRUCTURE = (
 # modules never depend on each other (spec §2.2): M5/M4 carry their own copies of
 # the same-format line template; this copy is M7's.
 _LABEL_ACTION_SEQUENCE = "[动作序列]"
+_LABEL_FRAGMENT_STRUCTURE = "[片段结构]"   # v1.9 (T15): the seventh section
 _LABEL_BOUNDARY_MARGIN = "[边界余量]"
 _LABEL_FIRST_FRAME = "[首帧截图]"
 _LABEL_LAST_FRAME = "[末帧截图]"
 _MEMBER_DIGEST_MAX_CHARS = 400   # sequence excerpt-tier digest cap (M4 §7.3 mirror)
 
 # Defect kind closed vocabulary in schema/enum order — the FIRST component of the
-# S31 deterministic de-dup sort key.
+# S31 deterministic de-dup sort key. v1.9 (T15): wrong_stitch appended (six).
 DEFECT_KINDS = ("label_mismatch", "off_task_members", "missing_head",
-                "missing_tail", "missing_members")
+                "missing_tail", "missing_members", "wrong_stitch")
 _MISSING_KINDS = frozenset({"missing_head", "missing_tail", "missing_members"})
 # judge_window relations that accept a reclaim candidate back into the segment
 # (spec 3.7.3 stream repair routing / §7.14 deductive mapping: non-boundary values).
@@ -155,14 +158,22 @@ def sequence_step_line(transition: Transition) -> str:
     """One [动作序列] line in the §10.1 frozen format
     `{index}. {action_type}（对象: {target|—}；值: {value|—}）{description}`; null
     target/value render as "—". Review evidence carries no （摘取兜底） suffix —
-    that S16 marker belongs to M4's scoring sections only (M5 rule, mirrored)."""
+    that S16 marker belongs to M4's scoring sections only (M5 rule, mirrored).
+    v1.9 (T14, deliberate revision of the no-suffix rule): thread-seam placeholder
+    steps (detail.kind == "thread_seam") DO get the 「（线索接缝：被 X 打断）」
+    suffix — without it the reviewer would read the mechanical placeholder as an
+    unexplained jump and call spurious defects."""
     action = transition.action
     target = action.get("target")
     value = action.get("value")
-    return (f"{transition.index}. {action.get('action_type')}"
+    line = (f"{transition.index}. {action.get('action_type')}"
             f"（对象: {'—' if target is None else target}；"
             f"值: {'—' if value is None else value}）"
             f"{action.get('description')}")
+    if transition.detail.get("kind") == "thread_seam":
+        names = "、".join(transition.detail.get("interrupted_by") or ())
+        line += f"（线索接缝：被{names}打断）"
+    return line
 
 
 def normalize_defects(entries: Sequence[Mapping]) -> list[dict]:
@@ -201,15 +212,54 @@ def _session_episodes(batch: Sequence[PipelineItem],
                       session_id: str | None) -> list[PipelineItem]:
     """The session's episode envelopes in batch position order, unique by record
     id — multi fan-out clones share the record id and collapse onto the original
-    (first in batch order), so segment ordinals stay stable under fan-out."""
+    (first in batch order), so segment ordinals stay stable under fan-out.
+    v1.9 (T15, major-5): stitched shells are excluded — a shell's stale member
+    set would otherwise pollute the "第 n 段" ordinals and the margin fates."""
     seen: set[str] = set()
     out: list[PipelineItem] = []
     for it in batch:
         if (it.record.kind == "sequence" and it.session_id == session_id
-                and it.record.id not in seen):
+                and it.status != "stitched" and it.record.id not in seen):
             seen.add(it.record.id)
             out.append(it)
     return out
+
+
+def fragment_structure_text(item: PipelineItem, digest_max_chars: int) -> str:
+    """[片段结构] section body (v1.9 T15 — the seventh §10.5 sequence section):
+    one line per fragment — thread-internal ordinal, member-index span (the
+    rebound-tuple coordinate, contiguous blocks in session order), member count
+    and the fragment's first-frame digest — plus the seam-position table
+    (seam_indexes are LEFT-member indexes = step indexes, m-8). Reads the M16
+    duck marks; a thread the stitch stage never touched (or a pre-surgery
+    mismatch) degrades to a single implied fragment. Pure code over envelope
+    state — zero LLM calls, zero rng."""
+    members = item.record.members
+    fragments = list(getattr(item, "stitch_fragments", ()) or ())
+    counts = [int(f.get("member_count", 0)) for f in fragments]
+    if not fragments or sum(counts) != len(members):
+        counts = [len(members)]                      # single implied fragment
+    lines: list[str] = []
+    start = 0
+    total = len(counts)
+    for k, count in enumerate(counts, 1):
+        end = start + count - 1
+        digest = (frame_digest(members[start], digest_max_chars)
+                  if start < len(members) else "")
+        lines.append(f"碎片 {k}/{total}: 成员 {start}–{end}（{count} 帧）"
+                     f"｜首帧摘要: {digest}")
+        start += count
+    seams = tuple(getattr(item, "seam_indexes", ()) or ())
+    interrupted = tuple(getattr(item, "seam_interrupted_by", ()) or ())
+    if seams:
+        entries = []
+        for j, idx in enumerate(seams):
+            names = "、".join(interrupted[j]) if j < len(interrupted) else ""
+            entries.append(f"步 {idx}（被{names}打断）" if names else f"步 {idx}")
+        lines.append("接缝位置: " + "；".join(entries))
+    else:
+        lines.append("接缝位置: 无")
+    return "\n".join(lines)
 
 
 def boundary_margin_text(item: PipelineItem, batch: Sequence[PipelineItem],
@@ -276,7 +326,8 @@ def render_critiques_text(critiques: Sequence[Mapping]) -> str:
 def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
                         label: str | None = None,
                         transitions: tuple[Transition, ...] | None = None,
-                        boundary_margin: str = "") -> "PromptBundle":
+                        boundary_margin: str = "",
+                        fragment_structure: str = "") -> "PromptBundle":
     """Assemble the §10.5 judge prompt for one (record, annotation-output) pair.
     UI modality carries screenshot + serialized tree parts as in §10.1/§10.2.
     v1.7 (R3): label non-None → the [任务指令] section and extra_criteria take the
@@ -284,11 +335,13 @@ def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
     class_views[label].verify.extra_criteria); None = global config.
     v1.8 (S7, additive trailing kwargs — non-sequence callers byte-unchanged):
     ``record.kind == "sequence"`` selects the §10.5 sequence variant — one user
-    message, six sections in order: [任务指令] → [动作序列] (omitted entirely when
-    transitions is None) → [边界余量] (pre-rendered by the stage driver, which
-    holds the batch context) → [首帧截图] + image → [末帧截图] + image → [标注结果];
-    text-modality sequences degrade without the screenshot sections (the M5 S6
-    precedent — frames carry no images)."""
+    message, sections in order: [任务指令] → [动作序列] (omitted entirely when
+    transitions is None) → v1.9 [片段结构] (T15: pre-rendered by the stage driver
+    from the M16 duck marks, omitted entirely when empty — stitch off keeps the
+    six-section v1.8 form byte-identical) → [边界余量] (pre-rendered by the stage
+    driver, which holds the batch context) → [首帧截图] + image → [末帧截图] +
+    image → [标注结果]; text-modality sequences degrade without the screenshot
+    sections (the M5 S6 precedent — frames carry no images)."""
     from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
 
     if label is not None:
@@ -308,6 +361,9 @@ def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
         if transitions is not None:  # section omitted entirely when None
             steps = "\n".join(sequence_step_line(t) for t in transitions)
             parts.append(Part(kind="text", text=f"{_LABEL_ACTION_SEQUENCE}\n{steps}"))
+        if fragment_structure:  # v1.9 seventh section (stitch on only, T15)
+            parts.append(Part(kind="text",
+                              text=f"{_LABEL_FRAGMENT_STRUCTURE}\n{fragment_structure}"))
         parts.append(Part(kind="text",
                           text=f"{_LABEL_BOUNDARY_MARGIN}\n{boundary_margin}"))
         if record.modality == "ui":
@@ -752,13 +808,18 @@ class VerifyStage:
                               batch: list[PipelineItem], ctx: "RunContext"):
         margin = boundary_margin_text(state.item, batch,
                                       self.cfg.segment.digest_max_chars)
+        structure = (fragment_structure_text(state.item,
+                                             self.cfg.stitch.digest_max_chars)
+                     if self.cfg.stitch.enabled else "")   # v1.9 (T15/m-11)
         return await self._judge_round_sequence(
             state.item, state.item.annotation, state.rounds + 1, ctx,
-            label=state.label, boundary_margin=margin)
+            label=state.label, boundary_margin=margin,
+            fragment_structure=structure)
 
     async def _judge_round_sequence(
         self, item: PipelineItem, annotation: Annotation, round_no: int,
         ctx: "RunContext", label: str | None = None, boundary_margin: str = "",
+        fragment_structure: str = "",
     ) -> tuple[str, list[dict], list[dict], list[dict]]:
         """One sequence review round: the _judge_round skeleton with the schema
         swapped to defect_verdict_schema(), critiques collected unchanged, and
@@ -773,7 +834,8 @@ class VerifyStage:
         record = item.record
         prompt = build_verify_prompt(record, annotation.output, ctx.cfg, label=label,
                                      transitions=item.transitions,
-                                     boundary_margin=boundary_margin)
+                                     boundary_margin=boundary_margin,
+                                     fragment_structure=fragment_structure)
         schema = defect_verdict_schema()
         results = await asyncio.gather(
             *(
@@ -849,6 +911,12 @@ class VerifyStage:
             kind = defect["kind"]
             if kind == "label_mismatch":
                 state.needs_reannotate = True
+                continue
+            if kind == "wrong_stitch":
+                # v1.9 (T15): INDEPENDENT mark-only + fail branch — no unstitch
+                # surgery exists (§4 non-goal 4), the defect stays in the table,
+                # triggers no repair action, and the fail verdict stands. NOT in
+                # _MISSING_KINDS: it must never enter the reclaim scan below.
                 continue
             if clone:
                 # Mark-only downgrade; the missing_* kinds count as mark-only
@@ -1083,9 +1151,16 @@ class VerifyStage:
             previous_output=state.item.annotation.output,
             critiques_text=render_critiques_text(state.fail_critiques),
         )
+        # v1.9 (T14 穿参义务): the per-fragment keyframe quota travels from the
+        # M16 duck mark into BOTH annotate call sites — dropping it here would
+        # silently downgrade repair re-annotation to the uniform downsample.
+        fragments = getattr(state.item, "stitch_fragments", None)
+        fragment_lens = (tuple(int(f["member_count"]) for f in fragments)
+                         if fragments else None)
         return await annotate_record(state.item.record, ctx, repair,
                                      label=state.label,
-                                     transitions=state.item.transitions)
+                                     transitions=state.item.transitions,
+                                     fragment_lens=fragment_lens)
 
     def _finalize_episode(self, state: _EpisodeReview, ctx: "RunContext") -> None:
         # verify.defects.<kind> is counted at review time (D4), not here —

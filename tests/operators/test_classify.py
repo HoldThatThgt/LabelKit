@@ -30,6 +30,7 @@ from labelkit.common.config.model import (
     Rubric,
     RunConfig,
     SegmentConfig,
+    StitchConfig,
     StreamConfig,
     ToolConfig,
     TraceConfig,
@@ -82,6 +83,7 @@ def make_cfg(*, modality="text", assignment="single", max_labels=None,
         stream=StreamConfig(),
         dedup=DedupConfig(),
         segment=SegmentConfig(),
+        stitch=StitchConfig(),
         extract=ExtractConfig(),
         classify=ClassifyConfig(enabled=True, llm="default", assignment=assignment,
                                 max_labels=max_labels, instruction=instruction,
@@ -576,6 +578,34 @@ def test_stage_multi_fan_out_clones_inherit_episode_marks():
     (clone2,) = batch2[1:]
     assert not hasattr(clone2, "session_split")
     assert not hasattr(clone2, "segment_degraded")
+
+
+def test_stage_multi_fan_out_clones_inherit_stitch_marks():
+    """v1.9 (T14): thread_id rides the clone constructor (a REAL field) and the
+    three M16 duck marks join the copy loop — a sibling must extract its own
+    seam placeholders and render the same _meta.stream.fragments."""
+    cfg = make_cfg(assignment="multi", classes=CLASSES4, max_labels=4)
+    rec = text_record()
+    item = PipelineItem(record=rec, session_id="sess-0042", thread_id=rec.id)
+    item.seam_indexes = (1,)
+    item.seam_interrupted_by = (("打车",),)
+    item.stitch_fragments = ({"order_span": [0, 1], "member_count": 2,
+                              "cause": "origin", "source_episode": rec.id},)
+    batch = [item]
+    run_stage(cfg, batch, MapEngine({rec.id: {"classes": ["code", "qa"]}}))
+    (clone,) = batch[1:]
+    assert clone.thread_id == rec.id
+    assert clone.seam_indexes == (1,)
+    assert clone.seam_interrupted_by == (("打车",),)
+    assert clone.stitch_fragments == item.stitch_fragments
+    # unmarked originals leave the clone unmarked (thread_id stays None)
+    plain = PipelineItem(record=text_record(rid="rec8", text="又一条"))
+    batch2 = [plain]
+    run_stage(cfg, batch2, MapEngine({"rec8": {"classes": ["code", "qa"]}}))
+    (clone2,) = batch2[1:]
+    assert clone2.thread_id is None
+    assert not hasattr(clone2, "seam_indexes")
+    assert not hasattr(clone2, "stitch_fragments")
 
 
 def test_stage_multi_append_order_batch_position_then_declaration():

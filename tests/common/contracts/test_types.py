@@ -258,11 +258,11 @@ class TestFrozen:
 
 class TestStatusEnum:
     def test_status_literal_full_set(self):
-        # spec §4.1 (v1.8): exactly seven values — absorbed / dropped_noise joined
+        # spec §4.1 (v1.9): exactly eight values — stitched joined (T7)
         assert frozenset(get_args(Status)) == frozenset({
             "active", "dropped_dup", "dropped_lowq", "dropped_verify",
-            "failed", "absorbed", "dropped_noise"})
-        assert len(get_args(Status)) == 7
+            "failed", "absorbed", "dropped_noise", "stitched"})
+        assert len(get_args(Status)) == 8
 
 
 class TestTransition:
@@ -310,6 +310,7 @@ class TestStreamEnvelopeFields:
         item = PipelineItem(record=_record())
         assert item.transitions is None
         assert item.session_id is None
+        assert item.thread_id is None          # v1.9: unstamped until M16
 
     def test_pipeline_item_stream_fields_writable(self):
         item = PipelineItem(record=_record())
@@ -318,6 +319,16 @@ class TestStreamEnvelopeFields:
                                        attempts=1, detail={}),)
         assert item.session_id == "s-0001"
         assert len(item.transitions) == 1
+
+    def test_pipeline_item_thread_id_constructor_and_write(self):
+        # v1.9 (T22): thread_id is a REAL field (classify._fan_out passes it in
+        # the constructor); M16 stamps it == record.id on thread survivors.
+        rec = _record()
+        via_ctor = PipelineItem(record=rec, thread_id=rec.id)
+        assert via_ctor.thread_id == rec.id
+        item = PipelineItem(record=rec)
+        item.thread_id = rec.id
+        assert item.thread_id == rec.id
 
     def test_verification_result_defects_default(self):
         vr = VerificationResult(verdict="pass", rounds=1, critiques=())

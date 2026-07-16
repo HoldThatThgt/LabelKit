@@ -16,6 +16,7 @@ Status = Literal[
     "failed",          # processing error (irreparable schema / provider retries exhausted ...)
     "absorbed",        # v1.8: member frame absorbed into an episode (M14; neither output channel)
     "dropped_noise",   # v1.8: noise frame (M14 interruption / below_min_len; M7 member shrink)
+    "stitched",        # v1.9: merged-fragment episode shell (M16; terminal, neither channel)
 ]
 
 
@@ -396,7 +397,9 @@ class Transition:                          # v1.8: one M15 extract verdict for a
                                            # {"action_type","target","value","description"}
     model: str                             # provider model string of the extracting profile
     attempts: int                          # 1 + L3 repair calls
-    detail: Mapping                        # fallback trace {"kind","message"} / {"reseamed": True};
+    detail: Mapping                        # fallback trace {"kind","message"} / {"reseamed": True} /
+                                           # v1.9 thread-seam placeholder {"kind": "thread_seam",
+                                           # "interrupted_by": [...]} (T10, zero-LLM);
                                            # {} for a clean extraction
 
 
@@ -412,4 +415,8 @@ class PipelineItem:                        # the ONLY mutable envelope; lifetime
     errors: list[StageError] = field(default_factory=list)
     session_id: str | None = None          # v1.8: stamped by M10 at envelope construction (stream
                                            # mode); M14 groups by it, M7 repair queries neighbors
+    thread_id: str | None = None           # v1.9: stamped by M16 stitch on surviving thread
+                                           # envelopes (== record.id == episode_id, T22); duck marks
+                                           # seam_indexes / seam_interrupted_by / stitch_fragments
+                                           # travel alongside (T20, copied by classify._fan_out)
     transitions: tuple[Transition, ...] | None = None   # v1.8: written by M15 extract

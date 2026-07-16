@@ -94,6 +94,14 @@ class ErrorKind(str, enum.Enum):
                                                              # action_type="other" (trace in
                                                              # Transition.detail, not item.errors);
                                                              # "fail" = episode failed → rejects
+    STITCH_INVALID = "stitch_invalid"                        # v1.9: M16, M8 repair exhausted —
+                                                             # "keep" = episode candidate opens its
+                                                             # own thread (evidence via error event
+                                                             # + stitch.failures, never item.errors);
+                                                             # "fail" = episode-candidate envelope
+                                                             # failed → rejects (member frames stay
+                                                             # absorbed; rescue candidates never
+                                                             # take the fail path, B-2)
     JUDGMENT_INVALID = "judgment_invalid"                    # M4, comparison-level → counts as tie
     SCHEMA_VIOLATION = "schema_violation"                    # M8 L3 exhausted → failed → rejects
     CALLBACK_VIOLATION = "callback_violation"                # v1.5: L3 exhausted, remaining

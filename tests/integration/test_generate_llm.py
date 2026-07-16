@@ -176,6 +176,7 @@ def _mk_cfg():
                                        ExtractConfig, GenerateConfig, InputConfig,
                                        OutputConfig, QualityConfig, ResolvedConfig,
                                        Rubric, RunConfig, SegmentConfig,
+                                       StitchConfig,
                                        StreamConfig, ToolConfig, TraceConfig,
                                        VerifyConfig)
     generate = GenerateConfig(
@@ -193,7 +194,8 @@ def _mk_cfg():
         run=RunConfig(output="out.jsonl", modality="text", mode="generate_only", seed=0),
         input=InputConfig(text_field="instruction"),
         stream=StreamConfig(),
-        dedup=DedupConfig(), segment=SegmentConfig(), extract=ExtractConfig(),
+        dedup=DedupConfig(), segment=SegmentConfig(), stitch=StitchConfig(),
+        extract=ExtractConfig(),
         classify=ClassifyConfig(),
         quality=QualityConfig(), generate=generate,
         annotate=AnnotateConfig(), verify=VerifyConfig(),

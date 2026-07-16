@@ -89,6 +89,7 @@ def test_error_kind_values_are_the_frozen_wire_codes():
         "CLASSIFICATION_INVALID": "classification_invalid",
         "SEGMENTATION_INVALID": "segmentation_invalid",
         "EXTRACTION_INVALID": "extraction_invalid",
+        "STITCH_INVALID": "stitch_invalid",
         "JUDGMENT_INVALID": "judgment_invalid",
         "SCHEMA_VIOLATION": "schema_violation",
         "CALLBACK_VIOLATION": "callback_violation",

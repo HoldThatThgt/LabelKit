@@ -13,7 +13,9 @@ annotate.sequence_frames; text-modality sequences skip ②) → ③ the ALWAYS-P
 [成员帧摘要] text part. Template invariant (S6): the final part is ALWAYS the ③ text
 section — the repair suffix concatenates onto parts[-1].text with zero repair-code
 changes. transitions is the second additive trailing kwarg on the two frozen signatures
-(after v1.7's label); None keeps every pre-v1.8 call site byte-identical.
+(after v1.7's label); None keeps every pre-v1.8 call site byte-identical. v1.9 (T14)
+appends the third: fragment_lens — per-fragment keyframe quotas for stitched threads
+(every fragment keeps ≥ 1 keyframe); None keeps the v1.8 uniform downsample.
 """
 from __future__ import annotations
 
@@ -83,14 +85,47 @@ def _step_line(transition: Transition) -> str:
             f"{action.get('description')}")
 
 
-def _keyframe_indexes(n: int, k: int) -> list[int]:
-    """S28 deterministic uniform downsample over n members with cap k
+def _keyframe_indexes(n: int, k: int,
+                      fragment_lens: Sequence[int] | None = None) -> list[int]:
+    """S28 deterministic downsample over n members with cap k
     (annotate.sequence_frames): n <= k keeps every member; otherwise
     idx_i = i*(n-1)//(k-1) for i = 0..k-1 — pure integer arithmetic, zero rng, first and
-    last always kept, strictly increasing (no duplicates for n > k)."""
+    last always kept, strictly increasing (no duplicates for n > k).
+
+    v1.9 (T14, per-fragment quota): fragment_lens — the thread's per-fragment
+    member counts in member-tuple order (fragments are contiguous session-order
+    blocks) — upgrades the downsample so EVERY fragment keeps ≥ 1 keyframe
+    (uniform sampling would drain small fragments whole, minor-8). Quota:
+    each of the m fragments gets 1 + a largest-remainder share of the k − m
+    surplus weighted by (Lᵢ − 1) (ties → lower fragment index); inside a
+    fragment the S28 uniform formula runs locally (quota 1 keeps the fragment's
+    FIRST member — last fragment keeps its LAST, so the global first/last
+    invariant holds). Degrades to the v1.8 uniform path when fragment_lens is
+    absent/single/inconsistent or k < m (the ≥ 1 guarantee is infeasible)."""
     if n <= k:
         return list(range(n))
-    return [i * (n - 1) // (k - 1) for i in range(k)]
+    if (not fragment_lens or len(fragment_lens) <= 1
+            or sum(fragment_lens) != n or len(fragment_lens) > k):
+        return [i * (n - 1) // (k - 1) for i in range(k)]
+    m = len(fragment_lens)
+    extra_total = k - m
+    weight_total = n - m                       # Σ (Lᵢ − 1) ≥ 1 since n > k ≥ m
+    base = [(length - 1) * extra_total // weight_total for length in fragment_lens]
+    remainders = [(length - 1) * extra_total % weight_total
+                  for length in fragment_lens]
+    leftover = extra_total - sum(base)
+    granted = set(sorted(range(m), key=lambda i: (-remainders[i], i))[:leftover])
+    out: list[int] = []
+    start = 0
+    for i, length in enumerate(fragment_lens):
+        quota = 1 + base[i] + (1 if i in granted else 0)
+        if quota == 1:
+            picks = [length - 1] if i == m - 1 else [0]
+        else:
+            picks = [j * (length - 1) // (quota - 1) for j in range(quota)]
+        out.extend(start + p for p in picks)
+        start += length
+    return out
 
 
 def _member_digest_lines(members: tuple[Record, ...], max_total_chars: int) -> list[str]:
@@ -128,7 +163,8 @@ def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: st
                           repair: RepairContext | None = None,
                           temperature: float | None = None,
                           label: str | None = None,
-                          transitions: tuple[Transition, ...] | None = None) -> PromptBundle:
+                          transitions: tuple[Transition, ...] | None = None,
+                          fragment_lens: tuple[int, ...] | None = None) -> PromptBundle:
     """Deterministic template assembly per CONTRACTS.md §10.1 (+ §10.5 repair suffix).
 
     schema_text = SchemaEngine.user_schema_text. Section order is fixed: system (task
@@ -143,6 +179,9 @@ def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: st
     keyframes (text label + image; S28 downsample to annotate.sequence_frames; skipped in
     text modality) → ③ ALWAYS-PRESENT closing [成员帧摘要] text part, so parts[-1] is
     guaranteed text and the repair concatenation below needs zero changes.
+    v1.9 (T14, THIRD additive trailing kwarg — the S5 form): fragment_lens non-None →
+    the ② keyframe downsample runs per-fragment quotas (every fragment keeps ≥ 1
+    keyframe); None = the v1.8 uniform downsample byte-identical.
     """
     acfg = cfg.class_views[label].annotate if label is not None else cfg.annotate
     messages: list[Message] = []
@@ -163,7 +202,8 @@ def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: st
             steps = "\n".join(_step_line(t) for t in transitions)
             seq_parts.append(Part(kind="text", text=f"{_LABEL_ACTION_SEQUENCE}\n{steps}"))
         if record.modality == "ui":  # ② text sequences degrade to ① + ③
-            kept = _keyframe_indexes(len(record.members), cfg.annotate.sequence_frames)
+            kept = _keyframe_indexes(len(record.members),
+                                     cfg.annotate.sequence_frames, fragment_lens)
             k = len(kept)
             for i, m_idx in enumerate(kept, start=1):
                 member = record.members[m_idx]
@@ -298,7 +338,8 @@ def _majority_vote(samples: Sequence[Mapping],
 async def annotate_record(record: Record, ctx: "RunContext",
                           repair: RepairContext | None = None,
                           label: str | None = None,
-                          transitions: tuple[Transition, ...] | None = None) -> Annotation:
+                          transitions: tuple[Transition, ...] | None = None,
+                          fragment_lens: tuple[int, ...] | None = None) -> Annotation:
     """One record's full annotation path incl. self-consistency (skipped when repair is
     not None: repair re-annotation is always a single call at profile-default temperature).
     Raises SchemaViolation / ProviderRetryableError / ProviderFatalError.
@@ -308,7 +349,10 @@ async def annotate_record(record: Record, ctx: "RunContext",
     build_annotate_prompt on every path (single call, each self-consistency sample, and
     repair re-annotation — M7 threads the REBUILT value after member surgery); None =
     pre-v1.8 behavior. Sequence records carry raw = None, so the L2.5 callback receives
-    record=None (documented limitation)."""
+    record=None (documented limitation).
+    v1.9 (T14, third additive trailing kwarg): fragment_lens is passed through on every
+    path the same way — both call sites (M5 main, M7 repair re-annotation) thread it
+    from the M16 stitch_fragments duck mark; None = pre-v1.9 behavior."""
     cfg = ctx.cfg
     profile = cfg.annotate.llm
     schema_text = ctx.schema_engine.user_schema_text
@@ -317,7 +361,8 @@ async def annotate_record(record: Record, ctx: "RunContext",
     if repair is not None or n == 0:
         prompt = build_annotate_prompt(record, cfg, schema_text, repair=repair,
                                        temperature=None, label=label,
-                                       transitions=transitions)
+                                       transitions=transitions,
+                                       fragment_lens=fragment_lens)
         obj, usage, attempts, model = await ctx.schema_engine.complete_validated(
             profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
             record=record.raw)
@@ -328,7 +373,8 @@ async def annotate_record(record: Record, ctx: "RunContext",
     async def one_sample() -> tuple[dict, Usage, int, str]:
         prompt = build_annotate_prompt(record, cfg, schema_text, repair=None,
                                        temperature=cfg.annotate.sc_temperature,
-                                       label=label, transitions=transitions)
+                                       label=label, transitions=transitions,
+                                       fragment_lens=fragment_lens)
         return await ctx.schema_engine.complete_validated(
             profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
             record=record.raw)
@@ -380,9 +426,14 @@ class AnnotateStage:
     async def _annotate_item(self, item: PipelineItem, ctx: "RunContext") -> None:
         record = item.record
         label = item.classification.label if item.classification else None
+        # v1.9 (T14): the per-fragment keyframe quota rides the M16 duck mark.
+        fragments = getattr(item, "stitch_fragments", None)
+        fragment_lens = (tuple(int(f["member_count"]) for f in fragments)
+                         if fragments else None)
         try:
             item.annotation = await annotate_record(record, ctx, label=label,
-                                                    transitions=item.transitions)
+                                                    transitions=item.transitions,
+                                                    fragment_lens=fragment_lens)
         except SchemaViolation as e:
             # Transport the raw last model output to M11 for the rejects "full"
             # tier (§9.2) via the duck-typed channel the emitter reads.

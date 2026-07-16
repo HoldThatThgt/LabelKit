@@ -44,6 +44,7 @@ from labelkit.common.config.model import (
     Rubric,
     RunConfig,
     SegmentConfig,
+    StitchConfig,
     StreamConfig,
     ToolConfig,
     TraceConfig,
@@ -111,6 +112,7 @@ def make_cfg(quality: QualityConfig, criteria: tuple[Criterion, ...] = (EDU,),
         stream=StreamConfig(),
         dedup=DedupConfig(),
         segment=SegmentConfig(),
+        stitch=StitchConfig(),
         extract=ExtractConfig(),
         classify=ClassifyConfig(),
         quality=quality,
@@ -970,6 +972,33 @@ def test_sequence_record_parts_pure_text_sections_and_step_lines():
     assert lines[6] == "[成员帧摘要]"
     assert lines[7:] == [f"{m}. {frame_digest(member, 400)}"
                          for m, member in enumerate(ep.members, start=1)]
+
+
+def test_step_line_thread_seam_suffix_parallel_to_fallback():
+    """v1.9 (T14): thread-seam placeholder steps carry the
+    「（线索接缝：被 X 打断）」 suffix — parallel to the （摘取兜底） branch, so the
+    trajectory rubric's noise_residue/coherence criteria never read the seam as
+    noise residue or an unexplained jump."""
+    from labelkit.operators.quality import _step_line
+
+    seam = Transition(index=2,
+                      action={"action_type": "app_switch", "target": None,
+                              "value": None,
+                              "description": "线索接缝：被打车打断后恢复"},
+                      model="", attempts=0,
+                      detail={"kind": "thread_seam", "interrupted_by": ["打车"]})
+    assert _step_line(seam) == ("2. app_switch（对象: —；值: —）"
+                                "线索接缝：被打车打断后恢复（线索接缝：被打车打断）")
+    multi = Transition(index=4,
+                       action={"action_type": "app_switch", "target": None,
+                               "value": None,
+                               "description": "线索接缝：被打车、社交打断后恢复"},
+                       model="", attempts=0,
+                       detail={"kind": "thread_seam",
+                               "interrupted_by": ["打车", "社交"]})
+    assert _step_line(multi).endswith("（线索接缝：被打车、社交打断）")
+    # the fallback branch is untouched (S16 regression anchor)
+    assert _step_line(SEQ_TRANSITIONS[2]) == STEP_LINES[2]
 
 
 def test_sequence_record_parts_omit_steps_when_transitions_none():

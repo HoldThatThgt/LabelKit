@@ -14,6 +14,8 @@ def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
     llm_names: list[str] = []
     if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
         llm_names.append(cfg.segment.llm)
+    if cfg.stitch.enabled:
+        llm_names.append(cfg.stitch.llm)
     if cfg.classify.enabled:
         llm_names.append(cfg.classify.llm)
     if cfg.extract.enabled:

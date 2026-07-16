@@ -29,6 +29,7 @@ from labelkit.common.config.model import (
     Rubric,
     RunConfig,
     SegmentConfig,
+    StitchConfig,
     StreamConfig,
     ToolConfig,
     TraceConfig,
@@ -81,6 +82,7 @@ def make_cfg(*, include_diff=True, instruction="", on_error="fallback",
         stream=StreamConfig(),
         dedup=DedupConfig(),
         segment=SegmentConfig(enabled=True),
+        stitch=StitchConfig(),
         extract=ExtractConfig(enabled=True, llm="default", instruction=instruction,
                               include_diff=include_diff, on_error=on_error),
         classify=ClassifyConfig(),
@@ -508,3 +510,75 @@ def test_multi_siblings_extract_independently_per_label():
     assert ctx.metrics.counters["extract.transitions"] == 2
     steps = [e for e in ctx.metrics.events if e[0] == "extract.step"]
     assert [s[3]["episode_id"] for s in steps] == [rec.id, rec.id]
+
+
+# ── v1.9 stitch seams (T10/T20): zero-LLM placeholders + counter exclusion ───
+
+def test_seam_indexes_take_placeholder_and_skip_llm():
+    """Pairs at seam_indexes never reach the LLM: the T10 four-key placeholder
+    lands at the pinned index, detail carries kind/interrupted_by, and the
+    len(transitions) == len(members) − 1 invariant holds."""
+    frames = [frame(f"f{i}" * 8, f"页面{i}", pair_index=i) for i in range(4)]
+    item = PipelineItem(record=episode(frames))
+    item.seam_indexes = (1,)
+    item.seam_interrupted_by = (("打车",),)
+    engine = QueueEngine([INPUT, CLICK])               # pairs 0 and 2 only
+    out, ctx = run_stage(make_cfg(), [item], engine)
+    assert len(engine.calls) == 2                      # seam pair judged ZERO times
+    called_pairs = [c[3] for c in engine.calls]
+    assert (frames[1].id, frames[2].id) not in called_pairs
+    assert len(item.transitions) == 3
+    assert [t.index for t in item.transitions] == [0, 1, 2]
+    seam = item.transitions[1]
+    assert seam.action == {"action_type": "app_switch", "target": None,
+                           "value": None,
+                           "description": "线索接缝：被打车打断后恢复"}
+    assert seam.detail == {"kind": "thread_seam", "interrupted_by": ["打车"]}
+    assert (seam.model, seam.attempts) == ("", 0)      # no call was ever made
+    assert [t.action for t in (item.transitions[0], item.transitions[2])] == [
+        INPUT, CLICK]
+
+
+def test_seam_placeholders_excluded_from_counters_and_events():
+    """T20 计数器口径: seam placeholders never feed extract.transitions /
+    by_type.* (their zero-LLM app_switch must not pollute the histogram) nor
+    the extract.step event — the seam's metering point is stream.stitch.seams."""
+    frames = [frame(f"f{i}" * 8, f"页面{i}", pair_index=i) for i in range(3)]
+    item = PipelineItem(record=episode(frames))
+    item.seam_indexes = (0,)
+    item.seam_interrupted_by = (("打车", "社交"),)
+    engine = QueueEngine([CLICK])                      # pair 1 only
+    out, ctx = run_stage(make_cfg(), [item], engine)
+    assert ctx.metrics.counters["extract.transitions"] == 1
+    assert ctx.metrics.counters["extract.by_type.click"] == 1
+    assert "extract.by_type.app_switch" not in ctx.metrics.counters
+    steps = [e for e in ctx.metrics.events if e[0] == "extract.step"]
+    assert len(steps) == 1 and steps[0][3]["index"] == 1
+    # multiple interrupters render 、-joined in gap order
+    assert item.transitions[0].action["description"] == (
+        "线索接缝：被打车、社交打断后恢复")
+
+
+def test_multiple_seams_and_all_seam_episode_zero_calls():
+    frames = [frame(f"f{i}" * 8, f"页面{i}", pair_index=i) for i in range(3)]
+    item = PipelineItem(record=episode(frames))
+    item.seam_indexes = (0, 1)
+    item.seam_interrupted_by = (("打车",), ("社交",))
+    out, ctx = run_stage(make_cfg(), [item], ExplodingEngine())   # zero LLM
+    assert len(item.transitions) == 2
+    assert all(t.detail["kind"] == "thread_seam" for t in item.transitions)
+    assert item.transitions[0].detail["interrupted_by"] == ["打车"]
+    assert item.transitions[1].detail["interrupted_by"] == ["社交"]
+    assert "extract.transitions" not in ctx.metrics.counters
+
+
+def test_no_seam_marks_keeps_v18_path_byte_identical():
+    """Regression anchor: without seam duck marks the flat-gather accounting
+    behaves exactly as v1.8 (one coroutine per pair, all steps counted)."""
+    frames = [frame(f"f{i}" * 8, f"页面{i}", pair_index=i) for i in range(3)]
+    item = PipelineItem(record=episode(frames))
+    engine = QueueEngine([INPUT, CLICK])
+    out, ctx = run_stage(make_cfg(), [item], engine)
+    assert len(engine.calls) == 2
+    assert [t.action for t in item.transitions] == [INPUT, CLICK]
+    assert ctx.metrics.counters["extract.transitions"] == 2

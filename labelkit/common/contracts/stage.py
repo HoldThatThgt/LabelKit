@@ -44,6 +44,15 @@ class Stage(Protocol):
            返回值仍须是传入的同一列表对象。M7 修复路径豁免：verify 的缺陷修复可在本批内
            将成员信封状态在 absorbed 与 dropped_noise 间双向改写（成员回收/收缩），
            此为契约①的唯一反向豁免；禁止将成员信封翻回 active；
+           ②c stitch 例外（v1.9，仅 stream 模式）——stitch 获授权恰好三件事（T6）：
+           ①将被并入的 episode 序列信封置 status='stitched'（壳终态）；②以成员并集
+           重绑幸存信封的 Record（成员按会话序键升序拼接，record.id 不重算——M7 手术
+           先例，thread_id == 幸存信封 record.id == episode_id）；③将 below_min_len
+           来源帧由 dropped_noise 翻回 absorbed（仅限救援命中——②b 双向豁免的 M16
+           延伸）。幸存者规范（m-7）：一遍中幸存信封恒为线索创始信封（开线索者），
+           被并候选信封作壳；二遍复评方向相反——单碎片线索候选信封作壳、目标线索信封
+           幸存。不追加、不删除、不重排、不替换任何元素对象；返回值仍须是传入的同一
+           列表对象；
            ③ generate 例外——返回新增子批（原批元素不修改）；④ 单条失败不得抛出到批层面，
            必须落入 item.errors 并置 status='failed'。"""
         ...

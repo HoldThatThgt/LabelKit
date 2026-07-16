@@ -38,6 +38,7 @@ from labelkit.common.config.model import (
     Rubric,
     RunConfig,
     SegmentConfig,
+    StitchConfig,
     StreamConfig,
     ToolConfig,
     TraceConfig,
@@ -71,7 +72,8 @@ SCHEMA_TEXT = json.dumps(USER_SCHEMA, ensure_ascii=False, separators=(", ", ": "
 
 def make_cfg(*, modality="text", instruction="你是意图标注员。", examples=(),
              self_consistency=0, ui_tree_max_chars=30000,
-             user_schema=USER_SCHEMA, trace=None) -> ResolvedConfig:
+             user_schema=USER_SCHEMA, trace=None,
+             sequence_frames=20) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
         llm_profiles={},
@@ -81,13 +83,15 @@ def make_cfg(*, modality="text", instruction="你是意图标注员。", example
         stream=StreamConfig(),
         dedup=DedupConfig(),
         segment=SegmentConfig(),
+        stitch=StitchConfig(),
         extract=ExtractConfig(),
         classify=ClassifyConfig(),
         quality=QualityConfig(),
         generate=GenerateConfig(),
         annotate=AnnotateConfig(enabled=True, llm="default", instruction=instruction,
                                 examples=tuple(examples),
-                                self_consistency=self_consistency),
+                                self_consistency=self_consistency,
+                                sequence_frames=sequence_frames),
         verify=VerifyConfig(),
         output=OutputConfig(schema_inline=json.dumps(user_schema)),
         trace=trace or TraceConfig(),
@@ -668,6 +672,60 @@ def test_keyframe_downsample_endpoints_monotonic_no_rng():
         assert len(idx) == min(n, k)
 
 
+# ── v1.9 (T14): per-fragment keyframe quota ─────────────────────────────────
+
+def test_keyframe_quota_every_fragment_keeps_at_least_one():
+    """The minor-8 counterexample: a small fragment that the uniform formula
+    drains whole must keep ≥ 1 keyframe under the quota path."""
+    # fragments 20 + 2 + 3 = 25 members, k = 4: uniform picks [0, 8, 16, 24]
+    # — nothing from the 2-member middle fragment
+    uniform = _keyframe_indexes(25, 4)
+    assert not any(20 <= i < 22 for i in uniform)
+    quota = _keyframe_indexes(25, 4, (20, 2, 3))
+    assert len(quota) == 4
+    assert any(20 <= i < 22 for i in quota)      # middle fragment survives
+    assert quota[0] == 0 and quota[-1] == 24     # global first/last invariant
+    assert quota == sorted(set(quota))
+
+
+def test_keyframe_quota_largest_remainder_distribution():
+    # n=10, k=5, fragments (6, 2, 2): surplus 2 over weights (5, 1, 1) →
+    # base [1, 0, 0] + leftover 1 by largest remainder (3/7 vs 2/7) → frag 1
+    idx = _keyframe_indexes(10, 5, (6, 2, 2))
+    assert len(idx) == 5
+    assert idx[0] == 0 and idx[-1] == 9
+    per_fragment = [sum(1 for i in idx if lo <= i < hi)
+                    for lo, hi in ((0, 6), (6, 8), (8, 10))]
+    assert per_fragment == [3, 1, 1]             # every fragment ≥ 1
+    # quota-1 middle fragment keeps its FIRST member; last fragment keeps LAST
+    assert 6 in idx and 9 in idx
+
+
+def test_keyframe_quota_degrades_to_uniform_when_infeasible_or_absent():
+    uniform = _keyframe_indexes(25, 4)
+    assert _keyframe_indexes(25, 4, None) == uniform
+    assert _keyframe_indexes(25, 4, (25,)) == uniform          # single fragment
+    assert _keyframe_indexes(25, 4, (10, 10)) == uniform       # sum mismatch
+    assert _keyframe_indexes(25, 4, (5,) * 5) == uniform       # k < m infeasible
+    # n <= k keeps everything regardless of fragments
+    assert _keyframe_indexes(4, 20, (2, 2)) == [0, 1, 2, 3]
+
+
+def test_keyframe_quota_invariants_across_shapes():
+    for n, k, lens in ((25, 20, (20, 2, 3)), (30, 5, (1, 1, 27, 1)),
+                       (12, 6, (4, 4, 4)), (9, 3, (3, 3, 3)),
+                       (40, 7, (35, 2, 3))):
+        idx = _keyframe_indexes(n, k, lens)
+        assert len(idx) == k
+        assert idx[0] == 0 and idx[-1] == n - 1
+        assert idx == sorted(set(idx))
+        bounds, start = [], 0
+        for length in lens:
+            bounds.append((start, start + length))
+            start += length
+        assert all(any(lo <= i < hi for i in idx) for lo, hi in bounds)
+
+
 # ── sequence template: ①②③ order + text-final invariant (S6) ────────────────
 
 def test_sequence_template_three_sections_in_order():
@@ -718,6 +776,56 @@ def test_sequence_template_downsamples_25_members_to_20_keyframes():
     assert parts[-1].kind == "text"
     # ③ still digests EVERY member, not just the kept keyframes
     assert parts[-1].text == digest_section(ep)
+
+
+def test_sequence_template_fragment_lens_selects_quota_keyframes():
+    """v1.9 (T14, third additive trailing kwarg): fragment_lens switches the ②
+    keyframe selection to per-fragment quotas; None keeps the v1.8 uniform
+    downsample byte-identical."""
+    cfg = make_cfg(modality="ui", sequence_frames=4)
+    ep = ui_episode(25)
+    quota = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
+                                  transitions=SEQ_TRANSITIONS,
+                                  fragment_lens=(20, 2, 3))
+    kept = _keyframe_indexes(25, 4, (20, 2, 3))
+    images = [p for p in quota.messages[-1].parts if p.kind == "image"]
+    assert [p.image for p in images] == [ep.members[m].image for m in kept]
+    assert any(20 <= m < 22 for m in kept)                 # small fragment kept
+    plain = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
+                                  transitions=SEQ_TRANSITIONS)
+    uniform = _keyframe_indexes(25, 4)
+    images_plain = [p for p in plain.messages[-1].parts if p.kind == "image"]
+    assert [p.image for p in images_plain] == [ep.members[m].image
+                                               for m in uniform]
+
+
+def test_stage_threads_fragment_lens_from_stitch_duck_mark():
+    """v1.9 (T14 穿参义务, M5 main call site): the stage derives fragment_lens
+    from the stitch_fragments duck mark and threads it into the prompt — the
+    quota keyframe set reaches the request."""
+    import asyncio
+    from types import SimpleNamespace
+    from labelkit.common.contracts.types import PipelineItem
+
+    cfg = make_cfg(modality="ui", sequence_frames=4)
+    ep = ui_episode(25)
+    item = PipelineItem(record=ep)
+    item.stitch_fragments = (
+        {"order_span": [0, 19], "member_count": 20, "cause": "origin",
+         "source_episode": ep.id},
+        {"order_span": [25, 26], "member_count": 2, "cause": "resumed",
+         "source_episode": "f" * 16},
+        {"order_span": [30, 32], "member_count": 3, "cause": "rescued",
+         "source_episode": None},
+    )
+    engine, metrics = _CapturingEngine(), _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
+    assert item.annotation is not None
+    prompt = engine.prompts[0]
+    images = [p for p in prompt.messages[-1].parts if p.kind == "image"]
+    kept = _keyframe_indexes(25, 4, (20, 2, 3))
+    assert [p.image for p in images] == [ep.members[m].image for m in kept]
 
 
 def test_text_sequence_degrades_to_steps_plus_digest():

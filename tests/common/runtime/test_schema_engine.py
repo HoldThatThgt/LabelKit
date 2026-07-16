@@ -26,6 +26,7 @@ from labelkit.common.runtime.schema_engine import (
     pointwise_schema,
     samples_schema,
     segment_window_schema,
+    stitch_schema,
 )
 from labelkit.common.contracts.types import Usage
 
@@ -424,6 +425,7 @@ class TestInternalSchemas:
         # v1.8 M7 stream variant (S7): all three top keys required; defect
         # members is a nullable STRING array; critiques byte-identical to
         # VERDICT_SCHEMA's (the feed-back/merge chain consumes them unchanged).
+        # v1.9 (T15): six kinds — wrong_stitch appended.
         s = defect_verdict_schema()
         Draft202012Validator.check_schema(s)
         assert list(s["properties"]) == ["critiques", "defects", "verdict"]
@@ -434,7 +436,7 @@ class TestInternalSchemas:
         assert defect["required"] == ["kind", "members", "position", "detail"]
         assert defect["properties"]["kind"]["enum"] == [
             "label_mismatch", "off_task_members", "missing_head",
-            "missing_tail", "missing_members"]
+            "missing_tail", "missing_members", "wrong_stitch"]
         assert defect["properties"]["members"] == {"type": ["array", "null"],
                                                    "items": {"type": "string"}}
         assert defect["properties"]["position"]["type"] == ["string", "null"]
@@ -452,6 +454,37 @@ class TestInternalSchemas:
                                             "members": [123], "position": None,
                                             "detail": "d"}],
                                "verdict": "fail"})       # members items are strings
+
+    def test_stitch_schema_shape(self):
+        # v1.9 M16 (spec 3.16 / §10.7): all five keys required; thread_ref is a
+        # nullable integer (pool ordinal range-checked code-side); confidence is
+        # the closed three-level enum (trace observation only, T9 — never a gate).
+        s = stitch_schema()
+        Draft202012Validator.check_schema(s)
+        assert list(s["properties"]) == ["verdict", "thread_ref", "task_name",
+                                         "reason", "confidence"]
+        assert s["required"] == ["verdict", "thread_ref", "task_name",
+                                 "reason", "confidence"]
+        assert s["additionalProperties"] is False
+        assert s["properties"]["verdict"]["enum"] == ["resume", "new"]
+        assert s["properties"]["thread_ref"]["type"] == ["integer", "null"]
+        assert s["properties"]["task_name"] == {"type": "string"}
+        assert s["properties"]["reason"] == {"type": "string"}
+        assert s["properties"]["confidence"]["enum"] == ["high", "medium", "low"]
+        assert "uniqueItems" not in _all_dict_keys(s)
+        v = Draft202012Validator(s)
+        assert v.is_valid({"verdict": "resume", "thread_ref": 1,
+                           "task_name": "点外卖", "reason": "订单实体延续",
+                           "confidence": "high"})
+        assert v.is_valid({"verdict": "new", "thread_ref": None,
+                           "task_name": "打车", "reason": "新任务",
+                           "confidence": "medium"})
+        assert not v.is_valid({"verdict": "merge", "thread_ref": None,
+                               "task_name": "t", "reason": "r",
+                               "confidence": "low"})     # closed verdict enum
+        assert not v.is_valid({"verdict": "new", "task_name": "t",
+                               "reason": "r", "confidence": "low"})
+                                                         # thread_ref key required
 
 
 # ── v1.7: classification_schema (§10.7 / spec 3.13, R1) ─────────────────────

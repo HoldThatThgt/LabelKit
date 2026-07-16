@@ -6,9 +6,12 @@ Three channels:
 - rejects channel ``{output_stem}.rejects.jsonl`` (streamed append log, no ``.part``);
 - ``{output_stem}.report.json`` (always written on finalize).
 
-Distribution by status (v1.8 three routes, spec 3.11.2): ``active`` → main output;
+Distribution by status (v1.9 four routes, spec 3.11.2): ``active`` → main output;
 ``absorbed`` → NEITHER channel, counted only (the member content lives inside its
-episode's sequence record); every other non-active status → rejects.
+episode's sequence record); ``stitched`` → NEITHER channel, counted only (v1.9 T21:
+the merged-fragment shell's content lives inside its thread's rebound record — a
+shell must never fall through to the rejects fallback); every other non-active
+status → rejects.
 
 The emitter never crashes on a bad record: a failed pre-write ``validate_only`` check
 (an internal invariant break) diverts the item to rejects with kind ``internal_error``
@@ -100,11 +103,12 @@ class Emitter:
             raise LabelKitError(f"output path unwritable: {exc}") from exc
 
     def emit_batch(self, batch: list[PipelineItem], batch_no: int) -> EmitResult:
-        """Distribute the batch by status — three routes (v1.8, spec 3.11.2):
-        active → main output; absorbed → counted only (neither channel); every
-        other non-active status → rejects. Appends + flush. Never raises for a
-        record — but a channel-write OSError is a run-level failure and propagates
-        as LabelKitError (spec 3.11.3 ④: the .part may now hold a truncated line)."""
+        """Distribute the batch by status — four routes (v1.9, spec 3.11.2):
+        active → main output; absorbed → counted only (neither channel);
+        stitched → counted only (v1.9 T21 fourth route); every other non-active
+        status → rejects. Appends + flush. Never raises for a record — but a
+        channel-write OSError is a run-level failure and propagates as
+        LabelKitError (spec 3.11.3 ④: the .part may now hold a truncated line)."""
         emitted = 0
         rejected = 0
         annotate_on = self._cfg.annotate.enabled
@@ -141,6 +145,12 @@ class Emitter:
                     # lives inside its episode's sequence record — neither main
                     # output nor rejects; the generic _status_totals tally below
                     # covers the count.
+                    continue
+                elif item.status == "stitched":
+                    # v1.9 fourth route (T21, spec 3.11.2): the merged-fragment
+                    # shell's content lives inside its thread's rebound record —
+                    # neither channel; a shell in the rejects fallback would
+                    # pollute rejects as internal_error and trip --strict.
                     continue
                 else:
                     self._write_reject(item, batch_no)
@@ -358,13 +368,30 @@ class Emitter:
         is disabled. In stream mode every main-output row is an episode (sequence
         record) — a non-sequence record here is defensive and also yields null.
         session_split / stream_repaired / segment_degraded travel as duck-typed
-        envelope marks written by M10/M7/M14 (S21/S26, §7.6)."""
+        envelope marks written by M10/M7/M14 (S21/S26, §7.6). v1.9 (T16/m-11):
+        thread_id / fragments and the per-step resumed flag are present ONLY when
+        stitch is enabled — the off-mode byte-equivalence condition. The
+        TOP-LEVEL order_span stays the envelope span (§6.3 包络 rule: a
+        multi-fragment thread's span may contain other threads' frames —
+        downstream slicing must use fragments[].order_span)."""
         rec = item.record
         if not self._cfg.segment.enabled or rec.kind != "sequence":
             return None
+        stitch_on = self._cfg.stitch.enabled
         members = rec.members
-        return {
-            "episode_id": rec.id,
+
+        def step_row(t) -> dict:
+            row = {"index": t.index, **t.action}
+            if stitch_on:
+                # v1.9 (T10): resumed = the step is a thread-seam placeholder —
+                # derived from detail.kind, never from action_type.
+                row["resumed"] = t.detail.get("kind") == "thread_seam"
+            return row
+
+        block: dict = {"episode_id": rec.id}
+        if stitch_on:
+            block["thread_id"] = item.thread_id       # == episode_id (T22)
+        block.update({
             "session_id": item.session_id,
             "order_span": [_order_key_repr(members[0]), _order_key_repr(members[-1])],
             "member_count": len(members),
@@ -373,9 +400,14 @@ class Emitter:
             "session_split": bool(getattr(item, "session_split", False)),
             "repaired": bool(getattr(item, "stream_repaired", False)),
             "degraded": getattr(item, "segment_degraded", None),
-            "steps": (None if item.transitions is None
-                      else [{"index": t.index, **t.action} for t in item.transitions]),
-        }
+        })
+        if stitch_on:
+            fragments = getattr(item, "stitch_fragments", None)
+            block["fragments"] = ([dict(f) for f in fragments]
+                                  if fragments is not None else None)
+        block["steps"] = (None if item.transitions is None
+                          else [step_row(t) for t in item.transitions])
+        return block
 
     def _annotation_block(self, item: PipelineItem) -> dict | None:
         ann = item.annotation

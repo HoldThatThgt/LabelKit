@@ -52,6 +52,7 @@ from labelkit.common.config.model import (
     Rubric,
     RunConfig,
     SegmentConfig,
+    StitchConfig,
     StreamConfig,
     ToolConfig,
     TraceConfig,
@@ -72,10 +73,10 @@ _RUBRIC_PKG_FILES: dict[str, str] = {
     "default:trajectory": "default_trajectory.toml",   # v1.8 (S29)
 }
 
-# v1.8: 10 values — "segment"/"extract" joined (S1: channel = stage name; the
+# v1.9: 11 values — "stitch" joined (T16; channel = stage name, S1: the
 # event-name first segment routes automatically, classify precedent).
-_TRACE_CHANNELS = ("ingest", "dedup", "segment", "extract", "classify", "quality",
-                   "annotate", "verify", "schema", "llm")
+_TRACE_CHANNELS = ("ingest", "dedup", "segment", "stitch", "extract", "classify",
+                   "quality", "annotate", "verify", "schema", "llm")
 
 # rubric selectors accepted at both selector sites (global [quality].rubric and
 # per-class [class.<name>.quality].rubric): the packaged defaults + "inline".
@@ -648,6 +649,23 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
     )
     t.finish()
 
+    stitch_section = _section(col, top, "stitch")
+    t = _Tbl(col, file, "[stitch]", stitch_section)
+    stitch = StitchConfig(
+        enabled=t.get_bool("enabled", False),
+        llm=t.get_str("llm", "default", nonempty=True),
+        max_open=t.get_int("max_open", 4, minimum=1),
+        bias=t.get_str("bias", "conservative", enum=("conservative", "llm")),
+        rescue_short=t.get_bool("rescue_short", True),
+        repass=t.get_bool("repass", True),
+        stale_gap_steps=t.get_int("stale_gap_steps", 0, minimum=0),
+        digest_max_chars=t.get_int("digest_max_chars", 400, minimum=1),
+        context=t.get_str("context", "") or "",
+        votes=t.get_int("votes", 1, minimum=1),   # odd required, checked in load() (T17)
+        on_error=t.get_str("on_error", "keep", enum=("keep", "fail")),
+    )
+    t.finish()
+
     extract_section = _section(col, top, "extract")
     t = _Tbl(col, file, "[extract]", extract_section)
     extract = ExtractConfig(
@@ -671,6 +689,10 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
     segment_provided = {
         "non_switch_keys": (isinstance(segment_section, dict)
                             and any(k != "enabled" for k in segment_section)),
+    }
+    stitch_provided = {
+        "non_switch_keys": (isinstance(stitch_section, dict)
+                            and any(k != "enabled" for k in stitch_section)),
     }
     extract_provided = {
         "non_switch_keys": (isinstance(extract_section, dict)
@@ -806,10 +828,10 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
     top.finish()
     return dict(
         run=run, input=input_cfg, stream=stream, dedup=dedup,
-        segment=segment, extract=extract, classify=classify,
+        segment=segment, stitch=stitch, extract=extract, classify=classify,
         classify_provided=classify_provided, class_raw=class_raw,
         stream_provided=stream_provided, segment_provided=segment_provided,
-        extract_provided=extract_provided,
+        stitch_provided=stitch_provided, extract_provided=extract_provided,
         sequence_frames_provided=sequence_frames_provided,
         quality=quality, generate=generate,
         gen_provided=gen_provided, top_ratio_provided=top_ratio_provided,
@@ -1230,12 +1252,14 @@ def load(config_path: Path, project_path: Path,
     stream: StreamConfig = p["stream"]
     dedup: DedupConfig = p["dedup"]
     segment: SegmentConfig = p["segment"]
+    stitch: StitchConfig = p["stitch"]
     extract: ExtractConfig = p["extract"]
     classify: ClassifyConfig = p["classify"]
     classify_provided: dict[str, bool] = p["classify_provided"]
     class_raw: Any = p["class_raw"]
     stream_provided: dict[str, bool] = p["stream_provided"]
     segment_provided: dict[str, bool] = p["segment_provided"]
+    stitch_provided: dict[str, bool] = p["stitch_provided"]
     extract_provided: dict[str, bool] = p["extract_provided"]
     sequence_frames_provided: bool = p["sequence_frames_provided"]
     quality: QualityConfig = p["quality"]
@@ -1265,6 +1289,10 @@ def load(config_path: Path, project_path: Path,
         # v1.8 S30: rules strategy makes zero LLM calls — segment.llm joins the
         # reference sets only when a strategy actually dials out
         _check_llm_ref(f"{fp}:[segment].llm", segment.llm)
+    if stitch.enabled:
+        # v1.9 T16/T17: pure-text judgment — referenced whenever enabled,
+        # never added to the vision-required set below
+        _check_llm_ref(f"{fp}:[stitch].llm", stitch.llm)
     if classify.enabled:
         # like verify below: the default reference ("default") need not exist
         # while the stage is disabled (v1.7, R24 reference-set point ①)
@@ -1411,6 +1439,8 @@ def load(config_path: Path, project_path: Path,
     referenced: set[str] = set()
     if segment.enabled and segment.strategy in ("llm", "hybrid"):
         referenced.add(segment.llm)      # v1.8, S30 reference-set point ②
+    if stitch.enabled:
+        referenced.add(stitch.llm)       # v1.9, T17 reference-set point
     if classify.enabled:
         referenced.add(classify.llm)     # v1.7, R24 reference-set point ②
     if extract.enabled:
@@ -1652,6 +1682,15 @@ def load(config_path: Path, project_path: Path,
         if not annotate.enabled:
             col.error(f"{fp}:[segment].enabled: segment.enabled = true 要求 "
                       f"annotate.enabled = true（约束⑭：episode 须经标注落用户 Schema）")
+    if stitch.enabled and not segment.enabled:
+        # v1.9 T17: stitch consumes segment products only
+        col.error(f"{fp}:[stitch].enabled: stitch.enabled = true 要求 "
+                  f"segment.enabled = true（线索缝合仅作用于分段产物）")
+    if stitch.votes % 2 == 0:
+        # v1.9 T18/M-4: strict majority needs an odd sample count (judges /
+        # classify.self_consistency precedent)
+        col.error(f"{fp}:[stitch].votes: 期望 ≥ 1 的奇数（(verdict, thread_ref) "
+                  f"严格多数决），得到 {stitch.votes}")
     if extract.enabled:
         if not segment.enabled:
             col.error(f"{fp}:[extract].enabled: extract.enabled = true 要求 "
@@ -1716,6 +1755,18 @@ def load(config_path: Path, project_path: Path,
             col.warn(f'{fp}:[segment].noise_filter: strategy = "rules" 时 '
                      f"noise_filter 不生效（噪声标记与 min_len 仅 llm/hybrid 策略"
                      f"生效）——要过滤噪声帧请切 strategy")
+        if stitch.enabled and segment.strategy == "rules":
+            # v1.9 T17 advisory: rules segmentation feeds coarse whole-session
+            # cuts into the stitch pool — legal but usually unintended
+            col.warn(f'{fp}:[stitch].enabled: segment.strategy = "rules" 时分段'
+                     f"无 LLM 精化，缝合输入为整会话粗段——要按任务粒度缝合请将 "
+                     f'strategy 切为 "llm" 或 "hybrid"')
+        if stitch_provided["non_switch_keys"] and not stitch.enabled:
+            # v1.9 T17: the parked-list warning below lives in the segment-off
+            # branch — this combination (payload while stitch off, segment on)
+            # gets its own warning (sequence_frames precedent)
+            col.warn(f"{fp}:[stitch].enabled: stitch.enabled = false，[stitch] "
+                     f"其余键不会生效，已忽略（留配置、关开关合法）")
         # S29 combo advisory: only when the EFFECTIVE rubric is the trajectory
         # rubric (incl. the empty-selector stream resolution) — an explicit
         # default:text/ui/inline choice scores by its own criteria and must
@@ -1734,6 +1785,8 @@ def load(config_path: Path, project_path: Path,
             parked.append("[stream]")
         if segment_provided["non_switch_keys"]:
             parked.append("[segment]")
+        if stitch_provided["non_switch_keys"] and not stitch.enabled:
+            parked.append("[stitch]")                  # v1.9 (T17)
         if extract_provided["non_switch_keys"] and not extract.enabled:
             parked.append("[extract]")
         if parked:
@@ -1820,6 +1873,7 @@ def load(config_path: Path, project_path: Path,
         stream=stream,
         dedup=dedup,
         segment=segment,
+        stitch=stitch,
         extract=extract,
         classify=classify,               # max_labels already backfilled when enabled
         quality=replace(quality, rubric=selector),

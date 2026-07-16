@@ -36,6 +36,7 @@ from labelkit.common.config.model import (
     Rubric,
     RunConfig,
     SegmentConfig,
+    StitchConfig,
     StreamConfig,
     ToolConfig,
     TraceConfig,
@@ -63,10 +64,12 @@ from labelkit.common.contracts.types import (
 )
 from labelkit.operators.verify import (
     _DEFAULT_FAIL_DEFECT,
+    DEFECT_KINDS,
     VerifyStage,
     _classify_error,
     boundary_margin_text,
     build_verify_prompt,
+    fragment_structure_text,
     majority_verdict,
     normalize_defects,
     render_critiques_text,
@@ -317,6 +320,7 @@ def trace_cfg(*, enabled=True, content="refs") -> ResolvedConfig:
         stream=StreamConfig(),
         dedup=DedupConfig(),
         segment=SegmentConfig(),
+        stitch=StitchConfig(),
         extract=ExtractConfig(),
         classify=ClassifyConfig(),
         quality=QualityConfig(),
@@ -426,6 +430,7 @@ def test_multi_judge_schema_violation_preserves_majority():
         stream=StreamConfig(),
         dedup=DedupConfig(),
         segment=SegmentConfig(),
+        stitch=StitchConfig(),
         extract=ExtractConfig(),
         classify=ClassifyConfig(),
         quality=QualityConfig(),
@@ -491,6 +496,7 @@ def test_single_judge_schema_violation_propagates_to_classify():
         stream=StreamConfig(),
         dedup=DedupConfig(),
         segment=SegmentConfig(),
+        stitch=StitchConfig(),
         extract=ExtractConfig(),
         classify=ClassifyConfig(),
         quality=QualityConfig(),
@@ -701,6 +707,7 @@ def _stream_cfg(*, policy="repair", max_repair_rounds=1, judges=(),
         base,
         run=replace(base.run, modality="ui"),
         segment=SegmentConfig(enabled=True),
+        stitch=StitchConfig(),
         extract=ExtractConfig(enabled=extract_enabled),
         verify=VerifyConfig(enabled=True, llm="judge", judges=tuple(judges),
                             policy=policy, max_repair_rounds=max_repair_rounds),
@@ -816,9 +823,11 @@ def _stub_extract(monkeypatch):
 def _stub_annotate(monkeypatch, output=None):
     calls = []
 
-    async def fake(record, ctx, repair=None, label=None, transitions=None):
+    async def fake(record, ctx, repair=None, label=None, transitions=None,
+                   fragment_lens=None):                # v1.9 third kwarg (T14)
         calls.append(SimpleNamespace(record=record, repair=repair, label=label,
-                                     transitions=transitions))
+                                     transitions=transitions,
+                                     fragment_lens=fragment_lens))
         return _annotation(output or {"task_label": "修正"})
 
     monkeypatch.setattr("labelkit.operators.annotate.annotate_record", fake)
@@ -848,6 +857,7 @@ def test_sequence_system_text_verbatim_without_extra_criteria():
         "- missing_head: 段首缺少任务起点帧（结合边界余量判断）\n"
         "- missing_tail: 段尾缺少任务终点帧（结合边界余量判断）\n"
         "- missing_members: 段中缺失成员帧（members 列出可指认的帧 id，无从指认则为 null）\n"
+        "- wrong_stitch: 线索缝合错误——各碎片并非同一任务的延续（结合片段结构判断）\n"
         "先逐维度给出简短意见，再列缺陷表，最后给结论。\n"
         "输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：\n"
         '{"critiques": [{"aspect": <维度>, "opinion": <一句话意见>}, ...],\n'
@@ -909,6 +919,153 @@ def test_sequence_step_line_frozen_format():
     assert sequence_step_line(_transition(
         0, action_type="navigate_back", target=None, value=None,
         description="返回")) == "0. navigate_back（对象: —；值: —）返回"
+
+
+# ── v1.9 stitch adaptation (T14/T15): seam suffix + [片段结构] + wrong_stitch ─
+
+def test_sequence_step_line_thread_seam_suffix():
+    """T14 (deliberate v1.9 revision of the no-suffix rule): thread-seam
+    placeholder steps carry the 「（线索接缝：被 X 打断）」 suffix; the S16
+    extraction-fallback marker still never appears in review evidence."""
+    seam = _transition(2, action_type="app_switch", target=None, value=None,
+                       description="线索接缝：被打车打断后恢复",
+                       detail={"kind": "thread_seam", "interrupted_by": ["打车"]})
+    assert sequence_step_line(seam) == (
+        "2. app_switch（对象: —；值: —）线索接缝：被打车打断后恢复（线索接缝：被打车打断）")
+    fallback = _transition(1, action_type="other", target=None, value=None,
+                           description="", detail={"kind": "extraction_invalid",
+                                                   "message": "L3 耗尽"})
+    assert sequence_step_line(fallback) == "1. other（对象: —；值: —）"
+
+
+def test_defect_kinds_six_values_with_wrong_stitch():
+    assert DEFECT_KINDS == ("label_mismatch", "off_task_members", "missing_head",
+                            "missing_tail", "missing_members", "wrong_stitch")
+
+
+def test_fragment_structure_text_fragments_and_seam_table():
+    """T15 [片段结构] body: per-fragment thread-internal ordinal + member-index
+    span + first-frame digest, then the seam-position table (step indexes)."""
+    f0, f1, f2, f3 = (_ui_frame("f0", "外卖首页"), _ui_frame("f1", "下单页"),
+                      _ui_frame("f2", "外卖收尾"), _ui_frame("f3", "订单完成"))
+    ep = _episode([f0, f1, f2, f3])
+    ep.stitch_fragments = (
+        {"order_span": [0, 1], "member_count": 2, "cause": "origin",
+         "source_episode": "e" * 16},
+        {"order_span": [4, 5], "member_count": 2, "cause": "resumed",
+         "source_episode": "f" * 16},
+    )
+    ep.seam_indexes = (1,)
+    ep.seam_interrupted_by = (("打车",),)
+    assert fragment_structure_text(ep, 400) == (
+        f"碎片 1/2: 成员 0–1（2 帧）｜首帧摘要: {frame_digest(f0, 400)}\n"
+        f"碎片 2/2: 成员 2–3（2 帧）｜首帧摘要: {frame_digest(f2, 400)}\n"
+        "接缝位置: 步 1（被打车打断）"
+    )
+    # unmarked thread (single implied fragment) + empty seam table
+    plain = _episode([f0, f1])
+    assert fragment_structure_text(plain, 400) == (
+        f"碎片 1/1: 成员 0–1（2 帧）｜首帧摘要: {frame_digest(f0, 400)}\n"
+        "接缝位置: 无"
+    )
+
+
+def test_sequence_prompt_seven_sections_with_fragment_structure():
+    """T15: the [片段结构] section slots between [动作序列] and [边界余量] when
+    supplied; empty keeps the six-section v1.8 form byte-identical (m-11)."""
+    cfg = _stream_cfg()
+    m0, m1 = _frame("f0"), _frame("f1")
+    episode = _episode([m0, m1])
+    structure = "碎片 1/1: 成员 0–1（2 帧）｜首帧摘要: x\n接缝位置: 无"
+    bundle = build_verify_prompt(episode.record, {"task_label": "外卖"}, cfg,
+                                 transitions=(_transition(0),),
+                                 boundary_margin="段首前 2: 无",
+                                 fragment_structure=structure)
+    parts = bundle.messages[1].parts
+    assert [p.kind for p in parts] == [
+        "text", "text", "text", "text", "text", "image", "text", "image", "text"]
+    assert parts[1].text.startswith("[动作序列]\n")
+    assert parts[2].text == f"[片段结构]\n{structure}"
+    assert parts[3].text.startswith("[边界余量]\n")
+    six = build_verify_prompt(episode.record, {"task_label": "外卖"}, cfg,
+                              transitions=(_transition(0),),
+                              boundary_margin="段首前 2: 无")
+    assert all("[片段结构]" not in p.text for p in six.messages[1].parts
+               if p.kind == "text")
+
+
+def test_session_episodes_ordinals_skip_stitched_shells():
+    """T15 (major-5): _session_episodes filters stitched shells — the boundary
+    margin's "第 n 段" ordinals must not be polluted by a shell's stale members."""
+    f0, f1, f2, f3 = (_ui_frame("f0", "首页"), _ui_frame("f1", "下单"),
+                      _ui_frame("f2", "搜索"), _ui_frame("f3", "支付"))
+    e0, e1, e2, e3 = _env(f0), _env(f1), _env(f2), _env(f3)
+    shell = _episode([f0, f1], eid="a" * 16)
+    shell.status = "stitched"                          # merged-away shell
+    thread = _episode([f0, f1], eid="b" * 16)          # the surviving thread
+    under_review = _episode([f2, f3], eid="c" * 16)
+    batch = [e0, e1, e2, e3, shell, thread, under_review]
+    text = boundary_margin_text(under_review, batch, digest_max_chars=400)
+    # without the filter the review target would render as 第 3 段's neighbor
+    # (shell counted); with it, f1's fate reads 第 1 段 (= the thread)
+    assert f"段首前 1: {frame_digest(f1, 400)}（去向: 第 1 段）" in text
+
+
+def test_wrong_stitch_routes_mark_only_and_fail_stands(monkeypatch):
+    """T15: wrong_stitch is an INDEPENDENT mark-only branch — no reclaim scan,
+    no reannotation, no boundary_flags/membership counters; the fail verdict
+    stands (dropped_verify) and the defect stays in the table."""
+    cfg = _stream_cfg()
+    jw_calls = _stub_judge_window(monkeypatch)
+    annotate_calls = _stub_annotate(monkeypatch)
+    f0, f1 = _frame("f0"), _frame("f1")
+    ep = _episode([f0, f1], transitions=(_transition(0),))
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[_defect("wrong_stitch",
+                                          detail="两碎片非同一任务")]),
+    ]})
+    metrics = _run_verify(cfg, [_env(f0), _env(f1), ep], engine)
+    assert jw_calls == [] and annotate_calls == []     # never entered any repair
+    assert ep.status == "dropped_verify"
+    (d,) = ep.verification.defects
+    assert d["kind"] == "wrong_stitch" and "suspected" not in d
+    assert [m.id for m in ep.record.members] == ["f0", "f1"]   # no unstitching
+    assert "verify.boundary_flags" not in metrics.counters
+    assert "verify.membership_repairs" not in metrics.counters
+    assert metrics.counters["verify.defects.wrong_stitch"] == 1
+
+
+def test_stream_driver_threads_fragment_structure_and_quota(monkeypatch):
+    """T14/T15 穿参义务: with stitch enabled the review prompt carries the
+    [片段结构] section rendered from the M16 duck marks, and the repair
+    re-annotation call receives fragment_lens."""
+    cfg = replace(_stream_cfg(), stitch=StitchConfig(enabled=True))
+    annotate_calls = _stub_annotate(monkeypatch)
+    f0, f1, f2 = _frame("f0"), _frame("f1"), _frame("f2")
+    ep = _episode([f0, f1, f2], transitions=(_transition(0), _transition(1)))
+    ep.thread_id = ep.record.id
+    ep.stitch_fragments = (
+        {"order_span": [0, 1], "member_count": 2, "cause": "origin",
+         "source_episode": ep.record.id},
+        {"order_span": [4, 4], "member_count": 1, "cause": "resumed",
+         "source_episode": "f" * 16},
+    )
+    ep.seam_indexes = (1,)
+    ep.seam_interrupted_by = (("打车",),)
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[_defect("label_mismatch")]),
+        _seq_obj("pass"),
+    ]})
+    _run_verify(cfg, [_env(f0), _env(f1), _env(f2), ep], engine)
+    first_prompt = engine.calls[0][1]
+    structure_parts = [p.text for p in first_prompt.messages[1].parts
+                       if p.kind == "text" and p.text.startswith("[片段结构]")]
+    assert len(structure_parts) == 1
+    assert "碎片 1/2: 成员 0–1（2 帧）" in structure_parts[0]
+    assert "接缝位置: 步 1（被打车打断）" in structure_parts[0]
+    (call,) = annotate_calls
+    assert call.fragment_lens == (2, 1)                # quota reached repair
+    assert ep.status == "active"
 
 
 # ── boundary margin: three fate states (spec 3.7.2) ─────────────────────────

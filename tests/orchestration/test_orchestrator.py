@@ -24,7 +24,8 @@ import pytest
 from labelkit.common.config.model import (
     AnnotateConfig, ClassifyConfig, ClassSpec, ClassView, Criterion, DedupConfig,
     ExtractConfig, GenerateConfig, InputConfig, OutputConfig, QualityConfig,
-    ResolvedConfig, Rubric, RunConfig, SegmentConfig, StreamConfig, ToolConfig,
+    ResolvedConfig, Rubric, RunConfig, SegmentConfig, StitchConfig, StreamConfig,
+    ToolConfig,
     TraceConfig, VerifyConfig,
 )
 from labelkit.common.errors import CircuitBreakerTripped
@@ -65,6 +66,7 @@ def make_cfg(tmp_path: Path, *, mode: str = "process", batch_size: int = 4,
              quality_cfg: QualityConfig | None = None,
              classify: ClassifyConfig | None = None,
              segment: SegmentConfig | None = None,
+             stitch: StitchConfig | None = None,
              extract: ExtractConfig | None = None,
              trace: TraceConfig | None = None) -> ResolvedConfig:
     return ResolvedConfig(
@@ -79,6 +81,7 @@ def make_cfg(tmp_path: Path, *, mode: str = "process", batch_size: int = 4,
         stream=StreamConfig(),
         dedup=DedupConfig(enabled=dedup),
         segment=segment if segment is not None else SegmentConfig(),
+        stitch=stitch if stitch is not None else StitchConfig(),
         extract=extract if extract is not None else ExtractConfig(),
         classify=classify if classify is not None else ClassifyConfig(),
         quality=quality_cfg if quality_cfg is not None else QualityConfig(enabled=quality),
@@ -477,6 +480,40 @@ class StubSegmentStage:
                              kind="sequence",
                              members=tuple(m.record for m in members))
             batch.append(PipelineItem(record=episode, session_id=sid))
+        return batch
+
+
+class StubStitchStage:
+    """Pure stitch stand-in (labelkit.operators.stitch's business logic is
+    covered in tests/operators/test_stitch.py — deliberately NOT imported).
+    Merges the sequence envelopes whose record ids are listed in `merges` into
+    the FIRST active sequence envelope of the batch — the contract ②c shape:
+    the surviving envelope's Record is rebound with the member union (id never
+    recomputed), the merged envelope becomes a stitched shell, thread_id is
+    stamped on survivors, nothing is appended or removed."""
+
+    name = "stitch"
+
+    def __init__(self, merges: tuple[str, ...] = ()):
+        self._merges = set(merges)
+        self.calls: list[int] = []
+
+    async def run(self, batch, ctx):
+        self.calls.append(ctx.batch_no)
+        head: PipelineItem | None = None
+        for item in batch:
+            if item.status != "active" or item.record.kind != "sequence":
+                continue
+            if head is None:
+                head = item
+                head.thread_id = head.record.id
+            elif item.record.id in self._merges:
+                head.record = replace(
+                    head.record,
+                    members=head.record.members + item.record.members)
+                item.status = "stitched"
+            elif item.thread_id is None:
+                item.thread_id = item.record.id
         return batch
 
 
@@ -1569,12 +1606,14 @@ async def test_finalize_honors_sink_breaker_even_without_escape(tmp_path):
 # ── tests: v1.8 stream orchestration (chain / packing / metering / report) ──
 
 def stream_counts_invariant(counts):
-    # v1.8 fully expanded form (spec 6.4): emitted + dropped_dup + dropped_lowq
+    # v1.9 fully expanded form (spec 6.4): emitted + dropped_dup + dropped_lowq
     # + dropped_verify + dropped_noise + failed + bad_input + absorbed
-    # [+ unprocessed] = scanned + generated [+ fanout] + episodes.
+    # + stitched [+ unprocessed] = scanned + generated [+ fanout] + episodes
+    # (the stitched term is absent-as-zero while stitch is off — T7).
     lhs = (counts["emitted"] + counts["dropped_dup"] + counts["dropped_lowq"]
            + counts["dropped_verify"] + counts["dropped_noise"] + counts["failed"]
            + counts["bad_input"] + counts["absorbed"]
+           + counts.get("stitched", 0)
            + counts.get("unprocessed", 0))
     rhs = (counts["scanned"] + counts["generated"] + counts.get("fanout", 0)
            + counts["episodes"])
@@ -1835,7 +1874,7 @@ async def test_stream_report_block_shape_and_counts_gating(tmp_path):
         "membership_repairs": 1, "boundary_flags": 2,
         "defects": {"label_mismatch": 0, "off_task_members": 1,
                     "missing_head": 0, "missing_tail": 0,
-                    "missing_members": 0}}
+                    "missing_members": 0, "wrong_stitch": 0}}
 
 
 async def test_stream_report_block_base_form_and_disabled_gating(tmp_path):
@@ -2011,3 +2050,180 @@ async def test_dry_run_extract_class_override_triggers_note(tmp_path, capsys):
     await orch.run()
     err = capsys.readouterr().err
     assert "按全局配置估算 / multi 按标签乘数 1 报下界" in err
+
+
+# ── tests: v1.9 stitch orchestration (chain / metering / report / dry-run) ──
+
+def stitch_stream_cfg(tmp_path, **kw):
+    kw.setdefault("stitch", StitchConfig(enabled=True))
+    return stream_cfg(tmp_path, **kw)
+
+
+async def test_chain_order_v19_superset_with_stitch(tmp_path):
+    """v1.9 canonical order: segment → stitch → dedup → classify → extract →
+    quality → annotate → verify regardless of the supplied stage list order
+    (T5); _compose_chain gates stitch on cfg.stitch.enabled."""
+    order: list[str] = []
+    cfg = stitch_stream_cfg(tmp_path, batch_size=8, dedup=True, annotate=True,
+                            verify=True, quality_cfg=QualityConfig(enabled=True),
+                            classify=classify_cfg(),
+                            extract=ExtractConfig(enabled=True))
+    stages = [Probe(n, order) for n in ("verify", "stitch", "extract",
+                                        "annotate", "quality", "classify",
+                                        "dedup", "segment")]
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
+    orch, _, _, _ = build(cfg, stages, ingestor=ingestor)
+    await orch.run()
+    assert order == ["segment", "stitch", "dedup", "classify", "extract",
+                     "quality", "annotate", "verify"]
+
+
+async def test_chain_stitch_disabled_excludes_supplied_stage(tmp_path):
+    """stitch off: a SUPPLIED stitch stage never joins the composed chain —
+    the _compose_chain enabled-map gate (tuple insertion alone would no-op)."""
+    order: list[str] = []
+    cfg = stream_cfg(tmp_path, batch_size=8)
+    stages = [Probe(n, order) for n in ("stitch", "dedup", "segment")]
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
+    orch, _, _, _ = build(cfg, stages, ingestor=ingestor)
+    await orch.run()
+    assert order == ["segment", "dedup"]
+
+
+async def test_stitched_tally_threads_derivation_and_report_block(tmp_path):
+    """T7/T16: counts.stitched from the post-emit tally; counts.threads =
+    episodes − stitched (single-point derivation); the failed fallback formula
+    subtracts the stitched term (shells are terminal, never failed);
+    batch.end gains stitched/threads; report.stream gains the stitch block
+    positioned before extract's."""
+    cfg = stitch_stream_cfg(tmp_path, batch_size=8)
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2), sess("s2", 11, 2)])
+    # StubSegmentStage appends one episode per session; the s2 episode merges
+    # into the s1 episode (batch-first survivor).
+    shell_id = "ep:s2:1"[:16]
+    orch, metrics, emitter, _ = build(
+        cfg, [StubSegmentStage(), StubStitchStage(merges=(shell_id,))],
+        ingestor=ingestor)
+    summary = await orch.run()
+
+    counts = emitter.report["counts"]
+    assert counts["episodes"] == 2
+    assert counts["stitched"] == 1
+    assert counts["threads"] == 1                  # episodes − stitched (T7)
+    assert counts["failed"] == 0                   # shell NOT miscounted failed
+    assert counts["emitted"] == 1                  # the surviving thread
+    assert counts["absorbed"] == 4
+    assert stream_counts_invariant(counts)
+    assert summary.output_lines == 1
+    assert metrics.counters["counts.stitched"] == 1
+
+    ends = [e for e in metrics.events if e[0] == "batch.end"]
+    assert [(e[4]["stitched"], e[4]["threads"]) for e in ends] == [(1, 1)]
+
+    stream = emitter.report["stream"]
+    assert stream["stitch"] == {"stitched": 1, "rescued_short": 0, "seams": 0,
+                                "judgments": 0, "repass_judgments": 0,
+                                "failures": 0}
+    keys = list(stream)
+    assert keys.index("stitch") == keys.index("segment_failures") + 1
+
+
+async def test_stitch_counters_surface_in_report_block(tmp_path):
+    """report.stream.stitch surfaces the five M16-owned counters plus the
+    M10-owned stitched mirror (T16 key set, zero-based)."""
+    cfg = stitch_stream_cfg(tmp_path, batch_size=8)
+    ingestor = FakeSessionIngestor([sess("s1", 1, 3)])
+    orch, metrics, emitter, _ = build(cfg, [StubSegmentStage()],
+                                      ingestor=ingestor)
+    metrics.counters["stitch.rescued_short"] = 2   # M16-owned, pre-fed
+    metrics.counters["stitch.seams"] = 1
+    metrics.counters["stitch.judgments"] = 4
+    metrics.counters["stitch.repass_judgments"] = 2
+    metrics.counters["stitch.failures"] = 1
+    await orch.run()
+    assert emitter.report["stream"]["stitch"] == {
+        "stitched": 0, "rescued_short": 2, "seams": 1, "judgments": 4,
+        "repass_judgments": 2, "failures": 1}
+
+
+async def test_stitch_disabled_no_v19_keys_anywhere(tmp_path):
+    """m-11 byte-equivalence anchor: with stitch off the report counts carry
+    no stitched/threads, the stream block no stitch sub-block, and batch.end
+    no stitched/threads keys — the v1.8 shapes exactly."""
+    cfg = stream_cfg(tmp_path, batch_size=8)
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
+    orch, metrics, emitter, _ = build(cfg, [StubSegmentStage()],
+                                      ingestor=ingestor)
+    await orch.run()
+    for key in ("stitched", "threads"):
+        assert key not in emitter.report["counts"]
+    assert "stitch" not in emitter.report["stream"]
+    ends = [e for e in metrics.events if e[0] == "batch.end"]
+    assert ends and all(k not in e[4] for e in ends
+                        for k in ("stitched", "threads"))
+
+
+async def test_stream_breaker_residual_subtracts_stitched(tmp_path):
+    """T7 blocker-1: the unprocessed residual subtracts the stitched term —
+    without it every completed batch's shell would inflate the residual.
+    Batch 1 (s1 + s2, merged → 1 shell + 1 failed thread) completes; batch 2
+    (s3) trips the breaker before emit and strands whole."""
+    cfg = stitch_stream_cfg(tmp_path, batch_size=4, fatal_threshold=2,
+                            annotate=True)
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2), sess("s2", 11, 2),
+                                    sess("s3", 21, 2)])
+    shell_id = "ep:s2:1"[:16]
+    orch, _, emitter, _ = build(
+        cfg, [StubSegmentStage(), StubStitchStage(merges=(shell_id,)),
+              BreakerStage()],
+        ingestor=ingestor)
+    summary = await orch.run()
+
+    assert summary.exit_code == 4
+    counts = emitter.report["counts"]
+    assert counts["stitched"] == 1                 # batch 1's shell, tallied
+    assert counts["failed"] == 1                   # batch 1's thread (breaker-fed)
+    assert "unprocessed" in counts
+    assert counts["unprocessed"] == 3              # s3's 2 frames + its episode
+    lhs = (counts["emitted"] + counts["dropped_dup"] + counts["dropped_lowq"]
+           + counts["dropped_verify"] + counts["dropped_noise"]
+           + counts["failed"] + counts["bad_input"] + counts["absorbed"]
+           + counts["stitched"] + counts["unprocessed"])
+    assert lhs == (counts["scanned"] + counts["generated"]
+                   + counts["episodes"])
+
+
+async def test_dry_run_stitch_calls_formula_and_unconditional_line(tmp_path, capsys):
+    """T16 estimate: stitch_calls = len(session_lens) × votes × (2 if repass
+    else 1) over the episodes ≈ sessions lower-bound base; counted into total."""
+    cfg = stitch_stream_cfg(tmp_path, batch_size=8, dry_run=True, annotate=True,
+                            segment=SegmentConfig(enabled=True, strategy="rules"),
+                            stitch=StitchConfig(enabled=True, votes=3,
+                                                repass=True))
+    ingestor = FakeSessionIngestor(session_lens=(21, 5))
+    orch, _, _, _ = build(cfg, [], ingestor=ingestor)
+    await orch.run()
+    err = capsys.readouterr().err
+    assert "stitch_calls=12" in err                # 2 sessions × 3 votes × 2 passes
+    assert "segment_calls=0" in err                # rules strategy
+    assert "annotate_calls=2" in err
+    assert "total=14" in err
+
+    # repass off halves the estimate; votes default 1
+    cfg2 = stitch_stream_cfg(tmp_path, batch_size=8, dry_run=True, annotate=True,
+                             segment=SegmentConfig(enabled=True, strategy="rules"),
+                             stitch=StitchConfig(enabled=True, repass=False))
+    orch2, _, _, _ = build(cfg2, [], ingestor=FakeSessionIngestor(session_lens=(21, 5)))
+    await orch2.run()
+    assert "stitch_calls=2" in capsys.readouterr().err
+
+
+async def test_dry_run_stitch_calls_zero_line_printed_unconditionally(tmp_path, capsys):
+    """The stitch_calls=0 line prints even with stitch (and stream) fully off —
+    the ONE sanctioned dry-run stderr deviation from v1.8 (m-11 exception)."""
+    cfg = make_cfg(tmp_path, batch_size=4, dry_run=True, annotate=True)
+    orch, _, _, _ = build(cfg, [], [rec(i) for i in range(1, 4)])
+    await orch.run()
+    err = capsys.readouterr().err
+    assert "stitch_calls=0" in err
+    assert "annotate_calls=3" in err and "total=3" in err

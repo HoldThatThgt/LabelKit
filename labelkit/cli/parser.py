@@ -31,8 +31,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="labelkit",
         description=(
-            "LLM-powered stateless batch pipeline: dedup / quality / "
-            "annotate / generate / verify."
+            "LLM-powered stateless batch pipeline: segment / stitch / dedup / "
+            "classify / extract / quality / generate / annotate / verify."
         ),
     )
     sub = parser.add_subparsers(dest="command", required=True)

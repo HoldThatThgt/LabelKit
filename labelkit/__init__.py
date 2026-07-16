@@ -1,7 +1,8 @@
 """LabelKit — 采集数据自动标注工具.
 
-Stateless, single-process CLI batch pipeline: ingest → dedup → (optional)
-classify → quality scoring (QuRating) → annotate → (optional) generate /
+Stateless, single-process CLI batch pipeline: ingest → (optional) segment →
+(optional) stitch → dedup → (optional) classify → (optional) extract →
+quality scoring (QuRating) → (optional) generate → annotate → (optional)
 verify → emit.
 """
 

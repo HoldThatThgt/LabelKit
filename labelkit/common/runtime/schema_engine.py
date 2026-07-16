@@ -279,14 +279,31 @@ def action_schema() -> dict:
             "additionalProperties": False}
 
 
+def stitch_schema() -> dict:
+    # v1.9 M16 (spec 3.16 / CONTRACTS §10.7): one thread-stitch verdict per candidate.
+    # All keys required with a nullable thread_ref (strict-safe, S7 lesson); thread_ref
+    # is the 1-based ordinal of a presented pool card (range-checked code-side — schemas
+    # cannot see the pool size); confidence is trace observation ONLY, never a gate (T9).
+    return {"type": "object",
+            "properties": {"verdict": {"type": "string", "enum": ["resume", "new"]},
+                           "thread_ref": {"type": ["integer", "null"]},
+                           "task_name": {"type": "string"},
+                           "reason": {"type": "string"},
+                           "confidence": {"type": "string",
+                                          "enum": ["high", "medium", "low"]}},
+            "required": ["verdict", "thread_ref", "task_name", "reason", "confidence"],
+            "additionalProperties": False}
+
+
 def defect_verdict_schema() -> dict:
     # v1.8 M7 stream variant (spec 3.7.2 / CONTRACTS §10.7): critiques kept verbatim
     # (the repair feed-back loop is built on them) + typed defect table; opinions/defects
     # before verdict (reason-then-conclusion, VERDICT_SCHEMA precedent). All keys
     # required, members/position nullable (strict-safe, S7). "fail" with an empty
     # defects array is normalized code-side to a default label_mismatch entry.
+    # v1.9 (T15): six kinds — wrong_stitch appended (mark-only + fail routing).
     kinds = ["label_mismatch", "off_task_members", "missing_head", "missing_tail",
-             "missing_members"]
+             "missing_members", "wrong_stitch"]
     return {"type": "object",
             "properties": {
                 "critiques": {"type": "array", "items": {"type": "object",

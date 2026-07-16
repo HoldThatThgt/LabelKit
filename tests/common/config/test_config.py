@@ -1964,3 +1964,168 @@ def test_class_extract_whitelist_rejects_other_keys(env):
     has(errors, "[class.qa.extract].llm: [class.*.extract] 不可覆盖该键"
                 "（白名单：instruction）")
     has(errors, "[class.qa.extract].enabled: [class.*.extract] 不可覆盖该键")
+
+
+# ── v1.9: [stitch] parsing + defaults + constraints (T17) ───────────────────
+
+STITCH_ON = SEG_ON + "\n[stitch]\nenabled = true\n"
+
+
+def test_stitch_section_defaults_when_absent(env):
+    cfg = env.load()
+    assert cfg.stitch.enabled is False
+    assert cfg.stitch.llm == "default"
+    assert cfg.stitch.max_open == 4
+    assert cfg.stitch.bias == "conservative"
+    assert cfg.stitch.rescue_short is True
+    assert cfg.stitch.repass is True
+    assert cfg.stitch.stale_gap_steps == 0
+    assert cfg.stitch.digest_max_chars == 400
+    assert cfg.stitch.context == ""
+    assert cfg.stitch.votes == 1
+    assert cfg.stitch.on_error == "keep"
+
+
+def test_stitch_section_parses_explicit_values(env):
+    body = SEG_ON + """
+[stitch]
+enabled = true
+llm = "judge"
+max_open = 6
+bias = "llm"
+rescue_short = false
+repass = false
+stale_gap_steps = 8
+digest_max_chars = 200
+context = "同一任务可被切走后恢复"
+votes = 3
+on_error = "fail"
+"""
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.stitch.enabled is True
+    assert cfg.stitch.llm == "judge"
+    assert cfg.stitch.max_open == 6
+    assert cfg.stitch.bias == "llm"
+    assert cfg.stitch.rescue_short is False
+    assert cfg.stitch.repass is False
+    assert cfg.stitch.stale_gap_steps == 8
+    assert cfg.stitch.digest_max_chars == 200
+    assert cfg.stitch.context == "同一任务可被切走后恢复"
+    assert cfg.stitch.votes == 3
+    assert cfg.stitch.on_error == "fail"
+
+
+def test_stitch_enum_and_numeric_errors(env):
+    errors = env.errors(project_text=env.project(body='[stitch]\nbias = "auto"'))
+    has(errors, '[stitch].bias: 期望 "conservative" | "llm"，得到 "auto"')
+    errors = env.errors(project_text=env.project(body='[stitch]\non_error = "skip"'))
+    has(errors, '[stitch].on_error: 期望 "keep" | "fail"，得到 "skip"')
+    errors = env.errors(project_text=env.project(body="[stitch]\nmax_open = 0"))
+    has(errors, "[stitch].max_open: 期望正整数，得到 0")
+    errors = env.errors(project_text=env.project(body="[stitch]\nvotes = 0"))
+    has(errors, "[stitch].votes: 期望正整数，得到 0")
+
+
+def test_stitch_requires_segment(env):
+    errors = env.errors(project_text=env.project(body="[stitch]\nenabled = true"))
+    has(errors, "[stitch].enabled: stitch.enabled = true 要求 segment.enabled = true"
+                "（线索缝合仅作用于分段产物）")
+
+
+def test_stitch_happy_path_loads(env):
+    cfg = env.load(project_text=env.project(body=STITCH_ON))
+    assert cfg.stitch.enabled is True
+
+
+@pytest.mark.parametrize("value", [2, 4])
+def test_stitch_votes_even_rejected(env, value):
+    errors = env.errors(project_text=env.project(
+        body=STITCH_ON + f"votes = {value}"))
+    has(errors, f"[stitch].votes: 期望 ≥ 1 的奇数（(verdict, thread_ref) "
+                f"严格多数决），得到 {value}")
+
+
+@pytest.mark.parametrize("value", [1, 3, 5])
+def test_stitch_votes_odd_accepted(env, value):
+    cfg = env.load(project_text=env.project(body=STITCH_ON + f"votes = {value}"))
+    assert cfg.stitch.votes == value
+
+
+def test_stitch_rules_strategy_warns(env, capsys):
+    body = SEG_ON + 'strategy = "rules"\n\n[stitch]\nenabled = true'
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.stitch.enabled is True                 # advisory, not an error
+    err = capsys.readouterr().err
+    assert "[stitch].enabled" in err and "缝合输入为整会话粗段" in err
+
+
+def test_stitch_hybrid_strategy_no_rules_warning(env, capsys):
+    env.load(project_text=env.project(body=STITCH_ON))
+    assert "粗段" not in capsys.readouterr().err
+
+
+def test_stitch_trace_channel_accepted_eleven_values(env):
+    from labelkit.common.config.loader import _TRACE_CHANNELS
+
+    assert _TRACE_CHANNELS == ("ingest", "dedup", "segment", "stitch", "extract",
+                               "classify", "quality", "annotate", "verify",
+                               "schema", "llm")       # v1.9: 11 values (T16)
+    body = '[trace]\nenabled = true\nchannels = ["stitch", "segment"]'
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.trace.channels == ("stitch", "segment")
+
+
+def test_stitch_llm_existence_and_key_when_enabled(env, monkeypatch):
+    errors = env.errors(project_text=env.project(body=STITCH_ON + 'llm = "ghost"'))
+    has(errors, '[stitch].llm: 引用的 profile "ghost" 不存在于 config.toml [llm.*]')
+    monkeypatch.delenv("LK_TEST_KEY_JUDGE")
+    errors = env.errors(project_text=env.project(body=STITCH_ON + 'llm = "judge"'))
+    has(errors, '环境变量 "LK_TEST_KEY_JUDGE" 未设置或为空')
+
+
+def test_stitch_llm_not_referenced_when_disabled(env, monkeypatch):
+    monkeypatch.delenv("LK_TEST_KEY_JUDGE")
+    cfg = env.load(project_text=env.project(body=SEG_ON + '\n[stitch]\nllm = "judge"'))
+    assert cfg.llm_profiles["judge"].api_key == ""    # unreferenced, key not resolved
+
+
+def test_stitch_llm_never_needs_vision(env):
+    # T16: pure-text judgment — a vision-less stitch profile is legal on UI
+    # modality even while stitch is enabled (NOT in any vision-required set)
+    body = (SEG_ON + 'strategy = "rules"\n\n[stitch]\nenabled = true\n'
+            'llm = "novision"')
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    cfg = env.load(config_text=BASE_CONFIG + NOVISION_PROFILE, project_text=project)
+    assert cfg.stitch.llm == "novision"
+
+
+def test_class_stitch_section_rejected(env):
+    # T17: [class.<name>.stitch] must not exist — stitch mirrors segment's
+    # exclusion from the per-class override whitelist
+    body = CLASSIFY_BODY + '\n[class.qa.stitch]\nbias = "llm"\n'
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[class.qa.stitch]: [class.*] 覆盖节不在白名单内")
+
+
+def test_stitch_payload_while_off_segment_on_warns_separately(env, capsys):
+    # T17 branch ownership: segment ON keeps the parked list silent — the
+    # combination gets its own warning (sequence_frames form)
+    body = SEG_ON + "\n[stitch]\nmax_open = 6"
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.stitch.enabled is False and cfg.stitch.max_open == 6
+    err = capsys.readouterr().err
+    assert "[stitch].enabled" in err and "stitch.enabled = false" in err
+    assert "不会生效" in err
+
+
+def test_stitch_payload_joins_parked_list_when_segment_off(env, capsys):
+    body = "[stitch]\nmax_open = 6\n"
+    env.load(project_text=env.project(body=body))
+    err = capsys.readouterr().err
+    assert "[segment].enabled" in err and "[stitch]" in err
+    assert "不会生效" in err
+
+
+def test_stitch_enabled_false_alone_no_noop_warning(env, capsys):
+    env.load(project_text=env.project(body=SEG_ON + "\n[stitch]\nenabled = false"))
+    assert "[stitch]" not in capsys.readouterr().err

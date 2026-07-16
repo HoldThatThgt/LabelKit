@@ -376,9 +376,10 @@ class ClassifyStage:
         first label; each remaining label clones one sibling appended to the batch
         tail. Clones share record and dedup BY REFERENCE and inherit session_id
         (v1.8: sibling episodes stay addressable for the M7 boundary-margin /
-        neighborhood queries, spec 3.13.4); classification swaps label (labels =
-        same full set); scores/annotation/verification/errors are fresh default
-        containers (spec 3.13.4)."""
+        neighborhood queries, spec 3.13.4) and thread_id (v1.9 T14: a real field —
+        thread identity belongs to the record, not the envelope); classification
+        swaps label (labels = same full set); scores/annotation/verification/errors
+        are fresh default containers (spec 3.13.4)."""
         for item in processed:
             classification = item.classification
             if classification is None or len(classification.labels) < 2:
@@ -390,11 +391,17 @@ class ClassifyStage:
                     classification=replace(classification, label=label),
                     dedup=item.dedup,
                     session_id=item.session_id,
+                    thread_id=item.thread_id,
                 )
                 # v1.8 (D6): session_split / segment_degraded describe the
                 # EPISODE's session and segmentation, not the envelope —
                 # sibling rows must not contradict the original's _meta.stream.
-                for mark in ("session_split", "segment_degraded"):
+                # v1.9 (T14): the M16 marks join the loop — seam_indexes drives
+                # the sibling's own extract pass, seam_interrupted_by its
+                # placeholder text, stitch_fragments its _meta.stream.fragments
+                # and annotate quota.
+                for mark in ("session_split", "segment_degraded", "seam_indexes",
+                             "seam_interrupted_by", "stitch_fragments"):
                     value = getattr(item, mark, None)
                     if value is not None:
                         setattr(clone, mark, value)
