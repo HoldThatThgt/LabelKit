@@ -43,7 +43,8 @@
       "fields": {"source": "ime-log"},               ← passthrough_fields 透传的原始字段
       "generator": null                              ← 若是合成样本：{"llm": "...", "style": "..."}
     },
-    "stream": null,                                  ← 时序流元信息（v1.8 恒在键；stream 模式未启用恒为 null，第 25 章）
+    "stream": null,                                  ← 时序流元信息（v1.8 恒在键；未启用恒为 null，第 25 章；
+                                                        v1.9 缝合启用时另含 thread_id / fragments 等线索键，第 26 章）
     "scores": {                                      ← 质量分（quality 开启时）
       "writing_style": 0.4,                          ← 每条准则一个 [0,1] 分
       "facts_trivia": 0.6,
@@ -100,7 +101,7 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
            "stage": "quality", "reason": "below_threshold", "errors": []}}
 ```
 
-- `stage` + `reason` 告诉你**在哪个工位、因为什么**被淘汰。常见组合：`dedup` / 判重类别（`exact` / `near_text` / `near_image` / `near_both`，开语义层时另有 `near_semantic`，与第 9 章一致）、`quality / below_threshold`（top_ratio 模式下为 `top_ratio`）、`verify / verify_fail`；记录处理**失败**（状态 `failed`）时，`stage` 为出错工位、`reason` 为首个错误的**错误码**（如 `schema_violation`、`provider_fatal`，全表见第 18 章），`errors` 列表为具体的错误信息文本；
+- `stage` + `reason` 告诉你**在哪个工位、因为什么**被淘汰。常见组合：`dedup` / 判重类别（`exact` / `near_text` / `near_image` / `near_both`，开语义层时另有 `near_semantic`，与第 9 章一致）、`quality / below_threshold`（top_ratio 模式下为 `top_ratio`）、`verify / verify_fail`；stream 模式（第 25 章）另有 `segment` / `noise`、`segment` / `below_min_len` 与 `verify` / `off_task_member`；v1.9 的 `stitch` / `stitch_invalid` 仅在 `stitch.on_error = "fail"` 时出现（缝合判定失败的 episode 候选信封，第 26 章）。记录处理**失败**（状态 `failed`）时，`stage` 为出错工位、`reason` 为首个错误的**错误码**（如 `schema_violation`、`provider_fatal`，全表见第 18 章），`errors` 列表为具体的错误信息文本。反向的提醒：缝合产生的 `stitched` 壳与救援命中的短段帧**不落 rejects**——救援把帧从 `dropped_noise` 翻回 `absorbed`，同一份输入开启缝合后 rejects 行数可能变少（`--strict` 交互见 8.4 末尾）；
 - `refs` 档**不含数据内容**——想看被淘汰的原文，要么拿 `line_no` 回输入文件查，要么把 `rejects` 改成 `"full"`（原文随行落盘，注意这就是一份数据副本了）；
 - `rejects = "none"` 时不写此文件，淘汰只反映在报告计数里。**调优期强烈建议至少 refs**：质量门帮你扔掉了什么，是判断阈值合不合理的第一手材料。
 
@@ -182,6 +183,8 @@ v1.7（分类算子，第 24 章）再增三处按需出现的字段（未启用
 - **`generate.buckets` 的桶 key**：classify 启用时由「`<llm>×<style>`」两段扩展为「`<class>×<llm>×<style>`」三段（关闭时格式不变，第 12 章）。
 
 v1.8（时序流，第 25 章）再增两处按需出现的块（未启用时报告形状与旧版逐字段一致）：`counts` 增列 `episodes` / `absorbed` / `dropped_noise`，且 `counts` 之后新增顶层 `stream` 节（会话数、段长均值、`below_min_len`、摘要贫瘠帧数，extract / verify 各一个子块）——两者都仅 segment 启用时出现。守恒等式相应扩展为全展开形：左侧另加 `dropped_noise + absorbed`、右侧另加 `episodes`（未启用项恒 0 时退化回第 4 章原式；真实验算见第 25 章）；且 stream 模式下 `counts.unprocessed` 的出现条件从「仅熔断」扩为「熔断或优雅中断」。
+
+v1.9（线索缝合，第 26 章）再增两处按需出现的字段（仅 `stitch.enabled = true` 时出现，未启用时报告与 v1.8 逐字节一致）：`counts` 增列 `stitched` / `threads`（被并进线索的 episode 壳数、线索数，恒满足 `threads = episodes − stitched`），`stream` 节内新增 `stitch` 子块（`{stitched, rescued_short, seams, judgments, repass_judgments, failures}`，逐键读法见第 26 章）；守恒等式左侧相应另加 `stitched`（第 4 章）。一处**无条件**的例外：stream×verify 的缺陷词表是闭集，`stream.verify.defects` 从五行扩为六行——即便 stitch 关闭，`wrong_stitch: 0` 这一行也在场（第 13、25 章）。`--strict` 交互提醒：stitched 壳与被救援的帧都不构成 rejects，同一份输入开启缝合后 `--strict` 的结果可能从 1 变 0（短段被救援、不再落 rejects）——属预期，不是账目错误。
 
 > **报告写失败怎么办**：主输出成功、报告写失败时，进程以退出码 1 结束——产物可用但账本缺失，别当成功处理。
 

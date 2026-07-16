@@ -241,6 +241,7 @@ tests/
 ├── operators/
 │   ├── test_ingest.py
 │   ├── test_segment.py
+│   ├── test_stitch.py
 │   ├── test_dedup.py
 │   ├── test_classify.py
 │   ├── test_extract.py
@@ -260,10 +261,13 @@ tests/
     ├── test_quality_llm.py
     ├── test_verify_llm.py
     ├── test_stream_llm.py
+    ├── test_stitch_llm.py
     └── test_key_pool_llm.py
 ```
 
 `test_key_pool.py` 的离线密钥池测试必须并入 `common/runtime/test_llm_client.py`；`test_stream_ingest.py` 必须并入 `operators/test_ingest.py`。迁移不得删除或弱化任何既有测试用例；`test_stage.py` 和 `test_errors.py` 必须覆盖对应公共契约。所有 fixture import 必须切换到新的测试路径。
+
+v1.9（M16 线索缝合，2026-07-16）向本封闭白名单登记两个新测试文件：`tests/operators/test_stitch.py` 与 `tests/integration/test_stitch_llm.py`（已列入上方目录树；白名单封闭语义不变——未列出的测试模块仍不允许出现）。注：§10 计数为 2026-07-16 时点历史记录（30/31），v1.9 后实为 31/33，不回改。
 
 ### 6.2 必须更新的文档
 

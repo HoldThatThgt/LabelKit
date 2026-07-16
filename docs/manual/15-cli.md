@@ -18,18 +18,18 @@ labelkit run --config <config.toml> --project <project.toml>
 | `--input` / `--output` | 覆盖 `run.input` / `run.output`（CLI > project.toml）。注意 `generate_only` 模式下传 `--input` 同样是配置错误 |
 | `--limit N` | 只处理前 N 条（N ≥ 1；0 或负数在参数解析层就被拒绝）。**试跑神器**：小样本验证配置、rubric、Schema、成本，再放开跑全量 |
 | `--dry-run` | 走完全部启动校验 + 输入扫描 + 成本估算，**不发一次 LLM 调用、不写主输出**。报告写 `{stem}.dryrun.report.json`；trace 写「trace 文件名在扩展名前插 .dryrun」（默认即 `{stem}.trace.dryrun.jsonl`），不覆盖上次真实运行的账本 |
-| `--strict` | 有任何记录被拒绝（dropped_* / failed 非零）⇒ 退出码 1。给 CI/定时任务用：让「有货被扔」成为可编程的失败信号 |
+| `--strict` | 有任何记录被拒绝（dropped_* / failed 非零）⇒ 退出码 1。给 CI/定时任务用：让「有货被扔」成为可编程的失败信号。v1.9 交互补注：缝合产生的 `stitched` 壳与救援命中的帧**不构成 rejects**——同一份输入开启 `[stitch]` 后 strict 结果可能从 1 变 0（短段被救援、不再落 rejects），属预期（第 26 章） |
 | `--log-level` | 覆盖 `tool.log_level`。`debug` 会打出每次 LLM 调用摘要（延迟/token/重试） |
 
 `--dry-run` 的输出示例（拿来做预算审批正合适）：
 
 ```
 dry-run: mode=process estimated_records=14 batches=1
-dry-run: estimated LLM calls — generate_calls=0 segment_calls=0 classify_calls=0 extract_calls=0 quality_calls=56 annotate_calls=14 verify_calls=0 total=70 (excludes retries and repair calls)
+dry-run: estimated LLM calls — generate_calls=0 segment_calls=0 stitch_calls=0 classify_calls=0 extract_calls=0 quality_calls=56 annotate_calls=14 verify_calls=0 total=70 (excludes retries and repair calls)
 dry-run: no LLM calls made, no output written (report and trace only)
 ```
 
-注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），`segment_calls` / `extract_calls` 是 v1.8 新增字段（时序流，第 25 章），未启用恒为 0；stream 模式下 quality/annotate/verify 的估算以「episode 数 ≈ 会话数」报**下界**、extract 按剔噪前帧数报**上界**（估算公式与真实对账见第 25 章）。`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。后两种情况 stderr 都会多打一行注记（`dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界`）。
+注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），`segment_calls` / `extract_calls` 是 v1.8 新增字段（时序流，第 25 章），`stitch_calls` 是 v1.9 新增字段（线索缝合，第 26 章），未启用恒为 0；stream 模式下 quality/annotate/verify 的估算以「episode 数 ≈ 会话数」报**下界**、extract 按剔噪前帧数报**上界**（估算公式与真实对账见第 25 章）。`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。后两种情况 stderr 都会多打一行注记（`dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界`）。
 
 ## 15.2 `labelkit validate`：只体检不跑车
 

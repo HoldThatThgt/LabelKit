@@ -138,7 +138,7 @@
 | `output.rejects` | "refs" | "none" \| "refs"（无数据内容）\| "full"（含原文=数据副本） | 8 |
 | `trace.enabled` | false | 事件流开关 | 16 |
 | `trace.path` | {stem}.trace.jsonl | 首个事件写出时截断（速败运行不再触碰；dry-run 写 `{名}.dryrun{后缀}` 独立文件） | 16 |
-| `trace.channels` | ["quality","verify","schema"] | 十通道：ingest/segment（v1.8）/dedup/classify（v1.7）/extract（v1.8）/quality/annotate/verify/schema/llm；默认值不变，分类/分段/摘取判决须显式订阅对应通道 | 16/24/25 |
+| `trace.channels` | ["quality","verify","schema"] | 十一通道：ingest/segment（v1.8）/stitch（v1.9）/dedup/classify（v1.7）/extract（v1.8）/quality/annotate/verify/schema/llm；默认值不变，分类/分段/缝合/摘取判决须显式订阅对应通道 | 16/24/25/26 |
 | `trace.content` | "refs" | none→refs→excerpt→full 四档脱敏；full=完整数据副本 | 16 |
 
 ## A.8 组合约束（启动即查，违反=退出码 2）
@@ -160,8 +160,10 @@
 15. `classify.enabled = false` 而 `[[classify.classes]]` / `[class.*]` 在场 ⇒ 仅 **warning**（一次、点名被忽略的表——「留配置、关开关」合法，不触发退出码 2）
 16. `segment.enabled = true` ⇒ `run.mode = "process"` ∧ `generate.enabled = false` ∧ `annotate.enabled = true`（v1.8）
 17. `extract.enabled = true` ⇒ `segment.enabled = true` ∧ `run.modality = "ui"`（v1.8）
-18. stream 的 vision 校验逐阶段（v1.8）：`extract.llm` **恒**须 supports_vision；`segment.llm` 仅 `use_vision = true` 时须；`quality.llm` **免除**（唯一放宽）；`stream.gap_s` / `session_max_span_s` 仅 `order_by = "meta:*"` 可设（meta:* 仅文本模态）
-19. `[stream]` / `[segment]` / `[extract]` 任一节在场而 `segment.enabled = false` ⇒ 仅 **warning**（同第 15 条形制）；`segment.window` ≥ 2；`annotate.sequence_frames` ∈ [2, 100]
+18. stream 的 vision 校验逐阶段（v1.8）：`extract.llm` **恒**须 supports_vision；`segment.llm` 仅 `use_vision = true` 时须；`quality.llm` **免除**、`stitch.llm`（v1.9）**恒免除**（两者都是纯文本判定）；`stream.gap_s` / `session_max_span_s` 仅 `order_by = "meta:*"` 可设（meta:* 仅文本模态）
+19. `[stream]` / `[segment]` / `[stitch]`（v1.9）/ `[extract]` 任一节在场而 `segment.enabled = false` ⇒ 仅 **warning**（同第 15 条形制）；`segment.window` ≥ 2；`annotate.sequence_frames` ∈ [2, 100]
+20. `stitch.enabled = true` ⇒ `segment.enabled = true`（v1.9）；启用时 `stitch.llm` 计入密钥/probe/存在性引用集但**不入 vision 集**；`[class.<name>.stitch]` 不存在（链序在 classify 之前，类标签尚不存在）
+21. `stitch.votes` 须为 ≥1 的**奇数**（偶数 = 退出码 2，v1.9）；`stitch.enabled = true` ∧ `segment.strategy = "rules"` ⇒ 仅 **warning**（规则分段不做语义精化，可缝证据薄）；`[stitch]` 带非开关键而 stitch 关、segment 开 ⇒ 仅 **warning**（segment 也关时并入第 19 条名单）
 
 ## A.9 project.toml — [classify] 与 [class.<name>.*] 按类覆盖（v1.7 追加）
 
@@ -219,3 +221,21 @@
 | `extract.instruction` | "" | 摘取补充说明，追加进 system 摘取指令后；`[class.<name>.extract]` 可按类覆盖（白名单仅此键） | 24/25 |
 | `extract.include_diff` | true | `[树变更摘要]` 注入开关（结构化树 diff 证据）；可关做 A/B 消融对比摘取质量 | 17/25 |
 | `extract.on_error` | "fallback" | 单转移修复耗尽：该步记 action_type="other" 留痕（episode 存活，**不写记录 errors**）\| "fail"（episode failed → rejects） | 18/25 |
+
+## A.11 project.toml — [stitch]（v1.9 追加）
+
+`[stitch]` 是线索缝合算子（第 26 章）：把同会话内被穿插切开的 episode 碎片保守缝合成线索。启用要求 `segment.enabled = true`（A.8 第 20 条）。
+
+| 键 | 默认 | 一句话 | 章 |
+|---|---|---|---|
+| `stitch.enabled` | false | 总开关；关闭时主输出/rejects/report 与 v1.8 **逐字节等价**（例外恰两处：dry-run 估算行的 `stitch_calls=0`、缺陷词表恒在的 `wrong_stitch: 0`） | 26 |
+| `stitch.llm` | "default" | 判定档；证据是摘要卡（纯文本），**恒不要求 supports_vision** | 26 |
+| `stitch.max_open` | 4 | 开放线索池容量（≥1；实证锚：桌面日志挂起窗口均值 3 + 1 条活跃）；穿插深的流上调 | 26 |
+| `stitch.bias` | "conservative" | 并入需 LLM 判 resume **且**机械先验命中（合取）\| "llm" 纯 LLM 判（审计/消融用） | 26 |
+| `stitch.rescue_short` | true | below_min_len 短段按连续 run 重组先进候选池，命中救援翻回 absorbed；false = v1.8 行为 | 26 |
+| `stitch.repass` | true | 有界二遍复评：对一遍结束时的单碎片线索复判，修正贪心漏缝；false = 纯一遍 | 26 |
+| `stitch.stale_gap_steps` | 0 | 时间衰减阈值（会话序号差，0=不启用）**双职**：超限先验降格须两腿命中 + 池满逐出优先腿；≠ `stream.gap_steps`（那是断会话规则） | 26 |
+| `stitch.digest_max_chars` | 400 | 摘要卡内每个帧摘要的截断上限（沿用 segment 同名键语义） | 26 |
+| `stitch.context` | "" | 可选域上下文（何为「同一任务」的领域提示）；判据内置于固定模板，零配置可用 | 26 |
+| `stitch.votes` | 1 | 判定稳定化采样：1=单调用；>1 须**奇数**（A.8 第 21 条），n 次采样对 (verdict, thread_ref) 严格多数决、分裂回落保守结局；成本 ×n | 26 |
+| `stitch.on_error` | "keep" | 判定修复耗尽：episode 候选开新线索存活（留痕不写 errors）\| "fail"（仅 episode 候选 failed → rejects；救援候选恒按未命中处理） | 18/26 |

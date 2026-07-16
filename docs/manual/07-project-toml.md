@@ -2,8 +2,8 @@
 
 > `project.toml` 是工程级配置：一次标注任务的全部意图都写在这里。
 > 本章精讲 `[run]` `[input]` `[output]` `[trace]` 四节的每个参数；
-> 八个算子节（`[dedup]` `[classify]` `[quality]` `[generate]` `[annotate]` `[verify]` 与 v1.8 的 `[segment]` `[extract]`）
-> 及配套的 `[stream]` 输入声明节在此给出速览，深度解读见第 9–13、24、25 章。
+> 九个算子节（`[dedup]` `[classify]` `[quality]` `[generate]` `[annotate]` `[verify]`、v1.8 的 `[segment]` `[extract]` 与 v1.9 的 `[stitch]`）
+> 及配套的 `[stream]` 输入声明节在此给出速览，深度解读见第 9–13、24、25、26 章。
 
 ## 7.1 文件骨架与最小可用配置
 
@@ -63,6 +63,7 @@ schema_inline = """
 |---|---|---|---|
 | `[stream]` | —（随 segment 生效，v1.8） | `order_by`（时间序依据）、`key`（分区键）、`gap_s`/`gap_steps`（断会话规则） | 第 25 章 |
 | `[segment]` | 关（v1.8） | `strategy`（rules/llm/hybrid）、`window`（滑窗帧数）、`min_len`（最短段长） | 第 25 章 |
+| `[stitch]` | 关（v1.9） | `max_open`（开放线索池容量）、`bias`（保守合取/纯 LLM）、`votes`（判定稳定化采样） | 第 26 章 |
 | `[dedup]` | **开** | `minhash_threshold`（0.85 近似判重线）、`scope`（global/batch）、`ui_dup_requires`（UI 判重口径） | 第 9 章 |
 | `[classify]` | 关（v1.7） | `[[classify.classes]]`（类别表，启用必填）、`fallback_class`（兜底类，启用必填）、`assignment`（single/multi 单多标签） | 第 24 章 |
 | `[extract]` | 关（v1.8） | `llm`（恒需视觉能力）、`instruction`（摘取补充说明）、`include_diff`（树变更摘要注入） | 第 25 章 |
@@ -73,7 +74,7 @@ schema_inline = """
 
 `[classify]` 是 v1.7 新增的分类算子节：按你声明的类别表对每条存活记录做 LLM 封闭集分类，类标签写进 `_meta.classification` 并驱动下游「按类条件化」。启用后另有一族按类覆盖节 **`[class.<name>.<section>]`**——对某个类别单独覆盖 quality / annotate / generate / verify（v1.8 起还有 extract 的 instruction）的白名单参数（按类 rubric、按类标注指令等），类未覆盖的键继承全局。完整键表、白名单与合并语义见第 24 章与 spec §5.2。
 
-v1.8 新增的三节同属**时序流（stream 模式）**一族：`[stream]` 声明输入的时间序与会话切分规则（排序依据、分区键、断开条件——它不是算子，随 `segment.enabled` 生效）；`[segment]` 是 stream 模式的总开关，把候选会话经 LLM 边界精化切成语义完整的 episode 并剔除噪声帧；`[extract]` 对 episode 的每对相邻帧推断结构化动作（仅 UI 模态，要求 segment 开启）。三节的逐键详解与完整示例见第 25 章。
+v1.8/v1.9 新增的四节同属**时序流（stream 模式）**一族：`[stream]` 声明输入的时间序与会话切分规则（排序依据、分区键、断开条件——它不是算子，随 `segment.enabled` 生效）；`[segment]` 是 stream 模式的总开关，把候选会话经 LLM 边界精化切成语义完整的 episode 并剔除噪声帧；`[stitch]`（v1.9）把同一任务被穿插切开的 episode 碎片保守缝合成完整线索，并可救援过短被剔的收尾帧（要求 segment 开启）；`[extract]` 对 episode 的每对相邻帧推断结构化动作（仅 UI 模态，要求 segment 开启）。四节的逐键详解与完整示例见第 25、26 章。
 
 开关组合的合法性约束见 4.5 节（M1 启动时强制检查）。
 

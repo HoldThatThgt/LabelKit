@@ -135,11 +135,11 @@ uv run labelkit run --config ../config.toml --project project.toml --dry-run
 
 ```
 dry-run: mode=process estimated_records=14 batches=1
-dry-run: estimated LLM calls — generate_calls=0 segment_calls=0 classify_calls=0 extract_calls=0 quality_calls=56 annotate_calls=14 verify_calls=0 total=70 (excludes retries and repair calls)
+dry-run: estimated LLM calls — generate_calls=0 segment_calls=0 stitch_calls=0 classify_calls=0 extract_calls=0 quality_calls=56 annotate_calls=14 verify_calls=0 total=70 (excludes retries and repair calls)
 dry-run: no LLM calls made, no output written (report and trace only)
 ```
 
-它告诉你：14 条记录、1 个批，预计约 70 次 LLM 调用（质量打分 56 次 = 14 条 × 4 条准则；标注 14 次；`classify_calls=0` 是 v1.7 新增的分类算子，`segment_calls=0` / `extract_calls=0` 是 v1.8 新增的时序流算子——都默认关闭，第 24、25 章）。对大任务，这一步是你估算成本和时长的依据。
+它告诉你：14 条记录、1 个批，预计约 70 次 LLM 调用（质量打分 56 次 = 14 条 × 4 条准则；标注 14 次；`classify_calls=0` 是 v1.7 新增的分类算子，`segment_calls=0` / `extract_calls=0` 是 v1.8 新增的时序流算子，`stitch_calls=0` 是 v1.9 新增的线索缝合算子——都默认关闭，第 24、25、26 章）。对大任务，这一步是你估算成本和时长的依据。
 
 **第三步：正式运行**：
 
