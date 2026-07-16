@@ -116,7 +116,7 @@ class PipelineItem:
 
 > **②b segment 例外（仅 stream 模式）**——segment 可将批内既有 active 成员信封的 status 置为 `absorbed` 或 `dropped_noise`（属①④的正常状态写入），并向传入列表**尾部**追加以这些成员拼装的序列信封；追加物视同批内普通元素、同受①③④约束；每个成员信封至多被一个序列信封吸收；不得删除、重排或替换任何既有元素对象；返回值仍须是传入的同一列表对象。**M7 修复路径豁免**：verify 的缺陷修复可在本批内将成员信封状态在 `absorbed` 与 `dropped_noise` 间双向改写（成员回收/收缩），此为契约①的唯一反向豁免；禁止将成员信封翻回 `active`。
 
-**帧摘要与树 diff（共享 helper，落 `labelkit/types.py` 模块级函数，签名入 CONTRACTS §3）**：
+**帧摘要与树 diff（共享 helper，canonical 落 `labelkit/common/contracts/types.py` 模块级函数，签名入 CONTRACTS §3）**：
 
 ```python
 def frame_digest(record: Record, max_chars: int) -> str

@@ -1,6 +1,6 @@
 # LabelKit 包分层重构规范
 
-状态：实施中
+状态：已实施
 
 版本：v1.0
 
@@ -372,3 +372,27 @@ uv run pytest tests/integration -q -m integration
 - 已创建 draft PR，PR 描述包含变更内容、分层原因、兼容策略和验证结果。
 
 不允许以“目录已建立但旧模块未迁移”“部分测试尚未更新”“shim 后续再补”“文档稍后同步”作为完成状态。
+
+## 10. 实施与验证记录
+
+实施完成日期：2026-07-16。
+
+- 生产实现已迁入 `labelkit/cli/`、`labelkit/common/`、`labelkit/operators/` 和
+  `labelkit/orchestration/`；旧平铺路径只保留兼容 shim，原 `labelkit/cli.py` 已删除。
+- CLI 参数解析、用户交互、stage factory、profile discovery 和运行时对象图已按本规范
+  分离；CLI 不再导入算子或实例化运行时对象。
+- 测试已镜像到四层目录；兼容测试覆盖全部冻结旧路径和十个 direct-call surface；
+  integration 测试仍独立保留。
+- `docs/CONTRACTS.md` 和命中的开发文档已同步 canonical 路径；本地工作文件
+  `AGENTS.md` / `CLAUDE.md` 已逐字同步，并按仓库既有 `.gitignore` 策略保持不入库。
+- 离线测试：`1047 passed, 28 deselected`。
+- 真实端点 integration：`28 passed in 311.09s`，provider 为 z.ai anthropic endpoint，
+  model 为 `glm-5.2`。
+- `examples/text`、`examples/ui`、`examples/generate`、`examples/classify`、
+  `examples/stream` 的 `validate` 路径全部通过。
+- CLI help/rubric、裸 `python3` 四层 import、sdist/wheel build、全新 venv wheel install、
+  console entrypoint 和 `git diff --check` 全部通过。
+- 独立对抗审查检查了目标文件、shim、依赖方向、CLI 边界、测试数量、文档路径、
+  用户未跟踪文件和新增待办，结论为 `BLOCKER: none`。
+
+本规范无未完成、待定、defer 或 follow-up 实现项。

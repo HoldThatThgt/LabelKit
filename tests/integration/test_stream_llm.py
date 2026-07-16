@@ -30,8 +30,8 @@ from pathlib import Path
 import jsonschema
 import pytest
 
-from labelkit.annotate import annotate_record, build_annotate_prompt
-from labelkit.config.model import (
+from labelkit.operators.annotate import annotate_record, build_annotate_prompt
+from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
     DedupConfig,
@@ -50,13 +50,13 @@ from labelkit.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.extract import extract_transition
-from labelkit.ingest import _parse_ui_tree
-from labelkit.llm_client import LLMClient
-from labelkit.schema_engine import SchemaEngine
-from labelkit.segment import judge_window
-from labelkit.stage import RunContext
-from labelkit.types import (
+from labelkit.operators.extract import extract_transition
+from labelkit.operators.ingest import _parse_ui_tree
+from labelkit.common.runtime.llm_client import LLMClient
+from labelkit.common.runtime.schema_engine import SchemaEngine
+from labelkit.operators.segment import judge_window
+from labelkit.common.contracts.stage import RunContext
+from labelkit.common.contracts.types import (
     Annotation,
     ImageRef,
     PipelineItem,
@@ -65,7 +65,7 @@ from labelkit.types import (
     Transition,
     Usage,
 )
-from labelkit.verify import VerifyStage, boundary_margin_text
+from labelkit.operators.verify import VerifyStage, boundary_margin_text
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 

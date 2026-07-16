@@ -15,72 +15,138 @@ Ground rules for every implementer:
 - Code identifiers, comments, docstrings-of-record: English. LLM prompt templates: the exact
   Chinese text given in §10 of this document (copied from the spec verbatim).
 - Do not rename any field, key, event, or error code defined here. Tests assert exact strings.
-- Import discipline (no cycles): `types.py` and `errors.py` import nothing from `labelkit`;
-  `config/model.py` imports nothing from `labelkit` except `types` if needed; `llm_client.py`
-  imports `types`, `errors`, `config.model`, `obslog`; `schema_engine.py` imports `llm_client`,
-  `errors`, `obslog`; `stage.py` imports the above under `typing.TYPE_CHECKING` only; operator
-  modules (`ingest/segment/dedup/classify/extract/quality/annotate/generate/verify/emitter`)
-  import service modules and `types`/`stage`, **never each other** — with the sanctioned
-  exceptions that `verify.py` imports the public repair hooks from `annotate.py` (§7.4; used per
-  §7.6) and, v1.8, the public direct-call surfaces `segment.judge_window` /
-  `extract.extract_transition` (§7.14/§7.15; used by the stream repair driver, §7.6).
+- Import discipline (no cycles): canonical production imports use the layered package paths below,
+  never the legacy shims. `labelkit.common.contracts.types` and `labelkit.common.errors` import
+  nothing from `labelkit`; `labelkit.common.config.model` imports nothing from `labelkit` except
+  shared contract types if needed; `labelkit.common.runtime.llm_client` imports only common-layer
+  contracts, errors, config, and observability; `labelkit.common.runtime.schema_engine` imports the
+  common runtime LLM client plus common errors/observability; `labelkit.common.contracts.stage`
+  imports runtime/config/observability types under `typing.TYPE_CHECKING` only. Common never imports
+  operators or orchestration. Operator modules import common and declared stdlib/third-party
+  dependencies, never orchestration and **never each other** — with the sanctioned lazy-import
+  exceptions that `labelkit.operators.verify` calls the public repair surface from
+  `labelkit.operators.annotate` (§7.4; used per §7.6) and, v1.8, the public direct-call surfaces
+  `labelkit.operators.segment.judge_window` / `labelkit.operators.extract.extract_transition`
+  (§7.14/§7.15; used by the stream repair driver, §7.6). Orchestration may import common and
+  operators. CLI imports orchestration's public entry points plus common error/config contracts,
+  and never imports or instantiates operators.
 
 ---
 
 ## 1. Package layout and ownership
 
-```
+```text
 labelkit/
-  __init__.py                 # __version__ = "1.0.0"; TOOL_VERSION = f"labelkit/{__version__}"
-  cli.py                      # Entry layer: run | validate | rubric        → owner E13
-  errors.py                   # Exception hierarchy + exit codes + ErrorKind → shared, frozen here
-  types.py                    # Ch.4 shared data types                       → shared, frozen here
-  stage.py                    # Stage protocol + RunContext                  → shared, frozen here
-  config/
-    __init__.py               # re-exports: load, default_rubric, ResolvedConfig
-    model.py                  # all config dataclasses (§5)                  → M1 owner (E1)
-    loader.py                 # load(), default_rubric(), validation         → M1 owner (E1)
-  ingest.py                   # M2: Ingestor, IngestPlan, IngestReport       → E2
-  dedup.py                    # M3: DedupStage, DedupIndex                   → E3
-  quality.py                  # M4: QualityStage, fit_bradley_terry          → E4
-  annotate.py                 # M5: AnnotateStage, build_annotate_prompt,
-                              #     annotate_record, RepairContext           → E5
-  generate.py                 # M6: GenerateStage, generate_all              → E6
-  verify.py                   # M7: VerifyStage                              → E7
-  schema_engine.py            # M8: SchemaEngine + internal schemas          → E8
-  llm_client.py               # M9: LLMClient, Part/Message/PromptBundle/
-                              #     LLMResponse, ProfileUsage, ProbeResult   → E9
-  orchestrator.py             # M10: Orchestrator, RunSummary                → E10
-  emitter.py                  # M11: Emitter, meta assembly, report writer   → E11
-  obslog.py                   # M12: TraceEvent, EventLog, MetricsSink,
-                              #     setup_logging, event-name constants      → E12
-  classify.py                 # M13 (v1.7): ClassifyStage, build_classify_prompt,
-                              #     classify_record                          → E14
-  segment.py                  # M14 (v1.8): SegmentStage, build_segment_prompt,
-                              #     judge_window                              → E15
-  extract.py                  # M15 (v1.8): ExtractStage, build_extract_prompt,
-                              #     extract_transition                        → E16
-  data/rubrics/
-    default_text.toml         # already written — do not modify
-    default_ui.toml           # already written — do not modify
-    default_trajectory.toml   # v1.8 (spec Appendix A.3) — already written — do not modify
-tests/                        # pytest; each owner ships tests for their module
+├── __init__.py                         # __version__ and TOOL_VERSION only
+├── cli/
+│   ├── __init__.py                     # compatibility exports: main, build_parser, exit_code_for
+│   ├── main.py                         # process entry, exception rendering, sole exit-code mapping
+│   ├── parser.py                       # argparse definitions and CliOverrides conversion
+│   └── commands.py                     # run / validate / rubric user-facing handlers
+├── common/
+│   ├── __init__.py
+│   ├── contracts/
+│   │   ├── __init__.py
+│   │   ├── types.py                    # Ch.4 shared data types and frame/tree helpers
+│   │   └── stage.py                    # Stage protocol and RunContext
+│   ├── errors.py                       # cross-layer error vocabulary, exit codes, ErrorKind
+│   ├── config/
+│   │   ├── __init__.py                 # exports load, default_rubric, ResolvedConfig
+│   │   ├── model.py                    # all config dataclasses (M1)
+│   │   └── loader.py                   # TOML merge, validation, startup hook validation (M1)
+│   ├── runtime/
+│   │   ├── __init__.py
+│   │   ├── llm_client.py               # M9 transport, retry/key pools, concurrency, usage
+│   │   └── schema_engine.py            # M8 L0-L3 guarantee, repair, schema validation/stats
+│   ├── observability/
+│   │   ├── __init__.py
+│   │   └── obslog.py                   # M12 logs, trace, events, metrics, breaker state
+│   └── extensions/
+│       ├── __init__.py
+│       └── hooks.py                    # user validator resolution/execution/normalization
+├── operators/
+│   ├── __init__.py
+│   ├── ingest.py                       # M2
+│   ├── segment.py                      # M14
+│   ├── dedup.py                        # M3
+│   ├── classify.py                     # M13
+│   ├── extract.py                      # M15
+│   ├── quality.py                      # M4
+│   ├── generate.py                     # M6
+│   ├── annotate.py                     # M5
+│   ├── verify.py                       # M7
+│   └── emitter.py                      # M11
+├── orchestration/
+│   ├── __init__.py
+│   ├── orchestrator.py                 # M10 batch/stage lifecycle and report aggregation
+│   ├── factory.py                      # operator construction and frozen pipeline order
+│   ├── profile_usage.py                # validate --probe referenced-profile discovery
+│   └── runtime.py                      # runtime object-graph assembly and public run/validate entry
+└── data/rubrics/
+    ├── default_text.toml
+    ├── default_ui.toml
+    └── default_trajectory.toml
 ```
 
-`errors.py`, `types.py`, `stage.py` and `config/model.py` are **copy-paste from this document**
-(sections 3–6). They are shared code; whoever lands first commits them verbatim, nobody edits them
-afterwards without updating this file.
+`labelkit/common/errors.py`, `labelkit/common/contracts/types.py`,
+`labelkit/common/contracts/stage.py`, and `labelkit/common/config/model.py` are the canonical homes
+of the verbatim frozen material in sections 3–6. Changes to their frozen content still require
+updating this file first.
+
+### 1.1 Canonical paths and legacy compatibility shims
+
+The directories above are the canonical implementation paths. Existing external imports remain
+valid through thin re-export shims; production code must not import through those shims, and a shim
+must never copy implementation:
+
+```text
+labelkit.types          → labelkit.common.contracts.types
+labelkit.stage          → labelkit.common.contracts.stage
+labelkit.errors         → labelkit.common.errors
+labelkit.config.*       → labelkit.common.config.*
+labelkit.llm_client     → labelkit.common.runtime.llm_client
+labelkit.schema_engine  → labelkit.common.runtime.schema_engine
+labelkit.obslog         → labelkit.common.observability.obslog
+labelkit.hooks          → labelkit.common.extensions.hooks
+labelkit.ingest         → labelkit.operators.ingest
+labelkit.segment        → labelkit.operators.segment
+labelkit.dedup          → labelkit.operators.dedup
+labelkit.classify       → labelkit.operators.classify
+labelkit.extract        → labelkit.operators.extract
+labelkit.quality        → labelkit.operators.quality
+labelkit.generate       → labelkit.operators.generate
+labelkit.annotate       → labelkit.operators.annotate
+labelkit.verify         → labelkit.operators.verify
+labelkit.emitter        → labelkit.operators.emitter
+labelkit.orchestrator   → labelkit.orchestration.orchestrator
+```
+
+`labelkit.cli` remains the public module name but is now the `labelkit/cli/` package; there is no
+coexisting `labelkit/cli.py`. Its `__init__.py` preserves the established CLI exports, and the
+console-script target `labelkit.cli:main` remains unchanged. Compatibility includes public
+direct-call surfaces such as `annotate_record`, `build_*_prompt`, `judge_window`,
+`extract_transition`, `RunContext`, `LLMClient`, and `SchemaEngine`; their signatures and behavior
+remain frozen by the sections below.
 
 ---
 
 ## 2. Architecture recap (normative)
 
-Four layers (spec §2.2): CLI → M10 orchestrator → operator stages (M2 ingest, M14 segment —
-v1.8, default off, M3 dedup, M13 classify — v1.7, M15 extract — v1.8, default off, M4 quality,
-M5 annotate, M6 generate, M7 verify, M11 emitter) → services (M1 config, M8 schema engine,
-M9 LLM client, M12 obslog). Operators depend only on services and the shared types — never on
-each other (exceptions: verify→annotate repair hook, §7.4/§7.6; v1.8 verify→segment/extract
-direct calls, §7.14/§7.15/§7.6).
+Four physical layers (spec §2.2 and package-layer reorganization spec):
+`labelkit.cli → labelkit.orchestration → labelkit.operators → labelkit.common`. Common contains
+cross-layer contracts and shared capabilities, not data-processing business logic: M1 config;
+M8/M9 under `common.runtime`; M12 under `common.observability`; user hooks under
+`common.extensions`; and the cross-layer error vocabulary at the `common.errors` root. Canonical
+files: errors at `labelkit/common/errors.py`; SchemaEngine/LLMClient at
+`labelkit/common/runtime/schema_engine.py` and `labelkit/common/runtime/llm_client.py`; hooks at
+`labelkit/common/extensions/hooks.py`; obslog at `labelkit/common/observability/obslog.py`. Operators
+(M2 ingest, M14 segment, M3 dedup, M13 classify, M15 extract, M4 quality, M5 annotate, M6
+generate, M7 verify, M11 emitter) depend only on common, subject solely to the three sanctioned
+lazy operator calls (verify→annotate/segment/extract, §7.4/§7.6/§7.14/§7.15). Orchestration may
+depend on common and operators and owns construction/order/lifecycle; CLI calls orchestration's
+public runtime entry points and owns only parsing, user interaction, and the sole exception-to-exit-
+code mapping. Common depends on neither operators nor orchestration; operators never depend on
+orchestration; CLI never imports operators.
 
 Pipeline order per batch (process mode, v1.8 chain — the single superset tuple, §7.9):
 `segment → dedup → classify → extract → quality → generate(off-path, returns sub-batch) →
@@ -105,7 +171,7 @@ M7 member surgery). Stages never delete list elements; they flip `status` and at
 
 ---
 
-## 3. `labelkit/types.py` — verbatim
+## 3. `labelkit/common/contracts/types.py` — verbatim
 
 ```python
 """Shared data types (spec ch.4). Frozen contract — do not edit without updating CONTRACTS.md."""
@@ -322,7 +388,7 @@ class VerificationResult:
 @dataclass(frozen=True)
 class StageError:
     stage: str                             # stage name that produced the error
-    kind: str                              # error classification code (§7.6 / errors.ErrorKind)
+    kind: str                              # error classification code (§7.6 / common.errors.ErrorKind)
     message: str
     retryable: bool
 
@@ -350,7 +416,7 @@ class PipelineItem:                        # the ONLY mutable envelope; lifetime
 
 
 # ── v1.8 shared frame helpers (spec §4.3, S12/S13) ──────────────────────────
-# Module-level functions in types.py, next to UITree.serialize — the shared
+# Module-level functions in labelkit/common/contracts/types.py, next to UITree.serialize — the shared
 # rendering layer used by M14 segment, M15 extract, M13 classify (sequence
 # branch) and M4 quality (sequence branch). Operator modules never depend on
 # each other; shared rendering always sinks to this types layer.
@@ -406,7 +472,7 @@ Notes binding on all implementers:
 
 ---
 
-## 4. `labelkit/errors.py` — verbatim
+## 4. `labelkit/common/errors.py` — verbatim
 
 ```python
 """Exception hierarchy (spec §4.3) and error classification codes (spec §7.6)."""
@@ -519,12 +585,12 @@ class ErrorKind(str, enum.Enum):
     INTERNAL_ERROR = "internal_error"                        # any unexpected exception
 ```
 
-Exception → exit-code mapping is implemented **only** in `cli.py` (§7.12). No module calls
+Exception → exit-code mapping is implemented **only** in `labelkit/cli/main.py` (§7.12). No module calls
 `sys.exit`.
 
 ---
 
-## 5. `labelkit/stage.py` — verbatim
+## 5. `labelkit/common/contracts/stage.py` — verbatim
 
 ```python
 """Stage protocol (spec §4.3) and RunContext (spec §3.10.3). Frozen contract."""
@@ -535,11 +601,11 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from labelkit.config.model import ResolvedConfig
-    from labelkit.llm_client import LLMClient
-    from labelkit.schema_engine import SchemaEngine
-    from labelkit.obslog import MetricsSink
-    from labelkit.types import PipelineItem
+    from labelkit.common.config.model import ResolvedConfig
+    from labelkit.common.runtime.llm_client import LLMClient
+    from labelkit.common.runtime.schema_engine import SchemaEngine
+    from labelkit.common.observability.obslog import MetricsSink
+    from labelkit.common.contracts.types import PipelineItem
 
 
 @dataclass
@@ -604,9 +670,9 @@ Binding rules:
 
 ---
 
-## 6. `labelkit/config/` — M1
+## 6. `labelkit/common/config/` — M1
 
-### 6.1 `config/model.py` — verbatim dataclasses
+### 6.1 `labelkit/common/config/model.py` — verbatim dataclasses
 
 Every field name, type and default below mirrors the spec §5.1/§5.2/§5.3 tables exactly.
 `None` means "absent/optional" unless stated. All arrays become tuples (immutability).
@@ -1057,7 +1123,7 @@ above is unchanged. v1.8: the merge covers the fifth section `extract` (whitelis
 (S2); per-class rubric re-resolution inherits the S29 empty-selector rule through the base
 selector automatically.
 
-### 6.2 `config/loader.py` — API (spec 3.1.3, verbatim)
+### 6.2 `labelkit/common/config/loader.py` — API (spec 3.1.3, verbatim)
 
 ```python
 def load(config_path: Path, project_path: Path, cli_overrides: CliOverrides) -> ResolvedConfig:
@@ -1162,7 +1228,7 @@ apply only when `classify.enabled = true` unless stated):
 23. `classify.llm` must exist in `[llm.*]`; UI modality ⇒ that profile has
     `supports_vision = true`. The classify profile joins ALL THREE reference sets (R24):
     the loader's referenced set (rule 12 key resolution), the vision-check set (rule 4),
-    and `cli.referenced_profiles()` (`validate --probe`).
+    and `labelkit.orchestration.profile_usage.referenced_profiles()` (`validate --probe`).
 24. `classify.assignment` ∈ {"single", "multi"}; `classify.max_labels` may be set ONLY when
     `assignment = "multi"` and must be ∈ [2, len(classes)] — when absent M1 back-fills it to
     `len(classes)`. `classify.self_consistency` is 0 or an odd integer ≥ 3;
@@ -1203,7 +1269,8 @@ apply only when the named switch is on unless stated):
     CONFIG_ERROR).
 33. Reference sets (S30 — the "three sets" of rule 23 are FOUR for v1.8 profiles:
     key resolution (rule 12) / vision (rule 4/34) / `validate --probe`
-    (`cli.referenced_profiles()`) / existence): `segment.llm` joins them ONLY when
+    (`labelkit.orchestration.profile_usage.referenced_profiles()`) / existence): `segment.llm`
+    joins them ONLY when
     `segment.enabled` AND `segment.strategy ∈ {llm, hybrid}` (the rules strategy makes zero
     LLM calls — no key may be demanded), and joins the vision set only when
     `segment.use_vision = true`; `extract.llm`, when `extract.enabled`, ALWAYS joins all
@@ -1248,7 +1315,7 @@ or lower `sequence_frames`; the 20-image threshold counts ALL image blocks in th
 Everything in this section is the complete public surface. Anything not listed is private
 (`_`-prefixed) and may not be imported across modules.
 
-### 7.1 M2 — `labelkit/ingest.py`
+### 7.1 M2 — `labelkit/operators/ingest.py`
 
 ```python
 @dataclass(frozen=True)                            # [FROZEN HERE]
@@ -1338,9 +1405,10 @@ class Ingestor:
     def report(self) -> IngestReport: ...
 ```
 
-Wiring note **[FROZEN HERE]**: `Ingestor` is not a `Stage` and has no `ctx`; the CLI/orchestrator
-sets `ingestor.metrics = metrics_sink` (public attribute, default `None`) before calling
-`records()` so ingest trace events can be emitted with `batch_no=0`.
+Wiring note **[FROZEN HERE]**: `Ingestor` is not a `Stage` and has no `ctx`;
+`labelkit/orchestration/runtime.py` sets `ingestor.metrics = metrics_sink` (public attribute,
+default `None`) before the orchestrator calls `records()` so ingest trace events can be emitted
+with `batch_no=0`.
 
 Pairing rules (spec 3.2.4, normative): recursive scan; one shared index namespace across
 subdirectories; filename patterns `^uitree_(\d+)\.jsonl$` and `^image_(\d+)\.(png|jpg|jpeg)$`
@@ -1372,6 +1440,8 @@ v1.8 stream ordering & monotonicity (spec §6.1, S19/S20 — active only when `s
   `ingest.disorder` event per record (trace-only; M2 itself logs ONE data-free stderr
   WARN per run — the reason carries timestamp values and never reaches stderr, §8.1);
   `"fail"` = InputError → exit 3.
+
+### 7.2 M3 — `labelkit/operators/dedup.py`
 
 ```python
 class DedupIndex:
@@ -1445,7 +1515,7 @@ adaptation points, all others unchanged):
   dedup in the chain, §7.9) — frame-level dedup semantics are intentionally void in stream
   mode.
 
-### 7.3 M4 — `labelkit/quality.py`
+### 7.3 M4 — `labelkit/operators/quality.py`
 
 ```python
 class QualityStage(Stage):
@@ -1522,6 +1592,8 @@ v1.8 sequence scoring (`record.kind == "sequence"`; spec 3.4.3 sequence row):
 - **Gate**: stream mode keeps the existing default of "score only, no filtering" when
   `quality.threshold` is absent — deliberately so (TRM ablation + E2E #6, spec §1.6).
 
+### 7.4 M5 — `labelkit/operators/annotate.py`
+
 ```python
 @dataclass(frozen=True)                            # [FROZEN HERE]
 class RepairContext:
@@ -1596,7 +1668,7 @@ rng; n ≤ k takes all members). Self-consistency and the L2.5 hook paths are UN
 L2.5 callback receives `record=None` for sequence records — documented limitation; a richer
 payload is a roadmap candidate).
 
-### 7.5 M6 — `labelkit/generate.py`
+### 7.5 M6 — `labelkit/operators/generate.py`
 
 ```python
 class GenerateStage(Stage):
@@ -1654,7 +1726,7 @@ v1.7 per-class generation (classify enabled, process mode; spec 3.6.2 按类种�
 - **generate_only:** the `generate_all` flat path is UNCHANGED (global instruction, no class
   segments); its products are classified normally by the chain's classify stage.
 
-### 7.6 M7 — `labelkit/verify.py`
+### 7.6 M7 — `labelkit/operators/verify.py`
 
 ```python
 class VerifyStage(Stage):
@@ -1727,7 +1799,7 @@ byte-unchanged; sequence envelopes are driven by a stage-layer bypass driver:
   (per defect kind) → `report.stream.verify`. Defect summaries ride the `verify.verdict`
   event payload (content-tiered, §8.1).
 
-### 7.7 M8 — `labelkit/schema_engine.py`
+### 7.7 M8 — `labelkit/common/runtime/schema_engine.py`
 
 ```python
 class SchemaEngine:
@@ -1782,7 +1854,7 @@ exhausted → `SchemaViolation(errors, raw_last_output)`. Bucketing: clean L2 pa
 response (whether L0 was active or L1 trivially parsed with no fence/repair needed) →
 `l0_or_clean`; L1 had to fix something and L2 then passed → `l1`; passed after repair round 1/2 →
 `l3_1`/`l3_2`; exhausted → `rejected`. Internal schema constants (module-level in
-`schema_engine.py`, imported by stages) — exact JSON in §10.7:
+`labelkit/common/runtime/schema_engine.py`, imported by stages) — exact JSON in §10.7:
 
 ```python
 def judgment_schema(criteria_keys: list[str], with_reason: bool) -> dict: ...
@@ -1803,7 +1875,7 @@ counting, no L2.5 hook, keyword set ⊆ the frozen internal-schema keyword set, 
 path keeps using the frozen `VERDICT_SCHEMA`; `defect_verdict_schema()` exists ALONGSIDE it
 (two verdict schemas co-exist, S7).
 
-### 7.8 M9 — `labelkit/llm_client.py`
+### 7.8 M9 — `labelkit/common/runtime/llm_client.py`
 
 ```python
 @dataclass(frozen=True)
@@ -1958,7 +2030,7 @@ nothing); retry exhaustion also records `fatal=True`; any success →
 §8.2 payload (+ `key_env` for pools > 1, v1.6); API keys never enter any log path — key
 identity is always the env-var NAME.
 
-### 7.9 M10 — `labelkit/orchestrator.py`
+### 7.9 M10 — `labelkit/orchestration/orchestrator.py`
 
 ```python
 @dataclass(frozen=True)                            # [FROZEN HERE]
@@ -2081,7 +2153,7 @@ v1.8 stream orchestration (spec 3.10.3 stream rows; active only when `segment.en
   session sizes; text-modality line counting and the session dry-run fuse into a single
   read pass (S23, §7.1).
 
-### 7.10 M11 — `labelkit/emitter.py`
+### 7.10 M11 — `labelkit/operators/emitter.py`
 
 ```python
 @dataclass(frozen=True)                            # [FROZEN HERE]
@@ -2150,7 +2222,7 @@ v1.8 (spec 3.11.2 stream rows):
   `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}` (S25, §9.2) instead
   of the single-record payload shape.
 
-### 7.11 M12 — `labelkit/obslog.py`
+### 7.11 M12 — `labelkit/common/observability/obslog.py`
 
 ```python
 @dataclass(frozen=True)
@@ -2232,11 +2304,12 @@ free text — stripped at `none`, carried from `refs`); NEW module constant
 `_DATA_KEYS = {"target", "value"}` — INPUT-DATA-DERIVED payload fields (widget text
 references, typed-in text), stripped at BOTH `none` and `refs` (the refs tier's
 "no input data content" red line), carried from `excerpt`. The channel enumeration
-`_TRACE_CHANNELS` (owned by `config/loader.py`) grows 8 → 10 with `"segment"`/`"extract"`
+`_TRACE_CHANNELS` (owned by `labelkit/common/config/loader.py`) grows 8 → 10 with
+`"segment"`/`"extract"`
 (S1: channel = stage name; the `error` event auto-routes by its `stage` field — zero routing
 code changes).
 
-### 7.12 CLI — `labelkit/cli.py`
+### 7.12 CLI — `labelkit/cli/` package
 
 ```
 labelkit run      --config <config.toml> --project <project.toml>
@@ -2250,27 +2323,41 @@ labelkit rubric   [--show default:text|default:ui|default:trajectory]
 def main(argv: list[str] | None = None) -> int:    # entry point (pyproject console script)
 ```
 
-Wiring order for `run` (owned by cli.py): parse args → `config.load()` → `setup_logging` →
-`run_id = secrets.token_hex(6)`, `run_started_at = datetime.now().astimezone()` →
-`EventLog` + `MetricsSink` → `LLMClient` → `SchemaEngine` → stages per switches (`DedupIndex`
-constructed here, passed to `DedupStage`) → `Ingestor` (process mode) → `Emitter` →
-`Orchestrator` → `asyncio.run(orch.run())` → exit code: `ConfigError`→2, `InputError`→3,
-fatal (`RunSummary.exit_code==4` / unwritable output / auth failure)→4, `--strict` and
-rejects>0 → 1 (already folded into `RunSummary.exit_code` by M10, §7.9), report write
-failure → 1, else 0. `validate`: `config.load()` only (+`--probe`:
-`LLMClient.probe_all` on every referenced profile (v1.6 — one line per key for pooled
-profiles; single-key output format unchanged), print results; any probe failure does not change
-the exit code unless config itself is invalid **[FROZEN HERE]**). `rubric`: no flag → list
-available names; `--show <name>` → print the packaged TOML verbatim (`_RUBRIC_FILES` /
-argparse choices gain `default:trajectory` → `default_trajectory.toml`, v1.8).
+Physical ownership is split without changing the CLI surface: `labelkit/cli/parser.py` owns
+argparse definitions and `CliOverrides` conversion; `labelkit/cli/commands.py` owns the `run`,
+`validate`, and `rubric` user-facing handlers; `labelkit/cli/main.py` owns the process entry,
+exception rendering, and the sole exception-to-exit-code mapping; `labelkit/cli/__init__.py`
+preserves the established public imports and `labelkit.cli:main` console-script target.
 
-v1.8: `_build_stages` constructs `SegmentStage` and `ExtractStage` per their switches at
-their `_CHAIN_ORDER` slots (§7.9). `referenced_profiles()` (the `validate --probe` set)
-gains `segment.llm` ONLY when `segment.enabled` and `segment.strategy ∈ {llm, hybrid}`, and
-`extract.llm` whenever `extract.enabled` (S30, §6.3 rule 33 — the same conditions govern all
-four reference sets).
+Wiring order for `run`: CLI parses arguments and calls
+`labelkit.orchestration.runtime.execute_run`; that orchestration runtime owns
+`labelkit.common.config.load()` →
+`setup_logging` → `run_id = secrets.token_hex(6)`,
+`run_started_at = datetime.now().astimezone()` → `EventLog` + `MetricsSink` → `LLMClient` →
+`SchemaEngine` → `labelkit.orchestration.factory.build_stages()` → `Ingestor` (process mode) →
+`Emitter` → `Orchestrator` → `asyncio.run(orch.run())`. The factory owns operator instantiation,
+including `DedupIndex`, and the frozen stage order; CLI never imports or constructs those objects.
+`labelkit/cli/main.py` then maps the unchanged outcomes: `ConfigError`→2, `InputError`→3, fatal
+(`RunSummary.exit_code==4` / unwritable output / auth failure)→4, `--strict` and rejects>0 → 1
+(already folded into `RunSummary.exit_code` by M10, §7.9), report write failure → 1, else 0.
 
-### 7.13 M13 — `labelkit/classify.py` (v1.7)
+`validate`: the command handler calls `labelkit.orchestration.runtime.validate_project`; with
+`--probe`, it calls `probe_referenced_profiles`, which uses
+`labelkit.orchestration.profile_usage.referenced_profiles` and `LLMClient.probe_all` on every
+referenced profile (v1.6 — one line per key for pooled profiles; single-key output format
+unchanged). Any probe failure does not change the exit code unless config itself is invalid
+**[FROZEN HERE]**. `rubric`: `labelkit/cli/commands.py` lists available names when no flag is
+given; `--show <name>` prints the packaged TOML verbatim (`_RUBRIC_FILES` / argparse choices
+include `default:trajectory` → `default_trajectory.toml`, v1.8).
+
+v1.8: `labelkit.orchestration.factory.build_stages` constructs `SegmentStage` and `ExtractStage`
+per their switches at their `_CHAIN_ORDER` slots (§7.9).
+`labelkit.orchestration.profile_usage.referenced_profiles()` (the `validate --probe` set) gains
+`segment.llm` ONLY when `segment.enabled` and `segment.strategy ∈ {llm, hybrid}`, and
+`extract.llm` whenever `extract.enabled` (S30, §6.3 rule 33 — the same conditions govern all four
+reference sets).
+
+### 7.13 M13 — `labelkit/operators/classify.py` (v1.7)
 
 (New module, spec 3.13. Numbered AFTER the pre-existing 7.12 CLI section so every
 frozen §7.x anchor in code and docs stays valid; chain position is dedup → **classify** →
@@ -2357,7 +2444,7 @@ Normative behavior:
   surgery — a repaired sibling's `record` diverges (same `_meta.id` output rows may then
   carry different `member_ids`), disambiguated by `_meta.stream.repaired` (§7.6/§9.1).
 
-### 7.14 M14 — `labelkit/segment.py` (v1.8)
+### 7.14 M14 — `labelkit/operators/segment.py` (v1.8)
 
 (New module, spec 3.14 / `spec/314-m14-segment.md`. Numbered AFTER §7.13 so every frozen
 §7.x anchor stays valid; chain position is the HEAD of the chain — before dedup, §7.9/§2.)
@@ -2437,7 +2524,7 @@ Normative behavior (spec 3.14.4):
   `below_min_len`/`digest_poor_frames` report fields are M14-owned (§9.3);
   `counts.episodes`/`absorbed`/`dropped_noise` are M10's (§7.9).
 
-### 7.15 M15 — `labelkit/extract.py` (v1.8)
+### 7.15 M15 — `labelkit/operators/extract.py` (v1.8)
 
 (New module, spec 3.15 / `spec/315-m15-extract.md`. Chain position: after classify, before
 quality, §7.9 — labels are in place so `[class.<label>.extract]` per-class instructions
@@ -2564,7 +2651,8 @@ milliseconds and timezone offset, e.g. `2026-07-02T09:31:04.482+08:00`.
 | `"excerpt"` | + `excerpt` field on `quality.judgment` / `quality.pointwise` / `annotate.done` / `verify.verdict`: `{record_id: first 200 chars}` (text: `Record.text`; UI: `UITree.serialize()` output; never images); + the `_DATA_KEYS` fields (v1.8, below) |
 | `"full"` | + `gen_ai.input.messages` / `gen_ai.output.messages` on `llm.call` (requires "llm" in channels) |
 
-v1.8 (S27): two redaction key sets in `obslog.py` (§7.11) — `_FREE_TEXT_KEYS` gains
+v1.8 (S27): two redaction key sets in `labelkit/common/observability/obslog.py` (§7.11) —
+`_FREE_TEXT_KEYS` gains
 `"defects"` (the verify.verdict stream defect table carries LLM free text in `detail`;
 dropped whole-key at tier "none", same level as critiques) and
 `"description"` (LLM-produced text: stripped at `none`, carried from `refs`, same tier as
@@ -3470,7 +3558,8 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
 18. `MetricsSink.event(...)` builder signature; `EventLog(cfg, run_id)`; stderr formatter via
     logging `extra={'stage','batch'}`; event-name constants list.
 19. CLI: `validate --probe` failures print results without changing the exit code; `rubric`
-    without `--show` lists names; exception→exit-code mapping lives only in `cli.py`.
+    without `--show` lists names; exception→exit-code mapping lives only in
+    `labelkit/cli/main.py`.
 20. Generated records' `_meta.source` emits `"pair_index": null` (never `line_no`), matching
     the spec 3.6.4 worked example; ingested records emit whichever of line_no/pair_index is
     non-null (§9.1 rule reproduces both spec examples).

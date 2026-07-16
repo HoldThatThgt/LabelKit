@@ -10,7 +10,7 @@ import os
 import jsonschema
 import pytest
 
-from labelkit.config.model import (
+from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
     Criterion,
@@ -30,9 +30,9 @@ from labelkit.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.errors import ProviderFatalError
-from labelkit.llm_client import LLMClient, Message, Part, PromptBundle
-from labelkit.obslog import EventLog, MetricsSink
+from labelkit.common.errors import ProviderFatalError
+from labelkit.common.runtime.llm_client import LLMClient, Message, Part, PromptBundle
+from labelkit.common.observability.obslog import EventLog, MetricsSink
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 
 pytestmark = pytest.mark.integration
@@ -214,8 +214,8 @@ async def test_auth_fatal_trips_breaker_and_queued_calls_fail_fast(tmp_path):
     immediately (hard trip) and the calls queued behind it on the semaphore
     fail fast WITHOUT firing doomed HTTP requests (per-attempt breaker
     re-check after semaphore acquisition)."""
-    from labelkit.errors import CircuitBreakerTripped
-    from tests.test_obslog import make_cfg as obslog_cfg
+    from labelkit.common.errors import CircuitBreakerTripped
+    from tests.common.test_obslog import make_cfg as obslog_cfg
 
     prof = _profile(api_key_env="LABELKIT_BAD_KEY_TEST", max_concurrency=1)
     os.environ["LABELKIT_BAD_KEY_TEST"] = "definitely-not-a-key"

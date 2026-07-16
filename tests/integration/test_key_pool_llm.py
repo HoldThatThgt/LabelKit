@@ -13,12 +13,12 @@ import os
 
 import pytest
 
-from labelkit.config.model import LLMProfile
-from labelkit.errors import ProviderFatalError
-from labelkit.llm_client import LLMClient, Message, Part, PromptBundle
-from labelkit.obslog import EventLog, MetricsSink
+from labelkit.common.config.model import LLMProfile
+from labelkit.common.errors import ProviderFatalError
+from labelkit.common.runtime.llm_client import LLMClient, Message, Part, PromptBundle
+from labelkit.common.observability.obslog import EventLog, MetricsSink
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
-from tests.test_obslog import make_cfg as obslog_cfg
+from tests.common.test_obslog import make_cfg as obslog_cfg
 
 pytestmark = pytest.mark.integration
 
@@ -91,7 +91,7 @@ async def test_bogus_first_key_absorbed_and_rotates(tmp_path):
     feeds the breaker. llm.key_disabled fires exactly once per key (7.2)."""
     import json
 
-    from labelkit.config.model import TraceConfig
+    from labelkit.common.config.model import TraceConfig
 
     prof = _pool_profile([("LK_POOL_ITEST_BAD", BOGUS_KEY),
                           ("LK_POOL_ITEST_GOOD", _real_key())],
