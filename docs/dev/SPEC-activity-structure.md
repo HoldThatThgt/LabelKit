@@ -331,7 +331,8 @@ on_error = "keep"        # "keep" | "fail"（fail 仅施于 episode 候选信封
 > ② spec §1.5 的 T-/N- 引用并入正式 spec 时映射为**全局顺延编号
 > [64]+**（v1.8 先例 [41]–[63]），先与既有 63 条查重（PoLL=[32]、Self-Consistency=[33]、
 > OS-Genesis=[41]、AndroidControl=[45]、GUI-Odyssey=[46] 等复用；含定稿复核增补
-> N-23…N-28，净新增约 20–25 条入 `85-ch9`）。③ CONTRACTS 三条算子间懒加载例外
+> N-23…N-28，实际净新增 27 条：[64]–[90]，总 90 条——同承重点合并遵循 v1.8
+> [47]/[53]/[60] 分组惯例）。③ CONTRACTS 三条算子间懒加载例外
 > **零增补**——seam 交接是 `seam_indexes` duck 标数据承载（与 session_split 同型），
 > 非函数直调。
 

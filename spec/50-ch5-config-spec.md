@@ -110,6 +110,17 @@ dims = 1024                         # 可选：返回向量维度校验
 | `segment.use_vision` | bool | false | true 时窗内逐帧附截图（所引 profile 须 supports_vision 且入 vision 引用集，S30）；默认纯文本（仅帧摘要）。 |
 | `segment.context` | str | "" | 可选域上下文，注入判据模板；**非边界定义**——边界判据内置于模板（3.14），零配置可用。 |
 | `segment.on_error` | str | "keep" | 单窗结构修复耗尽的处置："keep"（默认：该会话整体成一个 episode 存活 + 留痕三件套 `_meta.stream.degraded = {kind:"segmentation_invalid", windows_failed}` / error 事件 / `segment.failures` 计数，**不写 item.errors**——S26 归因防污染）\| "fail"（会话成员全部 failed → rejects，kind = segmentation_invalid，7.6）。 |
+| `stitch.enabled` | bool | false | v1.9 新增：线索缝合算子开关（M16，3.16；链序 segment 之后、dedup 之前，3.10.3）。默认关——主输出 / rejects / report.json 与 v1.8 **逐字节等价**（dry-run stderr 的 `stitch_calls=0` 行除外，3.16.4 退化锚）。启用要求 `segment.enabled = true`（M1 约束，3.1.4——stream 前置约束经此传递闭合）。no-op warning：`[stitch]` 在场而 `segment.enabled = false` 入 R8 点名名单；`segment.enabled = true` ∧ 本键 false 而节内有 payload ⇒ 单独 warning（3.1.4 ⑦）。 |
+| `stitch.llm` | str | "default" | 判定 profile 引用；仅启用时计入密钥解析 / `--probe` / 存在性引用集，**不入 vision 校验集**（判定证据为纯文本摘要卡，无视觉必需，3.1.4 / 3.16.3）。 |
+| `stitch.max_open` | int | 4 | 开放线索池容量（挂起窗口均值 3 + 1 活跃 [81]；移动域佐证 [90]）；池满且需开新线索时按逐出优先级封闭一条（stale-gap 优先 → LRU 兜底；封闭 ≠ 终结，3.16.4）。M1 校验 ≥ 1。 |
+| `stitch.bias` | str | "conservative" | "conservative"（默认：并入需 LLM 判 resume ∧ 机械先验合取命中——App 交集 / 实体重叠 / 返回同一页面析取三腿，3.16.4）\| "llm"（纯 LLM 判，审计/消融用）。 |
+| `stitch.rescue_short` | bool | true | below_min_len 短段按连续 run 重组先进候选池救援（3.16.4 救援行；命中翻转计 `rescued_short`、未命中维持 dropped_noise、永不开新线索）；false = 短段维持 dropped_noise（v1.8 行为）。 |
+| `stitch.repass` | bool | true | 有界二遍复评（3.16.4 ②：一遍结束后对单碎片线索逐个复评，修正顺序贪心漏缝；预算 ≤ 单碎片线索数）；false = 纯一遍贪心。 |
+| `stitch.stale_gap_steps` | int | 0 | 时间衰减阈值（会话序号差；0 = 不启用）。**双职**：① 先验降格——候选与线索尾跨度超限时先验须两腿命中（3.16.4 保守偏置行）；② 池满逐出优先腿（3.16.4 ①）。与 `stream.gap_steps` 语义区分：后者是 M2 会话切分规则，本键是会话内线索挂起跨度。 |
+| `stitch.digest_max_chars` | int | 400 | 摘要卡内嵌入的每个帧摘要截断上限（沿用 segment 同名键语义，3.16.3）。 |
+| `stitch.context` | str | "" | 可选域上下文（何为「同一任务」的领域提示），注入判定模板可选行；**非判据定义**——保守偏置内置于固定模板（3.16.4），零配置可用。 |
+| `stitch.votes` | int | 1 | 判定稳定化采样数：1（默认）= 不启用（单调用）；> 1 须为 ≥3 的奇数（**偶数 = CONFIG_ERROR**，M1 校验，3.1.4）——同判定 n 次采样、对 **(verdict, thread_ref) 完整判定**严格多数决（> n/2；任何分裂回落保守结局，3.16.4 votes 行）。成本 = 判定调用 ×n。 |
+| `stitch.on_error` | str | "keep" | 单判定结构修复耗尽的处置："keep"（默认：episode 候选开新线索存活 + 留痕两件（事件+计数器）；救援候选维持 dropped_noise + 同款留痕）\| "fail"（**仅施于 episode 候选信封**——failed → rejects，kind = stitch_invalid，7.6；救援候选不适用 fail 路径，3.16.6）。 |
 | `dedup.enabled` | bool | true | — |
 | `dedup.scope` | str | "global" | "global" \| "batch"（2.6 内存权衡）。 |
 | `dedup.minhash_threshold` | float | 0.85 | Jaccard 判重阈值（工业通行 0.8–0.9 [3][6]）。 |
@@ -137,7 +148,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `extract.on_error` | str | "fallback" | 单转移结构修复耗尽的处置："fallback"（默认，S16：该步记 `action_type="other"` + `Transition.detail = {kind:"extraction_invalid", message}` 留痕，**不写 item.errors**；quality 副读数注入时 fallback 步与 LLM 确证的 other **分列**——防污染连贯性锚点）\| "fail"（episode failed → rejects，kind = extraction_invalid，7.6）。 |
 | `quality.enabled` | bool | true | — |
 | `quality.mode` | str | "pairwise" | "pairwise" \| "pointwise"（1.6 对齐决策）。 |
-| `quality.llm` | str | "default" | profile 引用。v1.8 只增注：stream 模式下序列打分为纯文本（`[步骤序列]` + 帧摘要，无图，3.4.3 序列行）——UI 模态亦**不**因 stream 要求本 profile supports_vision（vision 逐阶段表的唯一放宽项，S30，3.1.4）。 |
+| `quality.llm` | str | "default" | profile 引用。v1.8 只增注：stream 模式下序列打分为纯文本（`[步骤序列]` + 帧摘要，无图，3.4.3 序列行）——UI 模态亦**不**因 stream 要求本 profile supports_vision（vision 逐阶段表的放宽项，S30，3.1.4；v1.9 起 `stitch.llm` 同为纯文本恒不要求，「唯一放宽」不再成立）。 |
 | `quality.rounds` | int | 4 | pairwise 轮数 k。 |
 | `quality.criteria_per_call` | str | "all" | "all" \| "single"（3.4.3）。 |
 | `quality.threshold` | float | 无 | 聚合分过滤线 [0,1]；缺省 = 不过滤只打分。 |
@@ -182,7 +193,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `output.rejects` | str | "refs" | "none" \| "refs" \| "full"（3.11.2）。 |
 | `trace.enabled` | bool | false | 启用 trace 追踪日志（第 7 章）。 |
 | `trace.path` | str | 自动 | 默认 `{output_stem}.trace.jsonl`，与主输出同目录。 |
-| `trace.channels` | array | ["quality","verify","schema"] | 可选值 ingest \| segment（v1.8 增）\| dedup \| classify（v1.7 增）\| extract（v1.8 增）\| quality \| annotate \| verify \| schema \| llm（十个，7.2 事件目录；通道 = stage 名，S1）；默认值不变——分类事件须用户显式加 "classify"、分段/摘取事件须显式加 "segment" / "extract" 才写；run.*/batch.* 生命周期事件不受此过滤。 |
+| `trace.channels` | array | ["quality","verify","schema"] | 可选值 ingest \| segment（v1.8 增）\| stitch（v1.9 增）\| dedup \| classify（v1.7 增）\| extract（v1.8 增）\| quality \| annotate \| verify \| schema \| llm（十一个，7.2 事件目录；通道 = stage 名，S1）；默认值不变——分类事件须用户显式加 "classify"、分段/摘取/缝合事件须显式加 "segment" / "extract" / "stitch" 才写；run.*/batch.* 生命周期事件不受此过滤。 |
 | `trace.content` | str | "refs" | "none" \| "refs" \| "excerpt" \| "full" 内容脱敏四档（7.4）。 |
 
 **`[class.<name>.<section>]` 按类覆盖（v1.7）。**classify 启用时可按类覆盖下游算子参数：`<name>` 必须 ∈ classes；未出现的键一律继承全局节（不配任何覆盖即纯打标模式）。可覆盖键白名单（M1 强校验，白名单外的键报 `CONFIG_ERROR`——3.1.4「未知键报 warning」行的显式例外；白名单后续只增）：
@@ -194,9 +205,9 @@ dims = 1024                         # 可选：返回向量维度校验
 | `[class.*.generate]` | instruction, styles, num_per_record, temperature | llms / mixture / weights / seeds_per_call / num_per_call / sample_validator |
 | `[class.*.verify]` | extra_criteria | llm / judges / policy / max_repair_rounds |
 | `[class.*.extract]` | instruction（v1.8 增） | llm / include_diff / on_error——LLM 绑定与失败策略属部署与成本面（与 quality 行同理） |
-| —— | —— | run.* / input.* / stream.*（v1.8）/ dedup.* / segment.*（v1.8）/ classify.* / output.*（含 schema 与 validator——输出 Schema 全局唯一）/ trace.* 全部不可按类 |
+| —— | —— | run.* / input.* / stream.*（v1.8）/ dedup.* / segment.*（v1.8）/ stitch.*（v1.9）/ classify.* / output.*（含 schema 与 validator——输出 Schema 全局唯一）/ trace.* 全部不可按类 |
 
-v1.8 注：`segment.*` 不入白名单是**链序因果**而非取舍——链序为 segment → dedup → classify → extract →…（3.10.3），segment 在 classify **之前**执行，成段时类标签尚不存在，「按类分段」无从谈起；extract 在 classify 之后，故其 `instruction` 可按类覆盖（multi 扇出下兄弟信封各按其标签的有效 instruction 摘取，S9，3.15）。
+v1.8 注：`segment.*` 不入白名单是**链序因果**而非取舍——链序为 segment → stitch → dedup → classify → extract →…（3.10.3），segment 在 classify **之前**执行，成段时类标签尚不存在，「按类分段」无从谈起；extract 在 classify 之后，故其 `instruction` 可按类覆盖（multi 扇出下兄弟信封各按其标签的有效 instruction 摘取，S9，3.15）。v1.9 注：`stitch.*` 不入白名单同为链序因果——stitch 亦在 classify 之前（3.10.3），`[class.<name>.stitch]` 不存在（3.1.4 线索缝合行）。
 
 合并优先级：`[class.<name>].<sect>.<key>` > project.toml `[<sect>].<key>` > 内置默认——这是 project.toml **内部**的条件化合并，不改变「CLI > project.toml > config.toml」三源优先级（2.5）。M1 启动时按逐键 provenance 静态合并、冻结为 `class_views`，运行期零查找成本；选择组互斥对剔除、per-class rubric 重解析、类 examples 干跑等精确语义见 3.1.4 按类覆盖合并行。
 

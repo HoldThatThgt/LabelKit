@@ -27,7 +27,10 @@
 | Episode（序列记录 / 情节） | stream 模式的复合记录（v1.8）：M14 把同一目标导向活动的成员帧按序键收拢为一条 `kind = "sequence"` 的序列 Record（成员经 `members` 元组引用共享持有），作为一条普通记录走下游分类、打分、标注与评审（3.14、4.1）。 |
 | 会话（Session） | 摄取层按 `[stream]` 规则（时间间隙 gap / 分区键 key / 长度与时长上限）从有序记录流切出的候选窗口——流处理标准的 session window 原语的对应物 [55]；是 M14 语义精化的输入单元，切批改整会话装箱保证会话不跨批（3.2.8、3.10.3）。 |
 | 转移（Transition） | 序列内相邻两帧 ⟨s_i, s_{i+1}⟩ 之间发生的单个语义动作：M15 经 LLM 推断为结构化对象 {action_type, target, value, description} 写入 `item.transitions`，转移数 = 成员数 − 1（3.15、4.1）。 |
-| stream 模式 | `segment.enabled = true` 的运行形态（v1.8）：摄取按 `[stream]` 声明排序与会话化，链序为 segment → dedup → classify → extract → quality → annotate → verify；默认关闭，关闭时数据产出与 v1.7 逐字段一致（`_meta.stream: null` 除外）（2.3.1、3.10.3）。 |
+| stream 模式 | `segment.enabled = true` 的运行形态（v1.8）：摄取按 `[stream]` 声明排序与会话化，链序为 segment → stitch → dedup → classify → extract → quality → annotate → verify（stitch 为 v1.9 增位，默认关）；默认关闭，关闭时数据产出与 v1.7 逐字段一致（`_meta.stream: null` 除外）（2.3.1、3.10.3）。 |
+| 线索（Thread） | v1.9 stream 模式的顶层工作单元：M16 把同一目标导向任务被穿插切开的碎片保守缝合所得（三级结构 thread ⊃ fragment ⊃ step），承载体仍是一条 `kind = "sequence"` 的序列记录（幸存信封 Record 重绑、id 不重算，`thread_id` = 幸存信封 record.id），作为一条普通记录走下游判重、分类、打分、标注与评审（3.16、4.1）。未被缝合的 episode 即单碎片线索；`stitch.enabled = false` 时线索与 episode 天然同值。 |
+| 碎片（Fragment） | 线索的成员分段（v1.9）：会话序上连续归属同一线索的成员帧区间——缝合前的一个 episode 或一个救援短段；以 `_meta.stream.fragments[]`{order_span, member_count, cause, source_episode} 溯源，cause ∈ "origin" \| "resumed" \| "rescued"（3.16、6.3）。 |
+| 接缝（Seam） | 多碎片线索中相邻两碎片的拼接处（v1.9）。判据：拼接对的会话序间隙含 ≥1 个归属其他线索的帧（间隙仅含噪声帧/本线索救援帧时不是接缝，该对照常摘取，3.16.4）；接缝步由 M15 零 LLM 机械占位（`action_type="app_switch"`、`detail.kind="thread_seam"`、步行内 `resumed=true`，3.15.4），位置经 `seam_indexes` duck 标承载（左成员下标坐标，4.1）。 |
 
 ## 1.3 设计原则
 
@@ -63,6 +66,7 @@
 | （v1.4 评审补充）无输入数据场景下直接生成数据（纯生成模式） | `run.mode`（5.2）；3.6.2 种子来源分支；3.10.3 纯生成行；2.3.1 组合④ |
 | （v1.7 评审补充）分类与按类条件化路由：加入分类算子，根据分类执行不同的打分、标注与生成；多类命中可流向多个管线（单/多分类开关锁定） | M13 分类（3.13）；按类条件化 3.4.3 / 3.5.2 / 3.6.2 / 3.7.2；multi 扇出 3.13.4 与契约 ②a（4.3）；`[classify]` / `[class.*]` 配置 5.2 |
 | （v1.8 评审补充）时序流分割与动作摘取：数据按时间排序输入时对流做语义分割（episode 形成与噪声帧剔除）并摘取流中的动作数据，标注算子为序列打「用户在做什么」的任务标签 | M2 会话化（`[stream]`，3.2.8）+ M14 segment（3.14）+ M15 extract（3.15）+ 下游序列适配（M3/M13/M4/M5/M7，3.3.3 / 3.13.3 / 3.4.3 / 3.5.2 / 3.7.2）；轨迹 rubric 附录 A.3；契约 ②b（4.3） |
+| （v1.9 评审补充）活动结构：x 小时自然使用流标注出「n 帧组成的 m 个工作单元」——同一任务被穿插切开时缝合为一个线索（串联/单交叉/多交叉/噪声四类标定），短段业务尾帧可救援，噪声帧过滤不入线索 | M16 stitch 线索缝合（3.16，链序 segment 之后、dedup 之前）+ 下游线索适配（M3/M4/M5/M7/M15，3.3.3 / 3.4.3 / 3.5.2 / 3.7.2 / 3.15.4）；三级结构 thread ⊃ fragment ⊃ step 与接缝占位（3.16.4、3.15.4）；契约 ②c（4.3）；`[stitch]` 配置 5.2 |
 
 ## 1.5 算法与工程背书总表
 
@@ -114,6 +118,17 @@
 | 轨迹判分信度护栏（v1.8） | 机械锚点（extract 副读数注入裁决 prompt）+ stream 默认只打分不筛 + 分数按 episode 长度可观测 | Web-Shepherd, NeurIPS 2025；GUI-Shepherd；AgentRewardBench [61]——取用：zero-shot LLM 轨迹判分高方差、无单一模型通吃，检查清单分解是保命组件——机械锚点与 checklist 思想同构 |
 | 统一动作空间对齐（v1.8） | `action_type` 枚举 11 值 = AndroidControl 全集 ∪ UI-TARS-mobile 增量（`drag`、`app_switch`）+ other 兜底 | UI-TARS（工业）；UIPro, ICCV 2025 [62]——取用：2025–2026 统一移动动作空间共识含 drag 与应用切换/recent，跨 App episode 场景频率不可忽略 |
 | 树可靠性护栏（v1.8） | 帧摘要贫瘠护栏：可见文本节点为零或摘要趋零 ⇒ 计 `digest_poor_frames` + WARN + 手册指引开 `use_vision` | Do GUI Agents Believe Their Eyes?（引 CLAY ghost-node 统计）[63]——取用：Android 10.6% 结构节点无视觉呈现、37.4% 屏幕含 ghost node——树贫瘠不是长尾，须主动可观测而非被动抽读 |
+| 线索缝合问题形态（v1.9） | 屏幕流 =「多线索穿插 + 噪声」的形式化；缝合以线索（thread）为产出单元、错缝以乘法惩罚度量 | PIRA-Bench [64]——取用：任务子轨迹 = **非连续帧子集**的问题定义；噪声消融证实过连接偏差跨模型家族共享（precision 92→51 而 recall 反升，原文 "trigger-happy"）；S_final = F1 × FPS_norm 与负样本协议进真机门禁（3.16.7）。注：0 被引新基准，自报数字权重打折 |
+| 保守偏置合取（v1.9） | 并入需 LLM 判 resume ∧ 机械先验命中（App 交集 / 实体重叠 / 返回同一页面，析取三腿 + 超期降格）；口头置信度不入门槛 | 过连接量化：IdentifyMe / CORRECT-DETECT [76]——取用：LLM 回避「以上皆非」宁可硬连、准确与弃权此消彼长；「返回同一页面」腿机理 = cue-guided resumption（Altmann & Trafton / Trafton et al.）[80]；置信度饱和 [79] |
+| 单调选池判定（v1.9） | 每候选一次调用：池内开放线索摘要卡（最近活跃降序）+ 候选卡 → `thread_ref \| new`，顺序贪心 | GreedyDisentangle（Takada & Mori, LaCATODA@AAAI-26）[87]——取用：同任务同形制 SOTA 先例（簇摘要呈现 + LLM 归簇或判 new + 顺序贪心，全指标超 per-pair）；对话解缠谱系（贪心链接标准解码、并发线程 ≤3 占 46.4%、VI / 1-1 overlap / link-F1）[75]；呈现序与位置扰动测试防位置偏差 [77] |
+| 有界二遍复评（v1.9） | 一遍结束后对单碎片线索逐个复评（池 = 其他线索活视图），修正顺序贪心漏缝；预算 ≤ 单碎片线索数 | FAMER / Gruenheid et al. [74]——取用：无修复贪心劣于 batch 且次序依赖、**n=1 局部重聚类即追平 batch**；merge-only 是增量法中质量最差；subsequent-context 有效 [87]；更重簇修复机器（LLM-CER / GraphCR / Alper）已评估按规模不采 [78] |
+| 池容量与时间衰减（v1.9） | `max_open = 4`（挂起窗口均值 3 + 1 活跃）；`stale_gap_steps` 双职：先验降格 + 池满逐出优先腿；封闭 ≠ 终结 | Iqbal & Horvitz, CHI 2007 [81]——取用：真实桌面日志挂起窗口均值 3（S.D.≈2）、27% 挂起 >2h 才恢复；时长分布特征 +11.36%（CASAS）[66]；移动域仅 22.6% 任务穿插佐证宽松上界 [90]；working spheres 与手机中断/回访人因基线 [82] |
+| 短段救援（v1.9） | `below_min_len` 短段按连续 run 重组先进候选池：命中并入 + 帧翻转，未命中维持 dropped_noise，永不开新线索 | Iqbal & Horvitz [81]——取用：切换前收尾动作密集（段落完成率 0.78/min → 切换前 10.9–12.8/min）——任务收尾帧天然易成短段、聚集在切换点旁的文献级机理 |
+| 摘要卡证据面（v1.9） | 结构化摘要卡（App 集合 · 任务名 · 首末帧摘要 · 变更提示 · 跨度）替代全量帧历史；判定对 = 线索尾帧摘要 × 候选首帧摘要 | resumption 判定单元 =「挂起尾 × 恢复首」对（CIGAR）[65]——取用：帧摘要级降格承载（3.16.3）；window title 最强单特征（85.57%）与多窗聚合（SWISH / TaskPredictor）[83]；精选紧凑上下文反超全量原始历史（+10.4 pt、token 少 8×）与 summarization drift 风险命名（Engram / Memori / 综述）[88]；两级任务组匹配工业近例 Log2Plan [84] |
+| 缝合稳定性 votes（v1.9） | 单模型 n 采样、(verdict, thread_ref) 完整判定严格多数决（默认 votes=1 不启用）；不采多模型评审团 | Self-Consistency [33]——取用：一致率是可靠的不确定性信号（votes 是置信度门槛的正规替代 [79]）；边界：高自一致处过度自信、votes 治方差不治偏差 + 评审团有效独立票仅 ≈2 [89]；跨模型共识修不了共享偏差（within-model 0.68 > cross-family 0.47）[86]——对照 PoLL [32] 评审团路线不采（8.3 O8） |
+| 三级层级与身份链（v1.9） | thread ⊃ fragment ⊃ step；帧单一归属——交叉用「平面分段 + 线索身份」表达，不引入帧多重归属/区间树 | Ego4D Goal-Step [69]——取用：goal⊃step⊃substep 三级 + `is_continued` 续接标志的直接先例；GUI 域层级标配 AndroidControl [45]；视频域层级范式（FineGym / Breakfast）[71]；帧多标签先例（MultiTHUMOS / Charades）[72] 评估后**否决采纳**；嵌套与区间关系形式语义底座（HHMM / Allen）[73] |
+| 线索命名后置（v1.9） | `task_name` 由池空判定自举、滚动更新（工具内部结构，进 trace 与判定证据；用户任务标签仍由 annotate 产出） | OS-Genesis [41] / NNetNav [70]——取用：自然流 → 事后反推任务标注范式；「可命名性」剪枝判据 |
+| 问题域现状与护栏（v1.9） | interleaved 解缠无域内基线：护栏 = 保守合取 + 二遍复评 + 负样本协议 + 真机门禁（错缝 FPS = 0 验收线） | Robotic Process Mining [67]——取用：UI 日志 interleaved 解缠 = open challenge、全局法依赖「例程重复」前提（2025 复核不变 [85]）；学术解缠系列与三家产品均无穿插解缠 + 通信类 App 天然噪声名单 [68]；跨 App 单目标轨迹形态 [46] |
 
 ## 1.6 已对齐的设计决策
 
@@ -168,3 +183,19 @@
 - S30 profile 引用集四处：`segment.llm` 仅 `strategy ∈ {llm, hybrid}` 时计入；`extract.llm` 恒入且恒入 vision_users；stream 模式下 quality 的 supports_vision 强制校验放宽（序列打分纯文本，3.1.4）。
 - S31 verify 收缩弃帧 rejects 行 stage = "verify"、reason = "off_task_member"；计数器 `membership_repairs` / `boundary_flags` / `defects.<kind>` 入 report.stream.verify；transitions 手术后重编号 + `reseamed` 溯源标（3.7.3、6.4）。
 - S32 v1 保留 hybrid 滑窗（window ≥ 会话长时天然退化为整段单调用，GUIDE 证据 [57] 建议长会话调大 window）；判据模板明文「相关但无实体延续的新流程 = context_switch（边界）」与「会话首帧恒为段首」；GEBD 措辞降级为「中等共识可达」[48]；「extract 先行 + 动作序列上分段」次序列演进候选（8.4），以成本权衡论证。
+
+**活动结构——线索缝合与层级工作单元（v1.9 对齐，2026-07-15/16）**：需求原型为「x 小时自然使用手机的时序流标注出 n 帧组成的 m 个工作单元」，四类规范验收场景（串联/单交叉/多交叉/噪声）由需求方 2026-07-16 给定；真机 E2E（2026-07-15）证实三处结构性失效——交叉目标被切碎互不关联、短段吞业务末帧、extract/verify 编造连续性且可自洽过审。设计草案经三轮独立验证修订（功能完整性审计 2 blocker + 9 major + 10 minor、两轮 deep-search refute/elevate 五机制无一被驳倒、定稿五路复核 2 blocker + 6 major + 5 minor——全部裁决并入），收敛为**二十二项设计裁决 T1–T22**（编号与 v1.8 的 S1–S32 区隔），凡与草案不一致处以裁决为准，**详表见 `docs/dev/SPEC-activity-structure.md` §2**。逐条择要：
+
+- T1/T2/T3 交叉的表达模型：**线索身份缝合**——episode 平面互斥分区不动，M16 合并同线索碎片为线索信封、`_meta.stream.fragments` 保留碎片结构（Goal-Step `is_continued` 同型 [69]）；**帧多重归属否决**（单前台屏无真并发 [65]，帧单一 absorbed 是手术/归因/守恒公共地基，[72] 引用记录被拒方案）；层级取**三级 thread ⊃ fragment ⊃ step**、不做帧级区间树（3.16）。
+- T4 episode 内子任务跨度：**不做引擎特性**（需求方 2026-07-16 裁决）——标注层模式（用户 Schema `subtasks: [{label, step_range}]`）+ 手册指引；下游无消费方。
+- T5 算子形态与链序：新算子 M16，`_CHAIN_ORDER` 九名单一超集元组 `segment → stitch → dedup → classify → extract → quality → generate → annotate → verify`（缝合改成员集 ⇒ 先于 dedup/extract）；默认 off，off 时主输出/rejects/report.json 与 v1.8 逐字节等价（回归锚；dry-run stderr 行例外，3.10.3）。
+- T6/T7 契约与守恒：Stage 契约增 **②c** 例外（被并碎片壳置 `stitched`、幸存信封 Record 重绑 id 不重算、below_min_len 来源帧 dropped_noise→absorbed 翻转，含幸存者规范句，4.3）；Status 增 `stitched`（壳仅计被并 episode 信封；救援无壳），守恒全式 / failed 兜底 / unprocessed 残差**三处同步**扩 stitched 项，`counts.threads` 以恒等式 **threads = episodes − stitched** 由 M10 post-emit tally 导出（6.4、3.10.3）。
+- T8/T9 判定形态与保守偏置：**单调选池**（每候选一调：池内线索摘要卡按最近活跃降序 [77] + 候选卡 → `thread_ref | new`；证据面全部为帧摘要级——链序上 extract 后置，运行时无 Transition，[65] 判定单元降格为首末帧摘要对承载）；池容量 `max_open = 4`（挂起窗口均值 3 + 1 活跃 [81]，移动域佐证 [90]）；封闭仅发生于池满逐出（stale-gap 优先 → LRU 兜底；完成感知腿撤除——无动作生产者，8.1 ⑥）、**封闭 ≠ 终结**（保留二遍目标集与产出 [64][81][66]）；`bias="conservative"` 默认——并入需 LLM 判 resume ∧ 机械先验析取三腿（App 交集 / 实体重叠 / 返回同一页面 [80]）命中、超 `stale_gap_steps` 降格须两腿；**去除 confidence 门槛腿**（口头置信度饱和 [79]，字段仅 trace 观测）。
+- T10/T20 接缝：**零 LLM 机械占位**四键钉死（`action_type="app_switch"`、`detail={kind:"thread_seam", interrupted_by:[…]}`、步行内 `resumed=true`，3.15.4）；接缝判据 = 拼接对会话序间隙**含 ≥1 异线索帧**（间隙仅噪声/本线索救援帧不是接缝、照常摘取——与 v1.8「剔噪对照常摘取」单一处理）；`seam_indexes` 左成员下标坐标、与 `Transition.index` 同键空间；seam 占位不计入 `extract.transitions` / `by_type`（接缝唯一计量点 = `stream.stitch.seams`，6.4）。
+- T11 短段救援：`below_min_len` 帧（duck 标判别）按**连续 run 重组**为救援候选先进池（`segment.py` 零改动）；命中并入 + ②c③ 翻转计 `rescued_short`（单位 = 帧）、未命中维持 dropped_noise，**永不开新线索**；噪声帧（reason="noise"）不入候选池（3.16.4）。
+- T12/T13 作用域与判重：不跨 session、不跨 batch，hard-split 边界不可缝；segment 降格 episode 照常入池；dedup 判重单元 = 线索（重绑成员配方按序拼接，S10 机制原样），stitched 壳被 `status=="active"` 过滤天然排除——dedup 代码零改动（3.3.3）。
+- T14/T15 下游适配：quality/verify 步行渲染对 `detail.kind=="thread_seam"` 加专用后缀（防 trajectory rubric 把接缝当噪声残留扣分，3.4.3）；annotate 关键帧降采样升级为**按碎片配额**（每碎片保底 1 帧，3.5.2）；verify 序列 prompt 六段 → **七段**（新增 `[片段结构]` 节——无此节 wrong_stitch 不可判）、缺陷词表 5→6（+`wrong_stitch`，路由 mark-only + fail 独立分支）、`_session_episodes` 过滤 stitched 壳（3.7.2/3.7.3）。
+- T16/T17 观测与配置：trace 通道 10→11（`stitch`）+ 两事件 `stitch.judge` / `stitch.thread`、`task_name` 入脱敏自由文本集（7.2/7.4）；`report.stream.stitch` 子块与 batch.end 增 stitched/threads、dry-run 增 `stitch_calls` 估算行（off 恒 0 且无条件打印，3.10.3）；`_meta.stream` 增 thread_id / fragments / steps 行内 resumed（**条件在场**：全部 v1.9 新键仅启用时出现——off 逐字节等价的充分条件，6.3/6.4）；新节 `[stitch]` 11 键，M1 约束 stitch⇒segment、votes 偶数 = 配置错误、stitch∧rules WARN（3.1.4、5.2）。
+- T18 缝合稳定性 votes：**机制立项、默认 `votes = 1` 不启用**（需求方 2026-07-16「不允许 defer」指令裁决）；>1 时 n 次采样对 **(verdict, thread_ref) 完整判定严格多数决**（分裂一律回落保守结局）；路线选型采「单模型多次」（self-consistency [33]）而非「多模型评审团」（PoLL [32]）——votes 治方差（漂移）不治偏差（过连接）[89]，过连接是跨家族共享偏差 [64]、评审团会把它投成多数 [86][89]；`stitch.judges` 多模型扩展列 8.3 O8。
+- T19 有界二遍复评：复评候选 = 一遍结束时的单碎片线索，池 = 会话内全部其他线索**活视图**（超 max_open 按与候选跨度最近截取）；命中方向相反——候选作壳、目标线索幸存；预算 ≤ 单碎片线索数（[74] n=1 重聚类追平 batch；merge-only 最差 [74]；后见上下文有效 [87]；更重机器不采 [78]）。
+- T21/T22 输出与身份链：M11 增第四路由（stitched 仅计数，壳不得落 rejects 兜底；`--strict` 补注：开 stitch 后 strict 结果可能 1→0 属预期，3.11.2/2.4）；`steps[].index` 全线索连续 0..n−2，`episode_id` = 幸存信封 record.id = `thread_id`、碎片原 episode_id 落 `fragments[].source_episode`（3.16.4）。

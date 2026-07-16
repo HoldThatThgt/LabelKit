@@ -16,6 +16,8 @@
 | 输入 | 批内 `status="active"` 且 `record.kind="sequence"` 且 `transitions is None` 的 PipelineItem（`transitions is not None` 者幂等跳过，3.15.4）；`[extract]` 参数（5.2）；LLM profile（`extract.llm`，须 `supports_vision = true`——一请求 2 图，3.1.4）。 |
 | 输出 | 每个处理信封 `item.transitions: tuple[Transition, ...]`（长度恒 = `len(record.members) − 1`，按成员对位次升序；单条转移失败不破坏该不变量——fallback 占位，3.15.6）；批基数不变（不追加、不淘汰），返回值 = 传入的同一列表对象。`on_error="fail"` 且结构修复耗尽时该 episode `status="failed"`、StageError 入 `item.errors`（唯一改状态路径）。 |
 
+**接缝序数机械占位（v1.9）。**stitch 启用且信封为多碎片线索时（3.16），`seam_indexes` duck 标所列序数（接缝对左成员下标，与 `Transition.index` 同坐标）的转移**不发 LLM 调用**——代码侧生成 T10 占位 Transition（四键与 detail 见 3.15.4 占位行）；其余成员对**照常摘取**（含「间隙仅噪声/本线索救援帧」的拼接对与会话位置紧邻的救援拼接对——真实转移，与 v1.8「剔噪对照常摘取」惯例单一处理，3.16.4 接缝判据）。`transitions is None` 幂等门与 `len(transitions) = len(members) − 1` 不变量**不动**（占位步占据其 index 位次）；实现注记：跳过 seam 序数需重构本模块平铺 gather 的记账结构（既有 `spans` / 切片假设每成员对一协程）——属实质改动，非行内小补。
+
 信封变化示例（沿用 3.14.2 的点外卖 episode `7655568d2c485c43`，成员 f0 首页 → f1 搜索结果页 → f3 餐厅页 → f4 下单确认页；f1↔f3 在采集流中原不相邻——噪声帧 f2 已被 M14 剔除，转移以**成员**相邻为准）：
 
 ```
@@ -129,6 +131,7 @@ user（单条消息多 Part——「text 标签 + image」组装惯例同 3.5.2/
 | 幂等 | `transitions is not None` 的信封跳过——任何重入零额外调用。M7 修复路径不重跑本 stage：接缝重摘取经 `extract_transition` 函数直调（3.15.3、3.7）。 |
 | multi 扇出（**按 label 各摘**，S9） | classify `assignment="multi"` 扇出的兄弟信封克隆时 `transitions` 恒 None（classify 在前、extract 在后，3.13.4 multi 扇出行）——每个兄弟按**各自 label** 的有效 `extract.instruction` 独立摘取（per-label 白名单承诺兑现；transitions 每信封自持，接受 ×k 调用成本）。episode 命中多类应属罕见——M14 边界判据即「单一目标导向活动」（3.14.4）。dry-run 估算按乘数 1 报下界 + stderr 注明（3.13 R28 口径，2.4）。 |
 | fallback 语义 | 单转移 M8 修复耗尽且 `on_error="fallback"`（默认）：该步写入代码侧构造的兜底 Transition——`action = {"action_type": "other", "target": null, "value": null, "description": ""}` + `detail = {kind: "extraction_invalid", message}` 留痕；episode 存活、后续转移照常摘取；**不写 `item.errors`**（rejects 归因取 `item.errors[0]`，写入会在该记录后续阶段失败时污染归因——3.13.4 失败与兜底行同则）。留痕使兜底步与 LLM 确证的 other 对下游可区分（detail.kind 在场与否）。 |
+| 接缝占位（v1.9，T10 四键钉死） | `seam_indexes` 所列序数（3.15.2 占位段）写入代码侧构造的占位 Transition，**零 LLM**：`action = {"action_type": "app_switch", "target": null, "value": null, "description": "线索接缝：被<打断者>打断后恢复"}`（<打断者> = interrupted_by 各任务名顿号连接）+ `detail = {kind: "thread_seam", interrupted_by: [...]}`（按接缝判据恒非空，3.16.4）；steps 步行 `resumed = true` 落接缝步自身（emitter 由 detail.kind 推导，6.3）。**语义备注**：占位 `action_type="app_switch"` 对同 App 内穿插（返回同页型）语义不贴——占位类型**不承诺语义**，下游以 `detail.kind` 判别（与 extraction_invalid 留痕同法）。**计数器口径**：seam 占位**不计入** `report.stream.extract.transitions` 与 `extract.by_type.*`（非摘取产物——零 LLM 的 app_switch 会灌污 by_type 分布；接缝唯一计量点 = `report.stream.stitch.seams`，6.4）；**相邻救援不占位**：会话位置紧邻的救援拼接对是真实转移，照常送 LLM 摘取并正常计数（3.16.4 救援行）。 |
 
 ### 3.15.5 配置项
 

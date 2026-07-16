@@ -31,6 +31,8 @@ UI 模态合成判定：`dedup.ui_dup_requires = "both"`（默认，树近似重
 - **③ pHash**：对序列记录自动跳过（序列 Record 的 `image is None`——既有跳过门，零新增代码路径）；`ui_dup_requires = "both"` 下序列记录的合成判定**降级按 `"tree"` 处理**（与图像解码失败的降级路径同款，3.3.4）。
 - **④ 语义**：参检判定与判种归类两处逻辑（实现为 `_semantic_participates` / `_semantic_verdict_kind`）各增序列 case——"both" 对序列走 tree-only 分支（与③的降级一致）；序列拼接文本超长导致 embedding 重试耗尽时，走既有 `embedding_failures` 跳过路径（3.3.4——该记录按①—③判定，不增新失败通道）。
 
+**线索记录（v1.9）。**stitch 启用时抵达本模块的判重单元升维为**线索**（thread——M16 缝合后的幸存序列信封，链序 stitch 在 dedup 之前，3.10.3/3.16）：`dedup_text` 配方**机制原样**（上列 S10 序列分支零改动）——成员逐条按其单记录配方产出后按成员序以 `"\x1e"` 拼接，作用对象自然是**重绑后**的成员元组，线索级重复 =「同样的完整操作流程（含恢复段）」；被并 episode 壳（`status = "stitched"`）被既有 `status == "active"` 处理面过滤**天然排除**、不参检不入索引（absorbed 成员帧同理）——**本模块代码零改动**（T13，审计核查点 6）。
+
 ### 3.3.4 API 与配置
 
 ```

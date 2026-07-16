@@ -2,7 +2,7 @@
 
 ### 3.8.1 职责与边界
 
-**做：**持有经预校验的用户 Schema 与各内部小 Schema（裁决、评分、评审、生成输出；v1.7 增分类 `classification_schema(class_names, assignment, max_labels, with_reason)`——按 `classify.assignment` 二态、类名词表以 enum 硬约束，关键字集 ⊆ 既有内部 Schema 关键字集且**无 uniqueItems**：该关键字会被 OpenAI strict 模式与部分约束解码网关硬拒，重复标签由 classify 代码在 M8 验证后确定性归一化，全文见 3.13.3；**v1.8 增三项**——分段窗口 `segment_window_schema(frame_count, with_reason)`（M14，全文见 3.14.3）、动作 `action_schema()`（M15，11 值动作词表 enum 硬约束，全文见 3.15.3）、stream 缺陷评审 `defect_verdict_schema()`（M7 stream 分支，三顶键 `{critiques, defects, verdict}` + 五值缺陷词表，全文见 3.7.2）。三者逐字 JSON 冻结于 CONTRACTS §10.7，规则同族：关键字集 ⊆ 既有内部 Schema 关键字集、同样**无 uniqueItems**（重复 index / 标签由调用方代码在 M8 验证后确定性收窄——3.14.4 的 first-wins 建表、3.13.4 的归一化行）；可选性一律以可空联合 type 数组 `["array","null"]` / `["string","null"]` 表达、**全键 required**（OpenAI strict 模式硬拒可选属性，L0 无条件透传 Schema）；`minItems = maxItems` 钉死窗口数组长度（judgment_schema 同款）。`defect_verdict_schema` 与既有评审 Schema **并存**——非 stream 评审路径继续用后者（回归锚，S7）。三者与其余内部 Schema 同级：不计入 `report.schema_engine.resolved_at`、不经过 L2.5）；提供「LLM 调用 → 合法 JSON 对象」的唯一入口 `complete_validated()`，内部实现四层结构保证；统计各层修复命中率。 
+**做：**持有经预校验的用户 Schema 与各内部小 Schema（裁决、评分、评审、生成输出；v1.7 增分类 `classification_schema(class_names, assignment, max_labels, with_reason)`——按 `classify.assignment` 二态、类名词表以 enum 硬约束，关键字集 ⊆ 既有内部 Schema 关键字集且**无 uniqueItems**：该关键字会被 OpenAI strict 模式与部分约束解码网关硬拒，重复标签由 classify 代码在 M8 验证后确定性归一化，全文见 3.13.3；**v1.8 增三项**——分段窗口 `segment_window_schema(frame_count, with_reason)`（M14，全文见 3.14.3）、动作 `action_schema()`（M15，11 值动作词表 enum 硬约束，全文见 3.15.3）、stream 缺陷评审 `defect_verdict_schema()`（M7 stream 分支，三顶键 `{critiques, defects, verdict}` + 缺陷词表——v1.8 五值，v1.9 起六值（+`wrong_stitch`，3.7.2），全文见 3.7.2）；**v1.9 增一项**——缝合判定 `stitch_schema()`（M16，五键 `{verdict, thread_ref, task_name, reason, confidence}` 全 required、thread_ref 可空联合，全文见 3.16.3）。四者逐字 JSON 冻结于 CONTRACTS §10.7，规则同族：关键字集 ⊆ 既有内部 Schema 关键字集、同样**无 uniqueItems**（重复 index / 标签由调用方代码在 M8 验证后确定性收窄——3.14.4 的 first-wins 建表、3.13.4 的归一化行）；可选性一律以可空联合 type 数组 `["array","null"]` / `["string","null"]` 表达、**全键 required**（OpenAI strict 模式硬拒可选属性，L0 无条件透传 Schema）；`minItems = maxItems` 钉死窗口数组长度（judgment_schema 同款）。`defect_verdict_schema` 与既有评审 Schema **并存**——非 stream 评审路径继续用后者（回归锚，S7）。四者与其余内部 Schema 同级：不计入 `report.schema_engine.resolved_at`、不经过 L2.5）；提供「LLM 调用 → 合法 JSON 对象」的唯一入口 `complete_validated()`，内部实现四层结构保证；统计各层修复命中率。 
 **不做：**不组装业务提示词（调用方传入完整 prompt）；不解释业务语义；不放行任何未通过校验的对象——这是它对全系统的硬契约。
 
 ### 3.8.2 四层保证与修复环
@@ -14,7 +14,7 @@
 | L0 | profile `supports_structured_output=true` 时：OpenAI 兼容 provider 传 `response_format={"type":"json_schema", "json_schema":{...strict:true}}`；Anthropic provider 以单工具 `tool_choice` 强制工具调用、Schema 作为工具入参。L0 只是「使 L1/L3 少触发」的优化，不豁免 L2——供应商实现存在覆盖缺口（JSONSchemaBench 实测各引擎均有不支持的 Schema 特性 [24]），校验永远执行。 |
 | L1 | 顺序执行：① 剥离 Markdown 代码围栏；② 取首个花括号平衡子串；③ `json_repair.loads()`（工业库，处理截断/单引号/尾逗号/裸换行 [8]）。全部失败 ⇒ 直接进 L3。L1 为纯函数，无副作用、可单测穷举。 |
 | L2 | `Draft202012Validator.iter_errors()` 收集全部违规（非首个），每条含 JSON Pointer 路径、期望与实际。通过 ⇒ 返回；未通过 ⇒ L3。 |
-| L2.5（v1.5，可选） | `output.validator` 配置时、且仅对用户 Schema 调用：L2 通过后执行用户回调 `fn(obj, record)`。返回非空违规列表 ⇒ 违规以 `(validator) <消息>` 形式并入违规清单、与 Schema 违规同路进入 L3 修复环（回调意见回喂模型自我修正——回调既是门卫也是修复环的教练）；返回空 ⇒ 通过。L3 每轮修复输出重走 L1→L2→L2.5。预算耗尽且剩余违规**全部**来自回调 ⇒ `SchemaViolation(callback_only=True)`，记录 kind = `callback_violation`（7.6），否则仍为 `schema_violation`。回调抛异常不吞：向上传播、按记录级 `internal_error` 收敛（3.5.3）。内部 Schema（裁决/评分/评审/生成/分类（v1.7）/分段窗口/动作/缺陷评审（v1.8））不经过 L2.5。 |
+| L2.5（v1.5，可选） | `output.validator` 配置时、且仅对用户 Schema 调用：L2 通过后执行用户回调 `fn(obj, record)`。返回非空违规列表 ⇒ 违规以 `(validator) <消息>` 形式并入违规清单、与 Schema 违规同路进入 L3 修复环（回调意见回喂模型自我修正——回调既是门卫也是修复环的教练）；返回空 ⇒ 通过。L3 每轮修复输出重走 L1→L2→L2.5。预算耗尽且剩余违规**全部**来自回调 ⇒ `SchemaViolation(callback_only=True)`，记录 kind = `callback_violation`（7.6），否则仍为 `schema_violation`。回调抛异常不吞：向上传播、按记录级 `internal_error` 收敛（3.5.3）。内部 Schema（裁决/评分/评审/生成/分类（v1.7）/分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9））不经过 L2.5。 |
 | L3 | 修复提示词 = 单条 user 消息，按 `[原始输出]` / `[违规清单]` 分节标签组织，末尾指令「只输出修正后的 JSON」（逐字实例见 3.8.4）。使用 `output.repair_llm`（默认同调用方 profile）。每次修复输出重走 L1→L2。尝试次数耗尽 ⇒ 抛 `SchemaViolation(errors, raw_last_output)`。修复调用计入 token 计量，命中层级分布计入报告（`report.schema_engine.resolved_at = {l0_or_clean, l1, l3_1, l3_2, rejected}`）。 |
 
 ### 3.8.3 API
@@ -25,7 +25,7 @@ class SchemaEngine:
     async def complete_validated(self, profile: str, prompt: PromptBundle,
                                  schema: dict | None = None) -> dict:
         """schema=None 时用用户 Schema；内部 Schema（裁决/评分/评审/生成/分类（v1.7）/
-           分段窗口/动作/缺陷评审（v1.8））由各 Stage 传入。
+           分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9））由各 Stage 传入。
            成功返回已通过 L2 的 dict；失败抛 SchemaViolation。"""
     def validate_only(self, obj: dict, schema: dict | None = None) -> list[str]:
         """M1 校验 few-shot 示例输出、M11 写出前终检用。"""

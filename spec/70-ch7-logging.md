@@ -16,20 +16,22 @@
 
 ## 7.2 事件目录
 
-通道归属规则：**事件名前缀即通道名**（`ingest. / segment.（v1.8）/ dedup. / classify.（v1.7）/ extract.（v1.8）/ quality. / annotate. / verify. / schema. / llm.`，对应 `trace.channels` 的十个可选值——v1.7 增 `"classify"`，v1.8 增 `"segment"`、`"extract"`（通道 = stage 名，与 classify 同构，S1），默认值不变，5.2）；`run.*` 与 `batch.*` 生命周期事件由 M10 发出、`stage="run"`、`record_ids` 为空，**不受 channels 过滤**（`trace.enabled=true` 即写）；`error` 事件按产生它的 stage 归属通道（segment/extract 阶段的 error 事件自动按此归属，零路由代码改动，S1）。本目录为稳定契约：`trace_schema_version = 1`，后续版本**只增不改**（可新增事件与 payload 字段，不改既有字段语义）。
+通道归属规则：**事件名前缀即通道名**（`ingest. / segment.（v1.8）/ stitch.（v1.9）/ dedup. / classify.（v1.7）/ extract.（v1.8）/ quality. / annotate. / verify. / schema. / llm.`，对应 `trace.channels` 的十一个可选值——v1.7 增 `"classify"`，v1.8 增 `"segment"`、`"extract"`，v1.9 增 `"stitch"`（通道 = stage 名，与 classify 同构，S1），默认值不变，5.2）；`run.*` 与 `batch.*` 生命周期事件由 M10 发出、`stage="run"`、`record_ids` 为空，**不受 channels 过滤**（`trace.enabled=true` 即写）；`error` 事件按产生它的 stage 归属通道（segment/extract 阶段的 error 事件自动按此归属，零路由代码改动，S1）。本目录为稳定契约：`trace_schema_version = 1`，后续版本**只增不改**（可新增事件与 payload 字段，不改既有字段语义）。
 
 | 事件名 | 通道 / stderr 级别 | 触发点 | payload 字段 |
 |---|---|---|---|
 | `run.start` | 恒写 / info | M1 校验通过、首批开始前；trace 文件首行 header 事件。 | `tool_version`、`config_digest`、`project_digest`（同 6.4 run 节）、`trace_schema_version`（=1，仅此事件携带，避免逐行冗余）。 |
 | `run.end` | 恒写 / info | finalize 完成后（trace 末行）。 | `counts`（与 report.json counts 同构的摘要对象）、`exit_code`。 |
 | `batch.start` | 恒写 / debug | 批构造完成（PipelineItem[] 就绪）。 | `size`。 |
-| `batch.end` | 恒写 / info | 批 emit 并释放中间态后。 | `active`、`dropped_dup`、`dropped_lowq`、`dropped_verify`、`failed`、`duration_ms`；v1.7 增可选字段 `fanout`（仅 classify 启用时携带；`batch.start.size` 语义 = 批入口信封数即扇出前基数，扇出后各状态计数和 = size + fanout，3.10.3 分类与扇出行）；v1.8 增可选字段 `episodes`、`absorbed`、`dropped_noise`（仅 segment 启用时携带，fanout 同形制，3.10.3 时序流行）。 |
+| `batch.end` | 恒写 / info | 批 emit 并释放中间态后。 | `active`、`dropped_dup`、`dropped_lowq`、`dropped_verify`、`failed`、`duration_ms`；v1.7 增可选字段 `fanout`（仅 classify 启用时携带；`batch.start.size` 语义 = 批入口信封数即扇出前基数，扇出后各状态计数和 = size + fanout，3.10.3 分类与扇出行）；v1.8 增可选字段 `episodes`、`absorbed`、`dropped_noise`（仅 segment 启用时携带，fanout 同形制，3.10.3 时序流行）；v1.9 增可选字段 `stitched`、`threads`（仅 stitch 启用时携带，同形制，3.10.3 线索缝合行）。 |
 | `ingest.bad_line` | ingest / warn | M2 坏行跳过（3.2.5）。 | `file`、`line_no`、`reason`。 |
 | `ingest.missing_pair` | ingest / warn | M2 缺对跳过（3.2.4）。 | `index`、`present`（"tree"\|"image"，实际存在的一侧）、`file`。 |
 | `ingest.index_conflict` | ingest / warn（fail 策略时 error） | M2 index 冲突（3.2.4）。 | `index`、`files`（冲突文件路径列表）。 |
 | `ingest.disorder` | ingest / —（trace-only，无逐事件 stderr 镜像；v1.8） | M2 流式单调性校验拒绝一条记录时（乱序或时间戳解析失败，`stream.on_disorder`，3.2/6.1）；skip 策略下每记录一事件，M2 自身另打**一条全运行仅一次的 data-free stderr WARN**（reason 含时间戳/游标值故不入 stderr——§7.1 ①）；fail 策略经 InputError 以退出码 3 终止。 | `file`、`line_no`（文本）\| `index`（UI）、`reason`（"乱序" \| "时间戳解析失败" 类文案，含违规值——仅 trace 通道）。 |
 | `segment.session` | segment / —（trace-only，无 stderr 镜像；v1.8） | M2 会话装配器闭合一个候选会话时（3.2 会话化行；`--limit` 截断视同 EOF 冲洗尾会话，S17）——发出方是 M2，但按前缀归 segment 通道（S1）；`record_ids` 为空。 | `session_id`、`first` / `last`（会话首/末帧）、`len`、`cause`（"gap" \| "key" \| "max_len" \| "max_span" \| "eof" \| "limit"）。 |
 | `segment.boundary` | segment / —（trace-only，无 stderr 镜像；v1.8） | M14 每个滑窗裁决经 M8 校验通过后（3.14）；`record_ids` 为空（成员溯源在 payload）。 | `session_id`、`window`（= [s, e] 窗口帧位次区间）、`member_ids`、`relations`[]{`index`, `relation`}（五值封闭词表，3.14）、`model`、`reason`†（逐帧关系理由，条件见表下注）。 |
+| `stitch.judge` | stitch / —（trace-only，无 stderr 镜像；v1.9） | M16 每候选判定定案后（votes 聚合之后；一遍与二遍均发，3.16.6）；`record_ids` = [候选碎片首成员 id]。 | `session_id`、`candidate`（"episode"\|"rescue"）、`repass`（bool，false = 一遍 / true = 二遍）、`verdict`（votes 分裂回落时记保守结局 "new"）、`thread_ref`、`confidence`（仅观测，不进门槛，3.16.3）、`priors`（机械先验命中腿列表，⊆ {app_overlap, entity_overlap, same_page}）、`merged`（bool）；条件字段：`votes_split`（= true，仅严格多数不成立回落时携带）、`task_name`¶、`reason`¶（votes 分裂时不携带）、`target_thread_id`（仅 merged 时携带）。 |
+| `stitch.thread` | stitch / —（trace-only，无 stderr 镜像；v1.9） | 会话缝合定案后每线索一条（3.16.6）；`record_ids` = [幸存信封 record.id]。 | `session_id`、`thread_id`、`task_name`¶、`fragments`[]{`order_span`, `member_count`, `cause`, `source_episode`}（碎片跨度表）、`seam_indexes`。 |
 | `dedup.duplicate` | dedup / — | M3 判重时；`record_ids` = [被判重记录 id]。 | `kind`、`cluster_key`、`kept_id`（同 DedupInfo，4.2）、`jaccard`（near_text：实测估计值）或 `hamming`（near_image：实测距离）或 `cosine`（near_semantic：实测余弦相似度，v1.2 增）；精确重复三者皆无。 |
 | `classify.decision` | classify / —（trace-only，无 stderr 镜像，同 quality.judgment；v1.7） | M13 每记录分类定案后（3.13.4）；`record_ids` = [记录 id]。 | `label`（本信封路由标签）、`labels`（multi 时携带命中全集）、`source`（"llm"\|"fallback"\|"inherited"）、`reason`†、`sc`（= {n, agreement_ratio}，仅 `classify.self_consistency` 启用时携带）。 |
 | `extract.step` | extract / —（trace-only，无 stderr 镜像；v1.8） | M15 每对相邻成员帧的转移摘取定案后（含 fallback，3.15）；`record_ids` = [s_i.id, s_{i+1}.id]（前后帧记录 id）。 | `episode_id`、`index`、`action_type`、`description`‡（LLM 产出文本，refs 档起）、`target`§ / `value`§（**输入数据派生**字段，excerpt 档起——S27，7.4 `_DATA_KEYS` 行）。 |
@@ -46,7 +48,7 @@
 | `llm.pool_parked` | llm / warn | v1.6：M9 某 profile 全部存活密钥均在冷却、调用开始驻留时（每次驻留一事件；任意池大小含 1）。 | `profile`、`wait_s`（预计驻留秒数）、`live_keys`（存活密钥数）。 |
 | `error` | 随产生 stage 的通道 / warn（记录级）· error（运行级） | StageError 构造时。 | `stage`、`kind`（取值见 7.6）、`message`、`retryable`——即 StageError 全字段（4.2）；v1.7 增可选字段 `label`（仅 classify 启用时携带——multi 扇出下消歧同 id 兄弟信封，3.13.4）。 |
 
-† `reason` 仅当 `quality.judgment_reasons` 生效时存在（5.2）；`classify.decision` 的 `reason` 条件独立（v1.7）= `trace.enabled = true` 且 `trace.channels` 含 `"classify"`（零额外 token 原则，3.13.4 调用与校验行）；`segment.boundary` 的 `reason` 条件同款（v1.8）= `trace.enabled = true` 且 `trace.channels` 含 `"segment"`（对应窗口内部 Schema 的 with_reason 参数，零额外 token，3.14）。‡ / § 为 `extract.step` 的内容分档标记（v1.8，S27）：`description` 自 `"refs"` 档起、`target` / `value` 自 `"excerpt"` 档起携带（7.4）。全部自由文本字段（reason / critiques / violations 文本）受 7.4 脱敏档位控制。密钥相关事件（v1.6）只携环境变量**名**——密钥值在任何档位、任何通道均不落日志（7.4 规则不变）。
+† `reason` 仅当 `quality.judgment_reasons` 生效时存在（5.2）；`classify.decision` 的 `reason` 条件独立（v1.7）= `trace.enabled = true` 且 `trace.channels` 含 `"classify"`（零额外 token 原则，3.13.4 调用与校验行）；`segment.boundary` 的 `reason` 条件同款（v1.8）= `trace.enabled = true` 且 `trace.channels` 含 `"segment"`（对应窗口内部 Schema 的 with_reason 参数，零额外 token，3.14）。¶ `stitch.judge` / `stitch.thread` 的 `task_name` 与 `reason`（v1.9）无请求条件——`stitch_schema()` 恒含两键（判定量级小、votes 聚合需按多数簇取值，3.16.3），但作为 LLM 自由文本受 7.4 分级：`none` 档剥除、`refs` 档起携带（`task_name` 为 v1.9 新增自由文本键，7.4）。‡ / § 为 `extract.step` 的内容分档标记（v1.8，S27）：`description` 自 `"refs"` 档起、`target` / `value` 自 `"excerpt"` 档起携带（7.4）。全部自由文本字段（reason / critiques / violations 文本）受 7.4 脱敏档位控制。密钥相关事件（v1.6）只携环境变量**名**——密钥值在任何档位、任何通道均不落日志（7.4 规则不变）。
 
 ## 7.3 记录格式规范
 
@@ -86,6 +88,8 @@ LLM 相关 payload 的字段命名（`gen_ai.request.model`、`gen_ai.usage.inpu
 
 **v1.8 只增（S27）：**`extract.step` 的 `target` / `value` 是**输入数据派生**字段（目标控件文本引用、键入文本——可能含用户输入内容），归入新增剥除集 `_DATA_KEYS = {"target", "value"}`：`"none"` 与 `"refs"` 档一律剥除（守住 refs 档「不含任何输入数据内容」红线），自 `"excerpt"` 档起携带；`description` 为 LLM 产出文本，计入既有自由文本集 `_FREE_TEXT_KEYS`：`"none"` 档剥除、自 `"refs"` 档起携带（与 reason / critiques 同级）；`verify.verdict` 的 v1.8 可选字段 `defects`（缺陷表含自由文本 `detail`）同入 `_FREE_TEXT_KEYS`——`"none"` 档整键剥除（与 critiques 同级）。逐事件分级速查：`extract.step` none = {episode_id, index, action_type}、refs = +description、excerpt = +target/value；`segment.boundary` none = 结构字段（session_id / window / 逐帧 relation）、refs = +reason（reason 键已在自由文本集）。三个 v1.8 事件的 stderr 镜像均无（trace-only，7.2）。
 
+**v1.9 只增：**`task_name`（线索任务名——`stitch.judge` / `stitch.thread` payload 及缝合判定输出的滚动线索名，3.16）为 LLM 产出文本，计入 `_FREE_TEXT_KEYS`：`"none"` 档剥除、自 `"refs"` 档起携带（与 reason / description 同级）。逐事件分级速查：`stitch.judge` none = {session_id, candidate, repass, verdict, thread_ref, confidence, priors, merged[, votes_split, target_thread_id]}、refs = +task_name/reason；`stitch.thread` none = {session_id, thread_id, fragments, seam_indexes}、refs = +task_name。两个 v1.9 事件的 stderr 镜像均无（trace-only，7.2）。
+
 **风险明示：**`content="full"` 时 trace 文件包含全部经手数据与模型输出，体积可达主输出的数十倍，且构成一份完整的数据副本——仅在调试/审计时短期启用，用后由用户负责清理。
 
 ## 7.5 rubric 优化闭环
@@ -118,6 +122,7 @@ jq -s '[.[] | select(.ev=="quality.judgment") | .payload.judgments[]
 | `bad_input_line` / `missing_pair` / `index_conflict` / `image_too_large` | 记录级 | M2；按 input.* 策略 skip（计数）或 fail（退出码 3）。 |
 | `image_decode_error` | 记录级 | M3 跳过 pHash 层；M5/M7 遇到时该记录 failed。 |
 | `segmentation_invalid` | 窗口级 | v1.8：M14 单窗边界裁决经 M8 修复耗尽——`segment.on_error="keep"`（默认）时该会话整体成一个 episode 存活，留痕三件套 `_meta.stream.degraded = {kind, windows_failed}` + error 事件 + `segment.failures` 计数（**不写 item.errors**——归因防污染，S26）；`"fail"` 时会话成员全部 failed → rejects（3.14）。 |
+| `stitch_invalid` | 判定级 | v1.9：M16 单候选缝合判定经 M8 修复耗尽——`stitch.on_error="keep"`（默认）时 episode 候选开新线索存活 / 救援候选维持 dropped_noise，留痕两件 = error 事件 + `stitch.failures` 计数（**不写 item.errors**——S26 同则；无 `_meta` 腿，`degraded` 键保持 segment 专属，3.16.6）；`"fail"` 时**仅 episode 候选信封** failed → rejects（救援候选不适用 fail 路径，3.16.6）。 |
 | `classification_invalid` | 记录级 | v1.7：M13 分类输出经 M8 修复耗尽——`classify.on_error="fallback"`（默认）时归兜底类并留痕于 `Classification.detail`（不入 rejects，记录存活）；`"fail"` 时记录 failed → rejects（3.13.4 失败与兜底行）。 |
 | `extraction_invalid` | 转移级 | v1.8：M15 单转移动作摘取经 M8 修复耗尽——`extract.on_error="fallback"`（默认）时该步记 `action_type="other"` 并留痕于 `Transition.detail = {kind, message}`（episode 存活，**不写 item.errors**，S16）；`"fail"` 时 episode failed → rejects（3.15）。 |
 | `judgment_invalid` | 比较级 | M4；按 tie 计入 BT（3.4.3）。 |

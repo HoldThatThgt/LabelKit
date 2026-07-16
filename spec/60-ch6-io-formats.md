@@ -66,9 +66,23 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
                                      //  "session_split": false,   // 所属会话曾被 batch_size 硬切（S21，M7 缺帧判定降级依据）
                                      //  "repaired": false,        // verify 缺陷修复改写过成员集（3.7 stream 分支；
                                      //                            //   multi 扇出下消歧同 id 兄弟行的成员分叉，3.13）
-                                     //  "degraded": null | {kind, windows_failed},   // segment.on_error="keep" 留痕（S26）
+                                     //  "degraded": null | {kind, windows_failed},   // segment.on_error="keep" 留痕（S26；segment 专属——
+                                     //                            //   stitch keep 路径留痕为事件+计数器两件，无 _meta 腿，3.16.6）
                                      //  "steps": null | [{index, action_type, target, value, description}, ...]}
-                                     //                            // extract 关闭时恒 null；启用 = transitions 逐步摘要（3.15）
+                                     //                            // extract 关闭时恒 null；启用 = transitions 逐步摘要（3.15）；
+                                     //                            //   v1.9（仅 stitch 启用）：步行内另含 "resumed": true——仅接缝
+                                     //                            //   占位步携带（emitter 由 Transition.detail.kind=="thread_seam"
+                                     //                            //   推导，3.15.4；非接缝步不携带该键）
+                                     // v1.9 增两键（仅 stitch.enabled=true 时在场——off 时本块与 v1.8
+                                     //   逐字节等价，3.16.4 退化锚）：
+                                     //  "thread_id": "9c31f5a2d84e07b6",   // = 幸存信封 record.id = episode_id（T22，3.16.4）
+                                     //  "fragments": [{"order_span": [first, last], "member_count", "cause",
+                                     //                 "source_episode"}, ...]
+                                     //                            // 每碎片一项、按会话序；cause ∈ "origin"|"resumed"|"rescued"；
+                                     //                            //   source_episode = 碎片缝合前的 episode_id（救援碎片 = null）。
+                                     //                            // 包络规范句：多碎片线索的顶层 order_span 为包络（区间内含
+                                     //                            //   异线索帧）——下游切片必须用 fragments[].order_span，
+                                     //                            //   不得按顶层跨度切片（3.16.4）
     "scores": {"screenshot_readability": 0.81, "tree_screen_consistency": 0.66,
                "state_completeness": 0.74, "interaction_richness": 0.52,
                "__aggregate__": 0.68, "mode": "pairwise_bt", "batch_no": 3},
@@ -101,14 +115,23 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
   // counts v1.8 只增：segment 启用时增列 "episodes"（segment 阶段 len 差，M10 计量，fanout 同构）/
   //             "absorbed" / "dropped_noise"（post-emit tally，3.10.3）；且 stream 模式下 "unprocessed"
   //             的出现条件扩为「熔断 ∨ interrupted」（S18；见尾注不变量扩展）
+  // counts v1.9 只增：stitch 启用时增列 "stitched"（壳终态 tally——仅计被并 episode 信封壳）/
+  //             "threads"（= episodes − stitched，M10 post-emit tally 导出式单点上报，3.10.3）；
+  //             两键仅启用时在场（off 时 counts 与 v1.8 逐字节等价，3.16.4 退化锚）
   // v1.8 可选节（segment 启用时出现，位于 counts 之后）：
   //   "stream": {"sessions", "episodes", "mean_episode_len", "absorbed", "dropped_noise",
   //              "below_min_len", "digest_poor_frames", "segment_failures",
+  //    [stitch 启用，v1.9] "stitch": {"stitched", "rescued_short", "seams", "judgments",
+  //              "repass_judgments", "failures"},
   //    [extract 启用] "extract": {"transitions", "fallback_steps", "failures", "by_type": {<action_type>: n, ...}},
   //    [verify 启用]  "verify": {"membership_repairs", "boundary_flags", "defects": {<kind>: n, ...}}}
-  //   —— sessions 数据源 = IngestReport（M2 属主，3.2）；below_min_len 独立于 noise 计数（S11）；
-  //      digest_poor_frames = 摘要贫瘠帧数（4.3 frame_digest 贫瘠判定）；extract.by_type 为按动作类型分布
-  //      （系统性劣化可观测，S14）；verify 子块见 3.7 stream 分支（S31）
+  //   —— sessions 数据源 = IngestReport（M2 属主，3.2）；below_min_len 独立于 noise 计数（S11，
+  //      发生计数、v1.9 救援不回退——救援量另计 rescued_short，3.14.4）；digest_poor_frames =
+  //      摘要贫瘠帧数（4.3 frame_digest 贫瘠判定）；stitch 子块 M16 属主（rescued_short 单位 = 帧、
+  //      seams = 满足 T20 判据的拼接处数——接缝唯一计量点、judgments / repass_judgments =
+  //      一遍/二遍判定调用数，3.16.6）；extract.by_type 为按动作类型分布（系统性劣化可观测，S14；
+  //      v1.9 注：接缝占位步不计入 extract.transitions 与 by_type——非摘取产物，3.15.4）；
+  //      verify 子块见 3.7 stream 分支（S31；defects 计数键 v1.9 起含 wrong_stitch，3.7.2）
   "dedup": {"exact": 118, "near_text": 201, "near_image": 46, "near_both": 47,
              "clusters": 366, "image_decode_failures": 2},   // v1.2：dedup.semantic 开启时另含 near_semantic 与 embedding_failures
   // v1.7 可选块（classify 启用时出现）："classify": {"assignment": "single", "classes": {<name>: n, ...}, // 逐标签计数（multi 下多标签记录逐标签计）
@@ -137,10 +160,10 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 }
 ```
 
-不变量：`emitted + dropped_* + failed + bad_input = scanned + generated`。熔断中止（v1.6 熔断交付，3.10.3）时扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`——`unprocessed` 仅此时出现，= 已扫描/已生成但因中止未走完流水线的记录数（M10 在 finalize 时按差额计算）。v1.7：`classify.assignment="multi"` 时右侧另加 `fanout`——`emitted + dropped_* + failed + bad_input = scanned + generated + fanout`；与熔断中止叠加时两项扩展并存（左侧 `+ unprocessed`、右侧 `+ fanout`，熔断残差公式同步，3.10.3 分类与扇出行）。v1.8：segment 启用时守恒式为全展开形（3.10.3）——
+不变量：`emitted + dropped_* + failed + bad_input = scanned + generated`。熔断中止（v1.6 熔断交付，3.10.3）时扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`——`unprocessed` 仅此时出现，= 已扫描/已生成但因中止未走完流水线的记录数（M10 在 finalize 时按差额计算）。v1.7：`classify.assignment="multi"` 时右侧另加 `fanout`——`emitted + dropped_* + failed + bad_input = scanned + generated + fanout`；与熔断中止叠加时两项扩展并存（左侧 `+ unprocessed`、右侧 `+ fanout`，熔断残差公式同步，3.10.3 分类与扇出行）。v1.8/v1.9：segment 启用时守恒式为全展开形（3.10.3；`stitched` 为 v1.9 增项，仅 stitch 启用时非零在场）——
 
-`emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed + bad_input + absorbed = scanned + generated + fanout + episodes`
+`emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed + bad_input + absorbed + stitched = scanned + generated + fanout + episodes`
 
-（左侧新增 `dropped_noise` 与 `absorbed`、右侧新增 `episodes`；未启用的项恒 0，退化为上式）。且 **stream 模式下 `counts.unprocessed` 的出现条件扩为「熔断 ∨ interrupted」**（S18：SIGINT 中断叠加会话缓冲会产生未走完流水线的残差；此时左侧另加 `unprocessed`，残差公式右侧 `+ episodes`、左侧 `+ absorbed + dropped_noise` 同步扩展）；非 stream 模式中断残差恒 0、不加键（回归锚不动）。`schema_engine.resolved_at` 仅统计用户 Schema 的标注调用，加总 = 进入 M5 的记录数（4141+87+30+3+9 = 4270 = ingested 4987 − dropped_dup 412 − dropped_lowq 305）；裁决/评审/生成等内部 Schema 解析不计入。报告中无任何数据内容字段。
+（左侧新增 `dropped_noise` 与 `absorbed`（v1.8）及 `stitched`（v1.9 壳终态；fanout（右侧）计信封存在、stitched（左侧）计壳终态，二者分别记账无双记——经审计数值验证）、右侧新增 `episodes`；未启用的项恒 0，退化为上式）。`counts.threads` 不入守恒式——它是恒等式 `threads = episodes − stitched` 的导出量（M10 post-emit tally 单点上报，3.10.3；`rescued_short` 帧的 dropped_noise → absorbed 翻转发生在 emit 前、账目在路由时已定格，不破坏两侧平衡）。且 **stream 模式下 `counts.unprocessed` 的出现条件扩为「熔断 ∨ interrupted」**（S18：SIGINT 中断叠加会话缓冲会产生未走完流水线的残差；此时左侧另加 `unprocessed`，残差公式右侧 `+ episodes`、左侧 `+ absorbed + dropped_noise`（v1.9 另 `+ stitched`）同步扩展，failed 兜底公式减项同步——三处同步见 3.10.3 线索缝合行）；非 stream 模式中断残差恒 0、不加键（回归锚不动）。`schema_engine.resolved_at` 仅统计用户 Schema 的标注调用，加总 = 进入 M5 的记录数（4141+87+30+3+9 = 4270 = ingested 4987 − dropped_dup 412 − dropped_lowq 305）；裁决/评审/生成等内部 Schema 解析不计入。报告中无任何数据内容字段。
 
-**rejects 通道 v1.8 增量**（完整格式规范属 3.11.2，此处登记 IO 面变化）：rejects 行的 (stage, reason) 组合新增三种——`segment / noise`（LLM 判噪声帧）、`segment / below_min_len`（短段丢弃帧，独立于 noise，S11）、`verify / off_task_member`（修复收缩弃帧，S31）；`--strict` 交互注意：stream 工程下噪声帧属预期产物，会触发退出码 1。`output.rejects = "full"` 档对序列 Record 的原始载荷输出 `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}`（S25——单记录 `_raw_payload` 假设的序列分支；`raw_last_output` 的 reason 门维持 schema_violation 现状，既有缺口明文接受）。
+**rejects 通道 v1.8 增量**（完整格式规范属 3.11.2，此处登记 IO 面变化）：rejects 行的 (stage, reason) 组合新增三种——`segment / noise`（LLM 判噪声帧）、`segment / below_min_len`（短段丢弃帧，独立于 noise，S11）、`verify / off_task_member`（修复收缩弃帧，S31）；`--strict` 交互注意：stream 工程下噪声帧属预期产物，会触发退出码 1。**rejects 通道 v1.9 增量**：(stage, reason) 组合再增一种——`stitch / stitch_invalid`（仅 `stitch.on_error = "fail"` 时出现，3.16.6）；stitched 壳与被救援帧永不入 rejects（第四路由 / 翻转回 absorbed，3.11.2）——`--strict` 补注：同输入开启 stitch 后（短段被救援不再落 rejects）strict 结果可能由 1 变 0，属预期（2.4）。`output.rejects = "full"` 档对序列 Record 的原始载荷输出 `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}`（S25——单记录 `_raw_payload` 假设的序列分支；`raw_last_output` 的 reason 门维持 schema_violation 现状，既有缺口明文接受）。

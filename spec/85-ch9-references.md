@@ -125,3 +125,57 @@
 - [62] ByteDance. UI-TARS 统一移动动作空间。工业开源项目。github.com/bytedance/UI-TARS；UIPro: Unifying and Propelling GUI Agents. ICCV 2025. arXiv:2509.17328.（2025 后移动端动作词表的事实并集：含 drag 与 recent/应用切换）
 
 - [63] Do GUI Agents Believe Their Eyes? 2026. arXiv:2607.04334.（引 CLAY 对 RICO 的人工标注统计：Android 10.6% 结构节点无有效视觉呈现（ghost node）、37.4% 屏幕含 ghost node——UI 树不可靠性的量化）
+
+- [64] Chai, Y. et al. PIRA-Bench: Proactive Intent Recognition from Ambient Screen Streams. 2026. arXiv:2603.08013.（屏幕流 = 多线索穿插 + 噪声的形式化：T = ∪任务子轨迹 ∪ 噪声，任务子轨迹为非连续帧子集；顺序线程记忆基线 PIRF（无容量上限，靠反思删除控规模）；噪声消融证实过连接偏差——GPT-5.2 于 PIRF 框架 precision 92.23→50.52 而 recall 83.57→84.54 反升、Gemini-3.1-Pro 85.28→53.05 同向，原文 "trigger-happy"；线索级指标 S_final = F1 × FPS_norm 与负样本协议。注意：0 被引新基准（2026-07 复核仍为 0），自报数字权重打折）
+
+- [65] Hu, D. H., Yang, Q. CIGAR: Concurrent and Interleaving Goal and Activity Recognition. AAAI 2008.（interleaving / concurrent 活动建模的区分；resumption 判定单元 =「挂起目标尾动作 × 候选恢复首动作」转移对）
+
+- [66] Cook, D. J., Crandall, A. S., Thomas, B. L., Krishnan, N. C. CASAS: A Smart Home in a Box. IEEE Computer 46(7), 2013.（interleaved ADL 数据集系列；挂起时长分布特征使重叠活动识别 +11.36%——时间衰减先验的实证）
+
+- [67] Leno, V., Polyvyanyy, A., Dumas, M., La Rosa, M., Maggi, F. M. Robotic Process Mining: Vision and Challenges. Business & Information Systems Engineering 62, 2020；Process Mining Handbook ch.16, Springer 2022.（UI 日志 interleaved 解缠 = open challenge；全局法（trace alignment / 频繁模式挖掘）依赖「例程重复」前提，对一次性自然任务不可迁移）
+
+- [68] Agostinelli, S., Marrella, A., Mecella, M. 任务挖掘学术解缠系列（Exploring the Challenge of Automated Segmentation in RPA 等, 2021/2024）；UiPath Task Mining / Celonis Task Mining / Microsoft Process Advisor 官方产品文档（2026-07 访问）。（学术系列之外，三家工业产品均无穿插解缠——采集纪律回避 / 时间邻近分组 / 按任务录制，产品空白区；通信类 App「天然噪声/穿插高发」名单同出其产品文档）
+
+- [69] Song, Y. et al. Ego4D Goal-Step: Toward Hierarchical Understanding of Procedural Activities. NeurIPS 2023 Datasets & Benchmarks.（goal⊃step⊃substep 三级层级标注 + `is_continued` 续接标志——「平面分段 + 线索身份」表达穿插的直接先例）
+
+- [70] Murty, S. et al. NNetNav: Unsupervised Learning of Browser Agents Through Environment Interaction in the Wild. 2024. arXiv:2410.02907.（自然流 → 事后反推任务标注范式；「可命名性」剪枝判据——与 OS-Genesis [41] 同范式组）
+
+- [71] Shao, D. et al. FineGym: A Hierarchical Video Dataset for Fine-grained Action Understanding. CVPR 2020；Kuehne, H. et al. The Language of Actions: Recovering the Syntax and Semantics of Goal-Directed Human Activities (Breakfast). CVPR 2014.（视频域层级时间标注范式——三级结构的域外印证）
+
+- [72] Yeung, S. et al. Every Moment Counts: Dense Detailed Labeling of Actions in Complex Videos (MultiTHUMOS). IJCV 123, 2017；Sigurdsson, G. A. et al. Hollywood in Homes: Crowdsourcing Data Collection for Activity Understanding (Charades). ECCV 2016.（帧多标签/重叠活动标注先例——经评估后否决采纳（帧单一归属是手术/归因/守恒公共地基），引用记录被拒方案）
+
+- [73] Fine, S., Singer, Y., Tishby, N. The Hierarchical Hidden Markov Model: Analysis and Applications. Machine Learning 32, 1998；Allen, J. F. Maintaining Knowledge about Temporal Intervals. CACM 26(11), 1983.（嵌套结构与 during / overlaps 区间关系的形式语义底座——界定「线索包含碎片、碎片穿插」语义而不引入区间树）
+
+- [74] Saeedi, A., Peukert, E., Rahm, E. Incremental Multi-source Entity Resolution for Knowledge Graph Completion (FAMER). ESWC 2020；Gruenheid, A., Dong, X. L., Srivastava, D. Incremental Record Linkage. VLDB 2014.（增量实体消解的修复证据：无修复贪心劣于 batch 且次序依赖、n=1 局部重聚类即追平 batch；merge-only 是增量法中质量最差、带修复可达 batch 质量——有界二遍复评的直接依据）
+
+- [75] Kummerfeld, J. K. et al. A Large-Scale Corpus for Conversation Disentanglement. ACL 2019；Zhu, H. et al. Online Conversation Disentanglement with Pointer Networks. EMNLP 2020；Ma, X. et al. Exploring Dialogue Disentanglement with Bipartite Graph Networks. ALTA 2021.（对话解缠谱系：贪心链接标准解码、并发线程 ≤3 占 46.4%、VI / 1-1 overlap / link-F1 指标三件套；在线顺序解缠端到端先例；全局二部图匹配仅在图结构已知时胜出）
+
+- [76] IdentifyMe: A Challenging Long-Context Mention Resolution Benchmark. Findings of NAACL 2025；CORRECT-DETECT: Balancing Accuracy and Abstention in LLMs. EMNLP 2025.（LLM 回避「以上皆非」宁可硬连的过连接量化；准确与弃权此消彼长、默认过度承诺——保守偏置的同向实证）
+
+- [77] Wang, Z. et al. On Position Bias in LLM Multi-candidate Selection. COLING 2025；LLM Pairwise Judgment Sensitivity to Positional and Contextual Structure. 2026. arXiv:2604.18835.（多候选选择式判定的位置偏差与成对判定的位置/上下文结构敏感性——池卡最近活跃降序呈现与候选位置扰动测试的依据）
+
+- [78] Zhang, Y. et al. In-context Clustering-based Entity Resolution with Large Language Models: A Design Space Exploration (LLM-CER). SIGMOD 2026. arXiv:2506.02509；GraphCR: Graph-based Cluster Repair with Active Learning. ACM JDIQ, 2025. DOI: 10.1145/3735511；Alper: Evolving-Graph Probabilistic Label Propagation for Entity Resolution. 2026. arXiv:2605.25814.（全局 LLM 聚类自身需防幻觉护栏（MDG）、记录集构成显著影响聚类质量——非免费替代；更重的簇修复机器——已评估、按规模不采：会话内碎片 ≤ 数十，n=1 复评够用且零训练）
+
+- [79] DINCO: Diversity-Normalized Intrinsic Confidence. 2026 (ICLR 2026 投稿). arXiv:2509.25532；ADVICE: Answer-Dependence for Verbalized Calibration. ACL 2026 (Long Papers).（口头置信度系统性过高且分数饱和——"miscalibrated, reporting high confidence on instances with low accuracy"；answer-independence 致 systematic overconfidence；采样一致性是最强基线之一——去 confidence 判定腿与 votes 机制的依据）
+
+- [80] Altmann, E. M., Trafton, J. G. Task Interruption: Resumption Lag and the Role of Cues. CogSci 2004；Trafton, J. G. et al. Preparing to Resume an Interrupted Task. IJHCS 58, 2003.（cue-guided resumption——「返回同一页面」是任务恢复强前兆线索的认知机理）
+
+- [81] Iqbal, S. T., Horvitz, E. Disruption and Recovery of Computing Tasks: Field Study, Analysis, and Directions. CHI 2007. DOI: 10.1145/1240624.1240730.（真实桌面日志：挂起窗口均值 3（S.D.≈2）——max_open=4 的实证锚点；27% 的挂起超过 2 小时才恢复——时间衰减与「封闭 ≠ 终结」依据；切换前收尾动作密集（段落完成率基线 0.78/min → 切换前 10.9–12.8/min，即时响应情形）——短段救援机理）
+
+- [82] González, V. M., Mark, G. "Constant, Constant, Multi-tasking Craziness": Managing Multiple Working Spheres. CHI 2004；Mark, G. et al. ECSCW 2005；Leiva, L. et al. Back to the App: The Costs of Mobile Application Interruptions. MobileHCI 2012；Jones, S. L. et al. Revisitation Analysis of Smartphone App Use. UbiComp 2015.（working spheres 多任务粒度人因基线；手机域中断/回访实证）
+
+- [83] Oliver, N. et al. SWISH: Semantic Analysis of Window Titles and Switching History. IUI 2006；Shen, J. et al. Real-Time Detection of Task Switches of Desktop Users (TaskPredictor). IJCAI 2007；Rath, A. S. et al. 2013.（window title 是任务识别最强单特征（85.57%）；多窗证据聚合优于单窗——摘要卡证据面依据）
+
+- [84] Log2Plan: Task Group Discovery from GUI Logs with Two-Level Matching. UIST 2025.（embedding 召回 + LLM 精判的两级任务组匹配工业近例）
+
+- [85] Leno, V. et al. Identifying Candidate Routines from Unsegmented UI Logs. ICPM 2020（例程发现主引用见 [50]，此处为全局法前提面）；Routine Identification over Unsegmented UI Logs Revisited. 2025. arXiv:2510.08118.（无分段 UI 日志例程识别全局法的「重复例程」前提——2025 年复核不变）
+
+- [86] LLMs as a Jury: Cross-Model Consensus Can Outperform Process Reward Models for LLM Reasoning. 2026. arXiv:2607.10139.（精确区分两路线：§2 逐字 "self-consistency is better calibrated while the cross-model signal is more accurate"；自一致性修不了系统性偏差（模型把自己的错投成多数）；实测错误相关性 within-model 0.68 > same-family 0.52 > cross-family 0.47，共享错误地板 = "unanimous and wrong"）
+
+- [87] Takada, K., Mori, S. Rethinking Dialogue Disentanglement for LLMs via Dialogue-Level Assignment and Subsequent Context (GreedyDisentangle). LaCATODA@AAAI-26, CEUR-WS Vol-4178, 2026.（M16 stitch 单调选池的同任务同形制 SOTA 先例：簇摘要呈现 + LLM 归簇或判 new + 顺序贪心，在 Kummerfeld IRC 基准 [75] 全指标超 per-pair 与非 LLM 方法；subsequent-context 显著有效——二遍复评的第三依据。风险注记：DD-GEPA（arXiv:2606.07894）报告 ~30B 开源模型上此法性能骤降——所配 profile 需实测门禁兜底）
+
+- [88] Engram: Selective Memory Curation for Long-Horizon Agents. 2026. arXiv:2606.09900；Memori: Structured Summarization Memory. 2026. arXiv:2603.19935；LLM Agent Memory 综述. 2026. arXiv:2603.07670.（精选紧凑上下文准确率反超全量原始历史——+10.4 pt（83.6% vs 73.2%，LongMemEval）且 token 少 8 倍；结构化摘要以 ~5% token 胜过其它记忆系统——摘要卡证据面的正面抬升；综述给出反向风险的正式命名 "summarization drift"：每次压缩静默丢弃低频细节）
+
+- [89] When LLMs Agree, Are They Right? 2026. arXiv:2607.08065（265k 样本审计）；Nine Judges, Two Effective Votes. 2026. arXiv:2605.29800.（前沿模型高自一致处过度自信：GPQA 上 77% 条目自一致 ≥0.8、其中 48% 是错的——自一致性只是条件性代理，votes 治方差（漂移）不治偏差（过连接）；9 裁判 7 家族评审团有效独立票仅 ≈2.0–2.5、聚合算法最多弥合 11% Condorcet 缺口——拒绝评审团路线的实测边界）
+
+- [90] Tian, Y., Zhou, K., Pelleg, D. Characterization and Prediction of Mobile Tasks. ACM TOIS 41(1), 2023. DOI: 10.1145/3522711.（人工标注 1414 个真实手机任务：仅 22.6% 任务存在穿插、多日志任务均 4.1 logs / 1.7 apps——手机穿插深度比桌面浅，桌面锚 max_open=4 在移动域为宽松上界的间接佐证）
