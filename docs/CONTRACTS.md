@@ -1110,7 +1110,7 @@ class StitchConfig:                               # v1.9 (spec §5.2 [stitch]): 
                                                   # pure-text evidence, NEVER in any
                                                   # vision-required set (T16, §6.3 rule 40)
     max_open: int = 4                             # open-thread pool capacity (suspension-window
-                                                  # mean 3 + 1 active, N-13 anchor); M1: >= 1
+                                                  # mean 3 + 1 active, T8 anchor); M1: >= 1
     bias: Literal["conservative", "llm"] = "conservative"
                                                   # conservative = LLM resume AND mechanical-prior
                                                   # whitelist hit (T9 conjunction); llm = pure
@@ -2947,7 +2947,7 @@ def build_stitch_prompt(thread_cards: Sequence[str], candidate_card: str,
     instruction with the pool card count substituted for {P}, the optional stitch.context
     line (omitted when empty), the structure sentence and shape. user: ONE message — one
     text part per thread card (already ordered most-recently-active first by the caller,
-    N-8 position-bias mitigation; an empty pool renders the fixed line 「（当前无开放线索）」
+    T8 position-bias mitigation; an empty pool renders the fixed line 「（当前无开放线索）」
     as its single part) and the candidate card as the final text part. PURE TEXT — stitch
     never attaches images. PromptBundle.temperature = None (profile default), votes
     samples included (T18 — [stitch] deliberately has no sc_temperature key)."""
@@ -4119,7 +4119,7 @@ structure):
   `title_changed` — M16's own copy of the §10.9 rendering (operator modules never depend on
   each other, spec §2.2). It appears on every thread card of a judgment call (both passes
   supply the candidate head).
-- Thread cards are presented MOST-RECENTLY-ACTIVE FIRST ([N-8] position-bias mitigation);
+- Thread cards are presented MOST-RECENTLY-ACTIVE FIRST (T8 position-bias mitigation);
   `thread_ref` in the answer is the 1-based ordinal of a presented card, range-checked
   code-side (§7.16 — an invalid ref resolves to the conservative `new`, never a schema
   failure). `类型` renders `分段产出` for episode candidates and `短段救援` for rescue

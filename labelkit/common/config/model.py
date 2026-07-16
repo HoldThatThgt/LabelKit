@@ -144,7 +144,7 @@ class StitchConfig:                               # v1.9 (spec 5.2 [stitch]): M1
                                                   # enabled — pure-text evidence, NEVER in any
                                                   # vision-required set (T16)
     max_open: int = 4                             # open-thread pool capacity (suspension-window
-                                                  # mean 3 + 1 active, N-13 anchor)
+                                                  # mean 3 + 1 active, T8 anchor)
     bias: Literal["conservative", "llm"] = "conservative"
                                                   # conservative = LLM resume AND mechanical prior
                                                   # (T9 conjunction); llm = pure LLM verdict

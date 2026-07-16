@@ -361,7 +361,7 @@ on_error = "keep"        # "keep" | "fail"（fail 仅施于 episode 候选信封
 | `60-ch6-io-formats.md` | 改 | §6.3 `_meta.stream` +thread_id/fragments/resumed + **order_span 包络规范句**；§6.4 counts +stitched/threads、stream +stitch 子块、守恒全式与残差公式扩项、rejects 组合 + strict 注 |
 | `70-ch7-logging.md` | 改 | §7.2 通道 10→**11**、batch.end 补字段、+stitch.judge/stitch.thread 两行；§7.4 +task_name 脱敏段；§7.6 +stitch_invalid 行 |
 | `80-ch8-nongoals-roadmap.md` | 改 | §8.1 补 v1.9 六条非目标（含完成感知封闭，B-1）；§8.3 增 O8（stitch.judges 多模型评审扩展，T18 选型记录）；§8.4 演进表 +M16 |
-| `85-ch9-references.md` | 改 | 尾部顺延 [64]+ 补 v1.9 文献（先查重，含 N-23…N-28 定稿增补，净新增约 20–25 条） |
+| `85-ch9-references.md` | 改 | 尾部顺延 [64]–[90] 补 v1.9 文献（先查重，含 N-23…N-28 定稿增补，净新增 27 条、总 90 条） |
 | `302/30-ch3/306/309/312/90` | 零改动 | 302：stitch 不触 M2（草案笔误）；30：无模块清单；306/309：互斥/无新传输；312：通道白名单不在此；90：无新 rubric |
 
 #### docs/CONTRACTS.md（1 文件，约 21 节触点；文档审计补 4 处遗漏 + 3 子项）

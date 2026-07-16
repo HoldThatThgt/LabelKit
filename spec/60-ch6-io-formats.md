@@ -129,7 +129,7 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
   //      发生计数、v1.9 救援不回退——救援量另计 rescued_short，3.14.4）；digest_poor_frames =
   //      摘要贫瘠帧数（4.3 frame_digest 贫瘠判定）；stitch 子块 M16 属主（rescued_short 单位 = 帧、
   //      seams = 满足 T20 判据的拼接处数——接缝唯一计量点、judgments / repass_judgments =
-  //      一遍/二遍判定调用数，3.16.6）；extract.by_type 为按动作类型分布（系统性劣化可观测，S14；
+  //      一遍/二遍逻辑判定数（每候选一判、失败不计；votes>1 放大调用不放大判定），3.16.6）；extract.by_type 为按动作类型分布（系统性劣化可观测，S14；
   //      v1.9 注：接缝占位步不计入 extract.transitions 与 by_type——非摘取产物，3.15.4）；
   //      verify 子块见 3.7 stream 分支（S31；defects 计数键 v1.9 起含 wrong_stitch，3.7.2）
   "dedup": {"exact": 118, "near_text": 201, "near_image": 46, "near_both": 47,

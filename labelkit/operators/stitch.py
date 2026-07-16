@@ -272,7 +272,7 @@ def build_stitch_prompt(thread_cards: Sequence[str], candidate_card: str,
     conservative-bias instruction with the pool card count substituted, the
     optional stitch.context line (omitted when empty), the structure sentence
     and shape. user: ONE message — one text part per thread card (already
-    ordered most-recently-active first by the caller, [N-8] position-bias
+    ordered most-recently-active first by the caller, T8 position-bias
     mitigation; an empty pool renders the fixed 零卡 line) and the candidate
     card as the final text part. Pure text: stitch never attaches images."""
     st = cfg.stitch
