@@ -1,8 +1,8 @@
 # LabelKit — Cross-Module Interface Contract (CONTRACTS.md)
 
 **Status: FROZEN.** This document is the single interface contract for parallel implementation of
-M1–M15 + CLI by independent engineers. It is derived from the design spec v1.4 base with the
-inline v1.5/v1.6/v1.7/v1.8 revisions (`spec/*.md`), which
+M1–M16 + CLI by independent engineers. It is derived from the design spec v1.4 base with the
+inline v1.5/v1.6/v1.7/v1.8/v1.9 revisions (`spec/*.md`), which
 remains the authority for *algorithms and behavior*; this document is the authority for *names,
 signatures, types, defaults, file formats, and prompt text*. Where the spec left a signature or
 format implicit, the decision is frozen here and tagged **[FROZEN HERE]** (all such decisions are
@@ -63,6 +63,7 @@ labelkit/
 ├── operators/
 │   ├── ingest.py                       # M2
 │   ├── segment.py                      # M14
+│   ├── stitch.py                       # M16
 │   ├── dedup.py                        # M3
 │   ├── classify.py                     # M13
 │   ├── extract.py                      # M15
@@ -110,7 +111,9 @@ config under `tests/common/config/`, runtime under `tests/common/runtime/`, obse
 `tests/common/observability/`, extensions under `tests/common/extensions/`, operators under
 `tests/operators/`, and orchestration under `tests/orchestration/`. Key-pool unit coverage belongs
 in `tests/common/runtime/test_llm_client.py`; stream-ingest coverage belongs in
-`tests/operators/test_ingest.py`. A separate compatibility-import test, `test_key_pool.py`, or
+`tests/operators/test_ingest.py`; v1.9 M16 stitch coverage belongs in
+`tests/operators/test_stitch.py` (offline) and `tests/integration/test_stitch_llm.py`
+(real-LLM judgments). A separate compatibility-import test, `test_key_pool.py`, or
 `test_stream_ingest.py` is forbidden. The exact file allowlist is normative in
 `docs/dev/SPEC-package-layer-reorganization.md` §6.1.
 
@@ -126,34 +129,38 @@ M8/M9 under `common.runtime`; M12 under `common.observability`; user hooks under
 files: errors at `labelkit/common/errors.py`; SchemaEngine/LLMClient at
 `labelkit/common/runtime/schema_engine.py` and `labelkit/common/runtime/llm_client.py`; hooks at
 `labelkit/common/extensions/hooks.py`; obslog at `labelkit/common/observability/obslog.py`. Operators
-(M2 ingest, M14 segment, M3 dedup, M13 classify, M15 extract, M4 quality, M5 annotate, M6
-generate, M7 verify, M11 emitter) depend only on common, subject solely to the three sanctioned
+(M2 ingest, M14 segment, M16 stitch, M3 dedup, M13 classify, M15 extract, M4 quality, M5 annotate,
+M6 generate, M7 verify, M11 emitter) depend only on common, subject solely to the three sanctioned
 lazy operator calls (verify→annotate/segment/extract, §7.4/§7.6/§7.14/§7.15). Orchestration may
 depend on common and operators and owns construction/order/lifecycle; CLI calls orchestration's
 public runtime entry points and owns only parsing, user interaction, and the sole exception-to-exit-
 code mapping. Common depends on neither operators nor orchestration; operators never depend on
 orchestration; CLI never imports operators.
 
-Pipeline order per batch (process mode, v1.8 chain — the single superset tuple, §7.9):
-`segment → dedup → classify → extract → quality → generate(off-path, returns sub-batch) →
-annotate → verify → emit`. segment and extract are DEFAULT OFF; with both disabled the chain
-degrades byte-identically to the v1.7 chain
+Pipeline order per batch (process mode, v1.9 chain — the single superset tuple, §7.9):
+`segment → stitch → dedup → classify → extract → quality → generate(off-path, returns sub-batch) →
+annotate → verify → emit`. segment, stitch and extract are DEFAULT OFF; with all three disabled
+the chain degrades byte-identically to the v1.7 chain
 `dedup → classify → quality → generate → annotate → verify → emit`. `generate.enabled` and
-`segment.enabled` are mutually exclusive (M1, §6.3 rule 29), so the generate slot never
-coexists with the stream stages.
+`segment.enabled` are mutually exclusive (M1, §6.3 rule 29) and `stitch.enabled` requires
+`segment.enabled` (§6.3 rule 37), so the generate slot never coexists with the stream stages
+(stitch included) and stitch never appears in the generation re-flow chain.
 Generation sub-batches re-enter the queue as new batches and run
 `dedup → classify → quality → annotate → verify → emit` (no generate; single-pass, no recursion;
 generated records enter carrying an `"inherited"` Classification, which the idempotent classify
 stage skips — §7.13).
 `generate_only` mode (v1.4): no M2; `GenerateStage.generate_all()` produces all Records up front,
 they are split by `run.batch_size`, and each batch runs `dedup → classify → quality → annotate →
-verify → emit` (classify/quality/annotate individually optional per switches; segment/extract
-never participate — segment requires process mode, §6.3).
+verify → emit` (classify/quality/annotate individually optional per switches;
+segment/stitch/extract never participate — segment requires process mode and stitch requires
+segment, §6.3).
 
 Statuses: `active | dropped_dup | dropped_lowq | dropped_verify | failed | absorbed |
-dropped_noise` (the last two are v1.8: `absorbed` = member frame absorbed into an episode
-envelope by M14, `dropped_noise` = noise/below-min-len frame dropped by M14 or shrunk out by
-M7 member surgery). Stages never delete list elements; they flip `status` and attach evidence.
+dropped_noise | stitched` (EIGHT values; `absorbed`/`dropped_noise` are v1.8: `absorbed` =
+member frame absorbed into an episode envelope by M14, `dropped_noise` = noise/below-min-len
+frame dropped by M14 or shrunk out by M7 member surgery; `stitched` is v1.9: merged-fragment
+episode shell terminal-marked by M16 stitch — contract ②c, §5/§7.16). Stages never delete list
+elements; they flip `status` and attach evidence.
 
 ---
 
@@ -181,6 +188,9 @@ Status = Literal[
     "dropped_noise",   # v1.8 additive: noise/short-segment frame (M14: reason "noise" /
                        #   "below_min_len", §7.14) or verify repair shrink
                        #   (M7: "off_task_member", §7.6) → rejects (§9.2)
+    "stitched",        # v1.9 additive: merged-fragment episode shell (M16 contract ②c,
+                       #   §5/§7.16; terminal); FOURTH ROUTE — written to neither main
+                       #   output nor rejects, counted only (§7.10/§9.3)
 ]
 
 
@@ -268,8 +278,9 @@ class Record:
                                            # Sequence-record field convention (S24, spec §4.1):
                                            # text/raw/ui_tree/image = None; modality = the
                                            # members' modality; id = the sequence rule below
-                                           # (fixed at formation — member surgery never
-                                           # recomputes it); ref = RecordRef(source_file=first
+                                           # (fixed at formation — M7 member surgery / M16
+                                           # thread rebinding never recompute it, v1.9 T22);
+                                           # ref = RecordRef(source_file=first
                                            # member's source, line_no=first member's line_no,
                                            # pair_index=first member's pair_index,
                                            # generated_from=(), generator=None) — full member
@@ -284,7 +295,9 @@ class Record:
 - generated records (M6): `raw = {input.text_field: sample_text}`, then the text rule.
 - sequence records (M14, v1.8): `sha256("\n".join(member_ids).encode("utf-8")).hexdigest()[:16]`
   over the member ids in order-key ascending order, fixed at episode formation — M7 member
-  surgery never recomputes it (spec 3.14.4 step ④).
+  surgery never recomputes it (spec 3.14.4 step ④), and neither does M16's thread rebinding
+  (contract ②c②, v1.9): the surviving envelope keeps its id, which doubles as `thread_id` and
+  `_meta.stream.episode_id`/`thread_id` (T22 identity chain).
 
 ```python
 @dataclass(frozen=True)
@@ -315,9 +328,12 @@ class Transition:                          # v1.8: one M15 extract verdict for a
                                            # {action_type, target, value, description} —
                                            # field semantics per the §10.10 table
     model: str                             # provider model string of the extracting profile
-    attempts: int                          # 1 + number of L3 repair calls
+                                           # ("" on a v1.9 thread-seam placeholder — no call)
+    attempts: int                          # 1 + number of L3 repair calls (0 on a seam placeholder)
     detail: Mapping                        # fallback trace: {kind: "extraction_invalid", message}
                                            # (S16); surgery re-seam: {reseamed: True} (S31);
+                                           # v1.9 thread-seam placeholder: {"kind": "thread_seam",
+                                           # "interrupted_by": [...]} (T10, zero-LLM — §7.15/§7.16);
                                            # {} for a clean extraction
 
 
@@ -366,7 +382,8 @@ class VerificationResult:
                                            # {"aspect": str, "opinion": str[, "judge": str]}
     defects: tuple[Mapping, ...] = ()      # v1.8 additive (S7): stream defect-table entries
                                            # {"kind", "members", "position", "detail"} — kind is
-                                           # the five-value enum of defect_verdict_schema (§10.7);
+                                           # the six-value enum of defect_verdict_schema (§10.7;
+                                           # five v1.8 values + wrong_stitch appended v1.9, T15);
                                            # non-stream paths: always (); travels to
                                            # _meta.verification.defects (§9.1)
 
@@ -389,16 +406,24 @@ class PipelineItem:                        # the ONLY mutable envelope; lifetime
     annotation: Annotation | None = None
     verification: VerificationResult | None = None
     errors: list[StageError] = field(default_factory=list)
-    transitions: tuple[Transition, ...] | None = None
-                                           # v1.8 additive: written by M15 extract (§7.15);
-                                           # None = extract disabled / not reached (idempotency
-                                           # gate: `transitions is not None` → skip)
     session_id: str | None = None          # v1.8 additive: in-batch carrier of the session
                                            # boundary (S4) — stamped by M10 on frame envelopes at
                                            # batching, by M14 on the appended episode envelopes
                                            # (bookkeeping, not business logic); M7's repair
                                            # neighborhood query = session_id filter + batch list
                                            # position order
+    thread_id: str | None = None           # v1.9 additive: stamped by M16 stitch on surviving
+                                           # thread envelopes at thread opening (== record.id ==
+                                           # episode_id, T22; doubles as the stitch idempotency
+                                           # gate); None everywhere else. The three M16 duck
+                                           # marks seam_indexes / seam_interrupted_by /
+                                           # stitch_fragments travel alongside as duck-typed
+                                           # envelope attributes (§7.16; copied by
+                                           # classify._fan_out, §7.13)
+    transitions: tuple[Transition, ...] | None = None
+                                           # v1.8 additive: written by M15 extract (§7.15);
+                                           # None = extract disabled / not reached (idempotency
+                                           # gate: `transitions is not None` → skip)
 
 
 # ── v1.8 shared frame helpers (spec §4.3, S12/S13) ──────────────────────────
@@ -451,6 +476,21 @@ Notes binding on all implementers:
   two `Status` values `absorbed`/`dropped_noise`. Sequence records hold their members **by
   reference** (frozen objects shared, zero copy) — episode formation does not change the
   batch's memory order of magnitude (spec §2.6).
+- v1.9 additive deltas (spec §4.1, same appended-with-defaults construction):
+  `PipelineItem.thread_id` and the `Status` value `stitched`. The three thread duck marks
+  stamped by M16 on surviving thread envelopes are deliberately NOT dataclass fields
+  (duck-typed envelope attributes, the `session_split`/`noise_attribution` family):
+  ① `seam_indexes: tuple[int, ...]` — each element is the seam pair's LEFT-member index in
+  the rebound member tuple, the SAME coordinate as `Transition.index`/`_meta.stream.steps[].index`,
+  range `[0, len(members) − 2]`; it has NO conversion relationship with `order_span`'s
+  session-order key space (m-8); ② `seam_interrupted_by: tuple[tuple[str, ...], ...]` —
+  positionally aligned with `seam_indexes`; the interrupting threads' `task_name`s in gap
+  order (M16 computes these — extract has no cross-thread visibility, T10/T20); never empty
+  for a seam; ③ `stitch_fragments` — session-ordered fragment table, elements
+  `{order_span, member_count, cause ∈ "origin"|"resumed"|"rescued", source_episode}` (M11
+  renders it as `_meta.stream.fragments`, §9.1). A fourth, frame-level audit mark
+  `rescued_by = <surviving thread record.id>` is stamped on rescue-flipped frames next to
+  their retained `noise_attribution` — trace/audit only, never emitted to any output channel.
 - `frame_digest`/`tree_diff` are v1.8 module-level helpers whose docstrings above are the
   behavior contract (spec §4.3 末段); M14/M15/M13/M4 consume them — never re-implement
   digest/diff logic inside an operator module.
@@ -562,6 +602,17 @@ class ErrorKind(str, enum.Enum):
                                                              # {kind, message}, episode stays alive,
                                                              # NEVER in item.errors — S16); "fail" →
                                                              # episode failed → rejects
+    STITCH_INVALID = "stitch_invalid"                        # v1.9: M16, judgment-level — M8 repair
+                                                             # exhausted; "keep" (default) = episode
+                                                             # candidate opens its own thread
+                                                             # (evidence via error event +
+                                                             # stitch.failures, NEVER in item.errors
+                                                             # — S26 form); "fail" = episode-
+                                                             # candidate envelope failed → rejects
+                                                             # (member frames stay absorbed; rescue
+                                                             # candidates never take the fail path —
+                                                             # a failed rescue judgment is a miss,
+                                                             # B-2)
     JUDGMENT_INVALID = "judgment_invalid"                    # M4, comparison-level → counts as tie
     SCHEMA_VIOLATION = "schema_violation"                    # M8 L3 exhausted → failed → rejects
     CALLBACK_VIOLATION = "callback_violation"                # v1.5: L3 exhausted, remaining
@@ -614,17 +665,26 @@ class Stage(Protocol):
 
     async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]:
         """契约：① 只处理 status=='active' 的项；② 不删除列表元素（只改 status）；
-           ②a（v1.7）classify 例外（仅 assignment="multi"）——可向传入列表尾部追加派生信封；
+           ②a classify 例外（仅 assignment="multi"）——可向传入列表尾部追加派生信封；
            追加物视同批内普通元素、同受 ①③④ 约束；不得删除、重排或替换任何既有元素对象
            （既有元素的 status / classification / errors 字段写入属 ①④ 的正常行为）；
            返回值仍须是传入的同一列表对象（调用方依赖列表身份）；
-           ②b（v1.8）segment 例外（仅 stream 模式）——segment 可将批内既有 active 成员信封的
-           status 置为 `absorbed` 或 `dropped_noise`（属①④的正常状态写入），并向传入列表
-           **尾部**追加以这些成员拼装的序列信封；追加物视同批内普通元素、同受①③④约束；
+           ②b segment 例外（v1.8，仅 stream 模式）——segment 可将批内既有 active 成员信封的
+           status 置为 absorbed 或 dropped_noise（属①④的正常状态写入），并向传入列表
+           尾部追加以这些成员拼装的序列信封；追加物视同批内普通元素、同受①③④约束；
            每个成员信封至多被一个序列信封吸收；不得删除、重排或替换任何既有元素对象；
-           返回值仍须是传入的同一列表对象。**M7 修复路径豁免**：verify 的缺陷修复可在本批内
-           将成员信封状态在 `absorbed` 与 `dropped_noise` 间双向改写（成员回收/收缩），
-           此为契约①的唯一反向豁免；禁止将成员信封翻回 `active`；
+           返回值仍须是传入的同一列表对象。M7 修复路径豁免：verify 的缺陷修复可在本批内
+           将成员信封状态在 absorbed 与 dropped_noise 间双向改写（成员回收/收缩），
+           此为契约①的唯一反向豁免；禁止将成员信封翻回 active；
+           ②c stitch 例外（v1.9，仅 stream 模式）——stitch 获授权恰好三件事（T6）：
+           ①将被并入的 episode 序列信封置 status='stitched'（壳终态）；②以成员并集
+           重绑幸存信封的 Record（成员按会话序键升序拼接，record.id 不重算——M7 手术
+           先例，thread_id == 幸存信封 record.id == episode_id）；③将 below_min_len
+           来源帧由 dropped_noise 翻回 absorbed（仅限救援命中——②b 双向豁免的 M16
+           延伸）。幸存者规范（m-7）：一遍中幸存信封恒为线索创始信封（开线索者），
+           被并候选信封作壳；二遍复评方向相反——单碎片线索候选信封作壳、目标线索信封
+           幸存。不追加、不删除、不重排、不替换任何元素对象；返回值仍须是传入的同一
+           列表对象；
            ③ generate 例外——返回新增子批（原批元素不修改）；④ 单条失败不得抛出到批层面，
            必须落入 item.errors 并置 status='failed'。"""
         ...
@@ -648,6 +708,18 @@ Binding rules:
   member envelopes bidirectionally between `absorbed` and `dropped_noise` (member reclaim /
   shrink) WITHIN the current batch; flipping a member back to `active` is forbidden — a frame
   and its episode must never both reach the main output.
+- v1.9 (contract ②c): stitch is authorized to do EXACTLY three things (T6) — ① flip merged
+  episode sequence envelopes to `stitched` (terminal shell); ② rebind the surviving envelope's
+  `record` to the member union (session-order-key ascending concatenation; `record.id` is never
+  recomputed — the M7 surgery precedent; `thread_id == surviving record.id == episode_id`, T22);
+  ③ flip `below_min_len`-attributed frames `dropped_noise → absorbed` on a rescue hit only (the
+  M16 extension of ②b's bidirectional exemption; the frames additionally get the `rescued_by`
+  audit duck mark, §3). Survivor rule (m-7): in pass 1 the thread-FOUNDING envelope always
+  survives and the merged candidate envelope becomes the shell; the pass-2 re-review runs the
+  opposite direction — the single-fragment candidate envelope becomes the shell and the target
+  thread's envelope survives (fragments re-sorted in session order; episode_id/thread_id follow
+  the surviving envelope, T22). Stitch appends, deletes, reorders and replaces NOTHING; the
+  returned value is still the same list object.
 - Non-generate stages: return value must be the input list (callers may rely on identity).
 - A stage must catch every per-record exception, append
   `StageError(stage=self.name, kind=..., message=..., retryable=...)` to `item.errors`, set
@@ -837,11 +909,16 @@ class AnnotateConfig:
     sc_temperature: float = 0.7
     sequence_frames: int = 20                     # v1.8: max keyframes per sequence-annotation
                                                   # request, ∈ [2, 100] (M1; outside → CONFIG_
-                                                  # ERROR). n members > k → deterministic uniform
-                                                  # downsample idx_i = ⌊i·(n−1)/(k−1)⌋, i=0..k−1
-                                                  # (first/last always kept, strictly increasing,
-                                                  # pure integer zero-rng; n <= k takes all —
-                                                  # S28). > 20 while the annotate profile's
+                                                  # ERROR). n members > k → deterministic
+                                                  # downsample, zero rng, first/last always kept,
+                                                  # strictly increasing; n <= k takes all (S28).
+                                                  # Non-stitched sequences: uniform
+                                                  # idx_i = ⌊i·(n−1)/(k−1)⌋, i=0..k−1; stitched
+                                                  # threads (v1.9, T14): per-fragment quotas —
+                                                  # every fragment keeps ≥ 1 keyframe, surplus
+                                                  # k−m split largest-remainder by (Lᵢ−1), local
+                                                  # uniform inside fragments (§7.4 formula).
+                                                  # > 20 while the annotate profile's
                                                   # max_image_px > 2000 → M1 WARN (§6.3);
                                                   # explicitly set while non-stream → no-op
                                                   # warning
@@ -876,11 +953,12 @@ class TraceConfig:
     enabled: bool = False
     path: str = ""                                # M1 resolves "" → "{output_stem}.trace.jsonl"
     channels: tuple[str, ...] = ("quality", "verify", "schema")
-                                                  # allowed: ingest|segment|dedup|classify|
-                                                  # extract|quality|annotate|verify|schema|llm —
-                                                  # TEN values (v1.7 adds "classify"; v1.8 adds
-                                                  # "segment"/"extract": channel = stage name,
-                                                  # S1); the default stays unchanged
+                                                  # allowed: ingest|dedup|segment|stitch|extract|
+                                                  # classify|quality|annotate|verify|schema|llm —
+                                                  # ELEVEN values (v1.7 adds "classify"; v1.8 adds
+                                                  # "segment"/"extract"; v1.9 adds "stitch":
+                                                  # channel = stage name, S1); the default stays
+                                                  # unchanged
     content: Literal["none", "refs", "excerpt", "full"] = "refs"
 
 
@@ -942,7 +1020,7 @@ class ClassView:                                  # one class's effective config
                                                   # spec §5.2)
 
 
-# ── stream (v1.8, spec §5.2 [stream] + [segment] + [extract]) ───────────────
+# ── stream (v1.8, spec §5.2 [stream] + [segment] + [extract]; v1.9 + [stitch]) ──
 
 @dataclass(frozen=True)
 class StreamConfig:                               # input-side ordering + sessionization
@@ -1019,6 +1097,48 @@ class SegmentConfig:                              # M14 (§7.14) — the stream-
 
 
 @dataclass(frozen=True)
+class StitchConfig:                               # v1.9 (spec §5.2 [stitch]): M16 (§7.16)
+    enabled: bool = False                         # true ⇒ segment.enabled (M1 rule 37, T17);
+                                                  # false = stage not in chain, output
+                                                  # byte-identical to v1.8 except the dry-run
+                                                  # stderr stitch_calls=0 line (m-11, §7.9)
+    llm: str = "default"                          # judgment profile; joins the reference sets
+                                                  # whenever enabled (no strategy condition) —
+                                                  # pure-text evidence, NEVER in any
+                                                  # vision-required set (T16, §6.3 rule 40)
+    max_open: int = 4                             # open-thread pool capacity (suspension-window
+                                                  # mean 3 + 1 active, N-13 anchor); M1: >= 1
+    bias: Literal["conservative", "llm"] = "conservative"
+                                                  # conservative = LLM resume AND mechanical-prior
+                                                  # whitelist hit (T9 conjunction); llm = pure
+                                                  # LLM verdict
+    rescue_short: bool = True                     # below_min_len short runs join the candidate
+                                                  # stream (T11); rescue never opens threads (B-2)
+    repass: bool = True                           # bounded second pass over single-fragment
+                                                  # threads (T19); false = pure one-pass greedy
+    stale_gap_steps: int = 0                      # ordinal-gap decay threshold; 0 = leg off;
+                                                  # double duty: T9 prior downgrade (two legs
+                                                  # required beyond the gap) + T8 pool-full
+                                                  # eviction priority (distinct from
+                                                  # stream.gap_steps); M1: >= 0
+    digest_max_chars: int = 400                   # per-frame digest cap inside summary cards
+                                                  # (segment key-name semantics, m-9); M1: >= 1
+    context: str = ""                             # optional domain hint (what "same task" means),
+                                                  # injected into the §10.11 system message
+    votes: int = 1                                # T18: 1 (default) = single call; >1 = n samples
+                                                  # with a strict (verdict, thread_ref) majority
+                                                  # (M-4); M1: odd only — even = CONFIG_ERROR
+                                                  # (rule 38); samples run at the profile default
+                                                  # temperature (NO sc_temperature key — T18)
+    on_error: Literal["keep", "fail"] = "keep"    # keep (default): episode candidate opens its
+                                                  # own thread, evidence = error event +
+                                                  # stitch.failures (never item.errors); fail
+                                                  # applies to episode-candidate envelopes ONLY —
+                                                  # rescue candidates never take the fail path
+                                                  # (B-2, §4 stitch_invalid)
+
+
+@dataclass(frozen=True)
 class ExtractConfig:                              # M15 (§7.15); UI-modality sequences only
     enabled: bool = False                         # requires segment.enabled AND
                                                   # run.modality = "ui" (§6.3 rule 30)
@@ -1064,6 +1184,8 @@ class ResolvedConfig:
                                                   # every construction site passes keywords)
     dedup: DedupConfig
     segment: SegmentConfig                        # v1.8 — required, no default
+    stitch: StitchConfig                          # v1.9 — required, no default (R23 convention:
+                                                  # every construction site passes keywords)
     extract: ExtractConfig                        # v1.8 — required, no default
     classify: ClassifyConfig                      # v1.7 — required, no default (R23)
     quality: QualityConfig
@@ -1277,13 +1399,40 @@ apply only when the named switch is on unless stated):
     selectors always win; class views inherit through the base selector). Rules 16/26/27
     apply to the trajectory rubric unchanged.
 
+Stitch (v1.9, spec §5.2 [stitch] rows + spec 2.3.1; T17):
+37. `stitch.enabled = true` requires `segment.enabled = true` (thread stitching consumes
+    segment products only — chain slot segment → stitch → dedup, T5). Transitively this
+    inherits rule 29's demands (process mode, generate off, annotate on) and rule 29's
+    generate exclusion — stitch can never co-occupy a chain with generate.
+38. `stitch.votes` is an odd integer ≥ 1 (parse floor ≥ 1; an EVEN value → CONFIG_ERROR —
+    the (verdict, thread_ref) strict-majority aggregation needs an odd sample count, T18/M-4;
+    the `judges`/`self_consistency` odd-count family). Checked regardless of the switch
+    (rule-32 family).
+39. `[stitch]` numeric/enum bounds (parse layer): `max_open ≥ 1`, `stale_gap_steps ≥ 0`,
+    `digest_max_chars ≥ 1`, `llm` non-empty; `bias ∈ {"conservative", "llm"}`,
+    `on_error ∈ {"keep", "fail"}`.
+40. Reference sets: `stitch.llm` joins the reference sets (rule 12 key resolution /
+    profile existence / `validate --probe` via
+    `labelkit.orchestration.profile_usage.referenced_profiles()`) whenever
+    `stitch.enabled = true` — with NO strategy condition (unlike `segment.llm`, rule 33) —
+    and NEVER joins the rule-4/34 vision set: the stitch judgment is pure text (summary
+    cards, no images — T16), so `supports_vision` is never demanded of it. The rule-34
+    per-stage vision table is unchanged (stitch has no row; quality stays the single
+    relaxation).
+41. `[class.<name>.stitch]` does NOT exist as a section: stitch runs BEFORE classify in the
+    chain, so class labels do not exist at stitching time (the same chain-order causality
+    that excludes `[class.<name>.segment]`, rule 35); it is outside rule 25's section list,
+    so any such table falls to the whitelist CONFIG_ERROR.
+
 Warnings (non-blocking): `verify` enabled and `verify.llm`'s `model` equals `annotate.llm`'s
 `model` → warn about self-enhancement bias (spec 3.7.2). v1.7 (R8): `classify.enabled = false`
 while `[[classify.classes]]` and/or `[class.*]` tables are present → ONE warning naming the
 ignored tables, never a CONFIG_ERROR ("keep the config, flip the switch" is legal — same
 family as the ineffective-top_ratio warning). v1.8 additions (same R8 family, all
 non-blocking): any of `[stream]`/`[segment]`/`[extract]` present while `segment.enabled =
-false` → ONE warning naming the ignored tables; `segment.strategy = "rules"` with explicit
+false` → ONE warning naming the ignored tables (v1.9: `[stitch]` joins that parked list when
+it carries payload beyond its own `enabled` switch while `stitch.enabled = false`);
+`segment.strategy = "rules"` with explicit
 `noise_filter = true` → no-op warning; `annotate.sequence_frames` explicitly set while
 `segment.enabled = false` → no-op warning; effective trajectory rubric while
 `extract.enabled = false` → warning (the rubric is modality-neutral and does not presuppose
@@ -1293,6 +1442,14 @@ static WARN (S21: such sessions will be hard-split by M10 + `session_split` mark
 (S28: Anthropic hard-rejects >20-image requests containing any image over 2000 px — HTTP
 400, not a resize; the default max_image_px=2048 hits it. Guide: set `max_image_px <= 2000`
 or lower `sequence_frames`; the 20-image threshold counts ALL image blocks in the request).
+v1.9 additions (T17, same family): ① `stitch.enabled = true` with `segment.strategy =
+"rules"` → advisory WARN (rules segmentation has no LLM refinement, so the stitch pool
+receives coarse whole-session cuts — legal but usually unintended; switch strategy to
+`"llm"`/`"hybrid"` to stitch at task granularity); ② `[stitch]` carrying payload beyond its
+own `enabled` switch while `stitch.enabled = false` AND `segment.enabled = true` → its OWN
+no-op warning (the `sequence_frames` precedent — the v1.8 parked-tables warning lives in the
+segment-OFF branch and cannot fire here; under segment off the table joins that parked list
+instead, see above).
 
 ---
 
@@ -1566,12 +1723,20 @@ v1.8 sequence scoring (`record.kind == "sequence"`; spec 3.4.3 sequence row):
 - **Record rendering** switches to the §10.2/§10.3 sequence variant: `[步骤序列]` (the
   transitions rendered as text; a fallback step — `Transition.detail.kind ==
   "extraction_invalid"` — is listed SEPARATELY from an LLM-confirmed `other` by the
-  `（摘取兜底）` line suffix, S16, so fallback noise cannot pollute the coherence anchor) +
+  `（摘取兜底）` line suffix, S16, so fallback noise cannot pollute the coherence anchor;
+  v1.9, T14 — a thread-seam placeholder step, `Transition.detail.kind == "thread_seam"`,
+  carries the PARALLEL trailing suffix `（线索接缝：被{X}打断）` where X =
+  `detail.interrupted_by` joined with `、`, frozen in §10.2: without it the trajectory
+  rubric's noise_residue/coherence criteria would score the mechanical seam as noise residue
+  or an unexplained jump) +
   `[成员帧摘要]` (bounded per-member `frame_digest`), **NO images** — sequence scoring is
   pure text even in UI modality (the rule-34 vision relaxation, §6.3). transitions and the
   pre-rendered text reach the judging calls via NEW PRIVATE parameters of
   `_judge_once`/`_pointwise_once` (private signatures — not part of the frozen surface);
   the `excerpt` tier payload for sequences = first 200 chars of the member-digest rendering.
+  With stitch on the scoring unit is unchanged mechanically but semantically becomes the
+  THREAD (a multi-fragment thread scores as one envelope; stitched shells are filtered by
+  the existing `status == "active"` gate).
 - **Rubric**: the stream default is `default:trajectory` (S29, §6.3 rule 36); the rubric is
   consumed by the EXISTING machinery with zero changes. With `extract.enabled = false` the
   steps section is absent and "步骤" degrades to "帧间变化" (M1 warns, §6.3).
@@ -1592,27 +1757,35 @@ def build_annotate_prompt(record: Record, cfg: ResolvedConfig, schema_text: str,
                           repair: RepairContext | None = None,
                           temperature: float | None = None,
                           label: str | None = None,
-                          transitions: tuple[Transition, ...] | None = None) -> PromptBundle:
+                          transitions: tuple[Transition, ...] | None = None,
+                          fragment_lens: tuple[int, ...] | None = None) -> PromptBundle:
     """Deterministic template assembly per §10.1. schema_text = SchemaEngine.user_schema_text.
     repair != None appends the repair suffix (§10.5). [FROZEN HERE; label is a v1.7 ADDITIVE
     trailing kwarg (R2): non-None → instruction/examples come from
     cfg.class_views[label].annotate; None = global config — pre-v1.7 call sites unchanged.
     transitions is the SECOND additive trailing-kwarg revision of this frozen signature
     (v1.8, S5 — same R2 construction): non-None → the §10.1 sequence variant renders the
-    [动作序列] section from it; None = section omitted / pre-v1.8 behavior byte-identical]"""
+    [动作序列] section from it; None = section omitted / pre-v1.8 behavior byte-identical.
+    fragment_lens is the THIRD additive trailing kwarg (v1.9, T14 — same S5 form): non-None →
+    the ② keyframe downsample runs the per-fragment quotas below; None = the v1.8 uniform
+    downsample byte-identical]"""
 
 
 async def annotate_record(record: Record, ctx: RunContext,
                           repair: RepairContext | None = None,
                           label: str | None = None,
-                          transitions: tuple[Transition, ...] | None = None) -> Annotation:
+                          transitions: tuple[Transition, ...] | None = None,
+                          fragment_lens: tuple[int, ...] | None = None) -> Annotation:
     """One record's full annotation path incl. self-consistency (skipped when repair != None:
     repair re-annotation is always a single call at profile-default temperature [FROZEN HERE]).
     Raises SchemaViolation / ProviderRetryableError / ProviderFatalError. This is the hook M7
     uses for verify.policy='repair'. [FROZEN HERE; label is a v1.7 ADDITIVE trailing kwarg
     (R2), same semantics as build_annotate_prompt — None = global config. transitions is the
     v1.8 ADDITIVE trailing kwarg (S5): the stage layer passes item.transitions; the M7 repair
-    path threads the REBUILT value through after member surgery — None = pre-v1.8 behavior]"""
+    path threads the REBUILT value through after member surgery — None = pre-v1.8 behavior.
+    fragment_lens is the v1.9 ADDITIVE trailing kwarg (T14), passed through to
+    build_annotate_prompt on EVERY path (single call, each self-consistency sample, repair
+    re-annotation) — None = pre-v1.9 behavior]"""
 
 
 class AnnotateStage(Stage):
@@ -1653,6 +1826,22 @@ section exists to guarantee this with zero repair-code changes. Keyframe selecti
 rng; n ≤ k takes all members). Self-consistency and the L2.5 hook paths are UNCHANGED (the
 L2.5 callback receives `record=None` for sequence records — documented limitation; a richer
 payload is a roadmap candidate).
+
+v1.9 per-fragment keyframe quota (T14; stitched threads only — `fragment_lens` non-None):
+uniform sampling would drain a small fragment whole (minor-8), so with m fragments of
+lengths L₁..Lₘ (member-tuple order — fragments are contiguous session-order blocks;
+Σ Lᵢ = n > k ≥ m) the downsample upgrades to quotas: every fragment gets a BASE quota of 1;
+the surplus k − m is distributed by largest remainder weighted by (Lᵢ − 1) — base share
+`⌊(Lᵢ−1)·(k−m) / (n−m)⌋`, leftover units granted in descending-remainder order with ties
+broken toward the LOWER fragment index; inside each fragment the S28 uniform formula runs
+LOCALLY over its quota (a quota-1 fragment keeps its FIRST member, except the LAST fragment
+keeps its LAST member — preserving the global first/last invariant). DEGRADE to the v1.8
+uniform formula when `fragment_lens` is absent, single-fragment, inconsistent
+(Σ Lᵢ ≠ n), or k < m (the ≥ 1-per-fragment guarantee is infeasible). Threading duty
+(穿参义务): the stage layer derives `fragment_lens` from the `stitch_fragments` duck mark's
+`member_count` column; the M7 repair re-annotation call site threads it IDENTICALLY —
+dropping it there would silently downgrade repair re-annotation to the uniform downsample
+(§7.6).
 
 ### 7.5 M6 — `labelkit/operators/generate.py`
 
@@ -1751,10 +1940,38 @@ byte-unchanged; sequence envelopes are driven by a stage-layer bypass driver:
   `VerificationResult.defects` and `_meta.verification.defects` (§9.1). A `fail` verdict with
   an EMPTY defects array is normalized code-side to one default `label_mismatch` entry (S7).
   Multi-judge: defects = the UNION over judges that voted fail, deterministically
-  de-duplicated and sorted by (kind enum order, position, members) (S31).
-- **Evidence** (§10.5 sequence variant): `[任务指令]` + `[动作序列]` + `[边界余量]` (the
+  de-duplicated and sorted by (kind enum order, position, members) (S31). The defect-kind
+  vocabulary is SIX values (v1.9, T15): the five v1.8 kinds + `wrong_stitch` appended last —
+  `DEFECT_KINDS` in `labelkit/operators/verify.py`, mirrored by `_DEFECT_KINDS` in the
+  orchestrator report assembly and the §10.7 schema enum (four-way sync).
+- **Evidence** (§10.5 sequence variant): `[任务指令]` + `[动作序列]` + (v1.9, stitch on only)
+  `[片段结构]` + `[边界余量]` (the
   frame_digest of the k=2 frames beyond each segment boundary plus each frame's fate:
-  noise / adjacent-episode ordinal / none) + `[首帧截图]` + `[末帧截图]` + `[标注结果]`.
+  noise / adjacent-episode ordinal / none) + `[首帧截图]` + `[末帧截图]` + `[标注结果]` —
+  six sections in v1.8 form, SEVEN under stitch (T15: without the fragment-structure section
+  `wrong_stitch` is unjudgeable). `[片段结构]` is pre-rendered by the stage driver via the
+  public helper `fragment_structure_text(item, cfg.stitch.digest_max_chars)` ONLY when
+  `stitch.enabled` (m-11 — stitch off keeps the six-section v1.8 form byte-identical): one
+  line per fragment (thread-internal ordinal / member-index span in the rebound-tuple
+  coordinate / member count / first-frame digest) plus the seam-position table rendered from
+  `seam_indexes`/`seam_interrupted_by` (`步 {idx}（被{X}打断）`, or `接缝位置: 无`); marks
+  absent/inconsistent degrade to a single implied fragment. The internal
+  `build_verify_prompt` builder gains the `fragment_structure: str = ""` trailing kwarg
+  (non-frozen surface, the boundary_margin construction) — empty string omits the section.
+  `[动作序列]` step lines follow the §10.1 format; review evidence carries NO `（摘取兜底）`
+  suffix (that S16 marker is M4's), but v1.9 thread-seam placeholder steps DO carry the
+  `（线索接缝：被{X}打断）` suffix (T14/T15 — a deliberate revision of the no-suffix rule:
+  without it the reviewer reads the mechanical placeholder as an unexplained jump and calls
+  spurious defects).
+- **Stitched-shell filtering (v1.9, T15 major-5).** The session-episode ordinal helper
+  `_session_episodes` (feeding the `[边界余量]` "第 n 段" fates and the neighbor-episode
+  determination) EXCLUDES `status == "stitched"` shells — a shell's stale member set would
+  otherwise pollute the segment ordinals and the margin fates.
+- **`wrong_stitch` routing (v1.9, T15).** An INDEPENDENT branch in `_route_defects`:
+  mark-only — the defect stays in the table (→ `_meta.verification.defects`), triggers NO
+  repair action (no member surgery, no unstitch — §4 non-goal), and the fail verdict stands
+  under the existing policy/budget semantics. It must NEVER enter the `missing_*` reclaim
+  scan (`_MISSING_KINDS` deliberately excludes it) and counts no boundary_flags.
 - **Two-phase batch-level repair round (S8** — determinism under concurrent gather;
   `policy="repair"` only): ① concurrent review of ALL pending episodes; ② SYNCHRONOUS
   member surgery executed in batch position order (first-come becomes
@@ -1772,7 +1989,8 @@ byte-unchanged; sequence envelopes are driven by a stage-layer bypass driver:
   ④ synchronous record rebuild (`dataclasses.replace(record, members=...)`; the record
   **id is NOT recomputed**) and transitions rebuild (renumbered so
   `len(transitions) == len(members) − 1` holds); ⑤ concurrent re-annotation via
-  `annotate_record(..., transitions=<rebuilt>)` (§7.4); → next-round re-review. Repair
+  `annotate_record(..., transitions=<rebuilt>, fragment_lens=<from the stitch_fragments
+  duck mark — the v1.9 T14 threading duty, §7.4>)`; → next-round re-review. Repair
   rounds count against `max_repair_rounds` INCLUDING the first review.
 - **Multi fan-out interplay (S8).** Membership-class surgery may execute ONLY on the
   original envelope (first label); cloned siblings downgrade to mark-only. After a repair
@@ -1782,8 +2000,8 @@ byte-unchanged; sequence envelopes are driven by a stage-layer bypass driver:
   `_meta.stream.repaired = true` is the marker.
 - **Counters (owner M7, §9.3):** `verify.membership_repairs` (surgeries executed),
   `verify.boundary_flags` (mark-only boundary determinations), `verify.defects.<kind>`
-  (per defect kind) → `report.stream.verify`. Defect summaries ride the `verify.verdict`
-  event payload (content-tiered, §8.1).
+  (per defect kind — six kinds incl. `wrong_stitch`, v1.9) → `report.stream.verify`.
+  Defect summaries ride the `verify.verdict` event payload (content-tiered, §8.1).
 
 ### 7.7 M8 — `labelkit/common/runtime/schema_engine.py`
 
@@ -1851,15 +2069,19 @@ def classification_schema(class_names: list[str], assignment: str,
                           max_labels: int, with_reason: bool) -> dict: ...   # v1.7 (M13), §10.7
 def segment_window_schema(frame_count: int, with_reason: bool) -> dict: ...  # v1.8 (M14), §10.7
 def action_schema() -> dict: ...                                             # v1.8 (M15), §10.7
-def defect_verdict_schema() -> dict: ...                                     # v1.8 (M7 stream),
-                                                                             # §10.7
+def stitch_schema() -> dict: ...                                             # v1.9 (M16), §10.7
+def defect_verdict_schema() -> dict: ...                                     # v1.8 (M7 stream);
+                                                                             # v1.9: kind enum
+                                                                             # +wrong_stitch, §10.7
 ```
 
-The three v1.8 builders are INTERNAL schemas like the rest: no `resolved_at` bucket
-counting, no L2.5 hook, keyword set ⊆ the frozen internal-schema keyword set, and NO
+The three v1.8 builders and the v1.9 `stitch_schema` are INTERNAL schemas like the rest: no
+`resolved_at` bucket counting, no L2.5 hook, keyword set ⊆ the frozen internal-schema keyword
+set, and NO
 `uniqueItems` anywhere (R1 lesson — L0 strict-mode pass-through). The non-stream verify
 path keeps using the frozen `VERDICT_SCHEMA`; `defect_verdict_schema()` exists ALONGSIDE it
-(two verdict schemas co-exist, S7).
+(two verdict schemas co-exist, S7 — its defect-kind enum grows to six values in v1.9 with
+`wrong_stitch` appended last, T15).
 
 ### 7.8 M9 — `labelkit/common/runtime/llm_client.py`
 
@@ -2049,12 +2271,16 @@ class Orchestrator:
 
 Normative behavior: split `ingestor.records()` into batches of `run.batch_size` (`--limit`
 truncates the stream to the first N records); wrap into `PipelineItem`s; per batch, per enabled
-stage in chain order — the SINGLE SUPERSET TUPLE (v1.8)
-`_CHAIN_ORDER = ("segment", "dedup", "classify", "extract", "quality", "generate",
-"annotate", "verify")` **[FROZEN HERE: the eight-name tuple]** — with segment/extract DEFAULT
+stage in chain order — the SINGLE SUPERSET TUPLE (v1.9)
+`_CHAIN_ORDER = ("segment", "stitch", "dedup", "classify", "extract", "quality", "generate",
+"annotate", "verify")` **[FROZEN HERE: the nine-name tuple — v1.9 slots stitch between
+segment and dedup, T5]** — with segment/stitch/extract DEFAULT
 OFF, so the effective v1.7 chain dedup → classify → quality → generate → annotate → verify is
 a byte-identical degradation (`generate` and `segment` are mutually exclusive per §6.3 rule
-29, so the two never co-occupy the chain; `_compose_chain` includes classify in the main,
+29 and stitch requires segment per rule 37, so generate never co-occupies the chain with any
+stream stage; `_compose_chain`'s enabled map carries the matching `"stitch":
+cfg.stitch.enabled` entry — inserting the tuple name alone is necessary but not sufficient;
+it includes classify in the main,
 re-flow AND generate_only chains — items already classified rely on M13's idempotent skip):
 build a fresh `RunContext`
 (rng derived per §5) and `await stage.run(batch, ctx)`; `generate.run`'s return value is enqueued as
@@ -2116,19 +2342,23 @@ v1.8 stream orchestration (spec 3.10.3 stream rows; active only when `segment.en
 - **Episode metering (fanout-isomorphic, R9 construction).** `counts.episodes` = the
   `len(batch)` delta across the SEGMENT stage invocation, metered by M10 — M14 never touches
   `counts.*`.
-- **Status tally.** The post-emit tally gains `absorbed`/`dropped_noise`; the `failed`
+- **Status tally.** The post-emit tally gains `absorbed`/`dropped_noise` (v1.8) and
+  `stitched` (v1.9, T7 blocker-1); the `failed`
   fallback formula extends to
   `failed = max(len(batch) − emitted − dropped_dup − dropped_lowq − dropped_verify −
-  absorbed − dropped_noise, 0)` — without the new terms, absorbed members would be
+  absorbed − dropped_noise − stitched, 0)` — without the new terms, absorbed members (or
+  v1.9 shells, which are terminal, not failed) would be
   miscounted as failed. `batch.end` payload gains `episodes`/`absorbed`/`dropped_noise`
   (carried only when segment is enabled, R20 form, §8.1); the stderr progress/summary line
   gains NO new keys (fanout precedent — the report carries them).
-- **Conservation & interrupted residual (S18).** The full v1.8 invariant is §9.3's
+- **Conservation & interrupted residual (S18).** The full expanded invariant is §9.3's
   `emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed +
-  bad_input + absorbed = scanned + generated + fanout + episodes`. In stream mode the
+  bad_input + absorbed + stitched = scanned + generated + fanout + episodes` (the
+  `stitched` term is v1.9, present only under `stitch.enabled`). In stream mode the
   `counts.unprocessed` residual appears on "breaker trip **OR** interrupted" (SIGINT over a
   session buffer strands in-flight records); the residual computation extends both sides
-  (`+ episodes` on the source side, `+ absorbed + dropped_noise` on the terminal side).
+  (`+ episodes` on the source side, `+ absorbed + dropped_noise` — and `+ stitched`,
+  v1.9 T7 — among the terminal counts).
   Non-stream interrupted runs keep a zero residual and NO `unprocessed` key (regression
   anchor).
 - **Dry-run (S22/S23).** `_estimate` gains, unconditionally printed (classify precedent;
@@ -2138,6 +2368,27 @@ v1.8 stream orchestration (spec 3.10.3 stream rows; active only when `segment.en
   a stderr note; the batch count is computed EXACTLY by dry-run next-fit packing of the
   session sizes; text-modality line counting and the session dry-run fuse into a single
   read pass (S23, §7.1).
+
+v1.9 stitch orchestration (spec 3.10.3 v1.9 rows; active only when `stitch.enabled`):
+
+- **`counts.stitched` tally & the derived `counts.threads` (T7).** `stitched` joins the
+  post-emit status tally (M10-owned, like absorbed/dropped_noise — M16 never touches
+  `counts.*`); `counts.threads` is NOT a counter: it is DERIVED once, at report assembly,
+  as **`threads = episodes − stitched`** — the single reporting point (the T16
+  double-landing guard; the same identity is the acceptance-table redundancy column).
+- **`batch.end` payload** gains `stitched`/`threads` (carried only when stitch is enabled —
+  the m-11 off-mode byte-equivalence condition; same R20 form, §8.1); the per-batch
+  `threads` value is the batch-local `episodes − stitched` delta. The stderr
+  progress/summary line still gains NO new keys (stitched is deliberately not displayed —
+  R20 culture).
+- **Dry-run (T16 estimate, S22 culture).** `_estimate` gains
+  `stitch_calls = len(session_lens) × stitch.votes × (2 if stitch.repass else 1)` — one
+  judgment per episode candidate over the episodes ≈ sessions lower-bound base, × votes
+  SAMPLES (call-count accounting — votes multiplies CALLS; the §9.3 judgments counters count
+  logical judgments and are votes-invariant), doubled when the
+  repass is on; 0 when disabled and the `stitch_calls=` field prints UNCONDITIONALLY on the
+  estimate line (the v1.8 segment_calls precedent — the sole observable difference of a
+  stitch-off run vs v1.8, m-11).
 
 ### 7.10 M11 — `labelkit/operators/emitter.py`
 
@@ -2192,9 +2443,13 @@ classification writes no `item.errors` entry (R4, §7.13).
 v1.8 (spec 3.11.2 stream rows):
 
 - **Third route.** `status == "absorbed"` goes to NEITHER the main output NOR rejects —
-  counted only (the member content lives inside its episode's sequence record). `emit_batch`
-  distribution becomes: active → main; absorbed → counted; every other non-active status →
-  rejects.
+  counted only (the member content lives inside its episode's sequence record).
+- **Fourth route (v1.9, T21).** `status == "stitched"` likewise goes to NEITHER channel —
+  counted only (the merged-fragment shell's content lives inside its thread's rebound
+  record). A shell must NEVER fall through to the rejects fallback: it would pollute rejects
+  as `internal_error` and trip `--strict` to exit 1. `emit_batch`
+  distribution becomes: active → main; absorbed → counted; stitched → counted; every other
+  non-active status → rejects.
 - **Rejects attribution for `dropped_noise`.** `_reject_stage_reason` gains a
   `dropped_noise` branch that reads the duck-typed reason mark left by the flipping stage:
   `("segment", "noise")` | `("segment", "below_min_len")` | `("verify", "off_task_member")`
@@ -2207,6 +2462,20 @@ v1.8 (spec 3.11.2 stream rows):
 - **`_raw_payload`** (rejects `full` tier) gains a `kind == "sequence"` branch emitting
   `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}` (S25, §9.2) instead
   of the single-record payload shape.
+
+v1.9 (spec 3.11.2 v1.9 rows; all three deltas present ONLY when `stitch.enabled` — the
+m-11 off-mode byte-equivalence condition):
+
+- **`_meta.stream` additions** (§9.1 key positions frozen): `thread_id` immediately AFTER
+  `episode_id` (`== item.thread_id == episode_id`, T22); `fragments` AFTER `degraded` and
+  BEFORE `steps` (rendered from the `stitch_fragments` duck mark; `null` when the mark is
+  absent); each `steps[]` row gains `resumed` — derived from
+  `Transition.detail.kind == "thread_seam"` (T10), never from `action_type`.
+- **Envelope `order_span` (包络 rule).** The TOP-LEVEL `order_span` stays the envelope span
+  [first member key, last member key] — for a multi-fragment thread it may CONTAIN other
+  threads' frames; downstream slicing must use `fragments[].order_span` (§9.1).
+- Stitched shells and rescue-flipped frames never produce output lines (fourth/third route);
+  `--strict` semantics note in §9.2.
 
 ### 7.11 M12 — `labelkit/common/observability/obslog.py`
 
@@ -2283,17 +2552,23 @@ and (v1.6) `EV_LLM_KEY_COOLDOWN = "llm.key_cooldown"`, `EV_LLM_KEY_DISABLED = "l
 `EV_LLM_POOL_PARKED = "llm.pool_parked"`, and (v1.7)
 `EV_CLASSIFY_DECISION = "classify.decision"`, and (v1.8)
 `EV_INGEST_DISORDER = "ingest.disorder"`, `EV_SEGMENT_SESSION = "segment.session"`,
-`EV_SEGMENT_BOUNDARY = "segment.boundary"`, `EV_EXTRACT_STEP = "extract.step"`.
+`EV_SEGMENT_BOUNDARY = "segment.boundary"`, `EV_EXTRACT_STEP = "extract.step"`, and (v1.9)
+`EV_STITCH_JUDGE = "stitch.judge"`, `EV_STITCH_THREAD = "stitch.thread"` (T16 — the
+EV_SEGMENT_BOUNDARY mirror pair; both trace-only, §8.1).
 
 v1.8 redaction constants (S27, §8.3): `_FREE_TEXT_KEYS` gains `"description"` (LLM-produced
 free text — stripped at `none`, carried from `refs`); NEW module constant
 `_DATA_KEYS = {"target", "value"}` — INPUT-DATA-DERIVED payload fields (widget text
 references, typed-in text), stripped at BOTH `none` and `refs` (the refs tier's
-"no input data content" red line), carried from `excerpt`. The channel enumeration
+"no input data content" red line), carried from `excerpt`. v1.9 (T16): `_FREE_TEXT_KEYS`
+additionally gains `"task_name"` (the stitch.judge/stitch.thread rolling thread task name is
+LLM-produced free text — same tier as `reason`). The channel enumeration
 `_TRACE_CHANNELS` (owned by `labelkit/common/config/loader.py`) grows 8 → 10 with
 `"segment"`/`"extract"`
 (S1: channel = stage name; the `error` event auto-routes by its `stage` field — zero routing
-code changes).
+code changes), and v1.9 grows it 10 → 11 with `"stitch"` (same S1 rule: the
+`stitch.judge`/`stitch.thread` prefix routes automatically and stitch-stage `error` events
+follow their `stage` field — again zero routing changes).
 
 ### 7.12 CLI — `labelkit/cli/` package
 
@@ -2342,6 +2617,14 @@ per their switches at their `_CHAIN_ORDER` slots (§7.9).
 `segment.llm` ONLY when `segment.enabled` and `segment.strategy ∈ {llm, hybrid}`, and
 `extract.llm` whenever `extract.enabled` (S30, §6.3 rule 33 — the same conditions govern all four
 reference sets).
+
+v1.9: `build_stages` constructs `StitchStage` (lazy import of `labelkit.operators.stitch`,
+the SegmentStage/ExtractStage convention) at its `_CHAIN_ORDER` slot — between the
+SegmentStage and DedupStage constructions — when `stitch.enabled`;
+`referenced_profiles()` gains `stitch.llm` whenever `stitch.enabled` (NO strategy condition,
+unlike segment; §6.3 rule 40 — same condition as the loader's key-resolution/existence sets),
+so `validate --probe` probes the stitch judgment profile. `stitch.llm` never joins the
+vision set (pure-text judgment, T16).
 
 ### 7.13 M13 — `labelkit/operators/classify.py` (v1.7)
 
@@ -2404,9 +2687,17 @@ Normative behavior:
   appended IN PLACE to the tail of the passed-in batch list. Clones share `record` and
   `dedup` BY REFERENCE (sibling rows' `_meta.dedup` stay consistent) and inherit
   `session_id` (v1.8: sibling episodes stay addressable for the M7
-  boundary-margin/neighborhood queries); `classification`
+  boundary-margin/neighborhood queries) and `thread_id` (v1.9, T14 — a real field, cloned
+  in the constructor: thread identity belongs to the record, not the envelope);
+  `classification`
   swaps `label` (`labels` = the same full set); `status="active"`;
-  scores/annotation/verification/errors are fresh default containers. Append order =
+  scores/annotation/verification/errors are fresh default containers. The duck-mark copy
+  loop (D6 — v1.8 copies `session_split`/`segment_degraded`, which describe the EPISODE's
+  session and segmentation, so sibling rows never contradict the original's `_meta.stream`)
+  grows in v1.9 (T14) by the three M16 marks `seam_indexes` / `seam_interrupted_by` /
+  `stitch_fragments`: seam_indexes drives the sibling's own extract pass (§7.15),
+  seam_interrupted_by its seam-placeholder text, stitch_fragments its
+  `_meta.stream.fragments` and annotate keyframe quota (§7.4). Append order =
   (original element's batch position → label declaration order), byte-reproducible. Return
   value = the same list object passed in.
 - **Idempotency.** Items with `classification is not None` are skipped (covers generated
@@ -2510,6 +2801,16 @@ Normative behavior (spec 3.14.4):
   `below_min_len`/`digest_poor_frames` report fields are M14-owned (§9.3);
   `counts.episodes`/`absorbed`/`dropped_noise` are M10's (§7.9).
 
+v1.9 carrier note (T11 — `segment.py` itself is ZERO-CHANGE for v1.9): the duck-typed
+`noise_attribution == ("segment", "below_min_len")` mark stamped in assembly step ③ is ALSO
+M16's rescue-candidate determination carrier. Stitch re-forms CONTIGUOUS session-order runs
+of such frames (no other frame in between) into rescue candidates — the run re-forming
+deliberately ignores the original segment cuts, so adjacent short segments fuse into ONE
+candidate (the two-element attribution tuple carries no original-segment identity, and none
+is needed); a rescue hit flips the frames back to `absorbed` per contract ②c③ (§5/§7.16),
+while `segment.below_min_len` stays an occurrence count (frame unit) and is never rolled
+back. `reason == "noise"` frames never enter the candidate stream.
+
 ### 7.15 M15 — `labelkit/operators/extract.py` (v1.8)
 
 (New module, spec 3.15 / `spec/315-m15-extract.md`. Chain position: after classify, before
@@ -2575,7 +2876,205 @@ Normative behavior (spec 3.15.4):
 - **Events & counters (owner M15, §9.3):** one `extract.step` per transition incl. fallback
   steps (§8.1); `extract.transitions` (total incl. fallback), `extract.fallback_steps`,
   `extract.failures`, `extract.by_type.<action_type>` (per-type distribution — systematic
-  degradation observable, S14; feeds `include_diff` A/B).
+  degradation observable, S14; feeds `include_diff` A/B). v1.9 (T20 counter accounting):
+  thread-seam placeholders are EXCLUDED from `extract.transitions`/`extract.by_type.*` AND
+  from the `extract.step` event alike — they are not extraction products, their zero-LLM
+  `app_switch` must not pollute `by_type`, and a synthetic record-pair payload would be
+  fabrication; the seam's single metering point is `stream.stitch.seams` (§9.3).
+
+v1.9 thread-seam handling (T10/T20; active only under stitch — marks absent ⇒ pre-v1.9
+behavior byte-identical):
+
+- **Seam pairs never reach the LLM.** Adjacent-pair ordinals named by the envelope's
+  `seam_indexes` duck mark (validated to `[0, pairs)`) are SKIPPED by the gather — zero
+  calls — and take the mechanical T10 placeholder, spliced in at their pinned indexes during
+  the synchronous finalize: `action = {"action_type": "app_switch", "target": null,
+  "value": null, "description": "线索接缝：被{X}打断后恢复"}` (X = the seam's
+  `seam_interrupted_by` entry joined with `、`), `detail = {"kind": "thread_seam",
+  "interrupted_by": [...]}`, `model = ""`, `attempts = 0`. The placeholder `action_type`
+  promises NO semantics (M-1 note: same-app interleavings land here too) — downstream
+  discriminates by `detail.kind`.
+- **Invariants unchanged.** The `transitions is None` idempotency gate and the
+  `len(transitions) == len(members) − 1` invariant hold exactly as before; adjacent-rescue
+  splices (a splice pair whose gap holds no other-thread frame — NOT a seam per the M-1
+  criterion, §7.16) are REAL transitions and extract normally.
+- **Gather bookkeeping rework (T20 implementation note).** The pre-v1.9 flat-gather slicing
+  assumed one coroutine per adjacent pair; skipping seam ordinals replaces it with
+  per-episode JUDGED-pair accounting (episode spans record `(pairs, seam set)`; results
+  slice by judged count) — write-back stays (episode batch position, pair ordinal), still
+  schedule-independent, zero rng.
+
+### 7.16 M16 — `labelkit/operators/stitch.py` (v1.9)
+
+(New module, spec 3.16 / `spec/316-m16-stitch.md`. Numbered AFTER §7.15 so every frozen
+§7.x anchor stays valid — the v1.7/v1.8 convention; chain position: segment → **stitch** →
+dedup, §7.9/§2 — before dedup because stitching changes member sets, so the dedup-text/id
+face must see final threads; never in the generation re-flow chain, §2.)
+
+Responsibilities: conservatively stitch same-session fragments back into THREADS — per
+session (batch position order = session order, M10 whole-session packing), walk the segment
+products (active episode envelopes + rescue candidates re-formed from contiguous
+`below_min_len` runs, §7.14 carrier note) through a MONOTONIC selection pool in session
+order; one LLM judgment per candidate (§10.11 prompt, `stitch_schema()` §10.7), gated under
+`bias = "conservative"` by the T9 mechanical-prior conjunction; merge per contract ②c
+(§5); a bounded second pass (T19) re-judges pass-1 single-fragment threads; finally stamp
+multi-fragment threads with `seam_indexes`/`seam_interrupted_by`/`stitch_fragments`
+(§3 duck marks) and emit one `stitch.thread` event each. Boundaries: never crosses a
+session or a batch (T12 — hard-split sessions stay unstitchable across the split; the
+`session_split` mark is M10's); appends/deletes/reorders NO envelopes (②c is status +
+rebind + rescue-flip only); no task labels beyond the internal rolling `task_name` card
+state (M13 owns classification); segment-degraded (`on_error="keep"`) episodes join the
+pool as normal candidates (T12). Depends on M1, M8, M9 only; consumes the shared
+`types.frame_digest`/`types.tree_diff` helpers but carries its OWN copies of the
+app/activity/title/entity extraction loops and the diff textualization (T9 feasibility
+ruling — the `extract._diff_text` precedent: operator modules never depend on each other,
+and rendered digest strings are never re-parsed).
+
+```python
+class StitchStage:
+    name = "stitch"
+    def __init__(self, cfg: ResolvedConfig): ...
+    async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]: ...
+        # returns the SAME list object it received (contract ②c: no additions, §5)
+
+
+def build_stitch_prompt(thread_cards: Sequence[str], candidate_card: str,
+                        cfg: ResolvedConfig) -> PromptBundle:
+    """Deterministic assembly of the §10.11 template. system: the frozen conservative-bias
+    instruction with the pool card count substituted for {P}, the optional stitch.context
+    line (omitted when empty), the structure sentence and shape. user: ONE message — one
+    text part per thread card (already ordered most-recently-active first by the caller,
+    N-8 position-bias mitigation; an empty pool renders the fixed line 「（当前无开放线索）」
+    as its single part) and the candidate card as the final text part. PURE TEXT — stitch
+    never attaches images. PromptBundle.temperature = None (profile default), votes
+    samples included (T18 — [stitch] deliberately has no sc_temperature key)."""
+
+
+async def judge_stitch(thread_cards: Sequence[str], candidate_card: str, ctx: RunContext,
+                       record_ids: tuple[str, ...] = ()) -> Mapping | None:
+    """One candidate judgment through complete_validated(schema=stitch_schema(), §10.7).
+    votes == 1 (default): a single call. votes > 1 (T18): n concurrent samples of the SAME
+    prompt, aggregated by aggregate_votes below; a SchemaViolation sample abstains while
+    provider/internal errors escalate (the classify sc discipline); zero surviving samples
+    re-raise the last violation so the stage's on_error disposition applies. Returns the
+    winning judgment object, or None when votes split short of a strict majority."""
+
+
+def aggregate_votes(samples: Sequence[Mapping]) -> Mapping | None:
+    """T18/M-4 pure aggregation: strict majority (> n/2) over the COMPLETE
+    (verdict, thread_ref) judgment key; the FIRST sample of the winning cluster is returned
+    whole (task_name/reason travel with it). Any split short of a strict majority —
+    including a verdict majority whose thread_ref splits — returns None (the caller falls
+    back to the conservative outcome: episode → new, rescue → miss)."""
+
+
+def prior_hits(thread_members: Sequence[Record], fragment_tails: Sequence[Record],
+               candidate_members: Sequence[Record]) -> list[str]:
+    """The T9 mechanical-prior whitelist — which of the three DISJUNCTIVE legs hit
+    (deterministic, zero LLM); returns ⊆ ["app_overlap", "entity_overlap", "same_page"]
+    (the trace-payload vocabulary): ① app_overlap — thread app set ∩ candidate app set ≠ ∅;
+    ② entity_overlap — thread TAIL-frame entities ∩ candidate HEAD-frame entities ≠ ∅ (the
+    E5 挂起尾 × 恢复首 resumption pair); ③ same_page — the candidate head frame's page
+    identity (app + activity (+ DFS-first visible title)) equals SOME fragment-tail frame's
+    (E6 cue-guided resumption; requires BOTH app and activity — activity is often absent in
+    capture-side dumps, in which case the leg silently fails: an acceptable disjunction
+    downgrade, T9). Text-modality frames carry no tree → empty sets, legs never fire."""
+
+
+def compute_seams(members: Sequence[Record], position_of: Mapping[str, int],
+                  owner_task: Mapping[str, str], own_ids: frozenset[str],
+                  frame_ids_by_pos: Sequence[str],
+) -> tuple[tuple[int, ...], tuple[tuple[str, ...], ...]]:
+    """Seam determination (T20/M-1): an adjacent member pair ⟨i, i+1⟩ is a seam iff the
+    session-order gap between the two members contains ≥ 1 frame absorbed by a DIFFERENT
+    thread. Noise-only gaps (and gaps of frames owned by no thread) are NOT seams — extract
+    judges those pairs normally, matching the v1.8 剔噪 convention (same physical situation,
+    single handling). Returns (seam_indexes, interrupted_by): LEFT-member indexes in the
+    rebound member tuple (m-8 coordinate, §3) and, positionally aligned, the distinct
+    interrupting threads' task_names in gap order (never empty for a seam)."""
+
+
+def select_eviction(pool: Sequence[_Thread], candidate_pos: int,
+                    stale_gap_steps: int) -> _Thread:
+    """Pool-full eviction priority (T8/M-3): ① threads whose suspension span (candidate
+    position − thread tail position) exceeds stale_gap_steps first (0 = leg off), LRU among
+    the stale ones; ② plain LRU fallback. Deterministic over pool insertion order (ties
+    keep the earlier thread)."""
+```
+
+(`render_thread_card`/`render_candidate_card` assemble the §10.11 summary cards —
+public, pure; `span_distance` is the T19 pool-truncation metric: 0 on overlap, else the
+nearer-edge gap. The `_Thread`/`_Fragment`/`_Candidate` session-local state types are
+private.)
+
+Normative behavior (spec 3.16):
+
+- **Selection & idempotency.** Sessions are processed STRICTLY in batch position order
+  (= session order) and SEQUENTIALLY — the pool is a serial decision process, giving a
+  deterministic event/judgment order with zero rng (concurrency exists only inside a
+  votes > 1 sample gather). Episode candidates = active sequence envelopes with
+  `thread_id is None` (`thread_id` is stamped at thread opening, so re-entry costs zero
+  calls); sessions with zero episode candidates are skipped whole — rescue candidates alone
+  can never merge into an empty pool (B-2).
+- **Candidate stream (T11).** One candidate per episode envelope, plus — when
+  `rescue_short` — one rescue candidate per CONTIGUOUS session-order run of
+  `below_min_len`-attributed frames (§7.14 carrier note); `reason="noise"` frames never
+  enter; candidates sort by first session position.
+- **Pass 1 (monotonic greedy pool).** Pool cards render most-recently-active first. An
+  episode candidate with an EMPTY pool is still judged (zero thread cards — the §10.11
+  template pins the verdict to `new`; its `task_name` self-bootstraps thread naming, the
+  ONLY naming source, M-6); a rescue candidate with an empty pool is SKIPPED (zero calls,
+  stays dropped_noise, B-2). Merge gate: LLM `resume` verdict ∧ a VALID 1-based
+  `thread_ref` pool ordinal (invalid/missing ref = conservative `new`) ∧ — under
+  `bias="conservative"` — ≥ 1 prior-whitelist hit, upgraded to ≥ 2 hits when the candidate
+  sits beyond `stale_gap_steps` of the thread tail (E7 time decay; `bias="llm"` skips the
+  prior gate but still records the hits for trace). Merge: founder envelope survives,
+  candidate envelope shells, rolling card state updates (task_name from the hit judgment,
+  span, recency). A rescue hit flips its frames per ②c③, stamps `rescued_by`, and counts
+  `stitch.rescued_short` PER FRAME (m-10) — no shell is produced (rescue candidates have no
+  envelope form; `stitched` counts episode shells only, T7). Pool-full at thread opening →
+  `select_eviction` closes ONE open thread (M-3: closure happens ONLY here; an evicted
+  thread leaves the pass-1 card set but remains a pass-2 target and a normal product).
+- **Pass 2 (T19/M-2, `repass = true`).** Candidates = the single-fragment threads AT THE
+  END of pass 1, in their fragment's session order (a snapshot; only candidates merged AWAY
+  during pass 2 drop out — one that GAINED fragments is still judged); pool = all other
+  alive session threads, most-recently-active first, truncated to the `max_open`
+  nearest-by-span (ties → lower head position) when over — NOT interval intersection (M-2).
+  The target set is a LIVE VIEW (a merge immediately updates spans and cards). Merge
+  direction is REVERSED (②c survivor rule, §5): the candidate envelope shells, the target
+  thread survives; transferred `origin` fragments re-cause to `"resumed"`, `rescued`
+  fragments keep `"rescued"`; fragments re-sort in session order. No other threads → skip
+  (zero calls).
+- **Failure semantics (`stitch_invalid`, §4).** A judgment whose M8 repair budget is
+  exhausted: `on_error="keep"` (default) — an EPISODE candidate opens its own thread with
+  `task_name = ""` (card renders 「（未命名）」), evidence pair = `error` event +
+  `stitch.failures` counter, NEVER `item.errors` (S26 form; no `_meta` mark — the m-11
+  closed key list has no stitch-degraded key); a RESCUE candidate stays dropped_noise with
+  the same evidence. `on_error="fail"` — ONLY the episode-candidate envelope flips to
+  `failed` (kind `stitch_invalid`) → rejects; member frames STAY absorbed (②c grants no
+  absorbed/dropped_noise → failed migration, the M7 fail precedent); rescue candidates
+  never take the fail path (a failed rescue judgment is a miss, B-2). PASS-2 judgment
+  failures are keep-equivalent REGARDLESS of on_error (an already-opened thread cannot be
+  failed) — counter + error event still fire.
+- **Finalization (T20/T22).** Per surviving thread: sort fragments in session order; stamp
+  `stitch_fragments` (elements `{order_span, member_count, cause, source_episode}`;
+  `order_span` elements use the member order-key presentation `"{source_file}:{line_no}"` |
+  `pair_index` — M16's own copy of M11's rendering; `source_episode` = the fragment's
+  original episode record id, `null` for rescue fragments — which have no episode of
+  origin; a pass-2-transferred origin fragment keeps its source_episode under its new
+  `"resumed"` cause); compute + stamp `seam_indexes`/`seam_interrupted_by`
+  (`compute_seams`); count `stitch.seams` (+= seam count) and emit ONE `stitch.thread`
+  event per thread (§8.1).
+- **Events & counters (owner M16, §9.3):** one `stitch.judge` per judgment (§8.1 payload;
+  a votes split records the conservative fallback verdict + `votes_split: true`);
+  `stitch.judgments` / `stitch.repass_judgments` count LOGICAL judgments — one per
+  candidate whose judgment completes (a votes-split fallback still counts; FAILED judgments
+  do not), and votes > 1 multiplies CALLS but
+  never judgments (the dry-run estimate is call-accounted ×votes, §7.9);
+  `stitch.rescued_short` (unit = FRAMES flipped, m-10); `stitch.seams` (splice pairs
+  satisfying the M-1 criterion); `stitch.failures` (failed judgments, both passes).
+  `counts.stitched` (post-emit shell tally) and the derived `counts.threads` are M10's
+  (§7.9) — M16 never touches `counts.*`.
 
 ---
 
@@ -2588,13 +3087,15 @@ Normative behavior (spec 3.15.4):
 | `run.start` | always / info | M10, after M1 passes, before first batch; trace header line | () | `tool_version`, `config_digest`, `project_digest`, `trace_schema_version` (=1, only here) |
 | `run.end` | always / info | M10 after finalize; last trace line | () | `counts` (report-shaped summary), `exit_code` |
 | `batch.start` | always / debug | M10 when PipelineItem[] ready | () | `size` |
-| `batch.end` | always / info | M10 after batch emit + release | () | `active`, `dropped_dup`, `dropped_lowq`, `dropped_verify`, `failed`, `duration_ms`[, `fanout` — v1.7, classify enabled only (R20)][, `episodes`, `absorbed`, `dropped_noise` — v1.8, segment enabled only (same R20 form)] |
+| `batch.end` | always / info | M10 after batch emit + release | () | `active`, `dropped_dup`, `dropped_lowq`, `dropped_verify`, `failed`, `duration_ms`[, `fanout` — v1.7, classify enabled only (R20)][, `episodes`, `absorbed`, `dropped_noise` — v1.8, segment enabled only (same R20 form)][, `stitched`, `threads` — v1.9, stitch enabled only (same R20 form; per-batch `threads` = batch-local episodes − stitched, §7.9)] |
 | `ingest.bad_line` | ingest / warn | M2 bad line skipped | () | `file`, `line_no`, `reason` |
 | `ingest.missing_pair` | ingest / warn | M2 missing pair skipped | () | `index`, `present` ("tree"\|"image"), `file` |
 | `ingest.index_conflict` | ingest / warn (error if policy=fail) | M2 index conflict | () | `index`, `files` (list) |
 | `ingest.disorder` | ingest / — (trace-only, no per-event stderr mirror) (v1.8) | M2 when the streaming monotonicity check rejects a record (out-of-order or timestamp parse failure, `stream.on_disorder`, §7.1); skip policy: one event PER RECORD, plus ONE data-free stderr WARN per run logged by M2 itself (the reason embeds timestamp/cursor values and never reaches stderr — spec §7.1 ①); fail policy terminates via InputError (exit 3) | () | `file`, `line_no` (text) \| `index` (UI), `reason` ("乱序" \| "时间戳解析失败"-class wording, carries the offending values — trace channel only) |
 | `segment.session` | segment / — (trace-only, no stderr mirror) (v1.8) | M2's session assembler closing a candidate session (§7.1; `--limit` truncation treated as EOF flushes the tail session, S17) — emitted by M2 but prefix-routed to the segment channel (S1) | () | `session_id`, `first` / `last` (first/last order keys), `len`, `cause` ("gap"\|"key"\|"max_len"\|"max_span"\|"eof"\|"limit") |
 | `segment.boundary` | segment / — (trace-only, no stderr mirror) (v1.8) | M14 per sliding window once the verdict passes M8 (§7.14); member provenance lives in the payload | () | `session_id`, `window` (= [s, e] frame-ordinal span), `member_ids`, `relations`[]{`index`, `relation` (five-value closed vocabulary, §10.9)}, `model`[, `reason`†] |
+| `stitch.judge` | stitch / — (trace-only, no stderr mirror) (v1.9) | M16 per candidate judgment reaching a disposition — pass-1 episode/rescue candidates and pass-2 re-reviews alike, incl. the M-4 votes-split conservative fallback; a FAILED judgment emits `error` instead (§7.16) | (candidate fragment's first member id,) | `session_id`, `candidate` ("episode"\|"rescue"), `repass` (bool), `verdict` ("resume"\|"new"; the fallback records "new"), `thread_ref`, `confidence` (trace observation only, never a gate — T9), `priors` (hit whitelist legs ⊆ {"app_overlap", "entity_overlap", "same_page"}), `merged` (bool)[, `task_name`¶, `reason`¶ — present whenever a judgment object exists][, `votes_split`=true — M-4 split fallback only][, `target_thread_id` — on merge] |
+| `stitch.thread` | stitch / — (trace-only, no stderr mirror) (v1.9) | M16 per surviving thread envelope at session finalization (§7.16) | (thread record id,) | `session_id`, `thread_id` (== record id == episode_id, T22), `task_name`¶, `fragments` (the `{order_span, member_count, cause, source_episode}` table = `_meta.stream.fragments`, §9.1), `seam_indexes` |
 | `dedup.duplicate` | dedup / — | M3 duplicate verdict | (dup id,) | `kind`, `cluster_key`, `kept_id`, plus exactly one of `jaccard` (near_text) / `hamming` (near_image) / `cosine` (near_semantic); exact dups carry none |
 | `classify.decision` | classify / — (trace-only, R29) | M13 per record once the classification is final (v1.7) | (id,) | `label`, `labels` (multi: full hit set), `source` ("llm"\|"fallback"\|"inherited")[, `reason`][, `sc` {n, agreement_ratio}] |
 | `extract.step` | extract / — (trace-only, no stderr mirror) (v1.8) | M15 per adjacent-pair transition finalized, incl. fallback steps (§7.15) | (s_i id, s_{i+1} id) | `episode_id`, `index`, `action_type`, `description`‡, `target`§, `value`§ |
@@ -2615,12 +3116,19 @@ Normative behavior (spec 3.15.4):
 when requested per R29, §7.13; † `segment.boundary`: the same construction — requested iff
 `trace.enabled` and `"segment"` in `trace.channels`, = the schema's `with_reason`, §7.14).
 ‡/§ are `extract.step` content-tier marks (S27, §8.3): `description` carried from `"refs"`,
-`target`/`value` carried from `"excerpt"`. `run.*`/`batch.*` bypass the
+`target`/`value` carried from `"excerpt"`. ¶ marks the v1.9 stitch free-text fields:
+`stitch_schema` (§10.7) always requires `task_name`/`reason`/`confidence` — no `with_reason`
+gating — so `stitch.judge` carries them whenever a judgment object exists (they are absent
+only on the votes-split fallback); both are `_FREE_TEXT_KEYS` members (task_name joins in
+v1.9, §8.3) and are stripped at tier `"none"`. `run.*`/`batch.*` bypass the
 `trace.channels` filter and use `stage="run"`, `batch_no` = current batch (0 for run.*).
 Channel enumeration (v1.8): 8 → 10 — `trace.channels` accepts
 ingest|segment|dedup|classify|extract|quality|annotate|verify|schema|llm (channel = stage
 name, S1); the `error` event keeps routing by its `stage` field, so segment/extract stage
-errors reach their channels with zero routing changes.
+errors reach their channels with zero routing changes. v1.9: 10 → 11 — `"stitch"` joins the
+enumeration (same S1 rule; `stitch.judge`/`stitch.thread` prefix-route to the stitch
+channel, and stitch-stage `error` events follow their `stage` field — zero routing changes
+again).
 
 ### 8.2 Trace line format
 
@@ -2632,8 +3140,8 @@ milliseconds and timezone offset, e.g. `2026-07-02T09:31:04.482+08:00`.
 
 | Tier | Payload content |
 |---|---|
-| `"none"` | ids, enums, numbers only; NO LLM-produced free text (`reason`/`critiques`/`violations`/`description` omitted) |
-| `"refs"` (default) | + LLM-produced text (reason / critiques / violations / description), NO input data content |
+| `"none"` | ids, enums, numbers only; NO LLM-produced free text (`reason`/`critiques`/`violations`/`description`/`task_name` omitted) |
+| `"refs"` (default) | + LLM-produced text (reason / critiques / violations / description / task_name), NO input data content |
 | `"excerpt"` | + `excerpt` field on `quality.judgment` / `quality.pointwise` / `annotate.done` / `verify.verdict`: `{record_id: first 200 chars}` (text: `Record.text`; UI: `UITree.serialize()` output; never images); + the `_DATA_KEYS` fields (v1.8, below) |
 | `"full"` | + `gen_ai.input.messages` / `gen_ai.output.messages` on `llm.call` (requires "llm" in channels) |
 
@@ -2645,11 +3153,18 @@ dropped whole-key at tier "none", same level as critiques) and
 reason/critiques); NEW `_DATA_KEYS = {"target", "value"}` — these `extract.step` payload
 fields are INPUT-DATA-DERIVED (widget text references, typed-in text) and are stripped at
 BOTH `none` and `refs` (preserving the refs tier's "no input data content" red line),
-carried from `excerpt`. Per-event tier quick reference: `extract.step` none =
+carried from `excerpt`. v1.9 (T16): `_FREE_TEXT_KEYS` additionally gains `"task_name"` —
+the stitch rolling thread task name is LLM-produced free text (stripped at `none`, carried
+from `refs`, same tier as reason). Per-event tier quick reference: `extract.step` none =
 {episode_id, index, action_type}, refs = + description, excerpt = + target/value;
 `segment.boundary` none = structural fields (session_id/window/member_ids/per-frame
-relations/model), refs = + reason (the key is already in `_FREE_TEXT_KEYS`). The three
-v1.8 events (`segment.session`/`segment.boundary`/`extract.step`) have NO stderr mirror
+relations/model), refs = + reason (the key is already in `_FREE_TEXT_KEYS`);
+`stitch.judge` none = structural fields (session_id/candidate/repass/verdict/thread_ref/
+confidence/priors/merged[/votes_split][/target_thread_id]), refs = + task_name/reason;
+`stitch.thread` none = {session_id, thread_id, fragments, seam_indexes}, refs =
++ task_name. The three
+v1.8 events (`segment.session`/`segment.boundary`/`extract.step`) and the two v1.9 events
+(`stitch.judge`/`stitch.thread`) have NO stderr mirror
 (trace-only, §8.1).
 
 API keys appear at no tier, in no channel.
@@ -2708,8 +3223,15 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
   // "source" and BEFORE "scores" — chain-order mirror (spec §6.3):
   "stream": null | {
       "episode_id": "<sequence record id>",
+      // v1.9 — the next key is present ONLY when stitch.enabled (m-11), frozen in this
+      // position: IMMEDIATELY after episode_id (T16 implementation ruling ③):
+      "thread_id": "<thread id>",  // == item.thread_id == episode_id (T22 identity chain)
       "session_id": "<session id>",
       "order_span": [<first order key>, <last order key>],
+                                   // v1.9 包络 rule: ALWAYS the ENVELOPE span — a
+                                   // multi-fragment thread's span may CONTAIN other
+                                   // threads' frames; downstream slicing must use
+                                   // fragments[].order_span, never this key
       "member_count": <int>,
       "member_ids": ["<member record id>", ...],
       "member_sources": [{"file": ..., "pair_index"|"line_no": ...}, ...],
@@ -2720,10 +3242,24 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
                                    // multi fan-out, §7.13)
       "degraded": null | {"kind": "segmentation_invalid", "windows_failed": <int>},
                                    // segment.on_error="keep" evidence (S26)
+      // v1.9 — present ONLY when stitch.enabled (m-11), frozen in this position: AFTER
+      // degraded, BEFORE steps (T16 ruling ③); null when the M16 mark is absent:
+      "fragments": null | [{"order_span": [<first key>, <last key>],
+                            "member_count": <int>,
+                            "cause": "origin"|"resumed"|"rescued",
+                            "source_episode": "<original episode id>"|null}, ...],
+                                   // session-ordered fragment table rendered from the
+                                   // stitch_fragments duck mark (§3/§7.16); rescue
+                                   // fragments carry source_episode = null
       "steps": null | [{"index": <int>, "action_type": "<enum>", "target": <str|null>,
-                        "value": <str|null>, "description": "<str>"}, ...]
+                        "value": <str|null>, "description": "<str>"
+                        [, "resumed": <bool>]}, ...]
                                    // extract disabled → always null; enabled = the
-                                   // transitions rendered verbatim, step by step (§7.15)
+                                   // transitions rendered verbatim, step by step (§7.15);
+                                   // "resumed" is v1.9, present per row ONLY when
+                                   // stitch.enabled — true iff the step is a thread-seam
+                                   // placeholder, derived from Transition.detail.kind ==
+                                   // "thread_seam" (T10), NEVER from action_type
   },
   "scores": null | {"<criterion>": <float|null>, ..., "__aggregate__": <float|null>,
                     "mode": "pairwise_bt"|"pointwise", "batch_no": <int>
@@ -2751,7 +3287,9 @@ stream, S29) or, for inline, the rubric's `name` **[FROZEN HERE]**. A disabled s
 multi fan-out the main-output line key is (`_meta.id`, `classification.label`) — sibling rows
 share the record id (spec §6.3). v1.8: `stream` is the SOLE new always-present key — with
 segment disabled every v1.7-era line differs from v1.7 output ONLY by `"stream": null`
-(spec §6.3; the four pre-existing example projects re-verify this byte-diff).
+(spec §6.3; the four pre-existing example projects re-verify this byte-diff). v1.9: the
+three stream additions (`thread_id`, `fragments`, per-step `resumed`) are present ONLY when
+`stitch.enabled` (m-11) — with stitch disabled the main output is byte-identical to v1.8.
 
 ### 9.2 Rejects channel (spec 3.11.2)
 
@@ -2786,8 +3324,16 @@ evidence is auditable via the trace events instead (`dedup.duplicate`, `quality.
 THREE new (stage, reason) combinations: (`"segment"`, `"noise"`) — LLM-judged noise frame,
 (`"segment"`, `"below_min_len"`) — short-segment frame (independent of noise, S11),
 (`"verify"`, `"off_task_member"`) — repair-shrunk member frame (S31). `absorbed` items never
-reach this file (third route, §7.10). `--strict` note: stream-mode noise frames are EXPECTED
-engineering rejects — `--strict` will exit 1 on them (spec 3.11.2/manual). `rejects="full"`
+reach this file (third route, §7.10). v1.9: `stitched` shells never reach this file either
+(fourth route, §7.10/T21), and rescue-flipped frames leave it (they become `absorbed`);
+the only NEW (stage, reason) combination is (`"stitch"`, `"stitch_invalid"`) via the
+`failed`/`errors[0]` rule — `stitch.on_error = "fail"` episode candidates only (§7.16).
+`--strict` note: stream-mode noise frames are EXPECTED
+engineering rejects — `--strict` will exit 1 on them (spec 3.11.2/manual). v1.9 `--strict`
+semantics note (T21): stitched shells and rescued frames do NOT constitute rejects, so
+enabling stitch on the same input can flip a strict run's exit code 1 → 0 (rescued
+below_min_len frames vacate the rejects file) — this is EXPECTED, not a regression.
+`rejects="full"`
 adds `"record"` — text: `Record.raw`; UI:
 `{"ui_tree": serialize(), "image_path": str}`; v1.8 sequence records:
 `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}` (S25 — the frozen
@@ -2840,10 +3386,16 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
   //         + "absorbed", + "dropped_noise" (post-emit status tallies, §7.9);
   //         "unprocessed" appearance condition widens in stream mode to
   //         "breaker trip OR interrupted" (S18 — see the invariant note below);
+  // v1.9, ONLY when stitch.enabled (m-11 — off keeps report.json byte-identical to v1.8):
+  // counts: + "stitched" (post-emit shell tally, M10-owned, §7.9),
+  //         + "threads" (DERIVED at report assembly: threads = episodes − stitched —
+  //           the single reporting point, never a counter; T7/T16);
   // "stream" block (placed after "counts", spec §6.4):
   // "stream": {"sessions": 0, "episodes": 0, "mean_episode_len": 0.0, "absorbed": 0,
   //            "dropped_noise": 0, "below_min_len": 0, "digest_poor_frames": 0,
   //            "segment_failures": 0
+  //   [, "stitch": {"stitched": 0, "rescued_short": 0, "seams": 0, "judgments": 0,
+  //                 "repass_judgments": 0, "failures": 0}]       (v1.9, stitch enabled only)
   //   [, "extract": {"transitions": 0, "fallback_steps": 0, "failures": 0,
   //                  "by_type": {"<action_type>": 0, ...}}]      (extract enabled only)
   //   [, "verify": {"membership_repairs": 0, "boundary_flags": 0,
@@ -2852,8 +3404,16 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
   //     IngestReport.disorder is a SUB-COUNT of counts.bad_input (audited via the
   //     ingest.disorder events; NO separate report key — spec §6.4); below_min_len is
   //     counted independently of noise (S11); digest_poor_frames per the §3 poverty
-  //     judgment; extract.by_type = per-action-type distribution (S14);
-  //     verify sub-block per §7.6 (S31)
+  //     judgment; stream.stitch (v1.9, chain-order slot before extract): "stitched"
+  //     mirrors counts.stitched, the other five surface the M16 counters (§7.16) —
+  //     "judgments"/"repass_judgments" count LOGICAL judgments (one per candidate,
+  //     failures excluded; votes > 1 multiplies CALLS, never judgments),
+  //     "rescued_short" counts FRAMES flipped (m-10), "seams" counts splice pairs
+  //     satisfying the T20/M-1 criterion (the seam's ONLY metering point — seam
+  //     placeholders are excluded from extract.transitions/by_type, §7.15);
+  //     threads deliberately has NO stream.* mirror (single point above, T16);
+  //     extract.by_type = per-action-type distribution (S14);
+  //     verify sub-block per §7.6 (S31; defects histogram over SIX kinds, v1.9)
   "trace": {"enabled": true, "path": "...", "events": 0, "dropped_events": 0},
   "llm_usage": {"<profile>": {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
                               "est_cost_usd": 0.0, "retries": 0
@@ -2873,13 +3433,16 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
 [+ fanout]` (the `fanout` term is v1.7: present only under `classify.assignment = "multi"`).
 generate_only degenerates to `emitted + dropped_* + failed = generated [+ fanout]`
 (scanned = bad_input = 0).
-v1.8 — with segment enabled the FULLY EXPANDED form (spec §6.4) is:
+v1.8 — with segment enabled — and v1.9, with stitch enabled — the FULLY EXPANDED form
+(spec §6.4) is:
 
 `emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed + bad_input
-+ absorbed = scanned + generated + fanout + episodes`
++ absorbed + stitched = scanned + generated + fanout + episodes`
 
-(new on the left: `dropped_noise`, `absorbed`; new on the right: `episodes`; disabled
-features contribute 0 and the form degrades to the previous line byte-identically).
+(new on the left: `dropped_noise`, `absorbed` — v1.8 — and `stitched` — v1.9, T7; new on
+the right: `episodes`; disabled
+features contribute 0 and the form degrades to the previous line byte-identically; the
+redundancy check `threads = episodes − stitched` holds alongside, T7).
 Breaker-trip runs (v1.6 partial delivery) extend it with `+ unprocessed` on the left side;
 `counts.unprocessed` is computed by M10 at finalize as the balancing residual — records scanned
 or generated that reached no terminal count (emitted/dropped_*/failed/bad_input) when the run
@@ -2887,7 +3450,8 @@ tripped, which includes generated-but-never-batched records in generate_only —
 MetricsSink counter and appears only on tripped runs. v1.8 (S18): in STREAM MODE the
 `unprocessed` key appears on "breaker trip **OR** `interrupted = true`" (SIGINT over the
 session buffer strands in-flight records); the residual computation carries the expanded
-sides (`+ episodes` on the source side, `+ absorbed + dropped_noise` among the terminal
+sides (`+ episodes` on the source side; `+ absorbed + dropped_noise` — and `+ stitched`,
+v1.9 T7: shells are terminal — among the terminal
 counts). Non-stream interrupted runs keep a PROVABLY ZERO residual and never emit the key
 (regression anchor).
 `schema_engine.resolved_at` counts ONLY user-schema annotate calls; its sum = records entering M5.
@@ -2926,6 +3490,12 @@ v1.8 additions: `counts.episodes` / `counts.absorbed` / `counts.dropped_noise` (
 `report.stream.verify` sub-block); `report.stream.sessions` maps from `IngestReport.sessions`
 (owner M2, §7.1 — not a MetricsSink counter), `report.stream.episodes`/`mean_episode_len`/
 `absorbed`/`dropped_noise` derive from the M10 tallies.
+v1.9 additions: `counts.stitched` (owner M10 — post-emit shell tally, §7.9);
+`stitch.judgments` / `stitch.repass_judgments` / `stitch.rescued_short` / `stitch.seams` /
+`stitch.failures` (owner M16, §7.16 — counter key names **[FROZEN HERE]**; surfacing as the
+`report.stream.stitch` sub-block with `stitched` mirrored from `counts.stitched`).
+`counts.threads` is deliberately NOT a counter — it is derived once at report assembly as
+`episodes − stitched` (T7/T16 single reporting point).
 
 Counter OWNERSHIP (normative): `counts.*` keys are incremented ONLY by M10 (orchestrator),
 derived from batch tallies / EmitResult — stages must never touch them (double-count).
@@ -2934,12 +3504,14 @@ stage (§7.9); M13 never increments any `counts.*` key.
 v1.8: likewise `counts.episodes` (len-delta around the segment stage) and
 `counts.absorbed`/`counts.dropped_noise` (post-emit tallies) belong to M10 — M14 never
 increments any `counts.*` key.
+v1.9: likewise `counts.stitched` (post-emit tally) belongs to M10, and `counts.threads` is
+derived by M10 at report assembly — M16 never increments any `counts.*` key.
 Stage-scoped keys are incremented only by their stage: `dedup.*` by M3, `quality.judgment_failures`
 by M4, `annotate.sc_disagreements` by M5, `generate.buckets.*` by M6 (`survived_dedup` = records
 surviving M6's own MinHash novelty filter against seeds + siblings; M3 still dedups generated
 records on re-flow), `classify.*` by M13 (v1.7), `quality.tie_*` by M4, `segment.*` by M14,
 `extract.*` by M15, `verify.membership_repairs`/`verify.boundary_flags`/`verify.defects.<kind>`
-by M7 (v1.8).
+by M7 (v1.8), `stitch.*` by M16 (v1.9).
 
 ### 9.4 Atomic delivery
 
@@ -3040,6 +3612,15 @@ parts even in UI modality — the §6.3 rule-34 quality relaxation), two subsect
                                                 "extraction_invalid", S16) so fallback
                                                 steps stay distinguishable from
                                                 LLM-confirmed "other"
+{index}. {action_type}（对象: {target|—}；值: {value|—}）{description}（线索接缝：被{X}打断）
+                                              ← v1.9 (T14): the PARALLEL trailing suffix
+                                                appears ONLY on thread-seam placeholder
+                                                steps (Transition.detail.kind ==
+                                                "thread_seam"); X = detail.interrupted_by
+                                                joined with 「、」 — without it the
+                                                trajectory rubric's noise_residue/coherence
+                                                criteria would read the mechanical seam as
+                                                noise residue / an unexplained jump
 [成员帧摘要]
 {frame_digest of every member, one per line, member order, total bounded}
 ```
@@ -3112,7 +3693,9 @@ annotation prompt when re-annotating (`RepairContext`):
 ```
 
 v1.8 stream variant (sequence envelopes only, spec 3.7 stream branch — structure per SPEC
-§3.5: five-kind defect explanation in system, the six-section user order; wording
+§3.5: the defect explanation in system — five kinds in v1.8, SIX in v1.9 (`wrong_stitch`
+appended, T15) — and the six-section user order, SEVEN under stitch (v1.9: `[片段结构]`
+slots between the action sequence and the boundary margin); wording
 **[FROZEN HERE]**; validated against `defect_verdict_schema()` §10.7, NOT `VERDICT_SCHEMA`):
 
 ```
@@ -3128,16 +3711,29 @@ system:
   - missing_head: 段首缺少任务起点帧（结合边界余量判断）
   - missing_tail: 段尾缺少任务终点帧（结合边界余量判断）
   - missing_members: 段中缺失成员帧（members 列出可指认的帧 id，无从指认则为 null）
+  - wrong_stitch: 线索缝合错误——各碎片并非同一任务的延续（结合片段结构判断）
+                                            ← v1.9 (T15): sixth bullet, appended last;
+                                              present in ALL stream reviews (the schema enum
+                                              carries six kinds unconditionally)
   先逐维度给出简短意见，再列缺陷表，最后给结论。
   输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
   {"critiques": [{"aspect": <维度>, "opinion": <一句话意见>}, ...],
    "defects": [{"kind": <缺陷类型>, "members": <帧 id 数组|null>,
                 "position": <位置说明|null>, "detail": <一句话>}, ...],
    "verdict": "pass"|"fail"}
-user (one message, six sections IN THIS ORDER):
+user (one message, six sections — SEVEN when stitch is on (v1.9) — IN THIS ORDER):
   text part:  [任务指令] {annotate.instruction — class-effective value under classify}
   text part:  [动作序列] {item.transitions rendered per the §10.1 line format;
-                          section omitted when transitions is None}
+                          section omitted when transitions is None; v1.9: thread-seam
+                          placeholder steps carry the 「（线索接缝：被{X}打断）」 suffix
+                          (T14/T15 — §7.6; the 「（摘取兜底）」 suffix stays M4-only)}
+  text part:  [片段结构] {v1.9 (T15) — SECTION PRESENT ONLY when stitch.enabled (m-11;
+                          stitch off keeps the six-section v1.8 form byte-identical):
+                          one line per fragment —
+                          碎片 {k}/{m}: 成员 {start}–{end}（{count} 帧）｜首帧摘要: {digest}
+                          (member-index span in the rebound-tuple coordinate; digest cap =
+                          stitch.digest_max_chars) — then the seam-position table:
+                          接缝位置: 步 {idx}（被{X}打断）；… or 接缝位置: 无}
   text part:  [边界余量] {frame_digest of the k=2 frames beyond EACH segment boundary,
                           each annotated with its fate: noise / 相邻段序数 / 无}
   text part:  [首帧截图]
@@ -3273,7 +3869,9 @@ def action_schema() -> dict:
 
 def defect_verdict_schema() -> dict:
     kinds = ["label_mismatch", "off_task_members", "missing_head", "missing_tail",
-             "missing_members"]
+             "missing_members", "wrong_stitch"]   # v1.9 (T15): wrong_stitch appended LAST
+                                                  # (six values; enum order = the S31 sort key
+                                                  # and the §9.3 histogram order)
     return {"type": "object",
             "properties": {
                 "critiques": {"type": "array",
@@ -3308,6 +3906,31 @@ byte-identical to `VERDICT_SCHEMA`'s (the feed-back/merge chain consumes them un
 critiques/defects precede verdict — reason-then-conclusion, same rationale as
 `VERDICT_SCHEMA`. The non-stream verify path keeps `VERDICT_SCHEMA`; the two verdict
 schemas co-exist (S7).
+
+v1.9 adds a ninth internal schema (M16; verbatim from spec 3.16):
+
+```python
+def stitch_schema() -> dict:
+    # v1.9 M16 (spec 3.16): one thread-stitch verdict per candidate. All keys required
+    # with a nullable thread_ref (strict-safe, S7 lesson); thread_ref is the 1-based
+    # ordinal of a presented pool card (range-checked code-side — schemas cannot see the
+    # pool size); confidence is trace observation ONLY, never a gate (T9).
+    return {"type": "object",
+            "properties": {"verdict": {"type": "string", "enum": ["resume", "new"]},
+                           "thread_ref": {"type": ["integer", "null"]},
+                           "task_name": {"type": "string"},
+                           "reason": {"type": "string"},
+                           "confidence": {"type": "string",
+                                          "enum": ["high", "medium", "low"]}},
+            "required": ["verdict", "thread_ref", "task_name", "reason", "confidence"],
+            "additionalProperties": False}
+```
+
+The S7/R1 binding notes above apply unchanged (all keys required, nullable union for
+`thread_ref`, no `uniqueItems`, INTERNAL schema — no `resolved_at` counting, no L2.5 hook).
+`task_name`/`reason`/`confidence` are ALWAYS required — there is no `with_reason` variant
+(the §8.1 ¶ note); an out-of-range or non-integer `thread_ref` is resolved code-side to the
+conservative `new` outcome (§7.16), never a schema failure.
 
 ### 10.8 M13 classification prompt (spec 3.13.3, verbatim)
 
@@ -3442,6 +4065,69 @@ result): deterministic evidence that shortens the visual inference distance
 text section (S6 invariant holds here too). Response validated against `action_schema()`
 (§10.7); the closing `[前后帧树摘要]` line is ALWAYS present.
 
+### 10.11 M16 stitch judgment prompt (spec 3.16, verbatim; v1.9)
+
+```
+system:
+  你是屏幕操作流的线索缝合审核员。下面给出当前会话中 {P} 条开放线索的摘要卡（按最近活跃降序排列）与一张候选碎片摘要卡。
+  判断该候选碎片是恢复其中某条线索（用户切回了之前挂起的同一任务），还是开启一个新任务：
+  - resume: 候选与某条线索是同一任务的延续——任务实体跨碎片延续（订单号、地点、商品、联系人等再次出现）、返回同一页面继续操作、或 App 与操作语境明确承接；给出该线索编号。
+  - new: 候选是一个新任务。
+  保守偏置：仅在证据明确指向同一任务时判 resume；证据不足、模糊或仅有表面相似（同 App 不同任务、同类页面不同对象）时一律判 new——错缝的代价高于漏缝。
+  若当前无开放线索，恒判 new。
+  task_name 用一句话概括任务：resume 时给出该线索合并候选后的任务名（滚动更新），new 时给出新任务名。
+  {stitch.context}                              ← 可选域上下文；缺省省略此行
+  输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
+  {"verdict": "resume"|"new", "thread_ref": <线索编号|null>,
+   "task_name": <一句话任务名>, "reason": <一句话理由>,
+   "confidence": "high"|"medium"|"low"}
+user（一条消息——每张线索卡一个 text Part，按最近活跃降序（调用方已排好）；候选卡恒为末尾
+     text Part；纯文本，恒不携图）:
+  [线索 {i}] 任务名: {thread.task_name，空名渲染为「（未命名）」}
+  App 集合: {成员 app 集合，排序后以「、」连接；空集渲染为「（未知）」}
+  序号跨度: [{首会话序号}, {尾会话序号}]｜帧数 {成员数}｜碎片数 {碎片数}
+  首帧摘要: {frame_digest(首成员, stitch.digest_max_chars)}
+  尾帧摘要: {frame_digest(尾成员, stitch.digest_max_chars)}
+  接续对（线索尾帧 → 候选首帧）变更: {tree_diff(线索尾帧, 候选首帧) 的文字化摘要}
+  （↑ one text part per open thread, most-recently-active first; POOL EMPTY → the thread
+     cards are replaced by ONE fixed text part, exactly:）
+  （当前无开放线索）
+  [候选碎片] 类型: {分段产出 | 短段救援}
+  App 集合: {…同上…}
+  序号跨度: [{首会话序号}, {尾会话序号}]｜帧数 {成员数}
+  首帧摘要: {frame_digest(首成员, stitch.digest_max_chars)}
+  末帧摘要: {frame_digest(末成员, stitch.digest_max_chars)}
+```
+
+Binding notes (T8/T9/T16/T18; wording **[FROZEN HERE]** where the spec fixed only
+structure):
+
+- `{P}` in the system head is substituted with the presented pool-card count (`0` with an
+  empty pool — the head text itself then pins the verdict to `new`, the M-6 task_name
+  bootstrap). The system message is the head + optional `stitch.context` line + the
+  structure sentence + the three-line structure shape, joined by newlines.
+- Card assembly is deterministic string concatenation; each frame digest inside a card is
+  truncated to `stitch.digest_max_chars` (the segment key-name semantics, m-9). The thread
+  card's fifth line is `尾帧摘要`, the candidate card's is `末帧摘要` (distinct labels,
+  frozen); the candidate card carries NO fragment count and NO 接续对 line.
+- The `接续对` line textualizes `tree_diff(thread tail frame, candidate head frame)` in the
+  fixed form `新增 {added} 节点，移除 {removed} 节点，文本变化 {text_changed} 处，变更比例
+  {change_ratio:.0%}`, appending `，应用切换` when `app_changed` and `，标题变化` when
+  `title_changed` — M16's own copy of the §10.9 rendering (operator modules never depend on
+  each other, spec §2.2). It appears on every thread card of a judgment call (both passes
+  supply the candidate head).
+- Thread cards are presented MOST-RECENTLY-ACTIVE FIRST ([N-8] position-bias mitigation);
+  `thread_ref` in the answer is the 1-based ordinal of a presented card, range-checked
+  code-side (§7.16 — an invalid ref resolves to the conservative `new`, never a schema
+  failure). `类型` renders `分段产出` for episode candidates and `短段救援` for rescue
+  candidates.
+- `PromptBundle.temperature = None` — the profile default — INCLUDING `votes > 1` samples
+  (T18: `[stitch]` deliberately carries no `sc_temperature` key; samples are the same
+  prompt drawn n times). The prompt is PURE TEXT: stitch never attaches images (T16;
+  `stitch.llm` is exempt from every vision requirement, §6.3 rule 40).
+- Response validated against `stitch_schema()` (§10.7); `confidence` is trace observation
+  only, never a gate (T9 — the verbal-confidence leg was removed by design).
+
 ---
 
 ## 11. Cross-cutting conventions (binding)
@@ -3451,7 +4137,10 @@ text section (S6 invariant holds here too). Response validated against `action_s
    `asyncio.gather`; stages are serial within a batch (barrier); batches are serial.
 2. **Stages never remove items** — status flips only; `generate` returns a new list instead
    (v1.7 ②a: classify multi may tail-append; v1.8 ②b: segment may tail-append sequence
-   envelopes and absorb members, with the M7 bidirectional repair exemption — §5).
+   envelopes and absorb members, with the M7 bidirectional repair exemption; v1.9 ②c:
+   stitch may shell merged episode envelopes as `stitched`, rebind the surviving envelope's
+   Record without recomputing its id, and flip rescued `below_min_len` frames
+   `dropped_noise → absorbed` — appending, deleting, reordering and replacing nothing — §5).
 3. **Single-record failures never escape**: `item.errors.append(StageError(...))` +
    `status="failed"` + `error` trace event; the run continues. Record-level isolation is absolute.
 4. **Determinism.** All sampling RNGs derive from `run.seed` exactly as §5; temperature default
@@ -3666,5 +4355,81 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     - the new module sections are numbered §7.14/§7.15 AFTER the pre-existing §7.13 (same
       anchor-stability rationale as v1.7). Segment/extract disabled is byte-identical to
       v1.7 output except `_meta.stream: null`.
+29. v1.9 M16 thread stitching (feature spec `docs/dev/SPEC-activity-structure.md`, rulings
+    T1–T22; 2026-07-16). Key frozen points, in ruling order:
+    - contract ②c (T6): stitch's exactly-three authorized writes (shell `stitched` / Record
+      rebind without id recomputation / rescue flip `dropped_noise → absorbed`) plus the
+      survivor rule — pass-1 founder survives, pass-2 target survives, candidate shells
+      (m-7); `thread_id == surviving record.id == episode_id` (T22 identity chain, §5/§3);
+    - `Status` grows to EIGHT values with `stitched` (terminal shell; M11 FOURTH route —
+      neither channel, counted only, T21; a shell in the rejects fallback would pollute
+      rejects as internal_error and trip `--strict`); enabling stitch may flip a strict run
+      1 → 0 (rescued frames vacate rejects) — EXPECTED (§9.2);
+    - `PipelineItem.thread_id` is a real field; the three M16 duck marks
+      `seam_indexes` (left-member indexes, the `Transition.index` coordinate, range
+      `[0, len(members)−2]`, no order_span conversion — m-8) / `seam_interrupted_by`
+      (aligned interrupter task_names — extract cannot compute these) / `stitch_fragments`
+      (`{order_span, member_count, cause ∈ origin|resumed|rescued, source_episode}`) ride
+      the envelope; frame-level `rescued_by` is audit-only, never emitted (§3);
+      `classify._fan_out` copies thread_id in the constructor + the three marks in the D6
+      loop (§7.13);
+    - `_CHAIN_ORDER` is the NINE-name tuple with stitch between segment and dedup (T5,
+      §7.9); `_compose_chain` carries the matching enabled entry; stitch never enters the
+      generation re-flow chain (stitch ⇒ segment ⊥ generate);
+    - `ErrorKind.STITCH_INVALID = "stitch_invalid"` (§4): "keep" opens an unnamed thread
+      with error event + `stitch.failures` (never item.errors, S26 form); "fail" fails the
+      episode-candidate envelope ONLY (members stay absorbed); rescue candidates never take
+      the fail path (B-2); pass-2 failures are keep-equivalent regardless of on_error;
+    - defect kinds grow to SIX with `wrong_stitch` appended last (schema enum /
+      `verify.DEFECT_KINDS` / orchestrator `_DEFECT_KINDS` / report histogram four-way
+      sync); `wrong_stitch` routes MARK-ONLY via an independent branch — never the
+      missing_* reclaim scan, no member surgery (T15, §7.6);
+    - `[stitch]` is an ELEVEN-key table (§6.1 defaults frozen: enabled=false, llm="default",
+      max_open=4, bias="conservative", rescue_short=true, repass=true, stale_gap_steps=0,
+      digest_max_chars=400, context="", votes=1, on_error="keep"); validation rules 37–41 +
+      two v1.9 warning entries (§6.3); `stitch.llm` joins the reference sets whenever
+      enabled and NEVER the vision set; `[class.<name>.stitch]` does not exist;
+    - votes (T18/M-4): odd only; n samples of the same prompt at the PROFILE-DEFAULT
+      temperature (no sc_temperature key); strict majority over the complete
+      (verdict, thread_ref) pair; splits fall back conservatively (episode → new, rescue →
+      miss) with `votes_split: true` on the stitch.judge payload; votes multiplies CALLS,
+      never the logical-judgment counters;
+    - conservation: the full equation, the failed-fallback formula and the unprocessed
+      residual ALL gain the `stitched` term (T7 blocker-1, §7.9/§9.3); `counts.threads` is
+      DERIVED once at report assembly as `episodes − stitched` (single reporting point,
+      never a counter); `report.stream.stitch = {stitched, rescued_short, seams, judgments,
+      repass_judgments, failures}` with `rescued_short` counting FRAMES (m-10); all v1.9
+      report/batch.end/_meta keys are present ONLY when `stitch.enabled` (m-11) — a
+      stitch-off run is byte-identical to v1.8 on main output/rejects/report.json, the sole
+      exception being the unconditionally printed dry-run stderr `stitch_calls` field
+      (`= len(session_lens) × votes × (2 if repass else 1)`, §7.9);
+    - `_meta.stream` key positions frozen (T16 ruling ③): `thread_id` immediately after
+      `episode_id`; `fragments` after `degraded`, before `steps`; per-step `resumed`
+      derived from `detail.kind == "thread_seam"`; the TOP-LEVEL `order_span` stays the
+      envelope span (包络 rule) — downstream slicing must use `fragments[].order_span`
+      (§9.1);
+    - the T10 seam placeholder is four keys pinned — `{"action_type": "app_switch",
+      "target": null, "value": null, "description": "线索接缝：被{X}打断后恢复"}` with
+      `detail = {"kind": "thread_seam", "interrupted_by": [...]}`, model=""/attempts=0 —
+      excluded from the extract counters AND the extract.step event (single metering point
+      = `stream.stitch.seams`, T20); seam criterion: the splice pair's session-order gap
+      holds ≥ 1 other-thread frame (M-1) — noise-only/own-rescue gaps extract normally;
+    - annotate keyframe selection upgrades to PER-FRAGMENT QUOTAS for stitched threads
+      (T14: base 1 per fragment + largest-remainder share of k−m weighted by Lᵢ−1, ties →
+      lower index; local S28 uniform inside fragments; degrade to uniform on
+      absent/inconsistent marks or k < m); `fragment_lens` is the THIRD additive trailing
+      kwarg on the two frozen §7.4 signatures, threaded at BOTH call sites (M5 main + M7
+      repair re-annotation, §7.4/§7.6);
+    - observability: events `stitch.judge`/`stitch.thread` with constants
+      `EV_STITCH_JUDGE`/`EV_STITCH_THREAD` (trace-only, §8.1); trace channels grow 10 → 11
+      with `"stitch"`; `task_name` joins `_FREE_TEXT_KEYS` (§8.3);
+    - prompt wording frozen here where the spec fixed only structure: the §10.11 judgment
+      template (system head with conservative bias, thread/candidate card line formats,
+      the empty-pool line 「（当前无开放线索）」, most-recently-active-first card order,
+      temperature None), the §10.2/§10.3 and §10.5 thread-seam step suffix
+      「（线索接缝：被{X}打断）」, and the §10.5 seventh section `[片段结构]` +
+      `wrong_stitch` system bullet; `stitch_schema()` exact JSON in §10.7;
+    - the new module section is numbered §7.16 AFTER the pre-existing §7.15 and the new
+      template section §10.11 after §10.10 (same anchor-stability rationale as v1.7/v1.8).
 
 — End of contract. —

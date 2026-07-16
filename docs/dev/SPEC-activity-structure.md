@@ -261,8 +261,9 @@ unprocessed 残差公式（熔断/中断）：减项同步增 − stitched
 
 `rescued_short` 帧同批内 dropped_noise→absorbed 翻转（**单位 = 帧**，m-10），账目在
 emit 前定格（D4"路由时计数"口径）；`below_min_len` 为发生计数不回退（T11）；
-`counts.threads` 单点上报，M10 post-emit tally 处以 **`threads = episodes − stitched`**
-导出（T7，四场景验收表冗余校验列同式）；fanout（右侧）与 stitched（左侧终态）分别计
+`counts.threads` 单点上报，M10 以 **`threads = episodes − stitched`** 导出（stitched
+在 post-emit tally 累计、threads 在 report 装配处单点导出——实现定稿位置；T7，四场景
+验收表冗余校验列同式）；fanout（右侧）与 stitched（左侧终态）分别计
 信封存在与壳终态，经审计数值验证无双记。**条件在场规则（m-11 正文）**：本节全部 v1.9
 新键（counts.stitched/threads、stream.stitch 子块、守恒式 stitched 项）仅
 `stitch.enabled=true` 时出现在 report.json——off 时守恒全式回落 v1.8 形态，字节等价。
@@ -373,7 +374,7 @@ on_error = "keep"        # "keep" | "fail"（fail 仅施于 episode 候选信封
 | §2 架构 recap | 改 | 算子 +M16、链序九名（主链插 stitch；退化链「with both disabled」句改三者）、Statuses 7→8 +stitched；懒加载例外句零改动（裁决③） |
 | §3/§4/§5 verbatim | 改 | types（Status/PipelineItem/Transition/S24 注补 M16、**`VerificationResult.defects`「five-value」注 5→6**——文档审计子项）、errors（+STITCH_INVALID）、stage（+②c 全文含幸存者句） |
 | §6.1/§6.3 | 改 | +StitchConfig 全字段（插 SegmentConfig/ExtractConfig 间）、ResolvedConfig+stitch、Trace 注 10→11、**`AnnotateConfig.sequence_frames` 注释内嵌均匀降采样公式改按碎片配额**（文档审计子项）；校验规则 +37–41 五条 + Warnings 两条 |
-| §7 模块 API | 改 | **新增 §7.16 M16**；§7.3 接缝后缀（并列句）、§7.4 配额公式+穿参义务、§7.6 kinds 六值+滤壳+wrong_stitch 独立分支、§7.7 +stitch_schema、§7.9 链序九名冻结/计量（threads 导出式）/两公式 −stitched/batch.end/dry-run、§7.10 第四路由、§7.11 +task_name **+ EV_STITCH_JUDGE/EV_STITCH_THREAD 常量清单 + 通道 10→11 镜像句**（文档审计子项）、§7.13 +两 duck 标、§7.14 载体注（连续 run 语义）、§7.15 seam 占位+计数器口径 |
+| §7 模块 API | 改 | **新增 §7.16 M16**；§7.3 接缝后缀（并列句）、§7.4 配额公式+穿参义务、§7.6 kinds 六值+滤壳+wrong_stitch 独立分支、§7.7 +stitch_schema、§7.9 链序九名冻结/计量（threads 导出式）/两公式 −stitched/batch.end/dry-run、§7.10 第四路由、§7.11 +task_name **+ EV_STITCH_JUDGE/EV_STITCH_THREAD 常量清单 + 通道 10→11 镜像句**（文档审计子项）、§7.13 +thread_id 真字段与三 duck 标（§3.2 实现定稿）、§7.14 载体注（连续 run 语义）、§7.15 seam 占位+计数器口径 |
 | **§7.12 CLI/factory/probe 接线** | 改 | **StitchStage 构造入 build_stages 链位句 + `referenced_profiles()` +stitch.llm 条件入 probe 集**（文档审计遗漏 3——代码表已列 factory/profile_usage，此为对应文档节） |
 | §8.1/§8.3 | 改 | batch.end 字段、两事件行、通道 10→11、task_name 分级 |
 | §9.1/§9.2/§9.3 | 改 | `_meta.stream` 增量+包络句；rejects 组合+stitched 永不入+strict 注；counts/stream.stitch/守恒残差/计数属主表 |
