@@ -5,7 +5,7 @@ with policy="drop"; we assert a pass and a fail verdict respectively.
 
 The sibling service modules M8/M9 may not be implemented yet. When absent, this test
 registers *contract-shaped data types* (Part/Message/PromptBundle, VERDICT_SCHEMA —
-copied verbatim from CONTRACTS.md §7.8/§10.7) so `labelkit.verify` can assemble prompts,
+copied verbatim from CONTRACTS.md §7.8/§10.7) so `labelkit.operators.verify` can assemble prompts,
 and drives the LLM through a minimal in-test engine that makes REAL httpx calls to the
 z.ai anthropic endpoint (tool-forced structured output per §7.8) and validates the
 verdict with jsonschema. Nothing is faked: every judge verdict comes from glm-5.2.
@@ -23,7 +23,7 @@ import httpx
 import jsonschema
 import pytest
 
-from labelkit.config.model import (
+from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
     Criterion,
@@ -43,8 +43,8 @@ from labelkit.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.errors import SchemaViolation
-from labelkit.types import Annotation, PipelineItem, Record, RecordRef, Usage
+from labelkit.common.errors import SchemaViolation
+from labelkit.common.contracts.types import Annotation, PipelineItem, Record, RecordRef, Usage
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 
@@ -77,9 +77,9 @@ _VERDICT_SCHEMA = {  # CONTRACTS.md §10.7, verbatim
 def _ensure_contract_modules() -> None:
     """Register CONTRACTS.md data shapes for modules other engineers have not landed."""
     try:
-        import labelkit.llm_client  # noqa: F401
+        import labelkit.common.runtime.llm_client  # noqa: F401
     except ImportError:
-        mod = ModuleType("labelkit.llm_client")
+        mod = ModuleType("labelkit.common.runtime.llm_client")
 
         @dataclass(frozen=True)
         class Part:
@@ -98,20 +98,20 @@ def _ensure_contract_modules() -> None:
             temperature: float | None = None
 
         mod.Part, mod.Message, mod.PromptBundle = Part, Message, PromptBundle
-        sys.modules["labelkit.llm_client"] = mod
+        sys.modules["labelkit.common.runtime.llm_client"] = mod
 
     try:
-        import labelkit.schema_engine  # noqa: F401
+        import labelkit.common.runtime.schema_engine  # noqa: F401
     except ImportError:
-        mod = ModuleType("labelkit.schema_engine")
+        mod = ModuleType("labelkit.common.runtime.schema_engine")
         mod.VERDICT_SCHEMA = _VERDICT_SCHEMA
-        sys.modules["labelkit.schema_engine"] = mod
+        sys.modules["labelkit.common.runtime.schema_engine"] = mod
 
 
 _ensure_contract_modules()
 
-from labelkit.stage import RunContext  # noqa: E402
-from labelkit.verify import VerifyStage  # noqa: E402
+from labelkit.common.contracts.stage import RunContext  # noqa: E402
+from labelkit.operators.verify import VerifyStage  # noqa: E402
 
 
 # ── minimal REAL-endpoint engine (anthropic provider adaptation, §7.8) ──────

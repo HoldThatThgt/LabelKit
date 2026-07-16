@@ -317,7 +317,7 @@ M1 组合约束（并入 §2.3.1 / §3.1.4）：`segment.enabled` 要求 `run.mo
 | spec/ | 新 `314-m14-segment.md` / `315-m15-extract.md`；§1.5/§1.6 背书与决策、§2.1–2.5 架构/开关矩阵/dry-run、§4 类型与 ②b、§5.2 三节键表 + 白名单表、§6.2–6.4 输入语义/`_meta`/report/守恒、§7.2/§7.6 事件与错误码、§8 决策溯源——约 14 文件 | 大 |
 | CONTRACTS.md | §3 types verbatim、§4 errors、§5 ②b（含 M7 翻转注记）、§6 配置 dataclass、§7 两新 API 节 + M7 直调函数登记、§8 事件目录、§9 `_meta`/计数词表/守恒、§10 三个模板与三个内部 Schema、§12 决策登记——约 11 处 | 中-大 |
 | docs/manual/ | 新章（追加制 `25-stream.md`：直觉/配置/四层防线/调优）；★`_meta.stream: null` 恒在 ⇒ **三个存量 examples 重跑 + 含 `_meta` 样例块的 3/8/15/20/21/22 章重同步**（classify `classification: null` 先例同款——此前工作量漏计）；16/17/18 章事件表/调用账/错误码增行 | 大 |
-| tests/ | 新：`test_stream_ingest`（单调性/会话闭合/装箱）、`test_segment`（缝合确定性/②b/守恒）、`test_extract`（diff 摘要/Schema/兜底）、`test_verify` 增缺陷路由、集成 `examples/stream`（噪声帧 + 双任务 + 跨 App fixture）；存量：emitter `_meta` 键全集断言、Status 枚举断言、★~14 文件 ResolvedConfig 补参 | 中-大 |
+| tests/ | 新增覆盖归档于 `tests/operators/test_ingest.py`（stream 单调性/会话闭合/装箱）、`test_segment`（缝合确定性/②b/守恒）、`test_extract`（diff 摘要/Schema/兜底）、`test_verify` 增缺陷路由、集成 `examples/stream`（噪声帧 + 双任务 + 跨 App fixture）；存量：emitter `_meta` 键全集断言、Status 枚举断言、★~14 文件 ResolvedConfig 补参 | 中-大 |
 
 ## 6. 里程碑与验收
 
