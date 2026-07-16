@@ -1,0 +1,5 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.hotel"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "酒店预订", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.hotel"}
+{"id": "2", "parent": "0", "class": "EditText", "text": "杭州", "bounds": [24, 80, 376, 128], "visible": true, "package": "com.example.hotel"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "8月2日 入住 · 8月3日 离店", "bounds": [24, 140, 340, 172], "visible": true, "package": "com.example.hotel"}
+{"id": "4", "parent": "0", "class": "Button", "text": "搜索酒店", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.hotel"}

@@ -1,0 +1,5 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.chat"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "李经理", "bounds": [24, 20, 160, 56], "visible": true, "package": "com.example.chat"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "下午的会议改到 3 点了，请准时参加", "bounds": [24, 90, 376, 140], "visible": true, "package": "com.example.chat"}
+{"id": "3", "parent": "0", "class": "EditText", "text": "好的，3 点会议室见", "bounds": [24, 640, 300, 688], "visible": true, "package": "com.example.chat"}
+{"id": "4", "parent": "0", "class": "Button", "text": "发送", "bounds": [312, 640, 376, 688], "visible": true, "package": "com.example.chat"}

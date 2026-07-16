@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.flight"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "上海 → 成都", "bounds": [24, 20, 260, 56], "visible": true, "package": "com.example.flight"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "7月20日 单程", "bounds": [24, 66, 200, 94], "visible": true, "package": "com.example.flight"}
+{"id": "3", "parent": "0", "class": "Button", "text": "MU5401 08:15 起飞 ¥760", "bounds": [24, 110, 376, 180], "visible": true, "package": "com.example.flight"}
+{"id": "4", "parent": "0", "class": "Button", "text": "CA1946 12:30 起飞 ¥820", "bounds": [24, 196, 376, 266], "visible": true, "package": "com.example.flight"}
+{"id": "5", "parent": "0", "class": "Button", "text": "HO1255 19:05 起飞 ¥690", "bounds": [24, 282, 376, 352], "visible": true, "package": "com.example.flight"}

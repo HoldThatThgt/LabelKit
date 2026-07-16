@@ -1,0 +1,5 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.notes"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "备忘录", "bounds": [24, 20, 150, 56], "visible": true, "package": "com.example.notes"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "周末大扫除", "bounds": [24, 90, 240, 122], "visible": true, "package": "com.example.notes"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "给绿萝浇水", "bounds": [24, 130, 240, 162], "visible": true, "package": "com.example.notes"}
+{"id": "4", "parent": "0", "class": "Button", "text": "新建备忘", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.notes"}

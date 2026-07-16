@@ -1,0 +1,5 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.shop"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "云驰跑步鞋", "bounds": [24, 20, 220, 56], "visible": true, "package": "com.example.shop"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "¥299 · 42 码 黑白配色", "bounds": [24, 90, 320, 126], "visible": true, "package": "com.example.shop"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "月销 2000+ 好评率 98%", "bounds": [24, 134, 300, 166], "visible": true, "package": "com.example.shop"}
+{"id": "4", "parent": "0", "class": "Button", "text": "立即购买", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.shop"}

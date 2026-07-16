@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.food"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "蜀香园麻辣香锅", "bounds": [24, 20, 260, 56], "visible": true, "package": "com.example.food"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "招牌麻辣香锅 ¥45", "bounds": [24, 90, 320, 126], "visible": true, "package": "com.example.food"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "微辣 · 大份 · 含土豆宽粉", "bounds": [24, 134, 340, 162], "visible": true, "package": "com.example.food"}
+{"id": "4", "parent": "0", "class": "TextView", "text": "月售 800+ 好评率 97%", "bounds": [24, 170, 300, 198], "visible": true, "package": "com.example.food"}
+{"id": "5", "parent": "0", "class": "Button", "text": "加入购物车", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.food"}

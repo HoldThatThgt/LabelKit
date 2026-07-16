@@ -1,0 +1,5 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.adpop"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "限时优惠", "bounds": [24, 20, 200, 56], "visible": true, "package": "com.example.adpop"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "新人专享大礼包", "bounds": [24, 90, 280, 126], "visible": true, "package": "com.example.adpop"}
+{"id": "3", "parent": "0", "class": "Button", "text": "立即领取", "bounds": [24, 700, 190, 760], "visible": true, "package": "com.example.adpop"}
+{"id": "4", "parent": "0", "class": "Button", "text": "关闭", "bounds": [210, 700, 376, 760], "visible": true, "package": "com.example.adpop"}

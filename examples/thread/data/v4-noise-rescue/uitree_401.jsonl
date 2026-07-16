@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.shop"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "潮品商城", "bounds": [24, 20, 200, 56], "visible": true, "package": "com.example.shop"}
+{"id": "2", "parent": "0", "class": "EditText", "text": "", "bounds": [24, 80, 376, 128], "visible": true, "package": "com.example.shop", "content_desc": "搜索商品"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "今日热卖", "bounds": [24, 160, 160, 188], "visible": true, "package": "com.example.shop"}
+{"id": "4", "parent": "0", "class": "TextView", "text": "云驰跑步鞋 ¥299", "bounds": [24, 200, 300, 236], "visible": true, "package": "com.example.shop"}
+{"id": "5", "parent": "0", "class": "TextView", "text": "轻风运动短袖 ¥89", "bounds": [24, 244, 300, 280], "visible": true, "package": "com.example.shop"}

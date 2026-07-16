@@ -1,0 +1,4 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.sysupdate"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "系统更新", "bounds": [24, 20, 200, 56], "visible": true, "package": "com.example.sysupdate"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "正在下载更新包 37%", "bounds": [24, 90, 300, 126], "visible": true, "package": "com.example.sysupdate"}
+{"id": "3", "parent": "0", "class": "Button", "text": "暂停下载", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.sysupdate"}

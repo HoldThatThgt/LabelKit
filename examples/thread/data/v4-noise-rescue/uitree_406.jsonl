@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.news"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "台风「木兰」明日登陆", "bounds": [24, 20, 340, 56], "visible": true, "package": "com.example.news"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "中央气象台发布橙色预警", "bounds": [24, 90, 340, 122], "visible": true, "package": "com.example.news"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "华南多地中小学明日停课", "bounds": [24, 130, 340, 162], "visible": true, "package": "com.example.news"}
+{"id": "4", "parent": "0", "class": "Button", "text": "收藏", "bounds": [24, 700, 190, 760], "visible": true, "package": "com.example.news"}
+{"id": "5", "parent": "0", "class": "Button", "text": "分享", "bounds": [210, 700, 376, 760], "visible": true, "package": "com.example.news"}

@@ -1102,6 +1102,9 @@ class StitchConfig:                               # v1.9 (spec §5.2 [stitch]): 
                                                   # false = stage not in chain, output
                                                   # byte-identical to v1.8 except the dry-run
                                                   # stderr stitch_calls=0 line (m-11, §7.9)
+                                                  # and the unconditional wrong_stitch: 0
+                                                  # defects row in stream×verify reports
+                                                  # (T15 closed vocabulary, §7.6/§9.3)
     llm: str = "default"                          # judgment profile; joins the reference sets
                                                   # whenever enabled (no strategy condition) —
                                                   # pure-text evidence, NEVER in any

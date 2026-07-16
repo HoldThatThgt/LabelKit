@@ -1,0 +1,4 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.camera"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "相机", "bounds": [24, 20, 140, 56], "visible": true, "package": "com.example.camera"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "轻触屏幕对焦", "bounds": [24, 90, 240, 122], "visible": true, "package": "com.example.camera"}
+{"id": "3", "parent": "0", "class": "Button", "text": "拍照", "bounds": [150, 700, 250, 760], "visible": true, "package": "com.example.camera"}

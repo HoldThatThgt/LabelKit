@@ -1,0 +1,5 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.taxi"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "快捷出行", "bounds": [24, 20, 200, 56], "visible": true, "package": "com.example.taxi"}
+{"id": "2", "parent": "0", "class": "EditText", "text": "城西银泰城", "bounds": [24, 90, 376, 140], "visible": true, "package": "com.example.taxi"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "当前位置：文三路 199 号", "bounds": [24, 150, 320, 182], "visible": true, "package": "com.example.taxi"}
+{"id": "4", "parent": "0", "class": "Button", "text": "呼叫快车", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.taxi"}

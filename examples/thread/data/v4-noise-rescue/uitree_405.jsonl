@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.news"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "每日头条", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.news"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "台风「木兰」明日登陆华南沿海", "bounds": [24, 90, 376, 126], "visible": true, "package": "com.example.news"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "新能源车 6 月销量创新高", "bounds": [24, 140, 360, 172], "visible": true, "package": "com.example.news"}
+{"id": "4", "parent": "0", "class": "TextView", "text": "国产大飞机开通新航线", "bounds": [24, 184, 340, 216], "visible": true, "package": "com.example.news"}
+{"id": "5", "parent": "0", "class": "Button", "text": "查看更多", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.news"}

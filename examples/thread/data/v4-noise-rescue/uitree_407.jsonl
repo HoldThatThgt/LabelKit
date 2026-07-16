@@ -1,0 +1,5 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.news"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "评论 1284 条", "bounds": [24, 20, 240, 56], "visible": true, "package": "com.example.news"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "希望大家注意安全", "bounds": [24, 90, 300, 122], "visible": true, "package": "com.example.news"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "已经开始下雨了", "bounds": [24, 130, 280, 162], "visible": true, "package": "com.example.news"}
+{"id": "4", "parent": "0", "class": "EditText", "text": "", "bounds": [24, 700, 376, 748], "visible": true, "package": "com.example.news", "content_desc": "写下你的评论"}

@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.hotel"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "支付成功", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.hotel"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "湖畔云居酒店", "bounds": [24, 90, 240, 122], "visible": true, "package": "com.example.hotel"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "大床房 ¥388", "bounds": [24, 130, 220, 162], "visible": true, "package": "com.example.hotel"}
+{"id": "4", "parent": "0", "class": "TextView", "text": "已支付", "bounds": [24, 170, 140, 202], "visible": true, "package": "com.example.hotel"}
+{"id": "5", "parent": "0", "class": "Button", "text": "查看订单", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.hotel"}

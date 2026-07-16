@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.food"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "确认订单", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.food"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "蜀香园麻辣香锅", "bounds": [24, 80, 260, 112], "visible": true, "package": "com.example.food"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "招牌麻辣香锅 ×1 ¥45", "bounds": [24, 120, 320, 156], "visible": true, "package": "com.example.food"}
+{"id": "4", "parent": "0", "class": "TextView", "text": "收货地址：静安区南京西路 88 号", "bounds": [24, 170, 376, 222], "visible": true, "package": "com.example.food"}
+{"id": "5", "parent": "0", "class": "Button", "text": "提交订单 ¥45", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.food"}

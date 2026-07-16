@@ -1,0 +1,4 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.notes"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "新建备忘", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.notes"}
+{"id": "2", "parent": "0", "class": "EditText", "text": "买牛奶、鸡蛋、面包", "bounds": [24, 80, 376, 160], "visible": true, "package": "com.example.notes"}
+{"id": "3", "parent": "0", "class": "Button", "text": "保存", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.notes"}

@@ -1,0 +1,5 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.hotel"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "入住凭证", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.hotel"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "湖畔云居酒店", "bounds": [24, 90, 240, 122], "visible": true, "package": "com.example.hotel"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "订单号 HT20260802031", "bounds": [24, 130, 330, 162], "visible": true, "package": "com.example.hotel"}
+{"id": "4", "parent": "0", "class": "TextView", "text": "8月2日 14:00 后办理入住", "bounds": [24, 170, 340, 202], "visible": true, "package": "com.example.hotel"}

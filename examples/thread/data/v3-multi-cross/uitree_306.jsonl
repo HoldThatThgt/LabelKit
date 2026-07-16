@@ -1,0 +1,5 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.taxi"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "司机已接单", "bounds": [24, 20, 220, 56], "visible": true, "package": "com.example.taxi"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "车牌 浙A·88T66", "bounds": [24, 90, 260, 126], "visible": true, "package": "com.example.taxi"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "预计 5 分钟到达", "bounds": [24, 134, 260, 166], "visible": true, "package": "com.example.taxi"}
+{"id": "4", "parent": "0", "class": "Button", "text": "联系司机", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.taxi"}

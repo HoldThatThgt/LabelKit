@@ -1,0 +1,5 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.music"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "已添加收藏", "bounds": [24, 20, 220, 56], "visible": true, "package": "com.example.music"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "晴天 已加入「我的收藏」", "bounds": [24, 90, 360, 126], "visible": true, "package": "com.example.music"}
+{"id": "3", "parent": "0", "class": "Button", "text": "继续播放", "bounds": [24, 700, 190, 760], "visible": true, "package": "com.example.music"}
+{"id": "4", "parent": "0", "class": "Button", "text": "查看歌单", "bounds": [210, 700, 376, 760], "visible": true, "package": "com.example.music"}

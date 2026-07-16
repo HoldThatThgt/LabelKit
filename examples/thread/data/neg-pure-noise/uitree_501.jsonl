@@ -1,0 +1,4 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.lockscreen"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "14:32", "bounds": [24, 20, 200, 76], "visible": true, "package": "com.example.lockscreen"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "7月16日 星期四", "bounds": [24, 90, 260, 122], "visible": true, "package": "com.example.lockscreen"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "上滑解锁", "bounds": [140, 700, 260, 732], "visible": true, "package": "com.example.lockscreen"}

@@ -1,0 +1,5 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.shop"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "收银台", "bounds": [24, 20, 160, 56], "visible": true, "package": "com.example.shop"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "支付订单 ¥299", "bounds": [24, 90, 260, 126], "visible": true, "package": "com.example.shop"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "云驰跑步鞋 42码 ×1", "bounds": [24, 134, 320, 170], "visible": true, "package": "com.example.shop"}
+{"id": "4", "parent": "0", "class": "Button", "text": "立即支付", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.shop"}

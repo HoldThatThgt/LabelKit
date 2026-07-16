@@ -1,0 +1,5 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.powersave"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "电量不足", "bounds": [24, 20, 200, 56], "visible": true, "package": "com.example.powersave"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "剩余电量 18%，请及时充电", "bounds": [24, 90, 350, 122], "visible": true, "package": "com.example.powersave"}
+{"id": "3", "parent": "0", "class": "Button", "text": "开启省电模式", "bounds": [24, 700, 240, 760], "visible": true, "package": "com.example.powersave"}
+{"id": "4", "parent": "0", "class": "Button", "text": "知道了", "bounds": [260, 700, 376, 760], "visible": true, "package": "com.example.powersave"}
