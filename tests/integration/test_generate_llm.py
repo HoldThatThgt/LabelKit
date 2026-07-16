@@ -20,8 +20,8 @@ import json_repair
 import pytest
 from jsonschema import Draft202012Validator
 
-from labelkit.common.errors import SchemaViolation
-from labelkit.common.contracts.types import Usage
+from labelkit.errors import SchemaViolation
+from labelkit.types import Usage
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 
@@ -32,11 +32,11 @@ pytestmark = pytest.mark.integration
 
 def _ensure_llm_client_module():
     try:
-        import labelkit.common.runtime.llm_client  # noqa: F401
+        import labelkit.llm_client  # noqa: F401
         return
     except ImportError:
         pass
-    mod = types.ModuleType("labelkit.common.runtime.llm_client")
+    mod = types.ModuleType("labelkit.llm_client")
 
     @dataclass(frozen=True)
     class Part:
@@ -55,16 +55,16 @@ def _ensure_llm_client_module():
         temperature: float | None = None
 
     mod.Part, mod.Message, mod.PromptBundle = Part, Message, PromptBundle
-    sys.modules["labelkit.common.runtime.llm_client"] = mod
+    sys.modules["labelkit.llm_client"] = mod
 
 
 def _ensure_schema_engine_module():
     try:
-        import labelkit.common.runtime.schema_engine  # noqa: F401
+        import labelkit.schema_engine  # noqa: F401
         return
     except ImportError:
         pass
-    mod = types.ModuleType("labelkit.common.runtime.schema_engine")
+    mod = types.ModuleType("labelkit.schema_engine")
 
     def samples_schema(num_per_call):                  # exact JSON per CONTRACTS §10.7
         return {"type": "object",
@@ -74,14 +74,14 @@ def _ensure_schema_engine_module():
                 "required": ["samples"], "additionalProperties": False}
 
     mod.samples_schema = samples_schema
-    sys.modules["labelkit.common.runtime.schema_engine"] = mod
+    sys.modules["labelkit.schema_engine"] = mod
 
 
 _ensure_llm_client_module()
 _ensure_schema_engine_module()
 
-from labelkit.operators.generate import GenerateStage  # noqa: E402  (needs the modules above)
-from labelkit.common.contracts.stage import RunContext  # noqa: E402
+from labelkit.generate import GenerateStage  # noqa: E402  (needs the modules above)
+from labelkit.stage import RunContext  # noqa: E402
 
 
 # ── minimal REAL engine: Anthropic messages protocol against z.ai ──────────
@@ -172,7 +172,7 @@ SEEDS = ("帮我写一条请假条，明天上午要去医院", "写一份周报
 
 
 def _mk_cfg():
-    from labelkit.common.config.model import (AnnotateConfig, ClassifyConfig, DedupConfig,
+    from labelkit.config.model import (AnnotateConfig, ClassifyConfig, DedupConfig,
                                        ExtractConfig, GenerateConfig, InputConfig,
                                        OutputConfig, QualityConfig, ResolvedConfig,
                                        Rubric, RunConfig, SegmentConfig,

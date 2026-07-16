@@ -1,1 +1,0 @@
-"""LabelKit pipeline operator implementations."""

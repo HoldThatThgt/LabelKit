@@ -1,6 +1,6 @@
 """M5 integration tests — REAL endpoint (glm-5.2 via api.z.ai, anthropic protocol).
 
-No mock LLMs (project policy). Uses the real labelkit.common.runtime.llm_client / labelkit.common.runtime.schema_engine
+No mock LLMs (project policy). Uses the real labelkit.llm_client / labelkit.schema_engine
 when those modules have landed; until then, minimal REAL-HTTP stand-ins implementing the
 exact contract surface annotate needs (SchemaEngine.user_schema_text /
 complete_validated) are used so the annotate path is exercised end-to-end against the
@@ -17,8 +17,8 @@ import httpx
 import jsonschema
 import pytest
 
-from labelkit.operators.annotate import AnnotateStage
-from labelkit.common.config.model import (
+from labelkit.annotate import AnnotateStage
+from labelkit.config.model import (
     AnnotateConfig,
     ClassifyConfig,
     DedupConfig,
@@ -37,9 +37,9 @@ from labelkit.common.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.common.errors import SchemaViolation
-from labelkit.common.contracts.stage import RunContext
-from labelkit.common.contracts.types import PipelineItem, Record, RecordRef, Usage
+from labelkit.errors import SchemaViolation
+from labelkit.stage import RunContext
+from labelkit.types import PipelineItem, Record, RecordRef, Usage
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 
@@ -216,8 +216,8 @@ class _RecordingMetrics:
 def make_ctx(cfg) -> RunContext:
     metrics = _RecordingMetrics()
     try:
-        from labelkit.common.runtime.llm_client import LLMClient
-        from labelkit.common.runtime.schema_engine import SchemaEngine
+        from labelkit.llm_client import LLMClient
+        from labelkit.schema_engine import SchemaEngine
     except ImportError:
         llm = _MiniAnthropicClient(cfg.llm_profiles)
         engine = _MiniSchemaEngine(dict(cfg.user_schema), llm)
