@@ -15,9 +15,10 @@ Ground rules for every implementer:
 - Code identifiers, comments, docstrings-of-record: English. LLM prompt templates: the exact
   Chinese text given in §10 of this document (copied from the spec verbatim).
 - Do not rename any field, key, event, or error code defined here. Tests assert exact strings.
-- Import discipline (no cycles): canonical production imports use the layered package paths below,
-  never the legacy shims. `labelkit.common.contracts.types` and `labelkit.common.errors` import
-  nothing from `labelkit`; `labelkit.common.config.model` imports nothing from `labelkit` except
+- Import discipline (no cycles): production imports use only the layered package paths below;
+  the former flat modules and `labelkit.config` package do not exist.
+  `labelkit.common.contracts.types` and `labelkit.common.errors` import nothing from `labelkit`;
+  `labelkit.common.config.model` imports nothing from `labelkit` except
   shared contract types if needed; `labelkit.common.runtime.llm_client` imports only common-layer
   contracts, errors, config, and observability; `labelkit.common.runtime.schema_engine` imports the
   common runtime LLM client plus common errors/observability; `labelkit.common.contracts.stage`
@@ -39,14 +40,12 @@ Ground rules for every implementer:
 labelkit/
 ├── __init__.py                         # __version__ and TOOL_VERSION only
 ├── cli/
-│   ├── __init__.py                     # compatibility exports: main, build_parser, exit_code_for
+│   ├── __init__.py                     # public exports: main, build_parser, exit_code_for
 │   ├── main.py                         # process entry, exception rendering, sole exit-code mapping
 │   ├── parser.py                       # argparse definitions and CliOverrides conversion
 │   └── commands.py                     # run / validate / rubric user-facing handlers
 ├── common/
-│   ├── __init__.py
 │   ├── contracts/
-│   │   ├── __init__.py
 │   │   ├── types.py                    # Ch.4 shared data types and frame/tree helpers
 │   │   └── stage.py                    # Stage protocol and RunContext
 │   ├── errors.py                       # cross-layer error vocabulary, exit codes, ErrorKind
@@ -55,17 +54,13 @@ labelkit/
 │   │   ├── model.py                    # all config dataclasses (M1)
 │   │   └── loader.py                   # TOML merge, validation, startup hook validation (M1)
 │   ├── runtime/
-│   │   ├── __init__.py
 │   │   ├── llm_client.py               # M9 transport, retry/key pools, concurrency, usage
 │   │   └── schema_engine.py            # M8 L0-L3 guarantee, repair, schema validation/stats
 │   ├── observability/
-│   │   ├── __init__.py
 │   │   └── obslog.py                   # M12 logs, trace, events, metrics, breaker state
 │   └── extensions/
-│       ├── __init__.py
 │       └── hooks.py                    # user validator resolution/execution/normalization
 ├── operators/
-│   ├── __init__.py
 │   ├── ingest.py                       # M2
 │   ├── segment.py                      # M14
 │   ├── dedup.py                        # M3
@@ -93,40 +88,31 @@ labelkit/
 of the verbatim frozen material in sections 3–6. Changes to their frozen content still require
 updating this file first.
 
-### 1.1 Canonical paths and legacy compatibility shims
+### 1.1 Canonical paths only
 
-The directories above are the canonical implementation paths. Existing external imports remain
-valid through thin re-export shims; production code must not import through those shims, and a shim
-must never copy implementation:
+The directories above are the only implementation paths. The package root contains only
+`labelkit/__init__.py`; the former flat modules (`labelkit.types`, `labelkit.stage`,
+`labelkit.errors`, service/operator modules, and `labelkit.orchestrator`) and the former
+`labelkit.config` package are intentionally removed. No re-export shim, module alias, or dynamic
+forwarder may recreate them. Consumers must import the layered canonical modules.
 
-```text
-labelkit.types          → labelkit.common.contracts.types
-labelkit.stage          → labelkit.common.contracts.stage
-labelkit.errors         → labelkit.common.errors
-labelkit.config.*       → labelkit.common.config.*
-labelkit.llm_client     → labelkit.common.runtime.llm_client
-labelkit.schema_engine  → labelkit.common.runtime.schema_engine
-labelkit.obslog         → labelkit.common.observability.obslog
-labelkit.hooks          → labelkit.common.extensions.hooks
-labelkit.ingest         → labelkit.operators.ingest
-labelkit.segment        → labelkit.operators.segment
-labelkit.dedup          → labelkit.operators.dedup
-labelkit.classify       → labelkit.operators.classify
-labelkit.extract        → labelkit.operators.extract
-labelkit.quality        → labelkit.operators.quality
-labelkit.generate       → labelkit.operators.generate
-labelkit.annotate       → labelkit.operators.annotate
-labelkit.verify         → labelkit.operators.verify
-labelkit.emitter        → labelkit.operators.emitter
-labelkit.orchestrator   → labelkit.orchestration.orchestrator
-```
+`labelkit.cli` remains the public module name as the `labelkit/cli/` package; there is no
+coexisting `labelkit/cli.py`. Its `__init__.py` exports the established CLI entry surfaces, and the
+console-script target `labelkit.cli:main` remains unchanged. Public direct-call surfaces such as
+`annotate_record`, `build_*_prompt`, `judge_window`, `extract_transition`, `RunContext`,
+`LLMClient`, and `SchemaEngine` retain their frozen signatures and behavior at their canonical
+layered paths only.
 
-`labelkit.cli` remains the public module name but is now the `labelkit/cli/` package; there is no
-coexisting `labelkit/cli.py`. Its `__init__.py` preserves the established CLI exports, and the
-console-script target `labelkit.cli:main` remains unchanged. Compatibility includes public
-direct-call surfaces such as `annotate_record`, `build_*_prompt`, `judge_window`,
-`extract_transition`, `RunContext`, `LLMClient`, and `SchemaEngine`; their signatures and behavior
-remain frozen by the sections below.
+### 1.2 Test ownership
+
+Offline tests physically mirror the production owners: contracts under `tests/common/contracts/`,
+config under `tests/common/config/`, runtime under `tests/common/runtime/`, observability under
+`tests/common/observability/`, extensions under `tests/common/extensions/`, operators under
+`tests/operators/`, and orchestration under `tests/orchestration/`. Key-pool unit coverage belongs
+in `tests/common/runtime/test_llm_client.py`; stream-ingest coverage belongs in
+`tests/operators/test_ingest.py`. A separate compatibility-import test, `test_key_pool.py`, or
+`test_stream_ingest.py` is forbidden. The exact file allowlist is normative in
+`docs/dev/SPEC-package-layer-reorganization.md` §6.1.
 
 ---
 

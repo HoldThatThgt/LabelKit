@@ -215,7 +215,7 @@ async def test_auth_fatal_trips_breaker_and_queued_calls_fail_fast(tmp_path):
     fail fast WITHOUT firing doomed HTTP requests (per-attempt breaker
     re-check after semaphore acquisition)."""
     from labelkit.common.errors import CircuitBreakerTripped
-    from tests.common.test_obslog import make_cfg as obslog_cfg
+    from tests.common.observability.test_obslog import make_cfg as obslog_cfg
 
     prof = _profile(api_key_env="LABELKIT_BAD_KEY_TEST", max_concurrency=1)
     os.environ["LABELKIT_BAD_KEY_TEST"] = "definitely-not-a-key"

@@ -8,7 +8,7 @@ import re
 
 import pytest
 
-from labelkit import obslog
+from labelkit.common.observability import obslog
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,

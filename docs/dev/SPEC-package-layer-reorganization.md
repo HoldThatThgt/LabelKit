@@ -1,6 +1,6 @@
 # LabelKit 包分层重构规范
 
-状态：严格物理归档修订实施中
+状态：已实施
 
 版本：v1.1
 
@@ -400,4 +400,29 @@ uv run pytest tests/integration -q -m integration
 
 ## 10. 实施与验证记录
 
-v1.0 的 shim-based 实施记录已被 v1.1 废止，不能作为完成证据。v1.1 只有在旧文件物理删除、测试严格归档、全部门禁重跑和独立对抗复查完成后，才可在此写入最终实测记录并将状态改为“已实施”。
+实施完成日期：2026-07-16。
+
+- v1.0 的 shim-based 实施记录已由 v1.1 废止；旧兼容方案不再是有效实现或验收依据。
+- `labelkit/` 根目录的 Python 文件严格只剩 `__init__.py`，旧 `labelkit/config/` 和 18 个
+  平铺模块已从工作树、Git 变更和构建产物删除；目标树未列出的 6 个 package marker
+  也已删除。canonical 生产 Python 文件共 30 个。
+- 测试树严格按 §6.1 归档，共 31 个 Python 文件，不含测试 package marker、
+  `test_compat_imports.py`、独立 `test_key_pool.py` 或独立 `test_stream_ingest.py`。
+- common 非兼容测试从 432 个节点无损迁移，新增 11 个 Stage/errors 契约测试后为
+  443 个；ingest 41 个与 stream-ingest 44 个合并后仍为 85 个。AST 定义集合对账均为
+  零缺失、零重名覆盖。
+- 目录形态与依赖方向机械回归：`2 passed`；离线全量：
+  `1028 passed, 28 deselected in 2.05s`。
+- 真实端点 integration：`28 passed in 286.21s`，使用 z.ai anthropic endpoint 和
+  `glm-5.2`，未使用 mock。
+- `examples/text`、`examples/ui`、`examples/generate`、`examples/classify`、
+  `examples/stream` 的 `validate` 全部通过。
+- CLI help/rubric、四层 canonical import、`python3 -m build`、wheel/sdist 成员对账、
+  全新 venv wheel 安装、console entrypoint 和 `git diff --check` 全部通过；wheel 与
+  sdist 各自只含与工作树相同的 30 个生产 Python 文件，旧 import path 不可解析。
+- 独立对抗审计分别覆盖结构/产物、测试无损迁移和 spec/文档一致性。文档审计的
+  4 个候选中，AGENTS/CLAUDE 单测命令路径 1 项被确认并修复、实跑通过；另外 3 项
+  经逐条独立驳倒后确认是带日期的历史实施快照，按原记录保留。审计未留下 blocker。
+- 用户未跟踪文件 `docs/dev/SPEC-activity-structure.md` 未读取、未修改、未暂存。
+
+本规范无未完成、待定、defer、follow-up 或 TODO 实现项。

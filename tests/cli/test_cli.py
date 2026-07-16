@@ -8,6 +8,8 @@ LLMs, and no LLM is ever reached (both scenarios fail before any call).
 """
 from __future__ import annotations
 
+import ast
+import importlib.util
 import tomllib
 from importlib import resources
 from pathlib import Path
@@ -54,6 +56,168 @@ from labelkit.common.errors import (
 )
 from labelkit.orchestration.factory import build_stages
 from labelkit.orchestration.profile_usage import referenced_profiles
+
+
+EXPECTED_PRODUCTION_PY = {
+    "labelkit/__init__.py",
+    "labelkit/cli/__init__.py",
+    "labelkit/cli/commands.py",
+    "labelkit/cli/main.py",
+    "labelkit/cli/parser.py",
+    "labelkit/common/config/__init__.py",
+    "labelkit/common/config/loader.py",
+    "labelkit/common/config/model.py",
+    "labelkit/common/contracts/stage.py",
+    "labelkit/common/contracts/types.py",
+    "labelkit/common/errors.py",
+    "labelkit/common/extensions/hooks.py",
+    "labelkit/common/observability/obslog.py",
+    "labelkit/common/runtime/llm_client.py",
+    "labelkit/common/runtime/schema_engine.py",
+    "labelkit/operators/annotate.py",
+    "labelkit/operators/classify.py",
+    "labelkit/operators/dedup.py",
+    "labelkit/operators/emitter.py",
+    "labelkit/operators/extract.py",
+    "labelkit/operators/generate.py",
+    "labelkit/operators/ingest.py",
+    "labelkit/operators/quality.py",
+    "labelkit/operators/segment.py",
+    "labelkit/operators/verify.py",
+    "labelkit/orchestration/__init__.py",
+    "labelkit/orchestration/factory.py",
+    "labelkit/orchestration/orchestrator.py",
+    "labelkit/orchestration/profile_usage.py",
+    "labelkit/orchestration/runtime.py",
+}
+
+EXPECTED_TEST_PY = {
+    "tests/cli/test_cli.py",
+    "tests/common/config/test_config.py",
+    "tests/common/contracts/test_stage.py",
+    "tests/common/contracts/test_types.py",
+    "tests/common/extensions/test_hooks.py",
+    "tests/common/observability/test_obslog.py",
+    "tests/common/runtime/test_llm_client.py",
+    "tests/common/runtime/test_schema_engine.py",
+    "tests/common/test_errors.py",
+    "tests/conftest.py",
+    "tests/hook_samples.py",
+    "tests/integration/test_annotate_llm.py",
+    "tests/integration/test_classify_llm.py",
+    "tests/integration/test_generate_llm.py",
+    "tests/integration/test_key_pool_llm.py",
+    "tests/integration/test_llm_client_llm.py",
+    "tests/integration/test_quality_llm.py",
+    "tests/integration/test_schema_engine_llm.py",
+    "tests/integration/test_stream_llm.py",
+    "tests/integration/test_verify_llm.py",
+    "tests/operators/test_annotate.py",
+    "tests/operators/test_classify.py",
+    "tests/operators/test_dedup.py",
+    "tests/operators/test_emitter.py",
+    "tests/operators/test_extract.py",
+    "tests/operators/test_generate.py",
+    "tests/operators/test_ingest.py",
+    "tests/operators/test_quality.py",
+    "tests/operators/test_segment.py",
+    "tests/operators/test_verify.py",
+    "tests/orchestration/test_orchestrator.py",
+}
+
+REMOVED_MODULES = (
+    "labelkit.annotate",
+    "labelkit.classify",
+    "labelkit.config",
+    "labelkit.dedup",
+    "labelkit.emitter",
+    "labelkit.errors",
+    "labelkit.extract",
+    "labelkit.generate",
+    "labelkit.hooks",
+    "labelkit.ingest",
+    "labelkit.llm_client",
+    "labelkit.obslog",
+    "labelkit.orchestrator",
+    "labelkit.quality",
+    "labelkit.schema_engine",
+    "labelkit.segment",
+    "labelkit.stage",
+    "labelkit.types",
+    "labelkit.verify",
+)
+
+
+def test_package_layout_matches_frozen_spec():
+    root = Path(__file__).resolve().parents[2]
+    production = {
+        path.relative_to(root).as_posix()
+        for path in (root / "labelkit").rglob("*.py")
+        if "__pycache__" not in path.parts
+    }
+    tests = {
+        path.relative_to(root).as_posix()
+        for path in (root / "tests").rglob("*.py")
+        if "__pycache__" not in path.parts
+    }
+
+    assert production == EXPECTED_PRODUCTION_PY
+    assert tests == EXPECTED_TEST_PY
+    assert {path.name for path in (root / "labelkit").glob("*.py")} == {"__init__.py"}
+    assert not (root / "labelkit" / "config").exists()
+
+    for module in REMOVED_MODULES:
+        try:
+            spec = importlib.util.find_spec(module)
+        except ModuleNotFoundError:
+            spec = None
+        assert spec is None, f"legacy import path still resolves: {module}"
+
+
+def test_package_layout_dependency_direction():
+    root = Path(__file__).resolve().parents[2]
+    violations: list[str] = []
+
+    for relative in sorted(EXPECTED_PRODUCTION_PY):
+        if relative == "labelkit/__init__.py":
+            continue
+        path = root / relative
+        imports: list[str] = []
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"), filename=relative)):
+            if isinstance(node, ast.Import):
+                imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.append(node.module)
+
+        if relative.startswith("labelkit/common/"):
+            forbidden = ("labelkit.cli", "labelkit.operators", "labelkit.orchestration")
+        elif relative.startswith("labelkit/operators/"):
+            forbidden = ("labelkit.cli", "labelkit.orchestration")
+        elif relative.startswith("labelkit/orchestration/"):
+            forbidden = ("labelkit.cli",)
+        elif relative.startswith("labelkit/cli/"):
+            forbidden = ("labelkit.operators",)
+        else:
+            forbidden = ()
+
+        for imported in imports:
+            if imported.startswith(forbidden):
+                violations.append(f"{relative}: forbidden import {imported}")
+
+        if relative.startswith("labelkit/operators/"):
+            own_module = relative.removesuffix(".py").replace("/", ".")
+            allowed_operator_calls = {
+                "labelkit.operators.annotate",
+                "labelkit.operators.extract",
+                "labelkit.operators.segment",
+            } if own_module == "labelkit.operators.verify" else set()
+            for imported in imports:
+                if (imported.startswith("labelkit.operators.")
+                        and imported != own_module
+                        and imported not in allowed_operator_calls):
+                    violations.append(f"{relative}: operator dependency {imported}")
+
+    assert violations == []
 
 # ── exit-code mapper (spec §2.4) ───────────────────────────────────────────
 

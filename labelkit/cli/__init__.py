@@ -1,4 +1,4 @@
-"""LabelKit CLI package and compatibility exports for the former ``cli.py``."""
+"""LabelKit CLI package and public command-line exports."""
 
 from labelkit.common.config.model import CliOverrides
 from labelkit.common.errors import (
