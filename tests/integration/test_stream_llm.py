@@ -1,8 +1,8 @@
 """v1.8 stream integration tests — REAL endpoint (glm-5.2 via api.z.ai, anthropic protocol).
 
 No mock LLMs (project policy). Pins the stream-mode LLM surfaces against the live
-endpoint using the REAL examples/stream fixtures (task A 点外卖 frames 1-8 with the
-frame-5 social interruption screen; task B 打车 frames 9-13):
+endpoint using the REAL examples/stream/data/s1-serial-noise fixtures (task A 点外卖
+frames 1-8 with the frame-5 social interruption screen; task B 打车 frames 9-13):
 
 1. M14 judge_window — one 8-frame window, per-frame relation within the frozen
    5-value vocabulary (enum hard constraint via forced tool use) + the frame-5
@@ -72,7 +72,8 @@ from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 
 pytestmark = pytest.mark.integration
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "examples" / "stream" / "data"
+DATA_DIR = (Path(__file__).resolve().parents[2]
+            / "examples" / "stream" / "data" / "s1-serial-noise")
 
 # The examples/stream/project.toml user schema (three required string fields).
 USER_SCHEMA = {
@@ -86,7 +87,7 @@ USER_SCHEMA = {
     "additionalProperties": False,
 }
 
-# examples/stream/project.toml verbatim (domain context + sequence-annotation task).
+# examples/stream/project.toml-style domain context + its sequence-annotation task.
 SEGMENT_CONTEXT = ("手机屏幕操作录屏流；通知面板、弹窗等与前后操作无关的短暂插入屏"
                    "属于干扰帧")
 ANNOTATE_INSTRUCTION = ("你是移动端操作序列标注员。根据动作序列与关键帧，\n"
@@ -179,7 +180,7 @@ def make_ctx(cfg) -> RunContext:
                       rng=random.Random("42:1:stream"), batch_no=1)
 
 
-# ── real fixture loading (examples/stream/data, the M2 id/field-mapping rules) ──
+# ── real fixture loading (examples/stream/data/s1-serial-noise, M2 rules) ──
 
 _FRAME_CACHE: dict[int, Record] = {}
 

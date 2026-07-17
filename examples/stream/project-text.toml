@@ -1,0 +1,106 @@
+# 流模态·纯文本 E2E 工程（spec §5.2，v1.8）——带时间戳的纯文本请求流：
+# meta:ts 时间轴排序 + gap 会话化 → segment(hybrid 文本滑窗) → dedup(序列级
+# 精确/近似判重) → classify(episode 分类) → quality(pointwise trajectory 打分)
+# → annotate(序列标注) → verify(评审 + 修复)。
+# extract 仅 UI 模态、stitch 的机械先验三腿（App 交集/实体重叠/同页回归）依赖
+# 控件树证据，二者在纯文本流上不启用；UI 流的姊妹工程见同目录 project.toml。
+#
+# fixture（data-text/events.jsonl，13 行，UTC+8 时间戳）：一位用户一天的
+# 输入法请求流，gap_s=900（15 分钟静默断会话）切出三个会话：
+#   会话 1 09:02–09:09  任务 A 安排成都出差 3 行 → 1 行「哈哈哈哈哈」（预期
+#                       dropped_noise）→ 任务 B 写周报 3 行（预期切成 2 个 episode）
+#   会话 2 12:31–12:33  任务 C 合同条款翻译 3 行（1 个 episode；行间「再」「上面
+#                       两句」显式承接）
+#   会话 3 18:05–18:07  任务 C 的三行逐字重发（用户晚间原样重提交；episode 判重
+#                       配方与会话 2 逐字一致，预期 dropped_dup·exact）
+# 运行：uv run labelkit run --config ../config.toml --project project-text.toml
+schema_version = 1
+
+[run]
+input = "./data-text/events.jsonl"
+output = "./out/stream-text-labels.jsonl"
+modality = "text"
+batch_size = 32
+seed = 42
+
+[input]
+text_field = "text"
+
+[stream]
+order_by = "meta:ts"              # 文本模态时间轴：ISO-8601 / epoch 皆可（spec 6.1）
+gap_s = 900                       # 相邻请求静默 > 15 分钟即断会话
+
+[segment]
+enabled = true
+strategy = "hybrid"
+window = 8                        # 最长会话 7 行 → 每会话恰一窗
+min_len = 2
+context = "中文输入法请求流；同一时段内围绕同一件事（同一次行程、同一篇文稿、同一段译文）的连续请求构成一段——追问、改写、补充约束都是同一任务的推进（advances 覆盖跨请求的实体延续）；与前后请求无关的无意义输入（纯表情、纯语气词）属于干扰帧"
+
+[dedup]
+enabled = true                    # 判重单元 = episode：成员规范化文本按序拼接
+
+[classify]
+enabled = true
+llm = "default"
+assignment = "single"
+fallback_class = "other"
+
+[[classify.classes]]
+name = "travel"
+description = "差旅出行安排类任务：查车票机票、订酒店、写出差申请等围绕一次行程的请求序列"
+
+[[classify.classes]]
+name = "writing"
+description = "写作协助类任务：起草、修改、润色同一篇文本的请求序列"
+
+[[classify.classes]]
+name = "translation"
+description = "翻译类任务：围绕同一段内容的翻译与译文调整请求序列"
+
+[[classify.classes]]
+name = "other"
+description = "不属于以上任何一类的请求序列"
+
+[quality]
+enabled = true
+mode = "pointwise"
+rubric = "default:trajectory"     # 轨迹四准则同样适用于文本请求序列；只打分不筛
+
+[annotate]
+enabled = true
+llm = "default"
+instruction = """
+你是输入法请求序列的标注员。根据一段时间内用户连续输入的请求序列，
+标注该序列的任务标签（用户在办什么事）、任务类别与一句话摘要。
+"""
+
+[verify]
+enabled = true
+llm = "judge"
+policy = "repair"
+max_repair_rounds = 1
+extra_criteria = "补充审核约定：边界余量中的段外邻帧仅用于核对边界完整性（missing_head / missing_tail），不属于本序列成员——邻帧内容与本序列任务不同属正常现象（相邻任务），不构成 label_mismatch 的证据；审核证据仅含成员请求文本，标注摘要对其概括与合并表述不因措辞差异判 label_mismatch"
+
+[trace]
+enabled = true
+channels = ["segment", "classify", "verify", "schema"]
+content = "refs"
+
+[output]
+meta_mode = "inline"
+rejects = "full"                  # 噪声行 rejects 携带完整载荷
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "task_label": {"type": "string"},
+    "category": {"type": "string",
+      "enum": ["travel", "writing", "translation", "other"]},
+    "summary": {"type": "string", "maxLength": 100}
+  },
+  "required": ["task_label", "category", "summary"],
+  "additionalProperties": false
+}
+"""

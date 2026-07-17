@@ -36,7 +36,7 @@ uv run labelkit validate --config ../config.toml --project project.toml --probe
 uv run labelkit run      --config ../config.toml --project project.toml
 ```
 
-一分半钟后得到主输出（每行 = 你的 Schema 字段 + 可选 `_meta` 履历）、拒绝通道与运行报告。六个示例工程分别覆盖：文本去重+打分+标注（`examples/text`）、UI 截图多模态全流程（`examples/ui`）、从零合成数据集（`examples/generate`）、分类路由与按类打分/标注（`examples/classify`）、时序 UI 流的 episode 分段与动作摘取（`examples/stream`）、穿插任务流的线索缝合与短段救援（`examples/thread`：四个规范交叉场景 + 纯噪声负样本会话）。
+几分钟后得到主输出（每行 = 你的 Schema 字段 + 可选 `_meta` 履历）、拒绝通道与运行报告。示例工程按**输入格式**分三个，各自把该格式下能开的算子全部打开：纯文本 JSONL（`examples/text`：去重 → 分类与按类条件化 → 打分门控 → 过门种子扩充生成回流 → 标注 → 评审修复；`project-synth.toml` 变体为无输入的纯生成模式）、UI 截图 + 控件树文件对（`examples/ui`：配对接入 → pHash/树去重 → 视觉分类 → pairwise QuRating → 多模态标注 → 评审修复）、时序流（`examples/stream`：`project.toml` 为 53 帧五会话穿插 UI 流——分段 → 线索缝合（短段救援 + 二遍复评）→ 去重 → 序列分类 → 动作摘取（接缝占位）→ 轨迹打分 → 序列标注 → 缺陷评审修复；`project-text.toml` 为带时间戳的纯文本请求流——meta:ts 排序 + gap 会话化走同链）。
 
 ## 文档
 
@@ -46,7 +46,7 @@ uv run labelkit run      --config ../config.toml --project project.toml
 | [设计规格](spec/) | 实现级设计规格（v1.4 + v1.5/v1.6/v1.7/v1.8/v1.9 修订）：每个模块的职责、算法、配置与 IO 契约，每处算法选择均有论文/工业项目背书 |
 | [跨模块契约](docs/CONTRACTS.md) | 冻结的接口契约：签名、配置数据类、事件目录、提示词模板 |
 | [开发文档](docs/dev/) | E2E 测试问题清单（含修复状态）、需求分析 |
-| [设计文档原稿](docs/design/) | 规格书的 HTML / PDF 原稿 |
+| [设计说明书](docs/design/) | 规格书的单文档 HTML / PDF 汇编稿（由 `tools/build_design_doc.py` 从 `spec/` 生成，与现行修订同步） |
 
 ## 开发
 

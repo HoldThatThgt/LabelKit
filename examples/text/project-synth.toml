@@ -1,22 +1,25 @@
-# Pure-generation E2E project (spec v1.4, run.mode = "generate_only"):
-# seed-pool form (Self-Instruct style) — synthesize from scratch, then dedup → score → annotate.
+# 纯文本模态·纯生成变体（spec v1.4，run.mode = "generate_only"）：无输入数据，
+# 从 3 条手写种子（Self-Instruct 形态）自举合成，再走同一条治理管线
+# dedup → quality → annotate。与主工程 project.toml 的差别只在入口：无 [run].input、
+# 无 M2 接入，种子来自 generate.seed_examples 而非过质量门的记录。
+# 运行：uv run labelkit run --config ../config.toml --project project-synth.toml
 schema_version = 1
 
 [run]
-output = "./out/generated.jsonl"
+output = "./out/text-synth.jsonl"
 modality = "text"
 mode = "generate_only"
 batch_size = 8
 seed = 7
 
 [dedup]
-enabled = true
+enabled = true                    # 生成样本与彼此做相似度过滤（Self-Instruct 惯例）
 
 [quality]
 enabled = true
 mode = "pointwise"
 llm = "default"
-rubric = "default:text"
+rubric = "default:text"           # 无 threshold——只打分不筛，分数随行落盘供后筛
 
 [generate]
 enabled = true
@@ -26,7 +29,7 @@ instruction = """
 类型多样（写作协助、翻译、问答、闲聊等），长度 10–60 字。
 """
 num_per_call = 4
-num_per_record = 2
+num_per_record = 2                # 调用数 = ⌈3 种子 × 2 / 4⌉ = 2
 temperature = 0.9
 seed_examples = [
   "帮我写一条请假条，明天上午要去医院复查",

@@ -1,29 +1,96 @@
-# Stream-UI E2E project (spec §5.2, v1.8): 会话化 → segment(hybrid 滑窗) → dedup
-# → extract(动作摘取) → pointwise trajectory 打分 → 序列标注 → verify+repair。
-# fixture：任务 A 点外卖 8 帧（帧 5 无关屏，预期 dropped_noise）+ 任务 B 打车 5 帧
-# + 帧 14 桌面屏；data/ 由 tools/gen_fixtures.py 一次性生成。
+# 流模态·UI E2E 工程（spec §5.2，v1.8/v1.9）——时间序「截图 + 控件树」流上
+# 能开的算子全开：会话化(source_dir 按场景子目录分区) → segment(hybrid 滑窗
+# 边界精化 + 噪声剔除) → stitch(线索缝合：短段救援 + 二遍复评) → dedup →
+# classify(episode/线索封闭集分类，按类条件化) → extract(逐相邻帧对摘取动作，
+# 接缝机械占位) → quality(pointwise trajectory 打分) → annotate(序列标注) →
+# verify(缺陷表评审 + 修复)。generate 与 stream 互斥（2.3.1），不可用。
+# 纯文本时间序流的姊妹工程见同目录 project-text.toml。
+#
+# fixture：五个场景子目录 = 五个会话（index 全树错开编号，53 对帧），覆盖
+# 缝合的四个规范验收场景 + 纯噪声负样本：
+#   s1-serial-noise/ 1–14   「串联+噪声」：点外卖 8 帧（帧 5 社交消息屏，预期
+#                           dropped_noise）+ 打车 5 帧背靠背 + 帧 14 桌面屏
+#                           （预期 below_min_len 落选→救援候选判 new 不并入）。
+#                           实体延续：「川味麻辣烫」跨 3/4/6、¥32 跨 4/6/7。
+#                           预期 2 线索零缝合。
+#   s2-single-cross/ 201–210「单交叉」：点外卖 4+3 帧被回消息 3 帧打断。实体
+#                           延续：「蜀香园麻辣香锅」「招牌麻辣香锅 ×1 ¥45」跨
+#                           203/204/208/209。预期 3 段缝成 2 线索（1 缝合 1 接缝）。
+#   s3-multi-cross/ 301–315 「多交叉」：订酒店 3+3+3 帧被打车/记备忘各 3 帧两度
+#                           打断。「湖畔云居酒店」跨全部 A 帧、「大床房 ¥388」跨
+#                           308/309/313。预期 5 段缝成 3 线索（2 缝合 2 接缝）。
+#   s4-noise-rescue/ 401–409「噪声+救援」：网购 4 帧 → 新闻 3 帧 → 1 低电量弹窗
+#                           噪声帧 → 1 帧支付尾段（below_min_len 命中救援：
+#                           rescued_short=1、1 接缝、1 噪声帧）。
+#   s5-pure-noise/ 501–505  「纯噪声负样本」：五帧互不相关插入屏（零段零线索）。
+# data/ 由 tools/gen_fixtures.py 一次性确定性生成。
 schema_version = 1
 
 [run]
 input = "./data"
 output = "./out/stream-labels.jsonl"
 modality = "ui"
-batch_size = 32
+batch_size = 64                   # 53 帧 5 会话整会话装箱进一批
 seed = 42
 
 [stream]
 order_by = "input_order"          # UI 模态 = pair_index 升序（meta:* 仅文本模态）
-# gap_steps = 3                   # 变体示范：pair_index 序号差 > 3 即断开会话（0 = 不启用）
+key = ["source_dir"]              # 分区键：每个场景子目录一个会话
 
 [segment]
 enabled = true                    # stream 模式总开关
 strategy = "hybrid"               # 滑窗 LLM 边界精化 + 逐帧噪声标记
-window = 8                        # 14 帧会话 → 2 窗（重叠 1 帧）
-min_len = 2                       # 仅作用于 LLM 精化切出的段
-context = "手机屏幕操作录屏流；通知面板、弹窗等与前后操作无关的短暂插入屏属于干扰帧"
+window = 16                       # ≥ 最长会话（15 帧）：每会话恰一窗，边界裁决见全会话上下文
+min_len = 2                       # 孤帧段以 below_min_len 落选 → 进 stitch 救援候选
+context = "手机屏幕操作录屏流；流中各项活动（购物、通讯、出行、资讯等）互为独立任务、彼此无从属或配合关系——用户常在任务间来回切换，被搁置的任务稍后可能切回收尾：切到另一任务处、切回被搁置任务处（含回到其支付/订单页完成收尾）都是新流程的开始（context_switch）；一笔任务已办完（下单成功、出票成功等收尾页）之后紧接着开始的另一笔任务同样是新流程的开始；advances 仅适用于为推进当前这一笔进行中的任务而发生的跨屏实体延续（如去短信里取验证码）——与几帧之前被打断的那笔任务的实体呼应属于切回收尾（context_switch），不是 advances；低电量弹窗、系统弹窗、通知面板、锁屏、广告弹窗等与前后操作无关的短暂插入屏属于干扰帧（interruption），不是任务切换"
+
+[stitch]
+enabled = true                    # 线索缝合总开关（要求 segment.enabled）
+llm = "default"                   # 纯文本判定：摘要卡证据，无视觉必需
+rescue_short = true               # below_min_len 短段按连续 run 重组先进候选池
+repass = true                     # 有界二遍复评修正一遍贪心漏缝
+# max_open / bias / votes / stale_gap_steps / digest_max_chars 取默认
+# （4 / "conservative" / 1 / 0 / 400）
+
+[dedup]
+enabled = true                    # 判重单元 = 线索（重绑后成员配方拼接，spec 3.3.3）
+
+[classify]
+enabled = true                    # 序列记录照常分类：episode 摘要 + 首帧截图入提示词
+llm = "default"
+assignment = "single"
+fallback_class = "other"
+
+[[classify.classes]]
+name = "shopping"
+description = "购物消费类任务：网购下单、点外卖、支付结算等围绕商品或订单的操作流程"
+
+[[classify.classes]]
+name = "travel"
+description = "出行差旅类任务：打车、订酒店、订票等围绕行程的操作流程"
+
+[[classify.classes]]
+name = "communication"
+description = "通讯社交类任务：查看与回复消息、聊天等围绕联系人的操作流程"
+
+[[classify.classes]]
+name = "news"
+description = "资讯浏览类任务：刷新闻、看文章、浏览评论等信息消费流程"
+
+[[classify.classes]]
+name = "other"
+description = "不属于以上任何一类的任务"
+
+# ── 按类覆盖：购物类序列的标注指令单独强调订单要素 ──
+[class.shopping.annotate]
+instruction = """
+你是移动端操作序列标注员。这条操作序列已被判定为购物消费类：
+标注任务标签（务必点明商品/餐品与金额等订单要素）、所属应用与一句话摘要。
+被打断后恢复的任务请标注其完整任务（接缝步表示任务曾被打断）。
+"""
 
 [extract]
-enabled = true                    # 逐相邻帧对摘取动作，写入 _meta.stream.steps
+enabled = true                    # 逐相邻帧对摘取动作；接缝序数零 LLM 机械占位
 llm = "default"
 
 [quality]
@@ -37,6 +104,7 @@ llm = "default"
 instruction = """
 你是移动端操作序列标注员。根据动作序列与关键帧，
 标注该操作序列的任务标签（用户在做什么）、所属应用与一句话摘要。
+被打断后恢复的任务请标注其完整任务（接缝步表示任务曾被打断）。
 """
 
 [verify]
@@ -44,10 +112,11 @@ enabled = true
 llm = "judge"
 policy = "repair"                 # 缺陷表路由：成员手术 + 重摘取 + 重标注
 max_repair_rounds = 1
+extra_criteria = "补充审核约定：动作序列恒为 成员帧数−1 步（每相邻帧对摘取一步，线索接缝为机械占位步），步数比成员帧数少一是构造使然，不构成 missing_members / missing_tail 的证据；标注摘要允许概括中间成员帧的可见内容（审核证据仅含首末帧截图），除非与所给证据直接矛盾，不因此判 label_mismatch"
 
 [trace]
 enabled = true
-channels = ["segment", "extract", "verify", "schema"]
+channels = ["segment", "stitch", "extract", "classify", "verify", "schema"]
 content = "refs"
 
 [output]

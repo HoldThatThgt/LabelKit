@@ -1,9 +1,9 @@
 """v1.9 stitch integration tests — REAL endpoint (glm-5.2 via api.z.ai, anthropic protocol).
 
 No mock LLMs (project policy). Pins the M16 judgment surface against the live
-endpoint using the REAL examples/stream fixtures (task A 点外卖 frames 1-8 with
-the frame-5 social interruption screen; task B 打车 frames 9-13; frame 14 the
-trailing launcher screen) — the four §3.6 judgment cases:
+endpoint using the REAL examples/stream/data/s1-serial-noise fixtures (task A
+点外卖 frames 1-8 with the frame-5 social interruption screen; task B 打车
+frames 9-13; frame 14 the trailing launcher screen) — the four §3.6 judgment cases:
 
 1. clear resume — the post-interruption 点外卖 tail (frames 6-8) against an
    open 点外卖 thread (frames 1-4): verdict resume naming that thread, and the
@@ -64,7 +64,8 @@ from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 
 pytestmark = pytest.mark.integration
 
-DATA_DIR = Path(__file__).resolve().parents[2] / "examples" / "stream" / "data"
+DATA_DIR = (Path(__file__).resolve().parents[2]
+            / "examples" / "stream" / "data" / "s1-serial-noise")
 
 # examples/stream/project.toml-style domain hint, adapted to the stitch face.
 STITCH_CONTEXT = ("手机屏幕操作录屏流；同一任务可能被其他 App 打断后恢复，"
@@ -147,7 +148,7 @@ def make_ctx(cfg) -> RunContext:
                       rng=random.Random("42:1:stitch"), batch_no=1)
 
 
-# ── real fixture loading (examples/stream/data, the M2 id rules) ────────────
+# ── real fixture loading (examples/stream/data/s1-serial-noise, M2 id rules) ─
 
 _FRAME_CACHE: dict[int, Record] = {}
 

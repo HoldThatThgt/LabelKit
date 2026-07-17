@@ -1,6 +1,0 @@
-{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.music"}
-{"id": "1", "parent": "0", "class": "TextView", "text": "云听音乐", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.music"}
-{"id": "2", "parent": "0", "class": "TextView", "text": "推荐歌单", "bounds": [24, 70, 160, 98], "visible": true, "package": "com.example.music"}
-{"id": "3", "parent": "0", "class": "Button", "text": "夏日清凉", "bounds": [24, 110, 186, 170], "visible": true, "package": "com.example.music"}
-{"id": "4", "parent": "0", "class": "Button", "text": "驾车金曲", "bounds": [214, 110, 376, 170], "visible": true, "package": "com.example.music"}
-{"id": "5", "parent": "0", "class": "EditText", "text": "", "bounds": [24, 700, 376, 748], "visible": true, "package": "com.example.music", "content_desc": "搜索歌曲"}

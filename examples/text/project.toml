@@ -1,4 +1,10 @@
-# Text-modality E2E project (spec §5.2): dedup → pointwise quality → annotate.
+# 纯文本模态 E2E 工程（spec §5.2）——文本输入格式下能开的算子全开：
+# dedup → classify（按类条件化）→ quality（pointwise 质量门，按类门槛）
+# → generate（过门种子按类扩充，子批回流再治理）→ annotate（按类指令）
+# → verify（LLM-as-a-Judge 评审 + 有界修复）。
+# fixture：14 条输入法/应用反馈渠道采集的中文请求（data/input.jsonl），刻意
+# 掺了 1 条精确重复、1 条近似改写重复与「哈哈哈哈」「在吗」两条低质闲聊。
+# 纯生成变体（run.mode="generate_only"，无输入从零合成）见同目录 project-synth.toml。
 schema_version = 1
 
 [run]
@@ -12,14 +18,76 @@ seed = 42
 text_field = "instruction"
 
 [dedup]
-enabled = true
+enabled = true                    # 精确 SHA-256 + MinHash 近似（请假条两连击各中一级）
+
+[classify]
+enabled = true                    # LLM 封闭集分类：类标签驱动下游按类条件化
+llm = "default"
+assignment = "single"             # 锁定一条一类；multi 扇出语义见手册第 24 章
+fallback_class = "other"
+
+[[classify.classes]]
+name = "writing"
+description = "写作协助类请求：代写、改写、模板、文案等需要模型产出一段文本的请求"
+examples = ["帮我写一条请假条，明天上午要去医院"]
+
+[[classify.classes]]
+name = "qa"
+description = "知识问答与解释类请求：询问事实、原理，或要求讲解概念、给出计算过程"
+
+[[classify.classes]]
+name = "translation"
+description = "翻译类请求：中外互译，含要求保留语气或意境的翻译"
+
+[[classify.classes]]
+name = "other"
+description = "不属于以上任何一类的请求（闲聊、无明确诉求等）"
 
 [quality]
 enabled = true
-mode = "pointwise"
+mode = "pointwise"                # 绝对刻度 0–5 → [0,1]，门槛跨批可比
 llm = "default"
-threshold = 0.25
+threshold = 0.25                  # 全局门槛；writing/qa 两类按下方覆盖
 rubric = "default:text"
+
+# ── 按类覆盖：未出现的键一律继承全局 ──
+[class.writing.quality]
+threshold = 0.2                   # 写作类门槛放宽
+
+[class.qa.quality]
+threshold = 0.4                   # 问答类门槛收严
+
+[class.writing.annotate]
+instruction = """
+你是写作协助类请求的意图标注员。这条请求已被判定为写作协助类：
+标注 intent（通常为 writing_assist）、主题（要写什么）与写作难度。
+"""
+
+[class.qa.annotate]
+instruction = """
+你是知识问答类请求的意图标注员。这条请求已被判定为知识问答类：
+标注 intent（通常为 qa）、主题（问的是什么知识点）与回答难度。
+"""
+
+[generate]
+enabled = true                    # process 模式：过质量门记录按类分种子池扩充
+llms = ["default"]
+instruction = """
+你是中文输入法的真实用户。模仿示例请求的口吻与场景，生成全新的一句话中文请求：
+日常场景、口语化、诉求明确；只借鉴风格与题材范围，不得复述示例内容。
+"""
+num_per_record = 1                # 每种子扩 1 条；调用数 = ⌈类内种子数 × 1 / 4⌉
+num_per_call = 4
+seeds_per_call = 3
+temperature = 0.9                 # 生成需要多样性，不用默认 0
+
+[[generate.styles]]
+name = "concise"
+prompt = "请求应当简短直接，一句话说清诉求。"
+
+[[generate.styles]]
+name = "detailed"
+prompt = "请求应包含具体的背景与约束条件（时间、对象、格式要求等）。"
 
 [annotate]
 enabled = true
@@ -30,9 +98,15 @@ instruction = """
 主题（简短名词短语）与完成该请求的难度（easy / medium / hard）。
 """
 
+[verify]
+enabled = true                    # LLM-as-a-Judge 复核 (记录, 标注) 对
+llm = "judge"
+policy = "repair"                 # 不合格先回喂批评意见重标注，仍败再淘汰
+max_repair_rounds = 1
+
 [trace]
 enabled = true
-channels = ["quality", "schema"]
+channels = ["classify", "quality", "verify", "schema"]
 content = "refs"
 
 [output]

@@ -1,6 +1,0 @@
-{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.flight"}
-{"id": "1", "parent": "0", "class": "TextView", "text": "订单填写", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.flight"}
-{"id": "2", "parent": "0", "class": "TextView", "text": "MU5401 上海虹桥 → 成都双流", "bounds": [24, 80, 376, 116], "visible": true, "package": "com.example.flight"}
-{"id": "3", "parent": "0", "class": "TextView", "text": "乘机人 张伟", "bounds": [24, 130, 220, 162], "visible": true, "package": "com.example.flight"}
-{"id": "4", "parent": "0", "class": "TextView", "text": "票价 ¥760", "bounds": [24, 176, 180, 208], "visible": true, "package": "com.example.flight"}
-{"id": "5", "parent": "0", "class": "Button", "text": "提交订单", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.flight"}

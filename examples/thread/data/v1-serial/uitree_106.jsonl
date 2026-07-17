@@ -1,6 +1,0 @@
-{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.music"}
-{"id": "1", "parent": "0", "class": "TextView", "text": "搜索歌曲", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.music"}
-{"id": "2", "parent": "0", "class": "EditText", "text": "周杰伦", "bounds": [24, 70, 376, 118], "visible": true, "package": "com.example.music"}
-{"id": "3", "parent": "0", "class": "TextView", "text": "晴天 - 周杰伦", "bounds": [24, 140, 300, 176], "visible": true, "package": "com.example.music"}
-{"id": "4", "parent": "0", "class": "TextView", "text": "七里香 - 周杰伦", "bounds": [24, 188, 300, 224], "visible": true, "package": "com.example.music"}
-{"id": "5", "parent": "0", "class": "TextView", "text": "稻香 - 周杰伦", "bounds": [24, 236, 300, 272], "visible": true, "package": "com.example.music"}

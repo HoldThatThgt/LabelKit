@@ -1,6 +1,0 @@
-{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.flight"}
-{"id": "1", "parent": "0", "class": "TextView", "text": "出票成功", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.flight"}
-{"id": "2", "parent": "0", "class": "TextView", "text": "订单号 FL20260720066", "bounds": [24, 90, 330, 126], "visible": true, "package": "com.example.flight"}
-{"id": "3", "parent": "0", "class": "TextView", "text": "MU5401 7月20日 08:15 起飞", "bounds": [24, 140, 360, 172], "visible": true, "package": "com.example.flight"}
-{"id": "4", "parent": "0", "class": "Button", "text": "查看行程", "bounds": [24, 700, 190, 760], "visible": true, "package": "com.example.flight"}
-{"id": "5", "parent": "0", "class": "Button", "text": "返回首页", "bounds": [210, 700, 376, 760], "visible": true, "package": "com.example.flight"}

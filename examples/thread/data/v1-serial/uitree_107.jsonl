@@ -1,6 +1,0 @@
-{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.music"}
-{"id": "1", "parent": "0", "class": "TextView", "text": "正在播放", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.music"}
-{"id": "2", "parent": "0", "class": "TextView", "text": "晴天 - 周杰伦", "bounds": [24, 90, 300, 126], "visible": true, "package": "com.example.music"}
-{"id": "3", "parent": "0", "class": "TextView", "text": "00:42 / 04:29", "bounds": [24, 140, 220, 172], "visible": true, "package": "com.example.music"}
-{"id": "4", "parent": "0", "class": "Button", "text": "暂停", "bounds": [24, 700, 190, 760], "visible": true, "package": "com.example.music"}
-{"id": "5", "parent": "0", "class": "Button", "text": "下一首", "bounds": [210, 700, 376, 760], "visible": true, "package": "com.example.music"}

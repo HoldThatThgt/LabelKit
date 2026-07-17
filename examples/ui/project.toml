@@ -1,4 +1,10 @@
-# UI-modality E2E project (spec §5.2): pairing → dedup (pHash+tree) → pairwise quality → annotate → verify.
+# UI + 控件树模态 E2E 工程（spec §5.2）——截图 + UI 树文件对输入格式下能开的
+# 算子全开：配对接入 → dedup（pHash + 树 MinHash 合成判定）→ classify（屏幕
+# 类型封闭集分类，视觉调用）→ quality（pairwise QuRating + BT 拟合）→
+# annotate（多模态标注，按类指令）→ verify（LLM-as-a-Judge 评审 + 有界修复）。
+# generate 仅文本模态（无法生成截图），本工程不可用。
+# fixture：6 组屏幕数据藏了三个「机关」——3 号是 1 号的精确重复、5 号文件对
+# 跨子目录（sub/）、9 号是没有配图的孤儿树（按缺对跳过）。
 schema_version = 1
 
 [run]
@@ -10,14 +16,44 @@ seed = 42
 
 [dedup]
 enabled = true
-ui_dup_requires = "both"
+ui_dup_requires = "both"          # 树与图两级同时命中才判重（保守）
+
+[classify]
+enabled = true                    # 屏幕类型路由：类标签驱动按类标注指令
+llm = "default"                   # UI 模态分类走视觉（截图 + 树同入提示词）
+assignment = "single"
+fallback_class = "other"
+
+[[classify.classes]]
+name = "auth"
+description = "登录 / 注册 / 验证码等账号认证类屏幕"
+
+[[classify.classes]]
+name = "dialog"
+description = "弹窗 / 对话框类屏幕：确认、警告、提示等模态弹层"
+
+[[classify.classes]]
+name = "browse"
+description = "浏览 / 列表 / 首页类屏幕：信息流、推荐位、设置菜单等以浏览为主的页面"
+
+[[classify.classes]]
+name = "other"
+description = "不属于以上任何一类的屏幕"
 
 [quality]
 enabled = true
-mode = "pairwise"
+mode = "pairwise"                 # 批内 k 轮随机配对 → LLM 判胜负 → BT 拟合
 rounds = 2
 llm = "default"
-rubric = "default:ui"
+rubric = "default:ui"             # 无 threshold——只打分不筛（pairwise 分是批内相对量）
+
+# ── 按类覆盖：dialog 类屏幕的标注指令单独收紧 ──
+[class.dialog.annotate]
+instruction = """
+你是移动端 UI 理解标注员。这块屏幕已被判定为弹窗类：
+标注其功能类别、弹窗标题、可交互元素列表（务必包含全部按钮及其 bounds）
+与一句话描述（说明该弹窗要求用户做什么决定）。
+"""
 
 [annotate]
 enabled = true
@@ -35,7 +71,7 @@ max_repair_rounds = 1
 
 [trace]
 enabled = true
-channels = ["quality", "verify", "schema"]
+channels = ["classify", "quality", "verify", "schema"]
 content = "refs"
 
 [output]

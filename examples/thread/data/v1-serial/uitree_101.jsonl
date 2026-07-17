@@ -1,6 +1,0 @@
-{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.flight"}
-{"id": "1", "parent": "0", "class": "TextView", "text": "机票查询", "bounds": [24, 20, 200, 56], "visible": true, "package": "com.example.flight"}
-{"id": "2", "parent": "0", "class": "TextView", "text": "单程 · 7月20日", "bounds": [24, 70, 220, 98], "visible": true, "package": "com.example.flight"}
-{"id": "3", "parent": "0", "class": "EditText", "text": "上海", "bounds": [24, 110, 376, 158], "visible": true, "package": "com.example.flight"}
-{"id": "4", "parent": "0", "class": "EditText", "text": "成都", "bounds": [24, 170, 376, 218], "visible": true, "package": "com.example.flight"}
-{"id": "5", "parent": "0", "class": "Button", "text": "搜索航班", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.flight"}
