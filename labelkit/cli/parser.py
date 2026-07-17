@@ -65,6 +65,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("debug", "info", "warn", "error"),
         help="stderr log level (default: info)",
     )
+    run.add_argument(
+        "--console",
+        default=None,
+        choices=("auto", "rich", "plain"),
+        help="progress face: live panel / v1.9 plain lines (default: auto)",
+    )
 
     validate = sub.add_parser("validate", help="M1 full validation only (no run)")
     validate.add_argument("--config", required=True, help="path to config.toml")
@@ -73,6 +79,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--probe",
         action="store_true",
         help="also probe connectivity of every referenced profile",
+    )
+    validate.add_argument(
+        "--console",
+        default=None,
+        choices=("auto", "rich", "plain"),
+        help="progress face: live panel / v1.9 plain lines (default: auto)",
     )
 
     rubric = sub.add_parser("rubric", help="print / list the packaged default rubrics")
@@ -86,6 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _overrides_from_args(args: argparse.Namespace) -> CliOverrides:
+    """run-namespace → CliOverrides. The validate namespace lacks the run-only
+    fields, so `_cmd_validate` builds its CliOverrides(console=...) inline."""
     return CliOverrides(
         input=args.input,
         output=args.output,
@@ -93,4 +107,5 @@ def _overrides_from_args(args: argparse.Namespace) -> CliOverrides:
         dry_run=args.dry_run,
         strict=args.strict,
         log_level=args.log_level,
+        console=args.console,
     )

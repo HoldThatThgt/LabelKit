@@ -11,7 +11,9 @@ also listed in §12). Any deviation requires editing this file first.
 Ground rules for every implementer:
 
 - Python ≥ 3.11. Deps: `httpx`, `jsonschema`, `datasketch`, `Pillow`, `imagehash`, `json_repair`,
-  `numpy`, stdlib `tomllib`. Nothing else.
+  `numpy`, stdlib `tomllib`, and — v1.10 (U4, spec §2.6 whitelist revision) — `rich`, CLI-layer
+  only: lazily imported inside `labelkit/cli/console.py`, the sole touchpoint (operators/common
+  never import it; M1 probes importability via `find_spec` without importing). Nothing else.
 - Code identifiers, comments, docstrings-of-record: English. LLM prompt templates: the exact
   Chinese text given in §10 of this document (copied from the spec verbatim).
 - Do not rename any field, key, event, or error code defined here. Tests assert exact strings.
@@ -43,7 +45,8 @@ labelkit/
 │   ├── __init__.py                     # public exports: main, build_parser, exit_code_for
 │   ├── main.py                         # process entry, exception rendering, sole exit-code mapping
 │   ├── parser.py                       # argparse definitions and CliOverrides conversion
-│   └── commands.py                     # run / validate / rubric user-facing handlers
+│   ├── commands.py                     # run / validate / rubric user-facing handlers
+│   └── console.py                      # v1.10 ConsoleRenderer — the SOLE rich lazy-import touchpoint: Live canvas, snapshot rendering, cbreak keyboard, log-stream takeover/restore, degradation (§7.12)
 ├── common/
 │   ├── contracts/
 │   │   ├── types.py                    # Ch.4 shared data types and frame/tree helpers
@@ -57,7 +60,8 @@ labelkit/
 │   │   ├── llm_client.py               # M9 transport, retry/key pools, concurrency, usage
 │   │   └── schema_engine.py            # M8 L0-L3 guarantee, repair, schema validation/stats
 │   ├── observability/
-│   │   └── obslog.py                   # M12 logs, trace, events, metrics, breaker state
+│   │   ├── obslog.py                   # M12 logs, trace, events, metrics, breaker state
+│   │   └── console_format.py           # v1.10 plain progress/summary line formats (U21) — pure functions, the single source shared by the M11 emitter and the CLI renderer; byte-frozen to the v1.9 strings
 │   └── extensions/
 │       └── hooks.py                    # user validator resolution/execution/normalization
 ├── operators/
@@ -113,7 +117,11 @@ config under `tests/common/config/`, runtime under `tests/common/runtime/`, obse
 in `tests/common/runtime/test_llm_client.py`; stream-ingest coverage belongs in
 `tests/operators/test_ingest.py`; v1.9 M16 stitch coverage belongs in
 `tests/operators/test_stitch.py` (offline) and `tests/integration/test_stitch_llm.py`
-(real-LLM judgments). A separate compatibility-import test, `test_key_pool.py`, or
+(real-LLM judgments); v1.10 console coverage belongs in `tests/cli/test_console.py`
+(renderer snapshots, keyboard, degradation) and
+`tests/common/observability/test_console_format.py` (byte-frozen golden snapshots of the
+plain line formats — regression anchor layer ①, U24). A separate compatibility-import test,
+`test_key_pool.py`, or
 `test_stream_ingest.py` is forbidden. The exact file allowlist is normative in
 `docs/dev/SPEC-package-layer-reorganization.md` §6.1.
 
@@ -748,7 +756,32 @@ from typing import Literal, Mapping
 @dataclass(frozen=True)
 class ToolConfig:
     log_level: str = "info"                       # debug|info|warn|error; overridden by --log-level
-    log_format: Literal["text", "jsonl"] = "text" # jsonl disables the progress bar (spec §7.7)
+    log_format: Literal["text", "jsonl"] = "text" # jsonl forces console plain (spec §7.7)
+
+
+@dataclass(frozen=True)
+class ConsoleConfig:                              # v1.10 (spec 5.1 [console]): the three-mode
+                                                  # console/progress face (§7.7); tool-level —
+                                                  # deployment property, whole section optional
+    mode: Literal["auto", "rich", "plain"] = "auto"
+                                                  # overridden by CLI --console; auto decision
+                                                  # chain in §7.7 (U5/U25)
+    refresh_hz: int = 5                           # rich canvas repaint rate, 1–10 inclusive
+                                                  # (out of range = CONFIG_ERROR, spec 3.1.4)
+    heartbeat_s: int = 0                          # plain ∧ non-TTY only: one data-free summary
+                                                  # line every N s; 0 = off (default, U14 —
+                                                  # keeps the regression anchor); < 0 = CONFIG_ERROR
+    estimate: bool = False                        # text modality only: startup estimate scan
+                                                  # buys the batch-total denominator + ETA
+                                                  # (one extra input pass, U17)
+    interactive: bool = True                      # rich ∧ stdin TTY ∧ termios: keyboard toggles
+                                                  # (closed key set ? l e + - p q; h=?, §7.7);
+                                                  # false = render-only (U15)
+    mode_resolved: Literal["rich", "plain"] = "plain"
+                                                  # parse PRODUCT — computed by the loader at
+                                                  # load() end (spec 3.1.4 console row, U21):
+                                                  # the frozen auto-chain verdict the emitter
+                                                  # static-gates on
 
 
 @dataclass(frozen=True)
@@ -1174,11 +1207,16 @@ class CliOverrides:
     dry_run: bool = False
     strict: bool = False
     log_level: str | None = None
+    console: str | None = None                    # v1.10: --console auto|rich|plain (spec §7.7;
+                                                  # argparse choices pre-validate the value)
 
 
 @dataclass(frozen=True)
 class ResolvedConfig:
     tool: ToolConfig
+    console: ConsoleConfig                        # v1.10 (spec 5.1 [console]) — required, no
+                                                  # default (R23 convention); mode_resolved
+                                                  # frozen by M1 at load() end (3.1.4, U21)
     llm_profiles: Mapping[str, LLMProfile]        # key = profile name
     embedding_profiles: Mapping[str, EmbeddingProfile]
     run: RunConfig
@@ -1224,7 +1262,9 @@ CLI overrides; parse `output.schema_inline`/`schema_path` into `user_schema`; re
 *referenced* profile's declared key env vars (`api_key_env`, or each element of
 `api_key_envs`) into `LLMProfile.api_keys`, mirroring element 0 into `api_key` (v1.6
 normalization, §6.3 rule 12); `tool.log_level` overridden by
-`--log-level`. Precedence: CLI > project.toml > config.toml/built-in defaults.
+`--log-level`; v1.10: `console.mode` overridden by `--console` (spec §7.7 — the merged mode
+then feeds the auto chain M1 freezes into `console.mode_resolved` at load() end, §6.3
+rule 42). Precedence: CLI > project.toml > config.toml/built-in defaults.
 v1.7: statically merge every `[class.<name>.*]` override family into the frozen
 `class_views` mapping (per-key provenance; selection-group and rubric re-parse semantics of
 §6.3 rules 26–27) and back-fill `classify.max_labels` to `len(classes)` when absent. The
@@ -1427,6 +1467,22 @@ Stitch (v1.9, spec §5.2 [stitch] rows + spec 2.3.1; T17):
     that excludes `[class.<name>.segment]`, rule 35); it is outside rule 25's section list,
     so any such table falls to the whitelist CONFIG_ERROR.
 
+Console (v1.10, spec §5.1 `[console]` rows + 3.1.4 console row; `[console]` is a tool-level
+table, whole section optional — a KNOWN top-level table (never rule 1's unknown-KEY warning
+target itself, though unknown keys INSIDE it stay rule-1 forward-compat warnings); checked
+regardless of any switch — the rule-32/38 "checked regardless" family):
+42. `console.mode` ∈ {"auto", "rich", "plain"}; `console.refresh_hz` ∈ [1, 10] (out of range →
+    CONFIG_ERROR); `console.heartbeat_s ≥ 0` (< 0 → CONFIG_ERROR); `console.estimate` /
+    `console.interactive` are bool — all aggregated with every other error, never first-raise.
+    Parse PRODUCT: at load() END (after CLI precedence — `--console` overrides `console.mode`,
+    argparse choices pre-validate) M1 freezes the spec §7.7 auto decision chain
+    (stderr `isatty()` ∧ `tool.log_format == "text"` ∧ TERM not "dumb"/empty ∧ rich importable
+    — probed via `importlib.util.find_spec("rich")` ONLY, never a real import (lazy import
+    stays a CLI-layer concern); NO_COLOR does NOT participate, U25) into
+    `ConsoleConfig.mode_resolved` ∈ {"rich", "plain"} (spec 3.1.4 console row, U21). Explicit
+    `--console rich`/`mode = "rich"` is honored even without a TTY (CI ANSI-recording
+    scenario) — only jsonl (below) or rich unimportability demotes it to plain.
+
 Warnings (non-blocking): `verify` enabled and `verify.llm`'s `model` equals `annotate.llm`'s
 `model` → warn about self-enhancement bias (spec 3.7.2). v1.7 (R8): `classify.enabled = false`
 while `[[classify.classes]]` and/or `[class.*]` tables are present → ONE warning naming the
@@ -1453,6 +1509,11 @@ own `enabled` switch while `stitch.enabled = false` AND `segment.enabled = true`
 no-op warning (the `sequence_frames` precedent — the v1.8 parked-tables warning lives in the
 segment-OFF branch and cannot fire here; under segment off the table joins that parked list
 instead, see above).
+v1.10 addition (spec 3.1.4 console row — independent of the R8 family): `tool.log_format =
+"jsonl"` ∧ explicit rich (CLI `--console rich` OR the `[console].mode` key literally present
+in config.toml with value `"rich"` — the dataclass default "auto" never counts as intent) →
+ONE WARN + forced plain (`mode_resolved = "plain"`), NEVER a CONFIG_ERROR (§7.7 iron rule:
+every stderr line stays `json.loads`-able; the WARN fires on the `validate` path too, U27).
 
 ---
 
@@ -2149,6 +2210,35 @@ class ProbeResult:
                                                    # profiles; None on single-key profiles
 
 
+@dataclass(frozen=True)
+class KeySnapshot:                                 # v1.10 (spec 3.9.2): console-panel key row
+    env: str                                       # env-var NAME — the only displayable identity
+                                                   # (key VALUES never surface anywhere, spec 7.4)
+    state: Literal["ok", "cooldown", "disabled"]
+    cooldown_remaining_s: int = 0                  # ceil seconds left; 0 unless state="cooldown"
+    calls: int = 0                                 # per-key KeyUsage mirror — the panel's 'l'
+    rate_limited: int = 0                          # expanded view (§7.7); 0 when unmaterialized
+
+
+@dataclass(frozen=True)
+class ProfileSnapshot:                             # v1.10 (spec 3.9.2): one console LLM-block row
+    name: str
+    kind: Literal["llm", "embedding"]              # _usage buckets by NAME (existing quirk) —
+                                                   # kind disambiguates the snapshot identity
+    in_flight: int                                 # Σ _KeyState.in_flight — on-the-wire HTTP
+                                                   # requests, excludes parked/backing-off calls
+    max_concurrency: int
+    calls: int
+    retries: int
+    prompt_tokens: int
+    completion_tokens: int
+    est_cost_usd: float | None                     # None when prices unconfigured (panel "—")
+    p50_latency_ms: int | None                     # bounded-window (deque 256) median, successful
+                                                   # calls only (spec 3.9.3 快照行); None when empty
+    keys: tuple[KeySnapshot, ...]                  # 1-element for pools of 1; built from
+                                                   # _pool_members WITHOUT materializing _pools
+
+
 class LLMClient:
     def __init__(self, llm_profiles: Mapping[str, LLMProfile],
                  embedding_profiles: Mapping[str, EmbeddingProfile],
@@ -2182,6 +2272,26 @@ class LLMClient:
 
     @property
     def usage_by_profile(self) -> dict[str, ProfileUsage]: ...
+
+    def snapshot(self, now: float | None = None) -> tuple[ProfileSnapshot, ...]:
+        """v1.10 (spec 3.9.2 / 3.9.3 快照行): the console panel's read-only pull
+        face (§7.7, one call per render tick, U19/U26). Pure read — no await, no
+        lock, and NEVER mutates state (in particular it does not materialize
+        self._pools); called from the render tick only (event-loop thread), so
+        there is no cross-thread contention under U26. Enumerates ALL [llm.*]
+        profiles, then [embedding.*] profiles, in declaration order. Per profile:
+        usage mirrored from self._usage (zero values when absent — the by-NAME
+        bucket quirk is disambiguated by kind); key states from the materialized
+        pool (disabled → cooldown with ceil remaining seconds → ok), or zero-value
+        "ok" KeySnapshots derived from the declared env names when the pool is
+        unmaterialized; in_flight = Σ key in_flight (0 when unmaterialized); p50
+        latency = the bounded window's median (None when empty). `now` is
+        injectable for offline tests (_KeyPool style); defaults to
+        time.monotonic(). p50 feed: _post_with_retries appends latency_ms to a
+        per-(kind, name) deque right before the success return — successful
+        logical calls only, the ONLY v1.10 collection point.
+        [FROZEN HERE: p50 window = deque(maxlen=256); never enters report.json
+        or any event]"""
 ```
 
 Provider adaptation (normative, 3.9.3): `openai_compatible` POST `{base_url}/chat/completions`;
@@ -2383,7 +2493,8 @@ v1.9 stitch orchestration (spec 3.10.3 v1.9 rows; active only when `stitch.enabl
   the m-11 off-mode byte-equivalence condition; same R20 form, §8.1); the per-batch
   `threads` value is the batch-local `episodes − stitched` delta. The stderr
   progress/summary line still gains NO new keys (stitched is deliberately not displayed —
-  R20 culture).
+  R20 culture; v1.10 U18 bounded revision: this fixed-key-set constraint narrows to the
+  PLAIN face — the rich panel's status account displays stitched/threads, spec §7.7).
 - **Dry-run (T16 estimate, S22 culture).** `_estimate` gains
   `stitch_calls = len(session_lens) × stitch.votes × (2 if stitch.repass else 1)` — one
   judgment per episode candidate over the episodes ≈ sessions lower-bound base, × votes
@@ -2392,6 +2503,33 @@ v1.9 stitch orchestration (spec 3.10.3 v1.9 rows; active only when `stitch.enabl
   repass is on; 0 when disabled and the `stitch_calls=` field prints UNCONDITIONALLY on the
   estimate line (the v1.8 segment_calls precedent — the sole observable difference of a
   stitch-off run vs v1.8, m-11).
+
+v1.10 console bypass (spec 3.10.3 console 旁路 row; ALL of it is a no-op when the
+MetricsSink carries no listener — byte-identical to v1.9):
+
+- **Stage signal (U11/U19).** In the batch chain loop, BEFORE every `stage.run()` M10 calls
+  `metrics.stage_begin(stage.name, batch_no)` — a listener-bypass forward ONLY: it produces
+  NO TraceEvent, never enters the §8.1 catalog, and is invisible to trace.channels.
+  `_request_stop` additionally calls `metrics.stop_requested()` (the graceful-interrupt
+  banner path, forwarded to `on_stop_requested`).
+- **Estimate export (U20).** The static estimate formula is exported as the PURE function
+  `estimate_run(cfg: ResolvedConfig, plan: IngestPlan | None) -> dict` (module level,
+  `labelkit/orchestration/orchestrator.py`); `_estimate()` becomes a thin wrapper. It is
+  shared by dry-run AND the renderer's RUN-LEVEL stage-board denominators (the `*_calls`
+  keys of the one `run_estimate` emission, displayed as「估算」— U20 explicitly rejected
+  per-batch recomputation).
+- **Live estimate emission (U17).** After `run.start`, the live path sends the estimate via
+  `metrics.run_estimate(...)` off the P2-4 rehearsal scan — process mode REUSES that single
+  scan: UI modality flips it to `scan(estimate=True)` (the pairing table makes the totals
+  free, zero extra I/O; stream batch count = exact next-fit simulation); text modality runs
+  the line-count estimate ONLY when `console.estimate = true` (one extra input pass the user
+  explicitly buys — otherwise no `on_estimate` is emitted and the panel shows `批 i` with no
+  denominator). NEVER scan twice. generate_only uses the 3.6.2 static call-count formula, no
+  scan.
+- **Dry-run presentation (U13).** Under `mode_resolved == "rich"` the dry-run estimate print
+  lines yield to the renderer's table (values identical item by item); the plain-mode line
+  output is the byte-for-byte regression anchor (U24 layer ②) — including the v1.8/v1.9
+  unconditionally printed `segment_calls`/`stitch_calls` lines, whose meaning is unchanged.
 
 ### 7.10 M11 — `labelkit/operators/emitter.py`
 
@@ -2417,14 +2555,24 @@ class Emitter:                                     # signatures [FROZEN HERE]
         pass the user schema): engine.validate_only(user_object) — non-empty violations =
         internal bug → the item is
         diverted to rejects with kind='internal_error' (fail loudly, run continues). Appends +
-        flush(). Updates stderr progress (TTY progress line; non-TTY: nothing — batch.end info
-        line comes from M12/M10)."""
+        flush(). Updates stderr progress (TTY \r progress line; non-TTY: nothing — batch.end
+        info line comes from M12/M10). v1.10 让位 (U21): the progress line is rendered by
+        console_format.format_progress_line (the common-layer single source shared with the
+        CLI renderer — byte-identical to the v1.9 hardcoded string, the plain byte-anchor)
+        and _progress is STATICALLY gated on cfg.console.mode_resolved: "rich" → return
+        immediately (the CLI panel owns the display; mid-run degradation and `q` detach are
+        the RENDERER's job — it keeps printing plain lines from the same console_format)."""
 
     def finalize(self, report: Mapping, deliver: bool = True) -> None:
         """fsync + atomic os.rename {output}.part → {output} (and sidecar) when deliver=True;
         always writes {output_stem}.report.json (cfg.dry_run diverts to {output_stem}.dryrun.report.json,
         v1.5 P2-4); prints the final stderr summary table matching
-        report['counts']. deliver=False is used by dry-run only (no .part was opened);
+        report['counts'] — v1.10 让位 (U21): the text lines come from
+        console_format.format_summary_lines (plain byte-anchor, golden-snapshot frozen) and
+        _print_summary is STATICALLY gated on cfg.console.mode_resolved: "rich" → return
+        immediately, the text summary is superseded by the CLI panel's final frozen table
+        (same numbers, same report['counts'] source — §7.7 rich 档).
+        deliver=False is used by dry-run only (no .part was opened);
         v1.6: a circuit-break finalize passes deliver=True — completed batches are renamed
         and delivered, the report marking run.partial_delivery=true (spec 3.10.3 熔断交付).
         Report write failure → CLI exit 1 (raise LabelKitError('report write failed')).
@@ -2494,6 +2642,51 @@ class TraceEvent:
     payload: Mapping               # per-event fields (§8.1), redacted per trace.content (§8.3)
 
 
+class ProgressListener(Protocol):
+    """v1.10 (spec 3.12.3 / §7.7, U19) — 进程内进度旁路: the console panel's ONLY
+    data path. Protocol owned by common (here); implementation owned by the CLI
+    layer (labelkit/cli/console.py lazy shell, §7.12). Four disciplines
+    (spec 3.12.3): ① the bypass is NOT a trace face — no callback produces a
+    TraceEvent or passes trace.channels filtering (the sufficient condition for
+    zero §8.1 catalog changes); on_event payloads are PRE-REDACTED via
+    redact_payload(payload, "none") before forwarding (U22 — no LLM free text,
+    no input content; the U6 red line becomes a mechanism; record_ids stay,
+    structural); ② every callback must be O(1), no I/O, no lock waits —
+    repainting is driven by the implementer's own throttled tick; ③ sink-side
+    guard (U23): every MetricsSink forward is wrapped in try/except Exception —
+    the first exception logs ONE WARN and sets the listener to None for the rest
+    of the run (the EventLog write-failure "warn once + close channel"
+    discipline, 3.12.4); a listener bug never enters the record-/batch-level
+    failure paths; ④ listener=None (validate / every pre-existing call path) is
+    byte-identical to v1.9."""
+
+    def on_run_context(self, cfg: ResolvedConfig,
+                       snapshot: "Callable[[], tuple[ProfileSnapshot, ...]]",
+                       counters: "Callable[[], Mapping[str, int]]",
+                       fatal_streak: "Callable[[], int]") -> None:
+        """Called ONCE by execute_run after assembly, before asyncio.run (U19):
+        snapshot = LLMClient.snapshot (§7.8); counters / fatal_streak =
+        MetricsSink read-only closures. The lazy-shell renderer (CLI has no cfg
+        before load) activates here."""
+
+    def on_estimate(self, est: Mapping) -> None:
+        """The estimate_run() static estimate, forwarded via
+        MetricsSink.run_estimate after M10's rehearsal scan (§7.9); NOT emitted
+        for text modality unless console.estimate (U17)."""
+
+    def on_event(self, ev: TraceEvent) -> None:
+        """MetricsSink.event() bypass forward; payload already pre-redacted at
+        tier "none" (U22)."""
+
+    def on_stage(self, stage: str, batch_no: int) -> None:
+        """M10 chain loop via MetricsSink.stage_begin — once before every
+        stage.run() (U11)."""
+
+    def on_stop_requested(self) -> None:
+        """SIGINT/SIGTERM via MetricsSink.stop_requested (graceful-interrupt
+        banner, §7.9)."""
+
+
 class EventLog:
     def __init__(self, cfg: TraceConfig, run_id: str): ...       # [FROZEN HERE]
     def emit(self, ev: TraceEvent) -> None:
@@ -2512,14 +2705,43 @@ class EventLog:
 
 
 class MetricsSink:
-    """Holds the EventLog + run counters. All stages emit through RunContext.metrics."""
-    def __init__(self, cfg: ResolvedConfig, run_id: str, event_log: EventLog): ...
+    """Holds the EventLog + run counters. All stages emit through RunContext.metrics.
+    v1.10 (spec 3.12.3, U19/U22/U23): optionally carries a ProgressListener — the console
+    panel's in-process bypass. Forwarding produces NO TraceEvent (§8.1 catalog untouched);
+    on_event payloads are pre-redacted at tier "none"; every forward is exception-guarded
+    (first failure warns once and permanently disables the bypass); listener=None is
+    byte-identical to v1.9."""
+    def __init__(self, cfg: ResolvedConfig, run_id: str, event_log: EventLog,
+                 listener: ProgressListener | None = None): ...
+        # v1.10: trailing optional param ONLY — every pre-existing construction site is valid
 
     def event(self, ev: str, *, stage: str, batch_no: int,
               record_ids: tuple[str, ...] = (), payload: Mapping | None = None) -> None:
         """Builds the TraceEvent (ts=now local ISO8601 ms, run_id) and forwards to EventLog;
-        also mirrors to the stderr logger at the §8.1 level when one is defined. [FROZEN HERE]"""
+        also mirrors to the stderr logger at the §8.1 level when one is defined. [FROZEN HERE]
+        v1.10: additionally forwards to the ProgressListener bypass — with a SECOND TraceEvent
+        whose payload is pre-redacted at tier "none" (U22); the event handed to EventLog stays
+        unredacted (EventLog applies its own trace.content tier at write time)."""
 
+    def stage_begin(self, stage: str, batch_no: int) -> None
+        # v1.10 forward-only (spec 3.12.3, U11/U19): M10 calls this before every stage.run();
+        # forwards on_stage — produces NO TraceEvent, never enters the §8.1 catalog. No-op
+        # when listener is None.
+    def run_estimate(self, est: Mapping) -> None
+        # v1.10 forward-only (spec 3.12.3, U19/U20): forwards the estimate_run() static
+        # estimate to on_estimate. No-op when listener is None.
+    def stop_requested(self) -> None
+        # v1.10 forward-only (spec 3.12.3, U19): graceful-stop signal → on_stop_requested
+        # (中断横幅, §7.9). No-op when listener is None.
+    @property
+    def fatal_streak(self) -> int: ...                 # v1.10 (spec 3.12.3, U19): read-only
+                                                       # breaker-streak view — the console
+                                                       # panel's 熔断行 data source (§7.7)
+    @property
+    def has_listener(self) -> bool: ...                # v1.10 (spec 3.12.3, U13): read-only
+                                                       # bypass-attachment probe — M10's dry-run
+                                                       # rich-yield gate reads it; flips False
+                                                       # permanently after the U23 forward trip
     def count(self, key: str, n: int = 1) -> None      # counter keys listed in §9.3
     def add_stage_time(self, stage: str, seconds: float) -> None
     def record_provider_result(self, fatal: bool, *, hard: bool = False) -> None
@@ -2578,8 +2800,9 @@ follow their `stage` field — again zero routing changes).
 ```
 labelkit run      --config <config.toml> --project <project.toml>
                   [--input PATH] [--output PATH] [--limit N] [--dry-run] [--strict]
-                  [--log-level debug|info|warn|error]
+                  [--log-level debug|info|warn|error] [--console auto|rich|plain]
 labelkit validate --config <config.toml> --project <project.toml> [--probe]
+                  [--console auto|rich|plain]
 labelkit rubric   [--show default:text|default:ui|default:trajectory]
 ```
 
@@ -2594,25 +2817,46 @@ exception rendering, and the sole exception-to-exit-code mapping; `labelkit/cli/
 preserves the established public imports and `labelkit.cli:main` console-script target.
 
 Wiring order for `run`: CLI parses arguments and calls
-`labelkit.orchestration.runtime.execute_run`; that orchestration runtime owns
+`labelkit.orchestration.runtime.execute_run` — v1.10 signature (trailing param only, U19):
+`execute_run(config_path, project_path, overrides, listener: ProgressListener | None = None)
+-> int`; `labelkit/cli/commands.py` constructs the LAZY-SHELL `ConsoleRenderer`
+(`labelkit/cli/console.py` — the SOLE rich import point in the codebase, imported lazily at
+activation; operators/common keep zero rich touchpoints, M1 probes importability via
+find_spec only, §6.3 rule 42) and passes it as `listener`. That orchestration runtime owns
 `labelkit.common.config.load()` →
 `setup_logging` → `run_id = secrets.token_hex(6)`,
-`run_started_at = datetime.now().astimezone()` → `EventLog` + `MetricsSink` → `LLMClient` →
+`run_started_at = datetime.now().astimezone()` → `EventLog` + `MetricsSink` (v1.10: the
+listener rides its trailing param, §7.11 — the Orchestrator constructor stays frozen,
+untouched) → `LLMClient` →
 `SchemaEngine` → `labelkit.orchestration.factory.build_stages()` → `Ingestor` (process mode) →
-`Emitter` → `Orchestrator` → `asyncio.run(orch.run())`. The factory owns operator instantiation,
+`Emitter` → `Orchestrator` → v1.10: `listener.on_run_context(cfg, snapshot, counters,
+fatal_streak)` once — `LLMClient.snapshot` plus the MetricsSink read-only closures — after
+assembly and before
+`asyncio.run` (U19 — the lazy shell activates here) → `asyncio.run(orch.run())`. The factory
+owns operator instantiation,
 including `DedupIndex`, and the frozen stage order; CLI never imports or constructs those objects.
+Renderer construction or rendering failure self-swallows, warns once, and degrades to plain —
+it NEVER alters exit codes or data output (U7; the sink-side U23 guard is §7.11's).
 `labelkit/cli/main.py` then maps the unchanged outcomes: `ConfigError`→2, `InputError`→3, fatal
 (`RunSummary.exit_code==4` / unwritable output / auth failure)→4, `--strict` and rejects>0 → 1
 (already folded into `RunSummary.exit_code` by M10, §7.9), report write failure → 1, else 0.
 
-`validate`: the command handler calls `labelkit.orchestration.runtime.validate_project`; with
+`validate`: the command handler calls `labelkit.orchestration.runtime.validate_project` —
+v1.10 signature (trailing param only, U27): `validate_project(config_path, project_path,
+overrides: CliOverrides = CliOverrides()) -> ResolvedConfig`; `_cmd_validate` passes its
+parsed overrides through, so `--console` reaches M1 and the jsonl × explicit-rich WARN
+(§6.3 Warnings) fires on the validate path too. With
 `--probe`, it calls `probe_referenced_profiles`, which uses
 `labelkit.orchestration.profile_usage.referenced_profiles` and `LLMClient.probe_all` on every
 referenced profile (v1.6 — one line per key for pooled profiles; single-key output format
-unchanged). Any probe failure does not change the exit code unless config itself is invalid
+unchanged); v1.10 (U13/U27): under `mode_resolved == "rich"` the probe result table is
+rendered as a table ONLY when stdout is a TTY — script consumers keep the current line
+format (stdout channel duty unchanged). Any probe failure does not change the exit code
+unless config itself is invalid
 **[FROZEN HERE]**. `rubric`: `labelkit/cli/commands.py` lists available names when no flag is
 given; `--show <name>` prints the packaged TOML verbatim (`_RUBRIC_FILES` / argparse choices
-include `default:trajectory` → `default_trajectory.toml`, v1.8).
+include `default:trajectory` → `default_trajectory.toml`, v1.8); v1.10: `rubric` stays plain
+ALWAYS — its stdout is machine-consumed and never touched by console.mode (U13).
 
 v1.8: `labelkit.orchestration.factory.build_stages` constructs `SegmentStage` and `ExtractStage`
 per their switches at their `_CHAIN_ORDER` slots (§7.9).
@@ -3181,10 +3425,16 @@ API keys appear at no tier, in no channel.
 {"ts":"...","level":"info","stage":"quality","batch":3,"msg":"..."}
 ```
 
-stderr NEVER contains data content, prompts, or API keys. `log_format="jsonl"` disables the
-progress bar (every stderr line must be `json.loads`-able). Progress display (TTY bar / non-TTY
-per-batch summary) is not logging: written directly to stderr by M11/M12 without the logging
-module.
+stderr NEVER contains data content, prompts, or API keys. `log_format="jsonl"` forces console
+plain (every stderr line must be `json.loads`-able; explicit rich — CLI `--console rich` or
+config `console.mode="rich"` — is refused with one M1 WARN, §6.3 Warnings). Progress display
+is the v1.10 three-mode console (spec §7.7), not logging: plain is written directly to stderr
+by M11 (TTY `\r` progress line + final text summary, formats owned by
+`labelkit/common/observability/console_format.py`; non-TTY per-batch line = the `batch.end`
+INFO mirror from M12); rich is rendered by the CLI-layer ConsoleRenderer
+(`labelkit/cli/console.py`, §7.12) fed by the M12 ProgressListener bypass (§7.11) +
+`LLMClient.snapshot()` (§7.8). No console mode passes through the logging module, emits
+TraceEvents, or adds report.json keys.
 
 ---
 
@@ -4434,5 +4684,29 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       `wrong_stitch` system bullet; `stitch_schema()` exact JSON in §10.7;
     - the new module section is numbered §7.16 AFTER the pre-existing §7.15 and the new
       template section §10.11 after §10.10 (same anchor-stability rationale as v1.7/v1.8).
+30. v1.10 console panel (feature spec `docs/dev/SPEC-tui-console.md`, rulings U1–U27;
+    2026-07-17). Key frozen points:
+    - `ConsoleConfig` field ORDER and defaults (§6.1): `mode="auto"`, `refresh_hz=5`,
+      `heartbeat_s=0`, `estimate=false`, `interactive=true`, plus the parse-PRODUCT sixth
+      field `mode_resolved` (dataclass default `"plain"`; overwritten with the frozen
+      auto-chain verdict by M1 at load() end — never a user key, §6.3 rule 42);
+    - the `ProgressListener` FIVE-callback name set (§7.11): `on_run_context` /
+      `on_estimate` / `on_event` / `on_stage` / `on_stop_requested` — with the U22
+      none-tier pre-redaction of `on_event` payloads and the U23 sink guard (first listener
+      exception → ONE WARN, listener permanently set to None);
+    - the p50 latency window = `deque(maxlen=256)` per (kind, profile), successful logical
+      calls only, fed at the single `_post_with_retries` success point; the window and its
+      median never enter report.json or any event (§7.8);
+    - the plain heartbeat line's fixed key set `heartbeat batch= stage= llm_calls= elapsed=`
+      (spec §7.7; plain ∧ non-TTY ∧ `heartbeat_s > 0` only — default 0 = off, U14, keeping
+      the regression anchor);
+    - the plain progress-line and text final-summary formats are OWNED by
+      `labelkit/common/observability/console_format.py` (`format_progress_line` /
+      `format_summary_lines`) — byte-frozen to the v1.9 hardcoded strings by golden
+      snapshots (regression anchor layer ①, U24); the M11 emitter and the CLI
+      ConsoleRenderer both import from there (U21), so the mid-run rich → plain handover
+      stays byte-identical;
+    - the keyboard CLOSED key set `? h l e + - p q` (`h` = `?` synonym; unlisted keys
+      ignored; Ctrl-C is never consumed by the panel — cbreak keeps ISIG, U15/spec §7.7).
 
 — End of contract. —

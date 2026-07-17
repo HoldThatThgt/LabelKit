@@ -28,7 +28,14 @@ writes (M11 owns the output channels). Responsibilities:
   written, ``.part`` NOT renamed) and SIGINT/SIGTERM graceful interruption;
 - ``--limit`` truncation and ``--dry-run`` (M1/M2 + static call/cost estimate
   on stderr, no LLM calls, no main output/rejects — report and, when
-  ``trace.enabled``, the trace channel only).
+  ``trace.enabled``, the trace channel only);
+- v1.10 console bypass (spec 3.10.3 console row, SPEC-tui-console U11/U13/U17/
+  U19/U20): ``estimate_run(cfg, plan)`` exported as a module-level pure
+  function (dry-run and the renderer's batch denominators share it), the live
+  ``metrics.run_estimate`` emission reusing the P2-4 pre-scan (NEVER a second
+  scan), ``metrics.stage_begin`` before every stage.run, ``stop_requested``
+  forwarding, and the rich-mode dry-run print yield. All of it is a no-op
+  when no ProgressListener is attached (byte-identical to v1.9).
 """
 from __future__ import annotations
 
@@ -55,7 +62,7 @@ if TYPE_CHECKING:
     from labelkit.common.runtime.llm_client import LLMClient
     from labelkit.common.runtime.schema_engine import SchemaEngine
     from labelkit.operators.emitter import Emitter
-    from labelkit.operators.ingest import Ingestor
+    from labelkit.operators.ingest import IngestPlan, Ingestor
 
 # Event names — exact strings per CONTRACTS.md §7.11/§8.1 (mirrors the
 # ``labelkit.common.observability.obslog`` constants; literals here avoid a
@@ -131,6 +138,134 @@ def _pack_next_fit(session_lens: Sequence[int],
     return frames, pieces
 
 
+def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
+    """Static record / LLM-call estimate — v1.10 (U20): the former
+    ``Orchestrator._estimate`` body exported as a MODULE-LEVEL PURE FUNCTION
+    over (cfg, plan), shared by dry-run, the live ``metrics.run_estimate``
+    emission and the renderer's per-batch denominators. ``plan`` is the M2
+    scan result (``IngestPlan``); generate_only passes None (the 3.6.2
+    call-count formulas are static, no scan). Key names are frozen.
+
+    generate_only follows the 3.6.2 call-count formulas; process mode uses
+    the plan's scan estimate. All estimates assume no drops (upper bound) and
+    exclude retries/repairs.
+    v1.7 R11: classify_calls = ingested × max(1, sc) in process mode
+    (re-flow sub-batches inherit their classification and skip M13),
+    <generated records> × max(1, sc) in generate_only.
+    v1.8 S22 (stream mode): the session table comes from
+    ``plan.session_lens``; ``segment_calls = Σ ceil((L−1)/(window−1))``
+    over sessions of length L ≥ 2 (L = 1 or strategy="rules" counts 0);
+    ``extract_calls = Σ (L−1)`` (extract enabled; UPPER bound); the
+    classify/quality/annotate/verify record base is ``len(session_lens)``
+    (episodes ≈ sessions, LOWER bound — stderr note in _run_dry); the batch
+    count comes EXACTLY from a next-fit packing simulation of the session
+    sizes, and the pairwise-quality per-batch pool sizes are the packed
+    sessions per batch. The non-stream branch is unchanged."""
+    g = cfg.generate
+    if cfg.run.mode == "generate_only":
+        n_ingested = 0
+        if g.seed_examples:
+            gen_calls = _ceil_div(len(g.seed_examples) * g.num_per_record, g.num_per_call)
+        else:
+            gen_calls = _ceil_div(g.standalone_count or 0, g.num_per_call)
+        if cfg.limit is not None:
+            gen_calls = min(gen_calls, _ceil_div(cfg.limit, g.num_per_call))
+        gen_records = gen_calls * g.num_per_call
+        if cfg.limit is not None:
+            gen_records = min(gen_records, cfg.limit)
+    else:
+        assert plan is not None, "process-mode estimate requires an IngestPlan"
+        n_ingested = plan.estimated_records
+        if cfg.limit is not None:
+            n_ingested = min(n_ingested, cfg.limit)
+        if g.enabled:
+            gen_calls = _ceil_div(n_ingested * g.num_per_record, g.num_per_call)
+            gen_records = gen_calls * g.num_per_call
+        else:
+            gen_calls = gen_records = 0
+
+    total_records = n_ingested + gen_records
+    bs = cfg.run.batch_size
+    sizes = [bs] * (total_records // bs)
+    if total_records % bs:
+        sizes.append(total_records % bs)
+
+    # v1.8 stream mode (segment × generate_only is M1-forbidden, so plan is
+    # always the process-mode scan here): sessions → exact batches,
+    # episodes ≈ sessions as the downstream record base.
+    segment_calls = 0
+    stitch_calls = 0
+    extract_calls = 0
+    stream = cfg.segment.enabled and cfg.run.mode == "process"
+    if stream:
+        session_lens = tuple(getattr(plan, "session_lens", ()) or ())
+        frame_sizes, piece_sizes = _pack_next_fit(session_lens, bs)
+        n_batches = len(frame_sizes)
+        sizes = piece_sizes                        # pairwise pools are episodes
+        downstream_base = len(session_lens)
+        if cfg.segment.strategy in ("llm", "hybrid"):
+            w = cfg.segment.window
+            segment_calls = sum(_ceil_div(length - 1, w - 1)
+                                for length in session_lens if length >= 2)
+        if cfg.stitch.enabled:
+            # v1.9 (T16 estimate, S22 culture): one judgment per episode
+            # candidate over the episodes ≈ sessions lower-bound base,
+            # × votes samples, doubled when the repass is on.
+            stitch_calls = (len(session_lens) * cfg.stitch.votes
+                            * (2 if cfg.stitch.repass else 1))
+        if cfg.extract.enabled:
+            extract_calls = sum(length - 1 for length in session_lens)
+    else:
+        n_batches = len(sizes)
+        downstream_base = total_records
+
+    classify_calls = 0
+    if cfg.classify.enabled:
+        sc_c = cfg.classify.self_consistency
+        if cfg.run.mode == "generate_only":
+            base = gen_records
+        else:
+            base = downstream_base if stream else n_ingested
+        classify_calls = base * max(1, sc_c)
+
+    quality_calls = 0
+    if cfg.quality.enabled:
+        n_criteria = len(cfg.rubric.criteria)
+        if cfg.quality.mode == "pairwise":
+            judges = max(1, len(cfg.quality.judges))
+            orders = 2 if cfg.quality.both_orders else 1
+            per_call = n_criteria if cfg.quality.criteria_per_call == "single" else 1
+            quality_calls = (sum(cfg.quality.rounds * (b // 2) for b in sizes)
+                             * per_call * judges * orders)
+        else:
+            quality_calls = downstream_base * n_criteria
+
+    annotate_calls = 0
+    if cfg.annotate.enabled:
+        sc = cfg.annotate.self_consistency
+        annotate_calls = downstream_base * (sc if sc >= 3 else 1)
+
+    verify_calls = 0
+    if cfg.verify.enabled:
+        verify_calls = downstream_base * max(1, len(cfg.verify.judges))
+
+    return {
+        "records": total_records,
+        "batches": n_batches,
+        "generate_calls": gen_calls,
+        "segment_calls": segment_calls,
+        "stitch_calls": stitch_calls,
+        "classify_calls": classify_calls,
+        "extract_calls": extract_calls,
+        "quality_calls": quality_calls,
+        "annotate_calls": annotate_calls,
+        "verify_calls": verify_calls,
+        "total_calls": (gen_calls + segment_calls + stitch_calls
+                        + classify_calls + extract_calls + quality_calls
+                        + annotate_calls + verify_calls),
+    }
+
+
 @dataclass(frozen=True)                            # [FROZEN in CONTRACTS.md §7.9]
 class RunSummary:
     counts: Mapping                                # same keys as report.json "counts" (§9.3)
@@ -189,6 +324,8 @@ class Orchestrator:
         if self.cfg.dry_run:
             return self._run_dry()
 
+        plan: IngestPlan | None = None             # v1.10: captured pre-scan plan (U17)
+        plan_estimated = False
         if self.cfg.run.mode == "process" and self.ingestor is not None:
             # Fail fast on path/candidate/pairing errors BEFORE the first trace
             # emit — which is what opens (and truncates) the trace file — so a
@@ -197,13 +334,19 @@ class Orchestrator:
             # nothing; the real records() pass re-emits everything in order.
             saved_metrics = getattr(self.ingestor, "metrics", None)
             self.ingestor.metrics = None
+            # v1.10 (U17 复用铁律): the SAME P2-4 rehearsal scan doubles as the
+            # live estimate source — NEVER scan twice. estimate=True is free on
+            # UI modality (the pairing table exists anyway) and an explicit
+            # opt-in on text (console.estimate reads the input once more);
+            # otherwise estimate=False keeps the fail-fast-only behavior (the
+            # text-modality line count reads every input byte and its result
+            # would be unused — doubling the input I/O of every run).
+            estimate = (self.cfg.run.modality == "ui") or self.cfg.console.estimate
             try:
-                # estimate=False: the fail-fast checks only — the text-modality
-                # line count reads every input byte and its result is unused
-                # here (that would double the input I/O of every run).
-                self.ingestor.scan(estimate=False)
+                plan = self.ingestor.scan(estimate=estimate)
             finally:
                 self.ingestor.metrics = saved_metrics
+            plan_estimated = estimate
 
         self._install_signal_handlers()
         try:
@@ -212,6 +355,14 @@ class Orchestrator:
                                         "config_digest": self.cfg.config_digest,
                                         "project_digest": self.cfg.project_digest,
                                         "trace_schema_version": 1})
+            # v1.10 (U17/U19/U20): live estimate emission — only when a USABLE
+            # estimate exists: a plan-with-estimates in process mode, or
+            # generate_only (plan=None — the 3.6.2 formula is static, no scan).
+            # A text-modality scan without console.estimate emits nothing (the
+            # renderer then shows `批 i` with no denominator). The sink method
+            # is a forward-only no-op when no listener is attached.
+            if self.cfg.run.mode == "generate_only" or plan_estimated:
+                self.metrics.run_estimate(estimate_run(self.cfg, plan))
             self.emitter.open()
             try:
                 if self.cfg.run.mode == "generate_only":
@@ -385,6 +536,10 @@ class Orchestrator:
         for stage in chain:
             ctx = self._make_ctx(batch_no, stage.name)
             size_before = len(batch)
+            # v1.10 (U11, spec 3.10.3 console row): in-process progress signal,
+            # fired immediately before EVERY stage.run in chain order —
+            # forward-only, produces NO TraceEvent (3.12.3), no-op sans listener.
+            self.metrics.stage_begin(stage.name, batch_no)
             t_stage = time.perf_counter()
             try:
                 result = await stage.run(batch, ctx)
@@ -923,32 +1078,40 @@ class Orchestrator:
                                     "project_digest": cfg.project_digest,
                                     "trace_schema_version": 1})
         est = self._estimate()
-        print(f"dry-run: mode={cfg.run.mode} estimated_records={est['records']} "
-              f"batches={est['batches']}", file=sys.stderr)
-        print(f"dry-run: estimated LLM calls — generate_calls={est['generate_calls']} "
-              f"segment_calls={est['segment_calls']} "
-              f"stitch_calls={est['stitch_calls']} "
-              f"classify_calls={est['classify_calls']} "
-              f"extract_calls={est['extract_calls']} "
-              f"quality_calls={est['quality_calls']} annotate_calls={est['annotate_calls']} "
-              f"verify_calls={est['verify_calls']} total={est['total_calls']} "
-              f"(excludes retries and repair calls)", file=sys.stderr)
-        if cfg.classify.enabled and (cfg.classify.assignment == "multi"
-                                     or self._class_overrides_exist()):
-            # v1.7 R28: per-class overrides make the static estimate inexact,
-            # and multi fan-out multiplies downstream calls by the (unknowable)
-            # label count — flag both with the fixed wording.
-            print("dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界",
+        if (cfg.console.mode_resolved == "rich"
+                and getattr(self.metrics, "has_listener", False)):
+            # v1.10 (U13): rich mode with an attached listener — the estimate
+            # print lines yield to the renderer's table (values identical, fed
+            # through the bypass); plain keeps the byte-identical line output
+            # below (the dry-run golden anchor, U24 layer ②).
+            self.metrics.run_estimate(est)
+        else:
+            print(f"dry-run: mode={cfg.run.mode} estimated_records={est['records']} "
+                  f"batches={est['batches']}", file=sys.stderr)
+            print(f"dry-run: estimated LLM calls — generate_calls={est['generate_calls']} "
+                  f"segment_calls={est['segment_calls']} "
+                  f"stitch_calls={est['stitch_calls']} "
+                  f"classify_calls={est['classify_calls']} "
+                  f"extract_calls={est['extract_calls']} "
+                  f"quality_calls={est['quality_calls']} annotate_calls={est['annotate_calls']} "
+                  f"verify_calls={est['verify_calls']} total={est['total_calls']} "
+                  f"(excludes retries and repair calls)", file=sys.stderr)
+            if cfg.classify.enabled and (cfg.classify.assignment == "multi"
+                                         or self._class_overrides_exist()):
+                # v1.7 R28: per-class overrides make the static estimate inexact,
+                # and multi fan-out multiplies downstream calls by the (unknowable)
+                # label count — flag both with the fixed wording.
+                print("dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界",
+                      file=sys.stderr)
+            if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
+                # v1.8 S22 (R28-style note): downstream estimates use
+                # episodes ≈ sessions — LLM boundary refinement can only ADD
+                # segments, so the numbers are a lower bound.
+                print("dry-run: 注：stream 估算：下游按 episodes≈sessions 报下界"
+                      "（LLM 精化只增段数）", file=sys.stderr)
+            side_channels = "report and trace only" if cfg.trace.enabled else "report only"
+            print(f"dry-run: no LLM calls made, no output written ({side_channels})",
                   file=sys.stderr)
-        if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
-            # v1.8 S22 (R28-style note): downstream estimates use
-            # episodes ≈ sessions — LLM boundary refinement can only ADD
-            # segments, so the numbers are a lower bound.
-            print("dry-run: 注：stream 估算：下游按 episodes≈sessions 报下界"
-                  "（LLM 精化只增段数）", file=sys.stderr)
-        side_channels = "report and trace only" if cfg.trace.enabled else "report only"
-        print(f"dry-run: no LLM calls made, no output written ({side_channels})",
-              file=sys.stderr)
 
         wall_s = time.perf_counter() - self._t0
         report = self._build_report(exit_code=0, wall_s=wall_s)
@@ -970,127 +1133,15 @@ class Orchestrator:
                    for view in cfg.class_views.values())
 
     def _estimate(self) -> dict:
-        """Static record / LLM-call estimate. generate_only follows the 3.6.2
-        call-count formulas; process mode uses the M2 scan estimate. All
-        estimates assume no drops (upper bound) and exclude retries/repairs.
-        v1.7 R11: classify_calls = ingested × max(1, sc) in process mode
-        (re-flow sub-batches inherit their classification and skip M13),
-        <generated records> × max(1, sc) in generate_only.
-        v1.8 S22 (stream mode): the session table comes from
-        ``plan.session_lens``; ``segment_calls = Σ ceil((L−1)/(window−1))``
-        over sessions of length L ≥ 2 (L = 1 or strategy="rules" counts 0);
-        ``extract_calls = Σ (L−1)`` (extract enabled; UPPER bound); the
-        classify/quality/annotate/verify record base is ``len(session_lens)``
-        (episodes ≈ sessions, LOWER bound — stderr note in _run_dry); the batch
-        count comes EXACTLY from a next-fit packing simulation of the session
-        sizes, and the pairwise-quality per-batch pool sizes are the packed
-        sessions per batch. The non-stream branch is unchanged."""
-        cfg = self.cfg
-        g = cfg.generate
-        if cfg.run.mode == "generate_only":
-            n_ingested = 0
-            plan = None
-            if g.seed_examples:
-                gen_calls = _ceil_div(len(g.seed_examples) * g.num_per_record, g.num_per_call)
-            else:
-                gen_calls = _ceil_div(g.standalone_count or 0, g.num_per_call)
-            if cfg.limit is not None:
-                gen_calls = min(gen_calls, _ceil_div(cfg.limit, g.num_per_call))
-            gen_records = gen_calls * g.num_per_call
-            if cfg.limit is not None:
-                gen_records = min(gen_records, cfg.limit)
-        else:
+        """Thin wrapper over the exported pure function (v1.10 U20): obtains
+        the plan via the existing scan path (estimate=True default — dry-run
+        behavior byte-identical) and delegates to ``estimate_run``.
+        generate_only passes plan=None (static 3.6.2 formulas, no scan)."""
+        plan = None
+        if self.cfg.run.mode != "generate_only":
             assert self.ingestor is not None, "process mode requires an Ingestor"
             plan = self.ingestor.scan()
-            n_ingested = plan.estimated_records
-            if cfg.limit is not None:
-                n_ingested = min(n_ingested, cfg.limit)
-            if g.enabled:
-                gen_calls = _ceil_div(n_ingested * g.num_per_record, g.num_per_call)
-                gen_records = gen_calls * g.num_per_call
-            else:
-                gen_calls = gen_records = 0
-
-        total_records = n_ingested + gen_records
-        bs = cfg.run.batch_size
-        sizes = [bs] * (total_records // bs)
-        if total_records % bs:
-            sizes.append(total_records % bs)
-
-        # v1.8 stream mode (segment × generate_only is M1-forbidden, so plan
-        # is always the process-mode scan here): sessions → exact batches,
-        # episodes ≈ sessions as the downstream record base.
-        segment_calls = 0
-        stitch_calls = 0
-        extract_calls = 0
-        stream = cfg.segment.enabled and cfg.run.mode == "process"
-        if stream:
-            session_lens = tuple(getattr(plan, "session_lens", ()) or ())
-            frame_sizes, piece_sizes = _pack_next_fit(session_lens, bs)
-            n_batches = len(frame_sizes)
-            sizes = piece_sizes                    # pairwise pools are episodes
-            downstream_base = len(session_lens)
-            if cfg.segment.strategy in ("llm", "hybrid"):
-                w = cfg.segment.window
-                segment_calls = sum(_ceil_div(length - 1, w - 1)
-                                    for length in session_lens if length >= 2)
-            if cfg.stitch.enabled:
-                # v1.9 (T16 estimate, S22 culture): one judgment per episode
-                # candidate over the episodes ≈ sessions lower-bound base,
-                # × votes samples, doubled when the repass is on.
-                stitch_calls = (len(session_lens) * cfg.stitch.votes
-                                * (2 if cfg.stitch.repass else 1))
-            if cfg.extract.enabled:
-                extract_calls = sum(length - 1 for length in session_lens)
-        else:
-            n_batches = len(sizes)
-            downstream_base = total_records
-
-        classify_calls = 0
-        if cfg.classify.enabled:
-            sc_c = cfg.classify.self_consistency
-            if cfg.run.mode == "generate_only":
-                base = gen_records
-            else:
-                base = downstream_base if stream else n_ingested
-            classify_calls = base * max(1, sc_c)
-
-        quality_calls = 0
-        if cfg.quality.enabled:
-            n_criteria = len(cfg.rubric.criteria)
-            if cfg.quality.mode == "pairwise":
-                judges = max(1, len(cfg.quality.judges))
-                orders = 2 if cfg.quality.both_orders else 1
-                per_call = n_criteria if cfg.quality.criteria_per_call == "single" else 1
-                quality_calls = (sum(cfg.quality.rounds * (b // 2) for b in sizes)
-                                 * per_call * judges * orders)
-            else:
-                quality_calls = downstream_base * n_criteria
-
-        annotate_calls = 0
-        if cfg.annotate.enabled:
-            sc = cfg.annotate.self_consistency
-            annotate_calls = downstream_base * (sc if sc >= 3 else 1)
-
-        verify_calls = 0
-        if cfg.verify.enabled:
-            verify_calls = downstream_base * max(1, len(cfg.verify.judges))
-
-        return {
-            "records": total_records,
-            "batches": n_batches,
-            "generate_calls": gen_calls,
-            "segment_calls": segment_calls,
-            "stitch_calls": stitch_calls,
-            "classify_calls": classify_calls,
-            "extract_calls": extract_calls,
-            "quality_calls": quality_calls,
-            "annotate_calls": annotate_calls,
-            "verify_calls": verify_calls,
-            "total_calls": (gen_calls + segment_calls + stitch_calls
-                            + classify_calls + extract_calls + quality_calls
-                            + annotate_calls + verify_calls),
-        }
+        return estimate_run(self.cfg, plan)
 
     # ── signals ────────────────────────────────────────────────────────────
 
@@ -1127,6 +1178,9 @@ class Orchestrator:
         report carries interrupted=true)."""
         self._stop = True
         self._interrupted = True
+        # v1.10 (U19, spec 3.10.3 console row): 中断横幅通路 — forward-only,
+        # no-op when no listener is attached.
+        self.metrics.stop_requested()
         task = self._current_task
         if task is not None and not task.done():
             try:

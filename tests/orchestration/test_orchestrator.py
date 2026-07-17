@@ -22,7 +22,9 @@ from types import SimpleNamespace
 import pytest
 
 from labelkit.common.config.model import (
-    AnnotateConfig, ClassifyConfig, ClassSpec, ClassView, Criterion, DedupConfig,
+    AnnotateConfig, ClassifyConfig, ClassSpec, ClassView, CliOverrides, Criterion,
+    DedupConfig,
+    ConsoleConfig,
     ExtractConfig, GenerateConfig, InputConfig, OutputConfig, QualityConfig,
     ResolvedConfig, Rubric, RunConfig, SegmentConfig, StitchConfig, StreamConfig,
     ToolConfig,
@@ -30,7 +32,9 @@ from labelkit.common.config.model import (
 )
 from labelkit.common.errors import CircuitBreakerTripped
 from labelkit.common.observability.obslog import EventLog, MetricsSink, TraceEvent
-from labelkit.orchestration.orchestrator import Orchestrator, RunSummary
+from labelkit.common.runtime.llm_client import LLMClient
+from labelkit.orchestration.orchestrator import Orchestrator, RunSummary, estimate_run
+from labelkit.orchestration.runtime import execute_run, validate_project
 from labelkit.common.contracts.types import (
     Classification, DedupInfo, PipelineItem, QualityScore, Record, RecordRef,
     StageError,
@@ -68,12 +72,15 @@ def make_cfg(tmp_path: Path, *, mode: str = "process", batch_size: int = 4,
              segment: SegmentConfig | None = None,
              stitch: StitchConfig | None = None,
              extract: ExtractConfig | None = None,
-             trace: TraceConfig | None = None) -> ResolvedConfig:
+             trace: TraceConfig | None = None,
+             modality: str = "text",
+             console: ConsoleConfig | None = None) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=console if console is not None else ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
-        run=RunConfig(output=str(tmp_path / "out.jsonl"), modality="text",
+        run=RunConfig(output=str(tmp_path / "out.jsonl"), modality=modality,
                       input=None if mode == "generate_only" else str(tmp_path / "in"),
                       mode=mode, batch_size=batch_size, seed=seed,
                       fatal_error_threshold=fatal_threshold),
@@ -133,9 +140,12 @@ def with_views(cfg: ResolvedConfig, overrides: dict[str, dict] | None = None) ->
 # ── contract-shaped test doubles (observability / IO, not LLMs) ─────────────
 
 class FakeMetrics:
-    """MetricsSink stand-in with the real fatal-streak breaker semantics."""
+    """MetricsSink stand-in with the real fatal-streak breaker semantics.
+    v1.10: mirrors the sink's forward-only console-bypass surface (spec 3.12.3
+    stage_begin/run_estimate/stop_requested + the has_listener/fatal_streak
+    read-only views) as plain recorders."""
 
-    def __init__(self, threshold: int = 20):
+    def __init__(self, threshold: int = 20, listener: bool = False):
         self.counters: dict[str, int] = {}
         self.events: list[tuple] = []          # (ev, stage, batch_no, record_ids, payload)
         self.stage_times: dict[str, float] = {}
@@ -143,6 +153,10 @@ class FakeMetrics:
         self._threshold = threshold
         self._fatal_streak = 0
         self.event_log = SimpleNamespace(events_written=0, dropped_events=0)
+        self.stage_begins: list[tuple[str, int]] = []   # v1.10 (U11)
+        self.run_estimates: list[dict] = []             # v1.10 (U17/U19/U20)
+        self.stop_requests = 0                          # v1.10 (U19)
+        self.has_listener = listener                    # v1.10 (U13 dry-run gate)
 
     def event(self, ev, *, stage, batch_no, record_ids=(), payload=None):
         self.events.append((ev, stage, batch_no, tuple(record_ids), dict(payload or {})))
@@ -156,6 +170,19 @@ class FakeMetrics:
 
     def record_provider_result(self, fatal):
         self._fatal_streak = self._fatal_streak + 1 if fatal else 0
+
+    def stage_begin(self, stage, batch_no):
+        self.stage_begins.append((stage, batch_no))
+
+    def run_estimate(self, est):
+        self.run_estimates.append(dict(est))
+
+    def stop_requested(self):
+        self.stop_requests += 1
+
+    @property
+    def fatal_streak(self):
+        return self._fatal_streak
 
     @property
     def circuit_broken(self):
@@ -215,11 +242,13 @@ class FakeIngestor:
         self._records = list(records)
         self.metrics = None
         self.scan_called = False
+        self.scan_estimates: list[bool] = []   # v1.10 (U17): one entry PER scan
         self.records_called = False
         self.report = SimpleNamespace(scanned=0, ingested=0, bad_input=0)
 
     def scan(self, *, estimate=True):
         self.scan_called = True
+        self.scan_estimates.append(estimate)
         return SimpleNamespace(files=("in.jsonl",), pairs=(),
                                estimated_records=len(self._records))
 
@@ -248,6 +277,7 @@ class FakeSessionIngestor:
         self._sessions = list(sessions)
         self.metrics = None
         self.scan_called = False
+        self.scan_estimates: list[bool] = []   # v1.10 (U17): one entry PER scan
         self.report = SimpleNamespace(scanned=0, ingested=0, bad_input=0,
                                       sessions=0)
         self._session_lens = (tuple(session_lens) if session_lens is not None
@@ -255,6 +285,7 @@ class FakeSessionIngestor:
 
     def scan(self, *, estimate=True):
         self.scan_called = True
+        self.scan_estimates.append(estimate)
         return SimpleNamespace(files=("in.jsonl",), pairs=(),
                                estimated_records=sum(self._session_lens),
                                session_lens=self._session_lens)
@@ -2227,3 +2258,496 @@ async def test_dry_run_stitch_calls_zero_line_printed_unconditionally(tmp_path, 
     err = capsys.readouterr().err
     assert "stitch_calls=0" in err
     assert "annotate_calls=3" in err and "total=3" in err
+
+
+# ── v1.10: console bypass wiring (spec 3.10.3 console row; SPEC-tui-console
+#    U11/U13/U17/U19/U20/U27) ────────────────────────────────────────────────
+
+_EST_KEYS = ("records", "batches", "generate_calls", "segment_calls",
+             "stitch_calls", "classify_calls", "extract_calls", "quality_calls",
+             "annotate_calls", "verify_calls", "total_calls")
+
+
+class RecorderListener:
+    """Minimal five-callback ProgressListener (spec 3.12.3) recording a unified
+    call sequence so ordering across callbacks is assertable."""
+
+    def __init__(self):
+        self.run_contexts: list[tuple] = []
+        self.estimates: list[dict] = []
+        self.events: list = []
+        self.stages: list[tuple[str, int]] = []
+        self.stops = 0
+        self.sequence: list[tuple] = []
+
+    def on_run_context(self, cfg, snapshot, counters, fatal_streak):
+        self.run_contexts.append((cfg, snapshot, counters, fatal_streak))
+        self.sequence.append(("run_context",))
+
+    def on_estimate(self, est):
+        self.estimates.append(dict(est))
+        self.sequence.append(("estimate",))
+
+    def on_event(self, ev):
+        self.events.append(ev)
+        self.sequence.append(("event", ev.ev))
+
+    def on_stage(self, stage, batch_no):
+        self.stages.append((stage, batch_no))
+        self.sequence.append(("stage", stage, batch_no))
+
+    def on_stop_requested(self):
+        self.stops += 1
+        self.sequence.append(("stop",))
+
+
+# — estimate_run pure function (U20: the exported _estimate body) —————————————
+
+
+def test_estimate_run_process_text_full_dict_and_frozen_keys(tmp_path):
+    """Process/text: the pure function reproduces the former _estimate dict
+    EXACTLY — same values, same (byte-identical) key names, same order."""
+    cfg = make_cfg(tmp_path, batch_size=4, annotate=True,
+                   quality_cfg=QualityConfig(enabled=True))
+    plan = SimpleNamespace(estimated_records=10, session_lens=())
+    est = estimate_run(cfg, plan)
+    assert tuple(est) == _EST_KEYS
+    assert est == {
+        "records": 10, "batches": 3, "generate_calls": 0, "segment_calls": 0,
+        "stitch_calls": 0, "classify_calls": 0, "extract_calls": 0,
+        # pairwise: k*floor(b/2) per batch → 4*2 + 4*2 + 4*1 = 20
+        "quality_calls": 20, "annotate_calls": 10, "verify_calls": 0,
+        "total_calls": 30,
+    }
+
+
+def test_estimate_run_process_ui_uses_plan_estimate(tmp_path):
+    """Process/ui: the record base is plan.estimated_records (= len(pairs) from
+    the pairing table — the free U17 denominator)."""
+    cfg = make_cfg(tmp_path, batch_size=4, annotate=True, modality="ui")
+    est = estimate_run(cfg, SimpleNamespace(estimated_records=7, session_lens=()))
+    assert est["records"] == 7 and est["batches"] == 2
+    assert est["annotate_calls"] == 7 and est["total_calls"] == 7
+
+
+def test_estimate_run_respects_limit(tmp_path):
+    cfg = make_cfg(tmp_path, batch_size=4, annotate=True, limit=5)
+    est = estimate_run(cfg, SimpleNamespace(estimated_records=10, session_lens=()))
+    assert est["records"] == 5 and est["batches"] == 2
+    assert est["annotate_calls"] == 5
+
+
+def test_estimate_run_stream_next_fit_exactness(tmp_path):
+    """S22 numbers via the pure function (ported from the dry-run stderr test):
+    exact next-fit batches, segment/extract formulas, episodes ≈ sessions."""
+    cfg = stream_cfg(tmp_path, batch_size=8, annotate=True,
+                     segment=SegmentConfig(enabled=True, strategy="hybrid",
+                                           window=20),
+                     extract=ExtractConfig(enabled=True))
+    est = estimate_run(cfg, SimpleNamespace(estimated_records=26,
+                                            session_lens=(21, 5)))
+    assert est["records"] == 26
+    assert est["batches"] == 4                     # 21 hard-splits [8][8][5], then [5]
+    assert est["segment_calls"] == 3               # ceil(20/19) + ceil(4/19)
+    assert est["extract_calls"] == 24              # 20 + 4 (upper bound)
+    assert est["annotate_calls"] == 2              # episodes ≈ sessions
+    assert est["total_calls"] == 29
+
+
+def test_estimate_run_stitch_votes_and_repass_formula(tmp_path):
+    """T16: stitch_calls = len(session_lens) × votes × (2 if repass else 1)."""
+    cfg = stitch_stream_cfg(tmp_path, batch_size=8, annotate=True,
+                            segment=SegmentConfig(enabled=True, strategy="rules"),
+                            stitch=StitchConfig(enabled=True, votes=3,
+                                                repass=True))
+    plan = SimpleNamespace(estimated_records=26, session_lens=(21, 5))
+    assert estimate_run(cfg, plan)["stitch_calls"] == 12
+
+    cfg2 = stitch_stream_cfg(tmp_path, batch_size=8, annotate=True,
+                             segment=SegmentConfig(enabled=True, strategy="rules"),
+                             stitch=StitchConfig(enabled=True, repass=False))
+    assert estimate_run(cfg2, plan)["stitch_calls"] == 2
+
+
+def test_estimate_run_generate_only_static_formulas_with_plan_none(tmp_path):
+    """3.6.2 formulas need NO plan (plan=None works — no scan in generate_only):
+    seed-pool form and the standalone --limit truncation."""
+    gen_cfg = GenerateConfig(enabled=True, instruction="生成",
+                             seed_examples=("a", "b", "c"),
+                             num_per_record=2, num_per_call=4)
+    cfg = make_cfg(tmp_path, mode="generate_only", batch_size=4, annotate=True,
+                   generate=gen_cfg)
+    est = estimate_run(cfg, None)
+    assert est["generate_calls"] == 2              # ceil(3*2/4)
+    assert est["records"] == 8                     # 2 calls × 4 per call
+    assert est["annotate_calls"] == 8
+
+    gen2 = GenerateConfig(enabled=True, instruction="生成",
+                          standalone_count=500, num_per_call=4)
+    cfg2 = make_cfg(tmp_path, mode="generate_only", limit=10, annotate=True,
+                    generate=gen2)
+    est2 = estimate_run(cfg2, None)
+    assert est2["generate_calls"] == 3             # ceil(10/4) under --limit
+    assert est2["records"] == 10
+
+
+def test_estimate_wrapper_delegates_to_pure_function(tmp_path):
+    """_estimate() is a thin wrapper: same dict as estimate_run over the plan
+    the existing scan path yields (dry-run behavior byte-identical)."""
+    cfg = make_cfg(tmp_path, batch_size=4, annotate=True)
+    orch, _, _, ingestor = build(cfg, [], [rec(i) for i in range(1, 11)])
+    assert orch._estimate() == estimate_run(cfg, ingestor.scan())
+
+
+# — live-run run_estimate emission matrix (U17/U19) ———————————————————————————
+
+
+async def test_live_run_ui_modality_emits_estimate_from_single_scan(tmp_path):
+    """UI modality: the P2-4 rehearsal scan flips estimate=True (pairing table,
+    zero extra I/O), run_estimate fires once — and the scan runs ONCE (U17)."""
+    cfg = make_cfg(tmp_path, batch_size=4, modality="ui")
+    orch, metrics, _, ingestor = build(cfg, [RecordingStage("dedup")],
+                                       [rec(1), rec(2)])
+    summary = await orch.run()
+    assert summary.exit_code == 0
+    assert ingestor.scan_estimates == [True]       # exactly one scan, estimated
+    expected = estimate_run(cfg, SimpleNamespace(estimated_records=2,
+                                                 session_lens=()))
+    assert metrics.run_estimates == [expected]
+
+
+async def test_live_run_text_default_no_estimate_scan_or_emission(tmp_path):
+    """Text without console.estimate: the rehearsal scan stays estimate=False
+    (no doubled input I/O) and run_estimate is NOT emitted — the renderer
+    shows `批 i` with no denominator (U17)."""
+    cfg = make_cfg(tmp_path, batch_size=4)
+    orch, metrics, _, ingestor = build(cfg, [RecordingStage("dedup")], [rec(1)])
+    await orch.run()
+    assert ingestor.scan_estimates == [False]
+    assert metrics.run_estimates == []
+
+
+async def test_live_run_text_console_estimate_optin_emits(tmp_path):
+    """console.estimate = true (text): the explicit one-extra-input-pass opt-in
+    buys the denominator — same single scan, estimate=True (U17)."""
+    cfg = make_cfg(tmp_path, batch_size=4, console=ConsoleConfig(estimate=True))
+    orch, metrics, _, ingestor = build(cfg, [RecordingStage("dedup")],
+                                       [rec(i) for i in range(1, 6)])
+    await orch.run()
+    assert ingestor.scan_estimates == [True]
+    expected = estimate_run(cfg, SimpleNamespace(estimated_records=5,
+                                                 session_lens=()))
+    assert metrics.run_estimates == [expected]
+
+
+async def test_live_run_generate_only_emits_static_estimate(tmp_path):
+    """generate_only: no scan exists — the 3.6.2 static formula (plan=None)
+    is emitted unconditionally after run.start."""
+    gen_cfg = GenerateConfig(enabled=True, instruction="生成",
+                             seed_examples=("a", "b"), num_per_record=2,
+                             num_per_call=2)
+    cfg = make_cfg(tmp_path, mode="generate_only", batch_size=4, generate=gen_cfg)
+    orch, metrics, _, _ = build(cfg, [PureGenerateStage(total=4)])
+    summary = await orch.run()
+    assert summary.exit_code == 0
+    assert metrics.run_estimates == [estimate_run(cfg, None)]
+
+
+async def test_live_run_ui_stream_estimate_reuses_session_lens(tmp_path):
+    """UI stream: the estimated rehearsal scan carries session_lens, so the
+    emitted estimate has the EXACT next-fit batch count — still one scan."""
+    cfg = stream_cfg(tmp_path, batch_size=8, modality="ui")
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2), sess("s2", 11, 3)])
+    orch, metrics, _, _ = build(cfg, [StubSegmentStage()], ingestor=ingestor)
+    await orch.run()
+    assert ingestor.scan_estimates == [True]
+    assert len(metrics.run_estimates) == 1
+    est = metrics.run_estimates[0]
+    assert est["records"] == 5 and est["batches"] == 1
+
+
+# — dry-run rich yield (U13) ——————————————————————————————————————————————————
+
+
+async def test_dry_run_rich_with_listener_suppresses_prints_emits_estimate(
+        tmp_path, capsys):
+    """rich × listener attached: the estimate print lines yield to the renderer
+    (run_estimate carries the same dict); the report is still written."""
+    cfg = make_cfg(tmp_path, batch_size=4, dry_run=True, annotate=True,
+                   console=ConsoleConfig(mode_resolved="rich"))
+    metrics = FakeMetrics(listener=True)
+    emitter = FakeEmitter(cfg)
+    ingestor = FakeIngestor([rec(i) for i in range(1, 4)])
+    orch = Orchestrator(cfg, [], ingestor, emitter, None, None, metrics, RUN_ID,
+                        datetime.now().astimezone())
+    summary = await orch.run()
+
+    assert summary.exit_code == 0
+    assert "dry-run" not in capsys.readouterr().err   # ALL print lines skipped
+    expected = estimate_run(cfg, SimpleNamespace(estimated_records=3,
+                                                 session_lens=()))
+    assert metrics.run_estimates == [expected]
+    assert emitter.report_path.exists()               # report written as today
+    assert emitter.deliver is False
+
+
+async def test_dry_run_rich_without_listener_keeps_plain_prints(tmp_path, capsys):
+    """rich mode_resolved alone is NOT enough — without an attached listener
+    the plain line output stays (nobody would render the table)."""
+    cfg = make_cfg(tmp_path, batch_size=4, dry_run=True, annotate=True,
+                   console=ConsoleConfig(mode_resolved="rich"))
+    orch, metrics, _, _ = build(cfg, [], [rec(i) for i in range(1, 4)])
+    await orch.run()
+    err = capsys.readouterr().err
+    assert "dry-run: mode=process estimated_records=3 batches=1" in err
+    assert metrics.run_estimates == []
+
+
+async def test_dry_run_plain_with_listener_prints_byte_identical(tmp_path, capsys):
+    """plain × listener: the line-form output is the regression anchor (U24 ②)
+    — byte-identical lines, and NO run_estimate from the dry-run path."""
+    cfg = make_cfg(tmp_path, batch_size=4, dry_run=True, annotate=True)
+    metrics = FakeMetrics(listener=True)
+    emitter = FakeEmitter(cfg)
+    ingestor = FakeIngestor([rec(i) for i in range(1, 4)])
+    orch = Orchestrator(cfg, [], ingestor, emitter, None, None, metrics, RUN_ID,
+                        datetime.now().astimezone())
+    await orch.run()
+    lines = [line for line in capsys.readouterr().err.splitlines()
+             if line.startswith("dry-run")]
+    assert lines == [
+        "dry-run: mode=process estimated_records=3 batches=1",
+        "dry-run: estimated LLM calls — generate_calls=0 segment_calls=0 "
+        "stitch_calls=0 classify_calls=0 extract_calls=0 quality_calls=0 "
+        "annotate_calls=3 verify_calls=0 total=3 "
+        "(excludes retries and repair calls)",
+        "dry-run: no LLM calls made, no output written (report only)",
+    ]
+    assert metrics.run_estimates == []
+
+
+# — stage_begin (U11) and stop_requested (U19) forwarding —————————————————————
+
+
+async def test_stage_begin_fires_per_stage_in_chain_order(tmp_path):
+    """One stage_begin per (stage, batch) immediately before stage.run, in
+    canonical chain order, across every batch."""
+    cfg = make_cfg(tmp_path, batch_size=4, annotate=True,
+                   quality_cfg=QualityConfig(enabled=True))
+    order: list[str] = []
+    stages = [Probe(n, order) for n in ("annotate", "quality", "dedup")]
+    orch, metrics, _, _ = build(cfg, stages, [rec(i) for i in range(1, 6)])
+    await orch.run()
+    assert metrics.stage_begins == [
+        ("dedup", 1), ("quality", 1), ("annotate", 1),
+        ("dedup", 2), ("quality", 2), ("annotate", 2),
+    ]
+
+
+async def test_stage_begin_forwards_on_stage_before_stage_effects(tmp_path):
+    """Through the REAL MetricsSink: the listener sees on_stage(X) BEFORE any
+    event X emits — the U20 bracket-attribution invariant — and after
+    run.start."""
+
+    class EmittingDedup:
+        name = "dedup"
+
+        async def run(self, batch, ctx):
+            ctx.metrics.event("dedup.duplicate", stage="dedup",
+                              batch_no=ctx.batch_no, payload={"kind": "exact"})
+            return batch
+
+    cfg = make_cfg(tmp_path, batch_size=4)
+    listener = RecorderListener()
+    event_log = EventLog(cfg.trace, RUN_ID)
+    metrics = MetricsSink(cfg, RUN_ID, event_log, listener=listener)
+    emitter = FakeEmitter(cfg)
+    ingestor = FakeIngestor([rec(1), rec(2)])
+    orch = Orchestrator(cfg, [EmittingDedup()], ingestor, emitter, None, None,
+                        metrics, RUN_ID, datetime.now().astimezone())
+    summary = await orch.run()
+    event_log.close()
+
+    assert summary.exit_code == 0
+    seq = listener.sequence
+    stage_idx = seq.index(("stage", "dedup", 1))
+    assert seq.index(("event", "run.start")) < stage_idx
+    assert stage_idx < seq.index(("event", "dedup.duplicate"))
+    assert listener.stages == [("dedup", 1)]
+
+
+async def test_request_stop_forwards_stop_requested(tmp_path):
+    """_request_stop forwards exactly one stop_requested per signal — the
+    中断横幅 path (U19); graceful-interrupt semantics unchanged."""
+
+    class StopMidBatch:
+        name = "dedup"
+
+        def __init__(self):
+            self.orch = None
+
+        async def run(self, batch, ctx):
+            self.orch._request_stop()
+            return batch
+
+    cfg = make_cfg(tmp_path, batch_size=2)
+    stage = StopMidBatch()
+    orch, metrics, _, _ = build(cfg, [stage], [rec(i) for i in range(1, 7)])
+    stage.orch = orch
+    summary = await orch.run()
+    assert metrics.stop_requests == 1
+    assert summary.interrupted is True
+
+
+# — execute_run / validate_project wiring (U19/U27) ———————————————————————————
+
+_CONSOLE_CONFIG_TOML = """\
+schema_version = 1
+
+[tool]
+log_level = "info"
+
+[llm.default]
+provider = "anthropic"
+base_url = "https://api.z.ai/api/anthropic"
+model = "glm-5.2"
+api_key_env = "LABELKIT_ORCH_TEST_KEY"
+"""
+
+_CONSOLE_SCHEMA = (
+    '{"type": "object", "properties": {"intent": {"type": "string"}}, '
+    '"required": ["intent"], "additionalProperties": false}'
+)
+
+# quality on / annotate off satisfies stage-combination rule ① while the
+# --dry-run overrides below guarantee zero LLM calls (offline, no mocks).
+_CONSOLE_PROJECT_TOML = """\
+schema_version = 1
+
+[run]
+input = {input_path!r}
+output = {output_path!r}
+modality = "text"
+
+[quality]
+enabled = true
+llm = "default"
+
+[annotate]
+enabled = false
+
+[output]
+schema_inline = '''{schema}'''
+"""
+
+
+def _write_console_pair(tmp_path):
+    config = tmp_path / "config.toml"
+    project = tmp_path / "project.toml"
+    data = tmp_path / "in.jsonl"
+    out_dir = tmp_path / "out"
+    out_dir.mkdir(exist_ok=True)
+    data.write_text('{"text": "样例一"}\n{"text": "样例二"}\n', encoding="utf-8")
+    config.write_text(_CONSOLE_CONFIG_TOML, encoding="utf-8")
+    project.write_text(
+        _CONSOLE_PROJECT_TOML.format(input_path=str(data),
+                                     output_path=str(out_dir / "o.jsonl"),
+                                     schema=_CONSOLE_SCHEMA),
+        encoding="utf-8",
+    )
+    return config, project, out_dir
+
+
+def test_execute_run_listener_receives_run_context(tmp_path, monkeypatch, capsys):
+    """U19 时序: on_run_context fires once after assembly with (cfg,
+    llm.snapshot, live counters closure, live fatal_streak closure); the plain
+    dry-run path still prints and never emits on_estimate."""
+    monkeypatch.setenv("LABELKIT_ORCH_TEST_KEY", "test-key")
+    config, project, out_dir = _write_console_pair(tmp_path)
+    listener = RecorderListener()
+    rc = execute_run(config, project, CliOverrides(dry_run=True),
+                     listener=listener)
+    assert rc == 0
+    assert len(listener.run_contexts) == 1
+    cfg, snapshot, counters, fatal_streak = listener.run_contexts[0]
+    assert isinstance(cfg, ResolvedConfig)
+    assert cfg.dry_run is True
+    assert cfg.run.output == str(out_dir / "o.jsonl")
+    # snapshot IS LLMClient.snapshot, bound to the run's client (U19)
+    assert isinstance(getattr(snapshot, "__self__", None), LLMClient)
+    assert snapshot.__func__ is LLMClient.snapshot
+    snaps = snapshot()
+    assert [s.name for s in snaps] == ["default"]
+    assert snaps[0].kind == "llm"
+    # the pull closures stay live after the run completes
+    assert isinstance(counters(), dict)
+    assert fatal_streak() == 0
+    # non-TTY auto → plain: line output intact, no estimate forwarded (U13)
+    assert "dry-run: mode=process" in capsys.readouterr().err
+    assert listener.estimates == []
+
+
+def test_execute_run_rich_dry_run_yields_to_listener(tmp_path, monkeypatch, capsys):
+    """--console rich (explicit, honored without a TTY) + listener: the dry-run
+    print lines yield; the estimate arrives via on_estimate; the report file is
+    still written (U13)."""
+    monkeypatch.setenv("LABELKIT_ORCH_TEST_KEY", "test-key")
+    config, project, out_dir = _write_console_pair(tmp_path)
+    listener = RecorderListener()
+    rc = execute_run(config, project,
+                     CliOverrides(dry_run=True, console="rich"),
+                     listener=listener)
+    assert rc == 0
+    assert "dry-run: mode=" not in capsys.readouterr().err
+    assert len(listener.estimates) == 1
+    est = listener.estimates[0]
+    assert est["records"] == 2 and est["batches"] == 1
+    # U19 ordering: activation → run.start → estimate
+    seq = listener.sequence
+    assert (seq.index(("run_context",))
+            < seq.index(("event", "run.start"))
+            < seq.index(("estimate",)))
+    assert (out_dir / "o.dryrun.report.json").exists()
+
+
+def test_execute_run_on_run_context_failure_warns_once_and_disables(
+        tmp_path, monkeypatch, capsys):
+    """U23 discipline on the activation path: one WARN, bypass disabled for the
+    run (the rich dry-run gate then prints plain lines), exit code 0."""
+    monkeypatch.setenv("LABELKIT_ORCH_TEST_KEY", "test-key")
+    config, project, _ = _write_console_pair(tmp_path)
+
+    class ExplodingListener(RecorderListener):
+        def on_run_context(self, cfg, snapshot, counters, fatal_streak):
+            raise RuntimeError("renderer bug")
+
+    listener = ExplodingListener()
+    rc = execute_run(config, project,
+                     CliOverrides(dry_run=True, console="rich"),
+                     listener=listener)
+    assert rc == 0                                 # run unaffected (U7/U23)
+    err = capsys.readouterr().err
+    assert err.count("console listener 异常，已停用面板旁路") == 1
+    # bypass disabled → the rich yield gate finds no listener → plain prints
+    assert "dry-run: mode=process" in err
+    assert listener.estimates == []
+
+
+def test_validate_project_overrides_passthrough(tmp_path, monkeypatch):
+    """U27: validate_project grew a defaulted overrides tail param — existing
+    callers unchanged; --console (and every other override) reaches M1."""
+    monkeypatch.setenv("LABELKIT_ORCH_TEST_KEY", "test-key")
+    config, project, _ = _write_console_pair(tmp_path)
+
+    cfg_default = validate_project(config, project)   # default arg keeps working
+    assert cfg_default.limit is None
+    assert cfg_default.console.mode == "auto"
+
+    cfg = validate_project(config, project, CliOverrides(console="plain", limit=7))
+    assert cfg.console.mode == "plain"
+    assert cfg.console.mode_resolved == "plain"
+    assert cfg.limit == 7
+
+    # explicit rich resolves through M1's find_spec probe (rich is installed)
+    cfg_rich = validate_project(config, project, CliOverrides(console="rich"))
+    assert cfg_rich.console.mode_resolved == "rich"

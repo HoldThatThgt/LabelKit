@@ -35,13 +35,26 @@ class EventLog:
 **v1.10 增：ProgressListener 进程内旁路**（console 面板的唯一数据通路，7.7；实现归 CLI 层 `labelkit/cli/console.py`，协议归本层——依赖方向 `cli → orchestration → operators → common` 不变）：
 
 ```
-class ProgressListener(Protocol):        # v1.10（7.7 console 的订阅协议）
-    def on_event(self, ev: TraceEvent) -> None: ...          # MetricsSink.event() 旁路转发（脱敏前原样；消费纪律 = stderr 镜像同级，实现只得读取标量结构字段）
-    def on_stage(self, stage: str, batch_no: int) -> None: ...  # M10 stage 循环经 MetricsSink.stage_begin 转发
-    def on_stop_requested(self) -> None: ...                 # SIGINT/SIGTERM 优雅中断横幅（3.10.3）
+class ProgressListener(Protocol):        # v1.10（7.7 console 的订阅协议，五回调）
+    def on_run_context(self, cfg, snapshot, counters, fatal_streak) -> None: ...
+        # execute_run 装配完成后、asyncio.run 之前调用一次（U19）：cfg = ResolvedConfig；
+        # snapshot = LLMClient.snapshot（3.9.2）；counters / fatal_streak = MetricsSink 只读闭包。
+        # 渲染器以「惰性壳」形态传入（CLI 在 load 前无 cfg），本回调完成激活。
+    def on_estimate(self, est: Mapping) -> None: ...
+        # M10 预扫后经 MetricsSink.run_estimate 转发的 estimate_run() 静态估算（3.10.3）；
+        # 文本模态未开 console.estimate 时不发（U17）。
+    def on_event(self, ev: TraceEvent) -> None: ...
+        # MetricsSink.event() 旁路转发；payload 经 redact_payload(payload, "none") 预脱敏（U22）——
+        # 无 LLM 自由文本、无输入内容，U6 红线由机制保证；record_ids 保留（结构字段）。
+    def on_stage(self, stage: str, batch_no: int) -> None: ...
+        # M10 stage 循环经 MetricsSink.stage_begin 转发（每 stage run() 之前一次）。
+    def on_stop_requested(self) -> None: ...
+        # SIGINT/SIGTERM 经 MetricsSink.stop_requested 转发（优雅中断横幅，3.10.3）。
 ```
 
-三条纪律：① 旁路**不属于 trace 面**——`stage_begin` 不产生 TraceEvent、不受 `trace.channels` 过滤、不经 7.4 脱敏（7.2 事件目录零改动的充分条件）；② 全部回调必须 O(1)、无 I/O、无锁等待——重绘由消费方自己的节流 tick 驱动（渲染与事件源解耦）；③ `listener = None`（validate / 全部既有调用路径）时行为与 v1.9 逐字节一致。`MetricsSink.__init__` 增可选尾参 `listener`（只增）；配套的 `LLMClient.snapshot()` 只读快照（密钥池三态 + 用量 + p50 有界样本窗）规格见 `docs/dev/SPEC-tui-console.md` §3.3，实施期随 CONTRACTS §8 入册。
+四条纪律：① 旁路**不属于 trace 面**——五回调均不产生 TraceEvent、不受 `trace.channels` 过滤（7.2 事件目录零改动的充分条件）；`on_event` 的 payload 按 none 档预脱敏后转发（仅 listener 非 None 时执行，浅递归 strip 成本可忽略——U22）。② 全部回调必须 O(1)、无 I/O、无锁等待——重绘由消费方自己的节流 tick 驱动（渲染与事件源解耦）。③ **sink 侧异常防护（U23）**：MetricsSink 每次转发 `try/except Exception`——首次异常打一条 WARN 并置 listener 为 None（EventLog 写失败「warn 一次 + 关通道」同款纪律，3.12.4），listener 异常永不进入记录级/批级失败路径。④ `listener = None`（validate / 全部既有调用路径）时行为与 v1.9 逐字节一致。
+
+API 增量（均只增）：`MetricsSink.__init__` 增可选尾参 `listener`；增仅转发方法 `stage_begin(stage, batch_no)` / `run_estimate(est)` / `stop_requested()` 与两只读属性 `fatal_streak`（熔断行数据源）、`has_listener`（旁路在挂探针——M10 dry-run 让位门读之；U23 跳闸后永久 False）。plain 行格式（进度行/终版摘要）下沉为本层纯函数模块 `labelkit/common/observability/console_format.py`（U21——emitter 与 CLI 渲染器共用的单一事实源，v1.9 字符串逐字节钉死）。配套的 `LLMClient.snapshot()` 只读快照（密钥池三态 + 逐密钥用量镜像 + p50 有界样本窗）规格见 3.9.2；全部签名已入册于 CONTRACTS §7.8/§7.11/§7.12（签名）与 §7.9/§7.10/§8.4（行为与措辞）。
 
 ### 3.12.4 行为规格
 

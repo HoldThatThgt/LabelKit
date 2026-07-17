@@ -1,0 +1,3 @@
+dry-run: mode=generate_only estimated_records=8 batches=1
+dry-run: estimated LLM calls — generate_calls=2 segment_calls=0 stitch_calls=0 classify_calls=0 extract_calls=0 quality_calls=32 annotate_calls=8 verify_calls=0 total=42 (excludes retries and repair calls)
+dry-run: no LLM calls made, no output written (report and trace only)

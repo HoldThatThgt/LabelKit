@@ -12,6 +12,7 @@ from jsonschema import Draft202012Validator
 from labelkit import TOOL_VERSION
 from labelkit.common.config.model import (
     AnnotateConfig, ClassifyConfig, ClassSpec, Criterion, DedupConfig,
+    ConsoleConfig,
     ExtractConfig, GenerateConfig, InputConfig, OutputConfig, QualityConfig,
     ResolvedConfig, Rubric, RunConfig, SegmentConfig, StitchConfig, StreamConfig,
     ToolConfig,
@@ -68,9 +69,11 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
     classify = kw.pop("classify", ClassifyConfig())
     segment = kw.pop("segment", SegmentConfig())
     stitch = kw.pop("stitch", StitchConfig())
+    console = kw.pop("console", ConsoleConfig())   # v1.10: mode_resolved gate
     assert not kw, f"unknown overrides: {kw}"
     return ResolvedConfig(
         tool=ToolConfig(log_format=log_format),
+        console=console,
         llm_profiles={},
         embedding_profiles={},
         run=RunConfig(output=output, modality=modality, seed=7),
@@ -1183,6 +1186,87 @@ def test_progress_suppressed_for_jsonl_log_format(tmp_path, monkeypatch):
     assert "\r" not in fake.text
     monkeypatch.undo()
     em.finalize({"counts": {}})
+
+
+# ── v1.10: rich static gate + console_format parity (U21, spec 3.11.2) ──────
+
+
+def test_rich_mode_resolved_suppresses_progress_and_summary(tmp_path, monkeypatch):
+    """mode_resolved="rich": _progress and _print_summary return before any
+    stderr write (the CLI panel supersedes both faces) — while the three file
+    channels stay fully live (the gate is display-only)."""
+    import sys as _sys
+    # Byte-exact stderr assertion: detach any ambient 'labelkit' logging handler
+    # (earlier e2e tests leave one bound to a closed capture stream, whose
+    # logging-error report would land in the monkeypatched stderr).
+    monkeypatch.setattr(logging.getLogger("labelkit"), "handlers", [])
+    cfg = make_cfg(tmp_path, console=ConsoleConfig(mode_resolved="rich"))
+    em = Emitter(cfg, EngineStub(), "ab12cd34ef56", RUN_STARTED_AT)
+    em.open()
+    fake = FakeTTY()                               # isatty()=True: only the rich
+    monkeypatch.setattr(_sys, "stderr", fake)      # gate can be doing the muting
+    em.emit_batch([make_item()], 1)
+    em.finalize({"counts": {"scanned": 1, "emitted": 1}})
+    monkeypatch.undo()
+    assert fake.text == ""                         # no \r progress, no summary
+    rows = read_jsonl(tmp_path / "out" / "res.jsonl")
+    assert len(rows) == 1                          # main output unaffected
+
+
+def test_plain_progress_line_equals_console_format_golden(tmp_path, monkeypatch):
+    """Plain path byte-parity (U24 ①): the emitter's progress write IS the
+    console_format pure-function string for its running totals."""
+    import sys as _sys
+    from labelkit.common.observability.console_format import format_progress_line
+
+    monkeypatch.setattr(logging.getLogger("labelkit"), "handlers", [])
+    cfg = make_cfg(tmp_path)                       # mode_resolved default "plain"
+    em = Emitter(cfg, EngineStub(), "ab12cd34ef56", RUN_STARTED_AT)
+    em.open()
+    fake = FakeTTY()
+    monkeypatch.setattr(_sys, "stderr", fake)
+    em.emit_batch([make_item(),
+                   make_item(status="dropped_dup", record=make_record("2" * 16, 2),
+                             annotated=False)], 1)
+    em.emit_batch([make_item(record=make_record("5" * 16, 5))], 2)
+    monkeypatch.undo()
+    first, second = fake.text.split("\r")[1:]      # two \r-prefixed writes
+    assert "\r" + first == format_progress_line(
+        1, 1, {"dropped_dup": 1, "active": 1})
+    assert "\r" + second == format_progress_line(
+        2, 2, {"dropped_dup": 1, "active": 2})
+    em.finalize({"counts": {}})
+
+
+def test_plain_summary_equals_console_format_golden(tmp_path, monkeypatch):
+    """Plain path byte-parity (U24 ①): _print_summary writes exactly the
+    console_format summary lines newline-joined with a trailing newline."""
+    import sys as _sys
+    from labelkit.common.observability.console_format import format_summary_lines
+
+    monkeypatch.setattr(logging.getLogger("labelkit"), "handlers", [])
+    counts = {"scanned": 60, "ingested": 58, "bad_input": 2, "generated": 12,
+              "dropped_dup": 5, "dropped_lowq": 6, "dropped_verify": 1,
+              "failed": 0, "emitted": 41}
+    cfg = make_cfg(tmp_path)
+
+    class PlainStderr(FakeTTY):
+        def isatty(self):                          # non-TTY: no progress writes,
+            return False                           # summary is unconditional
+
+    em = Emitter(cfg, EngineStub(), "ab12cd34ef56", RUN_STARTED_AT)
+    em.open()
+    em.emit_batch([make_item()], 1)
+    fake = PlainStderr()
+    monkeypatch.setattr(_sys, "stderr", fake)
+    em.finalize({"counts": counts})
+    monkeypatch.undo()
+    assert fake.text == "\n".join(format_summary_lines(counts)) + "\n"
+    assert fake.text == (
+        "   ── 终版摘要（与 report.counts 逐项一致）──\n"
+        "   scanned=60  ingested=58  bad_input=2  generated=12\n"
+        "   dropped_dup=5  dropped_lowq=6  dropped_verify=1  failed=0  emitted=41\n"
+    )
 
 
 # ── passthrough fields ─────────────────────────────────────────────────────

@@ -18,11 +18,14 @@ import json
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import IO, Mapping
+from typing import IO, TYPE_CHECKING, Callable, Mapping, Protocol
 
 from labelkit.common.config.model import ResolvedConfig, TraceConfig
+
+if TYPE_CHECKING:  # v1.10: string annotations break the obslog↔llm_client cycle (§3.3)
+    from labelkit.common.runtime.llm_client import ProfileSnapshot
 
 # ── Event-name constants (§7.11, exact strings) ────────────────────────────
 
@@ -133,6 +136,56 @@ def redact_payload(payload: Mapping, content: str) -> Mapping:
             for rid, text in out["excerpt"].items()
         }
     return out
+
+
+# ── ProgressListener (v1.10 console bypass, spec 3.12.3 / §7.7, U19) ───────
+
+class ProgressListener(Protocol):
+    """进程内进度旁路——console 面板的唯一数据通路（spec 3.12.3，SPEC-tui-console
+    U19）；协议归 common 层，实现归 CLI 层（labelkit/cli/console.py 惰性壳）。
+
+    四条纪律（spec 3.12.3）：
+    ① 旁路**不属于 trace 面**——五回调均不产生 TraceEvent、不受 trace.channels
+       过滤（§7.2 事件目录零改动的充分条件）；on_event 的 payload 经
+       redact_payload(payload, "none") 预脱敏后转发（U22——无 LLM 自由文本、
+       无输入内容，U6 红线由机制保证；record_ids 保留为结构字段）。
+    ② 全部回调必须 O(1)、无 I/O、无锁等待——重绘由实现方自己的节流 tick 驱动
+       （渲染与事件源解耦）。
+    ③ sink 侧异常防护（U23）：MetricsSink 每次转发 try/except Exception——首次
+       异常打一条 WARN 并置 listener 为 None（EventLog 写失败「warn 一次 + 关
+       通道」同款纪律，3.12.4），listener 异常永不进入记录级/批级失败路径。
+    ④ listener = None（validate / 全部既有调用路径）时行为与 v1.9 逐字节一致。
+    """
+
+    def on_run_context(self, cfg: ResolvedConfig,
+                       snapshot: "Callable[[], tuple[ProfileSnapshot, ...]]",
+                       counters: "Callable[[], Mapping[str, int]]",
+                       fatal_streak: "Callable[[], int]") -> None:
+        """execute_run 装配完成后、asyncio.run 之前调用一次（U19）：cfg =
+        ResolvedConfig；snapshot = LLMClient.snapshot（spec 3.9.2）；counters /
+        fatal_streak = MetricsSink 只读闭包。渲染器以「惰性壳」形态传入（CLI 在
+        load 前无 cfg），本回调完成激活。"""
+        ...
+
+    def on_estimate(self, est: Mapping) -> None:
+        """M10 预扫后经 MetricsSink.run_estimate 转发的 estimate_run() 静态估算
+        （spec 3.10.3）；文本模态未开 console.estimate 时不发（U17）。"""
+        ...
+
+    def on_event(self, ev: TraceEvent) -> None:
+        """MetricsSink.event() 旁路转发；payload 已经 redact_payload(payload,
+        "none") 预脱敏（U22）。"""
+        ...
+
+    def on_stage(self, stage: str, batch_no: int) -> None:
+        """M10 stage 循环经 MetricsSink.stage_begin 转发（每 stage run() 之前
+        一次，U11）。"""
+        ...
+
+    def on_stop_requested(self) -> None:
+        """SIGINT/SIGTERM 经 MetricsSink.stop_requested 转发（优雅中断横幅，
+        spec 3.10.3）。"""
+        ...
 
 
 # ── EventLog (trace channel) ───────────────────────────────────────────────
@@ -292,9 +345,16 @@ _STDERR_LEVELS: dict[str, int] = {
 
 
 class MetricsSink:
-    """Holds the EventLog + run counters. All stages emit through RunContext.metrics."""
+    """Holds the EventLog + run counters. All stages emit through RunContext.metrics.
 
-    def __init__(self, cfg: ResolvedConfig, run_id: str, event_log: EventLog):
+    v1.10 (spec 3.12.3, U19/U22/U23): optionally carries a ProgressListener —
+    the console panel's in-process bypass. Forwarding produces NO TraceEvent
+    (§7.2 catalog untouched); on_event payloads are pre-redacted at tier
+    "none"; every forward is exception-guarded (first failure warns once and
+    permanently disables the bypass); listener=None is byte-identical to v1.9."""
+
+    def __init__(self, cfg: ResolvedConfig, run_id: str, event_log: EventLog,
+                 listener: ProgressListener | None = None):
         self.cfg = cfg
         self.run_id = run_id
         self.event_log = event_log
@@ -302,12 +362,65 @@ class MetricsSink:
         self.stage_times: dict[str, float] = {}
         self._fatal_streak = 0
         self._circuit_broken = False
+        self._listener: ProgressListener | None = listener
+
+    def _forward(self, callback: str, *args) -> None:
+        """U23 guard — the ONLY path to the listener: try/except around every
+        forward; the first exception logs one WARN and sets the listener
+        reference to None for the rest of the run (EventLog write-failure
+        "warn once + close channel" discipline, spec 3.12.4). A listener bug
+        never enters the record-level/batch-level failure paths."""
+        listener = self._listener
+        if listener is None:
+            return
+        try:
+            getattr(listener, callback)(*args)
+        except Exception as exc:  # noqa: BLE001 — bypass isolation (U23)
+            self._listener = None
+            _logger.warning(
+                "console listener 异常，已停用面板旁路: %s", exc,
+                extra={"stage": "run", "batch": 0},
+            )
+
+    def stage_begin(self, stage: str, batch_no: int) -> None:
+        """v1.10 forward-only (spec 3.12.3, U11/U19): M10 calls this before every
+        stage.run(); forwards on_stage — produces NO TraceEvent, never enters
+        the §7.2 catalog. No-op when listener is None."""
+        self._forward("on_stage", stage, batch_no)
+
+    def run_estimate(self, est: Mapping) -> None:
+        """v1.10 forward-only (spec 3.12.3, U19/U20): forwards the estimate_run()
+        static estimate to on_estimate. No-op when listener is None."""
+        self._forward("on_estimate", est)
+
+    def stop_requested(self) -> None:
+        """v1.10 forward-only (spec 3.12.3, U19): SIGINT/SIGTERM graceful-stop
+        signal → on_stop_requested (中断横幅, spec 3.10.3). No-op when listener
+        is None."""
+        self._forward("on_stop_requested")
+
+    @property
+    def fatal_streak(self) -> int:
+        """v1.10 (spec 3.12.3, U19): read-only breaker-streak view — the console
+        panel's 熔断行 data source (§7.7 LLM block)."""
+        return self._fatal_streak
+
+    @property
+    def has_listener(self) -> bool:
+        """v1.10 (U13): read-only bypass-attachment probe — M10's dry-run
+        rich-yield gate reads it (the estimate print lines yield to the
+        renderer table only while a listener is actually attached); flips
+        False permanently after the U23 forward-failure trip."""
+        return self._listener is not None
 
     def event(self, ev: str, *, stage: str, batch_no: int,
               record_ids: tuple[str, ...] = (), payload: Mapping | None = None) -> None:
         """Builds the TraceEvent (ts=now local ISO8601 ms, run_id) and forwards to
         EventLog; also mirrors to the stderr logger at the §8.1 level when one is
-        defined."""
+        defined. v1.10: additionally forwards to the ProgressListener bypass —
+        with a SECOND TraceEvent whose payload is pre-redacted at tier "none"
+        (U22); the event handed to EventLog stays unredacted (EventLog applies
+        its own trace.content tier at write time)."""
         payload = payload or {}
         trace_ev = TraceEvent(
             ts=datetime.now().astimezone().isoformat(timespec="milliseconds"),
@@ -320,6 +433,9 @@ class MetricsSink:
         )
         self.event_log.emit(trace_ev)
         self._mirror(ev, stage, batch_no, payload)
+        if self._listener is not None:
+            self._forward("on_event",
+                          replace(trace_ev, payload=redact_payload(payload, "none")))
 
     def _mirror(self, ev: str, stage: str, batch_no: int, payload: Mapping) -> None:
         if ev == EV_ERROR:

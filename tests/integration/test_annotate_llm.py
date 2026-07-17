@@ -21,6 +21,7 @@ from labelkit.operators.annotate import AnnotateStage
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ConsoleConfig,
     DedupConfig,
     ExtractConfig,
     GenerateConfig,
@@ -75,6 +76,7 @@ def make_cfg(trace: TraceConfig | None = None) -> ResolvedConfig:
     )
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={"default": profile},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="text", input="in"),

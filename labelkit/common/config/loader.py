@@ -15,6 +15,7 @@ array-table elements are addressed as "[[section.key]][N]" with N 1-based.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -37,6 +38,7 @@ from labelkit.common.config.model import (
     ClassSpec,
     ClassView,
     CliOverrides,
+    ConsoleConfig,
     Criterion,
     DedupConfig,
     EmbeddingProfile,
@@ -64,6 +66,11 @@ from labelkit.common.extensions.hooks import normalize_violations, resolve_hook
 __all__ = ["load", "default_rubric"]
 
 _MISSING = object()
+
+# v1.10 (spec 3.1.4 console row / §7.7): the rich-importability probe is
+# find_spec ONLY — the loader never imports rich (lazy import stays a CLI-layer
+# concern, U4/U21). Module-level alias so offline tests can inject the probe.
+_find_spec = importlib.util.find_spec
 
 _KEY_RE = re.compile(r"[a-z0-9_]+")
 
@@ -312,6 +319,45 @@ def _parse_tool(col: _Collector, file: str, data: Any) -> ToolConfig:
     return tool
 
 
+def _parse_console(col: _Collector, file: str, data: Any) -> ConsoleConfig:
+    """v1.10 (spec 5.1 [console] / 3.1.4 console row): tool-level three-mode
+    console section, whole section optional. mode enum, refresh_hz ∈ [1, 10],
+    heartbeat_s ≥ 0 — violations are AGGREGATED CONFIG_ERRORs (never
+    first-raise); unknown keys inside [console] stay forward-compat warnings
+    (standard finish()). ``mode_resolved`` keeps its dataclass default here —
+    load() freezes the real verdict at its end (U21)."""
+    t = _Tbl(col, file, "[console]", data)
+    mode = t.get_str("mode", "auto", enum=("auto", "rich", "plain"))
+    refresh_hz = t.get_int("refresh_hz", 5)
+    if not 1 <= refresh_hz <= 10:
+        col.error(f"{file}:[console].refresh_hz: 期望 [1, 10] 内的整数"
+                  f"（rich 画布重绘频率），得到 {refresh_hz}")
+        refresh_hz = 5
+    console = ConsoleConfig(
+        mode=mode,
+        refresh_hz=refresh_hz,
+        heartbeat_s=t.get_int("heartbeat_s", 0, minimum=0),
+        estimate=t.get_bool("estimate", False),
+        interactive=t.get_bool("interactive", True),
+    )
+    t.finish()
+    return console
+
+
+def _auto_console_mode(*, isatty: bool, log_format: str, term: str | None,
+                       rich_importable: bool) -> Literal["rich", "plain"]:
+    """v1.10 auto decision chain (spec §7.7 / 3.1.4 console row, U5/U25):
+    rich iff stderr.isatty() ∧ tool.log_format == "text" ∧ TERM 非 "dumb"/空
+    ∧ rich importable (find_spec probe). NO_COLOR does NOT participate (U25 —
+    rich natively strips color while keeping layout); TERM is a terminal
+    capability probe, not a config channel (§2.6 no-env-var rule untouched).
+    Pure function over injected probe values so every branch is offline-testable."""
+    if (isatty and log_format == "text" and term not in ("", "dumb", None)
+            and rich_importable):
+        return "rich"
+    return "plain"
+
+
 def _parse_key_envs(col: _Collector, t: _Tbl, data: dict) -> tuple[str, ...]:
     """v1.6 key pool (spec 3.1.4 API-Key row / 5.1): exactly one of
     ``api_key_env`` / ``api_key_envs`` is provided; both forms normalize to a
@@ -400,10 +446,18 @@ def _parse_embedding_profile(col: _Collector, file: str, name: str, data: dict) 
 
 
 def _parse_config_file(col: _Collector, file: str, data: dict) -> tuple[
-        ToolConfig, dict[str, LLMProfile], dict[str, EmbeddingProfile]]:
+        ToolConfig, ConsoleConfig, bool,
+        dict[str, LLMProfile], dict[str, EmbeddingProfile]]:
     top = _Tbl(col, file, "", data)
     _check_schema_version(col, top)
     tool = _parse_tool(col, file, _section(col, top, "tool"))
+    # v1.10: [console] is an OWNED top-level table now — taken here so finish()
+    # below never flags it as an unknown key. The explicit-rich probe reads the
+    # RAW table (dataclass default "auto" must not count as intent, U21/§7.7).
+    console_section = _section(col, top, "console")
+    console = _parse_console(col, file, console_section)
+    console_rich_explicit = (isinstance(console_section, dict)
+                             and console_section.get("mode") == "rich")
 
     llm_profiles: dict[str, LLMProfile] = {}
     llm_data = top.take("llm")
@@ -429,7 +483,7 @@ def _parse_config_file(col: _Collector, file: str, data: dict) -> tuple[
                 embedding_profiles[name] = _parse_embedding_profile(col, file, name, sub)
 
     top.finish()
-    return tool, llm_profiles, embedding_profiles
+    return tool, console, console_rich_explicit, llm_profiles, embedding_profiles
 
 
 # ── project.toml side ──────────────────────────────────────────────────────
@@ -1233,10 +1287,13 @@ def load(config_path: Path, project_path: Path,
     project_ok = project_data is not None
 
     tool = ToolConfig()
+    console = ConsoleConfig()
+    console_rich_explicit = False
     llm_profiles: dict[str, LLMProfile] = {}
     embedding_profiles: dict[str, EmbeddingProfile] = {}
     if config_ok:
-        tool, llm_profiles, embedding_profiles = _parse_config_file(col, fc, config_data)
+        (tool, console, console_rich_explicit,
+         llm_profiles, embedding_profiles) = _parse_config_file(col, fc, config_data)
 
     if project_ok:
         p = _parse_project_file(col, fp, project_data)
@@ -1843,6 +1900,37 @@ def load(config_path: Path, project_path: Path,
             col.warn(f"{fp}:[verify].llm: verify.llm 与 annotate.llm 使用同一模型 "
                      f"{_fmt(a_prof.model)}，存在自增强偏差风险（3.7.2）")
 
+    # ── v1.10 console: CLI precedence + mode_resolved freeze (spec 3.1.4 ─
+    # console row / §7.7, U21/U25). --console values are pre-validated by
+    # argparse choices; explicit rich = CLI --console rich OR the [console].mode
+    # key literally present in the TOML with value "rich".
+    effective_mode: str = cli.console if cli.console is not None else console.mode
+    explicit_rich = cli.console == "rich" or console_rich_explicit
+    if tool.log_format == "jsonl":
+        # §7.7 铁律: stderr 逐行可 json.loads — jsonl forces plain and CANNOT be
+        # overridden by explicit rich; the explicit conflict warns exactly once.
+        mode_resolved: str = "plain"
+        if explicit_rich:
+            col.warn('console: log_format="jsonl" 强制 plain——显式 rich 不生效'
+                     "（stderr 逐行可解析铁律，7.7）")
+    elif effective_mode == "plain":
+        mode_resolved = "plain"
+    elif effective_mode == "rich":
+        # Explicit rich is honored even without a TTY (CI ANSI-recording
+        # scenario, §7.7) — only importability can demote it.
+        if _find_spec("rich") is not None:
+            mode_resolved = "rich"
+        else:
+            mode_resolved = "plain"
+            col.warn("console: rich 不可导入，降级 plain")
+    else:  # auto — the §7.7 decision chain over terminal capability probes
+        mode_resolved = _auto_console_mode(
+            isatty=sys.stderr.isatty(),
+            log_format=tool.log_format,
+            term=os.environ.get("TERM"),
+            rich_importable=_find_spec("rich") is not None,
+        )
+
     _flush_warnings(col)
     if col.errors:
         raise ConfigError(col.errors)
@@ -1856,6 +1944,11 @@ def load(config_path: Path, project_path: Path,
         tool=ToolConfig(
             log_level=cli.log_level if cli.log_level is not None else tool.log_level,
             log_format=tool.log_format,
+        ),
+        console=replace(
+            console,
+            mode=effective_mode,             # type: ignore[arg-type] # CLI > config (2.5)
+            mode_resolved=mode_resolved,     # type: ignore[arg-type] # frozen verdict (U21)
         ),
         llm_profiles=llm_profiles,
         embedding_profiles=embedding_profiles,

@@ -12,6 +12,7 @@ from labelkit.common.observability import obslog
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ConsoleConfig,
     Criterion,
     DedupConfig,
     ExtractConfig,
@@ -48,6 +49,7 @@ def make_cfg(tmp_path, *, tool: ToolConfig | None = None,
              input_cfg: InputConfig | None = None) -> ResolvedConfig:
     return ResolvedConfig(
         tool=tool or ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
         run=RunConfig(output=str(tmp_path / "out.jsonl"), modality="text",
@@ -719,3 +721,222 @@ def test_circuit_breaker_hard_trip_is_immediate(tmp_path):
     # One auth-class fatal (401/403) opens the breaker at once — no streak.
     sink.record_provider_result(fatal=True, hard=True)
     assert sink.circuit_broken
+
+
+# ── v1.10: ProgressListener bypass (spec 3.12.3 / §7.7, U19/U22/U23) ────────
+
+
+class _Recorder:
+    """Minimal five-callback ProgressListener implementation (spec 3.12.3)."""
+
+    def __init__(self):
+        self.run_contexts = []
+        self.estimates = []
+        self.events = []
+        self.stages = []
+        self.stops = 0
+
+    def on_run_context(self, cfg, snapshot, counters, fatal_streak):
+        self.run_contexts.append((cfg, snapshot, counters, fatal_streak))
+
+    def on_estimate(self, est):
+        self.estimates.append(est)
+
+    def on_event(self, ev):
+        self.events.append(ev)
+
+    def on_stage(self, stage, batch_no):
+        self.stages.append((stage, batch_no))
+
+    def on_stop_requested(self):
+        self.stops += 1
+
+
+# stitch.judge-shaped payload: LLM free text (task_name/reason), input-derived
+# fields (target/value), excerpt and gen_ai messages ALL present — the U22
+# pre-redaction must strip every one of them before the bypass.
+LEAKY_PAYLOAD = {
+    "session_id": "s2",
+    "candidate": "episode",
+    "verdict": "resume",
+    "thread_ref": 1,
+    "priors": ["app_overlap", "entity_overlap"],
+    "merged": True,
+    "task_name": "预订明天上午的机票",              # _FREE_TEXT_KEYS (v1.9)
+    "reason": "同一订票任务的延续",                  # _FREE_TEXT_KEYS
+    "critiques": [{"aspect": "a", "opinion": "o"}],  # _FREE_TEXT_KEYS
+    "description": "在搜索框键入关键词",             # _FREE_TEXT_KEYS (v1.8)
+    "defects": [{"kind": "missing_tail", "detail": "缺尾帧"}],  # _FREE_TEXT_KEYS
+    "target": "搜索框",                              # _DATA_KEYS (v1.8)
+    "value": "明天上午去医院",                       # _DATA_KEYS
+    "excerpt": {"r1": LONG_TEXT},                    # excerpt tier only
+    "gen_ai.input.messages": [{"role": "user", "content": LONG_TEXT}],
+    "gen_ai.output.messages": [{"role": "assistant", "content": "ok"}],
+}
+
+
+def _sink_with_listener(tmp_path, listener, *, trace: TraceConfig | None = None):
+    cfg = make_cfg(tmp_path, trace=trace or TraceConfig())
+    log = EventLog(cfg.trace, "abc")
+    return MetricsSink(cfg, "abc", log, listener=listener), log
+
+
+def test_listener_forward_only_methods_forward(tmp_path):
+    rec = _Recorder()
+    sink, _ = _sink_with_listener(tmp_path, rec)
+    sink.stage_begin("dedup", 1)
+    sink.stage_begin("quality", 1)
+    sink.run_estimate({"total_batches": 5, "quality_calls": 128})
+    sink.stop_requested()
+    assert rec.stages == [("dedup", 1), ("quality", 1)]
+    assert rec.estimates == [{"total_batches": 5, "quality_calls": 128}]
+    assert rec.stops == 1
+
+
+def test_listener_on_event_forwarded_with_metadata(tmp_path):
+    rec = _Recorder()
+    sink, _ = _sink_with_listener(tmp_path, rec)
+    sink.event("quality.gate", stage="quality", batch_no=3, record_ids=("r1",),
+               payload={"aggregate": 0.7, "decision": "keep"})
+    assert len(rec.events) == 1
+    got = rec.events[0]
+    assert isinstance(got, TraceEvent)
+    assert (got.ev, got.stage, got.batch_no) == ("quality.gate", "quality", 3)
+    assert got.record_ids == ("r1",)               # record ids are structural (U22)
+    assert got.payload == {"aggregate": 0.7, "decision": "keep"}
+
+
+def test_forward_only_methods_produce_no_trace_event_no_stderr(tmp_path, capsys):
+    """U11/spec 3.12.3 ①: stage_begin/run_estimate/stop_requested are pure
+    bypass — no TraceEvent (the §7.2 catalog is untouched), no stderr line."""
+    trace = TraceConfig(enabled=True, path=str(tmp_path / "t.trace.jsonl"),
+                        channels=("quality", "segment", "llm"))
+    cfg = make_cfg(tmp_path, tool=ToolConfig(log_level="debug"), trace=trace)
+    setup_logging(cfg)
+    log = EventLog(cfg.trace, "abc")
+    sink = MetricsSink(cfg, "abc", log, listener=_Recorder())
+    sink.stage_begin("segment", 1)
+    sink.run_estimate({"total_batches": 2})
+    sink.stop_requested()
+    sink.flush()
+    log.close()
+    assert not (tmp_path / "t.trace.jsonl").exists()   # zero events written
+    assert log.events_written == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_on_event_payload_is_pre_redacted_at_none_tier(tmp_path):
+    """U22: the bypass payload passes redact_payload(payload, "none") — no
+    _FREE_TEXT_KEYS, no _DATA_KEYS, no excerpt, no gen_ai messages; structural
+    fields survive intact."""
+    rec = _Recorder()
+    sink, _ = _sink_with_listener(tmp_path, rec)
+    sink.event("stitch.judge", stage="stitch", batch_no=2, record_ids=("f1",),
+               payload=LEAKY_PAYLOAD)
+    got = rec.events[0].payload
+    for key in ("reason", "task_name", "critiques", "description", "defects",
+                "violations"):
+        assert key not in got, key                  # _FREE_TEXT_KEYS stripped
+    for key in ("target", "value"):
+        assert key not in got, key                  # _DATA_KEYS stripped
+    assert "excerpt" not in got
+    assert "gen_ai.input.messages" not in got
+    assert "gen_ai.output.messages" not in got
+    assert got["session_id"] == "s2"                # structural fields intact
+    assert got["verdict"] == "resume"
+    assert got["priors"] == ["app_overlap", "entity_overlap"]
+    assert got["merged"] is True
+    assert LONG_TEXT[:20] not in json.dumps(got, ensure_ascii=False)
+
+
+def test_event_log_still_receives_unredacted_payload(tmp_path):
+    """U22 builds a SECOND TraceEvent for the bypass: the one handed to
+    EventLog keeps the raw payload, and EventLog applies its OWN trace.content
+    tier at write time (content="full" here keeps the LLM free text)."""
+    rec = _Recorder()
+    trace = TraceConfig(enabled=True, path=str(tmp_path / "t.trace.jsonl"),
+                        channels=("stitch",), content="full")
+    sink, log = _sink_with_listener(tmp_path, rec, trace=trace)
+    sink.event("stitch.judge", stage="stitch", batch_no=1, record_ids=("f1",),
+               payload=LEAKY_PAYLOAD)
+    sink.flush()
+    log.close()
+    written = json.loads(
+        (tmp_path / "t.trace.jsonl").read_text(encoding="utf-8").splitlines()[0])
+    assert written["payload"]["reason"] == "同一订票任务的延续"     # full tier kept
+    assert written["payload"]["task_name"] == "预订明天上午的机票"
+    assert "reason" not in rec.events[0].payload                    # bypass stripped
+    # the module-level payload object itself is never mutated
+    assert LEAKY_PAYLOAD["reason"] == "同一订票任务的延续"
+
+
+class _ExplodingListener(_Recorder):
+    def on_event(self, ev):
+        raise RuntimeError("renderer bug")
+
+
+def test_listener_exception_warns_once_and_disables_permanently(tmp_path, caplog):
+    """U23: first forward failure → exactly one WARN + listener set to None;
+    the run (EventLog writes, mirrors, counters) is unaffected; later forwards
+    are no-ops."""
+    rec = _ExplodingListener()
+    trace = TraceConfig(enabled=True, path=str(tmp_path / "t.trace.jsonl"),
+                        channels=("quality",))
+    sink, log = _sink_with_listener(tmp_path, rec, trace=trace)
+    with caplog.at_level(logging.WARNING, logger="labelkit"):
+        sink.event("quality.gate", stage="quality", batch_no=1,
+                   record_ids=("a",), payload={"decision": "keep"})
+        sink.event("quality.gate", stage="quality", batch_no=1,
+                   record_ids=("b",), payload={"decision": "drop"})
+        sink.stage_begin("annotate", 1)             # silently dropped now
+    sink.flush()
+    log.close()
+    warns = [r for r in caplog.records if "console listener 异常" in r.message]
+    assert len(warns) == 1                          # WARN exactly once
+    assert "已停用面板旁路" in warns[0].getMessage()
+    assert sink._listener is None                   # permanently disabled
+    assert rec.stages == []                         # nothing forwarded after trip
+    lines = (tmp_path / "t.trace.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2                          # both events still written
+
+
+def test_listener_exception_in_forward_only_method_same_discipline(tmp_path, caplog):
+    class _BadStage(_Recorder):
+        def on_stage(self, stage, batch_no):
+            raise ValueError("boom")
+
+    rec = _BadStage()
+    sink, _ = _sink_with_listener(tmp_path, rec)
+    with caplog.at_level(logging.WARNING, logger="labelkit"):
+        sink.stage_begin("dedup", 1)
+        sink.stage_begin("quality", 1)
+        sink.run_estimate({"total_batches": 1})
+    warns = [r for r in caplog.records if "console listener 异常" in r.message]
+    assert len(warns) == 1
+    assert sink._listener is None
+    assert rec.estimates == []                      # disabled before run_estimate
+
+
+def test_listener_none_forward_methods_are_noops(tmp_path, capsys):
+    """spec 3.12.3 ④: listener=None (validate / every pre-v1.10 call path) is
+    byte-identical to v1.9 — the new methods are silent no-ops."""
+    cfg = make_cfg(tmp_path)
+    sink = MetricsSink(cfg, "abc", EventLog(cfg.trace, "abc"))
+    sink.stage_begin("dedup", 1)
+    sink.run_estimate({"total_batches": 1})
+    sink.stop_requested()
+    sink.event("quality.gate", stage="quality", batch_no=1,
+               record_ids=("a",), payload={"decision": "keep"})
+    assert sink._listener is None
+    assert capsys.readouterr().err == ""
+
+
+def test_fatal_streak_property_tracks_breaker_window(tmp_path):
+    cfg = make_cfg(tmp_path)     # fatal_error_threshold = 3
+    sink = MetricsSink(cfg, "abc", EventLog(cfg.trace, "abc"))
+    assert sink.fatal_streak == 0
+    sink.record_provider_result(fatal=True)
+    sink.record_provider_result(fatal=True)
+    assert sink.fatal_streak == 2
+    sink.record_provider_result(fatal=False)
+    assert sink.fatal_streak == 0                   # success resets the streak

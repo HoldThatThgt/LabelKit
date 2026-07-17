@@ -11,6 +11,7 @@ dependencies = [
     "imagehash>=4.3",
     "json-repair>=0.30",
     "numpy>=1.26",
+    "rich>=13.7",
 ]
 
 [project.scripts]

@@ -13,6 +13,7 @@ import pytest
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ConsoleConfig,
     Criterion,
     DedupConfig,
     ExtractConfig,
@@ -128,6 +129,7 @@ async def test_concurrency_smoke_4_calls_under_semaphore_2():
 def _full_trace_cfg(tmp_path, profile: LLMProfile) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={"default": profile},
         embedding_profiles={},
         run=RunConfig(output=str(tmp_path / "out.jsonl"), modality="text",

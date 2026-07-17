@@ -10,6 +10,7 @@ labelkit run --config <config.toml> --project <project.toml>
              [--input PATH] [--output PATH]
              [--limit N] [--dry-run] [--strict]
              [--log-level debug|info|warn|error]
+             [--console auto|rich|plain]
 ```
 
 | 参数 | 作用 |
@@ -20,6 +21,7 @@ labelkit run --config <config.toml> --project <project.toml>
 | `--dry-run` | 走完全部启动校验 + 输入扫描 + 成本估算，**不发一次 LLM 调用、不写主输出**。报告写 `{stem}.dryrun.report.json`；trace 写「trace 文件名在扩展名前插 .dryrun」（默认即 `{stem}.trace.dryrun.jsonl`），不覆盖上次真实运行的账本 |
 | `--strict` | 有任何记录被拒绝（dropped_* / failed 非零）⇒ 退出码 1。给 CI/定时任务用：让「有货被扔」成为可编程的失败信号。v1.9 交互补注：缝合产生的 `stitched` 壳与救援命中的帧**不构成 rejects**——同一份输入开启 `[stitch]` 后 strict 结果可能从 1 变 0（短段被救援、不再落 rejects），属预期（第 26 章） |
 | `--log-level` | 覆盖 `tool.log_level`。`debug` 会打出每次 LLM 调用摘要（延迟/token/重试） |
+| `--console` | v1.10：进度显示三档，覆盖 config.toml 的 `console.mode`（第 6 章）。`rich` = 双区实时面板，`plain` = 现行行式输出（与 v1.9 等价），`auto`（默认）按终端环境自动选档；`tool.log_format = "jsonl"` 时强制 plain、显式 rich 也不可覆盖（启动 WARN 一次）。三档详解见 15.6 与 16.6；`validate` 也接受本参数（15.2） |
 
 `--dry-run` 的输出示例（拿来做预算审批正合适）：
 
@@ -35,6 +37,7 @@ dry-run: no LLM calls made, no output written (report and trace only)
 
 ```
 labelkit validate --config <config.toml> --project <project.toml> [--probe]
+                  [--console auto|rich|plain]
 ```
 
 执行 M1 全量校验（TOML 语法、字段类型、profile 引用、Schema 元校验、rubric 校验、few-shot 示例校验、环境变量存在性），**校验通过输出 `配置校验通过`，退出码 0；不通过退出码 2**，且所有错误一次性列全：
@@ -67,6 +70,8 @@ probe <profile>[<ENV名>]: FAIL <错误信息>
 
 - **FAIL ≠ 密钥失效**。正被限流的密钥并没有「死」——运行期的 429 只会让该密钥进入冷却、由池内其余密钥顶上（第 6 章），但 probe 恰好打在冷却窗口里时照样是一行 FAIL。脚本 grep FAIL 时请区分错误内容：401/403 是密钥级确定性故障，429 只是暂时限流。probe 失败从不改变退出码的约定对逐密钥行同样成立——哪怕整池 FAIL，validate 仍以 0 结束；
 - 密钥池下 401/403 的熔断语义也随之变化：运行期先按密钥禁用，仅当被禁用的是**最后一把**存活密钥才立即熔断（第 6 章）——所以「probe 里一把密钥 401、其余 ok」的池仍然能跑，只是白白少了一把密钥，建议开跑前修好。
+
+**`--console` 在 validate 上同样生效（v1.10）**：参数照常进配置装载——`log_format = "jsonl"` 与显式 rich 的冲突 WARN 在 validate 路径同样会出现。它对 validate 输出的唯一影响是 `--probe` 的结果呈现：rich 档且 **stdout 是 TTY** 时，探测结果渲染为一张表格；其余情形（脚本、重定向）保持上述行式输出逐字节不变——`grep FAIL` 的既有脚本不受影响。
 
 ## 15.3 `labelkit rubric`：导出内置评价准则
 
@@ -140,8 +145,8 @@ uv run labelkit run ... --strict; echo "exit=$?"
 运行期间 stderr 的信息分三类（第 16 章细讲）：
 
 - **运行日志**：生命周期与警告（`run.start`、`batch.end`、`ingest.bad_line`……），级别受 `--log-level` 控制；
-- **进度显示**：仅 TTY 下有批级进度行（当前批号 + 各状态累计计数；总批数与成本累计未接入进度显示，成本看 report.json）。它不经日志设施、不受 `--log-level` 影响；`tool.log_format = "jsonl"` 时禁用，使经日志模块输出的运行日志可逐行 `json.loads` 解析——注意仍有少量**不经日志模块**的纯文本行（结束时的三行终版摘要、配置装载期的 `warning:` 行、`--dry-run` 的估算行），采集侧需容忍或过滤。非 TTY（重定向、CI）下进度显示不输出——此时看到的每批一行摘要实为 `batch.end` 事件的 INFO 日志行，属于运行日志、受 `--log-level` 控制；
-- **结束摘要**：与 report.counts 逐项一致的终版对账单。
+- **进度显示（console，v1.10 起三档）**：`--console auto|rich|plain`，默认 auto 按终端环境自动选档（判定链见 16.6）。**plain** 是现行行式输出、也是回归锚（与 v1.9 等价）：TTY 下单行批级进度行（当前批号 + 各状态累计计数），非 TTY（重定向、CI）不输出进度——此时看到的每批一行摘要实为 `batch.end` 事件的 INFO 日志行，属运行日志、受 `--log-level` 控制（另有可选心跳行，默认关，16.6）。**rich** 是双区内联实时面板：日志照常在上方滚动（行文本与 plain 逐字节一致），底部画布原地重绘六个区块——标头（run_id / 模式 / 耗时 / ETA）、批进度、流水线段棋盘、各状态计数账、LLM 用量与密钥池 / 熔断、键位提示与中断横幅；键盘开关是封闭键集 `? l e + - p q`（`h` 为 `?` 同义键），`q` 随时脱离面板、余下运行降回 plain（全表见 16.6）。**jsonl 强制 plain**：`tool.log_format = "jsonl"` 时显式 rich 也不可覆盖（启动 WARN 一次），保证经日志模块输出的运行日志可逐行 `json.loads` 解析——注意仍有少量**不经日志模块**的纯文本行（结束时的终版摘要、配置装载期的 `warning:` 行、`--dry-run` 的估算行），采集侧需容忍或过滤。三档都不经日志设施、不受 `--log-level` 影响；rich 渲染异常自动降级 plain 续跑，永不影响退出码与产出（16.6）；
+- **结束摘要**：与 report.counts 逐项一致的终版对账单（plain 档为下方的文本版；rich 档为定格终版面板里的表格，数值同源）。
 
 ```
    ── 终版摘要（与 report.counts 逐项一致）──

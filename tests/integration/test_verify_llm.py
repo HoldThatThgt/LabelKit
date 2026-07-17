@@ -26,6 +26,7 @@ import pytest
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ConsoleConfig,
     Criterion,
     DedupConfig,
     ExtractConfig,
@@ -200,6 +201,7 @@ def _cfg(trace: TraceConfig | None = None) -> ResolvedConfig:
     )
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={"judge": judge},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="text", input="in"),

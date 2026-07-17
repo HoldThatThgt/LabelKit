@@ -24,6 +24,7 @@ from jsonschema import Draft202012Validator
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ConsoleConfig,
     Criterion,
     DedupConfig,
     ExtractConfig,
@@ -175,6 +176,7 @@ def make_cfg(quality: QualityConfig) -> ResolvedConfig:
                          api_key=os.environ.get(ZAI_KEY_ENV, ""))
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={"default": profile},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="text", seed=7),

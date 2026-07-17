@@ -172,7 +172,7 @@ user（单条消息多 text Part：线索卡在前——按最近活跃降序、
 
 †† `task_name` / `reason` 为 LLM 自由文本——入 `_FREE_TEXT_KEYS` 脱敏集（7.4，v1.9 增 `task_name`）：`none` 档剥除、`refs` 档起携带；其余 payload 字段均为结构字段，全档保留。
 
-计数与归属：`report.stream.stitch = {stitched, rescued_short, seams, judgments, repass_judgments, failures}`（M16 属主，6.4——judgments / repass_judgments 计一遍/二遍**逻辑判定数**：每候选一判、失败不计；votes > 1 放大调用数不放大判定数）；`counts.stitched`（壳终态 tally）与 `counts.threads`（= episodes − stitched 导出式）由 M10 计量（counts.* 属主不变，3.10.3）——threads 仅落 `counts.threads` 单点，避免双落点；`batch.end` payload 增 `stitched` / `threads`（仅启用时携带，7.2）。**壳的范围规范句**：`stitched` 仅计被并 **episode 信封**壳；救援短段无信封形态（由帧重组），命中只计 `rescued_short` 帧翻转、**不产生壳**。stderr 进度条与终版摘要为固定键集，stitched 不显示（fanout / episodes 先例，报表与 batch.end 可见——有意为之，7.7）。`--strict` 交互（3.11.2 / 2.4 补注）：stitched 壳与 rescued 帧均不构成 rejects——同输入开启 stitch 后（短段被救援而不再落 rejects）strict 结果可能 1→0，**属预期**。
+计数与归属：`report.stream.stitch = {stitched, rescued_short, seams, judgments, repass_judgments, failures}`（M16 属主，6.4——judgments / repass_judgments 计一遍/二遍**逻辑判定数**：每候选一判、失败不计；votes > 1 放大调用数不放大判定数）；`counts.stitched`（壳终态 tally）与 `counts.threads`（= episodes − stitched 导出式）由 M10 计量（counts.* 属主不变，3.10.3）——threads 仅落 `counts.threads` 单点，避免双落点；`batch.end` payload 增 `stitched` / `threads`（仅启用时携带，7.2）。**壳的范围规范句**：`stitched` 仅计被并 **episode 信封**壳；救援短段无信封形态（由帧重组），命中只计 `rescued_short` 帧翻转、**不产生壳**。stderr 进度条与终版摘要为固定键集，stitched 不显示（fanout / episodes 先例，报表与 batch.end 可见——有意为之；v1.10 U18：本约束收窄为 **plain 面专属**，rich 面板状态账展示 stitched/threads、与 report.counts 口径对齐，7.7）。`--strict` 交互（3.11.2 / 2.4 补注）：stitched 壳与 rescued 帧均不构成 rejects——同输入开启 stitch 后（短段被救援而不再落 rejects）strict 结果可能 1→0，**属预期**。
 
 ### 3.16.7 背书
 

@@ -34,6 +34,10 @@ from typing import TYPE_CHECKING, Any, Mapping
 from labelkit import TOOL_VERSION
 from labelkit.common.errors import ErrorKind, LabelKitError
 from labelkit.common.contracts.types import PipelineItem, Record, StageError
+# v1.10 (U21): the plain progress/summary line formats live in a common-layer
+# pure-function module shared with the CLI renderer (operators → common is the
+# sanctioned dependency direction; cli ↛ operators stays intact).
+from labelkit.common.observability import console_format
 
 if TYPE_CHECKING:  # pragma: no cover — service modules may not exist yet at import time
     from labelkit.common.config.model import ResolvedConfig
@@ -544,18 +548,16 @@ class Emitter:
     def _progress(self, batch_no: int) -> None:
         """TTY batch-level progress (spec §7.7): current batch number + cumulative
         per-status counts. Total-batch count and running cost are known only to
-        M10/M9 and are not plumbed into the emitter (accepted reduction)."""
+        M10/M9 and are not plumbed into the emitter (accepted reduction).
+        v1.10 (U21): the rich static gate comes FIRST (the panel supersedes this
+        line; mid-run demotion/`q` detach is the renderer's job, printing the
+        same ``console_format`` line); the plain path is byte-identical to v1.9."""
+        if self._cfg.console.mode_resolved == "rich":
+            return
         if not sys.stderr.isatty() or self._cfg.tool.log_format == "jsonl":
             return
-        t = self._status_totals
-        sys.stderr.write(
-            f"\rlabelkit: 批 {batch_no}"
-            f"  emitted={self._emitted_total}"
-            f"  dropped_dup={t.get('dropped_dup', 0)}"
-            f"  dropped_lowq={t.get('dropped_lowq', 0)}"
-            f"  dropped_verify={t.get('dropped_verify', 0)}"
-            f"  failed={t.get('failed', 0)}"
-        )
+        sys.stderr.write(console_format.format_progress_line(
+            batch_no, self._emitted_total, self._status_totals))
         sys.stderr.flush()
         self._progress_active = True
 
@@ -566,19 +568,14 @@ class Emitter:
             self._progress_active = False
 
     def _print_summary(self, report: Mapping) -> None:
+        """v1.10 (U21): same rich static gate as ``_progress`` (rich mode swaps
+        in the renderer's table version, values from the same report); the plain
+        path writes the ``console_format`` lines byte-identically to v1.9."""
+        if self._cfg.console.mode_resolved == "rich":
+            return
         counts = dict(report.get("counts", {}))
-        line1 = "  ".join(
-            f"{k}={counts.get(k, 0)}" for k in ("scanned", "ingested", "bad_input", "generated")
-        )
-        line2 = "  ".join(
-            f"{k}={counts.get(k, 0)}"
-            for k in ("dropped_dup", "dropped_lowq", "dropped_verify", "failed", "emitted")
-        )
         sys.stderr.write(
-            "   ── 终版摘要（与 report.counts 逐项一致）──\n"
-            f"   {line1}\n"
-            f"   {line2}\n"
-        )
+            "\n".join(console_format.format_summary_lines(counts)) + "\n")
         sys.stderr.flush()
 
 

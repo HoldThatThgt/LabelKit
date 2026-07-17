@@ -10,7 +10,32 @@ from typing import Literal, Mapping
 @dataclass(frozen=True)
 class ToolConfig:
     log_level: str = "info"                       # debug|info|warn|error; overridden by --log-level
-    log_format: Literal["text", "jsonl"] = "text" # jsonl disables the progress bar (spec §7.7)
+    log_format: Literal["text", "jsonl"] = "text" # jsonl forces console plain (spec §7.7)
+
+
+@dataclass(frozen=True)
+class ConsoleConfig:                              # v1.10 (spec 5.1 [console]): the three-mode
+                                                  # console/progress face (§7.7); tool-level —
+                                                  # deployment property, whole section optional
+    mode: Literal["auto", "rich", "plain"] = "auto"
+                                                  # overridden by CLI --console; auto decision
+                                                  # chain in §7.7 (U5/U25)
+    refresh_hz: int = 5                           # rich canvas repaint rate, 1–10 inclusive
+                                                  # (out of range = CONFIG_ERROR, spec 3.1.4)
+    heartbeat_s: int = 0                          # plain ∧ non-TTY only: one data-free summary
+                                                  # line every N s; 0 = off (default, U14 —
+                                                  # keeps the regression anchor); < 0 = CONFIG_ERROR
+    estimate: bool = False                        # text modality only: startup estimate scan
+                                                  # buys the batch-total denominator + ETA
+                                                  # (one extra input pass, U17)
+    interactive: bool = True                      # rich ∧ stdin TTY ∧ termios: keyboard toggles
+                                                  # (closed key set ? l e + - p q; h=?, §3.4);
+                                                  # false = render-only (U15)
+    mode_resolved: Literal["rich", "plain"] = "plain"
+                                                  # parse PRODUCT — computed by the loader at
+                                                  # load() end (spec 3.1.4 console row, U21):
+                                                  # the frozen auto-chain verdict the emitter
+                                                  # static-gates on
 
 
 @dataclass(frozen=True)
@@ -340,11 +365,15 @@ class CliOverrides:
     dry_run: bool = False
     strict: bool = False
     log_level: str | None = None
+    console: str | None = None                    # v1.10: --console auto|rich|plain (spec §7.7;
+                                                  # argparse choices pre-validate the value)
 
 
 @dataclass(frozen=True)
 class ResolvedConfig:
     tool: ToolConfig
+    console: ConsoleConfig                        # v1.10 (spec 5.1 [console]); mode_resolved
+                                                  # frozen by M1 at load() end (3.1.4, U21)
     llm_profiles: Mapping[str, LLMProfile]        # key = profile name
     embedding_profiles: Mapping[str, EmbeddingProfile]
     run: RunConfig

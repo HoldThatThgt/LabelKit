@@ -12,3 +12,6 @@ out/
 CLAUDE.md
 AGENTS.md
 uv.lock
+
+# 设计文档 PDF 构建的 Chrome 临时 profile（tools/build_design_doc.py）
+.chrome-pdf-profile/

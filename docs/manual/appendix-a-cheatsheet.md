@@ -9,7 +9,12 @@
 |---|---|---|---|---|
 | `schema_version` | int | 必填=1 | 配置格式版本 | 6 |
 | `tool.log_level` | str | "info" | stderr 级别（debug/info/warn/error），被 --log-level 覆盖 | 6 |
-| `tool.log_format` | str | "text" | "jsonl" 供采集系统；**同时禁用进度条** | 6/16 |
+| `tool.log_format` | str | "text" | "jsonl" 供采集系统；**同时强制 console plain 档**（显式 rich 不可覆盖，WARN 一次） | 6/16 |
+| `console.mode` | str | "auto" | v1.10 进度显示三档 "auto" \| "rich" \| "plain"，被 CLI `--console` 覆盖；auto = TTY ∧ text ∧ TERM 非 dumb/空 ∧ rich 可导入取 rich，否则 plain（NO_COLOR 不参与——剥色保布局）；解析产物 `mode_resolved` 为内部字段 | 6/16 |
+| `console.refresh_hz` | int | 5 | rich 画布重绘频率，**1–10 越界即配置错误** | 6/16 |
+| `console.heartbeat_s` | int | 0 | 仅 plain 且非 TTY：每 N 秒一行数据无关心跳；**0=关（默认），<0 即配置错误** | 6/16 |
+| `console.estimate` | bool | false | 仅文本模态：多读一遍输入换批总数分母 + ETA；UI 模态恒有分母、本键无效 | 6/16 |
+| `console.interactive` | bool | true | rich ∧ stdin TTY ∧ termios 可用时启用键盘开关（`? l e + - p q`；h=?）；false=纯渲染 | 6/16 |
 | `llm.<name>` | table | ≥1 个 | LLM 接入档，name 被 project 引用 | 6 |
 | `llm.*.provider` | str | 必填 | "openai_compatible" \| "anthropic" | 6 |
 | `llm.*.base_url` | str | 必填 | API 根地址（不带 /chat/completions） | 6 |

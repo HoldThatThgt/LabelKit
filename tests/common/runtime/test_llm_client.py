@@ -6,6 +6,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import random
+from collections import deque
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from pathlib import Path
@@ -17,11 +18,13 @@ from labelkit.common.config.model import EmbeddingProfile, LLMProfile
 from labelkit.common.errors import ProviderFatalError
 from labelkit.common.runtime.llm_client import (
     ANTHROPIC_VERSION,
+    KeySnapshot,
     KeyUsage,
     LLMClient,
     Message,
     Part,
     ProbeResult,
+    ProfileSnapshot,
     ProfileUsage,
     PromptBundle,
     _accumulate_usage,
@@ -721,3 +724,178 @@ def test_max_park_s_reads_run_config(tmp_path):
     sink0 = MetricsSink(cfg0, "t", EventLog(cfg0.trace, "t"))
     assert LLMClient({}, {}, sink0)._max_park_s() == 0.0
     assert LLMClient({}, {})._max_park_s() == 3600.0
+
+
+# ── v1.10: snapshot() read-only console pull (spec 3.9.2/3.9.3 快照行) ──────
+
+
+def test_snapshot_unmaterialized_pool_zero_values():
+    """No traffic yet: keys derive from the DECLARED env names, everything
+    else is zero/None — and snapshot() must NOT materialize self._pools."""
+    client = LLMClient({"default": _llm_profile()}, {"embed": _embedding_profile()})
+    snaps = client.snapshot()
+    assert client._pools == {}                      # read never materializes
+    assert [(s.kind, s.name) for s in snaps] == [("llm", "default"),
+                                                 ("embedding", "embed")]
+    llm_snap, emb_snap = snaps
+    assert llm_snap == ProfileSnapshot(
+        name="default", kind="llm", in_flight=0,
+        max_concurrency=2,                          # mirrors the profile
+        calls=0, retries=0, prompt_tokens=0, completion_tokens=0,
+        est_cost_usd=None, p50_latency_ms=None,
+        keys=(KeySnapshot(env="TEST_KEY", state="ok"),))
+    assert emb_snap.max_concurrency == 8
+    assert emb_snap.keys == (KeySnapshot(env="TEST_KEY", state="ok"),)
+
+
+def test_snapshot_unmaterialized_multi_key_pool_lists_declared_envs():
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"), api_keys=("ka", "kb"))
+    client = LLMClient({"default": prof}, {})
+    (snap,) = client.snapshot()
+    assert snap.keys == (KeySnapshot(env="KEY_A", state="ok"),
+                         KeySnapshot(env="KEY_B", state="ok"))
+    assert client._pools == {}
+
+
+def test_snapshot_enumerates_llm_then_embedding_in_declaration_order():
+    client = LLMClient(
+        {"default": _llm_profile(), "judge": _llm_profile(name="judge")},
+        {"embed": _embedding_profile()})
+    assert [(s.kind, s.name) for s in client.snapshot()] == [
+        ("llm", "default"), ("llm", "judge"), ("embedding", "embed")]
+
+
+def test_snapshot_key_states_cooldown_remaining_with_injected_now():
+    """Pool three-state row (spec 3.9.2): disabled wins over a future cooldown;
+    cooldown carries ceil remaining seconds; deadline-passed keys are ok.
+    in_flight = Σ key in_flight."""
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B", "KEY_C"),
+                        api_keys=("ka", "kb", "kc"))
+    client = LLMClient({"default": prof}, {})
+    pool = client._pool("llm", prof)                # materialize (as traffic would)
+    pool.states[0].in_flight = 2
+    pool.states[1].in_flight = 1
+    pool.states[1].cooldown_until = 100.0
+    pool.states[2].disabled = True
+    pool.states[2].cooldown_until = 999.0           # disabled wins over cooldown
+
+    (snap,) = client.snapshot(now=87.6)
+    assert snap.in_flight == 3
+    assert snap.keys == (
+        KeySnapshot(env="KEY_A", state="ok"),
+        KeySnapshot(env="KEY_B", state="cooldown",
+                    cooldown_remaining_s=13),       # ceil(100 - 87.6) = 13
+        KeySnapshot(env="KEY_C", state="disabled"),
+    )
+    # cooldown deadline reached → back to ok, remaining 0
+    (snap2,) = client.snapshot(now=100.0)
+    assert snap2.keys[1] == KeySnapshot(env="KEY_B", state="ok")
+
+
+def test_snapshot_usage_mirror_and_cost():
+    client = LLMClient({"default": _llm_profile()}, {})
+    client._usage["default"] = ProfileUsage(
+        calls=3, prompt_tokens=9552, completion_tokens=486, retries=2,
+        est_cost_usd=0.0066)
+    (snap,) = client.snapshot()
+    assert (snap.calls, snap.retries) == (3, 2)
+    assert (snap.prompt_tokens, snap.completion_tokens) == (9552, 486)
+    assert snap.est_cost_usd == 0.0066
+
+
+def test_snapshot_p50_median_window_and_none_when_empty():
+    client = LLMClient({"default": _llm_profile()}, {})
+    (snap,) = client.snapshot()
+    assert snap.p50_latency_ms is None              # no samples yet
+    client._latencies[("llm", "default")] = deque([100, 200, 300], maxlen=256)
+    (snap,) = client.snapshot()
+    assert snap.p50_latency_ms == 200
+    # even count: median 150.5 → int() per spec signature (int | None)
+    client._latencies[("llm", "default")] = deque([100, 201], maxlen=256)
+    (snap,) = client.snapshot()
+    assert snap.p50_latency_ms == 150
+
+
+def test_snapshot_p50_window_is_bounded_at_256():
+    client = LLMClient({"default": _llm_profile()}, {})
+    window = client._latencies.setdefault(("llm", "default"), deque(maxlen=256))
+    for v in range(300):                            # 0..299 → window keeps 44..299
+        window.append(v)
+    (snap,) = client.snapshot()
+    assert len(window) == 256
+    assert snap.p50_latency_ms == int((171 + 172) / 2)
+
+
+def test_snapshot_kind_disambiguates_same_name_profiles():
+    """spec 3.9.2: _usage buckets by NAME (existing quirk) — kind disambiguates
+    the snapshot identity, and the p50 window is keyed by (kind, name)."""
+    client = LLMClient({"shared": _llm_profile(name="shared")},
+                       {"shared": _embedding_profile(name="shared")})
+    client._usage["shared"] = ProfileUsage(calls=3)
+    client._latencies[("llm", "shared")] = deque([100], maxlen=256)
+    client._latencies[("embedding", "shared")] = deque([300], maxlen=256)
+    llm_snap, emb_snap = client.snapshot()
+    assert (llm_snap.kind, emb_snap.kind) == ("llm", "embedding")
+    assert llm_snap.name == emb_snap.name == "shared"
+    assert llm_snap.calls == emb_snap.calls == 3    # by-name bucket, both mirror
+    assert llm_snap.p50_latency_ms == 100
+    assert emb_snap.p50_latency_ms == 300
+
+
+def test_snapshot_never_mutates_client_state():
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"), api_keys=("ka", "kb"))
+    emb = _embedding_profile()
+    client = LLMClient({"default": prof}, {"embed": emb})
+    client._pool("llm", prof)                       # one materialized pool
+    client._latencies[("llm", "default")] = deque([50, 60], maxlen=256)
+    client._usage["default"].calls = 7
+
+    pools_before = dict(client._pools)
+    usage_before = {k: (v.calls, v.retries) for k, v in client._usage.items()}
+    lat_before = {k: list(v) for k, v in client._latencies.items()}
+
+    first = client.snapshot(now=10.0)
+    second = client.snapshot(now=10.0)
+    assert first == second                          # pure read is idempotent
+    assert client._pools == pools_before            # embed pool NOT materialized
+    assert set(client._pools) == {("llm", "default")}
+    assert {k: (v.calls, v.retries) for k, v in client._usage.items()} == usage_before
+    assert {k: list(v) for k, v in client._latencies.items()} == lat_before
+
+
+def test_snapshot_joins_per_key_usage_mirror():
+    """KeySnapshot carries the per-key KeyUsage mirror (calls / rate_limited)
+    — the panel's 'l' expanded view data source (spec 3.9.2 / §7.7)."""
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"), api_keys=("ka", "kb"))
+    client = LLMClient({"default": prof}, {})
+    client._pool("llm", prof)
+    client._usage["default"].keys["KEY_A"].calls = 41
+    client._usage["default"].keys["KEY_B"].calls = 12
+    client._usage["default"].keys["KEY_B"].rate_limited = 3
+    (snap,) = client.snapshot(now=0.0)
+    assert (snap.keys[0].calls, snap.keys[0].rate_limited) == (41, 0)
+    assert (snap.keys[1].calls, snap.keys[1].rate_limited) == (12, 3)
+
+
+def test_snapshot_nonblocking_inside_running_loop():
+    """spec §7.8 协议 row: snapshot() is a plain sync read — callable from a
+    coroutine amid a concurrent gather without awaiting, locking, or blocking
+    the event loop (U26: the render tick calls it between awaits)."""
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"), api_keys=("ka", "kb"))
+    client = LLMClient({"default": prof}, {})
+    client._pool("llm", prof)
+
+    async def sampler() -> list:
+        out = []
+        for _ in range(50):
+            out.append(client.snapshot())
+            await asyncio.sleep(0)                  # yield to the sibling task
+        return out
+
+    async def main() -> list:
+        a, b = await asyncio.gather(sampler(), sampler())
+        return a + b
+
+    for snaps in asyncio.run(main()):
+        (snap,) = snaps
+        assert snap.name == "default" and len(snap.keys) == 2

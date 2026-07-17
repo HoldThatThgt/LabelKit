@@ -39,6 +39,34 @@ class LLMClient:
     @property
     def usage_by_profile(self) -> dict[str, Usage]        # 报告用累计计量（v1.6：池化 profile 另含逐密钥
                                                           # calls/rate_limited/disabled 与驻留统计，6.4）
+
+    def snapshot(self, now: float | None = None) -> tuple[ProfileSnapshot, ...]
+        """v1.10（7.7 console 面板数据源，U19/U26）。纯读、无 await、无锁；仅从渲染 tick
+           （事件循环线程内）调用——同线程下与并发 gather 无争用。now 注入供离线测试
+           （_KeyPool 同风格）。全量枚举 [llm.*] 与 [embedding.*] profile；密钥池未物化时
+           从声明构造零值 KeySnapshot（snapshot 不物化池——读操作不改状态）。"""
+
+@dataclass(frozen=True)
+class KeySnapshot:                                # v1.10
+    env: str                                      # 环境变量名——唯一可展示身份（密钥值任何面均不出现）
+    state: Literal["ok", "cooldown", "disabled"]
+    cooldown_remaining_s: int = 0
+    calls: int = 0                                # 逐密钥用量镜像（KeyUsage）——面板 'l' 展开视图
+    rate_limited: int = 0                         # 数据源（7.7）；池未物化时为 0
+
+@dataclass(frozen=True)
+class ProfileSnapshot:                            # v1.10
+    name: str
+    kind: Literal["llm", "embedding"]             # usage 按 name 合桶的既有口径由 kind 消歧
+    in_flight: int                                # Σ 密钥 in_flight（在线 HTTP 请求数，不含驻留/退避）
+    max_concurrency: int
+    calls: int
+    retries: int
+    prompt_tokens: int
+    completion_tokens: int
+    est_cost_usd: float | None                    # 未配价目为 None（面板显示 "—"）
+    p50_latency_ms: int | None                    # 有界样本窗中位数；无样本为 None
+    keys: tuple[KeySnapshot, ...]                 # 池 = 1 时单元素
 ```
 
 ### 3.9.3 行为规格
@@ -51,6 +79,7 @@ class LLMClient:
 | 密钥池（v1.6） | profile 以 `api_key_envs = [...]`（5.1，与 `api_key_env` 恰提供其一）声明多把密钥，同 base_url、同 model 构成**同构池**；单密钥配置 = 池大小 1：数据产出、重试记账与熔断/退出语义与 v1.5 一致，429 等待路径为 v1.6 行为修订（见重试行：`Retry-After` 等待受 `run.max_park_s` 约束；无 `Retry-After` 冷却封顶 300s 且按密钥跨调用计数；驻留发 WARN 与事件）。**选择**：每次请求尝试发出前选「在途请求数最少」的可用密钥（并列取声明序靠前者；确定性算法、无 RNG——密钥选择只影响时序不影响数据内容，与重试抖动同属 seed 豁免，2.6 可复现性不受影响），请求头按所选密钥逐次构造。**每密钥 429 冷却**：含 `Retry-After` 时冷却其全时长；缺失时按 `random(0, retry_base_delay_s × 2^c)` 全抖动冷却、封顶 300s（c = 该密钥连续 429 计数，跨逻辑调用累计，**该密钥自身**任一成功清零）——无 `Retry-After` 的持续限流由此以每密钥 ≤ 每 5 分钟一次的探测频率自愈。冷却不改重试记账：该次尝试照常消耗一次重试预算，但下次尝试立即换可用密钥重发（`llm.key_cooldown` 事件，7.2）。**认证禁用**：密钥 401/403 ⇒ 本运行内永久禁用（stderr WARN 一次 + `llm.key_disabled` 事件，携环境变量名）；池内尚有存活密钥 ⇒ 同一尝试立即换密钥重发，不消耗重试预算、不计入熔断（认证失败是密钥级确定性故障，每密钥至多发生一次，轮换次数以池大小为界）；禁用的是**最后一把**存活密钥 ⇒ 等价 v1.5 认证首错：立即熔断、退出码 4（3.10.3）。配额以 403 形态出现的 provider 同按认证禁用处理，不做错误体嗅探（1.6 对齐决策 ④）。**驻留**：全部存活密钥均在冷却 ⇒ 调用驻留至最早冷却结束（`llm.pool_parked` 事件 + stderr WARN；≤60s 分片休眠，每片重查熔断器——v1.5 排队调用熔断复查语义保持）；驻留不消耗重试预算，单次逻辑调用累计驻留（跨多段驻留求和，不含信号量排队等待）> `run.max_park_s`（5.2，默认 3600，0 = 不驻留）⇒ 按重试耗尽抛 `ProviderRetryableError`（记录 failed、计入熔断窗口，1.6 对齐决策 ③）；最早冷却结束时刻已可证超出剩余驻留预算时立即按同路径失败，不空耗墙钟。驻留发生在**已获取的信号量槽内并持有该槽**——全池冷却时吞吐本为零，放槽只会放入更多注定驻留的调用。降级阶梯：**轮换（零等待）→ 驻留（有界）→ 记录失败累积 → 熔断退出 4**。400/404 等请求形错误与密钥无关：不轮换，行为同 v1.5。`embed()` 与 `[embedding.*]` profile 适用同一机制。 |
 | 图像编码 | 调用时读盘 → 若长边 > `profile.max_image_px`（默认 2048）按比例缩小再编码（Pillow）→ base64 → 请求发出后即释放字节（懒加载契约，2.6 节）。 |
 | 计量 | 从响应 usage 字段累计 prompt/completion token；`profile.price_per_mtok_in/out`（可选配置）存在时折算成本入报告。 |
+| 快照（v1.10） | `snapshot()`（3.9.2）为 console 面板的只读拉取面（7.7，每 tick 一次）：`in_flight` = Σ 密钥在途（在线 HTTP 请求数口径）、密钥三态（ok / cooldown 携剩余秒 / disabled）、用量镜像 usage、**p50 延迟 = 每 (kind, profile) 有界样本窗 `deque(maxlen=256)` 的中位数**（成功逻辑调用口径，`_post_with_retries` 成功返回前喂入——v1.10 唯一新增采集点）；窗口与中位数**不入 report.json**（报告零新键，7.7）、不入任何事件。 |
 
 **背书：**「统一多 provider 异步客户端 + 信号量并发 + 指数退避」与 distilabel 的 LLM 抽象层 [5]、NeMo Curator 的服务客户端 [9] 同构；全抖动退避为 AWS 架构规范确立的工业标准。
 

@@ -16,6 +16,7 @@ import pytest
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ConsoleConfig,
     DedupConfig,
     ExtractConfig,
     GenerateConfig,
@@ -43,6 +44,7 @@ JPEG_MAGIC = b"\xff\xd8\xff"
 def make_cfg(tmp_path: Path, modality: str = "text", **input_kw) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
         run=RunConfig(output=str(tmp_path / "out.jsonl"), modality=modality,
@@ -785,6 +787,7 @@ def make_stream_cfg(tmp_path: Path, *, modality: str = "text",
              limit: int | None = None, **input_kw) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
         run=RunConfig(output=str(tmp_path / "out.jsonl"), modality=modality,

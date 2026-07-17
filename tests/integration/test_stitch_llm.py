@@ -31,6 +31,7 @@ import pytest
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ConsoleConfig,
     DedupConfig,
     ExtractConfig,
     GenerateConfig,
@@ -98,6 +99,7 @@ def _profile(name: str) -> LLMProfile:
 def make_cfg(votes: int = 1) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={"default": _profile("default")},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="ui", input="data"),

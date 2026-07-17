@@ -15,6 +15,7 @@ from labelkit.common.config.model import (
     ClassSpec,
     ClassView,
     ClassifyConfig,
+    ConsoleConfig,
     DedupConfig,
     ExtractConfig,
     GenerateConfig,
@@ -77,6 +78,7 @@ def mk_cfg(generate: GenerateConfig | None = None, quality: QualityConfig | None
            class_views: dict[str, ClassView] | None = None) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="text", mode=mode),

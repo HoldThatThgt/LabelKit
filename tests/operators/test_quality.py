@@ -33,6 +33,7 @@ from labelkit.common.config.model import (
     ClassifyConfig,
     ClassSpec,
     ClassView,
+    ConsoleConfig,
     Criterion,
     DedupConfig,
     ExtractConfig,
@@ -105,6 +106,7 @@ def make_cfg(quality: QualityConfig, criteria: tuple[Criterion, ...] = (EDU,),
              trace: TraceConfig | None = None) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="text"),

@@ -20,6 +20,7 @@ from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
     ClassSpec,
+    ConsoleConfig,
     DedupConfig,
     ExtractConfig,
     GenerateConfig,
@@ -76,6 +77,7 @@ def make_cfg(*, modality="text", assignment="single", max_labels=None,
         max_labels = len(classes)          # mirror the M1 backfill (enabled ⇒ non-None)
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality=modality, input="in"),

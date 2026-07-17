@@ -15,9 +15,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
 import random
+import statistics
 import time
+from collections import deque
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
@@ -110,6 +113,35 @@ class ProbeResult:
     error: str | None = None
     key_env: str | None = None                     # v1.6: set by probe_all() on pooled
                                                    # profiles; None on single-key profiles
+
+
+@dataclass(frozen=True)
+class KeySnapshot:                                 # v1.10 (spec 3.9.2): console-panel key row
+    env: str                                       # env-var NAME — the only displayable identity
+                                                   # (key VALUES never surface anywhere, spec 7.4)
+    state: Literal["ok", "cooldown", "disabled"]
+    cooldown_remaining_s: int = 0                  # ceil seconds left; 0 unless state="cooldown"
+    calls: int = 0                                 # per-key usage (KeyUsage mirror) — the panel's
+    rate_limited: int = 0                          # 'l' expanded view (§7.7); 0 when unmaterialized
+
+
+@dataclass(frozen=True)
+class ProfileSnapshot:                             # v1.10 (spec 3.9.2): one console LLM-block row
+    name: str
+    kind: Literal["llm", "embedding"]              # _usage buckets by NAME (existing quirk) —
+                                                   # kind disambiguates the snapshot identity
+    in_flight: int                                 # Σ _KeyState.in_flight — on-the-wire HTTP
+                                                   # requests, excludes parked/backing-off calls
+    max_concurrency: int
+    calls: int
+    retries: int
+    prompt_tokens: int
+    completion_tokens: int
+    est_cost_usd: float | None                     # None when prices unconfigured (panel "—")
+    p50_latency_ms: int | None                     # bounded-window (deque 256) median, successful
+                                                   # calls only (spec 3.9.3 快照行); None when empty
+    keys: tuple[KeySnapshot, ...]                  # 1-element for pools of 1; built from
+                                                   # _pool_members WITHOUT materializing _pools
 
 
 # ── v1.6 key pool (spec 3.9.3 密钥池行) ────────────────────────────────────
@@ -446,6 +478,10 @@ class LLMClient:
         # v1.6 key-pool state, keyed like the semaphores (in-memory only,
         # spec §2.6 — no persistence).
         self._pools: dict[tuple[str, str], _KeyPool] = {}
+        # v1.10 p50 latency window (spec 3.9.3 快照行): per-(kind, name) bounded
+        # sample deque, successful logical calls only — the ONLY new collection
+        # point; never enters report.json or any event.
+        self._latencies: dict[tuple[str, str], deque] = {}
         # Jitter RNG is intentionally NOT seed-derived — timing only [FROZEN §7.8].
         self._jitter_rng = random.Random()
         self._http_client: httpx.AsyncClient | None = None
@@ -586,6 +622,74 @@ class LLMClient:
     @property
     def usage_by_profile(self) -> dict[str, ProfileUsage]:
         return self._usage
+
+    def snapshot(self, now: float | None = None) -> tuple[ProfileSnapshot, ...]:
+        """v1.10 (spec 3.9.2 / 3.9.3 快照行): the console panel's read-only pull
+        face (§7.7, one call per render tick, U19/U26). Pure read — no await, no
+        lock, and NEVER mutates state (in particular it does not materialize
+        ``self._pools``); called from the render tick only (event-loop thread),
+        so there is no cross-thread contention under U26.
+
+        Enumerates ALL [llm.*] profiles, then [embedding.*] profiles, in
+        declaration order. Per profile: usage mirrored from ``self._usage``
+        (zero values when absent — the by-NAME bucket quirk is disambiguated by
+        ``kind``); key states from the materialized pool (disabled → cooldown
+        with ceil remaining seconds → ok), or zero-value "ok" KeySnapshots
+        derived from the declared env names when the pool is unmaterialized;
+        in_flight = Σ key in_flight (0 when unmaterialized); p50 latency = the
+        bounded window's median (None when empty). ``now`` is injectable for
+        offline tests (_KeyPool style); defaults to time.monotonic()."""
+        ts = time.monotonic() if now is None else now
+        snapshots: list[ProfileSnapshot] = []
+        profile_maps: tuple[tuple[Literal["llm", "embedding"], Mapping], ...] = (
+            ("llm", self._llm_profiles), ("embedding", self._embedding_profiles))
+        for kind, profiles in profile_maps:
+            for name, prof in profiles.items():
+                pool = self._pools.get((kind, name))
+                usage = self._usage.get(name)
+                key_usages = usage.keys if usage is not None else {}
+                if pool is not None:
+                    keys = tuple(
+                        KeySnapshot(
+                            env=s.env,
+                            state=("disabled" if s.disabled
+                                   else "cooldown" if s.cooldown_until > ts
+                                   else "ok"),
+                            cooldown_remaining_s=(
+                                math.ceil(s.cooldown_until - ts)
+                                if not s.disabled and s.cooldown_until > ts
+                                else 0),
+                            calls=(key_usages[s.env].calls
+                                   if s.env in key_usages else 0),
+                            rate_limited=(key_usages[s.env].rate_limited
+                                          if s.env in key_usages else 0),
+                        )
+                        for s in pool.states
+                    )
+                    in_flight = sum(s.in_flight for s in pool.states)
+                else:
+                    # Read-only: derive the member list the pool builder would
+                    # use, WITHOUT materializing self._pools (spec 3.9.2).
+                    keys = tuple(KeySnapshot(env=env, state="ok")
+                                 for env, _key in _pool_members(prof))
+                    in_flight = 0
+                window = self._latencies.get((kind, name))
+                snapshots.append(ProfileSnapshot(
+                    name=name,
+                    kind=kind,
+                    in_flight=in_flight,
+                    max_concurrency=prof.max_concurrency,
+                    calls=usage.calls if usage is not None else 0,
+                    retries=usage.retries if usage is not None else 0,
+                    prompt_tokens=usage.prompt_tokens if usage is not None else 0,
+                    completion_tokens=(usage.completion_tokens
+                                       if usage is not None else 0),
+                    est_cost_usd=usage.est_cost_usd if usage is not None else None,
+                    p50_latency_ms=(int(statistics.median(window))
+                                    if window else None),
+                    keys=keys,
+                ))
+        return tuple(snapshots)
 
     async def aclose(self) -> None:
         """Release the shared httpx.AsyncClient (utility; call at run end)."""
@@ -891,6 +995,12 @@ class LLMClient:
                                 self._emit_llm_call(prof, latency_ms=latency_ms, usage=usage,
                                                     retries=retries_used, status="ok",
                                                     operation=operation, extra=success_extra)
+                                # v1.10 p50 feed — the ONLY collection point
+                                # (spec 3.9.3 快照行): successful logical calls
+                                # only, right before the success return.
+                                self._latencies.setdefault(
+                                    (kind, prof.name),
+                                    deque(maxlen=256)).append(latency_ms)
                                 return result, latency_ms, retries_used
                     else:
                         status_code = resp.status_code

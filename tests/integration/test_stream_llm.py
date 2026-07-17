@@ -34,6 +34,7 @@ from labelkit.operators.annotate import annotate_record, build_annotate_prompt
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ConsoleConfig,
     DedupConfig,
     ExtractConfig,
     GenerateConfig,
@@ -126,6 +127,7 @@ def _profile(name: str, max_output_tokens: int) -> LLMProfile:
 def make_cfg(sequence_frames: int = 20) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={"default": _profile("default", 4096),
                       "judge": _profile("judge", 2048)},
         embedding_profiles={},

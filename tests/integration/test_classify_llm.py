@@ -19,6 +19,7 @@ from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
     ClassSpec,
+    ConsoleConfig,
     DedupConfig,
     ExtractConfig,
     GenerateConfig,
@@ -77,6 +78,7 @@ def make_cfg(classify: ClassifyConfig, max_output_tokens: int = 500,
     )
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={"default": profile},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="text", input="in"),

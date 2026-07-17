@@ -176,7 +176,7 @@ dry-run: no LLM calls made, no output written (report and trace only)
 uv run labelkit run --config ../config.toml --project project.toml
 ```
 
-stderr 上会看到（省略时间戳）：
+交互终端下，run 还会在滚动日志下方显示一块实时刷新的运行面板（批进度、状态计数与 LLM 用量，v1.10，详见 15.6 与 16.6）；日志行本身不受影响，stderr 上会看到（省略时间戳）：
 
 ```
 INFO  run     batch=0 run.start tool_version=labelkit/1.0.0 config_digest=sha256:9c92... project_digest=sha256:b648... trace_schema_version=1

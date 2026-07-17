@@ -172,7 +172,8 @@ SEEDS = ("帮我写一条请假条，明天上午要去医院", "写一份周报
 
 
 def _mk_cfg():
-    from labelkit.common.config.model import (AnnotateConfig, ClassifyConfig, DedupConfig,
+    from labelkit.common.config.model import (AnnotateConfig, ClassifyConfig, ConsoleConfig,
+                                       DedupConfig,
                                        ExtractConfig, GenerateConfig, InputConfig,
                                        OutputConfig, QualityConfig, ResolvedConfig,
                                        Rubric, RunConfig, SegmentConfig,
@@ -190,7 +191,7 @@ def _mk_cfg():
         seed_examples=SEEDS,
     )
     return ResolvedConfig(
-        tool=ToolConfig(), llm_profiles={}, embedding_profiles={},
+        tool=ToolConfig(), console=ConsoleConfig(), llm_profiles={}, embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="text", mode="generate_only", seed=0),
         input=InputConfig(text_field="instruction"),
         stream=StreamConfig(),

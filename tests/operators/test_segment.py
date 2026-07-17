@@ -23,6 +23,7 @@ from labelkit.operators.segment import (
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ConsoleConfig,
     DedupConfig,
     ExtractConfig,
     GenerateConfig,
@@ -59,6 +60,7 @@ def make_cfg(*, strategy="hybrid", window=20, digest_max_chars=400,
              on_error="keep", trace=None) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="ui", input="in"),

@@ -34,6 +34,7 @@ from labelkit.operators.stitch import (
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ConsoleConfig,
     DedupConfig,
     ExtractConfig,
     GenerateConfig,
@@ -70,6 +71,7 @@ def make_cfg(*, enabled=True, llm="default", max_open=4, bias="conservative",
              output="out.jsonl") -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
         run=RunConfig(output=output, modality="ui", input="in"),

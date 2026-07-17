@@ -27,6 +27,7 @@ from labelkit.common.config.model import (
     ClassifyConfig,
     ClassSpec,
     ClassView,
+    ConsoleConfig,
     DedupConfig,
     ExtractConfig,
     FewShotExample,
@@ -76,6 +77,7 @@ def make_cfg(*, modality="text", instruction="你是意图标注员。", example
              sequence_frames=20) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality=modality, input="in"),

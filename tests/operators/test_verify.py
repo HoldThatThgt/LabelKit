@@ -26,6 +26,7 @@ from labelkit.common.config.model import (
     ClassifyConfig,
     ClassSpec,
     ClassView,
+    ConsoleConfig,
     DedupConfig,
     ExtractConfig,
     GenerateConfig,
@@ -313,6 +314,7 @@ USER_SCHEMA = {"type": "object", "properties": {"intent": {"type": "string"}},
 def trace_cfg(*, enabled=True, content="refs") -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="text", input="in"),
@@ -423,6 +425,7 @@ def test_multi_judge_schema_violation_preserves_majority():
 
     cfg = ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="text", input="in"),
@@ -489,6 +492,7 @@ def test_single_judge_schema_violation_propagates_to_classify():
     can map it to the correct ErrorKind (schema_violation, not judge_error)."""
     cfg = ResolvedConfig(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="text", input="in"),

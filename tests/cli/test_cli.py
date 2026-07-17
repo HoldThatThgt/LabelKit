@@ -21,6 +21,7 @@ from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
     ClassSpec,
+    ConsoleConfig,
     Criterion,
     DedupConfig,
     EmbeddingProfile,
@@ -63,6 +64,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/__init__.py",
     "labelkit/cli/__init__.py",
     "labelkit/cli/commands.py",
+    "labelkit/cli/console.py",
     "labelkit/cli/main.py",
     "labelkit/cli/parser.py",
     "labelkit/common/config/__init__.py",
@@ -72,6 +74,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/contracts/types.py",
     "labelkit/common/errors.py",
     "labelkit/common/extensions/hooks.py",
+    "labelkit/common/observability/console_format.py",
     "labelkit/common/observability/obslog.py",
     "labelkit/common/runtime/llm_client.py",
     "labelkit/common/runtime/schema_engine.py",
@@ -95,10 +98,12 @@ EXPECTED_PRODUCTION_PY = {
 
 EXPECTED_TEST_PY = {
     "tests/cli/test_cli.py",
+    "tests/cli/test_console.py",
     "tests/common/config/test_config.py",
     "tests/common/contracts/test_stage.py",
     "tests/common/contracts/test_types.py",
     "tests/common/extensions/test_hooks.py",
+    "tests/common/observability/test_console_format.py",
     "tests/common/observability/test_obslog.py",
     "tests/common/runtime/test_llm_client.py",
     "tests/common/runtime/test_schema_engine.py",
@@ -283,6 +288,45 @@ def test_parser_requires_subcommand_and_flags():
         cli.build_parser().parse_args(["rubric", "--show", "default:nope"])
 
 
+# ── --console (v1.10, spec §7.7 / 5.1; U5/U27) ─────────────────────────────
+
+
+@pytest.mark.parametrize("value", ["auto", "rich", "plain"])
+def test_parser_run_console_lands_in_overrides(value):
+    args = cli.build_parser().parse_args(
+        ["run", "--config", "c.toml", "--project", "p.toml", "--console", value])
+    assert cli._overrides_from_args(args).console == value
+
+
+def test_parser_run_console_default_none():
+    args = cli.build_parser().parse_args(
+        ["run", "--config", "c.toml", "--project", "p.toml"])
+    assert cli._overrides_from_args(args).console is None
+
+
+def test_parser_validate_accepts_console():
+    args = cli.build_parser().parse_args(
+        ["validate", "--config", "c.toml", "--project", "p.toml",
+         "--console", "rich"])
+    assert args.console == "rich"
+
+    args = cli.build_parser().parse_args(
+        ["validate", "--config", "c.toml", "--project", "p.toml"])
+    assert args.console is None
+
+
+def test_parser_console_invalid_value_rejected():
+    with pytest.raises(SystemExit) as excinfo:
+        cli.build_parser().parse_args(
+            ["run", "--config", "c.toml", "--project", "p.toml",
+             "--console", "fancy"])
+    assert excinfo.value.code == EXIT_CONFIG
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            ["validate", "--config", "c.toml", "--project", "p.toml",
+             "--console", "fancy"])
+
+
 # ── --limit validation (spec 3.1.2 CLI dict / 3.1.5 no runtime config errors) ─
 
 
@@ -353,6 +397,7 @@ def _profile(name: str) -> LLMProfile:
 def _cfg(**kw) -> ResolvedConfig:
     base = dict(
         tool=ToolConfig(),
+        console=ConsoleConfig(),
         llm_profiles={n: _profile(n) for n in ("default", "judge", "fixer")},
         embedding_profiles={"emb": EmbeddingProfile(
             name="emb", base_url="https://x", model="e", api_key_env="K")},

@@ -24,7 +24,7 @@ schema_version = 1
 
 [tool]
 log_level = "info"
-log_format = "jsonl"          # 理由：接日志采集系统；进度条自动禁用，CI 里本来也不需要
+log_format = "jsonl"          # 理由：接日志采集系统；console 强制 plain 档（第 16 章），CI 里本来也不需要面板
 
 [llm.default]                 # 主力：打分与标注
 provider = "openai_compatible"

@@ -14,7 +14,8 @@ from pathlib import Path
 import pytest
 
 from labelkit.common.config import ResolvedConfig, default_rubric, load
-from labelkit.common.config.model import CliOverrides
+from labelkit.common.config import loader as loader_mod
+from labelkit.common.config.model import CliOverrides, ConsoleConfig
 from labelkit.common.errors import ConfigError
 
 # ── fixtures / builders ────────────────────────────────────────────────────
@@ -2129,3 +2130,188 @@ def test_stitch_payload_joins_parked_list_when_segment_off(env, capsys):
 def test_stitch_enabled_false_alone_no_noop_warning(env, capsys):
     env.load(project_text=env.project(body=SEG_ON + "\n[stitch]\nenabled = false"))
     assert "[stitch]" not in capsys.readouterr().err
+
+
+# ── v1.10: [console] parsing + mode_resolved (spec 5.1 / 3.1.4 console row, §7.7) ──
+
+
+CONSOLE_RICH = BASE_CONFIG + '\n[console]\nmode = "rich"\n'
+JSONL_TOOL = BASE_CONFIG.replace('log_level = "info"',
+                                 'log_level = "info"\nlog_format = "jsonl"')
+
+
+@pytest.fixture
+def rich_importable(monkeypatch):
+    """Pin the find_spec probe truthy — tests stay hermetic whether or not the
+    venv happens to carry rich (it enters pyproject only in Wave 2)."""
+    monkeypatch.setattr(loader_mod, "_find_spec", lambda name: object())
+
+
+@pytest.fixture
+def rich_unimportable(monkeypatch):
+    monkeypatch.setattr(loader_mod, "_find_spec", lambda name: None)
+
+
+def test_console_defaults_whole_section_optional(env, monkeypatch):
+    monkeypatch.setenv("TERM", "dumb")            # pins the auto chain → plain
+    cfg = env.load()
+    assert cfg.console == ConsoleConfig(mode="auto", refresh_hz=5, heartbeat_s=0,
+                                        estimate=False, interactive=True,
+                                        mode_resolved="plain")
+
+
+def test_console_section_parsed(env, monkeypatch):
+    monkeypatch.setenv("TERM", "dumb")
+    body = ('\n[console]\nmode = "plain"\nrefresh_hz = 10\nheartbeat_s = 30\n'
+            "estimate = true\ninteractive = false\n")
+    cfg = env.load(config_text=BASE_CONFIG + body)
+    assert cfg.console.mode == "plain"
+    assert cfg.console.refresh_hz == 10
+    assert cfg.console.heartbeat_s == 30
+    assert cfg.console.estimate is True
+    assert cfg.console.interactive is False
+    assert cfg.console.mode_resolved == "plain"
+
+
+def test_console_mode_enum_rejected(env):
+    errors = env.errors(config_text=BASE_CONFIG + '\n[console]\nmode = "fancy"\n')
+    has(errors, '[console].mode: 期望 "auto" | "rich" | "plain"，得到 "fancy"')
+
+
+@pytest.mark.parametrize("value", [0, 11, -3])
+def test_console_refresh_hz_out_of_range_rejected(env, value):
+    errors = env.errors(config_text=BASE_CONFIG + f"\n[console]\nrefresh_hz = {value}\n")
+    has(errors, f"[console].refresh_hz: 期望 [1, 10] 内的整数")
+    has(errors, f"得到 {value}")
+
+
+@pytest.mark.parametrize("value", [1, 5, 10])
+def test_console_refresh_hz_bounds_inclusive(env, value):
+    cfg = env.load(config_text=BASE_CONFIG + f"\n[console]\nrefresh_hz = {value}\n")
+    assert cfg.console.refresh_hz == value
+
+
+def test_console_heartbeat_negative_rejected(env):
+    errors = env.errors(config_text=BASE_CONFIG + "\n[console]\nheartbeat_s = -1\n")
+    has(errors, "[console].heartbeat_s: 期望非负整数，得到 -1")
+
+
+def test_console_bool_keys_type_checked(env):
+    errors = env.errors(config_text=BASE_CONFIG
+                        + '\n[console]\nestimate = "yes"\ninteractive = 1\n')
+    has(errors, '[console].estimate: 期望布尔值，得到 "yes"')
+    has(errors, "[console].interactive: 期望布尔值，得到 1")
+
+
+def test_console_errors_aggregate_not_first_raise(env):
+    """spec 3.1.5: ALL [console] violations join the single aggregated
+    ConfigError alongside project-side errors — never first-error-only."""
+    bad_console = BASE_CONFIG + "\n[console]\nrefresh_hz = 0\nheartbeat_s = -1\n"
+    errors = env.errors(config_text=bad_console,
+                        project_text=env.project(body='[quality]\nllm = "ghost"'))
+    has(errors, "[console].refresh_hz: 期望 [1, 10] 内的整数")
+    has(errors, "[console].heartbeat_s: 期望非负整数")
+    has(errors, '[quality].llm: 引用的 profile "ghost" 不存在')
+    assert len(errors) >= 3
+
+
+def test_console_unknown_key_warns_section_owned(env, capsys, monkeypatch):
+    """Unknown keys INSIDE [console] warn (forward compat); the [console] table
+    itself is owned top-level now — no unknown-top-level-table warning."""
+    monkeypatch.setenv("TERM", "dumb")
+    cfg = env.load(config_text=BASE_CONFIG + "\n[console]\nfancy_new_key = 1\n")
+    assert isinstance(cfg, ResolvedConfig)
+    err = capsys.readouterr().err
+    assert "[console].fancy_new_key: 未知键" in err
+    assert ":console: 未知键" not in err          # not flagged as an unknown table
+
+
+def test_console_jsonl_forces_plain_over_explicit_config_rich(env, capsys,
+                                                              rich_importable):
+    cfg = env.load(config_text=JSONL_TOOL + '\n[console]\nmode = "rich"\n')
+    assert cfg.tool.log_format == "jsonl"
+    assert cfg.console.mode_resolved == "plain"
+    err = capsys.readouterr().err
+    assert ('console: log_format="jsonl" 强制 plain——显式 rich 不生效'
+            "（stderr 逐行可解析铁律，7.7）") in err
+    assert err.count("强制 plain") == 1            # WARN exactly once
+
+
+def test_console_jsonl_forces_plain_over_explicit_cli_rich(env, capsys,
+                                                           rich_importable):
+    cfg = env.load(config_text=JSONL_TOOL, cli=CliOverrides(console="rich"))
+    assert cfg.console.mode == "rich"              # CLI precedence recorded
+    assert cfg.console.mode_resolved == "plain"    # ... but jsonl wins (§7.7 铁律)
+    assert "强制 plain" in capsys.readouterr().err
+
+
+def test_console_jsonl_auto_plain_without_warning(env, capsys):
+    cfg = env.load(config_text=JSONL_TOOL)
+    assert cfg.console.mode_resolved == "plain"
+    assert "强制 plain" not in capsys.readouterr().err   # no explicit rich, no WARN
+
+
+def test_console_explicit_rich_honored_without_tty(env, rich_importable):
+    """§7.7 matrix: --console rich is respected even when stderr is not a TTY
+    (CI ANSI-recording scenario) — only importability/jsonl can demote it."""
+    cfg = env.load(config_text=CONSOLE_RICH)
+    assert cfg.console.mode == "rich"
+    assert cfg.console.mode_resolved == "rich"
+
+
+def test_console_rich_unimportable_degrades_plain_with_warning(env, capsys,
+                                                               rich_unimportable):
+    cfg = env.load(config_text=CONSOLE_RICH)
+    assert cfg.console.mode_resolved == "plain"
+    err = capsys.readouterr().err
+    assert "console: rich 不可导入，降级 plain" in err
+    assert err.count("rich 不可导入") == 1         # WARN exactly once
+
+
+def test_console_cli_overrides_config_mode(env, rich_importable):
+    # CLI plain beats config rich (2.5 precedence) — no degrade warning path
+    cfg = env.load(config_text=CONSOLE_RICH, cli=CliOverrides(console="plain"))
+    assert cfg.console.mode == "plain"
+    assert cfg.console.mode_resolved == "plain"
+    # CLI rich beats config plain
+    cfg = env.load(config_text=BASE_CONFIG + '\n[console]\nmode = "plain"\n',
+                   cli=CliOverrides(console="rich"))
+    assert cfg.console.mode == "rich"
+    assert cfg.console.mode_resolved == "rich"
+
+
+def test_console_auto_term_dumb_resolves_plain(env, monkeypatch, rich_importable):
+    monkeypatch.setenv("TERM", "dumb")
+    cfg = env.load()
+    assert cfg.console.mode == "auto"
+    assert cfg.console.mode_resolved == "plain"
+
+
+def test_console_no_color_does_not_participate(env, monkeypatch, rich_importable):
+    """U25: NO_COLOR never demotes to plain — rich natively strips color while
+    keeping layout. Explicit rich under NO_COLOR stays rich."""
+    monkeypatch.setenv("NO_COLOR", "1")
+    cfg = env.load(config_text=CONSOLE_RICH)
+    assert cfg.console.mode_resolved == "rich"
+
+
+@pytest.mark.parametrize(
+    "isatty,log_format,term,importable,expected",
+    [
+        (True, "text", "xterm-256color", True, "rich"),   # all four legs green
+        (False, "text", "xterm-256color", True, "plain"), # not a TTY
+        (True, "jsonl", "xterm-256color", True, "plain"), # jsonl line-parse rule
+        (True, "text", "dumb", True, "plain"),            # TERM dumb
+        (True, "text", "", True, "plain"),                # TERM empty
+        (True, "text", None, True, "plain"),              # TERM absent
+        (True, "text", "xterm-256color", False, "plain"), # rich not importable
+        (False, "jsonl", None, False, "plain"),           # everything red
+    ],
+)
+def test_auto_console_mode_chain_branches(isatty, log_format, term, importable,
+                                          expected):
+    """The §7.7 auto decision chain as a pure function over injected probes
+    (U5/U25) — every branch offline, no TTY/env manipulation needed."""
+    assert loader_mod._auto_console_mode(
+        isatty=isatty, log_format=log_format, term=term,
+        rich_importable=importable) == expected

@@ -1,0 +1,4 @@
+dry-run: mode=process estimated_records=5 batches=1
+dry-run: estimated LLM calls — generate_calls=0 segment_calls=0 stitch_calls=0 classify_calls=5 extract_calls=0 quality_calls=4 annotate_calls=5 verify_calls=5 total=19 (excludes retries and repair calls)
+dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界
+dry-run: no LLM calls made, no output written (report and trace only)
