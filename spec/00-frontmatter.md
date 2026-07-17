@@ -1,11 +1,11 @@
-LabelKit 采集数据自动标注工具 — 产品设计说明书 v1.9
+LabelKit 采集数据自动标注工具 — 产品设计说明书 v1.10
 
 # LabelKit 采集数据自动标注工具
 
-| 文档版本 | v1.9 |
+| 文档版本 | v1.10 |
 |---|---|
-| 日期 | 2026-07-16 |
-| 状态 | 评审修订稿 |
+| 日期 | 2026-07-17 |
+| 状态 | 评审修订稿（v1.10 为规格定稿、实现另行排期——见版本历史行注记） |
 | 目标读者 | 开发工程师、算法工程师、测试工程师 |
 | 文档定位 | 实现级设计规格 —— 开发者依据本文档即可完成实现，无需自行补全任何设计决策 |
 
@@ -21,5 +21,6 @@ LabelKit 采集数据自动标注工具 — 产品设计说明书 v1.9
 | v1.7 | 2026-07-07 | 分类算子与按类条件化（对齐决策见 1.6）：① **分类算子**——新增 M13 classify（3.13，链序 dedup 之后、quality 之前）：LLM 封闭集分类（内部 Schema enum 词表硬校验，无 uniqueItems——重复标签由代码侧确定性归一化）、单/多标签可配（`classify.assignment`）、可选 self-consistency 投票、失败归兜底类（`classify.fallback_class`）；multi 模式按标签向批尾扇出兄弟信封（Stage 契约增 ②a 例外，4.3；`counts.fanout` 与不变量扩展，6.4）；② **按类条件化**——`[class.<name>.*]` 白名单覆盖（5.2）：quality 批内按类分池（3.4.3）、annotate/verify 按类指令与评审维度（3.5.2、3.7.2）、generate 按类种子池与生成指令（3.6.2）；③ 观测面——`_meta` 增恒在键 `classification`（6.3）、report 增 classify 节与 quality.by_class（6.4）、trace 通道增 classify 与新事件 `classify.decision`（7.2）、错误码增 `classification_invalid`（7.6）。默认关（`classify.enabled = false`），关闭时数据产出与 v1.6 逐字段一致（`_meta.classification: null` 除外） |
 | v1.8 | 2026-07-13 | 时序流语义分割与动作摘取（对齐决策见 1.6）：① **时间轴与会话化**——`[stream]` 输入侧声明（5.2）：排序键与按分区键单调性校验、gap/key/上限会话规则（M2 会话装配器，3.2.8），切批改整会话装箱（3.10.3）；② **新算子**——M14 segment 语义分段（3.14，滑窗 LLM 边界裁决 + 噪声剔除，把成员帧收拢为序列记录 episode；Stage 契约增 ②b 例外，4.3）与 M15 extract 转移/动作摘取（3.15，相邻帧对 → 结构化动作，写入 `item.transitions`）；③ **序列级下游适配**——M3/M13/M4/M5/M7 收序列记录（3.3.3、3.13.3、3.4.3、3.5.2、3.7.2/3.7.3），内置轨迹 rubric `default:trajectory`（附录 A.3）；④ 观测面——`Status` 增 `absorbed`/`dropped_noise` 两值（4.1）、`_meta` 增恒在键 `stream`（6.3）、report 增 stream 节与守恒式扩展（6.4）、trace 通道增 segment/extract 与四个新事件（7.2）、错误码增 `segmentation_invalid`/`extraction_invalid`（7.6）。默认关（`segment.enabled = false`），关闭时数据产出与 v1.7 逐字段一致（`_meta.stream: null` 除外） |
 | v1.9 | 2026-07-16 | 线索缝合与层级工作单元（对齐决策见 1.6）：① **新算子**——M16 stitch 线索缝合（3.16，链序 segment 之后、dedup 之前）：会话内碎片以「单调选池 LLM 判定 × 机械先验合取」保守缝合为线索 thread（有界二遍复评修正贪心漏缝），产出三级结构 thread ⊃ fragment ⊃ step；被并 episode 壳置新状态 `stitched`、幸存信封 Record 重绑、`below_min_len` 短段先进候选池救援（Stage 契约增 ②c 例外，4.3）；接缝零 LLM 机械占位（extract 按 `seam_indexes` 生成 T10 四键占位步，3.15）；② **下游适配**——dedup 判重面 = 线索重绑配方（3.3.3）、quality/annotate/verify 以线索为单元（步行渲染 thread_seam 后缀、按碎片配额降采样、七段序列评审 + 缺陷词表增 `wrong_stitch`，3.4.3/3.5.2/3.7.2）；③ **配置面**——新节 `[stitch]`（11 键，5.2）：`max_open` 池容量 / `bias` 保守偏置 / `rescue_short` / `repass` / `stale_gap_steps` / `votes` 采样多数决（默认 1 不启用）等，M1 增 stitch⇒segment 等约束（3.1.4）；④ 观测面——`Status` 增 `stitched`（4.1）、M11 增第四路由（3.11.2）、counts 增 `stitched` / `threads`（= episodes − stitched 导出式）与守恒式扩项（6.4）、report 增 `stream.stitch` 子块、trace 通道 10→11（增 `stitch`）与两事件 `stitch.judge` / `stitch.thread`（7.2）、错误码增 `stitch_invalid`（7.6）、`_meta.stream` 增 thread_id / fragments / steps 行内 resumed（6.3）。默认关（`stitch.enabled = false`），关闭时主输出 / rejects / report.json 与 v1.8 逐字节等价（例外两处：dry-run stderr 的 `stitch_calls=0` 行与 stream×verify 缺陷词表 `wrong_stitch: 0` 行——3.16.4 退化锚） |
+| v1.10 | 2026-07-17 | Console 实时面板（对齐决策见 1.6；**规格定稿、实现另行排期**——需求方 2026-07-17 裁决 spec-only，动工前以 `docs/dev/SPEC-tui-console.md` §3.8 实施清单为纲）：① **三态 console**——`--console auto \| rich \| plain` 与 `[console]` 配置节（5.1）：7.7 进度显示面重写为三态规格——rich 档为双区内联实时面板（日志上方滚动 + 底部画布节流原地重绘：批进度、段棋盘、状态账、LLM 用量/密钥池/熔断、键盘开关；工业同型 buck2 superconsole / BuildKit --progress），plain 档与 v1.9 stderr 输出逐字节等价（回归锚，`heartbeat_s=0` 默认下），auto 按 TTY ∧ log_format ∧ NO_COLOR/TERM ∧ rich 可导入判定；② **架构**——面板为 M12 可观测性的第四个纯消费面：`ProgressListener` 进程内旁路协议（3.12.3，不产生 TraceEvent、不入 7.2 目录、不受 channels 过滤）+ `LLMClient.snapshot()` 只读快照，渲染器归 CLI 层（依赖方向不变）；渲染异常自吞降级 plain，永不影响退出码与产出；③ **依赖面**——§2.6 白名单增 `rich`（懒 import，仅 CLI 层单文件触点）；④ **T16 有界修订**——rich 面板状态账展示 stitched/threads（与 report.counts 口径对齐），plain 进度行与文本版终版摘要键集逐字节不动（T16 固定键集约束收窄为 plain 面专属）。**零 7.2 事件目录改动、report.json 零新键**；设计裁决 U1–U18 见 `docs/dev/SPEC-tui-console.md` §2，工业调研（[C-1]–[C-20]）见 `docs/dev/PROPOSAL-tui-console.md` |
 
 产品设计说明书（Product Design Specification）

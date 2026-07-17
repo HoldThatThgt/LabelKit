@@ -8,7 +8,7 @@
 |---|---|---|---|
 | ① 运行日志 | stderr，恒开。级别 debug/info/warn/error（`tool.log_level` / `--log-level`）；行格式 `tool.log_format = "text"`（默认）\| `"jsonl"`（7.3）。 | 仅运维事件：生命周期、警告、错误、LLM 调用摘要（debug 级）。绝不含数据内容与提示词。 | 人工排障；日志采集系统。 |
 | ② trace 追踪日志 | JSONL 文件，默认 `{output_stem}.trace.jsonl`（`trace.path`）；默认关（`trace.enabled = false`）。文件在**首个事件写出时**才打开/截断（v1.5）：死于配置或输入校验的运行不会碰上一次的 trace；dry-run 写 `{name}.dryrun{suffix}` 独立文件。 | 结构化事件流，一行一事件（7.2）；按 `trace.channels` 过滤通道，按 `trace.content` 控制内容量（7.4）。 | rubric 优化（7.5）；标注质量分析与审计；后续 `labelkit analyze`（8.3 O5）。 |
-| ③ 进度显示 | TTY 进度条 / 非 TTY 批摘要，恒开。 | 当前批号/总批数、各状态计数、瞬时成本累计。 | 交互终端前的人。不属于日志（7.7）。 |
+| ③ 进度显示（v1.10 起称 console） | 三态 `console.mode = auto \| rich \| plain`（5.1 / CLI `--console`），恒开。rich = 双区内联实时面板；plain = v1.9 行为逐字节保留；auto 按 TTY 等判定链选档（7.7）。 | 批进度、流水线段棋盘、各状态计数、LLM 用量/密钥池/熔断、瞬时成本累计（7.7 区块表）。 | 交互终端前的人。不属于日志（7.7）。 |
 
 **与「工具不存储数据」原则的关系：**trace 是用户**显式启用**的输出通道，与主输出、rejects 同级（2.6「数据不落盘」行已将其列入唯一写盘对象），而非中间态落盘——它记录的是「处理判定及其依据」而非批中间态本身。trace 文件的保留、脱敏档位选择（7.4）与清理均为用户责任；`content="full"` 档含数据内容，风险见 7.4 明示。
 
@@ -132,9 +132,48 @@ jq -s '[.[] | select(.ev=="quality.judgment") | .payload.judgments[]
 | `provider_fatal` | 运行级 | M9 不可重试错误。400/404 等计入连续熔断计数，连续达阈值 ⇒ 退出码 4；**401/403 认证类立即熔断**（v1.5，3.9.3）。v1.6 密钥池：认证失败先按密钥禁用（`llm.key_disabled`），池内尚有存活密钥时不产生本错误、不计入熔断——仅当禁用的是该 profile 最后一把存活密钥时才抛出并立即熔断（3.9.3 密钥池行）。 |
 | `internal_error` | 记录级 | 任何未预期异常（含 M11 终检失败）；记录 failed，堆栈入日志（debug 级）。 |
 
-## 7.7 进度显示与结束摘要
+## 7.7 进度显示与结束摘要（v1.10：三态 console）
 
-TTY 环境显示批级进度条：当前批号/总批数、各状态计数、瞬时成本累计；非 TTY 环境每批一行摘要（即 `batch.end` 的 stderr info 行）。运行结束向 stderr 打印与 report.json `counts` 完全一致的终版摘要表。进度显示**不属于日志**：直接写 stderr 而不经 logging 模块、无级别概念；唯一交互是 `tool.log_format="jsonl"` 时禁用进度条，以保证 stderr 每行可被 `json.loads` 解析（此时 `batch.end` 行即进度）。
+进度显示**不属于日志**：直接写 stderr 而不经 logging 模块、无级别概念、不产生 trace 事件。v1.10 将本面重写为三态 **console**（设计裁决 U1–U18 与工业调研 [C-1]–[C-20] 见 `docs/dev/SPEC-tui-console.md`；**规格定稿、实现另行排期**——动工前以该文 §3.8 实施清单为纲）。
+
+**三态与判定**（`console.mode`，5.1；CLI `--console` 覆盖）：
+
+```
+auto → rich 当且仅当：stderr.isatty() ∧ tool.log_format == "text"
+                   ∧ 未设 NO_COLOR ∧ TERM 非 "dumb"/空 ∧ rich 可导入（懒 import）
+其余一律 plain。显式 --console rich 尊重显式档（CI 录 ANSI 场景）；
+tool.log_format = "jsonl" 强制 plain 且不可覆盖（stderr 逐行可 json.loads 铁律；显式冲突 M1 WARN）。
+```
+
+**plain 档（回归锚）**：与 v1.9 行为逐字节等价（`console.heartbeat_s = 0` 默认下）——TTY 单行 `\r` 批级进度（批号 + 五状态固定键集，**T16 键集约束在本档继续成立**：stitched 不入行）；非 TTY 每批一行摘要（即 `batch.end` 的 stderr info 行）；运行结束打印与 report.json `counts` 完全一致的文本版终版摘要表。可选心跳：`console.heartbeat_s > 0` 且非 TTY 时每 N 秒一行数据无关汇总 `heartbeat batch= stage= llm_calls= elapsed=`（固定间隔不漂移；CI 长批「像死机」缓解，默认关）。
+
+**rich 档（双区内联实时面板）**：日志在上方滚动区照常输出（行文本与 plain 逐字节一致——渲染器接管 `labelkit` logger 的 handler 流、退出/降级时恢复），终端底部画布按 `console.refresh_hz` 节流原地重绘；**永不进入 alternate screen**（批任务保 scrollback，U1）。画布六区块（数据源全部为既有结构字段，零新增采集）：
+
+| 区块 | 内容 | 数据源 |
+|---|---|---|
+| 标头 | run_id、mode/modality（stream/stitch 徽标）、seed、耗时、ETA（仅批总数分母可得时显示，EMA 外推标 `~`） | ResolvedConfig、`run.start` |
+| 批进度 | UI 模态 `批 i/N` + scanned（IngestPlan 配对扫描廉价；stream 批数 = next-fit 仿真精确）；文本模态默认 `批 i` 无分母——行数估算需全量多读一遍输入，默认不做（M10 现状），`console.estimate = true` 显式换购（U17） | `batch.start/end`、`_estimate()` 复用 |
+| 段棋盘 | 仅启用 stage 按链序：`✓` 已过 / `▶` 进行中（该 stage `llm.call` 完成数/静态估算分母，标「估算」，3.10.3 dry-run 同款公式）/ `·` 待走 | stage_begin 旁路（3.12.3）+ `llm.call` 累计 |
+| 状态账 | 九态计数，stream/stitch 键仅启用时在场、同 report.counts 口径——**stitched/threads 的展示为对 T16 的有界修订（仅本档；对齐决策 1.6 U18）**；批内随批末更新（counts.* 为 post-emit tally） | MetricsSink counters |
+| LLM | 每 profile：在途/并发上限、calls、retries、tokens ↑↓、成本（未配价目 `—`）、p50 延迟；密钥池行（**环境变量名** + ok/冷却剩余秒/禁用）；熔断 streak/threshold，打开时红色横幅 | `LLMClient.snapshot()` 每 tick 只读拉取（3.12.3） |
+| 键位提示 / 中断态 | 交互键提示一行（下表）；SIGINT 后顶部横幅「正在优雅中断（≤30s）…」 | 3.10.3 中断路径旁路转发 |
+
+generate_only：批进度区退化为 `生成 ▶ calls i/N · 已产 n 条`，批棋盘自再流批次起激活。运行结束：最后一次重绘后**定格**为静态终版面板（counts 表 + per-stage 耗时横条 + llm_usage 表 + rejects/trace 路径行），scrollback 保留完整日志。
+
+**rich 档键盘开关**（一期实施，对齐决策 1.6 U15；生效合取：rich ∧ stdin TTY ∧ `console.interactive = true` ∧ termios 可用，否则纯渲染；封闭键集，未列键忽略）：
+
+| 键 | 行为 |
+|---|---|
+| `?` / `h` | 键位帮助展开/收起 |
+| `l` | LLM 面板展开（每密钥一行：env 名、状态、calls、rate_limited）/收起 |
+| `e` | 最近错误条开/关（环形最近 5 条 `error` 事件的 stage + kind——7.6 封闭词表，数据无关） |
+| `+` / `-` | 画布行数上限增/减（4–16） |
+| `p` | 暂停/恢复画布重绘（日志照常滚动；调试/复制友好） |
+| `q` | 面板脱离：余下运行降级 plain（不终止运行、不影响退出码） |
+
+终端状态纪律：`tty.setcbreak`（非全 raw——保留 ISIG，**Ctrl-C 产生 SIGINT 的语义不变**，仍走 3.10.3 优雅中断）；退出/降级/异常路径经 finally 恢复 termios 属性；键盘轮询在渲染 tick 内非阻塞 select，零新线程。stdin 被占用的代价（粘贴的后续命令被吞）以 `console.interactive = false` 回避。
+
+**信息纪律与失败语义（红线，U6/U7）**：面板与心跳行 = stderr 镜像同级——只显示计数、枚举、profile 名、密钥环境变量名、file:line 结构字段；**不显示 record id、excerpt、reason/task_name/critiques 等任何 LLM 自由文本与输入数据内容**。渲染期任何异常自吞 + 一次性 WARN + 当场降级 plain 续跑，**渲染永不影响退出码与数据产出**；终端宽 < 60 列退化为单行 `\r` 形态。面板为 M12 的第四个纯消费面（3.12.3 ProgressListener 旁路）：**零 7.2 事件目录改动、report.json 零新键**。
 
 ## 7.8 测试要求（验收级）
 
@@ -144,3 +183,4 @@ TTY 环境显示批级进度条：当前批号/总批数、各状态计数、瞬
 | 集成 | 以 mock provider（录制响应）跑通 2.3.1 全部组合矩阵；断言 report 不变量、主输出全行过用户 Schema、rejects=refs 时文件不含任何输入内容子串。 |
 | 契约 | 对真实 API 的 probe 冒烟（CI 可选）；结构化输出 L0 关闭/开启两态等价性（最终输出结构一致）。 |
 | 日志（v1.1 新增） | trace 每行可被 `json.loads` 解析且恰含 ts / run_id / batch_no / stage / ev / record_ids / payload 七字段；对 7.2 事件目录逐事件断言 payload 字段齐全；首行为 run.start 且携带 trace_schema_version=1；`trace.content="refs"` 时 trace 文件不含任何输入内容子串（与 rejects=refs 同法断言）；注入写失败（不可写路径 / mock OSError）断言运行不中断、warn 恰打印一次、`report.trace.dropped_events` 计数正确。 |
+| console（v1.10 新增，实施期生效） | 定宽渲染快照断言（`Console(width=100, force_terminal=True)`，喂 MetricsSink 计数器状态而非 LLM 响应——不违反真实 LLM 测试纪律）：九态账 / 密钥池三态 / 熔断横幅 / 中断横幅 / 窄终端退化 / generate_only 形态 / `l`·`e` 展开态；回归锚：`--console plain` 对 examples 六工程实跑 stderr 与 v1.9 基线逐字节 diff 为空（heartbeat 默认关）、`log_format="jsonl"` 下 stderr 逐行可解析且显式 rich 被拒并 WARN；降级注入：渲染 tick 抛异常 ⇒ 运行照常完成、退出码不变、恰一条 WARN、自动转 plain；键盘：伪 TTY 注入键序断言 `q` 脱离 / `p` 暂停期日志照常 / termios 属性退出后逐字节复原 / cbreak 下 Ctrl-C 仍触发 SIGINT 优雅中断；协议：`listener=None` 路径零行为变化、全回调 O(1) 无 I/O。 |

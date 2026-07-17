@@ -32,7 +32,12 @@
 | `embedding.*.timeout_s` | int | 60 | 单次请求超时。 |
 | `embedding.*.max_retries` | int | 5 | 可重试错误的最大重试次数（重试规则同 3.9.3）。 |
 | `embedding.*.dims` | int | 可选 | 返回向量维度校验：配置后 `embed()` 逐条比对返回维度，不匹配抛 ProviderFatalError（3.9.2）。 |
-| `tool.log_format` | str | "text" | "text" \| "jsonl"：stderr 运行日志行格式（7.3）；"jsonl" 时禁用进度条以保证 stderr 逐行可解析（7.7）。 |
+| `tool.log_format` | str | "text" | "text" \| "jsonl"：stderr 运行日志行格式（7.3）；"jsonl" 时强制 console plain 档以保证 stderr 逐行可解析（7.7，显式 `--console rich` 冲突时 M1 WARN）。 |
+| `console.mode` | str | "auto" | v1.10（7.7）："auto" \| "rich" \| "plain"——进度显示面三态；被 CLI `--console` 覆盖。auto 判定链：stderr TTY ∧ log_format="text" ∧ 未设 NO_COLOR ∧ TERM 非 dumb/空 ∧ rich 可导入，全真取 rich，否则 plain（NO_COLOR/TERM 定性为终端能力探测，与 isatty 同级，非配置通道）。plain 档 stderr 与 v1.9 逐字节等价（`heartbeat_s=0` 时——回归锚）。 |
+| `console.refresh_hz` | int | 5 | v1.10：rich 画布重绘频率（节流 tick），1–10，越界 = CONFIG_ERROR（7.7）。 |
+| `console.heartbeat_s` | int | 0 | v1.10：仅 plain 且非 TTY 生效——每 N 秒一行数据无关汇总心跳（固定键集 `heartbeat batch= stage= llm_calls= elapsed=`，7.7）；0 = 关（默认，保回归锚；对齐决策 1.6 U14）；< 0 = CONFIG_ERROR。 |
+| `console.estimate` | bool | false | v1.10：仅文本模态生效——启动时做估算扫描（`Ingestor.scan(estimate=True)`，全量多读一遍输入）换取批总数分母与 ETA（7.7；对齐决策 1.6 U17）；UI 模态分母天然廉价、恒显示，本键无效。 |
+| `console.interactive` | bool | true | v1.10：rich ∧ stdin TTY ∧ termios 可用时启用键盘开关（封闭键集 `? l e + - p q`，7.7）；false = 纯渲染（stdin 完全不被占用——buck2 `--no-interactive-console` 对应物）。 |
 
 ```
 # ─── config.toml 完整示例 ───
@@ -41,6 +46,13 @@ schema_version = 1
 [tool]
 log_level = "info"
 log_format = "text"                 # "jsonl" 供日志采集系统消费（7.3）
+
+[console]                           # v1.10 进度显示面（7.7）；整节可缺省
+mode = "auto"                       # auto | rich | plain
+refresh_hz = 5                      # rich 画布重绘频率（1–10）
+heartbeat_s = 0                     # plain 非 TTY 心跳；0 = 关（默认）
+estimate = false                    # 文本模态批总数分母（多读一遍输入）
+interactive = true                  # rich 档键盘开关（? l e + - p q）
 
 [llm.default]                       # 多模态主力模型
 provider = "openai_compatible"

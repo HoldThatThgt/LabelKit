@@ -3,7 +3,7 @@
 ### 3.12.1 职责与边界
 
 **做：**进程内**唯一**日志设施，承载两条通道：① **运行日志**——写 stderr，级别 debug/info/warn/error，行格式由 `tool.log_format = "text"`（默认）| `"jsonl"` 决定，只记运维事件，**绝不含数据内容与提示词**；② **trace 追踪日志**（可选，`trace.enabled=true` 时）——JSONL 文件（默认 `{output_stem}.trace.jsonl`），一行一事件的结构化事件流，供 rubric 优化（7.5）与标注质量分析。事件目录与格式规范见第 7 章。 
-**不做：**不做跨运行聚合分析（下游 / 后续 `labelkit analyze` 工具职责，8.3 O5）；不上传任何遥测（2.1.2 边界⑦）；写失败**绝不中断运行**——首次失败 warn 一次并关闭该通道，此后事件丢弃并计入 `report.trace.dropped_events`；API Key 永不落日志（任一通道、任一脱敏档位）。进度条不属于日志（7.7）。
+**不做：**不做跨运行聚合分析（下游 / 后续 `labelkit analyze` 工具职责，8.3 O5）；不上传任何遥测（2.1.2 边界⑦）；写失败**绝不中断运行**——首次失败 warn 一次并关闭该通道，此后事件丢弃并计入 `report.trace.dropped_events`；API Key 永不落日志（任一通道、任一脱敏档位）。进度显示（console，7.7）不属于日志——M12 仅以 3.12.3 的 ProgressListener 旁路向其**转发**（v1.10），不承载其渲染。
 
 ### 3.12.2 输入 / 输出
 
@@ -31,6 +31,17 @@ class EventLog:
 ```
 
 接入方式：`EventLog` 由 `MetricsSink` 持有并转发——各 Stage 通过既有的 `RunContext.metrics`（3.10.3）发事件，**不改 RunContext 签名**。stderr 侧直接使用标准 `logging` 模块，handler 由 M12 在启动时按 `log_format` 安装。
+
+**v1.10 增：ProgressListener 进程内旁路**（console 面板的唯一数据通路，7.7；实现归 CLI 层 `labelkit/cli/console.py`，协议归本层——依赖方向 `cli → orchestration → operators → common` 不变）：
+
+```
+class ProgressListener(Protocol):        # v1.10（7.7 console 的订阅协议）
+    def on_event(self, ev: TraceEvent) -> None: ...          # MetricsSink.event() 旁路转发（脱敏前原样；消费纪律 = stderr 镜像同级，实现只得读取标量结构字段）
+    def on_stage(self, stage: str, batch_no: int) -> None: ...  # M10 stage 循环经 MetricsSink.stage_begin 转发
+    def on_stop_requested(self) -> None: ...                 # SIGINT/SIGTERM 优雅中断横幅（3.10.3）
+```
+
+三条纪律：① 旁路**不属于 trace 面**——`stage_begin` 不产生 TraceEvent、不受 `trace.channels` 过滤、不经 7.4 脱敏（7.2 事件目录零改动的充分条件）；② 全部回调必须 O(1)、无 I/O、无锁等待——重绘由消费方自己的节流 tick 驱动（渲染与事件源解耦）；③ `listener = None`（validate / 全部既有调用路径）时行为与 v1.9 逐字节一致。`MetricsSink.__init__` 增可选尾参 `listener`（只增）；配套的 `LLMClient.snapshot()` 只读快照（密钥池三态 + 用量 + p50 有界样本窗）规格见 `docs/dev/SPEC-tui-console.md` §3.3，实施期随 CONTRACTS §8 入册。
 
 ### 3.12.4 行为规格
 
