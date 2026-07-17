@@ -145,8 +145,8 @@ uv run labelkit run ... --strict; echo "exit=$?"
 
 ```
    ── 终版摘要（与 report.counts 逐项一致）──
-   scanned=14  ingested=14  bad_input=0  generated=0
-   dropped_dup=1  dropped_lowq=6  dropped_verify=0  failed=0  emitted=7
+   scanned=14  ingested=14  bad_input=0  generated=12
+   dropped_dup=1  dropped_lowq=10  dropped_verify=0  failed=0  emitted=15
 ```
 
 **stderr 永远不含数据内容与提示词**——可以放心接入任何日志采集系统。

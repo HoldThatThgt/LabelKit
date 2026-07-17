@@ -1,17 +1,19 @@
 # 第 22 章　教程四：从零合成数据集（generate_only）
 
 > **难度：★★★☆☆**
-> 舞台：`examples/generate`——没有一条输入数据，从 3 条手写种子出发合成一个带标注的小数据集。
+> 舞台：`examples/text/project-synth.toml`——文本示例工程的纯生成变体：没有一条输入数据，
+> 从 3 条手写种子出发合成一个带标注的小数据集。（同目录 `project.toml` 里的 generate 是
+> **process 模式**的另一形态——过质量门的记录当种子、扩充样本回流治理，见第 12 章。）
 > 目标：理解纯生成模式的完整链路（合成 → 去重 → 打分 → 标注），学会用桶统计验收多样性，
 > 并掌握种子池 / 无种子两种形态的选型。
 
 ## 22.1 工程配置解剖
 
-`examples/generate/project.toml` 的骨架（完整文件见仓库）：
+`examples/text/project-synth.toml` 的骨架（完整文件见仓库）：
 
 ```toml
 [run]
-output = "./out/generated.jsonl"
+output = "./out/text-synth.jsonl"
 modality = "text"
 mode = "generate_only"            # ← 纯生成：注意没有 run.input（写了反而报错）
 batch_size = 8
@@ -58,9 +60,9 @@ instruction = """……"""
 ## 22.2 运行与对账
 
 ```bash
-cd examples/generate && mkdir -p out
+cd examples/text && mkdir -p out
 set -a && source ../../.env && set +a
-uv run labelkit run --config ../config.toml --project project.toml
+uv run labelkit run --config ../config.toml --project project-synth.toml
 ```
 
 ```
@@ -70,12 +72,12 @@ dropped_dup=0  dropped_lowq=0  dropped_verify=0  failed=0  emitted=8
 
 纯生成模式的账目特征：`scanned=0`（没有输入这回事），守恒等式退化为 `emitted + dropped_* + failed = generated`（8 = 8 ✓）。本次 8 条全部活过去重——种子多样、温度 0.9，两次调用没产出雷同货。
 
-产物长这样（已剥 `_meta`）：
+产物长这样（前三行，已剥 `_meta`）：
 
 ```json
-{"intent": "writing_assist", "topic": "求职邮件撰写", "difficulty": "medium"}
-{"intent": "writing_assist", "topic": "会议议程模板撰写", "difficulty": "medium"}
-{"intent": "writing_assist", "topic": "人工智能科普", "difficulty": "medium"}
+{"intent": "writing_assist", "topic": "产品介绍文案（智能保温杯）", "difficulty": "medium"}
+{"intent": "qa", "topic": "人工智能面试问题及参考答案", "difficulty": "hard"}
+{"intent": "translation", "topic": "商务周报中译日（商务敬语）", "difficulty": "hard"}
 ```
 
 注意：**合成品拿到的是和真实数据完全一样的待遇**——先被打分（`_meta.scores` 俱全）、再被标注、结构照样过 Schema 引擎。这就是「产物照常走全套治理」的含义。
