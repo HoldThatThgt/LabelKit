@@ -1,0 +1,99 @@
+<svg viewBox="0 0 1000 440" xmlns="http://www.w3.org/2000/svg" font-family="PingFang SC, sans-serif">
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <!-- 主链：输入 → M2 → M14 → M16 → M3 → M13 → M15 → M4 → M5 → M7 -->
+  <g font-size="12.5" text-anchor="middle">
+    <rect x="20" y="40" width="110" height="70" rx="8" fill="#eef3fa" stroke="#2456a6"/>
+    <text x="75" y="66">输入路径</text>
+    <text x="75" y="86" font-size="10.5" fill="#666">.jsonl / UI 文件对目录</text>
+    <text x="75" y="100" font-size="10.5" fill="#666">（stream = 会话流）</text>
+
+    <rect x="150" y="40" width="84" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="192" y="66">M2 接入</text>
+    <text x="192" y="86" font-size="10.5" fill="#666">必选</text>
+
+    <rect x="243" y="40" width="84" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="285" y="62">M14 分段</text>
+    <text x="285" y="80" font-size="10.5" fill="#a04010">默认关</text>
+    <text x="285" y="96" font-size="10" fill="#666">帧→episode</text>
+
+    <rect x="336" y="40" width="84" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="378" y="62">M16 缝合</text>
+    <text x="378" y="80" font-size="10.5" fill="#a04010">默认关</text>
+    <text x="378" y="96" font-size="10" fill="#666">碎片→线索</text>
+
+    <rect x="429" y="40" width="84" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="471" y="62">M3 去重</text>
+    <text x="471" y="80" font-size="10.5" fill="#2e8b57">默认开</text>
+
+    <rect x="522" y="40" width="84" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="564" y="62">M13 分类</text>
+    <text x="564" y="80" font-size="10.5" fill="#a04010">默认关</text>
+    <text x="564" y="96" font-size="10" fill="#666">multi 可扇出</text>
+
+    <rect x="615" y="40" width="84" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="657" y="62">M15 摘取</text>
+    <text x="657" y="80" font-size="10.5" fill="#a04010">默认关</text>
+    <text x="657" y="96" font-size="10" fill="#666">仅 UI 序列</text>
+
+    <rect x="708" y="40" width="84" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="750" y="62">M4 打分</text>
+    <text x="750" y="80" font-size="10.5" fill="#2e8b57">默认开</text>
+    <text x="750" y="96" font-size="10" fill="#666">阈值过滤</text>
+
+    <rect x="801" y="40" width="84" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="843" y="62">M5 标注</text>
+    <text x="843" y="80" font-size="10.5" fill="#2e8b57">默认开</text>
+
+    <rect x="894" y="40" width="84" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="936" y="62">M7 校验</text>
+    <text x="936" y="80" font-size="10.5" fill="#a04010">默认关</text>
+    <text x="936" y="96" font-size="10" fill="#666">drop/repair</text>
+
+    <rect x="20" y="185" width="110" height="70" rx="8" fill="#eef8f0" stroke="#2e8b57"/>
+    <text x="75" y="210">输出 .jsonl</text>
+    <text x="75" y="230" font-size="10.5" fill="#666">+ report.json</text>
+    <text x="75" y="246" font-size="10.5" fill="#666">+ rejects（可选）</text>
+
+    <rect x="185" y="185" width="110" height="70" rx="4" fill="#fff" stroke="#c9861a"/>
+    <text x="240" y="215">M11 输出</text>
+    <text x="240" y="233" font-size="10.5" fill="#666">必选</text>
+
+    <!-- 生成回流（旁路） -->
+    <rect x="760" y="320" width="110" height="70" rx="4" fill="#fff" stroke="#7a4fb5" stroke-dasharray="6,4"/>
+    <text x="815" y="346">M6 生成</text>
+    <text x="815" y="364" font-size="10.5" fill="#a04010">默认关</text>
+    <text x="815" y="380" font-size="10" fill="#666">仅文本模态</text>
+  </g>
+  <!-- 主流箭头 -->
+  <g stroke="#555" stroke-width="1.7" marker-end="url(#arr2)" fill="none">
+    <line x1="130" y1="75" x2="148" y2="75"/>
+    <line x1="234" y1="75" x2="241" y2="75"/>
+    <line x1="327" y1="75" x2="334" y2="75"/>
+    <line x1="420" y1="75" x2="427" y2="75"/>
+    <line x1="513" y1="75" x2="520" y2="75"/>
+    <line x1="606" y1="75" x2="613" y2="75"/>
+    <line x1="699" y1="75" x2="706" y2="75"/>
+    <line x1="792" y1="75" x2="799" y2="75"/>
+    <line x1="885" y1="75" x2="892" y2="75"/>
+    <path d="M 936 110 L 936 220 L 297 220"/>
+    <line x1="185" y1="220" x2="132" y2="220"/>
+  </g>
+  <!-- 生成回流虚线 -->
+  <g stroke="#7a4fb5" stroke-width="1.7" stroke-dasharray="6,4" marker-end="url(#arr2)" fill="none">
+    <path d="M 750 112 L 750 355 L 758 355"/>
+    <path d="M 872 355 L 985 355 L 985 20 L 471 20 L 471 38"/>
+  </g>
+  <text x="618" y="290" font-size="11.5" fill="#7a4fb5">过质量门的记录作为种子（stream 模式互斥，不出现）</text>
+  <text x="640" y="14" font-size="11.5" fill="#7a4fb5" text-anchor="middle">生成样本回流：从 M3 起重新去重、分类、打分、标注（仅回流一轮，不递归）</text>
+  <!-- 淘汰通道 -->
+  <g stroke="#b04a4a" stroke-width="1.4" marker-end="url(#arr2)" fill="none">
+    <path d="M 471 112 L 471 160 L 240 160 L 240 183"/>
+    <path d="M 285 112 L 285 160" stroke-dasharray="2,3"/>
+    <path d="M 843 112 L 843 160 L 471 160" stroke-dasharray="2,3"/>
+  </g>
+  <text x="300" y="152" font-size="11" fill="#b04a4a">重复 / 低质 / 噪声帧 / 校验失败 → rejects 通道（可配置）；absorbed / stitched 仅计数不落盘</text>
+</svg>

@@ -1,0 +1,73 @@
+<svg viewBox="0 0 1000 620" xmlns="http://www.w3.org/2000/svg" font-family="PingFang SC, sans-serif">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+    </marker>
+    <marker id="arrp" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#7a4fb5"/>
+    </marker>
+  </defs>
+  <rect x="20" y="20" width="960" height="70" rx="6" fill="#eef3fa" stroke="#2456a6"/>
+  <text x="40" y="45" font-size="15" font-weight="bold" fill="#2456a6">入口层</text>
+  <rect x="200" y="32" width="600" height="46" rx="4" fill="#fff" stroke="#2456a6"/>
+  <text x="500" y="60" font-size="14" text-anchor="middle">CLI：labelkit run / validate / rubric（参数解析、退出码、进度显示）</text>
+  <rect x="20" y="110" width="960" height="70" rx="6" fill="#eef8f0" stroke="#2e8b57"/>
+  <text x="40" y="135" font-size="15" font-weight="bold" fill="#2e8b57">编排层</text>
+  <rect x="180" y="122" width="640" height="46" rx="4" fill="#fff" stroke="#2e8b57"/>
+  <text x="500" y="150" font-size="13.5" text-anchor="middle">M10 编排器：批切分（stream 整会话装箱）· 阶段组合与调度 · 生成回流 · 生命周期与内存丢弃</text>
+  <rect x="20" y="200" width="960" height="250" rx="6" fill="#fdf7ee" stroke="#c9861a"/>
+  <text x="40" y="225" font-size="15" font-weight="bold" fill="#a06a10">算子层（统一 Stage 签名，可独立开关；链序 = 3.10.3）</text>
+  <g font-size="12" text-anchor="middle">
+    <rect x="24"  y="245" width="87" height="56" rx="4" fill="#fff" stroke="#c9861a"/><text x="67" y="267">M2 接入</text><text x="67" y="285" font-size="9.5" fill="#666">ingest</text>
+    <rect x="119" y="245" width="87" height="56" rx="4" fill="#fff" stroke="#c9861a"/><text x="162" y="267">M14 分段</text><text x="162" y="285" font-size="9.5" fill="#666">segment</text><text x="162" y="296" font-size="9" fill="#a04010">v1.8 · 默认关</text>
+    <rect x="214" y="245" width="87" height="56" rx="4" fill="#fff" stroke="#c9861a"/><text x="257" y="267">M16 缝合</text><text x="257" y="285" font-size="9.5" fill="#666">stitch</text><text x="257" y="296" font-size="9" fill="#a04010">v1.9 · 默认关</text>
+    <rect x="309" y="245" width="87" height="56" rx="4" fill="#fff" stroke="#c9861a"/><text x="352" y="267">M3 去重</text><text x="352" y="285" font-size="9.5" fill="#666">dedup</text>
+    <rect x="404" y="245" width="87" height="56" rx="4" fill="#fff" stroke="#c9861a"/><text x="447" y="267">M13 分类</text><text x="447" y="285" font-size="9.5" fill="#666">classify</text><text x="447" y="296" font-size="9" fill="#a04010">v1.7 · 默认关</text>
+    <rect x="499" y="245" width="87" height="56" rx="4" fill="#fff" stroke="#c9861a"/><text x="542" y="267">M15 摘取</text><text x="542" y="285" font-size="9.5" fill="#666">extract</text><text x="542" y="296" font-size="9" fill="#a04010">v1.8 · 默认关</text>
+    <rect x="594" y="245" width="87" height="56" rx="4" fill="#fff" stroke="#c9861a"/><text x="637" y="267">M4 质量打分</text><text x="637" y="285" font-size="9.5" fill="#666">quality (QuRating)</text>
+    <rect x="689" y="245" width="87" height="56" rx="4" fill="#fff" stroke="#c9861a"/><text x="732" y="267">M5 标注</text><text x="732" y="285" font-size="9.5" fill="#666">annotate</text>
+    <rect x="784" y="245" width="87" height="56" rx="4" fill="#fff" stroke="#c9861a"/><text x="827" y="267">M7 二次校验</text><text x="827" y="285" font-size="9.5" fill="#666">verify</text>
+    <rect x="879" y="245" width="87" height="56" rx="4" fill="#fff" stroke="#c9861a"/><text x="922" y="267">M11 输出器</text><text x="922" y="285" font-size="9.5" fill="#666">emitter</text>
+  </g>
+  <g stroke="#555" stroke-width="1.5" marker-end="url(#arr)">
+    <line x1="111" y1="273" x2="117" y2="273"/>
+    <line x1="206" y1="273" x2="212" y2="273"/>
+    <line x1="301" y1="273" x2="307" y2="273"/>
+    <line x1="396" y1="273" x2="402" y2="273"/>
+    <line x1="491" y1="273" x2="497" y2="273"/>
+    <line x1="586" y1="273" x2="592" y2="273"/>
+    <line x1="681" y1="273" x2="687" y2="273"/>
+    <line x1="776" y1="273" x2="782" y2="273"/>
+    <line x1="871" y1="273" x2="877" y2="273"/>
+  </g>
+  <text x="500" y="322" font-size="11.5" text-anchor="middle" fill="#666">PipelineItem 流（第 4 章定义的统一信封结构，携带记录、去重信息、分类、分数、转移、标注、状态）</text>
+  <line x1="60" y1="336" x2="940" y2="336" stroke="#c9861a" stroke-dasharray="5,4"/>
+  <g text-anchor="middle">
+    <rect x="404" y="352" width="150" height="48" rx="4" fill="#fff" stroke="#7a4fb5" stroke-dasharray="6,4"/>
+    <text x="479" y="373" font-size="13.5" fill="#7a4fb5">M6 生成</text>
+    <text x="479" y="391" font-size="11" fill="#666">generate · 旁路算子 · 默认关</text>
+  </g>
+  <g stroke="#7a4fb5" stroke-width="1.6" stroke-dasharray="5,4" marker-end="url(#arrp)" fill="none">
+    <line x1="637" y1="301" x2="637" y2="376"/>
+    <path d="M 637 376 L 556 376"/>
+    <path d="M 402 376 L 352 376 L 352 303"/>
+  </g>
+  <text x="586" y="428" font-size="11.5" fill="#7a4fb5" text-anchor="start">以 M4 过质量门记录为种子产出新样本子批，经 M10 调度回流至 M3（图 2-2 虚线路径）；</text>
+  <text x="586" y="443" font-size="11.5" fill="#7a4fb5" text-anchor="start">仅文本模态，与 stream 模式互斥（2.3.1）</text>
+  <rect x="20" y="470" width="960" height="130" rx="6" fill="#f6f1fb" stroke="#7a4fb5"/>
+  <text x="40" y="495" font-size="15" font-weight="bold" fill="#7a4fb5">服务层（被上层共享）</text>
+  <g font-size="12.5" text-anchor="middle">
+    <rect x="35"  y="510" width="220" height="72" rx="4" fill="#fff" stroke="#7a4fb5"/>
+    <text x="145" y="535">M1 配置管理 config</text>
+    <text x="145" y="557" font-size="10.5" fill="#666">双 TOML 装载/校验/合并</text>
+    <rect x="272" y="510" width="220" height="72" rx="4" fill="#fff" stroke="#7a4fb5"/>
+    <text x="382" y="535">M8 结构引擎 schema-engine</text>
+    <text x="382" y="557" font-size="10.5" fill="#666">Schema 校验 · 确定性/回调/LLM 修复</text>
+    <rect x="509" y="510" width="220" height="72" rx="4" fill="#fff" stroke="#7a4fb5"/>
+    <text x="619" y="535">M9 LLM 客户端 llm-client</text>
+    <text x="619" y="557" font-size="10.5" fill="#666">Profile · 多模态 · 密钥池 · 重试/限流/计量</text>
+    <rect x="746" y="510" width="220" height="72" rx="4" fill="#fff" stroke="#7a4fb5"/>
+    <text x="856" y="535">M12 日志 logging</text>
+    <text x="856" y="557" font-size="10.5" fill="#666">运行日志 · trace 事件流（11 通道）</text>
+  </g>
+</svg>

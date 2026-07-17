@@ -1,0 +1,40 @@
+<svg viewBox="0 0 1000 400" xmlns="http://www.w3.org/2000/svg" font-family="PingFang SC, sans-serif">
+  <defs>
+    <marker id="arr6" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <g font-size="12" text-anchor="middle">
+    <!-- lifelines -->
+    <rect x="40"  y="20" width="120" height="34" rx="4" fill="#eef3fa" stroke="#2456a6"/><text x="100" y="42">CLI / main</text>
+    <rect x="230" y="20" width="120" height="34" rx="4" fill="#eef8f0" stroke="#2e8b57"/><text x="290" y="42">M10 编排器</text>
+    <rect x="430" y="20" width="120" height="34" rx="4" fill="#fdf7ee" stroke="#c9861a"/><text x="490" y="42" font-size="11">阶段链（3.10.3 链序）</text>
+    <rect x="630" y="20" width="120" height="34" rx="4" fill="#fdf7ee" stroke="#c9861a"/><text x="690" y="42">M11 输出器</text>
+    <rect x="830" y="20" width="130" height="34" rx="4" fill="#f6f1fb" stroke="#7a4fb5"/><text x="895" y="42">进程内存</text>
+  </g>
+  <g stroke="#999" stroke-dasharray="4,4">
+    <line x1="100" y1="54" x2="100" y2="380"/><line x1="290" y1="54" x2="290" y2="380"/>
+    <line x1="490" y1="54" x2="490" y2="380"/><line x1="690" y1="54" x2="690" y2="380"/><line x1="895" y1="54" x2="895" y2="380"/>
+  </g>
+  <g font-size="11.5">
+    <g stroke="#555" stroke-width="1.5" marker-end="url(#arr6)"><line x1="100" y1="80" x2="288" y2="80"/></g>
+    <text x="150" y="74">run(ResolvedConfig)</text>
+    <g stroke="#555" stroke-width="1.5" marker-end="url(#arr6)"><line x1="290" y1="115" x2="893" y2="115"/></g>
+    <text x="480" y="109">取下一批 batch_size 条 Record（M2 惰性流）→ 构造 PipelineItem[]</text>
+    <g stroke="#555" stroke-width="1.5" marker-end="url(#arr6)"><line x1="290" y1="150" x2="488" y2="150"/></g>
+    <text x="368" y="144">依次 await stage.run(batch, ctx)</text>
+    <g stroke="#7a4fb5" stroke-width="1.5" marker-end="url(#arr6)" stroke-dasharray="5,3"><line x1="490" y1="185" x2="292" y2="185"/></g>
+    <text x="400" y="179" fill="#7a4fb5">generate 子批（如启用）</text>
+    <g stroke="#7a4fb5" stroke-width="1.5" marker-end="url(#arr6)" stroke-dasharray="5,3"><line x1="290" y1="212" x2="488" y2="212"/></g>
+    <text x="392" y="206" fill="#7a4fb5">子批走 M3→M7（不再生成）</text>
+    <g stroke="#555" stroke-width="1.5" marker-end="url(#arr6)"><line x1="290" y1="250" x2="688" y2="250"/></g>
+    <text x="470" y="244">emit(batch + 子批)：主输出/rejects 增量追加，flush</text>
+    <g stroke="#b04a4a" stroke-width="1.5" marker-end="url(#arr6)"><line x1="290" y1="290" x2="893" y2="290"/></g>
+    <text x="560" y="284" fill="#b04a4a">批完成 ⇒ 释放该批全部 PipelineItem / 比较结果 / 图像引用（中间态丢弃）</text>
+    <text x="290" y="318" font-size="11" fill="#666">循环直至记录流耗尽</text>
+    <g stroke="#555" stroke-width="1.5" marker-end="url(#arr6)"><line x1="290" y1="345" x2="688" y2="345"/></g>
+    <text x="470" y="339">finalize()：主输出原子改名 + 写 report.json</text>
+    <g stroke="#555" stroke-width="1.5" marker-end="url(#arr6)"><line x1="290" y1="372" x2="102" y2="372"/></g>
+    <text x="180" y="366">RunSummary → 退出码</text>
+  </g>
+</svg>

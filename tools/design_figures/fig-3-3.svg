@@ -1,0 +1,58 @@
+<svg viewBox="0 0 1000 370" xmlns="http://www.w3.org/2000/svg" font-family="PingFang SC, sans-serif">
+  <defs>
+    <marker id="arr5" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#555"/>
+    </marker>
+  </defs>
+  <g font-size="12.5" text-anchor="middle">
+    <rect x="20" y="130" width="150" height="70" rx="6" fill="#f6f8fa" stroke="#888"/>
+    <text x="95" y="153">LLM 调用 (M9)</text>
+    <text x="95" y="174" font-size="11" fill="#666">L0: 若 profile 支持</text>
+    <text x="95" y="190" font-size="11" fill="#666">带原生结构化输出参数</text>
+
+    <rect x="190" y="130" width="170" height="70" rx="6" fill="#fff" stroke="#c9861a"/>
+    <text x="275" y="152" font-weight="bold">L1 确定性修复</text>
+    <text x="275" y="172" font-size="11">剥 ```json 围栏 / 首个平衡 {}</text>
+    <text x="275" y="190" font-size="11">json-repair 补断尾/引号/逗号</text>
+
+    <rect x="390" y="130" width="170" height="70" rx="6" fill="#fff" stroke="#c9861a"/>
+    <text x="475" y="152" font-weight="bold">L2 Schema 校验</text>
+    <text x="475" y="172" font-size="11">jsonschema Draft 2020-12</text>
+    <text x="475" y="190" font-size="11">收集全部违规路径与原因</text>
+
+    <rect x="590" y="130" width="180" height="70" rx="6" fill="#fff" stroke="#2e8b57" stroke-dasharray="6,4"/>
+    <text x="680" y="152" font-weight="bold">L2.5 用户回调（v1.5）</text>
+    <text x="680" y="172" font-size="11">output.validator 可选</text>
+    <text x="680" y="190" font-size="11" fill="#666">仅 annotate 用户 Schema 调用</text>
+
+    <rect x="800" y="30" width="180" height="70" rx="6" fill="#fff" stroke="#7a4fb5"/>
+    <text x="890" y="55" font-weight="bold">L3 LLM 修复环</text>
+    <text x="890" y="75" font-size="11">违规清单 + 原输出回喂</text>
+    <text x="890" y="91" font-size="11">≤ max_repair_attempts 次（默认 2）</text>
+
+    <rect x="800" y="230" width="180" height="70" rx="6" fill="#eef8f0" stroke="#2e8b57"/>
+    <text x="890" y="258" font-weight="bold">通过 ✓</text>
+    <text x="890" y="278" font-size="11">返回合法 JSON 对象</text>
+
+    <rect x="390" y="280" width="185" height="70" rx="6" fill="#fbeeee" stroke="#b04a4a"/>
+    <text x="482" y="303" font-weight="bold" fill="#b04a4a">拒绝 ✗</text>
+    <text x="482" y="322" font-size="11">SchemaViolation → rejects</text>
+    <text x="482" y="340" font-size="10" fill="#666">仅剩回调违规 ⇒ callback_violation</text>
+  </g>
+  <g stroke="#555" stroke-width="1.8" marker-end="url(#arr5)" fill="none">
+    <line x1="170" y1="165" x2="188" y2="165"/>
+    <line x1="360" y1="165" x2="388" y2="165"/>
+    <path d="M 560 150 L 575 150 L 575 65 L 798 65"/>
+    <path d="M 560 180 L 588 180"/>
+    <path d="M 770 150 L 785 150 L 785 80 L 798 80"/>
+    <path d="M 680 200 L 680 265 L 798 265"/>
+    <path d="M 890 100 L 890 115 L 275 115 L 275 128" stroke="#7a4fb5" stroke-dasharray="5,4"/>
+    <path d="M 940 100 L 940 315 L 577 315" stroke="#b04a4a"/>
+  </g>
+  <text x="570" y="140" font-size="11" fill="#b04a4a">未过</text>
+  <text x="572" y="212" font-size="11" fill="#2e8b57">通过</text>
+  <text x="787" y="120" font-size="11" fill="#b04a4a">违规</text>
+  <text x="702" y="228" font-size="11" fill="#2e8b57">通过</text>
+  <text x="560" y="108" font-size="11" fill="#7a4fb5">修复输出重走 L1→L2（→L2.5）</text>
+  <text x="905" y="180" font-size="11" fill="#b04a4a">次数耗尽</text>
+</svg>
