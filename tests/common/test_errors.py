@@ -95,5 +95,7 @@ def test_error_kind_values_are_the_frozen_wire_codes():
         "CALLBACK_VIOLATION": "callback_violation",
         "PROVIDER_RETRYABLE_EXHAUSTED": "provider_retryable_exhausted",
         "PROVIDER_FATAL": "provider_fatal",
+        "CONTEXT_OVERFLOW": "context_overflow",        # v1.11 (V16/V24)
+        "OUTPUT_TRUNCATED": "output_truncated",        # v1.11 (V11)
         "INTERNAL_ERROR": "internal_error",
     }

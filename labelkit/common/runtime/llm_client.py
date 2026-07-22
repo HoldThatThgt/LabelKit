@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import os
 import random
@@ -32,9 +33,13 @@ from labelkit.common.config.model import EmbeddingProfile, LLMProfile
 from labelkit.common.contracts.types import ImageRef, Usage
 from labelkit.common.errors import (
     CircuitBreakerTripped,
+    ContextOverflowError,
+    OutputTruncatedError,
     ProviderFatalError,
     ProviderRetryableError,
 )
+from labelkit.common.runtime import budget
+from labelkit.common.runtime.budget import ImageCostCalibrator
 
 if TYPE_CHECKING:
     from labelkit.common.observability.obslog import MetricsSink
@@ -46,11 +51,70 @@ from labelkit.common.observability.obslog import (
     EV_LLM_POOL_PARKED,
 )
 
+_logger = logging.getLogger("labelkit.llm")
+
 ANTHROPIC_VERSION = "2023-06-01"          # [FROZEN in CONTRACTS.md §7.8]
 STRUCTURED_TOOL_NAME = "emit"             # [FROZEN in CONTRACTS.md §7.8]
 _MAX_BACKOFF_S = 60.0                     # backoff cap (spec 3.9.3) — v1.6: non-429 retryables only
 _MAX_KEY_COOLDOWN_S = 300.0               # no-Retry-After per-key 429 cooldown cap (spec 3.9.3)
 _PARK_SLICE_S = 60.0                      # park sleep slice; breaker re-checked per slice (v1.6)
+
+# v1.11 (V11/V24, [C-57][C-58]): termination reasons finalized on every 200 —
+# output-cap hits and the 200-shaped context-overflow oracle (both protocols).
+_TRUNCATED_FINISH_VALUES = ("length", "max_tokens")
+_OVERFLOW_FINISH_VALUE = "model_context_window_exceeded"
+
+# v1.11 (V20, CONTRACTS §7.8 sniff clause — [C-75] empirical seeds, frozen):
+# overflow-body pattern set, matched case-insensitively as substrings over the
+# FULL 400 resp.text (before any truncation, F5) — OpenAI/Azure code/message
+# family, vLLM message-only family (no code — matching code alone would miss
+# it), anthropic-protocol "prompt is too long", z.ai business code "1261" /
+# "Prompt too long", OpenRouter error_type. Budget-gated per profile
+# (context_window == 0 → sniff off, the 400 walks the v1.10 fatal path).
+_OVERFLOW_BODY_PATTERNS = (
+    "maximum context length",
+    "context_length_exceeded",
+    "prompt is too long",
+    "prompt too long",
+    '"code":"1261"',
+    '"code": "1261"',
+    "context_window_exceeded",
+)
+
+
+def overflow_body_matches(text: str) -> bool:
+    """Pure V20 matcher: case-insensitive substring test of the frozen pattern
+    set over the full response body."""
+    lowered = text.lower()
+    return any(p in lowered for p in _OVERFLOW_BODY_PATTERNS)
+
+
+def _sniff_overflow_400(context_window: int, status_code: int | None,
+                        body_text: str) -> bool:
+    """Pure V20 gate: sniff only under an enabled per-profile budget
+    (context_window > 0 — budget-off 400s keep the v1.10 fatal path
+    byte-identically) and only on HTTP 400."""
+    return (status_code == 400 and context_window > 0
+            and overflow_body_matches(body_text))
+
+
+def _raise_for_finish(finish: str | None, profile: str,
+                      max_output_tokens: int) -> None:
+    """Pure V11/V24 disposition over the normalized termination reason:
+    length (openai) / max_tokens (anthropic) → OutputTruncatedError;
+    model_context_window_exceeded (BOTH protocols) → the reactive
+    ContextOverflowError (200-shaped oracle). Other/unknown values flow on
+    unchanged (V11③ — z.ai sensitive/network_error included)."""
+    if finish in _TRUNCATED_FINISH_VALUES:
+        raise OutputTruncatedError(
+            f"response terminated at the output cap (finish={finish!r}, "
+            f"max_output_tokens={max_output_tokens})",
+            profile=profile, finish=finish)
+    if finish == _OVERFLOW_FINISH_VALUE:
+        raise ContextOverflowError(
+            f"provider signaled context overflow via termination reason "
+            f"{finish!r} (200-shaped oracle)",
+            phase="reactive", profile=profile)
 
 
 # ── public dataclasses (CONTRACTS.md §7.8, verbatim shapes) ────────────────
@@ -72,6 +136,17 @@ class Message:
 class PromptBundle:
     messages: tuple[Message, ...]
     temperature: float | None = None               # None = profile default
+    image_px: int | None = None                    # v1.11 additive (V23①): per-call EFFECTIVE
+                                                   # image px carrier — the V21 escalation
+                                                   # ladder's ONLY vehicle. Builders compute
+                                                   # effective px = image_px or
+                                                   # profile.default_image_px or
+                                                   # profile.max_image_px, then clamp
+                                                   # min(·, max_image_px). px MUST ride the
+                                                   # bundle, never operator state: build_body()
+                                                   # re-encodes images on every attempt, so only
+                                                   # a bundle-borne value keeps retries
+                                                   # deterministic
 
 
 @dataclass(frozen=True)
@@ -81,6 +156,12 @@ class LLMResponse:
     usage: Usage
     model: str
     latency_ms: int
+    finish: str | None = None                      # v1.11 additive (V23③): NORMALIZED termination
+                                                   # reason — the openai finish_reason / anthropic
+                                                   # stop_reason RAW value (None when the provider
+                                                   # sent none); feeds the V11/V24 disposition.
+                                                   # _result_usage's len==4 dispatch adjusts with
+                                                   # the tuple shape (F9)
 
 
 @dataclass                                          # v1.6 per-key accumulator (CONTRACTS §7.8)
@@ -255,12 +336,22 @@ def _resolve_temperature(profile: LLMProfile, prompt: PromptBundle) -> float:
     return profile.temperature if prompt.temperature is None else prompt.temperature
 
 
+def _effective_image_px(profile: LLMProfile, prompt: PromptBundle) -> int:
+    """v1.11 effective-px chain (V18/V21/V23①, spec 3.9.3 图像编码行):
+    bundle.image_px (escalation carrier) or profile.default_image_px (working
+    point) or profile.max_image_px — clamped to max_image_px (the ceiling).
+    All-zero/None legs degrade byte-identically to the v1.10 max_image_px."""
+    px = prompt.image_px or profile.default_image_px or profile.max_image_px
+    return min(px, profile.max_image_px)
+
+
 def _build_openai_body(profile: LLMProfile, prompt: PromptBundle,
                        response_schema: dict | None) -> dict:
     """POST {base_url}/chat/completions body. Images become image_url data URIs;
     structured output = response_format json_schema strict (spec 3.9.3 / 3.9.4 ①).
     Image bytes are loaded lazily HERE (request-build time) and only live inside
     the returned body."""
+    image_px = _effective_image_px(profile, prompt)
     messages: list[dict] = []
     for msg in prompt.messages:
         content: Any
@@ -273,7 +364,7 @@ def _build_openai_body(profile: LLMProfile, prompt: PromptBundle,
                     content.append({"type": "text", "text": part.text or ""})
                 else:
                     assert part.image is not None
-                    media_type, b64 = part.image.load_base64(profile.max_image_px)
+                    media_type, b64 = part.image.load_base64(image_px)
                     content.append({"type": "image_url",
                                     "image_url": {"url": f"data:{media_type};base64,{b64}"}})
         messages.append({"role": msg.role, "content": content})
@@ -296,6 +387,7 @@ def _build_anthropic_body(profile: LLMProfile, prompt: PromptBundle,
     """POST {base_url}/v1/messages body. System messages fold into the top-level
     `system` param; images use source.type="base64"; structured output = a single
     forced tool named "emit" with the schema as input_schema (CONTRACTS.md §7.8)."""
+    image_px = _effective_image_px(profile, prompt)
     system_chunks: list[str] = []
     messages: list[dict] = []
     for msg in prompt.messages:
@@ -308,7 +400,7 @@ def _build_anthropic_body(profile: LLMProfile, prompt: PromptBundle,
                 blocks.append({"type": "text", "text": part.text or ""})
             else:
                 assert part.image is not None
-                media_type, b64 = part.image.load_base64(profile.max_image_px)
+                media_type, b64 = part.image.load_base64(image_px)
                 blocks.append({"type": "image",
                                "source": {"type": "base64",
                                           "media_type": media_type,
@@ -345,9 +437,11 @@ def _build_headers(provider: str, api_key: str) -> dict[str, str]:
 # ── pure helpers: response parsing ─────────────────────────────────────────
 
 def _parse_anthropic_response(data: Mapping, fallback_model: str
-                              ) -> tuple[str, dict | None, Usage, str]:
-    """Extract (text, structured, usage, model) from a /v1/messages response.
-    tool_use block (forced tool) → structured payload; text blocks joined for text."""
+                              ) -> tuple[str, dict | None, Usage, str, str | None]:
+    """Extract (text, structured, usage, model, finish) from a /v1/messages
+    response. tool_use block (forced tool) → structured payload; text blocks
+    joined for text; finish = the raw stop_reason (v1.11 V23③, None when the
+    provider sent none)."""
     texts: list[str] = []
     structured: dict | None = None
     for block in data.get("content") or ():
@@ -364,16 +458,20 @@ def _parse_anthropic_response(data: Mapping, fallback_model: str
     usage = Usage(prompt_tokens=int(raw_usage.get("input_tokens") or 0),
                   completion_tokens=int(raw_usage.get("output_tokens") or 0))
     model = str(data.get("model") or fallback_model)
-    return "\n".join(texts), structured, usage, model
+    stop_reason = data.get("stop_reason")
+    finish = str(stop_reason) if isinstance(stop_reason, str) and stop_reason else None
+    return "\n".join(texts), structured, usage, model, finish
 
 
 def _parse_openai_response(data: Mapping, fallback_model: str
-                           ) -> tuple[str, dict | None, Usage, str]:
-    """Extract (text, structured=None, usage, model) from a /chat/completions
-    response. json_schema-mode output is TEXT — M9 never parses it (spec 3.9.1).
-    Missing or unexpectedly-shaped bits degrade to defaults instead of raising,
-    so a malformed 2xx never escapes M9 unclassified."""
+                           ) -> tuple[str, dict | None, Usage, str, str | None]:
+    """Extract (text, structured=None, usage, model, finish) from a
+    /chat/completions response. json_schema-mode output is TEXT — M9 never
+    parses it (spec 3.9.1); finish = the raw choices[0].finish_reason (v1.11
+    V23③). Missing or unexpectedly-shaped bits degrade to defaults instead of
+    raising, so a malformed 2xx never escapes M9 unclassified."""
     text = ""
+    finish: str | None = None
     choices = data.get("choices")
     first = choices[0] if isinstance(choices, (list, tuple)) and choices else None
     message = first.get("message") if isinstance(first, Mapping) else None
@@ -383,13 +481,17 @@ def _parse_openai_response(data: Mapping, fallback_model: str
             text = content
         elif isinstance(content, list):  # some gateways return typed part lists
             text = "".join(str(p.get("text") or "") for p in content if isinstance(p, Mapping))
+    if isinstance(first, Mapping):
+        finish_reason = first.get("finish_reason")
+        if isinstance(finish_reason, str) and finish_reason:
+            finish = finish_reason
     raw_usage = data.get("usage")
     if not isinstance(raw_usage, Mapping):
         raw_usage = {}
     usage = Usage(prompt_tokens=int(raw_usage.get("prompt_tokens") or 0),
                   completion_tokens=int(raw_usage.get("completion_tokens") or 0))
     model = str(data.get("model") or fallback_model)
-    return text, None, usage, model
+    return text, None, usage, model, finish
 
 
 def _parse_embeddings_response(data: Mapping, n_texts: int, profile_name: str,
@@ -482,6 +584,16 @@ class LLMClient:
         # sample deque, successful logical calls only — the ONLY new collection
         # point; never enters report.json or any event.
         self._latencies: dict[tuple[str, str], deque] = {}
+        # v1.11 (V19/V23②): the per-profile per-image cost calibrator —
+        # SELF-CONSTRUCTED (zero factory/runtime assembly changes; RunContext's
+        # frozen six fields untouched). Priors need (provider, working px) per
+        # profile; working px = default_image_px or max_image_px (V18).
+        self.calibrator = ImageCostCalibrator({
+            name: (p.provider, p.default_image_px or p.max_image_px)
+            for name, p in self._llm_profiles.items()})
+        # [C-64] fallback bookkeeping: usage-missing responses WARN once per
+        # profile ("image-cost calibration inactive"), then stay silent.
+        self._calibration_warned: set[str] = set()
         # Jitter RNG is intentionally NOT seed-derived — timing only [FROZEN §7.8].
         self._jitter_rng = random.Random()
         self._http_client: httpx.AsyncClient | None = None
@@ -493,11 +605,42 @@ class LLMClient:
         """response_schema becomes L0 params only if the profile declares
         supports_structured_output, else it is ignored. Raises
         ProviderRetryableError (retries exhausted) / ProviderFatalError /
-        CircuitBreakerTripped (fail-fast once the breaker is open)."""
+        CircuitBreakerTripped (fail-fast once the breaker is open).
+        v1.11 (spec 3.9.5): budget-declared profiles run the V16 precheck
+        before any provider dispatch; every 200 is finalized by termination
+        reason (V11/V24 — OutputTruncatedError / reactive ContextOverflowError,
+        both AFTER the success bookkeeping, never fed to the breaker, never
+        entering the retry loop); image-carrying successes feed the V19
+        calibrator."""
         prof = self._llm_profiles.get(profile)
         if prof is None:
             raise ValueError(f"unknown [llm.*] profile: {profile!r}")
         self._check_breaker()
+
+        # The schema rides the wire only under supports_structured_output
+        # (L0 clause) — an unsent schema must not inflate the estimate (the
+        # prompt-embedded schema copy is already counted via its text part).
+        effective_schema = response_schema if prof.supports_structured_output else None
+        n_images = sum(1 for m in prompt.messages
+                       for p in m.parts if p.kind == "image")
+
+        # v1.11 FINAL CHECK (V16 precheck, F13): complete() is the SINGLE
+        # throat — M8 L3 repairs and probes included (probe passes trivially:
+        # max_output_tokens=1 + the V6 positive-budget validation). Budget-off
+        # profiles (cw == 0) skip entirely; a correct packing layer never
+        # trips this (defensive invariant, not a second packing logic). Zero
+        # provider interaction: never fed to the breaker, no retry burned.
+        if prof.context_window > 0:
+            est = budget.est_prompt(prompt, prof, effective_schema,
+                                    image_cost=self.calibrator.cost(prof.name))
+            if (est + prof.max_output_tokens + budget.margin(prof.context_window)
+                    > prof.context_window):
+                raise ContextOverflowError(
+                    f"estimated prompt {est} tokens + max_output_tokens "
+                    f"{prof.max_output_tokens} + margin "
+                    f"{budget.margin(prof.context_window)} exceeds "
+                    f"context_window {prof.context_window}",
+                    phase="precheck", profile=prof.name)
 
         if prof.provider == "anthropic":
             url = prof.base_url.rstrip("/") + "/v1/messages"
@@ -520,16 +663,42 @@ class LLMClient:
                              _render_output_messages(result[0], result[1])})
             if full_trace else None)
 
-        (text, structured, usage, model), latency_ms, retries = await self._post_with_retries(
-            kind="llm", prof=prof, url=url,
-            build_body=build_body, parse=parse, trace_extra=extra,
-            finalize_extra=finalize)
+        (text, structured, usage, model, finish), latency_ms, retries = \
+            await self._post_with_retries(
+                kind="llm", prof=prof, url=url,
+                build_body=build_body, parse=parse, trace_extra=extra,
+                finalize_extra=finalize)
 
         _accumulate_usage(self._usage.setdefault(prof.name, ProfileUsage()),
                           usage, retries,
                           prof.price_per_mtok_in, prof.price_per_mtok_out)
+
+        # v1.11 calibration feed (V19/V23②, spec 3.9.3 校准采样行): every
+        # image-carrying response samples (prompt_tokens − text est) / images
+        # into the CURRENT batch bucket; a usage-less response ([C-64]
+        # gateways) records nothing and WARNs once per profile — the prior
+        # × PRIOR_INFLATION stays in effect indefinitely.
+        if n_images:
+            if usage.prompt_tokens > 0:
+                text_est = budget.est_prompt(prompt, prof, effective_schema,
+                                             image_cost=0)
+                self.calibrator.observe(prof.name, usage.prompt_tokens,
+                                        text_est, n_images)
+            elif prof.name not in self._calibration_warned:
+                self._calibration_warned.add(prof.name)
+                _logger.warning(
+                    "image-cost calibration inactive: profile %s returns no "
+                    "usage", prof.name)
+
+        # v1.11 termination-reason disposition (V11/V24, [C-57][C-58]) — AFTER
+        # the success bookkeeping (streak reset + llm.call status="ok" already
+        # emitted inside _post_with_retries; per spec §3.5 these are NOT
+        # provider-fatal and must never be "corrected" to fatal, F9). Neither
+        # exception enters the retry loop or feeds the breaker.
+        _raise_for_finish(finish, prof.name, prof.max_output_tokens)
+
         return LLMResponse(text=text, structured=structured, usage=usage,
-                           model=model, latency_ms=latency_ms)
+                           model=model, latency_ms=latency_ms, finish=finish)
 
     async def embed(self, profile: str, texts: list[str]) -> list[list[float]]:
         """v1.2. profile must be an [embedding.*] name — [llm.*] names rejected
@@ -943,6 +1112,7 @@ class LLMClient:
                 headers = _build_headers(prof.provider, ks.key)
 
                 failure_msg = ""
+                body_text = ""                # full resp.text (V20 sniff, F5)
                 status_code: int | None = None
                 retry_after: float | None = None
                 retryable = True
@@ -1005,7 +1175,10 @@ class LLMClient:
                     else:
                         status_code = resp.status_code
                         retryable = _is_retryable_status(status_code)
-                        failure_msg = f"HTTP {status_code}: {resp.text[:300]}"
+                        # FULL body kept for the V20 sniff (matched before any
+                        # truncation, F5); the failure message stays truncated.
+                        body_text = resp.text
+                        failure_msg = f"HTTP {status_code}: {body_text[:300]}"
                         if status_code == 429:
                             retry_after = _parse_retry_after(resp.headers.get("retry-after"))
                 finally:
@@ -1041,6 +1214,29 @@ class LLMClient:
                     raise ProviderFatalError(failure_msg, profile=prof.name,
                                              status_code=status_code, key_env=ks.env)
                 if not retryable:
+                    # v1.11 (V20/V24, budget-gated): a 400 whose FULL body
+                    # matches the overflow pattern set raises the reactive
+                    # ContextOverflowError instead of ProviderFatalError.
+                    # Per SPEC §3.5 「M9 抛出时不喂」: the breaker feed
+                    # (_record_provider_result(fatal=True)) is SKIPPED — the
+                    # OWNING operator settles the reactive-400 terminal
+                    # exactly once after its bounded degrade-retries exhaust
+                    # (A7). The llm.call event still emits status="fatal": it
+                    # IS a provider-fatal-shaped HTTP interaction, the event
+                    # is observability-only and drives no breaker logic, and
+                    # the frozen status vocabulary gains no value.
+                    if _sniff_overflow_400(prof.context_window, status_code,
+                                           body_text):
+                        if retries_used:
+                            acc.retries += retries_used
+                        self._emit_llm_call(prof, latency_ms=latency_ms,
+                                            usage=Usage(), retries=retries_used,
+                                            status="fatal", operation=operation,
+                                            extra=key_extra())
+                        raise ContextOverflowError(
+                            f"provider context overflow (400 body sniff): "
+                            f"{failure_msg}", phase="reactive",
+                            profile=prof.name)
                     # 400/404: request-shape errors are key-independent — no
                     # rotation, immediate fatal feeding the streak (spec 3.9.3).
                     self._record_provider_result(fatal=True)
@@ -1095,9 +1291,10 @@ def _split_embed(data: Mapping, n: int, prof: EmbeddingProfile) -> tuple:
 
 
 def _result_usage(result: tuple) -> Usage:
-    """Pull the Usage out of a parse() result tuple (complete: 4-tuple with usage
-    at index 2; embed: 1-tuple of (vectors, usage))."""
-    if len(result) == 4:
+    """Pull the Usage out of a parse() result tuple (complete: 5-tuple with usage
+    at index 2 — v1.11 F9: +finish widened the shape from 4 to 5; embed: 1-tuple
+    of (vectors, usage))."""
+    if len(result) == 5:
         return result[2]
     inner = result[0]
     return inner[1]

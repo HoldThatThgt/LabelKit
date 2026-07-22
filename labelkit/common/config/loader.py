@@ -24,6 +24,7 @@ import tomllib
 from dataclasses import replace
 from importlib import resources
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Literal
 from urllib.parse import urljoin
 
@@ -62,6 +63,7 @@ from labelkit.common.config.model import (
 )
 from labelkit.common.errors import ConfigError
 from labelkit.common.extensions.hooks import normalize_violations, resolve_hook
+from labelkit.common.runtime import budget
 
 __all__ = ["load", "default_rubric"]
 
@@ -416,12 +418,27 @@ def _parse_llm_profile(col: _Collector, file: str, name: str, data: dict) -> LLM
         supports_structured_output=t.get_bool("supports_structured_output", False),
         supports_vision=t.get_bool("supports_vision", False),
         max_output_tokens=t.get_int("max_output_tokens", 4096, minimum=1),
+        context_window=t.get_int("context_window", 0, minimum=0),
         temperature=t.get_float("temperature", 0.0, ge=0),
         max_image_px=t.get_int("max_image_px", 2048, minimum=1),
+        default_image_px=t.get_int("default_image_px", 0, minimum=0),
         price_per_mtok_in=t.get_float("price_per_mtok_in", None, ge=0),
         price_per_mtok_out=t.get_float("price_per_mtok_out", None, ge=0),
     )
     t.finish()
+    # v1.11 (V6, spec 3.1.4 上下文预算行): a declared window must leave a
+    # positive input budget — cw > max_output_tokens + margin (0 = undeclared
+    # = budget off, always legal).
+    if prof.context_window > 0 and budget.input_budget(prof) <= 0:
+        col.error(f"{file}:[llm.{name}].context_window: 声明窗口下预算非正——须满足 "
+                  f"context_window > max_output_tokens + margin"
+                  f"（margin = max(256, ceil(0.10 × context_window)) = "
+                  f"{budget.margin(prof.context_window)}），得到 context_window = "
+                  f"{prof.context_window}, max_output_tokens = {prof.max_output_tokens}")
+    # v1.11 (V18): the sampling working point never exceeds the ceiling.
+    if prof.default_image_px > 0 and prof.default_image_px > prof.max_image_px:
+        col.error(f"{file}:[llm.{name}].default_image_px: 期望 ≤ max_image_px"
+                  f"（{prof.max_image_px}），得到 {prof.default_image_px}")
     return prof
 
 
@@ -439,9 +456,17 @@ def _parse_embedding_profile(col: _Collector, file: str, name: str, data: dict) 
         timeout_s=t.get_int("timeout_s", 60, minimum=1),
         max_retries=t.get_int("max_retries", 5, minimum=0),
         retry_base_delay_s=t.get_float("retry_base_delay_s", 1.0, gt=0),
+        context_window=t.get_int("context_window", 0, minimum=0),
         dims=t.get_int("dims", None, minimum=1),
     )
     t.finish()
+    # v1.11 (V15): embed budget = cw − margin (no output reservation) — a
+    # declared window must leave it positive.
+    if prof.context_window > 0 and budget.embed_budget(prof) <= 0:
+        col.error(f"{file}:[embedding.{name}].context_window: 声明窗口下预算非正——"
+                  f"须满足 context_window > margin"
+                  f"（margin = max(256, ceil(0.10 × context_window)) = "
+                  f"{budget.margin(prof.context_window)}），得到 {prof.context_window}")
     return prof
 
 
@@ -697,10 +722,15 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
         digest_max_chars=t.get_int("digest_max_chars", 400, minimum=1),
         noise_filter=t.get_bool("noise_filter", True),
         min_len=t.get_int("min_len", 2, minimum=1),
-        use_vision=t.get_bool("use_vision", False),
         context=t.get_str("context", "") or "",
         on_error=t.get_str("on_error", "keep", enum=("keep", "fail")),
+        # vision_resolved is a parse PRODUCT — frozen at load() end (V1)
     )
+    # v1.11 (V2/V27②): `use_vision` was REMOVED — its explicit presence is a
+    # DIRECTED CONFIG_ERROR raised in load() via the raw-section probe below,
+    # never the unknown-key forward-compat WARN (marking it seen suppresses
+    # the WARN so the targeted error is the single report).
+    t.seen.add("use_vision")
     t.finish()
 
     stitch_section = _section(col, top, "stitch")
@@ -743,6 +773,10 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
     segment_provided = {
         "non_switch_keys": (isinstance(segment_section, dict)
                             and any(k != "enabled" for k in segment_section)),
+        # v1.11 (V2/V27②) raw-section probe: the removed key's presence,
+        # independent of the unknown-key path.
+        "use_vision": (isinstance(segment_section, dict)
+                       and "use_vision" in segment_section),
     }
     stitch_provided = {
         "non_switch_keys": (isinstance(stitch_section, dict)
@@ -1375,9 +1409,11 @@ def load(config_path: Path, project_path: Path,
             col.error(f"{fp}:[{section}].judges: 非空时长度须为奇数，得到 {len(judges)} 个")
 
     if modality == "ui":
+        # v1.11 (V3): segment is ADAPTIVE about vision (vision_resolved parse
+        # product) and never joins the vision-required set — the former
+        # use_vision-gated branch lost its failability; "segment" can no
+        # longer appear in the stages set of this error.
         vision_users: dict[str, set[str]] = {}
-        if segment.enabled and segment.strategy in ("llm", "hybrid") and segment.use_vision:
-            vision_users.setdefault(segment.llm, set()).add("segment")   # v1.8 S30
         if classify.enabled:
             vision_users.setdefault(classify.llm, set()).add("classify")
         if extract.enabled:
@@ -1852,6 +1888,147 @@ def load(config_path: Path, project_path: Path,
         if sequence_frames_provided:
             col.warn(f"{fp}:[annotate].sequence_frames: segment.enabled = false，"
                      f"sequence_frames 仅序列标注（stream 模式）生效，不会生效")
+
+    # ── v1.11 — context budget & vision derivation (spec 3.1.4 上下文预算行) ─
+    # V2 (V27② raw-section probe): the removed key gets a DIRECTED error with
+    # migration guidance — never the unknown-key forward-compat WARN.
+    if segment_provided["use_vision"]:
+        col.error(f"{fp}:[segment].use_vision: segment.use_vision 已于 v1.11 移除："
+                  f"窗口是否附图由 segment.llm 所指 profile 的 supports_vision 自动"
+                  f"决定；如需纯文本裁决，请将 segment.llm 指向纯文本 profile（V2）")
+
+    # V1: freeze the parse product (mode_resolved precedent) — every consumer
+    # below (V5/V9) and the assembled ResolvedConfig read the frozen value.
+    prof_seg = llm_profiles.get(segment.llm)
+    segment = replace(segment, vision_resolved=(
+        modality == "ui" and segment.enabled
+        and segment.strategy in ("llm", "hybrid")
+        and prof_seg is not None and prof_seg.supports_vision))
+
+    # V5 (S28 sibling): the Anthropic ">20 images ∧ any edge >2000px" 400
+    # hard-reject domain, segment multi-image window flavor (the S28 WARN
+    # above covers annotate.sequence_frames only). Default window = 20 sits
+    # just inside the boundary — never fires untouched.
+    if (segment.vision_resolved and segment.window > 20
+            and prof_seg is not None and prof_seg.max_image_px > 2000):
+        col.warn(f"{fp}:[segment].window: window = {segment.window} > 20 且 "
+                 f"vision_resolved 生效、被 segment 引用的 profile "
+                 f"[llm.{segment.llm}] max_image_px = {prof_seg.max_image_px} "
+                 f"> 2000——Anthropic 对 >20 图请求硬拒任一边 >2000px 的图"
+                 f"（400，非自动缩放），请将 max_image_px 改为 ≤ 2000 或降回 "
+                 f"window ≤ 20（V5）")
+
+    # V6: one WARN per stage-enabled-referenced profile without a declared
+    # window (budget OFF there; non-blocking, includes a declaration hint).
+    for name in sorted(referenced):
+        prof_r = llm_profiles.get(name)
+        if prof_r is not None and prof_r.context_window == 0:
+            col.warn(f"{fc}:[llm.{name}].context_window: 被启用阶段引用但未声明"
+                     f"（0 = 该 profile 上下文预算关闭）——建议按部署实效窗口声明"
+                     f"（如 context_window = 131072；欠声明恒安全，只多裁不溢出，"
+                     f"V6/V26）")
+    if dedup.semantic and dedup.semantic_embedding in embedding_profiles:
+        prof_e2 = embedding_profiles[dedup.semantic_embedding]
+        if prof_e2.context_window == 0:
+            col.warn(f"{fc}:[embedding.{prof_e2.name}].context_window: 被启用阶段"
+                     f"引用但未声明（0 = 该 profile 嵌入预算关闭）——建议按部署"
+                     f"实效窗口声明（欠声明恒安全，V6/V15）")
+
+    # V9 static guard: when the segment stage runs under a declared budget,
+    # the worst-case guaranteed packing size must fit floor frames — floor 3
+    # under verify repair (the fixed 3-frame member-reclaim re-judgment
+    # window, F14: policy="drop" builds no reclaim window and keeps floor 2).
+    if (segment.enabled and segment.strategy in ("llm", "hybrid")
+            and prof_seg is not None and prof_seg.context_window > 0):
+        w_min = budget.min_window(
+            SimpleNamespace(segment=segment, llm_profiles=llm_profiles))
+        floor = 3 if (verify.enabled and verify.policy == "repair"
+                      and segment.enabled) else 2
+        if w_min < floor:
+            col.error(f"{fp}:[segment].window: 预算最坏保证装填量 w_min = {w_min} "
+                      f"< floor = {floor}（profile [llm.{segment.llm}] "
+                      f"context_window = {prof_seg.context_window}）——须静态保证"
+                      f"任意帧装得进 {floor} 帧窗（verify repair 复裁窗恒为 3 帧），"
+                      f"请调大 context_window、缩小 segment.digest_max_chars 或"
+                      f"更换 profile（V9）")
+        elif w_min == floor:
+            col.warn(f"{fp}:[segment].window: 预算最坏保证装填量 w_min = {w_min} "
+                     f"== floor——退化形态：每帧皆接缝、逐帧双裁决，窗数放大"
+                     f"（200 帧满长会话至多 199 窗 ≈ 默认 20 窗形态的 18 倍调用量，"
+                     f"V9）")
+
+    # V13③ static system-side precheck: per enabled stage on budget-declared
+    # profiles, the un-trimmable prompt parts (V22 frozen template head +
+    # instruction/rubric/class table/schema/few-shot from ResolvedConfig) must
+    # leave room — est ≥ input_budget is a mathematical certainty of failure
+    # (CONFIG_ERROR); est > 50% halves the per-record share (WARN, A5).
+    schema_text = json.dumps(user_schema, ensure_ascii=False) if user_schema else ""
+    rubric_text = "\n".join(
+        f"{c.key}\n{c.description}\n{c.pairwise_prompt}"
+        + ("\n" + "\n".join(c.pointwise_levels) if quality.mode == "pointwise" else "")
+        for c in rubric.criteria)
+    class_table_text = "\n".join(
+        f"{c.name}\n{c.description}\n" + "\n".join(c.examples)
+        for c in classify.classes)
+    fewshot_text = "\n".join(
+        f"{ex.input}\n{json.dumps(ex.output, ensure_ascii=False)}"
+        for ex in annotate.examples)
+    static_checks: list[tuple[str, tuple[str, ...], int]] = []
+    if segment.enabled and segment.strategy in ("llm", "hybrid"):
+        static_checks.append(("segment", (segment.llm,),
+                              budget.TEMPLATE_HEAD_TOKENS["segment"]
+                              + budget.est_text(segment.context)))
+    if stitch.enabled:
+        static_checks.append(("stitch", (stitch.llm,),
+                              budget.TEMPLATE_HEAD_TOKENS["stitch"]
+                              + budget.est_text(stitch.context)))
+    if classify.enabled:
+        static_checks.append(("classify", (classify.llm,),
+                              budget.TEMPLATE_HEAD_TOKENS["classify"]
+                              + budget.est_text(classify.instruction)
+                              + budget.est_text(class_table_text)))
+    if extract.enabled:
+        static_checks.append(("extract", (extract.llm,),
+                              budget.TEMPLATE_HEAD_TOKENS["extract"]
+                              + budget.est_text(extract.instruction)))
+    if quality.enabled:
+        q_profiles = (quality.judges if quality_judges_active else (quality.llm,))
+        static_checks.append(("quality", tuple(q_profiles),
+                              budget.TEMPLATE_HEAD_TOKENS["quality"]
+                              + budget.est_text(rubric_text)))
+    if annotate.enabled:
+        static_checks.append(("annotate", (annotate.llm,),
+                              budget.TEMPLATE_HEAD_TOKENS["annotate"]
+                              + budget.est_text(annotate.instruction)
+                              + budget.est_text(schema_text)
+                              + budget.est_text(fewshot_text)))
+    if generate.enabled:
+        static_checks.append(("generate", tuple(generate.llms),
+                              budget.TEMPLATE_HEAD_TOKENS["generate"]
+                              + budget.est_text(generate.instruction)))
+    if verify.enabled:
+        v_profiles = verify.judges if verify.judges else (verify.llm,)
+        static_checks.append(("verify", tuple(v_profiles),
+                              budget.TEMPLATE_HEAD_TOKENS["verify"]
+                              + budget.est_text(verify.extra_criteria)
+                              + budget.est_text(annotate.instruction)))
+    for sect, prof_names, est_static in static_checks:
+        for name in prof_names:
+            prof_s = llm_profiles.get(name)
+            if prof_s is None or prof_s.context_window <= 0:
+                continue
+            ib = budget.input_budget(prof_s)
+            if est_static >= ib:
+                col.error(f"{fp}:[{sect}]: 静态系统侧提示部件估算 {est_static} "
+                          f"token ≥ 输入预算 {ib} token（profile [llm.{name}]，"
+                          f"context_window = {prof_s.context_window}）——任何记录"
+                          f"都装不下（V13③），请精简 instruction/rubric/类表/"
+                          f"schema/few-shot 或改用更大窗口的 profile")
+            elif est_static * 2 > ib:
+                col.warn(f"{fp}:[{sect}]: 静态系统侧提示部件估算 {est_static} "
+                         f"token 超过输入预算 {ib} token 的 50%（profile "
+                         f"[llm.{name}]）——单记录可用空间不足半，质量可能退化"
+                         f"（V13③）")
 
     # ── required-when-enabled instructions (spec §5.2 †) ──────────────────
     if annotate.enabled and not annotate.instruction.strip():

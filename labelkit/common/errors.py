@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import enum
+from typing import Literal
 
 
 class LabelKitError(Exception):
@@ -43,6 +44,39 @@ class ProviderFatalError(LabelKitError):
         self.profile = profile
         self.status_code = status_code
         self.key_env = key_env                # v1.6: env-var NAME of the failing key (pools)
+        super().__init__(message)
+
+
+class ContextOverflowError(LabelKitError):
+    """v1.11 (V16/V24): the unified context-overflow signal. Record-level →
+    status='failed', kind='context_overflow' (§7.6) → rejects; run continues.
+    phase='precheck' — the M9 pre-dispatch invariant check fired (V16, zero provider
+    interaction), or a packing layer found even the minimal semantic unit unfittable
+    (V10 — recorded directly by the operator, no exception crossing);
+    phase='reactive' — a real provider interaction identified overflow: budget-gated
+    400 body-sniff hit, or the 200-shaped `model_context_window_exceeded` termination
+    (V20/V24). M9 itself NEVER feeds `record_provider_result(fatal=True)` for this
+    exception and burns no regular retry — the reactive-400 terminal is fed exactly
+    once by the OWNING operator after its bounded degrade-retries exhaust (A7; §7.8
+    breaker matrix)."""
+    def __init__(self, message: str, phase: Literal["precheck", "reactive"],
+                 profile: str | None = None):
+        self.phase = phase
+        self.profile = profile                # additive carrier (trailing kwarg)
+        super().__init__(message)
+
+
+class OutputTruncatedError(LabelKitError):
+    """v1.11 (V11): the response terminated by hitting the output cap —
+    finish_reason='length' (openai) / stop_reason='max_tokens' (anthropic): input fit
+    the window, the model wrote max_output_tokens full. Record-level →
+    status='failed', kind='output_truncated' → rejects (own bucket); the truncated
+    text NEVER enters the L1–L3 repair loop, and the breaker is never fed (the HTTP
+    interaction succeeded — `llm.call` stays status='ok')."""
+    def __init__(self, message: str, profile: str | None = None,
+                 finish: str | None = None):
+        self.profile = profile                # additive carriers (trailing kwargs)
+        self.finish = finish
         super().__init__(message)
 
 
@@ -108,4 +142,13 @@ class ErrorKind(str, enum.Enum):
                                                              # violations all from output.validator
     PROVIDER_RETRYABLE_EXHAUSTED = "provider_retryable_exhausted"  # M9 → failed, feeds breaker window
     PROVIDER_FATAL = "provider_fatal"                        # M9 run-level, feeds breaker directly
+    CONTEXT_OVERFLOW = "context_overflow"                    # v1.11: ContextOverflowError — precheck
+                                                             # (V16 throat / V10 minimal unit) or
+                                                             # reactive (V20/V24) → failed → rejects;
+                                                             # counted in report.budget.
+                                                             # overflow_records; breaker matrix §7.8
+    OUTPUT_TRUNCATED = "output_truncated"                    # v1.11: OutputTruncatedError (V11) —
+                                                             # output hit max_output_tokens →
+                                                             # failed → rejects own bucket; never
+                                                             # repaired, never feeds the breaker
     INTERNAL_ERROR = "internal_error"                        # any unexpected exception

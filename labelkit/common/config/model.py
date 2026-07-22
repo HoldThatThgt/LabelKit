@@ -52,8 +52,23 @@ class LLMProfile:
     supports_structured_output: bool = False
     supports_vision: bool = False
     max_output_tokens: int = 4096
+    context_window: int = 0                       # v1.11 (V6/V26): model context window (tokens).
+                                                  # 0 = undeclared = context budget OFF for this
+                                                  # profile (v1.10 behavior unchanged); referenced
+                                                  # by an enabled stage while 0 → ONE M1 WARN.
+                                                  # > 0 requires context_window > max_output_tokens
+                                                  # + margin, else CONFIG_ERROR (non-positive
+                                                  # budget). Declare the DEPLOYMENT-EFFECTIVE
+                                                  # window, never the vendor table value (V26 —
+                                                  # under-declaring is always safe: more trimming,
+                                                  # never overflow)
     temperature: float = 0.0
     max_image_px: int = 2048
+    default_image_px: int = 0                     # v1.11 (V18): default image sampling WORKING
+                                                  # POINT (long edge px). 0 = use max_image_px
+                                                  # (v1.10 behavior byte-identical). > 0 must be
+                                                  # <= max_image_px (CONFIG_ERROR); the V21
+                                                  # escalation ladder may probe up to max_image_px
     price_per_mtok_in: float | None = None
     price_per_mtok_out: float | None = None
     api_key: str = field(default="", repr=False)  # resolved from env by M1; NEVER logged
@@ -80,6 +95,10 @@ class EmbeddingProfile:
     timeout_s: int = 60
     max_retries: int = 5
     retry_base_delay_s: float = 1.0               # same backoff mechanism as llm.* [FROZEN HERE]
+    context_window: int = 0                       # v1.11 (V15): 0 = undeclared = embed budget off;
+                                                  # > 0 → embed input truncated to
+                                                  # budget = context_window − margin (no output
+                                                  # reservation; §7.17 embed_budget)
     dims: int | None = None                       # if set, embed() validates returned dims
     api_key: str = field(default="", repr=False)  # resolved from env by M1
     api_key_envs: tuple[str, ...] = ()            # v1.6 key pool — same normalization as
@@ -152,14 +171,32 @@ class SegmentConfig:                              # v1.8 (spec 5.2 [segment]): M
     enabled: bool = False                         # off = v1.7 behavior (except _meta.stream: null)
     strategy: Literal["rules", "llm", "hybrid"] = "hybrid"
     llm: str = "default"                          # in the reference sets only when
-                                                  # strategy in {llm, hybrid} (S30)
-    window: int = 20                              # sliding-window frames/call; M1: >= 2
+                                                  # strategy in {llm, hybrid} (S30); v1.11 (V3):
+                                                  # never the vision set — vision is ADAPTIVE
+                                                  # via vision_resolved below
+    window: int = 20                              # v1.11 (V9): UPPER CAP on frames per window
+                                                  # call; M1: >= 2. Budget declared → greedy-
+                                                  # packed by per-frame cost up to this cap
+                                                  # (M1 guards w_min >= floor, §7.17
+                                                  # min_window); budget off → fixed windows,
+                                                  # byte-identical to v1.10
     digest_max_chars: int = 400                   # per-frame digest cap
     noise_filter: bool = True                     # llm/hybrid only; rules + true -> no-op warning
     min_len: int = 2                              # applies to LLM-refined segments only (S11)
-    use_vision: bool = False                      # attach per-frame screenshots to window calls
     context: str = ""                             # optional domain context — NOT a boundary definition
     on_error: Literal["keep", "fail"] = "keep"
+    vision_resolved: bool = False                 # v1.11 (V1) parse PRODUCT — never a user key
+                                                  # (the ConsoleConfig.mode_resolved precedent):
+                                                  # frozen by M1 at load() end via
+                                                  # dataclasses.replace as
+                                                  # (modality=="ui") ∧ enabled ∧
+                                                  # strategy∈{llm,hybrid} ∧
+                                                  # llm_profiles[segment.llm].supports_vision.
+                                                  # NOTE: the former user key `use_vision` was
+                                                  # REMOVED in v1.11 — an explicit [segment]
+                                                  # use_vision key is a DIRECTED CONFIG_ERROR
+                                                  # with migration guidance (V2), never the
+                                                  # unknown-key forward-compat warning
 
 
 @dataclass(frozen=True)

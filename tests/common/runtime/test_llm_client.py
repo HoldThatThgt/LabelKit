@@ -15,12 +15,17 @@ import pytest
 from PIL import Image
 
 from labelkit.common.config.model import EmbeddingProfile, LLMProfile
-from labelkit.common.errors import ProviderFatalError
+from labelkit.common.errors import (
+    ContextOverflowError,
+    OutputTruncatedError,
+    ProviderFatalError,
+)
 from labelkit.common.runtime.llm_client import (
     ANTHROPIC_VERSION,
     KeySnapshot,
     KeyUsage,
     LLMClient,
+    LLMResponse,
     Message,
     Part,
     ProbeResult,
@@ -266,12 +271,14 @@ def test_anthropic_parse_tool_use_extraction():
     data = {"model": "glm-x", "content": [
         {"type": "tool_use", "id": "t1", "name": "emit",
          "input": {"answer": "登录页"}}],
-        "usage": {"input_tokens": 31, "output_tokens": 8}}
-    text, structured, usage, model = _parse_anthropic_response(data, "fallback")
+        "usage": {"input_tokens": 31, "output_tokens": 8},
+        "stop_reason": "tool_use"}
+    text, structured, usage, model, finish = _parse_anthropic_response(data, "fallback")
     assert structured == {"answer": "登录页"}
     assert text == ""
     assert usage == Usage(31, 8)
     assert model == "glm-x"
+    assert finish == "tool_use"          # v1.11: raw stop_reason surfaces (V23③)
 
 
 def test_anthropic_parse_text_fallback_and_thinking_skipped():
@@ -280,10 +287,11 @@ def test_anthropic_parse_text_fallback_and_thinking_skipped():
         {"type": "text", "text": "第一段"},
         {"type": "text", "text": "第二段"}],
         "usage": {"input_tokens": 10, "output_tokens": 5}}
-    text, structured, usage, model = _parse_anthropic_response(data, "fallback")
+    text, structured, usage, model, finish = _parse_anthropic_response(data, "fallback")
     assert structured is None
     assert text == "第一段\n第二段"
     assert model == "fallback"          # no model in payload → profile model
+    assert finish is None               # provider sent no stop_reason
 
 
 def test_openai_parse_text_and_usage():
@@ -291,16 +299,17 @@ def test_openai_parse_text_and_usage():
         {"index": 0, "finish_reason": "stop",
          "message": {"role": "assistant", "content": '{"answer":"ok"}'}}],
         "usage": {"prompt_tokens": 3184, "completion_tokens": 156, "total_tokens": 3340}}
-    text, structured, usage, model = _parse_openai_response(data, "fallback")
+    text, structured, usage, model, finish = _parse_openai_response(data, "fallback")
     assert text == '{"answer":"ok"}'
     assert structured is None            # openai json_schema output stays text (M8 parses)
     assert usage == Usage(3184, 156)
     assert model == "qwen2.5"
+    assert finish == "stop"              # v1.11: raw finish_reason surfaces (V23③)
 
 
 def test_openai_parse_missing_bits_degrade_to_defaults():
-    text, structured, usage, model = _parse_openai_response({}, "fb")
-    assert (text, structured, usage, model) == ("", None, Usage(0, 0), "fb")
+    text, structured, usage, model, finish = _parse_openai_response({}, "fb")
+    assert (text, structured, usage, model, finish) == ("", None, Usage(0, 0), "fb", None)
 
 
 @pytest.mark.parametrize("data", [
@@ -314,8 +323,8 @@ def test_openai_parse_missing_bits_degrade_to_defaults():
 def test_openai_parse_malformed_shapes_degrade_never_raise(data):
     # A 2xx body with an unexpected shape must not escape M9 as a raw
     # AttributeError (spec 3.9.2: complete raises Provider* errors only).
-    text, structured, usage, model = _parse_openai_response(data, "fb")
-    assert (text, structured, usage, model) == ("", None, Usage(0, 0), "fb")
+    text, structured, usage, model, finish = _parse_openai_response(data, "fb")
+    assert (text, structured, usage, model, finish) == ("", None, Usage(0, 0), "fb", None)
 
 
 def test_embeddings_parse_non_mapping_items_are_fatal_not_attribute_error():
@@ -899,3 +908,189 @@ def test_snapshot_nonblocking_inside_running_loop():
     for snaps in asyncio.run(main()):
         (snap,) = snaps
         assert snap.name == "default" and len(snap.keys) == 2
+
+
+# ── v1.11: context budget — precheck / finish disposition / V20 sniff ───────
+
+
+class _BreakerRecorder:
+    """Minimal MetricsSink stand-in: records breaker feeds and events."""
+    circuit_broken = False
+
+    def __init__(self):
+        self.results: list = []
+        self.events: list = []
+
+    def record_provider_result(self, fatal, hard=False):
+        self.results.append((fatal, hard))
+
+    def event(self, ev, **kw):
+        self.events.append(ev)
+
+
+def test_precheck_raises_context_overflow_before_any_network():
+    """V16: budget-declared profile + over-window prompt → the precheck fires
+    at the complete() throat — zero provider interaction (no transport ever
+    created), nothing fed to the breaker, no llm.call event, no retry burned."""
+    rec = _BreakerRecorder()
+    prof = _llm_profile(context_window=512, max_output_tokens=256)
+    client = LLMClient({"default": prof}, {}, metrics=rec)
+    prompt = PromptBundle(messages=(
+        Message(role="user", parts=(Part(kind="text", text="hello"),)),))
+    with pytest.raises(ContextOverflowError) as ei:
+        asyncio.run(client.complete("default", prompt))
+    assert ei.value.phase == "precheck"
+    assert ei.value.profile == "default"
+    assert client._http_client is None          # dispatch never reached
+    assert rec.results == []                    # breaker never fed
+    assert rec.events == []                     # no llm.call emitted
+
+
+def test_precheck_counts_images_via_the_calibrator_prior(png_image: ImageRef):
+    # 131072 window fits the text alone easily; 60 images × the openai prior
+    # readout (ceil(1445 × 1.2) = 1734 each @2048) blow the 113868 budget.
+    rec = _BreakerRecorder()
+    prof = _llm_profile(context_window=131072)
+    client = LLMClient({"default": prof}, {}, metrics=rec)
+    parts = tuple(Part(kind="image", image=png_image) for _ in range(80))
+    prompt = PromptBundle(messages=(Message(role="user", parts=parts),))
+    with pytest.raises(ContextOverflowError) as ei:
+        asyncio.run(client.complete("default", prompt))
+    assert ei.value.phase == "precheck"
+    assert client._http_client is None
+
+
+def test_finish_surfaces_from_both_providers_pure_parse():
+    # openai: choices[0].finish_reason
+    data = {"choices": [{"finish_reason": "length",
+                         "message": {"content": '{"a": 1'}}]}
+    *_, finish = _parse_openai_response(data, "fb")
+    assert finish == "length"
+    data = {"choices": [{"finish_reason": "model_context_window_exceeded",
+                         "message": {"content": ""}}]}
+    *_, finish = _parse_openai_response(data, "fb")
+    assert finish == "model_context_window_exceeded"
+    # anthropic: top-level stop_reason
+    data = {"content": [{"type": "text", "text": "部分输出"}],
+            "stop_reason": "max_tokens"}
+    *_, finish = _parse_anthropic_response(data, "fb")
+    assert finish == "max_tokens"
+    data = {"content": [], "stop_reason": "model_context_window_exceeded"}
+    *_, finish = _parse_anthropic_response(data, "fb")
+    assert finish == "model_context_window_exceeded"
+
+
+def test_raise_for_finish_disposition_is_a_closed_map():
+    """V11/V24: length (openai) / max_tokens (anthropic) → OutputTruncatedError;
+    model_context_window_exceeded (both protocols) → reactive overflow; every
+    other value — stop, tool_use, end_turn, z.ai sensitive/network_error,
+    None — flows on unchanged (V11③)."""
+    from labelkit.common.runtime.llm_client import _raise_for_finish
+
+    with pytest.raises(OutputTruncatedError) as ti:
+        _raise_for_finish("length", "default", 4096)
+    assert ti.value.profile == "default" and ti.value.finish == "length"
+    with pytest.raises(OutputTruncatedError):
+        _raise_for_finish("max_tokens", "default", 4096)
+    with pytest.raises(ContextOverflowError) as ci:
+        _raise_for_finish("model_context_window_exceeded", "default", 4096)
+    assert ci.value.phase == "reactive"
+    for benign in ("stop", "tool_use", "end_turn", "sensitive",
+                   "network_error", None):
+        _raise_for_finish(benign, "default", 4096)   # no raise
+
+
+# [C-75] five empirical overflow-body families (V20 seeds, frozen set).
+_OVERFLOW_BODIES = [
+    # OpenAI/Azure: code + message family
+    '{"error": {"message": "This model\'s maximum context length is 128000 '
+    'tokens. However, your messages resulted in 130531 tokens.", '
+    '"type": "invalid_request_error", "param": "messages", '
+    '"code": "context_length_exceeded"}}',
+    # vLLM: same message family, type=BadRequestError, NO code
+    '{"object": "error", "message": "This model\'s maximum context length is '
+    '4096 tokens. However, you requested 5021 tokens.", '
+    '"type": "BadRequestError", "code": 400}',
+    # anthropic protocol: invalid_request_error ∧ "prompt is too long"
+    '{"type": "error", "error": {"type": "invalid_request_error", '
+    '"message": "prompt is too long: 213481 tokens > 200000 maximum"}}',
+    # z.ai business code 1261 / "Prompt too long"
+    '{"error": {"code": "1261", "message": "The input exceeds the maximum '
+    'context length supported by the model."}}',
+    '{"error": {"code":"1261", "message": "Prompt too long."}}',
+    # OpenRouter: error_type == context_length_exceeded
+    '{"error": {"message": "This endpoint\'s maximum context length is '
+    '131072 tokens.", "type": "context_length_exceeded"}}',
+]
+
+
+@pytest.mark.parametrize("body", _OVERFLOW_BODIES)
+def test_overflow_body_matcher_hits_all_five_families(body):
+    from labelkit.common.runtime.llm_client import overflow_body_matches
+    assert overflow_body_matches(body) is True
+
+
+def test_overflow_body_matcher_is_case_insensitive_and_selective():
+    from labelkit.common.runtime.llm_client import overflow_body_matches
+    assert overflow_body_matches('{"message": "MAXIMUM CONTEXT LENGTH"}') is True
+    assert overflow_body_matches('{"error": "invalid api key"}') is False
+    assert overflow_body_matches("") is False
+
+
+def test_sniff_gate_requires_budget_and_status_400():
+    """V20 budget gating: context_window == 0 → the sniff never engages (the
+    400 walks the v1.10 fatal path byte-identically); non-400 never sniffs."""
+    from labelkit.common.runtime.llm_client import _sniff_overflow_400
+    body = _OVERFLOW_BODIES[0]
+    assert _sniff_overflow_400(131072, 400, body) is True
+    assert _sniff_overflow_400(0, 400, body) is False        # budget off
+    assert _sniff_overflow_400(131072, 404, body) is False   # wrong status
+    assert _sniff_overflow_400(131072, 400, '{"error": "nope"}') is False
+
+
+def test_llm_response_finish_field_default_and_carry():
+    resp = LLMResponse(text="x", structured=None, usage=Usage(1, 1),
+                       model="m", latency_ms=3)
+    assert resp.finish is None                   # additive default (V23③)
+    resp = LLMResponse(text="x", structured=None, usage=Usage(1, 1),
+                       model="m", latency_ms=3, finish="stop")
+    assert resp.finish == "stop"
+
+
+def test_prompt_bundle_image_px_field_default_and_carry():
+    prompt = PromptBundle(messages=())
+    assert prompt.image_px is None               # additive default (V23①)
+    assert PromptBundle(messages=(), image_px=1092).image_px == 1092
+
+
+def test_result_usage_adapts_to_the_five_tuple_shape():
+    from labelkit.common.runtime.llm_client import _result_usage
+    complete_result = ("text", None, Usage(31, 8), "m", "stop")   # F9: 5-tuple
+    assert _result_usage(complete_result) == Usage(31, 8)
+    embed_result = (([[1.0, 0.0]], Usage(6, 0)),)                 # 1-tuple
+    assert _result_usage(embed_result) == Usage(6, 0)
+
+
+def test_effective_image_px_chain_and_clamp():
+    from labelkit.common.runtime.llm_client import _effective_image_px
+    prof = _llm_profile()                                          # max 2048
+    prompt = PromptBundle(messages=())
+    assert _effective_image_px(prof, prompt) == 2048               # v1.10 leg
+    prof = _llm_profile(default_image_px=1024)
+    assert _effective_image_px(prof, prompt) == 1024               # working point
+    escalated = PromptBundle(messages=(), image_px=1536)
+    assert _effective_image_px(prof, escalated) == 1536            # V21 carrier
+    over = PromptBundle(messages=(), image_px=4096)
+    assert _effective_image_px(prof, over) == 2048                 # ceiling clamp
+
+
+def test_client_self_constructs_calibrator_with_working_points():
+    """V23②: LLMClient holds its own calibrator seeded from the profile table
+    — anthropic prior 1568 @2048 and openai prior 765 @1024 working point,
+    both × PRIOR_INFLATION until samples accumulate."""
+    client = LLMClient({
+        "a": _llm_profile(name="a", provider="anthropic"),
+        "o": _llm_profile(name="o", default_image_px=1024),
+    }, {})
+    assert client.calibrator.cost("a") == 1882   # ceil(1568 × 1.2)
+    assert client.calibrator.cost("o") == 918    # ceil(765 × 1.2)

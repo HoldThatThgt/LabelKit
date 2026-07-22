@@ -24,7 +24,7 @@ import json_repair
 from jsonschema import Draft202012Validator
 
 from labelkit.common.contracts.types import Usage
-from labelkit.common.errors import SchemaViolation
+from labelkit.common.errors import ContextOverflowError, SchemaViolation
 
 if TYPE_CHECKING:
     from labelkit.common.runtime.llm_client import LLMClient
@@ -443,7 +443,11 @@ class SchemaEngine:
         configured, runs as L2.5 with ``record`` = the raw input mapping). Returns
         (validated_obj, total_usage, attempts, model) where attempts = 1 + L3 repair
         calls. Raises SchemaViolation once the L3 budget is exhausted — with
-        callback_only=True when every remaining violation came from the hook."""
+        callback_only=True when every remaining violation came from the hook.
+        v1.11: the INITIAL complete() may raise ContextOverflowError /
+        OutputTruncatedError — both propagate to the caller untouched (operators
+        classify them, V27①); a ContextOverflowError from a REPAIR call fails
+        that round and short-circuits straight to exhaustion (V25①)."""
         is_user_schema = schema is None
         active = self._user_schema if schema is None else schema
         use_hook = is_user_schema and self._validator is not None
@@ -485,8 +489,18 @@ class SchemaEngine:
                 Message(role="user",
                         parts=(Part(kind="text", text=_build_repair_prompt(raw, rendered)),)),
             ))
-            response = await self._llm.complete(repair_profile, repair_prompt,
-                                                response_schema=active)
+            try:
+                response = await self._llm.complete(repair_profile, repair_prompt,
+                                                    response_schema=active)
+            except ContextOverflowError:
+                # v1.11 (V25①, spec §3.3⑨): a repair call over budget counts
+                # the round as failed AND short-circuits the remaining rounds —
+                # the repair prompt is constant, so every later round fails
+                # identically. The exhaustion path below keeps the reject
+                # attribution schema_violation/callback_violation (never
+                # context_overflow; the repair source text is never truncated —
+                # truncating it would break the repair semantics).
+                break
             total_usage = total_usage + response.usage
             attempts += 1
 

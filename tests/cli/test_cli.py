@@ -76,6 +76,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/extensions/hooks.py",
     "labelkit/common/observability/console_format.py",
     "labelkit/common/observability/obslog.py",
+    "labelkit/common/runtime/budget.py",           # v1.11 (CONTRACTS §7.17)
     "labelkit/common/runtime/llm_client.py",
     "labelkit/common/runtime/schema_engine.py",
     "labelkit/operators/annotate.py",
@@ -105,6 +106,7 @@ EXPECTED_TEST_PY = {
     "tests/common/extensions/test_hooks.py",
     "tests/common/observability/test_console_format.py",
     "tests/common/observability/test_obslog.py",
+    "tests/common/runtime/test_budget.py",         # v1.11 (CONTRACTS §7.17)
     "tests/common/runtime/test_llm_client.py",
     "tests/common/runtime/test_schema_engine.py",
     "tests/common/test_errors.py",

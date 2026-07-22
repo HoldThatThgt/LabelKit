@@ -704,3 +704,76 @@ class TestL25Hook:
 
     def test_no_hook_configured_attribute_is_none(self):
         assert make_engine()._validator is None
+
+
+# ── v1.11 (V25①): L3 repair-call overflow short-circuits to exhaustion ──────
+# The engine's LLM boundary is stubbed with in-process objects (the segment/
+# classify QueueEngine 惯例 — never a mock server/transport): the FIRST call
+# returns an invalid-but-parseable response, every repair call overflows.
+
+class _StubResponse:
+    def __init__(self, text: str):
+        self.text = text
+        self.structured = None
+        self.usage = Usage(5, 2)
+        self.model = "glm-5.2"
+        self.latency_ms = 1
+
+
+class _FirstBadThenOverflowLLM:
+    def __init__(self):
+        self.calls = 0
+
+    async def complete(self, profile, prompt, response_schema=None):
+        from labelkit.common.errors import ContextOverflowError
+        self.calls += 1
+        if self.calls == 1:
+            return _StubResponse('{"intent": "nope"}')     # fails L2 (enum+required)
+        raise ContextOverflowError("repair prompt over budget",
+                                   phase="precheck", profile=profile)
+
+
+class _AlwaysOverflowLLM:
+    async def complete(self, profile, prompt, response_schema=None):
+        from labelkit.common.errors import ContextOverflowError
+        raise ContextOverflowError("initial call over budget",
+                                   phase="precheck", profile=profile)
+
+
+def test_l3_repair_overflow_short_circuits_to_exhaustion():
+    """V25①: the repair prompt is constant — one overflowing repair round
+    proves every remaining round fails identically, so the engine skips them
+    and lands on the EXISTING exhaustion path; reject attribution stays
+    schema_violation (never context_overflow, no overflow_records count)."""
+    import asyncio
+
+    import pytest
+    from labelkit.common.errors import SchemaViolation
+
+    llm = _FirstBadThenOverflowLLM()
+    eng = SchemaEngine(SPEC_SCHEMA, llm=llm,
+                       cfg=OutputConfig(max_repair_attempts=3))
+    prompt = object()                    # never inspected by the stub
+    with pytest.raises(SchemaViolation) as ei:
+        asyncio.run(eng.complete_validated("default", prompt))
+    assert ei.value.callback_only is False          # schema_violation attribution
+    assert any("/intent" in v for v in ei.value.errors)   # original violations kept
+    assert llm.calls == 2               # first call + ONE repair try — rounds
+    assert eng.stats["rejected"] == 1   # 2..3 short-circuited
+
+
+def test_initial_call_overflow_propagates_untouched():
+    """v1.11: ContextOverflowError from the INITIAL complete() is NOT the
+    engine's to classify — it propagates to the operator (V27①) with zero
+    bucket accounting."""
+    import asyncio
+
+    import pytest
+    from labelkit.common.errors import ContextOverflowError
+
+    eng = SchemaEngine(SPEC_SCHEMA, llm=_AlwaysOverflowLLM(), cfg=OutputConfig())
+    with pytest.raises(ContextOverflowError) as ei:
+        asyncio.run(eng.complete_validated("default", object()))
+    assert ei.value.phase == "precheck"
+    assert eng.stats == {"l0_or_clean": 0, "l1": 0, "l3_1": 0, "l3_2": 0,
+                         "rejected": 0}

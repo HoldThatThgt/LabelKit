@@ -56,7 +56,7 @@ from labelkit.common.contracts.types import (
 
 
 def make_cfg(*, strategy="hybrid", window=20, digest_max_chars=400,
-             noise_filter=True, min_len=2, use_vision=False, context="",
+             noise_filter=True, min_len=2, vision_resolved=False, context="",
              on_error="keep", trace=None) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
@@ -70,8 +70,8 @@ def make_cfg(*, strategy="hybrid", window=20, digest_max_chars=400,
         segment=SegmentConfig(enabled=True, strategy=strategy, llm="default",
                               window=window, digest_max_chars=digest_max_chars,
                               noise_filter=noise_filter, min_len=min_len,
-                              use_vision=use_vision, context=context,
-                              on_error=on_error),
+                              context=context, on_error=on_error,
+                              vision_resolved=vision_resolved),
         stitch=StitchConfig(),
         extract=ExtractConfig(),
         classify=ClassifyConfig(),
@@ -276,13 +276,13 @@ def test_render_tree_diff_fixed_format_and_flags():
         "新增 2 节点，移除 1 节点，文本变化 3 处，变更比例 67%，应用切换，标题变化")
 
 
-def test_use_vision_two_state_parts_shape():
+def test_vision_resolved_two_state_parts_shape():
     frames = [ui_frame("f0", 3), ui_frame("f1", 4)]
     plain = build_segment_prompt(frames, [None, None], make_cfg(),
                                  with_reason=False)
     assert [p.kind for p in plain.messages[1].parts] == ["text", "text"]
     vision = build_segment_prompt(frames, [None, None],
-                                  make_cfg(use_vision=True), with_reason=False)
+                                  make_cfg(vision_resolved=True), with_reason=False)
     parts = vision.messages[1].parts
     assert [p.kind for p in parts] == ["image", "text", "image", "text"]
     assert parts[0].image is frames[0].image     # each digest preceded by its frame

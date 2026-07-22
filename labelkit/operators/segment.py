@@ -119,8 +119,9 @@ def build_segment_prompt(frames: Sequence[Record], diffs: Sequence[Mapping | Non
     and the structure line with or without the reason fragment. user: ONE
     message, one text part per frame — "[帧 {i}] {digest}" plus, from the
     second frame on and when the caller supplied a diff, the "[帧 {i} 变更]"
-    line; under segment.use_vision each frame's digest part is preceded by
-    that frame's image part (§10.1/§10.10 single-message multi-part shape).
+    line; under segment.vision_resolved (v1.11 V1 parse product) each frame's
+    digest part is preceded by that frame's image part (§10.1/§10.10
+    single-message multi-part shape).
     """
     seg = cfg.segment
     n = str(len(frames))
@@ -135,7 +136,7 @@ def build_segment_prompt(frames: Sequence[Record], diffs: Sequence[Mapping | Non
 
     parts: list[Part] = []
     for i, frame in enumerate(frames):
-        if seg.use_vision and frame.image is not None:
+        if seg.vision_resolved and frame.image is not None:
             parts.append(Part(kind="image", image=frame.image))
         text = _FRAME_LABEL_TMPL.format(
             i=i, digest=frame_digest(frame, seg.digest_max_chars))

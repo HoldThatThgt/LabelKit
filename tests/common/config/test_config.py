@@ -1512,8 +1512,8 @@ def test_stream_sections_default_when_absent(env):
     assert cfg.segment.digest_max_chars == 400
     assert cfg.segment.noise_filter is True
     assert cfg.segment.min_len == 2
-    assert cfg.segment.use_vision is False
-    assert cfg.segment.context == ""
+    assert cfg.segment.vision_resolved is False    # v1.11 parse product (V1):
+    assert cfg.segment.context == ""               # segment disabled → False
     assert cfg.segment.on_error == "keep"
     assert cfg.extract.enabled is False
     assert cfg.extract.llm == "default"
@@ -1542,7 +1542,6 @@ window = 8
 digest_max_chars = 200
 noise_filter = false
 min_len = 3
-use_vision = false
 context = "外卖 App 采集流"
 on_error = "fail"
 """
@@ -1562,6 +1561,8 @@ on_error = "fail"
     assert cfg.segment.min_len == 3
     assert cfg.segment.context == "外卖 App 采集流"
     assert cfg.segment.on_error == "fail"
+    # text modality → the V1 parse product derives False even with segment on
+    assert cfg.segment.vision_resolved is False
 
 
 def test_extract_section_parses_explicit_values(env):
@@ -1917,17 +1918,19 @@ def test_extract_llm_always_needs_vision(env):
     has(errors, "[llm.novision].supports_vision: UI 模态被 extract 阶段引用")
 
 
-def test_segment_llm_needs_vision_only_when_use_vision(env):
-    body = SEG_ON + 'llm = "novision"\nuse_vision = true'
-    project = env.project(input_path=env.input_dir, modality="ui", body=body)
-    errors = env.errors(config_text=BASE_CONFIG + NOVISION_PROFILE,
-                        project_text=project)
-    has(errors, "[llm.novision].supports_vision: UI 模态被 segment 阶段引用")
-    # use_vision = false (default): pure-text window calls, no vision demand
+def test_segment_llm_never_needs_vision_and_vision_resolved_derives(env):
+    # v1.11 (V1/V3): segment is ADAPTIVE about vision — it never joins the
+    # vision-required set; the parse product derives from profile capability.
     body = SEG_ON + 'llm = "novision"'
     project = env.project(input_path=env.input_dir, modality="ui", body=body)
     cfg = env.load(config_text=BASE_CONFIG + NOVISION_PROFILE, project_text=project)
     assert cfg.segment.llm == "novision"
+    assert cfg.segment.vision_resolved is False    # capability off → pure text
+    # capable profile under UI modality → the same config flips to multi-image
+    body = SEG_ON + 'llm = "judge"'
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    cfg = env.load(project_text=project)
+    assert cfg.segment.vision_resolved is True
 
 
 def test_stream_quality_vision_relaxed(env):
@@ -2315,3 +2318,189 @@ def test_auto_console_mode_chain_branches(isatty, log_format, term, importable,
     assert loader_mod._auto_console_mode(
         isatty=isatty, log_format=log_format, term=term,
         rich_importable=importable) == expected
+
+
+# ── v1.11: context budget & vision auto-derivation (spec 3.1.4 上下文预算行) ─
+
+
+def _cw_config(cw, *, max_out=None, extra="") -> str:
+    """BASE_CONFIG with budget keys spliced into [llm.default] (POOL_CONFIG
+    string-replacement pattern)."""
+    add = f"context_window = {cw}"
+    if max_out is not None:
+        add = f"max_output_tokens = {max_out}\n" + add
+    if extra:
+        add += "\n" + extra
+    return BASE_CONFIG.replace("supports_structured_output = true",
+                               "supports_structured_output = true\n" + add, 1)
+
+
+def test_context_window_parses_and_zero_is_the_default(env):
+    cfg = env.load()
+    assert cfg.llm_profiles["default"].context_window == 0    # undeclared = off
+    assert cfg.embedding_profiles["emb"].context_window == 0
+    cfg = env.load(config_text=_cw_config(131072))
+    assert cfg.llm_profiles["default"].context_window == 131072
+
+
+def test_embedding_context_window_parses(env):
+    config = BASE_CONFIG.replace('model = "bge"',
+                                 'model = "bge"\ncontext_window = 8192', 1)
+    cfg = env.load(config_text=config)
+    assert cfg.embedding_profiles["emb"].context_window == 8192
+
+
+def test_context_window_negative_is_error(env):
+    errors = env.errors(config_text=_cw_config(-1))
+    has(errors, "[llm.default].context_window: 期望非负整数，得到 -1")
+
+
+def test_context_window_non_positive_budget_is_error(env):
+    # cw == max_output_tokens (default 4096): margin swallows everything (V6)
+    errors = env.errors(config_text=_cw_config(4096))
+    has(errors, "[llm.default].context_window: 声明窗口下预算非正")
+    # embedding flavor: cw ≤ margin floor (V15)
+    config = BASE_CONFIG.replace('model = "bge"',
+                                 'model = "bge"\ncontext_window = 200', 1)
+    errors = env.errors(config_text=config)
+    has(errors, "[embedding.emb].context_window: 声明窗口下预算非正")
+
+
+def test_default_image_px_validation(env):
+    cfg = env.load()                                          # 0 = use max (legal)
+    assert cfg.llm_profiles["default"].default_image_px == 0
+    config = _cw_config(131072, extra="default_image_px = 1024")
+    cfg = env.load(config_text=config)
+    assert cfg.llm_profiles["default"].default_image_px == 1024
+    config = BASE_CONFIG.replace("supports_structured_output = true",
+                                 "supports_structured_output = true\n"
+                                 "default_image_px = 4096", 1)
+    errors = env.errors(config_text=config)
+    has(errors, "[llm.default].default_image_px: 期望 ≤ max_image_px（2048），"
+                "得到 4096")
+
+
+def test_removed_use_vision_key_is_directed_error(env, capsys):
+    # V2/V27②: raw-section probe → migration guidance, both key values
+    for literal in ("false", "true"):
+        errors = env.errors(project_text=env.project(
+            body=SEG_ON + f"use_vision = {literal}"))
+        has(errors, "[segment].use_vision: segment.use_vision 已于 v1.11 移除")
+        has(errors, "supports_vision 自动决定")
+        has(errors, "请将 segment.llm 指向纯文本 profile")
+    # never double-reported through the unknown-key forward-compat WARN
+    assert "use_vision: 未知键" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("modality,strategy,profile,expected", [
+    ("ui", "hybrid", "judge", True),
+    ("ui", "llm", "judge", True),
+    ("ui", "rules", "judge", False),        # rules strategy makes zero LLM calls
+    ("text", "hybrid", "judge", False),     # text modality never attaches frames
+    ("ui", "hybrid", "novision", False),    # capability off → pure text
+])
+def test_vision_resolved_derivation_matrix(env, modality, strategy, profile,
+                                           expected):
+    body = SEG_ON + f'strategy = "{strategy}"\nllm = "{profile}"'
+    kw = dict(body=body)
+    if modality == "ui":
+        kw.update(input_path=env.input_dir, modality="ui")
+    cfg = env.load(config_text=BASE_CONFIG + NOVISION_PROFILE,
+                   project_text=env.project(**kw))
+    assert cfg.segment.vision_resolved is expected
+
+
+def test_vision_resolved_false_while_segment_disabled(env):
+    project = env.project(input_path=env.input_dir, modality="ui",
+                          body='[segment]\nllm = "judge"')
+    cfg = env.load(project_text=project)
+    assert cfg.segment.vision_resolved is False
+
+
+def test_segment_vision_window_image_px_warning(env, capsys):
+    # V5 (S28 sibling): vision_resolved ∧ window > 20 ∧ max_image_px > 2000
+    body = SEG_ON + "window = 21"
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    env.load(project_text=project)      # [llm.default]: vision on, px 2048
+    err = capsys.readouterr().err
+    assert "[segment].window: window = 21 > 20" in err
+    assert "max_image_px = 2048" in err
+    # default window = 20 sits inside the boundary — never fires
+    project = env.project(input_path=env.input_dir, modality="ui", body=SEG_ON)
+    env.load(project_text=project)
+    assert "[segment].window: window =" not in capsys.readouterr().err
+
+
+def test_undeclared_context_window_reference_warns_once(env, capsys):
+    env.load()                                              # default referenced
+    err = capsys.readouterr().err
+    assert "[llm.default].context_window: 被启用阶段引用但未声明" in err
+    assert err.count("[llm.default].context_window") == 1   # once per profile
+    assert "[llm.judge].context_window" not in err          # unreferenced: silent
+
+
+def test_declared_context_window_reference_does_not_warn(env, capsys):
+    env.load(config_text=_cw_config(131072))
+    assert "[llm.default].context_window" not in capsys.readouterr().err
+
+
+def test_static_system_precheck_error_when_nothing_fits(env):
+    # V13③ ERROR leg: cw 4864 / max_out 4096 → margin 487 → input budget 281;
+    # annotate static = head 32 + instruction 300 + schema 87 ≥ 281.
+    project = env.project(annotate_body=f'instruction = "{"标" * 300}"')
+    errors = env.errors(config_text=_cw_config(4864), project_text=project)
+    has(errors, "[annotate]: 静态系统侧提示部件估算")
+    has(errors, "任何记录都装不下")
+
+
+def test_static_system_precheck_warns_past_half_budget(env, capsys):
+    # V13③ WARN leg (A5, 50%): cw 5500 → input budget 854; annotate static =
+    # 32 + 400 + 87 = 519 ∈ (427, 854) → WARN, run loads.
+    project = env.project(annotate_body=f'instruction = "{"标" * 400}"')
+    cfg = env.load(config_text=_cw_config(5500), project_text=project)
+    assert isinstance(cfg, ResolvedConfig)
+    err = capsys.readouterr().err
+    assert "[annotate]: 静态系统侧提示部件估算" in err
+    assert "50%" in err
+
+
+def test_static_system_precheck_silent_with_room(env, capsys):
+    env.load(config_text=_cw_config(131072))
+    assert "静态系统侧提示部件估算" not in capsys.readouterr().err
+
+
+def test_min_window_guard_warns_at_floor_two(env, capsys):
+    # V9: cw 3200 / max_out 1024 → input budget 1856; per-frame worst 528,
+    # segment static 423 → w_min = 2 == floor (verify off → floor 2).
+    cfg = env.load(config_text=_cw_config(3200, max_out=1024),
+                   project_text=env.project(body=SEG_ON))
+    assert isinstance(cfg, ResolvedConfig)
+    err = capsys.readouterr().err
+    assert "[segment].window: 预算最坏保证装填量 w_min = 2" in err
+    assert "每帧皆接缝" in err
+
+
+def test_min_window_guard_errors_below_repair_floor(env):
+    # F14: verify.policy = "repair" lifts the floor to 3 (the fixed 3-frame
+    # member-reclaim re-judgment window) → w_min 2 < 3 is a CONFIG_ERROR.
+    body = SEG_ON + '\n[verify]\nenabled = true\npolicy = "repair"\nllm = "judge"'
+    errors = env.errors(config_text=_cw_config(3200, max_out=1024),
+                        project_text=env.project(body=body))
+    has(errors, "[segment].window: 预算最坏保证装填量 w_min = 2 < floor = 3")
+
+
+def test_min_window_guard_drop_policy_keeps_floor_two(env, capsys):
+    # F14 counter-leg: policy = "drop" builds no reclaim window — floor stays 2
+    body = SEG_ON + '\n[verify]\nenabled = true\npolicy = "drop"\nllm = "judge"'
+    cfg = env.load(config_text=_cw_config(3200, max_out=1024),
+                   project_text=env.project(body=body))
+    assert isinstance(cfg, ResolvedConfig)
+    assert "w_min = 2" in capsys.readouterr().err           # the WARN leg instead
+
+
+def test_min_window_guard_silent_without_budget_or_with_room(env, capsys):
+    env.load(project_text=env.project(body=SEG_ON))          # budget off
+    assert "预算最坏保证装填量" not in capsys.readouterr().err
+    env.load(config_text=_cw_config(131072),                 # w_min 214 ≫ floor
+             project_text=env.project(body=SEG_ON))
+    assert "预算最坏保证装填量" not in capsys.readouterr().err
