@@ -584,3 +584,89 @@ def test_no_seam_marks_keeps_v18_path_byte_identical():
     assert len(engine.calls) == 2
     assert [t.action for t in item.transitions] == [INPUT, CLICK]
     assert ctx.metrics.counters["extract.transitions"] == 2
+
+
+# ── v1.11 (V27①/spec 3.15.4 上下文预算 row): budget-kind dispositions ─────────
+
+def test_context_overflow_fallback_keeps_mechanical_semantics():
+    # No packing/degrade face at this call point: overflow rides the EXISTING
+    # on_error="fallback" mechanics unchanged — fallback step with the
+    # extraction_invalid trace shape (detail.kind drives the downstream
+    # （摘取兜底） suffix, S16), episode alive, fallback_steps counted.
+    from labelkit.common.errors import ContextOverflowError
+
+    cfg = make_cfg()
+    f0, f1 = frame("f0" * 8, "首页"), frame("f1" * 8, "搜索结果页")
+    item = PipelineItem(record=episode([f0, f1]), status="active")
+    exc = ContextOverflowError("precheck hit", phase="precheck")
+    out, ctx = run_stage(cfg, [item], PairEngine({(f0.id, f1.id): exc}))
+    assert item.status == "active"
+    (t,) = item.transitions
+    assert t.action["action_type"] == "other"
+    assert t.detail["kind"] == "extraction_invalid"        # mechanical shape unchanged
+    assert "precheck hit" in t.detail["message"]
+    assert ctx.metrics.counters["extract.fallback_steps"] == 1
+    assert "budget.overflow_records" not in ctx.metrics.counters  # no reject happened
+
+
+def test_context_overflow_fail_records_precise_kind():
+    # on_error="fail": the stage classifier routes the budget vocabulary FIRST —
+    # kind=context_overflow (never internal_error), reject counted.
+    from labelkit.common.errors import ContextOverflowError
+
+    cfg = make_cfg(on_error="fail")
+    f0, f1 = frame("f0" * 8, "首页"), frame("f1" * 8, "搜索结果页")
+    item = PipelineItem(record=episode([f0, f1]), status="active")
+    exc = ContextOverflowError("throat hit", phase="precheck")
+    out, ctx = run_stage(cfg, [item], PairEngine({(f0.id, f1.id): exc}))
+    assert item.status == "failed"
+    assert item.errors[0].kind == "context_overflow"
+    assert ctx.metrics.counters["budget.overflow_records"] == 1
+    assert ctx.metrics.counters["extract.failures"] == 1
+
+
+def test_output_truncated_fail_records_precise_kind():
+    from labelkit.common.errors import OutputTruncatedError
+
+    cfg = make_cfg(on_error="fail")
+    f0, f1 = frame("f0" * 8, "首页"), frame("f1" * 8, "搜索结果页")
+    item = PipelineItem(record=episode([f0, f1]), status="active")
+    out, ctx = run_stage(cfg, [item],
+                         PairEngine({(f0.id, f1.id): OutputTruncatedError("cap")}))
+    assert item.status == "failed"
+    assert item.errors[0].kind == "output_truncated"
+    assert "budget.overflow_records" not in ctx.metrics.counters
+
+
+def test_reactive_400_fallback_feeds_breaker_once():
+    # A7 terminal settlement on the fallback path: reactive-400 feeds exactly
+    # once; the finish-shaped (origin="finish") overflow never does.
+    from labelkit.common.errors import ContextOverflowError
+
+    class FeedMetrics(RecordingMetrics):
+        def __init__(self):
+            super().__init__()
+            self.fed = []
+
+        def record_provider_result(self, fatal, *, hard=False):
+            self.fed.append(fatal)
+
+    cfg = make_cfg()
+    f0, f1 = frame("f0" * 8, "首页"), frame("f1" * 8, "搜索结果页")
+    item = PipelineItem(record=episode([f0, f1]), status="active")
+    exc = ContextOverflowError("sniff", phase="reactive")   # origin defaults http_400
+    ctx = SimpleNamespace(cfg=cfg, llm=None,
+                          schema_engine=PairEngine({(f0.id, f1.id): exc}),
+                          metrics=FeedMetrics(), rng=None, batch_no=1)
+    asyncio.run(ExtractStage(cfg).run([item], ctx))
+    assert item.status == "active"                          # fallback kept it alive
+    assert ctx.metrics.fed == [True]
+
+    exc200 = ContextOverflowError("finish", phase="reactive")
+    exc200.origin = "finish"
+    item2 = PipelineItem(record=episode([f0, f1]), status="active")
+    ctx2 = SimpleNamespace(cfg=cfg, llm=None,
+                           schema_engine=PairEngine({(f0.id, f1.id): exc200}),
+                           metrics=FeedMetrics(), rng=None, batch_no=1)
+    asyncio.run(ExtractStage(cfg).run([item2], ctx2))
+    assert ctx2.metrics.fed == []

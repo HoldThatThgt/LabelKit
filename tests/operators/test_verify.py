@@ -1577,3 +1577,294 @@ def test_extract_disabled_shrink_keeps_transitions_none(monkeypatch):
     assert call.transitions is None
     assert ep.status == "active"
     assert metrics.counters["verify.membership_repairs"] == 1
+
+
+# ── v1.11 context-budget packing (spec 3.7.2/3.7.3 v1.11 rows, V25②③/V21/V27①) ─
+
+from labelkit.common.errors import ContextOverflowError, OutputTruncatedError
+from labelkit.common.runtime import budget as budget_mod
+from labelkit.operators.verify import _PromptFit
+
+
+def _budget_profile(name: str, context_window: int, *, default_image_px: int = 0,
+                    max_image_px: int = 2048, supports_structured_output=False):
+    from labelkit.common.config.model import LLMProfile
+    return LLMProfile(name=name, provider="openai_compatible", base_url="http://x",
+                      model="m", api_key_env="K", max_output_tokens=256,
+                      context_window=context_window,
+                      default_image_px=default_image_px,
+                      max_image_px=max_image_px,
+                      supports_structured_output=supports_structured_output)
+
+
+class _FixedCalibrator:
+    def __init__(self, value: int):
+        self.value = value
+
+    def cost(self, profile: str) -> int:
+        return self.value
+
+
+def _ui_single_record(n_nodes: int = 80) -> Record:
+    nodes = [UINode("1", None, 0, "FrameLayout", "", "", (0, 0, 1080, 1920), True, {})]
+    nodes += [UINode(str(i + 2), "1", 1, "TextView", "文本行" + "字" * 15, "",
+                     (0, i, 1080, i + 10), True, {}) for i in range(n_nodes)]
+    return Record(id="9" * 16, modality="ui", text=None, raw=None,
+                  ui_tree=UITree(tuple(nodes)),
+                  image=ImageRef(path=Path("shot.png"), format="png", size_bytes=1),
+                  ref=RecordRef("b/uitree_2.jsonl", None, 2, ()))
+
+
+def test_panel_fit_min_over_declared_judges():
+    cfg = replace(trace_cfg(enabled=False),
+                  verify=VerifyConfig(enabled=True, llm="judge",
+                                      judges=("j1", "j2", "j3")),
+                  llm_profiles={"j1": _budget_profile("j1", 4096),
+                                "j2": _budget_profile("j2", 2000),
+                                "j3": _budget_profile("j3", 0)})   # undeclared
+    stage = VerifyStage(cfg)
+    ctx = SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(70)))
+    fit = stage._panel_fit(ctx, _record(), VERDICT_SCHEMA)
+    # min over DECLARED budgets only (V25②); text record → no image cost
+    assert fit.input_budget == budget_mod.input_budget(_budget_profile("j2", 2000))
+    assert fit.image_cost == 0
+    # a UI record pulls the MAX calibrated cost across the declared panel
+    fit_ui = stage._panel_fit(ctx, _ui_single_record(), VERDICT_SCHEMA)
+    assert fit_ui.image_cost == 70
+    # all-undeclared panel → budget OFF
+    off = replace(cfg, llm_profiles={"j1": _budget_profile("j1", 0)})
+    assert VerifyStage(off)._panel_fit(ctx, _record(), VERDICT_SCHEMA) is None
+
+
+def test_build_verify_prompt_ui_tree_dynamic_cap_and_frozen_off_path():
+    rec = _ui_single_record()
+    cfg = trace_cfg(enabled=False)
+    fit = _PromptFit(input_budget=900, image_cost=100)
+    bundle = build_verify_prompt(rec, {"intent": "x"}, cfg, fit=fit)
+    assert not fit.overflow and fit.truncations == 1
+    tail = bundle.messages[1].parts[2].text
+    tree_lines = tail.split("\n")
+    marker_lines = [l for l in tree_lines if l.startswith("…(truncated ")
+                    and l.endswith(" nodes)")]
+    assert marker_lines                                    # §3.3③ marker in place
+    assert tree_lines[-1].startswith("[标注结果] ")         # V25③ JSON kept verbatim
+    # deterministic rerun
+    again = build_verify_prompt(rec, {"intent": "x"}, cfg,
+                                fit=_PromptFit(input_budget=900, image_cost=100))
+    assert again == bundle
+    # fit=None (budget off) is byte-identical to the pre-v1.11 build
+    plain = build_verify_prompt(rec, {"intent": "x"}, cfg)
+    assert plain == build_verify_prompt(rec, {"intent": "x"}, cfg, fit=None)
+    assert rec.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars) in \
+        plain.messages[1].parts[2].text
+
+
+def test_sequence_step_block_edges_trim_annotation_json_counted_not_trimmed():
+    cfg = _stream_cfg(policy="drop")
+    members = [_frame("f0"), _frame("f1")]
+    ep = _episode(members)
+    steps = tuple(_transition(i, description="步" + "很" * 40 + str(i))
+                  for i in range(12))
+    fit = _PromptFit(input_budget=800, image_cost=50)
+    bundle = build_verify_prompt(ep.record, {"task_label": "外卖"}, cfg,
+                                 transitions=steps, boundary_margin="段首前 1: 无",
+                                 fit=fit)
+    assert not fit.overflow and fit.truncations == 1
+    parts = bundle.messages[1].parts
+    steps_part = next(p.text for p in parts if (p.text or "").startswith("[动作序列]"))
+    step_lines = steps_part.split("\n")[1:]
+    assert step_lines[0].startswith("0. ")                 # first step kept
+    assert step_lines[-1].startswith("11. ")               # last step kept
+    assert any(l.startswith("…(truncated ") and l.endswith(" lines)")
+               for l in step_lines)                        # §3.3⑤ in-place marker
+    assert parts[-1].text == '[标注结果] {"task_label": "外卖"}'   # V25③ untouched
+
+
+def test_minimal_unit_unfittable_rejects_record_no_call():
+    # V10 via _settle_fit: the request is never sent, the record fails with
+    # kind=context_overflow and budget.overflow_records counts the reject.
+    cfg = replace(trace_cfg(enabled=False),
+                  verify=VerifyConfig(enabled=True, llm="judge"),
+                  llm_profiles={"judge": _budget_profile("judge", 600)})
+    item = PipelineItem(record=_record(text="长" * 900), annotation=_annotation())
+
+    class Exploding:
+        async def complete_validated(self, *a, **k):
+            raise AssertionError("must not be called")
+
+    metrics = _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(1)),
+                          schema_engine=Exploding(), metrics=metrics, rng=None,
+                          batch_no=1)
+    asyncio.run(VerifyStage(cfg).run([item], ctx))
+    assert item.status == "failed"
+    assert item.errors[0].kind == "context_overflow"
+    assert metrics.counters["budget.overflow_records"] == 1
+
+
+def test_classify_error_budget_vocabulary_first_and_stage_disposition():
+    assert _classify_error(ContextOverflowError("x", phase="precheck"), "text") == (
+        "context_overflow", False)
+    assert _classify_error(OutputTruncatedError("x"), "text") == (
+        "output_truncated", False)
+
+    class FeedMetrics(_CapturingMetrics):
+        def __init__(self):
+            super().__init__()
+            self.fed = []
+
+        def record_provider_result(self, fatal, *, hard=False):
+            self.fed.append(fatal)
+
+    cfg = trace_cfg(enabled=False)                 # budget off — finish oracle only
+
+    class Overflowing:
+        async def complete_validated(self, *a, **k):
+            exc = ContextOverflowError("sniff", phase="reactive")
+            raise exc
+
+    item = PipelineItem(record=_record(), annotation=_annotation())
+    metrics = FeedMetrics()
+    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=Overflowing(),
+                          metrics=metrics, rng=None, batch_no=1)
+    asyncio.run(VerifyStage(cfg).run([item], ctx))
+    assert item.status == "failed"
+    assert item.errors[0].kind == "context_overflow"
+    assert metrics.counters["budget.overflow_records"] == 1
+    assert metrics.fed == [True]                   # reactive-400 terminal: fed once
+
+
+# ── V21 repair-ladder (spec 3.7.3 修复路径与上下文预算的交互 ①) ───────────────
+
+def _ladder_cfg(*, annotate_cw=200_000, default_px=1024, max_px=2048,
+                sequence_frames=20) -> ResolvedConfig:
+    base = _stream_cfg()
+    return replace(
+        base,
+        annotate=replace(base.annotate, sequence_frames=sequence_frames),
+        llm_profiles={
+            "default": _budget_profile("default", annotate_cw,
+                                       default_image_px=default_px,
+                                       max_image_px=max_px),
+            "judge": _budget_profile("judge", 200_000),
+        })
+
+
+def _ladder_ctx(cfg, engine, metrics=None, image_cost: int = 100):
+    return SimpleNamespace(cfg=cfg, llm=SimpleNamespace(
+                               calibrator=_FixedCalibrator(image_cost)),
+                           schema_engine=engine, metrics=metrics or _CapturingMetrics(),
+                           rng=None, batch_no=1)
+
+
+def _stub_annotate_v21(monkeypatch, output=None):
+    """The _stub_annotate pattern extended with the v1.11 trailing kwargs."""
+    calls = []
+
+    async def fake(record, ctx, repair=None, label=None, transitions=None,
+                   fragment_lens=None, k_eff=None, image_px=None):
+        calls.append(SimpleNamespace(record=record, repair=repair, label=label,
+                                     transitions=transitions,
+                                     fragment_lens=fragment_lens,
+                                     k_eff=k_eff, image_px=image_px))
+        return _annotation(output or {"task_label": "修正"})
+
+    monkeypatch.setattr("labelkit.operators.annotate.annotate_record", fake)
+    return calls
+
+
+def test_repair_ladder_math_px_rung_and_gates():
+    cfg = _ladder_cfg()                            # default_px 1024 → rung 1536
+    stage = VerifyStage(cfg)
+    f0 = _frame("f0")
+    ep = _episode([f0])
+    from labelkit.operators.annotate import RepairContext
+    repair = RepairContext(previous_output={"task_label": "旧"}, critiques_text="c")
+    engine = SimpleNamespace(user_schema_text="{}")
+    metrics = _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(100)),
+                          schema_engine=engine, metrics=metrics, batch_no=1)
+    kwargs = stage._repair_ladder(ep, ctx, repair, None, None)
+    assert kwargs["k_eff"] == 10                   # max(2, ceil(20/2))
+    assert kwargs["image_px"] == 1536              # 1024 × 1.5, under the cap
+    assert metrics.counters["budget.escalations"] == 1
+
+    # cap: default_px 1600 × 1.5 = 2400 → clamped to max_image_px 2048
+    cfg2 = _ladder_cfg(default_px=1600)
+    metrics2 = _CapturingMetrics()
+    ctx2 = SimpleNamespace(cfg=cfg2, llm=SimpleNamespace(calibrator=_FixedCalibrator(100)),
+                           schema_engine=engine, metrics=metrics2, batch_no=1)
+    assert VerifyStage(cfg2)._repair_ladder(ep, ctx2, repair, None, None)[
+        "image_px"] == 2048
+
+    # default_image_px == 0: the working point IS max_image_px — no rung exists
+    cfg3 = _ladder_cfg(default_px=0)
+    metrics3 = _CapturingMetrics()
+    ctx3 = SimpleNamespace(cfg=cfg3, llm=SimpleNamespace(calibrator=_FixedCalibrator(100)),
+                           schema_engine=engine, metrics=metrics3, batch_no=1)
+    kwargs3 = VerifyStage(cfg3)._repair_ladder(ep, ctx3, repair, None, None)
+    assert kwargs3 == {"k_eff": 10}                # k halving stands alone
+    assert "budget.escalations" not in metrics3.counters
+
+    # budget off (annotate cw == 0): the ladder is dead code — empty kwargs
+    cfg4 = replace(_ladder_cfg(),
+                   llm_profiles={"default": _budget_profile("default", 0),
+                                 "judge": _budget_profile("judge", 0)})
+    assert VerifyStage(cfg4)._repair_ladder(ep, ctx, repair, None, None) == {}
+
+
+def test_repair_ladder_escalation_dropped_when_budget_refuses():
+    # The escalated trial est exceeds the annotate input budget → the px rung is
+    # dropped ("keep k halving") and budget.escalations stays untouched.
+    cfg = _ladder_cfg(annotate_cw=2048)            # tight window
+    stage = VerifyStage(cfg)
+    ep = _episode([_frame("f0"), _frame("f1")])
+    from labelkit.operators.annotate import RepairContext
+    repair = RepairContext(previous_output={"task_label": "旧"}, critiques_text="c")
+    metrics = _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(800)),
+                          schema_engine=SimpleNamespace(user_schema_text="{}"),
+                          metrics=metrics, batch_no=1)
+    kwargs = stage._repair_ladder(ep, ctx, repair, None, None)
+    assert kwargs == {"k_eff": 10}
+    assert "budget.escalations" not in metrics.counters
+
+
+def test_repair_chain_passes_escalation_kwargs_through(monkeypatch):
+    # fail → repair re-annotation receives the ladder kwargs (F3 pass-through);
+    # the second round passes and the escalation is counted once.
+    cfg = _ladder_cfg()
+    annotate_calls = _stub_annotate_v21(monkeypatch)
+    f0 = _frame("f0")
+    ep = _episode([f0])
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[], critiques=[C1]),
+        _seq_obj("pass"),
+    ]})
+    engine.user_schema_text = "{}"
+    metrics = _CapturingMetrics()
+    ctx = _ladder_ctx(cfg, engine, metrics)
+    batch = [_env(f0), ep]
+    asyncio.run(VerifyStage(cfg).run(batch, ctx))
+    assert ep.status == "active"
+    (call,) = annotate_calls
+    assert call.k_eff == 10                        # k halved: max(2, ⌈20/2⌉)
+    assert call.image_px == 1536                   # one rung up, ≤ max_image_px
+    assert metrics.counters["budget.escalations"] == 1
+
+
+def test_repair_chain_budget_off_keeps_v19_call_shape(monkeypatch):
+    # Budget off: annotate_record is called WITHOUT the v1.11 kwargs — the
+    # pre-v1.11 stub signature (no k_eff/image_px) must keep working.
+    cfg = _stream_cfg()                            # llm_profiles={} → budget off
+    annotate_calls = _stub_annotate(monkeypatch)   # v1.9-era stub, no new kwargs
+    f0 = _frame("f0")
+    ep = _episode([f0])
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[], critiques=[C1]),
+        _seq_obj("pass"),
+    ]})
+    metrics = _run_verify(cfg, [_env(f0), ep], engine)
+    assert ep.status == "active"
+    assert len(annotate_calls) == 1
+    assert "budget.escalations" not in metrics.counters

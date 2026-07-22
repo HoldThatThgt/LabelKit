@@ -58,11 +58,21 @@ class ContextOverflowError(LabelKitError):
     (V20/V24). M9 itself NEVER feeds `record_provider_result(fatal=True)` for this
     exception and burns no regular retry — the reactive-400 terminal is fed exactly
     once by the OWNING operator after its bounded degrade-retries exhaust (A7; §7.8
-    breaker matrix)."""
+    breaker matrix).
+
+    ``origin`` (SPEC-context-budget §3.5 breaker matrix) carries the reactive-form
+    distinction the operator cannot otherwise see: M9 emitted `llm.call`
+    status="fatal" for the 400-sniffed form but status="ok" for the 200-shaped one,
+    and only the "http_400" terminal may feed the breaker — the "finish" form rode a
+    successful HTTP interaction whose ok already cleared the streak. Meaningful only
+    when phase="reactive"; additive trailing kwarg (defaulted — construction sites
+    predating it stay valid)."""
     def __init__(self, message: str, phase: Literal["precheck", "reactive"],
-                 profile: str | None = None):
+                 profile: str | None = None,
+                 origin: Literal["http_400", "finish"] = "http_400"):
         self.phase = phase
         self.profile = profile                # additive carrier (trailing kwarg)
+        self.origin = origin
         super().__init__(message)
 
 

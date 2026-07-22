@@ -45,6 +45,7 @@ from typing import TYPE_CHECKING, Mapping, Sequence
 
 from labelkit.common.errors import (
     CircuitBreakerTripped,
+    ContextOverflowError,
     ErrorKind,
     SchemaViolation,
 )
@@ -55,6 +56,7 @@ from labelkit.common.contracts.types import (
     frame_digest,
     tree_diff,
 )
+from labelkit.common.runtime import budget
 
 from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
 from labelkit.common.runtime.schema_engine import stitch_schema
@@ -722,8 +724,14 @@ class StitchStage:
         a rescue candidate stays dropped_noise with the same evidence. "fail":
         ONLY the episode-candidate envelope fails (member frames stay absorbed
         — ②c grants no absorbed→failed migration); rescue candidates never
-        take the fail path — the failure is a miss (B-2)."""
-        kind = ErrorKind.STITCH_INVALID.value
+        take the fail path — the failure is a miss (B-2).
+        v1.11 (V27①/spec 3.16.4 上下文预算 row): the budget vocabulary routes
+        FIRST wherever a kind is recorded — the on_error dispositions themselves
+        are unchanged (the card pool is statically bounded, M1 WARN territory;
+        runtime backstop = the M9 throat + this keep/fail path). A
+        context_overflow REJECT counts budget.overflow_records; the reactive-400
+        terminal feeds the breaker exactly once (A7)."""
+        kind = budget.classify_stage_error(exc) or ErrorKind.STITCH_INVALID.value
         message = str(exc)
         if cand.kind == "episode":
             if self.cfg.stitch.on_error == "fail":
@@ -732,8 +740,15 @@ class StitchStage:
                     stage=self.name, kind=kind, message=message,
                     retryable=False))
                 cand.envelope.status = "failed"
+                if kind == ErrorKind.CONTEXT_OVERFLOW.value:
+                    ctx.metrics.count("budget.overflow_records")
             else:                               # "keep": bootstrap without a name
                 self._open_thread(cand, "", threads, pool, clock)
+        if (isinstance(exc, ContextOverflowError) and exc.phase == "reactive"
+                and getattr(exc, "origin", "http_400") == "http_400"
+                and not getattr(exc, "_breaker_fed", False)):
+            exc._breaker_fed = True  # type: ignore[attr-defined]
+            ctx.metrics.record_provider_result(fatal=True)
         ctx.metrics.count(_COUNTER_FAILURES)
         ctx.metrics.event(_EV_ERROR, stage=self.name, batch_no=ctx.batch_no,
                           record_ids=(cand.members[0].id,),
@@ -790,12 +805,20 @@ class StitchStage:
             except Exception as e:  # noqa: BLE001 — record-level isolation
                 # Pass-2 failure never fails an already-opened thread: the
                 # candidate simply stays its own thread (keep-equivalent).
+                # v1.11 (V27①): precise budget kinds in the event; the
+                # reactive-400 terminal feeds the breaker exactly once (A7).
+                if (isinstance(e, ContextOverflowError) and e.phase == "reactive"
+                        and getattr(e, "origin", "http_400") == "http_400"
+                        and not getattr(e, "_breaker_fed", False)):
+                    e._breaker_fed = True  # type: ignore[attr-defined]
+                    ctx.metrics.record_provider_result(fatal=True)
                 ctx.metrics.count(_COUNTER_FAILURES)
                 ctx.metrics.event(
                     _EV_ERROR, stage=self.name, batch_no=ctx.batch_no,
                     record_ids=(cand.members[0].id,),
                     payload={"stage": self.name,
-                             "kind": ErrorKind.STITCH_INVALID.value,
+                             "kind": (budget.classify_stage_error(e)
+                                      or ErrorKind.STITCH_INVALID.value),
                              "message": str(e), "retryable": False})
                 clock += 1
                 continue

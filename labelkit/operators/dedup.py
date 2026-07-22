@@ -16,11 +16,13 @@ from PIL import Image
 
 from labelkit.common.errors import (
     CircuitBreakerTripped,
+    ContextOverflowError,
     ErrorKind,
     ProviderFatalError,
     ProviderRetryableError,
 )
 from labelkit.common.contracts.types import DedupInfo, PipelineItem, Record, StageError
+from labelkit.common.runtime import budget
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import DedupConfig
@@ -336,9 +338,28 @@ class DedupStage:
             except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as exc:  # single-record failure never escapes to batch level
+                # v1.11 (V27①): the budget vocabulary routes FIRST — an imprecise
+                # kind would land in internal_error and break §3.5 attribution /
+                # overflow_records counting. Reachable via the embed call (M9
+                # throat/finish disposition); the embed input is pre-truncated to
+                # embed_budget (V15), so this is the defensive remainder.
+                kind = budget.classify_stage_error(exc) or ErrorKind.INTERNAL_ERROR.value
+                if kind == ErrorKind.CONTEXT_OVERFLOW.value:
+                    ctx.metrics.count("budget.overflow_records")
+                    # A7/§7.8 breaker matrix: ONLY a reactive-400 (body-sniff)
+                    # terminal feeds the streak, exactly once per exception
+                    # (duck flag guards propagation double-feeds); precheck and
+                    # the 200-shaped finish oracle never feed. `origin` is read
+                    # defensively pending the errors.py revision.
+                    if (isinstance(exc, ContextOverflowError)
+                            and exc.phase == "reactive"
+                            and getattr(exc, "origin", "http_400") == "http_400"
+                            and not getattr(exc, "_breaker_fed", False)):
+                        exc._breaker_fed = True  # type: ignore[attr-defined]
+                        ctx.metrics.record_provider_result(fatal=True)
                 err = StageError(
                     stage=self.name,
-                    kind=ErrorKind.INTERNAL_ERROR.value,
+                    kind=kind,
                     message=f"{type(exc).__name__}: {exc}",
                     retryable=False,
                 )
@@ -431,13 +452,32 @@ class DedupStage:
         # ④+③ together still records near_both.
         return "near_both" if detail.image_hit is not None else "near_semantic"
 
+    def _embed_input(self, detail: _ProbeDetail, ctx: "RunContext") -> str:
+        """v1.11 (V15, spec 3.3.3 嵌入输入预算截断): with the [embedding.*] profile's
+        context_window declared, the level-④ embed input (the _dedup_text product,
+        incl. sequence/thread concatenations) is truncated to embed_budget =
+        context_window − margin BEFORE the call — deterministic head keep (the
+        embedding's semantic body leads the text); cw == 0 keeps the v1.10 full
+        text byte-identically. The HASHING levels ①–③ always see the full text."""
+        text = detail.dedup_text
+        prof = (ctx.cfg.embedding_profiles.get(self.cfg.semantic_embedding)
+                if ctx.cfg is not None else None)
+        if prof is None or prof.context_window <= 0:
+            return text
+        cap = budget.embed_budget(prof)
+        if budget.est_text(text) <= cap:
+            return text
+        ctx.metrics.count("budget.truncations.dedup")
+        return budget.fit_text(text, cap, keep="head")
+
     async def _semantic_level(
         self, rec: Record, detail: _ProbeDetail, ctx: "RunContext"
     ) -> tuple[DedupInfo, tuple[str, float]] | None:
         """Level ④: one embed() call for this record; verdict per the composite rules.
         Returns (duplicate DedupInfo, ('cosine', value)) or None (record stays unique)."""
         try:
-            vecs = await ctx.llm.embed(self.cfg.semantic_embedding, [detail.dedup_text])
+            vecs = await ctx.llm.embed(self.cfg.semantic_embedding,
+                                       [self._embed_input(detail, ctx)])
         except (ProviderRetryableError, ProviderFatalError):
             # Retries exhausted / fatal for this call: skip level ④ for this record,
             # verdict stands on ①–③ (spec 3.3.4). Breaker bookkeeping is M9's job.

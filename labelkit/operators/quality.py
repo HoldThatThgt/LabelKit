@@ -30,14 +30,17 @@ default None are byte-identical to v1.7.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, Mapping, Sequence
 
 import numpy as np
 
 from labelkit.common.errors import (
     CircuitBreakerTripped,
+    ContextOverflowError,
     ErrorKind,
     ProviderFatalError,
     ProviderRetryableError,
@@ -53,10 +56,11 @@ from labelkit.common.contracts.types import (
 )
 
 if TYPE_CHECKING:
-    from labelkit.common.config.model import Criterion, QualityConfig, ResolvedConfig
+    from labelkit.common.config.model import Criterion, LLMProfile, QualityConfig, ResolvedConfig
     from labelkit.common.contracts.stage import RunContext
 
 # M9 (llm_client) / M8 (schema_engine) public surface per CONTRACTS.md §7.8 / §7.7.
+from labelkit.common.runtime import budget
 from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
 from labelkit.common.runtime.schema_engine import judgment_schema, pointwise_schema
 
@@ -212,12 +216,91 @@ def _classify_call_error(exc: Exception) -> tuple[str, bool]:
     """(StageError.kind, retryable) for a judging-call failure that is NOT a schema-invalid
     judgment (spec 7.6): M9 retry exhaustion is record-level provider_retryable_exhausted;
     M9 auth/4xx is run-level provider_fatal (obslog mirrors that kind to stderr at ERROR);
-    anything else is invariant breakage."""
+    anything else is invariant breakage. v1.11 (V27①): the budget vocabulary routes
+    FIRST — an imprecise kind would land in internal_error and break §3.5
+    attribution / overflow_records counting."""
+    kind = budget.classify_stage_error(exc)
+    if kind is not None:
+        return kind, False
     if isinstance(exc, ProviderRetryableError):
         return ErrorKind.PROVIDER_RETRYABLE_EXHAUSTED.value, True
     if isinstance(exc, ProviderFatalError):
         return ErrorKind.PROVIDER_FATAL.value, False
     return ErrorKind.INTERNAL_ERROR.value, False
+
+
+# ── v1.11 context-budget packing (spec 3.4.3 上下文预算装填 row, §3.3③④⑤) ────
+
+_TREE_MARKER_RE = re.compile(r"^…\(truncated (\d+) nodes\)$")
+
+
+@dataclass
+class _CallFit:
+    """Record-side packing state for ONE judging call under a declared budget.
+
+    quality builds per (comparison, judge) — the fit is derived from THIS judge's
+    profile (the V25② contrast to verify's min-over-panel): ``record_budget`` =
+    input_budget(judge) − est(static system side: pairwise/pointwise system text,
+    the two message envelopes, the structured-output schema when the profile
+    rides it) − n_images × calibrated image cost (UI pair: ×2 counted BEFORE the
+    split, §3.3④). ``sides`` splits the record side (2 = pairwise halves, 1 =
+    pointwise); ``tighten`` is the V20 reactive degrade divisor over the TEXT
+    share (1 = normal, 2 = the single tightened retry). ``overflow`` flags a
+    slot whose untrimmable floor exceeded its share (V10 — the minimal unit
+    does not fit; the caller disposes, never sends)."""
+    record_budget: int
+    sides: int = 1
+    tighten: int = 1
+    truncations: int = 0
+    overflow: bool = False
+
+    @property
+    def side_share(self) -> int:
+        return self.record_budget // (self.sides * self.tighten)
+
+
+def _feed_reactive_terminal(exc: BaseException, metrics) -> None:
+    """A7/§7.8 breaker matrix: ONLY the reactive-400 (body-sniff) overflow
+    terminal feeds the fatal streak — exactly once per exception object (the
+    duck flag guards double-feeds when one exception crosses operators);
+    precheck and the 200-shaped finish oracle never feed. ``origin`` is read
+    defensively pending the errors.py revision (default "http_400")."""
+    if (isinstance(exc, ContextOverflowError) and exc.phase == "reactive"
+            and getattr(exc, "origin", "http_400") == "http_400"
+            and not getattr(exc, "_breaker_fed", False)):
+        exc._breaker_fed = True  # type: ignore[attr-defined]
+        metrics.record_provider_result(fatal=True)
+
+
+def _fit_tree_text(rendered: str, budget_tokens: int) -> tuple[str, bool]:
+    """§3.3③ dynamic cap on a serialized UI tree: the render (already under the
+    absolute input.ui_tree_max_chars cap) is re-checked with est_text; over the
+    share, trailing NODE lines are dropped and the serialize-family marker
+    "…(truncated N nodes)" closes the text — N accumulates onto an existing
+    marker's count. est_text is prefix-monotone ⇒ bisection. Returns
+    (text, trimmed)."""
+    if budget.est_text(rendered) <= budget_tokens:
+        return rendered, False
+    lines = rendered.split("\n")
+    base = 0
+    m = _TREE_MARKER_RE.match(lines[-1])
+    if m is not None:
+        base = int(m.group(1))
+        lines = lines[:-1]
+    total = len(lines)
+
+    def candidate(keep: int) -> str:
+        marker = f"…(truncated {base + total - keep} nodes)"
+        return "\n".join(lines[:keep] + [marker])
+
+    lo, hi = 0, total - 1                        # keep == total is known not to fit
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if budget.est_text(candidate(mid)) <= budget_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    return candidate(lo), True
 
 
 def _violation_summary(exc: SchemaViolation) -> str:
@@ -287,34 +370,7 @@ def _member_digest_lines(members: Sequence[Record], max_total_chars: int) -> lis
 
 # ── prompt assembly (CONTRACTS.md §10.2 / §10.3, byte-exact Chinese) ──────────
 
-def _record_parts(record: Record, label: str, ui_tree_max_chars: int,
-                  transitions: tuple[Transition, ...] | None = None) -> list[Part]:
-    """Text modality: one '[label] text' line; UI modality: three parts per §10.2.
-    v1.8 sequence records (record.kind == "sequence", checked BEFORE modality) render as
-    ONE pure-text part — `[{label}·操作序列]` head line, then the §10.2/§10.3 sequence
-    subsections [步骤序列] (omitted entirely when transitions is None) + [成员帧摘要] —
-    with NO image part even in UI modality (rule-34 vision relaxation, S30)."""
-    if record.kind == "sequence":
-        lines = [f"[{label}·操作序列]"]
-        if transitions is not None:
-            lines.append("[步骤序列]")
-            lines.extend(_step_line(t) for t in transitions)
-        lines.append("[成员帧摘要]")
-        lines.extend(_member_digest_lines(record.members, ui_tree_max_chars))
-        return [Part(kind="text", text="\n".join(lines))]
-    if record.modality == "text":
-        return [Part(kind="text", text=f"[{label}] {record.text}")]
-    tree = record.ui_tree.serialize(max_chars=ui_tree_max_chars) if record.ui_tree else ""
-    return [Part(kind="text", text=f"[{label} 屏幕截图]"),
-            Part(kind="image", image=record.image),
-            Part(kind="text", text=f"[{label} UI 控件树]\n{tree}")]
-
-
-def _build_pairwise_prompt(rec_a: Record, rec_b: Record, criteria: Sequence["Criterion"],
-                           with_reason: bool, ui_tree_max_chars: int,
-                           transitions_a: tuple[Transition, ...] | None = None,
-                           transitions_b: tuple[Transition, ...] | None = None
-                           ) -> PromptBundle:
+def _pairwise_system_text(criteria: Sequence["Criterion"], with_reason: bool) -> str:
     lines = ["你将对两条记录进行成对质量比较。准则如下："]
     for crit in criteria:
         lines.append(f"- {crit.key}: {crit.description}")
@@ -325,37 +381,119 @@ def _build_pairwise_prompt(rec_a: Record, rec_b: Record, criteria: Sequence["Cri
                      '"reason": <一句话理由>}]}')
     else:
         lines.append('{"judgments": [{"criterion": <准则 key>, "winner": "A"|"B"|"tie"}]}')
-    system = Message(role="system", parts=(Part(kind="text", text="\n".join(lines)),))
-
-    if rec_a.kind == "sequence" or rec_b.kind == "sequence":
-        # v1.8: the sequence subsections sit inside each [记录 X] content slot; a text
-        # sequence must NOT take the plain-text fast path (record.text is None).
-        user_parts = (_record_parts(rec_a, "记录 A", ui_tree_max_chars, transitions_a)
-                      + _record_parts(rec_b, "记录 B", ui_tree_max_chars, transitions_b))
-    elif rec_a.modality == "text":
-        user_parts = [Part(kind="text",
-                           text=f"[记录 A] {rec_a.text}\n[记录 B] {rec_b.text}")]
-    else:
-        user_parts = (_record_parts(rec_a, "记录 A", ui_tree_max_chars)
-                      + _record_parts(rec_b, "记录 B", ui_tree_max_chars))
-    user = Message(role="user", parts=tuple(user_parts))
-    return PromptBundle(messages=(system, user))
+    return "\n".join(lines)
 
 
-def _build_pointwise_prompt(record: Record, criterion: "Criterion",
-                            ui_tree_max_chars: int,
-                            transitions: tuple[Transition, ...] | None = None
-                            ) -> PromptBundle:
+def _pointwise_system_text(criterion: "Criterion") -> str:
     label = _pointwise_label(criterion.description)
     lines = [f"按以下 0–5 加性量表为记录的 {criterion.key}（{label}）打分，"
              "先给两句理由再给整数分："]
     lines.extend(criterion.pointwise_levels)
     lines.append('输出 JSON：{"scores": [{"criterion": <准则 key>, "reason": <两句理由>, '
                  '"score": 0..5}]}')
-    system = Message(role="system", parts=(Part(kind="text", text="\n".join(lines)),))
+    return "\n".join(lines)
+
+
+def _record_parts(record: Record, label: str, ui_tree_max_chars: int,
+                  transitions: tuple[Transition, ...] | None = None,
+                  fit: _CallFit | None = None) -> list[Part]:
+    """Text modality: one '[label] text' line; UI modality: three parts per §10.2.
+    v1.8 sequence records (record.kind == "sequence", checked BEFORE modality) render as
+    ONE pure-text part — `[{label}·操作序列]` head line, then the §10.2/§10.3 sequence
+    subsections [步骤序列] (omitted entirely when transitions is None) + [成员帧摘要] —
+    with NO image part even in UI modality (rule-34 vision relaxation, S30).
+
+    v1.11 (``fit`` non-None, spec 3.4.3 v1.11 row): this record slot packs into
+    fit.side_share — the UI tree render gets the §3.3③ dynamic cap (trailing-line
+    drop, serialize marker kept), the sequence [步骤序列] block gets the §3.3⑤
+    edges trim (first/last steps kept, whole middle lines out, in-place marker);
+    plain record text and the member-digest block (already char-capped) are not
+    trim classes — a slot whose untrimmable floor still exceeds the share flags
+    fit.overflow (V10). fit=None is the byte-identical v1.10 path."""
+    if record.kind == "sequence":
+        lines = [f"[{label}·操作序列]"]
+        if transitions is not None:
+            lines.append("[步骤序列]")
+            step_body = "\n".join(_step_line(t) for t in transitions)
+            if fit is not None:
+                # steps get what the slot's fixed parts leave over (§3.3⑤): the
+                # digest block is the adjudication-fallback evidence and yields
+                # LAST (图片先于文本、文本中摘要最珍贵 — §3.3⑥ rationale family).
+                fixed = "\n".join([f"[{label}·操作序列]", "[步骤序列]", "[成员帧摘要]"]
+                                  + _member_digest_lines(record.members,
+                                                         ui_tree_max_chars))
+                step_share = fit.side_share - budget.est_text(fixed)
+                if budget.est_text(step_body) > step_share:
+                    step_body = budget.fit_text(step_body, max(0, step_share),
+                                                keep="edges")
+                    fit.truncations += 1
+            lines.extend(step_body.split("\n"))
+        lines.append("[成员帧摘要]")
+        lines.extend(_member_digest_lines(record.members, ui_tree_max_chars))
+        parts = [Part(kind="text", text="\n".join(lines))]
+        if fit is not None and budget.est_text(parts[0].text) > fit.side_share:
+            fit.overflow = True
+        return parts
+    if record.modality == "text":
+        parts = [Part(kind="text", text=f"[{label}] {record.text}")]
+        if fit is not None and budget.est_text(parts[0].text) > fit.side_share:
+            fit.overflow = True                  # record text is not a trim class
+        return parts
+    tree = record.ui_tree.serialize(max_chars=ui_tree_max_chars) if record.ui_tree else ""
+    head = f"[{label} 屏幕截图]"
+    tree_label = f"[{label} UI 控件树]\n"
+    if fit is not None:
+        tree_share = (fit.side_share - budget.est_text(head)
+                      - budget.est_text(tree_label))
+        tree, trimmed = _fit_tree_text(tree, max(0, tree_share))
+        if trimmed:
+            fit.truncations += 1
+    parts = [Part(kind="text", text=head),
+             Part(kind="image", image=record.image),
+             Part(kind="text", text=f"{tree_label}{tree}")]
+    if fit is not None and (budget.est_text(head)
+                            + budget.est_text(parts[2].text)) > fit.side_share:
+        fit.overflow = True
+    return parts
+
+
+def _build_pairwise_prompt(rec_a: Record, rec_b: Record, criteria: Sequence["Criterion"],
+                           with_reason: bool, ui_tree_max_chars: int,
+                           transitions_a: tuple[Transition, ...] | None = None,
+                           transitions_b: tuple[Transition, ...] | None = None,
+                           fit: _CallFit | None = None) -> PromptBundle:
+    system = Message(role="system", parts=(
+        Part(kind="text", text=_pairwise_system_text(criteria, with_reason)),))
+
+    if rec_a.kind == "sequence" or rec_b.kind == "sequence":
+        # v1.8: the sequence subsections sit inside each [记录 X] content slot; a text
+        # sequence must NOT take the plain-text fast path (record.text is None).
+        user_parts = (_record_parts(rec_a, "记录 A", ui_tree_max_chars, transitions_a,
+                                    fit=fit)
+                      + _record_parts(rec_b, "记录 B", ui_tree_max_chars, transitions_b,
+                                      fit=fit))
+    elif rec_a.modality == "text":
+        user_parts = [Part(kind="text",
+                           text=f"[记录 A] {rec_a.text}\n[记录 B] {rec_b.text}")]
+        if fit is not None and budget.est_text(
+                user_parts[0].text) > 2 * fit.side_share:
+            fit.overflow = True                  # joint slot = both halves (§3.3④)
+    else:
+        user_parts = (_record_parts(rec_a, "记录 A", ui_tree_max_chars, fit=fit)
+                      + _record_parts(rec_b, "记录 B", ui_tree_max_chars, fit=fit))
+    user = Message(role="user", parts=tuple(user_parts))
+    return PromptBundle(messages=(system, user))
+
+
+def _build_pointwise_prompt(record: Record, criterion: "Criterion",
+                            ui_tree_max_chars: int,
+                            transitions: tuple[Transition, ...] | None = None,
+                            fit: _CallFit | None = None) -> PromptBundle:
+    system = Message(role="system", parts=(
+        Part(kind="text", text=_pointwise_system_text(criterion)),))
     user = Message(role="user",
                    parts=tuple(_record_parts(record, "记录内容", ui_tree_max_chars,
-                                             transitions)))
+                                             transitions, fit=fit)))
     return PromptBundle(messages=(system, user))
 
 
@@ -575,6 +713,61 @@ class QualityStage:
             it.status = "failed"
         self._emit_error(ctx, tuple(it.record.id for it in items), err)
 
+    # ── v1.11 budget plumbing (spec 3.4.3 v1.11 row) ────────────────────────
+
+    def _call_fit(self, ctx: "RunContext", judge: str, system_text: str,
+                  schema: dict, records: Sequence[Record],
+                  sides: int) -> _CallFit | None:
+        """None = budget OFF for this judge (profile missing / cw == 0 — v1.10
+        byte-identical). quality packs PER (comparison, judge): each call fits
+        its own judge's budget (V25② contrast). The schema est is charged only
+        when the profile rides structured output; single-UI records each carry
+        one image ([记录 X 屏幕截图]) at the calibrated cost — counted before the
+        two-way split (§3.3④); sequences render imageless (rule-34/S30)."""
+        prof: "LLMProfile | None" = self.cfg.llm_profiles.get(judge)
+        if prof is None or prof.context_window <= 0:
+            return None
+        static = budget.est_text(system_text) + 2 * budget.MSG_OVERHEAD_TOKENS
+        if prof.supports_structured_output:
+            static += budget.est_text(json.dumps(schema, ensure_ascii=False))
+        n_images = sum(1 for r in records
+                       if r.kind != "sequence" and r.modality == "ui"
+                       and r.image is not None)
+        image_est = n_images * ctx.llm.calibrator.cost(prof.name) if n_images else 0
+        return _CallFit(record_budget=budget.input_budget(prof) - static - image_est,
+                        sides=sides)
+
+    def _overflow_tie(self, ctx: "RunContext", items: Sequence[PipelineItem],
+                      message: str) -> None:
+        """Pairwise minimal-unit overflow disposition — the judgment_invalid
+        GRANULARITY precedent (spec 3.4.3 裁决失败 row): the comparison resolves
+        as a tie (BT-neutral, outcomes None), the involved records stay active
+        and scoreable — a record whose EVERY comparison overflows lands in the
+        existing on_unscored family. The precise kind rides the StageError and
+        the error event (V27①); quality.judgment_failures stays a rubric-only
+        diagnostic (not incremented) and budget.overflow_records counts REJECTS
+        only (§9.3) — no reject happens here. NOTE: this is a deliberate
+        granularity reading of V10 for the two-record pairwise unit; the
+        single-record pointwise unit takes the record-level reject
+        (_overflow_fail_record)."""
+        err = StageError(stage=self.name, kind=ErrorKind.CONTEXT_OVERFLOW.value,
+                         message=message, retryable=False)
+        for it in items:
+            it.errors.append(err)
+        self._emit_error(ctx, tuple(it.record.id for it in items), err)
+
+    def _overflow_fail_record(self, ctx: "RunContext", item: PipelineItem,
+                              message: str) -> None:
+        """Pointwise/single-record V10 terminal: record-level failed →
+        rejects, kind=context_overflow, counted in budget.overflow_records
+        (spec §3.5 / 3.4.3 v1.11 row)."""
+        err = StageError(stage=self.name, kind=ErrorKind.CONTEXT_OVERFLOW.value,
+                         message=message, retryable=False)
+        item.errors.append(err)
+        item.status = "failed"
+        ctx.metrics.count("budget.overflow_records")
+        self._emit_error(ctx, (item.record.id,), err)
+
     # ── pairwise mode (split into plan/dispatch/finish phases, R13) ─────────
 
     def _pairwise_calls(self, items: list[PipelineItem], ctx: "RunContext",
@@ -749,29 +942,72 @@ class QualityStage:
         rec_a = items[a_idx].record
         rec_b = items[b_idx].record
         keys = [c.key for c in group]
-        # v1.8 (S5-adjacent): the envelopes' transitions ride down to the sequence
-        # rendering; single records carry None and the prompt is byte-identical.
-        prompt = _build_pairwise_prompt(rec_a, rec_b, group, with_reason,
-                                        self.cfg.input.ui_tree_max_chars,
-                                        transitions_a=items[a_idx].transitions,
-                                        transitions_b=items[b_idx].transitions)
         schema = judgment_schema(keys, with_reason)
-        try:
-            obj, _usage, _attempts, model = await ctx.schema_engine.complete_validated(
-                judge, prompt, schema,
-                record_ids=(rec_first.id, rec_second.id), batch_no=ctx.batch_no)
-        except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
-            raise
-        except SchemaViolation as exc:
-            # Still invalid after M8 repair -> this comparison counts as tie (spec 3.4.3).
-            self._record_judgment_failure(
-                ctx, (items[first_idx], items[second_idx]),
-                f"pairwise judgment failed (SchemaViolation): {_violation_summary(exc)}")
-            return comp_idx, judge, flipped, {k: None for k in keys}
-        except Exception as exc:
-            self._record_call_failure(ctx, (items[first_idx], items[second_idx]), exc,
-                                      "pairwise judgment call failed")
-            return comp_idx, judge, flipped, {k: None for k in keys}
+        # v1.11 (spec 3.4.3 v1.11 row): per-(pair, judge) packing under THIS
+        # judge's budget; None = budget off, byte-identical v1.10 build below.
+        base_fit = self._call_fit(ctx, judge,
+                                  _pairwise_system_text(group, with_reason),
+                                  schema, (rec_a, rec_b), sides=2)
+        attempt_fit = base_fit
+        degraded = False
+        overflow_exc: ContextOverflowError | None = None
+        while True:
+            fit = replace(attempt_fit) if attempt_fit is not None else None
+            # v1.8 (S5-adjacent): the envelopes' transitions ride down to the sequence
+            # rendering; single records carry None and the prompt is byte-identical.
+            prompt = _build_pairwise_prompt(rec_a, rec_b, group, with_reason,
+                                            self.cfg.input.ui_tree_max_chars,
+                                            transitions_a=items[a_idx].transitions,
+                                            transitions_b=items[b_idx].transitions,
+                                            fit=fit)
+            if fit is not None:
+                if fit.truncations:
+                    ctx.metrics.count("budget.truncations.quality", fit.truncations)
+                if fit.overflow:
+                    # V10 minimal unit (2 records) unfittable — never send the
+                    # doomed request; a reactive-400 that drove us here settles
+                    # its terminal now (A7).
+                    if overflow_exc is not None:
+                        _feed_reactive_terminal(overflow_exc, ctx.metrics)
+                    self._overflow_tie(
+                        ctx, (items[first_idx], items[second_idx]),
+                        "pairwise slot exceeds the record-side budget at the "
+                        "minimal unit (2 records)")
+                    return comp_idx, judge, flipped, {k: None for k in keys}
+            try:
+                obj, _usage, _attempts, model = await ctx.schema_engine.complete_validated(
+                    judge, prompt, schema,
+                    record_ids=(rec_first.id, rec_second.id), batch_no=ctx.batch_no)
+                break
+            except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except ContextOverflowError as exc:
+                # V20: ONE tightened retry (halve the record-side text share,
+                # re-render) — only under an active packing surface; exhausted
+                # (or budget off: the 200-shaped finish oracle can still fire)
+                # → terminal tie per the _overflow_tie granularity, with the
+                # reactive-400 breaker feed exactly once (A7).
+                if base_fit is not None and not degraded:
+                    degraded = True
+                    overflow_exc = exc
+                    ctx.metrics.count("budget.degrade_retries")
+                    attempt_fit = replace(base_fit, tighten=2)
+                    continue
+                _feed_reactive_terminal(exc, ctx.metrics)
+                self._overflow_tie(
+                    ctx, (items[first_idx], items[second_idx]),
+                    f"pairwise judgment overflow terminal ({type(exc).__name__}): {exc}")
+                return comp_idx, judge, flipped, {k: None for k in keys}
+            except SchemaViolation as exc:
+                # Still invalid after M8 repair -> this comparison counts as tie (spec 3.4.3).
+                self._record_judgment_failure(
+                    ctx, (items[first_idx], items[second_idx]),
+                    f"pairwise judgment failed (SchemaViolation): {_violation_summary(exc)}")
+                return comp_idx, judge, flipped, {k: None for k in keys}
+            except Exception as exc:
+                self._record_call_failure(ctx, (items[first_idx], items[second_idx]), exc,
+                                          "pairwise judgment call failed")
+                return comp_idx, judge, flipped, {k: None for k in keys}
 
         by_key: dict[str, Mapping] = {}
         for entry in obj.get("judgments", []):
@@ -816,29 +1052,68 @@ class QualityStage:
                               criterion: "Criterion", q: "QualityConfig",
                               pool: str | None = None) -> None:
         rec = item.record
-        prompt = _build_pointwise_prompt(rec, criterion, self.cfg.input.ui_tree_max_chars,
-                                         transitions=item.transitions)
         schema = pointwise_schema(criterion.key)
-        try:
-            obj, _usage, _attempts, _model = await ctx.schema_engine.complete_validated(
-                q.llm, prompt, schema,
-                record_ids=(rec.id,), batch_no=ctx.batch_no)
-        except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
-            raise
-        except SchemaViolation as exc:
-            # Still invalid after M8 repair -> null score, on_unscored decides (spec 3.4.3).
-            self._record_judgment_failure(
-                ctx, (item,),
-                f"pointwise scoring failed for criterion {criterion.key} "
-                f"(SchemaViolation): {_violation_summary(exc)}")
-            item.scores[criterion.key] = QualityScore(
-                criterion=criterion.key, score=None, mode="pointwise", detail={})
-            return
-        except Exception as exc:
-            self._record_call_failure(
-                ctx, (item,), exc,
-                f"pointwise scoring call failed for criterion {criterion.key}")
-            return
+        # v1.11 (spec 3.4.3 v1.11 row): the single-record family — same packing
+        # as pairwise with sides=1 (the whole record side is one slot).
+        base_fit = self._call_fit(ctx, q.llm, _pointwise_system_text(criterion),
+                                  schema, (rec,), sides=1)
+        attempt_fit = base_fit
+        degraded = False
+        overflow_exc: ContextOverflowError | None = None
+        while True:
+            fit = replace(attempt_fit) if attempt_fit is not None else None
+            prompt = _build_pointwise_prompt(rec, criterion,
+                                             self.cfg.input.ui_tree_max_chars,
+                                             transitions=item.transitions, fit=fit)
+            if fit is not None:
+                if fit.truncations:
+                    ctx.metrics.count("budget.truncations.quality", fit.truncations)
+                if fit.overflow:
+                    # V10 minimal unit (single record) unfittable → record-level
+                    # reject; a reactive-400 that drove us here settles now (A7).
+                    if overflow_exc is not None:
+                        _feed_reactive_terminal(overflow_exc, ctx.metrics)
+                    self._overflow_fail_record(
+                        ctx, item,
+                        f"pointwise slot for criterion {criterion.key} exceeds "
+                        "the record-side budget at the minimal unit (1 record)")
+                    return
+            try:
+                obj, _usage, _attempts, _model = await ctx.schema_engine.complete_validated(
+                    q.llm, prompt, schema,
+                    record_ids=(rec.id,), batch_no=ctx.batch_no)
+                break
+            except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except ContextOverflowError as exc:
+                # V20 degrade: ONE tightened retry (text share halved); exhausted
+                # (or budget off) → record-level context_overflow terminal.
+                if base_fit is not None and not degraded:
+                    degraded = True
+                    overflow_exc = exc
+                    ctx.metrics.count("budget.degrade_retries")
+                    attempt_fit = replace(base_fit, tighten=2)
+                    continue
+                _feed_reactive_terminal(exc, ctx.metrics)
+                self._overflow_fail_record(
+                    ctx, item,
+                    f"pointwise scoring overflow terminal for criterion "
+                    f"{criterion.key} ({type(exc).__name__}): {exc}")
+                return
+            except SchemaViolation as exc:
+                # Still invalid after M8 repair -> null score, on_unscored decides (spec 3.4.3).
+                self._record_judgment_failure(
+                    ctx, (item,),
+                    f"pointwise scoring failed for criterion {criterion.key} "
+                    f"(SchemaViolation): {_violation_summary(exc)}")
+                item.scores[criterion.key] = QualityScore(
+                    criterion=criterion.key, score=None, mode="pointwise", detail={})
+                return
+            except Exception as exc:
+                self._record_call_failure(
+                    ctx, (item,), exc,
+                    f"pointwise scoring call failed for criterion {criterion.key}")
+                return
 
         entry = obj["scores"][0]
         raw = int(entry["score"])

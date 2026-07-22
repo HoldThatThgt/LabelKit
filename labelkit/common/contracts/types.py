@@ -308,7 +308,9 @@ def digest_is_poor(record: "Record") -> bool:
     digest is shorter than 8 characters — barren ghost-node / canvas screens
     whose digest carries no information (S12 guard, spec §4 poverty judgment:
     可见文本节点数为 0 或摘要长度 < 8; callers count digest_poor_frames and
-    WARN once per run, pointing at segment.use_vision). Text modality is never
+    WARN once per run, directing users to configure a supports_vision=true
+    profile for segment.llm — v1.11 V4 wording, the former use_vision key is
+    removed and vision follows profile capability). Text modality is never
     poor by this judgment. The length disjunct renders at a cap far above the
     threshold, so the cap value cannot mask a genuinely short digest."""
     if record.modality != "ui":

@@ -111,10 +111,14 @@ def _raise_for_finish(finish: str | None, profile: str,
             f"max_output_tokens={max_output_tokens})",
             profile=profile, finish=finish)
     if finish == _OVERFLOW_FINISH_VALUE:
+        # origin="finish" (SPEC §3.5): the 200-shaped oracle arrived on a
+        # successful HTTP interaction (streak already cleared by its ok) — the
+        # owning operator's degrade-exhaust terminal must NOT feed the breaker
+        # for this form, and the origin field is what lets it tell.
         raise ContextOverflowError(
             f"provider signaled context overflow via termination reason "
             f"{finish!r} (200-shaped oracle)",
-            phase="reactive", profile=profile)
+            phase="reactive", profile=profile, origin="finish")
 
 
 # ── public dataclasses (CONTRACTS.md §7.8, verbatim shapes) ────────────────
@@ -1233,10 +1237,13 @@ class LLMClient:
                                             usage=Usage(), retries=retries_used,
                                             status="fatal", operation=operation,
                                             extra=key_extra())
+                        # origin="http_400" (SPEC §3.5): THIS is the reactive
+                        # form whose degrade-exhaust terminal the owning
+                        # operator feeds to the breaker exactly once (A7).
                         raise ContextOverflowError(
                             f"provider context overflow (400 body sniff): "
                             f"{failure_msg}", phase="reactive",
-                            profile=prof.name)
+                            profile=prof.name, origin="http_400")
                     # 400/404: request-shape errors are key-independent — no
                     # rotation, immediate fatal feeding the streak (spec 3.9.3).
                     self._record_provider_result(fatal=True)

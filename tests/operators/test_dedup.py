@@ -779,3 +779,108 @@ def test_semantic_verdict_kind_sequence_cases():
     cfg = DedupConfig(semantic=True, semantic_embedding="emb")
     text_stage = DedupStage(cfg, DedupIndex(cfg, "text"))
     assert text_stage._semantic_verdict_kind(probe_detail(is_sequence=True)) == "near_semantic"
+
+
+# ── v1.11 embed-input budget truncation (V15, spec 3.3.3 嵌入输入预算截断) ──
+
+def _emb_profile(context_window: int) -> "EmbeddingProfile":
+    from labelkit.common.config.model import EmbeddingProfile
+    return EmbeddingProfile(name="emb", base_url="http://x", model="m",
+                            api_key_env="K", context_window=context_window)
+
+
+class _EmbedRecorder:
+    """Minimal ctx.llm stand-in: records embed inputs, returns a fixed unit vector."""
+
+    def __init__(self, exc: Exception | None = None):
+        self.texts: list[str] = []
+        self.exc = exc
+
+    async def embed(self, profile, texts):
+        if self.exc is not None:
+            raise self.exc
+        self.texts.extend(texts)
+        return [[1.0, 0.0]]
+
+
+def _semantic_ctx(context_window: int, llm: _EmbedRecorder) -> RunContext:
+    from types import SimpleNamespace
+    cfg = SimpleNamespace(embedding_profiles={"emb": _emb_profile(context_window)})
+    return RunContext(cfg=cfg, llm=llm, schema_engine=None, metrics=FakeMetrics(),
+                      rng=random.Random(0), batch_no=1)
+
+
+def _long_text_item() -> PipelineItem:
+    # 40 lines × 60 CJK chars ≈ 2400 tokens under est_text — far over a 512 window.
+    text = "\n".join("行" + str(i) + "内" * 60 for i in range(40))
+    return PipelineItem(record=text_record(text, "1" * 16))
+
+
+def test_semantic_embed_input_head_truncated_under_declared_window():
+    from labelkit.common.runtime import budget as budget_mod
+
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    llm = _EmbedRecorder()
+    ctx = _semantic_ctx(512, llm)
+    item = _long_text_item()
+    run_stage(DedupStage(cfg, DedupIndex(cfg, "text")), [item], ctx)
+    assert item.status == "active"                         # unique, vector indexed
+    (sent,) = llm.texts
+    full = _dedup_text(item.record, cfg)
+    expected = budget_mod.fit_text(full, budget_mod.embed_budget(_emb_profile(512)),
+                                   keep="head")
+    assert sent == expected                                # deterministic head keep
+    assert sent != full and full.startswith(sent)          # strict prefix (line-bounded)
+    assert budget_mod.est_text(sent) <= budget_mod.embed_budget(_emb_profile(512))
+    assert ctx.metrics.counters["budget.truncations.dedup"] == 1
+
+    # Determinism: an identical re-run sends the identical truncated text.
+    llm2 = _EmbedRecorder()
+    ctx2 = _semantic_ctx(512, llm2)
+    run_stage(DedupStage(cfg, DedupIndex(cfg, "text")), [_long_text_item()], ctx2)
+    assert llm2.texts == [sent]
+
+
+def test_semantic_embed_input_untouched_when_window_undeclared():
+    # cw == 0 → embed budget OFF: the v1.10 full-text call is byte-identical and
+    # no truncation counter appears (the §1 byte-equivalence anchor).
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    llm = _EmbedRecorder()
+    ctx = _semantic_ctx(0, llm)
+    item = _long_text_item()
+    run_stage(DedupStage(cfg, DedupIndex(cfg, "text")), [item], ctx)
+    assert llm.texts == [_dedup_text(item.record, cfg)]
+    assert "budget.truncations.dedup" not in ctx.metrics.counters
+
+
+def test_embedding_failure_skip_path_unchanged_under_budget():
+    # V15: the existing embedding_failures skip path stays the fallback — a
+    # provider failure after truncation still resolves the record on ①–③.
+    from labelkit.common.errors import ProviderRetryableError
+
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    llm = _EmbedRecorder(exc=ProviderRetryableError("boom", "emb", 5))
+    ctx = _semantic_ctx(512, llm)
+    item = _long_text_item()
+    run_stage(DedupStage(cfg, DedupIndex(cfg, "text")), [item], ctx)
+    assert item.status == "active" and item.dedup.kind == "unique"
+    assert ctx.metrics.counters["dedup.embedding_failures"] == 1
+
+
+def test_context_overflow_from_embed_classified_precisely():
+    # V27①: a ContextOverflowError escaping the embed path lands in the stage's
+    # per-record classifier FIRST — kind context_overflow (never internal_error),
+    # record-level failed → rejects, budget.overflow_records counted, and the
+    # precheck phase never feeds the breaker.
+    from labelkit.common.errors import ContextOverflowError
+
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    llm = _EmbedRecorder(exc=ContextOverflowError("over", phase="precheck"))
+    ctx = _semantic_ctx(512, llm)
+    item = _long_text_item()
+    run_stage(DedupStage(cfg, DedupIndex(cfg, "text")), [item], ctx)
+    assert item.status == "failed"
+    assert item.errors[0].kind == "context_overflow"
+    assert ctx.metrics.counters["budget.overflow_records"] == 1
+    ev = [e for e in ctx.metrics.events if e[0] == "error"]
+    assert ev and ev[0][4]["kind"] == "context_overflow"

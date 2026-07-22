@@ -22,6 +22,7 @@ the seeds and against each other (Self-Instruct filter, threshold = dedup.minhas
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
 import json
 import logging
@@ -36,6 +37,7 @@ from datasketch import MinHash, MinHashLSH
 
 from labelkit.common.errors import (
     CircuitBreakerTripped,
+    ContextOverflowError,
     ErrorKind,
     LabelKitError,
     ProviderFatalError,
@@ -43,6 +45,7 @@ from labelkit.common.errors import (
     SchemaViolation,
 )
 from labelkit.common.contracts.types import Classification, PipelineItem, Record, RecordRef
+from labelkit.common.runtime import budget
 
 if TYPE_CHECKING:
     import random
@@ -432,6 +435,11 @@ def postprocess_samples(plans: Sequence[CallPlan],
 
 
 def _error_kind(exc: LabelKitError) -> str:
+    # v1.11 (V27①): the budget vocabulary routes FIRST — a context_overflow /
+    # output_truncated void must not surface as internal_error in the stderr line.
+    kind = budget.classify_stage_error(exc)
+    if kind is not None:
+        return kind
     if isinstance(exc, SchemaViolation):
         return ErrorKind.SCHEMA_VIOLATION.value
     if isinstance(exc, ProviderRetryableError):
@@ -439,6 +447,54 @@ def _error_kind(exc: LabelKitError) -> str:
     if isinstance(exc, ProviderFatalError):
         return ErrorKind.PROVIDER_FATAL.value
     return ErrorKind.INTERNAL_ERROR.value
+
+
+# ── v1.11 seed packing (spec 3.6.2 上下文预算装填 row / §3.3⑦) ──────────────
+
+def _fit_plan_seeds(plan: CallPlan, cfg: "ResolvedConfig") -> tuple[CallPlan, bool, bool]:
+    """seeds_per_call demoted to an UPPER BOUND under a declared budget: seeds are
+    dropped FROM THE TAIL of the rng-drawn order (never re-drawn — determinism)
+    until the call's prompt est fits the TARGET profile's input budget; min 1
+    seed. The (llm, style) pre-draw and rotation order are untouched, so the
+    trimmed plan stays call-by-call reproducible (llms mixture included). System
+    side (instruction / style / output-structure sentence) is static — V13③ M1
+    precheck territory, never trimmed here. Returns (plan', truncated,
+    unfittable); unfittable=True ⇒ not even 1 seed (or the seedless prompt)
+    fits — the CALL is disposed per V10 by the dispatcher (voided, kind
+    context_overflow). Budget off (profile missing / cw == 0) → (plan, False,
+    False) byte-identically."""
+    prof = cfg.llm_profiles.get(plan.llm)
+    if prof is None or prof.context_window <= 0:
+        return plan, False, False
+    g = cfg.generate
+    gen_c = effective_generate(cfg, plan.class_name)
+    b = budget.input_budget(prof)
+    if prof.supports_structured_output:
+        b -= budget.est_text(json.dumps(_samples_schema(g.num_per_call),
+                                        ensure_ascii=False))
+
+    def fits(seed_texts: Sequence[str]) -> bool:
+        system_text, user_text = render_prompt_texts(
+            gen_c.instruction, plan.style_prompt, g.num_per_call, seed_texts)
+        est = (budget.est_text(system_text) + budget.est_text(user_text)
+               + 2 * budget.MSG_OVERHEAD_TOKENS)
+        return est <= b
+
+    n = len(plan.seed_texts)
+    for keep in range(n, 0, -1):                # tail drop: prefix of the drawn order
+        if fits(plan.seed_texts[:keep]):
+            if keep == n:
+                return plan, False, False
+            # seed_ids align positionally with seed_texts in process mode; the
+            # generate_only pool carries no ids (empty tuple stays empty).
+            ids = (plan.seed_ids[:keep] if len(plan.seed_ids) == n
+                   else plan.seed_ids)
+            return (dataclasses.replace(plan, seed_ids=ids,
+                                        seed_texts=plan.seed_texts[:keep]),
+                    True, False)
+    if n == 0 and fits(()):                     # seedless form: nothing to drop
+        return plan, False, False
+    return plan, False, True                    # V10: voided whole, nothing trimmed
 
 
 def void_log_message(plan: CallPlan, exc: LabelKitError) -> str:
@@ -512,7 +568,28 @@ class GenerateStage:
         plans = build_segment_plans(g, segments, ctx.rng, exec_calls=exec_calls)
         schema = _samples_schema(g.num_per_call)
 
-        async def one_call(plan: CallPlan) -> list[str] | None:
+        # v1.11 (§3.3⑦): per-call seed packing BEFORE dispatch — deterministic
+        # (content + pre-drawn plan only), so the fitted plans drive dispatch AND
+        # post-processing (records inherit the actually-sent seed provenance).
+        fitted: list[tuple[CallPlan, bool]] = []
+        for plan in plans:
+            plan, truncated, unfittable = _fit_plan_seeds(plan, self._cfg)
+            if truncated:
+                ctx.metrics.count("budget.truncations.generate")
+            fitted.append((plan, unfittable))
+        plans = [plan for plan, _ in fitted]
+
+        async def one_call(plan: CallPlan, unfittable: bool) -> list[str] | None:
+            if unfittable:
+                # V10: not even 1 seed fits — never send the doomed request; the
+                # CALL is voided under the existing failure semantics (bucket
+                # `calls` counted, produced 0, no failed record) with the precise
+                # kind in the stderr line. phase=precheck never feeds the breaker.
+                _log.warning(void_log_message(plan, ContextOverflowError(
+                    "generation call unfittable at 1 seed", phase="precheck",
+                    profile=plan.llm)),
+                    extra={"stage": self.name, "batch": ctx.batch_no})
+                return None
             # R17: instruction/temperature are class-effective; num_per_call stays global.
             gen_c = effective_generate(self._cfg, plan.class_name)
             prompt = build_generate_prompt(gen_c.instruction, plan.style_prompt,
@@ -531,11 +608,18 @@ class GenerateStage:
                 # event either (§8.1 ties it to StageError construction) — the void shows
                 # up in report.generate.buckets (calls counted, produced 0) and in M8/M9's
                 # own schema.repair / llm.call events. Stderr gets a value-free one-liner.
+                # v1.11: a reactive-400 overflow terminal (no degrade face here)
+                # feeds the breaker exactly once (A7); precheck/finish never do.
+                if (isinstance(exc, ContextOverflowError) and exc.phase == "reactive"
+                        and getattr(exc, "origin", "http_400") == "http_400"
+                        and not getattr(exc, "_breaker_fed", False)):
+                    exc._breaker_fed = True  # type: ignore[attr-defined]
+                    ctx.metrics.record_provider_result(fatal=True)
                 _log.warning(void_log_message(plan, exc),
                              extra={"stage": self.name, "batch": ctx.batch_no})
                 return None
 
-        results = await asyncio.gather(*(one_call(p) for p in plans))
+        results = await asyncio.gather(*(one_call(p, u) for p, u in fitted))
         seed_texts = [text for seg in segments for _, text in seg.seeds]
         records = postprocess_samples(plans, list(results), seed_texts,
                                       self._cfg, ctx.metrics)

@@ -970,3 +970,72 @@ def test_multi_session_batches_processed_independently_in_order():
     assert engine.calls[0][3] == ("a0",) and engine.calls[1][3] == ("b0",)
     thread_events = [e for e in ctx.metrics.events if e[0] == "stitch.thread"]
     assert [e[3]["session_id"] for e in thread_events] == ["sa", "sb"]
+
+
+# ── v1.11 (V27①/spec 3.16.4 上下文预算 row): precise budget kinds ────────────
+
+def test_context_overflow_fail_records_precise_kind():
+    from labelkit.common.errors import ContextOverflowError
+
+    sid = "s1"
+    frames = [envelope(ui_frame("a0", 0), sid), envelope(ui_frame("a1", 1), sid)]
+    ep = episode_of(frames, sid)
+    batch = [*frames, ep]
+    engine = QueueEngine([ContextOverflowError("throat hit", phase="precheck")])
+    out, ctx = run_stage(make_cfg(on_error="fail", repass=False), batch, engine)
+    assert ep.status == "failed"
+    (err,) = ep.errors
+    assert (err.stage, err.kind) == ("stitch", "context_overflow")
+    assert ctx.metrics.counters["budget.overflow_records"] == 1
+    error_events = [e for e in ctx.metrics.events if e[0] == "error"]
+    assert error_events[0][3]["kind"] == "context_overflow"
+    # member frames stay absorbed — the fail scope is the episode envelope only
+    assert all(f.status == "absorbed" for f in frames)
+
+
+def test_context_overflow_keep_opens_thread_with_precise_event_kind():
+    # on_error="keep" (default) disposition unchanged: the candidate opens its
+    # own thread, no item.errors — only the event carries the precise kind.
+    from labelkit.common.errors import ContextOverflowError, OutputTruncatedError
+
+    sid = "s1"
+    frames = [envelope(ui_frame("a0", 0), sid)]
+    ep = episode_of(frames, sid)
+    engine = QueueEngine([ContextOverflowError("over", phase="precheck")])
+    out, ctx = run_stage(make_cfg(on_error="keep", repass=False),
+                         [*frames, ep], engine)
+    assert ep.status == "active" and ep.errors == []
+    assert ep.thread_id == ep.record.id                # keep: bootstrapped thread
+    error_events = [e for e in ctx.metrics.events if e[0] == "error"]
+    assert error_events[0][3]["kind"] == "context_overflow"
+    assert "budget.overflow_records" not in ctx.metrics.counters   # no reject
+
+    frames2 = [envelope(ui_frame("b0", 0), "s2")]
+    ep2 = episode_of(frames2, "s2")
+    engine2 = QueueEngine([OutputTruncatedError("cap")])
+    out, ctx2 = run_stage(make_cfg(on_error="keep", repass=False),
+                          [*frames2, ep2], engine2)
+    error_events2 = [e for e in ctx2.metrics.events if e[0] == "error"]
+    assert error_events2[0][3]["kind"] == "output_truncated"
+
+
+def test_reactive_400_terminal_feeds_breaker_once_keep_path():
+    from labelkit.common.errors import ContextOverflowError
+
+    class FeedMetrics(RecordingMetrics):
+        def __init__(self):
+            super().__init__()
+            self.fed = []
+
+        def record_provider_result(self, fatal, *, hard=False):
+            self.fed.append(fatal)
+
+    sid = "s1"
+    frames = [envelope(ui_frame("a0", 0), sid)]
+    ep = episode_of(frames, sid)
+    engine = QueueEngine([ContextOverflowError("sniff", phase="reactive")])
+    cfg = make_cfg(on_error="keep", repass=False)
+    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
+                          metrics=FeedMetrics(), rng=None, batch_no=1)
+    asyncio.run(StitchStage(cfg).run([*frames, ep], ctx))
+    assert ctx.metrics.fed == [True]                   # A7: exactly once

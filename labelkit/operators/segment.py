@@ -15,6 +15,19 @@ the S26 evidence triple (duck-typed ``segment_degraded`` → _meta.stream.degrad
 + error event + segment.failures counter, never item.errors); "fail" fails all
 session members. ``judge_window`` is a PUBLIC direct-call surface for M7's
 member-reclaim re-judgment (the sanctioned import exception).
+
+v1.11 (context budget, SPEC-context-budget V4/V9/V13④/V20/V24/V27①): frame
+digests are precomputed ONCE per session BEFORE windowing and shared by the
+packing costs and every window prompt; when the segment profile declares
+``context_window > 0`` the window cut switches from fixed spans to the greedy
+budget packer ``_pack_windows`` (window = pure upper cap; 1-frame overlap and
+later-window seam ownership preserved), undeclared budget keeps the v1.10
+fixed-window cut byte-identically; a window call raising the reactive
+``ContextOverflowError`` is re-cut in half and retried (bounded, ≤ 2 halvings
+deep — the 400-sniffed terminal feeds the breaker exactly once, A7); window
+failures classify through ``budget.classify_stage_error`` before falling back
+to segmentation_invalid; every dispatched window counts ``segment.windows``
+(→ report.stream.windows).
 """
 from __future__ import annotations
 
@@ -23,7 +36,11 @@ import hashlib
 import logging
 from typing import TYPE_CHECKING, Mapping, Sequence
 
-from labelkit.common.errors import CircuitBreakerTripped, ErrorKind
+from labelkit.common.errors import (
+    CircuitBreakerTripped,
+    ContextOverflowError,
+    ErrorKind,
+)
 from labelkit.common.contracts.types import (
     PipelineItem,
     Record,
@@ -34,6 +51,7 @@ from labelkit.common.contracts.types import (
     tree_diff,
 )
 
+from labelkit.common.runtime import budget as budget_mod
 from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
 from labelkit.common.runtime.schema_engine import segment_window_schema
 
@@ -48,10 +66,20 @@ _EV_BOUNDARY = "segment.boundary"
 _EV_ERROR = "error"
 
 # Counter keys owned by M14 (CONTRACTS.md §9.3; counts.episodes / absorbed /
-# dropped_noise are metered by M10).
+# dropped_noise are metered by M10). v1.11: segment.windows = ACTUAL windows
+# dispatched incl. V20 split sub-windows (→ report.stream.windows, V13④ —
+# reconciles estimate_run's w_min upper bound); budget.degrade_retries counts
+# every V20 halving (→ report.budget.degrade_retries, V13⑤).
 _COUNTER_FAILURES = "segment.failures"
 _COUNTER_BELOW_MIN_LEN = "segment.below_min_len"
 _COUNTER_DIGEST_POOR = "segment.digest_poor_frames"
+_COUNTER_WINDOWS = "segment.windows"
+_COUNTER_DEGRADE_RETRIES = "budget.degrade_retries"
+
+# V20 degrade bound: at most 2 degrade levels per original window (one further
+# halving of a half) — multiplicative decrease, bounded (AIMD family, spec
+# 3.14.4 溢出降级重试).
+_MAX_DEGRADE_LEVELS = 2
 
 # Deductive mapping (spec 3.14.4, code-side lookup — the LLM never answers the
 # boundary question): continues/advances → non-boundary; returns_to_entry/
@@ -86,8 +114,11 @@ _FRAME_LABEL_TMPL = "[帧 {i}] {digest}"
 _DIFF_LABEL_TMPL = "[帧 {i} 变更] {diff}"
 
 # Once-per-run stderr WARN for the digest-poverty guard (S12) — data-independent.
+# v1.11 (V4): guidance points at profile capability — the former use_vision key
+# is removed, choosing the profile IS choosing the capability (V1).
 _DIGEST_POOR_WARNING = ("帧摘要贫瘠（可见文本节点为零）：纯文本边界裁决依据不足，"
-                        "建议开启 segment.use_vision 附帧截图补偿")
+                        "建议为 segment.llm 配置 supports_vision=true 的 profile "
+                        "附帧截图补偿")
 
 
 def _reason_requested(cfg: "ResolvedConfig") -> bool:
@@ -111,8 +142,10 @@ def render_tree_diff(diff: Mapping) -> str:
 
 
 def build_segment_prompt(frames: Sequence[Record], diffs: Sequence[Mapping | None],
-                         cfg: "ResolvedConfig", with_reason: bool) -> PromptBundle:
-    """Deterministic assembly of the CONTRACTS §10.9 template.
+                         cfg: "ResolvedConfig", with_reason: bool,
+                         digests: Sequence[str]) -> PromptBundle:
+    """Deterministic assembly of the CONTRACTS §10.9 template — TEMPLATE BYTES
+    UNCHANGED by v1.11.
 
     system: the frozen three-step deductive criteria with the window frame
     count substituted, the optional segment.context line (omitted when empty),
@@ -122,6 +155,12 @@ def build_segment_prompt(frames: Sequence[Record], diffs: Sequence[Mapping | Non
     line; under segment.vision_resolved (v1.11 V1 parse product) each frame's
     digest part is preceded by that frame's image part (§10.1/§10.10
     single-message multi-part shape).
+
+    ``digests`` (v1.11 V9 frozen-signature revision, CONTRACTS §7.14): the
+    per-frame digest strings ALIGNED with ``frames``, precomputed once per
+    session BEFORE window packing — the packer prices frames off the same
+    vector and seam frames are no longer digested twice; the builder never
+    computes digests itself.
     """
     seg = cfg.segment
     n = str(len(frames))
@@ -138,14 +177,37 @@ def build_segment_prompt(frames: Sequence[Record], diffs: Sequence[Mapping | Non
     for i, frame in enumerate(frames):
         if seg.vision_resolved and frame.image is not None:
             parts.append(Part(kind="image", image=frame.image))
-        text = _FRAME_LABEL_TMPL.format(
-            i=i, digest=frame_digest(frame, seg.digest_max_chars))
+        text = _FRAME_LABEL_TMPL.format(i=i, digest=digests[i])
         diff = diffs[i] if i < len(diffs) else None
         if i >= 1 and diff is not None:            # 窗首帧无此行
             text += "\n" + _DIFF_LABEL_TMPL.format(i=i, diff=render_tree_diff(diff))
         parts.append(Part(kind="text", text=text))
     messages.append(Message(role="user", parts=tuple(parts)))
     return PromptBundle(messages=tuple(messages))
+
+
+def _static_prompt_est(cfg: "ResolvedConfig") -> int:
+    """est_text of the §10.9 prompt's static (record-independent) parts — the
+    packing condition's est_static_system term (SPEC-context-budget §3.3-1).
+
+    Enumerated from build_segment_prompt above: the system message is exactly
+    "\\n".join(_SYSTEM_HEAD, [segment.context], _STRUCTURE_SENTENCE, structure
+    line) — evaluated here in constant form ({N} unsubstituted; the 1–2 char
+    frame-count substitution is margin headroom by design, V7) with the
+    with_reason structure variant resolved deterministically from cfg — plus
+    MSG_OVERHEAD_TOKENS for each of the two messages (system + user). The
+    per-frame "[帧 {i}] " label and the "[帧 {i} 变更] {rendered diff}" line
+    are frame scaffolding covered by the per-frame DIFF_MAX_TOKENS worst
+    constant (V9: the diff is computed only after windowing; its rendered line
+    is structurally bounded ≪ 128 tokens incl. the labels)."""
+    seg = cfg.segment
+    lines = [_SYSTEM_HEAD]
+    if seg.context:
+        lines.append(seg.context)
+    lines.append(_STRUCTURE_SENTENCE)
+    lines.append(_STRUCTURE_REASON if _reason_requested(cfg) else _STRUCTURE_PLAIN)
+    return (budget_mod.est_text("\n".join(lines))
+            + 2 * budget_mod.MSG_OVERHEAD_TOKENS)
 
 
 # ── window verdict (one window, one call) ────────────────────────────────────
@@ -166,12 +228,20 @@ async def judge_window(frames: Sequence[Record], ctx: "RunContext") -> list[str]
 
 async def _judge_window(frames: Sequence[Record], ctx: "RunContext", *,
                         session_id: str | None,
-                        span: tuple[int, int]) -> list[str]:
+                        span: tuple[int, int],
+                        digests: Sequence[str] | None = None) -> list[str]:
     """Shared implementation behind ``judge_window`` and the stage's window
     calls — the keyword-only extras carry the event-payload context (session_id
-    + window span) that the frozen public signature cannot."""
+    + window span) that the frozen public signature cannot, plus the v1.11
+    session-precomputed ``digests`` slice (V9). ``digests=None`` = the public
+    judge_window path (M7's ≤3-frame re-judgment tables): the digest table is
+    self-computed here, keeping the frozen public signature unchanged
+    (CONTRACTS §7.14)."""
     cfg = ctx.cfg
     with_reason = _reason_requested(cfg)
+    if digests is None:
+        digests = [frame_digest(frame, cfg.segment.digest_max_chars)
+                   for frame in frames]
     # Adjacent-frame diffs are pre-assembled code-side; the window's first
     # frame carries none. Bounds quantization reuses the tool's single
     # quantization knob (dedup.bounds_quantize_px — the M3 serialize precedent)
@@ -180,7 +250,7 @@ async def _judge_window(frames: Sequence[Record], ctx: "RunContext", *,
     diffs: list[Mapping | None] = [None]
     for i in range(1, len(frames)):
         diffs.append(tree_diff(frames[i - 1].ui_tree, frames[i].ui_tree, quantize))
-    prompt = build_segment_prompt(frames, diffs, cfg, with_reason)
+    prompt = build_segment_prompt(frames, diffs, cfg, with_reason, digests)
     schema = segment_window_schema(len(frames), with_reason)
     obj, _usage, _attempts, model = await ctx.schema_engine.complete_validated(
         cfg.segment.llm, prompt, schema, record_ids=(frames[0].id,),
@@ -214,9 +284,13 @@ async def _judge_window(frames: Sequence[Record], ctx: "RunContext", *,
 
 
 def _window_spans(n: int, window: int) -> list[tuple[int, int]]:
-    """Sliding-window spans over a session of n frames (spec 3.14.4 pseudocode):
-    window = [start, end), stride = window − 1 (1-frame overlap — the seam
-    frame's whole verdict belongs to the later window during stitching)."""
+    """Fixed sliding-window spans over a session of n frames (spec 3.14.4
+    pseudocode): window = [start, end), stride = window − 1 (1-frame overlap —
+    the seam frame's whole verdict belongs to the later window during
+    stitching). v1.11: the BUDGET-UNDECLARED cut (segment profile missing or
+    context_window == 0) — kept verbatim so the degradation is byte-identical
+    to v1.10 by construction (V9 regression anchor); budget-declared sessions
+    cut through _pack_windows below."""
     spans: list[tuple[int, int]] = []
     start = 0
     while start < n:
@@ -226,6 +300,88 @@ def _window_spans(n: int, window: int) -> list[tuple[int, int]]:
             break
         start += window - 1
     return spans
+
+
+def _pack_windows(costs: list[int], budget: int, cap: int) -> list[tuple[int, int]]:
+    """Greedy budget packer (v1.11 V9, spec 3.14.4 装填伪代码; M14-owned
+    operator logic per CONTRACTS §7.17 — budget.py supplies only the
+    estimation primitives). ``costs[i]`` = per-frame cost c_i, ``budget`` =
+    input_budget − est_static_system (the caller subtracts the static term, so
+    the packing condition Σ c_j ≤ budget here IS the spec's est_static_system
+    + Σ c_i ≤ input_budget), ``cap`` = segment.window as pure upper cap.
+
+    Windows = [start, end): the first starts at 0, every subsequent one at the
+    previous window's end − 1 — the 1-frame overlap and later-window seam
+    ownership are PRESERVED (the rel[] assembly overwrite order relies on it);
+    a frame joins the open window while both the budget and the frame-count
+    cap hold, overflow closes the window. Every window carries ≥ 2 frames —
+    guaranteed statically by the M1 w_min ≥ floor guard (any two worst-case
+    frames fit the budget, spec 3.1.4), asserted here defensively. Pure
+    function of (costs, budget, cap) ⇒ deterministic rerun."""
+    spans: list[tuple[int, int]] = []
+    n = len(costs)
+    start = 0
+    while start < n:
+        end = start
+        total = 0
+        while end < n and end - start < cap and total + costs[end] <= budget:
+            total += costs[end]
+            end += 1
+        assert end - start >= 2, (
+            f"budget window packed {end - start} frame(s) — the M1 w_min ≥ "
+            f"floor guard promises any 2 frames fit (spec 3.1.4)")
+        spans.append((start, end))
+        if end == n:
+            break
+        start = end - 1
+    return spans
+
+
+async def _judge_span_degrading(judge, span: tuple[int, int],
+                                ctx: "RunContext", *,
+                                level: int = 0) -> list[tuple[tuple[int, int], list[str]]]:
+    """V20 window-split degrade-retry (spec 3.14.4 溢出降级重试; SPEC-context-
+    budget V20/V24/A7). ``judge`` = async callable(span) -> per-frame verdicts
+    for that span (injected — the seam that keeps this pure logic offline-
+    testable). Returns the leaf results as [(sub-span, verdicts), ...] in
+    ascending span order, ready for the schedule-independent rel[] overwrite
+    (the later sub-window still owns its seam frame).
+
+    A window call raising the reactive ContextOverflowError is re-cut in half:
+    [s, m+1) and [m, e) with m = midpoint — the 1-frame overlap and the
+    seam-owned-by-the-later-window semantics survive the split and no frame is
+    lost. Multiplicative decrease, bounded: at most _MAX_DEGRADE_LEVELS (2)
+    degrade levels per original window; each halving counts
+    budget.degrade_retries. The halves run SEQUENTIALLY — deterministic
+    breaker accounting (the first terminal stops the tree; degrade traffic is
+    reactive-only and rare, concurrency is not worth losing determinism).
+
+    Terminal (no further split): non-reactive phases (precheck = packing-layer
+    bug caught defensively — never degradable), a minimal 2-frame window
+    (< 3 frames cannot split into two ≥ 2-frame halves), or the level bound.
+    Per SPEC §3.5's breaker matrix, ONLY the 400-sniffed reactive terminal
+    (origin="http_400") feeds the breaker — exactly once, here, at the leaf
+    (A7: M9 deliberately skipped the feed when raising); the 200-shaped
+    origin="finish" oracle rode a successful HTTP interaction whose ok already
+    cleared the streak, and precheck had no provider interaction at all. The
+    exception then re-raises into the session's on_error disposition (the
+    parent recursion levels never re-settle it — only the direct judge() call
+    sits inside the try)."""
+    start, end = span
+    try:
+        return [(span, await judge(span))]
+    except ContextOverflowError as exc:
+        if exc.phase != "reactive" or end - start < 3 or level >= _MAX_DEGRADE_LEVELS:
+            if exc.phase == "reactive" and exc.origin == "http_400":
+                ctx.metrics.record_provider_result(fatal=True)
+            raise
+        ctx.metrics.count(_COUNTER_DEGRADE_RETRIES)
+        mid = (start + end) // 2
+        results = await _judge_span_degrading(judge, (start, mid + 1), ctx,
+                                              level=level + 1)
+        results.extend(await _judge_span_degrading(judge, (mid, end), ctx,
+                                                   level=level + 1))
+        return results
 
 
 # ── stage ────────────────────────────────────────────────────────────────────
@@ -256,6 +412,16 @@ class SegmentStage:
 
         refine = seg.strategy in ("llm", "hybrid")
 
+        # v1.11 (V9): the window cut is budget-packed iff the segment profile
+        # declares a context window; undeclared → the v1.10 fixed cut,
+        # byte-identical. Both the static prompt estimate and the per-image
+        # cost are config/batch-frozen values — computed once up front, so the
+        # packing stays a pure function of (input, config).
+        prof = self.cfg.llm_profiles.get(seg.llm)
+        budget_on = refine and prof is not None and prof.context_window > 0
+        pack_budget = (budget_mod.input_budget(prof) - _static_prompt_est(self.cfg)
+                       if budget_on else 0)
+
         # Phase 1: every window of every refined session joins ONE gather
         # (M4 phase-2 skeleton); stitching is a synchronous pass afterwards,
         # positioned by window span — schedule-independent, zero rng.
@@ -272,16 +438,40 @@ class SegmentStage:
                         _logger.warning(_DIGEST_POOR_WARNING,
                                         extra={"stage": self.name,
                                                "batch": ctx.batch_no})
-            for span in _window_spans(len(items), seg.window):
-                frames = [item.record for item in items[span[0]:span[1]]]
+            # V9 session-level digest precompute — ONCE per frame per session,
+            # BEFORE windowing; the packing costs and every window prompt
+            # (incl. V20 sub-windows) share this vector, so seam frames are no
+            # longer digested twice. The poverty guard above stays an
+            # independent computation path (digest_is_poor's own hardcoded
+            # cap), untouched by design.
+            records = [item.record for item in items]
+            digests = [frame_digest(record, seg.digest_max_chars)
+                       for record in records]
+            if budget_on:
+                # Per-image cost: ONE calibrator read per session — the
+                # snapshot is batch-frozen (V19), so the read is deterministic
+                # wherever it happens inside the batch.
+                image_cost = (ctx.llm.calibrator.cost(seg.llm)
+                              if seg.vision_resolved else 0)
+                costs = [budget_mod.est_text(digest) + budget_mod.DIFF_MAX_TOKENS
+                         + image_cost for digest in digests]
+                spans = _pack_windows(costs, pack_budget, seg.window)
+            else:
+                spans = _window_spans(len(items), seg.window)
+            for span in spans:
                 jobs_meta.append((sid, span))
-                jobs.append(self._run_window(frames, ctx, sid, span))
+                jobs.append(self._run_window(records, digests, ctx, sid, span,
+                                             degrade=budget_on))
 
         outcomes: dict[str, list[tuple[tuple[int, int], object]]] = {}
         if jobs:
             results = await asyncio.gather(*jobs)
             for (sid, span), result in zip(jobs_meta, results):
-                outcomes.setdefault(sid, []).append((span, result))
+                bucket = outcomes.setdefault(sid, [])
+                if isinstance(result, BaseException):
+                    bucket.append((span, result))
+                else:
+                    bucket.extend(result)          # V20 leaf results, span order
 
         # Phase 2: synchronous, deterministic per-session pass in batch order.
         for sid, items in sessions.items():
@@ -295,8 +485,7 @@ class SegmentStage:
                         if isinstance(result, BaseException)]
             if failures:
                 self._dispose_failed(batch, ctx, sid, items, split=split,
-                                     windows_failed=len(failures),
-                                     message=str(failures[0]))
+                                     failures=failures)
                 continue
             rel: list[str | None] = [None] * len(items)
             for (start, end), verdicts in outcomes[sid]:
@@ -306,13 +495,29 @@ class SegmentStage:
             self._assemble(batch, ctx, sid, items, rel, split=split)
         return batch                               # the SAME list object (②b)
 
-    async def _run_window(self, frames: list[Record], ctx: "RunContext",
-                          sid: str, span: tuple[int, int]):
-        """One window call with per-window error capture: only the big three
-        escape (contract ④ — everything else becomes the session-level
-        on_error disposition, S26)."""
+    async def _run_window(self, records: list[Record], digests: list[str],
+                          ctx: "RunContext", sid: str, span: tuple[int, int],
+                          *, degrade: bool):
+        """One original window with per-window error capture: only the big
+        three escape (contract ④ — everything else becomes the session-level
+        on_error disposition, S26). ``records``/``digests`` are the SESSION
+        vectors — sub-spans slice them, so V20 splits re-dispatch without
+        re-digesting. Returns the leaf results [(sub-span, verdicts), ...] or
+        the failure exception. ``degrade`` = budget on (V20's split-retry is a
+        budget-mode reaction; budget-off overflow signals — the unconditional
+        200-shaped oracle — take the plain failure path below and classify in
+        _dispose_failed). Every actually dispatched window, split sub-windows
+        included, counts segment.windows (V13④)."""
+        async def judge(sub: tuple[int, int]) -> list[str]:
+            ctx.metrics.count(_COUNTER_WINDOWS)
+            return await _judge_window(records[sub[0]:sub[1]], ctx,
+                                       session_id=sid, span=sub,
+                                       digests=digests[sub[0]:sub[1]])
+
         try:
-            return await _judge_window(frames, ctx, session_id=sid, span=span)
+            if degrade:
+                return await _judge_span_degrading(judge, span, ctx)
+            return [(span, await judge(span))]
         except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
             raise
         except Exception as e:  # noqa: BLE001 — record-level isolation is absolute
@@ -320,13 +525,24 @@ class SegmentStage:
 
     def _dispose_failed(self, batch: list[PipelineItem], ctx: "RunContext",
                         sid: str, items: list[PipelineItem], *, split: bool,
-                        windows_failed: int, message: str) -> None:
-        """segmentation_invalid two-form disposition (spec 3.14.6). "keep"
-        (default): the session abandons ALL window verdicts and survives as ONE
-        whole episode — evidence triple = duck-typed segment_degraded (→
+                        failures: list[BaseException]) -> None:
+        """Two-form window-failure disposition (spec 3.14.6). "keep" (default):
+        the session abandons ALL window verdicts and survives as ONE whole
+        episode — evidence triple = duck-typed segment_degraded (→
         _meta.stream.degraded) + error event + segment.failures counter, never
-        item.errors (S26). "fail": every session member fails → rejects."""
-        kind = ErrorKind.SEGMENTATION_INVALID.value
+        item.errors (S26). "fail": every session member fails → rejects.
+        v1.11 (V27①): the kind routes through budget.classify_stage_error
+        FIRST — ContextOverflowError → "context_overflow" (counted into
+        report.budget.overflow_records at report assembly from rejects),
+        OutputTruncatedError → "output_truncated" — falling back to the
+        existing segmentation_invalid; an imprecise vocabulary here would
+        break the §3.5 attribution. The first failure keys the classification
+        and the message (the pre-v1.11 message semantics)."""
+        first = failures[0]
+        kind = (budget_mod.classify_stage_error(first)
+                or ErrorKind.SEGMENTATION_INVALID.value)
+        windows_failed = len(failures)
+        message = str(first)
         if self.cfg.segment.on_error == "fail":
             error = StageError(stage=self.name, kind=kind, message=message,
                                retryable=False)

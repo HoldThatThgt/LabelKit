@@ -21,12 +21,16 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
+import re
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 from labelkit.common.errors import (
     CircuitBreakerTripped,
+    ContextOverflowError,
     ErrorKind,
+    OutputTruncatedError,
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
@@ -41,10 +45,11 @@ from labelkit.common.contracts.types import (
     frame_digest,
 )
 
+from labelkit.common.runtime import budget
 from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
 
 if TYPE_CHECKING:
-    from labelkit.common.config.model import ResolvedConfig
+    from labelkit.common.config.model import LLMProfile, ResolvedConfig
     from labelkit.common.contracts.stage import RunContext
 
 
@@ -159,12 +164,86 @@ def _dumps(obj: object) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
+# ── v1.11 context-budget packing (spec 3.5.2 上下文预算装填与修复升级换档) ────
+
+_TREE_MARKER_RE = re.compile(r"^…\(truncated (\d+) nodes\)$")
+
+
+@dataclass
+class _PackState:
+    """Per-build trim directives for _assemble_prompt (spec 3.5.2 v1.11 段,
+    share order ④): token budgets for the trimmable text blocks — None = that
+    block is not trimmed on this build. The V25③ untrimmable blocks (the repair
+    [上一版标注]/[审核意见] suffix) and the ① static system side (instruction /
+    user schema / few-shot) never appear here — they are COUNTED by the packer,
+    never cut."""
+    step_budget: int | None = None     # [动作序列] body (edges trim, §3.3⑤)
+    digest_budget: int | None = None   # [成员帧摘要] body (edges trim — same family)
+    tree_budget: int | None = None     # single-record UI tree render (§3.3③)
+    truncations: int = 0
+
+
+def _feed_reactive_terminal(exc: BaseException, metrics) -> None:
+    """A7/§7.8 breaker matrix: ONLY the reactive-400 (body-sniff) overflow
+    terminal feeds the fatal streak — exactly once per exception object (the
+    duck flag guards double-feeds when one exception crosses operators, e.g.
+    the M7→M5 repair chain); precheck and the 200-shaped finish oracle never
+    feed. ``origin`` is read defensively pending the errors.py revision
+    (default "http_400")."""
+    if (isinstance(exc, ContextOverflowError) and exc.phase == "reactive"
+            and getattr(exc, "origin", "http_400") == "http_400"
+            and not getattr(exc, "_breaker_fed", False)):
+        exc._breaker_fed = True  # type: ignore[attr-defined]
+        metrics.record_provider_result(fatal=True)
+
+
+def _fit_tree_text(rendered: str, budget_tokens: int) -> tuple[str, bool]:
+    """§3.3③ dynamic cap on a serialized UI tree: the render (already under the
+    absolute input.ui_tree_max_chars cap) is re-checked with est_text; over the
+    share, trailing NODE lines are dropped and the serialize-family marker
+    "…(truncated N nodes)" closes the text — N accumulates onto an existing
+    marker's count. est_text is prefix-monotone ⇒ bisection. Returns
+    (text, trimmed)."""
+    if budget.est_text(rendered) <= budget_tokens:
+        return rendered, False
+    lines = rendered.split("\n")
+    base = 0
+    m = _TREE_MARKER_RE.match(lines[-1])
+    if m is not None:
+        base = int(m.group(1))
+        lines = lines[:-1]
+    total = len(lines)
+
+    def candidate(keep: int) -> str:
+        marker = f"…(truncated {base + total - keep} nodes)"
+        return "\n".join(lines[:keep] + [marker])
+
+    lo, hi = 0, total - 1                        # keep == total is known not to fit
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if budget.est_text(candidate(mid)) <= budget_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    return candidate(lo), True
+
+
+def _fit_block(body: str, share: int | None) -> tuple[str, int]:
+    """One §3.3⑤ edges trim: first/last lines kept, whole middle lines out,
+    in-place "…(truncated N lines)" marker. Returns (body', trims)."""
+    if share is None or budget.est_text(body) <= share:
+        return body, 0
+    return budget.fit_text(body, max(0, share), keep="edges"), 1
+
+
 def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: str,
                           repair: RepairContext | None = None,
                           temperature: float | None = None,
                           label: str | None = None,
                           transitions: tuple[Transition, ...] | None = None,
-                          fragment_lens: tuple[int, ...] | None = None) -> PromptBundle:
+                          fragment_lens: tuple[int, ...] | None = None,
+                          k_eff: int | None = None,
+                          image_px: int | None = None) -> PromptBundle:
     """Deterministic template assembly per CONTRACTS.md §10.1 (+ §10.5 repair suffix).
 
     schema_text = SchemaEngine.user_schema_text. Section order is fixed: system (task
@@ -182,7 +261,32 @@ def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: st
     v1.9 (T14, THIRD additive trailing kwarg — the S5 form): fragment_lens non-None →
     the ② keyframe downsample runs per-fragment quotas (every fragment keeps ≥ 1
     keyframe); None = the v1.8 uniform downsample byte-identical.
+    v1.11 (V21 ladder / F3, FOURTH additive trailing-kwarg revision — CONTRACTS §7.4):
+    k_eff non-None → EFFECTIVE KEYFRAME CAP — the ② downsample runs with
+    k = min(annotate.sequence_frames, k_eff) (carrier of the V20 frame-halving retry
+    and the V21 repair-ladder k → max(2, ⌈k/2⌉); per-fragment quotas degrade per the
+    existing T14 rule when the quota becomes infeasible); image_px non-None →
+    ESCALATED RESOLUTION, carried into PromptBundle.image_px (V23① — the M9 builder
+    computes effective px = image_px or profile.default_image_px or
+    profile.max_image_px, clamped to min(·, max_image_px)); None/None = pre-v1.11
+    behavior byte-identical. The budget packing itself enters through the private
+    assembler's trailing ``fit`` parameter (annotate_record), never here.
     """
+    return _assemble_prompt(record, cfg, schema_text, repair, temperature, label,
+                            transitions, fragment_lens, k_eff, image_px)
+
+
+def _assemble_prompt(record: Record, cfg: "ResolvedConfig", schema_text: str,
+                     repair: RepairContext | None, temperature: float | None,
+                     label: str | None,
+                     transitions: tuple[Transition, ...] | None,
+                     fragment_lens: tuple[int, ...] | None,
+                     k_eff: int | None, image_px: int | None,
+                     fit: _PackState | None = None) -> PromptBundle:
+    """The §10.1 assembly body; ``fit`` non-None applies the spec 3.5.2 v1.11 ④
+    text-block trims (steps/digests edges, single-record tree dynamic cap) —
+    directives computed by _pack_prompt, which owns the share ordering. fit=None
+    is the byte-identical pre-pack path (budget off, or a build that fits)."""
     acfg = cfg.class_views[label].annotate if label is not None else cfg.annotate
     messages: list[Message] = []
 
@@ -196,14 +300,23 @@ def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: st
                         f"{_LABEL_EXAMPLE_OUT} {_dumps(example.output)}")
         messages.append(Message(role="user", parts=(Part(kind="text", text=example_text),)))
 
+    k_cap = cfg.annotate.sequence_frames
+    if k_eff is not None:
+        # External cap, min-ed with the config value (§7.4); floored at the V10
+        # minimal unit of 2 — every sanctioned carrier (V20 halving, V21 ladder,
+        # §3.3⑥③ packing) floors there already, and k=1 has no downsample form.
+        k_cap = min(k_cap, max(2, k_eff))
+
     if record.kind == "sequence":  # v1.8 sequence variant (checked BEFORE modality)
         seq_parts: list[Part] = []
         if transitions is not None:  # ① omitted entirely when transitions is None
             steps = "\n".join(_step_line(t) for t in transitions)
+            if fit is not None:
+                steps, trims = _fit_block(steps, fit.step_budget)
+                fit.truncations += trims
             seq_parts.append(Part(kind="text", text=f"{_LABEL_ACTION_SEQUENCE}\n{steps}"))
         if record.modality == "ui":  # ② text sequences degrade to ① + ③
-            kept = _keyframe_indexes(len(record.members),
-                                     cfg.annotate.sequence_frames, fragment_lens)
+            kept = _keyframe_indexes(len(record.members), k_cap, fragment_lens)
             k = len(kept)
             for i, m_idx in enumerate(kept, start=1):
                 member = record.members[m_idx]
@@ -212,6 +325,9 @@ def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: st
                 seq_parts.append(Part(kind="image", image=member.image))
         digests = "\n".join(
             _member_digest_lines(record.members, cfg.input.ui_tree_max_chars))
+        if fit is not None:
+            digests, trims = _fit_block(digests, fit.digest_budget)
+            fit.truncations += trims
         seq_parts.append(Part(kind="text", text=f"{_LABEL_MEMBER_DIGESTS}\n{digests}"))
         parts: tuple[Part, ...] = tuple(seq_parts)
     elif record.modality == "text":
@@ -220,6 +336,10 @@ def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: st
         )
     else:  # UI modality: three parts in one user message
         tree_text = record.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars)
+        if fit is not None and fit.tree_budget is not None:
+            tree_text, trimmed = _fit_tree_text(tree_text, max(0, fit.tree_budget))
+            if trimmed:
+                fit.truncations += 1
         parts = (
             Part(kind="text", text=_LABEL_SCREENSHOT),
             Part(kind="image", image=record.image),
@@ -227,6 +347,8 @@ def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: st
         )
 
     if repair is not None:
+        # V25③: the repair suffix is a per-record semantic asset — COUNTED into
+        # the est by the packer, NEVER trimmed (appended after all trims).
         suffix = (f"{_LABEL_PREV_OUTPUT} {_dumps(repair.previous_output)}\n"
                   f"{_LABEL_CRITIQUES} {repair.critiques_text}\n"
                   f"{_REPAIR_TAIL}")
@@ -234,7 +356,179 @@ def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: st
         parts = parts[:-1] + (Part(kind="text", text=f"{last.text}\n{suffix}"),)
 
     messages.append(Message(role="user", parts=parts))
-    return PromptBundle(messages=tuple(messages), temperature=temperature)
+    return PromptBundle(messages=tuple(messages), temperature=temperature,
+                        image_px=image_px)
+
+
+# ── v1.11 packing driver (spec 3.5.2 v1.11 段, deterministic share order) ────
+
+def _image_unit_cost(prof: "LLMProfile", ctx: "RunContext",
+                     image_px: int | None) -> int:
+    """Per-image est for the packing: the batch-frozen calibrated readout at the
+    working point; a V21-escalated px additionally floors at the provider prior
+    @ that px × PRIOR_INFLATION (the calibrator knows only the working point —
+    the max keeps the escalated est honest and errs conservative)."""
+    cost = ctx.llm.calibrator.cost(prof.name)
+    if image_px is not None:
+        cost = max(cost, math.ceil(budget.est_image_prior(prof, image_px)
+                                   * budget.PRIOR_INFLATION))
+    return cost
+
+
+def _prompt_text_est(bundle: PromptBundle, schema_est: int) -> tuple[int, int]:
+    """(text-side est, image count) of an assembled bundle — the est_prompt
+    formula at image_cost=0 (identical accounting to the M9 throat)."""
+    return (budget.est_prompt(bundle, None, None, image_cost=0) + schema_est,
+            sum(1 for m in bundle.messages for p in m.parts if p.kind == "image"))
+
+
+def _pack_prompt(record: Record, cfg: "ResolvedConfig", ctx: "RunContext",
+                 prof: "LLMProfile", schema_text: str,
+                 repair: RepairContext | None, temperature: float | None,
+                 label: str | None, transitions: tuple[Transition, ...] | None,
+                 fragment_lens: tuple[int, ...] | None,
+                 k_eff: int | None, image_px: int | None
+                 ) -> tuple[PromptBundle, int]:
+    """spec 3.5.2 v1.11 份额定序 (deterministic): ① the static system side
+    (instruction / user schema / few-shot) is COUNTED, never trimmed (V13③ M1
+    precheck territory); ② the text blocks (step lines + member digests; the
+    single-record tree) render at their existing absolute caps and are counted;
+    ③ images eat the remainder — k_eff = min(cap, max(2, ⌊remaining/cost⌋)),
+    first/last keyframes always kept, middle uniformly downsampled (only k
+    shrinks; the T14 per-fragment quotas degrade per their documented rule);
+    ④ k = 2 still over → the text blocks trim (edges; digests — the fallback
+    adjudication evidence — yield LAST); ⑤ still over → V10:
+    ContextOverflowError(phase="precheck") — the record is rejected by the
+    stage layer, the doomed request is never sent. Returns (bundle, k_used —
+    the image count actually packed, 0 when imageless)."""
+    b = budget.input_budget(prof)
+    schema_est = (budget.est_text(json.dumps(cfg.user_schema, ensure_ascii=False))
+                  if prof.supports_structured_output else 0)
+
+    def assemble(k: int | None, fit: _PackState | None) -> PromptBundle:
+        return _assemble_prompt(record, cfg, schema_text, repair, temperature,
+                                label, transitions, fragment_lens, k, image_px,
+                                fit=fit)
+
+    is_ui_sequence = record.kind == "sequence" and record.modality == "ui"
+    # ①② count everything at the requested cap (k_eff already min-ed inside).
+    bundle = assemble(k_eff, None)
+    text_est, n_images = _prompt_text_est(bundle, schema_est)
+    if n_images == 0:
+        if text_est <= b:
+            return bundle, 0
+        k_fin = 0
+        image_cost = 0
+    else:
+        image_cost = _image_unit_cost(prof, ctx, image_px)
+        remaining = b - text_est
+        k_budget = max(2, remaining // image_cost)
+        k_fin = min(n_images, k_budget)
+        if k_fin < n_images:
+            bundle = assemble(k_fin, None)
+            text_est, n_images = _prompt_text_est(bundle, schema_est)
+        if text_est + n_images * image_cost <= b:
+            return bundle, n_images
+
+    # ④ trim the text blocks at the keyframe floor. Shares are derived from the
+    # UNtrimmed block bodies of THIS build: everything outside the two blocks
+    # (incl. the V25③ repair suffix and the single-record labels) is fixed.
+    steps_body = ""
+    if record.kind == "sequence" and transitions is not None:
+        steps_body = "\n".join(_step_line(t) for t in transitions)
+    if record.kind == "sequence":
+        digest_body = "\n".join(
+            _member_digest_lines(record.members, cfg.input.ui_tree_max_chars))
+        # fixed keeps the section headers (they live inside the parts' est);
+        # the shares below are for the block BODIES the ⑤-family trims cut.
+        fixed = (text_est - budget.est_text(steps_body)
+                 - budget.est_text(digest_body))
+        avail = b - fixed - k_fin * image_cost
+        digest_share = min(budget.est_text(digest_body), max(0, avail))
+        step_share = max(0, avail - digest_share)
+        fit = _PackState(step_budget=step_share if transitions is not None else None,
+                         digest_budget=digest_share)
+    elif record.modality == "ui":
+        # §3.3③ single-record family: the tree render is the ONE trimmable slot.
+        tree_body = (record.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars)
+                     if record.ui_tree else "")
+        fixed = text_est - budget.est_text(tree_body)
+        fit = _PackState(tree_budget=b - fixed - k_fin * image_cost)
+    else:
+        # Plain record text is not a trim class (§3.3 vocabulary) → V10.
+        raise ContextOverflowError(
+            "annotation prompt exceeds the input budget at the minimal unit "
+            "(single text record — no trimmable block)", phase="precheck",
+            profile=prof.name)
+
+    bundle = assemble(k_fin if is_ui_sequence else k_eff, fit)
+    if fit.truncations:
+        ctx.metrics.count("budget.truncations.annotate", fit.truncations)
+    text_est, n_images = _prompt_text_est(bundle, schema_est)
+    if text_est + n_images * image_cost > b:
+        # ⑤ every trimmable share exhausted and the untrimmable floor (static
+        # side + V25③ suffix + 2 keyframes) still exceeds the budget → V10.
+        raise ContextOverflowError(
+            "annotation prompt exceeds the input budget at the minimal unit "
+            f"(k={n_images}, text floor untrimmable)", phase="precheck",
+            profile=prof.name)
+    return bundle, n_images
+
+
+async def _budgeted_call(record: Record, ctx: "RunContext",
+                         schema_text: str, repair: RepairContext | None,
+                         temperature: float | None, label: str | None,
+                         transitions: tuple[Transition, ...] | None,
+                         fragment_lens: tuple[int, ...] | None,
+                         k_eff: int | None, image_px: int | None
+                         ) -> tuple[dict, Usage, int, str]:
+    """One annotation call through the M8 guarantee. Budget-declared profile →
+    the §3.3⑥ packing above plus the V20 reactive degrade — keyframes halve
+    (k → max(2, ⌈k/2⌉), ≤ 2 degrades, budget.degrade_retries counted) and the
+    terminal follows the §3.5 matrix (reactive-400 feeds the breaker exactly
+    once). Budget off (cw == 0) → the pre-v1.11 build/call path byte-identically
+    (the finish-oracle overflow can still surface; it propagates unfed)."""
+    cfg = ctx.cfg
+    profile = cfg.annotate.llm
+    prof = cfg.llm_profiles.get(profile)
+    if prof is None or prof.context_window <= 0:
+        prompt = build_annotate_prompt(record, cfg, schema_text, repair=repair,
+                                       temperature=temperature, label=label,
+                                       transitions=transitions,
+                                       fragment_lens=fragment_lens,
+                                       k_eff=k_eff, image_px=image_px)
+        return await ctx.schema_engine.complete_validated(
+            profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
+            record=record.raw)
+
+    k_current = k_eff
+    degrades = 0
+    pending: ContextOverflowError | None = None
+    while True:
+        try:
+            prompt, k_used = _pack_prompt(record, cfg, ctx, prof, schema_text,
+                                          repair, temperature, label, transitions,
+                                          fragment_lens, k_current, image_px)
+        except ContextOverflowError:
+            # V10 from the packer: the reactive overflow (if any) that drove the
+            # degrade settles its terminal here (A7); the precheck raise itself
+            # never feeds.
+            if pending is not None:
+                _feed_reactive_terminal(pending, ctx.metrics)
+            raise
+        try:
+            return await ctx.schema_engine.complete_validated(
+                profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
+                record=record.raw)
+        except ContextOverflowError as exc:
+            if k_used > 2 and degrades < 2:
+                degrades += 1
+                pending = exc
+                ctx.metrics.count("budget.degrade_retries")
+                k_current = max(2, math.ceil(k_used / 2))   # V20 frame halving
+                continue
+            _feed_reactive_terminal(exc, ctx.metrics)
+            raise
 
 
 # ── self-consistency field-level majority vote (spec 3.5.2) ─────────────────
@@ -339,7 +633,9 @@ async def annotate_record(record: Record, ctx: "RunContext",
                           repair: RepairContext | None = None,
                           label: str | None = None,
                           transitions: tuple[Transition, ...] | None = None,
-                          fragment_lens: tuple[int, ...] | None = None) -> Annotation:
+                          fragment_lens: tuple[int, ...] | None = None,
+                          k_eff: int | None = None,
+                          image_px: int | None = None) -> Annotation:
     """One record's full annotation path incl. self-consistency (skipped when repair is
     not None: repair re-annotation is always a single call at profile-default temperature).
     Raises SchemaViolation / ProviderRetryableError / ProviderFatalError.
@@ -352,32 +648,29 @@ async def annotate_record(record: Record, ctx: "RunContext",
     record=None (documented limitation).
     v1.9 (T14, third additive trailing kwarg): fragment_lens is passed through on every
     path the same way — both call sites (M5 main, M7 repair re-annotation) thread it
-    from the M16 stitch_fragments duck mark; None = pre-v1.9 behavior."""
+    from the M16 stitch_fragments duck mark; None = pre-v1.9 behavior.
+    v1.11 (V21 ladder / F3, additive trailing kwargs — CONTRACTS §7.4): the M7 repair
+    driver passes the quality-ladder step on verify-fail re-annotation (k_eff = the
+    keyframe cap halved to max(2, ⌈k/2⌉), image_px = one rung up at 1.5×/dim ≤
+    max_image_px, budget re-checked by M7 against the calibrated estimate); M5's own
+    V20 overflow degrade passes k_eff alone (inside _budgeted_call). Both ride
+    build_annotate_prompt on EVERY path — None/None = pre-v1.11 byte-identical."""
     cfg = ctx.cfg
-    profile = cfg.annotate.llm
     schema_text = ctx.schema_engine.user_schema_text
     n = cfg.annotate.self_consistency
 
     if repair is not None or n == 0:
-        prompt = build_annotate_prompt(record, cfg, schema_text, repair=repair,
-                                       temperature=None, label=label,
-                                       transitions=transitions,
-                                       fragment_lens=fragment_lens)
-        obj, usage, attempts, model = await ctx.schema_engine.complete_validated(
-            profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
-            record=record.raw)
+        obj, usage, attempts, model = await _budgeted_call(
+            record, ctx, schema_text, repair, None, label, transitions,
+            fragment_lens, k_eff, image_px)
         return Annotation(output=obj, model=model, attempts=attempts, usage=usage)
 
     # Self-consistency: n independent samples at sc_temperature, each through the full
     # M8 guarantee; a SchemaViolation sample abstains (denominator stays n).
     async def one_sample() -> tuple[dict, Usage, int, str]:
-        prompt = build_annotate_prompt(record, cfg, schema_text, repair=None,
-                                       temperature=cfg.annotate.sc_temperature,
-                                       label=label, transitions=transitions,
-                                       fragment_lens=fragment_lens)
-        return await ctx.schema_engine.complete_validated(
-            profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
-            record=record.raw)
+        return await _budgeted_call(
+            record, ctx, schema_text, None, cfg.annotate.sc_temperature, label,
+            transitions, fragment_lens, k_eff, image_px)
 
     results = await asyncio.gather(*(one_sample() for _ in range(n)),
                                    return_exceptions=True)
@@ -441,6 +734,12 @@ class AnnotateStage:
             kind = (ErrorKind.CALLBACK_VIOLATION if getattr(e, "callback_only", False)
                     else ErrorKind.SCHEMA_VIOLATION)
             self._fail(item, ctx, kind.value, str(e), retryable=False)
+        except (ContextOverflowError, OutputTruncatedError) as e:
+            # v1.11 (V27①): the budget vocabulary routes FIRST — precise kinds,
+            # record-level failed → rejects. Terminal breaker feeds already
+            # happened inside _budgeted_call (A7 — duck-flag idempotent).
+            self._fail(item, ctx, budget.classify_stage_error(e), str(e),
+                       retryable=False)
         except ProviderRetryableError as e:
             self._fail(item, ctx, ErrorKind.PROVIDER_RETRYABLE_EXHAUSTED.value, str(e),
                        retryable=True)
@@ -485,6 +784,8 @@ class AnnotateStage:
         err = StageError(stage=self.name, kind=kind, message=message, retryable=retryable)
         item.errors.append(err)
         item.status = "failed"
+        if kind == ErrorKind.CONTEXT_OVERFLOW.value:
+            ctx.metrics.count("budget.overflow_records")  # V13②: rejected, all phases
         ctx.metrics.event(EV_ERROR, stage=self.name, batch_no=ctx.batch_no,
                           record_ids=(item.record.id,),
                           payload={"stage": self.name, "kind": kind,

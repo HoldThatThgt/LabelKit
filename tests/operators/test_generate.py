@@ -863,3 +863,127 @@ def test_generate_all_flat_path_ignores_classes():
     for key in metrics.counters:
         if key.startswith("generate.buckets."):
             assert key.split(".")[2].count("×") == 1  # two-segment keys
+
+
+# ── v1.11 seed packing (spec 3.6.2 上下文预算装填 row / §3.3⑦, V27①) ─────────
+
+def _budget_profile(context_window: int, name: str = "default"):
+    from labelkit.common.config.model import LLMProfile
+    return LLMProfile(name=name, provider="openai_compatible", base_url="http://x",
+                      model="m", api_key_env="K", max_output_tokens=256,
+                      context_window=context_window)
+
+
+def _budget_cfg(context_window: int, generate: GenerateConfig | None = None,
+                **kw) -> ResolvedConfig:
+    import dataclasses
+    cfg = mk_cfg(generate=generate, **kw)
+    return dataclasses.replace(
+        cfg, llm_profiles={"default": _budget_profile(context_window)})
+
+
+LONG_SEEDS = [(f"id{i}", f"种子{i}" + "字" * 100) for i in range(4)]
+
+
+def _seed_plan(seeds=None, llm="default") -> CallPlan:
+    seeds = LONG_SEEDS if seeds is None else seeds
+    return CallPlan(index=0, llm=llm, style_name=None, style_prompt=None,
+                    seed_ids=tuple(sid for sid, _ in seeds),
+                    seed_texts=tuple(text for _, text in seeds))
+
+
+def test_fit_plan_seeds_tail_drop_deterministic():
+    from labelkit.common.runtime import budget as budget_mod
+    from labelkit.operators.generate import _fit_plan_seeds
+
+    cfg = _budget_cfg(700)
+    fitted, truncated, unfittable = _fit_plan_seeds(_seed_plan(), cfg)
+    assert not unfittable and truncated
+    kept = len(fitted.seed_texts)
+    assert 1 <= kept < 4
+    # tail drop: the kept seeds are exactly the PREFIX of the drawn order,
+    # ids stay positionally aligned with texts
+    assert fitted.seed_texts == _seed_plan().seed_texts[:kept]
+    assert fitted.seed_ids == _seed_plan().seed_ids[:kept]
+    # the fitted prompt honours the budget; one more seed would not
+    g, prof = cfg.generate, cfg.llm_profiles["default"]
+
+    def est_for(texts):
+        s, u = render_prompt_texts(g.instruction, None, g.num_per_call, texts)
+        return (budget_mod.est_text(s) + budget_mod.est_text(u)
+                + 2 * budget_mod.MSG_OVERHEAD_TOKENS)
+
+    assert est_for(fitted.seed_texts) <= budget_mod.input_budget(prof)
+    assert est_for(_seed_plan().seed_texts[:kept + 1]) > budget_mod.input_budget(prof)
+    # deterministic: same inputs → identical trim
+    again, _, _ = _fit_plan_seeds(_seed_plan(), cfg)
+    assert again == fitted
+
+
+def test_fit_plan_seeds_budget_off_and_fitting_identity():
+    from labelkit.operators.generate import _fit_plan_seeds
+
+    # cw == 0 → byte-identical pass-through (dead code anchor)
+    plan = _seed_plan()
+    assert _fit_plan_seeds(plan, _budget_cfg(0)) == (plan, False, False)
+    # unknown profile (llms mixture pointing elsewhere) → pass-through
+    assert _fit_plan_seeds(_seed_plan(llm="other"), _budget_cfg(700)) == (
+        _seed_plan(llm="other"), False, False)
+    # roomy window → untouched plan, no truncation
+    assert _fit_plan_seeds(plan, _budget_cfg(100_000)) == (plan, False, False)
+
+
+def test_fit_plan_seeds_unfittable_at_one_seed():
+    from labelkit.operators.generate import _fit_plan_seeds
+
+    # cw=530 → input_budget = 530 − 256 − 256 = 18: not even one 100-char seed fits
+    fitted, truncated, unfittable = _fit_plan_seeds(_seed_plan(), _budget_cfg(530))
+    assert unfittable and not truncated
+    assert fitted == _seed_plan()                       # plan untouched (call voided whole)
+
+
+def test_stage_trims_seeds_and_counts_truncations():
+    # Stage-level: the dispatched prompt carries only the fitted seed prefix and
+    # the produced records inherit the TRIMMED provenance (generated_from).
+    g = GenerateConfig(enabled=True, instruction="gen", seeds_per_call=4,
+                       num_per_record=4, num_per_call=4)
+    cfg = _budget_cfg(700, generate=g, quality=QualityConfig(threshold=0.5))
+    batch = [mk_item(f"id{i}", f"种子{i}" + "字" * 100, 0.9) for i in range(4)]
+    items, engine, metrics = run_stage(cfg, batch)
+    assert metrics.counters["budget.truncations.generate"] >= 1
+    for _, _, user, _ in engine.calls:
+        n_seed_lines = sum(1 for line in user.split("\n")
+                           if line.startswith("[种子示例 "))
+        assert 1 <= n_seed_lines < 4                # tail-dropped below the cap
+    for item in items:
+        assert 1 <= len(item.record.ref.generated_from) < 4
+
+
+def test_stage_unfittable_call_voided_with_context_overflow_kind(caplog):
+    import logging
+
+    g = GenerateConfig(enabled=True, instruction="gen", seeds_per_call=4,
+                       num_per_record=4, num_per_call=4)
+    cfg = _budget_cfg(530, generate=g, quality=QualityConfig(threshold=0.5))
+    batch = [mk_item(f"id{i}", f"种子{i}" + "字" * 100, 0.9) for i in range(4)]
+    with caplog.at_level(logging.WARNING, logger="labelkit.generate"):
+        items, engine, metrics = run_stage(cfg, batch)
+    assert items == []                             # every call voided, no records
+    assert engine.calls == []                      # doomed requests never sent
+    # existing void semantics: bucket calls counted, produced 0, precise kind
+    assert metrics.counters["generate.buckets.default×null.calls"] == 4
+    assert "generate.buckets.default×null.produced" not in metrics.counters
+    assert "budget.truncations.generate" not in metrics.counters
+    assert any("kind=context_overflow" in r.message for r in caplog.records)
+
+
+def test_error_kind_routes_budget_vocabulary_first():
+    from labelkit.common.errors import ContextOverflowError, OutputTruncatedError
+    from labelkit.operators.generate import _error_kind
+
+    assert _error_kind(ContextOverflowError("x", phase="reactive")) == "context_overflow"
+    assert _error_kind(OutputTruncatedError("x")) == "output_truncated"
+    assert _error_kind(SchemaViolation(["v"], "raw")) == "schema_violation"
+    # the void stderr line carries the precise kind (V27①)
+    msg = void_log_message(_seed_plan(), ContextOverflowError("x", phase="precheck"))
+    assert "kind=context_overflow" in msg

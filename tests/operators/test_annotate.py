@@ -952,3 +952,235 @@ def test_single_record_transitions_default_none_regression():
     ui_rec = ui_record()
     assert (build_annotate_prompt(ui_rec, ui_cfg, SCHEMA_TEXT)
             == build_annotate_prompt(ui_rec, ui_cfg, SCHEMA_TEXT, transitions=None))
+
+
+# ── v1.11 context-budget packing (spec 3.5.2 v1.11 段, §3.3⑥/V20/V27①) ───────
+
+import asyncio as _asyncio
+from dataclasses import replace as _dc_replace
+from types import SimpleNamespace as _NS
+
+from labelkit.common.errors import ContextOverflowError, OutputTruncatedError
+from labelkit.common.runtime import budget as budget_mod
+
+
+def _budget_profile(context_window: int, name: str = "default"):
+    from labelkit.common.config.model import LLMProfile
+    return LLMProfile(name=name, provider="openai_compatible", base_url="http://x",
+                      model="m", api_key_env="K", max_output_tokens=256,
+                      context_window=context_window)
+
+
+def budget_cfg(context_window: int, **kw) -> ResolvedConfig:
+    return _dc_replace(make_cfg(**kw),
+                       llm_profiles={"default": _budget_profile(context_window)})
+
+
+class _FixedCalibrator:
+    def __init__(self, value: int):
+        self.value = value
+
+    def cost(self, profile: str) -> int:
+        return self.value
+
+
+class _BudgetMetrics:
+    def __init__(self):
+        self.counters: dict[str, int] = {}
+        self.events: list = []
+        self.fed: list = []
+
+    def count(self, key, n=1):
+        self.counters[key] = self.counters.get(key, 0) + n
+
+    def event(self, ev, **kw):
+        self.events.append((ev, dict(kw.get("payload") or {})))
+
+    def record_provider_result(self, fatal, *, hard=False):
+        self.fed.append(fatal)
+
+
+def budget_ctx(cfg, engine, image_cost: int = 300) -> _NS:
+    return _NS(cfg=cfg, llm=_NS(calibrator=_FixedCalibrator(image_cost)),
+               schema_engine=engine, metrics=_BudgetMetrics(), batch_no=1)
+
+
+class _PromptEngine:
+    """Captures prompts; optionally raises fresh reactive overflows first."""
+    user_schema_text = SCHEMA_TEXT
+
+    def __init__(self, n_overflows: int = 0):
+        self.prompts = []
+        self.n_overflows = n_overflows
+
+    async def complete_validated(self, profile, prompt, *, record_ids, batch_no,
+                                 record=None):
+        from labelkit.common.contracts.types import Usage
+        self.prompts.append(prompt)
+        if self.n_overflows > 0:
+            self.n_overflows -= 1
+            raise ContextOverflowError("provider overflow", phase="reactive")
+        return ({"intent": "qa", "topic": "t", "difficulty": "easy"},
+                Usage(1, 1), 1, "m")
+
+
+def _images(prompt) -> list:
+    return [p.image for p in prompt.messages[-1].parts if p.kind == "image"]
+
+
+def test_build_prompt_k_eff_caps_below_config_first_last_kept():
+    cfg = make_cfg(modality="ui", sequence_frames=20)
+    ep = ui_episode(25)
+    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT, k_eff=6)
+    kept = _keyframe_indexes(25, 6)
+    assert [p for p in _images(bundle)] == [ep.members[m].image for m in kept]
+    assert kept[0] == 0 and kept[-1] == 24         # first/last invariant
+    # min with the config value: k_eff above the config cap is inert
+    assert build_annotate_prompt(ep, cfg, SCHEMA_TEXT, k_eff=99) == (
+        build_annotate_prompt(ep, cfg, SCHEMA_TEXT))
+
+
+def test_build_prompt_image_px_rides_bundle():
+    cfg = make_cfg(modality="ui")
+    ep = ui_episode(3)
+    assert build_annotate_prompt(ep, cfg, SCHEMA_TEXT).image_px is None
+    assert build_annotate_prompt(ep, cfg, SCHEMA_TEXT, image_px=1536).image_px == 1536
+
+
+def test_build_prompt_none_none_byte_identical():
+    # None/None = pre-v1.11 byte-identical (frozen-signature anchor).
+    cfg = make_cfg(modality="ui")
+    ep = ui_episode(25)
+    assert build_annotate_prompt(ep, cfg, SCHEMA_TEXT, transitions=SEQ_TRANSITIONS) == \
+        build_annotate_prompt(ep, cfg, SCHEMA_TEXT, transitions=SEQ_TRANSITIONS,
+                              k_eff=None, image_px=None)
+
+
+def test_budget_k_eff_layer_images_eat_remainder():
+    # §3.3⑥③: images eat what the counted static+text side leaves —
+    # k_eff = min(cap, max(2, ⌊remaining/cost⌋)), first/last always kept.
+    cfg = budget_cfg(4096, modality="ui", sequence_frames=20)
+    ep = ui_episode(25)
+    engine = _PromptEngine()
+    ctx = budget_ctx(cfg, engine, image_cost=300)
+    ann = _asyncio.run(annotate_record(ep, ctx))
+    assert ann is not None
+    (prompt,) = engine.prompts
+    images = _images(prompt)
+    assert 2 <= len(images) < 20                   # shrunk below the config cap
+    assert images[0] is ep.members[0].image        # first member kept
+    assert images[-1] is ep.members[24].image      # last member kept
+    prof = cfg.llm_profiles["default"]
+    est = budget_mod.est_prompt(prompt, prof, None, image_cost=300)
+    assert est <= budget_mod.input_budget(prof)    # throat invariant honoured
+
+    # determinism: identical re-run → identical prompt and k
+    engine2 = _PromptEngine()
+    _asyncio.run(annotate_record(ui_episode(25), budget_ctx(cfg, engine2,
+                                                            image_cost=300)))
+    assert engine2.prompts[0] == prompt
+
+
+def test_budget_k_floor_then_text_blocks_trim():
+    # §3.3⑥④: at the k=2 floor the text blocks trim (edges) — digests are the
+    # last to yield; the assembled prompt then fits.
+    cfg = budget_cfg(2000, modality="ui", sequence_frames=20)
+    ep = ui_episode(25)
+    engine = _PromptEngine()
+    ctx = budget_ctx(cfg, engine, image_cost=500)
+    _asyncio.run(annotate_record(ep, ctx))
+    (prompt,) = engine.prompts
+    assert len(_images(prompt)) == 2               # keyframe floor
+    digest_part = prompt.messages[-1].parts[-1].text
+    assert "…(truncated " in digest_part           # §3.3⑤ edges marker in place
+    assert ctx.metrics.counters["budget.truncations.annotate"] >= 1
+    prof = cfg.llm_profiles["default"]
+    assert budget_mod.est_prompt(prompt, prof, None, image_cost=500) <= \
+        budget_mod.input_budget(prof)
+
+
+def test_budget_minimal_unit_unfittable_fails_record():
+    # V10: a plain text record has no trimmable block — unfittable rejects the
+    # record (kind=context_overflow, budget.overflow_records) with NO request.
+    cfg = budget_cfg(600)                          # input_budget = 88
+    from labelkit.common.contracts.types import PipelineItem
+    item = PipelineItem(record=text_record("长" * 800))
+    engine = _PromptEngine()
+    ctx = budget_ctx(cfg, engine)
+    _asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
+    assert engine.prompts == []                    # doomed request never sent
+    assert item.status == "failed"
+    assert item.errors[0].kind == "context_overflow"
+    assert ctx.metrics.counters["budget.overflow_records"] == 1
+
+
+def test_v20_reactive_degrade_halves_keyframes():
+    cfg = budget_cfg(8192, modality="ui", sequence_frames=8)
+    ep = ui_episode(25)
+    engine = _PromptEngine(n_overflows=1)
+    ctx = budget_ctx(cfg, engine, image_cost=100)
+    _asyncio.run(annotate_record(ep, ctx))
+    assert len(engine.prompts) == 2
+    k1 = len(_images(engine.prompts[0]))
+    k2 = len(_images(engine.prompts[1]))
+    assert k1 == 8                                 # roomy budget: config cap
+    assert k2 == max(2, -(-k1 // 2))               # V20: k → max(2, ⌈k/2⌉)
+    assert ctx.metrics.counters["budget.degrade_retries"] == 1
+    assert ctx.metrics.fed == []                   # successful degrade: no feed
+
+
+def test_v20_degrades_bounded_then_terminal_feeds_once():
+    cfg = budget_cfg(8192, modality="ui", sequence_frames=8)
+    ep = ui_episode(25)
+    engine = _PromptEngine(n_overflows=99)         # never recovers
+    ctx = budget_ctx(cfg, engine, image_cost=100)
+    from labelkit.common.contracts.types import PipelineItem
+    item = PipelineItem(record=ep)
+    _asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
+    assert len(engine.prompts) == 3                # initial + 2 bounded degrades
+    assert [len(_images(p)) for p in engine.prompts] == [8, 4, 2]
+    assert ctx.metrics.counters["budget.degrade_retries"] == 2
+    assert ctx.metrics.fed == [True]               # A7: reactive-400 fed ONCE
+    assert item.status == "failed"
+    assert item.errors[0].kind == "context_overflow"
+    assert ctx.metrics.counters["budget.overflow_records"] == 1
+
+
+def test_budget_off_no_degrade_and_precise_kinds():
+    # cw == 0: the packing/degrade machinery is dead code — a finish-oracle
+    # overflow propagates once, unfed, with the precise kind at the stage.
+    cfg = make_cfg()                               # llm_profiles={} → budget off
+
+    class _Overflowing:
+        user_schema_text = SCHEMA_TEXT
+        def __init__(self):
+            self.calls = 0
+        async def complete_validated(self, *a, **k):
+            self.calls += 1
+            exc = ContextOverflowError("finish oracle", phase="reactive")
+            exc.origin = "finish"
+            raise exc
+
+    engine = _Overflowing()
+    ctx = _NS(cfg=cfg, llm=None, schema_engine=engine,
+              metrics=_BudgetMetrics(), batch_no=1)
+    from labelkit.common.contracts.types import PipelineItem
+    item = PipelineItem(record=text_record())
+    _asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
+    assert engine.calls == 1                       # no degrade retry surface
+    assert item.errors[0].kind == "context_overflow"
+    assert ctx.metrics.fed == []                   # origin="finish": never fed
+    assert "budget.degrade_retries" not in ctx.metrics.counters
+
+    item2 = PipelineItem(record=text_record())
+
+    class _Truncating:
+        user_schema_text = SCHEMA_TEXT
+        async def complete_validated(self, *a, **k):
+            raise OutputTruncatedError("cap")
+
+    ctx2 = _NS(cfg=cfg, llm=None, schema_engine=_Truncating(),
+               metrics=_BudgetMetrics(), batch_no=1)
+    _asyncio.run(AnnotateStage(cfg)._annotate_item(item2, ctx2))
+    assert item2.errors[0].kind == "output_truncated"
+    assert "budget.overflow_records" not in ctx2.metrics.counters

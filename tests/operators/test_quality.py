@@ -1120,3 +1120,283 @@ def test_single_record_paths_unchanged_by_default_kwargs():
     parts = _record_parts(ui_single, "记录 A", 30000, transitions=None)
     assert [p.kind for p in parts] == ["text", "image", "text"]
     assert parts[1].image is ui_single.image
+
+
+# ── v1.11 context-budget packing (spec 3.4.3 上下文预算装填 row, V10/V20/V27①) ─
+
+import re
+
+from labelkit.common.errors import ContextOverflowError, OutputTruncatedError
+from labelkit.common.runtime import budget as budget_mod
+from labelkit.operators.quality import _CallFit, _pairwise_system_text
+
+
+def _budget_profile(context_window: int, name: str = "default"):
+    from labelkit.common.config.model import LLMProfile
+    return LLMProfile(name=name, provider="openai_compatible", base_url="http://x",
+                      model="m", api_key_env="K", max_output_tokens=256,
+                      context_window=context_window)
+
+
+def budget_cfg(quality: QualityConfig, context_window: int, **kw) -> ResolvedConfig:
+    return replace(make_cfg(quality, **kw),
+                   llm_profiles={"default": _budget_profile(context_window)})
+
+
+class _FixedCalibrator:
+    def __init__(self, value: int):
+        self.value = value
+
+    def cost(self, profile: str) -> int:
+        return self.value
+
+
+class FeedRecorder(Recorder):
+    def __init__(self):
+        super().__init__()
+        self.fed: list = []
+
+    def record_provider_result(self, fatal, *, hard=False):
+        self.fed.append(fatal)
+
+
+def budget_ctx(cfg, metrics=None, engine=None, image_cost: int = 100) -> RunContext:
+    from types import SimpleNamespace
+    return RunContext(cfg=cfg,
+                      llm=SimpleNamespace(calibrator=_FixedCalibrator(image_cost)),
+                      schema_engine=engine, metrics=metrics or Recorder(),
+                      rng=random.Random("0:1:quality"), batch_no=1)
+
+
+def big_ui_record(rec_id: str, n: int = 80) -> Record:
+    nodes = [UINode("1", None, 0, "FrameLayout", "", "", (0, 0, 1080, 1920), True, {})]
+    nodes += [UINode(str(i + 2), "1", 1, "TextView", "文本行" + "字" * 15, "",
+                     (0, i, 1080, i + 10), True, {}) for i in range(n)]
+    image = ImageRef(path=Path(f"{rec_id}.png"), format="png", size_bytes=1)
+    return Record(id=rec_id, modality="ui", text=None, raw=None,
+                  ui_tree=UITree(tuple(nodes)), image=image,
+                  ref=RecordRef("b/uitree_9.jsonl", None, 9, ()))
+
+
+def test_pairwise_ui_slots_trim_trees_with_marker_deterministically():
+    rec_a, rec_b = big_ui_record("a" * 16), big_ui_record("b" * 16)
+    fit = _CallFit(record_budget=1100, sides=2)
+    bundle = _build_pairwise_prompt(rec_a, rec_b, (EDU,), True, 30000, fit=fit)
+    assert not fit.overflow
+    assert fit.truncations == 2                    # each half trimmed once
+    user = bundle.messages[1]
+    for tree_part in (user.parts[2], user.parts[5]):
+        body = tree_part.text.split("\n", 1)[1]
+        assert body.split("\n")[-1].startswith("…(truncated ")
+        assert body.split("\n")[-1].endswith(" nodes)")
+        # each slot honours its half share (marker + labels included)
+        head, tree_lines = tree_part.text.split("\n", 1)
+        assert budget_mod.est_text(tree_part.text) <= fit.side_share
+    # deterministic: identical inputs → identical trimmed bundle
+    again = _build_pairwise_prompt(rec_a, rec_b, (EDU,), True, 30000,
+                                   fit=_CallFit(record_budget=1100, sides=2))
+    assert again == bundle
+
+
+def test_pairwise_prompt_budget_off_frozen():
+    # fit=None (budget off) must be byte-identical to the pre-v1.11 build — the
+    # worked-example prompt asserted at test_pairwise_prompt_matches_spec_worked_example
+    # is built through the same fit=None path (regression anchor).
+    rec_a, rec_b = big_ui_record("a" * 16), big_ui_record("b" * 16)
+    plain = _build_pairwise_prompt(rec_a, rec_b, (EDU,), True, 30000)
+    assert plain == _build_pairwise_prompt(rec_a, rec_b, (EDU,), True, 30000, fit=None)
+    tree = rec_a.ui_tree.serialize(max_chars=30000)
+    assert plain.messages[1].parts[2].text == f"[记录 A UI 控件树]\n{tree}"
+
+
+def test_sequence_step_lines_edges_trimmed_under_share():
+    # §3.3⑤: the [步骤序列] block gets the edges trim — first/last steps kept,
+    # whole middle lines dropped, in-place "…(truncated N lines)" marker; the
+    # member-digest block (fallback adjudication evidence) yields last.
+    steps = tuple(
+        Transition(index=i, action={"action_type": "click", "target": f"按钮{i}",
+                                    "value": None,
+                                    "description": "点击" + "很" * 40 + f"目标{i}"},
+                   model="m", attempts=1, detail={})
+        for i in range(12))
+    ep = make_episode(tuple(make_text_frame(f"f{i}", f"帧{i}") for i in range(3)))
+    fit = _CallFit(record_budget=700, sides=1)
+    bundle = _build_pointwise_prompt(ep, EDU, 30000, transitions=steps, fit=fit)
+    assert not fit.overflow and fit.truncations == 1
+    lines = bundle.messages[1].parts[0].text.split("\n")
+    steps_start = lines.index("[步骤序列]") + 1
+    steps_end = lines.index("[成员帧摘要]")
+    step_lines = lines[steps_start:steps_end]
+    assert step_lines[0].startswith("0. click")            # first step kept
+    assert step_lines[-1].startswith("11. click")          # last step kept
+    assert any(re.fullmatch(r"…\(truncated \d+ lines\)", l) for l in step_lines)
+    # digest block intact (not the trim target here)
+    assert lines[steps_end + 1].startswith("1. ")
+
+
+def test_pointwise_minimal_unit_unfittable_fails_record_before_send():
+    # V10 single-record terminal: plain record text is not a trim class — an
+    # unfittable slot rejects the record (kind=context_overflow) with NO request.
+    q = QualityConfig(mode="pointwise")
+    cfg = budget_cfg(q, 600)                       # input_budget = 88 < system est
+    rec = Recorder()
+
+    class Exploding:
+        async def complete_validated(self, *a, **k):
+            raise AssertionError("must not be called")
+
+    item = PipelineItem(record=make_record("solo", "长文本" + "字" * 400))
+    ctx = budget_ctx(cfg, rec, engine=Exploding())
+    import asyncio as _a
+    _a.run(QualityStage(cfg).run([item], ctx))
+    assert item.status == "failed"
+    assert item.errors[0].kind == "context_overflow"
+    assert rec.counters["budget.overflow_records"] == 1
+    assert rec.of("error")[0]["payload"]["kind"] == "context_overflow"
+
+
+def test_pairwise_minimal_unit_unfittable_resolves_as_tie():
+    # The pairwise two-record unit follows the judgment_invalid GRANULARITY:
+    # comparison → tie, records stay active/unscored (on_unscored), precise kind
+    # on errors + event, NO quality.judgment_failures, NO overflow_records.
+    q = QualityConfig(mode="pairwise", rounds=1)
+    cfg = budget_cfg(q, 600)
+    rec = Recorder()
+
+    class Exploding:
+        async def complete_validated(self, *a, **k):
+            raise AssertionError("must not be called")
+
+    a = PipelineItem(record=make_record("a", "文甲" + "字" * 400))
+    b = PipelineItem(record=make_record("b", "文乙" + "字" * 400))
+    ctx = budget_ctx(cfg, rec, engine=Exploding())
+    import asyncio as _a
+    _a.run(QualityStage(cfg).run([a, b], ctx))
+    for it in (a, b):
+        assert it.status == "active"               # tie path never fails records
+        assert it.errors[0].kind == "context_overflow"
+        assert it.scores[AGGREGATE_KEY].score is None   # unscored → on_unscored
+    assert "quality.judgment_failures" not in rec.counters
+    assert "budget.overflow_records" not in rec.counters
+    assert rec.of("error")[0]["payload"]["kind"] == "context_overflow"
+
+
+class OverflowThenOkEngine(StubEngine):
+    """Raises fresh reactive ContextOverflowErrors for the first `n_overflows`
+    calls, then delegates to the StubEngine judgment/pointwise behavior."""
+
+    def __init__(self, n_overflows: int, **kw):
+        super().__init__(**kw)
+        self.n_overflows = n_overflows
+        self.prompts: list = []
+
+    async def complete_validated(self, profile, prompt, schema=None, *,
+                                 record_ids=(), batch_no=0):
+        self.prompts.append(prompt)
+        if self.n_overflows > 0:
+            self.n_overflows -= 1
+            raise ContextOverflowError("provider overflow", phase="reactive")
+        return await super().complete_validated(profile, prompt, schema,
+                                                record_ids=record_ids,
+                                                batch_no=batch_no)
+
+
+def test_v20_degrade_retry_tightens_text_share_once():
+    q = QualityConfig(mode="pairwise", rounds=1)
+    cfg = budget_cfg(q, 4096)
+    rec = FeedRecorder()
+    engine = OverflowThenOkEngine(1)
+    batch = [PipelineItem(record=make_record("r1", "文甲" + "内" * 80)),
+             PipelineItem(record=make_record("r2", "文乙" + "内" * 80))]
+    ctx = budget_ctx(cfg, rec, engine=engine)
+    import asyncio as _a
+    _a.run(QualityStage(cfg).run(batch, ctx))
+    assert rec.counters["budget.degrade_retries"] == 1
+    assert len(engine.prompts) == 2                # one retry, then success
+    assert rec.fed == []                           # successful degrade: no feed
+    assert all(it.status == "active" for it in batch)
+    assert all(it.scores[AGGREGATE_KEY].score is not None for it in batch)
+
+
+def test_v20_degrade_exhausted_terminal_feeds_breaker_once():
+    q = QualityConfig(mode="pairwise", rounds=1)
+    cfg = budget_cfg(q, 4096)
+    rec = FeedRecorder()
+    engine = OverflowThenOkEngine(5)               # never recovers
+    batch = [PipelineItem(record=make_record("r1", "文甲")),
+             PipelineItem(record=make_record("r2", "文乙"))]
+    ctx = budget_ctx(cfg, rec, engine=engine)
+    import asyncio as _a
+    _a.run(QualityStage(cfg).run(batch, ctx))
+    assert rec.counters["budget.degrade_retries"] == 1     # bounded: ONE retry
+    assert len(engine.prompts) == 2
+    assert rec.fed == [True]                       # A7: reactive-400 terminal, once
+    for it in batch:                               # tie granularity: never failed
+        assert it.status == "active"
+        assert it.errors[0].kind == "context_overflow"
+
+
+def test_pointwise_reactive_terminal_fails_record():
+    q = QualityConfig(mode="pointwise")
+    cfg = budget_cfg(q, 4096)
+    rec = FeedRecorder()
+    engine = OverflowThenOkEngine(5)
+    item = PipelineItem(record=make_record("solo", "文本"))
+    ctx = budget_ctx(cfg, rec, engine=engine)
+    import asyncio as _a
+    _a.run(QualityStage(cfg).run([item], ctx))
+    assert item.status == "failed"
+    assert item.errors[0].kind == "context_overflow"
+    assert rec.counters["budget.overflow_records"] == 1
+    assert rec.counters["budget.degrade_retries"] == 1
+    assert rec.fed == [True]
+
+
+def test_budget_off_overflow_terminal_without_degrade():
+    # cw == 0: no packing surface — a 200-shaped finish-oracle overflow goes
+    # straight to the terminal (no degrade retry, no breaker feed).
+    q = QualityConfig(mode="pointwise")
+    cfg = make_cfg(q)                              # llm_profiles={} → budget off
+    rec = FeedRecorder()
+    exc = ContextOverflowError("finish oracle", phase="reactive")
+    exc.origin = "finish"
+
+    class AlwaysOverflow:
+        async def complete_validated(self, *a, **k):
+            raise exc
+
+    item = PipelineItem(record=make_record("solo"))
+    ctx = make_ctx(cfg, rec, engine=AlwaysOverflow())
+    import asyncio as _a
+    _a.run(QualityStage(cfg).run([item], ctx))
+    assert item.status == "failed"
+    assert item.errors[0].kind == "context_overflow"
+    assert "budget.degrade_retries" not in rec.counters
+    assert rec.fed == []                           # origin="finish": never fed
+
+
+def test_classify_call_error_budget_vocabulary_first():
+    assert _classify_call_error(ContextOverflowError("x", phase="precheck")) == (
+        "context_overflow", False)
+    assert _classify_call_error(OutputTruncatedError("x")) == (
+        "output_truncated", False)
+
+
+def test_output_truncated_call_fails_records_with_precise_kind():
+    # OutputTruncatedError keeps the existing provider-failure granularity
+    # (records fail) with the precise §7.6 kind (V27①); never fed to the breaker.
+    q = QualityConfig(mode="pointwise")
+    cfg = make_cfg(q)
+    rec = FeedRecorder()
+
+    class Truncating:
+        async def complete_validated(self, *a, **k):
+            raise OutputTruncatedError("hit max_output_tokens")
+
+    item = PipelineItem(record=make_record("solo"))
+    ctx = make_ctx(cfg, rec, engine=Truncating())
+    import asyncio as _a
+    _a.run(QualityStage(cfg).run([item], ctx))
+    assert item.status == "failed"
+    assert item.errors[0].kind == "output_truncated"
+    assert rec.fed == []

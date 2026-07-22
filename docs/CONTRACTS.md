@@ -4106,7 +4106,8 @@ v1.9 additions: `counts.stitched` (owner M10 — post-emit shell tally, §7.9);
 `episodes − stitched` (T7/T16 single reporting point).
 v1.11 additions (counter key names **[FROZEN HERE]**): `budget.truncations.<stage>`
 (owner = each trimming stage at its §3.3 content-trim point — quality/classify/verify/
-annotate/dedup); `budget.degrade_retries` (owner = the operator performing the V20
+annotate/dedup/generate, the last for §3.3⑦ seed tail-drops); `budget.degrade_retries`
+(owner = the operator performing the V20
 degrade — segment window re-split / annotate frame-halving / quality text-tightening);
 `budget.escalations` (owner M7 — the V21 fail∧repair ladder trigger);
 `budget.overflow_records` (owner = the stage recording the `context_overflow` reject,

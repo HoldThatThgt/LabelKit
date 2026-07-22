@@ -12,12 +12,16 @@ contract ②a). Chain position: dedup → classify → quality.
 from __future__ import annotations
 
 import asyncio
-from dataclasses import replace
+import json
+import re
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 from labelkit.common.errors import (
     CircuitBreakerTripped,
+    ContextOverflowError,
     ErrorKind,
+    OutputTruncatedError,
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
@@ -31,6 +35,7 @@ from labelkit.common.contracts.types import (
     frame_digest,
 )
 
+from labelkit.common.runtime import budget
 from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
 from labelkit.common.runtime.schema_engine import classification_schema
 
@@ -71,6 +76,114 @@ _SEQ_TRUNCATION_MARKER = "…(truncated {n} members)"
 def _reason_requested(cfg: "ResolvedConfig") -> bool:
     """R29: reason is requested iff trace.enabled and "classify" ∈ trace.channels."""
     return cfg.trace.enabled and "classify" in cfg.trace.channels
+
+
+# ── v1.11 context-budget packing (spec 3.13.4 上下文预算装填 row) ────────────
+
+_TREE_MARKER_RE = re.compile(r"^…\(truncated (\d+) nodes\)$")
+
+
+@dataclass
+class _PromptFit:
+    """Record-side packing state for ONE classification call (spec 3.13.4 v1.11
+    row). ``input_budget`` = input_budget(classify profile) minus the
+    structured-output schema est when the profile rides it; ``image_cost`` = the
+    calibrated per-image readout (batch-frozen, V19) — 0 when the prompt carries
+    no image. The single trimmable slot is the current-record tree render
+    (single UI) or the episode digest body (sequence, same-family cap); class
+    table / instruction / class examples are static user semantic assets — V13③
+    M1-precheck territory, NEVER trimmed dynamically."""
+    input_budget: int
+    image_cost: int
+    truncations: int = 0
+    overflow: bool = False
+
+
+def _fit_tree_text(rendered: str, budget_tokens: int) -> tuple[str, bool]:
+    """§3.3③ dynamic cap on a serialized UI tree: the render (already under the
+    absolute input.ui_tree_max_chars cap) is re-checked with est_text; over the
+    share, trailing NODE lines are dropped and the serialize-family marker
+    "…(truncated N nodes)" closes the text — N accumulates onto an existing
+    marker's count, so the marker semantics stay UITree.serialize's own.
+    Deterministic; est_text is prefix-monotone so the largest fitting prefix is
+    found by bisection. Returns (text, trimmed)."""
+    if budget.est_text(rendered) <= budget_tokens:
+        return rendered, False
+    lines = rendered.split("\n")
+    base = 0
+    m = _TREE_MARKER_RE.match(lines[-1])
+    if m is not None:
+        base = int(m.group(1))
+        lines = lines[:-1]
+    total = len(lines)
+
+    def candidate(keep: int) -> str:
+        marker = f"…(truncated {base + total - keep} nodes)"
+        return "\n".join(lines[:keep] + [marker])
+
+    lo, hi = 0, total - 1                        # keep == total is known not to fit
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if budget.est_text(candidate(mid)) <= budget_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    return candidate(lo), True
+
+
+def _fit_digest_body(body: str, budget_tokens: int) -> tuple[str, bool]:
+    """§3.3③ same-family cap on the sequence digest body: the char-capped
+    _sequence_digest_block output is re-checked with est_text; over the share,
+    MIDDLE member lines are dropped (first/last always kept) and the frozen
+    "…(truncated N members)" marker closes the block — the block's own §10.8
+    truncation convention (marker after the last member line), with N
+    accumulating onto an existing marker's count. Returns (text, trimmed)."""
+    if budget.est_text(body) <= budget_tokens:
+        return body, False
+    lines = body.split("\n")
+    base = 0
+    m = re.match(r"^…\(truncated (\d+) members\)$", lines[-1])
+    if m is not None:
+        base = int(m.group(1))
+        lines = lines[:-1]
+    n = len(lines)
+    if n > 2:
+        for keep_middle in range(n - 3, -1, -1):
+            marker = _SEQ_TRUNCATION_MARKER.format(n=base + n - 2 - keep_middle)
+            cand = "\n".join(lines[: 1 + keep_middle] + [lines[-1], marker])
+            if budget.est_text(cand) <= budget_tokens:
+                return cand, True
+    return _SEQ_TRUNCATION_MARKER.format(n=base + n), True
+
+
+def _feed_reactive_terminal(exc: BaseException, metrics) -> None:
+    """A7/§7.8 breaker matrix: ONLY the reactive-400 (body-sniff) overflow
+    terminal feeds the fatal streak — exactly once per exception object (the
+    duck flag guards double-feeds when one exception crosses operators);
+    precheck and the 200-shaped finish oracle never feed. ``origin`` is read
+    defensively pending the errors.py revision (default "http_400")."""
+    if (isinstance(exc, ContextOverflowError) and exc.phase == "reactive"
+            and getattr(exc, "origin", "http_400") == "http_400"
+            and not getattr(exc, "_breaker_fed", False)):
+        exc._breaker_fed = True  # type: ignore[attr-defined]
+        metrics.record_provider_result(fatal=True)
+
+
+def _prompt_fit(record: Record, cfg: "ResolvedConfig", ctx: "RunContext",
+                schema: dict) -> _PromptFit | None:
+    """None = budget OFF (profile missing or context_window == 0 — v1.10
+    behavior byte-identical). The schema est is charged only when the profile
+    declares supports_structured_output (the M9 throat sends it only then)."""
+    prof = cfg.llm_profiles.get(cfg.classify.llm)
+    if prof is None or prof.context_window <= 0:
+        return None
+    b = budget.input_budget(prof)
+    if prof.supports_structured_output:
+        b -= budget.est_text(json.dumps(schema, ensure_ascii=False))
+    # Both the single-UI record and the UI episode carry exactly ONE image
+    # ([屏幕截图] / [首帧截图]); text modality carries none.
+    cost = ctx.llm.calibrator.cost(prof.name) if record.modality == "ui" else 0
+    return _PromptFit(input_budget=b, image_cost=cost)
 
 
 def _sequence_digest_block(record: Record, cfg: "ResolvedConfig") -> str:
@@ -123,7 +236,21 @@ def build_classify_prompt(record: Record, cfg: "ResolvedConfig",
     §10.8 sequence variant — the [待分类数据·序列] episode digest block, plus (UI
     modality only — classify stays in the vision reference set) the [首帧截图] label
     and the first member's screenshot image part.
+
+    v1.11: the frozen signature stays intact — the budget path enters through the
+    private assembler's trailing ``fit`` parameter (classify_record), never here.
     """
+    return _assemble_classify(record, cfg, with_reason)
+
+
+def _assemble_classify(record: Record, cfg: "ResolvedConfig", with_reason: bool,
+                       fit: _PromptFit | None = None) -> PromptBundle:
+    """The §10.8 assembly body; ``fit`` non-None applies the spec 3.13.4 v1.11
+    packing — the current-record slot budget = fit.input_budget − (system +
+    class-example texts + record-part label overheads + message envelopes +
+    image cost), spent on the ONE trimmable block; the closing whole-prompt est
+    re-check sets fit.overflow (V10 — the caller records the reject). fit=None
+    is the byte-identical v1.10 path."""
     c = cfg.classify
     lines: list[str] = []
     if c.assignment == "single":
@@ -148,11 +275,30 @@ def build_classify_prompt(record: Record, cfg: "ResolvedConfig",
             text = _LABEL_EXAMPLE_TMPL.format(name=spec.name, example=example)
             messages.append(Message(role="user", parts=(Part(kind="text", text=text),)))
 
+    # v1.11 slot budget: everything OUTSIDE the trimmable block is counted first
+    # (static system side + label overheads + envelopes + calibrated image cost).
+    slot_budget: int | None = None
+    if fit is not None:
+        n_messages = len(messages) + 1
+        n_images = 1 if record.modality == "ui" else 0
+        static_est = (sum(budget.est_text(m.parts[0].text or "") for m in messages)
+                      + budget.MSG_OVERHEAD_TOKENS * n_messages
+                      + n_images * fit.image_cost)
+        slot_budget = fit.input_budget - static_est
+
     if record.kind == "sequence":
         # v1.8 sequence variant (§10.8): digest text part first; UI modality appends
         # the [首帧截图] label + the FIRST member's image (encoded by M9 at call time).
         # Text-modality sequences carry the digest part only.
         digest_block = _sequence_digest_block(record, cfg)
+        if slot_budget is not None:
+            head_est = budget.est_text(f"{_LABEL_RECORD_SEQ}\n")
+            if record.modality == "ui":
+                head_est += budget.est_text(_LABEL_FIRST_FRAME)
+            digest_block, trimmed = _fit_digest_body(
+                digest_block, max(0, slot_budget - head_est))
+            if trimmed:
+                fit.truncations += 1
         parts: tuple[Part, ...] = (
             Part(kind="text", text=f"{_LABEL_RECORD_SEQ}\n{digest_block}"),
         )
@@ -167,13 +313,27 @@ def build_classify_prompt(record: Record, cfg: "ResolvedConfig",
         )
     else:  # UI modality: three parts in one user message (same shape as §10.1, R27)
         tree_text = record.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars)
+        if slot_budget is not None:
+            label_est = (budget.est_text(_LABEL_SCREENSHOT)
+                         + budget.est_text(f"{_LABEL_UI_TREE}\n"))
+            tree_text, trimmed = _fit_tree_text(
+                tree_text, max(0, slot_budget - label_est))
+            if trimmed:
+                fit.truncations += 1
         parts = (
             Part(kind="text", text=_LABEL_SCREENSHOT),
             Part(kind="image", image=record.image),
             Part(kind="text", text=f"{_LABEL_UI_TREE}\n{tree_text}"),
         )
     messages.append(Message(role="user", parts=parts))
-    return PromptBundle(messages=tuple(messages))
+    bundle = PromptBundle(messages=tuple(messages))
+    if fit is not None:
+        # Whole-prompt re-check with the SAME estimator the M9 throat runs (the
+        # schema est is already folded into fit.input_budget): over ⇒ even the
+        # minimal unit (one record) is unfittable — V10, caller rejects.
+        est = budget.est_prompt(bundle, None, None, image_cost=fit.image_cost)
+        fit.overflow = est > fit.input_budget
+    return bundle
 
 
 # ── post-M8 normalization (deterministic, fixed order) ──────────────────────
@@ -208,7 +368,21 @@ async def classify_record(record: Record, ctx: "RunContext") -> Classification:
     with_reason = _reason_requested(cfg)
     names = [spec.name for spec in c.classes]
     schema = classification_schema(names, c.assignment, c.max_labels, with_reason)
-    prompt = build_classify_prompt(record, cfg, with_reason)
+    # v1.11 (spec 3.13.4 v1.11 row): budget-declared profile → the current-record
+    # slot packs under the derived share (fit=None keeps v1.10 byte-identical).
+    fit = _prompt_fit(record, cfg, ctx, schema)
+    prompt = _assemble_classify(record, cfg, with_reason, fit=fit)
+    if fit is not None:
+        if fit.truncations:
+            ctx.metrics.count("budget.truncations.classify", fit.truncations)
+        if fit.overflow:
+            # V10: even the minimal unit (one record) is unfittable — never send
+            # a request doomed to fail; the record goes to rejects (spec 3.13.4:
+            # overflow bypasses the fallback class), phase=precheck never feeds
+            # the breaker.
+            raise ContextOverflowError(
+                "classification prompt exceeds the input budget at the minimal "
+                "unit (single record)", phase="precheck", profile=c.llm)
     n = c.self_consistency
 
     if n == 0:
@@ -306,6 +480,15 @@ class ClassifyStage:
                            retryable=False)
                 return
             classification = self._fallback(item, ctx, str(e))
+        except (ContextOverflowError, OutputTruncatedError) as e:
+            # v1.11 (V27①): the budget vocabulary routes FIRST — precise kinds,
+            # record-level failed → rejects (spec 3.13.4 v1.11 row: overflow
+            # bypasses the on_error fallback class). The reactive-400 terminal
+            # feeds the breaker exactly once (A7, _feed_reactive_terminal).
+            _feed_reactive_terminal(e, ctx.metrics)
+            self._fail(item, ctx, budget.classify_stage_error(e), str(e),
+                       retryable=False)
+            return
         except ProviderRetryableError as e:
             self._fail(item, ctx, ErrorKind.PROVIDER_RETRYABLE_EXHAUSTED.value, str(e),
                        retryable=True)
@@ -364,6 +547,8 @@ class ClassifyStage:
         err = StageError(stage=self.name, kind=kind, message=message, retryable=retryable)
         item.errors.append(err)
         item.status = "failed"
+        if kind == ErrorKind.CONTEXT_OVERFLOW.value:
+            ctx.metrics.count("budget.overflow_records")  # V13②: rejected, all phases
         ctx.metrics.count(_COUNTER_FAILURES)
         ctx.metrics.event(_EV_ERROR, stage=self.name, batch_no=ctx.batch_no,
                           record_ids=(item.record.id,),

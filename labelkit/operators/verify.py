@@ -35,10 +35,13 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import math
+import re
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Mapping, Sequence
 
 from labelkit.common.errors import (
     CircuitBreakerTripped,
+    ContextOverflowError,
     ErrorKind,
     ProviderFatalError,
     ProviderRetryableError,
@@ -53,9 +56,10 @@ from labelkit.common.contracts.types import (
     VerificationResult,
     frame_digest,
 )
+from labelkit.common.runtime import budget
 
 if TYPE_CHECKING:
-    from labelkit.common.config.model import ResolvedConfig
+    from labelkit.common.config.model import LLMProfile, ResolvedConfig
     from labelkit.common.runtime.llm_client import PromptBundle
     from labelkit.common.contracts.stage import RunContext
 
@@ -120,6 +124,74 @@ _BOUNDARY_MARGIN_K = 2
 _COUNTER_MEMBERSHIP_REPAIRS = "verify.membership_repairs"
 _COUNTER_BOUNDARY_FLAGS = "verify.boundary_flags"
 _COUNTER_DEFECTS_PREFIX = "verify.defects."
+
+
+# ── v1.11 context-budget packing (spec 3.7.2 上下文预算装填 row, V25②③) ──────
+
+_TREE_MARKER_RE = re.compile(r"^…\(truncated (\d+) nodes\)$")
+
+
+@dataclasses.dataclass
+class _PromptFit:
+    """Record-side packing state for ONE review prompt (spec 3.7.2 v1.11 row).
+    Verify broadcasts a SINGLE prompt to the whole panel (one build per round),
+    so the fit packs against the panel's MINIMUM input budget (V25② — each
+    declared judge's input_budget minus its structured-output schema est when it
+    rides one) and the MAXIMUM calibrated per-image cost among the declared
+    judges (conservative broadcast). The single trimmable slot is the
+    [动作序列] step block (sequence, §3.3⑤ edges) or the UI tree render
+    (single record, §3.3③); the [标注结果] annotation JSON is a per-record
+    semantic asset — COUNTED, never trimmed (V25③), as are the boundary-margin
+    and fragment-structure sections (structurally bounded)."""
+    input_budget: int
+    image_cost: int
+    truncations: int = 0
+    overflow: bool = False
+
+
+def _feed_reactive_terminal(exc: BaseException, metrics) -> None:
+    """A7/§7.8 breaker matrix: ONLY the reactive-400 (body-sniff) overflow
+    terminal feeds the fatal streak — exactly once per exception object (the
+    duck flag guards double-feeds when one exception crosses operators, e.g.
+    the M7→M5 repair chain); precheck and the 200-shaped finish oracle never
+    feed. ``origin`` is read defensively pending the errors.py revision
+    (default "http_400")."""
+    if (isinstance(exc, ContextOverflowError) and exc.phase == "reactive"
+            and getattr(exc, "origin", "http_400") == "http_400"
+            and not getattr(exc, "_breaker_fed", False)):
+        exc._breaker_fed = True  # type: ignore[attr-defined]
+        metrics.record_provider_result(fatal=True)
+
+
+def _fit_tree_text(rendered: str, budget_tokens: int) -> tuple[str, bool]:
+    """§3.3③ dynamic cap on a serialized UI tree: the render (already under the
+    absolute input.ui_tree_max_chars cap) is re-checked with est_text; over the
+    share, trailing NODE lines are dropped and the serialize-family marker
+    "…(truncated N nodes)" closes the text — N accumulates onto an existing
+    marker's count. est_text is prefix-monotone ⇒ bisection. Returns
+    (text, trimmed)."""
+    if budget.est_text(rendered) <= budget_tokens:
+        return rendered, False
+    lines = rendered.split("\n")
+    base = 0
+    m = _TREE_MARKER_RE.match(lines[-1])
+    if m is not None:
+        base = int(m.group(1))
+        lines = lines[:-1]
+    total = len(lines)
+
+    def candidate(keep: int) -> str:
+        marker = f"…(truncated {base + total - keep} nodes)"
+        return "\n".join(lines[:keep] + [marker])
+
+    lo, hi = 0, total - 1                        # keep == total is known not to fit
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if budget.est_text(candidate(mid)) <= budget_tokens:
+            lo = mid
+        else:
+            hi = mid - 1
+    return candidate(lo), True
 
 
 # ── pure prompt-text assembly (unit-testable, no service imports) ──────────
@@ -327,7 +399,8 @@ def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
                         label: str | None = None,
                         transitions: tuple[Transition, ...] | None = None,
                         boundary_margin: str = "",
-                        fragment_structure: str = "") -> "PromptBundle":
+                        fragment_structure: str = "",
+                        fit: "_PromptFit | None" = None) -> "PromptBundle":
     """Assemble the §10.5 judge prompt for one (record, annotation-output) pair.
     UI modality carries screenshot + serialized tree parts as in §10.1/§10.2.
     v1.7 (R3): label non-None → the [任务指令] section and extra_criteria take the
@@ -341,7 +414,14 @@ def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
     six-section v1.8 form byte-identical) → [边界余量] (pre-rendered by the stage
     driver, which holds the batch context) → [首帧截图] + image → [末帧截图] +
     image → [标注结果]; text-modality sequences degrade without the screenshot
-    sections (the M5 S6 precedent — frames carry no images)."""
+    sections (the M5 S6 precedent — frames carry no images).
+    v1.11 (``fit`` non-None, spec 3.7.2 v1.11 row): the record-side trimmable
+    slot packs into the panel-min budget — the sequence [动作序列] block takes
+    the §3.3⑤ edges trim, the single-record tree render the §3.3③ dynamic cap;
+    the [标注结果] JSON / instruction / margin / fragment sections are counted,
+    never trimmed (V25③); an untrimmable floor over the budget flags
+    fit.overflow (V10 — the caller rejects, the request is never sent).
+    fit=None is the byte-identical v1.10 path."""
     from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
 
     if label is not None:
@@ -353,47 +433,88 @@ def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
         extra_criteria = cfg.verify.extra_criteria
 
     if record.kind == "sequence":  # v1.8 sequence variant (checked BEFORE modality)
+        system_text = verify_sequence_system_text(extra_criteria)
         seq_system = Message(
             role="system",
-            parts=(Part(kind="text", text=verify_sequence_system_text(extra_criteria)),),
+            parts=(Part(kind="text", text=system_text),),
         )
         parts: list[Part] = [Part(kind="text", text=f"[任务指令] {instruction}")]
+        steps_at = -1
         if transitions is not None:  # section omitted entirely when None
             steps = "\n".join(sequence_step_line(t) for t in transitions)
+            steps_at = len(parts)
             parts.append(Part(kind="text", text=f"{_LABEL_ACTION_SEQUENCE}\n{steps}"))
         if fragment_structure:  # v1.9 seventh section (stitch on only, T15)
             parts.append(Part(kind="text",
                               text=f"{_LABEL_FRAGMENT_STRUCTURE}\n{fragment_structure}"))
         parts.append(Part(kind="text",
                           text=f"{_LABEL_BOUNDARY_MARGIN}\n{boundary_margin}"))
+        n_images = 0
         if record.modality == "ui":
             parts.append(Part(kind="text", text=_LABEL_FIRST_FRAME))
             parts.append(Part(kind="image", image=record.members[0].image))
             parts.append(Part(kind="text", text=_LABEL_LAST_FRAME))
             parts.append(Part(kind="image", image=record.members[-1].image))
+            n_images = 2
         parts.append(Part(kind="text",
                           text=f"[标注结果] {json.dumps(output, ensure_ascii=False)}"))
+        if fit is not None:
+            fixed = (budget.est_text(system_text)
+                     + sum(budget.est_text(p.text or "") for i, p in enumerate(parts)
+                           if p.kind == "text" and i != steps_at)
+                     + 2 * budget.MSG_OVERHEAD_TOKENS + n_images * fit.image_cost)
+            if steps_at >= 0:
+                slot = (fit.input_budget - fixed
+                        - budget.est_text(f"{_LABEL_ACTION_SEQUENCE}\n"))
+                steps = "\n".join(sequence_step_line(t) for t in transitions)
+                if budget.est_text(steps) > slot:
+                    steps = budget.fit_text(steps, max(0, slot), keep="edges")
+                    fit.truncations += 1
+                    parts[steps_at] = Part(
+                        kind="text", text=f"{_LABEL_ACTION_SEQUENCE}\n{steps}")
+            total = (budget.est_text(system_text)
+                     + sum(budget.est_text(p.text or "") for p in parts
+                           if p.kind == "text")
+                     + 2 * budget.MSG_OVERHEAD_TOKENS + n_images * fit.image_cost)
+            fit.overflow = total > fit.input_budget
         return PromptBundle(messages=(seq_system,
                                       Message(role="user", parts=tuple(parts))))
 
+    system_text = verify_system_text(extra_criteria)
     system = Message(
         role="system",
-        parts=(Part(kind="text", text=verify_system_text(extra_criteria)),),
+        parts=(Part(kind="text", text=system_text),),
     )
     if record.modality == "text":
+        user_text = verify_user_text(instruction, record.text or "", output)
+        if fit is not None:
+            # Plain record text / annotation JSON are not trim classes → V10
+            # when the single-record unit does not fit.
+            total = (budget.est_text(system_text) + budget.est_text(user_text)
+                     + 2 * budget.MSG_OVERHEAD_TOKENS)
+            fit.overflow = total > fit.input_budget
         user = Message(
             role="user",
-            parts=(
-                Part(
-                    kind="text",
-                    text=verify_user_text(instruction, record.text or "", output),
-                ),
-            ),
+            parts=(Part(kind="text", text=user_text),),
         )
     else:
         head = f"[任务指令] {instruction}\n[原始数据]\n[屏幕截图]"
         tree = record.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars)
-        tail = f"[UI 控件树]\n{tree}\n[标注结果] {json.dumps(output, ensure_ascii=False)}"
+        result_text = f"[标注结果] {json.dumps(output, ensure_ascii=False)}"
+        if fit is not None:
+            fixed = (budget.est_text(system_text) + budget.est_text(head)
+                     + budget.est_text("[UI 控件树]\n")
+                     + budget.est_text(f"\n{result_text}")
+                     + 2 * budget.MSG_OVERHEAD_TOKENS + fit.image_cost)
+            tree, trimmed = _fit_tree_text(tree, max(0, fit.input_budget - fixed))
+            if trimmed:
+                fit.truncations += 1
+        tail = f"[UI 控件树]\n{tree}\n{result_text}"
+        if fit is not None:
+            total = (budget.est_text(system_text) + budget.est_text(head)
+                     + budget.est_text(tail) + 2 * budget.MSG_OVERHEAD_TOKENS
+                     + fit.image_cost)
+            fit.overflow = total > fit.input_budget
         user = Message(
             role="user",
             parts=(
@@ -440,7 +561,12 @@ async def run_verify_loop(
 
 
 def _classify_error(exc: Exception, modality: str) -> tuple[str, bool]:
-    """Map a per-record exception to (StageError.kind, retryable)."""
+    """Map a per-record exception to (StageError.kind, retryable). v1.11 (V27①):
+    the budget vocabulary routes FIRST — context_overflow / output_truncated
+    precisely, never internal_error (§3.5 attribution / overflow_records)."""
+    kind = budget.classify_stage_error(exc)
+    if kind is not None:
+        return kind, False
     if isinstance(exc, SchemaViolation):
         return ErrorKind.SCHEMA_VIOLATION.value, False
     if isinstance(exc, ProviderRetryableError):
@@ -524,6 +650,49 @@ class VerifyStage:
         await asyncio.gather(*(self._verify_item(item, ctx) for item in eligible))
         return batch
 
+    # ── v1.11 budget plumbing (spec 3.7.2 v1.11 row) ────────────────────────
+
+    def _panel_fit(self, ctx: "RunContext", record: Record,
+                   schema: Mapping) -> _PromptFit | None:
+        """None = budget OFF for the whole panel (no declared judge — v1.10
+        byte-identical). One prompt is built per round and broadcast to every
+        judge (multi-judge/S7), so the fit is V25②'s min-over-panel: budget =
+        min over budget-declared judges of (input_budget − that judge's
+        structured-output schema est); per-image cost = the MAX calibrated
+        readout among them (conservative for the shared build). Undeclared
+        panel members impose no constraint."""
+        vcfg = self.cfg.verify
+        judges = list(vcfg.judges) or [vcfg.llm]
+        declared: list["LLMProfile"] = []
+        for judge in judges:
+            prof = self.cfg.llm_profiles.get(judge)
+            if prof is not None and prof.context_window > 0:
+                declared.append(prof)
+        if not declared:
+            return None
+        schema_est = budget.est_text(json.dumps(schema, ensure_ascii=False))
+        min_budget = min(
+            budget.input_budget(p)
+            - (schema_est if p.supports_structured_output else 0)
+            for p in declared)
+        cost = (max(ctx.llm.calibrator.cost(p.name) for p in declared)
+                if record.modality == "ui" else 0)
+        return _PromptFit(input_budget=min_budget, image_cost=cost)
+
+    def _settle_fit(self, fit: _PromptFit | None, ctx: "RunContext") -> None:
+        """Count the performed trims; an overflow flag means even the minimal
+        unit (one record with every trimmable share spent) does not fit the
+        panel-min budget → V10 record-level reject via the phase=precheck raise
+        (classified context_overflow by _classify_error; never sent, never fed)."""
+        if fit is None:
+            return
+        if fit.truncations:
+            ctx.metrics.count("budget.truncations.verify", fit.truncations)
+        if fit.overflow:
+            raise ContextOverflowError(
+                "verify prompt exceeds the panel-min input budget at the "
+                "minimal unit (single record)", phase="precheck")
+
     # ── per-item driver ────────────────────────────────────────────────────
 
     async def _verify_item(self, item: PipelineItem, ctx: "RunContext") -> None:
@@ -546,6 +715,12 @@ class VerifyStage:
             if isinstance(exc, SchemaViolation):
                 # Duck-typed channel read by M11 for the rejects "full" tier (§9.2).
                 item.raw_last_output = exc.raw_last_output  # type: ignore[attr-defined]
+            if kind == ErrorKind.CONTEXT_OVERFLOW.value:
+                # V13②: counted at the reject, all phases; the reactive-400
+                # terminal feeds the breaker exactly once (A7 — duck-flag
+                # idempotent across the M7→M5 repair chain).
+                ctx.metrics.count("budget.overflow_records")
+                _feed_reactive_terminal(exc, ctx.metrics)
             err = StageError(stage=self.name, kind=kind, message=str(exc), retryable=retryable)
             item.errors.append(err)
             item.status = "failed"
@@ -580,7 +755,12 @@ class VerifyStage:
         vcfg = self.cfg.verify
         judges = list(vcfg.judges) or [vcfg.llm]
         multi = bool(vcfg.judges)
-        prompt = build_verify_prompt(record, annotation.output, ctx.cfg, label=label)
+        # v1.11 (spec 3.7.2 v1.11 row): min-over-panel packing of the ONE
+        # broadcast prompt; fit=None = budget off, byte-identical build.
+        fit = self._panel_fit(ctx, record, VERDICT_SCHEMA)
+        prompt = build_verify_prompt(record, annotation.output, ctx.cfg, label=label,
+                                     fit=fit)
+        self._settle_fit(fit, ctx)
         results = await asyncio.gather(
             *(
                 ctx.schema_engine.complete_validated(
@@ -832,11 +1012,16 @@ class VerifyStage:
         judges = list(vcfg.judges) or [vcfg.llm]
         multi = bool(vcfg.judges)
         record = item.record
+        schema = defect_verdict_schema()
+        # v1.11 (spec 3.7.2 v1.11 row): same min-over-panel packing for the
+        # sequence variant — the [动作序列] block is the trimmable slot.
+        fit = self._panel_fit(ctx, record, schema)
         prompt = build_verify_prompt(record, annotation.output, ctx.cfg, label=label,
                                      transitions=item.transitions,
                                      boundary_margin=boundary_margin,
-                                     fragment_structure=fragment_structure)
-        schema = defect_verdict_schema()
+                                     fragment_structure=fragment_structure,
+                                     fit=fit)
+        self._settle_fit(fit, ctx)
         results = await asyncio.gather(
             *(
                 ctx.schema_engine.complete_validated(
@@ -1143,6 +1328,59 @@ class VerifyStage:
 
     # ── (f) re-annotation + finalization ────────────────────────────────────
 
+    def _repair_ladder(self, item: PipelineItem, ctx: "RunContext",
+                       repair: "RepairContext", label: str | None,
+                       fragment_lens: tuple[int, ...] | None) -> dict:
+        """V21 quality-ladder step for the fail∧repair re-annotation (spec 3.7.3
+        修复路径与上下文预算的交互 ① — verdict=fail ∧ policy="repair" is the ONLY
+        trigger face, and we ARE that path here). Budget-gated on the ANNOTATE
+        profile (cw == 0 keeps the v1.10 call shape byte-identical) and only UI
+        sequences carry the keyframe face. Ladder: k → max(2, ⌈sequence_frames/2⌉)
+        (F3 trailing kwarg); px → ONE rung up from the working point
+        (default_image_px × 1.5/dim, int-rounded, capped at max_image_px;
+        default_image_px == 0 means the working point already IS max_image_px —
+        no escalation possible, image_px stays None). The escalated budget is
+        re-checked against the calibrated estimate BEFORE sending — a trial
+        build at (k_half, px_up) est-checked with per-image cost =
+        max(calibrator readout, provider prior @ px_up × PRIOR_INFLATION); over
+        budget → the px rung is dropped and only the k halving stands ("keep k
+        halving"). budget.escalations counts once per ESCALATED repair (px
+        actually passed). Single-shot per record — bounded by the existing
+        max_repair_rounds loop."""
+        record = item.record
+        acfg = self.cfg.annotate
+        prof = self.cfg.llm_profiles.get(acfg.llm)
+        if (prof is None or prof.context_window <= 0
+                or record.kind != "sequence" or record.modality != "ui"):
+            return {}
+        k_half = max(2, math.ceil(acfg.sequence_frames / 2))
+        px_up: int | None = None
+        if prof.default_image_px > 0:
+            candidate = min(int(round(prof.default_image_px * 1.5)),
+                            prof.max_image_px)
+            if candidate > prof.default_image_px:
+                px_up = candidate
+        if px_up is not None:
+            from labelkit.operators.annotate import build_annotate_prompt
+
+            trial = build_annotate_prompt(
+                record, ctx.cfg, ctx.schema_engine.user_schema_text,
+                repair=repair, label=label, transitions=item.transitions,
+                fragment_lens=fragment_lens, k_eff=k_half, image_px=px_up)
+            cost_up = max(ctx.llm.calibrator.cost(prof.name),
+                          math.ceil(budget.est_image_prior(prof, px_up)
+                                    * budget.PRIOR_INFLATION))
+            schema_eff = (ctx.cfg.user_schema
+                          if prof.supports_structured_output else None)
+            est = budget.est_prompt(trial, prof, schema_eff, image_cost=cost_up)
+            if est > budget.input_budget(prof):
+                px_up = None
+        kwargs: dict = {"k_eff": k_half}
+        if px_up is not None:
+            kwargs["image_px"] = px_up
+            ctx.metrics.count("budget.escalations")
+        return kwargs
+
     async def _reannotate_episode(self, state: _EpisodeReview,
                                   ctx: "RunContext") -> Annotation:
         from labelkit.operators.annotate import RepairContext, annotate_record
@@ -1157,10 +1395,15 @@ class VerifyStage:
         fragments = getattr(state.item, "stitch_fragments", None)
         fragment_lens = (tuple(int(f["member_count"]) for f in fragments)
                          if fragments else None)
+        # v1.11 (V21/F3): the ladder kwargs join ONLY when the ladder is live
+        # (budget on + UI sequence) — budget-off call shapes stay byte-identical.
+        ladder = self._repair_ladder(state.item, ctx, repair, state.label,
+                                     fragment_lens)
         return await annotate_record(state.item.record, ctx, repair,
                                      label=state.label,
                                      transitions=state.item.transitions,
-                                     fragment_lens=fragment_lens)
+                                     fragment_lens=fragment_lens,
+                                     **ladder)
 
     def _finalize_episode(self, state: _EpisodeReview, ctx: "RunContext") -> None:
         # verify.defects.<kind> is counted at review time (D4), not here —
@@ -1179,6 +1422,9 @@ class VerifyStage:
         kind, retryable = _classify_error(exc, item.record.modality)
         if isinstance(exc, SchemaViolation):
             item.raw_last_output = exc.raw_last_output  # type: ignore[attr-defined]
+        if kind == ErrorKind.CONTEXT_OVERFLOW.value:
+            ctx.metrics.count("budget.overflow_records")  # V13②: reject, all phases
+            _feed_reactive_terminal(exc, ctx.metrics)     # A7, duck-flag idempotent
         item.errors.append(StageError(stage=self.name, kind=kind,
                                       message=str(exc), retryable=retryable))
         item.status = "failed"

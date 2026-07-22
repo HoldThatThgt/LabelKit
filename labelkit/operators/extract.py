@@ -32,7 +32,9 @@ from typing import TYPE_CHECKING, Mapping
 
 from labelkit.common.errors import (
     CircuitBreakerTripped,
+    ContextOverflowError,
     ErrorKind,
+    OutputTruncatedError,
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
@@ -45,6 +47,7 @@ from labelkit.common.contracts.types import (
     frame_digest,
     tree_diff,
 )
+from labelkit.common.runtime import budget
 
 from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
 from labelkit.common.runtime.schema_engine import action_schema
@@ -210,6 +213,36 @@ async def extract_transition(prev: Record, curr: Record, index: int,
         return Transition(index=index, action=dict(_FALLBACK_ACTION), model="",
                           attempts=1 + cfg.output.max_repair_attempts,
                           detail={"kind": kind, "message": message})
+    except (ContextOverflowError, OutputTruncatedError) as e:
+        # v1.11 (spec 3.15.4 上下文预算 row): the constant 2-frame/2-image call has
+        # nothing to shrink — no packing, no degrade face; the M9 throat/finish
+        # disposition backstops (V16). Overflow/truncation rides the EXISTING
+        # mechanical-fallback semantics UNCHANGED: the fallback Transition keeps
+        # the extraction_invalid trace shape (detail.kind drives the downstream
+        # （摘取兜底） suffix and report attribution — S16); "fail" re-raises and
+        # the stage classifier records the precise §7.6 kind (V27①).
+        if cfg.extract.on_error == "fail":
+            raise
+        # A7 terminal settlement: a reactive-400 overflow disposed here (the
+        # fallback IS this call's terminal — no degrade face) feeds the fatal
+        # streak exactly once; precheck / the 200-shaped finish oracle never do.
+        if (isinstance(e, ContextOverflowError) and e.phase == "reactive"
+                and getattr(e, "origin", "http_400") == "http_400"
+                and not getattr(e, "_breaker_fed", False)):
+            e._breaker_fed = True  # type: ignore[attr-defined]
+            ctx.metrics.record_provider_result(fatal=True)
+        kind = ErrorKind.EXTRACTION_INVALID.value
+        message = str(e)
+        ctx.metrics.count(_COUNTER_FALLBACK_STEPS)
+        ctx.metrics.event(_EV_ERROR, stage=_STAGE_NAME, batch_no=ctx.batch_no,
+                          record_ids=(prev.id, curr.id),
+                          payload={"stage": _STAGE_NAME, "kind": kind,
+                                   "message": message, "retryable": False})
+        # attempts=1: overflow/truncation finalizes the call before any L3
+        # repair round runs (V11/V25① — never "repaired").
+        return Transition(index=index, action=dict(_FALLBACK_ACTION), model="",
+                          attempts=1,
+                          detail={"kind": kind, "message": message})
     if obj.get("action_type") == "scroll" and isinstance(obj.get("value"), str):
         obj = {**obj, "value": obj["value"].lower()}
     return Transition(index=index, action=obj, model=model, attempts=attempts,
@@ -322,8 +355,24 @@ class ExtractStage:
         """Episode-level failure: on_error="fail" schema exhaustion, or any
         provider/internal error of a step call (kinds classified as in
         classify._classify_item; extract records are always UI modality, so an
-        OSError is an image-decode failure surfacing from M9's lazy load)."""
-        if isinstance(exc, SchemaViolation):
+        OSError is an image-decode failure surfacing from M9's lazy load).
+        v1.11 (V27①): the budget vocabulary routes FIRST — context_overflow /
+        output_truncated precisely (never internal_error); an overflow reject
+        counts budget.overflow_records and the reactive-400 terminal feeds the
+        breaker exactly once (A7 — duck flag guards double-feeds)."""
+        budget_kind = budget.classify_stage_error(exc)
+        if budget_kind is not None:
+            kind, retryable = budget_kind, False
+            message = str(exc)
+            if kind == ErrorKind.CONTEXT_OVERFLOW.value:
+                ctx.metrics.count("budget.overflow_records")
+                if (isinstance(exc, ContextOverflowError)
+                        and exc.phase == "reactive"
+                        and getattr(exc, "origin", "http_400") == "http_400"
+                        and not getattr(exc, "_breaker_fed", False)):
+                    exc._breaker_fed = True  # type: ignore[attr-defined]
+                    ctx.metrics.record_provider_result(fatal=True)
+        elif isinstance(exc, SchemaViolation):
             kind, retryable = ErrorKind.EXTRACTION_INVALID.value, False
             message = str(exc)
         elif isinstance(exc, ProviderRetryableError):

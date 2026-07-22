@@ -710,3 +710,175 @@ def test_provider_retryable_exhausted_fails_item():
     (err,) = item.errors
     assert (err.kind, err.retryable) == ("provider_retryable_exhausted", True)
     assert ctx.metrics.counters == {"classify.failures": 1}
+
+
+# ── v1.11 context-budget packing (spec 3.13.4 上下文预算装填 row, V27①) ───────
+
+def budget_cfg(context_window: int, **kw) -> ResolvedConfig:
+    """make_cfg + a budget-declared [llm.default] profile (cw=0 = budget OFF)."""
+    from dataclasses import replace
+    from labelkit.common.config.model import LLMProfile
+    prof = LLMProfile(name="default", provider="openai_compatible",
+                      base_url="http://x", model="m", api_key_env="K",
+                      max_output_tokens=256, context_window=context_window)
+    return replace(make_cfg(**kw), llm_profiles={"default": prof})
+
+
+class _FixedCalibrator:
+    def __init__(self, value: int):
+        self.value = value
+
+    def cost(self, profile: str) -> int:
+        return self.value
+
+
+def budget_ctx(cfg, engine, image_cost: int = 100) -> SimpleNamespace:
+    return SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(image_cost)),
+                           schema_engine=engine, metrics=RecordingMetrics(),
+                           rng=None, batch_no=1)
+
+
+def big_ui_record(n: int = 80) -> Record:
+    nodes = [UINode("1", None, 0, "FrameLayout", "", "", (0, 0, 1080, 1920), True, {})]
+    nodes += [UINode(str(i + 2), "1", 1, "TextView", "文本行" + "字" * 20, "",
+                     (0, i, 1080, i + 10), True, {}) for i in range(n)]
+    image = ImageRef(path=__import__("pathlib").Path("image_9.png"),
+                     format="png", size_bytes=1)
+    return Record(id="a" * 16, modality="ui", text=None, raw=None,
+                  ui_tree=UITree(tuple(nodes)), image=image,
+                  ref=RecordRef("b/uitree_9.jsonl", None, 9, ()))
+
+
+async def test_budget_dynamic_tree_cap_trims_with_node_marker():
+    from labelkit.common.runtime import budget as budget_mod
+
+    cfg = budget_cfg(1200, modality="ui")
+    rec = big_ui_record()
+    item = PipelineItem(record=rec)
+    engine = MapEngine({rec.id: {"class": "qa"}})
+    ctx = budget_ctx(cfg, engine, image_cost=100)
+    await ClassifyStage(cfg).run([item], ctx)
+    assert item.status == "active"
+    (call,) = engine.calls
+    tree_part = call[1].messages[-1].parts[2].text
+    body = tree_part.removeprefix("[UI 控件树]\n")
+    # trailing-line drop with the serialize-family marker in place
+    assert body.split("\n")[-1].startswith("…(truncated ")
+    assert body.split("\n")[-1].endswith(" nodes)")
+    full = rec.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars)
+    assert body != full and body.split("\n")[0] == full.split("\n")[0]
+    assert ctx.metrics.counters["budget.truncations.classify"] == 1
+    # the whole prompt honours the throat invariant (same estimator, V16)
+    prof = cfg.llm_profiles["default"]
+    est = budget_mod.est_prompt(call[1], prof, None, image_cost=100)
+    assert est <= budget_mod.input_budget(prof)
+
+    # determinism: an identical re-run builds the identical prompt
+    engine2 = MapEngine({rec.id: {"class": "qa"}})
+    ctx2 = budget_ctx(cfg, engine2, image_cost=100)
+    await ClassifyStage(cfg).run([PipelineItem(record=big_ui_record())], ctx2)
+    assert engine2.calls[0][1] == call[1]
+
+
+def test_budget_off_prompt_byte_identical():
+    # cw == 0 → the packing layer is dead code: the assembled prompt equals the
+    # frozen public builder's output byte-for-byte (§1 byte-equivalence anchor).
+    rec = big_ui_record()
+    off_cfg = budget_cfg(0, modality="ui")
+    anchor = build_classify_prompt(rec, make_cfg(modality="ui"), with_reason=False)
+    item = PipelineItem(record=rec)
+    engine = MapEngine({rec.id: {"class": "qa"}})
+    ctx = budget_ctx(off_cfg, engine)
+    asyncio.run(ClassifyStage(off_cfg).run([item], ctx))
+    assert engine.calls[0][1] == anchor
+    assert not any(k.startswith("budget.") for k in ctx.metrics.counters)
+
+
+def test_budget_sequence_digest_body_trims_same_family():
+    cfg = budget_cfg(1000)                             # text modality, no images
+    members = [text_record("步骤" + "字" * 120, rid=f"s{i}") for i in range(1, 9)]
+    rec = seq_record(members)
+    item = PipelineItem(record=rec)
+    engine = MapEngine({rec.id: {"class": "qa"}})
+    ctx = budget_ctx(cfg, engine)
+    asyncio.run(ClassifyStage(cfg).run([item], ctx))
+    assert item.status == "active"
+    (call,) = engine.calls
+    body = call[1].messages[-1].parts[0].text.removeprefix("[待分类数据·序列]\n")
+    lines = body.split("\n")
+    assert lines[0].startswith("1. ")                  # first member kept
+    assert lines[-2].startswith("8. ")                 # last member kept
+    assert lines[-1].startswith("…(truncated ") and lines[-1].endswith(" members)")
+    assert ctx.metrics.counters["budget.truncations.classify"] == 1
+
+
+def test_budget_minimal_unit_unfittable_fails_record_no_call():
+    # V10: even the single record cannot fit (huge calibrated image cost) — the
+    # doomed request is never sent; kind=context_overflow → rejects, counted in
+    # budget.overflow_records; precheck never feeds the breaker.
+    cfg = budget_cfg(1200, modality="ui")
+    rec = big_ui_record()
+    item = PipelineItem(record=rec)
+    ctx = budget_ctx(cfg, ExplodingEngine(), image_cost=10_000)
+    asyncio.run(ClassifyStage(cfg).run([item], ctx))
+    assert item.status == "failed"
+    assert item.errors[0].kind == "context_overflow"
+    assert ctx.metrics.counters["budget.overflow_records"] == 1
+    error_events = [e for e in ctx.metrics.events if e[0] == "error"]
+    assert error_events and error_events[0][3]["kind"] == "context_overflow"
+
+
+def test_classifier_branch_context_overflow_and_output_truncated():
+    # V27①: the budget vocabulary routes FIRST in the per-record classifier —
+    # never internal_error; overflow rejects count budget.overflow_records.
+    from labelkit.common.errors import ContextOverflowError, OutputTruncatedError
+
+    cfg = make_cfg()
+    rec = text_record()
+    item = PipelineItem(record=rec)
+    exc = ContextOverflowError("over", phase="precheck")
+    out, ctx = run_stage(cfg, [item], MapEngine({rec.id: exc}))
+    assert item.status == "failed"
+    assert item.errors[0].kind == "context_overflow"
+    assert ctx.metrics.counters["budget.overflow_records"] == 1
+
+    item2 = PipelineItem(record=rec)
+    out, ctx2 = run_stage(cfg, [item2],
+                          MapEngine({rec.id: OutputTruncatedError("cap")}))
+    assert item2.status == "failed"
+    assert item2.errors[0].kind == "output_truncated"
+    assert "budget.overflow_records" not in ctx2.metrics.counters
+
+
+def test_reactive_400_terminal_feeds_breaker_exactly_once():
+    # A7/§7.8 matrix: reactive-400 → the owning operator feeds the fatal streak
+    # exactly once; the 200-shaped finish oracle (origin="finish") never feeds.
+    from labelkit.common.errors import ContextOverflowError
+
+    class FeedMetrics(RecordingMetrics):
+        def __init__(self):
+            super().__init__()
+            self.fed: list = []
+
+        def record_provider_result(self, fatal, *, hard=False):
+            self.fed.append((fatal, hard))
+
+    cfg = make_cfg()
+    rec = text_record()
+
+    exc = ContextOverflowError("sniff hit", phase="reactive")   # origin defaults http_400
+    item = PipelineItem(record=rec)
+    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=MapEngine({rec.id: exc}),
+                          metrics=FeedMetrics(), rng=None, batch_no=1)
+    asyncio.run(ClassifyStage(cfg).run([item], ctx))
+    assert item.errors[0].kind == "context_overflow"
+    assert ctx.metrics.fed == [(True, False)]
+
+    exc200 = ContextOverflowError("finish oracle", phase="reactive")
+    exc200.origin = "finish"                                    # 200-shaped: never fed
+    item2 = PipelineItem(record=rec)
+    ctx2 = SimpleNamespace(cfg=cfg, llm=None, schema_engine=MapEngine({rec.id: exc200}),
+                           metrics=FeedMetrics(), rng=None, batch_no=1)
+    asyncio.run(ClassifyStage(cfg).run([item2], ctx2))
+    assert item2.errors[0].kind == "context_overflow"
+    assert ctx2.metrics.fed == []

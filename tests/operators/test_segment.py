@@ -1,10 +1,14 @@
 """Offline unit tests for M14 segment: prompt assembly (spec 3.14.4 / CONTRACTS §10.9),
-the judge_window post-validation (first-wins, absent → "continues"), sliding-window
-stitching (seam frame belongs to the later window), the deterministic segment
-assembly (noise / boundary / min_len / episode), strategy routing (rules and
-lone-frame sessions cost zero LLM), the on_error two-path policy (S26), the ②b
-contract, and the digest-poverty guard (S12). Pure logic only — no LLM: the schema
-engine is replaced by the in-process complete_validated stubs (test_classify 惯例)."""
+the judge_window post-validation (first-wins, absent → "continues"), the window cut
+(fixed fallback + the v1.11 V9 greedy budget packer — seam frame belongs to the later
+window in both), the deterministic segment assembly (noise / boundary / min_len /
+episode), strategy routing (rules and lone-frame sessions cost zero LLM), the on_error
+two-path policy (S26) with the V27① error classification (context_overflow /
+output_truncated), the V20 window-split degrade-retry (bounded halving, A7 breaker
+terminal), the ②b contract, the V9 session-level digest precompute, and the
+digest-poverty guard (S12, V4 wording). Pure logic only — no LLM: the schema engine is
+replaced by the in-process complete_validated stubs (test_classify 惯例); budget-off
+configs (no llm_profiles / context_window == 0) are the v1.10 regression anchor."""
 from __future__ import annotations
 
 import asyncio
@@ -12,9 +16,14 @@ import hashlib
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from labelkit.operators.segment import (
     SegmentStage,
+    _judge_span_degrading,
+    _pack_windows,
     _reason_requested,
+    _static_prompt_est,
     _window_spans,
     build_segment_prompt,
     judge_window,
@@ -28,6 +37,7 @@ from labelkit.common.config.model import (
     ExtractConfig,
     GenerateConfig,
     InputConfig,
+    LLMProfile,
     OutputConfig,
     QualityConfig,
     ResolvedConfig,
@@ -40,7 +50,12 @@ from labelkit.common.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.common.errors import SchemaViolation
+from labelkit.common.errors import (
+    ContextOverflowError,
+    OutputTruncatedError,
+    SchemaViolation,
+)
+from labelkit.common.runtime import budget as budget_mod
 from labelkit.common.runtime.schema_engine import segment_window_schema
 from labelkit.common.contracts.types import (
     ImageRef,
@@ -51,17 +66,16 @@ from labelkit.common.contracts.types import (
     UITree,
     Usage,
     frame_digest,
-    tree_diff,
 )
 
 
 def make_cfg(*, strategy="hybrid", window=20, digest_max_chars=400,
              noise_filter=True, min_len=2, vision_resolved=False, context="",
-             on_error="keep", trace=None) -> ResolvedConfig:
+             on_error="keep", trace=None, llm_profiles=None) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
         console=ConsoleConfig(),
-        llm_profiles={},
+        llm_profiles=llm_profiles or {},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="ui", input="in"),
         input=InputConfig(),
@@ -92,6 +106,15 @@ def make_cfg(*, strategy="hybrid", window=20, digest_max_chars=400,
         config_digest="sha256:0",
         project_digest="sha256:0",
     )
+
+
+def llm_profile(*, context_window=0, max_output_tokens=256) -> LLMProfile:
+    """A budget-declared (or not) segment profile — context_window == 0 is the
+    v1.10 budget-off anchor, > 0 flips the V9 greedy packer on."""
+    return LLMProfile(name="default", provider="openai_compatible",
+                      base_url="http://localhost", model="glm-5.2",
+                      api_key_env="K", max_output_tokens=max_output_tokens,
+                      context_window=context_window)
 
 
 def ui_frame(rid, pair_index, *, texts=("外卖首页推荐列表",),
@@ -133,6 +156,11 @@ def window_obj(*relations, reasons=None) -> dict:
     return {"frames": frames}
 
 
+def digests_of(frames, max_chars=400) -> list[str]:
+    """The session-level digest vector callers now precompute (V9)."""
+    return [frame_digest(frame, max_chars) for frame in frames]
+
+
 # ── in-process complete_validated stubs (no LLM, test_classify 惯例) ─────────
 
 class QueueEngine:
@@ -168,6 +196,25 @@ class MapEngine:
         return out, Usage(), 1, "glm-5.2"
 
 
+class SpanEngine:
+    """Keyed by (first frame id, window frame count) — an original window and
+    its V20 sub-windows share the first frame, the frame count (read off the
+    internal schema's pinned minItems) tells them apart."""
+
+    def __init__(self, by_key):
+        self.by_key = dict(by_key)
+        self.calls: list = []              # (first frame id, frame count)
+
+    async def complete_validated(self, profile, prompt, schema=None, *,
+                                 record_ids=(), batch_no=0, record=None):
+        key = (record_ids[0], schema["properties"]["frames"]["minItems"])
+        self.calls.append(key)
+        out = self.by_key[key]
+        if isinstance(out, Exception):
+            raise out
+        return out, Usage(), 1, "glm-5.2"
+
+
 class ExplodingEngine:
     async def complete_validated(self, *a, **k):
         raise AssertionError("complete_validated must not be called")
@@ -177,6 +224,7 @@ class RecordingMetrics:
     def __init__(self):
         self.events: list = []             # (ev, stage, record_ids, payload)
         self.counters: dict[str, int] = {}
+        self.provider_results: list = []   # (fatal, hard) breaker feeds (A7)
 
     def event(self, ev, *, stage, batch_no, record_ids=(), payload=None):
         self.events.append((ev, stage, tuple(record_ids), dict(payload or {})))
@@ -184,14 +232,30 @@ class RecordingMetrics:
     def count(self, key, n=1):
         self.counters[key] = self.counters.get(key, 0) + n
 
+    def record_provider_result(self, fatal, *, hard=False):
+        self.provider_results.append((fatal, hard))
 
-def make_ctx(cfg, engine):
-    return SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
+
+class StubCalibrator:
+    """ctx.llm.calibrator stand-in — a frozen per-image cost readout (V19
+    batch-frozen snapshot); records reads to pin the once-per-session read."""
+
+    def __init__(self, value):
+        self.value = value
+        self.calls: list = []
+
+    def cost(self, profile):
+        self.calls.append(profile)
+        return self.value
+
+
+def make_ctx(cfg, engine, llm=None):
+    return SimpleNamespace(cfg=cfg, llm=llm, schema_engine=engine,
                            metrics=RecordingMetrics(), rng=None, batch_no=1)
 
 
-def run_stage(cfg, batch, engine, stage=None):
-    ctx = make_ctx(cfg, engine)
+def run_stage(cfg, batch, engine, stage=None, llm=None):
+    ctx = make_ctx(cfg, engine, llm=llm)
     out = asyncio.run((stage or SegmentStage(cfg)).run(batch, ctx))
     return out, ctx
 
@@ -203,13 +267,20 @@ def status_tally(items):
     return tally
 
 
+def boundary_windows(ctx):
+    """The dispatched window spans in event order (stub engines never yield,
+    so gather runs jobs in creation order — deterministic)."""
+    return [tuple(payload["window"]) for ev, _, _, payload in ctx.metrics.events
+            if ev == "segment.boundary"]
+
+
 # ── prompt assembly (§10.9, deterministic) ──────────────────────────────────
 
 def test_system_message_verbatim_no_reason_no_context():
     frames = [ui_frame("f0", 3), ui_frame("f1", 4, texts=("搜索美食页面",)),
               ui_frame("f2", 5, texts=("麻辣烫搜索结果",))]
     bundle = build_segment_prompt(frames, [None, None, None], make_cfg(),
-                                  with_reason=False)
+                                  False, digests_of(frames))
     assert [m.role for m in bundle.messages] == ["system", "user"]
     assert bundle.messages[0].parts[0].text == (
         "你是屏幕操作流的分段审核员。下面给出同一会话中按时间顺序排列的 3 帧状态摘要\n"
@@ -234,8 +305,8 @@ def test_system_message_verbatim_no_reason_no_context():
 def test_system_message_reason_fragment_and_context_line():
     frames = [ui_frame("f0", 3), ui_frame("f1", 4)]
     cfg = make_cfg(context="这是手机屏幕操作流")
-    text = build_segment_prompt(frames, [None, None], cfg,
-                                with_reason=True).messages[0].parts[0].text
+    text = build_segment_prompt(frames, [None, None], cfg, True,
+                                digests_of(frames)).messages[0].parts[0].text
     # optional domain-context line sits between the anchors and the structure
     # sentence; reason fragment appears in the structure line when requested
     assert text.endswith(
@@ -245,8 +316,8 @@ def test_system_message_reason_fragment_and_context_line():
         '{"frames": [{"index": <窗内帧序号>, "relation": <词表值>, '
         '"reason": <一句话理由>}, ...]}（恰 2 项）')
     # default: no context line
-    plain = build_segment_prompt(frames, [None, None], make_cfg(),
-                                 with_reason=False).messages[0].parts[0].text
+    plain = build_segment_prompt(frames, [None, None], make_cfg(), False,
+                                 digests_of(frames)).messages[0].parts[0].text
     assert "这是手机屏幕操作流" not in plain
     assert ("忽略状态栏、后台通知等背景变化。\n"
             "输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：\n") in plain
@@ -256,14 +327,25 @@ def test_user_parts_frame_labels_and_diff_lines():
     frames = [ui_frame("f0", 3), ui_frame("f1", 4, texts=("搜索美食页面",))]
     diff = {"added": 2, "removed": 1, "text_changed": 3, "change_ratio": 0.25,
             "app_changed": True, "title_changed": False}
-    bundle = build_segment_prompt(frames, [None, diff], make_cfg(),
-                                  with_reason=False)
+    bundle = build_segment_prompt(frames, [None, diff], make_cfg(), False,
+                                  digests_of(frames))
     parts = bundle.messages[1].parts
     assert [p.kind for p in parts] == ["text", "text"]
     assert parts[0].text == f"[帧 0] {frame_digest(frames[0], 400)}"
     assert parts[1].text == (
         f"[帧 1] {frame_digest(frames[1], 400)}\n"
         "[帧 1 变更] 新增 2 节点，移除 1 节点，文本变化 3 处，变更比例 25%，应用切换")
+
+
+def test_builder_consumes_supplied_digests_verbatim():
+    # V9: the builder never digests frames itself — the supplied vector is
+    # what lands in the "[帧 {i}] " lines, byte for byte.
+    frames = [ui_frame("f0", 3), ui_frame("f1", 4)]
+    bundle = build_segment_prompt(frames, [None, None], make_cfg(), False,
+                                  ["摘要甲", "摘要乙"])
+    parts = bundle.messages[1].parts
+    assert parts[0].text == "[帧 0] 摘要甲"
+    assert parts[1].text == "[帧 1] 摘要乙"
 
 
 def test_render_tree_diff_fixed_format_and_flags():
@@ -278,11 +360,12 @@ def test_render_tree_diff_fixed_format_and_flags():
 
 def test_vision_resolved_two_state_parts_shape():
     frames = [ui_frame("f0", 3), ui_frame("f1", 4)]
-    plain = build_segment_prompt(frames, [None, None], make_cfg(),
-                                 with_reason=False)
+    plain = build_segment_prompt(frames, [None, None], make_cfg(), False,
+                                 digests_of(frames))
     assert [p.kind for p in plain.messages[1].parts] == ["text", "text"]
     vision = build_segment_prompt(frames, [None, None],
-                                  make_cfg(vision_resolved=True), with_reason=False)
+                                  make_cfg(vision_resolved=True), False,
+                                  digests_of(frames))
     parts = vision.messages[1].parts
     assert [p.kind for p in parts] == ["image", "text", "image", "text"]
     assert parts[0].image is frames[0].image     # each digest preceded by its frame
@@ -361,14 +444,90 @@ def test_judge_window_with_reason_schema_and_reason_list_in_payload():
         '"reason": <一句话理由>}, ...]}（恰 2 项）')
 
 
-# ── sliding-window spans + stitching ─────────────────────────────────────────
+def test_public_judge_window_self_computes_digests(monkeypatch):
+    # The frozen public surface (M7's reclaim re-judgment, verify.py) passes no
+    # digest vector — _judge_window computes its own table (CONTRACTS §7.14).
+    calls = []
 
-def test_window_spans_stride_is_window_minus_one():
+    def counting(record, max_chars):
+        calls.append((record.id, max_chars))
+        return frame_digest(record, max_chars)
+
+    monkeypatch.setattr("labelkit.operators.segment.frame_digest", counting)
+    frames = [ui_frame("f0", 3), ui_frame("f1", 4)]
+    engine = QueueEngine([window_obj("continues", "continues")])
+    asyncio.run(judge_window(frames, make_ctx(make_cfg(), engine)))
+    assert calls == [("f0", 400), ("f1", 400)]
+    parts = engine.calls[0][1].messages[1].parts
+    assert parts[0].text == f"[帧 0] {frame_digest(frames[0], 400)}"
+
+
+# ── window cut: fixed fallback (budget off) + greedy packer (V9) ─────────────
+
+def test_window_spans_fixed_fallback_stride_is_window_minus_one():
+    # The budget-undeclared cut — byte-identical to v1.10 (regression anchor).
     assert _window_spans(5, 20) == [(0, 5)]
     assert _window_spans(3, 2) == [(0, 2), (1, 3)]
     assert _window_spans(21, 20) == [(0, 20), (19, 21)]
     assert _window_spans(39, 20) == [(0, 20), (19, 39)]
 
+
+def test_pack_windows_cap_ceiling_degrades_to_fixed_windows():
+    # Unconstrained budget → the frame-count cap alone cuts: the packer's
+    # spans coincide with the fixed v1.10 shape for the same (n, window).
+    for n, cap in ((5, 20), (3, 2), (21, 20), (39, 20)):
+        assert _pack_windows([1] * n, 10 ** 9, cap) == _window_spans(n, cap)
+
+
+def test_pack_windows_overflow_closes_window_with_one_frame_overlap():
+    # frames priced 100, budget 350 → 3 per window; each subsequent window
+    # starts at the previous end − 1 (seam owned by the later window).
+    assert _pack_windows([100] * 6, 350, 20) == [(0, 3), (2, 5), (4, 6)]
+
+
+def test_pack_windows_heterogeneous_costs_cut_at_cost_boundary():
+    costs = [50, 50, 200, 50, 50]
+    # 50+50+200 = 300 fits, +50 overflows → close; resume at the seam frame.
+    assert _pack_windows(costs, 300, 20) == [(0, 3), (2, 5)]
+
+
+def test_pack_windows_min_two_frames_at_exact_two_frame_budget():
+    # The w_min == floor degenerate shape: every window exactly 2 frames,
+    # every frame a seam.
+    assert _pack_windows([10] * 5, 20, 20) == [(0, 2), (1, 3), (2, 4), (3, 5)]
+
+
+def test_pack_windows_defensive_assert_below_two_frames():
+    # The M1 w_min ≥ floor guard promises any 2 frames fit — a budget that
+    # cannot hold 2 frames is a packing-layer invariant breach, asserted.
+    with pytest.raises(AssertionError):
+        _pack_windows([100, 100], 150, 20)
+
+
+def test_pack_windows_deterministic_rerun():
+    costs = [37, 91, 14, 88, 65, 42, 73, 29, 55, 61]
+    first = _pack_windows(costs, 200, 4)
+    assert first == _pack_windows(costs, 200, 4)        # pure function
+    assert first[0][0] == 0
+    for (s1, e1), (s2, e2) in zip(first, first[1:]):
+        assert s2 == e1 - 1                             # 1-frame overlap chain
+    assert all(2 <= e - s <= 4 for s, e in first)       # min-2 ∧ cap
+    assert first[-1][1] == len(costs)                   # every frame covered
+
+
+def test_static_prompt_est_tracks_context_and_reason_variants():
+    # The packer's est_static_system term follows build_segment_prompt's
+    # actual static parts: the optional context line and the longer reason
+    # structure variant both grow it deterministically.
+    base = _static_prompt_est(make_cfg())
+    assert base > 2 * budget_mod.MSG_OVERHEAD_TOKENS
+    assert _static_prompt_est(make_cfg(context="这是手机屏幕操作流")) > base
+    with_reason = _static_prompt_est(make_cfg(
+        trace=TraceConfig(enabled=True, channels=("segment",))))
+    assert with_reason > base
+
+
+# ── stitching across windows (fixed cut, budget off) ────────────────────────
 
 def test_stitching_seam_frame_belongs_to_later_window():
     cfg = make_cfg(window=2, min_len=1)
@@ -380,6 +539,7 @@ def test_stitching_seam_frame_belongs_to_later_window():
                         "f1": window_obj("advances", "continues")})
     out, ctx = run_stage(cfg, batch, engine)
     assert len(engine.calls) == 2
+    assert ctx.metrics.counters["segment.windows"] == 2  # V13④ actual windows
     assert status_tally(batch[:3]) == {"absorbed": 3}   # nothing dropped as noise
     (episode,) = batch[3:]
     assert [r.id for r in episode.record.members] == ["f0", "f1", "f2"]
@@ -569,7 +729,9 @@ def test_ignores_non_active_sequence_and_unstamped_items():
     assert ctx.metrics.events == [] and ctx.metrics.counters == {}
 
 
-# ── on_error two paths (S26) ─────────────────────────────────────────────────
+# ── on_error two paths (S26) — budget off, v1.10 regression anchor ───────────
+# (counters gain the unconditional v1.11 segment.windows dispatch count, V13④;
+# every other asserted value is the v1.10 one.)
 
 def test_on_error_keep_degrades_session_without_item_errors():
     cfg = make_cfg(window=2, on_error="keep")
@@ -588,7 +750,8 @@ def test_on_error_keep_degrades_session_without_item_errors():
     assert [r.id for r in episode.record.members] == ["f0", "f1", "f2"]
     assert episode.segment_degraded == {"kind": "segmentation_invalid",
                                         "windows_failed": 1}
-    assert ctx.metrics.counters == {"segment.failures": 1}
+    assert ctx.metrics.counters == {"segment.failures": 1,
+                                    "segment.windows": 2}
     error_events = [e for e in ctx.metrics.events if e[0] == "error"]
     assert len(error_events) == 1
     assert error_events[0][1] == "segment" and error_events[0][2] == ()
@@ -615,7 +778,8 @@ def test_on_error_fail_marks_all_session_members_failed():
         assert (err.stage, err.kind, err.retryable) == (
             "segment", "segmentation_invalid", False)
         assert err.message == "/frames: 长度不符"
-    assert ctx.metrics.counters == {"segment.failures": 1}
+    assert ctx.metrics.counters == {"segment.failures": 1,
+                                    "segment.windows": 2}
     assert [e[0] for e in ctx.metrics.events].count("error") == 1
 
 
@@ -630,7 +794,8 @@ def test_unexpected_exception_follows_on_error_disposition():
                                         "windows_failed": 1}
     assert status_tally(batch[:2]) == {"absorbed": 2}
     assert all(item.errors == [] for item in batch[:2])
-    assert ctx.metrics.counters == {"segment.failures": 1}
+    assert ctx.metrics.counters == {"segment.failures": 1,
+                                    "segment.windows": 1}
 
 
 def test_multiple_failed_windows_counted_in_degraded_evidence():
@@ -644,7 +809,347 @@ def test_multiple_failed_windows_counted_in_degraded_evidence():
     (episode,) = batch[5:]
     assert episode.segment_degraded == {"kind": "segmentation_invalid",
                                         "windows_failed": 2}
-    assert ctx.metrics.counters == {"segment.failures": 1}  # one per session
+    assert ctx.metrics.counters == {"segment.failures": 1,   # one per session
+                                    "segment.windows": 4}
+
+
+# ── V27① error classification: overflow / truncated window failures ─────────
+
+def test_reactive_overflow_without_budget_classifies_context_overflow():
+    # Budget off (no declared window): the 200-shaped oracle (origin="finish")
+    # takes the plain failure path — no degrade, no breaker feed — and the
+    # kind routes through budget.classify_stage_error (V27①).
+    cfg = make_cfg(on_error="keep")
+    frames = [ui_frame("f0", 0), ui_frame("f1", 1)]
+    batch = [envelope(r) for r in frames]
+    overflow = ContextOverflowError("prompt too long", phase="reactive",
+                                    profile="default", origin="finish")
+    out, ctx = run_stage(cfg, batch, MapEngine({"f0": overflow}))
+    (episode,) = batch[2:]
+    assert episode.segment_degraded == {"kind": "context_overflow",
+                                        "windows_failed": 1}
+    assert ctx.metrics.counters == {"segment.failures": 1,
+                                    "segment.windows": 1}
+    assert ctx.metrics.provider_results == []           # never fed budget-off
+    (err_event,) = [e for e in ctx.metrics.events if e[0] == "error"]
+    assert err_event[3]["kind"] == "context_overflow"
+
+
+def test_output_truncated_window_classifies_without_degrade():
+    # Output-side event (V11): no split retry even with the budget on — a
+    # single dispatched window, kind="output_truncated", breaker untouched.
+    cfg = make_cfg(on_error="keep",
+                   llm_profiles={"default": llm_profile(context_window=131072)})
+    frames = [ui_frame("f0", 0), ui_frame("f1", 1)]
+    batch = [envelope(r) for r in frames]
+    truncated = OutputTruncatedError("output cap", profile="default",
+                                     finish="length")
+    out, ctx = run_stage(cfg, batch, MapEngine({"f0": truncated}))
+    (episode,) = batch[2:]
+    assert episode.segment_degraded == {"kind": "output_truncated",
+                                        "windows_failed": 1}
+    assert ctx.metrics.counters == {"segment.failures": 1,
+                                    "segment.windows": 1}
+    assert "budget.degrade_retries" not in ctx.metrics.counters
+    assert ctx.metrics.provider_results == []
+
+
+def test_overflow_on_error_fail_writes_context_overflow_stage_error():
+    cfg = make_cfg(on_error="fail",
+                   llm_profiles={"default": llm_profile(context_window=131072)})
+    frames = [ui_frame("f0", 0), ui_frame("f1", 1)]     # minimal 2-frame window
+    batch = [envelope(r) for r in frames]
+    overflow = ContextOverflowError("400 sniff", phase="reactive",
+                                    profile="default", origin="http_400")
+    out, ctx = run_stage(cfg, batch, MapEngine({"f0": overflow}))
+    assert status_tally(batch) == {"failed": 2}
+    for item in batch:
+        (err,) = item.errors
+        assert (err.stage, err.kind) == ("segment", "context_overflow")
+    # minimal window ⇒ terminal at once; the 400-sniffed form feeds the
+    # breaker exactly once (A7)
+    assert ctx.metrics.provider_results == [(True, False)]
+    assert "budget.degrade_retries" not in ctx.metrics.counters
+
+
+# ── V20 window-split degrade-retry (unit seam: injected judge) ───────────────
+
+def degrade_ctx():
+    return SimpleNamespace(cfg=None, llm=None, schema_engine=None,
+                           metrics=RecordingMetrics(), rng=None, batch_no=1)
+
+
+def run_degrading(judge, span, ctx):
+    return asyncio.run(_judge_span_degrading(judge, span, ctx))
+
+
+def test_degrade_splits_once_and_merges_leaves_in_span_order():
+    calls = []
+
+    async def judge(span):
+        calls.append(span)
+        if span == (0, 8):
+            raise ContextOverflowError("over", phase="reactive",
+                                       origin="http_400")
+        return [f"v{span[0]}:{i}" for i in range(span[1] - span[0])]
+
+    ctx = degrade_ctx()
+    results = run_degrading(judge, (0, 8), ctx)
+    # halves [s, m+1) / [m, e) keep the 1-frame overlap (frame 4 judged twice,
+    # later sub-window owns it via the assembly overwrite order)
+    assert calls == [(0, 8), (0, 5), (4, 8)]
+    assert [span for span, _ in results] == [(0, 5), (4, 8)]
+    assert results[0][1] == ["v0:0", "v0:1", "v0:2", "v0:3", "v0:4"]
+    assert ctx.metrics.counters == {"budget.degrade_retries": 1}
+    assert ctx.metrics.provider_results == []           # degrade succeeded
+
+
+def test_degrade_second_level_halving_of_a_half():
+    calls = []
+
+    async def judge(span):
+        calls.append(span)
+        if span in {(0, 8), (0, 5)}:
+            raise ContextOverflowError("over", phase="reactive",
+                                       origin="http_400")
+        return ["continues"] * (span[1] - span[0])
+
+    ctx = degrade_ctx()
+    results = run_degrading(judge, (0, 8), ctx)
+    assert calls == [(0, 8), (0, 5), (0, 3), (2, 5), (4, 8)]
+    assert [span for span, _ in results] == [(0, 3), (2, 5), (4, 8)]
+    assert ctx.metrics.counters == {"budget.degrade_retries": 2}
+    assert ctx.metrics.provider_results == []
+
+
+def test_degrade_level_bound_terminal_feeds_breaker_once_for_http_400():
+    calls = []
+
+    async def judge(span):
+        calls.append(span)
+        raise ContextOverflowError("over", phase="reactive", origin="http_400")
+
+    ctx = degrade_ctx()
+    with pytest.raises(ContextOverflowError):
+        run_degrading(judge, (0, 16), ctx)
+    # level 0 (0,16) → level 1 (0,9) → level 2 (0,5): the level bound makes it
+    # terminal — the tree stops at the first terminal leaf (sequential halves)
+    assert calls == [(0, 16), (0, 9), (0, 5)]
+    assert ctx.metrics.counters == {"budget.degrade_retries": 2}
+    assert ctx.metrics.provider_results == [(True, False)]   # exactly once (A7)
+
+
+def test_degrade_minimal_two_frame_window_is_terminal():
+    async def judge(span):
+        raise ContextOverflowError("over", phase="reactive", origin="http_400")
+
+    ctx = degrade_ctx()
+    with pytest.raises(ContextOverflowError):
+        run_degrading(judge, (0, 2), ctx)               # cannot split below 2+2
+    assert "budget.degrade_retries" not in ctx.metrics.counters
+    assert ctx.metrics.provider_results == [(True, False)]
+
+
+def test_degrade_terminal_finish_origin_never_feeds_breaker():
+    # SPEC §3.5: the 200-shaped oracle rode a successful HTTP interaction —
+    # its terminal never feeds the breaker (streak already cleared by the ok).
+    async def judge(span):
+        raise ContextOverflowError("over", phase="reactive", origin="finish")
+
+    ctx = degrade_ctx()
+    with pytest.raises(ContextOverflowError):
+        run_degrading(judge, (0, 2), ctx)
+    assert ctx.metrics.provider_results == []
+
+
+def test_degrade_precheck_phase_never_degrades_or_feeds():
+    calls = []
+
+    async def judge(span):
+        calls.append(span)
+        raise ContextOverflowError("packing bug", phase="precheck")
+
+    ctx = degrade_ctx()
+    with pytest.raises(ContextOverflowError):
+        run_degrading(judge, (0, 8), ctx)
+    assert calls == [(0, 8)]                            # no split attempted
+    assert ctx.metrics.counters == {}
+    assert ctx.metrics.provider_results == []
+
+
+# ── V20 through the stage (budget on) ────────────────────────────────────────
+
+def test_stage_degrade_retry_merges_sub_window_verdicts():
+    cfg = make_cfg(on_error="keep",
+                   llm_profiles={"default": llm_profile(context_window=131072)})
+    frames = [ui_frame(f"f{i}", i) for i in range(5)]   # one packed window (0,5)
+    batch = [envelope(r) for r in frames]
+    overflow = ContextOverflowError("over", phase="reactive",
+                                    origin="http_400", profile="default")
+    engine = SpanEngine({
+        ("f0", 5): overflow,                            # original window
+        ("f0", 3): window_obj("continues", "continues", "continues"),  # (0,3)
+        ("f2", 3): window_obj("continues", "context_switch", "continues"),  # (2,5)
+    })
+    out, ctx = run_stage(cfg, batch, engine)
+    # sub-window verdicts land at session positions: boundary at frame 3
+    episodes = batch[5:]
+    assert [[r.id for r in e.record.members] for e in episodes] == [
+        ["f0", "f1", "f2"], ["f3", "f4"]]
+    assert status_tally(batch[:5]) == {"absorbed": 5}
+    assert ctx.metrics.counters["budget.degrade_retries"] == 1
+    assert ctx.metrics.counters["segment.windows"] == 3  # 1 original + 2 subs
+    assert "segment.failures" not in ctx.metrics.counters
+    assert ctx.metrics.provider_results == []           # degrade succeeded
+    assert boundary_windows(ctx) == [(0, 3), (2, 5)]    # leaves in span order
+
+
+def test_stage_degrade_exhaustion_disposes_context_overflow_and_feeds_once():
+    cfg = make_cfg(on_error="keep",
+                   llm_profiles={"default": llm_profile(context_window=131072)})
+    frames = [ui_frame(f"f{i}", i) for i in range(3)]   # one packed window (0,3)
+    batch = [envelope(r) for r in frames]
+    overflow = ContextOverflowError("over", phase="reactive",
+                                    origin="http_400", profile="default")
+    engine = SpanEngine({("f0", 3): overflow,           # original window
+                         ("f0", 2): overflow})          # first half (0,2): minimal
+    out, ctx = run_stage(cfg, batch, engine)
+    # first half's terminal stops the tree — the second half is never judged
+    assert engine.calls == [("f0", 3), ("f0", 2)]
+    (episode,) = batch[3:]
+    assert episode.segment_degraded == {"kind": "context_overflow",
+                                        "windows_failed": 1}
+    assert all(item.errors == [] for item in batch[:3])  # keep: never item.errors
+    assert ctx.metrics.counters == {"segment.failures": 1,
+                                    "segment.windows": 2,
+                                    "budget.degrade_retries": 1}
+    assert ctx.metrics.provider_results == [(True, False)]  # exactly once (A7)
+    (err_event,) = [e for e in ctx.metrics.events if e[0] == "error"]
+    assert err_event[3]["kind"] == "context_overflow"
+
+
+# ── budget-on packing through the stage (V9) ─────────────────────────────────
+
+def packed_spans(cfg, frames, image_cost=0):
+    """The spans the stage is expected to dispatch — computed with the same
+    production primitives the stage uses (wiring equality; the packer's own
+    arithmetic is pinned by the direct _pack_windows tests above)."""
+    prof = cfg.llm_profiles["default"]
+    costs = [budget_mod.est_text(d) + budget_mod.DIFF_MAX_TOKENS + image_cost
+             for d in digests_of(frames, cfg.segment.digest_max_chars)]
+    return _pack_windows(costs, budget_mod.input_budget(prof)
+                         - _static_prompt_est(cfg), cfg.segment.window)
+
+
+def test_budget_on_cost_driven_splits_below_the_cap():
+    # A small declared window: the budget, not the frame-count cap, cuts the
+    # session (cap 20 stays unfilled).
+    cfg = make_cfg(min_len=1,
+                   llm_profiles={"default": llm_profile(context_window=2048)})
+    frames = [ui_frame(f"f{i}", i) for i in range(10)]
+    expected = packed_spans(cfg, frames)
+    assert len(expected) > 1                            # the budget drove the cut
+    assert all(e - s < 20 for s, e in expected)         # cap never reached
+    batch = [envelope(r) for r in frames]
+    engine = MapEngine({f"f{s}": window_obj(*["continues"] * (e - s))
+                        for s, e in expected})
+    out, ctx = run_stage(cfg, batch, engine)
+    assert boundary_windows(ctx) == expected
+    assert ctx.metrics.counters["segment.windows"] == len(expected)
+    # all frames absorbed into one episode (all continues)
+    assert status_tally(batch[:10]) == {"absorbed": 10}
+    (episode,) = batch[10:]
+    assert len(episode.record.members) == 10
+
+
+def test_budget_on_same_input_rerun_yields_byte_identical_spans():
+    cfg = make_cfg(min_len=1,
+                   llm_profiles={"default": llm_profile(context_window=2048)})
+
+    def one_run():
+        frames = [ui_frame(f"f{i}", i) for i in range(10)]
+        expected = packed_spans(cfg, frames)
+        engine = MapEngine({f"f{s}": window_obj(*["continues"] * (e - s))
+                            for s, e in expected})
+        out, ctx = run_stage(cfg, [envelope(r) for r in frames], engine)
+        return boundary_windows(ctx), [
+            payload["member_ids"] for ev, _, _, payload in ctx.metrics.events
+            if ev == "segment.boundary"]
+
+    first_spans, first_members = one_run()
+    second_spans, second_members = one_run()
+    assert len(first_spans) > 1
+    assert first_spans == second_spans                  # deterministic rerun
+    assert first_members == second_members
+
+
+def test_budget_on_vision_image_cost_prices_frames_and_reads_calibrator_once():
+    # vision_resolved adds the calibrator's per-image cost to every frame:
+    # the same 4-frame session that fits ONE text-only window splits under
+    # image pricing; the calibrator snapshot is read once per session.
+    profiles = {"default": llm_profile(context_window=2900)}
+    text_cfg = make_cfg(min_len=1, llm_profiles=profiles)
+    frames = [ui_frame(f"f{i}", i) for i in range(4)]
+    assert packed_spans(text_cfg, frames) == [(0, 4)]   # text-only: one window
+
+    vision_cfg = make_cfg(min_len=1, vision_resolved=True, llm_profiles=profiles)
+    expected = packed_spans(vision_cfg, frames, image_cost=500)
+    assert len(expected) == 3                           # image cost forces splits
+    calibrator = StubCalibrator(500)
+    engine = MapEngine({f"f{s}": window_obj(*["continues"] * (e - s))
+                        for s, e in expected})
+    batch = [envelope(r) for r in frames]
+    out, ctx = run_stage(vision_cfg, batch, engine,
+                         llm=SimpleNamespace(calibrator=calibrator))
+    assert calibrator.calls == ["default"]              # ONE read per session
+    assert boundary_windows(ctx) == expected
+    # vision prompts carry one image part per frame
+    parts = engine.calls[0][1].messages[1].parts
+    assert [p.kind for p in parts][:2] == ["image", "text"]
+
+
+def test_budget_off_profile_with_zero_window_keeps_fixed_cut():
+    # context_window == 0 on the referenced profile = budget off: the fixed
+    # v1.10 cut, even though the profile table is populated.
+    cfg = make_cfg(window=2, min_len=1,
+                   llm_profiles={"default": llm_profile(context_window=0)})
+    frames = [ui_frame("f0", 0), ui_frame("f1", 1), ui_frame("f2", 2)]
+    batch = [envelope(r) for r in frames]
+    engine = MapEngine({"f0": window_obj("continues", "continues"),
+                        "f1": window_obj("continues", "continues")})
+    out, ctx = run_stage(cfg, batch, engine)
+    assert boundary_windows(ctx) == [(0, 2), (1, 3)]    # stride = window − 1
+    assert ctx.metrics.counters["segment.windows"] == 2
+
+
+# ── V9 session-level digest precompute ───────────────────────────────────────
+
+def test_digests_computed_once_per_frame_per_session(monkeypatch):
+    # v1.10 digested per window inclusion (the seam frame twice); v1.11
+    # precomputes the session vector once — exactly one frame_digest call per
+    # frame. (digest_is_poor's internal call lives in types.py and is not
+    # routed through the segment module's name — the poverty path stays
+    # independent by design.)
+    calls = []
+
+    def counting(record, max_chars):
+        calls.append((record.id, max_chars))
+        return frame_digest(record, max_chars)
+
+    monkeypatch.setattr("labelkit.operators.segment.frame_digest", counting)
+    cfg = make_cfg(window=2, min_len=1)                 # 3 frames → 2 windows (seam)
+    frames = [ui_frame("f0", 0), ui_frame("f1", 1), ui_frame("f2", 2)]
+    batch = [envelope(r) for r in frames]
+    engine = MapEngine({"f0": window_obj("continues", "continues"),
+                        "f1": window_obj("continues", "continues")})
+    out, ctx = run_stage(cfg, batch, engine)
+    assert sorted(calls) == [("f0", 400), ("f1", 400), ("f2", 400)]
+    # the seam frame's digest still reached both windows' prompts
+    first_parts = engine.calls[0][1].messages[1].parts
+    second_parts = engine.calls[1][1].messages[1].parts
+    seam_digest = frame_digest(frames[1], 400)
+    assert first_parts[1].text.startswith(f"[帧 1] {seam_digest}")
+    assert second_parts[0].text.startswith(f"[帧 0] {seam_digest}")
 
 
 # ── ②b contract ──────────────────────────────────────────────────────────────
@@ -700,7 +1205,9 @@ def test_digest_poor_frames_counted_once_per_frame_and_warned_once_per_run(
     # per frame, not per window appearance (the seam frame counts once)
     assert ctx.metrics.counters["segment.digest_poor_frames"] == 3
     assert len(logger.warnings) == 1
-    assert "segment.use_vision" in logger.warnings[0]
+    # V4 wording: profile capability, never the removed use_vision key
+    assert "为 segment.llm 配置 supports_vision=true 的 profile" in logger.warnings[0]
+    assert "use_vision" not in logger.warnings[0]
     # second batch through the SAME stage instance: counted again, no new WARN
     batch2 = [envelope(bare_frame("g0", 0), sid="s2"),
               envelope(bare_frame("g1", 1), sid="s2")]
