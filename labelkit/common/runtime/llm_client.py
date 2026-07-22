@@ -777,10 +777,22 @@ class LLMClient:
             if is_llm:
                 prompt = PromptBundle(messages=(
                     Message(role="user", parts=(Part(kind="text", text="ping"),)),))
-                resp = await client.complete(profile, prompt)
+                try:
+                    resp = await client.complete(profile, prompt)
+                    model, latency_ms = resp.model, resp.latency_ms
+                except OutputTruncatedError:
+                    # v1.11 P6 fix: a max_output_tokens=1 probe is terminated
+                    # AT the output cap by construction on conformant
+                    # endpoints (anthropic stop_reason="max_tokens" — z.ai
+                    # measured 2026-07-23), which the V11 disposition would
+                    # otherwise classify as a failure. For the probe that IS
+                    # the proof of life (auth passed, model responded, usage
+                    # returned) — spec 3.9.4 probe semantics unchanged.
+                    model = prof.model
+                    latency_ms = int((time.monotonic() - start) * 1000)
                 self._merge_usage(client._usage)
-                return ProbeResult(profile=profile, ok=True, model=resp.model,
-                                   latency_ms=resp.latency_ms, key_env=key_env)
+                return ProbeResult(profile=profile, ok=True, model=model,
+                                   latency_ms=latency_ms, key_env=key_env)
             await client.embed(profile, ["ping"])
             self._merge_usage(client._usage)
             return ProbeResult(profile=profile, ok=True, model=prof.model,

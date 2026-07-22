@@ -207,11 +207,15 @@ async def test_classify_multi_real_fans_out_dual_intent_record():
     assert len(plain_items) == 1                               # no fan-out for k=1
 
 
-async def test_classify_fallback_real_schema_exhaustion():
-    # max_output_tokens=2 truncates every response (first call AND both L3 repair
-    # rounds) below any parseable JSON → a REAL SchemaViolation after repair
-    # exhaustion → on_error="fallback" files the record into the fallback class,
-    # keeps it alive, and leaves item.errors empty (R4).
+async def test_classify_output_cap_truncation_is_terminal_not_fallback():
+    # v1.11 ADAPTATION (V11/V27①, spec §7.6 output_truncated): this test's
+    # original max_output_tokens=2 trick used to force truncated JSON through
+    # L1–L3 into a real SchemaViolation → on_error="fallback". Under the V11
+    # finalization the SAME real-endpoint response (stop_reason="max_tokens")
+    # never enters the repair loop: classify's V27① classifier routes it to a
+    # record-level output_truncated failure that BYPASSES the fallback class
+    # (spec 3.13.4 v1.11 row). The fallback-on-SchemaViolation path stays
+    # pinned offline (tests/operators/test_classify.py on_error family).
     cfg = make_cfg(ClassifyConfig(enabled=True, llm="default", assignment="single",
                                   max_labels=3, fallback_class="other",
                                   on_error="fallback", classes=CLASSES),
@@ -223,15 +227,16 @@ async def test_classify_fallback_real_schema_exhaustion():
     result = await ClassifyStage(cfg).run(batch, ctx)
 
     item = result[0]
-    assert item.status == "active"
-    cl = item.classification
-    assert cl is not None
-    assert cl.source == "fallback"
-    assert cl.label == "other" and cl.labels == ("other",)
-    assert cl.detail.get("kind") == "classification_invalid"
-    assert not item.errors                          # R4: no StageError on fallback
-    assert ctx.metrics.counters.get("classify.fallback") == 1
+    assert item.status == "failed"
+    assert item.classification is None              # fallback class NOT applied
+    assert len(item.errors) == 1
+    err = item.errors[0]
+    assert err.kind == "output_truncated" and err.stage == "classify"
+    assert err.retryable is False
+    assert ctx.metrics.counters.get("classify.failures") == 1
+    assert "classify.fallback" not in ctx.metrics.counters
+    assert "budget.overflow_records" not in ctx.metrics.counters  # own bucket
     errors = [e for e in ctx.metrics.events if e[0] == "error"]
-    assert errors and errors[0][4]["kind"] == "classification_invalid"
+    assert errors and errors[0][4]["kind"] == "output_truncated"
     decisions = [e for e in ctx.metrics.events if e[0] == "classify.decision"]
-    assert len(decisions) == 1 and decisions[0][4]["source"] == "fallback"
+    assert not decisions                            # no classification decided

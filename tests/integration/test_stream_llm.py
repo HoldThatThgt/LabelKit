@@ -136,7 +136,13 @@ def make_cfg(sequence_frames: int = 20) -> ResolvedConfig:
         stream=StreamConfig(),
         dedup=DedupConfig(),
         segment=SegmentConfig(enabled=True, strategy="hybrid", llm="default",
-                              window=8, min_len=2, context=SEGMENT_CONTEXT),
+                              window=8, min_len=2, context=SEGMENT_CONTEXT,
+                              # v1.11 (V1): parse product M1 derives for this
+                              # exact cfg (ui modality + hybrid + the profile's
+                              # supports_vision=true) — the window judgment is
+                              # a REAL multi-image call (SPEC v1.11 §3.7 P6
+                              # test_stream_llm 多图窗口适配).
+                              vision_resolved=True),
         stitch=StitchConfig(),
         extract=ExtractConfig(enabled=True, llm="default"),
         classify=ClassifyConfig(),

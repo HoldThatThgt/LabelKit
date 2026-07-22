@@ -113,6 +113,7 @@ EXPECTED_TEST_PY = {
     "tests/conftest.py",
     "tests/hook_samples.py",
     "tests/integration/test_annotate_llm.py",
+    "tests/integration/test_budget_llm.py",
     "tests/integration/test_classify_llm.py",
     "tests/integration/test_generate_llm.py",
     "tests/integration/test_key_pool_llm.py",
