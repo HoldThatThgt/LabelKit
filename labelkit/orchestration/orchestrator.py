@@ -35,7 +35,15 @@ writes (M11 owns the output channels). Responsibilities:
   ``metrics.run_estimate`` emission reusing the P2-4 pre-scan (NEVER a second
   scan), ``metrics.stage_begin`` before every stage.run, ``stop_requested``
   forwarding, and the rich-mode dry-run print yield. All of it is a no-op
-  when no ProgressListener is attached (byte-identical to v1.9).
+  when no ProgressListener is attached (byte-identical to v1.9);
+- v1.11 context budget (spec 3.10.3 上下文预算 row, SPEC-context-budget
+  V12/V13/V19): ``estimate_run`` clamps the segment window argument to
+  ``budget.min_window(cfg)`` (upper-bound semantics), every dispatched batch —
+  and finalize, once more — freezes ``llm.calibrator`` (the F8 batch-frozen
+  calibration snapshot), report assembly adds the ``budget`` node and
+  ``report.stream.windows``, and run startup logs the data-free budget INFO
+  line(s). All of it gates on a declared ``context_window`` so all-undeclared
+  configs keep v1.10 behavior byte-identical.
 """
 from __future__ import annotations
 
@@ -55,9 +63,11 @@ from labelkit import TOOL_VERSION, __version__
 from labelkit.common.contracts.stage import RunContext, Stage
 from labelkit.common.contracts.types import PipelineItem, Record
 from labelkit.common.errors import CircuitBreakerTripped, InternalError
+from labelkit.common.runtime import budget
+from labelkit.orchestration.profile_usage import referenced_profiles
 
 if TYPE_CHECKING:
-    from labelkit.common.config.model import ResolvedConfig
+    from labelkit.common.config.model import LLMProfile, ResolvedConfig
     from labelkit.common.observability.obslog import MetricsSink
     from labelkit.common.runtime.llm_client import LLMClient
     from labelkit.common.runtime.schema_engine import SchemaEngine
@@ -153,9 +163,16 @@ def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
     (re-flow sub-batches inherit their classification and skip M13),
     <generated records> × max(1, sc) in generate_only.
     v1.8 S22 (stream mode): the session table comes from
-    ``plan.session_lens``; ``segment_calls = Σ ceil((L−1)/(window−1))``
-    over sessions of length L ≥ 2 (L = 1 or strategy="rules" counts 0);
-    ``extract_calls = Σ (L−1)`` (extract enabled; UPPER bound); the
+    ``plan.session_lens``; ``segment_calls = Σ ceil((L−1)/(w_eff−1))``
+    over sessions of length L ≥ 2 (L = 1 or strategy="rules" counts 0),
+    where — v1.11 V12 (spec 3.10.3 时序流行) — ``w_eff =
+    min(segment.window, budget.min_window(cfg))``, the worst-case
+    guaranteed packing size (UPPER bound: every actual window packs
+    ≥ w_min frames, so actual windows ≤ estimate; prior-based — V19
+    calibration past the prior or V20 overflow splits relax it back to
+    the "excludes retries/repairs" approximation family above; budget
+    undeclared ⇒ w_min == window, formula and values byte-identical to
+    v1.10); ``extract_calls = Σ (L−1)`` (extract enabled; UPPER bound); the
     classify/quality/annotate/verify record base is ``len(session_lens)``
     (episodes ≈ sessions, LOWER bound — stderr note in _run_dry); the batch
     count comes EXACTLY from a next-fit packing simulation of the session
@@ -204,7 +221,14 @@ def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
         sizes = piece_sizes                        # pairwise pools are episodes
         downstream_base = len(session_lens)
         if cfg.segment.strategy in ("llm", "hybrid"):
-            w = cfg.segment.window
+            # v1.11 (V12): the window argument is the worst-case guaranteed
+            # packing size — min_window is UNCAPPED by design (the M1 V9
+            # guard needs the raw budget-derived value), so the estimate
+            # clamps to the cap at THIS call site. Budget off ⇒ min_window
+            # returns window ⇒ w == window ⇒ values byte-identical to v1.10
+            # (the V26 examples declare effective windows large enough that
+            # w_min > window keeps the five dry-run goldens frozen).
+            w = min(cfg.segment.window, budget.min_window(cfg))
             segment_calls = sum(_ceil_div(length - 1, w - 1)
                                 for length in session_lens if length >= 2)
         if cfg.stitch.enabled:
@@ -363,6 +387,13 @@ class Orchestrator:
             # is a forward-only no-op when no listener is attached.
             if self.cfg.run.mode == "generate_only" or plan_estimated:
                 self.metrics.run_estimate(estimate_run(self.cfg, plan))
+            # v1.11 (V13①, spec 3.10.3 上下文预算行): startup budget INFO —
+            # owned by the M10 startup segment (never the loader: load-time
+            # logging predates the CLI level override). --dry-run never
+            # reaches this point (_run_dry returned above), so the dry-run
+            # goldens stay byte-frozen even now that the examples declare a
+            # window (V26).
+            self._log_budget_startup()
             self.emitter.open()
             try:
                 if self.cfg.run.mode == "generate_only":
@@ -525,6 +556,14 @@ class Orchestrator:
             # interrupted mid-batch: already-flushed lines stay valid
         finally:
             self._current_task = None
+            # v1.11 (V19, spec 3.10.3 上下文预算行): batch-boundary
+            # calibration freeze — AFTER the batch settles, BEFORE the next
+            # dispatch, so batch N+1 packs against ≤ N aggregates only (the
+            # F8 determinism guard). Every dispatched batch funnels through
+            # here (all three mode drivers): generate re-flow sub-batches
+            # dispatch as their own outer batches and freeze like any other —
+            # nothing freezes inside a batch's stage loop.
+            self._freeze_calibrator()
 
     async def _process_batch(self, batch: list[PipelineItem], batch_no: int,
                              chain: Sequence[Stage]) -> None:
@@ -640,6 +679,58 @@ class Orchestrator:
                           rng=random.Random(f"{self.cfg.run.seed}:{batch_no}:{stage_name}"),
                           batch_no=batch_no)
 
+    def _freeze_calibrator(self) -> None:
+        """v1.11 (V19/V23②, §7.17): fold the finished batch's per-profile
+        image-cost sample buckets into the calibrator's frozen batch-max
+        window (order-free max over the unordered sample set — asyncio
+        completion order never leaks into the readable snapshot). Fired once
+        per dispatched batch (_guarded_batch) and once more at finalize so
+        ``report.budget.image_cost`` carries the calibration END value
+        (V13⑤). Duck-typed like the ``usage_by_profile`` read in
+        _build_report — unit fixtures pass llm=None; a no-sample freeze is a
+        no-op, so budget-off runs observe nothing."""
+        calibrator = getattr(self.llm, "calibrator", None)
+        if calibrator is not None:
+            calibrator.freeze_batch()
+
+    def _budget_profiles(self) -> list[tuple[str, "LLMProfile"]]:
+        """v1.11 (V13①②): the budget-declared profiles among those the run
+        resolved for use — the profile_usage referenced set filtered to
+        ``context_window > 0`` (order-preserving; V6's "referenced by enabled
+        stages" convention). Non-empty ⇔ the budget observability faces
+        (startup INFO line, report.budget node) appear; all-undeclared runs
+        keep v1.10 output byte-identical (the CONTRACTS §9.3 clause)."""
+        declared = []
+        for name in referenced_profiles(self.cfg)[0]:
+            prof = self.cfg.llm_profiles.get(name)
+            if prof is not None and prof.context_window > 0:
+                declared.append((name, prof))
+        return declared
+
+    def _log_budget_startup(self) -> None:
+        """v1.11 (V13①, spec 3.10.3 上下文预算行): ONE data-free INFO line
+        with the declared budget params — ``budget: <name>=<cw>/<input_budget>
+        ...`` — plus, when segment is enabled and its profile is budgeted, the
+        w_min line ``segment: w_min=<w_min> window=<cap> (budget)`` (w_min =
+        the raw budget.min_window value, the V9 guard/INFO print). Counts and
+        parameters only, never data content (§2.6); silent when no referenced
+        profile declares a window."""
+        declared = self._budget_profiles()
+        if not declared:
+            return
+        _log.info("budget: %s",
+                  " ".join(f"{name}={prof.context_window}"
+                           f"/{budget.input_budget(prof)}"
+                           for name, prof in declared),
+                  extra={"stage": "run", "batch": 0})
+        cfg = self.cfg
+        seg_prof = (cfg.llm_profiles.get(cfg.segment.llm)
+                    if cfg.segment.enabled else None)
+        if seg_prof is not None and seg_prof.context_window > 0:
+            _log.info("segment: w_min=%d window=%d (budget)",
+                      budget.min_window(cfg), cfg.segment.window,
+                      extra={"stage": "run", "batch": 0})
+
     def _compose_chain(self, include_generate: bool) -> list[Stage]:
         """Stage composition per the 2.3.1 switch matrix, canonical order.
 
@@ -699,6 +790,11 @@ class Orchestrator:
 
     def _finalize(self) -> RunSummary:
         wall_s = time.perf_counter() - self._t0
+        # v1.11 (V19/V13⑤): ONE more freeze after the final batch, before
+        # report assembly — report.budget.image_cost must read the
+        # calibration END value (per-batch freezes already ran at every
+        # dispatch boundary; with an empty current bucket this is a no-op).
+        self._freeze_calibrator()
         # Source of truth is the MetricsSink flag: the breaker can open on the
         # tail calls of a batch without CircuitBreakerTripped ever escaping a
         # stage (every in-flight call fails record-level first) — the run must
@@ -830,6 +926,13 @@ class Orchestrator:
                 "below_min_len": c("segment.below_min_len"),
                 "digest_poor_frames": c("segment.digest_poor_frames"),
                 "segment_failures": c("segment.failures"),
+                # v1.11 (V13④, §9.3): the ACTUAL dispatched-window count —
+                # the M14-owned segment.windows counter, same report-only
+                # family as below_min_len/digest_poor_frames and surfacing
+                # UNCONDITIONALLY whenever segment runs (budget on or off) —
+                # the user-side reconciliation face for the V12 upper-bound
+                # segment_calls estimate.
+                "windows": c("segment.windows"),
             }
             if cfg.stitch.enabled:
                 # v1.9 (T16, chain-order slot before extract): stitched mirrors
@@ -990,6 +1093,49 @@ class Orchestrator:
                 classify_block["multi_label_records"] = c("classify.multi_label_records")
             report["classify"] = classify_block
 
+        budget_profiles = self._budget_profiles()
+        if budget_profiles:
+            # v1.11 report.budget (V13②④⑤; key names FROZEN in §9.3): the
+            # WHOLE node appears only when ≥ 1 run-referenced profile
+            # declares a window — all-undeclared keeps report.json
+            # byte-identical to v1.10. Counts/stats only, never data content
+            # (§2.6). M10 assembles profiles/w_min/image_cost at report time
+            # from ResolvedConfig, budget.min_window and llm.calibrator; the
+            # remaining keys surface the operator-owned MetricsSink counters.
+            budget_block: dict = {
+                "profiles": {name: {"context_window": prof.context_window,
+                                    "input_budget": budget.input_budget(prof)}
+                             for name, prof in budget_profiles},
+            }
+            if cfg.segment.enabled:
+                # [cap, w_min] under the frozen "segment.window" sub-key —
+                # w_min is the RAW budget.min_window value (uncapped by
+                # design: the estimate clamps at its own call site, V12/V26).
+                budget_block["w_min"] = {
+                    "segment.window": [cfg.segment.window,
+                                       budget.min_window(cfg)]}
+            trunc_prefix = "budget.truncations."
+            budget_block["truncations"] = {
+                key[len(trunc_prefix):]: int(value)
+                for key, value in sorted(counters.items())
+                if key.startswith(trunc_prefix) and value}   # nonzero stages only
+            budget_block["overflow_records"] = c("budget.overflow_records")
+            # image_cost = each profile's calibration END value (V19; the
+            # finalize freeze above folded the last batch in). Minimal
+            # faithful form: only profiles the calibrator actually sampled
+            # (≥ 1 frozen image sample — cost() below min-samples still reads
+            # the effective prior×1.2 packing value); the sample ledger is
+            # the calibrator's batch-frozen _frozen_total, duck-typed like
+            # the metrics/_event_log reads above.
+            calibrator = getattr(self.llm, "calibrator", None)
+            frozen_totals = dict(getattr(calibrator, "_frozen_total", None) or {})
+            budget_block["image_cost"] = {
+                name: int(calibrator.cost(name))
+                for name in sorted(frozen_totals) if frozen_totals[name] > 0}
+            budget_block["degrade_retries"] = c("budget.degrade_retries")
+            budget_block["escalations"] = c("budget.escalations")
+            report["budget"] = budget_block
+
         event_log = (getattr(self.metrics, "event_log", None)
                      or getattr(self.metrics, "_event_log", None))
         trace_events = int(getattr(event_log, "events_written", 0) or 0)
@@ -1106,9 +1252,17 @@ class Orchestrator:
             if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
                 # v1.8 S22 (R28-style note): downstream estimates use
                 # episodes ≈ sessions — LLM boundary refinement can only ADD
-                # segments, so the numbers are a lower bound.
-                print("dry-run: 注：stream 估算：下游按 episodes≈sessions 报下界"
-                      "（LLM 精化只增段数）", file=sys.stderr)
+                # segments, so the numbers are a lower bound. v1.11 (V12,
+                # spec 3.10.3 时序流行): when the budget packs below the
+                # window cap (w_min < window) the note gains ONE appended
+                # sentence flagging segment_calls as the worst-case-packing
+                # upper bound; w_min ≥ window (the V26 examples) or budget
+                # off keeps the note byte-identical (dry-run golden anchor).
+                note = ("dry-run: 注：stream 估算：下游按 episodes≈sessions 报下界"
+                        "（LLM 精化只增段数）")
+                if budget.min_window(cfg) < cfg.segment.window:
+                    note += "；segment 按预算最坏装填报上界"
+                print(note, file=sys.stderr)
             side_channels = "report and trace only" if cfg.trace.enabled else "report only"
             print(f"dry-run: no LLM calls made, no output written ({side_channels})",
                   file=sys.stderr)

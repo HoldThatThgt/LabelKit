@@ -16,6 +16,7 @@ max_retries = 5
 supports_structured_output = true
 supports_vision = true
 max_output_tokens = 4096
+context_window = 131072 # 端点实效保守值（V26）——P6 实测后可上调
 temperature = 0.0
 
 [llm.judge]
@@ -29,4 +30,5 @@ max_retries = 5
 supports_structured_output = true
 supports_vision = true
 max_output_tokens = 2048
+context_window = 131072 # 端点实效保守值（V26）——P6 实测后可上调
 temperature = 0.0

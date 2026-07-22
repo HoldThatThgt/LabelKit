@@ -25,12 +25,14 @@ from labelkit.common.config.model import (
     AnnotateConfig, ClassifyConfig, ClassSpec, ClassView, CliOverrides, Criterion,
     DedupConfig,
     ConsoleConfig,
-    ExtractConfig, GenerateConfig, InputConfig, OutputConfig, QualityConfig,
+    ExtractConfig, GenerateConfig, InputConfig, LLMProfile, OutputConfig,
+    QualityConfig,
     ResolvedConfig, Rubric, RunConfig, SegmentConfig, StitchConfig, StreamConfig,
     ToolConfig,
     TraceConfig, VerifyConfig,
 )
 from labelkit.common.errors import CircuitBreakerTripped
+from labelkit.common.runtime import budget
 from labelkit.common.observability.obslog import EventLog, MetricsSink, TraceEvent
 from labelkit.common.runtime.llm_client import LLMClient
 from labelkit.orchestration.orchestrator import Orchestrator, RunSummary, estimate_run
@@ -1854,9 +1856,9 @@ async def test_stream_batch_end_carries_three_keys_only_when_enabled(tmp_path):
 
 async def test_stream_report_block_shape_and_counts_gating(tmp_path):
     """§9.3: with segment enabled counts gains the three keys and the report
-    gains the stream block right after counts — base eight keys, extract/verify
-    sub-blocks only when those stages are enabled, zero-based closed
-    vocabularies fed from the M15/M7 counters."""
+    gains the stream block right after counts — base nine keys (v1.11 V13④
+    adds windows), extract/verify sub-blocks only when those stages are
+    enabled, zero-based closed vocabularies fed from the M15/M7 counters."""
     cfg = stream_cfg(tmp_path, batch_size=8, verify=True,
                      extract=ExtractConfig(enabled=True))
     ingestor = FakeSessionIngestor([sess("s1", 1, 3), sess("s2", 11, 2)])
@@ -1866,6 +1868,7 @@ async def test_stream_report_block_shape_and_counts_gating(tmp_path):
     metrics.counters["segment.below_min_len"] = 2
     metrics.counters["segment.digest_poor_frames"] = 1
     metrics.counters["segment.failures"] = 1
+    metrics.counters["segment.windows"] = 4        # v1.11 V13④ (M14-owned)
     metrics.counters["extract.transitions"] = 3
     metrics.counters["extract.fallback_steps"] = 1
     metrics.counters["extract.failures"] = 0
@@ -1886,7 +1889,7 @@ async def test_stream_report_block_shape_and_counts_gating(tmp_path):
     assert set(stream) == {"sessions", "episodes", "mean_episode_len",
                            "absorbed", "dropped_noise", "below_min_len",
                            "digest_poor_frames", "segment_failures",
-                           "extract", "verify"}
+                           "windows", "extract", "verify"}
     assert stream["sessions"] == 2
     assert stream["episodes"] == 2
     assert stream["mean_episode_len"] == 2.5       # absorbed/episodes, round 2
@@ -1895,6 +1898,12 @@ async def test_stream_report_block_shape_and_counts_gating(tmp_path):
     assert stream["below_min_len"] == 2
     assert stream["digest_poor_frames"] == 1
     assert stream["segment_failures"] == 1
+    # v1.11 (V13④): windows surfaces UNCONDITIONALLY whenever segment runs
+    # (budget on or off — this run declares none), right after
+    # segment_failures (§9.3 order).
+    assert stream["windows"] == 4
+    keys = list(stream)
+    assert keys.index("windows") == keys.index("segment_failures") + 1
     assert stream["extract"] == {
         "transitions": 3, "fallback_steps": 1, "failures": 0,
         "by_type": {"click": 2, "long_press": 0, "input_text": 0, "scroll": 1,
@@ -1909,8 +1918,9 @@ async def test_stream_report_block_shape_and_counts_gating(tmp_path):
 
 
 async def test_stream_report_block_base_form_and_disabled_gating(tmp_path):
-    """extract/verify off → no sub-blocks (eight base keys exactly);
-    segment off → no stream block, no counts trio (regression anchor)."""
+    """extract/verify off → no sub-blocks (nine base keys exactly, v1.11
+    V13④ windows included); segment off → no stream block, no counts trio
+    (regression anchor)."""
     cfg = stream_cfg(tmp_path, batch_size=8)
     ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
     orch, _, emitter, _ = build(cfg, [StubSegmentStage()], ingestor=ingestor)
@@ -1918,7 +1928,7 @@ async def test_stream_report_block_base_form_and_disabled_gating(tmp_path):
     stream = emitter.report["stream"]
     assert set(stream) == {"sessions", "episodes", "mean_episode_len",
                            "absorbed", "dropped_noise", "below_min_len",
-                           "digest_poor_frames", "segment_failures"}
+                           "digest_poor_frames", "segment_failures", "windows"}
     assert stream["mean_episode_len"] == 2.0
 
     cfg_off = make_cfg(tmp_path, batch_size=8)
@@ -2156,7 +2166,9 @@ async def test_stitched_tally_threads_derivation_and_report_block(tmp_path):
                                 "judgments": 0, "repass_judgments": 0,
                                 "failures": 0}
     keys = list(stream)
-    assert keys.index("stitch") == keys.index("segment_failures") + 1
+    # v1.11 (V13④/§9.3): windows slots between segment_failures and stitch.
+    assert keys.index("stitch") == keys.index("windows") + 1
+    assert keys.index("windows") == keys.index("segment_failures") + 1
 
 
 async def test_stitch_counters_surface_in_report_block(tmp_path):
@@ -2751,3 +2763,321 @@ def test_validate_project_overrides_passthrough(tmp_path, monkeypatch):
     # explicit rich resolves through M1's find_spec probe (rich is installed)
     cfg_rich = validate_project(config, project, CliOverrides(console="rich"))
     assert cfg_rich.console.mode_resolved == "rich"
+
+
+# ── tests: v1.11 context budget (SPEC-context-budget V12/V13/V19, spec 3.10.3
+#    上下文预算行). The pre-existing estimate/report tests above are the
+#    budget-OFF regression anchors (make_cfg declares no llm_profiles →
+#    min_window returns segment.window → values byte-identical to v1.10);
+#    this section adds the budget-ON branches. ─────────────────────────────
+
+
+def budget_profile(context_window: int, *, name: str = "default",
+                   max_output_tokens: int = 1024) -> LLMProfile:
+    """Minimal budget-declared profile (V6): annotate/segment reference the
+    "default" name in these configs. margin(5600)=560 → input_budget 4016;
+    margin(131072)=13108 → input_budget 116940."""
+    return LLMProfile(name=name, provider="anthropic", base_url="https://x",
+                      model="m", api_key_env="K",
+                      max_output_tokens=max_output_tokens,
+                      context_window=context_window)
+
+
+class StubCalibrator:
+    """llm.calibrator stand-in over the §7.17 public face (freeze_batch/cost)
+    plus the batch-frozen ``_frozen_total`` sample ledger the report's
+    image_cost guard reads (V13⑤)."""
+
+    def __init__(self, costs: dict[str, int] | None = None,
+                 frozen_total: dict[str, int] | None = None):
+        self.freezes = 0
+        self._costs = costs or {}
+        self._frozen_total = dict(frozen_total or {})
+
+    def freeze_batch(self):
+        self.freezes += 1
+
+    def cost(self, profile):
+        return self._costs[profile]
+
+
+def budget_stream_cfg(tmp_path, context_window: int, **kw):
+    """stream_cfg + a budget-declared "default" profile (segment.llm/annotate
+    both resolve to it). Fixed shape: hybrid, window=20, digest_max_chars=400,
+    context="", text modality (vision_resolved False) → est_static = 415+0+8,
+    per_frame = 400+128 → w_min = (input_budget − 423) // 528."""
+    kw.setdefault("segment", SegmentConfig(enabled=True, strategy="hybrid",
+                                           window=20))
+    cfg = stream_cfg(tmp_path, **kw)
+    return replace(cfg, llm_profiles={"default": budget_profile(context_window)})
+
+
+# — V12: estimate_run / dry-run two-state branches ————————————————————————————
+
+
+def test_estimate_run_segment_calls_budget_two_state(tmp_path):
+    """V12 (spec 3.10.3 时序流行): a small declared window clamps the formula
+    to w_eff = min(window, min_window) — the worst-case-packing UPPER bound —
+    while a large declared window (w_min > window, the V26 examples shape)
+    reproduces the budget-off dict EXACTLY."""
+    plan = SimpleNamespace(estimated_records=26, session_lens=(21, 5))
+    base = stream_cfg(tmp_path, batch_size=8, annotate=True,
+                      segment=SegmentConfig(enabled=True, strategy="hybrid",
+                                            window=20),
+                      extract=ExtractConfig(enabled=True))
+    off = estimate_run(base, plan)                 # anchor (asserted above)
+    assert off["segment_calls"] == 3
+
+    small = replace(base, llm_profiles={"default": budget_profile(5600)})
+    assert budget.min_window(small) == 6           # (4016 − 423) // 528
+    est = estimate_run(small, plan)
+    assert est["segment_calls"] == 5               # ceil(20/5) + ceil(4/5)
+    assert est["extract_calls"] == off["extract_calls"] == 24
+    assert est["total_calls"] == off["total_calls"] + 2
+
+    large = replace(base, llm_profiles={"default": budget_profile(131072)})
+    assert budget.min_window(large) == 220 > 20    # uncapped by design
+    assert estimate_run(large, plan) == off        # clamp at the call site
+
+
+def test_estimate_run_rules_strategy_ignores_budget(tmp_path):
+    """strategy="rules" never consults the budget: segment_calls stays 0 even
+    under a tiny declared window (the L=1/rules zero-count gate precedes the
+    w_eff clamp)."""
+    cfg = budget_stream_cfg(tmp_path, 5600, batch_size=8, annotate=True,
+                            segment=SegmentConfig(enabled=True,
+                                                  strategy="rules"))
+    est = estimate_run(cfg, SimpleNamespace(estimated_records=26,
+                                            session_lens=(21, 5)))
+    assert est["segment_calls"] == 0
+
+
+async def test_dry_run_stream_budget_small_window_upper_bound_and_note(
+        tmp_path, capsys):
+    """V12 dry-run face: w_min < window → the segment_calls line reports the
+    upper-bound value and the stream note gains the ONE appended sentence
+    「segment 按预算最坏装填报上界」 (same line, after the v1.8 wording)."""
+    cfg = budget_stream_cfg(tmp_path, 5600, batch_size=8, dry_run=True,
+                            annotate=True, extract=ExtractConfig(enabled=True))
+    ingestor = FakeSessionIngestor(session_lens=(21, 5))
+    orch, _, _, _ = build(cfg, [], ingestor=ingestor)
+    summary = await orch.run()
+
+    assert summary.exit_code == 0
+    err = capsys.readouterr().err
+    assert "segment_calls=5" in err                # w_min=6: ceil(20/5)+ceil(4/5)
+    assert "extract_calls=24" in err               # non-segment keys unchanged
+    assert "total=31" in err
+    assert ("dry-run: 注：stream 估算：下游按 episodes≈sessions 报下界"
+            "（LLM 精化只增段数）；segment 按预算最坏装填报上界") in err
+
+
+async def test_dry_run_stream_budget_large_window_byte_identical(
+        tmp_path, capsys):
+    """V26 anchor: w_min > window → estimate values AND the stream note stay
+    byte-identical to the budget-off run (no appended sentence) — the
+    mechanism that keeps the five dry-run goldens frozen under the examples'
+    131072 declaration."""
+    cfg = budget_stream_cfg(tmp_path, 131072, batch_size=8, dry_run=True,
+                            annotate=True, extract=ExtractConfig(enabled=True))
+    ingestor = FakeSessionIngestor(session_lens=(21, 5))
+    orch, _, _, _ = build(cfg, [], ingestor=ingestor)
+    await orch.run()
+
+    err = capsys.readouterr().err
+    assert "segment_calls=3" in err                # ceil(20/19) + ceil(4/19)
+    assert "total=29" in err
+    assert ("dry-run: 注：stream 估算：下游按 episodes≈sessions 报下界"
+            "（LLM 精化只增段数）\n") in err
+    assert "segment 按预算最坏装填报上界" not in err
+
+
+# — V19: batch-boundary calibrator freezes ————————————————————————————————————
+
+
+async def test_calibrator_freeze_once_per_batch_plus_finalize(tmp_path):
+    """V19 (spec 3.10.3 上下文预算行): freeze_batch fires once per dispatched
+    batch (after it completes — batch N+1 packs against ≤ N aggregates) plus
+    ONCE more at finalize before report assembly (the image_cost END value)."""
+    cal = StubCalibrator()
+    cfg = make_cfg(tmp_path, batch_size=4)
+    orch, metrics, _, _ = build(cfg, [ExactDedupStage()],
+                                [rec(i) for i in range(1, 11)],
+                                llm=SimpleNamespace(calibrator=cal))
+    await orch.run()
+    ends = [e for e in metrics.events if e[0] == "batch.end"]
+    assert len(ends) == 3                          # 4 + 4 + 2 records
+    assert cal.freezes == 4                        # 3 batches + 1 at finalize
+
+
+async def test_calibrator_freeze_reflow_sub_batches_are_outer_batches(tmp_path):
+    """Generate re-flow sub-batches dispatch as their OWN outer batches (own
+    batch_no, own batch.end) and freeze like any other — no extra freeze fires
+    inside the parent batch's stage loop when the sub-batch is enqueued."""
+    cal = StubCalibrator()
+    gen_cfg = GenerateConfig(enabled=True, instruction="生成")
+    cfg = make_cfg(tmp_path, batch_size=4, quality=True, generate=gen_cfg,
+                   quality_cfg=QualityConfig(enabled=True))
+    orch, metrics, _, _ = build(
+        cfg, [ExactDedupStage(), ScoreStage({}), PureGenerateStage(per_batch=3)],
+        [rec(i) for i in range(1, 5)],
+        llm=SimpleNamespace(calibrator=cal))
+    await orch.run()
+    ends = [e for e in metrics.events if e[0] == "batch.end"]
+    assert len(ends) == 2                          # main batch + re-flow sub-batch
+    assert cal.freezes == 3                        # 2 batches + 1 at finalize
+
+
+async def test_calibrator_freeze_not_called_on_dry_run(tmp_path):
+    """Dry-run makes no LLM calls and dispatches no batches — zero freezes
+    (the finalize freeze belongs to the live path only)."""
+    cal = StubCalibrator()
+    cfg = make_cfg(tmp_path, batch_size=4, dry_run=True, annotate=True)
+    orch, _, _, _ = build(cfg, [], [rec(1)],
+                          llm=SimpleNamespace(calibrator=cal))
+    await orch.run()
+    assert cal.freezes == 0
+
+
+# — V13②④⑤: report.budget + report.stream.windows ————————————————————————————
+
+
+async def test_report_budget_node_shape_per_contracts(tmp_path):
+    """§9.3 frozen keys: profiles (run-referenced, budget-declared only) →
+    w_min ([cap, raw w_min] under "segment.window") → truncations (nonzero
+    stages only) → overflow_records → image_cost (≥ 1 frozen sample only) →
+    degrade_retries → escalations; node placed right before trace."""
+    cal = StubCalibrator(costs={"default": 1882}, frozen_total={"default": 9})
+    cfg = budget_stream_cfg(tmp_path, 5600, batch_size=8, annotate=True)
+    # "spare" is budget-declared but referenced by NO enabled stage — the
+    # profiles map follows the profile_usage referenced set (V6 convention).
+    cfg = replace(cfg, llm_profiles={**cfg.llm_profiles,
+                                     "spare": budget_profile(131072, name="spare")})
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
+    orch, metrics, emitter, _ = build(cfg, [StubSegmentStage()],
+                                      ingestor=ingestor,
+                                      llm=SimpleNamespace(calibrator=cal))
+    metrics.counters["segment.windows"] = 4        # M14-owned (V13④)
+    metrics.counters["budget.truncations.annotate"] = 3
+    metrics.counters["budget.truncations.quality"] = 0    # zero → excluded
+    metrics.counters["budget.overflow_records"] = 2
+    metrics.counters["budget.degrade_retries"] = 1
+    await orch.run()
+
+    b = emitter.report["budget"]
+    assert list(b) == ["profiles", "w_min", "truncations", "overflow_records",
+                       "image_cost", "degrade_retries", "escalations"]
+    assert b["profiles"] == {"default": {"context_window": 5600,
+                                         "input_budget": 4016}}
+    assert b["w_min"] == {"segment.window": [20, 6]}
+    assert b["truncations"] == {"annotate": 3}
+    assert b["overflow_records"] == 2
+    assert b["image_cost"] == {"default": 1882}    # cost() readout, ≥1 sample
+    assert b["degrade_retries"] == 1
+    assert b["escalations"] == 0
+    keys = list(emitter.report)
+    assert keys.index("budget") == keys.index("trace") - 1
+    # V13④: the M14-owned actual window count surfaces in the stream block.
+    assert emitter.report["stream"]["windows"] == 4
+
+
+async def test_report_budget_w_min_raw_and_absent_without_segment(tmp_path):
+    """w_min records the RAW budget.min_window value even above the cap
+    (uncapped by design — the estimate clamps at its own call site); the
+    w_min key itself appears only when segment is enabled."""
+    cal = StubCalibrator()
+    cfg = budget_stream_cfg(tmp_path, 131072, batch_size=8, annotate=True)
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
+    orch, _, emitter, _ = build(cfg, [StubSegmentStage()], ingestor=ingestor,
+                                llm=SimpleNamespace(calibrator=cal))
+    await orch.run()
+    assert emitter.report["budget"]["w_min"] == {"segment.window": [20, 220]}
+    assert emitter.report["budget"]["image_cost"] == {}   # zero samples
+
+    cfg2 = make_cfg(tmp_path, batch_size=4, annotate=True)
+    cfg2 = replace(cfg2, llm_profiles={"default": budget_profile(5600)})
+    orch2, _, emitter2, _ = build(cfg2, [RecordingStage("dedup")], [rec(1)],
+                                  llm=SimpleNamespace(calibrator=StubCalibrator()))
+    await orch2.run()
+    b2 = emitter2.report["budget"]
+    assert "w_min" not in b2
+    assert list(b2) == ["profiles", "truncations", "overflow_records",
+                        "image_cost", "degrade_retries", "escalations"]
+
+
+async def test_report_budget_node_absent_without_declaration(tmp_path):
+    """CONTRACTS §9.3 byte-equivalence clause: the node is ABSENT when no
+    referenced profile declares a window — undeclared (cw=0) referenced
+    profiles and declared-but-unreferenced profiles alike."""
+    # referenced (annotate) but undeclared → absent
+    cfg = make_cfg(tmp_path, batch_size=4, annotate=True)
+    cfg = replace(cfg, llm_profiles={"default": budget_profile(0)})
+    orch, _, emitter, _ = build(cfg, [RecordingStage("dedup")], [rec(1)])
+    await orch.run()
+    assert "budget" not in emitter.report
+
+    # declared but referenced by NO enabled stage (dedup-only run) → absent
+    cfg2 = make_cfg(tmp_path, batch_size=4)
+    cfg2 = replace(cfg2, llm_profiles={"default": budget_profile(5600)})
+    orch2, _, emitter2, _ = build(cfg2, [ExactDedupStage()], [rec(1)])
+    await orch2.run()
+    assert "budget" not in emitter2.report
+
+    # no profiles at all (every pre-existing fixture) → absent
+    cfg3 = make_cfg(tmp_path, batch_size=4, annotate=True)
+    orch3, _, emitter3, _ = build(cfg3, [RecordingStage("dedup")], [rec(1)])
+    await orch3.run()
+    assert "budget" not in emitter3.report
+
+
+# — V13①: startup budget INFO line ————————————————————————————————————————————
+
+
+async def test_startup_budget_info_lines_and_gating(tmp_path, caplog):
+    """V13① (M10 startup segment): ≥ 1 referenced declared profile → the
+    data-free `budget: <name>=<cw>/<input_budget>` INFO line, plus the
+    `segment: w_min=… window=… (budget)` line when the segment profile is
+    budgeted; budget-off and --dry-run runs log NEITHER (v1.10/golden
+    byte-equivalence)."""
+    logger = "labelkit.orchestrator"
+
+    cfg = budget_stream_cfg(tmp_path, 5600, batch_size=8, annotate=True)
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
+    orch, _, _, _ = build(cfg, [StubSegmentStage()], ingestor=ingestor,
+                          llm=SimpleNamespace(calibrator=StubCalibrator()))
+    with caplog.at_level(logging.INFO, logger=logger):
+        await orch.run()
+    msgs = [r.getMessage() for r in caplog.records]
+    assert "budget: default=5600/4016" in msgs
+    assert "segment: w_min=6 window=20 (budget)" in msgs
+
+    # non-stream budget run: profile line only, no segment line
+    caplog.clear()
+    cfg2 = make_cfg(tmp_path, batch_size=4, annotate=True)
+    cfg2 = replace(cfg2, llm_profiles={"default": budget_profile(5600)})
+    orch2, _, _, _ = build(cfg2, [RecordingStage("dedup")], [rec(1)])
+    with caplog.at_level(logging.INFO, logger=logger):
+        await orch2.run()
+    msgs2 = [r.getMessage() for r in caplog.records]
+    assert "budget: default=5600/4016" in msgs2
+    assert not any(m.startswith("segment: w_min=") for m in msgs2)
+
+    # budget-off live run → neither line (v1.10 stderr byte-equivalence)
+    caplog.clear()
+    cfg3 = make_cfg(tmp_path, batch_size=4, annotate=True)
+    orch3, _, _, _ = build(cfg3, [RecordingStage("dedup")], [rec(1)])
+    with caplog.at_level(logging.INFO, logger=logger):
+        await orch3.run()
+    assert not any(m.startswith(("budget:", "segment: w_min="))
+                   for m in (r.getMessage() for r in caplog.records))
+
+    # --dry-run with a declared budget → neither line (golden protection)
+    caplog.clear()
+    cfg4 = budget_stream_cfg(tmp_path, 5600, batch_size=8, dry_run=True,
+                             annotate=True)
+    orch4, _, _, _ = build(cfg4, [],
+                           ingestor=FakeSessionIngestor(session_lens=(2,)))
+    with caplog.at_level(logging.INFO, logger=logger):
+        await orch4.run()
+    assert not any(m.startswith(("budget:", "segment: w_min="))
+                   for m in (r.getMessage() for r in caplog.records))
