@@ -6,7 +6,7 @@
 
 | 输出面 | 形态与开关 | 内容 | 消费方 |
 |---|---|---|---|
-| ① 运行日志 | stderr，恒开。级别 debug/info/warn/error（`tool.log_level` / `--log-level`）；行格式 `tool.log_format = "text"`（默认）\| `"jsonl"`（7.3）。 | 仅运维事件：生命周期、警告、错误、LLM 调用摘要（debug 级）。绝不含数据内容与提示词。 | 人工排障；日志采集系统。 |
+| ① 运行日志 | stderr，恒开。级别 debug/info/warn/error（`tool.log_level` / `--log-level`）；行格式 `tool.log_format = "text"`（默认）\| `"jsonl"`（7.3）。 | 仅运维事件：生命周期、警告、错误、LLM 调用摘要（debug 级）；v1.11 增启动期上下文预算参数 INFO 行（如 `segment: w_min=6 window=20 (budget)`——数据无关、仅计数与参数，M10 启动段属主，V13①，3.10.3）。绝不含数据内容与提示词。 | 人工排障；日志采集系统。 |
 | ② trace 追踪日志 | JSONL 文件，默认 `{output_stem}.trace.jsonl`（`trace.path`）；默认关（`trace.enabled = false`）。文件在**首个事件写出时**才打开/截断（v1.5）：死于配置或输入校验的运行不会碰上一次的 trace；dry-run 写 `{name}.dryrun{suffix}` 独立文件。 | 结构化事件流，一行一事件（7.2）；按 `trace.channels` 过滤通道，按 `trace.content` 控制内容量（7.4）。 | rubric 优化（7.5）；标注质量分析与审计；后续 `labelkit analyze`（8.3 O5）。 |
 | ③ 进度显示（v1.10 起称 console） | 三态 `console.mode = auto \| rich \| plain`（5.1 / CLI `--console`），恒开。rich = 双区内联实时面板；plain = v1.9 行为逐字节保留（`heartbeat_s=0` 默认下）；auto 按 TTY 等判定链选档（7.7）。 | 批进度、流水线段棋盘、各状态计数、LLM 用量/密钥池/熔断、瞬时成本累计（7.7 区块表）。 | 交互终端前的人。不属于日志（7.7）。 |
 
@@ -128,9 +128,13 @@ jq -s '[.[] | select(.ev=="quality.judgment") | .payload.judgments[]
 | `judgment_invalid` | 比较级 | M4；按 tie 计入 BT（3.4.3）。 |
 | `schema_violation` | 记录级 | M8 L3 耗尽；记录 failed → rejects。 |
 | `callback_violation` | 记录级 | v1.5：M8 L3 耗尽且剩余违规全部来自 `output.validator` 回调（3.8.2 L2.5）；记录 failed → rejects。 |
+| `context_overflow` | 记录级 | v1.11：三形态（V24）——precheck = M9 终检命中（V16）/ 最小单元不装（V10）；reactive-400 = 预算开启下嗅探命中且 V20 降级耗尽；reactive-200 = `model_context_window_exceeded` 且降级耗尽（或无降级面）。处置：记录级 `failed` → rejects；计 `report.budget.overflow_records`。熔断矩阵：**precheck 不计连击**（无 provider 交互）；**reactive-400 终局计入连击**（A7 已裁——由属主算子经 `ctx.metrics.record_provider_result(fatal=True)` 补喂恰一次，M9 抛出时不喂；成功降级/任何成功调用清零连击）；**reactive-200 终局不补喂**（HTTP 交互成功、streak 已被该次 ok 清零——`llm.call` 事件维持 status="ok"，实现者不得"修正"为 fatal，F9）。均不烧常规重试（V20 降级重试独立计数、有界）。 |
+| `output_truncated` | 记录级 | v1.11：响应以输出上限截断收尾（`finish_reason=length` / `stop_reason="max_tokens"`，V11）——输入合窗、输出写满 max_output_tokens。处置：记录级 `failed` → rejects 归因独立成桶；不喂熔断（交互成功，`llm.call` 维持 ok）；不进 L1–L3 修复循环。 |
 | `provider_retryable_exhausted` | 记录级 | M9 重试耗尽（v1.6 含驻留超限 `run.max_park_s`，3.9.3 密钥池行）；记录 failed，计入熔断窗口。 |
 | `provider_fatal` | 运行级 | M9 不可重试错误。400/404 等计入连续熔断计数，连续达阈值 ⇒ 退出码 4；**401/403 认证类立即熔断**（v1.5，3.9.3）。v1.6 密钥池：认证失败先按密钥禁用（`llm.key_disabled`），池内尚有存活密钥时不产生本错误、不计入熔断——仅当禁用的是该 profile 最后一把存活密钥时才抛出并立即熔断（3.9.3 密钥池行）。 |
 | `internal_error` | 记录级 | 任何未预期异常（含 M11 终检失败）；记录 failed，堆栈入日志（debug 级）。 |
+
+v1.11 两注：① M8 L3 修复调用内的 precheck 溢出**不落本词表**（V25①：该轮记修复失败并短路至耗尽，reject 归因维持 `schema_violation` / `callback_violation`，3.8.2）；② z.ai 扩展终止值 `sensitive` / `network_error` 及未知值不做专项处置（V11③——沿现行管线流转，垃圾输出由 M8 校验兜住）。
 
 ## 7.7 进度显示与结束摘要（v1.10：三态 console）
 

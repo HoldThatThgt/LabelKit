@@ -19,8 +19,10 @@
 | `llm.*.supports_structured_output` | bool | false | true 时结构引擎启用 L0（3.8.2）。 |
 | `llm.*.supports_vision` | bool | false | UI 模态所引用 profile 必须为 true（M1 校验）。 |
 | `llm.*.max_output_tokens` | int | 4096 | 透传给 API。 |
+| `llm.*.context_window` | int | 0 | v1.11 新增（V6/V26，3.9.5）：模型上下文窗口（token）。`0` = 未声明：该 profile 上下文预算关闭（行为与 v1.10 一致），被启用阶段引用时 M1 WARN 一次（3.1.4）。> 0 时须满足 `context_window > max_output_tokens + margin`，否则 CONFIG_ERROR（预算非正）；`margin = max(256, ceil(0.10 × context_window))`。**声明部署实效窗口，勿照抄厂商表（V26/[C-59]，`docs/dev/PROPOSAL-context-budget.md`）**：同名模型随部署差数倍——z.ai anthropic 路由裸 `glm-5.2` 非 1M（1M 须模型名 `glm-5.2[1m]`）、Together 256K、vLLM 由 `--max-model-len` 决定；不确定时**欠声明恒安全**（只多裁不溢出）。 |
 | `llm.*.temperature` | float | 0.0 | profile 级默认；生成阶段建议在 project.toml 用 generate.temperature 调高。 |
-| `llm.*.max_image_px` | int | 2048 | 图像长边上限，超出等比缩小（3.9.3）。 |
+| `llm.*.max_image_px` | int | 2048 | 图像长边上限，超出等比缩小（3.9.3）。v1.11 语义升格（V18/V27③，3.9.5）：**升级天花板 + provider 像素制硬限制域**——V21 判审升级路径的分辨率上探以本键封顶；像素是运载意图与 provider 硬限制（带宽/载荷；Anthropic 的 8000px 与 >20 图 ∧ >2000px 硬拒本身是像素制）的控制面。[C-62] 记载：gpt-5.6 级 openai 后端默认 `detail` 等效 `original`（服务端不再隐式钳制图片 token），本键与 `default_image_px` 因此成为该类后端**唯一的客户端成本闸**。 |
+| `llm.*.default_image_px` | int | 0 | v1.11 新增（V18，3.9.5）：图片采样**默认工作点**（长边 px）。`0` = 沿用 `max_image_px`（v1.10 行为逐字节不变）。> 0 时须 ≤ `max_image_px`（CONFIG_ERROR，3.1.4）；V21 升级路径可上探至 `max_image_px`。 |
 | `llm.*.price_per_mtok_in / _out` | float | 可选 | 每百万 token 单价；配置后报告输出成本估算。 |
 | `embedding.<name>` | table | 可选 | v1.2 新增：每个子表定义一个 embedding profile，<name> 为被 project.toml `dedup.semantic_embedding` 引用的名字（5.2；3.3.3 第④级）。 |
 | `embedding.*.provider` | str | "openai_compatible" | 本版唯一取值：POST `{base_url}/embeddings`（3.9.3）。 |
@@ -32,6 +34,7 @@
 | `embedding.*.timeout_s` | int | 60 | 单次请求超时。 |
 | `embedding.*.max_retries` | int | 5 | 可重试错误的最大重试次数（重试规则同 3.9.3）。 |
 | `embedding.*.dims` | int | 可选 | 返回向量维度校验：配置后 `embed()` 逐条比对返回维度，不匹配抛 ProviderFatalError（3.9.2）。 |
+| `embedding.*.context_window` | int | 0 | v1.11 新增（V15，同 `llm.*.context_window` 声明制，3.9.5）：`0` = 未声明 = 该 embedding profile 预算关闭。> 0 时预算 = `context_window − margin`（**无输出预留**）；embed 输入超预算按确定性头部保留截断（3.3.3 第④级语义嵌入）。声明实效窗口指引同 llm 行（V26）。 |
 | `tool.log_format` | str | "text" | "text" \| "jsonl"：stderr 运行日志行格式（7.3）；"jsonl" 时强制 console plain 档以保证 stderr 逐行可解析（7.7，显式 rich（CLI `--console rich` 或 `console.mode="rich"`）冲突时 M1 WARN）。 |
 | `console.mode` | str | "auto" | v1.10（7.7）："auto" \| "rich" \| "plain"——进度显示面三态；被 CLI `--console` 覆盖。auto 判定链：stderr TTY ∧ log_format="text" ∧ TERM 非 dumb/空 ∧ rich 可导入（M1 以 find_spec 探测），全真取 rich，否则 plain（TERM 定性为终端能力探测，与 isatty 同级，非配置通道；NO_COLOR 不参与判定——rich 原生剥色保布局，U25）。判定产物由 M1 冻结为解析字段 `mode_resolved`（3.1.4）。plain 档 stderr 与 v1.9 行为等价（`heartbeat_s=0` 时——三层回归锚 7.8）。 |
 | `console.refresh_hz` | int | 5 | v1.10：rich 画布重绘频率（asyncio 节流 tick，7.7），1–10，越界 = CONFIG_ERROR。 |
@@ -65,6 +68,8 @@ timeout_s = 120
 max_retries = 5
 supports_structured_output = true
 supports_vision = true
+context_window = 131072             # v1.11 上下文预算（0/缺省 = 关；声明部署实效窗口而非厂商表值，3.9.5）
+# default_image_px = 1092           # v1.11 图片采样工作点（0/缺省 = 沿用 max_image_px；须 ≤ max_image_px）
 price_per_mtok_in = 0.6
 price_per_mtok_out = 1.8
 
@@ -97,14 +102,14 @@ dims = 1024                         # 可选：返回向量维度校验
 | `run.output` | str | 必填* | 主输出 .jsonl 路径（* 可被 CLI --output 覆盖）。 |
 | `run.modality` | str | 必填 | "text" \| "ui"。 |
 | `run.mode` | str | "process" | "process"（读取 run.input 加工既有数据）\| "generate_only"（v1.4 纯生成：无输入从零合成，3.6.2 / 3.10.3；组合与互斥约束见 2.3.1 ④、3.1.4）。 |
-| `run.batch_size` | int | 256 | 批大小 = QuRating 比较池大小（3.4.3）。 |
+| `run.batch_size` | int | 256 | 批大小 = QuRating 比较池大小（3.4.3）。v1.11 语义句（V14）：决定内存生命周期、QuRating 对比池基数与 stream 装箱容量；**从不影响单次 prompt 体积**——单次调用容量由各算子条数上限与上下文预算（3.9.5）共同决定。 |
 | `run.seed` | int | 0 | PRNG 种子（配对采样/顺序随机/种子抽样）。 |
 | `run.fatal_error_threshold` | int | 20 | 熔断阈值（3.10.3）。 |
 | `run.max_park_s` | int | 3600 | v1.6 驻留上限（3.9.3 密钥池行）：单次逻辑 LLM 调用因「所引 profile 全部存活密钥均在冷却」而驻留等待的累计秒数上限；超限按重试耗尽处理（记录 failed、计入熔断窗口，1.6 对齐决策 ③）。0 = 不驻留（全池冷却即按重试耗尽失败）——注意：0 与单密钥 profile 组合意味着**任何 429（含短 Retry-After）都立即按重试耗尽失败**，仅建议在多密钥池上设 0。运维容忍度参数，不影响产出内容；单密钥配置下亦约束超长 `Retry-After` 等待（3.9.3 重试行）。 |
 | `input.text_field` | str | "text" | 文本模态取文内容的点路径（3.2.5）。 |
 | `input.on_bad_line / on_missing_pair / on_index_conflict` | str | skip / skip / fail | "skip" \| "fail"（3.2.4–3.2.5）。 |
 | `input.max_image_mb` | int | 20 | 单图大小上限。 |
-| `input.ui_tree_max_chars` | int | 30000 | 提示词中树序列化长度上限。 |
+| `input.ui_tree_max_chars` | int | 30000 | 提示词中树序列化长度上限。v1.11（V9，3.9.5）：升格为**绝对上限**——所引 profile 声明 `context_window` 后，单记录树渲染实参取 `min(ui_tree_max_chars, 预算折算份额)` 动态收缩（超预算按行丢尾、保留既有 truncated marker）；未声明预算时即固定上限（现行为）。 |
 | `stream.order_by` | str | "input_order" | v1.8 新增（`[stream]` 节 = stream 模式输入侧排序与会话化声明，M2 消费，3.2/3.14；仅 `segment.enabled = true` 时生效）。"input_order"（默认：文本 = 文件名字典序→行号，UI = pair_index 升序）\| "meta:<field>"（**仅文本模态**，M1 校验；时间戳解析规格见 6.1——数值秒/毫秒判定、ISO 字符串、时区归一；解析失败与乱序同走 on_disorder）。 |
 | `stream.on_disorder` | str | "skip" | v1.8："skip"（默认：乱序/时间戳解析失败记录跳过——计 bad_input + IngestReport.disorder 子计数 + `ingest.disorder` 事件 + WARN 一次）\| "fail"（InputError，退出码 3）。单调性游标**按分区键各自维护**（S19；键变即断语义保留，输入须按键成组，6.1）。 |
 | `stream.key` | array | [] | v1.8：分区键列表，键变即断会话（groupby 语义非 keyBy）。元素 = "meta:<field>"（仅文本模态）\| "source_dir"（= ref.source_file 父目录派生，UI 模态可用——一次采集一目录惯例，S19）；元素合法性 M1 校验（3.1.4）。 |
@@ -114,14 +119,15 @@ dims = 1024                         # 可选：返回向量维度校验
 | `stream.session_max_span_s` | int | 0 | v1.8：会话时间跨度硬上限（秒，0 = 不启用）；**仅 `order_by="meta:*"` 时可设**（M1 校验）。 |
 | `segment.enabled` | bool | false | v1.8 新增：语义分段算子 / stream 模式总开关（M14，3.14）。默认关——工具行为与 v1.7 逐字节一致（`_meta.stream: null` 除外，6.3）。启用要求（3.1.4）：`run.mode = "process"` ∧ `generate.enabled = false`（generate_only 经 2.3.1 ④ 传递闭合）∧ `annotate.enabled = true`。no-op warning（R8 家族）：`[stream]`/`[segment]`/`[extract]` 任一节在场而 `segment.enabled = false`。 |
 | `segment.strategy` | str | "hybrid" | "rules"（候选会话原样成 episode，零 LLM；noise_filter / min_len 不生效）\| "llm" \| "hybrid"（默认：滑窗 LLM 边界精化 + 逐帧噪声标记；len(session)==1 走 rules 退化，3.14）。 |
-| `segment.llm` | str | "default" | profile 引用；**仅 `strategy ∈ {llm, hybrid}` 时**计入密钥解析 / vision（仅 use_vision = true 时）/ `--probe` / 存在性四处引用集（S30，3.1.4）——rules 策略零调用不强制配键。 |
-| `segment.window` | int | 20 | 滑窗帧数/调用；M1 校验 **≥ 2**。步长 = window−1（重叠 1 帧，接缝帧整帧判决归后窗）；window ≥ 会话长时天然退化为整段单调用（S32）。 |
+| `segment.llm` | str | "default" | profile 引用；**仅 `strategy ∈ {llm, hybrid}` 时**计入密钥解析 / `--probe` / 存在性引用集（S30，3.1.4）——rules 策略零调用不强制配键。v1.11（V1/V3）：**不再入 vision 校验集**——segment 从「要求视觉」改为「适配视觉」，窗口是否附图由本 profile 的 `supports_vision` 能力自动决定（parse product `vision_resolved`，见下）；选 profile 即选能力，需纯文本裁决请指向纯文本 profile。 |
+| `segment.window` | int | 20 | 滑窗帧数/调用上限；M1 校验 **≥ 2**。v1.11 语义修订（V9，3.9.5）：**单窗帧数上限**——所引 profile 声明 `context_window` 后按预算贪心装填（溢出即封窗，实际每窗帧数 ≤ window），未声明时为固定窗大小（v1.10 行为逐字节一致）。步长 = 重叠 1 帧（接缝帧整帧判决归后窗）；window ≥ 会话长且预算装得下时天然退化为整段单调用（S32，3.14.7）。 |
 | `segment.digest_max_chars` | int | 400 | 单帧摘要（frame_digest，4.3）长度上限。 |
 | `segment.noise_filter` | bool | true | 逐帧噪声标记（interruption → dropped_noise，reason="noise"）；仅 llm/hybrid 生效——`strategy = "rules"` ∧ noise_filter = true ⇒ no-op warning（3.1.4）。 |
 | `segment.min_len` | int | 2 | 段最短帧数；**仅作用于 LLM 边界精化切出的段**（S11）——规则层孤帧/短会话（含 strategy="rules"）原样成 episode、不受本键约束；被丢弃帧 reason = "below_min_len"（≠ "noise"），独立计数 `report.stream.below_min_len`（6.4）。 |
-| `segment.use_vision` | bool | false | true 时窗内逐帧附截图（所引 profile 须 supports_vision 且入 vision 引用集，S30）；默认纯文本（仅帧摘要）。 |
 | `segment.context` | str | "" | 可选域上下文，注入判据模板；**非边界定义**——边界判据内置于模板（3.14），零配置可用。 |
 | `segment.on_error` | str | "keep" | 单窗结构修复耗尽的处置："keep"（默认：该会话整体成一个 episode 存活 + 留痕三件套 `_meta.stream.degraded = {kind:"segmentation_invalid", windows_failed}` / error 事件 / `segment.failures` 计数，**不写 item.errors**——S26 归因防污染）\| "fail"（会话成员全部 failed → rejects，kind = segmentation_invalid，7.6）。 |
+| ~~`segment.use_vision`~~ | — | —（v1.11 移除） | v1.11 移除键（V1/V2）：显式出现 → CONFIG_ERROR：「`segment.use_vision` 已于 v1.11 移除：窗口是否附图由 `segment.llm` 所指 profile 的 `supports_vision` 自动决定；如需纯文本裁决，请将 segment.llm 指向纯文本 profile」（3.1.4）——**不走**「未知键忽略」前向兼容警告。 |
+| `segment.vision_resolved` | bool | parse product | v1.11（V1）：**非用户键**——M1 于 load() 收尾冻结的解析产物（`mode_resolved` 同款，3.1.4）：`vision_resolved = (modality=="ui") ∧ segment.enabled ∧ strategy∈{llm,hybrid} ∧ llm_profiles[segment.llm].supports_vision`；运行期窗口是否附图的唯一判据（3.14.4 模板）。 |
 | `stitch.enabled` | bool | false | v1.9 新增：线索缝合算子开关（M16，3.16；链序 segment 之后、dedup 之前，3.10.3）。默认关——主输出 / rejects / report.json 与 v1.8 **逐字节等价**（例外两处：dry-run stderr 的 `stitch_calls=0` 行、stream×verify 缺陷词表 `wrong_stitch: 0` 行——3.16.4 退化锚）。启用要求 `segment.enabled = true`（M1 约束，3.1.4——stream 前置约束经此传递闭合）。no-op warning：`[stitch]` 在场而 `segment.enabled = false` 入 R8 点名名单；`segment.enabled = true` ∧ 本键 false 而节内有 payload ⇒ 单独 warning（3.1.4 ⑦）。 |
 | `stitch.llm` | str | "default" | 判定 profile 引用；仅启用时计入密钥解析 / `--probe` / 存在性引用集，**不入 vision 校验集**（判定证据为纯文本摘要卡，无视觉必需，3.1.4 / 3.16.3）。 |
 | `stitch.max_open` | int | 4 | 开放线索池容量（挂起窗口均值 3 + 1 活跃 [81]；移动域佐证 [90]）；池满且需开新线索时按逐出优先级封闭一条（stale-gap 优先 → LRU 兜底；封闭 ≠ 终结，3.16.4）。M1 校验 ≥ 1。 |
@@ -178,7 +184,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `generate.weights` | array | [] | 正数权重；`mixture = "weighted"` 时必填且长度须等于 llms（M1 校验），round_robin 下忽略。 |
 | `[[generate.styles]]` | array | [] | 风格子表（可选）：每项含 `name`（str，表内唯一）与 `prompt`（str，非空）；非空时每次生成调用经 `ctx.rng` 均匀抽 1 个 style，其 prompt 追加进生成指令（3.6.2 风格条件化行）。 |
 | `generate.num_per_record` | int | 2 | 每种子期望产出条数。 |
-| `generate.seeds_per_call / num_per_call` | int | 3 / 4 | 3.6.2。 |
+| `generate.seeds_per_call / num_per_call` | int | 3 / 4 | 3.6.2。v1.11（V9，3.9.5）：`seeds_per_call` 升格为**上限**——所引 profile 声明 `context_window` 后按 rng 采样序从尾部丢弃种子直到装下（确定性收缩，min 1）；未声明预算时即固定条数（现行为）。 |
 | `generate.seed_min_score` | float | 自动 | 种子门槛，默认取 quality.threshold 或批中位数。 |
 | `generate.temperature` | float | 0.9 | 生成需要多样性，覆盖 profile 默认。 |
 | `generate.sample_validator` | str | 无 | v1.5 校验回调（方案 A）：`"module:function"`，签名 `fn(text: str) -> list[str]`（空 = 通过）。对每条生成样本在相似度过滤**之前**执行，违规样本剔除（过滤语义，不触发重试、不产生 failed 记录），计入桶统计 `rejected_by_validator`（3.6.2/6.4）。M1 校验同 output.validator（无 few-shot 干跑）。回调抛异常 ⇒ 该样本按违规剔除并 stderr warn（过滤器不失败）。 |
@@ -189,7 +195,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `annotate.examples` | array | [] | few-shot：[{input, output}]，output 须过用户 Schema（M1 校验）。 |
 | `annotate.self_consistency` | int | 0 | 0 = 关（单次标注，v1.1 行为）；启用须 ≥3 且为奇数（M1 校验）：每条记录独立采样 n 次后字段级投票（3.5.2 note 框）。成本：标注调用与 token ×n。 |
 | `annotate.sc_temperature` | float | 0.7 | self-consistency 各次采样的 temperature（采样多样性来源 [33]），覆盖 profile 默认；仅 `self_consistency ≥ 3` 时生效。 |
-| `annotate.sequence_frames` | int | 20 | v1.8 新增：序列（episode）标注单请求最大关键帧数，∈ **[2, 100]**（越界 CONFIG_ERROR，M1 校验）。成员数 n > k 时确定性均匀降采样 `idx_i = ⌊i·(n−1)/(k−1)⌋, i=0..k−1`（首末帧恒含、严格递增、纯整数零 rng；n ≤ k 取全量，3.5.2 序列行）。**`sequence_frames > 20` 且所引 profile `max_image_px > 2000` ⇒ M1 WARN**（S28：Anthropic 对 >20 图请求单图 >2000px 为 400 硬拒非缩放，现默认 max_image_px=2048 恰撞拒——指引改 ≤ 2000 或降帧；20 图阈值按请求内全部 image block 计）。非 stream 模式显式设置 ⇒ no-op warning（3.1.4）。 |
+| `annotate.sequence_frames` | int | 20 | v1.8 新增：序列（episode）标注单请求最大关键帧数，∈ **[2, 100]**（越界 CONFIG_ERROR，M1 校验）。成员数 n > k 时确定性均匀降采样 `idx_i = ⌊i·(n−1)/(k−1)⌋, i=0..k−1`（首末帧恒含、严格递增、纯整数零 rng；n ≤ k 取全量，3.5.2 序列行）。**`sequence_frames > 20` 且所引 profile `max_image_px > 2000` ⇒ M1 WARN**（S28：Anthropic 对 >20 图请求单图 >2000px 为 400 硬拒非缩放，现默认 max_image_px=2048 恰撞拒——指引改 ≤ 2000 或降帧；20 图阈值按请求内全部 image block 计）。非 stream 模式显式设置 ⇒ no-op warning（3.1.4）。v1.11（V9，3.9.5）：升格为**上限**——所引 profile 声明 `context_window` 后关键帧数按预算剩余动态收缩 `k_eff = min(sequence_frames, max(2, ⌊剩余 / 每图成本⌋))`（首末帧恒保留、中间均匀下采样，既有降采样语义不变）；未声明预算时即固定上限（现行为）。 |
 | `verify.enabled` | bool | false | — |
 | `verify.llm` | str | "judge"† | † `verify.enabled = true` 且 `verify.judges` 为空时该 profile 须存在于 config.toml `[llm.*]`（judges 非空时被评审团替代、不参与运行也不要求存在，v1.5）；建议独立于 annotate.llm（3.7.2）。 |
 | `verify.judges` | array | [] | 多评审团 profile 列表（v1.2，3.7.2；与 quality.judges 语义一致）：空 = 单评审用 verify.llm；非空须为奇数个（M1 校验），verdict 取多数票，critiques 合并并标注来源 judge，成本 ×\|judges\|。背书 PoLL [32]。 |

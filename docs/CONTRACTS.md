@@ -22,7 +22,10 @@ Ground rules for every implementer:
   `labelkit.common.contracts.types` and `labelkit.common.errors` import nothing from `labelkit`;
   `labelkit.common.config.model` imports nothing from `labelkit` except
   shared contract types if needed; `labelkit.common.runtime.llm_client` imports only common-layer
-  contracts, errors, config, and observability; `labelkit.common.runtime.schema_engine` imports the
+  contracts, errors, config, observability, and — v1.11 — the sibling
+  `labelkit.common.runtime.budget` (which itself references llm_client's `PromptBundle` under
+  `typing.TYPE_CHECKING` only — the stage.py convention, so no cycle);
+  `labelkit.common.runtime.schema_engine` imports the
   common runtime LLM client plus common errors/observability; `labelkit.common.contracts.stage`
   imports runtime/config/observability types under `typing.TYPE_CHECKING` only. Common never imports
   operators or orchestration. Operator modules import common and declared stdlib/third-party
@@ -57,6 +60,7 @@ labelkit/
 │   │   ├── model.py                    # all config dataclasses (M1)
 │   │   └── loader.py                   # TOML merge, validation, startup hook validation (M1)
 │   ├── runtime/
+│   │   ├── budget.py                   # v1.11 context-budget primitives + ImageCostCalibrator (§7.17)
 │   │   ├── llm_client.py               # M9 transport, retry/key pools, concurrency, usage
 │   │   └── schema_engine.py            # M8 L0-L3 guarantee, repair, schema validation/stats
 │   ├── observability/
@@ -455,7 +459,12 @@ def frame_digest(record: Record, max_chars: int) -> str:
     - text modality: record.text truncated to max_chars.
     Poverty judgment: zero visible text nodes, or digest length < 8 ⇒ poor — the
     CALLER counts digest_poor_frames (report.stream, §9.3) and WARNs at most once
-    per run, pointing at segment.use_vision."""
+    per run; v1.11 (V4): the WARN guidance reads 「为 segment.llm 配置
+    supports_vision=true 的 profile」 (the segment.use_vision key it formerly
+    pointed at was removed in v1.11). v1.11 (V9): M14 calls this ONCE per frame at
+    SESSION level, BEFORE window packing — the digest vector feeds both the
+    packer's per-frame costs and the §10.9 prompts (the pre-v1.11 per-window
+    recomputation is gone; the poverty-guard path stays independent)."""
     ...
 
 
@@ -513,6 +522,7 @@ Notes binding on all implementers:
 from __future__ import annotations
 
 import enum
+from typing import Literal
 
 
 class LabelKitError(Exception):
@@ -555,6 +565,32 @@ class ProviderFatalError(LabelKitError):
         self.status_code = status_code
         self.key_env = key_env                # v1.6: env-var NAME of the failing key (pools)
         super().__init__(message)
+
+
+class ContextOverflowError(LabelKitError):
+    """v1.11 (V16/V24): the unified context-overflow signal. Record-level →
+    status='failed', kind='context_overflow' (§7.6) → rejects; run continues.
+    phase='precheck' — the M9 pre-dispatch invariant check fired (V16, zero provider
+    interaction), or a packing layer found even the minimal semantic unit unfittable
+    (V10 — recorded directly by the operator, no exception crossing);
+    phase='reactive' — a real provider interaction identified overflow: budget-gated
+    400 body-sniff hit, or the 200-shaped `model_context_window_exceeded` termination
+    (V20/V24). M9 itself NEVER feeds `record_provider_result(fatal=True)` for this
+    exception and burns no regular retry — the reactive-400 terminal is fed exactly
+    once by the OWNING operator after its bounded degrade-retries exhaust (A7; §7.8
+    breaker matrix)."""
+    def __init__(self, message: str, phase: Literal["precheck", "reactive"]):
+        self.phase = phase
+        super().__init__(message)
+
+
+class OutputTruncatedError(LabelKitError):
+    """v1.11 (V11): the response terminated by hitting the output cap —
+    finish_reason='length' (openai) / stop_reason='max_tokens' (anthropic): input fit
+    the window, the model wrote max_output_tokens full. Record-level →
+    status='failed', kind='output_truncated' → rejects (own bucket); the truncated
+    text NEVER enters the L1–L3 repair loop, and the breaker is never fed (the HTTP
+    interaction succeeded — `llm.call` stays status='ok')."""
 
 
 class SchemaViolation(LabelKitError):
@@ -627,6 +663,15 @@ class ErrorKind(str, enum.Enum):
                                                              # violations all from output.validator
     PROVIDER_RETRYABLE_EXHAUSTED = "provider_retryable_exhausted"  # M9 → failed, feeds breaker window
     PROVIDER_FATAL = "provider_fatal"                        # M9 run-level, feeds breaker directly
+    CONTEXT_OVERFLOW = "context_overflow"                    # v1.11: ContextOverflowError — precheck
+                                                             # (V16 throat / V10 minimal unit) or
+                                                             # reactive (V20/V24) → failed → rejects;
+                                                             # counted in report.budget.
+                                                             # overflow_records; breaker matrix §7.8
+    OUTPUT_TRUNCATED = "output_truncated"                    # v1.11: OutputTruncatedError (V11) —
+                                                             # output hit max_output_tokens →
+                                                             # failed → rejects own bucket; never
+                                                             # repaired, never feeds the breaker
     INTERNAL_ERROR = "internal_error"                        # any unexpected exception
 ```
 
@@ -798,8 +843,23 @@ class LLMProfile:
     supports_structured_output: bool = False
     supports_vision: bool = False
     max_output_tokens: int = 4096
+    context_window: int = 0                       # v1.11 (V6/V26): model context window (tokens).
+                                                  # 0 = undeclared = context budget OFF for this
+                                                  # profile (v1.10 behavior unchanged); referenced
+                                                  # by an enabled stage while 0 → ONE M1 WARN.
+                                                  # > 0 requires context_window > max_output_tokens
+                                                  # + margin, else CONFIG_ERROR (non-positive
+                                                  # budget). Declare the DEPLOYMENT-EFFECTIVE
+                                                  # window, never the vendor table value (V26 —
+                                                  # under-declaring is always safe: more trimming,
+                                                  # never overflow)
     temperature: float = 0.0
     max_image_px: int = 2048
+    default_image_px: int = 0                     # v1.11 (V18): default image sampling WORKING
+                                                  # POINT (long edge px). 0 = use max_image_px
+                                                  # (v1.10 behavior byte-identical). > 0 must be
+                                                  # <= max_image_px (CONFIG_ERROR); the V21
+                                                  # escalation ladder may probe up to max_image_px
     price_per_mtok_in: float | None = None
     price_per_mtok_out: float | None = None
     api_key: str = field(default="", repr=False)  # resolved from env by M1; NEVER logged
@@ -826,6 +886,10 @@ class EmbeddingProfile:
     timeout_s: int = 60
     max_retries: int = 5
     retry_base_delay_s: float = 1.0               # same backoff mechanism as llm.* [FROZEN HERE]
+    context_window: int = 0                       # v1.11 (V15): 0 = undeclared = embed budget off;
+                                                  # > 0 → embed input truncated to
+                                                  # budget = context_window − margin (no output
+                                                  # reservation; §7.17 embed_budget)
     dims: int | None = None                       # if set, embed() validates returned dims
     api_key: str = field(default="", repr=False)  # resolved from env by M1
     api_key_envs: tuple[str, ...] = ()            # v1.6 key pool — same normalization as
@@ -1102,12 +1166,21 @@ class SegmentConfig:                              # M14 (§7.14) — the stream-
                                                   # refinement — identical behavior inside M14
                                                   # (rule-layer sessionization is always on in M2;
                                                   # "hybrid" names the rules+LLM composition)
-    llm: str = "default"                          # joins the four reference sets ONLY when
-                                                  # strategy ∈ {llm, hybrid} (S30, §6.3 rule 33)
-    window: int = 20                              # sliding-window frames per call; M1: >= 2;
-                                                  # step = window − 1 (1-frame overlap; window >=
-                                                  # session length degrades to one whole-session
-                                                  # call, S32)
+    llm: str = "default"                          # joins the existence/key/probe reference sets
+                                                  # ONLY when strategy ∈ {llm, hybrid} (S30, §6.3
+                                                  # rule 33); v1.11 (V3): never the vision set —
+                                                  # vision is ADAPTIVE via vision_resolved below
+    window: int = 20                              # v1.11 (V9) semantics revision: UPPER CAP on
+                                                  # frames per window call; M1: >= 2. Budget
+                                                  # declared (segment profile context_window > 0):
+                                                  # windows are GREEDY-PACKED by per-frame cost up
+                                                  # to this cap, PRESERVING the 1-frame overlap
+                                                  # and the seam-frame-owned-by-the-LATER-window
+                                                  # semantics (§7.14; M1 guards w_min ≥ floor,
+                                                  # §7.17 min_window); budget off: fixed windows,
+                                                  # step = window − 1, byte-identical to v1.10
+                                                  # (window >= session length degrades to one
+                                                  # whole-session call, S32)
     digest_max_chars: int = 400                   # frame_digest truncation cap (§3)
     noise_filter: bool = True                     # llm/hybrid only; rules + explicit true →
                                                   # no-op warning (§6.3)
@@ -1116,9 +1189,6 @@ class SegmentConfig:                              # M14 (§7.14) — the stream-
                                                   # short sessions become episodes untouched;
                                                   # dropped frames get reason "below_min_len"
                                                   # (≠ "noise"), counted separately (§9.3)
-    use_vision: bool = False                      # true: attach per-frame screenshots inside
-                                                  # window calls (profile joins the vision set,
-                                                  # S30); default = pure-text verdicts
     context: str = ""                             # optional domain context injected into the
                                                   # §10.9 template — NOT a boundary definition
                                                   # (the criteria are built in; zero-config works)
@@ -1127,6 +1197,18 @@ class SegmentConfig:                              # M14 (§7.14) — the stream-
                                                   # (never item.errors — S26); fail: session
                                                   # members failed → rejects (§4
                                                   # segmentation_invalid)
+    vision_resolved: bool = False                 # v1.11 (V1) parse PRODUCT — never a user key
+                                                  # (the ConsoleConfig.mode_resolved precedent):
+                                                  # frozen by M1 at load() end via
+                                                  # dataclasses.replace as
+                                                  # (modality=="ui") ∧ enabled ∧
+                                                  # strategy∈{llm,hybrid} ∧
+                                                  # llm_profiles[segment.llm].supports_vision.
+                                                  # NOTE: the former user key `use_vision` was
+                                                  # REMOVED in v1.11 — an explicit [segment]
+                                                  # use_vision key is a DIRECTED CONFIG_ERROR
+                                                  # with migration guidance (V2), never the
+                                                  # unknown-key forward-compat warning
 
 
 @dataclass(frozen=True)
@@ -1308,7 +1390,8 @@ Profile references:
 3. `quality.judges` / `verify.judges`: when non-empty, length must be odd.
 4. UI modality: every profile used by quality/annotate/verify must have `supports_vision = true`.
    v1.8: under `segment.enabled = true` this rule is superseded by the per-stage vision table
-   of rule 34 (quality is exempted there; classify/extract/segment join per their own rows).
+   of rule 34 (quality is exempted there; classify/extract join per their own rows;
+   v1.11 — segment's row is vision-ADAPTIVE, never a requirement, V1/V3).
 5. `dedup.semantic = true` ⇒ `dedup.semantic_embedding` set, exists in `[embedding.*]`, and that
    profile passes rule 12's key check (exactly one of `api_key_env`/`api_key_envs`, every
    listed variable set and non-empty; v1.6).
@@ -1421,15 +1504,23 @@ apply only when the named switch is on unless stated):
 33. Reference sets (S30 — the "three sets" of rule 23 are FOUR for v1.8 profiles:
     key resolution (rule 12) / vision (rule 4/34) / `validate --probe`
     (`labelkit.orchestration.profile_usage.referenced_profiles()`) / existence): `segment.llm`
-    joins them ONLY when
+    joins the existence/key-resolution/probe sets ONLY when
     `segment.enabled` AND `segment.strategy ∈ {llm, hybrid}` (the rules strategy makes zero
-    LLM calls — no key may be demanded), and joins the vision set only when
-    `segment.use_vision = true`; `extract.llm`, when `extract.enabled`, ALWAYS joins all
+    LLM calls — no key may be demanded; these three sets and their gate are UNCHANGED in
+    v1.11), and — v1.11 (V1/V3) — NEVER joins the vision set: segment left the
+    "requires vision" validation set and is vision-ADAPTIVE instead (whether window calls
+    attach images is the M1-derived parse product `segment.vision_resolved`, §6.1 — the
+    vision proposition has no failure mode left to validate, and the rule-4/34
+    error-message `stages` set can therefore no longer contain "segment");
+    `extract.llm`, when `extract.enabled`, ALWAYS joins all
     four sets and ALWAYS the vision set (every extract request carries 2 images).
 34. Stream-mode per-stage vision table (S30; UI modality, `segment.enabled = true`):
     classify ✓ (first-frame screenshot, §10.8), annotate ✓ (multi-image, §10.1),
-    verify ✓ (first/last-frame screenshots, §10.5), extract ✓ (always), segment — only when
-    `use_vision = true`, **quality ✗** — sequence scoring is pure text (§10.2/§10.3 sequence
+    verify ✓ (first/last-frame screenshots, §10.5), extract ✓ (always), segment —
+    ADAPTIVE, never required (v1.11, V1/V3: per-frame screenshots ride the window calls
+    iff `segment.vision_resolved` — capability follows the chosen profile's
+    `supports_vision`; a pure-text segment verdict is expressed by pointing `segment.llm`
+    at a text-only profile), **quality ✗** — sequence scoring is pure text (§10.2/§10.3 sequence
     variants); `quality.llm` is the single vision relaxation of rule 4.
 35. `[class.<name>.extract]` whitelist: `instruction` ONLY (extends rule 25's table; any
     other key → CONFIG_ERROR). `[class.<name>.segment]` does NOT exist as a section:
@@ -1822,7 +1913,9 @@ def build_annotate_prompt(record: Record, cfg: ResolvedConfig, schema_text: str,
                           temperature: float | None = None,
                           label: str | None = None,
                           transitions: tuple[Transition, ...] | None = None,
-                          fragment_lens: tuple[int, ...] | None = None) -> PromptBundle:
+                          fragment_lens: tuple[int, ...] | None = None,
+                          k_eff: int | None = None,
+                          image_px: int | None = None) -> PromptBundle:
     """Deterministic template assembly per §10.1. schema_text = SchemaEngine.user_schema_text.
     repair != None appends the repair suffix (§10.5). [FROZEN HERE; label is a v1.7 ADDITIVE
     trailing kwarg (R2): non-None → instruction/examples come from
@@ -1832,14 +1925,25 @@ def build_annotate_prompt(record: Record, cfg: ResolvedConfig, schema_text: str,
     [动作序列] section from it; None = section omitted / pre-v1.8 behavior byte-identical.
     fragment_lens is the THIRD additive trailing kwarg (v1.9, T14 — same S5 form): non-None →
     the ② keyframe downsample runs the per-fragment quotas below; None = the v1.8 uniform
-    downsample byte-identical]"""
+    downsample byte-identical.
+    k_eff / image_px are the FOURTH additive trailing-kwarg revision (v1.11, V21 ladder —
+    the same R2/S5/F3 construction): k_eff non-None → EFFECTIVE KEYFRAME CAP — the ②
+    downsample runs with k = min(annotate.sequence_frames, k_eff) (carrier of the V20
+    frame-halving retry and the V21 repair-ladder k → max(2, ⌈k/2⌉); per-fragment quotas
+    degrade per the existing T14 rule when the quota becomes infeasible); image_px
+    non-None → ESCALATED RESOLUTION — carried into PromptBundle.image_px (V23①; the
+    builder computes effective px = image_px or profile.default_image_px or
+    profile.max_image_px, clamped to min(·, max_image_px)); None/None = pre-v1.11
+    behavior byte-identical]"""
 
 
 async def annotate_record(record: Record, ctx: RunContext,
                           repair: RepairContext | None = None,
                           label: str | None = None,
                           transitions: tuple[Transition, ...] | None = None,
-                          fragment_lens: tuple[int, ...] | None = None) -> Annotation:
+                          fragment_lens: tuple[int, ...] | None = None,
+                          k_eff: int | None = None,
+                          image_px: int | None = None) -> Annotation:
     """One record's full annotation path incl. self-consistency (skipped when repair != None:
     repair re-annotation is always a single call at profile-default temperature [FROZEN HERE]).
     Raises SchemaViolation / ProviderRetryableError / ProviderFatalError. This is the hook M7
@@ -1849,7 +1953,14 @@ async def annotate_record(record: Record, ctx: RunContext,
     path threads the REBUILT value through after member surgery — None = pre-v1.8 behavior.
     fragment_lens is the v1.9 ADDITIVE trailing kwarg (T14), passed through to
     build_annotate_prompt on EVERY path (single call, each self-consistency sample, repair
-    re-annotation) — None = pre-v1.9 behavior]"""
+    re-annotation) — None = pre-v1.9 behavior.
+    k_eff / image_px are the v1.11 ADDITIVE trailing kwargs (V21 ladder / F3 — implementers
+    must match these names): the M7 repair driver passes the quality-ladder step on
+    verify-fail re-annotation (k_eff = keyframe cap halved to max(2, ⌈k/2⌉), image_px = one
+    rung up at 1.5×/dim ≤ max_image_px, budget re-checked against the calibrated estimate);
+    M5's own V20 overflow degrade passes k_eff alone. Both are passed through to
+    build_annotate_prompt on EVERY path (single call, each self-consistency sample, repair
+    re-annotation) — None/None = pre-v1.11 behavior byte-identical]"""
 
 
 class AnnotateStage(Stage):
@@ -2167,6 +2278,17 @@ class Message:
 class PromptBundle:
     messages: tuple[Message, ...]
     temperature: float | None = None               # None = profile default
+    image_px: int | None = None                    # v1.11 additive (V23①): per-call EFFECTIVE
+                                                   # image px carrier — the V21 escalation
+                                                   # ladder's ONLY vehicle. Builders compute
+                                                   # effective px = image_px or
+                                                   # profile.default_image_px or
+                                                   # profile.max_image_px, then clamp
+                                                   # min(·, max_image_px). px MUST ride the
+                                                   # bundle, never operator state: build_body()
+                                                   # re-encodes images on every attempt, so only
+                                                   # a bundle-borne value keeps retries
+                                                   # deterministic
 
 
 @dataclass(frozen=True)
@@ -2176,6 +2298,12 @@ class LLMResponse:
     usage: Usage
     model: str
     latency_ms: int
+    finish: str | None = None                      # v1.11 additive (V23③): NORMALIZED termination
+                                                   # reason — the openai finish_reason / anthropic
+                                                   # stop_reason RAW value (None when the provider
+                                                   # sent none); feeds the V11/V24 disposition.
+                                                   # _result_usage's len==4 dispatch adjusts with
+                                                   # the tuple shape (F9)
 
 
 @dataclass                                          # v1.6, per-key accumulator [FROZEN HERE]
@@ -2240,6 +2368,17 @@ class ProfileSnapshot:                             # v1.10 (spec 3.9.2): one con
 
 
 class LLMClient:
+    calibrator: ImageCostCalibrator                # v1.11 public attribute (V23②): the per-profile
+                                                   # per-image online cost calibrator (§7.17),
+                                                   # SELF-CONSTRUCTED in __init__ — zero factory/
+                                                   # runtime assembly changes, and RunContext's
+                                                   # frozen six fields stay untouched. Read paths:
+                                                   # M9 feeds observe() per response (usage
+                                                   # missing → no sample + ONE WARN per profile);
+                                                   # operators read ctx.llm.calibrator.cost(
+                                                   # profile) for packing; M10 calls
+                                                   # freeze_batch() at batch boundaries
+
     def __init__(self, llm_profiles: Mapping[str, LLMProfile],
                  embedding_profiles: Mapping[str, EmbeddingProfile],
                  metrics: MetricsSink | None = None): ...        # [FROZEN HERE: split dicts + metrics]
@@ -2249,7 +2388,38 @@ class LLMClient:
         """response_schema becomes L0 params only if the profile declares
         supports_structured_output, else ignored. Raises ProviderRetryableError (retries
         exhausted) / ProviderFatalError / CircuitBreakerTripped (fail-fast once the breaker
-        is open)."""
+        is open).
+        v1.11 FINAL CHECK (V16 precheck, F13): BEFORE provider dispatch, budget-declared
+        profiles (context_window > 0) verify the invariant
+        est_prompt(prompt, profile, response_schema, image_cost) + max_output_tokens +
+        margin(context_window) ≤ context_window — violation raises
+        ContextOverflowError(phase="precheck") (§4; zero provider interaction: never fed
+        to the breaker, no retry burned). Budget-off profiles (cw == 0) SKIP the check
+        entirely; probe() flows through this same throat and passes TRIVIALLY
+        (max_output_tokens=1 + the V6 positive-budget validation — no exemption
+        engineering, F13). complete() is the SINGLE throat — M8 L3 repair calls and
+        probes included; when the packing layer is correct the check never fires (it is
+        a defensive invariant, not a second packing logic). image_cost is read from
+        self.calibrator — the same source the packing layers use (batch-frozen snapshot).
+        v1.11 TERMINATION-REASON NORMALIZATION (V11/V24): LLMResponse.finish is inspected
+        on every 200 — finish_reason="length" (openai) / stop_reason="max_tokens"
+        (anthropic) → raise OutputTruncatedError (§4; the truncated text never enters the
+        L1–L3 repair loop); "model_context_window_exceeded" (BOTH protocols: anthropic
+        4.5+ stop_reason, z.ai openai-protocol finish_reason) → raise
+        ContextOverflowError(phase="reactive") — the 200-shaped overflow oracle. Other/
+        unknown finish values flow on unchanged (V11③).
+        v1.11 OVERFLOW-BODY SNIFF (V20, budget-gated): on an HTTP 400 with the profile's
+        budget ON (context_window > 0), the FULL resp.text (before any truncation, F5) is
+        matched against the frozen pattern set — OpenAI/Azure
+        code == "context_length_exceeded" ∨ message contains "maximum context length";
+        vLLM: the same message family (type=BadRequestError, NO code — matching code
+        alone would miss it); anthropic protocol: invalid_request_error ∧ message
+        contains "prompt is too long"; z.ai business code "1261" / message contains
+        "Prompt too long"; OpenRouter: error_type == "context_length_exceeded" — a hit
+        raises ContextOverflowError(phase="reactive") WITHOUT feeding
+        _record_provider_result(fatal=True) (the owning operator settles the terminal —
+        breaker matrix below); an unmatched 400, or any 400 under a budget-off profile,
+        walks the EXISTING ProviderFatalError path unchanged (zero regression)."""
 
     async def embed(self, profile: str, texts: list[str]) -> list[list[float]]:
         """v1.2. profile must be an [embedding.*] name — [llm.*] names rejected (ValueError).
@@ -2308,7 +2478,9 @@ this inter-attempt backoff applies to network errors/timeouts/408/409/5xx ONLY; 
 (with or without `Retry-After`) is expressed as per-key cooldown per the key-pool paragraph
 below, which is the single normative statement of 429 timing. At most
 `max_retries`; 400/404 → ProviderFatalError immediately, no rotation (request-shape errors are
-key-independent).
+key-independent) — v1.11 (V20): a 400 whose FULL body matches the overflow pattern set under
+an enabled budget raises `ContextOverflowError(phase="reactive")` instead (see the complete()
+sniff clause above); unmatched 400s and budget-off profiles keep this path byte-identically.
 
 Key pool (v1.6, spec 3.9.3 密钥池行; single-key profiles are pools of size 1 and keep v1.5
 retry accounting, data output and breaker/exit semantics — the 429 WAIT PATH is a v1.6 behavior
@@ -2350,6 +2522,36 @@ nothing); retry exhaustion also records `fatal=True`; any success →
 `CircuitBreakerTripped` at entry. Trace: `llm.call` after every call (incl. failures) with the
 §8.2 payload (+ `key_env` for pools > 1, v1.6); API keys never enter any log path — key
 identity is always the env-var NAME.
+
+v1.11 breaker matrix (V16/V24/A7 — the closed who-feeds-what table for the two new
+exceptions; normative):
+
+- **precheck** (`ContextOverflowError(phase="precheck")`): NEVER feeds the breaker, burns
+  no retry — it precedes any provider interaction (client-side decision, unrelated to
+  provider health).
+- **reactive-400** (budget-gated sniff hit): M9 raises WITHOUT feeding
+  `_record_provider_result(fatal=True)` (F5 responsibility split); when the OWNING
+  OPERATOR's bounded V20 degrade-retries exhaust, that operator feeds the terminal
+  EXACTLY ONCE via `ctx.metrics.record_provider_result(fatal=True)` (A7 ruling: the
+  reactive-400 terminal joins the fatal streak; a successful degrade — or any successful
+  call — still clears the streak).
+- **reactive-200** (`model_context_window_exceeded`): NEVER fed, by M9 or the operator —
+  the HTTP interaction succeeded and already cleared the streak as ok; the `llm.call`
+  event KEEPS `status="ok"` and implementers must not "correct" it to fatal (F9).
+- **`OutputTruncatedError`**: never feeds the breaker, burns no retry (interaction
+  succeeded; `llm.call` stays `status="ok"`).
+
+V20 degrade-retries are independently counted (`budget.degrade_retries`, §9.3) and bounded
+(≤ 2 per call) — they never consume the regular retry budget.
+
+v1.11 calibration feed (V19/V23②): after EVERY response carrying ≥ 1 image, M9 feeds
+`self.calibrator.observe(profile, usage.prompt_tokens, est_text(request text), n_images)`;
+a response with missing/unusable usage records NO sample and WARNs ONCE per profile
+("image-cost calibration inactive" — the prior × PRIOR_INFLATION stays in effect, C-64
+fallback). Image encoding: the effective long-edge px for `ImageRef.load_base64` =
+`bundle.image_px or profile.default_image_px or profile.max_image_px`, clamped to
+`min(·, max_image_px)` (V18/V21/V23① — `load_base64`'s own signature is unchanged; the
+builder passes the effective value in).
 
 ### 7.9 M10 — `labelkit/orchestration/orchestrator.py`
 
@@ -2862,8 +3064,10 @@ v1.8: `labelkit.orchestration.factory.build_stages` constructs `SegmentStage` an
 per their switches at their `_CHAIN_ORDER` slots (§7.9).
 `labelkit.orchestration.profile_usage.referenced_profiles()` (the `validate --probe` set) gains
 `segment.llm` ONLY when `segment.enabled` and `segment.strategy ∈ {llm, hybrid}`, and
-`extract.llm` whenever `extract.enabled` (S30, §6.3 rule 33 — the same conditions govern all four
-reference sets).
+`extract.llm` whenever `extract.enabled` (S30, §6.3 rule 33 — the same conditions govern the
+existence/key-resolution/probe sets; v1.11 V3: `segment.llm` never joins the vision set —
+whether window calls attach images is the `segment.vision_resolved` parse product, not a
+validation demand).
 
 v1.9: `build_stages` constructs `StitchStage` (lazy import of `labelkit.operators.stitch`,
 the SegmentStage/ExtractStage convention) at its `_CHAIN_ORDER` slot — between the
@@ -2992,9 +3196,18 @@ class SegmentStage(Stage):
 
 
 def build_segment_prompt(frames: Sequence[Record], diffs: Sequence[Mapping | None],
-                         cfg: ResolvedConfig, with_reason: bool) -> PromptBundle:
-    """Deterministic assembly of the §10.9 template; frame digests and adjacent-frame
-    diffs are pre-assembled code-side (frame_digest/tree_diff, §3)."""
+                         cfg: ResolvedConfig, with_reason: bool,
+                         digests: Sequence[str]) -> PromptBundle:
+    """Deterministic assembly of the §10.9 template — TEMPLATE BYTES UNCHANGED; frame
+    digests and adjacent-frame diffs are pre-assembled code-side (frame_digest/tree_diff,
+    §3). `digests` is the v1.11 (V9) signature revision: the per-frame digest strings
+    ALIGNED with `frames`, precomputed ONCE per session BEFORE window packing (the packer
+    prices frames off the same vector — seam frames are no longer digested twice; the
+    poverty-guard path stays independent, §7.14); the builder no longer computes digests
+    itself. The image-part conditionality keys on `cfg.segment.vision_resolved` (V1 —
+    was `use_vision`, removed v1.11). NOTE: `judge_window`'s PUBLIC signature below does
+    NOT change — it computes its own ≤3-frame digest table internally and passes it
+    through, so M7's re-judgment surface is untouched (V9)."""
 
 
 async def judge_window(frames: Sequence[Record], ctx: RunContext) -> list[str]:
@@ -3013,10 +3226,19 @@ Normative behavior (spec 3.14.4):
 - **Strategy** (`segment.strategy`): `"rules"` — candidate sessions become episodes as-is,
   zero LLM (noise_filter/min_len ineffective); `"llm"`/`"hybrid"` (default hybrid) —
   sliding-window refinement, identical behavior inside M14 (rule-layer sessionization is
-  always on in M2; "hybrid" names the composition). Window length `segment.window` (≥ 2);
-  step = window − 1 (1-frame overlap; the seam frame's WHOLE verdict belongs to the LATER
-  window — unconditional overwrite during stitching); `len(session) == 1` degrades to rules
-  (zero LLM).
+  always on in M2; "hybrid" names the composition). v1.11 (V9) window semantics:
+  `segment.window` (≥ 2) is the per-window UPPER CAP, no longer a fixed length. Budget
+  declared (the segment profile's `context_window > 0`): windows are GREEDY-PACKED per
+  session — digests precomputed once per session (§3), then windows cut by the packing
+  condition `est_static_system + Σ c_i ≤ input_budget ∧ window-frame count ≤ window`
+  (`c_i = est_text(digest_i) + DIFF_MAX_TOKENS + image cost when vision_resolved`;
+  overflow closes the window; the packer `_pack_windows(costs, budget, cap)` is M14-OWNED
+  operator logic — budget.py supplies only the estimation/budget primitives, §7.17). The
+  1-frame overlap is PRESERVED: each subsequent window starts at the previous window's
+  last frame, and the seam frame's WHOLE verdict still belongs to the LATER window —
+  unconditional overwrite during stitching. Budget off (`context_window == 0`): fixed
+  windows, step = window − 1, byte-identical to v1.10. `len(session) == 1` degrades to
+  rules (zero LLM).
 - **Calls & stitching.** One call per window; ALL windows across ALL sessions of the batch
   join ONE `asyncio.gather` (profile semaphore bound); stitching is a synchronous pass after
   all verdicts arrive, positioned by window index — schedule-independent; zero rng.
@@ -3040,12 +3262,18 @@ Normative behavior (spec 3.14.4):
   `_meta.stream.degraded = {kind: "segmentation_invalid", windows_failed: k}` + `error`
   event + `segment.failures` counter, **never `item.errors`** (S26 — rejects attribution
   reads `errors[0]`, §9.2); `on_error="fail"`: all session members `failed` → rejects.
-- **Digest-poverty guard (S12).** A frame whose `frame_digest` judges poor (zero visible
-  text nodes / digest < 8 chars) counts `digest_poor_frames` (§9.3) + at most ONE stderr
-  WARN per run pointing at `segment.use_vision`.
+- **Digest-poverty guard (S12; v1.11 V4 wording revision).** A frame whose `frame_digest`
+  judges poor (zero visible text nodes / digest < 8 chars) counts `digest_poor_frames`
+  (§9.3) + at most ONE stderr WARN per run whose guidance reads 「为 segment.llm 配置
+  supports_vision=true 的 profile」 (the removed `segment.use_vision` key is no longer
+  referenced — choosing the profile IS choosing the capability, V1). v1.11 (V9): digest
+  precompute moves BEFORE windowing — session-level, once per frame, shared by the
+  packing costs and the prompts; the poverty-guard computation path itself stays
+  independent and unchanged.
 - **Events:** `segment.boundary` per window (§8.1). `segment.session` is emitted by M2's
   assembler (§7.1), not by this module. Counter owned by M14: `segment.failures`;
-  `below_min_len`/`digest_poor_frames` report fields are M14-owned (§9.3);
+  `below_min_len`/`digest_poor_frames` report fields are M14-owned (§9.3) — and, v1.11
+  (V13④), so is `windows` (the ACTUAL window count → `report.stream.windows`, §9.3);
   `counts.episodes`/`absorbed`/`dropped_noise` are M10's (§7.9).
 
 v1.9 carrier note (T11 — `segment.py` itself is ZERO-CHANGE for v1.9): the duck-typed
@@ -3323,6 +3551,103 @@ Normative behavior (spec 3.16):
   `counts.stitched` (post-emit shell tally) and the derived `counts.threads` are M10's
   (§7.9) — M16 never touches `counts.*`.
 
+### 7.17 Budget — `labelkit/common/runtime/budget.py` (v1.11)
+
+(New common-runtime module, spec 3.9.x context-budget revision / dev spec
+`docs/dev/SPEC-context-budget.md` §3.2. Numbered AFTER the pre-existing §7.16 so every
+frozen §7.x anchor stays valid — the v1.7/v1.8/v1.9 convention; physically it sits beside
+`llm_client.py`/`schema_engine.py` under `labelkit/common/runtime/` (§1).)
+
+Responsibilities: the context-budget primitives — margin/budget arithmetic, the
+zero-dependency text/image token estimators, deterministic text fitting, the static
+minimum-window guarantee, the V27① stage-error classification helper, and the
+`ImageCostCalibrator` (V19 online per-image cost calibration). Pure functions + one
+in-memory class; zero third-party dependencies; zero persistence. The contract block
+below is copied VERBATIM from the dev spec §3.2 (the single source of truth — constants
+are FROZEN, V7/V8/V22: changing any value is a spec revision first):
+
+```
+# 全部纯函数、零第三方依赖；常数冻结（V7/V8/V22），修改即 spec 修订
+MARGIN_FLOOR = 256            # token
+MARGIN_RATIO = 0.10           # [C-15] 量级锚定
+ASCII_PER_TOKEN = 3.0         # /4 的 JSON 保守化 [C-24][C-26]
+CJK_TOKEN_PER_CHAR = 1.0      # 覆盖 GLM/o200k/Qwen [C-25][C-73]；cl100k 局限见 spec
+OTHER_PER_TOKEN = 2.0
+MSG_OVERHEAD_TOKENS = 4       # [C-7][C-76] 3+1 保守化
+DIFF_MAX_TOKENS = 128         # segment 窗内单帧 diff 行最坏常数（输出结构有界，V9）
+CALIBRATION_SAFETY = 0.85     # V19 装填折扣 [C-32][C-37][C-33]
+CALIBRATION_MIN_SAMPLES = 8   # 样本不足不升档 [C-32]
+CALIBRATION_WINDOW_BATCHES = 8  # 批最大值窗口深度（F8：窗口单位=批，序无关）
+PRIOR_INFLATION = 1.2         # 首批先验保守放大（V17）
+TEMPLATE_HEAD_TOKENS: dict[str, int]                  # V22：per-stage 冻结模板头 est 常数
+                                                      #   （= est_text(CONTRACTS §10 冻结文本)，
+                                                      #   离线测试跨层断言与算子常数一致）
+
+def margin(context_window: int) -> int
+def input_budget(profile: LLMProfile) -> int          # cw − max_output_tokens − margin；cw==0 → 0（预算关）
+def embed_budget(profile: EmbeddingProfile) -> int    # cw − margin
+def est_text(s: str) -> int                           # ceil(ascii/3 + cjk×1.0 + other/2)
+def est_image_prior(profile: LLMProfile, px: int) -> int
+                                                      # provider 公式先验 @ 生效 px（V8 v3）：
+                                                      #   anthropic = min(⌈px/28⌉², 1568)
+                                                      #   openai_compatible = tile 制最坏纵横比
+                                                      #     （2048→短边768 归一化；@2048 竖屏 = 1445 [C-60]）
+                                                      #   （校准器先验种子 = 本值 × PRIOR_INFLATION）
+def est_prompt(bundle: PromptBundle, profile: LLMProfile,
+               schema: dict | None,
+               image_cost: int) -> int                # Σ est_text + n_images×image_cost
+                                                      #   + MSG_OVERHEAD×消息数 + est_text(schema JSON)；
+                                                      #   image_cost 由调用方读校准器传入（M9 终检同源）
+def fit_text(s: str, budget_tokens: int,
+             keep: Literal["head", "edges"]) -> str   # 行边界截断：head=头部保留（embed）；
+                                                      # edges=首末恒保留丢中段（既有家族语义，V9）
+def min_window(cfg: ResolvedConfig) -> int            # 最坏保证装填量 w_min（V9 护栏 + V12 estimate 上界
+                                                      # 共用；未声明窗口 → cfg.segment.window 原值；基于先验）
+def classify_stage_error(exc: BaseException) -> str | None
+                                                      # V27①共享 helper：ContextOverflowError →
+                                                      #   "context_overflow"；OutputTruncatedError →
+                                                      #   "output_truncated"；其余 None（算子分类器前置调用）
+
+class ImageCostCalibrator:                            # V19：每 profile 每图成本在线校准（运行内存，零持久化；
+                                                      #   实例由 LLMClient 自持，公开面 llm.calibrator——V23②）
+    def observe(self, profile: str, prompt_tokens: int,
+                text_est: int, n_images: int) -> None # M9 每响应喂样本（含图调用才计；usage 缺失 → 不记样本，
+                                                      #   WARN 一次/profile，先验长期生效——[C-64] 兜底）
+    def freeze_batch(self) -> None                    # M10 批边界冻结：聚合本批样本 max（序无关）压入
+                                                      #   deque(maxlen=CALIBRATION_WINDOW_BATCHES)，
+                                                      #   刷新可读快照（第 N 批装填只读 <N 批聚合值）
+    def cost(self, profile: str) -> int               # 装填读数 = max(批最大值窗口) ÷ 0.85 取整；
+                                                      #   累计样本 < 8 → 先验 × 1.2
+```
+
+Binding notes (from dev spec §3.2, normative):
+
+- The data-adaptive greedy window packer (`_pack_windows(costs, budget, cap)`) is
+  OPERATOR logic and lives in `labelkit/operators/segment.py` (dependency direction
+  unchanged: operators → common); budget.py supplies ONLY the estimation/budget
+  primitives + the calibrator.
+- `est_text` is monotone over prefixes ⇒ `fit_text` bisects on line boundaries —
+  deterministic, O(n log n) upper bound. CJK determination = the Unicode block CJK
+  Unified Ideographs and its extensions + fullwidth punctuation (the implementation
+  enumerates the ranges; tests pin exact samples).
+- `ImageCostCalibrator` determinism guard (V19/F8): the calibration snapshot is FROZEN
+  PER BATCH — batch N's packing reads only the < N batches' aggregate (batches are
+  serial ⇒ same input + same config reproduces byte-identically); samples arrive in
+  asyncio completion order, so `freeze_batch()` aggregates the batch max over the
+  UNORDERED sample set (order-free) into the `deque(maxlen=8)` batch-max window;
+  per-response `observe()` during batch N never affects batch N's own `cost()` reads.
+  Below `CALIBRATION_MIN_SAMPLES` cumulative samples, `cost()` returns the prior
+  (`est_image_prior` at the effective working point) × `PRIOR_INFLATION`; a
+  usage-missing response is a NO-OP sample-wise (WARN once per profile, prior stays in
+  effect indefinitely — the [C-64] gateway fallback).
+- `TEMPLATE_HEAD_TOKENS` (V22, the cross-layer dependency waiver): common may not
+  import operators, so the per-stage frozen prompt-template heads enter the M1 static
+  precheck and the V9 guard as FROZEN INTEGER CONSTANTS here (= `est_text` evaluated on
+  the §10 frozen template texts); an offline test asserts
+  `est_text(operator template constant) == budget constant` cross-layer (the test layer
+  may import both directions) — revising a §10 template turns the test red and the
+  constant follows the CONTRACTS revision.
+
 ---
 
 ## 8. Observability contract (M12 + ch.7)
@@ -3581,6 +3906,16 @@ reach this file (third route, §7.10). v1.9: `stitched` shells never reach this 
 (fourth route, §7.10/T21), and rescue-flipped frames leave it (they become `absorbed`);
 the only NEW (stage, reason) combination is (`"stitch"`, `"stitch_invalid"`) via the
 `failed`/`errors[0]` rule — `stitch.on_error = "fail"` episode candidates only (§7.16).
+v1.11 — two new reasons join via the same `failed`/`errors[0]` rule (the V27① operator
+error classifiers; an L3-repair-INTERNAL overflow deliberately never surfaces here — it
+keeps the `schema_violation`/`callback_violation` attribution, V25①):
+(`<stage>`, `"context_overflow"`) — stage ∈ {`"segment"`, `"stitch"`, `"dedup"`,
+`"classify"`, `"extract"`, `"quality"`, `"generate"`, `"annotate"`, `"verify"`} (chain
+order; every §3.3 packing/final-check point — dedup's is the V15 semantic-embed path;
+extract and stitch reach it only under their `"fail"`-class `on_error` dispositions,
+their defaults degrading per §3.3②⑩); and (`<stage>`, `"output_truncated"`) — any
+LLM-CALLING stage, i.e. the same set minus `"dedup"` (V11: embedding responses carry no
+termination reason).
 `--strict` note: stream-mode noise frames are EXPECTED
 engineering rejects — `--strict` will exit 1 on them (spec 3.11.2/manual). v1.9 `--strict`
 semantics note (T21): stitched shells and rescued frames do NOT constitute rejects, so
@@ -3647,6 +3982,9 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
   // "stream": {"sessions": 0, "episodes": 0, "mean_episode_len": 0.0, "absorbed": 0,
   //            "dropped_noise": 0, "below_min_len": 0, "digest_poor_frames": 0,
   //            "segment_failures": 0
+  //   [, "windows": 0]                            (v1.11, V13④ — ACTUAL sliding-window count,
+  //                                                M14-owned; the user-side reconciliation face
+  //                                                for the V12 upper-bound segment_calls estimate)
   //   [, "stitch": {"stitched": 0, "rescued_short": 0, "seams": 0, "judgments": 0,
   //                 "repass_judgments": 0, "failures": 0}]       (v1.9, stitch enabled only)
   //   [, "extract": {"transitions": 0, "fallback_steps": 0, "failures": 0,
@@ -3667,6 +4005,23 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
   //     threads deliberately has NO stream.* mirror (single point above, T16);
   //     extract.by_type = per-action-type distribution (S14);
   //     verify sub-block per §7.6 (S31; defects histogram over SIX kinds, v1.9)
+  // v1.11, ONLY when ≥ 1 declared profile carries context_window > 0 (all-undeclared keeps
+  // report.json byte-identical to v1.10 — the context-budget byte-equivalence declaration);
+  // counts/stats ONLY, never data content (§2.6); key names [FROZEN HERE] (V13②/④/⑤):
+  // "budget": {"profiles": {"<profile>": {"context_window": 0, "input_budget": 0}},
+  //            "w_min": {"segment.window": [<cap>, <w_min>]},
+  //            "truncations": {"<stage>": 0, ...},
+  //            "overflow_records": 0,
+  //            "image_cost": {"<profile>": 0},
+  //            "degrade_retries": 0,
+  //            "escalations": 0}
+  //   — profiles = the budget-declared profiles with their derived input_budget (V13②);
+  //     w_min pairs [cap, w_min] under the frozen sub-key "segment.window" (V9/V12,
+  //     budget.min_window as the single fact source); truncations = per-stage §3.3
+  //     content-trim counts; overflow_records = context_overflow rejects, all phases
+  //     (L3-repair-internal overflows excluded, V25①); image_cost = each profile's
+  //     calibration END value (V19 — reconciles against usage); degrade_retries = V20
+  //     overflow degrade retries; escalations = V21 ladder escalations
   "trace": {"enabled": true, "path": "...", "events": 0, "dropped_events": 0},
   "llm_usage": {"<profile>": {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
                               "est_cost_usd": 0.0, "retries": 0
@@ -3749,6 +4104,17 @@ v1.9 additions: `counts.stitched` (owner M10 — post-emit shell tally, §7.9);
 `report.stream.stitch` sub-block with `stitched` mirrored from `counts.stitched`).
 `counts.threads` is deliberately NOT a counter — it is derived once at report assembly as
 `episodes − stitched` (T7/T16 single reporting point).
+v1.11 additions (counter key names **[FROZEN HERE]**): `budget.truncations.<stage>`
+(owner = each trimming stage at its §3.3 content-trim point — quality/classify/verify/
+annotate/dedup); `budget.degrade_retries` (owner = the operator performing the V20
+degrade — segment window re-split / annotate frame-halving / quality text-tightening);
+`budget.escalations` (owner M7 — the V21 fail∧repair ladder trigger);
+`budget.overflow_records` (owner = the stage recording the `context_overflow` reject,
+all phases); `segment.windows` (owner M14 — surfacing as `report.stream.windows`, the
+same M14-owned report-only family as `below_min_len`/`digest_poor_frames`).
+`report.budget.profiles` / `w_min` / `image_cost` are NOT MetricsSink counters — M10
+assembles them at report time from ResolvedConfig, `budget.min_window(cfg)` and
+`llm.calibrator` (V13②/⑤).
 
 Counter OWNERSHIP (normative): `counts.*` keys are incremented ONLY by M10 (orchestrator),
 derived from batch tallies / EmitResult — stages must never touch them (double-count).
@@ -4253,7 +4619,9 @@ system:
 user（窗内逐帧，一帧一段）:
   [帧 {i}] {frame_digest(frame_i, segment.digest_max_chars)}
   [帧 {i} 变更] {tree_diff(frame_{i-1}, frame_i) 的文字化摘要}      ← i ≥ 1；窗首帧无此行
-  （segment.use_vision = true 时：每帧摘要 text Part 前附该帧 kind="image" 的 Part，3.9.2）
+  （seg.vision_resolved = true 时：每帧摘要 text Part 前附该帧 kind="image" 的 Part，3.9.2
+    ——v1.11/V1：判据为 M1 派生的 parse product，取代 v1.11 已移除的 segment.use_vision 键；
+    模板正文字节不变）
 ```
 
 Both anchors are hard-coded in the template text and never vary with configuration:
@@ -4708,5 +5076,46 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       stays byte-identical;
     - the keyboard CLOSED key set `? h l e + - p q` (`h` = `?` synonym; unlisted keys
       ignored; Ctrl-C is never consumed by the panel — cbreak keeps ISIG, U15/spec §7.7).
+31. v1.11 context budget & vision auto-derivation (feature spec
+    `docs/dev/SPEC-context-budget.md`, rulings V1–V27; 2026-07-22). Key frozen points:
+    - config mirrors (§6.1): `LLMProfile.context_window = 0` (0 = undeclared = budget off;
+      declare the DEPLOYMENT-EFFECTIVE window, V6/V26) and `default_image_px = 0` (working
+      point, ≤ max_image_px, V18); `EmbeddingProfile.context_window = 0` (embed budget =
+      cw − margin, V15); `SegmentConfig.use_vision` REMOVED — replaced by the parse
+      product `vision_resolved` (V1; an explicit `use_vision` key in `[segment]` is a
+      DIRECTED CONFIG_ERROR with migration guidance, never the unknown-key warning, V2);
+    - rules 33/34 (V3): segment leaves the "requires vision" validation set — the
+      existence/key-resolution/probe sets keep their `enabled ∧ strategy` gate; the
+      rule-4/34 error-message stage set can no longer contain "segment";
+    - the §7.17 budget.py section mirrors dev-spec §3.2 VERBATIM (constants frozen —
+      V7/V8/V22: MARGIN_FLOOR/MARGIN_RATIO/ASCII_PER_TOKEN/CJK_TOKEN_PER_CHAR/
+      OTHER_PER_TOKEN/MSG_OVERHEAD_TOKENS/DIFF_MAX_TOKENS/CALIBRATION_*/PRIOR_INFLATION/
+      TEMPLATE_HEAD_TOKENS); the greedy packer `_pack_windows` stays M14-owned operator
+      logic (operators → common direction unchanged);
+    - errors (§4): `ContextOverflowError(phase ∈ {"precheck", "reactive"})` (V16/V24) and
+      `OutputTruncatedError` (V11); ErrorKind gains `context_overflow`/`output_truncated`;
+      the §7.8 breaker matrix — precheck never feeds; the reactive-400 terminal is fed
+      EXACTLY ONCE by the OWNING operator via ctx.metrics.record_provider_result(
+      fatal=True) (A7); reactive-200 is never fed and `llm.call` keeps status="ok" (F9);
+    - M9 (§7.8): the complete() pre-dispatch final check (V16; budget-off skips; probe
+      passes trivially — F13); V11/V24 termination-reason normalization; the V20
+      budget-gated FULL-body overflow sniff with the frozen five-family pattern set;
+      additive surfaces `PromptBundle.image_px` / `LLMResponse.finish` /
+      `LLMClient.calibrator` (V23; calibrator self-constructed — zero factory changes);
+    - frozen-signature revisions: `build_segment_prompt` gains `digests` (V9 — session-
+      level precompute, template bytes unchanged; `judge_window`'s public signature does
+      NOT change); `build_annotate_prompt`/`annotate_record` gain the trailing
+      `k_eff: int | None = None` / `image_px: int | None = None` (V21 ladder, F3 — the
+      fourth additive trailing-kwarg revision);
+    - window semantics (V9): `segment.window` = UPPER CAP; budget declared → greedy
+      packing preserving the 1-frame overlap and later-window seam ownership; budget off
+      → fixed windows byte-identical to v1.10; digest precompute moves BEFORE windowing
+      (session-level, once); the S12 poverty WARN re-worded per V4 (「为 segment.llm 配置
+      supports_vision=true 的 profile」);
+    - outputs: §9.2 gains (stage, "context_overflow") for the nine §3.3 stages and
+      (stage, "output_truncated") for the LLM-calling stages; §9.3 gains `report.budget`
+      {profiles, w_min, truncations, overflow_records, image_cost, degrade_retries,
+      escalations} (key names [FROZEN HERE]) and `report.stream.windows` (M14-owned);
+      all-undeclared budget keeps report.json byte-identical to v1.10.
 
 — End of contract. —

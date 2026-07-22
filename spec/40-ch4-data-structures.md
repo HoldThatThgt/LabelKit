@@ -199,8 +199,14 @@ def frame_digest(record: Record, max_chars: int) -> str
     #                     交互角色加 "*" 前缀
     #          整体截断至 max_chars（serialize 截断惯例）。
     # 文本模态：record.text 截断至 max_chars。
+    # v1.11（V9）：M14 的 digest 计算前移为会话级预计算——切窗前每会话一次求出逐帧
+    #   digest（预算贪心装填以逐帧成本为输入，3.14）；接缝帧不再随相邻两窗双算
+    #   （前移是净改善；贫瘠护栏计算路径独立、保持不动）。本函数为记录内容纯函数，
+    #   签名与语义零改动。
     # 摘要贫瘠判定：可见文本节点数为 0 或摘要长度 < 8 ⇒ 贫瘠——调用方计入
-    #   digest_poor_frames（6.4 report.stream）+ 每运行一次 WARN，指引开 segment.use_vision。
+    #   digest_poor_frames（6.4 report.stream）+ 每运行一次 WARN，指引为 segment.llm
+    #   配置 supports_vision=true 的 profile（v1.11/V4 改写——use_vision 键已移除，
+    #   窗口附图由能力推导 vision_resolved 决定，3.14）。
 
 def tree_diff(a: UITree | None, b: UITree | None, quantize_px: int) -> Mapping
     # 结构键 (role, bounds//quantize_px, depth) 多重集匹配（S13——node_id 非跨帧身份，
@@ -208,3 +214,5 @@ def tree_diff(a: UITree | None, b: UITree | None, quantize_px: int) -> Mapping
     # {added:int, removed:int, text_changed:int, change_ratio:float,
     #  app_changed:bool, title_changed:bool}
 ```
+
+**预算原语契约引（v1.11）**：上下文预算的估算与装填原语（`margin` / `input_budget` / `embed_budget` / `est_text` / `est_image_prior` / `est_prompt` / `fit_text` / `min_window` / `classify_stage_error` 与 `ImageCostCalibrator`）为新共享模块 `labelkit/common/runtime/budget.py` 的模块级纯函数与类（common 层运行时，**非本章类型层**——签名与冻结常数以 CONTRACTS 的 budget 新节为准，机制见 3.9）；本章共享渲染层（`serialize` / `frame_digest` / `tree_diff`）签名零改动，装填器（贪心切窗等）属算子逻辑、落各算子模块。

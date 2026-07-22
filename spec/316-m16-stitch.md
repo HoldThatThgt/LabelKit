@@ -133,6 +133,7 @@ user（单条消息多 text Part：线索卡在前——按最近活跃降序、
 | 作用域 | 不跨 session、不跨 batch；hard-split 边界不可缝（`session_split` 标照旧 + WARN 提示调大 batch_size，3.10.3）；segment `on_error="keep"` 的整会话降格 episode **照常入池**（合法 episode，3.14.6）。 |
 | 幂等 | 已盖章 `thread_id` 的信封跳过（重入零额外调用）；M7 修复路径不重跑本 stage（wrong_stitch 缺陷 mark-only，不拆线，3.7.3）。 |
 | 退化锚 | 单碎片会话 / 全 new 判定 → 产出 = v1.8 形态（thread = 单碎片、fragments 长度 1、零接缝）；`stitch.enabled = false` → **主输出、rejects、report.json 逐字节等价 v1.8**——依赖条件在场规则：counts.stitched/threads、`report.stream.stitch` 子块、batch.end 新字段、`_meta.stream` 新键（thread_id / fragments / resumed）**仅启用时在场**（6.3/6.4）。**例外恰两处（均无条件设计）**：① dry-run stderr 的 `stitch_calls=0` 行（3.10.3，v1.8 segment_calls 先例）；② stream×verify 报告的缺陷词表行 `verify.defects.wrong_stitch: 0` 与序列评审 system 词表行——缺陷词表是 3.7.2 四处同步的**单一闭集**，不随本开关条件化（真机复验：stitch off 重跑 examples/stream，counts / rejects 全等，仅该一行新增）。 |
+| 上下文预算（v1.11） | 判定 profile 声明 `context_window` 时（未声明 = 预算关闭，行为与 v1.10 一致；机制见 3.9）：缝合判定 prompt 的卡池结构**静态有界**（≤ max_open + 1 张卡 × digest 项，3.16.3 构造保证）⇒ 不做运行期动态裁剪，改由 **M1 静态最坏预检**把关——最坏 est > `input_budget` → **WARN**（**不自动缩 `max_open`**——改语义须用户动手：调大 context_window / 缩 `digest_max_chars` / 缩 `max_open`，3.1.4）。运行时兜底 = M9 咽喉终检（V16）+ 既有 `on_error="keep"` 保守结局（3.16.6：episode 候选开新线索存活、救援候选维持 dropped_noise），无专属降级重试面。 |
 
 ### 3.16.5 配置项
 

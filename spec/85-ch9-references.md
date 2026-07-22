@@ -179,3 +179,19 @@
 - [89] When LLMs Agree, Are They Right? 2026. arXiv:2607.08065（265k 样本审计）；Nine Judges, Two Effective Votes. 2026. arXiv:2605.29800.（前沿模型高自一致处过度自信：GPQA 上 77% 条目自一致 ≥0.8、其中 48% 是错的——自一致性只是条件性代理，votes 治方差（漂移）不治偏差（过连接）；9 裁判 7 家族评审团有效独立票仅 ≈2.0–2.5、聚合算法最多弥合 11% Condorcet 缺口——拒绝评审团路线的实测边界）
 
 - [90] Tian, Y., Zhou, K., Pelleg, D. Characterization and Prediction of Mobile Tasks. ACM TOIS 41(1), 2023. DOI: 10.1145/3522711.（人工标注 1414 个真实手机任务：仅 22.6% 任务存在穿插、多日志任务均 4.1 logs / 1.7 apps——手机穿插深度比桌面浅，桌面锚 max_open=4 在移动域为宽松上界的间接佐证）
+
+- [91] LlamaIndex. PromptHelper：`available_context = context_window − num_prompt_tokens − num_output`（负值抛错）、`DEFAULT_PADDING = 5`、`repack()` 把内容重新装填至最大化利用。工业开源项目。github.com/run-llama/llama_index（llama-index-core/llama_index/core/indices/prompt_helper.py，2026-07-22 访问）
+
+- [92] Claude Code auto-compact 触发式反编译记录：触发点 = `contextWindow − min(maxOutputTokens, 20000) − 13000`——「预留输出 + 万级固定 buffer」结构（各来源触发百分比 ~83%/~89.4%/~95% 不一，结构一致）。gist.github.com/sam-saffron-jarvis/9d8e291c4e696ac7948702d6c4884448（2026-07-22 访问）
+
+- [93] OpenAI. Codex CLI 高级配置：`model_context_window` 用户声明 + 目录钳制（`context_window.min(max_context_window)`）+ 400K = 272K 输入 + 128K 输出预留 + `effective_context_window_percent = 95` 与 90% 触发压缩——声明制 + 输出预留 + 比例边距的完整同构。工业文档。developers.openai.com/codex/config-advanced；github.com/openai/codex/issues/19185（2026-07-22 访问）
+
+- [94] QwenLM. Qwen-VL 官方评测口径：`max_frames = 768` **且**总视频 token ≤ 24,576 双约束；维护者给出 `max_pixels = 24576×28×28 // num_frames`——帧数是上限、预算守恒。github.com/QwenLM/Qwen3-VL/issues/1248（2026-07-22 访问）
+
+- [95] NVIDIA. NeMo Curator Nemotron-CC 管线 DocumentJoiner：把相邻短段拼至 `max_segment_tokens`（"maximize input utilization"）——数据管线的 token 装填同类算子（工具链主引用见 [9]，此处为装填能力面）。github.com/NVIDIA-NeMo/Curator（tutorials/synthetic/nemotron_cc/nemotron_cc_pipelines.py，2026-07-22 访问）
+
+- [96] BBA: A Buffer-Based Approach to Rate Adaptation（Huang, T.-Y. et al.）. SIGCOMM 2014. yuba.stanford.edu/~nickm/papers/sigcomm2014-video.pdf；BBR: Congestion-Based Congestion Control（Cardwell, N. et al.）. ACM Queue 14(5), 2016. dl.acm.org/doi/fullHtml/10.1145/3012426.3022184.（measure-don't-model 范式两代表作：BBA 稳态不需容量估计、启动期必须要；BBR windowed-max 带宽 / windowed-min RTT 测量式建模取代丢包反应——V19 在线校准器「窗口化最大值滤波」的直接蓝本）
+
+- [97] Cline. 生产级上下文管理的刻意反应式设计："deliberate design choice since accurate token counting varies by model/tokenizer … the first request that exceeds limits will fail"；图片 10K–30K+ token/张且 usage 滞后一拍；实证企业网关存在 `usage: null` 响应。工业开源项目 issue 记录。github.com/cline/cline/issues/6055；issues/7383；issues/9433（2026-07-22 访问）
+
+- [98] Zoom Eye: 置信度分数驱动的图像树递归变焦（训练无关；HR-Bench +15.7~17.7%，8B 超 GPT-4o）. EMNLP 2025 Oral. github.com/om-ai-lab/ZoomEye；V*/SEAL: Guided Visual Search as a Core Mechanism in Multimodal LLMs. CVPR 2024. vstar-seal.github.io（置信度低于阈值即递归切 patch 搜索，终止 = 命中或达最小粒度；V*Bench 7B+搜索 75.4% vs GPT-4V 55.0%）；UI-Zoomer: 置信门控变焦（训练无关；GUI grounding +4.2–13.4%）. 2026. arXiv:2604.14113.（「低置信 → 定向升清重试」谱系——V21 判审升级路径的学术与 GUI 域背书）

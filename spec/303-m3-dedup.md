@@ -33,6 +33,8 @@ UI 模态合成判定：`dedup.ui_dup_requires = "both"`（默认，树近似重
 
 **线索记录（v1.9）。**stitch 启用时抵达本模块的判重单元升维为**线索**（thread——M16 缝合后的幸存序列信封，链序 stitch 在 dedup 之前，3.10.3/3.16）：`dedup_text` 配方**机制原样**（上列 S10 序列分支零改动）——成员逐条按其单记录配方产出后按成员序以 `"\x1e"` 拼接，作用对象自然是**重绑后**的成员元组，线索级重复 =「同样的完整操作流程（含恢复段）」；被并 episode 壳（`status = "stitched"`）被既有 `status == "active"` 处理面过滤**天然排除**、不参检不入索引（absorbed 成员帧同理）——**本模块代码零改动**（T13，审计核查点 6）。
 
+**嵌入输入预算截断（v1.11，V15）。**`dedup.semantic = true` 且所引 `[embedding.<name>]` profile 声明 `context_window` 时（0 = 未声明 = 预算关闭，行为与 v1.10 一致），第④级的 embed 输入（`dedup_text` 产物，含序列/线索拼接文本）在发起 embedding 调用前按 `embed_budget = context_window − margin`（无输出预留，3.9）截断——**确定性头部保留**（`keep = "head"` 行边界截断：嵌入语义主体在文本前部），修复该调用点完全无截断的既有缺口；截断计入 `report.budget.truncations`（6.4）。既有 `embedding_failures` 跳过路径（3.3.4）**保留为兜底**——截断之外的 embedding 失败仍按①—③判定、不增新失败通道。
+
 ### 3.3.4 API 与配置
 
 ```
