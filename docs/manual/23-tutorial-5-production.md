@@ -34,6 +34,10 @@ api_key_env = "LABELKIT_KEY_DEFAULT"
 max_concurrency = 16          # 理由：生产网关额度高；从限流值的 60% 起步，盯 retries
 supports_structured_output = true
 supports_vision = true
+context_window = 131072       # 理由：v1.11 预算护栏的开关——声明后超长输入变成有界裁剪或
+                              # 记录级 context_overflow 拒绝，而不是撞端点报错烧熔断连击；
+                              # 值按部署实测保守声明（欠声明恒安全），每个会被调用的 profile
+                              # 都声明（第 6、18 章；报表对账读 report.budget，第 8 章）
 price_per_mtok_in = 0.6       # 理由：没有单价就没有成本账，预算无从谈起
 price_per_mtok_out = 1.8
 
@@ -44,6 +48,7 @@ model = "claude-sonnet-5"
 api_key_env = "LABELKIT_KEY_JUDGE_A"
 max_concurrency = 8
 supports_structured_output = true
+context_window = 200000
 price_per_mtok_in = 3.0       # 理由：成本账按 profile 计——漏配单价的 profile 不进 est_cost_usd，
 price_per_mtok_out = 15.0     # 而本配置的调用大头恰在评审团，漏配它们成本账就废了
 
@@ -54,6 +59,7 @@ model = "deepseek-v3"
 api_key_env = "LABELKIT_KEY_DEFAULT"
 max_concurrency = 8
 supports_structured_output = true
+context_window = 65536
 price_per_mtok_in = 0.3
 price_per_mtok_out = 1.1
 
@@ -64,6 +70,7 @@ model = "glm-5.2"
 api_key_env = "LABELKIT_KEY_DEFAULT"
 max_concurrency = 8
 supports_structured_output = true
+context_window = 131072
 price_per_mtok_in = 0.4
 price_per_mtok_out = 1.6
 
@@ -74,6 +81,7 @@ model = "qwen2.5-7b-instruct"
 api_key_env = "LABELKIT_KEY_DEFAULT"
 max_concurrency = 16
 supports_structured_output = true
+context_window = 131072
 price_per_mtok_in = 0.05
 price_per_mtok_out = 0.1
 ```

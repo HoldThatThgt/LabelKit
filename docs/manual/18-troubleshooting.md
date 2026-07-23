@@ -20,10 +20,12 @@
 | `classification_invalid` | classify | 分类输出修复耗尽（v1.7），两种形态：默认 `on_error="fallback"` ⇒ 归兜底类、记录**存活不进 rejects**（痕迹在 `_meta.classification.source="fallback"`、trace classify 通道的 error 事件与 report 的 `classify.fallback_count`）；`on_error="fail"` ⇒ 记录 failed 进 rejects。fallback_count 偏高 ⇒ 类别表描述区分度不足，第 24 章 |
 | `extraction_invalid` | extract | 单个转移的动作摘取修复耗尽（v1.8），两种形态：默认 `on_error="fallback"` ⇒ 该步记 `action_type="other"` 并留痕于该步 detail（episode **存活不进 rejects**，不写记录 errors，计 `stream.extract.fallback_steps`）；`on_error="fail"` ⇒ episode failed 进 rejects。fallback_steps 偏高 ⇒ 截图不可读或摘取指令需要补域说明，第 25 章 |
 | `judgment_invalid` | quality | 单次裁决修复后仍非法 ⇒ 按平局计入 BT（不失败记录），计 `report.quality.judgment_failures`。率 >5% 见第 16 章诊断 |
-| `schema_violation` | schema 引擎 | L3 修复预算耗尽 ⇒ 记录 failed。批量出现 ⇒ 第 14 章（Schema 太难/输出被截断） |
+| `schema_violation` | schema 引擎 | L3 修复预算耗尽 ⇒ 记录 failed。批量出现 ⇒ 第 14 章（Schema 对模型不友好）。v1.11 两注：「输出被截断」不再是本码的成因——截断已独立成 `output_truncated`（见下）；修复调用自身超上下文预算的轮失败短路（14.1）归因也维持本码/`callback_violation` 不变 |
 | `callback_violation` | schema 引擎 | L3 耗尽且剩余违规全部来自 `output.validator` 回调（14.5）⇒ 记录 failed。批量出现 ⇒ 回调规则模型学不会——把违规消息改写成更明确的改进指示，或放宽规则 |
+| `context_overflow` | llm-client / 各算子 | 超出上下文预算（v1.11，仅相关档声明了 `context_window` 时才会出现，第 6 章），三种形态：**预检**——调用发出前估算即超限，或连语义最小单元都装不下（单记录 / 2 帧窗 / 1 条种子 / 2 张关键帧；pairwise 的一对装不下**不拒收记录**——按裁决粒度折算平局，仅记错误与事件，第 10 章）；**反应态 400**——端点以 400 报超窗、有界降级重试（segment 窗对半改切 / annotate 减帧 / quality 收紧文本份额）耗尽仍失败；**反应态 200**——端点以成功响应报 `model_context_window_exceeded` 且降级耗尽（或该调用点无可降级项）。处置一致：记录 failed 进 rejects，计 `report.budget.overflow_records`；降级重试独立计数（`degrade_retries`）、不烧常规重试。熔断交互：预检不计连击（没碰端点）、反应态 200 不补喂（HTTP 交互成功）、**唯反应态 400 的终局计入连击一次**。批量出现 ⇒ 记录真的超大：核对 `context_window` 是否欠声明过狠（可按实测实效窗上调），或接受拒收 |
+| `output_truncated` | llm-client | 输出写满 `max_output_tokens` 被截断（v1.11：`finish_reason=length` / `stop_reason=max_tokens`）——输入合窗、输出溢出。**终局化**：记录 failed 进 rejects 独立成桶；不进 L1–L3 修复环（硬修截断 JSON 会产出结构合法但语义残缺的对象，第 14 章）；不喂熔断（交互成功）。处置 ⇒ 调大配置里的 `max_output_tokens`——工具刻意**不做**「加大 max_tokens 自动重试」（会破坏预算不变式与确定性）；声明了 `context_window` 时注意调大它会挤占输入预算（第 17 章） |
 | `provider_retryable_exhausted` | llm-client | 重试 max_retries 次仍失败（网络/超时/429/5xx），v1.6 起也包括驻留超限（全部存活密钥均在 429 冷却、累计等待超 `run.max_park_s`）⇒ 记录 failed。批量出现 ⇒ 端点在持续故障或限流，见 18.2「运行频繁被 429 限流拖慢 / 中断」 |
-| `provider_fatal` | llm-client | 不可重试错误（401/403/400/404）⇒ 记录立即 failed 并计入熔断窗口。v1.6 密钥池下 401/403 先按密钥禁用、池内尚有存活密钥时**不产生本错误**（见 18.2「某把 key 被吊销…」）。批量出现 ⇒ 密钥/权限/模型名问题 |
+| `provider_fatal` | llm-client | 不可重试错误（401/403/400/404）⇒ 记录立即 failed 并计入熔断窗口。v1.6 密钥池下 401/403 先按密钥禁用、池内尚有存活密钥时**不产生本错误**（见 18.2「某把 key 被吊销…」）。v1.11：预算开启（声明了 `context_window`）时，错误体被识别为「上下文超长」的 400 不落本码——先走有界降级重试，耗尽按 `context_overflow` 收场（终局补计一次连击）；未识别的 400 照旧走本码。批量出现 ⇒ 密钥/权限/模型名问题 |
 | `internal_error` | 任意 | 未预期异常（含输出前终检兜底）⇒ 记录 failed，堆栈在 debug 级日志。理论上不该出现，出现请留存日志报告 |
 
 ## 18.2 按症状排查
@@ -56,7 +58,7 @@ InputError: 无任何合法记录: input.jsonl（scanned=14 bad_input=14 missing
 
 ### 「退出码 4」
 
-- **熔断**：report 照常写出，显式标志是 `run.circuit_broken: true`（`interrupted` 保持 `false`——那个字段仅在 SIGINT/SIGTERM 中断时为 true）。v1.6 起已完成批的主输出与 rejects **照常改名交付**（v1.5 及以前是 `.part` 不改名丢弃），report 另标 `partial_delivery: true`——读法见下文「运行以退出码 4 结束，但主输出文件存在」。认证类错误（401/403）**首次出现即熔断**（v1.6 密钥池下指该 profile **最后一把**存活密钥被认证禁用——此前的单把 401/403 只静默禁用那把 key，见「某把 key 被吊销…」）；400/404、重试耗尽等按连续计数达阈值熔断。查密钥、模型名、网关状态；
+- **熔断**：report 照常写出，显式标志是 `run.circuit_broken: true`（`interrupted` 保持 `false`——那个字段仅在 SIGINT/SIGTERM 中断时为 true）。v1.6 起已完成批的主输出与 rejects **照常改名交付**（v1.5 及以前是 `.part` 不改名丢弃），report 另标 `partial_delivery: true`——读法见下文「运行以退出码 4 结束，但主输出文件存在」。认证类错误（401/403）**首次出现即熔断**（v1.6 密钥池下指该 profile **最后一把**存活密钥被认证禁用——此前的单把 401/403 只静默禁用那把 key，见「某把 key 被吊销…」）；400/404、重试耗尽等按连续计数达阈值熔断。查密钥、模型名、网关状态。**一类可根治的 400 熔断（v1.11）**：个别超大记录（超长文本、巨型控件树、多图长序列）连续把端点打出「上下文超长」的 400，也会攒满连击触发熔断——对策是**先给该 profile 声明 `context_window`**（第 6 章）：预算机制会在调用发出前把装不下的记录转成记录级 `context_overflow` 拒收，run 继续、熔断不再触发（预检形态不计连击；只有降级重试也救不回的反应态 400 终局才补计一次——那种连续失败值得停机排查）。另一个实测事实可省你排查时间：z.ai 的 anthropic 路由**根本不用 400 报超窗**——它返回 200 响应 + `stop_reason="model_context_window_exceeded"`（零计费、空内容），这种 200 形态 v1.11 起被自动识别为 `context_overflow`、天然不喂熔断，所以在该端点「超大记录攒熔断」本就不会发生，rejects 里直接找 `context_overflow` 即可；
 - **输出不可写（运行期才失败）**：启动时输出目录还正常、运行中途写入失败——目录被删/改名、磁盘写满、权限被中途收回等。注意：忘了 `mkdir -p out` 或目录一开始就没有写权限，会在启动校验被拦下 → **退出码 2**（消息「输出父目录不存在或不可写」）；
 - **Ctrl-C 打在流水线之外**：运行中的 Ctrl-C 走优雅中断（正常交付、退出码 0/1，见「`.part` 文件是什么」）；但打在启动/收尾阶段（配置装载、probe 等）或信号处理不可用的平台上时，进程以 `interrupted` + 退出码 4 收场。
 

@@ -42,10 +42,11 @@ max_retries = 5
 supports_structured_output = true
 supports_vision = true
 max_output_tokens = 4096
+context_window = 131072           # v1.11：声明端点上下文窗，激活预算护栏（第 6 章）
 temperature = 0.0
 ```
 
-（文件里还有一个结构几乎相同的 `[llm.judge]` 档，供第 21 章 UI 教程的 verify 独立评审引用，此处从略。）
+（文件里还有一个结构几乎相同的 `[llm.judge]` 档，供本工程与后续教程的 verify 独立评审引用，此处从略。两档都声明了 `context_window`——这是 v1.11 上下文预算护栏的开关，声明后长输入不再撞端点 400，报告里也会多一个 `budget` 节，第 6、8 章细讲。）
 
 **`examples/text/project.toml`（工程配置）**——声明这次任务怎么跑：
 
@@ -152,7 +153,8 @@ uv run labelkit validate --config ../config.toml --project project.toml --probe
 
 ```
 配置校验通过
-probe default: ok model=glm-5.2 latency_ms=7291
+probe default: ok model=glm-5.2 latency_ms=4031
+probe judge: ok model=glm-5.2 latency_ms=1808
 ```
 
 **第二步：试运行**（`--dry-run`：把配置和输入完整校验一遍、估算成本，但一次 LLM 都不调）：
@@ -179,37 +181,40 @@ uv run labelkit run --config ../config.toml --project project.toml
 交互终端下，run 还会在滚动日志下方显示一块实时刷新的运行面板（批进度、状态计数与 LLM 用量，v1.10，详见 15.6 与 16.6）；日志行本身不受影响，stderr 上会看到（省略时间戳）：
 
 ```
-INFO  run     batch=0 run.start tool_version=labelkit/1.0.0 config_digest=sha256:9c92... project_digest=sha256:b648... trace_schema_version=1
-INFO  emitter batch=1 批 1 落盘：主输出 +9 行（累计 9），rejects +5（累计 5）
-INFO  run     batch=1 batch.end active=9 dropped_dup=1 dropped_lowq=4 dropped_verify=0 failed=0 duration_ms=138905 fanout=0
-INFO  emitter batch=2 批 2 落盘：主输出 +6 行（累计 15），rejects +6（累计 11）
-INFO  run     batch=2 batch.end active=6 dropped_dup=0 dropped_lowq=6 dropped_verify=0 failed=0 duration_ms=90973 fanout=0
-INFO  emitter batch=- finalize：fsync + rename  out/text-labels.jsonl.part → out/text-labels.jsonl（15 行）
-INFO  emitter batch=- 已写出 out/text-labels.rejects.jsonl（11 行）与 out/text-labels.report.json
+INFO  run     batch=0 run.start tool_version=labelkit/1.0.0 config_digest=sha256:1c1c... project_digest=sha256:b648... trace_schema_version=1
+INFO  run     batch=0 budget: default=131072/113868 judge=131072/115916
+WARN  quality batch=1 error stage=quality kind=output_truncated message=pointwise scoring call failed for criterion facts_trivia (OutputTruncatedError): response terminated at the output cap (finish='max_tokens', max_output_tokens=4096) retryable=False
+INFO  emitter batch=1 批 1 落盘：主输出 +8 行（累计 8），rejects +6（累计 6）
+INFO  run     batch=1 batch.end active=8 dropped_dup=1 dropped_lowq=4 dropped_verify=0 failed=1 duration_ms=149982 fanout=0
+INFO  emitter batch=2 批 2 落盘：主输出 +5 行（累计 13），rejects +7（累计 13）
+INFO  run     batch=2 batch.end active=5 dropped_dup=0 dropped_lowq=7 dropped_verify=0 failed=0 duration_ms=84955 fanout=0
+INFO  emitter batch=- finalize：fsync + rename  out/text-labels.jsonl.part → out/text-labels.jsonl（13 行）
+INFO  emitter batch=- 已写出 out/text-labels.rejects.jsonl（13 行）与 out/text-labels.report.json
    ── 终版摘要（与 report.counts 逐项一致）──
    scanned=14  ingested=14  bad_input=0  generated=12
-   dropped_dup=1  dropped_lowq=10  dropped_verify=0  failed=0  emitted=15
+   dropped_dup=1  dropped_lowq=11  dropped_verify=0  failed=1  emitted=13
 INFO  run     batch=0 run.end exit_code=0
 ```
 
-四分钟左右，退出码 0。注意有**两个批**：批 1 是 14 条输入数据；批 2 是生成算子以批 1 过质量门的记录为种子扩充出的 12 条新样本（`generated=12`），它们**回流**从去重起重走一遍全流程。读一下这份摘要，它就是流水线的「过磅单」：
+四分钟左右，退出码 0。第二行的 `budget:` 是 v1.11 的启动预算 INFO：声明了 `context_window` 的每个 profile 各报一段「声明窗/输入预算」（第 16 章）。注意有**两个批**：批 1 是 14 条输入数据；批 2 是生成算子以批 1 过质量门的记录为种子扩充出的 12 条新样本（`generated=12`），它们**回流**从去重起重走一遍全流程。读一下这份摘要，它就是流水线的「过磅单」：
 
 - 14 条进来（`scanned=14`，全部合法 `ingested=14`），另有 12 条生成样本入流（`generated=12`）；
 - 去重工位拦下 1 条（`dropped_dup=1`——那条一字不差的重复；只多一个「做」字的那条为什么**没**被去重拦下？我们在 3.5 节看账）；
-- 质量工位共拦下 10 条（`dropped_lowq=10`——批 1 的「哈哈哈哈哈」「在吗」们拦下 4 条，批 2 的生成样本被同一把尺子拦下 6 条；门槛按类生效：writing 0.2 / qa 0.4 / 其余 0.25）；
-- 15 条通过全部工位、完成标注并通过评审、写入主输出（`emitted=15`：9 条真实 + 6 条合成）。
+- 质量工位共拦下 11 条（`dropped_lowq=11`——批 1 的「哈哈哈哈哈」「在吗」们拦下 4 条，批 2 的生成样本被同一把尺子拦下 7 条；门槛按类生效：writing 0.2 / qa 0.4 / 其余 0.25）；
+- 还有 1 条以 failed 收场（`failed=1`，就是日志里那行 WARN）：第 11 行的古诗翻译在质量打分时，模型的长推理把 4096 token 的输出上限写满——v1.11 起这类响应按 `output_truncated` **记录级拒绝**（案底在 rejects，第 8、18 章），run 照常继续；
+- 13 条通过全部工位、完成标注并通过评审、写入主输出（`emitted=13`：8 条真实 + 5 条合成）。
 
-注意守恒：`15 + 1 + 10 + 0 + 0 = 26 = 14（输入）+ 12（生成）`。**每一次运行这个等式都必须成立**——这是 LabelKit 的账目不变量。
+注意守恒：`13 + 1 + 11 + 0 + 1 = 26 = 14（输入）+ 12（生成）`。**每一次运行这个等式都必须成立**——这是 LabelKit 的账目不变量。
 
-> 你本机的具体拦截数可能与这里略有出入：LLM 服务端存在非确定性，生成样本条数与聚合分恰在阈值附近的两三条记录逐次运行可能进出浮动——但守恒等式永远成立。
+> 你本机的具体拦截数可能与这里略有出入：LLM 服务端存在非确定性，生成样本条数与聚合分恰在阈值附近的两三条记录逐次运行可能进出浮动，那条 `output_truncated` 也未必复现——但守恒等式永远成立。
 
 ## 3.4 读产物
 
 `out/` 下出现四个文件：
 
 ```
-text-labels.jsonl           # 主输出（15 行）
-text-labels.rejects.jsonl   # 拒绝通道（11 行）
+text-labels.jsonl           # 主输出（13 行）
+text-labels.rejects.jsonl   # 拒绝通道（13 行）
 text-labels.report.json     # 运行报告
 text-labels.trace.jsonl     # 追踪日志（因为开了 trace.enabled）
 ```
@@ -223,13 +228,13 @@ text-labels.trace.jsonl     # 追踪日志（因为开了 trace.enabled）
   "difficulty": "medium",
   "_meta": {
     "id": "a8aa181766eebd97",
-    "run": {"tool": "labelkit/1.0.0", "started_at": "2026-07-17T02:50:37.417380+08:00",
+    "run": {"tool": "labelkit/1.0.0", "started_at": "2026-07-23T04:41:06.239007+08:00",
             "project_file": "project.toml", "rubric": "default:text", "seed": 42},
     "source": {"file": "input.jsonl", "line_no": 4, "generated_from": [],
                "fields": {"source": "ime-log"}, "generator": null},
     "stream": null,
-    "scores": {"writing_style": 0.4, "facts_trivia": 0.6, "educational_value": 0.8,
-               "required_expertise": 0.6, "__aggregate__": 0.6,
+    "scores": {"educational_value": 0.6, "facts_trivia": 0.8, "required_expertise": 0.6,
+               "writing_style": 0.4, "__aggregate__": 0.6000000000000001,
                "mode": "pointwise", "batch_no": 1, "pool": "qa"},
     "dedup": {"kind": "unique"},
     "classification": {"label": "qa", "labels": ["qa"], "source": "llm"},
@@ -253,14 +258,14 @@ text-labels.trace.jsonl     # 追踪日志（因为开了 trace.enabled）
 
 ```json
 "quality": {
-  "per_criterion_mean": {"educational_value": 0.368,
-                          "facts_trivia": 0.16,
-                          "required_expertise": 0.288,
-                          "writing_style": 0.4}
+  "per_criterion_mean": {"educational_value": 0.29600000000000004,
+                          "facts_trivia": 0.18333333333333335,
+                          "required_expertise": 0.21600000000000005,
+                          "writing_style": 0.424}
 },
 "llm_usage": {
-  "default": {"calls": 131, "prompt_tokens": 52676, "completion_tokens": 12743, "retries": 0},
-  "judge":   {"calls": 16,  "prompt_tokens": 6171,  "completion_tokens": 4780,  "retries": 0}
+  "default": {"calls": 134, "prompt_tokens": 46399, "completion_tokens": 16183, "retries": 0},
+  "judge":   {"calls": 13,  "prompt_tokens": 4559,  "completion_tokens": 2323,  "retries": 0}
 }
 ```
 
@@ -275,7 +280,7 @@ text-labels.trace.jsonl     # 追踪日志（因为开了 trace.enabled）
  "payload": {"kind": "exact", "cluster_key": "...", "kept_id": "..."}}
 ```
 
-而第 7 行「多一个做字」那条，你会发现它**不在**去重的名单里（rejects 中它的 `stage` 是 `quality` 而非 `dedup`）——默认的近似去重阈值（Jaccard ≥ 0.85，字符 5-gram）对这句 20 字的短文本来说，一个字的差异已经让相似度跌破阈值，它是后来才被质量门拦下的。短文本去重要不要收紧、怎么收紧，见第 9 章「调优」。
+而第 7 行「多一个做字」那条，你会发现它**根本不在** rejects 里——默认的近似去重阈值（Jaccard ≥ 0.85，字符 5-gram）对这句 20 字的短文本来说，一个字的差异已经让相似度跌破阈值；躲过去重后它又以聚合分 0.2 贴着 writing 类的门线活了下来（门控规则是 `< 阈值` 才淘汰），反倒是它的原句第 1 行死于质量门——两条几乎一样的文本一死一生，第 20 章拿这对孪生兄弟当解剖标本。短文本去重要不要收紧、怎么收紧，见第 9 章「调优」。
 
 再比如质量工位给「哈哈哈哈哈哈哈」打分的原始裁决（`quality.pointwise` 事件、`content="refs"` 档带理由）：LLM 在每条准则上都给了 0 分，理由清清楚楚写在 `reason` 字段里。**当你对任何一条记录的去留有疑问时，trace 就是你查账的地方**（第 16 章）。
 

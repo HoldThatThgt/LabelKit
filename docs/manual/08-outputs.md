@@ -25,13 +25,13 @@
 ```json
 {
   "intent": "qa",                                    ← 你的 Schema 字段（顶层平铺）
-  "topic": "光合作用暗反应与卡尔文循环",
+  "topic": "光合作用暗反应（卡尔文循环）的发生部位与三个阶段",
   "difficulty": "medium",
   "_meta": {
     "id": "a8aa181766eebd97",                        ← 记录的确定性 id（第 4 章）
     "run": {                                         ← 这次运行的指纹
       "tool": "labelkit/1.0.0",
-      "started_at": "2026-07-14T04:56:31.624648+08:00",
+      "started_at": "2026-07-23T04:41:06.239007+08:00",
       "project_file": "project.toml",
       "rubric": "default:text",
       "seed": 42
@@ -46,18 +46,21 @@
     "stream": null,                                  ← 时序流元信息（v1.8 恒在键；未启用恒为 null，第 25 章；
                                                         v1.9 缝合启用时另含 thread_id / fragments 等线索键，第 26 章）
     "scores": {                                      ← 质量分（quality 开启时）
-      "writing_style": 0.4,                          ← 每条准则一个 [0,1] 分
-      "facts_trivia": 0.6,
-      "educational_value": 0.8,
+      "educational_value": 0.6,                      ← 每条准则一个 [0,1] 分
+      "facts_trivia": 0.8,
       "required_expertise": 0.6,
-      "__aggregate__": 0.6,                          ← 加权聚合分（质量门用的就是它）
+      "writing_style": 0.4,
+      "__aggregate__": 0.6000000000000001,           ← 加权聚合分（质量门用的就是它）
       "mode": "pointwise",                           ← 打分模式；pairwise 时为 "pairwise_bt"
-      "batch_no": 1                                  ← 在第几批打的分（pairwise 下跨批不可比）
+      "batch_no": 1,                                 ← 在第几批打的分（pairwise 下跨批不可比）
+      "pool": "qa"                                   ← classify 启用时出现：在哪个类池里打的分（第 24 章）
     },
     "dedup": {"kind": "unique"},                     ← 去重判定（存活者恒为 unique）
-    "classification": null,                          ← 分类结果（v1.7 恒在键；classify 未启用恒为 null）
+    "classification": {"label": "qa",                ← 分类结果（v1.7 恒在键；classify 未启用恒为 null——
+                        "labels": ["qa"],               本行来自开着 classify 的 quickstart 工程）
+                        "source": "llm"},
     "annotation": {"model": "glm-5.2", "attempts": 1},  ← 标注用的模型与尝试次数
-    "verification": null                             ← verify 未启用为 null；启用后 {"verdict","rounds"}
+    "verification": {"verdict": "pass", "rounds": 1}    ← verify 未启用恒为 null；启用后 {"verdict","rounds"}
   }
 }
 ```
@@ -93,40 +96,40 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
 
 ## 8.3 拒绝通道：淘汰者的案底
 
-`rejects = "refs"`（默认）档，每行长这样：
+`rejects = "refs"`（默认）档，每行长这样（quickstart 工程的第一行，classify 开启所以带 `label` 键）：
 
 ```json
 {"_meta": {"id": "6e60ce3c2d59f04d",
            "source": {"file": "input.jsonl", "line_no": 1, "generated_from": []},
-           "stage": "quality", "reason": "below_threshold", "errors": []}}
+           "stage": "quality", "reason": "below_threshold", "errors": [], "label": "writing"}}
 ```
 
-- `stage` + `reason` 告诉你**在哪个工位、因为什么**被淘汰。常见组合：`dedup` / 判重类别（`exact` / `near_text` / `near_image` / `near_both`，开语义层时另有 `near_semantic`，与第 9 章一致）、`quality / below_threshold`（top_ratio 模式下为 `top_ratio`）、`verify / verify_fail`；stream 模式（第 25 章）另有 `segment` / `noise`、`segment` / `below_min_len` 与 `verify` / `off_task_member`；v1.9 的 `stitch` / `stitch_invalid` 仅在 `stitch.on_error = "fail"` 时出现（缝合判定失败的 episode 候选信封，第 26 章）。记录处理**失败**（状态 `failed`）时，`stage` 为出错工位、`reason` 为首个错误的**错误码**（如 `schema_violation`、`provider_fatal`，全表见第 18 章），`errors` 列表为具体的错误信息文本。反向的提醒：缝合产生的 `stitched` 壳与救援命中的短段帧**不落 rejects**——救援把帧从 `dropped_noise` 翻回 `absorbed`，同一份输入开启缝合后 rejects 行数可能变少（`--strict` 交互见 8.4 末尾）；
+- `stage` + `reason` 告诉你**在哪个工位、因为什么**被淘汰。常见组合：`dedup` / 判重类别（`exact` / `near_text` / `near_image` / `near_both`，开语义层时另有 `near_semantic`，与第 9 章一致）、`quality / below_threshold`（top_ratio 模式下为 `top_ratio`）、`verify / verify_fail`；stream 模式（第 25 章）另有 `segment` / `noise`、`segment` / `below_min_len` 与 `verify` / `off_task_member`；v1.9 的 `stitch` / `stitch_invalid` 仅在 `stitch.on_error = "fail"` 时出现（缝合判定失败的 episode 候选信封，第 26 章）。记录处理**失败**（状态 `failed`）时，`stage` 为出错工位、`reason` 为首个错误的**错误码**（如 `schema_violation`、`provider_fatal`；v1.11 增两值——`context_overflow` 上下文超预算、`output_truncated` 响应写满输出上限被终局拒绝，任何走 LLM 调用的工位都可能出现，全表见第 18 章），`errors` 列表为具体的错误信息文本。反向的提醒：缝合产生的 `stitched` 壳与救援命中的短段帧**不落 rejects**——救援把帧从 `dropped_noise` 翻回 `absorbed`，同一份输入开启缝合后 rejects 行数可能变少（`--strict` 交互见 8.4 末尾）；
 - `refs` 档**不含数据内容**——想看被淘汰的原文，要么拿 `line_no` 回输入文件查，要么把 `rejects` 改成 `"full"`（原文随行落盘，注意这就是一份数据副本了）；
 - `rejects = "none"` 时不写此文件，淘汰只反映在报告计数里。**调优期强烈建议至少 refs**：质量门帮你扔掉了什么，是判断阈值合不合理的第一手材料。
 
 ## 8.4 report.json 逐节解读
 
-以下是一次真实运行的完整报告（14 条输入的 quickstart 工程）：
+以下是一次真实运行的完整报告（quickstart 工程：14 条输入 + 12 条生成样本回流；classify / generate 的专属节以 `{…}` 略）：
 
 ```json
 {
   "run": {
     "tool_version": "1.0.0",
-    "started_at": "2026-07-14T04:56:31.624648+08:00",
-    "finished_at": "2026-07-14T04:57:51.322560+08:00",
+    "started_at": "2026-07-23T04:41:06.239007+08:00",
+    "finished_at": "2026-07-23T04:45:01.401648+08:00",
     "interrupted": false,                ← 仅 SIGINT/SIGTERM 优雅中断时为 true
     "circuit_broken": false,             ← 熔断的显式标志（触发时为 true，exit_code 同为 4）
     "exit_code": 0,
     "modality": "text",
     "seed": 42,
-    "config_digest": "sha256:9c92d09a…", ← 两份配置文件的指纹：
-    "project_digest": "sha256:fbf42019…"    对账"这份产物是哪套配置跑的"就靠它
+    "config_digest": "sha256:1c1c1158…", ← 两份配置文件的指纹：
+    "project_digest": "sha256:b648d1cc…"    对账"这份产物是哪套配置跑的"就靠它
   },
   "counts": {                            ← 过磅单（守恒等式见第 4 章）
     "scanned": 14, "ingested": 14, "bad_input": 0,
-    "dropped_dup": 1, "dropped_lowq": 6, "dropped_verify": 0,
-    "failed": 0, "generated": 0, "emitted": 7
+    "dropped_dup": 1, "dropped_lowq": 11, "dropped_verify": 0,
+    "failed": 1, "generated": 12, "emitted": 13
   },
   "dedup": {                             ← 去重明细：各层各拦了几条
     "exact": 1, "near_text": 0, "near_image": 0, "near_both": 0,
@@ -138,25 +141,43 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
     "rounds": 4,
     "judgment_failures": 0,              ← 裁决输出不合法的次数（>5% 要警惕，见第 16 章）
     "aggregate_histogram": {             ← 聚合分 10 桶直方图：
-      "0.0-0.1": 3, "0.1-0.2": 1, "0.2-0.3": 3, "0.3-0.4": 1,
-      "0.4-0.5": 1, "0.5-0.6": 0, "0.6-0.7": 4, "…": 0
+      "0.0-0.1": 4, "0.1-0.2": 4, "0.2-0.3": 5, "0.3-0.4": 7,
+      "0.4-0.5": 0, "0.5-0.6": 1, "0.6-0.7": 3, "0.7-0.8": 1, "…": 0
     },                                       画质量线之前先看它！
     "per_criterion_mean": {              ← 每条准则的均值：哪条准则在拖后腿一目了然
-      "educational_value": 0.35384615384615387, "facts_trivia": 0.24615384615384617,
-      "required_expertise": 0.2769230769230769, "writing_style": 0.4
-    }                                    ← pairwise 模式下均值恒 ≈0.5，另有 per_criterion_tie_rate
-  },                                        （每准则平局率，只统计拿到裁决的比较——rubric 区分度的直接读数）
+      "educational_value": 0.29600000000000004, "facts_trivia": 0.18333333333333335,
+      "required_expertise": 0.21600000000000005, "writing_style": 0.424
+    },                                   ← pairwise 模式下均值恒 ≈0.5，另有 per_criterion_tie_rate
+                                            （每准则平局率，只统计拿到裁决的比较——rubric 区分度的直接读数）
+    "by_class": {…}                      ← classify 启用时出现：按类分池的直方图与均值（第 24 章）
+  },
   "schema_engine": {                     ← 结构引擎四层的命中分布（第 14 章）
-    "resolved_at": {"l0_or_clean": 5, "l1": 2, "l3_1": 0, "l3_2": 0, "rejected": 0}
+    "resolved_at": {"l0_or_clean": 11, "l1": 2, "l3_1": 0, "l3_2": 0, "rejected": 0}
+  },
+  "generate": {"buckets": {…}},          ← generate 启用时出现：分桶产出统计（第 12 章）
+  "classify": {…},                       ← classify 启用时出现：逐类命中计数（第 24 章）
+  "budget": {                            ← v1.11：被引用 profile 声明 context_window 时出现（见下文）
+    "profiles": {
+      "default": {"context_window": 131072, "input_budget": 113868},
+      "judge":   {"context_window": 131072, "input_budget": 115916}
+    },                                   ← 声明窗，与扣除输出预留、安全边距后的输入预算（16.4 启动 INFO 行同源）
+    "truncations": {},                   ← 各算子按预算裁剪证据的次数（仅列非零阶段；{} = 全程没裁）
+    "overflow_records": 0,               ← 以 context_overflow 被拒的记录数
+    "image_cost": {},                    ← 每图 token 成本的校准终值（纯文本运行恒空；UI 工程见第 21 章）
+    "degrade_retries": 0,                ← 溢出降级重试次数（如 segment 窗对半改切、annotate 减帧）
+    "escalations": 0                     ← verify 修复路径的质量升档次数（第 13 章）
   },
   "trace": {"enabled": true, "path": "out/text-labels.trace.jsonl",
-             "events": 73, "dropped_events": 0},
+             "events": 163, "dropped_events": 0},
   "llm_usage": {                         ← 分 profile 的用量账单
-    "default": {"calls": 61, "prompt_tokens": 22887,
-                 "completion_tokens": 5676, "retries": 0}
+    "default": {"calls": 134, "prompt_tokens": 46399,
+                 "completion_tokens": 16183, "retries": 0},
+    "judge":   {"calls": 13, "prompt_tokens": 4559,
+                 "completion_tokens": 2323, "retries": 0}
   },                                     ← 配了单价时另有 est_cost_usd
-  "timing": {"wall_s": 79.491,
-              "per_stage_s": {"dedup": 0.004, "quality": 70.044, "annotate": 9.436}}
+  "timing": {"wall_s": 234.94,
+              "per_stage_s": {"dedup": 0.01, "classify": 41.874, "quality": 139.574,
+                               "generate": 9.055, "annotate": 18.748, "verify": 25.677}}
 }
 ```
 
@@ -164,8 +185,8 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
 
 读报告的三板斧：
 
-1. **先看 `counts` 对不对账**——各状态数量符合预期吗？`failed` 非零就去拒绝通道翻 `errors`；
-2. **再看 `quality.aggregate_histogram`**——分布形状决定阈值画哪里。比如上面这份：0.25 的线落在 0.2-0.3 桶内，被淘汰的六条 = 0~0.2 两桶的全部（3+1）加 0.2-0.3 桶里两条 0.2 的；桶里剩下那条聚合分正好等于 0.25，质量门按「< 阈值才淘汰」放行，留下了。如果直方图整体右移，同一条线就几乎不淘汰东西；
+1. **先看 `counts` 对不对账**——各状态数量符合预期吗？`failed` 非零就去拒绝通道翻 `errors`（上面这份的 `failed=1` 是一次打分调用写满输出上限、按 v1.11 的 `output_truncated` 记录级拒绝——第 3、18 章）；
+2. **再看 `quality.aggregate_histogram`**——分布形状决定阈值画哪里。比如上面这份：0.2-0.4 两桶挤了 12 条，而本工程的三条类线（writing 0.2 / 全局 0.25 / qa 0.4）恰好全画在这片人堆里——阈值动一格、打分漂一格都会成批改变去留（第 20 章的「阈值敏感区」）。分类开启时按类画线要看 `by_class` 的分池直方图（第 24 章）——混合分布的汇总图会把几个类的峰糊在一起。如果直方图整体右移，同一条线就几乎不淘汰东西；
 3. **最后看 `llm_usage` 和 `timing`**——哪个阶段最烧钱/最耗时（几乎总是 quality），是否要换模式、调并发（第 17 章）。
 
 另有两个按需出现的块：`annotate.sc_disagreements`（开 self-consistency 时：全体分歧、回退首样本的次数）与 `generate.buckets`（开生成时：每个「模型×风格」桶的调用数 / 产出数 / 去重存活数，配置 `sample_validator` 时另有回调剔除数 `rejected_by_validator`——某桶存活率明显低说明它在产重复货或不合规货，第 12 章）。
@@ -185,6 +206,11 @@ v1.7（分类算子，第 24 章）再增三处按需出现的字段（未启用
 v1.8（时序流，第 25 章）再增两处按需出现的块（未启用时报告形状与旧版逐字段一致）：`counts` 增列 `episodes` / `absorbed` / `dropped_noise`，且 `counts` 之后新增顶层 `stream` 节（会话数、段长均值、`below_min_len`、摘要贫瘠帧数，extract / verify 各一个子块）——两者都仅 segment 启用时出现。守恒等式相应扩展为全展开形：左侧另加 `dropped_noise + absorbed`、右侧另加 `episodes`（未启用项恒 0 时退化回第 4 章原式；真实验算见第 25 章）；且 stream 模式下 `counts.unprocessed` 的出现条件从「仅熔断」扩为「熔断或优雅中断」。
 
 v1.9（线索缝合，第 26 章）再增两处按需出现的字段（仅 `stitch.enabled = true` 时出现，未启用时报告与 v1.8 逐字节一致）：`counts` 增列 `stitched` / `threads`（被并进线索的 episode 壳数、线索数，恒满足 `threads = episodes − stitched`），`stream` 节内新增 `stitch` 子块（`{stitched, rescued_short, seams, judgments, repass_judgments, failures}`，逐键读法见第 26 章）；守恒等式左侧相应另加 `stitched`（第 4 章）。一处**无条件**的例外：stream×verify 的缺陷词表是闭集，`stream.verify.defects` 从五行扩为六行——即便 stitch 关闭，`wrong_stitch: 0` 这一行也在场（第 13、25 章）。`--strict` 交互提醒：stitched 壳与被救援的帧都不构成 rejects，同一份输入开启缝合后 `--strict` 的结果可能从 1 变 0（短段被救援、不再落 rejects）——属预期，不是账目错误。
+
+v1.11（上下文预算，第 6、16 章）再增两处按需出现的字段，另有 rejects 词表的两个新 reason（见 8.3 节）：
+
+- **`budget` 节**（上面的样例里已在场）：仅当本次运行**被引用**的 profile 里至少一档声明了 `context_window` 时出现——全都不声明时报告与 v1.10 逐字节一致。键义见样例内注，三个值得盯的读数：`truncations` 某阶段持续走高 = 声明窗对这份数据偏小（预算裁剪在吃你的证据，考虑调大声明或换档）；`overflow_records` 非零 = 有记录连最小装填单元都塞不进（rejects 里对应 `context_overflow` 行）；`image_cost` 是按真实 usage **校准**的每图 token 成本终值（样本不足 8 个的档维持先验读数——第 21 章有一对真实的校准值/先验值对照：240 vs 1882）。segment 启用时另有 `w_min` 键：`{"segment.window": [窗上限, 最坏装填量]}`，与启动 INFO 行同源（16.4）；
+- **`stream.windows`**（`stream` 节内，v1.11 增键）：segment 实际切出的窗数，仅当 `segment.llm` 所指档声明了 `context_window` 时出现（预算不声明时 `stream` 节与 v1.10 逐字段一致）。预算装填下 dry-run 的 `segment_calls` 按最坏装填量报**上界**，实跑拿这个键对账——examples/stream 真跑估 5、实 5（最坏装填量 ≥ 窗上限时装填顶格，上界收紧为准确值；成本账见第 25 章）。
 
 > **报告写失败怎么办**：主输出成功、报告写失败时，进程以退出码 1 结束——产物可用但账本缺失，别当成功处理。
 

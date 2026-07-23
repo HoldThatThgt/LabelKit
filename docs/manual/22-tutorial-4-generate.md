@@ -75,9 +75,9 @@ dropped_dup=0  dropped_lowq=0  dropped_verify=0  failed=0  emitted=8
 产物长这样（前三行，已剥 `_meta`）：
 
 ```json
-{"intent": "writing_assist", "topic": "产品介绍文案（智能保温杯）", "difficulty": "medium"}
-{"intent": "qa", "topic": "人工智能面试问题及参考答案", "difficulty": "hard"}
-{"intent": "translation", "topic": "商务周报中译日（商务敬语）", "difficulty": "hard"}
+{"intent": "writing_assist", "topic": "年终总结润色", "difficulty": "medium"}
+{"intent": "writing_assist", "topic": "PPT大纲/产品演示", "difficulty": "medium"}
+{"intent": "qa", "topic": "儿童科普绘本推荐", "difficulty": "easy"}
 ```
 
 注意：**合成品拿到的是和真实数据完全一样的待遇**——先被打分（`_meta.scores` 俱全）、再被标注、结构照样过 Schema 引擎。这就是「产物照常走全套治理」的含义。

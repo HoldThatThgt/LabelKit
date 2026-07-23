@@ -7,7 +7,7 @@
 
 | 面 | 开关 | 内容 | 给谁看 |
 |---|---|---|---|
-| **stderr 运行日志** | 恒开（级别可调） | 只有运维事件：生命周期、警告、错误、调用摘要。**绝不含数据内容与提示词** | 人排障；日志采集系统 |
+| **stderr 运行日志** | 恒开（级别可调） | 只有运维事件：生命周期、警告、错误、调用摘要，v1.11 增启动期预算参数 INFO 行（16.4）。**绝不含数据内容与提示词** | 人排障；日志采集系统 |
 | **trace 事件流** | `trace.enabled`（默认关） | 结构化事件 JSONL，一行一事件：每次去重判定、每次质量裁决及理由、每轮评审结论、每次结构修复 | rubric 调优；质量审计 |
 | **进度显示（console）** | 恒开，三档 `--console auto/rich/plain`（v1.10，16.6） | rich = 双区实时面板：批进度、流水线段棋盘、各状态计数、LLM 用量/密钥池/熔断；plain = 现行批级进度行（非 TTY 无进度输出，可看 `batch.end` 的 INFO 日志行）；auto 按终端环境自动选档 | 坐在终端前的你。**不属于日志**——不经日志设施、不产生 trace 事件（16.6） |
 
@@ -37,7 +37,7 @@
 | `annotate.done` | 每条标注成功 | attempts；self-consistency 的 n 与一致率 |
 | `verify.verdict` | 每轮评审 | verdict、round、critiques 全文 |
 | `schema.repair` | 每次非清洁路径 | 在哪层解决（l1/l3_1/l3_2/rejected）、违规清单（JSON Pointer，不含数据值） |
-| `llm.call` | 每次 API 调用 | profile、延迟、input/output token、重试数、状态（命名对齐 OpenTelemetry GenAI 约定）；语义去重的 embedding 调用另带 `operation="embedding"`（缺省即对话补全）；密钥池 >1 的 profile 另带 `key_env`（v1.6）——本调用**最后一次尝试**所用密钥的环境变量名，成功失败同义；零尝试即中止的调用（如入口即驻留超限、熔断中止）不带 |
+| `llm.call` | 每次 API 调用 | profile、延迟、input/output token、重试数、状态（命名对齐 OpenTelemetry GenAI 约定）；语义去重的 embedding 调用另带 `operation="embedding"`（缺省即对话补全）；密钥池 >1 的 profile 另带 `key_env`（v1.6）——本调用**最后一次尝试**所用密钥的环境变量名，成功失败同义；零尝试即中止的调用（如入口即驻留超限、熔断中止）不带。v1.11 注：这行的 usage 同时是**图片成本校准器**的采样源——报表侧校准终值在 `report.budget.image_cost`（第 8 章），审计预算估算质量就拿 `input_tokens` 对照它 |
 | `llm.key_cooldown` | 密钥进入 429 冷却时（v1.6；任意池大小含 1——单密钥的 429 等待亦走冷却路径）。仅 trace，不上 stderr | profile、`key_env`、`cooldown_s`（本次冷却秒数）、`retry_after`（bool，时长是否来自 `Retry-After` 头） |
 | `llm.key_disabled` | 密钥 401/403 被本运行永久禁用时（v1.6；每密钥每运行至多一次）。同时发 stderr WARN 一次 | profile、`key_env`、`status_code` |
 | `llm.pool_parked` | 某 profile 全部存活密钥均在冷却、调用开始驻留时（v1.6；每次驻留一事件）。同时发 stderr WARN | profile、`wait_s`（预计驻留秒数）、`live_keys`（存活密钥数） |
@@ -95,16 +95,17 @@ jq -c 'select(.ev=="quality.judgment" and (.record_ids | index("6e60ce3c2d59f04d
        | .payload.judgments[] | {criterion, winner, reason}' $T
 ```
 
-一个真实的 `quality.judgment` 事件（UI 工程，refs 档）感受一下 reason 的信息量：
+一个真实的 `quality.judgment` 事件（UI 工程，refs 档；classify 开启时 payload 另带 `pool`——这场比较发生在哪个类池）感受一下 reason 的信息量：
 
 ```json
-{"ev": "quality.judgment", "record_ids": ["40f47f09…", "f8fc254f…"],
- "payload": {"order": {"A": "40f47f09…", "B": "f8fc254f…"}, "model": "glm-5.2",
+{"ev": "quality.judgment", "record_ids": ["194a2dd2…", "f8fc254f…"],
+ "payload": {"order": {"A": "f8fc254f…", "B": "194a2dd2…"}, "model": "glm-5.2",
    "judgments": [
-     {"criterion": "state_completeness", "winner": "tie",
-      "reason": "两组界面均加载完成，无骨架屏或异常空白区域，状态完整性一致。"},
-     {"criterion": "interaction_richness", "winner": "A",
-      "reason": "记录A的登录页包含输入框、按钮、复选框等多种可交互控件类型，比记录B以纯文本列表为主的设置页交互元素更丰富。"}]}}
+     {"criterion": "tree_screen_consistency", "winner": "tie",
+      "reason": "两组的UI控件树节点文本与截图内容均能对应吻合，没有明显不一致之处。"},
+     {"criterion": "interaction_richness", "winner": "B",
+      "reason": "记录B包含轮播图、推荐卡片、换一批按钮等多种交互元素，信息量和交互丰富度明显高于记录A的纯文本设置列表。"}],
+   "pool": "browse"}}
 ```
 
 这两句理由就是 rubric 工作状态的直接证据：判据被理解了、比较是逐维度独立的。当 reason 开始反复提到某个你没写进 rubric 的维度（比如「B 的隐私信息未打码」），那就是加新准则的信号。
@@ -120,6 +121,17 @@ jq -c 'select(.ev=="quality.judgment" and (.record_ids | index("6e60ce3c2d59f04d
 # jsonl 格式（采集系统用）
 {"ts":"2026-07-03T01:19:03+08:00","level":"info","stage":"run","batch":1,"msg":"batch.end active=8 ..."}
 ```
+
+### 启动期预算 INFO 行（v1.11）
+
+本次运行引用的 profile 里只要有档声明了 `context_window`（第 6 章），`run.start` 之后就多一行**预算参数 INFO**：逐档给出「声明窗/输入预算」；stream 工程（segment 启用且所引档声明了窗）再多一行 segment 的静态最坏装填量。真实两行（examples/stream 工程）：
+
+```
+2026-07-23T04:46:24+08:00 INFO  run     batch=0 budget: default=131072/113868 judge=131072/115916
+2026-07-23T04:46:24+08:00 INFO  run     batch=0 segment: w_min=46 window=16 (budget)
+```
+
+读法：`113868` = 声明窗 131072 扣掉输出预留（该档 `max_output_tokens`）与 10% 安全边距后**真正拿来装输入**的预算（judge 档输出预留小，可用输入反而更多）；`w_min=46` 是按最坏单帧成本（满长摘要 + diff 常数 + 每图先验）算出的单窗保底装填量——它 ≥ 窗上限 `window=16` 时装填顶格、行为与定长窗一致，它 < window 时实际窗会变小变多（对账细则见第 25 章成本账）。两行都是数据无关的参数与计数。**报告侧的对应读数是 `report.budget`**（profiles / w_min / truncations / overflow_records / image_cost / degrade_retries / escalations——第 8 章逐键解读），预算相关的记录级失败则以 `context_overflow` / `output_truncated` 两个新错误码落 rejects（第 18 章）。
 
 想要完整的调用审计（每次请求的 token、延迟、重试、状态），订阅 trace 的 `llm` 通道即可——`llm.call` 事件字段命名对齐 OpenTelemetry GenAI 语义约定（`gen_ai.usage.input_tokens` 等），现成的 OTel 生态分析工具可以直接吃。
 
@@ -229,7 +241,7 @@ examples/stream 工程（stream + stitch 全开，面板信息最全）真实运
  [?]帮助 [l]LLM展开 [e]错误条 [p]暂停 [q]脱离
 ```
 
-运行结束时定格的终版面板帧（留在 scrollback 里，可直接截屏贴工单；本次运行 53 帧 → 12 episodes → 缝合 3 → 9 线索落盘，与第 26 章的守恒账目一致）：
+运行结束时定格的终版面板帧（留在 scrollback 里，可直接截屏贴工单；两帧均捕获自 v1.10 验收期的一次真实运行——那次 53 帧 → 12 episodes → 缝合 3 → 9 线索落盘。面板布局与键位自那以来未变；分段判决逐次运行会漂移，当前基线的账目数字以第 26 章为准）：
 
 ```
 ────────────────────────────────────────────────────────────────────────────────────────────────────

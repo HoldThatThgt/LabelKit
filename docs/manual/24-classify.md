@@ -108,10 +108,10 @@ stderr 尾部的终版摘要（真实运行，退出码 0）：
 ```
    ── 终版摘要（与 report.counts 逐项一致）──
    scanned=14  ingested=14  bad_input=0  generated=12
-   dropped_dup=1  dropped_lowq=10  dropped_verify=0  failed=0  emitted=15
+   dropped_dup=1  dropped_lowq=11  dropped_verify=0  failed=1  emitted=13
 ```
 
-守恒等式照常成立：`15 + 1 + 10 + 0 + 0 = 26 = 14 + 12`（generate 开着，12 条合成样本回流，第 12 章）。分类本身的账在 `report.json` 新增的 `classify` 节里：
+守恒等式照常成立：`13 + 1 + 11 + 0 + 1 = 26 = 14 + 12`（generate 开着，12 条合成样本回流，第 12 章；`failed=1` 是一条死于打分调用输出截断的记录——v1.11 的 `output_truncated`，与分类无关，第 3、18 章）。分类本身的账在 `report.json` 新增的 `classify` 节里：
 
 ```json
 "classify": {
@@ -125,26 +125,26 @@ stderr 尾部的终版摘要（真实运行，退出码 0）：
 读法：去重放行的 13 条输入里，5 条分进 writing、3 条 qa、2 条 translation、3 条 other（5+3+2+3=13，分类不淘汰、账必对齐）；12 条回流的合成样本**不在**这里——它们带着种子的类标签回流（`source="inherited"`，幂等跳过分拣台、零调用，24.7）。`fallback_count=0` 说明没有一条是「分不出来兜底」的——那条「哈哈哈哈哈哈哈」是 LLM **主动**归入 other 的。trace 里能看到它的判决理由（`classify.decision` 事件，本次运行共 13 条，每条存活输入记录一条；`…` 处省略 `run_id`/`batch_no` 字段）：
 
 ```json
-{"ts": "2026-07-17T02:50:45.573+08:00", …, "stage": "classify", "ev": "classify.decision",
+{"ts": "2026-07-23T04:41:18.756+08:00", …, "stage": "classify", "ev": "classify.decision",
  "record_ids": ["4b9b1283cd63977b"],
  "payload": {"label": "other", "source": "llm",
-             "reason": "无明确诉求，仅为无意义的笑声，不属于任何具体类别。"}}
+             "reason": "用户仅发送了一串笑声，无明确诉求，属于闲聊类内容。"}}
 ```
 
-分拣之后，质量工位**按类分池**打分、按各自的线门控。trace 的 `quality.gate` 事件多了个 `pool` 字段，三条线同场执法一目了然（从真实 trace 的 25 条门控事件里各池摘一条；`…` 处省略 `ts`/`run_id`/`batch_no`/`stage` 字段）：
+分拣之后，质量工位**按类分池**打分、按各自的线门控。trace 的 `quality.gate` 事件多了个 `pool` 字段，三条线同场执法一目了然（从真实 trace 的 24 条门控事件里各池摘一条；`…` 处省略 `ts`/`run_id`/`batch_no`/`stage` 字段）：
 
 ```json
 {…, "ev": "quality.gate", "record_ids": ["a8aa181766eebd97"],
- "payload": {"aggregate": 0.6, "decision": "keep", "threshold": 0.4, "pool": "qa"}}
+ "payload": {"aggregate": 0.6000000000000001, "decision": "keep", "threshold": 0.4, "pool": "qa"}}
 {…, "ev": "quality.gate", "record_ids": ["7a5fe0c36babb643"],
  "payload": {"aggregate": 0.2, "decision": "keep", "threshold": 0.2, "pool": "writing"}}
 {…, "ev": "quality.gate", "record_ids": ["4b9b1283cd63977b"],
  "payload": {"aggregate": 0.0, "decision": "drop", "threshold": 0.25, "pool": "other"}}
 ```
 
-最终账目：输入侧 writing 池 0.2 的线拦 1 条、other 池全局 0.25 的线拦 3 条；回流侧 qa 池 0.4 的线拦 4 条、writing 池再拦 2 条（合计 `dropped_lowq=10`），活下来的 15 条按各自类的指令完成标注并通过评审。
+最终账目：输入侧 writing 池 0.2 的线拦 1 条、other 池全局 0.25 的线拦 3 条；回流侧 qa 池 0.4 的线拦 4 条、translation 池拦 2 条、writing 池再拦 1 条（合计 `dropped_lowq=11`；另有 1 条 translation 输入没走到门控——打分调用输出截断记 `failed`，24.2 开头的注），活下来的 13 条按各自类的指令完成标注并通过评审。
 
-**这次运行最值得咂摸的两组数字**：其一，writing 池输入侧五条的聚合分是 0.15、0.2、0.25、0.4、0.5——如果没有按类覆盖、全局一条 0.25 的线，贴线的那条请假条改写（0.2）就死了；0.2 的类内线把它捞了回来。这正是第 20 章亲手诊断过的现象（`default:text` 的口径天然压低日常写作请求）；当时的解法是换 rubric，现在你多了一个更轻的选项：**先分拣，再按类画线**。其二在反方向：qa 池 0.4 的严线放行了输入侧全部三条真问答（0.5~0.75），却把回流的四条合成问答（0.2~0.35）全部拦下——同一把尺子、按类两条线，各管各的分布，合成样本也别想搭便车。
+**这次运行最值得咂摸的两组数字**：其一，writing 池输入侧五条的聚合分是 0.15、0.2、0.2、0.35、0.5——如果没有按类覆盖、全局一条 0.25 的线，贴线的两条 0.2（周报模板与请假条改写）就都死了；0.2 的类内线把它们捞了回来。这正是第 20 章亲手诊断过的现象（`default:text` 的口径天然压低日常写作请求）；当时的解法是换 rubric，现在你多了一个更轻的选项：**先分拣，再按类画线**。其二在反方向：qa 池 0.4 的严线放行了输入侧全部三条真问答（0.6~0.75），却把回流的四条合成问答（0.1~0.35）全部拦下——同一把尺子、按类两条线，各管各的分布，合成样本也别想搭便车。
 
 ## 24.3 单标签与多标签：assignment 开关
 
@@ -210,17 +210,17 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
 ```json
 {
   "intent": "writing_assist",
-  "topic": "请假条（半天病假，去医院复查）",
+  "topic": "请假条（因去医院复查请半天假）",
   "difficulty": "easy",
   "_meta": {
     "id": "7a5fe0c36babb643",
-    "run": {"tool": "labelkit/1.0.0", "started_at": "2026-07-17T02:50:37.417380+08:00",
+    "run": {"tool": "labelkit/1.0.0", "started_at": "2026-07-23T04:41:06.239007+08:00",
              "project_file": "project.toml", "rubric": "default:text", "seed": 42},
     "source": {"file": "input.jsonl", "line_no": 7, "generated_from": [],
                 "fields": {"source": "ime-log"}, "generator": null},
     "stream": null,                      ← v1.8 恒在键（stream 模式未启用恒为 null，第 25 章）
     "scores": {
-      "writing_style": 0.4, "facts_trivia": 0.2,
+      "facts_trivia": 0.2, "writing_style": 0.4,
       "educational_value": 0.2, "required_expertise": 0.0,
       "__aggregate__": 0.2,              ← 贴着 writing 类 0.2 的线存活（门控规则是 < 才淘汰）
       "mode": "pointwise", "batch_no": 1,
@@ -256,12 +256,12 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
   "other": {…}, "qa": {…}, "translation": {…},
   "writing": {
     "mode": "pointwise", "rounds": 4,
-    "aggregate_histogram": {"0.0-0.1": 1, "0.1-0.2": 2, "0.2-0.3": 3,
-                             "0.4-0.5": 1, "0.5-0.6": 2, …其余 5 桶均为 0},
-    "per_criterion_mean": {"educational_value": 0.3333333333333333,
-                            "facts_trivia": 0.06666666666666668,
-                            "required_expertise": 0.2888888888888889,
-                            "writing_style": 0.4},
+    "aggregate_histogram": {"0.0-0.1": 1, "0.1-0.2": 1, "0.2-0.3": 3,
+                             "0.3-0.4": 3, "0.5-0.6": 1, …其余 5 桶均为 0},
+    "per_criterion_mean": {"educational_value": 0.3555555555555556,
+                            "facts_trivia": 0.044444444444444446,
+                            "required_expertise": 0.13333333333333333,
+                            "writing_style": 0.5111111111111111},
     "per_criterion_tie_rate": {}
   }
 }
@@ -274,7 +274,7 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
 ```bash
 # 按类拆分主输出
 jq -c 'select(._meta.classification.label == "qa")' out/text-labels.jsonl
-# 各类产出行数（本次真跑：writing 6、translation 6、qa 3）
+# 各类产出行数（本次真跑：writing 7、translation 3、qa 3）
 jq -r '._meta.classification.label' out/text-labels.jsonl | sort | uniq -c
 # 按类统计淘汰去向
 jq -r '._meta | "\(.label)\t\(.stage)/\(.reason)"' out/text-labels.rejects.jsonl | sort | uniq -c
@@ -303,10 +303,10 @@ jq -r '._meta | "\(.label)\t\(.stage)/\(.reason)"' out/text-labels.rejects.jsonl
 **成本账。**分类给每条存活记录追加 1 次调用（sc 时 ×n；`inherited` 的回流样本零调用），dry-run 估算按 ingested 计上界。它通常是流水线里较轻的一环——本次真跑的分账（`report.timing`，真实产物）：
 
 ```json
-"per_stage_s": {"dedup": 0.01, "classify": 17.608, "quality": 146.357,
-                 "generate": 6.436, "annotate": 18.46, "verify": 41.005}
+"per_stage_s": {"dedup": 0.01, "classify": 41.874, "quality": 139.574,
+                 "generate": 9.055, "annotate": 18.748, "verify": 25.677}
 ```
 
-14 条输入 + 12 条回流全程约 230 秒、147 次调用，其中分类只占 13 次——quality 仍是大头（第 10 章的结论不因分类而变）。multi 模式的钱花在扇出的**下游**（m 份打分/标注/评审），不在分类调用本身——控成本先控 `max_labels`。
+14 条输入 + 12 条回流全程约 235 秒、147 次调用，其中分类只占 13 次——quality 仍是大头（第 10 章的结论不因分类而变）。multi 模式的钱花在扇出的**下游**（m 份打分/标注/评审），不在分类调用本身——控成本先控 `max_labels`。
 
 最后一份检查清单，开 classify 前过一遍：类别表 ≥ 2 项且 name 全小写下划线；fallback_class 在表内、description 是排他形态；边界意图要么有自己的类、要么在 instruction 里写了裁决规则；trace.channels 加了 `"classify"`（调优期必开，判决理由全靠它）；multi 的话——下游知道行唯一键变成 (`_meta.id`, `label`) 了吗？

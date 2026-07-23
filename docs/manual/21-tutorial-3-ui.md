@@ -75,29 +75,29 @@ report.json 的去重节：
 
 ```json
 "quality": {"mode": "pairwise_bt", "rounds": 2, "judgment_failures": 0,
-            "aggregate_histogram": {"0.3-0.4": 1, "0.5-0.6": 2, "0.6-0.7": 1, "…": 0},
+            "aggregate_histogram": {"0.4-0.5": 1, "0.5-0.6": 3, "…": 0},
             "per_criterion_mean": {"interaction_richness": 0.5, "screenshot_readability": 0.5,
                                     "state_completeness": 0.5, "tree_screen_consistency": 0.5},
-            "per_criterion_tie_rate": {"screenshot_readability": 1.0, "state_completeness": 0.5,
-                                        "tree_screen_consistency": 0.5, "interaction_richness": 0.0}}
+            "per_criterion_tie_rate": {"interaction_richness": 0.0, "screenshot_readability": 0.5,
+                                        "state_completeness": 0.0, "tree_screen_consistency": 0.5}}
 ```
 
 三个读数：
 
 1. 四条准则的均值**全是 0.5**——这不是巧合，是 pairwise 的数学性质：分数是池内百分位，`(rank−1)/(N−1)` 的均值恒为 0.5。**pairwise 报告里的 per_criterion_mean 没有跨工程比较意义**（pointwise 才有）；
 2. auth、dialog 两个池各只有 1 条记录——**孤记录无对手可比**，四条准则全记中间值 0.5、聚合 0.5（看它们的 `_meta.scores` 就是清一色 0.5）。这是「按类分池 × 小批量」的固有形状：类切得越细，池越小，pairwise 越没得比。真在意类内排序就攒大批量，或换 pointwise；
-3. 真正的比较发生在 browse 池：设置页 vs 首页，`rounds=2` 正反各比一次。设置页赢下树一致性与状态完整性（1.0/1.0）、首页赢下交互丰富度（1.0，轮播图 + 推荐卡片 + 换一批按钮），截图可读性两轮全平（报告里 `tie_rate=1.0`——两张图都是程序化生成的清晰界面，这条准则在本数据集上没有区分度）。
+3. 真正的比较发生在 browse 池：设置页 vs 首页，`rounds=2` 正反各比一次。首页赢下交互丰富度（两轮全胜——轮播图 + 推荐卡片 + 换一批按钮）与截图可读性（一胜一平，胜局的理由是「轮播图和推荐卡片等图文内容，视觉层次更丰富」——两张程序化生成的图其实同样清晰，这条准则在本数据集上的裁决更像口味，`tie_rate=0.5`）；设置页赢下树一致性（一胜一平）；状态完整性最有意思：两轮的赢家恰好都是当轮坐在 **B 位**的那条（`tie_rate=0.0`，但两边各拿 0.5）——正反双序把这份位置偏好对消掉了，这正是 `rounds=2` 正反各一次的价值（第 10 章）。
 
-看池内胜者设置页的 `_meta.scores`（分数是本次运行的快照，逐次会有浮动）：
+看池内胜者首页的 `_meta.scores`（分数是本次运行的快照，逐次会有浮动）：
 
 ```json
-{"screenshot_readability": 0.5, "tree_screen_consistency": 1.0,
- "state_completeness": 1.0, "interaction_richness": 0.0,
- "__aggregate__": 0.667, "mode": "pairwise_bt", "batch_no": 1, "pool": "browse"}
+{"screenshot_readability": 1.0, "tree_screen_consistency": 0.0,
+ "state_completeness": 0.5, "interaction_richness": 1.0,
+ "__aggregate__": 0.5555555555555556, "mode": "pairwise_bt", "batch_no": 1, "pool": "browse"}
 ```
 
 验算聚合分（default:ui 的 tree_screen_consistency 权重是 1.5，其余 1.0）：
-(0.5 + 1.0×1.5 + 1.0 + 0.0) / 4.5 = 3.0 / 4.5 = **0.667** ✓。首页则是镜像的 0.333——`scores.pool` 字段自述了它们在哪个池里比的（第 24 章）。
+(1.0 + 0.0×1.5 + 0.5 + 1.0) / 4.5 = 2.5 / 4.5 = **0.556** ✓。设置页则是镜像的 (0.0 + 1.0×1.5 + 0.5 + 0.0) / 4.5 = 0.444——`scores.pool` 字段自述了它们在哪个池里比的（第 24 章）。
 
 ## 21.5 标注与评审：看图说话，独立复核
 
@@ -106,27 +106,27 @@ report.json 的去重节：
 ```json
 {"screen_category": "login", "page_title": "登录",
  "interactive_elements": [
-   {"role": "edittext", "label": "手机号输入框", "bounds": [32, 160, 368, 216]},
-   {"role": "edittext", "label": "验证码输入框", "bounds": [32, 240, 368, 296]},
+   {"role": "input", "label": "手机号输入框", "bounds": [32, 160, 368, 216]},
+   {"role": "input", "label": "验证码输入框", "bounds": [32, 240, 368, 296]},
    {"role": "button", "label": "获取验证码", "bounds": [240, 248, 360, 288]},
    {"role": "button", "label": "登录", "bounds": [32, 340, 368, 396]},
    {"role": "checkbox", "label": "同意用户协议", "bounds": [32, 420, 50, 438]},
-   {"role": "textview", "label": "我已阅读并同意《用户协议》", "bounds": [60, 420, 340, 440]}],
- "description": "手机号验证码登录页面，用户可输入手机号和验证码，勾选同意用户协议后点击登录按钮完成登录。"}
+   {"role": "link", "label": "我已阅读并同意《用户协议》", "bounds": [60, 420, 340, 440]}],
+ "description": "手机号验证码登录页面，用户输入手机号并获取验证码，勾选同意用户协议后点击登录按钮完成登录。"}
 ```
 
-4 号弹窗走的则是 `[class.dialog.annotate]` 的**按类指令**（「务必包含全部按钮及其 bounds……说明该弹窗要求用户做什么决定」）——同一工位、按类换词（第 24 章）。verify 用 judge profile 按三个内置维度复核（遵循指令 / 与截图树一致 / 字段语义），trace 里每轮一条 `verify.verdict` 事件、critiques 全文可读——4 号那条的评审意见原文就写着「可交互元素列表（interactive_elements，含全部按钮及bounds）……无遗漏」：评审读的任务指令同样是按类覆盖后的版本。本次运行 4 条全部一次通过：`_meta.verification = {"verdict": "pass", "rounds": 1}`、`dropped_verify=0`。若有 fail，`policy="repair"` 会带着批评意见让标注模型返工一轮（第 13 章走查过完整轨迹）。
+4 号弹窗走的则是 `[class.dialog.annotate]` 的**按类指令**（「务必包含全部按钮及其 bounds……说明该弹窗要求用户做什么决定」）——同一工位、按类换词（第 24 章）。verify 用 judge profile 按三个内置维度复核（遵循指令 / 与截图树一致 / 字段语义），trace 里每轮一条 `verify.verdict` 事件、critiques 全文可读——4 号那条的评审意见原文就写着「可交互元素列表(interactive_elements，含全部按钮及bounds)……无遗漏」：评审读的任务指令同样是按类覆盖后的版本。本次运行 4 条全部一次通过：`_meta.verification = {"verdict": "pass", "rounds": 1}`、`dropped_verify=0`。若有 fail，`policy="repair"` 会带着批评意见让标注模型返工一轮（第 13 章走查过完整轨迹）。
 
 ## 21.6 多模态工程的成本结构
 
 ```json
-"llm_usage": {"default": {"calls": 10, "prompt_tokens": 8541, ...},
-              "judge":   {"calls": 4, "prompt_tokens": 3359, ...}},
-"timing": {"wall_s": 26.3, "per_stage_s": {"dedup": 0.013, "classify": 5.6, "quality": 6.4,
-                                             "annotate": 6.4, "verify": 7.9}}
+"llm_usage": {"default": {"calls": 10, "prompt_tokens": 8545, ...},
+              "judge":   {"calls": 4, "prompt_tokens": 3097, ...}},
+"timing": {"wall_s": 27.185, "per_stage_s": {"dedup": 0.011, "classify": 6.5, "quality": 6.5,
+                                               "annotate": 6.4, "verify": 7.8}}
 ```
 
-default 档的 10 次调用 = 分类 4 + 裁决 2 + 标注 4（browse 池 2 轮正反共 2 次裁决调用；孤池零调用——分池顺带省了钱）。注意 prompt_tokens 的量级：**每次调用平均约 850 token**——截图就是这么贵（按分辨率折 token）。这也是为什么 `max_image_px` 是 UI 工程的重要成本旋钮（第 6 章）：2048 → 1536 能省一大截，但先确认小字仍可读。4 条记录 14 次调用不到半分钟——UI 管线天生比纯文本慢，`--limit` 试跑的价值更大。
+default 档的 10 次调用 = 分类 4 + 裁决 2 + 标注 4（browse 池 2 轮正反共 2 次裁决调用；孤池零调用——分池顺带省了钱）。注意 prompt_tokens 的量级：**每次调用平均约 830 token**——截图就是这么贵（按分辨率折 token）。v1.11 起报告里还有一个更直接的图片成本读数：`report.budget.image_cost` 给出按真实 usage 校准的**每图 token 成本终值**（本次真跑 default 档 240；judge 档样本不足 8 个、维持先验读数 1882——校准机制见第 8、16 章）。这也是为什么 `max_image_px` 是 UI 工程的重要成本旋钮（第 6 章，v1.11 另有 `default_image_px` 把「日常工作点」和「上限」分开声明）：2048 → 1536 能省一大截，但先确认小字仍可读。4 条记录 14 次调用不到半分钟——UI 管线天生比纯文本慢，`--limit` 试跑的价值更大。
 
 ## 21.7 迁移到你自己的截图数据
 

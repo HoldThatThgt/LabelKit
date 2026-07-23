@@ -20,7 +20,7 @@
 
 1. **选种子**：批内 `active` 且聚合分 ≥ `seed_min_score` 的记录。`seed_min_score` 不填时自动取 `quality.threshold`；连 threshold 也没有就取批内中位数——**种子必须是好货**，这是仿制质量的根。
 2. **算调用数**：`⌈种子数 × num_per_record / num_per_call⌉`。默认 num_per_record=2（每种子期望产 2 条）、num_per_call=4（每次调用要 4 条）。
-3. **每次调用**：随机不放回抽 `seeds_per_call`（默认 3）条种子作为示例，system = `generate.instruction`（+ 风格模板，见 12.4），要求输出 `{"samples": ["...", ...]}` 恰好 num_per_call 条，经结构引擎校验。
+3. **每次调用**：随机不放回抽 `seeds_per_call`（默认 3）条种子作为示例（v1.11 起这是**上限**：本次调用的目标档声明了 `context_window` 时，按抽样序**从尾部丢弃**种子直到装下——确定性收缩、至少留 1 条；连 1 条都装不下按 `context_overflow` 处置），system = `generate.instruction`（+ 风格模板，见 12.4），要求输出 `{"samples": ["...", ...]}` 恰好 num_per_call 条，经结构引擎校验。
 4. **构造新记录**：每条样本文本包成 `{text_field: 样本}` 的记录（id 规则与 ingest 相同），回流。
 
 调用失败（修复耗尽/重试耗尽）只损失**那一次调用**的样本——种子不受影响，也不产生 failed 记录；该次调用计入报告桶统计（calls 计入、produced 为 0）。
@@ -51,7 +51,7 @@ seed_examples = [
 num_per_record = 2      # 调用数 = ⌈3 × 2 / 4⌉ = 2 → 期望产出 8 条
 ```
 
-种子池就是「样品间」：调用数按 `⌈len(seed_examples) × num_per_record / num_per_call⌉` 算，每次调用从池里抽 `seeds_per_call` 条当示例。Self-Instruct 原文用 175 条人工种子自举出了整个数据集——种子的**多样性**直接决定产出的多样性，写种子时刻意覆盖你想要的类型光谱。
+种子池就是「样品间」：调用数按 `⌈len(seed_examples) × num_per_record / num_per_call⌉` 算，每次调用从池里抽**至多** `seeds_per_call` 条当示例（12.2 的预算尾丢收缩同样适用）。Self-Instruct 原文用 175 条人工种子自举出了整个数据集——种子的**多样性**直接决定产出的多样性，写种子时刻意覆盖你想要的类型光谱。
 
 **② 无种子条件化形态（Persona Hub / Cosmopedia 式）**——一条示例都不给，纯靠指令 × 风格驱动：
 
@@ -145,7 +145,8 @@ mixture = "round_robin"       # "round_robin" | "weighted"
 weights = []                  # weighted 时必填，正数、长度=len(llms)
 instruction = """……"""        # enabled 时必填
 num_per_record = 2            # 每种子期望产出条数
-seeds_per_call = 3            # 每次调用抽几条种子当示例
+seeds_per_call = 3            # 每次调用抽几条种子当示例（v1.11：声明 context_window 后为上限，
+                              # 超预算按抽样序从尾部确定性丢弃，min 1）
 num_per_call = 4              # 每次调用要求产出几条
 seed_min_score = 0.5          # 种子门槛；缺省=quality.threshold，再缺省=批中位数
 temperature = 0.9             # 生成温度（覆盖 profile）

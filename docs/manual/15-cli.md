@@ -31,7 +31,7 @@ dry-run: estimated LLM calls — generate_calls=0 segment_calls=0 stitch_calls=0
 dry-run: no LLM calls made, no output written (report and trace only)
 ```
 
-注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），`segment_calls` / `extract_calls` 是 v1.8 新增字段（时序流，第 25 章），`stitch_calls` 是 v1.9 新增字段（线索缝合，第 26 章），未启用恒为 0；stream 模式下 quality/annotate/verify 的估算以「episode 数 ≈ 会话数」报**下界**、extract 按剔噪前帧数报**上界**（估算公式与真实对账见第 25 章）。`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。后两种情况 stderr 都会多打一行注记（`dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界`）。
+注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），`segment_calls` / `extract_calls` 是 v1.8 新增字段（时序流，第 25 章），`stitch_calls` 是 v1.9 新增字段（线索缝合，第 26 章），未启用恒为 0；stream 模式下 quality/annotate/verify 的估算以「episode 数 ≈ 会话数」报**下界**、extract 按剔噪前帧数报**上界**（估算公式与真实对账见第 25 章）；v1.11 起 `segment_calls` 的语义随预算而变——`segment.llm` 所指档声明了 `context_window`（第 6 章）时，估算公式的窗宽取 `min(window, w_min)`（w_min = 预算保证每窗至少装下的帧数），实际装填每窗只多不少、窗数只少不多，故报的是**最坏装填上界**（实际窗数事后看 `report.stream.windows` 对账），且 w_min 小于 window 时 stream 注记行会追加一句「segment 按预算最坏装填报上界」；未声明预算或 w_min ≥ window 时公式与数值同 v1.10。`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。后两种情况 stderr 都会多打一行注记（`dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界`）。
 
 ## 15.2 `labelkit validate`：只体检不跑车
 
