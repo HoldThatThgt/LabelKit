@@ -50,8 +50,16 @@ PRIOR_INFLATION = 1.2         # 首批先验保守放大（V17）
 # templates (CONTRACTS §10 frozen texts); tests/common/runtime/test_budget.py
 # asserts est_text(operator constant) == this dict cross-layer — revising a §10
 # template turns the test red and the constant follows the CONTRACTS revision.
+# EXCEPTION — "segment" covers the prompt's FULL worst-case static scaffolding,
+# not the head alone: est_text("\n".join(_SYSTEM_HEAD, _STRUCTURE_SENTENCE,
+# _STRUCTURE_REASON)) — the with_reason structure variant is the worst case.
+# min_window's static term anchors the V9 runtime-packing guarantee, so it
+# must be ≥ segment._static_prompt_est for EVERY config; a head-only value
+# undercounted the structure sentences and let the packer see a smaller
+# per-window budget than the guard had promised.
 TEMPLATE_HEAD_TOKENS: dict[str, int] = {
-    "segment": 415,   # segment._SYSTEM_HEAD (§10.9)
+    "segment": 484,   # §10.9 full static scaffolding (head + structure lines,
+                      # with_reason variant — see the exception note above)
     "classify": 48,   # classify._SYSTEM_HEAD_MULTI (§10.8)
     "quality": 39,    # §10.2 pairwise verdict/structure sentence (inline literal)
     "annotate": 32,   # annotate._SCHEMA_SENTENCE (§10.1)
@@ -241,9 +249,15 @@ def min_window(cfg: "ResolvedConfig") -> int:
     ⌊(input_budget − est_static_system) / per_frame_max⌋ (≥ 0), prior-based:
     per_frame_max = est_text(worst all-CJK digest of digest_max_chars)
     + DIFF_MAX_TOKENS + (image prior × PRIOR_INFLATION @ the working px, only
-    under vision_resolved); est_static_system = the V22 frozen segment template
-    head + segment.context + the two message envelopes (finer frozen template
-    body lines are absorbed by margin/DIFF_MAX_TOKENS headroom by design, V7).
+    under vision_resolved); est_static_system = the V22 frozen segment
+    scaffolding constant (system head + worst structure lines — see the
+    TEMPLATE_HEAD_TOKENS exception note) + segment.context (+1 for its joining
+    newline, so the separate-ceil sum stays ≥ the runtime joined est) + the two
+    message envelopes — together ≥ segment._static_prompt_est for every config,
+    the alignment the V9 guarantee stands on. The guarantee itself is
+    PRIOR-BASED: a calibrated image cost above prior × PRIOR_INFLATION (legal,
+    no clamp) degrades record-level via the packer's forced-min-2 window + the
+    M9 precheck — never run-level (spec 3.1.4 honest form).
     NOTE: the return is NOT capped at window — w_min may exceed the cap (the
     guard needs the budget-derived value; estimate consumers clamp per V12/V26).
     Duck-typed: reads only cfg.segment and cfg.llm_profiles (M1 calls this
@@ -252,7 +266,8 @@ def min_window(cfg: "ResolvedConfig") -> int:
     prof = cfg.llm_profiles.get(seg.llm)
     if prof is None or prof.context_window <= 0:
         return seg.window
-    est_static = (TEMPLATE_HEAD_TOKENS["segment"] + est_text(seg.context)
+    est_static = (TEMPLATE_HEAD_TOKENS["segment"]
+                  + (est_text(seg.context) + 1 if seg.context else 0)
                   + 2 * MSG_OVERHEAD_TOKENS)
     per_frame = est_text("\u597d" * seg.digest_max_chars) + DIFF_MAX_TOKENS
     if seg.vision_resolved:
@@ -273,6 +288,24 @@ def classify_stage_error(exc: BaseException) -> str | None:
     if isinstance(exc, OutputTruncatedError):
         return "output_truncated"
     return None
+
+
+def feed_reactive_terminal(exc: BaseException, metrics) -> None:
+    """A7/§7.8 breaker matrix, the shared exactly-once feed: ONLY the
+    reactive-400 (body-sniff) overflow terminal feeds the fatal streak — once
+    per exception object (the ``_breaker_fed`` duck flag guards double-feeds
+    when one exception crosses layers, e.g. the M7→M5 repair chain or the M8
+    L3 short-circuit); precheck and the 200-shaped finish oracle never feed.
+    Lives here (common) because M8 schema_engine must feed it too and common
+    may not import operators; ``metrics`` is duck-typed
+    (MetricsSink.record_provider_result) and None-tolerant for the metrics-less
+    engine/validate paths."""
+    if (metrics is not None
+            and isinstance(exc, ContextOverflowError) and exc.phase == "reactive"
+            and getattr(exc, "origin", "http_400") == "http_400"
+            and not getattr(exc, "_breaker_fed", False)):
+        exc._breaker_fed = True  # type: ignore[attr-defined]
+        metrics.record_provider_result(fatal=True)
 
 
 # ── V19 online per-image cost calibration ───────────────────────────────────

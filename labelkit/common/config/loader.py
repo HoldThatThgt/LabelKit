@@ -1962,17 +1962,29 @@ def load(config_path: Path, project_path: Path,
     # instruction/rubric/class table/schema/few-shot from ResolvedConfig) must
     # leave room — est ≥ input_budget is a mathematical certainty of failure
     # (CONFIG_ERROR); est > 50% halves the per-record share (WARN, A5).
+    # Per-class overrides (spec 5.2 [class.*] whitelist) can swap in their own
+    # instruction/rubric/few-shot/extra_criteria per pool, so each stage's
+    # static sum takes the MAX over the global view and every class view —
+    # otherwise an oversized per-class surface would sail past startup and
+    # fail every record of that pool at runtime (V13③ covers every call shape
+    # the run can issue; class_views == {} when classify is off).
     schema_text = json.dumps(user_schema, ensure_ascii=False) if user_schema else ""
-    rubric_text = "\n".join(
-        f"{c.key}\n{c.description}\n{c.pairwise_prompt}"
-        + ("\n" + "\n".join(c.pointwise_levels) if quality.mode == "pointwise" else "")
-        for c in rubric.criteria)
+
+    def _rubric_est(rub: Rubric, mode: str) -> int:
+        return budget.est_text("\n".join(
+            f"{c.key}\n{c.description}\n{c.pairwise_prompt}"
+            + ("\n" + "\n".join(c.pointwise_levels) if mode == "pointwise" else "")
+            for c in rub.criteria))
+
+    def _fewshot_est(examples: tuple[FewShotExample, ...]) -> int:
+        return budget.est_text("\n".join(
+            f"{ex.input}\n{json.dumps(ex.output, ensure_ascii=False)}"
+            for ex in examples))
+
+    views = tuple(class_views.values())
     class_table_text = "\n".join(
         f"{c.name}\n{c.description}\n" + "\n".join(c.examples)
         for c in classify.classes)
-    fewshot_text = "\n".join(
-        f"{ex.input}\n{json.dumps(ex.output, ensure_ascii=False)}"
-        for ex in annotate.examples)
     static_checks: list[tuple[str, tuple[str, ...], int]] = []
     if segment.enabled and segment.strategy in ("llm", "hybrid"):
         static_checks.append(("segment", (segment.llm,),
@@ -1990,28 +2002,40 @@ def load(config_path: Path, project_path: Path,
     if extract.enabled:
         static_checks.append(("extract", (extract.llm,),
                               budget.TEMPLATE_HEAD_TOKENS["extract"]
-                              + budget.est_text(extract.instruction)))
+                              + max([budget.est_text(extract.instruction)]
+                                    + [budget.est_text(v.extract.instruction)
+                                       for v in views])))
     if quality.enabled:
         q_profiles = (quality.judges if quality_judges_active else (quality.llm,))
         static_checks.append(("quality", tuple(q_profiles),
                               budget.TEMPLATE_HEAD_TOKENS["quality"]
-                              + budget.est_text(rubric_text)))
+                              + max([_rubric_est(rubric, quality.mode)]
+                                    + [_rubric_est(v.rubric, v.quality.mode)
+                                       for v in views])))
     if annotate.enabled:
         static_checks.append(("annotate", (annotate.llm,),
                               budget.TEMPLATE_HEAD_TOKENS["annotate"]
-                              + budget.est_text(annotate.instruction)
                               + budget.est_text(schema_text)
-                              + budget.est_text(fewshot_text)))
+                              + max([budget.est_text(annotate.instruction)
+                                     + _fewshot_est(annotate.examples)]
+                                    + [budget.est_text(v.annotate.instruction)
+                                       + _fewshot_est(v.annotate.examples)
+                                       for v in views])))
     if generate.enabled:
         static_checks.append(("generate", tuple(generate.llms),
                               budget.TEMPLATE_HEAD_TOKENS["generate"]
-                              + budget.est_text(generate.instruction)))
+                              + max([budget.est_text(generate.instruction)]
+                                    + [budget.est_text(v.generate.instruction)
+                                       for v in views])))
     if verify.enabled:
         v_profiles = verify.judges if verify.judges else (verify.llm,)
         static_checks.append(("verify", tuple(v_profiles),
                               budget.TEMPLATE_HEAD_TOKENS["verify"]
-                              + budget.est_text(verify.extra_criteria)
-                              + budget.est_text(annotate.instruction)))
+                              + max([budget.est_text(verify.extra_criteria)
+                                     + budget.est_text(annotate.instruction)]
+                                    + [budget.est_text(v.verify.extra_criteria)
+                                       + budget.est_text(v.annotate.instruction)
+                                       for v in views])))
     for sect, prof_names, est_static in static_checks:
         for name in prof_names:
             prof_s = llm_profiles.get(name)
@@ -2029,6 +2053,30 @@ def load(config_path: Path, project_path: Path,
                          f"token 超过输入预算 {ib} token 的 50%（profile "
                          f"[llm.{name}]）——单记录可用空间不足半，质量可能退化"
                          f"（V13③）")
+
+    # v1.11 stitch card-pool worst-case precheck (spec 3.16.5 上下文预算 row):
+    # the stitch-judgment prompt is statically bounded — ≤ max_open + 1 cards,
+    # each carrying TWO frame digests capped at stitch.digest_max_chars (首帧/
+    # 尾帧摘要, §10.11 card structure) — so there is no runtime trimming;
+    # instead M1 warns when the worst-case est cannot fit the input budget.
+    # NEVER auto-shrink max_open (a semantics change belongs to the user:
+    # raise context_window / lower digest_max_chars / lower max_open); the
+    # runtime backstop is the M9 throat check + on_error="keep".
+    prof_st = llm_profiles.get(stitch.llm) if stitch.enabled else None
+    if prof_st is not None and prof_st.context_window > 0:
+        card_worst = 2 * budget.est_text("\u597d" * stitch.digest_max_chars)
+        stitch_worst = (budget.TEMPLATE_HEAD_TOKENS["stitch"]
+                        + budget.est_text(stitch.context)
+                        + (stitch.max_open + 1) * card_worst)
+        ib_st = budget.input_budget(prof_st)
+        if stitch_worst > ib_st:
+            col.warn(f"{fp}:[stitch].max_open: 缝合判定卡池最坏估算 "
+                     f"{stitch_worst} token > 输入预算 {ib_st} token（profile "
+                     f"[llm.{stitch.llm}]，(max_open + 1) = {stitch.max_open + 1} "
+                     f"张卡 × 2 段帧摘要 × digest_max_chars = "
+                     f"{stitch.digest_max_chars}）——不自动缩 max_open（改语义须"
+                     f"用户动手）：请调大 context_window、缩小 "
+                     f"stitch.digest_max_chars 或调小 stitch.max_open（3.16.5）")
 
     # ── required-when-enabled instructions (spec §5.2 †) ──────────────────
     if annotate.enabled and not annotate.instruction.strip():

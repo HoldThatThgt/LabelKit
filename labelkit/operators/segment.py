@@ -315,9 +315,16 @@ def _pack_windows(costs: list[int], budget: int, cap: int) -> list[tuple[int, in
     ownership are PRESERVED (the rel[] assembly overwrite order relies on it);
     a frame joins the open window while both the budget and the frame-count
     cap hold, overflow closes the window. Every window carries ≥ 2 frames —
-    guaranteed statically by the M1 w_min ≥ floor guard (any two worst-case
-    frames fit the budget, spec 3.1.4), asserted here defensively. Pure
-    function of (costs, budget, cap) ⇒ deterministic rerun."""
+    the V10 semantic minimum: the M1 w_min ≥ floor guard promises any two
+    worst-case frames fit under PRIOR image pricing (spec 3.1.4), but the
+    packer prices off the calibrator, which past CALIBRATION_MIN_SAMPLES may
+    legitimately exceed prior × PRIOR_INFLATION (no clamp, by design). A
+    window the budget would close below 2 frames is therefore FORCE-PACKED at
+    2 regardless of cost: if its true est really exceeds the budget, the M9
+    pre-dispatch check owns it record-level (ContextOverflowError(
+    phase="precheck") through the per-window failure path) — never a run-kill,
+    and the forced advance keeps the loop terminating. Pure function of
+    (costs, budget, cap) ⇒ deterministic rerun."""
     spans: list[tuple[int, int]] = []
     n = len(costs)
     start = 0
@@ -327,9 +334,8 @@ def _pack_windows(costs: list[int], budget: int, cap: int) -> list[tuple[int, in
         while end < n and end - start < cap and total + costs[end] <= budget:
             total += costs[end]
             end += 1
-        assert end - start >= 2, (
-            f"budget window packed {end - start} frame(s) — the M1 w_min ≥ "
-            f"floor guard promises any 2 frames fit (spec 3.1.4)")
+        if end - start < 2:
+            end = min(start + 2, n)                # forced semantic minimum
         spans.append((start, end))
         if end == n:
             break
@@ -532,12 +538,14 @@ class SegmentStage:
         _meta.stream.degraded) + error event + segment.failures counter, never
         item.errors (S26). "fail": every session member fails → rejects.
         v1.11 (V27①): the kind routes through budget.classify_stage_error
-        FIRST — ContextOverflowError → "context_overflow" (counted into
-        report.budget.overflow_records at report assembly from rejects),
-        OutputTruncatedError → "output_truncated" — falling back to the
-        existing segmentation_invalid; an imprecise vocabulary here would
-        break the §3.5 attribution. The first failure keys the classification
-        and the message (the pre-v1.11 message semantics)."""
+        FIRST — ContextOverflowError → "context_overflow" (every rejected
+        member counts budget.overflow_records at this reject site, the V13②
+        convention shared with annotate/quality/verify — the report reads the
+        counter, never rejects), OutputTruncatedError → "output_truncated" —
+        falling back to the existing segmentation_invalid; an imprecise
+        vocabulary here would break the §3.5 attribution. The first failure
+        keys the classification and the message (the pre-v1.11 message
+        semantics)."""
         first = failures[0]
         kind = (budget_mod.classify_stage_error(first)
                 or ErrorKind.SEGMENTATION_INVALID.value)
@@ -549,6 +557,8 @@ class SegmentStage:
             for item in items:
                 item.errors.append(error)
                 item.status = "failed"
+                if kind == ErrorKind.CONTEXT_OVERFLOW.value:
+                    ctx.metrics.count("budget.overflow_records")  # V13②: per reject
         else:                                      # "keep"
             self._emit_episode(batch, sid, items, split=split,
                                degraded={"kind": kind,

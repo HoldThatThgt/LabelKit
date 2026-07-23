@@ -941,6 +941,11 @@ class VerifyStage:
                             raise outcome
                         # Re-judgment failure degrades to mark-only (record-level
                         # isolation: a broken window call never fails the episode).
+                        # The swallow is the exception's terminal — the reclaim
+                        # window has no degrade surface (V24), so a reactive-400
+                        # overflow settles its A7 exactly-once breaker feed here
+                        # (duck-flag idempotent; precheck/finish never feed).
+                        _feed_reactive_terminal(outcome, ctx.metrics)
                         ctx.metrics.count(_COUNTER_BOUNDARY_FLAGS)
                         continue
                     if outcome in _RECLAIM_RELATIONS:

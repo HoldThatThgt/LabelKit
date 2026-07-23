@@ -259,17 +259,10 @@ class _CallFit:
         return self.record_budget // (self.sides * self.tighten)
 
 
-def _feed_reactive_terminal(exc: BaseException, metrics) -> None:
-    """A7/§7.8 breaker matrix: ONLY the reactive-400 (body-sniff) overflow
-    terminal feeds the fatal streak — exactly once per exception object (the
-    duck flag guards double-feeds when one exception crosses operators);
-    precheck and the 200-shaped finish oracle never feed. ``origin`` is read
-    defensively pending the errors.py revision (default "http_400")."""
-    if (isinstance(exc, ContextOverflowError) and exc.phase == "reactive"
-            and getattr(exc, "origin", "http_400") == "http_400"
-            and not getattr(exc, "_breaker_fed", False)):
-        exc._breaker_fed = True  # type: ignore[attr-defined]
-        metrics.record_provider_result(fatal=True)
+# A7/§7.8 exactly-once breaker feed: the canonical implementation lives at
+# budget.feed_reactive_terminal (common) so M8 schema_engine can share it —
+# identical semantics, same _breaker_fed duck flag; call sites below use it
+# directly.
 
 
 def _fit_tree_text(rendered: str, budget_tokens: int) -> tuple[str, bool]:
@@ -968,7 +961,7 @@ class QualityStage:
                     # doomed request; a reactive-400 that drove us here settles
                     # its terminal now (A7).
                     if overflow_exc is not None:
-                        _feed_reactive_terminal(overflow_exc, ctx.metrics)
+                        budget.feed_reactive_terminal(overflow_exc, ctx.metrics)
                     self._overflow_tie(
                         ctx, (items[first_idx], items[second_idx]),
                         "pairwise slot exceeds the record-side budget at the "
@@ -993,7 +986,7 @@ class QualityStage:
                     ctx.metrics.count("budget.degrade_retries")
                     attempt_fit = replace(base_fit, tighten=2)
                     continue
-                _feed_reactive_terminal(exc, ctx.metrics)
+                budget.feed_reactive_terminal(exc, ctx.metrics)
                 self._overflow_tie(
                     ctx, (items[first_idx], items[second_idx]),
                     f"pairwise judgment overflow terminal ({type(exc).__name__}): {exc}")
@@ -1072,7 +1065,7 @@ class QualityStage:
                     # V10 minimal unit (single record) unfittable → record-level
                     # reject; a reactive-400 that drove us here settles now (A7).
                     if overflow_exc is not None:
-                        _feed_reactive_terminal(overflow_exc, ctx.metrics)
+                        budget.feed_reactive_terminal(overflow_exc, ctx.metrics)
                     self._overflow_fail_record(
                         ctx, item,
                         f"pointwise slot for criterion {criterion.key} exceeds "
@@ -1094,7 +1087,7 @@ class QualityStage:
                     ctx.metrics.count("budget.degrade_retries")
                     attempt_fit = replace(base_fit, tighten=2)
                     continue
-                _feed_reactive_terminal(exc, ctx.metrics)
+                budget.feed_reactive_terminal(exc, ctx.metrics)
                 self._overflow_fail_record(
                     ctx, item,
                     f"pointwise scoring overflow terminal for criterion "

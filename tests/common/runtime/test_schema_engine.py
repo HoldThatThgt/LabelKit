@@ -777,3 +777,63 @@ def test_initial_call_overflow_propagates_untouched():
     assert ei.value.phase == "precheck"
     assert eng.stats == {"l0_or_clean": 0, "l1": 0, "l3_1": 0, "l3_2": 0,
                          "rejected": 0}
+
+
+# ── A7 blind-spot fix: the L3 swallow point owns the reactive-400 feed ───────
+# The engine's short-circuit is the overflow exception's TERMINAL — the
+# SchemaViolation raised at exhaustion never reaches an operator overflow
+# reject site, so the exactly-once breaker feed settles at the swallow.
+
+class _MetricsFeedSpy:
+    def __init__(self):
+        self.fed = []
+        self.events = []
+
+    def event(self, ev, *, stage, batch_no, record_ids=(), payload=None):
+        self.events.append(ev)
+
+    def record_provider_result(self, fatal, *, hard=False):
+        self.fed.append(fatal)
+
+
+class _FirstBadThenReactiveLLM:
+    def __init__(self, origin: str):
+        self.calls = 0
+        self.origin = origin
+
+    async def complete(self, profile, prompt, response_schema=None):
+        from labelkit.common.errors import ContextOverflowError
+        self.calls += 1
+        if self.calls == 1:
+            return _StubResponse('{"intent": "nope"}')     # fails L2
+        raise ContextOverflowError("sniffed 400 overflow", phase="reactive",
+                                   profile=profile, origin=self.origin)
+
+
+def _run_repair_overflow(origin: str) -> tuple["_MetricsFeedSpy", int]:
+    import asyncio
+
+    import pytest
+    from labelkit.common.errors import SchemaViolation
+
+    llm = _FirstBadThenReactiveLLM(origin)
+    metrics = _MetricsFeedSpy()
+    eng = SchemaEngine(SPEC_SCHEMA, llm=llm,
+                       cfg=OutputConfig(max_repair_attempts=3), metrics=metrics)
+    with pytest.raises(SchemaViolation):
+        asyncio.run(eng.complete_validated("default", object()))
+    return metrics, llm.calls
+
+
+def test_l3_repair_reactive_400_overflow_feeds_breaker_exactly_once():
+    metrics, calls = _run_repair_overflow("http_400")
+    assert calls == 2                    # first call + the ONE overflowing repair
+    assert metrics.fed == [True]         # A7: fed exactly once at the swallow
+
+
+def test_l3_repair_finish_origin_overflow_never_feeds():
+    # The 200-shaped oracle rode a successful HTTP interaction (§7.8 matrix) —
+    # the short-circuit semantics stay, the breaker stays untouched.
+    metrics, calls = _run_repair_overflow("finish")
+    assert calls == 2
+    assert metrics.fed == []

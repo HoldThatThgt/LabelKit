@@ -25,6 +25,7 @@ from labelkit.common.config.model import (
     AnnotateConfig, ClassifyConfig, ClassSpec, ClassView, CliOverrides, Criterion,
     DedupConfig,
     ConsoleConfig,
+    EmbeddingProfile,
     ExtractConfig, GenerateConfig, InputConfig, LLMProfile, OutputConfig,
     QualityConfig,
     ResolvedConfig, Rubric, RunConfig, SegmentConfig, StitchConfig, StreamConfig,
@@ -1856,9 +1857,10 @@ async def test_stream_batch_end_carries_three_keys_only_when_enabled(tmp_path):
 
 async def test_stream_report_block_shape_and_counts_gating(tmp_path):
     """§9.3: with segment enabled counts gains the three keys and the report
-    gains the stream block right after counts — base nine keys (v1.11 V13④
-    adds windows), extract/verify sub-blocks only when those stages are
-    enabled, zero-based closed vocabularies fed from the M15/M7 counters."""
+    gains the stream block right after counts — eight base keys (the v1.11
+    V13④ windows key is BUDGET-GATED per spec §6.4 and this run declares no
+    window), extract/verify sub-blocks only when those stages are enabled,
+    zero-based closed vocabularies fed from the M15/M7 counters."""
     cfg = stream_cfg(tmp_path, batch_size=8, verify=True,
                      extract=ExtractConfig(enabled=True))
     ingestor = FakeSessionIngestor([sess("s1", 1, 3), sess("s2", 11, 2)])
@@ -1868,7 +1870,7 @@ async def test_stream_report_block_shape_and_counts_gating(tmp_path):
     metrics.counters["segment.below_min_len"] = 2
     metrics.counters["segment.digest_poor_frames"] = 1
     metrics.counters["segment.failures"] = 1
-    metrics.counters["segment.windows"] = 4        # v1.11 V13④ (M14-owned)
+    metrics.counters["segment.windows"] = 4        # counter unconditional (V13④)
     metrics.counters["extract.transitions"] = 3
     metrics.counters["extract.fallback_steps"] = 1
     metrics.counters["extract.failures"] = 0
@@ -1889,7 +1891,7 @@ async def test_stream_report_block_shape_and_counts_gating(tmp_path):
     assert set(stream) == {"sessions", "episodes", "mean_episode_len",
                            "absorbed", "dropped_noise", "below_min_len",
                            "digest_poor_frames", "segment_failures",
-                           "windows", "extract", "verify"}
+                           "extract", "verify"}
     assert stream["sessions"] == 2
     assert stream["episodes"] == 2
     assert stream["mean_episode_len"] == 2.5       # absorbed/episodes, round 2
@@ -1898,12 +1900,10 @@ async def test_stream_report_block_shape_and_counts_gating(tmp_path):
     assert stream["below_min_len"] == 2
     assert stream["digest_poor_frames"] == 1
     assert stream["segment_failures"] == 1
-    # v1.11 (V13④): windows surfaces UNCONDITIONALLY whenever segment runs
-    # (budget on or off — this run declares none), right after
-    # segment_failures (§9.3 order).
-    assert stream["windows"] == 4
-    keys = list(stream)
-    assert keys.index("windows") == keys.index("segment_failures") + 1
+    # v1.11 (V13④, spec §6.4): the windows key is BUDGET-GATED — this run's
+    # segment profile declares no context_window, so the fed counter never
+    # surfaces (all-undeclared report byte-identity, CONTRACTS §9.3).
+    assert "windows" not in stream
     assert stream["extract"] == {
         "transitions": 3, "fallback_steps": 1, "failures": 0,
         "by_type": {"click": 2, "long_press": 0, "input_text": 0, "scroll": 1,
@@ -1918,9 +1918,9 @@ async def test_stream_report_block_shape_and_counts_gating(tmp_path):
 
 
 async def test_stream_report_block_base_form_and_disabled_gating(tmp_path):
-    """extract/verify off → no sub-blocks (nine base keys exactly, v1.11
-    V13④ windows included); segment off → no stream block, no counts trio
-    (regression anchor)."""
+    """extract/verify off → no sub-blocks (eight base keys exactly; the v1.11
+    V13④ windows key is budget-gated and this run declares none); segment off
+    → no stream block, no counts trio (regression anchor)."""
     cfg = stream_cfg(tmp_path, batch_size=8)
     ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
     orch, _, emitter, _ = build(cfg, [StubSegmentStage()], ingestor=ingestor)
@@ -1928,7 +1928,7 @@ async def test_stream_report_block_base_form_and_disabled_gating(tmp_path):
     stream = emitter.report["stream"]
     assert set(stream) == {"sessions", "episodes", "mean_episode_len",
                            "absorbed", "dropped_noise", "below_min_len",
-                           "digest_poor_frames", "segment_failures", "windows"}
+                           "digest_poor_frames", "segment_failures"}
     assert stream["mean_episode_len"] == 2.0
 
     cfg_off = make_cfg(tmp_path, batch_size=8)
@@ -2166,9 +2166,10 @@ async def test_stitched_tally_threads_derivation_and_report_block(tmp_path):
                                 "judgments": 0, "repass_judgments": 0,
                                 "failures": 0}
     keys = list(stream)
-    # v1.11 (V13④/§9.3): windows slots between segment_failures and stitch.
-    assert keys.index("stitch") == keys.index("windows") + 1
-    assert keys.index("windows") == keys.index("segment_failures") + 1
+    # v1.11 (V13④/spec §6.4): the budget-gated windows key is absent on this
+    # undeclared run — stitch follows segment_failures directly.
+    assert "windows" not in stream
+    assert keys.index("stitch") == keys.index("segment_failures") + 1
 
 
 async def test_stitch_counters_surface_in_report_block(tmp_path):
@@ -2804,8 +2805,9 @@ class StubCalibrator:
 def budget_stream_cfg(tmp_path, context_window: int, **kw):
     """stream_cfg + a budget-declared "default" profile (segment.llm/annotate
     both resolve to it). Fixed shape: hybrid, window=20, digest_max_chars=400,
-    context="", text modality (vision_resolved False) → est_static = 415+0+8,
-    per_frame = 400+128 → w_min = (input_budget − 423) // 528."""
+    context="", text modality (vision_resolved False) → est_static = 484+0+8
+    (the V22 full-scaffolding segment constant), per_frame = 400+128 →
+    w_min = (input_budget − 492) // 528."""
     kw.setdefault("segment", SegmentConfig(enabled=True, strategy="hybrid",
                                            window=20))
     cfg = stream_cfg(tmp_path, **kw)
@@ -2829,7 +2831,7 @@ def test_estimate_run_segment_calls_budget_two_state(tmp_path):
     assert off["segment_calls"] == 3
 
     small = replace(base, llm_profiles={"default": budget_profile(5600)})
-    assert budget.min_window(small) == 6           # (4016 − 423) // 528
+    assert budget.min_window(small) == 6           # (4016 − 492) // 528
     est = estimate_run(small, plan)
     assert est["segment_calls"] == 5               # ceil(20/5) + ceil(4/5)
     assert est["extract_calls"] == off["extract_calls"] == 24
@@ -2977,8 +2979,14 @@ async def test_report_budget_node_shape_per_contracts(tmp_path):
     assert b["escalations"] == 0
     keys = list(emitter.report)
     assert keys.index("budget") == keys.index("trace") - 1
-    # V13④: the M14-owned actual window count surfaces in the stream block.
-    assert emitter.report["stream"]["windows"] == 4
+    # V13④: the M14-owned actual window count surfaces in the stream block —
+    # this run's segment profile IS budget-declared (spec §6.4 gate open),
+    # slotted right after segment_failures (§9.3 order).
+    stream = emitter.report["stream"]
+    assert stream["windows"] == 4
+    stream_keys = list(stream)
+    assert (stream_keys.index("windows")
+            == stream_keys.index("segment_failures") + 1)
 
 
 async def test_report_budget_w_min_raw_and_absent_without_segment(tmp_path):
@@ -3028,6 +3036,30 @@ async def test_report_budget_node_absent_without_declaration(tmp_path):
     orch3, _, emitter3, _ = build(cfg3, [RecordingStage("dedup")], [rec(1)])
     await orch3.run()
     assert "budget" not in emitter3.report
+
+
+async def test_report_budget_profiles_include_referenced_embedding(
+        tmp_path, caplog):
+    """spec §6.4 「任一被启用阶段引用的 profile」 covers BOTH referenced_profiles
+    legs: a dedup-semantic run whose embedding profile declares a window joins
+    report.budget.profiles with input_budget = embed_budget (cw − margin, no
+    output reservation, V15) and the startup INFO line — an embedding-ONLY
+    declaration alone opens the budget faces."""
+    emb = EmbeddingProfile(name="emb", base_url="https://e", model="bge",
+                           api_key_env="K", context_window=8192)
+    cfg = make_cfg(tmp_path, batch_size=4)
+    cfg = replace(cfg,
+                  embedding_profiles={"emb": emb},
+                  dedup=DedupConfig(enabled=True, semantic=True,
+                                    semantic_embedding="emb"))
+    orch, _, emitter, _ = build(cfg, [ExactDedupStage()], [rec(1)])
+    with caplog.at_level(logging.INFO, logger="labelkit.orchestrator"):
+        await orch.run()
+    b = emitter.report["budget"]
+    # margin(8192) = 820 → embed budget 7372 (V15)
+    assert b["profiles"] == {"emb": {"context_window": 8192,
+                                     "input_budget": 7372}}
+    assert "budget: emb=8192/7372" in [r.getMessage() for r in caplog.records]
 
 
 # — V13①: startup budget INFO line ————————————————————————————————————————————

@@ -693,18 +693,29 @@ class Orchestrator:
         if calibrator is not None:
             calibrator.freeze_batch()
 
-    def _budget_profiles(self) -> list[tuple[str, "LLMProfile"]]:
+    def _budget_profiles(self) -> list[tuple[str, int, int]]:
         """v1.11 (V13①②): the budget-declared profiles among those the run
-        resolved for use — the profile_usage referenced set filtered to
+        resolved for use — BOTH referenced_profiles legs, LLM and embedding
+        (spec §6.4: "任一被启用阶段引用的 profile"), filtered to
         ``context_window > 0`` (order-preserving; V6's "referenced by enabled
-        stages" convention). Non-empty ⇔ the budget observability faces
-        (startup INFO line, report.budget node) appear; all-undeclared runs
-        keep v1.10 output byte-identical (the CONTRACTS §9.3 clause)."""
-        declared = []
-        for name in referenced_profiles(self.cfg)[0]:
+        stages" convention). Entries are (name, context_window, input_budget)
+        with input_budget = budget.input_budget for LLM profiles and
+        budget.embed_budget for embedding profiles (no output reservation,
+        V15). Non-empty ⇔ the budget observability faces (startup INFO line,
+        report.budget node) appear; all-undeclared runs keep v1.10 output
+        byte-identical (the CONTRACTS §9.3 clause)."""
+        llm_names, emb_names = referenced_profiles(self.cfg)
+        declared: list[tuple[str, int, int]] = []
+        for name in llm_names:
             prof = self.cfg.llm_profiles.get(name)
             if prof is not None and prof.context_window > 0:
-                declared.append((name, prof))
+                declared.append((name, prof.context_window,
+                                 budget.input_budget(prof)))
+        for name in emb_names:
+            emb = self.cfg.embedding_profiles.get(name)
+            if emb is not None and emb.context_window > 0:
+                declared.append((name, emb.context_window,
+                                 budget.embed_budget(emb)))
         return declared
 
     def _log_budget_startup(self) -> None:
@@ -719,9 +730,7 @@ class Orchestrator:
         if not declared:
             return
         _log.info("budget: %s",
-                  " ".join(f"{name}={prof.context_window}"
-                           f"/{budget.input_budget(prof)}"
-                           for name, prof in declared),
+                  " ".join(f"{name}={cw}/{ib}" for name, cw, ib in declared),
                   extra={"stage": "run", "batch": 0})
         cfg = self.cfg
         seg_prof = (cfg.llm_profiles.get(cfg.segment.llm)
@@ -926,14 +935,18 @@ class Orchestrator:
                 "below_min_len": c("segment.below_min_len"),
                 "digest_poor_frames": c("segment.digest_poor_frames"),
                 "segment_failures": c("segment.failures"),
-                # v1.11 (V13④, §9.3): the ACTUAL dispatched-window count —
-                # the M14-owned segment.windows counter, same report-only
-                # family as below_min_len/digest_poor_frames and surfacing
-                # UNCONDITIONALLY whenever segment runs (budget on or off) —
-                # the user-side reconciliation face for the V12 upper-bound
-                # segment_calls estimate.
-                "windows": c("segment.windows"),
             }
+            seg_prof = cfg.llm_profiles.get(cfg.segment.llm)
+            if seg_prof is not None and seg_prof.context_window > 0:
+                # v1.11 (V13④, spec §6.4): the ACTUAL dispatched-window count
+                # — the M14-owned segment.windows counter. BUDGET-GATED
+                # presence: the key surfaces only when the segment stage's
+                # profile declares a window（预算未声明时不在场）— the counter
+                # emission stays unconditional (process-internal), but an
+                # all-undeclared report must remain byte-identical to v1.10
+                # (CONTRACTS §9.3 clause). It is the user-side reconciliation
+                # face for the V12 upper-bound segment_calls estimate.
+                stream_block["windows"] = c("segment.windows")
             if cfg.stitch.enabled:
                 # v1.9 (T16, chain-order slot before extract): stitched mirrors
                 # counts.stitched; the other five surface the M16 counters.
@@ -1103,9 +1116,8 @@ class Orchestrator:
             # from ResolvedConfig, budget.min_window and llm.calibrator; the
             # remaining keys surface the operator-owned MetricsSink counters.
             budget_block: dict = {
-                "profiles": {name: {"context_window": prof.context_window,
-                                    "input_budget": budget.input_budget(prof)}
-                             for name, prof in budget_profiles},
+                "profiles": {name: {"context_window": cw, "input_budget": ib}
+                             for name, cw, ib in budget_profiles},
             }
             if cfg.segment.enabled:
                 # [cap, w_min] under the frozen "segment.window" sub-key —

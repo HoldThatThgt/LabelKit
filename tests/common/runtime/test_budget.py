@@ -223,9 +223,9 @@ def test_min_window_undeclared_budget_keeps_window():
 
 def test_min_window_large_window_exceeds_cap():
     # per-frame worst = 400 (all-CJK digest) + 128 (diff) = 528;
-    # static = 415 (V22 head) + 0 (context) + 8 (envelopes) = 423
+    # static = 484 (V22 full segment scaffolding) + 0 (context) + 8 (envelopes)
     prof = _llm(context_window=131072)
-    assert min_window(_cfg(prof)) == (113868 - 423) // 528  # 214, ≥ window
+    assert min_window(_cfg(prof)) == (113868 - 492) // 528  # 214, ≥ window
     assert min_window(_cfg(prof)) >= 20
 
 
@@ -241,7 +241,7 @@ def test_min_window_vision_adds_the_inflated_image_prior():
     text_only = min_window(_cfg(prof))
     vision = min_window(_cfg(prof, vision_resolved=True))
     # per-frame gains ceil(1568 × 1.2) = 1882 → 528 + 1882 = 2410
-    assert vision == (113868 - 423) // 2410                # 47
+    assert vision == (113868 - 492) // 2410                # 47
     assert vision < text_only
 
 
@@ -249,13 +249,41 @@ def test_min_window_vision_uses_the_working_point_px():
     prof = _llm(provider="anthropic", context_window=131072,
                 default_image_px=1092)
     # prior @1092 = 1521 → ×1.2 → 1826 → per-frame 2354
-    assert min_window(_cfg(prof, vision_resolved=True)) == (113868 - 423) // 2354
+    assert min_window(_cfg(prof, vision_resolved=True)) == (113868 - 492) // 2354
 
 
 def test_min_window_context_eats_static_budget():
     prof = _llm(context_window=3200, max_output_tokens=1024)
-    ctx = "外" * 600                                        # +600 static tokens
-    assert min_window(_cfg(prof, context=ctx)) == (1856 - 423 - 600) // 528
+    ctx = "外" * 600                # +600 static tokens (+1 joining newline)
+    assert min_window(_cfg(prof, context=ctx)) == (1856 - 492 - 601) // 528
+
+
+def test_min_window_static_term_covers_runtime_static_est():
+    """V9 guard alignment (finding-1 fix): min_window's static term must be
+    ≥ the operator's runtime _static_prompt_est for EVERY config — otherwise
+    the packer sees a smaller per-window budget than the guard promised and
+    the 2-frame guarantee silently breaks. Sweep context shapes × with_reason
+    (trace channel toggles the worst structure variant)."""
+    from types import SimpleNamespace as NS
+
+    from labelkit.operators.segment import _static_prompt_est
+
+    prof = _llm(context_window=131072)
+    contexts = ("", "短", "外" * 600, "mixed 上下文 hint\n第二行", "a" * 599,
+                "x")
+    for context in contexts:
+        for with_reason in (False, True):
+            seg = SegmentConfig(enabled=True, llm=prof.name, window=20,
+                                digest_max_chars=400, context=context)
+            trace = NS(enabled=with_reason,
+                       channels=("segment",) if with_reason else ())
+            cfg = NS(segment=seg, llm_profiles={prof.name: prof}, trace=trace,
+                     dedup=NS(bounds_quantize_px=8))
+            guard_static = (TEMPLATE_HEAD_TOKENS["segment"]
+                            + (est_text(context) + 1 if context else 0)
+                            + 2 * MSG_OVERHEAD_TOKENS)
+            assert guard_static >= _static_prompt_est(cfg), (
+                context, with_reason)
 
 
 # ── TEMPLATE_HEAD_TOKENS cross-layer equality (V22) ─────────────────────────
@@ -264,11 +292,22 @@ def test_template_head_tokens_match_operator_constants():
     """The V22 sync anchor: each budget constant equals est_text of the LARGEST
     frozen system/template head constant among that stage's operator templates
     (CONTRACTS §10). Revising a §10 template turns this red — the constant then
-    follows the CONTRACTS revision (test layer may import both directions)."""
+    follows the CONTRACTS revision (test layer may import both directions).
+    SEGMENT EXCEPTION (V22 revision, finding-1 fix): the segment constant
+    covers the §10.9 prompt's FULL worst-case static scaffolding — the
+    newline-joined system head + structure sentence + with_reason structure
+    line — because min_window's static term anchors the V9 runtime-packing
+    guarantee and must dominate the operator's runtime _static_prompt_est."""
     from labelkit.operators import annotate, classify, extract, segment, stitch, verify
 
+    segment_worst = "\n".join([segment._SYSTEM_HEAD,
+                               segment._STRUCTURE_SENTENCE,
+                               segment._STRUCTURE_REASON])
+    assert TEMPLATE_HEAD_TOKENS["segment"] == est_text(segment_worst)
+    # the with_reason variant IS the worst structure line
+    assert est_text(segment._STRUCTURE_REASON) > est_text(segment._STRUCTURE_PLAIN)
+
     heads = {
-        "segment": (segment._SYSTEM_HEAD,),
         "classify": (classify._SYSTEM_HEAD_SINGLE, classify._SYSTEM_HEAD_MULTI),
         "annotate": (annotate._SCHEMA_SENTENCE,),
         "verify": (verify._SYSTEM_HEAD, verify._SYSTEM_DIMS, verify._SYSTEM_TAIL,
@@ -320,6 +359,48 @@ def test_classify_stage_error_vocabulary():
     assert classify_stage_error(OutputTruncatedError("x")) == "output_truncated"
     assert classify_stage_error(ValueError("x")) is None
     assert classify_stage_error(SchemaViolation(["/x: bad"], "{}")) is None
+
+
+# ── feed_reactive_terminal (A7 shared exactly-once breaker feed) ─────────────
+
+class _FeedSpy:
+    def __init__(self):
+        self.fatal = 0
+
+    def record_provider_result(self, fatal: bool, *, hard: bool = False) -> None:
+        if fatal:
+            self.fatal += 1
+
+
+def test_feed_reactive_terminal_feeds_reactive_400_exactly_once():
+    spy = _FeedSpy()
+    exc = ContextOverflowError("x", phase="reactive", origin="http_400")
+    budget.feed_reactive_terminal(exc, spy)
+    budget.feed_reactive_terminal(exc, spy)      # duck flag blocks the re-feed
+    assert spy.fatal == 1
+    assert exc._breaker_fed is True
+
+
+def test_feed_reactive_terminal_never_feeds_precheck_or_finish():
+    spy = _FeedSpy()
+    budget.feed_reactive_terminal(
+        ContextOverflowError("x", phase="precheck"), spy)
+    budget.feed_reactive_terminal(
+        ContextOverflowError("x", phase="reactive", origin="finish"), spy)
+    budget.feed_reactive_terminal(OutputTruncatedError("x"), spy)
+    budget.feed_reactive_terminal(ValueError("x"), spy)
+    assert spy.fatal == 0
+
+
+def test_feed_reactive_terminal_tolerates_none_metrics():
+    # The metrics-less engine/validate paths hand in None — no crash, and the
+    # exception stays unfed for a later metrics-carrying swallow point.
+    exc = ContextOverflowError("x", phase="reactive")
+    budget.feed_reactive_terminal(exc, None)
+    assert not getattr(exc, "_breaker_fed", False)
+    spy = _FeedSpy()
+    budget.feed_reactive_terminal(exc, spy)
+    assert spy.fatal == 1
 
 
 # ── ImageCostCalibrator (V19/F8) ────────────────────────────────────────────

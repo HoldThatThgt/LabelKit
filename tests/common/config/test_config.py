@@ -2471,7 +2471,8 @@ def test_static_system_precheck_silent_with_room(env, capsys):
 
 def test_min_window_guard_warns_at_floor_two(env, capsys):
     # V9: cw 3200 / max_out 1024 → input budget 1856; per-frame worst 528,
-    # segment static 423 → w_min = 2 == floor (verify off → floor 2).
+    # segment static 492 (V22 full scaffolding) → w_min = 2 == floor
+    # (verify off → floor 2).
     cfg = env.load(config_text=_cw_config(3200, max_out=1024),
                    project_text=env.project(body=SEG_ON))
     assert isinstance(cfg, ResolvedConfig)
@@ -2504,3 +2505,63 @@ def test_min_window_guard_silent_without_budget_or_with_room(env, capsys):
     env.load(config_text=_cw_config(131072),                 # w_min 214 ≫ floor
              project_text=env.project(body=SEG_ON))
     assert "预算最坏保证装填量" not in capsys.readouterr().err
+
+
+def test_stitch_card_pool_worst_case_warns(env, capsys):
+    # spec 3.16.5 上下文预算 row: stitch enabled ∧ its profile budgeted →
+    # worst est = head 325 + context 0 + (max_open+1)=5 cards × 2 digests ×
+    # est("好"×400)=400 → 4325 > ib 2316 (cw 3712 / max_out 1024) → WARN
+    # (never an error, never an auto-shrunk max_open).
+    cfg = env.load(config_text=_cw_config(3712, max_out=1024),
+                   project_text=env.project(body=STITCH_ON))
+    assert isinstance(cfg, ResolvedConfig)
+    assert cfg.stitch.max_open == 4                          # untouched
+    err = capsys.readouterr().err
+    assert ("[stitch].max_open: 缝合判定卡池最坏估算 4325 token > "
+            "输入预算 2316 token") in err
+    assert "不自动缩 max_open" in err
+
+
+def test_stitch_card_pool_within_budget_or_undeclared_stays_silent(env, capsys):
+    # smaller digest cap fits: 325 + 5 × 2 × 100 = 1325 ≤ 2316 → silent
+    body = STITCH_ON + "digest_max_chars = 100\n"
+    env.load(config_text=_cw_config(3712, max_out=1024),
+             project_text=env.project(body=body))
+    assert "缝合判定卡池" not in capsys.readouterr().err
+    # undeclared stitch profile → the check never runs (budget off)
+    env.load(project_text=env.project(body=STITCH_ON))
+    assert "缝合判定卡池" not in capsys.readouterr().err
+
+
+def test_static_precheck_error_takes_max_over_class_annotate_views(env):
+    # V13③ + per-class overrides: the GLOBAL annotate instruction is tiny
+    # (est 4) but [class.qa.annotate] swaps in a 300-token one — the static
+    # sum must take the max over views: 32 (head) + 87 (schema) + 300 = 419
+    # ≥ ib 281 (cw 4864) → CONFIG_ERROR naming [annotate].
+    body = CLASSIFY_BODY + f'\n[class.qa.annotate]\ninstruction = "{"标" * 300}"\n'
+    errors = env.errors(config_text=_cw_config(4864),
+                        project_text=env.project(body=body))
+    has(errors, "[annotate]: 静态系统侧提示部件估算 419 token ≥ 输入预算 281 token")
+
+
+def test_static_precheck_error_takes_max_over_class_verify_views(env):
+    # Same mechanism on verify's per-class extra_criteria (its profile is
+    # [llm.judge] — declared here via string splice): 192 (head) +
+    # max(0, 300) + 4 (annotate instruction rides verify prompts) = 496 ≥ 281.
+    config = _cw_config(4864).replace(
+        'api_key_env = "LK_TEST_KEY_JUDGE"',
+        'api_key_env = "LK_TEST_KEY_JUDGE"\ncontext_window = 4864', 1)
+    body = (CLASSIFY_BODY + '\n[verify]\nenabled = true\nllm = "judge"\n'
+            + f'\n[class.qa.verify]\nextra_criteria = "{"标" * 300}"\n')
+    errors = env.errors(config_text=config, project_text=env.project(body=body))
+    has(errors, "[verify]: 静态系统侧提示部件估算 496 token ≥ 输入预算 281 token")
+
+
+def test_static_precheck_class_views_within_budget_stay_silent(env, capsys):
+    # Counter-leg: a modest per-class instruction (est 100 → annotate static
+    # 219, under 50% of ib 854 @ cw 5500) neither errors nor warns.
+    body = CLASSIFY_BODY + f'\n[class.qa.annotate]\ninstruction = "{"标" * 100}"\n'
+    cfg = env.load(config_text=_cw_config(5500),
+                   project_text=env.project(body=body))
+    assert isinstance(cfg, ResolvedConfig)
+    assert "[annotate]: 静态系统侧提示部件估算" not in capsys.readouterr().err

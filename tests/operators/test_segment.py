@@ -12,7 +12,9 @@ configs (no llm_profiles / context_window == 0) are the v1.10 regression anchor.
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import hashlib
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -497,11 +499,21 @@ def test_pack_windows_min_two_frames_at_exact_two_frame_budget():
     assert _pack_windows([10] * 5, 20, 20) == [(0, 2), (1, 3), (2, 4), (3, 5)]
 
 
-def test_pack_windows_defensive_assert_below_two_frames():
-    # The M1 w_min ≥ floor guard promises any 2 frames fit — a budget that
-    # cannot hold 2 frames is a packing-layer invariant breach, asserted.
-    with pytest.raises(AssertionError):
-        _pack_windows([100, 100], 150, 20)
+def test_pack_windows_forces_two_frames_when_budget_would_close_below():
+    # The M1 w_min ≥ floor guard is PRIOR-based; the packer prices off the
+    # calibrator, which may legally exceed the prior (V19, no clamp). A window
+    # the budget would close below 2 frames is force-packed at 2 (the V10
+    # semantic minimum) — the M9 precheck owns any true overflow record-level;
+    # never an assert, never a run-kill.
+    assert _pack_windows([100, 100], 150, 20) == [(0, 2)]
+
+
+def test_pack_windows_every_frame_over_budget_terminates_with_forced_pairs():
+    # Worst degenerate shape: every frame alone exceeds the budget. The old
+    # assert fired here (and under python -O the loop never advanced); the
+    # forced minimum keeps the overlap chain and terminates.
+    assert _pack_windows([200, 200, 200], 150, 20) == [(0, 2), (1, 3)]
+    assert _pack_windows([200] * 5, 150, 20) == [(0, 2), (1, 3), (2, 4), (3, 5)]
 
 
 def test_pack_windows_deterministic_rerun():
@@ -866,6 +878,8 @@ def test_overflow_on_error_fail_writes_context_overflow_stage_error():
     for item in batch:
         (err,) = item.errors
         assert (err.stage, err.kind) == ("segment", "context_overflow")
+    # V13② reject-site convention (finding 3): one count per rejected member.
+    assert ctx.metrics.counters["budget.overflow_records"] == 2
     # minimal window ⇒ terminal at once; the 400-sniffed form feeds the
     # breaker exactly once (A7)
     assert ctx.metrics.provider_results == [(True, False)]
@@ -1120,6 +1134,96 @@ def test_budget_off_profile_with_zero_window_keeps_fixed_cut():
     out, ctx = run_stage(cfg, batch, engine)
     assert boundary_windows(ctx) == [(0, 2), (1, 3)]    # stride = window − 1
     assert ctx.metrics.counters["segment.windows"] == 2
+
+
+# ── calibrated-above-prior forced-min-2 packing (finding-1 repro) ─────────────
+# The reviewer's scenario: an M1-passing config (w_min == 2 under PRIOR image
+# pricing) meets a calibrator whose post-min-samples readout legally exceeds
+# prior × 1.2 (V19, no clamp) — per-frame cost then exceeds the pack budget and
+# the pre-fix packer closed windows at 1 frame (AssertionError at runtime;
+# under python -O a non-advancing infinite loop). Now: forced 2-frame windows,
+# and a true overflow surfaces record-level via the M9 precheck terminal
+# through the per-window failure path — never an exception escaping run().
+
+def calibrated_above_prior_setup():
+    prof = llm_profile(context_window=7168, max_output_tokens=1024)
+    cfg = make_cfg(min_len=1, vision_resolved=True,
+                   llm_profiles={"default": prof})
+    # The M1 guard passes this shape: w_min == 2 == floor (WARN leg, not error).
+    assert budget_mod.min_window(cfg) == 2
+    # Feed the REAL calibrator directly: 8 samples of residue 2550 → frozen
+    # readout ceil(2550 / 0.85) = 3000, above the prior working point
+    # ceil(1445 × 1.2) = 1734 — legal, no clamp by design.
+    calibrator = budget_mod.ImageCostCalibrator(
+        {"default": ("openai_compatible", prof.max_image_px)})
+    for _ in range(budget_mod.CALIBRATION_MIN_SAMPLES):
+        calibrator.observe("default", prompt_tokens=2550, text_est=0, n_images=1)
+    calibrator.freeze_batch()
+    assert calibrator.cost("default") == 3000
+    assert calibrator.cost("default") > math.ceil(
+        budget_mod.est_image_prior(prof, prof.max_image_px)
+        * budget_mod.PRIOR_INFLATION)
+    frames = [ui_frame(f"f{i}", i) for i in range(4)]
+    # Per-frame calibrated cost exceeds what the budget can pair: the packer
+    # is forced into the min-2 chain (previously: 1-frame close → assert).
+    assert packed_spans(cfg, frames, image_cost=3000) == [(0, 2), (1, 3), (2, 4)]
+    return cfg, calibrator, frames
+
+
+def test_calibrated_above_prior_forces_two_frame_windows_and_completes():
+    cfg, calibrator, frames = calibrated_above_prior_setup()
+    engine = MapEngine({"f0": window_obj("continues", "continues"),
+                        "f1": window_obj("continues", "continues"),
+                        "f2": window_obj("continues", "continues")})
+    batch = [envelope(r) for r in frames]
+    out, ctx = run_stage(cfg, batch, engine,
+                         llm=SimpleNamespace(calibrator=calibrator))
+    assert boundary_windows(ctx) == [(0, 2), (1, 3), (2, 4)]
+    assert all(e - s == 2 for s, e in boundary_windows(ctx))
+    assert status_tally(batch[:4]) == {"absorbed": 4}   # normal assembly
+    assert ctx.metrics.provider_results == []           # nothing fed the breaker
+
+
+def test_calibrated_above_prior_true_overflow_fails_record_level_never_raises():
+    # The forced 2-frame window whose true est still exceeds the budget: the
+    # M9 precheck terminal (simulated at the engine seam — the stub raises
+    # what complete() would) must land in the session's on_error disposition,
+    # record-level, with the overflow_records reject counter (finding 3) and
+    # ZERO breaker feeds (precheck never feeds, §7.8 matrix).
+    cfg, calibrator, frames = calibrated_above_prior_setup()
+    cfg = dataclasses.replace(
+        cfg, segment=dataclasses.replace(cfg.segment, on_error="fail"))
+    engine = QueueEngine([ContextOverflowError(
+        "est 6483 + max_output 1024 + margin 717 > context_window 7168",
+        phase="precheck", profile="default") for _ in range(3)])
+    batch = [envelope(r) for r in frames]
+    out, ctx = run_stage(cfg, batch, engine,
+                         llm=SimpleNamespace(calibrator=calibrator))
+    assert out is batch                                 # no exception escaped
+    assert status_tally(batch) == {"failed": 4}
+    assert all(item.errors[0].kind == "context_overflow" for item in batch)
+    # V13② reject-site convention (finding 3): one count per rejected member.
+    assert ctx.metrics.counters["budget.overflow_records"] == 4
+    assert ctx.metrics.counters["segment.failures"] == 1
+    assert ctx.metrics.provider_results == []           # precheck never feeds
+
+
+def test_calibrated_above_prior_keep_disposition_degrades_whole_session():
+    # on_error="keep" (default): the same overflow terminal degrades the
+    # session to ONE whole episode with the S26 evidence triple — kind
+    # context_overflow — and no reject, so overflow_records stays untouched.
+    cfg, calibrator, frames = calibrated_above_prior_setup()
+    engine = QueueEngine([ContextOverflowError(
+        "over budget", phase="precheck", profile="default")
+        for _ in range(3)])
+    batch = [envelope(r) for r in frames]
+    out, ctx = run_stage(cfg, batch, engine,
+                         llm=SimpleNamespace(calibrator=calibrator))
+    assert status_tally(batch[:4]) == {"absorbed": 4}
+    (episode,) = batch[4:]
+    assert episode.segment_degraded["kind"] == "context_overflow"
+    assert "budget.overflow_records" not in ctx.metrics.counters
+    assert ctx.metrics.provider_results == []
 
 
 # ── V9 session-level digest precompute ───────────────────────────────────────

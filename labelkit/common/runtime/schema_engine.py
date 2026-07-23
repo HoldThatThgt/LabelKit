@@ -25,6 +25,7 @@ from jsonschema import Draft202012Validator
 
 from labelkit.common.contracts.types import Usage
 from labelkit.common.errors import ContextOverflowError, SchemaViolation
+from labelkit.common.runtime.budget import feed_reactive_terminal
 
 if TYPE_CHECKING:
     from labelkit.common.runtime.llm_client import LLMClient
@@ -492,14 +493,20 @@ class SchemaEngine:
             try:
                 response = await self._llm.complete(repair_profile, repair_prompt,
                                                     response_schema=active)
-            except ContextOverflowError:
+            except ContextOverflowError as overflow:
                 # v1.11 (V25①, spec §3.3⑨): a repair call over budget counts
                 # the round as failed AND short-circuits the remaining rounds —
                 # the repair prompt is constant, so every later round fails
                 # identically. The exhaustion path below keeps the reject
                 # attribution schema_violation/callback_violation (never
                 # context_overflow; the repair source text is never truncated —
-                # truncating it would break the repair semantics).
+                # truncating it would break the repair semantics). The swallow
+                # ends the exception's life here, so the A7 exactly-once
+                # reactive-400 breaker feed settles NOW (§7.8 matrix; the
+                # SchemaViolation raised below never reaches an operator
+                # overflow reject site) — precheck/finish-origin never feed,
+                # and the _breaker_fed duck flag keeps this idempotent.
+                feed_reactive_terminal(overflow, self._metrics)
                 break
             total_usage = total_usage + response.usage
             attempts += 1

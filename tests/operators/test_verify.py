@@ -1345,6 +1345,60 @@ def test_reclaim_rejected_by_rejudgment_marks_boundary_flag(monkeypatch):
     assert not hasattr(ep, "stream_repaired")
 
 
+def _reclaim_overflow_run(monkeypatch, origin):
+    """One reclaim round whose judge_window call raises a reactive
+    ContextOverflowError of the given origin; returns (noise env, metrics)."""
+    cfg = _stream_cfg()
+
+    class FeedMetrics(_CapturingMetrics):
+        def __init__(self):
+            super().__init__()
+            self.fed = []
+
+        def record_provider_result(self, fatal, *, hard=False):
+            self.fed.append(fatal)
+
+    async def overflowing_judge(frames, ctx):
+        raise ContextOverflowError("prompt is too long", phase="reactive",
+                                   profile="default", origin=origin)
+
+    monkeypatch.setattr("labelkit.operators.segment.judge_window",
+                        overflowing_judge)
+    _stub_annotate(monkeypatch)
+    f0, f1, f2 = _frame("f0"), _frame("f1"), _frame("f2")
+    e2 = _env(f2, status="dropped_noise")
+    e2.noise_attribution = ("segment", "noise")
+    ep = _episode([f0, f1], transitions=(_transition(0),))
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_tail")]),
+    ]})
+    metrics = FeedMetrics()
+    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
+                          metrics=metrics, rng=None, batch_no=1)
+    asyncio.run(VerifyStage(cfg).run([_env(f0), _env(f1), e2, ep], ctx))
+    return e2, metrics
+
+
+def test_reclaim_rejudgment_reactive_400_feeds_breaker_exactly_once(monkeypatch):
+    """A7 blind-spot fix: the reclaim re-judgment swallow (mark-only
+    degradation) is the exception's terminal — the 400-sniffed reactive
+    overflow settles its exactly-once breaker feed there, while the
+    record-level disposition stays mark-only (never fails the episode)."""
+    e2, metrics = _reclaim_overflow_run(monkeypatch, "http_400")
+    assert e2.status == "dropped_noise"            # mark-only, frame untouched
+    assert metrics.counters["verify.boundary_flags"] == 1
+    assert metrics.fed == [True]                   # fed exactly once
+
+
+def test_reclaim_rejudgment_finish_origin_never_feeds(monkeypatch):
+    """The 200-shaped oracle rode a successful HTTP interaction — the reclaim
+    swallow must NOT feed the breaker (§7.8 matrix), only mark the flag."""
+    e2, metrics = _reclaim_overflow_run(monkeypatch, "finish")
+    assert e2.status == "dropped_noise"
+    assert metrics.counters["verify.boundary_flags"] == 1
+    assert metrics.fed == []
+
+
 # ── mark-only downgrades: session_split / neighbor-held / capture_gap ───────
 
 def test_session_split_episode_downgrades_reclaim_with_suspected(monkeypatch):

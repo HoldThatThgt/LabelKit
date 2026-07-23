@@ -101,7 +101,7 @@ RELATION_VOCAB = {"continues", "advances", "returns_to_entry", "context_switch",
 ACTION_VOCAB = {"click", "long_press", "input_text", "scroll", "drag", "open_app",
                 "app_switch", "navigate_back", "navigate_home", "wait", "other"}
 DEFECT_KIND_VOCAB = {"label_mismatch", "off_task_members", "missing_head",
-                     "missing_tail", "missing_members"}
+                     "missing_tail", "missing_members", "wrong_stitch"}
 
 
 def _profile(name: str, max_output_tokens: int) -> LLMProfile:
