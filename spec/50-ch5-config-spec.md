@@ -33,6 +33,7 @@
 | `embedding.*.max_concurrency` | int | 8 | 该 profile 并发上限（信号量，与 llm.* 同机制，3.9.3）。 |
 | `embedding.*.timeout_s` | int | 60 | 单次请求超时。 |
 | `embedding.*.max_retries` | int | 5 | 可重试错误的最大重试次数（重试规则同 3.9.3）。 |
+| `embedding.*.retry_base_delay_s` | float | 1.0 | 全抖动指数退避基数（与 `llm.*` 同名键同机制，3.9.3）。 |
 | `embedding.*.dims` | int | 可选 | 返回向量维度校验：配置后 `embed()` 逐条比对返回维度，不匹配抛 ProviderFatalError（3.9.2）。 |
 | `embedding.*.context_window` | int | 0 | v1.11 新增（V15，同 `llm.*.context_window` 声明制，3.9.5）：`0` = 未声明 = 该 embedding profile 预算关闭。> 0 时预算 = `context_window − margin`（**无输出预留**）；embed 输入超预算按确定性头部保留截断（3.3.3 第④级语义嵌入）。声明实效窗口指引同 llm 行（V26）。 |
 | `tool.log_format` | str | "text" | "text" \| "jsonl"：stderr 运行日志行格式（7.3）；"jsonl" 时强制 console plain 档以保证 stderr 逐行可解析（7.7，显式 rich（CLI `--console rich` 或 `console.mode="rich"`）冲突时 M1 WARN）。 |
@@ -113,10 +114,10 @@ dims = 1024                         # 可选：返回向量维度校验
 | `stream.order_by` | str | "input_order" | v1.8 新增（`[stream]` 节 = stream 模式输入侧排序与会话化声明，M2 消费，3.2/3.14；仅 `segment.enabled = true` 时生效）。"input_order"（默认：文本 = 文件名字典序→行号，UI = pair_index 升序）\| "meta:<field>"（**仅文本模态**，M1 校验；时间戳解析规格见 6.1——数值秒/毫秒判定、ISO 字符串、时区归一；解析失败与乱序同走 on_disorder）。 |
 | `stream.on_disorder` | str | "skip" | v1.8："skip"（默认：乱序/时间戳解析失败记录跳过——计 bad_input + IngestReport.disorder 子计数 + `ingest.disorder` 事件 + WARN 一次）\| "fail"（InputError，退出码 3）。单调性游标**按分区键各自维护**（S19；键变即断语义保留，输入须按键成组，6.1）。 |
 | `stream.key` | array | [] | v1.8：分区键列表，键变即断会话（groupby 语义非 keyBy）。元素 = "meta:<field>"（仅文本模态）\| "source_dir"（= ref.source_file 父目录派生，UI 模态可用——一次采集一目录惯例，S19）；元素合法性 M1 校验（3.1.4）。 |
-| `stream.gap_s` | int | 300 | v1.8：相邻记录时间差 > gap_s 秒即断开会话；**仅 `order_by="meta:*"` 时可设**（M1 校验）。默认偏大的结构性论证：欠分割可由 LLM 边界精化拯救、过分割不可逆（3.14）。 |
+| `stream.gap_s` | int | 300 | v1.8：相邻记录时间差 > gap_s 秒即断开会话；仅 `order_by="meta:*"` 时生效——显式设置而非 meta 序 ⇒ M1 warning 一次（非阻断，键不生效；对照 `session_max_span_s` 行的 CONFIG_ERROR 级）。默认偏大的结构性论证：欠分割可由 LLM 边界精化拯救、过分割不可逆（3.14）。 |
 | `stream.gap_steps` | int | 0 | v1.8：相邻记录序号差 > gap_steps 即断开（0 = 不启用）；与 gap_s 可并用，任一触发即断。 |
 | `stream.session_max_len` | int | 200 | v1.8：会话硬上限（帧），到限即断。`session_max_len > run.batch_size` ⇒ M1 静态 WARN（S21：单会话超批容量将被 M10 硬切 + `session_split` 标，3.10.3）。 |
-| `stream.session_max_span_s` | int | 0 | v1.8：会话时间跨度硬上限（秒，0 = 不启用）；**仅 `order_by="meta:*"` 时可设**（M1 校验）。 |
+| `stream.session_max_span_s` | int | 0 | v1.8：会话时间跨度硬上限（秒，0 = 不启用）；**仅 `order_by="meta:*"` 时可设**（M1 校验，违反报 CONFIG_ERROR）。 |
 | `segment.enabled` | bool | false | v1.8 新增：语义分段算子 / stream 模式总开关（M14，3.14）。默认关——工具行为与 v1.7 逐字节一致（`_meta.stream: null` 除外，6.3）。启用要求（3.1.4）：`run.mode = "process"` ∧ `generate.enabled = false`（generate_only 经 2.3.1 ④ 传递闭合）∧ `annotate.enabled = true`。no-op warning（R8 家族）：`[stream]`/`[segment]`/`[extract]` 任一节在场而 `segment.enabled = false`。 |
 | `segment.strategy` | str | "hybrid" | "rules"（候选会话原样成 episode，零 LLM；noise_filter / min_len 不生效）\| "llm" \| "hybrid"（默认：滑窗 LLM 边界精化 + 逐帧噪声标记；len(session)==1 走 rules 退化，3.14）。 |
 | `segment.llm` | str | "default" | profile 引用；**仅 `strategy ∈ {llm, hybrid}` 时**计入密钥解析 / `--probe` / 存在性引用集（S30，3.1.4）——rules 策略零调用不强制配键。v1.11（V1/V3）：**不再入 vision 校验集**——segment 从「要求视觉」改为「适配视觉」，窗口是否附图由本 profile 的 `supports_vision` 能力自动决定（parse product `vision_resolved`，见下）；选 profile 即选能力，需纯文本裁决请指向纯文本 profile。 |

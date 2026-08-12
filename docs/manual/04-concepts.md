@@ -10,7 +10,7 @@
 - 文本模态下，记录 = 输入 JSONL 的一行；
 - UI 模态下，记录 = 一对文件（`uitree_<N>.jsonl` + `image_<N>.png/jpg`）。
 
-每条记录在进厂时（ingest 工位）拿到一个**确定性 id**——16 位十六进制字符串：
+每条记录在进厂时（ingest 算子）拿到一个**确定性 id**——16 位十六进制字符串：
 
 - 文本模态：`sha256(整行 JSON 的规范化序列化)` 取前 16 位。规范化 = 键排序、紧凑分隔，所以**内容相同的两行，无论出现在哪个文件第几行，id 必然相同**；
 - UI 模态：`sha256(树文件字节 + 图像文件字节)` 取前 16 位。
@@ -23,33 +23,38 @@ id 贯穿一切：主输出的 `_meta.id`、拒绝通道、trace 事件里的 `r
 
 每条记录在流水线上背着一个状态牌，从 `active` 出发，只会发生这些变迁：
 
+```mermaid
+stateDiagram-v2
+    state "active（存活，继续走）" as active
+    [*] --> active
+    active --> absorbed : segment 吸收（v1.8：帧被并入某个 episode）
+    active --> dropped_noise : segment 判噪（v1.8：噪声帧 / 不足最短段长）
+    active --> stitched : stitch 并入（v1.9：episode 被缝进线索后留下的壳）
+    active --> dropped_dup : dedup 判重（重复，簇内非首见）
+    active --> dropped_lowq : quality 门控（聚合分不过线 / 未入选）
+    active --> dropped_verify : verify 终裁（评审不合格且修不好）
+    active --> failed : 任何环节不可恢复失败（如结构修复耗尽、API 致命错误）
+    active --> [*] : 走完全部算子仍为 active ⇒ 写入主输出
+    absorbed --> dropped_noise : verify 修复路径剔除混入帧（分段吸收例外的双向豁免）
+    dropped_noise --> absorbed : verify 修复路径回收误杀帧；stitch 救援命中（缝合改绑例外，仅限救援）
 ```
-                    ┌─ segment 吸收 ────▶ absorbed         （v1.8：帧被并入某个 episode）
-                    ├─ segment 判噪 ────▶ dropped_noise    （v1.8：噪声帧 / 不足最短段长）
-                    ├─ stitch 并入 ─────▶ stitched         （v1.9：episode 被缝进线索后留下的壳）
-                    ├─ dedup 判重 ──────▶ dropped_dup      （重复，簇内非首见）
-     active ────────┼─ quality 门控 ────▶ dropped_lowq     （聚合分不过线 / 未入选）
-   （存活，继续走）  ├─ verify 终裁 ────▶ dropped_verify    （评审不合格且修不好）
-                    ├─ 任何环节不可恢复失败 ▶ failed         （如结构修复耗尽、API 致命错误）
-                    └─ 走完全部工位 ─────▶ 仍为 active ⇒ 写入主输出
-```
 
-两个 v1.8 新状态只在开启分段算子（stream 模式，第 25 章）时出现：`absorbed` 表示这条帧记录被吸收为某个 episode（序列信封）的成员——它不进主输出也不进拒绝通道，账记在序列信封名下；`dropped_noise` 表示这一帧被判为噪声（弹窗、误触等插入帧）或所在段不足最短段长而被剔除，进拒绝通道。v1.9 新状态 `stitched` 只在再开启缝合算子（第 26 章）时出现：一个 episode 被缝进另一条线索后，成员已转移到幸存信封名下，原信封成了「壳」——壳既不进主输出也不进拒绝通道，仅计数（`counts.stitched`）。
+两个 v1.8 新状态只在开启分段算子（流模式，第 25 章）时出现：`absorbed` 表示这条帧记录被吸收为某个 episode（序列信封）的成员——它不进主输出也不进拒绝通道，账记在序列信封名下；`dropped_noise` 表示这一帧被判为噪声（弹窗、误触等插入帧）或所在段不足最短段长而被剔除，进拒绝通道。v1.9 新状态 `stitched` 只在再开启缝合算子（第 26 章）时出现：一个 episode 被缝进另一条线索后，成员已转移到幸存信封名下，原信封成了「壳」——壳既不进主输出也不进拒绝通道，仅计数（`counts.stitched`）。
 
-三条铁律：
+三条铁律（出自 Stage 契约，spec §4.3）：
 
-1. **算子只处理 `active` 的记录**——被前面工位淘汰的，后面工位看都不看（也就不再为它花钱）；
-2. **算子永远不从批里删除元素，只改状态**——账目因此永远算得平。v1.7 起有一个**只增不删**的例外：分类算子在 `classify.assignment = "multi"` 下可向批**尾部**追加扇出的兄弟信封（一条记录命中多个类别时每类一个信封），既有元素仍一个不动（第 24 章）。v1.8 又添一个同族例外（②b）：分段算子可把批内成员帧信封置为 `absorbed` / `dropped_noise`，并向批尾追加以这些成员拼装的序列信封（每帧至多被一个 episode 吸收）；verify 的缺陷修复路径还可在本批内把成员帧状态在 `absorbed` 与 `dropped_noise` 之间**双向**改写（回收误杀帧 / 剔除混入帧）——这是「状态只进不退」的唯一反向豁免，且永远不会把成员翻回 `active`（第 25 章）。v1.9 再添例外 ②c：缝合算子把被并入线索的 episode 信封置为 `stitched`（壳）、幸存信封的成员集重绑为两方成员按序合并，救援命中时还可把过短被剔的收尾帧从 `dropped_noise` 翻回 `absorbed`——这是 ②b 双向豁免在缝合算子上的延伸，仅限救援命中（第 26 章）；
-3. **单条记录的失败绝不升级为整批失败**——异常被收进该记录的 `errors` 列表，状态置 `failed`，运行继续。
+1. **仅处理 active 条款**：算子只处理 `active` 的记录——被前面算子淘汰的，后面算子看都不看（也就不再为它花钱）；
+2. **不删元素条款**：算子永远不从批里删除元素，只改状态——账目因此永远算得平。v1.7 起有一个**只增不删**的例外——**多标签扇出例外**：分类算子在 `classify.assignment = "multi"` 下可向批**尾部**追加扇出的兄弟信封（一条记录命中多个类别时每类一个信封），既有元素仍一个不动（第 24 章）。v1.8 又添一个同族的**分段吸收例外**：分段算子可把批内成员帧信封置为 `absorbed` / `dropped_noise`，并向批尾追加以这些成员拼装的序列信封（每帧至多被一个 episode 吸收）；verify 的缺陷修复路径还可在本批内把成员帧状态在 `absorbed` 与 `dropped_noise` 之间**双向**改写（回收误杀帧 / 剔除混入帧）——这是「状态只进不退」的唯一反向豁免，且永远不会把成员翻回 `active`（第 25 章）。v1.9 再添**缝合改绑例外**：缝合算子把被并入线索的 episode 信封置为 `stitched`（壳）、幸存信封的成员集重绑为两方成员按序合并，救援命中时还可把过短被剔的收尾帧从 `dropped_noise` 翻回 `absorbed`——这是分段吸收例外的双向豁免在缝合算子上的延伸，仅限救援命中（第 26 章）；
+3. **失败不逃逸条款**：单条记录的失败绝不升级为整批失败——异常被收进该记录的 `errors` 列表，状态置 `failed`，运行继续。
 
-最终去向：`active` → 主输出；`dropped_*` / `failed` → 拒绝通道（按 `output.rejects` 档位落盘）；所有状态计数 → 报告。于是有了那条**守恒等式**：
+最终去向：`active` → 主输出；`dropped_*` / `failed` → 拒绝通道（按 `output.rejects` 档位落盘）；所有状态计数 → 报告。于是有了那条**守恒恒等式**：
 
 ```
 emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed + bad_input [+ absorbed] [+ stitched]
   = scanned + generated [+ fanout] [+ episodes]
 ```
 
-（`bad_input` 是 ingest 阶段就不成记录的坏行/缺对，没有 id，不走拒绝通道，只计数。`fanout` 仅在 `classify.assignment = "multi"` 时出现于 `counts`——multi 扇出净增的信封数，右侧随之补平，第 24 章。`absorbed` / `dropped_noise` / `episodes` 是 v1.8 的 stream 三项，仅 `segment.enabled = true` 时出现：分段吸收的帧与剔除的噪声帧记在左侧，净增的 episode 信封数记在右侧补平，第 25 章。`stitched` 是 v1.9 缝合项，仅 `stitch.enabled = true` 时出现：被并进线索的 episode 壳作为终态记在左侧，与右侧的 `episodes` 一对一抵扣（线索数 = episodes − stitched），第 26 章。未启用的项恒为 0，等式退化回原形。另注意残差项 `unprocessed`：熔断中止时左侧另加它；stream 模式下**优雅中断（SIGINT/SIGTERM）也会**产生该项——会话缓冲让中断时可能有已扫描但未走完流水线的帧；非 stream 模式的中断残差恒为 0、不出现此键。）
+（`bad_input` 是 ingest 阶段就不成记录的坏行/缺对，没有 id，不走拒绝通道，只计数。`fanout` 仅在 `classify.assignment = "multi"` 时出现于 `counts`——multi 扇出净增的信封数，右侧随之补平，第 24 章。`absorbed` / `dropped_noise` / `episodes` 是 v1.8 的 stream 三项，仅 `segment.enabled = true` 时出现：分段吸收的帧与剔除的噪声帧记在左侧，净增的 episode 信封数记在右侧补平，第 25 章。`stitched` 是 v1.9 缝合项，仅 `stitch.enabled = true` 时出现：被并进线索的 episode 壳作为终态记在左侧，与右侧的 `episodes` 一对一抵扣（线索数 = episodes − stitched），第 26 章。未启用的项恒为 0，等式退化回原形。另注意残差项 `unprocessed`：熔断中止时左侧另加它；流模式下**优雅中断（SIGINT/SIGTERM）也会**产生该项——会话缓冲让中断时可能有已扫描但未走完流水线的帧；非流模式的中断残差恒为 0、不出现此键。）
 
 ## 4.3 批（Batch）：流动与屏障
 
@@ -62,7 +67,7 @@ emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed
 
 > **批 = pairwise 打分的比较池。** `batch_size` 不只是内存/吞吐参数，它直接决定质量分的统计口径。pairwise 分数是「批内相对排名」，批间不可直接比较。
 
-批走完最后一个工位就**立即落盘并释放内存**——这是「无状态」的微观实现：任何时刻内存里最多只有一批的中间态（外加全局去重索引；开启 generate 时，还会短暂驻留排队等待回流的生成子批，见第 12 章）。
+批走完最后一个算子就**立即落盘并释放内存**——这是「无状态」的微观实现：任何时刻内存里最多只有一批的中间态（外加全局去重索引；开启 generate 时，还会短暂驻留排队等待回流的生成子批，见第 12 章）。
 
 ## 4.4 运行（Run）：一次进程的生命周期
 
@@ -87,7 +92,7 @@ emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed
 | `quality.threshold` 与 `quality.selection="top_ratio"` **互斥** | 两种淘汰机制不能同时生效 |
 | `segment` 开 ⇒ `mode = "process"` 且 `generate` 必须关且 `annotate` 必须开（v1.8） | 分段加工的是既有时序流，与生成互斥（序列合成属路线图）；episode 的产出物就是标注 |
 | `extract` 开 ⇒ `segment` 必须开且模态必须是 `ui`（v1.8） | 动作摘取的对象是屏幕帧序列——没有分段就没有 episode，文本序列 v1 不适用 |
-| `stitch` 开 ⇒ `segment` 必须开（v1.9） | 缝合的对象是分段产出的 episode 碎片——没有分段就没有可缝的东西（仅 stream 模式可用） |
+| `stitch` 开 ⇒ `segment` 必须开（v1.9） | 缝合的对象是分段产出的 episode 碎片——没有分段就没有可缝的东西（仅流模式可用） |
 | `stitch.votes` 若大于 1 必须为奇数（v1.9） | 偶数票可能平票，严格多数决失去意义 |
 | `segment` 开 ⇒ `quality.llm` **免除** `supports_vision` 要求（v1.8 放宽项；v1.9 的 `stitch.llm` 同样恒不要求视觉） | 序列打分是纯文本（步骤序列 + 帧摘要，无图），UI 模态也不需要视觉能力；缝合判定同理（摘要卡证据，无图） |
 | `frame.classify` / `frame.annotate` 任一开 ⇒ `segment` 必须开（v1.12） | 帧粒度是流模式内的第二层产物——帧的载体是 episode 的成员集；非流工程想按类定制标注，用 `[class.<名>.annotate]`（第 24 章） |

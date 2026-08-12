@@ -10,8 +10,8 @@
 | 维度 | 探索期（教程 1–4） | 生产期（本章） |
 |---|---|---|
 | 目标 | 快速迭代配置 | 结果可信、过程可审计、失败可感知 |
-| 裁决 | 单模型单次 | 评审团 + 双序（关键任务） |
-| 校验 | 可以不开 | 必开，独立模型 |
+| 裁决 | 单模型单次 | 评审团 + 双顺序（关键任务） |
+| 二次校验 | 可以不开 | 必开，独立模型 |
 | 失败处理 | 看看账就行 | `--strict` + 退出码接入调度系统 |
 | 产物管理 | 随手覆盖 | 按批次命名、trace 归档、报告留存 |
 
@@ -35,7 +35,7 @@ max_concurrency = 16          # 理由：生产网关额度高；从限流值的
 supports_structured_output = true
 supports_vision = true
 context_window = 131072       # 理由：v1.11 预算护栏的开关——声明后超长输入变成有界裁剪或
-                              # 记录级 context_overflow 拒绝，而不是撞端点报错烧熔断连击；
+                              # 记录级 context_overflow 拒收，而不是撞端点报错烧熔断连击；
                               # 值按部署实测保守声明（欠声明恒安全），每个会被调用的 profile
                               # 都声明（第 6、18 章；报表对账读 report.budget，第 8 章）
 price_per_mtok_in = 0.6       # 理由：没有单价就没有成本账，预算无从谈起
@@ -148,7 +148,7 @@ max_repair_attempts = 2
 repair_llm = "fixer"                     # 理由：修 JSON 不需要智力，小模型省钱
 ```
 
-这套配置的单条成本 ≈ 探索期默认档的 **6 倍**——quality 12N（评审团 ×3 × 双序 ×2）+ annotate 3N（SC ×3）+ verify 3N（评审团 ×3）= 18N，对比探索期默认档的 quality 2N + annotate 1N = 3N。所以 23.1 那张表才强调：**这些选项每一个都要先在小样本上论证收益，再进生产**。反过来，预算敏感的生产线砍掉 `both_orders` 和 verify 评审团（改单 judge），成本回到约 3 倍档（6N+3N+1N = 10N）。
+这套配置的单条成本 ≈ 探索期默认档的 **6 倍**——quality 12N（评审团 ×3 × 双顺序 ×2）+ annotate 3N（自洽采样 ×3）+ verify 3N（评审团 ×3）= 18N，对比探索期默认档的 quality 2N + annotate 1N = 3N。所以 23.1 那张表才强调：**这些选项每一个都要先在小样本上论证收益，再进生产**。反过来，预算敏感的生产线砍掉 `both_orders` 和 verify 评审团（改单 judge），成本回到约 3 倍档（6N+3N+1N = 10N）。
 
 ## 23.3 运行纪律：脚本化的四步
 
@@ -158,22 +158,22 @@ set -euo pipefail
 set -a && source /etc/labelkit/.env && set +a
 BATCH=0707
 
-# ① 体检（配置 + 连通）；validate 失败 = 配置坏了，直接停
+# 体检（配置 + 连通）；validate 失败 = 配置坏了，直接停
 uv run labelkit validate --config config.toml --project project.toml --probe \
   | tee out/probe-$BATCH.log
 grep -q "FAIL" out/probe-$BATCH.log && { echo "probe failed"; exit 1; }   # probe 失败不改退出码，要自己 grep
 
-# ② 预算核对：估算调用数落在预期区间才放行
+# 预算核对：估算调用数落在预期区间才放行
 uv run labelkit run --config config.toml --project project.toml \
   --dry-run --output out/dryrun-$BATCH.jsonl
 
-# ③ 全量，--strict 让"有淘汰"可被调度系统感知
+# 全量，--strict 让"有淘汰"可被调度系统感知
 #    注意：脚本开头有 set -e，必须用 `|| rc=$?` 吸收非零退出码——
-#    否则退出码 1（有淘汰，分诊信号）会让脚本在此行直接终止，步骤④永远不会执行
+#    否则退出码 1（有淘汰，分诊信号）会让脚本在此行直接终止，归档步骤永远不会执行
 rc=0
 uv run labelkit run --config config.toml --project project.toml --strict || rc=$?
 
-# ④ 归档：产物 + 账本 + trace 一起进对象存储（trace 下次运行会被截断！）
+# 归档：产物 + 账本 + trace 一起进对象存储（trace 下次运行会被截断！）
 tar czf archive/ime-intent-$BATCH.tgz out/ime-intent-$BATCH.*
 exit $rc
 ```
@@ -203,13 +203,15 @@ exit $rc
 
 ## 23.6 全书方法论的一页总结
 
-```
-选口径（rubric/instruction 说清楚"好"是什么）
-  → 小样本迭代（--limit + trace + 同 seed 对比）
-    → 画线（直方图 + rejects 双材料）
-      → 按需加固（评审团/双序/SC/verify，逐项论证）
-        → 全量（--strict + 归档 + 五指标周报）
-          → 漂移时回到第一步
+```mermaid
+flowchart TD
+    pick["选口径（rubric/instruction 说清楚「好」是什么）"]
+    trial["小样本迭代（--limit + trace + 同 seed 对比）"]
+    cut["画线（直方图 + rejects 双材料）"]
+    harden["按需加固（评审团/双顺序/自洽采样/verify，逐项论证）"]
+    full["全量（--strict + 归档 + 五指标周报）"]
+    pick --> trial --> cut --> harden --> full
+    full -- "漂移时" --> pick
 ```
 
 这条环就是 LabelKit 的正确打开方式：工具负责把每一步的证据摆到你面前，判断力永远是你的。

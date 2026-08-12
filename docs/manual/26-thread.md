@@ -12,7 +12,7 @@
 
 还有一个更隐蔽的伤口：任务收尾帧天然容易变成短段（用户在切走前密集执行收尾动作，收尾帧聚集在切换点旁边），而 `segment.min_len` 会把不足最短段长的段以 `below_min_len` 丢进拒绝通道——**支付成功页这一帧被当垃圾扔了**，任务从主输出里缺了最关键的结尾。
 
-stitch 的做法：分段产物不动（episode 平面分区保持互斥、帧永远单一归属——**不做**「一帧属于两个任务」的多重归属），在 segment 之后、dedup 之前加一个缝合工位，把同一线索的碎片**并回一个信封**。产出是三级结构 **thread ⊃ fragment ⊃ step**：线索是「一个完整任务」，碎片记录「它曾被切成几段、每段从哪来」，步骤是跨碎片连续编号的动作序列。链序必须在去重之前——缝合改变成员集，判重面要看到最终线索；也必须在摘取之前——接缝处的「转移」是已知的任务中断，由 extract 机械占位、不烧调用（26.3）。
+stitch 的做法：分段产物不动（episode 平面分区保持互斥、帧永远单一归属——**不做**「一帧属于两个任务」的多重归属），在 segment 之后、dedup 之前加一个缝合算子，把同一线索的碎片**并回一个信封**。产出是三级结构 **thread ⊃ fragment ⊃ step**：线索是「一个完整任务」，碎片记录「它曾被切成几段、每段从哪来」，步骤是跨碎片连续编号的动作序列。链序必须在去重之前——缝合改变成员集，判重面要看到最终线索；也必须在摘取之前——接缝处的「转移」是已知的任务中断，由 extract 机械占位、不烧调用（26.3）。
 
 设计上最重要的一条脾气是**保守偏置**：LLM 面对杂乱屏幕流的系统性偏差方向是**过连接**（业界噪声消融的一致结论：宁可硬连也不愿说「以上皆非」），所以默认配置下并入一条线索要 **LLM 判「恢复」与机械先验命中两票都过**（合取，26.3）——错缝的代价高于漏缝：漏缝只是少拼一条完整记录，错缝是把两个任务的帧搅进同一条轨迹喂给下游。
 
@@ -85,7 +85,7 @@ stderr 尾部（真实运行，退出码 0，全程约 248 秒）：
 2026-07-23T04:50:32+08:00 INFO  run     batch=0 run.end exit_code=0
 ```
 
-53 帧进来，缝合出 **9 条线索**——主输出 8 行、每行一条线索，第 9 条（s2 的回复消息 3 帧）死在下游的轨迹打分上（`failed=1`：打分调用写满输出上限的 `output_truncated`，v1.11 的记录级拒绝，第 25 章 25.4——缝合层的账不受影响）。`batch.end` 里的两个 v1.9 新字段直接给出缝合总账：`stitched=4`（四个 episode 被并成了壳）、`threads=9`（= episodes 13 − stitched 4）。逐场景对上 26.1 的预期（会话级数字由主输出 + rejects + trace 汇出，report 是合计行）：
+53 帧进来，缝合出 **9 条线索**——主输出 8 行、每行一条线索，第 9 条（s2 的回复消息 3 帧）死在下游的轨迹打分上（`failed=1`：打分调用写满输出上限的 `output_truncated`，v1.11 的记录级拒收，第 25 章 25.4——缝合层的账不受影响）。`batch.end` 里的两个 v1.9 新字段直接给出缝合总账：`stitched=4`（四个 episode 被并成了壳）、`threads=9`（= episodes 13 − stitched 4）。逐场景对上 26.1 的预期（会话级数字由主输出 + rejects + trace 汇出，report 是合计行）：
 
 | 场景（会话） | 帧 | episodes | threads | stitched | seams | rescued_short | dropped_noise | absorbed | 冗余校验 threads = episodes − stitched |
 |---|--:|--:|--:|--:|--:|--:|--:|--:|---|
@@ -100,6 +100,18 @@ s2/s3/s4/s5 四行与设计预期严丝合缝：单交叉一缝一接缝、多�
 
 ## 26.3 机制：单调选池两遍缝合、机械先验合取与接缝标定
 
+先看全景——缝合在一个会话内的五步走线（各步机制本节逐段展开）：
+
+```mermaid
+flowchart LR
+    cand["候选流：会话内 episode + 救援候选（噪声帧不入池）"]
+    pass1["一遍：单调贪心选池（逐候选判 resume / new）"]
+    conj["保守合取：LLM 票 ∧ 机械先验至少一腿命中"]
+    pass2["二遍：有界复评（单碎片线索逐条再判）"]
+    seam["接缝标定：定案后零 LLM 机械占位"]
+    cand --> pass1 --> conj --> pass2 --> seam
+```
+
 **按会话独立执行，会话内严格串行。**候选流 = 会话内的 episode（按会话序）+（`rescue_short = true` 时）`below_min_len` 短段按**连续 run 重组**的救援候选——注意 `reason="noise"` 的噪声帧**不入候选池**（s1 的社交消息屏、s4 的低电量弹窗、负样本会话的五帧噪声从没资格参与缝合）。池是一个串行决策过程（前一个候选的归属影响后一个候选看到的池），所以会话内逐候选处理、会话间也按批内位置顺序逐会话处理，全程零随机、事件序确定——并发只出现在 `votes > 1` 的重复采样内部。
 
 **一遍：单调贪心选池。**每个候选一次 LLM 调用，提示词呈现池内全部开放线索的**摘要卡**（按最近活跃降序编号）+ 候选摘要卡，要求输出 `resume`（恢复第几条线索）或 `new`。摘要卡是判定证据的全部——逐行是：任务名、App 集合、序号跨度｜帧数｜碎片数、首帧摘要、尾帧摘要，外加一行「接续对（线索尾帧 → 候选首帧）变更」的结构化树 diff。证据面刻意停在**帧摘要级**：链序上 extract 还没跑，缝合时批内没有任何动作序列可用。三条关键规则：
@@ -108,7 +120,7 @@ s2/s3/s4/s5 四行与设计预期严丝合缝：单交叉一缝一接缝、多�
 - **救援候选永不开新线索**：池空直接跳过（零调用）维持 `dropped_noise`；池非空才判定，命中 → 并入 + 成员帧从 `dropped_noise` 翻回 `absorbed`（计 `rescued_short`，单位是帧），未命中（含判定失败）→ 原样留在拒绝通道；
 - **池满才封闭**（`max_open`，默认 4）：需要开新线索而池已满时，按「挂起跨度超 `stale_gap_steps` 者优先、LRU 兜底」逐出一条。封闭 ≠ 终结——被逐出的线索不再出现在一遍的卡集里，但仍是二遍复评的目标、照常产出。
 
-**保守合取（`bias = "conservative"`，默认）。**LLM 判 `resume` 只是一票，还要机械先验白名单**至少一腿命中**（析取三腿，确定性代码、零调用）：① `app_overlap`——App 集合交集非空；② `entity_overlap`——线索尾帧与候选首帧的可见文本实体重叠（正是 fixture 埋「蜀香园麻辣香锅」「湖畔云居酒店」跨断点实体的原因）；③ `same_page`——候选首帧回到线索某碎片尾帧的同一页面（页面标识 = app + activity，采集侧没把 activity 写进树的 `extra` 时该腿静默失效）。候选与线索尾的跨度超过 `stale_gap_steps`（默认 0 = 不启用）时先验**降格为须两腿命中**——挂得越久，恢复的证据要求越高。`bias = "llm"` 跳过先验（纯 LLM 判），只该在审计消融时用。
+**保守合取（`bias = "conservative"`，默认）。**LLM 判 `resume` 只是一票，还要机械先验白名单**至少一腿命中**（析取三腿，确定性代码、零调用）：`app_overlap`——App 集合交集非空；`entity_overlap`——线索尾帧与候选首帧的可见文本实体重叠（正是 fixture 埋「蜀香园麻辣香锅」「湖畔云居酒店」跨断点实体的原因）；`same_page`——候选首帧回到线索某碎片尾帧的同一页面（页面标识 = app + activity，采集侧没把 activity 写进树的 `extra` 时该腿静默失效）。候选与线索尾的跨度超过 `stale_gap_steps`（默认 0 = 不启用）时先验**降格为须两腿命中**——挂得越久，恢复的证据要求越高。`bias = "llm"` 跳过先验（纯 LLM 判），只该在审计消融时用。
 
 **二遍：有界复评（`repass = true`，默认）。**顺序贪心有一类结构性漏缝：处理 A 前半时 B 还没出现，A 后半来时判定官只看到「B 最活跃」的池，可能漏判。二遍把**一遍结束时的单碎片线索**逐个再判一次（池 = 会话内全部其他线索，活视图），命中则**方向反转**——候选并入目标线索、目标幸存。预算有界（≤ 单碎片线索数），这是增量聚类文献里「n=1 局部重聚类即可追平批处理质量」的工程对应物。
 
@@ -191,6 +203,26 @@ s2/s3/s4/s5 四行与设计预期严丝合缝：单交叉一缝一接缝、多�
 }
 ```
 
+这行的三级结构画出来是（thread ⊃ fragment ⊃ step，步序号跨碎片连续）：
+
+```mermaid
+flowchart TD
+    thread["thread 线索：顶层 order_span = [301, 315]（首末成员的包络）"]
+    frag1["fragment 创始碎片 cause=origin：order_span = [301, 303]"]
+    frag2["fragment 恢复碎片 cause=resumed：order_span = [307, 309]"]
+    frag3["fragment 恢复碎片 cause=resumed：order_span = [313, 315]"]
+    thread --> frag1
+    thread --> frag2
+    thread --> frag3
+    frag1 --> st1["step 步骤 0–1（真实转移）"]
+    frag2 --> st2["step 步骤 3–4（真实转移）"]
+    frag3 --> st3["step 步骤 6–7（真实转移）"]
+    st1 -.->|"接缝步 2（resumed=true）"| st2
+    st2 -.->|"接缝步 5（resumed=true）"| st3
+```
+
+图注：顶层 `order_span` 只是首末成员的**包络**——这个 [301, 315] 里含着 6 帧归属打车与备忘的异线索帧，下游切片必须用 `fragments[].order_span`（下方警句展开）。
+
 逐键读法：
 
 - **`fragments`** 是线索的装订记录：`cause` 三值——`origin`（一遍开线索的创始碎片）、`resumed`（判定并入的恢复碎片）、`rescued`（救援回来的短段碎片）；`source_episode` 是碎片并入前的原 episode id（拿它能在 trace 里找回那次判定），`rescued` 碎片的 `source_episode` 恒为 `null`——短段从没成过 episode。s4 那行的 fragments 是 `origin [401,404]` + `rescued [409,409]` 的两碎片形态，可对照着读。
@@ -221,13 +253,13 @@ emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed +
 左 = 8 + 0 + 0 + 0 + 8 + 1 + 0 + 45 + 4 = 66；右 = 53 + 0 + 0 + 13 = 66 ✓
 ```
 
-直觉读法：右侧每个 episode 都是凭空追加的新信封（+13），左侧的壳（+4）把「一个 episode 并进另一个」的抵扣记回来——所以 `threads = episodes − stitched` 恒成立，报告里 `counts.threads` 就是按这个恒等式导出的单点（那条 failed 的线索也在等式里：左侧 `failed=1` 记信封、其成员帧照旧记 `absorbed`）。extract 的账也变了口径：`stream.extract.transitions = 32` = 36 个相邻对 −4 个接缝占位——**占位步不计入 `transitions` 与 `by_type`**（零 LLM 的机械产物不该灌污动作分布；本例 `by_type` 是 `click: 30` + `input_text: 1` + `scroll: 1`，没有一个占位的 `app_switch` 混进来）。接缝的唯一计量点在 `stream.stitch.seams`。
+直觉读法：右侧每个 episode 都是凭空追加的新信封（+13），左侧的壳（+4）把「一个 episode 并进另一个」的抵扣记回来——所以 `threads = episodes − stitched` 恒成立，报告里 `counts.threads` 就是按这个守恒恒等式导出的单点（那条 failed 的线索也在等式里：左侧 `failed=1` 记信封、其成员帧照旧记 `absorbed`）。extract 的账也变了口径：`stream.extract.transitions = 32` = 36 个相邻帧对 −4 个接缝占位——**占位步不计入 `transitions` 与 `by_type`**（零 LLM 的机械产物不该灌污动作分布；本例 `by_type` 是 `click: 30` + `input_text: 1` + `scroll: 1`，没有一个占位的 `app_switch` 混进来）。接缝的唯一计量点在 `stream.stitch.seams`。
 
 ## 26.5 调优与审计闭环
 
 **穿插流的两个推荐配置动作**（都是既有配置键，`examples/stream` 实际用到并验证过的）。
 
-**① 给 `segment.context` 讲清楚「这是条穿插流」。**分段在缝合的上游，分段的口径直接决定缝合的输入质量：穿插流里「切回被搁置的任务」必须开新段（否则碎片根本切不出来），而弹窗类插入必须判噪声（否则救援池被垃圾污染）。本工程的实际配置（照抄可改）：
+**给 `segment.context` 讲清楚「这是条穿插流」。**分段在缝合的上游，分段的口径直接决定缝合的输入质量：穿插流里「切回被搁置的任务」必须开新段（否则碎片根本切不出来），而弹窗类插入必须判噪声（否则救援池被垃圾污染）。本工程的实际配置（照抄可改）：
 
 ```toml
 [segment]
@@ -236,14 +268,14 @@ context = "手机屏幕操作录屏流；流中各项活动（购物、通讯、
 
 四个要点全在里面：声明各活动**互为独立任务**（防止 LLM 把「打车去商场」脑补成「订酒店行程的一部分」而判 `advances` 不切段）；声明**切回挂起任务 = 新流程开始**（碎片由此切出，缝合由此有料可缝）；把 `advances` 钉死在**当前这一笔进行中的任务**上——办完收尾页之后的背靠背新任务、与几帧前被打断任务的实体呼应，都是 `context_switch` 不是 `advances`（这两句是对着真实漂移调出来的：早期短版 context 下，glm-5.2 偶发把 s1 的背靠背串联判成一整段、把 s4 的跨段实体呼应判成推进——语义边界句加上后同 seed 复跑稳定）；**枚举本域的弹窗噪声原型**（低电量、系统弹窗、通知面板、锁屏、广告——收敛 `interruption` 的口径）。一处诚实的边界记录：这条「切回 = 新流程」的声明在 v1.11 的多图窗口下也被套用到了 s1「噪声打断后的回归」上（帧 6 判 `context_switch`，25.5）——分段口径宁碎勿粘的偏置正是缝合层存在的理由，碎了的由它按实体证据并回（26.2 表注）。
 
-**② 给 `verify.extra_criteria` 说明构造事实。**线索是 N 个成员帧配 N−1 步（每相邻对一步，接缝是机械占位步），评审不知道这个构造，容易把「步数比帧数少一」误判成 `missing_members`。本工程的实际配置：
+**给 `verify.extra_criteria` 说明构造事实。**线索是 N 个成员帧配 N−1 步（每相邻帧对一步，接缝是机械占位步），评审不知道这个构造，容易把「步数比帧数少一」误判成 `missing_members`。本工程的实际配置：
 
 ```toml
 [verify]
 extra_criteria = "补充审核约定：动作序列恒为 成员帧数−1 步（每相邻帧对摘取一步，线索接缝为机械占位步），步数比成员帧数少一是构造使然，不构成 missing_members / missing_tail 的证据；标注摘要允许概括中间成员帧的可见内容（审核证据仅含首末帧截图），除非与所给证据直接矛盾，不因此判 label_mismatch"
 ```
 
-本次真跑走到评审的 8 条线索全部一轮 pass、缺陷表全零（含 `wrong_stitch: 0`；第 9 条死在更早的打分工位，没走到评审——26.2）——这行约定在早期调参轮里就是为了消掉「构造性误报」加上的，值得照抄进你自己的 stream×stitch 工程。
+本次真跑走到评审的 8 条线索全部一轮 pass、缺陷表全零（含 `wrong_stitch: 0`；第 9 条死在更早的打分算子，没走到评审——26.2）——这行约定在早期调参轮里就是为了消掉「构造性误报」加上的，值得照抄进你自己的 stream×stitch 工程。
 
 **审计：抽读 `stitch.judge`。**订阅 `stitch` 通道后每次判定一条事件，抽读法盯三处：`verdict` 与 `merged` 的分离（resume 而未并入 = 先验拦截，看 `priors` 缺了哪条腿——是证据真不足还是采集侧没给 activity）；`repass: true` 的事件（二遍修回来的漏缝有多少）；`task_name` 的滚动演化（s3 的线索名从开线索时的「在杭州搜索并预订湖畔云居酒店大床房」经两次并入滚动到「在杭州预订湖畔云居酒店大床房并完成支付，查看入住凭证」，说明摘要卡在跟着碎片长大）。`stitch.thread` 事件则是每条线索的定案快照（fragments + seam_indexes），拿它跟 `_meta.stream.fragments` 对账。
 
@@ -261,7 +293,7 @@ dry-run: 注：stream 估算：下游按 episodes≈sessions 报下界（LLM 精
 dry-run: no LLM calls made, no output written (report and trace only)
 ```
 
-`stitch_calls=10` = 5 会话 ×（一遍 1 + 二遍 1）× votes 1——估算沿用 stream 的「episodes ≈ sessions」下界口径（实跑 20 次判定）；quality/annotate/verify/classify 同理报下界、extract 报上界（48 = 剔噪前相邻对数，实跑 32）；`segment_calls=5` 在 v1.11 的预算装填下也是**上界**口径（按最坏装填量估——本工程装填顶格、恰好等于实跑窗数，拿 `report.stream.windows=5` 对账，第 25 章成本账）。实跑比估算多出的部分 = 下界口径差 + 12 次结构修复调用（trace 里 41 条 `schema.repair` 事件，29 条在 L1 确定性层免费解决、12 条走了 L3 修复环）。`votes` 的账见 26.6 末条。
+`stitch_calls=10` = 5 会话 ×（一遍 1 + 二遍 1）× votes 1——估算沿用 stream 的「episodes ≈ sessions」下界口径（实跑 20 次判定）；quality/annotate/verify/classify 同理报下界、extract 报上界（48 = 剔噪前相邻帧对数，实跑 32）；`segment_calls=5` 在 v1.11 的预算装填下也是**上界**口径（按最坏装填量估——本工程装填顶格、恰好等于实跑窗数，拿 `report.stream.windows=5` 对账，第 25 章成本账）。实跑比估算多出的部分 = 下界口径差 + 12 次结构修复调用（trace 里 41 条 `schema.repair` 事件，29 条在确定性修复层免费解决、12 条走了 LLM 修复环）。`votes` 的账见 26.6 末条。
 
 ## 26.6 常见问题
 
@@ -285,4 +317,4 @@ dry-run: no LLM calls made, no output written (report and trace only)
 
 **`votes` 是什么？该开吗？**判定稳定化采样：默认 `1`（单调用，不启用）；设为 ≥3 的**奇数**（偶数直接配置错误）时，同一判定采样 n 次，对 (verdict, thread_ref) 完整判定取**严格多数**——凑不齐严格多数（含 verdict 一致但 thread_ref 分裂）一律回落保守结局（episode 候选判 new、救援候选按未命中）。它的定位是「口头置信度门槛的正规替代」：治**漂移**（同一判定跨运行摇摆），不治**偏差**（系统性过连接）——所以它跟机械先验合取不可互替、只能叠加。成本直白：判定调用 ×n（n=3 时 stitch 全口径占比仍 <8%，同前缀采样吃 prompt 缓存）。开的时机：同 seed 重跑时 `stitch.judge` 的判定翻转可测，再开——本例 fixture 实体证据充足，votes=1 就五缝五中（4 次 episode 并入 + 1 次救援命中，全部双腿先验）。
 
-最后一份检查清单，开 stitch 前过一遍：`segment.enabled = true` 且分段口径按穿插流调过（26.5 ①）；`trace.channels` 加了 `"stitch"`；verify 开着的话 `extra_criteria` 写了构造约定（26.5 ②）；留了纯噪声负样本会话当门禁；下游知道一行 = 一条线索、切片用 `fragments[].order_span` 而不是顶层包络、接缝步认 `resumed` 标志了吗？
+最后一份检查清单，开 stitch 前过一遍：`segment.enabled = true` 且分段口径按穿插流调过（26.5 的穿插流声明）；`trace.channels` 加了 `"stitch"`；verify 开着的话 `extra_criteria` 写了构造约定（26.5 的构造事实说明）；留了纯噪声负样本会话当门禁；下游知道一行 = 一条线索、切片用 `fragments[].order_span` 而不是顶层包络、接缝步认 `resumed` 标志了吗？

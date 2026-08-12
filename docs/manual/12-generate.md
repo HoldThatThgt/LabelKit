@@ -4,15 +4,15 @@
 > 本章讲两种工作形态（扩充既有数据 / 从零合成）、多样性的三个来源，
 > 以及如何用报告里的桶统计判断"生成的货够不够新"。
 
-## 12.1 直觉：复制车间与它的纪律
+## 12.1 直觉：仿制车间与它的纪律
 
 把 generate 想成流水线旁边的**仿制车间**：从过了质检的好货里抽几件当样品，让 LLM 照着「风格与题材」仿制新货。纪律有三条，都是为了防止仿品污染货架：
 
-1. **仿品不直接上架**——相似度过滤分两道：第一道**内置在 generate 算子里**、无条件执行（新样本与种子、与同批样本互查，复用 `[dedup]` 的 MinHash 参数——这正是 Self-Instruct 的相似度过滤，`survived_dedup` 统计的就是它的战果）；第二道是生成子批**回流**流水线从 dedup 起重新走一遍（与全部原始记录及先前生成的样本查重）→ 打分 → 标注 → 校验。仿得太像样品的，第一道就被扣下。
+1. **仿品不直接上架**——相似度过滤分两道：第一道**内置在 generate 算子里**、无条件执行（新样本与种子、与同批样本互查，复用 `[dedup]` 的 MinHash 参数——这正是 Self-Instruct 的相似度过滤，`survived_dedup` 统计的就是它的战果）；第二道是生成子批**回流**流水线从 dedup 起重新走一遍（与全部原始记录及先前生成的样本判重）→ 打分 → 标注 → 校验。仿得太像样品的，第一道就被扣下。
 2. **只仿一轮**——生成子批不会再触发生成（不递归），杜绝「仿品的仿品」的近亲繁殖。
 3. **件件有出处**——每条合成记录带 `generated_from`（种子记录 id 列表）和 `generator`（{"llm", "style"}）双溯源，主输出里 `generator ≠ null` 就是合成货的统一标识。
 
-**仅文本模态可用**（LLM 造不出配套截图），这是启动时的硬约束。v1.8 又加一条：generate 与 stream 模式（`segment.enabled = true`，第 25 章）**互斥**——「照着 episode 仿制新的操作序列」属于路线图上的候选项（spec §8.3 O3），本版不做。
+**仅文本模态可用**（LLM 造不出配套截图），这是启动时的硬约束。v1.8 又加一条：generate 与流模式（`segment.enabled = true`，第 25 章）**互斥**——「照着 episode 仿制新的操作序列」属于路线图上的候选项（spec §8.3 O3），本版不做。
 
 ## 12.2 process 模式：给既有数据扩容
 
@@ -20,7 +20,7 @@
 
 1. **选种子**：批内 `active` 且聚合分 ≥ `seed_min_score` 的记录。`seed_min_score` 不填时自动取 `quality.threshold`；连 threshold 也没有就取批内中位数——**种子必须是好货**，这是仿制质量的根。
 2. **算调用数**：`⌈种子数 × num_per_record / num_per_call⌉`。默认 num_per_record=2（每种子期望产 2 条）、num_per_call=4（每次调用要 4 条）。
-3. **每次调用**：随机不放回抽 `seeds_per_call`（默认 3）条种子作为示例（v1.11 起这是**上限**：本次调用的目标档声明了 `context_window` 时，按抽样序**从尾部丢弃**种子直到装下——确定性收缩、至少留 1 条；连 1 条都装不下按 `context_overflow` 处置），system = `generate.instruction`（+ 风格模板，见 12.4），要求输出 `{"samples": ["...", ...]}` 恰好 num_per_call 条，经结构引擎校验。
+3. **每次调用**：随机不放回抽 `seeds_per_call`（默认 3）条种子作为示例（v1.11 起这是**上限**：本次调用的目标 profile 声明了 `context_window` 时，按抽样序**从尾部丢弃**种子直到装下——确定性收缩、至少留 1 条；连 1 条都装不下按 `context_overflow` 处置），system = `generate.instruction`（+ 风格模板，见 12.4），要求输出 `{"samples": ["...", ...]}` 恰好 num_per_call 条，经结构引擎校验。
 4. **构造新记录**：每条样本文本包成 `{text_field: 样本}` 的记录（id 规则与 ingest 相同），回流。
 
 调用失败（修复耗尽/重试耗尽）只损失**那一次调用**的样本——种子不受影响，也不产生 failed 记录；该次调用计入报告桶统计（calls 计入、produced 为 0）。
@@ -67,7 +67,7 @@ standalone_count = 500        # 目标产出条数（与 seed_examples 互斥）
 
 两种形态下合成记录的 `generated_from` 恒为空数组（种子不是记录、没有记录 id；种子本身留在 project.toml 里可审计），`generator` 照常携带——所以**判断一条记录是否合成，只看 `generator ≠ null`**。
 
-计数不变量退化为 `emitted + dropped_* + failed = generated`；产出 0 条不算错误（照常写报告、退出码 0）。
+守恒恒等式退化为 `emitted + dropped_* + failed = generated`；产出 0 条不算错误（照常写报告、退出码 0）。
 
 ## 12.4 多样性的三个旋钮
 

@@ -43,7 +43,7 @@ name = "detailed"
 prompt = "请求应包含具体的背景与约束条件（时间、对象、格式要求等）。"
 
 [dedup]
-enabled = true                    # 只控制产出是否再过一遍去重工位；生成品的 Self-Instruct
+enabled = true                    # 只控制产出是否再过一遍去重算子；生成品的 Self-Instruct
                                   # 相似度过滤内置在 generate 算子里、无条件执行（复用本节的
                                   # minhash_threshold 等参数），关掉本开关它也照跑。
                                   # 所以要紧的是别放松本节阈值——过滤器读的就是它
@@ -70,7 +70,7 @@ scanned=0  ingested=0  bad_input=0  generated=8
 dropped_dup=0  dropped_lowq=0  dropped_verify=0  failed=0  emitted=8
 ```
 
-纯生成模式的账目特征：`scanned=0`（没有输入这回事），守恒等式退化为 `emitted + dropped_* + failed = generated`（8 = 8 ✓）。本次 8 条全部活过去重——种子多样、温度 0.9，两次调用没产出雷同货。
+纯生成模式的账目特征：`scanned=0`（没有输入这回事），守恒恒等式退化为 `emitted + dropped_* + failed = generated`（8 = 8 ✓）。本次 8 条全部活过去重——种子多样、温度 0.9，两次调用没产出雷同货。
 
 产物长这样（前三行，已剥 `_meta`）：
 
@@ -80,7 +80,7 @@ dropped_dup=0  dropped_lowq=0  dropped_verify=0  failed=0  emitted=8
 {"intent": "qa", "topic": "儿童科普绘本推荐", "difficulty": "easy"}
 ```
 
-注意：**合成品拿到的是和真实数据完全一样的待遇**——先被打分（`_meta.scores` 俱全）、再被标注、结构照样过 Schema 引擎。这就是「产物照常走全套治理」的含义。
+注意：**合成品拿到的是和真实数据完全一样的待遇**——先被打分（`_meta.scores` 俱全）、再被标注、结构照样过结构引擎。这就是「产物照常走全套治理」的含义。
 
 ## 22.3 溯源与桶统计
 
@@ -105,7 +105,7 @@ report.json 的桶统计：
 
 `survived_dedup / produced = 8/8 = 100%`——新颖率满分。当你看到某桶掉到 60% 以下，按第 12.5 节的顺序处置（改 style prompt → 提温度/加模型 → 降 num_per_call），**别放松 dedup**。
 
-## 22.4 变奏一：规模化 + 质量闸
+## 22.4 变奏一：规模化 + 质量门
 
 把这个玩具工程变成能交付的合成数据管线，加三样东西：
 
@@ -127,7 +127,7 @@ llm = "judge"
 policy = "drop"
 ```
 
-合成数据的特殊风险是 **model collapse**（第 12 章）：模型生成的数据再喂给模型，分布会收窄。工程上的三道保险：质量闸（threshold）拦住平庸品、dedup 拦住重复品、`generator` 字段让下游随时能控制真实:合成配比。
+合成数据的特殊风险是 **model collapse**（第 12 章）：模型生成的数据再喂给模型，分布会收窄。工程上的三道保险：质量门（threshold）拦住平庸品、dedup 拦住重复品、`generator` 字段让下游随时能控制真实:合成配比。
 
 ## 22.5 变奏二：无种子形态（standalone_count）
 
@@ -154,7 +154,7 @@ standalone_count = 200            # 目标产出条数；调用数 = ⌈200/4⌉
 ## 22.6 本教程的可迁移结论
 
 1. 纯生成的账目先心算再开跑：调用数与产出量都是配置的确定函数；
-2. 合成品走全套治理不是仪式——Self-Instruct 相似度过滤由 generate **内置**实现（`survived_dedup` 即其产物，复用 `[dedup]` 的 MinHash 参数、不受 enabled 开关影响），质量闸是 collapse 的保险；
+2. 合成品走全套治理不是仪式——Self-Instruct 相似度过滤由 generate **内置**实现（`survived_dedup` 即其产物，复用 `[dedup]` 的 MinHash 参数、不受 enabled 开关影响），质量门是 collapse 的保险；
 3. `generator` / `generated_from` 的语义（后者纯生成下恒空）决定了你下游怎么分拣；
 4. 桶统计 = 多样性的验收单：盯 `survived_dedup / produced`；
 5. 小规模下随机抽取（style、weighted 模型）有方差，配比敏感就拆工程或上规模。

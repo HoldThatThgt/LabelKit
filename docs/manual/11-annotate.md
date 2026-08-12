@@ -1,6 +1,6 @@
 # 第 11 章　标注算子 annotate：把你的意图翻译给模型
 
-> annotate 是流水线的「主产出」工位：它把每条存活记录变成一个符合你 Schema 的标注对象。
+> annotate 是流水线的「主产出」算子：它把每条存活记录变成一个符合你 Schema 的标注对象。
 > 本章讲提示词是如何组装的（这决定了你该怎么写 instruction 和 few-shot）、
 > self-consistency 投票何时值得开，以及标注质量上不去时先查什么。
 
@@ -36,7 +36,7 @@ user (当前记录):
 
 - **你的 Schema 就在提示词里**——字段名、枚举值、描述（`description`）模型都看得见。所以 **Schema 本身就是提示词的一部分**：枚举值取有意义的名字、给字段写 description，都会直接改善标注质量（第 14 章展开）。
 - **few-shot 示例是独立的 user 消息**，出现在当前记录之前。示例的 `output` 在启动时就被校验必须通过你的 Schema——你不可能用一个非法示例教坏模型。
-- **UI 模态是「图 + 结构文本」双通道**：模型同时看到截图和控件树的线性化文本（每节点一行：`角色 "文本" [边界框] {属性}`，只保留可见节点，超出 `input.ui_tree_max_chars` 深度优先截断）。这是 ScreenAI 等 GUI 理解工作的标准输入表示——图提供视觉语境，树提供精确的文本与坐标。v1.11 起 `ui_tree_max_chars` 是绝对天花板：所引档声明 `context_window` 后，树的实际渲染上限按预算份额动态收缩（超预算按行丢尾、截断标记保留，第 7 章）。
+- **UI 模态是「图 + 结构文本」双通道**：模型同时看到截图和控件树的线性化文本（每节点一行：`角色 "文本" [边界框] {属性}`，只保留可见节点，超出 `input.ui_tree_max_chars` 深度优先截断）。这是 ScreenAI 等 GUI 理解工作的标准输入表示——图提供视觉语境，树提供精确的文本与坐标。v1.11 起 `ui_tree_max_chars` 是绝对天花板：所引 profile 声明 `context_window` 后，树的实际渲染上限按预算份额动态收缩（超预算按行丢尾、截断标记保留，第 7 章）。
 
 一份组装结果（第 3 章的意图标注工程，另加 1 条 few-shot 作演示——该工程本身未配 `examples`）：
 
@@ -64,14 +64,14 @@ user:
 
 关键帧数量由 `annotate.sequence_frames` 控制（默认 20，合法范围 **[2, 100]**）：成员数超过它时按确定性降采样选帧，首帧与末帧恒被保留；v1.9 起降采样**按碎片配额**分配——线索（第 26 章）的每个碎片按成员占比分名额且**至少保底 1 帧**，防止小碎片（如救援回来的单帧收尾）被均匀采样整段抽空；未开缝合时线索只有一个碎片，配额法退化回等距采样。把它调到 **20 以上要当心一个供应商硬约束**：Anthropic 端点对「单请求超过 20 张图」的请求，任何一张图长边超过 2000px 就直接 400 **硬拒**（不是自动缩小）——而 `max_image_px` 默认恰是 2048。所以 M1 在「`sequence_frames > 20` 且所引 profile `max_image_px > 2000`」时会打警告：要么把 `max_image_px` 降到 ≤ 2000，要么降帧数。
 
-v1.11 起 `sequence_frames` 升格为**上限**：所引档声明 `context_window`（第 6 章）后，实际关键帧数按预算剩余动态收缩——`k_eff = min(sequence_frames, max(2, ⌊图片份额 / 每图成本⌋))`，首末帧恒保留、中间照旧均匀降采样。份额定序是「图片先于文本让步」：文本摘要是裁决的兜底证据、token 效率也高于像素；k = 2 仍装不下再回头按「首末恒保留、丢中段」裁文本块，最后才按 `context_overflow` 记录级拒收。运行期另有两条自动换档：端点报上下文溢出时，该次标注**减帧保清重试**（k 减半、min 2，至多两次降级，仍溢出按 `context_overflow` 拒收）；verify 判 fail 且 `policy = "repair"` 时，修复重标注按**质量阶梯换档**——关键帧数减半、分辨率上探一档（`default_image_px` × 1.5/维，封顶 `max_image_px`，第 13 章）。与上一段警告的交互：那条警告盯的是 `max_image_px` 这个**天花板**而非日常工作点——就算 `default_image_px` 调得很低，修复升档仍可能探到天花板，所以躲 Anthropic 多图硬拒要压的始终是 `max_image_px`（≤ 2000）或帧数。
+v1.11 起 `sequence_frames` 升格为**上限**：所引 profile 声明 `context_window`（第 6 章）后，实际关键帧数按预算剩余动态收缩——`k_eff = min(sequence_frames, max(2, ⌊图片份额 / 每图成本⌋))`，首末帧恒保留、中间照旧均匀降采样。份额定序是「图片先于文本让步」：文本摘要是裁决的兜底证据、token 效率也高于像素；k = 2 仍装不下再回头按「首末恒保留、丢中段」裁文本块，最后才按 `context_overflow` 记录级拒收。运行期另有两条自动换档：端点报上下文溢出时，该次标注**减帧保清重试**（k 减半、min 2，至多两次降级，仍溢出按 `context_overflow` 拒收）；verify 判 fail 且 `policy = "repair"` 时，修复重标注按**质量阶梯换档**——关键帧数减半、分辨率上探一档（`default_image_px` × 1.5/维，封顶 `max_image_px`，第 13 章）。与上一段警告的交互：那条警告盯的是 `max_image_px` 这个**天花板**而非日常工作点——就算 `default_image_px` 调得很低，修复升档仍可能探到天花板，所以躲 Anthropic 多图硬拒要压的始终是 `max_image_px`（≤ 2000）或帧数。
 
 ### 帧级标注（v1.12）：序列行内的逐成员第二层
 
 流模式还有一层可选的帧粒度标注（`[frame.annotate]`，仅 `segment.enabled` 时可开——机制与真实产物在第 25 章 25.6）：序列级标注完成后，annotate 对 episode 的每个成员帧**再各做一次独立标注**，每成员一次调用，产物挂 `_meta.stream.members[].annotation` 随序列行交付。提示词模板与单记录标注同构——`[任务]` + 帧 Schema 全文嵌入 + 当前成员帧（text 模态 = 该行文本；ui 模态 = 截图 + 控件树摘要），变的只是「当前记录」换成单个成员帧。三件事与序列级标注不同：
 
 - **全局指令 vs 按帧类覆盖**：`frame.annotate.instruction` 是全局帧标注指令（enabled 时必填，few-shot 走 `frame.annotate.examples`）；开了帧分类（`[frame.classify]`）后可在 `[frame.class.<帧类名>.annotate]` 里按帧类覆盖 `instruction` / `examples`，或 `enabled = false` 整类跳过标注（第 24 章 24.8）——`examples/mix` 的两个工程各演示一套：UI 主工程给 form_screen 表单屏覆盖「抽表单字段与取值」的指令、给 transition 过渡屏整类跳过，文本姊妹工程给 task_request 覆盖、给 chitchat 跳过（第 25 章 25.6）；帧分类关闭时全员用全局指令。帧级**没有** self-consistency——在 `[frame.annotate]` 里显式写 `self_consistency` 是定向配置错误。
-- **独立的帧 Schema**：`frame.annotate.schema_path` / `schema_inline` **恰一**，与 `output.schema` 互相独立——「帧对象长什么样」与「序列行长什么样」是两份契约，各自过 draft 2020-12 元校验、各自的 examples 各自启动干跑。结构保障走同一结构引擎，但**不经 L2.5 用户回调**（第 14 章 14.5）。
+- **独立的帧 Schema**：`frame.annotate.schema_path` / `schema_inline` **恰一**，与 `output.schema` 互相独立——「帧对象长什么样」与「序列行长什么样」是两份契约，各自过 draft 2020-12 元校验、各自的 examples 各自启动干跑。结构保障走同一结构引擎，但**不经代码回调校验层**（第 14 章 14.5）。
 - **失败去向不是 rejects**：成员标注修复穷尽 ⇒ 该成员在 members[] 里 `status="failed"`、`annotation=null`——**不写 rejects 行、不触发 `--strict`**，episode 照常发射；账记在 `report.stream.frame_annotate.failed`，逐成员审计走 trace 的 `annotate.frame` 事件（第 16 章）。与 11.6 的记录级失败语义对照着记：序列级标注失败死的是整条记录，帧级标注失败死的只是一个状态位。
 
 ## 11.3 配置参考

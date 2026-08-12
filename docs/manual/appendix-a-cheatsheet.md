@@ -15,31 +15,31 @@
 | `console.heartbeat_s` | int | 0 | 仅 plain 且非 TTY：每 N 秒一行数据无关心跳；**0=关（默认），<0 即配置错误** | 6/16 |
 | `console.estimate` | bool | false | 仅文本模态：多读一遍输入换批总数分母 + ETA；UI 模态恒有分母、本键无效 | 6/16 |
 | `console.interactive` | bool | true | rich ∧ stdin TTY ∧ termios 可用时启用键盘开关（`? l e + - p q`；h=?）；false=纯渲染 | 6/16 |
-| `llm.<name>` | table | ≥1 个 | LLM 接入档，name 被 project 引用 | 6 |
+| `llm.<name>` | table | ≥1 个 | LLM profile，name 被 project 引用 | 6 |
 | `llm.*.provider` | str | 必填 | "openai_compatible" \| "anthropic" | 6 |
 | `llm.*.base_url` | str | 必填 | API 根地址（不带 /chat/completions） | 6 |
 | `llm.*.model` | str | 必填 | 模型名，原样透传 | 6 |
 | `llm.*.api_key_env` | str | 必填* | 密钥的**环境变量名**（被引用才检查存在性）；* v1.6 起与 `api_key_envs` **恰设其一** | 2/6 |
-| `llm.*.api_key_envs` | array | 不设 | v1.6 密钥池：环境变量名数组，与 `api_key_env` **互斥（恰设其一）**；池内共享该档其余字段（同 base_url、同 model），被引用时**每个**变量都须存在非空 | 6/17 |
-| `llm.*.max_concurrency` | int | 8 | 并发信号量（该档全部调用共享；**密钥池仍是全池总在途上限**） | 6/17 |
+| `llm.*.api_key_envs` | array | 不设 | v1.6 密钥池：环境变量名数组，与 `api_key_env` **互斥（恰设其一）**；池内共享该 profile 其余字段（同 base_url、同 model），被引用时**每个**变量都须存在非空 | 6/17 |
+| `llm.*.max_concurrency` | int | 8 | 并发信号量（该 profile 全部调用共享；**密钥池仍是全池总在途上限**） | 6/17 |
 | `llm.*.timeout_s` | int | 120 | 单请求超时；超时可重试 | 6 |
 | `llm.*.max_retries` | int | 5 | 可重试错误（网络/408/409/429/5xx）上限 | 6 |
 | `llm.*.retry_base_delay_s` | float | 1.0 | 全抖动退避基数：random(0, 基数×2^i)，封顶 60s | 6 |
-| `llm.*.supports_structured_output` | bool | false | true 启用结构引擎 L0；**模型不支持别乱填** | 6/14 |
+| `llm.*.supports_structured_output` | bool | false | true 启用结构引擎的结构化输出层；**模型不支持别乱填** | 6/14 |
 | `llm.*.supports_vision` | bool | false | **UI 模态引用者必须 true（启动校验）** | 6 |
 | `llm.*.max_output_tokens` | int | 4096 | 太小→输出截断→**v1.11 终局化为记录级拒收 `output_truncated`（不进修复环）**；声明 context_window 后还整段挤占输入预算 | 6/14/17 |
 | `llm.*.context_window` | int | 0 | v1.11 上下文预算：**0=未声明=预算关**（被启用阶段引用时 WARN 一次）；>0 保证每次调用 est(输入)+max_output_tokens+margin ≤ 窗口（margin=max(256, ⌈10%×窗口⌉)），装不下的记录按 context_overflow 记录级拒收；须 > max_output_tokens+margin 否则预算非正=配置错误；**声明部署实效窗口、欠声明恒安全** | 6/17/18 |
-| `llm.*.temperature` | float | 0.0 | 档级默认；生成阶段由 generate.temperature 覆盖 | 6 |
+| `llm.*.temperature` | float | 0.0 | profile 级默认；生成阶段由 generate.temperature 覆盖 | 6 |
 | `llm.*.max_image_px` | int | 2048 | 图像长边上限，超出等比缩小；v1.11 升格：**升级天花板 + provider 像素制硬限制域**（日常发送尺寸看 default_image_px 工作点） | 6/21 |
 | `llm.*.default_image_px` | int | 0 | v1.11 图片采样默认工作点（长边 px）：**0=沿用 max_image_px**；>0 须 ≤ max_image_px（违反=配置错误）；verify 修复换档可逐档上探至 max_image_px | 6/13 |
 | `llm.*.price_per_mtok_in/_out` | float | 不设 | 配了才有 est_cost_usd | 6/17 |
-| `embedding.<name>` | table | 可选 | 语义去重向量档 | 6/9 |
+| `embedding.<name>` | table | 可选 | 语义去重的 embedding profile | 6/9 |
 | `embedding.*.provider` | str | "openai_compatible" | **唯一取值**；POST {base_url}/embeddings | 6 |
-| `embedding.*.base_url/model/api_key_env` | str | 必填 | 同 LLM 档 | 6 |
+| `embedding.*.base_url/model/api_key_env` | str | 必填 | 同 LLM profile | 6 |
 | `embedding.*.api_key_envs` | array | 不设 | v1.6 密钥池，机制同 `llm.*.api_key_envs`（与 `api_key_env` 恰设其一） | 6/17 |
 | `embedding.*.max_concurrency/timeout_s/max_retries/retry_base_delay_s` | — | 8/60/5/1.0 | 同一套重试限流机制 | 6 |
 | `embedding.*.dims` | int | 不设 | 设了则校验返回维度，不符判致命 | 6 |
-| `embedding.*.context_window` | int | 0 | v1.11：同 llm 档声明制（**0=未声明=预算关**）；>0 预算 = context_window − margin（无输出预留），embed 输入超预算按确定性**头部保留**截断 | 6/9 |
+| `embedding.*.context_window` | int | 0 | v1.11：同 llm profile 声明制（**0=未声明=预算关**）；>0 预算 = context_window − margin（无输出预留），embed 输入超预算按确定性**头部保留**截断 | 6/9 |
 
 ## A.2 project.toml — [run] / [input]
 
@@ -53,13 +53,13 @@
 | `run.batch_size` | 256 | 批大小 = **pairwise 比较池大小（质量口径参数）** | 7/10 |
 | `run.seed` | 0 | 全部随机行为的种子；同 seed 可复现 | 7 |
 | `run.fatal_error_threshold` | 20 | 熔断：**连续**致命 API 错误数达标 ⇒ 退出码 4（401/403 认证类首错即熔断，不计连续数；重试耗尽也计窗） | 7/17 |
-| `run.max_park_s` | 3600 | v1.6 驻留上限：所引档**全部存活密钥均在冷却**时，单次逻辑调用累计等待秒数上限，超限按重试耗尽处理（记录 failed、计入熔断窗）；**0=不驻留，单密钥档下任何 429 都立即失败**，仅建议多密钥池设 0 | 7/17 |
+| `run.max_park_s` | 3600 | v1.6 驻留上限：所引 profile **全部存活密钥均在冷却**时，单次逻辑调用累计等待秒数上限，超限按重试耗尽处理（记录 failed、计入熔断窗）；**0=不驻留，单密钥 profile 下任何 429 都立即失败**，仅建议多密钥池设 0 | 7/17 |
 | `input.text_field` | "text" | 正文字段点路径；**写错=全员坏行** | 5 |
 | `input.on_bad_line` | "skip" | \| "fail"（退出码 3） | 5 |
 | `input.on_missing_pair` | "skip" | UI 缺对策略 | 5 |
 | `input.on_index_conflict` | **"fail"** | UI 同号多文件；默认就退出 | 5 |
 | `input.max_image_mb` | 20 | 单图上限，超限跳过 | 5 |
-| `input.ui_tree_max_chars` | 30000 | 树序列化进提示词的**绝对上限**；v1.11：所引档声明 context_window 后按预算份额动态收缩（按行丢尾、truncated 标记保留） | 5/11 |
+| `input.ui_tree_max_chars` | 30000 | 树序列化进提示词的**绝对上限**；v1.11：所引 profile 声明 context_window 后按预算份额动态收缩（按行丢尾、truncated 标记保留） | 5/11 |
 
 ## A.3 project.toml — [dedup]
 
@@ -73,8 +73,8 @@
 | `image_phash_max_distance` | 8 | 64-bit pHash 汉明距离阈值 | 9 |
 | `ui_dup_requires` | "both" | \| "tree" \| "image"；both 防误杀同模板界面 | 9 |
 | `bounds_quantize_px` | 4 | 树坐标量化粒度（抗渲染抖动） | 9 |
-| `semantic` | false | 第④层语义去重开关（要花 embedding 钱） | 9 |
-| `semantic_embedding` | semantic=true 必填 | 引用 [embedding.*] 档名 | 9 |
+| `semantic` | false | 判重语义层开关（要花 embedding 钱） | 9 |
+| `semantic_embedding` | semantic=true 必填 | 引用 [embedding.*] profile 名 | 9 |
 | `semantic_threshold` | 0.95 | 余弦相似度判重线 | 9 |
 
 ## A.4 project.toml — [quality]
@@ -82,15 +82,15 @@
 | 键 | 默认 | 一句话 | 章 |
 |---|---|---|---|
 | `enabled` | **true** | 与 annotate 至少开一个 | 10 |
-| `mode` | "pairwise" | 批内相对（锦标赛）\| "pointwise" 绝对刻度 | 10 |
-| `llm` | "default" | 单评审时的裁决档 | 10 |
-| `rounds` | 4 | pairwise 轮数 k（每记录参赛 k 次，调用 ≈ N·k/2） | 10 |
+| `mode` | "pairwise" | 批内相对两两比较 \| "pointwise" 绝对刻度 | 10 |
+| `llm` | "default" | 单评审时的裁决 profile | 10 |
+| `rounds` | 4 | pairwise 轮数 k（每记录被比较 k 次，调用 ≈ N·k/2） | 10 |
 | `criteria_per_call` | "all" | 一次裁决全部准则 \| "single" 每准则一问（×C 成本） | 10 |
 | `threshold` | 不设 | 聚合分过滤线 [0,1]；**不设=只打分不过滤**；pairwise 下是批内百分位线 | 10 |
 | `selection` | "threshold" | \| "top_ratio"；**两机制互斥** | 10 |
 | `top_ratio` | selection=top_ratio 必填 | (0,1]，批内保留 ceil(ratio×**已打分**存活数) 条；selection 为 threshold 时设置无效（启动打 warning） | 10 |
-| `judges` | [] | 评审团（奇数个档名）；非空**替代** quality.llm；成本× | 10 |
-| `both_orders` | false | 正反双序一致才记胜负；成本 ×2 | 10 |
+| `judges` | [] | 评审团（奇数个 profile 名）；非空**替代** quality.llm；成本× | 10 |
+| `both_orders` | false | 正反双顺序一致才记胜负；成本 ×2 | 10 |
 | `on_unscored` | "keep" | 全部比较失败的记录去留；keep 不占 top_ratio 名额 | 10 |
 | `rubric` | 按模态自动 | "default:text" \| "default:ui" \| "default:trajectory"（v1.8 轨迹四准则）\| "inline"（须配 [[rubric.criteria]]）；缺省按模态选，**segment 开启时缺省解析为 default:trajectory** | 10/B |
 | `judgment_reasons` | "auto" | 裁决附理由；auto=开了 quality trace 才要 | 10/16 |
@@ -101,7 +101,7 @@
 | 键 | 默认 | 一句话 | 章 |
 |---|---|---|---|
 | `enabled` | false | 仅 text 模态；process 下要求 quality 开 | 12 |
-| `llms` | ["default"] | 档名数组；每次调用选 1 个 | 12 |
+| `llms` | ["default"] | profile 名数组；每次调用选 1 个 | 12 |
 | `mixture` | "round_robin" | \| "weighted"（配 weights） | 12 |
 | `weights` | [] | weighted 必填：正数、长度=len(llms) | 12 |
 | `instruction` | enabled 必填 | 生成指令（收放心法见 12.7） | 12 |
@@ -109,7 +109,7 @@
 | `seeds_per_call` | 3 | 每次调用抽几条种子当示例；v1.11：声明预算后为**上限**——超预算按抽样序从尾部确定性丢弃，min 1 | 12 |
 | `num_per_call` | 4 | 每次调用要求产出条数 | 12 |
 | `seed_min_score` | 自动 | 种子门槛：默认 quality.threshold，再缺省批中位数 | 12 |
-| `temperature` | 0.9 | 生成温度（覆盖档默认） | 12 |
+| `temperature` | 0.9 | 生成温度（覆盖 profile 默认） | 12 |
 | `sample_validator` | 不设 | 样本级代码回调 "module:function"：过滤语义，剔除计入桶 rejected_by_validator | 12 |
 | `seed_examples` | [] | generate_only 种子池形态（process 不得设） | 12/22 |
 | `standalone_count` | 不设 | generate_only 无种子形态目标条数（与 seed_examples 互斥；process 不得设） | 12/22 |
@@ -124,8 +124,8 @@
 | `annotate.instruction` | enabled 必填 | 写法指南 11.4 | 11 |
 | `annotate.examples` | [] | few-shot {input, output}；output 启动时过 Schema 校验 | 11 |
 | `annotate.self_consistency` | 0 | 0=关；≥3 奇数：n 次采样字段级投票，成本 ×n | 11 |
-| `annotate.sc_temperature` | 0.7 | SC 各次采样温度（多样性来源） | 11 |
-| `annotate.sequence_frames` | 20 | v1.8 序列标注单请求最大关键帧数，∈ **[2, 100]**；超员按等距降采样（首末帧恒含）；**>20 且所引档 max_image_px>2000 ⇒ WARN**（Anthropic 多图请求硬拒）；非 stream 显式设置 ⇒ no-op warning；v1.11：升格为**上限**——声明 context_window 后实际帧数 k_eff 按图片预算收缩（首末帧恒保留，min 2） | 11/25 |
+| `annotate.sc_temperature` | 0.7 | 自洽采样各次采样温度（多样性来源） | 11 |
+| `annotate.sequence_frames` | 20 | v1.8 序列标注单请求最大关键帧数，∈ **[2, 100]**；超员按等距降采样（首末帧恒含）；**>20 且所引 profile max_image_px>2000 ⇒ WARN**（Anthropic 多图请求硬拒）；非 stream 显式设置 ⇒ no-op warning；v1.11：升格为**上限**——声明 context_window 后实际帧数 k_eff 按图片预算收缩（首末帧恒保留，min 2） | 11/25 |
 | `verify.enabled` | false | 开则要求 annotate 开 | 13 |
 | `verify.llm` | "judge" | enabled 且 judges 为空时须存在于 [llm.*]（judges 非空即被替代、免校验）；建议独立于标注模型 | 13 |
 | `verify.judges` | [] | 评审团（奇数个）；非空替代 verify.llm | 13 |
@@ -138,14 +138,14 @@
 | 键 | 默认 | 一句话 | 章 |
 |---|---|---|---|
 | `output.schema_path` / `schema_inline` | 恰一 | 用户 Schema（draft 2020-12，顶层 object，禁 _meta） | 14 |
-| `output.max_repair_attempts` | 2 | 结构引擎 L3 轮数预算 | 14 |
-| `output.repair_llm` | 同调用方 | 修复专用档（可指便宜小模型） | 14 |
-| `output.validator` | 不设 | L2.5 代码回调 "module:function"：业务级硬校验，违规回喂修复环；启动校验含 few-shot 干跑 | 14 |
+| `output.max_repair_attempts` | 2 | 结构引擎 LLM 修复环轮数预算 | 14 |
+| `output.repair_llm` | 同调用方 | 修复专用 profile（可指便宜小模型） | 14 |
+| `output.validator` | 不设 | 代码回调校验层（"module:function"）：业务级硬校验，违规回喂修复环；启动校验含 few-shot 干跑 | 14 |
 | `output.meta_mode` | "inline" | \| "sidecar"（{stem}.meta.jsonl）\| "none"（丢分数溯源，不推荐） | 8 |
 | `output.passthrough_fields` | [] | 输入字段透传至 _meta.source.fields | 8 |
 | `output.rejects` | "refs" | "none" \| "refs"（无数据内容）\| "full"（含原文=数据副本） | 8 |
 | `trace.enabled` | false | 事件流开关 | 16 |
-| `trace.path` | {stem}.trace.jsonl | 首个事件写出时截断（速败运行不再触碰；dry-run 写 `{名}.dryrun{后缀}` 独立文件） | 16 |
+| `trace.path` | {stem}.trace.jsonl | 首个事件写出时截断（死于启动校验的运行不再触碰；dry-run 写 `{名}.dryrun{后缀}` 独立文件） | 16 |
 | `trace.channels` | ["quality","verify","schema"] | 十一通道：ingest/segment（v1.8）/stitch（v1.9）/dedup/classify（v1.7）/extract（v1.8）/quality/annotate/verify/schema/llm；默认值不变，分类/分段/缝合/摘取判决须显式订阅对应通道 | 16/24/25/26 |
 | `trace.content` | "refs" | none→refs→excerpt→full 四档脱敏；full=完整数据副本 | 16 |
 
@@ -158,41 +158,41 @@
 5. `quality.threshold` ⨯ `selection="top_ratio"` 互斥
 6. `generate_only` ⇒ `seed_examples` 与 `standalone_count` **恰好设置其一**（同时设置或均缺省都报错）；process 模式下两键均不得设置
 7. judges 数组非空须奇数且成员存在于 [llm.*]
-8. UI 模态被引用的 LLM 档须 `supports_vision=true`
+8. UI 模态被引用的 LLM profile 须 `supports_vision=true`
 9. `weighted` ⇒ weights 正数且长度=len(llms)
 10. `self_consistency` ∈ {0} ∪ {≥3 奇数}
-11. `dedup.semantic = true` ⇒ `semantic_embedding` 必填，且引用的档名须存在于 config.toml `[embedding.*]`
+11. `dedup.semantic = true` ⇒ `semantic_embedding` 必填，且引用的 profile 名须存在于 config.toml `[embedding.*]`
 12. `output.validator` / `generate.sample_validator` ⇒ 须为可导入、可调用的 `"module:function"`；前者还须让全部 few-shot 示例 output 干跑通过
 13. `classify.enabled = true` ⇒ `[[classify.classes]]` ≥ 2 项，且 `classify.fallback_class` 必填并 ∈ classes（v1.7）
 14. `classify.max_labels` 仅 `assignment = "multi"` 可设，∈ [2, 类别数]（缺省回填为类别数）
 15. `classify.enabled = false` 而 `[[classify.classes]]` / `[class.*]` 在场 ⇒ 仅 **warning**（一次、点名被忽略的表——「留配置、关开关」合法，不触发退出码 2）
 16. `segment.enabled = true` ⇒ `run.mode = "process"` ∧ `generate.enabled = false` ∧ `annotate.enabled = true`（v1.8）
 17. `extract.enabled = true` ⇒ `segment.enabled = true` ∧ `run.modality = "ui"`（v1.8）
-18. stream 的 vision 校验逐阶段（v1.8）：`extract.llm` **恒**须 supports_vision；`segment.llm` **恒不入 vision 校验集**（v1.11——窗口是否附图由所引档 `supports_vision` 自动推导为解析产物 `vision_resolved`，原 `use_vision` 键已移除，见第 22 条）；`quality.llm` **免除**、`stitch.llm`（v1.9）**恒免除**（两者都是纯文本判定）；v1.12 帧粒度分列：`frame.annotate.llm` ui ∧ enabled 时**恒**须 supports_vision（截图是帧标注主证据），`frame.classify.llm` **恒不入 vision 校验集**（附图与否自动推导，同 segment 形制——省钱面 = 指向纯文本档）；`stream.gap_s` / `session_max_span_s` 仅 `order_by = "meta:*"` 可设（meta:* 仅文本模态）
-19. `[stream]` / `[segment]` / `[stitch]`（v1.9）/ `[extract]` 任一节在场而 `segment.enabled = false` ⇒ 仅 **warning**（同第 15 条形制）；`segment.window` ≥ 2；`annotate.sequence_frames` ∈ [2, 100]
-20. `stitch.enabled = true` ⇒ `segment.enabled = true`（v1.9）；启用时 `stitch.llm` 计入密钥/probe/存在性引用集但**不入 vision 集**；`[class.<name>.stitch]` 不存在（链序在 classify 之前，类标签尚不存在）
-21. `stitch.votes` 须为 ≥1 的**奇数**（偶数 = 退出码 2，v1.9）；`stitch.enabled = true` ∧ `segment.strategy = "rules"` ⇒ 仅 **warning**（规则分段不做语义精化，可缝证据薄）；`[stitch]` 带非开关键而 stitch 关、segment 开 ⇒ 仅 **warning**（segment 也关时并入第 19 条名单）
-22. `[segment]` 内显式出现 `use_vision` ⇒ **配置错误**（v1.11 移除键定向报错，**不走**「未知键仅 warning」兜底）：窗口是否附图由 `segment.llm` 所指档的 `supports_vision` 自动决定；需纯文本裁决请把 `segment.llm` 指向纯文本档
-23. 上下文预算硬校验（v1.11）：`context_window` > 0 时须 > `max_output_tokens + margin`（margin = max(256, ⌈0.10 × context_window⌉)），否则预算非正 ⇒ 配置错误；`default_image_px` > 0 时须 ≤ `max_image_px`；静态系统侧预检——启用阶段的静态 prompt 部件（模板 + instruction + rubric/类表/Schema/few-shot）估算 ≥ 该档输入预算 ⇒ 配置错误（任何记录都装不下）；segment 装填护栏——最坏保证装填量 `w_min` < 下限（`verify.enabled ∧ verify.policy="repair" ∧ segment.enabled` 时为 3，否则 2）⇒ 配置错误
-24. 上下文预算 warning（v1.11）：被启用阶段引用的档未声明 `context_window` ⇒ WARN 一次（提示可声明）；静态系统侧部件估算 > 预算 50% ⇒ WARN（单记录可用空间预警）；`w_min` == 下限 ⇒ WARN（窗数放大警示）；`vision_resolved` ∧ `segment.window` > 20 ∧ 所引档 `max_image_px` > 2000 ⇒ WARN（Anthropic 多图硬拒域，sequence_frames 那条 WARN 的姊妹）
+18. 流模式的视觉必需校验逐阶段（v1.8）：`extract.llm` **恒**须 supports_vision；`segment.llm` **恒不入视觉必需集**（v1.11——窗口是否附图由所引 profile 的 `supports_vision` 自动推导为解析产物 `vision_resolved`，原 `use_vision` 键已移除，见 A.8 第 22 条）；`quality.llm` **免除**、`stitch.llm`（v1.9）**恒免除**（两者都是纯文本判定）；v1.12 帧粒度分列：`frame.annotate.llm` ui ∧ enabled 时**恒**须 supports_vision（截图是帧标注主证据），`frame.classify.llm` **恒不入视觉必需集**（附图与否自动推导，同 segment 形制——省钱面 = 指向纯文本 profile）；`stream.session_max_span_s` 设 > 0 要求 `order_by = "meta:*"`（时间跨度需时间序键，违反即配置错误；meta:* 仅文本模态）；`stream.gap_s` 显式设置而 `order_by` 非 meta:* ⇒ 仅 **warning**（值照常加载、时间差断开不会生效；默认值 300 不视作显式意图，不告警）
+19. `[stream]` / `[segment]` / `[stitch]`（v1.9）/ `[extract]` 任一节在场而 `segment.enabled = false` ⇒ 仅 **warning**（同 A.8 第 15 条形制）；`segment.window` ≥ 2；`annotate.sequence_frames` ∈ [2, 100]
+20. `stitch.enabled = true` ⇒ `segment.enabled = true`（v1.9）；启用时 `stitch.llm` 计入密钥/probe/存在性引用集但**不入视觉必需集**；`[class.<name>.stitch]` 不存在（链序在 classify 之前，类标签尚不存在）
+21. `stitch.votes` 须为 ≥1 的**奇数**（偶数 = 退出码 2，v1.9）；`stitch.enabled = true` ∧ `segment.strategy = "rules"` ⇒ 仅 **warning**（规则分段不做语义精化，可缝证据薄）；`[stitch]` 带非开关键而 stitch 关、segment 开 ⇒ 仅 **warning**（segment 也关时并入 A.8 第 19 条名单）
+22. `[segment]` 内显式出现 `use_vision` ⇒ **配置错误**（v1.11 移除键定向报错，**不走**「未知键仅 warning」兜底）：窗口是否附图由 `segment.llm` 所指 profile 的 `supports_vision` 自动决定；需纯文本裁决请把 `segment.llm` 指向纯文本 profile
+23. 上下文预算硬校验（v1.11）：`context_window` > 0 时须 > `max_output_tokens + margin`（margin = max(256, ⌈0.10 × context_window⌉)），否则预算非正 ⇒ 配置错误；`default_image_px` > 0 时须 ≤ `max_image_px`；静态系统侧预检——启用阶段的静态 prompt 部件（模板 + instruction + rubric/类表/Schema/few-shot）估算 ≥ 该 profile 输入预算 ⇒ 配置错误（任何记录都装不下）；segment 装填护栏——最坏保证装填量 `w_min` < 下限（`verify.enabled ∧ verify.policy="repair" ∧ segment.enabled` 时为 3，否则 2）⇒ 配置错误
+24. 上下文预算 warning（v1.11）：被启用阶段所引 profile 未声明 `context_window` ⇒ WARN 一次（提示可声明）；静态系统侧部件估算 > 预算 50% ⇒ WARN（单记录可用空间预警）；`w_min` == 下限 ⇒ WARN（窗数放大警示）；`vision_resolved` ∧ `segment.window` > 20 ∧ 所引 profile `max_image_px` > 2000 ⇒ WARN（Anthropic 多图硬拒域，sequence_frames 那条 WARN 的姊妹）
 25. `frame.classify.enabled` / `frame.annotate.enabled` 任一为 true ⇒ `segment.enabled = true`（v1.12 帧粒度仅流模式，报错文案指引非流工程改用 classify + `[class.<名>.annotate]`）**且** `output.meta_mode ≠ "none"`（帧产物仅经 `_meta.stream.members` 承载；sidecar 合法）
-26. `frame.classify.enabled = true` ⇒ `frame.classify.fallback_class` 必填并 ∈ `[[frame.classify.classes]]`（传递性要求帧类表非空；**无独立的 ≥2 类数规则**——与第 13 条的序列类表有意不同；两张类表相互独立、允许重名、互不约束）
+26. `frame.classify.enabled = true` ⇒ `frame.classify.fallback_class` 必填并 ∈ `[[frame.classify.classes]]`（传递性要求帧类表非空；**无独立的 ≥2 类数规则**——与 A.8 第 13 条的序列类表有意不同；两张类表相互独立、允许重名、互不约束）
 27. `frame.annotate.enabled = true` ⇒ `frame.annotate.instruction` 必填 ∧ `schema_path` / `schema_inline` **恰一**（帧级 Schema 独立于 `output.schema`：draft 2020-12 元校验 + examples 干跑走同一套分支）
 28. `[frame.class.<名>]` 在场 ⇒ `frame.classify.enabled = true` ∧ 节名 ∈ 帧类表；覆盖节白名单仅 `annotate` 一节、键白名单仅 instruction / examples / enabled（白名单外键/节 ⇒ 配置错误，同 A.9 的显式例外形制）
-29. `[frame.classify]` 显式出现 `assignment`、`[frame.annotate]` 显式出现 `self_consistency` ⇒ **定向配置错误**（帧级无多标签、无自洽采样；同第 22 条的定向探针形制）；`[frame.*]` 节在场 ∧ 均未启用 ∧ `segment.enabled = false` ⇒ 仅 **warning**（并入第 19 条名单，v1.12）
+29. `[frame.classify]` 显式出现 `assignment`、`[frame.annotate]` 显式出现 `self_consistency` ⇒ **定向配置错误**（帧级无多标签、无自洽采样；同 A.8 第 22 条的定向探针形制）；`[frame.*]` 节在场 ∧ 均未启用 ∧ `segment.enabled = false` ⇒ 仅 **warning**（并入 A.8 第 19 条名单，v1.12）
 
 ## A.9 project.toml — [classify] 与 [class.<name>.*] 按类覆盖（v1.7 追加）
 
 | 键 | 默认 | 一句话 | 章 |
 |---|---|---|---|
 | `classify.enabled` | false | 默认关；关闭时与 v1.6 行为一致（唯一可见差异：`_meta.classification` 恒在、值为 null） | 24 |
-| `classify.llm` | "default" | profile 引用；UI 模态须 supports_vision；计入密钥/vision/probe 三处引用集 | 24 |
+| `classify.llm` | "default" | profile 引用；UI 模态须 supports_vision；计入密钥/视觉必需/probe 三处引用集 | 24 |
 | `classify.assignment` | "single" | 锁定一条一类 \| "multi"（多类命中按标签扇出：**行唯一键变 (_meta.id, label)**，counts 增 fanout） | 24 |
 | `classify.max_labels` | 类别数 | 仅 multi 可设；∈ [2, 类别数]；扇出成本（×m 份打分/标注/评审）的封顶旋钮 | 24 |
 | `classify.instruction` | "" | 可选补充说明，追加在 system 类别表之后；横跨多类的裁决规则（「拿不准选 X」）写这里 | 24 |
 | `classify.fallback_class` | enabled 必填 | 兜底类：须 ∈ classes；分类失败归它，LLM 亦可主动选它 | 24 |
 | `classify.self_consistency` | 0 | 0=关；≥3 奇数：n 次采样投票，**无过半归兜底类**（不回退首样本），成本 ×n | 24 |
-| `classify.sc_temperature` | 0.7 | sc 各次采样温度；仅 self_consistency ≥ 3 生效 | 24 |
+| `classify.sc_temperature` | 0.7 | 自洽采样各次采样温度；仅 self_consistency ≥ 3 生效 | 24 |
 | `classify.on_error` | "fallback" | 结构修复耗尽：归兜底类、记录存活（不写 errors，不污染 rejects 归因）\| "fail"：记录 failed → rejects | 24 |
 | `[[classify.classes]]` | enabled 必填 | ≥2 项；每项 {name：`[a-z0-9_]+` 表内唯一, description：非空（LLM 可见的全部类语义）, examples：可选 few-shot（仅输入侧）} | 24 |
 
@@ -211,20 +211,20 @@
 
 ## A.10 project.toml — [stream] / [segment] / [extract]（v1.8 追加）
 
-`[stream]` 是输入侧声明（排序与会话化，随 `segment.enabled` 生效）；`[segment]` 是 stream 模式总开关；`[extract]` 仅 UI 序列可开。三节任一在场而 segment 关 ⇒ 仅 warning（A.8 第 19 条）。详见第 25 章。
+`[stream]` 是输入侧声明（排序与会话化，随 `segment.enabled` 生效）；`[segment]` 是流模式总开关；`[extract]` 仅 UI 序列可开。三节任一在场而 segment 关 ⇒ 仅 warning（A.8 第 19 条）。详见第 25 章。
 
 | 键 | 默认 | 一句话 | 章 |
 |---|---|---|---|
 | `stream.order_by` | "input_order" | 文本=文件名字典序→行号、UI=配对编号升序 \| "meta:<field>"（**仅文本模态**）：按行内时间戳定序，数值自动判秒/毫秒、ISO 字符串（含 Z）可解析 | 5/25 |
 | `stream.on_disorder` | "skip" | 乱序/时间戳解析失败的记录跳过并计数 \| "fail"（退出码 3）；单调性游标按分区键各自维护 | 25 |
 | `stream.key` | [] | 分区键列表："meta:<field>"（文本）\| "source_dir"（UI，= 文件父目录）；**键变即断**（groupby 语义，输入须按键成组） | 5/25 |
-| `stream.gap_s` | 300 | 相邻记录时间差 > 阈值即断会话；**仅 order_by="meta:*" 可设**；默认偏大——欠分割可由 LLM 精化拯救、过分割不可逆 | 25 |
+| `stream.gap_s` | 300 | 相邻记录时间差 > 阈值即断会话；仅 order_by="meta:*" 生效——显式设置而非 meta 序仅 **WARN** 不阻断（A.8 第 18 条）；默认偏大——欠分割可由 LLM 精化拯救、过分割不可逆 | 25 |
 | `stream.gap_steps` | 0 | 序号差断会话（0=不启用）；与 gap_s 可并用，任一触发即断 | 25 |
 | `stream.session_max_len` | 200 | 会话硬上限（帧）；**> batch_size ⇒ 启动 WARN**（超批会话将被硬切 + session_split 标） | 25 |
-| `stream.session_max_span_s` | 0 | 会话时间跨度硬上限（秒，0=不启用）；仅 order_by="meta:*" 可设 | 25 |
-| `segment.enabled` | false | stream 模式总开关；默认关 = 行为与 v1.7 逐字节一致（`_meta.stream` 恒在 = null 除外）；启用要求见 A.8 第 16 条 | 25 |
+| `stream.session_max_span_s` | 0 | 会话时间跨度硬上限（秒，0=不启用）；仅 order_by="meta:*" 可设——非 meta 序设 > 0 即配置错误（A.8 第 18 条） | 25 |
+| `segment.enabled` | false | 流模式总开关；默认关 = 行为与 v1.7 逐字节一致（`_meta.stream` 恒在 = null 除外）；启用要求见 A.8 第 16 条 | 25 |
 | `segment.strategy` | "hybrid" | "rules"（候选会话原样成 episode，零 LLM；noise_filter/min_len 不生效）\| "llm" \| "hybrid"（单帧会话自动走 rules 退化） | 25 |
-| `segment.llm` | "default" | **仅 strategy ∈ {llm, hybrid} 时**计入密钥/probe/存在性三处引用集——rules 零调用不强制配键；v1.11 起**恒不入 vision 校验集**：窗口是否附图由所引档 `supports_vision` 自动推导（解析产物 `vision_resolved`；原 `use_vision` 键已移除，显式出现即配置错误——A.8 第 22 条） | 25 |
+| `segment.llm` | "default" | **仅 strategy ∈ {llm, hybrid} 时**计入密钥/probe/存在性三处引用集——rules 零调用不强制配键；v1.11 起**恒不入视觉必需集**：窗口是否附图由所引 profile 的 `supports_vision` 自动推导（解析产物 `vision_resolved`；原 `use_vision` 键已移除，显式出现即配置错误——A.8 第 22 条） | 25 |
 | `segment.window` | 20 | 单窗帧数**上限**（v1.11 语义），**≥ 2**；声明 context_window 后按预算贪心装填（溢出即封窗，实际每窗 ≤ window），未声明为固定窗（v1.10 行为）；两形态均重叠 1 帧、接缝帧判决归后窗；窗 ≥ 会话长且预算装得下时天然退化为整段单调用 | 17/25 |
 | `segment.digest_max_chars` | 400 | 单帧文字摘要长度上限 | 25 |
 | `segment.noise_filter` | true | 逐帧噪声标记（判噪帧 → dropped_noise）；仅 llm/hybrid 生效——rules 下设 true 为 no-op warning | 25 |
@@ -244,7 +244,7 @@
 | 键 | 默认 | 一句话 | 章 |
 |---|---|---|---|
 | `stitch.enabled` | false | 总开关；关闭时主输出/rejects/report 与 v1.8 **逐字节等价**（例外恰两处：dry-run 估算行的 `stitch_calls=0`、缺陷词表恒在的 `wrong_stitch: 0`） | 26 |
-| `stitch.llm` | "default" | 判定档；证据是摘要卡（纯文本），**恒不要求 supports_vision** | 26 |
+| `stitch.llm` | "default" | 判定 profile；证据是摘要卡（纯文本），**恒不要求 supports_vision** | 26 |
 | `stitch.max_open` | 4 | 开放线索池容量（≥1；实证锚：桌面日志挂起窗口均值 3 + 1 条活跃）；穿插深的流上调 | 26 |
 | `stitch.bias` | "conservative" | 并入需 LLM 判 resume **且**机械先验命中（合取）\| "llm" 纯 LLM 判（审计/消融用） | 26 |
 | `stitch.rescue_short` | true | below_min_len 短段按连续 run 重组先进候选池，命中救援翻回 absorbed；false = v1.8 行为 | 26 |
@@ -257,19 +257,19 @@
 
 ## A.12 project.toml — [frame.*]（v1.12 追加）
 
-`[frame.classify]` / `[frame.annotate]` 是 classify / annotate 两个算子的**帧粒度**双开关（不是新算子，第 25 章 25.6）：对 episode 的成员帧做批量闭集分类与逐成员按帧类标注，产物挂 `_meta.stream.members[]` 随序列行交付。任一启用要求 `segment.enabled = true` 且 `output.meta_mode ≠ "none"`（A.8 第 25 条）；`[frame.class.<帧类名>.annotate]` 是按帧类覆盖面（A.8 第 28 条）。帧级**没有** `assignment` / `self_consistency` 键（显式书写 = 定向配置错误，A.8 第 29 条），`[frame.classify]` 也没有 `instruction` 键（判决提示词模板内建）。可运行样板是 `examples/mix` 的两个工程：UI 控件树主工程 `project.toml`（屏幕类型帧类表，form_screen 覆盖 / transition 跳过；DeepSeek + z.ai 双端点——帧分类走纯文本档、帧标注走 vision 档）与文本姊妹 `project-text.toml`（请求角色帧类表，纯 DeepSeek 最低成本形态）。
+`[frame.classify]` / `[frame.annotate]` 是 classify / annotate 两个算子的**帧粒度**双开关（不是新算子，第 25 章 25.6）：对 episode 的成员帧做批量闭集分类与逐成员按帧类标注，产物挂 `_meta.stream.members[]` 随序列行交付。任一启用要求 `segment.enabled = true` 且 `output.meta_mode ≠ "none"`（A.8 第 25 条）；`[frame.class.<帧类名>.annotate]` 是按帧类覆盖面（A.8 第 28 条）。帧级**没有** `assignment` / `self_consistency` 键（显式书写 = 定向配置错误，A.8 第 29 条），`[frame.classify]` 也没有 `instruction` 键（判决提示词模板内建）。可运行样板是 `examples/mix` 的两个工程：UI 控件树主工程 `project.toml`（屏幕类型帧类表，form_screen 覆盖 / transition 跳过；DeepSeek + z.ai 双端点——帧分类走纯文本 profile、帧标注走 vision profile）与文本姊妹 `project-text.toml`（请求角色帧类表，纯 DeepSeek 最低成本形态）。
 
 | 键 | 默认 | 一句话 | 章 |
 |---|---|---|---|
 | `frame.classify.enabled` | false | 帧级闭集分类总开关；关闭时 members[] 无 label 键 | 24/25 |
-| `frame.classify.llm` | "default" | 批量判决档；enabled 时入密钥/probe/预算引用集，**永不入 vision 必需集**（附图与否由所引档 supports_vision 自动推导——省钱面 = 指向纯文本档，判决仅凭摘要行） | 25 |
+| `frame.classify.llm` | "default" | 批量判决 profile；enabled 时入密钥/probe/预算引用集，**永不入视觉必需集**（附图与否由所引 profile 的 supports_vision 自动推导——省钱面 = 指向纯文本 profile，判决仅凭摘要行） | 25 |
 | `frame.classify.fallback_class` | enabled 必填 | 兜底帧类：须 ∈ 帧类表（修复穷尽/整窗失败的成员归它，episode 永不因此 failed） | 25 |
 | `[[frame.classify.classes]]` | enabled 必填 | 帧类表，与 [[classify.classes]] 同构（{name：`[a-z0-9_]+`, description, examples 可选}）；与序列类表**相互独立、允许重名、互不约束**（A.8 第 26 条） | 24/25 |
 | `frame.annotate.enabled` | false | 帧级标注总开关；关闭时 members[] 无 annotation / status 键 | 25 |
-| `frame.annotate.llm` | "default" | 逐成员标注档；ui 模态启用时**无条件入 vision 必需集**（截图是标注主证据，镜像序列级 annotate） | 25 |
+| `frame.annotate.llm` | "default" | 逐成员标注 profile；ui 模态启用时**无条件入视觉必需集**（截图是标注主证据，镜像序列级 annotate） | 25 |
 | `frame.annotate.instruction` | enabled 必填 | 全局帧标注指令；开帧分类后可被 `[frame.class.*.annotate]` 按类覆盖 | 11/25 |
 | `frame.annotate.examples` | [] | 可选 few-shot {input, output}；output 启动时过**帧级 Schema** 干跑校验 | 11/25 |
-| `frame.annotate.schema_path` / `schema_inline` | enabled 时恰一 | 帧级输出 JSON Schema，**独立于 output.schema**；帧标注调用走 L0–L3、**无 L2.5**、不计 resolved_at；失败落 members[] 状态位而非 rejects | 14/25 |
+| `frame.annotate.schema_path` / `schema_inline` | enabled 时恰一 | 帧级输出 JSON Schema，**独立于 output.schema**；帧标注调用走结构引擎完整四层、**无代码回调校验层**、不计 resolved_at；失败落 members[] 状态位而非 rejects | 14/25 |
 | `[frame.class.<帧类名>.annotate].instruction` | 继承全局 | 按帧类覆盖标注指令（类覆盖 > 全局） | 24/25 |
 | `[frame.class.<帧类名>.annotate].examples` | 继承全局 | 按帧类覆盖 few-shot；同样过帧级 Schema 干跑 | 24/25 |
 | `[frame.class.<帧类名>.annotate].enabled` | true | false ⇒ 该帧类成员跳过帧标注（members[] 呈现 status="skipped"——省成本面） | 24/25 |

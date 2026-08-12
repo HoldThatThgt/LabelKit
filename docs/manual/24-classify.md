@@ -49,7 +49,7 @@ name = "other"
 description = "不属于以上任何一类的请求（闲聊、无明确诉求等）"
 ```
 
-要点三个：① 类别表**至少两项**，`name` 用 `[a-z0-9_]+`（它会成为配置节名、`_meta` 字段值、报告键，别用中文）；② `description` 是 LLM 能看到的**全部类语义**——分得准不准，八成取决于这句话怎么写（24.7 有一个真实翻车展品）；③ `fallback_class` 必填且必须是表内成员——它既是分类失败时的兜底去向，也是 LLM 可以主动选择的普通类（所以 other 的 description 写成「不属于以上任何一类」的排他形态）。`examples` 可选，是**输入侧** few-shot：给边界样本一个锚点。
+要点三个：其一，类别表**至少两项**，`name` 用 `[a-z0-9_]+`（它会成为配置节名、`_meta` 字段值、报告键，别用中文）；其二，`description` 是 LLM 能看到的**全部类语义**——分得准不准，八成取决于这句话怎么写（24.7 有一个真实翻车展品）；其三，`fallback_class` 必填且必须是表内成员——它既是分类失败时的兜底去向，也是 LLM 可以主动选择的普通类（所以 other 的 description 写成「不属于以上任何一类」的排他形态）。`examples` 可选，是**输入侧** few-shot：给边界样本一个锚点。
 
 **第二节：按类覆盖。**全局打分是 pointwise + 0.25 的线，然后给两个类各开小灶：
 
@@ -112,7 +112,7 @@ stderr 尾部的终版摘要（真实运行，退出码 0）：
    dropped_dup=1  dropped_lowq=11  dropped_verify=0  failed=1  emitted=13
 ```
 
-守恒等式照常成立：`13 + 1 + 11 + 0 + 1 = 26 = 14 + 12`（generate 开着，12 条合成样本回流，第 12 章；`failed=1` 是一条死于打分调用输出截断的记录——v1.11 的 `output_truncated`，与分类无关，第 3、18 章）。分类本身的账在 `report.json` 新增的 `classify` 节里：
+守恒恒等式照常成立：`13 + 1 + 11 + 0 + 1 = 26 = 14 + 12`（generate 开着，12 条合成样本回流，第 12 章；`failed=1` 是一条死于打分调用输出截断的记录——v1.11 的 `output_truncated`，与分类无关，第 3、18 章）。分类本身的账在 `report.json` 新增的 `classify` 节里：
 
 ```json
 "classify": {
@@ -132,7 +132,7 @@ stderr 尾部的终版摘要（真实运行，退出码 0）：
              "reason": "用户仅发送了一串笑声，无明确诉求，属于闲聊类内容。"}}
 ```
 
-分拣之后，质量工位**按类分池**打分、按各自的线门控。trace 的 `quality.gate` 事件多了个 `pool` 字段，三条线同场执法一目了然（从真实 trace 的 24 条门控事件里各池摘一条；`…` 处省略 `ts`/`run_id`/`batch_no`/`stage` 字段）：
+分拣之后，质量算子**按类分池**打分、按各自的线门控。trace 的 `quality.gate` 事件多了个 `pool` 字段，三条线同场执法一目了然（从真实 trace 的 24 条门控事件里各池摘一条；`…` 处省略 `ts`/`run_id`/`batch_no`/`stage` 字段）：
 
 ```json
 {…, "ev": "quality.gate", "record_ids": ["a8aa181766eebd97"],
@@ -169,7 +169,7 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
 - **归一化**：LLM 返回的标签集合先映射到类别表声明序并去重；兜底类与具体类同时出现时剔除兜底类（「其余」和具体命中矛盾），只命中兜底类时保留。
 - **扇出 = 一条数据多行结果**：归一化后命中 k ≥ 2 类时，原信封拿首标签（声明序），其余 k−1 个标签各克隆一个「兄弟信封」追加到批尾。兄弟信封**共享**原始记录与去重判定（所以各行的 `_meta.dedup` 一致），但质量分、标注、评审结果**各自独立**——每个信封进自己的类池打分、按自己类的指令标注、独立淘汰、独立产出一行。
 - **⚠️ 行唯一键变了**：multi 模式下主输出中**同一个 `_meta.id` 可以出现多行**（每类一行），行唯一键是 **(`_meta.id`, `_meta.classification.label`)**。下游任何拿 `_meta.id` 当唯一键的脚本（join、去重、对账）都要改——这是开 multi 前必须通知下游的契约变更。
-- **账目**：扇出净增的信封数计入 `counts.fanout`（仅 multi 时出现在报告里），守恒等式右侧同步扩展：`emitted + dropped_* + failed + bad_input = scanned + generated + fanout`。报告的 `classify` 节另多一个 `multi_label_records`（命中多类的记录数）。
+- **账目**：扇出净增的信封数计入 `counts.fanout`（仅 multi 时出现在报告里），守恒恒等式右侧同步扩展：`emitted + dropped_* + failed + bad_input = scanned + generated + fanout`。报告的 `classify` 节另多一个 `multi_label_records`（命中多类的记录数）。
 - **`max_labels` 是成本旋钮**：∈ [2, 类别数]，缺省 = 类别数。一条记录命中 m 类，就要付 m 份打分 + m 份标注 + m 份评审的钱——`max_labels` 给这个乘数封顶。类别表大而互斥性弱时，别用缺省值裸奔。附带一提：`--dry-run` 的估算静态算不出实际命中数，multi 下按乘数 1 报**下界**并在 stderr 注明，预算要留余量。
 
 选型：数据天然单归属（意图分类、领域分类）用 single；标签语义是「适用于哪些场景」而非「属于哪一类」时才值得上 multi。拿不准就先跑 single，看 trace 里分拣员的 reason 有没有反复在两类之间挣扎。
@@ -239,7 +239,7 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
 }
 ```
 
-三个细节：① `classification` 只落 `label` / `labels` / `source` 三键——判决理由和 sc 统计不落主输出，要看去 trace（`classify.decision` 事件）；② `scores.pool` 与 `classification.label` 恒相等，pool 是打分池的自述，pairwise 模式下「批内相对分」从此变成「**池内**相对分」（见 24.7）；③ 输出 Schema 是全局的——类只改工艺，不改产出结构：本次真跑回流的合成样本带着种子的类标签（`source="inherited"`）、按类指令标注，但 `intent` 字段仍由标注工位从全局枚举里独立选出。
+三个细节：其一，`classification` 只落 `label` / `labels` / `source` 三键——判决理由和自洽采样统计不落主输出，要看去 trace（`classify.decision` 事件）；其二，`scores.pool` 与 `classification.label` 恒相等，pool 是打分池的自述，pairwise 模式下「批内相对分」从此变成「**池内**相对分」（见 24.7）；其三，输出 Schema 是全局的——类只改工艺，不改产出结构：本次真跑回流的合成样本带着种子的类标签（`source="inherited"`）、按类指令标注，但 `intent` 字段仍由标注算子从全局枚举里独立选出。
 
 **拒绝通道**每行多一个 `label` 键（真实运行产物第 1、3 行，逐字）：
 
@@ -248,7 +248,7 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
 {"_meta": {"id": "6e3ffe368ff0ad29", "source": {"file": "input.jsonl", "line_no": 6, "generated_from": []}, "stage": "dedup", "reason": "exact", "errors": [], "label": null}}
 ```
 
-第一行：writing 类的记录死于 writing 池的 0.2 线——`label` 让你能按类统计淘汰。第二行 `label` 是 `null`：它死在 dedup 工位，**还没走到分拣台**（链序 dedup → classify），自然没有标签。multi 模式下这个键还承担消歧职责：同 id 的兄弟信封在 rejects 里靠 label 区分。
+第一行：writing 类的记录死于 writing 池的 0.2 线——`label` 让你能按类统计淘汰。第二行 `label` 是 `null`：它死在 dedup 算子，**还没走到分拣台**（链序 dedup → classify），自然没有标签。multi 模式下这个键还承担消歧职责：同 id 的兄弟信封在 rejects 里靠 label 区分。
 
 **报告**的 `quality` 节多了 `by_class`——每个类池一套独立的直方图与准则均值（顶层的直方图/均值仍保留，是全池汇总；真实运行产物按池名字典序排列，`…` 处省略 other / qa / translation 三池的同构内容与其余全为 0 的桶）：
 
@@ -287,10 +287,10 @@ jq -r '._meta | "\(.label)\t\(.stage)/\(.reason)"' out/text-labels.rejects.jsonl
 
 **`classification_invalid` 的两副面孔**（对应 `classify.on_error`）：
 
-- `"fallback"`（默认）：记录**存活**、归兜底类，留痕走三条路——trace 的 error 事件（kind = `classification_invalid`）、`fallback_count` 计数、`Classification` 的内部 detail。注意它**不写** `item.errors`，所以这条记录后续如果死在别的工位，rejects 归因不会被分类失败污染；
+- `"fallback"`（默认）：记录**存活**、归兜底类，留痕走三条路——trace 的 error 事件（kind = `classification_invalid`）、`fallback_count` 计数、`Classification` 的内部 detail。注意它**不写** `item.errors`，所以这条记录后续如果死在别的算子，rejects 归因不会被分类失败污染；
 - `"fail"`：记录 `failed` 进 rejects，`reason` 就是 `classification_invalid`。适合「标签错了比没有标签更糟」的场景（比如标签直接决定下游训练配比）。
 
-**sc 投票：给分拣员上三个臭皮匠。**`classify.self_consistency = n`（≥3 奇数）时每条记录采样 n 次（温度取 `classify.sc_temperature`，默认 0.7），single 按多数票、multi 逐标签按「出现于过半采样」保留；**无过半不回退首样本，归兜底类**——分不出来就该进兜底，这是它与 annotate 字段级投票语义上的不同。票型统计（n 与 agreement_ratio）随 `classify.decision` 事件的 `sc` 字段落 trace。成本 ×n，先确认 fallback_count 和边界类的翻转率真的成问题再上。
+**自洽采样投票：给分拣员上三个臭皮匠。**`classify.self_consistency = n`（≥3 奇数）时每条记录采样 n 次（温度取 `classify.sc_temperature`，默认 0.7），single 按多数票、multi 逐标签按「出现于过半采样」保留；**无过半不回退首样本，归兜底类**——分不出来就该进兜底，这是它与 annotate 字段级投票语义上的不同。票型统计（n 与 agreement_ratio）随 `classify.decision` 事件的 `sc` 字段落 trace。成本 ×n，先确认 fallback_count 和边界类的翻转率真的成问题再上。
 
 **类描述是分类质量的第一杠杆。**示例工程的类别表自己就是一个演化展品：早期版本只有 writing / qa / other 三类，实测那条「把这句话翻译成英文……」被分进了 writing——分拣员的理由是「本质上是产出一段目标语言的文本，属于写作协助类请求」。回头看 writing 的 description 结尾：「……**需要模型产出一段文本的请求**」——这个尾巴写得太宽，几乎所有请求都要模型产出文本，翻译就这样被兜进来了。解法就是现在的类别表：给翻译立类、让 description 互相让地盘（本次真跑两条翻译请求全部正确归入 translation）。写类别表的四条纪律：
 
@@ -314,6 +314,6 @@ jq -r '._meta | "\(.label)\t\(.stage)/\(.reason)"' out/text-labels.rejects.jsonl
 
 ## 24.8 帧类表与序列类表：两张互相独立的表（v1.12）
 
-流模式的帧粒度（第 25 章 25.6）引入了**第二张类别表**：`[[frame.classify.classes]]`。它与本章的 `[[classify.classes]]` 形态同构（`name` 匹配 `[a-z0-9_]+`、`description` 是 LLM 能看到的全部类语义、`examples` 可选；`frame.classify.fallback_class` 同样必填且必须在表内），但两张表**互相独立、允许重名、互不约束**——`examples/mix` 的文本姊妹工程 `project-text.toml` 就各有一个 `other`：序列类表的 other 收「不属于差旅/餐饮/写作的请求序列」，帧类表的 other 收「不属于发起任务/追问/寒暄的单条请求」，同名不同表、各管各的兜底，谁也不引用谁。「帧类给什么词表」跟着数据形态走：UI 主工程 `project.toml` 的帧类表是**屏幕类型**（list_screen / detail_screen / form_screen / confirm_screen / transition / other——序列类是任务类型 food_delivery / hotel_booking），文本姊妹的帧类表是**请求角色**（task_request / followup / chitchat / other）。判断一个标签属于哪张表看它挂在哪：序列类落 `_meta.classification.label`（一行一个），帧类落 `_meta.stream.members[].label`（一行 N 个、逐成员）。分类调用与计数也各走各的：帧分类是每 episode 一次批量判决、账记在 `report.stream.frame_classify`，与本章 `report.classify` 的序列级账互不掺和（帧分类还**永不**要求 vision 档——UI 主工程把它指向纯文本端点省钱，第 25 章 25.6 的双端点成本拆分）。
+流模式的帧粒度（第 25 章 25.6）引入了**第二张类别表**：`[[frame.classify.classes]]`。它与本章的 `[[classify.classes]]` 形态同构（`name` 匹配 `[a-z0-9_]+`、`description` 是 LLM 能看到的全部类语义、`examples` 可选；`frame.classify.fallback_class` 同样必填且必须在表内），但两张表**互相独立、允许重名、互不约束**——`examples/mix` 的文本姊妹工程 `project-text.toml` 就各有一个 `other`：序列类表的 other 收「不属于差旅/餐饮/写作的请求序列」，帧类表的 other 收「不属于发起任务/追问/寒暄的单条请求」，同名不同表、各管各的兜底，谁也不引用谁。「帧类给什么词表」跟着数据形态走：UI 主工程 `project.toml` 的帧类表是**屏幕类型**（list_screen / detail_screen / form_screen / confirm_screen / transition / other——序列类是任务类型 food_delivery / hotel_booking），文本姊妹的帧类表是**请求角色**（task_request / followup / chitchat / other）。判断一个标签属于哪张表看它挂在哪：序列类落 `_meta.classification.label`（一行一个），帧类落 `_meta.stream.members[].label`（一行 N 个、逐成员）。分类调用与计数也各走各的：帧分类是每 episode 一次批量判决、账记在 `report.stream.frame_classify`，与本章 `report.classify` 的序列级账互不掺和（帧分类还**永不**入视觉必需集——UI 主工程把它指向纯文本端点省钱，第 25 章 25.6 的双端点成本拆分）。
 
-按类覆盖面同样各有各的白名单：序列类是 24.4 那张四节大表；帧类**只有 annotate 一节、三个键**——`[frame.class.<帧类名>.annotate]` 的 `instruction` / `examples` / `enabled`（`enabled = false` 让该类成员整个跳过帧标注，members[] 呈现 `status="skipped"`——省成本面，第 25 章 25.6）。帧类没有按类 quality / generate / verify（帧粒度本无这些工位），也没有 multi 多标签（帧单一归属——在 `[frame.classify]` 里显式写 `assignment` 是定向配置错误）。`[frame.class.*]` 在场要求 `frame.classify.enabled = true` 且节名必须是帧类表成员；白名单外的键/节与 24.4 同一惯例——直接报配置错误，不静默。
+按类覆盖面同样各有各的白名单：序列类是 24.4 那张四节大表；帧类**只有 annotate 一节、三个键**——`[frame.class.<帧类名>.annotate]` 的 `instruction` / `examples` / `enabled`（`enabled = false` 让该类成员整个跳过帧标注，members[] 呈现 `status="skipped"`——省成本面，第 25 章 25.6）。帧类没有按类 quality / generate / verify（帧粒度本无这些算子），也没有 multi 多标签（帧单一归属——在 `[frame.classify]` 里显式写 `assignment` 是定向配置错误）。`[frame.class.*]` 在场要求 `frame.classify.enabled = true` 且节名必须是帧类表成员；白名单外的键/节与 24.4 同一惯例——直接报配置错误，不静默。

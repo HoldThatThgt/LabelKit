@@ -21,7 +21,7 @@
 | ③ 图像（仅 UI） | 视觉相同 | pHash 感知哈希 + 汉明距离 | 零 |
 | ④ 语义（可选，默认关） | 意思相同 | 句向量余弦相似度（SemDeDup） | 每条一次 embedding 调用 |
 
-前一层判中就不再走后一层（短路）。被判重的记录标记 `dropped_dup`，**保留簇内首见者**（first-writer-wins）——输入顺序决定「留下哪一条」。精确层（①）的留存条数与顺序无关；近似层（②③④）只与**已保留**的记录比对（贪心聚簇），当相似度不传递时（A≈B、B≈C，但 A 与 C 差距超阈），不同输入顺序留下的条数也可能不同。同一输入文件的顺序是固定的，同输入同 seed 重跑结果完全一致。
+前一层判中就不再走后一层（短路）。被判重的记录标记 `dropped_dup`，**保留簇内首见者**（first-writer-wins）——输入顺序决定「留下哪一条」。精确层的留存条数与顺序无关；近似层、图像层、语义层只与**已保留**的记录比对（贪心聚簇），当相似度不传递时（A≈B、B≈C，但 A 与 C 差距超阈），不同输入顺序留下的条数也可能不同。同一输入文件的顺序是固定的，同输入同 seed 重跑结果完全一致。
 
 ## 9.2 每一层的工作原理
 
@@ -46,7 +46,7 @@ UI 模态的「正文」是控件树的规范序列化，且序列化前坐标�
 
 - 一段 64 字的文本结尾追加 6 个字符（" 10:12"）：Jaccard ≈ 0.91 ⇒ 被抓；
 - 一句 20 字的短句中间改一个字：默认 5-gram 下受影响的 shingle 有 5 个（共 16 个），Jaccard = 11/21 ≈ 0.52 ⇒ 远低于阈值，漏过（见 9.5 调优）；
-- 两句只是主题相同、措辞不同的话：Jaccard 通常 < 0.3 ⇒ 与近似层无关，那是④的活。
+- 两句只是主题相同、措辞不同的话：Jaccard 通常 < 0.3 ⇒ 与近似层无关，那是语义层的活。
 
 ### ③ 图像层：像素的"感知指纹"
 
@@ -54,7 +54,7 @@ UI 模态的「正文」是控件树的规范序列化，且序列化前坐标�
 
 ### ④ 语义层：向量的余弦（默认关）
 
-开启后，前三层（含 UI 合成判定）尚未构成判重的记录会取句向量（经 `[embedding.*]` profile），与索引中全部已保留向量算余弦相似度，≥ `semantic_threshold`（默认 0.95）判重（`kind="near_semantic"`）。它抓的是「措辞不同、意思相同」的深层重复。v1.11 起若给所引 `[embedding.*]` 档声明了 `context_window`（第 6 章），送去嵌入的文本会先按 `context_window − margin` 的预算截断——**确定性头部保留**（嵌入的语义主体在文本前部；episode/线索的成员拼接长文从此装得进窗口），截断计入 `report.budget.truncations`；未声明时无截断（现行为）。无论声明与否，既有的 `embedding_failures` 跳过路径都保留为兜底——embedding 调用失败的记录跳过本层、按前三层判定。例外：UI 模态 `ui_dup_requires="image"` 时④不参与判定、也不为这些记录发起 embedding 调用（仅当图像解码失败、退化为按树判定时才参与）。三点须知：
+开启后，前三层（含 UI 合成判定）尚未构成判重的记录会取句向量（经 `[embedding.*]` profile），与索引中全部已保留向量算余弦相似度，≥ `semantic_threshold`（默认 0.95）判重（`kind="near_semantic"`）。它抓的是「措辞不同、意思相同」的深层重复。v1.11 起若给所引 `[embedding.*]` profile 声明了 `context_window`（第 6 章），送去嵌入的文本会先按 `context_window − margin` 的预算截断——**确定性头部保留**（嵌入的语义主体在文本前部；episode/线索的成员拼接长文从此装得进窗口），截断计入 `report.budget.truncations`；未声明时无截断（现行为）。无论声明与否，既有的 `embedding_failures` 跳过路径都保留为兜底——embedding 调用失败的记录跳过本层、按前三层判定。例外：UI 模态 `ui_dup_requires="image"` 时语义层不参与判定、也不为这些记录发起 embedding 调用（仅当图像解码失败、退化为按树判定时才参与）。三点须知：
 
 - **要花钱**：每条参检记录一次 embedding 调用（走同一套重试/计量）；
 - **要内存**：scope=global 时向量索引常驻，按 float64 存储每维 8 字节（50 万条 × 1024 维 ≈ 4 GB，缓冲扩容时峰值还会短暂更高），须计入内存预算；
@@ -70,16 +70,43 @@ UI 记录有树、图两个通道，谁说了算由 `ui_dup_requires` 决定：
 | `"tree"` | 树近似重即判 | 你只关心结构多样性、不在乎画面状态时 |
 | `"image"` | 图近似重即判 | 树导出质量太差（如全 WebView）时退而求其次 |
 
-精确层（①）命中**无条件判重**，不受此配置影响。语义层（④）在合成判定中**视同树层命中**。两个通道都中记 `kind="near_both"`。
+精确层命中**无条件判重**，不受此配置影响。语义层在合成判定中**视同树层命中**。两个通道都中记 `kind="near_both"`。
 
-规格中的判定示例（spec §3.3.5）：同一 App 的两条登录页记录——簇首是空表单，待判这条已输入手机号、软键盘弹出——树 MinHash Jaccard 0.95（②命中）、图 pHash 汉明距离 21（③未命中）。`both` 之下**不判重**，这条不同输入状态的数据被保留；若配 `tree`，它就被误杀了。（`examples/ui` 数据集里实际的重复是 3 号与 1 号的**精确**重复——①层命中，rejects 中 `reason="exact"`；该数据集各树对 Jaccard ≤ 0.28、各图对汉明距离 ≥ 26，近似层都不会命中。）
+规格中的判定示例（spec §3.3.5）：同一 App 的两条登录页记录——簇首是空表单，待判这条已输入手机号、软键盘弹出——树 MinHash Jaccard 0.95（近似层命中）、图 pHash 汉明距离 21（图像层未命中）。`both` 之下**不判重**，这条不同输入状态的数据被保留；若配 `tree`，它就被误杀了。（`examples/ui` 数据集里实际的重复是 3 号与 1 号的**精确**重复——精确层命中，rejects 中 `reason="exact"`；该数据集各树对 Jaccard ≤ 0.28、各图对汉明距离 ≥ 26，近似层都不会命中。）
+
+四层短路顺序与合成判定的全景（含 9.4 序列记录的跳层）：
+
+```mermaid
+flowchart TD
+    REC["待判记录"] --> EXACT["精确层：规范化 + SHA-256"]
+    EXACT -- "命中 ⇒ exact（无条件判重，不看 ui_dup_requires）" --> DUP["判重 dropped_dup（保留簇内首见者）"]
+    EXACT -- "未命中" --> MODE{"模态"}
+
+    MODE -- "text" --> NEAR["近似层：MinHash Jaccard ≥ minhash_threshold"]
+    NEAR -- "命中 ⇒ near_text" --> DUP
+    NEAR -- "未命中" --> SEMT["语义层（semantic = true 时参检）：<br/>句向量余弦 ≥ semantic_threshold"]
+    SEMT -- "命中 ⇒ near_semantic" --> DUP
+    SEMT -- "未命中或未开启" --> UNIQ["unique：存活进入下一算子"]
+
+    MODE -- "ui" --> CHAN["树通道 = 近似层（树序列化文本）<br/>图通道 = 图像层（pHash 汉明距离 ≤ image_phash_max_distance）"]
+    CHAN --> GATE{"合成判定 ui_dup_requires"}
+    GATE -- "both：树、图都命中 ⇒ near_both" --> DUP
+    GATE -- "tree：树命中即判" --> DUP
+    GATE -- "image：图命中即判" --> DUP
+    GATE -- "image 口径未命中（语义层不参检）" --> UNIQ
+    GATE -- "both / tree 口径未构成判重" --> SEMU["语义层（semantic = true 时参检）：<br/>命中视同树通道命中、重过合成判定"]
+    SEMU -- "凑齐口径 ⇒ 判重" --> DUP
+    SEMU -- "仍未构成或未开启" --> UNIQ
+
+    EPI["序列记录（episode / 线索，9.4）：指纹 = 成员帧按序拼接；<br/>图像层自动跳过、both 退化为 tree、语义层同走树侧分支"] -.- CHAN
+```
 
 ## 9.4 序列记录（episode）怎么判重（v1.8）
 
-开启分段算子（第 25 章）后，走到去重工位的还有**序列记录**——由多个成员帧拼装成的 episode。它的判重规则有四点特殊：
+开启分段算子（第 25 章）后，走到去重算子的还有**序列记录**——由多个成员帧拼装成的 episode。它的判重规则有四点特殊：
 
-- **文本指纹 = 成员拼接**：episode 自己没有正文，①精确层与②近似层的判重文本由**各成员帧按序各自序列化后拼接**而成（分隔符是一个不可见的控制字符，不会与正文内容撞车）。两条 episode 的帧序列几乎相同，拼接文本就几乎相同——照常被①②抓住。
-- **③图像层对序列跳过**：episode 不携带单张图像，pHash 层自动不参与（这不是漏检——成员帧的画面差异已经体现在树序列化文本里）。
+- **文本指纹 = 成员拼接**：episode 自己没有正文，精确层与近似层的判重文本由**各成员帧按序各自序列化后拼接**而成（分隔符是一个不可见的控制字符，不会与正文内容撞车）。两条 episode 的帧序列几乎相同，拼接文本就几乎相同——照常被这两层抓住。
+- **图像层对序列跳过**：episode 不携带单张图像，pHash 层自动不参与（这不是漏检——成员帧的画面差异已经体现在树序列化文本里）。
 - **`ui_dup_requires = "both"` 退化为 `"tree"`**：图像通道缺席时，「树、图都近似才判重」自动降级为只看树通道（与单帧记录图像解码失败时的退化同一规则），语义层参与判定时同理只走树侧分支。
 - **episode 级重复的语义 = 「同样的操作流程」**：两个 episode 被判重，说的是两次采集录到了同一套操作（同样的页面序列、同样的推进路径），保留首见的那一条。
 
@@ -89,7 +116,7 @@ v1.9 再开缝合算子（第 26 章）时规则不变、单元升级：判重�
 
 ```toml
 [dedup]
-enabled = true                    # 关掉 = 完全跳过本工位
+enabled = true                    # 关掉 = 完全跳过本算子
 scope = "global"                  # "global" | "batch"
 minhash_threshold = 0.85          # Jaccard 判重线（工业通行 0.8–0.9）
 minhash_num_perm = 128            # 签名精度
@@ -97,14 +124,14 @@ ngram = 5                         # 字符 shingle 宽度
 image_phash_max_distance = 8      # 汉明距离阈值（仅 UI）
 ui_dup_requires = "both"          # UI 合成判定（仅 UI）
 bounds_quantize_px = 4            # 树坐标量化粒度（仅 UI）
-semantic = false                  # 第④层开关
+semantic = false                  # 语义层开关
 semantic_embedding = "default_emb"  # semantic=true 时必填，指向 [embedding.*]
 semantic_threshold = 0.95
 ```
 
 ### scope：全局还是批内
 
-- `"global"`（默认）：去重索引跨批累积，整个运行范围内查重。**这是你几乎总是想要的**；
+- `"global"`（默认）：去重索引跨批累积，整个运行范围内判重。**这是你几乎总是想要的**；
 - `"batch"`：每批重建索引，只查批内重复。唯一动机是省内存（50 万条的全局 LSH 索引占约 2–4 GB）。代价直白：跨批的重复漏网。
 
 ### 场景一：短文本（一句话请求、搜索 query）
@@ -113,7 +140,7 @@ semantic_threshold = 0.95
 
 1. `ngram` 从 5 降到 3——切得更碎，同样的编辑对 Jaccard 的冲击更小，短文本判重更敏感（上面那句 0.52 → 0.71）；
 2. 在此基础上把 `minhash_threshold` 降到 0.7 左右——注意单独降阈值而不动 ngram 抓不住上例（0.52 < 0.7），两者要搭配；且降阈值同时会放宽对长文本的判定，混合长短文本时慎用；
-3. 上第④层语义去重——短文本 embedding 便宜，效果最好。
+3. 上语义层——短文本 embedding 便宜，效果最好。
 
 **验证手感的方法**：调完参数先小样本跑一次（quality/annotate 不能全关——至少留 quality 不设阈值），看 `report.dedup` 各层计数 + `rejects` 里被判重的是谁（`trace.channels` 加 `"dedup"` 能看到每条**被判重**记录的实测 Jaccard/汉明距离/余弦值；判为 unique 的记录不产生事件，精确命中的事件也不带数值）。
 
@@ -123,7 +150,7 @@ semantic_threshold = 0.95
 
 ### 场景三：生成样本的相似度过滤
 
-Self-Instruct 式的「新样本相似度过滤」分两道（第 12 章）：第一道内置在 generate 算子里、无条件执行（新样本与种子、与同批样本互查，**复用本节的 `minhash_threshold` / `num_perm` / `ngram` 参数**，`survived_dedup` 统计的就是它）；第二道是生成子批回流经过本算子，与全部原始记录及先前生成的样本查重。`report.generate.buckets` 里某个桶 `survived_dedup` 明显低于 `produced`，说明那个模型×风格组合在产重复货。此时**先调 generate 的多样性**（温度、风格模板），而不是放松去重阈值。
+Self-Instruct 式的「新样本相似度过滤」分两道（第 12 章）：第一道内置在 generate 算子里、无条件执行（新样本与种子、与同批样本互查，**复用本节的 `minhash_threshold` / `num_perm` / `ngram` 参数**，`survived_dedup` 统计的就是它）；第二道是生成子批回流经过本算子，与全部原始记录及先前生成的样本判重。`report.generate.buckets` 里某个桶 `survived_dedup` 明显低于 `produced`，说明那个模型×风格组合在产重复货。此时**先调 generate 的多样性**（温度、风格模板），而不是放松去重阈值。
 
 ## 9.6 判定结果落在哪
 

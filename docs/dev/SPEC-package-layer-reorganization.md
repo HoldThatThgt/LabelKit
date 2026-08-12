@@ -84,7 +84,7 @@ labelkit/
 │   │   ├── llm_client.py
 │   │   │   └── LLM/Embedding transport、重试、密钥池、并发、用量计量
 │   │   └── schema_engine.py
-│   │       └── L0-L3 结构化输出保证、JSON 修复、Schema 校验和 repair 统计
+│   │       └── 结构化输出层到 LLM 修复环的四层保证、JSON 修复、Schema 校验和 repair 统计
 │   │
 │   ├── observability/
 │   │   └── obslog.py
@@ -179,7 +179,7 @@ Common 不得依赖 `operators` 或 `orchestration`。
 - signal、circuit breaker、生命周期清理；
 - 报告汇总和最终退出结果。
 
-编排层不复制任何算子算法，不实现 prompt、去重、评分、标注或验证业务。
+编排层不复制任何算子算法，不实现 prompt、去重、评分、标注或评审业务。
 
 ## 5. 严格物理归档和 import 迁移
 
@@ -187,19 +187,17 @@ Common 不得依赖 `operators` 或 `orchestration`。
 
 ### 5.1 唯一 canonical path
 
-```text
-labelkit.cli                  → labelkit/cli/ package
-labelkit.common.contracts.*  → labelkit/common/contracts/
-labelkit.common.errors       → labelkit/common/errors.py
-labelkit.common.config.*     → labelkit/common/config/
-labelkit.common.runtime.*    → labelkit/common/runtime/
-labelkit.common.observability.obslog
-                              → labelkit/common/observability/obslog.py
-labelkit.common.extensions.hooks
-                              → labelkit/common/extensions/hooks.py
-labelkit.operators.*         → labelkit/operators/
-labelkit.orchestration.*     → labelkit/orchestration/
-```
+| import 路径 | 物理位置 |
+|---|---|
+| `labelkit.cli` | `labelkit/cli/` package |
+| `labelkit.common.contracts.*` | `labelkit/common/contracts/` |
+| `labelkit.common.errors` | `labelkit/common/errors.py` |
+| `labelkit.common.config.*` | `labelkit/common/config/` |
+| `labelkit.common.runtime.*` | `labelkit/common/runtime/` |
+| `labelkit.common.observability.obslog` | `labelkit/common/observability/obslog.py` |
+| `labelkit.common.extensions.hooks` | `labelkit/common/extensions/hooks.py` |
+| `labelkit.operators.*` | `labelkit/operators/` |
+| `labelkit.orchestration.*` | `labelkit/orchestration/` |
 
 `labelkit.cli` 是 canonical package 名，不属于旧路径；`labelkit/cli.py` 不得存在，console script 继续指向 `labelkit.cli:main`。
 
@@ -283,6 +281,26 @@ v1.9（M16 线索缝合，2026-07-16）向本封闭白名单登记两个新测�
 
 每个 worker 必须只编辑声明的文件集合；不得重置、覆盖或删除其他 worker 的修改。所有 worker 必须读取本 spec 和当前工作树状态。
 
+波次依赖与文件所有权总览：
+
+```mermaid
+flowchart TD
+    W0["Wave 0 冻结 spec：主 agent 写入并提交本文件"]
+    W1["Wave 1 公共契约和配置：common/contracts、common/config、common/errors.py（删除旧 config/ 与对应旧平铺文件）"]
+    W2["Wave 2 运行时公共能力：common/runtime、common/observability、common/extensions（删除对应旧平铺文件）"]
+    subgraph W3["Wave 3 算子迁移（五组互不相交，可并行）"]
+        G1["输入/流：ingest.py、segment.py"]
+        G2["数据筛选：dedup.py、classify.py"]
+        G3["质量和生成：quality.py、generate.py"]
+        G4["标注和评审：annotate.py、verify.py、extract.py"]
+        G5["输出：emitter.py"]
+    end
+    W4["Wave 4 编排和 CLI：orchestration/、cli/、pyproject console script"]
+    W5["Wave 5 测试、契约和开发文档：tests/ 归档、CONTRACTS/AGENTS/CLAUDE、开发文档"]
+    W6["Wave 6 对抗评审：独立 reviewer 驳倒声明清单"]
+    W0 --> W1 --> W2 --> W3 --> W4 --> W5 --> W6
+```
+
 ### Wave 0：冻结 spec
 
 主 agent 负责：
@@ -320,7 +338,7 @@ v1.9（M16 线索缝合，2026-07-16）向本封闭白名单登记两个新测�
 - 输入/流：`ingest.py`、`segment.py`；
 - 数据筛选：`dedup.py`、`classify.py`；
 - 质量和生成：`quality.py`、`generate.py`；
-- 标注和审核：`annotate.py`、`verify.py`、`extract.py`；
+- 标注和评审：`annotate.py`、`verify.py`、`extract.py`；
 - 输出：`emitter.py`。
 
 每组删除对应的旧平铺文件；目标树只保留 `labelkit/operators/*.py` 算子实现，不能修改其他算子组的业务行为。
@@ -341,7 +359,7 @@ v1.9（M16 线索缝合，2026-07-16）向本封闭白名单登记两个新测�
 
 严格按 §6.1 移动/合并测试，删除兼容导入测试，补目录形态与依赖边界断言，并更新 `docs/CONTRACTS.md`、`AGENTS.md`、`CLAUDE.md` 和命中的开发文档。
 
-### Wave 6：对抗复查
+### Wave 6：对抗评审
 
 独立 reviewer 必须尝试驳倒以下声明：
 
@@ -386,7 +404,7 @@ labelkit/config 不存在
 uv run pytest tests/integration -q -m integration
 ```
 
-并至少执行 `examples/text`、`examples/ui`、`examples/generate`、`examples/classify` 和 `examples/stream` 的 `validate` 或真实运行路径，确认 import 重构没有破坏 CLI 和运行时组装。没有 key 时，必须明确记录 integration 被环境跳过，不能把 offline 通过冒充 integration 通过。
+并至少执行 `examples/text`、`examples/ui`、`examples/generate`、`examples/classify` 和 `examples/stream` 的 `validate` 或真实运行路径，确认 import 重构没有破坏 CLI 和运行时组装。没有密钥时，必须明确记录 integration 被环境跳过，不能把 offline 通过冒充 integration 通过。
 
 ## 9. 完成定义
 

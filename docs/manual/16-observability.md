@@ -22,7 +22,7 @@
 | `run.start` / `run.end` | 首行 / 末行 | 配置指纹；终版 counts 与 exit_code |
 | `batch.start` / `batch.end` | 每批 | 各状态计数、耗时 |
 | `ingest.bad_line` / `missing_pair` / `index_conflict` | 接入跳过时 | 文件、行号/index、原因 |
-| `ingest.disorder` | 流式单调性校验拒绝一条记录时（乱序或时间戳解析失败，v1.8 stream 模式）；skip 策略下每记录一事件、stderr 全运行只 WARN 一次 | 文件、行号（文本）/ index（UI）、原因（乱序 \| 时间戳解析失败） |
+| `ingest.disorder` | 流式单调性校验拒绝一条记录时（乱序或时间戳解析失败，v1.8 流模式）；skip 策略下每记录一事件、stderr 全运行只 WARN 一次 | 文件、行号（文本）/ index（UI）、原因（乱序 \| 时间戳解析失败） |
 | `segment.session` | 会话装配器闭合一个候选会话时（v1.8）。仅 trace、无 stderr 镜像；通道为 `"segment"`（发出方是接入层，但按事件名前缀归 segment 通道），不在默认订阅里 | session_id、首末帧、长度、断开原因（gap / key / max_len / max_span / eof / limit） |
 | `segment.boundary` | 每个滑窗边界裁决经校验通过后（v1.8）。仅 trace、无 stderr 镜像；通道 `"segment"` | session_id、窗口区间、成员 id、逐帧关系判决（封闭五词表）；**reason** 仅当订阅了 segment 通道时才请求并携带（零额外 token 原则，同 classify） |
 | `stitch.judge` | 每个缝合候选判定定案后（一遍与二遍都发；votes 分裂回落保守结局时也发，v1.9）。仅 trace、无 stderr 镜像；通道 `"stitch"` | session_id、candidate（episode/rescue 候选两型）、repass（false=一遍/true=二遍）、verdict、thread_ref、priors（机械先验命中腿 ⊆ {app_overlap, entity_overlap, same_page}）、merged（是否实际并入——LLM 判 resume 而先验未过时 verdict 与 merged 分离）、confidence（仅观测不进门槛）；task_name / reason 自 `refs` 档起携带；votes 分裂时另带 votes_split=true |
@@ -51,21 +51,26 @@
 
 ## 16.3 rubric 调优闭环：让准则跟着证据迭代
 
-**为什么 rubric 不可能一次写对**：EvalGen（UIST 2024）的实验结论——评估准则存在 *criteria drift*，人往往要**看到评审的具体输出**才知道自己真正想要什么准则。所以 LabelKit 把每一次裁决和理由都暴露出来（`quality.judgment` 事件），供你迭代。
+**为什么 rubric 不可能一次写对**：EvalGen（UIST 2024）的实验结论——评估准则存在 *criteria drift*，人往往要**看到裁决的具体输出**才知道自己真正想要什么准则。所以 LabelKit 把每一次裁决和理由都暴露出来（`quality.judgment` 事件），供你迭代。
 
-标准闭环六步：
+标准闭环六步，环形推进、指标收敛即出环：
 
+```mermaid
+flowchart TD
+    s1["开记录仪：project.toml 设 trace.enabled = true、channels 含 quality（quality.judgment_reasons 默认 auto，此时自动生效）"]
+    s2["小样本跑：labelkit run ... --limit 100 --output out/tune.jsonl"]
+    s3["算指标+抽读：下方诊断指标表 + 抽读 20 条 reason"]
+    s4["改 rubric：改写 pairwise_prompt / 合并冗余准则 / 加缺失准则 / 调 weight"]
+    s5["同 seed 重跑（seed 不变 ⇒ 配对方案逐对相同，可比）"]
+    s6["定稿全量：可关 judgment_reasons 省 token"]
+    s1 --> s2 --> s3
+    s3 -->|指标未收敛| s4
+    s4 --> s5
+    s5 -->|对比指标是否收敛| s3
+    s3 -->|指标收敛| s6
 ```
-① 开记录仪      project.toml: trace.enabled=true, channels 含 "quality"
-                （quality.judgment_reasons 默认 "auto"，此时自动生效）
-② 小样本跑      labelkit run ... --limit 100 --output out/tune.jsonl
-③ 算指标+抽读   下方诊断表 + 抽读 20 条 reason
-④ 改 rubric     改写 pairwise_prompt / 合并冗余准则 / 加缺失准则 / 调 weight
-⑤ 同 seed 重跑  对比指标是否收敛（seed 不变 ⇒ 配对方案逐对相同，可比）
-⑥ 定稿全量      可关 judgment_reasons 省 token
-```
 
-### 诊断指标表（③ 的量化部分）
+### 诊断指标表（「算指标+抽读」的量化部分）
 
 | 信号 | 参考线 | 诊断 | 处置 |
 |---|---|---|---|
@@ -126,14 +131,14 @@ jq -c 'select(.ev=="quality.judgment" and (.record_ids | index("6e60ce3c2d59f04d
 
 ### 启动期预算 INFO 行（v1.11）
 
-本次运行引用的 profile 里只要有档声明了 `context_window`（第 6 章），`run.start` 之后就多一行**预算参数 INFO**：逐档给出「声明窗/输入预算」；stream 工程（segment 启用且所引档声明了窗）再多一行 segment 的静态最坏装填量。真实两行（examples/stream 工程）：
+本次运行引用的 profile 里只要有一个声明了 `context_window`（第 6 章），`run.start` 之后就多一行**预算参数 INFO**：逐 profile 给出「声明窗/输入预算」；stream 工程（segment 启用且所引 profile 声明了窗）再多一行 segment 的静态最坏装填量。真实两行（examples/stream 工程）：
 
 ```
 2026-07-23T04:46:24+08:00 INFO  run     batch=0 budget: default=131072/113868 judge=131072/115916
 2026-07-23T04:46:24+08:00 INFO  run     batch=0 segment: w_min=46 window=16 (budget)
 ```
 
-读法：`113868` = 声明窗 131072 扣掉输出预留（该档 `max_output_tokens`）与 10% 安全边距后**真正拿来装输入**的预算（judge 档输出预留小，可用输入反而更多）；`w_min=46` 是按最坏单帧成本（满长摘要 + diff 常数 + 每图先验）算出的单窗保底装填量——它 ≥ 窗上限 `window=16` 时装填顶格、行为与定长窗一致，它 < window 时实际窗会变小变多（对账细则见第 25 章成本账）。两行都是数据无关的参数与计数。**报告侧的对应读数是 `report.budget`**（profiles / w_min / truncations / overflow_records / image_cost / degrade_retries / escalations——第 8 章逐键解读），预算相关的记录级失败则以 `context_overflow` / `output_truncated` 两个新错误码落 rejects（第 18 章）。
+读法：`113868` = 声明窗 131072 扣掉输出预留（该 profile 的 `max_output_tokens`）与 10% 安全边距后**真正拿来装输入**的预算（judge profile 输出预留小，可用输入反而更多）；`w_min=46` 是按最坏单帧成本（满长摘要 + diff 常数 + 每图先验）算出的单窗保底装填量——它 ≥ 窗上限 `window=16` 时装填顶格、行为与定长窗一致，它 < window 时实际窗会变小变多（对账细则见第 25 章成本账）。两行都是数据无关的参数与计数。**报告侧的对应读数是 `report.budget`**（profiles / w_min / truncations / overflow_records / image_cost / degrade_retries / escalations——第 8 章逐键解读），预算相关的记录级失败则以 `context_overflow` / `output_truncated` 两个新错误码落 rejects（第 18 章）。
 
 想要完整的调用审计（每次请求的 token、延迟、重试、状态），订阅 trace 的 `llm` 通道即可——`llm.call` 事件字段命名对齐 OpenTelemetry GenAI 语义约定（`gen_ai.usage.input_tokens` 等），现成的 OTel 生态分析工具可以直接吃。
 
@@ -222,7 +227,7 @@ heartbeat batch=3 stage=quality llm_calls=182 elapsed=312s
 
 ### 面板长什么样
 
-examples/stream 工程（stream + stitch 全开，面板信息最全）真实运行的两帧（100 列伪终端捕获，剥除 ANSI 色彩后原样收录）。运行中的一帧——quality 阶段进行中，段棋盘的分母是与 dry-run 同源的**下界估算**（此帧分子 24 已越过下界 20，正是 stream 估算「episodes ≈ sessions 报下界」语义的实景；段棋盘行超出 100 列自然折行）：
+examples/stream 工程（stream + stitch 全开，面板信息最全）真实运行的两帧（100 列伪终端捕获，剥除 ANSI 色彩后原样收录）。运行中的一帧——quality 阶段进行中，段棋盘的分母是与 dry-run 同源的**下界估算**（此帧分子 24 已越过下界 20，正是流模式估算「episodes ≈ sessions 报下界」语义的实景；段棋盘行超出 100 列自然折行）：
 
 ```
 ────────────────────────────────────────────────────────────────────────────────────────────────────

@@ -30,7 +30,7 @@ api_key_env = "LABELKIT_KEY_DEFAULT"
 # ...
 ```
 
-核心概念是 **profile（配置档）**：`[llm.default]` 定义了一个名叫 `default` 的 LLM 接入档，`project.toml` 里各算子按名字引用它（`quality.llm = "default"`）。名字随意取，`default` 和 `judge` 只是惯例——前者当主力，后者当独立评审。
+核心概念是 **profile**：`[llm.default]` 定义了一个名叫 `default` 的 LLM profile，`project.toml` 里各算子按名字引用它（`quality.llm = "default"`）。名字随意取，`default` 和 `judge` 只是惯例——前者当主力，后者当独立评审。
 
 > **未知键警告**：写错键名不会导致启动失败，但会收到一条警告日志（「未知键，已忽略（前向兼容）」）。看到这条警告务必回头检查拼写——你以为改了的参数可能根本没生效。
 
@@ -98,7 +98,37 @@ max_concurrency = 8         # 注意：这是池内三把密钥合计的并发�
 - **同构池**：池内密钥共享该 profile 的其余全部字段——同一个 `base_url`、同一个 `model`。密钥池是传输层容错，不是模型路由；选中哪把密钥只影响时序，**不改变任何产出数据的内容**（密钥选择是确定性算法，不占用 `run.seed`，可复现性不受影响）。想混用不同模型请配多个 profile（见 6.5）。
 - **`max_concurrency` 仍是一个信号量**：整只池共享这一个并发额度，加密钥不会自动放大并发。密钥池解决的是「限流了怎么办」，想更快还得调 `max_concurrency`。
 
-运行时的**降级阶梯**是：轮换（零等待）→ 驻留（有界等待）→ 记录失败累积 → 熔断退出 4。逐级看：
+运行时的**降级阶梯**是：轮换（零等待）→ 驻留（有界等待）→ 记录失败累积 → 熔断退出 4。它分密钥级与池级两层状态机——
+
+**单把密钥**的生命周期：
+
+```mermaid
+stateDiagram-v2
+    state "可用" as avail
+    state "冷却" as cool
+    state "禁用" as dis
+    [*] --> avail
+    avail --> cool : 收到 429——遵从 Retry-After，无则按连续 429 计数全抖动指数冷却、封顶 300 秒
+    cool --> avail : 冷却期满（该密钥任一成功即清零连续 429 计数）
+    avail --> dis : 收到 401/403——本运行内永久禁用，stderr 警告一次
+```
+
+**整只池**的降级阶梯：
+
+```mermaid
+stateDiagram-v2
+    state "轮换（零等待）" as rot
+    state "驻留（有界等待）" as park
+    state "熔断（退出码 4）" as brk
+    [*] --> rot
+    rot --> rot : 某把密钥冷却或被禁用，同一尝试立即换存活密钥重发
+    rot --> park : 全部存活密钥都在冷却
+    park --> rot : 最早的冷却结束，重发
+    park --> brk : 驻留超过 run.max_park_s 的记录按重试耗尽失败并计入熔断窗口，连续累积触发熔断
+    rot --> brk : 最后一把存活密钥被禁用，立即熔断
+```
+
+逐级细则：
 
 | 阶段 | 触发 | 行为 |
 |---|---|---|
@@ -127,8 +157,8 @@ max_concurrency = 8         # 注意：这是池内三把密钥合计的并发�
 
 | 键 | 默认 | 填错的后果 |
 |---|---|---|
-| `supports_structured_output` | false | 声明该模型支持原生结构化输出。填 `true` 时，结构引擎启用 L0 层：OpenAI 兼容口传 `response_format={"type":"json_schema",...}`，Anthropic 口用强制工具调用把 Schema 作为工具入参。**模型实际不支持却填 true** ⇒ 请求可能直接报 400。填 false 完全没问题——只是结构保证全部落到代码修复层（第 14 章），多花一点修复调用 |
-| `supports_vision` | false | 声明该模型能看图。**UI 模态下被引用的 profile 必须为 true**——这是启动时的硬校验（填 false 会退出码 2），因为跑到一半才发现模型看不了图，钱已经烧了。v1.8/v1.9 stream 模式（第 25、26 章）下这条校验有三处例外：`extract.llm` 引用的档**恒**要求 true（每次摘取都看前后两帧截图）；`quality.llm` 反而**免除**要求（序列打分是纯文本，UI 模态也不看图）；`stitch.llm`（v1.9）同样**恒不**要求（缝合判定的证据是摘要卡，纯文本无图）。`segment.llm` v1.11 起**不在校验集内**：分段窗口是否附图由该档的本键**自动推导**（配了视觉档就自动附图，选 profile 即选能力；要纯文本裁决就把 `segment.llm` 指向纯文本档，第 25 章） |
+| `supports_structured_output` | false | 声明该模型支持原生结构化输出。填 `true` 时，结构引擎启用结构化输出层：OpenAI 兼容口传 `response_format={"type":"json_schema",...}`，Anthropic 口用强制工具调用把 Schema 作为工具入参。**模型实际不支持却填 true** ⇒ 请求可能直接报 400。填 false 完全没问题——只是结构保证全部落到代码修复层（第 14 章），多花一点修复调用 |
+| `supports_vision` | false | 声明该模型能看图。**UI 模态下被引用的 profile 必须为 true**——这是启动时的硬校验（填 false 会退出码 2），因为跑到一半才发现模型看不了图，钱已经烧了。v1.8/v1.9 流模式（第 25、26 章）下这条校验有三处例外：`extract.llm` 所引 profile **恒**要求 true（每次摘取都看前后两帧截图）；`quality.llm` 反而**免除**要求（序列打分是纯文本，UI 模态也不看图）；`stitch.llm`（v1.9）同样**恒不**要求（缝合判定的证据是摘要卡，纯文本无图）。`segment.llm` v1.11 起**不在视觉必需集内**：分段窗口是否附图由所引 profile 的本键**自动推导**（所引 profile 支持视觉就自动附图，选 profile 即选能力；要纯文本裁决就把 `segment.llm` 指向纯文本 profile，第 25 章）。v1.12 帧粒度（第 25 章 25.6）再添两条：`frame.annotate.llm` 所引 profile 在 UI 模态且 `frame.annotate` 启用时**恒**要求 true（逐成员标注要看帧截图）；`frame.classify.llm` **永不**加入视觉必需集（判决仅凭成员摘要行，纯文本无图——可指向纯文本 profile 省成本） |
 
 ### 生成参数
 
@@ -144,7 +174,7 @@ v1.11 给每个 profile 增加一套**可选**的上下文预算机制：声明�
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `context_window` | 0 | 模型上下文窗口（token）。**0 = 未声明 = 该档预算关闭**（被启用算子引用时启动打一条 WARN 提示可声明）。> 0 即开启预算，且须满足 `context_window > max_output_tokens + margin`，否则预算为非正数、直接配置错误（退出码 2）；`margin = max(256, ⌈0.10 × context_window⌉)`，承担估算残差与消息封装开销。**声明部署实效窗口，别照抄厂商表**：同名模型在不同部署实效窗口差数倍（Together 256K；vLLM 由 `--max-model-len` 决定；z.ai anthropic 路由的裸 glm-5.2 实测实效窗是 2²⁰ = 1,048,576，且按 `input + max_tokens` 合并判定——窗口只能实测，文档与命名约定都不可靠）。不确定时**欠声明恒安全**：声明小了只会多裁剪，绝不会溢出 |
+| `context_window` | 0 | 模型上下文窗口（token）。**0 = 未声明 = 该 profile 预算关闭**（被启用算子引用时启动打一条 WARN 提示可声明）。> 0 即开启预算，且须满足 `context_window > max_output_tokens + margin`，否则预算为非正数、直接配置错误（退出码 2）；`margin = max(256, ⌈0.10 × context_window⌉)`，承担估算残差与消息封装开销。**声明部署实效窗口，别照抄厂商表**：同名模型在不同部署实效窗口差数倍（Together 256K；vLLM 由 `--max-model-len` 决定；z.ai anthropic 路由的裸 glm-5.2 实测实效窗是 2²⁰ = 1,048,576，且按 `input + max_tokens` 合并判定——窗口只能实测，文档与命名约定都不可靠）。不确定时**欠声明恒安全**：声明小了只会多裁剪，绝不会溢出 |
 | `default_image_px` | 0 | 图片采样**默认工作点**（长边 px）。**0 = 沿用 `max_image_px`**（v1.10 行为逐字节不变）；> 0 时须 ≤ `max_image_px`，违反即配置错误（退出码 2）。日常调用按工作点缩放编码；verify 判 fail 走 repair 修复重标时按质量阶梯逐档上探（× 1.5/维），封顶 `max_image_px`（第 13 章） |
 
 ### 计价（可选但强烈建议配）
@@ -153,18 +183,18 @@ v1.11 给每个 profile 增加一套**可选**的上下文预算机制：声明�
 |---|---|
 | `price_per_mtok_in` / `price_per_mtok_out` | 每百万输入/输出 token 的单价。**两个单价都配置后**，运行报告的 `llm_usage` 才会多出 `est_cost_usd` 字段（第 8、17 章）；只配一个不生效。注意 `--dry-run` 仅估算调用次数（不含成本）；plain 档进度行也只显示批号与各状态计数，运行中想看成本累计要用 rich 档面板的 LLM 区块（未配单价显示 `—`，16.6），事后账单看报告。不配置不影响功能，只是没有成本数字 |
 
-## 6.4 `[embedding.<name>]`：语义去重的向量档
+## 6.4 `[embedding.<name>]`：语义去重的 embedding profile
 
 只有打算开启**语义去重**（`dedup.semantic = true`，第 9 章）才需要配。字段与 `[llm.*]` 同构，差异：
 
 | 键 | 默认 | 说明 |
 |---|---|---|
 | `provider` | `"openai_compatible"` | **本版唯一取值**。请求打 POST `{base_url}/embeddings` |
-| `base_url` / `model` / `api_key_env` | 必填 | 同 LLM 档 |
-| `api_key_envs` | 无 | v1.6 密钥池，与 `api_key_env` 恰提供其一；轮换/冷却/禁用/驻留机制与 LLM 档完全一致（见 6.3「密钥池」），每个列出的环境变量都须存在且非空 |
-| `max_concurrency` / `timeout_s` / `max_retries` / `retry_base_delay_s` | 8 / 60 / 5 / 1.0 | 与 LLM 档同一套重试/限流机制 |
+| `base_url` / `model` / `api_key_env` | 必填 | 同 LLM profile |
+| `api_key_envs` | 无 | v1.6 密钥池，与 `api_key_env` 恰提供其一；轮换/冷却/禁用/驻留机制与 LLM profile 完全一致（见 6.3「密钥池」），每个列出的环境变量都须存在且非空 |
+| `max_concurrency` / `timeout_s` / `max_retries` / `retry_base_delay_s` | 8 / 60 / 5 / 1.0 | 与 LLM profile 同一套重试/限流机制 |
 | `dims` | 不设 | 设了就逐次校验返回向量的维度，不匹配立即判致命错误——防「模型换了没人知道」的静默事故 |
-| `context_window` | 0 | v1.11：同 LLM 档的声明制（**0 = 未声明 = 该向量档预算关闭**）。> 0 时预算 = `context_window − margin`——embedding 没有输出、无输出预留；送去嵌入的文本超预算按**确定性头部保留**截断（第 9 章）。声明实效窗口与欠声明恒安全的指引同 6.3 |
+| `context_window` | 0 | v1.11：同 LLM profile 的声明制（**0 = 未声明 = 该 embedding profile 预算关闭**）。> 0 时预算 = `context_window − margin`——embedding 没有输出、无输出预留；送去嵌入的文本超预算按**确定性头部保留**截断（第 9 章）。声明实效窗口与欠声明恒安全的指引同 6.3 |
 
 ## 6.5 多 profile 的典型格局
 

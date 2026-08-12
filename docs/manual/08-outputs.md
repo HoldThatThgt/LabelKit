@@ -10,9 +10,31 @@
 | 文件 | 何时产生 | 内容 |
 |---|---|---|
 | `labels.jsonl` | 恒有 | 主输出：每行 = 用户 Schema 字段（+ 可选 `_meta`） |
-| `labels.rejects.jsonl` | `output.rejects ≠ "none"`（运行开始即创建；无淘汰时为 0 行空文件） | 被淘汰记录的案底 |
+| `labels.rejects.jsonl` | `output.rejects ≠ "none"`（运行开始即创建；无淘汰时为 0 行空文件） | 拒绝通道：被淘汰记录的环节、原因与引用 |
 | `labels.report.json` | 恒有 | 运行报告：纯统计，无数据内容 |
 | `labels.trace.jsonl` | `trace.enabled = true` | 事件流（第 16 章专讲） |
+
+每条记录的终态决定它流进哪条路由；四条路由一图看全：
+
+```mermaid
+flowchart TD
+    STATE["记录终态"] --> ACTIVE["active：存活到发射"]
+    STATE --> DROPPED["dropped_dup / dropped_lowq / dropped_verify<br/>（流模式另有 dropped_noise）：被淘汰"]
+    STATE --> FAILED["failed：处理失败"]
+    STATE --> STREAM["absorbed / stitched（流模式）：<br/>被吸收进序列的成员帧、并入线索的壳"]
+
+    ACTIVE --> MAIN["主输出 labels.jsonl<br/>（用户 Schema 字段 + 可选 _meta）"]
+    DROPPED --> REJECTS["拒绝通道 labels.rejects.jsonl<br/>（output.rejects ≠ none 时逐条落行，见 8.3）"]
+    FAILED --> REJECTS
+    ACTIVE --> REPORT["运行报告 labels.report.json<br/>（恒有；全部终态只进计数，见 8.4）"]
+    DROPPED --> REPORT
+    FAILED --> REPORT
+    STREAM --> REPORT
+
+    EVENTS["处理过程中的判定与调用事件（与终态正交）"] --> TRACE["trace 通道 labels.trace.jsonl<br/>（trace.enabled = true 时，第 16 章）"]
+```
+
+注意 absorbed 成员帧与 stitched 壳只进报告计数、不落拒绝通道——它们的内容已由所属序列行经主输出承载（8.3 末尾与 8.4 的 `--strict` 交互提醒）。
 
 主输出的交付是**原子**的：运行中写 `labels.jsonl.part`，全部完成后 fsync + 改名。运行结束后仍看到 `.part` 文件，说明那次运行没走到交付——进程硬崩溃或输出路径不可写留下的残骸。注意：Ctrl-C 的**优雅中断**会正常收尾交付（`.part` 被改名、报告标记 `interrupted: true`），不留残骸；v1.6 起**熔断中止也交付**——已完成批的 `.part` 同样 fsync + 原子改名，退出码仍是 4（此前版本熔断直接丢弃 `.part`，长跑末段一次配额死亡就赔掉全部已完成产出）。
 
@@ -116,7 +138,7 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
 
 这就是「门控可以留宽」策略的基础：分数随行落盘后，**当次没淘汰的，下游随时可以再筛**；而当次淘汰掉的，想找回来就得重跑。拿不准阈值时，宁可放宽 `quality.threshold` 甚至不设，把裁量权留给后筛。
 
-## 8.3 拒绝通道：淘汰者的案底
+## 8.3 拒绝通道：被淘汰记录的去向
 
 `rejects = "refs"`（默认）档，每行长这样（quickstart 工程的第一行，classify 开启所以带 `label` 键）：
 
@@ -126,7 +148,7 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
            "stage": "quality", "reason": "below_threshold", "errors": [], "label": "writing"}}
 ```
 
-- `stage` + `reason` 告诉你**在哪个工位、因为什么**被淘汰。常见组合：`dedup` / 判重类别（`exact` / `near_text` / `near_image` / `near_both`，开语义层时另有 `near_semantic`，与第 9 章一致）、`quality / below_threshold`（top_ratio 模式下为 `top_ratio`）、`verify / verify_fail`；stream 模式（第 25 章）另有 `segment` / `noise`、`segment` / `below_min_len` 与 `verify` / `off_task_member`；v1.9 的 `stitch` / `stitch_invalid` 仅在 `stitch.on_error = "fail"` 时出现（缝合判定失败的 episode 候选信封，第 26 章）。记录处理**失败**（状态 `failed`）时，`stage` 为出错工位、`reason` 为首个错误的**错误码**（如 `schema_violation`、`provider_fatal`；v1.11 增两值——`context_overflow` 上下文超预算、`output_truncated` 响应写满输出上限被终局拒绝，任何走 LLM 调用的工位都可能出现，全表见第 18 章），`errors` 列表为具体的错误信息文本。反向的提醒：缝合产生的 `stitched` 壳与救援命中的短段帧**不落 rejects**——救援把帧从 `dropped_noise` 翻回 `absorbed`，同一份输入开启缝合后 rejects 行数可能变少（`--strict` 交互见 8.4 末尾）；
+- `stage` + `reason` 告诉你**在哪个算子、因为什么**被淘汰。常见组合：`dedup` / 判重类别（`exact` / `near_text` / `near_image` / `near_both`，开语义层时另有 `near_semantic`，与第 9 章一致）、`quality / below_threshold`（top_ratio 模式下为 `top_ratio`）、`verify / verify_fail`；流模式（第 25 章）另有 `segment` / `noise`、`segment` / `below_min_len` 与 `verify` / `off_task_member`；v1.9 的 `stitch` / `stitch_invalid` 仅在 `stitch.on_error = "fail"` 时出现（缝合判定失败的 episode 候选信封，第 26 章）。记录处理**失败**（状态 `failed`）时，`stage` 为出错算子、`reason` 为首个错误的**错误码**（如 `schema_violation`、`provider_fatal`；v1.11 增两值——`context_overflow` 上下文超预算、`output_truncated` 响应写满输出上限被终局拒绝，任何走 LLM 调用的算子都可能出现，全表见第 18 章），`errors` 列表为具体的错误信息文本。反向的提醒：缝合产生的 `stitched` 壳与救援命中的短段帧**不落 rejects**——救援把帧从 `dropped_noise` 翻回 `absorbed`，同一份输入开启缝合后 rejects 行数可能变少（`--strict` 交互见 8.4 末尾）；
 - `refs` 档**不含数据内容**——想看被淘汰的原文，要么拿 `line_no` 回输入文件查，要么把 `rejects` 改成 `"full"`（原文随行落盘，注意这就是一份数据副本了）；
 - `rejects = "none"` 时不写此文件，淘汰只反映在报告计数里。**调优期强烈建议至少 refs**：质量门帮你扔掉了什么，是判断阈值合不合理的第一手材料。
 
@@ -203,11 +225,11 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
 }
 ```
 
-（分数与耗时是真实运行的快照，逐次运行会有浮动；计数守恒与字段结构不变。这份 text 报告里**没有** `stream` 节——它与 `counts` 里的 `episodes` / `absorbed` / `dropped_noise` 一样，仅 stream 模式（segment 启用）时出现，第 25 章。）
+（分数与耗时是真实运行的快照，逐次运行会有浮动；计数守恒与字段结构不变。这份 text 报告里**没有** `stream` 节——它与 `counts` 里的 `episodes` / `absorbed` / `dropped_noise` 一样，仅流模式（segment 启用）时出现，第 25 章。）
 
 读报告的三板斧：
 
-1. **先看 `counts` 对不对账**——各状态数量符合预期吗？`failed` 非零就去拒绝通道翻 `errors`（上面这份的 `failed=1` 是一次打分调用写满输出上限、按 v1.11 的 `output_truncated` 记录级拒绝——第 3、18 章）；
+1. **先看 `counts` 对不对账**——各状态数量符合预期吗？`failed` 非零就去拒绝通道翻 `errors`（上面这份的 `failed=1` 是一次打分调用写满输出上限、按 v1.11 的 `output_truncated` 记录级拒收——第 3、18 章）；
 2. **再看 `quality.aggregate_histogram`**——分布形状决定阈值画哪里。比如上面这份：0.2-0.4 两桶挤了 12 条，而本工程的三条类线（writing 0.2 / 全局 0.25 / qa 0.4）恰好全画在这片人堆里——阈值动一格、打分漂一格都会成批改变去留（第 20 章的「阈值敏感区」）。分类开启时按类画线要看 `by_class` 的分池直方图（第 24 章）——混合分布的汇总图会把几个类的峰糊在一起。如果直方图整体右移，同一条线就几乎不淘汰东西；
 3. **最后看 `llm_usage` 和 `timing`**——哪个阶段最烧钱/最耗时（几乎总是 quality），是否要换模式、调并发（第 17 章）。
 
@@ -216,23 +238,23 @@ jq -r '.intent' out/labels.jsonl | sort | uniq -c
 v1.6 增补了三处按需出现的字段（不出现时语义同旧版，已有的报告解析脚本不受影响）：
 
 - **`run.partial_delivery`**：仅熔断交付时出现且恒为 `true`（恒伴随 `circuit_broken: true`）——标记这份主输出是**部分交付**，消费方完整性判定见 8.1 节的警告框；
-- **`counts.unprocessed`**：仅熔断中止时增列——已扫描/已生成但因中止没走完流水线的记录数。守恒等式相应扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`（第 4 章的原式是它在 `unprocessed = 0` 时的特例）；
+- **`counts.unprocessed`**：仅熔断中止时增列——已扫描/已生成但因中止没走完流水线的记录数。守恒恒等式相应扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`（第 4 章的原式是它在 `unprocessed = 0` 时的特例）；
 - **`llm_usage` 的密钥池明细**（profile 用第 6 章的 `api_key_envs` 配了多把密钥时）：profile 对象增 `"keys": {"<环境变量名>": {"calls", "rate_limited", "disabled"}}`，按密钥拆分调用数、被限流（429）次数与是否被认证禁用——密钥一律以**环境变量名**标识，密钥值不会出现在任何日志或报告里；另有 `parked_calls` / `parked_ms`（池 >1 或数值非零时出现——单密钥驻留也留痕）：因「全部存活密钥都在限流冷却」而**驻留**等待的逻辑调用数与累计毫秒数。`disabled` 非零该换密钥，`parked_ms` 持续走高说明并发压过了密钥池的配额承受力——该加密钥或降 `max_concurrency`（驻留上限 `run.max_park_s` 见第 7 章；对应的 `llm.key_cooldown` / `llm.key_disabled` / `llm.pool_parked` 事件见第 16 章）。
 
 v1.7（分类算子，第 24 章）再增三处按需出现的字段（未启用时报告形状与旧版逐字段一致）：
 
 - **`classify` 节**（仅 `classify.enabled = true` 时出现）：`assignment`、逐类命中计数 `classes`、兜底归类数 `fallback_count` 与失败数 `failures`（multi 模式另有 `multi_label_records`）；`quality` 节同时增 `by_class` 分池统计——各池独立的直方图与准则均值；
-- **`counts.fanout`**（仅 `assignment = "multi"` 时增列）：多标签扇出净增的行数，守恒等式右侧相应 `+ fanout`（第 4 章）；
+- **`counts.fanout`**（仅 `assignment = "multi"` 时增列）：多标签扇出净增的行数，守恒恒等式右侧相应 `+ fanout`（第 4 章）；
 - **`generate.buckets` 的桶 key**：classify 启用时由「`<llm>×<style>`」两段扩展为「`<class>×<llm>×<style>`」三段（关闭时格式不变，第 12 章）。
 
-v1.8（时序流，第 25 章）再增两处按需出现的块（未启用时报告形状与旧版逐字段一致）：`counts` 增列 `episodes` / `absorbed` / `dropped_noise`，且 `counts` 之后新增顶层 `stream` 节（会话数、段长均值、`below_min_len`、摘要贫瘠帧数，extract / verify 各一个子块）——两者都仅 segment 启用时出现。守恒等式相应扩展为全展开形：左侧另加 `dropped_noise + absorbed`、右侧另加 `episodes`（未启用项恒 0 时退化回第 4 章原式；真实验算见第 25 章）；且 stream 模式下 `counts.unprocessed` 的出现条件从「仅熔断」扩为「熔断或优雅中断」。
+v1.8（流模式，第 25 章）再增两处按需出现的块（未启用时报告形状与旧版逐字段一致）：`counts` 增列 `episodes` / `absorbed` / `dropped_noise`，且 `counts` 之后新增顶层 `stream` 节（会话数、段长均值、`below_min_len`、摘要贫瘠帧数，extract / verify 各一个子块）——两者都仅 segment 启用时出现。守恒恒等式相应扩展为全展开形：左侧另加 `dropped_noise + absorbed`、右侧另加 `episodes`（未启用项恒 0 时退化回第 4 章原式；真实验算见第 25 章）；且流模式下 `counts.unprocessed` 的出现条件从「仅熔断」扩为「熔断或优雅中断」。
 
-v1.9（线索缝合，第 26 章）再增两处按需出现的字段（仅 `stitch.enabled = true` 时出现，未启用时报告与 v1.8 逐字节一致）：`counts` 增列 `stitched` / `threads`（被并进线索的 episode 壳数、线索数，恒满足 `threads = episodes − stitched`），`stream` 节内新增 `stitch` 子块（`{stitched, rescued_short, seams, judgments, repass_judgments, failures}`，逐键读法见第 26 章）；守恒等式左侧相应另加 `stitched`（第 4 章）。一处**无条件**的例外：stream×verify 的缺陷词表是闭集，`stream.verify.defects` 从五行扩为六行——即便 stitch 关闭，`wrong_stitch: 0` 这一行也在场（第 13、25 章）。`--strict` 交互提醒：stitched 壳与被救援的帧都不构成 rejects，同一份输入开启缝合后 `--strict` 的结果可能从 1 变 0（短段被救援、不再落 rejects）——属预期，不是账目错误。
+v1.9（线索缝合，第 26 章）再增两处按需出现的字段（仅 `stitch.enabled = true` 时出现，未启用时报告与 v1.8 逐字节一致）：`counts` 增列 `stitched` / `threads`（被并进线索的 episode 壳数、线索数，恒满足 `threads = episodes − stitched`），`stream` 节内新增 `stitch` 子块（`{stitched, rescued_short, seams, judgments, repass_judgments, failures}`，逐键读法见第 26 章）；守恒恒等式左侧相应另加 `stitched`（第 4 章）。一处**无条件**的例外：流模式下 verify 的缺陷词表是闭集，`stream.verify.defects` 从五行扩为六行——即便 stitch 关闭，`wrong_stitch: 0` 这一行也在场（第 13、25 章）。`--strict` 交互提醒：stitched 壳与被救援的帧都不构成 rejects，同一份输入开启缝合后 `--strict` 的结果可能从 1 变 0（短段被救援、不再落 rejects）——属预期，不是账目错误。
 
 v1.11（上下文预算，第 6、16 章）再增两处按需出现的字段，另有 rejects 词表的两个新 reason（见 8.3 节）：
 
-- **`budget` 节**（上面的样例里已在场）：仅当本次运行**被引用**的 profile 里至少一档声明了 `context_window` 时出现——全都不声明时报告与 v1.10 逐字节一致。键义见样例内注，三个值得盯的读数：`truncations` 某阶段持续走高 = 声明窗对这份数据偏小（预算裁剪在吃你的证据，考虑调大声明或换档）；`overflow_records` 非零 = 有记录连最小装填单元都塞不进（rejects 里对应 `context_overflow` 行）；`image_cost` 是按真实 usage **校准**的每图 token 成本终值（样本不足 8 个的档维持先验读数——第 21 章有一对真实的校准值/先验值对照：240 vs 1882）。segment 启用时另有 `w_min` 键：`{"segment.window": [窗上限, 最坏装填量]}`，与启动 INFO 行同源（16.4）；
-- **`stream.windows`**（`stream` 节内，v1.11 增键）：segment 实际切出的窗数，仅当 `segment.llm` 所指档声明了 `context_window` 时出现（预算不声明时 `stream` 节与 v1.10 逐字段一致）。预算装填下 dry-run 的 `segment_calls` 按最坏装填量报**上界**，实跑拿这个键对账——examples/stream 真跑估 5、实 5（最坏装填量 ≥ 窗上限时装填顶格，上界收紧为准确值；成本账见第 25 章）。
+- **`budget` 节**（上面的样例里已在场）：仅当本次运行**被引用**的 profile 里至少一个声明了 `context_window` 时出现——全都不声明时报告与 v1.10 逐字节一致。键义见样例内注，三个值得盯的读数：`truncations` 某阶段持续走高 = 声明窗对这份数据偏小（预算裁剪在吃你的证据，考虑调大声明或换用更大窗口的 profile）；`overflow_records` 非零 = 有记录连最小装填单元都塞不进（rejects 里对应 `context_overflow` 行）；`image_cost` 是按真实 usage **校准**的每图 token 成本终值（样本不足 8 个的 profile 维持先验读数——第 21 章有一对真实的校准值/先验值对照：240 vs 1882）。segment 启用时另有 `w_min` 键：`{"segment.window": [窗上限, 最坏装填量]}`，与启动 INFO 行同源（16.4）；
+- **`stream.windows`**（`stream` 节内，v1.11 增键）：segment 实际切出的窗数，仅当 `segment.llm` 所指 profile 声明了 `context_window` 时出现（预算不声明时 `stream` 节与 v1.10 逐字段一致）。预算装填下 dry-run 的 `segment_calls` 按最坏装填量报**上界**，实跑拿这个键对账——examples/stream 真跑估 5、实 5（最坏装填量 ≥ 窗上限时装填顶格，上界收紧为准确值；成本账见第 25 章）。
 
 v1.12（帧级分类与标注，第 25 章 25.6）再增两个按需出现的子块——都在 `stream` 节内，对应开关开启才出现（帧粒度全关时报告与 v1.11 逐字段一致）：
 
@@ -245,6 +267,6 @@ v1.12（帧级分类与标注，第 25 章 25.6）再增两个按需出现的子
 
 ## 8.5 产物管理的三个提醒
 
-1. **同一输出路径重跑会覆盖全部产物**。trace 文件在**首个事件写出时**截断——死于配置或输入校验的「秒败」运行不会碰它，但正常启动的重跑会。正式任务建议输出文件名带日期/批次号：`out/ime-intent-0703.jsonl`；
-2. **`--dry-run` 的产物写独立文件**：`{stem}.dryrun.report.json` 与 `{名}.dryrun{后缀}` 的 trace，不会覆盖上一次真实运行的账本，放心试跑；
+1. **同一输出路径重跑会覆盖全部产物**。trace 文件在**首个事件写出时**截断——死于配置或输入校验的运行不会碰它，但正常启动的重跑会。正式任务建议输出文件名带日期/批次号：`out/ime-intent-0703.jsonl`；
+2. **`--dry-run` 的产物写独立文件**：`{stem}.dryrun.report.json` 与 `{名}.dryrun{后缀}` 的 trace，不会覆盖上一次真实运行的账本，放心 dry-run；
 3. **rejects=full / trace 高档位的文件里有数据**，清理和保管是你的责任——LabelKit 只在你显式选择时才写它们。

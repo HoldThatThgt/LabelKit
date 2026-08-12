@@ -1,4 +1,4 @@
-# 计划书：时序流语义分割与动作摘取（stream / segment / extract）
+# 提案：时序流语义分割与动作摘取（stream / segment / extract）
 
 > 2026-07-13。需求：「当前支持文本/截图+控件树输入，但缺少时间这一个轴。当数据按时间排序输入时，希望 LabelKit 对其做语义分割（如控件树 1,3,4,5,6 代表用户用 Uber Eats 下单点外卖的全动作）。两个缺失能力：① 无法语义分割数据流；② 无法摘取流中的动作数据。达成后应可通过标注算子为序列打上动作标签（这是用户在做什么）。另问：这是否是业界标注工程的通用能力？如果不是，如何拆分成多个通用能力算子？」
 > **状态：已定稿并实现（v1.8，2026-07-14）。**评审与裁决见 `SPEC-stream-segmentation.md`（S1–S32）；本文保留为需求与调研原始记录。
@@ -16,12 +16,24 @@
 
 对「是否业界通用能力」的回答（详见 §3.5）：**作为端到端整体不是——它是 GUI 智能体训练数据工程的新兴专用管线（OS-Genesis / AgentNet / AITW），每家自建，通用标注工具（CVAT / Label Studio）只有“人工时序分段”而无自动语义分割算子，通用数据管线框架（Data-Juicer / NeMo Curator / distilabel）也没有此类算子；但拆开后的每一步都是有成熟背书的通用能力**（session window、话题分割/变点检测、逆动力学动作标注、"定位再描述"的两段式）。本提案正是按通用能力算子拆分设计的，每个算子独立可用。
 
-数据流变化一句话：
+数据流变化一句话——现行（记录各自独立）：
 
+```mermaid
+flowchart LR
+    cIngest[ingest] --> cDedup[dedup] --> cClassify[classify] --> cQuality[quality] --> cAnnotate[annotate] --> cVerify[verify] --> cEmit[emit]
 ```
-现行:      ingest ─────────────────────→ dedup → classify → quality → annotate → verify → emit   （记录各自独立）
-stream 模式: ingest(排序+会话化) → segment → dedup(序列语义) → classify → extract → quality → annotate → verify → emit
-                └── 帧流 ──────┘   └────────────────────── episode 信封 ──────────────────────┘
+
+流模式（ingest 与 segment 之间流动的是帧流，segment 之后流动的是 episode 信封）：
+
+```mermaid
+flowchart LR
+    subgraph frames["帧流"]
+        sIngest["ingest（排序+会话化）"] --> sSegment[segment]
+    end
+    subgraph episodes["episode 信封"]
+        sDedup["dedup（序列语义）"] --> sClassify[classify] --> sExtract[extract] --> sQuality[quality] --> sAnnotate[annotate] --> sVerify[verify] --> sEmit[emit]
+    end
+    sSegment --> sDedup
 ```
 
 ## 2. 需求拆解与现状
@@ -43,7 +55,7 @@ stream 模式: ingest(排序+会话化) → segment → dedup(序列语义) → 
 | Record 无任何时间戳字段；顺序性只有 `RecordRef.line_no` / `pair_index` | `types.py:136-145, 19-27` | 时间轴须新增声明；UI 的 `pair_index`（`ingest.py:321` 升序遍历）可直接作默认序键 |
 | 摄取顺序确定性：文件名字典序 → 行号；UI 跨子目录按单一 index 命名空间配对 | `ingest.py:238, 253-294, 301-331` | 排序层可信，stable sort 叠加自定义键即可 |
 | 切批 = `islice(stream, run.batch_size)` 顺序切段 | `orchestrator.py:187` | episode 会被批边界切断 ⇒ 会话化必须先于切批，切批改整会话装箱 |
-| Stage 合同②禁止删元素；改变批基数的先例只有「classify ②a 尾部追加」与「generate ③ 返回新子批」，均只增不减 | `stage.py:34-41`、`classify.py:308-325`、`orchestrator.py:279-287` | 「多帧并一条」需新立合同例外 ②b（吸收成员 + 尾部追加序列信封），M10 用 len 差计量（同 `counts.fanout` 构造，`orchestrator.py:270-278`） |
+| Stage 契约的不删元素条款禁止删元素；改变批基数的先例只有「classify 多标签扇出例外的尾部追加」与「generate 生成子批例外的返回新子批」，均只增不减 | `stage.py:34-41`、`classify.py:308-325`、`orchestrator.py:279-287` | 「多帧并一条」需新立契约例外「分段吸收例外」（吸收成员 + 尾部追加序列信封），M10 用 len 差计量（同 `counts.fanout` 构造，`orchestrator.py:270-278`） |
 | Status 是封闭 Literal（5 值）；emitter 按 status 分流两通道 | `types.py:10-16`、`emitter.py:105-135` | 新增 `absorbed`（成员并入 episode，两通道都不写）与 `dropped_noise`（噪声帧，进 rejects）两个状态值 |
 | M9 对单请求图片数无上限（两 provider body builder 对 parts 循环）；现有调用方最多 2 图（pairwise quality） | `llm_client.py:238-246, 273-283`、`quality.py:250-251` | 序列级多图标注无底层障碍；Anthropic 端点上限 100 图/请求、>20 图时单图限 2000px（2026-07 官方文档）⇒ 需帧数降采样旋钮 |
 | 跨记录聚合先例：pairwise 的「多记录进一 prompt + 一个 gather 并发」 | `quality.py:232-253, 331-354` | extract / 序列 annotate 的组装骨架现成 |
@@ -72,7 +84,7 @@ stream 模式: ingest(排序+会话化) → segment → dedup(序列语义) → 
 
 ### 3.2 动作摘取的算法范式
 
-**VPT（OpenAI, NeurIPS 2022, arXiv:2206.11795）**：用少量带动作标签的数据训练**逆动力学模型（IDM）** p(a_t | o_1…T)——因为可以同时看过去与未来帧，「反演环境动力学」远比行为克隆易学——再用 IDM 给 70k 小时无标签视频打伪动作标签。**启示**：「从相邻状态推断动作」是被大规模验证过的独立工序；LabelKit 的负边界「不训练/托管本地模型」（spec §2.1.2 ①）决定我们用 **LLM zero-shot 充当运行时 IDM**（与 M4 用运行时 API 替代 QuRater 离线分类器是同一个既有决策的延伸），且同样利用「可看前后帧」的非因果优势（extract 一次调用喂 s_i 与 s_{i+1} 两图）。
+**VPT（OpenAI, NeurIPS 2022, arXiv:2206.11795）**：用少量带动作标签的数据训练**逆动力学模型（IDM）** p(a_t | o_1…T)——因为可以同时看过去与未来帧，「反演环境动力学」远比行为克隆易学——再用 IDM 给 70k 小时无标签视频打伪动作标签。**启示**：「从相邻状态推断动作」是被大规模验证过的独立工序；LabelKit 的负边界「不训练/托管本地模型」（spec §2.1.2）决定我们用 **LLM zero-shot 充当运行时 IDM**（与 M4 用运行时 API 替代 QuRater 离线分类器是同一个既有决策的延伸），且同样利用「可看前后帧」的非因果优势（extract 一次调用喂 s_i 与 s_{i+1} 两图）。
 
 **控件树 diff 作确定性辅助**：UI 模态两帧的树是结构化数据，节点增删改（尤其 text/focus/bounds 变化）可代码侧确定性计算——这是 OpenCUA Action Reduction 的树版对应物，作为 extract 提示词的 `[树变更摘要]` 段注入，缩短视觉推断距离、降低幻觉。零额外调用。
 
@@ -83,7 +95,7 @@ stream 模式: ingest(排序+会话化) → segment → dedup(序列语义) → 
 | 会话窗口（流处理标准原语） | Flink `EventTimeSessionWindows.withGap()` / Beam `Sessions` / Flink SQL `SESSION` TVF；web 分析 30min gap 惯例 | 规则层照抄：inactivity gap + 分区键（keyBy 对应 `stream.key`）+ 动态上限；纯代码零成本 |
 | 话题/文本分割 | TextTiling（Hearst 1997）→ 嵌入化 TextTiling → **Embed-KCPD**（句嵌入上的核变点检测, arXiv:2601.18788）→ **Def-DTS**（LLM 多步演绎裁决话题边界, arXiv:2505.21033） | LLM 滑窗边界裁决即 Def-DTS 形态；变点检测（需 embedding profile）列演进候选 |
 | 无词表事件边界 | **GEBD**（Shou et al., ICCV 2021, arXiv:2101.10511）：taxonomy-free 事件边界检测——认知科学结论「人类无需预定义事件类别就自然地把连续活动切成有意义的块」被形式化为标注准则与基准（Kinetics-GEBD），边界 = 动作/主体/环境变化点 | **边界判据可以内置、无需任务词表**的直接背书——segment 的判据模板固定内置（§4.3），用户不写边界定义 |
-| RPA / task mining 的 UI 日志分割 | Marrella et al.《Automated segmentation of UI logs》(2020)；Leno et al. arXiv:2008.05782（无分段 UI 日志中发现候选例程，**显式处理不属于任何例程的噪声事件**）——两者均为无监督，不需要任务描述 | 「分段 = 边界发现 + 噪声剔除」的问题定义直接沿用；其难点变体「交错例程」（同一动作属多个例程）v1 明确不做（§7 决策点④） |
+| RPA / task mining 的 UI 日志分割 | Marrella et al.《Automated segmentation of UI logs》(2020)；Leno et al. arXiv:2008.05782（无分段 UI 日志中发现候选例程，**显式处理不属于任何例程的噪声事件**）——两者均为无监督，不需要任务描述 | 「分段 = 边界发现 + 噪声剔除」的问题定义直接沿用；其难点变体「交错例程」（同一动作属多个例程）v1 明确不做（§7 开放问题「交错 episode」） |
 | 稠密视频描述 | dense video captioning：先 temporal localization 再 captioning 的两段式（Vid2Seq, arXiv:2302.14115 及其前身） | 「定位/分段」与「描述/标注」拆成两个工序的先例——对应 segment 与 annotate 分立 |
 
 **任务描述问题（边界判据从哪来）**：需求方的关键疑虑——「让用户描述任务的起止但不提及任务本身，对人类太难」。业界对此有三种解法，且**没有任何一家要求用户书写任务相关的边界定义**：
@@ -100,7 +112,7 @@ stream 模式: ingest(排序+会话化) → segment → dedup(序列语义) → 
 - **Data-Juicer（200+ 算子）**：有 grouper 类算子（`key_value_grouper` / `naive_grouper`），全部按键值分组，**无时序会话化、无语义流分割算子**（检索其 operator zoo 全表核实）；NeMo Curator、distilabel 同样没有。
 - 结论：**「按语义把有序数据流分割成序列样本」在通用数据管线框架里是空白**——各家 GUI 数据工程（3.1）都是自建管线。这既回答了「不是通用能力」，也意味着 LabelKit 把它算子化是有差异化价值的。
 
-### 3.5 小结：是否通用能力 + 拆分方案（回答需求方问题③）
+### 3.5 小结：是否通用能力 + 拆分方案（回答需求方的「是否通用能力」之问）
 
 **判定**：端到端的「流语义分割 → 动作摘取 → 序列打标」**不是**业界标注工程的既有通用能力，而是 GUI 智能体数据工程的新兴专用管线（每家自建，无现成工具/框架算子）。**但它可以无损拆解为四个各自有成熟背书的通用能力**，这正是推荐的实现结构：
 
@@ -115,10 +127,11 @@ stream 模式: ingest(排序+会话化) → segment → dedup(序列语义) → 
 
 ### 4.1 总览与链序
 
-stream 模式（`segment.enabled = true` 时生效）规范链序：
+stream 模式（`segment.enabled = true` 时生效）规范链序（`_CHAIN_ORDER(stream)`，七算子）：
 
-```
-_CHAIN_ORDER(stream) = ("segment", "dedup", "classify", "extract", "quality", "annotate", "verify")
+```mermaid
+flowchart LR
+    segment --> dedup --> classify --> extract --> quality --> annotate --> verify
 ```
 
 - **segment 最前**：episode 形成先于一切逐条算子；
@@ -130,14 +143,14 @@ _CHAIN_ORDER(stream) = ("segment", "dedup", "classify", "extract", "quality", "a
 
 ### 4.2 时间轴与会话化（M2 扩展 + `[stream]` 配置节）
 
-**排序**：`stream.order_by` 声明序键——`"input_order"`（默认；文本 = 文件名字典序→行号，UI = `pair_index` 升序，即现行摄取序）| `"meta:<field>"`（文本模态从原始行对象 `Record.raw` 取时间戳字段，ISO-8601 / epoch 秒毫秒自动识别；UI 记录无 `raw`，M1 校验 meta:* 仅限文本模态）。**不做全量重排，只做流式单调性校验**——全量 sort 要求整流驻留内存，破坏惰性批生命周期与 §2.6 内存模型；且需求前提本就是「数据按时间排序输入」。乱序或时间戳解析失败的记录按 `stream.on_disorder = "skip"`（默认，计 bad_input + WARN 一次）| `"fail"`（InputError，退出码 3）处理。轻度乱序输入的有界重排窗口列演进候选（§7 决策点⑬）。
+**排序**：`stream.order_by` 声明序键——`"input_order"`（默认；文本 = 文件名字典序→行号，UI = `pair_index` 升序，即现行摄取序）| `"meta:<field>"`（文本模态从原始行对象 `Record.raw` 取时间戳字段，ISO-8601 / epoch 秒毫秒自动识别；UI 记录无 `raw`，M1 校验 meta:* 仅限文本模态）。**不做全量重排，只做流式单调性校验**——全量 sort 要求整流驻留内存，破坏惰性批生命周期与 §2.6 内存模型；且需求前提本就是「数据按时间排序输入」。乱序或时间戳解析失败的记录按 `stream.on_disorder = "skip"`（默认，计 bad_input + WARN 一次）| `"fail"`（InputError，退出码 3）处理。轻度乱序输入的有界重排窗口列演进候选（§7 开放问题「输入乱序处理」）。
 
 **会话化（规则层，纯代码）**：有序流上按三条规则切候选会话——
 - `stream.key = ["meta:<field>", ...]`（可选分区键，如设备/用户 id；键不同即断开——Flink keyBy 对应物）；
 - `stream.gap_s`（相邻记录时间差 > gap 断开；仅 `order_by = "meta:*"` 时可用）/ `stream.gap_steps`（按序号差断开，index 序可用）；
 - `stream.session_max_len` / `stream.session_max_span_s`（长度/时长上限硬断开，防退化超长会话）。
 
-**切批改整会话装箱**：会话作为不可分单元装入批（首适应，批容量 = `run.batch_size` 帧）；单会话超 batch_size ⇒ 硬切 + stderr WARN 一次（§7 决策点⑧）。M2 的会话缓冲区最多驻留一个未闭合会话（≤ session_max_len 条 Record 元数据，图像仍懒加载），不违反内存模型。**摄取器与切批的接口从「记录流」变为「会话流」——这是 M10 侧唯一的结构性改动**（编排器仍零业务逻辑：装箱是容量逻辑不是语义逻辑）。
+**切批改整会话装箱**：会话作为不可分单元装入批（首适应，批容量 = `run.batch_size` 帧）；单会话超 batch_size ⇒ 硬切 + stderr WARN 一次（§7 开放问题「会话超 batch_size」）。M2 的会话缓冲区最多驻留一个未闭合会话（≤ session_max_len 条 Record 元数据，图像仍懒加载），不违反内存模型。**摄取器与切批的接口从「记录流」变为「会话流」——这是 M10 侧唯一的结构性改动**（编排器仍零业务逻辑：装箱是容量逻辑不是语义逻辑）。
 
 ### 4.3 M14 segment（语义分段算子）
 
@@ -170,11 +183,11 @@ _CHAIN_ORDER(stream) = ("segment", "dedup", "classify", "extract", "quality", "a
 
 - **提示词**（确定性模板，进 CONTRACTS §10 新节）：system = 摘取指令 + 动作词表说明 + 可选 `extract.instruction` 域提示；user = `[前一帧截图]` 图 + `[后一帧截图]` 图 + `[树变更摘要]`（代码侧 diff：增/删/文本变化节点，bounded）+ `[前后帧树摘要]`。一请求 2 图 = pairwise quality 既有形态。
 - **内部 Schema**（照 AndroidControl 动作词表裁剪）：`{action_type: enum[click, long_press, input_text, scroll, open_app, navigate_back, navigate_home, wait, other], target: str|null, value: str|null, description: str}`。
-- **失败语义**：单转移 M8 修复耗尽按 `extract.on_error = "unknown"`（默认：该步记 `action_type="other"` + `detail.kind="extraction_invalid"` 留痕，episode 存活）| `"fail"`（episode failed → rejects）。留痕不写 `item.errors`（classify R4 同款：避免污染 rejects 归因）。
-- 文本模态 v1 默认不适用（`extract` 仅 UI 序列；文本序列的「转移」语义弱，列演进候选，§7 决策点⑦）。
+- **失败语义**：单转移 M8 修复耗尽按 `extract.on_error = "unknown"`（默认：该步记 `action_type="other"` + `detail.kind="extraction_invalid"` 留痕，episode 存活）| `"fail"`（episode failed → rejects）。留痕不写 `item.errors`（与 classify 侧裁决·fallback 留痕不写 errors 同款：避免污染 rejects 归因）。
+- 文本模态 v1 默认不适用（`extract` 仅 UI 序列；文本序列的「转移」语义弱，列演进候选，§7 开放问题「extract 文本模态」）。
 - 并发：episode 内转移 + 批内 episode 全部并入一个 gather（profile 信号量约束），骨架同 quality phase2。
 
-### 4.5 序列记录与 Stage 合同 ②b
+### 4.5 序列记录与 Stage 契约分段吸收例外
 
 **类型（只增）**：
 - `Record` 增两个带默认值字段：`kind: Literal["single","sequence"] = "single"`、`members: tuple[Record, ...] = ()`（frozen 保持；序列记录 text/raw/ui_tree/image = None，modality 取成员模态，ref.source_file = 会话首帧源）；
@@ -182,11 +195,11 @@ _CHAIN_ORDER(stream) = ("segment", "dedup", "classify", "extract", "quality", "a
 - 新 frozen dataclass `Transition {index: int, action: Mapping, model: str, attempts: int, detail: Mapping}`；
 - `Status` 增两值：`absorbed`（成员并入 episode；emitter 两通道都不写，仅计数）、`dropped_noise`（噪声帧；进 rejects，stage=segment, reason=noise）。
 
-**Stage 合同新例外 ②b**（与 ②a 并列，拟入 spec §4.3 / `stage.py` docstring / CONTRACTS §5）：
+**Stage 契约新例外「分段吸收例外」**（与多标签扇出例外并列，拟入 spec §4.3 / `stage.py` docstring / CONTRACTS §5）：
 
-> **②b segment 例外（仅 stream 模式）**——可将批内既有 active 成员信封的 status 置为 `absorbed` 或 `dropped_noise`（属①④的正常状态写入），并向传入列表**尾部**追加以这些成员拼装的序列信封；追加物视同批内普通元素、同受①③④约束；不得删除、重排或替换任何既有元素对象；返回值仍须是传入的同一列表对象。
+> **分段吸收例外（仅 stream 模式）**——可将批内既有 active 成员信封的 status 置为 `absorbed` 或 `dropped_noise`（属仅处理 active 条款与失败不逃逸条款下的正常状态写入），并向传入列表**尾部**追加以这些成员拼装的序列信封；追加物视同批内普通元素、同受仅处理 active 条款、生成子批例外与失败不逃逸条款约束；不得删除、重排或替换任何既有元素对象；返回值仍须是传入的同一列表对象。
 
-**计量归 M10**（同 `counts.fanout` 构造）：segment 阶段前后 len 差 = `counts.episodes`；`absorbed`/`dropped_noise` 由状态 tally 归集。守恒式扩展：
+**计量归 M10**（同 `counts.fanout` 构造）：segment 阶段前后 len 差 = `counts.episodes`；`absorbed`/`dropped_noise` 由状态 tally 归集。守恒恒等式扩展：
 
 ```
 emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed + bad_input + absorbed
@@ -197,7 +210,7 @@ emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed +
 
 | 算子 | 适配 | 说明 |
 |---|---|---|
-| M3 dedup | 序列记录的 `dedup_text` = 成员规范化 dedup_text 按序拼接（分隔符固定）；①精确 ②MinHash ④语义照常作用于拼接文本；③pHash **跳过**（序列无单图；成员级图像重复已被拼接文本的树重复间接覆盖） | episode 级重复 = 「同样的操作流程」，正是训练数据去重想要的语义 |
+| M3 dedup | 序列记录的 `dedup_text` = 成员规范化 dedup_text 按序拼接（分隔符固定）；精确层、近似层（MinHash）、语义层照常作用于拼接文本；图像层 pHash **跳过**（序列无单图；成员级图像重复已被拼接文本的树重复间接覆盖） | episode 级重复 = 「同样的操作流程」，正是训练数据去重想要的语义 |
 | M13 classify | 零代码倾向改动：序列记录提示词的「当前记录」段 = episode 摘要（成员帧摘要按序拼接，bounded）+ 首帧截图（UI）；类标签驱动 per-class extract/annotate/verify 覆盖（白名单增 `[class.*.extract]` 的 instruction 键） | episode 级「哪个 App/什么域」分类恰是 per-class 条件化的高价值场景 |
 | M4 quality | 序列提示词 = 步骤序列文本（extract 产物）+ 帧摘要，**不放全帧截图**（pairwise 两 episode × N 帧图会爆）；新增内置 `default:trajectory` rubric（判据任务无关，见下方 M4 专块）；pairwise 仍可用（比较池 = 批内 episodes，classify 分池保证同类比较） | 轨迹质量分默认只打分不筛（threshold 缺省语义），门控可选 |
 | M5 annotate | 提示词增 `[动作序列]` 段（transitions 逐步文本，verbatim 注入）+ `[关键帧截图]` 多图：≤ `annotate.sequence_frames`（默认 20，首末帧恒保留，中间均匀降采样——Anthropic >20 图触发 2000px 单图上限 + 32MB 请求上限）；用户 Schema 照常承载最终结构（如 `{task_label, app, summary, steps[]}`） | 「这是用户在做什么」= 用户 Schema 的一个字段，工具不预设 |
@@ -223,8 +236,8 @@ emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed +
 4. **硬门 + 修复驱动（M7）**：stream 模式下 verify 内部 Schema 从「verdict + 批评意见」升级为「verdict + 类型化缺陷表」`defects: [{kind: label_mismatch | off_task_members | missing_head | missing_tail | missing_members, members?, position?, detail}]`（M8 enum 校验；`missing_members` = 段**中部**存在不可解释跳变、疑似缺帧——过度过滤不只发生在头尾）；评审证据 = 步骤序列 + 首末帧截图 + **边界余量摘要**：段边界外前后各 k 帧（默认 2）的帧摘要及其当前去向（`noise` / 相邻段段号）——语音端点检测 hangover 的证据版，使 `missing_head/tail` 的判定从「开局即中途」的间接推断变为与界外邻帧的直接对照（纯文本摘要，零额外 LLM 调用）。`policy="repair"` 时按缺陷类型路由修复（谁的错找谁修；机制沿用现行「批评回喂 `annotate_record` 重标注」的函数直调形态，M7 不重入链）：
    - `label_mismatch` → 现行回路重标注（零新机制）；
    - `off_task_members`（漏过滤）→ **成员收缩**：该成员置 `dropped_noise`、接缝转移重摘取（1–2 次 extract 调用）→ 重标注 → 复审；
-   - `missing_head/tail/members` → **缺帧三级判定**（按序查找，逐级降级）：① 缺口的时序邻域（head=段首前、tail=段尾后、members=跳变接缝的序键区间）内存在同会话 `dropped_noise` 帧 → **成员回收**：经边界复裁（复用 M14 窗口裁决）回收入段、重摘取接缝转移 → 重标注 → 复审——批内可行性由两条既有保证兜底：整会话装箱（缺帧必与段同批）+ Stage 合同「只改状态不删元素」（被弃帧仍在批列表里，emit 前状态可翻回——②b 合同措辞注明此翻转仅限 M7 修复路径）；② 缺帧在**相邻 episode**（切头切尾的跨段形态）→ v1 只标记不修复（跨段搬帧级联失效邻段已完成的打分/标注/评审，成本翻倍且可能乒乓；跨段仲裁列演进候选）；③ **无处可寻**（采集端本就没拍到 / 摄取期坏行、配对缺失、乱序被弃）→ 标记 `detail.suspected = "capture_gap"`——这是 LabelKit 不可知不可修的层次，只能靠上游采集解决；缺陷记入 `_meta.verification.defects` 供下游过滤或回溯。
-   修复轮数计入 `verify.max_repair_rounds`（含首评，语义不变）；全部路由确定性（enum 缺陷 + 确定性拼接，不消耗 rng）。**修复是工位内微循环，不是链级循环**：链严格单遍（编排器无递归原则，同 generate 回流单轮），成员手术调用的是 segment/extract 的函数（窗口复裁只看接缝邻域），量级 O(缺陷数) 而非 O(批)。**修复后不重打分**：pairwise 分数是池内相对量（BT 全池联立），单 episode 无法脱池重算——沿用修复前分数 + `_meta.stream.repaired = true` 使陈旧性对下游可见。计数器 `verify.membership_repairs` / `verify.boundary_flags`；`_meta.verification` 增 `defects` 键（仅 stream 模式）。
+   - `missing_head/tail/members` → **缺帧三级判定**（按序查找，逐级降级）：① 缺口的时序邻域（head=段首前、tail=段尾后、members=跳变接缝的序键区间）内存在同会话 `dropped_noise` 帧 → **成员回收**：经边界复裁（复用 M14 窗口裁决）回收入段、重摘取接缝转移 → 重标注 → 复审——批内可行性由两条既有保证兜底：整会话装箱（缺帧必与段同批）+ Stage 契约不删元素条款「只改状态不删元素」（被弃帧仍在批列表里，emit 前状态可翻回——分段吸收例外的契约措辞注明此翻转仅限 M7 修复路径）；② 缺帧在**相邻 episode**（切头切尾的跨段形态）→ v1 只标记不修复（跨段搬帧级联失效邻段已完成的打分/标注/评审，成本翻倍且可能乒乓；跨段仲裁列演进候选）；③ **无处可寻**（采集端本就没拍到 / 摄取期坏行、配对缺失、乱序被弃）→ 标记 `detail.suspected = "capture_gap"`——这是 LabelKit 不可知不可修的层次，只能靠上游采集解决；缺陷记入 `_meta.verification.defects` 供下游过滤或回溯。
+   修复轮数计入 `verify.max_repair_rounds`（含首评，语义不变）；全部路由确定性（enum 缺陷 + 确定性拼接，不消耗 rng）。**修复是算子内微循环，不是链级循环**：链严格单遍（编排器无递归原则，同 generate 回流单轮），成员手术调用的是 segment/extract 的函数（窗口复裁只看接缝邻域），量级 O(缺陷数) 而非 O(批)。**修复后不重打分**：pairwise 分数是池内相对量（Bradley-Terry 全池联立），单 episode 无法脱池重算——沿用修复前分数 + `_meta.stream.repaired = true` 使陈旧性对下游可见。计数器 `verify.membership_repairs` / `verify.boundary_flags`；`_meta.verification` 增 `defects` 键（仅 stream 模式）。
 5. **运行级审计闭环**：修不了的系统性失配（gap 失配、摘要漏实体）进 report（缺陷直方图、噪声率、平均段长）与 trace（`segment.boundary` / `verify.verdict` 带 reason）→ 调 window/gap/context → 同 seed 重跑对比（§7.5 同款）。
 
 ### 4.7 配置设计（project.toml 增量）
@@ -262,19 +275,19 @@ on_error = "unknown"              # "unknown" | "fail"
 sequence_frames = 20              # 序列标注单请求最大帧数（首末恒保留 + 均匀降采样）
 ```
 
-M1 组合约束（并入 §2.3.1 / §3.1.4）：`segment.enabled` 要求 `run.mode="process"` 且 `generate.enabled=false`；**`segment.enabled` 要求 `annotate.enabled`（v1，决策点⑭）**——annotate 关闭时序列记录无 passthrough 输出形态（序列 Record 无 `raw` 载荷可写主输出）；`extract.enabled` 要求 `segment.enabled` 且 UI 模态；`stream.gap_s`/`session_max_span_s` 要求 `order_by="meta:*"`；`order_by="meta:*"` 仅限文本模态（UI 记录无 `raw`）；`[stream]` 在场而 `segment.enabled=false` ⇒ warning（对齐 R8 no-op 分级惯例）；`segment.llm`/`extract.llm` 计入密钥解析/vision/probe 三处引用集（R24 同款；extract 恒入 vision_users，segment 仅 `use_vision=true` 时）；**stream 模式下 quality 的 supports_vision 强制校验放宽**（序列打分纯文本，§4.6）；`[class.<name>.extract]` 入按类覆盖白名单（仅 instruction 键），**segment 不入白名单**——链序因果：segment 在 classify 之前执行，类标签尚不存在，须在 spec 白名单表显式注明缘由。
+M1 组合约束（并入 §2.3.1 / §3.1.4）：`segment.enabled` 要求 `run.mode="process"` 且 `generate.enabled=false`；**`segment.enabled` 要求 `annotate.enabled`（v1，开放问题「stream ⇒ annotate 必开」）**——annotate 关闭时序列记录无 passthrough 输出形态（序列 Record 无 `raw` 载荷可写主输出）；`extract.enabled` 要求 `segment.enabled` 且 UI 模态；`stream.gap_s`/`session_max_span_s` 要求 `order_by="meta:*"`；`order_by="meta:*"` 仅限文本模态（UI 记录无 `raw`）；`[stream]` 在场而 `segment.enabled=false` ⇒ warning（对齐裁决·关开关留配置仅警告的 no-op 分级惯例）；`segment.llm`/`extract.llm` 计入密钥解析/视觉必需/probe 三处引用集（与裁决·三处引用集补分类同款；extract 恒入 vision_users，segment 仅 `use_vision=true` 时）；**stream 模式下 quality 的 supports_vision 强制校验放宽**（序列打分纯文本，§4.6）；`[class.<name>.extract]` 入按类覆盖白名单（仅 instruction 键），**segment 不入白名单**——链序因果：segment 在 classify 之前执行，类标签尚不存在，须在 spec 白名单表显式注明缘由。
 
 ### 4.8 输出与可观测性
 
 - **`_meta` 增恒在键 `"stream"`**（未启用 = null，对齐 classification 惯例）：`{episode_id, session_id, order_span: [first_key, last_key], member_count, member_ids: [...], member_sources: [...], steps: [{index, action_type, target, value, description}]}`——steps 为 extract 产物 verbatim（输出主通道本就承载数据内容；报表仍只含计数）。
 - **rejects**：`dropped_noise` 行 stage="segment"、reason="noise"；episode 级失败行携带 `episode_id`。
-- **report**：新 `stream` 节 `{sessions, episodes, mean_episode_len, absorbed, dropped_noise, extract: {transitions, unknown_actions, failures}}`；counts 增 `episodes`/`absorbed`/`dropped_noise`（§4.5 守恒式）。
+- **report**：新 `stream` 节 `{sessions, episodes, mean_episode_len, absorbed, dropped_noise, extract: {transitions, unknown_actions, failures}}`；counts 增 `episodes`/`absorbed`/`dropped_noise`（§4.5 守恒恒等式）。
 - **trace**：channels 增 `"stream"`；新事件 `segment.session`（会话闭合：起止键/长度）、`segment.boundary`（LLM 裁决窗：判决摘要，reason 受 `trace.content` 分级脱敏）、`extract.step`（每转移动作结果）。
 - **dry-run 估算**：`segment_calls ≈ Σ ceil((session_len−1)/window)`（hybrid/llm）；`extract_calls = Σ (episode_len−1)`；quality/annotate/verify 按 episode 数计。会话构成静态不可精确知 ⇒ 按 gap 规则空跑（不发 LLM）出精确会话数后估算——摄取元数据空跑与现有 `scan(estimate=False)` 先例同构。
 
 ### 4.9 成本模型（示例量级）
 
-> **v1.8 勘误（S22，2026-07-14）**：本段原文两处计数错误——extract 应为 **400** 次（转移数 = Σ(episode_len−1) = 450 − 50，原文把成员数当了转移数）；quality(pointwise) 应为 **200** 次（每记录 × 每准则一调用，四准则 × 50）。修正合计 ≈ **725–750** 次；「与逐帧 annotate 500 次同量级」的结论仍成立（~1.5×）。segment_calls 估算公式分母同步修正为 window−1（滑窗重叠 1 帧）。正式公式见 spec §3.10.3 与手册第 17 章调用账表。
+> **v1.8 勘误（裁决·窗口估算公式修正，2026-07-14）**：本段原文两处计数错误——extract 应为 **400** 次（转移数 = Σ(episode_len−1) = 450 − 50，原文把成员数当了转移数）；quality(pointwise) 应为 **200** 次（每记录 × 每准则一调用，四准则 × 50）。修正合计 ≈ **725–750** 次；「与逐帧 annotate 500 次同量级」的结论仍成立（~1.5×）。segment_calls 估算公式分母同步修正为 window−1（滑窗重叠 1 帧）。正式公式见 spec §3.10.3 与手册第 17 章调用账表。
 
 500 帧 UI 流、约 25 会话、精化后 50 episodes（均长 ~9）：segment(hybrid) ≈ 25–50 次纯文本调用；extract ≈ 450 次（2 图/次）；quality(pointwise) 50；annotate 50（≤20 图/次）；verify 50。合计 ≈ 650 次调用，与「逐帧 annotate 500 次」同量级，但产出从 500 条孤立标注变为 50 条带步骤的任务序列样本。extract 是大头，可独立指低成本 vision profile；`segment.strategy="rules"` + `extract.enabled=false` 的最小配置零新增调用（纯会话分组 + 序列标注）。
 
@@ -284,7 +297,7 @@ M1 组合约束（并入 §2.3.1 / §3.1.4）：`segment.enabled` 要求 `run.mo
 |---|---|
 | 无持久化 | 会话缓冲与 episode 均为进程内存，无新落盘面。✓ |
 | 跨批存活状态封闭清单 | 会话缓冲随切批消费即释放；episode 生命周期 = 一批；跨批存活仍仅 dedup 索引 + 计数器（M2 缓冲属摄取流的一部分，同 ingest 文件句柄级别）。✓（spec §3.10.3 须补一句注记） |
-| 记录级隔离 | 帧级失败落该帧/该 episode，不出批；②b 例外文字钉死。✓ |
+| 记录级隔离 | 帧级失败落该帧/该 episode，不出批；分段吸收例外文字钉死。✓ |
 | 可复现 | stable sort + 规则确定性 + temperature 0 + 确定性缝合/拼装 + seed 豁免面不变。✓ |
 | 隐私 | 帧摘要/步骤文本只去配置声明的 LLM 端点；stderr 无数据内容；trace reason 受 `trace.content` 分级。✓ |
 | 内存 | 序列 Record 持成员引用（frozen 共享）；图像懒加载不变（extract 峰值 2 图/请求、annotate ≤ sequence_frames 图）。✓ |
@@ -296,49 +309,49 @@ M1 组合约束（并入 §2.3.1 / §3.1.4）：`segment.enabled` 要求 `run.mo
 
 | 模块 | 改动项 | 量级 |
 |---|---|---|
-| M1 config | `StreamConfig`/`SegmentConfig`/`ExtractConfig` 三个 frozen dataclass + `AnnotateConfig.sequence_frames`；`ResolvedConfig` 增 3 必填字段——全必填风格（R23）⇒ ★直接构造它的 ~14 个测试文件机械补参；三节解析 + `*_provided` 防呆 warning；组合约束全量清单（§4.7，含 ★segment⇒annotate 必开、★stream 模式放宽 quality 的 vision 强制校验）；两 profile 入密钥/vision/probe 三处引用集（★extract 恒入 vision_users、segment 仅 use_vision 时）；★`[class.*]` 白名单增 `extract`（仅 instruction）但**不含 segment**（链序因果，须文档化）；★rubric selector 枚举扩 `default:trajectory` | 中-大 |
+| M1 config | `StreamConfig`/`SegmentConfig`/`ExtractConfig` 三个 frozen dataclass + `AnnotateConfig.sequence_frames`；`ResolvedConfig` 增 3 必填字段——全必填风格（裁决·配置全必填风格）⇒ ★直接构造它的 ~14 个测试文件机械补参；三节解析 + `*_provided` 防呆 warning；组合约束全量清单（§4.7，含 ★segment⇒annotate 必开、★stream 模式放宽 quality 的 vision 强制校验）；两 profile 入密钥/vision/probe 三处引用集（★extract 恒入 vision_users、segment 仅 use_vision 时）；★`[class.*]` 白名单增 `extract`（仅 instruction）但**不含 segment**（链序因果，须文档化）；★rubric selector 枚举扩 `default:trajectory` | 中-大 |
 | M2 ingest | `order_by` 键解析（★meta:* 仅文本模态——UI 记录无 raw）；★排序语义修订：**全量重排改为流式单调性校验**（`stream.on_disorder`，整流 sort 破坏惰性内存模型）；会话装配器（缓冲 ≤ session_max_len，gap/key/上限闭合，对 M10 暴露会话流视图）；IngestReport 增 sessions；dry-run 会话空跑（读全量元数据，成本同现有行数估算） | 中 |
-| M14 segment（新） | 本体：帧摘要 + diff 提示组装 → 三步演绎滑窗裁决（M8 内部 Schema）→ 确定性缝合 → episode 拼装与状态改写（②b） | 中 |
-| M3 dedup | 序列 `dedup_text` = 成员规范化文本按序拼接；③pHash 对序列跳过；★`ui_dup_requires` 合成判定对序列退化为纯文本层——spec §3.3 须明文（"both" 语义不适用序列） | 小 |
+| M14 segment（新） | 本体：帧摘要 + diff 提示组装 → 三步演绎滑窗裁决（M8 内部 Schema）→ 确定性缝合 → episode 拼装与状态改写（分段吸收例外） | 中 |
+| M3 dedup | 序列 `dedup_text` = 成员规范化文本按序拼接；图像层 pHash 对序列跳过；★`ui_dup_requires` 合成判定对序列退化为纯文本层——spec §3.3 须明文（"both" 语义不适用序列） | 小 |
 | M13 classify | 序列提示词分支（episode 摘要 + 首帧截图）；★multi 扇出 × episode：克隆时 `transitions` 恒 None（extract 在 classify 后）零代码；★verify 成员修复后兄弟信封 record 分叉——共享语义边界须文档声明 | 小 |
-| M15 extract（新） | 本体：相邻对（2 图 + 树 diff 摘要）裁决 → 内部动作 Schema（AndroidControl 词表裁剪）→ `unknown` 兜底留痕（不写 item.errors，R4 同款） | 中 |
+| M15 extract（新） | 本体：相邻对（2 图 + 树 diff 摘要）裁决 → 内部动作 Schema（AndroidControl 词表裁剪）→ `unknown` 兜底留痕（不写 item.errors，与裁决·fallback 留痕不写 errors 同款） | 中 |
 | M4 quality | 序列提示词分支（步骤文本 + 帧摘要，**无图**）；`default:trajectory` 内置 rubric（包数据 + spec Appendix A 全文）；★extract 关闭时轨迹 rubric 退化为按帧摘要打分——rubric 文本不得预设 steps 在场，M1 对该组合发 warning 指引 | 中 |
-| M5 annotate | 序列模板分支：`[动作序列]` verbatim 注入 + `[关键帧截图]` ≤ `sequence_frames` 多图（首末恒保留、均匀降采样）——CONTRACTS §10.3 冻结模板修订（R27 同级）；sc / L2.5 / repair 后缀路径全不动 | 小-中 |
+| M5 annotate | 序列模板分支：`[动作序列]` verbatim 注入 + `[关键帧截图]` ≤ `sequence_frames` 多图（首末恒保留、均匀降采样）——CONTRACTS §10.3 冻结模板修订（与裁决·分类自钉 UI 模板同级）；自洽采样 / 代码回调校验层 / repair 后缀路径全不动 | 小-中 |
 | M6 generate | 零代码——M1 互斥约束挡住（`segment.enabled ⇒ ¬generate.enabled`，含 generate_only） | — |
 | M7 verify | 内部 Schema 升级类型化缺陷表；按缺陷路由修复（§4.6 专块：成员收缩/噪声池回收/跨段只标记）；★episode id **形成时定死、成员修复不重算**（trace 可追溯性；`_meta.stream` 增 `repaired` 标记）；★被直调的 extract/segment 侧函数须列入 CONTRACTS §7 公开 API（沿 M7→`annotate_record` 既有先例）；`_meta.verification.defects` | 中 |
-| M8 schema_engine | 三个内部 Schema builder：segment 窗口关系表 / extract 动作 / verify 缺陷表——关键字集 ⊆ 既有冻结集、无 uniqueItems（R1 教训）；内部 Schema 不过 L2.5（同 classification_schema 先例） | 小 |
+| M8 schema_engine | 三个内部 Schema builder：segment 窗口关系表 / extract 动作 / verify 缺陷表——关键字集 ⊆ 既有冻结集、无 uniqueItems（裁决·Schema 不写 uniqueItems 的教训）；内部 Schema 不过代码回调校验层（同 classification_schema 先例） | 小 |
 | M9 llm_client | **零改动**——多图 body 构造已就绪（`llm_client.py:238-246, 273-283` 勘察证实，两 provider 对 parts 循环无张数限制） | — |
-| M10 orchestrator | 切批改整会话装箱（仅 stream 路径；非 stream 走原 `islice`，零变化回归锚）；`_CHAIN_ORDER` 双态；`counts.episodes` len-差计量（fanout 同构）+ absorbed/dropped_noise 入状态 tally；守恒式扩展；★熔断部分交付的 `unprocessed` 残差须计入**会话缓冲中未消费帧**（v1.6 公式再扩）；report `stream` 节；`_estimate` 双模式公式 | 中-大 |
+| M10 orchestrator | 切批改整会话装箱（仅 stream 路径；非 stream 走原 `islice`，零变化回归锚）；`_CHAIN_ORDER` 双态；`counts.episodes` len-差计量（fanout 同构）+ absorbed/dropped_noise 入状态 tally；守恒恒等式扩展；★熔断部分交付的 `unprocessed` 残差须计入**会话缓冲中未消费帧**（v1.6 公式再扩）；report `stream` 节；`_estimate` 双模式公式 | 中-大 |
 | M11 emitter | ★`absorbed` 是**第三条路由**（主输出与 rejects 都不写、仅入状态计数——现分发仅 active/其余两路，`emitter.py:105-135` 切口）；`dropped_noise` 进 rejects（stage=segment, reason=noise）；`_meta.stream` 恒在键（未启用 = null，随 classification 惯例）；`_meta.verification.defects`；summary/progress 增计数展示 | 中 |
 | M12 obslog | channels 8→9（`"stream"`；唯一硬编码改点 `loader.py:67`）；新事件 `segment.session` / `segment.boundary` / `extract.step`（reason 受 trace.content 分级）；segment/extract 阶段 error 事件的通道归属表 | 小 |
-| types / stage / errors | `Record` 尾部增 `kind`/`members`（带默认，frozen 兼容——现七字段全无默认，只能尾部追加）；`PipelineItem` 增 `transitions`；新 frozen `Transition`；`Status` 增 2 值（封闭 Literal 改点集中 types/emitter/orchestrator 三处）；②b 合同 + ★M7 修复路径状态翻转注记（dropped_noise → 回收仅限该路径）；ErrorKind 增 `segmentation_invalid`/`extraction_invalid`；★帧摘要 helper 落位 `types.py`（毗邻 `UITree.serialize()`，segment/classify/quality 三处共用——算子层不得互相依赖，共享工具必须下沉服务层/共享层） | 中 |
-| hooks | 零改动（L2.5 仅作用于用户 Schema 标注调用，序列 annotate 天然覆盖；sample_validator 属 generate，互斥） | — |
+| types / stage / errors | `Record` 尾部增 `kind`/`members`（带默认，frozen 兼容——现七字段全无默认，只能尾部追加）；`PipelineItem` 增 `transitions`；新 frozen `Transition`；`Status` 增 2 值（封闭 Literal 改点集中 types/emitter/orchestrator 三处）；分段吸收例外契约 + ★M7 修复路径状态翻转注记（dropped_noise → 回收仅限该路径）；ErrorKind 增 `segmentation_invalid`/`extraction_invalid`；★帧摘要 helper 落位 `types.py`（毗邻 `UITree.serialize()`，segment/classify/quality 三处共用——算子层不得互相依赖，共享工具必须下沉服务层/共享层） | 中 |
+| hooks | 零改动（代码回调校验层仅作用于用户 Schema 标注调用，序列 annotate 天然覆盖；sample_validator 属 generate，互斥） | — |
 | cli.py | `_build_stages` 注册 SegmentStage/ExtractStage（链位序）；`referenced_profiles()` 增两 profile；★`labelkit rubric --show default:trajectory` | 小 |
-| spec/ | 新 `314-m14-segment.md` / `315-m15-extract.md`；§1.5/§1.6 背书与决策、§2.1–2.5 架构/开关矩阵/dry-run、§4 类型与 ②b、§5.2 三节键表 + 白名单表、§6.2–6.4 输入语义/`_meta`/report/守恒、§7.2/§7.6 事件与错误码、§8 决策溯源——约 14 文件 | 大 |
-| CONTRACTS.md | §3 types verbatim、§4 errors、§5 ②b（含 M7 翻转注记）、§6 配置 dataclass、§7 两新 API 节 + M7 直调函数登记、§8 事件目录、§9 `_meta`/计数词表/守恒、§10 三个模板与三个内部 Schema、§12 决策登记——约 11 处 | 中-大 |
+| spec/ | 新 `314-m14-segment.md` / `315-m15-extract.md`；§1.5/§1.6 背书与决策、§2.1–2.5 架构/开关矩阵/dry-run、§4 类型与分段吸收例外、§5.2 三节键表 + 白名单表、§6.2–6.4 输入语义/`_meta`/report/守恒、§7.2/§7.6 事件与错误码、§8 决策溯源——约 14 文件 | 大 |
+| CONTRACTS.md | §3 types verbatim、§4 errors、§5 分段吸收例外（含 M7 翻转注记）、§6 配置 dataclass、§7 两新 API 节 + M7 直调函数登记、§8 事件目录、§9 `_meta`/计数词表/守恒、§10 三个模板与三个内部 Schema、§12 决策登记——约 11 处 | 中-大 |
 | docs/manual/ | 新章（追加制 `25-stream.md`：直觉/配置/四层防线/调优）；★`_meta.stream: null` 恒在 ⇒ **三个存量 examples 重跑 + 含 `_meta` 样例块的 3/8/15/20/21/22 章重同步**（classify `classification: null` 先例同款——此前工作量漏计）；16/17/18 章事件表/调用账/错误码增行 | 大 |
-| tests/ | 新增覆盖归档于 `tests/operators/test_ingest.py`（stream 单调性/会话闭合/装箱）、`test_segment`（缝合确定性/②b/守恒）、`test_extract`（diff 摘要/Schema/兜底）、`test_verify` 增缺陷路由、集成 `examples/stream`（噪声帧 + 双任务 + 跨 App fixture）；存量：emitter `_meta` 键全集断言、Status 枚举断言、★~14 文件 ResolvedConfig 补参 | 中-大 |
+| tests/ | 新增覆盖归档于 `tests/operators/test_ingest.py`（stream 单调性/会话闭合/装箱）、`test_segment`（缝合确定性/分段吸收例外/守恒恒等式）、`test_extract`（diff 摘要/Schema/兜底）、`test_verify` 增缺陷路由、集成 `examples/stream`（噪声帧 + 双任务 + 跨 App fixture）；存量：emitter `_meta` 键全集断言、Status 枚举断言、★~14 文件 ResolvedConfig 补参 | 中-大 |
 
 ## 6. 里程碑与验收
 
 1. **对齐**：本提案评审，裁决 §7 → 记入 spec §1.6。
 2. **规格**：spec + CONTRACTS 修订自洽（可仿 classify 做 fan-out 可行性审查后出 SPEC）。
-3. **实现**（依赖序）：M1/类型/②b → M2 排序+会话化 → M10 装箱 → M14 → M3 序列 dedup → M13/M5/M7 序列组装 → M15 → M4 轨迹 rubric → 可观测面。每步离线测试全绿门禁。
+3. **实现**（依赖序）：M1/类型/分段吸收例外 → M2 排序+会话化 → M10 装箱 → M14 → M3 序列 dedup → M13/M5/M7 序列组装 → M15 → M4 轨迹 rubric → 可观测面。每步离线测试全绿门禁。
 4. **验收**（观测定义）：
    - 新 `examples/stream` 工程真实运行：fixture 含「点外卖全流程 + 中途切走的无关屏 + 第二个任务」，断言噪声帧进 rejects(reason=noise)、两任务各成一个 episode、`_meta.stream.steps` 动作序列与人工预期一致（trace 抽查）、annotate 产出任务标签落在用户 Schema；
-   - 守恒式含 episodes/absorbed/dropped_noise 成立；同 seed 重跑逐字节一致；
+   - 守恒恒等式含 episodes/absorbed/dropped_noise 成立；同 seed 重跑逐字节一致；
    - `segment.enabled=false` 全量回归：现有四个 examples 输出与 v1.7 逐字段一致（`_meta.stream: null` 除外）；
    - 多图上限验证：sequence_frames=20 时对 25 帧 episode 的降采样调用成功（真实端点）；
    - `--strict`/dry-run/熔断交付语义不受影响。
 
-## 7. 开放决策点（需求方裁决；默认值可直接生效）
+## 7. 开放问题（需求方裁决；默认值可直接生效）
 
-1. **编号/命名**：追加 M14 `segment` / M15 `extract`（默认，同 R30 追加制）；`extract` 备选名 `transitions`。
+1. **编号/命名**：追加 M14 `segment` / M15 `extract`（默认，同裁决·手册新章追加制）；`extract` 备选名 `transitions`。
 2. **`[stream]` 位置**：独立节（默认）vs 并入 `[input]`。
 3. **噪声帧去向**：进 rejects（默认，可审计）vs 仅计数不落盘。
 4. **交错 episode**（帧 2 属于另一并行任务而非噪声）：v1 不做，列 roadmap（默认；RPA 文献中的难变体，需全局归属模型）。
 5. **generate × stream**：v1 互斥（默认）；序列合成并入 O3 立项。
-6. **序列 dedup 语义**：①②④ 作用于成员拼接文本、跳过③（默认）vs 增加「成员 pHash 序列相似」第五级。
+6. **序列 dedup 语义**：精确层/近似层/语义层作用于成员拼接文本、跳过图像层（默认）vs 增加「成员 pHash 序列相似」第五级。
 7. **extract 文本模态**：v1 不支持（默认）vs 提供「转移摘要」弱语义档。
 8. **会话超 batch_size**：硬切 + WARN（默认）vs CONFIG_ERROR 要求调大 batch_size。
 9. **轨迹 rubric**：新增内置 `default:trajectory`（默认）vs 仅文档示例。

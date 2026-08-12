@@ -96,7 +96,7 @@ stderr 尾部应见到：
 INFO  run  batch=0 run.end exit_code=0
 ```
 
-五进五出——没有任何治理工位开着，这是一条「纯标注」流水线。
+五进五出——没有任何治理算子开着，这是一条「纯标注」流水线。
 
 ## 19.5 看结果
 
@@ -114,7 +114,7 @@ jq -c 'del(._meta)' out/labels.jsonl
 
 （你的 topic 措辞可能略有不同——那是模型的自由发挥空间；`kind` 则被枚举锁死，只可能是三者之一。）
 
-再看一条完整的 `_meta`：`scores` 是 `null`（quality 关了）、`dedup` 是 `null`（dedup 关了）、`verification` 同理，`classification` 也是 `null`（v1.7 起恒有此键，分类工位默认关），`stream` 也是 `null`（v1.8 起恒有此键，分段工位默认关），`annotation.attempts` 大概率是 1。**`_meta` 的键始终齐全，关掉的工位一律置 `null`——哪些值非空，忠实反映你开了哪些工位。**（给 jq 用户提个醒：`._meta.scores` 会取到 null 而不是报缺键，判断工位是否开启要比较 `!= null`。）
+再看一条完整的 `_meta`：`scores` 是 `null`（quality 关了）、`dedup` 是 `null`（dedup 关了）、`verification` 同理，`classification` 也是 `null`（v1.7 起恒有此键，分类算子默认关），`stream` 也是 `null`（v1.8 起恒有此键，分段算子默认关），`annotation.attempts` 大概率是 1。**`_meta` 的键始终齐全，关掉的算子一律置 `null`——哪些值非空，忠实反映你开了哪些算子。**（给 jq 用户提个醒：`._meta.scores` 会取到 null 而不是报缺键，判断算子是否开启要比较 `!= null`。）
 
 ## 19.6 三个一分钟实验
 
@@ -126,7 +126,7 @@ InputError: 无任何合法记录: data/input.jsonl（scanned=5 bad_input=5 miss
 
 「一条合法记录都没有」是输入错误，不是一次成功的空跑。（设 `input.on_bad_line = "fail"` 会更早：第一条坏行处就停。）这是第 5 章说的头号坑，现在你亲眼见过它的症状了。
 
-**② 往数据里加一行重复，把 dedup 打开**——`emitted` 变回 5，`dropped_dup=1`，rejects 里多出一条 `"stage": "dedup", "reason": "exact"` 的案底（rejects 里承载判重类别的字段是 `reason`；`kind` 是主输出 `_meta.dedup.kind` 的字段名，恰好也和本教程 Schema 里的业务字段同名，别混淆）。
+**② 往数据里加一行重复，把 dedup 打开**——`emitted` 变回 5，`dropped_dup=1`，rejects 里多出一条 `"stage": "dedup", "reason": "exact"` 的记录（rejects 里承载判重类别的字段是 `reason`；`kind` 是主输出 `_meta.dedup.kind` 的字段名，恰好也和本教程 Schema 里的业务字段同名，别混淆）。
 
 **③ 在 instruction 里删掉「类别拿不准时选 other」再跑**——观察边界请求（比如第 5 条既像 write 又像 ask）的标注是否开始摇摆。边界规则的价值就在这里。
 
@@ -134,6 +134,6 @@ InputError: 无任何合法记录: data/input.jsonl（scanned=5 bad_input=5 miss
 
 - 一个工程的最小骨架：`[run]` 三件套 + `annotate.instruction` + `output.schema_inline`；
 - `text_field` 必须与数据对齐，错了是全员坏行、以「无任何合法记录」退出码 3 终止，而不是静默错标；
-- 开关哪个工位，`_meta` 和 counts 就长什么样。
+- 开关哪个算子，`_meta` 和 counts 就长什么样。
 
 下一篇教程把 quality 打开，学习画质量线——那是 LabelKit 从「能用」到「用好」的第一道分水岭。

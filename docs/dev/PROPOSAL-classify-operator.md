@@ -1,8 +1,8 @@
-# 计划书：分类算子（classify）与按类条件化管线
+# 提案：分类算子（classify）与按类条件化管线
 
 > 2026-07-07。需求：「LabelKit 当前支持单一类别标注，是否可以通过加入一个分类算子，支持分类，根据分类执行不同的打分、标注和生成？」同日补充需求：当数据在多个 class 匹配度都高时，允许其流向多个管线（一条数据产生多个标签与多份标注结果），并提供开关让工程锁定单分类 / 多分类——已并入 §4.2 / §4.3（`classify.assignment`）。
 > **状态：已实现（2026-07-08，v1.7，`feature/m13-classify` 合入 main）。**本文档保留为方案论证与决策溯源材料。
-> **2026-07-07 更新**：已完成六域并行可行性/亲和性审查（全部 feasible，35 条摩擦收敛为 30 条裁决），开发规格见 `SPEC-classify-operator.md`——凡与本文不一致处（如 R4 fallback 留痕、R8 防呆分级、uniqueItems 移除）以该文件为准。
+> **2026-07-07 更新**：已完成六域并行可行性/亲和性审查（全部 feasible，35 条摩擦收敛为 30 条裁决），开发规格见 `SPEC-classify-operator.md`——凡与本文不一致处（如裁决·fallback 留痕不写 errors、裁决·关开关留配置仅警告的防呆分级、uniqueItems 移除）以该文件为准。
 
 ---
 
@@ -16,9 +16,17 @@
 
 一句话概括数据流变化：
 
-```
-现行:  ingest → dedup → quality(单rubric) → generate(单指令) → annotate(单指令) → verify(单维度) → emit
-提案:  ingest → dedup → classify → quality(按类rubric+分池) → generate(按类种子+指令) → annotate(按类指令) → verify(按类维度) → emit
+```mermaid
+flowchart TD
+    subgraph now["现行"]
+        direction LR
+        A1[ingest] --> B1[dedup] --> C1["quality（单 rubric）"] --> D1["generate（单指令）"] --> E1["annotate（单指令）"] --> F1["verify（单维度）"] --> G1[emit]
+    end
+    subgraph proposed["提案"]
+        direction LR
+        A2[ingest] --> B2[dedup] --> X2[classify] --> C2["quality（按类 rubric + 分池）"] --> D2["generate（按类种子 + 指令）"] --> E2["annotate（按类指令）"] --> F2["verify（按类维度）"] --> G2[emit]
+        X2 -. "multi 扇出：命中 k 类派生 k−1 个单标签兄弟信封" .-> C2
+    end
 ```
 
 multi 标签模式（`classify.assignment = "multi"`）下 classify 处多一条扇出边：命中 k 类的记录派生出 k 个单标签兄弟信封，各自独立走完 quality → annotate → verify 并各产出一行（§4.3 扇出块）。
@@ -56,7 +64,7 @@ multi 标签模式（`classify.assignment = "multi"`）下 classify 处多一条
 
 ### 3.2 分类作为管线算子（形态先例）
 
-**NVIDIA NeMo Curator 分类器阶段**：`DomainClassifier`（26 个域标签）、`MultilingualDomainClassifier`（52 语言）、`QualityClassifier`（High/Medium/Low，DeBERTa v3）等以统一 `DistributedDataClassifier` 基类挂进管线，输出写入记录级标签字段（`quality_pred` 等），支持 `filter_by` 按标签过滤。**启示**：分类算子的输出契约 =「记录级标签 + 可选按标签动作」；其标签直接用于构建 quality-specific blends。差异：NeMo Curator 跑本地 GPU 分类模型，LabelKit 的工具级负边界「不训练/托管任何本地模型」（spec §2.1.2 ①）决定了本提案分类走运行时 LLM API——与 M4 用「运行时 API 裁决」替代 QuRater 离线分类器（spec §3.4.5 背书行、§1.6）是同一个既有决策的延伸。
+**NVIDIA NeMo Curator 分类器阶段**：`DomainClassifier`（26 个域标签）、`MultilingualDomainClassifier`（52 语言）、`QualityClassifier`（High/Medium/Low，DeBERTa v3）等以统一 `DistributedDataClassifier` 基类挂进管线，输出写入记录级标签字段（`quality_pred` 等），支持 `filter_by` 按标签过滤。**启示**：分类算子的输出契约 =「记录级标签 + 可选按标签动作」；其标签直接用于构建 quality-specific blends。差异：NeMo Curator 跑本地 GPU 分类模型，LabelKit 的工具级负边界「不训练/托管任何本地模型」（spec §2.1.2）决定了本提案分类走运行时 LLM API——与 M4 用「运行时 API 裁决」替代 QuRater 离线分类器（spec §3.4.5 背书行、§1.6）是同一个既有决策的延伸。
 
 **Dolma toolkit（AI2, ACL 2024，spec 已引 [6]）**：架构为 tagger → attributes → mixer 三段——tagger 给文档/片段打属性（语言、毒性、质量分…）写入 sidecar attributes 文件，**决策推迟到 mixer 按属性过滤/分流**；支持运行时挂载自定义 tagger。**启示**：「打标」与「按标决策」解耦是数据管线的成熟范式；对应到本提案：classify 算子只负责打标（写 `PipelineItem.classification` 与 `_meta.classification`），按类选参数的决策留在各下游算子内部完成，两层职责边界清晰。
 
@@ -111,9 +119,9 @@ dedup → classify → quality → generate → annotate → verify
 - 内部 Schema `classification_schema(class_names, assignment, max_labels, with_reason)` 按标签基数二态：single → `{"class": <enum: 类名表>, "reason": <str>}`；multi → `{"classes": <array of enum, minItems=1, maxItems=max_labels, uniqueItems>, "reason": <str>}`。enum 是词表硬校验（Autolabel 同款），走 M8 四层防线；`reason` 仅 trace 生效时要求（对齐 `quality.judgment_reasons` 的 "auto" 语义与零额外 token 原则）。multi 另有一条 Schema 表达不了的语义规则、由代码确定性归一化：兜底类与具体类同现时剔除兜底类（「其余」与具体类命中矛盾）。
 - **鲁棒性**：`classify.self_consistency = n`（默认 0 关；n≥3 奇数）——n 次独立采样投票：single 取多数票、无过半类时归兜底类；multi 逐标签投票（标签出现在 > n/2 个采样集合中才保留），全部落选归兜底类。机制复用 §3.5.2 的 self-consistency 决策（分类恰是该机制收益最大的「分类型 Schema」场景，spec [33]）。
 - **失败与兜底**：`classify.fallback_class` 必填且必须 ∈ 类别表（建议用户命名 `other`，描述写「其余」——LLM 也可主动选择它）；结构修复耗尽时按 `classify.on_error = "fallback"`（默认，归兜底类并记 StageError，kind 新增 `classification_invalid`）或 `"fail"`（记录 `failed` → rejects）。不新增 Status 取值。
-- temperature 恒 0（sc 采样除外，同 `annotate.sc_temperature` 机制）；分类调用并发同其他算子（profile 信号量）。
+- temperature 恒 0（自洽采样除外，同 `annotate.sc_temperature` 机制）；分类调用并发同其他算子（profile 信号量）。
 
-**不采用的分类信号及理由**：① 本地分类器（DeBERTa/fastText，NeMo Curator 形态）——违反工具级负边界「不训练/托管本地模型」（spec §2.1.2 ①），且引入框架级依赖（违反 §2.6 依赖面）；② embedding 最近邻/聚类——需要 embedding profile 与种子样例库，判别力弱于 LLM zero-shot 且引入「质心」这一隐性状态，列为 §8.4 式演进候选（触发条件：分类调用成本成为瓶颈时，以 embedding 粗分 + LLM 精分两级降本）；③ 开放集 tagging（InsTag 形态）——标签无法与配置键静态对齐，不能路由；列演进候选（仅打标进 `_meta`，供多样性分析）。
+**不采用的分类信号及理由**：① 本地分类器（DeBERTa/fastText，NeMo Curator 形态）——违反工具级负边界「不训练/托管本地模型」（spec §2.1.2），且引入框架级依赖（违反 §2.6 依赖面）；② embedding 最近邻/聚类——需要 embedding profile 与种子样例库，判别力弱于 LLM zero-shot 且引入「质心」这一隐性状态，列为 §8.4 式演进候选（触发条件：分类调用成本成为瓶颈时，以 embedding 粗分 + LLM 精分两级降本）；③ 开放集 tagging（InsTag 形态）——标签无法与配置键静态对齐，不能路由；列演进候选（仅打标进 `_meta`，供多样性分析）。
 
 ### 4.3 路由语义：类条件参数化（方案 A，推荐）
 
@@ -121,8 +129,8 @@ dedup → classify → quality → generate → annotate → verify
 
 | 算子 | 类条件行为 | 关键细节 |
 |---|---|---|
-| M4 quality | **批内按类分池**：每类独立执行 k 轮配对 → 裁决 → BT 拟合 → 类内百分位归一化；rubric / mode / threshold / selection / top_ratio 均取该类有效配置。 | 类池处理顺序按类名字典序（确定性）；类池 N=1 时沿用现行单条规则（不发裁决调用、score=0.5，spec §3.4.3 归一化行 + §3.10.3 尾批行）；`top_ratio` 名额基数变为**类内** scored 存活数；pairwise 分数语义从「批内相对」进一步收窄为「批内类内相对」——`_meta.scores` 增只增字段 `pool`（= 类名，仅 classify 启用时出现）以自述比较池。 |
-| M6 generate | **按类分种子池**：类内过门槛记录为种子，每类用该类有效 instruction / styles / num_per_record 独立走 §3.6.2 调用量公式；新样本**继承种子类**（`classification.source = "inherited"`，零额外调用、溯源确定）。 | (llm, style) 预抽仍按全局调用序号一次性完成（保持调度无关可复现，§3.6.2 多模型混合行不变）；分组后每次调用的种子全部同类，继承无歧义。回流子批经过 classify 时因已带分类而跳过。`generate_only` 模式：生成仍用全局指令（无输入无从按类），产出切批走 M3→classify→M4→M5→M7→M11 主链、被正常分类后按类打分/标注——**不支持 generate_only 的按类生成配比**（见本文 §7 开放决策点③）。 |
+| M4 quality | **批内按类分池**：每类独立执行 k 轮配对 → 裁决 → Bradley-Terry 拟合 → 类内百分位归一化；rubric / mode / threshold / selection / top_ratio 均取该类有效配置。 | 类池处理顺序按类名字典序（确定性）；类池 N=1 时沿用现行单条规则（不发裁决调用、score=0.5，spec §3.4.3 归一化行 + §3.10.3 尾批行）；`top_ratio` 名额基数变为**类内** scored 存活数；pairwise 分数语义从「批内相对」进一步收窄为「批内类内相对」——`_meta.scores` 增只增字段 `pool`（= 类名，仅 classify 启用时出现）以自述比较池。 |
+| M6 generate | **按类分种子池**：类内过门槛记录为种子，每类用该类有效 instruction / styles / num_per_record 独立走 §3.6.2 调用量公式；新样本**继承种子类**（`classification.source = "inherited"`，零额外调用、溯源确定）。 | (llm, style) 预抽仍按全局调用序号一次性完成（保持调度无关可复现，§3.6.2 多模型混合行不变）；分组后每次调用的种子全部同类，继承无歧义。回流子批经过 classify 时因已带分类而跳过。`generate_only` 模式：生成仍用全局指令（无输入无从按类），产出切批走 M3→classify→M4→M5→M7→M11 主链、被正常分类后按类打分/标注——**不支持 generate_only 的按类生成配比**（见本文 §7 的 generate_only × classify 组合深度开放问题）。 |
 | M5 annotate | 按类取 instruction 与 examples 组装提示词（§3.5.2 模板结构不变，仅取值来源变化）。 | **输出 Schema 不按类**（见下）。 |
 | M7 verify | 按类取 `extra_criteria` 追加进评审提示词（§10.5 模板结构不变）。 | policy / max_repair_rounds 全局。 |
 | M3 dedup / M2 / M11 | 不按类。 | 判重是内容属性、发生在分类之前；输出通道分发只看 status。 |
@@ -130,15 +138,28 @@ dedup → classify → quality → generate → annotate → verify
 **单标签 / 多标签开关与扇出语义（`classify.assignment = "single" | "multi"`，默认 `"single"`）**
 
 - **`"single"`（默认，锁定一条一类）**：内部 Schema 强制恰一类（§4.2），一条记录一个标签、至多一行输出——即上文全部行为。
-- **`"multi"`（允许多类命中，按标签扇出）**：LLM 返回该记录适用的类集合（1 ≤ k ≤ `classify.max_labels`）。k ≥ 2 时 classify 在批内**扇出**：标签集按类别表声明序规范排序，原信封取首标签，其余 k−1 个标签各克隆一个兄弟 `PipelineItem` 追加于批尾——克隆共享同一 frozen `Record`（引用共享，零内容复制），`classification.label` 各异、`classification.labels` 同为全集。此后每个信封与普通单标签记录完全同构：进各自类池打分、按各自类参数标注/评审、**独立淘汰**（同一条数据可以在写作池被质量门淘汰、在问答池存活）、独立产出一行。下游算子对扇出**零感知**——仍只读 `item.classification.label`。
-- **「匹配度」的运行化**：v1 = 模型对「类描述是否适用」的集合判断（sc 逐标签投票加固，§4.2），不引入数值置信度；逐类适用度打分（0–5 + 阈值筛集合）列演进候选，触发条件：需要可调的多标签灵敏度。
+- **`"multi"`（允许多类命中，按标签扇出）**：LLM 返回该记录适用的类集合（1 ≤ k ≤ `classify.max_labels`），k ≥ 2 时 classify 在批内**扇出**，流程见下图；下游算子对扇出**零感知**——仍只读 `item.classification.label`。
+
+```mermaid
+flowchart TD
+    A["LLM 返回适用类集合（1 ≤ k ≤ max_labels）"] --> B{"k ≥ 2？"}
+    B -- "否" --> C["单标签信封：即 single 的全部行为"]
+    B -- "是" --> D["标签集按类别表声明序规范排序"]
+    D --> E["原信封取首标签"]
+    D --> F["其余 k−1 个标签各克隆一个兄弟 PipelineItem 追加于批尾：<br/>共享同一 frozen Record（引用共享，零内容复制），<br/>classification.label 各异、classification.labels 同为全集"]
+    E --> G["每个信封与普通单标签记录完全同构"]
+    F --> G
+    G --> H["进各自类池打分"] --> I["按各自类参数标注/评审"] --> J["独立淘汰：同一条数据可以在写作池被质量门淘汰、在问答池存活"] --> K["独立产出一行"]
+```
+
+- **「匹配度」的运行化**：v1 = 模型对「类描述是否适用」的集合判断（自洽采样逐标签投票加固，§4.2），不引入数值置信度；逐类适用度打分（0–5 + 阈值筛集合）列演进候选，触发条件：需要可调的多标签灵敏度。
 - **扇出不过 dedup（链序硬依据）**：克隆在 classify 内追加、只走 quality 及之后阶段。克隆与原件内容相同，若经过 M3 会互判 exact 重复（规范化内容 SHA-256 相同）——扇出位置必须在 dedup 之后，现链序天然保证。生成样本继承其种子信封的单一标签、不再扇出。
 - **契约修订（spec §4.3）**：Stage 契约「不删除列表元素（只改 status）」需增补与 generate 例外并列的 classify 例外——「classify（multi 模式）可向批尾追加派生信封；不修改、不删除、不重排既有元素」。
 - **计数与不变量（spec §6.4）**：新计数 `counts.fanout` = 扇出净增信封数（single 恒 0；报告仅 multi 时出现该键），不变量扩展为 `emitted + dropped_* + failed + bad_input = scanned + generated + fanout`——与 `generated`、v1.6 `unprocessed` 的既有扩展手法相同。
 - **输出唯一键变化**：一条输入至多产出 `max_labels` 行（每行独立通过用户 Schema）；消费侧行唯一键由 `_meta.id` 变为 (`_meta.id`, `_meta.classification.label`)——仅 multi 模式如此，手册须明示。
 - **确定性**：扇出克隆按（原记录批内位置 → 标签声明序）追加，同输入同 seed 逐字节可复现。
 
-**输出 Schema 全局唯一（本提案的明确边界）**：多 Schema 会把「输出结构用户定义」变成「输出结构按类定义」，击穿 M8 单 user_schema、M11 终检、L2.5 回调、few-shot 启动校验、6.3 校验语义（「剥除 `_meta` 后必须过用户 Schema」）的整条链。且无必要——JSON Schema 2020-12 原生支持 `oneOf`/条件子模式，用户今天就能在**单个** Schema 内表达按类变体（配合按类 instruction 引导 LLM 落到对应分支）。按类 Schema 列演进候选，触发条件：出现 `oneOf` 无法表达的真实工程。
+**输出 Schema 全局唯一（本提案的明确边界）**：多 Schema 会把「输出结构用户定义」变成「输出结构按类定义」，击穿 M8 单 user_schema、M11 终检、代码回调校验层、few-shot 启动校验、6.3 校验语义（「剥除 `_meta` 后必须过用户 Schema」）的整条链。且无必要——JSON Schema 2020-12 原生支持 `oneOf`/条件子模式，用户今天就能在**单个** Schema 内表达按类变体（配合按类 instruction 引导 LLM 落到对应分支）。按类 Schema 列演进候选，触发条件：出现 `oneOf` 无法表达的真实工程。
 
 **方案 B（批级物理路由，distilabel `routing_batch_function` 形态）——已考虑，拒绝**：把批按类拆成子批、每类走独立链。三条硬伤：① 批是 pairwise 比较池与内存生命周期单元（spec §2.6 吞吐行「阶段之间在批内串行」），拆批产生大量小池，百分位归一化统计意义严重弱化；② 批号/报表/trace 的批级契约（`batch.start/end`、`_meta.scores.batch_no`）全部复杂化；③ 路由逻辑必然落进 M10，违反「编排器零业务逻辑」（spec §3.10.1）。方案 A 以记录级属性达成同等表达力（§3.5 调研共性①），无此三伤。
 
@@ -209,17 +230,17 @@ M1 校验清单（并入 §3.1.4，fail-fast 全量报错）：classes ≥ 2 且
 
 | 契约面 | 变更 |
 |---|---|
-| `types.py` | 新 frozen dataclass `Classification {label: str, labels: tuple[str, ...], source: Literal["llm","fallback","inherited"], detail: Mapping}`（label = 本信封的路由标签；labels = 该记录命中的全集，single 模式恒单元素；detail 含 reason / sc 统计）；`PipelineItem` 增字段 `classification: Classification \| None = None`。Status 枚举**不变**。 |
+| `types.py` | 新 frozen dataclass `Classification {label: str, labels: tuple[str, ...], source: Literal["llm","fallback","inherited"], detail: Mapping}`（label = 本信封的路由标签；labels = 该记录命中的全集，single 模式恒单元素；detail 含 reason / 自洽采样统计）；`PipelineItem` 增字段 `classification: Classification \| None = None`。Status 枚举**不变**。 |
 | `_meta`（§6.3） | 增顶层键 `"classification": {"label", "labels", "source"}`（未启用 = null，对齐 verification 惯例；single 模式 labels 恒为单元素数组）；`_meta.scores` 增 `pool` 字段（仅 classify 启用时）。 |
 | report.json（§6.4） | 增 `classify` 节：`{"assignment", "classes": {<name>: count}, "multi_label_records", "fallback_count", "failures"}`（多标签记录在 classes 直方图中逐标签计数）；quality 节的 `aggregate_histogram` / `per_criterion_mean` 在 classify 启用时增按类分组视图；generate `buckets` 的 key 在 classify 启用时扩展为 `<class>×<llm>×<style>`（默认关闭时格式不变）。counts 不变量：single 模式**不变**（分类不改变基数）；multi 模式 counts 增列 `fanout` 并扩展不变量（§4.3 扇出块）。 |
-| trace（§7.2） | `trace.channels` 枚举增 `"classify"`；新事件 `classify.decision`（payload：`label`、`labels`（multi 时携带全集）、`source`、`reason`†、`sc`†；† 分别受 judgment_reasons 同款语义与 sc 开关控制）；error 事件按产生 stage 归 classify 通道。事件目录只增不改契约维持。 |
+| trace（§7.2） | `trace.channels` 枚举增 `"classify"`；新事件 `classify.decision`（payload：`label`、`labels`（multi 时携带全集）、`source`、`reason`†、`sc`†；† 分别受 judgment_reasons 同款语义与自洽采样开关控制）；error 事件按产生 stage 归 classify 通道。事件目录只增不改契约维持。 |
 | 错误码（§7.6） | 增 `classification_invalid`（记录级：M8 修复耗尽且 on_error="fail" 时记录 failed；on_error="fallback" 时仅入 `item.errors` 留痕、记录存活）。 |
 | CONTRACTS.md | §7 增 classify 模块 API（`ClassifyStage` + `build_classify_prompt` + `classify_record`）；§10 增分类提示词模板与 `classification_schema`；§6.1 配置 dataclass 增 `ClassifyConfig` / `ClassSpec` / `ClassOverrides`。 |
-| dry-run 估算 | `classify_calls = total_records × max(1, self_consistency)`，并入 §2.4 `--dry-run` 行与 CONTRACTS §7.9 的静态估算公式（实现在 `orchestrator._estimate`）。multi 模式下游调用量依赖平均标签数、静态不可知——估算按乘数 1 报下界并在 stderr 注明（口径见 §7 ⑦）。 |
+| dry-run 估算 | `classify_calls = total_records × max(1, self_consistency)`，并入 §2.4 `--dry-run` 行与 CONTRACTS §7.9 的静态估算公式（实现在 `orchestrator._estimate`）。multi 模式下游调用量依赖平均标签数、静态不可知——估算按乘数 1 报下界并在 stderr 注明（口径见 §7 的 dry-run multi 估算口径开放问题）。 |
 
 ### 4.6 成本
 
-每记录净增 1 次 LLM 调用（sc 启用则 ×n）——与 pointwise 单准则同量级，显著低于 pairwise 打分（k/2 次/记录）与标注（1 次 + 修复）。分类提示词短（类别表 + 记录内容），token 成本低；`classify.llm` 可独立指向低成本 profile。对照收益：按类 rubric 使打分裁决更聚焦（tie 率下降是 §7.5 可量化的预期收益）、按类指令降低标注/生成的提示词内分支复杂度。
+每记录净增 1 次 LLM 调用（自洽采样启用则 ×n）——与 pointwise 单准则同量级，显著低于 pairwise 打分（k/2 次/记录）与标注（1 次 + 修复）。分类提示词短（类别表 + 记录内容），token 成本低；`classify.llm` 可独立指向低成本 profile。对照收益：按类 rubric 使打分裁决更聚焦（tie 率下降是 §7.5 可量化的预期收益）、按类指令降低标注/生成的提示词内分支复杂度。
 
 multi 标签模式的额外账：quality / annotate / verify 的调用量按**平均标签数 m̄** 放大（分类调用本身不变——一次调用产出整个标签集），上界由 `classify.max_labels` 控制；UI 模态下克隆各自的标注调用独立懒加载图像（内存仍不常驻，I/O ×m̄）。这是「一条数据换多份结果」的对价，`counts.fanout` 与 `classify.multi_label_records` 使其在报表中可见。
 
@@ -233,20 +254,20 @@ multi 标签模式的额外账：quality / annotate / verify 的调用量按**�
 | 记录级隔离 | 分类失败 fallback 或 failed，不出批。✓ |
 | 可复现 | temperature 0 + 确定性模板；类池处理与生成分组均按类名字典序；multi 扇出按（批内位置 → 标签声明序）确定性追加；(llm,style) 预抽机制不变。✓ |
 | 隐私 | 类别表属用户配置（同 rubric 信任级）；reason 文本受 `trace.content` 四档脱敏；report 只含类名计数（类名是配置产物，非数据内容）。✓ |
-| 不训练/托管本地模型（§2.1.2 ①） | 分类走运行时 LLM API，与 M4 既有决策同构。✓ |
-| 不做训练数据配比（§2.1.2 ⑥） | 按类参数是**加工条件化**，不做跨类输出配额/重采样；「每类输出恰好 N 条」明确不做（属 §8.3 O6 全局定量问题域）。✓（须在 spec 负边界处补一句划界） |
+| 不训练/托管本地模型（spec §2.1.2 负边界） | 分类走运行时 LLM API，与 M4 既有决策同构。✓ |
+| 不做训练数据配比（spec §2.1.2 负边界） | 按类参数是**加工条件化**，不做跨类输出配额/重采样；「每类输出恰好 N 条」明确不做（属 §8.3 O6 全局定量问题域）。✓（须在 spec 负边界处补一句划界） |
 | 内存 | 每 item 增一个小 dataclass；类池分组是批内临时字典；multi 扇出克隆共享 frozen Record 引用、只复制信封（×m̄，受 max_labels 界）。可控。✓ |
 
 ## 5. 触点与工作量估算
 
 | 触点 | 内容 | 量级 |
 |---|---|---|
-| spec | 新 §3.13（或重编号，见 §7①）模块节；§2.2/§2.3 架构与开关矩阵；§4 数据结构与 §4.3 Stage 契约（multi 扇出例外）；§5.2 配置表 + `[class.*]` 白名单表；§6.3/§6.4（含 multi 的 fanout 计数与不变量扩展）；§7.2/§7.6；§1.5/§1.6/§8.4 背书与决策记录 | 大 |
+| spec | 新 §3.13（或重编号，见 §7 的模块编号开放问题）模块节；§2.2/§2.3 架构与开关矩阵；§4 数据结构与 §4.3 Stage 契约（multi 扇出例外）；§5.2 配置表 + `[class.*]` 白名单表；§6.3/§6.4（含 multi 的 fanout 计数与不变量扩展）；§7.2/§7.6；§1.5/§1.6/§8.4 背书与决策记录 | 大 |
 | CONTRACTS.md | §6 配置 dataclass、§7 模块 API、§8 事件、§9 输出、§10 提示词模板与内部 Schema | 中 |
 | M1 config | ClassifyConfig/ClassSpec 解析、白名单校验、按类合并视图冻结、全量校验清单 | 中 |
-| M13 classify.py | 提示词组装、sc 投票、fallback、multi 扇出与归一化、事件与计数 | 中 |
+| M13 classify.py | 提示词组装、自洽采样投票、fallback、multi 扇出与归一化、事件与计数 | 中 |
 | M8 schema_engine | `classification_schema()` 内部 Schema 常量 | 小 |
-| M4 quality | 批内按类分池（配对/BT/归一化/门控循环套一层类分组）；有效配置解析 | 中偏大 |
+| M4 quality | 批内按类分池（配对/Bradley-Terry/归一化/门控循环套一层类分组）；有效配置解析 | 中偏大 |
 | M5/M7 | instruction/examples/extra_criteria 取值改走有效配置 | 小 |
 | M6 generate | 种子按类分组、每类独立预算与提示词、继承类标签、桶 key 扩展 | 中 |
 | M10/M11/M12 | 链序插入、fanout 计数与不变量扩展、report classify 节与按类视图、trace 通道 | 小-中 |
@@ -255,7 +276,7 @@ multi 标签模式的额外账：quality / annotate / verify 的调用量按**�
 
 ## 6. 里程碑与验收
 
-1. **对齐**：本文档评审，裁决 §7 开放决策点 → 结论记入 spec §1.6。
+1. **对齐**：本文档评审，裁决 §7 开放问题 → 结论记入 spec §1.6。
 2. **规格**：spec + CONTRACTS 修订并自洽（配置表/事件/错误码/模板逐表落位）。
 3. **实现**：M1 → M13 → M4 分池 → M5/M6/M7 条件化 → 可观测面；每步跑 `uv run pytest -q -m 'not integration'`。
 4. **验收**（观测定义）：
@@ -265,7 +286,7 @@ multi 标签模式的额外账：quality / annotate / verify 的调用量按**�
    - multi 模式集成运行：构造双意图 fixture（如「写一段讲解二分查找原理的教程」，writing + qa 双命中），断言同一 `_meta.id` 产出两行、行键 (`_meta.id`, `classification.label`) 唯一、`counts.fanout` 与扩展不变量成立、两行 `_meta.annotation` 各走各类 instruction；同一 fixture 在 `assignment="single"` 下仅产出一行（开关锁定生效的直接观测）；
    - `--strict` / dry-run / 熔断交付语义不受影响。
 
-## 7. 开放决策点（需求方裁决）
+## 7. 开放问题（需求方裁决）
 
 1. **模块编号**：追加 M13（零重排成本，推荐）vs 按流水线位置全量重编号（v1.3 曾有重编号先例，但那次是模块拆分；本次为纯新增，追加即可）。
 2. **fallback 语义**：本文取「fallback_class 必填且为普通类成员」（无特殊类、可配 per-class 参数）；备选为隐式 `_unclassified` 特殊类（永远走全局默认）。推荐前者。
@@ -280,7 +301,7 @@ multi 标签模式的额外账：quality / annotate / verify 的调用量按**�
 | 风险 | 缓解 |
 |---|---|
 | 小类池 pairwise 退化（类内 N 过小时百分位粗、N=1 恒 0.5） | per-class `quality.mode="pointwise"`（绝对刻度不依赖池）；手册指引：类别多时增大 `run.batch_size`；report 按类直方图使问题可见 |
-| 分类错误级联（错类 → 错 rubric/指令） | enum 硬约束 + sc 投票；`classify.decision` 事件带 reason 可审计（§7.5 同款闭环：抽读 reason → 修订类描述 → 同 seed 重跑对比类分布）；fallback 类兜底 |
+| 分类错误级联（错类 → 错 rubric/指令） | enum 硬约束 + 自洽采样投票；`classify.decision` 事件带 reason 可审计（§7.5 同款闭环：抽读 reason → 修订类描述 → 同 seed 重跑对比类分布）；fallback 类兜底 |
 | 配置面复杂化（N 类 × 覆盖键） | 白名单收窄 + 全键继承默认 + M1 全量 fail-fast；纯打标零覆盖即用 |
 | 成本上升（+1 调用/条） | 独立低成本 profile；`--dry-run` 估算先行 |
 | 报表消费者适配（buckets key、quality 按类视图） | 仅 classify 启用时出现新形态；默认关闭零变化；trace/`_meta` 严格只增 |

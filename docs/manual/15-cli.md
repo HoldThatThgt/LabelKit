@@ -31,7 +31,7 @@ dry-run: estimated LLM calls — generate_calls=0 segment_calls=0 stitch_calls=0
 dry-run: no LLM calls made, no output written (report and trace only)
 ```
 
-注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），`segment_calls` / `extract_calls` 是 v1.8 新增字段（时序流，第 25 章），`stitch_calls` 是 v1.9 新增字段（线索缝合，第 26 章），`frame_classify_calls` / `frame_annotate_calls` 是 v1.12 新增字段（流模式帧粒度，第 25 章），未启用恒为 0；stream 模式下 quality/annotate/verify 的估算以「episode 数 ≈ 会话数」报**下界**、extract 按剔噪前帧数报**上界**（估算公式与真实对账见第 25 章）；帧粒度两键按预扫描帧总数报**粗上界**——帧分类实付每 episode 一次批量判决（且住 dedup 之后，重复 episode 零调用）、帧标注实付过质量门的成员数，实跑对账看 `report.stream` 的两个帧子块（第 8 章，成本账见第 25 章 25.6）；v1.11 起 `segment_calls` 的语义随预算而变——`segment.llm` 所指档声明了 `context_window`（第 6 章）时，估算公式的窗宽取 `min(window, w_min)`（w_min = 预算保证每窗至少装下的帧数），实际装填每窗只多不少、窗数只少不多，故报的是**最坏装填上界**（实际窗数事后看 `report.stream.windows` 对账），且 w_min 小于 window 时 stream 注记行会追加一句「segment 按预算最坏装填报上界」；未声明预算或 w_min ≥ window 时公式与数值同 v1.10。`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。后两种情况 stderr 都会多打一行注记（`dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界`）。
+注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），`segment_calls` / `extract_calls` 是 v1.8 新增字段（时序流，第 25 章），`stitch_calls` 是 v1.9 新增字段（线索缝合，第 26 章），`frame_classify_calls` / `frame_annotate_calls` 是 v1.12 新增字段（流模式帧粒度，第 25 章），未启用恒为 0；流模式下 quality/annotate/verify 的估算以「episode 数 ≈ 会话数」报**下界**、extract 按剔噪前帧数报**上界**（估算公式与真实对账见第 25 章）；帧粒度两键按预扫描帧总数报**粗上界**——帧分类实付每 episode 一次批量判决（且住 dedup 之后，重复 episode 零调用）、帧标注实付过质量门的成员数，实跑对账看 `report.stream` 的两个帧子块（第 8 章，成本账见第 25 章 25.6）；v1.11 起 `segment_calls` 的语义随预算而变——`segment.llm` 所指 profile 声明了 `context_window`（第 6 章）时，估算公式的窗宽取 `min(window, w_min)`（w_min = 预算保证每窗至少装下的帧数），实际装填每窗只多不少、窗数只少不多，故报的是**最坏装填上界**（实际窗数事后看 `report.stream.windows` 对账），且 w_min 小于 window 时 stream 注记行会追加一句「segment 按预算最坏装填报上界」；未声明预算或 w_min ≥ window 时公式与数值同 v1.10。`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。后两种情况 stderr 都会多打一行注记（`dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界`）。
 
 ## 15.2 `labelkit validate`：只体检不跑车
 
@@ -113,32 +113,32 @@ uv run labelkit rubric --show default:text > my-rubric.toml
 
 - **0 不等于「全部记录都成功」**——它只承诺流程走完、账目写清。生产脚本请用 `--strict` 或解析 report.counts；
 - 2 与 3 的分界：**还没碰数据**的错都是 2（包括「输出父目录不存在或不可写」——忘了 `mkdir -p out` 是退出码 2，不是 4）；**数据本身**的错才是 3；
-- 4 的几种触发里，只有**熔断**会走完收尾：报告照常写出（特征是 `run.exit_code: 4`；注意 `interrupted` 仍为 `false`——该字段只在 SIGINT/SIGTERM 中断时为 true），且 **v1.6 起已完成批次的主输出与 rejects 照常 fsync + 原子改名交付**（v1.5 及以前是「`.part` 残骸留在原地、不交付」——长跑末段配额死亡不再丢弃全部已完成产出）。此时 report.json 的 run 节带 `partial_delivery: true`（仅熔断交付时出现），counts 增列 `unprocessed` 补齐守恒等式（第 8 章）；运行期写盘失败与未预期异常则在收尾之前就抛出，连报告都不会写出；
+- 4 的几种触发里，只有**熔断**会走完收尾：报告照常写出（特征是 `run.exit_code: 4`；注意 `interrupted` 仍为 `false`——该字段只在 SIGINT/SIGTERM 中断时为 true），且 **v1.6 起已完成批次的主输出与 rejects 照常 fsync + 原子改名交付**（v1.5 及以前是「`.part` 残骸留在原地、不交付」——长跑末段配额死亡不再丢弃全部已完成产出）。此时 report.json 的 run 节带 `partial_delivery: true`（仅熔断交付时出现），counts 增列 `unprocessed` 补齐守恒恒等式（第 8 章）；运行期写盘失败与未预期异常则在收尾之前就抛出，连报告都不会写出；
 - （v1.6）**最终文件名出现不再等价「全部输入处理完毕」**：它仍然保证已交付的每一行完整且合法，但熔断中止与优雅中断如今都会交付。判定一次运行是否完整处理了全部输入，要看 report.run 的 `interrupted=false` **且** `circuit_broken=false`——退出码本身不够用：被 SIGINT 优雅中断的运行同样交付且按 strict 规则以 0/1 退出（第 8、18 章）。
 
 ## 15.5 标准工作流：从零到全量
 
 ```bash
-# ① 体检：配置合法 + 端点可达（不花钱）
+# 体检：配置合法 + 端点可达（不花钱）
 uv run labelkit validate --config config.toml --project project.toml --probe
 
-# ② 估算：多少条、多少次调用（不花钱）
+# 估算：多少条、多少次调用（不花钱）
 uv run labelkit run --config config.toml --project project.toml \
     --dry-run --output out/dryrun.jsonl
 
-# ③ 小样本试跑：验证 rubric/instruction/Schema 的实际效果（花小钱）
+# 小样本试跑：验证 rubric/instruction/Schema 的实际效果（花小钱）
 uv run labelkit run --config config.toml --project project.toml \
     --limit 20 --output out/pilot.jsonl
-#    → 人工检查 out/pilot.jsonl 与 rejects；不满意就改配置回到 ③
+#    → 人工检查 out/pilot.jsonl 与 rejects；不满意就改配置回到小样本试跑
 
-# ④ 全量：正式输出（花正经钱）
+# 全量：正式输出（花正经钱）
 uv run labelkit run --config config.toml --project project.toml
 
-# ⑤ CI/生产变体：让"有淘汰"可被脚本感知
+# CI/生产变体：让"有淘汰"可被脚本感知
 uv run labelkit run ... --strict; echo "exit=$?"
 ```
 
-第 ③ 步是整个工作流的支点：**instruction、rubric、threshold 的每一轮修改都应该在 --limit 小样本上验证**，全量只跑定稿配置。这套流程在第 20 章的调优教程里会完整演练一遍。
+小样本试跑是整个工作流的支点：**instruction、rubric、threshold 的每一轮修改都应该在 --limit 小样本上验证**，全量只跑定稿配置。这套流程在第 20 章的调优教程里会完整演练一遍。
 
 ## 15.6 stderr 上会看到什么
 

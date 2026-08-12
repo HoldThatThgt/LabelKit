@@ -24,7 +24,7 @@ cd LabelKit
 uv sync            # 创建虚拟环境（Python 3.12）并安装全部依赖
 ```
 
-`uv sync` 依据 `pyproject.toml` 解析依赖、生成本地锁文件并装好虚拟环境。全部第三方依赖只有 7 个，都很轻：
+`uv sync` 依据 `pyproject.toml` 解析依赖、生成本地锁文件并装好虚拟环境。全部第三方依赖只有 8 个，都很轻：
 
 | 依赖 | 用途 |
 |---|---|
@@ -34,6 +34,7 @@ uv sync            # 创建虚拟环境（Python 3.12）并安装全部依赖
 | `Pillow` + `imagehash` | 截图缩放与感知哈希（图像去重） |
 | `json-repair` | 确定性修复 LLM 输出的破损 JSON |
 | `numpy` | Bradley-Terry 质量模型拟合 |
+| `rich` | 交互终端的实时进度面板（v1.10，懒导入，plain 档不加载） |
 
 没有任何「框架级」依赖——没有 LangChain，没有数据库驱动，没有 Web 框架。
 

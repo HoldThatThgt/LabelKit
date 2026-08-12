@@ -19,20 +19,40 @@
 | `stitch_invalid` | stitch | 单次缝合判定修复耗尽（v1.9），候选两型处置不对称：默认 `on_error="keep"` ⇒ episode 候选**开新线索存活**（task_name 为空、摘要卡渲染「（未命名）」）、救援候选维持 dropped_noise——都不写记录 errors，留痕 = trace stitch 通道的 error 事件 + report 的 `stream.stitch.failures`；`on_error="fail"` ⇒ **仅 episode 候选信封** failed 进 rejects（成员帧维持 absorbed；救援候选不适用 fail，判定失败一律按未命中处理）。二遍复评的判定失败无论配置一律按 keep 等价处理。批量出现 ⇒ stitch.llm 结构化输出能力不足，第 26 章 |
 | `classification_invalid` | classify | 分类输出修复耗尽（v1.7），两种形态：默认 `on_error="fallback"` ⇒ 归兜底类、记录**存活不进 rejects**（痕迹在 `_meta.classification.source="fallback"`、trace classify 通道的 error 事件与 report 的 `classify.fallback_count`）；`on_error="fail"` ⇒ 记录 failed 进 rejects。fallback_count 偏高 ⇒ 类别表描述区分度不足，第 24 章 |
 | `extraction_invalid` | extract | 单个转移的动作摘取修复耗尽（v1.8），两种形态：默认 `on_error="fallback"` ⇒ 该步记 `action_type="other"` 并留痕于该步 detail（episode **存活不进 rejects**，不写记录 errors，计 `stream.extract.fallback_steps`）；`on_error="fail"` ⇒ episode failed 进 rejects。fallback_steps 偏高 ⇒ 截图不可读或摘取指令需要补域说明，第 25 章 |
-| `judgment_invalid` | quality | 单次裁决修复后仍非法 ⇒ 按平局计入 BT（不失败记录），计 `report.quality.judgment_failures`。率 >5% 见第 16 章诊断 |
-| `schema_violation` | schema 引擎 | L3 修复预算耗尽 ⇒ 记录 failed。批量出现 ⇒ 第 14 章（Schema 对模型不友好）。v1.11 两注：「输出被截断」不再是本码的成因——截断已独立成 `output_truncated`（见下）；修复调用自身超上下文预算的轮失败短路（14.1）归因也维持本码/`callback_violation` 不变 |
-| `callback_violation` | schema 引擎 | L3 耗尽且剩余违规全部来自 `output.validator` 回调（14.5）⇒ 记录 failed。批量出现 ⇒ 回调规则模型学不会——把违规消息改写成更明确的改进指示，或放宽规则 |
-| `context_overflow` | llm-client / 各算子 | 超出上下文预算（v1.11，仅相关档声明了 `context_window` 时才会出现，第 6 章），三种形态：**预检**——调用发出前估算即超限，或连语义最小单元都装不下（单记录 / 2 帧窗 / 1 条种子 / 2 张关键帧；pairwise 的一对装不下**不拒收记录**——按裁决粒度折算平局，仅记错误与事件，第 10 章）；**反应态 400**——端点以 400 报超窗、有界降级重试（segment 窗对半改切 / annotate 减帧 / quality 收紧文本份额）耗尽仍失败；**反应态 200**——端点以成功响应报 `model_context_window_exceeded` 且降级耗尽（或该调用点无可降级项）。处置一致：记录 failed 进 rejects，计 `report.budget.overflow_records`；降级重试独立计数（`degrade_retries`）、不烧常规重试。熔断交互：预检不计连击（没碰端点）、反应态 200 不补喂（HTTP 交互成功）、**唯反应态 400 的终局计入连击一次**。批量出现 ⇒ 记录真的超大：核对 `context_window` 是否欠声明过狠（可按实测实效窗上调），或接受拒收 |
-| `output_truncated` | llm-client | 输出写满 `max_output_tokens` 被截断（v1.11：`finish_reason=length` / `stop_reason=max_tokens`）——输入合窗、输出溢出。**终局化**：记录 failed 进 rejects 独立成桶；不进 L1–L3 修复环（硬修截断 JSON 会产出结构合法但语义残缺的对象，第 14 章）；不喂熔断（交互成功）。处置 ⇒ 调大配置里的 `max_output_tokens`——工具刻意**不做**「加大 max_tokens 自动重试」（会破坏预算不变式与确定性）；声明了 `context_window` 时注意调大它会挤占输入预算（第 17 章） |
+| `judgment_invalid` | quality | 单次裁决修复后仍非法 ⇒ 按平局计入 Bradley-Terry（不失败记录），计 `report.quality.judgment_failures`。率 >5% 见第 16 章诊断 |
+| `schema_violation` | 结构引擎 | LLM 修复环预算耗尽 ⇒ 记录 failed。批量出现 ⇒ 第 14 章（Schema 对模型不友好）。v1.11 两注：「输出被截断」不再是本码的成因——截断已独立成 `output_truncated`（见下）；修复调用自身超上下文预算的轮失败短路（14.1）归因也维持本码/`callback_violation` 不变 |
+| `callback_violation` | 结构引擎 | LLM 修复环耗尽且剩余违规全部来自 `output.validator` 回调（14.5）⇒ 记录 failed。批量出现 ⇒ 回调规则模型学不会——把违规消息改写成更明确的改进指示，或放宽规则 |
+| `context_overflow` | llm-client / 各算子 | 超出上下文预算（v1.11，仅相关 profile 声明了 `context_window` 时才会出现，第 6 章），三种形态：**预检**——调用发出前估算即超限，或连语义最小单元都装不下（单记录 / 2 帧窗 / 1 条种子 / 2 张关键帧；pairwise 的一对装不下**不拒收记录**——按裁决粒度折算平局，仅记错误与事件，第 10 章）；**反应态 400**——端点以 400 报超窗、有界降级重试（segment 窗对半改切 / annotate 减帧 / quality 收紧文本份额）耗尽仍失败；**反应态 200**——端点以成功响应报 `model_context_window_exceeded` 且降级耗尽（或该调用点无可降级项）。处置一致：记录 failed 进 rejects，计 `report.budget.overflow_records`；降级重试独立计数（`degrade_retries`）、不烧常规重试。熔断交互：预检不计连击（没碰端点）、反应态 200 不补喂（HTTP 交互成功）、**唯反应态 400 的终局计入连击一次**。批量出现 ⇒ 记录真的超大：核对 `context_window` 是否欠声明过狠（可按实测实效窗上调），或接受拒收 |
+| `output_truncated` | llm-client | 输出写满 `max_output_tokens` 被截断（v1.11：`finish_reason=length` / `stop_reason=max_tokens`）——输入合窗、输出溢出。**终局化**：记录 failed 进 rejects 独立成桶；不进任何修复层（硬修截断 JSON 会产出结构合法但语义残缺的对象，第 14 章）；不喂熔断（交互成功）。处置 ⇒ 调大配置里的 `max_output_tokens`——工具刻意**不做**「加大 max_tokens 自动重试」（会破坏预算不变式与确定性）；声明了 `context_window` 时注意调大它会挤占输入预算（第 17 章） |
 | `provider_retryable_exhausted` | llm-client | 重试 max_retries 次仍失败（网络/超时/429/5xx），v1.6 起也包括驻留超限（全部存活密钥均在 429 冷却、累计等待超 `run.max_park_s`）⇒ 记录 failed。批量出现 ⇒ 端点在持续故障或限流，见 18.2「运行频繁被 429 限流拖慢 / 中断」 |
-| `provider_fatal` | llm-client | 不可重试错误（401/403/400/404）⇒ 记录立即 failed 并计入熔断窗口。v1.6 密钥池下 401/403 先按密钥禁用、池内尚有存活密钥时**不产生本错误**（见 18.2「某把 key 被吊销…」）。v1.11：预算开启（声明了 `context_window`）时，错误体被识别为「上下文超长」的 400 不落本码——先走有界降级重试，耗尽按 `context_overflow` 收场（终局补计一次连击）；未识别的 400 照旧走本码。批量出现 ⇒ 密钥/权限/模型名问题 |
+| `provider_fatal` | llm-client | 不可重试错误（401/403/400/404）⇒ 记录立即 failed 并计入熔断窗口。v1.6 密钥池下 401/403 先按密钥禁用、池内尚有存活密钥时**不产生本错误**（见 18.2「某把密钥被吊销…」）。v1.11：预算开启（声明了 `context_window`）时，错误体被识别为「上下文超长」的 400 不落本码——先走有界降级重试，耗尽按 `context_overflow` 收场（终局补计一次连击）；未识别的 400 照旧走本码。批量出现 ⇒ 密钥/权限/模型名问题 |
 | `internal_error` | 任意 | 未预期异常（含输出前终检兜底）⇒ 记录 failed，堆栈在 debug 级日志。理论上不该出现，出现请留存日志报告 |
 
 v1.12（流模式帧粒度，第 25 章 25.6）**零新增错误码**：帧级分类/标注的失败复用既有 kind（结构修复耗尽照旧是 `schema_violation` 等），且**不产生 rejects 行**——帧分类失败落兜底帧类（计 `report.stream.frame_classify.fallback` / `window_failures`），帧标注失败落 members[] 的 `status="failed"`（计 `frame_annotate.failed`），episode 信封照常发射。排查入口见 18.2 的「members 里大量 status="failed"」。
 
 ## 18.2 按症状排查
 
-### 「启动就退出，码 2」
+先用这棵决策树从退出码与 counts 特征定位到病灶小节，再进小节细查：
+
+```mermaid
+flowchart TD
+    code{"退出码？"}
+    code -->|2| c2["配置错误：stderr 的 ConfigError 清单带 文件:节.键 定位（见「启动就退出，退出码 2」）"]
+    code -->|3| c3["输入错误：路径 / 候选文件 / 无任何合法记录（见「退出码 3」）"]
+    code -->|4| c4["熔断 / 运行期写盘失败 / Ctrl-C 打在启动或收尾阶段（见「退出码 4」）"]
+    code -->|1| c1["--strict 被违反（有 rejects）或报告写出失败（第 15 章退出码表）"]
+    code -->|0| c0{"主输出比预期少？"}
+    c0 -->|否| done["流程走完；0 不等于全部记录成功，按需读 report.counts 对账（第 15 章）"]
+    c0 -->|是| counts{"report.counts 哪类占大头？"}
+    c1 -->|有 rejects 时| counts
+    counts -->|failed| tf["读 rejects 的 _meta.reason：provider_* ⇒ 端点/密钥（第 2 章 probe）；schema_violation ⇒ 第 14 章"]
+    counts -->|dropped_lowq| tq["质量线切多了或 rubric 口径不合 ⇒ 第 10 章"]
+    counts -->|dropped_dup| td["模板化数据被近似判重大面积命中 ⇒ 第 9 章"]
+    counts -->|bad_input| tb["text_field 对部分行不适用 / 格式混杂 ⇒ 第 5 章"]
+    counts -->|dropped_verify| tv["评审口径过严或标注质量真的差 ⇒ trace 读 critiques（第 13、16 章）"]
+```
+
+### 「启动就退出，退出码 2」
 
 读 stderr——所有配置错误都带**文件:节.键**定位与期望值提示，且一次列全：
 
@@ -60,7 +80,7 @@ InputError: 无任何合法记录: input.jsonl（scanned=14 bad_input=14 missing
 
 ### 「退出码 4」
 
-- **熔断**：report 照常写出，显式标志是 `run.circuit_broken: true`（`interrupted` 保持 `false`——那个字段仅在 SIGINT/SIGTERM 中断时为 true）。v1.6 起已完成批的主输出与 rejects **照常改名交付**（v1.5 及以前是 `.part` 不改名丢弃），report 另标 `partial_delivery: true`——读法见下文「运行以退出码 4 结束，但主输出文件存在」。认证类错误（401/403）**首次出现即熔断**（v1.6 密钥池下指该 profile **最后一把**存活密钥被认证禁用——此前的单把 401/403 只静默禁用那把 key，见「某把 key 被吊销…」）；400/404、重试耗尽等按连续计数达阈值熔断。查密钥、模型名、网关状态。**一类可根治的 400 熔断（v1.11）**：个别超大记录（超长文本、巨型控件树、多图长序列）连续把端点打出「上下文超长」的 400，也会攒满连击触发熔断——对策是**先给该 profile 声明 `context_window`**（第 6 章）：预算机制会在调用发出前把装不下的记录转成记录级 `context_overflow` 拒收，run 继续、熔断不再触发（预检形态不计连击；只有降级重试也救不回的反应态 400 终局才补计一次——那种连续失败值得停机排查）。另一个实测事实可省你排查时间：z.ai 的 anthropic 路由**根本不用 400 报超窗**——它返回 200 响应 + `stop_reason="model_context_window_exceeded"`（零计费、空内容），这种 200 形态 v1.11 起被自动识别为 `context_overflow`、天然不喂熔断，所以在该端点「超大记录攒熔断」本就不会发生，rejects 里直接找 `context_overflow` 即可；
+- **熔断**：report 照常写出，显式标志是 `run.circuit_broken: true`（`interrupted` 保持 `false`——那个字段仅在 SIGINT/SIGTERM 中断时为 true）。v1.6 起已完成批的主输出与 rejects **照常改名交付**（v1.5 及以前是 `.part` 不改名丢弃），report 另标 `partial_delivery: true`——读法见下文「运行以退出码 4 结束，但主输出文件存在」。认证类错误（401/403）**首次出现即熔断**（v1.6 密钥池下指该 profile **最后一把**存活密钥被认证禁用——此前的单把 401/403 只静默禁用那把密钥，见「某把密钥被吊销…」）；400/404、重试耗尽等按连续计数达阈值熔断。查密钥、模型名、网关状态。**一类可根治的 400 熔断（v1.11）**：个别超大记录（超长文本、巨型控件树、多图长序列）连续把端点打出「上下文超长」的 400，也会攒满连击触发熔断——对策是**先给该 profile 声明 `context_window`**（第 6 章）：预算机制会在调用发出前把装不下的记录转成记录级 `context_overflow` 拒收，run 继续、熔断不再触发（预检形态不计连击；只有降级重试也救不回的反应态 400 终局才补计一次——那种连续失败值得停机排查）。另一个实测事实可省你排查时间：z.ai 的 anthropic 路由**根本不用 400 报超窗**——它返回 200 响应 + `stop_reason="model_context_window_exceeded"`（零计费、空内容），这种 200 形态 v1.11 起被自动识别为 `context_overflow`、天然不喂熔断，所以在该端点「超大记录攒熔断」本就不会发生，rejects 里直接找 `context_overflow` 即可；
 - **输出不可写（运行期才失败）**：启动时输出目录还正常、运行中途写入失败——目录被删/改名、磁盘写满、权限被中途收回等。注意：忘了 `mkdir -p out` 或目录一开始就没有写权限，会在启动校验被拦下 → **退出码 2**（消息「输出父目录不存在或不可写」）；
 - **Ctrl-C 打在流水线之外**：运行中的 Ctrl-C 走优雅中断（正常交付、退出码 0/1，见「`.part` 文件是什么」）；但打在启动/收尾阶段（配置装载、probe 等）或信号处理不可用的平台上时，进程以 `interrupted` + 退出码 4 收场。
 
@@ -71,7 +91,7 @@ InputError: 无任何合法记录: input.jsonl（scanned=14 bad_input=14 missing
 v1.6 起这是正常组合，不是文件系统闹鬼。熔断中止的收尾**照常交付已完成批**——`.part` 被 fsync 后原子改名为最终文件（v1.5 及以前熔断丢弃 `.part`，长跑末段配额耗尽会把几小时的产出全部作废；v1.6 不再如此）。读法三步：
 
 1. **认标志**：report 的 `run.partial_delivery: true`——仅熔断交付时出现，恒伴随 `circuit_broken: true`；
-2. **对账**：`counts` 增列 `unprocessed`（已扫描/已生成但因中止没走完流水线的记录数），守恒等式相应扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`（第 8 章）；
+2. **对账**：`counts` 增列 `unprocessed`（已扫描/已生成但因中止没走完流水线的记录数），守恒恒等式相应扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`（第 8 章）；
 3. **用数**：主输出是「已完成批的完整前缀」——每一行照旧完整合法，可直接拿去评估或救急；缺口就是 `unprocessed`。修好熔断死因（密钥、配额、模型名，见上文「退出码 4」）后**整份重跑**补齐——工具无状态、无断点续跑，部分交付的产出救急可以，正式交付以完整重跑为准。
 
 **给下游脚本的判定规则（v1.6 必改）**：「最终文件名出现」不再等价「全部输入处理完毕」。判定一次运行是否完整，唯一可靠的判据是：
@@ -90,13 +110,13 @@ jq -e '.run.interrupted == false and .run.circuit_broken == false' out/report.js
 |---|---|---|
 | `failed` 占大头 | 看 rejects 的 `_meta.reason`：`provider_fatal` = 模型名/路径类错误（400/404）没攒够熔断阈值——密钥错误（401/403）如今会立即熔断、不会走到这里；`schema_violation` = Schema 问题 | 第 2 章 probe / 第 14 章 |
 | `dropped_lowq` 占大头 | 质量线切多了，或默认 rubric 的口径不适合你的数据 | 第 10 章：看直方图重新画线 / 换 rubric |
-| `dropped_dup` 占大头 | 模板化数据被近似去重大面积命中 | 第 9 章场景二：阈值提到 0.92+ |
+| `dropped_dup` 占大头 | 模板化数据被近似判重大面积命中 | 第 9 章场景二：阈值提到 0.92+ |
 | `bad_input` 占大头（但仍有部分合法行） | text_field 对部分行不适用 / 文件格式混杂（全员坏行不会走到这里——那是退出码 3「无任何合法记录」） | 第 5 章自查清单 |
 | `dropped_verify` 占大头 | 评审口径过严，或标注质量真的差 | trace 读 critiques（第 13/16 章） |
 
 ### 「跑得比 dry-run 估的贵」
 
-估算不含重试与修复。查 `llm_usage.retries`（限流？）与 `schema_engine.resolved_at.l3_*`（修复环烧钱？）。
+估算不含重试与修复。查 `llm_usage.retries`（限流？）与 `schema_engine.resolved_at.l3_*`（LLM 修复环烧钱？）。
 
 ### 「开了分段，会话被切得粉碎 / episode 只有两三帧」（v1.8）
 
@@ -108,7 +128,7 @@ jq -e '.run.interrupted == false and .run.circuit_broken == false' out/report.js
 
 ### 「stream 工程配 --strict 总以退出码 1 结束」（v1.8）
 
-**预期行为，不是故障**。工程噪声帧（弹窗、误触、短段丢弃）是 stream 模式的正常产物，它们进拒绝通道（reason 为 `noise` / `below_min_len`），而 `--strict` 的语义是「有任何拒绝即退出 1」。stream 工程要么不配 `--strict`，要么让脚本改读 report 计数（如 `failed` 与 `dropped_verify`）判断健康度。v1.9 再注意**反向变化**：开启 `[stitch]` 短段救援后，命中救援的 `below_min_len` 帧不再落 rejects——同一份输入 strict 结果可能从 1 变 0，同样属预期（第 26 章）。
+**预期行为，不是故障**。工程噪声帧（弹窗、误触、短段丢弃）是流模式的正常产物，它们进拒绝通道（reason 为 `noise` / `below_min_len`），而 `--strict` 的语义是「有任何拒绝即退出 1」。stream 工程要么不配 `--strict`，要么让脚本改读 report 计数（如 `failed` 与 `dropped_verify`）判断健康度。v1.9 再注意**反向变化**：开启 `[stitch]` 短段救援后，命中救援的 `below_min_len` 帧不再落 rejects——同一份输入 strict 结果可能从 1 变 0，同样属预期（第 26 章）。
 
 ### 「该缝的没缝上（漏缝）」（v1.9）
 
@@ -120,32 +140,32 @@ jq -e '.run.interrupted == false and .run.circuit_broken == false' out/report.js
 
 ### 「members 里大量 status="failed"」（v1.12）
 
-现象：主输出 episode 行的 `_meta.stream.members[]` 里 `status="failed"` 占比异常、对应 `annotation` 全是 null——而 rejects 里**找不到任何对应行**、`--strict` 也不红。后半是设计语义不是遗漏：成员失败不是信封失败，帧失败不入 rejects、不触发 `--strict`（第 25 章 25.6），账面就在 members[] 状态位与 report 的帧子块。按序排查：① **帧 Schema 复杂度**——帧标注输出越深越难修，第 14 章的编写指南对帧 Schema 同样成立（平铺、语义化枚举、`required` + `additionalProperties: false`），先把帧 Schema 改简单；② **上下文预算**——帧 prompt 是最小单元、无降级梯，所引档 `context_window` 声明过狠时预检直接把成员判 failed（查 `report.budget.overflow_records` 与 trace error 事件里的 `context_overflow`）；③ **对账计数**——`report.stream.frame_annotate.failed`（emitter 写前帧校验兜底翻掉的也计入此数）；④ **逐成员定位**——trace 订阅 `"annotate"` 通道读 `annotate.frame` 事件（member_id / status / attempts，第 16 章），attempts 偏高说明修复环在反复失败，回到帧 Schema 与模型能力。
+现象：主输出 episode 行的 `_meta.stream.members[]` 里 `status="failed"` 占比异常、对应 `annotation` 全是 null——而 rejects 里**找不到任何对应行**、`--strict` 也不红。后半是设计语义不是遗漏：成员失败不是信封失败，帧失败不入 rejects、不触发 `--strict`（第 25 章 25.6），账面就在 members[] 状态位与 report 的帧子块。按序排查：① **帧 Schema 复杂度**——帧标注输出越深越难修，第 14 章的编写指南对帧 Schema 同样成立（平铺、语义化枚举、`required` + `additionalProperties: false`），先把帧 Schema 改简单；② **上下文预算**——帧 prompt 是最小单元、无降级梯，所引 profile `context_window` 声明过狠时预检直接把成员判 failed（查 `report.budget.overflow_records` 与 trace error 事件里的 `context_overflow`）；③ **对账计数**——`report.stream.frame_annotate.failed`（emitter 写前帧校验兜底翻掉的也计入此数）；④ **逐成员定位**——trace 订阅 `"annotate"` 通道读 `annotate.frame` 事件（member_id / status / attempts，第 16 章），attempts 偏高说明修复环在反复失败，回到帧 Schema 与模型能力。
 
 ### 「运行频繁被 429 限流拖慢 / 中断」
 
 症状链是渐进的：stderr 反复出现重试告警、批间耗时越拉越长，report 的 `llm_usage.<profile>.retries` 偏高；恶化到重试耗尽时 rejects 里 `provider_retryable_exhausted` 批量出现；再攒够连续失败就熔断（退出码 4）。
 
-v1.6 的药方是**密钥池**：给该 profile 多配几把 key——`api_key_envs = ["LABELKIT_KEY_A", "LABELKIT_KEY_B"]`（与 `api_key_env` 恰写其一，池内共享其余全部参数，第 6 章）。此后一把 key 挨了 429 只冷却**它自己**（带 `Retry-After` 遵从全时长；不带则按该 key 的连续 429 计数指数冷却、封顶 300 秒），下一次尝试立即换池内可用 key 重发——**只要还有存活 key，限流等待恒为零**。全部存活 key 同时冷却时调用才**驻留**原地等待（有界，上限 `run.max_park_s`，默认 3600 秒，第 7 章），驻留超限按重试耗尽让该记录 failed。
+v1.6 的药方是**密钥池**：给该 profile 多配几把密钥——`api_key_envs = ["LABELKIT_KEY_A", "LABELKIT_KEY_B"]`（与 `api_key_env` 恰写其一，池内共享其余全部参数，第 6 章）。此后一把密钥挨了 429 只冷却**它自己**（带 `Retry-After` 遵从全时长；不带则按该密钥的连续 429 计数指数冷却、封顶 300 秒），下一次尝试立即换池内可用密钥重发——**只要还有存活密钥，限流等待恒为零**。全部存活密钥同时冷却时调用才**驻留**原地等待（有界，上限 `run.max_park_s`，默认 3600 秒，第 7 章），驻留超限按重试耗尽让该记录 failed。
 
 限流形势看四条线索（事件详情见第 16 章）：
 
 | 线索 | 在哪 | 读法 |
 |---|---|---|
 | `llm.key_cooldown` | 仅 trace（llm 通道），不上 stderr | 每次冷却一条：`key_env`、`cooldown_s`、`retry_after`。零星出现 = 池在正常消化限流 |
-| `llm.pool_parked` | stderr WARN + trace | 全部存活 key 同时在冷却、调用开始驻留（`wait_s`、`live_keys`）。频繁出现 = 池整体容量不够 |
-| `keys.<env名>.rate_limited` | report `llm_usage.<profile>` | 每把 key 各挨了多少次 429 |
-| `parked_calls` / `parked_ms` | report `llm_usage.<profile>` | 驻留总账。`parked_ms` 持续走高 ⇒ 加 key，或降 `max_concurrency` |
+| `llm.pool_parked` | stderr WARN + trace | 全部存活密钥同时在冷却、调用开始驻留（`wait_s`、`live_keys`）。频繁出现 = 池整体容量不够 |
+| `keys.<env名>.rate_limited` | report `llm_usage.<profile>` | 每把密钥各挨了多少次 429 |
+| `parked_calls` / `parked_ms` | report `llm_usage.<profile>` | 驻留总账。`parked_ms` 持续走高 ⇒ 加密钥，或降 `max_concurrency` |
 
-两个容易想当然的点：`max_concurrency` 是池内全部 key 的**总**在途上限，不随 key 数放大——加了 key 想提吞吐要同时上调它；单 key 配置不加池也受益于 v1.6——无 `Retry-After` 的 429 冷却封顶 300 秒、超长 `Retry-After`（小时级配额信号）受 `run.max_park_s` 约束，不再无界干等。
+两个容易想当然的点：`max_concurrency` 是池内全部密钥的**总**在途上限，不随密钥数放大——加了密钥想提吞吐要同时上调它；单密钥配置不加池也受益于 v1.6——无 `Retry-After` 的 429 冷却封顶 300 秒、超长 `Retry-After`（小时级配额信号）受 `run.max_park_s` 约束，不再无界干等。
 
-### 「某把 key 被吊销，整池只剩部分吞吐」
+### 「某把密钥被吊销，整池只剩部分吞吐」
 
-数据一条没坏、运行也不报错，但吞吐明显低于 key 数应有的水平。v1.6 密钥池对 401/403 的处置是**按 key 禁用**：那把 key 本运行内永久下线，同一尝试立即换存活 key 重发——不消耗重试预算、不喂熔断计数。池内还有活钥时这故障被**静默吸收**（配额耗尽以 403 形态上报的服务商同样按禁用处理，不做错误体嗅探），代价只是池容量悄悄缩水；只有**最后一把**存活 key 也被禁用时才回到 v1.5 语义——立即熔断、退出码 4。
+数据一条没坏、运行也不报错，但吞吐明显低于密钥数应有的水平。v1.6 密钥池对 401/403 的处置是**按密钥禁用**：那把密钥本运行内永久下线，同一尝试立即换存活密钥重发——不消耗重试预算、不喂熔断计数。池内还有存活密钥时这故障被**静默吸收**（配额耗尽以 403 形态上报的服务商同样按禁用处理，不做错误体嗅探），代价只是池容量悄悄缩水；只有**最后一把**存活密钥也被禁用时才回到 v1.5 语义——立即熔断、退出码 4。
 
 定位三处：
 
-- stderr 的 WARN（每把 key 每次运行至多一条，长跑日志里容易被刷走——grep `key_disabled`）；
+- stderr 的 WARN（每把密钥每次运行至多一条，长跑日志里容易被刷走——grep `key_disabled`）；
 - trace 的 `llm.key_disabled` 事件：`key_env`（环境变量名）与 `status_code`（401/403）；
 - 事后看 report——`llm_usage.<profile>.keys` 里哪把 `"disabled": true`：
 
@@ -157,7 +177,7 @@ jq '.llm_usage | map_values(.keys // {} | with_entries(select(.value.disabled)))
 
 ### 「一遇 429 记录就立即失败」
 
-查 project.toml 是不是把 `run.max_park_s` 设成了 `0`、而该 profile 只有一把 key。`0` = 不驻留：全池冷却的瞬间就按重试耗尽处理；单 key 池的「全池冷却」= 「这把 key 挨了一次 429」——哪怕 `Retry-After` 只有几秒，该记录也立即 failed（`provider_retryable_exhausted`）并计入熔断窗口，限流稍一持续整个运行就熔断。trace 特征：`llm.key_cooldown` 之后**没有** `llm.pool_parked`，`llm.call` 直接以 `status="retryable_exhausted"` 收场。处置：单 key 配置恢复默认 `max_park_s = 3600`（宁等勿失）；`0` 只该配在多 key 池上——在那里它的含义是「全池都被限流时快速失败、尽早暴露容量问题」，而不是「一次 429 即死」（第 7 章）。
+查 project.toml 是不是把 `run.max_park_s` 设成了 `0`、而该 profile 只有一把密钥。`0` = 不驻留：全池冷却的瞬间就按重试耗尽处理；单密钥池的「全池冷却」= 「这把密钥挨了一次 429」——哪怕 `Retry-After` 只有几秒，该记录也立即 failed（`provider_retryable_exhausted`）并计入熔断窗口，限流稍一持续整个运行就熔断。trace 特征：`llm.key_cooldown` 之后**没有** `llm.pool_parked`，`llm.call` 直接以 `status="retryable_exhausted"` 收场。处置：单密钥配置恢复默认 `max_park_s = 3600`（宁等勿失）；`0` 只该配在多密钥池上——在那里它的含义是「全池都被限流时快速失败、尽早暴露容量问题」，而不是「一次 429 即死」（第 7 章）。
 
 ### 「同配置两次运行结果不一样」
 
@@ -165,7 +185,7 @@ jq '.llm_usage | map_values(.keys // {} | with_entries(select(.value.disabled)))
 
 ### 「trace 文件怎么没了 / 变小了」
 
-trace 默认路径随输出走，在**首个事件写出时**截断（覆盖前 stderr 有一条 `trace file ... already exists — truncating` 的 WARN）。死于配置/输入校验的「秒败」运行与 dry-run（写 `{名}.dryrun{后缀}` 独立文件）都不会碰它；正常启动的重跑仍会覆盖——要历史就归档或换 `trace.path`。
+trace 默认路径随输出走，在**首个事件写出时**截断（覆盖前 stderr 有一条 `trace file ... already exists — truncating` 的 WARN）。死于配置/输入校验的运行与 dry-run（写 `{名}.dryrun{后缀}` 独立文件）都不会碰它；正常启动的重跑仍会覆盖——要历史就归档或换 `trace.path`。
 
 ### 「`.part` 文件是什么」
 

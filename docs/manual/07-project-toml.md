@@ -38,7 +38,7 @@ schema_inline = """
 | `output` | str | 必填 | 主输出 `.jsonl` 路径。可被 CLI `--output` 覆盖。其余产物都从它派生：`{stem}.rejects.jsonl`、`{stem}.report.json`、`{stem}.trace.jsonl` 都落在同目录 |
 | `modality` | str | 必填 | `"text"` 或 `"ui"`。决定输入解析方式、去重算法组合、提示词形态 |
 | `mode` | str | `"process"` | `"process"` = 加工既有数据；`"generate_only"` = 无输入纯生成（第 12 章）。 |
-| `batch_size` | int | 256 | 批大小。**双重身份**：内存/落盘节奏的单位 + pairwise 质量打分的比较池大小（stream 模式下还是整会话装箱容量）。用 pairwise 时这是质量口径参数（第 10 章详述），不要只当性能参数调。**它从不影响单次 prompt 体积**——单次调用装多少内容由各算子的条数上限与上下文预算决定（v1.11，第 6 章 `context_window`），调大 batch_size 不会让单个请求变大 |
+| `batch_size` | int | 256 | 批大小。**双重身份**：内存/落盘节奏的单位 + pairwise 质量打分的比较池大小（流模式下还是整会话装箱容量）。用 pairwise 时这是质量口径参数（第 10 章详述），不要只当性能参数调。**它从不影响单次 prompt 体积**——单次调用装多少内容由各算子的条数上限与上下文预算决定（v1.11，第 6 章 `context_window`），调大 batch_size 不会让单个请求变大 |
 | `seed` | int | 0 | 全局随机种子：配对采样、A/B 呈现顺序、生成时的模型/风格抽取全由它驱动。**换 seed = 换一套随机方案**；固定 seed + 固定输入 = 可复现的流程路径。调试 rubric 时保持 seed 不变，对照才有意义 |
 | `fatal_error_threshold` | int | 20 | 熔断阈值：**连续**多少次不可恢复的 API 错误后放弃整个运行（退出码 4）。认证类错误（401/403）不受此阈值约束、**首次出现即熔断**；重试耗尽也计入连续窗口；任何一次成功调用清零计数。调小（如 5）= 对坏端点更敏感、更快止损；调大 = 更能容忍偶发抽风 |
 | `max_park_s` | int | 3600 | **驻留预算**（v1.6）：一次逻辑 LLM 调用因所引 profile 的**全部存活密钥都在 429 冷却中**而原地等待（驻留）的累计秒数上限。配了密钥池（`api_key_envs`，第 6 章）时限流先靠换密钥零等待消化、全池冷却才驻留；单密钥配置下它同样约束超长 `Retry-After` 等待（如小时级配额信号），不再无界干等。**超限按重试耗尽处理**：该记录 `failed`、并计入 `fatal_error_threshold` 的连续熔断窗口——限流持续拖垮记录时运行照常熔断止损。驻留发生时 stderr 有 WARN、trace 有 `llm.pool_parked` 事件（第 16 章）。`0` = 不驻留：全池一冷却立即按重试耗尽失败。**警告**：0 配在单密钥 profile 上意味着任何一次 429（哪怕 `Retry-After` 只有几秒）都直接变成记录失败——0 只建议配在多密钥池上。怎么调：无人值守长跑保持默认甚至调大（限流窗口过去自动续跑，宁等勿失）；有人盯着、想尽快暴露限流问题时调小（如 60）快速失败 |
@@ -73,11 +73,11 @@ schema_inline = """
 | `[generate]` | 关 | `instruction`（生成指令）、`num_per_record`（每种子产几条）、`llms`/`styles`（多样性来源） | 第 12 章 |
 | `[annotate]` | **开** | `instruction`（标注指令，开了就必填）、`examples`（few-shot）、`self_consistency`（多次采样投票） | 第 11 章 |
 | `[frame.annotate]` | 关（v1.12，仅流模式） | `instruction`（帧标注指令，启用必填）、`schema_path`/`schema_inline`（独立帧 Schema，恰一）、`[frame.class.<名>.annotate]`（按帧类覆盖/跳过） | 第 11、25 章 |
-| `[verify]` | 关 | `llm`（评审档，建议独立模型）、`policy`（drop/repair）、`extra_criteria`（追加评审维度） | 第 13 章 |
+| `[verify]` | 关 | `llm`（评审 profile，建议独立模型）、`policy`（drop/repair）、`extra_criteria`（追加评审维度） | 第 13 章 |
 
 `[classify]` 是 v1.7 新增的分类算子节：按你声明的类别表对每条存活记录做 LLM 封闭集分类，类标签写进 `_meta.classification` 并驱动下游「按类条件化」。启用后另有一族按类覆盖节 **`[class.<name>.<section>]`**——对某个类别单独覆盖 quality / annotate / generate / verify（v1.8 起还有 extract 的 instruction）的白名单参数（按类 rubric、按类标注指令等），类未覆盖的键继承全局。完整键表、白名单与合并语义见第 24 章与 spec §5.2。
 
-v1.8/v1.9 新增的四节同属**时序流（stream 模式）**一族：`[stream]` 声明输入的时间序与会话切分规则（排序依据、分区键、断开条件——它不是算子，随 `segment.enabled` 生效）；`[segment]` 是 stream 模式的总开关，把候选会话经 LLM 边界精化切成语义完整的 episode 并剔除噪声帧；`[stitch]`（v1.9）把同一任务被穿插切开的 episode 碎片保守缝合成完整线索，并可救援过短被剔的收尾帧（要求 segment 开启）；`[extract]` 对 episode 的每对相邻帧推断结构化动作（仅 UI 模态，要求 segment 开启）。四节的逐键详解与完整示例见第 25、26 章。
+v1.8/v1.9 新增的四节同属**流模式**一族：`[stream]` 声明输入的时间序与会话切分规则（排序依据、分区键、断开条件——它不是算子，随 `segment.enabled` 生效）；`[segment]` 是流模式的总开关，把候选会话经 LLM 边界精化切成语义完整的 episode 并剔除噪声帧；`[stitch]`（v1.9）把同一任务被穿插切开的 episode 碎片保守缝合成完整线索，并可救援过短被剔的收尾帧（要求 segment 开启）；`[extract]` 对 episode 的每对相邻帧推断结构化动作（仅 UI 模态，要求 segment 开启）。四节的逐键详解与完整示例见第 25、26 章。
 
 v1.12 的帧粒度双节也是流模式一族（都要求 `segment.enabled = true`），但它们不是新算子——`[frame.classify]` 让 classify 算子顺带对 episode 成员帧做批量闭集分类（帧类表与序列类表互相独立），`[frame.annotate]` 让 annotate 算子逐成员做帧级标注（独立的帧 Schema），配套的 `[frame.class.<帧类名>.annotate]` 按帧类覆盖指令或跳过整类。帧产物挂 `_meta.stream.members[]` 随序列行交付。逐键详解见第 25 章 25.6，全键表见附录 A.12。
 
@@ -100,9 +100,9 @@ v1.12 的帧粒度双节也是流模式一族（都要求 `segment.enabled = tru
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `max_repair_attempts` | 2 | 结构引擎 L3 层（LLM 修复环）的最大轮数。修复 2 轮仍不合法 ⇒ 该记录 `failed` 进拒绝通道。调大能救回更多顽固记录，但每轮都是一次真金白银的调用；更值得做的是把 Schema 改简单（第 14 章） |
-| `repair_llm` | 同调用方 | 修复调用用哪个 profile。默认跟原调用同档；可以指一个便宜的小模型专门干修 JSON 的活 |
-| `validator` | 不设 | **代码回调校验（L2.5）**：`"module:function"`，对已过 Schema 的标注对象做业务级硬校验（跨字段/词表/业务规则），违规意见回喂修复环。签名与写法见 14.5；启动时校验可导入、可调用并对 few-shot 示例干跑 |
+| `max_repair_attempts` | 2 | 结构引擎 LLM 修复环的最大轮数。修复 2 轮仍不合法 ⇒ 该记录 `failed` 进拒绝通道。调大能救回更多顽固记录，但每轮都是一次真金白银的调用；更值得做的是把 Schema 改简单（第 14 章） |
+| `repair_llm` | 同调用方 | 修复调用用哪个 profile。默认跟原调用同一 profile；可以指一个便宜的小模型专门干修 JSON 的活 |
+| `validator` | 不设 | **代码回调校验层**：`"module:function"`，对已过 Schema 的标注对象做业务级硬校验（跨字段/词表/业务规则），违规意见回喂修复环。签名与写法见 14.5；启动时校验可导入、可调用并对 few-shot 示例干跑 |
 
 ### 元信息与透传
 
@@ -110,7 +110,7 @@ v1.12 的帧粒度双节也是流模式一族（都要求 `segment.enabled = tru
 |---|---|---|
 | `meta_mode` | `"inline"` | `_meta` 的去处：`inline` = 随行内嵌（保留键 `_meta`）；`sidecar` = 主输出保持纯净、`_meta` 逐行写 `{stem}.meta.jsonl`（与主输出行序对齐、以 `_meta.id` 关联）；`none` = 丢弃元信息（**分数、溯源全没了，不推荐**；帧粒度任一启用时不得为 none——帧产物仅经 `_meta` 承载，第 25 章 25.6） |
 | `passthrough_fields` | `[]` | 从输入行原样透传的字段名列表，落在 `_meta.source.fields`。典型用途：带上 `source`、`ts` 等业务字段，下游无需回查输入文件 |
-| `rejects` | `"refs"` | 拒绝通道内容量：`none` = 不写拒绝文件；`refs` = 只写 id、来源引用、淘汰环节与原因（**不含数据内容**）；`full` = 另含记录原文——方便直接人工审查被淘汰了什么，但意味着输出目录里存了一份数据副本，注意保管 |
+| `rejects` | `"refs"` | 拒绝通道内容量：`none` = 不写拒绝通道文件；`refs` = 只写 id、来源引用、淘汰环节与原因（**不含数据内容**）；`full` = 另含记录原文——方便直接人工审查被淘汰了什么，但意味着输出目录里存了一份数据副本，注意保管 |
 
 ## 7.6 `[trace]`：给流水线装行车记录仪
 
@@ -120,7 +120,7 @@ trace 是**可选的第四个输出通道**：一行一个 JSON 事件，记录�
 |---|---|---|
 | `enabled` | false | 开关。默认关 = 零额外产物 |
 | `path` | 自动 | 默认 `{output_stem}.trace.jsonl`。文件在**首个事件写出时**截断：死于配置/输入校验的运行与 dry-run（trace 写「文件名在扩展名前插 .dryrun」的独立文件）不会触碰旧账本；正常重跑仍会覆盖——要历史就改名归档或换 `path` |
-| `channels` | `["quality","verify","schema"]` | 订阅哪些事件通道，可选：`ingest` / `dedup` / `quality` / `annotate` / `verify` / `schema` / `llm`。`run.*`、`batch.*` 生命周期事件不受过滤，恒写 |
+| `channels` | `["quality","verify","schema"]` | 订阅哪些事件通道，可选（共十一个）：`ingest` / `dedup` / `segment` / `stitch` / `extract` / `classify` / `quality` / `annotate` / `verify` / `schema` / `llm`——分段/缝合/摘取/分类事件不在默认订阅里，要看须显式加入（第 16 章）。`run.*`、`batch.*` 生命周期事件不受过滤，恒写 |
 | `content` | `"refs"` | 内容脱敏档位，逐档递增：`none` = 只有 id、枚举与数值（最严合规）；`refs` = 另含 LLM 产出的理由/意见文本，**不含输入数据内容**（调优常规档）；`excerpt` = 另含输入内容前 200 字符（免回原文件对照）；`full` = 另含完整提示词与响应（`llm.call` 事件，需同时订阅 `llm` 通道）——**这构成一份完整数据副本，体积可达主输出数十倍，只在调试审计时短期开启** |
 
 什么时候开 trace？**调优期常开**（`channels` 含 `quality`，配合 `quality.judgment_reasons`，第 10/16 章）；**生产期看需要**——refs 档的体积和性能开销都不大，留着当审计底账也无妨。
