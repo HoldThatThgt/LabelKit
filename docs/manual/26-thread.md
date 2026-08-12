@@ -255,7 +255,7 @@ extra_criteria = "补充审核约定：动作序列恒为 成员帧数−1 步�
 
 ```
 dry-run: mode=process estimated_records=53 batches=1
-dry-run: estimated LLM calls — generate_calls=0 segment_calls=5 stitch_calls=10 classify_calls=5 extract_calls=48 quality_calls=20 annotate_calls=5 verify_calls=5 total=98 (excludes retries and repair calls)
+dry-run: estimated LLM calls — generate_calls=0 segment_calls=5 stitch_calls=10 classify_calls=5 frame_classify_calls=0 extract_calls=48 quality_calls=20 annotate_calls=5 frame_annotate_calls=0 verify_calls=5 total=98 (excludes retries and repair calls)
 dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界
 dry-run: 注：stream 估算：下游按 episodes≈sessions 报下界（LLM 精化只增段数）
 dry-run: no LLM calls made, no output written (report and trace only)

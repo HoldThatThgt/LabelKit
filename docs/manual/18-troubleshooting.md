@@ -28,6 +28,8 @@
 | `provider_fatal` | llm-client | 不可重试错误（401/403/400/404）⇒ 记录立即 failed 并计入熔断窗口。v1.6 密钥池下 401/403 先按密钥禁用、池内尚有存活密钥时**不产生本错误**（见 18.2「某把 key 被吊销…」）。v1.11：预算开启（声明了 `context_window`）时，错误体被识别为「上下文超长」的 400 不落本码——先走有界降级重试，耗尽按 `context_overflow` 收场（终局补计一次连击）；未识别的 400 照旧走本码。批量出现 ⇒ 密钥/权限/模型名问题 |
 | `internal_error` | 任意 | 未预期异常（含输出前终检兜底）⇒ 记录 failed，堆栈在 debug 级日志。理论上不该出现，出现请留存日志报告 |
 
+v1.12（流模式帧粒度，第 25 章 25.6）**零新增错误码**：帧级分类/标注的失败复用既有 kind（结构修复耗尽照旧是 `schema_violation` 等），且**不产生 rejects 行**——帧分类失败落兜底帧类（计 `report.stream.frame_classify.fallback` / `window_failures`），帧标注失败落 members[] 的 `status="failed"`（计 `frame_annotate.failed`），episode 信封照常发射。排查入口见 18.2 的「members 里大量 status="failed"」。
+
 ## 18.2 按症状排查
 
 ### 「启动就退出，码 2」
@@ -115,6 +117,10 @@ jq -e '.run.interrupted == false and .run.circuit_broken == false' out/report.js
 ### 「不该缝的缝上了（错缝）」（v1.9）
 
 现象：verify 报出 `wrong_stitch` 缺陷（只标记不拆线），或人工抽查发现一条线索里混着两个任务的碎片。处置：① 保持 `bias = "conservative"`（别为解决漏缝切到 `"llm"`——LLM 单腿的系统性偏差方向就是过连接）；② 抽读 `stitch.judge` 里错缝那次判定的 `priors`——若只靠 `app_overlap` 单腿命中（同 App 不同任务是它的天然盲区），给 `stitch.context` 写清「同 App 内的独立任务不算恢复」；③ 判定在同类场景上反复摇摆时开 `votes`（3 或 5，奇数）用采样多数决压漂移；④ 给 `stale_gap_steps` 设阈，让久挂线索的并入要求两条先验腿。错缝的验收线是「错缝帧数 = 0」——它比漏缝代价高（下游拿到的是被污染的轨迹），调参时始终朝保守方向偏。
+
+### 「members 里大量 status="failed"」（v1.12）
+
+现象：主输出 episode 行的 `_meta.stream.members[]` 里 `status="failed"` 占比异常、对应 `annotation` 全是 null——而 rejects 里**找不到任何对应行**、`--strict` 也不红。后半是设计语义不是遗漏：成员失败不是信封失败，帧失败不入 rejects、不触发 `--strict`（第 25 章 25.6），账面就在 members[] 状态位与 report 的帧子块。按序排查：① **帧 Schema 复杂度**——帧标注输出越深越难修，第 14 章的编写指南对帧 Schema 同样成立（平铺、语义化枚举、`required` + `additionalProperties: false`），先把帧 Schema 改简单；② **上下文预算**——帧 prompt 是最小单元、无降级梯，所引档 `context_window` 声明过狠时预检直接把成员判 failed（查 `report.budget.overflow_records` 与 trace error 事件里的 `context_overflow`）；③ **对账计数**——`report.stream.frame_annotate.failed`（emitter 写前帧校验兜底翻掉的也计入此数）；④ **逐成员定位**——trace 订阅 `"annotate"` 通道读 `annotate.frame` 事件（member_id / status / attempts，第 16 章），attempts 偏高说明修复环在反复失败，回到帧 Schema 与模型能力。
 
 ### 「运行频繁被 429 限流拖慢 / 中断」
 

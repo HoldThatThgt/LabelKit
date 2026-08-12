@@ -2,8 +2,9 @@
 
 > `project.toml` 是工程级配置：一次标注任务的全部意图都写在这里。
 > 本章精讲 `[run]` `[input]` `[output]` `[trace]` 四节的每个参数；
-> 九个算子节（`[dedup]` `[classify]` `[quality]` `[generate]` `[annotate]` `[verify]`、v1.8 的 `[segment]` `[extract]` 与 v1.9 的 `[stitch]`）
-> 及配套的 `[stream]` 输入声明节在此给出速览，深度解读见第 9–13、24、25、26 章。
+> 九个算子节（`[dedup]` `[classify]` `[quality]` `[generate]` `[annotate]` `[verify]`、v1.8 的 `[segment]` `[extract]` 与 v1.9 的 `[stitch]`）、
+> 配套的 `[stream]` 输入声明节与 v1.12 的帧粒度双节（`[frame.classify]` `[frame.annotate]`）在此给出速览，
+> 深度解读见第 9–13、24、25、26 章。
 
 ## 7.1 文件骨架与最小可用配置
 
@@ -66,15 +67,19 @@ schema_inline = """
 | `[stitch]` | 关（v1.9） | `max_open`（开放线索池容量）、`bias`（保守合取/纯 LLM）、`votes`（判定稳定化采样） | 第 26 章 |
 | `[dedup]` | **开** | `minhash_threshold`（0.85 近似判重线）、`scope`（global/batch）、`ui_dup_requires`（UI 判重口径） | 第 9 章 |
 | `[classify]` | 关（v1.7） | `[[classify.classes]]`（类别表，启用必填）、`fallback_class`（兜底类，启用必填）、`assignment`（single/multi 单多标签） | 第 24 章 |
+| `[frame.classify]` | 关（v1.12，仅流模式） | `[[frame.classify.classes]]`（帧类表，启用必填）、`fallback_class`（兜底帧类，启用必填） | 第 24、25 章 |
 | `[extract]` | 关（v1.8） | `llm`（恒需视觉能力）、`instruction`（摘取补充说明）、`include_diff`（树变更摘要注入） | 第 25 章 |
 | `[quality]` | **开** | `mode`（pairwise/pointwise）、`threshold` 或 `selection="top_ratio"`（淘汰机制）、`rubric`（评价准则） | 第 10 章 |
 | `[generate]` | 关 | `instruction`（生成指令）、`num_per_record`（每种子产几条）、`llms`/`styles`（多样性来源） | 第 12 章 |
 | `[annotate]` | **开** | `instruction`（标注指令，开了就必填）、`examples`（few-shot）、`self_consistency`（多次采样投票） | 第 11 章 |
+| `[frame.annotate]` | 关（v1.12，仅流模式） | `instruction`（帧标注指令，启用必填）、`schema_path`/`schema_inline`（独立帧 Schema，恰一）、`[frame.class.<名>.annotate]`（按帧类覆盖/跳过） | 第 11、25 章 |
 | `[verify]` | 关 | `llm`（评审档，建议独立模型）、`policy`（drop/repair）、`extra_criteria`（追加评审维度） | 第 13 章 |
 
 `[classify]` 是 v1.7 新增的分类算子节：按你声明的类别表对每条存活记录做 LLM 封闭集分类，类标签写进 `_meta.classification` 并驱动下游「按类条件化」。启用后另有一族按类覆盖节 **`[class.<name>.<section>]`**——对某个类别单独覆盖 quality / annotate / generate / verify（v1.8 起还有 extract 的 instruction）的白名单参数（按类 rubric、按类标注指令等），类未覆盖的键继承全局。完整键表、白名单与合并语义见第 24 章与 spec §5.2。
 
 v1.8/v1.9 新增的四节同属**时序流（stream 模式）**一族：`[stream]` 声明输入的时间序与会话切分规则（排序依据、分区键、断开条件——它不是算子，随 `segment.enabled` 生效）；`[segment]` 是 stream 模式的总开关，把候选会话经 LLM 边界精化切成语义完整的 episode 并剔除噪声帧；`[stitch]`（v1.9）把同一任务被穿插切开的 episode 碎片保守缝合成完整线索，并可救援过短被剔的收尾帧（要求 segment 开启）；`[extract]` 对 episode 的每对相邻帧推断结构化动作（仅 UI 模态，要求 segment 开启）。四节的逐键详解与完整示例见第 25、26 章。
+
+v1.12 的帧粒度双节也是流模式一族（都要求 `segment.enabled = true`），但它们不是新算子——`[frame.classify]` 让 classify 算子顺带对 episode 成员帧做批量闭集分类（帧类表与序列类表互相独立），`[frame.annotate]` 让 annotate 算子逐成员做帧级标注（独立的帧 Schema），配套的 `[frame.class.<帧类名>.annotate]` 按帧类覆盖指令或跳过整类。帧产物挂 `_meta.stream.members[]` 随序列行交付。逐键详解见第 25 章 25.6，全键表见附录 A.12。
 
 开关组合的合法性约束见 4.5 节（M1 启动时强制检查）。
 
@@ -103,7 +108,7 @@ v1.8/v1.9 新增的四节同属**时序流（stream 模式）**一族：`[stream
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `meta_mode` | `"inline"` | `_meta` 的去处：`inline` = 随行内嵌（保留键 `_meta`）；`sidecar` = 主输出保持纯净、`_meta` 逐行写 `{stem}.meta.jsonl`（与主输出行序对齐、以 `_meta.id` 关联）；`none` = 丢弃元信息（**分数、溯源全没了，不推荐**） |
+| `meta_mode` | `"inline"` | `_meta` 的去处：`inline` = 随行内嵌（保留键 `_meta`）；`sidecar` = 主输出保持纯净、`_meta` 逐行写 `{stem}.meta.jsonl`（与主输出行序对齐、以 `_meta.id` 关联）；`none` = 丢弃元信息（**分数、溯源全没了，不推荐**；帧粒度任一启用时不得为 none——帧产物仅经 `_meta` 承载，第 25 章 25.6） |
 | `passthrough_fields` | `[]` | 从输入行原样透传的字段名列表，落在 `_meta.source.fields`。典型用途：带上 `source`、`ts` 等业务字段，下游无需回查输入文件 |
 | `rejects` | `"refs"` | 拒绝通道内容量：`none` = 不写拒绝文件；`refs` = 只写 id、来源引用、淘汰环节与原因（**不含数据内容**）；`full` = 另含记录原文——方便直接人工审查被淘汰了什么，但意味着输出目录里存了一份数据副本，注意保管 |
 

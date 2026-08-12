@@ -168,13 +168,18 @@
 15. `classify.enabled = false` 而 `[[classify.classes]]` / `[class.*]` 在场 ⇒ 仅 **warning**（一次、点名被忽略的表——「留配置、关开关」合法，不触发退出码 2）
 16. `segment.enabled = true` ⇒ `run.mode = "process"` ∧ `generate.enabled = false` ∧ `annotate.enabled = true`（v1.8）
 17. `extract.enabled = true` ⇒ `segment.enabled = true` ∧ `run.modality = "ui"`（v1.8）
-18. stream 的 vision 校验逐阶段（v1.8）：`extract.llm` **恒**须 supports_vision；`segment.llm` **恒不入 vision 校验集**（v1.11——窗口是否附图由所引档 `supports_vision` 自动推导为解析产物 `vision_resolved`，原 `use_vision` 键已移除，见第 22 条）；`quality.llm` **免除**、`stitch.llm`（v1.9）**恒免除**（两者都是纯文本判定）；`stream.gap_s` / `session_max_span_s` 仅 `order_by = "meta:*"` 可设（meta:* 仅文本模态）
+18. stream 的 vision 校验逐阶段（v1.8）：`extract.llm` **恒**须 supports_vision；`segment.llm` **恒不入 vision 校验集**（v1.11——窗口是否附图由所引档 `supports_vision` 自动推导为解析产物 `vision_resolved`，原 `use_vision` 键已移除，见第 22 条）；`quality.llm` **免除**、`stitch.llm`（v1.9）**恒免除**（两者都是纯文本判定）；v1.12 帧粒度分列：`frame.annotate.llm` ui ∧ enabled 时**恒**须 supports_vision（截图是帧标注主证据），`frame.classify.llm` **恒不入 vision 校验集**（附图与否自动推导，同 segment 形制——省钱面 = 指向纯文本档）；`stream.gap_s` / `session_max_span_s` 仅 `order_by = "meta:*"` 可设（meta:* 仅文本模态）
 19. `[stream]` / `[segment]` / `[stitch]`（v1.9）/ `[extract]` 任一节在场而 `segment.enabled = false` ⇒ 仅 **warning**（同第 15 条形制）；`segment.window` ≥ 2；`annotate.sequence_frames` ∈ [2, 100]
 20. `stitch.enabled = true` ⇒ `segment.enabled = true`（v1.9）；启用时 `stitch.llm` 计入密钥/probe/存在性引用集但**不入 vision 集**；`[class.<name>.stitch]` 不存在（链序在 classify 之前，类标签尚不存在）
 21. `stitch.votes` 须为 ≥1 的**奇数**（偶数 = 退出码 2，v1.9）；`stitch.enabled = true` ∧ `segment.strategy = "rules"` ⇒ 仅 **warning**（规则分段不做语义精化，可缝证据薄）；`[stitch]` 带非开关键而 stitch 关、segment 开 ⇒ 仅 **warning**（segment 也关时并入第 19 条名单）
 22. `[segment]` 内显式出现 `use_vision` ⇒ **配置错误**（v1.11 移除键定向报错，**不走**「未知键仅 warning」兜底）：窗口是否附图由 `segment.llm` 所指档的 `supports_vision` 自动决定；需纯文本裁决请把 `segment.llm` 指向纯文本档
 23. 上下文预算硬校验（v1.11）：`context_window` > 0 时须 > `max_output_tokens + margin`（margin = max(256, ⌈0.10 × context_window⌉)），否则预算非正 ⇒ 配置错误；`default_image_px` > 0 时须 ≤ `max_image_px`；静态系统侧预检——启用阶段的静态 prompt 部件（模板 + instruction + rubric/类表/Schema/few-shot）估算 ≥ 该档输入预算 ⇒ 配置错误（任何记录都装不下）；segment 装填护栏——最坏保证装填量 `w_min` < 下限（`verify.enabled ∧ verify.policy="repair" ∧ segment.enabled` 时为 3，否则 2）⇒ 配置错误
 24. 上下文预算 warning（v1.11）：被启用阶段引用的档未声明 `context_window` ⇒ WARN 一次（提示可声明）；静态系统侧部件估算 > 预算 50% ⇒ WARN（单记录可用空间预警）；`w_min` == 下限 ⇒ WARN（窗数放大警示）；`vision_resolved` ∧ `segment.window` > 20 ∧ 所引档 `max_image_px` > 2000 ⇒ WARN（Anthropic 多图硬拒域，sequence_frames 那条 WARN 的姊妹）
+25. `frame.classify.enabled` / `frame.annotate.enabled` 任一为 true ⇒ `segment.enabled = true`（v1.12 帧粒度仅流模式，报错文案指引非流工程改用 classify + `[class.<名>.annotate]`）**且** `output.meta_mode ≠ "none"`（帧产物仅经 `_meta.stream.members` 承载；sidecar 合法）
+26. `frame.classify.enabled = true` ⇒ `frame.classify.fallback_class` 必填并 ∈ `[[frame.classify.classes]]`（传递性要求帧类表非空；**无独立的 ≥2 类数规则**——与第 13 条的序列类表有意不同；两张类表相互独立、允许重名、互不约束）
+27. `frame.annotate.enabled = true` ⇒ `frame.annotate.instruction` 必填 ∧ `schema_path` / `schema_inline` **恰一**（帧级 Schema 独立于 `output.schema`：draft 2020-12 元校验 + examples 干跑走同一套分支）
+28. `[frame.class.<名>]` 在场 ⇒ `frame.classify.enabled = true` ∧ 节名 ∈ 帧类表；覆盖节白名单仅 `annotate` 一节、键白名单仅 instruction / examples / enabled（白名单外键/节 ⇒ 配置错误，同 A.9 的显式例外形制）
+29. `[frame.classify]` 显式出现 `assignment`、`[frame.annotate]` 显式出现 `self_consistency` ⇒ **定向配置错误**（帧级无多标签、无自洽采样；同第 22 条的定向探针形制）；`[frame.*]` 节在场 ∧ 均未启用 ∧ `segment.enabled = false` ⇒ 仅 **warning**（并入第 19 条名单，v1.12）
 
 ## A.9 project.toml — [classify] 与 [class.<name>.*] 按类覆盖（v1.7 追加）
 
@@ -249,3 +254,22 @@
 | `stitch.context` | "" | 可选域上下文（何为「同一任务」的领域提示）；判据内置于固定模板，零配置可用 | 26 |
 | `stitch.votes` | 1 | 判定稳定化采样：1=单调用；>1 须**奇数**（A.8 第 21 条），n 次采样对 (verdict, thread_ref) 严格多数决、分裂回落保守结局；成本 ×n | 26 |
 | `stitch.on_error` | "keep" | 判定修复耗尽：episode 候选开新线索存活（留痕不写 errors）\| "fail"（仅 episode 候选 failed → rejects；救援候选恒按未命中处理） | 18/26 |
+
+## A.12 project.toml — [frame.*]（v1.12 追加）
+
+`[frame.classify]` / `[frame.annotate]` 是 classify / annotate 两个算子的**帧粒度**双开关（不是新算子，第 25 章 25.6）：对 episode 的成员帧做批量闭集分类与逐成员按帧类标注，产物挂 `_meta.stream.members[]` 随序列行交付。任一启用要求 `segment.enabled = true` 且 `output.meta_mode ≠ "none"`（A.8 第 25 条）；`[frame.class.<帧类名>.annotate]` 是按帧类覆盖面（A.8 第 28 条）。帧级**没有** `assignment` / `self_consistency` 键（显式书写 = 定向配置错误，A.8 第 29 条），`[frame.classify]` 也没有 `instruction` 键（判决提示词模板内建）。可运行样板是 `examples/mix` 的两个工程：UI 控件树主工程 `project.toml`（屏幕类型帧类表，form_screen 覆盖 / transition 跳过；DeepSeek + z.ai 双端点——帧分类走纯文本档、帧标注走 vision 档）与文本姊妹 `project-text.toml`（请求角色帧类表，纯 DeepSeek 最低成本形态）。
+
+| 键 | 默认 | 一句话 | 章 |
+|---|---|---|---|
+| `frame.classify.enabled` | false | 帧级闭集分类总开关；关闭时 members[] 无 label 键 | 24/25 |
+| `frame.classify.llm` | "default" | 批量判决档；enabled 时入密钥/probe/预算引用集，**永不入 vision 必需集**（附图与否由所引档 supports_vision 自动推导——省钱面 = 指向纯文本档，判决仅凭摘要行） | 25 |
+| `frame.classify.fallback_class` | enabled 必填 | 兜底帧类：须 ∈ 帧类表（修复穷尽/整窗失败的成员归它，episode 永不因此 failed） | 25 |
+| `[[frame.classify.classes]]` | enabled 必填 | 帧类表，与 [[classify.classes]] 同构（{name：`[a-z0-9_]+`, description, examples 可选}）；与序列类表**相互独立、允许重名、互不约束**（A.8 第 26 条） | 24/25 |
+| `frame.annotate.enabled` | false | 帧级标注总开关；关闭时 members[] 无 annotation / status 键 | 25 |
+| `frame.annotate.llm` | "default" | 逐成员标注档；ui 模态启用时**无条件入 vision 必需集**（截图是标注主证据，镜像序列级 annotate） | 25 |
+| `frame.annotate.instruction` | enabled 必填 | 全局帧标注指令；开帧分类后可被 `[frame.class.*.annotate]` 按类覆盖 | 11/25 |
+| `frame.annotate.examples` | [] | 可选 few-shot {input, output}；output 启动时过**帧级 Schema** 干跑校验 | 11/25 |
+| `frame.annotate.schema_path` / `schema_inline` | enabled 时恰一 | 帧级输出 JSON Schema，**独立于 output.schema**；帧标注调用走 L0–L3、**无 L2.5**、不计 resolved_at；失败落 members[] 状态位而非 rejects | 14/25 |
+| `[frame.class.<帧类名>.annotate].instruction` | 继承全局 | 按帧类覆盖标注指令（类覆盖 > 全局） | 24/25 |
+| `[frame.class.<帧类名>.annotate].examples` | 继承全局 | 按帧类覆盖 few-shot；同样过帧级 Schema 干跑 | 24/25 |
+| `[frame.class.<帧类名>.annotate].enabled` | true | false ⇒ 该帧类成员跳过帧标注（members[] 呈现 status="skipped"——省成本面） | 24/25 |

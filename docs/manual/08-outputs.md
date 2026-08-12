@@ -44,7 +44,8 @@
       "generator": null                              ← 若是合成样本：{"llm": "...", "style": "..."}
     },
     "stream": null,                                  ← 时序流元信息（v1.8 恒在键；未启用恒为 null，第 25 章；
-                                                        v1.9 缝合启用时另含 thread_id / fragments 等线索键，第 26 章）
+                                                        v1.9 缝合启用时另含 thread_id / fragments 等线索键，第 26 章；
+                                                        v1.12 帧粒度启用时另含 members[]，见下文）
     "scores": {                                      ← 质量分（quality 开启时）
       "educational_value": 0.6,                      ← 每条准则一个 [0,1] 分
       "facts_trivia": 0.8,
@@ -72,6 +73,27 @@
 - **`classification`**（v1.7 恒在键）：分类算子未启用时恒为 `null`；启用后为 `{"label", "labels", "source"}`——`label` 是本行的路由类别，`labels` 是该记录命中的类别全集（multi 模式下同一 `id` 可产多行，行唯一键变为 (`id`, `label`)），`source` 标记标签来源（`llm` / `fallback` / `inherited`）。启用时 `scores` 里另出现 `pool` 键（= 类名，自述这行分数是在哪个类池里打的）。详见第 24 章。
 - **`generator` / `generated_from`**：区分真实与合成数据的**唯一可靠判据**是 `generator ≠ null`（`generated_from` 在纯生成模式下恒为空数组，不可作判据）。
 - **校验语义**：inline 模式下「剥除 `_meta` 后的对象」保证通过你的 Schema。启动时已禁止用户 Schema 声明 `_meta`，不会撞名。
+
+**v1.12 帧粒度的 `stream.members`**：流模式下开启帧级分类/标注（第 25 章 25.6）后，`_meta.stream` 内多一个 `members` 数组（`member_sources` 之后、`session_split` 之前）——逐成员帧的帧类标签与帧级标注。真实样例（`examples/mix` UI 主工程本次真跑主输出 `out/mix-labels.jsonl` 第 1 行的外卖下单 episode，帧分类 + 帧标注同开；条目字段序 `index, id, label, annotation, status`）：
+
+```json
+"members": [
+  {"index": 0, "id": "7cfb0c25f855b2d7", "label": "list_screen",
+   "annotation": {"screen_role": "美食外卖首页",
+                  "key_widgets": ["搜索美食", "搜索", "推荐餐厅", "金牌黄焖鸡 4.9 分",
+                                  "老面坊牛肉面 4.7 分", "青禾轻食沙拉 4.5 分"]},
+   "status": "annotated"},
+  …index 1–3（detail_screen / form_screen / confirm_screen）status 均为 "annotated"
+  {"index": 4, "id": "96cb96ed666583b1", "label": "transition", "annotation": null, "status": "skipped"},
+  {"index": 5, "id": "347864af1bc54006", "label": "confirm_screen",
+   "annotation": {"screen_role": "支付成功结果页",
+                  "key_widgets": ["支付成功", "订单号 FD20260812001", "黄焖鸡米饭 大份 ×1 实付 ¥38",
+                                  "预计 40 分钟内送达", "查看订单", "返回首页"]},
+   "status": "annotated"}
+]
+```
+
+读法三句：`label` 键仅帧分类开启时在场（segment 降格的 episode 全员 label=null）；`annotation` / `status` 两键仅帧标注开启时在场，`status` 闭集 `annotated | skipped | failed`——skipped = 该帧类按 `[frame.class.<名>.annotate].enabled = false` 跳过（本例 index 4 的支付处理过渡屏，帧类 transition），failed = 修复穷尽或写前帧 Schema 校验不过（annotation 置 null）；帧失败**不产生 rejects 行、不触发 `--strict`**，账在报告的帧子块（8.4）。完整读法与配置见第 25 章 25.6（文本帧路径的同款样例看姊妹工程输出 `out/mix-text-labels.jsonl`）。
 
 `meta_mode = "sidecar"` 时主输出是纯用户结构，`_meta` 逐行写 `{stem}.meta.jsonl`，行序与主输出对齐、以 id 关联。`none` 则彻底不产元信息——分数与溯源都没了，除非下游明确拒绝任何附加字段，否则别选它。
 
@@ -211,6 +233,13 @@ v1.11（上下文预算，第 6、16 章）再增两处按需出现的字段，�
 
 - **`budget` 节**（上面的样例里已在场）：仅当本次运行**被引用**的 profile 里至少一档声明了 `context_window` 时出现——全都不声明时报告与 v1.10 逐字节一致。键义见样例内注，三个值得盯的读数：`truncations` 某阶段持续走高 = 声明窗对这份数据偏小（预算裁剪在吃你的证据，考虑调大声明或换档）；`overflow_records` 非零 = 有记录连最小装填单元都塞不进（rejects 里对应 `context_overflow` 行）；`image_cost` 是按真实 usage **校准**的每图 token 成本终值（样本不足 8 个的档维持先验读数——第 21 章有一对真实的校准值/先验值对照：240 vs 1882）。segment 启用时另有 `w_min` 键：`{"segment.window": [窗上限, 最坏装填量]}`，与启动 INFO 行同源（16.4）；
 - **`stream.windows`**（`stream` 节内，v1.11 增键）：segment 实际切出的窗数，仅当 `segment.llm` 所指档声明了 `context_window` 时出现（预算不声明时 `stream` 节与 v1.10 逐字段一致）。预算装填下 dry-run 的 `segment_calls` 按最坏装填量报**上界**，实跑拿这个键对账——examples/stream 真跑估 5、实 5（最坏装填量 ≥ 窗上限时装填顶格，上界收紧为准确值；成本账见第 25 章）。
+
+v1.12（帧级分类与标注，第 25 章 25.6）再增两个按需出现的子块——都在 `stream` 节内，对应开关开启才出现（帧粒度全关时报告与 v1.11 逐字段一致）：
+
+- **`stream.frame_classify`**（仅 `frame.classify.enabled = true` 时出现，位于 `stitch` 子块之后、`extract` 之前）：`{calls, fallback, window_failures, skipped_degraded}`——批量判决调用数（每存活 episode 一次）、落兜底帧类的成员数、整窗判决失败数、降格会话跳过的 episode 数。本次真跑（`examples/mix` UI 主工程）：`{"calls": 2, "fallback": 0, "window_failures": 0, "skipped_degraded": 0}`——3 个 episode 判重掉 1 个（s3 复刻会话），只付 2 次批量调用；
+- **`stream.frame_annotate`**（仅 `frame.annotate.enabled = true` 时出现，位于 `extract` 之后、`verify` 之前）：`{annotated, skipped, failed, discarded}`——成功标注、按类跳过、标注失败与沉没（帧标注已产出但信封终态非 active、未交付）的成员数。本次真跑：`{"annotated": 9, "skipped": 1, "failed": 0, "discarded": 0}`——两条交付 episode 的 10 个成员里，1 个 transition 过渡屏按类跳过。
+
+帧失败**不改变** `counts`、不产生 rejects 行（rejects 的 stage/reason 词表零新增）、不触发 `--strict`：members[] 的状态位加这两个子块就是帧粒度的全部账面（第 18 章的排查口径）。
 
 > **报告写失败怎么办**：主输出成功、报告写失败时，进程以退出码 1 结束——产物可用但账本缺失，别当成功处理。
 

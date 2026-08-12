@@ -165,12 +165,12 @@ uv run labelkit run --config ../config.toml --project project.toml --dry-run
 
 ```
 dry-run: mode=process estimated_records=30 batches=2
-dry-run: estimated LLM calls — generate_calls=4 segment_calls=0 stitch_calls=0 classify_calls=14 extract_calls=0 quality_calls=120 annotate_calls=30 verify_calls=30 total=198 (excludes retries and repair calls)
+dry-run: estimated LLM calls — generate_calls=4 segment_calls=0 stitch_calls=0 classify_calls=14 frame_classify_calls=0 extract_calls=0 quality_calls=120 annotate_calls=30 frame_annotate_calls=0 verify_calls=30 total=198 (excludes retries and repair calls)
 dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界
 dry-run: no LLM calls made, no output written (report and trace only)
 ```
 
-它告诉你：估算 30 条记录（14 条输入 + 预计 16 条生成样本上界）、2 个批，预计约 200 次 LLM 调用（质量打分 120 次 = 30 条 × 4 条准则；分类 14 次；标注、评审各 30 次；`segment_calls=0` / `extract_calls=0` 是 v1.8 时序流算子、`stitch_calls=0` 是 v1.9 线索缝合算子——本工程用不上，见第 25、26 章）。对大任务，这一步是你估算成本和时长的依据。
+它告诉你：估算 30 条记录（14 条输入 + 预计 16 条生成样本上界）、2 个批，预计约 200 次 LLM 调用（质量打分 120 次 = 30 条 × 4 条准则；分类 14 次；标注、评审各 30 次；`segment_calls=0` / `extract_calls=0` 是 v1.8 时序流算子、`stitch_calls=0` 是 v1.9 线索缝合算子、`frame_classify_calls=0` / `frame_annotate_calls=0` 是 v1.12 流模式帧粒度——本工程都用不上，见第 25、26 章）。对大任务，这一步是你估算成本和时长的依据。
 
 **第三步：正式运行**：
 

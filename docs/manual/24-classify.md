@@ -4,8 +4,9 @@
 > 然后允许下游的打分、标注、生成、评审**按类取不同的参数**。
 > 读完本章你应当能回答三个问题：**什么时候值得开分类？类别表怎么写才分得准？
 > 哪些参数能按类覆盖、哪些永远全局？**
-> 本章样例全部来自 `examples/text` 的真实运行（三个示例工程全都开了 classify——
-> UI 工程的视觉分类见第 21 章、时序流的序列分类见第 25/26 章；本章用文本工程讲机制）。
+> 本章样例全部来自 `examples/text` 的真实运行（四个示例工程全都开了 classify——
+> UI 工程的视觉分类见第 21 章、时序流的序列分类见第 25/26 章；本章用文本工程讲机制，
+> 流模式帧粒度的第二张类别表在 24.8）。
 
 ## 24.1 为什么要分类：一套全局配置治不了混合数据
 
@@ -310,3 +311,9 @@ jq -r '._meta | "\(.label)\t\(.stage)/\(.reason)"' out/text-labels.rejects.jsonl
 14 条输入 + 12 条回流全程约 235 秒、147 次调用，其中分类只占 13 次——quality 仍是大头（第 10 章的结论不因分类而变）。multi 模式的钱花在扇出的**下游**（m 份打分/标注/评审），不在分类调用本身——控成本先控 `max_labels`。
 
 最后一份检查清单，开 classify 前过一遍：类别表 ≥ 2 项且 name 全小写下划线；fallback_class 在表内、description 是排他形态；边界意图要么有自己的类、要么在 instruction 里写了裁决规则；trace.channels 加了 `"classify"`（调优期必开，判决理由全靠它）；multi 的话——下游知道行唯一键变成 (`_meta.id`, `label`) 了吗？
+
+## 24.8 帧类表与序列类表：两张互相独立的表（v1.12）
+
+流模式的帧粒度（第 25 章 25.6）引入了**第二张类别表**：`[[frame.classify.classes]]`。它与本章的 `[[classify.classes]]` 形态同构（`name` 匹配 `[a-z0-9_]+`、`description` 是 LLM 能看到的全部类语义、`examples` 可选；`frame.classify.fallback_class` 同样必填且必须在表内），但两张表**互相独立、允许重名、互不约束**——`examples/mix` 的文本姊妹工程 `project-text.toml` 就各有一个 `other`：序列类表的 other 收「不属于差旅/餐饮/写作的请求序列」，帧类表的 other 收「不属于发起任务/追问/寒暄的单条请求」，同名不同表、各管各的兜底，谁也不引用谁。「帧类给什么词表」跟着数据形态走：UI 主工程 `project.toml` 的帧类表是**屏幕类型**（list_screen / detail_screen / form_screen / confirm_screen / transition / other——序列类是任务类型 food_delivery / hotel_booking），文本姊妹的帧类表是**请求角色**（task_request / followup / chitchat / other）。判断一个标签属于哪张表看它挂在哪：序列类落 `_meta.classification.label`（一行一个），帧类落 `_meta.stream.members[].label`（一行 N 个、逐成员）。分类调用与计数也各走各的：帧分类是每 episode 一次批量判决、账记在 `report.stream.frame_classify`，与本章 `report.classify` 的序列级账互不掺和（帧分类还**永不**要求 vision 档——UI 主工程把它指向纯文本端点省钱，第 25 章 25.6 的双端点成本拆分）。
+
+按类覆盖面同样各有各的白名单：序列类是 24.4 那张四节大表；帧类**只有 annotate 一节、三个键**——`[frame.class.<帧类名>.annotate]` 的 `instruction` / `examples` / `enabled`（`enabled = false` 让该类成员整个跳过帧标注，members[] 呈现 `status="skipped"`——省成本面，第 25 章 25.6）。帧类没有按类 quality / generate / verify（帧粒度本无这些工位），也没有 multi 多标签（帧单一归属——在 `[frame.classify]` 里显式写 `assignment` 是定向配置错误）。`[frame.class.*]` 在场要求 `frame.classify.enabled = true` 且节名必须是帧类表成员；白名单外的键/节与 24.4 同一惯例——直接报配置错误，不静默。

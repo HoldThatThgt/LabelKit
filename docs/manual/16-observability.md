@@ -29,12 +29,14 @@
 | `stitch.thread` | 会话缝合定案后每条幸存线索一条（v1.9）。仅 trace、无 stderr 镜像；通道 `"stitch"` | session_id、thread_id、task_name、fragments 碎片跨度表（与 `_meta.stream.fragments` 同构）、seam_indexes 接缝位置 |
 | `dedup.duplicate` | 每次判重（判为 unique 不发事件） | kind、簇键、kept_id；近似重复另带**恰一项实测相似度**（文本 jaccard / 图像 hamming / 语义 cosine），exact 精确重复无相似度字段 |
 | `classify.decision` | 每条记录分类定案时（v1.7）。仅 trace、无 stderr 镜像；通道为 `"classify"`——独立通道值（通道全集 v1.8 起共十个、v1.9 增 `"stitch"` 后共**十一**个），不在默认订阅里，要看它须在 `trace.channels` 显式加入 | label（本信封的路由标签）、labels（multi 时的命中全集）、source（llm / fallback / inherited）；**reason** 仅当订阅了 classify 通道时才请求并携带（零额外 token 原则）；self-consistency 启用时另带 sc（n 与一致率） |
+| `classify.frame` | 每个 episode 的帧级批量判决定案后（v1.12）。仅 trace、无 stderr 镜像；前缀自动归 `"classify"` 通道（通道枚举维持十一值，零新增） | record_ids = episode id；members / windows / fallback 三个计数——逐帧标签不进 payload，看主输出的 members[]（第 25 章 25.6） |
 | `extract.step` | 每对相邻帧的动作摘取定案后（含 fallback 兜底步，v1.8）。仅 trace、无 stderr 镜像；通道 `"extract"` | episode_id、步序号、action_type；description 自 `refs` 档起携带；target / value 自 `excerpt` 档起（见下方分级细则） |
 | `quality.judgment` | 每次成对裁决 | 呈现顺序、每准则 winner + **reason**（评审团时每评审一条，带 judge 字段） |
 | `quality.pointwise` | 每次单点打分 | criterion、0–5 原始分、reason |
 | `quality.bt_fit` | 每批每准则拟合完 | 是否收敛、迭代数、比较数 |
 | `quality.gate` | 每条门控判定 | 聚合分、keep/drop、阈值或名次 |
 | `annotate.done` | 每条标注成功 | attempts；self-consistency 的 n 与一致率 |
+| `annotate.frame` | 每个成员帧的帧级标注定案后（annotated / skipped / failed 三种结局都发，v1.12）。仅 trace、无 stderr 镜像；归 `"annotate"` 通道 | record_ids = episode id；member_id、status、attempts（skipped 时为 0）；标注内容仅经既有 excerpt 键（自 `excerpt` 档起携带、200 字截断） |
 | `verify.verdict` | 每轮评审 | verdict、round、critiques 全文 |
 | `schema.repair` | 每次非清洁路径 | 在哪层解决（l1/l3_1/l3_2/rejected）、违规清单（JSON Pointer，不含数据值） |
 | `llm.call` | 每次 API 调用 | profile、延迟、input/output token、重试数、状态（命名对齐 OpenTelemetry GenAI 约定）；语义去重的 embedding 调用另带 `operation="embedding"`（缺省即对话补全）；密钥池 >1 的 profile 另带 `key_env`（v1.6）——本调用**最后一次尝试**所用密钥的环境变量名，成功失败同义；零尝试即中止的调用（如入口即驻留超限、熔断中止）不带。v1.11 注：这行的 usage 同时是**图片成本校准器**的采样源——报表侧校准终值在 `report.budget.image_cost`（第 8 章），审计预算估算质量就拿 `input_tokens` 对照它 |

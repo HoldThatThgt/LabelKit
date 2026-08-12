@@ -6,11 +6,13 @@
 > 读完本章你应当能回答三个问题：**什么样的数据该开 stream？边界与噪声是怎么判出来的？
 > 序列产物的账怎么对？**本章样例全部来自 `examples/stream` 两个工程的真实运行：
 > UI 流工程 `project.toml`（本章借它的 s1 会话讲 v1.8 基线，它同时开着 v1.9 的缝合——
-> 缝合层的机制与账目整体放在第 26 章）与纯文本流工程 `project-text.toml`。
+> 缝合层的机制与账目整体放在第 26 章）与纯文本流工程 `project-text.toml`；
+> 帧粒度小节 25.6 的样例另取自双粒度工程 `examples/mix` 的真实运行
+> （UI 控件树主工程，DeepSeek + z.ai 双端点分工）。
 
 ## 25.1 为什么要分段：时间轴上没有「一条记录」
 
-前面所有章节都默认一件事：输入里的**每一行/每一对就是一条独立记录**，标注单位与采集单位天然重合。但屏幕操作流不是这样采的——录屏抽帧得到的是「首页、搜索页、结果页、详情页、弹窗、购物车……」一长串状态截面，**单帧什么都说明不了**：训练侧要的样本是「用户搜索并下单了一次外卖」这样的完整任务段，而任务的边界、中间混入的通知弹窗、乃至「两帧之间用户到底做了什么」，在原始数据里根本没有字段承载。拿 v1.7 的流水线硬跑这种数据，得到的是逐帧的碎片标注：帧级去重在连续 UI 帧上大面积误伤，质量分打在单帧上毫无意义。
+前面所有章节都默认一件事：输入里的**每一行/每一对就是一条独立记录**，标注单位与采集单位天然重合。但屏幕操作流不是这样采的——录屏抽帧得到的是「首页、搜索页、结果页、详情页、弹窗、购物车……」一长串状态截面，**单帧什么都说明不了**：训练侧要的样本是「用户搜索并下单了一次外卖」这样的完整任务段，而任务的边界、中间混入的通知弹窗、乃至「两帧之间用户到底做了什么」，在原始数据里根本没有字段承载。拿 v1.7 的流水线硬跑这种数据，得到的是逐帧的碎片标注：帧级去重在连续 UI 帧上大面积误伤，质量分打在单帧上毫无意义。（v1.12 起 stream 模式内也有帧粒度产物——但那是 opt-in 的**第二层**产物：以段为单元跑完整条链之后，帧级分类与标注挂在 episode 行内随序列一起交付（25.6），与这里说的「把帧当独立记录逐帧硬跑」是两回事。）
 
 stream 模式把「原始帧流 → 训练样本」拆成一条新的加工链，四层各管一段：
 
@@ -42,7 +44,7 @@ min_len = 2                       # 仅作用于 LLM 精化切出的段
 context = "…"                     # 域上下文声明（本工程为穿插流写了长版，全文与解读见第 26 章）
 ```
 
-`[stream]` 声明「帧流怎么排、会话在哪断」：本例用分区键 `source_dir` 让**每个子目录成为一个会话**。`[segment]` 是 stream 模式总开关；`window` 自 v1.11 起是**上限**——所引 profile 声明了 `context_window` 时（本仓库示例配置就声明了 131072），窗口按预算**贪心装填**、装满或到上限即封窗，未声明预算时保持定长窗（步长 = window−1；两种形态都重叠 1 帧、接缝帧判决归后窗）。本工程 16 ≥ 最长会话且预算装得下整段（启动 INFO 报最坏也能装 46 帧，25.5），滑窗退化为**每会话恰一窗**。v1.11 的另一处变化：窗口**是否附图没有独立开关**——`segment.llm` 指向的 default 档 `supports_vision = true`，UI 模态下窗口自动逐帧附截图（选 profile 即选能力，25.5/25.6）。`context` 只是可选域上下文——**边界判据内置于固定模板，零配置可用**，这行不是必需品。
+`[stream]` 声明「帧流怎么排、会话在哪断」：本例用分区键 `source_dir` 让**每个子目录成为一个会话**。`[segment]` 是 stream 模式总开关；`window` 自 v1.11 起是**上限**——所引 profile 声明了 `context_window` 时（本仓库示例配置就声明了 131072），窗口按预算**贪心装填**、装满或到上限即封窗，未声明预算时保持定长窗（步长 = window−1；两种形态都重叠 1 帧、接缝帧判决归后窗）。本工程 16 ≥ 最长会话且预算装得下整段（启动 INFO 报最坏也能装 46 帧，25.5），滑窗退化为**每会话恰一窗**。v1.11 的另一处变化：窗口**是否附图没有独立开关**——`segment.llm` 指向的 default 档 `supports_vision = true`，UI 模态下窗口自动逐帧附截图（选 profile 即选能力，25.5/25.7）。`context` 只是可选域上下文——**边界判据内置于固定模板，零配置可用**，这行不是必需品。
 
 **第二节：摘取与序列打分。**
 
@@ -146,7 +148,7 @@ other                            无法归类（语义写进 description）
 **第四层：下游算子的序列适配。**episode 是 `kind="sequence"` 的记录（成员帧转入 `absorbed` 状态、不再独立产出——这是 Stage 契约的新受控例外 ②b，第 4 章），下游全部换序列口径。v1.9 起 segment 与下游之间还有一个可选工位：缝合算子（`[stitch]`，第 26 章）把同会话内被穿插切开的 episode 碎片并成线索（契约例外 ②c），开启后下面各算子看到的单元相应从 episode 升级为线索：
 
 - **dedup**（第 9 章）：序列的判重文本 = 成员配方按序拼接，episode 级重复 = 「同样的操作流程」；pHash 层自动跳过（序列记录无自己的图）。真实展品在 `project-text.toml` 的真跑里：晚间会话对合同翻译三连的逐字重发，episode 判重配方与中午那段逐字一致——`stage="dedup", reason="exact"` 落拒绝通道（`rejects="full"` 档的载荷是成员清单 `{"kind": "sequence", "member_ids": […], "member_sources": […]}`）；
-- **quality**（第 10 章）：证据 = `[步骤序列]`（extract 产物的文字渲染，fallback 步与确证 other 分列）+ `[成员帧摘要]`，**全程无图**——trajectory rubric 的四条准则（完成度/连贯性/目的性/噪声残留）全是结构性判据，不需要逐帧看图（25.6 有展开）。extract 关了也能打：「步骤」退化读作「帧间变化」（M1 会给 warning 提示这个组合）；
+- **quality**（第 10 章）：证据 = `[步骤序列]`（extract 产物的文字渲染，fallback 步与确证 other 分列）+ `[成员帧摘要]`，**全程无图**——trajectory rubric 的四条准则（完成度/连贯性/目的性/噪声残留）全是结构性判据，不需要逐帧看图（25.7 有展开）。extract 关了也能打：「步骤」退化读作「帧间变化」（M1 会给 warning 提示这个组合）；
 - **annotate**（第 11 章）：序列模板 = `[动作序列]` 逐步行渲染 + 关键帧图 + `[成员帧摘要]` 收尾。关键帧数以 `annotate.sequence_frames`（默认 20）为**上限**：v1.11 的预算装填先给足文本块，图片吃剩余份额——实发帧数 `k_eff = min(sequence_frames, 预算余量 ÷ 每图成本)`，首末帧恒保留、中间均匀降采样（预算宽裕时 k_eff 就等于上限，本工程即如此）；
 - **verify**（第 13 章）：评审输出在意见/结论之外多一张**缺陷表**（六值：`label_mismatch` 标签不符 / `off_task_members` 混入无关帧 / `missing_head` / `missing_tail` 切头切尾 / `missing_members` 段中缺帧 / `wrong_stitch` 缝合错误——v1.9 增，词表闭集恒在场、仅开缝合时可判），证据段含 `[边界余量]`——段边界外前后各 2 帧的摘要及去向，专防切头切尾。`policy = "repair"` 时按缺陷路由**成员手术**：收缩（把无关帧逐出段，reason=`off_task_member`）与回收（把批内同会话的噪声帧复裁后接回），手术后接缝重摘取、transitions 重编号、重标注复审，全程两阶段批级结构保证并发下确定性；修复过的行带 `_meta.stream.repaired = true`，不重打分。
 
@@ -180,7 +182,7 @@ other                            无法归类（语义写进 description）
                           {"file": "s1-serial-noise/uitree_6.jsonl", "pair_index": 6},   ← 5 缺席：噪声帧
                           {"file": "s1-serial-noise/uitree_7.jsonl", "pair_index": 7},
                           {"file": "s1-serial-noise/uitree_8.jsonl", "pair_index": 8}],
-      "session_split": false,                ← 所属会话曾被 batch_size 硬切过吗（25.6）
+      "session_split": false,                ← 所属会话曾被 batch_size 硬切过吗（25.7）
       "repaired": false,                     ← verify 手术改写过成员集吗
       "degraded": null,                      ← segment 失败降级留痕（on_error="keep" 时）
       "fragments": [{"order_span": [1, 4], "member_count": 4, "cause": "origin",
@@ -214,7 +216,7 @@ other                            无法归类（语义写进 description）
 }
 ```
 
-逐键读 `_meta.stream`：`member_sources` 是完整成员溯源（每帧来自哪个文件哪个 index——`source` 键只继承首成员），拿它能把 episode 还原回原始帧；`order_span` 与 `member_count` 对不上（跨度 8、成员 7）就说明段内有帧被剔了。`thread_id`、`fragments` 与步行内的 `resumed` 是 v1.9 增键，**仅本工程开着 `[stitch]` 才在场**（读法在第 26 章；关掉缝合，这三处消失，主输出与 v1.8 逐字节等价）。留意这行的 `steps` 里**没有**接缝占位步（六步全是真实转移、`resumed` 全 false）：两个碎片的间隙里只有噪声帧 5，按判据不构成接缝——这条辨析在第 26 章展开。顶层三个字段仍是你的 Schema 产物——**输出结构照旧由全局 Schema 管**，stream 改变的只是「一行代表什么」。另两处细节：`verification` 在 stream 模式恒带 `defects` 键（无缺陷 = 空数组）；判分噪声这次落在了别的行上——s4 的新闻浏览线索被打了 `noise_residue` 0.0、`completion` 0.4（聚合 0.55），对一条干净的三帧浏览流来说是个可疑判决，但因为没设 threshold，它只是个随行落盘的分数。**stream 工程默认只打分不筛**的价值就在这：判分的噪声不会变成数据的损失，后筛时你还有机会用 trace 复核。
+逐键读 `_meta.stream`：`member_sources` 是完整成员溯源（每帧来自哪个文件哪个 index——`source` 键只继承首成员），拿它能把 episode 还原回原始帧；`order_span` 与 `member_count` 对不上（跨度 8、成员 7）就说明段内有帧被剔了。v1.12 起这里还可能多一个 `members` 键（`member_sources` 之后、`session_split` 之前）：帧粒度任一开关开启时在场，逐成员给出帧类标签、帧级标注与状态位——本工程没开帧粒度所以缺席，读法与真实样例在 25.6。`thread_id`、`fragments` 与步行内的 `resumed` 是 v1.9 增键，**仅本工程开着 `[stitch]` 才在场**（读法在第 26 章；关掉缝合，这三处消失，主输出与 v1.8 逐字节等价）。留意这行的 `steps` 里**没有**接缝占位步（六步全是真实转移、`resumed` 全 false）：两个碎片的间隙里只有噪声帧 5，按判据不构成接缝——这条辨析在第 26 章展开。顶层三个字段仍是你的 Schema 产物——**输出结构照旧由全局 Schema 管**，stream 改变的只是「一行代表什么」。另两处细节：`verification` 在 stream 模式恒带 `defects` 键（无缺陷 = 空数组）；判分噪声这次落在了别的行上——s4 的新闻浏览线索被打了 `noise_residue` 0.0、`completion` 0.4（聚合 0.55），对一条干净的三帧浏览流来说是个可疑判决，但因为没设 threshold，它只是个随行落盘的分数。**stream 工程默认只打分不筛**的价值就在这：判分的噪声不会变成数据的损失，后筛时你还有机会用 trace 复核。
 
 **拒绝通道**是噪声帧的去向（`rejects = "full"` 档；s1 的两行 `_meta` 逐字如下，`record` 载荷——该帧的树文本与图路径——以 `{…}` 略去）：
 
@@ -305,13 +307,109 @@ index 4（帧 5）的 `interruption`、index 8（帧 9）的 `context_switch` �
 
 **`--strict` × 噪声帧。**stream 工程的噪声帧是**预期产物**——但它们进 rejects，`--strict` 会因 rejects 非空退出 1。CI 里给 stream 工程挂 strict 前想清楚：要么接受「有噪声帧就红」，要么改为解析 report（比如只在 `failed > 0` 或 `verify.defects` 非零时报警）。
 
-## 25.6 常见问题
+## 25.6 帧级分类与标注（v1.12）
+
+**双粒度动机。**到这里为止，stream 的产物粒度是「一行 = 一段活动」：分类、打分、标注全在回答「这一段是什么」。但下游经常还要第二层**原子粒度**——段内每个成员帧各自扮演什么角色（发起任务、追问修改、寒暄插入），各自承载哪些结构化要素（意图、实体、参数）。v1.12 把这层需求做成 stream 模式内 **opt-in 的帧粒度**：`[frame.classify]` 让 classify 处理每个 episode 时顺带对成员帧做**一次批量闭集判决**，`[frame.annotate]` 让 annotate 在序列级标注之后**逐成员**按帧类做结构化标注——一份配置、一次流水线，序列级意图与帧级原子标注同时拿到；帧产物挂在 episode 行内的 `_meta.stream.members[]` 随序列交付，成员帧状态机、链序与守恒等式零改动（帧粒度全关时行为与 v1.11 一致，唯 dry-run 估算行无条件多两个估算键，第 15 章）。仓库自带的 `examples/mix` 就是双粒度同开的上手工程，主工程 `project.toml` 是 UI 控件树时间序流：截图 + 控件树 17 帧对、三个会话子目录（s1 外卖下单、s2 订酒店、s3 = s1 的逐字节复刻——episode 级判重埋点），fixture 由 `tools/gen_fixtures.py` 用 PIL 确定性生成。它的 `config.toml` 独立成套且是**双端点**：`[llm.default]`（DeepSeek）承担文本判决面——segment 滑窗判决、帧级批量分类、轨迹打分；`[llm.vision]`（z.ai glm-5.2）承担视觉必需面——序列分类/序列标注/帧级标注/评审四阶段在 UI 模态强制 `supports_vision`（25.7 的逐阶段 vision 分列，在这里落成了「按阶段挑端点」的教学形态）。运行 `cd examples/mix && mkdir -p out && uv run labelkit run --config config.toml --project project.toml`（注意 config 在本目录，非 `../config.toml`）；同目录另有文本姊妹工程 `project-text.toml`——单端点纯 DeepSeek 的最低成本形态与文本帧路径演示，输出 `mix-text-labels.jsonl`（本节后文有其真跑节选）。以下配置与产物均摘自主工程的真实运行。
+
+**配置三节**（摘自 `examples/mix/project.toml`，UI 主工程——帧类表是**屏幕类型**词表）：
+
+```toml
+[frame.classify]                  # 帧级闭集分类（默认关；仅流模式）
+enabled = true
+llm = "default"                   # digest-only 帧级批量判决：永不入 vision 必需集——走 DeepSeek
+fallback_class = "other"          # 修复穷尽/窗口失败的兜底，须 ∈ 帧类表
+
+[[frame.classify.classes]]        # 帧类表：与 [[classify.classes]] 同构，但两张表互相独立（第 24 章）
+name = "form_screen"
+description = "表单类屏幕：规格选择、日期人数填写、地址备注输入等以字段填写为主的页面"
+# list_screen / detail_screen / confirm_screen / transition / other 五类同构，略
+
+[frame.annotate]                  # 帧级标注（默认关；仅流模式）
+enabled = true
+llm = "vision"                    # UI 模态 frame.annotate 无条件入 vision 必需集——走 z.ai
+instruction = """
+你是移动端屏幕帧标注员。根据单帧截图与 UI 控件树，标注该屏幕在流程中的
+角色（screen_role，一个名词短语）与关键控件列表（key_widgets，字符串数组：
+把承载本屏核心信息或核心操作的控件文本逐项列出；没有则给空数组）。
+"""
+schema_inline = """…"""           # 独立的帧级输出 Schema：{screen_role, key_widgets} 两字段（第 14 章）
+# examples = [...]                # 可选 few-shot，形态镜像 annotate.examples
+
+# ── 按帧类覆盖：表单类屏幕单独强调抽取表单字段与取值 ──
+[frame.class.form_screen.annotate]
+instruction = """
+你是移动端屏幕帧标注员。这一帧已被判定为表单类屏幕：标注其在流程中的
+角色（screen_role），并把表单字段与当前取值成对抽入关键控件列表
+（key_widgets，如「份量：大份」「辣度：微辣」——逐字段一项，空输入框记
+其占位提示）。
+"""
+
+# ── 按帧类覆盖：过渡屏跳过标注（省成本示范；members[] 呈现 skipped）──
+[frame.class.transition.annotate]
+enabled = false
+```
+
+**组合约束**（全部启动期配置错误，第 4 章有合订）：帧粒度是流模式的第二层产物——`frame.classify` / `frame.annotate` 任一启用都要求 `segment.enabled = true`（非流工程想按类定制标注，用第 24 章的 `[class.<名>.annotate]`）；帧产物仅经 `_meta` 承载，`output.meta_mode` 不得为 `"none"`；`fallback_class` 必须 ∈ 帧类表；`[frame.class.<名>]` 在场要求帧分类开启、节名必须是帧类表成员，且白名单只有 annotate 一节的 instruction / examples / enabled 三键；帧级**没有**多标签也**没有**自洽采样——在 `[frame.classify]` 里写 `assignment` 或在 `[frame.annotate]` 里写 `self_consistency` 会得到定向报错（机制同 v1.11 移除 `segment.use_vision` 时的原始节探针）。
+
+**members 块怎么读。**本次真跑主输出第 1 行（外卖下单的 episode，序列类 food_delivery，6 成员）的 `_meta.stream.members` 全文：
+
+```json
+"members": [
+  {"index": 0, "id": "7cfb0c25f855b2d7", "label": "list_screen",
+   "annotation": {"screen_role": "美食外卖首页",
+                  "key_widgets": ["搜索美食", "搜索", "推荐餐厅", "金牌黄焖鸡 4.9 分",
+                                  "老面坊牛肉面 4.7 分", "青禾轻食沙拉 4.5 分"]},
+   "status": "annotated"},
+  {"index": 1, "id": "164b7480ab098de5", "label": "detail_screen",
+   "annotation": {"screen_role": "菜品详情页",
+                  "key_widgets": ["金牌黄焖鸡", "黄焖鸡米饭 ¥38", "月售 1200+ 好评率 99%",
+                                  "招牌黄焖鸡块 配米饭一份", "选规格"]},
+   "status": "annotated"},
+  {"index": 2, "id": "25ce67ce53d5f1d7", "label": "form_screen",
+   "annotation": {"screen_role": "商品规格选择/加入购物车",
+                  "key_widgets": ["商品：黄焖鸡米饭 ¥38", "份量：大份", "辣度：微辣",
+                                  "米饭：×1", "口味备注（选填）：（空）"]},
+   "status": "annotated"},
+  {"index": 3, "id": "d77a51064a52f91e", "label": "confirm_screen",
+   "annotation": {"screen_role": "订单确认页",
+                  "key_widgets": ["确认订单", "金牌黄焖鸡", "黄焖鸡米饭 大份 ×1",
+                                  "收货地址：南京市玄武区中山路 18 号", "预计送达 12:40",
+                                  "提交订单 ¥38"]},
+   "status": "annotated"},
+  {"index": 4, "id": "96cb96ed666583b1", "label": "transition", "annotation": null, "status": "skipped"},
+  {"index": 5, "id": "347864af1bc54006", "label": "confirm_screen",
+   "annotation": {"screen_role": "支付成功结果页",
+                  "key_widgets": ["支付成功", "订单号 FD20260812001", "黄焖鸡米饭 大份 ×1 实付 ¥38",
+                                  "预计 40 分钟内送达", "查看订单", "返回首页"]},
+   "status": "annotated"}
+]
+```
+
+`index` 0 基、按成员序（与 `member_ids` 对位）；`label` 键仅帧分类开启时在场（segment 降格的 episode 跳过帧粒度两个 pass：全员 label=null、status="skipped"）；`annotation` / `status` 两键仅帧标注开启时在场，`status` 闭集三值——`annotated`（标注在场且过了写前帧 Schema 校验）、`skipped`（该帧类 `enabled = false`，本例 index 4 的支付处理过渡屏：帧类 transition、跳过标注）、`failed`（修复穷尽或写前校验不过，annotation 置 null）。index 2 的规格表单屏吃的是 `form_screen` 的按类覆盖指令——`key_widgets` 按覆盖要求抽成了「份量：大份」「辣度：微辣」这样的字段-取值对。第 2 行（订酒店的 episode）则是四成员全 annotated（form → list → detail → confirm）——s2 那块系统通知插入屏早在 segment 就被剔成噪声（`dropped_noise`），压根没进成员集，自然也没有它的 members 条目。**帧失败不入 rejects、不触发 `--strict`**：成员失败不是信封失败，episode 照常发射，账记在 `report.stream.frame_annotate.failed`（第 8、18 章）；帧分类侧的失败语义同样保守——单窗修复穷尽时全窗成员落 `fallback_class` 并计 `fallback` / `window_failures`，永不使 episode 失败。
+
+文本帧路径长什么样，看姊妹工程 `project-text.toml` 的真跑输出 `out/mix-text-labels.jsonl`（帧类 task_request/followup/chitchat/other + `{intent, entities}` 帧 Schema，全链纯 DeepSeek）——姊妹工程形态（本次真跑，撰写餐厅评价的 episode，节选）：
+
+```json
+{"index": 0, "id": "e665eea66d9f0688", "label": "task_request",
+ "annotation": {"intent": "撰写餐厅评价", "entities": []}, "status": "annotated"},
+{"index": 1, "id": "41984a72fe624e9b", "label": "chitchat", "annotation": null, "status": "skipped"},
+{"index": 2, "id": "f9268bd976ca4a4c", "label": "followup",
+ "annotation": {"intent": "添加评价内容", "entities": ["蟹粉狮子头"]}, "status": "annotated"}
+```
+
+同一套 members 语法，换了词表与 Schema——跳过类在这边是 chitchat（index 1 的天气寒暄行），按类覆盖挂在 task_request 上（抽订单/行程要素）。
+
+**成本账两句。**帧分类住 dedup **之后**、每 episode 一次批量调用：本次真跑 3 个 episode 判重掉 1 个后只付 2 次（`frame_classify.calls=2`——s3 复刻会话一分帧分类钱都没付）；帧标注住 quality 质量门**之后**、逐成员一次调用：被淘汰的记录永不付帧标注费，按类跳过再省（本次真跑 `annotated=9`、`skipped=1`——那个 skipped 就是外卖 episode 的 transition 过渡屏；dry-run 估算行报的上界是预扫描帧总数——本工程 `frame_classify_calls=17` / `frame_annotate_calls=17`，实付 2 + 9，第 15、17 章）。审计走 trace 的 `classify.frame` / `annotate.frame` 两事件（第 16 章）；verify 手术改写成员集时帧产物随行增删（第 13 章）。
+
+**双端点成本拆分。**报告的 `llm_usage` 按 profile 分账，本次真跑恰好对半：`default`（DeepSeek）15 次调用——文本判决面（segment 3 窗滑窗判决 + 帧级批量分类 2 + 两条存活 episode 的轨迹四准则打分 8 + 打分输出的 2 次 L3 结构修复）；`vision`（z.ai glm-5.2）15 次调用——视觉必需面（序列分类 2 + 序列标注 2 + 逐成员帧标注 9 + 评审 2）。哪个阶段该走哪个端点、为什么这么分，`examples/mix/config.toml` 的文件头注写着完整分工表——想把帧标注也省下来的读法只有换姊妹工程（帧标注在 UI 模态无条件要求 vision 档，25.7）；帧级批量分类反过来**永不**要求 vision（digest-only 判决），把 `frame.classify.llm` 指向纯文本档就是它的省钱面。
+
+## 25.7 常见问题
 
 **任务被打断、切成了两段怎么办？**这是分段的正确行为，不是 bug——分段的单元是「连续做一件事的段」，用户中途切去回消息，外卖任务在时间轴上就是两个碎片。想把它们按任务线索缝回一条完整记录（接缝处机械占位一步），开 v1.9 的缝合算子——`[stitch]`，配置、机制与验收全在第 26 章（本工程就开着它，s2–s4 三个会话是缝合的正戏）。要一个纯 v1.8 基线做对照时，把 `[stitch]` 关掉即可：关缝合时主输出/rejects/report 与 v1.8 逐字节一致（唯缺陷词表恒多一行 `wrong_stitch: 0`）——同目录的 `project-text.toml` 就是一个不开缝合的现成工程。
 
 **孤帧会话去哪了？**不会静默消失。`len(session) == 1` 的会话走 rules 退化：原样成一个单帧 episode（零 LLM 调用），**不经 min_len**——min_len 只砍「LLM 精化切出的短段」。所以帧 14 那条 `below_min_len` 的完整因果是：它在 14 帧大会话里被判 `returns_to_entry`（回到桌面开启新流程）、开了一个只有自己的新段，段长 1 < 2 才被丢（本工程开着缝合，它随后还进了救援候选池、被判 `new` 维持原判——救援候选永不开新线索，第 26 章）——假如它自成一个会话（比如配了 `gap_steps` 且序号断开），反而会原样活成 episode。
 
-**为什么 quality 不看图？**三重原因：trajectory rubric 的四条准则全是**结构性**判据（推进到终态了吗、步步承接吗、朝单一目标吗、混了无关步骤吗），动作序列 + 帧摘要足以裁决；序列打分若逐帧附图，一个 20 帧 episode × 4 准则就是 80 张图的开销；且多图请求有硬上限（见下条）。这是 vision 能力要求的显式放宽——stream（UI 模态）各阶段里 extract 恒要求 vision，annotate/verify/classify 启用时同样要看图；segment **不做 vision 校验**（v1.11）：窗口是否附图由 `segment.llm` 所指 profile 的 `supports_vision` 自动推导——支持就逐帧附图（本工程即多图窗口），不支持就纯文本摘要，原 `use_vision` 独立开关已移除；quality 与 v1.9 的 stitch 判定则**恒**是纯文本（后者的证据是摘要卡，第 26 章）。
+**为什么 quality 不看图？**三重原因：trajectory rubric 的四条准则全是**结构性**判据（推进到终态了吗、步步承接吗、朝单一目标吗、混了无关步骤吗），动作序列 + 帧摘要足以裁决；序列打分若逐帧附图，一个 20 帧 episode × 4 准则就是 80 张图的开销；且多图请求有硬上限（见下条）。这是 vision 能力要求的显式放宽——stream（UI 模态）各阶段里 extract 恒要求 vision，annotate/verify/classify 启用时同样要看图；segment **不做 vision 校验**（v1.11）：窗口是否附图由 `segment.llm` 所指 profile 的 `supports_vision` 自动推导——支持就逐帧附图（本工程即多图窗口），不支持就纯文本摘要，原 `use_vision` 独立开关已移除；v1.12 的帧粒度双开关同款分列——`frame.annotate.llm` 在 UI 模态**恒**要求 vision（单帧截图是帧标注的主证据），`frame.classify.llm` **恒不**入 vision 校验集（digest-only 批量判决，指向纯文本档即省钱面）——`examples/mix` 主工程按这条分界把两个开关分别指向 z.ai 与 DeepSeek 两个端点（25.6）；quality 与 v1.9 的 stitch 判定则**恒**是纯文本（后者的证据是摘要卡，第 26 章）。
 
 **多图上限与「帧数 × 像素」的联动是怎么回事？**Anthropic 端点对「单请求 >20 张图且任一图 >2000px」直接 400 硬拒（不是自动缩放）。两处会撞上它的配置都有 M1 启动 WARN：序列标注一请求带 ≤ `sequence_frames` 张关键帧图（默认 20，恰在界内），调到 >20 且所引 profile 的 `max_image_px > 2000` 即 WARN；v1.11 起 segment 的多图窗口有同款姊妹校验——`segment.window > 20` 且窗口附图（vision_resolved）且 `max_image_px > 2000` 同样 WARN（本工程 window=16，界内）。出路都一样：像素上限降到 2000，或把帧数/窗上限降回来；v1.11 还把「日常像素工作点」独立成键 `default_image_px`（`max_image_px` 升格为升级天花板与 provider 硬限域，第 6 章）——多图请求按工作点编码，预算与硬限都好算。降采样本身是纯整数公式（首末帧恒保留、均匀取样、零随机），成员数 ≤ sequence_frames 时全量带图。openai_compatible 一侧工具**不设独立上限**：官方口径宽松得多（1500 图/请求、512MB 载荷），但真实约束面在网关——Azure 文档写 10 图、GPT-4o 实测 20 图硬顶，vLLM/SGLang 的多模态上限随部署配置变化——静态校验必然虚警或漏警，建议对自己的端点用 `labelkit validate --probe` 加小样本试跑（`--limit`）实测确认。
 

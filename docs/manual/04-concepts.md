@@ -90,8 +90,11 @@ emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed
 | `stitch` 开 ⇒ `segment` 必须开（v1.9） | 缝合的对象是分段产出的 episode 碎片——没有分段就没有可缝的东西（仅 stream 模式可用） |
 | `stitch.votes` 若大于 1 必须为奇数（v1.9） | 偶数票可能平票，严格多数决失去意义 |
 | `segment` 开 ⇒ `quality.llm` **免除** `supports_vision` 要求（v1.8 放宽项；v1.9 的 `stitch.llm` 同样恒不要求视觉） | 序列打分是纯文本（步骤序列 + 帧摘要，无图），UI 模态也不需要视觉能力；缝合判定同理（摘要卡证据，无图） |
+| `frame.classify` / `frame.annotate` 任一开 ⇒ `segment` 必须开（v1.12） | 帧粒度是流模式内的第二层产物——帧的载体是 episode 的成员集；非流工程想按类定制标注，用 `[class.<名>.annotate]`（第 24 章） |
+| 帧粒度任一开 ⇒ `output.meta_mode` 不得为 `"none"`（v1.12） | 帧产物仅经 `_meta.stream.members[]` 承载——丢弃元信息 = 丢弃全部帧产物 |
+| `[frame.class.*]` 在场 ⇒ `frame.classify` 必须开，且节名 ∈ 帧类表（v1.12） | 按帧类覆盖以帧类判决为前提；`frame.classify.fallback_class` 同样必须 ∈ 帧类表 |
 
-`classify`（v1.7，默认关）与上表各开关**正交**：分类不改变组合合法性，任意合法组合都可以叠加分类——multi 扇出后的每个信封走同一套阶段组合（第 24 章）。
+`classify`（v1.7，默认关）与上表各开关**正交**：分类不改变组合合法性，任意合法组合都可以叠加分类——multi 扇出后的每个信封走同一套阶段组合（第 24 章）。v1.12 的帧粒度双开关（`frame.classify` / `frame.annotate`）不是新算子，而是 classify / annotate 两个算子在流模式下的第二层粒度；帧级没有多标签也没有自洽采样——在 `[frame.classify]` 里写 `assignment` 或在 `[frame.annotate]` 里写 `self_consistency` 是定向配置错误（第 25 章 25.6）。
 
 几个常用组合的「菜谱」：
 

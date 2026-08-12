@@ -66,6 +66,14 @@ user:
 
 v1.11 起 `sequence_frames` 升格为**上限**：所引档声明 `context_window`（第 6 章）后，实际关键帧数按预算剩余动态收缩——`k_eff = min(sequence_frames, max(2, ⌊图片份额 / 每图成本⌋))`，首末帧恒保留、中间照旧均匀降采样。份额定序是「图片先于文本让步」：文本摘要是裁决的兜底证据、token 效率也高于像素；k = 2 仍装不下再回头按「首末恒保留、丢中段」裁文本块，最后才按 `context_overflow` 记录级拒收。运行期另有两条自动换档：端点报上下文溢出时，该次标注**减帧保清重试**（k 减半、min 2，至多两次降级，仍溢出按 `context_overflow` 拒收）；verify 判 fail 且 `policy = "repair"` 时，修复重标注按**质量阶梯换档**——关键帧数减半、分辨率上探一档（`default_image_px` × 1.5/维，封顶 `max_image_px`，第 13 章）。与上一段警告的交互：那条警告盯的是 `max_image_px` 这个**天花板**而非日常工作点——就算 `default_image_px` 调得很低，修复升档仍可能探到天花板，所以躲 Anthropic 多图硬拒要压的始终是 `max_image_px`（≤ 2000）或帧数。
 
+### 帧级标注（v1.12）：序列行内的逐成员第二层
+
+流模式还有一层可选的帧粒度标注（`[frame.annotate]`，仅 `segment.enabled` 时可开——机制与真实产物在第 25 章 25.6）：序列级标注完成后，annotate 对 episode 的每个成员帧**再各做一次独立标注**，每成员一次调用，产物挂 `_meta.stream.members[].annotation` 随序列行交付。提示词模板与单记录标注同构——`[任务]` + 帧 Schema 全文嵌入 + 当前成员帧（text 模态 = 该行文本；ui 模态 = 截图 + 控件树摘要），变的只是「当前记录」换成单个成员帧。三件事与序列级标注不同：
+
+- **全局指令 vs 按帧类覆盖**：`frame.annotate.instruction` 是全局帧标注指令（enabled 时必填，few-shot 走 `frame.annotate.examples`）；开了帧分类（`[frame.classify]`）后可在 `[frame.class.<帧类名>.annotate]` 里按帧类覆盖 `instruction` / `examples`，或 `enabled = false` 整类跳过标注（第 24 章 24.8）——`examples/mix` 的两个工程各演示一套：UI 主工程给 form_screen 表单屏覆盖「抽表单字段与取值」的指令、给 transition 过渡屏整类跳过，文本姊妹工程给 task_request 覆盖、给 chitchat 跳过（第 25 章 25.6）；帧分类关闭时全员用全局指令。帧级**没有** self-consistency——在 `[frame.annotate]` 里显式写 `self_consistency` 是定向配置错误。
+- **独立的帧 Schema**：`frame.annotate.schema_path` / `schema_inline` **恰一**，与 `output.schema` 互相独立——「帧对象长什么样」与「序列行长什么样」是两份契约，各自过 draft 2020-12 元校验、各自的 examples 各自启动干跑。结构保障走同一结构引擎，但**不经 L2.5 用户回调**（第 14 章 14.5）。
+- **失败去向不是 rejects**：成员标注修复穷尽 ⇒ 该成员在 members[] 里 `status="failed"`、`annotation=null`——**不写 rejects 行、不触发 `--strict`**，episode 照常发射；账记在 `report.stream.frame_annotate.failed`，逐成员审计走 trace 的 `annotate.frame` 事件（第 16 章）。与 11.6 的记录级失败语义对照着记：序列级标注失败死的是整条记录，帧级标注失败死的只是一个状态位。
+
 ## 11.3 配置参考
 
 ```toml
@@ -137,6 +145,8 @@ instruction = """
 - 结构修复预算耗尽 ⇒ 记录 `failed` 进拒绝通道（错误码 `schema_violation`；注册了 `output.validator` 回调且剩余违规全部来自回调时为 `callback_violation`，见 14.5）——**永远不会有非法结构或违反你业务规则的对象混进主输出**；
 - API 重试耗尽 / 致命错误 ⇒ 同样 `failed`，错误码进拒绝通道的 `_meta.reason`（如 `provider_retryable_exhausted`），具体错误信息进 `errors` 列表；
 - 成功 ⇒ `_meta.annotation = {model, attempts}`（开 self-consistency 时另含 `sc`）。单次标注（`self_consistency = 0`）时 attempts = 1 + 结构修复轮数，>1 即说明结构引擎修过；开 self-consistency 时 attempts 是各合法样本尝试次数之**和**（零修复时就等于合法样本数），要与 `sc.n` 对照：attempts 明显超过 n 才说明发生过修复（第 14 章解读修复分布）。
+
+以上都是**记录级**语义；帧级标注（v1.12）的失败走另一套——成员状态位 + report 计数，不入 rejects，见 11.2 的「帧级标注」小节。
 
 ## 11.7 标注质量上不去，按序排查
 
