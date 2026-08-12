@@ -18,6 +18,10 @@ def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
         llm_names.append(cfg.stitch.llm)
     if cfg.classify.enabled:
         llm_names.append(cfg.classify.llm)
+    if cfg.frame_classify.enabled:
+        # v1.12：帧级分类判决 profile——enabled 即入探测集（链位居序列级 classify 之后；
+        # 永不入 vision 必需集，vision 语义分列裁决）
+        llm_names.append(cfg.frame_classify.llm)
     if cfg.extract.enabled:
         llm_names.append(cfg.extract.llm)
     if cfg.quality.enabled:
@@ -27,6 +31,9 @@ def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
             llm_names.extend(cfg.quality.judges)
     if cfg.annotate.enabled:
         llm_names.append(cfg.annotate.llm)
+    if cfg.frame_annotate.enabled:
+        # v1.12：帧级标注 profile——enabled 即入探测集（链位居序列级 annotate 之后）
+        llm_names.append(cfg.frame_annotate.llm)
     if cfg.generate.enabled:
         llm_names.extend(cfg.generate.llms)
     if cfg.verify.enabled:

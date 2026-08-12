@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Sequence
 
 import json_repair
 from jsonschema import Draft202012Validator
@@ -342,6 +342,18 @@ def classification_schema(class_names: list[str], assignment: str,
         required += ["reason"]
     return {"type": "object", "properties": props,
             "required": required, "additionalProperties": False}
+
+
+def frame_classify_schema(names: Sequence[str], n: int) -> dict:
+    # v1.12 M13 帧级批量判决（SPEC-frame-annotation §3.2）：一窗成员帧的闭集标签数组，
+    # 按窗内成员序位置对齐。minItems=maxItems 钉死数组长度（judgment_schema/
+    # segment_window_schema 先例）；长度/索引对齐后校验在代码侧（first-wins，
+    # 缺项 ⇒ 该帧 fallback_class）；R1 同理不用 uniqueItems（帧标签本就允许重复）。
+    return {"type": "object",
+            "properties": {"labels": {"type": "array",
+                "items": {"type": "string", "enum": list(names)},
+                "minItems": n, "maxItems": n}},
+            "required": ["labels"], "additionalProperties": False}
 
 
 # ── The engine ───────────────────────────────────────────────────────────────

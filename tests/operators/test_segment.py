@@ -23,7 +23,6 @@ import pytest
 from labelkit.operators.segment import (
     SegmentStage,
     _judge_span_degrading,
-    _pack_windows,
     _reason_requested,
     _static_prompt_est,
     _window_spans,
@@ -31,6 +30,10 @@ from labelkit.operators.segment import (
     judge_window,
     render_tree_diff,
 )
+
+# v1.12 装箱器下沉：_pack_windows 原样迁为 budget.pack_windows（行为字节等价），
+# 别名导入保持既有装箱断言原样不动。
+from labelkit.common.runtime.budget import pack_windows as _pack_windows
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,

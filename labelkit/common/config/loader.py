@@ -4,7 +4,9 @@ load(): three-source merge — CLI overrides > project.toml > config.toml/built-
 defaults — plus FULL startup validation. Every validation error is aggregated into
 a single ConfigError (never first-error-only); unknown keys produce stderr
 warnings only (forward compatibility) — EXCEPT inside the v1.7 [class.*] override
-namespace, which M1 explicitly owns: keys outside the whitelist are errors (R25).
+namespace, which M1 explicitly owns: keys outside the whitelist are errors (R25)
+— and, v1.12, the [frame.class.*] namespace likewise (白名单仅 annotate 节的
+instruction/examples/enabled 三键，白名单外键/节为 CONFIG_ERROR).
 
 default_rubric(): loads a packaged default rubric from labelkit/data/rubrics/.
 
@@ -45,6 +47,9 @@ from labelkit.common.config.model import (
     EmbeddingProfile,
     ExtractConfig,
     FewShotExample,
+    FrameAnnotateConfig,
+    FrameClassifyConfig,
+    FrameClassView,
     GenerateConfig,
     GenerateStyle,
     InputConfig,
@@ -111,6 +116,12 @@ _CLASS_SECTIONS = ("quality", "rubric", "annotate", "generate", "verify", "extra
 # defaults) before the class overrides apply, so a global threshold and a class
 # top_ratio (or vice versa) never spuriously coexist in the merged view.
 _SELECTION_GROUP = ("selection", "threshold", "top_ratio")
+
+# v1.12 [frame.class.<name>.<section>] 覆盖白名单（SPEC-frame-annotation §3.1）：帧类
+# 命名空间与 [class.*] 同为 M1 显名拥有（R25 家族）——白名单外键/节是 CONFIG_ERROR，
+# 不走前向兼容 WARN。仅 annotate 一节可覆盖，三键：instruction / examples / enabled。
+_FRAME_CLASS_SECTIONS = ("annotate",)
+_FRAME_ANNOTATE_KEYS = ("instruction", "examples", "enabled")
 
 
 # ── low-level helpers ──────────────────────────────────────────────────────
@@ -611,19 +622,22 @@ def _parse_examples(col: _Collector, file: str, raw: Any,
     return tuple(examples)
 
 
-def _parse_classes(col: _Collector, file: str, raw: Any) -> tuple[ClassSpec, ...]:
+def _parse_classes(col: _Collector, file: str, raw: Any,
+                   section: str = "classify") -> tuple[ClassSpec, ...]:
     """Parse the [[classify.classes]] array of tables (spec 5.2 v1.7): name
     matches [a-z0-9_]+ and is unique within the table, description is non-empty,
-    examples is an optional string array (input-side few-shot lines only)."""
+    examples is an optional string array (input-side few-shot lines only).
+    v1.12：`section` 平移错误定位——帧类表 [[frame.classify.classes]] 与之同构
+    （_parse_styles/_parse_examples 的 section 参数同款惯例）。"""
     if raw is _MISSING:
         return ()
     if not isinstance(raw, list):
-        col.error(f"{file}:[classify].classes: 期望表数组，得到 {_fmt(raw)}")
+        col.error(f"{file}:[{section}].classes: 期望表数组，得到 {_fmt(raw)}")
         return ()
     classes: list[ClassSpec] = []
     seen: set[str] = set()
     for i, sub in enumerate(raw, 1):
-        label = f"[[classify.classes]][{i}]"
+        label = f"[[{section}.classes]][{i}]"
         if not isinstance(sub, dict):
             col.error(f"{file}:{label}: 期望表（table），得到 {_fmt(sub)}")
             continue
@@ -809,6 +823,66 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
     }
     t.finish()
 
+    # ── v1.12 [frame] 命名空间：帧级分类/标注（SPEC-frame-annotation §3.1）────
+    # [frame.classify] / [frame.annotate] / [frame.class.<name>.annotate] 三面；
+    # [frame] 下未知子键走前向兼容 WARN（rule 1），[frame.class.*] 白名单校验与
+    # 七条组合约束在 load() 统一执行（需要已解析的 segment/output 等全局节）。
+    frame_section = _section(col, top, "frame")
+    ft = _Tbl(col, file, "[frame]", frame_section)
+
+    def _frame_sub(key: str) -> dict | None:
+        raw = ft.take(key)
+        if raw is _MISSING:
+            return None
+        if not isinstance(raw, dict):
+            col.error(f"{file}:[frame].{key}: 期望表（table），得到 {_fmt(raw)}")
+            return None
+        return raw
+
+    frame_classify_section = _frame_sub("classify")
+    frame_annotate_section = _frame_sub("annotate")
+    frame_class_raw = _frame_sub("class")
+    ft.finish()
+
+    t = _Tbl(col, file, "[frame.classify]", frame_classify_section)
+    frame_classify = FrameClassifyConfig(
+        enabled=t.get_bool("enabled", False),
+        llm=t.get_str("llm", "default", nonempty=True),
+        fallback_class=t.get_str("fallback_class", "") or "",
+        classes=_parse_classes(col, file, t.take("classes"),
+                               section="frame.classify"),
+        # vision_resolved 为解析产物——load() 收尾冻结（segment V1 同款）
+    )
+    # v1.12 定向探针（v1.11 use_vision 的原始节探针同款机制）：帧级无多标签——
+    # assignment 显式书写是定向 CONFIG_ERROR，由 load() 经原始节探针上报；此处
+    # 标记 seen 抑制未知键前向兼容 WARN，保证定向报错是唯一上报。
+    t.seen.add("assignment")
+    t.finish()
+
+    t = _Tbl(col, file, "[frame.annotate]", frame_annotate_section)
+    frame_annotate = FrameAnnotateConfig(
+        enabled=t.get_bool("enabled", False),
+        llm=t.get_str("llm", "default", nonempty=True),
+        instruction=t.get_str("instruction", "") or "",
+        examples=_parse_examples(col, file, t.take("examples"),
+                                 section="frame.annotate"),
+        schema_path=t.get_str("schema_path", None, nonempty=True),
+        schema_inline=t.get_str("schema_inline", None, nonempty=True),
+    )
+    # v1.12 定向探针（同上）：帧级无自洽采样——self_consistency 显式书写是
+    # 定向 CONFIG_ERROR。
+    t.seen.add("self_consistency")
+    t.finish()
+
+    frame_provided = {
+        "section": frame_section is not None,
+        "classify_assignment": (isinstance(frame_classify_section, dict)
+                                and "assignment" in frame_classify_section),
+        "annotate_self_consistency": (isinstance(frame_annotate_section, dict)
+                                      and "self_consistency"
+                                      in frame_annotate_section),
+    }
+
     quality_section = _section(col, top, "quality")
     t = _Tbl(col, file, "[quality]", quality_section)
     quality = QualityConfig(
@@ -918,6 +992,8 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
         run=run, input=input_cfg, stream=stream, dedup=dedup,
         segment=segment, stitch=stitch, extract=extract, classify=classify,
         classify_provided=classify_provided, class_raw=class_raw,
+        frame_classify=frame_classify, frame_annotate=frame_annotate,
+        frame_class_raw=frame_class_raw, frame_provided=frame_provided,
         stream_provided=stream_provided, segment_provided=segment_provided,
         stitch_provided=stitch_provided, extract_provided=extract_provided,
         sequence_frames_provided=sequence_frames_provided,
@@ -982,41 +1058,56 @@ def _unresolvable_refs(schema: dict) -> list[tuple[str, str]]:
     return sorted(bad.items())
 
 
-def _load_user_schema(col: _Collector, file: str, output: OutputConfig) -> tuple[dict, bool]:
-    """Rules 13/14 of CONTRACTS §6.3. Returns (schema_dict, usable)."""
-    sp, si = output.schema_path, output.schema_inline
+def _load_schema_pair(col: _Collector, file: str, section: str, noun: str,
+                      sp: str | None, si: str | None) -> tuple[dict, bool, str]:
+    """v1.12 抽取的通用 Schema 装载主体（§6.3 规则 13/14 分支，供 [output] 用户
+    Schema 与 [frame.annotate] 帧级 Schema 两处镜像复用）：恰一约束 → 读文件 →
+    JSON 解析 → 顶层对象 → draft 2020-12 元校验 → 顶层 type = "object"。
+    错误定位前缀 = "<file>:[<section>].<key>:"，名词（用户 Schema / 帧级 Schema）
+    经 ``noun`` 平移。output 专属的 "_meta" 保留键检查与两侧共有的 $ref 可解析性
+    检查留在各自包装函数（保持既有报错次序字节不变）。
+    Returns (schema_dict, usable, key)。"""
     if sp is not None and si is not None:
-        col.error(f"{file}:[output].schema_inline: 与 schema_path 恰好提供其一（互斥），得到两者均设置")
-        return {}, False
+        col.error(f"{file}:[{section}].schema_inline: 与 schema_path 恰好提供其一（互斥），得到两者均设置")
+        return {}, False, "schema_inline"
     if sp is None and si is None:
-        col.error(f"{file}:[output].schema_path: 须恰好提供 schema_path 或 schema_inline 其一，得到两者均缺失")
-        return {}, False
+        col.error(f"{file}:[{section}].schema_path: 须恰好提供 schema_path 或 schema_inline 其一，得到两者均缺失")
+        return {}, False, "schema_path"
     key = "schema_inline" if si is not None else "schema_path"
     text = si
     if sp is not None:
         try:
             text = Path(sp).read_text(encoding="utf-8")
         except OSError as e:
-            col.error(f"{file}:[output].schema_path: 无法读取 Schema 文件 {_fmt(sp)}：{e}")
-            return {}, False
+            col.error(f"{file}:[{section}].schema_path: 无法读取 Schema 文件 {_fmt(sp)}：{e}")
+            return {}, False, key
     try:
         schema = json.loads(text)  # type: ignore[arg-type]
     except json.JSONDecodeError as e:
-        col.error(f"{file}:[output].{key}: 期望合法 JSON，得到 JSON 解析错误：{e}")
-        return {}, False
+        col.error(f"{file}:[{section}].{key}: 期望合法 JSON，得到 JSON 解析错误：{e}")
+        return {}, False, key
     if not isinstance(schema, dict):
-        col.error(f"{file}:[output].{key}: 用户 Schema 顶层必须为 JSON 对象，得到 {_fmt(schema)}")
-        return {}, False
+        col.error(f"{file}:[{section}].{key}: {noun} 顶层必须为 JSON 对象，得到 {_fmt(schema)}")
+        return {}, False, key
     ok = True
     try:
         Draft202012Validator.check_schema(schema)
     except SchemaError as e:
-        col.error(f"{file}:[output].{key}: 未通过 JSON Schema draft 2020-12 元 Schema 校验：{e.message}")
+        col.error(f"{file}:[{section}].{key}: 未通过 JSON Schema draft 2020-12 元 Schema 校验：{e.message}")
         ok = False
     if schema.get("type") != "object":
-        col.error(f'{file}:[output].{key}: 用户 Schema 顶层 type 必须为 "object"，'
+        col.error(f'{file}:[{section}].{key}: {noun} 顶层 type 必须为 "object"，'
                   f"得到 {_fmt(schema.get('type'))}")
         ok = False
+    return schema, ok, key
+
+
+def _load_user_schema(col: _Collector, file: str, output: OutputConfig) -> tuple[dict, bool]:
+    """Rules 13/14 of CONTRACTS §6.3. Returns (schema_dict, usable)."""
+    schema, ok, key = _load_schema_pair(col, file, "output", "用户 Schema",
+                                        output.schema_path, output.schema_inline)
+    if not schema and not ok:
+        return schema, ok        # 硬解析失败已上报（与抽取前的提前返回等价）
     props = schema.get("properties")
     if isinstance(props, dict) and "_meta" in props:
         col.error(f'{file}:[output].{key}: 用户 Schema 顶层不得声明保留键 "_meta"'
@@ -1025,6 +1116,23 @@ def _load_user_schema(col: _Collector, file: str, output: OutputConfig) -> tuple
     if ok:
         for ref, why in _unresolvable_refs(schema):
             col.error(f"{file}:[output].{key}: 用户 Schema 引用无法解析"
+                      f"（$ref {_fmt(ref)}）：{why}")
+            ok = False
+    return schema, ok
+
+
+def _load_frame_schema(col: _Collector, file: str,
+                       fa: FrameAnnotateConfig) -> tuple[dict, bool]:
+    """v1.12（SPEC-frame-annotation §3.1 帧 Schema 恰一行）：帧级输出 Schema 装载，
+    镜像 output.schema 全套分支（恰一 / 读取 / JSON 解析 / 顶层对象 / 元校验 /
+    $ref 可解析性 + 调用方的 examples 干跑）。唯一不镜像的分支是 "_meta" 保留键
+    检查——帧标注对象落于 _meta.stream.members[].annotation 内部，与 §6.3 信封
+    字段无冲突面。Returns (schema_dict, usable)。"""
+    schema, ok, key = _load_schema_pair(col, file, "frame.annotate", "帧级 Schema",
+                                        fa.schema_path, fa.schema_inline)
+    if ok:
+        for ref, why in _unresolvable_refs(schema):
+            col.error(f"{file}:[frame.annotate].{key}: 帧级 Schema 引用无法解析"
                       f"（$ref {_fmt(ref)}）：{why}")
             ok = False
     return schema, ok
@@ -1086,7 +1194,9 @@ def _check_pointwise_rubric(col: _Collector, file: str, rubric: Rubric, *,
 
 def _dryrun_fewshot(col: _Collector, file: str, examples: tuple[FewShotExample, ...],
                     elem_label: str, *, validator: Any, schema_key: str,
-                    hook: Any, hook_ref: str | None) -> tuple[bool, bool]:
+                    hook: Any, hook_ref: str | None,
+                    schema_section: str = "output",
+                    schema_noun: str = "用户 Schema") -> tuple[bool, bool]:
     """Dry-run few-shot example outputs through the user schema (rule 14) and
     the output.validator hook (rule 17) — shared by the global [[annotate.
     examples]] and the v1.7 per-class [[class.<name>.annotate.examples]] sets
@@ -1094,7 +1204,10 @@ def _dryrun_fewshot(col: _Collector, file: str, examples: tuple[FewShotExample, 
     `validator` / `hook` argument is None. Returns (schema_alive, hook_alive):
     a False flag tells the caller to stop dry-running FURTHER example sets on
     that layer — the cause (unresolvable schema $ref / hook raising) lies in
-    the schema or hook itself, so one error line suffices."""
+    the schema or hook itself, so one error line suffices.
+    v1.12：``schema_section``/``schema_noun`` 平移错误定位与名词——帧级 Schema
+    干跑（[[frame.annotate.examples]] 与 [[frame.class.<name>.annotate.examples]]）
+    复用本函数（hook 恒 None：帧级调用无 L2.5）；缺省值保持 output 侧文案字节不变。"""
     schema_alive = True
     if validator is not None:
         for i, ex in enumerate(examples, 1):
@@ -1109,14 +1222,14 @@ def _dryrun_fewshot(col: _Collector, file: str, examples: tuple[FewShotExample, 
                 # join the aggregated ConfigError (exit 2), never escape as an
                 # unhandled crash (exit 4). One error suffices — the cause is
                 # the schema itself, not any individual example.
-                col.error(f"{file}:[output].{schema_key}: 用户 Schema 引用无法解析，"
+                col.error(f"{file}:[{schema_section}].{schema_key}: {schema_noun} 引用无法解析，"
                           f"无法校验 [[{elem_label}]] 示例输出：{e}")
                 schema_alive = False
                 break
             if errs:
                 e0 = errs[0]
                 ptr = "/" + "/".join(str(x) for x in e0.absolute_path)
-                col.error(f"{file}:[[{elem_label}]][{i}].output: 未通过用户 Schema："
+                col.error(f"{file}:[[{elem_label}]][{i}].output: 未通过{schema_noun}："
                           f"{ptr}: {e0.message}")
     hook_alive = True
     if hook is not None:
@@ -1265,6 +1378,43 @@ def _merge_class_sections(
     return quality, annotate, generate, verify, extract, info
 
 
+def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
+                       base: FrameAnnotateConfig) -> tuple[FrameClassView, bool]:
+    """v1.12：合并一个帧类的 [frame.class.<name>.annotate] 覆盖到全局
+    [frame.annotate]（SPEC-frame-annotation §3.1「帧类覆盖」行；R25 家族——
+    帧类命名空间由 M1 显名拥有，白名单外键/节是 CONFIG_ERROR 而非前向兼容
+    WARN）。按键溯源：类提供的键覆盖全局值，其余继承；``enabled`` 缺省 true
+    （= 该类照常标注；false = 跳过该类成员的帧标注，省成本面）。
+    Returns (view, examples_provided)——examples_provided 供调用方决定是否对
+    类内示例做帧级 Schema 干跑（规则 28 的帧级镜像）。"""
+    for sect, sub in sections.items():
+        if sect not in _FRAME_CLASS_SECTIONS:
+            col.error(f"{file}:[frame.class.{cname}.{sect}]: [frame.class.*] "
+                      f"覆盖节不在白名单内（可用：{'、'.join(_FRAME_CLASS_SECTIONS)}）")
+            continue
+        if not isinstance(sub, dict):
+            col.error(f"{file}:[frame.class.{cname}.{sect}]: 期望表（table），"
+                      f"得到 {_fmt(sub)}")
+            continue
+        for k in sub:
+            if k not in _FRAME_ANNOTATE_KEYS:
+                col.error(f"{file}:[frame.class.{cname}.annotate].{k}: "
+                          f"[frame.class.*.annotate] 不可覆盖该键"
+                          f"（白名单：{'、'.join(_FRAME_ANNOTATE_KEYS)}）")
+    a_over = sections.get("annotate")
+    a_over = a_over if isinstance(a_over, dict) else {}
+    t = _Tbl(col, file, f"[frame.class.{cname}.annotate]", a_over)
+    examples_provided = "examples" in a_over
+    view = FrameClassView(
+        instruction=t.get_str("instruction", base.instruction, nonempty=True),
+        examples=(_parse_examples(col, file, t.take("examples"),
+                                  section=f"frame.class.{cname}.annotate")
+                  if examples_provided else base.examples),
+        enabled=t.get_bool("enabled", True),
+    )
+    return view, examples_provided
+
+
 # ── public API ─────────────────────────────────────────────────────────────
 
 
@@ -1348,6 +1498,10 @@ def load(config_path: Path, project_path: Path,
     classify: ClassifyConfig = p["classify"]
     classify_provided: dict[str, bool] = p["classify_provided"]
     class_raw: Any = p["class_raw"]
+    frame_classify: FrameClassifyConfig = p["frame_classify"]
+    frame_annotate: FrameAnnotateConfig = p["frame_annotate"]
+    frame_class_raw: Any = p["frame_class_raw"]
+    frame_provided: dict[str, bool] = p["frame_provided"]
     stream_provided: dict[str, bool] = p["stream_provided"]
     segment_provided: dict[str, bool] = p["segment_provided"]
     stitch_provided: dict[str, bool] = p["stitch_provided"]
@@ -1388,6 +1542,13 @@ def load(config_path: Path, project_path: Path,
         # like verify below: the default reference ("default") need not exist
         # while the stage is disabled (v1.7, R24 reference-set point ①)
         _check_llm_ref(f"{fp}:[classify].llm", classify.llm)
+    if frame_classify.enabled:
+        # v1.12：enabled 即入存在性引用集；永不入下方 vision 必需集
+        # （vision 语义分列裁决——vision_resolved 自适应推导，segment V3 同款）
+        _check_llm_ref(f"{fp}:[frame.classify].llm", frame_classify.llm)
+    if frame_annotate.enabled:
+        # v1.12：enabled 即入存在性引用集（vision 登记见下方 ui 分支）
+        _check_llm_ref(f"{fp}:[frame.annotate].llm", frame_annotate.llm)
     if extract.enabled:
         _check_llm_ref(f"{fp}:[extract].llm", extract.llm)   # v1.8 S30: always when enabled
     _check_llm_ref(f"{fp}:[quality].llm", quality.llm)
@@ -1429,6 +1590,12 @@ def load(config_path: Path, project_path: Path,
                 vision_users.setdefault(name, set()).add("quality")
         if annotate.enabled:
             vision_users.setdefault(annotate.llm, set()).add("annotate")
+        if frame_annotate.enabled:
+            # v1.12（vision 语义分列）：frame.annotate.llm 在 ui ∧ enabled 时
+            # 无条件入 vision 必需集（截图是帧标注主证据，镜像序列级 annotate）；
+            # frame.classify.llm 永不入此集——附图与否由 vision_resolved 解析产物
+            # 自适应决定（成本控制面 = 指向纯文本 profile）。
+            vision_users.setdefault(frame_annotate.llm, set()).add("frame.annotate")
         if verify.enabled:
             for name in (verify.judges or (verify.llm,)):
                 vision_users.setdefault(name, set()).add("verify")
@@ -1536,6 +1703,10 @@ def load(config_path: Path, project_path: Path,
         referenced.add(stitch.llm)       # v1.9, T17 reference-set point
     if classify.enabled:
         referenced.add(classify.llm)     # v1.7, R24 reference-set point ②
+    if frame_classify.enabled:
+        referenced.add(frame_classify.llm)   # v1.12 帧级分类 reference-set point
+    if frame_annotate.enabled:
+        referenced.add(frame_annotate.llm)   # v1.12 帧级标注 reference-set point
     if extract.enabled:
         referenced.add(extract.llm)      # v1.8, S30 reference-set point ②
     if quality.enabled:
@@ -1882,12 +2053,130 @@ def load(config_path: Path, project_path: Path,
             parked.append("[stitch]")                  # v1.9 (T17)
         if extract_provided["non_switch_keys"] and not extract.enabled:
             parked.append("[extract]")
+        if (frame_provided["section"] and not frame_classify.enabled
+                and not frame_annotate.enabled):
+            # v1.12 no-op 约束：[frame.*] 节在场 ∧ 均未启用 ∧ segment off ⇒
+            # 入 R8 停放清单（任一帧开关启用时由「帧粒度要求流模式」CONFIG_ERROR
+            # 接管，不再重复告警）
+            parked.append("[frame]")
         if parked:
             col.warn(f"{fp}:[segment].enabled: segment.enabled = false，"
                      f"{'、'.join(parked)} 不会生效，已忽略（留配置、关开关合法）")
         if sequence_frames_provided:
             col.warn(f"{fp}:[annotate].sequence_frames: segment.enabled = false，"
                      f"sequence_frames 仅序列标注（stream 模式）生效，不会生效")
+
+    # ── v1.12 — 帧粒度 [frame.*] 组合约束（SPEC-frame-annotation §3.1 七条） ──
+    # 约束·帧粒度要求流模式：任一帧开关启用 ⇒ segment.enabled = true。
+    for fname, fon in (("frame.classify", frame_classify.enabled),
+                       ("frame.annotate", frame_annotate.enabled)):
+        if fon and not segment.enabled:
+            col.error(f"{fp}:[{fname}].enabled: {fname}.enabled = true 要求 "
+                      f"segment.enabled = true（帧粒度仅流模式可用）——非流模式"
+                      f"请改用 classify + [class.<name>.annotate] 按类标注")
+
+    # 约束·定向探针（v1.11 use_vision 原始节探针同款机制）：帧级无多标签、无自洽采样。
+    if frame_provided["classify_assignment"]:
+        col.error(f"{fp}:[frame.classify].assignment: 帧级分类不提供 assignment——"
+                  f"帧分类恒为单一归属（帧多标签/帧级扇出为 v1.12 非目标），"
+                  f"请删除该键；多标签扇出请用序列级 [classify].assignment")
+    if frame_provided["annotate_self_consistency"]:
+        col.error(f"{fp}:[frame.annotate].self_consistency: 帧级标注不提供 "
+                  f"self_consistency——自洽采样成本 ×n 且投票键须取自帧 Schema"
+                  f"（v1.12 非目标），请删除该键；自洽采样请用序列级 "
+                  f"[annotate].self_consistency")
+
+    # 约束·meta_mode 护栏：帧产物仅经 _meta.stream.members 承载（sidecar 合法）。
+    if (frame_classify.enabled or frame_annotate.enabled) and output.meta_mode == "none":
+        col.error(f'{fp}:[output].meta_mode: 帧粒度（frame.classify / frame.annotate）'
+                  f'启用时不得为 "none"——帧产物仅经 _meta.stream.members 承载，'
+                  f'meta_mode = "none" 将丢弃全部帧产物（sidecar 合法），得到 "none"')
+
+    # 约束·fallback 合法（帧类表与序列类表相互独立、允许重名、互不约束）。
+    frame_names = tuple(c.name for c in frame_classify.classes)
+    frame_avail = "、".join(frame_names) if frame_names else "（无）"
+    if frame_classify.enabled:
+        if any(c.examples for c in frame_classify.classes):
+            # 帧级批量判决模板不渲染类别示例（§10.12，与序列级 §10.8 的 few-shot
+            # 渲染有意不同）——显名提示避免"配置了但静默无效"的锐边。
+            col.warn(f"{fp}:[frame.classify].classes: 类别示例（examples）在帧级"
+                     f"批量判决模板中不渲染（§10.12），该键将被忽略")
+        if not frame_classify.fallback_class:
+            col.error(f"{fp}:[frame.classify].fallback_class: frame.classify.enabled "
+                      f"= true 时必填，期望 [[frame.classify.classes]] 中的类名")
+        elif frame_classify.fallback_class not in frame_names:
+            # 空类表不放行（可用：（无））——fallback ∈ 帧类表 传递性地要求类表非空
+            # （v1.12 约束表无独立的 ≥N 类数规则，与 [classify] 的 ≥2 规则有意不同）。
+            col.error(f"{fp}:[frame.classify].fallback_class: 引用的类名 "
+                      f"{_fmt(frame_classify.fallback_class)} 不在 "
+                      f"[[frame.classify.classes]] 中，可用：{frame_avail}")
+
+    # instruction 必填（§5.2 † 家族的帧级镜像）。
+    if frame_annotate.enabled and not frame_annotate.instruction.strip():
+        col.error(f"{fp}:[frame.annotate].instruction: frame.annotate.enabled = true "
+                  f"时必填，期望非空字符串")
+
+    # 约束·帧 Schema 恰一 + 元校验 + examples 干跑（镜像 output.schema 全套分支；
+    # 仅 enabled 时执行——留配置、关开关合法，帧 Schema 不做停放校验）。
+    frame_schema: dict | None = None
+    frame_validator = None
+    frame_schema_alive = True
+    fskey = ("schema_inline" if frame_annotate.schema_inline is not None
+             else "schema_path")
+    if frame_annotate.enabled:
+        fschema, fs_ok = _load_frame_schema(col, fp, frame_annotate)
+        if fs_ok:
+            frame_schema = fschema
+            frame_validator = Draft202012Validator(fschema)
+        if frame_validator is not None and frame_annotate.examples:
+            frame_schema_alive, _ = _dryrun_fewshot(
+                col, fp, frame_annotate.examples, "frame.annotate.examples",
+                validator=frame_validator, schema_key=fskey, hook=None,
+                hook_ref=None, schema_section="frame.annotate",
+                schema_noun="帧级 Schema")
+
+    # 约束·帧类覆盖：[frame.class.*] 在场要求帧分类启用；节名 ⊆ 帧类表；白名单
+    # 校验 + 视图物化（零覆盖类也各得一份视图，class_views 同款——下游运行期
+    # 永不回退）。
+    frame_class_views: dict[str, FrameClassView] = {}
+    if (isinstance(frame_class_raw, dict) and frame_class_raw
+            and not frame_classify.enabled):
+        for cname in frame_class_raw:
+            col.error(f"{fp}:[frame.class.{cname}]: [frame.class.*] 在场要求 "
+                      f"frame.classify.enabled = true（帧类覆盖依赖帧级分类的"
+                      f"类别产出）")
+    if frame_classify.enabled:
+        if isinstance(frame_class_raw, dict):
+            for cname in frame_class_raw:
+                if cname not in frame_names:
+                    col.error(f"{fp}:[frame.class.{cname}]: 类名 {_fmt(cname)} 不在 "
+                              f"[[frame.classify.classes]] 中，可用：{frame_avail}")
+        for cspec in frame_classify.classes:
+            sections_f = (frame_class_raw.get(cspec.name)
+                          if isinstance(frame_class_raw, dict) else None)
+            if sections_f is not None and not isinstance(sections_f, dict):
+                col.error(f"{fp}:[frame.class.{cspec.name}]: 期望表（table），"
+                          f"得到 {_fmt(sections_f)}")
+                sections_f = None
+            if sections_f:
+                view, f_examples_provided = _merge_frame_class(
+                    col, fp, cspec.name, sections_f, frame_annotate)
+            else:
+                view = FrameClassView(instruction=frame_annotate.instruction,
+                                      examples=frame_annotate.examples,
+                                      enabled=True)
+                f_examples_provided = False
+            # 类提供的示例对帧级 Schema 干跑（规则 28 的帧级镜像；帧级无 L2.5 hook）
+            if (f_examples_provided and view.examples
+                    and frame_validator is not None and frame_schema_alive):
+                fs_alive, _ = _dryrun_fewshot(
+                    col, fp, view.examples,
+                    f"frame.class.{cspec.name}.annotate.examples",
+                    validator=frame_validator, schema_key=fskey, hook=None,
+                    hook_ref=None, schema_section="frame.annotate",
+                    schema_noun="帧级 Schema")
+                frame_schema_alive = frame_schema_alive and fs_alive
+            frame_class_views[cspec.name] = view
 
     # ── v1.11 — context budget & vision derivation (spec 3.1.4 上下文预算行) ─
     # V2 (V27② raw-section probe): the removed key gets a DIRECTED error with
@@ -1904,6 +2193,13 @@ def load(config_path: Path, project_path: Path,
         modality == "ui" and segment.enabled
         and segment.strategy in ("llm", "hybrid")
         and prof_seg is not None and prof_seg.supports_vision))
+
+    # v1.12：冻结帧级分类解析产物（segment V1 同款；无 strategy 分量）——
+    # vision_resolved = (modality=="ui") ∧ enabled ∧ profile.supports_vision。
+    prof_fc = llm_profiles.get(frame_classify.llm)
+    frame_classify = replace(frame_classify, vision_resolved=(
+        modality == "ui" and frame_classify.enabled
+        and prof_fc is not None and prof_fc.supports_vision))
 
     # V5 (S28 sibling): the Anthropic ">20 images ∧ any edge >2000px" 400
     # hard-reject domain, segment multi-image window flavor (the S28 WARN
@@ -2036,6 +2332,29 @@ def load(config_path: Path, project_path: Path,
                                     + [budget.est_text(v.verify.extra_criteria)
                                        + budget.est_text(v.annotate.instruction)
                                        for v in views])))
+    if frame_classify.enabled:
+        # v1.12 V13③ 新段：帧级分类静态部件 = 冻结模板头 + 帧类表
+        # （[frame.classify] 无 instruction 键——提示词模板确定性内建）。
+        # 静态部件口径与渲染事实对齐：帧模板不渲染类别示例（§10.12），
+        # examples 不计入——多算会误触发 V13③ 启动预检。
+        frame_table_text = "\n".join(
+            f"{c.name}\n{c.description}" for c in frame_classify.classes)
+        static_checks.append(("frame.classify", (frame_classify.llm,),
+                              budget.TEMPLATE_HEAD_TOKENS["frame_classify"]
+                              + budget.est_text(frame_table_text)))
+    if frame_annotate.enabled:
+        # v1.12 V13③ 新段：帧级标注静态部件 = 冻结模板头 + 帧级 Schema +
+        # max(全局与各帧类视图的 instruction + few-shot)。
+        frame_schema_text = (json.dumps(frame_schema, ensure_ascii=False)
+                             if frame_schema else "")
+        static_checks.append(("frame.annotate", (frame_annotate.llm,),
+                              budget.TEMPLATE_HEAD_TOKENS["frame_annotate"]
+                              + budget.est_text(frame_schema_text)
+                              + max([budget.est_text(frame_annotate.instruction)
+                                     + _fewshot_est(frame_annotate.examples)]
+                                    + [budget.est_text(v.instruction)
+                                       + _fewshot_est(v.examples)
+                                       for v in frame_class_views.values()])))
     for sect, prof_names, est_static in static_checks:
         for name in prof_names:
             prof_s = llm_profiles.get(name)
@@ -2203,6 +2522,10 @@ def load(config_path: Path, project_path: Path,
         rubric=rubric,
         class_views=class_views,
         user_schema=user_schema,
+        frame_classify=frame_classify,   # v1.12；vision_resolved 已冻结
+        frame_annotate=frame_annotate,
+        frame_class_views=frame_class_views,
+        frame_schema=frame_schema,
         limit=cli.limit,
         strict=cli.strict,
         dry_run=cli.dry_run,

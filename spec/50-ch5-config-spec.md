@@ -196,6 +196,18 @@ dims = 1024                         # 可选：返回向量维度校验
 | `annotate.self_consistency` | int | 0 | 0 = 关（单次标注，v1.1 行为）；启用须 ≥3 且为奇数（M1 校验）：每条记录独立采样 n 次后字段级投票（3.5.2 note 框）。成本：标注调用与 token ×n。 |
 | `annotate.sc_temperature` | float | 0.7 | self-consistency 各次采样的 temperature（采样多样性来源 [33]），覆盖 profile 默认；仅 `self_consistency ≥ 3` 时生效。 |
 | `annotate.sequence_frames` | int | 20 | v1.8 新增：序列（episode）标注单请求最大关键帧数，∈ **[2, 100]**（越界 CONFIG_ERROR，M1 校验）。成员数 n > k 时确定性均匀降采样 `idx_i = ⌊i·(n−1)/(k−1)⌋, i=0..k−1`（首末帧恒含、严格递增、纯整数零 rng；n ≤ k 取全量，3.5.2 序列行）。**`sequence_frames > 20` 且所引 profile `max_image_px > 2000` ⇒ M1 WARN**（S28：Anthropic 对 >20 图请求单图 >2000px 为 400 硬拒非缩放，现默认 max_image_px=2048 恰撞拒——指引改 ≤ 2000 或降帧；20 图阈值按请求内全部 image block 计）。非 stream 模式显式设置 ⇒ no-op warning（3.1.4）。v1.11（V9，3.9.5）：升格为**上限**——所引 profile 声明 `context_window` 后关键帧数按预算剩余动态收缩 `k_eff = min(sequence_frames, max(2, ⌊剩余 / 每图成本⌋))`（首末帧恒保留、中间均匀下采样，既有降采样语义不变）；未声明预算时即固定上限（现行为）。 |
+| `frame.classify.enabled` | bool | false | v1.12 新增：帧级闭集分类开关（M13 帧粒度，3.13.7）——对流模式序列信封的成员帧做批量闭集判决，产物落 `_meta.stream.members[].label`（6.3）。默认关；帧粒度全关时全系统与 v1.11 字节等价（唯 dry-run 估算行与 estimate 键表例外，3.10.3）。启用要求 `segment.enabled = true`（帧粒度仅流模式，2.3.1 帧粒度约束；非流模式请改用 classify + `[class.<name>.annotate]`）。 |
+| `frame.classify.llm` | str | "default" | profile 引用；enabled 时计入密钥解析 / `--probe` / 存在性引用集；**永不入 vision 必需集**——附图由解析产物 `FrameClassifyConfig.vision_resolved`（= ui ∧ enabled ∧ profile.supports_vision）自动推导（3.1.4 帧粒度配置行；成本控制面 = 指向纯文本 profile，判决仅凭摘要行）。 |
+| `frame.classify.fallback_class` | str | 必填† | † enabled 时必填且 ∈ 帧类表 name 集（2.3.1 帧粒度约束）：修复穷尽 / 窗口失败的兜底类（3.13.7 失败语义；LLM 亦可主动选择它）。 |
+| `[[frame.classify.classes]]` | array | 必填† | † enabled 时经「fallback_class ∈ 类表」传递性要求非空（无独立 ≥ 2 类数下限，与 `[[classify.classes]]` 有意不同，3.1.4）。每项：`name`（`[a-z0-9_]+`，表内唯一）、`description`（非空）、`examples`（字符串数组，可选——**解析合法但帧级批量判决模板不渲染**（§10.12 只渲染类表，与序列级 few-shot 有意不同），在场时 M1 显名 WARN「该键将被忽略」，静态预算预检口径同步不计，3.1.4）。**帧类表与序列类表相互独立、允许重名、互不约束**（计数命名空间同分离：`frame_classify.*` vs `classify.*`，6.4）。 |
+| ~~`frame.classify.assignment`~~ | — | —（不提供） | v1.12 定向探针键：显式书写 → CONFIG_ERROR——帧分类恒为单一归属（帧多标签/帧级扇出为 v1.12 非目标，8.1）；多标签扇出请用序列级 `[classify].assignment`（机制 = v1.11 `use_vision` 原始节探针同款，3.1.4）。 |
+| `frame.annotate.enabled` | bool | false | v1.12 新增：帧级逐帧标注开关（M5 帧粒度，3.5.5）——序列级标注成功后对成员帧逐帧产出符合帧级 Schema 的标注，产物落 `_meta.stream.members[].annotation/status`（6.3）。默认关。启用要求 `segment.enabled = true`；`frame.*` 任一启用 ⇒ `output.meta_mode != "none"`（帧产物仅经 `_meta.stream.members` 承载，sidecar 合法——2.3.1 帧粒度约束）。 |
+| `frame.annotate.llm` | str | "default" | profile 引用；enabled 时计入密钥解析 / `--probe` / 存在性引用集；ui 模态 ∧ enabled 时**无条件入 vision 必需集**（镜像序列级 annotate——截图是标注主证据，3.1.4 帧粒度配置行）。 |
+| `frame.annotate.instruction` | str | 必填† | † enabled 时必填（非空，M1 校验）。全局帧标注指令；`[frame.class.<name>.annotate]` 可按帧类覆盖（见按类覆盖表 v1.12 注）。 |
+| `frame.annotate.examples` | array | [] | few-shot：[{input, output}]，output 须过**帧级 Schema**（M1 干跑校验，3.1.4；帧级无 L2.5 hook）；形态镜像 `annotate.examples`。 |
+| `frame.annotate.schema_path` | str | 二选一 | 外部 .json 的帧级输出 Schema；与 `schema_inline` 恰一（2.3.1 帧粒度约束；解析产物 `ResolvedConfig.frame_schema`，`user_schema` 同胞——draft 2020-12 元校验，镜像 `output.schema` 全套分支）。 |
+| `frame.annotate.schema_inline` | str | 二选一 | TOML 多行字符串内嵌的帧级 Schema JSON 文本（同上）。 |
+| ~~`frame.annotate.self_consistency`~~ | — | —（不提供） | v1.12 定向探针键：显式书写 → CONFIG_ERROR——自洽采样成本 ×n 且投票键须取自帧 Schema（v1.12 非目标，8.1）；自洽采样请用序列级 `[annotate].self_consistency`（机制同上）。 |
 | `verify.enabled` | bool | false | — |
 | `verify.llm` | str | "judge"† | † `verify.enabled = true` 且 `verify.judges` 为空时该 profile 须存在于 config.toml `[llm.*]`（judges 非空时被评审团替代、不参与运行也不要求存在，v1.5）；建议独立于 annotate.llm（3.7.2）。 |
 | `verify.judges` | array | [] | 多评审团 profile 列表（v1.2，3.7.2；与 quality.judges 语义一致）：空 = 单评审用 verify.llm；非空须为奇数个（M1 校验），verdict 取多数票，critiques 合并并标注来源 judge，成本 ×\|judges\|。背书 PoLL [32]。 |
@@ -223,9 +235,10 @@ dims = 1024                         # 可选：返回向量维度校验
 | `[class.*.generate]` | instruction, styles, num_per_record, temperature | llms / mixture / weights / seeds_per_call / num_per_call / sample_validator |
 | `[class.*.verify]` | extra_criteria | llm / judges / policy / max_repair_rounds |
 | `[class.*.extract]` | instruction（v1.8 增） | llm / include_diff / on_error——LLM 绑定与失败策略属部署与成本面（与 quality 行同理） |
-| —— | —— | run.* / input.* / stream.*（v1.8）/ dedup.* / segment.*（v1.8）/ stitch.*（v1.9）/ classify.* / output.*（含 schema 与 validator——输出 Schema 全局唯一）/ trace.* 全部不可按类 |
+| `[frame.class.*.annotate]`（v1.12） | instruction, examples, enabled（enabled = false ⇒ 该帧类成员跳过帧标注——省成本面，members[] 呈现 status="skipped"，3.11.2） | llm / schema——LLM 绑定属部署与成本面；帧级 Schema 按粒度唯一（8.4 M13 行）。`[frame.class.<name>]` 下 annotate 之外的节 ⇒ CONFIG_ERROR（白名单仅此一节三键，3.1.4 帧粒度配置行） |
+| —— | —— | run.* / input.* / stream.*（v1.8）/ dedup.* / segment.*（v1.8）/ stitch.*（v1.9）/ classify.* / output.*（含 schema 与 validator——输出 Schema 按粒度各唯一（v1.12 修订原「全局唯一」措辞：序列级 `output.schema` + 帧级 `frame.annotate.schema`，8.4 M13 行））/ trace.* 全部不可按类 |
 
-v1.8 注：`segment.*` 不入白名单是**链序因果**而非取舍——链序为 segment → stitch → dedup → classify → extract →…（3.10.3），segment 在 classify **之前**执行，成段时类标签尚不存在，「按类分段」无从谈起；extract 在 classify 之后，故其 `instruction` 可按类覆盖（multi 扇出下兄弟信封各按其标签的有效 instruction 摘取，S9，3.15）。v1.9 注：`stitch.*` 不入白名单同为链序因果——stitch 亦在 classify 之前（3.10.3），`[class.<name>.stitch]` 不存在（3.1.4 线索缝合行）。
+v1.8 注：`segment.*` 不入白名单是**链序因果**而非取舍——链序为 segment → stitch → dedup → classify → extract →…（3.10.3），segment 在 classify **之前**执行，成段时类标签尚不存在，「按类分段」无从谈起；extract 在 classify 之后，故其 `instruction` 可按类覆盖（multi 扇出下兄弟信封各按其标签的有效 instruction 摘取，S9，3.15）。v1.9 注：`stitch.*` 不入白名单同为链序因果——stitch 亦在 classify 之前（3.10.3），`[class.<name>.stitch]` 不存在（3.1.4 线索缝合行）。v1.12 注：`[frame.class.<name>.annotate]` 按**帧类**覆盖（键控 `[[frame.classify.classes]]` 类表，要求 `frame.classify.enabled = true`，3.1.4 帧粒度配置行②），与 `[class.<name>.*]` 的序列类覆盖是两个独立命名空间——**帧类表与序列类表相互独立、允许重名、互不约束**（重名类各自作用于各自粒度，互不干扰）；合并产物为 `frame_class_views`（零覆盖类也各得一份视图，`class_views` 同款，运行期零回退）。
 
 合并优先级：`[class.<name>].<sect>.<key>` > project.toml `[<sect>].<key>` > 内置默认——这是 project.toml **内部**的条件化合并，不改变「CLI > project.toml > config.toml」三源优先级（2.5）。M1 启动时按逐键 provenance 静态合并、冻结为 `class_views`，运行期零查找成本；选择组互斥对剔除、per-class rubric 重解析、类 examples 干跑等精确语义见 3.1.4 按类覆盖合并行。
 

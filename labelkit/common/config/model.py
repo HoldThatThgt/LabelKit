@@ -392,6 +392,52 @@ class ClassView:
                                                   # classify — labels do not exist yet)
 
 
+# ── frame granularity（v1.12，spec §3.1 [frame.classify]/[frame.annotate]/[frame.class.*]）──
+
+@dataclass(frozen=True)
+class FrameClassifyConfig:                        # v1.12：M13 帧级闭集分类（默认关；仅流模式——
+                                                  # 「帧粒度要求流模式」约束）。镜像 ClassifyConfig
+                                                  # 但无 assignment/max_labels（帧单一归属地基，
+                                                  # 显式书写为定向 CONFIG_ERROR）
+    enabled: bool = False                         # true ⇒ segment.enabled = true（M1 约束）
+    llm: str = "default"                          # 判决 profile；enabled 时入引用集；
+                                                  # 永不入 vision 必需集（vision 语义分列裁决——
+                                                  # 成本控制面 = 指向纯文本 profile）
+    fallback_class: str = ""                      # enabled 时必填；须 ∈ [[frame.classify.classes]]
+                                                  # （修复穷尽/窗口失败兜底，v1.7 fallback 哲学下推）
+    classes: tuple[ClassSpec, ...] = ()           # 帧类表，与 [[classify.classes]] 同构；
+                                                  # 与序列类表相互独立、允许重名、互不约束
+    vision_resolved: bool = False                 # v1.12 解析产物（segment.vision_resolved 同款，
+                                                  # 永非用户键）：M1 于 load() 收尾冻结为
+                                                  # (modality=="ui") ∧ enabled ∧
+                                                  # llm_profiles[frame.classify.llm].supports_vision
+
+
+@dataclass(frozen=True)
+class FrameAnnotateConfig:                        # v1.12：M5 帧级逐帧标注（默认关；仅流模式）。
+                                                  # 无 self_consistency（成本 ×n 且投票键须取自
+                                                  # 帧 Schema——显式书写为定向 CONFIG_ERROR）
+    enabled: bool = False                         # true ⇒ segment.enabled = true（M1 约束）
+    llm: str = "default"                          # ui ∧ enabled 时无条件入 vision 必需集
+                                                  # （截图是标注主证据，镜像序列级 annotate）
+    instruction: str = ""                         # 全局帧标注指令；enabled 时必填
+    examples: tuple[FewShotExample, ...] = ()     # 可选 few-shot；M1 对帧级 Schema 干跑校验
+    schema_path: str | None = None                # 帧级输出 JSON Schema：enabled 时
+    schema_inline: str | None = None              # schema_path/schema_inline 恰一
+                                                  # （镜像 output.schema 全套分支）
+
+
+@dataclass(frozen=True)
+class FrameClassView:                             # v1.12：一个帧类的生效标注配置——全局
+                                                  # [frame.annotate] 与 [frame.class.<name>.annotate]
+                                                  # 白名单三键的合并产物（键 = 帧类名）；M1 装载期
+                                                  # 冻结；frame.classify 关闭时 frame_class_views == {}
+    instruction: str                              # 生效帧标注指令（类覆盖 > 全局）
+    examples: tuple[FewShotExample, ...]          # 生效 few-shot（类覆盖 > 全局）
+    enabled: bool                                 # false ⇒ 该类成员跳过帧标注（省成本面；
+                                                  # 成员在 members[] 呈现 status="skipped"）
+
+
 # ── CLI overrides and the aggregate ────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -438,3 +484,15 @@ class ResolvedConfig:
     project_path: str
     config_digest: str                            # "sha256:<hex>" of the raw file bytes [FROZEN HERE]
     project_digest: str
+    # v1.12 帧粒度四字段：带默认值（有意偏离 stream/stitch 的 R23「必填无默认」惯例——
+    # 全关默认 = 字节等价 v1.11，既有 ResolvedConfig 构造点零波及；loader 恒显式传入）。
+    # 默认字段须列于全部必填字段之后，故置于尾部。
+    frame_classify: FrameClassifyConfig = FrameClassifyConfig()
+                                                  # v1.12；vision_resolved 由 M1 于 load() 收尾冻结
+    frame_annotate: FrameAnnotateConfig = FrameAnnotateConfig()
+    frame_class_views: Mapping[str, FrameClassView] = field(default_factory=dict)
+                                                  # v1.12：键 = 帧类名；仅 frame.classify.enabled
+                                                  # 时物化（零覆盖类也各得一份视图，class_views 同款）
+    frame_schema: Mapping | None = None           # v1.12：帧级输出 Schema 解析产物（user_schema
+                                                  # 同胞：元校验 + few-shot 干跑）；frame.annotate
+                                                  # 关闭时恒 None

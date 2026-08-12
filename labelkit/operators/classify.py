@@ -37,7 +37,10 @@ from labelkit.common.contracts.types import (
 
 from labelkit.common.runtime import budget
 from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
-from labelkit.common.runtime.schema_engine import classification_schema
+from labelkit.common.runtime.schema_engine import (
+    classification_schema,
+    frame_classify_schema,
+)
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import ClassifyConfig, ResolvedConfig
@@ -71,6 +74,32 @@ _LABEL_UI_TREE = "[UI 控件树]"
 _LABEL_RECORD_SEQ = "[待分类数据·序列]"
 _LABEL_FIRST_FRAME = "[首帧截图]"
 _SEQ_TRUNCATION_MARKER = "…(truncated {n} members)"
+
+# ── v1.12 帧级批量判决（SPEC-frame-annotation §3.2，实现后 verbatim 捕进 CONTRACTS §10.12）──
+# 事件与计数器：命名空间 frame_classify.* 与序列级 classify.* 严格分离（计数命名空间裁决）。
+_EV_FRAME = "classify.frame"
+_COUNTER_FRAME_CALLS = "frame_classify.calls"
+_COUNTER_FRAME_FALLBACK = "frame_classify.fallback"
+_COUNTER_FRAME_WINDOW_FAILURES = "frame_classify.window_failures"
+_COUNTER_FRAME_SKIPPED_DEGRADED = "frame_classify.skipped_degraded"
+_COUNTER_DEGRADE_RETRIES = "budget.degrade_retries"
+
+# V20 镜像（segment 同款）：单个原始窗口至多两级对半降级重试。
+_MAX_FRAME_DEGRADE_LEVELS = 2
+
+# 帧级模板头（冻结常量；budget.TEMPLATE_HEAD_TOKENS["frame_classify"] 跨层等式测试引用）。
+# {N} 装配期以 str.replace 代入窗内成员数（segment _SYSTEM_HEAD 同款——est 取未代入
+# 常量形，1–2 字符代入量由 margin 吸收，V7）。
+_FRAME_SYSTEM_HEAD = (
+    "[任务]\n"
+    "你是数据流的逐帧分类员。下面给出同一会话中按时间顺序排列的 {N} 帧成员摘要，"
+    "对每一帧独立判断它属于以下类别中的哪一类，只能从以下封闭类别表中取恰一值。类别表："
+)
+_FRAME_STRUCTURE = ('{"labels": [<第 1 帧类名>, <第 2 帧类名>, ...]}'
+                    "（恰 {N} 项，按帧序与成员摘要行对齐）")
+_LABEL_FRAME_MEMBERS = "[会话成员帧]"
+_LABEL_MEMBER_SCREENSHOT = "[成员 {i} 截图]"
+_FRAME_MEMBER_LINE = "{m}. {digest}"
 
 
 def _reason_requested(cfg: "ResolvedConfig") -> bool:
@@ -445,6 +474,295 @@ async def classify_record(record: Record, ctx: "RunContext") -> Classification:
     return Classification(label=final[0], labels=final, source="llm", detail=detail)
 
 
+# ── v1.12 帧级批量判决（SPEC-frame-annotation §3.2） ─────────────────────────
+
+def build_frame_classify_prompt(members: Sequence[Record], cfg: "ResolvedConfig",
+                                digests: Sequence[str]) -> PromptBundle:
+    """§10.12 帧级批量判决模板的确定性装配（公开面冻结）。
+
+    system：_FRAME_SYSTEM_HEAD（{N} 代入窗内成员数）+ 帧类表行 "- name: description"
+    （[[frame.classify.classes]] 声明序）+ 结构句 + _FRAME_STRUCTURE 输出契约。
+    user：单条消息——[会话成员帧] 文本部件承载 1-based 摘要行（``digests`` 与
+    ``members`` 对齐，调用方按 segment.digest_max_chars 预计算，segment V9 同款——
+    装配器自身永不计算摘要）；frame_classify.vision_resolved 时每成员追加
+    "[成员 i 截图]" 文本标签 + image part（工作点 = profile 图像工作点，M9 编码期
+    生效——镜像 segment 窗口判决的视觉形态）。
+
+    v1.11 形态延续：冻结签名不动——预算路径经私有装配器 _assemble_frame_classify
+    的尾参 ``fit`` 进入（build_classify_prompt 的「公开面冻结 + 私有 fit 尾参」同款）。
+    """
+    return _assemble_frame_classify(members, cfg, digests)
+
+
+def _assemble_frame_classify(members: Sequence[Record], cfg: "ResolvedConfig",
+                             digests: Sequence[str],
+                             fit: _PromptFit | None = None) -> PromptBundle:
+    """§10.12 装配本体；``fit`` 非 None 只做整篇 est 复核置 fit.overflow（窗口装填
+    本身即 fit——内容修剪不适用：窗内容量由 pack_windows 先行保证，残余溢出仅来自
+    强制 2 帧兜底窗，走 precheck 跳过），fit=None 为字节等价的公开面路径。"""
+    fc = cfg.frame_classify
+    n = str(len(members))
+    lines = [_FRAME_SYSTEM_HEAD.replace("{N}", n)]
+    for spec in fc.classes:
+        lines.append(f"- {spec.name}: {spec.description}")
+    lines.append(_STRUCTURE_SENTENCE)
+    lines.append(_FRAME_STRUCTURE.replace("{N}", n))
+    messages: list[Message] = [
+        Message(role="system", parts=(Part(kind="text", text="\n".join(lines)),))]
+
+    body = "\n".join(_FRAME_MEMBER_LINE.format(m=m, digest=digest)
+                     for m, digest in enumerate(digests, start=1))
+    parts: list[Part] = [Part(kind="text", text=f"{_LABEL_FRAME_MEMBERS}\n{body}")]
+    if fc.vision_resolved:
+        for m, member in enumerate(members, start=1):
+            if member.image is None:               # 防御：无图成员只留摘要行
+                continue
+            parts.append(Part(kind="text",
+                              text=_LABEL_MEMBER_SCREENSHOT.format(i=m)))
+            parts.append(Part(kind="image", image=member.image))
+    messages.append(Message(role="user", parts=tuple(parts)))
+    bundle = PromptBundle(messages=tuple(messages))
+    if fit is not None:
+        # 与 M9 咽喉同一估算器复核整篇（schema est 已折进 fit.input_budget）：
+        # 超出 ⇒ 本窗即最小单元不可装填，调用方走 precheck 跳过（不喂熔断）。
+        est = budget.est_prompt(bundle, None, None, image_cost=fit.image_cost)
+        fit.overflow = est > fit.input_budget
+    return bundle
+
+
+def _frame_prompt_fit(cfg: "ResolvedConfig", ctx: "RunContext",
+                      schema: dict) -> _PromptFit | None:
+    """_prompt_fit 的帧级镜像：None = 预算关（profile 缺失或 context_window == 0）。
+    schema est 仅在 profile 声明 supports_structured_output 时计入（M9 咽喉只在
+    此时随请求发送）；图像成本 = vision_resolved 时的校准器批冻结读数（V19）。"""
+    prof = cfg.llm_profiles.get(cfg.frame_classify.llm)
+    if prof is None or prof.context_window <= 0:
+        return None
+    b = budget.input_budget(prof)
+    if prof.supports_structured_output:
+        b -= budget.est_text(json.dumps(schema, ensure_ascii=False))
+    cost = (ctx.llm.calibrator.cost(prof.name)
+            if cfg.frame_classify.vision_resolved else 0)
+    return _PromptFit(input_budget=b, image_cost=cost)
+
+
+def _frame_static_est(cfg: "ResolvedConfig", prof, n_members: int) -> int:
+    """帧级提示词静态部件的 est（装填条件的 est_static_system 项，segment
+    _static_prompt_est 同族）：system 全文（{N} 取未代入常量形，代入量由 margin
+    吸收）+ 两条消息包络 + [会话成员帧] 标签行 + （structured output 时）以最大
+    可能窗 n_members 评估的 schema est 上界。"""
+    fc = cfg.frame_classify
+    lines = [_FRAME_SYSTEM_HEAD]
+    for spec in fc.classes:
+        lines.append(f"- {spec.name}: {spec.description}")
+    lines.append(_STRUCTURE_SENTENCE)
+    lines.append(_FRAME_STRUCTURE)
+    est = (budget.est_text("\n".join(lines)) + 2 * budget.MSG_OVERHEAD_TOKENS
+           + budget.est_text(f"{_LABEL_FRAME_MEMBERS}\n"))
+    if prof.supports_structured_output:
+        names = [spec.name for spec in fc.classes]
+        schema = frame_classify_schema(names, n_members)
+        est += budget.est_text(json.dumps(schema, ensure_ascii=False))
+    return est
+
+
+def _frame_windows(members: Sequence[Record], digests: Sequence[str],
+                   cfg: "ResolvedConfig", ctx: "RunContext") -> list[tuple[int, int]]:
+    """预算分窗（pack_windows 的零重叠调用形，SPEC §3.2 调用形态）。
+
+    per-frame 成本 = est_text(摘要) + 最坏序号前缀 + （vision 时）最坏截图标签 +
+    批冻结图像成本；帧分类无窗口上限键 ⇒ cap = 成员总数（预算是唯一切分力）。
+    pack_windows 的跨度链自带 1 帧重叠（后窗首帧 = 前窗末帧，M14 缝帧语义）——
+    帧分类是不重叠切分：按其 docstring 约定的零重叠调用形，自第二窗起丢弃与前窗
+    重叠的首帧（[start+1, end)），前窗持有缝帧判决；所得跨度两两不交且完整覆盖。"""
+    fc = cfg.frame_classify
+    prof = cfg.llm_profiles[fc.llm]
+    image_cost = ctx.llm.calibrator.cost(fc.llm) if fc.vision_resolved else 0
+    ordinal = budget.est_text(_FRAME_MEMBER_LINE.format(m=len(members), digest=""))
+    label_worst = (budget.est_text(_LABEL_MEMBER_SCREENSHOT.format(i=len(members)))
+                   if fc.vision_resolved else 0)
+    costs = [budget.est_text(digest) + ordinal + label_worst + image_cost
+             for digest in digests]
+    pack_budget = (budget.input_budget(prof)
+                   - _frame_static_est(cfg, prof, len(members)))
+    spans = budget.pack_windows(costs, pack_budget, len(members))
+    return [(start + 1, end) if idx else (start, end)
+            for idx, (start, end) in enumerate(spans)]
+
+
+async def _judge_frame_window(window_members: Sequence[Record],
+                              window_digests: Sequence[str], ctx: "RunContext",
+                              ids: tuple[str, ...]) -> list[str | None]:
+    """一窗一调用——经 complete_validated(schema=frame_classify_schema(names, n))。
+    位次对齐后校验在本函数内（first-wins 家族）：labels 数组按位置对齐窗内成员序，
+    超长截断（保留前 n 项）、缺项补 None（调用方落 fallback_class）。溢出 precheck
+    在派发前自查（fit.overflow ⇒ 掷 phase="precheck"，永不发出注定失败的请求）。"""
+    cfg = ctx.cfg
+    fc = cfg.frame_classify
+    names = [spec.name for spec in fc.classes]
+    n = len(window_members)
+    schema = frame_classify_schema(names, n)
+    fit = _frame_prompt_fit(cfg, ctx, schema)
+    prompt = _assemble_frame_classify(window_members, cfg, window_digests, fit=fit)
+    if fit is not None and fit.overflow:
+        raise ContextOverflowError(
+            "frame classification prompt exceeds the input budget at the "
+            "minimal window", phase="precheck", profile=fc.llm)
+    obj, _usage, _attempts, _model = await ctx.schema_engine.complete_validated(
+        fc.llm, prompt, schema, record_ids=ids, batch_no=ctx.batch_no)
+    raw: list[str | None] = list(obj["labels"])[:n]
+    return raw + [None] * (n - len(raw))
+
+
+async def _judge_frames_degrading(
+        judge, span: tuple[int, int], ctx: "RunContext", *,
+        level: int = 0) -> list[tuple[tuple[int, int], list[str | None]]]:
+    """V20 对半降级重试的帧级镜像（segment._judge_span_degrading 同形，零重叠版）。
+
+    反应式 ContextOverflowError ⇒ 窗口对半重切 [s, m) / [m, e)（m = 中点；帧分类
+    窗口零重叠，切分不保缝帧）、顺序执行（确定性熔断记账）、每次对半计
+    budget.degrade_retries，至多 _MAX_FRAME_DEGRADE_LEVELS 级。终止（不再切分）：
+    非 reactive 相位（precheck = 最小单元不可装填，不可降级）、单帧窗（< 2 帧
+    切不出两个非空半窗）、级数耗尽——异常原样上抛，由调用方按窗失败兜底；
+    熔断喂给在调用方吞点经 _feed_reactive_terminal 恰一次执行（A7 纪律）。"""
+    start, end = span
+    try:
+        return [(span, await judge(span))]
+    except ContextOverflowError as exc:
+        if (exc.phase != "reactive" or end - start < 2
+                or level >= _MAX_FRAME_DEGRADE_LEVELS):
+            raise
+        ctx.metrics.count(_COUNTER_DEGRADE_RETRIES)
+        mid = (start + end) // 2
+        results = await _judge_frames_degrading(judge, (start, mid), ctx,
+                                                level=level + 1)
+        results.extend(await _judge_frames_degrading(judge, (mid, end), ctx,
+                                                     level=level + 1))
+        return results
+
+
+def _frame_failure_kind(exc: BaseException) -> str:
+    """窗口失败留痕的 kind 归类：§7.6 零新 kind——预算词表先行（V27① 同序），
+    修复穷尽复用 classification_invalid（M13 自有词表），其余落既有供应商/内部
+    kind。仅入 Classification.detail 留痕（R4 哲学下推），不产 error 事件。"""
+    kind = budget.classify_stage_error(exc)
+    if kind is not None:
+        return kind
+    if isinstance(exc, SchemaViolation):
+        return ErrorKind.CLASSIFICATION_INVALID.value
+    if isinstance(exc, ProviderRetryableError):
+        return ErrorKind.PROVIDER_RETRYABLE_EXHAUSTED.value
+    if isinstance(exc, ProviderFatalError):
+        return ErrorKind.PROVIDER_FATAL.value
+    return ErrorKind.INTERNAL_ERROR.value
+
+
+def _fold_window_outcomes(outcomes, ctx: "RunContext") -> tuple[dict, dict]:
+    """把各窗叶结果折叠为（位置→标签, 位置→失败留痕）。窗口跨度零重叠 ⇒ 写入互不
+    覆盖，折叠结果与调度顺序无关；失败窗计 window_failures 并按 A7 纪律恰一次
+    喂熔断（仅 reactive-400 终局；precheck 与 200 形终局永不喂）。"""
+    aligned: dict[int, str] = {}
+    detail: dict[int, dict] = {}
+    for leaves in outcomes:
+        for (start, end), got in leaves:
+            if isinstance(got, BaseException):
+                _feed_reactive_terminal(got, ctx.metrics)
+                ctx.metrics.count(_COUNTER_FRAME_WINDOW_FAILURES)
+                kind = _frame_failure_kind(got)
+                for i in range(start, end):
+                    detail[i] = {"kind": kind, "message": str(got)}
+            else:
+                for i, label in enumerate(got):
+                    if label is not None:
+                        aligned[start + i] = label
+    return aligned, detail
+
+
+def _assemble_frame_results(members: Sequence[Record], fc, aligned: dict,
+                            detail: dict) -> tuple[dict[str, Classification], int]:
+    """按成员序落判决表：命中 ⇒ source="llm"；缺位（窗失败或对齐缺项）⇒
+    fallback_class + source="fallback"（窗失败者带 kind/message 留痕，对齐缺项
+    detail 为空）。返回 (成员判决表, fallback 帧数)。"""
+    result: dict[str, Classification] = {}
+    fallback = 0
+    for i, member in enumerate(members):
+        if member.id in result:
+            # 成员 id 是内容哈希，episode 内字节相同的帧同 id（ingest D2 已知
+            # 碰撞面）——first-wins：同 id 同产物，后位次不覆盖、不重复计数
+            # （终审缺陷修复；温度 0 下同内容判决本就应一致）。
+            continue
+        label = aligned.get(i)
+        if label is None:
+            fallback += 1
+            result[member.id] = Classification(
+                label=fc.fallback_class, labels=(fc.fallback_class,),
+                source="fallback", detail=detail.get(i, {}))
+        else:
+            result[member.id] = Classification(label=label, labels=(label,),
+                                               source="llm", detail={})
+    return result, fallback
+
+
+async def classify_frames(members: Sequence[Record],
+                          ctx: "RunContext") -> dict[str, Classification]:
+    """对给定成员 Record 序列做帧级闭集批量判决，返回 {member.id: Classification}
+    （source ∈ {"llm", "fallback"}）。
+
+    预算声明时按 budget.pack_windows 的零重叠调用形分窗（预算关 ⇒ 单窗全成员）；
+    单窗修复穷尽/不可恢复 ⇒ 该窗全部成员落 frame_classify.fallback_class（v1.7
+    fallback 哲学下推），本函数永不抛出记录级异常（大三样除外）。PUBLIC
+    DIRECT-CALL SURFACE：M7 verify 的成员回收补跑直接调用本函数（单成员回收即
+    单元素调用），CONTRACTS §1.1 算子间导入白名单第四向——judge_window（§7.14）
+    同款契约地位的 sanctioned import exception。"""
+    result, _windows, _fallback = await _classify_frames(members, ctx)
+    return result
+
+
+async def _classify_frames(members: Sequence[Record], ctx: "RunContext", *,
+                           episode_id: str | None = None,
+                           ) -> tuple[dict[str, Classification], int, int]:
+    """classify_frames 与 stage 帧 pass 背后的共享实现，返回 (成员判决表,
+    实际派发窗口数, fallback 帧数)——keyword-only 尾参承载事件归属所需的
+    episode_id（缺省取首成员 id：公开面/verify 回收路径的归属），冻结公开签名
+    之外的扩展位（segment._judge_window kwargs 同款手法）。"""
+    cfg = ctx.cfg
+    fc = cfg.frame_classify
+    digests = [frame_digest(member, cfg.segment.digest_max_chars)
+               for member in members]
+    ids = (episode_id,) if episode_id is not None else (members[0].id,)
+    prof = cfg.llm_profiles.get(fc.llm)
+    budget_on = prof is not None and prof.context_window > 0
+    spans = (_frame_windows(members, digests, cfg, ctx) if budget_on
+             else [(0, len(members))])
+    dispatched = 0
+
+    async def judge(span: tuple[int, int]) -> list[str | None]:
+        nonlocal dispatched
+        dispatched += 1
+        ctx.metrics.count(_COUNTER_FRAME_CALLS)
+        return await _judge_frame_window(members[span[0]:span[1]],
+                                         digests[span[0]:span[1]], ctx, ids)
+
+    async def run_window(span: tuple[int, int]):
+        # 降级重试是预算态反应（segment degrade=budget_on 同款）；失败以原始窗为
+        # 兜底单元——降级树任一终局失败即整窗 fallback（"该窗全部成员"语义）。
+        try:
+            if budget_on:
+                return await _judge_frames_degrading(judge, span, ctx)
+            return [(span, await judge(span))]
+        except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as e:  # noqa: BLE001 — 窗口失败永不外溢为 episode 失败
+            return [(span, e)]
+
+    outcomes = await asyncio.gather(*(run_window(span) for span in spans))
+    aligned, detail = _fold_window_outcomes(outcomes, ctx)
+    result, fallback = _assemble_frame_results(members, fc, aligned, detail)
+    if fallback:
+        ctx.metrics.count(_COUNTER_FRAME_FALLBACK, fallback)
+    return result, dispatched, fallback
+
+
 # ── stage ────────────────────────────────────────────────────────────────────
 
 class ClassifyStage:
@@ -456,16 +774,82 @@ class ClassifyStage:
     async def run(self, batch: list[PipelineItem], ctx: "RunContext") -> list[PipelineItem]:
         # Idempotency: classification is not None (e.g. generate's "inherited"
         # records on re-flow) is skipped — zero extra calls (spec 3.13.4).
-        todo = [item for item in batch
-                if item.status == "active" and item.classification is None]
+        # v1.12 双门：classify.enabled=false ∧ frame.classify.enabled=true 时
+        # 组链经 factory 或门仍含本 stage，序列级判决在此按开关静默跳过。
+        todo: list[PipelineItem] = []
+        if self.cfg.classify.enabled:
+            todo = [item for item in batch
+                    if item.status == "active" and item.classification is None]
         if todo:
             await asyncio.gather(*(self._classify_item(item, ctx) for item in todo))
-            if self.cfg.classify.assignment == "multi":
-                # Deterministic fan-out: one synchronous pass AFTER the gather
-                # (never inside the coroutines), batch position order → label
-                # declaration order (spec 3.13.4 multi 扇出).
-                self._fan_out(batch, todo)
+        if self.cfg.frame_classify.enabled:
+            # v1.12 帧级批量判决 pass（SPEC-frame-annotation §3.2）：序列级判决
+            # 写完之后、multi 扇出之前执行——克隆构造时按引用共享已就位的
+            # member_classifications（扇出共享裁决）。
+            frame_todo = self._frame_gate(batch, ctx)
+            if frame_todo:
+                await asyncio.gather(*(self._frame_pass(item, ctx)
+                                       for item in frame_todo))
+        if todo and self.cfg.classify.assignment == "multi":
+            # Deterministic fan-out: one synchronous pass AFTER the gather
+            # (never inside the coroutines), batch position order → label
+            # declaration order (spec 3.13.4 multi 扇出).
+            self._pin_shared_annotations(todo)
+            self._fan_out(batch, todo)
         return batch                               # the SAME list object (contract ②a)
+
+    def _pin_shared_annotations(self, todo: list[PipelineItem]) -> None:
+        """扇出共享裁决的时序补丁（终审缺陷修复）：帧标注 pass 在 M5 才运行，
+        克隆若在此共享 None，M5 对原信封的「None ⇒ 重绑新 dict」将使克隆永远
+        看不到帧标注——对将要扇出的首标签序列信封先钉住共享容器 {}（M5 只补
+        缺位、从不换对象）。降格信封除外：其帧 pass 恒跳过，dict 保持 None =
+        「未运行」语义（emitter 在场规则的单一真相）。"""
+        if not self.cfg.frame_annotate.enabled:
+            return
+        for item in todo:
+            cls = item.classification
+            if (cls is not None and len(cls.labels) >= 2
+                    and item.record.kind == "sequence"
+                    and item.member_annotations is None
+                    and getattr(item, "segment_degraded", None) is None):
+                item.member_annotations = {}
+
+    def _frame_gate(self, batch: list[PipelineItem],
+                    ctx: "RunContext") -> list[PipelineItem]:
+        """帧级 pass 执行门（SPEC §3.2）：active ∧ kind=="sequence" ∧ 首标签信封
+        （克隆判据 classification.label != classification.labels[0]，verify S8
+        同款；classification 为 None 视同非克隆——克隆恒携 classification）∧
+        幂等门 member_classifications 缺位 ∧ 非降格——segment_degraded duck 标
+        在场 ⇒ 计 frame_classify.skipped_degraded 并跳过（降格 = 噪声未剔，
+        不为垃圾帧付费，降格会话跳过裁决）。"""
+        todo: list[PipelineItem] = []
+        for item in batch:
+            if item.status != "active" or item.record.kind != "sequence":
+                continue
+            cls = item.classification
+            if cls is not None and cls.labels and cls.label != cls.labels[0]:
+                continue
+            if item.member_classifications is not None:
+                continue
+            if getattr(item, "segment_degraded", None) is not None:
+                ctx.metrics.count(_COUNTER_FRAME_SKIPPED_DEGRADED)
+                continue
+            todo.append(item)
+        return todo
+
+    async def _frame_pass(self, item: PipelineItem, ctx: "RunContext") -> None:
+        """一 episode 一次帧级批量判决：窗口失败已在 _classify_frames 内落
+        fallback_class，永不使 episode failed；产物挂 item.member_classifications；
+        事件 classify.frame 每 episode 一发（ids=(episode_id,)，payload 仅
+        members/windows/fallback 三个计数——不携带任何数据内容，trace 载荷纪律）。"""
+        record = item.record
+        result, windows, fallback = await _classify_frames(
+            record.members, ctx, episode_id=record.id)
+        item.member_classifications = result
+        ctx.metrics.event(_EV_FRAME, stage=self.name, batch_no=ctx.batch_no,
+                          record_ids=(record.id,),
+                          payload={"members": len(record.members),
+                                   "windows": windows, "fallback": fallback})
 
     async def _classify_item(self, item: PipelineItem, ctx: "RunContext") -> None:
         record = item.record
@@ -564,7 +948,10 @@ class ClassifyStage:
         neighborhood queries, spec 3.13.4) and thread_id (v1.9 T14: a real field —
         thread identity belongs to the record, not the envelope); classification
         swaps label (labels = same full set); scores/annotation/verification/errors
-        are fresh default containers (spec 3.13.4)."""
+        are fresh default containers (spec 3.13.4). v1.12（扇出共享裁决）：
+        member_classifications / member_annotations 与 record/dedup 同族按引用
+        共享——帧产物描述成员帧本身而非信封路由，克隆行渲染同一 dict；帧级两 pass
+        只在首标签信封执行（克隆判据 label != labels[0]），克隆自身永不重跑。"""
         for item in processed:
             classification = item.classification
             if classification is None or len(classification.labels) < 2:
@@ -577,6 +964,8 @@ class ClassifyStage:
                     dedup=item.dedup,
                     session_id=item.session_id,
                     thread_id=item.thread_id,
+                    member_classifications=item.member_classifications,
+                    member_annotations=item.member_annotations,
                 )
                 # v1.8 (D6): session_split / segment_degraded describe the
                 # EPISODE's session and segmentation, not the envelope —

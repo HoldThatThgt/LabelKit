@@ -91,6 +91,15 @@ class Emitter:
         self._undeliverable = False        # a channel write failed: never rename .part
         self._progress_active = False
 
+        # v1.12：帧计数通路（frame_annotate.failed / frame_annotate.discarded）——
+        # M10 装配期注入 MetricsSink（Ingestor.metrics 同款装配期鸭子面，构造签名
+        # 冻结不变）；单测直接构造时缺省 None ⇒ 仅不计数，行为不变。
+        self.metrics = None
+        # v1.12：写前帧校验的 Schema 入口（frame.annotate 关闭时恒 None，M1 保证
+        # 开启时必有解析产物）。
+        self._frame_schema = (dict(cfg.frame_schema)
+                              if cfg.frame_schema is not None else None)
+
     # ── channel lifecycle ─────────────────────────────────────────────────
 
     def open(self) -> None:
@@ -177,8 +186,21 @@ class Emitter:
         self._flush()
         self._emitted_total += emitted
         self._rejected_total += rejected
+        discarded = 0
         for item in batch:
             self._status_totals[item.status] = self._status_totals.get(item.status, 0) + 1
+            if item.status != "active" and item.member_annotations:
+                # v1.12 沉没成本记账（spec §3.6）：终态非 active 的序列信封仍携带
+                # 帧标注 ⇒ 已产出未交付，按非 None 条目数累计（仅计数，不落盘）。
+                # 记账视角 = 首标签信封（终审缺陷修复：扇出克隆共享同一 dict，
+                # 克隆终态不重复计——否则共享产物被计 k 次）。
+                cls = item.classification
+                if cls is not None and cls.labels and cls.label != cls.labels[0]:
+                    continue
+                discarded += sum(1 for ann in item.member_annotations.values()
+                                 if ann is not None)
+        if discarded and self.metrics is not None:
+            self.metrics.count("frame_annotate.discarded", discarded)
         _log.info(
             "批 %d 落盘：主输出 +%d 行（累计 %d），rejects +%d（累计 %d）",
             batch_no, emitted, self._emitted_total, rejected, self._rejected_total,
@@ -401,6 +423,12 @@ class Emitter:
             "member_count": len(members),
             "member_ids": [m.id for m in members],
             "member_sources": [_member_source(m) for m in members],
+        })
+        if self._cfg.frame_classify.enabled or self._cfg.frame_annotate.enabled:
+            # v1.12（spec §3.6）：members 数组仅在任一帧开关开启时在场，位置冻结在
+            # member_sources 之后、session_split 之前；全关时块形态与 v1.11 字节等价。
+            block["members"] = self._members_block(item)
+        block.update({
             "session_split": bool(getattr(item, "session_split", False)),
             "repaired": bool(getattr(item, "stream_repaired", False)),
             "degraded": getattr(item, "segment_degraded", None),
@@ -412,6 +440,51 @@ class Emitter:
         block["steps"] = (None if item.transitions is None
                           else [step_row(t) for t in item.transitions])
         return block
+
+    def _members_block(self, item: PipelineItem) -> list[dict]:
+        """v1.12（spec §3.6）：members 条目——逐成员按 rec.members 序，字段序冻结为
+        index, id[, label][, annotation, status]。label 键仅 frame.classify 开启时
+        在场（dict 为 None 或缺键 ⇒ null，覆盖降格跳过）；annotation/status 两键仅
+        frame.annotate 开启时在场（三值判定见 _member_annotation）。"""
+        classify_on = self._cfg.frame_classify.enabled
+        annotate_on = self._cfg.frame_annotate.enabled
+        rows: list[dict] = []
+        for index, member in enumerate(item.record.members):
+            row: dict = {"index": index, "id": member.id}
+            if classify_on:
+                cls = (item.member_classifications or {}).get(member.id)
+                row["label"] = cls.label if cls is not None else None
+            if annotate_on:
+                row["annotation"], row["status"] = self._member_annotation(
+                    item, member.id)
+            rows.append(row)
+        return rows
+
+    def _member_annotation(self, item: PipelineItem,
+                           member_id: str) -> tuple[dict | None, str]:
+        """v1.12（spec §3.6）：status 闭集三值判定 + 写前校验兜底。dict 为 None 或
+        缺键 ⇒ (null, "skipped")；值 None ⇒ (null, "failed")；对象 ⇒ 写前
+        validate_only(obj, schema=帧 Schema)——通过 ⇒ (对象, "annotated")，不通过 ⇒
+        (null, "failed") 且 frame_annotate.failed 计数，非法帧对象零落盘。"""
+        annotations = item.member_annotations
+        if annotations is None or member_id not in annotations:
+            return None, "skipped"
+        annotation = annotations[member_id]
+        if annotation is None:
+            return None, "failed"
+        obj = dict(annotation.output)
+        violations = self._engine.validate_only(obj, schema=self._frame_schema)
+        if violations:
+            # 违规文本可能携带数据值：stderr 只给去数据摘要（§7.1 ①），成员失败
+            # 不改信封状态、不写 item.errors（成员失败非信封失败，spec §3.3）。
+            if self.metrics is not None:
+                self.metrics.count("frame_annotate.failed")
+            _log.warning(
+                "frame annotation failed pre-write check: episode %s member %s:"
+                " %d violation(s)", item.record.id, member_id, len(violations),
+                extra={"stage": "emitter", "batch": "-"})
+            return None, "failed"
+        return obj, "annotated"
 
     def _annotation_block(self, item: PipelineItem) -> dict | None:
         ann = item.annotation

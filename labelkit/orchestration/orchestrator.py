@@ -177,7 +177,13 @@ def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
     (episodes ≈ sessions, LOWER bound — stderr note in _run_dry); the batch
     count comes EXACTLY from a next-fit packing simulation of the session
     sizes, and the pairwise-quality per-batch pool sizes are the packed
-    sessions per batch. The non-stream branch is unchanged."""
+    sessions per batch. The non-stream branch is unchanged.
+    v1.12（spec §3.7 estimate_run 行）：``frame_classify_calls`` /
+    ``frame_annotate_calls`` = 预扫描帧总数 Σ session_lens 的粗上界（数据源与
+    ``segment_calls`` 完全同源；帧分类实际按窗批量、帧标注跳过噪声成员，均 ≤
+    帧总数），对应开关关闭 ⇒ 0；两键并入 ``total_calls``。键序冻结：
+    frame_classify_calls 紧跟 classify_calls，frame_annotate_calls 紧跟
+    annotate_calls。"""
     g = cfg.generate
     if cfg.run.mode == "generate_only":
         n_ingested = 0
@@ -213,6 +219,8 @@ def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
     segment_calls = 0
     stitch_calls = 0
     extract_calls = 0
+    frame_classify_calls = 0
+    frame_annotate_calls = 0
     stream = cfg.segment.enabled and cfg.run.mode == "process"
     if stream:
         session_lens = tuple(getattr(plan, "session_lens", ()) or ())
@@ -239,6 +247,13 @@ def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
                             * (2 if cfg.stitch.repass else 1))
         if cfg.extract.enabled:
             extract_calls = sum(length - 1 for length in session_lens)
+        # v1.12：帧粒度两键的粗上界 = 预扫描帧总数（与 segment_calls 同源的
+        # session_lens 路径）；开关关闭 ⇒ 0。帧粒度要求流模式（M1 约束），
+        # 非流分支恒 0。
+        if cfg.frame_classify.enabled:
+            frame_classify_calls = sum(session_lens)
+        if cfg.frame_annotate.enabled:
+            frame_annotate_calls = sum(session_lens)
     else:
         n_batches = len(sizes)
         downstream_base = total_records
@@ -280,13 +295,16 @@ def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
         "segment_calls": segment_calls,
         "stitch_calls": stitch_calls,
         "classify_calls": classify_calls,
+        "frame_classify_calls": frame_classify_calls,
         "extract_calls": extract_calls,
         "quality_calls": quality_calls,
         "annotate_calls": annotate_calls,
+        "frame_annotate_calls": frame_annotate_calls,
         "verify_calls": verify_calls,
         "total_calls": (gen_calls + segment_calls + stitch_calls
-                        + classify_calls + extract_calls + quality_calls
-                        + annotate_calls + verify_calls),
+                        + classify_calls + frame_classify_calls + extract_calls
+                        + quality_calls + annotate_calls + frame_annotate_calls
+                        + verify_calls),
     }
 
 
@@ -316,6 +334,9 @@ class Orchestrator:
         self.metrics = metrics
         self.run_id = run_id
         self.run_started_at = run_started_at
+        # v1.12：向 M11 注入帧计数通路（frame_annotate.failed/discarded ——
+        # Ingestor.metrics 同款装配期鸭子面；emitter 构造签名冻结不改）。
+        emitter.metrics = metrics
 
         # Run-level aggregation state (content-free, spec 3.10.3).
         self._stage_time: dict[str, float] = {}
@@ -755,7 +776,9 @@ class Orchestrator:
             "segment": cfg.segment.enabled,
             "stitch": cfg.stitch.enabled,
             "dedup": cfg.dedup.enabled,
-            "classify": cfg.classify.enabled,
+            # v1.12 或门（与 factory.build_stages 同口径）：仅帧级分类开启时
+            # ClassifyStage 仍须在链——序列级判决由 stage 内 classify.enabled 门控。
+            "classify": cfg.classify.enabled or cfg.frame_classify.enabled,
             "extract": cfg.extract.enabled,
             "quality": cfg.quality.enabled,
             "generate": (cfg.generate.enabled and include_generate
@@ -958,6 +981,16 @@ class Orchestrator:
                     "repass_judgments": c("stitch.repass_judgments"),
                     "failures": c("stitch.failures"),
                 }
+            if cfg.frame_classify.enabled:
+                # v1.12（spec §3.7 report 行）：链序槽位 stitch 之后、extract 之前，
+                # 仅开关开启时在场；四键零基闭集镜像 stitch/extract 子块形态，
+                # 计数面由 M13 帧 pass 供给（frame_classify.* 前缀）。
+                stream_block["frame_classify"] = {
+                    "calls": c("frame_classify.calls"),
+                    "fallback": c("frame_classify.fallback"),
+                    "window_failures": c("frame_classify.window_failures"),
+                    "skipped_degraded": c("frame_classify.skipped_degraded"),
+                }
             if cfg.extract.enabled:
                 stream_block["extract"] = {
                     "transitions": c("extract.transitions"),
@@ -965,6 +998,16 @@ class Orchestrator:
                     "failures": c("extract.failures"),
                     "by_type": {t: c(f"extract.by_type.{t}")
                                 for t in _ACTION_TYPES},
+                }
+            if cfg.frame_annotate.enabled:
+                # v1.12（spec §3.7 report 行）：链序槽位 extract 之后、verify 之前，
+                # 仅开关开启时在场；annotated/skipped/failed 由 M5 帧 pass 供给，
+                # failed 另含 M11 写前校验兜底，discarded 由 M11 沉没成本记账供给。
+                stream_block["frame_annotate"] = {
+                    "annotated": c("frame_annotate.annotated"),
+                    "skipped": c("frame_annotate.skipped"),
+                    "failed": c("frame_annotate.failed"),
+                    "discarded": c("frame_annotate.discarded"),
                 }
             if cfg.verify.enabled:
                 stream_block["verify"] = {
@@ -1246,12 +1289,16 @@ class Orchestrator:
         else:
             print(f"dry-run: mode={cfg.run.mode} estimated_records={est['records']} "
                   f"batches={est['batches']}", file=sys.stderr)
+            # v1.12：帧粒度两键按冻结键序无条件打印（非流工程恒 =0，v1.9
+            # stitch_calls 先例）。
             print(f"dry-run: estimated LLM calls — generate_calls={est['generate_calls']} "
                   f"segment_calls={est['segment_calls']} "
                   f"stitch_calls={est['stitch_calls']} "
                   f"classify_calls={est['classify_calls']} "
+                  f"frame_classify_calls={est['frame_classify_calls']} "
                   f"extract_calls={est['extract_calls']} "
                   f"quality_calls={est['quality_calls']} annotate_calls={est['annotate_calls']} "
+                  f"frame_annotate_calls={est['frame_annotate_calls']} "
                   f"verify_calls={est['verify_calls']} total={est['total_calls']} "
                   f"(excludes retries and repair calls)", file=sys.stderr)
             if cfg.classify.enabled and (cfg.classify.assignment == "multi"

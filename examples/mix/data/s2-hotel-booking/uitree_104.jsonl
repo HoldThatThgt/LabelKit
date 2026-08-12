@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.hotel"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "平江府观景酒店", "bounds": [24, 20, 260, 56], "visible": true, "package": "com.example.hotel"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "高级大床房 ¥429/晚 含双早", "bounds": [24, 90, 350, 126], "visible": true, "package": "com.example.hotel"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "免费取消 · 近平江路历史街区", "bounds": [24, 134, 340, 166], "visible": true, "package": "com.example.hotel"}
+{"id": "4", "parent": "0", "class": "TextView", "text": "观景飘窗 · 45㎡", "bounds": [24, 174, 240, 202], "visible": true, "package": "com.example.hotel"}
+{"id": "5", "parent": "0", "class": "Button", "text": "预订高级大床房", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.hotel"}

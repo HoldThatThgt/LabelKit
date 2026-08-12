@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.sysnotify"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "系统通知", "bounds": [24, 20, 200, 56], "visible": true, "package": "com.example.sysnotify"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "应用商店：3 款应用已在后台完成更新", "bounds": [24, 90, 376, 142], "visible": true, "package": "com.example.sysnotify"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "存储空间：本周已清理 1.2GB 缓存", "bounds": [24, 152, 376, 204], "visible": true, "package": "com.example.sysnotify"}
+{"id": "4", "parent": "0", "class": "Button", "text": "查看详情", "bounds": [24, 700, 190, 760], "visible": true, "package": "com.example.sysnotify"}
+{"id": "5", "parent": "0", "class": "Button", "text": "全部忽略", "bounds": [210, 700, 376, 760], "visible": true, "package": "com.example.sysnotify"}

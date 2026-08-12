@@ -26,7 +26,8 @@ from labelkit.common.config.model import (
     DedupConfig,
     ConsoleConfig,
     EmbeddingProfile,
-    ExtractConfig, GenerateConfig, InputConfig, LLMProfile, OutputConfig,
+    ExtractConfig, FrameAnnotateConfig, FrameClassifyConfig, GenerateConfig,
+    InputConfig, LLMProfile, OutputConfig,
     QualityConfig,
     ResolvedConfig, Rubric, RunConfig, SegmentConfig, StitchConfig, StreamConfig,
     ToolConfig,
@@ -77,7 +78,9 @@ def make_cfg(tmp_path: Path, *, mode: str = "process", batch_size: int = 4,
              extract: ExtractConfig | None = None,
              trace: TraceConfig | None = None,
              modality: str = "text",
-             console: ConsoleConfig | None = None) -> ResolvedConfig:
+             console: ConsoleConfig | None = None,
+             frame_classify: FrameClassifyConfig | None = None,
+             frame_annotate: FrameAnnotateConfig | None = None) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
         console=console if console is not None else ConsoleConfig(),
@@ -113,7 +116,25 @@ def make_cfg(tmp_path: Path, *, mode: str = "process", batch_size: int = 4,
         project_path="project.toml",
         config_digest="sha256:c",
         project_digest="sha256:p",
+        frame_classify=(frame_classify if frame_classify is not None
+                        else FrameClassifyConfig()),
+        frame_annotate=(frame_annotate if frame_annotate is not None
+                        else FrameAnnotateConfig()),
     )
+
+
+def frame_classify_cfg() -> FrameClassifyConfig:
+    """v1.12：M1 形状的帧分类配置（帧类表 + fallback ∈ 表）。"""
+    return FrameClassifyConfig(
+        enabled=True, fallback_class="other",
+        classes=(ClassSpec(name="task_request", description="d"),
+                 ClassSpec(name="other", description="d")))
+
+
+def frame_annotate_cfg() -> FrameAnnotateConfig:
+    """v1.12：M1 形状的帧标注配置（指令 + 帧 Schema 恰一）。"""
+    return FrameAnnotateConfig(enabled=True, instruction="帧标注",
+                               schema_inline='{"type": "object"}')
 
 
 def classify_cfg(assignment: str = "single", classes: tuple[str, ...] = ("faq", "chat"),
@@ -1915,6 +1936,10 @@ async def test_stream_report_block_shape_and_counts_gating(tmp_path):
         "defects": {"label_mismatch": 0, "off_task_members": 1,
                     "missing_head": 0, "missing_tail": 0,
                     "missing_members": 0, "wrong_stitch": 0}}
+    # v1.12 门控（帧关方向）：帧开关全关 ⇒ 两子块不在场（上面的精确集合断言
+    # 已含此意，此处显式钉住键名）；帧开方向见
+    # test_stream_report_frame_subblocks_shape_position_and_gating。
+    assert "frame_classify" not in stream and "frame_annotate" not in stream
 
 
 async def test_stream_report_block_base_form_and_disabled_gating(tmp_path):
@@ -1930,6 +1955,8 @@ async def test_stream_report_block_base_form_and_disabled_gating(tmp_path):
                            "absorbed", "dropped_noise", "below_min_len",
                            "digest_poor_frames", "segment_failures"}
     assert stream["mean_episode_len"] == 2.0
+    # v1.12 门控（帧关方向）：基础八键形态即字节等价证明——两子块不在场。
+    assert "frame_classify" not in stream and "frame_annotate" not in stream
 
     cfg_off = make_cfg(tmp_path, batch_size=8)
     orch2, _, emitter2, _ = build(cfg_off, [ExactDedupStage()], [rec(1)])
@@ -1937,6 +1964,53 @@ async def test_stream_report_block_base_form_and_disabled_gating(tmp_path):
     assert "stream" not in emitter2.report
     for key in ("episodes", "absorbed", "dropped_noise"):
         assert key not in emitter2.report["counts"]
+
+
+async def test_stream_report_frame_subblocks_shape_position_and_gating(tmp_path):
+    """v1.12（spec §3.7 report 行，帧开方向）：frame_classify 子块 = {calls,
+    fallback, window_failures, skipped_degraded}，链序槽位 stitch 后、extract
+    前；frame_annotate 子块 = {annotated, skipped, failed, discarded}，extract
+    后、verify 前；计数读 frame_classify.*/frame_annotate.* 前缀，零基闭集；
+    单开关只出对应子块（帧关方向由前两测的精确集合断言守住）。"""
+    cfg = stitch_stream_cfg(tmp_path, batch_size=8, verify=True,
+                            extract=ExtractConfig(enabled=True),
+                            frame_classify=frame_classify_cfg(),
+                            frame_annotate=frame_annotate_cfg())
+    ingestor = FakeSessionIngestor([sess("s1", 1, 3)])
+    orch, metrics, emitter, _ = build(cfg, [StubSegmentStage()],
+                                      ingestor=ingestor)
+    # 帧 pass 侧计数器（M13/M5/M11 供给面），报表装配前预喂（既有子块测试同款）
+    metrics.counters["frame_classify.calls"] = 2
+    metrics.counters["frame_classify.fallback"] = 3
+    metrics.counters["frame_classify.window_failures"] = 1
+    metrics.counters["frame_annotate.annotated"] = 4
+    metrics.counters["frame_annotate.failed"] = 2
+    metrics.counters["frame_annotate.discarded"] = 5
+    await orch.run()
+
+    stream = emitter.report["stream"]
+    assert stream["frame_classify"] == {"calls": 2, "fallback": 3,
+                                        "window_failures": 1,
+                                        "skipped_degraded": 0}
+    assert stream["frame_annotate"] == {"annotated": 4, "skipped": 0,
+                                        "failed": 2, "discarded": 5}
+    keys = list(stream)
+    assert keys.index("frame_classify") == keys.index("stitch") + 1
+    assert keys.index("extract") == keys.index("frame_classify") + 1
+    assert keys.index("frame_annotate") == keys.index("extract") + 1
+    assert keys.index("verify") == keys.index("frame_annotate") + 1
+
+    # 单开关方向：只有对应子块在场（另一子块条件不在场）
+    cfg_c = stream_cfg(tmp_path, batch_size=8,
+                       frame_classify=frame_classify_cfg())
+    orch2, _, emitter2, _ = build(cfg_c, [StubSegmentStage()],
+                                  ingestor=FakeSessionIngestor([sess("s1", 1, 2)]))
+    await orch2.run()
+    stream2 = emitter2.report["stream"]
+    assert stream2["frame_classify"] == {"calls": 0, "fallback": 0,
+                                         "window_failures": 0,
+                                         "skipped_degraded": 0}   # 零基闭集
+    assert "frame_annotate" not in stream2
 
 
 async def test_stream_breaker_residual_includes_episodes_and_absorbed(tmp_path):
@@ -2069,13 +2143,16 @@ async def test_dry_run_stream_rules_strategy_zero_segment_calls(tmp_path, capsys
 
 async def test_dry_run_non_stream_prints_zero_segment_and_extract_calls(tmp_path, capsys):
     """The two new estimate keys print unconditionally (classify precedent):
-    0 with segment/extract disabled, non-stream branch otherwise unchanged."""
+    0 with segment/extract disabled, non-stream branch otherwise unchanged.
+    v1.12：帧粒度两键同享无条件打印（stitch_calls 先例）——非流工程恒 =0。"""
     cfg = make_cfg(tmp_path, batch_size=4, dry_run=True, annotate=True)
     orch, _, _, _ = build(cfg, [], [rec(i) for i in range(1, 11)])
     await orch.run()
     err = capsys.readouterr().err
     assert "segment_calls=0" in err
     assert "extract_calls=0" in err
+    assert "frame_classify_calls=0" in err
+    assert "frame_annotate_calls=0" in err
     assert "annotate_calls=10" in err
     assert "total=10" in err
 
@@ -2129,6 +2206,33 @@ async def test_chain_stitch_disabled_excludes_supplied_stage(tmp_path):
     orch, _, _, _ = build(cfg, stages, ingestor=ingestor)
     await orch.run()
     assert order == ["segment", "dedup"]
+
+
+async def test_chain_frame_only_or_gate_includes_classify_slot(tmp_path):
+    """v1.12 或门（SPEC §3.2，与 factory.build_stages 同口径）：classify.enabled
+    = false ∧ frame.classify.enabled = true 时 _compose_chain 的 classify 槽位
+    仍在链（槽位不变：dedup 后）；帧全关时保持排除（回归锚）。"""
+    from dataclasses import replace as _replace
+
+    from labelkit.common.config.model import FrameClassifyConfig
+
+    order: list[str] = []
+    base = stream_cfg(tmp_path, batch_size=8)
+    assert not base.classify.enabled            # 前提：序列级分类关闭
+    cfg = _replace(base, frame_classify=FrameClassifyConfig(
+        enabled=True, llm="default", fallback_class="other"))
+    stages = [Probe(n, order) for n in ("classify", "dedup", "segment")]
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
+    orch, _, _, _ = build(cfg, stages, ingestor=ingestor)
+    await orch.run()
+    assert order == ["segment", "dedup", "classify"]
+
+    order.clear()
+    stages2 = [Probe(n, order) for n in ("classify", "dedup", "segment")]
+    ingestor2 = FakeSessionIngestor([sess("s1", 1, 2)])
+    orch2, _, _, _ = build(base, stages2, ingestor=ingestor2)
+    await orch2.run()
+    assert order == ["segment", "dedup"]        # 帧全关 ⇒ classify 槽位仍被排除
 
 
 async def test_stitched_tally_threads_derivation_and_report_block(tmp_path):
@@ -2276,9 +2380,13 @@ async def test_dry_run_stitch_calls_zero_line_printed_unconditionally(tmp_path, 
 # ── v1.10: console bypass wiring (spec 3.10.3 console row; SPEC-tui-console
 #    U11/U13/U17/U19/U20/U27) ────────────────────────────────────────────────
 
+# v1.12：帧粒度两键按冻结键序折入——frame_classify_calls 紧跟 classify_calls，
+# frame_annotate_calls 紧跟 annotate_calls。
 _EST_KEYS = ("records", "batches", "generate_calls", "segment_calls",
-             "stitch_calls", "classify_calls", "extract_calls", "quality_calls",
-             "annotate_calls", "verify_calls", "total_calls")
+             "stitch_calls", "classify_calls", "frame_classify_calls",
+             "extract_calls", "quality_calls",
+             "annotate_calls", "frame_annotate_calls", "verify_calls",
+             "total_calls")
 
 
 class RecorderListener:
@@ -2327,9 +2435,11 @@ def test_estimate_run_process_text_full_dict_and_frozen_keys(tmp_path):
     assert tuple(est) == _EST_KEYS
     assert est == {
         "records": 10, "batches": 3, "generate_calls": 0, "segment_calls": 0,
-        "stitch_calls": 0, "classify_calls": 0, "extract_calls": 0,
+        "stitch_calls": 0, "classify_calls": 0, "frame_classify_calls": 0,
+        "extract_calls": 0,
         # pairwise: k*floor(b/2) per batch → 4*2 + 4*2 + 4*1 = 20
-        "quality_calls": 20, "annotate_calls": 10, "verify_calls": 0,
+        "quality_calls": 20, "annotate_calls": 10, "frame_annotate_calls": 0,
+        "verify_calls": 0,
         "total_calls": 30,
     }
 
@@ -2380,6 +2490,55 @@ def test_estimate_run_stitch_votes_and_repass_formula(tmp_path):
                              segment=SegmentConfig(enabled=True, strategy="rules"),
                              stitch=StitchConfig(enabled=True, repass=False))
     assert estimate_run(cfg2, plan)["stitch_calls"] == 2
+
+
+def test_estimate_run_frame_keys_formula_and_gating(tmp_path):
+    """v1.12（spec §3.7 estimate_run 行）：frame_classify_calls /
+    frame_annotate_calls = 预扫描帧总数 Σ session_lens 的粗上界（与
+    segment_calls 完全同源），并入 total_calls；对应开关关闭 ⇒ 0；返回键表
+    冻结键序（_EST_KEYS）含两新键。"""
+    plan = SimpleNamespace(estimated_records=26, session_lens=(21, 5))
+    cfg = stream_cfg(tmp_path, batch_size=8, annotate=True,
+                     segment=SegmentConfig(enabled=True, strategy="rules"),
+                     frame_classify=frame_classify_cfg(),
+                     frame_annotate=frame_annotate_cfg())
+    est = estimate_run(cfg, plan)
+    assert tuple(est) == _EST_KEYS
+    assert est["frame_classify_calls"] == 26       # Σ session_lens（帧总数上界）
+    assert est["frame_annotate_calls"] == 26
+    assert est["annotate_calls"] == 2              # episodes ≈ sessions（不变）
+    assert est["total_calls"] == 2 + 26 + 26       # annotate + 两个帧粒度上界
+
+    # 单开关：另一键归零
+    cfg_c = stream_cfg(tmp_path, batch_size=8, annotate=True,
+                       segment=SegmentConfig(enabled=True, strategy="rules"),
+                       frame_classify=frame_classify_cfg())
+    est_c = estimate_run(cfg_c, plan)
+    assert est_c["frame_classify_calls"] == 26
+    assert est_c["frame_annotate_calls"] == 0
+
+    # 全关（默认）⇒ 两键恒 0，total 与 v1.11 数值一致
+    cfg_off = stream_cfg(tmp_path, batch_size=8, annotate=True,
+                         segment=SegmentConfig(enabled=True, strategy="rules"))
+    est_off = estimate_run(cfg_off, plan)
+    assert est_off["frame_classify_calls"] == 0
+    assert est_off["frame_annotate_calls"] == 0
+    assert est_off["total_calls"] == 2
+
+
+async def test_dry_run_frame_calls_printed_with_switches_on(tmp_path, capsys):
+    """v1.12：帧开关开启时估算行按冻结键序携带两键的帧总数上界，并计入 total。"""
+    cfg = stream_cfg(tmp_path, batch_size=8, dry_run=True, annotate=True,
+                     segment=SegmentConfig(enabled=True, strategy="rules"),
+                     frame_classify=frame_classify_cfg(),
+                     frame_annotate=frame_annotate_cfg())
+    ingestor = FakeSessionIngestor(session_lens=(21, 5))
+    orch, _, _, _ = build(cfg, [], ingestor=ingestor)
+    await orch.run()
+    err = capsys.readouterr().err
+    assert ("classify_calls=0 frame_classify_calls=26 extract_calls=0" in err)
+    assert ("annotate_calls=2 frame_annotate_calls=26 verify_calls=0" in err)
+    assert "total=54" in err
 
 
 def test_estimate_run_generate_only_static_formulas_with_plan_none(tmp_path):
@@ -2531,8 +2690,9 @@ async def test_dry_run_plain_with_listener_prints_byte_identical(tmp_path, capsy
     assert lines == [
         "dry-run: mode=process estimated_records=3 batches=1",
         "dry-run: estimated LLM calls — generate_calls=0 segment_calls=0 "
-        "stitch_calls=0 classify_calls=0 extract_calls=0 quality_calls=0 "
-        "annotate_calls=3 verify_calls=0 total=3 "
+        "stitch_calls=0 classify_calls=0 frame_classify_calls=0 "
+        "extract_calls=0 quality_calls=0 "
+        "annotate_calls=3 frame_annotate_calls=0 verify_calls=0 total=3 "
         "(excludes retries and repair calls)",
         "dry-run: no LLM calls made, no output written (report only)",
     ]
@@ -2878,8 +3038,9 @@ async def test_dry_run_stream_budget_large_window_byte_identical(
         tmp_path, capsys):
     """V26 anchor: w_min > window → estimate values AND the stream note stay
     byte-identical to the budget-off run (no appended sentence) — the
-    mechanism that keeps the five dry-run goldens frozen under the examples'
-    131072 declaration."""
+    mechanism that keeps the seven dry-run goldens (v1.12: five re-sampled +
+    dryrun-mix.txt / dryrun-mix-text.txt) frozen under the examples' 131072
+    declaration."""
     cfg = budget_stream_cfg(tmp_path, 131072, batch_size=8, dry_run=True,
                             annotate=True, extract=ExtractConfig(enabled=True))
     ingestor = FakeSessionIngestor(session_lens=(21, 5))

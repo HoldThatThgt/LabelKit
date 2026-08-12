@@ -95,6 +95,19 @@ class PipelineItem:                   # 唯一可变信封；生命周期 = 一�
                                       #   中的下标，与 Transition.index / steps[].index 同坐标、
                                       #   值域 [0, len(members)−2]，与 _meta.stream.order_span 的
                                       #   会话序键空间无换算关系（3.16.4；_fan_out 同复制）
+    member_classifications: dict[str, Classification] | None = None
+                                      # v1.12 只增：M13 帧级批量判决写入（首标签序列信封，3.13.7）；
+                                      #   键 = 成员 record.id、值恒单标签（labels = (label,)，
+                                      #   source ∈ {"llm","fallback"}）；None = 帧 pass 未运行
+                                      #   （帧分类关闭 / 降格会话 / 非首标签克隆）——幂等门 is None；
+                                      #   扇出克隆按引用共享同一 dict（record/dedup 同族，3.13.7）
+    member_annotations: dict[str, Annotation] | None = None
+                                      # v1.12 只增：M5 帧级逐帧标注写入（同一执行门，3.5.5）；
+                                      #   键 = 成员 record.id；值语义 = 单一真相（emitter 三值判定
+                                      #   直读 dict 形态，3.11.2）：占键 Annotation = annotated、
+                                      #   占键 None = failed（成员标注不可修复）、缺键 = skipped
+                                      #   （跳过类）、dict 本身 None = 帧 pass 未运行；克隆按引用
+                                      #   共享（同上）；M7 手术同步随成员集删键/补跑（3.7.3）
 ```
 
 ## 4.2 阶段结果类型
@@ -184,6 +197,8 @@ LabelKitError
  ├─ SchemaViolation(errors, raw_last_output)   # M8，记录级
  └─ InternalError                              # 不变量破坏（如 M11 终检失败）
 ```
+
+**帧粒度与 Stage 契约（v1.12 零改动声明）**：帧级分类/标注（3.13.7、3.5.5）对本契约**零改动**——契约例外维持 ②a/②b/②c 三条原文，不新增例外条款：帧产物只写入信封自身的 `member_classifications` / `member_annotations` 两字段（属 ①④ 的正常字段写入），不改成员帧状态机（成员保持 `absorbed`）、不增删列表元素、不改链序与守恒恒等式（6.4）。**克隆共享语义补注**（②a 的 v1.12 侧注）：classify multi 扇出克隆对两字段**按引用共享**（与 `record` / `dedup` 同族，3.13.7 扇出共享行）——帧产物描述成员帧本身而非信封路由，原/克隆行渲染同一 dict；帧级两 pass 只在首标签信封上执行（克隆判据 = `classification.label != classification.labels[0]`，verify S8 同款），M7 帧产物同步亦无克隆分支（克隆信封永不手术，3.7.3）；手术后原/克隆行 members 分叉由既有 `repaired` 位消歧（6.3 补注）。
 
 `UITree.serialize()` 的规范定义（M3 去重与 M5 提示词共用，M3 传 `quantize_px=dedup.bounds_quantize_px`）：深度优先遍历可见节点；每行 = `" "*depth + role + (' "'+text+'"' if text) + (' desc="'+content_desc+'"' if content_desc) + ' ['+l,t,r,b+']' + 非空 extra 的 k=v 列表`；坐标除以 quantize_px 取整（0 = 不量化）；超长截断规则见 3.5.2。该线性化即 ScreenAI 的 screen-schema 表示思想 [13]。
 

@@ -1,0 +1,6 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.food"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "金牌黄焖鸡", "bounds": [24, 20, 220, 56], "visible": true, "package": "com.example.food"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "黄焖鸡米饭 ¥38", "bounds": [24, 90, 300, 126], "visible": true, "package": "com.example.food"}
+{"id": "3", "parent": "0", "class": "TextView", "text": "月售 1200+ 好评率 99%", "bounds": [24, 134, 300, 162], "visible": true, "package": "com.example.food"}
+{"id": "4", "parent": "0", "class": "TextView", "text": "招牌黄焖鸡块 配米饭一份", "bounds": [24, 170, 340, 198], "visible": true, "package": "com.example.food"}
+{"id": "5", "parent": "0", "class": "Button", "text": "选规格", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.food"}

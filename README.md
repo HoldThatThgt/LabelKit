@@ -36,7 +36,7 @@ uv run labelkit validate --config ../config.toml --project project.toml --probe
 uv run labelkit run      --config ../config.toml --project project.toml
 ```
 
-几分钟后得到主输出（每行 = 你的 Schema 字段 + 可选 `_meta` 履历）、拒绝通道与运行报告。示例工程按**输入格式**分三个，各自把该格式下能开的算子全部打开：纯文本 JSONL（`examples/text`：去重 → 分类与按类条件化 → 打分门控 → 过门种子扩充生成回流 → 标注 → 评审修复；`project-synth.toml` 变体为无输入的纯生成模式）、UI 截图 + 控件树文件对（`examples/ui`：配对接入 → pHash/树去重 → 视觉分类 → pairwise QuRating → 多模态标注 → 评审修复）、时序流（`examples/stream`：`project.toml` 为 53 帧五会话穿插 UI 流——分段 → 线索缝合（短段救援 + 二遍复评）→ 去重 → 序列分类 → 动作摘取（接缝占位）→ 轨迹打分 → 序列标注 → 缺陷评审修复；`project-text.toml` 为带时间戳的纯文本请求流——meta:ts 排序 + gap 会话化走同链）。
+几分钟后得到主输出（每行 = 你的 Schema 字段 + 可选 `_meta` 履历）、拒绝通道与运行报告。示例工程共四个，前三个按**输入格式**组织、各自把该格式下能开的算子全部打开：纯文本 JSONL（`examples/text`：去重 → 分类与按类条件化 → 打分门控 → 过门种子扩充生成回流 → 标注 → 评审修复；`project-synth.toml` 变体为无输入的纯生成模式）、UI 截图 + 控件树文件对（`examples/ui`：配对接入 → pHash/树去重 → 视觉分类 → pairwise QuRating → 多模态标注 → 评审修复）、时序流（`examples/stream`：`project.toml` 为 53 帧五会话穿插 UI 流——分段 → 线索缝合（短段救援 + 二遍复评）→ 去重 → 序列分类 → 动作摘取（接缝占位）→ 轨迹打分 → 序列标注 → 缺陷评审修复；`project-text.toml` 为带时间戳的纯文本请求流——meta:ts 排序 + gap 会话化走同链）。第四个 `examples/mix` 是 **UI 控件树双粒度上手示例（DeepSeek + z.ai 双端点）+ 文本姊妹（纯 DeepSeek）**：主工程 `project.toml` 在截图 + 控件树时间序流（17 帧对、三会话，含 transition 帧类跳过标注、form_screen 按帧类覆盖指令、复刻会话判重与通知插入屏噪声埋点）上一次运行同出帧级分类 + 按帧类标注与序列级意图标注，文本判决阶段走 DeepSeek、视觉必需阶段走 z.ai；姊妹工程 `project-text.toml` 是纯 DeepSeek 的文本请求流最低成本形态。独立自带 `config.toml`（密钥经环境变量 `LABELKIT_DEEPSEEK_KEY` 与 `LABELKIT_ZAI_KEY` 进入；config 在本目录，非 `../config.toml`）——运行 `cd examples/mix && mkdir -p out && uv run labelkit run --config config.toml --project project.toml`（UI 主工程）或 `uv run labelkit run --config config.toml --project project-text.toml`（文本姊妹）。
 
 ## 文档
 

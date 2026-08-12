@@ -26,6 +26,8 @@ from labelkit.common.config.model import (
     DedupConfig,
     EmbeddingProfile,
     ExtractConfig,
+    FrameAnnotateConfig,
+    FrameClassifyConfig,
     GenerateConfig,
     InputConfig,
     LLMProfile,
@@ -115,6 +117,7 @@ EXPECTED_TEST_PY = {
     "tests/integration/test_annotate_llm.py",
     "tests/integration/test_budget_llm.py",
     "tests/integration/test_classify_llm.py",
+    "tests/integration/test_frame_llm.py",         # v1.12 (SPEC-frame-annotation §3.9)
     "tests/integration/test_generate_llm.py",
     "tests/integration/test_key_pool_llm.py",
     "tests/integration/test_llm_client_llm.py",
@@ -218,8 +221,11 @@ def test_package_layout_dependency_direction():
 
         if relative.startswith("labelkit/operators/"):
             own_module = relative.removesuffix(".py").replace("/", ".")
+            # verify 的修复面懒加载白名单（CONTRACTS §1.1）：v1.12 第四向
+            # classify.classify_frames（帧产物回收补跑）加入，3→4。
             allowed_operator_calls = {
                 "labelkit.operators.annotate",
+                "labelkit.operators.classify",
                 "labelkit.operators.extract",
                 "labelkit.operators.segment",
             } if own_module == "labelkit.operators.verify" else set()
@@ -536,6 +542,20 @@ def test_build_stages_without_classify_unchanged():
     assert [s.name for s in stages] == ["dedup", "quality", "annotate"]
 
 
+def test_build_stages_frame_only_or_gate_includes_classify_stage():
+    """v1.12 或门（SPEC §3.2）：classify.enabled=false ∧ frame.classify.enabled=true
+    时 ClassifyStage 仍进链承载帧 pass（槽位不变：dedup 后、quality 前）；
+    序列级判决由 stage 内 classify.enabled 门静默跳过（test_classify 守护）。"""
+    from labelkit.operators.classify import ClassifyStage
+
+    cfg = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+               frame_classify=FrameClassifyConfig(enabled=True, llm="default"))
+    stages = build_stages(cfg)
+    assert [s.name for s in stages] == ["segment", "dedup", "classify",
+                                        "quality", "annotate"]
+    assert isinstance(stages[2], ClassifyStage)
+
+
 # ── v1.8 stream (S30 reference sets + chain slots §7.9/§7.12) ───────────────
 
 
@@ -604,6 +624,35 @@ def test_referenced_profiles_stitch_enabled_only():
 
     off = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
                stitch=StitchConfig(enabled=False, llm="judge"))
+    assert referenced_profiles(off)[0] == ["default"]
+
+
+# ── v1.12 frame granularity (帧级两 llm 键入探测集；vision 集分列见 test_config) ──
+
+
+def test_referenced_profiles_frame_classify_enabled_only():
+    """v1.12: frame.classify.llm joins the probe set iff enabled; slot follows
+    the chain order — right after sequence-level classify."""
+    on = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+              classify=_classify_cfg(llm="default"),
+              frame_classify=FrameClassifyConfig(enabled=True, llm="judge"))
+    assert referenced_profiles(on)[0] == ["default", "judge"]
+
+    off = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+               frame_classify=FrameClassifyConfig(enabled=False, llm="judge"))
+    assert referenced_profiles(off)[0] == ["default"]
+
+
+def test_referenced_profiles_frame_annotate_enabled_only():
+    """v1.12: frame.annotate.llm joins the probe set iff enabled; slot follows
+    the chain order — right after sequence-level annotate."""
+    on = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+              frame_annotate=FrameAnnotateConfig(enabled=True, llm="judge",
+                                                 instruction="标注帧意图"))
+    assert referenced_profiles(on)[0] == ["default", "judge"]
+
+    off = _cfg(segment=SegmentConfig(enabled=True, strategy="rules"),
+               frame_annotate=FrameAnnotateConfig(enabled=False, llm="judge"))
     assert referenced_profiles(off)[0] == ["default"]
 
 

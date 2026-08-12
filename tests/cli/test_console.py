@@ -270,6 +270,61 @@ def test_stage_board_bracket_attribution_and_symbols(_finalize_renderers):
     assert "annotate ·" in text
 
 
+def test_stage_call_keys_frozen_sum_mapping():
+    """v1.12：_STAGE_CALL_KEYS 冻结为多键求和映射——classify/annotate 折入
+    帧粒度调用键，其余段保持单键；_ESTIMATE_CALL_KEYS 按 estimate_run 冻结
+    键序含两新键。"""
+    assert console_mod._STAGE_CALL_KEYS == {
+        "segment": ("segment_calls",),
+        "stitch": ("stitch_calls",),
+        "classify": ("classify_calls", "frame_classify_calls"),
+        "extract": ("extract_calls",),
+        "quality": ("quality_calls",),
+        "generate": ("generate_calls",),
+        "annotate": ("annotate_calls", "frame_annotate_calls"),
+        "verify": ("verify_calls",),
+    }
+    assert console_mod._ESTIMATE_CALL_KEYS == (
+        "generate_calls", "segment_calls", "stitch_calls", "classify_calls",
+        "frame_classify_calls", "extract_calls", "quality_calls",
+        "annotate_calls", "frame_annotate_calls", "verify_calls")
+
+
+def test_stage_board_sums_frame_keys_into_classify_and_annotate(_finalize_renderers):
+    """v1.12：段棋盘分母＝多键求和——classify 分母 = classify_calls +
+    frame_classify_calls，annotate 同理；单键段（quality）行为不变；帧键缺位
+    的估算字典退回单键分母（v1.10 行为）。"""
+    cfg = _cfg(RICH, segment=SegmentConfig(enabled=True),
+               classify=ClassifyConfig(enabled=True))
+    renderer, _ = _rich_renderer(cfg)
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+    renderer.on_estimate({"records": 26, "batches": 1, "segment_calls": 3,
+                          "classify_calls": 2, "frame_classify_calls": 26,
+                          "quality_calls": 20,
+                          "annotate_calls": 2, "frame_annotate_calls": 26,
+                          "total_calls": 79})
+    renderer.on_event(_ev("batch.start", batch=1, payload={"size": 26}))
+    renderer.on_stage("classify", 1)
+    renderer.on_event(_ev("llm.call", batch=1, stage="llm"))
+    renderer.on_event(_ev("llm.call", batch=1, stage="llm"))
+    renderer.on_event(_ev("llm.call", batch=1, stage="llm"))
+    assert "classify ▶ 3/28" in _canvas(renderer)   # 2 + 26 求和分母
+
+    renderer.on_stage("annotate", 1)
+    renderer.on_event(_ev("llm.call", batch=1, stage="llm"))
+    assert "annotate ▶ 1/28" in _canvas(renderer)   # 2 + 26 求和分母
+
+    renderer.on_stage("quality", 1)
+    renderer.on_event(_ev("llm.call", batch=1, stage="llm"))
+    assert "quality ▶ 1/20" in _canvas(renderer)    # 单键段行为不变
+
+    # 帧键缺位（v1.10 形估算字典）⇒ classify 分母退回单键值
+    renderer._est = {"records": 26, "batches": 1, "classify_calls": 2}
+    renderer.on_stage("classify", 1)
+    assert "classify ▶ 3/2" in _canvas(renderer)
+
+
 def test_keyboard_toggles_l_e_and_help(_finalize_renderers):
     renderer, _ = _rich_renderer(_cfg(RICH), snapshot=_pool_snapshot)
     _finalize_renderers.append(renderer)
@@ -565,30 +620,37 @@ def test_dry_run_rich_renders_estimate_tables(_finalize_renderers):
     _finalize_renderers.append(renderer)
     renderer.on_event(_ev("run.start"))
     assert renderer._live_started is False   # dry path never starts a Live
+    # v1.12：估算字典按冻结键序携带帧粒度两键（rich 估算表等价性）
     est = {"records": 53, "batches": 2, "generate_calls": 0, "segment_calls": 5,
-           "stitch_calls": 10, "classify_calls": 5, "extract_calls": 48,
-           "quality_calls": 20, "annotate_calls": 5, "verify_calls": 5,
-           "total_calls": 98}
+           "stitch_calls": 10, "classify_calls": 5, "frame_classify_calls": 53,
+           "extract_calls": 48,
+           "quality_calls": 20, "annotate_calls": 5, "frame_annotate_calls": 53,
+           "verify_calls": 5,
+           "total_calls": 204}
     renderer.on_estimate(est)
     renderer.on_event(_ev("run.end", payload={"counts": {}, "exit_code": 0}))
     text = buf.getvalue()
     assert "dry-run 估算" in text
     assert "estimated_records" in text and "53" in text
     for key in ("generate_calls", "segment_calls", "stitch_calls",
-                "classify_calls", "extract_calls", "quality_calls",
-                "annotate_calls", "verify_calls"):
+                "classify_calls", "frame_classify_calls", "extract_calls",
+                "quality_calls", "annotate_calls", "frame_annotate_calls",
+                "verify_calls"):
         assert key in text, key
-    assert "98" in text and "total" in text
+    assert "204" in text and "total" in text
     assert "no LLM calls made, no output written (report only)" in text
     assert "dry-run:" not in text            # the plain-anchor prefix is not ours
 
 
 # ── U24 layer ② — dry-run golden files (spec §7.8 回归锚 row) ───────────────
 #
-# The five goldens under tests/cli/goldens/ were captured from the v1.9 HEAD
-# baseline (pre-v1.10) and verified identical against the current tree; this
-# test keeps the plain dry-run stderr byte-anchored to them forever. Real
-# example fixtures are scanned (M2), but NO LLM call is made (dry-run).
+# The seven goldens under tests/cli/goldens/ keep the plain dry-run stderr
+# byte-anchored forever: the original five date to the v1.9 HEAD baseline and
+# were re-captured at v1.12 (the estimate line gained the two frame keys —
+# 裁决·估算上界与六 golden); dryrun-mix.txt (the examples/mix UI main project,
+# both frame passes on) and dryrun-mix-text.txt (its pure-DeepSeek text
+# sibling) are the v1.12-born mix pair. Real example fixtures are scanned
+# (M2), but NO LLM call is made (dry-run).
 
 _EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 _GOLDENS = Path(__file__).parent / "goldens"
@@ -600,14 +662,20 @@ _GOLDENS = Path(__file__).parent / "goldens"
     ("ui", "project.toml", "dryrun-ui.txt"),
     ("stream", "project.toml", "dryrun-stream.txt"),
     ("stream", "project-text.toml", "dryrun-stream-text.txt"),
+    ("mix", "project.toml", "dryrun-mix.txt"),
+    ("mix", "project-text.toml", "dryrun-mix-text.txt"),
 ])
 def test_dry_run_plain_golden_files(subdir, project, golden,
                                     monkeypatch, tmp_path, capsys):
     from labelkit.cli.main import main
 
     monkeypatch.setenv("LABELKIT_ZAI_KEY", "dummy")     # referenced, never used
+    monkeypatch.setenv("LABELKIT_DEEPSEEK_KEY", "dummy")  # mix 同款 dummy（v1.12）
     monkeypatch.chdir(_EXAMPLES / subdir)
-    code = main(["run", "--config", "../config.toml", "--project", project,
+    # examples/mix 独立成套（两工程同用本目录 config.toml——DeepSeek+z.ai
+    # 双端点，§3.8）；其余五例共享 ../config.toml。
+    config = "config.toml" if subdir == "mix" else "../config.toml"
+    code = main(["run", "--config", config, "--project", project,
                  "--output", str(tmp_path / "o.jsonl"),
                  "--dry-run", "--console", "plain"])
     assert code == 0

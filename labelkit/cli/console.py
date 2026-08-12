@@ -106,20 +106,25 @@ _monotonic = time.monotonic
 # The orchestrator's canonical chain order (spec §2.3 / _compose_chain).
 _CHAIN_ORDER = ("segment", "stitch", "dedup", "classify", "extract",
                 "quality", "generate", "annotate", "verify")
-# Stage → estimate_run() denominator key (U20). dedup makes no LLM calls.
-_STAGE_CALL_KEYS: dict[str, str] = {
-    "segment": "segment_calls",
-    "stitch": "stitch_calls",
-    "classify": "classify_calls",
-    "extract": "extract_calls",
-    "quality": "quality_calls",
-    "generate": "generate_calls",
-    "annotate": "annotate_calls",
-    "verify": "verify_calls",
+# Stage → estimate_run() denominator keys (U20). dedup makes no LLM calls.
+# v1.12（spec §3.7 console 行）：改为可多键求和的分母映射——classify/annotate
+# 折入帧粒度调用键（帧 pass 住同一段内，llm.call 分子天然归段），其余段保持
+# 单键行为字节不变；面板零新行。
+_STAGE_CALL_KEYS: dict[str, tuple[str, ...]] = {
+    "segment": ("segment_calls",),
+    "stitch": ("stitch_calls",),
+    "classify": ("classify_calls", "frame_classify_calls"),
+    "extract": ("extract_calls",),
+    "quality": ("quality_calls",),
+    "generate": ("generate_calls",),
+    "annotate": ("annotate_calls", "frame_annotate_calls"),
+    "verify": ("verify_calls",),
 }
+# v1.12：帧粒度两键按 estimate_run 冻结键序折入（rich 估算表等价性）。
 _ESTIMATE_CALL_KEYS = ("generate_calls", "segment_calls", "stitch_calls",
-                       "classify_calls", "extract_calls", "quality_calls",
-                       "annotate_calls", "verify_calls")
+                       "classify_calls", "frame_classify_calls",
+                       "extract_calls", "quality_calls", "annotate_calls",
+                       "frame_annotate_calls", "verify_calls")
 
 _BAR_CELLS = 24                    # batch progress bar width (§3.2 mockup)
 _NARROW_COLS = 60                  # < 60 cols → single-line degradation (§3.1)
@@ -890,13 +895,13 @@ class ConsoleRenderer:
     def _board_line(self) -> str:
         parts = []
         for name in self._chain:
-            call_key = _STAGE_CALL_KEYS.get(name)
+            call_keys = _STAGE_CALL_KEYS.get(name)
             if name == self._current_stage:
-                if call_key is None:               # dedup: no LLM calls
+                if call_keys is None:              # dedup: no LLM calls
                     parts.append(f"{name} ▶")
                 else:
                     a = self._stage_calls.get(name, 0)
-                    denom = self._est.get(call_key) if self._est else None
+                    denom = self._stage_denominator(call_keys)
                     parts.append(f"{name} ▶ {a}/{denom}" if denom is not None
                                  else f"{name} ▶ {a}")
             elif name in self._stages_seen:
@@ -904,6 +909,14 @@ class ConsoleRenderer:
             else:
                 parts.append(f"{name} ·")
         return " 段  " + "   ".join(parts)
+
+    def _stage_denominator(self, call_keys: tuple[str, ...]) -> int | None:
+        """v1.12：段棋盘分母＝映射键求和（classify/annotate 折入帧粒度调用数）；
+        估算键全部缺位 ⇒ 无分母（单键段与 v1.10 行为逐字节一致）。"""
+        if self._est is None:
+            return None
+        values = [self._est[key] for key in call_keys if key in self._est]
+        return sum(values) if values else None
 
     def _account_line(self, counters: Mapping[str, int]) -> str:
         acc = self._acc

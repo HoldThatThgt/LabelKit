@@ -311,6 +311,8 @@ class TestStreamEnvelopeFields:
         assert item.transitions is None
         assert item.session_id is None
         assert item.thread_id is None          # v1.9: unstamped until M16
+        assert item.member_classifications is None   # v1.12: unwritten until M13 帧 pass
+        assert item.member_annotations is None       # v1.12: unwritten until M5 帧 pass
 
     def test_pipeline_item_stream_fields_writable(self):
         item = PipelineItem(record=_record())
@@ -337,6 +339,21 @@ class TestStreamEnvelopeFields:
                                  defects=({"kind": "missing_tail", "members": None,
                                            "position": "tail", "detail": "缺尾帧"},))
         assert vr2.defects[0]["kind"] == "missing_tail"
+
+    def test_pipeline_item_frame_products_default_and_write(self):
+        # v1.12：两帧产物 dict 字段——默认 None（未写入），键 = 成员 record.id；
+        # member_annotations 值允许 None（failed 占键为 None，skipped 不占键）。
+        a = PipelineItem(record=_record("a" * 16))
+        b = PipelineItem(record=_record("b" * 16))
+        a.member_classifications = {
+            "c" * 16: Classification(label="task_request", labels=("task_request",),
+                                     source="llm", detail={})}
+        a.member_annotations = {"c" * 16: None}        # failed 占键为 None
+        assert a.member_classifications["c" * 16].label == "task_request"
+        assert a.member_annotations == {"c" * 16: None}
+        # 默认值互不共享（field default 是 None 而非可变容器，天然独立）
+        assert b.member_classifications is None
+        assert b.member_annotations is None
 
 
 # ── v1.8 shared frame helpers: frame_digest / digest_is_poor / tree_diff ────

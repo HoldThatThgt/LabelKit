@@ -19,8 +19,10 @@ from labelkit.operators.annotate import (
     _majority_vote,
     _member_digest_lines,
     _voted_keys,
+    annotate_member,
     annotate_record,
     build_annotate_prompt,
+    build_frame_annotate_prompt,
 )
 from labelkit.common.config.model import (
     AnnotateConfig,
@@ -31,6 +33,8 @@ from labelkit.common.config.model import (
     DedupConfig,
     ExtractConfig,
     FewShotExample,
+    FrameAnnotateConfig,
+    FrameClassView,
     GenerateConfig,
     InputConfig,
     OutputConfig,
@@ -46,13 +50,16 @@ from labelkit.common.config.model import (
     VerifyConfig,
 )
 from labelkit.common.contracts.types import (
+    Annotation,
     Classification,
     ImageRef,
+    PipelineItem,
     Record,
     RecordRef,
     Transition,
     UINode,
     UITree,
+    Usage,
     frame_digest,
 )
 
@@ -1184,3 +1191,468 @@ def test_budget_off_no_degrade_and_precise_kinds():
     _asyncio.run(AnnotateStage(cfg)._annotate_item(item2, ctx2))
     assert item2.errors[0].kind == "output_truncated"
     assert "budget.overflow_records" not in ctx2.metrics.counters
+
+
+# ── v1.12 frame-level per-member annotation (SPEC-frame-annotation §3.3) ─────
+
+from labelkit.common.errors import SchemaViolation
+
+FRAME_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intent": {"type": "string"},
+        "entities": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["intent", "entities"],
+    "additionalProperties": False,
+}
+FRAME_SCHEMA_TEXT = json.dumps(FRAME_SCHEMA, ensure_ascii=False,
+                               separators=(", ", ": "))
+FRAME_INSTRUCTION = "标注该帧的意图与实体。"
+FRAME_OVERRIDE_INSTRUCTION = "标注任务请求帧：给出 intent 与 entities。"
+FRAME_EXAMPLE = FewShotExample(
+    input="帮我订明天去上海的高铁",
+    output={"intent": "book_train", "entities": ["上海", "明天"]})
+
+
+def make_frame_cfg(*, frame_examples=(), views=None, classified=False,
+                   **kw) -> ResolvedConfig:
+    """make_cfg（或 classified=True 时 make_classified_cfg）+ 帧粒度三件套：
+    frame_annotate 开、frame_class_views、frame_schema 解析产物。"""
+    base = make_classified_cfg(**kw) if classified else make_cfg(**kw)
+    return _dc_replace(
+        base,
+        frame_annotate=FrameAnnotateConfig(
+            enabled=True, llm="default", instruction=FRAME_INSTRUCTION,
+            examples=tuple(frame_examples),
+            schema_inline=json.dumps(FRAME_SCHEMA)),
+        frame_class_views=views or {},
+        frame_schema=FRAME_SCHEMA)
+
+
+def frame_views(*, skip_chitchat=True):
+    """三个帧类视图：task_request 覆盖指令 + few-shot；chitchat 默认跳过
+    （enabled=false 省成本面）；other 零覆盖（继承全局）。"""
+    return {
+        "task_request": FrameClassView(instruction=FRAME_OVERRIDE_INSTRUCTION,
+                                       examples=(FRAME_EXAMPLE,), enabled=True),
+        "chitchat": FrameClassView(instruction=FRAME_INSTRUCTION, examples=(),
+                                   enabled=not skip_chitchat),
+        "other": FrameClassView(instruction=FRAME_INSTRUCTION, examples=(),
+                                enabled=True),
+    }
+
+
+def member_cls(label: str) -> Classification:
+    return Classification(label=label, labels=(label,), source="llm", detail={})
+
+
+class _FrameEngine:
+    """捕获全部调用（profile/prompt/schema/record_ids）；fail_ids 内的 id 抛
+    SchemaViolation（修复穷尽形）。schema=None = 序列级用户 Schema 调用，
+    非 None = 帧级显式 Schema 调用——两路由靠该参数区分。"""
+    user_schema_text = SCHEMA_TEXT
+
+    def __init__(self, fail_ids=(), frame_output=None):
+        self.calls = []      # (profile, prompt, schema, record_ids)
+        self.fail_ids = set(fail_ids)
+        self.frame_output = frame_output or {"intent": "book_train",
+                                             "entities": ["上海"]}
+
+    async def complete_validated(self, profile, prompt, schema=None, *,
+                                 record_ids, batch_no, record=None):
+        self.calls.append((profile, prompt, schema, record_ids))
+        if record_ids and record_ids[0] in self.fail_ids:
+            raise SchemaViolation(["/intent: 枚举违规"], "{}")
+        if schema is None:                   # sequence-level user-schema call
+            return ({"intent": "qa", "topic": "t", "difficulty": "easy"},
+                    Usage(1, 1), 1, "m")
+        return (dict(self.frame_output), Usage(1, 1), 2, "m")
+
+    def frame_calls(self):
+        return [c for c in self.calls if c[2] is not None]
+
+
+class _FrameMetrics:
+    def __init__(self):
+        self.events = []     # (ev, record_ids, payload)
+        self.counters: dict[str, int] = {}
+
+    def event(self, ev, **kw):
+        self.events.append((ev, tuple(kw.get("record_ids") or ()),
+                            dict(kw.get("payload") or {})))
+
+    def count(self, key, n=1):
+        self.counters[key] = self.counters.get(key, 0) + n
+
+
+def run_annotate_item(cfg, item, engine=None, metrics=None):
+    engine = engine or _FrameEngine()
+    metrics = metrics or _FrameMetrics()
+    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    _asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
+    return engine, metrics
+
+
+def frame_event_payloads(metrics):
+    return [(ids, p) for ev, ids, p in metrics.events if ev == "annotate.frame"]
+
+
+def text_episode(n: int = 3, ep_id: str = "ep0001") -> Record:
+    return make_episode(tuple(text_member(i) for i in range(n)), ep_id)
+
+
+# ── frame prompt assembly (§10.13 形态) ──────────────────────────────────────
+
+def test_frame_prompt_text_sections_schema_embedding_and_few_shot():
+    cfg = make_frame_cfg(frame_examples=(FRAME_EXAMPLE,))
+    member = text_member(0)
+    bundle = build_frame_annotate_prompt(member, cfg, FRAME_SCHEMA_TEXT)
+
+    # 段序：system → few-shot（每条一条 user 消息）→ 成员内容
+    assert [m.role for m in bundle.messages] == ["system", "user", "user"]
+    assert bundle.messages[0].parts[0].text == (
+        "[任务]\n标注该帧的意图与实体。\n"
+        "输出必须是符合以下 JSON Schema 的单个 JSON 对象，不输出任何其他内容：\n"
+        + FRAME_SCHEMA_TEXT
+    )
+    assert bundle.messages[1].parts[0].text == (
+        "[示例输入] 帮我订明天去上海的高铁\n[示例输出] "
+        '{"intent": "book_train", "entities": ["上海", "明天"]}'
+    )
+    (part,) = bundle.messages[2].parts
+    assert part.text == "[成员帧] 步骤文本0"
+    # 无自洽采样、无独立图像尺寸：profile 默认温度、工作点 px
+    assert bundle.temperature is None and bundle.image_px is None
+
+
+def test_frame_prompt_ui_three_parts_and_tree_cap():
+    cfg = make_frame_cfg(modality="ui")
+    member = ui_member(2)
+    bundle = build_frame_annotate_prompt(member, cfg, FRAME_SCHEMA_TEXT)
+    msg = bundle.messages[-1]
+    assert [p.kind for p in msg.parts] == ["text", "image", "text"]
+    assert msg.parts[0].text == "[屏幕截图]"
+    assert msg.parts[1].image is member.image
+    expected_tree = member.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars)
+    assert msg.parts[2].text == "[UI 控件树]\n" + expected_tree
+
+    capped = make_frame_cfg(modality="ui", ui_tree_max_chars=40)
+    body = (build_frame_annotate_prompt(member, capped, FRAME_SCHEMA_TEXT)
+            .messages[-1].parts[2].text.removeprefix("[UI 控件树]\n"))
+    assert len(body) <= 40
+    assert "…(truncated" in body
+
+
+def test_frame_prompt_class_view_override_and_global_fallback():
+    cfg = make_frame_cfg(views=frame_views())
+    member = text_member(1)
+    over = build_frame_annotate_prompt(member, cfg, FRAME_SCHEMA_TEXT,
+                                       label="task_request")
+    assert over.messages[0].parts[0].text.startswith(
+        "[任务]\n" + FRAME_OVERRIDE_INSTRUCTION + "\n")
+    assert over.messages[1].parts[0].text.startswith(
+        "[示例输入] 帮我订明天去上海的高铁")
+    # label=None ⇒ 全局 [frame.annotate] 指令与 few-shot（此处为空）
+    plain = build_frame_annotate_prompt(member, cfg, FRAME_SCHEMA_TEXT)
+    assert [m.role for m in plain.messages] == ["system", "user"]
+    assert plain.messages[0].parts[0].text.startswith(
+        "[任务]\n" + FRAME_INSTRUCTION + "\n")
+
+
+# ── annotate_member：显式 Schema 路由 + 失败语义 + 溢出纪律 ──────────────────
+
+def test_annotate_member_routes_explicit_frame_schema():
+    cfg = make_frame_cfg()
+    engine, metrics = _FrameEngine(), _FrameMetrics()
+    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=3)
+    member = text_member(0)
+    ann = _asyncio.run(annotate_member(member, ctx))
+    assert ann is not None
+    assert ann.output == {"intent": "book_train", "entities": ["上海"]}
+    assert ann.attempts == 2 and ann.sc is None
+    ((profile, _prompt, schema, record_ids),) = engine.calls
+    assert profile == "default"
+    assert schema == FRAME_SCHEMA          # 显式 schema= 内部 Schema 待遇，绝非 None
+    assert record_ids == (member.id,)
+    assert metrics.counters == {"frame_annotate.annotated": 1}
+
+
+def test_annotate_member_failure_swallows_counts_and_returns_none():
+    cfg = make_frame_cfg()
+    member = text_member(0)
+    engine = _FrameEngine(fail_ids={member.id})
+    metrics = _FrameMetrics()
+    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ann = _asyncio.run(annotate_member(member, ctx))    # 不抛（成员级隔离）
+    assert ann is None
+    assert metrics.counters == {"frame_annotate.failed": 1}
+
+
+def test_annotate_member_precheck_overflow_fails_member_never_sends():
+    # 最小单元（text 成员无可裁块，无降级梯）：precheck 溢出 ⇒ 成员失败（None），
+    # 请求不发、不喂熔断、不计 overflow_records（成员失败非记录 reject）。
+    cfg = _dc_replace(make_frame_cfg(),
+                      llm_profiles={"default": _budget_profile(600)})
+    member = replace(text_member(0), text="长" * 800)
+    engine = _FrameEngine()
+    ctx = budget_ctx(cfg, engine)
+    ann = _asyncio.run(annotate_member(member, ctx))
+    assert ann is None
+    assert engine.calls == []                       # doomed request never sent
+    assert ctx.metrics.counters.get("frame_annotate.failed") == 1
+    assert ctx.metrics.fed == []                    # precheck 永不喂熔断（A7）
+    assert "budget.overflow_records" not in ctx.metrics.counters
+    assert "budget.degrade_retries" not in ctx.metrics.counters
+
+
+def test_annotate_member_reactive_overflow_feeds_terminal_once():
+    cfg = _dc_replace(make_frame_cfg(),
+                      llm_profiles={"default": _budget_profile(131072)})
+    member = text_member(0)
+
+    class _OverflowEngine:
+        async def complete_validated(self, *a, **k):
+            raise ContextOverflowError("provider overflow", phase="reactive")
+
+    ctx = budget_ctx(cfg, _OverflowEngine())
+    assert _asyncio.run(annotate_member(member, ctx)) is None
+    assert ctx.metrics.fed == [True]                # 反应式 http_400 恰一次喂
+    assert ctx.metrics.counters.get("frame_annotate.failed") == 1
+
+    class _FinishEngine:
+        async def complete_validated(self, *a, **k):
+            exc = ContextOverflowError("finish oracle", phase="reactive")
+            exc.origin = "finish"
+            raise exc
+
+    ctx2 = budget_ctx(cfg, _FinishEngine())
+    assert _asyncio.run(annotate_member(member, ctx2)) is None
+    assert ctx2.metrics.fed == []                   # 200 形终局 oracle 永不喂
+
+
+def test_annotate_member_ui_tree_trims_under_budget():
+    cfg = _dc_replace(make_frame_cfg(modality="ui"),
+                      llm_profiles={"default": _budget_profile(2000)})
+    nodes = [UINode("1", None, 0, "FrameLayout", "", "",
+                    (0, 0, 1080, 1920), True, {})]
+    nodes += [UINode(str(i), "1", 1, "TextView",
+                     f"文本节点内容第{i}行" + "长" * 40, "",
+                     (0, i, 100, i + 1), True, {}) for i in range(2, 120)]
+    member = Record(id="fatframe", modality="ui", text=None, raw=None,
+                    ui_tree=UITree(tuple(nodes)),
+                    image=ImageRef(path=Path("f.png"), format="png",
+                                   size_bytes=1),
+                    ref=RecordRef("frames/x.jsonl", None, 9, ()))
+    engine = _FrameEngine()
+    ctx = budget_ctx(cfg, engine, image_cost=300)
+    ann = _asyncio.run(annotate_member(member, ctx))
+    assert ann is not None
+    ((_, prompt, _, _),) = engine.calls
+    tree_part = prompt.messages[-1].parts[2].text
+    assert "…(truncated" in tree_part and "nodes)" in tree_part
+    assert ctx.metrics.counters.get("budget.truncations.frame_annotate", 0) >= 1
+    prof = cfg.llm_profiles["default"]
+    assert budget_mod.est_prompt(prompt, prof, None, image_cost=300) <= \
+        budget_mod.input_budget(prof)               # throat invariant honoured
+
+
+# ── stage 帧 pass：占键语义 / 幂等 / 执行门 / 计数与事件 ─────────────────────
+
+def test_frame_pass_annotates_members_events_and_counters():
+    cfg = make_frame_cfg()
+    ep = text_episode(3)
+    item = PipelineItem(record=ep)                  # 无 classification = 首标签
+    engine, metrics = run_annotate_item(cfg, item)
+
+    assert item.status == "active" and item.annotation is not None   # 序列级照常
+    assert set(item.member_annotations) == {m.id for m in ep.members}
+    assert all(a is not None for a in item.member_annotations.values())
+    assert metrics.counters.get("frame_annotate.annotated") == 3
+    assert "frame_annotate.failed" not in metrics.counters
+    # 帧调用走显式 frame_schema；每成员 record_ids=(member_id,)
+    assert len(engine.frame_calls()) == 3
+    assert all(c[2] == FRAME_SCHEMA for c in engine.frame_calls())
+    # annotate.frame 每成员一发，ids=(episode_id,)，payload 三键闭集
+    events = frame_event_payloads(metrics)
+    assert len(events) == 3
+    for ids, payload in events:
+        assert ids == (ep.id,)
+        assert payload["status"] == "annotated" and payload["attempts"] == 2
+        assert set(payload) == {"member_id", "status", "attempts"}
+    assert {p["member_id"] for _, p in events} == {m.id for m in ep.members}
+
+
+def test_frame_pass_duplicate_member_ids_single_call():
+    # 终审缺陷修复（内容哈希 id 碰撞）：同 id 成员只调用一次——防同键并发
+    # 双付费与 annotated 计数虚高（first-wins，与 M13 帧判决落表同口径）。
+    from dataclasses import replace as _replace
+    cfg = make_frame_cfg()
+    ep = text_episode(2)
+    dup_ep = _replace(ep, members=(ep.members[0], ep.members[0], ep.members[1]))
+    item = PipelineItem(record=dup_ep)
+    engine, metrics = run_annotate_item(cfg, item)
+
+    assert set(item.member_annotations) == {m.id for m in ep.members}
+    assert len(engine.frame_calls()) == 2               # 唯一 id 各一次
+    assert metrics.counters.get("frame_annotate.annotated") == 2
+
+
+def test_frame_pass_class_skip_takes_no_key():
+    cfg = make_frame_cfg(views=frame_views())
+    ep = text_episode(3)
+    item = PipelineItem(record=ep)
+    item.member_classifications = {
+        ep.members[0].id: member_cls("task_request"),
+        ep.members[1].id: member_cls("chitchat"),   # 视图 enabled=false ⇒ 跳过
+        ep.members[2].id: member_cls("other"),
+    }
+    engine, metrics = run_annotate_item(cfg, item)
+
+    assert set(item.member_annotations) == {ep.members[0].id, ep.members[2].id}
+    assert ep.members[1].id not in item.member_annotations   # skipped 不占键
+    assert metrics.counters.get("frame_annotate.skipped") == 1
+    assert metrics.counters.get("frame_annotate.annotated") == 2
+    skipped = [p for _, p in frame_event_payloads(metrics)
+               if p["status"] == "skipped"]
+    assert skipped == [{"member_id": ep.members[1].id, "status": "skipped",
+                        "attempts": 0}]
+    # 类覆盖/全局指令都到达请求（task_request 覆盖指令；other 继承全局）
+    sys_texts = [c[1].messages[0].parts[0].text for c in engine.frame_calls()]
+    assert any(t.startswith("[任务]\n" + FRAME_OVERRIDE_INSTRUCTION)
+               for t in sys_texts)
+    assert any(t.startswith("[任务]\n" + FRAME_INSTRUCTION) for t in sys_texts)
+
+
+def test_frame_pass_failure_occupies_key_with_none():
+    cfg = make_frame_cfg()
+    ep = text_episode(3)
+    bad = ep.members[1].id
+    item = PipelineItem(record=ep)
+    engine, metrics = run_annotate_item(cfg, item,
+                                        engine=_FrameEngine(fail_ids={bad}))
+
+    assert set(item.member_annotations) == {m.id for m in ep.members}
+    assert item.member_annotations[bad] is None          # failed 占键 None
+    assert item.member_annotations[ep.members[0].id] is not None
+    assert metrics.counters.get("frame_annotate.failed") == 1
+    assert metrics.counters.get("frame_annotate.annotated") == 2
+    failed = [p for _, p in frame_event_payloads(metrics)
+              if p["status"] == "failed"]
+    assert failed == [{"member_id": bad, "status": "failed", "attempts": 0}]
+    # 成员失败非信封失败：episode 照常发射、item.errors 不写
+    assert item.status == "active" and not item.errors
+
+
+def test_frame_pass_idempotent_fills_missing_keys_only():
+    cfg = make_frame_cfg()
+    ep = text_episode(3)
+    item = PipelineItem(record=ep)
+    seeded = Annotation(output={"intent": "seed", "entities": []}, model="m0",
+                        attempts=1, usage=Usage())
+    existing = {ep.members[0].id: seeded}
+    item.member_annotations = existing
+    engine, metrics = run_annotate_item(cfg, item)
+
+    assert item.member_annotations is existing      # 只补缺位，从不换 dict 对象
+    assert item.member_annotations[ep.members[0].id] is seeded   # 已占键不重跑
+    called = {c[3][0] for c in engine.frame_calls()}
+    assert called == {ep.members[1].id, ep.members[2].id}
+    assert metrics.counters.get("frame_annotate.annotated") == 2
+
+
+def test_frame_pass_gate_first_label_clone_and_degraded():
+    cfg = make_frame_cfg(classified=True)
+    ep = text_episode(2)
+    # 非首标签克隆（label != labels[0]）：帧 pass 不跑，dict 保持 None
+    clone = PipelineItem(record=ep, classification=Classification(
+        label="qa", labels=("writing", "qa"), source="llm", detail={}))
+    engine, metrics = run_annotate_item(cfg, clone)
+    assert clone.annotation is not None             # 序列级照常
+    assert clone.member_annotations is None
+    assert engine.frame_calls() == []
+    assert frame_event_payloads(metrics) == []
+    # 首标签信封照常执行
+    first = PipelineItem(record=ep, classification=Classification(
+        label="writing", labels=("writing", "qa"), source="llm", detail={}))
+    engine2, _ = run_annotate_item(cfg, first)
+    assert set(first.member_annotations) == {m.id for m in ep.members}
+    assert len(engine2.frame_calls()) == 2
+    # 降格会话（segment_degraded duck 标）：跳过，保持 None
+    degraded = PipelineItem(record=ep)
+    degraded.segment_degraded = {"stage": "segment", "kind": "provider_fatal",
+                                 "message": "x"}
+    engine3, metrics3 = run_annotate_item(cfg, degraded)
+    assert degraded.annotation is not None
+    assert degraded.member_annotations is None
+    assert engine3.frame_calls() == []
+    assert frame_event_payloads(metrics3) == []
+
+
+def test_frame_pass_gate_switch_and_kind():
+    # 开关关（默认 FrameAnnotateConfig()）：序列信封不跑帧 pass
+    off = make_cfg()
+    item = PipelineItem(record=text_episode(2))
+    engine, metrics = run_annotate_item(off, item)
+    assert item.annotation is not None
+    assert item.member_annotations is None
+    assert frame_event_payloads(metrics) == []
+    # 开关开但非序列记录（kind=="single"）：同样不跑
+    on = make_frame_cfg()
+    single = PipelineItem(record=text_record())
+    engine2, metrics2 = run_annotate_item(on, single)
+    assert single.annotation is not None
+    assert single.member_annotations is None
+    assert engine2.frame_calls() == []
+    assert frame_event_payloads(metrics2) == []
+
+
+def test_frame_pass_not_run_when_sequence_annotation_fails():
+    cfg = make_frame_cfg()
+    ep = text_episode(2)
+    item = PipelineItem(record=ep)
+    engine, metrics = run_annotate_item(cfg, item,
+                                        engine=_FrameEngine(fail_ids={ep.id}))
+    assert item.status == "failed"                  # 序列级修复穷尽
+    assert item.member_annotations is None          # 帧 pass 未运行
+    assert len(engine.calls) == 1                   # 仅序列级一发，无帧调用
+    assert frame_event_payloads(metrics) == []
+    assert "frame_annotate.annotated" not in metrics.counters
+
+
+def test_frame_pass_initializes_empty_dict_when_all_skipped():
+    # dict 初始化语义：pass 运行即 {}（≠ 未运行的 None），全员跳过也如此。
+    cfg = make_frame_cfg(views=frame_views())
+    ep = text_episode(2)
+    item = PipelineItem(record=ep)
+    item.member_classifications = {m.id: member_cls("chitchat")
+                                   for m in ep.members}
+    engine, metrics = run_annotate_item(cfg, item)
+    assert item.member_annotations == {}            # 已运行、全员 skipped 不占键
+    assert item.member_annotations is not None
+    assert engine.frame_calls() == []
+    assert metrics.counters.get("frame_annotate.skipped") == 2
+
+
+def test_frame_event_excerpt_discipline_by_tier():
+    ep = text_episode(1)
+    long_output = {"intent": "长" * 300, "entities": []}
+    for content in ("none", "refs"):
+        cfg = make_frame_cfg(trace=TraceConfig(
+            enabled=True, channels=("annotate",), content=content))
+        item = PipelineItem(record=ep)
+        _, metrics = run_annotate_item(cfg, item)
+        ((_, payload),) = frame_event_payloads(metrics)
+        assert set(payload) == {"member_id", "status", "attempts"}   # 无 excerpt
+    for content in ("excerpt", "full"):
+        cfg = make_frame_cfg(trace=TraceConfig(
+            enabled=True, channels=("annotate",), content=content))
+        item = PipelineItem(record=ep)
+        engine = _FrameEngine(frame_output=long_output)
+        _, metrics = run_annotate_item(cfg, item, engine=engine)
+        ((_, payload),) = frame_event_payloads(metrics)
+        # 标注内容仅经既有 excerpt 键，200 字截断；无其他数据内容键
+        assert set(payload) == {"member_id", "status", "attempts", "excerpt"}
+        expected = json.dumps(long_output, ensure_ascii=False)[:200]
+        assert payload["excerpt"] == {ep.members[0].id: expected}
+        assert len(payload["excerpt"][ep.members[0].id]) == 200

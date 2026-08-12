@@ -422,3 +422,12 @@ class PipelineItem:                        # the ONLY mutable envelope; lifetime
                                            # seam_indexes / seam_interrupted_by / stitch_fragments
                                            # travel alongside (T20, copied by classify._fan_out)
     transitions: tuple[Transition, ...] | None = None   # v1.8: written by M15 extract
+    member_classifications: dict[str, Classification] | None = None
+                                           # v1.12：M13 帧级批量判决写入（首标签序列信封）；
+                                           # 键 = 成员 record.id；扇出克隆按引用共享同一 dict
+                                           # （record/dedup 同族，classify._fan_out 显式复制）
+    member_annotations: dict[str, Annotation] | None = None
+                                           # v1.12：M5 帧级逐帧标注写入（同一执行门）；
+                                           # 键 = 成员 record.id；值 None = 该成员标注不可修复
+                                           # （failed 占键为 None，skipped 不占键——单一真相 =
+                                           # dict 形态本身）；克隆按引用共享（同上）

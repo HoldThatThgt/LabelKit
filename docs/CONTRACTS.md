@@ -31,9 +31,13 @@ Ground rules for every implementer:
   operators or orchestration. Operator modules import common and declared stdlib/third-party
   dependencies, never orchestration and **never each other** — with the sanctioned lazy-import
   exceptions that `labelkit.operators.verify` calls the public repair surface from
-  `labelkit.operators.annotate` (§7.4; used per §7.6) and, v1.8, the public direct-call surfaces
+  `labelkit.operators.annotate` (§7.4; used per §7.6), v1.8, the public direct-call surfaces
   `labelkit.operators.segment.judge_window` / `labelkit.operators.extract.extract_transition`
-  (§7.14/§7.15; used by the stream repair driver, §7.6). Orchestration may import common and
+  (§7.14/§7.15; used by the stream repair driver, §7.6) and, v1.12, the public direct-call surface
+  `labelkit.operators.classify.classify_frames` (the fourth sanctioned operator-to-operator
+  import — verify's member-reclaim frame-product re-run, §7.13/§7.6; the sibling reclaim
+  surface `annotate.annotate_member` is NOT a fifth direction — it joins the §7.4 annotate
+  repair-face family on the first leg). Orchestration may import common and
   operators. CLI imports orchestration's public entry points plus common error/config contracts,
   and never imports or instantiates operators.
 
@@ -108,7 +112,8 @@ forwarder may recreate them. Consumers must import the layered canonical modules
 `labelkit.cli` remains the public module name as the `labelkit/cli/` package; there is no
 coexisting `labelkit/cli.py`. Its `__init__.py` exports the established CLI entry surfaces, and the
 console-script target `labelkit.cli:main` remains unchanged. Public direct-call surfaces such as
-`annotate_record`, `build_*_prompt`, `judge_window`, `extract_transition`, `RunContext`,
+`annotate_record`, `build_*_prompt`, `judge_window`, `extract_transition`, `classify_frames`
+(v1.12 — the fourth sanctioned operator-to-operator import, ground rules above), `RunContext`,
 `LLMClient`, and `SchemaEngine` retain their frozen signatures and behavior at their canonical
 layered paths only.
 
@@ -142,8 +147,9 @@ files: errors at `labelkit/common/errors.py`; SchemaEngine/LLMClient at
 `labelkit/common/runtime/schema_engine.py` and `labelkit/common/runtime/llm_client.py`; hooks at
 `labelkit/common/extensions/hooks.py`; obslog at `labelkit/common/observability/obslog.py`. Operators
 (M2 ingest, M14 segment, M16 stitch, M3 dedup, M13 classify, M15 extract, M4 quality, M5 annotate,
-M6 generate, M7 verify, M11 emitter) depend only on common, subject solely to the three sanctioned
-lazy operator calls (verify→annotate/segment/extract, §7.4/§7.6/§7.14/§7.15). Orchestration may
+M6 generate, M7 verify, M11 emitter) depend only on common, subject solely to the four sanctioned
+lazy operator calls (verify→annotate/segment/extract/classify, §7.4/§7.6/§7.14/§7.15/§7.13 —
+the classify leg is v1.12's `classify_frames`). Orchestration may
 depend on common and operators and owns construction/order/lifecycle; CLI calls orchestration's
 public runtime entry points and owns only parsing, user interaction, and the sole exception-to-exit-
 code mapping. Common depends on neither operators nor orchestration; operators never depend on
@@ -436,6 +442,20 @@ class PipelineItem:                        # the ONLY mutable envelope; lifetime
                                            # v1.8 additive: written by M15 extract (§7.15);
                                            # None = extract disabled / not reached (idempotency
                                            # gate: `transitions is not None` → skip)
+    member_classifications: dict[str, Classification] | None = None
+                                           # v1.12 additive: written by the M13 classify frame
+                                           # pass on first-label sequence envelopes (§7.13);
+                                           # key = member record.id; None = frame classify off /
+                                           # not reached (idempotency gate); fan-out clones SHARE
+                                           # the dict BY REFERENCE (the record/dedup family,
+                                           # copied explicitly by classify._fan_out)
+    member_annotations: dict[str, Annotation] | None = None
+                                           # v1.12 additive: written by the M5 annotate frame
+                                           # pass (same execution gate); key = member record.id;
+                                           # value None = that member's frame annotation FAILED
+                                           # irreparably (failed 占键为 None, skipped 不占键 —
+                                           # the dict shape is the single source of truth for
+                                           # the members[] status三值); clones share by reference
 
 
 # ── v1.8 shared frame helpers (spec §4.3, S12/S13) ──────────────────────────
@@ -1279,6 +1299,64 @@ class ExtractConfig:                              # M15 (§7.15); UI-modality se
                                                   # extraction_invalid)
 
 
+# ── frame granularity (v1.12, spec §3.1 [frame.classify] + [frame.annotate] + [frame.class.*]) ──
+
+@dataclass(frozen=True)
+class FrameClassifyConfig:                        # v1.12: M13 frame-level closed-set classify
+                                                  # (default off; stream mode only — §6.3 rule 43).
+                                                  # Mirrors ClassifyConfig MINUS assignment/
+                                                  # max_labels (帧单一归属地基; explicit keys are
+                                                  # DIRECTED CONFIG_ERRORs, rule 48)
+    enabled: bool = False                         # true ⇒ segment.enabled = true (rule 43)
+    llm: str = "default"                          # joins the reference sets iff enabled; NEVER
+                                                  # the vision set (vision 语义分列 — adaptive via
+                                                  # vision_resolved below; cost-control face =
+                                                  # point it at a text-only profile)
+    fallback_class: str = ""                      # required iff enabled; must be in the frame
+                                                  # class table (rule 47 — 修复穷尽/窗口失败兜底)
+    classes: tuple[ClassSpec, ...] = ()           # frame class table, isomorphic with
+                                                  # [[classify.classes]]; INDEPENDENT of the
+                                                  # sequence-level table (重名合法、互不约束)
+    vision_resolved: bool = False                 # v1.12 parse PRODUCT (segment.vision_resolved
+                                                  # sibling, never a user key): frozen by M1 at
+                                                  # load() end as (modality=="ui") ∧ enabled ∧
+                                                  # llm_profiles[frame.classify.llm].supports_vision
+                                                  # (no strategy term, unlike segment)
+
+
+@dataclass(frozen=True)
+class FrameAnnotateConfig:                        # v1.12: M5 frame-level per-member annotation
+                                                  # (default off; stream mode only). NO
+                                                  # self_consistency (explicit key = DIRECTED
+                                                  # CONFIG_ERROR, rule 48)
+    enabled: bool = False                         # true ⇒ segment.enabled = true (rule 43)
+    llm: str = "default"                          # UNCONDITIONALLY in the vision set under
+                                                  # ui ∧ enabled (screenshots are the primary
+                                                  # annotation evidence — sequence-annotate mirror)
+    instruction: str = ""                         # global frame-annotation instruction;
+                                                  # required iff enabled (rule 45)
+    examples: tuple[FewShotExample, ...] = ()     # optional few-shot; M1 dry-runs them against
+                                                  # the FRAME schema (rule 45)
+    schema_path: str | None = None                # frame-level output JSON Schema: exactly one of
+    schema_inline: str | None = None              # schema_path/schema_inline iff enabled
+                                                  # (mirror of the output.schema branch set,
+                                                  # rule 45)
+
+
+@dataclass(frozen=True)
+class FrameClassView:                             # v1.12: one frame class's effective annotate
+                                                  # config — global [frame.annotate] merged with
+                                                  # the [frame.class.<name>.annotate] whitelist
+                                                  # trio (keyed by frame class name); frozen by M1;
+                                                  # frame_class_views == {} unless
+                                                  # frame.classify.enabled (class_views convention)
+    instruction: str                              # effective instruction (class override > global)
+    examples: tuple[FewShotExample, ...]          # effective few-shot (class override > global)
+    enabled: bool                                 # false ⇒ members of this class skip frame
+                                                  # annotation (cost-saving face; rendered
+                                                  # status="skipped" in members[])
+
+
 # ── CLI overrides and the aggregate ────────────────────────────────────────
 
 @dataclass(frozen=True)
@@ -1329,6 +1407,23 @@ class ResolvedConfig:
     project_path: str
     config_digest: str                            # "sha256:<hex>" of the raw file bytes [FROZEN HERE]
     project_digest: str
+    # v1.12 frame-granularity quartet — DEFAULTED, a deliberate deviation from the
+    # stream/stitch R23 "required, no default" convention: the all-off defaults are
+    # byte-equivalent to v1.11, so every pre-v1.12 construction site stays valid
+    # (the loader always passes all four explicitly). Defaults force tail placement.
+    frame_classify: FrameClassifyConfig = FrameClassifyConfig()
+                                                  # v1.12; vision_resolved frozen by M1 at
+                                                  # load() end (segment V1 sibling)
+    frame_annotate: FrameAnnotateConfig = FrameAnnotateConfig()
+    frame_class_views: Mapping[str, FrameClassView] = field(default_factory=dict)
+                                                  # v1.12: key = frame class name; materialized
+                                                  # per declared frame class iff
+                                                  # frame.classify.enabled (zero-override classes
+                                                  # included — class_views convention)
+    frame_schema: Mapping | None = None           # v1.12: parsed frame-level output schema
+                                                  # (user_schema sibling: meta-validated +
+                                                  # few-shot dry-run); None while frame.annotate
+                                                  # is disabled
 ```
 
 `schema_version` (a required top-level int key in BOTH files, spec §5.1/§5.2 row 1) is validated
@@ -1354,7 +1449,11 @@ per-class merge is project.toml-INTERNAL conditionalization; the three-source pr
 above is unchanged. v1.8: the merge covers the fifth section `extract` (whitelist:
 `instruction` only, §6.3 rule 35) and every `ClassView` carries the required `extract` field
 (S2); per-class rubric re-resolution inherits the S29 empty-selector rule through the base
-selector automatically.
+selector automatically. v1.12: parse `frame.annotate.schema_inline`/`schema_path` into
+`frame_schema` (rule 45, user_schema sibling), statically merge every
+`[frame.class.<name>.annotate]` override onto the global `[frame.annotate]` into the frozen
+`frame_class_views` mapping (rule 44), and freeze `FrameClassifyConfig.vision_resolved` at
+load() end (rule 43).
 
 ### 6.2 `labelkit/common/config/loader.py` — API (spec 3.1.3, verbatim)
 
@@ -1573,6 +1672,53 @@ regardless of any switch — the rule-32/38 "checked regardless" family):
     `ConsoleConfig.mode_resolved` ∈ {"rich", "plain"} (spec 3.1.4 console row, U21). Explicit
     `--console rich`/`mode = "rich"` is honored even without a TTY (CI ANSI-recording
     scenario) — only jsonl (below) or rich unimportability demotes it to plain.
+
+Frame granularity (v1.12, SPEC-frame-annotation §3.1 — the seven-row constraint table; all
+checks apply only when the named switch is on unless stated):
+43. 帧粒度要求流模式: `frame.classify.enabled ∨ frame.annotate.enabled` ⇒
+    `segment.enabled = true`; the error text points non-stream projects at
+    `classify + [class.<name>.annotate]`. Reference sets: `frame.classify.llm` /
+    `frame.annotate.llm` each join the existence/key-resolution/probe sets
+    (`labelkit.orchestration.profile_usage.referenced_profiles()`) iff their own switch is
+    on; the vision set takes ONLY `frame.annotate.llm` (ui ∧ enabled, unconditional — the
+    sequence-annotate mirror) and NEVER `frame.classify.llm` — frame classify is
+    vision-ADAPTIVE via the parse product `FrameClassifyConfig.vision_resolved` =
+    (modality=="ui") ∧ enabled ∧ profile.supports_vision, frozen by M1 at load() end
+    (segment V1 sibling, no strategy term).
+44. 帧类覆盖要求帧分类: any `[frame.class.<name>]` table present ⇒
+    `frame.classify.enabled = true` (a CONFIG_ERROR — deliberately NOT the R8 parked-config
+    warning family); `<name>` must be a declared frame class; the per-class section
+    whitelist is `annotate` ONLY with keys `instruction` / `examples` / `enabled` — anything
+    else is a CONFIG_ERROR (the [frame.class.*] namespace is M1-owned, R25 family). The
+    merge materializes `frame_class_views` per declared frame class (zero-override classes
+    included) iff frame.classify is enabled; `enabled` defaults true per class.
+45. 帧 Schema 恰一: `frame.annotate.enabled` ⇒ exactly one of
+    `frame.annotate.schema_path` / `schema_inline`, mirroring the output.schema branch set
+    (valid JSON / top-level object / draft 2020-12 meta-schema / top-level `type: "object"` /
+    `$ref` resolvability / few-shot dry-run incl. every
+    `[[frame.class.<name>.annotate.examples]]` output — no L2.5 hook on the frame side);
+    parse product `ResolvedConfig.frame_schema`. The `_meta` reserved-key branch is NOT
+    mirrored (frame annotations live INSIDE `_meta.stream.members[].annotation` — no envelope
+    collision). `frame.annotate.instruction` is required-iff-enabled (§5.2 † family).
+46. meta_mode 护栏: frame.classify or frame.annotate enabled ⇒ `output.meta_mode != "none"`
+    (frame products travel ONLY via `_meta.stream.members`; sidecar is legal).
+47. fallback 合法: `frame.classify.fallback_class` is required iff enabled and must be one of
+    the frame class table names (an empty table cannot satisfy membership — transitively a
+    non-empty table is demanded; there is deliberately NO ≥2-entry rule, unlike rule 22).
+    `[[frame.classify.classes]]` parses under rule 22's structural checks (name `[a-z0-9_]+`,
+    unique within the table, non-empty description, optional string-array examples). v1.12
+    终审补充: any frame class carrying `examples` draws ONE named WARN（「类别示例（examples）
+    在帧级批量判决模板中不渲染（§10.12），该键将被忽略」）—— the batch-verdict prompt renders
+    the class table only, and the V13③ static precheck deliberately EXCLUDES examples from
+    the frame.classify static-part estimate (over-counting would false-trip the precheck).
+48. 定向探针: an explicit `[frame.classify].assignment` or `[frame.annotate].self_consistency`
+    key is a DIRECTED CONFIG_ERROR (the v1.11 `use_vision` raw-section probe mechanism —
+    marked seen so the unknown-key forward-compat warning never double-reports; the guidance
+    points at the sequence-level `[classify].assignment` / `[annotate].self_consistency`).
+49. no-op (non-blocking WARN): the `[frame]` table present ∧ neither frame switch on ∧
+    `segment.enabled = false` ⇒ "[frame]" joins the v1.8 R8 parked-tables warning (one line
+    naming the ignored tables); with either frame switch on, rule 43's CONFIG_ERROR takes
+    over and the parked entry never appears.
 
 Warnings (non-blocking): `verify` enabled and `verify.llm`'s `model` equals `annotate.llm`'s
 `model` → warn about self-enhancement bias (spec 3.7.2). v1.7 (R8): `classify.enabled = false`
@@ -1963,6 +2109,45 @@ async def annotate_record(record: Record, ctx: RunContext,
     re-annotation) — None/None = pre-v1.11 behavior byte-identical]"""
 
 
+# ── v1.12 frame-level per-member annotation (SPEC-frame-annotation §3.3) ────
+
+def build_frame_annotate_prompt(member: Record, cfg: ResolvedConfig,
+                                schema_text: str,
+                                label: str | None = None) -> PromptBundle:
+    """Deterministic assembly of the §10.13 frame-annotation template (v1.12)
+    [FROZEN HERE]. schema_text = the canonical single-line dump of
+    cfg.frame_schema (the user_schema_text form: ensure_ascii=False,
+    separators=(", ", ": ")). label non-None → instruction/examples come from
+    cfg.frame_class_views[label] (the frame-class override view); None = the
+    global [frame.annotate] pair (the all-member form when frame.classify is
+    off). The budget packing enters through the private assembler's trailing
+    ``fit`` parameter (annotate_member), never here — the build_annotate_prompt
+    construction."""
+
+
+async def annotate_member(member: Record, ctx: RunContext,
+                          label: str | None = None) -> Annotation | None:
+    """One member Record's frame-level annotation (v1.12) [FROZEN HERE] —
+    PUBLIC DIRECT-CALL SURFACE and the repair-face family's new member: M7's
+    member-reclaim backfill lazy-loads and calls it directly (§7.6; same
+    contract standing as the annotate_record repair hook — the §1.1 fourth
+    sanctioned import direction rides classify_frames, THIS surface rides the
+    existing verify→annotate leg). Routes complete_validated(...,
+    schema=cfg.frame_schema) EXPLICITLY — internal-schema treatment: L0–L3 all
+    present, NO L2.5 hook, NO resolved_at counting (the §9.3 identity
+    "resolved_at sum = records entering M5" stays unpolluted). FAILURE RETURNS
+    None, NEVER RAISES a record-level exception (member failure ≠ envelope
+    failure; CircuitBreakerTripped / KeyboardInterrupt / CancelledError are
+    run-level control flow and propagate): repair exhaustion / unrecoverable
+    errors count frame_annotate.failed + ONE data-free stderr WARN; success
+    counts frame_annotate.annotated. The frame prompt is the MINIMAL UNIT
+    (single member, ≤ 1 image — no window to split, no keyframes to shrink),
+    so there is NO degrade ladder: a post-trim overflow is precheck-shaped and
+    never feeds the breaker (reactive-400 terminals feed exactly once, A7).
+    The view.enabled=false skip determination belongs to the CALLERS (M5 frame
+    pass / M7 backfill) — this surface never re-checks it."""
+
+
 class AnnotateStage(Stage):
     name = "annotate"
     def __init__(self, cfg: ResolvedConfig): ...
@@ -2017,6 +2202,28 @@ uniform formula when `fragment_lens` is absent, single-fragment, inconsistent
 `member_count` column; the M7 repair re-annotation call site threads it IDENTICALLY —
 dropping it there would silently downgrade repair re-annotation to the uniform downsample
 (§7.6).
+
+v1.12 frame pass (SPEC-frame-annotation §3.3; the two frozen sequence-level signatures
+above are ZERO-CHANGE): after a sequence envelope's OWN annotation succeeds — and only
+then: a sequence-level failure never pays for frame annotation (链位与成本 ruling — the
+frame pass sits after the quality gate by construction) — the stage appends a per-member
+pass under the execution gate `frame_annotate.enabled ∧ status=="active" ∧
+record.kind=="sequence" ∧ first-label envelope (clone criterion `classification.label !=
+classification.labels[0]`, the verify S8 test; no classification counts as first-label) ∧
+no `segment_degraded` duck mark (degraded = noise unfiltered — never pay for junk
+frames). Dict semantics (the SINGLE SOURCE OF TRUTH for the §9.1 members[] status
+three-value set): the pass initializes `item.member_annotations` to `{}` the moment it
+runs (distinct from the never-ran `None`); per member — the frame-class view
+(`frame_class_views[label]`, label from `member_classifications`; frame.classify off ⇒
+label None ⇒ global instruction) with `enabled=false` SKIPS the member and leaves NO key
+(+ `frame_annotate.skipped`); otherwise `annotate_member` occupies the key — Annotation
+on success, None on irreparable failure (failed 占键为 None，skipped 不占键). Existing
+keys are never re-run (idempotent — the M7 backfill fills gaps only, §7.6) and the dict
+OBJECT is never replaced (fan-out clones share it by reference, §7.13). Concurrency:
+members gather under the profile semaphore; isolation is guaranteed by annotate_member's
+no-raise contract. One `annotate.frame` event per member incl. skipped ones (§8.1).
+Counters owned here: `frame_annotate.annotated`/`skipped`/`failed` (§9.3; failed is also
+fed by the M11 pre-write backstop, §7.10).
 
 ### 7.5 M6 — `labelkit/operators/generate.py`
 
@@ -2167,6 +2374,23 @@ byte-unchanged; sequence envelopes are driven by a stage-layer bypass driver:
   `annotate_record(..., transitions=<rebuilt>, fragment_lens=<from the stitch_fragments
   duck mark — the v1.9 T14 threading duty, §7.4>)`; → next-round re-review. Repair
   rounds count against `max_repair_rounds` INCLUDING the first review.
+- **Frame-product sync (v1.12; SPEC-frame-annotation §3.4).** Slotted BETWEEN step ④'s
+  record rebuild and step ⑤'s re-annotation (`_rebuild_episode` 之后、重标注之前),
+  surgical episodes only: ⓐ SHRINK — synchronously delete removed members' keys from
+  BOTH `member_classifications` and `member_annotations` (None-valued keys included; no
+  ownerless entries survive a shrink); ⓑ RECLAIM BACKFILL — for reclaimed members whose
+  key is MISSING, lazy-load and re-run the frame products: `classify.classify_frames`
+  single-element calls first (frame.classify on; window failures land `fallback_class`
+  inside the surface, §7.13), THEN `annotate_member(member, ctx, label)` with the FRESH
+  frame label × `frame_class_views` gate (frame.annotate on; a skipped class leaves no
+  key, an irreparable member occupies the key as None — §7.4 semantics shared verbatim).
+  Backfill is IDEMPOTENT — it fills gaps ONLY, never re-runs occupied keys; a dict that
+  is None is NEVER touched (None = the frame pass never ran: switch off / degraded /
+  non-first-label — the sync never conjures products), and the dict object is never
+  replaced (clones share it by reference). Clone envelopes are never surgical (the
+  existing S8 rule), so the sync has NO clone branch — it runs on first-label envelopes
+  only and the shared dict updates siblings for free. Concurrency and record-level
+  isolation mirror `_reseam_episodes` (gather + dead-set).
 - **Multi fan-out interplay (S8).** Membership-class surgery may execute ONLY on the
   original envelope (first label); cloned siblings downgrade to mark-only. After a repair
   the sibling envelopes' `record` may diverge (shared-by-reference no longer holds for the
@@ -2740,6 +2964,28 @@ MetricsSink carries no listener — byte-identical to v1.9):
   becomes the V12 w_min upper bound under a declared budget — budget undeclared keeps the
   v1.9 meaning and bytes; `stitch_calls` unchanged).
 
+v1.12 frame-granularity estimate (SPEC-frame-annotation 裁决·估算上界与六 golden):
+
+- **Two new `estimate_run` keys.** `frame_classify_calls` / `frame_annotate_calls` —
+  COARSE UPPER BOUNDS = the pre-scan frame total `Σ session_lens`, the SAME data source
+  as `segment_calls` (the actual frame classify batches members per window and the
+  actual frame annotate skips noise-dropped members, so both real counts are ≤ the frame
+  total); the owning switch off ⇒ 0, and the non-stream branch is ALWAYS 0 (frame
+  granularity requires stream mode, §6.3 rule 43). KEY ORDER FROZEN in the returned
+  dict: `frame_classify_calls` immediately follows `classify_calls`,
+  `frame_annotate_calls` immediately follows `annotate_calls`; `total_calls` expands by
+  exactly these two terms.
+- **Dry-run line & goldens.** Both keys print UNCONDITIONALLY on the estimate line in
+  the frozen key order (the v1.9 `stitch_calls` precedent — non-stream projects print
+  `=0`); this is a REVISION OF THE EXISTING second stderr line, not a new line: the five
+  pre-existing `tests/cli/goldens/dryrun-*.txt` files were re-sampled and the mix pair
+  `dryrun-mix.txt` (UI primary) / `dryrun-mix-text.txt` (text sibling) joins the
+  pytest-enforced set — seven goldens total (examples/mix). The rich
+  console's estimate table stays item-identical by construction (`_ESTIMATE_CALL_KEYS`
+  gains the two keys; the stage-board denominators become multi-key sums — classify ↦
+  `classify_calls + frame_classify_calls`, annotate ↦ `annotate_calls +
+  frame_annotate_calls`; the panel gains no new rows — §7.12 territory).
+
 ### 7.10 M11 — `labelkit/operators/emitter.py`
 
 ```python
@@ -3114,6 +3360,37 @@ def build_classify_prompt(record: Record, cfg: ResolvedConfig,
 async def classify_record(record: Record, ctx: RunContext) -> Classification:
     """One record's full classification path incl. self-consistency voting and
     normalization; the on_error policy is applied by the stage layer."""
+
+
+# ── v1.12 frame-level batch verdict (SPEC-frame-annotation §3.2) ────────────
+
+def build_frame_classify_prompt(members: Sequence[Record], cfg: ResolvedConfig,
+                                digests: Sequence[str]) -> PromptBundle:
+    """Deterministic assembly of the §10.12 frame-verdict template (v1.12)
+    [FROZEN HERE]. ``digests`` is ALIGNED with ``members`` — the per-member
+    frame_digest strings at segment.digest_max_chars, precomputed ONCE per
+    episode by the caller (the segment V9 construction: the builder never
+    computes digests itself). frame_classify.vision_resolved appends a
+    "[成员 {i} 截图]" text label + image part per member (working point = the
+    profile's image working point, encoded by M9 at call time). The budget
+    path enters through the private assembler's trailing ``fit`` parameter
+    (the build_classify_prompt construction), never here."""
+
+
+async def classify_frames(members: Sequence[Record],
+                          ctx: RunContext) -> dict[str, Classification]:
+    """Frame-level closed-set batch verdict over the given member Records —
+    returns {member record.id: Classification} with source ∈ {"llm",
+    "fallback"} (v1.12) [FROZEN HERE]. PUBLIC DIRECT-CALL SURFACE: M7's
+    member-reclaim backfill calls it directly (single-element calls) — the
+    FOURTH sanctioned operator-to-operator import (§1.1 ground rules; the
+    judge_window/extract_transition contract standing). Budget declared ⇒
+    members are windowed via budget.pack_windows in the ZERO-OVERLAP
+    invocation form (§7.17); budget off ⇒ one window = all members. A
+    window's repair exhaustion / unrecoverable error lands EVERY member of
+    that window on frame_classify.fallback_class INSIDE this surface — it
+    never raises a record-level exception (the run-level big three
+    propagate)."""
 ```
 
 Normative behavior:
@@ -3178,6 +3455,45 @@ Normative behavior:
   the v1.7 "clones share `record` by reference" invariant holds only until M7 member
   surgery — a repaired sibling's `record` diverges (same `_meta.id` output rows may then
   carry different `member_ids`), disambiguated by `_meta.stream.repaired` (§7.6/§9.1).
+- **v1.12 frame pass** (SPEC-frame-annotation §3.2; first-label sequence envelopes only):
+  - **Composition or-gate.** The factory composes ClassifyStage into the chain when
+    `classify.enabled ∨ frame_classify.enabled` (slot unchanged); INSIDE the stage the
+    sequence-level verdict is gated on `classify.enabled` alone — a frame-only project
+    produces no sequence Classification while the frame pass runs normally.
+  - **Execution gate.** `status=="active"` ∧ `record.kind=="sequence"` ∧ first-label
+    envelope (clone criterion `classification.label != classification.labels[0]` — the
+    verify S8 test; None classification counts as first-label) ∧ no `segment_degraded`
+    duck mark (skip + `frame_classify.skipped_degraded` — degraded = noise unfiltered,
+    never pay for junk frames) ∧ idempotency `member_classifications is None`. The pass
+    runs AFTER the sequence verdicts land and BEFORE multi fan-out, so clones are
+    constructed with the finished dict shared by reference (§3) and never re-run it.
+  - **Call form & internal schema.** One episode per pass; each window is one
+    `complete_validated(schema=frame_classify_schema(names, n))` call — the EXACT
+    internal-schema JSON (no resolved_at, no L2.5; the segment_window_schema precedent;
+    NO `uniqueItems`, R1 — frame labels may legitimately repeat):
+    `{"type": "object", "properties": {"labels": {"type": "array", "items": {"type":
+    "string", "enum": [<frame class names>]}, "minItems": n, "maxItems": n}},
+    "required": ["labels"], "additionalProperties": false}`. Post-validation alignment
+    is code-side and FIRST-WINS: `labels` aligns positionally with the window's member
+    order, overlong arrays keep the first n items, missing positions take
+    `fallback_class`.
+  - **Failure & degrade.** Window repair exhaustion / unrecoverable ⇒ ALL that window's
+    members take `fallback_class` (`source="fallback"`, kind/message evidence in
+    `Classification.detail` — the v1.7 R4 philosophy pushed down; NEVER episode-failed,
+    no `item.errors`, no error event) + `frame_classify.window_failures` +
+    `frame_classify.fallback` per member. Overflow: a precheck minimal-unit overflow
+    never feeds the breaker; a reactive overflow splits the window in half and retries
+    ≤ 2 (the V20 segment mirror, `budget.degrade_retries` counted; zero-overlap
+    halving), exhaustion falls back per the window-failure rule; the reactive-400
+    terminal feeds the breaker exactly once at the swallow point (A7).
+  - **Product & observability.** `item.member_classifications = {member_id:
+    Classification(label, (label,), source, detail)}`. One `classify.frame` event per
+    episode (`record_ids=(episode_id,)`, payload = `members`/`windows`/`fallback`
+    counts only — §8.1). Counters owned by M13:
+    `frame_classify.calls`/`fallback`/`window_failures`/`skipped_degraded` (§9.3) —
+    the `frame_classify.*` namespace is strictly separate from the sequence-level
+    `classify.*` family, and frame class names are independent of (may repeat) the
+    sequence class table.
 
 ### 7.14 M14 — `labelkit/operators/segment.py` (v1.8)
 
@@ -3591,6 +3907,13 @@ TEMPLATE_HEAD_TOKENS: dict[str, int]                  # V22：per-stage 冻结�
                                                       #   离线测试跨层断言与算子常数一致；
                                                       #   segment 例外 = §10.9 全部最坏静态骨架
                                                       #   （头+结构句+with_reason 行拼接，V22 修订））
+                                                      #   v1.12 增 "frame_classify" = 81 /
+                                                      #   "frame_annotate" = 35 两键——跨层等式
+                                                      #   测试钉住 = est_text(classify.
+                                                      #   _FRAME_SYSTEM_HEAD) / est_text(
+                                                      #   annotate._FRAME_SYSTEM_STATIC)
+                                                      #   （§10.12/§10.13 冻结模板头；
+                                                      #   M1 V13③ 两新段消费）
 
 def margin(context_window: int) -> int
 def input_budget(profile: LLMProfile) -> int          # cw − max_output_tokens − margin；cw==0 → 0（预算关）
@@ -3610,6 +3933,12 @@ def est_prompt(bundle: PromptBundle, profile: LLMProfile,
 def fit_text(s: str, budget_tokens: int,
              keep: Literal["head", "edges"]) -> str   # 行边界截断：head=头部保留（embed）；
                                                       # edges=首末恒保留丢中段（既有家族语义，V9）
+def pack_windows(costs: list[int], budget: int,
+                 cap: int) -> list[tuple[int, int]]   # v1.12 下沉（原 segment._pack_windows，公开面，
+                                                      #   行为字节等价）：贪心预算装箱，1 帧重叠 +
+                                                      #   接缝归后窗 + 强制 ≥2 帧语义下限；M14 窗口
+                                                      #   切分与 M13 帧级批量判决共用（帧级为零重叠
+                                                      #   调用形——调用方对返回跨度去重叠）
 def min_window(cfg: ResolvedConfig) -> int            # 最坏保证装填量 w_min（V9 护栏 + V12 estimate 上界
                                                       # 共用；未声明窗口 → cfg.segment.window 原值；基于先验）
 def classify_stage_error(exc: BaseException) -> str | None
@@ -3637,9 +3966,14 @@ class ImageCostCalibrator:                            # V19：每 profile 每图
 
 Binding notes (from dev spec §3.2, normative):
 
-- The data-adaptive greedy window packer (`_pack_windows(costs, budget, cap)`) is
-  OPERATOR logic and lives in `labelkit/operators/segment.py` (dependency direction
-  unchanged: operators → common); budget.py supplies ONLY the estimation/budget
+- The data-adaptive greedy window packer `pack_windows(costs, budget, cap)` is, since
+  v1.12（装箱器下沉裁决）, a PUBLIC face of budget.py — sunk VERBATIM from the former
+  segment-private `_pack_windows`, byte-equivalent behavior (the pre-existing packing
+  tests hold it): M14 imports it for the V9 window cut (1-frame overlap, seam owned by
+  the later window, forced ≥2-frame semantic minimum), and M13's v1.12 frame-classify
+  batching reuses it in the zero-overlap invocation form (the caller strips the
+  overlapping head frame of every later span — the span-chaining convention itself stays
+  frozen). Apart from the packer, budget.py still supplies ONLY the estimation/budget
   primitives + the calibrator.
 - `est_text` is monotone over prefixes ⇒ `fit_text` bisects on line boundaries —
   deterministic, O(n log n) upper bound. CJK determination = the Unicode block CJK
@@ -3698,12 +4032,14 @@ Binding notes (from dev spec §3.2, normative):
 | `stitch.thread` | stitch / — (trace-only, no stderr mirror) (v1.9) | M16 per surviving thread envelope at session finalization (§7.16) | (thread record id,) | `session_id`, `thread_id` (== record id == episode_id, T22), `task_name`¶, `fragments` (the `{order_span, member_count, cause, source_episode}` table = `_meta.stream.fragments`, §9.1), `seam_indexes` |
 | `dedup.duplicate` | dedup / — | M3 duplicate verdict | (dup id,) | `kind`, `cluster_key`, `kept_id`, plus exactly one of `jaccard` (near_text) / `hamming` (near_image) / `cosine` (near_semantic); exact dups carry none |
 | `classify.decision` | classify / — (trace-only, R29) | M13 per record once the classification is final (v1.7) | (id,) | `label`, `labels` (multi: full hit set), `source` ("llm"\|"fallback"\|"inherited")[, `reason`][, `sc` {n, agreement_ratio}] |
+| `classify.frame` | classify / — (trace-only, no stderr mirror) (v1.12) | M13 once per episode when the frame pass completes (§7.13; degraded/clone-skipped episodes emit nothing) | (episode_id,) | `members`, `windows`, `fallback` — counts only (the v1.12 trace-payload discipline: no data-content keys ever) |
 | `extract.step` | extract / — (trace-only, no stderr mirror) (v1.8) | M15 per adjacent-pair transition finalized, incl. fallback steps (§7.15) | (s_i id, s_{i+1} id) | `episode_id`, `index`, `action_type`, `description`‡, `target`§, `value`§ |
 | `quality.judgment` | quality / — | M4 per pairwise judgment after M8 pass | (first-sampled record, second-sampled record) — SAMPLING order, NOT the presented A/B order; the A/B mapping lives in `payload.order` (spec 7.2/7.3) | `order` ({"A": id, "B": id} presented), `model`, `judgments`[]{`criterion`, `winner` "A"\|"B"\|"tie"[, `reason`]}[, `judge`][, `pool` — v1.7, classify enabled only (R16)] |
 | `quality.pointwise` | quality / — | M4 per record per criterion | (id,) | `criterion`, `score` (raw 0–5), `reason` |
 | `quality.bt_fit` | quality / — | M4 per batch per criterion (v1.7: per pool per criterion) | () | `criterion`, `iterations`, `converged`, `comparisons`[, `pool` — v1.7, classify enabled only (R16)] |
 | `quality.gate` | quality / — | M4 gate decision per record (threshold set or top_ratio) | (id,) | `aggregate`, `decision` ("keep"\|"drop")[, `threshold`][, `selection`, `top_ratio`, `rank`][, `pool` — v1.7, classify enabled only (R16)] |
 | `annotate.done` | annotate / — | M5 after M8 pass | (id,) | `attempts`[, `sc` {n, agreement_ratio}][, `label` — v1.7, classify enabled only (R5)] |
+| `annotate.frame` | annotate / — (trace-only, no stderr mirror) (v1.12) | M5 per member of a sequence envelope's frame pass, skipped members included (§7.4) | (episode_id,) | `member_id`, `status` ("annotated"\|"skipped"\|"failed"), `attempts` (0 for skipped/failed)[, `excerpt` — content tiers "excerpt"/"full" only: {member_id: first 200 chars of the annotation JSON} — annotation content travels ONLY through this existing tiered key] |
 | `verify.verdict` | verify / — | M7 per round (per judge when judges set) | (id,) | `verdict`, `round`, `critiques`[]{`aspect`, `opinion`}[, `judge`][, `label` — v1.7, classify enabled only (R5)] |
 | `schema.repair` | schema / — | M8 any non-clean resolution | (record ids if known) | `resolved_at` ("l1"\|"l3_1"\|"l3_2"\|"rejected"), `violations` (JSON-Pointer + violated keyword summary, NO data values)[, `l1_lossy`=true — v1.5, only on a suspected content-dropping L1 repair] |
 | `llm.call` | llm / debug (summary always) | M9 after every call incl. failures | () | `profile`, `gen_ai.request.model`, `latency_ms`, `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `retries`, `status` ("ok"\|"retryable_exhausted"\|"fatal")[, `operation`="embedding"][, `key_env` — env-var name of the key used by the LAST attempt (success or failure); absent on zero-attempt calls; pooled profiles (>1 key) only, v1.6][, `gen_ai.input.messages`, `gen_ai.output.messages` — content="full" + llm channel only] |
@@ -3728,7 +4064,10 @@ name, S1); the `error` event keeps routing by its `stage` field, so segment/extr
 errors reach their channels with zero routing changes. v1.9: 10 → 11 — `"stitch"` joins the
 enumeration (same S1 rule; `stitch.judge`/`stitch.thread` prefix-route to the stitch
 channel, and stitch-stage `error` events follow their `stage` field — zero routing changes
-again).
+again). v1.12: the enumeration stays ELEVEN values — the two frame events
+`classify.frame`/`annotate.frame` PREFIX-ROUTE automatically to the existing
+classify/annotate channels (the S1 channel = event-name-prefix rule), zero enumeration and
+zero routing changes.
 
 ### 8.2 Trace line format
 
@@ -3841,6 +4180,24 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
       "member_count": <int>,
       "member_ids": ["<member record id>", ...],
       "member_sources": [{"file": ..., "pair_index"|"line_no": ...}, ...],
+      // v1.12 — the members array is present ONLY when frame.classify.enabled ∨
+      // frame.annotate.enabled, frozen in this position: AFTER member_sources,
+      // BEFORE session_split (SPEC-frame-annotation §3.6). One entry per member in
+      // rec.members order, index 0-based; ENTRY FIELD ORDER FROZEN:
+      // index, id[, label][, annotation, status] —
+      //   "label"      present iff frame.classify.enabled: the frame class, or null
+      //                (null covers the degraded-episode skip);
+      //   "annotation" + "status" present iff frame.annotate.enabled; "status" is the
+      //                THREE-VALUE CLOSED SET "annotated" | "skipped" | "failed",
+      //                derived from the member_annotations dict shape (§7.4 single
+      //                source of truth): missing key ⇒ ("skipped", annotation null);
+      //                value None ⇒ ("failed", null); object ⇒ pre-write
+      //                validate_only(obj, schema=frame_schema) — pass ⇒ ("annotated",
+      //                the object), fail ⇒ ("failed", null) + frame_annotate.failed
+      //                (the M11 backstop: no invalid frame object ever lands, §7.10):
+      "members": [{"index": 0, "id": "<member record id>", "label": "<frame class>"|null,
+                   "annotation": {<frame-schema object>}|null,
+                   "status": "annotated"|"skipped"|"failed"}, ...],
       "session_split": false,      // the owning session was hard-split at batch_size
                                    // (S21; M7's missing-frame downgrade evidence)
       "repaired": false,           // verify defect repair rewrote the member set
@@ -3896,6 +4253,9 @@ segment disabled every v1.7-era line differs from v1.7 output ONLY by `"stream":
 (spec §6.3; the four pre-existing example projects re-verify this byte-diff). v1.9: the
 three stream additions (`thread_id`, `fragments`, per-step `resumed`) are present ONLY when
 `stitch.enabled` (m-11) — with stitch disabled the main output is byte-identical to v1.8.
+v1.12: the `members` array is the SOLE addition and is present ONLY when
+`frame.classify.enabled ∨ frame.annotate.enabled` — with frame granularity fully off the
+main output is byte-identical to v1.11.
 
 ### 9.2 Rejects channel (spec 3.11.2)
 
@@ -4019,8 +4379,18 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
   //                                                report stays byte-identical to v1.10)
   //   [, "stitch": {"stitched": 0, "rescued_short": 0, "seams": 0, "judgments": 0,
   //                 "repass_judgments": 0, "failures": 0}]       (v1.9, stitch enabled only)
+  //   [, "frame_classify": {"calls": 0, "fallback": 0, "window_failures": 0,
+  //                         "skipped_degraded": 0}]              (v1.12, frame.classify
+  //                                                              enabled only — chain-order
+  //                                                              slot AFTER stitch, BEFORE
+  //                                                              extract)
   //   [, "extract": {"transitions": 0, "fallback_steps": 0, "failures": 0,
   //                  "by_type": {"<action_type>": 0, ...}}]      (extract enabled only)
+  //   [, "frame_annotate": {"annotated": 0, "skipped": 0, "failed": 0,
+  //                         "discarded": 0}]                     (v1.12, frame.annotate
+  //                                                              enabled only — chain-order
+  //                                                              slot AFTER extract, BEFORE
+  //                                                              verify)
   //   [, "verify": {"membership_repairs": 0, "boundary_flags": 0,
   //                 "defects": {"<kind>": 0, ...}}]}             (verify enabled only)
   //   — stream.sessions data source = IngestReport.sessions (M2 owner, §7.1);
@@ -4152,6 +4522,21 @@ report byte-identical to v1.10 — unlike the unconditional
 `report.budget.profiles` / `w_min` / `image_cost` are NOT MetricsSink counters — M10
 assembles them at report time from ResolvedConfig, `budget.min_window(cfg)` and
 `llm.calibrator` (V13②/⑤).
+v1.12 additions (counter key names **[FROZEN HERE]**):
+`frame_classify.calls` / `frame_classify.fallback` / `frame_classify.window_failures` /
+`frame_classify.skipped_degraded` (owner M13, §7.13) and `frame_annotate.annotated` /
+`frame_annotate.skipped` / `frame_annotate.failed` / `frame_annotate.discarded` —
+`annotated` is owned by the M5 frame pass; `skipped` is fed by BOTH the M5 frame pass
+and the M7 reclaim backfill's skip-class branch (v1.12 终审修复 — report and the
+members[] status histogram reconcile); `failed` is fed by BOTH the `annotate_member`
+failure path (§7.4 — wherever it is called: M5 pass or M7 backfill) and the M11
+pre-write `validate_only` backstop; `discarded` is owned by M11 (sunk-cost accounting:
+a terminal non-active sequence envelope carrying `member_annotations` adds its non-None
+entry count — produced but never delivered, §7.10; counted from the FIRST-LABEL
+envelope's viewpoint only — fan-out clones share the dict and never re-count it). They surface as the two
+CONDITIONAL `report.stream` sub-blocks above. `counts.*` gains NOTHING: frame products
+never change an envelope status, so the conservation identity carries no new term (the
+v1.12 zero-change anchor).
 
 Counter OWNERSHIP (normative): `counts.*` keys are incremented ONLY by M10 (orchestrator),
 derived from batch tallies / EmitResult — stages must never touch them (double-count).
@@ -4167,7 +4552,8 @@ by M4, `annotate.sc_disagreements` by M5, `generate.buckets.*` by M6 (`survived_
 surviving M6's own MinHash novelty filter against seeds + siblings; M3 still dedups generated
 records on re-flow), `classify.*` by M13 (v1.7), `quality.tie_*` by M4, `segment.*` by M14,
 `extract.*` by M15, `verify.membership_repairs`/`verify.boundary_flags`/`verify.defects.<kind>`
-by M7 (v1.8), `stitch.*` by M16 (v1.9).
+by M7 (v1.8), `stitch.*` by M16 (v1.9), `frame_classify.*` by M13 and `frame_annotate.*` by
+M5/M11 per the v1.12 split above.
 
 ### 9.4 Atomic delivery
 
@@ -4786,6 +5172,97 @@ structure):
 - Response validated against `stitch_schema()` (§10.7); `confidence` is trace observation
   only, never a gate (T9 — the verbal-confidence leg was removed by design).
 
+### 10.12 M13 frame classification prompt (spec 3.13.7, verbatim; v1.12)
+
+```
+system:
+  [任务]
+  你是数据流的逐帧分类员。下面给出同一会话中按时间顺序排列的 {N} 帧成员摘要，对每一帧独立判断它属于以下类别中的哪一类，只能从以下封闭类别表中取恰一值。类别表：
+  - {name}: {description}                       ← 按 [[frame.classify.classes]] 声明序逐类一行
+  输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
+  {"labels": [<第 1 帧类名>, <第 2 帧类名>, ...]}（恰 {N} 项，按帧序与成员摘要行对齐）
+user（单条消息；一窗一调用）:
+  text part:  [会话成员帧]
+              {m}. {digest}
+              （↑ 1-based 成员摘要行，一成员一行——digests 与 members 对齐，按
+                frame_digest @ segment.digest_max_chars 每 episode 预计算一次，
+                装配器永不自行计算摘要，§7.13）
+  （frame_classify.vision_resolved = true 时，每成员追加两部件：）
+  text part:  [成员 {i} 截图]
+  image part: member.image                      （M9 调用时编码，3.9.2；工作点 =
+                                                  profile 图像工作点，帧调用不设独立尺寸）
+```
+
+Module constants in `labelkit/operators/classify.py`, transcribed VERBATIM above and
+**[FROZEN HERE]**: `_FRAME_SYSTEM_HEAD` (the two-line head — the `[任务]` label line plus
+the instruction/vocabulary sentence), `_FRAME_STRUCTURE` (the structure line incl. the
+alignment parenthesis), `_LABEL_FRAME_MEMBERS`, `_LABEL_MEMBER_SCREENSHOT`,
+`_FRAME_MEMBER_LINE`; the structure sentence 「输出必须是…」 is the SHARED §10.8
+`_STRUCTURE_SENTENCE`. Binding notes:
+
+- Section order (deterministic newline join): head → per-class `- {name}: {description}`
+  lines in `[[frame.classify.classes]]` declaration order → structure sentence →
+  `_FRAME_STRUCTURE`. There is NO instruction line (`[frame.classify]` deliberately
+  carries no instruction key — the verdict wording is template-built-in), NO per-class
+  example messages (frame-class `examples` parse under §6.3 rule 47 but the batch-verdict
+  prompt renders the class table only), and NO reason fragment ever (`with_reason` does
+  not apply to the frame pass — the R29 reason discipline belongs to `classify.decision`).
+- `{N}` is substituted via `str.replace` at assembly time with the window's member count;
+  budget estimation prices the UN-substituted constant form — the 1–2-char substitution
+  delta is absorbed by the margin (the segment §10.9 precedent, V7).
+  `TEMPLATE_HEAD_TOKENS["frame_classify"] = 81 = est_text(_FRAME_SYSTEM_HEAD)` is pinned
+  by the cross-layer equality test (`tests/common/runtime/test_budget.py`, §7.17).
+- One call per WINDOW (`budget.pack_windows` zero-overlap invocation form under a
+  declared budget; budget off ⇒ one window = all members, §7.13/§7.17). Response
+  validated against `frame_classify_schema(names, n)` — exact JSON in §7.13; positional
+  alignment/first-wins/missing ⇒ fallback are code-side, never the LLM's problem.
+
+### 10.13 M5 frame annotation prompt (spec 3.5.5, verbatim; v1.12)
+
+```
+system:
+  [任务]
+  {生效指令}                                    ← label 非 None ⇒ frame_class_views[label]
+                                                  .instruction；None ⇒ frame.annotate
+                                                  .instruction（全局形态）
+  输出必须是符合以下 JSON Schema 的单个 JSON 对象，不输出任何其他内容：
+  {frame_schema_text}                           ← cfg.frame_schema 的 canonical 单行 dump
+                                                  （ensure_ascii=False +
+                                                  separators=(", ", ": ")——
+                                                  user_schema_text 同形，§7.4）
+user (对每条生效 few-shot，配置序——§10.1 同形；来源随 label 取类覆盖或全局):
+  [示例输入] {example.input}
+  [示例输出] {example.output 的 JSON}
+user（成员内容）:
+  文本模态: [成员帧] {member.text}
+  UI 模态:  [屏幕截图] <image: base64>
+           [UI 控件树] {member.ui_tree.serialize(max_chars=input.ui_tree_max_chars)}
+```
+
+Module constants in `labelkit/operators/annotate.py`, transcribed VERBATIM above and
+**[FROZEN HERE]**: `_FRAME_LABEL_TASK` (`[任务]`), `_FRAME_LABEL_MEMBER` (`[成员帧]`),
+and the composed `_FRAME_SYSTEM_STATIC` = `_FRAME_LABEL_TASK` + `"\n"` + the §10.1
+`_SCHEMA_SENTENCE` — the frame template's FULL static system scaffolding (the effective
+instruction and the frame-schema text are config quantities, metered separately by the
+M1 V13③ static precheck, §6.2/§7.17); the example/screenshot/tree labels are the §10.1
+constants REUSED (`_LABEL_EXAMPLE_IN`/`_LABEL_EXAMPLE_OUT`/`_LABEL_SCREENSHOT`/
+`_LABEL_UI_TREE` — same bytes, same section shapes). Binding notes:
+
+- System section order frozen: `[任务]` label line → effective instruction → schema
+  sentence → frame-schema text. The UI member message is the §10.1 three-part
+  single-record shape (label text, image part, tree text; tree render absolutely capped
+  at `input.ui_tree_max_chars`, and under a declared budget the §3.3③ dynamic tree cap
+  is the ONE trimmable slot — the text-modality member line is not a trim class).
+  `TEMPLATE_HEAD_TOKENS["frame_annotate"] = 35 = est_text(_FRAME_SYSTEM_STATIC)` is
+  pinned by the same cross-layer equality test (§7.17).
+- NO repair suffix ever (frame calls never enter the M7 critique loop), NO
+  self-consistency (§6.3 rule 48), NO `_meta` reserved-key branch (frame annotations
+  live INSIDE `_meta.stream.members[].annotation` — §6.3 rule 45). The prompt is the
+  minimal unit — no degrade ladder: a post-trim overflow raises precheck-shaped and the
+  member fails (`annotate_member` → None, §7.4).
+- Response validated against `cfg.frame_schema` through `complete_validated(schema=…)` —
+  internal-schema treatment: no L2.5, no resolved_at (§7.4/§7.7).
+
 ---
 
 ## 11. Cross-cutting conventions (binding)
@@ -5160,5 +5637,70 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       `report.stream.windows` (M14-owned; presence budget-gated on the segment
       profile's declared window, spec §6.4);
       all-undeclared budget keeps report.json byte-identical to v1.10.
+32. v1.12 stream-mode frame-level classification & annotation (feature spec
+    `docs/dev/SPEC-frame-annotation.md`, adjudications recorded by NAME — 承载形态 /
+    成员失败不入 rejects / 帧 Schema 显式路由 / 装箱器下沉 / 修复面第四向 /
+    扇出共享与首标签执行 / 降格会话跳过 / members 块冻结位 / 估算上界与六 golden /
+    trace 载荷纪律 / 链位与成本 / 沉没成本记账 et al.; 2026-08-12). Key frozen points:
+    - carrier shape: the two PipelineItem dict fields
+      `member_classifications`/`member_annotations` (§3 — keyed by member record.id,
+      shared BY REFERENCE across fan-out clones like record/dedup; both frame passes
+      execute on FIRST-LABEL envelopes only); member frames stay `absorbed` — status
+      machine, chain order, contracts ②a/②b/②c and the conservation identity are ZERO
+      CHANGE, and frame granularity fully off is byte-identical to v1.11 everywhere;
+    - 终审修复三则 (2026-08-12): fan-out pins `member_annotations = {}` on the
+      first-label envelope BEFORE cloning (M5 fills in place, never rebinds — clones
+      would otherwise share a forever-None; degraded envelopes stay None = pass never
+      ran); duplicate member ids (content-hash collisions, ingest D2) are FIRST-WINS
+      in both frame passes (one call per unique id, counts follow unique ids, all
+      positional rows render the shared product); `frame_annotate.discarded` counts
+      from the first-label envelope's viewpoint only (shared dicts never re-counted)
+      except the two unconditionally printed dry-run estimate keys;
+    - repair-face fourth direction: `classify.classify_frames` is the fourth sanctioned
+      operator-to-operator import (verify member-reclaim, single-element calls);
+      `annotate.annotate_member` joins the EXISTING verify→annotate repair-face family
+      (not a fifth direction); both surfaces never raise record-level — window failures
+      land `fallback_class` inside `classify_frames`, member failures return None
+      (§7.4/§7.13);
+    - member failure never reaches rejects nor trips `--strict`: members[] renders
+      `status:"failed"` + `annotation:null` + the `frame_annotate.failed` count only —
+      no `item.errors` entry, no envelope status change; M11 additionally runs the
+      pre-write `validate_only(obj, schema=frame_schema)` backstop (invalid frame
+      objects never land) and the `frame_annotate.discarded` sunk-cost tally (§7.10/§9.1);
+    - frame-schema explicit routing: frame annotate calls ride
+      `complete_validated(..., schema=cfg.frame_schema)` — L0–L3 all present, NO L2.5,
+      NO resolved_at counting (the §9.3 resolved_at identity is preserved);
+      `ResolvedConfig.frame_schema` is the user_schema sibling parse product (§6.1);
+    - the greedy window packer is SUNK VERBATIM from segment-private `_pack_windows` to
+      the PUBLIC `budget.pack_windows` (byte-equivalent behavior, §7.17); M13's frame
+      batching reuses it in the zero-overlap invocation form (later spans strip the
+      overlapping head frame);
+    - `_meta.stream.members` position frozen AFTER `member_sources`, BEFORE
+      `session_split`; entry field order `index, id[, label][, annotation, status]`;
+      key-presence rules per switch; `status` three-value closed set derived from the
+      dict shape — missing key ⇒ skipped, None ⇒ failed, validated object ⇒ annotated
+      (§9.1);
+    - estimate: `frame_classify_calls`/`frame_annotate_calls` = pre-scan frame-total
+      upper bounds (Σ session_lens, the segment_calls data source; switch off ⇒ 0), key
+      order frozen immediately after `classify_calls`/`annotate_calls`, `total_calls`
+      expands, unconditional dry-run printing — the five dry-run goldens re-sampled and
+      the mix pair `dryrun-mix.txt`/`dryrun-mix-text.txt` joins the pytest-enforced
+      set, seven goldens total (§7.9);
+    - events `classify.frame` (per episode; payload members/windows/fallback counts
+      only) and `annotate.frame` (per member; payload member_id/status/attempts,
+      annotation content ONLY via the tiered `excerpt` key) — both trace-only,
+      prefix-routed to the existing classify/annotate channels; the channel enumeration
+      stays ELEVEN values with zero routing changes (§8.1);
+    - `TEMPLATE_HEAD_TOKENS` gains `"frame_classify" = 81` / `"frame_annotate" = 35`,
+      test-pinned to `est_text` of the §10.12/§10.13 frozen template heads (§7.17);
+      `report.stream` gains the two CONDITIONAL sub-blocks
+      `frame_classify{calls, fallback, window_failures, skipped_degraded}` (after
+      stitch, before extract) and `frame_annotate{annotated, skipped, failed,
+      discarded}` (after extract, before verify) (§9.3); config surface = §6.3 rules
+      43–49 with the vision split — `frame.annotate.llm` unconditionally in the vision
+      set under ui ∧ enabled, `frame.classify.llm` NEVER (vision-adaptive via the
+      `vision_resolved` parse product);
+    - the new template sections are numbered §10.12/§10.13 AFTER the pre-existing
+      §10.11 (same anchor-stability rationale as v1.7/v1.8/v1.9).
 
 — End of contract. —

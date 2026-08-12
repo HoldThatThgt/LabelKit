@@ -66,6 +66,7 @@ API 增量（均只增）：`MetricsSink.__init__` 增可选尾参 `listener`；
 | 写失败 | 首次 `OSError` ⇒ stderr warn 一次 + 关闭该通道 + 后续事件计入 `report.trace.dropped_events`；运行绝不因日志中断。 |
 | run_id | 启动时生成、写入本次运行全部事件；用于多次运行的 trace 文件合并分析时区分来源。 |
 | 文件语义 | **首个事件写出时**若 `trace.path` 已存在则截断覆盖并 stderr warn 一次（v1.5 惰性打开：构造不碰文件，死于配置/输入校验的运行不触碰旧 trace；保留历史请改名或另配 trace.path）。trace 不做 .part 原子改名——它是逐批 flush 的流式日志，异常终止时已 flush 的行即有效前缀（首行仍为本次 run.start）。 |
+| 帧粒度事件（v1.12） | 两个新事件（7.2 目录两行；事件名前缀自动路由既有 `classify` / `annotate` 通道，**通道枚举维持 11 值**）：① `classify.frame`——**每 episode 一发**（ids = (episode_id,)），payload = `members`（判决成员数）/ `windows`（分窗数）/ `fallback`（兜底帧数）三计数（3.13.7）；② `annotate.frame`——**每成员一发**（ids = (episode_id,)），payload = `member_id` / `status`（annotated \| skipped \| failed）/ `attempts`，标注内容仅经既有 `excerpt` 键按档位分级（excerpt/full 档 200 字截断，7.4），**不新增任何承载数据内容的 payload 键**（none 档预脱敏载荷直通 console 面板的红线，3.5.5）。 |
 
 ### 3.12.5 配置项
 

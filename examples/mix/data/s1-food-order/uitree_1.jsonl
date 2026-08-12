@@ -1,0 +1,8 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.food"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "美食外卖", "bounds": [24, 20, 200, 56], "visible": true, "package": "com.example.food"}
+{"id": "2", "parent": "0", "class": "EditText", "text": "", "bounds": [24, 80, 296, 128], "visible": true, "package": "com.example.food", "content_desc": "搜索美食"}
+{"id": "3", "parent": "0", "class": "Button", "text": "搜索", "bounds": [308, 80, 376, 128], "visible": true, "package": "com.example.food"}
+{"id": "4", "parent": "0", "class": "TextView", "text": "推荐餐厅", "bounds": [24, 160, 160, 188], "visible": true, "package": "com.example.food"}
+{"id": "5", "parent": "0", "class": "Button", "text": "金牌黄焖鸡 4.9 分", "bounds": [24, 200, 376, 260], "visible": true, "package": "com.example.food"}
+{"id": "6", "parent": "0", "class": "Button", "text": "老面坊牛肉面 4.7 分", "bounds": [24, 276, 376, 336], "visible": true, "package": "com.example.food"}
+{"id": "7", "parent": "0", "class": "Button", "text": "青禾轻食沙拉 4.5 分", "bounds": [24, 352, 376, 412], "visible": true, "package": "com.example.food"}

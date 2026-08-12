@@ -310,6 +310,9 @@ def test_template_head_tokens_match_operator_constants():
     heads = {
         "classify": (classify._SYSTEM_HEAD_SINGLE, classify._SYSTEM_HEAD_MULTI),
         "annotate": (annotate._SCHEMA_SENTENCE,),
+        # v1.12 帧级标注头 = 帧模板系统侧完整静态脚手架（[任务] 标签 + Schema
+        # 约束句，§10.13）——生效指令/帧 Schema 文本在 M1 静态预检各自计量。
+        "frame_annotate": (annotate._FRAME_SYSTEM_STATIC,),
         "verify": (verify._SYSTEM_HEAD, verify._SYSTEM_DIMS, verify._SYSTEM_TAIL,
                    verify._SEQ_SYSTEM_HEAD, verify._SEQ_SYSTEM_DIMS,
                    verify._SEQ_SYSTEM_DEFECT_TYPES, verify._SEQ_SYSTEM_TAIL,
@@ -319,6 +322,16 @@ def test_template_head_tokens_match_operator_constants():
     }
     for stage, texts in heads.items():
         assert TEMPLATE_HEAD_TOKENS[stage] == max(est_text(t) for t in texts), stage
+
+
+def test_template_head_tokens_frame_classify_matches_operator_constant():
+    """v1.12 帧级分类跨层等式（V22 家族）：预算冻结常量 == est_text(classify 模块
+    的帧级模板头常量 _FRAME_SYSTEM_HEAD，§10.12)——修订帧级模板即翻红，常量随
+    CONTRACTS 修订跟进。frame_annotate 的等式由帧级标注侧另行同步，不在本断言内。"""
+    from labelkit.operators import classify
+
+    assert (TEMPLATE_HEAD_TOKENS["frame_classify"]
+            == est_text(classify._FRAME_SYSTEM_HEAD))
 
 
 def test_template_head_tokens_quality_and_generate_inline_literals():
@@ -342,10 +355,13 @@ def test_template_head_tokens_quality_and_generate_inline_literals():
     assert generate_sentence in system_text
 
 
-def test_template_head_tokens_covers_all_eight_stages():
+def test_template_head_tokens_covers_all_ten_stages():
+    # v1.12：闭集加 frame_classify / frame_annotate 两键（值已由下方跨层
+    # 等式测试与算子帧模板冻结常量逐字对齐）。
     assert set(TEMPLATE_HEAD_TOKENS) == {"segment", "classify", "quality",
                                          "annotate", "verify", "generate",
-                                         "stitch", "extract"}
+                                         "stitch", "extract",
+                                         "frame_classify", "frame_annotate"}
     assert all(v > 0 for v in TEMPLATE_HEAD_TOKENS.values())
 
 

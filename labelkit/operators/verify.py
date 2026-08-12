@@ -18,14 +18,17 @@ member surgery per round: concurrent review → synchronous defect routing in ba
 position order (shrink / reclaim-claim / mark-only) → concurrent reclaim re-judgment
 (``segment.judge_window`` direct calls) → concurrent seam re-extraction
 (``extract.extract_transition`` direct calls) → synchronous record/transitions rebuild
-→ concurrent re-annotation → next-round re-review. The non-stream path is a REGRESSION
-ANCHOR: ``run_verify_loop``, ``VERDICT_SCHEMA`` usage and the classic prompt are
-byte-unchanged.
+→ v1.12 帧产物同步（收缩删键 + ``classify_frames``/``annotate_member`` 回收补跑，
+SPEC-frame-annotation §3.4）→ concurrent re-annotation → next-round re-review. The
+non-stream path is a REGRESSION ANCHOR: ``run_verify_loop``, ``VERDICT_SCHEMA`` usage
+and the classic prompt are byte-unchanged.
 
 Import note: the service/sibling modules this stage composes (``labelkit.common.runtime.llm_client``,
 ``labelkit.common.runtime.schema_engine``, ``labelkit.operators.annotate``, and for the stream repair path the
 sanctioned direct-call surfaces ``labelkit.operators.segment.judge_window`` /
-``labelkit.operators.extract.extract_transition``) are imported lazily inside the functions that
+``labelkit.operators.extract.extract_transition`` / v1.12 帧产物回收补跑的
+``labelkit.operators.classify.classify_frames`` 与 ``labelkit.operators.annotate.annotate_member``
+—— CONTRACTS §1.1 算子间导入白名单第四向) are imported lazily inside the functions that
 need them, so importing ``labelkit.verify`` (and unit-testing its pure logic) never
 requires those files to exist yet. The imported names and their use match CONTRACTS.md
 exactly.
@@ -874,10 +877,11 @@ class VerifyStage:
 
     # ── v1.8 stream driver: sequence review + two-phase batch repair (S7/S8) ──
     #
-    # Determinism contract (S8): zero rng; LLM calls happen ONLY inside the four
+    # Determinism contract (S8): zero rng; LLM calls happen ONLY inside the
     # gathers — (a) review, (c) reclaim re-judgment, (d) seam re-extraction,
-    # (f) re-annotation; every state write happens in the synchronous passes
-    # between them, in batch position order (the classify fan-out precedent).
+    # (e2) v1.12 frame-product backfill, (f) re-annotation; every state write
+    # happens in the synchronous passes between them, in batch position order
+    # (the classify fan-out precedent).
 
     async def _run_stream_driver(self, batch: list[PipelineItem],
                                  episodes: list[PipelineItem],
@@ -968,6 +972,19 @@ class VerifyStage:
                 if id(state) in dead or not state.surgical:
                     continue
                 self._rebuild_episode(state)
+
+            # ── (e2) v1.12 帧产物同步（SPEC-frame-annotation §3.4）：先收缩
+            # 删键（同步、批位序），再回收补跑（帧分类先行、帧标注按新鲜帧类
+            # 查视图，两次并发懒加载）。克隆信封被既有 S8 判据挡在手术之外
+            # （_route_defects 对克隆永不置 surgical），帧产物同步天然只发生在
+            # 首标签信封上，无克隆分支——克隆按引用共享同一 dict，随之生效。
+            synced = [state for state in repairing
+                      if id(state) not in dead and state.surgical]
+            for state in synced:
+                self._shrink_frame_products(state.item)
+            dead |= await self._backfill_frame_classify(synced, ctx)
+            dead |= await self._backfill_frame_annotate(
+                [state for state in synced if id(state) not in dead], ctx)
 
             # ── (f) concurrent re-annotation of surgical/label_mismatch ─────
             jobs = [state for state in repairing if id(state) not in dead]
@@ -1330,6 +1347,116 @@ class VerifyStage:
                                                        index=j))
             item.transitions = tuple(rebuilt)
         item.stream_repaired = True  # type: ignore[attr-defined]  # → _meta.stream.repaired
+
+    # ── (e2) v1.12 帧产物同步（SPEC-frame-annotation §3.4 手术同步）──────────
+
+    @staticmethod
+    def _shrink_frame_products(item: PipelineItem) -> None:
+        """收缩同步：成员手术后不再属于 record.members 的成员 id 从两个帧产物
+        dict 中删键，含值为 None 的 failed 占位键——不留无主条目。仅当对应 dict
+        非 None 时操作（dict None = 帧 pass 未运行：降格会话/帧粒度关闭/非首
+        标签，语义必须保持，永不无中生有）；dict 对象本身从不更换——扇出克隆
+        按引用共享同一 dict 的前提。"""
+        kept = {member.id for member in item.record.members}
+        for products in (item.member_classifications, item.member_annotations):
+            if products is None:
+                continue
+            for member_id in [k for k in products if k not in kept]:
+                del products[member_id]
+
+    async def _backfill_frame_classify(self, states: list[_EpisodeReview],
+                                       ctx: "RunContext") -> set[int]:
+        """回收补跑·帧分类：新入 record.members 且 member_classifications 缺键
+        的成员经 classify_frames 单元素调用补分类——只补缺位（幂等），门 =
+        frame_classify.enabled ∧ dict 非 None。窗口失败在 classify_frames 内落
+        fallback_class（§3.2 语义，契约上不抛记录级异常）；gather + dead 集合
+        形态镜像 _reseam_episodes（记录级隔离，兜底大三样之外的意外逃逸）。"""
+        jobs: list[tuple[_EpisodeReview, Record]] = []
+        if self.cfg.frame_classify.enabled:
+            for state in states:
+                classifications = state.item.member_classifications
+                if classifications is None:
+                    continue
+                jobs.extend((state, member)
+                            for member in state.item.record.members
+                            if member.id not in classifications)
+        dead: set[int] = set()
+        if not jobs:
+            return dead
+        # 懒加载 M13 公开直调面（CONTRACTS §1.1 算子间导入白名单第四向）。
+        from labelkit.operators.classify import classify_frames
+
+        outcomes = await asyncio.gather(
+            *(classify_frames([member], ctx) for _, member in jobs),
+            return_exceptions=True)
+        for (state, member), outcome in zip(jobs, outcomes):
+            if isinstance(outcome, BaseException):
+                if isinstance(outcome, _BIG_THREE):
+                    raise outcome
+                if id(state) not in dead:
+                    dead.add(id(state))
+                    self._fail_item(state.item, outcome, ctx)
+                continue
+            state.item.member_classifications[member.id] = outcome[member.id]
+        return dead
+
+    async def _backfill_frame_annotate(self, states: list[_EpisodeReview],
+                                       ctx: "RunContext") -> set[int]:
+        """回收补跑·帧标注：member_annotations 缺键的成员按帧类查
+        frame_class_views——视图 enabled=false ⇒ 跳过类不占键（emitter 按缺键
+        推导 skipped）；frame.classify 关 ⇒ label=None 走全局指令；
+        annotate_member 不可修复返回 None ⇒ 占键 None（failed 语义）。门 =
+        frame_annotate.enabled ∧ dict 非 None，只补缺位（幂等）；必须在帧分类
+        补跑落键之后运行（帧类取新鲜判决）。gather + dead 集合形态镜像
+        _reseam_episodes（annotate_member 契约上不抛，兜底同上）。"""
+        jobs: list[tuple[_EpisodeReview, Record, str | None]] = []
+        if self.cfg.frame_annotate.enabled:
+            for state in states:
+                jobs.extend(self._frame_annotate_jobs(state, ctx))
+        dead: set[int] = set()
+        if not jobs:
+            return dead
+        # 懒加载 M5 修复面族成员（CONTRACTS §1.1 算子间导入白名单第四向）。
+        from labelkit.operators.annotate import annotate_member
+
+        outcomes = await asyncio.gather(
+            *(annotate_member(member, ctx, label=label)
+              for _, member, label in jobs),
+            return_exceptions=True)
+        for (state, member, _label), outcome in zip(jobs, outcomes):
+            if isinstance(outcome, BaseException):
+                if isinstance(outcome, _BIG_THREE):
+                    raise outcome
+                if id(state) not in dead:
+                    dead.add(id(state))
+                    self._fail_item(state.item, outcome, ctx)
+                continue
+            state.item.member_annotations[member.id] = outcome
+        return dead
+
+    def _frame_annotate_jobs(
+        self, state: _EpisodeReview, ctx: "RunContext",
+    ) -> list[tuple[_EpisodeReview, Record, str | None]]:
+        """单 episode 的帧标注补跑工单：缺键成员 × 帧类视图门——label 与视图
+        判定镜像 M5 帧 pass 的成员槽位规则（annotate._frame_member），含跳过
+        类的 frame_annotate.skipped 计数（终审缺陷修复：与 M5 供数点同口径，
+        report 与 members[] 状态直方图可对账）。"""
+        item = state.item
+        if item.member_annotations is None:
+            return []
+        jobs: list[tuple[_EpisodeReview, Record, str | None]] = []
+        for member in item.record.members:
+            if member.id in item.member_annotations:
+                continue
+            cls = (item.member_classifications or {}).get(member.id)
+            label = cls.label if cls is not None else None
+            view = (self.cfg.frame_class_views.get(label)
+                    if label is not None else None)
+            if view is not None and not view.enabled:
+                ctx.metrics.count("frame_annotate.skipped")
+                continue                     # 跳过类不占键（skipped 语义）
+            jobs.append((state, member, label))
+        return jobs
 
     # ── (f) re-annotation + finalization ────────────────────────────────────
 

@@ -161,6 +161,11 @@ def test_happy_path_defaults(env):
     assert cfg.trace.path == str(env.out_dir / "result.trace.jsonl")
     assert cfg.limit is None and cfg.strict is False and cfg.dry_run is False
     assert cfg.user_schema["type"] == "object"
+    # v1.12 帧粒度四字段：全关默认（字节等价 v1.11）
+    assert cfg.frame_classify.enabled is False
+    assert cfg.frame_annotate.enabled is False
+    assert cfg.frame_class_views == {}
+    assert cfg.frame_schema is None
 
 
 def test_digests_are_sha256_of_raw_bytes(env):
@@ -2565,3 +2570,429 @@ def test_static_precheck_class_views_within_budget_stay_silent(env, capsys):
                    project_text=env.project(body=body))
     assert isinstance(cfg, ResolvedConfig)
     assert "[annotate]: 静态系统侧提示部件估算" not in capsys.readouterr().err
+
+
+# ── v1.12: [frame.*] 帧级分类与标注（SPEC-frame-annotation §3.1 七条约束） ────
+
+
+FRAME_SCHEMA = json.dumps({
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "properties": {
+        "intent": {"type": "string"},
+        "entities": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["intent", "entities"],
+    "additionalProperties": False,
+}, ensure_ascii=False)
+
+FRAME_CLASSIFY_ONLY = """\
+[frame.classify]
+enabled = true
+fallback_class = "other"
+
+[[frame.classify.classes]]
+name = "task_request"
+description = "发起一项新任务的请求"
+
+[[frame.classify.classes]]
+name = "chitchat"
+description = "与任务无关的闲聊"
+
+[[frame.classify.classes]]
+name = "other"
+description = "其余帧"
+"""
+
+FRAME_ANNOTATE_ONLY = f"""\
+[frame.annotate]
+enabled = true
+instruction = "标注帧意图"
+schema_inline = '''
+{FRAME_SCHEMA}
+'''
+"""
+
+
+def test_frame_sections_default_when_absent(env):
+    cfg = env.load()
+    assert cfg.frame_classify.enabled is False
+    assert cfg.frame_classify.llm == "default"
+    assert cfg.frame_classify.fallback_class == ""
+    assert cfg.frame_classify.classes == ()
+    assert cfg.frame_classify.vision_resolved is False
+    assert cfg.frame_annotate.enabled is False
+    assert cfg.frame_annotate.llm == "default"
+    assert cfg.frame_annotate.instruction == ""
+    assert cfg.frame_annotate.examples == ()
+    assert cfg.frame_annotate.schema_path is None
+    assert cfg.frame_annotate.schema_inline is None
+    assert cfg.frame_class_views == {}
+    assert cfg.frame_schema is None
+
+
+def test_frame_happy_path_materializes_views_and_schema(env):
+    body = (SEG_ON + "\n" + FRAME_CLASSIFY_ONLY + "\n" + FRAME_ANNOTATE_ONLY
+            + 'examples = [{input = "订火车票", '
+              'output = {intent = "book_train", entities = ["上海", "明天"]}}]\n'
+            + """
+[frame.class.task_request.annotate]
+instruction = "标注任务请求帧的意图与实体。"
+
+[frame.class.chitchat.annotate]
+enabled = false
+""")
+    cfg = env.load(project_text=env.project(body=body))
+    assert [c.name for c in cfg.frame_classify.classes] == [
+        "task_request", "chitchat", "other"]
+    assert cfg.frame_classify.fallback_class == "other"
+    assert cfg.frame_annotate.instruction == "标注帧意图"
+    assert cfg.frame_annotate.examples[0].output == {
+        "intent": "book_train", "entities": ["上海", "明天"]}   # 干跑通过
+    assert cfg.frame_schema == json.loads(FRAME_SCHEMA)
+    # 每个已声明帧类各得一份视图（零覆盖类含在内，class_views 同款）
+    assert set(cfg.frame_class_views) == {"task_request", "chitchat", "other"}
+    t = cfg.frame_class_views["task_request"]
+    assert t.instruction == "标注任务请求帧的意图与实体。"
+    assert t.enabled is True
+    assert t.examples == cfg.frame_annotate.examples   # 未覆盖键继承全局
+    c = cfg.frame_class_views["chitchat"]
+    assert c.instruction == "标注帧意图"                # 继承全局指令
+    assert c.enabled is False                           # 该类成员跳过帧标注
+    o = cfg.frame_class_views["other"]
+    assert o.instruction == "标注帧意图" and o.enabled is True
+    # 全局节不被类覆盖污染
+    assert cfg.frame_annotate.instruction == "标注帧意图"
+
+
+def test_frame_requires_stream_mode(env):
+    # 约束·帧粒度要求流模式（两开关各自定位报错 + 非流模式指引）
+    errors = env.errors(project_text=env.project(body=FRAME_CLASSIFY_ONLY))
+    has(errors, "[frame.classify].enabled: frame.classify.enabled = true 要求 "
+                "segment.enabled = true")
+    has(errors, "classify + [class.<name>.annotate]")
+    errors = env.errors(project_text=env.project(body=FRAME_ANNOTATE_ONLY))
+    has(errors, "[frame.annotate].enabled: frame.annotate.enabled = true 要求 "
+                "segment.enabled = true")
+
+
+def test_frame_class_requires_frame_classify(env):
+    body = SEG_ON + '\n[frame.class.task_request.annotate]\ninstruction = "x"\n'
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[frame.class.task_request]: [frame.class.*] 在场要求 "
+                "frame.classify.enabled = true")
+
+
+def test_frame_class_unknown_name_rejected(env):
+    body = (SEG_ON + "\n" + FRAME_CLASSIFY_ONLY
+            + '\n[frame.class.ghost.annotate]\ninstruction = "x"\n')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[frame.class.ghost]: 类名 "ghost" 不在 [[frame.classify.classes]] '
+                "中，可用：task_request、chitchat、other")
+
+
+def test_frame_class_whitelist_enforced(env):
+    body = (SEG_ON + "\n" + FRAME_CLASSIFY_ONLY + """
+[frame.class.task_request.quality]
+threshold = 0.5
+
+[frame.class.task_request.annotate]
+llm = "judge"
+instruction = "任务请求帧标注指令。"
+""")
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[frame.class.task_request.quality]: [frame.class.*] 覆盖节不在"
+                "白名单内（可用：annotate）")
+    has(errors, "[frame.class.task_request.annotate].llm: [frame.class.*.annotate] "
+                "不可覆盖该键（白名单：instruction、examples、enabled）")
+    # 白名单内键不误伤
+    assert not any(".instruction" in e for e in errors)
+
+
+def test_frame_schema_exactly_one_source(env):
+    body = SEG_ON + '\n[frame.annotate]\nenabled = true\ninstruction = "标"\n'
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[frame.annotate].schema_path: 须恰好提供 schema_path 或 "
+                "schema_inline 其一，得到两者均缺失")
+    body = SEG_ON + "\n" + FRAME_ANNOTATE_ONLY + 'schema_path = "x.json"\n'
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[frame.annotate].schema_inline: 与 schema_path 恰好提供其一"
+                "（互斥），得到两者均设置")
+
+
+def test_frame_schema_meta_validation_branches(env):
+    prefix = SEG_ON + '\n[frame.annotate]\nenabled = true\ninstruction = "标"\n'
+    errors = env.errors(project_text=env.project(
+        body=prefix + "schema_inline = '{bad'\n"))
+    has(errors, "[frame.annotate].schema_inline: 期望合法 JSON")
+    errors = env.errors(project_text=env.project(
+        body=prefix + "schema_inline = '[1, 2]'\n"))
+    has(errors, "[frame.annotate].schema_inline: 帧级 Schema 顶层必须为 JSON 对象")
+    errors = env.errors(project_text=env.project(
+        body=prefix + 'schema_inline = \'{"type": "object", "properties": 3}\'\n'))
+    has(errors, "[frame.annotate].schema_inline: 未通过 JSON Schema draft 2020-12 "
+                "元 Schema 校验")
+    errors = env.errors(project_text=env.project(
+        body=prefix + 'schema_inline = \'{"type": "array"}\'\n'))
+    has(errors, '[frame.annotate].schema_inline: 帧级 Schema 顶层 type 必须为 "object"')
+
+
+def test_frame_schema_path_variant_and_unreadable(env):
+    schema_file = env.tmp / "frame_schema.json"
+    schema_file.write_text(FRAME_SCHEMA, encoding="utf-8")
+    prefix = SEG_ON + '\n[frame.annotate]\nenabled = true\ninstruction = "标"\n'
+    cfg = env.load(project_text=env.project(
+        body=prefix + f'schema_path = "{schema_file}"\n'))
+    assert cfg.frame_schema == json.loads(FRAME_SCHEMA)
+    assert cfg.frame_annotate.schema_path == str(schema_file)
+    errors = env.errors(project_text=env.project(
+        body=prefix + 'schema_path = "ghost/frame.json"\n'))
+    has(errors, "[frame.annotate].schema_path: 无法读取 Schema 文件")
+
+
+def test_frame_schema_dangling_ref_is_config_error(env):
+    bad = json.dumps({"type": "object",
+                      "properties": {"x": {"$ref": "#/$defs/ghost"}}})
+    body = (SEG_ON + '\n[frame.annotate]\nenabled = true\ninstruction = "标"\n'
+            + f"schema_inline = '''\n{bad}\n'''\n")
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[frame.annotate].schema_inline: 帧级 Schema 引用无法解析")
+
+
+def test_frame_examples_dryrun_against_frame_schema(env):
+    body = (SEG_ON + "\n" + FRAME_ANNOTATE_ONLY
+            + 'examples = [{input = "订票", '
+              'output = {intent = "book", entities = 3}}]\n')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[[frame.annotate.examples]][1].output: 未通过帧级 Schema")
+
+
+def test_frame_class_examples_dryrun_against_frame_schema(env):
+    body = (SEG_ON + "\n" + FRAME_CLASSIFY_ONLY + "\n" + FRAME_ANNOTATE_ONLY + """
+[frame.class.task_request.annotate]
+examples = [{input = "订票", output = {intent = "book", entities = "上海"}}]
+""")
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[[frame.class.task_request.annotate.examples]][1].output: "
+                "未通过帧级 Schema")
+
+
+def test_frame_meta_mode_guard(env):
+    body = (SEG_ON + "\n" + FRAME_CLASSIFY_ONLY + f"""
+[output]
+meta_mode = "none"
+schema_inline = '''
+{SCHEMA}
+'''
+""")
+    errors = env.errors(project_text=env.project(body=body, include_output=False))
+    has(errors, "[output].meta_mode: 帧粒度（frame.classify / frame.annotate）"
+                '启用时不得为 "none"')
+    # sidecar 合法
+    cfg = env.load(project_text=env.project(
+        body=body.replace('meta_mode = "none"', 'meta_mode = "sidecar"'),
+        include_output=False))
+    assert cfg.output.meta_mode == "sidecar"
+
+
+def test_frame_fallback_required_and_member(env):
+    body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY.replace('fallback_class = "other"\n', "")
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[frame.classify].fallback_class: frame.classify.enabled = true "
+                "时必填，期望 [[frame.classify.classes]] 中的类名")
+    body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY.replace('fallback_class = "other"',
+                                                       'fallback_class = "ghost"')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[frame.classify].fallback_class: 引用的类名 "ghost" 不在 '
+                "[[frame.classify.classes]] 中，可用：task_request、chitchat、other")
+
+
+def test_frame_fallback_with_empty_class_table_rejected(env):
+    # fallback ∈ 帧类表 传递性地要求类表非空（v1.12 无独立 ≥N 类数规则）
+    body = SEG_ON + '\n[frame.classify]\nenabled = true\nfallback_class = "x"\n'
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[frame.classify].fallback_class: 引用的类名 "x" 不在 '
+                "[[frame.classify.classes]] 中，可用：（无）")
+
+
+def test_frame_classes_name_pattern_uniqueness_description(env):
+    body = SEG_ON + """
+[frame.classify]
+enabled = true
+fallback_class = "qa"
+
+[[frame.classify.classes]]
+name = "Q-A"
+description = "坏名字"
+
+[[frame.classify.classes]]
+name = "qa"
+description = "问答"
+
+[[frame.classify.classes]]
+name = "qa"
+description = "重复"
+
+[[frame.classify.classes]]
+name = "empty_desc"
+"""
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[[frame.classify.classes]][1].name: 期望匹配 [a-z0-9_]+，得到 "Q-A"')
+    has(errors, '[[frame.classify.classes]][3].name: 表内 name 须唯一，得到重复的 "qa"')
+    has(errors, "[[frame.classify.classes]][4].description: 缺失必填键")
+
+
+def test_frame_directed_probes(env, capsys):
+    # 约束·定向探针（v1.11 use_vision 原始节探针同款）：两键显式书写 ⇒ 定向报错
+    body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY.replace(
+        "enabled = true", 'enabled = true\nassignment = "single"')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[frame.classify].assignment: 帧级分类不提供 assignment")
+    has(errors, "[classify].assignment")            # 指引指向序列级
+    body = SEG_ON + "\n" + FRAME_ANNOTATE_ONLY + "self_consistency = 3\n"
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[frame.annotate].self_consistency: 帧级标注不提供 self_consistency")
+    has(errors, "[annotate].self_consistency")      # 指引指向序列级
+    # 永不经未知键前向兼容 WARN 双重上报
+    err = capsys.readouterr().err
+    assert "[frame.classify].assignment: 未知键" not in err
+    assert "[frame.annotate].self_consistency: 未知键" not in err
+
+
+def test_frame_class_examples_ignored_warns(env, capsys):
+    # 帧级批量判决模板不渲染类别示例（§10.12，与序列级 §10.8 有意不同）——
+    # 显名 WARN 而非静默无效；且静态预检口径同步不计 examples。
+    body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY.replace(
+        'description = "发起一项新任务的请求"',
+        'description = "发起一项新任务的请求"\nexamples = ["帮我订一张明天的高铁票"]')
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.frame_classify.classes[0].examples == ("帮我订一张明天的高铁票",)
+    err = capsys.readouterr().err
+    assert "[frame.classify].classes" in err and "不渲染" in err
+
+
+def test_frame_class_no_examples_no_render_warning(env, capsys):
+    env.load(project_text=env.project(body=SEG_ON + "\n" + FRAME_CLASSIFY_ONLY))
+    assert "不渲染" not in capsys.readouterr().err
+
+
+def test_frame_parked_joins_parked_list_when_segment_off(env, capsys):
+    # 约束·no-op：[frame.*] 在场 ∧ 均未启用 ∧ segment off ⇒ R8 停放清单
+    cfg = env.load(project_text=env.project(body='[frame.classify]\nllm = "judge"\n'))
+    assert cfg.frame_classify.enabled is False
+    err = capsys.readouterr().err
+    assert "[segment].enabled" in err and "[frame]" in err
+    assert "不会生效" in err
+
+
+def test_frame_parked_no_warn_when_segment_on(env, capsys):
+    body = SEG_ON + '\n[frame.classify]\nllm = "judge"\n'
+    env.load(project_text=env.project(body=body))
+    assert "[frame]" not in capsys.readouterr().err
+
+
+def test_frame_enabled_never_joins_parked_list(env, capsys):
+    # 任一帧开关启用 + segment off ⇒ CONFIG_ERROR 接管，不再入停放清单
+    with pytest.raises(ConfigError):
+        env.load(project_text=env.project(body=FRAME_CLASSIFY_ONLY))
+    assert "[frame]" not in capsys.readouterr().err
+
+
+def test_frame_annotate_llm_needs_vision_on_ui(env):
+    # vision 语义分列：frame.annotate.llm 在 ui ∧ enabled 时无条件入 vision 必需集
+    body = (SEG_ON + 'strategy = "rules"\n\n' + FRAME_ANNOTATE_ONLY
+            + 'llm = "novision"\n')
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    errors = env.errors(config_text=BASE_CONFIG + NOVISION_PROFILE,
+                        project_text=project)
+    has(errors, "[llm.novision].supports_vision: UI 模态被 frame.annotate 阶段引用")
+
+
+def test_frame_classify_llm_never_needs_vision_and_vision_resolved_derives(env):
+    # vision 语义分列：frame.classify.llm 永不入 vision 必需集——附图与否由
+    # vision_resolved 解析产物自适应（ui ∧ enabled ∧ supports_vision）
+    body = (SEG_ON + 'strategy = "rules"\n\n'
+            + FRAME_CLASSIFY_ONLY.replace("enabled = true",
+                                          'enabled = true\nllm = "novision"'))
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    cfg = env.load(config_text=BASE_CONFIG + NOVISION_PROFILE, project_text=project)
+    assert cfg.frame_classify.llm == "novision"
+    assert cfg.frame_classify.vision_resolved is False   # capability off → 纯文本判决
+    body = (SEG_ON + 'strategy = "rules"\n\n'
+            + FRAME_CLASSIFY_ONLY.replace("enabled = true",
+                                          'enabled = true\nllm = "judge"'))
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    cfg = env.load(project_text=project)
+    assert cfg.frame_classify.vision_resolved is True    # ui ∧ enabled ∧ 有视觉
+    # 文本模态：即便 profile 有视觉能力也恒 False
+    cfg = env.load(project_text=env.project(body=SEG_ON + "\n" + FRAME_CLASSIFY_ONLY))
+    assert cfg.frame_classify.vision_resolved is False
+
+
+def test_frame_vision_resolved_false_while_disabled(env):
+    body = SEG_ON + 'strategy = "rules"\n\n[frame.classify]\nllm = "judge"'
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    cfg = env.load(project_text=project)
+    assert cfg.frame_classify.vision_resolved is False
+
+
+def test_frame_llm_existence_and_key_when_enabled(env, monkeypatch):
+    body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY.replace(
+        "enabled = true", 'enabled = true\nllm = "ghost"')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '[frame.classify].llm: 引用的 profile "ghost" 不存在于 '
+                "config.toml [llm.*]")
+    monkeypatch.delenv("LK_TEST_KEY_JUDGE")
+    body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY.replace(
+        "enabled = true", 'enabled = true\nllm = "judge"')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '环境变量 "LK_TEST_KEY_JUDGE" 未设置或为空')
+    body = SEG_ON + "\n" + FRAME_ANNOTATE_ONLY + 'llm = "judge"\n'
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, '环境变量 "LK_TEST_KEY_JUDGE" 未设置或为空')
+
+
+def test_frame_llm_not_referenced_when_disabled(env, monkeypatch):
+    monkeypatch.delenv("LK_TEST_KEY_JUDGE")
+    body = (SEG_ON + '\n[frame.classify]\nllm = "judge"\n\n'
+            '[frame.annotate]\nllm = "judge"\n')
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.llm_profiles["judge"].api_key == ""    # unreferenced, key not resolved
+
+
+def test_frame_annotate_instruction_required_when_enabled(env):
+    body = (SEG_ON + "\n[frame.annotate]\nenabled = true\n"
+            + f"schema_inline = '''\n{FRAME_SCHEMA}\n'''\n")
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[frame.annotate].instruction: frame.annotate.enabled = true 时必填，"
+                "期望非空字符串")
+
+
+def test_frame_static_precheck_error_when_nothing_fits(env):
+    # V13③ 帧级标注段：头 96 + 帧 Schema + instruction("标"×300) ≥ ib 281 (cw 4864)
+    body = (SEG_ON + "\n"
+            + FRAME_ANNOTATE_ONLY.replace('instruction = "标注帧意图"',
+                                          f'instruction = "{"标" * 300}"'))
+    errors = env.errors(config_text=_cw_config(4864),
+                        project_text=env.project(body=body))
+    has(errors, "[frame.annotate]: 静态系统侧提示部件估算")
+    has(errors, "任何记录都装不下")
+
+
+def test_frame_classify_static_precheck_counts_class_table(env):
+    # V13③ 帧级分类段：头 96 + 帧类表（300 CJK 描述）≥ ib 281 (cw 4864)
+    body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY.replace(
+        'description = "其余帧"', f'description = "{"类" * 300}"')
+    errors = env.errors(config_text=_cw_config(4864),
+                        project_text=env.project(body=body))
+    has(errors, "[frame.classify]: 静态系统侧提示部件估算")
+
+
+def test_frame_static_precheck_silent_with_room(env, capsys):
+    body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY + "\n" + FRAME_ANNOTATE_ONLY
+    cfg = env.load(config_text=_cw_config(131072),
+                   project_text=env.project(body=body))
+    assert isinstance(cfg, ResolvedConfig)
+    err = capsys.readouterr().err
+    assert "[frame.classify]: 静态系统侧提示部件估算" not in err
+    assert "[frame.annotate]: 静态系统侧提示部件估算" not in err

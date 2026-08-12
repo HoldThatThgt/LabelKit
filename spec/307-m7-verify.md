@@ -53,6 +53,13 @@ user:   [任务指令] {annotate.instruction}
 4. **同步重建**：record 以新成员集重建（替换 `members`；序列 **id 不重算**，3.14.4 拼装行）、transitions 重编号——`Transition.index` 恒 = 元组下标、不变量 `len(transitions) = len(members) − 1` 恒真（4.2，S31）；
 5. **并发重标注与复审**：`annotate_record(..., transitions=重建值)`（3.5.2 transitions 形参段）→ 下一轮评审。
 
+**帧产物同步（v1.12）**：第 4 步同步重建之后、第 5 步重标注之前，对本轮执行了成员手术的 episode 同步两个帧产物 dict（`member_classifications` / `member_annotations`，4.1）——手术改了成员集，帧产物必须随成员集走，否则 members[] 落盘时出现无主条目或缺帧：
+
+- **收缩删键**：不再属于 `record.members` 的成员 id 从两 dict 删键，**含值为 None 的 failed 占位键**（不留无主条目）；仅当对应 dict 非 None 时操作；dict 对象本身**从不更换**（扇出克隆按引用共享同一 dict 的前提，4.3 补注）。
+- **回收补跑**（懒加载，幂等只补缺位）：新入 `record.members` 且键缺位的成员先经 `classify.classify_frames([member], ctx)` **单元素调用**补帧分类（`frame.classify.enabled` ∧ dict 非 None 时；窗口失败在 classify_frames 内落 `fallback_class`，契约上不抛记录级异常，3.13.7），再经 `annotate.annotate_member(member, ctx, label)` 补帧标注（`frame.annotate.enabled` ∧ dict 非 None 时；帧标注补跑必须在帧分类补跑落键之后——帧类取新鲜判决；帧类视图 `enabled=false` ⇒ **跳过类不占键**（emitter 按缺键推导 skipped）；`frame.classify` 关 ⇒ label=None 走全局指令；不可修复返回 None ⇒ 占键 None，同 3.5.5 失败语义）。并发形态与记录级隔离镜像接缝重摘取（gather + dead 集合）。
+- **dict None 全程不触碰**：dict 为 None = 帧 pass 未运行（降格会话 / 帧粒度关闭 / 非首标签），收缩与补跑均不触碰——降格语义保持、永不无中生有。
+- **克隆无同步分支**：克隆信封永不手术（既有 S8——multi 扇出克隆的 membership 类手术只标记，仅原信封可执行），故帧产物同步不需要克隆分支；懒加载直调面由三个扩为**四个**（`classify.classify_frames` 为算子间导入白名单第四向；`annotate_member` 并入既有 annotate 修复面族——CONTRACTS §1.1）。
+
 **wrong_stitch 路由（v1.9，独立分支）**：**只标记、不拆线**——自动拆线手术是 v1.9 非目标（8.1），本缺陷不进上述三类手术路由，尤其**不得落入 missing_\* 的噪声池回收扫描**（错缝的修复方向是移除碎片而非补帧，回收扫描会反向加重错缝）；repair 轮内不为其执行任何成员手术（重标注亦不能修复错缝），持续 fail 按 drop 收尾（`dropped_verify`——错缝线索 fail-closed 不入主输出）；计数入 `verify.defects.wrong_stitch`（6.4）。成员手术的回收扫描语义不变（异线索 absorbed 帧按既有 D5 邻域判定已是 neighbor mark-only，缝合不改变其结论）。
 
 修复轮数计入 `verify.max_repair_rounds`（含首评，与本节非 stream 语义一致）。状态改写授权：手术在 `absorbed` 与 `dropped_noise` 间**双向**改写成员信封状态——4.3 契约 ②b 的 M7 修复路径豁免（契约①的唯一反向豁免），**禁止翻回 `active`**（帧与其 episode 不得双写主输出）。其余裁决：multi 扇出克隆兄弟的 membership 类手术**只标记**——仅原信封（首标签）可执行（S8，3.13.4 multi × episode 行）；多评审团下 defects = 投 fail 的 judge 的**并集**，按 (kind 枚举序, position, members) 确定性去重排序，同成员的互斥手术取先序（S31）；修复后**不重打分**——沿用修复前质量分 + `_meta.stream.repaired = true` 标记（6.3；multi 下亦用于消歧同 id 兄弟行）。观测面（M7 属主，`report.stream.verify` 子块，6.4）：`verify.membership_repairs`（执行的手术数）、`verify.boundary_flags`（只标记的边界判定数）、`verify.defects.<kind>`（逐缺陷类型计数）。

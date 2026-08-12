@@ -8,9 +8,10 @@ third-party dependencies; zero persistence.
 
 Layering: llm_client imports this module at runtime, so this module must never
 import llm_client (or operators) at runtime — profile/bundle/config types enter
-as duck-typed values (TYPE_CHECKING-only imports below). The data-adaptive
-greedy window packer is OPERATOR logic and lives in segment.py (spec §3.2) —
-this module supplies only the estimation/budget primitives + the calibrator.
+as duck-typed values (TYPE_CHECKING-only imports below). v1.12（装箱器下沉裁决）：
+数据自适应贪心装箱器 ``pack_windows`` 自 segment.py 原样下沉为本模块公开面——
+M14 窗口切分与 M13 帧级批量判决共用（帧级为零重叠调用形）；除此之外本模块仍只
+提供估算/预算原语 + 校准器。
 """
 from __future__ import annotations
 
@@ -67,6 +68,11 @@ TEMPLATE_HEAD_TOKENS: dict[str, int] = {
     "generate": 29,   # §10.4 structure sentence (inline literal)
     "stitch": 325,    # stitch._SYSTEM_HEAD (§10.11)
     "extract": 286,   # extract._SYSTEM_HEAD (§10.10)
+    # v1.12 帧级两键：值 = est_text(算子帧模板头常数)，由跨层等式测试钉住
+    # （test_budget 与 classify/annotate 的冻结常量逐字对齐）；同时供 M1
+    # 静态预算预检（V13③ 两新段）使用。
+    "frame_classify": 81,   # classify._FRAME_SYSTEM_HEAD (§10.12)
+    "frame_annotate": 35,   # annotate._FRAME_SYSTEM_STATIC (§10.13)
 }
 
 # CJK determination (V8): Unicode block CJK Unified Ideographs + its
@@ -238,6 +244,53 @@ def fit_text(s: str, budget_tokens: int,
         if est_text(candidate) <= budget_tokens:
             return candidate
     return _FIT_MARKER.format(n=n)
+
+
+# ── greedy budget packer（v1.12 下沉自 segment._pack_windows；V9） ───────────
+
+def pack_windows(costs: list[int], budget: int, cap: int) -> list[tuple[int, int]]:
+    """Greedy budget packer (v1.11 V9, spec 3.14.4 装填伪代码).
+
+    来历（v1.12 装箱器下沉裁决）：本函数原为 M14 私有 ``segment._pack_windows``，
+    v1.12 原样搬入本模块改为公开面——算法与行为字节等价（既有装箱测试原样守住）；
+    M14 窗口切分与 M13 帧级批量判决共用。``costs[i]`` = per-frame cost c_i,
+    ``budget`` = input_budget − est_static_system (the caller subtracts the
+    static term, so the packing condition Σ c_j ≤ budget here IS the spec's
+    est_static_system + Σ c_i ≤ input_budget), ``cap`` = window upper cap.
+
+    Windows = [start, end): the first starts at 0, every subsequent one at the
+    previous window's end − 1 — the 1-frame overlap and later-window seam
+    ownership are PRESERVED (M14 的 rel[] 覆写序依赖之); a frame joins the open
+    window while both the budget and the frame-count cap hold, overflow closes
+    the window. Every window carries ≥ 2 frames — the V10 semantic minimum: the
+    M1 w_min ≥ floor guard promises any two worst-case frames fit under PRIOR
+    image pricing (spec 3.1.4), but the packer prices off the calibrator, which
+    past CALIBRATION_MIN_SAMPLES may legitimately exceed prior × PRIOR_INFLATION
+    (no clamp, by design). A window the budget would close below 2 frames is
+    therefore FORCE-PACKED at 2 regardless of cost: if its true est really
+    exceeds the budget, the M9 pre-dispatch check owns it record-level — never
+    a run-kill, and the forced advance keeps the loop terminating. Pure
+    function of (costs, budget, cap) ⇒ deterministic rerun.
+
+    零重叠调用形（v1.12，M13 帧级批量判决专用）：帧分类窗口是不重叠切分——重叠
+    语义不适用时，调用方对返回跨度自后窗起丢弃与前窗重叠的首帧（[start+1, end)）
+    即得不重叠划分；本函数自身的跨度链约定（start = end − 1）保持冻结不变。"""
+    spans: list[tuple[int, int]] = []
+    n = len(costs)
+    start = 0
+    while start < n:
+        end = start
+        total = 0
+        while end < n and end - start < cap and total + costs[end] <= budget:
+            total += costs[end]
+            end += 1
+        if end - start < 2:
+            end = min(start + 2, n)                # forced semantic minimum
+        spans.append((start, end))
+        if end == n:
+            break
+        start = end - 1
+    return spans
 
 
 # ── static minimum-window guarantee (V9/V12) ────────────────────────────────

@@ -29,6 +29,9 @@ from labelkit.common.config.model import (
     ConsoleConfig,
     DedupConfig,
     ExtractConfig,
+    FrameAnnotateConfig,
+    FrameClassifyConfig,
+    FrameClassView,
     GenerateConfig,
     InputConfig,
     OutputConfig,
@@ -1922,3 +1925,281 @@ def test_repair_chain_budget_off_keeps_v19_call_shape(monkeypatch):
     assert ep.status == "active"
     assert len(annotate_calls) == 1
     assert "budget.escalations" not in metrics.counters
+
+
+# ── v1.12 帧产物手术同步（SPEC-frame-annotation §3.4：收缩删键/回收补跑）─────
+
+FRAME_INSTRUCTION = "标注该帧的意图。"
+
+
+def _frame_views(*, skip_chitchat=True):
+    """两个帧类视图：task_request 正常标注；chitchat 跳过（enabled=false）。"""
+    return {
+        "task_request": FrameClassView(instruction=FRAME_INSTRUCTION,
+                                       examples=(), enabled=True),
+        "chitchat": FrameClassView(instruction=FRAME_INSTRUCTION,
+                                   examples=(), enabled=not skip_chitchat),
+    }
+
+
+def _frame_stream_cfg(base=None, *, classify_on=True, annotate_on=True,
+                      **kw) -> ResolvedConfig:
+    """_stream_cfg（或显式 base）+ 帧粒度配置：帧类表 task_request/chitchat，
+    chitchat 视图跳过标注；对应开关关闭时保持默认（enabled=false、views 空、
+    frame_schema None）。"""
+    base = base if base is not None else _stream_cfg(**kw)
+    frame_classify = FrameClassifyConfig(
+        enabled=True, llm="default", fallback_class="task_request",
+        classes=(ClassSpec(name="task_request", description="任务请求帧"),
+                 ClassSpec(name="chitchat", description="闲聊帧")),
+    ) if classify_on else FrameClassifyConfig()
+    frame_annotate = FrameAnnotateConfig(
+        enabled=True, llm="default", instruction=FRAME_INSTRUCTION,
+        schema_inline='{"type": "object"}',
+    ) if annotate_on else FrameAnnotateConfig()
+    return replace(base, frame_classify=frame_classify,
+                   frame_annotate=frame_annotate,
+                   frame_class_views=_frame_views() if classify_on else {},
+                   frame_schema={"type": "object"} if annotate_on else None)
+
+
+def _member_cls(label="task_request") -> Classification:
+    return Classification(label=label, labels=(label,), source="llm", detail={})
+
+
+def _stub_classify_frames(monkeypatch, label="task_request"):
+    """帧分类直调面桩：记录每次调用的成员 id 列表，全员判给定帧类
+    （classify_frames 契约上不抛记录级异常，窗口失败在内部落 fallback）。"""
+    calls = []
+
+    async def fake(members, ctx):
+        calls.append([m.id for m in members])
+        return {m.id: Classification(label=label, labels=(label,),
+                                     source="llm", detail={})
+                for m in members}
+
+    monkeypatch.setattr("labelkit.operators.classify.classify_frames", fake)
+    return calls
+
+
+def _stub_annotate_member(monkeypatch, *, fail=False):
+    """帧标注直调面桩：记录 (member_id, label)；fail=True ⇒ 返回 None
+    （不可修复失败语义——annotate_member 契约上不抛，None 由调用方占键）。"""
+    calls = []
+
+    async def fake(member, ctx, label=None):
+        calls.append((member.id, label))
+        return None if fail else _annotation({"intent": "帧", "entities": []})
+
+    monkeypatch.setattr("labelkit.operators.annotate.annotate_member", fake)
+    return calls
+
+
+def test_shrink_deletes_stale_keys_including_none_values(monkeypatch):
+    """收缩同步：被剔成员的键从两 dict 删除（含值为 None 的 failed 占位键），
+    键集与新成员集一致；dict 对象不更换；无键缺位 ⇒ 零补跑调用。"""
+    cfg = _frame_stream_cfg(extract_enabled=False)
+    _stub_annotate(monkeypatch)
+    cf_calls = _stub_classify_frames(monkeypatch)
+    am_calls = _stub_annotate_member(monkeypatch)
+    f0, f1, f2 = _frame("f0"), _frame("f1"), _frame("f2")
+    e0, e1, e2 = _env(f0), _env(f1), _env(f2)
+    ep = _episode([f0, f1, f2])
+    c0 = _member_cls()
+    a0 = _annotation({"intent": "帧"})
+    mc = {"f0": c0, "f1": _member_cls("chitchat"), "f2": _member_cls()}
+    ma = {"f0": a0, "f1": None, "f2": _annotation({"intent": "帧"})}
+    ep.member_classifications = mc
+    ep.member_annotations = ma
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[_defect("off_task_members", members=["f1"])]),
+        _seq_obj("pass"),
+    ]})
+    _run_verify(cfg, [e0, e1, e2, ep], engine)
+    assert [m.id for m in ep.record.members] == ["f0", "f2"]
+    assert ep.member_classifications is mc         # 对象不换（克隆共享前提）
+    assert ep.member_annotations is ma
+    assert set(mc) == {"f0", "f2"}
+    assert set(ma) == {"f0", "f2"}                 # f1 的 None 值键一并删除
+    assert mc["f0"] is c0 and ma["f0"] is a0       # 既有键原样保留
+    assert cf_calls == [] and am_calls == []       # 无键缺位 ⇒ 零补跑
+
+
+def test_reclaim_backfills_both_frame_products_only_missing(monkeypatch):
+    """回收补跑：新成员补帧分类（单元素调用）+ 帧标注（label = 新鲜帧类）；
+    既有键只字未动（对象同一性断言）——幂等 = 只补缺位，含值为 None 的
+    failed 占位键不重跑。"""
+    cfg = _frame_stream_cfg(extract_enabled=False)
+    _stub_judge_window(monkeypatch, relation="continues")
+    _stub_annotate(monkeypatch)
+    cf_calls = _stub_classify_frames(monkeypatch, label="task_request")
+    am_calls = _stub_annotate_member(monkeypatch)
+    f0, f1, f2 = _frame("f0"), _frame("f1"), _frame("f2")
+    e2 = _env(f2, status="dropped_noise")
+    e2.noise_attribution = ("segment", "noise")
+    ep = _episode([f0, f1])
+    c0, c1 = _member_cls(), _member_cls("chitchat")
+    a0 = _annotation({"intent": "帧"})
+    ep.member_classifications = {"f0": c0, "f1": c1}
+    ep.member_annotations = {"f0": a0, "f1": None}     # f1 = failed 占键 None
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_tail")]),
+        _seq_obj("pass"),
+    ]})
+    _run_verify(cfg, [_env(f0), _env(f1), e2, ep], engine)
+    assert [m.id for m in ep.record.members] == ["f0", "f1", "f2"]
+    assert cf_calls == [["f2"]]                        # 单元素调用、只补缺位
+    assert am_calls == [("f2", "task_request")]        # 帧类取自补跑判决
+    assert ep.member_classifications["f0"] is c0       # 幂等：既有键对象同一
+    assert ep.member_classifications["f1"] is c1
+    assert ep.member_annotations["f0"] is a0
+    assert ep.member_annotations["f1"] is None         # failed 占位不被重跑
+    assert ep.member_classifications["f2"].label == "task_request"
+    assert ep.member_annotations["f2"] is not None
+    assert ep.status == "active"
+
+
+def test_reclaim_skip_class_member_occupies_no_key(monkeypatch):
+    """回收成员帧类为跳过类（视图 enabled=false）⇒ 帧标注不跑、不占键
+    （emitter 按缺键推导 skipped）；帧分类照常补跑落键。"""
+    cfg = _frame_stream_cfg(extract_enabled=False)
+    _stub_judge_window(monkeypatch, relation="continues")
+    _stub_annotate(monkeypatch)
+    cf_calls = _stub_classify_frames(monkeypatch, label="chitchat")
+    am_calls = _stub_annotate_member(monkeypatch)
+    f0, f1, f2 = _frame("f0"), _frame("f1"), _frame("f2")
+    e2 = _env(f2, status="dropped_noise")
+    e2.noise_attribution = ("segment", "noise")
+    ep = _episode([f0, f1])
+    ep.member_classifications = {"f0": _member_cls(), "f1": _member_cls()}
+    ep.member_annotations = {"f0": _annotation({"intent": "帧"}),
+                             "f1": _annotation({"intent": "帧"})}
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_tail")]),
+        _seq_obj("pass"),
+    ]})
+    metrics = _run_verify(cfg, [_env(f0), _env(f1), e2, ep], engine)
+    assert [m.id for m in ep.record.members] == ["f0", "f1", "f2"]
+    assert cf_calls == [["f2"]]
+    assert ep.member_classifications["f2"].label == "chitchat"
+    assert am_calls == []                              # 跳过类不跑帧标注
+    assert "f2" not in ep.member_annotations           # 不占键（skipped 语义）
+    # 终审缺陷修复：回收路径的跳过类与 M5 供数点同口径计 skipped——
+    # report 与 members[] 状态直方图可对账。
+    assert metrics.counters.get("frame_annotate.skipped") == 1
+
+
+def test_reclaim_frame_classify_off_uses_global_instruction(monkeypatch):
+    """frame.classify 关而 frame.annotate 开：回收补跑不碰分类字段（保持
+    None，不得无中生有），帧标注走全局指令（label=None）。"""
+    cfg = _frame_stream_cfg(classify_on=False, extract_enabled=False)
+    _stub_judge_window(monkeypatch, relation="continues")
+    _stub_annotate(monkeypatch)
+    cf_calls = _stub_classify_frames(monkeypatch)
+    am_calls = _stub_annotate_member(monkeypatch)
+    f0, f1, f2 = _frame("f0"), _frame("f1"), _frame("f2")
+    e2 = _env(f2, status="dropped_noise")
+    e2.noise_attribution = ("segment", "noise")
+    ep = _episode([f0, f1])
+    ep.member_annotations = {"f0": _annotation({"intent": "帧"}),
+                             "f1": _annotation({"intent": "帧"})}
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_tail")]),
+        _seq_obj("pass"),
+    ]})
+    _run_verify(cfg, [_env(f0), _env(f1), e2, ep], engine)
+    assert [m.id for m in ep.record.members] == ["f0", "f1", "f2"]
+    assert cf_calls == []                              # 帧分类关：不补跑
+    assert ep.member_classifications is None           # 恒 None，不无中生有
+    assert am_calls == [("f2", None)]                  # label=None 全局指令
+    assert ep.member_annotations["f2"] is not None
+
+
+def test_surgery_never_touches_none_frame_products(monkeypatch):
+    """dict None（降格会话/帧 pass 未运行语义）：手术全程不触碰两字段——
+    回收进成员也不补跑、不建 dict，恒保持 None。"""
+    cfg = _frame_stream_cfg(extract_enabled=False)     # 帧粒度双开
+    _stub_judge_window(monkeypatch, relation="continues")
+    _stub_annotate(monkeypatch)
+    cf_calls = _stub_classify_frames(monkeypatch)
+    am_calls = _stub_annotate_member(monkeypatch)
+    f0, f1, f2 = _frame("f0"), _frame("f1"), _frame("f2")
+    e2 = _env(f2, status="dropped_noise")
+    e2.noise_attribution = ("segment", "noise")
+    ep = _episode([f0, f1])                            # 两字段默认 None
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_tail")]),
+        _seq_obj("pass"),
+    ]})
+    _run_verify(cfg, [_env(f0), _env(f1), e2, ep], engine)
+    assert [m.id for m in ep.record.members] == ["f0", "f1", "f2"]
+    assert ep.member_classifications is None
+    assert ep.member_annotations is None
+    assert cf_calls == [] and am_calls == []
+
+
+def test_reclaim_annotate_member_failure_occupies_key_none(monkeypatch):
+    """annotate_member 返回 None（不可修复）⇒ 占键 None（failed 语义）——
+    键在场使后续轮次/pass 不再重跑该成员。"""
+    cfg = _frame_stream_cfg(extract_enabled=False)
+    _stub_judge_window(monkeypatch, relation="continues")
+    _stub_annotate(monkeypatch)
+    _stub_classify_frames(monkeypatch)
+    am_calls = _stub_annotate_member(monkeypatch, fail=True)
+    f0, f1, f2 = _frame("f0"), _frame("f1"), _frame("f2")
+    e2 = _env(f2, status="dropped_noise")
+    e2.noise_attribution = ("segment", "noise")
+    ep = _episode([f0, f1])
+    ep.member_classifications = {"f0": _member_cls(), "f1": _member_cls()}
+    ep.member_annotations = {"f0": _annotation({"intent": "帧"}),
+                             "f1": _annotation({"intent": "帧"})}
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_tail")]),
+        _seq_obj("pass"),
+    ]})
+    _run_verify(cfg, [_env(f0), _env(f1), e2, ep], engine)
+    assert am_calls == [("f2", "task_request")]
+    assert "f2" in ep.member_annotations               # 占键在场
+    assert ep.member_annotations["f2"] is None         # 值 None = failed
+
+
+def test_clone_surgery_ban_keeps_frame_products_untouched(monkeypatch):
+    """克隆信封手术禁令（S8）下无帧产物同步分支：按引用共享的两 dict 键集
+    与值对象原样，两个直调面零调用（成员缺陷全部降格 mark-only）。"""
+    cfg = _frame_stream_cfg(base=_stream_classified_cfg())
+    _stub_judge_window(monkeypatch)
+    _stub_extract(monkeypatch)
+    _stub_annotate(monkeypatch)
+    cf_calls = _stub_classify_frames(monkeypatch)
+    am_calls = _stub_annotate_member(monkeypatch)
+    f0, f1, f2 = _frame("f0"), _frame("f1"), _frame("f2")
+    e0, e1 = _env(f0), _env(f1)
+    e2 = _env(f2, status="dropped_noise")              # 真实候选在场
+    e2.noise_attribution = ("segment", "noise")
+    original = _episode([f0, f1], classification=Classification(
+        label="a", labels=("a", "b"), source="llm", detail={}))
+    clone = PipelineItem(record=original.record, session_id="s1",
+                         annotation=_annotation({"task_label": "外卖"}),
+                         classification=Classification(
+                             label="b", labels=("a", "b"), source="llm",
+                             detail={}))
+    c0 = _member_cls()
+    a0 = _annotation({"intent": "帧"})
+    mc = {"f0": c0, "f1": _member_cls()}
+    ma = {"f0": a0, "f1": None}
+    original.member_classifications = mc               # 克隆按引用共享（扇出裁决）
+    original.member_annotations = ma
+    clone.member_classifications = mc
+    clone.member_annotations = ma
+    engine = SeqJudgeEngine({original.record.id: [
+        _seq_obj("pass"),                              # 原信封先评审
+        _seq_obj("fail", defects=[_defect("off_task_members", members=["f1"]),
+                                  _defect("missing_tail")]),
+    ]})
+    _run_verify(cfg, [e0, e1, e2, original, clone], engine)
+    assert clone.status == "dropped_verify"            # 缺陷降格 mark-only
+    assert [m.id for m in clone.record.members] == ["f0", "f1"]
+    assert clone.member_classifications is mc and set(mc) == {"f0", "f1"}
+    assert clone.member_annotations is ma and set(ma) == {"f0", "f1"}
+    assert mc["f0"] is c0 and ma["f0"] is a0 and ma["f1"] is None
+    assert cf_calls == [] and am_calls == []           # 无手术 ⇒ 无同步分支

@@ -30,7 +30,9 @@ def build_stages(cfg: "ResolvedConfig") -> list["Stage"]:
         stages.append(StitchStage(cfg))
     if cfg.dedup.enabled:
         stages.append(DedupStage(cfg.dedup, DedupIndex(cfg.dedup, cfg.run.modality)))
-    if cfg.classify.enabled:
+    if cfg.classify.enabled or cfg.frame_classify.enabled:
+        # v1.12 或门：仅帧级分类开启时 ClassifyStage 仍须进链承载帧 pass，
+        # 序列级判决由 stage 内 classify.enabled 门静默跳过（SPEC §3.2）。
         stages.append(ClassifyStage(cfg))
     if cfg.extract.enabled:
         from labelkit.operators.extract import ExtractStage

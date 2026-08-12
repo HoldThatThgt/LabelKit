@@ -20,8 +20,10 @@ v1.11 (context budget, SPEC-context-budget V4/V9/V13④/V20/V24/V27①): frame
 digests are precomputed ONCE per session BEFORE windowing and shared by the
 packing costs and every window prompt; when the segment profile declares
 ``context_window > 0`` the window cut switches from fixed spans to the greedy
-budget packer ``_pack_windows`` (window = pure upper cap; 1-frame overlap and
-later-window seam ownership preserved), undeclared budget keeps the v1.10
+budget packer ``budget.pack_windows``（v1.12 装箱器下沉：原 M14 私有
+``_pack_windows`` 原样迁入 budget 模块公开面，行为字节等价）(window = pure
+upper cap; 1-frame overlap and later-window seam ownership preserved),
+undeclared budget keeps the v1.10
 fixed-window cut byte-identically; a window call raising the reactive
 ``ContextOverflowError`` is re-cut in half and retried (bounded, ≤ 2 halvings
 deep — the 400-sniffed terminal feeds the breaker exactly once, A7); window
@@ -52,6 +54,7 @@ from labelkit.common.contracts.types import (
 )
 
 from labelkit.common.runtime import budget as budget_mod
+from labelkit.common.runtime.budget import pack_windows
 from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
 from labelkit.common.runtime.schema_engine import segment_window_schema
 
@@ -290,7 +293,7 @@ def _window_spans(n: int, window: int) -> list[tuple[int, int]]:
     stitching). v1.11: the BUDGET-UNDECLARED cut (segment profile missing or
     context_window == 0) — kept verbatim so the degradation is byte-identical
     to v1.10 by construction (V9 regression anchor); budget-declared sessions
-    cut through _pack_windows below."""
+    cut through budget.pack_windows (v1.12 下沉后的同一纯函数)."""
     spans: list[tuple[int, int]] = []
     start = 0
     while start < n:
@@ -302,45 +305,9 @@ def _window_spans(n: int, window: int) -> list[tuple[int, int]]:
     return spans
 
 
-def _pack_windows(costs: list[int], budget: int, cap: int) -> list[tuple[int, int]]:
-    """Greedy budget packer (v1.11 V9, spec 3.14.4 装填伪代码; M14-owned
-    operator logic per CONTRACTS §7.17 — budget.py supplies only the
-    estimation primitives). ``costs[i]`` = per-frame cost c_i, ``budget`` =
-    input_budget − est_static_system (the caller subtracts the static term, so
-    the packing condition Σ c_j ≤ budget here IS the spec's est_static_system
-    + Σ c_i ≤ input_budget), ``cap`` = segment.window as pure upper cap.
-
-    Windows = [start, end): the first starts at 0, every subsequent one at the
-    previous window's end − 1 — the 1-frame overlap and later-window seam
-    ownership are PRESERVED (the rel[] assembly overwrite order relies on it);
-    a frame joins the open window while both the budget and the frame-count
-    cap hold, overflow closes the window. Every window carries ≥ 2 frames —
-    the V10 semantic minimum: the M1 w_min ≥ floor guard promises any two
-    worst-case frames fit under PRIOR image pricing (spec 3.1.4), but the
-    packer prices off the calibrator, which past CALIBRATION_MIN_SAMPLES may
-    legitimately exceed prior × PRIOR_INFLATION (no clamp, by design). A
-    window the budget would close below 2 frames is therefore FORCE-PACKED at
-    2 regardless of cost: if its true est really exceeds the budget, the M9
-    pre-dispatch check owns it record-level (ContextOverflowError(
-    phase="precheck") through the per-window failure path) — never a run-kill,
-    and the forced advance keeps the loop terminating. Pure function of
-    (costs, budget, cap) ⇒ deterministic rerun."""
-    spans: list[tuple[int, int]] = []
-    n = len(costs)
-    start = 0
-    while start < n:
-        end = start
-        total = 0
-        while end < n and end - start < cap and total + costs[end] <= budget:
-            total += costs[end]
-            end += 1
-        if end - start < 2:
-            end = min(start + 2, n)                # forced semantic minimum
-        spans.append((start, end))
-        if end == n:
-            break
-        start = end - 1
-    return spans
+# v1.12（装箱器下沉裁决）：贪心预算装箱器 _pack_windows 原样迁至
+# budget.pack_windows（公开面，行为字节等价，M13 帧级批量判决复用），本模块经
+# 顶部 import 以既有调用形继续使用——归属句见 CONTRACTS §7.17。
 
 
 async def _judge_span_degrading(judge, span: tuple[int, int],
@@ -461,7 +428,7 @@ class SegmentStage:
                               if seg.vision_resolved else 0)
                 costs = [budget_mod.est_text(digest) + budget_mod.DIFF_MAX_TOKENS
                          + image_cost for digest in digests]
-                spans = _pack_windows(costs, pack_budget, seg.window)
+                spans = pack_windows(costs, pack_budget, seg.window)
             else:
                 spans = _window_spans(len(items), seg.window)
             for span in spans:

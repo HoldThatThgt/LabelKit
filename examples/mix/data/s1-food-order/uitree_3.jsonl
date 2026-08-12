@@ -1,0 +1,8 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "bounds": [0, 0, 400, 800], "visible": true, "package": "com.example.food"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "选择规格", "bounds": [24, 20, 180, 56], "visible": true, "package": "com.example.food"}
+{"id": "2", "parent": "0", "class": "TextView", "text": "黄焖鸡米饭 ¥38", "bounds": [24, 80, 300, 112], "visible": true, "package": "com.example.food"}
+{"id": "3", "parent": "0", "class": "Button", "text": "份量：大份", "bounds": [24, 140, 376, 196], "visible": true, "package": "com.example.food"}
+{"id": "4", "parent": "0", "class": "Button", "text": "辣度：微辣", "bounds": [24, 212, 376, 268], "visible": true, "package": "com.example.food"}
+{"id": "5", "parent": "0", "class": "TextView", "text": "米饭 ×1", "bounds": [24, 284, 180, 316], "visible": true, "package": "com.example.food"}
+{"id": "6", "parent": "0", "class": "EditText", "text": "", "bounds": [24, 332, 376, 388], "visible": true, "package": "com.example.food", "content_desc": "口味备注（选填）"}
+{"id": "7", "parent": "0", "class": "Button", "text": "加入购物车", "bounds": [24, 700, 376, 760], "visible": true, "package": "com.example.food"}

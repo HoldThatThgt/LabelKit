@@ -1,0 +1,52 @@
+# Tool-level static config（spec §5.1）——双 profile 双端点分工（v1.12 vision
+# 语义分列的教学形态）：
+#   [llm.default] = DeepSeek（deepseek-v4-flash，文本判决面）——UI 主工程的
+#     segment 滑窗摘要判决、帧级批量分类（digest-only，frame.classify 永不入
+#     vision 必需集）、stream 模式 quality 纯文本打分（S30 放宽），以及文本
+#     姊妹工程 project-text.toml 的全部阶段；
+#   [llm.vision] = z.ai glm-5.2（视觉必需面）——UI 模态下 classify/annotate/
+#     frame.annotate/verify 四阶段强制 supports_vision，取值哲学镜像
+#     ../config.toml。
+# 本示例独立成套、不复用 ../config.toml，偏离共享惯例的理由：双粒度上手示例
+# 单目录即完整可跑（独立上手），且 DeepSeek 端点与其余示例共用的 z.ai
+# glm-5.2 端点隔离、互不牵连。
+#
+# DeepSeek 端点实测（2026-08-12，两次真实探针）：文本调用可用、温度 0 可用、
+# usage 在场；响应默认携带 thinking 内容块，M9 anthropic 解析器只收集
+# type=="text" 块，thinking 被天然跳过，JSON 干净落在 text 块；该路由不支持
+# 图像内容块（官方兼容表），故视觉必需阶段走 [llm.vision]。
+schema_version = 1
+
+[tool]
+log_level = "info"
+log_format = "text"
+
+[llm.default]
+provider = "anthropic"
+base_url = "https://api.deepseek.com/anthropic"
+model = "deepseek-v4-flash"
+api_key_env = "LABELKIT_DEEPSEEK_KEY"
+max_concurrency = 4
+timeout_s = 120
+max_retries = 5
+# 该路由对指定工具强制返回 400（tool_choice type="tool"，2026-08-12 实测，
+# E2E-FINDINGS 第 24 条）：结构化输出走 text 块 JSON + Schema 引擎 L1 确定性解析。
+supports_structured_output = false
+supports_vision = false           # 官方兼容表：image 内容块不支持
+max_output_tokens = 4096
+context_window = 131072 # 端点标称 1M，按既有 V26 惯例保守声明——实测后可上调
+temperature = 0.0
+
+[llm.vision]
+provider = "anthropic"
+base_url = "https://api.z.ai/api/anthropic"
+model = "glm-5.2"
+api_key_env = "LABELKIT_ZAI_KEY"
+max_concurrency = 4
+timeout_s = 120
+max_retries = 5
+supports_structured_output = true
+supports_vision = true
+max_output_tokens = 4096
+context_window = 131072 # 端点实效保守值（V26）——P6 实测后可上调
+temperature = 0.0

@@ -13,7 +13,8 @@ from labelkit import TOOL_VERSION
 from labelkit.common.config.model import (
     AnnotateConfig, ClassifyConfig, ClassSpec, Criterion, DedupConfig,
     ConsoleConfig,
-    ExtractConfig, GenerateConfig, InputConfig, OutputConfig, QualityConfig,
+    ExtractConfig, FrameAnnotateConfig, FrameClassifyConfig, GenerateConfig,
+    InputConfig, OutputConfig, QualityConfig,
     ResolvedConfig, Rubric, RunConfig, SegmentConfig, StitchConfig, StreamConfig,
     ToolConfig,
     TraceConfig, VerifyConfig,
@@ -37,6 +38,17 @@ USER_SCHEMA = {
     "additionalProperties": False,
 }
 
+# v1.12：帧级输出 Schema（spec §3.6 members 示例同形），写前校验兜底用
+FRAME_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intent": {"type": "string"},
+        "entities": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["intent", "entities"],
+    "additionalProperties": False,
+}
+
 RUN_STARTED_AT = datetime(2026, 7, 2, 10, 27, 41, tzinfo=timezone.utc)
 
 
@@ -52,6 +64,16 @@ class EngineStub:
             "/" + "/".join(str(p) for p in e.absolute_path) + ": " + e.message
             for e in v.iter_errors(obj)
         ]
+
+
+class MetricsStub:
+    """v1.12：帧计数通路桩——只收 count() 键累计（M10 装配期注入面的测试端）。"""
+
+    def __init__(self):
+        self.counters: dict[str, int] = {}    # 键 = 计数器名，值 = 累计计数
+
+    def count(self, key, n=1):
+        self.counters[key] = self.counters.get(key, 0) + n
 
 
 def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
@@ -70,6 +92,10 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
     segment = kw.pop("segment", SegmentConfig())
     stitch = kw.pop("stitch", StitchConfig())
     console = kw.pop("console", ConsoleConfig())   # v1.10: mode_resolved gate
+    # v1.12：帧粒度三件（默认全关 = 字节等价 v1.11）
+    frame_classify = kw.pop("frame_classify", FrameClassifyConfig())
+    frame_annotate = kw.pop("frame_annotate", FrameAnnotateConfig())
+    frame_schema = kw.pop("frame_schema", None)
     assert not kw, f"unknown overrides: {kw}"
     return ResolvedConfig(
         tool=ToolConfig(log_format=log_format),
@@ -113,6 +139,9 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
         project_path="project.toml",
         config_digest="sha256:c",
         project_digest="sha256:p",
+        frame_classify=frame_classify,
+        frame_annotate=frame_annotate,
+        frame_schema=frame_schema,
     )
 
 
@@ -122,6 +151,20 @@ def classify_cfg(assignment="single", classes=("faq", "chat")) -> ClassifyConfig
         max_labels=len(classes) if assignment == "multi" else None,
         fallback_class=classes[-1],
         classes=tuple(ClassSpec(name=n, description="d") for n in classes))
+
+
+def frame_classify_cfg() -> FrameClassifyConfig:
+    """v1.12：M1 形状的帧分类配置（帧类表 + fallback ∈ 表）。"""
+    return FrameClassifyConfig(
+        enabled=True, fallback_class="other",
+        classes=(ClassSpec(name="task_request", description="d"),
+                 ClassSpec(name="other", description="d")))
+
+
+def frame_annotate_cfg() -> FrameAnnotateConfig:
+    """v1.12：M1 形状的帧标注配置（指令 + 帧 Schema 恰一）。"""
+    return FrameAnnotateConfig(enabled=True, instruction="帧标注",
+                               schema_inline=json.dumps(FRAME_SCHEMA))
 
 
 def make_record(rec_id="a" * 16, line_no=1, raw=None, generated=False):
@@ -187,8 +230,11 @@ def make_item(status="active", record=None, annotated=True, scores=False,
     return item
 
 
-def run_emitter(cfg, batch, batch_no=1, finalize=True, report=None, deliver=True):
+def run_emitter(cfg, batch, batch_no=1, finalize=True, report=None, deliver=True,
+                metrics=None):
     em = Emitter(cfg, EngineStub(), run_id="ab12cd34ef56", run_started_at=RUN_STARTED_AT)
+    if metrics is not None:
+        em.metrics = metrics      # v1.12：M10 装配期注入的帧计数通路（鸭子面）
     em.open()
     result = em.emit_batch(batch, batch_no)
     if finalize:
@@ -417,6 +463,7 @@ def test_meta_stream_episode_full_structure_text(tmp_path):
     assert keys.index("stream") == keys.index("source") + 1
     assert keys.index("scores") == keys.index("stream") + 1
     stream = meta["stream"]
+    # v1.12 锚：帧粒度全关 ⇒ 无 members 键，键序与 v1.11 字节等价
     assert list(stream) == ["episode_id", "session_id", "order_span",
                             "member_count", "member_ids", "member_sources",
                             "session_split", "repaired", "degraded", "steps"]
@@ -531,6 +578,7 @@ def test_meta_stream_stitch_keys_present_only_when_enabled(tmp_path):
     run_emitter(cfg, [item])
 
     stream = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"]
+    # v1.12 锚：帧粒度全关 ⇒ 无 members 键（v1.9 stitch 键序不变）
     assert list(stream) == ["episode_id", "thread_id", "session_id",
                             "order_span", "member_count", "member_ids",
                             "member_sources", "session_split", "repaired",
@@ -554,6 +602,222 @@ def test_meta_stream_stitch_keys_present_only_when_enabled(tmp_path):
                                 "member_count", "member_ids", "member_sources",
                                 "session_split", "repaired", "degraded", "steps"]
     assert all("resumed" not in row for row in stream_off["steps"])
+
+
+# ── v1.12 帧粒度：members 块 / status 三值 / 写前校验兜底 / discarded ─────────
+
+def test_meta_stream_members_block_shape_and_frozen_position(tmp_path):
+    """v1.12（spec §3.6）：members 位于 member_sources 之后、session_split 之前
+    （位置冻结）；条目字段序冻结为 index, id, label, annotation, status；逐成员
+    按 rec.members 序，index 0 基；label 缺键 ⇒ null，annotation 走三值判定。"""
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+                   frame_classify=frame_classify_cfg(),
+                   frame_annotate=frame_annotate_cfg(),
+                   frame_schema=FRAME_SCHEMA)
+    members = [make_record("1" * 16, 3), make_record("2" * 16, 5),
+               make_record("3" * 16, 8)]
+    item = make_item(record=make_seq_record(members))
+    item.session_id = "ime-log/0"
+    item.member_classifications = {
+        "1" * 16: Classification(label="task_request", labels=("task_request",),
+                                 source="llm", detail={}),
+        "3" * 16: Classification(label="other", labels=("other",),
+                                 source="fallback", detail={}),
+    }
+    item.member_annotations = {
+        "1" * 16: Annotation(output={"intent": "book_train", "entities": ["上海"]},
+                             model="glm-5.2", attempts=1, usage=Usage()),
+        "3" * 16: None,                        # failed 占键为 None（spec §3.3）
+    }
+    run_emitter(cfg, [item])
+
+    stream = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"]
+    assert list(stream) == ["episode_id", "session_id", "order_span",
+                            "member_count", "member_ids", "member_sources",
+                            "members",
+                            "session_split", "repaired", "degraded", "steps"]
+    assert stream["members"] == [
+        {"index": 0, "id": "1" * 16, "label": "task_request",
+         "annotation": {"intent": "book_train", "entities": ["上海"]},
+         "status": "annotated"},
+        {"index": 1, "id": "2" * 16, "label": None,
+         "annotation": None, "status": "skipped"},
+        {"index": 2, "id": "3" * 16, "label": "other",
+         "annotation": None, "status": "failed"},
+    ]
+    for row in stream["members"]:              # 条目字段序冻结
+        assert list(row) == ["index", "id", "label", "annotation", "status"]
+
+
+def test_members_key_presence_rules_per_switch(tmp_path):
+    """v1.12（spec §3.6 在场规则）：label 键仅 frame.classify 开启时在场（dict
+    None ⇒ null）；annotation/status 两键仅 frame.annotate 开启时在场；members
+    数组本身任一开关开启即在场。"""
+    members = [make_record("1" * 16, 3), make_record("2" * 16, 5)]
+
+    # 只开 frame.classify：条目只有 index, id, label
+    cfg_c = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+                     frame_classify=frame_classify_cfg())
+    item = make_item(record=make_seq_record(members))
+    item.member_classifications = None         # dict None ⇒ 全员 label null
+    run_emitter(cfg_c, [item])
+    rows = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"]["members"]
+    assert rows == [{"index": 0, "id": "1" * 16, "label": None},
+                    {"index": 1, "id": "2" * 16, "label": None}]
+    assert all(list(r) == ["index", "id", "label"] for r in rows)
+
+    # 只开 frame.annotate：条目只有 index, id, annotation, status
+    out2 = tmp_path / "ann" / "res.jsonl"
+    out2.parent.mkdir(parents=True)
+    cfg_a = make_cfg(tmp_path, output=str(out2),
+                     segment=SegmentConfig(enabled=True),
+                     frame_annotate=frame_annotate_cfg(),
+                     frame_schema=FRAME_SCHEMA)
+    item2 = make_item(record=make_seq_record(members))
+    item2.member_annotations = {
+        "1" * 16: Annotation(output={"intent": "x", "entities": []},
+                             model="m", attempts=1, usage=Usage())}
+    run_emitter(cfg_a, [item2])
+    rows2 = read_jsonl(out2)[0]["_meta"]["stream"]["members"]
+    assert rows2 == [
+        {"index": 0, "id": "1" * 16,
+         "annotation": {"intent": "x", "entities": []}, "status": "annotated"},
+        {"index": 1, "id": "2" * 16, "annotation": None, "status": "skipped"},
+    ]
+    assert all(list(r) == ["index", "id", "annotation", "status"] for r in rows2)
+
+
+def test_members_position_frozen_with_stitch_keys(tmp_path):
+    """v1.12：stitch 键共存时 members 位置不变——仍在 member_sources 之后、
+    session_split 之前（thread_id/fragments 的 v1.9 键序照旧）。"""
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+                   stitch=StitchConfig(enabled=True),
+                   frame_classify=frame_classify_cfg())
+    members = [make_record("1" * 16, 3), make_record("2" * 16, 5)]
+    item = make_item(record=make_seq_record(members))
+    item.thread_id = "e" * 16
+    run_emitter(cfg, [item])
+    stream = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"]
+    assert list(stream) == ["episode_id", "thread_id", "session_id",
+                            "order_span", "member_count", "member_ids",
+                            "member_sources", "members",
+                            "session_split", "repaired", "degraded",
+                            "fragments", "steps"]
+
+
+def test_member_status_matrix_and_prewrite_guard(tmp_path):
+    """v1.12（spec §3.6）：status 三值判定矩阵——缺键 ⇒ (null, skipped)；值 None
+    ⇒ (null, failed)；合法对象 ⇒ (对象, annotated)；非法对象 ⇒ 写前
+    validate_only(schema=帧 Schema) 兜底翻 (null, failed) 且 frame_annotate.failed
+    计数，非法帧对象零落盘；成员失败不改信封状态、不写 item.errors。"""
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+                   frame_annotate=frame_annotate_cfg(), frame_schema=FRAME_SCHEMA)
+    members = [make_record(str(i) * 16, i) for i in (1, 2, 3, 4)]
+    item = make_item(record=make_seq_record(members))
+    item.member_annotations = {
+        "1" * 16: Annotation(output={"intent": "ok", "entities": ["a"]},
+                             model="m", attempts=1, usage=Usage()),
+        "2" * 16: None,                                       # M5 侧不可修复
+        "3" * 16: Annotation(output={"intent": 42, "entities": "bad"},
+                             model="m", attempts=1, usage=Usage()),  # 违反帧 Schema
+        # "4"*16 缺键 ⇒ skipped
+    }
+    metrics = MetricsStub()
+    _, result = run_emitter(cfg, [item], metrics=metrics)
+    assert result == EmitResult(emitted=1, rejected=0)        # 信封照常发射
+
+    rows = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"]["members"]
+    by_id = {r["id"]: (r["annotation"], r["status"]) for r in rows}
+    assert by_id["1" * 16] == ({"intent": "ok", "entities": ["a"]}, "annotated")
+    assert by_id["2" * 16] == (None, "failed")
+    assert by_id["3" * 16] == (None, "failed")                # 写前兜底置 null
+    assert by_id["4" * 16] == (None, "skipped")
+    assert {r["status"] for r in rows} <= {"annotated", "skipped", "failed"}
+    # 写前兜底恰计 1 次（值 None 的成员失败由 M5 计，emitter 不重计）
+    assert metrics.counters == {"frame_annotate.failed": 1}
+    assert item.status == "active" and item.errors == []
+
+
+def test_frame_annotate_discarded_counts_terminal_envelopes(tmp_path):
+    """v1.12 沉没成本记账（spec §3.6）：终态非 active 且携带 member_annotations
+    的序列信封按非 None 条目数累计 frame_annotate.discarded（仅计数）；active
+    发射行与无帧产物的终态行不计；rejects 行键集零改动。"""
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+                   frame_annotate=frame_annotate_cfg(), frame_schema=FRAME_SCHEMA)
+    members = [make_record("a1" * 8, 1), make_record("a2" * 8, 2)]
+    ann = Annotation(output={"intent": "x", "entities": []}, model="m",
+                     attempts=1, usage=Usage())
+    dropped = make_item(status="dropped_verify",
+                        record=make_seq_record(members, rec_id="d" * 16))
+    dropped.member_annotations = {"a1" * 8: ann, "a2" * 8: None}   # 非 None 1 条
+    failed = make_item(status="failed", annotated=False,
+                       record=make_seq_record(members, rec_id="f" * 16),
+                       errors=[StageError(stage="annotate", kind="internal_error",
+                                          message="x", retryable=False)])
+    failed.member_annotations = {"a1" * 8: ann, "a2" * 8: ann}     # 非 None 2 条
+    active = make_item(record=make_seq_record(members, rec_id="e" * 16))
+    active.member_annotations = {"a1" * 8: ann}                    # 发射行不计
+    bare = make_item(status="dropped_dup", annotated=False,
+                     record=make_seq_record(members, rec_id="b" * 16))  # 无帧产物
+    metrics = MetricsStub()
+    _, result = run_emitter(cfg, [dropped, failed, active, bare], metrics=metrics)
+    assert result == EmitResult(emitted=1, rejected=3)
+    assert metrics.counters == {"frame_annotate.discarded": 3}     # 1 + 2
+
+    # rejects 面零改动：refs 行键集维持五键闭集（classify 关）
+    rows = read_jsonl(tmp_path / "out" / "res.rejects.jsonl")
+    for row in rows:
+        assert list(row["_meta"]) == ["id", "source", "stage", "reason", "errors"]
+
+
+def test_frame_annotate_discarded_skips_clone_envelopes(tmp_path):
+    """终审缺陷修复：扇出克隆共享同一 member_annotations dict——沉没成本记账
+    只取首标签信封视角（克隆终态不重复计，否则共享产物被计 k 次）。"""
+    from labelkit.common.contracts.types import Classification
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+                   frame_annotate=frame_annotate_cfg(), frame_schema=FRAME_SCHEMA)
+    members = [make_record("a1" * 8, 1)]
+    ann = Annotation(output={"intent": "x", "entities": []}, model="m",
+                     attempts=1, usage=Usage())
+    shared = {"a1" * 8: ann}
+    rec = make_seq_record(members, rec_id="o" * 16)
+    orig = make_item(status="dropped_verify", annotated=False, record=rec,
+                     errors=[StageError(stage="verify", kind="defect",
+                                        message="x", retryable=False)])
+    orig.classification = Classification(label="x", labels=("x", "y"),
+                                         source="llm", detail={})
+    orig.member_annotations = shared
+    clone = make_item(status="dropped_verify", annotated=False, record=rec,
+                      errors=[StageError(stage="verify", kind="defect",
+                                         message="x", retryable=False)])
+    clone.classification = Classification(label="y", labels=("x", "y"),
+                                          source="llm", detail={})
+    clone.member_annotations = shared
+    metrics = MetricsStub()
+    run_emitter(cfg, [orig, clone], metrics=metrics)
+    assert metrics.counters == {"frame_annotate.discarded": 1}   # 共享只计一次
+
+
+def test_frame_all_off_stream_block_byte_equivalent_and_no_counting(tmp_path):
+    """v1.12 全关字节等价：帧开关全关时 `_meta.stream` 无 members 键（键序 =
+    v1.11，上方两处既有有序精确断言为锚），且即便信封误携帧产物字段也零计数、
+    零渲染（开关门控先于字段读取）。"""
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
+    members = [make_record("1" * 16, 3), make_record("2" * 16, 5)]
+    item = make_item(record=make_seq_record(members))
+    item.member_classifications = {
+        "1" * 16: Classification(label="x", labels=("x",), source="llm", detail={})}
+    item.member_annotations = {
+        "1" * 16: Annotation(output={"intent": "x", "entities": []},
+                             model="m", attempts=1, usage=Usage())}
+    metrics = MetricsStub()
+    run_emitter(cfg, [item], metrics=metrics)
+    stream = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"]
+    assert "members" not in stream
+    assert list(stream) == ["episode_id", "session_id", "order_span",
+                            "member_count", "member_ids", "member_sources",
+                            "session_split", "repaired", "degraded", "steps"]
+    assert metrics.counters == {}              # active 行永不计 discarded
 
 
 def test_meta_verification_defects_stream_only(tmp_path):

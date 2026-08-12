@@ -1,0 +1,176 @@
+# 文本姊妹工程（spec §5.2，v1.12）——单端点纯 DeepSeek 最低成本上手形态 + 文本
+# 帧路径演示：文本模态时间序流上序列级与帧级两个粒度同开（全部阶段走
+# [llm.default] 一个纯文本 profile，零视觉调用）。UI 控件树主工程见同目录
+# project.toml（双端点：DeepSeek 文本判决面 + z.ai 视觉必需面）。
+# 链序：meta:ts 时间轴排序 + gap 会话化 → segment(llm 滑窗边界精化 + 噪声
+# 剔除) → dedup(episode 级判重) → classify(序列级 4 类) + classify 帧粒度（成员
+# 帧闭集判决）→ quality(pointwise trajectory 打分，只打分不筛) → annotate(序列
+# 级标注) + annotate 帧粒度（逐成员按帧类标注：task_request 覆盖指令、chitchat
+# 跳过）→ verify(评审 + 修复)。帧产物随序列行落盘 _meta.stream.members[]。
+# extract 仅 UI 模态、stitch 的机械先验依赖控件树证据，二者在纯文本流上不可用；
+# generate 与 segment 互斥（2.3.1），不可用。config.toml 独立成套（本目录），
+# 不复用 ../config.toml——理由见其头注。
+#
+# fixture（data-text/events.jsonl，16 行，UTC+8 时间戳）：一位用户一天的个人
+# 助理请求流，gap_s=900（15 分钟静默断会话）切出三个会话：
+#   会话 1 09:01–09:06  订高铁票 5 行：task_request 开头 + followup 改签/选座/
+#                       发行程单链（预期 1 个 episode，序列类 travel；帧类
+#                       1×task_request + 4×followup，task_request 成员吃
+#                       [frame.class.task_request.annotate] 覆盖指令抽订单/
+#                       行程要素）
+#   会话 2 12:30–12:35  写餐厅评价 5 行（预期 1 个 episode，序列类 writing——
+#                       写评价是写作任务，dining 类是近邻干扰项）；第 2 行天气
+#                       寒暄按 segment.context 约定保留为成员（continues），
+#                       帧类 chitchat，帧标注跳过（members[] 呈现
+#                       status="skipped"、annotation=null）
+#   会话 3 18:05–18:11  会话 1 的五行逐字重发（episode 判重配方与会话 1 逐字
+#                       一致，预期 dropped_dup·exact，episode 级判重演示）
+#                       + 1 行纯语气词「哈哈哈哈哈哈」（预期 dropped_noise）
+# 运行（config 在本目录，非 ../config.toml；out/ 不入库须先建）：
+#   mkdir -p out && uv run labelkit run --config config.toml --project project-text.toml
+schema_version = 1
+
+[run]
+input = "./data-text/events.jsonl"
+output = "./out/mix-text-labels.jsonl"
+modality = "text"
+batch_size = 32
+seed = 42
+
+[input]
+text_field = "text"
+
+[stream]
+order_by = "meta:ts"              # 文本模态时间轴：ISO-8601 / epoch 皆可（spec 6.1）
+gap_s = 900                       # 相邻请求静默 > 15 分钟即断会话
+
+[segment]
+enabled = true
+strategy = "llm"
+window = 8                        # 最长会话 6 行 → 每会话恰一窗
+min_len = 2
+context = "个人助理请求流；同一时段内围绕同一件事（同一次行程、同一篇文稿）的连续请求构成一段——追问、修改、改签、补充约束、收尾要求都是同一任务的推进（advances 覆盖跨请求的实体延续）；任务推进途中偶尔插入的一两句寒暄感叹（如聊天气、聊心情）不打断当前任务，视为当前段的延续（continues）；与前后请求都无关的纯语气词、纯表情（如「哈哈哈哈」）属于干扰帧"
+
+[dedup]
+enabled = true                    # 判重单元 = episode：成员规范化文本按序拼接
+
+[classify]
+enabled = true                    # 序列级分类：episode 整段判归哪类任务
+llm = "default"
+assignment = "single"
+fallback_class = "other"
+
+[[classify.classes]]
+name = "travel"
+description = "差旅出行安排类任务：查票订票、改签选座、订酒店等围绕一次行程的请求序列"
+
+[[classify.classes]]
+name = "dining"
+description = "餐饮安排类任务：找餐厅、订座、点外卖等围绕一顿饭的安排的请求序列"
+
+[[classify.classes]]
+name = "writing"
+description = "写作协助类任务：起草、修改、润色同一篇文本（评价、文案、周报等）的请求序列"
+
+[[classify.classes]]
+name = "other"
+description = "不属于以上任何一类的请求序列"
+
+# ── 帧粒度（v1.12）：成员帧闭集分类——帧类表与序列类表相互独立 ──
+[frame.classify]
+enabled = true
+llm = "default"
+fallback_class = "other"          # 修复穷尽/窗口失败的兜底，须 ∈ 帧类表
+
+[[frame.classify.classes]]
+name = "task_request"
+description = "发起一项新任务的请求：新的查询、新的委托，开启一件此前未在办的事"
+
+[[frame.classify.classes]]
+name = "followup"
+description = "对进行中任务的追问、修改、补充约束或收尾要求"
+
+[[frame.classify.classes]]
+name = "chitchat"
+description = "与任务无关的寒暄、感叹、闲聊"
+
+[[frame.classify.classes]]
+name = "other"
+description = "不属于以上任何一类的请求"
+
+# ── 帧粒度（v1.12）：逐成员帧级标注——产物挂 members[].annotation ──
+[frame.annotate]
+enabled = true
+llm = "default"
+instruction = """
+你是个人助理请求流的帧级标注员。对给定的单条用户请求，标注其意图
+（intent，一个动宾短语）与其中出现的实体列表（entities，如时间、地点、
+车次、金额；没有实体则给空数组）。
+"""
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "intent": {"type": "string"},
+    "entities": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["intent", "entities"],
+  "additionalProperties": false
+}
+"""
+
+# ── 按帧类覆盖：发起任务的帧单独强调抽取订单/行程要素 ──
+[frame.class.task_request.annotate]
+instruction = """
+你是个人助理请求流的帧级标注员。这条请求发起了一项新任务：标注其意图
+（intent，一个动宾短语），并把订单/行程要素（出发地、目的地、日期时段、
+车次坐席、预算金额等）逐项抽入实体列表（entities）。
+"""
+
+# ── 按帧类覆盖：寒暄帧跳过标注（省成本示范；members[] 呈现 skipped）──
+[frame.class.chitchat.annotate]
+enabled = false
+
+[quality]
+enabled = true
+mode = "pointwise"
+rubric = "default:trajectory"     # 轨迹四准则同样适用于文本请求序列；只打分不筛
+
+[annotate]
+enabled = true
+llm = "default"
+instruction = """
+你是个人助理请求序列的标注员。根据一段时间内用户连续输入的请求序列，
+标注该序列的任务标签（用户在办什么事）、任务类别与一句话摘要。
+"""
+
+[verify]
+enabled = true
+llm = "default"
+policy = "repair"
+max_repair_rounds = 1
+extra_criteria = "补充审核约定：边界余量中的段外邻帧仅用于核对边界完整性（missing_head / missing_tail），不属于本序列成员——邻帧内容与本序列任务不同属正常现象（相邻任务）；审核证据仅含成员请求文本，标注摘要对其概括与合并表述不因措辞差异判 label_mismatch；成员中偶发的寒暄帧是采集使然，不构成 off_task_members 的证据"
+
+[trace]
+enabled = true
+channels = ["segment", "classify", "annotate", "verify", "schema"]
+content = "refs"
+
+[output]
+meta_mode = "inline"              # 帧产物仅经 _meta 承载（M1 护栏：帧粒度启用 ⇒ 非 none）
+rejects = "full"                  # 噪声行 rejects 携带完整载荷
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "task_label": {"type": "string"},
+    "category": {"type": "string",
+      "enum": ["travel", "dining", "writing", "other"]},
+    "summary": {"type": "string", "maxLength": 100}
+  },
+  "required": ["task_label", "category", "summary"],
+  "additionalProperties": false
+}
+"""

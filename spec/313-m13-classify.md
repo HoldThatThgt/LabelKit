@@ -142,3 +142,35 @@ item.classification = Classification(label="qa", labels=("qa",), source="llm", d
 ```
 
 两个信封各自进 writing / qa 类池打分、按各自类有效 instruction 标注，各产出一行（行唯一键 (`_meta.id`, label)，6.3）；本批 `counts.fanout` 增 1（3.10.3）。**fallback 分支**：若某记录的分类输出经 M8 修复耗尽仍非法，默认 `on_error="fallback"` 下归兜底类——`Classification(label="other", labels=("other",), source="fallback", detail={"kind": "classification_invalid", "message": "…"})`，记录保持 active、不写 `item.errors`（3.13.4 失败与兜底行）。
+
+### 3.13.7 帧级批量判决（v1.12）
+
+流模式帧粒度的分类面（`frame.classify.enabled`，默认关，5.2）：对序列信封的成员帧按**帧类表**（`[[frame.classify.classes]]`，与序列类表相互独立、允许重名、互不约束）做一次批量闭集判决，产物写 `item.member_classifications`（键 = 成员 `record.id`，4.1）。链位住 M13 的成本结构（裁决·链位与成本）：dedup 之后——重复 episode 不付费；quality 之前的少量批量调用可接受（帧标注贵在逐帧，故住质量门之后的 M5，3.5.5）。
+
+**公开面（算子间导入白名单第四向，签名冻结）**：
+
+```
+async def classify_frames(members: Sequence[Record], ctx: RunContext) -> dict[str, Classification]:
+    """对给定成员 Record 序列做帧级闭集批量判决，返回 {member.id: Classification}
+       （label = 帧类名，labels = (label,) 恒单元素，source ∈ {"llm", "fallback"}）。
+       M7 verify 的成员回收补跑直接调用（单成员回收即单元素调用）——v1.8
+       segment.judge_window 同款契约地位的 sanctioned import exception（CONTRACTS §1.1）。
+       本函数永不抛出记录级异常（运行级控制流大三样除外）。"""
+
+def build_frame_classify_prompt(members: Sequence[Record], cfg: ResolvedConfig,
+                                digests: Sequence[str]) -> PromptBundle:
+    """帧级批量判决模板的确定性装配（verbatim 捕于 CONTRACTS §10.12）。"""
+```
+
+要点（规格与理由）：
+
+- **执行门**（stage 内帧 pass，序列级判决写完之后、multi 扇出之前）：active ∧ `record.kind == "sequence"` ∧ 首标签信封（`classification.label == labels[0]`；classification 为 None 视同非克隆——克隆恒携 classification）∧ 幂等门 `item.member_classifications is None` ∧ 非降格（`segment_degraded` duck 标在场 ⇒ 计 `frame_classify.skipped_degraded` 并跳过，裁决·降格会话跳过）。
+- **组链双门**（裁决·组链双门）：factory 以或门 `classify.enabled ∨ frame_classify.enabled` 决定 ClassifyStage 进链（槽位不变，3.10.3）；stage 内序列级判决单独受 `classify.enabled` 门控——仅帧级开启时序列记录不产生 Classification（`_meta.classification` 维持 null）、帧 pass 照常。
+- **调用形态**：一 episode 一调用；预算声明时按 `budget.pack_windows`（v1.12 自 `segment._pack_windows` 下沉的同一纯函数，裁决·装箱器下沉）对成员摘要行成本贪心分窗——**零重叠调用形**：pack_windows 跨度链自带的 1 帧重叠（M14 缝帧语义）不适用于帧分类，自第二窗起丢弃与前窗重叠的首帧（前窗持有缝帧判决），所得跨度两两不交且完整覆盖；帧分类无窗口上限键 ⇒ 预算是唯一切分力；**预算关 ⇒ 单窗全成员**。
+- **提示词**（确定性模板，house 风格，verbatim 冻结 CONTRACTS §10.12）：system = `[任务]` 逐帧闭集分类指令（{N} 代入窗内成员数）+ 帧类表行 `- name: description`（声明序）+ 结构句 + 输出契约；user = `[会话成员帧]` 1-based 摘要行（`frame_digest`，每行上限 `segment.digest_max_chars`，会话级预计算复用——装配器自身永不计算摘要）；`FrameClassifyConfig.vision_resolved` 时每成员追加 `[成员 i 截图]` 标签 + image part（工作点 = profile `default_image_px`，不另设尺寸——校准器按 profile 聚合的前提）。
+- **内部 Schema**：`schema_engine.frame_classify_schema(names, n)` = `{"labels": {"type": "array", "items": {"enum": [...]}, "minItems": n, "maxItems": n}}` + `additionalProperties: false`（`segment_window_schema` 同款先例，3.8.1）；**对齐后校验**在代码侧（first-wins 家族）：labels 数组按位置对齐窗内成员序，**超长截断**（保留前 n 项）、**缺项 ⇒ 该帧 `fallback_class`**（source="fallback"）；**同 id 成员 first-wins**（裁决·同 id 成员 first-wins，§1.6）——成员 id 为内容哈希，episode 内同 id 帧落表首位次胜出、不重复计数，各位次 members[] 行渲染同一产物。
+- **失败语义**（v1.7 fallback 哲学下推）：单窗修复穷尽或调用不可恢复 ⇒ 该窗**全部成员**落 `fallback_class`，计 `frame_classify.fallback += N`、`frame_classify.window_failures += 1`；**永不**使 episode 信封 failed、不写 `item.errors`。窗口跨度零重叠 ⇒ 各窗写入互不覆盖，折叠结果与调度顺序无关。
+- **溢出纪律**：precheck（含强制最小窗仍不可装填）= 最小单元失败，**永不喂熔断**；反应式溢出 ⇒ 窗口**对半重切 ≤ 2 级**（segment V20 同款镜像；帧分类窗口零重叠，切分不保缝帧；每次对半计 `budget.degrade_retries`），级数耗尽/单帧窗不可再切 ⇒ 按窗失败兜底；reactive-400 终局在窗失败吞点经共享 `budget.feed_reactive_terminal` 补喂熔断**恰一次**（A7 纪律，7.6 熔断矩阵）。
+- **扇出共享**（裁决·扇出共享与首标签执行）：`_fan_out` 克隆构造清单显式加入 `member_classifications` / `member_annotations` 两字段——与 `record`/`dedup` 同族**按引用共享**（帧产物描述成员帧本身而非信封路由，克隆行渲染同一 dict）；帧 pass 在扇出**之前**执行，克隆自身永不重跑。
+- **产物**：`item.member_classifications = {member_id: Classification(label=帧类名, labels=(label,), source="llm"|"fallback")}`（恒单标签——帧级无 assignment，3.1.4 定向探针）。
+- **事件与计数**：`classify.frame` 每 episode 一发（ids=(episode_id,)，payload = members/windows/fallback 三计数，不携带任何数据内容，3.12.4）；计数器 `frame_classify.calls` / `fallback` / `window_failures` / `skipped_degraded`（report 子块见 6.4）。

@@ -16,11 +16,21 @@ changes. transitions is the second additive trailing kwarg on the two frozen sig
 (after v1.7's label); None keeps every pre-v1.8 call site byte-identical. v1.9 (T14)
 appends the third: fragment_lens — per-fragment keyframe quotas for stitched threads
 (every fragment keeps ≥ 1 keyframe); None keeps the v1.8 uniform downsample.
+
+v1.12 frame-level per-member annotation (SPEC-frame-annotation §3.3): after a
+sequence envelope's own annotation SUCCEEDS, the stage appends a per-member frame
+pass (first-label envelope only, degraded episodes skipped) filling
+item.member_annotations through the PUBLIC direct-call surface ``annotate_member``
+— the repair-face family's new member (M7 verify member-reclaim re-runs it lazily).
+Frame calls route cfg.frame_schema EXPLICITLY through
+complete_validated(schema=...): internal-schema treatment — no L2.5, no
+resolved_at. The two sequence-level frozen signatures stay untouched.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass
@@ -54,7 +64,11 @@ if TYPE_CHECKING:
 
 
 EV_ANNOTATE_DONE = "annotate.done"
+EV_ANNOTATE_FRAME = "annotate.frame"   # v1.12：帧级逐帧标注事件（每成员一发，前缀
+                                       # 自动路由既有 annotate 通道，§7.2 目录加行）
 EV_ERROR = "error"
+
+_logger = logging.getLogger("labelkit.annotate")
 
 # Chinese prompt fragments — verbatim from CONTRACTS.md §10.1/§10.5 (spec 3.5.2/3.7.3).
 _SCHEMA_SENTENCE = "输出必须是符合以下 JSON Schema 的单个 JSON 对象，不输出任何其他内容："
@@ -70,6 +84,17 @@ _REPAIR_TAIL = "请修正后重新输出"
 # v1.8 sequence-variant fragments (CONTRACTS §10.1 sequence variant, S5/S6).
 _LABEL_ACTION_SEQUENCE = "[动作序列]"
 _LABEL_MEMBER_DIGESTS = "[成员帧摘要]"
+
+# v1.12 帧级标注模板片段（SPEC-frame-annotation §3.3；实现后 verbatim 捕进
+# CONTRACTS §10.13）。[任务] 标出生效指令段；[成员帧] 是 text 模态成员内容行的
+# 标签（ui 模态复用上方单记录三段形的 [屏幕截图]/[UI 控件树]）。
+_FRAME_LABEL_TASK = "[任务]"
+_FRAME_LABEL_MEMBER = "[成员帧]"
+# 跨层等式载体：帧级系统侧完整静态脚手架（[任务] 标签 + Schema 约束句——生效
+# 指令与帧 Schema 文本是配置量，在 M1 静态预算预检（V13③）各自计量）。
+# budget.TEMPLATE_HEAD_TOKENS["frame_annotate"] 钉住 est_text(本常量)，
+# tests/common/runtime/test_budget.py 的跨层等式测试守护两侧同步。
+_FRAME_SYSTEM_STATIC = f"{_FRAME_LABEL_TASK}\n{_SCHEMA_SENTENCE}"
 
 # Operator modules never depend on each other (spec §2.2): M4 quality carries its own
 # same-format step-line template (plus the （摘取兜底） fallback suffix); this copy is M5's.
@@ -702,6 +727,181 @@ async def annotate_record(record: Record, ctx: "RunContext",
                       sc={"n": n, "agreement_ratio": matches / n})
 
 
+# ── v1.12 帧级逐帧标注（SPEC-frame-annotation §3.3；公开直调面 = 修复面族新成员）──
+
+def build_frame_annotate_prompt(member: Record, cfg: "ResolvedConfig",
+                                schema_text: str,
+                                label: str | None = None) -> PromptBundle:
+    """帧级标注提示词的确定性装配（SPEC-frame-annotation §3.3；实现后 verbatim
+    捕进 CONTRACTS §10.13）。schema_text = cfg.frame_schema 的 canonical 单行
+    dump（形态对齐 SchemaEngine.user_schema_text：ensure_ascii=False +
+    separators=(", ", ": ")）。段序冻结：system（[任务] + 生效指令 + Schema
+    约束句 + 帧 Schema 文本——Schema 嵌入手法镜像序列级 build_annotate_prompt）
+    → 每条 few-shot 一条 user 消息（配置序，§10.1 同形）→ 成员内容 user 消息
+    （text 模态 = "[成员帧] {行文本}"；ui 模态 = [屏幕截图] + 该成员截图 +
+    [UI 控件树] + 树摘要三段，单记录标注三段形同款，树渲染绝对上限
+    input.ui_tree_max_chars）。label 非 None ⇒ 指令/few-shot 取
+    cfg.frame_class_views[label]（帧类覆盖视图）；None ⇒ 全局 [frame.annotate]
+    （frame.classify 关闭时的全员形态）。预算装填经私有装配器的尾参 ``fit``
+    进入（annotate_member 内），永不在此。"""
+    return _assemble_frame_prompt(member, cfg, schema_text, label)
+
+
+def _assemble_frame_prompt(member: Record, cfg: "ResolvedConfig",
+                           schema_text: str, label: str | None,
+                           fit: _PackState | None = None) -> PromptBundle:
+    """§10.13 装配体；fit 非 None 时应用 §3.3③ 单记录族的树动态帽
+    （_fit_tree_text——ui 成员的树渲染是唯一可裁块；生效指令 / few-shot / 帧
+    Schema 文本是静态语义资产，只计不裁，V13③ M1 预检领地）。"""
+    view = cfg.frame_class_views[label] if label is not None else None
+    acfg = cfg.frame_annotate
+    instruction = view.instruction if view is not None else acfg.instruction
+    examples = view.examples if view is not None else acfg.examples
+
+    system_text = (f"{_FRAME_LABEL_TASK}\n{instruction}\n"
+                   f"{_SCHEMA_SENTENCE}\n{schema_text}")
+    messages: list[Message] = [
+        Message(role="system", parts=(Part(kind="text", text=system_text),))]
+    for example in examples:
+        example_text = (f"{_LABEL_EXAMPLE_IN} {example.input}\n"
+                        f"{_LABEL_EXAMPLE_OUT} {_dumps(example.output)}")
+        messages.append(Message(role="user",
+                                parts=(Part(kind="text", text=example_text),)))
+
+    if member.modality == "text":
+        parts: tuple[Part, ...] = (
+            Part(kind="text", text=f"{_FRAME_LABEL_MEMBER} {member.text}"),
+        )
+    else:  # ui 成员：三段形（镜像本文件单记录 ui 标注）
+        tree_text = member.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars)
+        if fit is not None and fit.tree_budget is not None:
+            tree_text, trimmed = _fit_tree_text(tree_text, max(0, fit.tree_budget))
+            if trimmed:
+                fit.truncations += 1
+        parts = (
+            Part(kind="text", text=_LABEL_SCREENSHOT),
+            Part(kind="image", image=member.image),
+            Part(kind="text", text=f"{_LABEL_UI_TREE}\n{tree_text}"),
+        )
+    messages.append(Message(role="user", parts=parts))
+    return PromptBundle(messages=tuple(messages))
+
+
+def _pack_frame_prompt(member: Record, ctx: "RunContext", prof: "LLMProfile",
+                       schema_text: str, label: str | None) -> PromptBundle:
+    """帧级提示词预算装填（§3.3③ 单记录族的帧级镜像）：ui 成员的树渲染是唯一
+    可裁块（动态帽，绝对上限仍是 input.ui_tree_max_chars）；text 成员行文本非
+    裁剪类。帧 prompt 本身就是最小单元——单成员、至多单图，无窗可分、无关键帧
+    可减，故**无降级梯**：裁树后仍超限直接 V10
+    ContextOverflowError(phase="precheck")，调用方按成员失败处置，注定失败的
+    请求永不发出。图像成本恒取 profile 工作点（校准器按 profile 聚合的前提，
+    V18/V19——帧调用不设独立尺寸）。"""
+    cfg = ctx.cfg
+    b = budget.input_budget(prof)
+    schema_est = (budget.est_text(schema_text)
+                  if prof.supports_structured_output else 0)
+    bundle = _assemble_frame_prompt(member, cfg, schema_text, label)
+    text_est, n_images = _prompt_text_est(bundle, schema_est)
+    image_cost = _image_unit_cost(prof, ctx, None) if n_images else 0
+    if text_est + n_images * image_cost <= b:
+        return bundle
+    if member.modality == "ui" and member.ui_tree is not None:
+        tree_body = member.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars)
+        fixed = text_est - budget.est_text(tree_body)
+        fit = _PackState(tree_budget=b - fixed - n_images * image_cost)
+        bundle = _assemble_frame_prompt(member, cfg, schema_text, label, fit=fit)
+        if fit.truncations:
+            ctx.metrics.count("budget.truncations.frame_annotate", fit.truncations)
+        text_est, n_images = _prompt_text_est(bundle, schema_est)
+        if text_est + n_images * image_cost <= b:
+            return bundle
+    raise ContextOverflowError(
+        "frame annotation prompt exceeds the input budget at the minimal unit "
+        "(single member — no degrade ladder)", phase="precheck",
+        profile=prof.name)
+
+
+def _frame_error_kind(member: Record, exc: BaseException) -> str:
+    """帧失败的 §7.6 既有词表分类（stage 层 _annotate_item 分类器的成员级镜像；
+    预算词表由调用方经 budget.classify_stage_error 先行路由，V27① 同序）。帧
+    Schema 走内部 Schema 待遇、无 L2.5 ⇒ callback_violation 不可达，
+    SchemaViolation 恒归 schema_violation——零新错误 kind（spec 明写）。"""
+    if isinstance(exc, SchemaViolation):
+        return ErrorKind.SCHEMA_VIOLATION.value
+    if isinstance(exc, ProviderRetryableError):
+        return ErrorKind.PROVIDER_RETRYABLE_EXHAUSTED.value
+    if isinstance(exc, ProviderFatalError):
+        return ErrorKind.PROVIDER_FATAL.value
+    if member.modality == "ui" and isinstance(exc, OSError):
+        return ErrorKind.IMAGE_DECODE_ERROR.value
+    return ErrorKind.INTERNAL_ERROR.value
+
+
+def _count_frame_failure(member: Record, ctx: "RunContext",
+                         exc: BaseException) -> None:
+    """成员失败处置（§3.3 失败语义）：frame_annotate.failed 计数 + WARN 运行
+    日志。日志只含成员 id / 错误 kind / 异常类型——绝不含数据内容或提示词
+    （隐私红线）。item.errors 不写、rejects 不入、--strict 不触发（裁决·成员
+    失败不入 rejects——成员失败非信封失败，episode 照常发射）。"""
+    kind = budget.classify_stage_error(exc) or _frame_error_kind(member, exc)
+    ctx.metrics.count("frame_annotate.failed")
+    _logger.warning("frame annotation failed: member=%s kind=%s exc=%s",
+                    member.id, kind, type(exc).__name__,
+                    extra={"stage": "annotate", "batch": ctx.batch_no})
+
+
+async def annotate_member(member: Record, ctx: "RunContext",
+                          label: str | None = None) -> Annotation | None:
+    """v1.12 帧级逐帧标注的公开直调面（SPEC-frame-annotation §3.3/§3.4）——修复
+    面族新成员：M7 verify 回收成员补跑经懒加载直调本面，与 annotate_record /
+    segment.judge_window / extract.extract_transition 同列（算子间导入白名单
+    第四向），契约地位与 annotate_record 修复面同款，签名冻结。
+
+    对单个成员 Record 做一次帧级标注。label 非 None ⇒ 指令/few-shot 取
+    cfg.frame_class_views[label]（类覆盖）；None ⇒ 全局 [frame.annotate]
+    （frame.classify 关闭时的全员形态）。类视图 enabled=false 的跳过判定归
+    调用方（M5 帧 pass / M7 回收），本面不重复判定。
+
+    Schema 路由（裁决·帧 Schema 显式路由）：complete_validated 显式传
+    schema=cfg.frame_schema ⇒ 内部 Schema 待遇——L0–L3 四层全在、无 L2.5、
+    不计 resolved_at（§6.4 恒等式「resolved_at 加总 = 进入 M5 的记录数」不被
+    帧调用污染）；勿改走 schema=None。
+
+    失败语义（成员失败非信封失败）：修复穷尽/不可恢复 ⇒ 返回 None（调用方按
+    「failed 占键 None」落 dict）并内部计数 frame_annotate.failed + WARN 日志，
+    **不抛**记录级异常——CircuitBreakerTripped / KeyboardInterrupt /
+    CancelledError 是运行级控制流，照常上抛。成功 ⇒ 返回 Annotation 并计
+    frame_annotate.annotated（M7 回收补跑共享同一计数语义）。溢出纪律：
+    precheck 溢出 = 最小单元失败（帧 prompt 极小——单成员单图，无窗可分、无
+    关键帧可减，故无降级梯），永不喂熔断；反应式终端镜像本文件
+    _feed_reactive_terminal 纪律（仅 http_400 反应式恰一次喂，A7）。"""
+    cfg = ctx.cfg
+    schema = dict(cfg.frame_schema)        # M1 保证 enabled ⇒ frame_schema 非 None
+    schema_text = json.dumps(schema, ensure_ascii=False, separators=(", ", ": "))
+    prof = cfg.llm_profiles.get(cfg.frame_annotate.llm)
+    try:
+        if prof is None or prof.context_window <= 0:   # 预算未声明：直装配
+            prompt = build_frame_annotate_prompt(member, cfg, schema_text,
+                                                 label=label)
+        else:
+            prompt = _pack_frame_prompt(member, ctx, prof, schema_text, label)
+        obj, usage, attempts, model = await ctx.schema_engine.complete_validated(
+            cfg.frame_annotate.llm, prompt, schema=schema,
+            record_ids=(member.id,), batch_no=ctx.batch_no)
+    except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+        raise
+    except ContextOverflowError as exc:
+        # precheck/finish 形永不喂；仅反应式 http_400 恰一次喂熔断（A7）。
+        _feed_reactive_terminal(exc, ctx.metrics)
+        _count_frame_failure(member, ctx, exc)
+        return None
+    except Exception as exc:  # noqa: BLE001 — 成员级隔离绝对（契约：本面不抛）
+        _count_frame_failure(member, ctx, exc)
+        return None
+    ctx.metrics.count("frame_annotate.annotated")
+    return Annotation(output=obj, model=model, attempts=attempts, usage=usage)
+
+
 # ── stage ────────────────────────────────────────────────────────────────────
 
 class AnnotateStage:
@@ -764,6 +964,72 @@ class AnnotateStage:
                 payload["excerpt"] = excerpt
             ctx.metrics.event(EV_ANNOTATE_DONE, stage=self.name, batch_no=ctx.batch_no,
                               record_ids=(record.id,), payload=payload)
+            # v1.12：帧级逐帧标注 pass 只在序列级标注成功后追加（§3.3 链位：
+            # 质量门之后、成员逐帧——序列级失败的信封永不付帧标注费）。
+            await self._frame_pass(item, ctx)
+
+    async def _frame_pass(self, item: PipelineItem, ctx: "RunContext") -> None:
+        """v1.12 帧级逐帧标注 pass（SPEC-frame-annotation §3.3）。执行门 =
+        active ∧ kind=="sequence" ∧ 首标签信封（classification.label ==
+        labels[0]；无 classification 视为首标签）∧ 非降格（segment_degraded
+        duck 标在场即跳——降格 = 噪声未剔，不为垃圾帧付费）∧
+        frame_annotate.enabled。产物 dict 语义：pass 一旦运行即初始化为 {}
+        （区别于「未运行」的 None——emitter 在场规则的单一真相）；降格/非首
+        标签跳过保持 None；已有 dict 只补缺位、从不换对象（扇出克隆按引用共享
+        同一 dict 的前提）。幂等 = 仅当 member.id 不在 dict 时调用（M7 回收
+        补跑同款只补缺位）。成员级并发 gather；隔离由 annotate_member 不抛
+        保证。"""
+        if not (self.cfg.frame_annotate.enabled
+                and item.record.kind == "sequence"):
+            return
+        cls = item.classification
+        if cls is not None and cls.labels and cls.label != cls.labels[0]:
+            return                       # 非首标签克隆不执行（裁决·扇出共享与首标签执行）
+        if getattr(item, "segment_degraded", None) is not None:
+            return                       # 降格会话跳过（裁决·降格会话跳过）
+        if item.member_annotations is None:
+            item.member_annotations = {}
+        pending: list[Record] = []
+        seen: set[str] = set()
+        for m in item.record.members:
+            # 同 id 成员（内容哈希碰撞，ingest D2 已知面）只调用一次——
+            # first-wins 与 M13 帧判决落表同口径（终审缺陷修复：防同键并发
+            # 双付费与 annotated 计数虚高）。
+            if m.id in item.member_annotations or m.id in seen:
+                continue
+            seen.add(m.id)
+            pending.append(m)
+        if pending:
+            await asyncio.gather(*(self._frame_member(item, m, ctx)
+                                   for m in pending))
+
+    async def _frame_member(self, item: PipelineItem, member: Record,
+                            ctx: "RunContext") -> None:
+        """单成员槽位：帧类视图 enabled=false ⇒ skipped（不占键）；否则经
+        annotate_member（不抛，成员级隔离）占键——成功 Annotation / 失败 None。
+        事件 annotate.frame 每成员一发，ids=(episode_id,)；payload 仅
+        member_id/status/attempts——标注内容只经既有 excerpt 键按档位截断
+        （excerpt/full 档 200 字），不新增任何数据内容 payload 键。"""
+        cls = (item.member_classifications or {}).get(member.id)
+        label = cls.label if cls is not None else None   # frame.classify 关 ⇒ 全局指令
+        view = (self.cfg.frame_class_views.get(label)
+                if label is not None else None)
+        if view is not None and not view.enabled:
+            ctx.metrics.count("frame_annotate.skipped")
+            payload: dict = {"member_id": member.id, "status": "skipped",
+                             "attempts": 0}
+        else:
+            ann = await annotate_member(member, ctx, label=label)
+            item.member_annotations[member.id] = ann
+            payload = {"member_id": member.id,
+                       "status": "annotated" if ann is not None else "failed",
+                       "attempts": ann.attempts if ann is not None else 0}
+            if (ann is not None and self.cfg.trace.enabled
+                    and self.cfg.trace.content in ("excerpt", "full")):
+                payload["excerpt"] = {member.id: _dumps(ann.output)[:200]}
+        ctx.metrics.event(EV_ANNOTATE_FRAME, stage=self.name,
+                          batch_no=ctx.batch_no, record_ids=(item.record.id,),
+                          payload=payload)
 
     def _excerpt_payload(self, record: Record) -> dict | None:
         """`excerpt` payload addition for the annotate.done event. §7.4: the four

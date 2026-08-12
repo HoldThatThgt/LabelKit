@@ -269,3 +269,38 @@ inode**，先启动进程 rename 交付的「主输出」实为后进程内容�
   实测 8+0+0+0+1+0+8+45+4 = 53+0+0+13 = 66 ✓、`threads = episodes −
   stitched = 13 − 4 = 9` ✓、rejects 9 行（8 noise + 1 #20）下 exit 0
   （strict 语义不变）。
+
+---
+
+## 追加条目：v1.12 DeepSeek 端点实测（2026-08-12）
+
+> v1.12「流模式帧级分类与标注」为 `examples/mix` 选型 DeepSeek anthropic 兼容
+> 路由（`https://api.deepseek.com/anthropic`，模型 `deepseek-v4-flash`，密钥
+> `.env` 的 `LABELKIT_DEEPSEEK_KEY`）时的端点行为实测，2026-08-12 两次真实
+> 探针 + mix 工程真跑确认。UI 帧路径不受影响——mix 主工程（UI 模态，2026-08-12
+> 需求方修订后）的视觉必需阶段经 `[llm.vision]` 走 z.ai glm-5.2，另有 z.ai
+> 集成测试（`tests/integration/test_frame_llm.py`）覆盖。
+
+### 22. DeepSeek anthropic 路由响应默认携带 thinking 内容块 —— 📌 已记录（M9 天然兼容，2026-08-12）
+
+**现象**：`https://api.deepseek.com/anthropic` + `deepseek-v4-flash` 的文本调用响应 `content` 数组默认携带 `type=="thinking"` 内容块（模型默认开思考，无请求侧关闭开关），`type=="text"` 块随后。两次真实探针一致；温度 0 可用、usage 在场。
+
+**后果**：零适配成本——M9 anthropic 解析器只收集 `type=="text"` 块拼接文本（`llm_client.py` 的响应解析循环，约 :451-456），thinking 块天然跳过，JSON 干净落在 text 块、L1 无感。但该兼容性是**解析器按块类型过滤**这一实现选择的副产品：若未来改为「拼接全部内容块」，thinking 文本会污染 L1 解析面——记录在案防回归。
+
+**处置**：`examples/mix/config.toml` 以该端点为默认 profile，文件头注记录本结论；无代码改动面。
+
+### 23. 该路由不支持图像内容块 —— ✅ 已适配（examples/mix 双 profile 混合接入，2026-08-12 需求方修订后更新）
+
+**现象**：DeepSeek anthropic 兼容路由的官方字段支持表不含图像内容块（`type=="image"`），实测附图请求被拒。
+
+**后果**：该端点不能单独承载 UI 模态（截图是 UI 链路的主证据：vision 分类/标注/verify 评审/帧级标注均需附图）。
+
+**处置**（2026-08-12 需求方修订「示例必须用 UI 控件树数据或混合数据，不能纯文本」后更新）：`examples/mix` 主工程取 **UI 模态 + 双 profile 混合接入**——视觉必需四阶段（classify/annotate/frame.annotate/verify）经 `[llm.vision]` 走 z.ai glm-5.2，文本判决面（segment 滑窗判决、帧级批量分类、stream 模式 quality 打分）经 `[llm.default]` 走 DeepSeek，恰为 v1.12 vision 语义分列的教学形态；文本姊妹工程 `project-text.toml` 保留纯 DeepSeek 形态（`meta:ts` 排序 + gap 会话化 + 双粒度标注）。分工写进 `config.toml` 与两份 project 头注（SPEC-frame-annotation §3.8）。
+
+### 24. 该路由对强制 tool_choice 返回 400 —— ✅ 已适配（mix profile 声明 supports_structured_output=false，2026-08-12）
+
+**现象**：M9 anthropic 协议的结构化输出形态（名为 `emit` 的 tool + 强制 `tool_choice`，CONTRACTS §12）在该路由返回 HTTP 400——强制工具调用不受支持。
+
+**后果**：`supports_structured_output=true` 的 profile 声明在该端点不可用；若声明为 true，首个 LLM 调用即 400 快速失败。
+
+**处置**：`examples/mix/config.toml` 的 `[llm.default]`（DeepSeek 档）声明 `supports_structured_output = false`——该档全部调用走**文本 + L1 确定性解析**路径（L0 缺位由 L1–L3 兜底，M8 四层保证语义不变），实测 JSON 干净落在 text 块、mix 主/姊妹两工程全流程 exit 0；`[llm.vision]` 的 z.ai 档不受影响，照走 L0 结构化输出。配置注释记录该 400 实测依据。

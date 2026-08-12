@@ -2,7 +2,7 @@
 
 ### 3.8.1 职责与边界
 
-**做：**持有经预校验的用户 Schema 与各内部小 Schema（裁决、评分、评审、生成输出；v1.7 增分类 `classification_schema(class_names, assignment, max_labels, with_reason)`——按 `classify.assignment` 二态、类名词表以 enum 硬约束，关键字集 ⊆ 既有内部 Schema 关键字集且**无 uniqueItems**：该关键字会被 OpenAI strict 模式与部分约束解码网关硬拒，重复标签由 classify 代码在 M8 验证后确定性归一化，全文见 3.13.3；**v1.8 增三项**——分段窗口 `segment_window_schema(frame_count, with_reason)`（M14，全文见 3.14.3）、动作 `action_schema()`（M15，11 值动作词表 enum 硬约束，全文见 3.15.3）、stream 缺陷评审 `defect_verdict_schema()`（M7 stream 分支，三顶键 `{critiques, defects, verdict}` + 缺陷词表——v1.8 五值，v1.9 起六值（+`wrong_stitch`，3.7.2），全文见 3.7.2）；**v1.9 增一项**——缝合判定 `stitch_schema()`（M16，五键 `{verdict, thread_ref, task_name, reason, confidence}` 全 required、thread_ref 可空联合，全文见 3.16.3）。四者逐字 JSON 冻结于 CONTRACTS §10.7，规则同族：关键字集 ⊆ 既有内部 Schema 关键字集、同样**无 uniqueItems**（重复 index / 标签由调用方代码在 M8 验证后确定性收窄——3.14.4 的 first-wins 建表、3.13.4 的归一化行）；可选性一律以可空联合 type 数组 `["array","null"]` / `["string","null"]` 表达、**全键 required**（OpenAI strict 模式硬拒可选属性，L0 无条件透传 Schema）；`minItems = maxItems` 钉死窗口数组长度（judgment_schema 同款）。`defect_verdict_schema` 与既有评审 Schema **并存**——非 stream 评审路径继续用后者（回归锚，S7）。四者与其余内部 Schema 同级：不计入 `report.schema_engine.resolved_at`、不经过 L2.5）；提供「LLM 调用 → 合法 JSON 对象」的唯一入口 `complete_validated()`，内部实现四层结构保证；统计各层修复命中率。 
+**做：**持有经预校验的用户 Schema 与各内部小 Schema（裁决、评分、评审、生成输出；v1.7 增分类 `classification_schema(class_names, assignment, max_labels, with_reason)`——按 `classify.assignment` 二态、类名词表以 enum 硬约束，关键字集 ⊆ 既有内部 Schema 关键字集且**无 uniqueItems**：该关键字会被 OpenAI strict 模式与部分约束解码网关硬拒，重复标签由 classify 代码在 M8 验证后确定性归一化，全文见 3.13.3；**v1.8 增三项**——分段窗口 `segment_window_schema(frame_count, with_reason)`（M14，全文见 3.14.3）、动作 `action_schema()`（M15，11 值动作词表 enum 硬约束，全文见 3.15.3）、stream 缺陷评审 `defect_verdict_schema()`（M7 stream 分支，三顶键 `{critiques, defects, verdict}` + 缺陷词表——v1.8 五值，v1.9 起六值（+`wrong_stitch`，3.7.2），全文见 3.7.2）；**v1.9 增一项**——缝合判定 `stitch_schema()`（M16，五键 `{verdict, thread_ref, task_name, reason, confidence}` 全 required、thread_ref 可空联合，全文见 3.16.3）；**v1.12 增一项**——帧级批量判决 `frame_classify_schema(names, n)`（M13 帧粒度，单键 `{"labels": [enum×n]}`、`minItems = maxItems = n` 钉死窗内成员数组长度、帧标签词表 enum 硬约束，同族**无 uniqueItems**（帧标签本就允许重复）；长度/索引对齐后校验在代码侧（first-wins，缺项 ⇒ 该帧 `fallback_class`），全文见 3.13.7）。四者逐字 JSON 冻结于 CONTRACTS §10.7，规则同族：关键字集 ⊆ 既有内部 Schema 关键字集、同样**无 uniqueItems**（重复 index / 标签由调用方代码在 M8 验证后确定性收窄——3.14.4 的 first-wins 建表、3.13.4 的归一化行）；可选性一律以可空联合 type 数组 `["array","null"]` / `["string","null"]` 表达、**全键 required**（OpenAI strict 模式硬拒可选属性，L0 无条件透传 Schema）；`minItems = maxItems` 钉死窗口数组长度（judgment_schema 同款）。`defect_verdict_schema` 与既有评审 Schema **并存**——非 stream 评审路径继续用后者（回归锚，S7）。四者与其余内部 Schema 同级：不计入 `report.schema_engine.resolved_at`、不经过 L2.5）；提供「LLM 调用 → 合法 JSON 对象」的唯一入口 `complete_validated()`，内部实现四层结构保证；统计各层修复命中率。 
 **不做：**不组装业务提示词（调用方传入完整 prompt）；不解释业务语义；不放行任何未通过校验的对象——这是它对全系统的硬契约。
 
 ### 3.8.2 四层保证与修复环
@@ -17,6 +17,12 @@
 | L2.5（v1.5，可选） | `output.validator` 配置时、且仅对用户 Schema 调用：L2 通过后执行用户回调 `fn(obj, record)`。返回非空违规列表 ⇒ 违规以 `(validator) <消息>` 形式并入违规清单、与 Schema 违规同路进入 L3 修复环（回调意见回喂模型自我修正——回调既是门卫也是修复环的教练）；返回空 ⇒ 通过。L3 每轮修复输出重走 L1→L2→L2.5。预算耗尽且剩余违规**全部**来自回调 ⇒ `SchemaViolation(callback_only=True)`，记录 kind = `callback_violation`（7.6），否则仍为 `schema_violation`。回调抛异常不吞：向上传播、按记录级 `internal_error` 收敛（3.5.3）。内部 Schema（裁决/评分/评审/生成/分类（v1.7）/分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9））不经过 L2.5。 |
 | L3 | 修复提示词 = 单条 user 消息，按 `[原始输出]` / `[违规清单]` 分节标签组织，末尾指令「只输出修正后的 JSON」（逐字实例见 3.8.4）。使用 `output.repair_llm`（默认同调用方 profile）。每次修复输出重走 L1→L2。尝试次数耗尽 ⇒ 抛 `SchemaViolation(errors, raw_last_output)`。修复调用计入 token 计量，命中层级分布计入报告（`report.schema_engine.resolved_at = {l0_or_clean, l1, l3_1, l3_2, rejected}`）。**上下文预算交互（v1.11，V25①）**：修复调用经 M9 终检（3.9）抛出 `ContextOverflowError(phase="precheck")` 时**捕获并记该轮修复失败**——修复 prompt 恒定 ⇒ 余轮必然同败，**短路至预算耗尽**；reject 归因维持既有 `schema_violation` / `callback_violation`（**不新增 reject 值、不计 `report.budget.overflow_records`**，7.6 注）；`[原始输出]` 修复原文**永不截断**——截断即破坏修复语义；该吞点即异常终局——reactive-400 形态在此经共享 `budget.feed_reactive_terminal` 补喂熔断**恰一次**（7.6 熔断矩阵；`_breaker_fed` duck 标防重喂，precheck/200 形态永不喂，v1.11 审计修订）。 |
 
+**帧级两类调用的路由声明（v1.12）**：帧粒度引入的两类 LLM 调用都走本引擎既有能力，`complete_validated` 与 `validate_only` 的显式 schema 参数路径**零改动**——
+
+- **帧分类**（M13 批量判决，3.13.7）：传入模块级构造器 `frame_classify_schema(names, n)` 产出的**内部 Schema**，待遇与裁决/评分/评审等内部 Schema 完全同族——L0–L3 全在、不经过 L2.5、不计入 `report.schema_engine.resolved_at`。
+- **帧标注**（M5 逐帧标注，3.5.5）：传入**用户声明的帧级 Schema** `cfg.frame_schema`（显式 schema 参数，裁决·帧 Schema 显式路由）——虽为用户 Schema 的同胞（M1 元校验 + few-shot 干跑，3.1.4），但按**内部 Schema 待遇**路由：L0–L3 四层全在、**无 L2.5**（`output.validator` 仅约束序列级用户 Schema 调用；帧级回调列 8.4 演进候选）、**不计 `resolved_at`**——保住 6.4 恒等式「resolved_at 加总 = 进入 M5 的记录数」不被帧调用污染。
+- **写前兜底**（M11，3.11.2）：emitter 对每个非 null 帧标注对象跑 `validate_only(obj, schema=cfg.frame_schema)`——通过 ⇒ status="annotated"，不通过 ⇒ 翻 "failed" + annotation 置 null + 计数，非法帧对象**永不落盘**（主输出 `validate_only` 终检的帧级镜像）。
+
 ### 3.8.3 API
 
 ```
@@ -28,7 +34,8 @@ class SchemaEngine:
            分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9））由各 Stage 传入。
            成功返回已通过 L2 的 dict；失败抛 SchemaViolation。"""
     def validate_only(self, obj: dict, schema: dict | None = None) -> list[str]:
-        """M1 校验 few-shot 示例输出、M11 写出前终检用。"""
+        """M1 校验 few-shot 示例输出、M11 写出前终检用；v1.12：M11 帧标注写前
+           校验经显式 schema=cfg.frame_schema 走同一入口（3.8.2 路由声明）。"""
 ```
 
 **设计考量：**“Let Me Speak Freely?”（arXiv:2408.02442）报告了严格格式约束可能损失推理质量 [25]。缓解按各内部 Schema 的实际字段序落地：评审输出的 `critiques` 置于 `verdict` **之前**（3.7.2「先意见后结论」）、pointwise 打分的 `reason` 置于 `score` **之前**（3.4.4「先给两句理由再给整数分」），让模型先推理后作答。例外是成对裁决：字段序为 `criterion → winner → reason`，`reason` 在结论**之后**且仅当 `quality.judgment_reasons` 生效时才要求（3.4.3）——它的用途是落入 trace 供 rubric 优化（7.5），不承担「先推理后作答」的缓解职责（生成输出 `{"samples": [...]}` 则不含自由文本字段）。用户 Schema 若需同类缓解，可自行加 reasoning 字段并在下游忽略。

@@ -1,7 +1,9 @@
 """Offline unit tests for M13 classify: prompt assembly (spec 3.13.3 / CONTRACTS §10.8),
 post-M8 normalization, self-consistency voting (R26 own rules), the on_error two-path
-policy (R4), and multi fan-out (contract ②a). Pure logic only — no LLM: the schema
-engine is replaced by the in-process complete_validated stubs (test_annotate 惯例)."""
+policy (R4), and multi fan-out (contract ②a); v1.12 帧级批量判决（SPEC-frame-annotation
+§3.2）——§10.12 装配、零重叠分窗、对齐后校验、全窗 fallback、执行门与扇出共享。
+Pure logic only — no LLM: the schema engine is replaced by the in-process
+complete_validated stubs (test_annotate 惯例)."""
 from __future__ import annotations
 
 import asyncio
@@ -14,6 +16,8 @@ from labelkit.operators.classify import (
     _normalize_labels,
     _reason_requested,
     build_classify_prompt,
+    build_frame_classify_prompt,
+    classify_frames,
     classify_record,
 )
 from labelkit.common.config.model import (
@@ -23,6 +27,7 @@ from labelkit.common.config.model import (
     ConsoleConfig,
     DedupConfig,
     ExtractConfig,
+    FrameClassifyConfig,
     GenerateConfig,
     InputConfig,
     OutputConfig,
@@ -38,7 +43,10 @@ from labelkit.common.config.model import (
     VerifyConfig,
 )
 from labelkit.common.errors import ProviderRetryableError, SchemaViolation
-from labelkit.common.runtime.schema_engine import classification_schema
+from labelkit.common.runtime.schema_engine import (
+    classification_schema,
+    frame_classify_schema,
+)
 from labelkit.common.contracts.types import (
     Classification,
     DedupInfo,
@@ -882,3 +890,467 @@ def test_reactive_400_terminal_feeds_breaker_exactly_once():
     asyncio.run(ClassifyStage(cfg).run([item2], ctx2))
     assert item2.errors[0].kind == "context_overflow"
     assert ctx2.metrics.fed == []
+
+
+# ── v1.12 帧级批量判决（SPEC-frame-annotation §3.2，CONTRACTS §10.12） ────────
+
+FRAME_CLASSES = (
+    ClassSpec(name="task_request", description="发起一项新任务的请求"),
+    ClassSpec(name="followup", description="对进行中任务的补充或跟进"),
+    ClassSpec(name="chitchat", description="与任务无关的闲聊"),
+    ClassSpec(name="other", description="其余"),
+)
+
+FRAME_NAMES = [c.name for c in FRAME_CLASSES]
+
+
+def frame_cfg(*, context_window=0, frame_enabled=True, vision_resolved=False,
+              fallback_class="other", **kw) -> ResolvedConfig:
+    """make_cfg/budget_cfg + 帧级分类配置（vision_resolved 为 M1 解析产物——
+    单测按产物形态直接注入，segment.vision_resolved 测试同款手法）。"""
+    from dataclasses import replace
+    base = budget_cfg(context_window, **kw) if context_window else make_cfg(**kw)
+    return replace(base, frame_classify=FrameClassifyConfig(
+        enabled=frame_enabled, llm="default", fallback_class=fallback_class,
+        classes=FRAME_CLASSES, vision_resolved=vision_resolved))
+
+
+class FrameStageEngine:
+    """帧级测试引擎：schema 带 labels 键 ⇒ 帧窗调用（frame_outcomes 队列优先出货/
+    抛出，队列空则按窗长自动应答 frame_label × n），单独记入 frame_calls；
+    其余 ⇒ 序列级判决按 record id 出货（MapEngine 形态）。"""
+
+    def __init__(self, by_record, frame_label="task_request", frame_outcomes=None):
+        self.by_record = dict(by_record)
+        self.frame_label = frame_label
+        self.frame_outcomes = list(frame_outcomes or [])
+        self.calls: list = []              # (profile, prompt, schema, record_ids)
+        self.frame_calls: list = []
+
+    async def complete_validated(self, profile, prompt, schema=None, *,
+                                 record_ids=(), batch_no=0, record=None):
+        self.calls.append((profile, prompt, schema, record_ids))
+        if schema is not None and "labels" in schema.get("properties", {}):
+            self.frame_calls.append((profile, prompt, schema, record_ids))
+            if self.frame_outcomes:
+                out = self.frame_outcomes.pop(0)
+                if isinstance(out, Exception):
+                    raise out
+                return out, Usage(), 1, "glm-5.2"
+            n = schema["properties"]["labels"]["minItems"]
+            return {"labels": [self.frame_label] * n}, Usage(), 1, "glm-5.2"
+        out = self.by_record[record_ids[0]]
+        if isinstance(out, Exception):
+            raise out
+        return out, Usage(), 1, "glm-5.2"
+
+
+def frame_members(n: int, text="步骤") -> list[Record]:
+    return [text_record(f"{text}{i}", rid=f"fm{i}") for i in range(1, n + 1)]
+
+
+# ── prompt 装配（§10.12：确定性模板 + vision 形态 + fit 尾参） ────────────────
+
+def test_frame_prompt_verbatim_text():
+    cfg = frame_cfg()
+    members = [text_record("打开外卖应用", rid="fm1"), text_record("搜索奶茶", rid="fm2")]
+    digests = [frame_digest(m, cfg.segment.digest_max_chars) for m in members]
+    bundle = build_frame_classify_prompt(members, cfg, digests)
+    assert [m.role for m in bundle.messages] == ["system", "user"]
+    assert bundle.messages[0].parts[0].text == (
+        "[任务]\n"
+        "你是数据流的逐帧分类员。下面给出同一会话中按时间顺序排列的 2 帧成员摘要，"
+        "对每一帧独立判断它属于以下类别中的哪一类，只能从以下封闭类别表中取恰一值。类别表：\n"
+        "- task_request: 发起一项新任务的请求\n"
+        "- followup: 对进行中任务的补充或跟进\n"
+        "- chitchat: 与任务无关的闲聊\n"
+        "- other: 其余\n"
+        "输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：\n"
+        '{"labels": [<第 1 帧类名>, <第 2 帧类名>, ...]}（恰 2 项，按帧序与成员摘要行对齐）'
+    )
+    (part,) = bundle.messages[1].parts
+    assert part.text == "[会话成员帧]\n1. 打开外卖应用\n2. 搜索奶茶"
+    assert bundle.temperature is None
+
+
+def test_frame_prompt_vision_appends_member_screenshot_parts():
+    cfg = frame_cfg(modality="ui", vision_resolved=True)
+    members = [seq_member_ui(1), seq_member_ui(2)]
+    digests = [frame_digest(m, cfg.segment.digest_max_chars) for m in members]
+    bundle = build_frame_classify_prompt(members, cfg, digests)
+    msg = bundle.messages[-1]
+    assert [p.kind for p in msg.parts] == ["text", "text", "image", "text", "image"]
+    assert msg.parts[0].text.startswith("[会话成员帧]\n1. ")
+    assert msg.parts[1].text == "[成员 1 截图]"
+    assert msg.parts[2].image is members[0].image
+    assert msg.parts[3].text == "[成员 2 截图]"
+    assert msg.parts[4].image is members[1].image
+    # vision_resolved=False（成本控制面 = 指向纯文本 profile）⇒ 摘要行 only
+    off = frame_cfg(modality="ui", vision_resolved=False)
+    plain = build_frame_classify_prompt(members, off, digests)
+    assert [p.kind for p in plain.messages[-1].parts] == ["text"]
+
+
+def test_frame_assemble_fit_checks_whole_prompt_and_keeps_bytes():
+    from labelkit.operators.classify import _PromptFit, _assemble_frame_classify
+
+    cfg = frame_cfg()
+    members = [text_record("字" * 200, rid="fm1")]
+    digests = ["字" * 200]
+    tight = _PromptFit(input_budget=50, image_cost=0)
+    bundle = _assemble_frame_classify(members, cfg, digests, fit=tight)
+    assert tight.overflow is True                      # 最小单元不可装填 → precheck 跳过位
+    roomy = _PromptFit(input_budget=100_000, image_cost=0)
+    bundle2 = _assemble_frame_classify(members, cfg, digests, fit=roomy)
+    assert roomy.overflow is False
+    # fit 尾参不改字节：公开面与 fit 路径同篇（「公开面冻结 + 私有 fit 尾参」形态）
+    assert bundle == bundle2 == build_frame_classify_prompt(members, cfg, digests)
+
+
+# ── classify_frames：位次对齐后校验（缺项 fallback / 超长截断） ───────────────
+
+def test_classify_frames_single_window_maps_labels_positionally():
+    cfg = frame_cfg()
+    members = frame_members(3)
+    engine = QueueEngine([{"labels": ["task_request", "followup", "chitchat"]}])
+    ctx = make_ctx(cfg, engine)
+    result = asyncio.run(classify_frames(members, ctx))
+    assert set(result) == {"fm1", "fm2", "fm3"}
+    assert result["fm1"] == Classification(label="task_request",
+                                           labels=("task_request",),
+                                           source="llm", detail={})
+    assert [result[f"fm{i}"].label for i in (1, 2, 3)] == [
+        "task_request", "followup", "chitchat"]
+    profile, _prompt, schema, record_ids = engine.calls[0]
+    assert profile == "default"                        # cfg.frame_classify.llm
+    assert schema == frame_classify_schema(FRAME_NAMES, 3)
+    assert record_ids == ("fm1",)                      # 公开面缺省归属 = 首成员 id
+    assert ctx.metrics.counters == {"frame_classify.calls": 1}
+
+
+def test_classify_frames_short_array_pads_missing_with_fallback():
+    cfg = frame_cfg()
+    members = frame_members(3)
+    engine = QueueEngine([{"labels": ["task_request", "followup"]}])   # 缺第 3 项
+    ctx = make_ctx(cfg, engine)
+    result = asyncio.run(classify_frames(members, ctx))
+    assert result["fm1"].source == "llm" and result["fm2"].source == "llm"
+    assert result["fm3"] == Classification(label="other", labels=("other",),
+                                           source="fallback", detail={})
+    assert ctx.metrics.counters == {"frame_classify.calls": 1,
+                                    "frame_classify.fallback": 1}
+
+
+def test_classify_frames_overlong_array_truncates_keeping_head():
+    cfg = frame_cfg()
+    members = frame_members(2)
+    engine = QueueEngine([{"labels": ["followup", "chitchat", "task_request",
+                                      "other"]}])
+    ctx = make_ctx(cfg, engine)
+    result = asyncio.run(classify_frames(members, ctx))
+    assert [result[f"fm{i}"].label for i in (1, 2)] == ["followup", "chitchat"]
+    assert all(c.source == "llm" for c in result.values())
+    assert "frame_classify.fallback" not in ctx.metrics.counters
+
+
+# ── classify_frames：全窗 fallback 语义（修复穷尽/不可恢复，永不 episode failed）─
+
+def test_classify_frames_window_failure_falls_back_whole_window():
+    cfg = frame_cfg()
+    members = frame_members(3)
+    engine = QueueEngine([SchemaViolation(["/labels: 枚举违规"], "{}")])
+    ctx = make_ctx(cfg, engine)
+    result = asyncio.run(classify_frames(members, ctx))
+    assert all(c.label == "other" and c.labels == ("other",)
+               and c.source == "fallback" for c in result.values())
+    assert all(c.detail["kind"] == "classification_invalid"
+               for c in result.values())               # R4 留痕：kind/message 入 detail
+    assert ctx.metrics.counters == {"frame_classify.calls": 1,
+                                    "frame_classify.window_failures": 1,
+                                    "frame_classify.fallback": 3}
+
+
+# ── classify_frames：分窗（预算开/关 + 零重叠） ──────────────────────────────
+
+def test_classify_frames_budget_off_single_window_all_members():
+    cfg = frame_cfg()                                  # llm_profiles={} ⇒ 预算关
+    members = frame_members(8)
+    engine = FrameStageEngine({})
+    ctx = make_ctx(cfg, engine)
+    result = asyncio.run(classify_frames(members, ctx))
+    assert len(engine.frame_calls) == 1                # 单窗全成员
+    assert engine.frame_calls[0][2]["properties"]["labels"]["minItems"] == 8
+    assert len(result) == 8
+
+
+def test_classify_frames_budget_packs_zero_overlap_windows():
+    cfg = frame_cfg(context_window=2000)
+    members = [text_record("字" * 400, rid=f"fm{i:02d}") for i in range(12)]
+    engine = FrameStageEngine({})
+    ctx = budget_ctx(cfg, engine)
+    result = asyncio.run(classify_frames(members, ctx))
+    assert len(engine.frame_calls) >= 2                # 预算确实切了窗
+    # 零重叠去重叠形：各窗长度之和 == 成员总数（pack_windows 原生跨度带 1 帧重叠，
+    # 帧分类调用形自第二窗起丢弃重叠首帧），拼接摘要行 == 全序列恰一次按序覆盖。
+    sizes = [c[2]["properties"]["labels"]["minItems"] for c in engine.frame_calls]
+    assert sum(sizes) == 12
+    seen: list[str] = []
+    for call in engine.frame_calls:
+        body = call[1].messages[-1].parts[0].text.removeprefix("[会话成员帧]\n")
+        lines = body.split("\n")
+        assert lines[0].startswith("1. ")              # 窗内序号 1-based 重编
+        assert len(lines) == call[2]["properties"]["labels"]["minItems"]
+        seen.extend(line.split(". ", 1)[1] for line in lines)
+    assert seen == ["字" * 400] * 12
+    assert set(result) == {f"fm{i:02d}" for i in range(12)}
+    assert all(c.source == "llm" for c in result.values())
+    assert ctx.metrics.counters["frame_classify.calls"] == len(engine.frame_calls)
+
+
+# ── classify_frames：反应式溢出对半降级（V20 镜像）与 precheck 纪律 ───────────
+
+def test_classify_frames_reactive_overflow_halves_then_succeeds():
+    from labelkit.common.errors import ContextOverflowError
+
+    cfg = frame_cfg(context_window=100_000)
+    overflow = ContextOverflowError("prompt too long", phase="reactive")
+    overflow.origin = "finish"                         # 200 形终局：永不喂熔断
+    engine = FrameStageEngine({}, frame_outcomes=[overflow])
+    ctx = budget_ctx(cfg, engine)
+    result = asyncio.run(classify_frames(frame_members(4), ctx))
+    # 原窗 (0,4) 溢出 → 对半 (0,2)/(2,4) 各自成功；零成员落 fallback
+    assert [c[2]["properties"]["labels"]["minItems"]
+            for c in engine.frame_calls] == [4, 2, 2]
+    assert all(c.source == "llm" for c in result.values())
+    assert ctx.metrics.counters["budget.degrade_retries"] == 1
+    assert ctx.metrics.counters["frame_classify.calls"] == 3
+    assert "frame_classify.window_failures" not in ctx.metrics.counters
+
+
+def test_classify_frames_degrade_exhausted_feeds_breaker_once_and_falls_back():
+    from labelkit.common.errors import ContextOverflowError
+
+    class FeedMetrics(RecordingMetrics):
+        def __init__(self):
+            super().__init__()
+            self.fed: list = []
+
+        def record_provider_result(self, fatal, *, hard=False):
+            self.fed.append((fatal, hard))
+
+    cfg = frame_cfg(context_window=100_000)
+    outcomes = [ContextOverflowError("prompt too long", phase="reactive")
+                for _ in range(3)]                     # (0,4) → (0,2) → (0,1) 终局
+    engine = FrameStageEngine({}, frame_outcomes=outcomes)
+    ctx = budget_ctx(cfg, engine)
+    ctx.metrics = FeedMetrics()
+    result = asyncio.run(classify_frames(frame_members(4), ctx))
+    # 降级树终局失败 ⇒ 整个原始窗兜底；反应式 400 终局恰一次喂熔断（A7）
+    assert all(c.label == "other" and c.source == "fallback"
+               for c in result.values())
+    assert all(c.detail["kind"] == "context_overflow" for c in result.values())
+    assert ctx.metrics.counters["budget.degrade_retries"] == 2
+    assert ctx.metrics.counters["frame_classify.window_failures"] == 1
+    assert ctx.metrics.counters["frame_classify.fallback"] == 4
+    assert ctx.metrics.fed == [(True, False)]
+
+
+def test_classify_frames_precheck_overflow_skips_window_without_dispatch():
+    # 校准后图像成本巨大 ⇒ 每窗（强制 2 帧兜底窗 + 去重叠单帧窗）皆 precheck 溢出：
+    # 零 LLM 派发（若误派发 ExplodingEngine 会把 kind 打成 internal_error）、全员
+    # fallback、precheck 永不喂熔断（RecordingMetrics 无 record_provider_result——
+    # 被误喂将直接 AttributeError）、非 reject 不计 budget.overflow_records（V13②）。
+    cfg = frame_cfg(context_window=2000, modality="ui", vision_resolved=True)
+    members = [seq_member_ui(i) for i in range(1, 5)]
+    ctx = budget_ctx(cfg, ExplodingEngine(), image_cost=10_000)
+    result = asyncio.run(classify_frames(members, ctx))
+    assert all(c.label == "other" and c.source == "fallback"
+               for c in result.values())
+    assert all(c.detail["kind"] == "context_overflow" for c in result.values())
+    assert ctx.metrics.counters["frame_classify.fallback"] == 4
+    assert ctx.metrics.counters["frame_classify.window_failures"] == 3
+    assert ctx.metrics.counters["frame_classify.calls"] == 3
+    assert "budget.overflow_records" not in ctx.metrics.counters
+
+
+# ── stage 帧 pass：产物、事件、计数与执行门四条件 ────────────────────────────
+
+def test_stage_frame_pass_writes_member_classifications_and_event():
+    cfg = frame_cfg()
+    members = frame_members(3)
+    episode = seq_record(members, rid="ep0001aabbccdd00")
+    item = PipelineItem(record=episode)
+    single = PipelineItem(record=text_record(rid="solo", text="独行记录"))
+    engine = FrameStageEngine({"ep0001aabbccdd00": {"class": "qa"},
+                               "solo": {"class": "qa"}})
+    out, ctx = run_stage(cfg, [item, single], engine)
+    assert item.classification.label == "qa"           # 序列级判决先行写入
+    assert set(item.member_classifications) == {"fm1", "fm2", "fm3"}
+    assert all(c == Classification(label="task_request", labels=("task_request",),
+                                   source="llm", detail={})
+               for c in item.member_classifications.values())
+    assert single.member_classifications is None       # 帧 pass 只作用于序列信封
+    assert ctx.metrics.counters["frame_classify.calls"] == 1
+    # 帧窗 record_ids 归属 = episode_id（SPEC §3.2 调用形态）
+    assert engine.frame_calls[0][3] == ("ep0001aabbccdd00",)
+    frame_events = [e for e in ctx.metrics.events if e[0] == "classify.frame"]
+    assert frame_events == [("classify.frame", "classify", ("ep0001aabbccdd00",),
+                             {"members": 3, "windows": 1, "fallback": 0})]
+
+
+def test_stage_frame_window_failure_keeps_episode_active():
+    cfg = frame_cfg()
+    episode = seq_record(frame_members(2), rid="ep0002aabbccdd00")
+    item = PipelineItem(record=episode)
+    engine = FrameStageEngine(
+        {"ep0002aabbccdd00": {"class": "qa"}},
+        frame_outcomes=[SchemaViolation(["/labels: 枚举违规"], "{}")])
+    out, ctx = run_stage(cfg, [item], engine)
+    assert item.status == "active" and item.errors == []   # 永不 episode failed
+    assert all(c.label == "other" and c.source == "fallback"
+               for c in item.member_classifications.values())
+    (ev,) = [e for e in ctx.metrics.events if e[0] == "classify.frame"]
+    assert ev[3] == {"members": 2, "windows": 1, "fallback": 2}
+    assert ctx.metrics.counters["frame_classify.window_failures"] == 1
+
+
+def test_stage_frame_gate_skips_clone_envelopes():
+    # 克隆判据 = classification.label != classification.labels[0]（verify S8 同款）
+    cfg = frame_cfg()
+    episode = seq_record([text_record("步骤", rid="fm1")], rid="ep0003aabbccdd00")
+    clone = PipelineItem(record=episode,
+                         classification=Classification(label="qa",
+                                                       labels=("writing", "qa"),
+                                                       source="llm", detail={}))
+    out, ctx = run_stage(cfg, [clone], ExplodingEngine())   # 零调用（序列级也幂等跳过）
+    assert clone.member_classifications is None
+    assert ctx.metrics.counters == {} and ctx.metrics.events == []
+
+
+def test_stage_frame_gate_skips_degraded_episode_with_counter():
+    cfg = frame_cfg()
+    episode = seq_record(frame_members(2), rid="ep0004aabbccdd00")
+    item = PipelineItem(record=episode)
+    item.segment_degraded = {"kind": "segmentation_invalid", "windows_failed": 1}
+    engine = FrameStageEngine({"ep0004aabbccdd00": {"class": "qa"}})
+    out, ctx = run_stage(cfg, [item], engine)
+    assert item.classification is not None             # 序列级判决照常
+    assert item.member_classifications is None         # 帧 pass 跳过（降格裁决）
+    assert engine.frame_calls == []
+    assert ctx.metrics.counters["frame_classify.skipped_degraded"] == 1
+    assert not [e for e in ctx.metrics.events if e[0] == "classify.frame"]
+
+
+def test_stage_frame_gate_idempotent_on_existing_dict():
+    cfg = frame_cfg()
+    episode = seq_record([text_record("步骤", rid="fm1")], rid="ep0005aabbccdd00")
+    existing = {"fm1": Classification(label="chitchat", labels=("chitchat",),
+                                      source="llm", detail={})}
+    item = PipelineItem(record=episode, member_classifications=existing)
+    engine = FrameStageEngine({"ep0005aabbccdd00": {"class": "qa"}})
+    out, ctx = run_stage(cfg, [item], engine)
+    assert item.member_classifications is existing     # 幂等门：原 dict 原样保留
+    assert engine.frame_calls == []
+    assert "frame_classify.calls" not in ctx.metrics.counters
+
+
+def test_stage_frame_only_dual_gate_skips_sequence_classification():
+    # v1.12 双门（SPEC §3.2）：classify.enabled=false ∧ frame.classify.enabled=true
+    # 时序列级判决静默跳过、帧 pass 照常运行（组链或门由 test_cli 的 factory
+    # 测试守护）；空 by_record 引擎保证序列级若被误调必挂（KeyError → failed）。
+    from dataclasses import replace as _replace
+    cfg = frame_cfg()
+    cfg = _replace(cfg, classify=_replace(cfg.classify, enabled=False))
+    episode = seq_record(frame_members(2), rid="ep0007aabbccdd00")
+    item = PipelineItem(record=episode)
+    engine = FrameStageEngine({})
+    out, ctx = run_stage(cfg, [item], engine)
+    assert item.status == "active" and item.classification is None
+    assert set(item.member_classifications) == {"fm1", "fm2"}
+    assert len(engine.frame_calls) == 1
+    assert engine.calls == engine.frame_calls          # 序列级零调用
+    assert ctx.metrics.counters["frame_classify.calls"] == 1
+
+
+def test_stage_frame_pass_disabled_by_switch():
+    cfg = frame_cfg(frame_enabled=False)
+    episode = seq_record(frame_members(2), rid="ep0006aabbccdd00")
+    item = PipelineItem(record=episode)
+    engine = FrameStageEngine({"ep0006aabbccdd00": {"class": "qa"}})
+    out, ctx = run_stage(cfg, [item], engine)
+    assert item.classification is not None
+    assert item.member_classifications is None
+    assert engine.frame_calls == []
+    assert not any(key.startswith("frame_classify.")
+                   for key in ctx.metrics.counters)
+
+
+# ── _fan_out：两 dict 按引用共享（扇出共享裁决） ─────────────────────────────
+
+def test_fan_out_pins_shared_annotations_dict_when_frame_annotate_on():
+    # 终审缺陷修复（扇出共享时序）：M5 尚未运行时克隆共享 None 将永久失联
+    # （M5 的「None ⇒ 重绑新 dict」只作用于原信封）——扇出前对首标签序列信封
+    # 钉住共享容器 {}，克隆与原信封持同一 dict 对象。
+    from dataclasses import replace as _replace
+
+    from labelkit.common.config.model import FrameAnnotateConfig
+    cfg = frame_cfg(assignment="multi", classes=CLASSES4, max_labels=4)
+    cfg = _replace(cfg, frame_annotate=FrameAnnotateConfig(
+        enabled=True, llm="default", instruction="标注帧"))
+    episode = seq_record(frame_members(2), rid="ep0008aabbccdd00")
+    item = PipelineItem(record=episode)
+    engine = FrameStageEngine({"ep0008aabbccdd00": {"classes": ["code", "qa"]}})
+    out, ctx = run_stage(cfg, [item], engine)
+    (clone,) = out[1:]
+    assert item.member_annotations == {}                # 已钉住（非 None 空容器）
+    assert clone.member_annotations is item.member_annotations
+
+
+def test_fan_out_pin_respects_degraded_none_semantics():
+    # 降格信封的帧 pass 恒跳过：钉住不得破坏「dict None = pass 未运行」语义。
+    from dataclasses import replace as _replace
+
+    from labelkit.common.config.model import FrameAnnotateConfig
+    cfg = frame_cfg(assignment="multi", classes=CLASSES4, max_labels=4)
+    cfg = _replace(cfg, frame_annotate=FrameAnnotateConfig(
+        enabled=True, llm="default", instruction="标注帧"))
+    episode = seq_record(frame_members(2), rid="ep0009aabbccdd00")
+    item = PipelineItem(record=episode)
+    item.segment_degraded = {"kind": "segmentation_invalid", "windows_failed": 1}
+    engine = FrameStageEngine({"ep0009aabbccdd00": {"classes": ["code", "qa"]}})
+    out, ctx = run_stage(cfg, [item], engine)
+    (clone,) = out[1:]
+    assert item.member_annotations is None
+    assert clone.member_annotations is None
+
+
+def test_classify_frames_duplicate_member_ids_first_wins():
+    # 终审缺陷修复（内容哈希 id 碰撞）：同 id 成员 first-wins——后位次判决
+    # 不覆盖首位次、不重复计数（温度 0 下同内容判决本就应一致）。
+    cfg = frame_cfg()
+    members = frame_members(2)
+    dup_batch = [members[0], members[0], members[1]]    # 位次 0/1 同 id
+    engine = FrameStageEngine(
+        {}, frame_outcomes=[{"labels": ["task_request", "chitchat", "other"]}])
+    ctx = make_ctx(cfg, engine)
+    result = asyncio.run(classify_frames(dup_batch, ctx))
+    assert set(result) == {members[0].id, members[1].id}
+    assert result[members[0].id].label == "task_request"   # 首位次胜出
+    assert result[members[1].id].label == "other"
+    assert "frame_classify.fallback" not in ctx.metrics.counters
+
+
+def test_stage_frame_fan_out_clones_share_member_dicts_by_reference():
+    cfg = frame_cfg(assignment="multi", classes=CLASSES4, max_labels=4)
+    episode = seq_record(frame_members(2), rid="ep0007aabbccdd00")
+    item = PipelineItem(record=episode)
+    sentinel_annotations = {"fm1": None}               # 后续 wave 的 M5 产物占位
+    item.member_annotations = sentinel_annotations
+    engine = FrameStageEngine({"ep0007aabbccdd00": {"classes": ["code", "qa"]}})
+    out, ctx = run_stage(cfg, [item], engine)
+    (clone,) = out[1:]
+    assert clone.classification.label == "code"        # 克隆 = 非首标签信封
+    assert item.member_classifications is not None
+    assert clone.member_classifications is item.member_classifications
+    assert clone.member_annotations is sentinel_annotations
+    assert len(engine.frame_calls) == 1                # 帧 pass 只跑一次（扇出前）

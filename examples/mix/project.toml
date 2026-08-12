@@ -1,0 +1,195 @@
+# UI 控件树主工程（spec §5.2，v1.12 双粒度上手）——「截图 + 控件树」时间序流上
+# 序列级与帧级两个粒度同开：会话化(source_dir 按会话子目录分区) → segment(llm
+# 滑窗边界精化 + 噪声剔除) → dedup(episode 级判重) → classify(序列级 3 类) +
+# classify 帧粒度（成员帧闭集判决）→ quality(pointwise trajectory 打分，只打分
+# 不筛) → annotate(序列级标注) + annotate 帧粒度（逐成员按帧类标注：form_screen
+# 覆盖指令、transition 跳过）→ verify(评审 + 修复)。帧产物随序列行落盘
+# _meta.stream.members[]。
+#
+# 双端点分工（v1.12 vision 语义分列的教学形态，config.toml 在本目录）：
+# DeepSeek [llm.default] = 文本判决面——segment 滑窗摘要判决（vision_resolved=
+# false 成本控制面）、帧级批量分类（digest-only，frame.classify 永不入 vision
+# 必需集）、stream 模式 quality 纯文本打分（S30 放宽）；z.ai glm-5.2
+# [llm.vision] = 视觉必需面——classify/annotate/frame.annotate/verify 四阶段在
+# UI 模态强制 supports_vision。
+#
+# extract/stitch 显式不启用：上手示例聚焦双粒度，动作摘取与线索缝合见
+# examples/stream；generate 与 segment 互斥（2.3.1），不可用。纯文本时间序流的
+# 姊妹工程见同目录 project-text.toml（单端点纯 DeepSeek 最低成本上手 + 文本帧
+# 路径演示）。
+#
+# fixture：三个会话子目录 = 三个会话（index 全树错开编号，17 对帧），
+# data/ 由 tools/gen_fixtures.py 一次性确定性生成：
+#   s1-food-order/ 1–6        外卖下单 6 帧：浏览列表 → 商品详情 → 规格表单
+#                             （帧类 form_screen，吃 [frame.class.form_screen.
+#                             annotate] 覆盖指令抽表单字段与取值）→ 订单确认 →
+#                             支付处理过渡屏（帧类 transition，标注跳过示范：
+#                             members[] 呈现 status="skipped"、annotation=null）
+#                             → 支付成功。预期 1 个 episode，序列类
+#                             food_delivery；过渡屏是同 App 任务内屏，按
+#                             segment.context 约定保留为成员（continues）。
+#   s2-hotel-booking/ 101–105 订酒店 5 帧：搜索表单 → 酒店列表 → 系统通知插入
+#                             屏（package 异域、与前后操作无关——噪声候选，预期
+#                             dropped_noise）→ 房型详情 → 订单确认。预期 1 个
+#                             episode，序列类 hotel_booking。
+#   s3-food-order-replay/ 201–206 = s1 的逐字节复刻（同内容不同文件名）：
+#                             episode 判重配方与 s1 逐字一致，预期
+#                             dropped_dup·exact（episode 级判重演示；帧粒度两
+#                             pass 在重复信封上永不运行——重复不付费）。
+# 运行（config 在本目录，非 ../config.toml；out/ 不入库须先建）：
+#   mkdir -p out && uv run labelkit run --config config.toml --project project.toml
+schema_version = 1
+
+[run]
+input = "./data"
+output = "./out/mix-labels.jsonl"
+modality = "ui"
+batch_size = 32                   # 17 帧 3 会话整会话装箱进一批
+seed = 42
+
+[stream]
+order_by = "input_order"          # UI 模态 = pair_index 升序（meta:* 仅文本模态）
+key = ["source_dir"]              # 分区键：每个会话子目录一个会话
+
+[segment]
+enabled = true                    # stream 模式总开关
+llm = "default"                   # DeepSeek 摘要判决：vision_resolved=false 成本控制面
+strategy = "llm"                  # 滑窗 LLM 边界精化 + 逐帧噪声标记
+window = 8                        # ≥ 最长会话（6 帧）：每会话恰一窗
+min_len = 2
+context = "手机屏幕操作录屏流；围绕同一笔任务（点外卖下单、订酒店预订）的连续屏幕构成一段——浏览列表、看详情、填规格/表单、确认订单、支付各环节都是同一任务的推进（advances 覆盖跨屏的商品、酒店、金额等实体延续）；任务推进途中同一 App 内出现的启动页、加载中、支付处理中等短暂过渡屏不打断当前任务，视为当前段的延续（continues）；与前后操作都无关的系统弹窗、通知插入屏属于干扰帧（interruption）"
+
+[stitch]
+enabled = false                   # 显式不启用：线索缝合的完整演示见 examples/stream
+
+[dedup]
+enabled = true                    # 判重单元 = episode：成员配方按序拼接（spec 3.3.3）
+
+[classify]
+enabled = true                    # 序列级分类：episode 摘要 + 首帧截图入提示词
+llm = "vision"                    # UI 模态 classify 入 vision 必需集——走 z.ai
+assignment = "single"
+fallback_class = "other"
+
+[[classify.classes]]
+name = "food_delivery"
+description = "外卖点餐类任务：浏览餐厅与菜品、选规格、下单支付等围绕一笔外卖订单的操作流程"
+
+[[classify.classes]]
+name = "hotel_booking"
+description = "酒店预订类任务：搜索酒店、比价选房、填单支付等围绕一次住宿预订的操作流程"
+
+[[classify.classes]]
+name = "other"
+description = "不属于以上任何一类的任务"
+
+# ── 帧粒度（v1.12）：成员帧闭集分类——帧类表与序列类表相互独立 ──
+[frame.classify]
+enabled = true
+llm = "default"                   # digest-only 帧级批量判决：永不入 vision 必需集
+fallback_class = "other"          # 修复穷尽/窗口失败的兜底，须 ∈ 帧类表
+
+[[frame.classify.classes]]
+name = "list_screen"
+description = "列表/浏览类屏幕：餐厅列表、酒店列表、搜索结果等以条目罗列为主的页面"
+
+[[frame.classify.classes]]
+name = "detail_screen"
+description = "详情类屏幕：单个商品、房型或店铺的详细信息页"
+
+[[frame.classify.classes]]
+name = "form_screen"
+description = "表单类屏幕：规格选择、日期人数填写、地址备注输入等以字段填写为主的页面"
+
+[[frame.classify.classes]]
+name = "confirm_screen"
+description = "确认/结果类屏幕：订单确认、支付确认、下单成功等交易节点页面"
+
+[[frame.classify.classes]]
+name = "transition"
+description = "过渡类屏幕：启动页、加载中、支付处理中等无实际内容的短暂过渡屏"
+
+[[frame.classify.classes]]
+name = "other"
+description = "不属于以上任何一类的屏幕"
+
+[extract]
+enabled = false                   # 显式不启用：逐帧对动作摘取的完整演示见 examples/stream
+
+[quality]
+enabled = true
+mode = "pointwise"
+llm = "default"                   # stream 模式质量打分纯文本（S30）——走 DeepSeek
+rubric = "default:trajectory"     # 轨迹四准则；无 threshold——只打分不筛
+
+[annotate]
+enabled = true
+llm = "vision"                    # UI 模态 annotate 入 vision 必需集——走 z.ai
+instruction = """
+你是移动端操作序列标注员。根据成员帧摘要与关键帧截图，
+标注该操作序列的任务标签（用户在做什么）、所属应用与一句话摘要。
+"""
+
+# ── 帧粒度（v1.12）：逐成员帧级标注——产物挂 members[].annotation ──
+[frame.annotate]
+enabled = true
+llm = "vision"                    # UI 模态 frame.annotate 无条件入 vision 必需集——走 z.ai
+instruction = """
+你是移动端屏幕帧标注员。根据单帧截图与 UI 控件树，标注该屏幕在流程中的
+角色（screen_role，一个名词短语）与关键控件列表（key_widgets，字符串数组：
+把承载本屏核心信息或核心操作的控件文本逐项列出；没有则给空数组）。
+"""
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "screen_role": {"type": "string"},
+    "key_widgets": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["screen_role", "key_widgets"],
+  "additionalProperties": false
+}
+"""
+
+# ── 按帧类覆盖：表单类屏幕单独强调抽取表单字段与取值 ──
+[frame.class.form_screen.annotate]
+instruction = """
+你是移动端屏幕帧标注员。这一帧已被判定为表单类屏幕：标注其在流程中的
+角色（screen_role），并把表单字段与当前取值成对抽入关键控件列表
+（key_widgets，如「份量：大份」「辣度：微辣」——逐字段一项，空输入框记
+其占位提示）。
+"""
+
+# ── 按帧类覆盖：过渡屏跳过标注（省成本示范；members[] 呈现 skipped）──
+[frame.class.transition.annotate]
+enabled = false
+
+[verify]
+enabled = true
+llm = "vision"                    # UI 模态 verify 入 vision 必需集——走 z.ai
+policy = "repair"
+max_repair_rounds = 1
+extra_criteria = "补充审核约定：审核证据仅含首末帧截图与成员帧摘要行，标注摘要允许概括中间成员帧的可见内容，除非与所给证据直接矛盾，不因此判 label_mismatch；成员中偶发的支付处理中等同 App 过渡屏是采集使然，不构成 off_task_members 的证据"
+
+[trace]
+enabled = true
+channels = ["segment", "classify", "annotate", "verify", "schema"]
+content = "refs"
+
+[output]
+meta_mode = "inline"              # 帧产物仅经 _meta 承载（M1 护栏：帧粒度启用 ⇒ 非 none）
+rejects = "full"                  # 噪声帧 rejects 行携带完整载荷（序列 = 成员清单）
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "task_label": {"type": "string"},
+    "app": {"type": "string"},
+    "summary": {"type": "string", "maxLength": 100}
+  },
+  "required": ["task_label", "app", "summary"],
+  "additionalProperties": false
+}
+"""
