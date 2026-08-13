@@ -40,6 +40,8 @@ flowchart LR
 
 这套形态不是发明：从状态对反推动作是 OpenAI VPT 的逆动力学模型与 OS-Genesis 逆向任务合成的既有工序，滑窗 LLM 边界裁决是 2026 年 GUI 轨迹量产管线（Video2GUI 等）仍在用的形态之一，LabelKit 按自己的负边界（不训练本地模型）用运行时 LLM 充当这两个角色。**什么时候开**：输入是按时间排好的操作流（UI 模态的截图 + 树对，或带时间戳的文本事件流）、且你要的样本单位是「活动段」而非单条记录。开关是 `segment.enabled = true`，约束：仅 process 模式、必须开 annotate、与 generate 互斥；`extract` 再要求 UI 模态。默认全关——不开时行为与 v1.7 逐字节一致（输出只多一个恒为 null 的 `_meta.stream` 键）。
 
+**手上没有真实流呢？**那是另一条路：v1.13 的时间流生成（`[generate.stream]`，第 27 章）在 `generate_only` 下从零合成一条带时间戳的多会话流。两者是**镜像关系**而非替代——本章从帧流**演绎**出序列（会话化 + LLM 边界精化），那边直接**铺设**序列（蓝图定结构 + 机械交织器铺会话/交叉/噪音/时间戳），所以分段/缝合/摘取在那边一概不参与，「generate 与 segment 互斥」的字面约束原样成立。它落的时间流工件是本章的合法输入，把合成流当采集流重放一遍，就得到一份**带逐帧真值**的分段评测集（第 27 章 27.8 有实测账）。
+
 ## 25.2 快速上手：examples/stream 全流程
 
 仓库自带的 `examples/stream`（`project.toml`）是一个 53 帧、五个场景子目录的 UI 操作流工程——时序流格式能开的算子全开（分段、缝合、去重、分类、摘取、轨迹打分、序列标注、评审修复；generate 与 stream 互斥）。本章用它的第一个会话 `s1-serial-noise/`（帧 1–14）讲 v1.8 的分段与摘取基线：任务 A「点外卖」帧 1–8（其中帧 5 是突然插入的社交 App 消息屏——预期噪声）、任务 B「打车」帧 9–13 背靠背、帧 14 回到桌面；其余四个会话是穿插与救援场景，属第 26 章缝合的舞台（本次真跑 s1 自己也贡献了一次缝合——见 25.2 与 26.2）。fixture 由 `tools/gen_fixtures.py` 一次性确定性生成（树是唯一语义源，截图为 PIL 程序化绘制），刻意埋了「实体跨屏延续」的线索：餐厅名「川味麻辣烫」跨帧 3/4/6 出现、金额 ¥32 跨帧 4/6/7。逐节看 `project.toml`。
@@ -364,7 +366,7 @@ instruction = """
 enabled = false
 ```
 
-**组合约束**（全部启动期配置错误，第 4 章有合订）：帧粒度是流模式的第二层产物——`frame.classify` / `frame.annotate` 任一启用都要求 `segment.enabled = true`（非流工程想按类定制标注，用第 24 章的 `[class.<名>.annotate]`）；帧产物仅经 `_meta` 承载，`output.meta_mode` 不得为 `"none"`；`fallback_class` 必须 ∈ 帧类表；`[frame.class.<名>]` 在场要求帧分类开启、节名必须是帧类表成员，且白名单只有 annotate 一节的 instruction / examples / enabled 三键；帧级**没有**多标签也**没有**自洽采样——在 `[frame.classify]` 里写 `assignment` 或在 `[frame.annotate]` 里写 `self_consistency` 会得到定向配置错误（机制同 v1.11 移除 `segment.use_vision` 时的原始节探针）。
+**组合约束**（全部启动期配置错误，第 4 章有合订）：帧粒度是流模式的第二层产物——`frame.classify` / `frame.annotate` 任一启用都要求 `segment.enabled = true`（非流工程想按类定制标注，用第 24 章的 `[class.<名>.annotate]`）；帧产物仅经 `_meta` 承载，`output.meta_mode` 不得为 `"none"`；`fallback_class` 必须 ∈ 帧类表；`[frame.class.<名>]` 在场要求帧分类开启、节名必须是帧类表成员，且白名单只有 annotate 一节的 instruction / examples / enabled 三键；帧级**没有**多标签也**没有**自洽采样——在 `[frame.classify]` 里写 `assignment` 或在 `[frame.annotate]` 里写 `self_consistency` 会得到定向配置错误（机制同 v1.11 移除 `segment.use_vision` 时的原始节探针）。v1.13 再加一条**互斥**：帧粒度两开关与时间流生成（`[generate.stream]`，第 27 章）不能同开——合成流的帧类是蓝图定下来的**真值**，再花钱判一遍没有意义，显式开启同样是定向配置错误。那边复用的只是帧类**表**（`[[frame.classify.classes]]` 保持 `enabled = false` 当真值词表用），帧内容契约写在另一族节 `[frame.class.<帧类名>.generate]` 里。
 
 **members 块怎么读。**本次真跑主输出第 1 行（外卖下单的 episode，序列类 food_delivery，6 成员）的 `_meta.stream.members` 全文：
 

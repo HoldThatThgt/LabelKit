@@ -105,6 +105,20 @@ _LABEL_FIRST_FRAME = "[首帧截图]"
 _LABEL_LAST_FRAME = "[末帧截图]"
 _MEMBER_DIGEST_MAX_CHARS = 400   # sequence excerpt-tier digest cap (M4 §7.3 mirror)
 
+# §10.16 v1.13 判决形序列变体（裁决·直装评审判决形，实现即冻结面）：经典路径遇
+# kind=="sequence"（segment 关闭——直装序列信封）时的评审模板——判决指令 system
+# 文本（非缺陷词表，defects 键被 VERDICT_SCHEMA 禁止）+ [任务指令]/[成员帧摘要]/
+# [标注结果] 三段 user 证据；无缺陷表/边界余量/片段结构。
+_VERDICT_SEQ_SYSTEM_HEAD = ("你是标注质量审核员。给定任务指令、成员帧摘要与标注结果，独立判断该序列"
+                            "（episode）的标注是否合格。")
+_VERDICT_SEQ_SYSTEM_DIMS = ("评审维度: ① 是否遵循任务指令 ② 与成员帧摘要证据的事实一致性 "
+                            "③ 字段语义是否正确填写")
+_VERDICT_SEQ_SYSTEM_STRUCTURE = (
+    "输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：\n"
+    '{"critiques": [{"aspect": <维度>, "opinion": <一句话意见>}, ...],\n'
+    ' "verdict": "pass"|"fail"}')
+_LABEL_MEMBER_DIGESTS = "[成员帧摘要]"
+
 # Defect kind closed vocabulary in schema/enum order — the FIRST component of the
 # S31 deterministic de-dup sort key. v1.9 (T15): wrong_stitch appended (six).
 DEFECT_KINDS = ("label_mismatch", "off_task_members", "missing_head",
@@ -227,6 +241,41 @@ def verify_sequence_system_text(extra_criteria: str) -> str:
         lines.append(extra_criteria)
     lines.extend((_SEQ_SYSTEM_DEFECT_TYPES, _SEQ_SYSTEM_TAIL, _SEQ_SYSTEM_STRUCTURE))
     return "\n".join(lines)
+
+
+def verify_verdict_sequence_system_text(extra_criteria: str) -> str:
+    """判决形序列变体（§10.16，v1.13 裁决·直装评审判决形）的 system 段：三维评审 +
+    结论指令 + VERDICT_SCHEMA 结构句——无缺陷词表；extra_criteria 为空时整行省略
+    （非流规则同款）。
+
+    :param extra_criteria: 类有效附加评审准则（[class.<name>.verify] 覆盖后取值）。
+    :returns: 换行拼接的 system 文本。
+    """
+    lines = [_VERDICT_SEQ_SYSTEM_HEAD, _VERDICT_SEQ_SYSTEM_DIMS]
+    if extra_criteria:
+        lines.append(extra_criteria)
+    lines.extend((_SYSTEM_TAIL, _VERDICT_SEQ_SYSTEM_STRUCTURE))
+    return "\n".join(lines)
+
+
+def _member_digest_lines(members: Sequence[Record], max_total_chars: int) -> list[str]:
+    """[成员帧摘要] 行——逐成员 ``{m}. {frame_digest(member, 400)}``（m 1 基，成员
+    序）。总量受 max_total_chars（input.ui_tree_max_chars）约束：首末行恒保留，
+    中段整行丢弃并以 ``…(truncated N members)`` 标记闭合（镜像 M5 渲染——算子间
+    不互导，M7 自持副本，annotate._member_digest_lines 同式）。"""
+    lines = [f"{m}. {frame_digest(member, _MEMBER_DIGEST_MAX_CHARS)}"
+             for m, member in enumerate(members, start=1)]
+    if len(lines) <= 2 or len("\n".join(lines)) <= max_total_chars:
+        return lines
+    last = lines[-1]
+    keep = 1                 # 首行即使超预算也保留（M5 同款地板）
+    for k in range(len(lines) - 2, 0, -1):
+        marker = f"…(truncated {len(lines) - k - 1} members)"
+        if len("\n".join(lines[:k] + [marker, last])) <= max_total_chars:
+            keep = k
+            break
+    marker = f"…(truncated {len(lines) - keep - 1} members)"
+    return lines[:keep] + [marker, last]
 
 
 def sequence_step_line(transition: Transition) -> str:
@@ -398,12 +447,55 @@ def render_critiques_text(critiques: Sequence[Mapping]) -> str:
     return "\n".join(lines)
 
 
+def _build_verdict_sequence_prompt(record: Record, output: Mapping,
+                                   cfg: "ResolvedConfig",
+                                   texts: tuple[str, str],
+                                   fit: "_PromptFit | None") -> "PromptBundle":
+    """判决形序列 prompt 装配（§10.16，v1.13 裁决·直装评审判决形）：user 段 =
+    [任务指令] → [成员帧摘要]（400 字/成员、ui_tree_max_chars 总量中段丢弃——镜像
+    M5 渲染）→ [标注结果]；无缺陷表/边界余量/片段结构，无截图段（直装序列 text
+    模态）。``fit`` 非 None 时成员摘要块是唯一可裁槽位（§3.3⑤ edges 裁剪），
+    [标注结果]/指令是记录级语义资产恒计不裁（V25③）；不可裁地板超预算 ⇒
+    fit.overflow（V10——调用方拒绝，请求从不发出）。
+
+    :param record: kind == "sequence" 的直装序列记录。
+    :param output: 待评审的标注对象。
+    :param cfg: 已解析配置（ui_tree_max_chars 总量取值）。
+    :param texts: (类有效任务指令, 类有效 extra_criteria)。
+    :param fit: v1.11 面板最小预算装填状态；None = 预算关。
+    """
+    from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
+
+    instruction, extra_criteria = texts
+    system_text = verify_verdict_sequence_system_text(extra_criteria)
+    head = f"[任务指令] {instruction}"
+    digest_body = "\n".join(
+        _member_digest_lines(record.members, cfg.input.ui_tree_max_chars))
+    result_text = f"[标注结果] {json.dumps(output, ensure_ascii=False)}"
+    if fit is not None:
+        fixed = (budget.est_text(system_text) + budget.est_text(head)
+                 + budget.est_text(f"{_LABEL_MEMBER_DIGESTS}\n")
+                 + budget.est_text(result_text) + 2 * budget.MSG_OVERHEAD_TOKENS)
+        slot = fit.input_budget - fixed
+        if budget.est_text(digest_body) > slot:
+            digest_body = budget.fit_text(digest_body, max(0, slot), keep="edges")
+            fit.truncations += 1
+        fit.overflow = fixed + budget.est_text(digest_body) > fit.input_budget
+    parts = (Part(kind="text", text=head),
+             Part(kind="text", text=f"{_LABEL_MEMBER_DIGESTS}\n{digest_body}"),
+             Part(kind="text", text=result_text))
+    return PromptBundle(messages=(
+        Message(role="system", parts=(Part(kind="text", text=system_text),)),
+        Message(role="user", parts=parts)))
+
+
 def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
                         label: str | None = None,
                         transitions: tuple[Transition, ...] | None = None,
                         boundary_margin: str = "",
                         fragment_structure: str = "",
-                        fit: "_PromptFit | None" = None) -> "PromptBundle":
+                        fit: "_PromptFit | None" = None,
+                        verdict_form: bool = False) -> "PromptBundle":
     """Assemble the §10.5 judge prompt for one (record, annotation-output) pair.
     UI modality carries screenshot + serialized tree parts as in §10.1/§10.2.
     v1.7 (R3): label non-None → the [任务指令] section and extra_criteria take the
@@ -424,7 +516,13 @@ def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
     the [标注结果] JSON / instruction / margin / fragment sections are counted,
     never trimmed (V25③); an untrimmable floor over the budget flags
     fit.overflow (V10 — the caller rejects, the request is never sent).
-    fit=None is the byte-identical v1.10 path."""
+    fit=None is the byte-identical v1.10 path.
+    v1.13 (``verdict_form``, additive trailing kwarg — 裁决·直装评审判决形): the
+    CALLER selects the form by the stream driver's presence — the classic path
+    (segment off) passes verdict_form=True for its sequence envelopes and gets
+    the §10.16 verdict variant (VERDICT_SCHEMA-shaped, no defect vocabulary,
+    member-digest evidence); the stream driver never passes it, keeping the
+    §10.5 defect-table variant byte-identical."""
     from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
 
     if label is not None:
@@ -434,6 +532,10 @@ def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
     else:
         instruction = cfg.annotate.instruction
         extra_criteria = cfg.verify.extra_criteria
+
+    if record.kind == "sequence" and verdict_form:  # v1.13 判决形（经典路径序列）
+        return _build_verdict_sequence_prompt(record, output, cfg,
+                                              (instruction, extra_criteria), fit)
 
     if record.kind == "sequence":  # v1.8 sequence variant (checked BEFORE modality)
         system_text = verify_sequence_system_text(extra_criteria)
@@ -760,9 +862,13 @@ class VerifyStage:
         multi = bool(vcfg.judges)
         # v1.11 (spec 3.7.2 v1.11 row): min-over-panel packing of the ONE
         # broadcast prompt; fit=None = budget off, byte-identical build.
+        # v1.13（裁决·直装评审判决形）：经典路径遇序列信封（segment 关闭的直装
+        # 形态——流式驱动器在场时序列永不进本函数）走判决形模板，schema 恒
+        # VERDICT_SCHEMA 不变。
         fit = self._panel_fit(ctx, record, VERDICT_SCHEMA)
         prompt = build_verify_prompt(record, annotation.output, ctx.cfg, label=label,
-                                     fit=fit)
+                                     fit=fit,
+                                     verdict_form=(record.kind == "sequence"))
         self._settle_fit(fit, ctx)
         results = await asyncio.gather(
             *(
@@ -1493,16 +1599,20 @@ class VerifyStage:
             if candidate > prof.default_image_px:
                 px_up = candidate
         if px_up is not None:
-            from labelkit.operators.annotate import build_annotate_prompt
+            # v1.13：试装的 Schema 文本与计价对象都取类有效 Schema——按类标注
+            # Schema 在场时若仍按全局计价，试装估算与真实重标注调用不同源。
+            from labelkit.operators.annotate import (build_annotate_prompt,
+                                                     class_effective_schema,
+                                                     class_schema_text)
 
             trial = build_annotate_prompt(
-                record, ctx.cfg, ctx.schema_engine.user_schema_text,
+                record, ctx.cfg, class_schema_text(ctx, label),
                 repair=repair, label=label, transitions=item.transitions,
                 fragment_lens=fragment_lens, k_eff=k_half, image_px=px_up)
             cost_up = max(ctx.llm.calibrator.cost(prof.name),
                           math.ceil(budget.est_image_prior(prof, px_up)
                                     * budget.PRIOR_INFLATION))
-            schema_eff = (ctx.cfg.user_schema
+            schema_eff = (dict(class_effective_schema(ctx.cfg, label))
                           if prof.supports_structured_output else None)
             est = budget.est_prompt(trial, prof, schema_eff, image_cost=cost_up)
             if est > budget.input_budget(prof):

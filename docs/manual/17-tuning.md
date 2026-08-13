@@ -19,6 +19,7 @@
 | annotate | N | × self_consistency 的 n |
 | annotate 帧粒度（v1.12） | Σ 过质量门 episode 的未跳过成员数 | 逐成员一次调用（帧粒度里贵的那半）；住 quality 门之后——被淘汰记录永不付帧标注费；`[frame.class.<名>.annotate].enabled = false` 按类再省；dry-run 的 `frame_annotate_calls` 同样按帧总数报粗上界 |
 | generate | ⌈种子数 × num_per_record / num_per_call⌉ | 产出还会回流产生新的 quality/annotate 调用 |
+| generate 时间流形态（v1.13） | **2 × Σsequences + ⌈噪音帧数 / num_per_call⌉** | 一序列一次蓝图 + 一次帧实现，噪音批量另算；装箱/交叉/噪音位置/时间戳零 LLM。下游 quality/annotate/verify 的记录基数 = 幸存序列数 |
 | verify | N 左右 | × 评审数；每轮 repair 追加 1 标注 + 1 复审 |
 | 结构修复（LLM 修复环） | 按需 | 健康工程接近 0；`resolved_at.l3_*` 高说明 Schema 有问题（第 14 章） |
 | 重试 | 按需 | 报告 `llm_usage.*.retries` 可见 |
@@ -28,6 +29,8 @@
 stream 工程（v1.8）另有两条成本注记：`annotate.sequence_frames`（默认 20）决定每个 episode 的标注请求**至多**携带几张关键帧图（v1.11 起它是上限：声明 `context_window` 后实际帧数 k_eff 按预算剩余收缩，首末帧恒保留，第 11 章）——序列标注的 token 开销与实际帧数近似线性，降帧最省钱但会丢视觉证据；`extract.include_diff` 默认开（向摘取提示词注入结构化树变更摘要，工程实践正面），怀疑它对你的数据没有增益时可关掉跑一次 A/B（对比 `report.stream.extract.by_type` 分布与 verify 缺陷率），确认后再定去留。
 
 帧粒度（v1.12，第 25 章 25.6）的成本模型自带四重保护，预算时按「上界很松、实付常小得多」来读：`--dry-run` 的 `frame_classify_calls` / `frame_annotate_calls` 都按**预扫描帧总数**报粗上界；实付层面——帧分类是**每 episode 一次批量判决**（一次调用判整窗成员，不是每帧一次），且住 **dedup 之后**（重复 episode 一分帧钱不付）；帧标注虽是逐成员一次调用（帧粒度里贵的那半），但住 **quality 质量门之后**（被淘汰记录永不付帧标注费），还能用 `[frame.class.<名>.annotate].enabled = false` 把低价值帧类整类跳过。`examples/mix` UI 主工程本次真跑的对照：上界 17/17，实付 2 次批量判决 + 9 次帧标注（1 个 transition 过渡屏成员按类跳过）——对账看 `report.stream.frame_classify` / `frame_annotate` 两个子块（第 8 章）。该工程还是「贵的调用挑贵的端点」的活例：双端点分账 `llm_usage.default`（DeepSeek，segment 滑窗/帧级批量分类/轨迹打分的文本判决面）与 `llm_usage.vision`（z.ai，序列分类/序列标注/帧标注/评审的视觉必需面）本次真跑各 15 次调用——帧级批量分类永不要求 vision，指向便宜的纯文本 profile 即省钱面（第 25 章 25.6 的双端点成本拆分）。
+
+时间流生成（v1.13，第 27 章）的成本账有两点与别处不同。其一，**`--dry-run` 的估算是精确复演而非上界**：估算分支吃同一套计划期纯函数（同 `seed` 同配置），序列长度、噪音帧数、会话装箱按真实抽签算一遍——`examples/synth-stream` 真跑对照是估 49、实 52（`llm_usage.default.calls`）、约 97 秒，差额三次全在估算从不包含的修复上（一轮 verify repair 的重标注 + 复审，外加一次内部 Schema 的修复环调用——该次运行用户 Schema 侧 `resolved_at` 的 `l1` / `l3_*` 与 `retries` 都是 0）。其二，**大头换人了**：真跑 `per_stage_s` 是 `{"generate": 38.362, "dedup": 0.003, "classify": 0.0, "quality": 26.244, "annotate": 16.973, "verify": 15.387}`——13 次生成调用里有 12 次要写出整条序列的内容，单次输出 token 远大于下游的判决类调用，「quality 是大头」的经验在这个形态下不成立；`classify` 恒 0.0 秒是标签继承的直接体现。控成本的旋钮按性价比：砍 `sequences`（配额是尝试配额，直接线性）> 缩 `len_range`（实现调用的输出 token 与步数近似线性）> 调 `noise_ratio`（噪音是批量装箱的，最便宜的那部分）。
 
 **先验预算**：`--dry-run` 直接给出估算调用数（不含修复与重试）。**后验核账**：报告 `llm_usage` 分 profile 给出 calls / tokens / retries，配了单价还有 `est_cost_usd`。
 
@@ -85,3 +88,4 @@ stream 工程（v1.8）另有两条成本注记：`annotate.sequence_frames`（�
 | 内存吃紧 | 条数 × 是否 global scope | 切分运行；scope=batch；语义去重改 batch 或关 |
 | 质量门口径不对 | aggregate_histogram | 第 10 章（threshold/top_ratio/模式选择） |
 | 错缝 / 漏缝（stream×stitch，v1.9） | report.stream.stitch；trace 的 stitch.judge（priors 命中腿 / merged） | 错缝：`bias` 保持 conservative、`votes` ↑（3/5，奇数）、`stale_gap_steps` 设阈让久挂线索降格；漏缝：补强 `stitch.context`、确认 `repass` 开着、查先验哪条腿没命中；穿插深的流：`max_open` ↑（第 26 章） |
+| 合成序列产出少于配额（时间流生成，v1.13） | report.generate.stream 的 `produced/planned` 与三项 failures | `realize_failures` 高 ⇒ 降 `generate.temperature`、缩 `len_range`、给帧类 Schema 减字段；`survived_dedup ≪ produced` ⇒ 反过来提温度、把类 instruction 写出更多可变要素（**别放松 `[dedup]` 阈值**）；`validator_scrapped` 高 ⇒ 钩子对整序列过严（一帧违规废整条，第 27 章） |

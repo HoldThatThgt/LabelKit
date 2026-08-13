@@ -12,7 +12,7 @@
 2. **只仿一轮**——生成子批不会再触发生成（不递归），杜绝「仿品的仿品」的近亲繁殖。
 3. **件件有出处**——每条合成记录带 `generated_from`（种子记录 id 列表）和 `generator`（{"llm", "style"}）双溯源，主输出里 `generator ≠ null` 就是合成货的统一标识。
 
-**仅文本模态可用**（LLM 造不出配套截图），这是启动时的硬约束。v1.8 又加一条：generate 与流模式（`segment.enabled = true`，第 25 章）**互斥**——「照着 episode 仿制新的操作序列」属于路线图上的候选项（spec §8.3 O3），本版不做。
+**仅文本模态可用**（LLM 造不出配套截图），这是启动时的硬约束。v1.8 又加一条：generate 与流模式（`segment.enabled = true`，第 25 章）**互斥**——采集来的流要分段，合成的流不需要。这条互斥在 v1.13 依然字面成立：新增的时间流生成（`[generate.stream]`，第 27 章）走的是**直装**路线——序列在生成期就装配好了，直接进 dedup 之后的链，segment / stitch / extract 全程不参与。
 
 ## 12.2 process 模式：给既有数据扩容
 
@@ -69,6 +69,51 @@ standalone_count = 500        # 目标产出条数（与 seed_examples 互斥）
 
 守恒恒等式退化为 `emitted + dropped_* + failed = generated`；产出 0 条不算错误（照常写报告、退出码 0）。
 
+`generate_only` 还有**第三形态**——时间流生成（v1.13），见下。
+
+### 时间流形态：产出的不是一条文本，是一条序列
+
+上面两种形态产出的都是**互不相干的独立文本**。要的样本单位若是「一段活动」——多轮请求按时间先后连成一条会话、几条会话交织成一条流——就换 `[generate.stream]`：
+
+```toml
+[run]
+mode = "generate_only"
+modality = "text"
+
+[stream]                      # 生成侧的铺设契约（复用摄取侧词汇，故工件可重放）
+order_by = "meta:ts"
+gap_s = 900
+
+[generate]
+enabled = true
+temperature = 0.9
+
+[generate.stream]
+enabled = true
+sessions = 5                  # 会话数；交叉会话数 = Σsequences − sessions
+noise_ratio = 0.1             # 掺入的无关干扰帧占任务帧的比例
+duplicates = 1                # 原样重发几条序列（落流尾新会话）
+frame_gap_s = [5, 60]
+ts_start = "2026-01-05T09:00:00+08:00"
+
+[class.ticket_booking.generate]
+instruction = """……"""        # 配额与长度按序列类挂
+sequences = 3
+len_range = [3, 5]
+```
+
+与本章前两种形态的分工，一句话各表：
+
+| | 平面生成（12.3 两形态） | 时间流形态（v1.13） |
+|---|---|---|
+| 一次调用产出 | `num_per_call` 条独立文本 | 一条序列的**蓝图**，或这条序列的全部**帧内容** |
+| 配额 | `num_per_record` / `standalone_count` | 按类 `sequences` × `len_range`（同为**尝试配额**，不补齐） |
+| 结构 | 无 | 会话装箱、两序列交叉、噪音插入、原样重发、时间戳铺设——**全部由零 LLM 的机械交织器完成** |
+| 产物 | 主输出 | 主输出（一行 = 一条序列）**+ 时间流工件**（一行 = 一帧，可当输入重放） |
+| 本章键的效力 | 全部生效 | `llms`/`mixture`/`weights`/`styles`/`temperature`/`sample_validator` 生效（作用面见第 27 章 27.4）；`num_per_call` 只管噪音批装箱；`seed_examples`/`standalone_count`/`num_per_record`/`seeds_per_call` **显式书写即配置错误** |
+
+其余照旧：序列级的相似度过滤（判重文本 = 成员文本按序拼接）照常内置执行、`survived_dedup` 照常记桶，合成序列照常走 dedup → classify（标签继承、零调用）→ quality → annotate → verify 全套治理，守恒恒等式仍是上面那条退化形（成员帧只活在工件里、不构造信封）。完整配置、两份产物的读法、工件重放与成本账见**第 27 章**。
+
 ## 12.4 多样性的三个旋钮
 
 单一模型反复自生成会让产出分布收窄、长尾消失（model collapse，Nature 2024）。LabelKit 给了三个对抗手段：
@@ -109,7 +154,7 @@ prompt = "请求应包含具体的背景与约束条件（时间、对象、格�
 }
 ```
 
-读法：`survived_dedup / produced` 是**新颖率**。上例 detailed 桶只有 55% 的样本活过去重——这个桶在产重复货。处置顺序：
+读法：`survived_dedup / produced` 是**新颖率**。上例 detailed 桶只有 55% 的样本活过去重——这个桶在产重复货。（v1.13 时间流形态下 `produced` 数的是**序列**条数、`calls` 含蓝图与实现两类调用；那里另有一个 key 只有两段的**噪音桶**——噪音不属于任何序列类，也不参与序列级相似度过滤，其 `survived_dedup` 恒为 0，见第 27 章 27.4。）处置顺序：
 
 1. 改该 style 的 prompt，让它约束出更具体的差异化方向；
 2. 提高温度或增加模型（12.4）；
@@ -153,7 +198,10 @@ temperature = 0.9             # 生成温度（覆盖 profile）
 sample_validator = ""         # 可选：样本级代码校验回调 "module:function"（见下）
 seed_examples = []            # generate_only 种子池形态专用（process 模式不得设置）
 standalone_count = 500        # generate_only 无种子形态专用（与 seed_examples 互斥）
+sequences = 0                 # v1.13 时间流形态：全局默认序列配额（按类覆盖）
+len_range = [3, 6]            # v1.13 时间流形态：全局默认序列长度区间（按类覆盖）
 # [[generate.styles]] 子表见 12.4
+# [generate.stream] 子表（时间流形态七键）见第 27 章 27.3 与附录 A.13
 ```
 
 ## 12.7 instruction 写作要点

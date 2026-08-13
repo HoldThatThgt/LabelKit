@@ -15,7 +15,7 @@
 - 文本模态：`sha256(整行 JSON 的规范化序列化)` 取前 16 位。规范化 = 键排序、紧凑分隔，所以**内容相同的两行，无论出现在哪个文件第几行，id 必然相同**；
 - UI 模态：`sha256(树文件字节 + 图像文件字节)` 取前 16 位。
 
-id 贯穿一切：主输出的 `_meta.id`、拒绝通道、trace 事件里的 `record_ids`，全都用它指代记录。你可以拿着一个 id 在四个产物文件之间对账。
+id 贯穿一切：主输出的 `_meta.id`、拒绝通道、trace 事件里的 `record_ids`，全都用它指代记录。你可以拿着一个 id 在各个产物文件之间对账。
 
 记录本体是**不可变**的——去重不改它，打分不改它，标注是「另附标签」而不是改写原文。唯一会动到「已产出标注」的是 verify 的修复路径（第 13 章）。
 
@@ -54,7 +54,7 @@ emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed
   = scanned + generated [+ fanout] [+ episodes]
 ```
 
-（`bad_input` 是 ingest 阶段就不成记录的坏行/缺对，没有 id，不走拒绝通道，只计数。`fanout` 仅在 `classify.assignment = "multi"` 时出现于 `counts`——multi 扇出净增的信封数，右侧随之补平，第 24 章。`absorbed` / `dropped_noise` / `episodes` 是 v1.8 的 stream 三项，仅 `segment.enabled = true` 时出现：分段吸收的帧与剔除的噪声帧记在左侧，净增的 episode 信封数记在右侧补平，第 25 章。`stitched` 是 v1.9 缝合项，仅 `stitch.enabled = true` 时出现：被并进线索的 episode 壳作为终态记在左侧，与右侧的 `episodes` 一对一抵扣（线索数 = episodes − stitched），第 26 章。未启用的项恒为 0，等式退化回原形。另注意残差项 `unprocessed`：熔断中止时左侧另加它；流模式下**优雅中断（SIGINT/SIGTERM）也会**产生该项——会话缓冲让中断时可能有已扫描但未走完流水线的帧；非流模式的中断残差恒为 0、不出现此键。）
+（v1.13 的时间流生成（`[generate.stream]`，第 27 章）**不给这条等式添项**：合成流的成员帧只活在时间流工件里、不构造信封，一条序列 = 一个信封 = 一行，等式取 generate_only 的退化形 `emitted + dropped_* + failed = generated`——`absorbed` / `episodes` 是分段算子的记账项，本形态不出现。`bad_input` 是 ingest 阶段就不成记录的坏行/缺对，没有 id，不走拒绝通道，只计数。`fanout` 仅在 `classify.assignment = "multi"` 时出现于 `counts`——multi 扇出净增的信封数，右侧随之补平，第 24 章。`absorbed` / `dropped_noise` / `episodes` 是 v1.8 的 stream 三项，仅 `segment.enabled = true` 时出现：分段吸收的帧与剔除的噪声帧记在左侧，净增的 episode 信封数记在右侧补平，第 25 章。`stitched` 是 v1.9 缝合项，仅 `stitch.enabled = true` 时出现：被并进线索的 episode 壳作为终态记在左侧，与右侧的 `episodes` 一对一抵扣（线索数 = episodes − stitched），第 26 章。未启用的项恒为 0，等式退化回原形。另注意残差项 `unprocessed`：熔断中止时左侧另加它；流模式下**优雅中断（SIGINT/SIGTERM）也会**产生该项——会话缓冲让中断时可能有已扫描但未走完流水线的帧；非流模式的中断残差恒为 0、不出现此键。）
 
 ## 4.3 批（Batch）：流动与屏障
 
@@ -97,7 +97,10 @@ emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed
 | `segment` 开 ⇒ `quality.llm` **免除** `supports_vision` 要求（v1.8 放宽项；v1.9 的 `stitch.llm` 同样恒不要求视觉） | 序列打分是纯文本（步骤序列 + 帧摘要，无图），UI 模态也不需要视觉能力；缝合判定同理（摘要卡证据，无图） |
 | `frame.classify` / `frame.annotate` 任一开 ⇒ `segment` 必须开（v1.12） | 帧粒度是流模式内的第二层产物——帧的载体是 episode 的成员集；非流工程想按类定制标注，用 `[class.<名>.annotate]`（第 24 章） |
 | 帧粒度任一开 ⇒ `output.meta_mode` 不得为 `"none"`（v1.12） | 帧产物仅经 `_meta.stream.members[]` 承载——丢弃元信息 = 丢弃全部帧产物 |
-| `[frame.class.*]` 在场 ⇒ `frame.classify` 必须开，且节名 ∈ 帧类表（v1.12） | 按帧类覆盖以帧类判决为前提；`frame.classify.fallback_class` 同样必须 ∈ 帧类表 |
+| `[frame.class.*]` 在场 ⇒ `frame.classify` 必须开，且节名 ∈ 帧类表（v1.12；v1.13 放宽为 `frame.classify` 开 **∨** `generate.stream` 开——后者用 `[frame.class.<名>.generate]` 声明帧内容契约） | 按帧类覆盖以帧类判决为前提；`frame.classify.fallback_class` 同样必须 ∈ 帧类表 |
+| `generate.stream` 开 ⇒ `mode = "generate_only"` ∧ 模态 `text` ∧ `generate` 开 ∧ `classify` 开 ∧ `stream.order_by = "meta:<字段>"` ∧ `output.meta_mode ≠ "none"`（v1.13） | 时间流生成从零合成流：类表是配额与标签继承的载体、`order_by` 声明的字段名即工件的时间戳字段名（重放靠它）、帧类真值仅经 `_meta` 承载 |
+| `generate.stream` 开 ⇒ `frame.classify` / `frame.annotate` 必须关（v1.13） | 帧类真值在生成期已知（蓝图即真值），帧级判决与帧级标注在本形态下没有对象——显式开启是定向配置错误 |
+| `generate.stream` 开 ⇒ 序列类表放宽为 **≥1 类**、`fallback_class` **免填**（v1.13） | 标签继承（`inherited`）没有判决路径，「≥2 类才分得动」与兜底类这两条规则保护的对象不存在 |
 
 `classify`（v1.7，默认关）与上表各开关**正交**：分类不改变组合合法性，任意合法组合都可以叠加分类——multi 扇出后的每个信封走同一套阶段组合（第 24 章）。v1.12 的帧粒度双开关（`frame.classify` / `frame.annotate`）不是新算子，而是 classify / annotate 两个算子在流模式下的第二层粒度；帧级没有多标签也没有自洽采样——在 `[frame.classify]` 里写 `assignment` 或在 `[frame.annotate]` 里写 `self_consistency` 是定向配置错误（第 25 章 25.6）。
 
@@ -112,6 +115,7 @@ emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed
 | ✓ | — | 可选 | ✓ | 可选 | — | **纯生成**（`generate_only`）：无中生有 → 治理 →（标注）→ 输出 |
 | ✓ | ✓ | ✓ | — | ✓ | — | **按类分治**（v1.7）：先分类，再按类 rubric 打分、按类指令标注（第 24 章） |
 | ✓ | — | ✓ | — | ✓ | 可选 | **时序流分段标注**（v1.8）：另开 `[segment]`（UI 下可再开 `[extract]`），把连续采集的帧流切成 episode、摘出动作序列，再整段打分与标注（第 25 章） |
+| ✓ | ✓ | ✓ | ✓ | ✓ | 可选 | **时间流生成**（v1.13）：`generate_only` + `[generate.stream]`，从零合成一条带时间戳的多会话流——一条序列一行，另落一份可重放的时间流工件（第 27 章） |
 
 ## 4.6 两份配置文件：为什么是两份
 
@@ -140,7 +144,7 @@ project.toml:[quality].llm: 引用的 profile "gpt4" 不存在于 config.toml [l
 
 最后把「无状态 + 隐私」的承诺说满：
 
-- **落盘的只有四样**：主输出、拒绝通道、`report.json`、（显式开启时的）trace 日志。没有临时文件、缓存、checkpoint。
+- **落盘的只有这几样**：主输出、拒绝通道、`report.json`、（显式开启时的）trace 日志，外加 v1.13 时间流生成的**时间流工件**（`{输出名}.stream.jsonl`，与主输出同级的数据输出通道，仅该形态开启时产生，第 27 章）。没有临时文件、缓存、checkpoint——「无中间态落盘」的原则不变，工件是显式的产物而非中间态。
 - **报告永远不含数据内容**——只有计数、分布、耗时、token 统计。
 - **stderr 运行日志永远不含数据内容与提示词**。会含数据的只有两个你**显式选择**的地方：`output.rejects = "full"` 和 `trace.content` 的高档位（第 16 章有明确的风险提示）。
 - **API 密钥在任何通道都不落盘**。

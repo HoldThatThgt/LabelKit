@@ -25,7 +25,7 @@ UI 模态合成判定：`dedup.ui_dup_requires = "both"`（默认，树近似重
 
 第④级（语义，v1.2）与合成判定的关系：UI 模态下④作用于树规范序列化文本，在 `ui_dup_requires` 合成判定中**视同 tree 层命中**——"both" 下需（②或④）与③同时命中才判重；"tree" 下④单独命中即判重；"image" 下④不参与判定。判重由④贡献时记 `kind="near_semantic"`（④与③同时命中仍记 `near_both`）。④ 与 ② 的分工：② 抓 n-gram 重叠的表层改写，④ 抓措辞不同语义相同的深层重复（[26] 的动机），两级独立可关。
 
-**序列记录（v1.8，S10）。**stream 模式下抵达本模块的判重单元是 episode（`record.kind = "sequence"`，3.14）——episode 级重复 =「同样的操作流程」；成员帧不会单独抵达（链序 segment 在 dedup 之前，成员帧已置 absorbed / dropped_noise，3.10.3），帧级判重语义在 stream 模式下有意留空（连续 UI 帧上帧级判重本就失效）。四处适配，其余零改动：
+**序列记录（v1.8，S10）。**stream 模式下抵达本模块的判重单元是 episode（`record.kind = "sequence"`，3.14）——episode 级重复 =「同样的操作流程」；成员帧不会单独抵达（链序 segment 在 dedup 之前，成员帧已置 absorbed / dropped_noise，3.10.3），帧级判重语义在 stream 模式下有意留空（连续 UI 帧上帧级判重本就失效）。**v1.13 适用性注记**：本段以「链序 segment 在 dedup 之前」为前提陈述序列记录的来源，但该前提**不是**序列分支的生效条件——时间流生成形态（`generate_stream.enabled`，segment 关闭）下 M6 直接产出 `kind = "sequence"` 的直装信封，同样按下列序列配方判重（判别式恒为 `record.kind`，与 segment 开关无关）；本形态下**没有**成员帧信封（噪音帧与重发帧只活在工件里，从不构造信封），故 absorbed / dropped_noise 两态不出现。另注：M6 在交织**之前**已用同一配方（成员文本按序 `"\x1e"` 拼接）对兄弟序列做过一次相似度过滤（3.6.5），本模块是该过滤之后的第二道、口径一致。四处适配，其余零改动：
 
 - **①② dedup_text**：配方增 `kind == "sequence"` 分支（优先于模态分支）——成员逐条按其单记录配方（文本规则 / 树规范序列化，随成员模态）产出后按成员序拼接，分隔符 `"\x1e"`（ASCII Record Separator，0x1E：`isspace() == True`，而成员配方输出的规范化文本已将空白折叠为单空格、不可能含该字符——拼接串与任何单记录配方输出结构性零碰撞）；①精确与②近似两级在拼接文本上照常执行。
 - **③ pHash**：对序列记录自动跳过（序列 Record 的 `image is None`——既有跳过门，零新增代码路径）；`ui_dup_requires = "both"` 下序列记录的合成判定**降级按 `"tree"` 处理**（与图像解码失败的降级路径同款，3.3.4）。

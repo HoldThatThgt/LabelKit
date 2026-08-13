@@ -12,7 +12,8 @@
 - **数据是按时间采集的操作流**（v1.8）：第 25 章——会话化 → 语义分段 → 动作摘取，把屏幕帧流切成一段段可标注的 episode（序列记录）；
 - **操作流里的任务被来回切换切碎了**（v1.9）：第 26 章——把被穿插切开的 episode 碎片按任务线索保守缝合成完整记录，短段救援、接缝占位、错缝零容忍的验收法都在这一章；
 - **序列之外还要帧级的原子标注**（v1.12）：第 25 章 25.6——流模式内的帧粒度双开关：成员帧批量闭集分类 + 按帧类逐成员标注，产物随 episode 行的 `members[]` 交付；帧类表与序列类表的关系在第 24 章 24.8；
-- **抄作业**：Part VI 五篇教程从易到难——教程一从空目录手搭（数据与配置全在文中），教程二至四基于仓库内 `examples/` 的可运行工程（text、ui 与 text 的纯生成变体 `project-synth.toml`；示例按输入格式分 text / ui / stream 三个工程，各自开满该格式可用的算子；v1.12 另有独立成套的双粒度示例 `examples/mix`——UI 控件树主工程 `project.toml`（截图 + 控件树时间序流上序列级与帧级同开，DeepSeek + z.ai 双端点分工）加文本姊妹工程 `project-text.toml`（纯 DeepSeek 最低成本形态），第 25 章 25.6 以主工程为样例），教程五是生产级配置模板与运维纪律（虚构场景，供改造套用）；
+- **要序列样本，但手上没有真实流**（v1.13）：第 27 章——从零合成一条带时间戳的多会话流：LLM 只出内容（蓝图 + 帧实现），会话装箱、交叉、噪音、重发、时间戳由零 LLM 的机械交织器铺设；一行 = 一条序列，另落一份可当输入重放的时间流工件。顺带兑现了「按序列类各用一份标注 Schema」（第 24 章 24.4、第 14 章 14.5）；
+- **抄作业**：Part VI 五篇教程从易到难——教程一从空目录手搭（数据与配置全在文中），教程二至四基于仓库内 `examples/` 的可运行工程（text、ui 与 text 的纯生成变体 `project-synth.toml`；示例按输入格式分 text / ui / stream 三个工程，各自开满该格式可用的算子；v1.12 另有独立成套的双粒度示例 `examples/mix`——UI 控件树主工程 `project.toml`（截图 + 控件树时间序流上序列级与帧级同开，DeepSeek + z.ai 双端点分工）加文本姊妹工程 `project-text.toml`（纯 DeepSeek 最低成本形态），第 25 章 25.6 以主工程为样例；v1.13 再添独立成套的时间流生成示例 `examples/synth-stream`——`generate_only` 从零合成一条带时间戳的多会话流，单端点 DeepSeek，第 27 章通篇以它为样例），教程五是生产级配置模板与运维纪律（虚构场景，供改造套用）；
 - **随手查**：附录 A 全参数速查、第 18 章按症状排障、附录 B 默认准则全文。
 
 ## 目录
@@ -38,7 +39,7 @@
 |---|---|---|
 | 6 | [config.toml 完全解读](06-config-toml.md) | LLM/embedding profile 逐参数 |
 | 7 | [project.toml 完全解读](07-project-toml.md) | run/input/output/trace 逐参数 + 算子节速览 |
-| 8 | [读懂四个产物](08-outputs.md) | 主输出、_meta、拒绝通道、report.json 逐字段 |
+| 8 | [读懂五个产物](08-outputs.md) | 主输出、_meta、拒绝通道、report.json 与时间流工件逐字段 |
 
 ### Part IV　算子详解（每章：直觉 → 原理 → 配置 → 调优 → 误区）
 
@@ -47,12 +48,13 @@
 | 9 | [去重 dedup](09-dedup.md) | 精确/MinHash/pHash/语义四层与 UI 合成判定 |
 | 10 | [质量 quality](10-quality.md) | pairwise 锦标赛 vs pointwise 刻度尺、质量门、rubric 设计 |
 | 11 | [标注 annotate](11-annotate.md) | 提示词模板、instruction 写法、self-consistency |
-| 12 | [生成 generate](12-generate.md) | 种子自举、两种纯生成形态、多样性三旋钮与桶统计 |
+| 12 | [生成 generate](12-generate.md) | 种子自举、三种纯生成形态（含 v1.13 时间流）、多样性三旋钮与桶统计 |
 | 13 | [二次校验算子 verify](13-verify.md) | 独立评审、drop/repair、多评审团 |
 | 14 | [结构引擎](14-schema-engine.md) | 四层防线与「模型容易答对」的 Schema 编写指南 |
 | 24 | [分类 classify](24-classify.md) | 类别表分拣、按类覆盖打分与标注参数、multi 扇出（v1.7 追加章） |
 | 25 | [流模式 stream](25-stream.md) | 会话化、滑窗语义分段、动作摘取与序列标注（v1.8 追加章） |
 | 26 | [线索缝合 stitch](26-thread.md) | 单调选池两遍缝合、短段救援、接缝占位与线索三级结构（v1.9 追加章） |
+| 27 | [时间流生成](27-synth-stream.md) | 两阶段合成 + 机械交织、按类配额与帧类契约、按序列类标注 Schema、时间流工件与重放（v1.13 追加章） |
 
 ### Part V　运行与运维
 
@@ -70,7 +72,7 @@
 | 19 | [教程一：最小工程 ★](19-tutorial-1-minimal.md) | 从空目录搭出纯标注流水线 |
 | 20 | [教程二：质量门实战 ★★](20-tutorial-2-quality.md) | 画线三步法、换 rubric 口径、top_ratio |
 | 21 | [教程三：UI 全流程 ★★★](21-tutorial-3-ui.md) | 配对机关、双通道去重、视觉标注与评审 |
-| 22 | [教程四：从零合成数据集 ★★★](22-tutorial-4-generate.md) | generate_only 两形态、桶统计验收 |
+| 22 | [教程四：从零合成数据集 ★★★](22-tutorial-4-generate.md) | generate_only 三形态（种子池 / 无种子 / 时间流）、桶统计验收 |
 | 23 | [教程五：生产级配置 ★★★★](23-tutorial-5-production.md) | 评审团、strict、归档纪律与五指标周报 |
 
 ### 附录

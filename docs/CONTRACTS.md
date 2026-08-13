@@ -147,7 +147,13 @@ in `tests/common/runtime/test_llm_client.py`; stream-ingest coverage belongs in
 (real-LLM judgments); v1.10 console coverage belongs in `tests/cli/test_console.py`
 (renderer snapshots, keyboard, degradation) and
 `tests/common/observability/test_console_format.py` (byte-frozen golden snapshots of the
-plain line formats — the golden-snapshot layer of the three-layer regression anchor, U24).
+plain line formats — the golden-snapshot layer of the three-layer regression anchor, U24);
+v1.13 time-stream generation coverage belongs in `tests/operators/test_generate_stream.py`
+(planning draws, weaver mechanics, direct assembly, artifact replay equivalence),
+`tests/common/config/test_loader_generate_stream.py` (the M1 constraint matrix, §6.3 rules
+50–56) and `tests/integration/test_generate_stream_llm.py` (real-LLM: the DeepSeek endpoint
+for blueprint/realize/per-class annotation, plus ONE z.ai `glm-5.2` case pinning
+`prefixItems` L0 pass-through).
 A separate compatibility-import test,
 `test_key_pool.py`, or
 `test_stream_ingest.py` is forbidden. The exact file allowlist is normative in
@@ -1045,6 +1051,45 @@ class GenerateConfig:
     seed_examples: tuple[str, ...] = ()           # generate_only seed-pool form only
     standalone_count: int | None = None           # generate_only seedless form only; mutually
                                                   # exclusive with seed_examples
+    sequences: int = 0                            # v1.13 time-stream form: this class's sequence
+                                                  # ATTEMPT quota (global default here, overridden
+                                                  # by [class.<name>.generate].sequences); 0 = the
+                                                  # class does not take part in generation
+    len_range: tuple[int, int] = (3, 6)           # v1.13 time-stream form: uniform sampling range
+                                                  # of a sequence's step count (1 <= lo <= hi;
+                                                  # per-class override as usual)
+
+
+@dataclass(frozen=True)
+class GenerateStreamConfig:                       # v1.13 (spec 5.2 [generate.stream]): the
+                                                  # generate_only TIME-STREAM form — the LLM makes
+                                                  # exactly two content calls per sequence
+                                                  # (blueprint + frame realization); session
+                                                  # packing / crossing / noise / duplication /
+                                                  # timestamps are all done by the mechanical
+                                                  # weaver. Default off; all-off is byte-equivalent
+                                                  # to v1.12
+    enabled: bool = False                         # true ⇒ generate_only ∧ text ∧ generate.enabled
+                                                  # ∧ classify.enabled ∧ stream.order_by =
+                                                  # "meta:<field>" ∧ output.meta_mode != "none"
+                                                  # (M1 hard conjunction, §6.3)
+    sessions: int = 0                             # session count (>= 1); crossed sessions =
+                                                  # Σsequences − sessions, hence M1 requires
+                                                  # sessions <= Σsequences <= 2 × sessions
+                                                  # (crossing concurrency is always k ∈ {1, 2})
+    noise_ratio: float = 0.0                      # noise frames / task frames, ∈ [0,1);
+                                                  # noise frame count = round(ratio × task frames)
+    noise_instruction: str = ""                   # required non-empty iff noise_ratio > 0
+    duplicates: int = 0                           # verbatim re-sent sequences (0 = none;
+                                                  # <= Σsequences) — byte-identical frames, always
+                                                  # a NEW session at the tail of the stream
+    frame_gap_s: tuple[float, float] = (5.0, 60.0)
+                                                  # uniform sampling range of the intra-session
+                                                  # frame gap (seconds); M1: 0 < lo <= hi <
+                                                  # stream.gap_s (an intra-session gap at or above
+                                                  # the session-split threshold is self-defeating)
+    ts_start: str = "2026-01-01T00:00:00Z"        # stream origin (ISO-8601; NEVER the wall clock —
+                                                  # same seed, byte-identical artifact)
 
 
 @dataclass(frozen=True)
@@ -1172,6 +1217,14 @@ class ClassView:                                  # one class's effective config
                                                   # has NO per-class view: it runs BEFORE classify,
                                                   # labels do not exist yet (chain-order causality,
                                                   # spec §5.2)
+    schema: Mapping | None = None                 # v1.13 (裁决·按类标注 Schema) — DEFAULTED tail
+                                                  # field: this class's annotation output schema,
+                                                  # the parsed product of
+                                                  # [class.<name>.annotate].schema_path /
+                                                  # schema_inline (AT MOST ONE); None = no override
+                                                  # ⇒ falls back to the global output.schema
+                                                  # (override semantics, mirroring the per-class
+                                                  # rubric heavy-asset precedent)
 
 
 # ── stream (v1.8, spec §5.2 [stream] + [segment] + [extract]; v1.9 + [stitch]) ──
@@ -1394,6 +1447,15 @@ class FrameClassView:                             # v1.12: one frame class's eff
     enabled: bool                                 # false ⇒ members of this class skip frame
                                                   # annotation (cost-saving face; rendered
                                                   # status="skipped" in members[])
+    gen_instruction: str | None = None            # v1.13 (裁决·帧类生成面): this frame class's
+                                                  # CONTENT-generation instruction
+                                                  # ([frame.class.<name>.generate].instruction);
+                                                  # None = not declared — every frame class must
+                                                  # declare one under the time-stream form (M1)
+    gen_schema: Mapping | None = None             # v1.13: parsed generation schema of this frame
+                                                  # class (at most one of schema_path /
+                                                  # schema_inline); None = plain-text frame (the
+                                                  # frame content is the text itself)
 
 
 # ── CLI overrides and the aggregate ────────────────────────────────────────
@@ -1463,6 +1525,11 @@ class ResolvedConfig:
                                                   # (user_schema sibling: meta-validated +
                                                   # few-shot dry-run); None while frame.annotate
                                                   # is disabled
+    generate_stream: GenerateStreamConfig = GenerateStreamConfig()
+                                                  # v1.13: the time-stream generation form
+                                                  # (default off = byte-equivalent to v1.12);
+                                                  # follows the same "defaulted tail field"
+                                                  # convention as the v1.12 frame quartet
 ```
 
 `schema_version` (a required top-level int key in BOTH files, spec §5.1/§5.2 row 1) is validated
@@ -1570,7 +1637,13 @@ Run mode (v1.4):
 10. **generate_only 前提** — `run.mode = "generate_only"` ⇒ `run.input` absent (also rejecting
     CLI `--input`), `run.modality == "text"`, `generate.enabled == true`; exactly ONE of
     `generate.seed_examples` (non-empty array of non-empty strings) and
-    `generate.standalone_count` (≥ 1) is provided.
+    `generate.standalone_count` (≥ 1) is provided. v1.13 THREE-WAY form split: under
+    `generate_stream.enabled = true` the "exactly one of seed_examples / standalone_count"
+    clause DOES NOT run (the time-stream form carries its quota on
+    `[class.<name>.generate].sequences × len_range`; writing either key explicitly is a
+    DIRECTED CONFIG_ERROR — rule 52). `generate.instruction`'s required-iff-enabled check is
+    likewise skipped under the time-stream form (per-class instructions carry the task;
+    rule 51 checks the participating classes instead).
 11. **process 禁种子形态** — `run.mode = "process"` ⇒ neither `generate.seed_examples` nor
     `generate.standalone_count` may be set.
 
@@ -1630,12 +1703,22 @@ apply only when `classify.enabled = true` unless stated):
     and is unique
     within the table; each `description` is non-empty; `examples`, when present, is an array
     of strings (input-side only). `classify.fallback_class` is required and must be one of
-    the class names.
+    the class names. v1.13 RELAXATION, time-stream form only (裁决·序列类约束按形态放宽):
+    under `generate_stream.enabled = true` the minimum drops to **≥ 1 entry** and
+    `fallback_class` becomes **optional** (when written it must still be a declared class
+    name) — both rules protect the LLM verdict path, which does not exist under inherited
+    labels. Everything else (name/description/examples structure) is unchanged.
 23. **classify 引用集** — `classify.llm` must exist in `[llm.*]`; UI modality ⇒ that profile
     has
     `supports_vision = true`. The classify profile joins ALL THREE reference sets (R24):
     the loader's referenced set (rule 12 key resolution), the vision-check set (rule 4),
     and `labelkit.orchestration.profile_usage.referenced_profiles()` (`validate --probe`).
+    v1.13 EXEMPTION: under `generate_stream.enabled = true` `classify.llm` does NOT join the
+    loader's KEY-RESOLUTION set (the S30 precedent — sequence labels are inherited, classify
+    makes zero verdict calls, so no live key may be demanded); EXISTENCE is still checked
+    (a misspelt profile name must still fail at startup) and
+    `profile_usage.referenced_profiles()` still lists it under `classify.enabled`, so an
+    explicit `validate --probe` still probes that profile.
 24. **classify 归属与上限** — `classify.assignment` ∈ {"single", "multi"};
     `classify.max_labels` may be set ONLY when
     `assignment = "multi"` and must be ∈ [2, len(classes)] — when absent M1 back-fills it to
@@ -1644,8 +1727,9 @@ apply only when `classify.enabled = true` unless stated):
 25. **按类覆盖白名单** — `[class.<name>.*]`: `<name>` must be a declared class name. Override
     keys must be inside
     the per-section whitelist — `quality`: mode, rounds, rubric (incl. the `[class.*.rubric]`
-    inline table), threshold, selection, top_ratio; `annotate`: instruction, examples;
-    `generate`: instruction, styles, num_per_record, temperature; `verify`: extra_criteria.
+    inline table), threshold, selection, top_ratio; `annotate`: instruction, examples,
+    **schema_path, schema_inline** (v1.13); `generate`: instruction, styles, num_per_record,
+    temperature, **sequences, len_range** (v1.13); `verify`: extra_criteria.
     Any key outside the whitelist → CONFIG_ERROR (R25 exception to rule 1's unknown-key
     warning: `[classify]` / `[class.*]` are explicitly owned namespaces).
 26. **按类选择组合并** — Per-class merge builds the frozen `class_views` (per-key provenance:
@@ -1661,9 +1745,14 @@ apply only when `classify.enabled = true` unless stated):
     effective selector is not `"inline"` → table ignored + warning (same convention as the
     global rubric).
 28. **类内示例干跑** — Every `[[class.<name>.annotate.examples]]` output dry-runs against the
-    GLOBAL user
-    schema and `output.validator` (rule 15 semantics; error locations rendered
-    `[[class.<name>.annotate.examples]][N]`, N 1-based).
+    CLASS-EFFECTIVE
+    schema and the global `output.validator` (rule 15 semantics; error locations rendered
+    `[[class.<name>.annotate.examples]][N]`, N 1-based). v1.13 correction: the dry-run target
+    was the GLOBAL user schema through v1.12 — with a per-class schema (rule 50) that
+    misjudges, so the target is now `class_views[name].schema ?? user_schema`. A class owning
+    a schema ALSO re-runs its INHERITED global examples against that class schema (runtime
+    sends the class schema); a `$ref`-dead class schema stops only that class's dry-run, never
+    the global layer's.
 
 Stream (v1.8, spec §5.2 [stream]/[segment]/[extract] rows + spec 2.3.1; all checks below
 apply only when the named switch is on unless stated):
@@ -1779,12 +1868,18 @@ checks apply only when the named switch is on unless stated):
     (modality=="ui") ∧ enabled ∧ profile.supports_vision, frozen by M1 at load() end
     (segment V1 sibling, no strategy term).
 44. **帧类覆盖要求帧分类** — any `[frame.class.<name>]` table present ⇒
-    `frame.classify.enabled = true` (a CONFIG_ERROR — deliberately NOT the parked-config
-    warning family, R8); `<name>` must be a declared frame class; the per-class section
-    whitelist is `annotate` ONLY with keys `instruction` / `examples` / `enabled` — anything
-    else is a CONFIG_ERROR (the [frame.class.*] namespace is M1-owned, R25 family). The
+    `frame.classify.enabled = true` **∨ `generate_stream.enabled = true`** (v1.13 widening; a
+    CONFIG_ERROR — deliberately NOT the parked-config warning family, R8); `<name>` must be a
+    declared frame class; the per-class section whitelist is TWO sections (v1.13) —
+    `annotate` with keys `instruction` / `examples` / `enabled`, and `generate` with keys
+    `instruction` / `schema_path` / `schema_inline` — anything else is a CONFIG_ERROR (the
+    [frame.class.*] namespace is M1-owned, R25 family). The `generate` section is legal ONLY
+    under the time-stream form: present while `generate_stream.enabled = false` ⇒ a REVERSE
+    directed CONFIG_ERROR pointing at `[frame.class.<name>.annotate]` (the whitelist accepts
+    the section name, so it must be intercepted by name or it would silently no-op). The
     merge materializes `frame_class_views` per declared frame class (zero-override classes
-    included) iff frame.classify is enabled; `enabled` defaults true per class.
+    included) iff frame.classify **or** generate.stream is enabled; `enabled` defaults true
+    per class.
 45. **帧 Schema 恰一** — `frame.annotate.enabled` ⇒ exactly one of
     `frame.annotate.schema_path` / `schema_inline`, mirroring the output.schema branch set
     (valid JSON / top-level object / draft 2020-12 meta-schema / top-level `type: "object"` /
@@ -1816,7 +1911,77 @@ checks apply only when the named switch is on unless stated):
     frame switch on ∧
     `segment.enabled = false` ⇒ "[frame]" joins the v1.8 R8 parked-tables warning (one line
     naming the ignored tables); with either frame switch on, rule 43's CONFIG_ERROR takes
-    over and the parked entry never appears.
+    over and the parked entry never appears. v1.13: `generate_stream.enabled = true` ALSO
+    keeps `[frame]` out of the parked list (the frame class table and
+    `[frame.class.*.generate]` are live surfaces there), and likewise `[stream]` (the section
+    doubles as the generation-side laying contract) — `[segment]`/`[stitch]`/`[extract]` keep
+    warning as before (裁决·停放豁免精确化).
+
+Time-stream generation (v1.13, spec 3.1.4 时间流生成 row + 2.3.1; every rule below runs ONLY
+when `generate_stream.enabled = true` — with the switch off the loader takes zero new code
+paths and the whole system is byte-equivalent to v1.12):
+50. **按类标注 Schema** — `[class.<name>.annotate]` accepts AT MOST ONE of `schema_path` /
+    `schema_inline` (both present → CONFIG_ERROR; neither = no override, falling back to the
+    global `output.schema`). A declared one loads through the full `output.schema` branch set
+    (rule 13/14 semantics: valid JSON / top-level object / draft 2020-12 meta-schema /
+    top-level `type: "object"`) PLUS the `_meta` reserved-key ban and the `$ref` resolvability
+    walk; error locations are prefixed `[class.<name>.annotate].schema_*`. The parse product
+    lands on `ClassView.schema` (None = no override). **This rule is NOT gated on the
+    time-stream form** — per-class annotation schemas are a standalone v1.13 capability usable
+    by any classify-enabled project; it is listed here because the form is its first consumer.
+51. **形态前提合取** — `generate_stream.enabled = true` requires ALL of: `run.mode =
+    "generate_only"`, `run.modality = "text"`, `generate.enabled`, `classify.enabled` (the
+    sequence class table is the quota + per-class conditioning carrier; labels are inherited),
+    `stream.order_by` matching `"meta:<field>"` with a non-empty field (that field is the
+    artifact's timestamp key — ingest replays by the same declaration), and
+    `output.meta_mode != "none"` (frame-class ground truth travels only via `_meta.stream`).
+    Artifact-key guard (v1.13, part of this rule): neither `input.text_field` nor the
+    `order_by` timestamp field may contain `"."` (artifact rows use them VERBATIM as top-level
+    keys while ingest resolves dotted paths — a dotted name cannot round-trip and every
+    replayed row would be a bad line), the two must differ, and neither may be `"truth"` (the
+    three artifact-row top-level keys are mutually exclusive).
+    Quota side: `Σ sequences` over the class-effective views ≥ 1; every PARTICIPATING class
+    (effective `sequences >= 1`) has a non-empty effective generate instruction;
+    `[[frame.classify.classes]]` is non-empty and EVERY frame class has a non-empty
+    `[frame.class.<name>.generate].instruction` (the blueprint enum spans the whole table).
+52. **禁设键探针** — DIRECTED CONFIG_ERRORs (the v1.11 `use_vision` raw-section probe
+    mechanism — never rule 1's unknown-key warning; every message names the replacement
+    surface): an explicit `[generate].seed_examples` / `standalone_count` / `num_per_record` /
+    `seeds_per_call`; an explicit `[class.<name>.generate].num_per_record` / `seeds_per_call`;
+    and `frame.classify.enabled = true` or `frame.annotate.enabled = true` (mutually exclusive
+    with the form — frame-class ground truth is already known at blueprint time; frame CONTENT
+    contracts go in `[frame.class.<name>.generate]`).
+53. **装箱一致性** — `sessions >= 1` and `sessions <= Σsequences <= 2 × sessions` (crossed
+    sessions = `Σsequences − sessions`, so crossing concurrency is always k ∈ {1,2});
+    `duplicates ∈ [0, Σsequences]`; `noise_ratio ∈ [0,1)` and, when > 0, `noise_instruction`
+    non-empty; `frame_gap_s` is a 2-element numeric range with `0 < lo <= hi` and
+    `hi < stream.gap_s`.
+54. **织造上限与铺设契约** — `2 × max(per-class len_range upper bound) <=
+    stream.session_max_len` (a crossed session always holds two sequences); `stream.key == []`
+    and `stream.gap_steps == 0` (partition keys and step-gap splitting contradict the
+    generation-side laying contract); when `stream.session_max_span_s > 0`, the worst-case
+    span `(session_max_len − 1) × frame_gap_s[1]` must not exceed it; `ts_start` must parse
+    via `datetime.fromisoformat`.
+55. **帧类生成 Schema** — `[frame.class.<name>.generate]` accepts AT MOST ONE of `schema_path`
+    / `schema_inline` (declared = structured frame, neither = plain-text frame); a declared
+    one loads through the same branch set as rule 50 plus the `$ref` walk, but WITHOUT the
+    `_meta` reserved-key branch (frame content lands in the artifact row's text field — no
+    envelope collision, the rule-45 precedent). Parse products land on
+    `FrameClassView.gen_instruction` / `gen_schema`.
+56. **S29 扩展与静态预算两段** — The empty-`quality.rubric` resolution condition widens from
+    `segment.enabled` to `segment.enabled ∨ generate_stream.enabled` ⇒ `"default:trajectory"`
+    (loader AND the emitter mirror change together, §7.10). The trajectory-rubric ∧
+    `extract.enabled = false` advisory WARN does NOT fire here — it lives in the
+    `segment.enabled` branch and segment is always off under this form (and there is nothing
+    to advise: extract is UI-only while the form is always text). The V13③ static budget precheck
+    gains two segments — `generate.stream.plan` = `TEMPLATE_HEAD_TOKENS["generate_plan"]` +
+    max(global, per-class) generate instruction + the frame class table text;
+    `generate.stream.realize` = `TEMPLATE_HEAD_TOKENS["generate_realize"]` + the same
+    instruction term + `max(len_range upper bound) × max(frame-class generation schema text)`
+    — under the existing verdict (est ≥ input_budget → CONFIG_ERROR, > 50% → WARN). The
+    `annotate` segment's schema term becomes PER-CLASS: the max now runs over the whole
+    per-view sum (schema + instruction + few-shot); with no per-class schema declared every
+    view resolves to the global one and the value is byte-identical to v1.12.
 
 Warnings (non-blocking): `verify` enabled and `verify.llm`'s `model` equals `annotate.llm`'s
 `model` → warn about self-enhancement bias (spec 3.7.2). v1.7 (R8): `classify.enabled = false`
@@ -2173,7 +2338,9 @@ def build_annotate_prompt(record: Record, cfg: ResolvedConfig, schema_text: str,
                           fragment_lens: tuple[int, ...] | None = None,
                           k_eff: int | None = None,
                           image_px: int | None = None) -> PromptBundle:
-    """Deterministic template assembly per §10.1. schema_text = SchemaEngine.user_schema_text.
+    """Deterministic template assembly per §10.1. schema_text = the CLASS-EFFECTIVE schema
+    text (v1.13: `class_schema_text(ctx, label)` — SchemaEngine.user_schema_text unless the
+    record's class overrides output.schema).
     repair != None appends the repair suffix (§10.5). [FROZEN HERE; label is a v1.7 ADDITIVE
     trailing kwarg (R2): non-None → instruction/examples come from
     cfg.class_views[label].annotate; None = global config — pre-v1.7 call sites unchanged.
@@ -2217,7 +2384,42 @@ async def annotate_record(record: Record, ctx: RunContext,
     rung up at 1.5×/dim ≤ max_image_px, budget re-checked against the calibrated estimate);
     M5's own V20 overflow degrade passes k_eff alone. Both are passed through to
     build_annotate_prompt on EVERY path (single call, each self-consistency sample, repair
-    re-annotation) — None/None = pre-v1.11 behavior byte-identical]"""
+    re-annotation) — None/None = pre-v1.11 behavior byte-identical.
+    v1.13 (裁决·按类标注 Schema — signature UNCHANGED, semantics widened): `label` now ALSO
+    selects the annotation SCHEMA. Prompt text, the M8 call, the self-consistency vote and
+    the V9 packing estimate all read `class_effective_schema` / `class_schema_text`, and a
+    class-schema call routes `complete_validated(schema=<class schema>,
+    user_treatment=True)` — record-level annotation stays in the user-treatment family, so
+    L2.5 and the resolved_at accounting are preserved (§7.7). M7's repair re-annotation
+    inherits this by passing the same label — no repair-side change. With no per-class
+    schema configured every call shape is byte-identical to v1.12]"""
+
+
+# ── v1.13 per-sequence-class annotation schema (SPEC-stream-generation §3.4) ─
+# The SINGLE lookup point for the class-effective annotation schema. Every schema
+# consumer inside M5 reads through these three functions so the PRICED schema is
+# always the CALLED one; M7's V21 trial packing lazy-imports the same pair (an
+# existing sanctioned import edge); M11 may NOT import them (operator isolation,
+# spec §2.2) and keeps a minimal in-module mirror whose semantics must match.
+
+def class_annotate_schema(cfg: ResolvedConfig, label: str | None) -> Mapping | None:
+    """The per-class annotation schema OVERRIDE, or None [FROZEN HERE].
+    label None / unknown class / class without an override → None, which every
+    caller reads as "stay on the global output.schema path" (byte-equivalent to
+    v1.12)."""
+
+
+def class_effective_schema(cfg: ResolvedConfig, label: str | None) -> Mapping:
+    """`class_annotate_schema(...) ?? cfg.user_schema` — the schema the record is
+    actually constrained by (self-consistency voting and budget pricing share
+    it) [FROZEN HERE]."""
+
+
+def class_schema_text(ctx: RunContext, label: str | None) -> str:
+    """The schema text embedded in the prompt [FROZEN HERE]. No override → the
+    existing `ctx.schema_engine.user_schema_text` property verbatim; with an
+    override → computed per call in the SAME shape (json.dumps with
+    ensure_ascii=False, separators=(", ", ": ")) — the frame-side precedent."""
 
 
 # ── v1.12 frame-level per-member annotation (SPEC-frame-annotation §3.3) ────
@@ -2394,7 +2596,106 @@ v1.7 per-class generation (classify enabled, process mode; spec 3.6.2 按类种�
   `Classification(label, (label,), "inherited", {})` — the chain's classify stage skips them
   (idempotency, §7.13).
 - **generate_only:** the `generate_all` flat path is UNCHANGED (global instruction, no class
-  segments); its products are classified normally by the chain's classify stage.
+  segments); its products are classified normally by the chain's classify stage. v1.13 branch
+  note: under `generate_stream.enabled` M10 calls `generate_stream_all` INSTEAD (below) —
+  `generate_all`'s frozen signature, its call-count formulas and its flat code path are
+  UNTOUCHED.
+
+v1.13 time-stream form (SPEC-stream-generation §3.2; spec 3.6.5). Public surface:
+
+```python
+@dataclass(frozen=True)                            # [FROZEN HERE]
+class StreamGenerateProduct:
+    envelopes: list[PipelineItem]                  # direct-assembly sequence envelopes (plan order)
+    artifact_lines: list[str]                      # artifact rows, weave order; line_no = index + 1
+
+
+async def generate_stream_all(ctx: RunContext) -> StreamGenerateProduct:
+    """GENERATE_ONLY TIME-STREAM entry (called once by M10; ctx.batch_no == 0,
+    ctx.rng == Random(f"{seed}:0:generate")) [FROZEN HERE]. Planning draws → dispatch
+    (per-sequence blueprint→realize jobs and the noise batches gather together) → per-frame
+    hook + sequence-level similarity filter → mechanical weave → direct assembly. A voided
+    sequence merely ABSENTS itself: no failed record, no item.errors. Returns the RICH product
+    because a bare `PipelineItem(record=r)` cannot carry session_id / classification /
+    member_classifications."""
+
+
+def plan_stream(cfg: ResolvedConfig, rng: random.Random) -> StreamPlan:
+    """The planning-phase PURE function (cfg + rng, no IO, no LLM) [FROZEN HERE]. M10's
+    estimate_run reuses it for the EXACT dry-run replay (§7.9) — not an upper bound."""
+
+
+def stream_artifact_path(cfg: ResolvedConfig) -> str:
+    """`Path(cfg.run.output).with_suffix("") + ".stream.jsonl"` [FROZEN HERE]. M11 derives the
+    same value INDEPENDENTLY (operators never import each other); the equality of the two
+    derivations is test-pinned."""
+```
+
+Normative behavior:
+
+- **Draw-order table (FROZEN, test-pinned).** One `Random(f"{seed}:0:generate")` consumed in
+  three phases. Planning (before ANY dispatch): ① expand quotas into (class, ordinal) pairs in
+  class-name LEXICOGRAPHIC order (`--limit` prefix-truncates HERE, zero rng) ② per sequence
+  `L = rng.randint(class len_range)` ③ per sequence pre-draw (llm, style) — the noise-batch
+  draws follow the sequence draws in the SAME predraw stream (round_robin consumes zero rng,
+  weighted one `choices` per index, non-empty styles one `choice` per index; noise batches take
+  the GLOBAL styles). Dispatch: ZERO rng (the existing discipline). Weaving (after gather, in
+  surviving-sequence plan order): ④ duplicate selection `rng.sample` ⑤ packing shuffle + the
+  first `Σsurvivors − sessions_eff` pairs crossed ⑥ per-crossed-session switch points ⑦ per
+  noise frame (session, slot) draws ⑧ duplicates appended as NEW tail sessions (zero rng)
+  ⑨ timestamp laying. Voided sequences change the weave input, so determinism is conditional on
+  the LLM content (spec §2.6).
+- **Two content calls + noise.** Blueprint (one per surviving quota sequence): §10.14 template,
+  `plan_schema(frame class names, L)` (internal treatment); exhaustion/unfittable ⇒ the sequence
+  is voided, `generate.stream.plan_failures`. Realize (one per blueprint): §10.15 template with
+  the per-position contract line, `realize_schema(step schemas)` (plain-text positions take
+  `{"type": "string"}`); reactive overflow ⇒ SEQUENCE HALVING (schema and step digest sliced
+  together, ≤ 2 AIMD levels, each halving counted into `budget.degrade_retries`), exhaustion ⇒
+  voided, `generate.stream.realize_failures`. Noise: `render_prompt_texts(noise_instruction,
+  style, num_per_call, ())` reusing §10.4 + `SAMPLES_SCHEMA`, `ceil(noise frames / num_per_call)`
+  calls; a voided batch just leaves those frames absent (never regenerated).
+- **Filters.** `generate.sample_validator` runs PER FRAME of the realize product — any violation
+  scraps the WHOLE sequence (a fixed-length blueprint cannot drop one frame; rejection-sampling
+  semantics), counting `generate.stream.validator_scrapped` + the bucket's
+  `rejected_by_validator`. The built-in `SimilarityFilter` is lifted to SEQUENCE level: probe
+  text = member texts joined by `"\x1e"` in order (the M3 sequence recipe), compared against
+  SIBLING sequences only (no seeds), parameters from `[dedup]`; survivors count
+  `survived_dedup`. **Bucket keys** take the three-segment `<class>×<llm>×<style>` form here —
+  the FIRST generate_only appearance of the class segment (the two-segment form stays for the
+  noise batches, which have no class).
+- **Weaver (pure functions, zero LLM, zero IO).** `sessions_eff = min(sessions, Σsurvivors)`,
+  crossed pairs = `Σsurvivors − sessions_eff`; a crossed session is `A[:cut_a] + B[:cut_b] +
+  A[cut_a:] + B[cut_b:]` with `cut_a ∈ [1, |A|−1]`, `cut_b ∈ [1, |B|]` (sides swap when the
+  first has < 2 frames; both < 2 degrades to concatenation — a pure length condition, zero rng);
+  noise frames draw (session, slot) with FULL sessions (`len >= stream.session_max_len`) out of
+  the pool (pool exhausted ⇒ remaining frames absent + WARN); `duplicates` (clamped to the
+  survivor count + WARN) are byte-identical re-sends appended as NEW tail sessions; timestamps
+  start at `ts_start` and increase strictly — `uniform(frame_gap_s)` within a session,
+  `uniform(gap_s + lo, gap_s + hi)` across sessions, microsecond-precision ISO-8601. The final
+  pass back-fills `truth.session` with the whole-stream session ordinal.
+- **Direct assembly.** Row = `{<ts field>: ts, <text_field>: payload, "truth": {...}}` (§9.5);
+  member `Record.raw` = THE WHOLE ROW, `id = sha256(canonical_json(raw))[:16]` (the M2 formula ⇒
+  replay-identical), `text` = the M2 projection of the text field (string as-is, object →
+  canonical JSON), `ref = RecordRef(source_file=<artifact path>, line_no=<1-based row>,
+  pair_index=None, generated_from=(), generator={"llm", "style"})`; `session_id =
+  sha256("\n".join(all frame ids in the session))[:16]` (the M2 formula, INCLUDING noise and
+  duplicate frames); the sequence Record follows the S24 conventions with the M14 id formula;
+  the envelope carries `Classification(label, (label,), "inherited", {})` plus
+  `member_classifications = {member id: Classification(frame class, (frame class,),
+  "inherited", {})}`. Noise and duplicate frames live ONLY in the artifact — no envelopes.
+- **Counters owned here** (`generate.stream.*`, surfaced as `report.generate.stream`, §9.3):
+  `sessions` (woven sessions EXCLUDING the duplicate tails; voided sequences push it below
+  the declared `sessions` because packing uses `sessions_eff = min(sessions, Σsurvivors)`) /
+  `crossed_sessions` / `sequences.<class>.planned` / `.produced` (= the sequences that
+  actually reach the chain — past blueprint, realize, the per-frame hook AND the
+  sequence-level similarity filter; the `planned − produced` gap is therefore split across
+  `plan_failures` / `realize_failures` / `validator_scrapped` AND the similarity eliminations,
+  which only surface as the bucket's `survived_dedup` shortfall) / `frames` (task frames of
+  the surviving sequences — noise and duplicate frames excluded) / `noise_frames` /
+  `duplicates` / `plan_calls` / `realize_calls` (including halved sub-calls) / `noise_calls`
+  (all three call counters increment BEFORE dispatch, so they include calls the budget
+  precheck rejected and never sent — the flat path's precedent) / `plan_failures` /
+  `realize_failures` / `validator_scrapped`.
 
 ### 7.6 M7 — `labelkit/operators/verify.py`
 
@@ -2518,6 +2819,43 @@ byte-unchanged; sequence envelopes are driven by a stage-layer bypass driver:
   (per defect kind — six kinds incl. `wrong_stitch`, v1.9) → `report.stream.verify`.
   Defect summaries ride the `verify.verdict` event payload (content-tiered, §8.1).
 
+v1.13 verdict-form sequence review (裁决·直装评审判决形; spec 3.7.5). Sequence envelopes now
+have TWO origins — M14 episodes (driven by the stream driver above) and M6 direct-assembly
+sequences (`generate_stream.enabled`, segment OFF, §7.5). The latter travel the CLASSIC path,
+which must not reuse the non-sequence template (a sequence Record has no text/raw/ui_tree/image
+to render) nor the defect-table variant (its `defects` key is forbidden by `VERDICT_SCHEMA`):
+
+- **Selection = driver presence.** The internal `build_verify_prompt` gains the ADDITIVE
+  trailing kwarg `verdict_form: bool = False` (the `boundary_margin`/`fragment_structure`
+  construction — non-frozen surface); the classic path passes
+  `verdict_form=(record.kind == "sequence")`, the stream driver NEVER passes it, so the §10.5
+  defect-table variant stays byte-identical. `schema` remains `VERDICT_SCHEMA` — template and
+  schema are paired by construction.
+- **Template** (§10.16, verbatim): system = the verdict instruction (three review dimensions:
+  instruction adherence / factual consistency with the member-frame digests / field semantics)
+  + the class-effective `extra_criteria` (empty ⇒ the whole line is omitted, the non-stream
+  rule) + the "opinions first, verdict last" line + the `VERDICT_SCHEMA` structure句; user =
+  `[任务指令]` → `[成员帧摘要]` → `[标注结果]`. NO defect table, NO `[边界余量]`, NO
+  `[片段结构]`, NO screenshots (direct-assembly sequences are text modality).
+- **Member digests.** `{m}. {frame_digest(member, 400)}` (m 1-based, member order), total
+  bounded by `input.ui_tree_max_chars` — first and last lines ALWAYS kept, middle lines dropped
+  whole with a `…(truncated N members)` marker (mirroring M5's sequence rendering; operators
+  never import each other, so M7 keeps its own identical copy).
+- **Packing.** With `fit` non-None the digest block is the ONLY trimmable slot (edges trim,
+  counted into `report.budget.truncations`); `[标注结果]` and the instruction are record-level
+  semantic assets — counted, never trimmed (V25③); an untrimmable floor over budget sets
+  `fit.overflow` (V10 — the caller rejects, the request is never sent).
+- **Public helper:** `verify_verdict_sequence_system_text(extra_criteria: str) -> str`
+  [FROZEN HERE] — the system段 assembler (three dimensions + verdict instruction + structure句;
+  no defect vocabulary).
+- **Zero-change declarations.** `VerificationResult.defects` stays EMPTY in this form and
+  M11's `_verification_block` defects gate is UNCHANGED (the key appears in stream mode only,
+  §9.1); the six-value defect vocabulary, its four-way sync and the whole member-surgery path
+  are untouched. Repair = the existing policy re-annotation (threading the same `label`, so the
+  per-class annotation schema flows through §7.4 for free); persistent fail ⇒ `dropped_verify`
+  — for synthetic data that IS rejection sampling: the losing sequence leaves the main output
+  while the artifact keeps its frames and truth (§9.5).
+
 ### 7.7 M8 — `labelkit/common/runtime/schema_engine.py`
 
 ```python
@@ -2535,20 +2873,26 @@ class SchemaEngine:
                                  schema: dict | None = None, *,
                                  record_ids: tuple[str, ...] = (),
                                  batch_no: int = 0,
-                                 record: Mapping | None = None) -> tuple[dict, Usage, int, str]:
+                                 record: Mapping | None = None,
+                                 user_treatment: bool | None = None) -> tuple[dict, Usage, int, str]:
         """schema=None → user schema; internal schemas (judgment/pointwise/verdict/samples)
         passed in by stages. Runs L0→L1→L2[→L2.5]→L3 (spec 3.8.2). ``record`` (v1.5,
         additive kwarg) is the raw input mapping handed to the output.validator hook
-        at L2.5 — user-schema calls only; callback violations are rendered
+        at L2.5 — user-treatment calls only; callback violations are rendered
         "(validator) <msg>", join the L3 repair prompt, and share the repair budget;
         exhaustion with ONLY callback violations left raises
         SchemaViolation(callback_only=True) → record kind callback_violation. Success: returns
         (validated_obj, total_usage, attempts, model) where attempts = 1 + L3 repair calls
         and total_usage sums the first call + repairs. Failure: raises SchemaViolation.
-        Counts resolved_at buckets ONLY when schema is None (user-schema annotate calls,
-        spec §6.4); emits `schema.repair` trace events (any non-clean resolution) with the
-        given record_ids/batch_no. Extra kwargs and tuple return are [FROZEN HERE] (spec
-        gives `-> dict`; callers need usage/attempts/model to build Annotation)."""
+        Counts resolved_at buckets for USER-TREATMENT calls only (spec §6.4); emits
+        `schema.repair` trace events (any non-clean resolution) with the given
+        record_ids/batch_no. Extra kwargs and tuple return are [FROZEN HERE] (spec
+        gives `-> dict`; callers need usage/attempts/model to build Annotation).
+        ``user_treatment`` (v1.13, ADDITIVE trailing kwarg — 裁决·M8 显式待遇参数) DECOUPLES
+        treatment from how the schema is passed: None = the pre-v1.13 inference
+        `schema is None` (EVERY pre-existing call site is unchanged); True = user treatment
+        (resolved_at accounting + the L2.5 hook) even with an explicit schema — the
+        per-sequence-class annotation schema route (§7.4); False = internal treatment."""
 
     def validate_only(self, obj: dict, schema: dict | None = None) -> list[str]:
         """Full-violation list (Draft202012Validator.iter_errors), rendered
@@ -2558,7 +2902,11 @@ class SchemaEngine:
     @property
     def stats(self) -> dict:
         """{"l0_or_clean": int, "l1": int, "l3_1": int, "l3_2": int, "rejected": int}
-        — user-schema calls only. [FROZEN HERE]"""
+        — USER-TREATMENT calls only (v1.13 restatement of "user-schema calls only": a
+        per-sequence-class annotation call passes an explicit schema yet is still a
+        record-level annotation and IS counted; frame-level and internal-schema calls are
+        not — spec §6.4's identity becomes "the sum = the number of RECORD-LEVEL annotation
+        calls entering M5"). [FROZEN HERE]"""
 ```
 
 Layer definitions (normative, spec 3.8.2): **L0** — if the profile has
@@ -2588,15 +2936,29 @@ def stitch_schema() -> dict: ...                                             # v
 def defect_verdict_schema() -> dict: ...                                     # v1.8 (M7 stream);
                                                                              # v1.9: kind enum
                                                                              # +wrong_stitch, §10.7
+def frame_classify_schema(names: Sequence[str], n: int) -> dict: ...         # v1.12 (M13 frame), §10.7
+def plan_schema(names: Sequence[str], length: int) -> dict: ...              # v1.13 (M6 blueprint), §10.7
+def realize_schema(step_schemas: Sequence[dict]) -> dict: ...                # v1.13 (M6 realize), §10.7
 ```
 
-The three v1.8 builders and the v1.9 `stitch_schema` are INTERNAL schemas like the rest: no
-`resolved_at` bucket counting, no L2.5 hook, keyword set ⊆ the frozen internal-schema keyword
-set, and NO
+The three v1.8 builders, the v1.9 `stitch_schema`, the v1.12 `frame_classify_schema` and the
+two v1.13 builders are INTERNAL schemas like the rest: no `resolved_at` bucket counting, no
+L2.5 hook, and NO
 `uniqueItems` anywhere (R1 lesson — L0 strict-mode pass-through). The non-stream verify
 path keeps using the frozen `VERDICT_SCHEMA`; `defect_verdict_schema()` exists ALONGSIDE it
 (two verdict schemas co-exist, S7 — its defect-kind enum grows to six values in v1.9 with
 `wrong_stitch` appended last, T15).
+
+**Keyword-freeze scope (v1.13 rewrite of "keyword set ⊆ the frozen internal-schema keyword
+set").** The freeze covers **the LabelKit-side constructors' own scope** plus the `realize`
+wrapper's skeleton keys (`prefixItems`, `items: false`, `minItems`/`maxItems`,
+`additionalProperties`, `required`, `type`, `enum`) — it does NOT extend into
+`realize_schema`'s POSITIONAL SUB-SCHEMAS, which are USER-authored frame-class generation
+schemas (`[frame.class.<name>.generate].schema_*`, M1 meta-validated) wrapped verbatim and
+passed through L0 exactly like `output.schema` is today. There is deliberately NO keyword
+allow-list lint on them (裁决·用户生成 Schema 的 L0 待遇); the escape hatch for strict routes
+that reject `prefixItems` is configuration-level `supports_structured_output = false`, never a
+per-call parameter.
 
 ### 7.8 M9 — `labelkit/common/runtime/llm_client.py`
 
@@ -3101,6 +3463,42 @@ v1.12 frame-granularity estimate (SPEC-frame-annotation 裁决·估算上界与 
   `classify_calls + frame_classify_calls`, annotate ↦ `annotate_calls +
   frame_annotate_calls`; the panel gains no new rows — §7.12 territory).
 
+v1.13 time-stream generation (SPEC-stream-generation §3.7; spec 3.10.3 时间流生成 row):
+
+- **Driver branch.** `_run_generate` forks on `cfg.generate_stream.enabled` at its entry:
+  the time-stream form awaits `gen.generate_stream_all(ctx0)` ONCE (as a guarded task, the
+  flat path's construction — a SIGINT's 30 s timer can cancel it; the elapsed time still
+  lands in `timing.per_stage_s.generate`; a mid-generation interrupt yields no product, no
+  artifact, no batches and finalize still runs with `interrupted=true`). The flat
+  seed-pool / seedless path is code-unchanged. On success, in order: ① the artifact is
+  staged FIRST (below) ② `counts.generated = len(envelopes)` ③ envelopes are sliced by
+  `run.batch_size` through `_compose_chain(include_generate=False)` — the ENVELOPES are
+  dispatched as-is, never rebuilt from their records (that would drop session_id /
+  classification / member_classifications). `--limit` already truncated at M6's planning-phase
+  quota layer; M10 re-truncates belt & braces.
+- **Artifact ownership.** M6 finalizes the row content, M11 owns the channel and the delivery
+  discipline (§7.10), and M10 hands over exactly once via
+  `emitter.write_stream_artifact(lines)` BEFORE any batch dispatch. `report.run.artifact`
+  (`path` / `sha256` / `lines`) is read back from the emitter at report-assembly time and is
+  present ONLY when the artifact was actually written (absent under dry-run and with the form
+  off).
+- **`estimate_run` EXACT replay.** The generate_only branch reuses M6's planning-phase pure
+  function `plan_stream(cfg, Random(f"{seed}:0:generate"))` — an exact replay of the length and
+  noise draws, NOT an upper bound: `records = Σsequences` (post-`--limit`),
+  `generate_calls = 2 × records + ceil(noise frames / num_per_call)` (blueprint + realize +
+  noise batches all folded into the EXISTING key), `classify_calls = 0` (inherited labels, zero
+  verdict calls — the v1.7 R11 idempotency philosophy), quality/annotate/verify bases =
+  `records`, `batches = ceil(records / batch_size)`. **The estimate line format is UNCHANGED**
+  (no new keys; `_ESTIMATE_CALL_KEYS` / `_STAGE_CALL_KEYS` and the panel rows are untouched) —
+  the SEVEN pre-existing dry-run goldens stay BYTE-FROZEN and only an eighth,
+  `tests/cli/goldens/dryrun-synth-stream.txt`, joins the pytest-enforced set (eight goldens
+  total, five example directories / eight projects, §7.12 + spec §7.8).
+- **`report.generate.stream`.** Assembled here from the `generate.stream.*` counters M6 feeds
+  (counts-only, key set and key order frozen; the `sequences` histogram is laid out zero-based
+  over `[[classify.classes]]` in declaration order — the `report.classify` convention). The
+  `report.stream` node does NOT appear (that is segment's observability surface) and
+  `report.classify`'s histogram is legitimately all-zero.
+
 ### 7.10 M11 — `labelkit/operators/emitter.py`
 
 ```python
@@ -3133,6 +3531,22 @@ class Emitter:                                     # signatures [FROZEN HERE]
         immediately (the CLI panel owns the display; mid-run degradation and `q` detach are
         the RENDERER's job — it keeps printing plain lines from the same console_format)."""
 
+    def write_stream_artifact(self, lines: Sequence[str]) -> None:
+        """v1.13 FIFTH output channel (裁决·时间流工件通道) [FROZEN HERE]. Writes the
+        weave-order-final artifact rows handed over by M6 into
+        {output_stem}.stream.jsonl.part (write + flush); the path rule is
+        `Path(cfg.run.output).with_suffix("") + ".stream.jsonl"`, derived INDEPENDENTLY of
+        M6's `stream_artifact_path` (operators never import each other; the equality is
+        test-pinned). Delivery rides the SAME finalize batch as the main output (fsync +
+        atomic rename) and shares the `_undeliverable` discipline — an unwritable channel or
+        a failed write sets the flag, after which finalize renames nothing (a truncated
+        artifact never masquerades as a finished one; the exit-4 family). Dry-run never
+        reaches this method (`_run_dry` drives no generation and opens no channels). The call
+        also freezes `self.artifact_summary = {"path", "sha256", "lines"}` (sha256 over the
+        bytes as written, `config_digest`'s "sha256:" prefix form) for M10's
+        `report.run.artifact` (§9.3). The emitter neither produces nor validates artifact row
+        content — M6 finalizes it (§9.5)."""
+
     def finalize(self, report: Mapping, deliver: bool = True) -> None:
         """fsync + atomic os.rename {output}.part → {output} (and sidecar) when deliver=True;
         always writes {output_stem}.report.json (cfg.dry_run diverts to {output_stem}.dryrun.report.json,
@@ -3151,7 +3565,9 @@ class Emitter:                                     # signatures [FROZEN HERE]
 
 File names: main `run.output`; temp `run.output + ".part"` (same directory); sidecar
 `{output_stem}.meta.jsonl` (temp `+ ".part"`); rejects `{output_stem}.rejects.jsonl` (streamed,
-no .part — it is an append log like trace **[FROZEN HERE]**); report `{output_stem}.report.json`.
+no .part — it is an append log like trace **[FROZEN HERE]**); report `{output_stem}.report.json`;
+v1.13 stream artifact `{output_stem}.stream.jsonl` (temp `+ ".part"`, delivered in the main
+output's finalize batch — time-stream generation form only **[FROZEN HERE]**).
 `output_stem` = output path minus final suffix. Line formats: §9.
 
 v1.7: `_assemble_meta` gains the ALWAYS-PRESENT `classification` key (`null` when classify is
@@ -3197,6 +3613,32 @@ off-mode byte-equivalence condition, m-11):
   threads' frames; downstream slicing must use `fragments[].order_span` (§9.1).
 - Stitched shells and rescue-flipped frames never produce output lines (fourth/third route);
   `--strict` semantics note in §9.2.
+
+v1.13 (spec 3.11.2 v1.13 rows) — three deltas, everything else zero-change:
+
+- **Per-row pre-write schema.** `emit_batch`'s final `validate_only` takes the ROW's
+  CLASS-EFFECTIVE schema: `item.classification.label` → that class's declared annotation
+  schema override, else None ⇒ the existing global-`output.schema` default path (byte-identical
+  to v1.12). multi fan-out siblings each carry their own label, so rows align naturally. M11
+  does NOT import M5's lookup functions (operator isolation, spec §2.2) and keeps a MINIMAL
+  in-module mirror `{class name: schema}` built from `cfg.class_views`; the two sides'
+  semantics must agree (test-pinned).
+- **`_meta.stream` gate widening.** The block's gate becomes `segment.enabled ∨
+  generate_stream.enabled`, and so do the `members[]` presence gate and its `label` column.
+  Direct-assembly rows reuse the block verbatim: `order_span` /`member_sources` point at the
+  ARTIFACT path and line numbers, `members[]` entries are `{index, id, label}` (the label is
+  the blueprint's frame-class ground truth; the form is mutually exclusive with
+  `frame.annotate`, so the `annotation`/`status` columns are absent — the v1.12 conditional
+  column rule is compatible), `session_split=false`, `repaired=false`, `degraded=null`,
+  `steps=null`, no `thread_id`/`fragments`.
+- **Rubric mirror.** `_meta.run.rubric`'s empty-selector resolution mirror widens to
+  `segment.enabled ∨ generate_stream.enabled ⇒ "default:trajectory"` (changed together with
+  the loader, §6.3 rule 56).
+
+Zero-change (explicit): the `_meta` top-level key order, the four-route exclusivity (this form
+produces only active and dropped_*/failed — there are no absorbed/stitched envelopes because
+member frames are never enveloped), the rejects line key sets and (stage, reason) vocabulary,
+and the conservation identity (the generate_only degenerate form, §9.3).
 
 ### 7.11 M12 — `labelkit/common/observability/obslog.py`
 
@@ -4298,7 +4740,8 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
              "generated_from": [<seed ids>],          // [] unless process-mode generated
              "fields": {<output.passthrough_fields from Record.raw>},   // {} when none
              "generator": null | {"llm": "<profile>", "style": "<name>"|null}},
-  // v1.8 — ALWAYS-PRESENT key (null whenever segment is disabled); key position AFTER
+  // v1.8 — ALWAYS-PRESENT key (null whenever segment is disabled — v1.13 widens the gate to
+  // segment.enabled ∨ generate_stream.enabled); key position AFTER
   // "source" and BEFORE "scores" — chain-order mirror (spec §6.3):
   "stream": null | {
       "episode_id": "<sequence record id>",
@@ -4315,8 +4758,11 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
       "member_ids": ["<member record id>", ...],
       "member_sources": [{"file": ..., "pair_index"|"line_no": ...}, ...],
       // v1.12 — the members array is present ONLY when frame.classify.enabled ∨
-      // frame.annotate.enabled, frozen in this position: AFTER member_sources,
-      // BEFORE session_split (SPEC-frame-annotation §3.6). One entry per member in
+      // frame.annotate.enabled (v1.13: ∨ generate_stream.enabled — the "label" column's
+      // gate widens identically, carrying the blueprint's frame-class ground truth with
+      // source="inherited"; that form is mutually exclusive with frame.annotate, so its
+      // rows carry NO annotation/status columns), frozen in this position: AFTER
+      // member_sources, BEFORE session_split (SPEC-frame-annotation §3.6). One entry per member in
       // rec.members order, index 0-based; ENTRY FIELD ORDER FROZEN:
       // index, id[, label][, annotation, status] —
       //   "label"      present iff frame.classify.enabled: the frame class, or null
@@ -4390,6 +4836,16 @@ three stream additions (`thread_id`, `fragments`, per-step `resumed`) are presen
 v1.12: the `members` array is the SOLE addition and is present ONLY when
 `frame.classify.enabled ∨ frame.annotate.enabled` — with frame granularity fully off the
 main output is byte-identical to v1.11.
+v1.13: NO new keys at all — the only deltas are gate widenings (`stream` block, `members`
+array and its `label` column all take `∨ generate_stream.enabled`) plus the inline-mode
+validation semantics ("strip `_meta`, then pass **the row's CLASS-EFFECTIVE schema**" —
+`[class.<name>.annotate].schema_*` when declared, `output.schema` otherwise; §6.3 rule 50,
+§7.10). With the form off (the default) the main output is byte-identical to v1.12. Under the
+form the stream block's values are: `order_span` = `["<artifact path>:<first row>",
+"<artifact path>:<last row>"]`, `member_sources[]` = `{file: <artifact path>, line_no: <1-based
+row>}` (main output ↔ artifact are mutually reconcilable by line number), `session_split=false`,
+`repaired=false`, `degraded=null`, `steps=null`, no `thread_id`/`fragments`; and
+`_meta.run.rubric` resolves an empty selector to `"default:trajectory"` (§7.10 rubric mirror).
 
 ### 9.2 Rejects channel (spec 3.11.2)
 
@@ -4484,6 +4940,28 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
   // "annotate": {"sc_disagreements": 0}                       (self-consistency enabled)
   // "generate": {"buckets": {"<llm>×<style|null>": {"calls": 0, "produced": 0,
   //                                                 "survived_dedup": 0}}} (generate enabled)
+  // v1.13, ONLY when generate_stream.enabled — a sub-block INSIDE "generate", after
+  // "buckets"; counts-only, KEY SET AND KEY ORDER FROZEN (M6-owned counters, §7.5):
+  // "generate": {"buckets": {...},
+  //              "stream": {"sessions": 0,           // woven sessions, EXCLUDING duplicate tails
+  //                         "crossed_sessions": 0,   // = Σsurvivors − sessions_eff
+  //                         "sequences": {"<class>": {"planned": 0, "produced": 0}},
+  //                                                  // zero-based over [[classify.classes]] in
+  //                                                  // declaration order (report.classify form)
+  //                         "frames": 0,             // task frames (Σ steps of surviving sequences)
+  //                         "noise_frames": 0,       // frames actually woven in (< target when the
+  //                                                  //   draw pool ran out of non-full sessions)
+  //                         "duplicates": 0,         // re-sent sequences (after survivor clamping)
+  //                         "plan_calls": 0, "realize_calls": 0, "noise_calls": 0,
+  //                                                  // realize_calls counts halved sub-calls too
+  //                         "plan_failures": 0, "realize_failures": 0,
+  //                         "validator_scrapped": 0}}
+  // run block: + "artifact": {"path": "...", "sha256": "sha256:...", "lines": 0} (v1.13,
+  //            present ONLY when the artifact channel actually wrote — absent under dry-run
+  //            and with the form off; the main-output summary's shape, §7.10);
+  //            the "stream" block below does NOT appear under this form (it is segment's
+  //            surface) and report.classify's histogram is legitimately all-zero (labels are
+  //            inherited, zero verdict calls);
   // v1.7, ONLY when classify.enabled:
   // "classify": {"assignment": "single"|"multi", "classes": {"<name>": 0, ...},
   //              "fallback_count": 0, "failures": 0
@@ -4678,6 +5156,19 @@ envelope's viewpoint only — fan-out clones share the dict and never re-count i
 CONDITIONAL `report.stream` sub-blocks above. `counts.*` gains NOTHING: frame products
 never change an envelope status, so the conservation identity carries no new term (the
 v1.12 zero-change anchor).
+v1.13 additions (counter key names **[FROZEN HERE]**): the twelve `generate.stream.*` keys
+`sessions` / `crossed_sessions` / `sequences.<class>.planned` / `sequences.<class>.produced` /
+`frames` / `noise_frames` / `duplicates` / `plan_calls` / `realize_calls` / `noise_calls` /
+`plan_failures` / `realize_failures` / `validator_scrapped` (owner M6, §7.5), surfacing as the
+conditional `report.generate.stream` sub-block above. `report.run.artifact` is NOT a counter —
+M11 freezes the triple when it stages the artifact and M10 reads it back at report assembly
+(§7.10). `counts.*` gains NOTHING here either: the conservation identity takes the
+generate_only DEGENERATE form `emitted + dropped_dup + dropped_lowq + dropped_verify + failed
+= generated` (member frames are never enveloped, so `absorbed` / `dropped_noise` / `stitched` /
+`episodes` stay 0 and absent; noise and duplicate frames live only in the artifact and enter no
+ledger). The `resolved_at` identity is RESTATED rather than changed: "the sum = the number of
+RECORD-LEVEL annotation calls entering M5" — a per-class-schema call passes an explicit schema
+yet is user-treatment and IS counted (§7.7); frame-level and internal calls still are not.
 
 Counter OWNERSHIP (normative): `counts.*` keys are incremented ONLY by M10 (orchestrator),
 derived from batch tallies / EmitResult — stages must never touch them (double-count).
@@ -4688,6 +5179,9 @@ v1.8: likewise `counts.episodes` (len-delta around the segment stage) and
 increments any `counts.*` key.
 v1.9: likewise `counts.stitched` (post-emit tally) belongs to M10, and `counts.threads` is
 derived by M10 at report assembly — M16 never increments any `counts.*` key.
+v1.13: `counts.generated` under the time-stream form is likewise M10's — it is set from
+`len(product.envelopes)` after the `--limit` belt-and-braces truncation (§7.9); M6 owns only
+the `generate.*` stage-scoped keys.
 Stage-scoped keys are incremented only by their stage: `dedup.*` by M3, `quality.judgment_failures`
 by M4, `annotate.sc_disagreements` by M5, `generate.buckets.*` by M6 (`survived_dedup` = records
 surviving M6's own MinHash novelty filter against seeds + siblings; M3 still dedups generated
@@ -4707,6 +5201,50 @@ consumers judge run completeness by `report.run`: `interrupted=false` AND `circu
 (the exit code alone is insufficient — a graceful-SIGINT run delivers and exits 0), with
 `counts.unprocessed` quantifying the breaker-trip gap. Unwritable output
 (exit 4 at open) and unhandled crashes leave `.part`; graceful SIGINT finalize renames.
+v1.13: the stream artifact rides the SAME finalize batch and the same `_undeliverable`
+discipline (§7.10), so the guarantee above holds for it verbatim.
+
+### 9.5 Stream artifact (v1.13, spec §6.5)
+
+`{output_stem}.stream.jsonl` — the time-stream generation form's second product. UTF-8 JSONL,
+one row per frame, ROW ORDER = weave order (strictly increasing timestamps); the 1-based row
+number is exactly `_meta.stream.member_sources[].line_no`.
+
+```jsonc
+{"<stream.order_by's meta field name>": "<ISO-8601 timestamp, microsecond precision>",
+ "<input.text_field>": <string for a plain-text frame | object for a structured frame>,
+ "truth": {"session": 0,                 // whole-stream session ordinal, 0-based (duplicate
+                                         //   tail sessions included)
+           "sequence_class": "<class>",  // null on noise frames
+           "sequence": 0,                // 0-based ordinal WITHIN its class (the planning-phase
+                                         //   identity); null on noise frames AND duplicate copies
+           "frame_class": "<frame class>",  // null on noise frames
+           "noise": false                // true on inserted noise frames (which carry the three
+                                         //   nulls above)
+           [, "duplicate_of": 0]}}       // PRESENT ONLY on the frames of a re-sent sequence:
+                                         //   the ORIGINAL sequence's in-class ordinal
+```
+
+The `truth` key set is **[FROZEN HERE]**. Truth carries NO post-assembly ids (裁决·真值不携最终
+id): a member id hashes the row and a sequence id hashes the member ids, so embedding either
+would be circular — main output ↔ artifact reconcile through `member_sources` line numbers
+instead.
+
+Replay contract: the artifact IS a valid §6.1 text-modality input. Round-trippability is
+enforced at startup by the M1 artifact-key guard (§6.3 rule 51): `input.text_field` and the
+`order_by` timestamp field must be flat names (the row uses them verbatim as top-level keys, so
+a dotted path — legal per §6.1 — would make every replayed row a bad line), must differ from
+each other, and neither may be `"truth"` (the three artifact-row top-level keys are mutually
+exclusive). Copied to a project's
+`[run].input` with the SAME `[stream]` declaration (`order_by = "meta:<same field>"`, same
+`gap_s`) and segment on, it replays exactly — ① member `Record.id`s are byte-identical (M2's
+`sha256(canonical_json(raw))[:16]` over the same row object, because the generation side used
+the WHOLE ROW as `raw`); ② session splitting is identical (woven inter-session gaps are always
+> `gap_s`, intra-session gaps always <) and so are the `session_id`s (the M2 formula's input
+includes ALL frames of the session); ③ `truth` is an ordinary field to the ingest side — it
+participates in the id hash and in NO decision, and can be surfaced through
+`output.passthrough_fields` for comparison. An automated replay-and-score loop is an explicit
+non-goal (spec 2.1.2 ⑧).
 
 ---
 
@@ -5116,6 +5654,48 @@ The S7/R1 binding notes above apply unchanged (all keys required, nullable union
 (the §8.1 ¶ note); an out-of-range or non-integer `thread_ref` is resolved code-side to the
 conservative `new` outcome (§7.16), never a schema failure.
 
+v1.13 adds two M6 builders (verbatim from `labelkit/common/runtime/schema_engine.py`):
+
+```python
+def plan_schema(names: Sequence[str], length: int) -> dict:
+    # v1.13 M6 blueprint call (裁决·蓝图实现内部 Schema): one sequence's `length`-step plan —
+    # each step names its frame class (closed set = the frame class table) and a one-sentence
+    # brief for the realize call to expand. minItems = maxItems pins the step count
+    # (judgment_schema / frame_classify_schema precedent); NO uniqueItems — one frame class may
+    # legitimately recur within a sequence (R1: strict gateways hard-reject the keyword anyway).
+    return {"type": "object",
+            "properties": {"steps": {"type": "array",
+                "items": {"type": "object",
+                          "properties": {"frame_class": {"type": "string",
+                                                         "enum": list(names)},
+                                         "brief": {"type": "string"}},
+                          "required": ["frame_class", "brief"],
+                          "additionalProperties": False},
+                "minItems": length, "maxItems": length}},
+            "required": ["steps"], "additionalProperties": False}
+
+
+def realize_schema(step_schemas: Sequence[dict]) -> dict:
+    # v1.13 M6 frame-realization call: a POSITIONAL wrapper — frame i obeys the USER generation
+    # schema of blueprint step i's frame class (the caller passes {"type": "string"} for
+    # plain-text frames). `prefixItems` is a native draft 2020-12 keyword (jsonschema >= 4.21
+    # validates it directly — no translation layer at L2), `"items": False` seals the tail
+    # against over-long arrays, and minItems = maxItems pins the length once more. The user
+    # generation schemas pass through L0 verbatim — NO keyword allow-list lint (§7.7).
+    steps = list(step_schemas)
+    return {"type": "object",
+            "properties": {"frames": {"type": "array",
+                "prefixItems": steps,
+                "minItems": len(steps), "maxItems": len(steps),
+                "items": False}},
+            "required": ["frames"], "additionalProperties": False}
+```
+
+Both are INTERNAL schemas in the established sense (no `resolved_at` counting, no L2.5 hook,
+no `uniqueItems`). The keyword freeze covers the constructors' own scope plus the realize
+wrapper's skeleton keys; `realize_schema`'s positional sub-schemas are user-authored and are
+deliberately NOT linted (§7.7 keyword-freeze scope).
+
 ### 10.8 M13 classification prompt (spec 3.13.3, verbatim)
 
 ```
@@ -5407,6 +5987,117 @@ constants REUSED (`_LABEL_EXAMPLE_IN`/`_LABEL_EXAMPLE_OUT`/`_LABEL_SCREENSHOT`/
   member fails (`annotate_member` → None, §7.4).
 - Response validated against `cfg.frame_schema` through `complete_validated(schema=…)` —
   internal-schema treatment: no L2.5, no resolved_at (§7.4/§7.7).
+
+### 10.14 M6 blueprint prompt (spec 3.6.5, verbatim; v1.13)
+
+```
+system:
+  你是时间流数据规划器。给定任务描述与帧类表，为一条序列规划逐步蓝图：每一步选定一个帧类，并用一句话写明该步内容要点。
+  [任务] {class-effective generate.instruction}
+  [帧类表]
+  {name}: {description}                         ← 按 [[frame.classify.classes]] 声明序逐类一行
+  输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
+  {"steps": [{"frame_class": <帧类名>, "brief": <一句话要点>}, ...]}
+  字段说明：steps 恰为要求的步数，一步一项，按时间顺序排列；frame_class 必须取自 [帧类表] 中的帧类名；brief 用一句话写明该步内容要点，供逐帧实现展开。
+user:
+  请为一条「{sequence class name}」序列产出 {L} 步蓝图。
+```
+
+Module constants in `labelkit/operators/generate.py`, transcribed VERBATIM above and
+**[FROZEN HERE]**: `_PLAN_SYSTEM_HEAD`, `_PLAN_LABEL_TASK` (`[任务]`),
+`_PLAN_LABEL_FRAME_TABLE` (`[帧类表]`), `_PLAN_STRUCTURE`, and the composed
+`_PLAN_SYSTEM_STATIC` = the four joined by `"\n"` — the template's FULL static system
+scaffolding (the class instruction and the frame class table are config quantities, metered
+separately by M1's static budget precheck, §6.3 rule 56).
+`TEMPLATE_HEAD_TOKENS["generate_plan"] = 189 = est_text(_PLAN_SYSTEM_STATIC)` is pinned by the
+cross-layer equality test (§7.17). Assembly is
+`render_plan_prompt_texts(instruction, frame_classes, class_name, length) -> (system, user)`
+(public, §7.5); the four system parts join with `"\n"`, the frame-table rows join with `"\n"`
+inside the `[帧类表]` part. Binding notes:
+
+- The system section order is frozen: head → `[任务]` line → `[帧类表]` + rows → structure
+  block. The frame table is ALWAYS the whole table (the blueprint enum spans it — §6.3 rule 51
+  demands a generation instruction for every frame class precisely because any of them may be
+  picked).
+- On L0-off endpoints the structure block IS the structural guarantee, not a fallback: the
+  `{"steps": [...]}` shape sentence plus the per-field explanation carry compliance (the
+  DeepSeek anthropic route hard-rejects forced tool calls, so `supports_structured_output` is
+  false there — E2E-FINDINGS).
+- Response validated against `plan_schema(frame class names, L)` (§10.7) — internal treatment;
+  repair exhaustion voids THE SEQUENCE (no failed record, §7.5).
+
+### 10.15 M6 frame-realization prompt (spec 3.6.5, verbatim; v1.13)
+
+```
+system:
+  [任务] {class-effective generate.instruction}
+  [风格要求] {pre-drawn style prompt}            ← 无风格时整行省略（蓝图不带风格，实现才带）
+  输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
+  {"frames": [<第 1 帧内容>, <第 2 帧内容>, ...]}
+  字段说明：frames 恰为蓝图步数，一帧一项，与蓝图步序逐位对应；逐帧内容契约如下：
+  第 {i} 帧（{frame_class}）须符合：{contract}   ← 每步一行，i 自 1 起；contract = 该帧类生成
+                                                  Schema 的单行 dump，或字面量「自由文本一段」
+user:
+  {i}. [{frame_class}] {brief}                  ← 蓝图步逐行，i 自 1 起
+  请实现全部 {L} 帧内容。
+```
+
+Module constants in `labelkit/operators/generate.py`, transcribed VERBATIM above and
+**[FROZEN HERE]**: `_REALIZE_LABEL_TASK` (`[任务]`), `_REALIZE_LABEL_STYLE` (`[风格要求]`),
+`_REALIZE_STRUCTURE`, `_REALIZE_FREE_TEXT` (`自由文本一段`), and the composed
+`_REALIZE_SYSTEM_STATIC` = the three labels/blocks joined by `"\n"`.
+`TEMPLATE_HEAD_TOKENS["generate_realize"] = 95 = est_text(_REALIZE_SYSTEM_STATIC)` is pinned by
+the same cross-layer equality test (§7.17). Assembly is
+`render_realize_prompt_texts(instruction, style_prompt, steps, contracts) -> (system, user)`
+(public, §7.5). Binding notes:
+
+- The PER-POSITION contract lines are the structural contract on an L0-off endpoint (they
+  repeat the frame-class schema text once per step, which is why M1's realize precheck prices
+  `max(len_range upper bound) × max(schema text)`, §6.3 rule 56). A frame class without a
+  generation schema contributes the literal `自由文本一段`.
+- Under the reactive-overflow SEQUENCE HALVING (§7.5) the steps/contracts slices are re-rendered
+  with LOCAL 1-based numbering and `realize_schema` is rebuilt for the slice — the halves are
+  independent calls whose frame lists concatenate in span order.
+- Response validated against `realize_schema(step schemas)` (§10.7) — internal treatment for
+  the wrapper, verbatim pass-through for the user sub-schemas. A structured frame's object is
+  stored AS AN OBJECT in the artifact row's text field; `Record.text` takes its M2 projection
+  (canonical JSON), §9.5.
+
+### 10.16 M7 verdict-form sequence review prompt (spec 3.7.5, verbatim; v1.13)
+
+```
+system:
+  你是标注质量审核员。给定任务指令、成员帧摘要与标注结果，独立判断该序列（episode）的标注是否合格。
+  评审维度: ① 是否遵循任务指令 ② 与成员帧摘要证据的事实一致性 ③ 字段语义是否正确填写
+  {class-effective verify.extra_criteria}        ← 为空时整行省略
+  先逐维度给出简短意见，再给结论。
+  输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
+  {"critiques": [{"aspect": <维度>, "opinion": <一句话意见>}, ...],
+   "verdict": "pass"|"fail"}
+user (three text parts, in this order):
+  [任务指令] {class-effective annotate.instruction}
+  [成员帧摘要]
+  {m}. {frame_digest(member, 400)}               ← 每成员一行，m 自 1 起；总量超
+                                                    input.ui_tree_max_chars 时中段整行丢弃，
+                                                    以 …(truncated {N} members) 标记闭合
+  [标注结果] {json.dumps(annotation.output, ensure_ascii=False)}
+```
+
+Module constants in `labelkit/operators/verify.py`, transcribed VERBATIM above and
+**[FROZEN HERE]**: `_VERDICT_SEQ_SYSTEM_HEAD`, `_VERDICT_SEQ_SYSTEM_DIMS`,
+`_VERDICT_SEQ_SYSTEM_STRUCTURE`, `_LABEL_MEMBER_DIGESTS` (`[成员帧摘要]`), plus the REUSED
+`_SYSTEM_TAIL` (`先逐维度给出简短意见，再给结论。` — the §10.5 non-stream constant, same bytes)
+and `_MEMBER_DIGEST_MAX_CHARS = 400`. The system段 assembler is the public
+`verify_verdict_sequence_system_text(extra_criteria)` (§7.6). Binding notes:
+
+- NO defect table, NO `[边界余量]`, NO `[片段结构]`, NO screenshot parts — this variant is
+  reached ONLY from the classic path (`verdict_form=True`), never from the stream driver, so
+  the §10.5 defect-table variant stays byte-identical.
+- Response validated against the frozen `VERDICT_SCHEMA` (§10.7) — template and schema are
+  paired by construction (the defect-table variant's `defects` key is forbidden there).
+- The member-digest block is the ONLY trimmable slot under budget packing; `[标注结果]` and the
+  instruction are counted-never-trimmed (V25③), and an untrimmable floor over budget sets
+  `fit.overflow` (§7.6).
 
 ---
 
@@ -5888,5 +6579,60 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       `vision_resolved` parse product);
     - the new template sections are numbered §10.12/§10.13 AFTER the pre-existing
       §10.11 (same anchor-stability rationale as v1.7/v1.8/v1.9).
+33. **时间流生成冻结点** — v1.13 time-stream generation (feature spec
+    `docs/dev/SPEC-stream-generation.md`, adjudications recorded by NAME — 形态与分工 /
+    抽签消费顺序表 / 时间流工件通道 / 工件行即 raw / 真值不携最终 id / 工件行真值字段集 /
+    会话装箱定容 / 噪音只做插入与重复 / 量目标辖区 / 序列类约束按形态放宽 / 按类标注 Schema /
+    M8 显式待遇参数 / 蓝图实现内部 Schema / 用户生成 Schema 的 L0 待遇 / 直装评审判决形 /
+    轨迹准则自动解析扩展 / 生成键效力矩阵 / 序列相似度过滤 / 估算精确复演 /
+    golden 冻结锚不动 / 预算头两键 / 观测面 / members 呈现真值门 / 停放豁免精确化 /
+    织造上限静态校验 / meta_mode 护栏 / 帧类生成面 / 互斥语义答卷 / 示例工程形态 et al.;
+    2026-08-13). Key frozen points:
+    - **artifact row format & truth key set** (§9.5): `{<ts field>, <text_field>, "truth"}`
+      with truth keys `session` / `sequence_class` / `sequence` / `frame_class` / `noise`
+      [+ `duplicate_of` on re-sent frames ONLY] — a CLOSED set carrying NO post-assembly ids
+      (member ids hash the row, sequence ids hash the member ids ⇒ embedding either is
+      circular); the artifact is the FIFTH output channel `{output_stem}.stream.jsonl`,
+      delivered in the main output's finalize batch under the shared `_undeliverable`
+      discipline, never touched by dry-run (§7.10, spec §2.6's writable-object list gains its
+      fifth entry);
+    - **draw-order table** (§7.5): one `Random(f"{seed}:0:generate")`, three phases —
+      planning ①quota expansion in class-name lexicographic order (`--limit` truncates HERE)
+      ②per-sequence length ③per-sequence (llm, style) with the noise batches drawn in the same
+      predraw stream; dispatch consumes ZERO rng; weaving ④duplicate selection ⑤packing
+      shuffle + pairwise crossing ⑥per-crossed-session switch points ⑦per-noise-frame draws
+      ⑧duplicates as tail sessions (zero rng) ⑨timestamp laying. Test-pinned against drift;
+      determinism is conditional on the LLM content (voided sequences change the weave input);
+    - **M8 treatment parameter** (§7.7): `complete_validated(..., user_treatment: bool | None
+      = None)` — None keeps the pre-v1.13 `schema is None` inference (every pre-existing call
+      site unchanged), True means user treatment WITH an explicit schema (L2.5 + resolved_at
+      preserved — the per-sequence-class annotation schema route), False means internal. The
+      `stats` / §9.3 identity is restated as "the sum = RECORD-LEVEL annotation calls entering
+      M5"; the keyword-freeze sentence is rescoped to the LabelKit-side constructors plus the
+      realize wrapper's skeleton keys (user generation sub-schemas pass through L0 unlinted);
+    - **three new verbatim templates** §10.14 (blueprint) / §10.15 (frame realization, with
+      the per-position contract lines) / §10.16 (verdict-form sequence review), numbered AFTER
+      the pre-existing §10.13 (anchor stability); `TEMPLATE_HEAD_TOKENS` gains
+      `"generate_plan" = 189` / `"generate_realize" = 95`, test-pinned to `est_text` of the
+      corresponding frozen system scaffolding (§7.17);
+    - **two internal schema builders** `plan_schema` / `realize_schema` (§10.7) — the latter
+      uses native draft 2020-12 `prefixItems` + `"items": false`; no `uniqueItems`, no
+      resolved_at, no L2.5;
+    - **estimate & goldens** (§7.9): the generate_only branch replays M6's planning-phase pure
+      function EXACTLY (`records = Σsequences`, `generate_calls = 2 × records + ceil(noise /
+      num_per_call)`, `classify_calls = 0`); the estimate LINE FORMAT and the console key sets
+      are ZERO CHANGE, the seven pre-existing dry-run goldens stay BYTE-FROZEN, and only
+      `dryrun-synth-stream.txt` joins — eight goldens over five example directories / eight
+      projects;
+    - **observability** (§9.3): `report.generate.stream` (twelve counts-only keys, frozen key
+      order) + `report.run.artifact` (path/sha256/lines, present only when written);
+      `report.stream` does NOT appear; ZERO new trace channels, ZERO new events, ZERO new
+      error kinds (§8.1, spec §7.6) — voided sequences produce no StageError at all;
+    - **zero-change anchors**: Stage contract exceptions (the rich return value is still the
+      generate exception's "returns a new sub-batch" form, §4.3), the status machine, the
+      `_meta` top-level key order, the four-route exclusivity, the rejects surface, and the
+      conservation identity (generate_only degenerate form). With
+      `generate.stream.enabled = false` (the default) the whole system is byte-equivalent to
+      v1.12.
 
 — End of contract. —

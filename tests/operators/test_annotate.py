@@ -1656,3 +1656,173 @@ def test_frame_event_excerpt_discipline_by_tier():
         expected = json.dumps(long_output, ensure_ascii=False)[:200]
         assert payload["excerpt"] == {ep.members[0].id: expected}
         assert len(payload["excerpt"][ep.members[0].id]) == 200
+
+
+# ── v1.13 按序列类标注 Schema（裁决·按类标注 Schema，SPEC §3.4 六消费点）─────
+
+import pytest as _pytest
+
+from labelkit.operators.annotate import (
+    class_annotate_schema,
+    class_effective_schema,
+    class_schema_text,
+)
+
+CLASS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "task": {"type": "string"},
+        "kind": {"type": "string", "enum": ["book", "cancel"]},
+    },
+    "required": ["task", "kind"],
+    "additionalProperties": False,
+}
+
+CLASS_SCHEMA_TEXT = json.dumps(CLASS_SCHEMA, ensure_ascii=False,
+                               separators=(", ", ": "))
+
+
+def schema_cfg(**kw) -> ResolvedConfig:
+    """make_classified_cfg + 'writing' 类声明按类标注 Schema 覆盖；'qa' 类零
+    覆盖（schema=None）——两类共同构成「按类 vs 回落全局」的对照面。"""
+    base = make_classified_cfg(**kw)
+    views = dict(base.class_views)
+    views["writing"] = replace(views["writing"], schema=CLASS_SCHEMA)
+    return replace(base, class_views=views)
+
+
+class _SchemaRoutingEngine:
+    """记录每次 M8 调用的 (schema, user_treatment, record)；序列级用户 Schema
+    调用的既有形态是两者皆 None——v1.12 字节等价的判定面。"""
+
+    user_schema_text = SCHEMA_TEXT
+
+    def __init__(self, outputs=None):
+        self.calls = []
+        self._outputs = list(outputs or [])
+
+    async def complete_validated(self, profile, prompt, schema=None, *,
+                                 record_ids, batch_no, record=None,
+                                 user_treatment=None):
+        self.calls.append(_NS(profile=profile, prompt=prompt, schema=schema,
+                              user_treatment=user_treatment, record=record))
+        output = (self._outputs.pop(0) if self._outputs
+                  else {"task": "订票", "kind": "book"})
+        return output, Usage(1, 1), 1, "m"
+
+
+def test_class_effective_schema_single_point_and_three_fallbacks():
+    cfg = schema_cfg()
+    assert class_annotate_schema(cfg, "writing") == CLASS_SCHEMA
+    assert class_effective_schema(cfg, "writing") == CLASS_SCHEMA
+    # 三反例：零覆盖类 / 类表外未知类 / label 缺失 —— 全部回落全局 user_schema
+    for label in ("qa", "no_such_class", None):
+        assert class_annotate_schema(cfg, label) is None
+        assert class_effective_schema(cfg, label) is cfg.user_schema
+    # classify 关闭（class_views == {}）：任何标签都回落全局
+    plain = make_cfg()
+    assert class_annotate_schema(plain, "writing") is None
+    assert class_effective_schema(plain, "writing") is plain.user_schema
+
+
+def test_class_schema_text_computed_per_class():
+    cfg = schema_cfg()
+    ctx = _NS(cfg=cfg, schema_engine=_NS(user_schema_text=SCHEMA_TEXT))
+    # 按类现算（帧侧先例同款 canonical 单行 dump）
+    assert class_schema_text(ctx, "writing") == CLASS_SCHEMA_TEXT
+    # 无覆盖 ⇒ 沿用 M8 既有属性对象本身（字节等价）
+    assert class_schema_text(ctx, "qa") is SCHEMA_TEXT
+    assert class_schema_text(ctx, None) is SCHEMA_TEXT
+
+
+def test_class_schema_call_routes_explicit_schema_with_user_treatment():
+    cfg = schema_cfg()
+    engine = _SchemaRoutingEngine()
+    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(),
+              batch_no=1)
+    record = text_record()
+    item = PipelineItem(record=record,
+                        classification=_classification("writing"))
+    _asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
+
+    (call,) = engine.calls
+    assert item.status == "active" and item.annotation is not None
+    assert call.schema == CLASS_SCHEMA
+    assert call.schema is not cfg.class_views["writing"].schema   # 防御性拷贝
+    assert call.user_treatment is True          # L2.5 与 resolved_at 记账保留
+    assert call.record == record.raw            # L2.5 回调仍拿到原始映射
+    # 提示词 system 段内嵌按类现算的 Schema 文本，而非全局文本
+    system_text = call.prompt.messages[0].parts[0].text
+    assert system_text.endswith(CLASS_SCHEMA_TEXT)
+    assert SCHEMA_TEXT not in system_text
+
+
+def test_class_without_schema_keeps_v112_call_shape():
+    cfg = schema_cfg()
+    engine = _SchemaRoutingEngine()
+    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(),
+              batch_no=1)
+    zero_override = PipelineItem(record=text_record(),
+                                 classification=_classification("qa"))
+    unclassified = PipelineItem(record=text_record())       # classification None
+    _asyncio.run(AnnotateStage(cfg)._annotate_item(zero_override, ctx))
+    _asyncio.run(AnnotateStage(cfg)._annotate_item(unclassified, ctx))
+
+    for call in engine.calls:
+        # 既有推断路径：schema 与 user_treatment 都不传（v1.12 调用形字节等价）
+        assert (call.schema, call.user_treatment) == (None, None)
+        assert call.prompt.messages[0].parts[0].text.endswith(SCHEMA_TEXT)
+
+
+def test_self_consistency_vote_uses_class_effective_schema():
+    # 样本在 kind（按类 Schema 的枚举字段）上 1:2 分歧；全局 Schema 的可投票
+    # 字段（intent/difficulty 枚举）在样本中缺席 ⇒ 两条取值路线结论不同。
+    samples = [{"task": "A", "kind": "book"},
+               {"task": "B", "kind": "cancel"},
+               {"task": "C", "kind": "cancel"}]
+    cfg = schema_cfg(self_consistency=3)
+
+    engine = _SchemaRoutingEngine(list(samples))
+    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(),
+              batch_no=1)
+    ann = _asyncio.run(annotate_record(text_record(), ctx, label="writing"))
+    assert ann.output == {"task": "B", "kind": "cancel"}      # kind 多数派
+    assert ann.sc == {"n": 3, "agreement_ratio": 2 / 3}
+
+    engine2 = _SchemaRoutingEngine(list(samples))
+    ctx2 = _NS(cfg=cfg, schema_engine=engine2, metrics=_CapturingMetrics(),
+               batch_no=1)
+    ann2 = _asyncio.run(annotate_record(text_record(), ctx2, label="qa"))
+    assert ann2.output == {"task": "A", "kind": "book"}       # 无分歧，取样本 #1
+    assert ann2.sc == {"n": 3, "agreement_ratio": 1.0}
+
+
+def _structured_profile(context_window: int, name: str = "default"):
+    from labelkit.common.config.model import LLMProfile
+    return LLMProfile(name=name, provider="openai_compatible", base_url="http://x",
+                      model="m", api_key_env="K", max_output_tokens=256,
+                      context_window=context_window,
+                      supports_structured_output=True)
+
+
+def test_pack_prompt_schema_est_prices_class_effective_schema():
+    # V13③ 计价对象必须与调用 Schema 同源：巨大的按类 Schema 抬高 schema_est ⇒
+    # 单条文本记录在最小单元上 V10 溢出，注定失败的请求永不发出。
+    big = {"type": "object",
+           "properties": {"task": {"type": "string", "description": "凑" * 20000}},
+           "required": ["task"]}
+    base = make_classified_cfg()
+    views = dict(base.class_views)
+    views["writing"] = replace(views["writing"], schema=big)
+    cfg = _dc_replace(base, class_views=views,
+                      llm_profiles={"default": _structured_profile(30000)})
+    engine = _SchemaRoutingEngine()
+    ctx = budget_ctx(cfg, engine)
+
+    _asyncio.run(annotate_record(text_record(), ctx, label="qa"))
+    assert len(engine.calls) == 1                # 全局 Schema 计价 ⇒ 装填通过
+
+    with _pytest.raises(ContextOverflowError) as excinfo:
+        _asyncio.run(annotate_record(text_record(), ctx, label="writing"))
+    assert excinfo.value.phase == "precheck"
+    assert len(engine.calls) == 1                # 溢出发生在派发前

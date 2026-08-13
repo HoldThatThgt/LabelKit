@@ -82,6 +82,7 @@ from labelkit.operators.verify import (
     verify_sequence_system_text,
     verify_system_text,
     verify_user_text,
+    verify_verdict_sequence_system_text,
 )
 
 
@@ -2203,3 +2204,298 @@ def test_clone_surgery_ban_keeps_frame_products_untouched(monkeypatch):
     assert clone.member_annotations is ma and set(ma) == {"f0", "f1"}
     assert mc["f0"] is c0 and ma["f0"] is a0 and ma["f1"] is None
     assert cf_calls == [] and am_calls == []           # 无手术 ⇒ 无同步分支
+
+
+# ── v1.13 按序列类标注 Schema 在 V21 试装上的取值（裁决·按类标注 Schema）──────
+#
+# 修复路径的重标注本身经 annotate_record 的 label 自然穿透（M5 单点取值），M7
+# 侧唯一的消费点是升清换档的试装估算：提示词 Schema 文本与 schema_eff 计价都
+# 必须按类取值，否则试装与真实调用不同源。以下两例分别钉住文本侧与计价侧。
+
+CLASS_SCHEMA_BIG = {
+    "type": "object",
+    "properties": {"task_label": {"type": "string", "description": "凑" * 20000}},
+    "required": ["task_label"],
+}
+
+
+def _class_schema_cfg(*, structured: bool, annotate_cw: int) -> ResolvedConfig:
+    """_ladder_cfg + 两个序列类视图：'big' 声明巨大的按类标注 Schema，'plain'
+    零覆盖（回落全局 USER_SCHEMA）。annotate profile 的结构化输出开关可切——
+    关 ⇒ schema_eff 恒 None（只有提示词文本进计价），开 ⇒ 再计一份类有效
+    Schema。"""
+    base = _ladder_cfg(annotate_cw=annotate_cw)
+    profiles = dict(base.llm_profiles)
+    profiles["default"] = replace(profiles["default"],
+                                  supports_structured_output=structured)
+    views = {
+        name: ClassView(name=name, quality=base.quality, rubric=base.rubric,
+                        annotate=base.annotate, generate=base.generate,
+                        verify=base.verify, extract=base.extract, schema=schema)
+        for name, schema in (("big", CLASS_SCHEMA_BIG), ("plain", None))
+    }
+    classify = ClassifyConfig(
+        enabled=True, fallback_class="plain",
+        classes=(ClassSpec(name="big", description="按类 Schema 类"),
+                 ClassSpec(name="plain", description="零覆盖类")))
+    return replace(base, llm_profiles=profiles, classify=classify,
+                   class_views=views)
+
+
+def _ladder_kwargs(cfg, label, metrics):
+    """跑一次 V21 换档决策（零 LLM：试装只做估算，不发请求）。"""
+    from labelkit.operators.annotate import RepairContext
+
+    repair = RepairContext(previous_output={"task_label": "旧"}, critiques_text="c")
+    ctx = _ladder_ctx(cfg, SimpleNamespace(user_schema_text="{}"), metrics)
+    return VerifyStage(cfg)._repair_ladder(_episode([_frame("f0")]), ctx,
+                                           repair, label, None)
+
+
+def test_repair_ladder_trial_uses_class_schema_text():
+    # 结构化输出关 ⇒ schema_eff 恒 None：唯一变量是提示词内嵌的 Schema 文本。
+    # 按类 Schema 文本（2 万 CJK）本身就撑破紧窗口 ⇒ 升清被否决、保留 k 减半；
+    # 零覆盖类沿用 M8 既有 user_schema_text ⇒ 升清照常。
+    cfg = _class_schema_cfg(structured=False, annotate_cw=20_000)
+    metrics = _CapturingMetrics()
+    assert _ladder_kwargs(cfg, "big", metrics) == {"k_eff": 10}
+    assert "budget.escalations" not in metrics.counters
+
+    plain_metrics = _CapturingMetrics()
+    assert _ladder_kwargs(cfg, "plain", plain_metrics)["image_px"] == 1536
+    assert plain_metrics.counters["budget.escalations"] == 1
+
+
+def test_repair_ladder_prices_class_effective_schema():
+    # 宽窗口下按类 Schema 文本单独放得进（对照组：结构化输出关 ⇒ 升清照常）。
+    control = _class_schema_cfg(structured=False, annotate_cw=30_000)
+    assert _ladder_kwargs(control, "big", _CapturingMetrics())["image_px"] == 1536
+
+    # 结构化输出开 ⇒ schema_eff 再计一份类有效 Schema ⇒ 越预算，升清被否决。
+    cfg = _class_schema_cfg(structured=True, annotate_cw=30_000)
+    metrics = _CapturingMetrics()
+    assert _ladder_kwargs(cfg, "big", metrics) == {"k_eff": 10}
+    assert "budget.escalations" not in metrics.counters
+
+    # 同一 cfg 的零覆盖类按全局 user_schema 计价 ⇒ 升清照常（计价确按类取值）。
+    plain_metrics = _CapturingMetrics()
+    assert _ladder_kwargs(cfg, "plain", plain_metrics)["image_px"] == 1536
+    assert plain_metrics.counters["budget.escalations"] == 1
+
+
+# ── v1.13 判决形序列变体（裁决·直装评审判决形，§10.16）───────────────────────
+
+def _text_member(rid: str, text: str) -> Record:
+    return Record(id=rid, modality="text", text=text, raw={"text": text},
+                  ui_tree=None, image=None,
+                  ref=RecordRef("out/res.stream.jsonl", int(rid[0]), None, ()))
+
+
+def _assembled_sequence(n: int = 3) -> Record:
+    members = tuple(_text_member(f"{i}" * 16, f"帧内容第 {i} 句") for i in range(1, n + 1))
+    return Record(id="e" * 16, modality="text", text=None, raw=None, ui_tree=None,
+                  image=None, ref=members[0].ref, kind="sequence", members=members)
+
+
+def _verdict_cfg(*, policy="drop", max_repair_rounds=1,
+                 with_views=False) -> ResolvedConfig:
+    base = trace_cfg(enabled=False)
+    cfg = replace(base,
+                  run=replace(base.run, mode="generate_only", input=None),
+                  verify=VerifyConfig(enabled=True, llm="judge", policy=policy,
+                                      max_repair_rounds=max_repair_rounds))
+    if with_views:
+        view = ClassView(
+            name="faq", quality=cfg.quality, rubric=cfg.rubric,
+            annotate=AnnotateConfig(enabled=True, instruction="按类标注 faq。"),
+            generate=cfg.generate,
+            verify=VerifyConfig(enabled=True, llm="judge",
+                                extra_criteria="④ 序列连贯性"),
+            extract=cfg.extract)
+        cfg = replace(cfg, classify=ClassifyConfig(
+            enabled=True,
+            classes=(ClassSpec(name="faq", description="d"),)),
+            class_views={"faq": view})
+    return cfg
+
+
+def test_verdict_sequence_system_text_shape():
+    text = verify_verdict_sequence_system_text("")
+    assert text == (
+        "你是标注质量审核员。给定任务指令、成员帧摘要与标注结果，独立判断该序列"
+        "（episode）的标注是否合格。\n"
+        "评审维度: ① 是否遵循任务指令 ② 与成员帧摘要证据的事实一致性 ③ 字段语义是否正确填写\n"
+        "先逐维度给出简短意见，再给结论。\n"
+        "输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：\n"
+        '{"critiques": [{"aspect": <维度>, "opinion": <一句话意见>}, ...],\n'
+        ' "verdict": "pass"|"fail"}')
+    # 判决形不带缺陷词表（defects 键被 VERDICT_SCHEMA 禁止）
+    assert "缺陷类型" not in text and "defects" not in text
+    with_extra = verify_verdict_sequence_system_text("④ 额外准则")
+    assert "④ 额外准则\n先逐维度给出简短意见，再给结论。" in with_extra
+
+
+def test_verdict_form_prompt_sections_and_member_digests():
+    cfg = _verdict_cfg()
+    record = _assembled_sequence(3)
+    bundle = build_verify_prompt(record, {"intent": "问答"}, cfg,
+                                 verdict_form=True)
+    assert len(bundle.messages) == 2
+    system_text = bundle.messages[0].parts[0].text
+    assert system_text == verify_verdict_sequence_system_text("")
+    parts = bundle.messages[1].parts
+    assert [p.kind for p in parts] == ["text", "text", "text"]     # 无截图段
+    assert parts[0].text == "[任务指令] 给指令分类。"
+    digest_lines = parts[1].text.split("\n")
+    assert digest_lines[0] == "[成员帧摘要]"
+    assert digest_lines[1:] == ["1. 帧内容第 1 句", "2. 帧内容第 2 句",
+                                "3. 帧内容第 3 句"]
+    assert parts[2].text == '[标注结果] {"intent": "问答"}'
+    # 判决形无缺陷表/边界余量/片段结构三段
+    joined = "\n".join(p.text for p in parts)
+    assert "[边界余量]" not in joined and "[片段结构]" not in joined
+    assert "[动作序列]" not in joined
+
+
+def test_verdict_form_uses_class_effective_instruction_and_criteria():
+    cfg = _verdict_cfg(with_views=True)
+    bundle = build_verify_prompt(_assembled_sequence(), {"intent": "x"}, cfg,
+                                 label="faq", verdict_form=True)
+    system_text = bundle.messages[0].parts[0].text
+    assert "④ 序列连贯性" in system_text
+    assert bundle.messages[1].parts[0].text == "[任务指令] 按类标注 faq。"
+
+
+def test_verdict_form_off_keeps_defect_variant_byte_identical():
+    """verdict_form 缺省 False ⇒ 既有 §10.5 缺陷词表序列变体零改动（流式驱动器
+    调用面）。"""
+    cfg = _verdict_cfg()
+    record = _assembled_sequence()
+    bundle = build_verify_prompt(record, {"intent": "x"}, cfg,
+                                 boundary_margin="段首前 1: 无")
+    system_text = bundle.messages[0].parts[0].text
+    assert "缺陷类型" in system_text
+    assert any("[边界余量]" in (p.text or "")
+               for p in bundle.messages[1].parts if p.kind == "text")
+
+
+class _VerdictEngine:
+    """经典路径判决形桩：按 record_ids[0] 弹出既定判决对象（VERDICT_SCHEMA 形）。"""
+
+    def __init__(self, scripts):
+        self.scripts = {k: list(v) for k, v in scripts.items()}
+        self.calls: list = []              # (profile, prompt, schema, record_ids)
+
+    async def complete_validated(self, profile, prompt, schema=None, *,
+                                 record_ids=(), batch_no=0, record=None):
+        self.calls.append((profile, prompt, schema, record_ids))
+        out = self.scripts[record_ids[0]].pop(0)
+        if isinstance(out, Exception):
+            raise out
+        return out, Usage(), 1, "m"
+
+
+def _verdict_obj(verdict, critiques=None):
+    return {"critiques": critiques if critiques is not None
+            else [{"aspect": "指令遵循", "opinion": "一致"}],
+            "verdict": verdict}
+
+
+def test_classic_path_sequence_pairs_verdict_form_with_verdict_schema():
+    """直装序列（segment 关）走经典路径：prompt = 判决形模板 × schema =
+    VERDICT_SCHEMA（模板/schema 配对错位即 v1.12 的审计缺陷面）；fail ⇒
+    dropped_verify；VerificationResult.defects 恒空。"""
+    cfg = _verdict_cfg()
+    passing = PipelineItem(record=_assembled_sequence(), status="active",
+                           annotation=_annotation({"intent": "问答"}))
+    failing = PipelineItem(record=replace(_assembled_sequence(), id="f" * 16),
+                           status="active",
+                           annotation=_annotation({"intent": "错标"}))
+    engine = _VerdictEngine({"e" * 16: [_verdict_obj("pass")],
+                             "f" * 16: [_verdict_obj("fail")]})
+    metrics = _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
+                          rng=None, batch_no=1)
+    asyncio.run(VerifyStage(cfg).run([passing, failing], ctx))
+
+    for _, prompt, schema, _ids in engine.calls:
+        assert schema is VERDICT_SCHEMA
+        system_text = prompt.messages[0].parts[0].text
+        assert system_text.startswith(_VERDICT_HEAD)
+        assert "缺陷类型" not in system_text
+        assert any("[成员帧摘要]" in (p.text or "")
+                   for p in prompt.messages[1].parts)
+    assert passing.status == "active"
+    assert passing.verification.verdict == "pass"
+    assert passing.verification.defects == ()
+    assert failing.status == "dropped_verify"
+    assert failing.verification.defects == ()
+
+
+_VERDICT_HEAD = "你是标注质量审核员。给定任务指令、成员帧摘要与标注结果"
+
+
+def test_classic_path_sequence_repair_policy_reannotates(monkeypatch):
+    """修复 = 既有 policy 重标注（annotate_record 修复面穿透）：首轮 fail →
+    重标注 → 次轮 pass ⇒ active + 修复后标注落信封。"""
+    cfg = _verdict_cfg(policy="repair", max_repair_rounds=1, with_views=True)
+    item = PipelineItem(record=_assembled_sequence(), status="active",
+                        annotation=_annotation({"intent": "错标"}),
+                        classification=Classification(
+                            label="faq", labels=("faq",), source="inherited",
+                            detail={}))
+    engine = _VerdictEngine({"e" * 16: [_verdict_obj("fail"),
+                                        _verdict_obj("pass")]})
+    calls = _stub_annotate(monkeypatch, output={"intent": "修正"})
+    metrics = _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
+                          rng=None, batch_no=1)
+    asyncio.run(VerifyStage(cfg).run([item], ctx))
+
+    assert item.status == "active"
+    assert item.annotation.output == {"intent": "修正"}
+    assert item.verification.rounds == 2
+    (call,) = calls
+    assert call.label == "faq"                     # 修复穿按类取值面
+    assert call.record.kind == "sequence"
+
+
+def test_stream_driver_path_unperturbed_by_verdict_form():
+    """流式驱动器路径零改动：segment 开 ⇒ 序列走 §10.5 缺陷词表变体 +
+    defect_verdict_schema（判决形永不触发）。"""
+    cfg = _stream_cfg(policy="drop", extract_enabled=False)
+    members = [_frame("m1"), _frame("m2")]
+    batch = [_env(members[0]), _env(members[1]),
+             _episode(members, eid="e" * 16)]
+    engine = SeqJudgeEngine({"e" * 16: [_seq_obj("pass")]})
+    metrics = _CapturingMetrics()
+    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
+                          rng=None, batch_no=1)
+    asyncio.run(VerifyStage(cfg).run(batch, ctx))
+
+    ((_, prompt, schema, _ids),) = [engine.calls[0]]
+    assert schema == defect_verdict_schema()
+    system_text = prompt.messages[0].parts[0].text
+    assert "缺陷类型" in system_text
+    assert any("[边界余量]" in (p.text or "") for p in prompt.messages[1].parts)
+
+
+def test_verdict_form_budget_fit_trims_digest_block_only():
+    """v1.11 装填相容：判决形的唯一可裁槽位 = 成员摘要块（edges 裁剪计
+    truncations）；[标注结果] 恒计不裁；地板超预算 ⇒ overflow（V10）。"""
+    from labelkit.operators.verify import _PromptFit, _build_verdict_sequence_prompt
+
+    record = _assembled_sequence(30)
+    cfg = _verdict_cfg()
+    fit = _PromptFit(input_budget=260, image_cost=0)
+    bundle = _build_verdict_sequence_prompt(record, {"intent": "x"}, cfg,
+                                            ("指令", ""), fit)
+    assert fit.truncations == 1 and fit.overflow is False
+    digest_part = bundle.messages[1].parts[1].text
+    assert "…(truncated" in digest_part
+    assert digest_part.split("\n")[1] == "1. 帧内容第 1 句"    # 首行恒保留
+
+    tight = _PromptFit(input_budget=10, image_cost=0)
+    _build_verdict_sequence_prompt(record, {"intent": "x"}, cfg, ("指令", ""),
+                                   tight)
+    assert tight.overflow is True

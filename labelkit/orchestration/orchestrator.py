@@ -183,19 +183,35 @@ def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
     ``segment_calls`` 完全同源；帧分类实际按窗批量、帧标注跳过噪声成员，均 ≤
     帧总数），对应开关关闭 ⇒ 0；两键并入 ``total_calls``。键序冻结：
     frame_classify_calls 紧跟 classify_calls，frame_annotate_calls 紧跟
-    annotate_calls。"""
+    annotate_calls。
+    v1.13（裁决·估算精确复演）：``generate_stream.enabled`` 时 generate_only 分支
+    改走 M6 计划期纯函数的精确复演——records = Σsequences（limit 后）、
+    generate_calls = 2 × Σsequences + ⌈噪音帧数/num_per_call⌉（蓝图/实现/噪音全
+    折入既有键，行格式零改动）、classify_calls = 0（inherited 零调用）、quality/
+    annotate/verify 基数 = Σsequences、batches = ceil(records / batch_size)。"""
     g = cfg.generate
     if cfg.run.mode == "generate_only":
         n_ingested = 0
-        if g.seed_examples:
+        if cfg.generate_stream.enabled:
+            # v1.13（裁决·估算精确复演）：复用 M6 计划期纯函数吃 cfg + seed 精确
+            # 复演长度/噪音采样（非上界）——records = Σsequences（limit 后）、
+            # generate_calls = 蓝图 + 实现（各一序列一次）+ 噪音批
+            # ⌈噪音帧数/num_per_call⌉（三类调用全折入 generate_calls，行格式
+            # 零改动）。orchestration → operators 是既定依赖方向（懒导入）。
+            from labelkit.operators.generate import plan_stream
+            stream_plan = plan_stream(cfg, random.Random(f"{cfg.run.seed}:0:generate"))
+            gen_records = len(stream_plan.sequences)
+            gen_calls = 2 * gen_records + len(stream_plan.noise_plans)
+        elif g.seed_examples:
             gen_calls = _ceil_div(len(g.seed_examples) * g.num_per_record, g.num_per_call)
         else:
             gen_calls = _ceil_div(g.standalone_count or 0, g.num_per_call)
-        if cfg.limit is not None:
-            gen_calls = min(gen_calls, _ceil_div(cfg.limit, g.num_per_call))
-        gen_records = gen_calls * g.num_per_call
-        if cfg.limit is not None:
-            gen_records = min(gen_records, cfg.limit)
+        if not cfg.generate_stream.enabled:
+            if cfg.limit is not None:
+                gen_calls = min(gen_calls, _ceil_div(cfg.limit, g.num_per_call))
+            gen_records = gen_calls * g.num_per_call
+            if cfg.limit is not None:
+                gen_records = min(gen_records, cfg.limit)
     else:
         assert plan is not None, "process-mode estimate requires an IngestPlan"
         n_ingested = plan.estimated_records
@@ -259,7 +275,9 @@ def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
         downstream_base = total_records
 
     classify_calls = 0
-    if cfg.classify.enabled:
+    if cfg.classify.enabled and not cfg.generate_stream.enabled:
+        # v1.13：时间流形态的序列标签直接继承（inherited，v1.7 R11 幂等哲学）——
+        # classify_calls 恒 0，classify.enabled 只作类表载体。
         sc_c = cfg.classify.self_consistency
         if cfg.run.mode == "generate_only":
             base = gen_records
@@ -526,6 +544,10 @@ class Orchestrator:
             raise InternalError("generate_only mode requires a generate stage")
         # Pre-draw PRNG fixed at batch_no=0 (spec 3.10.3): Random(f"{seed}:0:generate").
         ctx0 = self._make_ctx(0, "generate")
+        if self.cfg.generate_stream.enabled:
+            # v1.13 时间流形态（SPEC-stream-generation §3.2/§3.6）分支。
+            await self._run_generate_stream(gen, ctx0)
+            return
         # The generation phase runs as a guarded task — same pattern as
         # _guarded_batch — so a SIGINT/SIGTERM can stop it: _request_stop's
         # 30 s timer cancels `self._current_task` (spec 3.10.3 中断 row;
@@ -561,6 +583,48 @@ class Orchestrator:
             self._batch_no += 1
             await self._guarded_batch(batch, self._batch_no, chain)
             del batch
+
+    async def _run_generate_stream(self, gen, ctx0: RunContext) -> None:
+        """v1.13 时间流形态驱动（SPEC-stream-generation §3.2/§3.6）：一次
+        ``generate_stream_all``（guarded task 形态沿平面路径——SIGINT 30 s 计时器
+        可取消；耗时照记 report.timing）→ 工件经 M11 工件通道落盘 →
+        ``counts.generated`` = 进链序列条数 → 直装信封按 batch_size 切批走 reflow
+        链（信封已带 session_id/classification/member_classifications，绝不
+        ``PipelineItem(record=r)`` 裸构造重建）。``--limit`` 已在 M6 计划期配额层
+        前缀截断，此处 belt & braces 再截一次。"""
+        task = asyncio.ensure_future(gen.generate_stream_all(ctx0))
+        self._current_task = task
+        t_gen = time.perf_counter()
+        envelopes: list[PipelineItem] = []
+        produced = False
+        try:
+            product = await task
+            envelopes = list(product.envelopes)
+            produced = True
+        except asyncio.CancelledError:
+            if not self._stop:
+                raise                              # external cancellation, not ours
+            # interrupted mid-generation: no product, no artifact, no batches;
+            # finalize still runs normally (interrupted=true).
+        finally:
+            self._current_task = None
+            elapsed = time.perf_counter() - t_gen
+            self._stage_time["generate"] = self._stage_time.get("generate", 0.0) + elapsed
+            self.metrics.add_stage_time("generate", elapsed)
+        if produced:
+            # 工件先于任何批派发落盘（.part + flush；finalize 与主输出同批改名）。
+            self.emitter.write_stream_artifact(list(product.artifact_lines))
+        if self.cfg.limit is not None:
+            envelopes = envelopes[: self.cfg.limit]
+        if envelopes:
+            self.metrics.count("counts.generated", len(envelopes))
+        chain = self._compose_chain(include_generate=False)
+        bs = self.cfg.run.batch_size
+        for i in range(0, len(envelopes), bs):
+            if self._stop:
+                break
+            self._batch_no += 1
+            await self._guarded_batch(envelopes[i:i + bs], self._batch_no, chain)
 
     # ── batch lifecycle ────────────────────────────────────────────────────
 
@@ -909,6 +973,11 @@ class Orchestrator:
             "config_digest": cfg.config_digest,
             "project_digest": cfg.project_digest,
         }
+        artifact = getattr(self.emitter, "artifact_summary", None)
+        if artifact:
+            # v1.13（裁决·观测面）：run 摘要族的工件条目（路径/sha256/行数，主输出
+            # 同款形态）——仅工件通道实际写入时在场（dry-run/形态关闭恒缺席）。
+            run_block["artifact"] = dict(artifact)
         if self._circuit_broken:
             # v1.6 熔断交付 (spec 6.4, 只增): partial_delivery present only on
             # breaker-trip delivery.
@@ -1133,6 +1202,30 @@ class Orchestrator:
                 buckets.setdefault(bucket, {"calls": 0, "produced": 0,
                                             "survived_dedup": 0})[field_name] = int(value)
             report["generate"] = {"buckets": buckets}
+            if cfg.generate_stream.enabled:
+                # v1.13（裁决·观测面）：stream 子块——counts-only，形态开启才在场；
+                # 键集与键序冻结；sequences 按声明类零基（report.classify.classes
+                # 同款），计数面由 M6 供给（generate.stream.* 前缀）。
+                report["generate"]["stream"] = {
+                    "sessions": c("generate.stream.sessions"),
+                    "crossed_sessions": c("generate.stream.crossed_sessions"),
+                    "sequences": {
+                        spec.name: {
+                            "planned": c(f"generate.stream.sequences.{spec.name}.planned"),
+                            "produced": c(f"generate.stream.sequences.{spec.name}.produced"),
+                        }
+                        for spec in cfg.classify.classes
+                    },
+                    "frames": c("generate.stream.frames"),
+                    "noise_frames": c("generate.stream.noise_frames"),
+                    "duplicates": c("generate.stream.duplicates"),
+                    "plan_calls": c("generate.stream.plan_calls"),
+                    "realize_calls": c("generate.stream.realize_calls"),
+                    "noise_calls": c("generate.stream.noise_calls"),
+                    "plan_failures": c("generate.stream.plan_failures"),
+                    "realize_failures": c("generate.stream.realize_failures"),
+                    "validator_scrapped": c("generate.stream.validator_scrapped"),
+                }
 
         if cfg.classify.enabled:
             # v1.7 §9.3 classify block: the classes histogram is zero-based

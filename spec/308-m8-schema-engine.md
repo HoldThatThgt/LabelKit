@@ -2,7 +2,7 @@
 
 ### 3.8.1 职责与边界
 
-**做：**持有经预校验的用户 Schema 与各内部小 Schema（裁决、评分、评审、生成输出；v1.7 增分类 `classification_schema(class_names, assignment, max_labels, with_reason)`——按 `classify.assignment` 二态、类名词表以 enum 硬约束，关键字集 ⊆ 既有内部 Schema 关键字集且**无 uniqueItems**：该关键字会被 OpenAI strict 模式与部分约束解码网关硬拒，重复标签由 classify 代码在 M8 验证后确定性归一化，全文见 3.13.3；**v1.8 增三项**——分段窗口 `segment_window_schema(frame_count, with_reason)`（M14，全文见 3.14.3）、动作 `action_schema()`（M15，11 值动作词表 enum 硬约束，全文见 3.15.3）、stream 缺陷评审 `defect_verdict_schema()`（M7 stream 分支，三顶键 `{critiques, defects, verdict}` + 缺陷词表——v1.8 五值，v1.9 起六值（+`wrong_stitch`，3.7.2），全文见 3.7.2）；**v1.9 增一项**——缝合判定 `stitch_schema()`（M16，五键 `{verdict, thread_ref, task_name, reason, confidence}` 全 required、thread_ref 可空联合，全文见 3.16.3）；**v1.12 增一项**——帧级批量判决 `frame_classify_schema(names, n)`（M13 帧粒度，单键 `{"labels": [enum×n]}`、`minItems = maxItems = n` 钉死窗内成员数组长度、帧标签词表 enum 硬约束，同族**无 uniqueItems**（帧标签本就允许重复）；长度/索引对齐后校验在代码侧（first-wins，缺项 ⇒ 该帧 `fallback_class`），全文见 3.13.7）。四者逐字 JSON 冻结于 CONTRACTS §10.7，规则同族：关键字集 ⊆ 既有内部 Schema 关键字集、同样**无 uniqueItems**（重复 index / 标签由调用方代码在 M8 验证后确定性收窄——3.14.4 的 first-wins 建表、3.13.4 的归一化行）；可选性一律以可空联合 type 数组 `["array","null"]` / `["string","null"]` 表达、**全键 required**（OpenAI strict 模式硬拒可选属性，L0 无条件透传 Schema）；`minItems = maxItems` 钉死窗口数组长度（judgment_schema 同款）。`defect_verdict_schema` 与既有评审 Schema **并存**——非 stream 评审路径继续用后者（回归锚，S7）。四者与其余内部 Schema 同级：不计入 `report.schema_engine.resolved_at`、不经过 L2.5）；提供「LLM 调用 → 合法 JSON 对象」的唯一入口 `complete_validated()`，内部实现四层结构保证；统计各层修复命中率。 
+**做：**持有经预校验的用户 Schema 与各内部小 Schema（裁决、评分、评审、生成输出；v1.7 增分类 `classification_schema(class_names, assignment, max_labels, with_reason)`——按 `classify.assignment` 二态、类名词表以 enum 硬约束，关键字集 ⊆ 既有内部 Schema 关键字集且**无 uniqueItems**：该关键字会被 OpenAI strict 模式与部分约束解码网关硬拒，重复标签由 classify 代码在 M8 验证后确定性归一化，全文见 3.13.3；**v1.8 增三项**——分段窗口 `segment_window_schema(frame_count, with_reason)`（M14，全文见 3.14.3）、动作 `action_schema()`（M15，11 值动作词表 enum 硬约束，全文见 3.15.3）、stream 缺陷评审 `defect_verdict_schema()`（M7 stream 分支，三顶键 `{critiques, defects, verdict}` + 缺陷词表——v1.8 五值，v1.9 起六值（+`wrong_stitch`，3.7.2），全文见 3.7.2）；**v1.9 增一项**——缝合判定 `stitch_schema()`（M16，五键 `{verdict, thread_ref, task_name, reason, confidence}` 全 required、thread_ref 可空联合，全文见 3.16.3）；**v1.12 增一项**——帧级批量判决 `frame_classify_schema(names, n)`（M13 帧粒度，单键 `{"labels": [enum×n]}`、`minItems = maxItems = n` 钉死窗内成员数组长度、帧标签词表 enum 硬约束，同族**无 uniqueItems**（帧标签本就允许重复）；长度/索引对齐后校验在代码侧（first-wins，缺项 ⇒ 该帧 `fallback_class`），全文见 3.13.7）。四者逐字 JSON 冻结于 CONTRACTS §10.7，规则同族：关键字集 ⊆ 既有内部 Schema 关键字集、同样**无 uniqueItems**（重复 index / 标签由调用方代码在 M8 验证后确定性收窄——3.14.4 的 first-wins 建表、3.13.4 的归一化行）；可选性一律以可空联合 type 数组 `["array","null"]` / `["string","null"]` 表达、**全键 required**（OpenAI strict 模式硬拒可选属性，L0 无条件透传 Schema）；`minItems = maxItems` 钉死窗口数组长度（judgment_schema 同款）。`defect_verdict_schema` 与既有评审 Schema **并存**——非 stream 评审路径继续用后者（回归锚，S7）。四者与其余内部 Schema 同级：不计入 `report.schema_engine.resolved_at`、不经过 L2.5）；**v1.13 增两项**——时间流生成的蓝图 `plan_schema(names, length)`（M6，单键 `{"steps": [{frame_class: enum, brief: string}]}`、`minItems = maxItems = length` 钉死步数、帧类名词表 enum 硬约束，同族**无 uniqueItems**（同一帧类在一条序列里本就可重复出现），全文见 3.6.5）与帧实现 `realize_schema(step_schemas)`（M6，**逐位包装器**：单键 `{"frames": [...]}`，第 i 位服从蓝图第 i 步帧类的用户生成 Schema——纯文本帧位取 `{"type": "string"}`；以 draft 2020-12 原生关键字 `prefixItems` 表达逐位约束（jsonschema ≥ 4.21 直接可校验、无翻译层）、`"items": false` 封尾禁超长、`minItems = maxItems` 再钉一次长度）；两者逐字 JSON 冻结于 CONTRACTS §10.7，与前述内部 Schema 同族同级。**用户生成 Schema 的 L0 待遇（v1.13）**：`realize_schema` 的逐位子模式是**用户手写**的帧类生成 Schema（`[frame.class.<name>.generate].schema_*`，M1 元校验），包装后随 L0 原样透传——**不做关键字白名单 lint**（与 `output.schema` 今日同款暴露面）；某些 strict 路由拒 `prefixItems` 的排障面是配置级 `supports_structured_output = false`，不新增调用级参数）；提供「LLM 调用 → 合法 JSON 对象」的唯一入口 `complete_validated()`，内部实现四层结构保证；统计各层修复命中率。 
 **不做：**不组装业务提示词（调用方传入完整 prompt）；不解释业务语义；不放行任何未通过校验的对象——这是它对全系统的硬契约。
 
 ### 3.8.2 四层保证与修复环
@@ -23,16 +23,30 @@
 - **帧标注**（M5 逐帧标注，3.5.5）：传入**用户声明的帧级 Schema** `cfg.frame_schema`（显式 schema 参数，裁决·帧 Schema 显式路由）——虽为用户 Schema 的同胞（M1 元校验 + few-shot 干跑，3.1.4），但按**内部 Schema 待遇**路由：L0–L3 四层全在、**无 L2.5**（`output.validator` 仅约束序列级用户 Schema 调用；帧级回调列 8.4 演进候选）、**不计 `resolved_at`**——保住 6.4 恒等式「resolved_at 加总 = 进入 M5 的记录数」不被帧调用污染。
 - **写前兜底**（M11，3.11.2）：emitter 对每个非 null 帧标注对象跑 `validate_only(obj, schema=cfg.frame_schema)`——通过 ⇒ status="annotated"，不通过 ⇒ 翻 "failed" + annotation 置 null + 计数，非法帧对象**永不落盘**（主输出 `validate_only` 终检的帧级镜像）。
 
+**显式待遇参数与三类路由声明（v1.13，裁决·M8 显式待遇参数）**：v1.12 的路由把「显式 schema 参数」与「内部 Schema 待遇」绑死，导致 v1.13 的按序列类标注 Schema 无处安放——它是用户 Schema 的另一份实例（记录级标注调用），却必须显式传参。裁决：`complete_validated` 增末位 additive keyword `user_treatment: bool | None = None` 把**待遇**与**传参方式**解耦——
+
+| 路由 | schema 参数 | user_treatment | L2.5 | `resolved_at` 记账 |
+|---|---|---|---|---|
+| 用户 Schema（全局 `output.schema`） | None（引擎持有） | None ⇒ 推断为真 | ✓（配置了 `output.validator` 时） | ✓ |
+| **按序列类标注 Schema（v1.13）** | 显式传该类 Schema | **True** | ✓ | ✓ |
+| 帧级 Schema 与全部内部 Schema | 显式传 | None ⇒ 推断为假（帧级/内部调用不显式传 True） | ✗ | ✗ |
+
+`None` 即现行 `schema is None` 推断 ⇒ **既有全部调用点零改动**；`stats` 的口径句相应重述为「**用户待遇族**调用」而非「schema 参数为 None 的调用」，§6.4 恒等式重述为「`resolved_at` 加总 = 进入 M5 的**记录级**标注调用数」（按类 Schema 的记录级标注照常计入，帧级标注仍不计——恒等式不被帧调用污染，6.4）。
+
 ### 3.8.3 API
 
 ```
 class SchemaEngine:
     def __init__(self, user_schema: dict, llm: LLMClient, cfg: OutputConfig): ...
     async def complete_validated(self, profile: str, prompt: PromptBundle,
-                                 schema: dict | None = None) -> dict:
+                                 schema: dict | None = None,
+                                 user_treatment: bool | None = None) -> dict:
         """schema=None 时用用户 Schema；内部 Schema（裁决/评分/评审/生成/分类（v1.7）/
-           分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9））由各 Stage 传入。
-           成功返回已通过 L2 的 dict；失败抛 SchemaViolation。"""
+           分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9）/帧级判决（v1.12）/
+           蓝图与帧实现（v1.13））由各 Stage 传入。
+           v1.13 user_treatment：None = 按 schema is None 推断（既有调用点零改动）；
+           True = 用户待遇（计 resolved_at + 启 L2.5）——按序列类标注 Schema 即此形；
+           False = 内部待遇。成功返回已通过 L2 的 dict；失败抛 SchemaViolation。"""
     def validate_only(self, obj: dict, schema: dict | None = None) -> list[str]:
         """M1 校验 few-shot 示例输出、M11 写出前终检用；v1.12：M11 帧标注写前
            校验经显式 schema=cfg.frame_schema 走同一入口（3.8.2 路由声明）。"""

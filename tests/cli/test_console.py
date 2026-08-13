@@ -644,13 +644,15 @@ def test_dry_run_rich_renders_estimate_tables(_finalize_renderers):
 
 # ── U24 layer ② — dry-run golden files (spec §7.8 回归锚 row) ───────────────
 #
-# The seven goldens under tests/cli/goldens/ keep the plain dry-run stderr
+# The eight goldens under tests/cli/goldens/ keep the plain dry-run stderr
 # byte-anchored forever: the original five date to the v1.9 HEAD baseline and
 # were re-captured at v1.12 (the estimate line gained the two frame keys —
 # 裁决·估算上界与六 golden); dryrun-mix.txt (the examples/mix UI main project,
 # both frame passes on) and dryrun-mix-text.txt (its pure-DeepSeek text
-# sibling) are the v1.12-born mix pair. Real example fixtures are scanned
-# (M2), but NO LLM call is made (dry-run).
+# sibling) are the v1.12-born mix pair; dryrun-synth-stream.txt is the
+# v1.13-born eighth (examples/synth-stream, the time-stream generate_only
+# form — 裁决·golden 冻结锚不动 keeps the seven older files byte-identical).
+# Real example fixtures are scanned (M2), but NO LLM call is made (dry-run).
 
 _EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
 _GOLDENS = Path(__file__).parent / "goldens"
@@ -664,6 +666,7 @@ _GOLDENS = Path(__file__).parent / "goldens"
     ("stream", "project-text.toml", "dryrun-stream-text.txt"),
     ("mix", "project.toml", "dryrun-mix.txt"),
     ("mix", "project-text.toml", "dryrun-mix-text.txt"),
+    ("synth-stream", "project.toml", "dryrun-synth-stream.txt"),
 ])
 def test_dry_run_plain_golden_files(subdir, project, golden,
                                     monkeypatch, tmp_path, capsys):
@@ -673,8 +676,11 @@ def test_dry_run_plain_golden_files(subdir, project, golden,
     monkeypatch.setenv("LABELKIT_DEEPSEEK_KEY", "dummy")  # mix 同款 dummy（v1.12）
     monkeypatch.chdir(_EXAMPLES / subdir)
     # examples/mix 独立成套（两工程同用本目录 config.toml——DeepSeek+z.ai
-    # 双端点，§3.8）；其余五例共享 ../config.toml。
-    config = "config.toml" if subdir == "mix" else "../config.toml"
+    # 双端点，§3.8）；examples/synth-stream 同样自含（单 profile DeepSeek——
+    # v1.13 的 E2E 端点由需求方指定，共享的 ../config.toml 是 z.ai）；
+    # 其余五例共享 ../config.toml。
+    config = ("config.toml" if subdir in {"mix", "synth-stream"}
+              else "../config.toml")
     code = main(["run", "--config", config, "--project", project,
                  "--output", str(tmp_path / "o.jsonl"),
                  "--dry-run", "--console", "plain"])

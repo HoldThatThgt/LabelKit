@@ -1,6 +1,6 @@
-# 第 8 章　读懂四个产物：主输出、_meta、拒绝通道与运行报告
+# 第 8 章　读懂五个产物：主输出、_meta、拒绝通道、运行报告与时间流工件
 
-> 一次运行最多产出四个文件。本章逐字段解读它们，并给出几个「拿到产物之后」的实用姿势：
+> 一次运行最多产出五个文件。本章逐字段解读它们，并给出几个「拿到产物之后」的实用姿势：
 > 后筛、对账、剥离元信息。
 
 ## 8.1 产物一览
@@ -13,6 +13,7 @@
 | `labels.rejects.jsonl` | `output.rejects ≠ "none"`（运行开始即创建；无淘汰时为 0 行空文件） | 拒绝通道：被淘汰记录的环节、原因与引用 |
 | `labels.report.json` | 恒有 | 运行报告：纯统计，无数据内容 |
 | `labels.trace.jsonl` | `trace.enabled = true` | 事件流（第 16 章专讲） |
+| `labels.stream.jsonl` | `[generate.stream].enabled = true`（v1.13，`--dry-run` 不写） | **时间流工件**：合成流的逐帧落盘（时间戳 + 文本 + 逐帧真值），行号即 `_meta.stream.member_sources[].line_no`；它是与主输出同级的数据输出通道，可当输入原样重放（第 27 章） |
 
 每条记录的终态决定它流进哪条路由；四条路由一图看全：
 
@@ -34,9 +35,9 @@ flowchart TD
     EVENTS["处理过程中的判定与调用事件（与终态正交）"] --> TRACE["trace 通道 labels.trace.jsonl<br/>（trace.enabled = true 时，第 16 章）"]
 ```
 
-注意 absorbed 成员帧与 stitched 壳只进报告计数、不落拒绝通道——它们的内容已由所属序列行经主输出承载（8.3 末尾与 8.4 的 `--strict` 交互提醒）。
+注意 absorbed 成员帧与 stitched 壳只进报告计数、不落拒绝通道——它们的内容已由所属序列行经主输出承载（8.3 末尾与 8.4 的 `--strict` 交互提醒）。v1.13 的时间流工件与 trace 一样**与终态路由正交**：它写的是合成流的每一帧（含从不成为信封的噪音帧与重发帧），不参与守恒恒等式；合成序列的终态照常走上面四条路由（第 27 章）。
 
-主输出的交付是**原子**的：运行中写 `labels.jsonl.part`，全部完成后 fsync + 改名。运行结束后仍看到 `.part` 文件，说明那次运行没走到交付——进程硬崩溃或输出路径不可写留下的残骸。注意：Ctrl-C 的**优雅中断**会正常收尾交付（`.part` 被改名、报告标记 `interrupted: true`），不留残骸；v1.6 起**熔断中止也交付**——已完成批的 `.part` 同样 fsync + 原子改名，退出码仍是 4（此前版本熔断直接丢弃 `.part`，长跑末段一次配额死亡就赔掉全部已完成产出）。
+主输出的交付是**原子**的：运行中写 `labels.jsonl.part`，全部完成后 fsync + 改名（时间流工件与它**同批** fsync + 改名，要么一起交付、要么一起留 `.part`）。运行结束后仍看到 `.part` 文件，说明那次运行没走到交付——进程硬崩溃或输出路径不可写留下的残骸。注意：Ctrl-C 的**优雅中断**会正常收尾交付（`.part` 被改名、报告标记 `interrupted: true`），不留残骸；v1.6 起**熔断中止也交付**——已完成批的 `.part` 同样 fsync + 原子改名，退出码仍是 4（此前版本熔断直接丢弃 `.part`，长跑末段一次配额死亡就赔掉全部已完成产出）。
 
 > **消费方判定规则变了（v1.6）**：最终文件名出现，仍然保证**已交付的每一行完整且合法**——永远读不到半截行；但它**不再等价于「全部输入处理完毕」**。判定一次运行是否完整，唯一可靠的信号是报告里的 `run.interrupted = false` **且** `run.circuit_broken = false`。退出码不充分：优雅中断的运行同样交付且以 0 退出，熔断交付则以 4 退出但文件照样出现。熔断交付的主输出是「已完成批的完整前缀」，缺了多少可拿 `counts.unprocessed` 对账（见 8.4 节）。下游若有自动消费流水线，把这条判定写进去。
 
@@ -115,7 +116,28 @@ flowchart TD
 ]
 ```
 
-读法三句：`label` 键仅帧分类开启时在场（segment 降格的 episode 全员 label=null）；`annotation` / `status` 两键仅帧标注开启时在场，`status` 闭集 `annotated | skipped | failed`——skipped = 该帧类按 `[frame.class.<名>.annotate].enabled = false` 跳过（本例 index 4 的支付处理过渡屏，帧类 transition），failed = 修复穷尽或写前帧 Schema 校验不过（annotation 置 null）；帧失败**不产生 rejects 行、不触发 `--strict`**，账在报告的帧子块（8.4）。完整读法与配置见第 25 章 25.6（文本帧路径的同款样例看姊妹工程输出 `out/mix-text-labels.jsonl`）。
+**v1.13 时间流生成的 `_meta.stream`**：合成流（第 27 章）的一行也是一条序列，`_meta.stream` 用的是同一族键但形态更简——`order_span` 是**工件路径 + 行号**、`members[]` 只有 `{index, id, label}` 三键（label 是生成期就已知的**帧类真值**，没有 annotation / status 列）、`steps` 恒 `null`（extract 不参与）、`thread_id` / `fragments` 不出现（stitch 不参与）。真实样例（`examples/synth-stream` 本次真跑主输出第 1 行，节选）：
+
+```json
+"source": {"file": "out/synth-labels.stream.jsonl", "line_no": 8, "generated_from": [],
+            "fields": {}, "generator": {"llm": "default", "style": null}},
+"stream": {
+  "episode_id": "dca32faee082d938", "session_id": "6a83d9760c7f5194",
+  "order_span": ["out/synth-labels.stream.jsonl:8", "out/synth-labels.stream.jsonl:11"],
+  "member_count": 4,
+  "member_ids": ["0b70aaa3d93519fa", "b80f10ebf46cf54f", "27728a4084747378", "37e2d24d2fbf7990"],
+  "member_sources": [{"file": "out/synth-labels.stream.jsonl", "line_no": 8}, …共 4 项],
+  "members": [{"index": 0, "id": "0b70aaa3d93519fa", "label": "task_request"},
+               {"index": 1, "id": "b80f10ebf46cf54f", "label": "followup"},
+               {"index": 2, "id": "27728a4084747378", "label": "followup"},
+               {"index": 3, "id": "37e2d24d2fbf7990", "label": "confirmation"}],
+  "session_split": false, "repaired": false, "degraded": null, "steps": null
+}
+```
+
+`source.file` 指向的是**时间流工件**（合成品的溯源判据仍是 `generator ≠ null`），拿 `member_sources[].line_no` 能把每一帧回查到工件行；`session_id` 与 `episode_id` 不等就说明这个会话里还有别的帧（噪音帧，或交叉进来的另一条序列）。同一份主输出里**不同序列类的行字段集可以不同**（按类标注 Schema，第 27 章 27.6），下游按 `_meta.classification.label` 分流后再解析。
+
+回到 v1.12 的帧粒度，读法三句：`label` 键仅帧分类开启时在场（segment 降格的 episode 全员 label=null）；`annotation` / `status` 两键仅帧标注开启时在场，`status` 闭集 `annotated | skipped | failed`——skipped = 该帧类按 `[frame.class.<名>.annotate].enabled = false` 跳过（本例 index 4 的支付处理过渡屏，帧类 transition），failed = 修复穷尽或写前帧 Schema 校验不过（annotation 置 null）；帧失败**不产生 rejects 行、不触发 `--strict`**，账在报告的帧子块（8.4）。完整读法与配置见第 25 章 25.6（文本帧路径的同款样例看姊妹工程输出 `out/mix-text-labels.jsonl`）。
 
 `meta_mode = "sidecar"` 时主输出是纯用户结构，`_meta` 逐行写 `{stem}.meta.jsonl`，行序与主输出对齐、以 id 关联。`none` 则彻底不产元信息——分数与溯源都没了，除非下游明确拒绝任何附加字段，否则别选它。
 
@@ -263,10 +285,28 @@ v1.12（帧级分类与标注，第 25 章 25.6）再增两个按需出现的子
 
 帧失败**不改变** `counts`、不产生 rejects 行（rejects 的 stage/reason 词表零新增）、不触发 `--strict`：members[] 的状态位加这两个子块就是帧粒度的全部账面（第 18 章的排查口径）。
 
+v1.13（时间流生成，第 27 章）再增两处按需出现的字段（形态关闭时报告与 v1.12 逐字段一致），另外**不出现** `stream` 节（那是分段算子的观测面，别拿它对账合成流）：
+
+- **`run.artifact`**（仅工件实际写出时在场）：`{path, sha256, lines}`——与主输出同款的摘要三件套，拿 `lines` 与 `generate.stream` 的帧数对账。本次真跑：`{"path": "out/synth-labels.stream.jsonl", "sha256": "sha256:3b444935…", "lines": 29}`；
+- **`generate.stream`** 子块（仅形态开启时在场，counts-only）：
+
+```json
+"stream": {
+  "sessions": 5, "crossed_sessions": 1,
+  "sequences": {"ticket_booking": {"planned": 3, "produced": 3},
+                 "smart_home":     {"planned": 3, "produced": 3}},
+  "frames": 23, "noise_frames": 2, "duplicates": 1,
+  "plan_calls": 6, "realize_calls": 6, "noise_calls": 1,
+  "plan_failures": 0, "realize_failures": 0, "validator_scrapped": 0
+}
+```
+
+读法：`planned` vs `produced` 的差额 = 作废序列数（三项 failures + 序列相似度过滤淘汰）；`sessions` **不含**重发的流尾会话（29 行工件 = 23 任务帧 + 2 噪音帧 + 4 重发帧，共 6 个会话）；`crossed_sessions = Σ幸存 − sessions`，作废多了它会退化为 0。同一次运行里 `classify` 节的逐类计数**恒全零**（标签在生成期已知、直接继承，零判决调用）——这是预期，不是分类失灵。
+
 > **报告写失败怎么办**：主输出成功、报告写失败时，进程以退出码 1 结束——产物可用但账本缺失，别当成功处理。
 
 ## 8.5 产物管理的三个提醒
 
 1. **同一输出路径重跑会覆盖全部产物**。trace 文件在**首个事件写出时**截断——死于配置或输入校验的运行不会碰它，但正常启动的重跑会。正式任务建议输出文件名带日期/批次号：`out/ime-intent-0703.jsonl`；
 2. **`--dry-run` 的产物写独立文件**：`{stem}.dryrun.report.json` 与 `{名}.dryrun{后缀}` 的 trace，不会覆盖上一次真实运行的账本，放心 dry-run；
-3. **rejects=full / trace 高档位的文件里有数据**，清理和保管是你的责任——LabelKit 只在你显式选择时才写它们。
+3. **rejects=full / trace 高档位的文件里有数据**，清理和保管是你的责任——LabelKit 只在你显式选择时才写它们。v1.13 的时间流工件同理**是一份数据文件**（合成出来的每一帧都在里面），但它是这个形态的正式产物、不是副本：主输出只承载序列级标注，成员帧内容只有工件里有——要重放或要逐帧材料就得留着它（第 27 章）。

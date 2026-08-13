@@ -181,16 +181,17 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
 | 节 | 可按类覆盖 | 锁定全局（及理由） |
 |---|---|---|
 | `[class.*.quality]` | `mode`、`rounds`、`rubric`（含 `[class.*.rubric]` 内联子表）、`threshold`、`selection`、`top_ratio` | `llm` / `judges` / `both_orders` / `criteria_per_call` / `on_unscored`——LLM 绑定属部署与成本面，类间差异优先用 rubric 表达 |
-| `[class.*.annotate]` | `instruction`、`examples` | `llm` / `self_consistency` / `sc_temperature` |
-| `[class.*.generate]` | `instruction`、`styles`、`num_per_record`、`temperature` | `llms` / `mixture` / `weights` / `seeds_per_call` / `num_per_call` / `sample_validator` |
+| `[class.*.annotate]` | `instruction`、`examples`、**`schema_path` / `schema_inline`**（至多其一，v1.13） | `llm` / `self_consistency` / `sc_temperature` |
+| `[class.*.generate]` | `instruction`、`styles`、`num_per_record`、`temperature`；v1.13 时间流形态另加 **`sequences` / `len_range`**（该形态下 `num_per_record` / `seeds_per_call` 反过来禁设，第 27 章 27.4） | `llms` / `mixture` / `weights` / `seeds_per_call` / `num_per_call` / `sample_validator` |
 | `[class.*.verify]` | `extra_criteria` | `llm` / `judges` / `policy` / `max_repair_rounds` |
-| —— | —— | `run.*` / `input.*` / `dedup.*` / `classify.*` / `output.*` / `trace.*` **从不按类**——尤其输出 Schema 全局唯一，所有类的产出行必须长一个样 |
+| —— | —— | `run.*` / `input.*` / `dedup.*` / `classify.*` / `trace.*` 与 `[output]` 的其余键 **从不按类**——输出通道的形态（`meta_mode`、`rejects`、修复预算、`validator`）是运行级契约 |
 
-白名单之外，三条合并细则值得知道：
+白名单之外，四条合并细则值得知道：
 
 1. **选择组按组合并**：threshold 和 top_ratio 本是互斥对（第 10 章）。类里显式提供 `selection` / `threshold` / `top_ratio` 任何一个，合并视图就**整组换掉**全局侧的互斥对键——所以「全局 threshold + 某类 top_ratio」是合法组合，不会误报互斥；
 2. **rubric 按类重解析**：类可以换整把尺子（`rubric = "default:ui"` 或配 `[class.X.rubric]` 内联子表）；pointwise 的 6 级量表校验跑在「类有效 mode × 类有效 rubric」的组合上。`[class.X.rubric]` 子表在场但该类 selector 不是 `"inline"` 时，子表被忽略并打 warning（与全局同一惯例）；
-3. **类 examples 启动干跑**：`[class.X.annotate.examples]` 的 output 一样要过全局 Schema（与 validator）校验，错误信息会精确定位到 `[[class.<类名>.annotate.examples]][N]`。
+3. **输出 Schema 按类重解析**（v1.13）：`[class.X.annotate].schema_path` / `schema_inline` 至多其一，语义是**整份覆盖**（不做字段级合并）；每份类 Schema 各自过 draft 2020-12 元校验与 `_meta` 禁令，落盘前 emitter 按该行类的有效 Schema 再纯校验一次。这条与全局 Schema 待遇完全相同——代码回调校验层照常生效、`resolved_at` 照常记账（第 14 章 14.5 的三 Schema 对照表）；
+4. **类 examples 启动干跑**：`[class.X.annotate.examples]` 的 output 一样要过 Schema（与 validator）校验，错误信息会精确定位到 `[[class.<类名>.annotate.examples]][N]`。v1.13 起干跑用的是**该类的有效 Schema**（类声明了就用类的），修掉了旧版「类示例统一过全局 Schema」的错配。
 
 ## 24.5 纯打标模式：一个覆盖都不配
 
@@ -239,7 +240,9 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
 }
 ```
 
-三个细节：其一，`classification` 只落 `label` / `labels` / `source` 三键——判决理由和自洽采样统计不落主输出，要看去 trace（`classify.decision` 事件）；其二，`scores.pool` 与 `classification.label` 恒相等，pool 是打分池的自述，pairwise 模式下「批内相对分」从此变成「**池内**相对分」（见 24.7）；其三，输出 Schema 是全局的——类只改工艺，不改产出结构：本次真跑回流的合成样本带着种子的类标签（`source="inherited"`）、按类指令标注，但 `intent` 字段仍由标注算子从全局枚举里独立选出。
+三个细节：其一，`classification` 只落 `label` / `labels` / `source` 三键——判决理由和自洽采样统计不落主输出，要看去 trace（`classify.decision` 事件）；其二，`scores.pool` 与 `classification.label` 恒相等，pool 是打分池的自述，pairwise 模式下「批内相对分」从此变成「**池内**相对分」（见 24.7）；其三，本工程的输出 Schema 是全局的——类只改工艺、不改产出结构：本次真跑回流的合成样本带着种子的类标签（`source="inherited"`）、按类指令标注，但 `intent` 字段仍由标注算子从全局枚举里独立选出。
+
+**「产出结构必须全局唯一」这条在 v1.13 松开了。**`[class.<类名>.annotate]` 的白名单增加了 `schema_path` / `schema_inline`（24.4 的表与合并细则 3）：声明了就用类的、没声明的类回落全局。这解的是一类真实困境——类与类要抽的**字段集本就不同**（购票要出发地/目的地/日期，设备控制要设备/动作/位置），逼它们共用一份 Schema 只有两条烂路：写成并集（每类填一半空字段）或退化成宽松对象（等于没有结构约束）。代价是下游契约变了：**同一份主输出里不同类的行字段集可以不同**，按 `_meta.classification.label` 分流后再解析——这与 multi 扇出改变行唯一键是同级的通知事项。真实对照（两份字段集互不相同的产物行）见第 27 章 27.6。至于**永远不按类**的那些：`run.*` / `input.*` / `dedup.*` / `classify.*` / `trace.*` 与 `[output]` 的其余键——它们是运行级契约（一次运行只有一个输出通道、一套去重口径、一份分类器），不是「加工工艺」。
 
 **拒绝通道**每行多一个 `label` 键（真实运行产物第 1、3 行，逐字）：
 
@@ -283,7 +286,7 @@ jq -r '._meta | "\(.label)\t\(.stage)/\(.reason)"' out/text-labels.rejects.jsonl
 
 ## 24.7 调优与排障
 
-**三种 `source`，先分清谁是谁。**`"llm"` = 分拣员正常判决（含主动选中兜底类——本次真跑那条笑声进 other 就是 `source="llm"`，所以 `fallback_count=0`）；`"fallback"` = 分类输出经结构修复耗尽仍非法、被**兜底机制**塞进 `fallback_class`；`"inherited"` = generate 按类生成的样本天生带标签、回流时幂等跳过分类（零额外调用）。诊断口径：`report.classify.fallback_count` 持续偏高，说明的不是「数据难分」而是「**分类调用的输出结构不稳**」或类别表口径盖不住数据——先查 trace 的 error 事件，再审 description。
+**三种 `source`，先分清谁是谁。**`"llm"` = 分拣员正常判决（含主动选中兜底类——本次真跑那条笑声进 other 就是 `source="llm"`，所以 `fallback_count=0`）；`"fallback"` = 分类输出经结构修复耗尽仍非法、被**兜底机制**塞进 `fallback_class`；`"inherited"` = generate 按类生成的样本天生带标签、回流时幂等跳过分类（零额外调用；v1.13 时间流生成的序列同理——整条链上一次分类调用都不发，所以那种工程的 `report.classify` 逐类计数**恒全零**，是预期不是失灵，第 27 章）。诊断口径：`report.classify.fallback_count` 持续偏高，说明的不是「数据难分」而是「**分类调用的输出结构不稳**」或类别表口径盖不住数据——先查 trace 的 error 事件，再审 description。
 
 **`classification_invalid` 的两副面孔**（对应 `classify.on_error`）：
 

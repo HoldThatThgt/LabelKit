@@ -1,0 +1,265 @@
+# 时间流生成工程（spec v1.13，run.mode = "generate_only" + [generate.stream]）——
+# 无输入数据，从零合成一条**带时间戳的多会话请求流**，再让合成出来的序列直接走
+# 同一条治理管线。与 examples/text/project-synth.toml（种子池平面生成）的差别在
+# 产物形状：那边一次生成一条独立文本，这边一次生成一条**序列**，并把多条序列机械
+# 地交织成时间流。
+#
+# 链序：generate 时间流形态（蓝图 → 帧实现 → 机械交织）→ dedup（序列级判重）→
+# classify（标签在生成期已知，inherited，零判决调用）→ quality（default:trajectory
+# 轨迹打分 + 阈值门）→ annotate（**按序列类各用一份独立 Schema**）→ verify（判决形
+# 评审 + 修复）→ emit。segment / stitch / extract 不参与（流是生成出来的，不需要
+# 再切分；抽取仅 UI 模态）。
+#
+# LLM 只做两类内容调用——一序列一次**蓝图**（定步数、定每步帧类与要点）、一序列
+# 一次**帧实现**（按蓝图逐位产出帧内容），外加噪音帧的批量生成；会话装箱、交叉、
+# 噪音插入、重复重发、时间戳铺设全部由机械交织器（零 LLM）完成，同 seed 双跑逐
+# 字节一致。本工程的调用量 = 2 × 6 序列 + ⌈噪音帧数 / num_per_call⌉ 批噪音，精确
+# 数值可用 --dry-run 复演（估算与真跑同源同一套计划期纯函数）。
+#
+# 会话账（Σsequences = 2 类 × 3 = 6，sessions = 5）：交叉会话数 = 6 − 5 = 1（一个
+# 会话里两条序列交错出现，形如 A 段 + B 段 + A 余段），其余 4 个会话各装一条序列；
+# 重复重发的 1 条序列另落**流尾新会话**，故工件里共 6 个会话。
+#
+# 两份产物：
+#   out/synth-labels.jsonl         主输出（每行 = 一条序列的标注结果 + _meta）
+#   out/synth-labels.stream.jsonl  **时间流工件**（每行 = 一帧，含 ts / 文本 /
+#                                  truth 真值三件套），行号即 _meta.stream 的
+#                                  member_sources.line_no，可双向对账
+#
+# 工件即输入格式：把它拷成某个工程的 [run].input，配上同样的 [stream]
+# （order_by = "meta:ts"、gap_s = 900）就能按 examples/stream 的形态原样重放——
+# 交织器铺的会话间隔恒 > gap_s，摄取侧会切出与生成侧完全一致的会话。truth 字段
+# 不参与任何判定，需要时经 [output].passthrough_fields 透传出来做对照。
+#
+# 重复序列的判重演示位在**重放**，不在本次运行：重发帧只活在工件里（不构造信封），
+# 因此本次运行的守恒账里既没有它、也不会出现 dropped_dup。把工件重放（process
+# 模式 + segment）时，重发会话与原会话命中判重落 dropped_dup（实测：29 帧 → 6 会话
+# → 6 episode，dropped_dup = 1）；命中档位取决于原会话的噪音帧是否被 segment 剔除
+# ——剔除则两侧成员文本逐字节相同走 exact，被吸收则原 episode 多一帧走 near_text
+# （实测即此档）。重放时加 --strict 则预期退出码 1（有 rejects）。
+#
+# 运行（out/ 不入库，须先建；密钥见仓库根 .env，只经 api_key_env 名引用）：
+#   mkdir -p out && set -a && source ../../.env && set +a
+#   uv run labelkit run --config config.toml --project project.toml
+schema_version = 1
+
+[run]
+output = "./out/synth-labels.jsonl"
+modality = "text"                 # 时间流生成恒 text 模态（UI 模态为 v1.13 非目标）
+mode = "generate_only"
+batch_size = 8                    # 6 条序列 ⇒ 一批跑完
+seed = 20260813                   # 交织器单流抽签的唯一随机源：同 seed 双跑逐字节一致
+
+[input]
+text_field = "text"               # 工件行的文本字段名（重放时 M2 按同一声明提取）
+
+[stream]                          # 生成侧的铺设契约（复用摄取侧词汇，故可重放）
+order_by = "meta:ts"              # 工件行的时间戳字段名由此声明（此处即 "ts"）
+gap_s = 900                       # 会话间隔恒 > 15 分钟；会话内帧间隔见 frame_gap_s
+
+[dedup]
+enabled = true                    # 序列级判重（成员文本按序拼接的 episode 配方）。
+                                  # 本次运行里六条序列各不相同，预期 dropped_dup = 0；
+                                  # 重复重发的那条只活在工件，判重演示位在重放。
+                                  # 本节三键（minhash_threshold / minhash_num_perm /
+                                  # ngram）同时是 M6 交织前序列相似度过滤的参数。
+
+[generate]
+enabled = true
+llms = ["default"]
+num_per_call = 4                  # 本形态下仅噪音批量生成按此装箱（一批 4 条噪音）
+temperature = 0.9                 # 蓝图与帧实现同温；合成需要多样性——温度过低会让
+                                  # 同类的三条序列彼此近重，被序列相似度过滤淘汰
+# 注：seed_examples / standalone_count / num_per_record / seeds_per_call 属平面生成
+# 形态，本形态显式书写它们是 CONFIG_ERROR——配额由 [class.*.generate].sequences 承载。
+
+[generate.stream]
+enabled = true
+sessions = 5                      # 会话数；交叉会话数 = Σsequences − sessions = 1
+noise_ratio = 0.1                 # 噪音帧 / 任务帧 ≈ 10%，帧数 = round(比例 × 任务帧数)
+noise_instruction = """
+生成与任何任务都无关的干扰输入：用户随口说的闲聊、感叹、纯语气词或跑题的一句话
+（如聊天气、聊心情、无意义的重复字），长度 5–20 字，不得包含任何可执行的诉求。
+"""
+duplicates = 1                    # 原样重发 1 条序列（逐字节同源）到流尾新会话
+frame_gap_s = [5, 60]             # 会话内帧间隔均匀采样（秒）；上界须 < stream.gap_s
+ts_start = "2026-01-05T09:00:00+08:00"   # 时间流起点（恒不取墙钟——双跑一致）
+
+[classify]
+enabled = true                    # 类表是配额与按类条件化的载体；生成侧标签直接继承
+                                  # （inherited，零判决调用 ⇒ report.classify 直方图
+                                  # 恒全零是预期），本形态下 ≥1 类即可、fallback 免填
+
+[[classify.classes]]
+name = "ticket_booking"
+description = "高铁购票类会话：查车次、订票、改签退票、选座与票务证件等围绕一次铁路出行的连续请求"
+
+[[classify.classes]]
+name = "smart_home"
+description = "智能家居指令类会话：控制灯光空调窗帘等设备、设定定时与场景、查询设备状态的连续指令"
+
+# ── 按类生成：配额 + 长度区间 + 该类的内容指令 ──────────────────────────────
+[class.ticket_booking.generate]
+instruction = """
+你在为高铁购票场景合成真实用户与语音助手的一次对话序列。序列围绕**同一次出行**
+展开：从提出购票诉求开始，逐步补全或修改出发地、目的地、日期时段、车次坐席、
+同行人、证件等要素，最后收尾确认。要求口语化、中文、每帧一句话，前后帧之间信息
+连贯且有推进（不得原地重复）。
+"""
+sequences = 3                     # 尝试配额（无输出条数保证，作废序列不补齐）
+len_range = [3, 5]                # 单序列步数的均匀采样区间
+
+[class.smart_home.generate]
+instruction = """
+你在为智能家居场景合成真实用户与语音助手的一次指令序列。序列围绕**同一个居家
+场景**展开：从一条设备控制指令开始，逐步追加或修改设备、房间、动作强度、定时与
+联动条件，最后收尾确认。要求口语化、中文、每帧一句话，前后帧之间信息连贯且有
+推进（不得原地重复）。
+"""
+sequences = 3
+len_range = [3, 5]
+
+# ── 按类标注：两类各用一份**独立**的标注 Schema（v1.13 裁决·按类标注 Schema）──
+# 覆盖语义：类声明了就用类的，未声明回落全局 [output].schema。两份 Schema 的字段
+# 集合刻意不同——购票要抽行程要素、智能家居要抽设备动作，同一个全局 Schema 无法
+# 同时贴合两者，这正是按类 Schema 的用武之地。
+[class.ticket_booking.annotate]
+instruction = """
+你是高铁购票会话的标注员。阅读整段请求序列，抽出这次出行的意图（intent，一个
+动宾短语）、出发地（origin）、目的地（destination）、出发日期或时段（depart_date，
+原文表述即可）以及用户提出的其他约束（constraints，如坐席、车次偏好、同行人、
+证件、预算；没有则给空数组）。序列中未提及的字段填空字符串。
+"""
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "intent": {"type": "string"},
+    "origin": {"type": "string"},
+    "destination": {"type": "string"},
+    "depart_date": {"type": "string"},
+    "constraints": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["intent", "origin", "destination", "depart_date", "constraints"],
+  "additionalProperties": false
+}
+"""
+
+[class.smart_home.annotate]
+instruction = """
+你是智能家居指令会话的标注员。阅读整段请求序列，抽出这次操作的意图（intent，一个
+动宾短语）、被操作设备（device）、动作（action，如开启/关闭/调暗/设定温度）、
+所在位置（location，如客厅/卧室）与定时或联动条件（schedule，原文表述即可）。
+序列中未提及的字段填空字符串。
+"""
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "intent": {"type": "string"},
+    "device": {"type": "string"},
+    "action": {"type": "string"},
+    "location": {"type": "string"},
+    "schedule": {"type": "string"}
+  },
+  "required": ["intent", "device", "action", "location", "schedule"],
+  "additionalProperties": false
+}
+"""
+
+# ── 帧类表：蓝图逐步在这个闭集上取值，帧类即帧级真值（随 members[] 落盘）──────
+# frame.classify.enabled 保持 false——真值在生成期已知，无需帧级判决调用。
+[[frame.classify.classes]]
+name = "task_request"
+description = "发起任务的首帧请求：说明诉求并给出已知要素"
+
+[[frame.classify.classes]]
+name = "followup"
+description = "对进行中任务的追问、修改、补充约束"
+
+[[frame.classify.classes]]
+name = "confirmation"
+description = "对助手结果的确认、收尾或致谢"
+
+# ── 按帧类的内容契约（每个帧类都必填 instruction；蓝图 enum 覆盖全类表）────────
+# 声明 schema_* 的帧类 = 结构化帧（帧内容是对象，按 canonical JSON 落工件行的文本
+# 字段）；未声明的 = 纯文本帧（帧内容直接是一句话）。此处的 Schema 会被逐位包进
+# realize_schema 的 prefixItems 作为子模式，故不写顶层 $schema 声明。
+[frame.class.task_request.generate]
+instruction = """
+产出发起任务的首帧：utterance 是用户说出的那一句话（口语、中文），entities 逐项
+列出这句话里出现的关键要素（地点、日期时段、设备、房间、车次坐席等），没有则给
+空数组。
+"""
+schema_inline = """
+{
+  "type": "object",
+  "properties": {
+    "utterance": {"type": "string"},
+    "entities": {"type": "array", "items": {"type": "string"}}
+  },
+  "required": ["utterance", "entities"],
+  "additionalProperties": false
+}
+"""
+
+[frame.class.followup.generate]
+instruction = """
+产出一句追问或修改：在已有诉求之上补充约束、更换要素或询问细节，口语、中文、
+一句话，须与蓝图给出的该步要点一致。
+"""
+
+[frame.class.confirmation.generate]
+instruction = """
+产出一句确认或收尾：认可助手给出的结果、拍板下单/执行，或补一句致谢，口语、
+中文、一句话。
+"""
+
+[quality]
+enabled = true
+mode = "pointwise"
+llm = "default"
+threshold = 0.3                   # 质量门演示：分低于此的序列落 dropped_lowq。
+                                  # 阈值刻意从宽——合成序列本就是照着准则写的，
+                                  # 设狠了只会把整批筛空，教学价值反而没了。
+# rubric 留空：本形态自动解析为 default:trajectory（轨迹四准则，与流模式同款
+# ——打的是序列的分，不是单条文本的分）。
+
+[annotate]
+enabled = true
+llm = "default"
+instruction = """
+你是时间流请求序列的标注员。阅读整段序列（按时间先后给出的连续用户请求），
+按输出 Schema 抽取这段序列所表达的任务要素；只根据序列内出现的信息作答，
+未提及的字段留空，不要臆造。
+"""
+# 注：本工程的两个序列类各自声明了 [class.<name>.annotate].schema_inline，实际
+# 生效的输出 Schema 按行的类标签取——全局 [output].schema 只是未声明类的回落。
+
+[verify]
+enabled = true
+llm = "default"
+policy = "repair"                 # 判决形评审：不合格先按缺陷重标注，仍不合格则淘汰
+max_repair_rounds = 1
+extra_criteria = "补充审核约定：本序列是合成数据，成员帧之间信息连贯即可，不要求覆盖真实票务/设备系统的全部字段；标注中留空的字段若序列内确实未提及，属正常，不判为缺失"
+
+[output]
+meta_mode = "inline"              # 帧类真值与成员对账仅经 _meta.stream 承载（本形态
+                                  # 下不得为 "none"）
+rejects = "refs"
+# 全局回退 Schema：两个序列类都自带 Schema，实际用不到它；但 M1 规则「output.schema
+# 恰一」不因按类覆盖而豁免，故写一份宽松对象 Schema 占位。
+schema_inline = """
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "intent": {"type": "string"},
+    "summary": {"type": "string"}
+  },
+  "required": ["intent"],
+  "additionalProperties": true
+}
+"""

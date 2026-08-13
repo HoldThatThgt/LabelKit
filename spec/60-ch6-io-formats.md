@@ -16,6 +16,7 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 - 时区：aware 值换算为 UTC epoch；naive 值**按 UTC 解释**。内部序键 = float 秒。
 - 解析失败与乱序**同走 `stream.on_disorder`**（"skip" 默认：跳过并计 bad_input + `IngestReport.disorder`；"fail"：InputError，退出码 3；5.2）。
 - 流式单调性校验不做全量重排：单调性游标**按 `stream.key` 分区键各自维护**（S19，内存 = 键基数）——逐设备/逐来源拼接的输入不会被整体判乱序；键变即断会话，**输入须按分区键成组**（交错流为演进候选，8.4）。
+- **与时间流工件的对应（v1.13）**：时间流生成形态产出的工件（6.5）就是本节格式的一份实例——工件行的时间戳字段名即该工程 `stream.order_by = "meta:<field>"` 声明的 `<field>`、文本字段名即 `input.text_field`，写出值为微秒精度的 ISO-8601 字符串（本节字符串分支）；工件另带一个 `truth` 对象，对摄取侧而言只是行上的普通字段（参与 id 计算、不参与任何判定，可经 `output.passthrough_fields` 透传做对照）。配同一份 `[stream]` 声明重放时，M2 切出的会话与生成侧逐一对应（3.2.8 可重放注记）。
 
 ## 6.2 输入：UI 模态
 
@@ -40,7 +41,7 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 
 | meta_mode | 行结构 |
 |---|---|
-| inline（默认） | 用户 Schema 的全部字段平铺在顶层 + 保留键 `_meta`。校验语义：剥除 `_meta` 后的对象必须通过用户 Schema（M1 已禁止用户 Schema 声明 _meta，3.1.4）。 |
+| inline（默认） | 用户 Schema 的全部字段平铺在顶层 + 保留键 `_meta`。校验语义：剥除 `_meta` 后的对象必须通过**该行的类有效 Schema**（v1.13 修订原「用户 Schema」措辞——= `[class.<name>.annotate].schema_*` 声明的按序列类覆盖，未声明 / 未分类 / 未知类则为全局 `output.schema`；M1 已禁止两者顶层声明 `_meta`，3.1.4）。M11 写出前的 `validate_only` 终检按同一口径逐行取 Schema（3.11.2）。 |
 | sidecar | 主输出行 = 纯用户结构；`_meta` 逐行写入 `{output_stem}.meta.jsonl`，以 `_meta.id` 与行序对齐。 |
 | none | 只写用户结构，不产出元信息（丢弃分数与溯源，不推荐）。 |
 
@@ -60,7 +61,8 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
                "generated_from": [], "fields": {},           // passthrough_fields 落点
                "generator": null},   // v1.2 只增：生成记录为 {"llm", "style"}（3.6.2），否则 null
     "stream": null,                  // v1.8 恒在键（位置：source 之后、scores 之前——链序镜像）；
-                                     // 未启用 segment = null。启用时（3.14/3.10.3）：
+                                     // = null 当 segment 与 generate_stream 均未启用（v1.13 门扩：
+                                     //   segment.enabled ∨ generate_stream.enabled，3.11.2）。启用时（3.14/3.10.3）：
                                      // {"episode_id", "session_id", "order_span": [first, last], "member_count",
                                      //  "member_ids": [...], "member_sources": [{file, pair_index|line_no}, ...],
                                      //  "members": [{index, id[, label][, annotation, status]}, ...],
@@ -72,6 +74,11 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
                                      //                            //   校验兜底见 3.11.2；真实示例见 3.11.3）；帧粒度全关时
                                      //                            //   本键不在场——本块与 v1.11 逐字节等价（退化锚）；
                                      //                            //   手术后原/克隆行 members 分叉由 repaired 位消歧（4.3）
+                                     //                            // v1.13 时间流生成形态：本块与 label 列的在场门同步扩
+                                     //                            //   `∨ generate_stream.enabled`——条目恒 {index, id, label}
+                                     //                            //   （label = 蓝图定下的帧类真值，source="inherited"；本形态
+                                     //                            //   与 frame.annotate 互斥 ⇒ 无 annotation/status 两列，
+                                     //                            //   v1.12 条件列规则相容，3.6.5/3.11.2）
                                      //  "session_split": false,   // 所属会话曾被 batch_size 硬切（S21，M7 缺帧判定降级依据）
                                      //  "repaired": false,        // verify 缺陷修复改写过成员集（3.7 stream 分支；
                                      //                            //   multi 扇出下消歧同 id 兄弟行的成员分叉，3.13）
@@ -108,6 +115,8 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 }
 ```
 
+**时间流生成形态的 `_meta.stream`（v1.13）**：直装序列行原样复用上述 stream 块，取值面如下——`episode_id` = `session_id` 之外的序列 record.id、`order_span` = `["<工件路径>:<首行号>", "<工件路径>:<末行号>"]`、`member_sources` 每项 = `{file: <工件路径>, line_no: <工件行号>}`（工件路径即 `run.output` 同款相对写法，行号 1 基、与工件行序一一对应 ⇒ 主输出与工件双向可对账）、`members[]` 见上、`session_split = false`、`repaired = false`、`degraded = null`、`steps = null`（extract 不参与）、**无** `thread_id` / `fragments`（stitch 不参与）。`_meta.run.rubric` 在本形态下的空选择器解析为 `"default:trajectory"`（3.11.2 rubric 镜像）。
+
 ## 6.4 report.json 结构
 
 ```
@@ -116,6 +125,9 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
            "interrupted": false, "circuit_broken": false, "exit_code": 0,   // circuit_broken：v1.5 只增 "modality": "ui", "seed": 42,
            "config_digest": "sha256:...", "project_digest": "sha256:..."},   // 配置指纹（脱敏后）
   // run 节 v1.6 只增："partial_delivery": true —— 仅熔断交付（3.10.3）时出现，恒伴随 circuit_broken=true
+  // run 节 v1.13 只增："artifact": {"path", "sha256", "lines"} —— 时间流工件条目（主输出摘要同款形态：
+  //             sha256 按落盘字节计、带 "sha256:" 前缀）；**仅工件通道实际写入时在场**（形态关闭与
+  //             dry-run 恒缺席，3.11.2 工件通道行）
   "counts": {"scanned": 5000, "ingested": 4987, "bad_input": 13,
               "dropped_dup": 412, "dropped_lowq": 305, "dropped_verify": 41,
               "failed": 9, "generated": 0, "emitted": 4220},
@@ -175,6 +187,20 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
   // v1.2 可选块："annotate": {"sc_disagreements": 0}（self-consistency 启用时）；
   //             "generate": {"buckets": {"default×concise": {"calls", "produced", "survived_dedup"[, "rejected_by_validator" — v1.5，仅配置 generate.sample_validator 时]}}}（generate 启用时）
   //             generate.buckets v1.7：classify 启用时桶 key 扩展为 "<class>×<llm>×<style>"（3.6.2 按类种子池行；关闭时格式不变）
+  // v1.13 可选子块（generate.stream 启用时出现，位于 generate 节内、buckets 之后；counts-only，键集与键序冻结）：
+  //   "generate": {"buckets": {...},
+  //                "stream": {"sessions",            // 交织出的会话数（**不含**重发尾会话）
+  //                           "crossed_sessions",    // 其中的交叉会话数（= Σ幸存 − sessions_eff）
+  //                           "sequences": {<class>: {"planned", "produced"}},  // 按 [[classify.classes]] 声明序零基铺开
+  //                           "frames",              // 任务帧总数（幸存序列的步数之和）
+  //                           "noise_frames",        // 实际织入的噪音帧数（签池耗尽时 < 目标数）
+  //                           "duplicates",          // 实际重发的序列条数（按幸存数钳制后）
+  //                           "plan_calls", "realize_calls", "noise_calls",     // 三类调用数（realize 含对半降级的分次调用）
+  //                           "plan_failures", "realize_failures",              // 作废序列数（按失败环节归类）
+  //                           "validator_scrapped"}} // sample_validator 逐帧违规作废的序列数
+  //   —— M6 属主（3.6.5）；工件行数不在本子块，登记于 run.artifact.lines（上文 run 节）；
+  //      `report.stream` 节在本形态下**不出现**（那是 segment 的观测面，避免混淆）；
+  //      `report.classify` 直方图恒全零属预期（标签 inherited、零判决调用，3.13.4）
   "trace": {"enabled": true, "path": "./out/ui-labels-0701.trace.jsonl",
              "events": 18342, "dropped_events": 0},
   "llm_usage": {"default": {"calls": 31240, "prompt_tokens": 8.1e7,
@@ -192,6 +218,57 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 
 `emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed + bad_input + absorbed + stitched = scanned + generated + fanout + episodes`
 
-（左侧新增 `dropped_noise` 与 `absorbed`（v1.8）及 `stitched`（v1.9 壳终态；fanout（右侧）计信封存在、stitched（左侧）计壳终态，二者分别记账无双记——经审计数值验证）、右侧新增 `episodes`；未启用的项恒 0，退化为上式）。`counts.threads` 不入守恒式——它是恒等式 `threads = episodes − stitched` 的导出量（M10 post-emit tally 单点上报，3.10.3；`rescued_short` 帧的 dropped_noise → absorbed 翻转发生在 emit 前、账目在路由时已定格，不破坏两侧平衡）。且 **stream 模式下 `counts.unprocessed` 的出现条件扩为「熔断 ∨ interrupted」**（S18：SIGINT 中断叠加会话缓冲会产生未走完流水线的残差；此时左侧另加 `unprocessed`，残差公式右侧 `+ episodes`、左侧 `+ absorbed + dropped_noise`（v1.9 另 `+ stitched`）同步扩展，failed 兜底公式减项同步——三处同步见 3.10.3 线索缝合行）；非 stream 模式中断残差恒 0、不加键（回归锚不动）。`schema_engine.resolved_at` 仅统计用户 Schema 的标注调用，加总 = 进入 M5 的记录数（4141+87+30+3+9 = 4270 = ingested 4987 − dropped_dup 412 − dropped_lowq 305）；裁决/评审/生成等内部 Schema 解析不计入。v1.12：**守恒恒等式与全部计数不变量零改动**——帧产物挂信封字段、不改任何信封状态（成员帧保持 absorbed，4.3 零改动声明），`frame_classify.*` / `frame_annotate.*` 是独立命名空间的新增计数、不进 counts 与守恒式；**`resolved_at` 恒等式不受帧标注影响**——帧标注走 `complete_validated` 的**显式 schema 参数**（= 内部 Schema 待遇，3.8.2 路由声明），与裁决/评审/生成同列不入桶，「加总 = 进入 M5 的记录数」在帧粒度开启时依然逐数成立。报告中无任何数据内容字段。
+（左侧新增 `dropped_noise` 与 `absorbed`（v1.8）及 `stitched`（v1.9 壳终态；fanout（右侧）计信封存在、stitched（左侧）计壳终态，二者分别记账无双记——经审计数值验证）、右侧新增 `episodes`；未启用的项恒 0，退化为上式）。`counts.threads` 不入守恒式——它是恒等式 `threads = episodes − stitched` 的导出量（M10 post-emit tally 单点上报，3.10.3；`rescued_short` 帧的 dropped_noise → absorbed 翻转发生在 emit 前、账目在路由时已定格，不破坏两侧平衡）。且 **stream 模式下 `counts.unprocessed` 的出现条件扩为「熔断 ∨ interrupted」**（S18：SIGINT 中断叠加会话缓冲会产生未走完流水线的残差；此时左侧另加 `unprocessed`，残差公式右侧 `+ episodes`、左侧 `+ absorbed + dropped_noise`（v1.9 另 `+ stitched`）同步扩展，failed 兜底公式减项同步——三处同步见 3.10.3 线索缝合行）；非 stream 模式中断残差恒 0、不加键（回归锚不动）。`schema_engine.resolved_at` 仅统计用户 Schema 的标注调用，加总 = 进入 M5 的记录数（4141+87+30+3+9 = 4270 = ingested 4987 − dropped_dup 412 − dropped_lowq 305）；裁决/评审/生成等内部 Schema 解析不计入。v1.12：**守恒恒等式与全部计数不变量零改动**——帧产物挂信封字段、不改任何信封状态（成员帧保持 absorbed，4.3 零改动声明），`frame_classify.*` / `frame_annotate.*` 是独立命名空间的新增计数、不进 counts 与守恒式；**`resolved_at` 恒等式不受帧标注影响**——帧标注走 `complete_validated` 的**显式 schema 参数**（= 内部 Schema 待遇，3.8.2 路由声明），与裁决/评审/生成同列不入桶，「加总 = 进入 M5 的记录数」在帧粒度开启时依然逐数成立。v1.13：**守恒恒等式零改动**——时间流生成形态取 generate_only 的**退化形** `emitted + dropped_dup + dropped_lowq + dropped_verify + failed = generated`（`generated` = 进链的直装序列条数；成员帧从不构造信封 ⇒ `absorbed` / `dropped_noise` / `stitched` / `episodes` 四项恒 0 不出现，噪音帧与重发帧只活在工件、不进任何账），`report.generate.stream.*` 与 `run.artifact.*` 同属独立命名空间的新增计数、不进 counts 与守恒式。**`resolved_at` 恒等式口径重述**（3.8.2 待遇参数）：「加总 = 进入 M5 的**记录级**标注调用数（用户待遇族）」——按序列类标注 Schema 的调用虽显式传 schema，仍属记录级标注、**照常计入**（`user_treatment=True`）；帧级标注等内部待遇调用仍不计。报告中无任何数据内容字段。
 
-**rejects 通道 v1.8 增量**（完整格式规范属 3.11.2，此处登记 IO 面变化）：rejects 行的 (stage, reason) 组合新增三种——`segment / noise`（LLM 判噪声帧）、`segment / below_min_len`（短段丢弃帧，独立于 noise，S11）、`verify / off_task_member`（修复收缩弃帧，S31）；`--strict` 交互注意：stream 工程下噪声帧属预期产物，会触发退出码 1。**rejects 通道 v1.9 增量**：(stage, reason) 组合再增一种——`stitch / stitch_invalid`（仅 `stitch.on_error = "fail"` 时出现，3.16.6）；stitched 壳与被救援帧永不入 rejects（第四路由 / 翻转回 absorbed，3.11.2）——`--strict` 补注：同输入开启 stitch 后（短段被救援不再落 rejects）strict 结果可能由 1 变 0，属预期（2.4）。`output.rejects = "full"` 档对序列 Record 的原始载荷输出 `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}`（S25——单记录 `_raw_payload` 假设的序列分支；`raw_last_output` 的 reason 门维持 schema_violation 现状，既有缺口明文接受）。**rejects 通道 v1.11 增量**：reason 词表再增两值——`context_overflow`（上下文预算三形态：预检 / 最小单元不装 / 反应态降级耗尽，V10/V16/V24）与 `output_truncated`（响应以输出上限截断收尾的终局化，V11）；stage = 产生该错误的属主算子（任何 LLM 调用阶段皆可出现），语义、处置与熔断矩阵见 7.6；refs / full 档行形态不变（两 kind 均不携带 `raw_last_output`）。**rejects 通道 v1.12 零增量声明**：帧粒度对本通道**零改动**——(stage, reason) 组合不增、reason 词表不增、行键集闭集不动；**帧级失败的成员不产生 rejects 行**（帧分类失败落 `fallback_class`、帧标注失败落 members[] 条目 status="failed"，均为成员级留痕非信封失败，3.13.7/3.5.5/3.11.2），`--strict` 判定读信封状态计数，**不受帧失败影响**（裁决·成员失败不入 rejects）。
+**rejects 通道 v1.8 增量**（完整格式规范属 3.11.2，此处登记 IO 面变化）：rejects 行的 (stage, reason) 组合新增三种——`segment / noise`（LLM 判噪声帧）、`segment / below_min_len`（短段丢弃帧，独立于 noise，S11）、`verify / off_task_member`（修复收缩弃帧，S31）；`--strict` 交互注意：stream 工程下噪声帧属预期产物，会触发退出码 1。**rejects 通道 v1.9 增量**：(stage, reason) 组合再增一种——`stitch / stitch_invalid`（仅 `stitch.on_error = "fail"` 时出现，3.16.6）；stitched 壳与被救援帧永不入 rejects（第四路由 / 翻转回 absorbed，3.11.2）——`--strict` 补注：同输入开启 stitch 后（短段被救援不再落 rejects）strict 结果可能由 1 变 0，属预期（2.4）。`output.rejects = "full"` 档对序列 Record 的原始载荷输出 `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}`（S25——单记录 `_raw_payload` 假设的序列分支；`raw_last_output` 的 reason 门维持 schema_violation 现状，既有缺口明文接受）。**rejects 通道 v1.11 增量**：reason 词表再增两值——`context_overflow`（上下文预算三形态：预检 / 最小单元不装 / 反应态降级耗尽，V10/V16/V24）与 `output_truncated`（响应以输出上限截断收尾的终局化，V11）；stage = 产生该错误的属主算子（任何 LLM 调用阶段皆可出现），语义、处置与熔断矩阵见 7.6；refs / full 档行形态不变（两 kind 均不携带 `raw_last_output`）。**rejects 通道 v1.12 零增量声明**：帧粒度对本通道**零改动**——(stage, reason) 组合不增、reason 词表不增、行键集闭集不动；**帧级失败的成员不产生 rejects 行**（帧分类失败落 `fallback_class`、帧标注失败落 members[] 条目 status="failed"，均为成员级留痕非信封失败，3.13.7/3.5.5/3.11.2），`--strict` 判定读信封状态计数，**不受帧失败影响**（裁决·成员失败不入 rejects）。**rejects 通道 v1.13 零增量声明**：时间流生成对本通道同样**零改动**——(stage, reason) 组合不增、reason 词表不增、行键集闭集不动；生成期**作废**的序列（蓝图/帧实现失败、逐帧钩子违规、序列相似度过滤淘汰）**不产生 rejects 行**——它们从未成为记录，留痕在 `report.generate.stream.*` 计数与值-free 的 stderr WARN（3.6.5 作废语义，`--strict` 不受影响）；进链后被淘汰的序列（`dropped_dup` / `dropped_lowq` / `dropped_verify` / `failed`）照既有规则入 rejects——判决形评审的 fail 收尾即 `verify / dropped_verify` 的既有形态（3.7.5）。
+
+## 6.5 时间流工件格式（v1.13）
+
+时间流生成形态（`generate_stream.enabled`，3.6.5）的第二份产物，路径 `{output_stem}.stream.jsonl`（M11 第五输出通道，3.11.2）。UTF-8 JSONL，一行一帧，**行序 = 交织序**（时间戳严格递增），行号（1 基）即 `_meta.stream.member_sources[].line_no`。
+
+**行结构**（三键，键序冻结）：
+
+```
+{"<stream.order_by 的 meta 字段名>": "<ISO-8601 微秒精度时间戳>",
+ "<input.text_field>": <帧内容：纯文本帧为字符串 | 结构化帧为对象>,
+ "truth": {...}}
+```
+
+`truth` 键集（**冻结**，counts 与标识，不含任何工具内部 id）：
+
+| 键 | 类型 | 语义 |
+|---|---|---|
+| `session` | int | 全流会话序数，0 基（含重发尾会话）。 |
+| `sequence_class` | str \| null | 所属序列类名；噪音帧为 null。 |
+| `sequence` | int \| null | 该序列在其类内的序数，0 基（= 计划期标识）；噪音帧与**重发副本**为 null。 |
+| `frame_class` | str \| null | 该帧的帧类（蓝图定下的真值）；噪音帧为 null。 |
+| `noise` | bool | 插入型噪音帧标志；任务帧与重发帧恒 false。 |
+| `duplicate_of` | int | **仅重发序列的帧在场**：值 = 被重发的原序列的类内序数（重发副本无自身计划期身份，归属经本键对账）。 |
+
+**真值不携最终 id**（封死循环依赖）：序列归属只用计划期标识（`sequence_class` + `sequence`），**禁止**携带装配后的 record id——成员 id 依赖行内容、序列 id 依赖成员 id，携带即成环；主输出 `_meta.stream` 与工件的对账靠 `member_sources` 的行号双向可查（3.6.5）。
+
+**重放契约**：工件本身就是一份合法的 6.1 文本模态输入。可往返性由 M1 工件键守卫在启动期保证（3.1.4 时间流生成行）：`input.text_field` 与 `stream.order_by` 的时间戳字段名均须为**平坦字段名**（工件行以该字符串原样作键，点路径在重放侧按 6.1 抽取时取不到、整份判坏行——含 `"."` 即 CONFIG_ERROR），两者互不同名、且均不得为 `"truth"`（工件行三个顶层键互斥）。把它拷为某工程的 `[run].input`、配同一份 `[stream]` 声明（`order_by = "meta:<同名字段>"`、同一 `gap_s`）并开 `segment`，即可原样重放——① 成员 `Record.id` 逐字节一致（M2 的 `sha256(canonical_json(raw))[:16]` 作用于同一份行对象，生成侧的成员 raw 就是工件行全对象，3.2.5）；② 会话切分一致（交织器铺设的会话间隔恒 > `gap_s`、会话内间隔恒 < `gap_s`），`session_id` 亦逐字节一致（M2 公式的输入含会话内**全部**帧，3.2.8）；③ `truth` 对摄取侧只是普通字段——参与 id 计算、**不参与任何判定**，需要时经 `output.passthrough_fields` 透传出来与重放结果比对（自动化的重放评测回路是明确非目标，2.1.2 ⑧）。
+
+**真实样例**（`examples/synth-stream` 真跑工件的三行摘录，`order_by = "meta:ts"`、`text_field = "text"`；实际为单行 JSONL）：
+
+```
+// 第 1 行：结构化帧（帧类 task_request 声明了生成 Schema ⇒ 文本字段是对象）
+{"ts": "2026-01-05T09:00:00.000000+08:00",
+ "text": {"utterance": "我想订明天早上从北京到上海的高铁票，二等座就行。",
+          "entities": ["北京", "上海", "明天早上", "二等座"]},
+ "truth": {"session": 0, "sequence_class": "ticket_booking", "sequence": 0,
+           "frame_class": "task_request", "noise": false}}
+
+// 第 12 行：插入型噪音帧（三 null + noise=true）
+{"ts": "2026-01-05T09:22:20.673020+08:00", "text": "哎呀这雨下得没完没了啊",
+ "truth": {"session": 1, "sequence_class": null, "sequence": null,
+           "frame_class": null, "noise": true}}
+
+// 第 26 行：重发序列的首帧（sequence=null + duplicate_of 指回原序列类内序数；落流尾新会话）
+{"ts": "2026-01-05T10:28:43.981411+08:00",
+ "text": {"utterance": "帮我把客厅空调打开", "entities": ["客厅空调", "客厅", "空调"]},
+ "truth": {"session": 5, "sequence_class": "smart_home", "sequence": null,
+           "frame_class": "task_request", "noise": false, "duplicate_of": 0}}
+```
+
+同一份工件的第 1 行与第 2 行分属交叉会话里的两条序列（`sequence` 0 与 1，同 `session: 0`）——交叉形态在工件上直接可读。

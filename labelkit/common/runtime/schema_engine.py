@@ -356,6 +356,44 @@ def frame_classify_schema(names: Sequence[str], n: int) -> dict:
             "required": ["labels"], "additionalProperties": False}
 
 
+def plan_schema(names: Sequence[str], length: int) -> dict:
+    """v1.13 M6 时间流形态·蓝图调用的内部 Schema（裁决·蓝图实现内部 Schema）。
+
+    一条序列的 ``length`` 步计划：每步给出所属帧类（闭集，取自 ``names`` 帧类表）与
+    一句话内容要点 ``brief``（供帧实现调用逐位展开）。minItems = maxItems 钉死步数
+    （judgment_schema / frame_classify_schema 先例）；不用 uniqueItems——同一帧类在
+    一条序列里本就可重复出现（R1 同理，strict 网关硬拒该关键字）。
+    """
+    return {"type": "object",
+            "properties": {"steps": {"type": "array",
+                "items": {"type": "object",
+                          "properties": {"frame_class": {"type": "string",
+                                                         "enum": list(names)},
+                                         "brief": {"type": "string"}},
+                          "required": ["frame_class", "brief"],
+                          "additionalProperties": False},
+                "minItems": length, "maxItems": length}},
+            "required": ["steps"], "additionalProperties": False}
+
+
+def realize_schema(step_schemas: Sequence[dict]) -> dict:
+    """v1.13 M6 时间流形态·帧实现调用的内部 Schema（裁决·蓝图实现内部 Schema）。
+
+    逐位包装器：第 i 帧服从蓝图第 i 步帧类的**用户生成 Schema**（纯文本帧由调用方
+    传 ``{"type": "string"}``）。``prefixItems`` 是 draft 2020-12 原生关键字
+    （jsonschema ≥ 4.21 直接可校验，L2 无需翻译层），``"items": false`` 封尾禁止
+    超长数组，minItems = maxItems 再钉一次长度。用户生成 Schema 随 L0 原样透传，
+    不做关键字白名单 lint（output.schema 今日同款暴露面）。
+    """
+    steps = list(step_schemas)
+    return {"type": "object",
+            "properties": {"frames": {"type": "array",
+                "prefixItems": steps,
+                "minItems": len(steps), "maxItems": len(steps),
+                "items": False}},
+            "required": ["frames"], "additionalProperties": False}
+
+
 # ── The engine ───────────────────────────────────────────────────────────────
 
 def _extract_object(response: Any) -> tuple[dict | None, bool, str]:
@@ -414,7 +452,13 @@ class SchemaEngine:
 
     @property
     def stats(self) -> dict:
-        """resolved_at counters — user-schema calls only (report.schema_engine)."""
+        """resolved_at counters — user-treatment calls only (report.schema_engine).
+
+        v1.13（裁决·M8 显式待遇参数）：口径是「用户待遇族」而非「schema 参数为
+        None」——按序列类标注 Schema 显式传 schema 但同属记录级标注调用，照常记账
+        （§6.4 恒等式：resolved_at 加总 = 进入 M5 的记录级标注调用数）；帧级标注等
+        内部待遇调用仍不计。
+        """
         return dict(self._stats)
 
     def validate_only(self, obj: dict, schema: dict | None = None) -> list[str]:
@@ -433,7 +477,7 @@ class SchemaEngine:
     def _resolve(self, bucket: str, *, is_user_schema: bool,
                  record_ids: tuple[str, ...], batch_no: int,
                  violations: list[str], l1_lossy: bool = False) -> None:
-        """Count the bucket (user-schema calls only) and emit the schema.repair trace
+        """Count the bucket (user-TREATMENT calls only, v1.13) and emit the schema.repair trace
         event for any non-clean resolution. ``l1_lossy`` adds an optional payload
         field (7.2 payload 只增不改) flagging a suspected content-dropping repair."""
         if is_user_schema:
@@ -450,6 +494,7 @@ class SchemaEngine:
                                  record_ids: tuple[str, ...] = (),
                                  batch_no: int = 0,
                                  record: "Mapping | None" = None,
+                                 user_treatment: bool | None = None,
                                  ) -> tuple[dict, Usage, int, str]:
         """L0 -> L1 -> L2 [-> L2.5] -> L3 (spec 3.8.2). schema=None -> user schema (and
         the call counts toward the resolved_at buckets; the output.validator hook, when
@@ -460,10 +505,14 @@ class SchemaEngine:
         v1.11: the INITIAL complete() may raise ContextOverflowError /
         OutputTruncatedError — both propagate to the caller untouched (operators
         classify them, V27①); a ContextOverflowError from a REPAIR call fails
-        that round and short-circuits straight to exhaustion (V25①)."""
-        is_user_schema = schema is None
+        that round and short-circuits straight to exhaustion (V25①).
+        v1.13（裁决·M8 显式待遇参数）：``user_treatment`` 显式声明本次调用是否按
+        「用户 Schema 待遇」处理——None = 现行 ``schema is None`` 推断（既有调用点
+        零改动）；True = 计 resolved_at 记账 + 启 L2.5（按序列类标注 Schema 即此形，
+        正面修掉「显式 Schema = 放弃记账与回调」的弯折）；False = 内部待遇。"""
+        user_treated = (schema is None) if user_treatment is None else user_treatment
         active = self._user_schema if schema is None else schema
-        use_hook = is_user_schema and self._validator is not None
+        use_hook = user_treated and self._validator is not None
 
         # L0: always hand the schema to the client; it applies vendor structured-output
         # mechanics only when the profile declares supports_structured_output.
@@ -488,7 +537,7 @@ class SchemaEngine:
                         "区段的一部分，字段结构合法但文本可能残缺；详见 trace schema.repair "
                         "事件的 l1_lossy 标记",
                         extra={"stage": "schema", "batch": batch_no})
-                self._resolve(bucket, is_user_schema=is_user_schema,
+                self._resolve(bucket, is_user_schema=user_treated,
                               record_ids=record_ids, batch_no=batch_no, violations=[],
                               l1_lossy=lossy)
                 return obj, total_usage, attempts, model
@@ -531,7 +580,7 @@ class SchemaEngine:
                     new_rendered, new_summaries = cb, list(cb)
                 if not new_rendered:
                     bucket = _bucket_for(False, repair_round)
-                    self._resolve(bucket, is_user_schema=is_user_schema,
+                    self._resolve(bucket, is_user_schema=user_treated,
                                   record_ids=record_ids, batch_no=batch_no,
                                   violations=summaries)
                     return obj, total_usage, attempts, model
@@ -539,7 +588,7 @@ class SchemaEngine:
             else:
                 rendered, summaries = [_UNPARSEABLE_VIOLATION], [_UNPARSEABLE_SUMMARY]
 
-        self._resolve("rejected", is_user_schema=is_user_schema,
+        self._resolve("rejected", is_user_schema=user_treated,
                       record_ids=record_ids, batch_no=batch_no, violations=summaries)
         raise SchemaViolation(
             rendered, raw,

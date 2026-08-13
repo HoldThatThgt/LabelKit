@@ -77,7 +77,7 @@ v1.11 补两条边界规则：
 
 ## 14.3 读懂修复分布：resolved_at
 
-报告的 `schema_engine.resolved_at` 是模型「结构纪律」的体检单（仅统计**用户 Schema** 的标注调用；裁决/评审/生成等内部结构不计入，v1.12 走独立帧 Schema 的帧级标注同样不计入——见 14.5 末尾的区隔）：
+报告的 `schema_engine.resolved_at` 是模型「结构纪律」的体检单（仅统计**用户 Schema** 的标注调用——含 v1.13 走按序列类 Schema 的调用；裁决/评审/生成等内部结构不计入，v1.12 走独立帧 Schema 的帧级标注同样不计入——三者的分界见 14.5 末尾那张表）：
 
 ```json
 "schema_engine": {"resolved_at": {"l0_or_clean": 4141, "l1": 87, "l3_1": 30, "l3_2": 3, "rejected": 9}}
@@ -153,7 +153,19 @@ def check_annotation(obj: dict, record: dict | None) -> list[str]:
 
 生成侧有一个孪生钩子 `generate.sample_validator`（签名 `fn(text) -> list[str]`），语义是**过滤器**而非 LLM 修复环：违规样本直接剔除、计入桶统计，详见第 12 章。
 
-一句区隔（v1.12）：帧级标注（第 25 章 25.6）虽然也用你声明的 Schema——`frame.annotate.schema_path` / `schema_inline`，与 `output.schema` **互相独立**（各自元校验、各自的 few-shot 各自干跑、互不引用）——但它的调用**不经过代码回调校验层**（`output.validator` 只管主输出行的标注对象），也不计入 `resolved_at`（14.3）。结构化输出层、确定性修复层、jsonschema 校验层与 LLM 修复环四层照常全在；修复穷尽的成员落 members[] 的 `failed` 状态位而非 rejects（第 11、25 章），emitter 落盘前还会对每个帧标注对象再跑一次纯校验兜底——非法帧对象永不落盘。
+### 三种用户 Schema，三种待遇
+
+到 v1.13 为止，「你声明的 Schema」有三份，各自的待遇不同——这张表是它们的分界线：
+
+| Schema | 声明在哪 | 管什么 | 四层防线 | 代码回调校验层 | 计入 `resolved_at` | 失败去哪 |
+|---|---|---|---|:-:|:-:|---|
+| 全局输出 Schema | `[output].schema_path` / `schema_inline` | 主输出每一行的标注对象 | 全在 | ✓ | ✓ | rejects（`schema_violation` / `callback_violation`） |
+| **按序列类输出 Schema**（v1.13） | `[class.<类名>.annotate].schema_path` / `schema_inline`（至多其一） | **该类**的行；未声明的类回落全局 | 全在 | ✓ | ✓ | 同上 |
+| 帧级 Schema（v1.12） | `[frame.annotate].schema_path` / `schema_inline` | `_meta.stream.members[]` 里的帧标注对象 | 全在 | ✗ | ✗ | members[] 的 `status="failed"`，**不入 rejects** |
+
+**按类 Schema 与全局 Schema 待遇完全相同**（v1.13 特意如此：显式换一份 Schema 不该顺带丢掉回调校验与账目）——回调照常执行、`resolved_at` 照常计数，第 8 章那条「`resolved_at` 加总 = 进入标注算子的记录级标注调用数」的恒等式因此不变。它多出来的只有启动期的两条校验：每份类 Schema 各自过 draft 2020-12 元校验与 `_meta` 禁令，且**该类的 few-shot 示例用该类的 Schema 干跑**（v1.13 修掉了旧版「类示例统一过全局 Schema」的错配）。落盘前 emitter 还会按**该行类的有效 Schema** 再纯校验一次。用法与真实对照见第 27 章 27.6。
+
+帧级 Schema 是那个特例（v1.12，第 25 章 25.6）：它与 `output.schema` 互相独立（各自元校验、各自的 few-shot 各自干跑、互不引用），但调用**不经过代码回调校验层**（`output.validator` 只管主输出行的标注对象），也不计入 `resolved_at`（14.3）。结构化输出层、确定性修复层、jsonschema 校验层与 LLM 修复环四层照常全在；修复穷尽的成员落 members[] 的 `failed` 状态位而非 rejects（第 11、25 章），emitter 落盘前同样有一次纯校验兜底——非法帧对象永不落盘。
 
 ## 14.6 配置参考
 
@@ -171,10 +183,11 @@ max_repair_attempts = 2           # LLM 修复环轮数预算（代码回调校�
 
 ## 14.7 内部结构也走同一个引擎
 
-一个容易忽略的事实：不只你的标注 Schema，**LabelKit 自己的内部输出**——质量裁决 `{"judgments": [...]}`、pointwise 评分、评审结论 `{"critiques": [...], "verdict"}`、生成样本 `{"samples": [...]}`、分类结果 `{"class": ...}` / multi 模式的 `{"classes": [...]}`（v1.7），以及 v1.8/v1.9 stream 一族的四个：分段的**窗口关系表** `{"frames": [{index, relation}]}`（逐帧关系用封闭五词表枚举锁死，LLM 答不出词表外的边界判断）、摘取的**动作对象** `{"action_type", "target", "value", "description"}`（动作类型用 11 值词表锁死，target/value 是可空联合）、序列评审的**缺陷表** `{"critiques", "defects", "verdict"}`（缺陷种类用六值枚举锁死——v1.9 起含 `wrong_stitch`，意见与缺陷在前、结论在后）、缝合的**判定对象** `{"verdict", "thread_ref", "task_name", "reason", "confidence"}`（v1.9：resume/new 二值 verdict 加可空线索编号，编号越界由代码侧收窄为保守的 new），以及 v1.12 帧分类的**帧标签数组** `{"labels": [<帧类枚举>, …]}`（enum 锁死帧类词表、条目数锁死为窗口成员数，缺项由代码侧落兜底帧类）——全部经由同一个 `complete_validated()` 入口、同一套四层防线。所以：
+一个容易忽略的事实：不只你的标注 Schema，**LabelKit 自己的内部输出**——质量裁决 `{"judgments": [...]}`、pointwise 评分、评审结论 `{"critiques": [...], "verdict"}`、生成样本 `{"samples": [...]}`、分类结果 `{"class": ...}` / multi 模式的 `{"classes": [...]}`（v1.7），以及 v1.8/v1.9 stream 一族的四个：分段的**窗口关系表** `{"frames": [{index, relation}]}`（逐帧关系用封闭五词表枚举锁死，LLM 答不出词表外的边界判断）、摘取的**动作对象** `{"action_type", "target", "value", "description"}`（动作类型用 11 值词表锁死，target/value 是可空联合）、序列评审的**缺陷表** `{"critiques", "defects", "verdict"}`（缺陷种类用六值枚举锁死——v1.9 起含 `wrong_stitch`，意见与缺陷在前、结论在后）、缝合的**判定对象** `{"verdict", "thread_ref", "task_name", "reason", "confidence"}`（v1.9：resume/new 二值 verdict 加可空线索编号，编号越界由代码侧收窄为保守的 new），v1.12 帧分类的**帧标签数组** `{"labels": [<帧类枚举>, …]}`（enum 锁死帧类词表、条目数锁死为窗口成员数，缺项由代码侧落兜底帧类），以及 v1.13 时间流生成的两个（第 27 章）：蓝图的**步骤表** `{"steps": [{frame_class, brief}]}`（帧类 enum 锁死、条目数锁死为抽定的序列长度 L）与帧实现的**逐位帧数组** `{"frames": [...]}`（用 draft 2020-12 的 `prefixItems` 给第 i 帧套上第 i 个帧类的 Schema、长度锁死为 L）——全部经由同一个 `complete_validated()` 入口、同一套四层防线。所以：
 
 - 裁决输出偶尔非法不会炸：修不好按平局计（`judgment_invalid`，对 Bradley-Terry 中性），计入 `report.quality.judgment_failures`；
 - 内部修复调用同样计入 token 计量与 `llm.call` trace 事件——账一分不少；
-- 分类结果的内部 Schema（v1.7）用 enum 封闭集锁死类名词表——标签不可能落在你的类别表之外；multi 模式刻意**不写** `uniqueItems`（部分供应商的结构化输出实现会硬拒该关键字），重复标签由 classify 算子在校验通过后做确定性去重归一化。
+- 分类结果的内部 Schema（v1.7）用 enum 封闭集锁死类名词表——标签不可能落在你的类别表之外；multi 模式刻意**不写** `uniqueItems`（部分供应商的结构化输出实现会硬拒该关键字），重复标签由 classify 算子在校验通过后做确定性去重归一化；
+- 帧实现的 `prefixItems`（v1.13）是 draft 2020-12 的正规关键字、jsonschema 校验层原生支持，但个别对结构化输出关键字挑剔的路由可能对含它的请求直接 400——处置是配置级的：把该 profile 的 `supports_structured_output` 声明为 `false`，让这类调用走「文本 + 确定性修复层解析」的路径（`examples/synth-stream` 的 DeepSeek 端点就是这么配的，第 27 章 27.5）。
 
 这就是「LLM 输出不可信」原则的完整落地：**没有任何一条 LLM 文本能绕过校验进入任何下游**。

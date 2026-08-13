@@ -30,6 +30,8 @@
 
 v1.12（流模式帧粒度，第 25 章 25.6）**零新增错误码**：帧级分类/标注的失败复用既有 kind（结构修复耗尽照旧是 `schema_violation` 等），且**不产生 rejects 行**——帧分类失败落兜底帧类（计 `report.stream.frame_classify.fallback` / `window_failures`），帧标注失败落 members[] 的 `status="failed"`（计 `frame_annotate.failed`），episode 信封照常发射。排查入口见 18.2 的「members 里大量 status="failed"」。
 
+v1.13（时间流生成，第 27 章）同样**零新增错误码**，且它的失败也**不进 rejects**：蓝图/帧实现的修复穷尽、逐帧校验钩子违规都按「该序列整条作废」处置——不产 failed 记录、不补生成，账记在 `report.generate.stream` 的 `plan_failures` / `realize_failures` / `validator_scrapped` 三项上（排查入口见 18.2 的「合成序列大批作废」）。噪音批调用作废则更轻：缺额的噪音帧从交织中缺席，仅此而已。
+
 ## 18.2 按症状排查
 
 先用这棵决策树从退出码与 counts 特征定位到病灶小节，再进小节细查：
@@ -141,6 +143,18 @@ jq -e '.run.interrupted == false and .run.circuit_broken == false' out/report.js
 ### 「members 里大量 status="failed"」（v1.12）
 
 现象：主输出 episode 行的 `_meta.stream.members[]` 里 `status="failed"` 占比异常、对应 `annotation` 全是 null——而 rejects 里**找不到任何对应行**、`--strict` 也不红。后半是设计语义不是遗漏：成员失败不是信封失败，帧失败不入 rejects、不触发 `--strict`（第 25 章 25.6），账面就在 members[] 状态位与 report 的帧子块。按序排查：① **帧 Schema 复杂度**——帧标注输出越深越难修，第 14 章的编写指南对帧 Schema 同样成立（平铺、语义化枚举、`required` + `additionalProperties: false`），先把帧 Schema 改简单；② **上下文预算**——帧 prompt 是最小单元、无降级梯，所引 profile `context_window` 声明过狠时预检直接把成员判 failed（查 `report.budget.overflow_records` 与 trace error 事件里的 `context_overflow`）；③ **对账计数**——`report.stream.frame_annotate.failed`（emitter 写前帧校验兜底翻掉的也计入此数）；④ **逐成员定位**——trace 订阅 `"annotate"` 通道读 `annotate.frame` 事件（member_id / status / attempts，第 16 章），attempts 偏高说明修复环在反复失败，回到帧 Schema 与模型能力。
+
+### 「工件重放时会话对不上」（v1.13）
+
+现象：把时间流工件（`{输出名}.stream.jsonl`，第 27 章）拷去当输入重放，摄取侧切出的会话数与生成侧的 `report.generate.stream.sessions` 对不上——多半是重放工程的 `[stream]` 没抄对。三处逐一核对：① `order_by` 必须是**同一个** `meta:<字段>`（字段名由生成侧的 `[stream].order_by` 决定，工件行的时间戳键就叫这个名字，写错即全员坏行、退出码 3）；② `gap_s` 必须与生成侧一致——交织器铺的会话间隔恒为 `gap_s + frame_gap_s` 区间内的一个值，比生成侧调大就会把相邻两个会话粘成一个，调小则可能把会话内的长间隔切开；③ 重放侧别设 `key` / `gap_steps`（生成侧要求它们为空/0，重放侧多设一条断开规则自然会多切）。还要记得**加上重发的那个尾会话**：生成侧的 `sessions` 不含它，实测 5 + 1 = 6（第 27 章 27.8）。
+
+### 「按类标注 Schema 没生效」（v1.13）
+
+现象：给某个类配了 `[class.<类名>.annotate].schema_inline`，产出行的字段集却还是全局那份。按序排查：① **节名逐字对**——`<类名>` 必须精确等于 `[[classify.classes]]` 里的 `name`，拼错的节名会在启动时报配置错误（白名单机制不静默，第 24 章 24.4）；② **看那一行的 label**——`_meta.classification.label` 才是取 Schema 的依据，行被判成了别的类自然用别的类的 Schema，multi 扇出时更要按 (`id`, `label`) 看；③ **确认没写成 `schema_path` 与 `schema_inline` 同时给**（至多其一，同时给是配置错误）；④ 类 few-shot 示例报错时注意定位串——v1.13 起类示例是用**该类的 Schema** 干跑的，错误里的 `[[class.<类名>.annotate.examples]][N]` 指的就是它。
+
+### 「合成序列大批作废 / 交叉演示位没了」（v1.13）
+
+现象：时间流生成的 `report.generate.stream` 里 `produced` 明显小于 `planned`，或 `crossed_sessions` 掉到 0。先分三项 failures 定位：`plan_failures`（蓝图阶段修复耗尽——帧类表太大或 Schema 对模型偏难）、`realize_failures`（帧实现违反逐位契约或写满输出上限——降 `generate.temperature`、缩 `len_range`、给帧类 Schema 减字段；结构化输出层关掉的端点上这条更敏感，第 27 章 27.5）、`validator_scrapped`（`generate.sample_validator` 逐帧执行，任一帧违规**整序列作废**——这是拒绝采样语义，不是 bug）。`crossed_sessions` 是**派生量**（= Σ幸存 − `sessions`），幸存少了它先被吃掉——先治作废率，别去调 `sessions`。反方向的症状是桶统计的 `survived_dedup ≪ produced`：同类序列彼此太像被序列级相似度过滤淘汰，处置是提温度、把类 instruction 写出更多可变要素，**不要**放松 `[dedup]` 阈值。作废路径全都有 stderr WARN（带序列序号与类名），要看提示词与响应就临时订阅 `llm` 通道 + `trace.content = "full"`（数据副本，用完即清）。
 
 ### 「运行频繁被 429 限流拖慢 / 中断」
 

@@ -1,0 +1,37 @@
+# Tool-level static config（spec §5.1）——单 profile 单端点纯文本形态（v1.13
+# 时间流生成示例）：
+#   [llm.default] = DeepSeek（deepseek-v4-flash）——本例全部阶段（蓝图、帧实现、
+#     噪音批量、quality 轨迹打分、annotate 按类标注、verify 判决）都走这一个纯
+#     文本 profile；时间流生成恒 text 模态，零视觉调用，故不设 [llm.vision]。
+# 本示例独立成套、不复用 ../config.toml，偏离共享惯例的理由：本特性的 E2E 面由
+# 需求方指定为 DeepSeek 端点（2026-08-13），而 ../config.toml 是 z.ai——共享它就
+# 违背端点指定；自含一份也让 DeepSeek 端点与其余示例共用的 z.ai glm-5.2 端点相互
+# 隔离、互不牵连（examples/mix 自含 config.toml 的同款先例）。
+#
+# DeepSeek 端点实测（2026-08-13 探针复核）：文本调用可用、温度 0 可用、usage 在场；
+# 响应默认携带 thinking 内容块，M9 anthropic 解析器只收集 type=="text" 块，thinking
+# 被天然跳过，JSON 干净落在 text 块；该路由对指定工具强制返回 400（tool_choice
+# type="tool"，E2E-FINDINGS 第 24 条）⇒ supports_structured_output = false，L0 全关，
+# 蓝图/实现的结构服从性由两个模板的内嵌结构契约承担（提示词文本内的形状句 + 逐位
+# 契约），JSON 由 Schema 引擎 L1 确定性解析 + L2 校验 + L3 修复兜底。
+schema_version = 1
+
+[tool]
+log_level = "info"
+log_format = "text"
+
+[llm.default]
+provider = "anthropic"
+base_url = "https://api.deepseek.com/anthropic"
+model = "deepseek-v4-flash"
+api_key_env = "LABELKIT_DEEPSEEK_KEY"
+max_concurrency = 4
+timeout_s = 120
+max_retries = 5
+# 该路由对指定工具强制返回 400（tool_choice type="tool"，2026-08-12 实测，
+# E2E-FINDINGS 第 24 条）：结构化输出走 text 块 JSON + Schema 引擎 L1 确定性解析。
+supports_structured_output = false
+supports_vision = false           # 官方兼容表：image 内容块不支持
+max_output_tokens = 4096
+context_window = 131072 # 端点标称 1M，按既有 V26 惯例保守声明——实测后可上调
+temperature = 0.0

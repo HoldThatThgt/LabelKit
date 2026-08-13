@@ -25,6 +25,19 @@ item.member_annotations through the PUBLIC direct-call surface ``annotate_member
 Frame calls route cfg.frame_schema EXPLICITLY through
 complete_validated(schema=...): internal-schema treatment — no L2.5, no
 resolved_at. The two sequence-level frozen signatures stay untouched.
+
+v1.13 per-sequence-class annotation schema (SPEC-stream-generation §3.4,
+裁决·按类标注 Schema): a class may override the global output.schema through
+[class.<name>.annotate].schema_path/schema_inline. ``class_annotate_schema``
+is the SINGLE lookup point (label → cfg.class_views[label].schema; a missing
+label, an unknown class or a class without an override falls back to the
+global schema) and every schema consumer in this module reads through it —
+the two annotation calls, the prompt schema text, the self-consistency vote
+and the v1.11 packing estimate — so the priced schema is always the called
+one. A class-schema call routes schema=<class schema> EXPLICITLY with
+user_treatment=True (裁决·M8 显式待遇参数): record-level annotation stays in
+the user-treatment family, keeping L2.5 and the resolved_at accounting. With
+no per-class schema configured every call shape is byte-identical to v1.12.
 """
 from __future__ import annotations
 
@@ -189,6 +202,83 @@ def _dumps(obj: object) -> str:
     return json.dumps(obj, ensure_ascii=False)
 
 
+# ── v1.13 按序列类标注 Schema（裁决·按类标注 Schema，SPEC §3.4）──────────────
+#
+# 三个取值函数是本特性在 M5 侧的单点真相：调用 Schema、提示词 Schema 文本、
+# 预算计价与自洽投票全部经此取值，保证「计价的 Schema 就是调用的 Schema」。
+# M7 verify 的 V21 试装经懒加载复用同一组函数；M11 emitter 不得跨算子导入，
+# 按 spec §2.2 在其内部做最小镜像（语义须与 class_annotate_schema 一致）。
+
+def class_annotate_schema(cfg: "ResolvedConfig",
+                          label: str | None) -> Mapping | None:
+    """取该记录所属序列类的标注 Schema 覆盖（单点取值函数）。
+
+    :param cfg: 已解析配置；``cfg.class_views[label].schema`` 是 M1 装载的
+        ``[class.<name>.annotate].schema_path/schema_inline`` 解析产物。
+    :param label: 该记录的分类标签（``item.classification.label``）；None =
+        无 classification（classify 关闭、未分类或未到达 classify）。
+    :returns: 该类声明的 Schema 覆盖；None = 无覆盖 ⇒ 调用方沿用全局
+        ``output.schema`` 的既有路径（全链字节等价 v1.12）。label 缺失或类表
+        外的未知类同样回落 None。
+    """
+    if label is None:
+        return None
+    view = cfg.class_views.get(label)
+    return None if view is None else view.schema
+
+
+def class_effective_schema(cfg: "ResolvedConfig", label: str | None) -> Mapping:
+    """类有效标注 Schema = 按类覆盖 ?? 全局 ``output.schema``。
+
+    :param cfg: 已解析配置。
+    :param label: 该记录的分类标签；None = 无 classification。
+    :returns: 该记录实际受约束的 Schema 对象（自洽投票与预算计价共用）。
+    """
+    override = class_annotate_schema(cfg, label)
+    return cfg.user_schema if override is None else override
+
+
+def class_schema_text(ctx: "RunContext", label: str | None) -> str:
+    """提示词内嵌的类有效 Schema 文本（canonical 单行 dump）。
+
+    :param ctx: 运行上下文；无按类覆盖时直接取 M8 的
+        ``schema_engine.user_schema_text`` 既有属性（字节等价）。
+    :param label: 该记录的分类标签；None = 无 classification。
+    :returns: 注入 system 段的 Schema 文本；按类覆盖按帧侧先例现算，形态对齐
+        ``user_schema_text``（ensure_ascii=False + separators=(", ", ": ")）。
+    """
+    override = class_annotate_schema(ctx.cfg, label)
+    if override is None:
+        return ctx.schema_engine.user_schema_text
+    return json.dumps(override, ensure_ascii=False, separators=(", ", ": "))
+
+
+async def _complete_annotation(ctx: "RunContext", record: Record,
+                               prompt: PromptBundle,
+                               schema: Mapping | None
+                               ) -> tuple[dict, Usage, int, str]:
+    """把一次记录级标注调用路由进 M8（裁决·M8 显式待遇参数）。
+
+    :param ctx: 运行上下文（M8 入口 + 批次号）。
+    :param record: 被标注记录（record_ids 与 L2.5 回调的原始映射来源）。
+    :param prompt: 已装配的提示词。
+    :param schema: 按类 Schema 覆盖；None = 无覆盖。
+    :returns: ``complete_validated`` 的四元组（对象、用量、尝试数、模型）。
+
+    有覆盖 ⇒ 显式传 ``schema`` + ``user_treatment=True``：L0–L3 四层照常，且
+    L2.5 与 resolved_at 记账保留（记录级标注恒属用户待遇族）。无覆盖 ⇒
+    ``schema=None`` 的既有推断路径，调用形与 v1.12 逐字节一致。
+    """
+    profile = ctx.cfg.annotate.llm
+    if schema is None:
+        return await ctx.schema_engine.complete_validated(
+            profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
+            record=record.raw)
+    return await ctx.schema_engine.complete_validated(
+        profile, prompt, schema=dict(schema), record_ids=(record.id,),
+        batch_no=ctx.batch_no, record=record.raw, user_treatment=True)
+
+
 # ── v1.11 context-budget packing (spec 3.5.2 上下文预算装填与修复升级换档) ────
 
 _TREE_MARKER_RE = re.compile(r"^…\(truncated (\d+) nodes\)$")
@@ -271,7 +361,9 @@ def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: st
                           image_px: int | None = None) -> PromptBundle:
     """Deterministic template assembly per CONTRACTS.md §10.1 (+ §10.5 repair suffix).
 
-    schema_text = SchemaEngine.user_schema_text. Section order is fixed: system (task
+    schema_text = the class-effective schema text (``class_schema_text``: the M8
+    SchemaEngine.user_schema_text property unless the record's class overrides
+    output.schema, v1.13). Section order is fixed: system (task
     instruction + schema constraint), one user message per few-shot example in configured
     order, then the current-record user message (text part, or UI screenshot + tree parts).
     v1.7 (R2): label non-None → instruction/examples come from
@@ -427,7 +519,8 @@ def _pack_prompt(record: Record, cfg: "ResolvedConfig", ctx: "RunContext",
     stage layer, the doomed request is never sent. Returns (bundle, k_used —
     the image count actually packed, 0 when imageless)."""
     b = budget.input_budget(prof)
-    schema_est = (budget.est_text(json.dumps(cfg.user_schema, ensure_ascii=False))
+    # v1.13：计价对象 = 类有效 Schema（与本次调用实际传出的 Schema 同源）。
+    schema_est = (budget.est_text(_dumps(class_effective_schema(cfg, label)))
                   if prof.supports_structured_output else 0)
 
     def assemble(k: int | None, fit: _PackState | None) -> PromptBundle:
@@ -512,19 +605,19 @@ async def _budgeted_call(record: Record, ctx: "RunContext",
     (k → max(2, ⌈k/2⌉), ≤ 2 degrades, budget.degrade_retries counted) and the
     terminal follows the §3.5 matrix (reactive-400 feeds the breaker exactly
     once). Budget off (cw == 0) → the pre-v1.11 build/call path byte-identically
-    (the finish-oracle overflow can still surface; it propagates unfed)."""
+    (the finish-oracle overflow can still surface; it propagates unfed).
+    v1.13: both call sites (budget-off and packed) route through
+    _complete_annotation, which carries the per-class schema override."""
     cfg = ctx.cfg
-    profile = cfg.annotate.llm
-    prof = cfg.llm_profiles.get(profile)
+    prof = cfg.llm_profiles.get(cfg.annotate.llm)
+    schema = class_annotate_schema(cfg, label)     # v1.13：按类 Schema 覆盖
     if prof is None or prof.context_window <= 0:
         prompt = build_annotate_prompt(record, cfg, schema_text, repair=repair,
                                        temperature=temperature, label=label,
                                        transitions=transitions,
                                        fragment_lens=fragment_lens,
                                        k_eff=k_eff, image_px=image_px)
-        return await ctx.schema_engine.complete_validated(
-            profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
-            record=record.raw)
+        return await _complete_annotation(ctx, record, prompt, schema)
 
     k_current = k_eff
     degrades = 0
@@ -542,9 +635,7 @@ async def _budgeted_call(record: Record, ctx: "RunContext",
                 _feed_reactive_terminal(pending, ctx.metrics)
             raise
         try:
-            return await ctx.schema_engine.complete_validated(
-                profile, prompt, record_ids=(record.id,), batch_no=ctx.batch_no,
-                record=record.raw)
+            return await _complete_annotation(ctx, record, prompt, schema)
         except ContextOverflowError as exc:
             if k_used > 2 and degrades < 2:
                 degrades += 1
@@ -679,9 +770,14 @@ async def annotate_record(record: Record, ctx: "RunContext",
     keyframe cap halved to max(2, ⌈k/2⌉), image_px = one rung up at 1.5×/dim ≤
     max_image_px, budget re-checked by M7 against the calibrated estimate); M5's own
     V20 overflow degrade passes k_eff alone (inside _budgeted_call). Both ride
-    build_annotate_prompt on EVERY path — None/None = pre-v1.11 byte-identical."""
+    build_annotate_prompt on EVERY path — None/None = pre-v1.11 byte-identical.
+    v1.13 (裁决·按类标注 Schema): label ALSO selects the annotation schema —
+    prompt text, M8 call, self-consistency vote and budget pricing all read the
+    class-effective schema through the single lookup point; a class-schema call
+    keeps user treatment (L2.5 + resolved_at). M7's repair re-annotation
+    inherits this by passing the same label — no repair-side change."""
     cfg = ctx.cfg
-    schema_text = ctx.schema_engine.user_schema_text
+    schema_text = class_schema_text(ctx, label)    # v1.13：按类 Schema 文本
     n = cfg.annotate.self_consistency
 
     if repair is not None or n == 0:
@@ -715,7 +811,9 @@ async def annotate_record(record: Record, ctx: "RunContext",
             ["self-consistency: all samples failed"], "")
 
     outputs = [obj for obj, _, _, _ in valid]
-    chosen, matches, disagreed = _majority_vote(outputs, cfg.user_schema)
+    # v1.13：可投票字段取自类有效 Schema（按类 Schema 的字段集可与全局不同）。
+    chosen, matches, disagreed = _majority_vote(
+        outputs, class_effective_schema(cfg, label))
     if disagreed:
         ctx.metrics.count("annotate.sc_disagreements")
 

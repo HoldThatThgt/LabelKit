@@ -282,10 +282,39 @@ class GenerateStyle:
 
 
 @dataclass(frozen=True)
+class GenerateStreamConfig:                       # v1.13（spec 5.2 [generate.stream]）：
+                                                  # generate_only 的时间流形态——LLM 只做
+                                                  # 蓝图与帧实现两类内容调用，装箱/交叉/噪音/
+                                                  # 重复/时间戳全部由机械交织器完成。默认关；
+                                                  # 全关 ⇒ 与 v1.12 字节等价
+    enabled: bool = False                         # 形态总开关；true ⇒ generate_only ∧ text
+                                                  # ∧ generate.enabled ∧ classify.enabled
+                                                  # ∧ stream.order_by = "meta:<字段>"
+                                                  # ∧ output.meta_mode != "none"（M1 硬合取）
+    sessions: int = 0                             # 会话数（≥ 1）；交叉会话数 =
+                                                  # Σsequences − sessions，故 M1 要求
+                                                  # sessions ≤ Σsequences ≤ 2 × sessions
+                                                  # （交叉并发度恒 k ∈ {1, 2}）
+    noise_ratio: float = 0.0                      # 噪音帧 / 任务帧 比例，[0,1)；
+                                                  # 噪音帧数 = round(noise_ratio × 任务帧数)
+    noise_instruction: str = ""                   # 噪音帧生成指令；noise_ratio > 0 时必填非空
+    duplicates: int = 0                           # 原样重发的序列条数（0 = 无；≤ Σsequences）
+                                                  # ——重发帧逐字节同源，恒落流尾新会话
+    frame_gap_s: tuple[float, float] = (5.0, 60.0)
+                                                  # 会话内帧间隔的均匀采样区间（秒）；
+                                                  # M1: 0 < lo ≤ hi < stream.gap_s（会话内
+                                                  # 间隔须小于会话切分阈值，否则自相矛盾）
+    ts_start: str = "2026-01-01T00:00:00Z"        # 时间流起点（ISO-8601；恒不取墙钟——
+                                                  # 同 seed 双跑工件逐字节一致）
+
+
+@dataclass(frozen=True)
 class GenerateConfig:
     enabled: bool = False
     llms: tuple[str, ...] = ("default",)
-    instruction: str = ""                         # required iff enabled
+    instruction: str = ""                         # required iff enabled (v1.13: the
+                                                  # time-stream form carries the task in
+                                                  # the per-class instructions instead)
     mixture: Literal["round_robin", "weighted"] = "round_robin"
     weights: tuple[float, ...] = ()               # required iff mixture="weighted"; len == len(llms)
     styles: tuple[GenerateStyle, ...] = ()
@@ -300,6 +329,11 @@ class GenerateConfig:
     seed_examples: tuple[str, ...] = ()           # generate_only seed-pool form only
     standalone_count: int | None = None           # generate_only seedless form only; mutually
                                                   # exclusive with seed_examples
+    sequences: int = 0                            # v1.13 时间流形态：该类的序列**尝试配额**
+                                                  # （全局设默认、[class.<name>.generate]
+                                                  # 覆盖）；0 = 该类不参与生成
+    len_range: tuple[int, int] = (3, 6)           # v1.13 时间流形态：单序列步数的均匀采样
+                                                  # 区间（1 ≤ lo ≤ hi；类覆盖照常）
 
 
 @dataclass(frozen=True)
@@ -390,6 +424,12 @@ class ClassView:
     extract: ExtractConfig                        # v1.8 (S3): only `instruction` is whitelisted;
                                                   # segment has no per-class view (runs before
                                                   # classify — labels do not exist yet)
+    schema: Mapping | None = None                 # v1.13（裁决·按类标注 Schema）：该类的
+                                                  # 标注输出 Schema——[class.<name>.annotate]
+                                                  # 的 schema_path/schema_inline 解析产物
+                                                  # （至多其一）；None = 回落全局
+                                                  # output.schema（覆盖语义，rubric 按类
+                                                  # 重资产先例）
 
 
 # ── frame granularity（v1.12，spec §3.1 [frame.classify]/[frame.annotate]/[frame.class.*]）──
@@ -436,6 +476,13 @@ class FrameClassView:                             # v1.12：一个帧类的生�
     examples: tuple[FewShotExample, ...]          # 生效 few-shot（类覆盖 > 全局）
     enabled: bool                                 # false ⇒ 该类成员跳过帧标注（省成本面；
                                                   # 成员在 members[] 呈现 status="skipped"）
+    gen_instruction: str | None = None            # v1.13（裁决·帧类生成面）：该帧类的内容
+                                                  # 生成指令（[frame.class.<name>.generate]
+                                                  # .instruction）；None = 未声明——时间流
+                                                  # 生成形态下每个帧类都必填（M1 校验）
+    gen_schema: Mapping | None = None             # v1.13：该帧类的生成 Schema 解析产物
+                                                  # （至多其一的 schema_path/schema_inline）；
+                                                  # None = 纯文本帧（帧内容直取文本）
 
 
 # ── CLI overrides and the aggregate ────────────────────────────────────────
@@ -496,3 +543,7 @@ class ResolvedConfig:
     frame_schema: Mapping | None = None           # v1.12：帧级输出 Schema 解析产物（user_schema
                                                   # 同胞：元校验 + few-shot 干跑）；frame.annotate
                                                   # 关闭时恒 None
+    generate_stream: GenerateStreamConfig = GenerateStreamConfig()
+                                                  # v1.13：时间流生成形态（默认关 = 字节等价
+                                                  # v1.12；沿用 v1.12 帧粒度四字段的
+                                                  # 「尾部追加带默认」惯例）

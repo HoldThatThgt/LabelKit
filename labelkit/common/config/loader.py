@@ -24,6 +24,7 @@ import re
 import sys
 import tomllib
 from dataclasses import replace
+from datetime import datetime
 from importlib import resources
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,6 +52,7 @@ from labelkit.common.config.model import (
     FrameClassifyConfig,
     FrameClassView,
     GenerateConfig,
+    GenerateStreamConfig,
     GenerateStyle,
     InputConfig,
     LLMProfile,
@@ -102,10 +104,14 @@ _RUBRIC_SELECTORS = ("default:text", "default:ui", "default:trajectory", "inline
 # rubric sub-table companion of quality.rubric = "inline" (R7). v1.8 adds
 # "extract" (instruction only, S2); segment stays OUT of the whitelist — it runs
 # before classify, so class labels do not exist yet (chain-order causality).
+# v1.13 增两族键：annotate 的 schema_path/schema_inline（裁决·按类标注 Schema，
+# 覆盖语义、缺省回落全局 output.schema）与 generate 的 sequences/len_range
+# （时间流形态的按类配额与序列长度区间载体）。
 _CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "quality": ("mode", "rounds", "rubric", "threshold", "selection", "top_ratio"),
-    "annotate": ("instruction", "examples"),
-    "generate": ("instruction", "styles", "num_per_record", "temperature"),
+    "annotate": ("instruction", "examples", "schema_path", "schema_inline"),
+    "generate": ("instruction", "styles", "num_per_record", "temperature",
+                 "sequences", "len_range"),
     "verify": ("extra_criteria",),
     "extract": ("instruction",),
 }
@@ -119,9 +125,26 @@ _SELECTION_GROUP = ("selection", "threshold", "top_ratio")
 
 # v1.12 [frame.class.<name>.<section>] 覆盖白名单（SPEC-frame-annotation §3.1）：帧类
 # 命名空间与 [class.*] 同为 M1 显名拥有（R25 家族）——白名单外键/节是 CONFIG_ERROR，
-# 不走前向兼容 WARN。仅 annotate 一节可覆盖，三键：instruction / examples / enabled。
-_FRAME_CLASS_SECTIONS = ("annotate",)
-_FRAME_ANNOTATE_KEYS = ("instruction", "examples", "enabled")
+# 不走前向兼容 WARN。annotate 节三键：instruction / examples / enabled。
+# v1.13（裁决·帧类生成面）增 generate 节三键：instruction（时间流生成形态下每个帧类
+# 必填）+ schema_path/schema_inline（至多其一；均缺 = 纯文本帧）——该节**仅时间流
+# 生成形态合法**，非本形态出现是定向 CONFIG_ERROR（在 load() 的约束簇上报）。
+_FRAME_CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
+    "annotate": ("instruction", "examples", "enabled"),
+    "generate": ("instruction", "schema_path", "schema_inline"),
+}
+_FRAME_CLASS_SECTIONS = tuple(_FRAME_CLASS_SECTION_KEYS)
+
+# v1.13 时间流形态的定向禁设键（v1.11 use_vision 原始节探针同款机制）：这四个键属于
+# generate 的**另外两种形态**（种子池 / 独立计数 / 逐记录扩增 / 每调用种子数），在时间流
+# 形态下显式书写是 CONFIG_ERROR，而非白名单外键的前向兼容 WARN。
+_STREAM_FORBIDDEN_GEN_KEYS = ("seed_examples", "standalone_count",
+                              "num_per_record", "seeds_per_call")
+# 按类生成节的同族禁设键（num_per_record 在本形态从白名单语义中除名）。
+_STREAM_FORBIDDEN_CLASS_GEN_KEYS = ("num_per_record", "seeds_per_call")
+
+# [generate.stream].ts_start 缺省：恒不取墙钟（同 seed 双跑工件逐字节一致）。
+_TS_START_DEFAULT = "2026-01-01T00:00:00Z"
 
 
 # ── low-level helpers ──────────────────────────────────────────────────────
@@ -298,6 +321,43 @@ class _Tbl:
         for k in self.data:
             if k not in self.seen:
                 self.col.warn(f"{self.loc(k)}: 未知键，已忽略（前向兼容）")
+
+
+def _int_pair(t: _Tbl, key: str, default: tuple[int, int]) -> tuple[int, int]:
+    """v1.13：读取 [lo, hi] 整数闭区间（len_range 形）——长度恰 2、元素为整数、
+    1 ≤ lo ≤ hi。任一违反记录错误并返回 ``default``（聚合式，绝不提前抛）。"""
+    v = t.take(key)
+    if v is _MISSING:
+        return default
+    expected = "长度为 2 的整数区间数组 [lo, hi]（1 ≤ lo ≤ hi）"
+    if (not isinstance(v, list) or len(v) != 2
+            or any(isinstance(e, bool) or not isinstance(e, int) for e in v)):
+        t.err(key, expected, v)
+        return default
+    lo, hi = int(v[0]), int(v[1])
+    if lo < 1 or lo > hi:
+        t.err(key, expected, v)
+        return default
+    return lo, hi
+
+
+def _num_pair(t: _Tbl, key: str,
+              default: tuple[float, float]) -> tuple[float, float]:
+    """v1.13：读取 [lo, hi] 数值闭区间（frame_gap_s 形）——长度恰 2、元素为数值、
+    0 < lo ≤ hi。跨节上界（hi < stream.gap_s）留给形态约束簇。"""
+    v = t.take(key)
+    if v is _MISSING:
+        return default
+    expected = "长度为 2 的数值区间数组 [lo, hi]（0 < lo ≤ hi，单位秒）"
+    if (not isinstance(v, list) or len(v) != 2
+            or any(isinstance(e, bool) or not isinstance(e, (int, float)) for e in v)):
+        t.err(key, expected, v)
+        return default
+    lo, hi = float(v[0]), float(v[1])
+    if lo <= 0 or lo > hi:
+        t.err(key, expected, v)
+        return default
+    return lo, hi
 
 
 def _section(col: _Collector, top: _Tbl, key: str) -> Any:
@@ -659,6 +719,30 @@ def _parse_classes(col: _Collector, file: str, raw: Any,
     return tuple(classes)
 
 
+def _parse_generate_stream(col: _Collector, file: str,
+                           raw: Any) -> GenerateStreamConfig:
+    """v1.13：解析 [generate.stream] 子表（_frame_sub 先例——子表经父表 take 取出，
+    非表即定位错误）。结构性校验（类型、区间数组形状、内在序关系）在此完成；跨节与
+    形态相关的约束（sessions ≤ Σsequences、frame_gap 上界、织造上限……）留给 load()
+    的形态约束簇——本形态关闭时那些键只是停放配置，不构成错误。"""
+    if raw is not _MISSING and not isinstance(raw, dict):
+        col.error(f"{file}:[generate].stream: 期望表（table），得到 {_fmt(raw)}")
+        raw = _MISSING
+    t = _Tbl(col, file, "[generate.stream]", raw if isinstance(raw, dict) else None)
+    cfg = GenerateStreamConfig(
+        enabled=t.get_bool("enabled", False),
+        sessions=t.get_int("sessions", 0, minimum=0),
+        noise_ratio=t.get_float("noise_ratio", 0.0),   # [0,1) 由形态约束簇裁定
+        noise_instruction=t.get_str("noise_instruction", "") or "",
+        duplicates=t.get_int("duplicates", 0, minimum=0),
+        frame_gap_s=_num_pair(t, "frame_gap_s", (5.0, 60.0)),
+        ts_start=t.get_str("ts_start", _TS_START_DEFAULT, nonempty=True)
+        or _TS_START_DEFAULT,
+    )
+    t.finish()
+    return cfg
+
+
 def _parse_judgment_reasons(col: _Collector, t: _Tbl) -> bool | str:
     v = t.take("judgment_reasons")
     if v is _MISSING:
@@ -919,12 +1003,16 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
         sample_validator=t.get_str("sample_validator", None, nonempty=True),
         seed_examples=t.get_str_tuple("seed_examples", ()),
         standalone_count=t.get_int("standalone_count", None, minimum=1),
+        sequences=t.get_int("sequences", 0, minimum=0),          # v1.13 全局默认配额
+        len_range=_int_pair(t, "len_range", (3, 6)),             # v1.13 全局默认区间
     )
-    # distinguish "explicitly set" from "dataclass default" for the mode rules
+    # distinguish "explicitly set" from "dataclass default" for the mode rules;
+    # v1.13 起同一张表兼作时间流形态的原始节禁设键探针（四键，_STREAM_FORBIDDEN_GEN_KEYS）
     gen_provided = {
-        "seed_examples": isinstance(gen_section, dict) and "seed_examples" in gen_section,
-        "standalone_count": isinstance(gen_section, dict) and "standalone_count" in gen_section,
+        key: isinstance(gen_section, dict) and key in gen_section
+        for key in _STREAM_FORBIDDEN_GEN_KEYS
     }
+    generate_stream = _parse_generate_stream(col, file, t.take("stream"))
     top_ratio_provided = isinstance(quality_section, dict) and "top_ratio" in quality_section
     t.finish()
 
@@ -997,7 +1085,7 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> dict[str, Any
         stream_provided=stream_provided, segment_provided=segment_provided,
         stitch_provided=stitch_provided, extract_provided=extract_provided,
         sequence_frames_provided=sequence_frames_provided,
-        quality=quality, generate=generate,
+        quality=quality, generate=generate, generate_stream=generate_stream,
         gen_provided=gen_provided, top_ratio_provided=top_ratio_provided,
         annotate=annotate, verify=verify, output=output,
         trace=trace, rubric_raw=rubric_raw,
@@ -1119,6 +1207,59 @@ def _load_user_schema(col: _Collector, file: str, output: OutputConfig) -> tuple
                       f"（$ref {_fmt(ref)}）：{why}")
             ok = False
     return schema, ok
+
+
+def _load_class_schema(col: _Collector, file: str, cname: str,
+                       sp: str | None, si: str | None) -> dict | None:
+    """v1.13（裁决·按类标注 Schema）：装载 [class.<name>.annotate] 的按类标注
+    Schema——语义是**至多其一**（两者均缺 = 覆盖未声明，回落全局 output.schema），
+    声明了就走 _load_schema_pair 全套（读取 / JSON 解析 / 顶层对象 / draft 2020-12
+    元校验 / 顶层 type = "object"），再加 output.schema 同款的 "_meta" 保留键禁令与
+    $ref 可解析性遍历（运行期不取外部资源，悬空引用必然每条记录都炸）。
+    错误定位前缀 = "<file>:[class.<name>.annotate].schema_*"。
+    Returns 解析后的 Schema；未声明或不可用（错误已聚合上报）时返回 None。"""
+    if sp is None and si is None:
+        return None
+    section = f"class.{cname}.annotate"
+    schema, ok, key = _load_schema_pair(col, file, section, "按类标注 Schema", sp, si)
+    props = schema.get("properties")
+    if isinstance(props, dict) and "_meta" in props:
+        col.error(f'{file}:[{section}].{key}: 按类标注 Schema 顶层不得声明保留键 '
+                  f'"_meta"（6.3 信封字段由工具写入），得到 properties 含 "_meta"')
+        ok = False
+    if ok:
+        for ref, why in _unresolvable_refs(schema):
+            col.error(f"{file}:[{section}].{key}: 按类标注 Schema 引用无法解析"
+                      f"（$ref {_fmt(ref)}）：{why}")
+            ok = False
+    return schema if ok else None
+
+
+def _load_frame_gen(col: _Collector, file: str, cname: str,
+                    sections: dict) -> tuple[str | None, dict | None]:
+    """v1.13（裁决·帧类生成面）：解析 [frame.class.<name>.generate] 白名单三键——
+    instruction（时间流生成形态下每个帧类必填，缺失由形态约束簇上报）与
+    schema_path/schema_inline（**至多其一**；均缺 = 纯文本帧）。Schema 走
+    _load_schema_pair 全套 + $ref 可解析性遍历；无 "_meta" 分支——帧内容落工件行的
+    文本字段，与 §6.3 信封字段无冲突面（帧级 Schema 同理）。
+    Returns (生成指令 | None, 生成 Schema | None)。"""
+    sub = sections.get("generate")
+    if not isinstance(sub, dict):
+        return None, None            # 缺节 / 非表（非表已由白名单校验定位上报）
+    section = f"frame.class.{cname}.generate"
+    t = _Tbl(col, file, f"[{section}]", sub)
+    instruction = t.get_str("instruction", None, nonempty=True)
+    sp = t.get_str("schema_path", None, nonempty=True)
+    si = t.get_str("schema_inline", None, nonempty=True)
+    if sp is None and si is None:
+        return instruction, None
+    schema, ok, key = _load_schema_pair(col, file, section, "帧类生成 Schema", sp, si)
+    if ok:
+        for ref, why in _unresolvable_refs(schema):
+            col.error(f"{file}:[{section}].{key}: 帧类生成 Schema 引用无法解析"
+                      f"（$ref {_fmt(ref)}）：{why}")
+            ok = False
+    return instruction, (schema if ok else None)
 
 
 def _load_frame_schema(col: _Collector, file: str,
@@ -1275,7 +1416,9 @@ def _merge_class_sections(
       (R7) needs the merged selector, so it is returned raw via `info`.
 
     Returns (quality, annotate, generate, verify, extract, info) with info =
-    {"rubric_raw", "examples_provided"}."""
+    {"rubric_raw", "examples_provided", "schema_path", "schema_inline"} (v1.13:
+    the last two carry the per-class annotate Schema sources — loaded by
+    _load_class_schema on the load() side, next to the few-shot dry-run)."""
     for sect, sub in sections.items():
         if sect not in _CLASS_SECTIONS:
             col.error(f"{file}:[class.{cname}.{sect}]: [class.*] 覆盖节不在白名单内"
@@ -1296,37 +1439,7 @@ def _merge_class_sections(
         sub = sections.get(name)
         return sub if isinstance(sub, dict) else {}
 
-    # ── quality: selection-group takeover (R6), then per-key overrides ────
-    q_over = _sect("quality")
-    group_taken = any(k in q_over for k in _SELECTION_GROUP)
-    base_q = (replace(base_quality, selection="threshold", threshold=None, top_ratio=None)
-              if group_taken else base_quality)
-    t = _Tbl(col, file, f"[class.{cname}.quality]", q_over)
-    quality = replace(
-        base_q,
-        mode=t.get_str("mode", base_q.mode, enum=("pairwise", "pointwise")),
-        rounds=t.get_int("rounds", base_q.rounds, minimum=1),
-        rubric=t.get_str("rubric", base_q.rubric, enum=_RUBRIC_SELECTORS),
-        threshold=t.get_float("threshold", base_q.threshold, ge=0, le=1),
-        selection=t.get_str("selection", base_q.selection,
-                            enum=("threshold", "top_ratio")),
-        top_ratio=t.get_float("top_ratio", base_q.top_ratio, gt=0, le=1),
-    )
-    if group_taken:
-        # Rule-6 family on the MERGED view (an untouched group was already
-        # validated globally, so re-checking would only duplicate errors).
-        if quality.selection == "top_ratio":
-            if quality.top_ratio is None and "top_ratio" not in q_over:
-                col.error(f'{file}:[class.{cname}.quality].top_ratio: selection = '
-                          f'"top_ratio" 时必填，期望 (0,1] 内的数值')
-            if quality.threshold is not None:
-                col.error(f'{file}:[class.{cname}.quality].threshold: 与 '
-                          f'quality.top_ratio 互斥（selection = "top_ratio" 时不得设置）')
-        elif "top_ratio" in q_over:
-            # Same silent-footgun guard as the global P3-7 warning.
-            col.warn(f'{file}:[class.{cname}.quality].top_ratio: selection 仍为默认 '
-                     f'"threshold"，该键不会生效——要按比例定量保留请同时设 '
-                     f'selection = "top_ratio"')
+    quality = _merge_class_quality(col, file, cname, _sect("quality"), base_quality)
 
     # ── annotate ───────────────────────────────────────────────────────────
     a_over = _sect("annotate")
@@ -1339,6 +1452,10 @@ def _merge_class_sections(
                                   section=f"class.{cname}.annotate")
                   if examples_provided else base_annotate.examples),
     )
+    # v1.13：按类标注 Schema 的两个源键在此只取值，装载与元校验由 load() 侧的
+    # _load_class_schema 统一执行（干跑要与全局 hook 一起做，需要 load() 的上下文）
+    schema_path = t.get_str("schema_path", None, nonempty=True)
+    schema_inline = t.get_str("schema_inline", None, nonempty=True)
 
     # ── generate ───────────────────────────────────────────────────────────
     g_over = _sect("generate")
@@ -1352,6 +1469,8 @@ def _merge_class_sections(
         num_per_record=t.get_int("num_per_record", base_generate.num_per_record,
                                  minimum=1),
         temperature=t.get_float("temperature", base_generate.temperature, ge=0),
+        sequences=t.get_int("sequences", base_generate.sequences, minimum=0),
+        len_range=_int_pair(t, "len_range", base_generate.len_range),
     )
 
     # ── verify ─────────────────────────────────────────────────────────────
@@ -1374,8 +1493,49 @@ def _merge_class_sections(
     info = {
         "rubric_raw": rubric_raw if isinstance(rubric_raw, dict) else None,
         "examples_provided": examples_provided,
+        "schema_path": schema_path,        # v1.13 按类标注 Schema 的两个源键
+        "schema_inline": schema_inline,
     }
     return quality, annotate, generate, verify, extract, info
+
+
+def _merge_class_quality(col: _Collector, file: str, cname: str, q_over: dict,
+                         base_quality: QualityConfig) -> QualityConfig:
+    """[class.<name>.quality] 的合并（R6 选择组接管 + 合并视图上的规则 6 家族）——
+    自 _merge_class_sections 抽出的原样搬迁（行为字节等价），使调用方保持单一职责。
+    选择组语义：类提供 selection/threshold/top_ratio 任一 ⇒ 接管整组，未提供的组内
+    键从内建默认重启（而非全局值），全局 threshold 与类 top_ratio 不会伪共存。"""
+    group_taken = any(k in q_over for k in _SELECTION_GROUP)
+    base_q = (replace(base_quality, selection="threshold", threshold=None, top_ratio=None)
+              if group_taken else base_quality)
+    t = _Tbl(col, file, f"[class.{cname}.quality]", q_over)
+    quality = replace(
+        base_q,
+        mode=t.get_str("mode", base_q.mode, enum=("pairwise", "pointwise")),
+        rounds=t.get_int("rounds", base_q.rounds, minimum=1),
+        rubric=t.get_str("rubric", base_q.rubric, enum=_RUBRIC_SELECTORS),
+        threshold=t.get_float("threshold", base_q.threshold, ge=0, le=1),
+        selection=t.get_str("selection", base_q.selection,
+                            enum=("threshold", "top_ratio")),
+        top_ratio=t.get_float("top_ratio", base_q.top_ratio, gt=0, le=1),
+    )
+    if not group_taken:
+        # An untouched group was already validated globally — re-checking would
+        # only duplicate errors.
+        return quality
+    if quality.selection == "top_ratio":
+        if quality.top_ratio is None and "top_ratio" not in q_over:
+            col.error(f'{file}:[class.{cname}.quality].top_ratio: selection = '
+                      f'"top_ratio" 时必填，期望 (0,1] 内的数值')
+        if quality.threshold is not None:
+            col.error(f'{file}:[class.{cname}.quality].threshold: 与 '
+                      f'quality.top_ratio 互斥（selection = "top_ratio" 时不得设置）')
+    elif "top_ratio" in q_over:
+        # Same silent-footgun guard as the global P3-7 warning.
+        col.warn(f'{file}:[class.{cname}.quality].top_ratio: selection 仍为默认 '
+                 f'"threshold"，该键不会生效——要按比例定量保留请同时设 '
+                 f'selection = "top_ratio"')
+    return quality
 
 
 def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
@@ -1385,6 +1545,8 @@ def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
     帧类命名空间由 M1 显名拥有，白名单外键/节是 CONFIG_ERROR 而非前向兼容
     WARN）。按键溯源：类提供的键覆盖全局值，其余继承；``enabled`` 缺省 true
     （= 该类照常标注；false = 跳过该类成员的帧标注，省成本面）。
+    v1.13：同时物化该帧类的生成面（[frame.class.<name>.generate] 三键白名单）——
+    时间流生成形态的帧内容契约；非本形态出现该节由形态约束簇定向报错。
     Returns (view, examples_provided)——examples_provided 供调用方决定是否对
     类内示例做帧级 Schema 干跑（规则 28 的帧级镜像）。"""
     for sect, sub in sections.items():
@@ -1396,23 +1558,206 @@ def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
             col.error(f"{file}:[frame.class.{cname}.{sect}]: 期望表（table），"
                       f"得到 {_fmt(sub)}")
             continue
+        allowed = _FRAME_CLASS_SECTION_KEYS[sect]
         for k in sub:
-            if k not in _FRAME_ANNOTATE_KEYS:
-                col.error(f"{file}:[frame.class.{cname}.annotate].{k}: "
-                          f"[frame.class.*.annotate] 不可覆盖该键"
-                          f"（白名单：{'、'.join(_FRAME_ANNOTATE_KEYS)}）")
+            if k not in allowed:
+                col.error(f"{file}:[frame.class.{cname}.{sect}].{k}: "
+                          f"[frame.class.*.{sect}] 不可覆盖该键"
+                          f"（白名单：{'、'.join(allowed)}）")
     a_over = sections.get("annotate")
     a_over = a_over if isinstance(a_over, dict) else {}
     t = _Tbl(col, file, f"[frame.class.{cname}.annotate]", a_over)
     examples_provided = "examples" in a_over
+    gen_instruction, gen_schema = _load_frame_gen(col, file, cname, sections)
     view = FrameClassView(
         instruction=t.get_str("instruction", base.instruction, nonempty=True),
         examples=(_parse_examples(col, file, t.take("examples"),
                                   section=f"frame.class.{cname}.annotate")
                   if examples_provided else base.examples),
         enabled=t.get_bool("enabled", True),
+        gen_instruction=gen_instruction,
+        gen_schema=gen_schema,
     )
     return view, examples_provided
+
+
+# ── v1.13 时间流生成形态的组合约束（SPEC-stream-generation §3.1 约束表）──────
+
+
+def _check_generate_stream(col: _Collector, fp: str, gs: GenerateStreamConfig,
+                           v: SimpleNamespace) -> None:
+    """时间流形态（[generate.stream].enabled = true）的 M1 约束簇驱动器。
+
+    ``v`` 是 load() 组装的取值捆包（mode / modality / generate / classify /
+    class_views / stream / meta_mode / frame_classify / frame_annotate /
+    frame_class_views / gen_provided / class_raw / seq_total / len_max）——形态约束
+    横跨十余个节，逐参传递会把签名撑爆。形态关闭时调用方不进入本簇：相关键退化为
+    停放配置，全系统与 v1.12 字节等价。"""
+    _stream_form_premise(col, fp, v)
+    _stream_form_probes(col, fp, v)
+    _stream_form_quota(col, fp, v)
+    _stream_form_packing(col, fp, gs, v)
+    _stream_form_weaving(col, fp, gs, v)
+
+
+def _stream_form_premise(col: _Collector, fp: str, v: SimpleNamespace) -> None:
+    """形态前提合取：generate_only ∧ text ∧ generate.enabled ∧ classify.enabled ∧
+    stream.order_by = "meta:<字段>" ∧ output.meta_mode != "none"——缺一即
+    CONFIG_ERROR，报错文案给出形态语义指引。另含工件键守卫：ts 字段与文本字段
+    不得含点（字面顶层键 vs 点路径解析，往返不成立）、互不同名、均不得为
+    "truth"（工件行三个顶层键互斥）。"""
+    loc = f"{fp}:[generate.stream].enabled"
+    if v.mode != "generate_only":
+        col.error(f'{loc}: 时间流形态要求 run.mode = "generate_only"，得到 '
+                  f"{_fmt(v.mode)}——本形态从零合成时间流，不消费输入数据")
+    if v.modality != "text":
+        col.error(f'{loc}: 时间流形态要求 run.modality = "text"，得到 '
+                  f"{_fmt(v.modality)}（UI 模态时间流生成为 v1.13 非目标）")
+    if not v.generate.enabled:
+        col.error(f"{loc}: 时间流形态要求 generate.enabled = true")
+    if not v.classify.enabled:
+        col.error(f"{loc}: 时间流形态要求 classify.enabled = true——序列类表是配额与"
+                  f"按类条件化的载体，生成侧标签直接继承（inherited，零判决调用）")
+    order_by = v.stream.order_by
+    if not (order_by.startswith("meta:") and order_by[len("meta:"):]):
+        col.error(f'{fp}:[stream].order_by: 时间流形态要求 "meta:<字段名>"（该字段即'
+                  f"工件行的时间戳字段，摄取侧按同一声明可重放），得到 "
+                  f"{_fmt(order_by)}")
+    elif "." in order_by[len("meta:"):]:
+        # 工件行把 ts 字段名当字面顶层键写，而 M2 按点路径解析——带点的字段名
+        # 无法往返（重放侧整份判坏行），本形态定向封死。
+        col.error(f"{fp}:[stream].order_by: 时间流形态的时间戳字段名不得含 \".\""
+                  f"（工件行以其为字面顶层键，点路径在重放摄取时无法往返），得到 "
+                  f"{_fmt(order_by)}")
+    if "." in v.text_field:
+        col.error(f"{fp}:[input].text_field: 时间流形态的文本字段名不得含 \".\""
+                  f"（工件行以其为字面顶层键，点路径在重放摄取时无法往返），得到 "
+                  f"{_fmt(v.text_field)}")
+    ts_field = order_by[len("meta:"):] if order_by.startswith("meta:") else ""
+    # 工件行的三个顶层键（ts 字段、文本字段、truth）互斥——同名即键冲突，行不成立。
+    if ts_field and ts_field == v.text_field:
+        col.error(f"{fp}:[input].text_field: 时间流形态下不得与 [stream].order_by 的"
+                  f"时间戳字段同名（工件行两键冲突），得到 {_fmt(v.text_field)}")
+    for owner, field in (("[input].text_field", v.text_field),
+                         ("[stream].order_by", ts_field)):
+        if field == "truth":
+            col.error(f'{fp}:{owner}: 时间流形态下字段名不得为 "truth"'
+                      f"（与工件行的真值键冲突）")
+    if v.meta_mode == "none":
+        col.error(f'{fp}:[output].meta_mode: 时间流形态下不得为 "none"——帧类真值与'
+                  f"成员对账仅经 _meta.stream 承载（sidecar 合法）")
+
+
+def _stream_form_probes(col: _Collector, fp: str, v: SimpleNamespace) -> None:
+    """定向禁设键探针（v1.11 原始节探针机制）：[generate] 的四个「另一形态」键、
+    [class.*.generate] 的两个同族键、以及帧粒度两开关——本形态下显式书写均为
+    CONFIG_ERROR，不走白名单外键的前向兼容 WARN，报错指明替代面。"""
+    for key in _STREAM_FORBIDDEN_GEN_KEYS:
+        if v.gen_provided.get(key):
+            col.error(f"{fp}:[generate].{key}: 时间流形态不提供该键——序列配额由 "
+                      f"[class.<name>.generate].sequences 承载、序列长度由 len_range "
+                      f"承载、噪音批量由 num_per_call 装箱，请删除该键")
+    for cname, sections in (v.class_raw or {}).items():
+        g_over = sections.get("generate") if isinstance(sections, dict) else None
+        if not isinstance(g_over, dict):
+            continue
+        for key in _STREAM_FORBIDDEN_CLASS_GEN_KEYS:
+            if key in g_over:
+                col.error(f"{fp}:[class.{cname}.generate].{key}: 时间流形态不提供该键"
+                          f"（逐记录扩增 / 每调用种子数属平面生成形态），"
+                          f"请改用 sequences / len_range")
+    for name, on in (("frame.classify", v.frame_classify.enabled),
+                     ("frame.annotate", v.frame_annotate.enabled)):
+        if on:
+            col.error(f"{fp}:[{name}].enabled: 与时间流形态互斥——帧类真值在生成期"
+                      f"已知（蓝图即真值），无需帧级判决；帧内容契约请写 "
+                      f"[frame.class.<name>.generate]")
+
+
+def _stream_form_quota(col: _Collector, fp: str, v: SimpleNamespace) -> None:
+    """类表与配额：至少一个序列类的有效 sequences ≥ 1；参与类（有效 sequences ≥ 1）
+    的有效生成指令非空；帧类表非空且**每个**帧类都有非空的
+    [frame.class.<name>.generate].instruction（蓝图 enum 覆盖全类表）。"""
+    if v.seq_total < 1:
+        col.error(f"{fp}:[class.<name>.generate].sequences: 时间流形态要求至少一个"
+                  f"序列类的有效 sequences ≥ 1（全局 [generate].sequences 可设默认、"
+                  f"按类覆盖），得到各类合计 {v.seq_total}")
+    for name, view in v.class_views.items():
+        if view.generate.sequences >= 1 and not view.generate.instruction.strip():
+            col.error(f"{fp}:[class.{name}.generate].instruction: 参与生成的序列类"
+                      f"（有效 sequences = {view.generate.sequences}）须提供非空生成"
+                      f"指令（全局 [generate].instruction 可设默认）")
+    if not v.frame_classify.classes:
+        col.error(f"{fp}:[[frame.classify.classes]]: 时间流形态要求非空帧类表"
+                  f"（蓝图逐步在该闭集上取值；frame.classify.enabled 保持 false）")
+    for spec in v.frame_classify.classes:
+        view = v.frame_class_views.get(spec.name)
+        if view is None or not (view.gen_instruction or "").strip():
+            col.error(f"{fp}:[frame.class.{spec.name}.generate].instruction: 每个帧类"
+                      f"都须提供非空生成指令（蓝图 enum 覆盖全类表，任一帧类都可能"
+                      f"被选中），期望非空字符串")
+
+
+def _stream_form_packing(col: _Collector, fp: str, gs: GenerateStreamConfig,
+                         v: SimpleNamespace) -> None:
+    """装箱一致性：sessions ≥ 1 ∧ sessions ≤ Σsequences ≤ 2 × sessions（交叉并发度
+    恒 k ∈ {1, 2}，交叉会话数 = Σsequences − sessions）；duplicates ∈ [0, Σsequences]；
+    noise_ratio ∈ [0,1) 且 > 0 时 noise_instruction 必填；frame_gap_s 上界 <
+    stream.gap_s。"""
+    total = v.seq_total
+    if gs.sessions < 1:
+        col.error(f"{fp}:[generate.stream].sessions: 期望 ≥ 1 的整数（会话数），"
+                  f"得到 {gs.sessions}")
+    elif not gs.sessions <= total <= 2 * gs.sessions:
+        col.error(f"{fp}:[generate.stream].sessions: 期望 sessions ≤ Σsequences ≤ "
+                  f"2 × sessions（交叉会话数 = Σsequences − sessions，交叉并发度恒 "
+                  f"k ∈ 1,2），得到 sessions = {gs.sessions}、Σsequences = {total}")
+    if gs.duplicates > total:
+        col.error(f"{fp}:[generate.stream].duplicates: 期望 [0, Σsequences] 内的整数"
+                  f"（重发序列取自幸存序列），得到 {gs.duplicates}，"
+                  f"Σsequences = {total}")
+    if not 0 <= gs.noise_ratio < 1:
+        col.error(f"{fp}:[generate.stream].noise_ratio: 期望 [0,1) 内的数值"
+                  f"（噪音帧 / 任务帧 比例），得到 {_fmt(gs.noise_ratio)}")
+    elif gs.noise_ratio > 0 and not gs.noise_instruction.strip():
+        col.error(f"{fp}:[generate.stream].noise_instruction: noise_ratio > 0 时必填，"
+                  f"期望非空字符串（噪音帧的生成指令）")
+    if gs.frame_gap_s[1] >= v.stream.gap_s:
+        col.error(f"{fp}:[generate.stream].frame_gap_s: 上界须 < stream.gap_s"
+                  f"（= {v.stream.gap_s}；否则会话内帧间隔自身就触发会话切分），"
+                  f"得到上界 {_fmt(gs.frame_gap_s[1])}")
+
+
+def _stream_form_weaving(col: _Collector, fp: str, gs: GenerateStreamConfig,
+                         v: SimpleNamespace) -> None:
+    """织造上限与铺设契约：2 × max(各类 len_range 上界) ≤ stream.session_max_len
+    （交叉会话恒装两条序列）；stream.key 须为空数组、stream.gap_steps 须为 0（分区键
+    与序差断开同生成侧的铺设契约冲突）；session_max_span_s > 0 时按最坏帧间隔做静态
+    跨度校验；ts_start 须可解析为 ISO-8601 时刻。"""
+    if 2 * v.len_max > v.stream.session_max_len:
+        col.error(f"{fp}:[stream].session_max_len: 时间流形态要求 ≥ 2 × "
+                  f"max(len_range 上界)（交叉会话恒装两条序列），得到 "
+                  f"{v.stream.session_max_len} < {2 * v.len_max}")
+    if v.stream.key:
+        col.error(f"{fp}:[stream].key: 时间流形态要求空数组——会话由交织器直接铺设，"
+                  f"分区键不参与，得到 {_fmt(list(v.stream.key))}")
+    if v.stream.gap_steps:
+        col.error(f"{fp}:[stream].gap_steps: 时间流形态要求 0——会话边界由交织器直接"
+                  f"铺设（会话间隔恒 > gap_s），序差断开不参与，"
+                  f"得到 {v.stream.gap_steps}")
+    span = v.stream.session_max_span_s
+    worst = (v.stream.session_max_len - 1) * gs.frame_gap_s[1]
+    if span > 0 and worst > span:
+        col.error(f"{fp}:[stream].session_max_span_s: 最坏会话跨度 "
+                  f"(session_max_len − 1) × frame_gap_s 上界 = {worst:g} 秒 > "
+                  f"{span} 秒——铺设出的会话会被摄取侧按跨度硬切，请调大 "
+                  f"session_max_span_s、调小 frame_gap_s 上界或调小 session_max_len")
+    try:
+        datetime.fromisoformat(gs.ts_start)
+    except ValueError:
+        col.error(f'{fp}:[generate.stream].ts_start: 期望可解析的 ISO-8601 时刻'
+                  f'（如 "2026-01-01T09:00:00+08:00"；无时区视为 UTC，与 '
+                  f"meta:<字段> 摄取规则一致），得到 {_fmt(gs.ts_start)}")
 
 
 # ── public API ─────────────────────────────────────────────────────────────
@@ -1509,6 +1854,7 @@ def load(config_path: Path, project_path: Path,
     sequence_frames_provided: bool = p["sequence_frames_provided"]
     quality: QualityConfig = p["quality"]
     generate: GenerateConfig = p["generate"]
+    generate_stream: GenerateStreamConfig = p["generate_stream"]   # v1.13
     gen_provided: dict[str, bool] = p["gen_provided"]
     annotate: AnnotateConfig = p["annotate"]
     verify: VerifyConfig = p["verify"]
@@ -1669,19 +2015,23 @@ def load(config_path: Path, project_path: Path,
         if not generate.enabled:
             col.error(f'{fp}:[generate].enabled: run.mode = "generate_only" 要求 '
                       f"generate.enabled = true")
-        if seed_examples_set and standalone_set:
-            col.error(f"{fp}:[generate].seed_examples: 与 standalone_count 互斥，"
-                      f"恰好提供其一")
-        elif not seed_examples_set and not standalone_set:
-            col.error(f"{fp}:[generate].seed_examples: generate_only 模式要求提供 "
-                      f"seed_examples（非空字符串数组）或 standalone_count（≥ 1）其一")
-        elif seed_examples_set:
-            if not generate.seed_examples:
-                col.error(f"{fp}:[generate].seed_examples: 期望非空字符串数组，得到空数组")
-            for i, s in enumerate(generate.seed_examples, 1):
-                if not s.strip():
-                    col.error(f"{fp}:[generate].seed_examples[{i}]: 期望非空字符串，"
-                              f"得到 {_fmt(s)}")
+        # v1.13：时间流形态自带配额面（按类 sequences × len_range）——种子池与独立
+        # 计数两族键都不适用（显式书写由形态约束簇定向报错），互斥校验仅平面形态执行
+        if not generate_stream.enabled:
+            if seed_examples_set and standalone_set:
+                col.error(f"{fp}:[generate].seed_examples: 与 standalone_count 互斥，"
+                          f"恰好提供其一")
+            elif not seed_examples_set and not standalone_set:
+                col.error(f"{fp}:[generate].seed_examples: generate_only 模式要求提供 "
+                          f"seed_examples（非空字符串数组）或 standalone_count（≥ 1）其一")
+            elif seed_examples_set:
+                if not generate.seed_examples:
+                    col.error(f"{fp}:[generate].seed_examples: 期望非空字符串数组，"
+                              f"得到空数组")
+                for i, s in enumerate(generate.seed_examples, 1):
+                    if not s.strip():
+                        col.error(f"{fp}:[generate].seed_examples[{i}]: 期望非空字符串，"
+                                  f"得到 {_fmt(s)}")
         # standalone_count >= 1 already enforced at parse time
     else:  # process mode
         if seed_examples_set:
@@ -1701,8 +2051,11 @@ def load(config_path: Path, project_path: Path,
         referenced.add(segment.llm)      # v1.8, S30 reference-set point ②
     if stitch.enabled:
         referenced.add(stitch.llm)       # v1.9, T17 reference-set point
-    if classify.enabled:
-        referenced.add(classify.llm)     # v1.7, R24 reference-set point ②
+    if classify.enabled and not generate_stream.enabled:
+        # v1.7, R24 reference-set point ②; v1.13：时间流形态的序列标签直接继承
+        # （inherited，classify 零判决调用）⇒ 援引 S30 先例豁免密钥引用集——存在性
+        # 检查照旧（拼错 profile 名仍要在启动期揪出，不需要活密钥）
+        referenced.add(classify.llm)
     if frame_classify.enabled:
         referenced.add(frame_classify.llm)   # v1.12 帧级分类 reference-set point
     if frame_annotate.enabled:
@@ -1788,9 +2141,11 @@ def load(config_path: Path, project_path: Path,
     # rubric for BOTH modalities (per-frame default:ui criteria are meaningless
     # for imageless sequence scoring); an explicit selector always wins, and
     # per-class views inherit through the backfilled base selector.
+    # v1.13（裁决·轨迹准则自动解析扩展）: the空 selector 条件扩为
+    # segment.enabled ∨ generate_stream.enabled — 时间流形态打的也是序列/轨迹分。
     if quality.rubric:
         selector = quality.rubric
-    elif segment.enabled:
+    elif segment.enabled or generate_stream.enabled:
         selector = "default:trajectory"
     else:
         selector = "default:ui" if modality == "ui" else "default:text"
@@ -1819,14 +2174,19 @@ def load(config_path: Path, project_path: Path,
                      f"{'、'.join(ignored)} 不会生效，已忽略（留配置、关开关合法）")
     else:
         avail = "、".join(class_names) if class_names else "（无）"
-        if len(classify.classes) < 2:
+        # v1.13（裁决·序列类约束按形态放宽）：时间流形态无判决路径（标签 inherited），
+        # 「≥ 2 类」与「fallback_class 必填」两条规则的保护对象不存在 ⇒ 放宽为 ≥ 1 类、
+        # fallback 免填（写了仍须 ∈ 类表）。
+        min_classes = 1 if generate_stream.enabled else 2
+        if len(classify.classes) < min_classes:
             col.error(f"{fp}:[classify].classes: classify.enabled = true 时须声明 "
-                      f"≥ 2 个类别（[[classify.classes]] 表数组），"
+                      f"≥ {min_classes} 个类别（[[classify.classes]] 表数组），"
                       f"得到 {len(classify.classes)} 个")
-        if not classify.fallback_class:
+        if not classify.fallback_class and not generate_stream.enabled:
             col.error(f"{fp}:[classify].fallback_class: classify.enabled = true 时必填，"
                       f"期望 [[classify.classes]] 中的类名")
-        elif class_names and classify.fallback_class not in class_names:
+        elif classify.fallback_class and class_names \
+                and classify.fallback_class not in class_names:
             col.error(f"{fp}:[classify].fallback_class: 引用的类名 "
                       f"{_fmt(classify.fallback_class)} 不在 [[classify.classes]] 中，"
                       f"可用：{avail}")
@@ -1861,7 +2221,8 @@ def load(config_path: Path, project_path: Path,
                     extract)
             else:
                 q_c, a_c, g_c, v_c, e_c = base_q, annotate, generate, verify, extract
-                info = {"rubric_raw": None, "examples_provided": False}
+                info = {"rubric_raw": None, "examples_provided": False,
+                        "schema_path": None, "schema_inline": None}
 
             # rubric (R7): merged selector → re-resolve; per-key provenance for
             # the inline table ([class.<name>.rubric] beats the global [rubric])
@@ -1903,21 +2264,36 @@ def load(config_path: Path, project_path: Path,
                 _check_pointwise_rubric(col, fp, rubric_c, is_inline=inline_c,
                                         selector=rkey, scope=rscope)
 
-            # class-provided examples dry-run against the GLOBAL user schema and
-            # validator hook (inherited examples were already dry-run above)
-            if info["examples_provided"] and a_c.examples:
-                v_arg = schema_validator if schema_alive else None
-                h_arg = output_hook if (hook_alive and schema_ok) else None
+            # v1.13（裁决·按类标注 Schema）：装载该类的标注 Schema（覆盖语义，
+            # 未声明 = None = 回落全局 output.schema）。
+            schema_c = _load_class_schema(col, fp, cname, info["schema_path"],
+                                          info["schema_inline"])
+
+            # few-shot 干跑：过**类有效 Schema** + 全局 hook（v1.13 修正——此前恒过
+            # 全局 Schema，类自带 Schema 时会误判）。类自带 Schema 时，继承来的全局
+            # 示例也要按类 Schema 复跑一遍（运行期就是按类 Schema 发出去的）。
+            if a_c.examples and (info["examples_provided"] or schema_c is not None):
+                own = schema_c is not None
+                v_arg = (Draft202012Validator(schema_c) if own
+                         else (schema_validator if schema_alive else None))
+                key_c = (("schema_inline" if info["schema_inline"] is not None
+                          else "schema_path") if own else skey)
                 s_ok, h_ok = _dryrun_fewshot(
                     col, fp, a_c.examples, f"class.{cname}.annotate.examples",
-                    validator=v_arg, schema_key=skey, hook=h_arg,
-                    hook_ref=output.validator)
-                schema_alive = schema_alive and s_ok
+                    validator=v_arg, schema_key=key_c,
+                    hook=output_hook if (hook_alive and schema_ok) else None,
+                    hook_ref=output.validator,
+                    schema_section=f"class.{cname}.annotate" if own else "output",
+                    schema_noun="按类标注 Schema" if own else "用户 Schema")
+                if not own:
+                    # 全局 Schema 的 $ref 解析死了才停后续类的干跑；类自带 Schema
+                    # 的失败只属于该类，不牵连全局层。
+                    schema_alive = schema_alive and s_ok
                 hook_alive = hook_alive and h_ok
 
             class_views[cname] = ClassView(name=cname, quality=q_c, rubric=rubric_c,
                                            annotate=a_c, generate=g_c, verify=v_c,
-                                           extract=e_c)
+                                           extract=e_c, schema=schema_c)
 
     # ── rules 17–19 — stage combination matrix (spec 2.3.1 ①–③) ───────────
     if not annotate.enabled and not quality.enabled:
@@ -2045,7 +2421,10 @@ def load(config_path: Path, project_path: Path,
         # no-op warnings (R8 family): parked stream-family config is legal —
         # warn once, naming the ignored tables
         parked = []
-        if stream_provided["section"]:
+        if stream_provided["section"] and not generate_stream.enabled:
+            # v1.13（裁决·停放豁免精确化）：时间流形态复用摄取侧词汇——[stream] 是
+            # 生成侧的铺设契约（order_by 声明工件时间戳字段、gap_s 定会话间隔下界），
+            # 此时不是停放配置
             parked.append("[stream]")
         if segment_provided["non_switch_keys"]:
             parked.append("[segment]")
@@ -2054,10 +2433,11 @@ def load(config_path: Path, project_path: Path,
         if extract_provided["non_switch_keys"] and not extract.enabled:
             parked.append("[extract]")
         if (frame_provided["section"] and not frame_classify.enabled
-                and not frame_annotate.enabled):
+                and not frame_annotate.enabled and not generate_stream.enabled):
             # v1.12 no-op 约束：[frame.*] 节在场 ∧ 均未启用 ∧ segment off ⇒
             # 入 R8 停放清单（任一帧开关启用时由「帧粒度要求流模式」CONFIG_ERROR
-            # 接管，不再重复告警）
+            # 接管，不再重复告警）。v1.13：时间流形态下帧类表与
+            # [frame.class.*.generate] 是生效面，不入停放清单
             parked.append("[frame]")
         if parked:
             col.warn(f"{fp}:[segment].enabled: segment.enabled = false，"
@@ -2139,13 +2519,22 @@ def load(config_path: Path, project_path: Path,
     # 校验 + 视图物化（零覆盖类也各得一份视图，class_views 同款——下游运行期
     # 永不回退）。
     frame_class_views: dict[str, FrameClassView] = {}
-    if (isinstance(frame_class_raw, dict) and frame_class_raw
-            and not frame_classify.enabled):
+    frame_ns_live = frame_classify.enabled or generate_stream.enabled
+    if isinstance(frame_class_raw, dict) and frame_class_raw and not frame_ns_live:
         for cname in frame_class_raw:
             col.error(f"{fp}:[frame.class.{cname}]: [frame.class.*] 在场要求 "
-                      f"frame.classify.enabled = true（帧类覆盖依赖帧级分类的"
-                      f"类别产出）")
-    if frame_classify.enabled:
+                      f"frame.classify.enabled = true 或 generate.stream.enabled = "
+                      f"true（帧类覆盖依赖帧级分类的类别产出；时间流生成形态经 "
+                      f"[frame.class.*.generate] 声明帧内容契约）")
+    if isinstance(frame_class_raw, dict) and not generate_stream.enabled:
+        # v1.13（裁决·帧类生成面）：generate 节仅时间流生成形态合法——反向定向
+        # CONFIG_ERROR（白名单接纳该节名，故此处必须显名拦截，否则会静默无效）
+        for cname, sections_g in frame_class_raw.items():
+            if isinstance(sections_g, dict) and "generate" in sections_g:
+                col.error(f"{fp}:[frame.class.{cname}.generate]: 该节仅时间流生成"
+                          f"形态（[generate.stream].enabled = true）合法——帧级"
+                          f"标注请写 [frame.class.{cname}.annotate]")
+    if frame_ns_live:
         if isinstance(frame_class_raw, dict):
             for cname in frame_class_raw:
                 if cname not in frame_names:
@@ -2177,6 +2566,20 @@ def load(config_path: Path, project_path: Path,
                     schema_noun="帧级 Schema")
                 frame_schema_alive = frame_schema_alive and fs_alive
             frame_class_views[cspec.name] = view
+
+    # ── v1.13 — 时间流生成形态的组合约束（SPEC-stream-generation §3.1 约束表）──
+    # 类视图与帧类视图都已物化，形态约束在此一次性裁定（形态关闭 ⇒ 零执行、
+    # 零行为差异）。Σsequences / max(len_range 上界) 取自按类生效视图。
+    seq_total = sum(cv.generate.sequences for cv in class_views.values())
+    len_max = max([1] + [cv.generate.len_range[1] for cv in class_views.values()])
+    if generate_stream.enabled:
+        _check_generate_stream(col, fp, generate_stream, SimpleNamespace(
+            mode=mode, modality=modality, generate=generate, classify=classify,
+            class_views=class_views, stream=stream, meta_mode=output.meta_mode,
+            frame_classify=frame_classify, frame_annotate=frame_annotate,
+            frame_class_views=frame_class_views, gen_provided=gen_provided,
+            class_raw=class_raw if isinstance(class_raw, dict) else {},
+            seq_total=seq_total, len_max=len_max, text_field=input_cfg.text_field))
 
     # ── v1.11 — context budget & vision derivation (spec 3.1.4 上下文预算行) ─
     # V2 (V27② raw-section probe): the removed key gets a DIRECTED error with
@@ -2309,20 +2712,48 @@ def load(config_path: Path, project_path: Path,
                                     + [_rubric_est(v.rubric, v.quality.mode)
                                        for v in views])))
     if annotate.enabled:
+        # v1.13: the schema term is per-class now (裁决·按类标注 Schema) — the max
+        # runs over the WHOLE per-pool sum (schema + instruction + few-shot); with
+        # no class Schema declared every view resolves to the global one, so the
+        # value is byte-identical to v1.12.
+        def _class_schema_est(view: ClassView) -> int:
+            if view.schema is None:
+                return budget.est_text(schema_text)
+            return budget.est_text(json.dumps(view.schema, ensure_ascii=False))
+
         static_checks.append(("annotate", (annotate.llm,),
                               budget.TEMPLATE_HEAD_TOKENS["annotate"]
-                              + budget.est_text(schema_text)
-                              + max([budget.est_text(annotate.instruction)
+                              + max([budget.est_text(schema_text)
+                                     + budget.est_text(annotate.instruction)
                                      + _fewshot_est(annotate.examples)]
-                                    + [budget.est_text(v.annotate.instruction)
+                                    + [_class_schema_est(v)
+                                       + budget.est_text(v.annotate.instruction)
                                        + _fewshot_est(v.annotate.examples)
                                        for v in views])))
+    gen_instruction_est = max([budget.est_text(generate.instruction)]
+                              + [budget.est_text(v.generate.instruction)
+                                 for v in views])
     if generate.enabled:
         static_checks.append(("generate", tuple(generate.llms),
                               budget.TEMPLATE_HEAD_TOKENS["generate"]
-                              + max([budget.est_text(generate.instruction)]
-                                    + [budget.est_text(v.generate.instruction)
-                                       for v in views])))
+                              + gen_instruction_est))
+    if generate_stream.enabled:
+        # v1.13 V13③ 两新段（裁决·预算头两键）：蓝图调用 = 冻结模板头 + 类有效
+        # instruction + 全帧类表；帧实现调用 = 冻结模板头 + 类有效 instruction +
+        # 最坏 L_max × max(帧类生成 Schema)（逐位契约把 Schema 文本重复 L 次）。
+        # 噪音批量实现复用上面的 generate 段。
+        frame_gen_table_text = "\n".join(f"{c.name}\n{c.description}"
+                                         for c in frame_classify.classes)
+        gen_schema_max = max([0] + [
+            budget.est_text(json.dumps(fv.gen_schema, ensure_ascii=False))
+            for fv in frame_class_views.values() if fv.gen_schema])
+        static_checks.append(("generate.stream.plan", tuple(generate.llms),
+                              budget.TEMPLATE_HEAD_TOKENS["generate_plan"]
+                              + gen_instruction_est
+                              + budget.est_text(frame_gen_table_text)))
+        static_checks.append(("generate.stream.realize", tuple(generate.llms),
+                              budget.TEMPLATE_HEAD_TOKENS["generate_realize"]
+                              + gen_instruction_est + len_max * gen_schema_max))
     if verify.enabled:
         v_profiles = verify.judges if verify.judges else (verify.llm,)
         static_checks.append(("verify", tuple(v_profiles),
@@ -2401,7 +2832,10 @@ def load(config_path: Path, project_path: Path,
     if annotate.enabled and not annotate.instruction.strip():
         col.error(f"{fp}:[annotate].instruction: annotate.enabled = true 时必填，"
                   f"期望非空字符串")
-    if generate.enabled and not generate.instruction.strip():
+    if (generate.enabled and not generate.instruction.strip()
+            and not generate_stream.enabled):
+        # v1.13：时间流形态把任务描述放在按类生成指令上（全局键退化为可选默认），
+        # 「参与类 instruction 非空」由形态约束簇按类裁定
         col.error(f"{fp}:[generate].instruction: generate.enabled = true 时必填，"
                   f"期望非空字符串")
 
@@ -2526,6 +2960,7 @@ def load(config_path: Path, project_path: Path,
         frame_annotate=frame_annotate,
         frame_class_views=frame_class_views,
         frame_schema=frame_schema,
+        generate_stream=generate_stream,   # v1.13
         limit=cli.limit,
         strict=cli.strict,
         dry_run=cli.dry_run,

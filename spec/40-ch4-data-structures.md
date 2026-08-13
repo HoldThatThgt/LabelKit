@@ -25,6 +25,11 @@ class RecordRef:
     pair_index: int | None            # UI 模态：文件对 index
     generated_from: tuple[str, ...]   # process 模式生成样本：种子记录 id 列表；其余（含 generate_only 生成样本）为空元组——合成判据用 generator（v1.4）
     generator: Mapping | None = None  # v1.2：生成记录的 {"llm": profile 名, "style": name|None} 溯源（3.6.2）；非生成记录为 None
+                                      # v1.13 时间流生成侧构造约定（3.6.5）：成员帧的 ref =
+                                      #   RecordRef(source_file=时间流工件路径, line_no=工件行号（1 基）,
+                                      #   pair_index=None, generated_from=(), generator={"llm","style"})
+                                      #   ——工件是该帧的**真实来源文件**，故走 source_file/line_no 而非
+                                      #   空源；序列 Record 的 ref 照 S24 继承首成员 ref（下方 Record 注）
 
 @dataclass(frozen=True)
 class ImageRef:
@@ -64,6 +69,13 @@ class Record:
                                       #   line_no=首成员 line_no, pair_index=首成员 pair_index,
                                       #   generated_from=(), generator=None)——完整成员溯源由
                                       #   _meta.stream.member_sources 承担（6.3）
+                                      # v1.13 生成侧构造约定（时间流形态，3.6.5）：序列 Record 的第二
+                                      #   来源——M6 直装组装（非 M14 拼装），字段约定与公式**逐条同 S24**
+                                      #   （id = sha256("\n".join(member ids))[:16]、text/raw/ui_tree/
+                                      #   image = None、ref = 首成员 ref）；成员 Record 的 raw = 工件行
+                                      #   **全对象**（含 truth 字段）、id = M2 公式 sha256(canonical_json
+                                      #   (raw))[:16]、text = text_field 值的 M2 语义投影（字符串直取 /
+                                      #   对象 canonical JSON）——工件重放时成员 id 逐字节一致（6.5）
 
 @dataclass(frozen=True)
 class Classification:                 # v1.7：M13 分类结果（3.13）
@@ -98,7 +110,9 @@ class PipelineItem:                   # 唯一可变信封；生命周期 = 一�
     member_classifications: dict[str, Classification] | None = None
                                       # v1.12 只增：M13 帧级批量判决写入（首标签序列信封，3.13.7）；
                                       #   键 = 成员 record.id、值恒单标签（labels = (label,)，
-                                      #   source ∈ {"llm","fallback"}）；None = 帧 pass 未运行
+                                      #   source ∈ {"llm","fallback"}；v1.13 增第三值 "inherited"
+                                      #   ——时间流生成的帧类真值在蓝图层已知，由 M6 直装写入，
+                                      #   值形态与帧级判决产物完全一致，3.6.5/3.13.7）；None = 帧 pass 未运行
                                       #   （帧分类关闭 / 降格会话 / 非首标签克隆）——幂等门 is None；
                                       #   扇出克隆按引用共享同一 dict（record/dedup 同族，3.13.7）
     member_annotations: dict[str, Annotation] | None = None
@@ -199,6 +213,8 @@ LabelKitError
 ```
 
 **帧粒度与 Stage 契约（v1.12 零改动声明）**：帧级分类/标注（3.13.7、3.5.5）对本契约**零改动**——契约例外维持 ②a/②b/②c 三条原文，不新增例外条款：帧产物只写入信封自身的 `member_classifications` / `member_annotations` 两字段（属 ①④ 的正常字段写入），不改成员帧状态机（成员保持 `absorbed`）、不增删列表元素、不改链序与守恒恒等式（6.4）。**克隆共享语义补注**（②a 的 v1.12 侧注）：classify multi 扇出克隆对两字段**按引用共享**（与 `record` / `dedup` 同族，3.13.7 扇出共享行）——帧产物描述成员帧本身而非信封路由，原/克隆行渲染同一 dict；帧级两 pass 只在首标签信封上执行（克隆判据 = `classification.label != classification.labels[0]`，verify S8 同款），M7 帧产物同步亦无克隆分支（克隆信封永不手术，3.7.3）；手术后原/克隆行 members 分叉由既有 `repaired` 位消歧（6.3 补注）。
+
+**时间流生成与 Stage 契约（v1.13 零改动声明）**：时间流形态（3.6.5）对本契约**零改动**——契约例外维持 ②a/②b/②c 三条原文，不新增例外条款。理由逐条：① M6 仍遵守既有的 generate 例外（「返回新子批而非原地改状态」）——返回值只是从 `list[Record]` 升格为「信封列表 + 工件行列表」的富返回（`PipelineItem(record=r)` 裸构造无法携带 `session_id` / `classification` / `member_classifications`，故必须整只交付），**平面路径 `generate_all` 的冻结签名与行为不动**；② 直装序列信封自出厂即是**普通 active 信封**，下游六个算子按既有规则处理，无任何序列专属的状态迁移；③ **成员帧从不构造信封**（噪音帧与重发帧只活在工件里），故 `absorbed` / `dropped_noise` / `stitched` 三态在本形态下不出现，②b/②c 的适用面为空；④ 状态机、链序与守恒恒等式（取 generate_only 退化形，6.4）全部不动。
 
 `UITree.serialize()` 的规范定义（M3 去重与 M5 提示词共用，M3 传 `quantize_px=dedup.bounds_quantize_px`）：深度优先遍历可见节点；每行 = `" "*depth + role + (' "'+text+'"' if text) + (' desc="'+content_desc+'"' if content_desc) + ' ['+l,t,r,b+']' + 非空 extra 的 k=v 列表`；坐标除以 quantize_px 取整（0 = 不量化）；超长截断规则见 3.5.2。该线性化即 ScreenAI 的 screen-schema 表示思想 [13]。
 

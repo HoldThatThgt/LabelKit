@@ -13,6 +13,10 @@ the merged-fragment shell's content lives inside its thread's rebound record —
 shell must never fall through to the rejects fallback); every other non-active
 status → rejects.
 
+v1.13 (裁决·按类标注 Schema, spec §6.3): the pre-write check validates each row against
+its CLASS-EFFECTIVE schema — the ``[class.<name>.annotate]`` schema override of the row's
+own label when declared, the global ``output.schema`` otherwise.
+
 The emitter never crashes on a bad record: a failed pre-write ``validate_only`` check
 (an internal invariant break) diverts the item to rejects with kind ``internal_error``
 and the run continues. Record-level isolation covers meta assembly / serialization
@@ -22,6 +26,7 @@ run undeliverable so ``finalize`` can never rename a corrupted ``.part`` (spec 3
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -29,7 +34,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, Sequence
 
 from labelkit import TOOL_VERSION
 from labelkit.common.errors import ErrorKind, LabelKitError
@@ -74,6 +79,10 @@ class Emitter:
         self._sidecar_path = Path(str(stem) + ".meta.jsonl")
         self._sidecar_part = Path(str(self._sidecar_path) + ".part")
         self._rejects_path = Path(str(stem) + ".rejects.jsonl")
+        # v1.13（裁决·时间流工件通道）：第五输出通道——路径规则与 M6 的
+        # generate.stream_artifact_path 各自推导同一值（算子间不互导，测试钉住）。
+        self._artifact_path = Path(str(stem) + ".stream.jsonl")
+        self._artifact_part = Path(str(self._artifact_path) + ".part")
         # Dry runs write their report to a separate name so a rehearsal never
         # clobbers the ledger of the last real run (E2E finding P2-4).
         self._report_path = Path(str(stem) + (".dryrun.report.json" if cfg.dry_run
@@ -82,6 +91,10 @@ class Emitter:
         self._main_fh = None
         self._sidecar_fh = None
         self._rejects_fh = None
+        self._artifact_fh = None
+        # v1.13：工件 run 摘要条目（路径/sha256/行数，主输出同款形态）——
+        # write_stream_artifact 写入时冻结，M10 组报告时鸭子面读取；未写恒 None。
+        self.artifact_summary: dict | None = None
 
         self._emitted_total = 0
         self._rejected_total = 0
@@ -99,6 +112,13 @@ class Emitter:
         # 开启时必有解析产物）。
         self._frame_schema = (dict(cfg.frame_schema)
                               if cfg.frame_schema is not None else None)
+        # v1.13（裁决·按类标注 Schema）：按序列类的写前终检 Schema 表——键 = 类名，
+        # 仅声明了覆盖的类入表（未声明的类缺席 ⇒ 终检走全局 output.schema 的既有
+        # 路径）。M5 侧 annotate.class_annotate_schema 的最小镜像：算子间不新增
+        # 依赖（spec §2.2），两侧取值语义必须保持一致。
+        self._class_schemas = {name: dict(view.schema)
+                               for name, view in cfg.class_views.items()
+                               if view.schema is not None}
 
     # ── channel lifecycle ─────────────────────────────────────────────────
 
@@ -138,7 +158,8 @@ class Emitter:
                         continue
                     user_obj = self._user_object(item)
                     if annotate_on:
-                        violations = self._engine.validate_only(dict(user_obj))
+                        violations = self._engine.validate_only(
+                            dict(user_obj), schema=self._row_schema(item))
                         if violations:
                             # Violation text may embed data values: it goes only to
                             # the rejects channel (one array element per violation,
@@ -209,18 +230,52 @@ class Emitter:
         self._progress(batch_no)
         return EmitResult(emitted=emitted, rejected=rejected)
 
+    def write_stream_artifact(self, lines: Sequence[str]) -> None:
+        """v1.13（裁决·时间流工件通道）：把交织序定稿的工件行写入
+        ``{output_stem}.stream.jsonl.part``（写入 + flush；finalize 与主输出同批
+        fsync + 原子改名；``_undeliverable`` 纪律共用）。dry-run 天然不触达
+        （``_run_dry`` 不驱动生成、不开 emitter 通道）。同时冻结 run 摘要条目
+        （路径/sha256/行数——sha256 按落盘字节计，config_digest 同款前缀形态）。"""
+        try:
+            self._artifact_fh = open(self._artifact_part, "w", encoding="utf-8")
+        except OSError as exc:
+            self._undeliverable = True
+            raise LabelKitError(f"stream artifact channel unwritable: {exc}") from exc
+        digest = hashlib.sha256()
+        for line in lines:
+            data = line + "\n"
+            digest.update(data.encode("utf-8"))
+            self._channel_write(self._artifact_fh, data, "stream artifact")
+        try:
+            self._artifact_fh.flush()
+        except OSError as exc:
+            self._undeliverable = True
+            raise LabelKitError(f"stream artifact flush failed: {exc}") from exc
+        self.artifact_summary = {"path": str(self._artifact_path),
+                                 "sha256": "sha256:" + digest.hexdigest(),
+                                 "lines": len(lines)}
+        _log.info("stream artifact staged: %s (%d lines)",
+                  self._artifact_part, len(lines),
+                  extra={"stage": "emitter", "batch": 0})
+
     def finalize(self, report: Mapping, deliver: bool = True) -> None:
         """fsync + atomic rename when deliver=True; always write report.json.
         deliver=False is dry-run-only (no .part was ever opened); v1.6: a
         circuit-break finalize passes deliver=True — completed batches ARE
         delivered, the report marking run.partial_delivery (spec 3.10.3 熔断交付).
         A prior channel-write failure forces deliver=False: a possibly-corrupted
-        .part is never renamed to the final name (spec 3.11.3 ④)."""
+        .part is never renamed to the final name (spec 3.11.3 ④). v1.13: the
+        stream artifact channel (when staged) delivers in the SAME finalize batch
+        as the main output, under the same rules."""
         self._end_progress()
         deliver = deliver and not self._undeliverable
         try:
             self._deliver(self._main_fh, self._output_part, self._output_path, deliver)
             self._main_fh = None
+            if self._artifact_fh is not None:
+                self._deliver(self._artifact_fh, self._artifact_part,
+                              self._artifact_path, deliver)
+                self._artifact_fh = None
             if self._sidecar_fh is not None:
                 self._deliver(self._sidecar_fh, self._sidecar_part, self._sidecar_path, deliver)
                 self._sidecar_fh = None
@@ -267,6 +322,20 @@ class Emitter:
         if self._cfg.annotate.enabled:
             return item.annotation.output  # type: ignore[union-attr]
         return _raw_payload(item.record)
+
+    def _row_schema(self, item: PipelineItem) -> dict | None:
+        """写前终检的按行 Schema（v1.13 裁决·按类标注 Schema）。
+
+        :param item: 待发射的信封；``item.classification.label`` 是该行的序列类
+            标签（multi 扇出的每个兄弟信封各带自己的标签，故按行天然对齐）。
+        :returns: 该类声明的标注 Schema 覆盖；None = 无覆盖（未分类、未知类或
+            该类未声明）⇒ ``validate_only`` 走全局 ``output.schema`` 的既有缺省
+            路径，字节等价 v1.12。
+        """
+        cls = item.classification
+        if cls is None:
+            return None
+        return self._class_schemas.get(cls.label)
 
     def _write_main(self, item: PipelineItem, user_obj: Mapping, batch_no: int) -> None:
         # Assemble + serialize EVERY line first (record-level failures stay
@@ -336,8 +405,10 @@ class Emitter:
             return sel
         # "" should have been resolved by M1; mirror the loader's resolution
         # rule (v1.8 S29: stream mode resolves the empty selector to the
-        # trajectory rubric for both modalities).
-        if self._cfg.segment.enabled:
+        # trajectory rubric for both modalities; v1.13 裁决·轨迹准则自动解析扩展:
+        # the time-stream generation form scores sequences too — the condition
+        # widens to segment.enabled ∨ generate_stream.enabled, loader-mirrored).
+        if self._cfg.segment.enabled or self._cfg.generate_stream.enabled:
             return "default:trajectory"
         return f"default:{self._cfg.run.modality}"
 
@@ -399,9 +470,15 @@ class Emitter:
         stitch is enabled — the off-mode byte-equivalence condition. The
         TOP-LEVEL order_span stays the envelope span (§6.3 包络 rule: a
         multi-fragment thread's span may contain other threads' frames —
-        downstream slicing must use fragments[].order_span)."""
+        downstream slicing must use fragments[].order_span).
+        v1.13（裁决·members 呈现真值门）: the gate widens to segment.enabled ∨
+        generate_stream.enabled — direct-assembly rows reuse this block as-is
+        (order_span/member_sources point at the artifact path + line numbers;
+        session_split=false / repaired=false / degraded=null / steps=null fall
+        out of the duck-typed defaults; stitch keys stay absent)."""
         rec = item.record
-        if not self._cfg.segment.enabled or rec.kind != "sequence":
+        stream_on = self._cfg.segment.enabled or self._cfg.generate_stream.enabled
+        if not stream_on or rec.kind != "sequence":
             return None
         stitch_on = self._cfg.stitch.enabled
         members = rec.members
@@ -424,9 +501,13 @@ class Emitter:
             "member_ids": [m.id for m in members],
             "member_sources": [_member_source(m) for m in members],
         })
-        if self._cfg.frame_classify.enabled or self._cfg.frame_annotate.enabled:
+        if (self._cfg.frame_classify.enabled or self._cfg.frame_annotate.enabled
+                or self._cfg.generate_stream.enabled):
             # v1.12（spec §3.6）：members 数组仅在任一帧开关开启时在场，位置冻结在
             # member_sources 之后、session_split 之前；全关时块形态与 v1.11 字节等价。
+            # v1.13（裁决·members 呈现真值门）：时间流生成形态同门在场——label 列
+            # 承载帧类真值（member_classifications，inherited），无 annotation/
+            # status 列（frame.annotate 与本形态 M1 互斥）。
             block["members"] = self._members_block(item)
         block.update({
             "session_split": bool(getattr(item, "session_split", False)),
@@ -445,8 +526,10 @@ class Emitter:
         """v1.12（spec §3.6）：members 条目——逐成员按 rec.members 序，字段序冻结为
         index, id[, label][, annotation, status]。label 键仅 frame.classify 开启时
         在场（dict 为 None 或缺键 ⇒ null，覆盖降格跳过）；annotation/status 两键仅
-        frame.annotate 开启时在场（三值判定见 _member_annotation）。"""
-        classify_on = self._cfg.frame_classify.enabled
+        frame.annotate 开启时在场（三值判定见 _member_annotation）。v1.13：label
+        列门扩 ∨ generate_stream（帧类真值列，裁决·members 呈现真值门）。"""
+        classify_on = (self._cfg.frame_classify.enabled
+                       or self._cfg.generate_stream.enabled)
         annotate_on = self._cfg.frame_annotate.enabled
         rows: list[dict] = []
         for index, member in enumerate(item.record.members):
@@ -588,7 +671,8 @@ class Emitter:
 
     def _flush(self) -> None:
         try:
-            for fh in (self._main_fh, self._sidecar_fh, self._rejects_fh):
+            for fh in (self._main_fh, self._sidecar_fh, self._rejects_fh,
+                       self._artifact_fh):
                 if fh is not None:
                     fh.flush()
         except OSError as exc:
@@ -608,13 +692,15 @@ class Emitter:
             os.rename(part, target)
 
     def _close_all(self) -> None:
-        for fh in (self._main_fh, self._sidecar_fh, self._rejects_fh):
+        for fh in (self._main_fh, self._sidecar_fh, self._rejects_fh,
+                   self._artifact_fh):
             if fh is not None:
                 try:
                     fh.close()
                 except OSError:
                     pass
         self._main_fh = self._sidecar_fh = self._rejects_fh = None
+        self._artifact_fh = None
 
     # ── stderr progress + summary (display, not logging — spec §7.7) ─────
 

@@ -49,6 +49,8 @@
 
 一条与脱敏档位无关的恒定规则（v1.6）：`llm.key_*` / `llm.pool_*` 事件与 `llm.call` 的 `key_env` 字段里，密钥恒以**环境变量名**标识——密钥值本身在任何档位（含 `full`）都不写入 trace、运行日志与报告。
 
+**v1.13 时间流生成：零新通道、零新事件、零新错误码。**第 27 章那个形态在上面这张表里**一行都不加**：蓝图与帧实现是普通的 LLM 调用，订阅 `llm` 通道就能在 `llm.call` 事件里看到它们的延迟、token 与重试（`full` 档还能看到提示词与响应全文——那是一份数据副本，用完即清）；序列作废、噪音批作废这类判决只走 stderr 的 WARN 与报告计数，不单开事件。通道枚举维持十一值，`error` 事件的错误码词表（第 18 章）零新增。它的账全在报告里——见下节末尾的两处新读数。
+
 ## 16.3 rubric 调优闭环：让准则跟着证据迭代
 
 **为什么 rubric 不可能一次写对**：EvalGen（UIST 2024）的实验结论——评估准则存在 *criteria drift*，人往往要**看到裁决的具体输出**才知道自己真正想要什么准则。所以 LabelKit 把每一次裁决和理由都暴露出来（`quality.judgment` 事件），供你迭代。
@@ -141,6 +143,15 @@ jq -c 'select(.ev=="quality.judgment" and (.record_ids | index("6e60ce3c2d59f04d
 读法：`113868` = 声明窗 131072 扣掉输出预留（该 profile 的 `max_output_tokens`）与 10% 安全边距后**真正拿来装输入**的预算（judge profile 输出预留小，可用输入反而更多）；`w_min=46` 是按最坏单帧成本（满长摘要 + diff 常数 + 每图先验）算出的单窗保底装填量——它 ≥ 窗上限 `window=16` 时装填顶格、行为与定长窗一致，它 < window 时实际窗会变小变多（对账细则见第 25 章成本账）。两行都是数据无关的参数与计数。**报告侧的对应读数是 `report.budget`**（profiles / w_min / truncations / overflow_records / image_cost / degrade_retries / escalations——第 8 章逐键解读），预算相关的记录级失败则以 `context_overflow` / `output_truncated` 两个新错误码落 rejects（第 18 章）。
 
 想要完整的调用审计（每次请求的 token、延迟、重试、状态），订阅 trace 的 `llm` 通道即可——`llm.call` 事件字段命名对齐 OpenTelemetry GenAI 语义约定（`gen_ai.usage.input_tokens` 等），现成的 OTel 生态分析工具可以直接吃。
+
+### 时间流生成的两处报告读数（v1.13）
+
+这个形态（第 27 章）不加事件，观测面全部落在 `report.json` 的两处按需字段上：
+
+- **`run.artifact`**：时间流工件的摘要三件套 `{path, sha256, lines}`（主输出同款形态），仅工件实际写出时在场（`--dry-run` 不写工件，自然也没有它）。`lines` 是逐帧账的总闸——拿它与下面的帧数交叉验证；
+- **`generate.stream`**：`{sessions, crossed_sessions, sequences: {<类>: {planned, produced}}, frames, noise_frames, duplicates, plan_calls, realize_calls, noise_calls, plan_failures, realize_failures, validator_scrapped}`，counts-only。日常盯三个比值：`produced / planned`（作废率——三项 failures 与序列相似度过滤的合力）、`crossed_sessions`（交叉演示位还在不在，它 = Σ幸存 − sessions）、`noise_frames / frames`（掺噪比是否如你所愿）。
+
+同一份报告里还有两处「反直觉但正确」的读数：`classify` 的逐类计数**恒全零**（标签生成期已知、继承，零判决调用），`stream` 节**不出现**（那是分段算子的观测面）。逐键解读与真跑数字见第 8 章 8.4 与第 27 章 27.7。
 
 ### 密钥池的分密钥视角（v1.6）
 

@@ -147,3 +147,29 @@ VerificationResult(
 ```
 
 **对照分支：**若二次评审仍 fail，此时已达 `max_repair_rounds`（默认 1），按 drop 收尾——`status = "dropped_verify"`，批评意见摘要入 `_meta.verification` 与 rejects 通道（3.7.3）；rejects 行（`output.rejects = "refs"`）不含数据内容本体。
+
+### 3.7.5 直装序列评审：判决形（v1.13）
+
+序列信封自 v1.13 起有**两个**来源：M14 分段产出的 episode（stream 模式）与 M6 时间流生成产出的**直装序列**（`generate_stream.enabled`，segment 关闭，3.6.5）。前者由 stage 层的流式驱动器承载、走 3.7.2 的缺陷词表变体；后者走经典路径，但**不能**照搬非序列模板——非流模板的 `[原始数据]` 段对 `kind = "sequence"` 的记录无内容可渲染（序列 Record 的 text/raw/ui_tree/image 恒 None，4.1），且缺陷词表变体的 `defects` 键被经典路径的 `VERDICT_SCHEMA` 禁止。裁决为**判决形**：调用方按「流式驱动器在场与否」选择模板变体，两条路径互不干扰。
+
+**装配面（additive 尾参，签名冻结）**：
+
+```
+def build_verify_prompt(record, output, cfg, label=None, transitions=None,
+                        boundary_margin="", fragment_structure="",
+                        fit=None, verdict_form: bool = False) -> PromptBundle:
+    """verdict_form = True 且 record.kind == "sequence" ⇒ §10.16 判决形序列变体；
+       其余组合逐字节维持既有分支（流式驱动器从不传该参）。"""
+
+def verify_verdict_sequence_system_text(extra_criteria: str) -> str:
+    """判决形 system 段：三维评审 + 结论指令 + VERDICT_SCHEMA 结构句；无缺陷词表。"""
+```
+
+要点（规格与理由）：
+
+- **选择判据 = 驱动器在场**：经典路径遇 `record.kind == "sequence"` 时传 `verdict_form=True`（流式驱动器在场时序列永不进入该函数）；`schema` 恒为既有 `VERDICT_SCHEMA`，与模板天然配对——修掉「驱动器门 = `segment.enabled` 而模板门 = `kind`」的错配。
+- **模板形态**（verbatim 冻结于 CONTRACTS §10.16）：system = 判决指令（三维评审：遵循任务指令 / 与成员帧摘要证据的事实一致性 / 字段语义）+ 类有效 `extra_criteria`（为空整行省略，非流规则同款）+「先意见后结论」句 + `VERDICT_SCHEMA` 结构句；user = `[任务指令]` → `[成员帧摘要]` → `[标注结果]` 三段。**无缺陷表、无 `[边界余量]`、无 `[片段结构]`、无截图段**（直装序列为 text 模态）。
+- **成员摘要渲染**：逐成员 `{m}. {frame_digest(member, 400)}`（m 1 基、成员序），总量受 `input.ui_tree_max_chars` 约束——**首末行恒保留、中段整行丢弃**并以 `…(truncated N members)` 标记闭合（镜像 M5 的序列摘要渲染；算子间不互导，M7 自持同式副本）。
+- **预算装填**：`fit` 非 None 时成员摘要块是**唯一可裁槽位**（edges 裁剪计 `report.budget.truncations`），`[标注结果]` 与任务指令是记录级语义资产**恒计不裁**（V25③）；不可裁地板仍超预算 ⇒ `fit.overflow`（V10——调用方拒绝，请求从不发出）。
+- **失败与修复**：修复 = 既有 policy 重标注（透传同一 `label` ⇒ 自然穿按序列类标注 Schema，3.5.2）；持续 fail ⇒ `dropped_verify`——对合成数据而言这就是**拒绝采样**：淘汰不合格序列，**不改真值**（工件行照常保留该序列的帧与 truth，主输出少一行，6.5）。
+- **零改动面（显式声明）**：`VerificationResult.defects` 在本形态恒空、emitter 的 `_verification_block` defects 门**零改动**（该键仅 stream 模式在场，6.3）；缺陷词表六值闭集、四处同步登记、流式驱动器与成员手术路径**全部零改动**。

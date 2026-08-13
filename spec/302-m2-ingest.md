@@ -46,7 +46,7 @@ class Ingestor:
 
 ### 3.2.5 文本模态解析
 
-每行必须是 JSON object（非 object 的合法 JSON 视为坏行）。标注/打分所用文本由 `input.text_field`（支持点路径，如 `"conversation.turns"`；默认 `"text"`）抽取：命中字符串则直接使用；命中数组/对象则按 canonical JSON（`sort_keys=True, ensure_ascii=False`，紧凑分隔符）序列化为文本；未命中字段 ⇒ 坏行。原始对象完整保留在 `Record.raw`，输出时可按 `output.passthrough_fields` 透传（见 6.3）。记录 id = `sha256(canonical_json(raw))[:16]`。坏行策略 `input.on_bad_line = "skip"`（默认）| `"fail"`。
+每行必须是 JSON object（非 object 的合法 JSON 视为坏行）。标注/打分所用文本由 `input.text_field`（支持点路径，如 `"conversation.turns"`；默认 `"text"`）抽取：命中字符串则直接使用；命中数组/对象则按 canonical JSON（`sort_keys=True, ensure_ascii=False`，紧凑分隔符）序列化为文本；未命中字段 ⇒ 坏行。原始对象完整保留在 `Record.raw`，输出时可按 `output.passthrough_fields` 透传（见 6.3）。记录 id = `sha256(canonical_json(raw))[:16]`。坏行策略 `input.on_bad_line = "skip"`（默认）| `"fail"`。**v1.13 工件可重放注记**：时间流生成形态产出的时间流工件（6.5）按本节规则**逐字节可重放**——M6 构造成员 Record 时同样取「工件行全对象」为 `raw`（含 `truth` 字段）并套用本行 id 公式，故把工件当输入重跑时 M2 算出的成员 id 与生成侧完全一致；`truth` 字段只是行上的普通字段，参与 id 计算、不参与任何判定，需要时经 `output.passthrough_fields` 透传出来做对照（3.6.5、6.5）。
 
 ### 3.2.6 配置项
 
@@ -161,7 +161,7 @@ FrameLayout [0,0,1080,2340]
 - `stream.session_max_len`（默认 200，硬上限）/ `stream.session_max_span_s`（时间跨度硬上限，0 = 不启用；仅 meta:*）；
 - 流耗尽（eof）或 `--limit` 截断（limit）。
 
-会话闭合时发一条 `segment.session` trace 事件（**属主 M2**；事件名冠 segment 前缀、按前缀归 segment 通道，S1，7.2）——payload 含 `session_id`、`first` / `last`（首末序键）、`len`、`cause`（∈ `gap`\|`key`\|`max_len`\|`max_span`\|`eof`\|`limit`），并计 `IngestReport.sessions`。会话对象 `Session(session_id, records, cause)` 的形态冻结于 CONTRACTS §7.1：`session_id = sha256("\n".join(会话内记录 id))[:16]`（会话序）、`records` 为按会话序的成员 Record 元组、`cause` 即上述闭合词表。
+会话闭合时发一条 `segment.session` trace 事件（**属主 M2**；事件名冠 segment 前缀、按前缀归 segment 通道，S1，7.2）——payload 含 `session_id`、`first` / `last`（首末序键）、`len`、`cause`（∈ `gap`\|`key`\|`max_len`\|`max_span`\|`eof`\|`limit`），并计 `IngestReport.sessions`。会话对象 `Session(session_id, records, cause)` 的形态冻结于 CONTRACTS §7.1：`session_id = sha256("\n".join(会话内记录 id))[:16]`（会话序）、`records` 为按会话序的成员 Record 元组、`cause` 即上述闭合词表。**v1.13 工件可重放注记**：时间流生成形态的交织器按同一 `session_id` 公式给直装信封盖章——口径含**会话内全部帧**（噪音帧与重发帧一并计入），且铺设的会话间隔恒 > `stream.gap_s`、会话内帧间隔恒 < `stream.gap_s`，故把工件当输入重放时本装配器按同一份 `[stream]` 声明切出的会话与生成侧**逐一对应、session_id 逐字节相同**（3.6.5）。
 
 **--limit 帧级截断（S17）。**`--limit` 的单位不变、仍是**帧**（记录）：islice 位于解析流与会话装配器**之间**；截断视同 EOF——尾部未闭合会话按会话闭合下发（cause = "limit"）+ WARN 一次。`cause = "limit"` 的精确语义是「**该会话在 --limit 预算耗尽处闭合**」：预算恰好在流末耗尽（无真截断）与真截断不可区分——消歧需要多拉取并解析一条记录，会扰动 scanned/bad_input 台账，工具不做（v1.8 D3 裁决）；WARN 文案据此陈述预算耗尽而非断言截断（2.4 --limit 行 stream 子句）。
 

@@ -27,6 +27,7 @@ from labelkit.common.config.model import (
     ConsoleConfig,
     EmbeddingProfile,
     ExtractConfig, FrameAnnotateConfig, FrameClassifyConfig, GenerateConfig,
+    GenerateStreamConfig,
     InputConfig, LLMProfile, OutputConfig,
     QualityConfig,
     ResolvedConfig, Rubric, RunConfig, SegmentConfig, StitchConfig, StreamConfig,
@@ -232,12 +233,25 @@ class FakeEmitter:
         self.batches: list[tuple[int, int, int]] = []
         self.report = None
         self.deliver = None
+        # v1.13：工件通道面（真 Emitter 的 write_stream_artifact/artifact_summary
+        # 鸭子面）——calls 记录调用时序（工件须先于任何批派发落盘）。
+        self.artifact_lines: list[str] | None = None
+        self.artifact_summary: dict | None = None
+        self.calls: list[str] = []
 
     def open(self):
         self.opened = True
         self.part.write_text("", encoding="utf-8")
 
+    def write_stream_artifact(self, lines):
+        self.calls.append("artifact")
+        self.artifact_lines = list(lines)
+        self.artifact_summary = {"path": str(self.output.with_suffix("")) + ".stream.jsonl",
+                                 "sha256": "sha256:" + "0" * 64,
+                                 "lines": len(self.artifact_lines)}
+
     def emit_batch(self, batch, batch_no):
+        self.calls.append("batch")
         emitted = rejected = 0
         with self.part.open("a", encoding="utf-8") as fh:
             for item in batch:
@@ -886,6 +900,191 @@ async def test_generate_only_interrupt_stops_taking_batches_after_generation(tmp
     assert emitter.deliver is True
     assert emitter.report["counts"]["generated"] == 5
     assert emitter.report["run"]["interrupted"] is True
+
+
+# ── tests: v1.13 generate_stream 时间流形态（驱动分支/estimate/report）────────
+
+def stream_gen_cfg(tmp_path, *, batch_size=4, limit=None, quotas=None,
+                   quality=False, annotate=False, verify=False,
+                   noise_ratio=0.0) -> ResolvedConfig:
+    """M1 形状的时间流形态配置：classify 类表 = 配额载体（inherited 零调用），
+    class_views 携按类 sequences/len_range，generate_stream 开启。"""
+    quotas = quotas or {"faq": 2, "chat": 1}
+    base = make_cfg(tmp_path, mode="generate_only", batch_size=batch_size,
+                    limit=limit, quality=quality, annotate=annotate, verify=verify,
+                    generate=GenerateConfig(enabled=True, num_per_call=2),
+                    classify=classify_cfg(classes=tuple(sorted(quotas))))
+    cfg = replace(base, generate_stream=GenerateStreamConfig(
+        enabled=True, sessions=max(1, sum(quotas.values()) - 1),
+        noise_ratio=noise_ratio,
+        noise_instruction="噪音" if noise_ratio > 0 else "",
+        frame_gap_s=(5.0, 60.0), ts_start="2026-01-01T00:00:00Z"))
+    overrides = {
+        name: {"generate": replace(cfg.generate, instruction=f"生成{name}",
+                                   sequences=n, len_range=(2, 3))}
+        for name, n in quotas.items()}
+    return with_views(cfg, overrides)
+
+
+def stream_envelope(i: int, label: str = "faq") -> PipelineItem:
+    """直装信封夹具：kind="sequence" + session_id + 两级 inherited 标签。"""
+    member = rec(i)
+    seq = Record(id=f"{i + 20_000:016x}", modality="text", text=None,
+                 raw={"seq": i}, ui_tree=None, image=None, ref=member.ref,
+                 kind="sequence", members=(member,))
+    return PipelineItem(
+        record=seq, session_id=f"sess-{i}",
+        classification=Classification(label=label, labels=(label,),
+                                      source="inherited", detail={}),
+        member_classifications={member.id: Classification(
+            label="task_request", labels=("task_request",),
+            source="inherited", detail={})})
+
+
+class PureStreamGenerateStage:
+    """generate_stream_all 的纯桩（M6 真身归 test_generate_stream；此处只测
+    M10 驱动/报告面）：返回既定富产品并按 M6 口径喂 generate.stream.* 计数。"""
+
+    name = "generate"
+
+    def __init__(self, envelopes, lines, counters=None):
+        self._product = SimpleNamespace(envelopes=list(envelopes),
+                                        artifact_lines=list(lines))
+        self._counters = dict(counters or {})
+        self.calls: list[tuple[int, float]] = []
+
+    async def run(self, batch, ctx):               # generate_only 下永不进链
+        raise AssertionError("stream form never runs generate in-chain")
+
+    async def generate_all(self, ctx):
+        raise AssertionError("stream form must call generate_stream_all")
+
+    async def generate_stream_all(self, ctx):
+        self.calls.append((ctx.batch_no, ctx.rng.random()))
+        for key, value in self._counters.items():
+            ctx.metrics.count(key, value)
+        return self._product
+
+
+async def test_generate_stream_drives_artifact_then_batches(tmp_path):
+    """驱动分支：工件先于任何批派发经 M11 落盘；counts.generated = 进链序列条数；
+    信封原样进链（session_id/classification/member_classifications 不重建）。"""
+    envelopes = [stream_envelope(i) for i in range(1, 6)]
+    counters = {"generate.stream.sessions": 4, "generate.stream.crossed_sessions": 1,
+                "generate.stream.frames": 5, "generate.stream.plan_calls": 5,
+                "generate.stream.realize_calls": 5,
+                "generate.stream.sequences.faq.planned": 2,
+                "generate.stream.sequences.faq.produced": 2,
+                "generate.stream.sequences.chat.planned": 1,
+                "generate.stream.sequences.chat.produced": 1}
+    gen = PureStreamGenerateStage(envelopes, ["l1", "l2", "l3"], counters)
+    dedup = RecordingStage("dedup")
+    cfg = stream_gen_cfg(tmp_path, batch_size=2)
+    orch, metrics, emitter, _ = build(cfg, [dedup, gen])
+    summary = await orch.run()
+
+    assert summary.exit_code == 0
+    assert gen.calls and gen.calls[0][0] == 0      # ctx0：batch_no=0 预抽 rng
+    assert emitter.artifact_lines == ["l1", "l2", "l3"]
+    assert emitter.calls[0] == "artifact"          # 工件写出先于首批
+    assert emitter.calls.count("batch") == 3       # 5 信封 × batch_size 2
+    assert metrics.counters["counts.generated"] == 5
+    # 信封不被裸构造重建：dedup 看到的批就是直装信封本体
+    assert [len(ids) for _, ids in dedup.calls] == [2, 2, 1]
+    report = emitter.report
+    assert report["counts"]["generated"] == 5
+    assert report["run"]["artifact"] == emitter.artifact_summary
+    stream_block = report["generate"]["stream"]
+    assert list(stream_block) == ["sessions", "crossed_sessions", "sequences",
+                                  "frames", "noise_frames", "duplicates",
+                                  "plan_calls", "realize_calls", "noise_calls",
+                                  "plan_failures", "realize_failures",
+                                  "validator_scrapped"]
+    assert stream_block["sessions"] == 4
+    assert stream_block["sequences"] == {
+        "chat": {"planned": 1, "produced": 1},
+        "faq": {"planned": 2, "produced": 2}}
+    assert stream_block["noise_calls"] == 0        # 计数缺席 ⇒ 零基在场
+    assert "stream" not in report                  # report.stream 不出现（segment 观测面）
+
+
+async def test_generate_stream_envelopes_keep_direct_assembly_fields(tmp_path):
+    """信封字段穿透：session_id 与两级 inherited 标签穿过批派发原样到达 stage。"""
+    captured: list[PipelineItem] = []
+
+    class Probe:
+        name = "dedup"
+
+        async def run(self, batch, ctx):
+            captured.extend(batch)
+            return batch
+
+    envelopes = [stream_envelope(1), stream_envelope(2, label="chat")]
+    gen = PureStreamGenerateStage(envelopes, ["x"])
+    cfg = stream_gen_cfg(tmp_path)
+    orch, _, _, _ = build(cfg, [Probe(), gen])
+    await orch.run()
+    assert [item.session_id for item in captured] == ["sess-1", "sess-2"]
+    assert [item.classification.source for item in captured] == ["inherited"] * 2
+    assert all(item.member_classifications for item in captured)
+
+
+async def test_generate_stream_limit_belt_and_braces(tmp_path):
+    """--limit 的 M10 兜底截断：配额层已截（M6），此处对信封列表再截一刀。"""
+    gen = PureStreamGenerateStage([stream_envelope(i) for i in range(1, 6)], [])
+    cfg = stream_gen_cfg(tmp_path, limit=2)
+    orch, metrics, emitter, _ = build(cfg, [gen])
+    await orch.run()
+    assert metrics.counters["counts.generated"] == 2
+    assert emitter.report["counts"]["generated"] == 2
+
+
+async def test_generate_stream_estimate_exact_replay_and_zero_classify(tmp_path):
+    """estimate 分支（裁决·估算精确复演）：复用 M6 计划期纯函数——records =
+    Σsequences（limit 后）、generate_calls = 2×Σ + ⌈噪音帧数/num_per_call⌉、
+    classify_calls = 0（inherited 零调用）、quality/annotate/verify 基数 = Σ、
+    batches = ceil(records/batch_size)。"""
+    import random as random_module
+
+    from labelkit.operators.generate import plan_stream
+
+    cfg = stream_gen_cfg(tmp_path, batch_size=2, quality=True, annotate=True,
+                         verify=True, noise_ratio=0.4)
+    est = estimate_run(cfg, None)
+    plan = plan_stream(cfg, random_module.Random(f"{cfg.run.seed}:0:generate"))
+    n = len(plan.sequences)
+    assert n == 3
+    assert est["records"] == n
+    assert est["batches"] == -(-n // 2)
+    assert est["generate_calls"] == 2 * n + len(plan.noise_plans)
+    assert len(plan.noise_plans) > 0               # 噪音采样确被精确复演
+    assert est["classify_calls"] == 0
+    assert est["annotate_calls"] == n
+    assert est["verify_calls"] == n
+    sizes = [2, 1]
+    assert est["quality_calls"] == sum(4 * (b // 2) for b in sizes)
+    assert est["total_calls"] == (est["generate_calls"] + est["quality_calls"]
+                                  + est["annotate_calls"] + est["verify_calls"])
+
+
+async def test_generate_stream_estimate_limit_truncates_at_quota_layer(tmp_path):
+    cfg = stream_gen_cfg(tmp_path, batch_size=4, limit=1)
+    est = estimate_run(cfg, None)
+    assert est["records"] == 1
+    assert est["batches"] == 1
+    assert est["generate_calls"] == 2              # 无噪音：蓝图 + 实现各一
+    assert est["classify_calls"] == 0
+
+
+async def test_generate_stream_off_report_has_no_stream_block(tmp_path):
+    """零改动声明面：形态关闭时 report.generate 无 stream 子块、run 无 artifact。"""
+    gen_cfg = GenerateConfig(enabled=True, instruction="生成", standalone_count=3,
+                             num_per_call=2)
+    cfg = make_cfg(tmp_path, mode="generate_only", batch_size=4, generate=gen_cfg)
+    orch, _, emitter, _ = build(cfg, [PureGenerateStage(total=3)])
+    await orch.run()
+    assert "stream" not in emitter.report.get("generate", {})
+    assert "artifact" not in emitter.report["run"]
 
 
 async def test_process_interrupt_stops_taking_new_batches(tmp_path):

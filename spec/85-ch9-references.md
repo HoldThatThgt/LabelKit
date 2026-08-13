@@ -195,3 +195,15 @@
 - [97] Cline. 生产级上下文管理的刻意反应式设计："deliberate design choice since accurate token counting varies by model/tokenizer … the first request that exceeds limits will fail"；图片 10K–30K+ token/张且 usage 滞后一拍；实证企业网关存在 `usage: null` 响应。工业开源项目 issue 记录。github.com/cline/cline/issues/6055；issues/7383；issues/9433（2026-07-22 访问）
 
 - [98] Zoom Eye: 置信度分数驱动的图像树递归变焦（训练无关；HR-Bench +15.7~17.7%，8B 超 GPT-4o）. EMNLP 2025 Oral. github.com/om-ai-lab/ZoomEye；V*/SEAL: Guided Visual Search as a Core Mechanism in Multimodal LLMs. CVPR 2024. vstar-seal.github.io（置信度低于阈值即递归切 patch 搜索，终止 = 命中或达最小粒度；V*Bench 7B+搜索 75.4% vs GPT-4V 55.0%）；UI-Zoomer: 置信门控变焦（训练无关；GUI grounding +4.2–13.4%）. 2026. arXiv:2604.14113.（「低置信 → 定向升清重试」谱系——V21 判审升级路径的学术与 GUI 域背书）
+
+- [99] APIGen-MT: Agentic Pipeline for Multi-Turn Data Generation via Simulated Agent-Human Interplay. NeurIPS 2025. arXiv:2504.03601.（两阶段合成骨架：先产出并校验**任务蓝图**（含可验证的真值），再由模拟互演把蓝图展开为多轮轨迹——v1.13 时间流形态「蓝图 → 帧实现」两类调用的直接同型先例）
+
+- [100] Yao, L. et al. Plan-and-Write: Towards Better Automatic Storytelling. AAAI 2019. arXiv:1811.05701.；Shah, P. et al. Building a Conversational Agent Overnight with Dialogue Self-Play (M2M). 2018. arXiv:1801.04871.；Rastogi, A. et al. Towards Scalable Multi-Domain Conversational Agents: The Schema-Guided Dialogue Dataset. AAAI 2020. arXiv:1909.05855.（静态计划先行对长文本连贯性的收益对照；M2M / SGD 的「先按 schema 生成结构化真值骨架、再自然语言化」范式 = 零再标注真值保留的方法学来源——v1.13 帧类真值在蓝图层即确定的依据）
+
+- [101] Burattin, A. PLG2: Multiperspective Process Randomization with Online and Offline Simulations. BPM 2016 Demo. arXiv:1506.08415.；Camargo, M., Dumas, M., González-Rojas, O. Automated Discovery of Business Process Simulation Models from Event Logs (Simod). Decision Support Systems 134, 2020.（过程日志生成器：噪音逐类概率参数 + 多轨迹按时间归并交织的机械形态；Simod 的到达间隔分布族——v1.13 机械交织器「结构维度全部机械化、LLM 只管内容」的工业方法学背书）
+
+- [102] Wu, D. et al. LongMemEval: Benchmarking Chat Assistants on Long-Term Interactive Memory. ICLR 2025. arXiv:2410.10813.；Kwan, W.-C. et al. MT-Eval: A Multi-Turn Capabilities Evaluation Benchmark for LLMs. EMNLP 2024. arXiv:2401.16745.；Maharana, A. et al. Evaluating Very Long-Term Conversational Memory of LLM Agents (LoCoMo). ACL 2024. arXiv:2402.17753.（长程交互数据集的构造惯例：干扰/无关轮次的**注入位置参数化**为可控实验变量、时间事件图先于内容生成——v1.13 噪音掷签位置与 ts 铺设先于内容的次序背书）
+
+- [103] Process-mining 合成日志的真值方法学（2025）：噪音须在**计划层**注入方能保留标签溯源链接，事后加噪会切断真值归属。综述与实践记录（BPM / Process Mining 社区）。（v1.13「噪音在蓝图/交织层注入、`truth` 链接保留」的依据——对照事后加噪的不可对账形态）
+
+- [104] Chen, L. et al. AlpaGasus: Training a Better Alpaca with Fewer Data. ICLR 2024. arXiv:2307.08701.；NVIDIA. Nemotron-4 340B Technical Report. 2024. arXiv:2406.11704.（合成数据两条纪律：**过滤优于全量**（9k 精选超 52k 全量）、**判定与生成分离**（reward model / judge 独立于生成器）——v1.13 序列级相似度过滤与判决形评审拒绝采样的背书）

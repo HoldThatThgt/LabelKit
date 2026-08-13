@@ -33,6 +33,10 @@
 | 22 | DeepSeek anthropic 路由响应默认携带 thinking 内容块 | 实测记录 | 📌 已记录（2026-08-12，M9 天然兼容） |
 | 23 | DeepSeek anthropic 路由不支持图像内容块 | 实测记录 | ✅ 已适配（2026-08-12） |
 | 24 | DeepSeek anthropic 路由对强制 tool_choice 返回 400 | 实测记录 | ✅ 已适配（2026-08-12） |
+| 25 | 无 L0 端点上 `prefixItems` 逐位契约靠提示词文本承载 | 实测记录 | ✅ 已适配（2026-08-13，模板内嵌结构契约） |
+| 26 | 温度 0.9 下帧实现偶发违约 ⇒ 整序列作废、交叉演示位退化 | 实测记录（同第 6 条根因家族） | ⏸ 数据侧缓解（按设计处置） |
+| 27 | 工件重放的判重档位实测：`near_text` 而非 `exact` | 实测记录 | 已记录（示例头注与手册按实测叙述） |
+| 28 | `resolved_at` 恒等式在 M8 显式待遇参数重构后的回归确认 | 实测记录 | ✅ 已确认（2026-08-13） |
 
 ## P1 — 实现与规格的偏差
 
@@ -338,3 +342,53 @@ inode**，先启动进程 rename 交付的「主输出」实为后进程内容�
 **后果**：`supports_structured_output=true` 的 profile 声明在该端点不可用；若声明为 true，首个 LLM 调用即 400 快速失败。
 
 **处置**：`examples/mix/config.toml` 的 `[llm.default]`（DeepSeek profile）声明 `supports_structured_output = false`——该 profile 全部调用走**文本 + 确定性修复层解析**路径（结构化输出层缺位由确定性修复层至 LLM 修复环兜底，M8 四层保证语义不变），实测 JSON 干净落在 text 块、mix 主/姊妹两工程全流程 exit 0；`[llm.vision]` 的 z.ai profile 不受影响，照走结构化输出层。配置注释记录该 400 实测依据。
+
+---
+
+## 追加条目：v1.13 时间流生成 E2E 实测（2026-08-13）
+
+> spec v1.13「时间流生成」（`SPEC-stream-generation.md`）的验收工序实测记录。E2E 面按需求方
+> 指定走 DeepSeek anthropic 路由（`https://api.deepseek.com/anthropic`，`deepseek-v4-flash`，
+> 密钥 `.env` 的 `LABELKIT_DEEPSEEK_KEY`），示例工程 `examples/synth-stream` 自含单 profile
+> `config.toml`；集成测试另设一例 z.ai glm-5.2 钉住 `prefixItems` 的 L0 透传。
+> 验收真跑：`counts.generated = emitted = 6`、`failed`/`dropped_*` 全 0、工件 29 行、exit 0。
+
+### 25. 无 L0 端点上 `prefixItems` 逐位契约靠提示词文本承载 —— ✅ 已适配（2026-08-13）
+
+**现象**：帧实现调用的内部 Schema 是 `realize_schema`——`{"frames": [...]}` 用 draft 2020-12 的 `prefixItems` 给第 i 帧套上第 i 个帧类的子模式、长度锁死为蓝图抽定的 L。但本特性的 E2E 端点声明 `supports_structured_output = false`（第 24 条：该路由对强制 tool_choice 硬拒 400），**L0 全关**：这份 Schema 根本不会到达供应商，模型看不到任何机器可读的结构约束。
+
+**后果**：逐位契约的服从性完全由**提示词文本**承担——两个新模板（蓝图 / 帧实现）内嵌的结构契约（`{"frames": [...]}` 形状句 + 逐位「第 i 帧（{frame_class}）须符合：{Schema 文本 | 自由文本一段}」）在无 L0 端点上是**硬要求而非兜底**。校验侧不受影响：jsonschema ≥ 4.21 原生支持 `prefixItems`，L2 照常逐位校验、违约照常进 L3 修复环。
+
+**处置与实测**：验收真跑 6/6 帧实现调用全部通过（`realize_calls = 6`、`realize_failures = 0`），用户 Schema 侧 `resolved_at = {l0_or_clean: 7, l1: 0, l3_1: 0, l3_2: 0, rejected: 0}`——一次修复都没花。集成测试 `tests/integration/test_generate_stream_llm.py` 双向钉板：DeepSeek 一侧钉「无 L0 走 L1–L3 路径」的蓝图 + 含结构化帧类的实现，z.ai glm-5.2 一侧钉 `prefixItems` 的 L0 供应商透传（站立假设：该关键字能被结构化输出层原样接受）。**残余锐边**：个别对结构化输出关键字挑剔的路由可能对含 `prefixItems` 的请求直接 400——处置是配置级的（该 profile 声明 `supports_structured_output = false`），**不新增调用级参数**；手册第 14 章 14.7 与第 27 章 27.5 已注明。
+
+### 26. 温度 0.9 下帧实现偶发违约 ⇒ 整序列作废、交叉演示位退化 —— ⏸ 数据侧缓解（同第 6、14 条根因家族）
+
+**现象**：`examples/synth-stream` 取 `generate.temperature = 0.9`（生成侧默认值）。验收前的一次早期真跑里，6 条计划序列有 **2 条在帧实现阶段作废**（`realize_failures = 2`：逐位契约违约或输出被截断），幸存 4 条；由于交叉会话数是派生量 `Σ幸存 − sessions`，`crossed_sessions` 随之**退化为 0**——工程刻意埋的交叉演示位当次不复现。随后的验收真跑则 6/6 全成、`crossed_sessions = 1`。
+
+**后果**：形态本身无缺陷——配额是**尝试配额**（裁决·量目标辖区：无输出条数保证、无补齐回路），作废序列不产 failed 记录、不进交织，守恒恒等式照常成立（`emitted + dropped_* + failed = generated`，generated 数的是**进链**序列数）。但示例的**逐场景演示位依赖足量幸存序列**：交叉、噪音落点、重发抽取都在交织期按幸存集掷签，作废会改变交织输入并使后续抽签整体位移——同 seed 双跑逐字节一致的前提是「蓝图与帧实现的 LLM 输出也一致」（spec §2.6 确定性声明链的 v1.13 句已如此表述）。
+
+**处置**：根因与第 6、14 条同源（服务端非确定性 + 判决/生成对措辞极敏感），工具侧无案。温度是两难旋钮，两端都有代价——低温使同类序列彼此近重、被序列级相似度过滤淘汰（`survived_dedup ≪ produced`），高温使帧实现违约（`produced < planned`）；无 L0 端点上后者的边界更窄（第 25 条）。数据侧缓解 = 保持 0.9 并把类 instruction 写出足够多的可变要素（不同城市/设备/时段），使低温不必要。验收口径写入手册第 27 章 27.9（温度两难表）与 27.10（排障表首行）：**先看 `produced/planned`，再看 `survived_dedup/produced`**；两处均声明逐次运行数字会浮动、守恒恒成立。
+
+### 27. 工件重放的判重档位实测：`near_text` 而非 `exact` —— 已记录（2026-08-13）
+
+**现象**：把验收真跑的时间流工件（`out/synth-labels.stream.jsonl`，29 行）拷成 process 模式输入、配同参 `[stream]`（`order_by = "meta:ts"`、`gap_s = 900`）+ `segment` 重放：**29 帧 → 6 会话（= sessions 5 + 重发尾会话 1）→ 6 episodes、`absorbed = 28`、`dropped_noise = 1`、`dropped_dup = 1`、exit 0**（加 `--strict` 预期退 1）。判重命中如设计预期，但**档位是 `near_text` 不是 `exact`**。
+
+**根因**：重发帧与原序列帧逐字节同源，但原会话里还混着一个噪音帧——重放时 segment 只判掉了两个噪音帧中的一个（`dropped_noise = 1`），另一个被**吸收**进 episode。于是原 episode 比重发 episode 多一个成员，序列判重配方（成员文本按序 `"\x1e"` 拼接）不再逐字节相同，命中落到近似层。噪音帧若被剔干净，两侧成员文本完全一致，档位就是 `exact`。
+
+**后果与处置**：判重命中本身稳定（演示位不会丢），但**档位随分段判决浮动**——文档不得把它写死。`examples/synth-stream/project.toml` 的文件头注与手册第 27 章 27.8 均按实测叙述（「剔除则 `exact`、被吸收则 `near_text`，实测为后者」）；spec §3.8 的验收记录同款措辞。另附一条对账事实：生成侧 `report.generate.stream.sessions = 5` **不含**重发的流尾会话，与重放侧的 6 会话差的就是它——两侧账目一致，不是偏差。
+
+### 28. `resolved_at` 恒等式在 M8 显式待遇参数重构后的回归确认 —— ✅ 已确认（2026-08-13）
+
+**背景**：v1.13 的按序列类标注 Schema 要求 M5 以**显式 schema** 调用 `complete_validated`，而 v1.12 及以前「显式 schema ⇒ 内部待遇」的推断会顺带丢掉两样东西：L2.5 代码回调校验层与 `resolved_at` 记账（该弯折即帧级标注的现状）。裁决·M8 显式待遇参数以 additive keyword `user_treatment: bool | None = None` 正面修掉它（`None` = 现行推断，15 个既有调用点零改动；按类标注调用传 `True`）。本条是该重构在真端点上的账目回归确认。
+
+**实测**：验收真跑 `schema_engine.resolved_at = {"l0_or_clean": 7, "l1": 0, "l3_1": 0, "l3_2": 0, "rejected": 0}`，加总 **7 = 6 条序列的标注调用 + 1 次 verify 修复路径的重标注**（主输出第 4 行的 `verification.rounds = 2` 佐证那一轮修复，其 `annotation.attempts = 1` 说明重标注本身一次到位）——与 §6.4 重述后的恒等式「`resolved_at` 加总 = 进入 M5 的**记录级**标注调用数（user_treatment 族）」逐项吻合。两个序列类各走自己的 `schema_inline`（产出行字段集互不相同）且**都计入**，证明显式 Schema 不再掉出记账；`llm_usage.default.calls = 52` 与 dry-run 估算 49 的差额三次全在估算从不包含的修复上：一轮 verify repair 的重标注 + 复审（第 4 行 `rounds = 2`），外加一次**内部** Schema 的修复环调用——用户 Schema 侧 `l1`/`l3_*` 全 0、`llm_usage.default.retries = 0`，两条同时成立即排除了「用户侧修复」与「重试」两种可能。帧级标注（内部待遇、不计 `resolved_at`）在本工程不可达（帧粒度与时间流形态互斥），该分支由 `examples/mix` 与离线套件继续覆盖。
+
+### 测试留痕（v1.13）
+
+| 套件 | 数量 | 备注 |
+|---|---|---|
+| 离线套件 | 1673 passed | 新增 `tests/common/config/test_loader_generate_stream.py` 与 `tests/operators/test_generate_stream.py`；既有必红项（budget 头常量十→十二、console 参数化七→八 golden、config 默认值、schema_engine stats 语义、`EXPECTED_TEST_PY`）全部同步 |
+| 集成套件（真端点） | 3 passed | `tests/integration/test_generate_stream_llm.py`：DeepSeek 蓝图/实现（含结构化帧类）+ 按类标注 Schema 两例、z.ai glm-5.2 的 `prefixItems` L0 透传一例 |
+| `examples/synth-stream` 真跑 | exit 0 | `counts.generated = emitted = 6`、`failed`/`dropped_*` 全 0；`generate.stream = {sessions 5, crossed_sessions 1, 两类各 planned 3/produced 3, frames 23, noise_frames 2, duplicates 1, plan_calls 6, realize_calls 6, noise_calls 1, 三项 failures 0}`；`run.artifact.lines = 29`、`llm_usage.default.calls = 52`、`timing.wall_s = 96.97`；`_meta.run.rubric = "default:trajectory"`（S29 扩展生效）；`report.classify` 直方图全零（inherited，预期） |
+| 工件重放（process + segment） | exit 0 | 29 帧 → 6 会话 → 6 episodes、`absorbed 28`、`dropped_noise 1`、`dropped_dup 1`（`near_text`，见第 27 条） |
+| 既有示例 dry-run golden | 七个字节不动 | 新增第八个 `tests/cli/goldens/dryrun-synth-stream.txt`（`generate_calls=13`、`classify_calls=0`、`total=49`） |

@@ -14,6 +14,7 @@ from labelkit.common.config.model import (
     AnnotateConfig, ClassifyConfig, ClassSpec, Criterion, DedupConfig,
     ConsoleConfig,
     ExtractConfig, FrameAnnotateConfig, FrameClassifyConfig, GenerateConfig,
+    GenerateStreamConfig,
     InputConfig, OutputConfig, QualityConfig,
     ResolvedConfig, Rubric, RunConfig, SegmentConfig, StitchConfig, StreamConfig,
     ToolConfig,
@@ -96,6 +97,8 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
     frame_classify = kw.pop("frame_classify", FrameClassifyConfig())
     frame_annotate = kw.pop("frame_annotate", FrameAnnotateConfig())
     frame_schema = kw.pop("frame_schema", None)
+    # v1.13：时间流形态（默认关 = 字节等价 v1.12）
+    generate_stream = kw.pop("generate_stream", GenerateStreamConfig())
     assert not kw, f"unknown overrides: {kw}"
     return ResolvedConfig(
         tool=ToolConfig(log_format=log_format),
@@ -142,6 +145,7 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
         frame_classify=frame_classify,
         frame_annotate=frame_annotate,
         frame_schema=frame_schema,
+        generate_stream=generate_stream,
     )
 
 
@@ -1559,3 +1563,239 @@ def test_dry_run_report_path_is_diverted(tmp_path):
     em_real = Emitter(make_cfg(tmp_path), engine=None, run_id="a" * 12,
                       run_started_at=datetime.now().astimezone())
     assert str(em_real._report_path).endswith("res.report.json")
+
+
+# ── v1.13 写前终检按行取类有效 Schema（裁决·按类标注 Schema，spec §6.3）───────
+
+from dataclasses import replace as _dc_replace                    # noqa: E402
+
+from labelkit.common.config.model import ClassView                # noqa: E402
+
+# faq 类 Schema：不要求 difficulty（全局 USER_SCHEMA 要求）——按类取值时才放行
+FAQ_SCHEMA = {
+    "type": "object",
+    "properties": {"intent": {"type": "string"}, "topic": {"type": "string"}},
+    "required": ["intent", "topic"],
+    "additionalProperties": False,
+}
+# chat 类 Schema：额外要求 answer（全局 USER_SCHEMA 无此字段）——按类取值时才拒
+CHAT_SCHEMA = {
+    "type": "object",
+    "properties": {"intent": {"type": "string"}, "answer": {"type": "string"}},
+    "required": ["intent", "answer"],
+    "additionalProperties": False,
+}
+
+
+def class_schema_cfg(tmp_path, assignment="single"):
+    """三个序列类：faq / chat 各自声明按类标注 Schema，plain 零覆盖（回落全局
+    USER_SCHEMA），构成「按类 vs 回落」的对照面。"""
+    cfg = make_cfg(tmp_path, classify=classify_cfg(
+        assignment=assignment, classes=("faq", "chat", "plain")))
+    views = {
+        name: ClassView(name=name, quality=cfg.quality, rubric=cfg.rubric,
+                        annotate=cfg.annotate, generate=cfg.generate,
+                        verify=cfg.verify, extract=cfg.extract, schema=schema)
+        for name, schema in (("faq", FAQ_SCHEMA), ("chat", CHAT_SCHEMA),
+                            ("plain", None))
+    }
+    return _dc_replace(cfg, class_views=views)
+
+
+def _cls(label, labels=None):
+    return Classification(label=label, labels=tuple(labels or (label,)),
+                          source="llm", detail={})
+
+
+def test_prewrite_check_routes_per_row_class_schema(tmp_path):
+    cfg = class_schema_cfg(tmp_path)
+    # faq 行：过 faq Schema，但缺 difficulty ⇒ 若按全局终检会被拒（按类取值证明）
+    faq = make_item(record=make_record("1" * 16, 1), classification=_cls("faq"),
+                    output={"intent": "写作", "topic": "请假条"})
+    # chat 行：过全局 Schema，但缺 answer ⇒ 该类 Schema 违规 ⇒ 进 rejects
+    chat = make_item(record=make_record("2" * 16, 2), classification=_cls("chat"),
+                     output={"intent": "闲聊", "topic": "天气", "difficulty": "easy"})
+    # plain 行（零覆盖）：违反全局枚举 ⇒ 回落路径照常拒（字节等价 v1.12）
+    plain = make_item(record=make_record("3" * 16, 3), classification=_cls("plain"),
+                      output={"intent": "问答", "topic": "t", "difficulty": "极难"})
+    _, result = run_emitter(cfg, [faq, chat, plain])
+
+    assert result == EmitResult(emitted=1, rejected=2)
+    rows = read_jsonl(tmp_path / "out" / "res.jsonl")
+    assert len(rows) == 1                                # 违规行零落盘
+    assert rows[0]["_meta"]["classification"]["label"] == "faq"
+    assert rows[0]["intent"] == "写作" and "difficulty" not in rows[0]
+
+    rejects = {r["_meta"]["id"]: r["_meta"]
+               for r in read_jsonl(tmp_path / "out" / "res.rejects.jsonl")}
+    assert set(rejects) == {"2" * 16, "3" * 16}
+    for meta in rejects.values():
+        assert (meta["stage"], meta["reason"]) == ("emitter", "internal_error")
+    assert any("answer" in e for e in rejects["2" * 16]["errors"])
+    assert chat.status == "failed" and plain.status == "failed"
+
+
+def test_prewrite_check_multi_fanout_rows_use_own_label(tmp_path):
+    # multi 扇出：兄弟信封共享 record 但各带自己的标签 ⇒ 各过各的类 Schema。
+    cfg = class_schema_cfg(tmp_path, assignment="multi")
+    record = make_record("4" * 16, 4)
+    output = {"intent": "写作", "topic": "请假条"}      # 过 faq，不过 chat
+    first = make_item(record=record, output=dict(output),
+                      classification=_cls("faq", ("faq", "chat")))
+    clone = make_item(record=record, output=dict(output),
+                      classification=_cls("chat", ("faq", "chat")))
+    _, result = run_emitter(cfg, [first, clone])
+
+    assert result == EmitResult(emitted=1, rejected=1)
+    rows = read_jsonl(tmp_path / "out" / "res.jsonl")
+    assert [row["_meta"]["classification"]["label"] for row in rows] == ["faq"]
+    reject = read_jsonl(tmp_path / "out" / "res.rejects.jsonl")[0]["_meta"]
+    assert (reject["id"], reject["label"]) == ("4" * 16, "chat")
+
+
+# ── v1.13 时间流形态：工件通道 / _stream_block 或门 / members 真值 / rubric ──
+
+def gs_on() -> GenerateStreamConfig:
+    """M1 形状的开启态 generate_stream（emitter 只读 enabled 位）。"""
+    return GenerateStreamConfig(enabled=True, sessions=1, noise_instruction="",
+                                frame_gap_s=(5.0, 60.0))
+
+
+def artifact_member(rec_id: str, line_no: int) -> Record:
+    """直装成员帧：ref 指向工件路径 + 行号、generator 携带预抽溯源。"""
+    raw = {"ts": f"2026-01-01T09:00:0{line_no}.000000+08:00",
+           "text": f"帧 {line_no}", "truth": {"session": 0}}
+    return Record(id=rec_id, modality="text", text=raw["text"], raw=raw,
+                  ui_tree=None, image=None,
+                  ref=RecordRef(source_file="out/res.stream.jsonl", line_no=line_no,
+                                pair_index=None, generated_from=(),
+                                generator={"llm": "default", "style": None}))
+
+
+def stream_form_item() -> PipelineItem:
+    members = [artifact_member("1" * 16, 1), artifact_member("2" * 16, 2)]
+    seq = Record(id="e" * 16, modality="text", text=None, raw=None, ui_tree=None,
+                 image=None, ref=members[0].ref, kind="sequence",
+                 members=tuple(members))
+    item = make_item(record=seq,
+                     classification=Classification(label="faq", labels=("faq",),
+                                                   source="inherited", detail={}))
+    item.session_id = "s" * 16
+    item.member_classifications = {
+        "1" * 16: Classification(label="task_request", labels=("task_request",),
+                                 source="inherited", detail={}),
+        "2" * 16: Classification(label="followup", labels=("followup",),
+                                 source="inherited", detail={}),
+    }
+    return item
+
+
+def test_stream_artifact_channel_part_rename_and_summary(tmp_path):
+    cfg = make_cfg(tmp_path, generate_stream=gs_on())
+    lines = ['{"ts": "t1", "text": "帧一"}', '{"ts": "t2", "text": "帧二"}']
+    em = Emitter(cfg, EngineStub(), run_id="ab12cd34ef56",
+                 run_started_at=RUN_STARTED_AT)
+    em.open()
+    em.write_stream_artifact(lines)
+    artifact = tmp_path / "out" / "res.stream.jsonl"
+    part = Path(str(artifact) + ".part")
+    assert part.exists() and not artifact.exists()     # finalize 前只有 .part
+    assert em.artifact_summary["path"] == str(artifact)
+    assert em.artifact_summary["lines"] == 2
+    em.finalize({"counts": {}}, deliver=True)
+    assert artifact.exists() and not part.exists()     # 与主输出同批原子改名
+    data = artifact.read_bytes()
+    assert data.decode("utf-8") == "\n".join(lines) + "\n"
+    import hashlib as hashlib_module
+
+    assert em.artifact_summary["sha256"] == (
+        "sha256:" + hashlib_module.sha256(data).hexdigest())
+
+
+def test_stream_artifact_undeliverable_never_renames(tmp_path):
+    cfg = make_cfg(tmp_path, generate_stream=gs_on())
+    em = Emitter(cfg, EngineStub(), run_id="ab12cd34ef56",
+                 run_started_at=RUN_STARTED_AT)
+    em.open()
+    # 以目录占位 .part 路径 ⇒ open 失败：_undeliverable 纪律共用（exit 4 家族）
+    (tmp_path / "out" / "res.stream.jsonl.part").mkdir()
+    with pytest.raises(LabelKitError):
+        em.write_stream_artifact(["x"])
+    em.finalize({"counts": {}}, deliver=True)
+    assert not (tmp_path / "out" / "res.jsonl").exists()   # 主 .part 不改名
+    assert em.artifact_summary is None
+
+
+def test_stream_artifact_absent_without_write(tmp_path):
+    """dry-run 天然豁免面：未调用 write_stream_artifact ⇒ 工件零落盘、摘要 None
+    （_run_dry 不驱动生成、不触达通道——无专门代码）。"""
+    cfg = make_cfg(tmp_path, generate_stream=gs_on())
+    em, _ = run_emitter(cfg, [make_item()])
+    assert em.artifact_summary is None
+    assert not (tmp_path / "out" / "res.stream.jsonl").exists()
+    assert not (tmp_path / "out" / "res.stream.jsonl.part").exists()
+
+
+def test_stream_block_or_gate_members_truth_and_default_semantics(tmp_path):
+    """裁决·members 呈现真值门：segment 关、generate_stream 开 ⇒ _meta.stream 在
+    场；members[] = {index, id, label}（label = member_classifications 真值，无
+    annotation/status 列）；session_split=false / repaired=false / degraded=null /
+    steps=null 缺省语义；无 thread_id/fragments；order_span/member_sources 指向
+    工件路径 + 行号。"""
+    cfg = make_cfg(tmp_path, generate_stream=gs_on())
+    run_emitter(cfg, [stream_form_item()])
+    meta = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]
+    stream = meta["stream"]
+    assert list(stream) == ["episode_id", "session_id", "order_span",
+                            "member_count", "member_ids", "member_sources",
+                            "members", "session_split", "repaired", "degraded",
+                            "steps"]
+    assert stream["episode_id"] == "e" * 16
+    assert stream["session_id"] == "s" * 16
+    assert stream["order_span"] == ["out/res.stream.jsonl:1",
+                                    "out/res.stream.jsonl:2"]
+    assert stream["member_sources"] == [
+        {"file": "out/res.stream.jsonl", "line_no": 1},
+        {"file": "out/res.stream.jsonl", "line_no": 2}]
+    assert stream["members"] == [
+        {"index": 0, "id": "1" * 16, "label": "task_request"},
+        {"index": 1, "id": "2" * 16, "label": "followup"}]
+    assert (stream["session_split"], stream["repaired"],
+            stream["degraded"], stream["steps"]) == (False, False, None, None)
+    assert "thread_id" not in stream and "fragments" not in stream
+    # 生成溯源：source.generator 随首成员 ref 落 _meta.source
+    assert meta["source"]["generator"] == {"llm": "default", "style": None}
+
+
+def test_stream_block_gate_off_is_null_when_form_disabled(tmp_path):
+    """零改动声明面：形态关闭（segment 也关）⇒ 序列行 stream 恒 null。"""
+    cfg = make_cfg(tmp_path)
+    run_emitter(cfg, [stream_form_item()])
+    assert read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"] is None
+
+
+def test_verification_block_defects_gate_untouched_in_stream_form(tmp_path):
+    """_verification_block defects 门零改动：判决形 defects 恒空且 segment 关 ⇒
+    verification 块无 defects 键（v1.8 非流规则字面维持）。"""
+    cfg = make_cfg(tmp_path, generate_stream=gs_on())
+    item = stream_form_item()
+    item.verification = VerificationResult(verdict="pass", rounds=1, critiques=())
+    run_emitter(cfg, [item])
+    verification = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["verification"]
+    assert verification == {"verdict": "pass", "rounds": 1}
+
+
+def test_rubric_selector_mirror_resolves_trajectory_in_stream_form(tmp_path):
+    """S29 emitter 镜像（裁决·轨迹准则自动解析扩展）：空选择子 ∧ generate_stream
+    开 ⇒ "default:trajectory"（与 loader 侧对齐）。"""
+    cfg = make_cfg(tmp_path, generate_stream=gs_on(), quality_rubric="")
+    run_emitter(cfg, [stream_form_item()])
+    meta = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]
+    assert meta["run"]["rubric"] == "default:trajectory"
+
+
+def test_rubric_selector_off_form_keeps_modality_default(tmp_path):
+    cfg = make_cfg(tmp_path, quality_rubric="")
+    run_emitter(cfg, [make_item()])
+    meta = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]
+    assert meta["run"]["rubric"] == "default:text"

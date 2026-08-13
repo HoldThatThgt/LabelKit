@@ -103,6 +103,7 @@ EXPECTED_TEST_PY = {
     "tests/cli/test_cli.py",
     "tests/cli/test_console.py",
     "tests/common/config/test_config.py",
+    "tests/common/config/test_loader_generate_stream.py",   # v1.13 (SPEC-stream-generation §3.1)
     "tests/common/contracts/test_stage.py",
     "tests/common/contracts/test_types.py",
     "tests/common/extensions/test_hooks.py",
@@ -119,6 +120,7 @@ EXPECTED_TEST_PY = {
     "tests/integration/test_classify_llm.py",
     "tests/integration/test_frame_llm.py",         # v1.12 (SPEC-frame-annotation §3.9)
     "tests/integration/test_generate_llm.py",
+    "tests/integration/test_generate_stream_llm.py",  # v1.13 (SPEC-stream-generation §3.9)
     "tests/integration/test_key_pool_llm.py",
     "tests/integration/test_llm_client_llm.py",
     "tests/integration/test_quality_llm.py",
@@ -132,6 +134,7 @@ EXPECTED_TEST_PY = {
     "tests/operators/test_emitter.py",
     "tests/operators/test_extract.py",
     "tests/operators/test_generate.py",
+    "tests/operators/test_generate_stream.py",   # v1.13 时间流形态（wave 三）
     "tests/operators/test_ingest.py",
     "tests/operators/test_quality.py",
     "tests/operators/test_segment.py",

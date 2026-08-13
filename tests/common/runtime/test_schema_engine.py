@@ -23,7 +23,9 @@ from labelkit.common.runtime.schema_engine import (
     defect_verdict_schema,
     deterministic_repair,
     judgment_schema,
+    plan_schema,
     pointwise_schema,
+    realize_schema,
     samples_schema,
     segment_window_schema,
     stitch_schema,
@@ -487,6 +489,115 @@ class TestInternalSchemas:
                                                          # thread_ref key required
 
 
+# ── v1.13: plan_schema / realize_schema (§10.7 / SPEC-stream-generation §3.3) ─
+
+FRAME_CLASSES = ["task_request", "followup", "confirmation"]
+
+# 一个"结构化帧"的用户生成 Schema（帧类生成 Schema 的形状），与"纯文本帧"对照。
+UTTERANCE_SCHEMA = {
+    "type": "object",
+    "properties": {"utterance": {"type": "string"},
+                   "entities": {"type": "array", "items": {"type": "string"}}},
+    "required": ["utterance", "entities"],
+    "additionalProperties": False,
+}
+TEXT_FRAME_SCHEMA = {"type": "string"}
+
+
+class TestPlanSchema:
+    def test_shape_pins_step_count_and_closed_frame_class_set(self):
+        s = plan_schema(FRAME_CLASSES, 3)
+        Draft202012Validator.check_schema(s)
+        assert s["required"] == ["steps"] and s["additionalProperties"] is False
+        arr = s["properties"]["steps"]
+        assert arr["minItems"] == 3 and arr["maxItems"] == 3
+        item = arr["items"]
+        assert item["required"] == ["frame_class", "brief"]
+        assert item["additionalProperties"] is False
+        assert item["properties"]["frame_class"] == {"type": "string",
+                                                     "enum": FRAME_CLASSES}
+        assert item["properties"]["brief"] == {"type": "string"}
+
+    def test_validation_positive_and_negative(self):
+        v = Draft202012Validator(plan_schema(FRAME_CLASSES, 2))
+        steps = [{"frame_class": "task_request", "brief": "发起购票"},
+                 {"frame_class": "followup", "brief": "补充日期"}]
+        assert v.is_valid({"steps": steps})
+        assert not v.is_valid({"steps": steps[:1]})              # minItems 钉长度
+        assert not v.is_valid({"steps": steps + steps[:1]})      # maxItems 钉长度
+        assert not v.is_valid({"steps": [{"frame_class": "ghost", "brief": "x"},
+                                         steps[1]]})             # 闭集之外
+        assert not v.is_valid({"steps": [{"frame_class": "followup"}, steps[1]]})
+        assert not v.is_valid({"steps": steps, "note": "多余键"})
+
+    def test_repeated_frame_class_is_schema_legal(self):
+        # 同一帧类在一条序列里本就可重复出现（R1 同理：不用 uniqueItems）
+        v = Draft202012Validator(plan_schema(FRAME_CLASSES, 2))
+        assert v.is_valid({"steps": [{"frame_class": "followup", "brief": "a"},
+                                     {"frame_class": "followup", "brief": "b"}]})
+
+    def test_keyword_set_stays_inside_the_frozen_vocabulary(self):
+        s = plan_schema(FRAME_CLASSES, 4)
+        assert _schema_keywords(s) <= ALLOWED_KEYWORDS
+        assert "uniqueItems" not in _all_dict_keys(s)
+
+    def test_enum_copies_input_sequence(self):
+        names = ["a", "b"]
+        s = plan_schema(names, 1)
+        names.append("c")
+        assert s["properties"]["steps"]["items"]["properties"]["frame_class"][
+            "enum"] == ["a", "b"]
+
+
+class TestRealizeSchema:
+    def test_shape_is_positional_prefix_items_closed_at_the_tail(self):
+        s = realize_schema([UTTERANCE_SCHEMA, TEXT_FRAME_SCHEMA])
+        Draft202012Validator.check_schema(s)
+        assert s["required"] == ["frames"] and s["additionalProperties"] is False
+        arr = s["properties"]["frames"]
+        assert arr["prefixItems"] == [UTTERANCE_SCHEMA, TEXT_FRAME_SCHEMA]
+        assert arr["minItems"] == 2 and arr["maxItems"] == 2
+        assert arr["items"] is False                    # 封尾：禁止超长数组
+
+    def test_prefix_items_validate_position_by_position(self):
+        # jsonschema ≥ 4.21 原生支持 draft 2020-12 prefixItems ⇒ L2 直接可校验
+        v = Draft202012Validator(realize_schema([UTTERANCE_SCHEMA,
+                                                 TEXT_FRAME_SCHEMA]))
+        good = {"frames": [{"utterance": "帮我订票", "entities": ["上海"]}, "好的"]}
+        assert v.is_valid(good)
+        # 位序颠倒 ⇒ 两位都不合规
+        assert not v.is_valid({"frames": ["好的",
+                                          {"utterance": "帮我订票",
+                                           "entities": ["上海"]}]})
+        # 第 1 帧缺必填键
+        assert not v.is_valid({"frames": [{"utterance": "帮我订票"}, "好的"]})
+        # 第 2 帧类型错（纯文本帧位收到对象）
+        assert not v.is_valid({"frames": [good["frames"][0], {"x": 1}]})
+        # 长度：少一帧 / 多一帧都不合规
+        assert not v.is_valid({"frames": good["frames"][:1]})
+        assert not v.is_valid({"frames": good["frames"] + ["多余"]})
+        assert not v.is_valid({"frames": good["frames"], "note": "多余键"})
+
+    def test_single_and_uniform_positions(self):
+        v = Draft202012Validator(realize_schema([TEXT_FRAME_SCHEMA] * 3))
+        assert v.is_valid({"frames": ["a", "b", "c"]})
+        assert not v.is_valid({"frames": ["a", "b"]})
+
+    def test_wrapper_skeleton_keywords_add_only_prefix_items(self):
+        s = realize_schema([TEXT_FRAME_SCHEMA])
+        skeleton = {"type", "properties", "required", "additionalProperties",
+                    "prefixItems", "minItems", "maxItems", "items"}
+        assert set(s) | set(s["properties"]["frames"]) <= skeleton
+        assert "uniqueItems" not in _all_dict_keys(s)
+
+    def test_step_schema_sequence_is_copied(self):
+        steps = [dict(TEXT_FRAME_SCHEMA)]
+        s = realize_schema(steps)
+        steps.append(dict(UTTERANCE_SCHEMA))
+        assert s["properties"]["frames"]["minItems"] == 1
+        assert len(s["properties"]["frames"]["prefixItems"]) == 1
+
+
 # ── v1.7: classification_schema (§10.7 / spec 3.13, R1) ─────────────────────
 
 NAMES = ["faq", "chitchat", "other"]
@@ -837,3 +948,90 @@ def test_l3_repair_finish_origin_overflow_never_feeds():
     metrics, calls = _run_repair_overflow("finish")
     assert calls == 2
     assert metrics.fed == []
+
+
+# ── v1.13（裁决·M8 显式待遇参数）: user_treatment 显式门 ─────────────────────
+# 「用户 Schema 待遇」= 计 resolved_at 记账 + 启 L2.5 回调。v1.13 前该待遇由
+# `schema is None` 隐式推断，导致「按序列类标注 Schema」这类显式 Schema 的记录级
+# 标注调用被误当内部调用；新增的 additive keyword 把待遇与 Schema 来源解耦。
+
+class _FixedLLM:
+    """In-process 桩（QueueEngine 惯例——绝不 mock 服务端/传输层）：每次调用返回
+    同一段文本，并记录 L0 透传的 response_schema。"""
+
+    def __init__(self, text: str):
+        self.text = text
+        self.calls = 0
+        self.schemas: list = []
+
+    async def complete(self, profile, prompt, response_schema=None):
+        self.calls += 1
+        self.schemas.append(response_schema)
+        return _StubResponse(self.text)
+
+
+CLASS_SCHEMA = {"type": "object",
+                "properties": {"topic": {"type": "string"}},
+                "required": ["topic"], "additionalProperties": False}
+
+HOOK_REF = "tests.hook_samples:topic_max6"          # topic > 6 字符即违规
+ZERO_STATS = {"l0_or_clean": 0, "l1": 0, "l3_1": 0, "l3_2": 0, "rejected": 0}
+
+
+def _run_engine(engine, **kw):
+    import asyncio
+
+    return asyncio.run(engine.complete_validated("default", object(), **kw))
+
+
+def test_user_treatment_default_keeps_the_schema_is_none_inference():
+    # 显式 schema + 缺省 user_treatment ⇒ 内部待遇（15 个既有调用点零改动的语义）
+    llm = _FixedLLM('{"topic": "这是一个很长很长的主题"}')
+    eng = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(validator=HOOK_REF))
+    obj, _usage, attempts, _model = _run_engine(eng, schema=CLASS_SCHEMA)
+    assert obj == {"topic": "这是一个很长很长的主题"}   # hook 未跑，否则会被判违规
+    assert attempts == 1 and llm.calls == 1
+    assert eng.stats == ZERO_STATS                     # 内部调用不进 resolved_at
+
+
+def test_user_treatment_true_counts_the_bucket_on_an_explicit_schema():
+    llm = _FixedLLM('{"topic": "请假条"}')
+    eng = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(validator=HOOK_REF))
+    obj, _usage, attempts, _model = _run_engine(eng, schema=CLASS_SCHEMA,
+                                                user_treatment=True)
+    assert obj == {"topic": "请假条"} and attempts == 1
+    assert eng.stats["l0_or_clean"] == 1               # 记录级标注调用，照常记账
+    assert llm.schemas == [CLASS_SCHEMA]               # L0 透传的是显式 Schema
+
+
+def test_user_treatment_true_also_runs_the_l25_hook():
+    import pytest
+    from labelkit.common.errors import SchemaViolation
+
+    llm = _FixedLLM('{"topic": "这是一个很长很长的主题"}')     # 过 L2、被 hook 拒
+    eng = SchemaEngine(SPEC_SCHEMA, llm=llm,
+                       cfg=OutputConfig(max_repair_attempts=1, validator=HOOK_REF))
+    with pytest.raises(SchemaViolation) as ei:
+        _run_engine(eng, schema=CLASS_SCHEMA, user_treatment=True)
+    assert ei.value.callback_only is True              # 剩余违规全部来自 L2.5
+    assert all(v.startswith("(validator) ") for v in ei.value.errors)
+    assert eng.stats["rejected"] == 1
+    assert llm.calls == 2                              # 首调 + 1 轮 L3 修复
+
+
+def test_user_treatment_false_turns_a_user_schema_call_internal():
+    llm = _FixedLLM('{"intent": "qa", "topic": "这是一个很长很长的主题", '
+                    '"difficulty": "easy"}')
+    eng = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(validator=HOOK_REF))
+    obj, _usage, _attempts, _model = _run_engine(eng, user_treatment=False)
+    assert obj["intent"] == "qa"                       # hook 未跑
+    assert eng.stats == ZERO_STATS
+    assert llm.schemas == [SPEC_SCHEMA]                # 仍按全局 Schema 校验
+
+
+def test_plain_user_schema_call_is_byte_equivalent_to_v1_12():
+    llm = _FixedLLM('{"intent": "qa", "topic": "请假条", "difficulty": "easy"}')
+    eng = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(validator=HOOK_REF))
+    _obj, _usage, _attempts, _model = _run_engine(eng)
+    assert eng.stats["l0_or_clean"] == 1
+    assert llm.schemas == [SPEC_SCHEMA]

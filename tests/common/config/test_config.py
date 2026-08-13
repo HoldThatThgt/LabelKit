@@ -15,7 +15,11 @@ import pytest
 
 from labelkit.common.config import ResolvedConfig, default_rubric, load
 from labelkit.common.config import loader as loader_mod
-from labelkit.common.config.model import CliOverrides, ConsoleConfig
+from labelkit.common.config.model import (
+    CliOverrides,
+    ConsoleConfig,
+    GenerateStreamConfig,
+)
 from labelkit.common.errors import ConfigError
 
 # ── fixtures / builders ────────────────────────────────────────────────────
@@ -166,6 +170,10 @@ def test_happy_path_defaults(env):
     assert cfg.frame_annotate.enabled is False
     assert cfg.frame_class_views == {}
     assert cfg.frame_schema is None
+    # v1.13 时间流生成：整节缺省 = 全关（字节等价 v1.12），配额两键取内建默认
+    assert cfg.generate_stream == GenerateStreamConfig()
+    assert cfg.generate.sequences == 0
+    assert cfg.generate.len_range == (3, 6)
 
 
 def test_digests_are_sha256_of_raw_bytes(env):
@@ -2701,8 +2709,10 @@ llm = "judge"
 instruction = "任务请求帧标注指令。"
 """)
     errors = env.errors(project_text=env.project(body=body))
+    # v1.13：节白名单增 generate（时间流生成形态的帧内容契约；非本形态出现该节由
+    # 定向 CONFIG_ERROR 接管，见 test_loader_generate_stream.py）
     has(errors, "[frame.class.task_request.quality]: [frame.class.*] 覆盖节不在"
-                "白名单内（可用：annotate）")
+                "白名单内（可用：annotate、generate）")
     has(errors, "[frame.class.task_request.annotate].llm: [frame.class.*.annotate] "
                 "不可覆盖该键（白名单：instruction、examples、enabled）")
     # 白名单内键不误伤
@@ -2996,3 +3006,24 @@ def test_frame_static_precheck_silent_with_room(env, capsys):
     err = capsys.readouterr().err
     assert "[frame.classify]: 静态系统侧提示部件估算" not in err
     assert "[frame.annotate]: 静态系统侧提示部件估算" not in err
+
+
+# ── v1.13: 新字段在时间流生成关闭时的缺省（形态覆盖见 test_loader_generate_stream） ──
+
+
+def test_class_views_v113_fields_default_off(env):
+    # 按类标注 Schema 未声明 ⇒ None（回落全局 output.schema）；配额两键取全局默认
+    cfg = env.load(project_text=env.project(body=CLASSIFY_BODY))
+    assert set(cfg.class_views) == {"writing", "qa", "other"}
+    for view in cfg.class_views.values():
+        assert view.schema is None
+        assert view.generate.sequences == 0
+        assert view.generate.len_range == (3, 6)
+
+
+def test_frame_class_views_v113_generate_face_default_none(env):
+    body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY + "\n" + FRAME_ANNOTATE_ONLY
+    cfg = env.load(project_text=env.project(body=body))
+    for view in cfg.frame_class_views.values():
+        assert view.gen_instruction is None
+        assert view.gen_schema is None
