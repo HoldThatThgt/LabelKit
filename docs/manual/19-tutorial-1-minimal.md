@@ -121,7 +121,7 @@ jq -c 'del(._meta)' out/labels.jsonl
 **① 把 `text_field` 改回 `"text"` 再跑**——收获 5 条 `ingest.bad_line` 警告，随后运行以退出码 3 终止：
 
 ```
-InputError: 无任何合法记录: data/input.jsonl（scanned=5 bad_input=5 missing_pair=0 index_conflict=0）
+InputError: no valid records: data/input.jsonl (scanned=5 bad_input=5 missing_pair=0 index_conflict=0)
 ```
 
 「一条合法记录都没有」是输入错误，不是一次成功的空跑。（设 `input.on_bad_line = "fail"` 会更早：第一条坏行处就停。）这是第 5 章说的头号坑，现在你亲眼见过它的症状了。

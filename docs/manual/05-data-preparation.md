@@ -147,10 +147,10 @@ capture/2026-07-01/
 - [ ] 跑过 `labelkit validate --probe`？
 - [ ] 用 `--dry-run` 看过预计记录数和调用量？
 
-其中「`input.text_field` 和数据里的字段名对上了」这条值得专门强调：`text_field` 写错时，**每一行都是坏行**。默认 `on_bad_line = "skip"` 下你会看到满屏 `ingest.bad_line` 警告（reason 为 `input.text_field "…" 未命中`），随后运行在读完输入时以**退出码 3** 终止，stderr 死因行形如：
+其中「`input.text_field` 和数据里的字段名对上了」这条值得专门强调：`text_field` 写错时，**每一行都是坏行**。默认 `on_bad_line = "skip"` 下你会看到满屏 `ingest.bad_line` 警告（reason 为 `input.text_field "…" missed`），随后运行在读完输入时以**退出码 3** 终止，stderr 死因行形如：
 
 ```
-InputError: 无任何合法记录: input.jsonl（scanned=14 bad_input=14 missing_pair=0 index_conflict=0）
+InputError: no valid records: input.jsonl (scanned=14 bad_input=14 missing_pair=0 index_conflict=0)
 ```
 
 「一条合法记录都没有」被视为输入错误而不是一次成功的空跑——看到这行，先查字段名。（配 `on_bad_line = "fail"` 则更早：第一条坏行处即退出码 3。只要有部分行合法，skip 策略照常跳过坏行跑完，坏行只计入 `bad_input`。）

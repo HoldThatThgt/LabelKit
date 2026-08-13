@@ -27,6 +27,7 @@ from labelkit.operators.stitch import (
     page_identity,
     prior_hits,
     render_candidate_card,
+    ThreadCard,
     render_thread_card,
     select_eviction,
     span_distance,
@@ -51,7 +52,11 @@ from labelkit.common.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.common.errors import SchemaViolation
+from labelkit.common.errors import (
+    ContextOverflowError,
+    OutputTruncatedError,
+    SchemaViolation,
+)
 from labelkit.common.runtime.schema_engine import stitch_schema
 from labelkit.common.contracts.types import (
     ImageRef,
@@ -165,8 +170,8 @@ class QueueEngine:
         self.outcomes = list(outcomes)
         self.calls: list = []              # (profile, prompt, schema, record_ids)
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0, record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
         out = self.outcomes.pop(0)
         if isinstance(out, Exception):
@@ -240,8 +245,10 @@ def test_thread_card_deterministic_and_structured():
     members = [ui_frame("a0", 0, texts=("外卖首页", "川味麻辣烫")),
                ui_frame("a1", 1, texts=("下单页",))]
     head = ui_frame("c0", 4, texts=("外卖收尾", "川味麻辣烫"))
-    card1 = render_thread_card(1, "点外卖", members, (0, 1), 2, head, cfg)
-    card2 = render_thread_card(1, "点外卖", members, (0, 1), 2, head, cfg)
+    thread = ThreadCard(index=1, task_name="点外卖", members=members, span=(0, 1),
+                        fragment_count=2)
+    card1 = render_thread_card(thread, head, cfg)
+    card2 = render_thread_card(thread, head, cfg)
     assert card1 == card2                              # determinism
     lines = card1.splitlines()
     assert lines[0] == "[线索 1] 任务名: 点外卖"
@@ -252,7 +259,9 @@ def test_thread_card_deterministic_and_structured():
     # the E5 resumption pair rides the card with tree_diff change evidence
     assert lines[5].startswith("接续对（线索尾帧 → 候选首帧）变更: 新增 ")
     # unnamed threads (failed-judgment bootstrap) render the placeholder
-    unnamed = render_thread_card(2, "", members, (0, 1), 1, None, cfg)
+    unnamed = render_thread_card(
+        ThreadCard(index=2, task_name="", members=members, span=(0, 1),
+                   fragment_count=1), None, cfg)
     assert unnamed.splitlines()[0] == "[线索 2] 任务名: （未命名）"
     assert "接续对" not in unnamed                     # no candidate head → no pair
 
@@ -274,7 +283,9 @@ def test_candidate_card_kinds_and_digest_cap():
 def test_prompt_shape_pool_count_context_and_empty_pool():
     cfg = make_cfg(context="手机自然使用流；同一任务可被切走后恢复")
     members = [ui_frame("a0", 0)]
-    card = render_thread_card(1, "点外卖", members, (0, 0), 1, members[0], cfg)
+    card = render_thread_card(
+        ThreadCard(index=1, task_name="点外卖", members=members, span=(0, 0),
+                   fragment_count=1), members[0], cfg)
     cand = render_candidate_card("episode", members, (4, 4), cfg)
     bundle = build_stitch_prompt([card], cand, cfg)
     assert [m.role for m in bundle.messages] == ["system", "user"]
@@ -1039,3 +1050,105 @@ def test_reactive_400_terminal_feeds_breaker_once_keep_path():
                           metrics=FeedMetrics(), rng=None, batch_no=1)
     asyncio.run(StitchStage(cfg).run([*frames, ep], ctx))
     assert ctx.metrics.fed == [True]                   # A7: exactly once
+
+
+# ── pass-2 judgment failure disposition (spec 3.16.6 keep 行的二遍形态) ───────
+
+class _FeedMetrics(RecordingMetrics):
+    """RecordingMetrics + 熔断喂入台账（A7 的「恰好一次」判定面）。"""
+
+    def __init__(self):
+        super().__init__()
+        self.fed: list = []
+
+    def record_provider_result(self, fatal, *, hard=False):
+        self.fed.append(fatal)
+
+
+def _repass_failure_run(exc, *, cfg=None):
+    """跑一遍 V2 场景，让 pass-2 的**首个**候选（A1）判决抛出给定异常。
+
+    @param exc pass-2 首个判决抛出的异常
+    @param cfg 已解析配置；默认 make_cfg()（on_error 缺省 keep、repass 开）
+    @return (a1, b, a2, engine, ctx)
+    """
+    cfg = cfg or make_cfg()
+    batch, a1, b, a2 = v2_batch()
+    engine = QueueEngine([
+        # pass 1：A1 / B / A2 各开一条单碎片线索
+        obj("new", task="点外卖"), obj("new", task="打车"),
+        obj("new", task="点外卖收尾"),
+        # pass 2（候选按碎片会话序 A1 → B → A2）：A1 的判决失败，其余判 new
+        exc, obj("new", task="打车"), obj("new", task="点外卖收尾"),
+    ])
+    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
+                          metrics=_FeedMetrics(), rng=None, batch_no=1)
+    out = asyncio.run(StitchStage(cfg).run(batch, ctx))
+    assert out is batch                                # 契约②c：同一列表对象
+    return a1, b, a2, engine, ctx
+
+
+def test_repass_judgment_failure_keeps_the_candidate_on_its_own_thread():
+    # spec 3.16.6 keep 行的二遍形态：判决放弃 ⇒ 候选保持自己那条线索（等价 keep），
+    # 留痕两件 = error 事件 + stitch.failures 计数，**不写 item.errors**。
+    a1, b, a2, engine, ctx = _repass_failure_run(SchemaViolation(["/verdict"], "{}"))
+
+    assert a1.status == "active" and a1.errors == []   # 既不失败也不留错
+    assert a1.thread_id == a1.record.id                # 仍是自己那条线索
+    assert [m.id for m in a1.record.members] == ["a0", "a1"]   # 未被并入任何线索
+    assert b.status == "active" and a2.status == "active"
+    counters = ctx.metrics.counters
+    assert counters["stitch.failures"] == 1
+    # judgments / repass_judgments 计**逻辑判定数**，失败不计（3.16.6 计数与归属）
+    assert counters["stitch.judgments"] == 3           # pass 1 三条全成功
+    assert counters["stitch.repass_judgments"] == 2    # pass 2 三候选，一条失败
+    # 失败的候选不发 stitch.judge 事件（判决未定案）
+    judge_events = [e for e in ctx.metrics.events if e[0] == "stitch.judge"]
+    assert len(judge_events) == 5                      # 3 + 2
+    assert sum(1 for e in judge_events if e[3]["repass"]) == 2
+    assert len(engine.calls) == 6                      # 失败调用照样发生过
+
+
+@pytest.mark.parametrize("exc, kind", [
+    (SchemaViolation(["/verdict"], "{}"), "stitch_invalid"),
+    (ContextOverflowError("precheck throat", phase="precheck"),
+     "context_overflow"),
+    (OutputTruncatedError("hit max_output_tokens"), "output_truncated"),
+])
+def test_repass_failure_event_records_the_precise_budget_kind(exc, kind):
+    # V27①：预算词表先行——事件 kind 取精确值，而非笼统的 stitch_invalid。
+    a1, _b, _a2, _engine, ctx = _repass_failure_run(exc)
+    error_events = [e for e in ctx.metrics.events if e[0] == "error"]
+    ((_ev, stage, record_ids, payload),) = error_events
+    assert stage == "stitch"
+    assert record_ids == ("a0",)                       # 候选碎片首成员 id
+    assert payload == {"stage": "stitch", "kind": kind,
+                       "message": str(exc), "retryable": False}
+    # keep 等价处置：pass-2 失败绝不产 rejects，也就绝不计 overflow_records
+    assert "budget.overflow_records" not in ctx.metrics.counters
+    assert a1.errors == []
+
+
+@pytest.mark.parametrize("exc, fed", [
+    (ContextOverflowError("sniffed 400", phase="reactive", origin="http_400"),
+     [True]),
+    (ContextOverflowError("200 oracle", phase="reactive", origin="finish"), []),
+    (ContextOverflowError("precheck", phase="precheck"), []),
+    (OutputTruncatedError("cap"), []),
+])
+def test_repass_reactive_400_terminal_feeds_breaker_once(exc, fed):
+    # §7.6 熔断矩阵 A7：只有 reactive × http_400 的溢出终局喂一次致命连击；
+    # precheck 与 200 形态的 finish 判据一律不喂（后者搭乘的是一次成功 HTTP 交互）。
+    _a1, _b, _a2, _engine, ctx = _repass_failure_run(exc)
+    assert ctx.metrics.fed == fed
+    assert ctx.metrics.counters["stitch.failures"] == 1
+
+
+def test_repass_failure_under_on_error_fail_still_keeps_the_candidate():
+    # SPEC-activity-structure.md §3.2「二遍判定失败：无论 on_error 取值一律降格为
+    # keep 等价（已开线索无从 fail），计数器与 error 事件照发」——这是 3.16.6 错误
+    # 处置表两行分流在二遍上的收敛点。
+    a1, _b, _a2, _engine, ctx = _repass_failure_run(
+        SchemaViolation(["/verdict"], "{}"), cfg=make_cfg(on_error="fail"))
+    assert a1.status == "active" and a1.errors == []
+    assert ctx.metrics.counters["stitch.failures"] == 1

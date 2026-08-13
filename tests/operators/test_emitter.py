@@ -1378,25 +1378,26 @@ def test_finalize_logs_rejects_line_count_and_report_path(tmp_path, caplog):
     with caplog.at_level(logging.INFO, logger=".".join(("labelkit", "emitter"))):
         run_emitter(cfg, batch)
     msgs = [r.getMessage() for r in caplog.records]
-    expect = (f"已写出 {tmp_path / 'out' / 'res.rejects.jsonl'}（2 行）"
-              f"与 {tmp_path / 'out' / 'res.report.json'}")
+    expect = (f"wrote {tmp_path / 'out' / 'res.rejects.jsonl'} (2 lines) "
+              f"and {tmp_path / 'out' / 'res.report.json'}")
     assert expect in msgs
-    # ordering: batch flush line → finalize rename line → 已写出 line
+    # ordering: batch flush line → finalize rename line → wrote line
     assert msgs.index(expect) > msgs.index(
-        next(m for m in msgs if m.startswith("finalize：fsync + rename")))
+        next(m for m in msgs if m.startswith("finalize: fsync + rename")))
 
 
 def test_finalize_logs_report_only_when_rejects_none(tmp_path, caplog):
     cfg = make_cfg(tmp_path, rejects="none")
     # a rejected item that is COUNTED but never written (rejects='none'):
-    # the 已写出 line must not claim a rejects file
+    # the "wrote" line must not claim a rejects file
     batch = [make_item(), make_item(status="dropped_dup",
                                     record=make_record("2" * 16, 2),
                                     annotated=False)]
     with caplog.at_level(logging.INFO, logger=".".join(("labelkit", "emitter"))):
         run_emitter(cfg, batch)
-    lines = [r.getMessage() for r in caplog.records if r.getMessage().startswith("已写出")]
-    assert lines == [f"已写出 {tmp_path / 'out' / 'res.report.json'}"]
+    lines = [r.getMessage() for r in caplog.records
+             if r.getMessage().startswith("wrote ")]
+    assert lines == [f"wrote {tmp_path / 'out' / 'res.report.json'}"]
 
 
 # ── TTY progress line (spec §7.7) ───────────────────────────────────────────
@@ -1433,7 +1434,7 @@ def test_progress_line_shows_batch_no_and_status_counts(tmp_path, monkeypatch):
                                                 message="x", retryable=False)])], 1)
     em.emit_batch([make_item(record=make_record("5" * 16, 5))], 2)
     line = fake.text.rsplit("\r", 1)[-1]
-    assert "批 2" in line
+    assert "batch 2" in line
     assert "emitted=2" in line
     assert "dropped_dup=1" in line
     assert "dropped_lowq=1" in line
@@ -1531,7 +1532,7 @@ def test_plain_summary_equals_console_format_golden(tmp_path, monkeypatch):
     monkeypatch.undo()
     assert fake.text == "\n".join(format_summary_lines(counts)) + "\n"
     assert fake.text == (
-        "   ── 终版摘要（与 report.counts 逐项一致）──\n"
+        "   ── final summary (matches report.counts item by item) ──\n"
         "   scanned=60  ingested=58  bad_input=2  generated=12\n"
         "   dropped_dup=5  dropped_lowq=6  dropped_verify=1  failed=0  emitted=41\n"
     )

@@ -175,8 +175,8 @@ class QueueEngine:
         self.outcomes = list(outcomes)
         self.calls: list = []              # (profile, prompt, schema, record_ids)
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0, record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
         out = self.outcomes.pop(0)
         if isinstance(out, Exception):
@@ -192,8 +192,8 @@ class MapEngine:
         self.by_first_frame = dict(by_first_frame)
         self.calls: list = []
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0, record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
         out = self.by_first_frame[record_ids[0]]
         if isinstance(out, Exception):
@@ -210,8 +210,8 @@ class SpanEngine:
         self.by_key = dict(by_key)
         self.calls: list = []              # (first frame id, frame count)
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0, record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
         key = (record_ids[0], schema["properties"]["frames"]["minItems"])
         self.calls.append(key)
         out = self.by_key[key]
@@ -1313,7 +1313,8 @@ def test_digest_poor_frames_counted_once_per_frame_and_warned_once_per_run(
     assert ctx.metrics.counters["segment.digest_poor_frames"] == 3
     assert len(logger.warnings) == 1
     # V4 wording: profile capability, never the removed use_vision key
-    assert "为 segment.llm 配置 supports_vision=true 的 profile" in logger.warnings[0]
+    assert "segment.llm" in logger.warnings[0]
+    assert "supports_vision=true profile" in logger.warnings[0]
     assert "use_vision" not in logger.warnings[0]
     # second batch through the SAME stage instance: counted again, no new WARN
     batch2 = [envelope(bare_frame("g0", 0), sid="s2"),

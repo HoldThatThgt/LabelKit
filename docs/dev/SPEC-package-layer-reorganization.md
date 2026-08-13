@@ -6,6 +6,8 @@
 
 日期：2026-07-16
 
+> **2026-08-14 整改修订注记**：M1 的 `loader.py` 已按「每文件 ≤ 2000 行、每函数 ≤ 50 行」拆为「公开入口 + 六个包内私有模块」（`_collect` / `_sections` / `_schemas` / `_rubrics` / `_classviews` / `_constraints`，见 §3 目录树）。分层方向、模块归属与公开面（`load` / `default_rubric` / `ResolvedConfig`）零改动；本文其余内容保留为历史重构记录。
+
 ## 1. 目的
 
 将当前平铺在 `labelkit/` 下的生产代码按职责整理为四个可识别的层：
@@ -77,8 +79,20 @@ labelkit/
 │   │   │   └── load、default_rubric、ResolvedConfig 公共出口
 │   │   ├── model.py
 │   │   │   └── 所有配置 dataclass
-│   │   └── loader.py
-│   │       └── TOML 读取、配置合并、字段校验、启动期 hook 校验
+│   │   ├── loader.py
+│   │   │   └── 公开入口：三源合并驱动、console 模式裁定、ResolvedConfig 装配
+│   │   ├── _collect.py
+│   │   │   └── 错误/警告聚合器与类型化表读取（2026-08-14 拆分）
+│   │   ├── _sections.py
+│   │   │   └── 逐节 TOML 解析 → 配置 dataclass（2026-08-14 拆分）
+│   │   ├── _schemas.py
+│   │   │   └── 用户/帧 JSON Schema 元校验与 few-shot 干跑（2026-08-14 拆分）
+│   │   ├── _rubrics.py
+│   │   │   └── 内联 rubric 解析与 default:* 包数据装载（2026-08-14 拆分）
+│   │   ├── _classviews.py
+│   │   │   └── [class.*] / [frame.class.*] 白名单合并为按类视图（2026-08-14 拆分）
+│   │   └── _constraints.py
+│   │       └── 跨节组合约束与解析产物冻结（2026-08-14 拆分）
 │   │
 │   ├── runtime/
 │   │   ├── llm_client.py

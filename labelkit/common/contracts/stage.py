@@ -1,4 +1,4 @@
-"""Stage protocol (spec §4.3) and RunContext (spec §3.10.3). Frozen contract."""
+"""Stage 协议（spec §4.3）与 RunContext（spec §3.10.3）。冻结契约。"""
 from __future__ import annotations
 
 import random
@@ -15,20 +15,26 @@ if TYPE_CHECKING:
 
 @dataclass
 class RunContext:
-    """Context handed to every stage.run() invocation. Constructed by M10 orchestrator,
-    ONE PER (batch, stage) INVOCATION, because rng is derived per batch and stage.
-    Exactly the six fields of spec 3.10.3 — spec 3.12.3 explicitly forbids extending this
-    signature; run_id/run_started_at travel via the MetricsSink/Emitter/Orchestrator
-    constructors instead (§7.9–§7.11)."""
-    cfg: ResolvedConfig
-    llm: LLMClient
-    schema_engine: SchemaEngine
-    metrics: MetricsSink
+    """交给每次 stage.run() 调用的上下文。
+
+    由 M10 orchestrator 构造，**每（批次, 阶段）调用一个**——因为 rng 是按批次与阶段派生的。
+    字段恰为 spec 3.10.3 的六个：spec 3.12.3 明确禁止扩展本签名；run_id / run_started_at
+    改走 MetricsSink / Emitter / Orchestrator 的构造函数传递（§7.9–§7.11）。
+    """
+    cfg: ResolvedConfig           # 本次运行的不可变解析配置（M1 产物）
+    llm: LLMClient                # M9 LLM 客户端；并发/重试/熔断/密钥池均在其内部
+    schema_engine: SchemaEngine   # M8 Schema 引擎；四层保证的唯一入口
+    metrics: MetricsSink          # M12 计数器与 trace 事件汇；阶段一切埋点经此发出
     rng: random.Random            # random.Random(f"{cfg.run.seed}:{batch_no}:{stage_name}")
-    batch_no: int                 # 1-based; run-level events use 0
+    batch_no: int                 # 从 1 开始；运行级事件用 0
 
 
 class Stage(Protocol):
+    """算子的统一执行面（spec §4.3）：一批信封进、同一批信封出。
+
+    `name` 为阶段名，用于日志 / trace 的 stage 字段与阶段耗时统计的键。
+    """
+
     name: str
 
     async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]:
@@ -54,5 +60,10 @@ class Stage(Protocol):
            幸存。不追加、不删除、不重排、不替换任何元素对象；返回值仍须是传入的同一
            列表对象；
            ③ generate 例外——返回新增子批（原批元素不修改）；④ 单条失败不得抛出到批层面，
-           必须落入 item.errors 并置 status='failed'。"""
+           必须落入 item.errors 并置 status='failed'。
+
+        @param batch 本批信封列表（唯一可变载体，生命周期 = 一个批次）
+        @param ctx 本次（批次, 阶段）调用的运行上下文
+        @return 传入的同一列表对象（调用方依赖列表身份）
+        """
         ...

@@ -1,4 +1,4 @@
-"""Stage construction for the configured LabelKit pipeline."""
+"""按配置装配 LabelKit 流水线的算子实例。"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -11,7 +11,11 @@ __all__ = ["build_stages"]
 
 
 def build_stages(cfg: "ResolvedConfig") -> list["Stage"]:
-    """Instantiate enabled operators in the frozen superset-chain order."""
+    """按冻结的超集链序实例化已启用的算子。
+
+    @param cfg: 已解析配置
+    @return: 已启用的算子实例列表（链序由 M10 组链时再行确认）
+    """
     from labelkit.operators.annotate import AnnotateStage
     from labelkit.operators.classify import ClassifyStage
     from labelkit.operators.dedup import DedupIndex, DedupStage

@@ -164,8 +164,8 @@ class QueueEngine:
         self.outcomes = list(outcomes)
         self.calls: list = []              # (profile, prompt, schema, record_ids)
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0, record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
         out = self.outcomes.pop(0)
         if isinstance(out, Exception):
@@ -180,8 +180,8 @@ class PairEngine:
         self.by_pair = dict(by_pair)
         self.calls: list = []
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0, record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
         out = self.by_pair[record_ids]
         if isinstance(out, Exception):

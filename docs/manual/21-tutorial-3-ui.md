@@ -30,8 +30,8 @@ uv run labelkit run --config ../config.toml --project project.toml
 启动阶段就有两条值得停下来读的输出：
 
 ```
-warning: project.toml:[verify].llm: verify.llm 与 annotate.llm 使用同一模型 "glm-5.2"，
-         存在自增强偏差风险（3.7.2）
+warning: project.toml:[verify].llm: verify.llm and annotate.llm use the same model
+         "glm-5.2", which risks self-enhancement bias (3.7.2)
 WARN  ingest  batch=0 ingest.missing_pair index=9 present=tree file=uitree_9.jsonl
 ```
 

@@ -15,13 +15,17 @@ byte-identical termios restoration after the ``q`` detach (§3.4 discipline).
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import logging
 import os
 import subprocess
 import sys
+from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -30,6 +34,8 @@ from labelkit.cli.console import ConsoleRenderer
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
+    ClassSpec,
+    ClassView,
     ConsoleConfig,
     Criterion,
     DedupConfig,
@@ -52,6 +58,7 @@ from labelkit.common.config.model import (
 from labelkit.common.observability import console_format
 from labelkit.common.observability.obslog import TraceEvent
 from labelkit.common.runtime.llm_client import KeySnapshot, ProfileSnapshot
+from labelkit.orchestration.orchestrator import Orchestrator
 
 RICH = ConsoleConfig(mode="rich", mode_resolved="rich")
 
@@ -128,6 +135,18 @@ def _canvas(renderer: ConsoleRenderer, *, width: int = 100) -> str:
     return cap.get()
 
 
+def _final_canvas(renderer: ConsoleRenderer, counts: dict, *,
+                  width: int = 100) -> str:
+    """定格末帧快照（U8）：与 `_canvas` 同款定宽捕获，抓 `_render_final()`。"""
+    from rich.console import Console
+
+    capture_console = Console(width=width, height=40, force_terminal=True,
+                              no_color=True, file=io.StringIO())
+    with capture_console.capture() as cap:
+        capture_console.print(renderer._render_final(counts))
+    return cap.get()
+
+
 @pytest.fixture
 def _finalize_renderers():
     renderers: list[ConsoleRenderer] = []
@@ -151,7 +170,7 @@ def test_account_line_nine_states_with_stream_stitch(_finalize_renderers):
         "failed": 0, "dropped_noise": 2, "absorbed": 88, "stitched": 2,
         "threads": 5, "duration_ms": 1000}))
     text = _canvas(renderer)
-    assert "账  emitted 41" in text
+    assert "account  emitted 41" in text
     for fragment in ("dup 3", "lowq 5", "verify 1", "failed 0", "noise 2",
                      "absorbed 88", "stitched 2", "threads 5"):
         assert fragment in text, fragment
@@ -185,11 +204,12 @@ def test_llm_block_and_key_pool_three_states(_finalize_renderers):
     _finalize_renderers.append(renderer)
     renderer.on_event(_ev("run.start"))
     text = _canvas(renderer)
-    assert "LLM  default  在途 4/4  calls 213  重试 7  tok 412k↑ 96k↓  $0.83  p50 2.1s" in text
+    assert ("LLM  default  in_flight 4/4  calls 213  retries 7  "
+            "tok 412k↑ 96k↓  $0.83  p50 2.1s") in text
     assert "LABELKIT_KEY_A ok" in text
-    assert "LABELKIT_KEY_B 冷却12s" in text
-    assert "LABELKIT_KEY_C 禁用" in text
-    assert "熔断 0/20" in text
+    assert "LABELKIT_KEY_B cooldown 12s" in text
+    assert "LABELKIT_KEY_C disabled" in text
+    assert "breaker 0/20" in text
 
 
 def test_breaker_banner_when_streak_reaches_threshold(_finalize_renderers):
@@ -197,8 +217,8 @@ def test_breaker_banner_when_streak_reaches_threshold(_finalize_renderers):
     _finalize_renderers.append(renderer)
     renderer.on_event(_ev("run.start"))
     text = _canvas(renderer)
-    assert "⚠ 熔断已打开" in text
-    assert "熔断 20/20" in text
+    assert "⚠ breaker open" in text
+    assert "breaker 20/20" in text
 
 
 def test_interrupt_banner_on_stop_requested(_finalize_renderers):
@@ -206,7 +226,7 @@ def test_interrupt_banner_on_stop_requested(_finalize_renderers):
     _finalize_renderers.append(renderer)
     renderer.on_event(_ev("run.start"))
     renderer.on_stop_requested()
-    assert "正在优雅中断（≤30s）…" in _canvas(renderer)
+    assert "graceful interrupt in progress (≤30s)…" in _canvas(renderer)
 
 
 def test_narrow_terminal_degrades_to_single_progress_line(_finalize_renderers):
@@ -218,9 +238,9 @@ def test_narrow_terminal_degrades_to_single_progress_line(_finalize_renderers):
     text = _canvas(renderer, width=50).replace("\n", "")   # terminal wrap
     # The canvas collapses to the plain single-line form (spec §3.1 < 60 列),
     # minus the leading \r; no other block survives.
-    assert ("labelkit: 批 2  emitted=10  dropped_dup=2  "
+    assert ("labelkit: batch 2  emitted=10  dropped_dup=2  "
             "dropped_lowq=0  dropped_verify=0  failed=0") in text
-    assert "账" not in text and "段" not in text and "LLM" not in text
+    assert "account" not in text and "stages" not in text and "LLM" not in text
 
 
 def test_generate_only_phase_line_then_normal_batches(_finalize_renderers):
@@ -240,14 +260,32 @@ def test_generate_only_phase_line_then_normal_batches(_finalize_renderers):
     renderer.on_event(_ev("llm.call", stage="llm"))
     renderer.on_event(_ev("llm.call", stage="llm"))
     text = _canvas(renderer)
-    assert "生成 ▶ calls 3/25 · 已产 0 条" in text
+    assert "generate ▶ calls 3/25 · produced 0" in text
     produced["n"] = 12                     # phase-end meter (counts.generated)
     text = _canvas(renderer)
-    assert "已产 12 条" in text
+    assert "produced 12" in text
     renderer.on_event(_ev("batch.start", batch=1, payload={"size": 100}))
     text = _canvas(renderer)
-    assert "生成 ▶" not in text
-    assert "批 1/1" in text
+    assert "generate ▶" not in text
+    assert "batch 1/1" in text
+
+
+def test_header_eta_appears_once_the_ema_rate_is_known(monkeypatch,
+                                                       _finalize_renderers):
+    """§7.7 抬头块 ETA 行：仅在批总数分母可得（on_estimate 已送达）且 EMA 速率
+    已知（至少一条带 duration_ms 的 batch.end）时显示，以 `~` 标外推。"""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(console_mod, "_monotonic", lambda: clock["t"])
+    renderer, _ = _rich_renderer(_cfg(RICH))
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+    renderer.on_estimate({"records": 100, "batches": 10, "total_calls": 0})
+    assert "ETA" not in _canvas(renderer)          # 还没有速率样本
+
+    renderer.on_event(_ev("batch.start", batch=1, payload={"size": 10}))
+    renderer.on_event(_ev("batch.end", batch=1, payload={
+        "active": 10, "duration_ms": 1000}))       # 10 条/秒，已完成 10 条
+    assert "ETA ~00:09" in _canvas(renderer)       # 剩 90 条 ÷ 10 条/秒
 
 
 def test_stage_board_bracket_attribution_and_symbols(_finalize_renderers):
@@ -335,28 +373,50 @@ def test_keyboard_toggles_l_e_and_help(_finalize_renderers):
     renderer._handle_key("l")              # LLM expanded: one line per key —
     text = _canvas(renderer)               # env/state + per-key usage (§3.4)
     assert "default·LABELKIT_KEY_A ok  calls 150  rate_limited 0" in text
-    assert "default·LABELKIT_KEY_B 冷却12s  calls 60  rate_limited 3" in text
-    assert "default·LABELKIT_KEY_C 禁用  calls 3  rate_limited 0" in text
+    assert "default·LABELKIT_KEY_B cooldown 12s  calls 60  rate_limited 3" in text
+    assert "default·LABELKIT_KEY_C disabled  calls 3  rate_limited 0" in text
     renderer._handle_key("l")
     assert "default·LABELKIT_KEY_A ok" not in _canvas(renderer)
 
     renderer._handle_key("e")              # error strip: ring of stage·kind
     text = _canvas(renderer)
-    assert "错误" in text and "quality·judgment_invalid" in text
+    assert "errors" in text and "quality·judgment_invalid" in text
     renderer._handle_key("e")
     assert "quality·judgment_invalid" not in _canvas(renderer)
 
     renderer._handle_key("?")              # help expanded lists all keys
     text = _canvas(renderer).replace("\n", "")   # fold-insensitive
-    assert "键位" in text and "q 脱离" in text
+    assert "keymap" in text and "q detach" in text
     renderer._handle_key("h")              # 'h' is the '?' synonym
-    assert "键位" not in _canvas(renderer)
+    assert "keymap" not in _canvas(renderer)
 
     renderer._handle_key("x")              # outside the closed set: ignored
     renderer._handle_key("p")
     assert renderer._paused is True
     renderer._handle_key("p")
     assert renderer._paused is False
+
+
+def test_keyboard_canvas_lines_clamp_between_four_and_sixteen(_finalize_renderers):
+    """§7.7 键盘开关表 `+` / `-` 行：画布行数上限在 4–16 之间增减并双向钳制
+    （未按过任何一键时为自适应——由 Live 裁剪，不截行）。"""
+    renderer, _ = _rich_renderer(_cfg(RICH), snapshot=_pool_snapshot)
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+    assert renderer._max_lines is None             # 自适应
+    assert "account" in _canvas(renderer)
+
+    renderer._handle_key("-")                      # 自适应起步按 16 算
+    assert renderer._max_lines == 15
+    for _ in range(20):
+        renderer._handle_key("-")
+    assert renderer._max_lines == 4                # 下界钳制
+    assert "account" not in _canvas(renderer)      # 画布被截到 4 行
+
+    for _ in range(30):
+        renderer._handle_key("+")
+    assert renderer._max_lines == 16               # 上界钳制
+    assert "account" in _canvas(renderer)
 
 
 def test_p_pause_freezes_canvas_but_logs_keep_scrolling(_finalize_renderers):
@@ -504,7 +564,7 @@ def test_render_exception_degrades_to_detached_plain(monkeypatch, _finalize_rend
         assert renderer._live_started is False
         warns = [r for r in handler.records if r.levelno == logging.WARNING]
         assert len(warns) == 1
-        assert "console 渲染异常，已降级 plain" in warns[0].getMessage()
+        assert "console render failed, degraded to plain" in warns[0].getMessage()
 
         # The rest of the run gets the plain lines from THIS renderer.
         fake_err = _FakeTty()
@@ -630,7 +690,7 @@ def test_dry_run_rich_renders_estimate_tables(_finalize_renderers):
     renderer.on_estimate(est)
     renderer.on_event(_ev("run.end", payload={"counts": {}, "exit_code": 0}))
     text = buf.getvalue()
-    assert "dry-run 估算" in text
+    assert "dry-run estimate" in text
     assert "estimated_records" in text and "53" in text
     for key in ("generate_calls", "segment_calls", "stitch_calls",
                 "classify_calls", "frame_classify_calls", "extract_calls",
@@ -831,3 +891,463 @@ def test_pty_cbreak_q_detach_restores_termios():
     assert result["isig_kept"] is True        # Ctrl-C → SIGINT unchanged
     assert result["detached"] is True         # 'q' consumed from the pty
     assert result["restored"] is True         # byte-identical termios restore
+
+
+# ── 定格末帧（spec §7.7「运行结束……定格为静态终版面板」U8） ──────────────────
+
+
+def _usage_snapshot() -> tuple[ProfileSnapshot, ...]:
+    """两 profile 快照：第二个未配价目、p50 窗为空（末帧用量表的两个 `—` 位）。"""
+    return (
+        ProfileSnapshot(
+            name="default", kind="llm", in_flight=0, max_concurrency=4,
+            calls=213, retries=7, prompt_tokens=1_500_000,
+            completion_tokens=96_000, est_cost_usd=0.83, p50_latency_ms=2100,
+            keys=(KeySnapshot(env="LABELKIT_KEY_A", state="ok"),)),
+        ProfileSnapshot(
+            name="vision", kind="llm", in_flight=0, max_concurrency=2,
+            calls=15, retries=0, prompt_tokens=1_200, completion_tokens=300,
+            est_cost_usd=None, p50_latency_ms=None,
+            keys=(KeySnapshot(env="LABELKIT_KEY_B", state="ok"),)),
+    )
+
+
+def _run_with_stage_times(renderer: ConsoleRenderer, clock: dict) -> None:
+    """跑一批并累出三段耗时：dedup 10 s、quality 40 s、annotate 20 s。"""
+    renderer.on_event(_ev("run.start"))            # t0 = 1000
+    renderer.on_event(_ev("batch.start", batch=1, payload={"size": 10}))
+    renderer.on_stage("dedup", 1)
+    clock["t"] = 1010.0
+    renderer.on_stage("quality", 1)
+    clock["t"] = 1050.0
+    renderer.on_stage("annotate", 1)
+    clock["t"] = 1070.0
+    renderer.on_event(_ev("batch.end", batch=1, payload={
+        "active": 8, "dropped_dup": 1, "failed": 1, "duration_ms": 70000}))
+
+
+def test_final_frame_renders_counts_stage_times_and_usage(monkeypatch,
+                                                          _finalize_renderers):
+    """U8 定格末帧：抬头（run_id + 模式徽标 + mm:ss 用时）+ counts 两列表 +
+    段耗时横条（按 `_chain` 链序、最长者 20 格）+ llm_usage 表。"""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(console_mod, "_monotonic", lambda: clock["t"])
+    # verify 在链上但本批从未走到——它不出条（段耗时只画有数据的段）。
+    renderer, _ = _rich_renderer(_cfg(RICH, verify=VerifyConfig(enabled=True)),
+                                 snapshot=_usage_snapshot)
+    _finalize_renderers.append(renderer)
+    _run_with_stage_times(renderer, clock)
+
+    clock["t"] = 1187.0                            # 用时 187 s → 03:07
+    counts = {"scanned": 10, "emitted": 8, "dropped_dup": 1, "failed": 1}
+    text = _final_canvas(renderer, counts)
+    lines = [ln.rstrip() for ln in text.splitlines()]
+
+    assert (" labelkit run done · f3a9c04b7d21 · process/text · elapsed 03:07"
+            in lines)
+    assert " counts (= report.counts)" in lines
+    for key, value in counts.items():              # counts 两列表逐键逐值
+        assert any(key in ln and str(value) in ln for ln in lines), key
+    # 段耗时条：链序 dedup → quality → annotate，最长的 quality 满 20 格
+    bars = [ln for ln in lines
+            if ln.startswith((" dedup", " quality", " annotate", " verify"))]
+    assert bars == [" dedup     █████ 10.0s",
+                    " quality   " + "█" * 20 + " 40.0s",
+                    " annotate  " + "█" * 10 + " 20.0s"]
+    assert any("stage time (approx" in ln for ln in lines)
+    # llm_usage 表：列头 + 逐 profile 行（tok 缩写与画布同款）
+    assert " llm_usage" in lines
+    header = next(ln for ln in lines if "profile" in ln and "p50" in ln)
+    for column in ("profile", "calls", "retries", "tok↑", "tok↓", "cost", "p50"):
+        assert column in header, column
+    default_row = next(ln for ln in lines if "default" in ln and "213" in ln)
+    assert "1.5M" in default_row and "96k" in default_row
+    assert "$0.83" in default_row and "2.1s" in default_row
+
+
+def test_final_frame_usage_table_dashes_missing_price_and_p50(monkeypatch,
+                                                              _finalize_renderers):
+    """未配价目 ⇒ cost 显示 `—`；p50 窗为空 ⇒ p50 显示 `—`（画布同款渲染）。"""
+    monkeypatch.setattr(console_mod, "_monotonic", lambda: 1000.0)
+    renderer, _ = _rich_renderer(_cfg(RICH), snapshot=_usage_snapshot)
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+
+    row = next(ln for ln in _final_canvas(renderer, {}).splitlines()
+               if "vision" in ln)
+    assert row.count("—") == 2                     # cost 与 p50 各一
+    assert "15" in row                             # 其余列照常渲染
+    assert console_mod._fmt_tok(1_200) in row      # tok 缩写与画布同款
+
+
+def test_final_frame_stage_time_lines_absent_without_timing(monkeypatch,
+                                                            _finalize_renderers):
+    """无计时数据（一次 on_stage 都没发生）⇒ 段耗时段整块缺席；无快照 ⇒ 用量表
+    整块缺席（末帧只画有内容的块）。"""
+    monkeypatch.setattr(console_mod, "_monotonic", lambda: 1000.0)
+    renderer, _ = _rich_renderer(_cfg(RICH))       # snapshot 默认返回空元组
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+
+    text = _final_canvas(renderer, {"scanned": 0})
+    assert "stage time" not in text
+    assert "llm_usage" not in text
+    assert "counts (= report.counts)" in text      # counts 块恒在
+
+
+def test_final_frame_side_product_paths_follow_switches(monkeypatch,
+                                                        _finalize_renderers):
+    """侧产物路径行随开关在场：rejects 行仅 `output.rejects != "none"`、
+    trace 行仅 `trace.enabled`（U6 纪律：只有路径，没有数据内容）。"""
+    monkeypatch.setattr(console_mod, "_monotonic", lambda: 1000.0)
+    renderer, _ = _rich_renderer(_cfg(RICH))       # 默认 rejects="refs"、trace 关
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+    text = _final_canvas(renderer, {})
+    assert " rejects → out/labels.rejects.jsonl" in text
+    assert "trace →" not in text
+
+    both_off = _cfg(RICH, output=OutputConfig(schema_inline="{}", rejects="none"),
+                    trace=TraceConfig(enabled=True, path="out/labels.trace.jsonl"))
+    renderer2, _ = _rich_renderer(both_off)
+    _finalize_renderers.append(renderer2)
+    renderer2.on_event(_ev("run.start"))
+    text2 = _final_canvas(renderer2, {})
+    assert "rejects →" not in text2
+    assert " trace → out/labels.trace.jsonl" in text2
+
+
+def test_run_end_freezes_the_final_frame_then_stops_live(monkeypatch,
+                                                         _finalize_renderers):
+    """接线面：run.end 把末帧画进 Live（transient=False ⇒ 留在回滚区）后停掉
+    Live，渲染器转惰性——杂散事件此后保持廉价。"""
+    clock = {"t": 1000.0}
+    monkeypatch.setattr(console_mod, "_monotonic", lambda: clock["t"])
+    renderer, buf = _rich_renderer(_cfg(RICH), snapshot=_usage_snapshot)
+    _finalize_renderers.append(renderer)
+    _run_with_stage_times(renderer, clock)
+    mark = len(buf.getvalue())
+
+    renderer.on_event(_ev("run.end", payload={"counts": {"emitted": 8},
+                                              "exit_code": 0}))
+    frame = buf.getvalue()[mark:]
+    assert "labelkit run done" in frame
+    assert "counts (= report.counts)" in frame
+    assert renderer._live_started is False
+    assert renderer._mode == "inert"
+
+
+# ── dry-run 注记门的 console 侧镜像（spec 3.10.3 R28 注记） ───────────────────
+
+_MIRROR_OVERRIDES = {
+    "quality": lambda cfg: replace(cfg.quality, rounds=7),
+    "rubric": lambda cfg: Rubric(name="r2", criteria=(
+        Criterion(key="c2", description="d2", pairwise_prompt="p2"),)),
+    "annotate": lambda cfg: replace(cfg.annotate, instruction="按类指令"),
+    "generate": lambda cfg: GenerateConfig(enabled=True, instruction="生成"),
+    "verify": lambda cfg: VerifyConfig(enabled=True),
+    "extract": lambda cfg: ExtractConfig(enabled=True),
+}
+
+
+def _classify_cfg_with_views(overrides: dict | None = None) -> ResolvedConfig:
+    """M1 形态的 class_views：每个声明类一份合并视图，零覆盖类逐节镜像全局。"""
+    cfg = _cfg(RICH, classify=ClassifyConfig(
+        enabled=True, fallback_class="other",
+        classes=(ClassSpec(name="faq", description="问答"),
+                 ClassSpec(name="other", description="其余"))))
+    views = {}
+    for spec in cfg.classify.classes:
+        fields = dict(quality=cfg.quality, rubric=cfg.rubric,
+                      annotate=cfg.annotate, generate=cfg.generate,
+                      verify=cfg.verify, extract=cfg.extract)
+        if overrides is not None and spec.name == "faq":
+            fields.update(overrides)
+        views[spec.name] = ClassView(name=spec.name, **fields)
+    return replace(cfg, class_views=views)
+
+
+def _mirrored_verdict(cfg: ResolvedConfig) -> bool:
+    """两侧同名判定必须逐例相等（console 侧注释自称是 Orchestrator 的镜像）。
+
+    Orchestrator 侧只读 `self.cfg`，故以最小 self 直调未绑定方法——避免为一个
+    纯判定装配整个运行期对象图。
+    """
+    console_verdict = console_mod._class_overrides_exist(cfg)
+    orchestrator_verdict = Orchestrator._class_overrides_exist(
+        SimpleNamespace(cfg=cfg))
+    assert console_verdict == orchestrator_verdict
+    return console_verdict
+
+
+@pytest.mark.parametrize("field", sorted(_MIRROR_OVERRIDES))
+def test_class_overrides_mirror_matches_the_orchestrator_predicate(field):
+    """六个被检查字段各自都能单独触发 True，且两侧判定逐例相等。"""
+    cfg = _classify_cfg_with_views({field: _MIRROR_OVERRIDES[field](_cfg(RICH))})
+    assert _mirrored_verdict(cfg) is True
+
+
+def test_class_overrides_absent_for_empty_or_global_identical_views():
+    """无 class_views（classify 关）与「每类都与全局全等」两态都判 False——
+    class_views 非空本身说明不了什么，必须逐节与全局基值比较。"""
+    assert _mirrored_verdict(_cfg(RICH)) is False
+    assert _mirrored_verdict(_classify_cfg_with_views()) is False
+
+
+def test_class_override_note_line_follows_the_mirror(_finalize_renderers):
+    """注记门的落点：dry-run 的 rich 面在判定为真时打那条固定措辞的下界注记
+    （与 plain 路径同文），判定为假时不打。"""
+    cfg = _classify_cfg_with_views({"annotate": _MIRROR_OVERRIDES["annotate"](
+        _cfg(RICH))})
+    renderer, buf = _rich_renderer(replace(cfg, dry_run=True))
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+    renderer.on_estimate({"records": 1, "batches": 1, "total_calls": 0})
+    assert ("note: estimated with global config / multi reports a lower bound "
+            "at label multiplier 1") in buf.getvalue().replace("\n", "")
+
+    clean, buf2 = _rich_renderer(replace(_classify_cfg_with_views(),
+                                         dry_run=True))
+    _finalize_renderers.append(clean)
+    clean.on_event(_ev("run.start"))
+    clean.on_estimate({"records": 1, "batches": 1, "total_calls": 0})
+    assert "lower bound at label multiplier 1" not in buf2.getvalue()
+
+
+def test_dry_run_rich_stream_note_matches_the_plain_wording(_finalize_renderers):
+    """U13：rich 估算面的第二条注记与 plain 路径**同文**——流模式下游按
+    episodes≈sessions 报下界（LLM 边界精化只会增加段数，spec 3.10.3 时序流行）。"""
+    cfg = _cfg(RICH, dry_run=True,
+               segment=SegmentConfig(enabled=True, strategy="hybrid"))
+    renderer, buf = _rich_renderer(cfg)
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+    renderer.on_estimate({"records": 26, "batches": 4, "segment_calls": 3,
+                          "total_calls": 3})
+    assert ("note: stream estimate: downstream reports a lower bound at "
+            "episodes≈sessions (LLM refinement only adds segments)"
+            ) in buf.getvalue().replace("\n", "")
+
+
+# ── 渲染 tick 协程（spec §7.7 rich 档「渲染 tick = asyncio task」U26） ────────
+
+
+async def test_tick_loop_repaints_during_event_silence(_finalize_renderers):
+    """静默期活性：一个回调都不发，tick 仍按 refresh_hz 周期重绘（单次长 LLM
+    调用可让事件停滞至 timeout_s——时钟 / ETA / 键位照常）。"""
+    cfg = _cfg(ConsoleConfig(mode="rich", mode_resolved="rich", refresh_hz=10))
+    renderer, _ = _rich_renderer(cfg)
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))        # 有运行中循环 ⇒ tick 任务在场
+    assert renderer._tick_task is not None
+
+    painted = {"n": 0}
+    real_update = renderer._live.update
+
+    def counting_update(*args, **kwargs):
+        painted["n"] += 1
+        return real_update(*args, **kwargs)
+
+    renderer._live.update = counting_update    # type: ignore[method-assign]
+    await asyncio.sleep(0.45)                  # 事件静默期（0.1 s 周期）
+    assert painted["n"] >= 2
+    renderer._stop_tick()
+
+
+async def test_tick_loop_cancellation_is_swallowed(_finalize_renderers):
+    """`_stop_tick()` 取消 tick：CancelledError 在协程内部消化（一条 debug），
+    任务正常收尾而不是以 cancelled 态外抛。"""
+    cfg = _cfg(ConsoleConfig(mode="rich", mode_resolved="rich", refresh_hz=10))
+    renderer, _ = _rich_renderer(cfg)
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+    task = renderer._tick_task
+    await asyncio.sleep(0.15)                  # 确保任务已挂在 sleep 上
+
+    renderer._stop_tick()
+    assert renderer._tick_task is None         # 幂等：句柄先摘
+    await asyncio.wait_for(task, timeout=2)    # 不外抛
+    assert task.cancelled() is False
+    renderer._stop_tick()                      # 二次调用是 no-op
+
+
+async def test_tick_loop_exception_degrades_to_detached_plain(_finalize_renderers):
+    """U7：tick 内任何异常自吞 + 一次性 WARN + 当场降级；rich 归属下落到
+    脱离-plain（emitter 被静态门关掉，plain 行归渲染器）。"""
+    handler = _ListHandler()
+    logger = logging.getLogger("labelkit.console")
+    logger.addHandler(handler)
+    old_level = logger.level
+    logger.setLevel(logging.WARNING)
+    try:
+        cfg = _cfg(ConsoleConfig(mode="rich", mode_resolved="rich", refresh_hz=10))
+        renderer, _ = _rich_renderer(cfg)
+        _finalize_renderers.append(renderer)
+        renderer.on_event(_ev("run.start"))
+        task = renderer._tick_task
+
+        def boom(force: bool = False):
+            raise RuntimeError("injected tick failure")
+
+        renderer._maybe_refresh = boom         # type: ignore[method-assign]
+        # 降级会顺手取消 tick 自身（_stop_live → _stop_tick），故任务以 cancelled
+        # 收尾；生产侧无人 await 它——异常绝不外溢到运行。
+        with suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+        assert task.done()
+        assert renderer._mode == "detached"
+        assert renderer._live_started is False
+        warns = [r for r in handler.records if r.levelno == logging.WARNING]
+        assert len(warns) == 1
+        assert "console render failed, degraded to plain" in warns[0].getMessage()
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(old_level)
+
+
+# ── 键盘轮询（spec §7.7「键盘轮询在渲染 tick 内非阻塞 select，零新线程」） ───
+
+
+@pytest.fixture
+def _pipe():
+    """一对管道 fd：读端冒充 stdin（封闭键集经它逐字节喂进来）。"""
+    read_fd, write_fd = os.pipe()
+    yield read_fd, write_fd
+    for fd in (read_fd, write_fd):
+        with suppress(OSError):
+            os.close(fd)
+
+
+def _keyboard_on(renderer: ConsoleRenderer, read_fd: int) -> None:
+    """把渲染器的键盘面接到给定 fd（真 pty 见本文件末尾的 cbreak 用例）。"""
+    renderer._kbd_fd = read_fd
+    renderer._kbd_active = True
+
+
+def test_poll_keys_drains_pending_bytes_through_handle_key(_pipe,
+                                                           _finalize_renderers):
+    """轮询搭 `_maybe_refresh` 便车：待读字节逐个过 `_handle_key` 生效
+    （封闭键集 `l` / `e`）。"""
+    read_fd, write_fd = _pipe
+    renderer, _ = _rich_renderer(_cfg(RICH), snapshot=_pool_snapshot)
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+    _keyboard_on(renderer, read_fd)
+
+    os.write(write_fd, b"le")
+    renderer._maybe_refresh()
+    assert renderer._show_keys is True and renderer._show_errors is True
+    assert "LABELKIT_KEY_A ok  calls 150" in _canvas(renderer)
+
+
+def test_poll_keys_stops_polling_after_detach(_pipe, _finalize_renderers):
+    """`q` 脱离后立即返回——同一次轮询里排在它后面的字节**不再消费**
+    （余下按键留给终端，不被面板吞掉）。"""
+    read_fd, write_fd = _pipe
+    renderer, _ = _rich_renderer(_cfg(RICH))
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+    _keyboard_on(renderer, read_fd)
+
+    os.write(write_fd, b"qle")
+    renderer._poll_keys()
+    assert renderer._mode == "detached"
+    assert renderer._show_keys is False
+    assert os.read(read_fd, 2) == b"le"
+
+
+def test_poll_keys_returns_on_no_data_and_on_eof(_pipe, _finalize_renderers):
+    """无待读数据（select 空）与 EOF（读到空串）两条早返回路径都不改状态。"""
+    read_fd, write_fd = _pipe
+    renderer, _ = _rich_renderer(_cfg(RICH))
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+    _keyboard_on(renderer, read_fd)
+
+    renderer._poll_keys()                      # 管道空：select 不就绪
+    assert renderer._show_keys is False and renderer._mode == "rich"
+
+    os.close(write_fd)                         # EOF：select 就绪但 read 空
+    renderer._poll_keys()
+    assert renderer._show_keys is False and renderer._mode == "rich"
+
+
+@pytest.mark.parametrize("bad_fd_kind", ["closed", "negative"])
+def test_poll_keys_logs_a_failed_select_once(bad_fd_kind, _finalize_renderers,
+                                             caplog):
+    """轮询失败只记一次：它搭每帧刷新的便车，逐帧记录会淹没日志
+    （OSError 与 ValueError 两条 except 臂各钉一例）。"""
+    renderer, _ = _rich_renderer(_cfg(RICH))
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+    if bad_fd_kind == "closed":
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        os.close(write_fd)
+    else:
+        read_fd = -1                           # select 拒负 fd（ValueError）
+    _keyboard_on(renderer, read_fd)
+
+    with caplog.at_level(logging.DEBUG, logger="labelkit.console"):
+        renderer._poll_keys()
+        renderer._poll_keys()
+    assert renderer._kbd_poll_logged is True
+    failures = [r for r in caplog.records if "key poll failed" in r.getMessage()]
+    assert len(failures) == 1
+    assert renderer._mode == "rich"            # 收不到键不影响渲染
+
+
+# ── 心跳定时器回调（spec §7.7 plain 档可选心跳，U14） ────────────────────────
+
+
+def _heartbeat_renderer(monkeypatch, clock: dict) -> tuple[ConsoleRenderer,
+                                                           io.StringIO]:
+    """plain × heartbeat_s>0 × 非 TTY 的心跳态渲染器（注入假 monotonic 时钟）。"""
+    monkeypatch.setattr(console_mod, "_monotonic", lambda: clock["t"])
+    fake_err = io.StringIO()                   # isatty() → False
+    monkeypatch.setattr(sys, "stderr", fake_err)
+    renderer = ConsoleRenderer()
+    renderer.on_run_context(_cfg(ConsoleConfig(heartbeat_s=1)),
+                            lambda: (), lambda: {}, lambda: 0)
+    assert renderer._mode == "heartbeat"
+    return renderer, fake_err
+
+
+async def test_hb_fire_beats_and_rearms_at_the_advanced_deadline(monkeypatch):
+    """定时器回调跳一拍后按**推进后的固定截止点**重新布防（追赶式，不随处理
+    延迟漂移）——定时器独立于事件到达而触发，静默正是心跳的目标场景。"""
+    clock = {"t": 1000.0}
+    renderer, fake_err = _heartbeat_renderer(monkeypatch, clock)
+    renderer._hb_t0, renderer._hb_next = 1000.0, 1000.0
+    renderer._hb_batch, renderer._hb_stage, renderer._hb_calls = 7, "quality", 42
+    clock["t"] = 1002.5                        # 截止点已过 ⇒ call_later(0)
+    renderer._arm_hb_timer()
+    first_handle = renderer._hb_handle
+    assert first_handle is not None
+
+    await asyncio.sleep(0.01)                  # 让事件循环跑到定时器
+    assert fake_err.getvalue() == (
+        "heartbeat batch=7 stage=quality llm_calls=42 elapsed=2s\n")
+    assert renderer._hb_next == 1003.0         # 步进到 now 之后（非 now+1=1003.5）
+    assert renderer._hb_handle is not None and renderer._hb_handle is not first_handle
+    renderer._disarm_heartbeat()
+
+
+async def test_hb_fire_exception_disarms_without_harming_the_run(monkeypatch,
+                                                                 caplog):
+    """定时器出问题绝不伤及运行：撤防（截止点与句柄双清）、一条 debug、
+    不外抛——事件循环照常活着。"""
+    clock = {"t": 1000.0}
+    renderer, fake_err = _heartbeat_renderer(monkeypatch, clock)
+    renderer._hb_t0, renderer._hb_next = 1000.0, 1000.0
+    renderer._hb_check = (                     # type: ignore[method-assign]
+        lambda: (_ for _ in ()).throw(RuntimeError("hb")))
+
+    with caplog.at_level(logging.DEBUG, logger="labelkit.console"):
+        renderer._arm_hb_timer()
+        await asyncio.sleep(0.01)
+    assert renderer._hb_next is None and renderer._hb_handle is None
+    assert "heartbeat batch=" not in fake_err.getvalue()   # 这一拍没跳成
+    assert any("heartbeat timer failed" in r.getMessage()
+               for r in caplog.records)
+    await asyncio.sleep(0)                     # 循环未被定时器异常打死

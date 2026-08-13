@@ -1,13 +1,14 @@
-"""M3 dedup (spec 3.3): exact SHA-256 → MinHash-LSH near-text → pHash near-image (UI)
-→ optional semantic (embedding cosine, v1.2). First-writer-wins; duplicates are status-flagged,
-never removed. Default configuration calls no LLM/embedding API."""
+"""M3 去重（spec 3.3）：精确 SHA-256 → MinHash-LSH 近文本 → pHash 近图像（UI）
+→ 可选语义级（嵌入余弦，v1.2）。先到先得；重复项只改状态标记，绝不从列表中移除。
+默认配置下不调用任何 LLM / 嵌入 API。"""
 from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import unicodedata
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Literal, Sequence
 
 import imagehash
 import numpy as np
@@ -28,32 +29,47 @@ if TYPE_CHECKING:
     from labelkit.common.config.model import DedupConfig
     from labelkit.common.contracts.stage import RunContext
 
-# Event names (defined canonically in labelkit.obslog; literals used here so this module
-# never imports obslog — tests assert the exact strings, CONTRACTS.md §7.11/§8.1).
+# 事件名（规范定义在 labelkit.obslog；这里用字面量以免本模块反向依赖 obslog ——
+# 测试会逐字断言这些字符串，CONTRACTS.md §7.11/§8.1）
 _EV_DEDUP_DUPLICATE = "dedup.duplicate"
 _EV_ERROR = "error"
 
+# 本模块的 stderr 运行日志通道（spec §7.1：日志恒不含数据内容）
+_LOGGER = logging.getLogger("labelkit.dedup")
+# 日志记录附加字段：索引层不知道批次号，故 batch 留空（文本格式化器渲染为 "-"）
+_LOG_EXTRA: dict[str, Any] = {"stage": "dedup", "batch": None}
 
-# ── pure helpers ───────────────────────────────────────────────────────────
+
+# ── 纯函数辅助 ─────────────────────────────────────────────────────────────
 
 
 def _normalize_text(text: str) -> str:
-    """Level-① normalization recipe (spec 3.3.3): NFC normalization, whitespace-run
-    collapse to a single space, strip. str.split() splits on all Unicode whitespace
-    (incl. U+3000), so join+split both collapses and strips."""
+    """① 级归一化配方（spec 3.3.3）：NFC 归一 + 连续空白折叠为单个空格 + 去首尾空白。
+
+    str.split() 按全部 Unicode 空白切分（含 U+3000），故 join+split 同时完成折叠与
+    去首尾。
+
+    @param text 原始文本
+    @return 归一化后的文本
+    """
     return " ".join(unicodedata.normalize("NFC", text).split())
 
 
 def _dedup_text(rec: Record, cfg: "DedupConfig") -> str:
-    """The text every dedup level operates on. Text modality: normalized extracted text;
-    UI modality: canonical UITree serialization with quantized bounds (spec 3.3.3 ①).
+    """各去重级共同作用的那份文本。
 
-    Sequence records (v1.8, S10 — this branch takes precedence over the modality
-    branch): each member's own single-record recipe, concatenated in member order with
-    separator "\\x1e" (ASCII Record Separator, 0x1E). The separator is whitespace to
-    Python (isspace() == True), so the whitespace-collapsed text recipe can never emit
-    it — the joined string is structurally collision-free against any single-record
-    recipe output (spec 3.3.3 sequence row)."""
+    文本模态：归一化后的提取文本；UI 模态：bounds 量化后的 UITree 规范序列化
+    （spec 3.3.3 ①）。
+
+    序列记录（v1.8、S10 —— 本分支优先于模态分支）：各成员各自的单记录配方，按成员
+    顺序以分隔符 "\\x1e"（ASCII Record Separator, 0x1E）拼接。该分隔符在 Python 眼里
+    是空白（isspace() == True），所以折叠空白后的文本配方永远吐不出它 —— 拼接串对任
+    何单记录配方输出都结构性免撞（spec 3.3.3 序列行）。
+
+    @param rec 待判重记录
+    @param cfg [dedup] 配置节
+    @return 该记录的判重文本
+    """
     if rec.kind == "sequence":
         return "\x1e".join(_dedup_text(m, cfg) for m in rec.members)
     if rec.modality == "ui":
@@ -64,7 +80,12 @@ def _dedup_text(rec: Record, cfg: "DedupConfig") -> str:
 
 
 def _shingles(text: str, n: int) -> set[str]:
-    """Character n-gram sliding-window shingle set over the (already collapsed) text."""
+    """在（已折叠空白的）文本上做字符 n-gram 滑窗，取 shingle 集合。
+
+    @param text 判重文本
+    @param n n-gram 长度
+    @return shingle 集合（空文本返回空集）
+    """
     if not text:
         return set()
     if len(text) <= n:
@@ -73,6 +94,13 @@ def _shingles(text: str, n: int) -> set[str]:
 
 
 def _build_minhash(text: str, ngram: int, num_perm: int) -> MinHash | None:
+    """为文本构造 MinHash 签名。
+
+    @param text 判重文本
+    @param ngram 字符 n-gram 长度
+    @param num_perm MinHash 置换数
+    @return MinHash 签名；shingle 集为空时返回 None
+    """
     sh = _shingles(text, ngram)
     if not sh:
         return None
@@ -83,7 +111,11 @@ def _build_minhash(text: str, ngram: int, num_perm: int) -> MinHash | None:
 
 
 def _phash_int(image_path) -> int:
-    """64-bit perceptual hash (imagehash default DCT pHash) packed into an int."""
+    """计算 64 位感知哈希（imagehash 默认的 DCT pHash）并打包成整数。
+
+    @param image_path 图像文件路径
+    @return 64 位 pHash 的整数形式
+    """
     with Image.open(image_path) as im:
         h = imagehash.phash(im)
     value = 0
@@ -93,10 +125,21 @@ def _phash_int(image_path) -> int:
 
 
 def _hamming(a: int, b: int) -> int:
+    """计算两个整数形式哈希的汉明距离。
+
+    @param a 哈希一
+    @param b 哈希二
+    @return 汉明距离（不同比特位数）
+    """
     return (a ^ b).bit_count()
 
 
 def _l2_normalize(vec: Sequence[float]) -> np.ndarray:
+    """把向量做 L2 归一（零向量原样返回）。
+
+    @param vec 原始向量
+    @return 单位向量（此后余弦相似度 = 点积）
+    """
     v = np.asarray(vec, dtype=np.float64)
     norm = float(np.linalg.norm(v))
     if norm == 0.0:
@@ -106,29 +149,34 @@ def _l2_normalize(vec: Sequence[float]) -> np.ndarray:
 
 @dataclass
 class _ProbeDetail:
-    """Internal per-record probe scratchpad shared between DedupIndex and DedupStage
-    (needed by the semantic level's composite verdict and by trace-event payloads)."""
+    """逐记录的探测便签（内部），由 DedupIndex 与 DedupStage 共用
+    （语义级的复合判决与 trace 事件 payload 都要读它）。"""
 
-    dedup_text: str
-    digest: bytes
+    dedup_text: str                                     # 该记录的判重文本
+    digest: bytes                                       # 判重文本的 SHA-256 摘要
     own_key: str                                        # digest.hex()[:16]
-    is_sequence: bool = False                           # v1.8: rec.kind == "sequence" (S10)
-    minhash: MinHash | None = None
-    tree_hit: tuple[str, str, float] | None = None      # (kept_id, cluster_key, est. Jaccard)
-    phash: int | None = None
-    image_hit: tuple[str, str, int] | None = None       # (kept_id, cluster_key, Hamming)
-    image_decode_failed: bool = False
-    verdict: DedupInfo | None = None
+    is_sequence: bool = False                           # v1.8：rec.kind == "sequence"（S10）
+    minhash: MinHash | None = None                      # ② 级 MinHash 签名
+    tree_hit: tuple[str, str, float] | None = None      # (保留记录 id, 簇键, Jaccard 估计)
+    phash: int | None = None                            # ③ 级 64 位 pHash
+    image_hit: tuple[str, str, int] | None = None       # (保留记录 id, 簇键, 汉明距离)
+    image_decode_failed: bool = False                   # 图像解码失败 ⇒ 本记录跳过 pHash 层
+    verdict: DedupInfo | None = None                    # 最终判决（复合后回填）
 
 
-# ── index ──────────────────────────────────────────────────────────────────
+# ── 索引 ───────────────────────────────────────────────────────────────────
 
 
 class DedupIndex:
-    """In-memory dedup index: exact set[bytes] + datasketch.MinHashLSH + list[(id, phash)]
-    (+ list[(id, unit_vec)] when dedup.semantic). scope='batch' → reset per batch."""
+    """内存判重索引：精确 set[bytes] + datasketch.MinHashLSH + list[(id, phash)]
+    （dedup.semantic 开启时再加 list[(id, 单位向量)]）。scope='batch' ⇒ 每批重置。"""
 
     def __init__(self, cfg: "DedupConfig", modality: Literal["text", "ui"]):
+        """构造判重索引。
+
+        @param cfg [dedup] 配置节
+        @param modality 运行模态（"text" | "ui"）
+        """
         self.cfg = cfg
         self.modality = modality
         self._last_similarity: float | None = None
@@ -136,37 +184,46 @@ class DedupIndex:
         self.reset()
 
     def reset(self) -> None:
-        """Drop all index state. Called by DedupStage at batch start when scope='batch'."""
-        self._exact: dict[bytes, str] = {}              # exact key digest -> kept record id
-        self._digest_by_id: dict[str, bytes] = {}
+        """清空全部索引状态。scope='batch' 时由 DedupStage 在批开始处调用。
+
+        @return 无
+        """
+        self._exact: dict[bytes, str] = {}              # 精确键摘要 → 保留记录 id
+        self._digest_by_id: dict[str, bytes] = {}       # 记录 id → 精确键摘要
         self._lsh = MinHashLSH(
             threshold=self.cfg.minhash_threshold, num_perm=self.cfg.minhash_num_perm
         )
-        self._minhashes: dict[str, tuple[MinHash, str]] = {}   # id -> (signature, cluster_key)
-        self._minhash_seq: dict[str, int] = {}                 # id -> insertion order
-        self._seq = 0
-        self._phashes: list[tuple[int, str, str]] = []         # (phash, id, cluster_key)
-        self._vec_ids: list[str] = []
-        self._vec_keys: list[str] = []
-        self._vec_buf: np.ndarray | None = None
-        self._vec_count = 0
+        self._minhashes: dict[str, tuple[MinHash, str]] = {}   # id → (签名, 簇键)
+        self._minhash_seq: dict[str, int] = {}                 # id → 插入序号
+        self._seq = 0                                          # 插入序号发号器
+        self._phashes: list[tuple[int, str, str]] = []         # (pHash, id, 簇键)
+        self._vec_ids: list[str] = []                          # ④ 级：向量对应的记录 id
+        self._vec_keys: list[str] = []                         # ④ 级：向量对应的簇键
+        self._vec_buf: np.ndarray | None = None                # ④ 级：向量缓冲（倍增扩容）
+        self._vec_count = 0                                    # ④ 级：已入缓冲的向量数
 
     @property
     def last_similarity(self) -> float | None:
-        """Measured metric of the most recent duplicate verdict: estimated Jaccard
-        (near_text / near_both), Hamming distance (near_image), or None (exact)."""
+        """最近一次判重判决所用的度量值。
+
+        @return Jaccard 估计（near_text / near_both）、汉明距离（near_image）或
+                None（exact）
+        """
         return self._last_similarity
 
     def probe_and_add(self, rec: Record) -> DedupInfo:
-        """Levels ①②(③) probe; on unique, adds the record's keys/signature/phash to the
-        index (first-writer-wins). Returns the DedupInfo for the record."""
+        """①②（③）级探测；判为唯一时把该记录的键 / 签名 / pHash 写入索引（先到先得）。
+
+        @param rec 待判重记录
+        @return 该记录的 DedupInfo 判决
+        """
         text = _dedup_text(rec, self.cfg)
         digest = hashlib.sha256(text.encode("utf-8")).digest()
         detail = _ProbeDetail(dedup_text=text, digest=digest, own_key=digest.hex()[:16],
                               is_sequence=rec.kind == "sequence")
         self._last_probe = detail
 
-        # ① exact — a hit is an unconditional duplicate in both modalities.
+        # ① 精确级 —— 命中即无条件判重，两个模态一视同仁
         kept = self._exact.get(digest)
         if kept is not None:
             self._last_similarity = None
@@ -174,42 +231,9 @@ class DedupIndex:
             detail.verdict = info
             return info
 
-        # ② near-text: char n-gram MinHash signature → LSH candidates → verify by
-        # signature-estimated Jaccard (candidates checked in insertion order; best wins).
-        mh = _build_minhash(text, self.cfg.ngram, self.cfg.minhash_num_perm)
-        detail.minhash = mh
-        if mh is not None:
-            best: tuple[str, str, float] | None = None
-            candidates = sorted(
-                self._lsh.query(mh), key=lambda c: self._minhash_seq.get(c, 1 << 62)
-            )
-            for cand_id in candidates:
-                entry = self._minhashes.get(cand_id)
-                if entry is None:
-                    continue
-                est = float(mh.jaccard(entry[0]))
-                if est >= self.cfg.minhash_threshold and (best is None or est > best[2]):
-                    best = (cand_id, entry[1], est)
-            detail.tree_hit = best
-
-        # ③ near-image (UI modality only): 64-bit pHash, linear scan over kept hashes.
-        # (Spec 3.3.3 suggests 16-bit-prefix bucketing as an acceleration; exact-prefix
-        # bucketing is not sound for Hamming ≤ 8, so we keep the correct linear scan the
-        # same spec row declares acceptable.)
+        self._probe_near_text(text, detail)
         if self.modality == "ui" and rec.image is not None:
-            try:
-                detail.phash = _phash_int(rec.image.path)
-            except Exception:
-                detail.image_decode_failed = True
-            if detail.phash is not None:
-                best_img: tuple[str, str, int] | None = None
-                for stored, sid, skey in self._phashes:
-                    d = _hamming(stored, detail.phash)
-                    if d <= self.cfg.image_phash_max_distance and (
-                        best_img is None or d < best_img[2]
-                    ):
-                        best_img = (sid, skey, d)
-                detail.image_hit = best_img
+            self._probe_near_image(rec.image.path, detail)
 
         info = self._compose(detail)
         detail.verdict = info
@@ -217,13 +241,68 @@ class DedupIndex:
             self._add(rec.id, detail)
         return info
 
-    def _compose(self, detail: _ProbeDetail) -> DedupInfo:
-        """Composite ②③ verdict (spec 3.3.3/3.3.5): text modality = level ② alone;
-        UI modality per dedup.ui_dup_requires. Both levels hitting → kind='near_both'.
+    def _probe_near_text(self, text: str, detail: _ProbeDetail) -> None:
+        """② 近文本级：字符 n-gram MinHash 签名 → LSH 取候选 → 用签名估计的 Jaccard
+        复核（候选按插入序检查，取最优者）。
 
-        Sequence records (v1.8, spec 3.3.3 sequence row): image is None ⇒ image_hit is
-        always None, so the composite verdict degrades to "tree" semantics — the same
-        degradation shape as an image decode failure (spec 3.3.4)."""
+        @param text 判重文本
+        @param detail 本记录的探测便签（就地写入 minhash / tree_hit）
+        @return 无
+        """
+        mh = _build_minhash(text, self.cfg.ngram, self.cfg.minhash_num_perm)
+        detail.minhash = mh
+        if mh is None:
+            return
+        best: tuple[str, str, float] | None = None
+        candidates = sorted(
+            self._lsh.query(mh), key=lambda c: self._minhash_seq.get(c, 1 << 62)
+        )
+        for cand_id in candidates:
+            entry = self._minhashes.get(cand_id)
+            if entry is None:
+                continue
+            est = float(mh.jaccard(entry[0]))
+            if est >= self.cfg.minhash_threshold and (best is None or est > best[2]):
+                best = (cand_id, entry[1], est)
+        detail.tree_hit = best
+
+    def _probe_near_image(self, image_path, detail: _ProbeDetail) -> None:
+        """③ 近图像级（仅 UI 模态）：64 位 pHash，对已保留哈希做线性扫描。
+
+        （spec 3.3.3 提到可用 16 位前缀分桶加速；精确前缀分桶对汉明 ≤ 8 并不可靠，
+        因此保留同一 spec 行同样认可的、正确的线性扫描。）
+
+        @param image_path 本记录的图像路径
+        @param detail 本记录的探测便签（就地写入 phash / image_hit / 解码失败标记）
+        @return 无
+        """
+        try:
+            detail.phash = _phash_int(image_path)
+        except Exception as exc:
+            detail.image_decode_failed = True
+            _LOGGER.debug("image decode failed, dedup judges this record by tree alone: %s",
+                          type(exc).__name__, extra=_LOG_EXTRA)
+        if detail.phash is None:
+            return
+        best_img: tuple[str, str, int] | None = None
+        for stored, sid, skey in self._phashes:
+            d = _hamming(stored, detail.phash)
+            if d <= self.cfg.image_phash_max_distance and (
+                best_img is None or d < best_img[2]
+            ):
+                best_img = (sid, skey, d)
+        detail.image_hit = best_img
+
+    def _compose(self, detail: _ProbeDetail) -> DedupInfo:
+        """②③ 复合判决（spec 3.3.3/3.3.5）：文本模态只看 ② 级；UI 模态按
+        dedup.ui_dup_requires 判。两级同时命中 ⇒ kind='near_both'。
+
+        序列记录（v1.8，spec 3.3.3 序列行）：image 恒为 None ⇒ image_hit 恒为 None，
+        于是复合判决退化成 "tree" 语义 —— 与图像解码失败同形的退化（spec 3.3.4）。
+
+        @param detail 本记录的探测便签
+        @return 复合后的 DedupInfo 判决
+        """
         tree, image = detail.tree_hit, detail.image_hit
         unique = DedupInfo(kind="unique", cluster_key=detail.own_key, kept_id=None)
 
@@ -235,10 +314,9 @@ class DedupIndex:
 
         requires = self.cfg.ui_dup_requires
         if detail.image_decode_failed or detail.is_sequence:
-            # Image decode failure ⇒ this record skips the pHash layer and is judged by
-            # the tree alone (spec 3.3.4 "跳过 pHash 层（按树判定）", CONTRACTS.md §7.2):
-            # "both" and "image" degrade to "tree" for this record. Sequence records
-            # take the isomorphic degradation (spec 3.3.3 sequence row, S10).
+            # 图像解码失败 ⇒ 本记录跳过 pHash 层、按树判定（spec 3.3.4「跳过 pHash 层
+            # （按树判定）」、CONTRACTS.md §7.2）：对本记录而言 "both" 与 "image" 都退
+            # 化为 "tree"。序列记录走同构的退化（spec 3.3.3 序列行，S10）。
             requires = "tree"
         if requires == "both":
             is_dup = tree is not None and image is not None
@@ -260,7 +338,12 @@ class DedupIndex:
         return DedupInfo(kind="near_image", cluster_key=image[1], kept_id=image[0])
 
     def _add(self, rec_id: str, detail: _ProbeDetail) -> None:
-        """Index a kept (unique) record: exact key, MinHash signature, pHash."""
+        """把一条被保留（唯一）的记录写入索引：精确键、MinHash 签名、pHash。
+
+        @param rec_id 记录 id
+        @param detail 本记录的探测便签
+        @return 无
+        """
         self._exact[detail.digest] = rec_id
         self._digest_by_id[rec_id] = detail.digest
         if detail.minhash is not None:
@@ -272,9 +355,14 @@ class DedupIndex:
             self._phashes.append((detail.phash, rec_id, detail.own_key))
 
     def _retract(self, rec_id: str) -> None:
-        """Remove a record's ①②③ entries again — used when the semantic level (which runs
-        after probe_and_add already indexed the record as unique) flips the verdict to
-        duplicate, preserving first-writer-wins (only kept records stay indexed)."""
+        """把一条记录的 ①②③ 条目再撤回。
+
+        用于语义级（它跑在 probe_and_add 之后，那时记录已按唯一入索引）把判决翻成
+        重复的场合，从而维持先到先得（只有被保留的记录才留在索引里）。
+
+        @param rec_id 记录 id
+        @return 无
+        """
         digest = self._digest_by_id.pop(rec_id, None)
         if digest is not None and self._exact.get(digest) == rec_id:
             del self._exact[digest]
@@ -283,25 +371,38 @@ class DedupIndex:
             self._minhash_seq.pop(rec_id, None)
             try:
                 self._lsh.remove(rec_id)
-            except Exception:
-                pass
+            except Exception as exc:
+                _LOGGER.debug("LSH entry was already absent on retract: %s",
+                              type(exc).__name__, extra=_LOG_EXTRA)
         self._phashes = [e for e in self._phashes if e[1] != rec_id]
 
-    # ── semantic level ④ (only used when cfg.semantic) ────────────────────
+    # ── 语义级 ④（仅 cfg.semantic 开启时使用）──────────────────────────────
 
     def semantic_probe(self, vec: list[float]) -> tuple[str, str, float] | None:
-        """Returns (kept_id, cluster_key, cosine) of the best match with cosine >= threshold,
-        else None. vec must be L2-normalized (cosine = dot product, spec 3.3.3 ④)."""
+        """在向量索引里找余弦 >= 阈值的最优匹配。
+
+        vec 必须已 L2 归一（此时余弦 = 点积，spec 3.3.3 ④）。
+
+        @param vec 本记录的单位向量
+        @return (保留记录 id, 簇键, 余弦)；无命中返回 None
+        """
         if self._vec_count == 0:
             return None
         sims = self._vec_buf[: self._vec_count] @ np.asarray(vec, dtype=np.float64)
-        best = int(np.argmax(sims))  # ties → lowest index = earliest writer
+        best = int(np.argmax(sims))  # 并列取下标最小者 = 最早写入者
         cosine = float(sims[best])
         if cosine >= self.cfg.semantic_threshold:
             return (self._vec_ids[best], self._vec_keys[best], cosine)
         return None
 
     def add_vector(self, rec_id: str, cluster_key: str, vec: list[float]) -> None:
+        """把一条被保留记录的向量加入 ④ 级索引（缓冲满则倍增扩容）。
+
+        @param rec_id 记录 id
+        @param cluster_key 该记录的簇键
+        @param vec 单位向量
+        @return 无
+        """
         v = np.asarray(vec, dtype=np.float64)
         if self._vec_buf is None:
             self._vec_buf = np.empty((16, v.shape[0]), dtype=np.float64)
@@ -316,18 +417,32 @@ class DedupIndex:
         self._vec_count += 1
 
 
-# ── stage ──────────────────────────────────────────────────────────────────
+# ── 算子 ───────────────────────────────────────────────────────────────────
 
 
 class DedupStage:
+    """M3 去重算子：逐条探测判重，重复项只改状态为 dropped_dup，绝不移除列表元素。"""
+
     name = "dedup"
 
     def __init__(self, cfg: "DedupConfig", index: DedupIndex):
+        """构造去重算子。
+
+        @param cfg [dedup] 配置节
+        @param index 共享的判重索引
+        """
         self.cfg = cfg
         self.index = index
-        self._counted_clusters: set[str] = set()   # run-level distinct duplicate clusters
+        self._counted_clusters: set[str] = set()   # 运行级去重后的重复簇集合
 
     async def run(self, batch: list[PipelineItem], ctx: "RunContext") -> list[PipelineItem]:
+        """处理一批信封：逐条判重，单条失败绝不逃逸到批级。
+
+        @param batch 本批信封列表
+        @param ctx 运行上下文
+        @return 原列表（就地改状态，元素永不移除）
+        @raises CircuitBreakerTripped 熔断器已跳闸（批级传播）
+        """
         if self.cfg.scope == "batch":
             self.index.reset()
         for item in batch:
@@ -337,52 +452,66 @@ class DedupStage:
                 await self._process(item, ctx)
             except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
                 raise
-            except Exception as exc:  # single-record failure never escapes to batch level
-                # v1.11 (V27①): the budget vocabulary routes FIRST — an imprecise
-                # kind would land in internal_error and break §3.5 attribution /
-                # overflow_records counting. Reachable via the embed call (M9
-                # throat/finish disposition); the embed input is pre-truncated to
-                # embed_budget (V15), so this is the defensive remainder.
-                kind = budget.classify_stage_error(exc) or ErrorKind.INTERNAL_ERROR.value
-                if kind == ErrorKind.CONTEXT_OVERFLOW.value:
-                    ctx.metrics.count("budget.overflow_records")
-                    # A7/§7.8 breaker matrix: ONLY a reactive-400 (body-sniff)
-                    # terminal feeds the streak, exactly once per exception
-                    # (duck flag guards propagation double-feeds); precheck and
-                    # the 200-shaped finish oracle never feed. `origin` is read
-                    # defensively pending the errors.py revision.
-                    if (isinstance(exc, ContextOverflowError)
-                            and exc.phase == "reactive"
-                            and getattr(exc, "origin", "http_400") == "http_400"
-                            and not getattr(exc, "_breaker_fed", False)):
-                        exc._breaker_fed = True  # type: ignore[attr-defined]
-                        ctx.metrics.record_provider_result(fatal=True)
-                err = StageError(
-                    stage=self.name,
-                    kind=kind,
-                    message=f"{type(exc).__name__}: {exc}",
-                    retryable=False,
-                )
-                item.errors.append(err)
-                item.status = "failed"
-                ctx.metrics.event(
-                    _EV_ERROR,
-                    stage=self.name,
-                    batch_no=ctx.batch_no,
-                    record_ids=(item.record.id,),
-                    payload={"stage": err.stage, "kind": err.kind,
-                             "message": err.message, "retryable": err.retryable},
-                )
+            except Exception as exc:  # 单条失败绝不逃逸到批级
+                _LOGGER.debug("record-level dedup failure: %s", type(exc).__name__,
+                              extra={"stage": self.name, "batch": ctx.batch_no})
+                self._fail_item(item, exc, ctx)
         return batch
 
+    def _fail_item(self, item: PipelineItem, exc: Exception, ctx: "RunContext") -> None:
+        """把单条失败落到信封上：判错误 kind、按矩阵喂熔断、记 StageError 并发 error 事件。
+
+        @param item 出错的信封
+        @param exc 捕获到的异常
+        @param ctx 运行上下文
+        @return 无
+        """
+        # v1.11（V27①）：预算词表优先路由 —— kind 不精确会落进 internal_error，破坏
+        # §3.5 归因与 overflow_records 计数。可达路径是嵌入调用（M9 的咽喉/收尾处置）；
+        # 嵌入输入已按 embed_budget 预截断（V15），所以这里是防御性的残余分支。
+        kind = budget.classify_stage_error(exc) or ErrorKind.INTERNAL_ERROR.value
+        if kind == ErrorKind.CONTEXT_OVERFLOW.value:
+            ctx.metrics.count("budget.overflow_records")
+            # A7/§7.8 熔断矩阵：只有 reactive-400（嗅探体）终局喂连败计数，且每个异常
+            # 只喂一次（鸭子标记防传播路径重复喂）；precheck 与 200 形收尾神谕都不喂。
+            # `origin` 取值做防御式读取，等 errors.py 修订后收敛。
+            if (isinstance(exc, ContextOverflowError)
+                    and exc.phase == "reactive"
+                    and getattr(exc, "origin", "http_400") == "http_400"
+                    and not getattr(exc, "_breaker_fed", False)):
+                exc._breaker_fed = True  # type: ignore[attr-defined]
+                ctx.metrics.record_provider_result(fatal=True)
+        err = StageError(
+            stage=self.name,
+            kind=kind,
+            message=f"{type(exc).__name__}: {exc}",
+            retryable=False,
+        )
+        item.errors.append(err)
+        item.status = "failed"
+        ctx.metrics.event(
+            _EV_ERROR,
+            stage=self.name,
+            batch_no=ctx.batch_no,
+            record_ids=(item.record.id,),
+            payload={"stage": err.stage, "kind": err.kind,
+                     "message": err.message, "retryable": err.retryable},
+        )
+
     async def _process(self, item: PipelineItem, ctx: "RunContext") -> None:
+        """判定单条记录：唯一则挂 DedupInfo，重复则改状态并发事件。
+
+        @param item 当前信封
+        @param ctx 运行上下文
+        @return 无
+        """
         rec = item.record
         info = self.index.probe_and_add(rec)
         detail = self.index._last_probe
         assert detail is not None
         if detail.image_decode_failed:
-            # Skip pHash for this record (tree-only verdict); record stays active,
-            # no StageError (CONTRACTS.md §7.2 [FROZEN HERE]).
+            # 本记录跳过 pHash 层（按树判定）；记录保持 active，不产 StageError
+            # —— 契约见 CONTRACTS.md §7.2 [FROZEN HERE]
             ctx.metrics.count("dedup.image_decode_failures")
 
         metric: tuple[str, int | float] | None = None
@@ -418,8 +547,13 @@ class DedupStage:
 
     @staticmethod
     def _metric_for(info: DedupInfo, detail: _ProbeDetail) -> tuple[str, int | float] | None:
-        """Exactly one metric per dedup.duplicate event (CONTRACTS.md §8.1): jaccard for
-        near_text (and ②-driven near_both), hamming for near_image, none for exact."""
+        """每条 dedup.duplicate 事件恰好带一个度量（CONTRACTS.md §8.1）：near_text
+        （以及由 ② 驱动的 near_both）带 jaccard，near_image 带 hamming，exact 不带。
+
+        @param info 判重判决
+        @param detail 本记录的探测便签
+        @return (度量名, 度量值)；exact 判决返回 None
+        """
         if info.kind in ("near_text", "near_both") and detail.tree_hit is not None:
             return ("jaccard", detail.tree_hit[2])
         if info.kind == "near_image" and detail.image_hit is not None:
@@ -427,38 +561,48 @@ class DedupStage:
         return None
 
     def _semantic_participates(self, detail: _ProbeDetail) -> bool:
-        # ④ counts as a tree-level hit; under ui_dup_requires="image" it does not take part
-        # in the verdict (spec 3.3.3), so no embedding is spent there — unless this record's
-        # image failed to decode, in which case the record is judged by the tree alone
-        # (spec 3.3.4) and ④ participates as it would under "tree". Sequence records (v1.8,
-        # S10) likewise still participate under "image": their dedup face IS the concatenated
-        # member text (spec 3.3.3 sequence row).
+        """判定 ④ 级是否参与本记录的判决（决定要不要花这次嵌入调用）。
+
+        ④ 算作树级命中；在 ui_dup_requires="image" 下它不参与判决（spec 3.3.3），因此
+        那里不花嵌入 —— 除非本记录图像解码失败，此时记录按树判定（spec 3.3.4），④ 就
+        按 "tree" 的方式参与。序列记录（v1.8、S10）在 "image" 下同样仍参与：它们的判重
+        面本来就是拼接后的成员文本（spec 3.3.3 序列行）。
+
+        @param detail 本记录的探测便签
+        @return True 表示 ④ 级参与
+        """
         if self.index.modality == "text" or self.cfg.ui_dup_requires != "image":
             return True
         return detail.image_decode_failed or detail.is_sequence
 
     def _semantic_verdict_kind(self, detail: _ProbeDetail) -> str | None:
-        """Composite kind for a level-④ hit (spec 3.3.3: ④ counts as a tree-level hit).
-        None → the hit alone does not constitute a duplicate (record stays unique)."""
+        """④ 级命中后的复合 kind（spec 3.3.3：④ 算作树级命中）。
+
+        @param detail 本记录的探测便签
+        @return 复合判重 kind；返回 None 表示仅凭该命中还不构成重复（记录保持唯一）
+        """
         if self.index.modality == "text":
             return "near_semantic"
         if (self.cfg.ui_dup_requires == "both" and not detail.image_decode_failed
                 and not detail.is_sequence):
-            # ④ is a tree-level hit: "both" additionally needs the image level.
+            # ④ 是树级命中："both" 还额外需要图像级也命中
             return "near_both" if detail.image_hit is not None else None
-        # "tree" — including "both"/"image" degraded to tree-only when this record's
-        # image failed to decode (spec 3.3.4) or the record is a sequence (v1.8, S10:
-        # image_hit is always None and must not block a near_semantic verdict).
-        # ④+③ together still records near_both.
+        # "tree" —— 也包括本记录图像解码失败（spec 3.3.4）或本记录是序列（v1.8、S10：
+        # image_hit 恒为 None，不得因此挡住 near_semantic 判决）时，由 "both"/"image"
+        # 退化成的纯树判定。④+③ 同时命中仍记 near_both。
         return "near_both" if detail.image_hit is not None else "near_semantic"
 
     def _embed_input(self, detail: _ProbeDetail, ctx: "RunContext") -> str:
-        """v1.11 (V15, spec 3.3.3 嵌入输入预算截断): with the [embedding.*] profile's
-        context_window declared, the level-④ embed input (the _dedup_text product,
-        incl. sequence/thread concatenations) is truncated to embed_budget =
-        context_window − margin BEFORE the call — deterministic head keep (the
-        embedding's semantic body leads the text); cw == 0 keeps the v1.10 full
-        text byte-identically. The HASHING levels ①–③ always see the full text."""
+        """v1.11（V15，spec 3.3.3 嵌入输入预算截断）：[embedding.*] profile 声明了
+        context_window 时，④ 级的嵌入输入（即 _dedup_text 产物，含序列/线程拼接）在
+        调用前截断到 embed_budget = context_window − margin —— 确定性保头（嵌入的语义
+        主体在文本前段）；cw == 0 时与 v1.10 的全文逐字节等价。①–③ 这些哈希级永远看
+        到全文。
+
+        @param detail 本记录的探测便签
+        @param ctx 运行上下文
+        @return 送去嵌入的文本
+        """
         text = detail.dedup_text
         prof = (ctx.cfg.embedding_profiles.get(self.cfg.semantic_embedding)
                 if ctx.cfg is not None else None)
@@ -473,14 +617,21 @@ class DedupStage:
     async def _semantic_level(
         self, rec: Record, detail: _ProbeDetail, ctx: "RunContext"
     ) -> tuple[DedupInfo, tuple[str, float]] | None:
-        """Level ④: one embed() call for this record; verdict per the composite rules.
-        Returns (duplicate DedupInfo, ('cosine', value)) or None (record stays unique)."""
+        """④ 级：为本记录发一次 embed() 调用，再按复合规则出判决。
+
+        @param rec 待判重记录
+        @param detail 本记录的探测便签
+        @param ctx 运行上下文
+        @return (重复判决 DedupInfo, ('cosine', 余弦值))；记录保持唯一时返回 None
+        """
         try:
             vecs = await ctx.llm.embed(self.cfg.semantic_embedding,
                                        [self._embed_input(detail, ctx)])
-        except (ProviderRetryableError, ProviderFatalError):
-            # Retries exhausted / fatal for this call: skip level ④ for this record,
-            # verdict stands on ①–③ (spec 3.3.4). Breaker bookkeeping is M9's job.
+        except (ProviderRetryableError, ProviderFatalError) as exc:
+            # 本次调用重试耗尽 / 致命：本记录跳过 ④ 级，判决停在 ①–③（spec 3.3.4）。
+            # 熔断记账是 M9 的职责。
+            _LOGGER.debug("level-4 embedding call failed, verdict stands on levels 1-3: %s",
+                          type(exc).__name__, extra=_LOG_EXTRA)
             ctx.metrics.count("dedup.embedding_failures")
             return None
         vec = _l2_normalize(vecs[0])
@@ -488,7 +639,7 @@ class DedupStage:
         kind = None if hit is None else self._semantic_verdict_kind(detail)
 
         if kind is None:
-            # Kept: its vector joins the index (first-writer-wins).
+            # 保留：其向量加入索引（先到先得）
             self.index.add_vector(rec.id, detail.own_key, list(vec))
             return None
         kept_id, cluster_key, cosine = hit

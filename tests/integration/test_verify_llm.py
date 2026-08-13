@@ -125,8 +125,7 @@ class RealJudgeEngine:
     def __init__(self, profiles: dict[str, LLMProfile]):
         self.profiles = profiles
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
         p = self.profiles[profile]
         system = "\n".join(
             part.text

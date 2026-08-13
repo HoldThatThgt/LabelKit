@@ -117,8 +117,8 @@ class RealSamplesEngine:
             return None
         return obj if isinstance(obj, dict) else None
 
-    async def complete_validated(self, profile: str, prompt, schema: dict | None = None, *,
-                                 record_ids: tuple = (), batch_no: int = 0):
+    async def complete_validated(self, profile: str, prompt, schema: dict | None = None,
+                                 *, scope):
         system = "\n".join(part.text for msg in prompt.messages if msg.role == "system"
                            for part in msg.parts if part.text)
         messages = [{"role": msg.role,

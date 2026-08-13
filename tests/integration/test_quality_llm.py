@@ -116,8 +116,7 @@ class RealEndpointEngine:
         return "\n".join(system_chunks), user_msgs
 
     async def complete_validated(self, profile: str, prompt, schema: dict | None = None,
-                                 *, record_ids: tuple[str, ...] = (),
-                                 batch_no: int = 0) -> tuple[dict, Usage, int, str]:
+                                 *, scope) -> tuple[dict, Usage, int, str]:
         system, messages = self._messages(prompt)
         body = {"model": ZAI_MODEL, "max_tokens": self.max_tokens,
                 "temperature": prompt.temperature if prompt.temperature is not None else 0.0,

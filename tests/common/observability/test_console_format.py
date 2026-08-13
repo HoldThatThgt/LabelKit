@@ -1,9 +1,11 @@
 """Offline golden-snapshot tests for console_format (v1.10, SPEC-tui-console U21/U24 ①).
 
 These byte-exact literals ARE the regression anchor's unit layer: the plain
-progress line and text final-summary lines must stay byte-identical to the v1.9
-emitter hardcoded strings — the emitter and the CLI renderer both import these
-pure functions (single source of truth), so any drift here is a spec break.
+progress line and text final-summary lines are frozen here — the emitter and the
+CLI renderer both import these pure functions (single source of truth), so any
+drift here is a spec break. The 2026-08-14 repository-wide English pass
+deliberately re-froze both strings onto their English wording; the key sets,
+line structure and information set are unchanged.
 """
 from __future__ import annotations
 
@@ -19,13 +21,13 @@ def test_progress_line_golden_byte_exact():
     totals = {"dropped_dup": 3, "dropped_lowq": 5, "dropped_verify": 1,
               "failed": 0}
     line = format_progress_line(3, 41, totals)
-    assert line == ("\rlabelkit: 批 3  emitted=41  dropped_dup=3"
+    assert line == ("\rlabelkit: batch 3  emitted=41  dropped_dup=3"
                     "  dropped_lowq=5  dropped_verify=1  failed=0")
 
 
 def test_progress_line_missing_keys_zero_fill():
     assert format_progress_line(1, 0, {}) == (
-        "\rlabelkit: 批 1  emitted=0  dropped_dup=0  dropped_lowq=0"
+        "\rlabelkit: batch 1  emitted=0  dropped_dup=0  dropped_lowq=0"
         "  dropped_verify=0  failed=0")
 
 
@@ -34,7 +36,7 @@ def test_progress_line_fixed_key_set_ignores_extras():
     key set — stitched/threads (rich-panel-only keys) never enter this line."""
     totals = {"dropped_dup": 2, "stitched": 7, "threads": 4, "absorbed": 88}
     line = format_progress_line(2, 10, totals)
-    assert line == ("\rlabelkit: 批 2  emitted=10  dropped_dup=2"
+    assert line == ("\rlabelkit: batch 2  emitted=10  dropped_dup=2"
                     "  dropped_lowq=0  dropped_verify=0  failed=0")
     assert "stitched" not in line and "threads" not in line
 
@@ -53,7 +55,7 @@ def test_summary_lines_golden_byte_exact():
               "dropped_dup": 5, "dropped_lowq": 6, "dropped_verify": 1,
               "failed": 0, "emitted": 41}
     assert format_summary_lines(counts) == [
-        "   ── 终版摘要（与 report.counts 逐项一致）──",
+        "   ── final summary (matches report.counts item by item) ──",
         "   scanned=60  ingested=58  bad_input=2  generated=12",
         "   dropped_dup=5  dropped_lowq=6  dropped_verify=1  failed=0  emitted=41",
     ]
@@ -61,7 +63,7 @@ def test_summary_lines_golden_byte_exact():
 
 def test_summary_lines_missing_keys_zero_fill():
     assert format_summary_lines({}) == [
-        "   ── 终版摘要（与 report.counts 逐项一致）──",
+        "   ── final summary (matches report.counts item by item) ──",
         "   scanned=0  ingested=0  bad_input=0  generated=0",
         "   dropped_dup=0  dropped_lowq=0  dropped_verify=0  failed=0  emitted=0",
     ]

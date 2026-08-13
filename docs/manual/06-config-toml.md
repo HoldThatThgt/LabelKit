@@ -223,7 +223,7 @@ supports_vision = true
 为什么评审要换模型家族？模型评审自己（或同家族模型）的输出存在**自增强偏差**——它倾向于觉得「和我口味一致的就是好的」。LabelKit 在 `verify.llm` 与 `annotate.llm` 的 model 相同时会打印警告（不阻断）：
 
 ```
-warning: project.toml:[verify].llm: verify.llm 与 annotate.llm 使用同一模型 "glm-5.2"，存在自增强偏差风险（3.7.2）
+warning: project.toml:[verify].llm: verify.llm and annotate.llm use the same model "glm-5.2", which risks self-enhancement bias (3.7.2)
 ```
 
 预算有限只有一个模型可用时，这个警告可以接受——verify 依然能抓住事实性错误，只是对「风格性偏差」的纠察力打折。

@@ -9,7 +9,12 @@ LLMs, and no LLM is ever reached (both scenarios fail before any call).
 from __future__ import annotations
 
 import ast
+import importlib
 import importlib.util
+import io
+import logging
+import runpy
+import sys
 import tomllib
 from importlib import resources
 from pathlib import Path
@@ -17,10 +22,12 @@ from pathlib import Path
 import pytest
 
 import labelkit.cli as cli
+from labelkit.cli import commands as cli_commands
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
     ClassSpec,
+    CliOverrides,
     ConsoleConfig,
     Criterion,
     DedupConfig,
@@ -58,8 +65,14 @@ from labelkit.common.errors import (
     ProviderRetryableError,
     SchemaViolation,
 )
+from labelkit.common.runtime.llm_client import LLMClient, ProbeResult
 from labelkit.orchestration.factory import build_stages
 from labelkit.orchestration.profile_usage import referenced_profiles
+from labelkit.orchestration.runtime import execute_run, probe_referenced_profiles
+
+# labelkit.cli 把 main 这个**函数**导出到包命名空间，遮住了同名子模块——兜底出口
+# 的 monkeypatch 要打在真模块对象上。
+cli_main = importlib.import_module("labelkit.cli.main")
 
 
 EXPECTED_PRODUCTION_PY = {
@@ -70,6 +83,12 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/cli/main.py",
     "labelkit/cli/parser.py",
     "labelkit/common/config/__init__.py",
+    "labelkit/common/config/_classviews.py",   # M1 拆分（2026-08-14 规则整改：每文件 ≤2000 行）
+    "labelkit/common/config/_collect.py",
+    "labelkit/common/config/_constraints.py",
+    "labelkit/common/config/_rubrics.py",
+    "labelkit/common/config/_schemas.py",
+    "labelkit/common/config/_sections.py",
     "labelkit/common/config/loader.py",
     "labelkit/common/config/model.py",
     "labelkit/common/contracts/stage.py",
@@ -266,7 +285,7 @@ def test_config_error_aggregation_printed(capsys):
     exc = ConfigError(["a: err1", "b: err2"])
     cli._print_exception(exc)
     err = capsys.readouterr().err
-    assert "ConfigError: 2 个配置错误" in err
+    assert "ConfigError: 2 config error(s) (all aggregated)" in err
     assert "a: err1" in err and "b: err2" in err
 
 
@@ -350,7 +369,7 @@ def test_limit_rejects_non_positive_or_non_int(bad, capsys):
         cli.build_parser().parse_args(
             ["run", "--config", "c.toml", "--project", "p.toml", "--limit", bad])
     assert excinfo.value.code == EXIT_CONFIG
-    assert "期望 ≥ 1 的整数" in capsys.readouterr().err
+    assert "expected an integer >= 1" in capsys.readouterr().err
 
 
 def test_limit_rejected_via_main_exits_2(capsys):
@@ -880,3 +899,268 @@ def test_dry_run_diverts_trace_and_report(tmp_path, monkeypatch, capsys):
     assert (out_dir / "o.trace.dryrun.jsonl").exists()
     assert (out_dir / "o.dryrun.report.json").exists()
     assert "dry-run" in capsys.readouterr().err
+
+
+def test_execute_run_without_a_listener_is_the_pre_v110_path(tmp_path, monkeypatch,
+                                                             capsys):
+    """v1.10（U19）：``listener`` 是尾参——不传（v1.10 之前的全部调用方）时旁路
+    整轮不挂，运行照常收敛退出码（这里走 dry-run，零 LLM 调用）。"""
+    for mod in ("labelkit.common.config.loader", "labelkit.operators.ingest",
+                "labelkit.orchestration.orchestrator"):
+        pytest.importorskip(mod)
+    monkeypatch.setenv("LABELKIT_CLI_TEST_KEY", "test-key")
+    data = tmp_path / "in.jsonl"
+    data.write_text('{"text": "样例"}\n', encoding="utf-8")
+    config, project, _ = _write_pair(tmp_path, str(data))
+
+    assert execute_run(config, project, CliOverrides(dry_run=True)) == EXIT_OK
+    assert "dry-run" in capsys.readouterr().err
+
+
+# ── validate --probe（spec §2.4 退出码表 / §7.7「run 之外的面」U13） ──────────
+#
+# 探针的**可离线部分**：引用集组装（referenced_profiles）× 逐 profile 展开
+# （LLMClient.probe_all）× 结果呈现（rich 表 / 逐行 plain）。真连通性属集成面——
+# 这里 monkeypatch 的是 Python 对象层的 probe_all 协程，绝不桩 HTTP 传输层。
+
+
+def _probe(profile: str, *, ok: bool = True, model: str = "glm-5.2",
+           latency_ms: int = 421, error: str | None = None,
+           key_env: str | None = None) -> ProbeResult:
+    """构造一条探测结果（spec 3.9.2 ProbeResult 六字段）。"""
+    return ProbeResult(profile=profile, ok=ok, model=model,
+                       latency_ms=latency_ms, error=error, key_env=key_env)
+
+
+def _probe_cfg(**kw) -> ResolvedConfig:
+    """引用了三个 llm profile 与一个 embedding profile 的工程配置。"""
+    base = dict(
+        quality=QualityConfig(mode="pairwise",
+                              judges=("default", "judge", "fixer")),
+        annotate=AnnotateConfig(enabled=False, instruction="标注"),
+        dedup=DedupConfig(semantic=True, semantic_embedding="emb"),
+    )
+    base.update(kw)
+    return _cfg(**base)
+
+
+def test_probe_referenced_profiles_walks_llm_then_embedding_in_order(monkeypatch):
+    """spec §2.4 `validate --probe` / 3.9.2 probe_all（「成本 = 各被引用 profile
+    池大小之和 次探测调用」）：探测顺序 = 引用集的 (LLM…, embedding…) 拼接，池化
+    profile 的多条结果被**展开**而非嵌套，返回 tuple。"""
+    probed: list[str] = []
+
+    async def fake_probe_all(self, name):     # noqa: ANN001 — 对象层桩，非传输层
+        probed.append(name)
+        if name == "judge":                   # 池化 profile：逐键一条，声明序
+            return [_probe(name, key_env="LABELKIT_KEY_A"),
+                    _probe(name, ok=False, error="401", key_env="LABELKIT_KEY_B")]
+        return [_probe(name)]
+
+    monkeypatch.setattr(LLMClient, "probe_all", fake_probe_all)
+    cfg = _probe_cfg()
+    results = probe_referenced_profiles(cfg)
+
+    llms, embs = referenced_profiles(cfg)
+    assert (llms, embs) == (["default", "judge", "fixer"], ["emb"])
+    assert probed == [*llms, *embs]           # 引用集顺序即探测顺序
+    assert isinstance(results, tuple)
+    assert [r.profile for r in results] == ["default", "judge", "judge",
+                                            "fixer", "emb"]
+    assert [r.key_env for r in results] == [None, "LABELKIT_KEY_A",
+                                            "LABELKIT_KEY_B", None, None]
+
+
+class _TtyStdout(io.StringIO):
+    """stdout 替身：isatty() 为真——U13 的「仅 stdout 为 TTY 时渲染表格」判定面。"""
+
+    def isatty(self) -> bool:
+        return True
+
+
+def _pin_terminal(monkeypatch) -> None:
+    """把 rich 的终端探测钉成定宽无色，让表格文本在任何终端下逐字可断言。"""
+    monkeypatch.setenv("COLUMNS", "120")
+    monkeypatch.setenv("NO_COLOR", "1")
+    monkeypatch.setenv("TERM", "xterm")
+
+
+_PROBE_RESULTS = (
+    _probe("default"),
+    _probe("judge", ok=False, model="m", latency_ms=8,
+           error="401 unauthorized", key_env="LABELKIT_KEY_B"),
+)
+
+_PROBE_LINES = ["probe default: ok model=glm-5.2 latency_ms=421",
+                "probe judge[LABELKIT_KEY_B]: FAIL 401 unauthorized"]
+
+
+def _validate_args(*extra: str):
+    """解析一条 validate 命令行（真 argparse 面，不手搓 Namespace）。"""
+    return cli.build_parser().parse_args(
+        ["validate", "--config", "c.toml", "--project", "p.toml", *extra])
+
+
+def test_validate_probe_prints_one_line_per_result_when_not_rich_tty(
+        monkeypatch, capsys):
+    """U13：非 rich 档保持行式输出（脚本消费不破坏）——`probe {label}: ok
+    model=… latency_ms=…` / `probe {label}: FAIL {error}`，label 在有 key_env
+    时为 `profile[key_env]`；退出码 0。"""
+    seen: list = []
+    monkeypatch.setattr(cli_commands, "validate_project",
+                        lambda *a, **kw: seen.append(kw["overrides"]) or _cfg())
+    monkeypatch.setattr(cli_commands, "probe_referenced_profiles",
+                        lambda cfg: _PROBE_RESULTS)
+
+    assert cli_commands._cmd_validate(_validate_args("--probe")) == EXIT_OK
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == _PROBE_LINES
+    assert "configuration valid" in captured.err
+    assert seen[0].console is None            # U27：--console 覆盖项照常透传
+
+
+def test_validate_probe_renders_the_rich_table_when_rich_and_tty(monkeypatch):
+    """U13：rich 档 × stdout 为 TTY 走表格，并**提前返回**——同一批结果不再逐行
+    重复打印一遍。"""
+    _pin_terminal(monkeypatch)
+    monkeypatch.setattr(cli_commands, "validate_project", lambda *a, **kw: _cfg(
+        console=ConsoleConfig(mode="rich", mode_resolved="rich")))
+    monkeypatch.setattr(cli_commands, "probe_referenced_profiles",
+                        lambda cfg: _PROBE_RESULTS)
+    fake_out = _TtyStdout()
+    monkeypatch.setattr(sys, "stdout", fake_out)
+
+    assert cli_commands._cmd_validate(_validate_args("--probe")) == EXIT_OK
+    text = fake_out.getvalue()
+    assert "validate --probe" in text
+    assert "judge[LABELKIT_KEY_B]" in text and "FAIL" in text
+    for line in _PROBE_LINES:
+        assert line not in text               # 表格分支 return EXIT_OK 提前返回
+
+
+def test_validate_probe_falls_back_to_lines_when_rich_is_unimportable(monkeypatch):
+    """U21：mode_resolved 只做过 find_spec 探测——rich 实际装坏时表格返回 False，
+    调用方回落逐行 plain（退出码不变）。"""
+    monkeypatch.setattr(cli_commands, "validate_project", lambda *a, **kw: _cfg(
+        console=ConsoleConfig(mode="rich", mode_resolved="rich")))
+    monkeypatch.setattr(cli_commands, "probe_referenced_profiles",
+                        lambda cfg: _PROBE_RESULTS)
+    monkeypatch.setitem(sys.modules, "rich.table", None)
+    fake_out = _TtyStdout()
+    monkeypatch.setattr(sys, "stdout", fake_out)
+
+    assert cli_commands._cmd_validate(_validate_args("--probe")) == EXIT_OK
+    assert fake_out.getvalue().splitlines() == _PROBE_LINES
+
+
+def test_validate_without_probe_makes_no_probe_calls(monkeypatch, capsys):
+    """无 `--probe` 时只做 M1 全量校验：零探测调用、stdout 一字不出。"""
+    monkeypatch.setattr(cli_commands, "validate_project", lambda *a, **kw: _cfg())
+    monkeypatch.setattr(cli_commands, "probe_referenced_profiles",
+                        lambda cfg: pytest.fail("probe must not run"))
+
+    assert cli_commands._cmd_validate(_validate_args()) == EXIT_OK
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "configuration valid" in captured.err
+
+
+def test_print_probe_table_renders_five_columns(monkeypatch):
+    """U13 探测表：五列表头齐全、ok/FAIL 两态、latency_ms 右对齐。
+
+    表头 `profile[key]` 与 `profile[key_env]` 标签都带方括号——rich 的控制台
+    markup 会把小写方括号片段当样式标签吃掉，故生产侧以 Text 直传
+    （裁决·探测表字面格以 Text 直传）；本例正是那条回归锚。"""
+    _pin_terminal(monkeypatch)
+    fake_out = _TtyStdout()
+    monkeypatch.setattr(sys, "stdout", fake_out)
+
+    assert cli_commands._print_probe_table(_PROBE_RESULTS) is True
+    lines = [ln for ln in fake_out.getvalue().splitlines() if ln.strip()]
+    header = next(ln for ln in lines if "status" in ln)
+    for column in ("profile[key]", "status", "model", "latency_ms", "error"):
+        assert column in header, column
+    ok_row = next(ln for ln in lines if "default" in ln and "ok" in ln)
+    fail_row = next(ln for ln in lines if "judge[LABELKIT_KEY_B]" in ln)
+    assert "glm-5.2" in ok_row and "421" in ok_row
+    assert "FAIL" in fail_row and "401 unauthorized" in fail_row
+    # 右对齐：latency_ms 值贴着本格右边界（后面只剩边框与空格）
+    assert ok_row.index("421") > ok_row.index("glm-5.2")
+    assert ok_row[ok_row.index("421") + 3:].lstrip().startswith("│")
+
+
+def test_print_probe_table_returns_false_when_rich_is_unimportable(monkeypatch,
+                                                                   capsys):
+    """rich 不可导入 ⇒ 返回 False 且**零 stdout 输出**（调用方据此回落逐行）。"""
+    monkeypatch.setitem(sys.modules, "rich.table", None)
+    assert cli_commands._print_probe_table(_PROBE_RESULTS) is False
+    assert capsys.readouterr().out == ""
+
+
+# ── main() 的兜底异常出口与 __main__ 守卫（spec §2.4 退出码 / §4.3 映射） ─────
+
+
+def _raise_from_rubric(monkeypatch, exc: BaseException) -> None:
+    """让 rubric 处理器抛出指定异常（main 的 handlers 表按模块全局名查找）。"""
+    def boom(_args):
+        raise exc
+
+    monkeypatch.setattr(cli_main, "_cmd_rubric", boom)
+
+
+@pytest.fixture
+def _isolated_cli_logging():
+    """摘掉 setup_logging 留在进程里的 handler。
+
+    它是**每进程一次**的装配（生产里一次运行一个进程），但在同一个 pytest 进程内
+    会绑着上一条用例早已关闭的捕获流——写失败时 logging 会把自己的报错倾泻到当前
+    stderr，淹没本例要逐行断言的 CLI 输出。
+    """
+    logger = logging.getLogger("labelkit")
+    saved = logger.handlers[:]
+    logger.handlers = []
+    try:
+        yield
+    finally:
+        logger.handlers = saved
+
+
+def test_main_keyboard_interrupt_prints_interrupted_and_exits_4(
+        monkeypatch, capsys, caplog, _isolated_cli_logging):
+    """Ctrl-C：stderr 打 `interrupted`、退出码 4、恰一条分类 error 日志，
+    且**不重新抛出**（进程以退出码而非 traceback 收尾）。"""
+    _raise_from_rubric(monkeypatch, KeyboardInterrupt())
+    with caplog.at_level(logging.ERROR, logger="labelkit.cli"):
+        rc = cli.main(["rubric"])
+    assert rc == EXIT_FATAL
+    assert capsys.readouterr().err.splitlines() == ["interrupted"]
+    records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(records) == 1
+    assert "interrupted by user" in records[0].getMessage()
+
+
+def test_main_unexpected_exception_maps_through_exit_code_for(
+        monkeypatch, capsys, caplog, _isolated_cli_logging):
+    """兜底 Exception 分支：退出码取 `exit_code_for(exc)`、走 `_print_exception`
+    的单行形，同样不外抛。"""
+    exc = RuntimeError("unexpected")
+    _raise_from_rubric(monkeypatch, exc)
+    with caplog.at_level(logging.ERROR, logger="labelkit.cli"):
+        rc = cli.main(["rubric"])
+    assert rc == cli.exit_code_for(exc) == EXIT_FATAL
+    assert capsys.readouterr().err.splitlines() == ["RuntimeError: unexpected"]
+    records = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(records) == 1
+    assert "command rubric failed: RuntimeError (exit 4)" in records[0].getMessage()
+
+
+@pytest.mark.filterwarnings("ignore:.*found in sys.modules:RuntimeWarning")
+def test_main_module_guard_exits_with_the_command_code(monkeypatch, capsys):
+    """`__main__` 守卫：以脚本形态执行时 `sys.exit(main())` 把子命令退出码交给
+    进程（spec §2.4 退出码表的进程边界）。"""
+    monkeypatch.setattr(sys, "argv", ["labelkit", "rubric"])
+    with pytest.raises(SystemExit) as excinfo:
+        runpy.run_module("labelkit.cli.main", run_name="__main__")
+    assert excinfo.value.code == EXIT_OK
+    assert set(capsys.readouterr().out.splitlines()) == {
+        "default:text", "default:ui", "default:trajectory"}

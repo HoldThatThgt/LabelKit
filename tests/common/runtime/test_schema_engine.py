@@ -12,8 +12,10 @@ from jsonschema import Draft202012Validator
 from labelkit.common.config.model import OutputConfig
 from labelkit.common.runtime.schema_engine import (
     VERDICT_SCHEMA,
+    CallScope,
     SchemaEngine,
     _bucket_for,
+    _CallContext,
     _build_repair_prompt,
     _extract_object,
     _first_balanced_braces,
@@ -50,6 +52,12 @@ SPEC_SCHEMA = {
 def make_engine(user_schema=None, cfg=None) -> SchemaEngine:
     # llm=None: these tests never trigger an LLM call (pure-logic paths only).
     return SchemaEngine(user_schema or SPEC_SCHEMA, llm=None, cfg=cfg or OutputConfig())
+
+
+def _ctx(*, user_treated: bool, schema=None, record=None) -> _CallContext:
+    # The per-call context object _resolve/_inspect take (accounting + trace inputs).
+    return _CallContext(active=schema or SPEC_SCHEMA, user_treated=user_treated,
+                        record_ids=(), batch_no=0, record=record)
 
 
 # ── L1: deterministic_repair, exhaustively ──────────────────────────────────
@@ -171,6 +179,13 @@ class TestDeterministicRepair:
     def test_balanced_helper_returns_none_without_brace(self):
         assert _first_balanced_braces("no braces here") is None
 
+    def test_unrepairable_candidate_is_swallowed_and_returns_none(self):
+        # 失控模型吐出的极深嵌套让 json_repair 自己抛（递归深度）：L1 只记 debug、
+        # 换下一个来源继续，最终返回 None 而不是把异常甩给调用方。
+        runaway = "{" + '"a": [' * 20000 + "]" * 20000 + "}"
+        assert deterministic_repair(runaway) is None
+        assert deterministic_repair(f"```json\n{runaway}\n```") is None
+
     def test_balanced_helper_returns_suffix_when_unbalanced(self):
         assert _first_balanced_braces('x {"a": {"b": 1}') == '{"a": {"b": 1}'
 
@@ -217,8 +232,8 @@ class TestValidateOnly:
         errors = engine.validate_only(
             {"intent": "writing", "topic": "请假条写作", "difficulty": "easy"})
         assert errors == [
-            '/intent: 期望为枚举 ["writing_assist", "qa", "translation", "chitchat", '
-            '"other"] 之一，实际值为 "writing"'
+            '/intent: expected one of enum ["writing_assist", "qa", "translation", '
+            '"chitchat", "other"], got "writing"'
         ]
 
 
@@ -245,8 +260,8 @@ SPEC_REPAIR_PROMPT = (
     '```\n'
     '\n'
     '[违规清单]\n'
-    '1. /intent: 期望为枚举 ["writing_assist", "qa", "translation", "chitchat", '
-    '"other"] 之一，实际值为 "writing"\n'
+    '1. /intent: expected one of enum ["writing_assist", "qa", "translation", '
+    '"chitchat", "other"], got "writing"\n'
     '\n'
     '只输出修正后的 JSON。'
 )
@@ -280,14 +295,13 @@ class TestBucketing:
 
     def test_stats_count_user_schema_calls_only(self):
         engine = make_engine()
-        engine._resolve("l0_or_clean", is_user_schema=True, record_ids=(), batch_no=0,
-                        violations=[])
-        engine._resolve("l1", is_user_schema=True, record_ids=(), batch_no=0,
-                        violations=[])
-        engine._resolve("l3_1", is_user_schema=False, record_ids=(), batch_no=0,
-                        violations=["/x: enum"])  # internal-schema call: not counted
-        engine._resolve("rejected", is_user_schema=True, record_ids=(), batch_no=0,
-                        violations=["/x: enum"])
+        user_ctx = _ctx(user_treated=True)
+        internal_ctx = _ctx(user_treated=False)
+        engine._resolve("l0_or_clean", user_ctx, violations=[])
+        engine._resolve("l1", user_ctx, violations=[])
+        # internal-schema call: not counted
+        engine._resolve("l3_1", internal_ctx, violations=["/x: enum"])
+        engine._resolve("rejected", user_ctx, violations=["/x: enum"])
         assert engine.stats == {"l0_or_clean": 1, "l1": 1, "l3_1": 0, "l3_2": 0,
                                 "rejected": 1}
 
@@ -310,6 +324,11 @@ class TestBucketing:
         # Unparseable — all layers of L1 fail.
         resp = SimpleNamespace(structured=None, text="cannot comply")
         assert _extract_object(resp) == (None, False, "cannot comply")
+        # Clean JSON that is not an OBJECT — L1 still gets a shot at it.
+        resp = SimpleNamespace(structured=None, text='[{"a": 1}]')
+        assert _extract_object(resp) == ({"a": 1}, True, '[{"a": 1}]')
+        resp = SimpleNamespace(structured=None, text="42")
+        assert _extract_object(resp) == (None, False, "42")
 
 
 # ── canonical user-schema text ───────────────────────────────────────────────
@@ -753,6 +772,23 @@ def test_l1_lossy_not_flagged_for_fenced_pretty_json():
     assert l1_repair_is_lossy(obj, raw) is False
 
 
+def test_l1_lossy_falls_back_to_the_length_heuristic_when_the_region_differs():
+    # 花括号区段本身能干净解析、但解析结果与修复对象不是同一个（L1 真出手改了内容）
+    # ⇒ 不能直接判无损，转由长度启发式裁定。
+    from labelkit.common.runtime.schema_engine import l1_repair_is_lossy
+    raw = '{"opinion": "' + "长" * 200 + '"}'
+    assert l1_repair_is_lossy({"opinion": "短"}, raw) is True
+    assert l1_repair_is_lossy({"opinion": "长" * 199}, raw) is False
+
+
+def test_l1_lossy_is_false_without_a_brace_region():
+    # 长度启发式的基线是"花括号区段"；原始文本里根本没有花括号时无从比较，
+    # 按定义判无损（结构化输出直接给对象、原始文本为空即此形）。
+    from labelkit.common.runtime.schema_engine import l1_repair_is_lossy
+    assert l1_repair_is_lossy({"intent": "qa", "topic": "请假条"}, "") is False
+    assert l1_repair_is_lossy({"intent": "qa"}, "抱歉，我无法完成该任务。") is False
+
+
 def test_l1_lossy_not_flagged_for_ascii_escaped_json():
     import json as _json
     from labelkit.common.runtime.schema_engine import l1_repair_is_lossy
@@ -810,7 +846,7 @@ class TestL25Hook:
     def test_hook_bad_return_raises_type_error(self):
         eng = self._engine("tests.hook_samples:bad_return")
         import pytest as _pytest
-        with _pytest.raises(TypeError, match="应返回 list"):
+        with _pytest.raises(TypeError, match="must return list"):
             eng._callback_violations({"topic": "x"}, None)
 
     def test_no_hook_configured_attribute_is_none(self):
@@ -899,9 +935,11 @@ class _MetricsFeedSpy:
     def __init__(self):
         self.fed = []
         self.events = []
+        self.payloads = []
 
     def event(self, ev, *, stage, batch_no, record_ids=(), payload=None):
         self.events.append(ev)
+        self.payloads.append(payload or {})
 
     def record_provider_result(self, fatal, *, hard=False):
         self.fed.append(fatal)
@@ -950,6 +988,68 @@ def test_l3_repair_finish_origin_overflow_never_feeds():
     assert metrics.fed == []
 
 
+# ── L1 截断嫌疑与不可解析首轮：两条走完 complete_validated 的定案路径 ─────────
+
+
+class _QueueLLM:
+    """In-process 桩（QueueEngine 惯例）：按队列依次返回文本响应。"""
+
+    def __init__(self, *texts: str):
+        self.texts = list(texts)
+        self.calls = 0
+
+    async def complete(self, profile, prompt, response_schema=None):
+        self.calls += 1
+        return _StubResponse(self.texts[min(self.calls - 1, len(self.texts) - 1)])
+
+
+def test_clean_settlement_flags_a_suspected_lossy_l1_repair(caplog):
+    # 首轮就过校验，但对象是 L1 从一段"花括号里夹自由文字"的响应里救出来的，
+    # 保留体量远小于原区段 ⇒ 运行态只报长度不报内容，trace 事件加 l1_lossy 标。
+    import asyncio
+    import logging
+
+    junk = "这是一段模型自说自话的解释文字并没有任何键值结构" * 5
+    raw = ('{"intent": "qa", "topic": "请假条", "difficulty": "easy", '
+           + junk + "}")
+    metrics = _MetricsFeedSpy()
+    eng = SchemaEngine(SPEC_SCHEMA, llm=_QueueLLM(raw), cfg=OutputConfig(),
+                       metrics=metrics)
+    with caplog.at_level(logging.WARNING, logger="labelkit"):
+        obj, _usage, attempts, _model = asyncio.run(
+            eng.complete_validated("default", object()))
+    assert obj == {"intent": "qa", "topic": "请假条", "difficulty": "easy"}
+    assert attempts == 1 and eng.stats["l1"] == 1        # 首轮经 L1 定案
+    assert metrics.events == ["schema.repair"]
+    assert metrics.payloads[0]["l1_lossy"] is True
+    assert metrics.payloads[0]["resolved_at"] == "l1"
+    warns = [r for r in caplog.records if "L1 repair may have dropped content" in r.message]
+    assert len(warns) == 1
+    assert junk not in warns[0].getMessage()             # 只讲长度，绝不讲内容
+
+
+def test_unparseable_first_round_is_repaired_and_bucketed_at_l3_1():
+    # 首轮连 JSON 对象都产不出（纯散文）⇒ 违规清单只有那条"不可解析"，进入 L3；
+    # 第一轮修复通过即定案 l3_1，attempts 计首调 + 修复调用。
+    import asyncio
+
+    llm = _QueueLLM("抱歉，我无法给出结构化结果。",
+                    '{"intent": "qa", "topic": "请假条", "difficulty": "easy"}')
+    metrics = _MetricsFeedSpy()
+    eng = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(max_repair_attempts=2),
+                       metrics=metrics)
+    obj, usage, attempts, model = asyncio.run(eng.complete_validated("default", object()))
+    assert obj == {"intent": "qa", "topic": "请假条", "difficulty": "easy"}
+    assert llm.calls == 2 and attempts == 2
+    assert usage == Usage(10, 4)                         # 首调 + 修复调用逐字段相加
+    assert model == "glm-5.2"                            # 首轮模型名
+    assert eng.stats["l3_1"] == 1 and eng.stats["rejected"] == 0
+    assert metrics.events == ["schema.repair"]
+    assert metrics.payloads[0]["resolved_at"] == "l3_1"
+    assert metrics.payloads[0]["violations"] == [": unparseable"]
+    assert "l1_lossy" not in metrics.payloads[0]
+
+
 # ── v1.13（裁决·M8 显式待遇参数）: user_treatment 显式门 ─────────────────────
 # 「用户 Schema 待遇」= 计 resolved_at 记账 + 启 L2.5 回调。v1.13 前该待遇由
 # `schema is None` 隐式推断，导致「按序列类标注 Schema」这类显式 Schema 的记录级
@@ -978,10 +1078,11 @@ HOOK_REF = "tests.hook_samples:topic_max6"          # topic > 6 字符即违规
 ZERO_STATS = {"l0_or_clean": 0, "l1": 0, "l3_1": 0, "l3_2": 0, "rejected": 0}
 
 
-def _run_engine(engine, **kw):
+def _run_engine(engine, schema=None, **scope_kw):
     import asyncio
 
-    return asyncio.run(engine.complete_validated("default", object(), **kw))
+    return asyncio.run(engine.complete_validated("default", object(), schema,
+                                                 scope=CallScope(**scope_kw)))
 
 
 def test_user_treatment_default_keeps_the_schema_is_none_inference():

@@ -135,9 +135,9 @@ LabelKit 把配置切成两半，职责严格分离：
 **启动校验（快速失败，全量反馈）**：M1 在启动时把两份文件、CLI 覆盖、内联 Schema、rubric、few-shot 示例全部校验一遍，**所有错误一次性列出**，然后以退出码 2 结束。你不会遇到「跑了十分钟才发现第二个配置错误」的情况。校验通过后配置被冻结为不可变对象——运行期间不存在配置歧义。
 
 ```
-ConfigError: 2 个配置错误（全量聚合反馈）
-project.toml:[run].output: 缺失必填键，期望字符串（可用 CLI --output 提供）
-project.toml:[quality].llm: 引用的 profile "gpt4" 不存在于 config.toml [llm.*]，可用：default、judge
+ConfigError: 2 config error(s) (all aggregated)
+project.toml:[run].output: missing required key, expected string (may be supplied by CLI --output)
+project.toml:[quality].llm: referenced profile "gpt4" does not exist in config.toml [llm.*], available: default, judge
 ```
 
 ## 4.7 数据只去它该去的地方

@@ -86,7 +86,7 @@ v1.12 members 块示例（摘自 `examples/mix` UI 主工程真跑主输出 `out
 
 #### ② rejects = "refs"（默认）的一行
 
-场景：第 213 行的标注输出经 L3 两次修复（`output.max_repair_attempts = 2`）仍未通过用户 Schema，M8 抛 `SchemaViolation`，记录置 `failed`（kind = `schema_violation`，7.6）转入 `out/ime-intent-0630.rejects.jsonl`。`errors` 即 M8 L2 `iter_errors()` 收集的全部违规（JSON Pointer 路径 + 期望 + 实际，3.8.2）；行内无任何数据内容——记录原文与 `raw_last_output` 仅在 `rejects = "full"` 时才写出。
+场景：第 213 行的标注输出经 L3 两次修复（`output.max_repair_attempts = 2`）仍未通过用户 Schema，M8 抛 `SchemaViolation`，记录置 `failed`（kind = `schema_violation`，7.6）转入 `out/ime-intent-0630.rejects.jsonl`。`errors` 即 M8 L2 `iter_errors()` 收集的全部违规（JSON Pointer 路径 + 期望 + 实际，3.8.2；违规描述为英文——枚举类由 M8 自渲染，其余直接携带 jsonschema 的原始消息，2026-08-14 起统一）；行内无任何数据内容——记录原文与 `raw_last_output` 仅在 `rejects = "full"` 时才写出。
 
 ```
 # ── out/ime-intent-0630.rejects.jsonl 中的一行（折行排版）──
@@ -96,8 +96,8 @@ v1.12 members 块示例（摘自 `examples/mix` UI 主工程真跑主输出 `out
   "stage": "annotate",
   "reason": "schema_violation",
   "errors": [
-    "/difficulty: 期望枚举 [\"easy\",\"medium\",\"hard\"] 之一，实际为 \"非常难\"",
-    "/: 存在 Schema 未声明的字段 \"confidence\"（additionalProperties=false）"
+    "/difficulty: expected one of enum [\"easy\", \"medium\", \"hard\"], got \"非常难\"",
+    "/: Additional properties are not allowed ('confidence' was unexpected)"
   ]
 }}
 ```
@@ -106,14 +106,14 @@ v1.7：classify 启用的工程中该 `_meta` 另含 `"label"` 键（3.11.2 reje
 
 #### ③ 运行结束 stderr 摘要（逐字样例）
 
-非 TTY、`--log-level info` 下的运行尾部。行格式为 7.3 的 `ts level stage batch msg`；数字即 3.10.4 走查：1000 条无坏行入流水线（4 批：256×3 + 232），尾批写出 184 行、失败 2 条；rejects 通道含重复 / 低质 / 失败三类（`output.rejects = "refs"`，3.11.2）。
+非 TTY、`--log-level info` 下的运行尾部。行格式为 7.3 的 `ts level stage batch msg`（日志正文自 2026-08-14 起统一英文，键名、结构与信息集不变）；数字即 3.10.4 走查：1000 条无坏行入流水线（4 批：256×3 + 232），尾批写出 184 行、失败 2 条；rejects 通道含重复 / 低质 / 失败三类（`output.rejects = "refs"`，3.11.2）。
 
 ```
-2026-07-02T10:41:22+08:00 INFO  emitter batch=4 批 4/4 落盘：主输出 +184 行（累计 811），rejects +48（累计 189）
-2026-07-02T10:41:23+08:00 INFO  emitter batch=- finalize：fsync + rename  out/ime-intent-0630.jsonl.part → out/ime-intent-0630.jsonl（811 行）
-2026-07-02T10:41:23+08:00 INFO  emitter batch=- 已写出 out/ime-intent-0630.rejects.jsonl（189 行）与 out/ime-intent-0630.report.json
-2026-07-02T10:41:23+08:00 INFO  orchestrator batch=- 运行结束：exit_code=0，wall=822s
-   ── 终版摘要（与 report.counts 逐项一致）──
+2026-07-02T10:41:22+08:00 INFO  emitter batch=4 batch 4 flushed: main output +184 line(s) (total 811), rejects +48 (total 189)
+2026-07-02T10:41:23+08:00 INFO  emitter batch=- finalize: fsync + rename  out/ime-intent-0630.jsonl.part -> out/ime-intent-0630.jsonl (811 lines)
+2026-07-02T10:41:23+08:00 INFO  emitter batch=- wrote out/ime-intent-0630.rejects.jsonl (189 lines) and out/ime-intent-0630.report.json
+2026-07-02T10:41:23+08:00 INFO  run     batch=0 run.end exit_code=0
+   ── final summary (matches report.counts item by item) ──
    scanned=1000  ingested=1000  bad_input=0  generated=0
    dropped_dup=97  dropped_lowq=78  dropped_verify=0  failed=14  emitted=811
 ```

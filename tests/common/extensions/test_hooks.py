@@ -19,14 +19,14 @@ def test_resolve_hook_bad_format():
 
 
 def test_resolve_hook_import_and_attr_errors():
-    with pytest.raises(ValueError, match="无法导入模块"):
+    with pytest.raises(ValueError, match="cannot import module"):
         resolve_hook("no_such_module_xyz:fn")
-    with pytest.raises(ValueError, match="找不到"):
+    with pytest.raises(ValueError, match="not found"):
         resolve_hook("tests.hook_samples:missing_fn")
 
 
 def test_resolve_hook_not_callable():
-    with pytest.raises(ValueError, match="不是可调用对象"):
+    with pytest.raises(ValueError, match="is not callable"):
         resolve_hook("tests.hook_samples:NOT_CALLABLE")
 
 
@@ -34,5 +34,5 @@ def test_normalize_violations():
     assert normalize_violations(None, "r") == []
     assert normalize_violations([], "r") == []
     assert normalize_violations(("a", 1), "r") == ["a", "1"]
-    with pytest.raises(TypeError, match="应返回 list"):
+    with pytest.raises(TypeError, match="must return list"):
         normalize_violations("nope", "r")

@@ -85,8 +85,8 @@ uv run labelkit run --config config.toml --project project.toml
 > **常见坑**：忘了加载 `.env` 就运行，会在启动时收到清晰的配置错误并以退出码 2 结束：
 >
 > ```
-> ConfigError: 1 个配置错误（全量聚合反馈）
-> config.toml:[llm.default].api_key_env: 环境变量 "LABELKIT_KEY_DEFAULT" 未设置或为空
+> ConfigError: 1 config error(s) (all aggregated)
+> config.toml:[llm.default].api_key_env: environment variable "LABELKIT_KEY_DEFAULT" is not set or empty
 > ```
 >
 > 注意：只有**被启用的算子实际引用到的** profile 才需要密钥。配置里多写几个备用 profile 没关系，不用它就不查它的密钥。
@@ -102,7 +102,7 @@ uv run labelkit validate --config config.toml --project project.toml --probe
 成功时输出形如：
 
 ```
-配置校验通过
+configuration valid
 probe default: ok model=glm-5.2 latency_ms=7291
 ```
 
@@ -124,7 +124,7 @@ my-labeling-task/
 
 两份配置放哪里都行——CLI 用 `--config` / `--project` 显式指路径；`project.toml` 里的相对路径（输入、输出、外部 Schema 文件）相对**当前工作目录**解析，所以建议在工程目录里运行命令。
 
-> **注意**：输出目录不会自动创建。运行前 `mkdir -p out`，否则启动时的配置校验会直接拦下，报配置错误并以退出码 2 结束：`project.toml:[run].output: 输出父目录不存在或不可写`。（退出码 4 的「输出路径不可写」只针对运行**中途**写输出失败的情形，比如磁盘写满或权限被中途收回。）
+> **注意**：输出目录不会自动创建。运行前 `mkdir -p out`，否则启动时的配置校验会直接拦下，报配置错误并以退出码 2 结束：`project.toml:[run].output: output parent directory does not exist or is not writable`。（退出码 4 的「输出路径不可写」只针对运行**中途**写输出失败的情形，比如磁盘写满或权限被中途收回。）
 
 ## 2.6 给开发者：运行测试套件
 

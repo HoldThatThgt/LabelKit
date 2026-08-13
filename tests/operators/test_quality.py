@@ -20,6 +20,7 @@ single-record default-kwarg regression anchor.
 """
 from __future__ import annotations
 
+import asyncio
 import math
 import random
 from dataclasses import replace
@@ -51,11 +52,17 @@ from labelkit.common.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.common.errors import ProviderFatalError, ProviderRetryableError, SchemaViolation
+from labelkit.common.errors import (
+    CircuitBreakerTripped,
+    ProviderFatalError,
+    ProviderRetryableError,
+    SchemaViolation,
+)
 from labelkit.operators.quality import (
     AGGREGATE_KEY,
     QualityStage,
     _build_pairwise_prompt,
+    _Comparison,
     _build_pointwise_prompt,
     _classify_call_error,
     _criterion_percentiles,
@@ -433,7 +440,7 @@ async def test_stage_skips_non_active_items():
 def test_pairwise_prompt_matches_spec_worked_example():
     rec_a = make_record("a1", "解释一下二分查找为什么是 O(log n)，能不能举个在通讯录里找人的例子")
     rec_b = make_record("b1", "帮我写一条请假条，明天上午要去医院")
-    bundle = _build_pairwise_prompt(rec_a, rec_b, (EDU,), with_reason=True,
+    bundle = _build_pairwise_prompt(_Comparison(rec_a, rec_b), (EDU,), with_reason=True,
                                     ui_tree_max_chars=30000)
     assert bundle.temperature is None
     system, user = bundle.messages
@@ -452,8 +459,8 @@ def test_pairwise_prompt_matches_spec_worked_example():
 
 
 def test_pairwise_prompt_without_reason():
-    bundle = _build_pairwise_prompt(make_record("a"), make_record("b"), (EDU,),
-                                    with_reason=False, ui_tree_max_chars=30000)
+    bundle = _build_pairwise_prompt(_Comparison(make_record("a"), make_record("b")),
+                                    (EDU,), with_reason=False, ui_tree_max_chars=30000)
     text = bundle.messages[0].parts[0].text
     assert text.endswith('{"judgments": [{"criterion": <准则 key>, "winner": "A"|"B"|"tie"}]}')
     assert "reason" not in text
@@ -515,7 +522,7 @@ def test_violation_summary_is_data_free():
     # can quote record content; the summary must keep only pointers (spec 7.1, §8.4).
     secret = "身份证号 110101199003077777"
     exc = SchemaViolation(
-        [f'/judgments/0/winner: 期望为枚举 ["A", "B", "tie"] 之一，实际值为 "{secret}"',
+        [f'/judgments/0/winner: expected one of enum ["A", "B", "tie"], got "{secret}"',
          "/judgments/0: 'reason' is a required property"],
         raw_last_output=secret)
     summary = _violation_summary(exc)
@@ -525,7 +532,8 @@ def test_violation_summary_is_data_free():
 
 
 def test_violation_summary_root_pointer():
-    assert _violation_summary(SchemaViolation([": 输出无法解析为 JSON 对象"], "raw")) == (
+    assert _violation_summary(
+        SchemaViolation([": output is not parseable as a JSON object"], "raw")) == (
         "1 violation(s) at <root>")
 
 
@@ -627,8 +635,8 @@ class StubEngine:
         self.tie_ids = tie_ids
         self.poison_ids = poison_ids
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
         props = schema["properties"]
         if "judgments" in props:  # pairwise judgment call
             if set(record_ids) & self.poison_ids:
@@ -952,11 +960,9 @@ class CapturingStubEngine(StubEngine):
         super().__init__(**kw)
         self.prompts = []
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
         self.prompts.append(prompt)
-        return await super().complete_validated(profile, prompt, schema,
-                                                record_ids=record_ids, batch_no=batch_no)
+        return await super().complete_validated(profile, prompt, schema, scope=scope)
 
 
 def test_sequence_record_parts_pure_text_sections_and_step_lines():
@@ -1063,9 +1069,9 @@ def test_text_modality_sequence_skips_text_fast_path():
                         "ep000a")
     ep_b = make_episode(tuple(make_text_frame(f"b{i}", f"乙步骤{i}") for i in range(2)),
                         "ep000b")
-    bundle = _build_pairwise_prompt(ep_a, ep_b, (EDU,), with_reason=False,
-                                    ui_tree_max_chars=30000,
-                                    transitions_a=SEQ_TRANSITIONS, transitions_b=None)
+    bundle = _build_pairwise_prompt(
+        _Comparison(ep_a, ep_b, transitions_a=SEQ_TRANSITIONS, transitions_b=None),
+        (EDU,), with_reason=False, ui_tree_max_chars=30000)
     user = bundle.messages[1]
     assert [p.kind for p in user.parts] == ["text", "text"]
     assert user.parts[0].text.startswith("[记录 A·操作序列]\n[步骤序列]\n")
@@ -1107,9 +1113,10 @@ def test_single_record_paths_unchanged_by_default_kwargs():
     # Regression anchor: the trailing transitions kwargs default to None and leave the
     # single-record prompts byte-identical; a single record IGNORES passed transitions.
     rec_a, rec_b = make_record("a1", "文本甲"), make_record("b1", "文本乙")
-    assert _build_pairwise_prompt(rec_a, rec_b, (EDU,), True, 30000) == (
-        _build_pairwise_prompt(rec_a, rec_b, (EDU,), True, 30000,
-                               transitions_a=None, transitions_b=None))
+    assert _build_pairwise_prompt(_Comparison(rec_a, rec_b), (EDU,), True, 30000) == (
+        _build_pairwise_prompt(_Comparison(rec_a, rec_b, transitions_a=None,
+                                           transitions_b=None),
+                               (EDU,), True, 30000))
     assert _build_pointwise_prompt(rec_a, EDU, 30000) == (
         _build_pointwise_prompt(rec_a, EDU, 30000, transitions=None))
     with_steps = _build_pointwise_prompt(rec_a, EDU, 30000, transitions=SEQ_TRANSITIONS)
@@ -1181,7 +1188,8 @@ def big_ui_record(rec_id: str, n: int = 80) -> Record:
 def test_pairwise_ui_slots_trim_trees_with_marker_deterministically():
     rec_a, rec_b = big_ui_record("a" * 16), big_ui_record("b" * 16)
     fit = _CallFit(record_budget=1100, sides=2)
-    bundle = _build_pairwise_prompt(rec_a, rec_b, (EDU,), True, 30000, fit=fit)
+    bundle = _build_pairwise_prompt(_Comparison(rec_a, rec_b), (EDU,), True, 30000,
+                                    fit=fit)
     assert not fit.overflow
     assert fit.truncations == 2                    # each half trimmed once
     user = bundle.messages[1]
@@ -1193,7 +1201,7 @@ def test_pairwise_ui_slots_trim_trees_with_marker_deterministically():
         head, tree_lines = tree_part.text.split("\n", 1)
         assert budget_mod.est_text(tree_part.text) <= fit.side_share
     # deterministic: identical inputs → identical trimmed bundle
-    again = _build_pairwise_prompt(rec_a, rec_b, (EDU,), True, 30000,
+    again = _build_pairwise_prompt(_Comparison(rec_a, rec_b), (EDU,), True, 30000,
                                    fit=_CallFit(record_budget=1100, sides=2))
     assert again == bundle
 
@@ -1203,8 +1211,9 @@ def test_pairwise_prompt_budget_off_frozen():
     # worked-example prompt asserted at test_pairwise_prompt_matches_spec_worked_example
     # is built through the same fit=None path (regression anchor).
     rec_a, rec_b = big_ui_record("a" * 16), big_ui_record("b" * 16)
-    plain = _build_pairwise_prompt(rec_a, rec_b, (EDU,), True, 30000)
-    assert plain == _build_pairwise_prompt(rec_a, rec_b, (EDU,), True, 30000, fit=None)
+    plain = _build_pairwise_prompt(_Comparison(rec_a, rec_b), (EDU,), True, 30000)
+    assert plain == _build_pairwise_prompt(_Comparison(rec_a, rec_b), (EDU,), True,
+                                           30000, fit=None)
     tree = rec_a.ui_tree.serialize(max_chars=30000)
     assert plain.messages[1].parts[2].text == f"[记录 A UI 控件树]\n{tree}"
 
@@ -1290,15 +1299,12 @@ class OverflowThenOkEngine(StubEngine):
         self.n_overflows = n_overflows
         self.prompts: list = []
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
         self.prompts.append(prompt)
         if self.n_overflows > 0:
             self.n_overflows -= 1
             raise ContextOverflowError("provider overflow", phase="reactive")
-        return await super().complete_validated(profile, prompt, schema,
-                                                record_ids=record_ids,
-                                                batch_no=batch_no)
+        return await super().complete_validated(profile, prompt, schema, scope=scope)
 
 
 def test_v20_degrade_retry_tightens_text_share_once():
@@ -1400,3 +1406,393 @@ def test_output_truncated_call_fails_records_with_precise_kind():
     assert item.status == "failed"
     assert item.errors[0].kind == "output_truncated"
     assert rec.fed == []
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# criteria_per_call / both_orders / 多评审团的 stage 级派发（spec 3.4.3 三行）
+# ═════════════════════════════════════════════════════════════════════════════
+
+CLARITY = Criterion(
+    key="clarity", description="表达清晰度。",
+    pairwise_prompt="哪一段表达更清晰？", weight=1.0,
+    pointwise_levels=tuple(f"{i}: 清晰度第 {i} 级。" for i in range(6)))
+
+FACTUALITY = Criterion(
+    key="factuality", description="事实准确性。",
+    pairwise_prompt="哪一段更可能事实准确？", weight=1.0,
+    pointwise_levels=tuple(f"{i}: 准确性第 {i} 级。" for i in range(6)))
+
+THREE_CRITERIA = (EDU, CLARITY, FACTUALITY)
+
+
+def _system_texts(engine) -> list[str]:
+    return [p.messages[0].parts[0].text for p in engine.prompts]
+
+
+def _slot_a_text(prompt) -> str:
+    """从成对提示词的合并文本槽位里取 A 位记录正文（text 模态 §10.2 形态）。
+
+    @param prompt 一次成对判定的 PromptBundle
+    @return A 位记录的正文文本
+    """
+    merged = prompt.messages[1].parts[0].text
+    return merged.split("\n")[0].removeprefix("[记录 A] ")
+
+
+async def _run_criteria_per_call(per_call: str):
+    """按给定的 criteria_per_call 档跑一遍三准则 pairwise 打分。
+
+    @param per_call "all" | "single"
+    @return (batch, engine, recorder)
+    """
+    cfg = make_cfg(QualityConfig(mode="pairwise", rounds=1,
+                                 criteria_per_call=per_call),
+                   criteria=THREE_CRITERIA)
+    batch = [PipelineItem(record=make_record(f"r{k}", f"文本{k}")) for k in range(4)]
+    rec, engine = Recorder(), CapturingStubEngine()
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=engine))
+    return batch, engine, rec
+
+
+async def test_criteria_per_call_single_splits_one_call_per_criterion():
+    # spec 3.4.3 裁决提示词 行：criteria_per_call = "single" 切回 QuRating 原文的
+    # 「每 criterion 独立询问」——调用数 = 比较数 × 准则数，每次调用的系统提示只渲染
+    # 本准则一条 pairwise_prompt。
+    batch, engine, rec = await _run_criteria_per_call("single")
+    comparisons = 1 * (len(batch) // 2)                # rounds × ⌊N/2⌋ = 2
+    assert len(engine.prompts) == comparisons * len(THREE_CRITERIA) == 6
+    per_call_keys = []
+    for text in _system_texts(engine):
+        keys = [c.key for c in THREE_CRITERIA if f"- {c.key}: " in text]
+        assert len(keys) == 1                          # 逐维度拆调用
+        per_call_keys.append(keys[0])
+        (only,) = keys
+        crit = next(c for c in THREE_CRITERIA if c.key == only)
+        assert crit.pairwise_prompt in text
+        for other in THREE_CRITERIA:
+            if other.key != only:
+                assert other.pairwise_prompt not in text
+    # 每个比较都覆盖全部三条准则（准则组按 rubric 声明序展开）
+    assert per_call_keys == [c.key for _ in range(comparisons) for c in THREE_CRITERIA]
+    # 三条准则各写一条 quality.bt_fit，最终每条记录都拿到三准则分 + 聚合分
+    assert [p["payload"]["criterion"] for p in rec.of("quality.bt_fit")] == [
+        c.key for c in THREE_CRITERIA]
+    for it in batch:
+        assert set(it.scores) == {c.key for c in THREE_CRITERIA} | {AGGREGATE_KEY}
+
+
+async def test_criteria_per_call_all_keeps_one_call_for_every_criterion():
+    # 默认档（成本优化）：一次调用裁决全部 criteria——调用数 = 比较数，系统提示渲染三条。
+    batch, engine, _rec = await _run_criteria_per_call("all")
+    assert len(engine.prompts) == 1 * (len(batch) // 2) == 2
+    for text in _system_texts(engine):
+        for crit in THREE_CRITERIA:
+            assert f"- {crit.key}: {crit.description}" in text
+            assert crit.pairwise_prompt in text
+
+
+async def test_criteria_per_call_switch_is_score_equivalent():
+    # spec 3.4.4 末句「切换零迁移成本」的成对侧读法：两档的抽签、BT 输入与最终分逐条
+    # 相等——只有调用数不同。估算侧（orchestrator._estimate_quality_calls）的
+    # per_call 乘子取 n_criteria，与此处实测调用数在零丢弃前提下**取等号**。
+    all_batch, all_engine, all_rec = await _run_criteria_per_call("all")
+    single_batch, single_engine, single_rec = await _run_criteria_per_call("single")
+    assert len(single_engine.prompts) == len(all_engine.prompts) * len(THREE_CRITERIA)
+    for a, s in zip(all_batch, single_batch):
+        assert a.record.id == s.record.id
+        assert a.status == s.status
+        assert {k: v.score for k, v in a.scores.items()} == {
+            k: v.score for k, v in s.scores.items()}
+    assert all_rec.counters == single_rec.counters
+
+
+class OrderAwareEngine(StubEngine):
+    """按 (评委 profile, A 位记录 id) 查表给裁决——两键唯一确定一次调用，因而能给
+    正反两序不同的结论（both_orders 的判定面）。值为胜者记录 id 或 "tie"。"""
+
+    def __init__(self, table: dict[tuple[str, str], str], **kw):
+        super().__init__(**kw)
+        self.table = table
+        self.prompts: list = []
+        self.seen: list[tuple[str, str]] = []          # (评委, A 位记录 id)
+
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        self.prompts.append(prompt)
+        a_id = _ID_BY_TEXT[_slot_a_text(prompt)]
+        self.seen.append((profile, a_id))
+        winner = self.table[(profile, a_id)]
+        slot = "tie" if winner == "tie" else ("A" if winner == a_id else "B")
+        keys = schema["properties"]["judgments"]["items"]["properties"][
+            "criterion"]["enum"]
+        return ({"judgments": [{"criterion": k, "winner": slot} for k in keys]},
+                None, 1, "stub-model")
+
+
+_ID_BY_TEXT = {"文甲": "r0", "文乙": "r1"}
+
+
+def _two_record_batch() -> list[PipelineItem]:
+    return [PipelineItem(record=make_record("r0", "文甲")),
+            PipelineItem(record=make_record("r1", "文乙"))]
+
+
+async def test_both_orders_dispatches_each_pair_twice_with_flipped_presentation():
+    # spec 3.4.3 双顺序裁决 行：同一对记录以正反两种呈现顺序各裁决一次；per-criterion
+    # 两次结果不一致 ⇒ 记 tie（位置偏差被系统性消除，而非随机化缓解）。
+    cfg = make_cfg(QualityConfig(mode="pairwise", rounds=1, both_orders=True))
+    batch = _two_record_batch()
+    # 单评委：正序判 r0 胜、反序判 r1 胜 ⇒ 合成为 tie ⇒ 两条记录同分 0.5
+    engine = OrderAwareEngine({("default", "r0"): "r0", ("default", "r1"): "r1"})
+    rec = Recorder()
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=engine))
+
+    assert len(engine.prompts) == 2                    # 每对恰两次调用
+    a_slots = [_slot_a_text(p) for p in engine.prompts]
+    assert sorted(a_slots) == ["文乙", "文甲"]         # 两次的 A/B 互换
+    assert all(it.scores[AGGREGATE_KEY].score == 0.5 for it in batch)
+    assert rec.counters["quality.tie_outcomes.educational_value"] == 1
+    # 每序各写一条 quality.judgment 事件，以 order 字段区分两序
+    orders = [p["payload"]["order"] for p in rec.of("quality.judgment")]
+    assert len(orders) == 2 and orders[0] != orders[1]
+    assert {frozenset(o.items()) for o in orders} == {
+        frozenset({"A": "r0", "B": "r1"}.items()),
+        frozenset({"A": "r1", "B": "r0"}.items())}
+    # record_ids 恒为抽样序（不随呈现序翻转，§8.1）
+    sampling = {p["record_ids"] for p in rec.of("quality.judgment")}
+    assert len(sampling) == 1
+
+
+async def test_both_orders_composes_per_judge_before_cross_judge_majority():
+    # spec 3.4.3：「合成次序固定：先 per-judge 做双顺序一致性合成，再跨 judge 取多数票」。
+    # 本组返回值让两种次序结论不同：
+    #   per-judge 先合成 ⇒ [r0, tie, tie] ⇒ 跨 judge 多数 = tie（两条记录同分 0.5）
+    #   先跨 judge 后合成 ⇒ 正序多数 r0、反序多数 r0 ⇒ 合成 r0（分数 1.0 / 0.0）
+    cfg = make_cfg(QualityConfig(mode="pairwise", rounds=1, both_orders=True,
+                                 judges=("j1", "j2", "j3")))
+    batch = _two_record_batch()
+    engine = OrderAwareEngine({
+        ("j1", "r0"): "r0", ("j1", "r1"): "r0",        # 两序一致 ⇒ r0
+        ("j2", "r0"): "r0", ("j2", "r1"): "r1",        # 两序矛盾 ⇒ tie
+        ("j3", "r0"): "r1", ("j3", "r1"): "r0",        # 两序矛盾 ⇒ tie
+    })
+    rec = Recorder()
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=engine))
+
+    assert len(engine.prompts) == 6                    # 3 评委 × 2 序
+    assert all(it.scores[AGGREGATE_KEY].score == 0.5 for it in batch)
+    assert rec.counters["quality.tie_outcomes.educational_value"] == 1
+    assert rec.counters["quality.tie_comparisons.educational_value"] == 1
+    # 反证本用例非空转：把次序倒过来（先跨 judge 多数、再合成双序）会得出 r0 胜，
+    # 从而给出 1.0 / 0.0 的分数——与上面断言的 0.5 / 0.5 明确可分。
+    compose, majority = QualityStage._compose_orders, QualityStage._majority
+    per_order = [[0, 0, 1], [0, 1, 0]]                 # [正序三票, 反序三票]
+    wrong = compose([majority(votes, 0, 1) for votes in per_order])
+    assert wrong == 0
+    right = majority([compose([per_order[0][k], per_order[1][k]])
+                      for k in range(3)], 0, 1)
+    assert right == "tie"
+
+
+async def test_multi_judge_writes_one_judgment_event_per_judge():
+    # spec 3.4.3 多评审团 行 + §7.2 v1.2 可选字段 judge：每次比较由各 judge 以「同一
+    # 呈现顺序」独立裁决，trace 中每 judge 各写一条 quality.judgment 事件。
+    cfg = make_cfg(QualityConfig(mode="pairwise", rounds=1,
+                                 judges=("a", "b", "c")))
+    batch = _two_record_batch()
+    engine = OrderAwareEngine({("a", "r0"): "r0", ("a", "r1"): "r0",
+                               ("b", "r0"): "r0", ("b", "r1"): "r0",
+                               ("c", "r0"): "r1", ("c", "r1"): "r1"})
+    rec = Recorder()
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=engine))
+
+    events = rec.of("quality.judgment")
+    assert len(events) == 3                            # 每 judge 一条
+    assert [p["payload"]["judge"] for p in events] == ["a", "b", "c"]
+    # 同一呈现顺序广播全团：三条事件的 order 字段完全相同
+    assert len({frozenset(p["payload"]["order"].items()) for p in events}) == 1
+    assert [profile for profile, _ in engine.seen] == ["a", "b", "c"]
+    # BT 取多数结果：a、b 判 r0 胜（2/3 过半）⇒ r0 得 1.0、r1 得 0.0
+    scores = {it.record.id: it.scores[AGGREGATE_KEY].score for it in batch}
+    assert scores == {"r0": 1.0, "r1": 0.0}
+    assert rec.counters["quality.tie_outcomes.educational_value"] == 0
+
+
+async def test_single_judge_judgment_event_omits_the_judge_field():
+    # 回归锚：judges 为空（单评审）时 payload 不含 judge 键（§7.2 只增不改）。
+    cfg = make_cfg(QualityConfig(mode="pairwise", rounds=1))
+    rec = Recorder()
+    await QualityStage(cfg).run(_two_record_batch(),
+                                make_ctx(cfg, rec, engine=StubEngine()))
+    (event,) = rec.of("quality.judgment")
+    assert "judge" not in event["payload"]
+
+
+# ── 池级四段兜底（spec 3.4.3 按类分池「池级 try/except 隔离」）────────────────
+
+_POOL_STAGES = {
+    "partition": "_build_pools",          # 划分破损 ⇒ 批级兜底
+    "predraw": "_pairing_plan",           # 预抽破损 ⇒ 池级兜底
+    "assembly": "_pairwise_calls",        # 装配破损 ⇒ 池级兜底
+    "postprocess": "_pairwise_finish",    # 后处理破损 ⇒ 池级兜底
+}
+
+
+class _Boom(RuntimeError):
+    """毒化桩抛出的普通异常（非运行级控制流）。"""
+
+
+def _poison_pool_stage(monkeypatch, which: str, victim: str | None):
+    """把四段兜底中的一段替换成「只对被毒池抛异常」的桩。
+
+    @param monkeypatch pytest monkeypatch 夹具
+    @param which _POOL_STAGES 的键
+    @param victim 被毒池名；None = 无差别毒化（划分段用）
+    @return 无
+    """
+    if which == "partition":
+        def broken_build(self, items):
+            raise _Boom("pool partition broken")
+        monkeypatch.setattr(QualityStage, "_build_pools", broken_build)
+        return
+    if which == "predraw":
+        real = _pairing_plan
+
+        def broken_plan(n_items, rounds, rng):
+            if rounds == 99:                            # 被毒池的哨兵 rounds
+                raise _Boom("pairing pre-draw broken")
+            return real(n_items, rounds, rng)
+        monkeypatch.setattr("labelkit.operators.quality._pairing_plan", broken_plan)
+        return
+    real_method = getattr(QualityStage, _POOL_STAGES[which])
+
+    def broken(self, pool, ctx):
+        if pool.pool == victim:
+            raise _Boom(f"{which} broken")
+        return real_method(self, pool, ctx)
+    monkeypatch.setattr(QualityStage, _POOL_STAGES[which], broken)
+
+
+async def test_pool_partition_failure_fails_the_batch_not_the_run(monkeypatch):
+    # 划分破损发生在任何池之前 ⇒ 沿用批级兜底（契约④）：这批记录失败，运行继续。
+    cfg = make_pooled_cfg({"a": QualityConfig(mode="pointwise"),
+                           "b": QualityConfig(mode="pointwise")})
+    batch = [make_classified("a1", "a"), make_classified("b1", "b")]
+    _poison_pool_stage(monkeypatch, "partition", None)
+    rec = Recorder()
+    out = await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=StubEngine()))
+    assert out is batch                                 # 契约③
+    for it in batch:
+        assert it.status == "failed"
+        assert it.errors[0].kind == "internal_error"
+        assert "quality stage internal error" in it.errors[0].message
+        assert AGGREGATE_KEY not in it.scores
+    assert {rid for p in rec.of("error") for rid in p["record_ids"]} == {"a1", "b1"}
+
+
+async def test_predraw_failure_isolates_the_offending_pool(monkeypatch):
+    # 预抽破损：只有被毒池的记录失败，另一池照常打分门控。
+    cfg = make_pooled_cfg({"a": QualityConfig(mode="pairwise", rounds=99),
+                           "b": QualityConfig(mode="pairwise", rounds=1)})
+    batch = [make_classified("a1", "a"), make_classified("a2", "a"),
+             make_classified("b1", "b"), make_classified("b2", "b")]
+    _poison_pool_stage(monkeypatch, "predraw", "a")
+    rec = Recorder()
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=StubEngine()))
+    a1, a2, b1, b2 = batch
+    assert all(it.status == "failed" and it.errors[0].kind == "internal_error"
+               for it in (a1, a2))
+    assert all(AGGREGATE_KEY not in it.scores for it in (a1, a2))
+    assert b1.status == "active" and b2.status == "active"   # 无 threshold ⇒ 不门控
+    assert {b1.scores[AGGREGATE_KEY].score, b2.scores[AGGREGATE_KEY].score} == {
+        0.0, 1.0}
+    # 被毒池零抽签 ⇒ 零调用；另一池的判定照常
+    assert [p["payload"]["pool"] for p in rec.of("quality.judgment")] == ["b"]
+
+
+async def test_call_assembly_failure_isolates_the_offending_pool(monkeypatch):
+    cfg = make_pooled_cfg({"a": QualityConfig(mode="pairwise", rounds=1),
+                           "b": QualityConfig(mode="pairwise", rounds=1)})
+    batch = [make_classified("a1", "a"), make_classified("a2", "a"),
+             make_classified("b1", "b"), make_classified("b2", "b")]
+    _poison_pool_stage(monkeypatch, "assembly", "a")
+    rec = Recorder()
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=StubEngine()))
+    a1, a2, b1, b2 = batch
+    assert all(it.status == "failed" for it in (a1, a2))
+    assert all(AGGREGATE_KEY not in it.scores for it in (a1, a2))
+    assert {b1.scores[AGGREGATE_KEY].score, b2.scores[AGGREGATE_KEY].score} == {
+        0.0, 1.0}
+    # 被毒池的调用一条都没发出；另一池的判定照常
+    assert [p["payload"]["pool"] for p in rec.of("quality.judgment")] == ["b"]
+
+
+async def test_pool_postprocessing_failure_isolates_the_offending_pool(monkeypatch):
+    cfg = make_pooled_cfg({"a": QualityConfig(mode="pairwise", rounds=1),
+                           "b": QualityConfig(mode="pairwise", rounds=1)})
+    batch = [make_classified("a1", "a"), make_classified("a2", "a"),
+             make_classified("b1", "b"), make_classified("b2", "b")]
+    _poison_pool_stage(monkeypatch, "postprocess", "a")
+    rec = Recorder()
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=StubEngine()))
+    a1, a2, b1, b2 = batch
+    assert all(it.status == "failed" for it in (a1, a2))
+    assert {b1.scores[AGGREGATE_KEY].score, b2.scores[AGGREGATE_KEY].score} == {
+        0.0, 1.0}
+    # 后处理段在判定之后：被毒池的两次判定调用确实发生过
+    assert sorted(p["payload"]["pool"] for p in rec.of("quality.judgment")) == [
+        "a", "b"]
+
+
+@pytest.mark.parametrize("which", sorted(_POOL_STAGES))
+@pytest.mark.parametrize("control_flow", ["breaker", "keyboard", "cancelled"])
+async def test_pool_guards_never_swallow_run_level_control_flow(
+        monkeypatch, which, control_flow):
+    # 四段兜底的 except 子句都先重抛三类运行级控制流（熔断 / 中断 / 取消）——
+    # 吞掉它们会让熔断失效、Ctrl-C 静默。
+    exc_cls = {"breaker": CircuitBreakerTripped,
+               "keyboard": KeyboardInterrupt,
+               "cancelled": asyncio.CancelledError}[control_flow]
+    cfg = make_pooled_cfg({"a": QualityConfig(mode="pairwise", rounds=1),
+                           "b": QualityConfig(mode="pairwise", rounds=1)})
+    batch = [make_classified("a1", "a"), make_classified("a2", "a"),
+             make_classified("b1", "b"), make_classified("b2", "b")]
+    _poison_control_flow(monkeypatch, which, exc_cls)
+    with pytest.raises(exc_cls):
+        await QualityStage(cfg).run(batch, make_ctx(cfg, engine=StubEngine()))
+    assert all(it.status == "active" for it in batch)   # 未被降级为 failed
+
+
+@pytest.mark.parametrize("exc_cls", [CircuitBreakerTripped, asyncio.CancelledError])
+async def test_guarded_call_never_swallows_run_level_control_flow(exc_cls):
+    # 第五道兜底（_guarded_call）：逃出单次判定处置的运行级控制流照样上抛，
+    # 中断合并 gather——吞掉它会让熔断器形同虚设。（KeyboardInterrupt 在 gather 子
+    # 任务里由 asyncio 直接重抛进事件循环，不经本兜底，故只在同步四段上断言。）
+    cfg = make_pooled_cfg({"a": QualityConfig(mode="pairwise", rounds=1)})
+
+    class ControlFlowEngine:
+        async def complete_validated(self, *a, **k):
+            raise (exc_cls("breaker tripped")
+                   if exc_cls is CircuitBreakerTripped else exc_cls())
+
+    batch = [make_classified("a1", "a"), make_classified("a2", "a")]
+    with pytest.raises(exc_cls):
+        await QualityStage(cfg).run(batch, make_ctx(cfg, engine=ControlFlowEngine()))
+    assert all(it.status == "active" for it in batch)
+
+
+def _poison_control_flow(monkeypatch, which: str, exc_cls):
+    """让四段兜底之一抛出运行级控制流异常。
+
+    @param monkeypatch pytest monkeypatch 夹具
+    @param which _POOL_STAGES 的键
+    @param exc_cls 待抛出的异常类
+    @return 无
+    """
+    def raiser(*_a, **_kw):
+        raise exc_cls() if exc_cls is not CircuitBreakerTripped else exc_cls(
+            "breaker tripped")
+
+    if which == "predraw":
+        monkeypatch.setattr("labelkit.operators.quality._pairing_plan", raiser)
+    else:
+        monkeypatch.setattr(QualityStage, _POOL_STAGES[which], raiser)

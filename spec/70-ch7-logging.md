@@ -27,7 +27,7 @@
 | `ingest.bad_line` | ingest / warn | M2 坏行跳过（3.2.5）。 | `file`、`line_no`、`reason`。 |
 | `ingest.missing_pair` | ingest / warn | M2 缺对跳过（3.2.4）。 | `index`、`present`（"tree"\|"image"，实际存在的一侧）、`file`。 |
 | `ingest.index_conflict` | ingest / warn（fail 策略时 error） | M2 index 冲突（3.2.4）。 | `index`、`files`（冲突文件路径列表）。 |
-| `ingest.disorder` | ingest / —（trace-only，无逐事件 stderr 镜像；v1.8） | M2 流式单调性校验拒绝一条记录时（乱序或时间戳解析失败，`stream.on_disorder`，3.2/6.1）；skip 策略下每记录一事件，M2 自身另打**一条全运行仅一次的 data-free stderr WARN**（reason 含时间戳/游标值故不入 stderr——§7.1 ①）；fail 策略经 InputError 以退出码 3 终止。 | `file`、`line_no`（文本）\| `index`（UI）、`reason`（"乱序" \| "时间戳解析失败" 类文案，含违规值——仅 trace 通道）。 |
+| `ingest.disorder` | ingest / —（trace-only，无逐事件 stderr 镜像；v1.8） | M2 流式单调性校验拒绝一条记录时（乱序或时间戳解析失败，`stream.on_disorder`，3.2/6.1）；skip 策略下每记录一事件，M2 自身另打**一条全运行仅一次的 data-free stderr WARN**（reason 含时间戳/游标值故不入 stderr——§7.1 ①）；fail 策略经 InputError 以退出码 3 终止。 | `file`、`line_no`（文本）\| `index`（UI）、`reason`（`out of order: …` \| `timestamp parse failure: …` 类文案，含违规值——仅 trace 通道）。 |
 | `segment.session` | segment / —（trace-only，无 stderr 镜像；v1.8） | M2 会话装配器闭合一个候选会话时（3.2 会话化行；`--limit` 截断视同 EOF 冲洗尾会话，S17）——发出方是 M2，但按前缀归 segment 通道（S1）；`record_ids` 为空。 | `session_id`、`first` / `last`（会话首/末帧）、`len`、`cause`（"gap" \| "key" \| "max_len" \| "max_span" \| "eof" \| "limit"）。 |
 | `segment.boundary` | segment / —（trace-only，无 stderr 镜像；v1.8） | M14 每个滑窗裁决经 M8 校验通过后（3.14）；`record_ids` 为空（成员溯源在 payload）。 | `session_id`、`window`（= [s, e] 窗口帧位次区间）、`member_ids`、`relations`[]{`index`, `relation`}（五值封闭词表，3.14）、`model`、`reason`†（逐帧关系理由，条件见表下注）。 |
 | `stitch.judge` | stitch / —（trace-only，无 stderr 镜像；v1.9） | M16 每候选判定定案后（votes 聚合之后；一遍与二遍均发，3.16.6）；`record_ids` = [候选碎片首成员 id]。 | `session_id`、`candidate`（"episode"\|"rescue"）、`repass`（bool，false = 一遍 / true = 二遍）、`verdict`（votes 分裂回落时记保守结局 "new"）、`thread_ref`、`confidence`（仅观测，不进门槛，3.16.3）、`priors`（机械先验命中腿列表，⊆ {app_overlap, entity_overlap, same_page}）、`merged`（bool）；条件字段：`votes_split`（= true，仅严格多数不成立回落时携带）、`task_name`¶、`reason`¶（votes 分裂时不携带）、`target_thread_id`（仅 merged 时携带）。 |
@@ -50,21 +50,31 @@
 | `llm.pool_parked` | llm / warn | v1.6：M9 某 profile 全部存活密钥均在冷却、调用开始驻留时（每次驻留一事件；任意池大小含 1）。 | `profile`、`wait_s`（预计驻留秒数）、`live_keys`（存活密钥数）。 |
 | `error` | 随产生 stage 的通道 / warn（记录级）· error（运行级） | StageError 构造时。 | `stage`、`kind`（取值见 7.6）、`message`、`retryable`——即 StageError 全字段（4.2）；v1.7 增可选字段 `label`（仅 classify 启用时携带——multi 扇出下消歧同 id 兄弟信封，3.13.4）。 |
 
+**不经事件目录的 CLI 顶层 stderr 行（2026-08-14 明示）**：`labelkit/cli/main.py` 的异常收口在事件目录**之外**另打三条 ERROR 级运行日志（它们发生在 M12 事件生命周期结束之后或之外，故不入本目录、不进 trace）：
+
+```
+command <cmd> aborted: <message> (exit <n>)      # 已归类的 LabelKitError
+command <cmd> interrupted by user (exit <n>)     # KeyboardInterrupt
+command <cmd> failed: <message> (exit <n>)       # 未预期异常
+```
+
+配置错误另经 stdout/stderr 打印聚合抬头 `ConfigError: {n} config error(s) (all aggregated)` 加逐条错误行（3.1.5），`validate` 通过时打印一行 `configuration valid`。
+
 **v1.13 零增量声明（时间流生成）**：本目录对时间流生成形态**零改动**——**零新通道**（通道枚举维持 11 值；蓝图、帧实现与噪音批三类调用经既有 `llm.call` 完全可见，generate 专属通道列 8.4 演进候选）、**零新事件**（不新增任何事件名，既有事件的 payload 亦不增键）、**零新错误 kind**（7.6 词表不动：蓝图/实现的结构失败复用 `schema_violation`、预算面复用 `context_overflow` / `output_truncated`，且这些失败**不产生记录级 StageError**——序列直接作废，留痕在 `report.generate.stream.*` 计数与值-free 的 stderr WARN，3.6.5）。
 
 † `reason` 仅当 `quality.judgment_reasons` 生效时存在（5.2）；`classify.decision` 的 `reason` 条件独立（v1.7）= `trace.enabled = true` 且 `trace.channels` 含 `"classify"`（零额外 token 原则，3.13.4 调用与校验行）；`segment.boundary` 的 `reason` 条件同款（v1.8）= `trace.enabled = true` 且 `trace.channels` 含 `"segment"`（对应窗口内部 Schema 的 with_reason 参数，零额外 token，3.14）。¶ `stitch.judge` / `stitch.thread` 的 `task_name` 与 `reason`（v1.9）无请求条件——`stitch_schema()` 恒含两键（判定量级小、votes 聚合需按多数簇取值，3.16.3），但作为 LLM 自由文本受 7.4 分级：`none` 档剥除、`refs` 档起携带（`task_name` 为 v1.9 新增自由文本键，7.4）。‡ / § 为 `extract.step` 的内容分档标记（v1.8，S27）：`description` 自 `"refs"` 档起、`target` / `value` 自 `"excerpt"` 档起携带（7.4）。全部自由文本字段（reason / critiques / violations 文本）受 7.4 脱敏档位控制。密钥相关事件（v1.6）只携环境变量**名**——密钥值在任何档位、任何通道均不落日志（7.4 规则不变）。
 
 ## 7.3 记录格式规范
 
-stderr 两种格式承载同一信息，由 `tool.log_format` 选择；trace 事件行是 TraceEvent（3.12.3）的 JSON 序列化，恒为 UTF-8 单行（下例因排版自动折行）。
+stderr 两种格式承载同一信息，由 `tool.log_format` 选择；trace 事件行是 TraceEvent（3.12.3）的 JSON 序列化，恒为 UTF-8 单行（下例因排版自动折行）。**日志正文语言（2026-08-14 代码规则整改）**：stderr 运行日志、报错消息与 CLI 输出统一英文（数据内容原样，不翻译）；中文只出现在源码注释/docstring 与 LLM 提示词模板中。
 
 ```
 # ── stderr, tool.log_format = "text"（行格式: ts level stage batch msg）──
-2026-07-02T09:31:04+08:00 INFO  quality batch=3 pairwise 完成 items=128 comparisons=256 judgment_failures=1
+2026-07-02T09:31:04+08:00 INFO  quality batch=3 pairwise done items=128 comparisons=256 judgment_failures=1
 2026-07-02T09:31:12+08:00 WARN  ingest  batch=4 bad_line file=ime-2026-06-30.jsonl line=217 reason=missing_text_field
 
 # ── stderr, tool.log_format = "jsonl"（同一事件）──
-{"ts":"2026-07-02T09:31:04+08:00","level":"info","stage":"quality","batch":3,"msg":"pairwise 完成 items=128 comparisons=256 judgment_failures=1"}
+{"ts":"2026-07-02T09:31:04+08:00","level":"info","stage":"quality","batch":3,"msg":"pairwise done items=128 comparisons=256 judgment_failures=1"}
 ```
 
 ```
@@ -157,20 +167,28 @@ tool.log_format = "jsonl" 强制 plain 且不可被显式 rich（CLI 或 config�
 （stderr 逐行可 json.loads 铁律；显式冲突 M1 WARN 一次）。
 ```
 
-**plain 档（回归锚）**：与 v1.9 行为等价（`console.heartbeat_s = 0` 默认下；判据 = 三层回归锚，7.8 console 行/U24）——TTY 单行 `\r` 批级进度（批号 + 五状态固定键集，**T16 键集约束在本档继续成立**：stitched 不入行）；非 TTY 每批一行摘要（即 `batch.end` 的 stderr info 行）；运行结束打印与 report.json `counts` 完全一致的文本版终版摘要表。行格式的单一事实源为 common 层纯函数 `console_format`（U21——emitter 与渲染器共用，v1.9 字符串逐字节钉死于黄金快照）。可选心跳：`console.heartbeat_s > 0` 且非 TTY 时每 N 秒一行数据无关汇总 `heartbeat batch= stage= llm_calls= elapsed=`（固定 deadline 自续不漂移；CI 长批「像死机」缓解，默认关；所有权 = CLI 层 plain 监听器，`run.start` 起 `run.end` 止）。
+**plain 档（回归锚）**：与 v1.9 行为等价（`console.heartbeat_s = 0` 默认下；判据 = 三层回归锚，7.8 console 行/U24）——TTY 单行 `\r` 批级进度（批号 + 五状态固定键集，**T16 键集约束在本档继续成立**：stitched 不入行）；非 TTY 每批一行摘要（即 `batch.end` 的 stderr info 行）；运行结束打印与 report.json `counts` 完全一致的文本版终版摘要表。行格式的单一事实源为 common 层纯函数 `console_format`（U21——emitter 与渲染器共用，字符串逐字节钉死于黄金快照）。两条锚串（2026-08-14 **重冻结**到英文文案上——键集、行结构与信息集不变，仅语言变）：
+
+```
+\rlabelkit: batch {batch_no}  emitted={emitted_total}  dropped_dup=N  dropped_lowq=N  dropped_verify=N  failed=N
+   ── final summary (matches report.counts item by item) ──
+```
+可选心跳：`console.heartbeat_s > 0` 且非 TTY 时每 N 秒一行数据无关汇总 `heartbeat batch= stage= llm_calls= elapsed=`（固定 deadline 自续不漂移；CI 长批「像死机」缓解，默认关；所有权 = CLI 层 plain 监听器，`run.start` 起 `run.end` 止）。
 
 **rich 档（双区内联实时面板）**：日志在上方滚动区照常输出（行文本与 plain 逐字节一致——渲染器接管 `labelkit` logger 的 handler 流（setStream 返回值记账），退出/降级时恢复），终端底部画布按 `console.refresh_hz` 节流原地重绘（渲染 tick = asyncio task，`Live(auto_refresh=false)` 钉死——rich 默认自刷新线程与事件循环内动态字典有跨线程争用，U26；除 rich 自身外零新线程）；**永不进入 alternate screen**（批任务保 scrollback，U1）。画布六区块（数据源全部为既有结构字段，唯一新增采集点 = M9 的 p50 延迟有界样本窗）：
 
 | 区块 | 内容 | 数据源 |
 |---|---|---|
 | 标头 | run_id、mode/modality（stream/stitch 徽标）、seed、耗时、ETA（仅批总数分母可得时显示，EMA 外推标 `~`） | `on_run_context(cfg,…)`（3.12.3）；run_id 自 `run.start` |
-| 批进度 | UI 模态 `批 i/N` + scanned（**live 预扫复用**：M10 既有 P2-4 预扫在 UI 模态翻 `estimate=True`，配对表零额外 I/O、stream 批数 = next-fit 仿真精确，禁二次 scan——U17）；文本模态默认 `批 i` 无分母——行数估算需全量多读一遍输入，默认不做（M10 现状），`console.estimate = true` 显式换购（U17） | `batch.start/end`、`on_estimate`（estimate_run 导出，3.10.3） |
+| 批进度 | UI 模态 `batch i/N` + scanned（**live 预扫复用**：M10 既有 P2-4 预扫在 UI 模态翻 `estimate=True`，配对表零额外 I/O、stream 批数 = next-fit 仿真精确，禁二次 scan——U17）；文本模态默认 `batch i` 无分母——行数估算需全量多读一遍输入，默认不做（M10 现状），`console.estimate = true` 显式换购（U17） | `batch.start/end`、`on_estimate`（estimate_run 导出，3.10.3） |
 | 段棋盘 | 仅启用 stage 按链序；`✓` 本批已过 / `▶` 进行中 / `·` 待走（三符号反映**当前批**位置）。`▶` 后缀进度数：分子 = **运行级累计** llm.call 完成数按**括号归属**记账（批内阶段串行屏障下，落在本 stage `on_stage` 与下一次 `on_stage` 之间的调用记入本 stage——U20）；分母 = `on_estimate` 送达的**运行级** `estimate_run` 各 `*_calls` 估算（标「估算」；未送达估算——文本模态未开 `console.estimate`——则仅显示分子计数）。v1.12 分母口径：`_STAGE_CALL_KEYS` 改为可多键求和的分母映射——classify 分母 = `classify_calls + frame_classify_calls`、annotate 分母 = `annotate_calls + frame_annotate_calls`（帧调用的 llm.call 括号归属落在同名 stage 内，分子分母同栏对齐）；`_ESTIMATE_CALL_KEYS` 加两键（rich 估算表与 dry-run 键表等价性），**面板零新行** | stage_begin 旁路（3.12.3）+ `llm.call` 括号归集 + `on_estimate` |
 | 状态账 | 九态计数，stream/stitch 键仅启用时在场、同 report.counts 口径——**stitched/threads 的展示为对 T16 的有界修订（仅本档；对齐决策 1.6 U18）**；emitted 分量 = `batch.end.active`（post-emit 恒等）；批内随批末更新 | `batch.end` + counters 拉取 |
 | LLM | 每 profile：在途/并发上限（在途 = Σ 密钥 in_flight，口径 = 在线 HTTP 请求数）、calls、retries、tokens ↑↓、成本（未配价目 `—`）、p50 延迟（成功调用口径，有界窗 256）；密钥池行（**环境变量名** + ok/冷却剩余秒/禁用）；熔断 streak/threshold，打开时红色横幅 | `LLMClient.snapshot()` 每 tick 只读拉取（3.9.2/3.12.3） |
-| 键位提示 / 中断态 | 交互键提示一行（下表）；SIGINT 后画布顶部横幅「正在优雅中断（≤30s）…」 | 3.10.3 中断路径旁路转发 |
+| 键位提示 / 中断态 | 交互键提示一行（下表）；SIGINT 后画布顶部横幅 `graceful interrupt in progress (≤30s)…` | 3.10.3 中断路径旁路转发 |
 
-generate_only：批进度区退化为 `生成 ▶ calls i/N · 已产 n 条`（calls 实时自 llm.call；「已产」于生成相位结束一次更新——produced 为相位末计量），批棋盘自再流批次起激活。运行结束：最后一次重绘后**定格**为静态终版面板（counts 表 + per-stage 耗时横条 + llm_usage 小表 + rejects/trace 路径行），scrollback 保留完整日志。
+面板行的**标签文案自 2026-08-14 起统一英文**（键集、区块划分、数据源与布局不变）：抬头 `labelkit run · {run_id} · {badge} · seed {n} · elapsed {mm:ss}`、批进度 `batch {i}/{N} … records {n}/{N} (scanned)`、段棋盘 `stages  …`、状态账 `account  emitted … dup … lowq … verify … failed …[ noise … absorbed …][ stitched … threads …]`、LLM 行 `{profile}  in_flight a/b  calls n  retries n  tok ↑↓  {cost}  p50 {t}` + `keys {env} ok|cooldown Ns|disabled` + `breaker {streak}/{threshold}`、熔断横幅 `⚠ breaker open`、错误条 `errors …`（空为 `(none)`）、终版面板 `labelkit run done · {run_id} · {badge} · elapsed {mm:ss}` + `counts (= report.counts)` + `stage time (approx: summed on_stage intervals, not report timings)`。
+
+generate_only：批进度区退化为 `generate ▶ calls i/N · produced n`（calls 实时自 llm.call；produced 于生成相位结束一次更新——它是相位末计量），批棋盘自再流批次起激活。运行结束：最后一次重绘后**定格**为静态终版面板（counts 表 + per-stage 耗时横条 + llm_usage 小表 + rejects/trace 路径行），scrollback 保留完整日志。
 
 **run 之外的面（U13）**：rich 档下 `validate --probe` 结果表（仅当 stdout 为 TTY 时渲染，否则保持现行行式——脚本消费不破坏）与 dry-run 估算摘要以表格呈现（数值与 plain 逐项一致；plain 档行式输出为逐字节锚——含 v1.8/v1.9 无条件打印的 `segment_calls`/`stitch_calls` 行）；`rubric --show` 恒 plain（stdout 机器消费，不受 console.mode 影响）。
 
@@ -185,6 +203,13 @@ generate_only：批进度区退化为 `生成 ▶ calls i/N · 已产 n 条`（c
 | `p` | 暂停/恢复画布重绘（日志照常滚动；调试/复制友好） |
 | `q` | 面板脱离：余下运行降级 plain（不终止运行、不影响退出码） |
 
+两行提示的逐字文案（2026-08-14 英文化）：
+
+```
+ [?]help [l]LLM expand [e]errors [p]pause [q]detach
+ keymap  ?/h help   l LLM expand (one line per key)   e recent errors   +/- canvas lines(4–16)   p pause repaint   q detach (rest of the run degrades to plain)
+```
+
 终端状态纪律：`tty.setcbreak`（非全 raw——保留 ISIG，**Ctrl-C 产生 SIGINT 的语义不变**，仍走 3.10.3 优雅中断）；退出/降级/异常路径经 finally 恢复 termios 属性；键盘轮询在渲染 tick 内非阻塞 select，零新线程。stdin 被占用的代价（粘贴的后续命令被吞）以 `console.interactive = false` 回避。
 
 **信息纪律与失败语义（红线，U6/U7）**：面板与心跳行 = stderr 镜像同级——只显示计数、枚举、profile 名、密钥环境变量名、file:line 结构字段；**不显示 record id、excerpt、reason/task_name/critiques 等任何 LLM 自由文本与输入数据内容**。渲染期任何异常自吞 + 一次性 WARN + 当场降级 plain 续跑，**渲染永不影响退出码与数据产出**；终端宽 < 60 列退化为单行 `\r` 形态。面板为 M12 的第四个纯消费面（3.12.3 ProgressListener 旁路）：**零 7.2 事件目录改动、report.json 零新键**。
@@ -197,4 +222,4 @@ generate_only：批进度区退化为 `生成 ▶ calls i/N · 已产 n 条`（c
 | 集成 | 以 mock provider（录制响应）跑通 2.3.1 全部组合矩阵；断言 report 不变量、主输出全行过用户 Schema、rejects=refs 时文件不含任何输入内容子串。 |
 | 契约 | 对真实 API 的 probe 冒烟（CI 可选）；结构化输出 L0 关闭/开启两态等价性（最终输出结构一致）。 |
 | 日志（v1.1 新增） | trace 每行可被 `json.loads` 解析且恰含 ts / run_id / batch_no / stage / ev / record_ids / payload 七字段；对 7.2 事件目录逐事件断言 payload 字段齐全；首行为 run.start 且携带 trace_schema_version=1；`trace.content="refs"` 时 trace 文件不含任何输入内容子串（与 rejects=refs 同法断言）；注入写失败（不可写路径 / mock OSError）断言运行不中断、warn 恰打印一次、`report.trace.dropped_events` 计数正确。 |
-| console（v1.10 新增） | 定宽渲染快照断言（`Console(width=100, force_terminal=True)`，喂 MetricsSink 计数器状态而非 LLM 响应——不违反真实 LLM 测试纪律）：九态账 / 密钥池三态 / 熔断横幅 / 中断横幅 / 窄终端退化 / generate_only 形态 / `l`·`e` 展开态；**回归锚（三层，U24——实跑逐字节 diff 经 refute 审计证伪：行携时间戳与 duration_ms、温度 0 端点非逐字节确定）**：① 单元层——固定时钟注入下 plain 行格式纯函数（`console_format`）黄金快照逐字节断言；② dry-run 层——examples **五目录八工程**（v1.13 起：text 两工程 / ui / stream 两工程 / mix 两工程 / synth-stream；v1.12 为四目录七工程）`--dry-run --console plain` 的 stderr 估算行（无时间戳字段）逐字节 diff 为空（**八个黄金文件**入库、离线套件逐运行钉死——`dryrun-mix.txt` / `dryrun-mix-text.txt` 为 v1.12 新增的 mix 主/姊妹双工程 golden，`dryrun-synth-stream.txt` 为 v1.13 新增的时间流生成工程 golden；**v1.13 的七个既有 golden 字节不动**——估算行格式零改动，三类生成调用全折入 `generate_calls`，3.10.3 时间流生成行）；③ 实跑层——八工程实跑 stderr 归一化（时间戳/耗时/token/延迟/计数值 → 占位符，cargo 测试套 `[ELAPSED]` 遮蔽同法）后与基线**结构等价**（行序与固定文案逐字节一致）；`log_format="jsonl"` 下 stderr 逐行可解析且显式 rich 被拒并 WARN；降级注入：渲染 tick 抛异常 ⇒ 运行照常完成、退出码不变、恰一条 WARN、自动转 plain（rich 档下 emitter 已静态让位——余下 plain 进度/摘要行由渲染器以 `console_format` 续打，q 脱离同路径）；键盘：伪 TTY 注入键序断言 `q` 脱离 / `p` 暂停期日志照常 / termios 属性退出后逐字节复原 / cbreak 下 Ctrl-C 仍触发 SIGINT 优雅中断；协议：`listener=None` 路径零行为变化、全回调 O(1) 无 I/O。 |
+| console（v1.10 新增） | 定宽渲染快照断言（`Console(width=100, force_terminal=True)`，喂 MetricsSink 计数器状态而非 LLM 响应——不违反真实 LLM 测试纪律）：九态账 / 密钥池三态 / 熔断横幅 / 中断横幅 / 窄终端退化 / generate_only 形态 / `l`·`e` 展开态；**回归锚（三层，U24——实跑逐字节 diff 经 refute 审计证伪：行携时间戳与 duration_ms、温度 0 端点非逐字节确定）**：① 单元层——固定时钟注入下 plain 行格式纯函数（`console_format`）黄金快照逐字节断言；② dry-run 层——examples **五目录八工程**（v1.13 起：text 两工程 / ui / stream 两工程 / mix 两工程 / synth-stream；v1.12 为四目录七工程）`--dry-run --console plain` 的 stderr 估算行（无时间戳字段）逐字节 diff 为空（**八个黄金文件**入库、离线套件逐运行钉死——`dryrun-mix.txt` / `dryrun-mix-text.txt` 为 v1.12 新增的 mix 主/姊妹双工程 golden，`dryrun-synth-stream.txt` 为 v1.13 新增的时间流生成工程 golden；**v1.13 的七个既有 golden 字节不动**——估算行格式零改动，三类生成调用全折入 `generate_calls`，3.10.3 时间流生成行；**2026-08-14 代码规则整改把八个黄金文件整体重冻结**到英文估算行与英文注记行上——键、键序、数值与行序全部不变，仅文案语言变，此后八文件继续逐字节钉死）；③ 实跑层——八工程实跑 stderr 归一化（时间戳/耗时/token/延迟/计数值 → 占位符，cargo 测试套 `[ELAPSED]` 遮蔽同法）后与基线**结构等价**（行序与固定文案逐字节一致）；`log_format="jsonl"` 下 stderr 逐行可解析且显式 rich 被拒并 WARN；降级注入：渲染 tick 抛异常 ⇒ 运行照常完成、退出码不变、恰一条 WARN、自动转 plain（rich 档下 emitter 已静态让位——余下 plain 进度/摘要行由渲染器以 `console_format` 续打，q 脱离同路径）；键盘：伪 TTY 注入键序断言 `q` 脱离 / `p` 暂停期日志照常 / termios 属性退出后逐字节复原 / cbreak 下 Ctrl-C 仍触发 SIGINT 优雅中断；协议：`listener=None` 路径零行为变化、全回调 O(1) 无 I/O。 |

@@ -60,7 +60,7 @@ v1.11 补两条边界规则：
 上面那段三重问题的输出，引擎是这么救的：
 
 1. **确定性修复层**：剥掉 ` ```json ` 围栏 → 取平衡花括号子串 → `json_repair` 修掉尾逗号。得到可解析对象——注意 `"intent": "writing"` 的枚举错误这一层管不了（它只管「能不能解析」，不看 Schema）；
-2. **jsonschema 校验层**：校验发现 1 条违规：`/intent: 期望为枚举 ["writing_assist", "qa", "translation", "chitchat", "other"] 之一，实际值为 "writing"` ⇒ 进 LLM 修复环；
+2. **jsonschema 校验层**：校验发现 1 条违规：`/intent: expected one of enum ["writing_assist", "qa", "translation", "chitchat", "other"], got "writing"` ⇒ 进 LLM 修复环；
 3. **LLM 修复环第 1 轮**：向 `repair_llm`（默认同调用方 profile）发一条修复消息（[违规清单] 就是 jsonschema 校验层渲染出的违规原文，只加序号、不改写）：
 
    ```
@@ -68,7 +68,7 @@ v1.11 补两条边界规则：
    （原文全文照贴）
 
    [违规清单]
-   1. /intent: 期望为枚举 ["writing_assist", "qa", "translation", "chitchat", "other"] 之一，实际值为 "writing"
+   1. /intent: expected one of enum ["writing_assist", "qa", "translation", "chitchat", "other"], got "writing"
 
    只输出修正后的 JSON。
    ```

@@ -188,6 +188,18 @@ class TestImageRefLoadBase64:
         _, b64 = ref.load_base64(max_px=64)  # long edge == max_px → untouched
         assert base64.b64decode(b64) == raw
 
+    def test_jpeg_downscale_converts_alpha_mode_to_rgb(self, tmp_path: Path):
+        # JPEG 不支持 alpha 通道：缩放路径必须先转 RGB 再编码，否则 Pillow 抛
+        # OSError（一个 RGBA 源 + 越界长边即触发该分支）。
+        p = tmp_path / "img.jpg"
+        Image.new("RGBA", (120, 60), (0, 128, 0, 255)).save(p, format="PNG")
+        ref = ImageRef(path=p, format="jpeg", size_bytes=p.stat().st_size)
+        media_type, b64 = ref.load_base64(max_px=60)
+        assert media_type == "image/jpeg"
+        with Image.open(io.BytesIO(base64.b64decode(b64))) as im:
+            assert im.format == "JPEG" and im.mode == "RGB"
+            assert im.size == (60, 30)
+
 
 # ── PipelineItem defaults / frozen-ness ─────────────────────────────────────
 
@@ -252,6 +264,15 @@ class TestFrozen:
 
     def test_usage_add(self):
         assert Usage(1, 2) + Usage(10, 20) == Usage(11, 22)
+
+    def test_usage_radd_supports_plain_sum(self):
+        # CONTRACTS 不变量第 4 条「Usage 可求和」：sum() 的隐式起始值是 int 0，
+        # __radd__ 只认这一个左操作数，其余返回 NotImplemented。
+        assert sum([Usage(1, 2), Usage(3, 4)]) == Usage(4, 6)
+        assert 0 + Usage(1, 2) == Usage(1, 2)
+        assert sum([], Usage()) == Usage(0, 0)          # 空表仍是合法的求和
+        with pytest.raises(TypeError):
+            "x" + Usage(1, 2)                           # type: ignore[operator]
 
 
 # ── v1.8: Status full set / Transition / sequence Record / stream envelopes ─
@@ -444,6 +465,13 @@ class TestDigestIsPoor:
 
     def test_text_modality_never_poor(self):
         assert digest_is_poor(_record()) is False
+
+    def test_ui_record_without_a_tree_is_poor(self):
+        # 第一析取支的边界：UI 模态但树整个缺席（配对缺件的残缺记录）恒判贫瘠，
+        # 不进入后面的可见文本扫描。
+        rec = Record(id="e" * 16, modality="ui", text=None, raw=None, ui_tree=None,
+                     image=None, ref=RecordRef("a/uitree_1.jsonl", None, 1, ()))
+        assert digest_is_poor(rec) is True
 
 
 def _tree(*nodes: UINode) -> UITree:

@@ -141,9 +141,7 @@ class StreamEngine:
         self.realize_no = 0
         self.noise_no = 0
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0, record=None,
-                                 user_treatment=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
         self.calls.append((profile, prompt, schema))
         props = schema["properties"]
         if "steps" in props:

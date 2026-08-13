@@ -52,6 +52,18 @@ class StitchStage(Stage):
     async def run(self, batch, ctx) -> list[PipelineItem]: ...   # 返回传入的同一列表（②c 状态改写
                                                                  #   + 幸存信封 Record 重绑）
 
+@dataclasses.dataclass(frozen=True)
+class ThreadCard:                          # 2026-08-14 收参：一张线索摘要卡的线索侧取值
+    index: int                             # 卡片在池中的 1 基编号（= 提示词里的线索编号）
+    task_name: str                         # 线索当前任务名；为空渲染占位符
+    members: Sequence[Record]              # 线索当前的全部成员帧，按会话序
+    span: tuple[int, int]                  # 线索的会话序跨度 [首, 尾]
+    fragment_count: int                    # 线索当前的碎片数
+
+def render_thread_card(card: ThreadCard, candidate_head: Record | None,
+                       cfg: ResolvedConfig) -> str
+                                       # 渲染一张开放线索摘要卡（逐行结构见下）；candidate_head
+                                       #   非 None 时追加「接续对」变更证据行（E5 判定对）
 def build_stitch_prompt(thread_cards: Sequence[str], candidate_card: str,
                         cfg: ResolvedConfig) -> PromptBundle
                                        # 3.16.4 模板的确定性组装；线索卡由调用方按最近活跃降序

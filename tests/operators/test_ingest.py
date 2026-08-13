@@ -130,7 +130,7 @@ def test_text_spec_example_ids_and_report(tmp_path):
     assert rep.missing_pair == 0 and rep.index_conflict == 0
     assert rep.bad_locations == [{
         "file": "ime-2026-06-30.jsonl", "line_no": 3, "index": None,
-        "reason": 'input.text_field "instruction" 未命中',
+        "reason": 'input.text_field "instruction" missed',
     }]
 
 
@@ -224,11 +224,11 @@ def test_text_invalid_utf8_line_is_bad_line(tmp_path):
     assert (rep.scanned, rep.ingested, rep.bad_input) == (3, 2, 1)
     assert rep.bad_locations == [{
         "file": "d.jsonl", "line_no": 2, "index": None,
-        "reason": "行不是合法 UTF-8",
+        "reason": "line is not valid UTF-8",
     }]
     ev, payload = rec_events.events[0]
     assert ev == "ingest.bad_line"
-    assert payload["line_no"] == 2 and payload["reason"] == "行不是合法 UTF-8"
+    assert payload["line_no"] == 2 and payload["reason"] == "line is not valid UTF-8"
     # no replacement character ever reaches a Record
     assert all("�" not in r.text for r in recs)
 
@@ -262,14 +262,14 @@ def test_text_null_hit_is_bad_line(tmp_path):
     write_jsonl(tmp_path / "in" / "d.jsonl", [{"text": None}])
     ing = Ingestor(cfg)
     # The only line is bad → the stream exhausts with zero valid records,
-    # which is itself an InputError (spec §2.4「无任何合法记录」→ exit 3).
-    with pytest.raises(InputError, match="无任何合法记录"):
+    # which is itself an InputError (spec §2.4 "no valid records" → exit 3).
+    with pytest.raises(InputError, match="no valid records"):
         list(ing.records())
     assert ing.report.bad_input == 1
     assert ing.report.ingested == 0
 
 
-# ── zero-valid-record guard（spec §2.4「无任何合法记录」→ exit 3）────────────
+# ── zero-valid-record guard（spec §2.4 "no valid records" → exit 3）────────────
 
 def test_text_all_lines_miss_text_field_raises(tmp_path):
     # The empirical footgun this guard exists for: a wrong input.text_field
@@ -279,7 +279,7 @@ def test_text_all_lines_miss_text_field_raises(tmp_path):
     write_jsonl(tmp_path / "in" / "d.jsonl",
                 [{"query": "今天天气怎么样"}, {"query": "在吗"}])
     ing = Ingestor(cfg)
-    with pytest.raises(InputError, match="无任何合法记录"):
+    with pytest.raises(InputError, match="no valid records"):
         list(ing.records())
     assert (ing.report.scanned, ing.report.ingested, ing.report.bad_input) == (2, 0, 2)
 
@@ -289,7 +289,7 @@ def test_text_empty_file_raises_no_valid_records(tmp_path):
     (tmp_path / "in").mkdir()
     (tmp_path / "in" / "d.jsonl").write_text("\n\n", encoding="utf-8")
     ing = Ingestor(cfg)
-    with pytest.raises(InputError, match="无任何合法记录"):
+    with pytest.raises(InputError, match="no valid records"):
         list(ing.records())
     assert (ing.report.scanned, ing.report.ingested) == (0, 0)
 
@@ -312,7 +312,7 @@ def test_ui_all_pairs_missing_counterpart_raises(tmp_path):
     (root / "uitree_1.jsonl").write_text('{"id": "0", "class": "V"}\n', encoding="utf-8")
     (root / "uitree_2.jsonl").write_text('{"id": "0", "class": "V"}\n', encoding="utf-8")
     ing = Ingestor(cfg)
-    with pytest.raises(InputError, match="无任何合法记录"):
+    with pytest.raises(InputError, match="no valid records"):
         list(ing.records())
     assert ing.report.missing_pair == 2
     assert ing.report.ingested == 0
@@ -419,7 +419,7 @@ def test_ui_same_index_in_different_subdirs_is_conflict(tmp_path):
     rec_events = EventRecorder()
     ing.metrics = rec_events
     # The conflicted index is the only candidate → zero valid records → InputError.
-    with pytest.raises(InputError, match="无任何合法记录"):
+    with pytest.raises(InputError, match="no valid records"):
         list(ing.records())
     rep = ing.report
     assert rep.index_conflict == 1 and rep.bad_input == 1 and rep.scanned == 1
@@ -439,7 +439,7 @@ def test_ui_png_plus_jpg_same_index_is_conflict(tmp_path):
     (root / "image_7.jpg").write_bytes(JPEG_MAGIC + b"x")
     ing = Ingestor(cfg)
     # The sole index is skipped as a conflict → zero valid records → InputError.
-    with pytest.raises(InputError, match="无任何合法记录"):
+    with pytest.raises(InputError, match="no valid records"):
         list(ing.records())
     assert ing.report.index_conflict == 1
     assert ing.report.ingested == 0
@@ -543,7 +543,7 @@ def test_ui_bad_magic_is_bad_record(tmp_path):
     put_pair(root, 1, image_bytes=b"GIF89a not a png")
     ing = Ingestor(cfg)
     # The only pair is a bad record → zero valid records → InputError.
-    with pytest.raises(InputError, match="无任何合法记录"):
+    with pytest.raises(InputError, match="no valid records"):
         list(ing.records())
     assert ing.report.bad_input == 1
     assert ing.report.ingested == 0
@@ -761,7 +761,7 @@ def test_scan_missing_pair_fail_raises_early(tmp_path):
     root = make_ui_dir(tmp_path)
     (root / "uitree_1.jsonl").write_text('{"id": "0", "class": "V"}\n', encoding="utf-8")
     ing = Ingestor(cfg)
-    with pytest.raises(InputError, match="缺对"):
+    with pytest.raises(InputError, match="missing pair"):
         ing.scan()
 
 
@@ -960,7 +960,7 @@ def test_same_key_disorder_skipped_and_counted(tmp_path):
     assert [s.cause for s in sessions] == ["key", "eof"]
     assert [len(s.records) for s in sessions] == [2, 2]
     assert [loc["line_no"] for loc in rep.bad_locations] == [3, 6]
-    assert all(loc["reason"].startswith("乱序：") for loc in rep.bad_locations)
+    assert all(loc["reason"].startswith("out of order:") for loc in rep.bad_locations)
     disorder_events = [p for ev, p in rec.events if ev == "ingest.disorder"]
     assert len(disorder_events) == 2
 
@@ -976,8 +976,8 @@ def test_timestamp_parse_failure_walks_disorder_path(tmp_path):
     assert ing.report.disorder == 2
     assert [len(s.records) for s in sessions] == [2]
     reasons = [loc["reason"] for loc in ing.report.bad_locations]
-    assert all(r.startswith("时间戳解析失败：") for r in reasons)
-    assert "字段缺失" in reasons[0]
+    assert all(r.startswith("timestamp parse failure:") for r in reasons)
+    assert "field missing" in reasons[0]
     assert "next tuesday" in reasons[1]                # timestamp value may enter reason
 
 
@@ -1097,7 +1097,7 @@ def test_cause_limit_flushes_tail_and_warns_once(tmp_path, caplog):
     assert ing.report.sessions == 1
     # D3: the WARN states budget exhaustion, never claims truncation (exact
     # exhaustion at EOF is indistinguishable without an extra pull).
-    warns = [r for r in caplog.records if "--limit 预算耗尽处闭合" in r.message]
+    warns = [r for r in caplog.records if "--limit budget was exhausted" in r.message]
     assert len(warns) == 1
     # frame-level limit: only 3 records were ever consumed from the parse stream
     assert ing.report.ingested == 3
@@ -1110,7 +1110,7 @@ def test_limit_not_reached_is_plain_eof(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger=".".join(("labelkit", "ingest"))):
         sessions = list(ing.sessions())
     assert [s.cause for s in sessions] == ["eof"]
-    assert not [r for r in caplog.records if "截断" in r.message]
+    assert not [r for r in caplog.records if "--limit budget" in r.message]
 
 
 def test_text_input_order_file_boundary_closes_session(tmp_path):
@@ -1351,7 +1351,7 @@ def test_ingest_disorder_event_payload_text(tmp_path):
     (payload,) = [p for ev, p in rec.events if ev == "ingest.disorder"]
     assert set(payload) == {"file", "line_no", "reason"}
     assert payload["file"] == "d.jsonl" and payload["line_no"] == 2
-    assert payload["reason"].startswith("乱序：")
+    assert payload["reason"].startswith("out of order:")
     assert "90" in payload["reason"]                   # timestamp values may appear
 
 

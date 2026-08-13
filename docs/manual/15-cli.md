@@ -36,13 +36,13 @@ v1.13 的时间流生成（第 27 章）在这一行里没有新键——蓝图�
 ```
 dry-run: mode=generate_only estimated_records=6 batches=1
 dry-run: estimated LLM calls — generate_calls=13 segment_calls=0 stitch_calls=0 classify_calls=0 frame_classify_calls=0 extract_calls=0 quality_calls=24 annotate_calls=6 frame_annotate_calls=0 verify_calls=6 total=49 (excludes retries and repair calls)
-dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界
+dry-run: note: estimated with global config / multi reports a lower bound at label multiplier 1
 dry-run: no LLM calls made, no output written (report only)
 ```
 
 对着配置验算：`generate_calls = 2 × 6 序列 + ⌈2 噪音帧 / num_per_call 4⌉ = 13`、`estimated_records = Σsequences = 6`、`quality_calls = 6 × 4 准则`、`classify_calls = 0`（标签生成期已知、继承，零判决调用）。**这不是上界口径**：估算分支复用生成算子的计划期纯函数（吃同一个 `seed` 与配置），序列长度、噪音帧数、会话装箱都按真实抽签复演一遍——与流模式那种「按会话数报下界」的估算不是一回事（真跑对账见第 27 章 27.9）。
 
-注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），`segment_calls` / `extract_calls` 是 v1.8 新增字段（时序流，第 25 章），`stitch_calls` 是 v1.9 新增字段（线索缝合，第 26 章），`frame_classify_calls` / `frame_annotate_calls` 是 v1.12 新增字段（流模式帧粒度，第 25 章），未启用恒为 0；流模式下 quality/annotate/verify 的估算以「episode 数 ≈ 会话数」报**下界**、extract 按剔噪前帧数报**上界**（估算公式与真实对账见第 25 章）；帧粒度两键按预扫描帧总数报**粗上界**——帧分类实付每 episode 一次批量判决（且住 dedup 之后，重复 episode 零调用）、帧标注实付过质量门的成员数，实跑对账看 `report.stream` 的两个帧子块（第 8 章，成本账见第 25 章 25.6）；v1.11 起 `segment_calls` 的语义随预算而变——`segment.llm` 所指 profile 声明了 `context_window`（第 6 章）时，估算公式的窗宽取 `min(window, w_min)`（w_min = 预算保证每窗至少装下的帧数），实际装填每窗只多不少、窗数只少不多，故报的是**最坏装填上界**（实际窗数事后看 `report.stream.windows` 对账），且 w_min 小于 window 时 stream 注记行会追加一句「segment 按预算最坏装填报上界」；未声明预算或 w_min ≥ window 时公式与数值同 v1.10。`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。后两种情况 stderr 都会多打一行注记（`dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界`）。
+注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），`segment_calls` / `extract_calls` 是 v1.8 新增字段（时序流，第 25 章），`stitch_calls` 是 v1.9 新增字段（线索缝合，第 26 章），`frame_classify_calls` / `frame_annotate_calls` 是 v1.12 新增字段（流模式帧粒度，第 25 章），未启用恒为 0；流模式下 quality/annotate/verify 的估算以「episode 数 ≈ 会话数」报**下界**、extract 按剔噪前帧数报**上界**（估算公式与真实对账见第 25 章）；帧粒度两键按预扫描帧总数报**粗上界**——帧分类实付每 episode 一次批量判决（且住 dedup 之后，重复 episode 零调用）、帧标注实付过质量门的成员数，实跑对账看 `report.stream` 的两个帧子块（第 8 章，成本账见第 25 章 25.6）；v1.11 起 `segment_calls` 的语义随预算而变——`segment.llm` 所指 profile 声明了 `context_window`（第 6 章）时，估算公式的窗宽取 `min(window, w_min)`（w_min = 预算保证每窗至少装下的帧数），实际装填每窗只多不少、窗数只少不多，故报的是**最坏装填上界**（实际窗数事后看 `report.stream.windows` 对账），且 w_min 小于 window 时 stream 注记行会追加一句 `; segment reports an upper bound at worst-case budget packing`；未声明预算或 w_min ≥ window 时公式与数值同 v1.10。`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。后两种情况 stderr 都会多打一行注记（`dry-run: note: estimated with global config / multi reports a lower bound at label multiplier 1`）。
 
 ## 15.2 `labelkit validate`：只体检不跑车
 
@@ -51,18 +51,18 @@ labelkit validate --config <config.toml> --project <project.toml> [--probe]
                   [--console auto|rich|plain]
 ```
 
-执行 M1 全量校验（TOML 语法、字段类型、profile 引用、Schema 元校验、rubric 校验、few-shot 示例校验、环境变量存在性），**校验通过输出 `配置校验通过`，退出码 0；不通过退出码 2**，且所有错误一次性列全：
+执行 M1 全量校验（TOML 语法、字段类型、profile 引用、Schema 元校验、rubric 校验、few-shot 示例校验、环境变量存在性），**校验通过输出 `configuration valid`，退出码 0；不通过退出码 2**，且所有错误一次性列全：
 
 ```
-ConfigError: 2 个配置错误（全量聚合反馈）
-project.toml:[run].output: 缺失必填键，期望字符串（可用 CLI --output 提供）
-project.toml:[quality].llm: 引用的 profile "gpt4" 不存在于 config.toml [llm.*]，可用：default、judge
+ConfigError: 2 config error(s) (all aggregated)
+project.toml:[run].output: missing required key, expected string (may be supplied by CLI --output)
+project.toml:[quality].llm: referenced profile "gpt4" does not exist in config.toml [llm.*], available: default, judge
 ```
 
 `--probe` 追加连通性探测：对每个**被实际引用**的 profile 发一次 1-token 试调用（没被任何启用算子引用的 profile 不探测、也不要求密钥存在）：
 
 ```
-配置校验通过
+configuration valid
 probe default: ok model=glm-5.2 latency_ms=7291
 probe judge: FAIL HTTP 401: {"error":{"message":"token expired or incorrect",...}}
 ```
@@ -160,7 +160,7 @@ uv run labelkit run ... --strict; echo "exit=$?"
 - **结束摘要**：与 report.counts 逐项一致的终版对账单（plain 档为下方的文本版；rich 档为定格终版面板里的表格，数值同源）。
 
 ```
-   ── 终版摘要（与 report.counts 逐项一致）──
+   ── final summary (matches report.counts item by item) ──
    scanned=14  ingested=14  bad_input=0  generated=12
    dropped_dup=1  dropped_lowq=10  dropped_verify=0  failed=0  emitted=15
 ```

@@ -1,49 +1,34 @@
-"""M10 orchestrator (spec 3.10, CONTRACTS.md §7.9).
+"""M10 编排器（spec 3.10、CONTRACTS.md §7.9）。
 
-Pure composition/scheduling — zero business logic, no direct LLM calls, no file
-writes (M11 owns the output channels). Responsibilities:
+纯编排/调度——零业务逻辑、不直接发 LLM 调用、不写文件（输出通道属主是 M11）。职责：
 
-- slice the M2 record stream (or the M6 generate_all output in generate_only
-  mode) into batches of ``run.batch_size``; in stream mode (v1.8,
-  ``segment.enabled``) consume the M2 session-stream view instead and pack
-  WHOLE sessions per batch by next-fit — one open bin, oversized sessions
-  hard-split (S21) — stamping ``session_id`` on frame envelopes (S4);
-- compose the per-batch stage chain from the config switches (2.3.1 matrix) in
-  the canonical order segment → stitch → dedup → classify → extract →
-  quality → generate → annotate → verify (the v1.9 single superset tuple;
-  segment, stitch and extract default off, degrading byte-identically to the
-  v1.7 chain);
-- meter ``counts.fanout`` / ``counts.episodes`` as the len-delta across the
-  classify / segment stage (v1.7 R9 / v1.8 §7.9 — ``counts.*`` ownership stays
-  with M10; M13/M14 append siblings/episodes in place); tally
-  ``counts.stitched`` post-emit and derive ``counts.threads`` as
-  episodes − stitched (v1.9 T7 single-point derivation);
-- schedule the single-round generation re-flow (sub-batches re-enter at M3,
-  never at M6 — no recursion);
-- drive per-batch lifecycle: fresh RunContext per (batch, stage), emit via M11,
-  flush trace, then drop every batch intermediate (memory release);
-- aggregate run-level stats into the §9.3 report structure and hand it to
-  ``Emitter.finalize``;
-- circuit-breaker handling (``CircuitBreakerTripped`` → exit code 4, report
-  written, ``.part`` NOT renamed) and SIGINT/SIGTERM graceful interruption;
-- ``--limit`` truncation and ``--dry-run`` (M1/M2 + static call/cost estimate
-  on stderr, no LLM calls, no main output/rejects — report and, when
-  ``trace.enabled``, the trace channel only);
-- v1.10 console bypass (spec 3.10.3 console row, SPEC-tui-console U11/U13/U17/
-  U19/U20): ``estimate_run(cfg, plan)`` exported as a module-level pure
-  function (dry-run and the renderer's batch denominators share it), the live
-  ``metrics.run_estimate`` emission reusing the P2-4 pre-scan (NEVER a second
-  scan), ``metrics.stage_begin`` before every stage.run, ``stop_requested``
-  forwarding, and the rich-mode dry-run print yield. All of it is a no-op
-  when no ProgressListener is attached (byte-identical to v1.9);
-- v1.11 context budget (spec 3.10.3 上下文预算 row, SPEC-context-budget
-  V12/V13/V19): ``estimate_run`` clamps the segment window argument to
-  ``budget.min_window(cfg)`` (upper-bound semantics), every dispatched batch —
-  and finalize, once more — freezes ``llm.calibrator`` (the F8 batch-frozen
-  calibration snapshot), report assembly adds the ``budget`` node and
-  ``report.stream.windows``, and run startup logs the data-free budget INFO
-  line(s). All of it gates on a declared ``context_window`` so all-undeclared
-  configs keep v1.10 behavior byte-identical.
+- 把 M2 记录流（generate_only 模式下是 M6 generate_all 的产物）按 ``run.batch_size``
+  切批；流模式（v1.8，``segment.enabled``）改消费 M2 会话流视图，按 next-fit **整会话**
+  装箱——仅一只开口箱、超长会话硬切（S21）——并在帧信封上盖章 ``session_id``（S4）；
+- 按配置开关（2.3.1 矩阵）以规范链序 segment → stitch → dedup → classify → extract →
+  quality → generate → annotate → verify 组链（v1.9 单一超集元组；segment/stitch/extract
+  默认关，关闭时逐字节退化为 v1.7 链）；
+- 以 classify / segment 阶段前后的 len 差值计量 ``counts.fanout`` / ``counts.episodes``
+  （v1.7 R9 / v1.8 §7.9——``counts.*`` 所有权归 M10，M13/M14 只就地追加信封）；post-emit
+  清点 ``counts.stitched``，并以 episodes − stitched 单点导出 ``counts.threads``（v1.9 T7）；
+- 调度单轮生成再流转（子批自 M3 重新入链，绝不回到 M6——不递归）；
+- 驱动每批生命周期：每 (批, 阶段) 新建 RunContext、经 M11 落盘、冲洗 trace，然后丢弃全部
+  批内中间态（内存释放）；
+- 汇总运行级统计为 §9.3 报表结构并交给 ``Emitter.finalize``；
+- 熔断处理（``CircuitBreakerTripped`` → 退出码 4，报告照写，``.part`` 不改名）与
+  SIGINT/SIGTERM 优雅中断；
+- ``--limit`` 截断与 ``--dry-run``（M1/M2 + stderr 静态调用/成本估算，零 LLM 调用、无主
+  输出与 rejects——只有报告，以及 ``trace.enabled`` 时的 trace 通道）；
+- v1.10 console 旁路（spec 3.10.3 console 行，SPEC-tui-console U11/U13/U17/U19/U20）：
+  ``estimate_run(cfg, plan)`` 作为模块级纯函数导出（dry-run 与渲染器批级分母共用）、live
+  路径复用 P2-4 预扫描发 ``metrics.run_estimate``（绝不二次 scan）、每次 stage.run 前发
+  ``metrics.stage_begin``、``stop_requested`` 转发、rich 档 dry-run 打印让位。未挂
+  ProgressListener 时以上全为 no-op（与 v1.9 逐字节一致）；
+- v1.11 上下文预算（spec 3.10.3 上下文预算行，SPEC-context-budget V12/V13/V19）：
+  ``estimate_run`` 把 segment 窗宽实参钳到 ``budget.min_window(cfg)``（上界语义）、每批派发
+  后（以及 finalize 再一次）冻结 ``llm.calibrator``（F8 批冻结校准快照）、报表增 ``budget``
+  节与 ``report.stream.windows``、启动期打印数据无关的预算 INFO 行。以上全部以「声明了
+  ``context_window``」为门，全未声明的配置与 v1.10 行为逐字节一致。
 """
 from __future__ import annotations
 
@@ -74,28 +59,24 @@ if TYPE_CHECKING:
     from labelkit.operators.emitter import Emitter
     from labelkit.operators.ingest import IngestPlan, Ingestor
 
-# Event names — exact strings per CONTRACTS.md §7.11/§8.1 (mirrors the
-# ``labelkit.common.observability.obslog`` constants; literals here avoid a
-# runtime import and remain test-asserted against the contract.
+# 事件名——逐字对齐 CONTRACTS.md §7.11/§8.1（镜像
+# ``labelkit.common.observability.obslog`` 的常量；此处用字面量避免运行时导入，
+# 并由测试对着契约反查）。
 _EV_RUN_START = "run.start"
 _EV_RUN_END = "run.end"
 _EV_BATCH_START = "batch.start"
 _EV_BATCH_END = "batch.end"
 
-# Canonical pipeline order (spec §2.2 / CONTRACTS.md §2/§7.9): the v1.9 SINGLE
-# SUPERSET TUPLE — v1.7 inserted classify right after dedup; v1.8 prepended
-# segment and slotted extract between classify and quality; v1.9 slots stitch
-# between segment and dedup (T5). segment/stitch/extract are default OFF, so
-# the effective chain degrades byte-identically to the v1.7 six-name form
-# (generate and segment are mutually exclusive per M1, so the two never
-# co-occupy the chain).
+# 规范链序（spec §2.2 / CONTRACTS.md §2/§7.9）：v1.9 的**单一超集元组**——v1.7 把
+# classify 插在 dedup 之后；v1.8 前置 segment 并把 extract 排在 classify 与 quality
+# 之间；v1.9 把 stitch 排在 segment 与 dedup 之间（T5）。segment/stitch/extract 默认关，
+# 故有效链逐字节退化为 v1.7 的六名形（generate 与 segment 按 M1 互斥，两者永不同链）。
 _CHAIN_ORDER = ("segment", "stitch", "dedup", "classify", "extract", "quality",
                 "generate", "annotate", "verify")
 
-# v1.8 closed vocabularies (§9.3 report zero-based histograms) — must equal the
-# schema_engine enums: action_schema() action_type 11 values (S15) and
-# defect_verdict_schema() defect kind 6 values (S31; v1.9 T15 appends
-# wrong_stitch).
+# v1.8 闭集词表（§9.3 报表零基直方图）——必须等于 schema_engine 的枚举：
+# action_schema() 的 action_type 11 值（S15）与 defect_verdict_schema() 的 defect
+# kind 6 值（S31；v1.9 T15 追加 wrong_stitch）。
 _ACTION_TYPES = ("click", "long_press", "input_text", "scroll", "drag", "open_app",
                  "app_switch", "navigate_back", "navigate_home", "wait", "other")
 _DEFECT_KINDS = ("label_mismatch", "off_task_members", "missing_head",
@@ -103,23 +84,50 @@ _DEFECT_KINDS = ("label_mismatch", "off_task_members", "missing_head",
 
 _log = logging.getLogger("labelkit.orchestrator")
 
-# report.json quality.aggregate_histogram bucket labels — frozen (§9.3).
+# report.json 的 quality.aggregate_histogram 桶标签——冻结（§9.3）。
 _HIST_LABELS = tuple(f"{i / 10:.1f}-{(i + 1) / 10:.1f}" for i in range(10))
 
 _SCHEMA_STATS_ZERO = {"l0_or_clean": 0, "l1": 0, "l3_1": 0, "l3_2": 0, "rejected": 0}
 
+# estimate_run 返回字典里十个调用数键的**冻结键序**（v1.12 起 frame_classify_calls
+# 紧跟 classify_calls、frame_annotate_calls 紧跟 annotate_calls）；total_calls 恒等于
+# 这十项之和。records / batches 两键在其前，total_calls 在其后。
+_ESTIMATE_CALL_ORDER = ("generate_calls", "segment_calls", "stitch_calls",
+                        "classify_calls", "frame_classify_calls", "extract_calls",
+                        "quality_calls", "annotate_calls", "frame_annotate_calls",
+                        "verify_calls")
+
+# 时序流五键的零值底盘（非流分支恒取此值）。
+_STREAM_CALLS_ZERO = {"segment_calls": 0, "stitch_calls": 0, "extract_calls": 0,
+                      "frame_classify_calls": 0, "frame_annotate_calls": 0}
+
+# post-emit 状态清点中从 failed 兜底公式里扣除的终态（v1.8 增 absorbed /
+# dropped_noise，v1.9 增 stitched——不扣除则这些终态信封被误计为 failed）；
+# 顺序即 counts.* 的落账顺序。
+_DEDUCTED_STATUSES = ("dropped_dup", "dropped_lowq", "dropped_verify",
+                      "absorbed", "dropped_noise", "stitched")
+
 
 def _ceil_div(a: int, b: int) -> int:
+    """向上取整除法（除数非正时返回 0）。
+
+    @param a: 被除数
+    @param b: 除数
+    @return: ``ceil(a / b)``；``b <= 0`` 时返回 0
+    """
     return -(-a // b) if b > 0 else 0
 
 
 def _pack_next_fit(session_lens: Sequence[int],
                    batch_size: int) -> tuple[list[int], list[int]]:
-    """Next-fit packing simulation over session lengths — mirrors
-    ``_run_process_stream`` exactly, so the dry-run batch count is EXACT
-    (S21/S22). Returns (frames per batch, session pieces per batch); an
-    oversized session hard-splits into ``batch_size`` slices, each its own
-    batch."""
+    """会话长度序列的 next-fit 装箱空跑——与 ``_run_process_stream`` 逐条同构，
+    故 dry-run 批数是**精确值**（S21/S22）。超长会话硬切成 ``batch_size`` 片，每片
+    自成一批。
+
+    @param session_lens: 按到达序的会话帧数序列
+    @param batch_size: 批容量（帧）
+    @return: (每批帧数, 每批会话片数)
+    """
     frames: list[int] = []
     pieces: list[int] = []
     open_frames = open_pieces = 0
@@ -148,230 +156,303 @@ def _pack_next_fit(session_lens: Sequence[int],
     return frames, pieces
 
 
-def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
-    """Static record / LLM-call estimate — v1.10 (U20): the former
-    ``Orchestrator._estimate`` body exported as a MODULE-LEVEL PURE FUNCTION
-    over (cfg, plan), shared by dry-run, the live ``metrics.run_estimate``
-    emission and the renderer's per-batch denominators. ``plan`` is the M2
-    scan result (``IngestPlan``); generate_only passes None (the 3.6.2
-    call-count formulas are static, no scan). Key names are frozen.
+@dataclass(frozen=True)
+class _EstimateScale:
+    """静态估算的规模量——``estimate_run`` 的中间产物，仅本模块内部使用。"""
 
-    generate_only follows the 3.6.2 call-count formulas; process mode uses
-    the plan's scan estimate. All estimates assume no drops (upper bound) and
-    exclude retries/repairs.
-    v1.7 R11: classify_calls = ingested × max(1, sc) in process mode
-    (re-flow sub-batches inherit their classification and skip M13),
-    <generated records> × max(1, sc) in generate_only.
-    v1.8 S22 (stream mode): the session table comes from
-    ``plan.session_lens``; ``segment_calls = Σ ceil((L−1)/(w_eff−1))``
-    over sessions of length L ≥ 2 (L = 1 or strategy="rules" counts 0),
-    where — v1.11 V12 (spec 3.10.3 时序流行) — ``w_eff =
-    min(segment.window, budget.min_window(cfg))``, the worst-case
-    guaranteed packing size (UPPER bound: every actual window packs
-    ≥ w_min frames, so actual windows ≤ estimate; prior-based — V19
-    calibration past the prior or V20 overflow splits relax it back to
-    the "excludes retries/repairs" approximation family above; budget
-    undeclared ⇒ w_min == window, formula and values byte-identical to
-    v1.10); ``extract_calls = Σ (L−1)`` (extract enabled; UPPER bound); the
-    classify/quality/annotate/verify record base is ``len(session_lens)``
-    (episodes ≈ sessions, LOWER bound — stderr note in _run_dry); the batch
-    count comes EXACTLY from a next-fit packing simulation of the session
-    sizes, and the pairwise-quality per-batch pool sizes are the packed
-    sessions per batch. The non-stream branch is unchanged.
-    v1.12（spec §3.7 estimate_run 行）：``frame_classify_calls`` /
-    ``frame_annotate_calls`` = 预扫描帧总数 Σ session_lens 的粗上界（数据源与
-    ``segment_calls`` 完全同源；帧分类实际按窗批量、帧标注跳过噪声成员，均 ≤
-    帧总数），对应开关关闭 ⇒ 0；两键并入 ``total_calls``。键序冻结：
-    frame_classify_calls 紧跟 classify_calls，frame_annotate_calls 紧跟
-    annotate_calls。
-    v1.13（裁决·估算精确复演）：``generate_stream.enabled`` 时 generate_only 分支
-    改走 M6 计划期纯函数的精确复演——records = Σsequences（limit 后）、
-    generate_calls = 2 × Σsequences + ⌈噪音帧数/num_per_call⌉（蓝图/实现/噪音全
-    折入既有键，行格式零改动）、classify_calls = 0（inherited 零调用）、quality/
-    annotate/verify 基数 = Σsequences、batches = ceil(records / batch_size)。"""
+    total_records: int                             # 进链记录总数（摄取 + 生成）
+    ingested: int                                  # 摄取记录数（generate_only 恒 0）
+    generated: int                                 # 生成记录数
+    generate_calls: int                            # 生成调用数
+    batches: int                                   # 批次数
+    pools: list[int]                               # 每批 pairwise 评审池大小
+    downstream_base: int                           # quality/annotate/verify 的记录基数
+    stream_calls: dict                             # 时序流五键调用数（非流分支全 0）
+
+
+@dataclass(frozen=True)
+class _CounterView:
+    """报表组装期的计数器只读视图——一次快照供各分节共读，避免组装中途漂移。"""
+
+    values: Mapping                                # 计数器键 → 累计值的快照
+
+    def __call__(self, key: str) -> int:
+        """读一个计数器。
+
+        @param key: 计数器键名
+        @return: 累计值；键缺席记 0
+        """
+        return int(self.values.get(key, 0))
+
+
+def _estimate_generate_only(cfg: "ResolvedConfig") -> tuple[int, int]:
+    """generate_only 模式的生成量估算（3.6.2 量公式，静态、无需 scan）。
+
+    v1.13（裁决·估算精确复演）：``generate_stream.enabled`` 时改走 M6 计划期纯函数吃
+    cfg + seed 的**精确复演**（非上界）——records = Σsequences（limit 后）、
+    generate_calls = 蓝图 + 实现（各一序列一次）+ 噪音批 ⌈噪音帧数/num_per_call⌉（三类
+    调用全折入 generate_calls，行格式零改动）。orchestration → operators 是既定依赖
+    方向（懒导入）。
+
+    @param cfg: 已解析配置
+    @return: (生成调用数, 生成记录数)
+    """
     g = cfg.generate
+    if cfg.generate_stream.enabled:
+        from labelkit.operators.generate import plan_stream
+        stream_plan = plan_stream(cfg, random.Random(f"{cfg.run.seed}:0:generate"))
+        records = len(stream_plan.sequences)
+        return 2 * records + len(stream_plan.noise_plans), records
+    if g.seed_examples:
+        calls = _ceil_div(len(g.seed_examples) * g.num_per_record, g.num_per_call)
+    else:
+        calls = _ceil_div(g.standalone_count or 0, g.num_per_call)
+    if cfg.limit is not None:
+        calls = min(calls, _ceil_div(cfg.limit, g.num_per_call))
+    records = calls * g.num_per_call
+    if cfg.limit is not None:
+        records = min(records, cfg.limit)
+    return calls, records
+
+
+def _estimate_inline_generate(cfg: "ResolvedConfig", n_ingested: int) -> tuple[int, int]:
+    """process 模式下在链内 generate 工位的生成量估算（关闭时全 0）。
+
+    @param cfg: 已解析配置
+    @param n_ingested: 摄取记录数（已按 ``--limit`` 截断）
+    @return: (生成调用数, 生成记录数)
+    """
+    g = cfg.generate
+    if not g.enabled:
+        return 0, 0
+    calls = _ceil_div(n_ingested * g.num_per_record, g.num_per_call)
+    return calls, calls * g.num_per_call
+
+
+def _estimate_stream_calls(cfg: "ResolvedConfig",
+                           session_lens: Sequence[int]) -> dict:
+    """时序流五键（segment/stitch/extract/帧分类/帧标注）的调用数估算。
+
+    ``segment_calls = Σ ceil((L−1)/(w−1))``（L ≥ 2 的会话求和；L = 1 或
+    ``strategy="rules"`` 计 0），其中 v1.11 V12 起 ``w = min(segment.window,
+    budget.min_window(cfg))``——最坏保证装填量（**上界**语义：实际每窗装填 ≥ w_min 帧，
+    故实际窗数 ≤ 估算）。min_window 按设计**不自带上限**（M1 的 V9 护栏要用原始预算导出
+    值），故在**本调用点**钳到窗宽上限；预算未声明 ⇒ min_window 返回 window ⇒ 数值与
+    v1.10 逐字节一致（V26 的 examples 声明的实效窗足够大，w_min > window，八个 dry-run
+    golden 不动）。``stitch_calls``（v1.9 T16 估算，沿用 S22 的 episodes ≈ sessions 下界
+    基数）= 每 episode 候选一次判断 × votes 采样 × repass 开启时翻倍。``extract_calls =
+    Σ(L−1)``（上界）。v1.12 帧粒度两键 = 预扫描帧总数 Σ session_lens 的粗上界（与
+    segment_calls 完全同源；帧分类实际按窗批量、帧标注跳过噪声成员，均 ≤ 帧总数）。
+
+    @param cfg: 已解析配置
+    @param session_lens: 预扫描得到的会话帧数序列
+    @return: 五键调用数字典（对应开关关闭 ⇒ 该键 0）
+    """
+    calls = dict(_STREAM_CALLS_ZERO)
+    if cfg.segment.strategy in ("llm", "hybrid"):
+        w = min(cfg.segment.window, budget.min_window(cfg))
+        calls["segment_calls"] = sum(_ceil_div(length - 1, w - 1)
+                                     for length in session_lens if length >= 2)
+    if cfg.stitch.enabled:
+        calls["stitch_calls"] = (len(session_lens) * cfg.stitch.votes
+                                 * (2 if cfg.stitch.repass else 1))
+    if cfg.extract.enabled:
+        calls["extract_calls"] = sum(length - 1 for length in session_lens)
+    if cfg.frame_classify.enabled:
+        calls["frame_classify_calls"] = sum(session_lens)
+    if cfg.frame_annotate.enabled:
+        calls["frame_annotate_calls"] = sum(session_lens)
+    return calls
+
+
+def _estimate_scale(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> _EstimateScale:
+    """算出估算的规模量：记录数、批数、评审池、下游基数、生成量与时序流调用数。
+
+    v1.8 流模式（segment × generate_only 被 M1 禁止，故这里的 plan 恒为 process 模式的
+    扫描结果）：会话表 → **精确**批数（next-fit 空跑），episodes ≈ sessions 作为下游记录
+    基数（**下界**，stderr 另有注记），pairwise 每批池大小 = 该批装入的会话片数。
+
+    @param cfg: 已解析配置
+    @param plan: M2 扫描结果；generate_only 传 None
+    @return: 规模量聚合对象
+    @raises AssertionError: process 模式未提供扫描结果
+    """
+    n_ingested = 0
     if cfg.run.mode == "generate_only":
-        n_ingested = 0
-        if cfg.generate_stream.enabled:
-            # v1.13（裁决·估算精确复演）：复用 M6 计划期纯函数吃 cfg + seed 精确
-            # 复演长度/噪音采样（非上界）——records = Σsequences（limit 后）、
-            # generate_calls = 蓝图 + 实现（各一序列一次）+ 噪音批
-            # ⌈噪音帧数/num_per_call⌉（三类调用全折入 generate_calls，行格式
-            # 零改动）。orchestration → operators 是既定依赖方向（懒导入）。
-            from labelkit.operators.generate import plan_stream
-            stream_plan = plan_stream(cfg, random.Random(f"{cfg.run.seed}:0:generate"))
-            gen_records = len(stream_plan.sequences)
-            gen_calls = 2 * gen_records + len(stream_plan.noise_plans)
-        elif g.seed_examples:
-            gen_calls = _ceil_div(len(g.seed_examples) * g.num_per_record, g.num_per_call)
-        else:
-            gen_calls = _ceil_div(g.standalone_count or 0, g.num_per_call)
-        if not cfg.generate_stream.enabled:
-            if cfg.limit is not None:
-                gen_calls = min(gen_calls, _ceil_div(cfg.limit, g.num_per_call))
-            gen_records = gen_calls * g.num_per_call
-            if cfg.limit is not None:
-                gen_records = min(gen_records, cfg.limit)
+        gen_calls, gen_records = _estimate_generate_only(cfg)
     else:
         assert plan is not None, "process-mode estimate requires an IngestPlan"
         n_ingested = plan.estimated_records
         if cfg.limit is not None:
             n_ingested = min(n_ingested, cfg.limit)
-        if g.enabled:
-            gen_calls = _ceil_div(n_ingested * g.num_per_record, g.num_per_call)
-            gen_records = gen_calls * g.num_per_call
-        else:
-            gen_calls = gen_records = 0
+        gen_calls, gen_records = _estimate_inline_generate(cfg, n_ingested)
 
     total_records = n_ingested + gen_records
     bs = cfg.run.batch_size
-    sizes = [bs] * (total_records // bs)
+    pools = [bs] * (total_records // bs)
     if total_records % bs:
-        sizes.append(total_records % bs)
-
-    # v1.8 stream mode (segment × generate_only is M1-forbidden, so plan is
-    # always the process-mode scan here): sessions → exact batches,
-    # episodes ≈ sessions as the downstream record base.
-    segment_calls = 0
-    stitch_calls = 0
-    extract_calls = 0
-    frame_classify_calls = 0
-    frame_annotate_calls = 0
-    stream = cfg.segment.enabled and cfg.run.mode == "process"
-    if stream:
+        pools.append(total_records % bs)
+    n_batches, downstream_base = len(pools), total_records
+    stream_calls = dict(_STREAM_CALLS_ZERO)
+    if cfg.segment.enabled and cfg.run.mode == "process":
         session_lens = tuple(getattr(plan, "session_lens", ()) or ())
-        frame_sizes, piece_sizes = _pack_next_fit(session_lens, bs)
-        n_batches = len(frame_sizes)
-        sizes = piece_sizes                        # pairwise pools are episodes
-        downstream_base = len(session_lens)
-        if cfg.segment.strategy in ("llm", "hybrid"):
-            # v1.11 (V12): the window argument is the worst-case guaranteed
-            # packing size — min_window is UNCAPPED by design (the M1 V9
-            # guard needs the raw budget-derived value), so the estimate
-            # clamps to the cap at THIS call site. Budget off ⇒ min_window
-            # returns window ⇒ w == window ⇒ values byte-identical to v1.10
-            # (the V26 examples declare effective windows large enough that
-            # w_min > window keeps the five dry-run goldens frozen).
-            w = min(cfg.segment.window, budget.min_window(cfg))
-            segment_calls = sum(_ceil_div(length - 1, w - 1)
-                                for length in session_lens if length >= 2)
-        if cfg.stitch.enabled:
-            # v1.9 (T16 estimate, S22 culture): one judgment per episode
-            # candidate over the episodes ≈ sessions lower-bound base,
-            # × votes samples, doubled when the repass is on.
-            stitch_calls = (len(session_lens) * cfg.stitch.votes
-                            * (2 if cfg.stitch.repass else 1))
-        if cfg.extract.enabled:
-            extract_calls = sum(length - 1 for length in session_lens)
-        # v1.12：帧粒度两键的粗上界 = 预扫描帧总数（与 segment_calls 同源的
-        # session_lens 路径）；开关关闭 ⇒ 0。帧粒度要求流模式（M1 约束），
-        # 非流分支恒 0。
-        if cfg.frame_classify.enabled:
-            frame_classify_calls = sum(session_lens)
-        if cfg.frame_annotate.enabled:
-            frame_annotate_calls = sum(session_lens)
+        frame_sizes, pools = _pack_next_fit(session_lens, bs)
+        n_batches, downstream_base = len(frame_sizes), len(session_lens)
+        stream_calls = _estimate_stream_calls(cfg, session_lens)
+    return _EstimateScale(total_records=total_records, ingested=n_ingested,
+                          generated=gen_records, generate_calls=gen_calls,
+                          batches=n_batches, pools=pools,
+                          downstream_base=downstream_base,
+                          stream_calls=stream_calls)
+
+
+def _estimate_classify_calls(cfg: "ResolvedConfig", scale: _EstimateScale) -> int:
+    """classify 调用数估算。
+
+    v1.7 R11：process 模式 = ingested × max(1, self_consistency)（再流转子批继承分类、
+    跳过 M13，不计入），generate_only = 生成记录数 × max(1, self_consistency)，流模式改
+    以 episodes ≈ sessions 为基数。v1.13：时间流形态的序列标签直接继承（inherited，
+    v1.7 R11 幂等哲学）——classify_calls 恒 0，classify.enabled 只作类表载体。
+
+    @param cfg: 已解析配置
+    @param scale: 规模量
+    @return: classify 调用数
+    """
+    if not cfg.classify.enabled or cfg.generate_stream.enabled:
+        return 0
+    if cfg.run.mode == "generate_only":
+        base = scale.generated
+    elif cfg.segment.enabled:
+        base = scale.downstream_base
     else:
-        n_batches = len(sizes)
-        downstream_base = total_records
+        base = scale.ingested
+    return base * max(1, cfg.classify.self_consistency)
 
-    classify_calls = 0
-    if cfg.classify.enabled and not cfg.generate_stream.enabled:
-        # v1.13：时间流形态的序列标签直接继承（inherited，v1.7 R11 幂等哲学）——
-        # classify_calls 恒 0，classify.enabled 只作类表载体。
-        sc_c = cfg.classify.self_consistency
-        if cfg.run.mode == "generate_only":
-            base = gen_records
-        else:
-            base = downstream_base if stream else n_ingested
-        classify_calls = base * max(1, sc_c)
 
-    quality_calls = 0
-    if cfg.quality.enabled:
-        n_criteria = len(cfg.rubric.criteria)
-        if cfg.quality.mode == "pairwise":
-            judges = max(1, len(cfg.quality.judges))
-            orders = 2 if cfg.quality.both_orders else 1
-            per_call = n_criteria if cfg.quality.criteria_per_call == "single" else 1
-            quality_calls = (sum(cfg.quality.rounds * (b // 2) for b in sizes)
-                             * per_call * judges * orders)
-        else:
-            quality_calls = downstream_base * n_criteria
+def _estimate_quality_calls(cfg: "ResolvedConfig", scale: _EstimateScale) -> int:
+    """quality 调用数估算（pairwise 按每批评审池计，pointwise 按记录数 × 准则数）。
 
-    annotate_calls = 0
-    if cfg.annotate.enabled:
-        sc = cfg.annotate.self_consistency
-        annotate_calls = downstream_base * (sc if sc >= 3 else 1)
+    @param cfg: 已解析配置
+    @param scale: 规模量
+    @return: quality 调用数
+    """
+    if not cfg.quality.enabled:
+        return 0
+    n_criteria = len(cfg.rubric.criteria)
+    if cfg.quality.mode != "pairwise":
+        return scale.downstream_base * n_criteria
+    judges = max(1, len(cfg.quality.judges))
+    orders = 2 if cfg.quality.both_orders else 1
+    per_call = n_criteria if cfg.quality.criteria_per_call == "single" else 1
+    return (sum(cfg.quality.rounds * (b // 2) for b in scale.pools)
+            * per_call * judges * orders)
 
-    verify_calls = 0
-    if cfg.verify.enabled:
-        verify_calls = downstream_base * max(1, len(cfg.verify.judges))
 
-    return {
-        "records": total_records,
-        "batches": n_batches,
-        "generate_calls": gen_calls,
-        "segment_calls": segment_calls,
-        "stitch_calls": stitch_calls,
-        "classify_calls": classify_calls,
-        "frame_classify_calls": frame_classify_calls,
-        "extract_calls": extract_calls,
-        "quality_calls": quality_calls,
-        "annotate_calls": annotate_calls,
-        "frame_annotate_calls": frame_annotate_calls,
-        "verify_calls": verify_calls,
-        "total_calls": (gen_calls + segment_calls + stitch_calls
-                        + classify_calls + frame_classify_calls + extract_calls
-                        + quality_calls + annotate_calls + frame_annotate_calls
-                        + verify_calls),
-    }
+def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
+    """静态记录数 / LLM 调用数估算——v1.10（U20）把原 ``Orchestrator._estimate`` 的函数体
+    导出为吃 (cfg, plan) 的**模块级纯函数**，由 dry-run、live 的 ``metrics.run_estimate``
+    与渲染器的批级分母共用。``plan`` 是 M2 的扫描结果（``IngestPlan``）；generate_only 传
+    None（3.6.2 量公式是静态的，不需要 scan）。**返回键集与键序冻结**（见
+    ``_ESTIMATE_CALL_ORDER``）。
+
+    全部估算假定零丢弃（上界）且不含重试与修复调用；各分项的上/下界语义与版本沿革见
+    ``_estimate_scale`` / ``_estimate_stream_calls`` / ``_estimate_classify_calls`` 的
+    说明（v1.8 S22 流模式、v1.11 V12 预算钳位、v1.12 帧粒度两键、v1.13 时间流精确复演）。
+
+    @param cfg: 已解析配置
+    @param plan: M2 扫描结果；generate_only 传 None
+    @return: 冻结键集的估算字典
+    @raises AssertionError: process 模式未提供扫描结果
+    """
+    scale = _estimate_scale(cfg, plan)
+    calls = dict(scale.stream_calls)
+    calls["generate_calls"] = scale.generate_calls
+    calls["classify_calls"] = _estimate_classify_calls(cfg, scale)
+    calls["quality_calls"] = _estimate_quality_calls(cfg, scale)
+    sc = cfg.annotate.self_consistency
+    calls["annotate_calls"] = (scale.downstream_base * (sc if sc >= 3 else 1)
+                               if cfg.annotate.enabled else 0)
+    calls["verify_calls"] = (scale.downstream_base * max(1, len(cfg.verify.judges))
+                             if cfg.verify.enabled else 0)
+    est: dict = {"records": scale.total_records, "batches": scale.batches}
+    for key in _ESTIMATE_CALL_ORDER:
+        est[key] = calls[key]
+    est["total_calls"] = sum(calls[key] for key in _ESTIMATE_CALL_ORDER)
+    return est
 
 
 @dataclass(frozen=True)                            # [FROZEN in CONTRACTS.md §7.9]
 class RunSummary:
-    counts: Mapping                                # same keys as report.json "counts" (§9.3)
-    interrupted: bool
-    exit_code: int                                 # 4 (circuit break) | 1 (strict + rejects) | 0
-    wall_s: float
-    output_lines: int
-    rejects_lines: int
+    """一次运行的对外摘要——CLI 据此收敛退出码与终端摘要行。"""
+
+    counts: Mapping                                # 与 report.json "counts" 同键集（§9.3）
+    interrupted: bool                              # 是否被 SIGINT/SIGTERM 优雅中断
+    exit_code: int                                 # 4（熔断）| 1（strict 且有 rejects）| 0
+    wall_s: float                                  # 运行墙钟秒数
+    output_lines: int                              # 主输出行数
+    rejects_lines: int                             # rejects 行数
+
+
+@dataclass(frozen=True)
+class RunServices:
+    """编排器的运行期共享服务与运行身份——构造参数对象（CONTRACTS.md §7.9）。
+
+    spec 3.10.3 列出 (cfg, stages, ingestor, emitter, llm)；schema_engine/metrics 是构造
+    RunContext 所需，run_id/run_started_at 供报表组装与运行级事件使用（**不进**
+    RunContext，spec 3.12.3）。
+    """
+
+    llm: "LLMClient"                               # M9 LLM 客户端（用量/校准器读取面）
+    schema_engine: "SchemaEngine"                  # M8 Schema 引擎（resolved_at 统计面）
+    metrics: "MetricsSink"                         # M12 计数与事件汇（含 console 旁路）
+    run_id: str                                    # 本次运行标识
+    run_started_at: datetime                       # 运行起点（带时区）
 
 
 class Orchestrator:
-    """Drives the whole run. Constructor signature frozen in CONTRACTS.md §7.9."""
+    """驱动整轮运行的编排器；构造签名冻结于 CONTRACTS.md §7.9。"""
 
     def __init__(self, cfg: ResolvedConfig, stages: list[Stage],
-                 ingestor: Ingestor | None, emitter: Emitter, llm: LLMClient,
-                 schema_engine: SchemaEngine, metrics: MetricsSink,
-                 run_id: str, run_started_at: datetime):
+                 ingestor: Ingestor | None, emitter: Emitter,
+                 services: RunServices):
+        """装配编排器（不做任何 I/O，真正的运行发生在 ``run()``）。
+
+        @param cfg: 已解析配置
+        @param stages: M1 开关筛出的算子实例（组链时按规范链序重排）
+        @param ingestor: M2 摄取器；generate_only 模式传 None
+        @param emitter: M11 输出器
+        @param services: 运行期共享服务与运行身份
+        """
         self.cfg = cfg
         self.stages = stages
         self.ingestor = ingestor
         self.emitter = emitter
-        self.llm = llm
-        self.schema_engine = schema_engine
-        self.metrics = metrics
-        self.run_id = run_id
-        self.run_started_at = run_started_at
+        self.llm = services.llm
+        self.schema_engine = services.schema_engine
+        self.metrics = services.metrics
+        self.run_id = services.run_id
+        self.run_started_at = services.run_started_at
         # v1.12：向 M11 注入帧计数通路（frame_annotate.failed/discarded ——
         # Ingestor.metrics 同款装配期鸭子面；emitter 构造签名冻结不改）。
-        emitter.metrics = metrics
+        emitter.metrics = services.metrics
 
-        # Run-level aggregation state (content-free, spec 3.10.3).
+        # 运行级汇总状态（不含数据内容，spec 3.10.3）。
         self._stage_time: dict[str, float] = {}
         self._agg_hist = [0] * 10
         self._crit_sum: dict[str, float] = {}
         self._crit_n: dict[str, int] = {}
-        # v1.7 R12: pool-dimensioned mirrors of the three accumulators above,
-        # fed only when classify is enabled (pool = item.classification.label).
+        # v1.7 R12：上面三个累加器的按池镜像，仅 classify 启用时喂入
+        # （池 = item.classification.label）。
         self._pool_agg_hist: dict[str, list[int]] = {}
         self._pool_crit_sum: dict[str, dict[str, float]] = {}
         self._pool_crit_n: dict[str, dict[str, int]] = {}
         self._output_lines = 0
         self._rejects_lines = 0
         self._batch_no = 0
-        self._pending: deque[list[PipelineItem]] = deque()  # generation re-flow queue
+        self._pending: deque[list[PipelineItem]] = deque()  # 生成再流转队列
+        self._split_warned = False                 # 会话硬切 WARN 每轮仅一次
 
-        # Control flow.
+        # 控制流。
         self._stop = False
         self._interrupted = False
         self._circuit_broken = False
@@ -380,59 +461,21 @@ class Orchestrator:
         self._timer_handles: list[asyncio.TimerHandle] = []
         self._t0 = 0.0
 
-    # ── public entry ───────────────────────────────────────────────────────
+    # ── 对外入口 ───────────────────────────────────────────────────────────
 
     async def run(self) -> RunSummary:
+        """跑完一轮：预扫描 → 装信号 → 起运行 → 按模式驱动 → finalize。
+
+        @return: 运行摘要（含退出码）
+        """
         self._t0 = time.perf_counter()
         if self.cfg.dry_run:
             return self._run_dry()
 
-        plan: IngestPlan | None = None             # v1.10: captured pre-scan plan (U17)
-        plan_estimated = False
-        if self.cfg.run.mode == "process" and self.ingestor is not None:
-            # Fail fast on path/candidate/pairing errors BEFORE the first trace
-            # emit — which is what opens (and truncates) the trace file — so a
-            # dead-on-arrival run never destroys the previous run's trace
-            # (E2E finding P2-4). Detach metrics so the rehearsal scan emits
-            # nothing; the real records() pass re-emits everything in order.
-            saved_metrics = getattr(self.ingestor, "metrics", None)
-            self.ingestor.metrics = None
-            # v1.10 (U17 复用铁律): the SAME P2-4 rehearsal scan doubles as the
-            # live estimate source — NEVER scan twice. estimate=True is free on
-            # UI modality (the pairing table exists anyway) and an explicit
-            # opt-in on text (console.estimate reads the input once more);
-            # otherwise estimate=False keeps the fail-fast-only behavior (the
-            # text-modality line count reads every input byte and its result
-            # would be unused — doubling the input I/O of every run).
-            estimate = (self.cfg.run.modality == "ui") or self.cfg.console.estimate
-            try:
-                plan = self.ingestor.scan(estimate=estimate)
-            finally:
-                self.ingestor.metrics = saved_metrics
-            plan_estimated = estimate
-
+        plan, plan_estimated = self._prescan()
         self._install_signal_handlers()
         try:
-            self.metrics.event(_EV_RUN_START, stage="run", batch_no=0,
-                               payload={"tool_version": TOOL_VERSION,
-                                        "config_digest": self.cfg.config_digest,
-                                        "project_digest": self.cfg.project_digest,
-                                        "trace_schema_version": 1})
-            # v1.10 (U17/U19/U20): live estimate emission — only when a USABLE
-            # estimate exists: a plan-with-estimates in process mode, or
-            # generate_only (plan=None — the 3.6.2 formula is static, no scan).
-            # A text-modality scan without console.estimate emits nothing (the
-            # renderer then shows `批 i` with no denominator). The sink method
-            # is a forward-only no-op when no listener is attached.
-            if self.cfg.run.mode == "generate_only" or plan_estimated:
-                self.metrics.run_estimate(estimate_run(self.cfg, plan))
-            # v1.11 (V13①, spec 3.10.3 上下文预算行): startup budget INFO —
-            # owned by the M10 startup segment (never the loader: load-time
-            # logging predates the CLI level override). --dry-run never
-            # reaches this point (_run_dry returned above), so the dry-run
-            # goldens stay byte-frozen even now that the examples declare a
-            # window (V26).
-            self._log_budget_startup()
+            self._emit_run_start(plan, plan_estimated)
             self.emitter.open()
             try:
                 if self.cfg.run.mode == "generate_only":
@@ -440,23 +483,75 @@ class Orchestrator:
                 else:
                     await self._run_process()
             except CircuitBreakerTripped:
-                # Fatal-error streak >= run.fatal_error_threshold: remaining
-                # work abandoned, report still written, .part NOT renamed.
+                # 连续致命错误达 run.fatal_error_threshold：剩余工作放弃，报告照写，
+                # .part 不改名（v1.6 熔断交付另行决定已完成批的交付）。
+                _log.error("circuit breaker tripped: remaining batches abandoned",
+                           extra={"stage": "run", "batch": self._batch_no})
                 self._circuit_broken = True
         finally:
             self._remove_signal_handlers()
         return self._finalize()
 
-    # ── mode drivers ───────────────────────────────────────────────────────
+    def _prescan(self) -> tuple["IngestPlan | None", bool]:
+        """P2-4 预扫描：在首个 trace 落笔（即打开并截断 trace 文件）**之前**先对路径/
+        候选/配对错误 fail fast，免得一个出生即死的运行毁掉上一轮的 trace。扫描期把
+        metrics 摘掉，彩排一声不响；真正的 records() 遍历会按序重发全部事件。
+
+        v1.10（U17 复用铁律）：**同一次**彩排扫描兼作 live 估算的数据源，绝不扫第二遍。
+        UI 模态下 estimate=True 是白送的（配对表本来就要建），文本模态则是显式 opt-in
+        （console.estimate 会把输入再读一遍）；否则 estimate=False 维持只 fail-fast 的
+        行为（文本模态数行数要读完每个字节，结果却没人用——等于每轮运行的输入 I/O 翻倍）。
+
+        @return: (扫描计划, 该计划是否带估算)；generate_only 返回 (None, False)
+        """
+        if self.cfg.run.mode != "process" or self.ingestor is None:
+            return None, False
+        saved_metrics = getattr(self.ingestor, "metrics", None)
+        self.ingestor.metrics = None
+        estimate = (self.cfg.run.modality == "ui") or self.cfg.console.estimate
+        try:
+            plan = self.ingestor.scan(estimate=estimate)
+        finally:
+            self.ingestor.metrics = saved_metrics
+        return plan, estimate
+
+    def _emit_run_start(self, plan: "IngestPlan | None", plan_estimated: bool) -> None:
+        """发 run.start、（可用时）发 live 估算、打印启动期预算 INFO 行。
+
+        v1.10（U17/U19/U20）：live 估算只在**确有可用估算**时发——process 模式带估算的
+        计划，或 generate_only（plan=None，3.6.2 量公式是静态的、无需 scan）。文本模态未
+        开 console.estimate 时什么都不发（渲染器于是只显示「批 i」不带分母）。未挂 listener
+        时该汇方法是纯 no-op。
+
+        @param plan: 预扫描计划
+        @param plan_estimated: 该计划是否带估算
+        """
+        self.metrics.event(_EV_RUN_START, stage="run", batch_no=0,
+                           payload={"tool_version": TOOL_VERSION,
+                                    "config_digest": self.cfg.config_digest,
+                                    "project_digest": self.cfg.project_digest,
+                                    "trace_schema_version": 1})
+        if self.cfg.run.mode == "generate_only" or plan_estimated:
+            self.metrics.run_estimate(estimate_run(self.cfg, plan))
+        # v1.11（V13①，spec 3.10.3 上下文预算行）：启动期预算 INFO 归 M10 启动段所有
+        # （绝不归 loader：加载期 logging 尚未按 CLI 覆盖定级）。--dry-run 走不到这里
+        # （_run_dry 已在上游返回），故即便 examples 现已声明窗宽（V26），dry-run 的
+        # golden 仍逐字节冻结。
+        self._log_budget_startup()
+
+    # ── 模式驱动 ───────────────────────────────────────────────────────────
 
     async def _run_process(self) -> None:
+        """process 模式主驱动：按 batch_size 切批，生成子批插在父批之后。
+
+        @raises AssertionError: 未提供摄取器
+        """
         assert self.ingestor is not None, "process mode requires an Ingestor"
         if getattr(self.ingestor, "metrics", None) is None:
-            self.ingestor.metrics = self.metrics  # trace wiring (CONTRACTS §7.1)
+            self.ingestor.metrics = self.metrics   # trace 接线（CONTRACTS §7.1）
         if self.cfg.segment.enabled:
-            # v1.8 stream mode: whole-session next-fit packing over the M2
-            # session-stream view (generate is mutually exclusive with segment
-            # per M1, so the re-flow queue can never fill here).
+            # v1.8 流模式：改走 M2 会话流视图的整会话 next-fit 装箱（generate 与 segment
+            # 按 M1 互斥，故再流转队列在这条路径上永不填充）。
             await self._run_process_stream()
             return
         stream = iter(self.ingestor.records())
@@ -468,8 +563,7 @@ class Orchestrator:
 
         while not self._stop:
             if self._pending:
-                # Generation sub-batches run right after their parent batch,
-                # with consecutive batch numbers, and never re-generate.
+                # 生成子批紧跟父批执行，批号连续，且绝不二次生成。
                 batch = self._pending.popleft()
                 chain = reflow_chain
             else:
@@ -478,34 +572,24 @@ class Orchestrator:
                     break
                 batch = [PipelineItem(record=r) for r in records]
                 chain = main_chain
-            self._batch_no += 1
-            await self._guarded_batch(batch, self._batch_no, chain)
-            del batch  # per-batch memory lifecycle: no reference survives emit
+            await self._dispatch(batch, chain)
+            del batch                              # 批级内存生命周期：落盘后不留引用
 
     async def _run_process_stream(self) -> None:
-        """v1.8 stream batching (S21/S4, CONTRACTS §7.9): consume
-        ``ingestor.sessions()`` (the --limit islice lives INSIDE M2, between
-        parse stream and assembler — S17) and pack WHOLE sessions into batches
-        by next-fit: exactly one open bin; a session that no longer fits closes
-        the current batch and opens the next. Batch capacity = run.batch_size
-        FRAMES. A session longer than batch_size is HARD-SPLIT into
-        batch_size slices, each dispatched as its own batch, with ONE WARN per
-        run and a duck-typed ``session_split`` mark on the split session's
-        frame envelopes (M7's missing-frame downgrade evidence,
-        ``_meta.stream.session_split``). M10 stamps ``PipelineItem.session_id``
-        at envelope construction (S4); the residual open bin ships as-is once
-        the session stream is exhausted. On SIGINT/SIGTERM no NEW batch is
-        dispatched — buffered frames strand into the interrupted residual
-        (S18)."""
+        """v1.8 流模式装箱（S21/S4，CONTRACTS §7.9）：消费 ``ingestor.sessions()``
+        （``--limit`` 的 islice 住在 M2 内部、夹在解析流与组装器之间——S17），按 next-fit
+        整会话装箱：恰一只开口箱，装不下的会话封掉当前批、另开一箱。批容量 =
+        run.batch_size **帧**。超过 batch_size 的会话**硬切**成 batch_size 片，每片自成
+        一批。M10 在构造信封时盖章 ``PipelineItem.session_id``（S4）；会话流耗尽后，残留的
+        开口箱原样发出。收到 SIGINT/SIGTERM 后不再派发**新**批——缓冲中的帧滞留为中断残差
+        （S18）。
+
+        @raises AssertionError: 未提供摄取器
+        """
         assert self.ingestor is not None, "process mode requires an Ingestor"
         chain = self._compose_chain(include_generate=True)
         bs = self.cfg.run.batch_size
         open_batch: list[PipelineItem] = []
-        split_warned = False
-
-        async def dispatch(batch: list[PipelineItem]) -> None:
-            self._batch_no += 1
-            await self._guarded_batch(batch, self._batch_no, chain)
 
         for sess in self.ingestor.sessions():
             if self._stop:
@@ -513,107 +597,93 @@ class Orchestrator:
             frames = [PipelineItem(record=r, session_id=sess.session_id)
                       for r in sess.records]
             if len(frames) > bs:
-                # Hard split (S21): slice at batch_size, each slice its own
-                # batch, dispatched in order. Mark every frame of the session.
-                if not split_warned:
-                    split_warned = True
-                    _log.warning("会话超 batch_size 被硬切（本条提示仅打印一次）",
-                                 extra={"stage": "run", "batch": self._batch_no})
-                for item in frames:
-                    item.session_split = True      # duck-typed mark (S21)
+                self._mark_split_session(frames)
                 if open_batch:
-                    await dispatch(open_batch)
+                    await self._dispatch(open_batch, chain)
                     open_batch = []
-                for i in range(0, len(frames), bs):
-                    if self._stop:
-                        break
-                    await dispatch(frames[i:i + bs])
+                await self._dispatch_split_session(frames, chain)
                 continue
             if open_batch and len(open_batch) + len(frames) > bs:
-                # The one pending overflow session — the only new cross-batch
-                # survivor (§11 ⑤), released as soon as it is packed.
-                await dispatch(open_batch)
+                # 唯一的待装箱溢出会话——新增的跨批存活项（§11 ⑤），装箱即释放。
+                await self._dispatch(open_batch, chain)
                 open_batch = []
             open_batch.extend(frames)
         if open_batch and not self._stop:
-            await dispatch(open_batch)             # residual open bin ships as-is
+            await self._dispatch(open_batch, chain)  # 残留开口箱原样发出
+
+    def _mark_split_session(self, frames: list[PipelineItem]) -> None:
+        """给被硬切会话的每一帧打 duck-typed ``session_split`` 标（S21），并每轮 WARN
+        一次（M7 缺帧判定的降级依据，落到 ``_meta.stream.session_split``）。
+
+        @param frames: 该会话的全部帧信封
+        """
+        if not self._split_warned:
+            self._split_warned = True
+            _log.warning("session exceeds batch_size and was hard-split "
+                         "(warned once per run)",
+                         extra={"stage": "run", "batch": self._batch_no})
+        for item in frames:
+            item.session_split = True
+
+    async def _dispatch_split_session(self, frames: list[PipelineItem],
+                                      chain: Sequence[Stage]) -> None:
+        """硬切派发（S21）：按 batch_size 切片，每片自成一批、按序派发。
+
+        @param frames: 该会话的全部帧信封
+        @param chain: 本批的阶段链
+        """
+        bs = self.cfg.run.batch_size
+        for i in range(0, len(frames), bs):
+            if self._stop:
+                break
+            await self._dispatch(frames[i:i + bs], chain)
 
     async def _run_generate_only(self) -> None:
+        """generate_only 模式驱动：一次性生成 → 切批走再流转链（不含 generate 工位）。
+
+        @raises InternalError: 阶段表里没有 generate 算子
+        """
         gen = next((s for s in self.stages if s.name == "generate"), None)
         if gen is None:
             raise InternalError("generate_only mode requires a generate stage")
-        # Pre-draw PRNG fixed at batch_no=0 (spec 3.10.3): Random(f"{seed}:0:generate").
+        # 预抽 PRNG 固定在 batch_no=0（spec 3.10.3）：Random(f"{seed}:0:generate")。
         ctx0 = self._make_ctx(0, "generate")
         if self.cfg.generate_stream.enabled:
             # v1.13 时间流形态（SPEC-stream-generation §3.2/§3.6）分支。
             await self._run_generate_stream(gen, ctx0)
             return
-        # The generation phase runs as a guarded task — same pattern as
-        # _guarded_batch — so a SIGINT/SIGTERM can stop it: _request_stop's
-        # 30 s timer cancels `self._current_task` (spec 3.10.3 中断 row;
-        # CONTRACTS §7.9 "wait current batch ≤ 30 s then cancel"). Its
-        # wall-clock feeds report.timing.per_stage_s like any enabled stage.
-        task = asyncio.ensure_future(gen.generate_all(ctx0))
-        self._current_task = task
-        t_gen = time.perf_counter()
-        records: list[Record] = []
-        try:
-            records = list(await task)
-        except asyncio.CancelledError:
-            if not self._stop:
-                raise                              # external cancellation, not ours
-            # interrupted mid-generation: a cancelled generate_all yields no
-            # records; finalize still runs normally (interrupted=true).
-        finally:
-            self._current_task = None
-            elapsed = time.perf_counter() - t_gen
-            self._stage_time["generate"] = self._stage_time.get("generate", 0.0) + elapsed
-            self.metrics.add_stage_time("generate", elapsed)
+        product = await self._await_generate(gen.generate_all(ctx0))
+        records: list[Record] = list(product) if product is not None else []
         if self.cfg.limit is not None:
-            records = records[: self.cfg.limit]  # generate_all already truncates; belt & braces
+            records = records[: self.cfg.limit]    # generate_all 已截断，此处兜底
         if records:
             self.metrics.count("counts.generated", len(records))
-        # 0 generated → loop is a no-op → normal finalize, exit 0.
+        # 生成 0 条 → 循环空转 → 正常 finalize，退出码 0。
         chain = self._compose_chain(include_generate=False)
         bs = self.cfg.run.batch_size
         for i in range(0, len(records), bs):
             if self._stop:
                 break
             batch = [PipelineItem(record=r) for r in records[i:i + bs]]
-            self._batch_no += 1
-            await self._guarded_batch(batch, self._batch_no, chain)
+            await self._dispatch(batch, chain)
             del batch
 
     async def _run_generate_stream(self, gen, ctx0: RunContext) -> None:
         """v1.13 时间流形态驱动（SPEC-stream-generation §3.2/§3.6）：一次
-        ``generate_stream_all``（guarded task 形态沿平面路径——SIGINT 30 s 计时器
-        可取消；耗时照记 report.timing）→ 工件经 M11 工件通道落盘 →
-        ``counts.generated`` = 进链序列条数 → 直装信封按 batch_size 切批走 reflow
-        链（信封已带 session_id/classification/member_classifications，绝不
-        ``PipelineItem(record=r)`` 裸构造重建）。``--limit`` 已在 M6 计划期配额层
-        前缀截断，此处 belt & braces 再截一次。"""
-        task = asyncio.ensure_future(gen.generate_stream_all(ctx0))
-        self._current_task = task
-        t_gen = time.perf_counter()
-        envelopes: list[PipelineItem] = []
-        produced = False
-        try:
-            product = await task
-            envelopes = list(product.envelopes)
-            produced = True
-        except asyncio.CancelledError:
-            if not self._stop:
-                raise                              # external cancellation, not ours
-            # interrupted mid-generation: no product, no artifact, no batches;
-            # finalize still runs normally (interrupted=true).
-        finally:
-            self._current_task = None
-            elapsed = time.perf_counter() - t_gen
-            self._stage_time["generate"] = self._stage_time.get("generate", 0.0) + elapsed
-            self.metrics.add_stage_time("generate", elapsed)
-        if produced:
-            # 工件先于任何批派发落盘（.part + flush；finalize 与主输出同批改名）。
-            self.emitter.write_stream_artifact(list(product.artifact_lines))
+        ``generate_stream_all`` → 工件经 M11 工件通道落盘 → ``counts.generated`` = 进链
+        序列条数 → 直装信封按 batch_size 切批走再流转链（信封已带 session_id/
+        classification/member_classifications，绝不 ``PipelineItem(record=r)`` 裸构造
+        重建）。``--limit`` 已在 M6 计划期配额层前缀截断，此处兜底再截一次。
+
+        @param gen: generate 算子实例
+        @param ctx0: batch_no=0 的生成期上下文
+        """
+        product = await self._await_generate(gen.generate_stream_all(ctx0))
+        if product is None:
+            return                                 # 中断即无产物、无工件、无批次
+        # 工件先于任何批派发落盘（.part + flush；finalize 与主输出同批改名）。
+        self.emitter.write_stream_artifact(list(product.artifact_lines))
+        envelopes = list(product.envelopes)
         if self.cfg.limit is not None:
             envelopes = envelopes[: self.cfg.limit]
         if envelopes:
@@ -623,46 +693,115 @@ class Orchestrator:
         for i in range(0, len(envelopes), bs):
             if self._stop:
                 break
-            self._batch_no += 1
-            await self._guarded_batch(envelopes[i:i + bs], self._batch_no, chain)
+            await self._dispatch(envelopes[i:i + bs], chain)
 
-    # ── batch lifecycle ────────────────────────────────────────────────────
+    async def _await_generate(self, coro):
+        """守护式执行生成协程——与 ``_guarded_batch`` 同形，故 SIGINT/SIGTERM 能停下它：
+        ``_request_stop`` 的 30 s 计时器会取消 ``self._current_task``（spec 3.10.3 中断行；
+        CONTRACTS §7.9「等当前批 ≤ 30 s 再取消」）。其墙钟像任何启用阶段一样计入
+        report.timing.per_stage_s。
+
+        @param coro: 生成协程（``generate_all`` 或 ``generate_stream_all``）
+        @return: 协程产物；被我方中断取消时返回 None（生成期中断 ⇒ 无产物，finalize 照常
+                 以 interrupted=true 收尾）
+        @raises asyncio.CancelledError: 非我方 stop 触发的外部取消原样上抛
+        """
+        task = asyncio.ensure_future(coro)
+        self._current_task = task
+        t_gen = time.perf_counter()
+        try:
+            return await task
+        except asyncio.CancelledError:
+            if not self._stop:
+                raise                              # 外部取消，不是我方中断
+            return None
+        finally:
+            self._current_task = None
+            elapsed = time.perf_counter() - t_gen
+            self._stage_time["generate"] = self._stage_time.get("generate", 0.0) + elapsed
+            self.metrics.add_stage_time("generate", elapsed)
+
+    # ── 批生命周期 ─────────────────────────────────────────────────────────
+
+    async def _dispatch(self, batch: list[PipelineItem],
+                        chain: Sequence[Stage]) -> None:
+        """批号自增后派发一批（三条模式驱动的唯一派发口）。
+
+        @param batch: 本批信封
+        @param chain: 本批的阶段链
+        """
+        self._batch_no += 1
+        await self._guarded_batch(batch, self._batch_no, chain)
 
     async def _guarded_batch(self, batch: list[PipelineItem], batch_no: int,
                              chain: Sequence[Stage]) -> None:
-        """Run one batch as a task so a SIGINT 30 s timeout can cancel it."""
+        """把一批包成 task 跑，好让 SIGINT 的 30 s 超时能取消它。
+
+        @param batch: 本批信封
+        @param batch_no: 批号
+        @param chain: 本批的阶段链
+        @raises asyncio.CancelledError: 非我方 stop 触发的外部取消原样上抛
+        """
         task = asyncio.ensure_future(self._process_batch(batch, batch_no, chain))
         self._current_task = task
         try:
             await task
         except asyncio.CancelledError:
             if not self._stop:
-                raise                              # external cancellation, not ours
-            # interrupted mid-batch: already-flushed lines stay valid
+                raise                              # 外部取消，不是我方中断
+            # 批中途被中断：已冲洗的输出行依然有效
         finally:
             self._current_task = None
-            # v1.11 (V19, spec 3.10.3 上下文预算行): batch-boundary
-            # calibration freeze — AFTER the batch settles, BEFORE the next
-            # dispatch, so batch N+1 packs against ≤ N aggregates only (the
-            # F8 determinism guard). Every dispatched batch funnels through
-            # here (all three mode drivers): generate re-flow sub-batches
-            # dispatch as their own outer batches and freeze like any other —
-            # nothing freezes inside a batch's stage loop.
+            # v1.11（V19，spec 3.10.3 上下文预算行）：批边界校准冻结——在本批落定**之后**、
+            # 下一批派发**之前**，故第 N+1 批只按 ≤ N 批的聚合值装填（F8 确定性护栏）。
+            # 每一个派发出去的批都经由这里（三条模式驱动皆然）：生成再流转子批作为独立外层
+            # 批派发，冻结待遇与普通批相同——批内阶段循环里绝不冻结。
             self._freeze_calibrator()
 
     async def _process_batch(self, batch: list[PipelineItem], batch_no: int,
                              chain: Sequence[Stage]) -> None:
+        """一批的完整生命周期：链上跑完 → 质量统计 → 落盘 → 状态清点 → 事件与冲洗。
+
+        @param batch: 本批信封
+        @param batch_no: 批号
+        @param chain: 本批的阶段链
+        """
         t_batch = time.perf_counter()
         self.metrics.event(_EV_BATCH_START, stage="run", batch_no=batch_no,
                            payload={"size": len(batch)})
+        deltas = await self._run_chain(batch, batch_no, chain)
+        if self.cfg.quality.enabled:
+            self._collect_quality_stats(batch)
+
+        emit = self.emitter.emit_batch(batch, batch_no)
+        self._output_lines += emit.emitted
+        self._rejects_lines += emit.rejected
+
+        tally = self._tally_statuses(batch, emit)
+        self.metrics.event(_EV_BATCH_END, stage="run", batch_no=batch_no,
+                           payload=self._batch_end_payload(tally, deltas, t_batch))
+        self.metrics.flush()                       # trace 冲洗跟在输出冲洗之后
+
+    async def _run_chain(self, batch: list[PipelineItem], batch_no: int,
+                         chain: Sequence[Stage]) -> tuple[int, int]:
+        """按链序跑完一批的全部阶段，并计量 fanout / episodes 两个 len 差值。
+
+        v1.8 §7.9 / v1.7 R9：``counts.episodes`` 与 ``counts.fanout`` **在此处**计量——
+        segment / classify 调用前后的 len 差值（M14/M13 只就地追加信封、从不碰
+        ``counts.*``；与从 generate 返回值导出 counts.generated 是同一构造）。
+
+        @param batch: 本批信封（阶段可就地追加尾部信封）
+        @param batch_no: 批号
+        @param chain: 本批的阶段链
+        @return: (本批 fanout 增量, 本批 episodes 增量)
+        """
         batch_fanout = 0
         batch_episodes = 0
         for stage in chain:
             ctx = self._make_ctx(batch_no, stage.name)
             size_before = len(batch)
-            # v1.10 (U11, spec 3.10.3 console row): in-process progress signal,
-            # fired immediately before EVERY stage.run in chain order —
-            # forward-only, produces NO TraceEvent (3.12.3), no-op sans listener.
+            # v1.10（U11，spec 3.10.3 console 行）：进程内进度信号，按链序在**每次**
+            # stage.run 之前发——只转发、不产生 TraceEvent（3.12.3），无 listener 即 no-op。
             self.metrics.stage_begin(stage.name, batch_no)
             t_stage = time.perf_counter()
             try:
@@ -671,124 +810,122 @@ class Orchestrator:
                 elapsed = time.perf_counter() - t_stage
                 self._stage_time[stage.name] = self._stage_time.get(stage.name, 0.0) + elapsed
                 self.metrics.add_stage_time(stage.name, elapsed)
-            if stage.name == "segment":
-                # v1.8 §7.9: counts.episodes is METERED HERE — the len-delta
-                # across the segment invocation (M14 tail-appends episode
-                # envelopes in place and never touches counts.*; fanout-
-                # isomorphic R9 construction).
-                delta = len(batch) - size_before
-                if delta > 0:
-                    self.metrics.count("counts.episodes", delta)
-                    batch_episodes += delta
-            if stage.name == "classify":
-                # v1.7 R9: counts.fanout is METERED HERE — the len-delta across
-                # the classify invocation (M13 tail-appends siblings in place
-                # and never touches counts.*; same construction as deriving
-                # counts.generated from generate's return value).
-                delta = len(batch) - size_before
-                if delta > 0:
-                    self.metrics.count("counts.fanout", delta)
-                    batch_fanout += delta
+            delta = len(batch) - size_before
+            if stage.name == "segment" and delta > 0:
+                self.metrics.count("counts.episodes", delta)
+                batch_episodes += delta
+            if stage.name == "classify" and delta > 0:
+                self.metrics.count("counts.fanout", delta)
+                batch_fanout += delta
             if stage.name == "generate":
-                # Off-path stage: returns a NEW sub-batch; enqueue it split at
-                # batch_size. Sub-batches re-enter at M3 (single round).
-                sub = list(result) if result is not None else []
-                if sub:
-                    self.metrics.count("counts.generated", len(sub))
-                    bs = self.cfg.run.batch_size
-                    for i in range(0, len(sub), bs):
-                        self._pending.append(sub[i:i + bs])
+                self._enqueue_generated(result)
+        return batch_fanout, batch_episodes
 
-        if self.cfg.quality.enabled:
-            self._collect_quality_stats(batch)
+    def _enqueue_generated(self, result) -> None:
+        """链外工位 generate 的产物入队：按 batch_size 切成子批，自 M3 重新入链（单轮）。
 
-        emit = self.emitter.emit_batch(batch, batch_no)
-        self._output_lines += emit.emitted
-        self._rejects_lines += emit.rejected
+        @param result: generate 阶段返回的新子批（None 视同空）
+        """
+        sub = list(result) if result is not None else []
+        if not sub:
+            return
+        self.metrics.count("counts.generated", len(sub))
+        bs = self.cfg.run.batch_size
+        for i in range(0, len(sub), bs):
+            self._pending.append(sub[i:i + bs])
 
-        # Status tally (post-emit; emitter may have diverted internal errors).
+    def _tally_statuses(self, batch: list[PipelineItem], emit) -> dict[str, int]:
+        """post-emit 状态清点并落 counts.*（此时 emitter 可能已把内部错误改判）。
+
+        counts 不变量：既没落盘也没被丢弃的，一律算 failed（把 emitter 改判的
+        internal_error 项也覆盖进来）。v1.8 起若不扣除 absorbed/dropped_noise，episode
+        成员会被误计为 failed（§7.9）；v1.9（T7 blocker-1）stitched 同理入扣除项——壳是
+        终态，不是失败。
+
+        @param batch: 本批信封
+        @param emit: M11 的落盘结果（emitted/rejected 计数）
+        @return: 原始状态直方图（供 batch.end payload 读取）
+        """
         tally: dict[str, int] = {}
         for item in batch:
             tally[item.status] = tally.get(item.status, 0) + 1
-        dropped_dup = tally.get("dropped_dup", 0)
-        dropped_lowq = tally.get("dropped_lowq", 0)
-        dropped_verify = tally.get("dropped_verify", 0)
-        absorbed = tally.get("absorbed", 0)        # v1.8: episode members (third route)
-        dropped_noise = tally.get("dropped_noise", 0)
-        stitched = tally.get("stitched", 0)        # v1.9: merged-fragment shells (fourth route)
-        # counts invariant: whatever was neither emitted nor dropped is failed
-        # (covers emitter-diverted internal_error items too). v1.8: without the
-        # absorbed/dropped_noise terms, episode members would be miscounted
-        # as failed (§7.9); v1.9 (T7 blocker-1): the stitched term joins for the
-        # same reason — shells are terminal, not failed.
-        failed = max(len(batch) - emit.emitted - dropped_dup - dropped_lowq
-                     - dropped_verify - absorbed - dropped_noise - stitched, 0)
+        deducted = {name: tally.get(name, 0) for name in _DEDUCTED_STATUSES}
+        failed = max(len(batch) - emit.emitted - sum(deducted.values()), 0)
         self.metrics.count("counts.emitted", emit.emitted)
-        self.metrics.count("counts.dropped_dup", dropped_dup)
-        self.metrics.count("counts.dropped_lowq", dropped_lowq)
-        self.metrics.count("counts.dropped_verify", dropped_verify)
-        self.metrics.count("counts.absorbed", absorbed)
-        self.metrics.count("counts.dropped_noise", dropped_noise)
-        self.metrics.count("counts.stitched", stitched)
+        for name, value in deducted.items():
+            self.metrics.count(f"counts.{name}", value)
         self.metrics.count("counts.failed", failed)
+        return tally
 
-        end_payload: dict = {"active": tally.get("active", 0),
-                             "dropped_dup": dropped_dup,
-                             "dropped_lowq": dropped_lowq,
-                             "dropped_verify": dropped_verify,
-                             "failed": tally.get("failed", 0),
-                             "duration_ms": int((time.perf_counter() - t_batch) * 1000)}
-        if self.cfg.classify.enabled:
-            # v1.7 R20 (§8.1): batch.start.size stays the batch-ENTRY envelope
-            # count; batch.end carries the fan-out delta (classify enabled only).
-            end_payload["fanout"] = batch_fanout
-        if self.cfg.segment.enabled:
-            # v1.8 (same R20 form): carried only when segment is enabled; the
-            # stderr progress/summary line gains NO new keys (§7.9).
-            end_payload["episodes"] = batch_episodes
-            end_payload["absorbed"] = absorbed
-            end_payload["dropped_noise"] = dropped_noise
-        if self.cfg.stitch.enabled:
-            # v1.9 (T16, same R20 form): present only when stitch is enabled —
-            # the m-11 off-mode byte-equivalence condition.
-            end_payload["stitched"] = stitched
-            end_payload["threads"] = batch_episodes - stitched
-        self.metrics.event(_EV_BATCH_END, stage="run", batch_no=batch_no,
-                           payload=end_payload)
-        self.metrics.flush()                       # trace flush follows output flush
+    def _batch_end_payload(self, tally: dict[str, int], deltas: tuple[int, int],
+                           t_batch: float) -> dict:
+        """组装 batch.end 事件 payload。
+
+        v1.7 R20（§8.1）：batch.start.size 恒为批入口信封数，扇出增量由 batch.end 携带
+        （仅 classify 启用时）；v1.8 的 episodes/absorbed/dropped_noise 与 v1.9 的
+        stitched/threads 同款形制（仅对应开关启用时在场——m-11 关模式逐字节等价条件），
+        stderr 进度/摘要行**不增键**（§7.9）。
+
+        @param tally: 原始状态直方图
+        @param deltas: (fanout 增量, episodes 增量)
+        @param t_batch: 本批起始的 perf_counter 读数
+        @return: 事件 payload
+        """
+        cfg = self.cfg
+        batch_fanout, batch_episodes = deltas
+        stitched = tally.get("stitched", 0)
+        payload: dict = {"active": tally.get("active", 0),
+                         "dropped_dup": tally.get("dropped_dup", 0),
+                         "dropped_lowq": tally.get("dropped_lowq", 0),
+                         "dropped_verify": tally.get("dropped_verify", 0),
+                         "failed": tally.get("failed", 0),
+                         "duration_ms": int((time.perf_counter() - t_batch) * 1000)}
+        if cfg.classify.enabled:
+            payload["fanout"] = batch_fanout
+        if cfg.segment.enabled:
+            payload["episodes"] = batch_episodes
+            payload["absorbed"] = tally.get("absorbed", 0)
+            payload["dropped_noise"] = tally.get("dropped_noise", 0)
+        if cfg.stitch.enabled:
+            payload["stitched"] = stitched
+            payload["threads"] = batch_episodes - stitched
+        return payload
 
     def _make_ctx(self, batch_no: int, stage_name: str) -> RunContext:
-        """Fresh RunContext per (batch, stage); rng derivation frozen (spec 3.10.3)."""
+        """每 (批, 阶段) 新建 RunContext；rng 派生式冻结（spec 3.10.3）。
+
+        @param batch_no: 批号
+        @param stage_name: 阶段名
+        @return: 该 (批, 阶段) 的运行上下文
+        """
         return RunContext(cfg=self.cfg, llm=self.llm, schema_engine=self.schema_engine,
                           metrics=self.metrics,
                           rng=random.Random(f"{self.cfg.run.seed}:{batch_no}:{stage_name}"),
                           batch_no=batch_no)
 
     def _freeze_calibrator(self) -> None:
-        """v1.11 (V19/V23②, §7.17): fold the finished batch's per-profile
-        image-cost sample buckets into the calibrator's frozen batch-max
-        window (order-free max over the unordered sample set — asyncio
-        completion order never leaks into the readable snapshot). Fired once
-        per dispatched batch (_guarded_batch) and once more at finalize so
-        ``report.budget.image_cost`` carries the calibration END value
-        (V13⑤). Duck-typed like the ``usage_by_profile`` read in
-        _build_report — unit fixtures pass llm=None; a no-sample freeze is a
-        no-op, so budget-off runs observe nothing."""
+        """v1.11（V19/V23②，§7.17）：把刚跑完这批的按 profile 图片成本样本桶折进校准器的
+        批最大值冻结窗口（对无序样本集取 max——asyncio 完成序永远漏不进可读快照）。每派发
+        一批触发一次（_guarded_batch），finalize 时再触发一次，好让
+        ``report.budget.image_cost`` 拿到校准**终值**（V13⑤）。与 _build_report 里的
+        ``usage_by_profile`` 读法同为鸭子面——单测夹具传 llm=None；无样本的冻结是 no-op，
+        故预算关闭的运行观察不到任何动静。
+        """
         calibrator = getattr(self.llm, "calibrator", None)
         if calibrator is not None:
             calibrator.freeze_batch()
 
     def _budget_profiles(self) -> list[tuple[str, int, int]]:
-        """v1.11 (V13①②): the budget-declared profiles among those the run
-        resolved for use — BOTH referenced_profiles legs, LLM and embedding
-        (spec §6.4: "任一被启用阶段引用的 profile"), filtered to
-        ``context_window > 0`` (order-preserving; V6's "referenced by enabled
-        stages" convention). Entries are (name, context_window, input_budget)
-        with input_budget = budget.input_budget for LLM profiles and
-        budget.embed_budget for embedding profiles (no output reservation,
-        V15). Non-empty ⇔ the budget observability faces (startup INFO line,
-        report.budget node) appear; all-undeclared runs keep v1.10 output
-        byte-identical (the CONTRACTS §9.3 clause)."""
+        """v1.11（V13①②）：本轮实际解析到的 profile 中声明了预算的那些——
+        referenced_profiles 的 LLM 与 embedding **两条腿**都算（spec §6.4：「任一被启用
+        阶段引用的 profile」），筛 ``context_window > 0``（保序；V6 的「被启用阶段引用」
+        口径）。条目为 (名字, context_window, input_budget)，其中 LLM profile 取
+        budget.input_budget、embedding profile 取 budget.embed_budget（不预留输出，V15）。
+        非空 ⇔ 预算观测面（启动 INFO 行、report.budget 节）在场；全未声明的运行输出与
+        v1.10 逐字节一致（CONTRACTS §9.3 条款）。
+
+        @return: (profile 名, 上下文窗, 输入预算) 三元组列表
+        """
         llm_names, emb_names = referenced_profiles(self.cfg)
         declared: list[tuple[str, int, int]] = []
         for name in llm_names:
@@ -804,13 +941,12 @@ class Orchestrator:
         return declared
 
     def _log_budget_startup(self) -> None:
-        """v1.11 (V13①, spec 3.10.3 上下文预算行): ONE data-free INFO line
-        with the declared budget params — ``budget: <name>=<cw>/<input_budget>
-        ...`` — plus, when segment is enabled and its profile is budgeted, the
-        w_min line ``segment: w_min=<w_min> window=<cap> (budget)`` (w_min =
-        the raw budget.min_window value, the V9 guard/INFO print). Counts and
-        parameters only, never data content (§2.6); silent when no referenced
-        profile declares a window."""
+        """v1.11（V13①，spec 3.10.3 上下文预算行）：打一行数据无关的 INFO 罗列已声明的
+        预算参数——``budget: <name>=<cw>/<input_budget> ...``——并在 segment 启用且其
+        profile 有预算时补一行 ``segment: w_min=<w_min> window=<cap> (budget)``（w_min 取
+        budget.min_window 的原始值，即 V9 护栏/INFO 的打印值）。只有计数与参数，绝无数据
+        内容（§2.6）；无任何被引用 profile 声明窗宽时静默。
+        """
         declared = self._budget_profiles()
         if not declared:
             return
@@ -826,14 +962,15 @@ class Orchestrator:
                       extra={"stage": "run", "batch": 0})
 
     def _compose_chain(self, include_generate: bool) -> list[Stage]:
-        """Stage composition per the 2.3.1 switch matrix, canonical order.
+        """按 2.3.1 开关矩阵以规范链序组链。
 
-        The CLI hands in the constructed enabled stages; composition here
-        re-orders them canonically and drops anything the config disables.
-        `generate` only ever runs on main process-mode batches (never on
-        re-flow sub-batches, never in generate_only where it is the chain head).
-        `classify` is included in the main, re-flow AND generate_only chains
-        (v1.7, §7.9) — already-classified items rely on M13's idempotent skip.
+        CLI 交进来的是已构造的启用算子；这里只负责按规范序重排并剔掉配置关闭的。
+        ``generate`` 只出现在 process 模式的主批链上（再流转子批绝不含它，generate_only
+        下它是链头另行驱动）。``classify`` 在主链、再流转链与 generate_only 链上**都**在
+        （v1.7，§7.9）——已分类的信封靠 M13 的幂等跳过。
+
+        @param include_generate: 是否把 generate 工位纳入本链
+        @return: 按规范链序排好的阶段列表
         """
         cfg = self.cfg
         enabled = {
@@ -853,14 +990,16 @@ class Orchestrator:
         by_name = {s.name: s for s in self.stages}
         return [by_name[n] for n in _CHAIN_ORDER if enabled[n] and n in by_name]
 
-    # ── run-level stats aggregation ────────────────────────────────────────
+    # ── 运行级统计汇总 ─────────────────────────────────────────────────────
 
     def _collect_quality_stats(self, batch: list[PipelineItem]) -> None:
-        """Aggregate quality scores into the report histogram/means (M10 owns
-        report assembly; only counts, never data content). v1.7 R12: with
-        classify enabled the accumulators additionally split by pool
-        (= item.classification.label); classify disabled is byte-identical
-        to the flat v1.6 path."""
+        """把质量分汇进报表直方图与均值（报表组装归 M10，只记数、绝不记数据内容）。
+
+        v1.7 R12：classify 启用时累加器额外按池（= item.classification.label）分列；
+        classify 关闭时与 v1.6 的平坦路径逐字节一致。
+
+        @param batch: 本批信封
+        """
         classify_on = self.cfg.classify.enabled
         for item in batch:
             pool = (item.classification.label
@@ -882,19 +1021,20 @@ class Orchestrator:
                     psum[key] = psum.get(key, 0.0) + qs.score
                     pn[key] = pn.get(key, 0) + 1
 
-    # ── finalize / report ──────────────────────────────────────────────────
+    # ── finalize 与报表 ────────────────────────────────────────────────────
 
     def _finalize(self) -> RunSummary:
+        """收尾：定退出码 → 组报表 → 交付 → 发 run.end。
+
+        @return: 运行摘要
+        """
         wall_s = time.perf_counter() - self._t0
-        # v1.11 (V19/V13⑤): ONE more freeze after the final batch, before
-        # report assembly — report.budget.image_cost must read the
-        # calibration END value (per-batch freezes already ran at every
-        # dispatch boundary; with an empty current bucket this is a no-op).
+        # v1.11（V19/V13⑤）：末批之后、组报表之前再冻结一次——report.budget.image_cost
+        # 必须读到校准**终值**（每批派发边界已冻结过；当前桶为空时这次是 no-op）。
         self._freeze_calibrator()
-        # Source of truth is the MetricsSink flag: the breaker can open on the
-        # tail calls of a batch without CircuitBreakerTripped ever escaping a
-        # stage (every in-flight call fails record-level first) — the run must
-        # still end 4 / undelivered.
+        # 事实源是 MetricsSink 的标志位：熔断可能在一批的尾部调用上打开而
+        # CircuitBreakerTripped 从未逃出任何阶段（在飞调用都先在记录级失败）——这轮仍须
+        # 以 4 / 未交付收尾。
         self._circuit_broken = (self._circuit_broken
                                 or bool(getattr(self.metrics, "circuit_broken", False)))
         if self._circuit_broken:
@@ -904,12 +1044,10 @@ class Orchestrator:
         else:
             exit_code = 0
         report = self._build_report(exit_code=exit_code, wall_s=wall_s)
-        # v1.6 熔断交付 (spec 3.10.3, stakeholder decision 1.6 ②): a circuit
-        # break ALSO delivers the completed batches — fsync + atomic rename,
-        # report marked run.partial_delivery=true with counts.unprocessed as
-        # the balancing residual. deliver=True here is unconditional; the
-        # emitter still refuses to rename after a channel-write failure
-        # (_undeliverable), and dry-run passes deliver=False elsewhere.
+        # v1.6 熔断交付（spec 3.10.3，1.6 对齐决策 ②）：熔断**同样**交付已完成的批——
+        # fsync + 原子改名，报告标 run.partial_delivery=true 并以 counts.unprocessed 作
+        # 平衡残差。这里的 deliver=True 是无条件的；emitter 在通道写失败后仍会拒绝改名
+        # （_undeliverable），而 dry-run 走的是另一处的 deliver=False。
         self.emitter.finalize(report, deliver=True)
         self.metrics.event(_EV_RUN_END, stage="run", batch_no=0,
                            payload={"counts": report["counts"], "exit_code": exit_code})
@@ -920,15 +1058,59 @@ class Orchestrator:
                           rejects_lines=self._rejects_lines)
 
     def _build_report(self, exit_code: int, wall_s: float) -> dict:
-        """Assemble the §9.3 report dict from ingestor.report, metrics counters,
-        schema_engine.stats, llm.usage_by_profile and stage timing."""
+        """从 ingestor.report、metrics 计数器、schema_engine.stats、llm.usage_by_profile
+        与阶段计时组装 §9.3 报表字典（顶层键序冻结）。
+
+        @param exit_code: 本轮退出码
+        @param wall_s: 运行墙钟秒数
+        @return: 报表字典
+        """
         cfg = self.cfg
-        counters = dict(getattr(self.metrics, "counters", {}) or {})
-
-        def c(key: str) -> int:
-            return int(counters.get(key, 0))
-
+        c = _CounterView(dict(getattr(self.metrics, "counters", {}) or {}))
         ingest_report = getattr(self.ingestor, "report", None) if self.ingestor else None
+        counts = self._report_counts(c, ingest_report)
+        report: dict = {"run": self._report_run_block(exit_code), "counts": counts}
+        if cfg.segment.enabled:
+            report["stream"] = self._report_stream(c, counts, ingest_report)
+        if cfg.dedup.enabled:
+            report["dedup"] = self._report_dedup(c)
+        if cfg.quality.enabled:
+            report["quality"] = self._report_quality(c)
+        stats = getattr(self.schema_engine, "stats", None) if self.schema_engine else None
+        report["schema_engine"] = {
+            "resolved_at": dict(stats) if stats else dict(_SCHEMA_STATS_ZERO)}
+        if cfg.annotate.enabled and cfg.annotate.self_consistency >= 3:
+            report["annotate"] = {"sc_disagreements": c("annotate.sc_disagreements")}
+        if cfg.generate.enabled:
+            report["generate"] = self._report_generate(c)
+        if cfg.classify.enabled:
+            report["classify"] = self._report_classify(c)
+        budget_block = self._report_budget(c)
+        if budget_block is not None:
+            report["budget"] = budget_block
+        report["trace"] = self._report_trace()
+        report["llm_usage"] = self._report_llm_usage()
+        report["timing"] = {
+            "wall_s": round(wall_s, 3),
+            "per_stage_s": {name: round(seconds, 3)
+                            for name, seconds in self._stage_time.items()},
+        }
+        return report
+
+    def _report_counts(self, c: _CounterView, ingest_report) -> dict:
+        """组装 counts 节（键的在场条件即 §9.3 的只增约定）。
+
+        v1.7 R9/R10：fanout 键只在 multi 分配下出现（single 永不扇出；计数由
+        _run_chain 的 len 差值计量喂入，M10 属主）。v1.8 只增：segment 启用时三个流计数
+        才出现（episodes 来自 len 差值计量，absorbed/dropped_noise 来自 post-emit 清点）。
+        v1.9 只增（T7）：stitched 来自 post-emit 清点，threads 是**单点导出**
+        threads = episodes − stitched（不设第二计数器——T16 双落点护栏）。
+
+        @param c: 计数器视图
+        @param ingest_report: M2 摄取报表（generate_only 下为 None）
+        @return: counts 字典
+        """
+        cfg = self.cfg
         counts = {
             "scanned": int(getattr(ingest_report, "scanned", 0)),
             "ingested": int(getattr(ingest_report, "ingested", 0)),
@@ -941,31 +1123,54 @@ class Orchestrator:
             "emitted": c("counts.emitted"),
         }
         if cfg.classify.enabled and cfg.classify.assignment == "multi":
-            # v1.7 R9/R10: the fanout key appears only under multi assignment
-            # (§9.3) — single assignment never fans out; the counter is fed by
-            # the _process_batch len-delta metering (M10-owned).
             counts["fanout"] = c("counts.fanout")
         if cfg.segment.enabled:
-            # v1.8 只增 (§9.3): the three stream counts appear only when
-            # segment is enabled — episodes from the len-delta metering,
-            # absorbed/dropped_noise from the post-emit tallies (all M10-owned).
             counts["episodes"] = c("counts.episodes")
             counts["absorbed"] = c("counts.absorbed")
             counts["dropped_noise"] = c("counts.dropped_noise")
         if cfg.stitch.enabled:
-            # v1.9 只增 (§9.3/T7): stitched from the post-emit tally; threads is
-            # the SINGLE-POINT derivation threads = episodes − stitched (no
-            # second counter — the T16 double-landing guard).
             counts["stitched"] = c("counts.stitched")
             counts["threads"] = counts["episodes"] - counts["stitched"]
+        if self._circuit_broken or (cfg.segment.enabled and self._interrupted):
+            counts["unprocessed"] = self._unprocessed_residual(counts)
+        return counts
 
+    def _unprocessed_residual(self, counts: dict) -> int:
+        """counts.unprocessed = 平衡残差，使守恒式扩展为 emitted + dropped_* + failed +
+        bad_input + unprocessed = scanned + generated [+ fanout] [+ episodes]（即进了流水线
+        却没走到任何终态计数的记录，含 generate_only 里生成了但从未装批的记录；fanout 项
+        是 v1.7 R10——扇出兄弟也是信封）。v1.8（S18）：**流模式**下该键在中断的运行上也出现
+        （SIGINT 叠加会话缓冲会滞留在飞记录），两侧同步扩展——源侧 + episodes，终态侧
+        + absorbed + dropped_noise。非流的中断运行残差可证为零、永不加键（回归锚）。
+
+        @param counts: 已填好各终态的 counts 字典
+        @return: 非负残差
+        """
+        residual = (counts["scanned"] + counts["generated"]
+                    + counts.get("fanout", 0)
+                    + counts.get("episodes", 0)
+                    - counts["emitted"] - counts["dropped_dup"]
+                    - counts["dropped_lowq"] - counts["dropped_verify"]
+                    - counts["failed"] - counts["bad_input"]
+                    - counts.get("absorbed", 0)
+                    - counts.get("dropped_noise", 0)
+                    - counts.get("stitched", 0))   # v1.9（T7）：壳是终态
+        return max(0, residual)
+
+    def _report_run_block(self, exit_code: int) -> dict:
+        """组装 run 节（工具版本、起止时刻、中断/熔断标志、模态、种子、两个摘要）。
+
+        @param exit_code: 本轮退出码
+        @return: run 节字典
+        """
+        cfg = self.cfg
         run_block: dict = {
             "tool_version": __version__,
             "started_at": self.run_started_at.isoformat(),
             "finished_at": datetime.now().astimezone().isoformat(),
             "interrupted": self._interrupted,
-            # Explicit breaker flag (E2E finding P4-10): interrupted stays
-            # false on a circuit break — exit_code=4 alone was easy to misread.
+            # 显式熔断标志（E2E 发现 P4-10）：熔断时 interrupted 仍为 false——只看
+            # exit_code=4 太容易读错。
             "circuit_broken": self._circuit_broken,
             "exit_code": exit_code,
             "modality": cfg.run.modality,
@@ -979,392 +1184,375 @@ class Orchestrator:
             # 同款形态）——仅工件通道实际写入时在场（dry-run/形态关闭恒缺席）。
             run_block["artifact"] = dict(artifact)
         if self._circuit_broken:
-            # v1.6 熔断交付 (spec 6.4, 只增): partial_delivery present only on
-            # breaker-trip delivery.
+            # v1.6 熔断交付（spec 6.4，只增）：partial_delivery 仅熔断交付时在场。
             run_block["partial_delivery"] = True
-        if self._circuit_broken or (cfg.segment.enabled and self._interrupted):
-            # counts.unprocessed = balancing residual so the invariant extends
-            # to emitted + dropped_* + failed + bad_input + unprocessed =
-            # scanned + generated [+ fanout] [+ episodes] (records that entered
-            # the pipeline but reached no terminal count, incl. generated-but-
-            # never-batched records in generate_only; the fanout term is v1.7
-            # R10 — fanned-out siblings are envelopes too). v1.8 (S18): in
-            # STREAM MODE the key also appears on interrupted runs (SIGINT over
-            # the session buffer strands in-flight records) with the expanded
-            # sides — + episodes on the source side, + absorbed + dropped_noise
-            # among the terminal counts. Non-stream interrupted runs keep a
-            # provably zero residual and never emit the key (regression anchor).
-            residual = (counts["scanned"] + counts["generated"]
-                        + counts.get("fanout", 0)
-                        + counts.get("episodes", 0)
-                        - counts["emitted"] - counts["dropped_dup"]
-                        - counts["dropped_lowq"] - counts["dropped_verify"]
-                        - counts["failed"] - counts["bad_input"]
-                        - counts.get("absorbed", 0)
-                        - counts.get("dropped_noise", 0)
-                        - counts.get("stitched", 0))   # v1.9 (T7): shells are terminal
-            counts["unprocessed"] = max(0, residual)
-        report: dict = {
-            "run": run_block,
-            "counts": counts,
+        return run_block
+
+    def _report_stream(self, c: _CounterView, counts: dict, ingest_report) -> dict:
+        """组装 v1.8 stream 节（§9.3/spec §6.4：紧跟 counts 之后）。
+
+        sessions 的数据源是 IngestReport（M2 属主，§7.1）；below_min_len /
+        digest_poor_frames / segment_failures 直出 M14 计数器；各子块按闭集词表直出
+        M15/M16/M13/M5/M7 的计数器（零基，与 report.classify.classes 同款）。
+
+        @param c: 计数器视图
+        @param counts: 已组装的 counts 节
+        @param ingest_report: M2 摄取报表
+        @return: stream 节字典
+        """
+        cfg = self.cfg
+        episodes = counts["episodes"]
+        absorbed = counts["absorbed"]
+        block: dict = {
+            "sessions": int(getattr(ingest_report, "sessions", 0)),
+            "episodes": episodes,
+            "mean_episode_len": (round(absorbed / episodes, 2) if episodes else 0.0),
+            "absorbed": absorbed,
+            "dropped_noise": counts["dropped_noise"],
+            "below_min_len": c("segment.below_min_len"),
+            "digest_poor_frames": c("segment.digest_poor_frames"),
+            "segment_failures": c("segment.failures"),
         }
+        seg_prof = cfg.llm_profiles.get(cfg.segment.llm)
+        if seg_prof is not None and seg_prof.context_window > 0:
+            # v1.11（V13④，spec §6.4）：**实际**派发窗数——M14 属主的 segment.windows
+            # 计数器。**预算为门**的在场条件：仅当 segment 阶段的 profile 声明了窗宽时该键
+            # 才浮现（预算未声明时不在场）——计数发射本身无条件（进程内部），但全未声明的
+            # 报表必须与 v1.10 逐字节一致（CONTRACTS §9.3 条款）。它是用户侧对账 V12 上界
+            # segment_calls 估算的那一面。
+            block["windows"] = c("segment.windows")
+        block.update(self._report_stream_operators(c))
+        return block
 
-        if cfg.segment.enabled:
-            # v1.8 stream block (§9.3/spec §6.4: placed right after counts).
-            # sessions data source = IngestReport (M2 owner, §7.1);
-            # below_min_len / digest_poor_frames / segment_failures surface the
-            # M14 counters; the sub-blocks surface the M15/M7 counters over the
-            # closed vocabularies (zero-based like report.classify.classes).
-            episodes = counts["episodes"]
-            absorbed = counts["absorbed"]
-            stream_block: dict = {
-                "sessions": int(getattr(ingest_report, "sessions", 0)),
-                "episodes": episodes,
-                "mean_episode_len": (round(absorbed / episodes, 2)
-                                     if episodes else 0.0),
-                "absorbed": absorbed,
-                "dropped_noise": counts["dropped_noise"],
-                "below_min_len": c("segment.below_min_len"),
-                "digest_poor_frames": c("segment.digest_poor_frames"),
-                "segment_failures": c("segment.failures"),
+    # v1.9（T16，链序槽位在 extract 之前）stitch：stitched 镜像 counts.stitched，其余五键
+    # 直出 M16 计数器。v1.12（spec §3.7 report 行）frame_classify 在 stitch 之后、extract
+    # 之前，frame_annotate 在 extract 之后、verify 之前：两者各四键零基闭集，计数面分别由
+    # M13 帧 pass 与 M5 帧 pass 供给（后者的 failed 另含 M11 写前校验兜底，discarded 由
+    # M11 沉没成本记账供给）。
+    def _report_stream_operators(self, c: _CounterView) -> dict:
+        """stream 节里按链序排布的算子子块（各自以开关为门）。
+
+        @param c: 计数器视图
+        @return: 按链序排好的子块字典（未启用的开关不出现）
+        """
+        cfg = self.cfg
+        blocks: dict = {}
+        if cfg.stitch.enabled:
+            blocks["stitch"] = {
+                "stitched": c("counts.stitched"),
+                "rescued_short": c("stitch.rescued_short"),
+                "seams": c("stitch.seams"),
+                "judgments": c("stitch.judgments"),
+                "repass_judgments": c("stitch.repass_judgments"),
+                "failures": c("stitch.failures"),
             }
-            seg_prof = cfg.llm_profiles.get(cfg.segment.llm)
-            if seg_prof is not None and seg_prof.context_window > 0:
-                # v1.11 (V13④, spec §6.4): the ACTUAL dispatched-window count
-                # — the M14-owned segment.windows counter. BUDGET-GATED
-                # presence: the key surfaces only when the segment stage's
-                # profile declares a window（预算未声明时不在场）— the counter
-                # emission stays unconditional (process-internal), but an
-                # all-undeclared report must remain byte-identical to v1.10
-                # (CONTRACTS §9.3 clause). It is the user-side reconciliation
-                # face for the V12 upper-bound segment_calls estimate.
-                stream_block["windows"] = c("segment.windows")
-            if cfg.stitch.enabled:
-                # v1.9 (T16, chain-order slot before extract): stitched mirrors
-                # counts.stitched; the other five surface the M16 counters.
-                stream_block["stitch"] = {
-                    "stitched": c("counts.stitched"),
-                    "rescued_short": c("stitch.rescued_short"),
-                    "seams": c("stitch.seams"),
-                    "judgments": c("stitch.judgments"),
-                    "repass_judgments": c("stitch.repass_judgments"),
-                    "failures": c("stitch.failures"),
-                }
-            if cfg.frame_classify.enabled:
-                # v1.12（spec §3.7 report 行）：链序槽位 stitch 之后、extract 之前，
-                # 仅开关开启时在场；四键零基闭集镜像 stitch/extract 子块形态，
-                # 计数面由 M13 帧 pass 供给（frame_classify.* 前缀）。
-                stream_block["frame_classify"] = {
-                    "calls": c("frame_classify.calls"),
-                    "fallback": c("frame_classify.fallback"),
-                    "window_failures": c("frame_classify.window_failures"),
-                    "skipped_degraded": c("frame_classify.skipped_degraded"),
-                }
-            if cfg.extract.enabled:
-                stream_block["extract"] = {
-                    "transitions": c("extract.transitions"),
-                    "fallback_steps": c("extract.fallback_steps"),
-                    "failures": c("extract.failures"),
-                    "by_type": {t: c(f"extract.by_type.{t}")
-                                for t in _ACTION_TYPES},
-                }
-            if cfg.frame_annotate.enabled:
-                # v1.12（spec §3.7 report 行）：链序槽位 extract 之后、verify 之前，
-                # 仅开关开启时在场；annotated/skipped/failed 由 M5 帧 pass 供给，
-                # failed 另含 M11 写前校验兜底，discarded 由 M11 沉没成本记账供给。
-                stream_block["frame_annotate"] = {
-                    "annotated": c("frame_annotate.annotated"),
-                    "skipped": c("frame_annotate.skipped"),
-                    "failed": c("frame_annotate.failed"),
-                    "discarded": c("frame_annotate.discarded"),
-                }
-            if cfg.verify.enabled:
-                stream_block["verify"] = {
-                    "membership_repairs": c("verify.membership_repairs"),
-                    "boundary_flags": c("verify.boundary_flags"),
-                    "defects": {k: c(f"verify.defects.{k}")
-                                for k in _DEFECT_KINDS},
-                }
-            report["stream"] = stream_block
-
-        if cfg.dedup.enabled:
-            dedup_block = {
-                "exact": c("dedup.exact"),
-                "near_text": c("dedup.near_text"),
-                "near_image": c("dedup.near_image"),
-                "near_both": c("dedup.near_both"),
-                "clusters": c("dedup.clusters"),
-                "image_decode_failures": c("dedup.image_decode_failures"),
+        if cfg.frame_classify.enabled:
+            blocks["frame_classify"] = {
+                "calls": c("frame_classify.calls"),
+                "fallback": c("frame_classify.fallback"),
+                "window_failures": c("frame_classify.window_failures"),
+                "skipped_degraded": c("frame_classify.skipped_degraded"),
             }
-            if cfg.dedup.semantic:
-                dedup_block["near_semantic"] = c("dedup.near_semantic")
-                dedup_block["embedding_failures"] = c("dedup.embedding_failures")
-            report["dedup"] = dedup_block
-
-        if cfg.quality.enabled:
-            # Top-level mode/rounds keep the globally-inherited base values
-            # even under per-class overrides (v1.7 R14); by_class carries each
-            # pool's effective values.
-            report["quality"] = {
-                "mode": "pairwise_bt" if cfg.quality.mode == "pairwise" else "pointwise",
-                "rounds": cfg.quality.rounds,
-                "judgment_failures": c("quality.judgment_failures"),
-                "aggregate_histogram": {label: self._agg_hist[i]
-                                        for i, label in enumerate(_HIST_LABELS)},
-                "per_criterion_mean": {key: self._crit_sum[key] / self._crit_n[key]
-                                       for key in sorted(self._crit_sum)
-                                       if self._crit_n.get(key)},
+        if cfg.extract.enabled:
+            blocks["extract"] = {
+                "transitions": c("extract.transitions"),
+                "fallback_steps": c("extract.fallback_steps"),
+                "failures": c("extract.failures"),
+                "by_type": {t: c(f"extract.by_type.{t}") for t in _ACTION_TYPES},
             }
-            # v1.7 R12: with classify enabled the tie counters are
-            # pool-dimensioned (quality.tie_outcomes.<pool>.<crit>); parse them
-            # once for both the per-pool rates and the cross-pool aggregate.
-            prefix = "quality.tie_outcomes."
-            tie_rate: dict[str, float] = {}
-            pool_tie_rate: dict[str, dict[str, float]] = {}
-            if cfg.classify.enabled:
-                crit_ties: dict[str, int] = {}
-                crit_comps: dict[str, int] = {}
-                for key, ties in sorted(self.metrics.counters.items()):
-                    if not key.startswith(prefix):
-                        continue
-                    rest = key[len(prefix):]
-                    if "." not in rest:            # malformed / flat key: skip
-                        continue
-                    pool, _, crit = rest.partition(".")
-                    comps = self.metrics.counters.get(
-                        f"quality.tie_comparisons.{pool}.{crit}", 0)
-                    if comps:
-                        pool_tie_rate.setdefault(pool, {})[crit] = ties / comps
-                        crit_ties[crit] = crit_ties.get(crit, 0) + ties
-                        crit_comps[crit] = crit_comps.get(crit, 0) + comps
-                tie_rate = {crit: crit_ties[crit] / crit_comps[crit]
-                            for crit in sorted(crit_ties) if crit_comps.get(crit)}
-            else:
-                for key, ties in sorted(self.metrics.counters.items()):
-                    if not key.startswith(prefix):
-                        continue
-                    crit = key[len(prefix):]
-                    comps = self.metrics.counters.get(
-                        f"quality.tie_comparisons.{crit}", 0)
-                    if comps:
-                        tie_rate[crit] = ties / comps
-            # Tie-rate emission gate (v1.7 R14): global pairwise, or — classify
-            # enabled — at least one pairwise pool exists. Pairwise percentile
-            # means are ~0.5 by construction; the tie rate is the
-            # discriminative per-criterion signal (E2E P4-9).
-            any_pairwise_pool = cfg.classify.enabled and any(
-                view.quality.mode == "pairwise" for view in cfg.class_views.values())
-            if cfg.quality.mode == "pairwise" or any_pairwise_pool:
-                report["quality"]["per_criterion_tie_rate"] = tie_rate
-            if cfg.classify.enabled:
-                # v1.7 R12/R14 quality.by_class: one entry per DECLARED class
-                # (zero-count based, like report.classify.classes); mode/rounds
-                # are the pool's EFFECTIVE values from cfg.class_views.
-                by_class: dict[str, dict] = {}
-                for pool in sorted(cfg.class_views):
-                    view_q = cfg.class_views[pool].quality
-                    hist = self._pool_agg_hist.get(pool, [0] * 10)
-                    psum = self._pool_crit_sum.get(pool, {})
-                    pn = self._pool_crit_n.get(pool, {})
-                    by_class[pool] = {
-                        "mode": ("pairwise_bt" if view_q.mode == "pairwise"
-                                 else "pointwise"),
-                        "rounds": view_q.rounds,
-                        "aggregate_histogram": {label: hist[i]
-                                                for i, label in enumerate(_HIST_LABELS)},
-                        "per_criterion_mean": {key: psum[key] / pn[key]
-                                               for key in sorted(psum)
-                                               if pn.get(key)},
-                        "per_criterion_tie_rate": pool_tie_rate.get(pool, {}),
-                    }
-                report["quality"]["by_class"] = by_class
+        if cfg.frame_annotate.enabled:
+            blocks["frame_annotate"] = {
+                "annotated": c("frame_annotate.annotated"),
+                "skipped": c("frame_annotate.skipped"),
+                "failed": c("frame_annotate.failed"),
+                "discarded": c("frame_annotate.discarded"),
+            }
+        if cfg.verify.enabled:
+            blocks["verify"] = {
+                "membership_repairs": c("verify.membership_repairs"),
+                "boundary_flags": c("verify.boundary_flags"),
+                "defects": {k: c(f"verify.defects.{k}") for k in _DEFECT_KINDS},
+            }
+        return blocks
 
-        stats = getattr(self.schema_engine, "stats", None) if self.schema_engine else None
-        report["schema_engine"] = {"resolved_at": dict(stats) if stats else dict(_SCHEMA_STATS_ZERO)}
+    def _report_dedup(self, c: _CounterView) -> dict:
+        """组装 dedup 节（语义层两键仅 semantic 开启时在场）。
 
-        if cfg.annotate.enabled and cfg.annotate.self_consistency >= 3:
-            report["annotate"] = {"sc_disagreements": c("annotate.sc_disagreements")}
+        @param c: 计数器视图
+        @return: dedup 节字典
+        """
+        block = {
+            "exact": c("dedup.exact"),
+            "near_text": c("dedup.near_text"),
+            "near_image": c("dedup.near_image"),
+            "near_both": c("dedup.near_both"),
+            "clusters": c("dedup.clusters"),
+            "image_decode_failures": c("dedup.image_decode_failures"),
+        }
+        if self.cfg.dedup.semantic:
+            block["near_semantic"] = c("dedup.near_semantic")
+            block["embedding_failures"] = c("dedup.embedding_failures")
+        return block
 
-        if cfg.generate.enabled:
-            buckets: dict[str, dict] = {}
-            prefix = "generate.buckets."
-            # rejected_by_validator joined the whitelist (bug fix, spec v1.7 §6:
-            # M6 counts it since v1.5 but the report parse silently dropped it);
-            # zero-init keeps the three always-present fields — the fourth is
-            # written only when its counter appears (validator configured).
-            for key, value in counters.items():
+    def _report_quality(self, c: _CounterView) -> dict:
+        """组装 quality 节。
+
+        顶层 mode/rounds 即便存在按类覆盖也保持全局继承的基值（v1.7 R14）；各池的实效值由
+        by_class 承载。平局率发射门（v1.7 R14）：全局 pairwise，或——classify 启用时——
+        至少存在一个 pairwise 池。pairwise 的百分位均值按构造恒 ≈ 0.5，平局率才是有区分度
+        的按准则信号（E2E P4-9）。
+
+        @param c: 计数器视图
+        @return: quality 节字典
+        """
+        cfg = self.cfg
+        block: dict = {
+            "mode": "pairwise_bt" if cfg.quality.mode == "pairwise" else "pointwise",
+            "rounds": cfg.quality.rounds,
+            "judgment_failures": c("quality.judgment_failures"),
+            "aggregate_histogram": {label: self._agg_hist[i]
+                                    for i, label in enumerate(_HIST_LABELS)},
+            "per_criterion_mean": {key: self._crit_sum[key] / self._crit_n[key]
+                                   for key in sorted(self._crit_sum)
+                                   if self._crit_n.get(key)},
+        }
+        tie_rate, pool_tie_rate = self._quality_tie_rates(c)
+        any_pairwise_pool = cfg.classify.enabled and any(
+            view.quality.mode == "pairwise" for view in cfg.class_views.values())
+        if cfg.quality.mode == "pairwise" or any_pairwise_pool:
+            block["per_criterion_tie_rate"] = tie_rate
+        if cfg.classify.enabled:
+            block["by_class"] = self._quality_by_class(pool_tie_rate)
+        return block
+
+    def _quality_tie_rates(self, c: _CounterView) -> tuple[dict, dict]:
+        """解析平局计数器为按准则平局率与按池平局率。
+
+        v1.7 R12：classify 启用时平局计数器是按池分维的
+        （quality.tie_outcomes.<pool>.<crit>），一趟解析同时产出按池率与跨池聚合率。
+
+        @param c: 计数器视图
+        @return: (按准则平局率, 按池按准则平局率)
+        """
+        prefix = "quality.tie_outcomes."
+        tie_rate: dict[str, float] = {}
+        pool_tie_rate: dict[str, dict[str, float]] = {}
+        if not self.cfg.classify.enabled:
+            for key, ties in sorted(c.values.items()):
                 if not key.startswith(prefix):
                     continue
-                bucket, _, field_name = key[len(prefix):].rpartition(".")
-                if not bucket or field_name not in ("calls", "produced", "survived_dedup",
-                                                    "rejected_by_validator"):
-                    continue
-                buckets.setdefault(bucket, {"calls": 0, "produced": 0,
-                                            "survived_dedup": 0})[field_name] = int(value)
-            report["generate"] = {"buckets": buckets}
-            if cfg.generate_stream.enabled:
-                # v1.13（裁决·观测面）：stream 子块——counts-only，形态开启才在场；
-                # 键集与键序冻结；sequences 按声明类零基（report.classify.classes
-                # 同款），计数面由 M6 供给（generate.stream.* 前缀）。
-                report["generate"]["stream"] = {
-                    "sessions": c("generate.stream.sessions"),
-                    "crossed_sessions": c("generate.stream.crossed_sessions"),
-                    "sequences": {
-                        spec.name: {
-                            "planned": c(f"generate.stream.sequences.{spec.name}.planned"),
-                            "produced": c(f"generate.stream.sequences.{spec.name}.produced"),
-                        }
-                        for spec in cfg.classify.classes
-                    },
-                    "frames": c("generate.stream.frames"),
-                    "noise_frames": c("generate.stream.noise_frames"),
-                    "duplicates": c("generate.stream.duplicates"),
-                    "plan_calls": c("generate.stream.plan_calls"),
-                    "realize_calls": c("generate.stream.realize_calls"),
-                    "noise_calls": c("generate.stream.noise_calls"),
-                    "plan_failures": c("generate.stream.plan_failures"),
-                    "realize_failures": c("generate.stream.realize_failures"),
-                    "validator_scrapped": c("generate.stream.validator_scrapped"),
+                crit = key[len(prefix):]
+                comps = c.values.get(f"quality.tie_comparisons.{crit}", 0)
+                if comps:
+                    tie_rate[crit] = ties / comps
+            return tie_rate, pool_tie_rate
+        crit_ties: dict[str, int] = {}
+        crit_comps: dict[str, int] = {}
+        for key, ties in sorted(c.values.items()):
+            if not key.startswith(prefix):
+                continue
+            rest = key[len(prefix):]
+            if "." not in rest:                    # 畸形/平坦键：跳过
+                continue
+            pool, _, crit = rest.partition(".")
+            comps = c.values.get(f"quality.tie_comparisons.{pool}.{crit}", 0)
+            if comps:
+                pool_tie_rate.setdefault(pool, {})[crit] = ties / comps
+                crit_ties[crit] = crit_ties.get(crit, 0) + ties
+                crit_comps[crit] = crit_comps.get(crit, 0) + comps
+        tie_rate = {crit: crit_ties[crit] / crit_comps[crit]
+                    for crit in sorted(crit_ties) if crit_comps.get(crit)}
+        return tie_rate, pool_tie_rate
+
+    def _quality_by_class(self, pool_tie_rate: dict) -> dict:
+        """v1.7 R12/R14 的 quality.by_class：每个**声明类**一条（零基，与
+        report.classify.classes 同款）；mode/rounds 取该池自 cfg.class_views 的**实效值**。
+
+        @param pool_tie_rate: 按池按准则平局率
+        @return: by_class 字典
+        """
+        by_class: dict[str, dict] = {}
+        for pool in sorted(self.cfg.class_views):
+            view_q = self.cfg.class_views[pool].quality
+            hist = self._pool_agg_hist.get(pool, [0] * 10)
+            psum = self._pool_crit_sum.get(pool, {})
+            pn = self._pool_crit_n.get(pool, {})
+            by_class[pool] = {
+                "mode": "pairwise_bt" if view_q.mode == "pairwise" else "pointwise",
+                "rounds": view_q.rounds,
+                "aggregate_histogram": {label: hist[i]
+                                        for i, label in enumerate(_HIST_LABELS)},
+                "per_criterion_mean": {key: psum[key] / pn[key]
+                                       for key in sorted(psum) if pn.get(key)},
+                "per_criterion_tie_rate": pool_tie_rate.get(pool, {}),
+            }
+        return by_class
+
+    def _report_generate(self, c: _CounterView) -> dict:
+        """组装 generate 节（按桶计数 + v1.13 时间流子块）。
+
+        rejected_by_validator 已并入白名单（bug 修复，spec v1.7 §6：M6 自 v1.5 起就在计数，
+        报表解析却静默丢弃）；零初始化保住三个恒在字段，第四个仅在其计数器出现时（即配了
+        validator）才写。
+
+        @param c: 计数器视图
+        @return: generate 节字典
+        """
+        buckets: dict[str, dict] = {}
+        prefix = "generate.buckets."
+        for key, value in c.values.items():
+            if not key.startswith(prefix):
+                continue
+            bucket, _, field_name = key[len(prefix):].rpartition(".")
+            if not bucket or field_name not in ("calls", "produced", "survived_dedup",
+                                                "rejected_by_validator"):
+                continue
+            buckets.setdefault(bucket, {"calls": 0, "produced": 0,
+                                        "survived_dedup": 0})[field_name] = int(value)
+        block: dict = {"buckets": buckets}
+        if self.cfg.generate_stream.enabled:
+            block["stream"] = self._report_generate_stream(c)
+        return block
+
+    def _report_generate_stream(self, c: _CounterView) -> dict:
+        """v1.13（裁决·观测面）时间流子块——counts-only，形态开启才在场；键集与键序冻结；
+        sequences 按声明类零基（report.classify.classes 同款），计数面由 M6 供给
+        （generate.stream.* 前缀）。
+
+        @param c: 计数器视图
+        @return: generate.stream 子块字典
+        """
+        return {
+            "sessions": c("generate.stream.sessions"),
+            "crossed_sessions": c("generate.stream.crossed_sessions"),
+            "sequences": {
+                spec.name: {
+                    "planned": c(f"generate.stream.sequences.{spec.name}.planned"),
+                    "produced": c(f"generate.stream.sequences.{spec.name}.produced"),
                 }
+                for spec in self.cfg.classify.classes
+            },
+            "frames": c("generate.stream.frames"),
+            "noise_frames": c("generate.stream.noise_frames"),
+            "duplicates": c("generate.stream.duplicates"),
+            "plan_calls": c("generate.stream.plan_calls"),
+            "realize_calls": c("generate.stream.realize_calls"),
+            "noise_calls": c("generate.stream.noise_calls"),
+            "plan_failures": c("generate.stream.plan_failures"),
+            "realize_failures": c("generate.stream.realize_failures"),
+            "validator_scrapped": c("generate.stream.validator_scrapped"),
+        }
 
-        if cfg.classify.enabled:
-            # v1.7 §9.3 classify block: the classes histogram is zero-based
-            # over ALL declared classes (declaration order); counters are
-            # M13-owned (classify.fallback surfaces as fallback_count).
-            classify_block: dict = {
-                "assignment": cfg.classify.assignment,
-                "classes": {spec.name: c(f"classify.classes.{spec.name}")
-                            for spec in cfg.classify.classes},
-                "fallback_count": c("classify.fallback"),
-                "failures": c("classify.failures"),
-            }
-            if cfg.classify.assignment == "multi":
-                classify_block["multi_label_records"] = c("classify.multi_label_records")
-            report["classify"] = classify_block
+    def _report_classify(self, c: _CounterView) -> dict:
+        """v1.7 §9.3 classify 节：classes 直方图对**全部声明类**零基铺开（声明序）；计数器
+        归 M13 所有（classify.fallback 以 fallback_count 露面）。
 
+        @param c: 计数器视图
+        @return: classify 节字典
+        """
+        cfg = self.cfg
+        block: dict = {
+            "assignment": cfg.classify.assignment,
+            "classes": {spec.name: c(f"classify.classes.{spec.name}")
+                        for spec in cfg.classify.classes},
+            "fallback_count": c("classify.fallback"),
+            "failures": c("classify.failures"),
+        }
+        if cfg.classify.assignment == "multi":
+            block["multi_label_records"] = c("classify.multi_label_records")
+        return block
+
+    def _report_budget(self, c: _CounterView) -> dict | None:
+        """v1.11 report.budget（V13②④⑤；键名冻结于 §9.3）：**整节**仅在 ≥ 1 个本轮被引用
+        的 profile 声明了窗宽时才出现——全未声明时 report.json 与 v1.10 逐字节一致。只记数
+        与统计，绝无数据内容（§2.6）。M10 在组报表时自 ResolvedConfig、budget.min_window
+        与 llm.calibrator 组装 profiles/w_min/image_cost，其余键直出算子属主的计数器。
+
+        image_cost = 各 profile 的校准**终值**（V19；上面 finalize 的冻结已把末批折进去）。
+        最小忠实形态：只列校准器真正采过样的 profile（≥ 1 个冻结图片样本——低于最小样本数时
+        cost() 读到的仍是先验 ×1.2 的装填值）；样本台账取校准器批冻结的 _frozen_total，与
+        上面 metrics/_event_log 同为鸭子读法。
+
+        @param c: 计数器视图
+        @return: budget 节字典；无声明预算的 profile 时返回 None
+        """
         budget_profiles = self._budget_profiles()
-        if budget_profiles:
-            # v1.11 report.budget (V13②④⑤; key names FROZEN in §9.3): the
-            # WHOLE node appears only when ≥ 1 run-referenced profile
-            # declares a window — all-undeclared keeps report.json
-            # byte-identical to v1.10. Counts/stats only, never data content
-            # (§2.6). M10 assembles profiles/w_min/image_cost at report time
-            # from ResolvedConfig, budget.min_window and llm.calibrator; the
-            # remaining keys surface the operator-owned MetricsSink counters.
-            budget_block: dict = {
-                "profiles": {name: {"context_window": cw, "input_budget": ib}
-                             for name, cw, ib in budget_profiles},
-            }
-            if cfg.segment.enabled:
-                # [cap, w_min] under the frozen "segment.window" sub-key —
-                # w_min is the RAW budget.min_window value (uncapped by
-                # design: the estimate clamps at its own call site, V12/V26).
-                budget_block["w_min"] = {
-                    "segment.window": [cfg.segment.window,
-                                       budget.min_window(cfg)]}
-            trunc_prefix = "budget.truncations."
-            budget_block["truncations"] = {
-                key[len(trunc_prefix):]: int(value)
-                for key, value in sorted(counters.items())
-                if key.startswith(trunc_prefix) and value}   # nonzero stages only
-            budget_block["overflow_records"] = c("budget.overflow_records")
-            # image_cost = each profile's calibration END value (V19; the
-            # finalize freeze above folded the last batch in). Minimal
-            # faithful form: only profiles the calibrator actually sampled
-            # (≥ 1 frozen image sample — cost() below min-samples still reads
-            # the effective prior×1.2 packing value); the sample ledger is
-            # the calibrator's batch-frozen _frozen_total, duck-typed like
-            # the metrics/_event_log reads above.
-            calibrator = getattr(self.llm, "calibrator", None)
-            frozen_totals = dict(getattr(calibrator, "_frozen_total", None) or {})
-            budget_block["image_cost"] = {
-                name: int(calibrator.cost(name))
-                for name in sorted(frozen_totals) if frozen_totals[name] > 0}
-            budget_block["degrade_retries"] = c("budget.degrade_retries")
-            budget_block["escalations"] = c("budget.escalations")
-            report["budget"] = budget_block
+        if not budget_profiles:
+            return None
+        block: dict = {
+            "profiles": {name: {"context_window": cw, "input_budget": ib}
+                         for name, cw, ib in budget_profiles},
+        }
+        if self.cfg.segment.enabled:
+            # 冻结子键 "segment.window" 下的 [cap, w_min]——w_min 是 budget.min_window 的
+            # **原始**值（按设计不带上限：钳位发生在估算自己的调用点，V12/V26）。
+            block["w_min"] = {"segment.window": [self.cfg.segment.window,
+                                                 budget.min_window(self.cfg)]}
+        trunc_prefix = "budget.truncations."
+        block["truncations"] = {key[len(trunc_prefix):]: int(value)
+                                for key, value in sorted(c.values.items())
+                                if key.startswith(trunc_prefix) and value}  # 只列非零阶段
+        block["overflow_records"] = c("budget.overflow_records")
+        calibrator = getattr(self.llm, "calibrator", None)
+        frozen_totals = dict(getattr(calibrator, "_frozen_total", None) or {})
+        block["image_cost"] = {name: int(calibrator.cost(name))
+                               for name in sorted(frozen_totals) if frozen_totals[name] > 0}
+        block["degrade_retries"] = c("budget.degrade_retries")
+        block["escalations"] = c("budget.escalations")
+        return block
 
+    def _report_trace(self) -> dict:
+        """组装 trace 节。
+
+        终局的 run.end 事件要等本报表组装完才发（它的 payload 带报表 counts，且 §8.1 规定它
+        是 trace 的最后一行、写在 finalize 之后）。这里预先把它记上，好让 report.trace 与最终
+        的 trace 文件对得上：通道还开着就多记一行已写，写失败已关闭通道就多记一条丢弃。
+
+        @return: trace 节字典
+        """
         event_log = (getattr(self.metrics, "event_log", None)
                      or getattr(self.metrics, "_event_log", None))
         trace_events = int(getattr(event_log, "events_written", 0) or 0)
         trace_dropped = int(getattr(event_log, "dropped_events", 0) or 0)
-        if cfg.trace.enabled:
-            # The terminal run.end event is emitted only after this report is
-            # assembled (its payload carries the report counts, and §8.1 makes
-            # it the trace's last line, written after finalize). Account for it
-            # here so report.trace matches the final trace file: one more
-            # written line while the channel is open, one more dropped event
-            # once a write failure closed it.
+        if self.cfg.trace.enabled:
             if getattr(event_log, "closed", False):
                 trace_dropped += 1
             else:
                 trace_events += 1
-        report["trace"] = {
-            "enabled": cfg.trace.enabled,
-            # The EventLog may be writing to a diverted path (dry-run uses
-            # "<name>.dryrun<suffix>", P2-4) — report the ACTUAL file.
+        return {
+            "enabled": self.cfg.trace.enabled,
+            # EventLog 可能写在改道后的路径上（dry-run 用 "<name>.dryrun<suffix>"，
+            # P2-4）——报**实际**文件。
             "path": (getattr(getattr(event_log, "cfg", None), "path", None)
-                     or cfg.trace.path),
+                     or self.cfg.trace.path),
             "events": trace_events,
             "dropped_events": trace_dropped,
         }
 
+    def _report_llm_usage(self) -> dict:
+        """组装 llm_usage 节（零活动 profile 略去，保持 v1.5 报表形态）。
+
+        @return: llm_usage 节字典
+        """
         usage_by_profile = getattr(self.llm, "usage_by_profile", None) if self.llm else None
         llm_usage: dict[str, dict] = {}
         for name, usage in (usage_by_profile or {}).items():
-            # v1.6 key pool (spec 6.4, 只增): keys sub-object only for pools > 1
-            # (M9 pre-seeds every member, so len == pool size; key identity =
-            # env-var NAME, decision 1.6 ⑤); parked stats for pools > 1 or
-            # whenever nonzero — single-key parking must leave report evidence.
-            key_usages = getattr(usage, "keys", None) or {}
-            parked_calls = getattr(usage, "parked_calls", 0)
-            parked_ms = getattr(usage, "parked_ms", 0)
-            emit_keys = len(key_usages) > 1
-            emit_parked = emit_keys or bool(parked_calls) or bool(parked_ms)
-            if (usage.calls == 0 and usage.retries == 0
-                    and usage.prompt_tokens == 0 and usage.completion_tokens == 0
-                    and usage.est_cost_usd is None
-                    and not emit_keys and not emit_parked):
-                # Zero-activity profile (e.g. its only call was breaker-aborted
-                # before any attempt): keep the v1.5 report shape — omit.
-                continue
-            entry = {
-                "calls": usage.calls,
-                "prompt_tokens": usage.prompt_tokens,
-                "completion_tokens": usage.completion_tokens,
-                "retries": usage.retries,
-            }
-            if usage.est_cost_usd is not None:
-                entry["est_cost_usd"] = usage.est_cost_usd
-            if emit_keys:
-                entry["keys"] = {
-                    env: {"calls": ku.calls, "rate_limited": ku.rate_limited,
-                          "disabled": ku.disabled}
-                    for env, ku in sorted(key_usages.items())
-                }
-            if emit_parked:
-                entry["parked_calls"] = parked_calls
-                entry["parked_ms"] = parked_ms
-            llm_usage[name] = entry
-        report["llm_usage"] = llm_usage
-
-        report["timing"] = {
-            "wall_s": round(wall_s, 3),
-            "per_stage_s": {name: round(seconds, 3)
-                            for name, seconds in self._stage_time.items()},
-        }
-        return report
+            entry = _usage_entry(usage)
+            if entry is not None:
+                llm_usage[name] = entry
+        return llm_usage
 
     # ── dry-run ────────────────────────────────────────────────────────────
 
     def _run_dry(self) -> RunSummary:
-        """--dry-run: M1 already passed; run the M2 scan (process mode) or the
-        3.6.2 static call-count formula (generate_only), print the call/cost
-        estimate to stderr, write the report, make NO LLM calls, produce NO
-        main output/rejects (Emitter.open is never called). The trace channel
-        — an opt-in first-class output channel (spec 2.6) that carries only
-        operational events, never data content — still receives its run.start
-        / run.end lifecycle events when trace.enabled."""
+        """--dry-run：M1 已通过；跑 M2 扫描（process 模式）或 3.6.2 静态量公式
+        （generate_only），把调用/成本估算打到 stderr，写报告，**不发**任何 LLM 调用、
+        **不产**主输出与 rejects（Emitter.open 从不被调用）。trace 通道——一个 opt-in 的
+        一等输出通道（spec 2.6），只承载运行事件、绝无数据内容——在 trace.enabled 时照常
+        收到它的 run.start / run.end 生命周期事件。
+
+        @return: 运行摘要（退出码恒 0）
+        """
         cfg = self.cfg
         self.metrics.event(_EV_RUN_START, stage="run", batch_no=0,
                            payload={"tool_version": TOOL_VERSION,
@@ -1374,64 +1562,75 @@ class Orchestrator:
         est = self._estimate()
         if (cfg.console.mode_resolved == "rich"
                 and getattr(self.metrics, "has_listener", False)):
-            # v1.10 (U13): rich mode with an attached listener — the estimate
-            # print lines yield to the renderer's table (values identical, fed
-            # through the bypass); plain keeps the byte-identical line output
-            # below (the dry-run golden anchor, U24 layer ②).
+            # v1.10（U13）：rich 档且挂了 listener——估算打印行让位于渲染器的表格（数值
+            # 逐项一致，经旁路送达）；plain 档走下面逐字节一致的行式输出（dry-run 黄金锚，
+            # U24 第 ② 层）。
             self.metrics.run_estimate(est)
         else:
-            print(f"dry-run: mode={cfg.run.mode} estimated_records={est['records']} "
-                  f"batches={est['batches']}", file=sys.stderr)
-            # v1.12：帧粒度两键按冻结键序无条件打印（非流工程恒 =0，v1.9
-            # stitch_calls 先例）。
-            print(f"dry-run: estimated LLM calls — generate_calls={est['generate_calls']} "
-                  f"segment_calls={est['segment_calls']} "
-                  f"stitch_calls={est['stitch_calls']} "
-                  f"classify_calls={est['classify_calls']} "
-                  f"frame_classify_calls={est['frame_classify_calls']} "
-                  f"extract_calls={est['extract_calls']} "
-                  f"quality_calls={est['quality_calls']} annotate_calls={est['annotate_calls']} "
-                  f"frame_annotate_calls={est['frame_annotate_calls']} "
-                  f"verify_calls={est['verify_calls']} total={est['total_calls']} "
-                  f"(excludes retries and repair calls)", file=sys.stderr)
-            if cfg.classify.enabled and (cfg.classify.assignment == "multi"
-                                         or self._class_overrides_exist()):
-                # v1.7 R28: per-class overrides make the static estimate inexact,
-                # and multi fan-out multiplies downstream calls by the (unknowable)
-                # label count — flag both with the fixed wording.
-                print("dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界",
-                      file=sys.stderr)
-            if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
-                # v1.8 S22 (R28-style note): downstream estimates use
-                # episodes ≈ sessions — LLM boundary refinement can only ADD
-                # segments, so the numbers are a lower bound. v1.11 (V12,
-                # spec 3.10.3 时序流行): when the budget packs below the
-                # window cap (w_min < window) the note gains ONE appended
-                # sentence flagging segment_calls as the worst-case-packing
-                # upper bound; w_min ≥ window (the V26 examples) or budget
-                # off keeps the note byte-identical (dry-run golden anchor).
-                note = ("dry-run: 注：stream 估算：下游按 episodes≈sessions 报下界"
-                        "（LLM 精化只增段数）")
-                if budget.min_window(cfg) < cfg.segment.window:
-                    note += "；segment 按预算最坏装填报上界"
-                print(note, file=sys.stderr)
-            side_channels = "report and trace only" if cfg.trace.enabled else "report only"
-            print(f"dry-run: no LLM calls made, no output written ({side_channels})",
-                  file=sys.stderr)
+            self._print_dry_estimate(est)
 
         wall_s = time.perf_counter() - self._t0
         report = self._build_report(exit_code=0, wall_s=wall_s)
-        self.emitter.finalize(report, deliver=False)   # report only; no .part exists
+        self.emitter.finalize(report, deliver=False)   # 只写报告；不存在 .part
         self.metrics.event(_EV_RUN_END, stage="run", batch_no=0,
                            payload={"counts": report["counts"], "exit_code": 0})
         self.metrics.flush()
         return RunSummary(counts=report["counts"], interrupted=False, exit_code=0,
                           wall_s=wall_s, output_lines=0, rejects_lines=0)
 
+    def _print_dry_estimate(self, est: dict) -> None:
+        """plain 档 dry-run 的 stderr 行式输出（逐字节回归锚）。
+
+        v1.12：帧粒度两键按冻结键序**无条件**打印（非流工程恒 = 0，v1.9 stitch_calls 先例）。
+
+        @param est: estimate_run 的返回字典
+        """
+        cfg = self.cfg
+        print(f"dry-run: mode={cfg.run.mode} estimated_records={est['records']} "
+              f"batches={est['batches']}", file=sys.stderr)
+        print(f"dry-run: estimated LLM calls — generate_calls={est['generate_calls']} "
+              f"segment_calls={est['segment_calls']} "
+              f"stitch_calls={est['stitch_calls']} "
+              f"classify_calls={est['classify_calls']} "
+              f"frame_classify_calls={est['frame_classify_calls']} "
+              f"extract_calls={est['extract_calls']} "
+              f"quality_calls={est['quality_calls']} annotate_calls={est['annotate_calls']} "
+              f"frame_annotate_calls={est['frame_annotate_calls']} "
+              f"verify_calls={est['verify_calls']} total={est['total_calls']} "
+              f"(excludes retries and repair calls)", file=sys.stderr)
+        self._print_dry_notes()
+        side_channels = "report and trace only" if cfg.trace.enabled else "report only"
+        print(f"dry-run: no LLM calls made, no output written ({side_channels})",
+              file=sys.stderr)
+
+    def _print_dry_notes(self) -> None:
+        """两条口径注记（措辞固定，与 rich 面板的注记文案严格一致）。
+
+        v1.7 R28：按类覆盖会让静态估算不精确，multi 扇出又把下游调用数乘上一个（不可知的）
+        标签数——两者都用固定措辞标注。v1.8 S22（R28 式）：下游估算按 episodes ≈ sessions，
+        而 LLM 边界精化只会**增加**段数，故这些数字是下界。v1.11（V12，spec 3.10.3 时序流
+        行）：预算装填低于窗宽上限（w_min < window）时，该注记**追加一句**把 segment_calls
+        标为最坏装填上界；w_min ≥ window（V26 的 examples）或预算关闭时注记逐字节不变
+        （dry-run 黄金锚）。
+        """
+        cfg = self.cfg
+        if cfg.classify.enabled and (cfg.classify.assignment == "multi"
+                                     or self._class_overrides_exist()):
+            print("dry-run: note: estimated with global config / multi reports a "
+                  "lower bound at label multiplier 1", file=sys.stderr)
+        if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
+            note = ("dry-run: note: stream estimate: downstream reports a lower bound "
+                    "at episodes≈sessions (LLM refinement only adds segments)")
+            if budget.min_window(cfg) < cfg.segment.window:
+                note += "; segment reports an upper bound at worst-case budget packing"
+            print(note, file=sys.stderr)
+
     def _class_overrides_exist(self) -> bool:
-        """True when at least one [class.*] override diverges from the global
-        sections (class_views holds one merged view per DECLARED class, so
-        non-emptiness alone says nothing — compare against the global base)."""
+        """是否至少存在一处偏离全局节的 [class.*] 覆盖（class_views 对**每个声明类**都持有
+        一份合并视图，故仅凭非空说明不了什么——必须与全局基值逐节比较）。
+
+        @return: 存在偏离全局的按类覆盖则 True
+        """
         cfg = self.cfg
         return any(view.quality != cfg.quality or view.rubric != cfg.rubric
                    or view.annotate != cfg.annotate or view.generate != cfg.generate
@@ -1439,58 +1638,111 @@ class Orchestrator:
                    for view in cfg.class_views.values())
 
     def _estimate(self) -> dict:
-        """Thin wrapper over the exported pure function (v1.10 U20): obtains
-        the plan via the existing scan path (estimate=True default — dry-run
-        behavior byte-identical) and delegates to ``estimate_run``.
-        generate_only passes plan=None (static 3.6.2 formulas, no scan)."""
+        """对导出纯函数的薄封装（v1.10 U20）：经既有扫描路径拿到 plan（estimate=True 是
+        默认值——dry-run 行为逐字节不变）再委派给 ``estimate_run``。generate_only 传
+        plan=None（3.6.2 静态量公式，不需要 scan）。
+
+        @return: 估算字典
+        @raises AssertionError: process 模式未提供摄取器
+        """
         plan = None
         if self.cfg.run.mode != "generate_only":
             assert self.ingestor is not None, "process mode requires an Ingestor"
             plan = self.ingestor.scan()
         return estimate_run(self.cfg, plan)
 
-    # ── signals ────────────────────────────────────────────────────────────
+    # ── 信号 ───────────────────────────────────────────────────────────────
 
     def _install_signal_handlers(self) -> None:
+        """装 SIGINT/SIGTERM 处理器（无事件循环或平台不支持时静默降级为不可中断）。"""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            _log.debug("no running event loop: signal handlers not installed",
+                       extra={"stage": "run", "batch": 0})
             return
         for sig in (_signal.SIGINT, _signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, self._request_stop)
                 self._installed_signals.append(sig)
             except (NotImplementedError, RuntimeError, ValueError):
-                pass
+                _log.debug("signal handler not supported for signal %d", sig,
+                           extra={"stage": "run", "batch": 0})
 
     def _remove_signal_handlers(self) -> None:
+        """摘掉已装的信号处理器并取消挂起的取消计时器。"""
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
+            _log.debug("no running event loop: signal handlers not removed",
+                       extra={"stage": "run", "batch": 0})
             return
         for sig in self._installed_signals:
             try:
                 loop.remove_signal_handler(sig)
             except (NotImplementedError, RuntimeError, ValueError):
-                pass
+                _log.debug("signal handler not removable for signal %d", sig,
+                           extra={"stage": "run", "batch": 0})
         self._installed_signals.clear()
         for handle in self._timer_handles:
             handle.cancel()
         self._timer_handles.clear()
 
     def _request_stop(self) -> None:
-        """SIGINT/SIGTERM: stop taking new batches; give the in-flight batch
-        30 s before cancelling it. Finalize still runs normally (rename happens,
-        report carries interrupted=true)."""
+        """SIGINT/SIGTERM：不再取新批，给在飞的批 30 s 再取消它。finalize 照常运行
+        （该改名就改名，报告带 interrupted=true）。
+        """
         self._stop = True
         self._interrupted = True
-        # v1.10 (U19, spec 3.10.3 console row): 中断横幅通路 — forward-only,
-        # no-op when no listener is attached.
+        # v1.10（U19，spec 3.10.3 console 行）：中断横幅通路——只转发，无 listener 即 no-op。
         self.metrics.stop_requested()
         task = self._current_task
         if task is not None and not task.done():
             try:
                 loop = asyncio.get_running_loop()
             except RuntimeError:
+                _log.debug("no running event loop: cancel timer not scheduled",
+                           extra={"stage": "run", "batch": self._batch_no})
                 return
             self._timer_handles.append(loop.call_later(30.0, task.cancel))
+
+
+def _usage_entry(usage) -> dict | None:
+    """把一个 profile 的用量折成 report.llm_usage 条目。
+
+    v1.6 密钥池（spec 6.4，只增）：keys 子对象仅在池 > 1 时出现（M9 会预置每个成员，故
+    len == 池大小；密钥身份 = 环境变量**名**，1.6 决策 ⑤）；parked 统计在池 > 1 或任一项
+    非零时出现——单密钥停泊也必须在报表里留下证据。零活动 profile（例如它唯一的调用在任何
+    尝试之前就被熔断掉了）略去，以保住 v1.5 的报表形态。
+
+    @param usage: M9 的按 profile 用量对象
+    @return: 报表条目；零活动 profile 返回 None
+    """
+    key_usages = getattr(usage, "keys", None) or {}
+    parked_calls = getattr(usage, "parked_calls", 0)
+    parked_ms = getattr(usage, "parked_ms", 0)
+    emit_keys = len(key_usages) > 1
+    emit_parked = emit_keys or bool(parked_calls) or bool(parked_ms)
+    if (usage.calls == 0 and usage.retries == 0
+            and usage.prompt_tokens == 0 and usage.completion_tokens == 0
+            and usage.est_cost_usd is None
+            and not emit_keys and not emit_parked):
+        return None
+    entry = {
+        "calls": usage.calls,
+        "prompt_tokens": usage.prompt_tokens,
+        "completion_tokens": usage.completion_tokens,
+        "retries": usage.retries,
+    }
+    if usage.est_cost_usd is not None:
+        entry["est_cost_usd"] = usage.est_cost_usd
+    if emit_keys:
+        entry["keys"] = {
+            env: {"calls": ku.calls, "rate_limited": ku.rate_limited,
+                  "disabled": ku.disabled}
+            for env, ku in sorted(key_usages.items())
+        }
+    if emit_parked:
+        entry["parked_calls"] = parked_calls
+        entry["parked_ms"] = parked_ms
+    return entry

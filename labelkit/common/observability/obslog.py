@@ -1,16 +1,15 @@
-"""M12 — observability (spec ch.7, 3.12).
+"""M12——可观测性（spec ch.7、3.12）。
 
-Two independent channels:
+两条互相独立的通道：
 
-1. stderr run log — stdlib ``logging`` on logger ``labelkit``; text | jsonl line
-   formats per CONTRACTS.md §8.4. NEVER contains data content, prompts, or API keys.
-2. trace event log — opt-in JSONL file (``trace.path``), one :class:`TraceEvent`
-   per line, line-buffered, flushed per batch in sync with M11. Payloads are
-   redacted per the four ``trace.content`` tiers (§8.3).
+1. stderr 运行日志——标准库 ``logging``，记录器 ``labelkit``；text | jsonl 两种行格式，
+   见 CONTRACTS.md §8.4。**绝不**包含数据内容、prompt 或 API 密钥。
+2. trace 事件日志——按需开启的 JSONL 文件（``trace.path``），每行一个
+   :class:`TraceEvent`，行缓冲，与 M11 同步按批 flush。载荷按 ``trace.content``
+   四档脱敏（§8.3）。
 
-Write failures never interrupt the run: the first OSError warns once on stderr,
-closes the channel, and every subsequent event counts into
-``report.trace.dropped_events``.
+写失败永不打断运行：首个 OSError 在 stderr 上告警一次、关闭通道，此后每个事件都计入
+``report.trace.dropped_events``。
 """
 from __future__ import annotations
 
@@ -24,10 +23,10 @@ from typing import IO, TYPE_CHECKING, Callable, Mapping, Protocol
 
 from labelkit.common.config.model import ResolvedConfig, TraceConfig
 
-if TYPE_CHECKING:  # v1.10: string annotations break the obslog↔llm_client cycle (§3.3)
+if TYPE_CHECKING:  # v1.10：字符串注解切断 obslog↔llm_client 的循环依赖（§3.3）
     from labelkit.common.runtime.llm_client import ProfileSnapshot
 
-# ── Event-name constants (§7.11, exact strings) ────────────────────────────
+# ── 事件名常量（§7.11，字符串精确）──────────────────────────────────────────
 
 EV_RUN_START = "run.start"
 EV_RUN_END = "run.end"
@@ -36,15 +35,15 @@ EV_BATCH_END = "batch.end"
 EV_INGEST_BAD_LINE = "ingest.bad_line"
 EV_INGEST_MISSING_PAIR = "ingest.missing_pair"
 EV_INGEST_INDEX_CONFLICT = "ingest.index_conflict"
-EV_INGEST_DISORDER = "ingest.disorder"       # v1.8 M2 stream monotonicity (spec 7.2)
-EV_SEGMENT_SESSION = "segment.session"       # v1.8 M2 session close (spec 7.2); trace-only
-EV_SEGMENT_BOUNDARY = "segment.boundary"     # v1.8 M14 window verdict (spec 7.2); trace-only
-EV_STITCH_JUDGE = "stitch.judge"             # v1.9 M16 candidate verdict (spec 7.2); trace-only
-EV_STITCH_THREAD = "stitch.thread"           # v1.9 M16 fragments span table (spec 7.2); trace-only
+EV_INGEST_DISORDER = "ingest.disorder"       # v1.8 M2 流单调性（spec 7.2）
+EV_SEGMENT_SESSION = "segment.session"       # v1.8 M2 会话关闭（spec 7.2）；仅 trace
+EV_SEGMENT_BOUNDARY = "segment.boundary"     # v1.8 M14 窗口判决（spec 7.2）；仅 trace
+EV_STITCH_JUDGE = "stitch.judge"             # v1.9 M16 候选判决（spec 7.2）；仅 trace
+EV_STITCH_THREAD = "stitch.thread"           # v1.9 M16 碎片跨度表（spec 7.2）；仅 trace
 EV_DEDUP_DUPLICATE = "dedup.duplicate"
-EV_CLASSIFY_DECISION = "classify.decision"   # v1.7 M13 (spec 7.2); trace-only, R29
+EV_CLASSIFY_DECISION = "classify.decision"   # v1.7 M13（spec 7.2）；仅 trace，R29
 EV_CLASSIFY_FRAME = "classify.frame"         # v1.12 M13 帧级批量判决（spec 7.2）; trace-only
-EV_EXTRACT_STEP = "extract.step"             # v1.8 M15 (spec 7.2); trace-only, S27
+EV_EXTRACT_STEP = "extract.step"             # v1.8 M15（spec 7.2）；仅 trace，S27
 EV_QUALITY_JUDGMENT = "quality.judgment"
 EV_QUALITY_POINTWISE = "quality.pointwise"
 EV_QUALITY_BT_FIT = "quality.bt_fit"
@@ -54,7 +53,7 @@ EV_ANNOTATE_FRAME = "annotate.frame"         # v1.12 M5 帧级逐帧标注（spe
 EV_VERIFY_VERDICT = "verify.verdict"
 EV_SCHEMA_REPAIR = "schema.repair"
 EV_LLM_CALL = "llm.call"
-EV_LLM_KEY_COOLDOWN = "llm.key_cooldown"     # v1.6 key pool (spec 7.2)
+EV_LLM_KEY_COOLDOWN = "llm.key_cooldown"     # v1.6 密钥池（spec 7.2）
 EV_LLM_KEY_DISABLED = "llm.key_disabled"     # v1.6
 EV_LLM_POOL_PARKED = "llm.pool_parked"       # v1.6
 EV_ERROR = "error"
@@ -68,36 +67,43 @@ _logger = logging.getLogger("labelkit.obslog")
 
 @dataclass(frozen=True)
 class TraceEvent:
-    ts: str                        # ISO8601 milliseconds with timezone offset
-    run_id: str                    # secrets.token_hex(6) — 12 hex chars per run
-    batch_no: int                  # 0 for run-level events
-    stage: str                     # emitting stage name; run.*/batch.* use "run"
-    ev: str                        # event name (§8.1)
-    record_ids: tuple[str, ...]    # 0/1/2 record ids
-    payload: Mapping               # per-event fields (§8.1), redacted per trace.content (§8.3)
+    """trace 通道的一行；字段顺序即 JSONL 写出顺序（§8.1）。"""
+
+    ts: str                        # ISO8601 毫秒精度，带时区偏移
+    run_id: str                    # secrets.token_hex(6)——每次运行 12 个十六进制字符
+    batch_no: int                  # 运行级事件为 0
+    stage: str                     # 发出事件的阶段名；run.*/batch.* 用 "run"
+    ev: str                        # 事件名（§8.1）
+    record_ids: tuple[str, ...]    # 0/1/2 个记录 id
+    payload: Mapping               # 各事件自有字段（§8.1），按 trace.content 脱敏（§8.3）
 
 
-# ── Redaction (§8.3) ───────────────────────────────────────────────────────
+# ── 脱敏（§8.3）────────────────────────────────────────────────────────────
 
-# LLM-produced free text, dropped at tier "none". v1.8 (S27, §8.3):
-# + "description" (extract.step LLM text, same tier as reason/critiques) and
-# + "defects" (the verify.verdict stream defect table carries LLM free text in
-#   `detail` — dropped whole-key at "none", critiques level).
-# v1.9 (T16): + "task_name" (stitch.judge/stitch.thread rolling thread task
-#   name — LLM free text, same tier as reason).
+# LLM 产出的自由文本，在 "none" 档丢弃。v1.8（S27、§8.3）新增：
+# + "description"（extract.step 的 LLM 文本，与 reason/critiques 同档）与
+# + "defects"（verify.verdict 的流缺陷表在 `detail` 里带 LLM 自由文本——在 "none"
+#   档整键丢弃，与 critiques 同级）。
+# v1.9（T16）新增："task_name"（stitch.judge/stitch.thread 的滚动线索任务名——
+#   LLM 自由文本，与 reason 同档）。
 _FREE_TEXT_KEYS = frozenset({"reason", "critiques", "violations",
                              "description", "defects", "task_name"})
-# v1.8 (S27, §8.3): INPUT-DATA-DERIVED payload fields (extract.step's widget
-# text reference / typed-in text) — stripped at BOTH "none" and "refs" (the
-# refs tier's "no input data content" red line), carried from "excerpt".
+# v1.8（S27、§8.3）：**源自输入数据**的载荷字段（extract.step 引用的控件文本 /
+# 键入文本）——在 "none" 与 "refs" 两档都剥除（refs 档「不含输入数据内容」的红线），
+# 语义承自 "excerpt"。
 _DATA_KEYS = frozenset({"target", "value"})
-# Full prompt/response messages, present only at tier "full".
+# 完整的 prompt/response 消息，仅在 "full" 档出现。
 _MESSAGE_KEYS = frozenset({"gen_ai.input.messages", "gen_ai.output.messages"})
 _EXCERPT_MAX_CHARS = 200
 
 
 def _strip(value, drop: frozenset[str] | set[str]):
-    """Recursively remove ``drop`` keys from nested mappings/sequences."""
+    """递归剥除嵌套映射/序列中的 ``drop`` 键。
+
+    @param value 任意载荷片段（映射、序列或标量）
+    @param drop 待剥除的键名集合
+    @return 剥除后的新对象（原对象绝不被改写）
+    """
     if isinstance(value, Mapping):
         return {k: _strip(v, drop) for k, v in value.items() if k not in drop}
     if isinstance(value, (list, tuple)):
@@ -106,32 +112,35 @@ def _strip(value, drop: frozenset[str] | set[str]):
 
 
 def redact_payload(payload: Mapping, content: str) -> Mapping:
-    """Apply the trace.content tier (§8.3) to an event payload.
+    """按 trace.content 档位（§8.3）脱敏一个事件载荷。
 
-    - "none":    ids/enums/numbers only — reason/critiques/violations/
-                 description/defects dropped, no excerpt, no target/value,
-                 no gen_ai messages.
-    - "refs":    + LLM-produced text (reason/critiques/violations/description/
-                 defects); still no input data content (no excerpt, no
-                 target/value — _DATA_KEYS, v1.8 S27 —, no gen_ai messages).
-    - "excerpt": + ``excerpt`` field, each value truncated to its first
-                 200 characters; + the _DATA_KEYS fields (target/value).
-    - "full":    + gen_ai.input.messages / gen_ai.output.messages verbatim.
-                 Tiers are cumulative — "full" keeps the (truncated) excerpt too.
+    - "none"：   只留 id/枚举/数字——reason/critiques/violations/description/defects
+                 丢弃，无 excerpt，无 target/value，无 gen_ai 消息。
+    - "refs"：   额外保留 LLM 产出文本（reason/critiques/violations/description/
+                 defects）；仍然不含输入数据内容（无 excerpt、无 target/value
+                 ——_DATA_KEYS，v1.8 S27——、无 gen_ai 消息）。
+    - "excerpt"：额外保留 ``excerpt`` 字段，每个值截到前 200 个字符；
+                 额外保留 _DATA_KEYS 字段（target/value）。
+    - "full"：   额外保留 gen_ai.input.messages / gen_ai.output.messages 原文。
+                 档位逐档递增——"full" 同样保留（已截断的）excerpt。
+
+    @param payload 未脱敏的原始载荷
+    @param content 档位："none" | "refs" | "excerpt" | "full"
+    @return 脱敏后的新载荷（原载荷对象绝不被改写）
     """
     drop: set[str] = set()
     if content != "full":
         drop |= _MESSAGE_KEYS
     if content in ("none", "refs"):
         drop.add("excerpt")
-        # v1.8 (S27, §8.3): input-data-derived fields never leak below the
-        # excerpt tier — the refs tier carries LLM text but NO input content.
+        # v1.8（S27、§8.3）：源自输入数据的字段绝不下漏到 excerpt 档以下——
+        # refs 档携带 LLM 文本，但不含任何输入内容。
         drop |= _DATA_KEYS
     if content == "none":
         drop |= _FREE_TEXT_KEYS
     out = _strip(payload, drop)
-    # Tiers are cumulative (spec 7.4 "逐档递增"): "full" contains everything
-    # "excerpt" does, so the 200-char truncation applies at both tiers.
+    # 档位逐档递增（spec 7.4「逐档递增」）："full" 包含 "excerpt" 的一切，
+    # 故 200 字符截断在两档都生效。
     if content in ("excerpt", "full") and isinstance(out.get("excerpt"), Mapping):
         out["excerpt"] = {
             rid: (text[:_EXCERPT_MAX_CHARS] if isinstance(text, str) else text)
@@ -140,7 +149,7 @@ def redact_payload(payload: Mapping, content: str) -> Mapping:
     return out
 
 
-# ── ProgressListener (v1.10 console bypass, spec 3.12.3 / §7.7, U19) ───────
+# ── ProgressListener（v1.10 console 旁路，spec 3.12.3 / §7.7，U19）─────────
 
 class ProgressListener(Protocol):
     """进程内进度旁路——console 面板的唯一数据通路（spec 3.12.3，SPEC-tui-console
@@ -190,84 +199,125 @@ class ProgressListener(Protocol):
         ...
 
 
-# ── EventLog (trace channel) ───────────────────────────────────────────────
+# ── EventLog（trace 通道）──────────────────────────────────────────────────
 
 class EventLog:
-    """JSONL trace writer. Never raises to callers; write failure warns once,
-    closes the channel, and counts subsequent events as dropped."""
+    """JSONL trace 写出器。绝不向调用方抛异常；写失败告警一次、关闭通道，
+    此后事件只计入 dropped。"""
 
     def __init__(self, cfg: TraceConfig, run_id: str):
+        """构造 trace 写出器（**不**在此打开文件，见下方 P2-4 说明）。
+
+        @param cfg 已解析的 [trace] 配置
+        @param run_id 本次运行的 12 位十六进制标识
+        """
         self.cfg = cfg
         self.run_id = run_id
         self.dropped_events: int = 0
         self.events_written: int = 0
         self._fh: IO[str] | None = None
-        self._closed = False           # closed due to write failure
-        self._opened = False           # lazy open: file is touched on FIRST emit
+        self._closed = False           # 因写失败而关闭
+        self._opened = False           # 惰性打开：文件在**首个** emit 时才 touch
         self._channels = frozenset(cfg.channels)
-        # The trace file is deliberately NOT opened here (E2E finding P2-4):
-        # opening (and truncating a previous run's file) waits until the first
-        # emitted event, so a run that dies in config/input validation before
-        # run.start never destroys the previous run's trace.
+        # 这里刻意**不**打开 trace 文件（E2E 发现 P2-4）：打开（并截断上次运行的
+        # 文件）推迟到首个事件发出时，这样在 run.start 之前死于配置/输入校验的运行
+        # 绝不会毁掉上次运行的 trace。
 
     def _open(self) -> None:
+        """惰性打开 trace 文件；打开失败按 warn-once 纪律停用通道，绝不抛出。"""
         self._opened = True
-        try:
-            if self.cfg.path and os.path.exists(self.cfg.path):
-                _logger.warning(
-                    "trace file %s already exists — truncating (rename it or set "
-                    "trace.path to keep history)", self.cfg.path,
-                    extra={"stage": "run", "batch": 0},
-                )
-            # buffering=1 → line-buffered text stream
-            self._fh = open(self.cfg.path, "w", encoding="utf-8", buffering=1)
-        except OSError as exc:
-            self._fail(exc)
+        self._guard_io(self._open_handle)
 
-    # internal ---------------------------------------------------------------
+    # 内部 -------------------------------------------------------------------
 
-    def _fail(self, exc: OSError) -> None:
-        """First OSError: warn once on stderr, close the channel."""
-        if not self._closed:
-            self._closed = True
+    def _open_handle(self) -> None:
+        """真正执行打开：旧文件存在则先告警再截断；buffering=1 → 行缓冲文本流。"""
+        if self.cfg.path and os.path.exists(self.cfg.path):
             _logger.warning(
-                "trace channel disabled after write failure: %s — subsequent "
-                "events are dropped and counted", exc,
+                "trace file %s already exists — truncating (rename it or set "
+                "trace.path to keep history)", self.cfg.path,
                 extra={"stage": "run", "batch": 0},
             )
-        if self._fh is not None:
-            try:
-                self._fh.close()
-            except OSError:
-                pass
-            self._fh = None
+        self._fh = open(self.cfg.path, "w", encoding="utf-8", buffering=1)
+
+    def _guard_io(self, action: Callable[[], None]) -> bool:
+        """执行一次 trace 文件 I/O（打开/写/刷新），承载唯一的写失败处置分支。
+
+        warn-once 纪律（3.12.4）：首个 OSError 在 stderr 上告警一次并关闭通道，
+        之后同类失败只关句柄不再刷屏——调用方据返回值把事件计入 dropped。
+
+        @param action 无参 I/O 动作（打开、写一行或刷新）
+        @return True = 动作成功；False = 发生 OSError，通道已停用
+        """
+        try:
+            action()
+        except OSError as exc:
+            if not self._closed:
+                self._closed = True
+                _logger.warning(
+                    "trace channel disabled after write failure: %s — subsequent "
+                    "events are dropped and counted", exc,
+                    extra={"stage": "run", "batch": 0},
+                )
+            self._close_handle()
+            return False
+        return True
+
+    def _close_handle(self) -> None:
+        """关闭文件句柄并置空；关闭失败只告警不抛——trace 通道永不打断运行。"""
+        if self._fh is None:
+            return
+        try:
+            self._fh.close()
+        except OSError as exc:
+            _logger.error("trace file close failed: %s", exc,
+                          extra={"stage": "run", "batch": 0})
+        self._fh = None
 
     def _channel(self, ev: TraceEvent) -> str:
-        # Channel = event-name prefix before the first '.', EXCEPT ev == "error",
-        # whose channel is the producing stage (spec 7.2).
+        """求事件所属通道。
+
+        通道 = 事件名首个 '.' 之前的前缀，**唯独** ev == "error" 例外——它归属于
+        产生它的 stage（spec 7.2）。
+
+        @param ev 待归属的事件
+        @return 通道名
+        """
         if ev.ev == EV_ERROR:
             return ev.stage
         return ev.ev.split(".", 1)[0]
 
     def _passes_filter(self, ev: TraceEvent) -> bool:
+        """判断事件是否通过 trace.channels 订阅过滤。
+
+        @param ev 待判断的事件
+        @return True = 应当写出；生命周期事件（run/batch）恒为 True
+        """
         channel = self._channel(ev)
-        if channel in ("run", "batch"):    # lifecycle events bypass the filter
+        if channel in ("run", "batch"):    # 生命周期事件绕过过滤
             return True
         return channel in self._channels
 
-    # public -----------------------------------------------------------------
+    # 公开 -------------------------------------------------------------------
 
     @property
     def closed(self) -> bool:
-        """True once a write failure shut the channel (3.12.4). The
-        orchestrator reads this when assembling ``report.trace`` to account
-        for the terminal ``run.end`` event, which is emitted after the report
-        is built (§9.3)."""
+        """通道是否已被写失败关闭（3.12.4）。
+
+        orchestrator 组装 ``report.trace`` 时读取它，以便为终局的 ``run.end``
+        事件正确记账——该事件在 report 构建之后才发出（§9.3）。
+
+        @return True = 通道已因写失败关闭
+        """
         return self._closed
 
     def emit(self, ev: TraceEvent) -> None:
-        """Line-buffered JSONL write. No-op when the channel is disabled,
-        filtered out, or closed after a write failure (callers never check)."""
+        """行缓冲 JSONL 写出。
+
+        通道未开启、被过滤掉、或已因写失败关闭时静默跳过（调用方从不判断）。
+
+        @param ev 待写出的事件（载荷未脱敏，由本方法按 trace.content 处理）
+        """
         if not self.cfg.enabled:
             return
         if not self._passes_filter(ev):
@@ -292,34 +342,25 @@ class EventLog:
             },
             ensure_ascii=False,
         )
-        try:
-            self._fh.write(line + "\n")
-        except OSError as exc:
-            self._fail(exc)
+        if not self._guard_io(lambda: self._fh.write(line + "\n")):
             self.dropped_events += 1
             return
         self.events_written += 1
 
     def flush(self) -> None:
+        """把行缓冲刷到磁盘；刷新失败按 warn-once 纪律停用通道，绝不抛出。"""
         if self._fh is None:
             return
-        try:
-            self._fh.flush()
-        except OSError as exc:
-            self._fail(exc)
+        self._guard_io(self._fh.flush)
 
     def close(self) -> None:
-        if self._fh is not None:
-            try:
-                self._fh.close()
-            except OSError:
-                pass
-            self._fh = None
+        """关闭 trace 文件句柄（幂等）。"""
+        self._close_handle()
 
 
 # ── MetricsSink ────────────────────────────────────────────────────────────
 
-# stderr mirror levels per §8.1 (events with "—" are trace-only, never mirrored).
+# 各事件的 stderr 镜像级别，见 §8.1（标注 "—" 的事件仅入 trace，永不镜像）。
 _STDERR_LEVELS: dict[str, int] = {
     EV_RUN_START: logging.INFO,
     EV_RUN_END: logging.INFO,
@@ -327,36 +368,40 @@ _STDERR_LEVELS: dict[str, int] = {
     EV_BATCH_END: logging.INFO,
     EV_INGEST_BAD_LINE: logging.WARNING,
     EV_INGEST_MISSING_PAIR: logging.WARNING,
-    # EV_INGEST_INDEX_CONFLICT: warn, but error when input.on_index_conflict="fail"
-    # (spec 7.2 / CONTRACTS §8.1) — resolved dynamically in _mirror().
-    # v1.8 ingest.disorder is trace-only here (D1): its reason embeds
-    # timestamp/cursor values and fires once PER RECORD — mirroring would both
-    # break the "one stderr WARN per run" contract and flood stderr with
-    # input-derived values under a systematically bad timestamp field. M2
-    # itself logs the single data-free WARN per run (spec 7.2); the fail
-    # policy surfaces through InputError (exit 3). The three segment/extract
-    # events (segment.session / segment.boundary / extract.step) are likewise
-    # trace-only ("—", §8.1) and stay out of this table.
+    # EV_INGEST_INDEX_CONFLICT：镜像为 warn，但 input.on_index_conflict="fail" 时为
+    # error（spec 7.2 / CONTRACTS §8.1）——在 _mirror() 里动态判定。
+    # v1.8 的 ingest.disorder 在此**仅入 trace**（D1）：它的 reason 内嵌时间戳/游标
+    # 取值且**每条记录**都会触发——镜像既会打破「每次运行一条 stderr WARN」的契约，
+    # 又会在时间戳字段系统性写错时把输入派生值刷满 stderr。M2 自己每次运行打那条
+    # 唯一的、无数据的 WARN（spec 7.2）；fail 策略经 InputError 浮现（退出码 3）。
+    # segment/extract 三个事件（segment.session / segment.boundary / extract.step）
+    # 同样仅入 trace（"—"，§8.1），不进本表。
     EV_LLM_CALL: logging.DEBUG,
-    # v1.6 key-pool events (spec 7.2): key_cooldown is trace-only ("—"),
-    # key_disabled / pool_parked mirror at warn.
+    # v1.6 密钥池事件（spec 7.2）：key_cooldown 仅入 trace（"—"），
+    # key_disabled / pool_parked 镜像为 warn。
     EV_LLM_KEY_DISABLED: logging.WARNING,
     EV_LLM_POOL_PARKED: logging.WARNING,
-    # EV_ERROR: warn (record-level) / error (run-level) — resolved in event()
+    # EV_ERROR：warn（记录级）/ error（运行级）——在 event() 里判定
 }
 
 
 class MetricsSink:
-    """Holds the EventLog + run counters. All stages emit through RunContext.metrics.
+    """持有 EventLog 与运行计数器。所有阶段都经 RunContext.metrics 发出埋点。
 
-    v1.10 (spec 3.12.3, U19/U22/U23): optionally carries a ProgressListener —
-    the console panel's in-process bypass. Forwarding produces NO TraceEvent
-    (§7.2 catalog untouched); on_event payloads are pre-redacted at tier
-    "none"; every forward is exception-guarded (first failure warns once and
-    permanently disables the bypass); listener=None is byte-identical to v1.9."""
+    v1.10（spec 3.12.3，U19/U22/U23）：可选携带一个 ProgressListener——console
+    面板的进程内旁路。转发**不**产生 TraceEvent（§7.2 目录零改动）；on_event 的
+    载荷在 "none" 档预脱敏；每次转发都有异常防护（首次失败告警一次并永久停用
+    旁路）；listener=None 时与 v1.9 逐字节一致。"""
 
     def __init__(self, cfg: ResolvedConfig, run_id: str, event_log: EventLog,
                  listener: ProgressListener | None = None):
+        """装配计数器汇。
+
+        @param cfg 本次运行的解析配置
+        @param run_id 本次运行的 12 位十六进制标识
+        @param event_log trace 写出器
+        @param listener v1.10 console 旁路监听器；None = 无旁路（默认）
+        """
         self.cfg = cfg
         self.run_id = run_id
         self.event_log = event_log
@@ -367,62 +412,83 @@ class MetricsSink:
         self._listener: ProgressListener | None = listener
 
     def _forward(self, callback: str, *args) -> None:
-        """U23 guard — the ONLY path to the listener: try/except around every
-        forward; the first exception logs one WARN and sets the listener
-        reference to None for the rest of the run (EventLog write-failure
-        "warn once + close channel" discipline, spec 3.12.4). A listener bug
-        never enters the record-level/batch-level failure paths."""
+        """U23 防护——通往 listener 的**唯一**通路：每次转发都套 try/except；
+        首个异常打一条 WARN 并把 listener 引用置 None，本次运行余下时间不再转发
+        （EventLog 写失败「warn 一次 + 关通道」同款纪律，spec 3.12.4）。listener
+        的缺陷永不进入记录级/批级失败路径。
+
+        @param callback 回调方法名
+        @param args 透传给回调的实参
+        """
         listener = self._listener
         if listener is None:
             return
         try:
             getattr(listener, callback)(*args)
-        except Exception as exc:  # noqa: BLE001 — bypass isolation (U23)
+        except Exception as exc:  # noqa: BLE001 —— 旁路隔离（U23）
             self._listener = None
             _logger.warning(
-                "console listener 异常，已停用面板旁路: %s", exc,
+                "console listener failed, panel bypass disabled: %s", exc,
                 extra={"stage": "run", "batch": 0},
             )
 
     def stage_begin(self, stage: str, batch_no: int) -> None:
-        """v1.10 forward-only (spec 3.12.3, U11/U19): M10 calls this before every
-        stage.run(); forwards on_stage — produces NO TraceEvent, never enters
-        the §7.2 catalog. No-op when listener is None."""
+        """v1.10 纯转发（spec 3.12.3，U11/U19）：M10 在每次 stage.run() 之前调用；
+        转发 on_stage——**不**产生 TraceEvent，永不进入 §7.2 目录。listener 为
+        None 时是空操作。
+
+        @param stage 即将运行的阶段名
+        @param batch_no 批次序号（从 1 开始）
+        """
         self._forward("on_stage", stage, batch_no)
 
     def run_estimate(self, est: Mapping) -> None:
-        """v1.10 forward-only (spec 3.12.3, U19/U20): forwards the estimate_run()
-        static estimate to on_estimate. No-op when listener is None."""
+        """v1.10 纯转发（spec 3.12.3，U19/U20）：把 estimate_run() 的静态估算转给
+        on_estimate。listener 为 None 时是空操作。
+
+        @param est estimate_run() 的估算结果
+        """
         self._forward("on_estimate", est)
 
     def stop_requested(self) -> None:
-        """v1.10 forward-only (spec 3.12.3, U19): SIGINT/SIGTERM graceful-stop
-        signal → on_stop_requested (中断横幅, spec 3.10.3). No-op when listener
-        is None."""
+        """v1.10 纯转发（spec 3.12.3，U19）：SIGINT/SIGTERM 优雅中断信号 →
+        on_stop_requested（中断横幅，spec 3.10.3）。listener 为 None 时是空操作。"""
         self._forward("on_stop_requested")
 
     @property
     def fatal_streak(self) -> int:
-        """v1.10 (spec 3.12.3, U19): read-only breaker-streak view — the console
-        panel's 熔断行 data source (§7.7 LLM block)."""
+        """v1.10（spec 3.12.3，U19）：熔断连续计数的只读视图——console 面板熔断行
+        的数据源（§7.7 LLM 块）。
+
+        @return 当前连续致命错误数
+        """
         return self._fatal_streak
 
     @property
     def has_listener(self) -> bool:
-        """v1.10 (U13): read-only bypass-attachment probe — M10's dry-run
-        rich-yield gate reads it (the estimate print lines yield to the
-        renderer table only while a listener is actually attached); flips
-        False permanently after the U23 forward-failure trip."""
+        """v1.10（U13）：旁路是否挂接的只读探针。
+
+        M10 的 dry-run rich 让位门读它（估算打印行只有在确实挂了 listener 时才
+        让位给渲染器表格）；U23 转发失败跳闸后永久变为 False。
+
+        @return True = 旁路仍然挂接
+        """
         return self._listener is not None
 
     def event(self, ev: str, *, stage: str, batch_no: int,
               record_ids: tuple[str, ...] = (), payload: Mapping | None = None) -> None:
-        """Builds the TraceEvent (ts=now local ISO8601 ms, run_id) and forwards to
-        EventLog; also mirrors to the stderr logger at the §8.1 level when one is
-        defined. v1.10: additionally forwards to the ProgressListener bypass —
-        with a SECOND TraceEvent whose payload is pre-redacted at tier "none"
-        (U22); the event handed to EventLog stays unredacted (EventLog applies
-        its own trace.content tier at write time)."""
+        """构造 TraceEvent（ts = 本地当前时间 ISO8601 毫秒，run_id）并转给 EventLog；
+        §8.1 定义了级别的事件同时镜像到 stderr 记录器。v1.10：额外转发给
+        ProgressListener 旁路——用**第二个** TraceEvent，其载荷在 "none" 档预脱敏
+        （U22）；交给 EventLog 的那个仍是未脱敏的（EventLog 在写出时按自己的
+        trace.content 档位处理）。
+
+        @param ev 事件名（§8.1）
+        @param stage 发出事件的阶段名
+        @param batch_no 批次序号；运行级事件用 0
+        @param record_ids 相关记录 id（0/1/2 个）
+        @param payload 事件自有字段；None 视作 {}
+        """
         payload = payload or {}
         trace_ev = TraceEvent(
             ts=datetime.now().astimezone().isoformat(timespec="milliseconds"),
@@ -440,23 +506,28 @@ class MetricsSink:
                           replace(trace_ev, payload=redact_payload(payload, "none")))
 
     def _mirror(self, ev: str, stage: str, batch_no: int, payload: Mapping) -> None:
+        """把事件按 §8.1 级别镜像成一行 stderr 运行日志（无级别定义则不镜像）。
+
+        @param ev 事件名
+        @param stage 发出事件的阶段名
+        @param batch_no 批次序号
+        @param payload 事件载荷（只取标量字段入行）
+        """
         if ev == EV_ERROR:
-            # run-level provider_fatal → error; record-level → warn (§8.1)
+            # 运行级 provider_fatal → error；记录级 → warn（§8.1）
             level = logging.ERROR if payload.get("kind") == "provider_fatal" else logging.WARNING
         elif ev == EV_INGEST_INDEX_CONFLICT:
-            # spec 7.2: warn, but error under the fail policy (§8.1)
+            # spec 7.2：镜像为 warn，但 fail 策略下为 error（§8.1）
             level = (logging.ERROR if self.cfg.input.on_index_conflict == "fail"
                      else logging.WARNING)
         else:
             level = _STDERR_LEVELS.get(ev)
             if level is None:
                 return
-        # Operational summary only: scalar payload fields; never nested content
-        # (counts objects, judgments, messages ...). No data content, no prompts.
-        # Scalars in mirrored events are structural (e.g. ingest.bad_line's
-        # skip-reason enum, spec 7.3 normative example) — LLM free text only ever
-        # appears in non-mirrored events or as nested lists, which the isinstance
-        # filter already excludes.
+        # 只写运行态摘要：载荷里的标量字段；绝不写嵌套内容（counts 对象、判决、
+        # 消息……）。既无数据内容，也无 prompt。被镜像事件里的标量都是结构性的
+        # （例如 ingest.bad_line 的跳过原因枚举，spec 7.3 规范样例）——LLM 自由文本
+        # 只出现在不镜像的事件里，或以嵌套列表形式出现，而后者已被 isinstance 过滤挡下。
         parts = [
             f"{k}={v}" for k, v in payload.items()
             if isinstance(v, (str, int, float, bool))
@@ -467,15 +538,30 @@ class MetricsSink:
         )
 
     def count(self, key: str, n: int = 1) -> None:
+        """累加一个运行计数器。
+
+        @param key 计数器键（report.json 的计数来源）
+        @param n 增量，默认 1
+        """
         self.counters[key] = self.counters.get(key, 0) + n
 
     def add_stage_time(self, stage: str, seconds: float) -> None:
+        """累加某阶段的累计耗时。
+
+        @param stage 阶段名
+        @param seconds 本次耗时（秒）
+        """
         self.stage_times[stage] = self.stage_times.get(stage, 0.0) + seconds
 
     def record_provider_result(self, fatal: bool, *, hard: bool = False) -> None:
-        """Feed the circuit breaker. ``hard=True`` (auth-class 401/403 fatals)
-        opens the breaker immediately — credential/permission failures never
-        self-heal, so counting a streak would only burn money (spec 3.9.3)."""
+        """给熔断器喂一次 provider 结果。
+
+        ``hard=True``（鉴权类 401/403 致命错误）立即打开熔断——凭证/权限失败不会
+        自愈，继续攒连续计数只是白烧钱（spec 3.9.3）。
+
+        @param fatal 本次是否为致命错误（False 会清空连续计数）
+        @param hard 是否鉴权类硬致命，True 则立即熔断
+        """
         if fatal:
             self._fatal_streak += 1
             if hard or self._fatal_streak >= self.cfg.run.fatal_error_threshold:
@@ -485,13 +571,18 @@ class MetricsSink:
 
     @property
     def circuit_broken(self) -> bool:
+        """熔断器是否已打开。
+
+        @return True = 已熔断（M9 据此拒发新调用，M10 以退出码 4 收尾）
+        """
         return self._circuit_broken
 
     def flush(self) -> None:
+        """按批把 trace 通道刷到磁盘（与 M11 同步）。"""
         self.event_log.flush()
 
 
-# ── stderr run log (§8.4) ──────────────────────────────────────────────────
+# ── stderr 运行日志（§8.4）─────────────────────────────────────────────────
 
 _TEXT_LEVEL_NAMES = {
     logging.DEBUG: "DEBUG",
@@ -512,14 +603,24 @@ _LOG_LEVELS = {"debug": logging.DEBUG, "info": logging.INFO,
 
 
 def _record_ts(record: logging.LogRecord) -> str:
+    """把日志记录的创建时刻渲染成带时区的 ISO8601 秒级时间戳。
+
+    @param record 标准库日志记录
+    @return 形如 "2026-08-14T01:41:07+08:00" 的时间戳
+    """
     return datetime.fromtimestamp(record.created).astimezone().isoformat(timespec="seconds")
 
 
 class _TextFormatter(logging.Formatter):
-    """'{ts} {LEVEL:<5} {stage:<7} batch={n|-} {msg}' — stage/batch from record
-    extras, '-' when absent."""
+    """文本行格式：'{ts} {LEVEL:<5} {stage:<7} batch={n|-} {msg}'——stage/batch 取自
+    记录的 extra，缺失时写 '-'。"""
 
     def format(self, record: logging.LogRecord) -> str:
+        """渲染一行文本日志。
+
+        @param record 标准库日志记录
+        @return 单行文本（不含换行）
+        """
         level = _TEXT_LEVEL_NAMES.get(record.levelno, record.levelname[:5])
         stage = getattr(record, "stage", None) or "-"
         batch = getattr(record, "batch", None)
@@ -528,9 +629,14 @@ class _TextFormatter(logging.Formatter):
 
 
 class _JsonlFormatter(logging.Formatter):
-    """One JSON object per line: {"ts","level","stage","batch","msg"}."""
+    """JSONL 行格式：每行一个 JSON 对象 {"ts","level","stage","batch","msg"}。"""
 
     def format(self, record: logging.LogRecord) -> str:
+        """渲染一行 JSONL 日志。
+
+        @param record 标准库日志记录
+        @return 单行 JSON 文本（不含换行）
+        """
         batch = getattr(record, "batch", None)
         return json.dumps(
             {
@@ -545,13 +651,17 @@ class _JsonlFormatter(logging.Formatter):
 
 
 def setup_logging(cfg: ResolvedConfig) -> None:
-    """Installs the stderr handler on logger 'labelkit' per tool.log_format /
-    tool.log_level. Modules log via logging.getLogger('labelkit.<module>') with
-    extra={'stage': ..., 'batch': ...}."""
+    """按 tool.log_format / tool.log_level 在记录器 'labelkit' 上装 stderr 处理器。
+
+    各模块经 logging.getLogger('labelkit.<module>') 记日志，并带
+    extra={'stage': ..., 'batch': ...}。重复调用幂等。
+
+    @param cfg 本次运行的解析配置
+    """
     logger = logging.getLogger("labelkit")
     logger.setLevel(_LOG_LEVELS.get(cfg.tool.log_level, logging.INFO))
     logger.propagate = False
-    for handler in list(logger.handlers):    # idempotent re-setup
+    for handler in list(logger.handlers):    # 幂等重装
         if getattr(handler, "_labelkit_handler", False):
             logger.removeHandler(handler)
     handler = logging.StreamHandler(sys.stderr)

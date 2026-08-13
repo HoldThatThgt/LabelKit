@@ -14,8 +14,13 @@ Ground rules for every implementer:
   `numpy`, stdlib `tomllib`, and — v1.10 (U4, spec §2.6 whitelist revision) — `rich`, CLI-layer
   only: lazily imported inside `labelkit/cli/console.py`, the sole touchpoint (operators/common
   never import it; M1 probes importability via `find_spec` without importing). Nothing else.
-- Code identifiers, comments, docstrings-of-record: English. LLM prompt templates: the exact
-  Chinese text given in §10 of this document (copied from the spec verbatim).
+- Code identifiers: English. **Comments and docstrings: Chinese** (the 2026-08-14 code-rule
+  remediation — see §12 and spec §1.6). **Everything a user or a machine reads — log lines, error
+  messages, CLI output, exception text, report/trace payloads: English.** LLM prompt templates are
+  the exception in the other direction: the exact Chinese text given in §10 of this document
+  (copied from the spec verbatim), together with the spec-frozen output data it produces
+  (`thread_seam` step text, defect-table `detail` strings, packaged rubric criteria), stays
+  Chinese verbatim.
 - Do not rename any field, key, event, or error code defined here. Tests assert exact strings.
 - Import discipline (no cycles): production imports use only the layered package paths below;
   the former flat modules and `labelkit.config` package do not exist.
@@ -80,14 +85,20 @@ labelkit/
 │   ├── config/
 │   │   ├── __init__.py                 # exports load, default_rubric, ResolvedConfig
 │   │   ├── model.py                    # all config dataclasses (M1)
-│   │   └── loader.py                   # TOML merge, validation, startup hook validation (M1)
+│   │   ├── loader.py                   # M1 public entry: load / default_rubric re-export, console-mode verdict, ResolvedConfig assembly
+│   │   ├── _collect.py                 # error/warning aggregator and typed table readers (package-private)
+│   │   ├── _sections.py                # per-section TOML parsing into config dataclasses (package-private)
+│   │   ├── _schemas.py                 # user/frame JSON Schema meta-validation and few-shot dry runs (package-private)
+│   │   ├── _rubrics.py                 # rubric resolution: inline table and packaged default:* selectors (package-private)
+│   │   ├── _classviews.py              # [class.*] / [frame.class.*] whitelist merge into class views (package-private)
+│   │   └── _constraints.py             # cross-section combination constraints and parse products (package-private)
 │   ├── runtime/
 │   │   ├── budget.py                   # v1.11 context-budget primitives + ImageCostCalibrator (§7.17)
 │   │   ├── llm_client.py               # M9 transport, retry/key pools, concurrency, usage
 │   │   └── schema_engine.py            # M8 L0-L3 guarantee, repair, schema validation/stats
 │   ├── observability/
 │   │   ├── obslog.py                   # M12 logs, trace, events, metrics, breaker state
-│   │   └── console_format.py           # v1.10 plain progress/summary line formats (U21) — pure functions, the single source shared by the M11 emitter and the CLI renderer; byte-frozen to the v1.9 strings
+│   │   └── console_format.py           # v1.10 plain progress/summary line formats (U21) — pure functions, the single source shared by the M11 emitter and the CLI renderer; byte-frozen (re-frozen 2026-08-14 onto the English strings)
 │   └── extensions/
 │       └── hooks.py                    # user validator resolution/execution/normalization
 ├── operators/
@@ -519,9 +530,10 @@ def frame_digest(record: Record, max_chars: int) -> str:
     - text modality: record.text truncated to max_chars.
     Poverty judgment: zero visible text nodes, or digest length < 8 ⇒ poor — the
     CALLER counts digest_poor_frames (report.stream, §9.3) and WARNs at most once
-    per run; v1.11 (V4): the WARN guidance reads 「为 segment.llm 配置
-    supports_vision=true 的 profile」 (the segment.use_vision key it formerly
-    pointed at was removed in v1.11). v1.11 (V9): M14 calls this ONCE per frame at
+    per run; v1.11 (V4): the WARN guidance reads "attach frame screenshots by
+    pointing segment.llm at a supports_vision=true profile" (the segment.use_vision
+    key it formerly pointed at was removed in v1.11; the wording is the 2026-08-14
+    English re-freeze of the same guidance). v1.11 (V9): M14 calls this ONCE per frame at
     SESSION level, BEFORE window packing — the digest vector feeds both the
     packer's per-frame costs and the §10.9 prompts (the pre-v1.11 per-window
     recomputation is gone; the poverty-guard path stays independent)."""
@@ -1582,10 +1594,11 @@ def default_rubric(name: Literal["default:text", "default:ui",
 ```
 
 Error message format (spec 3.1.5): `"<file>:[section].key: <expected>, got <actual>"`, e.g.
-`config.toml:[llm.default].timeout_s: 期望正整数，得到 "abc"`; array-table elements addressed as
-`[[rubric.criteria]][N]` with N 1-based. Unknown keys → stderr warning only (forward compat).
-Error messages themselves are Chinese where the spec shows Chinese samples; keep the
-`<file>:[section].key:` prefix machine-stable.
+`config.toml:[llm.default].timeout_s: expected positive integer, got "abc"`; array-table elements
+addressed as `[[rubric.criteria]][N]` with N 1-based. Unknown keys → stderr warning only (forward
+compat). Error messages themselves are **English** (2026-08-14 code-rule remediation — the
+`<file>:[section].key:` prefix stays machine-stable and every spec sample was re-synced to the
+English strings; only comments and docstrings are Chinese).
 
 ### 6.3 Validation rules M1 must enforce (complete list, spec 3.1.4 + 2.3.1)
 
@@ -1897,8 +1910,9 @@ checks apply only when the named switch is on unless stated):
     non-empty table is demanded; there is deliberately NO ≥2-entry rule, unlike rule 22).
     `[[frame.classify.classes]]` parses under rule 22's structural checks (name `[a-z0-9_]+`,
     unique within the table, non-empty description, optional string-array examples). v1.12
-    终审补充: any frame class carrying `examples` draws ONE named WARN（「类别示例（examples）
-    在帧级批量判决模板中不渲染（§10.12），该键将被忽略」）—— the batch-verdict prompt renders
+    终审补充: any frame class carrying `examples` draws ONE named WARN
+    (`<project>:[frame.classify].classes: class examples are not rendered by the batched
+    frame-verdict template (§10.12), so this key is ignored`) — the batch-verdict prompt renders
     the class table only, and the static budget precheck (the static-precheck branch of V13)
     deliberately EXCLUDES examples from
     the frame.classify static-part estimate (over-counting would false-trip the precheck).
@@ -2330,69 +2344,76 @@ class RepairContext:
                                                    # (multi-judge: "judge_name/aspect: opinion")
 
 
+@dataclass(frozen=True)                            # [FROZEN HERE — 2026-08-14]
+class AnnotatePromptOptions:
+    """Every assembly variant of one annotation call, in ONE parameter object.
+
+    The 2026-08-14 code-rule remediation (≤ 5 parameters per function) collapsed the
+    v1.7/v1.8/v1.9/v1.11 additive trailing kwargs of the two public faces below into this
+    frozen dataclass. FIELD NAMES AND SEMANTICS ARE UNCHANGED — only the carrier changed;
+    the "additive trailing kwarg" narrative is retired, and callers step a variant with
+    `dataclasses.replace(opts, ...)` (the V20 halving and the V21 repair ladder both do).
+    The default instance reproduces the pre-v1.7 global no-variant assembly byte for byte.
+    """
+    repair: RepairContext | None = None            # §10.5 repair context; None = first annotation
+    temperature: float | None = None               # sampling temperature; None = profile default
+    label: str | None = None                       # v1.7 (R2) class label; v1.13 also selects the class schema
+    transitions: tuple[Transition, ...] | None = None   # v1.8 (S5) [动作序列] steps; None = section omitted
+    fragment_lens: tuple[int, ...] | None = None   # v1.9 (T14) per-fragment member counts; None = uniform downsample
+    k_eff: int | None = None                       # v1.11 (V20/V21) externally narrowed keyframe cap
+    image_px: int | None = None                    # v1.11 (V23①) escalated image sampling edge
+
+
 def build_annotate_prompt(record: Record, cfg: ResolvedConfig, schema_text: str,
-                          repair: RepairContext | None = None,
-                          temperature: float | None = None,
-                          label: str | None = None,
-                          transitions: tuple[Transition, ...] | None = None,
-                          fragment_lens: tuple[int, ...] | None = None,
-                          k_eff: int | None = None,
-                          image_px: int | None = None) -> PromptBundle:
+                          opts: AnnotatePromptOptions = AnnotatePromptOptions(),
+                          ) -> PromptBundle:
     """Deterministic template assembly per §10.1. schema_text = the CLASS-EFFECTIVE schema
     text (v1.13: `class_schema_text(ctx, label)` — SchemaEngine.user_schema_text unless the
     record's class overrides output.schema).
-    repair != None appends the repair suffix (§10.5). [FROZEN HERE; label is a v1.7 ADDITIVE
-    trailing kwarg (R2): non-None → instruction/examples come from
-    cfg.class_views[label].annotate; None = global config — pre-v1.7 call sites unchanged.
-    transitions is the SECOND additive trailing-kwarg revision of this frozen signature
-    (v1.8, S5 — same R2 construction): non-None → the §10.1 sequence variant renders the
-    [动作序列] section from it; None = section omitted / pre-v1.8 behavior byte-identical.
-    fragment_lens is the THIRD additive trailing kwarg (v1.9, T14 — same S5 form): non-None →
-    the ② keyframe downsample runs the per-fragment quotas below; None = the v1.8 uniform
-    downsample byte-identical.
-    k_eff / image_px are the FOURTH additive trailing-kwarg revision (v1.11, V21 ladder —
-    the same R2/S5/F3 construction): k_eff non-None → EFFECTIVE KEYFRAME CAP — the ②
-    downsample runs with k = min(annotate.sequence_frames, k_eff) (carrier of the V20
-    frame-halving retry and the V21 repair-ladder k → max(2, ⌈k/2⌉); per-fragment quotas
-    degrade per the existing T14 rule when the quota becomes infeasible); image_px
-    non-None → ESCALATED RESOLUTION — carried into PromptBundle.image_px (V23①; the
-    builder computes effective px = image_px or profile.default_image_px or
-    profile.max_image_px, clamped to min(·, max_image_px)); None/None = pre-v1.11
-    behavior byte-identical]"""
+    [FROZEN HERE] `opts.repair` != None appends the repair suffix (§10.5).
+    `opts.label` (v1.7, R2): non-None → instruction/examples come from
+    cfg.class_views[label].annotate; None = global config.
+    `opts.transitions` (v1.8, S5): non-None → the §10.1 sequence variant renders the
+    [动作序列] section from it; None = section omitted.
+    `opts.fragment_lens` (v1.9, T14): non-None → the ② keyframe downsample runs the
+    per-fragment quotas below; None = the uniform downsample.
+    `opts.k_eff` (v1.11, V20/V21) → EFFECTIVE KEYFRAME CAP: the ② downsample runs with
+    k = min(annotate.sequence_frames, k_eff) (carrier of the V20 frame-halving retry and
+    the V21 repair-ladder k → max(2, ⌈k/2⌉); per-fragment quotas degrade per the existing
+    T14 rule when the quota becomes infeasible).
+    `opts.image_px` (v1.11, V23①) → ESCALATED RESOLUTION, carried into PromptBundle.image_px
+    (the builder computes effective px = image_px or profile.default_image_px or
+    profile.max_image_px, clamped to min(·, max_image_px)).
+    Budget packing itself enters through the PRIVATE assembler's `fit` parameter (inside
+    annotate_record), never here."""
 
 
 async def annotate_record(record: Record, ctx: RunContext,
-                          repair: RepairContext | None = None,
-                          label: str | None = None,
-                          transitions: tuple[Transition, ...] | None = None,
-                          fragment_lens: tuple[int, ...] | None = None,
-                          k_eff: int | None = None,
-                          image_px: int | None = None) -> Annotation:
-    """One record's full annotation path incl. self-consistency (skipped when repair != None:
-    repair re-annotation is always a single call at profile-default temperature [FROZEN HERE]).
-    Raises SchemaViolation / ProviderRetryableError / ProviderFatalError. This is the hook M7
-    uses for verify.policy='repair'. [FROZEN HERE; label is a v1.7 ADDITIVE trailing kwarg
-    (R2), same semantics as build_annotate_prompt — None = global config. transitions is the
-    v1.8 ADDITIVE trailing kwarg (S5): the stage layer passes item.transitions; the M7 repair
-    path threads the REBUILT value through after member surgery — None = pre-v1.8 behavior.
-    fragment_lens is the v1.9 ADDITIVE trailing kwarg (T14), passed through to
-    build_annotate_prompt on EVERY path (single call, each self-consistency sample, repair
-    re-annotation) — None = pre-v1.9 behavior.
-    k_eff / image_px are the v1.11 ADDITIVE trailing kwargs (V21 ladder / F3 — implementers
-    must match these names): the M7 repair driver passes the quality-ladder step on
-    verify-fail re-annotation (k_eff = keyframe cap halved to max(2, ⌈k/2⌉), image_px = one
-    rung up at 1.5×/dim ≤ max_image_px, budget re-checked against the calibrated estimate);
-    M5's own V20 overflow degrade passes k_eff alone. Both are passed through to
-    build_annotate_prompt on EVERY path (single call, each self-consistency sample, repair
-    re-annotation) — None/None = pre-v1.11 behavior byte-identical.
-    v1.13 (裁决·按类标注 Schema — signature UNCHANGED, semantics widened): `label` now ALSO
-    selects the annotation SCHEMA. Prompt text, the M8 call, the self-consistency vote and
-    the V9 packing estimate all read `class_effective_schema` / `class_schema_text`, and a
-    class-schema call routes `complete_validated(schema=<class schema>,
-    user_treatment=True)` — record-level annotation stays in the user-treatment family, so
-    L2.5 and the resolved_at accounting are preserved (§7.7). M7's repair re-annotation
-    inherits this by passing the same label — no repair-side change. With no per-class
-    schema configured every call shape is byte-identical to v1.12]"""
+                          opts: AnnotatePromptOptions = AnnotatePromptOptions(),
+                          ) -> Annotation:
+    """One record's full annotation path incl. self-consistency (skipped when
+    `opts.repair` != None: repair re-annotation is always a single call at profile-default
+    temperature [FROZEN HERE]).
+    Raises SchemaViolation / ProviderRetryableError / ProviderFatalError / ContextOverflowError.
+    This is the hook M7 uses for verify.policy='repair'. [FROZEN HERE] Every `opts` field is
+    threaded through to build_annotate_prompt on EVERY path (single call, each
+    self-consistency sample, repair re-annotation), with the same semantics as above:
+    `label` = global config when None; `transitions` = the stage layer's item.transitions,
+    and the M7 repair path threads the REBUILT value through after member surgery;
+    `fragment_lens` = M16's stitch_fragments quotas; `k_eff`/`image_px` = the M7 V21 ladder
+    step on verify-fail re-annotation (keyframe cap halved to max(2, ⌈k/2⌉), one resolution
+    rung up at 1.5×/dim ≤ max_image_px, budget re-checked against the calibrated estimate),
+    while M5's own V20 overflow degrade sets `k_eff` internally. `opts.temperature` is
+    OVERRIDDEN by M5 (single call = profile default, self-consistency samples =
+    sc_temperature) — a caller-set value is ignored.
+    v1.13 (裁决·按类标注 Schema): `label` ALSO selects the annotation SCHEMA. Prompt text,
+    the M8 call, the self-consistency vote and the V9 packing estimate all read
+    `class_effective_schema` / `class_schema_text`, and a class-schema call routes
+    `complete_validated(schema=<class schema>, scope=CallScope(..., user_treatment=True))` —
+    record-level annotation stays in the user-treatment family, so L2.5 and the resolved_at
+    accounting are preserved (§7.7). M7's repair re-annotation inherits this by passing the
+    same label — no repair-side change. With no per-class schema configured every call shape
+    is byte-identical to v1.12]"""
 
 
 # ── v1.13 per-sequence-class annotation schema (SPEC-stream-generation §3.4) ─
@@ -2445,9 +2466,9 @@ async def annotate_member(member: Record, ctx: RunContext,
     member-reclaim backfill lazy-loads and calls it directly (§7.6; same
     contract standing as the annotate_record repair hook — the §1.1 fourth
     sanctioned import direction rides classify_frames, THIS surface rides the
-    existing verify→annotate leg). Routes complete_validated(...,
-    schema=cfg.frame_schema) EXPLICITLY — internal-schema treatment: L0–L3 all
-    present, NO L2.5 hook, NO resolved_at counting (the §9.3 identity
+    existing verify→annotate leg). Routes complete_validated(prof, prompt,
+    schema=cfg.frame_schema, scope=CallScope(...)) EXPLICITLY — internal-schema
+    treatment: L0–L3 all present, NO L2.5 hook, NO resolved_at counting (the §9.3 identity
     "resolved_at sum = records entering M5" stays unpolluted). FAILURE RETURNS
     None, NEVER RAISES a record-level exception (member failure ≠ envelope
     failure; CircuitBreakerTripped / KeyboardInterrupt / CancelledError are
@@ -2712,19 +2733,40 @@ by majority, all critiques merged with `"judge"` field added, one `verify.verdic
 per judge per round. Policy drop: fail → `status="dropped_verify"`. Policy repair: on fail and
 rounds used < `max_repair_rounds`: build `RepairContext(previous_output=item.annotation.output,
 critiques_text=<critiques of the judges that voted fail, one per line, "aspect: opinion",
-multi-judge prefixed with judge name>)`, call `annotate_record(record, ctx, repair)`; new
+multi-judge prefixed with judge name>)`, call
+`annotate_record(record, ctx, AnnotatePromptOptions(repair=repair))`; new
 annotation replaces `item.annotation`; re-verify; still fail at budget → drop as above.
 `VerificationResult.rounds` counts review rounds incl. the first; `critiques` accumulate over
 rounds in order. Verify errors on a record (provider exhausted etc.) → `failed` per stage
 contract.
 
-v1.7 label threading (R3): the internal prompt builder `build_verify_prompt` (NOT part of the
-frozen surface) gains a `label` parameter — the `[任务指令]` section and `extra_criteria` both
-take the class-effective values (`class_views[label].annotate.instruction` /
+Prompt-builder options (2026-08-14 code-rule remediation, ≤ 5 parameters per function): the
+internal builder's signature is
+`build_verify_prompt(record, output, cfg, options: VerifyPromptOptions | None = None)`, with
+
+```python
+@dataclasses.dataclass(frozen=True)
+class VerifyPromptOptions:
+    label: str | None = None                            # class label; None = global instruction + criteria (v1.7 R3)
+    transitions: tuple[Transition, ...] | None = None   # sequence step table; None omits [动作序列] (v1.8 S7)
+    boundary_margin: str = ""                           # [边界余量] body, pre-rendered by the driver
+    fragment_structure: str = ""                        # [片段结构] body; "" omits the section (v1.9 T15)
+    fit: _PromptFit | None = None                       # panel-minimum budget packing state; None = budget off (v1.11)
+    verdict_form: bool = False                          # v1.13 §10.16 verdict-form sequence variant
+```
+
+The default instance is the pre-v1.7 single-record classic call. The builder is NOT part of the
+frozen public surface, but the option object's field names and semantics are frozen here so the
+stage driver and the docs agree; `_repair_ladder` steps a variant with
+`dataclasses.replace(opts, k_eff=…, image_px=…)` on the ANNOTATE option object (§7.4), never by
+positional re-assembly.
+
+v1.7 label threading (R3): `options.label` selects the class-effective values for both the
+`[任务指令]` section and `extra_criteria` (`class_views[label].annotate.instruction` /
 `class_views[label].verify.extra_criteria`); `_judge_round`/`_reannotate` thread the label
-through, and repair re-annotation calls `annotate_record(..., label=...)` (§7.4). The stage
-passes `item.classification.label if item.classification else None`; `verify.verdict` payloads
-gain `label` (classify enabled only, §8.1).
+through, and repair re-annotation calls `annotate_record(record, ctx, AnnotatePromptOptions(…,
+label=…))` (§7.4). The stage passes `item.classification.label if item.classification else None`;
+`verify.verdict` payloads gain `label` (classify enabled only, §8.1).
 
 v1.8 stream branch (sequence envelopes only; spec 3.7 stream branch, S7/S8/S31). The
 non-stream path is a REGRESSION ANCHOR — `run_verify_loop` and `VERDICT_SCHEMA` are
@@ -2751,9 +2793,9 @@ byte-unchanged; sequence envelopes are driven by a stage-layer bypass driver:
   line per fragment (thread-internal ordinal / member-index span in the rebound-tuple
   coordinate / member count / first-frame digest) plus the seam-position table rendered from
   `seam_indexes`/`seam_interrupted_by` (`步 {idx}（被{X}打断）`, or `接缝位置: 无`); marks
-  absent/inconsistent degrade to a single implied fragment. The internal
-  `build_verify_prompt` builder gains the `fragment_structure: str = ""` trailing kwarg
-  (non-frozen surface, the boundary_margin construction) — empty string omits the section.
+  absent/inconsistent degrade to a single implied fragment. The section body rides
+  `VerifyPromptOptions.fragment_structure` (the `boundary_margin` construction) — an empty
+  string omits the section.
   `[动作序列]` step lines follow the §10.1 format; review evidence carries NO `（摘取兜底）`
   suffix (that S16 marker is M4's), but v1.9 thread-seam placeholder steps DO carry the
   `（线索接缝：被{X}打断）` suffix (T14/T15 — a deliberate revision of the no-suffix rule:
@@ -2785,8 +2827,9 @@ byte-unchanged; sequence envelopes are driven by a stage-layer bypass driver:
   ④ synchronous record rebuild (`dataclasses.replace(record, members=...)`; the record
   **id is NOT recomputed**) and transitions rebuild (renumbered so
   `len(transitions) == len(members) − 1` holds); ⑤ concurrent re-annotation via
-  `annotate_record(..., transitions=<rebuilt>, fragment_lens=<from the stitch_fragments
-  duck mark — the v1.9 per-fragment-quota threading duty (T14), §7.4>)`; → next-round
+  `annotate_record(record, ctx, AnnotatePromptOptions(transitions=<rebuilt>,
+  fragment_lens=<from the stitch_fragments duck mark — the v1.9 per-fragment-quota
+  threading duty (T14), §7.4>, …))`; → next-round
   re-review. Repair
   rounds count against `max_repair_rounds` INCLUDING the first review.
 - **Frame-product sync (v1.12; SPEC-frame-annotation §3.4).** Slotted BETWEEN the surgery
@@ -2825,12 +2868,11 @@ sequences (`generate_stream.enabled`, segment OFF, §7.5). The latter travel the
 which must not reuse the non-sequence template (a sequence Record has no text/raw/ui_tree/image
 to render) nor the defect-table variant (its `defects` key is forbidden by `VERDICT_SCHEMA`):
 
-- **Selection = driver presence.** The internal `build_verify_prompt` gains the ADDITIVE
-  trailing kwarg `verdict_form: bool = False` (the `boundary_margin`/`fragment_structure`
-  construction — non-frozen surface); the classic path passes
-  `verdict_form=(record.kind == "sequence")`, the stream driver NEVER passes it, so the §10.5
-  defect-table variant stays byte-identical. `schema` remains `VERDICT_SCHEMA` — template and
-  schema are paired by construction.
+- **Selection = driver presence.** The `VerifyPromptOptions.verdict_form` flag (the
+  `boundary_margin`/`fragment_structure` construction) picks the variant; the classic path
+  passes `verdict_form=(record.kind == "sequence")`, the stream driver NEVER sets it, so the
+  §10.5 defect-table variant stays byte-identical. `schema` remains `VERDICT_SCHEMA` —
+  template and schema are paired by construction.
 - **Template** (§10.16, verbatim): system = the verdict instruction (three review dimensions:
   instruction adherence / factual consistency with the member-frame digests / field semantics)
   + the class-effective `extra_criteria` (empty ⇒ the whole line is omitted, the non-stream
@@ -2869,15 +2911,33 @@ class SchemaEngine:
         json.dumps(user_schema, ensure_ascii=False, separators=(", ", ": ")) — single line.
         [FROZEN HERE]"""
 
+@dataclass(frozen=True)                            # [FROZEN HERE — 2026-08-14]
+class CallScope:
+    """Accounting/tracing scope of ONE schema-engine call — the public parameter object.
+
+    The 2026-08-14 code-rule remediation (≤ 5 parameters per function) collapsed
+    `complete_validated`'s four keyword-only parameters into this frozen dataclass; field
+    names and semantics are unchanged, and the default instance is an internal-treatment
+    call with no owning record. It sits ALONGSIDE the private `_CallContext` rather than
+    replacing it: this object is what the CALLER declares, `_CallContext` additionally
+    carries the engine-derived `active` schema and `user_treated` verdict.
+    """
+    record_ids: tuple[str, ...] = ()   # records this call covers; trace events only
+    batch_no: int = 0                  # batch number; trace events and log extra only
+    record: Mapping | None = None      # the L2.5 hook's second argument (Record.raw); None if absent
+    user_treatment: bool | None = None # explicit treatment gate; None ⇒ inferred from `schema is None`
+
+
+class SchemaEngine:
+    ...
+
     async def complete_validated(self, profile: str, prompt: PromptBundle,
                                  schema: dict | None = None, *,
-                                 record_ids: tuple[str, ...] = (),
-                                 batch_no: int = 0,
-                                 record: Mapping | None = None,
-                                 user_treatment: bool | None = None) -> tuple[dict, Usage, int, str]:
+                                 scope: CallScope = CallScope(),
+                                 ) -> tuple[dict, Usage, int, str]:
         """schema=None → user schema; internal schemas (judgment/pointwise/verdict/samples)
-        passed in by stages. Runs L0→L1→L2[→L2.5]→L3 (spec 3.8.2). ``record`` (v1.5,
-        additive kwarg) is the raw input mapping handed to the output.validator hook
+        passed in by stages. Runs L0→L1→L2[→L2.5]→L3 (spec 3.8.2). ``scope.record`` (v1.5)
+        is the raw input mapping handed to the output.validator hook
         at L2.5 — user-treatment calls only; callback violations are rendered
         "(validator) <msg>", join the L3 repair prompt, and share the repair budget;
         exhaustion with ONLY callback violations left raises
@@ -2885,12 +2945,12 @@ class SchemaEngine:
         (validated_obj, total_usage, attempts, model) where attempts = 1 + L3 repair calls
         and total_usage sums the first call + repairs. Failure: raises SchemaViolation.
         Counts resolved_at buckets for USER-TREATMENT calls only (spec §6.4); emits
-        `schema.repair` trace events (any non-clean resolution) with the given
-        record_ids/batch_no. Extra kwargs and tuple return are [FROZEN HERE] (spec
-        gives `-> dict`; callers need usage/attempts/model to build Annotation).
-        ``user_treatment`` (v1.13, ADDITIVE trailing kwarg — 裁决·M8 显式待遇参数) DECOUPLES
-        treatment from how the schema is passed: None = the pre-v1.13 inference
-        `schema is None` (EVERY pre-existing call site is unchanged); True = user treatment
+        `schema.repair` trace events (any non-clean resolution) with the scope's
+        record_ids/batch_no. The `scope` parameter and the tuple return are [FROZEN HERE]
+        (spec gives `-> dict`; callers need usage/attempts/model to build Annotation).
+        ``scope.user_treatment`` (v1.13 — 裁决·M8 显式待遇参数) DECOUPLES
+        treatment from how the schema is passed: None = the inference
+        `schema is None`; True = user treatment
         (resolved_at accounting + the L2.5 hook) even with an explicit schema — the
         per-sequence-class annotation schema route (§7.4); False = internal treatment."""
 
@@ -2961,6 +3021,12 @@ that reject `prefixItems` is configuration-level `supports_structured_output = f
 per-call parameter.
 
 ### 7.8 M9 — `labelkit/common/runtime/llm_client.py`
+
+Dataclass-mirror language note (2026-08-14): the shapes below stay frozen field for field, but the
+inline comments here are the CONTRACT's English gloss — the production mirrors in
+`llm_client.py` carry the same information as **Chinese** comments, per the code rule "comments and
+docstrings Chinese, code/logs/errors/CLI output English". Reviewers must diff FIELDS, not comment
+text. The same reading applies to every other dataclass block in this document.
 
 ```python
 @dataclass(frozen=True)
@@ -3221,7 +3287,10 @@ both prices set; v1.6 adds per-key `KeyUsage` and `parked_calls`/`parked_ms` to 
 `metrics.record_provider_result(fatal=True)` — with `hard=True` for auth only when the failing
 key was the profile's last live key (v1.6; absorbed per-key auth failures raise nothing and feed
 nothing); retry exhaustion also records `fatal=True`; any success →
-`record_provider_result(fatal=False)`; when `metrics.circuit_broken`, `complete`/`embed` raise
+`record_provider_result(fatal=False)`. **`hard` is ALWAYS passed** (2026-08-14): M9's internal
+forwarder hands the sink `record(fatal=…, hard=…)` unconditionally — the old call-form sniffing
+branch that omitted the keyword for sinks without it is deleted, so any `MetricsSink` substitute
+must accept the keyword-only `hard` parameter. When `metrics.circuit_broken`, `complete`/`embed` raise
 `CircuitBreakerTripped` at entry. Trace: `llm.call` after every call (incl. failures) with the
 §8.2 payload (+ `key_env` for pools > 1, v1.6); API keys never enter any log path — key
 identity is always the env-var NAME.
@@ -3270,13 +3339,28 @@ class RunSummary:
     rejects_lines: int
 
 
+@dataclass(frozen=True)                            # [FROZEN HERE — 2026-08-14]
+class RunServices:
+    """The orchestrator's shared runtime services and run identity, as ONE parameter object.
+
+    The 2026-08-14 code-rule remediation (≤ 5 parameters per function) collapsed the five
+    trailing constructor parameters into this dataclass. It is EXPORTED from
+    `labelkit.orchestration` (alongside `Orchestrator` / `RunSummary` / `build_stages` / the
+    runtime entry points), so callers construct it by name.
+    """
+    llm: LLMClient                                 # M9 client (usage / calibrator read face)
+    schema_engine: SchemaEngine                    # M8 engine (resolved_at stats face)
+    metrics: MetricsSink                           # M12 counter/event sink (incl. the console bypass)
+    run_id: str                                    # this run's identifier
+    run_started_at: datetime                       # run start (timezone-aware)
+
+
 class Orchestrator:
     def __init__(self, cfg: ResolvedConfig, stages: list[Stage],
-                 ingestor: Ingestor | None, emitter: Emitter, llm: LLMClient,
-                 schema_engine: SchemaEngine, metrics: MetricsSink,
-                 run_id: str, run_started_at: datetime): ...
-        # spec 3.10.3 lists (cfg, stages, ingestor, emitter, llm); the extra parameters are
-        # [FROZEN HERE] — schema_engine/metrics are needed to build RunContext; run_id/
+                 ingestor: Ingestor | None, emitter: Emitter,
+                 services: RunServices): ...
+        # spec 3.10.3 lists (cfg, stages, ingestor, emitter, llm); the rest ride `services` and
+        # are [FROZEN HERE] — schema_engine/metrics are needed to build RunContext; run_id/
         # run_started_at feed report assembly and run-level events (NOT RunContext, spec 3.12.3).
 
     async def run(self) -> RunSummary: ...
@@ -3526,7 +3610,10 @@ class Emitter:                                     # signatures [FROZEN HERE]
         flush(). Updates stderr progress (TTY \r progress line; non-TTY: nothing — batch.end
         info line comes from M12/M10). v1.10 让位 (U21): the progress line is rendered by
         console_format.format_progress_line (the common-layer single source shared with the
-        CLI renderer — byte-identical to the v1.9 hardcoded string, the plain byte-anchor)
+        CLI renderer — the plain byte-anchor, re-frozen 2026-08-14 onto
+        `\rlabelkit: batch {batch_no}  emitted={emitted_total}  dropped_dup=N  dropped_lowq=N
+        dropped_verify=N  failed=N`: key set, line structure and information set unchanged,
+        only the language)
         and _progress is STATICALLY gated on cfg.console.mode_resolved: "rich" → return
         immediately (the CLI panel owns the display; mid-run degradation and `q` detach are
         the RENDERER's job — it keeps printing plain lines from the same console_format)."""
@@ -3552,7 +3639,9 @@ class Emitter:                                     # signatures [FROZEN HERE]
         always writes {output_stem}.report.json (cfg.dry_run diverts to {output_stem}.dryrun.report.json,
         v1.5 P2-4); prints the final stderr summary table matching
         report['counts'] — v1.10 让位 (U21): the text lines come from
-        console_format.format_summary_lines (plain byte-anchor, golden-snapshot frozen) and
+        console_format.format_summary_lines (plain byte-anchor, golden-snapshot frozen;
+        re-frozen 2026-08-14 onto the English header
+        `   ── final summary (matches report.counts item by item) ──`) and
         _print_summary is STATICALLY gated on cfg.console.mode_resolved: "rich" → return
         immediately, the text summary is superseded by the CLI panel's final frozen table
         (same numbers, same report['counts'] source — §7.7 rich 档).
@@ -4302,6 +4391,27 @@ class StitchStage:
         # returns the SAME list object it received (contract ②c: no additions, §5)
 
 
+@dataclasses.dataclass(frozen=True)                # [FROZEN HERE — 2026-08-14]
+class ThreadCard:
+    """The THREAD-side values of one open-thread summary card — `render_thread_card`'s
+    parameter object (the 2026-08-14 ≤ 5-parameter code rule; the rendered card text is
+    unchanged)."""
+    index: int                 # the card's 1-based pool number (= the thread number in the prompt)
+    task_name: str             # the thread's current task name; empty renders the placeholder
+    members: Sequence[Record]  # all current member frames, in session order
+    span: tuple[int, int]      # the thread's session-order span [head, tail]
+    fragment_count: int        # the thread's current fragment count
+
+
+def render_thread_card(card: ThreadCard, candidate_head: Record | None,
+                       cfg: ResolvedConfig) -> str:
+    """Render ONE open-thread summary card (the T8 evidence face): app set, session-order
+    span + frame/fragment counts, head and tail frame digests, and — when the caller passes
+    a candidate head frame — the E5 resumption pair (thread tail × candidate head) with its
+    deterministic `tree_diff` change evidence. Digests are truncated at
+    `stitch.digest_max_chars`."""
+
+
 def build_stitch_prompt(thread_cards: Sequence[str], candidate_card: str,
                         cfg: ResolvedConfig) -> PromptBundle:
     """Deterministic assembly of the §10.11 template. system: the frozen conservative-bias
@@ -4600,7 +4710,7 @@ Binding notes (from dev spec §3.2, normative):
 | `ingest.bad_line` | ingest / warn | M2 bad line skipped | () | `file`, `line_no`, `reason` |
 | `ingest.missing_pair` | ingest / warn | M2 missing pair skipped | () | `index`, `present` ("tree"\|"image"), `file` |
 | `ingest.index_conflict` | ingest / warn (error if policy=fail) | M2 index conflict | () | `index`, `files` (list) |
-| `ingest.disorder` | ingest / — (trace-only, no per-event stderr mirror) (v1.8) | M2 when the streaming monotonicity check rejects a record (out-of-order or timestamp parse failure, `stream.on_disorder`, §7.1); skip policy: one event PER RECORD, plus ONE data-free stderr WARN per run logged by M2 itself (the reason embeds timestamp/cursor values and never reaches stderr — spec §7.1 ①); fail policy terminates via InputError (exit 3) | () | `file`, `line_no` (text) \| `index` (UI), `reason` ("乱序" \| "时间戳解析失败"-class wording, carries the offending values — trace channel only) |
+| `ingest.disorder` | ingest / — (trace-only, no per-event stderr mirror) (v1.8) | M2 when the streaming monotonicity check rejects a record (out-of-order or timestamp parse failure, `stream.on_disorder`, §7.1); skip policy: one event PER RECORD, plus ONE data-free stderr WARN per run logged by M2 itself (the reason embeds timestamp/cursor values and never reaches stderr — spec §7.1 ①); fail policy terminates via InputError (exit 3) | () | `file`, `line_no` (text) \| `index` (UI), `reason` (`out of order: …` \| `timestamp parse failure: …`-class wording, carries the offending values — trace channel only) |
 | `segment.session` | segment / — (trace-only, no stderr mirror) (v1.8) | M2's session assembler closing a candidate session (§7.1; `--limit` truncation treated as EOF flushes the tail session, S17) — emitted by M2 but prefix-routed to the segment channel (S1) | () | `session_id`, `first` / `last` (first/last order keys), `len`, `cause` ("gap"\|"key"\|"max_len"\|"max_span"\|"eof"\|"limit") |
 | `segment.boundary` | segment / — (trace-only, no stderr mirror) (v1.8) | M14 per sliding window once the verdict passes M8 (§7.14); member provenance lives in the payload | () | `session_id`, `window` (= [s, e] frame-ordinal span), `member_ids`, `relations`[]{`index`, `relation` (five-value closed vocabulary, §10.9)}, `model`[, `reason`†] |
 | `stitch.judge` | stitch / — (trace-only, no stderr mirror) (v1.9) | M16 per candidate judgment reaching a disposition — pass-1 episode/rescue candidates and pass-2 re-reviews alike, incl. the M-4 votes-split conservative fallback; a FAILED judgment emits `error` instead (§7.16) | (candidate fragment's first member id,) | `session_id`, `candidate` ("episode"\|"rescue"), `repass` (bool), `verdict` ("resume"\|"new"; the fallback records "new"), `thread_ref`, `confidence` (trace observation only, never a gate — T9), `priors` (hit whitelist legs ⊆ {"app_overlap", "entity_overlap", "same_page"}), `merged` (bool)[, `task_name`¶, `reason`¶ — present whenever a judgment object exists][, `votes_split`=true — M-4 split fallback only][, `target_thread_id` — on merge] |
@@ -4688,7 +4798,7 @@ API keys appear at no tier, in no channel.
 
 ```
 # text (default):  {ts} {LEVEL:<5} {stage:<7} batch={n|-} {msg}
-2026-07-02T09:31:04+08:00 INFO  quality batch=3 pairwise 完成 items=128 comparisons=256 judgment_failures=1
+2026-07-02T09:31:04+08:00 INFO  quality batch=3 pairwise done items=128 comparisons=256 judgment_failures=1
 # jsonl:
 {"ts":"...","level":"info","stage":"quality","batch":3,"msg":"..."}
 ```
@@ -6161,15 +6271,17 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
 5. **RunContext 六字段** — `RunContext` is exactly the spec's six fields (cfg, llm,
    schema_engine, rng, batch_no,
    metrics — spec 3.10.3); spec 3.12.3 forbids changing its signature, so `run_id` /
-   `run_started_at` travel via the Orchestrator/Emitter/MetricsSink constructors instead.
+   `run_started_at` travel via the Orchestrator/Emitter/MetricsSink constructors instead
+   (2026-08-14: on the Orchestrator side they ride the `RunServices` parameter object, §7.9).
    One RunContext per (batch, stage) invocation.
 6. **profile 名与配置摘要** — `LLMProfile`/`EmbeddingProfile` carry `name` and resolved
    `api_key` (`repr=False`);
    `EmbeddingProfile.retry_base_delay_s` defaults 1.0 (spec §5.1 lists it; same full-jitter
    retry mechanism as llm profiles). Config digests = sha256 of raw file bytes, rendered `"sha256:<hex>"`.
 7. **complete_validated 四元返回** — `SchemaEngine.complete_validated` returns
-   `(dict, Usage, attempts, model)` and accepts
-   `record_ids`/`batch_no` kwargs for trace attribution; constructor takes optional `metrics`;
+   `(dict, Usage, attempts, model)` and takes the keyword-only `scope: CallScope` parameter
+   object (2026-08-14; `record_ids`/`batch_no`/`record`/`user_treatment` are its fields —
+   §7.7); constructor takes optional `metrics`;
    `user_schema_text` = single-line `json.dumps(..., ensure_ascii=False, separators=(", ", ": "))`;
    L1 exposed as module-level `deterministic_repair()`; internal schema JSONs of §10.7.
 8. **LLMClient 构造与 emit 工具** — `LLMClient.__init__` takes split
@@ -6186,7 +6298,8 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     regexes with case-insensitive
     extensions; `IngestPlan`/`IngestReport` shapes.
 11. **修复钩子与审核意见** — M5/M7 repair hook: `annotate.build_annotate_prompt` /
-    `annotate_record` / `RepairContext`;
+    `annotate_record` / `RepairContext`, with every assembly variant riding the
+    `AnnotatePromptOptions` parameter object (2026-08-14, §7.4);
     critiques rendered `"aspect: opinion"` (multi-judge `"judge/aspect: opinion"`).
 12. **生成提示词与桶键** — Generation prompt wording beyond spec-fixed fragments
     (`[种子示例 N]`,
@@ -6214,8 +6327,8 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     `null` in `_meta`; histogram bucket labels `"0.0-0.1"`…`"0.9-1.0"`; report `quality.mode`
     uses the `pairwise_bt`/`pointwise` strings; MetricsSink counter-key vocabulary.
 17. **Orchestrator 构造与退出码** — Orchestrator extra constructor params (`schema_engine`,
-    `metrics`, `run_id`,
-    `run_started_at`), `RunSummary` shape, report assembly owned by M10 —
+    `metrics`, `run_id`, `run_started_at`) — carried since 2026-08-14 by the exported
+    `RunServices` parameter object (§7.9), `RunSummary` shape, report assembly owned by M10 —
     `RunSummary.exit_code` / `report.run.exit_code` fold in the `--strict` escalation
     (1 when cfg.strict and rejects > 0; report-write failure is the only exit-1 cause not
     representable in the report),
@@ -6281,10 +6394,10 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     exits 0).
 27. **分类按类冻结点** — v1.7 classify (feature spec `docs/dev/SPEC-classify-operator.md`,
     rulings R1–R30;
-    2026-07-07). Key frozen points: `build_annotate_prompt` / `annotate_record` gain a
-    TRAILING optional `label: str | None = None` — an additive revision of the §7.4 frozen
-    signatures whose `None` default reproduces pre-v1.7 behavior with zero changes at old
-    call sites (R2); `counts.fanout` is OWNED BY M10, metered as the `len(batch)` delta
+    2026-07-07). Key frozen points: `build_annotate_prompt` / `annotate_record` gain an
+    optional `label: str | None = None` whose `None` default reproduces pre-v1.7 behavior
+    (R2) — since 2026-08-14 it is the `AnnotatePromptOptions.label` FIELD rather than a
+    trailing kwarg (§7.4; semantics unchanged); `counts.fanout` is OWNED BY M10, metered as the `len(batch)` delta
     around the classify stage — M13 never touches `counts.*` (R9); `on_error="fallback"`
     writes NO entry into `item.errors` — evidence goes to `Classification.detail` + the
     `error` trace event + `classify.fallback`, keeping the §9.2 rejects attribution
@@ -6424,9 +6537,9 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     - annotate keyframe selection upgrades to PER-FRAGMENT QUOTAS for stitched threads
       (T14: base 1 per fragment + largest-remainder share of k−m weighted by Lᵢ−1, ties →
       lower index; the local uniform downsample (S28) inside fragments; degrade to uniform on
-      absent/inconsistent marks or k < m); `fragment_lens` is the THIRD additive trailing
-      kwarg on the two frozen §7.4 signatures, threaded at BOTH call sites (M5 main + M7
-      repair re-annotation, §7.4/§7.6);
+      absent/inconsistent marks or k < m); `fragment_lens` joins the §7.4 assembly variants
+      (since 2026-08-14 an `AnnotatePromptOptions` field), threaded at BOTH call sites
+      (M5 main + M7 repair re-annotation, §7.4/§7.6);
     - observability: events `stitch.judge`/`stitch.thread` with constants
       `EV_STITCH_JUDGE`/`EV_STITCH_THREAD` (trace-only, §8.1); trace channels grow 10 → 11
       with `"stitch"`; `task_name` joins `_FREE_TEXT_KEYS` (§8.3);
@@ -6458,9 +6571,10 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       the regression anchor);
     - the plain progress-line and text final-summary formats are OWNED by
       `labelkit/common/observability/console_format.py` (`format_progress_line` /
-      `format_summary_lines`) — byte-frozen to the v1.9 hardcoded strings by golden
-      snapshots (the golden-snapshot layer of the three-layer regression anchor, U24); the
-      M11 emitter and the CLI
+      `format_summary_lines`) — byte-frozen by golden
+      snapshots (the golden-snapshot layer of the three-layer regression anchor, U24), and
+      RE-FROZEN 2026-08-14 onto the English strings (same key set, same line structure,
+      same information — only the language changed); the M11 emitter and the CLI
       ConsoleRenderer both import from there (U21), so the mid-run rich → plain handover
       stays byte-identical;
     - the keyboard CLOSED key set `? h l e + - p q` (`h` = `?` synonym; unlisted keys
@@ -6496,15 +6610,15 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       `LLMClient.calibrator` (V23; calibrator self-constructed — zero factory changes);
     - frozen-signature revisions: `build_segment_prompt` gains `digests` (V9 — session-
       level precompute, template bytes unchanged; `judge_window`'s public signature does
-      NOT change); `build_annotate_prompt`/`annotate_record` gain the trailing
-      `k_eff: int | None = None` / `image_px: int | None = None` (V21 ladder, F3 — the
-      fourth additive trailing-kwarg revision);
+      NOT change); `build_annotate_prompt`/`annotate_record` gain
+      `k_eff: int | None = None` / `image_px: int | None = None` (V21 ladder, F3 — since
+      2026-08-14 `AnnotatePromptOptions` fields, §7.4);
     - window semantics (V9): `segment.window` = UPPER CAP; budget declared → greedy
       packing preserving the 1-frame overlap and later-window seam ownership; budget off
       → fixed windows byte-identical to v1.10; digest precompute moves BEFORE windowing
       (session-level, once); the digest-poverty WARN (S12) re-worded per the
-      profile-guidance revision V4 (「为 segment.llm 配置
-      supports_vision=true 的 profile」);
+      profile-guidance revision V4 ("attach frame screenshots by pointing segment.llm at a
+      supports_vision=true profile" — English since the 2026-08-14 re-freeze);
     - outputs: §9.2 gains (stage, "context_overflow") for the nine §3.3 stages and
       (stage, "output_truncated") for the LLM-calling stages; §9.3 gains `report.budget`
       {profiles, w_min, truncations, overflow_records, image_cost, degrade_retries,
@@ -6545,7 +6659,7 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       pre-write `validate_only(obj, schema=frame_schema)` backstop (invalid frame
       objects never land) and the `frame_annotate.discarded` sunk-cost tally (§7.10/§9.1);
     - frame-schema explicit routing: frame annotate calls ride
-      `complete_validated(..., schema=cfg.frame_schema)` — L0–L3 all present, NO L2.5,
+      `complete_validated(..., schema=cfg.frame_schema, scope=CallScope(...))` — L0–L3 all present, NO L2.5,
       NO resolved_at counting (the §9.3 resolved_at identity is preserved);
       `ResolvedConfig.frame_schema` is the user_schema sibling parse product (§6.1);
     - the greedy window packer is SUNK VERBATIM from segment-private `_pack_windows` to
@@ -6603,8 +6717,9 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       shuffle + pairwise crossing ⑥per-crossed-session switch points ⑦per-noise-frame draws
       ⑧duplicates as tail sessions (zero rng) ⑨timestamp laying. Test-pinned against drift;
       determinism is conditional on the LLM content (voided sequences change the weave input);
-    - **M8 treatment parameter** (§7.7): `complete_validated(..., user_treatment: bool | None
-      = None)` — None keeps the pre-v1.13 `schema is None` inference (every pre-existing call
+    - **M8 treatment parameter** (§7.7): `user_treatment: bool | None = None` (since
+      2026-08-14 a `CallScope` field rather than a standalone kwarg)
+      — None keeps the pre-v1.13 `schema is None` inference (every pre-existing call
       site unchanged), True means user treatment WITH an explicit schema (L2.5 + resolved_at
       preserved — the per-sequence-class annotation schema route), False means internal. The
       `stats` / §9.3 identity is restated as "the sum = RECORD-LEVEL annotation calls entering
@@ -6634,5 +6749,27 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       conservation identity (generate_only degenerate form). With
       `generate.stream.enabled = false` (the default) the whole system is byte-equivalent to
       v1.12.
+34. **代码规则整改冻结点** — the 2026-08-14 code-rule remediation (spec §1.6, same date).
+    Behavior, field names, keys, event names, error kinds, report shapes, chain order and the
+    prompt templates of §10 are ALL unchanged; what moved is the carrier and the language:
+    - **language split**: comments and docstrings are Chinese; identifiers, log lines, error
+      messages, exception text and CLI output are English (Ground rules, §6.2). The §10 prompt
+      templates and the spec-frozen output DATA they produce (`thread_seam` step text, the
+      defect-table `detail` strings, the packaged rubric criteria) stay Chinese verbatim;
+    - **parameter objects** (≤ 5 parameters per function): `CallScope` (§7.7),
+      `AnnotatePromptOptions` (§7.4), `VerifyPromptOptions` (§7.6), `ThreadCard` (§7.16) and
+      `RunServices` (§7.9, exported from `labelkit.orchestration`). Each field keeps its
+      pre-existing name and meaning; the "additive trailing kwarg" narrative of v1.7–v1.13 is
+      retired in favor of `dataclasses.replace` on the option object;
+    - **M1 split** (§1): `loader.py` keeps only the public entry, the console-mode verdict and
+      the `ResolvedConfig` assembly; parsing/validation moves into the six package-private
+      modules `_collect` / `_sections` / `_schemas` / `_rubrics` / `_classviews` /
+      `_constraints`. `labelkit.common.config.load` / `default_rubric` / `ResolvedConfig` are
+      the unchanged public face;
+    - **M9 breaker feed** (§7.8): `_record_provider_result` always forwards the keyword-only
+      `hard` — the call-form sniffing branch is deleted;
+    - **re-frozen byte anchors**: the eight `tests/cli/goldens/dryrun-*.txt` files and the two
+      `console_format` plain lines (progress line + final-summary header) are re-frozen onto
+      the English strings; key sets, line structure and information content are unchanged.
 
 — End of contract. —

@@ -133,7 +133,7 @@ trace 是**可选的第四个输出通道**：一行一个 JSON 事件，记录�
 
 ## 7.7 内联 rubric：`[rubric]` 节
 
-`quality.rubric = "inline"` 时，评价准则直接写在 project.toml 里。注意 `[rubric]` 表的 `name` 是**必填键**（非空字符串，作为 rubric 标识写入每条输出记录的 `_meta.run.rubric`）——漏了它，`labelkit validate` 会报「`project.toml:[rubric].name: 缺失必填键，期望非空字符串`」并以退出码 2 失败：
+`quality.rubric = "inline"` 时，评价准则直接写在 project.toml 里。注意 `[rubric]` 表的 `name` 是**必填键**（非空字符串，作为 rubric 标识写入每条输出记录的 `_meta.run.rubric`）——漏了它，`labelkit validate` 会报「`project.toml:[rubric].name: missing required key, expected non-empty string`」并以退出码 2 失败：
 
 ```toml
 [quality]

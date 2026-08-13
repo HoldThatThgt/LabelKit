@@ -10,6 +10,8 @@
 > 引用 [C-1]–[C-20] 均为 2026-07-17 真实检索核实；仓库表面经独立勘察复核
 > （M12 事件目录 26 事件/11 通道、report 计数器全量清单、密钥池/熔断状态面）。
 
+> **2026-08-14 整改修订注记**：本文的面板样板与行文案已随全库英文化**重采**（`account` / `stages` / `keys` / `breaker` / `elapsed` / `records` 等标签、键位提示行、中断横幅、counts 与 llm_usage 表头）；区块划分、数据源、布局与键位集**零改动**。plain 档的两条字节锚（进度行与终版摘要头）同批重冻结到英文串上，golden 家族继续逐字节钉死。决策 U1–U27 本身不变，本文保留为历史裁决记录。
+
 ## 1. 结论先行
 
 **LabelKit `run` 是一次性批处理，不是常驻交互系统——正确的 TUI 品类是
@@ -125,22 +127,22 @@ canvas 每 tick 覆盖重绘（组件化、渲染与状态分离、可测试性�
 运行中（rich 模式，stderr；上方为照常滚动的运行日志，下方画布 5 Hz 原地重绘）：
 
 ```
-2026-07-17T01:20:04+08:00 INFO  run     batch=- run f3a9c04b7d21 开始 examples/thread
+2026-07-17T01:20:04+08:00 INFO  run     batch=0 run.start tool_version=labelkit/1.0.0
 2026-07-17T01:21:12+08:00 WARN  ingest  batch=1 bad_line file=s2.jsonl line=17 reason=missing_text_field
-2026-07-17T01:23:40+08:00 INFO  emitter batch=2 批完成 emitted=18 rejected=1        ← 滚动区（日志，逐字节同 plain）
+2026-07-17T01:23:40+08:00 INFO  emitter batch=2 batch 2 flushed: main output +18 line(s) (total 41), rejects +1 (total 3)   ← 滚动区（日志，逐字节同 plain）
 ────────────────────────────────────────────────────────────────────────────────────
- labelkit run · f3a9c04b7d21 · process/ui/stream · seed 42 · 已用 04:12 · ETA ~06:40
+ labelkit run · f3a9c04b7d21 · process/ui/stream · seed 42 · elapsed 04:12 · ETA ~06:40
  project examples/thread/project.toml → out/threads.jsonl
 
- 批 3/5  ██████████████░░░░░░░░░░  记录 96/160 (scanned)
+ batch 3/5  ██████████████░░░░░░░░░░  records 96/160 (scanned)
 
- 段  segment ✓   stitch ✓   dedup ✓   extract ▶ 18/46   quality ·   annotate ·   verify ·
+ stages  segment ✓   stitch ✓   dedup ✓   extract ▶ 18/46   quality ·   annotate ·   verify ·
 
- 账  emitted 41   dup 3   lowq 5   verify 1   failed 0   noise 2   absorbed 88   stitched 2   threads 5
+ account  emitted 41   dup 3   lowq 5   verify 1   failed 0   noise 2   absorbed 88   stitched 2   threads 5
 
- LLM  default  在途 4/4  calls 213  重试 7  tok 412k↑ 96k↓  $0.83  p50 2.1s
-      judge    在途 2/4  calls 46   重试 0  tok 88k↑ 12k↓   $0.19  p50 3.4s
-      密钥 LABELKIT_KEY_A ok · _B 冷却12s · _C 禁用          熔断 0/20
+ LLM  default  in_flight 4/4  calls 213  retries 7  tok 412k↑ 96k↓  $0.83  p50 2.1s
+      judge    in_flight 2/4  calls 46   retries 0  tok 88k↑ 12k↓   $0.19  p50 3.4s
+      keys LABELKIT_KEY_A ok · _B cooldown 12s · _C disabled          breaker 0/20
 ────────────────────────────────────────────────────────────────────────────────────
 ```
 
@@ -153,7 +155,7 @@ canvas 每 tick 覆盖重绘（组件化、渲染与状态分离、可测试性�
 | 段棋盘 | 仅启用 stage，链序展示；`✓` 本批已过 / `▶` 进行中（LLM 调用完成数/估算分母）/ `·` 待走；分母来自 dry-run 同款公式，悬浮标注「估算」 | 进程内 stage 回调（裁决·阶段回调不入事件目录）+ `llm.call` 事件按 stage 累计 |
 | 状态账 | 九态计数（stream/stitch 键仅启用时在场，同 report.counts 口径）；批内只随批末更新（counts.* 为 post-emit tally）。**与裁决·缝合观测条件在场的交互**：该现行裁决把进度行钉为固定键集、stitched 永不入进度/摘要——rich 面板展示 stitched/threads 构成对它的**有界修订**（仅限 rich 面；plain 进度行与文本版摘要键集逐字节不动），立项时须在 spec §1.6 登记（裁决·固定键集有界修订） | MetricsSink counters（emit 后 tally） |
 | LLM | 每 profile：在途/上限、calls、retries、tokens、成本（未配价目显示 `—`）、p50 延迟；密钥池行（环境变量**名** + ok/冷却剩余/禁用）；熔断 fatal_streak/threshold，打开时整行变红 + 顶部横幅 | `LLMClient.snapshot()`（裁决·节流重绘原子快照新增只读方法）+ `llm.*` 事件 |
-| 中断态 | SIGINT 后画布顶部显示「正在优雅中断（≤30s）…」 | M10 `_request_stop` 回调 |
+| 中断态 | SIGINT 后画布顶部显示 `graceful interrupt in progress (≤30s)…` | M10 `_request_stop` 回调 |
 
 运行结束：画布做最后一次重绘后**定格为静态输出**（rich `Live(transient=False)`
 语义）——终版摘要表（counts 逐项 = report.json）+ per-stage 耗时横条 +
@@ -161,7 +163,7 @@ llm_usage 小表 + rejects/trace 路径行。scrollback 里留下完整日志 + 
 符合「批任务跑完要能贴进工单」的运维习惯（superconsole 同行为，调查·superconsole 双区设计）。
 
 `generate_only` 模式：生成阶段无批概念——批进度区退化为
-`生成 ▶ calls 87/120 · 已产 348 条`（`llm.call` + `counts.generated`），
+`generate ▶ calls 87/120 · produced 348`（`llm.call` + `counts.generated`），
 批棋盘自再流批次起激活。
 
 ### 4.2 架构——第四消费面，零事件目录改动

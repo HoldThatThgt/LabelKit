@@ -352,8 +352,12 @@ async def test_defect_verdict_schema_roundtrip():
     assert "去向: noise" in margin                     # margin evidence assembled
 
     stage = VerifyStage(cfg)
+    # 2026-08-14 收参整改：_judge_round_sequence 改走 _EpisodeReview 台账
+    # （rounds=0 ⇒ round_no=1，标注/类标签取自 item 本身），空串 = 无 [片段结构] 段。
+    from labelkit.operators.verify import _EpisodeReview
+    state = _EpisodeReview(item)
     verdict, merged, fail_critiques, defects = await stage._judge_round_sequence(
-        item, item.annotation, 1, ctx, boundary_margin=margin)  # ONE real call
+        state, ctx, margin, "")  # ONE real call
 
     assert verdict in {"pass", "fail"}
     # Real semantic assertion: the annotation claims 点外卖 while steps and

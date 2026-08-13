@@ -515,6 +515,14 @@ class _BrokenFile:
         pass
 
 
+class _BrokenCloseFile(_BrokenFile):
+    def write(self, s):
+        pass
+
+    def close(self):
+        raise OSError("close failed while flushing")
+
+
 def test_midrun_write_failure_warns_once_and_counts_drops(tmp_path, caplog):
     log, _ = open_log(tmp_path, channels=("quality",))
     log.emit(ev("quality.gate", record_ids=("ok",)))
@@ -529,6 +537,21 @@ def test_midrun_write_failure_warns_once_and_counts_drops(tmp_path, caplog):
     assert log.dropped_events == 2
     warns = [r for r in caplog.records if "trace channel disabled" in r.message]
     assert len(warns) == 1
+
+
+def test_close_failure_is_logged_and_never_raises(tmp_path, caplog):
+    # 关闭时才暴露的写失败（行缓冲刷盘落在 close 上）只记 error，绝不打断运行；
+    # 句柄照常置空，close() 保持幂等。
+    log, _ = open_log(tmp_path, channels=("quality",))
+    log.emit(ev("quality.gate", record_ids=("ok",)))    # 惰性开文件
+    log._fh.close()
+    log._fh = _BrokenCloseFile()
+    with caplog.at_level(logging.ERROR, logger="labelkit"):
+        log.close()
+        log.close()                                     # 幂等：第二次是 no-op
+    errs = [r for r in caplog.records if "trace file close failed" in r.message]
+    assert len(errs) == 1
+    assert log._fh is None
 
 
 # ── MetricsSink ────────────────────────────────────────────────────────────
@@ -891,9 +914,9 @@ def test_listener_exception_warns_once_and_disables_permanently(tmp_path, caplog
         sink.stage_begin("annotate", 1)             # silently dropped now
     sink.flush()
     log.close()
-    warns = [r for r in caplog.records if "console listener 异常" in r.message]
+    warns = [r for r in caplog.records if "console listener failed" in r.message]
     assert len(warns) == 1                          # WARN exactly once
-    assert "已停用面板旁路" in warns[0].getMessage()
+    assert "panel bypass disabled" in warns[0].getMessage()
     assert sink._listener is None                   # permanently disabled
     assert rec.stages == []                         # nothing forwarded after trip
     lines = (tmp_path / "t.trace.jsonl").read_text(encoding="utf-8").splitlines()
@@ -911,7 +934,7 @@ def test_listener_exception_in_forward_only_method_same_discipline(tmp_path, cap
         sink.stage_begin("dedup", 1)
         sink.stage_begin("quality", 1)
         sink.run_estimate({"total_batches": 1})
-    warns = [r for r in caplog.records if "console listener 异常" in r.message]
+    warns = [r for r in caplog.records if "console listener failed" in r.message]
     assert len(warns) == 1
     assert sink._listener is None
     assert rec.estimates == []                      # disabled before run_estimate

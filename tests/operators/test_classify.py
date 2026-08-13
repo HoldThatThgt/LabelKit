@@ -147,8 +147,8 @@ class QueueEngine:
         self.outcomes = list(outcomes)
         self.calls: list = []              # (profile, prompt, schema, record_ids)
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0, record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
         out = self.outcomes.pop(0)
         if isinstance(out, Exception):
@@ -163,8 +163,8 @@ class MapEngine:
         self.by_record = dict(by_record)
         self.calls: list = []
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0, record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
         out = self.by_record[record_ids[0]]
         if isinstance(out, Exception):
@@ -927,8 +927,8 @@ class FrameStageEngine:
         self.calls: list = []              # (profile, prompt, schema, record_ids)
         self.frame_calls: list = []
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0, record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
         if schema is not None and "labels" in schema.get("properties", {}):
             self.frame_calls.append((profile, prompt, schema, record_ids))

@@ -52,7 +52,7 @@
 
 **现象（修复前）**：spec §2.4 将「无任何合法记录」列入退出码 3 的触发条件，errors.py 与 CONTRACTS.md §InputError 也有同样表述，但实现缺该检查：`text_field` 全员不命中（默认 `on_bad_line="skip"`）时运行照常收尾——实测 `scanned=2 ingested=0 bad_input=2 emitted=0`、退出码 0。
 
-**修复**：按 spec 实现于 M2（ingest 拥有输入级合法性校验）：`Ingestor.records()` 流耗尽时若 `ingested == 0` 抛 `InputError("无任何合法记录: …（scanned/bad_input/missing_pair/index_conflict 计数）")` → 退出码 3。覆盖全坏行、空文件、UI 全缺对/全冲突四种形态；只要有一条合法记录则行为不变。新增 4 个单测 + 更新 4 个原「空流不抛错」的单测（tests/test_ingest.py），CLI 级实测确认 exit=3；手册第 5/15/18/19 章已同步回改为新行为。
+**修复**：按 spec 实现于 M2（ingest 拥有输入级合法性校验）：`Ingestor.records()` 流耗尽时若 `ingested == 0` 抛 `InputError("no valid records: …(scanned/bad_input/missing_pair/index_conflict counts)")` → 退出码 3。覆盖全坏行、空文件、UI 全缺对/全冲突四种形态；只要有一条合法记录则行为不变。新增 4 个单测 + 更新 4 个原「空流不抛错」的单测（tests/test_ingest.py），CLI 级实测确认 exit=3；手册第 5/15/18/19 章已同步回改为新行为。
 
 ## P2 — 符合规格但伤用户的锐边
 
@@ -388,6 +388,14 @@ inode**，先启动进程 rename 交付的「主输出」实为后进程内容�
 | 套件 | 数量 | 备注 |
 |---|---|---|
 | 离线套件 | 1673 passed | 新增 `tests/common/config/test_loader_generate_stream.py` 与 `tests/operators/test_generate_stream.py`；既有必红项（budget 头常量十→十二、console 参数化七→八 golden、config 默认值、schema_engine stats 语义、`EXPECTED_TEST_PY`）全部同步 |
+
+## 追加条目：2026-08-14 规则整改测试补齐发现
+
+### 29. `validate --probe` 的 rich 表格把 `profile[key]` 字面格当 markup 吞掉 —— ✅ 已修复（2026-08-14）
+
+**现象**：`--probe` 在 rich × TTY 档渲染探测表时，表头 `profile[key]` 实际显示为 `profile`，池化 profile 的小写 `key_env` 标签同样整段消失。**根因**：`rich` 控制台 markup 把小写方括号片段解析为样式标签并从输出中移除（官方文档明言 "Rich will assume that `[bar]` is a tag and remove it from the output"），而 `_print_probe_table` 把表头与数据格作为裸字符串传入。这违反 spec §7.7（U13）「表格与 plain 行式数值逐项一致」——plain 行的标签形是 `profile[key_env]`，表格丢标签即信息丢失。**修复**：字面格一律以 `rich.text.Text` 直传、状态列改显式 `style=` 参数（裁决·探测表字面格以 Text 直传；业界依据：rich markup 官方文档的 `escape()`/`Text` 处置与 Textualize/rich Issue #120 作者建议）。发现途径：本轮测试补齐为 `_print_probe_table` 落零覆盖补用例时暴露。
+
+同批按「过时代码直接删除」纪律清掉三处死代码（HTTP-date 的 Python < 3.10 兼容分支、`_collect` 数值读取器零调用的 `required` 形参、校准器 `freeze_batch` 不可达空桶分支），并把 `tests/out.jsonl` / `tests/out.report.json` 判定为一次临时脚本残留后删除——复跑全量套件确认 `tests/` 目录零文件产出。裁决全文见 spec §1.6「代码规则整改（2026-08-14 对齐）」的测试补齐闭环条目。
 | 集成套件（真端点） | 3 passed | `tests/integration/test_generate_stream_llm.py`：DeepSeek 蓝图/实现（含结构化帧类）+ 按类标注 Schema 两例、z.ai glm-5.2 的 `prefixItems` L0 透传一例 |
 | `examples/synth-stream` 真跑 | exit 0 | `counts.generated = emitted = 6`、`failed`/`dropped_*` 全 0；`generate.stream = {sessions 5, crossed_sessions 1, 两类各 planned 3/produced 3, frames 23, noise_frames 2, duplicates 1, plan_calls 6, realize_calls 6, noise_calls 1, 三项 failures 0}`；`run.artifact.lines = 29`、`llm_usage.default.calls = 52`、`timing.wall_s = 96.97`；`_meta.run.rubric = "default:trajectory"`（S29 扩展生效）；`report.classify` 直方图全零（inherited，预期） |
 | 工件重放（process + segment） | exit 0 | 29 帧 → 6 会话 → 6 episodes、`absorbed 28`、`dropped_noise 1`、`dropped_dup 1`（`near_text`，见第 27 条） |

@@ -35,6 +35,7 @@ from labelkit.common.runtime.budget import (
     input_budget,
     margin,
     min_window,
+    pack_windows,
 )
 from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
 
@@ -339,7 +340,7 @@ def test_template_head_tokens_quality_and_generate_inline_literals():
     §10.4) — pin the literals AND prove them live in the operators' assembly."""
     from labelkit.common.contracts.types import Record, RecordRef
     from labelkit.operators.generate import render_prompt_texts
-    from labelkit.operators.quality import _build_pairwise_prompt
+    from labelkit.operators.quality import _build_pairwise_prompt, _Comparison
 
     quality_close = "对每条准则给出裁决。输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容："
     generate_sentence = "输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容："
@@ -348,7 +349,7 @@ def test_template_head_tokens_quality_and_generate_inline_literals():
 
     rec = Record(id="r1", modality="text", text="样例", raw=None, ui_tree=None,
                  image=None, ref=RecordRef("f.jsonl", 1, None, ()))
-    bundle = _build_pairwise_prompt(rec, rec, (), with_reason=False,
+    bundle = _build_pairwise_prompt(_Comparison(rec, rec), (), with_reason=False,
                                     ui_tree_max_chars=1000)
     assert quality_close in bundle.messages[0].parts[0].text
     system_text, _user = render_prompt_texts("指令", None, 4, ())
@@ -546,6 +547,21 @@ def test_calibrator_profiles_are_independent():
     cal.freeze_batch()
     assert cal.cost("a") == 589
     assert cal.cost("o") == 1734          # untouched profile keeps its prior
+
+
+def test_freeze_batch_without_any_sample_keeps_the_prior_and_clears_nothing():
+    # 空批（整批无带图调用）：窗口与累计样本数都不动，读数仍是先验。
+    cal = _calibrator()
+    cal.freeze_batch()
+    cal.freeze_batch()
+    assert cal.cost("p") == ANTHROPIC_PRIOR_READOUT
+    assert cal._windows == {} and cal._frozen_total == {}
+
+
+# ── pack_windows 的公开面（v1.12 装箱器下沉后由 budget 承载）─────────────────
+
+def test_pack_windows_on_an_empty_frame_list_yields_no_windows():
+    assert pack_windows([], 1000, 20) == []
 
 
 def test_diff_constant_matches_spec():

@@ -182,8 +182,7 @@ class SamplesEngine:
         self._n = num_per_call
         self._served = 0
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0, record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
         system = prompt.messages[0].parts[0].text
         user = prompt.messages[1].parts[0].text
         self.calls.append((profile, system, user, prompt.temperature))
@@ -560,7 +559,8 @@ def test_void_log_message_schema_violation_carries_no_data_values():
     plan = _plan(3, "default", "concise")
     msg = void_log_message(plan, exc)
     # structural fields only
-    assert msg == "生成调用作废 call=3 llm=default style=concise kind=schema_violation violations=2"
+    assert msg == ("generate call voided: call=3 llm=default style=concise "
+                   "kind=schema_violation violations=2")
     # NEVER the rendered violations / raw output (they embed generated sample text)
     assert sample not in msg
     assert str(exc) not in msg
@@ -569,7 +569,8 @@ def test_void_log_message_schema_violation_carries_no_data_values():
 def test_void_log_message_provider_error_kind_and_null_style():
     exc = ProviderRetryableError("429 rate limited", profile="glm", retries=3)
     msg = void_log_message(_plan(0, "glm", None), exc)
-    assert msg == "生成调用作废 call=0 llm=glm style=null kind=provider_retryable_exhausted"
+    assert msg == ("generate call voided: call=0 llm=glm style=null "
+                   "kind=provider_retryable_exhausted")
 
 
 # ── seed selection (process mode) ──────────────────────────────────────────
@@ -706,7 +707,8 @@ def test_postprocess_sample_validator_zero_touch_and_exception(caplog):
         records = postprocess_samples(plans, results, [], cfg, metrics)
     assert records == []                                        # 异常 ⇒ 按违规剔除
     assert metrics.counters["generate.buckets.a×null.rejected_by_validator"] == 1
-    assert sum("sample_validator 回调抛出异常" in r.message for r in caplog.records) == 1
+    assert sum("generate.sample_validator raised" in r.message
+               for r in caplog.records) == 1
 
 
 def test_postprocess_without_validator_has_no_bucket_field():

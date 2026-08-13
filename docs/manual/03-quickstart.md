@@ -152,7 +152,7 @@ uv run labelkit validate --config ../config.toml --project project.toml --probe
 ```
 
 ```
-配置校验通过
+configuration valid
 probe default: ok model=glm-5.2 latency_ms=4031
 probe judge: ok model=glm-5.2 latency_ms=1808
 ```
@@ -166,7 +166,7 @@ uv run labelkit run --config ../config.toml --project project.toml --dry-run
 ```
 dry-run: mode=process estimated_records=30 batches=2
 dry-run: estimated LLM calls — generate_calls=4 segment_calls=0 stitch_calls=0 classify_calls=14 frame_classify_calls=0 extract_calls=0 quality_calls=120 annotate_calls=30 frame_annotate_calls=0 verify_calls=30 total=198 (excludes retries and repair calls)
-dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界
+dry-run: note: estimated with global config / multi reports a lower bound at label multiplier 1
 dry-run: no LLM calls made, no output written (report and trace only)
 ```
 
@@ -184,13 +184,13 @@ uv run labelkit run --config ../config.toml --project project.toml
 INFO  run     batch=0 run.start tool_version=labelkit/1.0.0 config_digest=sha256:1c1c... project_digest=sha256:b648... trace_schema_version=1
 INFO  run     batch=0 budget: default=131072/113868 judge=131072/115916
 WARN  quality batch=1 error stage=quality kind=output_truncated message=pointwise scoring call failed for criterion facts_trivia (OutputTruncatedError): response terminated at the output cap (finish='max_tokens', max_output_tokens=4096) retryable=False
-INFO  emitter batch=1 批 1 落盘：主输出 +8 行（累计 8），rejects +6（累计 6）
+INFO  emitter batch=1 batch 1 flushed: main output +8 line(s) (total 8), rejects +6 (total 6)
 INFO  run     batch=1 batch.end active=8 dropped_dup=1 dropped_lowq=4 dropped_verify=0 failed=1 duration_ms=149982 fanout=0
-INFO  emitter batch=2 批 2 落盘：主输出 +5 行（累计 13），rejects +7（累计 13）
+INFO  emitter batch=2 batch 2 flushed: main output +5 line(s) (total 13), rejects +7 (total 13)
 INFO  run     batch=2 batch.end active=5 dropped_dup=0 dropped_lowq=7 dropped_verify=0 failed=0 duration_ms=84955 fanout=0
-INFO  emitter batch=- finalize：fsync + rename  out/text-labels.jsonl.part → out/text-labels.jsonl（13 行）
-INFO  emitter batch=- 已写出 out/text-labels.rejects.jsonl（13 行）与 out/text-labels.report.json
-   ── 终版摘要（与 report.counts 逐项一致）──
+INFO  emitter batch=- finalize: fsync + rename  out/text-labels.jsonl.part -> out/text-labels.jsonl (13 lines)
+INFO  emitter batch=- wrote out/text-labels.rejects.jsonl (13 lines) and out/text-labels.report.json
+   ── final summary (matches report.counts item by item) ──
    scanned=14  ingested=14  bad_input=0  generated=12
    dropped_dup=1  dropped_lowq=11  dropped_verify=0  failed=1  emitted=13
 INFO  run     batch=0 run.end exit_code=0

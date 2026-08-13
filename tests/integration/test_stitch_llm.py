@@ -53,6 +53,7 @@ from labelkit.operators.ingest import _parse_ui_tree
 from labelkit.common.runtime.llm_client import LLMClient
 from labelkit.common.runtime.schema_engine import SchemaEngine
 from labelkit.operators.stitch import (
+    ThreadCard,
     judge_stitch,
     prior_hits,
     render_candidate_card,
@@ -181,14 +182,16 @@ def frames(*ns: int) -> list[Record]:
 
 def food_thread_card(cfg, candidate_head: Record | None, index: int = 1) -> str:
     """The open 点外卖 thread (task-A head, frames 1-4): session span [0, 3]."""
-    return render_thread_card(index, "点外卖", frames(1, 2, 3, 4), (0, 3), 1,
-                              candidate_head, cfg)
+    return render_thread_card(
+        ThreadCard(index=index, task_name="点外卖", members=frames(1, 2, 3, 4),
+                   span=(0, 3), fragment_count=1), candidate_head, cfg)
 
 
 def taxi_thread_card(cfg, candidate_head: Record | None, index: int) -> str:
     """An open 打车 thread (frames 9-10): session span [8, 9]."""
-    return render_thread_card(index, "打车", frames(9, 10), (8, 9), 1,
-                              candidate_head, cfg)
+    return render_thread_card(
+        ThreadCard(index=index, task_name="打车", members=frames(9, 10),
+                   span=(8, 9), fragment_count=1), candidate_head, cfg)
 
 
 # ── 1. clear resume: 点外卖 tail resumes the 点外卖 thread ───────────────────

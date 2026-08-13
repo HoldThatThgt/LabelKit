@@ -199,11 +199,11 @@ rich 档下终端分两区：**上方日志照常滚动**（行文本与 plain �
 | 区块 | 显示什么 | 数据从哪来 |
 |---|---|---|
 | 标头 | run_id、模式/模态（stream/stitch 徽标）、seed、已用时长、ETA（仅批总数分母可得时显示，吞吐外推、标 `~`） | 启动时注入的运行上下文与 `run.start` 事件 |
-| 批进度 | UI 模态恒为 `批 i/N` + 已扫描数（复用启动预扫描，零额外 I/O）；文本模态默认 `批 i` 无分母，`console.estimate = true` 换取分母与 ETA（第 6 章）；generate_only 相位内退化为 `生成 ▶ calls i/N · 已产 n 条` | 批生命周期事件 + 启动估算 |
+| 批进度 | UI 模态恒为 `batch i/N` + 已扫描数（复用启动预扫描，零额外 I/O）；文本模态默认 `batch i` 无分母，`console.estimate = true` 换取分母与 ETA（第 6 章）；generate_only 相位内退化为 `generate ▶ calls i/N · produced n` | 批生命周期事件 + 启动估算 |
 | 段棋盘 | 仅启用的算子按链序排开：`✓` 本批已过 / `▶` 进行中（附「已完成调用数 / 分母」，分母来自与 dry-run 同源的运行级估算、标**估算**；估算不可得时只显示分子）/ `·` 待走 | 阶段开始信号 + LLM 调用事件按在途阶段归集 |
 | 状态账 | 各状态计数，与 report.counts 同口径；stream/stitch 的键（noise / absorbed / stitched / threads）仅对应算子启用时在场 | 每批批末的计数拉取 |
 | LLM | 每 profile 一行：在途/并发上限、calls、重试、tokens ↑↓、成本（未配单价显示 `—`）、p50 延迟；密钥池行（环境变量名 + ok/冷却剩余秒/禁用）；熔断计数，触发时红色横幅 | LLM 客户端只读快照，每次重绘拉取一次 |
-| 键位提示 / 中断横幅 | 键盘开关一览（下表；交互未启用时不显示）；Ctrl-C 后画布顶部显示「正在优雅中断」横幅 | 中断信号的进程内旁路 |
+| 键位提示 / 中断横幅 | 键盘开关一览（下表；交互未启用时不显示）；Ctrl-C 后画布顶部显示 `graceful interrupt in progress (≤30s)…` 横幅 | 中断信号的进程内旁路 |
 
 `validate --probe` 与 dry-run 在 rich 档下也有对应的表格呈现（数值与行式逐项一致，probe 表仅当 stdout 是 TTY 时渲染，15.2）；`rubric --show` 恒为行式——它的 stdout 是给机器消费的。
 
@@ -242,48 +242,48 @@ examples/stream 工程（stream + stitch 全开，面板信息最全）真实运
 
 ```
 ────────────────────────────────────────────────────────────────────────────────────────────────────
- labelkit run · 36c7fbe8beae · process/ui/stream+stitch · seed 42 · 已用 04:35
+ labelkit run · 36c7fbe8beae · process/ui/stream+stitch · seed 42 · elapsed 04:35
  project project.toml → ./out/stream-labels.jsonl
 
- 批 1/1  ████████████████████████  记录 53/53 (scanned)
+ batch 1/1  ████████████████████████  records 53/53 (scanned)
 
- 段  segment ✓   stitch ✓   dedup ✓   classify ✓   extract ✓   quality ▶ 24/20   annotate ·   verify
+ stages  segment ✓   stitch ✓   dedup ✓   classify ✓   extract ✓   quality ▶ 24/20   annotate ·   verify
 ·
 
- 账  emitted 0   dup 0   lowq 0   verify 0   failed 0   noise 0   absorbed 0   stitched 0   threads
+ account  emitted 0   dup 0   lowq 0   verify 0   failed 0   noise 0   absorbed 0   stitched 0   threads
 0
 
- LLM  default  在途 4/4  calls 89  重试 0  tok 74k↑ 7k↓  —  p50 6.1s
-      judge    在途 0/4  calls 0  重试 0  tok 0↑ 0↓  —  p50 —
-      熔断 0/20
- [?]帮助 [l]LLM展开 [e]错误条 [p]暂停 [q]脱离
+ LLM  default  in_flight 4/4  calls 89  retries 0  tok 74k↑ 7k↓  —  p50 6.1s
+      judge    in_flight 0/4  calls 0  retries 0  tok 0↑ 0↓  —  p50 —
+      breaker 0/20
+ [?]help [l]LLM expand [e]errors [p]pause [q]detach
 ```
 
 运行结束时定格的终版面板帧（留在 scrollback 里，可直接截屏贴工单；两帧均捕获自 v1.10 验收期的一次真实运行——那次 53 帧 → 12 episodes → 缝合 3 → 9 线索落盘。面板布局与键位自那以来未变；分段判决逐次运行会漂移，当前基线的账目数字以第 26 章为准）：
 
 ```
 ────────────────────────────────────────────────────────────────────────────────────────────────────
- labelkit run 完成 · 36c7fbe8beae · process/ui/stream+stitch · 用时 06:04
- counts（= report.counts）
-┏━━━━━━━━━━━━━━━━┳━━━━┓
-┃ 键             ┃ 值 ┃
-┡━━━━━━━━━━━━━━━━╇━━━━┩
-│ scanned        │ 53 │
-│ ingested       │ 53 │
-│ bad_input      │  0 │
-│ dropped_dup    │  0 │
-│ dropped_lowq   │  0 │
-│ dropped_verify │  0 │
-│ failed         │  0 │
-│ generated      │  0 │
-│ emitted        │  9 │
-│ episodes       │ 12 │
-│ absorbed       │ 45 │
-│ dropped_noise  │  8 │
-│ stitched       │  3 │
-│ threads        │  9 │
-└────────────────┴────┘
- 段耗时（近似：on_stage 转换间隔累加，非 report 计时）
+ labelkit run done · 36c7fbe8beae · process/ui/stream+stitch · elapsed 06:04
+ counts (= report.counts)
+┏━━━━━━━━━━━━━━━━┳━━━━━━━┓
+┃ key            ┃ value ┃
+┡━━━━━━━━━━━━━━━━╇━━━━━━━┩
+│ scanned        │    53 │
+│ ingested       │    53 │
+│ bad_input      │     0 │
+│ dropped_dup    │     0 │
+│ dropped_lowq   │     0 │
+│ dropped_verify │     0 │
+│ failed         │     0 │
+│ generated      │     0 │
+│ emitted        │     9 │
+│ episodes       │    12 │
+│ absorbed       │    45 │
+│ dropped_noise  │     8 │
+│ stitched       │     3 │
+│ threads        │     9 │
+└────────────────┴───────┘
+ stage time (approx: summed on_stage intervals, not report timings)
  segment   ████ 22.3s
  stitch    ████████████████████ 120.7s
  dedup     █ 0.0s
@@ -293,12 +293,12 @@ examples/stream 工程（stream + stitch 全开，面板信息最全）真实运
  annotate  ████ 23.9s
  verify    ████ 22.4s
  llm_usage
-┏━━━━━━━━━┳━━━━━━━┳━━━━━━┳━━━━━━┳━━━━━━┳━━━━━━┳━━━━━━┓
-┃ profile ┃ calls ┃ 重试 ┃ tok↑ ┃ tok↓ ┃ 成本 ┃  p50 ┃
-┡━━━━━━━━━╇━━━━━━━╇━━━━━━╇━━━━━━╇━━━━━━╇━━━━━━╇━━━━━━┩
-│ default │   123 │    0 │ 103k │  14k │    — │ 6.1s │
-│ judge   │     9 │    0 │  11k │   2k │    — │ 7.9s │
-└─────────┴───────┴──────┴──────┴──────┴──────┴──────┘
+┏━━━━━━━━━┳━━━━━━━┳━━━━━━━━━┳━━━━━━┳━━━━━━┳━━━━━━┳━━━━━━┓
+┃ profile ┃ calls ┃ retries ┃ tok↑ ┃ tok↓ ┃ cost ┃  p50 ┃
+┡━━━━━━━━━╇━━━━━━━╇━━━━━━━━━╇━━━━━━╇━━━━━━╇━━━━━━╇━━━━━━┩
+│ default │   123 │       0 │ 103k │  14k │    — │ 6.1s │
+│ judge   │     9 │       0 │  11k │   2k │    — │ 7.9s │
+└─────────┴───────┴─────────┴──────┴──────┴──────┴──────┘
  rejects → out/stream-labels.rejects.jsonl
  trace → out/stream-labels.trace.jsonl
 ```

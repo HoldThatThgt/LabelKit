@@ -59,9 +59,9 @@ flowchart TD
 读 stderr——所有配置错误都带**文件:节.键**定位与期望值提示，且一次列全：
 
 ```
-ConfigError: 2 个配置错误（全量聚合反馈）
-project.toml:[run].output: 缺失必填键，期望字符串（可用 CLI --output 提供）
-config.toml:[llm.default].api_key_env: 环境变量 "LABELKIT_ZAI_KEY" 未设置或为空
+ConfigError: 2 config error(s) (all aggregated)
+project.toml:[run].output: missing required key, expected string (may be supplied by CLI --output)
+config.toml:[llm.default].api_key_env: environment variable "LABELKIT_ZAI_KEY" is not set or empty
 ```
 
 高频前六名：环境变量没加载（`set -a && source .env && set +a`）；引用的 profile 名拼错（错误里会列出可用名单）；Schema 不是合法 draft 2020-12 / 顶层不是 object / 声明了 `_meta`；`selection = "top_ratio"` 时仍设了 `threshold`（两种淘汰机制互斥，第 10 章）；UI 模态引用的 profile 没开 `supports_vision`；输出父目录不存在（忘了 `mkdir -p out`）。反向情形（`selection` 保持默认 `"threshold"` 时写了 `top_ratio`）不报错但会打一条 warning 提示「该键不会生效」——看到它就补上 `selection = "top_ratio"`。
@@ -75,7 +75,7 @@ config.toml:[llm.default].api_key_env: 环境变量 "LABELKIT_ZAI_KEY" 未设置
 其中「无任何合法记录」的经典病根是 **`text_field` 与数据字段名不匹配**——每行都成了坏行，默认 skip 策略逐行告警后在流末尾统一报错：
 
 ```
-InputError: 无任何合法记录: input.jsonl（scanned=14 bad_input=14 missing_pair=0 index_conflict=0）
+InputError: no valid records: input.jsonl (scanned=14 bad_input=14 missing_pair=0 index_conflict=0)
 ```
 
 只要有部分行合法，skip 策略照常跑完（坏行计入 `bad_input`，退出码 0）——见下文「`bad_input` 占大头」一行。
@@ -86,7 +86,7 @@ InputError: 无任何合法记录: input.jsonl（scanned=14 bad_input=14 missing
 - **输出不可写（运行期才失败）**：启动时输出目录还正常、运行中途写入失败——目录被删/改名、磁盘写满、权限被中途收回等。注意：忘了 `mkdir -p out` 或目录一开始就没有写权限，会在启动校验被拦下 → **退出码 2**（消息「输出父目录不存在或不可写」）；
 - **Ctrl-C 打在流水线之外**：运行中的 Ctrl-C 走优雅中断（正常交付、退出码 0/1，见「`.part` 文件是什么」）；但打在启动/收尾阶段（配置装载、probe 等）或信号处理不可用的平台上时，进程以 `interrupted` + 退出码 4 收场。
 
-顺带说明 stderr 的死因行格式：真正逃逸到进程级的异常，首行为「异常类名: 消息」——现实中会出现的有 `InputError`（退出码 3）、运行期写盘失败的 `LabelKitError` 与各种未预期异常类名（退出码 4）；配置错误则是 `ConfigError: N 个配置错误…` 的聚合格式。注意**熔断不产生异常死因行**——它走正常收尾，stderr 特征是连续 provider 错误日志之后的 `run.end exit_code=4` 与终版摘要；`ProviderFatalError` 也总是被转成记录级错误（落在 rejects 的 `_meta.reason`），不会以死因行出现。
+顺带说明 stderr 的死因行格式：真正逃逸到进程级的异常，首行为「异常类名: 消息」——现实中会出现的有 `InputError`（退出码 3）、运行期写盘失败的 `LabelKitError` 与各种未预期异常类名（退出码 4）；配置错误则是 `ConfigError: N config error(s) (all aggregated)` 抬头加逐条错误行的聚合格式。注意**熔断不产生异常死因行**——它走正常收尾，stderr 特征是连续 provider 错误日志之后的 `run.end exit_code=4` 与终版摘要；`ProviderFatalError` 也总是被转成记录级错误（落在 rejects 的 `_meta.reason`），不会以死因行出现。
 
 ### 「运行以退出码 4 结束，但主输出文件存在」
 

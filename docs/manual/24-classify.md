@@ -107,7 +107,7 @@ uv run labelkit run --config ../config.toml --project project.toml
 stderr 尾部的终版摘要（真实运行，退出码 0）：
 
 ```
-   ── 终版摘要（与 report.counts 逐项一致）──
+   ── final summary (matches report.counts item by item) ──
    scanned=14  ingested=14  bad_input=0  generated=12
    dropped_dup=1  dropped_lowq=11  dropped_verify=0  failed=1  emitted=13
 ```

@@ -180,7 +180,7 @@ uv run labelkit run --config config.toml --project project.toml
 ```
 dry-run: mode=generate_only estimated_records=6 batches=1
 dry-run: estimated LLM calls — generate_calls=13 segment_calls=0 stitch_calls=0 classify_calls=0 frame_classify_calls=0 extract_calls=0 quality_calls=24 annotate_calls=6 frame_annotate_calls=0 verify_calls=6 total=49 (excludes retries and repair calls)
-dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界
+dry-run: note: estimated with global config / multi reports a lower bound at label multiplier 1
 dry-run: no LLM calls made, no output written (report only)
 ```
 
@@ -189,7 +189,7 @@ dry-run: no LLM calls made, no output written (report only)
 真跑的终版摘要（与 `report.counts` 逐项一致，退出码 0，全程约 97 秒）：
 
 ```
-   ── 终版摘要（与 report.counts 逐项一致）──
+   ── final summary (matches report.counts item by item) ──
    scanned=0  ingested=0  bad_input=0  generated=6
    dropped_dup=0  dropped_lowq=0  dropped_verify=0  failed=0  emitted=6
 ```

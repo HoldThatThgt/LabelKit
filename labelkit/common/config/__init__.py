@@ -1,8 +1,8 @@
-"""Config service (M1). Re-exports per CONTRACTS.md §1: load, default_rubric, ResolvedConfig.
+"""配置服务（M1）。按 CONTRACTS.md §1 再导出：load、default_rubric、ResolvedConfig。
 
-`load` / `default_rubric` live in `labelkit.common.config.loader` (owned by M1) and are
-re-exported lazily (PEP 562) so that importing `labelkit.common.config.model` never
-requires loader.py — keeping the import graph acyclic.
+`load` / `default_rubric` 实现在 `labelkit.common.config.loader`（归 M1 所有），此处以
+PEP 562 惰性再导出——这样导入 `labelkit.common.config.model` 永不牵连 loader.py，
+从而保持导入图无环。
 """
 from __future__ import annotations
 
@@ -14,6 +14,12 @@ __all__ = ["load", "default_rubric", "ResolvedConfig"]
 
 
 def __getattr__(name: str) -> Any:
+    """惰性再导出 loader 侧符号（PEP 562），保持导入图无环。
+
+    @param name 被访问的模块属性名
+    @return `loader.load` / `loader.default_rubric` 对应的可调用对象
+    @raises AttributeError 名字不在再导出白名单内
+    """
     if name in ("load", "default_rubric"):
         from labelkit.common.config import loader
         return getattr(loader, name)

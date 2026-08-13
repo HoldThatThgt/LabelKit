@@ -1,33 +1,27 @@
-"""M15 extract stage (spec 3.15, CONTRACTS.md §7.15).
+"""M15 extract 阶段（spec 3.15，CONTRACTS.md §7.15）。
 
-Transition/action extraction for sequence envelopes (episodes): one structured
-action per adjacent member pair ⟨s_i, s_{i+1}⟩ via LLM — deterministic prompt
-assembly (CONTRACTS §10.10: two images + optional tree-diff evidence + the
-always-present frame-digest tail), the M8 internal-schema guarantee
-(schema_engine.action_schema — no resolved_at counting, no L2.5), and the
-on_error fallback/fail policy (S16: fallback evidence lives in Transition.detail,
-never in item.errors — R4 family). Transition count == member count − 1, always
-(a failed step becomes a fallback placeholder, never a hole). v1.9 (T10/T20):
-pairs at M16 ``seam_indexes`` never reach the LLM — they take the mechanical
-thread-seam placeholder (detail.kind == "thread_seam") and stay OUT of the
-extract counters; adjacent-rescue splices are real transitions and extract
-normally. Chain position:
-classify → extract → quality (labels are in place so [class.<label>.extract]
-per-class instructions apply); multi fan-out siblings each extract independently
-under their own label (S9 — never de-duplicated by record id). UI-modality
-sequences only (M1 enforces; re-checked defensively here).
+对序列信封（episode）做动作摘取：每对相邻成员 ⟨s_i, s_{i+1}⟩ 经 LLM 得一个结构化
+动作——确定性提示词装配（CONTRACTS §10.10：两张截图 + 可选的树变更证据 + 恒在的
+帧摘要尾部）、M8 内部 schema 保证（schema_engine.action_schema——不计 resolved_at、
+不过 L2.5），以及 on_error 的 fallback/fail 策略（S16：兜底取证落在
+Transition.detail，绝不入 item.errors——R4 家族）。步骤数恒等于成员数 − 1（失败的
+步骤变成兜底占位，绝不留洞）。v1.9（T10/T20）：落在 M16 ``seam_indexes`` 上的相邻
+对永不进 LLM——它们取机械的线索接缝占位（detail.kind == "thread_seam"）且**不进**
+extract 计数器；相邻救援的拼接处是真实步骤，照常摘取。链位：classify → extract →
+quality（标签已就位，故 [class.<label>.extract] 的按类指令得以生效）；multi 扇出的
+兄弟信封各自按自己的标签独立摘取（S9——绝不按 record id 去重）。仅 UI 模态序列
+（由 M1 强制，此处再防御式复核）。
 
-Concurrency: ALL transitions across ALL episodes of the batch join ONE
-asyncio.gather (M4 pairwise phase-2 skeleton); results are written back by
-(episode batch position, pair ordinal) — schedule-independent, zero rng.
+并发：全批所有 episode 的所有步骤合进**同一个** asyncio.gather（M4 pairwise 第二
+阶段骨架）；结果按（episode 批内位置, 步骤序号）回写——与调度顺序无关、零 rng。
 
-``extract_transition`` is a PUBLIC DIRECT-CALL SURFACE: M7's post-surgery seam
-re-extraction calls it directly (1–2 calls per surgery; the stage itself is
-never re-run — ``transitions is not None`` skips, so re-entry costs zero calls).
+``extract_transition`` 是**公开直调面**：M7 手术后的接缝重摘直接调用它（每次手术
+1–2 次调用；stage 本身永不重跑——``transitions is not None`` 即跳过，重入零调用）。
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import TYPE_CHECKING, Mapping
 
 from labelkit.common.errors import (
@@ -50,28 +44,29 @@ from labelkit.common.contracts.types import (
 from labelkit.common.runtime import budget
 
 from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
-from labelkit.common.runtime.schema_engine import action_schema
+from labelkit.common.runtime.schema_engine import CallScope, action_schema
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import ResolvedConfig
     from labelkit.common.contracts.stage import RunContext
 
 
+_logger = logging.getLogger("labelkit.extract")
+
 _STAGE_NAME = "extract"
 
-# Event names (exact strings per CONTRACTS.md §7.15 / §8.1).
+# 事件名（严格取 CONTRACTS.md §7.15 / §8.1 的字面串）。
 _EV_STEP = "extract.step"
 _EV_ERROR = "error"
 
-# Counter keys owned by M15 (CONTRACTS.md §9.3; report.stream.extract).
-_COUNTER_TRANSITIONS = "extract.transitions"        # total steps incl. fallback
+# M15 自有的计数器键（CONTRACTS.md §9.3；report.stream.extract）。
+_COUNTER_TRANSITIONS = "extract.transitions"        # 全部最终步骤数（含兜底）
 _COUNTER_FALLBACK_STEPS = "extract.fallback_steps"
-_COUNTER_FAILURES = "extract.failures"              # failed episodes
-_COUNTER_BY_TYPE_PREFIX = "extract.by_type."        # per action_type, incl. fallback "other"
+_COUNTER_FAILURES = "extract.failures"              # 失败的 episode 数
+_COUNTER_BY_TYPE_PREFIX = "extract.by_type."        # 按 action_type，含兜底的 "other"
 
-# Chinese prompt fragments — verbatim from CONTRACTS.md §10.10 (spec 3.15.4),
-# including the documented line breaks. The vocabulary bullets and the OpenCUA
-# anchoring sentence are frozen template text and never vary with configuration.
+# 中文提示词片段——逐字取自 CONTRACTS.md §10.10（spec 3.15.4），包括其中记录在案的
+# 换行。词表条目与 OpenCUA 锚定句是冻结模板文本，绝不随配置变化。
 _SYSTEM_HEAD = (
     "你是屏幕操作流的动作摘取员。给定同一操作流中相邻的前后两帧屏幕状态，推断用户在两帧之间\n"
     "执行的动作。action_type 只能取以下值：\n"
@@ -94,24 +89,29 @@ _LABEL_NEXT = "[后一帧截图]"
 _LABEL_DIFF = "[树变更摘要]"
 _LABEL_DIGESTS = "[前后帧树摘要]"
 
-# Per-frame digest cap for the [前后帧树摘要] tail. The [extract] table carries no
-# digest key; 400 = segment.digest_max_chars default — the same resolution M4's
-# sequence branch made for its member digests (quality._MEMBER_DIGEST_MAX_CHARS).
+# [前后帧树摘要] 尾部的每帧摘要上限。[extract] 表不带摘要键；400 = segment.
+# digest_max_chars 的缺省值——与 M4 序列分支为其成员摘要所作的取舍同一口径
+# （quality._MEMBER_DIGEST_MAX_CHARS）。
 _DIGEST_MAX_CHARS = 400
 
-# Code-side fallback action (S16): distinguishable from an LLM-confirmed "other"
-# by the presence of Transition.detail["kind"] == "extraction_invalid".
+# 代码侧兜底动作（S16）：与 LLM 确认的 "other" 的区分点，是
+# Transition.detail["kind"] == "extraction_invalid" 的在场。
 _FALLBACK_ACTION: Mapping = {"action_type": "other", "target": None,
                              "value": None, "description": ""}
 
 
 def _seam_placeholder(index: int, interrupted_by: tuple[str, ...]) -> Transition:
-    """v1.9 (T10, four keys pinned): the zero-LLM mechanical placeholder written
-    at a thread-seam step. action_type="app_switch" promises NO semantics (M-1
-    备注: same-app interleavings land here too) — downstream discriminates by
-    detail.kind == "thread_seam". interrupted_by = the distinct interrupting
-    threads' task_names in gap order (M-1 guarantees ≥ 1); model=""/attempts=0:
-    no call was ever made."""
+    """v1.9（T10，四个键钉死）：写在线索接缝步骤上的零 LLM 机械占位。
+
+    action_type="app_switch" **不**承诺任何语义（M-1 备注：同应用交错也落这里）
+    ——下游一律以 detail.kind == "thread_seam" 区分。interrupted_by = 打断者线索
+    按缺口序去重后的 task_name（M-1 保证 ≥ 1）；model=""/attempts=0 表示从未发生
+    过任何调用。
+
+    @param index 步骤序号（相邻对序号）
+    @param interrupted_by 打断者线索的 task_name（按缺口序）
+    @return 接缝占位步骤记录
+    """
     names = "、".join(interrupted_by)
     action = {"action_type": "app_switch", "target": None, "value": None,
               "description": f"线索接缝：被{names}打断后恢复"}
@@ -121,11 +121,16 @@ def _seam_placeholder(index: int, interrupted_by: tuple[str, ...]) -> Transition
 
 
 def _diff_text(diff: Mapping) -> str:
-    """Deterministic textualization of a tree_diff mapping for [树变更摘要]
-    (spec 3.15.4: added/removed/text-changed node counts, change ratio, App/title
-    changed). Same fixed form as M14's §10.9 [帧 {i} 变更] rendering — operator
-    modules never depend on each other (spec §2.2), so this is M15's own copy of
-    the shared format (the quality/annotate step-line precedent)."""
+    """把 tree_diff 映射确定性地文本化为 [树变更摘要]（spec 3.15.4：新增 / 移除 /
+    文本变化的节点数、变更比例、应用与标题是否变化）。
+
+    与 M14 的 §10.9 [帧 {i} 变更] 渲染同一固定形态——算子模块之间从不相互依赖
+    （spec §2.2），故这是 M15 自己的一份共享格式副本（quality / annotate 的步骤行
+    先例）。
+
+    @param diff tree_diff 产出的差异映射
+    @return [树变更摘要] 的正文文本
+    """
     text = (f"新增 {diff['added']} 节点，移除 {diff['removed']} 节点，"
             f"文本变化 {diff['text_changed']} 处，"
             f"变更比例 {diff['change_ratio']:.0%}")
@@ -138,19 +143,22 @@ def _diff_text(diff: Mapping) -> str:
 
 def build_extract_prompt(prev: Record, curr: Record, cfg: "ResolvedConfig",
                          label: str | None) -> PromptBundle:
-    """Deterministic assembly of the §10.10 template.
+    """§10.10 模板的确定性装配。
 
-    system: extraction instruction + the 11-value vocabulary bullets + the
-    OpenCUA anchoring sentence + the optional instruction line (label non-None →
-    class_views[label].extract's effective value, the only whitelisted per-class
-    key; omitted entirely when empty) + the structure sentence and shape.
-    user: ONE message, five parts — text [前一帧截图], image s_i, text
-    [后一帧截图], image s_{i+1}, and the always-present closing text part:
-    the [树变更摘要] line (include_diff=true only; structural tree diff, S14)
-    plus the ALWAYS-present [前后帧树摘要] line (S6: the final part is text).
-    tree_diff quantization reuses dedup.bounds_quantize_px — the config's single
-    coordinate-quantization notion, absorbing the same capture-side bounds
-    jitter it exists for (spec §4.3).
+    system：摘取指令 + 11 值词表条目 + OpenCUA 锚定句 + 可选的指令行（label 非
+    None ⇒ 取 class_views[label].extract 的生效值，这是唯一进白名单的按类键；为空
+    时整行省略）+ 结构句与结构形。
+    user：**一条**消息、五个部件——文本 [前一帧截图]、图像 s_i、文本 [后一帧截图]、
+    图像 s_{i+1}，以及恒在的收尾文本部件：[树变更摘要] 行（仅 include_diff=true；
+    结构化树差异，S14）加上**恒在**的 [前后帧树摘要] 行（S6：末部件必为文本）。
+    tree_diff 的量化复用 dedup.bounds_quantize_px——配置里唯一的坐标量化概念，
+    吸收的正是它本就为之而生的采集侧 bounds 抖动（spec §4.3）。
+
+    @param prev 前一帧记录
+    @param curr 后一帧记录
+    @param cfg 本次运行的解析配置
+    @param label 序列级标签；非 None 时取按类摘取指令
+    @return 装配好的提示词包
     """
     ecfg = cfg.class_views[label].extract if label is not None else cfg.extract
     lines = [_SYSTEM_HEAD]
@@ -176,119 +184,189 @@ def build_extract_prompt(prev: Record, curr: Record, cfg: "ResolvedConfig",
     return PromptBundle(messages=(system, user))
 
 
+def _feed_reactive_terminal(exc: BaseException, metrics) -> None:
+    """A7/§7.8 熔断矩阵：只有 reactive-400（响应体嗅探）溢出终局喂致命连续计数。
+
+    每个异常对象恰喂一次（duck 标位守住重复喂给）；precheck 与 200 形态的 finish
+    判据永不喂——后者搭乘的本就是一次成功的 HTTP 交互。
+
+    @param exc 待结算的异常对象
+    @param metrics 本次运行的 M12 计数汇（MetricsSink）
+    @return 无（副作用为 record_provider_result）
+    """
+    if (isinstance(exc, ContextOverflowError) and exc.phase == "reactive"
+            and getattr(exc, "origin", "http_400") == "http_400"
+            and not getattr(exc, "_breaker_fed", False)):
+        exc._breaker_fed = True  # type: ignore[attr-defined]
+        metrics.record_provider_result(fatal=True)
+
+
+def _fallback_transition(index: int, ids: tuple[str, str], ctx: "RunContext",
+                         message: str, attempts: int) -> Transition:
+    """S16 代码侧兜底步骤：计 extract.fallback_steps、发 error 事件并构造占位步骤。
+
+    兜底取证只进 Transition.detail，**绝不**进 item.errors（rejects 归属读的是
+    errors[0]，R4）；model="" 表示不存在通过校验的输出——动作是代码侧构造物。
+
+    @param index 步骤序号（相邻对序号）
+    @param ids （前一帧 id, 后一帧 id）
+    @param ctx 本次（批次, 阶段）运行上下文
+    @param message 英文错误消息
+    @param attempts 该终局形态下已消耗的调用预算
+    @return 兜底步骤记录
+    """
+    kind = ErrorKind.EXTRACTION_INVALID.value
+    _logger.debug("transition extraction fell back: index=%d kind=%s", index, kind,
+                  extra={"stage": _STAGE_NAME, "batch": ctx.batch_no})
+    ctx.metrics.count(_COUNTER_FALLBACK_STEPS)
+    ctx.metrics.event(_EV_ERROR, stage=_STAGE_NAME, batch_no=ctx.batch_no,
+                      record_ids=ids,
+                      payload={"stage": _STAGE_NAME, "kind": kind,
+                               "message": message, "retryable": False})
+    return Transition(index=index, action=dict(_FALLBACK_ACTION), model="",
+                      attempts=attempts,
+                      detail={"kind": kind, "message": message})
+
+
 async def extract_transition(prev: Record, curr: Record, index: int,
                              ctx: "RunContext", label: str | None = None) -> Transition:
-    """One transition, one call — through complete_validated(schema=action_schema()).
+    """一个步骤一次调用——经 complete_validated(schema=action_schema())。
 
-    Repair exhaustion follows extract.on_error (S16): "fallback" (default)
-    returns the code-side fallback Transition — action_type="other",
-    detail={kind: "extraction_invalid", message} — plus the extract.fallback_steps
-    counter and the error trace event; NEVER item.errors (rejects attribution
-    reads errors[0], R4). "fail" re-raises the SchemaViolation (the stage layer
-    fails the episode). Provider/internal errors always propagate to the caller.
-    Post-validation normalization: a scroll direction value is lowercased
-    code-side (spec 3.15.4 field-semantics table).
+    修复穷尽遵循 extract.on_error（S16）："fallback"（缺省）返回代码侧兜底
+    Transition（action_type="other"、detail.kind="extraction_invalid"），外加
+    extract.fallback_steps 计数与 error trace 事件，绝不入 item.errors（R4）；
+    "fail" 原样上抛，由 stage 层置 episode failed。provider / 内部错误恒向调用方
+    传播。后校验归一：scroll 的方向值在代码侧转小写（spec 3.15.4 字段语义表）。
+    公开直调面：M7 手术后的接缝重摘直接调用本函数（CONTRACTS §7.15）。
 
-    PUBLIC DIRECT-CALL SURFACE: M7's post-surgery seam re-extraction calls this
-    function directly (CONTRACTS §7.15) — the sanctioned import exception.
+    @param prev 前一帧记录
+    @param curr 后一帧记录
+    @param index 步骤序号（相邻对序号）
+    @param ctx 本次（批次, 阶段）运行上下文
+    @param label 序列级标签；非 None 时取 [class.<label>.extract] 的按类指令
+    @return 步骤记录（正常摘取产物，或代码侧兜底占位）
+    @raises SchemaViolation on_error="fail" 时的修复穷尽 / 溢出 / 截断原样上抛
     """
     cfg = ctx.cfg
     prompt = build_extract_prompt(prev, curr, cfg, label)
+    ids = (prev.id, curr.id)
     try:
         obj, _usage, attempts, model = await ctx.schema_engine.complete_validated(
             cfg.extract.llm, prompt, action_schema(),
-            record_ids=(prev.id, curr.id), batch_no=ctx.batch_no)
+            scope=CallScope(record_ids=ids, batch_no=ctx.batch_no))
     except SchemaViolation as e:
         if cfg.extract.on_error == "fail":
             raise
-        kind = ErrorKind.EXTRACTION_INVALID.value
-        message = str(e)
-        ctx.metrics.count(_COUNTER_FALLBACK_STEPS)
-        ctx.metrics.event(_EV_ERROR, stage=_STAGE_NAME, batch_no=ctx.batch_no,
-                          record_ids=(prev.id, curr.id),
-                          payload={"stage": _STAGE_NAME, "kind": kind,
-                                   "message": message, "retryable": False})
-        # model=""/attempts=1+L3 budget: no validated output exists — the action
-        # is a code-side construct; attempts reflects the exhausted call budget.
-        return Transition(index=index, action=dict(_FALLBACK_ACTION), model="",
-                          attempts=1 + cfg.output.max_repair_attempts,
-                          detail={"kind": kind, "message": message})
+        # attempts=1+L3 预算：反映已耗尽的调用预算。
+        return _fallback_transition(index, ids, ctx, str(e),
+                                    1 + cfg.output.max_repair_attempts)
     except (ContextOverflowError, OutputTruncatedError) as e:
-        # v1.11 (spec 3.15.4 上下文预算 row): the constant 2-frame/2-image call has
-        # nothing to shrink — no packing, no degrade face; the M9 throat/finish
-        # disposition backstops (V16). Overflow/truncation rides the EXISTING
-        # mechanical-fallback semantics UNCHANGED: the fallback Transition keeps
-        # the extraction_invalid trace shape (detail.kind drives the downstream
-        # （摘取兜底） suffix and report attribution — S16); "fail" re-raises and
-        # the stage classifier records the precise §7.6 kind (V27①).
+        # v1.11（spec 3.15.4「上下文预算」行）：恒定的 2 帧 / 2 图调用无物可缩——
+        # 无装填、无降级面，由 M9 咽喉 / finish 处置兜底（V16）；溢出与截断原样
+        # 搭乘**既有**的机械兜底语义（detail.kind 驱动下游的（摘取兜底）后缀与
+        # report 归属，S16），"fail" 则上抛、由 stage 分类器记精确 kind（V27①）。
         if cfg.extract.on_error == "fail":
             raise
-        # A7 terminal settlement: a reactive-400 overflow disposed here (the
-        # fallback IS this call's terminal — no degrade face) feeds the fatal
-        # streak exactly once; precheck / the 200-shaped finish oracle never do.
-        if (isinstance(e, ContextOverflowError) and e.phase == "reactive"
-                and getattr(e, "origin", "http_400") == "http_400"
-                and not getattr(e, "_breaker_fed", False)):
-            e._breaker_fed = True  # type: ignore[attr-defined]
-            ctx.metrics.record_provider_result(fatal=True)
-        kind = ErrorKind.EXTRACTION_INVALID.value
-        message = str(e)
-        ctx.metrics.count(_COUNTER_FALLBACK_STEPS)
-        ctx.metrics.event(_EV_ERROR, stage=_STAGE_NAME, batch_no=ctx.batch_no,
-                          record_ids=(prev.id, curr.id),
-                          payload={"stage": _STAGE_NAME, "kind": kind,
-                                   "message": message, "retryable": False})
-        # attempts=1: overflow/truncation finalizes the call before any L3
-        # repair round runs (V11/V25① — never "repaired").
-        return Transition(index=index, action=dict(_FALLBACK_ACTION), model="",
-                          attempts=1,
-                          detail={"kind": kind, "message": message})
+        # A7 终局结算：兜底**就是**本次调用的终局（无降级面），reactive-400 在此
+        # 恰喂一次熔断。attempts=1：溢出 / 截断在任何 L3 修复轮开跑之前就终结了
+        # 本次调用（V11/V25①——绝非"已修复"）。
+        _feed_reactive_terminal(e, ctx.metrics)
+        return _fallback_transition(index, ids, ctx, str(e), 1)
     if obj.get("action_type") == "scroll" and isinstance(obj.get("value"), str):
         obj = {**obj, "value": obj["value"].lower()}
     return Transition(index=index, action=obj, model=model, attempts=attempts,
                       detail={})
 
 
+def _plan_episode_pairs(todo: list[PipelineItem], ctx: "RunContext"):
+    """为每个待摘取 episode 排布相邻对，并生成全批的扁平协程表。
+
+    协程顺序 =（episode 批内位置, 步骤序号），gather 保序，故调用方的回写与调度
+    顺序无关。v1.9（T20）：落在接缝序号上的相邻对被**跳过**——它们不进 gather
+    （零 LLM），在收尾阶段取机械的 T10 占位；v1.9 之前"一对一协程"的切片口径正
+    因此换成了按 episode 的已判决对数记账。
+
+    @param todo 本批待摘取的序列信封（按批内位置序）
+    @param ctx 本次（批次, 阶段）运行上下文
+    @return （每 episode 的 (信封, 相邻对数, 接缝序号集) 列表, 扁平协程表）
+    """
+    spans: list[tuple[PipelineItem, int, frozenset[int]]] = []
+    coros = []
+    for item in todo:
+        members = item.record.members
+        label = item.classification.label if item.classification else None
+        pairs = max(0, len(members) - 1)
+        seams = frozenset(i for i in getattr(item, "seam_indexes", ()) or ()
+                          if 0 <= i < pairs)
+        spans.append((item, pairs, seams))
+        for i in range(pairs):
+            if i in seams:
+                continue
+            coros.append(extract_transition(members[i], members[i + 1], i,
+                                            ctx, label=label))
+    return spans, coros
+
+
+def _finalize_transitions(row: list, pairs: int, seams: frozenset[int],
+                          interrupted: tuple[str, ...]) -> tuple[Transition, ...]:
+    """把已判决步骤与机械接缝占位按序号拼成完整步骤元组。
+
+    长度恒为 pairs：接缝序号取 T10 占位（其 interrupted_by 按缝序与
+    seam_interrupted_by 对齐），其余序号按序取已判决结果。
+
+    @param row 本 episode 的已判决步骤（按步骤序号）
+    @param pairs 相邻对总数
+    @param seams 接缝序号集合
+    @param interrupted 各接缝的打断者线索名（按缝序）
+    @return 完整步骤元组（长度 == pairs）
+    """
+    seam_order = sorted(seams)
+    transitions: list[Transition] = []
+    judged_iter = iter(row)
+    for i in range(pairs):
+        if i in seams:
+            names = (interrupted[seam_order.index(i)]
+                     if seam_order.index(i) < len(interrupted) else ())
+            transitions.append(_seam_placeholder(i, tuple(names)))
+        else:
+            transitions.append(next(judged_iter))
+    return tuple(transitions)
+
+
 class ExtractStage:
+    """M15 extract 阶段的 Stage 实现（spec 3.15.2）。
+
+    全批所有 episode 的所有相邻对合进同一次 gather，随后按批内位置序同步收尾。
+    """
+
     name = "extract"
 
     def __init__(self, cfg: "ResolvedConfig"):
+        """绑定本次运行的解析配置。
+
+        @param cfg 本次运行的不可变解析配置（M1 产物）
+        """
         self.cfg = cfg
 
-    async def run(self, batch: list[PipelineItem], ctx: "RunContext") -> list[PipelineItem]:
-        # Selection & idempotency (spec 3.15.2): active sequence envelopes not
-        # yet extracted; transitions is not None skips (any re-entry costs zero
-        # calls — M7 repair uses the extract_transition direct call instead).
-        # Modality is M1-guaranteed "ui"; re-checked defensively. Multi fan-out
-        # siblings are NOT de-duplicated by record id — each envelope extracts
-        # under its own label (S9).
+    async def run(self, batch: list[PipelineItem],
+                  ctx: "RunContext") -> list[PipelineItem]:
+        """对本批的 active 序列信封做动作摘取。
+
+        @param batch 本批信封列表（唯一可变载体）
+        @param ctx 本次（批次, 阶段）运行上下文
+        @return 传入的同一列表对象（契约 ②）
+        """
+        # 选取与幂等（spec 3.15.2）：尚未摘取的 active 序列信封；transitions 非
+        # None 即跳过（任何重入零调用——M7 修复改走 extract_transition 直调）。
+        # 模态由 M1 保证为 "ui"，此处再防御式复核。multi 扇出的兄弟信封**不**按
+        # record id 去重——每个信封按自己的标签独立摘取（S9）。
         todo = [item for item in batch
                 if item.status == "active" and item.record.kind == "sequence"
                 and item.transitions is None and item.record.modality == "ui"]
         if not todo:
             return batch
 
-        # ONE flat gather over every JUDGED (episode, adjacent pair) of the
-        # batch; coroutine order = (episode batch position, pair ordinal), and
-        # gather preserves it, so the write-back below is schedule-independent.
-        # v1.9 (T20): pairs at seam indexes are SKIPPED — they never join the
-        # gather (zero LLM) and take the mechanical T10 placeholder in the
-        # finalize below; the pre-v1.9 one-coroutine-per-pair slicing is
-        # replaced by per-episode judged-pair accounting for exactly this.
-        spans: list[tuple[PipelineItem, int, frozenset[int]]] = []
-        coros = []
-        for item in todo:
-            members = item.record.members
-            label = item.classification.label if item.classification else None
-            pairs = max(0, len(members) - 1)
-            seams = frozenset(i for i in getattr(item, "seam_indexes", ()) or ()
-                              if 0 <= i < pairs)
-            spans.append((item, pairs, seams))
-            for i in range(pairs):
-                if i in seams:
-                    continue
-                coros.append(extract_transition(members[i], members[i + 1], i,
-                                                ctx, label=label))
+        spans, coros = _plan_episode_pairs(todo, ctx)
         results = await asyncio.gather(*coros, return_exceptions=True)
 
         for res in results:
@@ -296,11 +374,9 @@ class ExtractStage:
                                 asyncio.CancelledError)):
                 raise res
 
-        # Synchronous finalize in batch position order: an episode with any
-        # escaped step exception fails whole (its other step results are
-        # discarded — the invariant tuple is all-or-nothing); otherwise
-        # len(transitions) == len(members) − 1 with fallback placeholders and,
-        # v1.9, the seam placeholders spliced in at their pinned indexes.
+        # 按批内位置序同步收尾：任一步骤异常外溢的 episode 整体失败（它其余步骤的
+        # 结果一并丢弃——步骤元组是全有或全无的不变式）；否则 len(transitions) ==
+        # 成员数 − 1，兜底占位与（v1.9）接缝占位按其钉死的序号拼入。
         pos = 0
         for item, pairs, seams in spans:
             judged = pairs - len(seams)
@@ -311,29 +387,24 @@ class ExtractStage:
                 self._fail(item, ctx, exc)
                 continue
             interrupted = tuple(getattr(item, "seam_interrupted_by", ()) or ())
-            seam_order = sorted(seams)
-            transitions: list[Transition] = []
-            judged_iter = iter(row)
-            for i in range(pairs):
-                if i in seams:
-                    names = (interrupted[seam_order.index(i)]
-                             if seam_order.index(i) < len(interrupted) else ())
-                    transitions.append(_seam_placeholder(i, tuple(names)))
-                else:
-                    transitions.append(next(judged_iter))
-            item.transitions = tuple(transitions)
+            item.transitions = _finalize_transitions(row, pairs, seams, interrupted)
             self._register(item, ctx)
-        return batch                            # the SAME list object (contract ②)
+        return batch                            # 传入的同一列表对象（契约 ②）
 
     def _register(self, item: PipelineItem, ctx: "RunContext") -> None:
-        """Counters + one extract.step event per finalized step, fallback steps
-        included (§8.1): extract.transitions / extract.by_type.<action_type>
-        count EVERY final step (fallback lands in by_type.other). Payload fields
-        go in raw — the S27 redaction (_DATA_KEYS/_FREE_TEXT_KEYS) is M12's.
-        v1.9 (T20 计数器口径): thread-seam placeholders are NOT extraction
-        products — they skip the counters (their zero-LLM app_switch must not
-        pollute by_type) and the extract.step event alike; the seam's single
-        metering point is stream.stitch.seams."""
+        """计数器 + 每个最终步骤一发的 extract.step 事件（兜底步骤也在内，§8.1）。
+
+        extract.transitions / extract.by_type.<action_type> 对**每个**最终步骤都
+        计数（兜底落在 by_type.other）。payload 字段原样进——S27 的脱敏
+        （_DATA_KEYS/_FREE_TEXT_KEYS）是 M12 的职责。
+        v1.9（T20 计数器口径）：线索接缝占位**不是**摘取产物——它既不进计数器
+        （其零 LLM 的 app_switch 不得污染 by_type），也不发 extract.step 事件；
+        接缝唯一的计量点是 stream.stitch.seams。
+
+        @param item 已完成摘取的序列信封
+        @param ctx 本次（批次, 阶段）运行上下文
+        @return 无（副作用为计数与事件）
+        """
         members = item.record.members
         for t in item.transitions:
             if t.detail.get("kind") == "thread_seam":
@@ -352,26 +423,27 @@ class ExtractStage:
                                        "value": t.action["value"]})
 
     def _fail(self, item: PipelineItem, ctx: "RunContext", exc: BaseException) -> None:
-        """Episode-level failure: on_error="fail" schema exhaustion, or any
-        provider/internal error of a step call (kinds classified as in
-        classify._classify_item; extract records are always UI modality, so an
-        OSError is an image-decode failure surfacing from M9's lazy load).
-        v1.11 (V27①): the budget vocabulary routes FIRST — context_overflow /
-        output_truncated precisely (never internal_error); an overflow reject
-        counts budget.overflow_records and the reactive-400 terminal feeds the
-        breaker exactly once (A7 — duck flag guards double-feeds)."""
+        """episode 级失败：on_error="fail" 的修复穷尽，或某步骤调用的任何
+        provider / 内部错误。
+
+        kind 的归类与 classify 的失败处置同款；extract 的记录恒为 UI 模态，故
+        OSError 即 M9 惰性加载浮上来的图像解码失败。
+        v1.11（V27①）：预算词表**先行**——精确取 context_overflow /
+        output_truncated（绝不落 internal_error）；溢出拒绝计 budget.
+        overflow_records，reactive-400 终局恰喂一次熔断（A7——duck 标位守住重复喂给）。
+
+        @param item 失败的序列信封
+        @param ctx 本次（批次, 阶段）运行上下文
+        @param exc 步骤路径抛出的异常
+        @return 无（副作用为状态写入、计数与事件）
+        """
         budget_kind = budget.classify_stage_error(exc)
         if budget_kind is not None:
             kind, retryable = budget_kind, False
             message = str(exc)
             if kind == ErrorKind.CONTEXT_OVERFLOW.value:
                 ctx.metrics.count("budget.overflow_records")
-                if (isinstance(exc, ContextOverflowError)
-                        and exc.phase == "reactive"
-                        and getattr(exc, "origin", "http_400") == "http_400"
-                        and not getattr(exc, "_breaker_fed", False)):
-                    exc._breaker_fed = True  # type: ignore[attr-defined]
-                    ctx.metrics.record_provider_result(fatal=True)
+                _feed_reactive_terminal(exc, ctx.metrics)
         elif isinstance(exc, SchemaViolation):
             kind, retryable = ErrorKind.EXTRACTION_INVALID.value, False
             message = str(exc)

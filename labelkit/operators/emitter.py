@@ -1,28 +1,24 @@
-"""M11 — output emitter (spec 3.11, ch.6; CONTRACTS.md §7.10, §9).
+"""M11 —— 输出发射器（spec 3.11、ch.6；CONTRACTS.md §7.10、§9）。
 
-Three channels:
-- main output JSONL: appended to ``{output}.part`` with per-batch flush, delivered by
-  fsync + atomic rename on finalize;
-- rejects channel ``{output_stem}.rejects.jsonl`` (streamed append log, no ``.part``);
-- ``{output_stem}.report.json`` (always written on finalize).
+三个通道：
+- 主输出 JSONL：逐批追加写入 ``{output}.part`` 并 flush，finalize 时 fsync + 原子改名
+  交付；
+- rejects 通道 ``{output_stem}.rejects.jsonl``（流式追加日志，无 ``.part``）；
+- ``{output_stem}.report.json``（finalize 时恒写）。
 
-Distribution by status (v1.9 four routes, spec 3.11.2): ``active`` → main output;
-``absorbed`` → NEITHER channel, counted only (the member content lives inside its
-episode's sequence record); ``stitched`` → NEITHER channel, counted only (v1.9 T21:
-the merged-fragment shell's content lives inside its thread's rebound record — a
-shell must never fall through to the rejects fallback); every other non-active
-status → rejects.
+按状态分发（v1.9 四路，spec 3.11.2）：``active`` → 主输出；``absorbed`` → 两个通道都不
+进，只计数（成员内容活在其 episode 的序列记录里）；``stitched`` → 两个通道都不进，只
+计数（v1.9 T21：被合并片段壳的内容活在其 thread 的重绑记录里——壳绝不能落到 rejects
+兜底路径）；其余一切非 active 状态 → rejects。
 
-v1.13 (裁决·按类标注 Schema, spec §6.3): the pre-write check validates each row against
-its CLASS-EFFECTIVE schema — the ``[class.<name>.annotate]`` schema override of the row's
-own label when declared, the global ``output.schema`` otherwise.
+v1.13（裁决·按类标注 Schema，spec §6.3）：写前终检按行取类有效 Schema——该行自身标签
+声明了 ``[class.<name>.annotate]`` 覆盖时用覆盖，否则用全局 ``output.schema``。
 
-The emitter never crashes on a bad record: a failed pre-write ``validate_only`` check
-(an internal invariant break) diverts the item to rejects with kind ``internal_error``
-and the run continues. Record-level isolation covers meta assembly / serialization
-only — an ``OSError`` on a channel write is a run-level failure (the ``.part`` file may
-hold a truncated line): it propagates as ``LabelKitError`` (CLI exit 4) and marks the
-run undeliverable so ``finalize`` can never rename a corrupted ``.part`` (spec 3.11.3 ④).
+发射器绝不因单条坏记录崩溃：写前 ``validate_only`` 不通过（内部不变式破裂）就把该条
+改道 rejects 并标 ``internal_error``，运行继续。记录级隔离只覆盖 meta 装配与序列化——
+通道写出的 ``OSError`` 是 run 级失败（``.part`` 里可能已留半行）：它以
+``LabelKitError`` 上抛（CLI 退出码 4）并把本次运行标记为不可交付，使 ``finalize``
+永不把损坏的 ``.part`` 改名（spec 3.11.3 ④）。
 """
 from __future__ import annotations
 
@@ -39,12 +35,11 @@ from typing import TYPE_CHECKING, Any, Mapping, Sequence
 from labelkit import TOOL_VERSION
 from labelkit.common.errors import ErrorKind, LabelKitError
 from labelkit.common.contracts.types import PipelineItem, Record, StageError
-# v1.10 (U21): the plain progress/summary line formats live in a common-layer
-# pure-function module shared with the CLI renderer (operators → common is the
-# sanctioned dependency direction; cli ↛ operators stays intact).
+# v1.10（U21）：plain 模式的进度/摘要行格式活在 common 层的纯函数模块里，与 CLI
+# 渲染器共用（operators → common 是许可的依赖方向；cli ↛ operators 依旧成立）。
 from labelkit.common.observability import console_format
 
-if TYPE_CHECKING:  # pragma: no cover — service modules may not exist yet at import time
+if TYPE_CHECKING:  # pragma: no cover —— 导入期服务模块可能尚未就位
     from labelkit.common.config.model import ResolvedConfig
     from labelkit.common.runtime.schema_engine import SchemaEngine
 
@@ -53,29 +48,49 @@ _log = logging.getLogger("labelkit.emitter")
 
 @dataclass(frozen=True)                            # [FROZEN in CONTRACTS.md §7.10]
 class EmitResult:
-    emitted: int
-    rejected: int
+    """单批发射结果（CONTRACTS.md §7.10 冻结形态）。"""
+    emitted: int                                   # 本批写入主输出的行数
+    rejected: int                                  # 本批判入 rejects 的条数
 
 
 def _dumps(obj: Any) -> str:
-    """Compact single-line JSON, non-ASCII preserved (CONTRACTS.md §9.1)."""
+    """紧凑单行 JSON 序列化，非 ASCII 保真（CONTRACTS.md §9.1）。
+
+    :param obj: 待序列化对象。
+    :returns: 单行 JSON 文本（不含换行）。
+    """
     return json.dumps(obj, ensure_ascii=False)
 
 
 class Emitter:
-    """Signatures frozen in CONTRACTS.md §7.10."""
+    """M11 发射器：五个输出通道的所有者，签名冻结在 CONTRACTS.md §7.10。"""
 
     def __init__(self, cfg: "ResolvedConfig", engine: "SchemaEngine",
                  run_id: str, run_started_at: datetime):
+        """构造发射器（只推导路径与初始化计数，不触碰磁盘）。
+
+        :param cfg: 已解析配置。
+        :param engine: M8 Schema 引擎（写前终检用）。
+        :param run_id: 本次运行 id。
+        :param run_started_at: 本次运行起始时刻（写进 ``_meta.run``）。
+        """
         self._cfg = cfg
         self._engine = engine
         self._run_id = run_id
         self._run_started_at = run_started_at
+        self._init_paths(cfg)
+        self._init_counters()
+        self._init_schemas(cfg)
 
+    def _init_paths(self, cfg: "ResolvedConfig") -> None:
+        """推导五个输出通道的路径与 ``.part`` 暂存名，并复位全部文件句柄。
+
+        :param cfg: 已解析配置。
+        """
         output = Path(cfg.run.output)
         self._output_path = output
         self._output_part = Path(str(output) + ".part")
-        stem = output.with_suffix("")  # output path minus final suffix
+        stem = output.with_suffix("")  # 输出路径去掉末级后缀
         self._sidecar_path = Path(str(stem) + ".meta.jsonl")
         self._sidecar_part = Path(str(self._sidecar_path) + ".part")
         self._rejects_path = Path(str(stem) + ".rejects.jsonl")
@@ -83,31 +98,37 @@ class Emitter:
         # generate.stream_artifact_path 各自推导同一值（算子间不互导，测试钉住）。
         self._artifact_path = Path(str(stem) + ".stream.jsonl")
         self._artifact_part = Path(str(self._artifact_path) + ".part")
-        # Dry runs write their report to a separate name so a rehearsal never
-        # clobbers the ledger of the last real run (E2E finding P2-4).
+        # dry-run 的报告写到另一个文件名，使一次彩排绝不覆盖上一次真实运行的账本
+        # （E2E finding P2-4）。
         self._report_path = Path(str(stem) + (".dryrun.report.json" if cfg.dry_run
                                               else ".report.json"))
-
         self._main_fh = None
         self._sidecar_fh = None
         self._rejects_fh = None
         self._artifact_fh = None
+
+    def _init_counters(self) -> None:
+        """初始化批间累计计数、通道状态标志与装配期注入的鸭子面。"""
         # v1.13：工件 run 摘要条目（路径/sha256/行数，主输出同款形态）——
         # write_stream_artifact 写入时冻结，M10 组报告时鸭子面读取；未写恒 None。
         self.artifact_summary: dict | None = None
-
         self._emitted_total = 0
         self._rejected_total = 0
         self._status_totals: dict[str, int] = {}
-        self._reject_lines_written = 0     # lines actually in the rejects FILE
+        self._reject_lines_written = 0     # 实际落进 rejects 文件的行数
         self._rejects_opened = False
-        self._undeliverable = False        # a channel write failed: never rename .part
+        self._undeliverable = False        # 有通道写失败：绝不改名 .part
         self._progress_active = False
-
         # v1.12：帧计数通路（frame_annotate.failed / frame_annotate.discarded）——
         # M10 装配期注入 MetricsSink（Ingestor.metrics 同款装配期鸭子面，构造签名
         # 冻结不变）；单测直接构造时缺省 None ⇒ 仅不计数，行为不变。
         self.metrics = None
+
+    def _init_schemas(self, cfg: "ResolvedConfig") -> None:
+        """冻结写前终检要用的两张 Schema 面（帧 Schema 与按类标注 Schema 表）。
+
+        :param cfg: 已解析配置。
+        """
         # v1.12：写前帧校验的 Schema 入口（frame.annotate 关闭时恒 None，M1 保证
         # 开启时必有解析产物）。
         self._frame_schema = (dict(cfg.frame_schema)
@@ -120,10 +141,13 @@ class Emitter:
                                for name, view in cfg.class_views.items()
                                if view.schema is not None}
 
-    # ── channel lifecycle ─────────────────────────────────────────────────
+    # ── 通道生命周期 ──────────────────────────────────────────────────────
 
     def open(self) -> None:
-        """Create/truncate the output channels. Unwritable → LabelKitError (CLI exit 4)."""
+        """创建/截断输出通道。
+
+        :raises LabelKitError: 输出路径不可写（CLI 退出码 4）。
+        """
         try:
             self._main_fh = open(self._output_part, "w", encoding="utf-8")
             if self._cfg.output.meta_mode == "sidecar":
@@ -136,77 +160,129 @@ class Emitter:
             raise LabelKitError(f"output path unwritable: {exc}") from exc
 
     def emit_batch(self, batch: list[PipelineItem], batch_no: int) -> EmitResult:
-        """Distribute the batch by status — four routes (v1.9, spec 3.11.2):
-        active → main output; absorbed → counted only (neither channel);
-        stitched → counted only (v1.9 T21 fourth route); every other non-active
-        status → rejects. Appends + flush. Never raises for a record — but a
-        channel-write OSError is a run-level failure and propagates as
-        LabelKitError (spec 3.11.3 ④: the .part may now hold a truncated line)."""
+        """按状态分发整批——四路（v1.9，spec 3.11.2）。
+
+        active → 主输出；absorbed → 只计数（两通道都不进）；stitched → 只计数
+        （v1.9 T21 第四路）；其余一切非 active 状态 → rejects。追加写 + flush。
+        单条记录永不抛出——但通道写出的 OSError 是 run 级失败，以 LabelKitError
+        上抛（spec 3.11.3 ④：``.part`` 里此刻可能已留半行）。
+
+        :param batch: 待发射的一批信封。
+        :param batch_no: 批号（进日志与 ``_meta.scores.batch_no``）。
+        :returns: 本批的写出与判拒计数。
+        :raises LabelKitError: 通道写出或 flush 失败（CLI 退出码 4）。
+        """
         emitted = 0
         rejected = 0
-        annotate_on = self._cfg.annotate.enabled
         for item in batch:
             try:
-                if item.status == "active":
-                    if annotate_on and item.annotation is None:
-                        # Invariant break: active item without annotation.
-                        self._divert_internal(item, batch_no,
-                                              ["active item has no annotation"],
-                                              "active item has no annotation")
-                        self._write_reject(item, batch_no)
-                        rejected += 1
-                        continue
-                    user_obj = self._user_object(item)
-                    if annotate_on:
-                        violations = self._engine.validate_only(
-                            dict(user_obj), schema=self._row_schema(item))
-                        if violations:
-                            # Violation text may embed data values: it goes only to
-                            # the rejects channel (one array element per violation,
-                            # §9.2); stderr gets a data-free summary (spec §7.1 ①).
-                            self._divert_internal(
-                                item, batch_no, list(violations),
-                                "final validate_only failed: record "
-                                f"{item.record.id}: {len(violations)} violation(s)",
-                            )
-                            self._write_reject(item, batch_no)
-                            rejected += 1
-                            continue
-                    self._write_main(item, user_obj, batch_no)
-                    emitted += 1
-                elif item.status == "absorbed":
-                    # v1.8 third route (spec 3.11.2 / §7.10): the member content
-                    # lives inside its episode's sequence record — neither main
-                    # output nor rejects; the generic _status_totals tally below
-                    # covers the count.
-                    continue
-                elif item.status == "stitched":
-                    # v1.9 fourth route (T21, spec 3.11.2): the merged-fragment
-                    # shell's content lives inside its thread's rebound record —
-                    # neither channel; a shell in the rejects fallback would
-                    # pollute rejects as internal_error and trip --strict.
-                    continue
-                else:
-                    self._write_reject(item, batch_no)
-                    rejected += 1
+                route = self._route_item(item, batch_no)
             except LabelKitError:
-                raise  # channel write failure — run-level, never record-level
-            except Exception as exc:  # noqa: BLE001 — record-level isolation is absolute
-                # str(exc) may embed record content → rejects channel only; the
-                # stderr log gets the exception type, the stack goes to debug (§7.6).
-                self._divert_internal(item, batch_no, [f"emitter failure: {exc}"],
-                                      f"emitter failure: {type(exc).__name__}", exc=exc)
-                try:
-                    self._write_reject(item, batch_no)
-                except LabelKitError:
-                    raise
-                except Exception:  # reject-line assembly itself failed; count, continue
-                    pass
+                raise  # 通道写失败——run 级，绝不降为记录级
+            except Exception as exc:  # noqa: BLE001 —— 记录级隔离是绝对的
+                # 栈只进 debug 级（§7.6）：str(exc) 可能内嵌记录内容，故 stderr 的
+                # WARN 一行由 _divert_on_failure 只给异常类型。
+                _log.debug("internal_error stack (record %s)", item.record.id,
+                           exc_info=exc,
+                           extra={"stage": "emitter", "batch": batch_no})
+                self._divert_on_failure(item, batch_no, exc)
+                route = "rejects"
+            if route == "main":
+                emitted += 1
+            elif route == "rejects":
                 rejected += 1
 
         self._flush()
         self._emitted_total += emitted
         self._rejected_total += rejected
+        self._tally_batch(batch)
+        _log.info(
+            "batch %d flushed: main output +%d line(s) (total %d), "
+            "rejects +%d (total %d)",
+            batch_no, emitted, self._emitted_total, rejected, self._rejected_total,
+            extra={"stage": "emitter", "batch": batch_no},
+        )
+        self._progress(batch_no)
+        return EmitResult(emitted=emitted, rejected=rejected)
+
+    def _route_item(self, item: PipelineItem, batch_no: int) -> str:
+        """把单个信封分发到它该去的通道（v1.9 四路）。
+
+        :param item: 待分发的信封。
+        :param batch_no: 批号。
+        :returns: ``"main"`` | ``"none"`` | ``"rejects"``——``"none"`` 即
+            absorbed/stitched 两路：成员内容活在其 episode 的序列记录 / 其 thread
+            的重绑记录里，两个通道都不进，只由下方的通用状态计数覆盖；壳落到
+            rejects 兜底会以 internal_error 污染 rejects 并触发 --strict。
+        :raises LabelKitError: 通道写出失败。
+        """
+        if item.status == "active":
+            return self._route_active(item, batch_no)
+        if item.status in ("absorbed", "stitched"):
+            return "none"
+        self._write_reject(item, batch_no)
+        return "rejects"
+
+    def _route_active(self, item: PipelineItem, batch_no: int) -> str:
+        """active 信封的主输出路：不变式校验 → 写前终检 → 落主输出。
+
+        :param item: 待写出的 active 信封。
+        :param batch_no: 批号。
+        :returns: ``"main"`` 或（终检不过改道后的）``"rejects"``。
+        :raises LabelKitError: 通道写出失败。
+        """
+        annotate_on = self._cfg.annotate.enabled
+        if annotate_on and item.annotation is None:
+            # 不变式破裂：active 条目却没有标注。
+            self._divert_internal(item, batch_no,
+                                  ["active item has no annotation"],
+                                  "active item has no annotation")
+            self._write_reject(item, batch_no)
+            return "rejects"
+        user_obj = self._user_object(item)
+        if annotate_on:
+            violations = self._engine.validate_only(
+                dict(user_obj), schema=self._row_schema(item))
+            if violations:
+                # 违规文本可能内嵌数据值：只进 rejects 通道（一条违规一个数组元素，
+                # §9.2）；stderr 只得到去数据摘要（spec §7.1 ①）。
+                self._divert_internal(
+                    item, batch_no, list(violations),
+                    "final validate_only failed: record "
+                    f"{item.record.id}: {len(violations)} violation(s)",
+                )
+                self._write_reject(item, batch_no)
+                return "rejects"
+        self._write_main(item, user_obj, batch_no)
+        return "main"
+
+    def _divert_on_failure(self, item: PipelineItem, batch_no: int,
+                           exc: BaseException) -> None:
+        """记录级隔离兜底：发射单条时的意外异常一律改道 rejects。
+
+        :param item: 出错的信封。
+        :param batch_no: 批号。
+        :param exc: 捕获到的意外异常。
+        :raises LabelKitError: rejects 通道写出本身失败（run 级）。
+        """
+        # str(exc) 可能内嵌记录内容 → 只进 rejects 通道；stderr 日志只给异常类型
+        # （栈由捕获点写进 debug 级，§7.6）。
+        self._divert_internal(item, batch_no, [f"emitter failure: {exc}"],
+                              f"emitter failure: {type(exc).__name__}")
+        try:
+            self._write_reject(item, batch_no)
+        except LabelKitError:
+            raise
+        except Exception as reject_exc:  # noqa: BLE001 —— rejects 行装配本身失败
+            _log.warning("rejects line assembly failed: record %s: %s",
+                         item.record.id, type(reject_exc).__name__,
+                         extra={"stage": "emitter", "batch": batch_no})
+
+    def _tally_batch(self, batch: list[PipelineItem]) -> None:
+        """批级状态计数 + v1.12 沉没成本记账。
+
+        :param batch: 刚发射完的这一批信封。
+        """
         discarded = 0
         for item in batch:
             self._status_totals[item.status] = self._status_totals.get(item.status, 0) + 1
@@ -222,13 +298,6 @@ class Emitter:
                                  if ann is not None)
         if discarded and self.metrics is not None:
             self.metrics.count("frame_annotate.discarded", discarded)
-        _log.info(
-            "批 %d 落盘：主输出 +%d 行（累计 %d），rejects +%d（累计 %d）",
-            batch_no, emitted, self._emitted_total, rejected, self._rejected_total,
-            extra={"stage": "emitter", "batch": batch_no},
-        )
-        self._progress(batch_no)
-        return EmitResult(emitted=emitted, rejected=rejected)
 
     def write_stream_artifact(self, lines: Sequence[str]) -> None:
         """v1.13（裁决·时间流工件通道）：把交织序定稿的工件行写入
@@ -259,16 +328,36 @@ class Emitter:
                   extra={"stage": "emitter", "batch": 0})
 
     def finalize(self, report: Mapping, deliver: bool = True) -> None:
-        """fsync + atomic rename when deliver=True; always write report.json.
-        deliver=False is dry-run-only (no .part was ever opened); v1.6: a
-        circuit-break finalize passes deliver=True — completed batches ARE
-        delivered, the report marking run.partial_delivery (spec 3.10.3 熔断交付).
-        A prior channel-write failure forces deliver=False: a possibly-corrupted
-        .part is never renamed to the final name (spec 3.11.3 ④). v1.13: the
-        stream artifact channel (when staged) delivers in the SAME finalize batch
-        as the main output, under the same rules."""
+        """收尾：deliver=True 时 fsync + 原子改名；report.json 恒写。
+
+        deliver=False 只出现在 dry-run（从未开过 ``.part``）；v1.6：熔断收尾传的
+        是 deliver=True——已完成的批照常交付，由报告标记 run.partial_delivery
+        （spec 3.10.3 熔断交付）。先前发生过通道写失败会强制 deliver=False：可能
+        损坏的 ``.part`` 绝不会被改名成最终名（spec 3.11.3 ④）。v1.13：时间流工件
+        通道（若已暂存）与主输出在同一次 finalize 里按同一规则交付。
+
+        :param report: 待写出的 report 对象（counts-only）。
+        :param deliver: 是否真正交付；False = 只关闭通道不改名。
+        :raises LabelKitError: 交付失败或 report 写失败。
+        """
         self._end_progress()
         deliver = deliver and not self._undeliverable
+        self._deliver_channels(deliver)
+        if deliver:
+            _log.info(
+                "finalize: fsync + rename  %s -> %s (%d lines)",
+                self._output_part, self._output_path, self._emitted_total,
+                extra={"stage": "emitter", "batch": "-"},
+            )
+        self._write_report(report)
+        self._print_summary(report)
+
+    def _deliver_channels(self, deliver: bool) -> None:
+        """逐个交付已开通道（主输出 → 工件 → sidecar → rejects），末了统一收口。
+
+        :param deliver: True = fsync + 原子改名；False = 仅关闭。
+        :raises LabelKitError: 任一通道交付失败（CLI 退出码 4）。
+        """
         try:
             self._deliver(self._main_fh, self._output_part, self._output_path, deliver)
             self._main_fh = None
@@ -288,13 +377,12 @@ class Emitter:
         finally:
             self._close_all()
 
-        if deliver:
-            _log.info(
-                "finalize：fsync + rename  %s → %s（%d 行）",
-                self._output_part, self._output_path, self._emitted_total,
-                extra={"stage": "emitter", "batch": "-"},
-            )
+    def _write_report(self, report: Mapping) -> None:
+        """写出 report.json，并打印 spec 3.11.3 ③ 的 run 收尾行。
 
+        :param report: 待写出的 report 对象。
+        :raises LabelKitError: report 写失败（CLI 退出码 1）。
+        """
         try:
             self._report_path.write_text(
                 json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
@@ -302,23 +390,26 @@ class Emitter:
         except OSError as exc:
             raise LabelKitError("report write failed") from exc
 
-        # Spec 3.11.3 ③ verbatim run-tail line: rejects file (actual line count,
-        # only when the channel was opened) + report path.
+        # spec 3.11.3 ③ 逐字 run 收尾行：rejects 文件（实际行数，且仅在通道开过时
+        # 出现）加 report 路径。
         if self._rejects_opened:
             _log.info(
-                "已写出 %s（%d 行）与 %s",
+                "wrote %s (%d lines) and %s",
                 self._rejects_path, self._reject_lines_written, self._report_path,
                 extra={"stage": "emitter", "batch": "-"},
             )
         else:
-            _log.info("已写出 %s", self._report_path,
+            _log.info("wrote %s", self._report_path,
                       extra={"stage": "emitter", "batch": "-"})
 
-        self._print_summary(report)
-
-    # ── main channel ──────────────────────────────────────────────────────
+    # ── 主输出通道 ────────────────────────────────────────────────────────
 
     def _user_object(self, item: PipelineItem) -> Mapping:
+        """取该行落盘的用户对象。
+
+        :param item: 待写出的信封。
+        :returns: annotate 开启时为标注产物，否则为记录原始载荷。
+        """
         if self._cfg.annotate.enabled:
             return item.annotation.output  # type: ignore[union-attr]
         return _raw_payload(item.record)
@@ -338,9 +429,15 @@ class Emitter:
         return self._class_schemas.get(cls.label)
 
     def _write_main(self, item: PipelineItem, user_obj: Mapping, batch_no: int) -> None:
-        # Assemble + serialize EVERY line first (record-level failures stay
-        # record-level and cannot leave a partial line or desynchronize the
-        # sidecar's frozen line alignment, spec 3.11.3 ①); only then write.
+        """把一行写进主输出（inline/sidecar/none 三种 meta 形态）。
+
+        :param item: 待写出的信封。
+        :param user_obj: 该行的用户对象。
+        :param batch_no: 批号。
+        :raises LabelKitError: 通道写出失败。
+        """
+        # 先把每一行整体装配并序列化完（记录级失败就停在记录级，绝不留下半行、也
+        # 绝不打乱 sidecar 的冻结行对齐，spec 3.11.3 ①）；然后才写。
         mode = self._cfg.output.meta_mode
         sidecar_line: str | None = None
         if mode == "inline":
@@ -357,8 +454,15 @@ class Emitter:
             self._channel_write(self._sidecar_fh, sidecar_line, "sidecar")
 
     def _channel_write(self, fh, line: str, channel: str) -> None:
-        """A failed write may leave a truncated line in the channel file — run-level
-        failure: mark the run undeliverable and raise LabelKitError (CLI exit 4)."""
+        """向某个通道写一行；写失败即 run 级失败。
+
+        写失败可能在通道文件里留下半行——因此标记本次运行不可交付并上抛。
+
+        :param fh: 目标通道的文件句柄。
+        :param line: 待写出的整行文本（含换行）。
+        :param channel: 通道名（只进错误消息，不含数据内容）。
+        :raises LabelKitError: 写出失败（CLI 退出码 4）。
+        """
         try:
             fh.write(line)
         except OSError as exc:
@@ -366,7 +470,12 @@ class Emitter:
             raise LabelKitError(f"{channel} channel write failed: {exc}") from exc
 
     def _assemble_meta(self, item: PipelineItem, batch_no: int) -> dict:
-        """The §6.3 `_meta` object — all keys always present; disabled stages → null."""
+        """装配 §6.3 的 `_meta` 对象——顶层键恒在场，关闭的阶段取 null。
+
+        :param item: 该行的信封。
+        :param batch_no: 批号。
+        :returns: 顶层键序冻结的 `_meta` 对象。
+        """
         rec = item.record
         return {
             "id": rec.id,
@@ -378,15 +487,14 @@ class Emitter:
                 "seed": self._cfg.run.seed,
             },
             "source": self._source_block(rec, with_fields=True),
-            # v1.8 ALWAYS-PRESENT key (§9.1): null whenever segment is disabled;
-            # position source → scores mirrors the chain order.
+            # v1.8 恒在场键（§9.1）：segment 关闭时取 null；位置在 source 与
+            # scores 之间，与链序一致。
             "stream": self._stream_block(item),
             "scores": self._scores_block(item, batch_no),
             "dedup": {"kind": item.dedup.kind} if item.dedup is not None else None,
-            # v1.7 ALWAYS-PRESENT key (§9.1): null when the item carries no
-            # classification (classify disabled, or never reached) — same
-            # convention as the other stage keys; position dedup → annotation
-            # mirrors the chain order.
+            # v1.7 恒在场键（§9.1）：信封没带分类时取 null（classify 关闭，或根本
+            # 没走到）——与其余阶段键同一惯例；位置在 dedup 与 annotation 之间，
+            # 与链序一致。
             "classification": (
                 {"label": item.classification.label,
                  "labels": list(item.classification.labels),
@@ -398,25 +506,34 @@ class Emitter:
         }
 
     def _rubric_selector(self) -> str:
+        """`_meta.run.rubric` 的取值。
+
+        :returns: 内联准则时取准则名，否则取 ``default:*`` 选择子。
+        """
         sel = self._cfg.quality.rubric
         if sel == "inline":
             return self._cfg.rubric.name
         if sel in ("default:text", "default:ui", "default:trajectory"):
             return sel
-        # "" should have been resolved by M1; mirror the loader's resolution
-        # rule (v1.8 S29: stream mode resolves the empty selector to the
-        # trajectory rubric for both modalities; v1.13 裁决·轨迹准则自动解析扩展:
-        # the time-stream generation form scores sequences too — the condition
-        # widens to segment.enabled ∨ generate_stream.enabled, loader-mirrored).
+        # "" 本应已被 M1 解析掉；此处镜像 loader 的解析规则（v1.8 S29：流模式把空
+        # 选择子解析成轨迹准则，两种模态皆然；v1.13 裁决·轨迹准则自动解析扩展：
+        # 时间流生成形态同样在给序列打分——条件扩为 segment.enabled ∨
+        # generate_stream.enabled，与 loader 两侧对齐）。
         if self._cfg.segment.enabled or self._cfg.generate_stream.enabled:
             return "default:trajectory"
         return f"default:{self._cfg.run.modality}"
 
     def _source_block(self, rec: Record, *, with_fields: bool) -> dict:
+        """装配 `_meta.source`（rejects 侧共用同一装配，只是不带 fields）。
+
+        :param rec: 该行的记录。
+        :param with_fields: True = 主输出形态（带 fields 与恒在场的 generator）。
+        :returns: source 块。
+        """
         ref = rec.ref
         src: dict = {"file": ref.source_file}
-        # Exactly one of line_no / pair_index (§9.1); generated records (both null)
-        # emit "pair_index": null (CONTRACTS.md §12.20).
+        # line_no / pair_index 恰有其一（§9.1）；生成记录两者皆 null，写出
+        # "pair_index": null（CONTRACTS.md §12.20）。
         if ref.line_no is not None:
             src["line_no"] = ref.line_no
         else:
@@ -425,17 +542,28 @@ class Emitter:
         if with_fields:
             src["fields"] = self._passthrough(rec)
             src["generator"] = dict(ref.generator) if ref.generator is not None else None
-        elif ref.generator is not None:  # rejects: generator only when present, no fields
+        elif ref.generator is not None:  # rejects：generator 有才写，且不带 fields
             src["generator"] = dict(ref.generator)
         return src
 
     def _passthrough(self, rec: Record) -> dict:
+        """按 ``output.passthrough_fields`` 从 raw 里摘出透传字段。
+
+        :param rec: 该行的记录。
+        :returns: 透传字段子集（raw 里缺席的字段直接不出现）。
+        """
         raw = rec.raw or {}
         return {
             f: raw[f] for f in self._cfg.output.passthrough_fields if f in raw
         }
 
     def _scores_block(self, item: PipelineItem, batch_no: int) -> dict | None:
+        """装配 `_meta.scores`。
+
+        :param item: 该行的信封。
+        :param batch_no: 批号（写进 batch_no 列）。
+        :returns: scores 块；信封未评分时为 None。
+        """
         if not item.scores:
             return None
         block: dict = {}
@@ -455,45 +583,36 @@ class Emitter:
         )
         block["batch_no"] = batch_no
         if self._cfg.classify.enabled and item.classification is not None:
-            # v1.7 (§9.1): the scoring pool this envelope was ranked in —
-            # present only when classify is enabled.
+            # v1.7（§9.1）：该信封参与排序的评分池——仅 classify 开启时在场。
             block["pool"] = item.classification.label
         return block
 
     def _stream_block(self, item: PipelineItem) -> dict | None:
-        """The v1.8 `_meta.stream` value (§9.1 / spec §6.3): null whenever segment
-        is disabled. In stream mode every main-output row is an episode (sequence
-        record) — a non-sequence record here is defensive and also yields null.
-        session_split / stream_repaired / segment_degraded travel as duck-typed
-        envelope marks written by M10/M7/M14 (S21/S26, §7.6). v1.9 (T16/m-11):
-        thread_id / fragments and the per-step resumed flag are present ONLY when
-        stitch is enabled — the off-mode byte-equivalence condition. The
-        TOP-LEVEL order_span stays the envelope span (§6.3 包络 rule: a
-        multi-fragment thread's span may contain other threads' frames —
-        downstream slicing must use fragments[].order_span).
-        v1.13（裁决·members 呈现真值门）: the gate widens to segment.enabled ∨
-        generate_stream.enabled — direct-assembly rows reuse this block as-is
-        (order_span/member_sources point at the artifact path + line numbers;
-        session_split=false / repaired=false / degraded=null / steps=null fall
-        out of the duck-typed defaults; stitch keys stay absent)."""
+        """装配 v1.8 的 `_meta.stream` 值（§9.1 / spec §6.3）。
+
+        segment 关闭时恒 null。流模式下每一行主输出都是一条 episode（序列记录）
+        ——这里遇到非序列记录属防御性分支，同样给 null。session_split /
+        stream_repaired / segment_degraded 以鸭子面信封标记传递，由 M10/M7/M14
+        写入（S21/S26，§7.6）。v1.9（T16/m-11）：thread_id / fragments 与逐步的
+        resumed 标志仅在 stitch 开启时在场——这是关闭态字节等价的条件。顶层
+        order_span 保持信封跨度（§6.3 包络规则：多片段 thread 的跨度里可能夹着别
+        的 thread 的帧——下游切片必须用 fragments[].order_span）。
+        v1.13（裁决·members 呈现真值门）：门扩为 segment.enabled ∨
+        generate_stream.enabled——直装行原样复用本块（order_span/member_sources
+        指向工件路径与行号；session_split=false / repaired=false / degraded=null
+        / steps=null 均由鸭子面缺省值落出；stitch 两键保持缺席）。
+
+        :param item: 该行的信封。
+        :returns: stream 块；非流模式或非序列记录时为 None。
+        """
         rec = item.record
         stream_on = self._cfg.segment.enabled or self._cfg.generate_stream.enabled
         if not stream_on or rec.kind != "sequence":
             return None
-        stitch_on = self._cfg.stitch.enabled
         members = rec.members
-
-        def step_row(t) -> dict:
-            row = {"index": t.index, **t.action}
-            if stitch_on:
-                # v1.9 (T10): resumed = the step is a thread-seam placeholder —
-                # derived from detail.kind, never from action_type.
-                row["resumed"] = t.detail.get("kind") == "thread_seam"
-            return row
-
         block: dict = {"episode_id": rec.id}
-        if stitch_on:
-            block["thread_id"] = item.thread_id       # == episode_id (T22)
+        if self._cfg.stitch.enabled:
+            block["thread_id"] = item.thread_id       # == episode_id（T22）
         block.update({
             "session_id": item.session_id,
             "order_span": [_order_key_repr(members[0]), _order_key_repr(members[-1])],
@@ -509,6 +628,17 @@ class Emitter:
             # 承载帧类真值（member_classifications，inherited），无 annotation/
             # status 列（frame.annotate 与本形态 M1 互斥）。
             block["members"] = self._members_block(item)
+        self._append_stream_tail(block, item)
+        return block
+
+    def _append_stream_tail(self, block: dict, item: PipelineItem) -> None:
+        """就地补齐 `_meta.stream` 的尾部键（键序冻结：session_split / repaired /
+        degraded[/ fragments] / steps）。
+
+        :param block: 待补齐的 stream 块（就地修改）。
+        :param item: 该行的信封。
+        """
+        stitch_on = self._cfg.stitch.enabled
         block.update({
             "session_split": bool(getattr(item, "session_split", False)),
             "repaired": bool(getattr(item, "stream_repaired", False)),
@@ -519,8 +649,7 @@ class Emitter:
             block["fragments"] = ([dict(f) for f in fragments]
                                   if fragments is not None else None)
         block["steps"] = (None if item.transitions is None
-                          else [step_row(t) for t in item.transitions])
-        return block
+                          else [_step_row(t, stitch_on) for t in item.transitions])
 
     def _members_block(self, item: PipelineItem) -> list[dict]:
         """v1.12（spec §3.6）：members 条目——逐成员按 rec.members 序，字段序冻结为
@@ -570,6 +699,11 @@ class Emitter:
         return obj, "annotated"
 
     def _annotation_block(self, item: PipelineItem) -> dict | None:
+        """装配 `_meta.annotation`。
+
+        :param item: 该行的信封。
+        :returns: annotation 块；未标注时为 None。
+        """
         ann = item.annotation
         if ann is None:
             return None
@@ -579,27 +713,37 @@ class Emitter:
         return block
 
     def _verification_block(self, item: PipelineItem) -> dict | None:
+        """装配 `_meta.verification`。
+
+        :param item: 该行的信封。
+        :returns: verification 块；未审校时为 None。
+        """
         ver = item.verification
         if ver is None:
             return None
         block: dict = {"verdict": ver.verdict, "rounds": ver.rounds}
         if self._cfg.segment.enabled:
-            # v1.8 (§9.1): stream mode carries the ALWAYS-PRESENT defects key
-            # ([] when none); non-stream verification blocks never carry it.
+            # v1.8（§9.1）：流模式带恒在场的 defects 键（无缺陷时为 []）；非流模式
+            # 的审校块永不带它。
             block["defects"] = list(ver.defects)
         return block
 
-    # ── rejects channel ───────────────────────────────────────────────────
+    # ── rejects 通道 ──────────────────────────────────────────────────────
 
     def _divert_internal(self, item: PipelineItem, batch_no: int, errors: list[str],
-                         log_message: str, exc: BaseException | None = None) -> None:
-        """Fail loudly, keep running: mark the item failed with kind internal_error.
+                         log_message: str) -> None:
+        """大声失败但继续运行：把该条标为 failed 且 kind = internal_error。
 
-        ``errors`` (full text, may embed data values) goes onto the item — one
-        StageError per violation, so the rejects ``errors`` array keeps one element
-        per violation (spec 3.11.3 ②). ``log_message`` MUST be data-free: the stderr
-        run log never carries data content (spec §7.1 ①); any stack goes to debug
-        level per §7.6."""
+        ``errors``（全文，可能内嵌数据值）挂到信封上——一条违规一个 StageError，
+        使 rejects 的 ``errors`` 数组保持逐违规一元素（spec 3.11.3 ②）。
+        ``log_message`` 必须去数据：stderr 运行日志永不携带数据内容（spec §7.1
+        ①）；异常栈由捕获点按 §7.6 写进 debug 级，不在这里重复。
+
+        :param item: 待改道的信封。
+        :param batch_no: 批号。
+        :param errors: 逐条违规全文（进信封与 rejects，不进 stderr）。
+        :param log_message: 去数据的 stderr 摘要。
+        """
         for message in errors:
             item.errors.append(StageError(
                 stage="emitter",
@@ -610,11 +754,14 @@ class Emitter:
         item.status = "failed"
         _log.warning("internal_error: %s", log_message,
                      extra={"stage": "emitter", "batch": batch_no})
-        if exc is not None:
-            _log.debug("internal_error stack (record %s)", item.record.id,
-                       exc_info=exc, extra={"stage": "emitter", "batch": batch_no})
 
     def _write_reject(self, item: PipelineItem, batch_no: int) -> None:
+        """把一条判拒记录写进 rejects 通道（``rejects = "none"`` 时直接返回）。
+
+        :param item: 被判拒的信封。
+        :param batch_no: 批号（保留在签名里与其余写出面对齐）。
+        :raises LabelKitError: rejects 通道写出失败。
+        """
         if self._rejects_fh is None:
             return
         stage, reason = self._reject_stage_reason(item)
@@ -623,28 +770,31 @@ class Emitter:
             "source": self._source_block(item.record, with_fields=False),
             "stage": stage,
             "reason": reason,
-            "errors": [e.message for e in item.errors],  # [] when none (frozen)
+            "errors": [e.message for e in item.errors],  # 无错误时为 []（冻结）
         }
         if self._cfg.classify.enabled:
-            # v1.7 R5 (§9.2): the closed five-key enumeration becomes SIX keys
-            # when classify is enabled — `label` disambiguates fanned-out
-            # siblings sharing a record id; null when the item was rejected
-            # before ever being classified. Both refs and full tiers carry it
-            # (full extends refs). Classify disabled keeps the five-key form
-            # byte-identical.
+            # v1.7 R5（§9.2）：classify 开启时闭集五键变六键——`label` 用来区分共享
+            # 同一记录 id 的扇出兄弟；条目在被分类之前就判拒时取 null。refs 与 full
+            # 两档都带它（full 是 refs 的扩展）。classify 关闭保持五键形态逐字节
+            # 不变。
             meta["label"] = (item.classification.label
                              if item.classification is not None else None)
         row: dict = {"_meta": meta}
         if self._cfg.output.rejects == "full":
             row["record"] = _raw_payload(item.record)
             if reason == ErrorKind.SCHEMA_VIOLATION.value:
-                # raw_last_output travels on the item when the failing stage attached
-                # it (SchemaViolation.raw_last_output); absent → null.
+                # 失败阶段挂了 raw_last_output 时它随信封传过来
+                # （SchemaViolation.raw_last_output）；缺席 ⇒ null。
                 row["raw_last_output"] = getattr(item, "raw_last_output", None)
         self._channel_write(self._rejects_fh, _dumps(row) + "\n", "rejects")
         self._reject_lines_written += 1
 
     def _reject_stage_reason(self, item: PipelineItem) -> tuple[str, str]:
+        """按终态推导 rejects 行的 (stage, reason) 二元组（§9.2）。
+
+        :param item: 被判拒的信封。
+        :returns: (归因阶段, 判拒原因)。
+        """
         if item.status == "dropped_dup":
             kind = item.dedup.kind if item.dedup is not None else "exact"
             return "dedup", kind
@@ -655,33 +805,44 @@ class Emitter:
         if item.status == "dropped_verify":
             return "verify", "verify_fail"
         if item.status == "dropped_noise":
-            # v1.8 (§9.2): these frames carry no item.errors entry — attribution
-            # reads the duck-typed mark left by the flipping stage (M14/M7):
-            # ("segment", "noise") | ("segment", "below_min_len") |
-            # ("verify", "off_task_member").
+            # v1.8（§9.2）：这些帧不带 item.errors 条目——归因读的是翻转阶段
+            # （M14/M7）留下的鸭子面标记：("segment", "noise") |
+            # ("segment", "below_min_len") | ("verify", "off_task_member")。
             attribution = getattr(item, "noise_attribution", None)
             return attribution if attribution else ("segment", "noise")
-        # failed (incl. emitter-diverted internal errors)
+        # failed（含发射器自己改道的 internal error）
         if item.errors:
             first = item.errors[0]
             return first.stage, first.kind
         return "emitter", ErrorKind.INTERNAL_ERROR.value
 
-    # ── plumbing ──────────────────────────────────────────────────────────
+    # ── 通道管路 ──────────────────────────────────────────────────────────
 
     def _flush(self) -> None:
+        """把全部已开通道的缓冲刷到磁盘。
+
+        :raises LabelKitError: flush 失败（缓冲可能已部分落盘，等同写失败）。
+        """
         try:
             for fh in (self._main_fh, self._sidecar_fh, self._rejects_fh,
                        self._artifact_fh):
                 if fh is not None:
                     fh.flush()
         except OSError as exc:
-            # Buffered data may be partially on disk → same as a failed write.
+            # 缓冲数据可能已部分落盘 → 与写失败同等对待。
             self._undeliverable = True
             raise LabelKitError(f"output flush failed: {exc}") from exc
 
     @staticmethod
     def _deliver(fh, part: Path, target: Path, deliver: bool) -> None:
+        """交付单个通道：flush → fsync → 关闭 → 原子改名。
+
+        :param fh: 通道文件句柄；None = 该通道从未开过，直接返回。
+        :param part: ``.part`` 暂存路径。
+        :param target: 最终路径。
+        :param deliver: False = 只 flush 与关闭，不 fsync 也不改名。
+        :raises OSError: fsync 或改名失败（由调用方转成 LabelKitError）。
+        """
         if fh is None:
             return
         fh.flush()
@@ -692,25 +853,32 @@ class Emitter:
             os.rename(part, target)
 
     def _close_all(self) -> None:
+        """关闭全部已开通道并复位句柄（清理路径，绝不掩盖首要错误）。"""
         for fh in (self._main_fh, self._sidecar_fh, self._rejects_fh,
                    self._artifact_fh):
             if fh is not None:
                 try:
                     fh.close()
-                except OSError:
-                    pass
+                except OSError as exc:
+                    # 清理期关闭失败不改变交付结论：首要错误已在上抛路径上。
+                    _log.warning("channel close failed during cleanup: %s",
+                                 type(exc).__name__,
+                                 extra={"stage": "emitter", "batch": "-"})
         self._main_fh = self._sidecar_fh = self._rejects_fh = None
         self._artifact_fh = None
 
-    # ── stderr progress + summary (display, not logging — spec §7.7) ─────
+    # ── stderr 进度与摘要（展示面，不是日志——spec §7.7）─────────────────
 
     def _progress(self, batch_no: int) -> None:
-        """TTY batch-level progress (spec §7.7): current batch number + cumulative
-        per-status counts. Total-batch count and running cost are known only to
-        M10/M9 and are not plumbed into the emitter (accepted reduction).
-        v1.10 (U21): the rich static gate comes FIRST (the panel supersedes this
-        line; mid-run demotion/`q` detach is the renderer's job, printing the
-        same ``console_format`` line); the plain path is byte-identical to v1.9."""
+        """TTY 批级进度（spec §7.7）：当前批号 + 逐状态累计计数。
+
+        总批数与运行开销只有 M10/M9 知道，不接进发射器（可接受的削减）。
+        v1.10（U21）：rich 静态闸在最前（面板取代此行；运行中降级或 `q` 脱离由
+        渲染器负责，打印同一条 ``console_format`` 行）；plain 路径与 v1.9 字节
+        等价。
+
+        :param batch_no: 刚落盘的批号。
+        """
         if self._cfg.console.mode_resolved == "rich":
             return
         if not sys.stderr.isatty() or self._cfg.tool.log_format == "jsonl":
@@ -721,15 +889,21 @@ class Emitter:
         self._progress_active = True
 
     def _end_progress(self) -> None:
+        """收尾进度行：写过就补一个换行，让最后一帧留在滚动区里。"""
         if self._progress_active:
             sys.stderr.write("\n")
             sys.stderr.flush()
             self._progress_active = False
 
     def _print_summary(self, report: Mapping) -> None:
-        """v1.10 (U21): same rich static gate as ``_progress`` (rich mode swaps
-        in the renderer's table version, values from the same report); the plain
-        path writes the ``console_format`` lines byte-identically to v1.9."""
+        """打印 run 摘要。
+
+        v1.10（U21）：与 ``_progress`` 同一道 rich 静态闸（rich 模式换成渲染器的
+        表格版，取值同源于本 report）；plain 路径写出的 ``console_format`` 行与
+        v1.9 逐字节一致。
+
+        :param report: 本次运行的 report 对象（只读 counts 块）。
+        """
         if self._cfg.console.mode_resolved == "rich":
             return
         counts = dict(report.get("counts", {}))
@@ -738,11 +912,31 @@ class Emitter:
         sys.stderr.flush()
 
 
+def _step_row(transition, stitch_on: bool) -> dict:
+    """`_meta.stream.steps` 的一条步记录。
+
+    :param transition: 该步的 Transition。
+    :param stitch_on: stitch 是否开启（决定是否带 resumed 列）。
+    :returns: 步记录对象。
+    """
+    row = {"index": transition.index, **transition.action}
+    if stitch_on:
+        # v1.9（T10）：resumed = 该步是线程接缝占位——由 detail.kind 推导，绝不看
+        # action_type。
+        row["resumed"] = transition.detail.get("kind") == "thread_seam"
+    return row
+
+
 def _raw_payload(rec: Record) -> Mapping:
-    """Record content payload: text → Record.raw; UI → serialized tree + image path;
-    v1.8 sequence records (S25, §9.2) → member id/source references (the frozen
-    single-record shapes stay for kind="single"). Shared by the annotate-disabled
-    main output and the rejects `full` tier (§9.1/§9.2)."""
+    """记录内容载荷。
+
+    text 模态 → Record.raw；UI 模态 → 序列化树 + 图片路径；v1.8 序列记录
+    （S25，§9.2）→ 成员 id/来源引用（kind="single" 保持冻结的单记录形态）。由
+    annotate 关闭时的主输出与 rejects 的 `full` 档共用（§9.1/§9.2）。
+
+    :param rec: 待取载荷的记录。
+    :returns: 该记录的内容载荷对象。
+    """
     if rec.kind == "sequence":
         return {
             "kind": "sequence",
@@ -758,8 +952,14 @@ def _raw_payload(rec: Record) -> Mapping:
 
 
 def _member_source(member: Record) -> dict:
-    """One `_meta.stream.member_sources` entry (§9.1): {"file", ...} plus exactly
-    one of line_no / pair_index — the §9.1 source-block convention per member."""
+    """`_meta.stream.member_sources` 的一个条目（§9.1）。
+
+    形态为 {"file", ...} 加 line_no / pair_index 恰有其一——即 §9.1 的 source 块
+    惯例逐成员套用。
+
+    :param member: 成员记录。
+    :returns: 该成员的来源条目。
+    """
     src: dict = {"file": member.ref.source_file}
     if member.ref.line_no is not None:
         src["line_no"] = member.ref.line_no
@@ -769,8 +969,13 @@ def _member_source(member: Record) -> dict:
 
 
 def _order_key_repr(member: Record) -> str | int | None:
-    """`_meta.stream.order_span` element (spec §6.3): the member's order-key
-    presentation — text = "file:line_no", UI = pair_index."""
+    """`_meta.stream.order_span` 的一个元素（spec §6.3）。
+
+    即该成员的排序键呈现形式——text 模态为 "file:line_no"，UI 模态为 pair_index。
+
+    :param member: 成员记录。
+    :returns: 排序键呈现值。
+    """
     ref = member.ref
     if ref.line_no is not None:
         return f"{ref.source_file}:{ref.line_no}"

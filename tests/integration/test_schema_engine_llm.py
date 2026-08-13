@@ -16,7 +16,13 @@ from dataclasses import dataclass
 import httpx
 import pytest
 
-from labelkit.common.runtime.schema_engine import Message, Part, PromptBundle, SchemaEngine
+from labelkit.common.runtime.schema_engine import (
+    CallScope,
+    Message,
+    Part,
+    PromptBundle,
+    SchemaEngine,
+)
 from labelkit.common.config.model import LLMProfile, OutputConfig
 from labelkit.common.contracts.types import Usage
 
@@ -205,7 +211,8 @@ async def test_l25_hook_violation_repaired_by_loop():
             text="[待标注数据] 帮我写一条请假条，明天上午要去医院", image=None),)),
     ))
     obj, usage, attempts, model = await engine.complete_validated(
-        "default", prompt, record={"instruction": "帮我写一条请假条"})
+        "default", prompt,
+        scope=CallScope(record={"instruction": "帮我写一条请假条"}))
     assert len(obj["topic"]) <= 6            # 回调的要求最终被满足
     assert attempts >= 2                     # 至少经过一轮 L3 修复（回调当教练）
     assert engine.stats["rejected"] == 0
@@ -225,7 +232,8 @@ async def test_l25_unsatisfiable_hook_exhausts_as_callback_violation():
             text="[待标注数据] 在吗", image=None),)),
     ))
     with pytest.raises(SchemaViolation) as ei:
-        await engine.complete_validated("default", prompt, record=None)
+        await engine.complete_validated("default", prompt,
+                                        scope=CallScope(record=None))
     assert ei.value.callback_only is True
     assert all(v.startswith("(validator) ") for v in ei.value.errors)
     assert engine.stats["rejected"] == 1

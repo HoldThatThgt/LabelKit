@@ -23,14 +23,28 @@ user (当前记录):
 
 UI 树序列化格式（`UITree.serialize()`，4.3 节）：深度缩进的每节点一行 `<role> "text" [l,t,r,b] {关键属性}`，只保留可见节点与非空属性，超出 `ui_tree_max_chars` 时按深度优先截断并追加 `…(truncated N nodes)` 标记。此「图 + 线性化结构文本」双通道输入是 ScreenAI 的 screen-schema 表示 [13] 与 GUI 智能体输入惯例 [16][17]。
 
-**按类取值（v1.7）。**classify 启用且记录带类标签时，本节模板的 `{annotate.instruction}` 与 few-shot `examples` 取该类有效配置（`class_views[label].annotate`，3.1.4 按类覆盖合并行）——模板结构不变，仅取值来源变化。为此 `build_annotate_prompt` 与 `annotate_record` 各增末位可选形参 `label: str | None = None`（默认 None = 现行为，旧调用点零改动）；stage 层传 `item.classification.label if item.classification else None`。trace `annotate.done` 事件 payload 增 `label` 字段（仅 classify 启用时携带，7.2 只增不改）。
+**装配变体参数对象（2026-08-14 代码规则整改）。**`build_annotate_prompt(record, cfg, schema_text, opts)` 与 `annotate_record(record, ctx, opts)` 的**全部**装配变体取值集中在一个冻结 dataclass `AnnotatePromptOptions` 上：
+
+| 字段 | 语义 | 引入 |
+|---|---|---|
+| `repair` | 修复上下文（`RepairContext`）；None = 首次标注 | v1.1 |
+| `temperature` | 采样温度；None = profile 默认（M5 内部设定，调用方置值忽略） | v1.1 |
+| `label` | 分类标签；v1.13 起同时选定按类标注 Schema | v1.7 |
+| `transitions` | `[动作序列]` 步骤源；None = 整段省略 | v1.8 |
+| `fragment_lens` | 逐碎片成员数（按碎片配额降采样）；None = 全局均匀降采样 | v1.9 |
+| `k_eff` | 生效关键帧上限（V20 折半 / V21 修复梯） | v1.11 |
+| `image_px` | 升档后的图像采样边长 | v1.11 |
+
+缺省实例即引入这些取值之前的全局无变体装配（逐字节等价）；换档一律以 `dataclasses.replace(opts, …)` 产出新对象。字段名与语义与逐次引入时完全一致——变的只是承载形式，v1.7–v1.11 的「追加式末位 kwarg」叙事就此退场。
+
+**按类取值（v1.7）。**classify 启用且记录带类标签时，本节模板的 `{annotate.instruction}` 与 few-shot `examples` 取该类有效配置（`class_views[label].annotate`，3.1.4 按类覆盖合并行）——模板结构不变，仅取值来源变化。取值载体为 `opts.label`（None = 全局配置）；stage 层传 `item.classification.label if item.classification else None`。trace `annotate.done` 事件 payload 增 `label` 字段（仅 classify 启用时携带，7.2 只增不改）。
 
 **按类标注 Schema（v1.13，裁决·按类标注 Schema）。**`label` 自 v1.13 起**同时选定标注 Schema**：类有效 Schema = `class_views[label].schema ?? cfg.user_schema`（`[class.<name>.annotate].schema_path`/`schema_inline` 的解析产物；类未声明覆盖、label 缺失或类表外的未知类一律回落全局，3.1.4 按类覆盖合并行 ⑤）。取值经**单点取值函数**实现，本模块的每个 Schema 消费点都读它——保证「计价的 Schema 恒等于调用的 Schema」，六处：
 
 | 消费点 | v1.13 取值 |
 |---|---|
 | 本节模板的 `{user_schema_json}` | 类有效 Schema 的 canonical 单行 dump（无覆盖时直取 M8 的 `user_schema_text` 属性，字节等价） |
-| 标注调用（首次 / 修复重标注两处） | 有覆盖 ⇒ 显式 `schema=类有效Schema` **且** `user_treatment=True`（3.8.2 待遇参数：L2.5 与 `resolved_at` 记账双保留）；无覆盖 ⇒ `schema=None` 的既有推断路径 |
+| 标注调用（首次 / 修复重标注两处） | 有覆盖 ⇒ 显式 `schema=类有效Schema` **且** `scope.user_treatment=True`（3.8.2 待遇参数：L2.5 与 `resolved_at` 记账双保留）；无覆盖 ⇒ `schema=None` 的既有推断路径 |
 | self-consistency 字段级投票 | 可投票字段取自类有效 Schema（按类 Schema 的字段集可与全局不同） |
 | v1.11 预算装填的 schema 计价项 | 按类有效 Schema 计价 |
 | M7 修复路径的重标注与 V21 试装 | 传同一 `label` 自然穿透（无修复侧改动，3.7.3） |
@@ -73,11 +87,11 @@ UI 树序列化格式（`UITree.serialize()`，4.3 节）：深度缩进的每�
         全局均匀公式（单碎片线索由此逐字节退化为 v1.8 行为——零变化回归锚）
 ```
 
-**穿参义务（v1.9）：**碎片划分在信封 duck 标上而 `build_annotate_prompt` / `annotate_record` 只收 Record——两函数各增**第三个**末位可选形参 `fragment_lens: tuple[int, ...] | None = None`（= 线索各碎片的成员数，按碎片序；None = 现行为——继 v1.7 `label`、v1.8 `transitions` 之后对该冻结签名的第三次 additive 末位 kwarg 修订，旧调用点零改动）。stage 层自信封碎片跨度表取各碎片 member_count 传入；**M7 修复重标注调用同步穿参**（3.7.3——两处调用点一并穿参，否则修复重标丢配额、退回全局均匀采样）。
+**穿参义务（v1.9）：**碎片划分在信封 duck 标上而 `build_annotate_prompt` / `annotate_record` 只收 Record——载体是 `opts.fragment_lens`（= 线索各碎片的成员数，按碎片序；None = 全局均匀降采样）。stage 层自信封碎片跨度表取各碎片 member_count 传入；**M7 修复重标注调用同步穿参**（3.7.3——两处调用点一并穿参，否则修复重标丢配额、退回全局均匀采样）。
 
-**transitions 形参（S5）：**`build_annotate_prompt` 与 `annotate_record` 各增末位可选形参 `transitions: tuple[Transition, ...] | None = None`——继 v1.7 `label` 之后对该冻结签名的**第二次** additive 末位 kwarg 修订（CONTRACTS §7.4；R2 同款构造：默认 None = 现行为，旧调用点零改动）。stage 层传 `item.transitions`；M7 修复路径在成员手术后传**重建值**（3.7.3）。self-consistency 与 L2.5 路径不动——序列记录的 L2.5 回调收到 `record = None`（`Record.raw` 对序列恒 None，4.1；文档声明的既有局限，富载荷形参列演进候选）。
+**transitions 取值（S5）：**载体是 `opts.transitions`（CONTRACTS §7.4）。stage 层传 `item.transitions`；M7 修复路径在成员手术后传**重建值**（3.7.3）。self-consistency 与 L2.5 路径不动——序列记录的 L2.5 回调收到 `record = None`（`Record.raw` 对序列恒 None，4.1；文档声明的既有局限，富载荷形参列演进候选）。
 
-**上下文预算装填与修复升级换档（v1.11）。**标注 profile 声明 `context_window` 时按上下文预算装填单次标注调用（未声明 = 预算关闭，行为与 v1.10 一致；预算/估算/校准机制见 3.9）。**份额定序**（确定性，V9）：① 系统侧静态部件（instruction / 用户 Schema / few-shot）**不裁剪**——用户语义资产，由 M1 静态预检把关（3.1.4，V13③）；② 文本块（步骤行 + 成员摘要块；单记录 UI 树渲染同 3.13.4 的动态封顶语义）按其既有绝对上限渲染并计 est；③ 图片吃剩余：`k_eff = min(sequence_frames, max(2, ⌊剩余 / est_image⌋))`——**首末帧恒保留**、中间均匀下采样（本节降采样公式与按碎片配额语义不变，仅 k 收缩；图片单价读校准器，3.9）；④ k = 2 仍超预算 → 回头按「首末恒保留、丢中段」裁文本块直至装下；⑤ 仍不下 → 该记录记 `context_overflow` 入 rejects（V10，7.6）。**图片先于文本让步**：文本摘要是裁决兜底证据、token 效率高于像素。**溢出反应（V20）**：识别到 provider 上下文溢出 → 关键帧减半重试（k 减半，min 2；有界 ≤ 2 次降级），耗尽仍溢出按 V10 处置。**修复轮升级换档（V21）**：`verify.policy = "repair"` 的修复重标注按质量阶梯换档——关键帧数减半（k → max(2, ⌈k/2⌉)，首末恒保）+ 分辨率上探一档（`default_image_px` × 1.5ⁿ/维，≤ `max_image_px`），预算约束经校准估算复核后不变；阶梯参数经 `build_annotate_prompt` / `annotate_record` **追加式末位可选 kwarg** 传入（继 `label`、`transitions`、`fragment_lens` 之后对该冻结签名的第四次 additive 尾参修订，旧调用点零改动，F3）；单向有界——升级仅发生于修复路径、每记录 ≤ `verify.max_repair_rounds` 次（触发条件见 3.7.3）。**不可裁剪动态块（V25③）**：修复轮追加的 `[上一版标注] / [审核意见]` 尾注为语义资产——**计入 est、永不裁剪**；全部可裁份额耗尽仍超 → V10。逐裁剪点计入 `report.budget.truncations`（6.4）。
+**上下文预算装填与修复升级换档（v1.11）。**标注 profile 声明 `context_window` 时按上下文预算装填单次标注调用（未声明 = 预算关闭，行为与 v1.10 一致；预算/估算/校准机制见 3.9）。**份额定序**（确定性，V9）：① 系统侧静态部件（instruction / 用户 Schema / few-shot）**不裁剪**——用户语义资产，由 M1 静态预检把关（3.1.4，V13③）；② 文本块（步骤行 + 成员摘要块；单记录 UI 树渲染同 3.13.4 的动态封顶语义）按其既有绝对上限渲染并计 est；③ 图片吃剩余：`k_eff = min(sequence_frames, max(2, ⌊剩余 / est_image⌋))`——**首末帧恒保留**、中间均匀下采样（本节降采样公式与按碎片配额语义不变，仅 k 收缩；图片单价读校准器，3.9）；④ k = 2 仍超预算 → 回头按「首末恒保留、丢中段」裁文本块直至装下；⑤ 仍不下 → 该记录记 `context_overflow` 入 rejects（V10，7.6）。**图片先于文本让步**：文本摘要是裁决兜底证据、token 效率高于像素。**溢出反应（V20）**：识别到 provider 上下文溢出 → 关键帧减半重试（k 减半，min 2；有界 ≤ 2 次降级），耗尽仍溢出按 V10 处置。**修复轮升级换档（V21）**：`verify.policy = "repair"` 的修复重标注按质量阶梯换档——关键帧数减半（k → max(2, ⌈k/2⌉)，首末恒保）+ 分辨率上探一档（`default_image_px` × 1.5ⁿ/维，≤ `max_image_px`），预算约束经校准估算复核后不变；阶梯参数经 `opts.k_eff` / `opts.image_px` 两字段传入（M7 以 `dataclasses.replace` 换档，F3）；单向有界——升级仅发生于修复路径、每记录 ≤ `verify.max_repair_rounds` 次（触发条件见 3.7.3）。**不可裁剪动态块（V25③）**：修复轮追加的 `[上一版标注] / [审核意见]` 尾注为语义资产——**计入 est、永不裁剪**；全部可裁份额耗尽仍超 → V10。逐裁剪点计入 `report.budget.truncations`（6.4）。
 
 ### 3.5.3 API 与错误处理
 

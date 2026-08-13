@@ -38,7 +38,9 @@ from labelkit.common.errors import CircuitBreakerTripped
 from labelkit.common.runtime import budget
 from labelkit.common.observability.obslog import EventLog, MetricsSink, TraceEvent
 from labelkit.common.runtime.llm_client import LLMClient
-from labelkit.orchestration.orchestrator import Orchestrator, RunSummary, estimate_run
+from labelkit.orchestration.orchestrator import (
+    Orchestrator, RunServices, RunSummary, estimate_run,
+)
 from labelkit.orchestration.runtime import execute_run, validate_project
 from labelkit.common.contracts.types import (
     Classification, DedupInfo, PipelineItem, QualityScore, Record, RecordRef,
@@ -193,7 +195,7 @@ class FakeMetrics:
     def add_stage_time(self, stage, seconds):
         self.stage_times[stage] = self.stage_times.get(stage, 0.0) + seconds
 
-    def record_provider_result(self, fatal):
+    def record_provider_result(self, fatal, *, hard=False):
         self._fatal_streak = self._fatal_streak + 1 if fatal else 0
 
     def stage_begin(self, stage, batch_no):
@@ -609,13 +611,19 @@ class BreakerStage:
 
 # ── wiring helper ───────────────────────────────────────────────────────────
 
+def services(metrics, llm=None, schema_engine=None):
+    """收拢编排器构造的运行期服务参数对象（生产侧 RunServices 的测试口径）。"""
+    return RunServices(llm=llm, schema_engine=schema_engine, metrics=metrics,
+                       run_id=RUN_ID, run_started_at=datetime.now().astimezone())
+
+
 def build(cfg, stages, records=None, *, ingestor=None, llm=None, schema_engine=None):
     metrics = FakeMetrics(threshold=cfg.run.fatal_error_threshold)
     emitter = FakeEmitter(cfg)
     if ingestor is None and cfg.run.mode == "process":
         ingestor = FakeIngestor(records or [])
-    orch = Orchestrator(cfg, stages, ingestor, emitter, llm, schema_engine,
-                        metrics, RUN_ID, datetime.now().astimezone())
+    orch = Orchestrator(cfg, stages, ingestor, emitter,
+                        services(metrics, llm, schema_engine))
     return orch, metrics, emitter, ingestor
 
 
@@ -1231,8 +1239,7 @@ async def test_dry_run_trace_enabled_message_and_lifecycle_events(tmp_path, caps
     metrics = MetricsSink(cfg, RUN_ID, event_log)
     emitter = FakeEmitter(cfg)
     ingestor = FakeIngestor([rec(1)])
-    orch = Orchestrator(cfg, [], ingestor, emitter, None, None,
-                        metrics, RUN_ID, datetime.now().astimezone())
+    orch = Orchestrator(cfg, [], ingestor, emitter, services(metrics))
     summary = await orch.run()
     event_log.close()
 
@@ -1356,8 +1363,8 @@ async def test_report_trace_events_counts_run_end(tmp_path):
     metrics = MetricsSink(cfg, RUN_ID, event_log)
     emitter = FakeEmitter(cfg)
     ingestor = FakeIngestor([rec(1), rec(2)])
-    orch = Orchestrator(cfg, [ExactDedupStage()], ingestor, emitter, None, None,
-                        metrics, RUN_ID, datetime.now().astimezone())
+    orch = Orchestrator(cfg, [ExactDedupStage()], ingestor, emitter,
+                        services(metrics))
     summary = await orch.run()
     event_log.close()
 
@@ -1386,8 +1393,8 @@ async def test_report_trace_run_end_counted_dropped_when_channel_closed(tmp_path
     metrics = MetricsSink(cfg, RUN_ID, event_log)
     emitter = FakeEmitter(cfg)
     ingestor = FakeIngestor([rec(1), rec(2)])
-    orch = Orchestrator(cfg, [ExactDedupStage()], ingestor, emitter, None, None,
-                        metrics, RUN_ID, datetime.now().astimezone())
+    orch = Orchestrator(cfg, [ExactDedupStage()], ingestor, emitter,
+                        services(metrics))
     await orch.run()
 
     # probe + run.start + batch.start + batch.end dropped before report
@@ -1752,7 +1759,7 @@ async def test_dry_run_process_classify_calls_formula(tmp_path, capsys):
     assert "classify_calls=30" in err              # 10 ingested × sc 3
     assert "annotate_calls=10" in err
     assert "total=40" in err                       # classify counted into total
-    assert "按全局配置估算" not in err               # no overrides, no multi
+    assert "estimated with global config" not in err   # no overrides, no multi
 
 
 async def test_dry_run_generate_only_classify_calls_and_multi_note(tmp_path, capsys):
@@ -1773,7 +1780,8 @@ async def test_dry_run_generate_only_classify_calls_and_multi_note(tmp_path, cap
     assert "classify_calls=8" in err               # 8 generated × max(1, 0)
     assert "annotate_calls=8" in err
     assert "total=18" in err
-    assert "按全局配置估算 / multi 按标签乘数 1 报下界" in err
+    assert ("estimated with global config / multi reports a lower bound at "
+            "label multiplier 1") in err
 
 
 async def test_dry_run_class_override_triggers_note_without_multi(tmp_path, capsys):
@@ -1787,7 +1795,8 @@ async def test_dry_run_class_override_triggers_note_without_multi(tmp_path, caps
     await orch.run()
     err = capsys.readouterr().err
     assert "classify_calls=2" in err
-    assert "按全局配置估算 / multi 按标签乘数 1 报下界" in err
+    assert ("estimated with global config / multi reports a lower bound at "
+            "label multiplier 1") in err
 
 
 # ── E2E-finding fixes: P4-9 tie rate / P4-10 circuit_broken flag ─────────────
@@ -1976,7 +1985,7 @@ async def test_stream_oversized_session_hard_split_and_marks(tmp_path, caplog):
     for b in probe.batches:
         assert all(split is True for _, split in b)
     assert probe.batches[0][0][0] == "s1" and probe.batches[3][0][0] == "s2"
-    assert sum("硬切" in r.message for r in caplog.records) == 1
+    assert sum("hard-split" in r.message for r in caplog.records) == 1
     assert summary.output_lines == 19
     assert stream_counts_invariant(emitter.report["counts"])
 
@@ -2323,7 +2332,8 @@ async def test_dry_run_stream_estimate_formulas_and_note(tmp_path, capsys):
     assert "extract_calls=24" in err               # 20 + 4 (upper bound)
     assert "annotate_calls=2" in err               # episodes ≈ sessions
     assert "total=29" in err
-    assert "stream 估算：下游按 episodes≈sessions 报下界（LLM 精化只增段数）" in err
+    assert ("stream estimate: downstream reports a lower bound at "
+            "episodes≈sessions (LLM refinement only adds segments)") in err
 
 
 async def test_dry_run_stream_rules_strategy_zero_segment_calls(tmp_path, capsys):
@@ -2366,7 +2376,8 @@ async def test_dry_run_extract_class_override_triggers_note(tmp_path, capsys):
     orch, _, _, _ = build(cfg, [], [rec(1), rec(2)])
     await orch.run()
     err = capsys.readouterr().err
-    assert "按全局配置估算 / multi 按标签乘数 1 报下界" in err
+    assert ("estimated with global config / multi reports a lower bound at "
+            "label multiplier 1") in err
 
 
 # ── tests: v1.9 stitch orchestration (chain / metering / report / dry-run) ──
@@ -2659,6 +2670,60 @@ def test_estimate_run_respects_limit(tmp_path):
     assert est["annotate_calls"] == 5
 
 
+def _three_criteria_quality_cfg(tmp_path, **quality_kw) -> ResolvedConfig:
+    """三条 criterion 的 pairwise 工程（估算乘子用例的共同夹具）。"""
+    rubric = Rubric(name="t", criteria=tuple(
+        Criterion(key=key, description="d", pairwise_prompt="p")
+        for key in ("clarity", "usefulness", "coherence")))
+    cfg = make_cfg(tmp_path, batch_size=4, annotate=True,
+                   quality_cfg=QualityConfig(enabled=True, rounds=4, **quality_kw))
+    return replace(cfg, rubric=rubric)
+
+
+@pytest.mark.parametrize("both_orders,per_call,judges,factor", [
+    (False, "all", (), 1),
+    (True, "all", (), 2),
+    (False, "single", (), 3),
+    (True, "single", (), 6),
+    (True, "all", ("default", "judge", "fixer"), 6),
+])
+def test_estimate_run_quality_calls_scale_with_both_orders_and_criteria_per_call(
+        tmp_path, both_orders, per_call, judges, factor):
+    """spec 3.4.3「裁决提示词」行（单次调用裁决全部 criteria；
+    `criteria_per_call = "all"`（默认）| `"single"` 可切回原文行为——逐 criterion
+    一次调用）与「双顺序裁决」行（正反两序各为一次独立裁决，成本 ×2；多评审团下
+    每 judge 各判两次）：pairwise 估算 = Σ_批 rounds×⌊b/2⌋ × per_call × judges ×
+    orders（实现 spec 3.10.3 dry-run 估算，orchestrator._estimate_quality_calls）。
+
+    口径（与运行期侧 tests/operators/test_quality.py 的实测调用数交叉对齐）：
+    比较基数按 spec 3.10.3「全部估算假定零丢弃（上界）且不含重试与修复调用」取
+    批容量，故它在**记录数**意义上是上界；乘子结构 per_call × judges × orders
+    与运行期逐调用派发是**等号**。奇数池每轮末位轮空（⌊N/2⌋，spec 3.10.4 走查
+    「批 3 的 N=229 为奇数，每轮末位轮空」）。
+    """
+    cfg = _three_criteria_quality_cfg(tmp_path, mode="pairwise",
+                                      both_orders=both_orders,
+                                      criteria_per_call=per_call, judges=judges)
+    est = estimate_run(cfg, SimpleNamespace(estimated_records=10, session_lens=()))
+
+    base = 20                              # 三批 [4,4,2]：4×2 + 4×2 + 4×1
+    assert est["quality_calls"] == base * factor
+    assert tuple(est) == _EST_KEYS         # 乘子不引入新键、不动键序
+    assert est["total_calls"] == est["quality_calls"] + est["annotate_calls"]
+
+
+def test_estimate_run_pointwise_quality_calls_ignore_pairwise_multipliers(tmp_path):
+    """pointwise 是逐记录逐维度的绝对刻度打分——`both_orders` 与
+    `criteria_per_call` 都是成对比较概念（spec 3.4.3 两行都写在 pairwise 语境
+    里），故估算恒 = 记录数 × 准则数，两键置任何值都不改数。"""
+    cfg = _three_criteria_quality_cfg(tmp_path, mode="pointwise",
+                                      both_orders=True,
+                                      criteria_per_call="single",
+                                      judges=("default", "judge", "fixer"))
+    est = estimate_run(cfg, SimpleNamespace(estimated_records=10, session_lens=()))
+    assert est["quality_calls"] == 30      # 10 条 × 3 准则
+
+
 def test_estimate_run_stream_next_fit_exactness(tmp_path):
     """S22 numbers via the pure function (ported from the dry-run stderr test):
     exact next-fit batches, segment/extract formulas, episodes ≈ sessions."""
@@ -2849,8 +2914,7 @@ async def test_dry_run_rich_with_listener_suppresses_prints_emits_estimate(
     metrics = FakeMetrics(listener=True)
     emitter = FakeEmitter(cfg)
     ingestor = FakeIngestor([rec(i) for i in range(1, 4)])
-    orch = Orchestrator(cfg, [], ingestor, emitter, None, None, metrics, RUN_ID,
-                        datetime.now().astimezone())
+    orch = Orchestrator(cfg, [], ingestor, emitter, services(metrics))
     summary = await orch.run()
 
     assert summary.exit_code == 0
@@ -2881,8 +2945,7 @@ async def test_dry_run_plain_with_listener_prints_byte_identical(tmp_path, capsy
     metrics = FakeMetrics(listener=True)
     emitter = FakeEmitter(cfg)
     ingestor = FakeIngestor([rec(i) for i in range(1, 4)])
-    orch = Orchestrator(cfg, [], ingestor, emitter, None, None, metrics, RUN_ID,
-                        datetime.now().astimezone())
+    orch = Orchestrator(cfg, [], ingestor, emitter, services(metrics))
     await orch.run()
     lines = [line for line in capsys.readouterr().err.splitlines()
              if line.startswith("dry-run")]
@@ -2935,8 +2998,8 @@ async def test_stage_begin_forwards_on_stage_before_stage_effects(tmp_path):
     metrics = MetricsSink(cfg, RUN_ID, event_log, listener=listener)
     emitter = FakeEmitter(cfg)
     ingestor = FakeIngestor([rec(1), rec(2)])
-    orch = Orchestrator(cfg, [EmittingDedup()], ingestor, emitter, None, None,
-                        metrics, RUN_ID, datetime.now().astimezone())
+    orch = Orchestrator(cfg, [EmittingDedup()], ingestor, emitter,
+                        services(metrics))
     summary = await orch.run()
     event_log.close()
 
@@ -3099,7 +3162,7 @@ def test_execute_run_on_run_context_failure_warns_once_and_disables(
                      listener=listener)
     assert rc == 0                                 # run unaffected (U7/U23)
     err = capsys.readouterr().err
-    assert err.count("console listener 异常，已停用面板旁路") == 1
+    assert err.count("console listener failed, panel bypass disabled") == 1
     # bypass disabled → the rich yield gate finds no listener → plain prints
     assert "dry-run: mode=process" in err
     assert listener.estimates == []
@@ -3217,7 +3280,8 @@ async def test_dry_run_stream_budget_small_window_upper_bound_and_note(
         tmp_path, capsys):
     """V12 dry-run face: w_min < window → the segment_calls line reports the
     upper-bound value and the stream note gains the ONE appended sentence
-    「segment 按预算最坏装填报上界」 (same line, after the v1.8 wording)."""
+    "segment reports an upper bound at worst-case budget packing" (same line,
+    after the v1.8 wording)."""
     cfg = budget_stream_cfg(tmp_path, 5600, batch_size=8, dry_run=True,
                             annotate=True, extract=ExtractConfig(enabled=True))
     ingestor = FakeSessionIngestor(session_lens=(21, 5))
@@ -3229,8 +3293,9 @@ async def test_dry_run_stream_budget_small_window_upper_bound_and_note(
     assert "segment_calls=5" in err                # w_min=6: ceil(20/5)+ceil(4/5)
     assert "extract_calls=24" in err               # non-segment keys unchanged
     assert "total=31" in err
-    assert ("dry-run: 注：stream 估算：下游按 episodes≈sessions 报下界"
-            "（LLM 精化只增段数）；segment 按预算最坏装填报上界") in err
+    assert ("dry-run: note: stream estimate: downstream reports a lower bound "
+            "at episodes≈sessions (LLM refinement only adds segments)"
+            "; segment reports an upper bound at worst-case budget packing") in err
 
 
 async def test_dry_run_stream_budget_large_window_byte_identical(
@@ -3249,9 +3314,9 @@ async def test_dry_run_stream_budget_large_window_byte_identical(
     err = capsys.readouterr().err
     assert "segment_calls=3" in err                # ceil(20/19) + ceil(4/19)
     assert "total=29" in err
-    assert ("dry-run: 注：stream 估算：下游按 episodes≈sessions 报下界"
-            "（LLM 精化只增段数）\n") in err
-    assert "segment 按预算最坏装填报上界" not in err
+    assert ("dry-run: note: stream estimate: downstream reports a lower bound "
+            "at episodes≈sessions (LLM refinement only adds segments)\n") in err
+    assert "worst-case budget packing" not in err
 
 
 # — V19: batch-boundary calibrator freezes ————————————————————————————————————

@@ -4,6 +4,8 @@
 > 本文是**最终开发规格**：三方预实现审计（代码可行性/亲和性、文档观测清单穷尽、对抗性反证——反驳四条 + 需调整十二条全部折入）已于 2026-08-13 完成——凡与提案不一致处，**以本文为准**。
 > 实现纪律：不允许 defer 任何本文描述的内容；每条规格必须有对应测试用例；观测面与输出面逐字节按本文冻结；注释统一中文、代码/日志/报错英文；函数 ≤50 行、≤5 入参；异常分支必须有错误日志。
 
+> **2026-08-14 整改修订注记**：全库代码规则整改（spec §1.6 同日条目 / CONTRACTS §12 第 34 条）对本文的**决策与规格零改动**——本文保留为历史裁决记录。仅两处口径随代码更新：① 生产代码的注释与 docstring 为中文，日志/报错/CLI 输出为英文（LLM 提示词模板与 spec 冻结的输出数据仍为中文原样）；② 若本文引用了 `build_annotate_prompt` / `annotate_record` / `build_verify_prompt` / `complete_validated` / `render_thread_card` / `Orchestrator` 的「末位可选形参」调用形，这些取值现已收拢为参数对象 `AnnotatePromptOptions` / `VerifyPromptOptions` / `CallScope` / `ThreadCard` / `RunServices`（字段名与语义逐项不变）。
+
 ---
 
 ## 1. 结论与形态

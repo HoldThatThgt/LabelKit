@@ -1,7 +1,7 @@
 """Canonical orchestration layer exports."""
 
 from labelkit.orchestration.factory import build_stages
-from labelkit.orchestration.orchestrator import Orchestrator, RunSummary
+from labelkit.orchestration.orchestrator import Orchestrator, RunServices, RunSummary
 from labelkit.orchestration.profile_usage import referenced_profiles
 from labelkit.orchestration.runtime import (
     execute_run,
@@ -11,6 +11,7 @@ from labelkit.orchestration.runtime import (
 
 __all__ = [
     "Orchestrator",
+    "RunServices",
     "RunSummary",
     "build_stages",
     "execute_run",

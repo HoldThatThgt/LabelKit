@@ -179,8 +179,7 @@ class _MiniSchemaEngine:
     def user_schema_text(self) -> str:
         return json.dumps(self._schema, ensure_ascii=False, separators=(", ", ": "))
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
         target = schema if schema is not None else self._schema
         resp = await self._llm.complete(profile, prompt)
         obj = self._parse(resp.text)

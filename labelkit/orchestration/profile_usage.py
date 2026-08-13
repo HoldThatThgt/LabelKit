@@ -1,4 +1,4 @@
-"""Referenced-profile discovery for ``labelkit validate --probe``."""
+"""``labelkit validate --probe`` 的被引用 profile 发现。"""
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
@@ -10,7 +10,11 @@ __all__ = ["referenced_profiles"]
 
 
 def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
-    """Return order-preserving, deduplicated LLM and embedding profile names."""
+    """返回被启用阶段引用的 LLM 与 embedding profile 名（保序、去重）。
+
+    @param cfg: 已解析配置
+    @return: (LLM profile 名列表, embedding profile 名列表)
+    """
     llm_names: list[str] = []
     if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
         llm_names.append(cfg.segment.llm)

@@ -23,9 +23,9 @@
 - **帧标注**（M5 逐帧标注，3.5.5）：传入**用户声明的帧级 Schema** `cfg.frame_schema`（显式 schema 参数，裁决·帧 Schema 显式路由）——虽为用户 Schema 的同胞（M1 元校验 + few-shot 干跑，3.1.4），但按**内部 Schema 待遇**路由：L0–L3 四层全在、**无 L2.5**（`output.validator` 仅约束序列级用户 Schema 调用；帧级回调列 8.4 演进候选）、**不计 `resolved_at`**——保住 6.4 恒等式「resolved_at 加总 = 进入 M5 的记录数」不被帧调用污染。
 - **写前兜底**（M11，3.11.2）：emitter 对每个非 null 帧标注对象跑 `validate_only(obj, schema=cfg.frame_schema)`——通过 ⇒ status="annotated"，不通过 ⇒ 翻 "failed" + annotation 置 null + 计数，非法帧对象**永不落盘**（主输出 `validate_only` 终检的帧级镜像）。
 
-**显式待遇参数与三类路由声明（v1.13，裁决·M8 显式待遇参数）**：v1.12 的路由把「显式 schema 参数」与「内部 Schema 待遇」绑死，导致 v1.13 的按序列类标注 Schema 无处安放——它是用户 Schema 的另一份实例（记录级标注调用），却必须显式传参。裁决：`complete_validated` 增末位 additive keyword `user_treatment: bool | None = None` 把**待遇**与**传参方式**解耦——
+**显式待遇参数与三类路由声明（v1.13，裁决·M8 显式待遇参数）**：v1.12 的路由把「显式 schema 参数」与「内部 Schema 待遇」绑死，导致 v1.13 的按序列类标注 Schema 无处安放——它是用户 Schema 的另一份实例（记录级标注调用），却必须显式传参。裁决：`complete_validated` 增待遇门 `user_treatment: bool | None = None` 把**待遇**与**传参方式**解耦（2026-08-14 代码规则整改后它是 `CallScope` 的一个字段，与 `record_ids` / `batch_no` / `record` 同乘一个参数对象；语义逐字不变）——
 
-| 路由 | schema 参数 | user_treatment | L2.5 | `resolved_at` 记账 |
+| 路由 | schema 参数 | scope.user_treatment | L2.5 | `resolved_at` 记账 |
 |---|---|---|---|---|
 | 用户 Schema（全局 `output.schema`） | None（引擎持有） | None ⇒ 推断为真 | ✓（配置了 `output.validator` 时） | ✓ |
 | **按序列类标注 Schema（v1.13）** | 显式传该类 Schema | **True** | ✓ | ✓ |
@@ -36,15 +36,24 @@
 ### 3.8.3 API
 
 ```
+@dataclass(frozen=True)
+class CallScope:
+    """一次调用的记账与追踪范围（2026-08-14 收参：原四个关键字入参的参数对象形，
+       字段名与语义逐项不变）。"""
+    record_ids: tuple[str, ...] = ()    # 本次调用覆盖的记录 id，仅用于 trace 事件
+    batch_no: int = 0                   # 批次号，仅用于 trace 事件与日志 extra
+    record: Mapping | None = None       # L2.5 回调第二入参（Record.raw），无则 None
+    user_treatment: bool | None = None  # 显式待遇门；None ⇒ 按 schema is None 推断
+
 class SchemaEngine:
     def __init__(self, user_schema: dict, llm: LLMClient, cfg: OutputConfig): ...
     async def complete_validated(self, profile: str, prompt: PromptBundle,
-                                 schema: dict | None = None,
-                                 user_treatment: bool | None = None) -> dict:
+                                 schema: dict | None = None, *,
+                                 scope: CallScope = CallScope()) -> dict:
         """schema=None 时用用户 Schema；内部 Schema（裁决/评分/评审/生成/分类（v1.7）/
            分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9）/帧级判决（v1.12）/
            蓝图与帧实现（v1.13））由各 Stage 传入。
-           v1.13 user_treatment：None = 按 schema is None 推断（既有调用点零改动）；
+           v1.13 scope.user_treatment：None = 按 schema is None 推断（既有调用点零改动）；
            True = 用户待遇（计 resolved_at + 启 L2.5）——按序列类标注 Schema 即此形；
            False = 内部待遇。成功返回已通过 L2 的 dict；失败抛 SchemaViolation。"""
     def validate_only(self, obj: dict, schema: dict | None = None) -> list[str]:
@@ -115,8 +124,8 @@ JSON Pointer: /intent
 ```
 
 [违规清单]
-1. /intent: 期望为枚举 ["writing_assist", "qa", "translation", "chitchat",
-   "other"] 之一，实际值为 "writing"
+1. /intent: expected one of enum ["writing_assist", "qa", "translation",
+   "chitchat", "other"], got "writing"
 
 只输出修正后的 JSON。
 ```

@@ -69,7 +69,9 @@ from labelkit.common.contracts.types import (
 from labelkit.operators.verify import (
     _DEFAULT_FAIL_DEFECT,
     DEFECT_KINDS,
+    VerifyPromptOptions,
     VerifyStage,
+    _VerdictEvent,
     _classify_error,
     boundary_margin_text,
     build_verify_prompt,
@@ -368,7 +370,9 @@ def _emit(*, enabled=True, content="refs", verdict="pass", judge=None, text="hel
     metrics = _CapturingMetrics()
     ctx = SimpleNamespace(cfg=cfg, metrics=metrics, batch_no=3)
     rec = _record(text=text)
-    VerifyStage(cfg)._emit_verdict_event(rec, verdict, 1, [C1], judge, ctx)
+    VerifyStage(cfg)._emit_verdict_event(
+        _VerdictEvent(record=rec, verdict=verdict, round_no=1, critiques=[C1],
+                      judge=judge), ctx)
     (event,) = metrics.events
     return rec, event
 
@@ -459,8 +463,7 @@ def test_multi_judge_schema_violation_preserves_majority():
     ann = _annotation()
 
     call_idx = [0]  # mutable counter for closure
-    async def mock_complete_validated(judge, prompt, *, schema, record_ids,
-                                      batch_no):
+    async def mock_complete_validated(judge, prompt, *, schema, scope):
         idx = call_idx[0]
         call_idx[0] += 1
         if idx == 1:  # judge 2 (j2) raises SchemaViolation
@@ -525,8 +528,7 @@ def test_single_judge_schema_violation_propagates_to_classify():
     rec = _record(text="你好")
     ann = _annotation()
 
-    async def mock_complete_validated(judge, prompt, *, schema, record_ids,
-                                      batch_no):
+    async def mock_complete_validated(judge, prompt, *, schema, scope):
         raise SchemaViolation(["违反 schema 约束"], '{"raw": "bad"}')
 
     class MockEngine:
@@ -579,7 +581,7 @@ def _classified_cfg(*, policy="drop", max_repair_rounds=1) -> ResolvedConfig:
 def test_verify_prompt_label_takes_class_effective_values():
     cfg = _classified_cfg()
     bundle = build_verify_prompt(_record(text="写一首诗"), {"intent": "写作"}, cfg,
-                                 label="writing")
+                                 VerifyPromptOptions(label="writing"))
     assert bundle.messages[0].parts[0].text == (
         "你是标注质量审核员。给定任务指令、原始数据与标注结果，独立判断标注是否合格。\n"
         "评审维度: ① 是否遵循任务指令 ② 与原始数据的事实一致性 ③ 字段语义是否正确填写\n"
@@ -602,7 +604,7 @@ def test_verify_prompt_label_none_falls_back_to_global():
     assert bundle.messages[1].parts[0].text.startswith("[任务指令] 给指令分类。\n")
     # zero-override view behaves exactly like the global config
     qa_bundle = build_verify_prompt(_record(text="hello"), {"intent": "x"}, cfg,
-                                    label="qa")
+                                    VerifyPromptOptions(label="qa"))
     assert qa_bundle == bundle
 
 
@@ -619,7 +621,8 @@ def test_verify_prompt_ui_branch_head_uses_class_instruction():
                  image=ImageRef(path=Path("image_1.png"), format="png", size_bytes=1),
                  ref=RecordRef("a/uitree_1.jsonl", None, 1, ()))
     cfg = _classified_cfg()
-    bundle = build_verify_prompt(rec, {"intent": "x"}, cfg, label="writing")
+    bundle = build_verify_prompt(rec, {"intent": "x"}, cfg,
+                                 VerifyPromptOptions(label="writing"))
     assert CLASS_EXTRA in bundle.messages[0].parts[0].text
     head = bundle.messages[1].parts[0].text
     assert head == f"[任务指令] {CLASS_INSTRUCTION}\n[原始数据]\n[屏幕截图]"
@@ -630,8 +633,9 @@ def test_verdict_event_label_only_when_classify_enabled():
     cfg = trace_cfg()
     metrics = _CapturingMetrics()
     ctx = SimpleNamespace(cfg=cfg, metrics=metrics, batch_no=1)
-    VerifyStage(cfg)._emit_verdict_event(_record(), "pass", 1, [C1], None, ctx,
-                                         label="writing")
+    VerifyStage(cfg)._emit_verdict_event(
+        _VerdictEvent(record=_record(), verdict="pass", round_no=1, critiques=[C1],
+                      judge=None, label="writing"), ctx)
     (_, _, _, _, payload) = metrics.events[0]
     assert "label" not in payload
 
@@ -639,8 +643,9 @@ def test_verdict_event_label_only_when_classify_enabled():
     cfg2 = _classified_cfg()
     metrics2 = _CapturingMetrics()
     ctx2 = SimpleNamespace(cfg=cfg2, metrics=metrics2, batch_no=1)
-    VerifyStage(cfg2)._emit_verdict_event(_record(), "pass", 1, [C1], None, ctx2,
-                                          label="writing")
+    VerifyStage(cfg2)._emit_verdict_event(
+        _VerdictEvent(record=_record(), verdict="pass", round_no=1, critiques=[C1],
+                      judge=None, label="writing"), ctx2)
     (_, _, _, _, payload2) = metrics2.events[0]
     assert payload2["label"] == "writing"
 
@@ -664,7 +669,7 @@ def test_verify_item_threads_label_through_judges_and_repair(monkeypatch):
         {"verdict": "pass", "critiques": [{"aspect": "字段语义", "opinion": "已修正"}]},
     ])
 
-    async def mock_complete_validated(judge, prompt, *, schema, record_ids, batch_no):
+    async def mock_complete_validated(judge, prompt, *, schema, scope):
         prompts.append(prompt)
         return (next(script), Usage(1, 1), 1, "m")
 
@@ -672,9 +677,9 @@ def test_verify_item_threads_label_through_judges_and_repair(monkeypatch):
 
     captured = {}
 
-    async def fake_annotate_record(record, ctx, repair=None, label=None):
-        captured["label"] = label
-        captured["repair"] = repair
+    async def fake_annotate_record(record, ctx, opts=None):
+        captured["label"] = opts.label
+        captured["repair"] = opts.repair
         return _annotation({"intent": "修正后"})
 
     monkeypatch.setattr("labelkit.operators.annotate.annotate_record", fake_annotate_record)
@@ -793,8 +798,8 @@ class SeqJudgeEngine:
         self.scripts = {k: list(v) for k, v in scripts.items()}
         self.calls: list = []              # (profile, prompt, schema, record_ids)
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0, record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
         out = self.scripts[record_ids[0]].pop(0)
         if isinstance(out, Exception):
@@ -831,11 +836,11 @@ def _stub_extract(monkeypatch):
 def _stub_annotate(monkeypatch, output=None):
     calls = []
 
-    async def fake(record, ctx, repair=None, label=None, transitions=None,
-                   fragment_lens=None):                # v1.9 third kwarg (T14)
-        calls.append(SimpleNamespace(record=record, repair=repair, label=label,
-                                     transitions=transitions,
-                                     fragment_lens=fragment_lens))
+    async def fake(record, ctx, opts=None):        # v1.9 逐片段配额（T14）随 opts 到
+        calls.append(SimpleNamespace(record=record, repair=opts.repair,
+                                     label=opts.label,
+                                     transitions=opts.transitions,
+                                     fragment_lens=opts.fragment_lens))
         return _annotation(output or {"task_label": "修正"})
 
     monkeypatch.setattr("labelkit.operators.annotate.annotate_record", fake)
@@ -890,8 +895,9 @@ def test_sequence_prompt_six_section_order_with_transitions():
                    _transition(1, action_type="scroll", target=None,
                                value="down", description="向下滚动"))
     margin = "段首前 2: 无\n段首前 1: 无\n段尾后 1: 无\n段尾后 2: 无"
-    bundle = build_verify_prompt(episode.record, {"task_label": "外卖"}, cfg,
-                                 transitions=transitions, boundary_margin=margin)
+    bundle = build_verify_prompt(
+        episode.record, {"task_label": "外卖"}, cfg,
+        VerifyPromptOptions(transitions=transitions, boundary_margin=margin))
     assert bundle.messages[0].parts[0].text == verify_sequence_system_text("")
     parts = bundle.messages[1].parts
     assert [p.kind for p in parts] == [
@@ -911,8 +917,9 @@ def test_sequence_prompt_six_section_order_with_transitions():
 def test_sequence_prompt_action_section_omitted_when_transitions_none():
     cfg = _stream_cfg()
     episode = _episode([_frame("f0"), _frame("f1")])
-    bundle = build_verify_prompt(episode.record, {"task_label": "外卖"}, cfg,
-                                 transitions=None, boundary_margin="段首前 2: 无")
+    bundle = build_verify_prompt(
+        episode.record, {"task_label": "外卖"}, cfg,
+        VerifyPromptOptions(transitions=None, boundary_margin="段首前 2: 无"))
     parts = bundle.messages[1].parts
     assert [p.kind for p in parts] == [
         "text", "text", "text", "image", "text", "image", "text"]
@@ -985,19 +992,21 @@ def test_sequence_prompt_seven_sections_with_fragment_structure():
     m0, m1 = _frame("f0"), _frame("f1")
     episode = _episode([m0, m1])
     structure = "碎片 1/1: 成员 0–1（2 帧）｜首帧摘要: x\n接缝位置: 无"
-    bundle = build_verify_prompt(episode.record, {"task_label": "外卖"}, cfg,
-                                 transitions=(_transition(0),),
-                                 boundary_margin="段首前 2: 无",
-                                 fragment_structure=structure)
+    bundle = build_verify_prompt(
+        episode.record, {"task_label": "外卖"}, cfg,
+        VerifyPromptOptions(transitions=(_transition(0),),
+                            boundary_margin="段首前 2: 无",
+                            fragment_structure=structure))
     parts = bundle.messages[1].parts
     assert [p.kind for p in parts] == [
         "text", "text", "text", "text", "text", "image", "text", "image", "text"]
     assert parts[1].text.startswith("[动作序列]\n")
     assert parts[2].text == f"[片段结构]\n{structure}"
     assert parts[3].text.startswith("[边界余量]\n")
-    six = build_verify_prompt(episode.record, {"task_label": "外卖"}, cfg,
-                              transitions=(_transition(0),),
-                              boundary_margin="段首前 2: 无")
+    six = build_verify_prompt(
+        episode.record, {"task_label": "外卖"}, cfg,
+        VerifyPromptOptions(transitions=(_transition(0),),
+                            boundary_margin="段首前 2: 无"))
     assert all("[片段结构]" not in p.text for p in six.messages[1].parts
                if p.kind == "text")
 
@@ -1464,6 +1473,151 @@ def test_no_candidate_anywhere_marks_capture_gap(monkeypatch):
     assert metrics.counters["verify.boundary_flags"] == 1
 
 
+# ── missing_members: the INTERIOR reclaim scan (_interior_claim) ────────────
+
+def _noise_env(record, *, sid="s1", stage="segment", reason="noise"):
+    """段内噪声池里的一帧（可回收候选的默认形态）。
+
+    @param record 帧记录
+    @param sid 会话 id
+    @param stage 噪声归因阶段（"verify" = 自弃帧，永不回收）
+    @param reason 噪声归因原因
+    @return dropped_noise 状态的帧信封
+    """
+    env = _env(record, sid=sid, status="dropped_noise")
+    env.noise_attribution = (stage, reason)
+    return env
+
+
+def test_missing_members_interior_reclaim_claims_the_first_qualifying_frame(
+        monkeypatch):
+    # spec 3.7.3 回收三级判定的 missing_members 支：候选取「段首末成员之间」的首个
+    # 内部噪声帧；复裁窗为 §3.7.3② 静态保证的固定三帧 [前成员, 候选, 后成员]。
+    cfg = _stream_cfg(extract_enabled=False)
+    jw_calls = _stub_judge_window(monkeypatch, relation="continues")
+    annotate_calls = _stub_annotate(monkeypatch)
+    f0, f1, fn, f2, f3 = (_frame("f0"), _frame("f1"), _frame("fn"),
+                          _frame("f2"), _frame("f3"))
+    en = _noise_env(fn)                                # 段内部的可回收噪声帧
+    ep = _episode([f0, f1, f2, f3])                    # 四个成员夹住 fn
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_members")]),
+        _seq_obj("pass"),
+    ]})
+    metrics = _run_verify(
+        cfg, [_env(f0), _env(f1), en, _env(f2), _env(f3), ep], engine)
+
+    # 复裁窗恒为三帧、且取候选的**紧邻**成员（不是段首末）
+    assert jw_calls == [["f1", "fn", "f2"]]
+    assert en.status == "absorbed"                     # dropped_noise → absorbed
+    assert [m.id for m in ep.record.members] == ["f0", "f1", "fn", "f2", "f3"]
+    assert ep.stream_repaired is True
+    assert len(annotate_calls) == 1
+    assert ep.status == "active"
+    assert (ep.verification.verdict, ep.verification.rounds) == ("pass", 2)
+    assert metrics.counters["verify.membership_repairs"] == 1
+    assert "verify.boundary_flags" not in metrics.counters
+
+
+def test_missing_members_interior_named_filter_skips_unnamed_frames(monkeypatch):
+    # defect.members 点名时，内部扫描只回收被点名的帧——未点名的可回收帧原样留在
+    # 噪声池（judge 的指认是收窄条件，不是提示）。
+    cfg = _stream_cfg(extract_enabled=False)
+    jw_calls = _stub_judge_window(monkeypatch, relation="advances")
+    _stub_annotate(monkeypatch)
+    f0, f1, f2, f3 = _frame("f0"), _frame("f1"), _frame("f2"), _frame("f3")
+    e1, e2 = _noise_env(f1), _noise_env(f2)            # 两个都可回收
+    ep = _episode([f0, f3])
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_members", members=["f2"])]),
+        _seq_obj("pass"),
+    ]})
+    metrics = _run_verify(cfg, [_env(f0), e1, e2, _env(f3), ep], engine)
+
+    assert jw_calls == [["f0", "f2", "f3"]]            # 跳过未点名的 f1
+    assert e1.status == "dropped_noise"                # 未点名 ⇒ 不动
+    assert e2.status == "absorbed"
+    assert [m.id for m in ep.record.members] == ["f0", "f2", "f3"]
+    assert metrics.counters["verify.membership_repairs"] == 1
+
+
+def test_missing_members_interior_contention_marks_neighbor(monkeypatch):
+    # 二级判定：段内部的唯一候选已被本轮更早的 episode（批位序在先）预定 ⇒ 标
+    # "neighbor"（只计 boundary_flags），绝不标 suspected="capture_gap"——帧确实
+    # 存在，只是被邻段拿走了（D5）。
+    cfg = _stream_cfg(extract_enabled=False)
+    jw_calls = _stub_judge_window(monkeypatch, relation="continues")
+    _stub_annotate(monkeypatch)
+    f0, f1, fn, f2, f3 = (_frame("f0"), _frame("f1"), _frame("fn"),
+                          _frame("f2"), _frame("f3"))
+    en = _noise_env(fn)                                # 被两段同时觊觎的噪声帧
+    early = _episode([f1, f2], eid="a" * 16)           # 位序 1..3，内部含 fn(2)
+    late = _episode([f0, f3], eid="b" * 16)            # 位序 0..4，内部也含 fn
+    batch = [_env(f0), _env(f1), en, _env(f2), _env(f3), early, late]
+    engine = SeqJudgeEngine({
+        early.record.id: [_seq_obj("fail", defects=[_defect("missing_members")]),
+                          _seq_obj("pass")],
+        late.record.id: [_seq_obj("fail", defects=[_defect("missing_members")])],
+    })
+    metrics = _run_verify(cfg, batch, engine)
+
+    assert jw_calls == [["f1", "fn", "f2"]]            # 只有 early 复裁了一次
+    assert en.status == "absorbed"
+    assert [m.id for m in early.record.members] == ["f1", "fn", "f2"]
+    assert early.status == "active"
+    # late 输掉争用：仅标记，缺陷条目上没有 suspected 键
+    assert [m.id for m in late.record.members] == ["f0", "f3"]
+    assert late.status == "dropped_verify"
+    (d,) = late.verification.defects
+    assert d["kind"] == "missing_members" and "suspected" not in d
+    assert metrics.counters["verify.boundary_flags"] == 1
+    assert metrics.counters["verify.membership_repairs"] == 1
+
+
+def test_missing_members_interior_without_candidates_returns_none(monkeypatch):
+    # 三级判定：段内部无任何可回收候选（中间那帧是 verify 自己弃掉的，收缩↔回收
+    # 乒乓护栏）⇒ 无处可寻 ⇒ 缺陷条目增 suspected="capture_gap"。
+    cfg = _stream_cfg(extract_enabled=False)
+    jw_calls = _stub_judge_window(monkeypatch)
+    _stub_annotate(monkeypatch)
+    f0, f1, f2 = _frame("f0"), _frame("f1"), _frame("f2")
+    e1 = _noise_env(f1, stage="verify", reason="off_task_member")
+    ep = _episode([f0, f2])
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_members")]),
+    ]})
+    metrics = _run_verify(cfg, [_env(f0), e1, _env(f2), ep], engine)
+
+    assert jw_calls == []                              # 无候选 ⇒ 零复裁调用
+    assert e1.status == "dropped_noise"
+    assert [m.id for m in ep.record.members] == ["f0", "f2"]
+    (d,) = ep.verification.defects
+    assert d["suspected"] == "capture_gap"
+    assert metrics.counters["verify.boundary_flags"] == 1
+    assert "verify.membership_repairs" not in metrics.counters
+
+
+def test_missing_members_with_a_single_member_has_no_interior(monkeypatch):
+    # 边界形态：段只有一个成员 ⇒ head == tail ⇒ 内部扫描区间为空，即便相邻位置
+    # 存在可回收噪声帧也不越界回收（missing_members 只管段内部，边缘归 _edge_claim）。
+    cfg = _stream_cfg(extract_enabled=False)
+    jw_calls = _stub_judge_window(monkeypatch, relation="continues")
+    _stub_annotate(monkeypatch)
+    f0, f1 = _frame("f0"), _frame("f1")
+    e1 = _noise_env(f1)
+    ep = _episode([f0])
+    engine = SeqJudgeEngine({ep.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_members")]),
+    ]})
+    metrics = _run_verify(cfg, [_env(f0), e1, ep], engine)
+
+    assert jw_calls == []
+    assert e1.status == "dropped_noise"
+    (d,) = ep.verification.defects
+    assert d["suspected"] == "capture_gap"
+    assert metrics.counters["verify.boundary_flags"] == 1
+
+
 def test_verify_dropped_frames_never_reclaimed(monkeypatch):
     """The shrink↔reclaim ping-pong guard: a frame verify itself dropped
     (attribution stage 'verify') is not a candidate — capture_gap instead."""
@@ -1698,7 +1852,8 @@ def test_build_verify_prompt_ui_tree_dynamic_cap_and_frozen_off_path():
     rec = _ui_single_record()
     cfg = trace_cfg(enabled=False)
     fit = _PromptFit(input_budget=900, image_cost=100)
-    bundle = build_verify_prompt(rec, {"intent": "x"}, cfg, fit=fit)
+    bundle = build_verify_prompt(rec, {"intent": "x"}, cfg,
+                                 VerifyPromptOptions(fit=fit))
     assert not fit.overflow and fit.truncations == 1
     tail = bundle.messages[1].parts[2].text
     tree_lines = tail.split("\n")
@@ -1707,12 +1862,14 @@ def test_build_verify_prompt_ui_tree_dynamic_cap_and_frozen_off_path():
     assert marker_lines                                    # §3.3③ marker in place
     assert tree_lines[-1].startswith("[标注结果] ")         # V25③ JSON kept verbatim
     # deterministic rerun
-    again = build_verify_prompt(rec, {"intent": "x"}, cfg,
-                                fit=_PromptFit(input_budget=900, image_cost=100))
+    again = build_verify_prompt(
+        rec, {"intent": "x"}, cfg,
+        VerifyPromptOptions(fit=_PromptFit(input_budget=900, image_cost=100)))
     assert again == bundle
     # fit=None (budget off) is byte-identical to the pre-v1.11 build
     plain = build_verify_prompt(rec, {"intent": "x"}, cfg)
-    assert plain == build_verify_prompt(rec, {"intent": "x"}, cfg, fit=None)
+    assert plain == build_verify_prompt(rec, {"intent": "x"}, cfg,
+                                        VerifyPromptOptions(fit=None))
     assert rec.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars) in \
         plain.messages[1].parts[2].text
 
@@ -1724,9 +1881,10 @@ def test_sequence_step_block_edges_trim_annotation_json_counted_not_trimmed():
     steps = tuple(_transition(i, description="步" + "很" * 40 + str(i))
                   for i in range(12))
     fit = _PromptFit(input_budget=800, image_cost=50)
-    bundle = build_verify_prompt(ep.record, {"task_label": "外卖"}, cfg,
-                                 transitions=steps, boundary_margin="段首前 1: 无",
-                                 fit=fit)
+    bundle = build_verify_prompt(
+        ep.record, {"task_label": "外卖"}, cfg,
+        VerifyPromptOptions(transitions=steps, boundary_margin="段首前 1: 无",
+                            fit=fit))
     assert not fit.overflow and fit.truncations == 1
     parts = bundle.messages[1].parts
     steps_part = next(p.text for p in parts if (p.text or "").startswith("[动作序列]"))
@@ -1819,12 +1977,12 @@ def _stub_annotate_v21(monkeypatch, output=None):
     """The _stub_annotate pattern extended with the v1.11 trailing kwargs."""
     calls = []
 
-    async def fake(record, ctx, repair=None, label=None, transitions=None,
-                   fragment_lens=None, k_eff=None, image_px=None):
-        calls.append(SimpleNamespace(record=record, repair=repair, label=label,
-                                     transitions=transitions,
-                                     fragment_lens=fragment_lens,
-                                     k_eff=k_eff, image_px=image_px))
+    async def fake(record, ctx, opts=None):
+        calls.append(SimpleNamespace(record=record, repair=opts.repair,
+                                     label=opts.label,
+                                     transitions=opts.transitions,
+                                     fragment_lens=opts.fragment_lens,
+                                     k_eff=opts.k_eff, image_px=opts.image_px))
         return _annotation(output or {"task_label": "修正"})
 
     monkeypatch.setattr("labelkit.operators.annotate.annotate_record", fake)
@@ -1836,15 +1994,16 @@ def test_repair_ladder_math_px_rung_and_gates():
     stage = VerifyStage(cfg)
     f0 = _frame("f0")
     ep = _episode([f0])
-    from labelkit.operators.annotate import RepairContext
+    from labelkit.operators.annotate import AnnotatePromptOptions, RepairContext
     repair = RepairContext(previous_output={"task_label": "旧"}, critiques_text="c")
+    base = AnnotatePromptOptions(repair=repair)
     engine = SimpleNamespace(user_schema_text="{}")
     metrics = _CapturingMetrics()
     ctx = SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(100)),
                           schema_engine=engine, metrics=metrics, batch_no=1)
-    kwargs = stage._repair_ladder(ep, ctx, repair, None, None)
-    assert kwargs["k_eff"] == 10                   # max(2, ceil(20/2))
-    assert kwargs["image_px"] == 1536              # 1024 × 1.5, under the cap
+    opts = stage._repair_ladder(ep, ctx, base)
+    assert opts.k_eff == 10                        # max(2, ceil(20/2))
+    assert opts.image_px == 1536                   # 1024 × 1.5, under the cap
     assert metrics.counters["budget.escalations"] == 1
 
     # cap: default_px 1600 × 1.5 = 2400 → clamped to max_image_px 2048
@@ -1852,23 +2011,22 @@ def test_repair_ladder_math_px_rung_and_gates():
     metrics2 = _CapturingMetrics()
     ctx2 = SimpleNamespace(cfg=cfg2, llm=SimpleNamespace(calibrator=_FixedCalibrator(100)),
                            schema_engine=engine, metrics=metrics2, batch_no=1)
-    assert VerifyStage(cfg2)._repair_ladder(ep, ctx2, repair, None, None)[
-        "image_px"] == 2048
+    assert VerifyStage(cfg2)._repair_ladder(ep, ctx2, base).image_px == 2048
 
     # default_image_px == 0: the working point IS max_image_px — no rung exists
     cfg3 = _ladder_cfg(default_px=0)
     metrics3 = _CapturingMetrics()
     ctx3 = SimpleNamespace(cfg=cfg3, llm=SimpleNamespace(calibrator=_FixedCalibrator(100)),
                            schema_engine=engine, metrics=metrics3, batch_no=1)
-    kwargs3 = VerifyStage(cfg3)._repair_ladder(ep, ctx3, repair, None, None)
-    assert kwargs3 == {"k_eff": 10}                # k halving stands alone
+    opts3 = VerifyStage(cfg3)._repair_ladder(ep, ctx3, base)
+    assert (opts3.k_eff, opts3.image_px) == (10, None)   # k halving stands alone
     assert "budget.escalations" not in metrics3.counters
 
-    # budget off (annotate cw == 0): the ladder is dead code — empty kwargs
+    # budget off (annotate cw == 0): the ladder is dead code — opts pass through
     cfg4 = replace(_ladder_cfg(),
                    llm_profiles={"default": _budget_profile("default", 0),
                                  "judge": _budget_profile("judge", 0)})
-    assert VerifyStage(cfg4)._repair_ladder(ep, ctx, repair, None, None) == {}
+    assert VerifyStage(cfg4)._repair_ladder(ep, ctx, base) is base
 
 
 def test_repair_ladder_escalation_dropped_when_budget_refuses():
@@ -1877,14 +2035,14 @@ def test_repair_ladder_escalation_dropped_when_budget_refuses():
     cfg = _ladder_cfg(annotate_cw=2048)            # tight window
     stage = VerifyStage(cfg)
     ep = _episode([_frame("f0"), _frame("f1")])
-    from labelkit.operators.annotate import RepairContext
+    from labelkit.operators.annotate import AnnotatePromptOptions, RepairContext
     repair = RepairContext(previous_output={"task_label": "旧"}, critiques_text="c")
     metrics = _CapturingMetrics()
     ctx = SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(800)),
                           schema_engine=SimpleNamespace(user_schema_text="{}"),
                           metrics=metrics, batch_no=1)
-    kwargs = stage._repair_ladder(ep, ctx, repair, None, None)
-    assert kwargs == {"k_eff": 10}
+    opts = stage._repair_ladder(ep, ctx, AnnotatePromptOptions(repair=repair))
+    assert (opts.k_eff, opts.image_px) == (10, None)
     assert "budget.escalations" not in metrics.counters
 
 
@@ -2242,14 +2400,15 @@ def _class_schema_cfg(*, structured: bool, annotate_cw: int) -> ResolvedConfig:
                    class_views=views)
 
 
-def _ladder_kwargs(cfg, label, metrics):
+def _ladder_opts(cfg, label, metrics):
     """跑一次 V21 换档决策（零 LLM：试装只做估算，不发请求）。"""
-    from labelkit.operators.annotate import RepairContext
+    from labelkit.operators.annotate import AnnotatePromptOptions, RepairContext
 
     repair = RepairContext(previous_output={"task_label": "旧"}, critiques_text="c")
     ctx = _ladder_ctx(cfg, SimpleNamespace(user_schema_text="{}"), metrics)
-    return VerifyStage(cfg)._repair_ladder(_episode([_frame("f0")]), ctx,
-                                           repair, label, None)
+    return VerifyStage(cfg)._repair_ladder(
+        _episode([_frame("f0")]), ctx,
+        AnnotatePromptOptions(repair=repair, label=label))
 
 
 def test_repair_ladder_trial_uses_class_schema_text():
@@ -2258,28 +2417,30 @@ def test_repair_ladder_trial_uses_class_schema_text():
     # 零覆盖类沿用 M8 既有 user_schema_text ⇒ 升清照常。
     cfg = _class_schema_cfg(structured=False, annotate_cw=20_000)
     metrics = _CapturingMetrics()
-    assert _ladder_kwargs(cfg, "big", metrics) == {"k_eff": 10}
+    big = _ladder_opts(cfg, "big", metrics)
+    assert (big.k_eff, big.image_px) == (10, None)
     assert "budget.escalations" not in metrics.counters
 
     plain_metrics = _CapturingMetrics()
-    assert _ladder_kwargs(cfg, "plain", plain_metrics)["image_px"] == 1536
+    assert _ladder_opts(cfg, "plain", plain_metrics).image_px == 1536
     assert plain_metrics.counters["budget.escalations"] == 1
 
 
 def test_repair_ladder_prices_class_effective_schema():
     # 宽窗口下按类 Schema 文本单独放得进（对照组：结构化输出关 ⇒ 升清照常）。
     control = _class_schema_cfg(structured=False, annotate_cw=30_000)
-    assert _ladder_kwargs(control, "big", _CapturingMetrics())["image_px"] == 1536
+    assert _ladder_opts(control, "big", _CapturingMetrics()).image_px == 1536
 
     # 结构化输出开 ⇒ schema_eff 再计一份类有效 Schema ⇒ 越预算，升清被否决。
     cfg = _class_schema_cfg(structured=True, annotate_cw=30_000)
     metrics = _CapturingMetrics()
-    assert _ladder_kwargs(cfg, "big", metrics) == {"k_eff": 10}
+    big = _ladder_opts(cfg, "big", metrics)
+    assert (big.k_eff, big.image_px) == (10, None)
     assert "budget.escalations" not in metrics.counters
 
     # 同一 cfg 的零覆盖类按全局 user_schema 计价 ⇒ 升清照常（计价确按类取值）。
     plain_metrics = _CapturingMetrics()
-    assert _ladder_kwargs(cfg, "plain", plain_metrics)["image_px"] == 1536
+    assert _ladder_opts(cfg, "plain", plain_metrics).image_px == 1536
     assert plain_metrics.counters["budget.escalations"] == 1
 
 
@@ -2339,7 +2500,7 @@ def test_verdict_form_prompt_sections_and_member_digests():
     cfg = _verdict_cfg()
     record = _assembled_sequence(3)
     bundle = build_verify_prompt(record, {"intent": "问答"}, cfg,
-                                 verdict_form=True)
+                                 VerifyPromptOptions(verdict_form=True))
     assert len(bundle.messages) == 2
     system_text = bundle.messages[0].parts[0].text
     assert system_text == verify_verdict_sequence_system_text("")
@@ -2359,8 +2520,9 @@ def test_verdict_form_prompt_sections_and_member_digests():
 
 def test_verdict_form_uses_class_effective_instruction_and_criteria():
     cfg = _verdict_cfg(with_views=True)
-    bundle = build_verify_prompt(_assembled_sequence(), {"intent": "x"}, cfg,
-                                 label="faq", verdict_form=True)
+    bundle = build_verify_prompt(
+        _assembled_sequence(), {"intent": "x"}, cfg,
+        VerifyPromptOptions(label="faq", verdict_form=True))
     system_text = bundle.messages[0].parts[0].text
     assert "④ 序列连贯性" in system_text
     assert bundle.messages[1].parts[0].text == "[任务指令] 按类标注 faq。"
@@ -2372,7 +2534,7 @@ def test_verdict_form_off_keeps_defect_variant_byte_identical():
     cfg = _verdict_cfg()
     record = _assembled_sequence()
     bundle = build_verify_prompt(record, {"intent": "x"}, cfg,
-                                 boundary_margin="段首前 1: 无")
+                                 VerifyPromptOptions(boundary_margin="段首前 1: 无"))
     system_text = bundle.messages[0].parts[0].text
     assert "缺陷类型" in system_text
     assert any("[边界余量]" in (p.text or "")
@@ -2386,8 +2548,8 @@ class _VerdictEngine:
         self.scripts = {k: list(v) for k, v in scripts.items()}
         self.calls: list = []              # (profile, prompt, schema, record_ids)
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids=(), batch_no=0, record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
         out = self.scripts[record_ids[0]].pop(0)
         if isinstance(out, Exception):

@@ -75,11 +75,11 @@ uv run labelkit run --config ../config.toml --project project.toml
 stderr 尾部（真实运行，退出码 0，全程约 248 秒）：
 
 ```
-2026-07-23T04:50:32+08:00 INFO  emitter batch=1 批 1 落盘：主输出 +8 行（累计 8），rejects +9（累计 9）
+2026-07-23T04:50:32+08:00 INFO  emitter batch=1 batch 1 flushed: main output +8 line(s) (total 8), rejects +9 (total 9)
 2026-07-23T04:50:32+08:00 INFO  run     batch=1 batch.end active=8 dropped_dup=0 dropped_lowq=0 dropped_verify=0 failed=1 duration_ms=248093 fanout=0 episodes=13 absorbed=45 dropped_noise=8 stitched=4 threads=9
-2026-07-23T04:50:32+08:00 INFO  emitter batch=- finalize：fsync + rename  out/stream-labels.jsonl.part → out/stream-labels.jsonl（8 行）
-2026-07-23T04:50:32+08:00 INFO  emitter batch=- 已写出 out/stream-labels.rejects.jsonl（9 行）与 out/stream-labels.report.json
-   ── 终版摘要（与 report.counts 逐项一致）──
+2026-07-23T04:50:32+08:00 INFO  emitter batch=- finalize: fsync + rename  out/stream-labels.jsonl.part -> out/stream-labels.jsonl (8 lines)
+2026-07-23T04:50:32+08:00 INFO  emitter batch=- wrote out/stream-labels.rejects.jsonl (9 lines) and out/stream-labels.report.json
+   ── final summary (matches report.counts item by item) ──
    scanned=53  ingested=53  bad_input=0  generated=0
    dropped_dup=0  dropped_lowq=0  dropped_verify=0  failed=1  emitted=8
 2026-07-23T04:50:32+08:00 INFO  run     batch=0 run.end exit_code=0
@@ -288,8 +288,8 @@ extra_criteria = "补充审核约定：动作序列恒为 成员帧数−1 步�
 ```
 dry-run: mode=process estimated_records=53 batches=1
 dry-run: estimated LLM calls — generate_calls=0 segment_calls=5 stitch_calls=10 classify_calls=5 frame_classify_calls=0 extract_calls=48 quality_calls=20 annotate_calls=5 frame_annotate_calls=0 verify_calls=5 total=98 (excludes retries and repair calls)
-dry-run: 注：按全局配置估算 / multi 按标签乘数 1 报下界
-dry-run: 注：stream 估算：下游按 episodes≈sessions 报下界（LLM 精化只增段数）
+dry-run: note: estimated with global config / multi reports a lower bound at label multiplier 1
+dry-run: note: stream estimate: downstream reports a lower bound at episodes≈sessions (LLM refinement only adds segments)
 dry-run: no LLM calls made, no output written (report and trace only)
 ```
 

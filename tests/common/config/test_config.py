@@ -241,21 +241,21 @@ def test_schema_version_wrong_and_missing(env):
     bad_config = BASE_CONFIG.replace("schema_version = 1", "schema_version = 2")
     project = env.project().replace("schema_version = 1\n", "")
     errors = env.errors(config_text=bad_config, project_text=project)
-    has(errors, "config.toml:schema_version: 期望 1，得到 2")
-    has(errors, "project.toml:schema_version: 缺失必填键，期望 1")
+    has(errors, "config.toml:schema_version: expected 1, got 2")
+    has(errors, "project.toml:schema_version: missing required key, expected 1")
 
 
 def test_type_mismatch_message_format(env):
     bad = BASE_CONFIG.replace('api_key_env = "LK_TEST_KEY_DEFAULT"',
                               'api_key_env = "LK_TEST_KEY_DEFAULT"\ntimeout_s = "abc"')
     errors = env.errors(config_text=bad)
-    has(errors, '[llm.default].timeout_s: 期望正整数，得到 "abc"')
+    has(errors, '[llm.default].timeout_s: expected positive integer, got "abc"')
 
 
 def test_missing_required_profile_key(env):
     bad = BASE_CONFIG.replace('model = "main-model"\n', "")
     errors = env.errors(config_text=bad)
-    has(errors, "[llm.default].model: 缺失必填键")
+    has(errors, "[llm.default].model: missing required key")
 
 
 def test_unknown_keys_warn_not_error(env, capsys):
@@ -265,25 +265,176 @@ def test_unknown_keys_warn_not_error(env, capsys):
     assert isinstance(cfg, ResolvedConfig)
     err_out = capsys.readouterr().err
     assert "warning:" in err_out
-    assert "[tool].fancy_new_key: 未知键" in err_out
-    assert "[run].future_flag: 未知键" in err_out
+    assert "[tool].fancy_new_key: unknown key" in err_out
+    assert "[run].future_flag: unknown key" in err_out
 
 
 def test_config_file_missing(env):
     with pytest.raises(ConfigError) as ei:
         load(env.tmp / "nope.toml", env.tmp / "also_nope.toml", CliOverrides())
     joined = "\n".join(ei.value.errors)
-    assert "无法读取配置文件" in joined
+    assert "cannot read config file" in joined
 
 
 def test_toml_parse_failure(env):
     errors = env.errors(config_text="schema_version = [oops")
-    has(errors, "TOML 解析失败")
+    has(errors, "TOML parse failed")
 
 
 def test_no_llm_profile(env):
     errors = env.errors(config_text='schema_version = 1\n[tool]\nlog_level = "info"\n')
-    has(errors, "至少需要 1 个 [llm.<name>] profile")
+    has(errors, "at least one [llm.<name>] profile is required")
+
+
+# ── §3.1.5 类型化读取器：逐形态的定位前缀与 got 渲染 ────────────────────────
+
+
+def test_scalar_type_mismatch_per_reader_kind(env):
+    # 四种标量读取器各一条：字符串（枚举期望渲染成候选串）/ 整数 / 数值 / 布尔。
+    project = env.project(run_extra="mode = 3\nseed = false",
+                          body='[dedup]\nminhash_threshold = "high"\n'
+                               '[quality]\nenabled = "yes"\n')
+    errors = env.errors(project_text=project)
+    has(errors, '[run].mode: expected "process" | "generate_only", got 3')
+    has(errors, "[run].seed: expected integer, got false")
+    has(errors, '[dedup].minhash_threshold: expected number in (0,1], got "high"')
+    has(errors, '[quality].enabled: expected boolean, got "yes"')
+
+
+def test_array_readers_report_the_offending_element_position(env):
+    # 数组读取器逐元素定位（`key[N]`，N 从 1 起）：字符串数组的非串元素 / 枚举外
+    # 元素 / 数值数组的非数值元素，外加"整个值根本不是数组"的上层形态。
+    project = env.project(body='[quality]\njudges = ["judge", 7, "judge"]\n'
+                               '[trace]\nenabled = true\nchannels = ["llm", "ghost"]\n'
+                               '[generate]\nenabled = true\ninstruction = "生成"\n'
+                               'weights = [1.0, "x"]\n'
+                               '[stream]\nkey = "meta:uid"\n')
+    errors = env.errors(project_text=project)
+    has(errors, "[quality].judges[2]: expected string, got 7")
+    has(errors, '[trace].channels[2]: expected "ingest" | ')
+    has(errors, '[trace].channels[2]: expected ')
+    has(errors, 'got "ghost"')
+    has(errors, '[generate].weights[2]: expected number, got "x"')
+    has(errors, '[stream].key: expected string array, got "meta:uid"')
+
+
+def test_whole_array_type_mismatch_falls_back_to_the_default(env):
+    project = env.project(body='[generate]\nenabled = true\ninstruction = "生成"\n'
+                               "weights = 3\n")
+    errors = env.errors(project_text=project)
+    has(errors, "[generate].weights: expected number array, got 3")
+
+
+def test_top_level_section_must_be_a_table(env):
+    errors = env.errors(project_text="dedup = 3\n" + env.project())
+    has(errors, "project.toml:dedup: expected table, got 3")
+
+
+def test_unrenderable_value_falls_back_to_repr(env):
+    # TOML 原生 datetime 不是 JSON 可序列化值：got 段回落 repr，报错照常聚合
+    # （spec 3.1.5 的定位前缀不变）。
+    project = env.project(run_extra="seed = 2026-08-14T02:00:00Z")
+    errors = env.errors(project_text=project)
+    has(errors, "[run].seed: expected integer, got datetime.datetime(2026, 8, 14")
+
+
+def _config_without_embedding(top_level: str = "") -> str:
+    """BASE_CONFIG 去掉 [embedding.emb] 节，可在最前面插入若干顶层键。"""
+    trimmed = BASE_CONFIG.split("[embedding.emb]", 1)[0]
+    return trimmed.replace("schema_version = 1\n",
+                           f"schema_version = 1\n{top_level}", 1)
+
+
+def test_llm_sub_table_must_be_a_table(env):
+    config = ("schema_version = 1\n\n[llm]\nbroken = 3\n"
+              + BASE_CONFIG.replace("schema_version = 1\n", "", 1))
+    errors = env.errors(config_text=config)
+    has(errors, "config.toml:[llm.broken]: expected table, got 3")
+
+
+def test_embedding_table_shape_errors(env):
+    errors = env.errors(config_text=_config_without_embedding("embedding = 3\n"))
+    has(errors, "config.toml:embedding: expected table, got 3")
+    errors = env.errors(config_text=_config_without_embedding("embedding.other = 7\n"))
+    has(errors, "config.toml:[embedding.other]: expected table, got 7")
+
+
+def test_array_of_tables_shape_errors_locate_by_element(env):
+    # 三张表数组（styles / examples / classes）共享同一套定位形制：整体非数组、
+    # 元素非表、元素内字段类型错，各报一条 `[[section]][N]` 定位。
+    body = ('[generate]\nenabled = true\ninstruction = "生成"\nstyles = 3\n'
+            '[classify]\nenabled = true\nclasses = 3\n')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[generate].styles: expected array of tables, got 3")
+    has(errors, "[classify].classes: expected array of tables, got 3")
+
+    body = ('[generate]\nenabled = true\ninstruction = "生成"\nstyles = [3]\n'
+            '[classify]\nenabled = true\nclasses = [7]\n')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[[generate.styles]][1]: expected table, got 3")
+    has(errors, "[[classify.classes]][1]: expected table, got 7")
+
+
+def test_annotate_examples_shape_errors(env):
+    errors = env.errors(project_text=env.project(
+        annotate_body='instruction = "标注意图"\nexamples = 3'))
+    has(errors, "[annotate].examples: expected array of tables, got 3")
+    errors = env.errors(project_text=env.project(
+        annotate_body='instruction = "标注意图"\nexamples = [3]'))
+    has(errors, "[[annotate.examples]][1]: expected table, got 3")
+    errors = env.errors(project_text=env.project(
+        annotate_body='instruction = "标注意图"\n'
+                      'examples = [{input = "x", output = "not-a-table"}]'))
+    has(errors, "[[annotate.examples]][1].output: expected table (object, must pass "
+                'the user schema), got "not-a-table"')
+
+
+def test_rubric_criteria_shape_errors(env):
+    body = '[quality]\nrubric = "inline"\n[rubric]\ncriteria = 3\n'
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[[rubric.criteria]]: expected array of tables, got 3")
+    body = '[quality]\nrubric = "inline"\n[rubric]\ncriteria = [3]\n'
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[[rubric.criteria]][1]: expected table, got 3")
+
+
+def test_frame_sub_tables_must_be_tables(env):
+    body = "[frame]\nclassify = 3\n"
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "project.toml:[frame].classify: expected table, got 3")
+
+
+def test_pool_env_name_must_be_nonempty(env):
+    config = BASE_CONFIG.replace('api_key_env = "LK_TEST_KEY_DEFAULT"',
+                                 'api_key_envs = ["", "LK_TEST_KEY_DEFAULT"]')
+    errors = env.errors(config_text=config)
+    has(errors, '[llm.default].api_key_envs[1]: expected non-empty string, got ""')
+
+
+def test_pool_element_error_is_not_doubled_by_a_shape_error(env):
+    # 元素级错误已由 get_str_tuple 逐条报出，池解析不再补一条误导性的
+    # "non-empty array" ——那条只留给真正写成 `[]` 的形态。
+    config = BASE_CONFIG.replace('api_key_env = "LK_TEST_KEY_DEFAULT"',
+                                 "api_key_envs = [3]")
+    errors = env.errors(config_text=config)
+    has(errors, "[llm.default].api_key_envs[1]: expected string, got 3")
+    assert not any("expected a non-empty array of env var names" in e for e in errors)
+
+
+def test_style_element_missing_name_is_not_uniqueness_checked(env):
+    body = ('[generate]\nenabled = true\ninstruction = "生成"\n'
+            'styles = [{prompt = "正式一些"}]\n')
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[[generate.styles]][1].name: missing required key, "
+                "expected non-empty string")
+    assert not any("must be unique within the table" in e for e in errors)
+
+
+def test_cli_log_level_enum_is_validated_by_m1(env):
+    with pytest.raises(ConfigError) as ei:
+        env.load(cli=CliOverrides(log_level="loud"))
+    assert any('cli:--log-level: expected "debug" | "info" | "warn" | "error", '
+               'got "loud"' in e for e in ei.value.errors)
 
 
 # ── rules 2–5: profile references ──────────────────────────────────────────
@@ -291,14 +442,14 @@ def test_no_llm_profile(env):
 
 def test_unknown_profile_reference_lists_available(env):
     errors = env.errors(project_text=env.project(body='[quality]\nllm = "fast"'))
-    has(errors, '[quality].llm: 引用的 profile "fast" 不存在于 config.toml [llm.*]，'
-                "可用：default、judge")
+    has(errors, '[quality].llm: referenced profile "fast" does not exist in config.toml '
+                "[llm.*], available: default, judge")
 
 
 def test_generate_llms_checked_per_element(env):
     body = '[generate]\nllms = ["default", "ghost"]'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[generate].llms[2]: 引用的 profile "ghost" 不存在')
+    has(errors, '[generate].llms[2]: referenced profile "ghost" does not exist')
 
 
 def test_verify_llm_not_checked_when_disabled(env):
@@ -318,26 +469,26 @@ supports_vision = true
 def test_verify_llm_checked_when_enabled(env):
     body = '[verify]\nenabled = true\nllm = "ghost"'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[verify].llm: 引用的 profile "ghost" 不存在')
+    has(errors, '[verify].llm: referenced profile "ghost" does not exist')
 
 
 def test_repair_llm_checked_when_set(env):
     body = f"[output]\nrepair_llm = \"ghost\"\nschema_inline = '''\n{SCHEMA}\n'''"
     errors = env.errors(project_text=env.project(include_output=False, body=body))
-    has(errors, '[output].repair_llm: 引用的 profile "ghost" 不存在')
+    has(errors, '[output].repair_llm: referenced profile "ghost" does not exist')
 
 
 def test_judges_must_be_odd(env):
     errors = env.errors(project_text=env.project(
         body='[quality]\njudges = ["default", "judge"]'))
-    has(errors, "[quality].judges: 非空时长度须为奇数，得到 2 个")
+    has(errors, "[quality].judges: must have an odd length when non-empty, got 2")
 
 
 def test_verify_judges_odd_and_existing(env):
     body = '[verify]\nenabled = true\njudges = ["judge", "ghost"]'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[verify].judges[2]: 引用的 profile "ghost" 不存在')
-    has(errors, "[verify].judges: 非空时长度须为奇数")
+    has(errors, '[verify].judges[2]: referenced profile "ghost" does not exist')
+    has(errors, "[verify].judges: must have an odd length when non-empty")
 
 
 def test_ui_modality_requires_vision(env):
@@ -355,15 +506,32 @@ api_key_env = "LK_TEST_KEY_DEFAULT"
     assert not any("llm.default" in e for e in errors)   # vision profile is fine
 
 
+def test_ui_modality_vision_set_drops_a_disabled_annotate(env):
+    # 视觉必需集只收启用阶段：annotate 关掉后，它引用的纯文本 profile 不再被要求
+    # supports_vision（quality 仍在册，故用一个有视觉能力的 judge 顶上）。
+    config = BASE_CONFIG + """
+[llm.novision]
+provider = "openai_compatible"
+base_url = "https://example.com/v1"
+model = "blind-model"
+api_key_env = "LK_TEST_KEY_DEFAULT"
+"""
+    project = env.project(input_path=env.input_dir, modality="ui",
+                          annotate_body='enabled = false\nllm = "novision"',
+                          body='[quality]\nllm = "judge"\nthreshold = 0.5\n')
+    cfg = env.load(config_text=config, project_text=project)
+    assert cfg.annotate.enabled is False and cfg.annotate.llm == "novision"
+
+
 def test_semantic_dedup_requires_embedding_name(env):
     errors = env.errors(project_text=env.project(body="[dedup]\nsemantic = true"))
-    has(errors, "[dedup].semantic_embedding: dedup.semantic = true 时必填")
+    has(errors, "[dedup].semantic_embedding: required when dedup.semantic = true")
 
 
 def test_semantic_dedup_unknown_embedding(env):
     body = '[dedup]\nsemantic = true\nsemantic_embedding = "ghost"'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '不存在于 config.toml [embedding.*]，可用：emb')
+    has(errors, "does not exist in config.toml [embedding.*], available: emb")
 
 
 def test_semantic_dedup_ok_resolves_embedding_key(env):
@@ -372,34 +540,65 @@ def test_semantic_dedup_ok_resolves_embedding_key(env):
     assert cfg.embedding_profiles["emb"].api_key == "sk-emb"
 
 
+def test_semantic_dedup_key_resolution_skips_a_profile_with_no_declaration(env):
+    # embedding profile 的密钥声明本身非法（两式皆无）时，规则 12 不再二次解析
+    # ——只留声明侧那一条错误，不叠加"缺环境变量"。
+    config = BASE_CONFIG.replace('api_key_env = "LK_TEST_KEY_EMB"\n', "")
+    body = '[dedup]\nsemantic = true\nsemantic_embedding = "emb"'
+    errors = env.errors(config_text=config, project_text=env.project(body=body))
+    has(errors, "[embedding.emb].api_key_env: missing required key - exactly one of "
+                "api_key_env / api_key_envs must be provided (v1.6)")
+    assert not any("environment variable" in e for e in errors)
+
+
+def test_declared_embedding_window_does_not_warn(env, capsys):
+    config = BASE_CONFIG.replace('model = "bge"',
+                                 'model = "bge"\ncontext_window = 8192', 1)
+    body = '[dedup]\nsemantic = true\nsemantic_embedding = "emb"'
+    env.load(config_text=config, project_text=env.project(body=body))
+    assert "[embedding.emb].context_window" not in capsys.readouterr().err
+
+
+def test_annotate_disabled_leaves_the_stage_out_of_the_reference_set(env):
+    # 引用集只收启用阶段：annotate 关掉后 [llm.default] 只因 quality 在册。
+    config = BASE_CONFIG.replace('model = "main-model"',
+                                 'model = "main-model"\ncontext_window = 131072', 1)
+    cfg = env.load(config_text=config,
+                   project_text=env.project(annotate_body="enabled = false",
+                                            body='[quality]\nllm = "judge"\n'
+                                                 "threshold = 0.5\n"))
+    assert cfg.annotate.enabled is False
+    assert cfg.quality.llm == "judge"
+
+
 # ── rules 6–9: cross-field constraints ─────────────────────────────────────
 
 
 def test_top_ratio_required_when_selected(env):
     errors = env.errors(project_text=env.project(
         body='[quality]\nselection = "top_ratio"'))
-    has(errors, '[quality].top_ratio: selection = "top_ratio" 时必填')
+    has(errors, '[quality].top_ratio: required when selection = "top_ratio"')
 
 
 def test_top_ratio_threshold_mutually_exclusive(env):
     body = '[quality]\nselection = "top_ratio"\ntop_ratio = 0.5\nthreshold = 0.3'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[quality].threshold: 与 quality.top_ratio 互斥")
+    has(errors, "[quality].threshold: mutually exclusive with quality.top_ratio")
 
 
 def test_top_ratio_range(env):
     body = '[quality]\nselection = "top_ratio"\ntop_ratio = 1.5'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[quality].top_ratio: 期望(0,1] 内的数值，得到 1.5")
+    has(errors, "[quality].top_ratio: expected number in (0,1], got 1.5")
     # the "required" branch of rule 6 must not fire when the key was provided (just invalid)
-    assert not any("时必填" in e for e in errors)
+    assert not any("required when" in e for e in errors)
 
 
 @pytest.mark.parametrize("value", [2, 4, 1])
 def test_self_consistency_rejects_bad_values(env, value):
     errors = env.errors(project_text=env.project(
         annotate_body=f'instruction = "标注"\nself_consistency = {value}'))
-    has(errors, f"[annotate].self_consistency: 期望 0 或 ≥3 的奇数，得到 {value}")
+    has(errors, f"[annotate].self_consistency: expected 0 or an odd number >= 3, got {value}")
 
 
 @pytest.mark.parametrize("value", [0, 3, 5])
@@ -413,19 +612,19 @@ def test_weighted_mixture_requires_weights(env):
     body = ('[generate]\nenabled = true\ninstruction = "生成"\n'
             'llms = ["default", "judge"]\nmixture = "weighted"')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[generate].weights: mixture = "weighted" 时必填')
+    has(errors, '[generate].weights: required when mixture = "weighted"')
 
 
 def test_weighted_mixture_length_and_positivity(env):
     body = ('[generate]\nenabled = true\ninstruction = "生成"\n'
             'llms = ["default", "judge"]\nmixture = "weighted"\nweights = [1.0]')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[generate].weights: 期望长度 2（= generate.llms），得到长度 1")
+    has(errors, "[generate].weights: expected length 2 (= generate.llms), got length 1")
 
     body = ('[generate]\nenabled = true\ninstruction = "生成"\n'
             'llms = ["default", "judge"]\nmixture = "weighted"\nweights = [1.0, -0.5]')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[generate].weights[2]: 期望正数，得到 -0.5")
+    has(errors, "[generate].weights[2]: expected positive number, got -0.5")
 
 
 def test_styles_unique_names_and_nonempty_prompts(env):
@@ -433,14 +632,14 @@ def test_styles_unique_names_and_nonempty_prompts(env):
             '[[generate.styles]]\nname = "formal"\nprompt = "正式风格"\n'
             '[[generate.styles]]\nname = "formal"\nprompt = ""')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[[generate.styles]][2].name: 表内 name 须唯一，得到重复的 "formal"')
-    has(errors, "[[generate.styles]][2].prompt: 期望非空字符串")
+    has(errors, '[[generate.styles]][2].name: name must be unique within the table, got duplicate "formal"')
+    has(errors, "[[generate.styles]][2].prompt: expected non-empty string")
 
 
 def test_judgment_reasons_values(env):
     errors = env.errors(project_text=env.project(
         body='[quality]\njudgment_reasons = "always"'))
-    has(errors, '[quality].judgment_reasons: 期望 "auto" | true | false')
+    has(errors, '[quality].judgment_reasons: expected "auto" | true | false')
     cfg = env.load(project_text=env.project(body="[quality]\njudgment_reasons = true"))
     assert cfg.quality.judgment_reasons is True
 
@@ -470,7 +669,7 @@ def test_generate_only_forbids_input(env):
     project = env.project(run_extra='mode = "generate_only"',
                           body=GEN_BODY + "standalone_count = 10")
     errors = env.errors(project_text=project)
-    has(errors, '[run].input: run.mode = "generate_only" 时必须缺省')
+    has(errors, '[run].input: must be absent when run.mode = "generate_only"')
 
 
 def test_generate_only_forbids_cli_input(env):
@@ -478,7 +677,7 @@ def test_generate_only_forbids_cli_input(env):
                           body=GEN_BODY + "standalone_count = 10")
     with pytest.raises(ConfigError) as ei:
         env.load(project_text=project, cli=CliOverrides(input=str(env.input_file)))
-    has(ei.value.errors, 'cli:--input: run.mode = "generate_only" 时不得提供输入路径')
+    has(ei.value.errors, 'cli:--input: must not provide an input path when run.mode = "generate_only"')
 
 
 def test_generate_only_requires_text_modality(env):
@@ -486,49 +685,49 @@ def test_generate_only_requires_text_modality(env):
                           run_extra='mode = "generate_only"',
                           body=GEN_BODY + "standalone_count = 10")
     errors = env.errors(project_text=project)
-    has(errors, '[run].modality: run.mode = "generate_only" 要求 "text"，得到 "ui"')
+    has(errors, '[run].modality: run.mode = "generate_only" requires "text", got "ui"')
 
 
 def test_generate_only_requires_generate_enabled(env):
     project = env.project(input_path=None, run_extra='mode = "generate_only"')
     errors = env.errors(project_text=project)
-    has(errors, '[generate].enabled: run.mode = "generate_only" 要求 generate.enabled = true')
+    has(errors, '[generate].enabled: run.mode = "generate_only" requires generate.enabled = true')
 
 
 def test_generate_only_seed_forms_mutually_exclusive(env):
     project = env.project(input_path=None, run_extra='mode = "generate_only"',
                           body=GEN_BODY + 'standalone_count = 10\nseed_examples = ["a"]')
     errors = env.errors(project_text=project)
-    has(errors, "[generate].seed_examples: 与 standalone_count 互斥")
+    has(errors, "[generate].seed_examples: mutually exclusive with standalone_count")
 
 
 def test_generate_only_requires_one_seed_form(env):
     project = env.project(input_path=None, run_extra='mode = "generate_only"',
                           body=GEN_BODY)
     errors = env.errors(project_text=project)
-    has(errors, "seed_examples（非空字符串数组）或 standalone_count（≥ 1）其一")
+    has(errors, "seed_examples (a non-empty string array) or standalone_count (>= 1)")
 
 
 def test_generate_only_seed_examples_nonempty_strings(env):
     project = env.project(input_path=None, run_extra='mode = "generate_only"',
                           body=GEN_BODY + 'seed_examples = ["ok", " "]')
     errors = env.errors(project_text=project)
-    has(errors, "[generate].seed_examples[2]: 期望非空字符串")
+    has(errors, "[generate].seed_examples[2]: expected non-empty string")
 
     project = env.project(input_path=None, run_extra='mode = "generate_only"',
                           body=GEN_BODY + "seed_examples = []")
     errors = env.errors(project_text=project)
-    has(errors, "[generate].seed_examples: 期望非空字符串数组，得到空数组")
+    has(errors, "[generate].seed_examples: expected a non-empty string array, got an empty array")
 
 
 def test_process_mode_forbids_generate_only_keys(env):
     errors = env.errors(project_text=env.project(
         body='[generate]\nseed_examples = ["a"]'))
-    has(errors, '[generate].seed_examples: 仅 run.mode = "generate_only" 可设置')
+    has(errors, '[generate].seed_examples: can only be set when run.mode = "generate_only"')
 
     errors = env.errors(project_text=env.project(
         body="[generate]\nstandalone_count = 5"))
-    has(errors, '[generate].standalone_count: 仅 run.mode = "generate_only" 可设置')
+    has(errors, '[generate].standalone_count: can only be set when run.mode = "generate_only"')
 
 
 # ── rule 12: API keys, referenced profiles only ────────────────────────────
@@ -537,7 +736,7 @@ def test_process_mode_forbids_generate_only_keys(env):
 def test_referenced_profile_needs_env_key(env, monkeypatch):
     monkeypatch.delenv("LK_TEST_KEY_DEFAULT")
     errors = env.errors()
-    has(errors, '[llm.default].api_key_env: 环境变量 "LK_TEST_KEY_DEFAULT" 未设置或为空')
+    has(errors, '[llm.default].api_key_env: environment variable "LK_TEST_KEY_DEFAULT" is not set or empty')
 
 
 def test_unreferenced_profile_key_not_required(env, monkeypatch):
@@ -549,7 +748,7 @@ def test_unreferenced_profile_key_not_required(env, monkeypatch):
 def test_verify_enabled_makes_judge_referenced(env, monkeypatch):
     monkeypatch.delenv("LK_TEST_KEY_JUDGE")
     errors = env.errors(project_text=env.project(body="[verify]\nenabled = true"))
-    has(errors, '环境变量 "LK_TEST_KEY_JUDGE" 未设置或为空')
+    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
 
 
 # ── rules 13–15: user schema + few-shot ────────────────────────────────────
@@ -558,33 +757,33 @@ def test_verify_enabled_makes_judge_referenced(env, monkeypatch):
 def test_schema_exactly_one_source(env):
     body = f"[output]\nschema_path = \"x.json\"\nschema_inline = '''\n{SCHEMA}\n'''"
     errors = env.errors(project_text=env.project(include_output=False, body=body))
-    has(errors, "与 schema_path 恰好提供其一（互斥）")
+    has(errors, "exactly one of schema_path / schema_inline must be provided (mutually exclusive)")
 
     errors = env.errors(project_text=env.project(include_output=False))
-    has(errors, "须恰好提供 schema_path 或 schema_inline 其一")
+    has(errors, "exactly one of schema_path or schema_inline must be provided")
 
 
 def test_schema_path_unreadable(env):
     body = '[output]\nschema_path = "does/not/exist.json"'
     errors = env.errors(project_text=env.project(include_output=False, body=body))
-    has(errors, "无法读取 Schema 文件")
+    has(errors, "cannot read schema file")
 
 
 def test_schema_invalid_json(env):
     errors = env.errors(project_text=env.project(schema="{not json"))
-    has(errors, "[output].schema_inline: 期望合法 JSON")
+    has(errors, "[output].schema_inline: expected valid JSON")
 
 
 def test_schema_meta_schema_violation(env):
     bad = json.dumps({"type": "object", "properties": {"a": {"type": 123}}})
     errors = env.errors(project_text=env.project(schema=bad))
-    has(errors, "未通过 JSON Schema draft 2020-12 元 Schema 校验")
+    has(errors, "failed JSON Schema draft 2020-12 meta-schema validation")
 
 
 def test_schema_top_level_must_be_object(env):
     bad = json.dumps({"type": "array", "items": {"type": "string"}})
     errors = env.errors(project_text=env.project(schema=bad))
-    has(errors, '用户 Schema 顶层 type 必须为 "object"，得到 "array"')
+    has(errors, 'user schema top-level type must be "object", got "array"')
 
 
 def test_schema_reserved_meta_key(env):
@@ -592,7 +791,7 @@ def test_schema_reserved_meta_key(env):
                       "properties": {"intent": {"type": "string"},
                                      "_meta": {"type": "object"}}})
     errors = env.errors(project_text=env.project(schema=bad))
-    has(errors, '用户 Schema 顶层不得声明保留键 "_meta"')
+    has(errors, 'user schema must not declare the reserved top-level key "_meta"')
 
 
 def test_few_shot_output_validated_against_schema(env):
@@ -604,7 +803,7 @@ def test_few_shot_output_validated_against_schema(env):
     bad = ('instruction = "标注"\n'
            'examples = [{input = "你好", output = {intent = "nope", topic = "问候"}}]')
     errors = env.errors(project_text=env.project(annotate_body=bad))
-    has(errors, "[[annotate.examples]][1].output: 未通过用户 Schema")
+    has(errors, "[[annotate.examples]][1].output: failed user schema validation")
 
 
 def test_few_shot_with_unresolvable_ref_schema_is_config_error(env):
@@ -622,7 +821,7 @@ def test_few_shot_with_unresolvable_ref_schema_is_config_error(env):
     body = ('instruction = "标注"\n'
             'examples = [{input = "你好", output = {intent = "qa", topic = "问候"}}]')
     errors = env.errors(project_text=env.project(annotate_body=body, schema=ref_schema))
-    has(errors, "[output].schema_inline: 用户 Schema 引用无法解析")
+    has(errors, "[output].schema_inline: user schema has an unresolvable reference")
 
 
 def test_few_shot_unresolvable_ref_aggregates_with_other_errors(env):
@@ -637,7 +836,7 @@ def test_few_shot_unresolvable_ref_aggregates_with_other_errors(env):
             'self_consistency = 2')  # rule 7 violation collected before rule 15
     errors = env.errors(project_text=env.project(annotate_body=body, schema=ref_schema))
     has(errors, "[annotate].self_consistency")
-    has(errors, "[output].schema_inline: 用户 Schema 引用无法解析")
+    has(errors, "[output].schema_inline: user schema has an unresolvable reference")
 
 
 def test_unresolvable_ref_without_examples_is_config_error(env):
@@ -650,7 +849,7 @@ def test_unresolvable_ref_without_examples_is_config_error(env):
         "properties": {"intent": {"$ref": "https://example.invalid/defs.json"}},
     })
     errors = env.errors(project_text=env.project(schema=ref_schema))
-    has(errors, "[output].schema_inline: 用户 Schema 引用无法解析")
+    has(errors, "[output].schema_inline: user schema has an unresolvable reference")
 
 
 def test_local_refs_and_ref_shaped_data_are_not_flagged(env):
@@ -678,13 +877,83 @@ def test_dangling_local_ref_is_config_error(env):
         "properties": {"intent": {"$ref": "#/$defs/missing"}},
     })
     errors = env.errors(project_text=env.project(schema=ref_schema))
-    has(errors, "[output].schema_inline: 用户 Schema 引用无法解析")
+    has(errors, "[output].schema_inline: user schema has an unresolvable reference")
 
 
 def test_few_shot_requires_input_and_output(env):
     body = 'instruction = "标注"\nexamples = [{input = "你好"}]'
     errors = env.errors(project_text=env.project(annotate_body=body))
-    has(errors, "[[annotate.examples]][1].output: 缺失必填键")
+    has(errors, "[[annotate.examples]][1].output: missing required key")
+
+
+def test_nested_id_shifts_the_ref_base_uri(env):
+    # $ref 遍历跟踪 $id 引起的基 URI 变化（RFC 3986 join）：同一个相对 ref 在
+    # 顶层 $id 下能解析，被嵌套 $id 挪走基址后就解析不了。
+    ok_schema = json.dumps({
+        "$id": "https://example.com/labelkit/out.json",
+        "type": "object",
+        "properties": {"intent": {"$ref": "intent.json"}},
+        "$defs": {"intent": {"$id": "intent.json", "type": "string"}},
+    })
+    assert isinstance(env.load(project_text=env.project(schema=ok_schema)),
+                      ResolvedConfig)
+    moved = json.dumps({
+        "$id": "https://example.com/labelkit/out.json",
+        "type": "object",
+        "properties": {"wrap": {"$id": "https://elsewhere.invalid/w.json",
+                                "properties": {"intent": {"$ref": "intent.json"}}}},
+        "$defs": {"intent": {"$id": "intent.json", "type": "string"}},
+    })
+    errors = env.errors(project_text=env.project(schema=moved))
+    has(errors, "[output].schema_inline: user schema has an unresolvable reference")
+
+
+def test_repeated_unresolvable_ref_reported_once(env):
+    # 同一个 ref 出现多次只报一条（按 ref 去重，避免同一病因刷屏）。
+    ref_schema = json.dumps({
+        "type": "object",
+        "properties": {"a": {"$ref": "#/$defs/missing"},
+                       "b": {"$ref": "#/$defs/missing"}},
+    })
+    errors = env.errors(project_text=env.project(schema=ref_schema))
+    dangling = [e for e in errors if "unresolvable reference" in e]
+    assert len(dangling) == 1                       # 两处同名 ref 合成一条
+    assert "#/$defs/missing" in dangling[0]
+
+
+def test_ref_traversal_is_best_effort_when_the_document_cannot_be_ingested():
+    # 引用机制本身摄不进该文档时返回空表、绝不抛（规则 15 的运行期兜底仍在）——
+    # 这类文档在 load() 里已被元校验拦下，此处直接钉纯函数的契约。
+    from labelkit.common.config._schemas import _unresolvable_refs
+
+    assert _unresolvable_refs({"$schema": 3, "type": "object"}) == []
+    assert _unresolvable_refs({"$id": 3, "type": "object"}) == []
+
+
+def test_fewshot_dryrun_reports_a_reference_error_the_static_walk_cannot_see(env):
+    # $dynamicRef 静态遍历看不见，但 iter_errors 会抛 referencing 异常：必须并入
+    # 聚合 ConfigError（退出码 2），绝不作为未捕获崩溃逃逸（退出码 4）。
+    dyn = json.dumps({"type": "object",
+                      "properties": {"intent": {"$dynamicRef": "#ghost"}}})
+    errors = env.errors(project_text=env.project(
+        schema=dyn,
+        annotate_body=('instruction = "标注意图"\n'
+                       'examples = [{input = "问路", output = {intent = "qa"}}]')))
+    has(errors, "[output].schema_inline: user schema has an unresolvable reference, "
+                "cannot validate the [[annotate.examples]] example outputs")
+
+
+def test_fewshot_dryrun_reports_a_raising_validator_callback(env):
+    # 回调自身有 bug（抛异常）⇒ 按配置错误上报并停跑其余示例，而不是退出码 4。
+    errors = env.errors(project_text=env.project(
+        annotate_body=('instruction = "标注意图"\n'
+                       'examples = [{input = "问路", '
+                       'output = {intent = "qa", topic = "问路"}}]'),
+        body=_output_with('validator = "tests.hook_samples:boom"'),
+        include_output=False,
+    ))
+    has(errors, "[output].validator: the callback raised while dry-running few-shot "
+                "example 1: RuntimeError: hook exploded")
 
 
 # ── rule 16: rubric ────────────────────────────────────────────────────────
@@ -715,7 +984,7 @@ def test_inline_rubric_happy(env):
 
 def test_inline_selector_without_criteria(env):
     errors = env.errors(project_text=env.project(body='[quality]\nrubric = "inline"'))
-    has(errors, '[quality].rubric: rubric = "inline" 但未提供 [[rubric.criteria]]')
+    has(errors, '[quality].rubric: rubric = "inline" but [[rubric.criteria]] is not provided')
 
 
 def test_rubric_key_pattern(env):
@@ -726,7 +995,7 @@ description = "话题是否明确可归类"
 pairwise_prompt = "哪条指令的话题更明确？"
 """
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[[rubric.criteria]][2].key: 期望匹配 [a-z0-9_]+，得到 "Topic-Match"')
+    has(errors, '[[rubric.criteria]][2].key: expected a match of [a-z0-9_]+, got "Topic-Match"')
 
 
 def test_rubric_duplicate_key(env):
@@ -737,26 +1006,26 @@ description = "重复"
 pairwise_prompt = "重复？"
 """
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[[rubric.criteria]][2].key: key 须唯一")
+    has(errors, "[[rubric.criteria]][2].key: key must be unique")
 
 
 def test_rubric_weight_positive(env):
     body = INLINE_RUBRIC.replace("weight = 2.0", "weight = 0.0")
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[[rubric.criteria]][1].weight: 期望正数，得到 0.0")
+    has(errors, "[[rubric.criteria]][1].weight: expected positive number, got 0.0")
 
 
 def test_rubric_criteria_nonempty(env):
     body = '[quality]\nrubric = "inline"\n\n[rubric]\nname = "empty"\ncriteria = []'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[rubric].criteria: criteria 不得为空")
+    has(errors, "[rubric].criteria: criteria must not be empty")
 
 
 def test_pointwise_requires_six_levels_inline(env):
     body = INLINE_RUBRIC.replace('rubric = "inline"', 'rubric = "inline"\nmode = "pointwise"')
     body += 'pointwise_levels = ["0: 差", "1: 中", "2: 好"]\n'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[[rubric.criteria]][1].pointwise_levels: pointwise 模式要求恰好 6 级（0–5），得到 3 级")
+    has(errors, "[[rubric.criteria]][1].pointwise_levels: pointwise mode requires exactly 6 levels (0-5), got 3")
 
 
 def test_pointwise_with_default_rubric_ok(env):
@@ -788,33 +1057,33 @@ def test_default_rubrics_load_from_package():
 def test_annotate_and_quality_not_both_disabled(env):
     errors = env.errors(project_text=env.project(
         annotate_body="enabled = false", body="[quality]\nenabled = false"))
-    has(errors, "quality 与 annotate 不得同时禁用")
+    has(errors, "quality and annotate must not both be disabled")
 
 
 def test_verify_requires_annotate(env):
     errors = env.errors(project_text=env.project(
         annotate_body="enabled = false", body="[verify]\nenabled = true"))
-    has(errors, "verify.enabled = true 要求 annotate.enabled = true（2.3.1 约束②）")
+    has(errors, 'verify.enabled = true requires annotate.enabled = true (2.3.1 constraint ②)')
 
 
 def test_generate_requires_text_modality(env):
     project = env.project(input_path=env.input_dir, modality="ui", body=GEN_BODY)
     errors = env.errors(project_text=project)
-    has(errors, 'generate.enabled = true 要求 run.modality = "text"')
+    has(errors, 'generate.enabled = true requires run.modality = "text"')
 
 
 def test_generate_process_requires_quality(env):
     body = "[quality]\nenabled = false\n\n" + GEN_BODY
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "要求 quality.enabled = true（种子来自质量门，2.3.1 约束③）")
+    has(errors, 'requires quality.enabled = true (seeds come from the quality gate, 2.3.1 constraint ③)')
 
 
 def test_instruction_required_when_enabled(env):
     errors = env.errors(project_text=env.project(annotate_body=""))
-    has(errors, "[annotate].instruction: annotate.enabled = true 时必填")
+    has(errors, "[annotate].instruction: required when annotate.enabled = true")
 
     errors = env.errors(project_text=env.project(body="[generate]\nenabled = true"))
-    has(errors, "[generate].instruction: generate.enabled = true 时必填")
+    has(errors, "[generate].instruction: required when generate.enabled = true")
 
 
 # ── rule 21: paths ─────────────────────────────────────────────────────────
@@ -829,30 +1098,30 @@ def test_input_existence_not_checked_by_m1(env):
 
 def test_input_required_in_process_mode(env):
     errors = env.errors(project_text=env.project(input_path=None))
-    has(errors, "[run].input: process 模式必填（可用 CLI --input 提供）")
+    has(errors, "[run].input: required in process mode (may be supplied by CLI --input)")
 
 
 def test_output_not_inside_input_dir(env):
     project = env.project(input_path=env.input_dir, modality="ui",
                           output_path=env.input_dir / "o.jsonl")
     errors = env.errors(project_text=project)
-    has(errors, "[run].output: 不得位于输入目录内部（防止自吞）")
+    has(errors, "[run].output: must not be inside the input directory (self-ingestion guard)")
 
 
 def test_output_must_not_equal_input_file(env):
     errors = env.errors(project_text=env.project(output_path=env.input_file))
-    has(errors, "[run].output: 不得与输入文件相同")
+    has(errors, "[run].output: must not be the same as the input file")
 
 
 def test_output_parent_must_exist(env):
     errors = env.errors(project_text=env.project(
         output_path=env.tmp / "no_dir" / "o.jsonl"))
-    has(errors, "[run].output: 输出父目录不存在或不可写")
+    has(errors, "[run].output: output parent directory does not exist or is not writable")
 
 
 def test_output_required(env):
     errors = env.errors(project_text=env.project(output_path=None))
-    has(errors, "[run].output: 缺失必填键")
+    has(errors, "[run].output: missing required key")
 
 
 # ── aggregation & warnings ─────────────────────────────────────────────────
@@ -893,9 +1162,9 @@ pairwise_prompt = "哪条指令的话题更明确、更易归类？"
     errors = env.errors(project_text=env.project(body=body, schema=schema_with_meta))
     assert len(errors) == 3, "\n".join(errors)
     fp = str(env.tmp / "project.toml")
-    assert '引用的 profile "fast" 不存在于 config.toml [llm.*]，可用：default、judge' in errors[0]
-    assert '不得声明保留键 "_meta"' in errors[1]
-    assert errors[2] == f'{fp}:[[rubric.criteria]][2].key: 期望匹配 [a-z0-9_]+，得到 "Topic-Match"'
+    assert 'referenced profile "fast" does not exist in config.toml [llm.*], available: default, judge' in errors[0]
+    assert 'must not declare the reserved top-level key "_meta"' in errors[1]
+    assert errors[2] == f'{fp}:[[rubric.criteria]][2].key: expected a match of [a-z0-9_]+, got "Topic-Match"'
 
 
 def test_never_fails_on_first_error(env, monkeypatch):
@@ -916,14 +1185,14 @@ def test_self_enhancement_warning(env, capsys):
                    project_text=env.project(body="[verify]\nenabled = true"))
     assert cfg.verify.enabled
     err_out = capsys.readouterr().err
-    assert "自增强偏差" in err_out
+    assert "self-enhancement bias" in err_out
 
 
 def test_ignored_inline_rubric_warns(env, capsys):
     body = "[rubric]\nname = 'unused'\n[[rubric.criteria]]\nkey = 'x'\ndescription = 'd'\npairwise_prompt = 'p'"
     cfg = env.load(project_text=env.project(body=body))
     assert cfg.rubric.name == "default-text-v1"
-    assert "内联 rubric 未生效" in capsys.readouterr().err
+    assert "the inline rubric has no effect" in capsys.readouterr().err
 
 
 # ── E2E-finding fixes: P3-7 top_ratio no-op warning / P3-8 judges exemption ──
@@ -945,14 +1214,14 @@ def test_top_ratio_without_selection_warns_but_loads(env, capsys):
     assert cfg.quality.selection == "threshold"
     err = capsys.readouterr().err
     assert "warning:" in err
-    assert "top_ratio" in err and "不会生效" in err
+    assert "top_ratio" in err and "no effect" in err
 
 
 def test_top_ratio_with_selection_does_not_warn(env, capsys):
     cfg = env.load(project_text=env.project(
         body='[quality]\nselection = "top_ratio"\ntop_ratio = 0.5'))
     assert cfg.quality.selection == "top_ratio"
-    assert "不会生效" not in capsys.readouterr().err
+    assert "no effect" not in capsys.readouterr().err
 
 
 def test_verify_judges_panel_exempts_verify_llm_existence(env):
@@ -980,7 +1249,7 @@ def test_pointwise_judges_warns_noop(env, capsys):
         body='[quality]\nmode = "pointwise"\njudges = ["default", "default", "default"]'))
     assert cfg.quality.mode == "pointwise"
     err = capsys.readouterr().err
-    assert "warning:" in err and "评审团不生效" in err
+    assert "warning:" in err and "judges panel has no effect" in err
 
 
 def test_pointwise_judges_key_checked_on_quality_llm(env, tmp_path, monkeypatch):
@@ -1015,7 +1284,7 @@ def test_output_validator_bad_ref_is_config_error(env):
         include_output=False,
     ))
     has(errors, "[output].validator")
-    has(errors, "无法导入模块")
+    has(errors, "cannot import module")
 
 
 def test_output_validator_rejecting_fewshot_is_config_error(env):
@@ -1026,7 +1295,7 @@ def test_output_validator_rejecting_fewshot_is_config_error(env):
         body=_output_with('validator = "tests.hook_samples:topic_max6"'),
         include_output=False,
     ))
-    has(errors, "未通过 output.validator 回调")
+    has(errors, "failed the output.validator callback")
 
 
 def test_sample_validator_checked_when_generate_enabled(env):
@@ -1036,7 +1305,7 @@ def test_sample_validator_checked_when_generate_enabled(env):
               'sample_validator = "tests.hook_samples:NOT_CALLABLE"'),
     ))
     has(errors, "[generate].sample_validator")
-    has(errors, "不是可调用对象")
+    has(errors, "is not callable")
 
 
 # ── v1.7: [classify] parsing + validation (spec 5.2; R8/R21/R24) ────────────
@@ -1123,34 +1392,34 @@ name = "solo"
 description = "唯一类"
 """
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[classify].classes: classify.enabled = true 时须声明 ≥ 2 个类别")
+    has(errors, "[classify].classes: classify.enabled = true requires >= 2 declared classes")
 
 
 def test_classify_fallback_required_and_member(env):
     body = CLASSIFY_BODY.replace('fallback_class = "other"\n', "")
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[classify].fallback_class: classify.enabled = true 时必填")
+    has(errors, "[classify].fallback_class: required when classify.enabled = true")
 
     body = CLASSIFY_BODY.replace('fallback_class = "other"', 'fallback_class = "ghost"')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[classify].fallback_class: 引用的类名 "ghost" 不在 [[classify.classes]] 中，'
-                "可用：writing、qa、other")
+    has(errors, '[classify].fallback_class: referenced class name "ghost" is not in '
+                "[[classify.classes]], available: writing, qa, other")
 
 
 def test_classify_assignment_and_on_error_enums(env):
     body = CLASSIFY_BODY.replace("enabled = true", 'enabled = true\nassignment = "both"')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[classify].assignment: 期望 "single" | "multi"，得到 "both"')
+    has(errors, '[classify].assignment: expected "single" | "multi", got "both"')
 
     body = CLASSIFY_BODY.replace("enabled = true", 'enabled = true\non_error = "skip"')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[classify].on_error: 期望 "fallback" | "fail"，得到 "skip"')
+    has(errors, '[classify].on_error: expected "fallback" | "fail", got "skip"')
 
 
 def test_classify_max_labels_multi_only(env):
     body = CLASSIFY_BODY.replace("enabled = true", "enabled = true\nmax_labels = 2")
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[classify].max_labels: 仅 assignment = "multi" 时可设置')
+    has(errors, '[classify].max_labels: can only be set when assignment = "multi"')
 
 
 @pytest.mark.parametrize("value", [1, 4])
@@ -1158,7 +1427,7 @@ def test_classify_max_labels_range(env, value):
     body = CLASSIFY_BODY.replace(
         "enabled = true", f'enabled = true\nassignment = "multi"\nmax_labels = {value}')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, f"[classify].max_labels: 期望 [2, 3] 内的整数（上界 = 类别数），得到 {value}")
+    has(errors, f"[classify].max_labels: expected an integer in [2, 3] (upper bound = number of classes), got {value}")
 
 
 def test_classify_max_labels_multi_valid_and_backfill(env):
@@ -1177,7 +1446,7 @@ def test_classify_self_consistency_rejects_bad_values(env, value):
     body = CLASSIFY_BODY.replace("enabled = true",
                                  f"enabled = true\nself_consistency = {value}")
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, f"[classify].self_consistency: 期望 0 或 ≥3 的奇数，得到 {value}")
+    has(errors, f"[classify].self_consistency: expected 0 or an odd number >= 3, got {value}")
 
 
 def test_classify_self_consistency_accepts_valid(env):
@@ -1210,15 +1479,15 @@ description = "重复"
 name = "empty_desc"
 """
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[[classify.classes]][1].name: 期望匹配 [a-z0-9_]+，得到 "Q-A"')
-    has(errors, '[[classify.classes]][3].name: 表内 name 须唯一，得到重复的 "qa"')
-    has(errors, "[[classify.classes]][4].description: 缺失必填键")
+    has(errors, '[[classify.classes]][1].name: expected a match of [a-z0-9_]+, got "Q-A"')
+    has(errors, '[[classify.classes]][3].name: name must be unique within the table, got duplicate "qa"')
+    has(errors, "[[classify.classes]][4].description: missing required key")
 
 
 def test_classify_llm_profile_checked_when_enabled(env):
     body = CLASSIFY_BODY.replace("enabled = true", 'enabled = true\nllm = "ghost"')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[classify].llm: 引用的 profile "ghost" 不存在于 config.toml [llm.*]')
+    has(errors, '[classify].llm: referenced profile "ghost" does not exist in config.toml [llm.*]')
 
 
 def test_classify_llm_not_checked_when_disabled(env):
@@ -1230,7 +1499,7 @@ def test_classify_llm_key_resolved_when_enabled(env, monkeypatch):
     monkeypatch.delenv("LK_TEST_KEY_JUDGE")
     body = CLASSIFY_BODY.replace("enabled = true", 'enabled = true\nllm = "judge"')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '环境变量 "LK_TEST_KEY_JUDGE" 未设置或为空')
+    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
 
 
 def test_classify_ui_modality_requires_vision(env):
@@ -1244,7 +1513,7 @@ api_key_env = "LK_TEST_KEY_DEFAULT"
     body = CLASSIFY_BODY.replace("enabled = true", 'enabled = true\nllm = "novision"')
     project = env.project(input_path=env.input_dir, modality="ui", body=body)
     errors = env.errors(config_text=config, project_text=project)
-    has(errors, "[llm.novision].supports_vision: UI 模态被 classify 阶段引用")
+    has(errors, "[llm.novision].supports_vision: a profile referenced by the classify stage(s) in UI modality")
 
 
 def test_classify_disabled_with_tables_warns_once(env, capsys):
@@ -1259,7 +1528,7 @@ def test_classify_disabled_with_tables_warns_once(env, capsys):
     assert err.count("[classify].enabled") == 1   # one warning line, not one per table
     assert "[[classify.classes]]" in err
     assert "[class.writing]" in err
-    assert "不会生效" in err
+    assert "no effect" in err
 
 
 # ── v1.7: [class.*] whitelist + per-class merge (R6/R7/R25) ────────────────
@@ -1268,8 +1537,16 @@ def test_classify_disabled_with_tables_warns_once(env, capsys):
 def test_class_unknown_name_rejected(env):
     body = CLASSIFY_BODY + "\n[class.ghost.quality]\nthreshold = 0.5\n"
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[class.ghost]: 类名 "ghost" 不在 [[classify.classes]] 中，'
-                "可用：writing、qa、other")
+    has(errors, '[class.ghost]: class name "ghost" is not in [[classify.classes]], available: writing, qa, other')
+
+
+def test_class_override_tables_must_be_tables(env):
+    body = CLASSIFY_BODY + "\n[class]\nqa = 3\n"
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[class.qa]: expected table, got 3")
+    body = CLASSIFY_BODY + "\n[class.qa]\nannotate = 3\n"
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[class.qa.annotate]: expected table, got 3")
 
 
 def test_class_section_whitelist_enforced(env):
@@ -1284,12 +1561,12 @@ num_per_call = 8
 """
     errors = env.errors(project_text=env.project(body=body))
     # section outside the whitelist → error (R25), not a forward-compat warning
-    has(errors, "[class.qa.dedup]: [class.*] 覆盖节不在白名单内"
-                "（可用：quality、rubric、annotate、generate、verify、extract）")
+    has(errors, "[class.qa.dedup]: section is not in the [class.*] override whitelist "
+                "(available: quality, rubric, annotate, generate, verify, extract)")
     # key outside a section's whitelist → error
-    has(errors, "[class.qa.quality].llm: [class.*.quality] 不可覆盖该键"
-                "（白名单：mode、rounds、rubric、threshold、selection、top_ratio）")
-    has(errors, "[class.qa.generate].num_per_call: [class.*.generate] 不可覆盖该键")
+    has(errors, "[class.qa.quality].llm: [class.*.quality] cannot override this key "
+                "(whitelist: mode, rounds, rubric, threshold, selection, top_ratio)")
+    has(errors, "[class.qa.generate].num_per_call: [class.*.generate] cannot override this key")
     # whitelisted keys in the same tables merge fine (no error about them)
     assert not any(".threshold" in e for e in errors)
 
@@ -1323,7 +1600,7 @@ def test_class_selection_group_still_exclusive_within_class(env):
     body = (CLASSIFY_BODY
             + '\n[class.qa.quality]\nselection = "top_ratio"\ntop_ratio = 0.5\nthreshold = 0.3\n')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[class.qa.quality].threshold: 与 quality.top_ratio 互斥")
+    has(errors, "[class.qa.quality].threshold: mutually exclusive with quality.top_ratio")
 
 
 def test_class_selection_top_ratio_required_on_merged_view(env):
@@ -1332,7 +1609,7 @@ def test_class_selection_top_ratio_required_on_merged_view(env):
     body = ("[quality]\ntop_ratio = 0.5\nselection = \"top_ratio\"\n\n" + CLASSIFY_BODY
             + '\n[class.qa.quality]\nselection = "top_ratio"\n')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[class.qa.quality].top_ratio: selection = "top_ratio" 时必填')
+    has(errors, '[class.qa.quality].top_ratio: required when selection = "top_ratio"')
 
 
 def test_class_top_ratio_noop_warns(env, capsys):
@@ -1340,7 +1617,7 @@ def test_class_top_ratio_noop_warns(env, capsys):
     cfg = env.load(project_text=env.project(body=body))
     assert cfg.class_views["qa"].quality.top_ratio == 0.5
     err = capsys.readouterr().err
-    assert "[class.qa.quality].top_ratio" in err and "不会生效" in err
+    assert "[class.qa.quality].top_ratio" in err and "no effect" in err
 
 
 CLASS_INLINE_RUBRIC = """
@@ -1376,8 +1653,8 @@ def test_class_pointwise_six_level_check_on_class_rubric(env):
         'pointwise_levels = ["0", "1", "2", "3", "4", "5"]',
         'pointwise_levels = ["0", "1", "2"]')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[[class.qa.rubric.criteria]][1].pointwise_levels: "
-                "pointwise 模式要求恰好 6 级（0–5），得到 3 级")
+    has(errors, "[[class.qa.rubric.criteria]][1].pointwise_levels: pointwise mode requires "
+                "exactly 6 levels (0-5), got 3")
 
 
 def test_class_pointwise_with_inherited_default_rubric_ok(env):
@@ -1402,14 +1679,23 @@ pairwise_prompt = "p"
     cfg = env.load(project_text=env.project(body=body))
     assert cfg.class_views["qa"].rubric.name == "default-text-v1"
     err = capsys.readouterr().err
-    assert "[[class.qa.rubric.criteria]]" in err and "内联 rubric 未生效" in err
+    assert "[[class.qa.rubric.criteria]]" in err and "the inline rubric has no effect" in err
+
+
+def test_class_selector_can_switch_to_another_packaged_rubric(env):
+    # 合并 ③：类选择器与全局选择器不同名时按类重新装载打包准则（全局 default:text
+    # 不变，该类拿到 default:ui 那份）。
+    body = CLASSIFY_BODY + '\n[class.qa.quality]\nrubric = "default:ui"\n'
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.rubric.name == "default-text-v1"
+    assert cfg.class_views["qa"].rubric.name == "default-ui-v1"
+    assert cfg.class_views["writing"].rubric.name == "default-text-v1"
 
 
 def test_class_inline_selector_without_table_errors(env):
     body = CLASSIFY_BODY + '\n[class.qa.quality]\nrubric = "inline"\n'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[class.qa.quality].rubric: rubric = "inline" 但未提供 '
-                "[[class.qa.rubric.criteria]]")
+    has(errors, '[class.qa.quality].rubric: rubric = "inline" but [[class.qa.rubric.criteria]] is not provided')
 
 
 def test_class_inherits_global_inline_rubric(env):
@@ -1429,7 +1715,7 @@ instruction = "你是问答类指令的标注员。"
 examples = [{input = "问路", output = {intent = "nope", topic = "问路"}}]
 """
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[[class.qa.annotate.examples]][1].output: 未通过用户 Schema")
+    has(errors, "[[class.qa.annotate.examples]][1].output: failed user schema validation")
 
 
 def test_class_annotate_examples_dryrun_through_validator_hook(env):
@@ -1444,7 +1730,7 @@ schema_inline = '''
 examples = [{input = "问", output = {intent = "qa", topic = "这是一个特别长的主题短语"}}]
 """
     errors = env.errors(project_text=env.project(body=body, include_output=False))
-    has(errors, "[[class.qa.annotate.examples]][1].output: 未通过 output.validator 回调")
+    has(errors, "[[class.qa.annotate.examples]][1].output: failed the output.validator callback")
 
 
 def test_class_annotate_and_verify_overrides(env):
@@ -1465,7 +1751,7 @@ extra_criteria = "问答类须核对事实性。"
 def test_class_annotate_instruction_must_be_nonempty(env):
     body = CLASSIFY_BODY + '\n[class.qa.annotate]\ninstruction = " "\n'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[class.qa.annotate].instruction: 期望非空字符串")
+    has(errors, "[class.qa.annotate].instruction: expected non-empty string")
 
 
 def test_class_generate_overrides_with_styles(env):
@@ -1500,8 +1786,8 @@ name = "dup"
 prompt = ""
 """
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[[class.qa.generate.styles]][2].name: 表内 name 须唯一，得到重复的 "dup"')
-    has(errors, "[[class.qa.generate.styles]][2].prompt: 期望非空字符串")
+    has(errors, '[[class.qa.generate.styles]][2].name: name must be unique within the table, got duplicate "dup"')
+    has(errors, "[[class.qa.generate.styles]][2].prompt: expected non-empty string")
 
 
 # ── v1.8: [stream]/[segment]/[extract] parsing + defaults ───────────────────
@@ -1598,13 +1884,13 @@ on_error = "fail"
 
 def test_stream_family_enum_errors(env):
     errors = env.errors(project_text=env.project(body='[segment]\nstrategy = "auto"'))
-    has(errors, '[segment].strategy: 期望 "rules" | "llm" | "hybrid"，得到 "auto"')
+    has(errors, '[segment].strategy: expected "rules" | "llm" | "hybrid", got "auto"')
     errors = env.errors(project_text=env.project(body='[segment]\non_error = "skip"'))
-    has(errors, '[segment].on_error: 期望 "keep" | "fail"，得到 "skip"')
+    has(errors, '[segment].on_error: expected "keep" | "fail", got "skip"')
     errors = env.errors(project_text=env.project(body='[stream]\non_disorder = "drop"'))
-    has(errors, '[stream].on_disorder: 期望 "skip" | "fail"，得到 "drop"')
+    has(errors, '[stream].on_disorder: expected "skip" | "fail", got "drop"')
     errors = env.errors(project_text=env.project(body='[extract]\non_error = "keep"'))
-    has(errors, '[extract].on_error: 期望 "fallback" | "fail"，得到 "keep"')
+    has(errors, '[extract].on_error: expected "fallback" | "fail", got "keep"')
 
 
 def test_stream_trace_channels_accepted(env):
@@ -1620,18 +1906,18 @@ def test_segment_requires_process_mode(env):
     project = env.project(input_path=None, run_extra='mode = "generate_only"',
                           body=GEN_BODY + "standalone_count = 10\n\n" + SEG_ON)
     errors = env.errors(project_text=project)
-    has(errors, '[segment].enabled: segment.enabled = true 要求 run.mode = "process"')
+    has(errors, '[segment].enabled: segment.enabled = true requires run.mode = "process"')
 
 
 def test_segment_generate_mutually_exclusive(env):
     errors = env.errors(project_text=env.project(body=GEN_BODY + "\n" + SEG_ON))
-    has(errors, "[segment].enabled: segment.enabled = true 与 generate.enabled = true 互斥")
+    has(errors, "[segment].enabled: segment.enabled = true and generate.enabled = true are mutually exclusive")
 
 
 def test_segment_requires_annotate(env):
     errors = env.errors(project_text=env.project(
         annotate_body="enabled = false", body=SEG_ON))
-    has(errors, "[segment].enabled: segment.enabled = true 要求 annotate.enabled = true")
+    has(errors, "[segment].enabled: segment.enabled = true requires annotate.enabled = true")
 
 
 def test_segment_happy_path_loads(env):
@@ -1641,8 +1927,8 @@ def test_segment_happy_path_loads(env):
 
 def test_extract_requires_segment_and_ui_modality(env):
     errors = env.errors(project_text=env.project(body="[extract]\nenabled = true"))
-    has(errors, "[extract].enabled: extract.enabled = true 要求 segment.enabled = true")
-    has(errors, '[extract].enabled: extract.enabled = true 要求 run.modality = "ui"')
+    has(errors, "[extract].enabled: extract.enabled = true requires segment.enabled = true")
+    has(errors, '[extract].enabled: extract.enabled = true requires run.modality = "ui"')
 
 
 def test_extract_happy_on_ui_stream(env):
@@ -1654,16 +1940,16 @@ def test_extract_happy_on_ui_stream(env):
 
 def test_stream_order_by_domain(env):
     errors = env.errors(project_text=env.project(body='[stream]\norder_by = "timestamp"'))
-    has(errors, '[stream].order_by: 期望 "input_order" | "meta:<field>"，得到 "timestamp"')
+    has(errors, '[stream].order_by: expected "input_order" | "meta:<field>", got "timestamp"')
     errors = env.errors(project_text=env.project(body='[stream]\norder_by = "meta:"'))
-    has(errors, '[stream].order_by: 期望 "input_order" | "meta:<field>"，得到 "meta:"')
+    has(errors, '[stream].order_by: expected "input_order" | "meta:<field>", got "meta:"')
 
 
 def test_stream_meta_order_text_only(env):
     project = env.project(input_path=env.input_dir, modality="ui",
                           body='[stream]\norder_by = "meta:ts"')
     errors = env.errors(project_text=project)
-    has(errors, '[stream].order_by: "meta:<field>" 仅文本模态可用')
+    has(errors, '[stream].order_by: "meta:<field>" is only available in text modality')
 
 
 def test_stream_meta_order_ok_on_text(env):
@@ -1674,7 +1960,7 @@ def test_stream_meta_order_ok_on_text(env):
 def test_session_max_span_requires_meta_order(env):
     errors = env.errors(project_text=env.project(
         body="[stream]\nsession_max_span_s = 60"))
-    has(errors, '[stream].session_max_span_s: > 0 要求 order_by = "meta:<field>"')
+    has(errors, '[stream].session_max_span_s: > 0 requires order_by = "meta:<field>"')
     cfg = env.load(project_text=env.project(
         body='[stream]\norder_by = "meta:ts"\nsession_max_span_s = 60'))
     assert cfg.stream.session_max_span_s == 60
@@ -1685,7 +1971,7 @@ def test_gap_s_explicit_without_meta_warns_not_errors(env, capsys):
     assert cfg.stream.gap_s == 60                 # loads — a warning, not an error
     err = capsys.readouterr().err
     assert "warning:" in err
-    assert "[stream].gap_s" in err and "不会生效" in err
+    assert "[stream].gap_s" in err and "no effect" in err
 
 
 def test_gap_s_default_not_treated_as_intent(env, capsys):
@@ -1702,20 +1988,20 @@ def test_gap_s_explicit_with_meta_order_no_warning(env, capsys):
 
 def test_stream_key_element_domain(env):
     errors = env.errors(project_text=env.project(body='[stream]\nkey = ["device"]'))
-    has(errors, '[stream].key[1]: 期望 "meta:<field>"（仅文本）| "source_dir"，得到 "device"')
+    has(errors, '[stream].key[1]: expected "meta:<field>" (text only) | "source_dir", got "device"')
 
 
 def test_stream_key_meta_text_only(env):
     project = env.project(input_path=env.input_dir, modality="ui",
                           body='[stream]\nkey = ["source_dir", "meta:device"]')
     errors = env.errors(project_text=project)
-    has(errors, '[stream].key[2]: "meta:<field>" 分区键仅文本模态可用')
+    has(errors, '[stream].key[2]: a "meta:<field>" partition key is only available in text modality')
     assert not any(".key[1]" in e for e in errors)   # source_dir legal on UI
 
 
 def test_segment_window_minimum(env):
     errors = env.errors(project_text=env.project(body="[segment]\nwindow = 1"))
-    has(errors, "[segment].window: 期望 ≥ 2 的整数")
+    has(errors, "[segment].window: expected an integer >= 2")
     cfg = env.load(project_text=env.project(body="[segment]\nwindow = 2"))
     assert cfg.segment.window == 2
 
@@ -1724,7 +2010,7 @@ def test_segment_window_minimum(env):
 def test_sequence_frames_range_rejected(env, value):
     errors = env.errors(project_text=env.project(
         annotate_body=f'instruction = "标注"\nsequence_frames = {value}'))
-    has(errors, f"[annotate].sequence_frames: 期望 [2, 100] 内的整数，得到 {value}")
+    has(errors, f"[annotate].sequence_frames: expected an integer in [2, 100], got {value}")
 
 
 @pytest.mark.parametrize("value", [2, 100])
@@ -1757,7 +2043,7 @@ def test_sequence_frames_image_px_no_warning_at_2000(env, capsys):
 def test_session_max_len_exceeds_batch_warns(env, capsys):
     env.load(project_text=env.project(run_extra="batch_size = 100", body=SEG_ON))
     err = capsys.readouterr().err
-    assert "[stream].session_max_len" in err and "硬切" in err
+    assert "[stream].session_max_len" in err and "hard-cut" in err
 
 
 def test_session_max_len_within_batch_no_warning(env, capsys):
@@ -1776,12 +2062,12 @@ def test_stream_family_parked_warns_once_naming_tables(env, capsys):
     err = capsys.readouterr().err
     assert err.count("[segment].enabled") == 1    # one warning line, not one per table
     assert "[stream]" in err and "[segment]" in err and "[extract]" in err
-    assert "不会生效" in err
+    assert "no effect" in err
 
 
 def test_segment_enabled_false_alone_no_parked_warning(env, capsys):
     env.load(project_text=env.project(body="[segment]\nenabled = false"))
-    assert "不会生效" not in capsys.readouterr().err
+    assert "no effect" not in capsys.readouterr().err
 
 
 def test_rules_strategy_noise_filter_noop_warns(env, capsys):
@@ -1789,7 +2075,7 @@ def test_rules_strategy_noise_filter_noop_warns(env, capsys):
         body=SEG_ON + 'strategy = "rules"'))
     assert cfg.segment.strategy == "rules"
     err = capsys.readouterr().err
-    assert "[segment].noise_filter" in err and "不生效" in err
+    assert "[segment].noise_filter" in err and "no effect" in err
 
 
 def test_hybrid_strategy_no_noise_filter_warning(env, capsys):
@@ -1802,19 +2088,19 @@ def test_sequence_frames_noop_without_stream_warns(env, capsys):
         annotate_body='instruction = "标注"\nsequence_frames = 10'))
     assert cfg.annotate.sequence_frames == 10
     err = capsys.readouterr().err
-    assert "[annotate].sequence_frames" in err and "不会生效" in err
+    assert "[annotate].sequence_frames" in err and "no effect" in err
 
 
 def test_stream_quality_without_extract_hints_frame_digest_scoring(env, capsys):
     env.load(project_text=env.project(body=SEG_ON))
-    assert "帧摘要" in capsys.readouterr().err
+    assert "frame digests" in capsys.readouterr().err
 
 
 def test_stream_quality_with_extract_no_hint(env, capsys):
     body = SEG_ON + "\n[extract]\nenabled = true"
     project = env.project(input_path=env.input_dir, modality="ui", body=body)
     env.load(project_text=project)
-    assert "帧摘要" not in capsys.readouterr().err
+    assert "frame digests" not in capsys.readouterr().err
 
 
 def test_stream_explicit_non_trajectory_rubric_no_hint(env, capsys):
@@ -1823,7 +2109,7 @@ def test_stream_explicit_non_trajectory_rubric_no_hint(env, capsys):
     # be told it is doing trajectory scoring.
     body = SEG_ON + '\n[quality]\nrubric = "default:text"'
     env.load(project_text=env.project(body=body))
-    assert "帧摘要" not in capsys.readouterr().err
+    assert "frame digests" not in capsys.readouterr().err
 
 
 # ── v1.8 rubric: default:trajectory + stream empty-selector resolution ─────
@@ -1884,7 +2170,7 @@ def test_stream_classify_views_inherit_trajectory_selector(env):
 
 def test_segment_llm_existence_only_for_llm_strategies(env):
     errors = env.errors(project_text=env.project(body=SEG_ON + 'llm = "ghost"'))
-    has(errors, '[segment].llm: 引用的 profile "ghost" 不存在于 config.toml [llm.*]')
+    has(errors, '[segment].llm: referenced profile "ghost" does not exist in config.toml [llm.*]')
     # rules strategy makes zero LLM calls — the same reference is inert
     cfg = env.load(project_text=env.project(
         body=SEG_ON + 'strategy = "rules"\nllm = "ghost"'))
@@ -1894,7 +2180,7 @@ def test_segment_llm_existence_only_for_llm_strategies(env):
 def test_segment_llm_key_required_only_for_llm_strategies(env, monkeypatch):
     monkeypatch.delenv("LK_TEST_KEY_JUDGE")
     errors = env.errors(project_text=env.project(body=SEG_ON + 'llm = "judge"'))
-    has(errors, '环境变量 "LK_TEST_KEY_JUDGE" 未设置或为空')
+    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
     cfg = env.load(project_text=env.project(
         body=SEG_ON + 'strategy = "rules"\nllm = "judge"'))
     assert cfg.llm_profiles["judge"].api_key == ""    # unreferenced, key not resolved
@@ -1911,7 +2197,7 @@ def test_extract_llm_existence_and_key_when_enabled(env, monkeypatch):
     body = SEG_ON + 'strategy = "rules"\n\n[extract]\nenabled = true\nllm = "judge"'
     project = env.project(input_path=env.input_dir, modality="ui", body=body)
     errors = env.errors(project_text=project)
-    has(errors, '环境变量 "LK_TEST_KEY_JUDGE" 未设置或为空')
+    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
 
 
 NOVISION_PROFILE = """
@@ -1928,7 +2214,7 @@ def test_extract_llm_always_needs_vision(env):
     project = env.project(input_path=env.input_dir, modality="ui", body=body)
     errors = env.errors(config_text=BASE_CONFIG + NOVISION_PROFILE,
                         project_text=project)
-    has(errors, "[llm.novision].supports_vision: UI 模态被 extract 阶段引用")
+    has(errors, "[llm.novision].supports_vision: a profile referenced by the extract stage(s) in UI modality")
 
 
 def test_segment_llm_never_needs_vision_and_vision_resolved_derives(env):
@@ -1960,7 +2246,7 @@ def test_nonstream_quality_vision_still_required(env):
                           body='[quality]\nllm = "novision"')
     errors = env.errors(config_text=BASE_CONFIG + NOVISION_PROFILE,
                         project_text=project)
-    has(errors, "[llm.novision].supports_vision: UI 模态被 quality 阶段引用")
+    has(errors, "[llm.novision].supports_vision: a profile referenced by the quality stage(s) in UI modality")
 
 
 # ── v1.8 [class.<name>.extract] whitelist (S2) ─────────────────────────────
@@ -1978,9 +2264,8 @@ def test_class_extract_instruction_override(env):
 def test_class_extract_whitelist_rejects_other_keys(env):
     body = CLASSIFY_BODY + '\n[class.qa.extract]\nllm = "judge"\nenabled = true\n'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[class.qa.extract].llm: [class.*.extract] 不可覆盖该键"
-                "（白名单：instruction）")
-    has(errors, "[class.qa.extract].enabled: [class.*.extract] 不可覆盖该键")
+    has(errors, "[class.qa.extract].llm: [class.*.extract] cannot override this key (whitelist: instruction)")
+    has(errors, "[class.qa.extract].enabled: [class.*.extract] cannot override this key")
 
 
 # ── v1.9: [stitch] parsing + defaults + constraints (T17) ───────────────────
@@ -2034,19 +2319,19 @@ on_error = "fail"
 
 def test_stitch_enum_and_numeric_errors(env):
     errors = env.errors(project_text=env.project(body='[stitch]\nbias = "auto"'))
-    has(errors, '[stitch].bias: 期望 "conservative" | "llm"，得到 "auto"')
+    has(errors, '[stitch].bias: expected "conservative" | "llm", got "auto"')
     errors = env.errors(project_text=env.project(body='[stitch]\non_error = "skip"'))
-    has(errors, '[stitch].on_error: 期望 "keep" | "fail"，得到 "skip"')
+    has(errors, '[stitch].on_error: expected "keep" | "fail", got "skip"')
     errors = env.errors(project_text=env.project(body="[stitch]\nmax_open = 0"))
-    has(errors, "[stitch].max_open: 期望正整数，得到 0")
+    has(errors, "[stitch].max_open: expected positive integer, got 0")
     errors = env.errors(project_text=env.project(body="[stitch]\nvotes = 0"))
-    has(errors, "[stitch].votes: 期望正整数，得到 0")
+    has(errors, "[stitch].votes: expected positive integer, got 0")
 
 
 def test_stitch_requires_segment(env):
     errors = env.errors(project_text=env.project(body="[stitch]\nenabled = true"))
-    has(errors, "[stitch].enabled: stitch.enabled = true 要求 segment.enabled = true"
-                "（线索缝合仅作用于分段产物）")
+    has(errors, "[stitch].enabled: stitch.enabled = true requires segment.enabled = true "
+                "(thread stitching only applies to segmentation products)")
 
 
 def test_stitch_happy_path_loads(env):
@@ -2058,8 +2343,8 @@ def test_stitch_happy_path_loads(env):
 def test_stitch_votes_even_rejected(env, value):
     errors = env.errors(project_text=env.project(
         body=STITCH_ON + f"votes = {value}"))
-    has(errors, f"[stitch].votes: 期望 ≥ 1 的奇数（(verdict, thread_ref) "
-                f"严格多数决），得到 {value}")
+    has(errors, f"[stitch].votes: expected an odd number >= 1 (strict majority over "
+                f"(verdict, thread_ref)), got {value}")
 
 
 @pytest.mark.parametrize("value", [1, 3, 5])
@@ -2073,12 +2358,12 @@ def test_stitch_rules_strategy_warns(env, capsys):
     cfg = env.load(project_text=env.project(body=body))
     assert cfg.stitch.enabled is True                 # advisory, not an error
     err = capsys.readouterr().err
-    assert "[stitch].enabled" in err and "缝合输入为整会话粗段" in err
+    assert "[stitch].enabled" in err and "stitching consumes coarse whole-session segments" in err
 
 
 def test_stitch_hybrid_strategy_no_rules_warning(env, capsys):
     env.load(project_text=env.project(body=STITCH_ON))
-    assert "粗段" not in capsys.readouterr().err
+    assert "coarse whole-session segments" not in capsys.readouterr().err
 
 
 def test_stitch_trace_channel_accepted_eleven_values(env):
@@ -2094,10 +2379,10 @@ def test_stitch_trace_channel_accepted_eleven_values(env):
 
 def test_stitch_llm_existence_and_key_when_enabled(env, monkeypatch):
     errors = env.errors(project_text=env.project(body=STITCH_ON + 'llm = "ghost"'))
-    has(errors, '[stitch].llm: 引用的 profile "ghost" 不存在于 config.toml [llm.*]')
+    has(errors, '[stitch].llm: referenced profile "ghost" does not exist in config.toml [llm.*]')
     monkeypatch.delenv("LK_TEST_KEY_JUDGE")
     errors = env.errors(project_text=env.project(body=STITCH_ON + 'llm = "judge"'))
-    has(errors, '环境变量 "LK_TEST_KEY_JUDGE" 未设置或为空')
+    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
 
 
 def test_stitch_llm_not_referenced_when_disabled(env, monkeypatch):
@@ -2121,7 +2406,7 @@ def test_class_stitch_section_rejected(env):
     # exclusion from the per-class override whitelist
     body = CLASSIFY_BODY + '\n[class.qa.stitch]\nbias = "llm"\n'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[class.qa.stitch]: [class.*] 覆盖节不在白名单内")
+    has(errors, "[class.qa.stitch]: section is not in the [class.*] override whitelist")
 
 
 def test_stitch_payload_while_off_segment_on_warns_separately(env, capsys):
@@ -2132,7 +2417,7 @@ def test_stitch_payload_while_off_segment_on_warns_separately(env, capsys):
     assert cfg.stitch.enabled is False and cfg.stitch.max_open == 6
     err = capsys.readouterr().err
     assert "[stitch].enabled" in err and "stitch.enabled = false" in err
-    assert "不会生效" in err
+    assert "no effect" in err
 
 
 def test_stitch_payload_joins_parked_list_when_segment_off(env, capsys):
@@ -2140,7 +2425,7 @@ def test_stitch_payload_joins_parked_list_when_segment_off(env, capsys):
     env.load(project_text=env.project(body=body))
     err = capsys.readouterr().err
     assert "[segment].enabled" in err and "[stitch]" in err
-    assert "不会生效" in err
+    assert "no effect" in err
 
 
 def test_stitch_enabled_false_alone_no_noop_warning(env, capsys):
@@ -2191,14 +2476,14 @@ def test_console_section_parsed(env, monkeypatch):
 
 def test_console_mode_enum_rejected(env):
     errors = env.errors(config_text=BASE_CONFIG + '\n[console]\nmode = "fancy"\n')
-    has(errors, '[console].mode: 期望 "auto" | "rich" | "plain"，得到 "fancy"')
+    has(errors, '[console].mode: expected "auto" | "rich" | "plain", got "fancy"')
 
 
 @pytest.mark.parametrize("value", [0, 11, -3])
 def test_console_refresh_hz_out_of_range_rejected(env, value):
     errors = env.errors(config_text=BASE_CONFIG + f"\n[console]\nrefresh_hz = {value}\n")
-    has(errors, f"[console].refresh_hz: 期望 [1, 10] 内的整数")
-    has(errors, f"得到 {value}")
+    has(errors, f"[console].refresh_hz: expected an integer in [1, 10]")
+    has(errors, f"got {value}")
 
 
 @pytest.mark.parametrize("value", [1, 5, 10])
@@ -2209,14 +2494,14 @@ def test_console_refresh_hz_bounds_inclusive(env, value):
 
 def test_console_heartbeat_negative_rejected(env):
     errors = env.errors(config_text=BASE_CONFIG + "\n[console]\nheartbeat_s = -1\n")
-    has(errors, "[console].heartbeat_s: 期望非负整数，得到 -1")
+    has(errors, "[console].heartbeat_s: expected non-negative integer, got -1")
 
 
 def test_console_bool_keys_type_checked(env):
     errors = env.errors(config_text=BASE_CONFIG
                         + '\n[console]\nestimate = "yes"\ninteractive = 1\n')
-    has(errors, '[console].estimate: 期望布尔值，得到 "yes"')
-    has(errors, "[console].interactive: 期望布尔值，得到 1")
+    has(errors, '[console].estimate: expected boolean, got "yes"')
+    has(errors, "[console].interactive: expected boolean, got 1")
 
 
 def test_console_errors_aggregate_not_first_raise(env):
@@ -2225,9 +2510,9 @@ def test_console_errors_aggregate_not_first_raise(env):
     bad_console = BASE_CONFIG + "\n[console]\nrefresh_hz = 0\nheartbeat_s = -1\n"
     errors = env.errors(config_text=bad_console,
                         project_text=env.project(body='[quality]\nllm = "ghost"'))
-    has(errors, "[console].refresh_hz: 期望 [1, 10] 内的整数")
-    has(errors, "[console].heartbeat_s: 期望非负整数")
-    has(errors, '[quality].llm: 引用的 profile "ghost" 不存在')
+    has(errors, "[console].refresh_hz: expected an integer in [1, 10]")
+    has(errors, "[console].heartbeat_s: expected non-negative integer")
+    has(errors, '[quality].llm: referenced profile "ghost" does not exist')
     assert len(errors) >= 3
 
 
@@ -2238,8 +2523,8 @@ def test_console_unknown_key_warns_section_owned(env, capsys, monkeypatch):
     cfg = env.load(config_text=BASE_CONFIG + "\n[console]\nfancy_new_key = 1\n")
     assert isinstance(cfg, ResolvedConfig)
     err = capsys.readouterr().err
-    assert "[console].fancy_new_key: 未知键" in err
-    assert ":console: 未知键" not in err          # not flagged as an unknown table
+    assert "[console].fancy_new_key: unknown key" in err
+    assert ":console: unknown key" not in err          # not flagged as an unknown table
 
 
 def test_console_jsonl_forces_plain_over_explicit_config_rich(env, capsys,
@@ -2248,9 +2533,9 @@ def test_console_jsonl_forces_plain_over_explicit_config_rich(env, capsys,
     assert cfg.tool.log_format == "jsonl"
     assert cfg.console.mode_resolved == "plain"
     err = capsys.readouterr().err
-    assert ('console: log_format="jsonl" 强制 plain——显式 rich 不生效'
-            "（stderr 逐行可解析铁律，7.7）") in err
-    assert err.count("强制 plain") == 1            # WARN exactly once
+    assert ('console: log_format="jsonl" forces plain - an explicit rich has no '
+            "effect (the line-parseable stderr invariant, 7.7)") in err
+    assert err.count("forces plain") == 1            # WARN exactly once
 
 
 def test_console_jsonl_forces_plain_over_explicit_cli_rich(env, capsys,
@@ -2258,13 +2543,13 @@ def test_console_jsonl_forces_plain_over_explicit_cli_rich(env, capsys,
     cfg = env.load(config_text=JSONL_TOOL, cli=CliOverrides(console="rich"))
     assert cfg.console.mode == "rich"              # CLI precedence recorded
     assert cfg.console.mode_resolved == "plain"    # ... but jsonl wins (§7.7 铁律)
-    assert "强制 plain" in capsys.readouterr().err
+    assert "forces plain" in capsys.readouterr().err
 
 
 def test_console_jsonl_auto_plain_without_warning(env, capsys):
     cfg = env.load(config_text=JSONL_TOOL)
     assert cfg.console.mode_resolved == "plain"
-    assert "强制 plain" not in capsys.readouterr().err   # no explicit rich, no WARN
+    assert "forces plain" not in capsys.readouterr().err   # no explicit rich, no WARN
 
 
 def test_console_explicit_rich_honored_without_tty(env, rich_importable):
@@ -2280,8 +2565,8 @@ def test_console_rich_unimportable_degrades_plain_with_warning(env, capsys,
     cfg = env.load(config_text=CONSOLE_RICH)
     assert cfg.console.mode_resolved == "plain"
     err = capsys.readouterr().err
-    assert "console: rich 不可导入，降级 plain" in err
-    assert err.count("rich 不可导入") == 1         # WARN exactly once
+    assert "console: rich is not importable, demoted to plain" in err
+    assert err.count("rich is not importable") == 1         # WARN exactly once
 
 
 def test_console_cli_overrides_config_mode(env, rich_importable):
@@ -2365,18 +2650,18 @@ def test_embedding_context_window_parses(env):
 
 def test_context_window_negative_is_error(env):
     errors = env.errors(config_text=_cw_config(-1))
-    has(errors, "[llm.default].context_window: 期望非负整数，得到 -1")
+    has(errors, "[llm.default].context_window: expected non-negative integer, got -1")
 
 
 def test_context_window_non_positive_budget_is_error(env):
     # cw == max_output_tokens (default 4096): margin swallows everything (V6)
     errors = env.errors(config_text=_cw_config(4096))
-    has(errors, "[llm.default].context_window: 声明窗口下预算非正")
+    has(errors, "[llm.default].context_window: declared window leaves a non-positive budget")
     # embedding flavor: cw ≤ margin floor (V15)
     config = BASE_CONFIG.replace('model = "bge"',
                                  'model = "bge"\ncontext_window = 200', 1)
     errors = env.errors(config_text=config)
-    has(errors, "[embedding.emb].context_window: 声明窗口下预算非正")
+    has(errors, "[embedding.emb].context_window: declared window leaves a non-positive budget")
 
 
 def test_default_image_px_validation(env):
@@ -2389,8 +2674,7 @@ def test_default_image_px_validation(env):
                                  "supports_structured_output = true\n"
                                  "default_image_px = 4096", 1)
     errors = env.errors(config_text=config)
-    has(errors, "[llm.default].default_image_px: 期望 ≤ max_image_px（2048），"
-                "得到 4096")
+    has(errors, "[llm.default].default_image_px: expected <= max_image_px (2048), got 4096")
 
 
 def test_removed_use_vision_key_is_directed_error(env, capsys):
@@ -2398,11 +2682,11 @@ def test_removed_use_vision_key_is_directed_error(env, capsys):
     for literal in ("false", "true"):
         errors = env.errors(project_text=env.project(
             body=SEG_ON + f"use_vision = {literal}"))
-        has(errors, "[segment].use_vision: segment.use_vision 已于 v1.11 移除")
-        has(errors, "supports_vision 自动决定")
-        has(errors, "请将 segment.llm 指向纯文本 profile")
+        has(errors, "[segment].use_vision: segment.use_vision was removed in v1.11")
+        has(errors, "derived automatically from supports_vision")
+        has(errors, "point segment.llm at a text-only profile")
     # never double-reported through the unknown-key forward-compat WARN
-    assert "use_vision: 未知键" not in capsys.readouterr().err
+    assert "use_vision: unknown key" not in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("modality,strategy,profile,expected", [
@@ -2447,7 +2731,7 @@ def test_segment_vision_window_image_px_warning(env, capsys):
 def test_undeclared_context_window_reference_warns_once(env, capsys):
     env.load()                                              # default referenced
     err = capsys.readouterr().err
-    assert "[llm.default].context_window: 被启用阶段引用但未声明" in err
+    assert "[llm.default].context_window: referenced by an enabled stage but not declared" in err
     assert err.count("[llm.default].context_window") == 1   # once per profile
     assert "[llm.judge].context_window" not in err          # unreferenced: silent
 
@@ -2462,8 +2746,8 @@ def test_static_system_precheck_error_when_nothing_fits(env):
     # annotate static = head 32 + instruction 300 + schema 87 ≥ 281.
     project = env.project(annotate_body=f'instruction = "{"标" * 300}"')
     errors = env.errors(config_text=_cw_config(4864), project_text=project)
-    has(errors, "[annotate]: 静态系统侧提示部件估算")
-    has(errors, "任何记录都装不下")
+    has(errors, "[annotate]: static system-side prompt parts estimated")
+    has(errors, "no record can fit")
 
 
 def test_static_system_precheck_warns_past_half_budget(env, capsys):
@@ -2473,13 +2757,13 @@ def test_static_system_precheck_warns_past_half_budget(env, capsys):
     cfg = env.load(config_text=_cw_config(5500), project_text=project)
     assert isinstance(cfg, ResolvedConfig)
     err = capsys.readouterr().err
-    assert "[annotate]: 静态系统侧提示部件估算" in err
+    assert "[annotate]: static system-side prompt parts estimated" in err
     assert "50%" in err
 
 
 def test_static_system_precheck_silent_with_room(env, capsys):
     env.load(config_text=_cw_config(131072))
-    assert "静态系统侧提示部件估算" not in capsys.readouterr().err
+    assert "static system-side prompt parts estimated" not in capsys.readouterr().err
 
 
 def test_min_window_guard_warns_at_floor_two(env, capsys):
@@ -2490,8 +2774,8 @@ def test_min_window_guard_warns_at_floor_two(env, capsys):
                    project_text=env.project(body=SEG_ON))
     assert isinstance(cfg, ResolvedConfig)
     err = capsys.readouterr().err
-    assert "[segment].window: 预算最坏保证装填量 w_min = 2" in err
-    assert "每帧皆接缝" in err
+    assert "[segment].window: worst-case guaranteed packing size w_min = 2" in err
+    assert "every frame is a seam" in err
 
 
 def test_min_window_guard_errors_below_repair_floor(env):
@@ -2500,7 +2784,7 @@ def test_min_window_guard_errors_below_repair_floor(env):
     body = SEG_ON + '\n[verify]\nenabled = true\npolicy = "repair"\nllm = "judge"'
     errors = env.errors(config_text=_cw_config(3200, max_out=1024),
                         project_text=env.project(body=body))
-    has(errors, "[segment].window: 预算最坏保证装填量 w_min = 2 < floor = 3")
+    has(errors, "[segment].window: worst-case guaranteed packing size w_min = 2 < floor = 3")
 
 
 def test_min_window_guard_drop_policy_keeps_floor_two(env, capsys):
@@ -2514,10 +2798,10 @@ def test_min_window_guard_drop_policy_keeps_floor_two(env, capsys):
 
 def test_min_window_guard_silent_without_budget_or_with_room(env, capsys):
     env.load(project_text=env.project(body=SEG_ON))          # budget off
-    assert "预算最坏保证装填量" not in capsys.readouterr().err
+    assert "worst-case guaranteed packing size" not in capsys.readouterr().err
     env.load(config_text=_cw_config(131072),                 # w_min 214 ≫ floor
              project_text=env.project(body=SEG_ON))
-    assert "预算最坏保证装填量" not in capsys.readouterr().err
+    assert "worst-case guaranteed packing size" not in capsys.readouterr().err
 
 
 def test_stitch_card_pool_worst_case_warns(env, capsys):
@@ -2530,9 +2814,9 @@ def test_stitch_card_pool_worst_case_warns(env, capsys):
     assert isinstance(cfg, ResolvedConfig)
     assert cfg.stitch.max_open == 4                          # untouched
     err = capsys.readouterr().err
-    assert ("[stitch].max_open: 缝合判定卡池最坏估算 4325 token > "
-            "输入预算 2316 token") in err
-    assert "不自动缩 max_open" in err
+    assert ("[stitch].max_open: worst-case stitch card-pool estimate 4325 tokens > "
+            "the input budget of 2316 tokens") in err
+    assert "max_open is never auto-shrunk" in err
 
 
 def test_stitch_card_pool_within_budget_or_undeclared_stays_silent(env, capsys):
@@ -2540,10 +2824,10 @@ def test_stitch_card_pool_within_budget_or_undeclared_stays_silent(env, capsys):
     body = STITCH_ON + "digest_max_chars = 100\n"
     env.load(config_text=_cw_config(3712, max_out=1024),
              project_text=env.project(body=body))
-    assert "缝合判定卡池" not in capsys.readouterr().err
+    assert "stitch card-pool" not in capsys.readouterr().err
     # undeclared stitch profile → the check never runs (budget off)
     env.load(project_text=env.project(body=STITCH_ON))
-    assert "缝合判定卡池" not in capsys.readouterr().err
+    assert "stitch card-pool" not in capsys.readouterr().err
 
 
 def test_static_precheck_error_takes_max_over_class_annotate_views(env):
@@ -2554,7 +2838,7 @@ def test_static_precheck_error_takes_max_over_class_annotate_views(env):
     body = CLASSIFY_BODY + f'\n[class.qa.annotate]\ninstruction = "{"标" * 300}"\n'
     errors = env.errors(config_text=_cw_config(4864),
                         project_text=env.project(body=body))
-    has(errors, "[annotate]: 静态系统侧提示部件估算 419 token ≥ 输入预算 281 token")
+    has(errors, "[annotate]: static system-side prompt parts estimated at 419 tokens >= the input budget of 281 tokens")
 
 
 def test_static_precheck_error_takes_max_over_class_verify_views(env):
@@ -2567,7 +2851,7 @@ def test_static_precheck_error_takes_max_over_class_verify_views(env):
     body = (CLASSIFY_BODY + '\n[verify]\nenabled = true\nllm = "judge"\n'
             + f'\n[class.qa.verify]\nextra_criteria = "{"标" * 300}"\n')
     errors = env.errors(config_text=config, project_text=env.project(body=body))
-    has(errors, "[verify]: 静态系统侧提示部件估算 496 token ≥ 输入预算 281 token")
+    has(errors, "[verify]: static system-side prompt parts estimated at 496 tokens >= the input budget of 281 tokens")
 
 
 def test_static_precheck_class_views_within_budget_stay_silent(env, capsys):
@@ -2577,7 +2861,7 @@ def test_static_precheck_class_views_within_budget_stay_silent(env, capsys):
     cfg = env.load(config_text=_cw_config(5500),
                    project_text=env.project(body=body))
     assert isinstance(cfg, ResolvedConfig)
-    assert "[annotate]: 静态系统侧提示部件估算" not in capsys.readouterr().err
+    assert "[annotate]: static system-side prompt parts estimated" not in capsys.readouterr().err
 
 
 # ── v1.12: [frame.*] 帧级分类与标注（SPEC-frame-annotation §3.1 七条约束） ────
@@ -2676,27 +2960,24 @@ enabled = false
 def test_frame_requires_stream_mode(env):
     # 约束·帧粒度要求流模式（两开关各自定位报错 + 非流模式指引）
     errors = env.errors(project_text=env.project(body=FRAME_CLASSIFY_ONLY))
-    has(errors, "[frame.classify].enabled: frame.classify.enabled = true 要求 "
-                "segment.enabled = true")
+    has(errors, "[frame.classify].enabled: frame.classify.enabled = true requires segment.enabled = true")
     has(errors, "classify + [class.<name>.annotate]")
     errors = env.errors(project_text=env.project(body=FRAME_ANNOTATE_ONLY))
-    has(errors, "[frame.annotate].enabled: frame.annotate.enabled = true 要求 "
-                "segment.enabled = true")
+    has(errors, "[frame.annotate].enabled: frame.annotate.enabled = true requires segment.enabled = true")
 
 
 def test_frame_class_requires_frame_classify(env):
     body = SEG_ON + '\n[frame.class.task_request.annotate]\ninstruction = "x"\n'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[frame.class.task_request]: [frame.class.*] 在场要求 "
-                "frame.classify.enabled = true")
+    has(errors, "[frame.class.task_request]: the presence of [frame.class.*] requires frame.classify.enabled = true")
 
 
 def test_frame_class_unknown_name_rejected(env):
     body = (SEG_ON + "\n" + FRAME_CLASSIFY_ONLY
             + '\n[frame.class.ghost.annotate]\ninstruction = "x"\n')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[frame.class.ghost]: 类名 "ghost" 不在 [[frame.classify.classes]] '
-                "中，可用：task_request、chitchat、other")
+    has(errors, '[frame.class.ghost]: class name "ghost" is not in [[frame.classify.classes]], '
+                "available: task_request, chitchat, other")
 
 
 def test_frame_class_whitelist_enforced(env):
@@ -2711,40 +2992,62 @@ instruction = "任务请求帧标注指令。"
     errors = env.errors(project_text=env.project(body=body))
     # v1.13：节白名单增 generate（时间流生成形态的帧内容契约；非本形态出现该节由
     # 定向 CONFIG_ERROR 接管，见 test_loader_generate_stream.py）
-    has(errors, "[frame.class.task_request.quality]: [frame.class.*] 覆盖节不在"
-                "白名单内（可用：annotate、generate）")
-    has(errors, "[frame.class.task_request.annotate].llm: [frame.class.*.annotate] "
-                "不可覆盖该键（白名单：instruction、examples、enabled）")
+    has(errors, "[frame.class.task_request.quality]: section is not in the [frame.class.*] "
+                "override whitelist (available: annotate, generate)")
+    has(errors, "[frame.class.task_request.annotate].llm: [frame.class.*.annotate] cannot "
+                "override this key (whitelist: instruction, examples, enabled)")
     # 白名单内键不误伤
     assert not any(".instruction" in e for e in errors)
+
+
+def test_frame_class_override_tables_must_be_tables(env):
+    body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY + "\n[frame.class]\ntask_request = 3\n"
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[frame.class.task_request]: expected table, got 3")
+    body = (SEG_ON + "\n" + FRAME_CLASSIFY_ONLY
+            + "\n[frame.class.task_request]\nannotate = 3\n")
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[frame.class.task_request.annotate]: expected table, got 3")
+
+
+def test_frame_class_examples_skip_dryrun_without_a_frame_schema(env):
+    # 帧分类开、帧标注关：没有帧 Schema 就没有校验器，类示例照常解析但不干跑
+    # （干跑是 Schema 侧的事，无 Schema 时静默跳过而不是报错）。
+    body = (SEG_ON + "\n" + FRAME_CLASSIFY_ONLY + """
+[frame.class.task_request.annotate]
+examples = [{input = "订票", output = {anything = 1}}]
+""")
+    cfg = env.load(project_text=env.project(body=body))
+    view = cfg.frame_class_views["task_request"]
+    assert view.examples[0].output == {"anything": 1}
+    assert cfg.frame_schema is None
 
 
 def test_frame_schema_exactly_one_source(env):
     body = SEG_ON + '\n[frame.annotate]\nenabled = true\ninstruction = "标"\n'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[frame.annotate].schema_path: 须恰好提供 schema_path 或 "
-                "schema_inline 其一，得到两者均缺失")
+    has(errors, "[frame.annotate].schema_path: exactly one of schema_path or schema_inline "
+                "must be provided, got neither")
     body = SEG_ON + "\n" + FRAME_ANNOTATE_ONLY + 'schema_path = "x.json"\n'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[frame.annotate].schema_inline: 与 schema_path 恰好提供其一"
-                "（互斥），得到两者均设置")
+    has(errors, "[frame.annotate].schema_inline: exactly one of schema_path / schema_inline "
+                "must be provided (mutually exclusive), got both set")
 
 
 def test_frame_schema_meta_validation_branches(env):
     prefix = SEG_ON + '\n[frame.annotate]\nenabled = true\ninstruction = "标"\n'
     errors = env.errors(project_text=env.project(
         body=prefix + "schema_inline = '{bad'\n"))
-    has(errors, "[frame.annotate].schema_inline: 期望合法 JSON")
+    has(errors, "[frame.annotate].schema_inline: expected valid JSON")
     errors = env.errors(project_text=env.project(
         body=prefix + "schema_inline = '[1, 2]'\n"))
-    has(errors, "[frame.annotate].schema_inline: 帧级 Schema 顶层必须为 JSON 对象")
+    has(errors, "[frame.annotate].schema_inline: frame schema must be a JSON object at the top level")
     errors = env.errors(project_text=env.project(
         body=prefix + 'schema_inline = \'{"type": "object", "properties": 3}\'\n'))
-    has(errors, "[frame.annotate].schema_inline: 未通过 JSON Schema draft 2020-12 "
-                "元 Schema 校验")
+    has(errors, "[frame.annotate].schema_inline: failed JSON Schema draft 2020-12 meta-schema validation")
     errors = env.errors(project_text=env.project(
         body=prefix + 'schema_inline = \'{"type": "array"}\'\n'))
-    has(errors, '[frame.annotate].schema_inline: 帧级 Schema 顶层 type 必须为 "object"')
+    has(errors, '[frame.annotate].schema_inline: frame schema top-level type must be "object"')
 
 
 def test_frame_schema_path_variant_and_unreadable(env):
@@ -2757,7 +3060,7 @@ def test_frame_schema_path_variant_and_unreadable(env):
     assert cfg.frame_annotate.schema_path == str(schema_file)
     errors = env.errors(project_text=env.project(
         body=prefix + 'schema_path = "ghost/frame.json"\n'))
-    has(errors, "[frame.annotate].schema_path: 无法读取 Schema 文件")
+    has(errors, "[frame.annotate].schema_path: cannot read schema file")
 
 
 def test_frame_schema_dangling_ref_is_config_error(env):
@@ -2766,7 +3069,7 @@ def test_frame_schema_dangling_ref_is_config_error(env):
     body = (SEG_ON + '\n[frame.annotate]\nenabled = true\ninstruction = "标"\n'
             + f"schema_inline = '''\n{bad}\n'''\n")
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[frame.annotate].schema_inline: 帧级 Schema 引用无法解析")
+    has(errors, "[frame.annotate].schema_inline: frame schema has an unresolvable reference")
 
 
 def test_frame_examples_dryrun_against_frame_schema(env):
@@ -2774,7 +3077,7 @@ def test_frame_examples_dryrun_against_frame_schema(env):
             + 'examples = [{input = "订票", '
               'output = {intent = "book", entities = 3}}]\n')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[[frame.annotate.examples]][1].output: 未通过帧级 Schema")
+    has(errors, "[[frame.annotate.examples]][1].output: failed frame schema validation")
 
 
 def test_frame_class_examples_dryrun_against_frame_schema(env):
@@ -2783,8 +3086,7 @@ def test_frame_class_examples_dryrun_against_frame_schema(env):
 examples = [{input = "订票", output = {intent = "book", entities = "上海"}}]
 """)
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[[frame.class.task_request.annotate.examples]][1].output: "
-                "未通过帧级 Schema")
+    has(errors, "[[frame.class.task_request.annotate.examples]][1].output: failed frame schema validation")
 
 
 def test_frame_meta_mode_guard(env):
@@ -2796,8 +3098,8 @@ schema_inline = '''
 '''
 """)
     errors = env.errors(project_text=env.project(body=body, include_output=False))
-    has(errors, "[output].meta_mode: 帧粒度（frame.classify / frame.annotate）"
-                '启用时不得为 "none"')
+    has(errors, '[output].meta_mode: must not be "none" when frame granularity (frame.classify '
+                "/ frame.annotate) is enabled")
     # sidecar 合法
     cfg = env.load(project_text=env.project(
         body=body.replace('meta_mode = "none"', 'meta_mode = "sidecar"'),
@@ -2808,21 +3110,21 @@ schema_inline = '''
 def test_frame_fallback_required_and_member(env):
     body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY.replace('fallback_class = "other"\n', "")
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[frame.classify].fallback_class: frame.classify.enabled = true "
-                "时必填，期望 [[frame.classify.classes]] 中的类名")
+    has(errors, "[frame.classify].fallback_class: required when frame.classify.enabled = true, "
+                "expected a class name from [[frame.classify.classes]]")
     body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY.replace('fallback_class = "other"',
                                                        'fallback_class = "ghost"')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[frame.classify].fallback_class: 引用的类名 "ghost" 不在 '
-                "[[frame.classify.classes]] 中，可用：task_request、chitchat、other")
+    has(errors, '[frame.classify].fallback_class: referenced class name "ghost" is not in '
+                "[[frame.classify.classes]], available: task_request, chitchat, other")
 
 
 def test_frame_fallback_with_empty_class_table_rejected(env):
     # fallback ∈ 帧类表 传递性地要求类表非空（v1.12 无独立 ≥N 类数规则）
     body = SEG_ON + '\n[frame.classify]\nenabled = true\nfallback_class = "x"\n'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[frame.classify].fallback_class: 引用的类名 "x" 不在 '
-                "[[frame.classify.classes]] 中，可用：（无）")
+    has(errors, '[frame.classify].fallback_class: referenced class name "x" is not in '
+                "[[frame.classify.classes]], available: (none)")
 
 
 def test_frame_classes_name_pattern_uniqueness_description(env):
@@ -2847,9 +3149,9 @@ description = "重复"
 name = "empty_desc"
 """
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[[frame.classify.classes]][1].name: 期望匹配 [a-z0-9_]+，得到 "Q-A"')
-    has(errors, '[[frame.classify.classes]][3].name: 表内 name 须唯一，得到重复的 "qa"')
-    has(errors, "[[frame.classify.classes]][4].description: 缺失必填键")
+    has(errors, '[[frame.classify.classes]][1].name: expected a match of [a-z0-9_]+, got "Q-A"')
+    has(errors, '[[frame.classify.classes]][3].name: name must be unique within the table, got duplicate "qa"')
+    has(errors, "[[frame.classify.classes]][4].description: missing required key")
 
 
 def test_frame_directed_probes(env, capsys):
@@ -2857,16 +3159,16 @@ def test_frame_directed_probes(env, capsys):
     body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY.replace(
         "enabled = true", 'enabled = true\nassignment = "single"')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[frame.classify].assignment: 帧级分类不提供 assignment")
+    has(errors, "[frame.classify].assignment: frame classification does not provide assignment")
     has(errors, "[classify].assignment")            # 指引指向序列级
     body = SEG_ON + "\n" + FRAME_ANNOTATE_ONLY + "self_consistency = 3\n"
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[frame.annotate].self_consistency: 帧级标注不提供 self_consistency")
+    has(errors, "[frame.annotate].self_consistency: frame annotation does not provide self_consistency")
     has(errors, "[annotate].self_consistency")      # 指引指向序列级
     # 永不经未知键前向兼容 WARN 双重上报
     err = capsys.readouterr().err
-    assert "[frame.classify].assignment: 未知键" not in err
-    assert "[frame.annotate].self_consistency: 未知键" not in err
+    assert "[frame.classify].assignment: unknown key" not in err
+    assert "[frame.annotate].self_consistency: unknown key" not in err
 
 
 def test_frame_class_examples_ignored_warns(env, capsys):
@@ -2878,12 +3180,12 @@ def test_frame_class_examples_ignored_warns(env, capsys):
     cfg = env.load(project_text=env.project(body=body))
     assert cfg.frame_classify.classes[0].examples == ("帮我订一张明天的高铁票",)
     err = capsys.readouterr().err
-    assert "[frame.classify].classes" in err and "不渲染" in err
+    assert "[frame.classify].classes" in err and "are not rendered" in err
 
 
 def test_frame_class_no_examples_no_render_warning(env, capsys):
     env.load(project_text=env.project(body=SEG_ON + "\n" + FRAME_CLASSIFY_ONLY))
-    assert "不渲染" not in capsys.readouterr().err
+    assert "are not rendered" not in capsys.readouterr().err
 
 
 def test_frame_parked_joins_parked_list_when_segment_off(env, capsys):
@@ -2892,7 +3194,7 @@ def test_frame_parked_joins_parked_list_when_segment_off(env, capsys):
     assert cfg.frame_classify.enabled is False
     err = capsys.readouterr().err
     assert "[segment].enabled" in err and "[frame]" in err
-    assert "不会生效" in err
+    assert "no effect" in err
 
 
 def test_frame_parked_no_warn_when_segment_on(env, capsys):
@@ -2915,7 +3217,7 @@ def test_frame_annotate_llm_needs_vision_on_ui(env):
     project = env.project(input_path=env.input_dir, modality="ui", body=body)
     errors = env.errors(config_text=BASE_CONFIG + NOVISION_PROFILE,
                         project_text=project)
-    has(errors, "[llm.novision].supports_vision: UI 模态被 frame.annotate 阶段引用")
+    has(errors, "[llm.novision].supports_vision: a profile referenced by the frame.annotate stage(s) in UI modality")
 
 
 def test_frame_classify_llm_never_needs_vision_and_vision_resolved_derives(env):
@@ -2950,16 +3252,15 @@ def test_frame_llm_existence_and_key_when_enabled(env, monkeypatch):
     body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY.replace(
         "enabled = true", 'enabled = true\nllm = "ghost"')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '[frame.classify].llm: 引用的 profile "ghost" 不存在于 '
-                "config.toml [llm.*]")
+    has(errors, '[frame.classify].llm: referenced profile "ghost" does not exist in config.toml [llm.*]')
     monkeypatch.delenv("LK_TEST_KEY_JUDGE")
     body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY.replace(
         "enabled = true", 'enabled = true\nllm = "judge"')
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '环境变量 "LK_TEST_KEY_JUDGE" 未设置或为空')
+    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
     body = SEG_ON + "\n" + FRAME_ANNOTATE_ONLY + 'llm = "judge"\n'
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, '环境变量 "LK_TEST_KEY_JUDGE" 未设置或为空')
+    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
 
 
 def test_frame_llm_not_referenced_when_disabled(env, monkeypatch):
@@ -2974,8 +3275,8 @@ def test_frame_annotate_instruction_required_when_enabled(env):
     body = (SEG_ON + "\n[frame.annotate]\nenabled = true\n"
             + f"schema_inline = '''\n{FRAME_SCHEMA}\n'''\n")
     errors = env.errors(project_text=env.project(body=body))
-    has(errors, "[frame.annotate].instruction: frame.annotate.enabled = true 时必填，"
-                "期望非空字符串")
+    has(errors, "[frame.annotate].instruction: required when frame.annotate.enabled = true, "
+                "expected a non-empty string")
 
 
 def test_frame_static_precheck_error_when_nothing_fits(env):
@@ -2985,8 +3286,8 @@ def test_frame_static_precheck_error_when_nothing_fits(env):
                                           f'instruction = "{"标" * 300}"'))
     errors = env.errors(config_text=_cw_config(4864),
                         project_text=env.project(body=body))
-    has(errors, "[frame.annotate]: 静态系统侧提示部件估算")
-    has(errors, "任何记录都装不下")
+    has(errors, "[frame.annotate]: static system-side prompt parts estimated")
+    has(errors, "no record can fit")
 
 
 def test_frame_classify_static_precheck_counts_class_table(env):
@@ -2995,7 +3296,7 @@ def test_frame_classify_static_precheck_counts_class_table(env):
         'description = "其余帧"', f'description = "{"类" * 300}"')
     errors = env.errors(config_text=_cw_config(4864),
                         project_text=env.project(body=body))
-    has(errors, "[frame.classify]: 静态系统侧提示部件估算")
+    has(errors, "[frame.classify]: static system-side prompt parts estimated")
 
 
 def test_frame_static_precheck_silent_with_room(env, capsys):
@@ -3004,8 +3305,8 @@ def test_frame_static_precheck_silent_with_room(env, capsys):
                    project_text=env.project(body=body))
     assert isinstance(cfg, ResolvedConfig)
     err = capsys.readouterr().err
-    assert "[frame.classify]: 静态系统侧提示部件估算" not in err
-    assert "[frame.annotate]: 静态系统侧提示部件估算" not in err
+    assert "[frame.classify]: static system-side prompt parts estimated" not in err
+    assert "[frame.annotate]: static system-side prompt parts estimated" not in err
 
 
 # ── v1.13: 新字段在时间流生成关闭时的缺省（形态覆盖见 test_loader_generate_stream） ──

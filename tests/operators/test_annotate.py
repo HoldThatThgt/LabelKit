@@ -24,6 +24,7 @@ from labelkit.operators.annotate import (
     build_annotate_prompt,
     build_frame_annotate_prompt,
 )
+from labelkit.operators.annotate import AnnotatePromptOptions
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
@@ -193,7 +194,8 @@ def test_no_examples_yields_system_plus_record_only():
 
 
 def test_temperature_passthrough():
-    bundle = build_annotate_prompt(text_record(), make_cfg(), SCHEMA_TEXT, temperature=0.7)
+    bundle = build_annotate_prompt(text_record(), make_cfg(), SCHEMA_TEXT,
+                                   AnnotatePromptOptions(temperature=0.7))
     assert bundle.temperature == 0.7
 
 
@@ -233,7 +235,8 @@ def test_ui_prompt_honors_ui_tree_max_chars():
 def test_repair_suffix_appended_to_final_text_part():
     repair = RepairContext(previous_output={"intent": "qa", "topic": "错", "difficulty": "easy"},
                            critiques_text="事实一致性: 主题字段与原始数据不符")
-    bundle = build_annotate_prompt(text_record(), make_cfg(), SCHEMA_TEXT, repair=repair)
+    bundle = build_annotate_prompt(text_record(), make_cfg(), SCHEMA_TEXT,
+                                   AnnotatePromptOptions(repair=repair))
     final = bundle.messages[-1].parts[-1].text
     assert final == (
         "[待标注数据] 帮我写一条请假条，明天上午要去医院\n"
@@ -246,7 +249,8 @@ def test_repair_suffix_appended_to_final_text_part():
 def test_repair_suffix_ui_modality_lands_on_tree_part():
     repair = RepairContext(previous_output={"a": 1}, critiques_text="x: y")
     cfg = make_cfg(modality="ui")
-    bundle = build_annotate_prompt(ui_record(), cfg, SCHEMA_TEXT, repair=repair)
+    bundle = build_annotate_prompt(ui_record(), cfg, SCHEMA_TEXT,
+                                   AnnotatePromptOptions(repair=repair))
     parts = bundle.messages[-1].parts
     assert [p.kind for p in parts] == ["text", "image", "text"]
     assert parts[2].text.startswith("[UI 控件树]\n")
@@ -495,7 +499,8 @@ def test_label_takes_class_effective_instruction_and_examples():
                                       output={"intent": "qa", "topic": "全局主题",
                                               "difficulty": "easy"}),)
     cfg = make_classified_cfg(examples=global_examples)
-    bundle = build_annotate_prompt(text_record(), cfg, SCHEMA_TEXT, label="writing")
+    bundle = build_annotate_prompt(text_record(), cfg, SCHEMA_TEXT,
+                                   AnnotatePromptOptions(label="writing"))
 
     # template structure unchanged: system, one message per class example, record
     assert [m.role for m in bundle.messages] == ["system", "user", "user"]
@@ -522,7 +527,8 @@ def test_label_none_falls_back_to_global_config():
     assert (build_annotate_prompt(text_record(), cfg, SCHEMA_TEXT)
             == build_annotate_prompt(text_record(), plain, SCHEMA_TEXT))
     # zero-override view ('qa') also equals the global assembly
-    assert (build_annotate_prompt(text_record(), cfg, SCHEMA_TEXT, label="qa")
+    assert (build_annotate_prompt(text_record(), cfg, SCHEMA_TEXT,
+                                  AnnotatePromptOptions(label="qa"))
             == build_annotate_prompt(text_record(), plain, SCHEMA_TEXT))
 
 
@@ -532,8 +538,7 @@ class _CapturingEngine:
     def __init__(self):
         self.prompts = []
 
-    async def complete_validated(self, profile, prompt, *, record_ids, batch_no,
-                                 record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
         from labelkit.common.contracts.types import Usage
         self.prompts.append(prompt)
         return ({"intent": "writing_assist", "topic": "诗歌创作", "difficulty": "easy"},
@@ -596,7 +601,8 @@ def test_annotate_record_threads_label_through_sc_path():
     cfg = make_classified_cfg(self_consistency=3)
     engine, metrics = _CapturingEngine(), _CapturingMetrics()
     ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
-    ann = asyncio.run(annotate_record(text_record(), ctx, label="writing"))
+    ann = asyncio.run(annotate_record(text_record(), ctx,
+                                      AnnotatePromptOptions(label="writing")))
 
     assert ann.sc == {"n": 3, "agreement_ratio": 1.0}
     assert len(engine.prompts) == 3
@@ -740,7 +746,8 @@ def test_keyframe_quota_invariants_across_shapes():
 def test_sequence_template_three_sections_in_order():
     cfg = make_cfg(modality="ui")
     ep = ui_episode(3)
-    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT, transitions=SEQ_TRANSITIONS)
+    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
+                                   AnnotatePromptOptions(transitions=SEQ_TRANSITIONS))
     parts = bundle.messages[-1].parts
 
     assert [p.kind for p in parts] == [
@@ -772,7 +779,8 @@ def test_sequence_template_transitions_none_omits_action_section():
 def test_sequence_template_downsamples_25_members_to_20_keyframes():
     cfg = make_cfg(modality="ui")                              # sequence_frames default 20
     ep = ui_episode(25)
-    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT, transitions=SEQ_TRANSITIONS)
+    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
+                                   AnnotatePromptOptions(transitions=SEQ_TRANSITIONS))
     parts = bundle.messages[-1].parts
 
     images = [p for p in parts if p.kind == "image"]
@@ -794,14 +802,15 @@ def test_sequence_template_fragment_lens_selects_quota_keyframes():
     cfg = make_cfg(modality="ui", sequence_frames=4)
     ep = ui_episode(25)
     quota = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
-                                  transitions=SEQ_TRANSITIONS,
-                                  fragment_lens=(20, 2, 3))
+                                  AnnotatePromptOptions(
+                                      transitions=SEQ_TRANSITIONS,
+                                      fragment_lens=(20, 2, 3)))
     kept = _keyframe_indexes(25, 4, (20, 2, 3))
     images = [p for p in quota.messages[-1].parts if p.kind == "image"]
     assert [p.image for p in images] == [ep.members[m].image for m in kept]
     assert any(20 <= m < 22 for m in kept)                 # small fragment kept
     plain = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
-                                  transitions=SEQ_TRANSITIONS)
+                                  AnnotatePromptOptions(transitions=SEQ_TRANSITIONS))
     uniform = _keyframe_indexes(25, 4)
     images_plain = [p for p in plain.messages[-1].parts if p.kind == "image"]
     assert [p.image for p in images_plain] == [ep.members[m].image
@@ -840,7 +849,8 @@ def test_stage_threads_fragment_lens_from_stitch_duck_mark():
 def test_text_sequence_degrades_to_steps_plus_digest():
     cfg = make_cfg()
     ep = make_episode(tuple(text_member(i) for i in range(4)))
-    with_steps = build_annotate_prompt(ep, cfg, SCHEMA_TEXT, transitions=SEQ_TRANSITIONS)
+    with_steps = build_annotate_prompt(
+        ep, cfg, SCHEMA_TEXT, AnnotatePromptOptions(transitions=SEQ_TRANSITIONS))
     parts = with_steps.messages[-1].parts
     assert [p.kind for p in parts] == ["text", "text"]         # ① + ③, no image
     assert parts[0].text == ACTION_SECTION
@@ -872,8 +882,10 @@ def test_sequence_repair_suffix_lands_on_digest_part_keeps_images():
     cfg = make_cfg(modality="ui")
     ep = ui_episode(3)
     repair = RepairContext(previous_output={"a": 1}, critiques_text="x: y")
-    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT, repair=repair,
-                                   transitions=SEQ_TRANSITIONS)
+    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
+                                   AnnotatePromptOptions(
+                                       repair=repair,
+                                       transitions=SEQ_TRANSITIONS))
     parts = bundle.messages[-1].parts
     # every keyframe image survives; the suffix concatenates onto the ③ text part
     assert [p.kind for p in parts] == [
@@ -893,7 +905,8 @@ def test_annotate_record_threads_transitions_through_sc_path():
     cfg = make_cfg(modality="ui", self_consistency=3)
     engine, metrics = _CapturingEngine(), _CapturingMetrics()
     ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
-    ann = asyncio.run(annotate_record(ui_episode(3), ctx, transitions=SEQ_TRANSITIONS))
+    ann = asyncio.run(annotate_record(
+        ui_episode(3), ctx, AnnotatePromptOptions(transitions=SEQ_TRANSITIONS)))
 
     assert ann.sc == {"n": 3, "agreement_ratio": 1.0}
     assert len(engine.prompts) == 3
@@ -912,8 +925,10 @@ def test_annotate_record_threads_transitions_through_repair_path():
     engine, metrics = _CapturingEngine(), _CapturingMetrics()
     ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
     repair = RepairContext(previous_output={"intent": "qa"}, critiques_text="a: b")
-    asyncio.run(annotate_record(ui_episode(2), ctx, repair=repair,
-                                transitions=SEQ_TRANSITIONS))
+    asyncio.run(annotate_record(ui_episode(2), ctx,
+                                AnnotatePromptOptions(
+                                    repair=repair,
+                                    transitions=SEQ_TRANSITIONS)))
 
     (prompt,) = engine.prompts                         # repair skips self-consistency
     parts = prompt.messages[-1].parts
@@ -947,10 +962,11 @@ def test_single_record_transitions_default_none_regression():
     cfg = make_cfg()
     rec = text_record()
     assert (build_annotate_prompt(rec, cfg, SCHEMA_TEXT)
-            == build_annotate_prompt(rec, cfg, SCHEMA_TEXT, transitions=None))
+            == build_annotate_prompt(rec, cfg, SCHEMA_TEXT,
+                                     AnnotatePromptOptions(transitions=None)))
     # a single record IGNORES passed transitions — no sequence sections leak in
-    with_steps = build_annotate_prompt(rec, cfg, SCHEMA_TEXT,
-                                       transitions=SEQ_TRANSITIONS)
+    with_steps = build_annotate_prompt(
+        rec, cfg, SCHEMA_TEXT, AnnotatePromptOptions(transitions=SEQ_TRANSITIONS))
     assert with_steps == build_annotate_prompt(rec, cfg, SCHEMA_TEXT)
     joined = "".join(p.text or "" for m in with_steps.messages for p in m.parts)
     assert "[动作序列]" not in joined and "[成员帧摘要]" not in joined
@@ -958,7 +974,8 @@ def test_single_record_transitions_default_none_regression():
     ui_cfg = make_cfg(modality="ui")
     ui_rec = ui_record()
     assert (build_annotate_prompt(ui_rec, ui_cfg, SCHEMA_TEXT)
-            == build_annotate_prompt(ui_rec, ui_cfg, SCHEMA_TEXT, transitions=None))
+            == build_annotate_prompt(ui_rec, ui_cfg, SCHEMA_TEXT,
+                                     AnnotatePromptOptions(transitions=None)))
 
 
 # ── v1.11 context-budget packing (spec 3.5.2 v1.11 段, §3.3⑥/V20/V27①) ───────
@@ -1020,8 +1037,7 @@ class _PromptEngine:
         self.prompts = []
         self.n_overflows = n_overflows
 
-    async def complete_validated(self, profile, prompt, *, record_ids, batch_no,
-                                 record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
         from labelkit.common.contracts.types import Usage
         self.prompts.append(prompt)
         if self.n_overflows > 0:
@@ -1038,12 +1054,14 @@ def _images(prompt) -> list:
 def test_build_prompt_k_eff_caps_below_config_first_last_kept():
     cfg = make_cfg(modality="ui", sequence_frames=20)
     ep = ui_episode(25)
-    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT, k_eff=6)
+    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
+                                   AnnotatePromptOptions(k_eff=6))
     kept = _keyframe_indexes(25, 6)
     assert [p for p in _images(bundle)] == [ep.members[m].image for m in kept]
     assert kept[0] == 0 and kept[-1] == 24         # first/last invariant
     # min with the config value: k_eff above the config cap is inert
-    assert build_annotate_prompt(ep, cfg, SCHEMA_TEXT, k_eff=99) == (
+    assert build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
+                                 AnnotatePromptOptions(k_eff=99)) == (
         build_annotate_prompt(ep, cfg, SCHEMA_TEXT))
 
 
@@ -1051,16 +1069,20 @@ def test_build_prompt_image_px_rides_bundle():
     cfg = make_cfg(modality="ui")
     ep = ui_episode(3)
     assert build_annotate_prompt(ep, cfg, SCHEMA_TEXT).image_px is None
-    assert build_annotate_prompt(ep, cfg, SCHEMA_TEXT, image_px=1536).image_px == 1536
+    assert build_annotate_prompt(
+        ep, cfg, SCHEMA_TEXT, AnnotatePromptOptions(image_px=1536)).image_px == 1536
 
 
 def test_build_prompt_none_none_byte_identical():
     # None/None = pre-v1.11 byte-identical (frozen-signature anchor).
     cfg = make_cfg(modality="ui")
     ep = ui_episode(25)
-    assert build_annotate_prompt(ep, cfg, SCHEMA_TEXT, transitions=SEQ_TRANSITIONS) == \
-        build_annotate_prompt(ep, cfg, SCHEMA_TEXT, transitions=SEQ_TRANSITIONS,
-                              k_eff=None, image_px=None)
+    assert build_annotate_prompt(
+        ep, cfg, SCHEMA_TEXT,
+        AnnotatePromptOptions(transitions=SEQ_TRANSITIONS)) == \
+        build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
+                              AnnotatePromptOptions(transitions=SEQ_TRANSITIONS,
+                                                    k_eff=None, image_px=None))
 
 
 def test_budget_k_eff_layer_images_eat_remainder():
@@ -1259,8 +1281,8 @@ class _FrameEngine:
         self.frame_output = frame_output or {"intent": "book_train",
                                              "entities": ["上海"]}
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids, batch_no, record=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
         if record_ids and record_ids[0] in self.fail_ids:
             raise SchemaViolation(["/intent: 枚举违规"], "{}")
@@ -1701,11 +1723,10 @@ class _SchemaRoutingEngine:
         self.calls = []
         self._outputs = list(outputs or [])
 
-    async def complete_validated(self, profile, prompt, schema=None, *,
-                                 record_ids, batch_no, record=None,
-                                 user_treatment=None):
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
         self.calls.append(_NS(profile=profile, prompt=prompt, schema=schema,
-                              user_treatment=user_treatment, record=record))
+                              user_treatment=scope.user_treatment,
+                              record=scope.record))
         output = (self._outputs.pop(0) if self._outputs
                   else {"task": "订票", "kind": "book"})
         return output, Usage(1, 1), 1, "m"
@@ -1785,14 +1806,16 @@ def test_self_consistency_vote_uses_class_effective_schema():
     engine = _SchemaRoutingEngine(list(samples))
     ctx = _NS(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(),
               batch_no=1)
-    ann = _asyncio.run(annotate_record(text_record(), ctx, label="writing"))
+    ann = _asyncio.run(annotate_record(text_record(), ctx,
+                                       AnnotatePromptOptions(label="writing")))
     assert ann.output == {"task": "B", "kind": "cancel"}      # kind 多数派
     assert ann.sc == {"n": 3, "agreement_ratio": 2 / 3}
 
     engine2 = _SchemaRoutingEngine(list(samples))
     ctx2 = _NS(cfg=cfg, schema_engine=engine2, metrics=_CapturingMetrics(),
                batch_no=1)
-    ann2 = _asyncio.run(annotate_record(text_record(), ctx2, label="qa"))
+    ann2 = _asyncio.run(annotate_record(text_record(), ctx2,
+                                        AnnotatePromptOptions(label="qa")))
     assert ann2.output == {"task": "A", "kind": "book"}       # 无分歧，取样本 #1
     assert ann2.sc == {"n": 3, "agreement_ratio": 1.0}
 
@@ -1819,10 +1842,127 @@ def test_pack_prompt_schema_est_prices_class_effective_schema():
     engine = _SchemaRoutingEngine()
     ctx = budget_ctx(cfg, engine)
 
-    _asyncio.run(annotate_record(text_record(), ctx, label="qa"))
+    _asyncio.run(annotate_record(text_record(), ctx,
+                                 AnnotatePromptOptions(label="qa")))
     assert len(engine.calls) == 1                # 全局 Schema 计价 ⇒ 装填通过
 
     with _pytest.raises(ContextOverflowError) as excinfo:
-        _asyncio.run(annotate_record(text_record(), ctx, label="writing"))
+        _asyncio.run(annotate_record(text_record(), ctx,
+                                     AnnotatePromptOptions(label="writing")))
     assert excinfo.value.phase == "precheck"
     assert len(engine.calls) == 1                # 溢出发生在派发前
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Stage 协议门面（spec §3.5.3 API / §4.3 契约①③④）与 sc 分歧计数器（§3.5.2）
+# ═════════════════════════════════════════════════════════════════════════════
+
+def _run_stage(cfg, batch, engine=None, metrics=None):
+    """驱动 AnnotateStage.run 的批循环外层（与 run_annotate_item 并列的门面驱动）。
+
+    @param cfg 已解析配置
+    @param batch 传给 run 的信封列表
+    @param engine 进程内 M8 桩；默认 _FrameEngine
+    @param metrics 计数/事件汇；默认 _FrameMetrics
+    @return (run 的返回值, engine, metrics)
+    """
+    engine = engine or _FrameEngine()
+    metrics = metrics or _FrameMetrics()
+    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    returned = _asyncio.run(AnnotateStage(cfg).run(batch, ctx))
+    return returned, engine, metrics
+
+
+def test_stage_run_returns_the_same_list_and_only_touches_active():
+    # spec §3.5.3 的 API 面 = Stage 协议唯一方法；§4.3 契约① 只处理 active、
+    # 契约③ 返回同一个列表对象（编排器唯一的算子驱动点是 stage.run）。
+    cfg = make_cfg()
+    active_a = PipelineItem(record=text_record())
+    active_b = PipelineItem(record=Record(
+        id="b" * 16, modality="text", text="另一条待标注文本",
+        raw={"instruction": "另一条待标注文本"}, ui_tree=None, image=None,
+        ref=RecordRef("data.jsonl", 2, None, ())))
+    dropped = PipelineItem(record=Record(
+        id="c" * 16, modality="text", text="重复文本", raw={"instruction": "重复文本"},
+        ui_tree=None, image=None, ref=RecordRef("data.jsonl", 3, None, ())),
+        status="dropped_dup")
+    failed = PipelineItem(record=Record(
+        id="d" * 16, modality="text", text="上游已失败", raw={"instruction": "上游已失败"},
+        ui_tree=None, image=None, ref=RecordRef("data.jsonl", 4, None, ())),
+        status="failed")
+    batch = [active_a, dropped, active_b, failed]
+
+    returned, engine, _metrics = _run_stage(cfg, batch)
+
+    assert returned is batch                     # 契约③：同一个 list 对象
+    assert len(batch) == 4                       # 契约②：绝不增删元素
+    assert [ids[0] for _p, _pr, _s, ids in engine.calls] == [
+        active_a.record.id, "b" * 16]
+    assert len(engine.calls) == 2                # 契约①：非 active 项零调用
+    assert active_a.annotation is not None and active_b.annotation is not None
+    assert dropped.status == "dropped_dup" and dropped.annotation is None
+    assert failed.status == "failed" and failed.annotation is None
+
+
+def test_stage_run_empty_active_batch_makes_no_calls():
+    cfg = make_cfg()
+    only_dropped = [PipelineItem(record=text_record(), status="dropped_lowq")]
+    returned, engine, metrics = _run_stage(cfg, only_dropped)
+    assert returned is only_dropped
+    assert engine.calls == [] and metrics.events == []
+    assert only_dropped[0].annotation is None
+    # 空批（列表本身为空）同样零调用零异常
+    empty: list[PipelineItem] = []
+    returned2, engine2, _ = _run_stage(cfg, empty)
+    assert returned2 is empty and engine2.calls == []
+
+
+def test_stage_run_single_record_failure_never_escapes_to_batch_level():
+    # §4.3 契约④：单条记录失败落 item.errors + status="failed"，绝不外溢到批层
+    # ——同批的兄弟照常完成标注。
+    cfg = make_cfg()
+    doomed = PipelineItem(record=text_record())          # id = "1cda030abc565f17"
+    sibling = PipelineItem(record=Record(
+        id="e" * 16, modality="text", text="兄弟记录", raw={"instruction": "兄弟记录"},
+        ui_tree=None, image=None, ref=RecordRef("data.jsonl", 9, None, ())))
+    batch = [doomed, sibling]
+    engine = _FrameEngine(fail_ids=(doomed.record.id,))
+
+    returned, engine, _metrics = _run_stage(cfg, batch, engine=engine)
+
+    assert returned is batch
+    assert doomed.status == "failed" and doomed.annotation is None
+    assert [e.kind for e in doomed.errors] == ["schema_violation"]
+    assert sibling.status == "active" and sibling.annotation is not None
+    assert sibling.errors == []
+
+
+def test_sc_full_disagreement_counts_the_report_counter():
+    # spec §3.5.2 self-consistency 段：字段级投票全体分歧 ⇒ 计入
+    # report.annotate.sc_disagreements（§6.4 v1.2 可选块）。
+    samples = [{"intent": "qa", "topic": "t1", "difficulty": "easy"},
+               {"intent": "other", "topic": "t2", "difficulty": "medium"},
+               {"intent": "chitchat", "topic": "t3", "difficulty": "hard"}]
+    cfg = make_cfg(self_consistency=3)
+    engine = _SchemaRoutingEngine(list(samples))
+    metrics = _FrameMetrics()
+    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ann = _asyncio.run(annotate_record(text_record(), ctx))
+
+    assert ann.output == samples[0]              # 平局回退首样本
+    assert ann.sc == {"n": 3, "agreement_ratio": 1 / 3}
+    assert metrics.counters["annotate.sc_disagreements"] == 1
+
+
+def test_sc_agreement_leaves_the_disagreement_counter_untouched():
+    agreeing = [{"intent": "qa", "topic": "t1", "difficulty": "easy"},
+                {"intent": "qa", "topic": "t2", "difficulty": "easy"},
+                {"intent": "other", "topic": "t3", "difficulty": "hard"}]
+    cfg = make_cfg(self_consistency=3)
+    engine = _SchemaRoutingEngine(list(agreeing))
+    metrics = _FrameMetrics()
+    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ann = _asyncio.run(annotate_record(text_record(), ctx))
+
+    assert ann.sc == {"n": 3, "agreement_ratio": 2 / 3}   # 明显多数派
+    assert "annotate.sc_disagreements" not in metrics.counters

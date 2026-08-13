@@ -64,8 +64,12 @@ from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import Record, RecordRef
 from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
 from labelkit.common.runtime.llm_client import LLMClient
-from labelkit.common.runtime.schema_engine import SchemaEngine, realize_schema
-from labelkit.operators.annotate import annotate_record
+from labelkit.common.runtime.schema_engine import (
+    CallScope,
+    SchemaEngine,
+    realize_schema,
+)
+from labelkit.operators.annotate import AnnotatePromptOptions, annotate_record
 from labelkit.operators.generate import GenerateStage, canonical_json
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
@@ -223,7 +227,7 @@ class _RecordingMetrics:
     def event(self, ev, *, stage, batch_no, record_ids=(), payload=None) -> None:
         self.events.append((ev, stage, batch_no, record_ids, payload or {}))
 
-    def record_provider_result(self, *, fatal: bool) -> None:
+    def record_provider_result(self, fatal: bool, *, hard: bool = False) -> None:
         self.count("provider.fatal" if fatal else "provider.ok")
 
 
@@ -328,8 +332,8 @@ async def test_annotate_record_real_deepseek_routes_per_class_schema():
                       ui_tree=None, image=None, ref=members[0].ref,
                       kind="sequence", members=members)
 
-    annotation = await annotate_record(sequence, ctx,          # ONE real call
-                                       label="ticket_booking")
+    annotation = await annotate_record(                        # ONE real call
+        sequence, ctx, AnnotatePromptOptions(label="ticket_booking"))
 
     # 产物过**类** Schema——全局 Schema 的字段集与之不相交，过了即证明按类路由
     jsonschema.Draft202012Validator(CLASS_SCHEMA).validate(dict(annotation.output))
@@ -367,7 +371,8 @@ async def test_realize_schema_prefixitems_passthrough_zai_structured_output():
         temperature=0.0)
 
     obj, usage, attempts, model = await ctx.schema_engine.complete_validated(
-        "default", prompt, schema=schema, batch_no=0)          # ONE real call
+        "default", prompt, schema=schema,                      # ONE real call
+        scope=CallScope(batch_no=0))
 
     frames = obj["frames"]
     assert len(frames) == 2                       # minItems = maxItems 钉死长度

@@ -20,6 +20,8 @@
 > 全绿、五工程 dry-run golden 对账（HEAD 基线同输出溯源）、examples/stream 全链
 > 实跑 + pty 面板/键盘真机验证。
 
+> **2026-08-14 整改修订注记**：本文的面板样板与行文案已随全库英文化**重采**（`account` / `stages` / `keys` / `breaker` / `elapsed` / `records` 等标签、键位提示行、中断横幅、counts 与 llm_usage 表头）；区块划分、数据源、布局与键位集**零改动**。plain 档的两条字节锚（进度行与终版摘要头）同批重冻结到英文串上，golden 家族继续逐字节钉死。决策 U1–U27 本身不变，本文保留为历史裁决记录。
+
 ## 1. 结论与形态
 
 **品类判定**（调研收敛，提案引用表 [C-1]–[C-20]）：LabelKit `run` 是一次性批处理，正确品类
@@ -127,32 +129,32 @@ NO_COLOR 不参与判定（裁决·NO_COLOR 剥色保布局）——rich 档下�
 
 ```
 2026-07-17T01:21:12+08:00 WARN  ingest  batch=1 bad_line file=s2.jsonl line=17 reason=missing_text_field
-2026-07-17T01:23:40+08:00 INFO  emitter batch=2 批 2 落盘：主输出 +18 行（累计 41），rejects +1（累计 3）
+2026-07-17T01:23:40+08:00 INFO  emitter batch=2 batch 2 flushed: main output +18 line(s) (total 41), rejects +1 (total 3)
 ────────────────────────────────────────────────────────────────────────────────────
- labelkit run · f3a9c04b7d21 · process/ui/stream+stitch · seed 42 · 已用 04:12 · ETA ~06:40
+ labelkit run · f3a9c04b7d21 · process/ui/stream+stitch · seed 42 · elapsed 04:12 · ETA ~06:40
  project examples/stream/project.toml → out/stream-labels.jsonl
 
- 批 3/5  ██████████████░░░░░░░░░░  记录 96/160 (scanned)
+ batch 3/5  ██████████████░░░░░░░░░░  records 96/160 (scanned)
 
- 段  segment ✓   stitch ✓   dedup ✓   extract ▶ 18/46   quality ·   annotate ·   verify ·
+ stages  segment ✓   stitch ✓   dedup ✓   extract ▶ 18/46   quality ·   annotate ·   verify ·
 
- 账  emitted 41   dup 3   lowq 5   verify 1   failed 0   noise 2   absorbed 88   stitched 2   threads 5
+ account  emitted 41   dup 3   lowq 5   verify 1   failed 0   noise 2   absorbed 88   stitched 2   threads 5
 
- LLM  default  在途 4/4  calls 213  重试 7  tok 412k↑ 96k↓  $0.83  p50 2.1s
-      judge    在途 2/4  calls 46   重试 0  tok 88k↑ 12k↓   $0.19  p50 3.4s
-      密钥 LABELKIT_KEY_A ok · _B 冷却12s · _C 禁用          熔断 0/20
- [?]帮助 [l]LLM展开 [e]错误条 [p]暂停 [q]脱离
+ LLM  default  in_flight 4/4  calls 213  retries 7  tok 412k↑ 96k↓  $0.83  p50 2.1s
+      judge    in_flight 2/4  calls 46   retries 0  tok 88k↑ 12k↓   $0.19  p50 3.4s
+      keys LABELKIT_KEY_A ok · _B cooldown 12s · _C disabled          breaker 0/20
+ [?]help [l]LLM expand [e]errors [p]pause [q]detach
 ────────────────────────────────────────────────────────────────────────────────────
 ```
 
 | 区块 | 内容 | 数据源（全部为既有结构字段，唯一新增采集点 = p50 延迟窗） |
 |---|---|---|
 | 标头 | run_id、mode/modality（stream/stitch 徽标）、seed、耗时、ETA（仅批总数分母可得时显示，裁决·批分母预扫复用；EMA 吞吐外推标 `~`） | `on_run_context(cfg, ...)`（裁决·监听协议五回调）；run_id 自 `run.start` 事件 |
-| 批进度 | UI 模态 `批 i/N` + scanned（输入预扫翻 `estimate=True` 复用，禁二次 scan，裁决·批分母预扫复用）；文本模态默认 `批 i`（`console.estimate=true` 换分母）；generate_only 相位内退化为 `生成 ▶ calls i/N · 已产 n 条`（calls 实时自 llm.call；**已产 于生成相位结束一次更新**——produced 为相位末计量） | `batch.start/end` 事件 + `on_estimate`（裁决·监听协议五回调、裁决·调用括号归属计数） |
+| 批进度 | UI 模态 `batch i/N` + scanned（输入预扫翻 `estimate=True` 复用，禁二次 scan，裁决·批分母预扫复用）；文本模态默认 `batch i`（`console.estimate=true` 换分母）；generate_only 相位内退化为 `generate ▶ calls i/N · produced n`（calls 实时自 llm.call；**produced 于生成相位结束一次更新**——produced 为相位末计量） | `batch.start/end` 事件 + `on_estimate`（裁决·监听协议五回调、裁决·调用括号归属计数） |
 | 段棋盘 | 仅启用 stage 按链序：`✓` 本批已过 / `▶` 进行中（**括号归属**的运行级累计 llm.call 完成数 / `estimate_run` 运行级 `*_calls` 分母，标「估算」；估算未送达时仅显示分子，裁决·调用括号归属计数）/ `·` 待走 | `on_stage`（裁决·阶段回调不入事件目录）+ `on_event(llm.call)` 括号归集 + `on_estimate` |
 | 状态账 | 九态计数，stream/stitch 键仅启用时在场、同 report.counts 口径（stitched/threads 展示 = 裁决·固定键集有界修订）；**emitted 分量 = `batch.end.active`（post-emit 恒等）**；批内随批末更新 | `on_event(batch.end)` + `counters()` 拉取 |
 | LLM | 每 profile：在途/上限（在途 = Σ 密钥 in_flight，口径 = 在线 HTTP 请求数，不含驻留/退避）、calls、retries、tok ↑↓、成本（未配价目 `—`）、p50 延迟（成功调用口径，有界窗 256）；密钥池行（**环境变量名** + ok/冷却剩余秒/禁用）；熔断 `fatal_streak/threshold`，打开时整行红 + 顶部横幅 | `snapshot()` 每 tick 一次 + `fatal_streak()`（裁决·监听协议五回调） |
-| 键位提示 / 中断态 | 交互启用时恒显示一行（`?` 展开全表）；SIGINT 后画布顶部横幅「正在优雅中断（≤30s）…」 | §3.4；`on_stop_requested`（裁决·监听协议五回调） |
+| 键位提示 / 中断态 | 交互启用时恒显示一行（`?` 展开全表）；SIGINT 后画布顶部横幅 `graceful interrupt in progress (≤30s)…` | §3.4；`on_stop_requested`（裁决·监听协议五回调） |
 
 运行结束：最后一次重绘后**定格**（裁决·结束定格留滚动历史）——终版摘要表（counts 逐项 = report.json）+
 per-stage 耗时横条 + llm_usage 小表 + rejects/trace 路径行；scrollback 保留完整

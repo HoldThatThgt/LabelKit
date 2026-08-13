@@ -101,7 +101,7 @@ class Ingestor:
   "missing_pair": 0, "index_conflict": 0,        // 仅 UI 模态会非零
   "bad_locations": [
     {"file": "ime-2026-06-30.jsonl", "line_no": 3,
-     "reason": "input.text_field \"instruction\" 未命中"}
+     "reason": "input.text_field \"instruction\" missed"}
   ]
 }
 ```

@@ -125,7 +125,7 @@ INFO  run     batch=0 segment: w_min=46 window=16 (budget)
 stderr 尾部的终版摘要（真实运行，退出码 0，全程约 248 秒）：
 
 ```
-   ── 终版摘要（与 report.counts 逐项一致）──
+   ── final summary (matches report.counts item by item) ──
    scanned=53  ingested=53  bad_input=0  generated=0
    dropped_dup=0  dropped_lowq=0  dropped_verify=0  failed=1  emitted=8
 ```
@@ -308,7 +308,7 @@ index 4（帧 5）的 `interruption`、index 8（帧 9）的 `context_switch` �
 
 **extract 的可靠性预算：按 70–80%/步做计划。**LLM zero-shot 动作推断的实测可靠性就在这个区间（Watch & Learn 70.5%、Sharingan 70–80% 且按动作类型不均衡）——每步 20–30% 的错误率会沿 episode 级联，**不要把单步 steps 当真值消费**。工具承诺的是缓解链而非单步正确性：`include_diff` 的树 diff 证据（默认开，可关做 A/B——对照读数就是 `extract.by_type` 分布与 verify 缺陷率）、verify 缺陷路由兜底（步骤↔标签不符会被打 `label_mismatch`）、quality 结构分软门（连贯性/噪声残留压分可疑段）。日常盯两个计数：`by_type.other` 占比异常升高或某类型塌缩 = 系统性劣化信号；`fallback_steps` 持续非零 = 摘取输出结构不稳，先查 trace 的 error 事件。
 
-**帧摘要贫瘠与 vision 补偿。**纯文本裁决的第一瓶颈是帧摘要保真度——摘要没抓到的实体，LLM 看不见。摘要贫瘠（可见文本节点为零或摘要长度趋零：画布类屏幕、ghost nodes）会计入 `report.stream.digest_poor_frames` 并打一次 WARN，WARN 文案给出的补偿动作是 v1.11 的新口径：**为 `segment.llm` 配置 `supports_vision = true` 的 profile**——窗口是否附图由所引 profile 的能力自动推导（选 profile 即选能力），原 `segment.use_vision` 键已随 v1.11 移除，配置里显式写出会直接报配置错误并附迁移指引。本工程的 default profile 支持视觉，多图窗口默认就开着（每帧一图、成本相应上去；想省钱就指向纯文本 profile）；本次真跑贫瘠计数为 0——fixture 的树信息充足，附图属于锦上添花。
+**帧摘要贫瘠与 vision 补偿。**纯文本裁决的第一瓶颈是帧摘要保真度——摘要没抓到的实体，LLM 看不见。摘要贫瘠（可见文本节点为零或摘要长度趋零：画布类屏幕、ghost nodes）会计入 `report.stream.digest_poor_frames` 并打一次 WARN，WARN 文案（`poor frame digest (zero visible text nodes): text-only boundary verdicts lack evidence; attach frame screenshots by pointing segment.llm at a supports_vision=true profile`）给出的补偿动作是 v1.11 的新口径：**为 `segment.llm` 配置 `supports_vision = true` 的 profile**——窗口是否附图由所引 profile 的能力自动推导（选 profile 即选能力），原 `segment.use_vision` 键已随 v1.11 移除，配置里显式写出会直接报配置错误并附迁移指引。本工程的 default profile 支持视觉，多图窗口默认就开着（每帧一图、成本相应上去；想省钱就指向纯文本 profile）；本次真跑贫瘠计数为 0——fixture 的树信息充足，附图属于锦上添花。
 
 **长 episode 的信度注记。**episode 超过 ~20 步后，LLM 对整段的判分信度会衰减（业界同证据）。两个缓解：质量侧改 pairwise（相对比较对长序列比绝对刻度稳）；或对超长段的分数降信任、把裁量交给人工抽检。
 

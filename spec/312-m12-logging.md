@@ -54,7 +54,7 @@ class ProgressListener(Protocol):        # v1.10（7.7 console 的订阅协议�
 
 四条纪律：① 旁路**不属于 trace 面**——五回调均不产生 TraceEvent、不受 `trace.channels` 过滤（7.2 事件目录零改动的充分条件）；`on_event` 的 payload 按 none 档预脱敏后转发（仅 listener 非 None 时执行，浅递归 strip 成本可忽略——U22）。② 全部回调必须 O(1)、无 I/O、无锁等待——重绘由消费方自己的节流 tick 驱动（渲染与事件源解耦）。③ **sink 侧异常防护（U23）**：MetricsSink 每次转发 `try/except Exception`——首次异常打一条 WARN 并置 listener 为 None（EventLog 写失败「warn 一次 + 关通道」同款纪律，3.12.4），listener 异常永不进入记录级/批级失败路径。④ `listener = None`（validate / 全部既有调用路径）时行为与 v1.9 逐字节一致。
 
-API 增量（均只增）：`MetricsSink.__init__` 增可选尾参 `listener`；增仅转发方法 `stage_begin(stage, batch_no)` / `run_estimate(est)` / `stop_requested()` 与两只读属性 `fatal_streak`（熔断行数据源）、`has_listener`（旁路在挂探针——M10 dry-run 让位门读之；U23 跳闸后永久 False）。plain 行格式（进度行/终版摘要）下沉为本层纯函数模块 `labelkit/common/observability/console_format.py`（U21——emitter 与 CLI 渲染器共用的单一事实源，v1.9 字符串逐字节钉死）。配套的 `LLMClient.snapshot()` 只读快照（密钥池三态 + 逐密钥用量镜像 + p50 有界样本窗）规格见 3.9.2；全部签名已入册于 CONTRACTS §7.8/§7.11/§7.12（签名）与 §7.9/§7.10/§8.4（行为与措辞）。
+API 增量（均只增）：`MetricsSink.__init__` 增可选尾参 `listener`；增仅转发方法 `stage_begin(stage, batch_no)` / `run_estimate(est)` / `stop_requested()` 与两只读属性 `fatal_streak`（熔断行数据源）、`has_listener`（旁路在挂探针——M10 dry-run 让位门读之；U23 跳闸后永久 False）。plain 行格式（进度行/终版摘要）下沉为本层纯函数模块 `labelkit/common/observability/console_format.py`（U21——emitter 与 CLI 渲染器共用的单一事实源，两串由 golden 快照逐字节钉死；2026-08-14 全库英文化把这两串**重冻结**到英文文案上：进度行 `\rlabelkit: batch {batch_no}  emitted={emitted_total}  dropped_dup=N  dropped_lowq=N  dropped_verify=N  failed=N`、终版摘要头 `   ── final summary (matches report.counts item by item) ──`；键集、行结构与信息集不变，仅语言变）。配套的 `LLMClient.snapshot()` 只读快照（密钥池三态 + 逐密钥用量镜像 + p50 有界样本窗）规格见 3.9.2；全部签名已入册于 CONTRACTS §7.8/§7.11/§7.12（签名）与 §7.9/§7.10/§8.4（行为与措辞）。
 
 ### 3.12.4 行为规格
 

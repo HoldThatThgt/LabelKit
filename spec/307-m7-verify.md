@@ -20,7 +20,7 @@ user:   [任务指令] {annotate.instruction}
 
 「先意见后结论」的顺序固定，利用自回归生成让结论以意见为条件（chain-of-thought 评审，Zheng et al. [20]）。judge profile 应配置为与标注 profile 不同的模型（自我评审存在自增强偏差 [20]），M1 在两 profile 的 model 字段相同时打印 warning（不阻断）。
 
-**按类取值（v1.7）。**classify 启用且记录带类标签时，本节模板的 `[任务指令]` 段与 `{verify.extra_criteria}` 均取该类有效值（分别为 `class_views[label]` 的 annotate.instruction 与 verify.extra_criteria，3.1.4 按类覆盖合并行）——按类标注配全局评审指令是语义错位，故两处同步取类值。`build_verify_prompt` 增 `label` 形参，`_judge_round` / `_reannotate` 透传（repair 重标注调 `annotate_record(..., label=...)`，3.5.2 按类取值段）；policy / max_repair_rounds / llm / judges 恒为全局（5.2 按类覆盖白名单表）。trace `verify.verdict` 事件 payload 增 `label` 字段（仅 classify 启用时携带，7.2 只增不改）。
+**按类取值（v1.7）。**classify 启用且记录带类标签时，本节模板的 `[任务指令]` 段与 `{verify.extra_criteria}` 均取该类有效值（分别为 `class_views[label]` 的 annotate.instruction 与 verify.extra_criteria，3.1.4 按类覆盖合并行）——按类标注配全局评审指令是语义错位，故两处同步取类值。`build_verify_prompt` 经 `options.label` 取值，`_judge_round` / `_reannotate` 透传（repair 重标注调 `annotate_record(record, ctx, AnnotatePromptOptions(label=…, …))`，3.5.2 按类取值段）；policy / max_repair_rounds / llm / judges 恒为全局（5.2 按类覆盖白名单表）。trace `verify.verdict` 事件 payload 增 `label` 字段（仅 classify 启用时携带，7.2 只增不改）。
 
 **多评审团（可选，v1.2）：**`verify.judges`（array，默认 `[]`，与 `quality.judges` 语义一致）非空时启用评审团：空 = 单评审走 `verify.llm`，本节既有行为完全不变；非空须为**奇数个** profile 引用（M1 校验，不满足报错退出码 2）。各 judge 按本节同一模板**各自独立**评审（互不可见对方意见），最终 `verdict` 取多数票；各方 `critiques` 全部合并保留进 `VerificationResult.critiques`（4.2），每条标注来源——条目增加 `judge` 字段（= profile 名）。trace 事件 `verify.verdict` 相应改为**每 judge 一条**，payload 新增 `judge` 字段（字段只增不改，7.2 事件契约向后兼容）。`policy = "repair"` 回喂 M5 时，[审核意见] 段 = 全部投 fail 的 judge 的 critiques 合并（各条前缀来源 judge 名）。成本为单评审的 |judges| 倍，宜配置 3 个异构小模型 profile 而非加倍调用同一大模型。**背书：**多个较小模型组成的评审团（PoLL）在三种评审设置、六个数据集上优于单一大模型评审，因跨模型家族的多样性显著降低单模型自增强偏差，且成本比单一大评审低 7 倍以上（Verga et al. [32]）——与本节「judge 独立于标注模型」是同一去偏原则的推广。
 
@@ -51,7 +51,7 @@ user:   [任务指令] {annotate.instruction}
 2. **同步按批位置序执行全部成员手术**（「先到先得」变为确定性「位次得」）——**收缩**：`defect.members` 指认帧 `absorbed → dropped_noise` + duck-typed `off_task_member` 标（rejects 归因 stage="verify"、reason="off_task_member"，3.11.2）；**回收**（三级判定）：同 `session_id` 的批内 `dropped_noise` 噪声池帧经 `segment.judge_window` 直调复裁（3.14.3；relation ∈ {continues, advances} 即回收 `dropped_noise → absorbed`、按序键插回 `members`）→ 缺帧在相邻 episode 手中：**只标记、不跨段夺帧**（boundary_flags 计数）→ 无处可寻：缺陷条目增顶层键 `suspected = "capture_gap"`（代码侧标注，非 LLM 输出——`detail` 在 Schema 中为字符串，故 suspected 以兄弟键落在缺陷条目上；所属会话曾被 batch_size 硬切的帧改标 `"session_split"`——判定依据即 `_meta.stream.session_split`，S21，3.10.3）；
 3. **并发接缝重摘取**：手术触点经 `extract.extract_transition` 直调重摘（3.15.3；1–2 次/手术，重建 Transition 带 `detail.reseamed = true` 溯源）；
 4. **同步重建**：record 以新成员集重建（替换 `members`；序列 **id 不重算**，3.14.4 拼装行）、transitions 重编号——`Transition.index` 恒 = 元组下标、不变量 `len(transitions) = len(members) − 1` 恒真（4.2，S31）；
-5. **并发重标注与复审**：`annotate_record(..., transitions=重建值)`（3.5.2 transitions 形参段）→ 下一轮评审。
+5. **并发重标注与复审**：`annotate_record(record, ctx, AnnotatePromptOptions(transitions=重建值, …))`（3.5.2 transitions 取值段）→ 下一轮评审。
 
 **帧产物同步（v1.12）**：第 4 步同步重建之后、第 5 步重标注之前，对本轮执行了成员手术的 episode 同步两个帧产物 dict（`member_classifications` / `member_annotations`，4.1）——手术改了成员集，帧产物必须随成员集走，否则 members[] 落盘时出现无主条目或缺帧：
 
@@ -64,7 +64,7 @@ user:   [任务指令] {annotate.instruction}
 
 修复轮数计入 `verify.max_repair_rounds`（含首评，与本节非 stream 语义一致）。状态改写授权：手术在 `absorbed` 与 `dropped_noise` 间**双向**改写成员信封状态——4.3 契约 ②b 的 M7 修复路径豁免（契约①的唯一反向豁免），**禁止翻回 `active`**（帧与其 episode 不得双写主输出）。其余裁决：multi 扇出克隆兄弟的 membership 类手术**只标记**——仅原信封（首标签）可执行（S8，3.13.4 multi × episode 行）；多评审团下 defects = 投 fail 的 judge 的**并集**，按 (kind 枚举序, position, members) 确定性去重排序，同成员的互斥手术取先序（S31）；修复后**不重打分**——沿用修复前质量分 + `_meta.stream.repaired = true` 标记（6.3；multi 下亦用于消歧同 id 兄弟行）。观测面（M7 属主，`report.stream.verify` 子块，6.4）：`verify.membership_repairs`（执行的手术数）、`verify.boundary_flags`（只标记的边界判定数）、`verify.defects.<kind>`（逐缺陷类型计数）。
 
-**修复路径与上下文预算的交互（v1.11）。**① **升级触发（V21）**：`verdict = "fail"` ∧ `policy = "repair"` 是修复重标注质量阶梯换档（关键帧减半 + 分辨率上探 ≤ `max_image_px`，3.5.2 v1.11 段）的**唯一**触发面——升级只发生在修复路径、每记录 ≤ `verify.max_repair_rounds` 次，阶梯参数经 `annotate_record` 追加尾参传入（F3）。② **回收复裁的静态保证（V9/F14）**：成员回收的固定 [前成员, 候选, 后成员] 三帧复裁窗（直调 `segment.judge_window`）由 M1 预算护栏静态覆盖——`w_min` 护栏下限 `floor = 3` **仅当** `verify.enabled ∧ verify.policy = "repair" ∧ segment.enabled`（`policy = "drop"` 不构造复裁窗、不做三帧静态要求），`w_min < floor` → CONFIG_ERROR（3.1.4、3.9），由此在**先验计价**下保证修复路径运行期复裁不 `context_overflow`（v1.11 审计修订：校准值超先验的个案降为复裁失败的既有 mark-only 处置——记录级，永不 run 级；reactive-400 形态在该吞点补喂熔断恰一次，7.6 熔断矩阵）。③ 缺陷词表与预算无交互：`wrong_stitch` 的无条件闭合词表语义不变（3.7.2 四处同步闭集，stitch off 亦在场）。
+**修复路径与上下文预算的交互（v1.11）。**① **升级触发（V21）**：`verdict = "fail"` ∧ `policy = "repair"` 是修复重标注质量阶梯换档（关键帧减半 + 分辨率上探 ≤ `max_image_px`，3.5.2 v1.11 段）的**唯一**触发面——升级只发生在修复路径、每记录 ≤ `verify.max_repair_rounds` 次，阶梯参数经 `AnnotatePromptOptions` 的 `k_eff` / `image_px` 两字段传入（实现为 `dataclasses.replace(opts, …)`，F3）。② **回收复裁的静态保证（V9/F14）**：成员回收的固定 [前成员, 候选, 后成员] 三帧复裁窗（直调 `segment.judge_window`）由 M1 预算护栏静态覆盖——`w_min` 护栏下限 `floor = 3` **仅当** `verify.enabled ∧ verify.policy = "repair" ∧ segment.enabled`（`policy = "drop"` 不构造复裁窗、不做三帧静态要求），`w_min < floor` → CONFIG_ERROR（3.1.4、3.9），由此在**先验计价**下保证修复路径运行期复裁不 `context_overflow`（v1.11 审计修订：校准值超先验的个案降为复裁失败的既有 mark-only 处置——记录级，永不 run 级；reactive-400 形态在该吞点补喂熔断恰一次，7.6 熔断矩阵）。③ 缺陷词表与预算无交互：`wrong_stitch` 的无条件闭合词表语义不变（3.7.2 四处同步闭集，stitch off 亦在场）。
 
 **背书：**LLM-as-a-Judge 的可靠性、偏差类型（位置/冗长/自增强）与缓解手段出自 Zheng et al.（NeurIPS 2023）[20]；「批评意见回喂原模型迭代修正」是 Self-Refine（NeurIPS 2023）的 FEEDBACK→REFINE 循环 [21]，有界轮数与其停机设定一致；批评-修订两阶段结构同 Constitutional AI [22]。GUI-360 以同构的「LLM 质量过滤」环节筛选 GUI 轨迹数据 [14]。
 
@@ -152,14 +152,23 @@ VerificationResult(
 
 序列信封自 v1.13 起有**两个**来源：M14 分段产出的 episode（stream 模式）与 M6 时间流生成产出的**直装序列**（`generate_stream.enabled`，segment 关闭，3.6.5）。前者由 stage 层的流式驱动器承载、走 3.7.2 的缺陷词表变体；后者走经典路径，但**不能**照搬非序列模板——非流模板的 `[原始数据]` 段对 `kind = "sequence"` 的记录无内容可渲染（序列 Record 的 text/raw/ui_tree/image 恒 None，4.1），且缺陷词表变体的 `defects` 键被经典路径的 `VERDICT_SCHEMA` 禁止。裁决为**判决形**：调用方按「流式驱动器在场与否」选择模板变体，两条路径互不干扰。
 
-**装配面（additive 尾参，签名冻结）**：
+**装配面（选项对象，2026-08-14 收参）**：
 
 ```
-def build_verify_prompt(record, output, cfg, label=None, transitions=None,
-                        boundary_margin="", fragment_structure="",
-                        fit=None, verdict_form: bool = False) -> PromptBundle:
-    """verdict_form = True 且 record.kind == "sequence" ⇒ §10.16 判决形序列变体；
-       其余组合逐字节维持既有分支（流式驱动器从不传该参）。"""
+@dataclasses.dataclass(frozen=True)
+class VerifyPromptOptions:
+    """一次评审提示词的全部可选装配项；缺省实例 = v1.7 之前的单记录经典调用形。"""
+    label: str | None = None            # 类标签；None = 取全局指令与准则（v1.7）
+    transitions: tuple | None = None    # 序列步表；None = 整段省略 [动作序列]（v1.8）
+    boundary_margin: str = ""           # [边界余量] 段正文（驱动器预渲染）
+    fragment_structure: str = ""        # [片段结构] 段正文；空串 = 整段省略（v1.9）
+    fit: "_PromptFit | None" = None     # 面板最小预算装填状态；None = 预算关（v1.11）
+    verdict_form: bool = False          # 序列走 §10.16 判决形变体（v1.13 直装序列）
+
+def build_verify_prompt(record, output, cfg,
+                        options: VerifyPromptOptions | None = None) -> PromptBundle:
+    """options.verdict_form = True 且 record.kind == "sequence" ⇒ §10.16 判决形序列变体；
+       其余组合逐字节维持既有分支（流式驱动器从不置该字段）。"""
 
 def verify_verdict_sequence_system_text(extra_criteria: str) -> str:
     """判决形 system 段：三维评审 + 结论指令 + VERDICT_SCHEMA 结构句；无缺陷词表。"""
@@ -167,7 +176,7 @@ def verify_verdict_sequence_system_text(extra_criteria: str) -> str:
 
 要点（规格与理由）：
 
-- **选择判据 = 驱动器在场**：经典路径遇 `record.kind == "sequence"` 时传 `verdict_form=True`（流式驱动器在场时序列永不进入该函数）；`schema` 恒为既有 `VERDICT_SCHEMA`，与模板天然配对——修掉「驱动器门 = `segment.enabled` 而模板门 = `kind`」的错配。
+- **选择判据 = 驱动器在场**：经典路径遇 `record.kind == "sequence"` 时置 `options.verdict_form = True`（流式驱动器在场时序列永不进入该函数）；`schema` 恒为既有 `VERDICT_SCHEMA`，与模板天然配对——修掉「驱动器门 = `segment.enabled` 而模板门 = `kind`」的错配。
 - **模板形态**（verbatim 冻结于 CONTRACTS §10.16）：system = 判决指令（三维评审：遵循任务指令 / 与成员帧摘要证据的事实一致性 / 字段语义）+ 类有效 `extra_criteria`（为空整行省略，非流规则同款）+「先意见后结论」句 + `VERDICT_SCHEMA` 结构句；user = `[任务指令]` → `[成员帧摘要]` → `[标注结果]` 三段。**无缺陷表、无 `[边界余量]`、无 `[片段结构]`、无截图段**（直装序列为 text 模态）。
 - **成员摘要渲染**：逐成员 `{m}. {frame_digest(member, 400)}`（m 1 基、成员序），总量受 `input.ui_tree_max_chars` 约束——**首末行恒保留、中段整行丢弃**并以 `…(truncated N members)` 标记闭合（镜像 M5 的序列摘要渲染；算子间不互导，M7 自持同式副本）。
 - **预算装填**：`fit` 非 None 时成员摘要块是**唯一可裁槽位**（edges 裁剪计 `report.budget.truncations`），`[标注结果]` 与任务指令是记录级语义资产**恒计不裁**（V25③）；不可裁地板仍超预算 ⇒ `fit.overflow`（V10——调用方拒绝，请求从不发出）。
