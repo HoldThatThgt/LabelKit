@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Mapping
+from typing import Literal, Mapping, Sequence
 
 
 # ── config.toml 侧 ─────────────────────────────────────────────────────────
@@ -309,6 +309,57 @@ class GenerateStyle:
 
 
 @dataclass(frozen=True)
+class TierSpec:
+    """v1.14（裁决·档位即帧类构成）：``[[generate.stream.tiers]]`` 档位表的一项。
+
+    档位的定义**就是**该档序列的帧类构成集合——不携带质量指令、不控制帧内部语义
+    质量（那归各帧类的生成指令与温度）。
+    """
+
+    tier_rank: int                                # 档位序数（第几档的要求）：正整数、
+                                                  # 表内唯一、全表连续覆盖 1..N；也是
+                                                  # 配分平票与类内序数分块的确定性排序
+                                                  # 依据。工具**不赋予**序数高低任何
+                                                  # 质量方向语义（方向归用户）
+    weight: int                                   # 配额权重：整数 >= 1；类配额按整数域
+                                                  # 最大余额法在各档间零抽签配分
+                                                  # （apportion_tiers）
+    frame_classes: tuple[str, ...]                # 档位构成：该档序列**恰用**这些帧类
+                                                  # （enum 给「⊆」、contains 给「⊇」）；
+                                                  # 非空、档内互异、名 ∈ 帧类表、各档
+                                                  # 构成集合两两互异（M1 校验）
+
+
+def apportion_tiers(sequences: int, tiers: Sequence[TierSpec]) -> tuple[int, ...]:
+    """v1.14（裁决·零抽签配分）：把一个序列类的配额按权重配到各档。
+
+    整数域最大余额法（算术冻结，**禁止任何浮点中间量**——平票判定要一路喂给类内序数
+    分块 → truth → 工件字节 → 成员 id，是冻结面，不能悬在浮点比较语义上）：
+    基额 = ``(sequences × weight) // Σweight``、余额键 =
+    ``(sequences × weight) mod Σweight``，按余额键降序、平票按 ``tier_rank`` 升序逐档
+    +1，直至 Σ逐档 = sequences。是 ``(sequences, tiers)`` 的纯函数、零 rng——冻结的抽签
+    消费顺序表原文不动。落点在 common 而非 operators：M1 的逐非零配额对约束与 M6 计划
+    期共用同一实现，而分层纪律不许 common 依赖 operators（M6 反向导入）。
+
+    @param sequences 该类的序列尝试配额（>= 0；0 = 该类不参与，逐档得 0）
+    @param tiers 档位表，调用方按 ``tier_rank`` 升序传入（``GenerateStreamConfig.tiers``
+                 的存放序即此序），每档 ``weight >= 1``（M1 解析期强制）
+    @return 与入参同序（即 ``tier_rank`` 升序）的逐档配额元组；空档位表返回空元组
+    """
+    if not tiers:
+        return ()
+    total_weight = sum(spec.weight for spec in tiers)
+    scaled = [sequences * spec.weight for spec in tiers]
+    quotas = [value // total_weight for value in scaled]
+    remainders = [value % total_weight for value in scaled]
+    order = sorted(range(len(tiers)),
+                   key=lambda i: (-remainders[i], tiers[i].tier_rank))
+    for i in order[:sequences - sum(quotas)]:
+        quotas[i] += 1
+    return tuple(quotas)
+
+
+@dataclass(frozen=True)
 class GenerateStreamConfig:
     """v1.13（spec 5.2 [generate.stream]）：generate_only 的时间流形态。
 
@@ -335,6 +386,9 @@ class GenerateStreamConfig:
                                                   # 间隔须小于会话切分阈值，否则自相矛盾）
     ts_start: str = "2026-01-01T00:00:00Z"        # 时间流起点（ISO-8601；恒不取墙钟——
                                                   # 同 seed 双跑工件逐字节一致）
+    tiers: tuple[TierSpec, ...] = ()              # v1.14 档位表（[[generate.stream.tiers]]），
+                                                  # 按 tier_rank 升序存放；空元组 = 档位面
+                                                  # 整体不在场（字节等价 v1.13）
 
 
 @dataclass(frozen=True)
@@ -538,6 +592,14 @@ class FrameClassView:
     gen_schema: Mapping | None = None             # v1.13：该帧类的生成 Schema 解析产物
                                                   # （至多其一的 schema_path/schema_inline）；
                                                   # None = 纯文本帧（帧内容直取文本）
+    time_fields: Mapping[str, str] | None = None  # v1.14（裁决·绑定即剔除）：时间语义字段
+                                                  # 绑定表（[frame.class.<name>.generate
+                                                  # .time_fields]）——键 = 生成 Schema 顶层
+                                                  # 字段名, 值 ∈ 语义词表 {ts, gap_prev_s,
+                                                  # gap_next_s, elapsed_s}; 绑定字段从
+                                                  # LLM 面向的逐位 Schema 与契约行中剔除,
+                                                  # 值由机械回填尾声按已铺时间轴写回。
+                                                  # None = 无绑定
 
 
 # ── CLI 覆盖项与总聚合 ──────────────────────────────────────────────────────

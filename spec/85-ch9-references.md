@@ -207,3 +207,13 @@
 - [103] Process-mining 合成日志的真值方法学（2025）：噪音须在**计划层**注入方能保留标签溯源链接，事后加噪会切断真值归属。综述与实践记录（BPM / Process Mining 社区）。（v1.13「噪音在蓝图/交织层注入、`truth` 链接保留」的依据——对照事后加噪的不可对账形态）
 
 - [104] Chen, L. et al. AlpaGasus: Training a Better Alpaca with Fewer Data. ICLR 2024. arXiv:2307.08701.；NVIDIA. Nemotron-4 340B Technical Report. 2024. arXiv:2406.11704.（合成数据两条纪律：**过滤优于全量**（9k 精选超 52k 全量）、**判定与生成分离**（reward model / judge 独立于生成器）——v1.13 序列级相似度过滤与判决形评审拒绝采样的背书）
+
+- [105] Dong, Y. et al. SteerLM: Attribute Conditioned SFT as an (User-Steerable) Alternative to RLHF. EMNLP 2023 Findings. arXiv:2310.05344.；Wang, Z. et al. HelpSteer2: Open-source dataset for training top-performing reward models. NeurIPS 2024 Datasets & Benchmarks. arXiv:2406.08673.（显式多维属性条件化生成——属性是可控输入而非隐式偏好，且属性值随样本保留供下游消费（偏好对构造、课程学习）——v1.14 帧类构成档位「档位是显式声明的构成属性 + 档位序数随产物三点落盘」的方法学背书）
+
+- [106] BIMP / QBP Simulator：BPMN 2.0 离散事件业务流程仿真引擎（到达率、活动历时分布族、资源池为机械参数；仿真引擎盖章全部时间量）。工业工具，University of Tartu。bimp.cs.ut.ee（2026-08-18 访问；与 [101] Simod 同族——Simod 发现的仿真模型即由本引擎执行）（v1.14「时间量归时钟、内容量归 LLM」分工的工业形态背书）
+
+- [107] LogGenerator：由用户声明的过程模型经离散事件仿真产出合成事件日志的工具形态——**全部时间字段由引擎盖章**，模型侧从不自报时间量。过程挖掘社区工具（2026-08-18 访问）（v1.14 时间字段回填「绑定即剔除 + 机械回填」的同型实现先例）
+
+- [108] Kirchdorfer, L., Özdemir, K. et al. A Divide-and-Conquer Approach for Modeling Arrival Times in Business Process Simulation (AT-KDE). arXiv:2505.22381；扩展版 Arrival Times in Dynamic Environments: Modeling, Evaluation, and Benchmarking for Business Process Simulation. Process Science, 2026. DOI: 10.1007/s44311-026-00041-z. 开源：github.com/konradoezdemir/AT-KDE（静态到达间隔分布的局限与分段 KDE 的替代方案，20 个真实流程实测——v1.14 把 `frame_gap_s` 的间隔分布形扩展列为演进候选而非本版内置的依据，8.4 M6 行）
+
+- [109] JSON Schema. Draft 2020-12 Core / Validation 规范：`contains`、`allOf`、`const` 均为原生关键字（`contains` 断言数组中至少一个元素满足子模式，一个 Schema 对象只有一个 `contains` 键位故多条件须分 `allOf` 支）。json-schema.org/draft/2020-12（2026-08-18 访问；`jsonschema` ≥ 4.21 直接可校验，L2 无需翻译层）（v1.14 蓝图覆盖硬约束「enum 给 ⊆、contains 给 ⊇、合成构成恰等」的规范依据，3.8.1）

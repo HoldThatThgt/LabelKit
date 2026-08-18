@@ -1,28 +1,33 @@
-"""v1.13 time-stream generation integration tests — REAL endpoints, no mock LLMs.
+"""v1.13/v1.14 time-stream generation integration tests — REAL endpoints, no mocks.
 
-SPEC-stream-generation.md §3.9 integration row. Two endpoints, by design:
+SPEC-stream-generation.md §3.9 and SPEC-generation-tiers.md §3.7 integration
+rows. Two endpoints, by design:
 
-1./2. **DeepSeek** (``deepseek-v4-flash`` via api.deepseek.com/anthropic) — the
-   E2E face the stakeholder pinned for this feature (2026-08-13). The route
-   hard-rejects forced tool calls (400, E2E-FINDINGS #24) ⇒
-   ``supports_structured_output = false`` ⇒ L0 is fully off and the structural
-   compliance of the blueprint / realize calls rests on the two templates'
-   embedded structure contracts, with the schema engine's L1 deterministic
-   parse + L2 validation + L3 repair behind them. Case 1 drives the whole
-   ``generate_stream_all`` entry (one blueprint + one realize call for a single
-   two-to-three-step sequence, noise off) and pins the artifact/envelope
-   contracts; case 2 drives ``annotate_record`` through a per-sequence-class
-   annotation schema (裁决·按类标注 Schema).
-3. **z.ai** (``glm-5.2``) — the standing assumption behind
-   ``realize_schema``: ``prefixItems`` passes through a vendor structured-output
-   route (L0 on, ``supports_structured_output = true``) and the returned frames
-   obey the per-position contracts.
+1./2./4./5. **DeepSeek** (``deepseek-v4-flash`` via api.deepseek.com/anthropic)
+   — the E2E face the stakeholder pinned for this feature (2026-08-13, carried
+   over to v1.14 on 2026-08-18). The route hard-rejects forced tool calls (400,
+   E2E-FINDINGS #24) ⇒ ``supports_structured_output = false`` ⇒ L0 is fully off
+   and the structural compliance of the blueprint / realize calls rests on the
+   two templates' embedded structure contracts, with the schema engine's L1
+   deterministic parse + L2 validation + L3 repair behind them. Case 1 drives
+   the whole ``generate_stream_all`` entry (one blueprint + one realize call for
+   a single two-to-three-step sequence, noise off) and pins the
+   artifact/envelope contracts; case 2 drives ``annotate_record`` through a
+   per-sequence-class annotation schema (裁决·按类标注 Schema); case 4 (v1.14)
+   drives the same entry over a two-tier table and pins 裁决·构成恰等 on the
+   surviving envelopes plus the per-rank counters; case 5 (v1.14) pins the
+   mechanical time-field backfill against the artifact's own timestamps.
+3./6. **z.ai** (``glm-5.2``) — the standing assumptions behind the two internal
+   schema constructors under a vendor structured-output route (L0 on,
+   ``supports_structured_output = true``): case 3 pins ``realize_schema``'s
+   ``prefixItems`` passthrough, case 6 (v1.14) pins ``plan_schema``'s
+   ``cover_all`` products (``allOf`` + per-class ``contains``, 裁决·L0 待遇沿用).
 
 Skips: the DeepSeek cases skip themselves when ``LABELKIT_DEEPSEEK_KEY`` is
-absent; the z.ai case rides the conftest-wide ``LABELKIT_ZAI_KEY`` gate that
+absent; the z.ai cases ride the conftest-wide ``LABELKIT_ZAI_KEY`` gate that
 skips every integration-marked test. Both variables are auto-loaded from the
 git-ignored repo-root ``.env`` by tests/conftest.py. Every case stays at
-temperature 0 and spends at most three real LLM calls.
+temperature 0; the most expensive one (case 4) spends four real LLM calls.
 """
 from __future__ import annotations
 
@@ -30,6 +35,8 @@ import hashlib
 import json
 import os
 import random
+from dataclasses import replace
+from datetime import datetime
 
 import jsonschema
 import pytest
@@ -56,6 +63,7 @@ from labelkit.common.config.model import (
     SegmentConfig,
     StitchConfig,
     StreamConfig,
+    TierSpec,
     ToolConfig,
     TraceConfig,
     VerifyConfig,
@@ -67,10 +75,15 @@ from labelkit.common.runtime.llm_client import LLMClient
 from labelkit.common.runtime.schema_engine import (
     CallScope,
     SchemaEngine,
+    plan_schema,
     realize_schema,
 )
 from labelkit.operators.annotate import AnnotatePromptOptions, annotate_record
-from labelkit.operators.generate import GenerateStage, canonical_json
+from labelkit.operators.generate import (
+    GenerateStage,
+    canonical_json,
+    render_plan_prompt_texts,
+)
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 
@@ -133,6 +146,54 @@ FRAME_CLASSES = (
 )
 FRAME_VOCAB = {spec.name for spec in FRAME_CLASSES}
 
+TASK_FRAME_INSTRUCTION = ("产出发起任务的首帧：utterance 是用户说出的那一句话，"
+                          "entities 逐项列出其中的关键要素（地点、日期时段、车次"
+                          "坐席等），没有则给空数组。")
+FOLLOWUP_FRAME_INSTRUCTION = ("产出一句追问或修改：在已有诉求之上补充约束、更换要素"
+                              "或询问细节，口语、中文、一句话。")
+
+# ── v1.14 档位面（SPEC-generation-tiers §3.1/§3.2）──────────────────────────
+# 第三个帧类只服务档位面：两档的构成必须集合互异，故第 2 档比第 1 档多一类。
+CONFIRMATION = ClassSpec(name="confirmation",
+                         description="对助手结果的确认、收尾或致谢")
+CONFIRMATION_FRAME_INSTRUCTION = ("产出一句确认或收尾：认可助手给出的结果、拍板下单，"
+                                  "或补一句致谢，口语、中文、一句话。")
+# 权重 1:1 × sequences = 2 ⇒ 整数域最大余额法配分 (1, 1)：两档各真跑一条序列。
+TIERS = (TierSpec(tier_rank=1, weight=1,
+                  frame_classes=("task_request", "followup")),
+         TierSpec(tier_rank=2, weight=1,
+                  frame_classes=("task_request", "followup", "confirmation")))
+TIER_COMPOSITION = {spec.tier_rank: set(spec.frame_classes) for spec in TIERS}
+
+# ── v1.14 时间字段面（SPEC-generation-tiers §3.3）───────────────────────────
+# 两个帧类都结构化并各绑一个语义词：gap_next_s 的末帧 0.0 与 gap_prev_s 的首帧 0.0
+# 两个边界哨兵因此在同一条序列里同时受检。绑定字段从 LLM 面向的逐位 Schema 与契约
+# 行里剔除（裁决·绑定即剔除），故两条帧指令都不提它们。
+TIMED_TASK_SCHEMA = {
+    "type": "object",
+    "properties": {"utterance": {"type": "string"},
+                   "entities": {"type": "array", "items": {"type": "string"}},
+                   "duration": {"type": "number"}},
+    "required": ["utterance", "entities", "duration"],
+    "additionalProperties": False,
+}
+TIMED_FOLLOWUP_SCHEMA = {
+    "type": "object",
+    "properties": {"utterance": {"type": "string"},
+                   "wait_s": {"type": "number"}},
+    "required": ["utterance", "wait_s"],
+    "additionalProperties": False,
+}
+TIMED_SCHEMAS = {"task_request": TIMED_TASK_SCHEMA,
+                 "followup": TIMED_FOLLOWUP_SCHEMA}
+TIME_BINDINGS = {"task_request": {"duration": "gap_next_s"},
+                 "followup": {"wait_s": "gap_prev_s"}}
+TIMED_FOLLOWUP_INSTRUCTION = ("产出一句追问或修改：utterance 是用户说出的那一句话"
+                              "（在已有诉求之上补充约束、更换要素或询问细节，口语、"
+                              "中文、一句话）。")
+NOISE_INSTRUCTION = ("生成与任何任务都无关的干扰输入：用户随口说的闲聊、感叹或跑题的"
+                     "一句话，长度 5–20 字，不得包含任何可执行的诉求。")
+
 
 # ── fixtures: real profiles + a directly built ResolvedConfig (M1 shape) ────
 
@@ -158,20 +219,23 @@ def _zai_profile() -> LLMProfile:
         api_key=os.environ.get(ZAI_KEY_ENV, ""))
 
 
-def _class_view(name: str, *, sequences: int, schema=None) -> ClassView:
+def _class_view(name: str, *, sequences: int, schema=None,
+                len_range=(2, 3)) -> ClassView:
     return ClassView(
         name=name, quality=QualityConfig(), rubric=Rubric(name="r", criteria=()),
         annotate=AnnotateConfig(enabled=True, llm="default",
                                 instruction=ANNOTATE_INSTRUCTION),
         generate=GenerateConfig(enabled=True, llms=("default",),
                                 instruction=CLASS_INSTRUCTION, temperature=0.0,
-                                sequences=sequences, len_range=(2, 3)),
+                                sequences=sequences, len_range=len_range),
         verify=VerifyConfig(), extract=ExtractConfig(), schema=schema)
 
 
-def _frame_view(instruction: str, gen_schema=None) -> FrameClassView:
+def _frame_view(instruction: str, gen_schema=None,
+                time_fields=None) -> FrameClassView:
     return FrameClassView(instruction="", examples=(), enabled=True,
-                          gen_instruction=instruction, gen_schema=gen_schema)
+                          gen_instruction=instruction, gen_schema=gen_schema,
+                          time_fields=time_fields)
 
 
 def _cfg(profile: LLMProfile, *, class_schema=None) -> ResolvedConfig:
@@ -204,16 +268,52 @@ def _cfg(profile: LLMProfile, *, class_schema=None) -> ResolvedConfig:
         config_digest="sha256:0", project_digest="sha256:0",
         frame_classify=FrameClassifyConfig(classes=FRAME_CLASSES),
         frame_class_views={
-            "task_request": _frame_view("产出发起任务的首帧：utterance 是用户说出的"
-                                        "那一句话，entities 逐项列出其中的关键要素"
-                                        "（地点、日期时段、车次坐席等），没有则给"
-                                        "空数组。", FRAME_GEN_SCHEMA),
-            "followup": _frame_view("产出一句追问或修改：在已有诉求之上补充约束、"
-                                    "更换要素或询问细节，口语、中文、一句话。")},
+            "task_request": _frame_view(TASK_FRAME_INSTRUCTION, FRAME_GEN_SCHEMA),
+            "followup": _frame_view(FOLLOWUP_FRAME_INSTRUCTION)},
         generate_stream=GenerateStreamConfig(
             enabled=True, sessions=1, noise_ratio=0.0, duplicates=0,
             frame_gap_s=(5.0, 60.0), ts_start="2026-01-05T09:00:00+08:00"),
     )
+
+
+def _tiered_cfg() -> ResolvedConfig:
+    """v1.14 档位面的最小真跑配置（examples/synth-stream 的档位表同构缩微）：帧类
+    表三类、两档（构成两类 / 全三类、权重 1:1），单序列类 sequences = 2 ⇒ 逐档各
+    一条；len_range = [3, 3] 恰等最大构成大小（M1 长度可覆盖的下界），噪音与重发
+    全关 ⇒ 恰四次真实调用。"""
+    base = _cfg(_deepseek_profile())
+    views = dict(base.frame_class_views)
+    views["confirmation"] = _frame_view(CONFIRMATION_FRAME_INSTRUCTION)
+    return replace(
+        base,
+        class_views={"ticket_booking": _class_view("ticket_booking", sequences=2,
+                                                   len_range=(3, 3))},
+        frame_classify=replace(base.frame_classify,
+                               classes=FRAME_CLASSES + (CONFIRMATION,)),
+        frame_class_views=views,
+        generate_stream=replace(base.generate_stream, sessions=2, tiers=TIERS))
+
+
+def _timed_cfg() -> ResolvedConfig:
+    """v1.14 时间字段面的最小真跑配置：单序列类 sequences = 2、len_range = [3, 3]，
+    两个帧类都结构化且各绑一个语义词；噪音开、单会话（⇒ 两条序列交叉，序内口径要有
+    外来帧夹入才检得出）、重发一条（承源载荷面）⇒ 五次真实调用（两轮蓝图 + 帧实现
+    + 一批噪音）。配额取 2 而非 1 是作废容忍所需：一条序列偶发作废时另一条仍能承载
+    全部断言。"""
+    base = _cfg(_deepseek_profile())
+    return replace(
+        base,
+        class_views={"ticket_booking": _class_view("ticket_booking", sequences=2,
+                                                   len_range=(3, 3))},
+        frame_class_views={
+            "task_request": _frame_view(TASK_FRAME_INSTRUCTION, TIMED_TASK_SCHEMA,
+                                        TIME_BINDINGS["task_request"]),
+            "followup": _frame_view(TIMED_FOLLOWUP_INSTRUCTION,
+                                    TIMED_FOLLOWUP_SCHEMA,
+                                    TIME_BINDINGS["followup"])},
+        generate_stream=replace(base.generate_stream, noise_ratio=0.5,
+                                duplicates=1,
+                                noise_instruction=NOISE_INSTRUCTION))
 
 
 class _RecordingMetrics:
@@ -380,6 +480,169 @@ async def test_realize_schema_prefixitems_passthrough_zai_structured_output():
     assert str(frames[0]["utterance"]).strip()
     assert isinstance(frames[1], str) and frames[1].strip()
     # 整体再过一次包装器 Schema（prefixItems + items: false 封尾）
+    jsonschema.Draft202012Validator(schema).validate(obj)
+    assert attempts >= 1 and model
+    assert usage.prompt_tokens > 0 and usage.completion_tokens > 0
+
+
+# ── 4. DeepSeek: v1.14 帧类构成档位（裁决·构成恰等 + 逐档计数）───────────────
+
+@needs_deepseek
+async def test_generate_stream_tiers_real_deepseek_composition_and_counters():
+    """档位真跑：**幸存**序列的 members[] 帧类真值集合恰等于其档声明的构成
+    （enum 给「⊆」、contains 给「⊇」），逐档 planned/produced 如实落账。
+
+    作废容忍（E2E-FINDINGS 第 26 条先例）：断言只压幸存面并要求至少一条幸存——
+    L0 关端点上蓝图或帧实现偶发违约，按既有 plan_failures / realize_failures 作废
+    并让该序列缺席，不是本用例要钉的行为。
+    """
+    cfg = _tiered_cfg()
+    ctx = _ctx(cfg)
+
+    product = await GenerateStage(cfg).generate_stream_all(ctx)   # 4 real calls
+
+    # 计划期逐档落账：零抽签配分（sequences = 2、权重 1:1）⇒ 每档恰一条
+    assert ctx.metrics.counters.get("generate.stream.tiers.1.planned") == 1
+    assert ctx.metrics.counters.get("generate.stream.tiers.2.planned") == 1
+    assert product.envelopes, "两条计划序列全部作废，档位面无从断言"
+
+    produced: dict[int, int] = {}
+    for item in product.envelopes:
+        ranks = {member.ref.generator["tier_rank"]
+                 for member in item.record.members}
+        assert len(ranks) == 1                      # 一条序列恒属一档
+        rank = ranks.pop()
+        assert len(item.record.members) == 3        # len_range = [3, 3]
+        labels = {item.member_classifications[member.id].label
+                  for member in item.record.members}
+        assert labels == TIER_COMPOSITION[rank]     # 裁决·构成恰等
+        produced[rank] = produced.get(rank, 0) + 1
+    for rank, count in produced.items():
+        assert ctx.metrics.counters[f"generate.stream.tiers.{rank}.produced"] == count
+    assert sum(produced.values()) == len(product.envelopes) <= 2
+
+    # 工件面：truth 键序冻结（tier_rank 在 sequence 之后、frame_class 之前），
+    # 逐行档位与帧类自洽——档位身份可从数据反推对账，不必信任标签
+    for row in map(json.loads, product.artifact_lines):
+        assert list(row["truth"]) == ["session", "sequence_class", "sequence",
+                                      "tier_rank", "frame_class", "noise"]
+        assert (row["truth"]["frame_class"]
+                in TIER_COMPOSITION[row["truth"]["tier_rank"]])
+
+
+# ── 5. DeepSeek: v1.14 时间字段回填（裁决·绑定即剔除 / 序内间隔口径）─────────
+
+def _expected_time_value(stamps: list[datetime], position: int, term: str) -> float:
+    """从工件自身的 ts 独立复算一个语义词的期望值（不复用生产实现）。"""
+    if term == "gap_next_s":
+        return (round((stamps[position + 1] - stamps[position]).total_seconds(), 6)
+                if position + 1 < len(stamps) else 0.0)
+    assert term == "gap_prev_s"
+    return (round((stamps[position] - stamps[position - 1]).total_seconds(), 6)
+            if position else 0.0)
+
+
+def _owned_sequences(rows: list[dict]) -> dict[tuple[str, int], list[dict]]:
+    """按序列身份归组工件行（噪音行与重发行除外），组内保持工件序 = 序内成员序。"""
+    groups: dict[tuple[str, int], list[dict]] = {}
+    for row in rows:
+        truth = row["truth"]
+        if truth["noise"] or "duplicate_of" in truth:
+            continue
+        groups.setdefault((truth["sequence_class"], truth["sequence"]), []).append(row)
+    return groups
+
+
+@needs_deepseek
+async def test_generate_stream_time_fields_real_deepseek_backfilled_from_ts():
+    """时间字段真跑：绑定字段的值恰等于**本序列相邻成员**的 ts 差（序内口径——
+    交叉进来的外序列帧与夹在中间的噪音帧占墙钟但不计入），首/末帧边界取 0.0，
+    重发行承源值不与自身会话时间轴对账，且回填先于行对象与 id 计算。
+
+    作废容忍同案例四：断言只压幸存序列，并要求至少一条幸存。
+    """
+    cfg = _timed_cfg()
+    ctx = _ctx(cfg)
+
+    product = await GenerateStage(cfg).generate_stream_all(ctx)   # <= 5 real calls
+
+    rows = [json.loads(line) for line in product.artifact_lines]
+    groups = _owned_sequences(rows)
+    assert groups, "两条计划序列全部作废，时间字段面无从断言"
+
+    checked = 0
+    for members in groups.values():
+        assert len(members) == 3                    # len_range = [3, 3]
+        stamps = [datetime.fromisoformat(row["ts"]) for row in members]
+        for position, row in enumerate(members):
+            payload = row["text"]
+            frame_class = row["truth"]["frame_class"]
+            # 回填后的载荷满足用户声明的**完整**生成 Schema（含被剔除的绑定字段）
+            jsonschema.Draft202012Validator(
+                TIMED_SCHEMAS[frame_class]).validate(payload)
+            for field, term in TIME_BINDINGS[frame_class].items():
+                assert payload[field] == _expected_time_value(stamps, position, term)
+                checked += 1
+    assert checked == 3 * len(groups)               # 每帧恰一个绑定字段
+
+    # 噪音帧不属任何序列 ⇒ 不被回填遍历（纯文本载荷，压根没有绑定字段可写）
+    assert all(isinstance(row["text"], str) and row["text"].strip()
+               for row in rows if row["truth"]["noise"])
+
+    # 重发会话：与源帧引用同一载荷对象 ⇒ 绑定值逐字节承源（裁决·重发帧承源档与
+    # 同源载荷），自身另铺一条时间轴，不与之对账
+    duplicated: dict[tuple[str, int], list[dict]] = {}
+    for row in rows:
+        truth = row["truth"]
+        if "duplicate_of" in truth:
+            key = (truth["sequence_class"], truth["duplicate_of"])
+            duplicated.setdefault(key, []).append(row)
+    assert len(duplicated) == 1                     # duplicates = 1
+    key, copies = next(iter(duplicated.items()))
+    for source, duplicate in zip(groups[key], copies):
+        assert duplicate["text"] == source["text"]
+        assert duplicate["ts"] > source["ts"]
+        assert duplicate["truth"]["sequence"] is None
+
+    # 裁决·回填后计 id：行对象与成员 id 都含回填值 ⇒ 工件重放逐字节同 id
+    for item in product.envelopes:
+        members = groups[(item.classification.label,
+                          item.record.members[0].raw["truth"]["sequence"])]
+        for member, row in zip(item.record.members, members):
+            assert member.raw == row
+            assert member.id == hashlib.sha256(
+                canonical_json(row).encode("utf-8")).hexdigest()[:16]
+
+
+# ── 6. z.ai: plan_schema cover_all (allOf + contains) passthrough under L0 ──
+
+async def test_plan_schema_cover_all_passthrough_zai_structured_output():
+    """站立假设钉板（裁决·L0 待遇沿用，prefixItems 同族）：``cover_all`` 产物的
+    ``allOf`` + 逐类 ``contains`` 随 L0（supports_structured_output = true）原样
+    上行为供应商强制工具的 input_schema，返回的蓝图逐类覆盖（构成恰等）。"""
+    cfg = _cfg(_zai_profile())
+    ctx = _ctx(cfg)
+    classes = FRAME_CLASSES + (CONFIRMATION,)
+    names = [spec.name for spec in classes]
+    schema = plan_schema(names, 3, cover_all=True)
+    assert [branch["contains"]["properties"]["frame_class"]["const"]
+            for branch in schema["properties"]["steps"]["allOf"]] == names
+    system_text, user_text = render_plan_prompt_texts(
+        CLASS_INSTRUCTION, classes, "ticket_booking", 3, cover_all=True)
+    assert user_text.endswith("中每个帧类都至少出现一次。")   # 冻结的覆盖句变体
+    prompt = PromptBundle(
+        messages=(Message(role="system", parts=(Part(kind="text", text=system_text),)),
+                  Message(role="user", parts=(Part(kind="text", text=user_text),))),
+        temperature=0.0)
+
+    obj, usage, attempts, model = await ctx.schema_engine.complete_validated(
+        "default", prompt, schema=schema,                      # ONE real call
+        scope=CallScope(batch_no=0))
+
+    steps = obj["steps"]
+    assert len(steps) == 3                        # minItems = maxItems 钉死步数
+    assert {step["frame_class"] for step in steps} == set(names)   # 逐类覆盖
+    assert all(str(step["brief"]).strip() for step in steps)
     jsonschema.Draft202012Validator(schema).validate(obj)
     assert attempts >= 1 and model
     assert usage.prompt_tokens > 0 and usage.completion_tokens > 0

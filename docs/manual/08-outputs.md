@@ -64,7 +64,8 @@ flowchart TD
       "line_no": 4,                                  ← 文本模态：行号；UI 模态换成 pair_index
       "generated_from": [],                          ← 若是合成样本：种子记录的 id 列表
       "fields": {"source": "ime-log"},               ← passthrough_fields 透传的原始字段
-      "generator": null                              ← 若是合成样本：{"llm": "...", "style": "..."}
+      "generator": null                              ← 若是合成样本：{"llm": …, "style": …}，
+                                                        时间流生成开了档位表时再多一个 tier_rank（v1.14，第 27 章）
     },
     "stream": null,                                  ← 时序流元信息（v1.8 恒在键；未启用恒为 null，第 25 章；
                                                         v1.9 缝合启用时另含 thread_id / fragments 等线索键，第 26 章；
@@ -120,22 +121,22 @@ flowchart TD
 
 ```json
 "source": {"file": "out/synth-labels.stream.jsonl", "line_no": 8, "generated_from": [],
-            "fields": {}, "generator": {"llm": "default", "style": null}},
+            "fields": {}, "generator": {"llm": "default", "style": null, "tier_rank": 1}},
 "stream": {
-  "episode_id": "dca32faee082d938", "session_id": "6a83d9760c7f5194",
+  "episode_id": "34b9cbc7738887e5", "session_id": "51c15cb3c24aed01",
   "order_span": ["out/synth-labels.stream.jsonl:8", "out/synth-labels.stream.jsonl:11"],
   "member_count": 4,
-  "member_ids": ["0b70aaa3d93519fa", "b80f10ebf46cf54f", "27728a4084747378", "37e2d24d2fbf7990"],
+  "member_ids": ["699fa33b08717127", "a9023a4220cd0771", "66887551f7fdf477", "58b7479f1f032681"],
   "member_sources": [{"file": "out/synth-labels.stream.jsonl", "line_no": 8}, …共 4 项],
-  "members": [{"index": 0, "id": "0b70aaa3d93519fa", "label": "task_request"},
-               {"index": 1, "id": "b80f10ebf46cf54f", "label": "followup"},
-               {"index": 2, "id": "27728a4084747378", "label": "followup"},
-               {"index": 3, "id": "37e2d24d2fbf7990", "label": "confirmation"}],
+  "members": [{"index": 0, "id": "699fa33b08717127", "label": "task_request"},
+               {"index": 1, "id": "a9023a4220cd0771", "label": "followup"},
+               {"index": 2, "id": "66887551f7fdf477", "label": "followup"},
+               {"index": 3, "id": "58b7479f1f032681", "label": "followup"}],
   "session_split": false, "repaired": false, "degraded": null, "steps": null
 }
 ```
 
-`source.file` 指向的是**时间流工件**（合成品的溯源判据仍是 `generator ≠ null`），拿 `member_sources[].line_no` 能把每一帧回查到工件行；`session_id` 与 `episode_id` 不等就说明这个会话里还有别的帧（噪音帧，或交叉进来的另一条序列）。同一份主输出里**不同序列类的行字段集可以不同**（按类标注 Schema，第 27 章 27.6），下游按 `_meta.classification.label` 分流后再解析。
+`source.file` 指向的是**时间流工件**（合成品的溯源判据仍是 `generator ≠ null`），拿 `member_sources[].line_no` 能把每一帧回查到工件行；`session_id` 与 `episode_id` 不等就说明这个会话里还有别的帧（噪音帧，或交叉进来的另一条序列）。`generator.tier_rank`（v1.14，仅档位表在场时）说明这条序列按哪一档的帧类构成生成——它与 `members[]` 的帧类集合**恰等对账**，档位身份因此可从数据反推（第 27 章 27.4）。同一份主输出里**不同序列类的行字段集可以不同**（按类标注 Schema，第 27 章 27.6），下游按 `_meta.classification.label` 分流后再解析。
 
 回到 v1.12 的帧粒度，读法三句：`label` 键仅帧分类开启时在场（segment 降格的 episode 全员 label=null）；`annotation` / `status` 两键仅帧标注开启时在场，`status` 闭集 `annotated | skipped | failed`——skipped = 该帧类按 `[frame.class.<名>.annotate].enabled = false` 跳过（本例 index 4 的支付处理过渡屏，帧类 transition），failed = 修复穷尽或写前帧 Schema 校验不过（annotation 置 null）；帧失败**不产生 rejects 行、不触发 `--strict`**，账在报告的帧子块（8.4）。完整读法与配置见第 25 章 25.6（文本帧路径的同款样例看姊妹工程输出 `out/mix-text-labels.jsonl`）。
 
@@ -287,7 +288,7 @@ v1.12（帧级分类与标注，第 25 章 25.6）再增两个按需出现的子
 
 v1.13（时间流生成，第 27 章）再增两处按需出现的字段（形态关闭时报告与 v1.12 逐字段一致），另外**不出现** `stream` 节（那是分段算子的观测面，别拿它对账合成流）：
 
-- **`run.artifact`**（仅工件实际写出时在场）：`{path, sha256, lines}`——与主输出同款的摘要三件套，拿 `lines` 与 `generate.stream` 的帧数对账。本次真跑：`{"path": "out/synth-labels.stream.jsonl", "sha256": "sha256:3b444935…", "lines": 29}`；
+- **`run.artifact`**（仅工件实际写出时在场）：`{path, sha256, lines}`——与主输出同款的摘要三件套，拿 `lines` 与 `generate.stream` 的帧数对账。本次真跑：`{"path": "out/synth-labels.stream.jsonl", "sha256": "sha256:603860b5…", "lines": 29}`；
 - **`generate.stream`** 子块（仅形态开启时在场，counts-only）：
 
 ```json
@@ -295,6 +296,8 @@ v1.13（时间流生成，第 27 章）再增两处按需出现的字段（形�
   "sessions": 5, "crossed_sessions": 1,
   "sequences": {"ticket_booking": {"planned": 3, "produced": 3},
                  "smart_home":     {"planned": 3, "produced": 3}},
+  "tiers": {"1": {"planned": 4, "produced": 4},        ← v1.14，仅档位表在场时
+             "2": {"planned": 2, "produced": 2}},
   "frames": 23, "noise_frames": 2, "duplicates": 1,
   "plan_calls": 6, "realize_calls": 6, "noise_calls": 1,
   "plan_failures": 0, "realize_failures": 0, "validator_scrapped": 0
@@ -302,6 +305,8 @@ v1.13（时间流生成，第 27 章）再增两处按需出现的字段（形�
 ```
 
 读法：`planned` vs `produced` 的差额 = 作废序列数（三项 failures + 序列相似度过滤淘汰）；`sessions` **不含**重发的流尾会话（29 行工件 = 23 任务帧 + 2 噪音帧 + 4 重发帧，共 6 个会话）；`crossed_sessions = Σ幸存 − sessions`，作废多了它会退化为 0。同一次运行里 `classify` 节的逐类计数**恒全零**（标签在生成期已知、直接继承，零判决调用）——这是预期，不是分类失灵。
+
+`tiers` 子块（v1.14）仅在声明了 `[[generate.stream.tiers]]` 时出现，键位固定在 `sequences` 之后、`frames` 之前，键是 `tier_rank` 的十进制字符串、按升序排列（零配额档与全军作废档也照样在场，如实呈现 0）。它与 `sequences` 是同一笔配额的**两个切法**（按档 vs 按类），两边 `planned` 合计相等——作废时对照着看就知道缺口是集中在某一档还是普遍现象（第 27 章 27.4）。
 
 > **报告写失败怎么办**：主输出成功、报告写失败时，进程以退出码 1 结束——产物可用但账本缺失，别当成功处理。
 

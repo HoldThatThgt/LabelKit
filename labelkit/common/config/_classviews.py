@@ -34,7 +34,11 @@ from labelkit.common.config._schemas import (
     _load_class_schema,
     _load_frame_gen,
 )
-from labelkit.common.config._sections import _parse_examples, _parse_styles
+from labelkit.common.config._sections import (
+    _parse_examples,
+    _parse_styles,
+    _parse_time_fields,
+)
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
@@ -77,9 +81,11 @@ _SELECTION_GROUP = ("selection", "threshold", "top_ratio")
 # v1.13(裁决·帧类生成面)增 generate 节三键: instruction(时间流生成形态下每个帧类
 # 必填)+ schema_path/schema_inline(至多其一; 均缺 = 纯文本帧)——该节**仅时间流生成
 # 形态合法**, 非本形态出现是定向 CONFIG_ERROR(在约束簇上报)。
+# v1.14(裁决·绑定即剔除)增第四键 time_fields(时间语义字段绑定子表)——不入白名单的话
+# 该子表会被下面的白名单循环判成未知键 CONFIG_ERROR。
 _FRAME_CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "annotate": ("instruction", "examples", "enabled"),
-    "generate": ("instruction", "schema_path", "schema_inline"),
+    "generate": ("instruction", "schema_path", "schema_inline", "time_fields"),
 }
 _FRAME_CLASS_SECTIONS = tuple(_FRAME_CLASS_SECTION_KEYS)
 
@@ -563,7 +569,8 @@ def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
     (SPEC-frame-annotation §3.1「帧类覆盖」行; R25 家族。)按键溯源: 类提供的键覆盖
     全局值, 其余继承; ``enabled`` 缺省 true(= 该类照常标注; false = 跳过该类成员的帧
     标注, 省成本面)。v1.13: 同时物化该帧类的生成面(``[frame.class.<name>.generate]``
-    三键白名单)——时间流生成形态的帧内容契约。
+    四键白名单)——时间流生成形态的帧内容契约。v1.14: 生成面第四键 ``time_fields``
+    (时间语义字段绑定表)在此并入视图。
 
     @param col 错误聚合器
     @param file 报错定位用的 project.toml 路径字符串
@@ -586,6 +593,7 @@ def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
         enabled=t.get_bool("enabled", True),
         gen_instruction=gen_instruction,
         gen_schema=gen_schema,
+        time_fields=_parse_time_fields(col, file, cname, sections.get("generate")),
     )
     return view, examples_provided
 

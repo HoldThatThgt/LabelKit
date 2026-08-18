@@ -59,7 +59,9 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
              "project_file": "project.toml", "rubric": "default:ui", "seed": 42},
     "source": {"file": "capture/2026-07-01/b/uitree_2.jsonl", "pair_index": 2,
                "generated_from": [], "fields": {},           // passthrough_fields 落点
-               "generator": null},   // v1.2 只增：生成记录为 {"llm", "style"}（3.6.2），否则 null
+               "generator": null},   // v1.2 只增：生成记录为 {"llm", "style"}（3.6.2），否则 null；
+                                     //   v1.14 键集条件形：时间流生成的档位表在场时增第三键
+                                     //   tier_rank（该序列所属档位序数），档位表缺省时维持两键
     "stream": null,                  // v1.8 恒在键（位置：source 之后、scores 之前——链序镜像）；
                                      // = null 当 segment 与 generate_stream 均未启用（v1.13 门扩：
                                      //   segment.enabled ∨ generate_stream.enabled，3.11.2）。启用时（3.14/3.10.3）：
@@ -192,6 +194,13 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
   //                "stream": {"sessions",            // 交织出的会话数（**不含**重发尾会话）
   //                           "crossed_sessions",    // 其中的交叉会话数（= Σ幸存 − sessions_eff）
   //                           "sequences": {<class>: {"planned", "produced"}},  // 按 [[classify.classes]] 声明序零基铺开
+  //                           "tiers": {"<tier_rank>": {"planned", "produced"}}, // v1.14，**条件在场**：仅
+  //                                                  //   [[generate.stream.tiers]] 非空时出现；键位冻结在
+  //                                                  //   sequences 之后、frames 之前（配额族相邻），键为十进制
+  //                                                  //   字符串的档位序数、按 tier_rank 升序；口径同 sequences
+  //                                                  //   （planned 计于计划期、produced 数最终进链的条数）。
+  //                                                  //   由 M10 按声明档位表**显式铺开** ⇒ 零额档与全作废档也
+  //                                                  //   如实在场（planned 0 / produced 0），不依赖计数器首触序
   //                           "frames",              // 任务帧总数（幸存序列的步数之和）
   //                           "noise_frames",        // 实际织入的噪音帧数（签池耗尽时 < 目标数）
   //                           "duplicates",          // 实际重发的序列条数（按幸存数钳制后）
@@ -241,34 +250,43 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 | `session` | int | 全流会话序数，0 基（含重发尾会话）。 |
 | `sequence_class` | str \| null | 所属序列类名；噪音帧为 null。 |
 | `sequence` | int \| null | 该序列在其类内的序数，0 基（= 计划期标识）；噪音帧与**重发副本**为 null。 |
+| `tier_rank` | int \| null | **v1.14 新增，仅档位表（`[[generate.stream.tiers]]`）在场时出现**：该序列所属档位的序数。任务帧 = 本档序数；噪音帧为 null；重发帧**承源**（= 被重发序列的档位）。键位在 `sequence` 之后（序列身份组）、`frame_class` 之前——**键序重冻结**，行文件的字节序由此定（id 用 canonical JSON 键排序计算，不受键序影响）。 |
 | `frame_class` | str \| null | 该帧的帧类（蓝图定下的真值）；噪音帧为 null。 |
 | `noise` | bool | 插入型噪音帧标志；任务帧与重发帧恒 false。 |
 | `duplicate_of` | int | **仅重发序列的帧在场**：值 = 被重发的原序列的类内序数（重发副本无自身计划期身份，归属经本键对账）。 |
 
-**真值不携最终 id**（封死循环依赖）：序列归属只用计划期标识（`sequence_class` + `sequence`），**禁止**携带装配后的 record id——成员 id 依赖行内容、序列 id 依赖成员 id，携带即成环；主输出 `_meta.stream` 与工件的对账靠 `member_sources` 的行号双向可查（3.6.5）。
+**真值不携最终 id**（封死循环依赖）：序列归属只用计划期标识（`sequence_class` + `sequence`[+ `tier_rank`]），**禁止**携带装配后的 record id——成员 id 依赖行内容、序列 id 依赖成员 id，携带即成环；主输出 `_meta.stream` 与工件的对账靠 `member_sources` 的行号双向可查（3.6.5）。
+
+**回填字段注记（v1.14）**：声明了时间字段绑定（`[frame.class.<name>.generate.time_fields]`）的帧类，其行内**文本字段对象**里的绑定键不是 LLM 产出而是 harness 按已铺时间轴回填的机械量（值 = `round(序内相邻成员 ts 差, 6)` 等，词表见 5.2）。回填发生在时间戳铺设之后、行对象与 id 计算**之前**，故这些值同样进 `Record.raw`、进成员 id 与序列 id ⇒ 工件重放逐字节同 id 同会话（下方重放契约①）。对账口径两条：① 值按**本序列相邻成员**计——交叉会话里夹进来的外序列帧与噪音帧不参与差值，逐行对账时须先按 `truth.sequence_class` + `truth.sequence` 归组；② **`duplicate_of` 在场的重发行除外**——其绑定值与 `tier_rank` 同为承源量，不与自身所在会话的时间轴对账。
 
 **重放契约**：工件本身就是一份合法的 6.1 文本模态输入。可往返性由 M1 工件键守卫在启动期保证（3.1.4 时间流生成行）：`input.text_field` 与 `stream.order_by` 的时间戳字段名均须为**平坦字段名**（工件行以该字符串原样作键，点路径在重放侧按 6.1 抽取时取不到、整份判坏行——含 `"."` 即 CONFIG_ERROR），两者互不同名、且均不得为 `"truth"`（工件行三个顶层键互斥）。把它拷为某工程的 `[run].input`、配同一份 `[stream]` 声明（`order_by = "meta:<同名字段>"`、同一 `gap_s`）并开 `segment`，即可原样重放——① 成员 `Record.id` 逐字节一致（M2 的 `sha256(canonical_json(raw))[:16]` 作用于同一份行对象，生成侧的成员 raw 就是工件行全对象，3.2.5）；② 会话切分一致（交织器铺设的会话间隔恒 > `gap_s`、会话内间隔恒 < `gap_s`），`session_id` 亦逐字节一致（M2 公式的输入含会话内**全部**帧，3.2.8）；③ `truth` 对摄取侧只是普通字段——参与 id 计算、**不参与任何判定**，需要时经 `output.passthrough_fields` 透传出来与重放结果比对（自动化的重放评测回路是明确非目标，2.1.2 ⑧）。
 
-**真实样例**（`examples/synth-stream` 真跑工件的三行摘录，`order_by = "meta:ts"`、`text_field = "text"`；实际为单行 JSONL）：
+**真实样例**（`examples/synth-stream` 2026-08-18 真跑工件的三行摘录，`order_by = "meta:ts"`、`text_field = "text"`，档位表与时间字段绑定均在场；实际为单行 JSONL）：
 
 ```
-// 第 1 行：结构化帧（帧类 task_request 声明了生成 Schema ⇒ 文本字段是对象）
+// 第 1 行：结构化帧（帧类 task_request 声明了生成 Schema ⇒ 文本字段是对象）；
+//          tier_rank = 1（第 1 档，构成 {task_request, followup}）；
+//          duration 是回填字段（绑定 gap_next_s）
 {"ts": "2026-01-05T09:00:00.000000+08:00",
- "text": {"utterance": "我想订明天早上从北京到上海的高铁票，二等座就行。",
-          "entities": ["北京", "上海", "明天早上", "二等座"]},
+ "text": {"utterance": "你好，我想买明天上午从北京到上海的高铁票，有合适的推荐吗？",
+          "entities": ["明天", "上午", "北京", "上海", "高铁票"],
+          "duration": 71.053996},
  "truth": {"session": 0, "sequence_class": "ticket_booking", "sequence": 0,
-           "frame_class": "task_request", "noise": false}}
+           "tier_rank": 1, "frame_class": "task_request", "noise": false}}
 
-// 第 12 行：插入型噪音帧（三 null + noise=true）
-{"ts": "2026-01-05T09:22:20.673020+08:00", "text": "哎呀这雨下得没完没了啊",
+// 第 12 行：插入型噪音帧（四 null + noise=true——档位表在场时 tier_rank 亦为 null）
+{"ts": "2026-01-05T09:22:20.673020+08:00", "text": "今天天气真不错啊",
  "truth": {"session": 1, "sequence_class": null, "sequence": null,
-           "frame_class": null, "noise": true}}
+           "tier_rank": null, "frame_class": null, "noise": true}}
 
-// 第 26 行：重发序列的首帧（sequence=null + duplicate_of 指回原序列类内序数；落流尾新会话）
+// 第 26 行：重发序列的首帧（sequence=null + duplicate_of 指回原序列类内序数；落流尾新会话）；
+//          tier_rank 与 duration 均**承源**——不与本行所在会话的时间轴对账
 {"ts": "2026-01-05T10:28:43.981411+08:00",
- "text": {"utterance": "帮我把客厅空调打开", "entities": ["客厅空调", "客厅", "空调"]},
+ "text": {"utterance": "小爱同学，把卧室的空调开到26度。",
+          "entities": ["卧室", "空调", "26度"], "duration": 45.413886},
  "truth": {"session": 5, "sequence_class": "smart_home", "sequence": null,
-           "frame_class": "task_request", "noise": false, "duplicate_of": 0}}
+           "tier_rank": 1, "frame_class": "task_request", "noise": false,
+           "duplicate_of": 0}}
 ```
 
-同一份工件的第 1 行与第 2 行分属交叉会话里的两条序列（`sequence` 0 与 1，同 `session: 0`）——交叉形态在工件上直接可读。
+三条可直接在工件上读出来的事实：① 第 1 行与第 2 行分属交叉会话里的两条序列（`sequence` 0 与 1，同 `session: 0`）——交叉形态肉眼可读；② 第 1 行的 `duration = 71.053996` 对应的是**同序列下一帧**（第 3 行，ts `09:01:11.053996`）而非流水里的下一行（第 2 行，ts `09:00:56.012563`）——序内口径的直接体现；③ 第 26 行的 `duration = 45.413886` 等于其**源序列**首两帧（第 8、9 行）的 ts 差，与本行所在的流尾会话无关——承源语义的直接体现。

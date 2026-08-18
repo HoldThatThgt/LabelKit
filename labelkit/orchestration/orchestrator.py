@@ -1419,10 +1419,14 @@ class Orchestrator:
         sequences 按声明类零基（report.classify.classes 同款），计数面由 M6 供给
         （generate.stream.* 前缀）。
 
+        v1.14（裁决·报表显式装配）：档位表非空时在 sequences 之后、frames 之前插入 tiers
+        子块（配额族相邻）——本节是显式键装配而非计数器前缀树，零额档与全作废档的在场由
+        装配保证，不依赖计数器首触序。
+
         @param c: 计数器视图
         @return: generate.stream 子块字典
         """
-        return {
+        block: dict = {
             "sessions": c("generate.stream.sessions"),
             "crossed_sessions": c("generate.stream.crossed_sessions"),
             "sequences": {
@@ -1432,6 +1436,10 @@ class Orchestrator:
                 }
                 for spec in self.cfg.classify.classes
             },
+        }
+        if self.cfg.generate_stream.tiers:
+            block["tiers"] = self._report_stream_tiers(c)
+        block.update({
             "frames": c("generate.stream.frames"),
             "noise_frames": c("generate.stream.noise_frames"),
             "duplicates": c("generate.stream.duplicates"),
@@ -1441,6 +1449,24 @@ class Orchestrator:
             "plan_failures": c("generate.stream.plan_failures"),
             "realize_failures": c("generate.stream.realize_failures"),
             "validator_scrapped": c("generate.stream.validator_scrapped"),
+        })
+        return block
+
+    def _report_stream_tiers(self, c: _CounterView) -> dict:
+        """v1.14 档位配额子块：按声明档位表零基铺开 planned / produced。
+
+        档位表按 tier_rank 升序存放（M1 解析期定序），故迭代序即 rank 升序；键为十进制
+        字符串的档位序数（report 落盘无 sort_keys ⇒ 键序 = 装配插入序）。
+
+        @param c: 计数器视图
+        @return: {"<tier_rank>": {"planned": …, "produced": …}} 字典
+        """
+        return {
+            str(spec.tier_rank): {
+                "planned": c(f"generate.stream.tiers.{spec.tier_rank}.planned"),
+                "produced": c(f"generate.stream.tiers.{spec.tier_rank}.produced"),
+            }
+            for spec in self.cfg.generate_stream.tiers
         }
 
     def _report_classify(self, c: _CounterView) -> dict:

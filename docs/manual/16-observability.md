@@ -144,12 +144,12 @@ jq -c 'select(.ev=="quality.judgment" and (.record_ids | index("6e60ce3c2d59f04d
 
 想要完整的调用审计（每次请求的 token、延迟、重试、状态），订阅 trace 的 `llm` 通道即可——`llm.call` 事件字段命名对齐 OpenTelemetry GenAI 语义约定（`gen_ai.usage.input_tokens` 等），现成的 OTel 生态分析工具可以直接吃。
 
-### 时间流生成的两处报告读数（v1.13）
+### 时间流生成的两处报告读数（v1.13，v1.14 增档位子块）
 
-这个形态（第 27 章）不加事件，观测面全部落在 `report.json` 的两处按需字段上：
+这个形态（第 27 章）不加事件——v1.14 的两个增量同样零新通道、零新事件、零新错误码——观测面全部落在 `report.json` 的两处按需字段上：
 
 - **`run.artifact`**：时间流工件的摘要三件套 `{path, sha256, lines}`（主输出同款形态），仅工件实际写出时在场（`--dry-run` 不写工件，自然也没有它）。`lines` 是逐帧账的总闸——拿它与下面的帧数交叉验证；
-- **`generate.stream`**：`{sessions, crossed_sessions, sequences: {<类>: {planned, produced}}, frames, noise_frames, duplicates, plan_calls, realize_calls, noise_calls, plan_failures, realize_failures, validator_scrapped}`，counts-only。日常盯三个比值：`produced / planned`（作废率——三项 failures 与序列相似度过滤的合力）、`crossed_sessions`（交叉演示位还在不在，它 = Σ幸存 − sessions）、`noise_frames / frames`（掺噪比是否如你所愿）。
+- **`generate.stream`**：`{sessions, crossed_sessions, sequences: {<类>: {planned, produced}}, frames, noise_frames, duplicates, plan_calls, realize_calls, noise_calls, plan_failures, realize_failures, validator_scrapped}`，counts-only。日常盯三个比值：`produced / planned`（作废率——三项 failures 与序列相似度过滤的合力）、`crossed_sessions`（交叉演示位还在不在，它 = Σ幸存 − sessions）、`noise_frames / frames`（掺噪比是否如你所愿）。声明了帧类构成档位（`[[generate.stream.tiers]]`，v1.14）时，这里**多一个 `tiers` 子块**——键位在 `sequences` 之后、`frames` 之前，形状 `{"<tier_rank>": {planned, produced}}`（十进制字符串键、按 tier_rank 升序；零配额档与全军作废档也在场，如实报 0）。它是同一笔配额的按档切法，与 `sequences` 的按类切法互为对照：`planned` 两边合计相等，作废时看缺口压在哪一档（第 27 章 27.4）。档位表缺省时该键整块不在场；时间字段回填（v1.14 的另一半）**零观测增量**——机械算术没有可计数的失败模式。
 
 同一份报告里还有两处「反直觉但正确」的读数：`classify` 的逐类计数**恒全零**（标签生成期已知、继承，零判决调用），`stream` 节**不出现**（那是分段算子的观测面）。逐键解读与真跑数字见第 8 章 8.4 与第 27 章 27.7。
 

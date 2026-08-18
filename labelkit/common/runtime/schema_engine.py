@@ -174,12 +174,33 @@ def _json_pointer(path: Any) -> str:
     )
 
 
+def _render_contains(error: Any) -> str:
+    """v1.14（裁决·渲染缺类可见）：渲染一条 ``contains`` 违规——点名缺失的帧类。
+
+    蓝图覆盖约束的 contains 子 Schema 形如
+    ``{"properties": {"frame_class": {"const": <名>}}, ...}``，故直接取那个 const 值
+    点名；不是该形状（用户 Schema 也可以用 contains）时回落 jsonschema 原始消息。
+    L0 关端点上的 L3 修复提示必须点名缺失帧类，否则修复指导性趋零。
+
+    @param error jsonschema 的一条 ValidationError（validator == "contains"）。
+    @return 渲染后的描述串。
+    """
+    props = (error.validator_value.get("properties")
+             if isinstance(error.validator_value, dict) else None)
+    field = props.get("frame_class") if isinstance(props, dict) else None
+    name = field.get("const") if isinstance(field, dict) else None
+    if name is None:
+        return error.message
+    return f"missing required frame_class {json.dumps(name, ensure_ascii=False)}"
+
+
 def _render_error(error: Any) -> str:
     """把一条违规渲染成 '<json-pointer>: <描述>'（面向修复提示词）。
 
-    枚举类违规按 spec 3.8.4 的「期望/实际」措辞自行渲染；其它关键字直接携带
-    jsonschema 的原始消息。渲染文本双重用途——既进 L3 修复提示词的违规清单，也进
-    StageError / rejects 的错误报告面，故按「报错输出英文」规则统一为英文。
+    枚举类违规按 spec 3.8.4 的「期望/实际」措辞自行渲染；v1.14 起 contains 违规点名
+    缺失的帧类（裁决·渲染缺类可见）；其它关键字直接携带 jsonschema 的原始消息。渲染
+    文本双重用途——既进 L3 修复提示词的违规清单，也进 StageError / rejects 的错误报告
+    面，故按「报错输出英文」规则统一为英文。
 
     @param error jsonschema 的一条 ValidationError。
     @return 渲染后的违规行。
@@ -189,6 +210,8 @@ def _render_error(error: Any) -> str:
         expected = json.dumps(list(error.validator_value), ensure_ascii=False)
         actual = json.dumps(error.instance, ensure_ascii=False)
         description = f"expected one of enum {expected}, got {actual}"
+    elif error.validator == "contains":
+        description = _render_contains(error)
     else:
         description = error.message
     return f"{pointer}: {description}"
@@ -453,7 +476,7 @@ def frame_classify_schema(names: Sequence[str], n: int) -> dict:
             "required": ["labels"], "additionalProperties": False}
 
 
-def plan_schema(names: Sequence[str], length: int) -> dict:
+def plan_schema(names: Sequence[str], length: int, cover_all: bool = False) -> dict:
     """v1.13 M6 时间流形态·蓝图调用的内部 Schema（裁决·蓝图实现内部 Schema）。
 
     一条序列的 ``length`` 步计划：每步给出所属帧类（闭集，取自 ``names`` 帧类表）与
@@ -461,19 +484,31 @@ def plan_schema(names: Sequence[str], length: int) -> dict:
     （judgment_schema / frame_classify_schema 先例）；不用 uniqueItems——同一帧类在
     一条序列里本就可重复出现（R1 同理，strict 网关硬拒该关键字）。
 
-    @param names 帧类名闭集。
+    v1.14（裁决·蓝图双向硬约束）：``cover_all = True`` 时在 steps 数组对象上追加
+    ``allOf`` + 逐名一项 ``contains``（按传入名集序）——enum 给「⊆ 档内名集」、
+    contains 给「⊇」，合成构成恰等「步帧类集合 ≡ 档声明构成」。一个 Schema 对象只有
+    一个 contains 键位，故多类分 allOf 支（draft 2020-12 原生关键字，L2 直接可校验）。
+    缺省 False 的输出与 v1.13 逐字节一致。
+
+    @param names 帧类名闭集（档位表在场时 = 档内子集，构造器零感知）。
     @param length 本条序列的步数（同时钉死数组长度）。
+    @param cover_all 是否注入「档内每类至少一次」的逐类 contains 覆盖约束。
     @return draft 2020-12 Schema 对象。
     """
-    return {"type": "object",
-            "properties": {"steps": {"type": "array",
-                "items": {"type": "object",
-                          "properties": {"frame_class": {"type": "string",
-                                                         "enum": list(names)},
-                                         "brief": {"type": "string"}},
-                          "required": ["frame_class", "brief"],
-                          "additionalProperties": False},
-                "minItems": length, "maxItems": length}},
+    steps: dict = {"type": "array",
+                   "items": {"type": "object",
+                             "properties": {"frame_class": {"type": "string",
+                                                            "enum": list(names)},
+                                            "brief": {"type": "string"}},
+                             "required": ["frame_class", "brief"],
+                             "additionalProperties": False},
+                   "minItems": length, "maxItems": length}
+    if cover_all:
+        steps["allOf"] = [{"contains": {"type": "object",
+                                        "properties": {"frame_class": {"const": name}},
+                                        "required": ["frame_class"]}}
+                          for name in names]
+    return {"type": "object", "properties": {"steps": steps},
             "required": ["steps"], "additionalProperties": False}
 
 

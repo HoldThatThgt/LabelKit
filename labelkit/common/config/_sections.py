@@ -46,6 +46,7 @@ from labelkit.common.config.model import (
     SegmentConfig,
     StitchConfig,
     StreamConfig,
+    TierSpec,
     ToolConfig,
     TraceConfig,
     VerifyConfig,
@@ -538,6 +539,75 @@ def _parse_classes(col: _Collector, file: str, raw: Any,
     return tuple(classes)
 
 
+def _parse_tiers(col: _Collector, file: str, raw: Any) -> tuple[TierSpec, ...]:
+    """v1.14: 解析 ``[[generate.stream.tiers]]`` 档位表数组(_parse_classes 同款形)。
+
+    只做键级类型校验(三键的类型与下界); 身份连续性、构成互异与名集归属、逐非零配额对
+    的长度可覆盖等结构约束留给形态约束簇。产物按 ``tier_rank`` 升序存放——
+    ``tiers[rank - 1]`` 直取是 M6 蓝图侧的取档方式。
+
+    @param col 错误聚合器
+    @param file 报错定位用的 project.toml 路径字符串
+    @param raw ``[generate.stream].tiers`` 的原始值
+    @return 按 ``tier_rank`` 升序的 ``TierSpec`` 元组
+    """
+    if raw is _MISSING:
+        return ()
+    if not isinstance(raw, list):
+        col.error(f"{file}:[generate.stream].tiers: expected array of tables, "
+                  f"got {_fmt(raw)}")
+        return ()
+    tiers: list[TierSpec] = []
+    for i, sub in enumerate(raw, 1):
+        label = f"[[generate.stream.tiers]][{i}]"
+        if not isinstance(sub, dict):
+            col.error(f"{file}:{label}: expected table, got {_fmt(sub)}")
+            continue
+        t = _Tbl(col, file, label, sub)
+        rank = t.get_int("tier_rank", None, minimum=1)
+        weight = t.get_int("weight", None, minimum=1)
+        frame_classes = t.get_str_tuple("frame_classes", ())
+        for key, value in (("tier_rank", rank), ("weight", weight)):
+            if value is None and key not in sub:
+                t.err(key, "positive integer")
+        t.finish()
+        if rank is not None and weight is not None:
+            tiers.append(TierSpec(tier_rank=rank, weight=weight,
+                                  frame_classes=frame_classes))
+    return tuple(sorted(tiers, key=lambda spec: spec.tier_rank))
+
+
+def _parse_time_fields(col: _Collector, file: str, cname: str,
+                       gen_sub: Any) -> dict[str, str] | None:
+    """v1.14(裁决·时间字段回填方向): 解析 ``[frame.class.<name>.generate.time_fields]``。
+
+    子表语义是"生成 Schema 顶层字段名 → 语义词表取值"的字符串映射; 此处只做键级类型
+    校验(子表形状 + 逐项取值为字符串), 绑定键与生成 Schema 的对账、词表取值合法性、
+    声明类型字面恰等与剔除余量都留给形态约束簇。
+
+    @param col 错误聚合器
+    @param file 报错定位用的 project.toml 路径字符串
+    @param cname 帧类名
+    @param gen_sub 该帧类的 ``generate`` 覆盖表(非表视作缺省)
+    @return 绑定映射(空表 = 在场但为空); 未声明返回 None
+    """
+    raw = gen_sub.get("time_fields") if isinstance(gen_sub, dict) else None
+    if raw is None:
+        return None
+    label = f"[frame.class.{cname}.generate.time_fields]"
+    if not isinstance(raw, dict):
+        col.error(f"{file}:{label}: expected table, got {_fmt(raw)}")
+        return None
+    bindings: dict[str, str] = {}
+    for key, value in raw.items():
+        if not isinstance(value, str):
+            col.error(f"{file}:{label}.{key}: expected string (a time vocabulary term), "
+                      f"got {_fmt(value)}")
+            continue
+        bindings[key] = value
+    return bindings
+
+
 def _parse_generate_stream(col: _Collector, file: str, raw: Any) -> GenerateStreamConfig:
     """v1.13: 解析 ``[generate.stream]`` 子表(_frame_sub 先例——子表经父表 take 取出)。
 
@@ -562,6 +632,7 @@ def _parse_generate_stream(col: _Collector, file: str, raw: Any) -> GenerateStre
         duplicates=t.get_int("duplicates", 0, minimum=0),
         frame_gap_s=_num_pair(t, "frame_gap_s", (5.0, 60.0)),
         ts_start=t.get_str("ts_start", _TS_START_DEFAULT, nonempty=True) or _TS_START_DEFAULT,
+        tiers=_parse_tiers(col, file, t.take("tiers")),          # v1.14 档位表
     )
     t.finish()
     return cfg
@@ -837,7 +908,12 @@ def _parse_generate_block(col: _Collector, file: str,
         key: isinstance(section, dict) and key in section
         for key in _STREAM_FORBIDDEN_GEN_KEYS
     }
-    generate_stream = _parse_generate_stream(col, file, t.take("stream"))
+    stream_section = t.take("stream")
+    # v1.14 原始节探针: 档位表的**在场性**独立于其解析成败——档位表前提(仅时间流形态
+    # 合法)必须在表内容非法时也照样上报。
+    gen_provided["stream_tiers"] = (isinstance(stream_section, dict)
+                                    and "tiers" in stream_section)
+    generate_stream = _parse_generate_stream(col, file, stream_section)
     t.finish()
     return generate, generate_stream, gen_provided
 

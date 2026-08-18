@@ -7,10 +7,22 @@ duplicate_of、直装组装约定（成员 id = M2 公式、序列 id = M14 公�
 含噪音帧、inherited 两级、ref 行号）、canonical JSON 重放等价（工件行写临时
 文件 → Ingestor 摄取 → 同 id 同会话切分）、sample_validator 整序列作废、
 SimilarityFilter 序列单元、--limit 配额层截断与工件一致性、序列对半降级路径。
+
+v1.14 档位面（SPEC-generation-tiers §3.2/§3.7）另覆盖：档位映射的连续分块与
+``--limit`` 交换律、配分零抽签消费（同 seed 有无档位表抽签流逐字节一致）、蓝图的
+档内子集表与覆盖句冻结文本、truth 键序三形态（任务/噪音/重发）、``ref.generator``
+三键、逐档 planned/produced 落账。
+
+v1.14 时间字段面（SPEC-generation-tiers §3.3/§3.7）再覆盖：缩减 Schema 派生
+（properties 删键 / required 差集 / 其余关键字原样 / 不污染 M1 冻结产物 / 两个面
+同源）、回填算术（首末边界 0.0、序内相邻口径含交叉夹帧、微秒精度、同 seed 双跑
+确定性）、重发帧的同源载荷与承源 ts、回填后计 id 与工件重放往返、回填前钩子口径，
+以及绑定表全缺省时的双关字节等价。
 """
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import random
@@ -40,21 +52,30 @@ from labelkit.common.config.model import (
     SegmentConfig,
     StitchConfig,
     StreamConfig,
+    TierSpec,
     ToolConfig,
     TraceConfig,
     VerifyConfig,
+    apportion_tiers,
 )
 from labelkit.common.errors import ContextOverflowError, SchemaViolation
 from labelkit.common.contracts.types import Usage
 from labelkit.operators.generate import (
     GenerateStage,
     NoiseCallPlan,
+    RealizedSequence,
     SequencePlan,
     StreamGenerateProduct,
+    _reduced_gen_schema,
+    _StreamSlot,
+    backfill_time_fields,
     expand_stream_quota,
     plan_stream,
     predraw_llm_style,
+    render_plan_prompt_texts,
     stream_artifact_path,
+    tier_rank_for_ordinal,
+    weave_stream,
 )
 
 
@@ -62,6 +83,20 @@ from labelkit.operators.generate import (
 
 FRAME_SCHEMA = {"type": "object", "properties": {"utterance": {"type": "string"}},
                 "required": ["utterance"], "additionalProperties": False}
+FRAME_TABLE = ("task_request", "followup")      # 声明序（档内子集渲染按此序过滤）
+
+# v1.14 绑定形态夹具：结构化帧类的生成 Schema 覆盖语义词表四值 + 一个自由字段；
+# since_prev/elapsed 故意不写进 required——required 差集语义的容忍面。
+TIMED_SCHEMA = {"type": "object",
+                "properties": {"utterance": {"type": "string"},
+                               "started_at": {"type": "string"},
+                               "duration": {"type": "number"},
+                               "since_prev": {"type": "number"},
+                               "elapsed": {"type": "number"}},
+                "required": ["utterance", "duration", "started_at"],
+                "additionalProperties": False}
+TIME_FIELDS = {"started_at": "ts", "duration": "gap_next_s",
+               "since_prev": "gap_prev_s", "elapsed": "elapsed_s"}
 
 
 def mk_view(name: str, *, sequences: int, len_range=(2, 3),
@@ -74,16 +109,27 @@ def mk_view(name: str, *, sequences: int, len_range=(2, 3),
                                 styles=tuple(styles)))
 
 
-def frame_view(gen_instruction: str, gen_schema=None) -> FrameClassView:
+def frame_view(gen_instruction: str, gen_schema=None,
+               time_fields=None) -> FrameClassView:
     return FrameClassView(instruction="", examples=(), enabled=True,
-                          gen_instruction=gen_instruction, gen_schema=gen_schema)
+                          gen_instruction=gen_instruction, gen_schema=gen_schema,
+                          time_fields=time_fields)
+
+
+def mk_tiers(*specs) -> tuple[TierSpec, ...]:
+    """按 (weight, frame_classes) 的声明序造档位表：tier_rank = 1..N、升序存放
+    （M1 解析产物的形状）。"""
+    return tuple(TierSpec(tier_rank=i, weight=weight, frame_classes=tuple(frame_classes))
+                 for i, (weight, frame_classes) in enumerate(specs, 1))
 
 
 def mk_cfg(*, quotas: dict[str, int] | None = None, sessions: int = 2,
            noise_ratio: float = 0.0, duplicates: int = 0,
            limit: int | None = None, generate: GenerateConfig | None = None,
            len_range=(2, 3), session_max_len: int = 200,
-           llm_profiles=None) -> ResolvedConfig:
+           llm_profiles=None, tiers: tuple[TierSpec, ...] = (),
+           frame_classes: tuple[str, ...] = FRAME_TABLE,
+           frame_schema=FRAME_SCHEMA, time_fields=None) -> ResolvedConfig:
     quotas = quotas if quotas is not None else {"booking": 2, "smalltalk": 1}
     base_generate = generate or GenerateConfig(enabled=True, num_per_call=2)
     views = {name: replace(mk_view(name, sequences=n, len_range=len_range),
@@ -113,16 +159,26 @@ def mk_cfg(*, quotas: dict[str, int] | None = None, sessions: int = 2,
         config_path="config.toml", project_path="project.toml",
         config_digest="sha256:0", project_digest="sha256:0",
         frame_classify=FrameClassifyConfig(
-            classes=(ClassSpec(name="task_request", description="d"),
-                     ClassSpec(name="followup", description="d"))),
-        frame_class_views={"task_request": frame_view("生成请求", FRAME_SCHEMA),
-                           "followup": frame_view("生成跟进")},
+            classes=tuple(ClassSpec(name=n, description="d") for n in frame_classes)),
+        frame_class_views={
+            n: frame_view(f"生成{n}",
+                          frame_schema if n == "task_request" else None,
+                          time_fields if n == "task_request" else None)
+            for n in frame_classes},
         generate_stream=GenerateStreamConfig(
             enabled=True, sessions=sessions, noise_ratio=noise_ratio,
             noise_instruction="生成噪音" if noise_ratio > 0 else "",
             duplicates=duplicates, frame_gap_s=(5.0, 60.0),
-            ts_start="2026-01-01T09:00:00+08:00"),
+            ts_start="2026-01-01T09:00:00+08:00", tiers=tiers),
     )
+
+
+def mk_timed_cfg(**kwargs) -> ResolvedConfig:
+    """v1.14 绑定形态的 mk_cfg：结构化帧类带 TIMED_SCHEMA + 语义词表四值绑定表
+    （M1 合法形：绑定键 ∈ 顶层 properties、类型字面恰等、剔除后仍余 utterance）。"""
+    kwargs.setdefault("frame_schema", TIMED_SCHEMA)
+    kwargs.setdefault("time_fields", TIME_FIELDS)
+    return mk_cfg(**kwargs)
 
 
 class StreamEngine:
@@ -725,3 +781,591 @@ def test_real_product_flows_through_real_emitter(tmp_path):
             assert entry["label"] == truth["frame_class"]     # 真值门
         assert (stream["session_split"], stream["repaired"],
                 stream["degraded"], stream["steps"]) == (False, False, None, None)
+
+
+# ── v1.14 档位面：映射、零抽签消费、蓝图双向硬约束、标识三点、逐档计数 ────────
+
+TIERS = mk_tiers((2, FRAME_TABLE), (1, ("task_request",)))
+
+
+def test_sequence_plan_tier_rank_defaults_to_none():
+    """档位面不在场时计划期定稿的档位序数缺省为 None（尾追默认字段）。"""
+    plan = SequencePlan(index=0, class_name="booking", ordinal=0, length=3,
+                        llm="default", style_name=None, style_prompt=None)
+    assert plan.tier_rank is None
+
+
+def test_tier_mapping_is_ascending_contiguous_blocks():
+    """映射 = 配分结果按 tier_rank 升序的连续分块前缀和（裁决·零抽签配分）。"""
+    assert apportion_tiers(5, TIERS) == (3, 2)
+    assert [tier_rank_for_ordinal(5, TIERS, o) for o in range(5)] == [1, 1, 1, 2, 2]
+    # 档位表缺省 ⇒ 映射不参与（无档可归）
+    assert tier_rank_for_ordinal(5, (), 0) is None
+
+
+def test_tier_mapping_commutes_with_limit_and_cuts_from_the_top_rank():
+    """--limit 是配额层前缀截断，映射吃全量配额 ⇒ 交换律成立，且类内从最高档位
+    序数侧截起（低档序数在前）。"""
+    cfg = mk_cfg(quotas={"booking": 5}, sessions=5, tiers=TIERS)
+    full = [p.tier_rank
+            for p in plan_stream(cfg, random.Random("0:0:generate")).sequences]
+    assert full == [1, 1, 1, 2, 2]
+    limited = [p.tier_rank for p in
+               plan_stream(replace(cfg, limit=3),
+                           random.Random("0:0:generate")).sequences]
+    assert limited == full[:3]                  # 尾部（tier_rank 2）先被截掉
+
+
+def test_tier_apportionment_consumes_no_rng():
+    """配分零抽签（顺序表原文不动）：同 seed 下有无档位表，长度与 (llm, style)
+    预抽流逐字节一致，且 rng 消费位置相同。"""
+    plain = mk_cfg(quotas={"booking": 3, "smalltalk": 2}, sessions=3, noise_ratio=0.4)
+    tiered = replace(plain, generate_stream=replace(plain.generate_stream, tiers=TIERS))
+    rng_plain = random.Random("0:0:generate")
+    rng_tiered = random.Random("0:0:generate")
+    a, b = plan_stream(plain, rng_plain), plan_stream(tiered, rng_tiered)
+    assert [(p.length, p.llm, p.style_name, p.style_prompt) for p in a.sequences] == \
+           [(p.length, p.llm, p.style_name, p.style_prompt) for p in b.sequences]
+    assert (a.noise_target, a.noise_plans) == (b.noise_target, b.noise_plans)
+    assert rng_plain.getstate() == rng_tiered.getstate()
+    assert [p.tier_rank for p in a.sequences] == [None] * len(a.sequences)
+    assert [p.tier_rank for p in b.sequences] == [1, 1, 2, 1, 2]
+
+
+def test_tier_face_only_adds_keys_to_the_v113_artifact_bytes():
+    """构成 = 全表的单档 ⇒ 工件除 truth.tier_rank 一键外与 v1.13 逐字段一致
+    （交织期抽签流不受档位面扰动，ts 与载荷全同）。"""
+    plain = mk_cfg(quotas={"booking": 2, "smalltalk": 1}, sessions=2,
+                   noise_ratio=0.3, duplicates=1)
+    tiered = replace(plain, generate_stream=replace(plain.generate_stream,
+                                                    tiers=mk_tiers((1, FRAME_TABLE))))
+    a, _, _ = run_stream(plain)
+    b, _, _ = run_stream(tiered)
+    assert len(a.artifact_lines) == len(b.artifact_lines) > 0
+    for plain_line, tiered_line in zip(a.artifact_lines, b.artifact_lines):
+        plain_row, tiered_row = json.loads(plain_line), json.loads(tiered_line)
+        assert tiered_row["truth"].pop("tier_rank", "absent") != "absent"
+        assert tiered_row == plain_row
+
+
+def test_plan_user_line_variants_are_frozen():
+    """蓝图 user 行的两个冻结变体（§10.14）：system 段不随 cover_all 变。"""
+    classes = (ClassSpec(name="a", description="d"),)
+    system_plain, plain = render_plan_prompt_texts("指令", classes, "类", 4)
+    system_covered, covered = render_plan_prompt_texts("指令", classes, "类", 4,
+                                                       cover_all=True)
+    assert plain == "请为一条「类」序列产出 4 步蓝图。"
+    assert covered == "请为一条「类」序列产出 4 步蓝图，且 [帧类表] 中每个帧类都至少出现一次。"
+    assert system_plain == system_covered
+
+
+def test_blueprint_uses_in_tier_subset_table_and_cover_all_schema():
+    """档位在场的蓝图调用：[帧类表] 只渲染档内类（按帧类表**声明序**，非档内书写
+    序）、enum 限档内子集、schema 带逐类 contains 覆盖；产物构成恰等档声明。"""
+    cfg = mk_cfg(quotas={"booking": 1}, sessions=1, len_range=(3, 3),
+                 frame_classes=("task_request", "followup", "confirmation"),
+                 tiers=mk_tiers((1, ("confirmation", "task_request"))))
+    product, engine, _ = run_stream(cfg)
+    (_, prompt, schema), = [c for c in engine.calls if "steps" in c[2]["properties"]]
+    system = prompt.messages[0].parts[0].text
+    user = prompt.messages[1].parts[0].text
+    assert "[帧类表]\ntask_request: d\nconfirmation: d\n" in system
+    assert "followup" not in system
+    assert user.endswith("，且 [帧类表] 中每个帧类都至少出现一次。")
+    steps = schema["properties"]["steps"]
+    assert steps["items"]["properties"]["frame_class"]["enum"] == ["task_request",
+                                                                   "confirmation"]
+    assert steps["allOf"] == [
+        {"contains": {"type": "object",
+                      "properties": {"frame_class": {"const": name}},
+                      "required": ["frame_class"]}}
+        for name in ("task_request", "confirmation")]
+    assert {row["truth"]["frame_class"] for row in parse_lines(product)} == {
+        "task_request", "confirmation"}
+
+
+def test_blueprint_without_tiers_is_byte_identical_to_v113():
+    """档位表缺省 ⇒ 全帧类表 + 无覆盖约束，提示词与 schema 逐字节回归 v1.13。"""
+    from labelkit.common.runtime.schema_engine import plan_schema
+
+    cfg = mk_cfg(quotas={"booking": 1}, sessions=1, len_range=(3, 3))
+    _, engine, _ = run_stream(cfg)
+    (_, prompt, schema), = [c for c in engine.calls if "steps" in c[2]["properties"]]
+    assert (prompt.messages[0].parts[0].text,
+            prompt.messages[1].parts[0].text) == render_plan_prompt_texts(
+        "生成booking", cfg.frame_classify.classes, "booking", 3)
+    assert schema == plan_schema(list(FRAME_TABLE), 3)
+
+
+def test_truth_key_order_frozen_with_tier_rank_for_the_three_frame_shapes():
+    """裁决·真值键序重冻结：tier_rank 在 sequence 之后、frame_class 之前；任务帧
+    带本档序数、噪音帧恒 null、重发帧承源档。"""
+    cfg = mk_cfg(quotas={"booking": 3}, sessions=2, noise_ratio=0.4, duplicates=1,
+                 tiers=TIERS)
+    product, _, _ = run_stream(cfg)
+    rows = parse_lines(product)
+    base = ["session", "sequence_class", "sequence", "tier_rank", "frame_class", "noise"]
+    shapes = set()
+    for row in rows:
+        truth = row["truth"]
+        assert list(truth) in (base, base + ["duplicate_of"])
+        if truth["noise"]:
+            assert truth["tier_rank"] is None
+            shapes.add("noise")
+        elif "duplicate_of" in truth:
+            source = [r["truth"] for r in rows
+                      if r["truth"]["sequence_class"] == truth["sequence_class"]
+                      and r["truth"]["sequence"] == truth["duplicate_of"]]
+            assert {t["tier_rank"] for t in source} == {truth["tier_rank"]}
+            shapes.add("duplicate")
+        else:
+            assert truth["tier_rank"] == tier_rank_for_ordinal(3, TIERS,
+                                                               truth["sequence"])
+            shapes.add("task")
+    assert shapes == {"noise", "duplicate", "task"}
+
+
+def test_member_generator_gains_tier_rank_only_when_the_table_is_declared():
+    """裁决·档位标识三点落位其一：成员 ref.generator 三键（值 = owner 序列档序数）；
+    档位表缺省时两键不变。"""
+    tiers = mk_tiers((1, FRAME_TABLE), (1, ("task_request",)))
+    product, _, _ = run_stream(mk_cfg(quotas={"booking": 2}, sessions=2, tiers=tiers))
+    for env in product.envelopes:
+        ordinal = env.record.members[0].raw["truth"]["sequence"]
+        expected = tier_rank_for_ordinal(2, tiers, ordinal)
+        for member in env.record.members:
+            assert list(member.ref.generator) == ["llm", "style", "tier_rank"]
+            assert member.ref.generator["tier_rank"] == expected
+    assert {env.record.members[0].ref.generator["tier_rank"]
+            for env in product.envelopes} == {1, 2}
+    plain, _, _ = run_stream(mk_cfg(quotas={"booking": 2}, sessions=2))
+    assert all(set(m.ref.generator) == {"llm", "style"}
+               for env in plain.envelopes for m in env.record.members)
+
+
+def test_generator_tier_rank_flows_out_through_the_real_emitter(tmp_path):
+    """标识流出面：emitter 的 source 装配零改动（generator 整字典原样拷出）⇒ 档位
+    序数自然出现在主输出行的 _meta.source.generator，rejects 侧共用同一装配。"""
+    from datetime import timezone
+
+    from labelkit.operators.emitter import Emitter
+
+    cfg = mk_cfg(quotas={"booking": 2}, sessions=2, tiers=TIERS)
+    cfg = replace(cfg, run=replace(cfg.run, output=str(tmp_path / "labels.jsonl")),
+                  annotate=AnnotateConfig(enabled=False))
+    product, _, _ = run_stream(cfg)
+
+    class EngineStub:
+        def validate_only(self, obj, schema=None):
+            return []
+
+    emitter = Emitter(cfg, EngineStub(), "run0", datetime.now(timezone.utc))
+    emitter.open()
+    emitter.emit_batch(product.envelopes, 1)
+    emitter.finalize({"counts": {}}, deliver=True)
+
+    rows = [json.loads(line) for line
+            in (tmp_path / "labels.jsonl").read_text("utf-8").splitlines()]
+    assert len(rows) == len(product.envelopes) == 2
+    for row, env in zip(rows, product.envelopes):
+        generator = row["_meta"]["source"]["generator"]
+        assert generator == env.record.members[0].ref.generator
+        assert list(generator) == ["llm", "style", "tier_rank"]
+    assert [row["_meta"]["source"]["generator"]["tier_rank"] for row in rows] == [1, 2]
+
+
+def test_tier_planned_and_produced_counters_land_per_rank():
+    """逐档计数：planned 在计划期落账（含被作废的序列），produced 口径 = 最终进链
+    的幸存序列；档位表缺省 ⇒ 整族计数器不在场。"""
+    cfg = mk_cfg(quotas={"booking": 3}, sessions=2, tiers=TIERS)
+    _, _, metrics = run_stream(cfg, engine=StreamEngine(fail_plans={3}))
+    assert metrics.counters["generate.stream.tiers.1.planned"] == 2
+    assert metrics.counters["generate.stream.tiers.2.planned"] == 1
+    assert metrics.counters["generate.stream.sequences.booking.planned"] == 3
+    assert metrics.counters["generate.stream.tiers.1.produced"] == 2
+    # 第三条（tier_rank 2）蓝图作废 ⇒ 该档 produced 不落账（报表侧按声明表零基铺开）
+    assert "generate.stream.tiers.2.produced" not in metrics.counters
+    _, _, plain = run_stream(mk_cfg(quotas={"booking": 3}, sessions=2))
+    assert not [key for key in plain.counters
+                if key.startswith("generate.stream.tiers.")]
+
+
+# ── v1.14 时间字段面：缩减 Schema 派生 ──────────────────────────────────────
+
+def test_reduced_gen_schema_strips_bound_keys_from_properties_and_required():
+    """派生 =「生成 Schema − 绑定键」：properties 删键、required 取差集（绑定键不在
+    required 的形照样容忍）、其余关键字与各属性子 Schema 引用原样。"""
+    reduced = _reduced_gen_schema(frame_view("生成", TIMED_SCHEMA, TIME_FIELDS))
+    assert list(reduced["properties"]) == ["utterance"]
+    assert reduced["required"] == ["utterance"]
+    assert reduced["type"] == "object" and reduced["additionalProperties"] is False
+    # 属性子 Schema 引用原样（层级拷贝只到 properties 一层）
+    assert reduced["properties"]["utterance"] is TIMED_SCHEMA["properties"]["utterance"]
+    # 纯文本帧（未声明生成 Schema）没有派生面
+    assert _reduced_gen_schema(frame_view("生成")) is None
+
+
+def test_reduced_gen_schema_tolerates_a_schema_without_required():
+    """required 差集的容忍面 + 其余关键字原样：没有 required 关键字时派生不凭空造键，
+    非 properties/required 的关键字连同其子对象引用原样带过。"""
+    schema = {"type": "object",
+              "properties": {"utterance": {"type": "string"},
+                             "elapsed": {"type": "number"}},
+              "$defs": {"unused": {"type": "string"}}}
+    reduced = _reduced_gen_schema(frame_view("生成", schema, {"elapsed": "elapsed_s"}))
+    assert reduced == {"type": "object",
+                       "properties": {"utterance": {"type": "string"}},
+                       "$defs": {"unused": {"type": "string"}}}
+    assert "required" not in reduced
+    assert reduced["$defs"] is schema["$defs"]
+
+
+def test_reduced_derivation_never_pollutes_the_frozen_frame_class_view_schema():
+    """层级拷贝纪律：``FrameClassView.gen_schema`` 是 M1 冻结产物（静态预算预检与
+    契约行渲染同源读它）——派生与整轮真跑之后本体逐对象不变。"""
+    snapshot = copy.deepcopy(TIMED_SCHEMA)
+    properties, required = TIMED_SCHEMA["properties"], TIMED_SCHEMA["required"]
+    view = frame_view("生成", TIMED_SCHEMA, TIME_FIELDS)
+    reduced = _reduced_gen_schema(view)
+    assert view.gen_schema["properties"] is properties      # 未被换掉，也未被删键
+    assert view.gen_schema["required"] is required
+    assert view.gen_schema == snapshot
+    assert reduced is not view.gen_schema
+    assert reduced["properties"] is not properties
+    run_stream(mk_timed_cfg(quotas={"booking": 1}, sessions=1, len_range=(3, 3)))
+    assert TIMED_SCHEMA == snapshot
+
+
+def test_realize_faces_take_the_same_reduced_product_for_schema_and_contract():
+    """逐位 Schema 面与契约行文本面取同一份派生产物；纯文本帧位逐字节不变。"""
+    cfg = mk_timed_cfg(quotas={"booking": 1}, sessions=1)
+    schemas, contracts = GenerateStage(cfg)._realize_step_faces(
+        [("task_request", "要点"), ("followup", "要点")])
+    assert schemas[0] == _reduced_gen_schema(cfg.frame_class_views["task_request"])
+    assert contracts[0] == json.dumps(schemas[0], ensure_ascii=False,
+                                      separators=(", ", ": "))
+    assert not [field for field in TIME_FIELDS if field in contracts[0]]
+    assert schemas[1] == {"type": "string"} and contracts[1] == "自由文本一段"
+
+
+def test_dispatched_realize_schema_carries_no_bound_field():
+    """真派发面：LLM 收到的逐位 Schema 已剔除绑定字段（不为注定被覆写的字段付
+    token 与修复环成本）。"""
+    cfg = mk_timed_cfg(quotas={"booking": 1}, sessions=1, len_range=(3, 3))
+    _, engine, _ = run_stream(cfg)
+    (schema,) = [c[2] for c in engine.calls if "frames" in c[2]["properties"]]
+    structured = [sub for sub in schema["properties"]["frames"]["prefixItems"]
+                  if sub.get("type") == "object"]
+    assert structured
+    for sub in structured:
+        assert list(sub["properties"]) == ["utterance"]
+        assert sub["required"] == ["utterance"]
+
+
+def test_time_field_face_absent_reproduces_the_v113_faces_byte_for_byte():
+    """双关字节等价其一：绑定表全缺省 ⇒ 逐位 Schema 与契约行回归 v1.13 原式，
+    回填尾声对载荷对象零触碰。"""
+    cfg = mk_cfg(quotas={"booking": 1}, sessions=1)
+    views = cfg.frame_class_views
+    schemas, contracts = GenerateStage(cfg)._realize_step_faces(
+        [("task_request", "要点"), ("followup", "要点")])
+    assert schemas == [dict(views["task_request"].gen_schema), {"type": "string"}]
+    assert contracts == [json.dumps(views["task_request"].gen_schema,
+                                    ensure_ascii=False, separators=(", ", ": ")),
+                         "自由文本一段"]
+    product, _, _ = run_stream(mk_cfg(quotas={"booking": 2, "smalltalk": 1},
+                                      sessions=2, noise_ratio=0.3, duplicates=1))
+    for row in parse_lines(product):
+        if isinstance(row["text"], dict):
+            assert list(row["text"]) == ["utterance"]       # LLM 产物原样，无回填键
+
+
+def test_binding_face_only_adds_payload_keys_to_the_v113_artifact_bytes():
+    """双关字节等价其二：绑定面零 rng ⇒ 同 seed 下工件除结构化载荷多出的四个绑定
+    键外逐字段一致（ts、truth、纯文本帧与噪音/重发行全同）。"""
+    plain = mk_cfg(quotas={"booking": 2, "smalltalk": 1}, sessions=2,
+                   noise_ratio=0.3, duplicates=1, len_range=(3, 3))
+    bound = mk_timed_cfg(quotas={"booking": 2, "smalltalk": 1}, sessions=2,
+                         noise_ratio=0.3, duplicates=1, len_range=(3, 3))
+    a, _, _ = run_stream(plain)
+    b, _, _ = run_stream(bound)
+    assert len(a.artifact_lines) == len(b.artifact_lines) > 0
+    for plain_line, bound_line in zip(a.artifact_lines, b.artifact_lines):
+        plain_row, bound_row = json.loads(plain_line), json.loads(bound_line)
+        if isinstance(bound_row["text"], dict):
+            for field in TIME_FIELDS:
+                assert field in bound_row["text"]
+                bound_row["text"].pop(field)
+        assert bound_row == plain_row
+
+
+# ── v1.14 时间字段面：回填算术、重发共享、回填后计 id、钩子口径 ──────────────
+
+def test_time_field_values_boundaries_and_in_sequence_arithmetic():
+    """直调回填尾声钉住四值算术：``ts`` 取该槽位已铺串、首帧 gap_prev_s/elapsed_s
+    = 0.0、末帧 gap_next_s = 0.0，其余 = 本序列相邻/首帧的 ts 差秒。"""
+    cfg = mk_timed_cfg(quotas={"booking": 1}, sessions=1)
+    stamps = ("2026-01-01T09:00:00.000000+08:00", "2026-01-01T09:00:05.500000+08:00",
+              "2026-01-01T09:00:17.750000+08:00")
+    payloads = [{"utterance": f"第{i}帧"} for i in range(3)]
+    slots = [_StreamSlot(payload=payload, truth={"frame_class": "task_request"},
+                         owner=0, ts=ts) for payload, ts in zip(payloads, stamps)]
+    backfill_time_fields([slots], cfg)
+    assert payloads[0] == {"utterance": "第0帧", "started_at": stamps[0],
+                           "since_prev": 0.0, "duration": 5.5, "elapsed": 0.0}
+    assert payloads[1] == {"utterance": "第1帧", "started_at": stamps[1],
+                           "since_prev": 5.5, "duration": 12.25, "elapsed": 5.5}
+    assert payloads[2] == {"utterance": "第2帧", "started_at": stamps[2],
+                           "since_prev": 12.25, "duration": 0.0, "elapsed": 17.75}
+
+
+def test_time_field_values_keep_microsecond_resolution():
+    """round(·, 6) 的分辨率下界与 isoformat 对齐：1 微秒差保真为 1e-06，不塌到 0.0
+    （0.0 是首/末帧边界哨兵，须无歧义）。"""
+    cfg = mk_timed_cfg(quotas={"booking": 1}, sessions=1)
+    payloads = [{"utterance": "甲"}, {"utterance": "乙"}]
+    slots = [_StreamSlot(payload=payload, truth={"frame_class": "task_request"},
+                         owner=0, ts=ts)
+             for payload, ts in zip(payloads, ("2026-01-01T09:00:00.000000+08:00",
+                                               "2026-01-01T09:00:00.000001+08:00"))]
+    backfill_time_fields([slots], cfg)
+    assert payloads[0]["duration"] == 1e-06
+    assert payloads[1]["since_prev"] == 1e-06 == payloads[1]["elapsed"]
+
+
+def test_backfilled_values_match_the_in_sequence_neighbour_gaps():
+    """整轮真跑对账：逐条序列按**交织后真实 ts** 复算四值，与工件行载荷逐值相等；
+    无绑定帧类（纯文本帧）与噪音帧不被触碰。"""
+    cfg = mk_timed_cfg(quotas={"booking": 2, "smalltalk": 1}, sessions=2,
+                       noise_ratio=0.3, duplicates=1, len_range=(3, 3))
+    product, _, _ = run_stream(cfg)
+    groups: dict[tuple, list[dict]] = {}
+    for row in parse_lines(product):
+        truth = row["truth"]
+        if truth["noise"]:
+            assert isinstance(row["text"], str)          # 噪音帧不触碰
+            continue
+        if "duplicate_of" in truth:
+            continue
+        groups.setdefault((truth["sequence_class"], truth["sequence"]), []).append(row)
+    assert len(groups) == 3
+    for members in groups.values():
+        stamps = [datetime.fromisoformat(row["ts"]) for row in members]
+        for i, row in enumerate(members):
+            if row["truth"]["frame_class"] != "task_request":
+                assert isinstance(row["text"], str)      # 无绑定帧类不触碰
+                continue
+            payload = row["text"]
+            expected_prev = (round((stamps[i] - stamps[i - 1]).total_seconds(), 6)
+                             if i else 0.0)
+            expected_next = (round((stamps[i + 1] - stamps[i]).total_seconds(), 6)
+                             if i + 1 < len(stamps) else 0.0)
+            assert payload["started_at"] == row["ts"]
+            assert payload["since_prev"] == expected_prev
+            assert payload["duration"] == expected_next
+            assert payload["elapsed"] == round(
+                (stamps[i] - stamps[0]).total_seconds(), 6)
+            if i == 0:
+                assert (payload["since_prev"], payload["elapsed"]) == (0.0, 0.0)
+            if i == len(members) - 1:
+                assert payload["duration"] == 0.0
+
+
+def test_in_sequence_caliber_ignores_foreign_frames_woven_between_members():
+    """裁决·序内间隔口径：交叉会话夹入的外序列帧与插入的噪音帧本就占用其间墙钟，
+    绑定值仍按本序列相邻成员的 ts 差计——与「会话内相邻行」口径以差值不等钉开。"""
+    cfg = mk_timed_cfg(quotas={"booking": 2, "smalltalk": 1}, sessions=2,
+                       noise_ratio=0.4, len_range=(3, 3))
+    product, _, _ = run_stream(cfg)
+    rows = parse_lines(product)
+    by_session: dict[int, list[dict]] = {}
+    for row in rows:
+        by_session.setdefault(row["truth"]["session"], []).append(row)
+    crossed = [session for session in by_session.values()
+               if len({(r["truth"]["sequence_class"], r["truth"]["sequence"])
+                       for r in session if not r["truth"]["noise"]}) == 2]
+    assert len(crossed) == 1                       # 3 序列装 2 会话 ⇒ 1 交叉会话
+    checked = 0
+    for session in by_session.values():
+        for position, row in enumerate(session[:-1]):
+            if row["truth"]["noise"] or row["truth"]["frame_class"] != "task_request":
+                continue
+            key = (row["truth"]["sequence_class"], row["truth"]["sequence"])
+            own = [r for r in session
+                   if (r["truth"]["sequence_class"], r["truth"]["sequence"]) == key]
+            index = own.index(row)
+            if index + 1 >= len(own):
+                continue
+            neighbour = session[position + 1]
+            if neighbour is own[index + 1]:
+                continue                           # 会话内下一行恰是序内下一帧
+            assert row["text"]["duration"] == round(
+                (datetime.fromisoformat(own[index + 1]["ts"])
+                 - datetime.fromisoformat(row["ts"])).total_seconds(), 6)
+            assert row["text"]["duration"] != round(
+                (datetime.fromisoformat(neighbour["ts"])
+                 - datetime.fromisoformat(row["ts"])).total_seconds(), 6)
+            checked += 1
+    assert checked, "交织后须至少有一个绑定帧的会话内邻居属外序列或噪音"
+
+
+def test_backfill_is_deterministic_under_the_same_seed():
+    """同 seed 双跑逐字节确定性——档位 + 绑定同开（SPEC §3.5 点名回归）：两机制均
+    零 rng（配分是纯函数、回填只读已铺时间轴），工件与信封逐字节一致。"""
+    cfg = mk_timed_cfg(quotas={"booking": 2, "smalltalk": 1}, sessions=2,
+                       noise_ratio=0.3, duplicates=1, tiers=TIERS)
+    first, _, _ = run_stream(cfg)
+    second, _, _ = run_stream(cfg)
+    assert first.artifact_lines == second.artifact_lines
+    assert [e.record.id for e in first.envelopes] == [e.record.id
+                                                      for e in second.envelopes]
+
+
+class CountingPayload(dict):
+    """写入计数的载荷 dict：钉住「每个载荷对象恰被写入一次」——重发槽位与源槽位共享
+    同一对象，若回填也遍历重发槽位，计数就会翻倍。"""
+
+    writes = 0
+
+    def __setitem__(self, key, value):
+        self.writes += 1
+        super().__setitem__(key, value)
+
+
+def test_duplicate_slots_share_the_backfilled_payload_object():
+    """裁决·重发帧承源档与同源载荷：重发槽位与源槽位引用同一载荷对象 ⇒ 回填只写
+    一次即自动生效，其 ``ts`` 绑定值 = 源帧时间戳 ≠ 自身行 ts。"""
+    cfg = mk_timed_cfg(quotas={"booking": 1}, sessions=1, duplicates=1)
+    plan = SequencePlan(index=0, class_name="booking", ordinal=0, length=2,
+                        llm="default", style_name=None, style_prompt=None)
+    payloads = (CountingPayload(utterance="一"), CountingPayload(utterance="二"))
+    seq = RealizedSequence(plan=plan,
+                           frame_classes=("task_request", "task_request"),
+                           payloads=payloads)
+    sessions, _ = weave_stream([seq], (), cfg, random.Random("0:0:generate"))
+    backfill_time_fields(sessions, cfg)
+    task = [slot for session in sessions for slot in session if slot.owner is not None]
+    resent = [slot for session in sessions for slot in session if slot.owner is None]
+    assert len(task) == len(resent) == 2
+    for source, copy_slot in zip(task, resent):
+        assert copy_slot.payload is source.payload
+        assert copy_slot.payload["started_at"] == source.ts != copy_slot.ts
+    for payload in payloads:
+        assert payload.writes == len(TIME_FIELDS)       # 恰一次回填，无重复写入
+
+
+def test_duplicate_rows_carry_the_source_payload_bytes_including_backfilled_fields():
+    """工件面同源：重发行的 text_field 值与源行逐字节相同（含回填字段），且其
+    ``ts`` 绑定值指向源帧而非自身行 ts。"""
+    cfg = mk_timed_cfg(quotas={"booking": 2, "smalltalk": 1}, sessions=2,
+                       duplicates=1, len_range=(3, 3))
+    product, _, _ = run_stream(cfg)
+    rows = parse_lines(product)
+    resent = [row for row in rows if "duplicate_of" in row["truth"]]
+    assert resent
+    source = [row for row in rows
+              if "duplicate_of" not in row["truth"] and not row["truth"]["noise"]
+              and row["truth"]["sequence_class"] == resent[0]["truth"]["sequence_class"]
+              and row["truth"]["sequence"] == resent[0]["truth"]["duplicate_of"]]
+    assert [row["text"] for row in resent] == [row["text"] for row in source]
+    bound = [(copy_row, source_row) for copy_row, source_row in zip(resent, source)
+             if isinstance(copy_row["text"], dict)]
+    assert bound
+    for copy_row, source_row in bound:
+        assert copy_row["text"]["started_at"] == source_row["ts"]
+        assert copy_row["text"]["started_at"] != copy_row["ts"]
+
+
+def test_backfill_precedes_row_and_id_construction():
+    """裁决·回填后计 id（调用序钉板：回填在 weave 之后、assemble 之前）——工件行、
+    成员 ``raw``/``text``/id 与序列 id 全部按回填后载荷计算。"""
+    cfg = mk_timed_cfg(quotas={"booking": 1}, sessions=1, len_range=(3, 3))
+    product, _, _ = run_stream(cfg)
+    rows = parse_lines(product)
+    (env,) = product.envelopes
+    bound_rows = 0
+    for member in env.record.members:
+        row = rows[member.ref.line_no - 1]
+        assert member.raw == row
+        canonical = json.dumps(row, sort_keys=True, ensure_ascii=False,
+                               separators=(",", ":"))
+        assert member.id == hashlib.sha256(
+            canonical.encode("utf-8")).hexdigest()[:16]
+        if isinstance(row["text"], dict):
+            assert set(TIME_FIELDS) <= set(row["text"])
+            assert json.loads(member.text) == row["text"]
+            bound_rows += 1
+    assert bound_rows
+    joined = "\n".join(member.id for member in env.record.members)
+    assert env.record.id == hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def test_artifact_replay_with_bound_time_fields_reingests_same_ids(tmp_path):
+    """重放往返（v1.13 用例的绑定形扩展）：含回填数值的工件行经 M2 摄取，成员 id、
+    会话切分与 canonical JSON 文本投影逐字节一致。"""
+    cfg = mk_timed_cfg(quotas={"booking": 2, "smalltalk": 1}, sessions=2,
+                       noise_ratio=0.2, duplicates=1, len_range=(3, 3))
+    product, _, _ = run_stream(cfg)
+    assert any(isinstance(row["text"], dict)
+               and isinstance(row["text"]["duration"], float)
+               for row in parse_lines(product))
+    artifact = tmp_path / "events.jsonl"
+    artifact.write_text("\n".join(product.artifact_lines) + "\n", encoding="utf-8")
+
+    from labelkit.operators.ingest import Ingestor
+
+    replay_cfg = replace(
+        cfg,
+        run=replace(cfg.run, mode="process", input=str(artifact)),
+        segment=SegmentConfig(enabled=True),
+        generate=GenerateConfig(),
+        generate_stream=GenerateStreamConfig(),
+        limit=None)
+    sessions = list(Ingestor(replay_cfg).sessions())
+    assert len(sessions) == 2 + 1
+    replay_ids = [record.id for session in sessions for record in session.records]
+    assert replay_ids == [
+        hashlib.sha256(json.dumps(json.loads(line), sort_keys=True,
+                                  ensure_ascii=False, separators=(",", ":"))
+                       .encode("utf-8")).hexdigest()[:16]
+        for line in product.artifact_lines]
+    assert {env.session_id for env in product.envelopes} <= {
+        session.session_id for session in sessions}
+    replay_text = {record.id: record.text
+                   for session in sessions for record in session.records}
+    for env in product.envelopes:
+        for member in env.record.members:
+            assert replay_text[member.id] == member.text
+
+
+def test_hooks_and_the_similarity_filter_see_pre_backfill_payloads(monkeypatch):
+    """裁决·回填前钩子口径：``sample_validator`` 逐帧探针与序列相似度过滤探针都在
+    交织之前取值 ⇒ 绑定字段缺席（时间量是机械量，不参与内容校验与内容判重）。"""
+    import labelkit.operators.generate as generate_module
+
+    seen: list[str] = []
+
+    def hook(text: str) -> list[str]:
+        seen.append(text)
+        return []
+
+    monkeypatch.setattr("labelkit.common.extensions.hooks.resolve_hook",
+                        lambda ref: hook)
+    probes: list[str] = []
+    probe_and_add = generate_module.SimilarityFilter.probe_and_add
+
+    def spy(self, text: str) -> bool:
+        probes.append(text)
+        return probe_and_add(self, text)
+
+    monkeypatch.setattr(generate_module.SimilarityFilter, "probe_and_add", spy)
+    generate = GenerateConfig(enabled=True, num_per_call=2,
+                              sample_validator="mod:fn")
+    cfg = mk_timed_cfg(quotas={"booking": 2}, sessions=2, len_range=(3, 3),
+                       generate=generate)
+    product, _, _ = run_stream(cfg)
+    assert seen and probes
+    assert not [text for text in seen + probes
+                if [field for field in TIME_FIELDS if field in text]]
+    # 对照面：同一批载荷回填之后才带绑定字段
+    assert [line for line in product.artifact_lines if '"duration"' in line]

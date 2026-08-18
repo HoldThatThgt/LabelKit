@@ -72,7 +72,7 @@ schema_inline = """
 | `[extract]` | 关（v1.8） | `llm`（恒需视觉能力）、`instruction`（摘取补充说明）、`include_diff`（树变更摘要注入） | 第 25 章 |
 | `[quality]` | **开** | `mode`（pairwise/pointwise）、`threshold` 或 `selection="top_ratio"`（淘汰机制）、`rubric`（评价准则） | 第 10 章 |
 | `[generate]` | 关 | `instruction`（生成指令）、`num_per_record`（每种子产几条）、`llms`/`styles`（多样性来源） | 第 12 章 |
-| `[generate.stream]` | 关（v1.13，仅 `generate_only`） | `sessions`（会话数，交叉会话数 = Σsequences − sessions）、`noise_ratio`（噪音帧占比）、`duplicates`（原样重发条数） | 第 27 章 |
+| `[generate.stream]` | 关（v1.13，仅 `generate_only`） | `sessions`（会话数，交叉会话数 = Σsequences − sessions）、`noise_ratio`（噪音帧占比）、`duplicates`（原样重发条数）；子表 `[[generate.stream.tiers]]`（v1.14 帧类构成档位：`tier_rank` / `weight` / `frame_classes`） | 第 27 章 |
 | `[annotate]` | **开** | `instruction`（标注指令，开了就必填）、`examples`（few-shot）、`self_consistency`（多次采样投票） | 第 11 章 |
 | `[frame.annotate]` | 关（v1.12，仅流模式） | `instruction`（帧标注指令，启用必填）、`schema_path`/`schema_inline`（独立帧 Schema，恰一）、`[frame.class.<名>.annotate]`（按帧类覆盖/跳过） | 第 11、25 章 |
 | `[verify]` | 关 | `llm`（评审 profile，建议独立模型）、`policy`（drop/repair）、`extra_criteria`（追加评审维度） | 第 13 章 |
@@ -81,7 +81,7 @@ schema_inline = """
 
 v1.8/v1.9 新增的四节同属**流模式**一族：`[stream]` 声明输入的时间序与会话切分规则（排序依据、分区键、断开条件——它不是算子，随 `segment.enabled` 生效）；`[segment]` 是流模式的总开关，把候选会话经 LLM 边界精化切成语义完整的 episode 并剔除噪声帧；`[stitch]`（v1.9）把同一任务被穿插切开的 episode 碎片保守缝合成完整线索，并可救援过短被剔的收尾帧（要求 segment 开启）；`[extract]` 对 episode 的每对相邻帧推断结构化动作（仅 UI 模态，要求 segment 开启）。四节的逐键详解与完整示例见第 25、26 章。
 
-v1.13 的 `[generate.stream]` 是 generate 算子的**第三形态**（不是新算子）：`generate_only` 下从零合成一条带时间戳的多会话流——LLM 只出内容（一序列一次蓝图 + 一次帧实现），会话装箱、交叉、噪音、重发、时间戳由零 LLM 的机械交织器铺设。它复用两族既有词汇：`[stream]` 在这里是**生成侧的铺设契约**（`order_by` 声明工件的时间戳字段名、`gap_s` 决定会话间隔下限，故工件可按摄取侧规则原样重放），`[[frame.classify.classes]]` 在这里是**帧类真值表**（`frame.classify.enabled` 保持 false，帧内容契约写 `[frame.class.<帧类名>.generate]`）。配额按序列类挂在 `[class.<名>.generate].sequences` / `len_range`，标注可按序列类各用一份独立 Schema（`[class.<名>.annotate].schema_path` / `schema_inline`，v1.13）。逐键详解见第 27 章，全键表见附录 A.13。
+v1.13 的 `[generate.stream]` 是 generate 算子的**第三形态**（不是新算子）：`generate_only` 下从零合成一条带时间戳的多会话流——LLM 只出内容（一序列一次蓝图 + 一次帧实现），会话装箱、交叉、噪音、重发、时间戳由零 LLM 的机械交织器铺设。它复用两族既有词汇：`[stream]` 在这里是**生成侧的铺设契约**（`order_by` 声明工件的时间戳字段名、`gap_s` 决定会话间隔下限，故工件可按摄取侧规则原样重放），`[[frame.classify.classes]]` 在这里是**帧类真值表**（`frame.classify.enabled` 保持 false，帧内容契约写 `[frame.class.<帧类名>.generate]`）。配额按序列类挂在 `[class.<名>.generate].sequences` / `len_range`，标注可按序列类各用一份独立 Schema（`[class.<名>.annotate].schema_path` / `schema_inline`，v1.13）。v1.14 又给它加了两张可选子表：`[[generate.stream.tiers]]` 声明**帧类构成档位**（一档 = 一种帧类构成，类配额按 `weight` 零抽签配分，档位序数随产物落盘可对账），`[frame.class.<帧类名>.generate.time_fields]` 把帧 Schema 里的**时间语义字段**绑给时间轴（绑定即从 LLM 面剔除，值由工具在铺好时间戳后机械回填）。逐键详解见第 27 章，全键表见附录 A.13。
 
 v1.12 的帧粒度双节也是流模式一族（都要求 `segment.enabled = true`），但它们不是新算子——`[frame.classify]` 让 classify 算子顺带对 episode 成员帧做批量闭集分类（帧类表与序列类表互相独立），`[frame.annotate]` 让 annotate 算子逐成员做帧级标注（独立的帧 Schema），配套的 `[frame.class.<帧类名>.annotate]` 按帧类覆盖指令或跳过整类。帧产物挂 `_meta.stream.members[]` 随序列行交付。逐键详解见第 25 章 25.6，全键表见附录 A.12。
 

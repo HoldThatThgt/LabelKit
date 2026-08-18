@@ -192,13 +192,13 @@ dims = 1024                         # 可选：返回向量维度校验
 | `generate.seed_examples` | array | [] | generate_only 专用（process 模式不得设置，3.1.4）：字符串数组种子池，非空即种子池形态（3.6.2）。 |
 | `generate.standalone_count` | int | 无 | generate_only 无种子形态必填（与 seed_examples 互斥）：目标产出条数，调用数 = ⌈standalone_count / num_per_call⌉。 |
 | `generate.sequences` | int | 0 | v1.13 新增（时间流形态）：序列**尝试配额**的全局默认，按类经 `[class.<name>.generate].sequences` 覆盖；0 = 该类不参与生成。M1 要求 `Σsequences ≥ 1`（各类有效值求和，3.1.4 时间流生成行）。语义同 `standalone_count`——**尝试**配额，无输出条数保证、无补齐回路（8.3 O6 辖区）。 |
-| `generate.len_range` | array | [3, 6] | v1.13 新增（时间流形态）：单序列步数的均匀采样区间 `[lo, hi]`（整数，`1 ≤ lo ≤ hi`），按类可覆盖；逐序列 `L = randint(lo, hi)`（计划期第②步抽签，3.6.5）。织造上限：`2 × max(各类 hi) ≤ stream.session_max_len`（M1 校验）。 |
+| `generate.len_range` | array | [3, 6] | v1.13 新增（时间流形态）：单序列步数的均匀采样区间 `[lo, hi]`（整数，`1 ≤ lo ≤ hi`），按类可覆盖；逐序列 `L = randint(lo, hi)`（计划期第②步抽签，3.6.5）。织造上限：`2 × max(各类 hi) ≤ stream.session_max_len`（M1 校验）。**v1.14 长度可覆盖交叉引用**：档位表在场时，逐 (参与类, 档) **非零配额对**另须满足 `lo ≥ len(该档 frame_classes)`（档内每类至少出现一次，步数不足即装不下；零额对豁免——见下方 `[[generate.stream.tiers]]` 表与 3.1.4）。 |
 | `generate.stream.enabled` | bool | false | v1.13 新增：**时间流生成形态**总开关（generate_only 第三形态，M6，3.6.5）。默认关——全关时全系统与 v1.12 **字节等价**（含七个既有 dry-run golden）。启用要求（M1 硬合取，3.1.4 时间流生成行）：`run.mode="generate_only"` ∧ `run.modality="text"` ∧ `generate.enabled` ∧ `classify.enabled` ∧ `stream.order_by="meta:<字段>"` ∧ `output.meta_mode != "none"`；与 `frame.classify.enabled` / `frame.annotate.enabled` **互斥**（帧类真值在蓝图层已知，定向 CONFIG_ERROR）。 |
 | `generate.stream.sessions` | int | 0 | v1.13：会话数（≥ 1）。交叉会话数 = `Σsequences − sessions`，故 M1 要求 `sessions ≤ Σsequences ≤ 2 × sessions`（交叉并发度恒 k ∈ {1,2}；更高并发度列 8.4 演进候选）。重发序列另落流尾新会话、**不计入本键**（无作废时工件实际会话数 = sessions + duplicates；有序列作废或被相似度淘汰时按 `sessions_eff = min(sessions, Σ幸存)` 装箱，实际会话数相应减少——见 `report.generate.stream.sessions`，3.6.5）。 |
 | `generate.stream.noise_ratio` | float | 0.0 | v1.13：噪音帧 / 任务帧 比例，∈ [0,1)；噪音帧数 = `round(noise_ratio × Σ任务帧数)`，调用数 = `⌈噪音帧数 / generate.num_per_call⌉`。> 0 时 `noise_instruction` 必填。噪音帧逐帧掷签 (会话, 槽位)，满员会话（`len ≥ stream.session_max_len`）退出签池（3.6.5）。 |
 | `generate.stream.noise_instruction` | str | "" | v1.13：噪音帧的生成指令（`noise_ratio > 0` 时必填非空，M1 校验）；批量实现复用 3.6.2 的既有生成模板与输出 Schema。 |
 | `generate.stream.duplicates` | int | 0 | v1.13：**原样重发**的序列条数（0 = 无；M1 要求 ∈ [0, Σsequences]，运行期另按幸存数钳制 + WARN）。取自幸存序列、帧内容逐字节同源、恒落**流尾新会话**（避免同刻不定序）——重发帧只活在工件（不构造信封、不进本次运行的守恒账），判重演示位在**工件重放**（6.5）。 |
-| `generate.stream.frame_gap_s` | array | [5, 60] | v1.13：会话内帧间隔的均匀采样区间（秒，数值）；M1 要求 `0 < lo ≤ hi < stream.gap_s`（否则会话内间隔自身就触发会话切分，自相矛盾）。会话间隔取 `uniform(gap_s + lo, gap_s + hi)` 恒 > `gap_s` ⇒ 摄取侧按同一 `gap_s` 复演出相同会话切分（3.6.5）。 |
+| `generate.stream.frame_gap_s` | array | [5, 60] | v1.13：会话内帧间隔的均匀采样区间（秒，数值）；M1 要求 **`1e-6 ≤ lo ≤ hi < stream.gap_s`**（上界：否则会话内间隔自身就触发会话切分，自相矛盾；下界为 v1.14 补的**微秒地板**——isoformat 精度与 `round(·, 6)` 的分辨率下界，亚微秒 lo 下帧间隔 `timedelta` 取整为 0 微秒，破坏「ts 严格递增」并使时间语义词表的 0.0 边界哨兵失去无歧义性）。会话间隔取 `uniform(gap_s + lo, gap_s + hi)` 恒 > `gap_s` ⇒ 摄取侧按同一 `gap_s` 复演出相同会话切分（3.6.5）。 |
 | `generate.stream.ts_start` | str | "2026-01-01T00:00:00Z" | v1.13：时间流起点（ISO-8601，M1 以 `datetime.fromisoformat` 校验可解析；无时区视为 UTC，与 `meta:<字段>` 摄取规则一致）。**恒不取墙钟**——同 seed 双跑工件逐字节一致的前提之一（2.6 可复现行）。 |
 | `annotate.enabled` | bool | true | — |
 | `annotate.llm / instruction` | str | default / 必填† | † enabled 时必填。 |
@@ -236,6 +236,16 @@ dims = 1024                         # 可选：返回向量维度校验
 | `trace.channels` | array | ["quality","verify","schema"] | 可选值 ingest \| segment（v1.8 增）\| stitch（v1.9 增）\| dedup \| classify（v1.7 增）\| extract（v1.8 增）\| quality \| annotate \| verify \| schema \| llm（十一个，7.2 事件目录；通道 = stage 名，S1）；默认值不变——分类事件须用户显式加 "classify"、分段/摘取/缝合事件须显式加 "segment" / "extract" / "stitch" 才写；run.*/batch.* 生命周期事件不受此过滤。 |
 | `trace.content` | str | "refs" | "none" \| "refs" \| "excerpt" \| "full" 内容脱敏四档（7.4）。 |
 
+**`[[generate.stream.tiers]]` 帧类构成档位表（v1.14 新增，可选；数组表，仅时间流生成形态合法）。**一个档位的定义**就是**该档序列的帧类构成集合：它不携带质量指令、不控制帧内部语义质量（那归各帧类的生成指令与温度）。缺省（表不在场）⇒ 档位面整体不在场，与 v1.13 字节等价。
+
+| 字段 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `tier_rank` | int | 必填 | 档位序数（「第几个档位的要求」，即档位身份——本表**不设** `name` 键）。正整数、表内唯一、全表**连续覆盖 1..N**（N = 表长；缺号/重号 = CONFIG_ERROR）。它同时是配分平票与类内序数分块的确定性排序依据；**工具不赋予序数高低任何质量方向语义**——方向由用户在各档构成上自行赋予。 |
+| `weight` | int | 必填 | 配额权重（整数 ≥ 1）。每个参与类的 `sequences` 配额按各档权重走**整数域最大余额法**零抽签配分（3.6.5 档位构成行）；配分为 `(sequences, 权重表)` 的纯函数、不消费任何随机数。某 (参与类, 档) 配额为 0 是小配额 × 悬殊权重的自然结果 ⇒ M1 发 WARN（非错误，`report.generate.stream.tiers.<rank>.planned` 如实呈现 0）。 |
+| `frame_classes` | array | 必填 | 档位构成：该档序列**恰用**这些帧类（每类至少出现一次、不出现档外类）。非空、档内无重复、每名 ∈ `[[frame.classify.classes]]` 名集，各档构成**集合两两互异**（同构成即语义重复）。恰等语义由蓝图内部 Schema 双向保证——enum 限档内子集给「⊆」、逐类 `contains` 给「⊇」（3.8.1），故档位身份可从 `_meta.stream.members[]` 的帧类集合直接反推对账。长度前提：配额非零的 (类, 档) 对须满足该类 `len_range` 下界 ≥ 本档构成大小（M1 校验）。 |
+
+档位序数在**三处**落地（同一个值三个面，档位表缺省时三处全部不在场）：主输出每行的 `_meta.source.generator.tier_rank`（6.3）、时间流工件行的 `truth.tier_rank`（6.5）、报表的 `report.generate.stream.tiers.<rank>.{planned, produced}`（6.4）。另一条推论：`--limit` 在计划期配额层做前缀截断，而类内序数按 tier_rank 升序占连续区间，故截断是在每个类内**从最高档序数侧截起**。
+
 **`[class.<name>.<section>]` 按类覆盖（v1.7）。**classify 启用时可按类覆盖下游算子参数：`<name>` 必须 ∈ classes；未出现的键一律继承全局节（不配任何覆盖即纯打标模式）。可覆盖键白名单（M1 强校验，白名单外的键报 `CONFIG_ERROR`——3.1.4「未知键报 warning」行的显式例外；白名单后续只增）：
 
 | 节 | 可覆盖键 | 不可覆盖（保持全局）及理由 |
@@ -246,10 +256,21 @@ dims = 1024                         # 可选：返回向量维度校验
 | `[class.*.verify]` | extra_criteria | llm / judges / policy / max_repair_rounds |
 | `[class.*.extract]` | instruction（v1.8 增） | llm / include_diff / on_error——LLM 绑定与失败策略属部署与成本面（与 quality 行同理） |
 | `[frame.class.*.annotate]`（v1.12） | instruction, examples, enabled（enabled = false ⇒ 该帧类成员跳过帧标注——省成本面，members[] 呈现 status="skipped"，3.11.2） | llm / schema——LLM 绑定属部署与成本面；帧级标注 Schema 按粒度唯一（8.4 M13 行）。v1.12 时白名单仅此一节，v1.13 增 `generate` 节（下行）；两节之外的节名 ⇒ CONFIG_ERROR（3.1.4 帧粒度配置行） |
-| `[frame.class.*.generate]`（v1.13） | instruction（**每个帧类必填非空**——蓝图 enum 覆盖全类表，任一帧类都可能被选中）, schema_path / schema_inline（**至多其一**：声明 = 结构化帧（帧内容以**对象原样**落工件行的文本字段，成员 `Record.text` 取其 canonical JSON 投影，6.5）；均缺 = 纯文本帧） | llm / temperature / styles——生成侧 profile 与采样参数属序列级（蓝图与实现绑定同一 profile，3.6.5）。**本节仅时间流生成形态合法**：`generate_stream.enabled = false` 时出现是反向定向 CONFIG_ERROR（指引改写 `[frame.class.<name>.annotate]`，3.1.4）；帧类生成 Schema 走 `_load_schema_pair` 全套 + `$ref` 遍历，**无 `_meta` 分支**（帧内容落工件行文本字段，与 §6.3 信封字段无冲突面） |
+| `[frame.class.*.generate]`（v1.13；v1.14 增第四键） | instruction（**必填非空**——v1.13 为「每个帧类」，v1.14 起：档位表在场时检查域收窄为 **∪各档 `frame_classes`**，未入档帧类豁免必填并另发一条 WARN 提示其整个生成面为死配置）, schema_path / schema_inline（**至多其一**：声明 = 结构化帧（帧内容以**对象原样**落工件行的文本字段，成员 `Record.text` 取其 canonical JSON 投影，6.5）；均缺 = 纯文本帧）, **`time_fields`（v1.14 增，子表——见下方时间字段绑定表）** | llm / temperature / styles——生成侧 profile 与采样参数属序列级（蓝图与实现绑定同一 profile，3.6.5）。**本节仅时间流生成形态合法**：`generate_stream.enabled = false` 时出现是反向定向 CONFIG_ERROR（指引改写 `[frame.class.<name>.annotate]`，3.1.4）；帧类生成 Schema 走 `_load_schema_pair` 全套 + `$ref` 遍历，**无 `_meta` 分支**（帧内容落工件行文本字段，与 §6.3 信封字段无冲突面） |
 | —— | —— | run.* / input.* / stream.*（v1.8）/ dedup.* / segment.*（v1.8）/ stitch.*（v1.9）/ classify.* / trace.* 全部不可按类；`output.*` 中除**标注 Schema** 外全部不可按类——v1.13 修订：`output.schema` 自本版起**可按序列类覆盖**（`[class.<name>.annotate].schema_*`，上表 annotate 行；兑现 8.4 M13 行「按类输出 Schema」演进候选），`output.validator`（L2.5 回调）与 meta_mode / rejects / passthrough_fields 等其余输出面仍全局唯一，帧级标注 Schema（`frame.annotate.schema`）亦维持按粒度唯一 |
 
 v1.8 注：`segment.*` 不入白名单是**链序因果**而非取舍——链序为 segment → stitch → dedup → classify → extract →…（3.10.3），segment 在 classify **之前**执行，成段时类标签尚不存在，「按类分段」无从谈起；extract 在 classify 之后，故其 `instruction` 可按类覆盖（multi 扇出下兄弟信封各按其标签的有效 instruction 摘取，S9，3.15）。v1.9 注：`stitch.*` 不入白名单同为链序因果——stitch 亦在 classify 之前（3.10.3），`[class.<name>.stitch]` 不存在（3.1.4 线索缝合行）。v1.12 注：`[frame.class.<name>.annotate]` 按**帧类**覆盖（键控 `[[frame.classify.classes]]` 类表，要求 `frame.classify.enabled = true`，3.1.4 帧粒度配置行②），与 `[class.<name>.*]` 的序列类覆盖是两个独立命名空间——**帧类表与序列类表相互独立、允许重名、互不约束**（重名类各自作用于各自粒度，互不干扰）；合并产物为 `frame_class_views`（零覆盖类也各得一份视图，`class_views` 同款，运行期零回退）。
+
+**`[frame.class.<name>.generate.time_fields]` 时间字段绑定子表（v1.14 新增，可选；仅结构化帧合法）**——把该帧类生成 Schema 里的时间语义字段绑定到时间轴：**键 = 生成 Schema 顶层字段名，值 = 语义词表取值**。绑定即剔除——被绑定字段从 LLM 面向的逐位 Schema 与逐位契约行中一并删掉（LLM 物理上生不出它），值由机械回填尾声在时间戳铺好之后按**本序列相邻成员**的 ts 差算出写回（3.6.5 时间字段回填行）。语义词表是**冻结闭集**，扩词走 spec 修订：
+
+| 语义词 | 要求的字段类型 | 取值 |
+|---|---|---|
+| `ts` | `"string"` | 本帧已铺时间戳的 ISO-8601 串。任务帧上 = 该行的时间戳字段值；**重发帧承源值**（≠ 自身行 ts——原样重发本就携带陈旧内容）。 |
+| `gap_prev_s` | `"number"` | 与**本序列**上一帧的间隔秒；本序列首帧恒 `0.0`。 |
+| `gap_next_s` | `"number"` | 与**本序列**下一帧的间隔秒；本序列末帧恒 `0.0`。 |
+| `elapsed_s` | `"number"` | 距**本序列**首帧的秒数；首帧恒 `0.0`。 |
+
+口径与约束：间隔一律按**序内相邻成员**计——交叉会话夹入的外序列帧与噪音帧本就占用其间墙钟，序内差值才与下游从数据实测的口径一致；不提供「会话内相邻行」口径（那是重放侧可自行计算的流水量）。数值取 `round(·, 6)`（微秒精度，与 isoformat 写出的分辨率对齐；0.0 边界的无歧义性由 `frame_gap_s` 的微秒地板保证）。M1 校验（3.1.4 帧类构成档位与时间字段绑定行）：绑定表仅结构化帧合法（纯文本帧带绑定表 = 定向 CONFIG_ERROR）；每个绑定键 ∈ 生成 Schema 顶层 `properties`；绑定值 ∈ 上表四词；该属性 Schema 的 `type` 关键字**字面恰等**于上表要求（联合类型数组、缺失、经 `$ref`/组合关键字间接声明均判不匹配）；顶层 `properties` 键数 − 绑定键数 ≥ 1（全绑定 = CONFIG_ERROR）。绑定字段上再写 `minimum`/`maximum`/`pattern` 等约束关键字 ⇒ WARN——那些关键字既不上行也不被强制，**时间量的值域由时间轴决定，不受 Schema 数值约束辖制**。
 
 合并优先级：`[class.<name>].<sect>.<key>` > project.toml `[<sect>].<key>` > 内置默认——这是 project.toml **内部**的条件化合并，不改变「CLI > project.toml > config.toml」三源优先级（2.5）。M1 启动时按逐键 provenance 静态合并、冻结为 `class_views`，运行期零查找成本；选择组互斥对剔除、per-class rubric 重解析、类 examples 干跑等精确语义见 3.1.4 按类覆盖合并行。
 

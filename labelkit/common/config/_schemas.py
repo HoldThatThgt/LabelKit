@@ -267,7 +267,9 @@ def _load_frame_gen(col: _Collector, file: str, cname: str,
     ``instruction``(时间流生成形态下每个帧类必填, 缺失由形态约束簇上报)与
     ``schema_path``/``schema_inline``(**至多其一**; 均缺 = 纯文本帧)。Schema 走
     ``_load_schema_pair`` 全套 + ``$ref`` 可解析性遍历; 无 ``"_meta"`` 分支——帧内容
-    落工件行的文本字段, 与 §6.3 信封字段无冲突面(帧级 Schema 同理)。
+    落工件行的文本字段, 与 §6.3 信封字段无冲突面(帧级 Schema 同理)。v1.14 的第四键
+    ``time_fields`` 不在此消费: 它由帧类视图侧的 ``_parse_time_fields`` 解析(本函数
+    不做未知键 finish(), 白名单校验独立执行, 故无重复上报面)。
 
     @param col 错误聚合器
     @param file 报错定位用的 project.toml 路径字符串

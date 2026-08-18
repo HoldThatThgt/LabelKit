@@ -37,6 +37,11 @@
 | 26 | 温度 0.9 下帧实现偶发违约 ⇒ 整序列作废、交叉演示位退化 | 实测记录（同第 6 条根因家族） | ⏸ 数据侧缓解（按设计处置） |
 | 27 | 工件重放的判重档位实测：`near_text` 而非 `exact` | 实测记录 | 已记录（示例头注与手册按实测叙述） |
 | 28 | `resolved_at` 恒等式在 M8 显式待遇参数重构后的回归确认 | 实测记录 | ✅ 已确认（2026-08-13） |
+| 29 | `validate --probe` 的 rich 表格把 `profile[key]` 字面格当 markup 吞掉 | 真 bug（实现勘误） | ✅ 已修复（2026-08-14） |
+| 30 | 蓝图 `cover_all` 服从性实测：首轮全过，作废集中在帧实现 | 实测记录 | ✅ 已确认（2026-08-18） |
+| 31 | z.ai glm-5.2 接受 `allOf`/`contains` 作强制工具 input_schema | 实测记录 | ✅ 已确认（2026-08-18，L0 透传钉板） |
+| 32 | 工件重放判重档位的两分支现在都有实测：`exact` 与 `near_text` | 实测记录（第 27 条续） | 已记录（两分支并列叙述） |
+| 33 | v1.13 集成首例在真端点约 8 跑中偶发红一次 | 锐边记录（同第 6、26 条根因家族） | ⏸ 不改测试（处置理由见条目） |
 
 ## P1 — 实现与规格的偏差
 
@@ -400,3 +405,56 @@ inode**，先启动进程 rename 交付的「主输出」实为后进程内容�
 | `examples/synth-stream` 真跑 | exit 0 | `counts.generated = emitted = 6`、`failed`/`dropped_*` 全 0；`generate.stream = {sessions 5, crossed_sessions 1, 两类各 planned 3/produced 3, frames 23, noise_frames 2, duplicates 1, plan_calls 6, realize_calls 6, noise_calls 1, 三项 failures 0}`；`run.artifact.lines = 29`、`llm_usage.default.calls = 52`、`timing.wall_s = 96.97`；`_meta.run.rubric = "default:trajectory"`（S29 扩展生效）；`report.classify` 直方图全零（inherited，预期） |
 | 工件重放（process + segment） | exit 0 | 29 帧 → 6 会话 → 6 episodes、`absorbed 28`、`dropped_noise 1`、`dropped_dup 1`（`near_text`，见第 27 条） |
 | 既有示例 dry-run golden | 七个字节不动 | 新增第八个 `tests/cli/goldens/dryrun-synth-stream.txt`（`generate_calls=13`、`classify_calls=0`、`total=49`） |
+
+---
+
+## 追加条目：v1.14 帧类构成档位与时间字段回填 E2E 实测（2026-08-18）
+
+> spec v1.14 两机制（`SPEC-generation-tiers.md`）的验收工序实测记录。E2E 面沿用 v1.13 端点纪律：
+> `examples/synth-stream` 就地扩展后走 DeepSeek anthropic 路由（`https://api.deepseek.com/anthropic`，
+> `deepseek-v4-flash`，密钥 `.env` 的 `LABELKIT_DEEPSEEK_KEY`），集成套件另设一例 z.ai glm-5.2 钉
+> `allOf`/`contains` 的 L0 透传。验收真跑：`counts.generated = emitted = 6`、`failed`/`dropped_*` 全 0、
+> `tiers = {"1": 4/4, "2": 2/2}`、工件 29 行、exit 0。
+
+### 30. 蓝图 `cover_all` 服从性实测：首轮全过，作废集中在帧实现 —— ✅ 已确认（2026-08-18）
+
+**背景**：档位的「构成恰等」由蓝图内部 Schema 双向承担——enum 限档内子集给「⊆」、`allOf` + 逐类 `contains` 给「⊇」。但 E2E 端点声明 `supports_structured_output = false`（第 24 条），**L0 全关**：这份 Schema 根本不会到达供应商，覆盖约束的服从性在首轮完全由**提示词文本**承担（§10.14 的 user 行冻结变体「……且 [帧类表] 中每个帧类都至少出现一次。」），校验侧则由 jsonschema 在 L2 逐条兑现（`contains` 是 draft 2020-12 原生关键字，4.26.0 实测直接可校验）。规格为此把服从率按「首轮通过率 / 修复后通过率」两列记录——L3 修复轮的提示包不带温度、生效温度回落 profile 默认（示例为 0.0），高温首轮违约由低温修复轮收敛是既有机制事实。
+
+**实测**：**全部真跑 `plan_failures = 0`**——`examples/synth-stream` 两次保留运行（`out/` 与 `out-run1/`）各 6 次蓝图调用、12/12 首轮即过，无一进修复环；集成套件的 DeepSeek 档位例同样零蓝图失败。逐行反查亦成立：主输出每行的 `_meta.stream.members[]` 帧类集合与其 `generator.tier_rank` 所声明的档构成**逐条恰等**（第 1 档 `{task_request, followup}` 四条、第 2 档全三类两条），工件行按 `truth.tier_rank` 分组对账同样恰等——构成语义可从数据直接反推，不必信任标签。
+
+**处置与残余**：两列服从率里首轮一列已足够（`temperature = 0.9` 下仍是 12/12），修复列本次无样本。作废依旧**集中在帧实现**（第 26 条同族锐边，kinds `schema_violation` / `output_truncated`）——保留运行 `out-run1/` 即该形态的真实样本：`plan_failures = 0` 而 `realize_failures = 2`，两类各作废一条 ⇒ `tiers = {"1": {planned 4, produced 3}, "2": {planned 2, produced 1}}`、`crossed_sessions` 退化为 0、工件 23 行。这正是**尝试配额语义**的教学样本：`planned` 是计划期配额、`produced` 是最终进链条数，缺口不补齐、守恒恒等式照常成立。M8 侧另有一条配套改动已随本版落地——`_render_error` 的 `contains` 分支点名缺失帧类（`steps: missing required frame_class "<名>"`），使 L0 关端点上万一发生的修复轮有可指导的违规描述，而非裸数组 repr。
+
+### 31. z.ai glm-5.2 接受 `allOf`/`contains` 作强制工具 input_schema —— ✅ 已确认（2026-08-18）
+
+**背景**：`cover_all` 产物随 `supports_structured_output` 上行，沿用 v1.13 裁决·用户生成 Schema 的 L0 待遇——不做关键字白名单 lint。站立假设需要一枚真端点钉板：某些对结构化输出关键字挑剔的路由可能对含 `allOf`/`contains` 的请求直接 400（`prefixItems` 的同款暴露面，第 25 条）。
+
+**实测**：集成测试 `tests/integration/test_generate_stream_llm.py` 新增的 z.ai 一例（`glm-5.2`，anthropic 路由，`supports_structured_output = true`）**HTTP 200 通过**——该路由把整份 Schema 作强制工具的 `input_schema` 原样收下，`allOf` + 逐类 `contains` 未被拒收，蓝图产物在 L2 直接过校验。集成套件本轮 6/6 全绿（DeepSeek 档位与时间字段两例 + z.ai `cover_all` L0 透传一例，加既有三例）。
+
+**处置与残余暴露面**：与第 25 条同款——**拒收形态是首个蓝图调用即 HTTP 400 快速失败**且计入熔断连击（连续 400 以退出码 4 收场，不是逐序列作废），处置是**配置级**的 `supports_structured_output = false`，**不新增调用级参数**。`openai_compatible` 的 strict 网关文档明载不支持 `allOf`/`contains`，处置同款；仓内两个真端点均为 anthropic 路由，故该面无钉板，属**已知未测暴露面**，写入手册第 14 章排障条目。
+
+### 32. 工件重放判重档位的两分支现在都有实测：`exact` 与 `near_text` —— 已记录（2026-08-18，第 27 条续）
+
+**现象**：把本轮验收工件（`out/synth-labels.stream.jsonl`，29 行）拷成 process 模式输入重放（`segment` hybrid + `dedup` + `annotate`，`quality` 关）：**29 帧 → 6 会话 → 6 episodes、`absorbed = 27`、`dropped_noise = 2`、`dropped_dup = 1`、`emitted = 5`、`failed = 0`、exit 0**。判重命中如设计预期，且**档位是 `exact`**——与第 27 条实测的 `near_text` 相反。
+
+**根因与结论**：档位随分段判决浮动，第 27 条已勘明机理（重发帧与源帧逐字节同源，但原会话里混着噪音帧：噪音被**剔除**则两侧成员文本完全一致走 `exact`，被**吸收**则原 episode 多一帧、序列判重配方不再逐字节相同而落近似层）。本次两枚噪音帧**都**被剔除（`dropped_noise = 2`），故走 `exact`。**至此两个分支都有实测样本**：`near_text`（v1.13，2026-08-13）与 `exact`（v1.14，2026-08-18）。文档一律按「取决于噪音帧是否被剔除，两分支皆可能」叙述，**不得把任一档位写死**——手册第 27 章与示例头注均已按此措辞。
+
+**同批对账事实两条**：① 生成侧全部成员 id 可从工件行**逐字节推导**（M2 的 `sha256(canonical_json(raw))[:16]` 作用于同一份行对象），4/5 幸存 episode 的 id 与生成侧序列 id **恰等**——差的那一条是交叉会话被分段判决合并/切分的浮动，属既有语义（分段是 LLM 判决，不承诺与生成侧的会话切分逐条同构）；② 时间字段回填不扰动上述任何一条——回填先于行对象与 id 计算，判重配方吃成员文本不吃 id，重发帧与源帧的文本字节同源不变。
+
+### 33. v1.13 集成首例在真端点约 8 跑中偶发红一次 —— ⏸ 不改测试（同第 6、26 条根因家族）
+
+**现象**：`tests/integration/test_generate_stream_llm.py` 的 v1.13 第一例（单序列 + 零作废断言）在本轮验收前后的约 8 次真端点执行中**偶发红一次**——帧实现调用 `schema_violation`，重跑即过。
+
+**根因**：与第 26 条同源——服务端非确定性 + 生成对措辞极敏感，`temperature = 0.9` 下帧实现偶发违约；该用例把「零作废」写进断言，一旦命中即红。
+
+**处置（不改测试）与理由**：① 该断言正是这条锐边的**探针**——放宽为「允许作废」会让真正的回归（例如缩减 Schema 派生出错导致的系统性违约）无声通过，探针价值高于偶发红的成本；② 作废语义本身无缺陷：配额是**尝试配额**，作废序列不产 failed 记录、不进交织、守恒恒等式照常成立（第 26 条已确立）；③ 温度是两难旋钮，两端都有代价（低温 ⇒ 同类序列近重被相似度过滤淘汰，高温 ⇒ 帧实现违约），工具侧无案；④ 集成套件本就是**手动执行**的真端点面（离线套件从不触网），偶发红重跑即可，不进 CI 门禁。记录于此以免后来者把它当作新缺陷重新调查。
+
+### 测试留痕（v1.14）
+
+| 套件 | 数量 | 备注 |
+|---|---|---|
+| 离线套件 | 1980 passed | v1.13 基线 1884；新增覆盖分布在 `test_loader_generate_stream.py`（M1 约束两簇逐条正反例）、`test_generate_stream.py`（映射与 `--limit` 交换律、蓝图渲染、缩减 Schema 派生、回填算术、truth 键序与条件在场、双关字节等价）、`test_config.py`（`tiers`/`time_fields` 默认值）、`test_schema_engine.py`（`cover_all` 形态与 `ALLOWED_KEYWORDS` 扩三词、`contains` 渲染分支）、`test_orchestrator.py`（`tiers` 形状/键序/零额在场/缺省不在场四向）、`tests/common/config/`（`apportion_tiers` 整数配分性质，随函数落点归属） |
+| 集成套件（真端点） | 6 passed | v1.13 三例 + v1.14 三例：DeepSeek 档位一例（逐行 `members[]` 帧类集合 ≡ 档声明构成、`tiers` 计数落账）、DeepSeek 时间字段一例（解析工件断言 `duration` = 序内相邻成员 ts 差，重发行除外）、z.ai glm-5.2 `cover_all` L0 透传一例（第 31 条）。偶发红锐边见第 33 条 |
+| `examples/synth-stream` 真跑 | exit 0 | `counts.generated = emitted = 6`、`failed`/`dropped_*` 全 0；`generate.stream = {sessions 5, crossed_sessions 1, 两类各 planned 3/produced 3, tiers {"1": 4/4, "2": 2/2}, frames 23, noise_frames 2, duplicates 1, plan_calls 6, realize_calls 6, noise_calls 1, 三项 failures 0}`；`run.artifact.lines = 29`、`llm_usage.default.calls = 51`；构成恰等逐行对账通过、`duration` = 序内相邻 ts 差逐帧对账通过、重发行载荷与源行字节一致 |
+| 保留运行 `out-run1/` | exit 0 | 尝试配额语义的真实样本：2 条序列在帧实现作废（`realize_failures = 2`）⇒ `tiers {"1": 4/3, "2": 2/1}`、`crossed_sessions 0`、工件 23 行（第 30 条） |
+| 工件重放（process + segment） | exit 0 | 29 帧 → 6 会话 → 6 episodes、`absorbed 27`、`dropped_noise 2`、`dropped_dup 1`（**`exact`**，第 32 条）、`emitted 5`、`failed 0` |
+| dry-run golden | 八个**字节不动** | 两机制零调用数变化 ⇒ `estimate_run` 零改动，含示例扩展后的 `dryrun-synth-stream.txt`（`generate_calls=13`、`classify_calls=0`、`total=49`） |

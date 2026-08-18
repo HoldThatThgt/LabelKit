@@ -16,9 +16,10 @@
 # 字节一致。本工程的调用量 = 2 × 6 序列 + ⌈噪音帧数 / num_per_call⌉ 批噪音，精确
 # 数值可用 --dry-run 复演（估算与真跑同源同一套计划期纯函数）。
 #
-# 会话账（Σsequences = 2 类 × 3 = 6，sessions = 5）：交叉会话数 = 6 − 5 = 1（一个
-# 会话里两条序列交错出现，形如 A 段 + B 段 + A 余段），其余 4 个会话各装一条序列；
-# 重复重发的 1 条序列另落**流尾新会话**，故工件里共 6 个会话。
+# 会话账（Σsequences = 2 类 × 3 = 6，sessions = 5）：交叉会话数 = 6 − 5 = 1（全部序列
+# 存活时；有序列作废会使交叉退化——装箱按 sessions_eff = min(sessions, Σ幸存) 走，见
+# 手册排障）。那个交叉会话里两条序列交错出现，形如 A 段 + B 段 + A 余段，其余 4 个
+# 会话各装一条序列；重复重发的 1 条序列另落**流尾新会话**，故工件里共 6 个会话。
 #
 # 两份产物：
 #   out/synth-labels.jsonl         主输出（每行 = 一条序列的标注结果 + _meta）
@@ -37,6 +38,29 @@
 # → 6 episode，dropped_dup = 1）；命中档位取决于原会话的噪音帧是否被 segment 剔除
 # ——剔除则两侧成员文本逐字节相同走 exact，被吸收则原 episode 多一帧走 near_text
 # （实测即此档）。重放时加 --strict 则预期退出码 1（有 rejects）。
+#
+# ── 帧类构成档位（spec v1.14，[[generate.stream.tiers]]）────────────────────
+# 一个档位的定义**就是**该档序列的帧类构成集合——它不带任何质量指令、不管帧内部
+# 写得好不好（那归各帧类的生成指令与温度）。本工程两档：第 1 档只用
+# {task_request, followup} 两类，第 2 档用全三类。构成语义是**恰等**（蓝图 Schema
+# 的 enum 给「只能用这些类」、逐类 contains 给「每类至少一次」），因此每条序列的
+# _meta.stream.members[] 帧类集合恰等于其档声明的构成——档位身份可从数据直接反推
+# 对账，不必信任标签。
+# 档位序数（tier_rank）只是「第几档的要求」，工具不赋予高低任何质量方向语义，方向
+# 归你自己定；它在三处落地，同一个值三个面：主输出每行的
+# _meta.source.generator.tier_rank、工件行的 truth.tier_rank、报表的
+# report.generate.stream.tiers.<rank>.{planned, produced}。
+# --limit 在配额层做前缀截断，而类内序数按 tier_rank 升序占连续区间，故截断是从每
+# 个类的**最高档序数侧**截起（低档序数在前）。
+#
+# ── 时间字段回填（spec v1.14，[frame.class.<name>.generate.time_fields]）────
+# 结构化帧的生成 Schema 里那些「时间语义」字段（本工程是 task_request 的 duration）
+# 与真实帧间隔本就对不上——LLM 没有时间轴，写出来的秒数是编的。绑定即剔除：绑定过
+# 的字段从 LLM 面向的逐位 Schema 与契约行里一并删掉，LLM 物理上生不出它；值由机械
+# 回填尾声在时间戳铺好之后按**本序列相邻成员**的 ts 差算出写回（round 到微秒）。
+# 回填先于行对象与 id 计算，所以工件重放逐字节同 id 同会话。
+# 重发会话承源：重发帧与源帧引用同一个载荷对象，其 duration 与 truth.tier_rank 都
+# 是**源会话**的值，不与自身那条时间轴对账（原样重发本就携带陈旧内容，语义自洽）。
 #
 # 运行（out/ 不入库，须先建；密钥见仓库根 .env，只经 api_key_env 名引用）：
 #   mkdir -p out && set -a && source ../../.env && set +a
@@ -84,6 +108,23 @@ noise_instruction = """
 duplicates = 1                    # 原样重发 1 条序列（逐字节同源）到流尾新会话
 frame_gap_s = [5, 60]             # 会话内帧间隔均匀采样（秒）；上界须 < stream.gap_s
 ts_start = "2026-01-05T09:00:00+08:00"   # 时间流起点（恒不取墙钟——双跑一致）
+
+# ── 档位表：一档 = 一种帧类构成（v1.14）───────────────────────────────────────
+# 配分：每类 sequences = 3，权重 2 : 1 按整数域最大余额法零抽签配分 ⇒ 2 + 1
+# （两个序列类各出 2 条一档序列、1 条二档序列），配分是 (sequences, 权重表) 的纯
+# 函数，不消费任何随机数。
+# 长度关系：len_range 下界 3 必须 ≥ 最大构成大小 3（第 2 档三类各至少出现一次，
+# 三步才装得下）——这是 M1 逐 (类, 档) 非零配额对的硬约束，把下界改成 2 会直接
+# CONFIG_ERROR 而不是悄悄产出缺类的序列。
+[[generate.stream.tiers]]
+tier_rank = 1                     # 档位身份（表内唯一、全表连续覆盖 1..N，无 name 键）
+weight = 2                        # 配额权重（整数 ≥ 1）
+frame_classes = ["task_request", "followup"]      # 该档序列恰用这两类
+
+[[generate.stream.tiers]]
+tier_rank = 2
+weight = 1
+frame_classes = ["task_request", "followup", "confirmation"]   # 恰用全三类
 
 [classify]
 enabled = true                    # 类表是配额与按类条件化的载体；生成侧标签直接继承
@@ -193,17 +234,31 @@ instruction = """
 列出这句话里出现的关键要素（地点、日期时段、设备、房间、车次坐席等），没有则给
 空数组。
 """
+# duration 是绑定给时间轴的字段（见下面的 time_fields 子表）：它照旧写进这份完整的
+# 生成 Schema（含 required）——工件里的帧对象要满足它——但会从 LLM 面向的逐位
+# Schema 与契约行里被剔除，故不必也不能在 instruction 里要求模型产出它。
 schema_inline = """
 {
   "type": "object",
   "properties": {
     "utterance": {"type": "string"},
-    "entities": {"type": "array", "items": {"type": "string"}}
+    "entities": {"type": "array", "items": {"type": "string"}},
+    "duration": {"type": "number"}
   },
-  "required": ["utterance", "entities"],
+  "required": ["utterance", "entities", "duration"],
   "additionalProperties": false
 }
 """
+
+# 时间字段绑定（仅结构化帧合法）：键 = 生成 Schema 顶层字段名，值 = 语义词表取值
+# （闭集四值：ts / gap_prev_s / gap_next_s / elapsed_s）。此处把 duration 绑成
+# gap_next_s = 与**本序列下一帧**的间隔秒（序内口径：交叉会话夹进来的外序列帧与噪音
+# 帧不计），本序列末帧恒 0.0；值由 harness 在时间戳铺好之后回填，LLM 物理上不生成
+# 它。绑定字段的声明类型必须字面恰等（ts ⇒ "string"、其余三值 ⇒ "number"）；若再给
+# 它写 minimum 之类的约束关键字，那些既不上行也不被强制（M1 为此发一条 WARN）——时
+# 间量的值域由时间轴决定，不受 Schema 数值约束辖制。
+[frame.class.task_request.generate.time_fields]
+duration = "gap_next_s"
 
 [frame.class.followup.generate]
 instruction = """

@@ -5,6 +5,7 @@ Pointer paths, byte-exact L3 repair-prompt rendering vs the spec 3.8.4 worked ex
 resolved_at bucket logic driven by synthetic layer outcomes, canonical user-schema
 text, and the §10.7 internal schema constants.
 """
+import json
 from types import SimpleNamespace
 
 from jsonschema import Draft202012Validator
@@ -19,6 +20,7 @@ from labelkit.common.runtime.schema_engine import (
     _build_repair_prompt,
     _extract_object,
     _first_balanced_braces,
+    _render_error,
     _strip_markdown_fences,
     action_schema,
     classification_schema,
@@ -568,6 +570,88 @@ class TestPlanSchema:
             "enum"] == ["a", "b"]
 
 
+def _plan_step(name: str) -> dict:
+    """One blueprint step of the given frame class (the brief is content-free filler)."""
+    return {"frame_class": name, "brief": "要点"}
+
+
+class TestPlanSchemaCoverAll:
+    """v1.14（裁决·蓝图双向硬约束）：cover_all 的形状、语义与缺省字节等价。"""
+
+    def test_default_output_is_byte_identical_to_the_v1_13_shape(self):
+        # 缺省 False ⇒ 既有调用点与 golden 面零波及（双关字节等价的构造器一侧）
+        for length in (1, 4):
+            explicit = plan_schema(FRAME_CLASSES, length, cover_all=False)
+            assert json.dumps(plan_schema(FRAME_CLASSES, length)) == json.dumps(explicit)
+            assert "allOf" not in explicit["properties"]["steps"]
+
+    def test_cover_all_appends_one_contains_branch_per_name_in_order(self):
+        s = plan_schema(FRAME_CLASSES, 3, cover_all=True)
+        Draft202012Validator.check_schema(s)
+        steps = s["properties"]["steps"]
+        # allOf 追加在数组对象尾部，其余键与缺省形态逐字节一致
+        assert list(steps) == ["type", "items", "minItems", "maxItems", "allOf"]
+        assert steps["allOf"] == [
+            {"contains": {"type": "object",
+                          "properties": {"frame_class": {"const": name}},
+                          "required": ["frame_class"]}}
+            for name in FRAME_CLASSES]
+
+    def test_composition_is_exact_equality_of_the_frame_class_set(self):
+        # enum 给「⊆」、contains 给「⊇」，合成「步帧类集合 ≡ 传入名集」
+        v = Draft202012Validator(plan_schema(FRAME_CLASSES, 3, cover_all=True))
+        assert v.is_valid({"steps": [_plan_step(n) for n in FRAME_CLASSES]})
+        assert not v.is_valid({"steps": [_plan_step("task_request"),
+                                         _plan_step("followup"),
+                                         _plan_step("followup")]})  # 缺 confirmation
+        assert not v.is_valid({"steps": [_plan_step("task_request"),
+                                         _plan_step("followup"),
+                                         _plan_step("ghost")]})     # 档外类（enum）
+
+    def test_cover_all_on_a_tier_subset_only_covers_that_subset(self):
+        v = Draft202012Validator(plan_schema(["task_request", "followup"], 3,
+                                             cover_all=True))
+        assert v.is_valid({"steps": [_plan_step("task_request"),
+                                     _plan_step("followup"),
+                                     _plan_step("followup")]})
+        assert not v.is_valid({"steps": [_plan_step("task_request")] * 3})
+        assert not v.is_valid({"steps": [_plan_step("task_request"),
+                                         _plan_step("followup"),
+                                         _plan_step("confirmation")]})
+
+    def test_keyword_set_grows_by_exactly_the_three_frozen_words(self):
+        s = plan_schema(FRAME_CLASSES, 4, cover_all=True)
+        assert _schema_keywords(s) <= ALLOWED_KEYWORDS
+        assert _schema_keywords(s) - _schema_keywords(plan_schema(FRAME_CLASSES, 4)) == {
+            "allOf", "contains", "const"}
+        assert "uniqueItems" not in _all_dict_keys(s)
+
+    def test_render_error_names_the_missing_frame_class(self):
+        # 裁决·渲染缺类可见：L0 关端点上的 L3 修复提示必须点名缺失帧类
+        v = Draft202012Validator(plan_schema(FRAME_CLASSES, 3, cover_all=True))
+        obj = {"steps": [_plan_step("task_request"), _plan_step("followup"),
+                         _plan_step("followup")]}
+        rendered = sorted(_render_error(e) for e in v.iter_errors(obj))
+        assert rendered == ['/steps: missing required frame_class "confirmation"']
+
+    def test_render_error_reports_every_missing_frame_class(self):
+        v = Draft202012Validator(plan_schema(FRAME_CLASSES, 3, cover_all=True))
+        obj = {"steps": [_plan_step("task_request")] * 3}
+        rendered = sorted(_render_error(e) for e in v.iter_errors(obj))
+        assert rendered == ['/steps: missing required frame_class "confirmation"',
+                            '/steps: missing required frame_class "followup"']
+
+    def test_render_error_falls_back_for_a_foreign_contains_shape(self):
+        # 用户 Schema 也可以用 contains——不是覆盖约束形状时回落 jsonschema 原始消息
+        v = Draft202012Validator({"type": "object",
+                                  "properties": {"xs": {"type": "array",
+                                                        "contains": {"type": "integer"}}}})
+        rendered = [_render_error(e) for e in v.iter_errors({"xs": ["a"]})]
+        assert len(rendered) == 1
+        assert rendered[0].startswith("/xs: ")
+        assert "missing required frame_class" not in rendered[0]
+
+
 class TestRealizeSchema:
     def test_shape_is_positional_prefix_items_closed_at_the_tail(self):
         s = realize_schema([UTTERANCE_SCHEMA, TEXT_FRAME_SCHEMA])
@@ -623,9 +707,11 @@ NAMES = ["faq", "chitchat", "other"]
 
 # The frozen keyword vocabulary of the internal schemas — classification_schema must
 # not grow it (R1: strict-mode gateways hard-reject e.g. uniqueItems, L0 passes
-# schemas through unconditionally).
+# schemas through unconditionally). v1.14 grows it by exactly three words, all of them
+# draft 2020-12 natives carried by plan_schema(cover_all=True): allOf / contains / const.
 ALLOWED_KEYWORDS = {"type", "properties", "required", "additionalProperties",
-                    "enum", "items", "minItems", "maxItems"}
+                    "enum", "items", "minItems", "maxItems",
+                    "allOf", "contains", "const"}
 
 
 def _schema_keywords(schema: dict) -> set[str]:
@@ -635,8 +721,11 @@ def _schema_keywords(schema: dict) -> set[str]:
         if key == "properties":
             for sub in value.values():
                 kws |= _schema_keywords(sub)
-        elif key == "items":
+        elif key in ("items", "contains"):
             kws |= _schema_keywords(value)
+        elif key == "allOf":                     # v1.14 cover_all 的逐类覆盖支
+            for sub in value:
+                kws |= _schema_keywords(sub)
     return kws
 
 

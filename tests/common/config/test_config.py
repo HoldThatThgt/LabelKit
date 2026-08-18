@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from dataclasses import FrozenInstanceError
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,8 @@ from labelkit.common.config.model import (
     CliOverrides,
     ConsoleConfig,
     GenerateStreamConfig,
+    TierSpec,
+    apportion_tiers,
 )
 from labelkit.common.errors import ConfigError
 
@@ -3328,3 +3331,86 @@ def test_frame_class_views_v113_generate_face_default_none(env):
     for view in cfg.frame_class_views.values():
         assert view.gen_instruction is None
         assert view.gen_schema is None
+
+
+# ── v1.14: 档位面与绑定面的缺省（在场覆盖见 test_loader_generate_stream） ────
+
+
+def test_generate_stream_tiers_default_is_absent(env):
+    # 档位面整体不在场 ⇒ 空元组（与 v1.13 字节等价的那一半）
+    assert GenerateStreamConfig().tiers == ()
+    cfg = env.load()
+    assert cfg.generate_stream.tiers == ()
+
+
+def test_frame_class_view_time_fields_default_none(env):
+    # 绑定面不在场 ⇒ None（无绑定），零覆盖帧类的视图也一样
+    body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY + "\n" + FRAME_ANNOTATE_ONLY
+    cfg = env.load(project_text=env.project(body=body))
+    for view in cfg.frame_class_views.values():
+        assert view.time_fields is None
+
+
+def test_tier_spec_carries_rank_weight_and_composition():
+    spec = TierSpec(tier_rank=1, weight=2, frame_classes=("task_request", "followup"))
+    assert (spec.tier_rank, spec.weight) == (1, 2)
+    assert spec.frame_classes == ("task_request", "followup")
+    with pytest.raises(FrozenInstanceError):
+        spec.weight = 3                              # 冻结面：解析后不可变
+
+
+# ── v1.14 apportion_tiers：整数域最大余额法的性质（裁决·零抽签配分）─────────
+
+
+def _tiers(*weights: int) -> tuple[TierSpec, ...]:
+    """A tier table with the given weights, ranked 1..N in the declared order."""
+    return tuple(TierSpec(tier_rank=i, weight=w, frame_classes=("f",))
+                 for i, w in enumerate(weights, 1))
+
+
+@pytest.mark.parametrize("sequences, weights", [
+    (0, (1,)), (1, (1, 1)), (3, (2, 1)), (7, (3, 2, 2)), (10, (1, 1, 1)),
+    (100, (5, 3, 1)), (1, (9, 1)), (2, (1, 1, 1, 1)),
+])
+def test_apportionment_sums_to_the_class_quota(sequences, weights):
+    quotas = apportion_tiers(sequences, _tiers(*weights))
+    assert len(quotas) == len(weights)
+    assert sum(quotas) == sequences
+    assert all(q >= 0 for q in quotas)
+
+
+def test_apportionment_is_exact_when_the_weights_divide_the_quota():
+    # 整除形：全部配额落基额，零余额分配
+    assert apportion_tiers(9, _tiers(2, 1)) == (6, 3)
+    assert apportion_tiers(12, _tiers(1, 1, 1, 1)) == (3, 3, 3, 3)
+
+
+def test_apportionment_pins_the_integer_arithmetic_when_not_divisible():
+    # 不整除形：基额 = (s × w) // Σw，余额键 = (s × w) mod Σw，按余额键降序 +1
+    # s = 7, weights (3, 2, 2), Σw = 7 ⇒ scaled (21, 14, 14) ⇒ base (3, 2, 2)，全零余额
+    assert apportion_tiers(7, _tiers(3, 2, 2)) == (3, 2, 2)
+    # s = 5, weights (3, 2, 2), Σw = 7 ⇒ scaled (15, 10, 10) ⇒ base (2, 1, 1)，
+    # 余额 (1, 3, 3)，缺 1 席 ⇒ 最大余额 3 平票，tier_rank 升序取第 2 档
+    assert apportion_tiers(5, _tiers(3, 2, 2)) == (2, 2, 1)
+    # s = 4, weights (5, 1), Σw = 6 ⇒ scaled (20, 4) ⇒ base (3, 0)，余额 (2, 4)
+    # ⇒ 缺 1 席给余额最大的第 2 档
+    assert apportion_tiers(4, _tiers(5, 1)) == (3, 1)
+
+
+def test_apportionment_breaks_ties_by_ascending_tier_rank():
+    # 全等权重、缺 1 席 ⇒ 余额三档全等，平票判定必须落在 tier_rank 升序上
+    assert apportion_tiers(4, _tiers(1, 1, 1)) == (2, 1, 1)
+    assert apportion_tiers(5, _tiers(1, 1, 1)) == (2, 2, 1)
+    # 传入序被打乱也按 rank 定平票（返回序恒对齐入参序）
+    shuffled = (TierSpec(tier_rank=2, weight=1, frame_classes=("f",)),
+                TierSpec(tier_rank=1, weight=1, frame_classes=("f",)))
+    assert apportion_tiers(1, shuffled) == (0, 1)
+
+
+def test_apportionment_can_hand_a_tier_zero_and_stays_a_pure_function():
+    # 小配额 × 权重悬殊 ⇒ 零额档（最大余额法的自然结果，M1 发 WARN 而非报错）
+    tiers = _tiers(5, 1)
+    assert apportion_tiers(1, tiers) == (1, 0)
+    assert apportion_tiers(0, tiers) == (0, 0)       # 不参与的类：逐档零额
+    assert apportion_tiers(3, ()) == ()              # 档位面不在场
+    assert apportion_tiers(3, tiers) == apportion_tiers(3, tiers)   # 零 rng

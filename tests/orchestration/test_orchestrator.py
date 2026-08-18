@@ -31,6 +31,7 @@ from labelkit.common.config.model import (
     InputConfig, LLMProfile, OutputConfig,
     QualityConfig,
     ResolvedConfig, Rubric, RunConfig, SegmentConfig, StitchConfig, StreamConfig,
+    TierSpec,
     ToolConfig,
     TraceConfig, VerifyConfig,
 )
@@ -914,9 +915,10 @@ async def test_generate_only_interrupt_stops_taking_batches_after_generation(tmp
 
 def stream_gen_cfg(tmp_path, *, batch_size=4, limit=None, quotas=None,
                    quality=False, annotate=False, verify=False,
-                   noise_ratio=0.0) -> ResolvedConfig:
+                   noise_ratio=0.0, tiers=()) -> ResolvedConfig:
     """M1 形状的时间流形态配置：classify 类表 = 配额载体（inherited 零调用），
-    class_views 携按类 sequences/len_range，generate_stream 开启。"""
+    class_views 携按类 sequences/len_range，generate_stream 开启。v1.14：tiers
+    传入即档位面在场（按 tier_rank 升序存放，M1 解析产物的形状）。"""
     quotas = quotas or {"faq": 2, "chat": 1}
     base = make_cfg(tmp_path, mode="generate_only", batch_size=batch_size,
                     limit=limit, quality=quality, annotate=annotate, verify=verify,
@@ -926,7 +928,8 @@ def stream_gen_cfg(tmp_path, *, batch_size=4, limit=None, quotas=None,
         enabled=True, sessions=max(1, sum(quotas.values()) - 1),
         noise_ratio=noise_ratio,
         noise_instruction="噪音" if noise_ratio > 0 else "",
-        frame_gap_s=(5.0, 60.0), ts_start="2026-01-01T00:00:00Z"))
+        frame_gap_s=(5.0, 60.0), ts_start="2026-01-01T00:00:00Z",
+        tiers=tuple(tiers)))
     overrides = {
         name: {"generate": replace(cfg.generate, instruction=f"生成{name}",
                                    sequences=n, len_range=(2, 3))}
@@ -1082,6 +1085,60 @@ async def test_generate_stream_estimate_limit_truncates_at_quota_layer(tmp_path)
     assert est["batches"] == 1
     assert est["generate_calls"] == 2              # 无噪音：蓝图 + 实现各一
     assert est["classify_calls"] == 0
+
+
+def tier_table() -> tuple[TierSpec, ...]:
+    """v1.14 两档档位表（M1 形状：tier_rank 连续覆盖 1..N、按 rank 升序存放）。"""
+    return (TierSpec(tier_rank=1, weight=2, frame_classes=("task_request",)),
+            TierSpec(tier_rank=2, weight=1,
+                     frame_classes=("task_request", "followup")))
+
+
+async def test_generate_stream_report_tiers_shape_and_key_order(tmp_path):
+    """v1.14（裁决·报表显式装配）：tiers 子块按声明表 tier_rank 升序零基铺开
+    planned/produced，键位冻结在 sequences 之后、frames 之前（配额族相邻）。"""
+    counters = {"generate.stream.tiers.1.planned": 2,
+                "generate.stream.tiers.1.produced": 2,
+                "generate.stream.tiers.2.planned": 1,
+                "generate.stream.tiers.2.produced": 1}
+    gen = PureStreamGenerateStage([stream_envelope(1)], ["l1"], counters)
+    cfg = stream_gen_cfg(tmp_path, tiers=tier_table())
+    orch, _, emitter, _ = build(cfg, [gen])
+    await orch.run()
+
+    stream_block = emitter.report["generate"]["stream"]
+    assert list(stream_block) == ["sessions", "crossed_sessions", "sequences",
+                                  "tiers", "frames", "noise_frames", "duplicates",
+                                  "plan_calls", "realize_calls", "noise_calls",
+                                  "plan_failures", "realize_failures",
+                                  "validator_scrapped"]
+    assert list(stream_block["tiers"]) == ["1", "2"]        # 十进制字符串键、rank 升序
+    assert stream_block["tiers"] == {"1": {"planned": 2, "produced": 2},
+                                     "2": {"planned": 1, "produced": 1}}
+
+
+async def test_generate_stream_report_tiers_keeps_a_zero_quota_tier_present(tmp_path):
+    """零额档/全作废档由装配保证在场（不依赖计数器首触序）：planned 与 produced
+    如实呈现 0——E2E-FINDINGS 第 11 条（计数器被报表白名单静默丢弃）的同族防线。"""
+    counters = {"generate.stream.tiers.1.planned": 3,
+                "generate.stream.tiers.1.produced": 2}
+    gen = PureStreamGenerateStage([stream_envelope(1)], [], counters)
+    cfg = stream_gen_cfg(tmp_path, tiers=tier_table())
+    orch, _, emitter, _ = build(cfg, [gen])
+    await orch.run()
+
+    assert emitter.report["generate"]["stream"]["tiers"] == {
+        "1": {"planned": 3, "produced": 2},
+        "2": {"planned": 0, "produced": 0}}
+
+
+async def test_generate_stream_report_has_no_tiers_block_without_the_table(tmp_path):
+    """档位表缺省 ⇒ tiers 键整体不在场（v1.13 十二键序回归，字节等价）。"""
+    gen = PureStreamGenerateStage([stream_envelope(1)], [])
+    cfg = stream_gen_cfg(tmp_path)
+    orch, _, emitter, _ = build(cfg, [gen])
+    await orch.run()
+    assert "tiers" not in emitter.report["generate"]["stream"]
 
 
 async def test_generate_stream_off_report_has_no_stream_block(tmp_path):

@@ -101,6 +101,8 @@ emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed
 | `generate.stream` 开 ⇒ `mode = "generate_only"` ∧ 模态 `text` ∧ `generate` 开 ∧ `classify` 开 ∧ `stream.order_by = "meta:<字段>"` ∧ `output.meta_mode ≠ "none"`（v1.13） | 时间流生成从零合成流：类表是配额与标签继承的载体、`order_by` 声明的字段名即工件的时间戳字段名（重放靠它）、帧类真值仅经 `_meta` 承载 |
 | `generate.stream` 开 ⇒ `frame.classify` / `frame.annotate` 必须关（v1.13） | 帧类真值在生成期已知（蓝图即真值），帧级判决与帧级标注在本形态下没有对象——显式开启是定向配置错误 |
 | `generate.stream` 开 ⇒ 序列类表放宽为 **≥1 类**、`fallback_class` **免填**（v1.13） | 标签继承（`inherited`）没有判决路径，「≥2 类才分得动」与兜底类这两条规则保护的对象不存在 |
+| `[[generate.stream.tiers]]` 在场 ⇒ `generate.stream` 必须开；`tier_rank` 连续覆盖 1..N、各档 `frame_classes` 两两互异、每个非零配额的 (类, 档) 组合须满足该类 `len_range` 下界 ≥ 该档构成大小（v1.14） | 档位即帧类构成，构成语义是**恰等**（档内每类至少出现一次）——步数装不下构成就必然产出缺类序列，故在启动时拦下；零配额组合豁免（不为永不尝试的组合抬高下界） |
+| `[frame.class.<名>.generate.time_fields]` 在场 ⇒ 该帧类必须声明 `schema_path` / `schema_inline`，绑定值 ∈ 闭集 `{ts, gap_prev_s, gap_next_s, elapsed_s}`，声明类型字面恰等（`ts` ⇒ string、其余 ⇒ number），且剔除后至少剩一个字段（v1.14） | 绑定字段从 LLM 面剔除、由时间轴机械回填——纯文本帧没有字段可绑，类型不符则回填值不满足用户 Schema，全绑定则这次调用没有任何内容要生成 |
 
 `classify`（v1.7，默认关）与上表各开关**正交**：分类不改变组合合法性，任意合法组合都可以叠加分类——multi 扇出后的每个信封走同一套阶段组合（第 24 章）。v1.12 的帧粒度双开关（`frame.classify` / `frame.annotate`）不是新算子，而是 classify / annotate 两个算子在流模式下的第二层粒度；帧级没有多标签也没有自洽采样——在 `[frame.classify]` 里写 `assignment` 或在 `[frame.annotate]` 里写 `self_consistency` 是定向配置错误（第 25 章 25.6）。
 

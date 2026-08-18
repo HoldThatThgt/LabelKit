@@ -15,7 +15,7 @@ import json
 import pytest
 
 from labelkit.common.config import ResolvedConfig
-from labelkit.common.config.model import GenerateStreamConfig
+from labelkit.common.config.model import GenerateStreamConfig, TierSpec
 from labelkit.common.errors import ConfigError
 from tests.common.config.test_config import (  # noqa: F401 (env is a fixture)
     BASE_CONFIG,
@@ -768,10 +768,12 @@ def test_frame_class_generate_schema_dangling_ref_is_config_error(env):
 
 
 def test_frame_class_generate_whitelist_enforced(env):
+    # v1.14 起白名单四键（time_fields 入表，否则绑定子表会被判成未知键）
     frames = frames_with_schema("enabled = false")
     errors = env.errors(project_text=gs_project(env, gs_body(frames=frames)))
     has(errors, "[frame.class.task_request.generate].enabled: [frame.class.*.generate] cannot "
-                "override this key (whitelist: instruction, schema_path, schema_inline)")
+                "override this key (whitelist: instruction, schema_path, schema_inline, "
+                "time_fields)")
 
 
 def test_frame_class_generate_section_only_legal_in_the_form(env):
@@ -914,3 +916,376 @@ def test_generate_stream_default_dataclass_is_all_off():
     assert gs.noise_ratio == 0.0 and gs.noise_instruction == ""
     assert gs.duplicates == 0 and gs.frame_gap_s == (5.0, 60.0)
     assert gs.ts_start == "2026-01-01T00:00:00Z"
+    assert gs.tiers == ()                            # v1.14 档位面不在场
+
+
+# ── v1.14 档位表（[[generate.stream.tiers]]；SPEC-generation-tiers §3.1）──────
+
+TIER_ONE = """\
+[[generate.stream.tiers]]
+tier_rank = 1
+weight = 2
+frame_classes = ["task_request", "followup"]
+"""
+
+TIER_TWO = """\
+[[generate.stream.tiers]]
+tier_rank = 2
+weight = 1
+frame_classes = ["task_request", "followup", "confirmation"]
+"""
+
+TIERS = "\n" + TIER_ONE + "\n" + TIER_TWO
+
+# 档位面的基线帧类表：三类（第 2 档的构成用满全表）
+GS_FRAMES3 = GS_FRAMES + """
+[[frame.classify.classes]]
+name = "confirmation"
+description = "确认下单的收尾帧"
+
+[frame.class.confirmation.generate]
+instruction = "生成一条确认下单的用户话语"
+"""
+
+
+def tier_body(tiers: str = TIERS, *, generate: str = GS_GENERATE,
+              frames: str = GS_FRAMES3) -> str:
+    """The canonical body plus a tier table（档位面在场的基线工程）。
+
+    基线数：sequences = 3 按权重 (2, 1) 配分为 (2, 1)，len_range 下界 3 覆盖两档的
+    最大构成 3 —— 全部约束刚好通过。
+    """
+    return gs_body(generate=generate + tiers, frames=frames)
+
+
+def test_tier_table_parses_into_the_form_config(env):
+    cfg = env.load(project_text=gs_project(env, tier_body()))
+    tiers = cfg.generate_stream.tiers
+    assert tiers == (
+        TierSpec(tier_rank=1, weight=2, frame_classes=("task_request", "followup")),
+        TierSpec(tier_rank=2, weight=1,
+                 frame_classes=("task_request", "followup", "confirmation")))
+
+
+def test_tier_table_is_stored_by_ascending_rank_whatever_the_declaration_order(env):
+    # tiers[rank - 1] 直取是 M6 蓝图侧的取档方式 ⇒ 存放序必须由 rank 定，而非书写序
+    cfg = env.load(project_text=gs_project(
+        env, tier_body("\n" + TIER_TWO + "\n" + TIER_ONE)))
+    assert [t.tier_rank for t in cfg.generate_stream.tiers] == [1, 2]
+    assert cfg.generate_stream.tiers[0].weight == 2
+
+
+def test_tier_table_requires_the_time_stream_form(env):
+    body = ("[generate]\nenabled = false\n\n[generate.stream]\nenabled = false\n" + TIERS)
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[[generate.stream.tiers]]: the tier table is only legal in the time-stream "
+                "generation form ([generate.stream].enabled = true)")
+
+
+def test_tier_table_premise_probe_is_independent_of_the_parse(env):
+    # v1.11 原始节探针机制：表内容非法（解析产物为空）也要照发前提错误
+    body = ("[generate]\nenabled = false\n\n[generate.stream]\nenabled = false\n"
+            "\n[[generate.stream.tiers]]\ntier_rank = 0\n")
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[[generate.stream.tiers]]: the tier table is only legal in the time-stream")
+    has(errors, "[[generate.stream.tiers]][1].tier_rank: expected positive integer, got 0")
+
+
+def test_no_tier_table_is_byte_equivalent_to_v1_13(env, capsys):
+    cfg = env.load(project_text=gs_project(env))
+    assert cfg.generate_stream.tiers == ()
+    err = capsys.readouterr().err                    # 零档位告警：档位面整体缺席
+    assert "[[generate.stream.tiers]]" not in err
+    assert "tier composition" not in err
+
+
+@pytest.mark.parametrize("line, expected", [
+    ("tier_rank = 0", "tier_rank: expected positive integer, got 0"),
+    ('tier_rank = "1"', 'tier_rank: expected positive integer, got "1"'),
+    ("weight = 0", "weight: expected positive integer, got 0"),
+    ("weight = 1.5", "weight: expected positive integer, got 1.5"),
+    ('frame_classes = "task_request"',
+     'frame_classes: expected string array, got "task_request"'),
+])
+def test_tier_entry_key_types(env, line, expected):
+    key = line.split(" =")[0]
+    kept = [row for row in TIER_ONE.splitlines() if not row.startswith(f"{key} =")]
+    tiers = "\n" + "\n".join(kept + [line]) + "\n"
+    errors = env.errors(project_text=gs_project(env, tier_body(tiers)))
+    has(errors, f"[[generate.stream.tiers]][1].{expected}")
+
+
+def test_tier_entry_requires_rank_and_weight(env):
+    tiers = '\n[[generate.stream.tiers]]\nframe_classes = ["task_request"]\n'
+    errors = env.errors(project_text=gs_project(env, tier_body(tiers)))
+    has(errors, "[[generate.stream.tiers]][1].tier_rank: missing required key, expected "
+                "positive integer")
+    has(errors, "[[generate.stream.tiers]][1].weight: missing required key, expected "
+                "positive integer")
+
+
+def test_tier_table_shape_errors(env):
+    generate = GS_GENERATE.replace("sessions = 2", "sessions = 2\ntiers = 3")
+    errors = env.errors(project_text=gs_project(
+        env, gs_body(generate=generate, frames=GS_FRAMES3)))
+    has(errors, "[generate.stream].tiers: expected array of tables, got 3")
+    generate = GS_GENERATE.replace("sessions = 2", 'sessions = 2\ntiers = ["x"]')
+    errors = env.errors(project_text=gs_project(
+        env, gs_body(generate=generate, frames=GS_FRAMES3)))
+    has(errors, '[[generate.stream.tiers]][1]: expected table, got "x"')
+
+
+def test_unknown_key_inside_a_tier_entry_warns(env, capsys):
+    env.load(project_text=gs_project(
+        env, tier_body(TIERS.replace("weight = 2", 'weight = 2\nname = "s"'))))
+    assert "[[generate.stream.tiers]][1].name: unknown key" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("swap, ranks", [
+    (("tier_rank = 2", "tier_rank = 1"), "[1, 1]"),      # 重号
+    (("tier_rank = 2", "tier_rank = 3"), "[1, 3]"),      # 缺号
+    (("tier_rank = 1", "tier_rank = 3"), "[2, 3]"),      # 不从 1 起
+])
+def test_tier_ranks_must_be_unique_and_contiguous(env, swap, ranks):
+    tiers = TIERS.replace(*swap)
+    errors = env.errors(project_text=gs_project(env, tier_body(tiers)))
+    has(errors, "[[generate.stream.tiers]].tier_rank: tier ranks must be unique and cover "
+                "1..N contiguously (N = 2 = the number of tiers; the rank is the identity "
+                f"of a tier, there is no name key), got {ranks}")
+
+
+def test_tier_composition_must_be_nonempty(env):
+    tiers = TIERS.replace('frame_classes = ["task_request", "followup"]\n',
+                          "frame_classes = []\n", 1)
+    errors = env.errors(project_text=gs_project(env, tier_body(tiers)))
+    has(errors, "[[generate.stream.tiers]](tier_rank = 1).frame_classes: expected a "
+                "non-empty array of frame class names (a tier IS its frame-class "
+                "composition)")
+
+
+def test_tier_composition_rejects_duplicates_within_a_tier(env):
+    tiers = TIERS.replace('["task_request", "followup"]\n',
+                          '["task_request", "task_request"]\n', 1)
+    errors = env.errors(project_text=gs_project(env, tier_body(tiers)))
+    has(errors, "[[generate.stream.tiers]](tier_rank = 1).frame_classes: frame class names "
+                'must be distinct within a tier (the composition is a set), got duplicate '
+                '"task_request"')
+
+
+def test_tier_composition_names_must_be_in_the_frame_class_table(env):
+    tiers = TIERS.replace('["task_request", "followup"]\n', '["task_request", "ghost"]\n', 1)
+    errors = env.errors(project_text=gs_project(env, tier_body(tiers)))
+    has(errors, '[[generate.stream.tiers]](tier_rank = 1).frame_classes: frame class name '
+                '"ghost" is not in [[frame.classify.classes]], available: task_request, '
+                "followup, confirmation")
+
+
+def test_tier_compositions_must_be_pairwise_distinct(env):
+    # 构成是集合：书写序不同、集合相同即语义重复
+    tiers = TIERS.replace('["task_request", "followup", "confirmation"]',
+                          '["followup", "task_request"]')
+    errors = env.errors(project_text=gs_project(env, tier_body(tiers)))
+    has(errors, "[[generate.stream.tiers]](tier_rank = 2).frame_classes: the composition is "
+                "identical to the one of tier_rank = 1 - two tiers with the same "
+                "frame-class set are semantically duplicates")
+
+
+def test_len_range_must_cover_every_nonzero_quota_tier(env):
+    generate = GS_GENERATE.replace("len_range = [3, 5]", "len_range = [2, 5]")
+    errors = env.errors(project_text=gs_project(env, tier_body(generate=generate)))
+    has(errors, "[class.ticket_booking.generate].len_range: the lower bound must be >= the "
+                "composition size of every tier this class draws from (tier_rank = 2 "
+                "declares 3 frame classes and is apportioned 1 of the 3 sequences, and each "
+                "of them must appear at least once), got lower bound 2")
+    # 构成大小 2 的第 1 档在下界 2 下照常放行——逐 (类, 档) 对裁定，不是全表取最大
+    assert not any("tier_rank = 1 declares" in e for e in errors)
+
+
+def test_a_class_that_does_not_participate_gets_no_quota_pair(env, capsys):
+    # 有效 sequences = 0 的类整类跳过：既不发零额 WARN，也不裁定它的 len_range
+    classify = GS_CLASSIFY + ('\n[[classify.classes]]\nname = "home_control"\n'
+                              'description = "智能家居控制序列"\n')
+    body = gs_body(classify=classify, generate=GS_GENERATE + TIERS, frames=GS_FRAMES3)
+    cfg = env.load(project_text=gs_project(env, body))
+    assert cfg.class_views["home_control"].generate.sequences == 0
+    assert "home_control" not in capsys.readouterr().err
+
+
+def test_zero_quota_pair_warns_and_is_exempt_from_the_length_rule(env, capsys):
+    # 权重悬殊：3 条序列按 (5, 1) 最大余额法配分 = (3, 0) ⇒ 第 2 档零额
+    tiers = TIERS.replace("weight = 2", "weight = 5")
+    generate = GS_GENERATE.replace("len_range = [3, 5]", "len_range = [2, 5]")
+    cfg = env.load(project_text=gs_project(env, tier_body(tiers, generate=generate)))
+    assert cfg.class_views["ticket_booking"].generate.len_range == (2, 5)
+    err = capsys.readouterr().err
+    assert ('[[generate.stream.tiers]]: class "ticket_booking" apportions 0 sequences to '
+            "tier_rank = 2" in err)
+    assert "weights tier_rank 1: weight 5, tier_rank 2: weight 1" in err
+    # 零额对豁免长度可覆盖（否则下界 2 < 第 2 档构成 3 会报错）
+    assert "must be >= the composition size" not in err
+
+
+def test_frame_class_outside_every_tier_warns_and_needs_no_instruction(env, capsys):
+    # 裁决·指令必填域收窄：未入档的帧类永不被蓝图选中 ⇒ 生成面整体是死配置
+    frames = GS_FRAMES + """
+[[frame.classify.classes]]
+name = "confirmation"
+description = "确认下单的收尾帧"
+"""
+    cfg = env.load(project_text=gs_project(
+        env, tier_body("\n" + TIER_ONE, frames=frames)))
+    assert cfg.frame_class_views["confirmation"].gen_instruction is None
+    assert ('[frame.class.confirmation.generate]: frame class "confirmation" is in no tier '
+            "composition, so it can never be picked by a blueprint" in capsys.readouterr().err)
+
+
+def test_frame_class_inside_a_tier_still_needs_its_instruction(env):
+    frames = GS_FRAMES.replace(
+        '[frame.class.followup.generate]\ninstruction = "生成一条补充信息的用户话语"\n', "")
+    errors = env.errors(project_text=gs_project(
+        env, tier_body("\n" + TIER_ONE, frames=frames)))
+    has(errors, "[frame.class.followup.generate].instruction: every frame class must provide "
+                "a non-empty generation instruction (the blueprint enum covers the union of "
+                "the tier compositions, so any frame class of a tier may be picked)")
+
+
+def test_frame_gap_lower_bound_has_a_microsecond_floor(env):
+    # v1.14 裁决·微秒地板（v1.13 形态级缺陷修补）
+    generate = GS_GENERATE.replace("frame_gap_s = [5, 60]", "frame_gap_s = [0.0000001, 60]")
+    errors = env.errors(project_text=gs_project(env, gs_body(generate=generate)))
+    has(errors, "[generate.stream].frame_gap_s: the lower bound must be >= 1e-06 s (one "
+                "microsecond)")
+    has(errors, "must be strictly increasing")
+    has(errors, "0.0 as its first/last frame boundary sentinel")
+    generate_ok = GS_GENERATE.replace("frame_gap_s = [5, 60]", "frame_gap_s = [0.000001, 60]")
+    cfg = env.load(project_text=gs_project(env, gs_body(generate=generate_ok)))
+    assert cfg.generate_stream.frame_gap_s == (1e-06, 60.0)
+
+
+# ── v1.14 时间字段绑定表（[frame.class.<name>.generate.time_fields]）──────────
+
+TIME_GEN_PROPS = {"utterance": {"type": "string"}, "duration": {"type": "number"}}
+
+
+def bind_frames(binding: str = 'duration = "gap_next_s"',
+                props: dict | None = None, **schema_extra) -> str:
+    """A frames block whose task_request frame is structured AND carries a binding."""
+    schema = json.dumps({"type": "object",
+                         "properties": TIME_GEN_PROPS if props is None else props,
+                         "additionalProperties": False, **schema_extra},
+                        ensure_ascii=False)
+    return frames_with_schema(f"schema_inline = '''\n{schema}\n'''\n\n"
+                              f"[frame.class.task_request.generate.time_fields]\n{binding}")
+
+
+def test_time_fields_parsed_into_the_frame_class_view(env, capsys):
+    cfg = env.load(project_text=gs_project(env, gs_body(frames=bind_frames())))
+    assert cfg.frame_class_views["task_request"].time_fields == {"duration": "gap_next_s"}
+    assert cfg.frame_class_views["followup"].time_fields is None    # 无绑定
+    assert "unknown key" not in capsys.readouterr().err             # 白名单已扩键
+
+
+def test_time_fields_accept_the_whole_vocabulary_on_one_frame(env):
+    props = {"utterance": {"type": "string"}, "duration": {"type": "number"},
+             "since_start": {"type": "number"}, "waited": {"type": "number"},
+             "at": {"type": "string"}}
+    frames = bind_frames('duration = "gap_next_s"\nsince_start = "elapsed_s"\n'
+                         'waited = "gap_prev_s"\nat = "ts"', props=props)
+    cfg = env.load(project_text=gs_project(env, gs_body(frames=frames)))
+    assert cfg.frame_class_views["task_request"].time_fields == {
+        "duration": "gap_next_s", "since_start": "elapsed_s",
+        "waited": "gap_prev_s", "at": "ts"}
+
+
+def test_time_fields_require_a_structured_frame(env):
+    frames = frames_with_schema('[frame.class.task_request.generate.time_fields]\n'
+                                'duration = "gap_next_s"')
+    errors = env.errors(project_text=gs_project(env, gs_body(frames=frames)))
+    has(errors, "[frame.class.task_request.generate.time_fields]: a time-field binding is "
+                "only legal on a structured frame class - declare schema_path / "
+                "schema_inline for [frame.class.task_request.generate] first")
+    has(errors, "the payload must always be a JSON object")
+
+
+def test_time_fields_stay_silent_when_the_schema_itself_is_unusable(env):
+    # 顶层联合类型：生成 Schema 装载期就地报错（回填要求载荷恒为对象）——绑定簇不
+    # 叠加"仅结构化帧合法"那条误导性第二错
+    frames = bind_frames(props=TIME_GEN_PROPS)
+    frames = frames.replace('{"type": "object"', '{"type": ["object", "null"]')
+    errors = env.errors(project_text=gs_project(env, gs_body(frames=frames)))
+    has(errors, "[frame.class.task_request.generate].schema_inline: frame-class generation "
+                'schema top-level type must be "object", got ["object", "null"]')
+    assert not any("only legal on a structured frame class" in e for e in errors)
+
+
+def test_time_fields_key_must_be_a_top_level_property(env):
+    frames = bind_frames('elapsed = "elapsed_s"')
+    errors = env.errors(project_text=gs_project(env, gs_body(frames=frames)))
+    has(errors, '[frame.class.task_request.generate.time_fields].elapsed: "elapsed" is not a '
+                "top-level property of the frame-class generation schema, available: "
+                "utterance, duration")
+
+
+def test_time_fields_value_must_be_in_the_frozen_vocabulary(env):
+    frames = bind_frames('duration = "gap_s"')
+    errors = env.errors(project_text=gs_project(env, gs_body(frames=frames)))
+    has(errors, "[frame.class.task_request.generate.time_fields].duration: expected one of "
+                "the time vocabulary terms ts, gap_prev_s, gap_next_s, elapsed_s (a frozen "
+                'closed set), got "gap_s"')
+
+
+@pytest.mark.parametrize("prop, got", [
+    ({"type": "string"}, '"string"'),                       # number 词绑到串字段
+    ({"type": ["number", "null"]}, '["number", "null"]'),   # 联合类型数组
+    ({}, "null"),                                           # 缺失 type
+    ({"$ref": "#/$defs/secs"}, "null"),                     # 经 $ref 间接声明
+    ({"anyOf": [{"type": "number"}]}, "null"),              # 经组合关键字间接声明
+])
+def test_time_fields_type_must_match_literally(env, prop, got):
+    props = {"utterance": {"type": "string"}, "duration": prop}
+    frames = bind_frames(props=props, **{"$defs": {"secs": {"type": "number"}}})
+    errors = env.errors(project_text=gs_project(env, gs_body(frames=frames)))
+    has(errors, f'[frame.class.task_request.generate.time_fields].duration: the bound '
+                f'property must declare "type": "number" literally for the term '
+                f'"gap_next_s" (a union type array, a missing type and an indirect '
+                f"declaration through $ref or a combining keyword all count as a "
+                f"mismatch), got {got}")
+
+
+def test_time_fields_ts_term_requires_a_string_property(env):
+    frames = bind_frames('duration = "ts"')
+    errors = env.errors(project_text=gs_project(env, gs_body(frames=frames)))
+    has(errors, '[frame.class.task_request.generate.time_fields].duration: the bound '
+                'property must declare "type": "string" literally for the term "ts"')
+
+
+def test_time_fields_extra_keywords_warn_value_free(env, capsys):
+    props = {"utterance": {"type": "string"},
+             "duration": {"type": "number", "minimum": 0, "description": "本帧时长"}}
+    env.load(project_text=gs_project(env, gs_body(frames=bind_frames(props=props))))
+    err = capsys.readouterr().err
+    for keyword in ('"minimum"', '"description"'):
+        assert ("[frame.class.task_request.generate.time_fields].duration: the bound field "
+                f"carries the keyword {keyword}, which is neither sent to the LLM nor "
+                "enforced" in err)
+    assert "本帧时长" not in err                     # 值-free：只点名关键字
+
+
+def test_time_fields_must_leave_one_property_for_the_llm(env):
+    frames = bind_frames(props={"duration": {"type": "number"}})
+    errors = env.errors(project_text=gs_project(env, gs_body(frames=frames)))
+    has(errors, "[frame.class.task_request.generate.time_fields]: the bindings would remove "
+                "every top-level property of the frame-class generation schema (top-level "
+                "properties: 1, bound: 1)")
+
+
+def test_time_fields_table_shape_errors(env):
+    schema = json.dumps({"type": "object", "properties": TIME_GEN_PROPS},
+                        ensure_ascii=False)
+    frames = frames_with_schema(f"schema_inline = '''\n{schema}\n'''\ntime_fields = 3")
+    errors = env.errors(project_text=gs_project(env, gs_body(frames=frames)))
+    has(errors, "[frame.class.task_request.generate.time_fields]: expected table, got 3")
+    frames = bind_frames("duration = 3")
+    errors = env.errors(project_text=gs_project(env, gs_body(frames=frames)))
+    has(errors, "[frame.class.task_request.generate.time_fields].duration: expected string "
+                "(a time vocabulary term), got 3")

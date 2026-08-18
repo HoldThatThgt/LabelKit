@@ -23,6 +23,20 @@ v1.13 时间流形态（SPEC-stream-generation §3.2，``generate_stream.enabled
 按裁决·抽签消费顺序表三段消费（计划期①②③、派发期零消费、交织期④–⑨）。产物一式两份：
 可重放的时间流工件行（工件行即 raw——重放同 id；真值不携最终 id——循环依赖封死）与直装
 序列信封（两级 inherited 标签 + session_id）。``generate_all`` 平面路径零改动。
+
+v1.14 档位面（SPEC-generation-tiers §3.2，``[[generate.stream.tiers]]`` 在场时生效）：
+类配额按权重零抽签配到各档（``apportion_tiers``，整数域最大余额法），类内序数按
+tier_rank 升序占连续分块 ⇒ 每条序列的计划期定稿多带一个档位序数；蓝图调用改取档内帧类
+子集 + ``cover_all`` 覆盖约束（enum 给「⊆」、contains 给「⊇」，合成构成恰等），档位序数
+落工件 truth、成员 ``ref.generator`` 与 ``report.generate.stream.tiers`` 三点。配分零 rng
+（抽签消费顺序表原文不动）；档位表缺省 ⇒ 三点全部不在场，与 v1.13 逐字节等价。
+
+v1.14 时间字段面（SPEC-generation-tiers §3.3，``[frame.class.<name>.generate.time_fields]``
+在场时生效）：绑定的时间语义字段从 LLM 面向的逐位 Schema 与契约行中剔除
+（``_reduced_gen_schema``），值改由机械回填尾声（``backfill_time_fields``，零 rng 零 LLM）
+按已铺时间轴就地写回共享载荷对象——回填位于交织之后、直装组装之前，故行对象与全部 id
+都按回填后载荷计算，工件重放逐字节同 id 同会话。逐帧钩子与序列相似度过滤看到的是回填前
+载荷；绑定表全缺省 ⇒ 与 v1.13 逐字节等价。
 """
 from __future__ import annotations
 
@@ -42,6 +56,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from datasketch import MinHash, MinHashLSH
 
+from labelkit.common.config.model import apportion_tiers
 from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
@@ -59,7 +74,14 @@ if TYPE_CHECKING:
     import random
     from typing import Mapping
 
-    from labelkit.common.config.model import GenerateConfig, GenerateStyle, ResolvedConfig
+    from labelkit.common.config.model import (
+        ClassSpec,
+        FrameClassView,
+        GenerateConfig,
+        GenerateStyle,
+        ResolvedConfig,
+        TierSpec,
+    )
     from labelkit.common.contracts.stage import RunContext
     from labelkit.common.runtime.llm_client import PromptBundle
 
@@ -754,20 +776,30 @@ _MAX_STREAM_DEGRADE_LEVELS = 2   # 实现调用对半降级级数上限（裁决
 
 
 def render_plan_prompt_texts(instruction: str, frame_classes: Sequence,
-                             class_name: str, length: int) -> tuple[str, str]:
+                             class_name: str, length: int,
+                             cover_all: bool = False) -> tuple[str, str]:
     """蓝图调用的纯文本装配（§10.14）：返回 (system_text, user_text)。
 
+    入参已达 5 个上限（v1.14 增 cover_all）——后续再增须改参数对象。
+
     :param instruction: 类有效生成指令（[class.<name>.generate].instruction）。
-    :param frame_classes: 全帧类表（[[frame.classify.classes]] 的 ClassSpec 序列）。
+    :param frame_classes: 待渲染的帧类表（无档位 = 全表；档位表在场 = 档内子集，
+        按 [[frame.classify.classes]] 声明序，过滤由调用方完成）。
     :param class_name: 序列类名（user 段引用）。
     :param length: 步数 L（与 plan_schema 的 minItems=maxItems 同源）。
+    :param cover_all: v1.14（裁决·蓝图双向硬约束）：True 时 user 行取覆盖变体，与
+        ``plan_schema(cover_all=True)`` 的 contains 硬约束成对出现；False 的输出与
+        v1.13 逐字节一致。
     """
     table = "\n".join(f"{c.name}: {c.description}" for c in frame_classes)
     system = "\n".join((_PLAN_SYSTEM_HEAD,
                         f"{_PLAN_LABEL_TASK} {instruction}",
                         f"{_PLAN_LABEL_FRAME_TABLE}\n{table}",
                         _PLAN_STRUCTURE))
-    return system, f"请为一条「{class_name}」序列产出 {length} 步蓝图。"
+    user = f"请为一条「{class_name}」序列产出 {length} 步蓝图"
+    if cover_all:
+        return system, f"{user}，且 {_PLAN_LABEL_FRAME_TABLE} 中每个帧类都至少出现一次。"
+    return system, f"{user}。"
 
 
 def render_realize_prompt_texts(instruction: str, style_prompt: str | None,
@@ -792,17 +824,18 @@ def render_realize_prompt_texts(instruction: str, style_prompt: str | None,
     return "\n".join(lines), "\n".join(user_lines)
 
 
-def _plan_schema(names: Sequence[str], length: int) -> dict:
+def _plan_schema(names: Sequence[str], length: int, cover_all: bool = False) -> dict:
     """取蓝图调用的内部 Schema。
 
-    :param names: 全帧类名闭集（逐步 frame_class 的 enum 域）。
+    :param names: 帧类名闭集（逐步 frame_class 的 enum 域；档位表在场 = 档内子集）。
     :param length: 步数 L（minItems = maxItems）。
+    :param cover_all: v1.14：True 时注入逐类 contains 覆盖约束（构成恰等）。
     :returns: draft 2020-12 Schema 对象。
     """
     # 懒导入：内部 Schema 构造器归 M8（CONTRACTS §7.7/§10.7）。
     from labelkit.common.runtime.schema_engine import plan_schema
 
-    return plan_schema(names, length)
+    return plan_schema(names, length, cover_all=cover_all)
 
 
 def _realize_schema(step_schemas: Sequence[dict]) -> dict:
@@ -840,6 +873,8 @@ class SequencePlan:
     llm: str                    # 预抽 profile——蓝图+实现绑定同一 profile
     style_name: str | None      # 预抽风格名（实现才生效，蓝图不带风格）
     style_prompt: str | None    # 预抽风格提示词
+    tier_rank: int | None = None    # v1.14 档位序数（配分的连续分块查表所得，零 rng）；
+                                    # None = 档位面不在场（档位表缺省）
 
 
 @dataclass(frozen=True)
@@ -889,6 +924,28 @@ def expand_stream_quota(cfg: "ResolvedConfig") -> list[tuple[str, int]]:
     return entries
 
 
+def tier_rank_for_ordinal(sequences: int, tiers: "Sequence[TierSpec]",
+                          ordinal: int) -> int | None:
+    """v1.14（裁决·零抽签配分）：把一个类内序数映射到它所属档位的序数。
+
+    配分结果（``apportion_tiers``，整数域最大余额法）按 tier_rank 升序把类配额切成
+    **连续分块**，类内序数落进哪一块就属哪一档——前缀和查表，零 rng。推论：``--limit``
+    的前缀截断只切掉尾部序数，即类内从最高 tier_rank 侧截起，截断与映射可交换。
+
+    :param sequences: 该序列类的**全量**配额（``[class.<name>.generate].sequences``）；
+        绝不能传 ``--limit`` 截断后的条数，否则分块会随截断漂移。
+    :param tiers: 按 tier_rank 升序存放的档位表；空 = 档位面不在场。
+    :param ordinal: 类内序数 0 基（= 工件 truth.sequence）。
+    :returns: 该序数所属档的 tier_rank；档位表为空时 None。
+    """
+    upper = 0
+    for spec, quota in zip(tiers, apportion_tiers(sequences, tiers)):
+        upper += quota
+        if ordinal < upper:
+            return spec.tier_rank
+    return None
+
+
 def plan_stream(cfg: "ResolvedConfig", rng: "random.Random") -> StreamPlan:
     """计划期纯函数（M10 estimate_run 精确复演共用，裁决·估算精确复演）。
 
@@ -896,8 +953,12 @@ def plan_stream(cfg: "ResolvedConfig", rng: "random.Random") -> StreamPlan:
     ②逐序列 L = rng.randint(类有效 len_range) ③逐序列 (llm, style) 预抽——噪音批
     调用独立预抽，紧随序列预抽在同一 predraw 流内消费（round_robin 不耗 rng、
     weighted 逐位 rng.choices、styles 非空逐位 rng.choice；噪音批取全局 styles）。
+    v1.14 的档位赋值插在①与②之间，零 rng ⇒ 同 seed 下有无档位表的抽签流逐字节一致。
     """
     entries = expand_stream_quota(cfg)
+    tiers = cfg.generate_stream.tiers
+    ranks = [tier_rank_for_ordinal(cfg.class_views[name].generate.sequences,
+                                   tiers, ordinal) for name, ordinal in entries]
     lengths: list[int] = []
     for name, _ in entries:
         lo, hi = cfg.class_views[name].generate.len_range
@@ -913,7 +974,8 @@ def plan_stream(cfg: "ResolvedConfig", rng: "random.Random") -> StreamPlan:
         SequencePlan(index=i, class_name=name, ordinal=ordinal, length=lengths[i],
                      llm=pairs[i][0],
                      style_name=pairs[i][1].name if pairs[i][1] else None,
-                     style_prompt=pairs[i][1].prompt if pairs[i][1] else None)
+                     style_prompt=pairs[i][1].prompt if pairs[i][1] else None,
+                     tier_rank=ranks[i])
         for i, (name, ordinal) in enumerate(entries))
     offset = len(entries)
     noise_plans = tuple(
@@ -938,11 +1000,25 @@ class _StreamSlot:
     ts: str = ""                # ⑨ 铺设的 ISO-8601 时间戳
 
 
+def _tier_truth(tier_rank: int | None, tiered: bool) -> dict:
+    """truth 的档位片段（裁决·真值键序重冻结）：档位表在场才有这一键，位于
+    ``sequence`` 之后、``frame_class`` 之前——三个槽位构造点按同一位置内联展开。
+
+    :param tier_rank: 该帧承载的档位序数（噪音帧恒 None）。
+    :param tiered: 档位表是否在场；False ⇒ 空片段（键不在场，v1.13 字节回退）。
+    :returns: 可直接解包进 truth 字面量的单键或空字典。
+    """
+    return {"tier_rank": tier_rank} if tiered else {}
+
+
 def _sequence_slots(index: int, seq: RealizedSequence) -> list[_StreamSlot]:
-    """一条幸存序列的任务帧槽位（truth.session 占位 −1，交织尾声回填）。"""
+    """一条幸存序列的任务帧槽位（truth.session 占位 −1，交织尾声回填）。v1.14：
+    档位表在场时 truth 带本序列的档位序数。"""
+    plan = seq.plan
+    tier = _tier_truth(plan.tier_rank, tiered=plan.tier_rank is not None)
     return [_StreamSlot(payload=seq.payloads[i],
-                        truth={"session": -1, "sequence_class": seq.plan.class_name,
-                               "sequence": seq.plan.ordinal,
+                        truth={"session": -1, "sequence_class": plan.class_name,
+                               "sequence": plan.ordinal, **tier,
                                "frame_class": seq.frame_classes[i], "noise": False},
                         owner=index)
             for i in range(len(seq.payloads))]
@@ -951,19 +1027,25 @@ def _sequence_slots(index: int, seq: RealizedSequence) -> list[_StreamSlot]:
 def _duplicate_slots(seq: RealizedSequence) -> list[_StreamSlot]:
     """⑧ 一条重复序列的流尾新会话槽位：帧 text_field 值逐字节同源（同对象再序列
     化），truth 带 duplicate_of = 原序列类内序数、sequence = null（重发副本无自身
-    计划期身份，归属经 duplicate_of 对账——裁决·工件行真值字段集）。"""
+    计划期身份，归属经 duplicate_of 对账——裁决·工件行真值字段集）。v1.14：档位
+    序数承源（裁决·重发帧承源档与同源载荷）。"""
+    plan = seq.plan
+    tier = _tier_truth(plan.tier_rank, tiered=plan.tier_rank is not None)
     return [_StreamSlot(payload=seq.payloads[i],
-                        truth={"session": -1, "sequence_class": seq.plan.class_name,
-                               "sequence": None, "frame_class": seq.frame_classes[i],
-                               "noise": False, "duplicate_of": seq.plan.ordinal},
+                        truth={"session": -1, "sequence_class": plan.class_name,
+                               "sequence": None, **tier,
+                               "frame_class": seq.frame_classes[i],
+                               "noise": False, "duplicate_of": plan.ordinal},
                         owner=None)
             for i in range(len(seq.payloads))]
 
 
-def _noise_slot(payload: str) -> _StreamSlot:
-    """一帧插入噪音的槽位（真值三 null + noise=true）。"""
+def _noise_slot(payload: str, tiered: bool) -> _StreamSlot:
+    """一帧插入噪音的槽位（真值三 null + noise=true；档位表在场时档位序数亦 null
+    ——噪音帧不属任何序列，自然不承档）。"""
     return _StreamSlot(payload=payload,
                        truth={"session": -1, "sequence_class": None, "sequence": None,
+                              **_tier_truth(None, tiered=tiered),
                               "frame_class": None, "noise": True},
                        owner=None)
 
@@ -1001,21 +1083,23 @@ def _pack_sessions(survivors: Sequence[RealizedSequence], declared: int,
     return sessions, n_cross
 
 
-def _insert_noise(sessions: list[list[_StreamSlot]], payloads: Sequence[str],
+def _insert_noise(sessions: list[list[_StreamSlot]], slots: Sequence[_StreamSlot],
                   session_max_len: int, rng: "random.Random") -> int:
     """⑦ 逐噪音帧 (会话, 槽位) 掷签：满员会话（len ≥ session_max_len）退出签池；
-    签池耗尽 ⇒ 余帧从交织缺席（不补生成）。返回实际织入帧数。"""
+    签池耗尽 ⇒ 余帧从交织缺席（不补生成）。返回实际织入帧数。v1.14：槽位由持有
+    cfg 的 ``weave_stream`` 预先构造后传入（噪音真值要条件写档位键），本函数只掷签
+    落位——入参数不变。"""
     woven = 0
-    for payload in payloads:
+    for slot in slots:
         pool = [session for session in sessions if len(session) < session_max_len]
         if not pool:
             _log.warning("noise weaving stopped: every session is at "
                          "stream.session_max_len; %d noise frame(s) dropped",
-                         len(payloads) - woven,
+                         len(slots) - woven,
                          extra={"stage": "generate", "batch": 0})
             break
         target = rng.choice(pool)
-        target.insert(rng.randint(0, len(target)), _noise_slot(payload))
+        target.insert(rng.randint(0, len(target)), slot)
         woven += 1
     return woven
 
@@ -1055,7 +1139,9 @@ def weave_stream(survivors: Sequence[RealizedSequence], noise_payloads: Sequence
                      gs.duplicates, dup_k, extra={"stage": "generate", "batch": 0})
     chosen = rng.sample(list(survivors), dup_k) if dup_k else []           # ④
     sessions, crossed = _pack_sessions(survivors, gs.sessions, rng)        # ⑤⑥
-    woven_noise = _insert_noise(sessions, noise_payloads,
+    noise_slots = [_noise_slot(payload, bool(gs.tiers))                    # 零 rng
+                   for payload in noise_payloads]
+    woven_noise = _insert_noise(sessions, noise_slots,
                                 cfg.stream.session_max_len, rng)           # ⑦
     for source in chosen:                                                  # ⑧
         sessions.append(_duplicate_slots(source))
@@ -1067,6 +1153,93 @@ def weave_stream(survivors: Sequence[RealizedSequence], noise_payloads: Sequence
              "frames": sum(len(seq.payloads) for seq in survivors),
              "noise_frames": woven_noise, "duplicates": dup_k}
     return sessions, stats
+
+
+# ── v1.14 时间字段面：缩减 Schema 派生 + 机械回填尾声（§3.3）─────────────────
+
+def _reduced_gen_schema(view: "FrameClassView") -> dict | None:
+    """派生 LLM 面向的逐位 Schema =「生成 Schema − 绑定键」（裁决·绑定即剔除）。
+
+    绑定字段注定被回填尾声按已铺时间轴覆写，故从逐位 Schema 与契约行里一并剔除——
+    不为注定被覆写的字段付 token 与修复环成本，契约也不误导。层级拷贝纪律：顶层与
+    ``properties`` 两层重建、``required`` 取差集（容忍绑定键不在 required），其余关键字
+    连同各属性子 Schema 引用原样——``FrameClassView.gen_schema`` 是 M1 冻结产物（静态
+    预算预检与契约行渲染同源读它），绝不就地改动。
+
+    :param view: 该帧类的配置视图（``gen_schema`` + ``time_fields``）。
+    :returns: 派生产物（恒为新顶层字典；无绑定表时逐字段等于原 Schema）；纯文本帧
+        （未声明生成 Schema）返回 None。
+    """
+    schema = view.gen_schema
+    if schema is None:
+        return None
+    bound = set(view.time_fields or ())
+    reduced = dict(schema)
+    if "properties" in reduced:
+        reduced["properties"] = {name: sub
+                                 for name, sub in reduced["properties"].items()
+                                 if name not in bound}
+    if "required" in reduced:
+        reduced["required"] = [name for name in reduced["required"]
+                               if name not in bound]
+    return reduced
+
+
+def _time_field_values(stamps: Sequence[datetime], position: int,
+                       ts: str) -> dict[str, object]:
+    """一帧的语义词表四值（裁决·语义词表四值 / 序内间隔口径）。
+
+    间隔按**本序列相邻成员**计——交叉会话夹入的外序列帧与噪音帧本就占用其间墙钟，
+    序内差值与下游从数据实测的口径一致。数值取 ``round(·, 6)``（微秒精度，与
+    isoformat 写出的分辨率对齐）；首帧的 ``gap_prev_s``/``elapsed_s`` 与末帧的
+    ``gap_next_s`` 恒 0.0。
+
+    :param stamps: 本序列全部成员的已铺时间戳（序内成员序）。
+    :param position: 本帧在序内的位置（0 基）。
+    :param ts: 该槽位已铺的 ISO-8601 串（``ts`` 词直取）。
+    :returns: {语义词 → 值} 的四键字典。
+    """
+    current = stamps[position]
+    previous = (current - stamps[position - 1]).total_seconds() if position else 0.0
+    following = ((stamps[position + 1] - current).total_seconds()
+                 if position + 1 < len(stamps) else 0.0)
+    return {"ts": ts,
+            "gap_prev_s": round(previous, 6),
+            "gap_next_s": round(following, 6),
+            "elapsed_s": round((current - stamps[0]).total_seconds(), 6)}
+
+
+def backfill_time_fields(sessions: list[list[_StreamSlot]],
+                         cfg: "ResolvedConfig") -> None:
+    """机械回填尾声（纯函数族，零 rng 零 LLM 零 IO；裁决·时间字段回填方向）。
+
+    调用点 = ``weave_stream`` 之后、``assemble_stream`` 之前：回填先于行对象与 id 计算
+    （裁决·回填后计 id），故工件行、成员 ``Record.raw``/``text``/id、序列 id 与 session_id
+    全部含回填值，工件重放逐字节同 id 同会话。只遍历任务帧槽位（``owner`` 非 None）并按
+    owner 归组（会话序即序内成员序——交叉切片不改序内次序），对绑定帧类逐帧把绑定值
+    **就地写入共享载荷对象**（载荷恒为 JSON 对象由 M1 的绑定表前提保证：仅结构化帧可
+    绑定）；每个载荷对象恰被写入一次（一条序列在 owned 会话中恰出现一次）。重发槽位不
+    遍历也不触碰——它与源槽位引用同一载荷对象，回填自动生效且其 ``ts`` 绑定值承源、
+    ≠ 自身行 ts（裁决·重发帧承源档与同源载荷）。噪音帧与无绑定帧类：不触碰。
+
+    :param sessions: 已交织并铺好 ts 的会话列表（就地修改其中的载荷对象）。
+    :param cfg: 已解析配置（读 ``frame_class_views`` 的绑定表）。
+    """
+    views = cfg.frame_class_views
+    groups: dict[int, list[_StreamSlot]] = {}
+    for session in sessions:
+        for slot in session:
+            if slot.owner is not None:
+                groups.setdefault(slot.owner, []).append(slot)
+    for slots in groups.values():
+        stamps = [datetime.fromisoformat(slot.ts) for slot in slots]
+        for position, slot in enumerate(slots):
+            bindings = views[slot.truth["frame_class"]].time_fields
+            if not bindings:
+                continue
+            values = _time_field_values(stamps, position, slot.ts)
+            for field, semantic in bindings.items():
+                slot.payload[field] = values[semantic]
 
 
 # ── v1.13 时间流形态：直装组装 ───────────────────────────────────────────────
@@ -1112,7 +1285,8 @@ def assemble_stream(sessions: list[list[_StreamSlot]],
     ``{<ts字段>: …, <text_field>: …, "truth": {…}}``（行序列化 json.dumps
     ensure_ascii=False 族；canonical_json 只用于 id 计算）与成员 Record（id =
     M2 公式、行号 = 列表序 + 1）；session_id = M2 公式（含噪音帧与重复帧）；
-    噪音/重复帧只活在工件。信封按计划序返回。"""
+    噪音/重复帧只活在工件。信封按计划序返回。v1.14：档位表在场时成员
+    ``ref.generator`` 增第三键 tier_rank（= owner 序列的档位序数）。"""
     ts_field = cfg.stream.order_by[len("meta:"):]
     text_field = cfg.input.text_field
     path = stream_artifact_path(cfg)
@@ -1131,12 +1305,14 @@ def assemble_stream(sessions: list[list[_StreamSlot]],
             if slot.owner is None:
                 continue                   # 噪音/重复帧不构造信封
             plan = survivors[slot.owner].plan
+            generator: dict = {"llm": plan.llm, "style": plan.style_name}
+            if plan.tier_rank is not None:      # v1.14 裁决·档位标识三点落位其一
+                generator["tier_rank"] = plan.tier_rank
             members.setdefault(slot.owner, []).append(Record(
                 id=rec_id, modality="text", text=_payload_text(slot.payload),
                 raw=row, ui_tree=None, image=None,
                 ref=RecordRef(source_file=path, line_no=len(lines), pair_index=None,
-                              generated_from=(),
-                              generator={"llm": plan.llm, "style": plan.style_name})))
+                              generated_from=(), generator=generator)))
             owner_session.setdefault(slot.owner, session_no)
         session_ids.append(hashlib.sha256(
             "\n".join(frame_ids).encode("utf-8")).hexdigest()[:16])
@@ -1329,11 +1505,15 @@ class GenerateStage:
         """GENERATE_ONLY 时间流形态入口（M10 分支调用一次；ctx.batch_no == 0，
         ctx.rng == Random(f"{seed}:0:generate")）。计划期抽签（①②③）→ 派发
         （零 rng：逐序列蓝图→实现作业与噪音批并发）→ 逐帧钩子与序列相似度过滤 →
-        机械交织（④–⑨）→ 直装组装。作废序列只缺席，不产 failed 记录。"""
+        机械交织（④–⑨）→ v1.14 时间字段回填尾声（零 rng，先于行对象与 id 计算）→
+        直装组装。作废序列只缺席，不产 failed 记录。"""
         plan = plan_stream(self._cfg, ctx.rng)
         for seq_plan in plan.sequences:
             ctx.metrics.count(
                 f"generate.stream.sequences.{seq_plan.class_name}.planned")
+            if seq_plan.tier_rank is not None:      # v1.14 逐档计划期计数
+                ctx.metrics.count(
+                    f"generate.stream.tiers.{seq_plan.tier_rank}.planned")
         results = await asyncio.gather(
             *(self._stream_sequence_job(p, ctx) for p in plan.sequences),
             *(self._stream_noise_call(p, ctx) for p in plan.noise_plans))
@@ -1344,6 +1524,7 @@ class GenerateStage:
         survivors = self._filter_stream_sequences(realized, ctx)
         sessions, stats = weave_stream(survivors, noise[: plan.noise_target],
                                        self._cfg, ctx.rng)
+        backfill_time_fields(sessions, self._cfg)
         lines, envelopes = assemble_stream(sessions, survivors, self._cfg)
         self._count_stream_product(survivors, stats, ctx)
         return StreamGenerateProduct(envelopes=envelopes, artifact_lines=lines)
@@ -1366,11 +1547,30 @@ class GenerateStage:
                                 frame_classes=tuple(fc for fc, _ in steps),
                                 payloads=tuple(payloads))
 
+    def _plan_tier_face(self, plan: SequencePlan) -> tuple[tuple["ClassSpec", ...], bool]:
+        """v1.14 蓝图调用的档位面（纯查表，零 rng）。
+
+        档位表在场 ⇒ 帧类表按声明序过滤出档内子集（档位表按 tier_rank 升序存放，
+        故 ``tiers[tier_rank - 1]`` 直取），并要求逐类覆盖；缺省 ⇒ 全表 + 不覆盖，
+        与 v1.13 逐字节一致。
+
+        :param plan: 该序列的计划期定稿（携带档位序数）。
+        :returns: (待渲染帧类表, 是否施加逐类覆盖约束)。
+        """
+        classes = self._cfg.frame_classify.classes
+        if plan.tier_rank is None:
+            return tuple(classes), False
+        composition = set(self._cfg.generate_stream.tiers[plan.tier_rank - 1]
+                          .frame_classes)
+        return tuple(c for c in classes if c.name in composition), True
+
     async def _stream_plan_call(self, plan: SequencePlan,
                                 ctx: "RunContext") -> list[tuple[str, str]] | None:
         """蓝图调用（一序列一次；§10.14 模板 + plan_schema 内部待遇）。
 
         修复穷尽或不可装填 ⇒ 序列作废并计 plan_failures（不产 failed 记录）。
+        v1.14（裁决·蓝图双向硬约束）：档位表在场时帧类表、enum 与覆盖约束都收窄到
+        档内构成，user 行取覆盖变体。
 
         :param plan: 该序列的计划期定稿。
         :param ctx: 运行上下文。
@@ -1378,10 +1578,12 @@ class GenerateStage:
         """
         cfg = self._cfg
         gen_c = cfg.class_views[plan.class_name].generate
-        classes = cfg.frame_classify.classes
+        classes, cover_all = self._plan_tier_face(plan)
         system_text, user_text = render_plan_prompt_texts(
-            gen_c.instruction, classes, plan.class_name, plan.length)
-        schema = _plan_schema([c.name for c in classes], plan.length)
+            gen_c.instruction, classes, plan.class_name, plan.length,
+            cover_all=cover_all)
+        schema = _plan_schema([c.name for c in classes], plan.length,
+                              cover_all=cover_all)
         bucket = bucket_key(plan.llm, plan.style_name, plan.class_name)
         ctx.metrics.count(f"generate.buckets.{bucket}.calls")
         ctx.metrics.count("generate.stream.plan_calls")
@@ -1413,18 +1615,20 @@ class GenerateStage:
         """把蓝图步序展开成逐位的 Schema 面与文本契约面（§10.15）。
 
         帧类声明了生成 Schema ⇒ 结构化帧（Schema 单行 dump 作契约行）；未声明 ⇒
-        纯文本帧（``{"type": "string"}`` + 自由文本契约句）。
+        纯文本帧（``{"type": "string"}`` + 自由文本契约句）。v1.14（裁决·绑定即剔除）：
+        两个面取**同一份**缩减产物（生成 Schema − 绑定键）——无绑定帧类与纯文本帧位
+        逐字节不变。
 
         :param steps: 蓝图步序 [(frame_class, brief), ...]。
         :returns: (逐位 Schema 列表, 逐位契约文本列表)，与 steps 对位。
         """
         views = self._cfg.frame_class_views
-        schemas = [(dict(views[fc].gen_schema) if views[fc].gen_schema is not None
-                    else {"type": "string"}) for fc, _ in steps]
-        contracts = [(json.dumps(views[fc].gen_schema, ensure_ascii=False,
-                                 separators=(", ", ": "))
-                      if views[fc].gen_schema is not None else _REALIZE_FREE_TEXT)
-                     for fc, _ in steps]
+        reduced = [_reduced_gen_schema(views[fc]) for fc, _ in steps]
+        schemas = [schema if schema is not None else {"type": "string"}
+                   for schema in reduced]
+        contracts = [(json.dumps(schema, ensure_ascii=False, separators=(", ", ": "))
+                      if schema is not None else _REALIZE_FREE_TEXT)
+                     for schema in reduced]
         return schemas, contracts
 
     async def _stream_realize_call(self, plan: SequencePlan,
@@ -1611,7 +1815,8 @@ class GenerateStage:
     def _count_stream_product(self, survivors: Sequence[RealizedSequence],
                               stats: "Mapping", ctx: "RunContext") -> None:
         """report.generate.stream 供数（counts-only；键集 = 裁决·观测面；planned
-        已在计划期计数，本处补交织统计与按类 produced）。"""
+        已在计划期计数，本处补交织统计与按类 produced）。v1.14：逐档 produced 与按类
+        produced 同处计数，口径同为「最终进链的幸存序列」。"""
         for key in ("sessions", "crossed_sessions", "frames", "noise_frames",
                     "duplicates"):
             if stats[key]:
@@ -1619,3 +1824,6 @@ class GenerateStage:
         for seq in survivors:
             ctx.metrics.count(
                 f"generate.stream.sequences.{seq.plan.class_name}.produced")
+            if seq.plan.tier_rank is not None:
+                ctx.metrics.count(
+                    f"generate.stream.tiers.{seq.plan.tier_rank}.produced")

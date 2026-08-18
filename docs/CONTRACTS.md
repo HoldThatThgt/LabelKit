@@ -162,9 +162,13 @@ plain line formats — the golden-snapshot layer of the three-layer regression a
 v1.13 time-stream generation coverage belongs in `tests/operators/test_generate_stream.py`
 (planning draws, weaver mechanics, direct assembly, artifact replay equivalence),
 `tests/common/config/test_loader_generate_stream.py` (the M1 constraint matrix, §6.3 rules
-50–56) and `tests/integration/test_generate_stream_llm.py` (real-LLM: the DeepSeek endpoint
-for blueprint/realize/per-class annotation, plus ONE z.ai `glm-5.2` case pinning
-`prefixItems` L0 pass-through).
+50–60 — v1.14's tier and binding clusters land in the same file) and
+`tests/integration/test_generate_stream_llm.py` (real-LLM: the DeepSeek endpoint
+for blueprint/realize/per-class annotation and, v1.14, for tiers and time-field back-fill, plus
+z.ai `glm-5.2` cases pinning `prefixItems` and `allOf`/`contains` L0 pass-through). v1.14's
+`apportion_tiers` unit coverage belongs in `tests/common/config/` (it follows the function's
+`model.py` home), while the ordinal mapping and the `--limit` commutativity belong in
+`tests/operators/`.
 A separate compatibility-import test,
 `test_key_pool.py`, or
 `test_stream_ingest.py` is forbidden. The exact file allowlist is normative in
@@ -1073,6 +1077,49 @@ class GenerateConfig:
 
 
 @dataclass(frozen=True)
+class TierSpec:                                   # v1.14 (spec 5.2 [[generate.stream.tiers]]):
+                                                  # ONE frame-class composition tier. A tier IS its
+                                                  # frame-class composition set — it carries NO
+                                                  # quality instruction and does not govern
+                                                  # intra-frame semantics (裁决·档位即帧类构成)
+    tier_rank: int                                # the tier's IDENTITY (there is deliberately no
+                                                  # `name` key): positive, unique in the table, and
+                                                  # the table must cover 1..N CONTIGUOUSLY (N =
+                                                  # table length). Also the deterministic tiebreak
+                                                  # key for apportionment and the ordering of the
+                                                  # in-class ordinal blocks. The TOOL ASSIGNS NO
+                                                  # quality direction to rank order (that is the
+                                                  # user's, 裁决·tier_rank 即档位身份)
+    weight: int                                   # quota weight, integer >= 1; a class's quota is
+                                                  # split across tiers by INTEGER-DOMAIN largest
+                                                  # remainder, zero rng (apportion_tiers below)
+    frame_classes: tuple[str, ...]                # the composition: this tier's sequences use
+                                                  # EXACTLY these frame classes (enum gives "⊆",
+                                                  # per-class `contains` gives "⊇"). Non-empty, no
+                                                  # dupes inside a tier, every name in the frame
+                                                  # class table, and the composition SETS are
+                                                  # pairwise distinct across tiers (M1, §6.3)
+
+
+def apportion_tiers(sequences: int, tiers: Sequence[TierSpec]) -> tuple[int, ...]:
+    """v1.14 (裁决·零抽签配分) — a TierSpec companion PURE function living in `model.py`, not in
+    operators: M1's per-nonzero-quota-pair constraint and M6's planning phase share ONE
+    implementation, and the layering rule forbids common → operators (M6 imports it backwards,
+    which is the legal direction). [FROZEN HERE]
+
+    Integer-domain largest remainder, arithmetic FROZEN — base = `(sequences * weight) //
+    Σweight`, remainder key = `(sequences * weight) % Σweight`, then +1 per tier by descending
+    remainder with ties broken by ASCENDING tier_rank until the parts sum to `sequences`. NO
+    floating-point intermediate is permitted: the tie verdict feeds the in-class ordinal blocks →
+    truth → artifact bytes → member ids, so it is a frozen surface and may not hang off
+    float comparison semantics. Consumes ZERO rng — the frozen draw-order table (§7.5) is
+    UNCHANGED, apportionment slots in between quota expansion ① and length drawing ② as a
+    zero-consumption step. Callers pass tiers in tier_rank ascending order (which is how
+    `GenerateStreamConfig.tiers` stores them) and get parts back in the same order; an empty
+    tier table returns ()."""
+
+
+@dataclass(frozen=True)
 class GenerateStreamConfig:                       # v1.13 (spec 5.2 [generate.stream]): the
                                                   # generate_only TIME-STREAM form — the LLM makes
                                                   # exactly two content calls per sequence
@@ -1102,6 +1149,13 @@ class GenerateStreamConfig:                       # v1.13 (spec 5.2 [generate.st
                                                   # the session-split threshold is self-defeating)
     ts_start: str = "2026-01-01T00:00:00Z"        # stream origin (ISO-8601; NEVER the wall clock —
                                                   # same seed, byte-identical artifact)
+    tiers: tuple[TierSpec, ...] = ()              # v1.14 frame-class composition tier table,
+                                                  # STORED IN tier_rank ASCENDING ORDER (M1 sorts
+                                                  # at parse time, so iteration order IS rank
+                                                  # order everywhere downstream). Empty = the tier
+                                                  # face is absent entirely: no generator.tier_rank
+                                                  # key, no truth.tier_rank key, no report tiers
+                                                  # sub-block — byte-equivalent to v1.13
 
 
 @dataclass(frozen=True)
@@ -1468,6 +1522,19 @@ class FrameClassView:                             # v1.12: one frame class's eff
                                                   # class (at most one of schema_path /
                                                   # schema_inline); None = plain-text frame (the
                                                   # frame content is the text itself)
+    time_fields: Mapping[str, str] | None = None  # v1.14 (裁决·绑定即剔除): time-semantics field
+                                                  # bindings ([frame.class.<name>.generate
+                                                  # .time_fields]) — key = a TOP-LEVEL field name
+                                                  # of gen_schema, value = one of the FROZEN
+                                                  # four-word vocabulary {ts, gap_prev_s,
+                                                  # gap_next_s, elapsed_s}. None = no bindings.
+                                                  # Legal on STRUCTURED frames only (gen_schema
+                                                  # declared). Bound fields are STRIPPED from the
+                                                  # LLM-facing per-position schema and contract
+                                                  # line and back-filled mechanically from the
+                                                  # laid timeline (§7.5); the whitelist tuple
+                                                  # _FRAME_CLASS_SECTION_KEYS["generate"] gains
+                                                  # this fourth key
 
 
 # ── CLI overrides and the aggregate ────────────────────────────────────────
@@ -1956,8 +2023,13 @@ paths and the whole system is byte-equivalent to v1.12):
     three artifact-row top-level keys are mutually exclusive).
     Quota side: `Σ sequences` over the class-effective views ≥ 1; every PARTICIPATING class
     (effective `sequences >= 1`) has a non-empty effective generate instruction;
-    `[[frame.classify.classes]]` is non-empty and EVERY frame class has a non-empty
-    `[frame.class.<name>.generate].instruction` (the blueprint enum spans the whole table).
+    `[[frame.classify.classes]]` is non-empty and every frame class IN SCOPE has a non-empty
+    `[frame.class.<name>.generate].instruction`. **Scope is conditional (v1.14, 裁决·指令必填域
+    收窄)**: with no tier table the scope is the WHOLE frame class table (the blueprint enum spans
+    it, so any class may be picked); with a tier table declared the scope narrows to the UNION of
+    the tiers' `frame_classes` (the closed set the blueprint can actually pick from) — a frame
+    class in no tier is exempt from the requirement, already-written instructions stay legal, and
+    rule 58 warns that its whole generate face is dead config.
 52. **禁设键探针** — DIRECTED CONFIG_ERRORs (the v1.11 `use_vision` raw-section probe
     mechanism — never rule 1's unknown-key warning; every message names the replacement
     surface): an explicit `[generate].seed_examples` / `standalone_count` / `num_per_record` /
@@ -1996,6 +2068,56 @@ paths and the whole system is byte-equivalent to v1.12):
     `annotate` segment's schema term becomes PER-CLASS: the max now runs over the whole
     per-view sum (schema + instruction + few-shot); with no per-class schema declared every
     view resolves to the global one and the value is byte-identical to v1.12.
+
+Frame-class composition tiers and time-field bindings (v1.14, spec 3.1.4 帧类构成档位与时间字段
+绑定 row + 2.3.1; both clusters run ONLY inside the time-stream form, and with neither the tier
+table nor a bindings sub-table declared the loader takes zero new code paths and the whole system
+is byte-equivalent to v1.13 — the ONE exception is rule 59, a v1.13 defect repair):
+57. **档位表前提与身份** — `[[generate.stream.tiers]]` present ⇒ `generate_stream.enabled = true`
+    (a DIRECTED CONFIG_ERROR: the table is legal only in the time-stream form). Inside the table:
+    `tier_rank` is a positive integer, unique across rows, and the set of ranks must cover
+    `1..N` CONTIGUOUSLY where N = table length (a gap or a duplicate is a CONFIG_ERROR naming the
+    offending rank); `weight` is an integer >= 1; `frame_classes` is non-empty, has no duplicates
+    within a row, every name is in `[[frame.classify.classes]]`, and the composition SETS are
+    pairwise distinct across rows (identical compositions are semantic duplicates). The parse
+    product is `GenerateStreamConfig.tiers`, sorted tier_rank ASCENDING.
+58. **配分推论与两条 WARN** — `apportion_tiers` (§6.1) is a pure function, so M1 can compute every
+    per-(participating class, tier) quota at load time and enforce **长度可覆盖**: for every pair
+    whose quota is >= 1, that class's `len_range` LOWER bound must be >= `len(tier.frame_classes)`
+    (the tier's every class must appear at least once, which needs at least that many steps);
+    ZERO-quota pairs are EXEMPT (no raising a bound for a combination that will never be
+    attempted). Two non-blocking WARNs, both value-free: **配分零额** — a (participating class,
+    tier) pair apportioned 0 (the natural result of a small quota against lopsided weights;
+    `report.generate.stream.tiers.<rank>.planned` reports the 0 faithfully) names the class,
+    the tier_rank and the weight table; **帧类未入档** — a frame class belonging to no tier's
+    `frame_classes` names it and states that its whole `[frame.class.<name>.generate]` face
+    (instruction, schema, time_fields) is dead config, since no blueprint can ever pick it. The
+    latter is the rule-51 scope-narrowing counterpart.
+59. **微秒地板（v1.13 defect repair, NOT a switch face）** — rule 53's `frame_gap_s` bound
+    `0 < lo` tightens to `lo >= 1e-6`. Sub-microsecond `lo` rounds the inter-frame `timedelta` to
+    0 microseconds, which already punched a hole in v1.13's "timestamps increase STRICTLY" claim,
+    and v1.14's 0.0 boundary sentinels in the time vocabulary tolerate a true zero gap even less;
+    the error message cites both grounds. Zero impact on every existing project with `lo >= 1e-6`
+    (all examples use 5) — a sub-microsecond configuration produced defective data under v1.13
+    already.
+60. **绑定表前提与键类型** — `[frame.class.<name>.generate.time_fields]` is legal ONLY on a
+    STRUCTURED frame class (one that declared `schema_path`/`schema_inline` per rule 55); a
+    plain-text frame class carrying the sub-table is a DIRECTED CONFIG_ERROR. "The payload is
+    always a JSON object" — the precondition for in-place back-fill — is already carried by rule
+    55's unconditional top-level `type: "object"` check, so this cluster stays SILENT on a frame
+    class that declared a schema source key but failed to load (no second error stacked on the
+    first; the discriminator is source-key PRESENCE, not load success). Inside the sub-table:
+    every key must be a TOP-LEVEL `properties` name of that class's generation schema; every
+    value must be one of the frozen vocabulary `{ts, gap_prev_s, gap_next_s, elapsed_s}`; and the
+    property's declared `type` keyword must be LITERALLY EQUAL to the required one — `"string"`
+    for `ts`, `"number"` for the other three (a union-type array, a missing `type`, or a type
+    reached indirectly through `$ref`/composition keywords all count as a mismatch, DIRECTED
+    CONFIG_ERROR). A bound field carrying constraint keywords BEYOND `type` (minimum/maximum/
+    pattern/…) raises a value-free WARN naming the frame class, the field and the keyword: those
+    keywords are neither sent upstream nor enforced, because a time quantity's range is decided
+    by the timeline, not by the schema. Finally **剔除余量** — top-level `properties` count minus
+    bound-key count must be >= 1 (the LLM must keep at least one field to generate; binding every
+    field is a CONFIG_ERROR). Parse product: `FrameClassView.time_fields` (None = no bindings).
 
 Warnings (non-blocking): `verify` enabled and `verify.llm`'s `model` equals `annotate.llm`'s
 `model` → warn about self-enhancement bias (spec 3.7.2). v1.7 (R8): `classify.enabled = false`
@@ -2650,6 +2772,34 @@ def stream_artifact_path(cfg: ResolvedConfig) -> str:
     """`Path(cfg.run.output).with_suffix("") + ".stream.jsonl"` [FROZEN HERE]. M11 derives the
     same value INDEPENDENTLY (operators never import each other); the equality of the two
     derivations is test-pinned."""
+
+
+# ── v1.14 additions (SPEC-generation-tiers §3.2 / §3.3) ──────────────────────
+
+def tier_rank_for_ordinal(sequences: int, tiers: Sequence[TierSpec],
+                          ordinal: int) -> int | None:
+    """Map an IN-CLASS ordinal to its tier's rank [FROZEN HERE]. `apportion_tiers` (§6.1) cuts a
+    class's quota into CONTIGUOUS blocks in tier_rank ascending order, so this is a prefix-sum
+    lookup — zero rng. `sequences` must be that class's FULL quota, never the `--limit`-truncated
+    count, or the blocks drift. Returns None when the tier table is empty. Corollary: `--limit`
+    prefix-truncation only removes trailing ordinals, i.e. it cuts from each class's HIGHEST
+    tier_rank side, and truncation commutes with the mapping. Deliberately a STANDALONE function
+    rather than a third element on `expand_stream_quota`'s return — widening that tuple would
+    break three existing two-tuple unpack assertions, which contradicts the verbatim draw-order
+    pin-board regression."""
+
+
+def backfill_time_fields(sessions: list[list[_StreamSlot]], cfg: ResolvedConfig) -> None:
+    """The mechanical back-fill coda [FROZEN HERE] — zero rng, zero LLM, zero IO. Call site is
+    INSIDE `generate_stream_all`, AFTER `weave_stream` and BEFORE `assemble_stream`, so the
+    back-filled values precede row-object and id computation (裁决·回填后计 id). Walks TASK-frame
+    slots only (`owner is not None`), groups them by owner (session order IS intra-sequence member
+    order — crossing slices never reorder within a sequence), and for a bound frame class writes
+    each binding IN PLACE into the shared payload object. Duplicate slots are neither walked nor
+    touched: they reference the SAME payload object as their source slots, so the back-fill takes
+    effect automatically and their `ts` binding is the SOURCE's, deliberately != their own row ts
+    (裁决·重发帧承源档与同源载荷). Noise frames and unbound frame classes are untouched; every
+    payload object is written EXACTLY once."""
 ```
 
 Normative behavior:
@@ -2665,16 +2815,62 @@ Normative behavior:
   first `Σsurvivors − sessions_eff` pairs crossed ⑥ per-crossed-session switch points ⑦ per
   noise frame (session, slot) draws ⑧ duplicates appended as NEW tail sessions (zero rng)
   ⑨ timestamp laying. Voided sequences change the weave input, so determinism is conditional on
-  the LLM content (spec §2.6).
+  the LLM content (spec §2.6). **v1.14 zero-consumption note:** tier apportionment slots between
+  ① and ②, and the time-field back-fill coda follows ⑨ — BOTH consume zero rng, so this table is
+  UNCHANGED (the pin-board tests regress verbatim) and, at a given seed, the draw stream is
+  byte-identical with and without a tier table or a bindings sub-table.
 - **Two content calls + noise.** Blueprint (one per surviving quota sequence): §10.14 template,
   `plan_schema(frame class names, L)` (internal treatment); exhaustion/unfittable ⇒ the sequence
-  is voided, `generate.stream.plan_failures`. Realize (one per blueprint): §10.15 template with
+  is voided, `generate.stream.plan_failures`. **With a tier table (v1.14)** the blueprint call
+  becomes tier-conditional: the frame classes rendered into `[帧类表]` are the frame class table
+  FILTERED (in declaration order) to `tiers[plan.tier_rank - 1].frame_classes`, the user line
+  takes the frozen cover variant (§10.14), and the schema becomes `plan_schema(that subset, L,
+  cover_all=True)` — enum gives "⊆", the per-class `contains` gives "⊇", together the composition
+  is EXACTLY EQUAL to the tier's declaration. A cover violation is an ordinary L2 violation that
+  enters M8's existing repair loop and, on exhaustion, the existing `plan_failures` voiding —
+  ZERO new failure mechanism. Realize (one per blueprint): §10.15 template with
   the per-position contract line, `realize_schema(step schemas)` (plain-text positions take
-  `{"type": "string"}`); reactive overflow ⇒ SEQUENCE HALVING (schema and step digest sliced
-  together, ≤ 2 AIMD levels, each halving counted into `budget.degrade_retries`), exhaustion ⇒
-  voided, `generate.stream.realize_failures`. Noise: `render_prompt_texts(noise_instruction,
-  style, num_per_call, ())` reusing §10.4 + `SAMPLES_SCHEMA`, `ceil(noise frames / num_per_call)`
-  calls; a voided batch just leaves those frames absent (never regenerated).
+  `{"type": "string"}`); **the per-position schema and its contract line take the REDUCED schema**
+  (v1.14, see the bindings bullet below); reactive overflow ⇒ SEQUENCE HALVING (schema and step
+  digest sliced together, ≤ 2 AIMD levels, each halving counted into `budget.degrade_retries`),
+  exhaustion ⇒ voided, `generate.stream.realize_failures`. Noise:
+  `render_prompt_texts(noise_instruction, style, num_per_call, ())` reusing §10.4 +
+  `SAMPLES_SCHEMA`, `ceil(noise frames / num_per_call)` calls; a voided batch just leaves those
+  frames absent (never regenerated).
+- **Tier apportionment and identity (v1.14).** A class's `sequences` quota is split across tiers
+  by `apportion_tiers` (§6.1, integer-domain largest remainder, zero rng); in-class ordinals
+  occupy CONTIGUOUS blocks in tier_rank ascending order and `tier_rank_for_ordinal` is the
+  prefix-sum lookup. `SequencePlan` gains `tier_rank: int | None = None` (None = the tier face is
+  absent; the default-value assertion belongs in `tests/operators/test_generate_stream.py`, not
+  test_config, because the dataclass is operator-owned). The rank lands in exactly THREE places,
+  all conditional on a non-empty tier table: `ref.generator` gains a third key `tier_rank`
+  (`{"llm", "style", "tier_rank"}` — the emitter's `_source_block` flows it out unchanged, and
+  the rejects side's existing generator carry-through follows automatically), the artifact
+  `truth` gains `tier_rank` at its frozen position (§9.5), and `report.generate.stream` gains the
+  `tiers` sub-block (§7.9/§9.3). Noise slots carry `tier_rank: null` and duplicate slots carry
+  the SOURCE sequence's rank. Carrier note: noise-slot CONSTRUCTION moves up into `weave_stream`
+  (which holds cfg and therefore knows whether the tier face is present) and `_insert_noise` takes
+  the already-built slot list — its parameter count is unchanged (it was already at 4, and adding
+  one would hit the 5-parameter ceiling).
+- **Time-field bindings (v1.14).** Bound fields are STRIPPED from the LLM-facing surface: the
+  reduced schema deletes them from `properties` and subtracts them from `required` (set-difference
+  semantics, tolerating a bound key absent from `required`), leaving every other keyword as-is.
+  Derivation discipline: rebuild the TOP LEVEL and the `properties` level (other keywords and each
+  property sub-schema keep their original references) and NEVER mutate the shared
+  `FrameClassView.gen_schema` in place — that is an M1-frozen product read by the static budget
+  precheck and by contract-line rendering alike. The per-position schema face and the contract
+  TEXT face take the SAME derived product; plain-text positions and unbound frame classes are
+  byte-unchanged. M8 validates against the reduced schema (that is also what L0 carries), so an
+  LLM that emits a bound field anyway trips `additionalProperties` and the repair loop asks for
+  its removal — semantically correct. Values are back-filled by `backfill_time_fields` above:
+  `ts` = the slot's laid ISO string; `gap_prev_s`/`gap_next_s`/`elapsed_s` = the INTRA-SEQUENCE
+  neighbour/first-frame timestamp deltas at `round(·, 6)`, with the first frame's `gap_prev_s`
+  and `elapsed_s` and the last frame's `gap_next_s` pinned to 0.0. Intra-sequence is the frozen
+  reading: foreign-sequence frames and noise frames woven between them genuinely occupy that wall
+  clock, so an intra-sequence delta is what a downstream consumer measures from the data. Hook
+  scope is UNCHANGED and semantic: `generate.sample_validator` (per frame) and the sequence-level
+  similarity filter both run BEFORE weaving and therefore see the PRE-back-fill payloads — time
+  quantities are mechanical and take part in neither content validation nor content dedup.
 - **Filters.** `generate.sample_validator` runs PER FRAME of the realize product — any violation
   scraps the WHOLE sequence (a fixed-length blueprint cannot drop one frame; rejection-sampling
   semantics), counting `generate.stream.validator_scrapped` + the bucket's
@@ -2698,7 +2894,8 @@ Normative behavior:
   member `Record.raw` = THE WHOLE ROW, `id = sha256(canonical_json(raw))[:16]` (the M2 formula ⇒
   replay-identical), `text` = the M2 projection of the text field (string as-is, object →
   canonical JSON), `ref = RecordRef(source_file=<artifact path>, line_no=<1-based row>,
-  pair_index=None, generated_from=(), generator={"llm", "style"})`; `session_id =
+  pair_index=None, generated_from=(), generator={"llm", "style"} — `{"llm", "style", "tier_rank"}`
+  with a tier table, v1.14)`; `session_id =
   sha256("\n".join(all frame ids in the session))[:16]` (the M2 formula, INCLUDING noise and
   duplicate frames); the sequence Record follows the S24 conventions with the M14 id formula;
   the envelope carries `Classification(label, (label,), "inherited", {})` plus
@@ -2716,7 +2913,14 @@ Normative behavior:
   `duplicates` / `plan_calls` / `realize_calls` (including halved sub-calls) / `noise_calls`
   (all three call counters increment BEFORE dispatch, so they include calls the budget
   precheck rejected and never sent — the flat path's precedent) / `plan_failures` /
-  `realize_failures` / `validator_scrapped`.
+  `realize_failures` / `validator_scrapped`. **v1.14 adds two** (present only with a tier table):
+  `tiers.<tier_rank>.planned` (incremented per planned sequence, alongside
+  `sequences.<class>.planned`) and `tiers.<tier_rank>.produced` (same four-gate reading as
+  `sequences.<class>.produced`); `<tier_rank>` is the DECIMAL STRING form of the rank. The
+  counters are the raw feed only — the report sub-block itself is assembled EXPLICITLY by M10
+  (§7.9), which is what makes zero-quota and fully-voided tiers present in the report at all.
+  The time-field face owns NO counter: back-fill is a deterministic mechanical operation with no
+  countable failure mode.
 
 ### 7.6 M7 — `labelkit/operators/verify.py`
 
@@ -2997,9 +3201,35 @@ def defect_verdict_schema() -> dict: ...                                     # v
                                                                              # v1.9: kind enum
                                                                              # +wrong_stitch, §10.7
 def frame_classify_schema(names: Sequence[str], n: int) -> dict: ...         # v1.12 (M13 frame), §10.7
-def plan_schema(names: Sequence[str], length: int) -> dict: ...              # v1.13 (M6 blueprint), §10.7
+def plan_schema(names: Sequence[str], length: int,
+                cover_all: bool = False) -> dict: ...                        # v1.13 (M6 blueprint), §10.7;
+                                                                             # v1.14 adds cover_all
 def realize_schema(step_schemas: Sequence[dict]) -> dict: ...                # v1.13 (M6 realize), §10.7
 ```
+
+`plan_schema`'s `cover_all` (v1.14, 裁决·蓝图双向硬约束) is a keyword with default False, so the
+function stays at three parameters and every v1.13 call site and test is untouched: **False emits
+byte-identical output to v1.13**. True appends, to the `steps` array object, an `allOf` carrying
+ONE `contains` branch per name in the passed order — each branch being
+`{"contains": {"type": "object", "properties": {"frame_class": {"const": <name>}},
+"required": ["frame_class"]}}`. A schema object has exactly one `contains` slot, which is why
+multiple classes need separate `allOf` branches. The enum already spans the passed `names`, so
+the SUBSET semantics are carried entirely by what M6 passes (the constructor is subset-unaware);
+enum gives "⊆" and `contains` gives "⊇", composing to "the step frame-class set EQUALS the tier's
+declared composition". Keyword-freeze consequence: the frozen internal-schema keyword set gains
+`allOf` / `contains` / `const` (tests asserting the allow-list must widen, and a schema-keyword
+walker must recurse through `allOf`). `realize_schema` is UNCHANGED in signature and behavior —
+the v1.14 reduced schema is derived M6-side and passed in (§7.5).
+
+Violation rendering (v1.14, 裁决·渲染缺类可见): `_render_error` gains a **`contains` branch**
+beside the existing `enum` branch. A blueprint cover violation renders as
+`steps: missing required frame_class "<name>"`, taking the name from the `const` inside
+`error.validator_value`'s `frame_class` property; a `contains` violation of any OTHER shape (a
+user schema may legitimately use `contains`) falls back to jsonschema's own message. Rationale:
+on an L0-off endpoint the L3 repair prompt MUST name the missing frame class or its guidance
+value collapses to zero (the else branch renders a bare array repr). The text is English like
+every other rendered violation, and the value-free discipline is intact — a frame-class name is a
+CONFIG quantity, not data content.
 
 The three v1.8 builders, the v1.9 `stitch_schema`, the v1.12 `frame_classify_schema` and the
 two v1.13 builders are INTERNAL schemas like the rest: no `resolved_at` bucket counting, no
@@ -3582,6 +3812,18 @@ v1.13 time-stream generation (SPEC-stream-generation §3.7; spec 3.10.3 时间�
   over `[[classify.classes]]` in declaration order — the `report.classify` convention). The
   `report.stream` node does NOT appear (that is segment's observability surface) and
   `report.classify`'s histogram is legitimately all-zero.
+  **`tiers` sub-block (v1.14, 裁决·报表显式装配).** This section is EXPLICIT KEY ASSEMBLY, not a
+  counter prefix tree, and the `tiers` sub-block must be assembled the same way: when
+  `cfg.generate_stream.tiers` is non-empty, iterate the DECLARED tier table (stored tier_rank
+  ascending, so iteration order IS rank order) and lay it out zero-based as
+  `{"<tier_rank>": {"planned": …, "produced": …}}`, where `"<tier_rank>"` is the decimal string
+  form; the report is written without `sort_keys`, so key order equals insertion order. **Key
+  position is FROZEN between `sequences` and `frames`** (adjacent to the quota family). Assembling
+  from the declaration — rather than from whichever counters happened to fire — is what puts
+  zero-quota tiers and fully-voided tiers in the report at all (`planned` 0 / `produced` 0,
+  faithfully). With no tier table the key is ABSENT. This is the same family of trap as
+  E2E-FINDINGS #11 (a counter silently dropped by a report allow-list), caught at the spec layer
+  this time.
 
 ### 7.10 M11 — `labelkit/operators/emitter.py`
 
@@ -4849,7 +5091,11 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
              "line_no": <int>, "pair_index": <int|null>,
              "generated_from": [<seed ids>],          // [] unless process-mode generated
              "fields": {<output.passthrough_fields from Record.raw>},   // {} when none
+             //   v1.14 conditional third key: with a time-stream tier table declared the object
+             //   is {"llm", "style", "tier_rank"} (the sequence's tier rank, a positive int);
+             //   with no tier table it stays the two-key form — §6.3 envelope additive-only
              "generator": null | {"llm": "<profile>", "style": "<name>"|null}},
+
   // v1.8 — ALWAYS-PRESENT key (null whenever segment is disabled — v1.13 widens the gate to
   // segment.enabled ∨ generate_stream.enabled); key position AFTER
   // "source" and BEFORE "scores" — chain-order mirror (spec §6.3):
@@ -5058,6 +5304,17 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
   //                         "sequences": {"<class>": {"planned": 0, "produced": 0}},
   //                                                  // zero-based over [[classify.classes]] in
   //                                                  // declaration order (report.classify form)
+  //                         "tiers": {"<tier_rank>": {"planned": 0, "produced": 0}},
+  //                                                  // v1.14, PRESENT ONLY with a non-empty
+  //                                                  //   [[generate.stream.tiers]]; key position
+  //                                                  //   FROZEN between "sequences" and "frames"
+  //                                                  //   (quota family adjacency); keys are the
+  //                                                  //   DECIMAL STRING ranks in ascending order;
+  //                                                  //   same reading as "sequences" above.
+  //                                                  //   Laid out zero-based over the DECLARED
+  //                                                  //   tier table by M10 (§7.9) ⇒ zero-quota
+  //                                                  //   and fully-voided tiers are present with
+  //                                                  //   0/0, not missing
   //                         "frames": 0,             // task frames (Σ steps of surviving sequences)
   //                         "noise_frames": 0,       // frames actually woven in (< target when the
   //                                                  //   draw pool ran out of non-full sessions)
@@ -5279,6 +5536,13 @@ generate_only DEGENERATE form `emitted + dropped_dup + dropped_lowq + dropped_ve
 ledger). The `resolved_at` identity is RESTATED rather than changed: "the sum = the number of
 RECORD-LEVEL annotation calls entering M5" — a per-class-schema call passes an explicit schema
 yet is user-treatment and IS counted (§7.7); frame-level and internal calls still are not.
+v1.14 additions (counter key names **[FROZEN HERE]**): two `generate.stream.tiers.<tier_rank>.*`
+keys, `planned` and `produced` (owner M6, §7.5), fed only when a tier table is declared and
+surfaced through M10's EXPLICIT assembly of the conditional `report.generate.stream.tiers`
+sub-block above (§7.9) — the explicit assembly, not the counters, is what guarantees zero-quota
+and fully-voided tiers appear at all. The time-field back-fill face adds NO counter (a
+deterministic mechanical operation has no countable failure mode). `counts.*` again gains
+nothing, and `resolved_at` is untouched.
 
 Counter OWNERSHIP (normative): `counts.*` keys are incremented ONLY by M10 (orchestrator),
 derived from batch tallies / EmitResult — stages must never touch them (double-count).
@@ -5328,17 +5592,35 @@ number is exactly `_meta.stream.member_sources[].line_no`.
            "sequence_class": "<class>",  // null on noise frames
            "sequence": 0,                // 0-based ordinal WITHIN its class (the planning-phase
                                          //   identity); null on noise frames AND duplicate copies
+           "tier_rank": 1,               // v1.14, PRESENT ONLY with a declared tier table:
+                                         //   the sequence's tier rank. Task frames carry their
+                                         //   own tier, noise frames carry null, duplicate frames
+                                         //   INHERIT THE SOURCE's tier. Key position is FROZEN
+                                         //   AFTER "sequence" (the sequence-identity group) and
+                                         //   BEFORE "frame_class"
            "frame_class": "<frame class>",  // null on noise frames
-           "noise": false                // true on inserted noise frames (which carry the three
+           "noise": false                // true on inserted noise frames (which carry the
                                          //   nulls above)
            [, "duplicate_of": 0]}}       // PRESENT ONLY on the frames of a re-sent sequence:
                                          //   the ORIGINAL sequence's in-class ordinal
 ```
 
-The `truth` key set is **[FROZEN HERE]**. Truth carries NO post-assembly ids (裁决·真值不携最终
-id): a member id hashes the row and a sequence id hashes the member ids, so embedding either
-would be circular — main output ↔ artifact reconcile through `member_sources` line numbers
-instead.
+The `truth` key set is **[FROZEN HERE]** — and RE-FROZEN in v1.14 by the insertion above
+(裁决·真值键序重冻结): row byte order follows this key order, while ids are computed over
+canonical JSON (sorted keys) and are therefore unaffected by it. Truth carries NO post-assembly
+ids (裁决·真值不携最终 id): a member id hashes the row and a sequence id hashes the member ids, so
+embedding either would be circular — main output ↔ artifact reconcile through `member_sources`
+line numbers instead.
+
+**Back-filled time fields (v1.14).** For a frame class with `time_fields` bindings, the bound keys
+inside the row's TEXT-FIELD OBJECT are not LLM output: they are mechanical quantities written by
+`backfill_time_fields` (§7.5) from the laid timeline, before the row object and every id are
+computed — so they participate in the member id, the sequence id and the session id, and the
+replay contract below holds unchanged. Two reconciliation rules for anyone auditing an artifact:
+values are INTRA-SEQUENCE deltas (group rows by `truth.sequence_class` + `truth.sequence` first —
+foreign-sequence frames and noise frames woven between them do not participate), and rows
+carrying `truth.duplicate_of` are EXCLUDED (their bound values, like their `tier_rank`, are
+inherited from the source and do not reconcile against their own session's timeline).
 
 Replay contract: the artifact IS a valid §6.1 text-modality input. Round-trippability is
 enforced at startup by the M1 artifact-key guard (§6.3 rule 51): `input.text_field` and the
@@ -5767,21 +6049,30 @@ conservative `new` outcome (§7.16), never a schema failure.
 v1.13 adds two M6 builders (verbatim from `labelkit/common/runtime/schema_engine.py`):
 
 ```python
-def plan_schema(names: Sequence[str], length: int) -> dict:
+def plan_schema(names: Sequence[str], length: int, cover_all: bool = False) -> dict:
     # v1.13 M6 blueprint call (裁决·蓝图实现内部 Schema): one sequence's `length`-step plan —
     # each step names its frame class (closed set = the frame class table) and a one-sentence
     # brief for the realize call to expand. minItems = maxItems pins the step count
     # (judgment_schema / frame_classify_schema precedent); NO uniqueItems — one frame class may
     # legitimately recur within a sequence (R1: strict gateways hard-reject the keyword anyway).
-    return {"type": "object",
-            "properties": {"steps": {"type": "array",
-                "items": {"type": "object",
-                          "properties": {"frame_class": {"type": "string",
-                                                         "enum": list(names)},
-                                         "brief": {"type": "string"}},
-                          "required": ["frame_class", "brief"],
-                          "additionalProperties": False},
-                "minItems": length, "maxItems": length}},
+    # v1.14 (裁决·蓝图双向硬约束): cover_all=True appends allOf + one contains branch per name,
+    # in the PASSED order. enum gives "⊆ the passed name set", contains gives "⊇", composing to
+    # composition EQUALITY. A schema object has ONE contains slot, hence the allOf branches.
+    # cover_all=False emits byte-identical output to v1.13.
+    steps: dict = {"type": "array",
+                   "items": {"type": "object",
+                             "properties": {"frame_class": {"type": "string",
+                                                            "enum": list(names)},
+                                            "brief": {"type": "string"}},
+                             "required": ["frame_class", "brief"],
+                             "additionalProperties": False},
+                   "minItems": length, "maxItems": length}
+    if cover_all:
+        steps["allOf"] = [{"contains": {"type": "object",
+                                        "properties": {"frame_class": {"const": name}},
+                                        "required": ["frame_class"]}}
+                          for name in names]
+    return {"type": "object", "properties": {"steps": steps},
             "required": ["steps"], "additionalProperties": False}
 
 
@@ -6109,8 +6400,10 @@ system:
   输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
   {"steps": [{"frame_class": <帧类名>, "brief": <一句话要点>}, ...]}
   字段说明：steps 恰为要求的步数，一步一项，按时间顺序排列；frame_class 必须取自 [帧类表] 中的帧类名；brief 用一句话写明该步内容要点，供逐帧实现展开。
-user:
+user:                                           ← cover_all=False（无档位表）
   请为一条「{sequence class name}」序列产出 {L} 步蓝图。
+user:                                           ← cover_all=True（v1.14，档位表在场）
+  请为一条「{sequence class name}」序列产出 {L} 步蓝图，且 [帧类表] 中每个帧类都至少出现一次。
 ```
 
 Module constants in `labelkit/operators/generate.py`, transcribed VERBATIM above and
@@ -6119,22 +6412,33 @@ Module constants in `labelkit/operators/generate.py`, transcribed VERBATIM above
 `_PLAN_SYSTEM_STATIC` = the four joined by `"\n"` — the template's FULL static system
 scaffolding (the class instruction and the frame class table are config quantities, metered
 separately by M1's static budget precheck, §6.3 rule 56).
+Both user lines are **[FROZEN HERE] VERBATIM**; the cover variant is v1.14's only template change
+and it is a pure ADDITION (with no tier table the emitted bytes are the v1.13 line exactly).
 `TEMPLATE_HEAD_TOKENS["generate_plan"] = 189 = est_text(_PLAN_SYSTEM_STATIC)` is pinned by the
-cross-layer equality test (§7.17). Assembly is
-`render_plan_prompt_texts(instruction, frame_classes, class_name, length) -> (system, user)`
-(public, §7.5); the four system parts join with `"\n"`, the frame-table rows join with `"\n"`
-inside the `[帧类表]` part. Binding notes:
+cross-layer equality test (§7.17) and is UNCHANGED in v1.14 — the cover sentence lives on the
+dynamic user line, not in the frozen static system scaffolding. Assembly is
+`render_plan_prompt_texts(instruction, frame_classes, class_name, length, cover_all=False)
+-> (system, user)` (public, §7.5); the four system parts join with `"\n"`, the frame-table rows
+join with `"\n"` inside the `[帧类表]` part. That signature now sits at FIVE parameters — the
+ceiling — so any further parameter must convert it to a parameter object. Binding notes:
 
 - The system section order is frozen: head → `[任务]` line → `[帧类表]` + rows → structure
-  block. The frame table is ALWAYS the whole table (the blueprint enum spans it — §6.3 rule 51
-  demands a generation instruction for every frame class precisely because any of them may be
-  picked).
+  block. **What goes into the frame table is CONDITIONAL (v1.14).** With no tier table it is the
+  WHOLE table, exactly as in v1.13 — the blueprint enum spans it, which is why §6.3 rule 51
+  demands a generation instruction for every frame class: any of them may be picked. With a tier
+  table declared it is the TIER's SUBSET (the frame class table filtered, in declaration order,
+  to that tier's `frame_classes`), the caller does the filtering, and rule 51's instruction
+  requirement correspondingly narrows to the UNION of the tiers' compositions.
 - On L0-off endpoints the structure block IS the structural guarantee, not a fallback: the
   `{"steps": [...]}` shape sentence plus the per-field explanation carry compliance (the
   DeepSeek anthropic route hard-rejects forced tool calls, so `supports_structured_output` is
-  false there — E2E-FINDINGS).
-- Response validated against `plan_schema(frame class names, L)` (§10.7) — internal treatment;
-  repair exhaustion voids THE SEQUENCE (no failed record, §7.5).
+  false there — E2E-FINDINGS). Under `cover_all` the user line's cover sentence is the same kind
+  of hard requirement for the coverage half of the constraint.
+- Response validated against `plan_schema(frame class names, L)` — `plan_schema(tier subset, L,
+  cover_all=True)` with a tier table (§10.7) — internal treatment; repair exhaustion voids THE
+  SEQUENCE (no failed record, §7.5). A coverage violation renders through `_render_error`'s
+  `contains` branch as `steps: missing required frame_class "<name>"` so the L3 repair prompt
+  names what is missing (§7.7).
 
 ### 10.15 M6 frame-realization prompt (spec 3.6.5, verbatim; v1.13)
 
@@ -6709,14 +7013,18 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       circular); the artifact is the FIFTH output channel `{output_stem}.stream.jsonl`,
       delivered in the main output's finalize batch under the shared `_undeliverable`
       discipline, never touched by dry-run (§7.10, spec §2.6's writable-object list gains its
-      fifth entry);
+      fifth entry). **v1.14 amendment (item 35):** the key set is RE-FROZEN with a conditional
+      `tier_rank` inserted after `sequence` and before `frame_class`; the "no post-assembly ids"
+      rule and the closed-set discipline are unchanged;
     - **draw-order table** (§7.5): one `Random(f"{seed}:0:generate")`, three phases —
       planning ①quota expansion in class-name lexicographic order (`--limit` truncates HERE)
       ②per-sequence length ③per-sequence (llm, style) with the noise batches drawn in the same
       predraw stream; dispatch consumes ZERO rng; weaving ④duplicate selection ⑤packing
       shuffle + pairwise crossing ⑥per-crossed-session switch points ⑦per-noise-frame draws
       ⑧duplicates as tail sessions (zero rng) ⑨timestamp laying. Test-pinned against drift;
-      determinism is conditional on the LLM content (voided sequences change the weave input);
+      determinism is conditional on the LLM content (voided sequences change the weave input).
+      **v1.14 amendment (item 35):** the table itself is UNCHANGED — tier apportionment (between
+      ① and ②) and the time-field back-fill coda (after ⑨) both consume ZERO rng;
     - **M8 treatment parameter** (§7.7): `user_treatment: bool | None = None` (since
       2026-08-14 a `CallScope` field rather than a standalone kwarg)
       — None keeps the pre-v1.13 `schema is None` inference (every pre-existing call
@@ -6742,7 +7050,10 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     - **observability** (§9.3): `report.generate.stream` (twelve counts-only keys, frozen key
       order) + `report.run.artifact` (path/sha256/lines, present only when written);
       `report.stream` does NOT appear; ZERO new trace channels, ZERO new events, ZERO new
-      error kinds (§8.1, spec §7.6) — voided sequences produce no StageError at all;
+      error kinds (§8.1, spec §7.6) — voided sequences produce no StageError at all.
+      **v1.14 amendment (item 35):** a THIRTEENTH key `tiers` joins that block CONDITIONALLY, at
+      the frozen position between `sequences` and `frames`, assembled explicitly by M10 (§7.9);
+      the other twelve keys, their order, and every zero-increment statement above are unchanged;
     - **zero-change anchors**: Stage contract exceptions (the rich return value is still the
       generate exception's "returns a new sub-batch" form, §4.3), the status machine, the
       `_meta` top-level key order, the four-route exclusivity, the rejects surface, and the
@@ -6771,5 +7082,60 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     - **re-frozen byte anchors**: the eight `tests/cli/goldens/dryrun-*.txt` files and the two
       `console_format` plain lines (progress line + final-summary header) are re-frozen onto
       the English strings; key sets, line structure and information content are unchanged.
+35. **帧类构成档位与时间字段回填冻结点** — v1.14 (feature spec
+    `docs/dev/SPEC-generation-tiers.md`, adjudications recorded by NAME — 档位即帧类构成 /
+    tier_rank 即档位身份 / 时间字段回填方向 / 零抽签配分 / 蓝图双向硬约束 / 构成恰等 /
+    档位标识三点落位 / 报表显式装配 / 真值键序重冻结 / 重发帧承源档与同源载荷 / 配分零额告警 /
+    语义词表四值 / 序内间隔口径 / 绑定即剔除 / 回填后计 id / 回填前钩子口径 /
+    观测零增量与冻结锚不动 / 静态预检上界照旧 / L0 待遇沿用 / 渲染缺类可见 / 微秒地板 /
+    指令必填域收窄; 2026-08-18). Two ORTHOGONAL mechanisms sharing one revision number, both
+    default-off. Key frozen points:
+    - **integer-domain apportionment** (§6.1 `apportion_tiers`): base =
+      `(sequences * weight) // Σweight`, remainder key = `(sequences * weight) % Σweight`,
+      +1 by descending remainder with ties broken by ASCENDING tier_rank. NO floating-point
+      intermediate is permitted — the tie verdict feeds in-class ordinal blocks → truth →
+      artifact bytes → member ids. The function lives in `model.py` (common), NOT in operators,
+      because M1's per-nonzero-quota-pair constraint and M6's planning phase share it and common
+      may not import operators; `tier_rank_for_ordinal` (§7.5, operators) is the prefix-sum
+      lookup, kept as a STANDALONE function so `expand_stream_quota`'s two-tuple return and its
+      three existing unpack assertions stay intact;
+    - **composition equality** (§10.7): `plan_schema(names, length, cover_all=False)` — True
+      appends `allOf` + one `contains` branch per name in the PASSED order; enum "⊆" ∧ contains
+      "⊇" ⇒ EQUALITY. `cover_all=False` is byte-identical to v1.13. The frozen internal-schema
+      keyword set grows by `allOf` / `contains` / `const`. `_render_error` gains a `contains`
+      branch rendering `steps: missing required frame_class "<name>"` (§7.7);
+    - **the blueprint template's conditional faces** (§10.14): the `[帧类表]` rows are the whole
+      table with no tier table and the TIER SUBSET with one; the user line has TWO verbatim
+      variants (plain / cover), the cover variant being v1.14's only template change and a pure
+      addition. `TEMPLATE_HEAD_TOKENS` is UNCHANGED (`generate_plan = 189`) — the cover sentence
+      is on the dynamic user line; `render_plan_prompt_texts` now sits at FIVE parameters, the
+      ceiling;
+    - **three landing points for the rank** (all conditional on a non-empty tier table):
+      `_meta.source.generator` becomes the three-key `{"llm", "style", "tier_rank"}` (§9.1),
+      the artifact `truth` gains `tier_rank` between `sequence` and `frame_class` (§9.5, the
+      item-33 re-freeze), and `report.generate.stream` gains `tiers` between `sequences` and
+      `frames` (§9.3) — the last one assembled EXPLICITLY from the declared tier table by M10
+      (§7.9), which is what makes zero-quota and fully-voided tiers appear with 0/0 rather than
+      vanish (the E2E-FINDINGS #11 family of trap, caught at the spec layer);
+    - **binding vocabulary and back-fill** (§6.1 `FrameClassView.time_fields`, §7.5): the FROZEN
+      four-word closed set `{ts, gap_prev_s, gap_next_s, elapsed_s}` with literal type equality
+      (`"string"` for `ts`, `"number"` for the rest); bound fields are STRIPPED from the
+      LLM-facing per-position schema AND its contract line (hierarchical copy — the shared
+      `FrameClassView.gen_schema` is never mutated); values are `round(·, 6)` INTRA-SEQUENCE
+      deltas with 0.0 first/last boundaries, written IN PLACE into the shared payload after ⑨ and
+      BEFORE assembly, so ids are computed over back-filled payloads and artifact replay stays
+      byte-identical; duplicate slots inherit by OBJECT IDENTITY (never walked, never touched);
+      the `sample_validator` and sequence-similarity hooks keep seeing PRE-back-fill payloads;
+    - **config surface** = §6.3 rules 57–60, plus the `_FRAME_CLASS_SECTION_KEYS["generate"]`
+      whitelist growing from three keys to four (`time_fields`) and rule 51's
+      instruction-required scope narrowing to the union of tier compositions;
+    - **v1.13 defect repair, not a switch face**: rule 59's `frame_gap_s.lo >= 1e-6` microsecond
+      floor — zero impact on any project with `lo >= 1e-6` (every example uses 5);
+    - **zero-change anchors**: the draw-order table (item 33's amendment), `estimate_run` and the
+      estimate line format, the EIGHT dry-run goldens (byte-frozen, example extension included),
+      the console key sets and panel rows, `TEMPLATE_HEAD_TOKENS`, `realize_schema`, trace
+      channels/events, §7.6 error kinds, the status machine, the Stage-contract exceptions and
+      the conservation identity. With both switches off the whole system is byte-equivalent to
+      v1.13 (rule 59 excepted, as a defect repair).
 
 — End of contract. —
