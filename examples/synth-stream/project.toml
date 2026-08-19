@@ -41,7 +41,7 @@
 #
 # ── 帧类构成档位（spec v1.14，[[generate.stream.tiers]]）────────────────────
 # 一个档位的定义**就是**该档序列的帧类构成集合——它不带任何质量指令、不管帧内部
-# 写得好不好（那归各帧类的生成指令与温度）。本工程两档：第 1 档只用
+# 写得好不好（那归各帧类的生成指令与温度）。全局表在本工程有两档：第 1 档只用
 # {task_request, followup} 两类，第 2 档用全三类。构成语义是**恰等**（蓝图 Schema
 # 的 enum 给「只能用这些类」、逐类 contains 给「每类至少一次」），因此每条序列的
 # _meta.stream.members[] 帧类集合恰等于其档声明的构成——档位身份可从数据直接反推
@@ -49,9 +49,34 @@
 # 档位序数（tier_rank）只是「第几档的要求」，工具不赋予高低任何质量方向语义，方向
 # 归你自己定；它在三处落地，同一个值三个面：主输出每行的
 # _meta.source.generator.tier_rank、工件行的 truth.tier_rank、报表的
-# report.generate.stream.tiers.<rank>.{planned, produced}。
-# --limit 在配额层做前缀截断，而类内序数按 tier_rank 升序占连续区间，故截断是从每
-# 个类的**最高档序数侧**截起（低档序数在前）。
+# report.generate.stream.tiers（形状见下段）。
+#
+# ── 按类档位表（spec v1.15，[[class.<name>.generate.tiers]]）───────────────
+# 序列类可以自带一张档位表，**整表原子取代**全局表（不逐行合并——行级合并会让 rank
+# 身份跨表漂移）。本工程 ticket_booking 声明了自己的两档（第 1 档
+# {task_request, followup} 权重 1、第 2 档 {task_request, confirmation} 权重 2 ⇒
+# 配额 3 配分 1 + 2），smart_home 不声明、回落全局表（权重 2 : 1 ⇒ 2 + 1）：两类的
+# 构成与权重方向都不同，这正是按类表的用武之地——购票类想要一档「确认帧直达、不带
+# 追问」的形态，全局表一张表根本表达不出来。
+# 全局表是**锚**：声明按类表要求全局表在场（缺了是 CONFIG_ERROR），故「档位面开没
+# 开」恒等于「全局表非空」，每个参与类恒有生效表，generator / truth / 报表三处的在
+# 场性不会逐行漂移。想让某个类「不分档」，给它一张单档表即可；写 tiers = [] 是显式
+# 空表，M1 拒收（指引删键回落）。
+# tier_rank 是**类内身份**：每张生效表各自连续覆盖 1..N，N 逐类可不同；跨类同 rank
+# 没有任何工具语义，跨类同构成也完全合法（各类都可以有自己的「全类档」）。所以读一
+# 行的档位必须连着它的类一起读——主输出行携 classification.label、工件行携
+# truth.sequence_class，与 tier_rank 同行相邻，行级消歧免费。
+# 报表随之两形：只有全局表时 report.generate.stream.tiers 是平面形
+# {"<rank>": {planned, produced}}；任一按类表在场即转**类嵌套形**
+# {"<class>": {"<rank>": {planned, produced}}}——外层是全部声明类按声明序、内层是该
+# 类生效表的 rank 升序，零配额类与全作废档一律呈现 0/0（显式装配，不靠计数器首触
+# 序）。本工程读作 ticket_booking 的 1 → 1 条、2 → 2 条，smart_home 的 1 → 2 条、
+# 2 → 1 条，两层各自求和都回到该类的 sequences = 3。
+# --limit 在配额层做前缀截断（类按类名字典序展开、类内按序数升序），而类内序数按
+# **本类生效表**的 rank 升序占连续区间，故截断落到哪个类身上，就从那个类的最高档序
+# 数侧截起。按类表在场时这笔账要逐类算：本工程 --limit 4 保住 smart_home 全 3 条
+# （rank 1 两条 + rank 2 一条），ticket_booking 只剩 rank 1 那一条，它的两条 rank 2
+# 序列全没了。
 #
 # ── 时间字段回填（spec v1.14，[frame.class.<name>.generate.time_fields]）────
 # 结构化帧的生成 Schema 里那些「时间语义」字段（本工程是 task_request 的 duration）
@@ -109,15 +134,17 @@ duplicates = 1                    # 原样重发 1 条序列（逐字节同源�
 frame_gap_s = [5, 60]             # 会话内帧间隔均匀采样（秒）；上界须 < stream.gap_s
 ts_start = "2026-01-05T09:00:00+08:00"   # 时间流起点（恒不取墙钟——双跑一致）
 
-# ── 档位表：一档 = 一种帧类构成（v1.14）───────────────────────────────────────
-# 配分：每类 sequences = 3，权重 2 : 1 按整数域最大余额法零抽签配分 ⇒ 2 + 1
-# （两个序列类各出 2 条一档序列、1 条二档序列），配分是 (sequences, 权重表) 的纯
-# 函数，不消费任何随机数。
-# 长度关系：len_range 下界 3 必须 ≥ 最大构成大小 3（第 2 档三类各至少出现一次，
-# 三步才装得下）——这是 M1 逐 (类, 档) 非零配额对的硬约束，把下界改成 2 会直接
-# CONFIG_ERROR 而不是悄悄产出缺类的序列。
+# ── 全局档位表：一档 = 一种帧类构成（v1.14）─────────────────────────────────
+# 双重身份：档位面的总开关，以及未声明按类表的序列类的回落表。本工程只有 smart_home
+# 吃它（ticket_booking 另有按类表，见 [[class.ticket_booking.generate.tiers]]）。
+# 配分：smart_home 的 sequences = 3 在权重 2 : 1 上按整数域最大余额法零抽签配分
+# ⇒ 2 + 1（2 条一档序列、1 条二档序列），配分是 (配额, 生效表) 的纯函数，不消费任何
+# 随机数。
+# 长度关系：len_range 下界 3 必须 ≥ **本类生效表**的最大构成大小（本表第 2 档三类各
+# 至少出现一次，三步才装得下）——这是 M1 逐 (类, 档) 非零配额对的硬约束，把下界改成
+# 2 会直接 CONFIG_ERROR 而不是悄悄产出缺类的序列。
 [[generate.stream.tiers]]
-tier_rank = 1                     # 档位身份（表内唯一、全表连续覆盖 1..N，无 name 键）
+tier_rank = 1                     # 档位身份（表内唯一、本表连续覆盖 1..N，无 name 键）
 weight = 2                        # 配额权重（整数 ≥ 1）
 frame_classes = ["task_request", "followup"]      # 该档序列恰用这两类
 
@@ -149,6 +176,23 @@ instruction = """
 """
 sequences = 3                     # 尝试配额（无输出条数保证，作废序列不补齐）
 len_range = [3, 5]                # 单序列步数的均匀采样区间
+
+# 按类档位表（v1.15）：整表取代全局表——本类的序列只在下面这两档里取构成，全局表对它
+# 完全不生效。与全局表的差别是双重的：构成不同（第 2 档走 {task_request, confirmation}
+# ——确认帧直达、不带追问；全局第 2 档则是全三类）、权重方向也相反（1 : 2 对全局的
+# 2 : 1）⇒ 同样的配额 3 配分成 1 + 2。
+# 本表最大构成大小是 2，≤ len_range 下界 3，逐 (类, 档) 非零配额对的长度约束照过；
+# 这两档的构成互异只需在**本表之内**成立，与全局表撞车完全合法（第 1 档正是与全局第
+# 1 档同构成的例子）。
+[[class.ticket_booking.generate.tiers]]
+tier_rank = 1                     # 类内身份：本表自己连续覆盖 1..2，与全局表的 rank 不可比
+weight = 1
+frame_classes = ["task_request", "followup"]
+
+[[class.ticket_booking.generate.tiers]]
+tier_rank = 2
+weight = 2
+frame_classes = ["task_request", "confirmation"]
 
 [class.smart_home.generate]
 instruction = """

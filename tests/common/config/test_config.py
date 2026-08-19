@@ -22,6 +22,7 @@ from labelkit.common.config.model import (
     GenerateStreamConfig,
     TierSpec,
     apportion_tiers,
+    effective_tiers,
 )
 from labelkit.common.errors import ConfigError
 
@@ -3414,3 +3415,29 @@ def test_apportionment_can_hand_a_tier_zero_and_stays_a_pure_function():
     assert apportion_tiers(0, tiers) == (0, 0)       # 不参与的类：逐档零额
     assert apportion_tiers(3, ()) == ()              # 档位面不在场
     assert apportion_tiers(3, tiers) == apportion_tiers(3, tiers)   # 零 rng
+
+
+# ── v1.15 按类档位表：载体缺省与 effective_tiers 三态（SPEC-per-class-tiers §3.1）─
+
+
+def test_class_view_tiers_default_is_absent(env):
+    # 载体缺省 = None（未声明 ⇒ 回落全局表）；零覆盖的类经 _inherit_class 亦得 None
+    body = ('[classify]\nenabled = true\nfallback_class = "other"\n'
+            '[[classify.classes]]\nname = "qa"\ndescription = "问答"\n'
+            '[[classify.classes]]\nname = "other"\ndescription = "其它"\n')
+    cfg = env.load(project_text=env.project(body=body))
+    assert set(cfg.class_views) == {"qa", "other"}
+    for view in cfg.class_views.values():
+        assert view.tiers is None
+
+
+def test_effective_tiers_covers_the_three_carrier_states():
+    # 裁决·表级原子覆盖：None = 回落全局整张表；非空 = 类表整表取代（不做行级合并）
+    glob = _tiers(2, 1)
+    own = (TierSpec(tier_rank=1, weight=7, frame_classes=("g",)),)
+    assert effective_tiers(None, glob) is glob
+    assert effective_tiers(own, glob) is own
+    assert effective_tiers(own, ()) is own
+    # 显式空表原样回传——拒收归 M1（rule 61③），查找点不替用户做决定
+    assert effective_tiers((), glob) == ()
+    assert effective_tiers(None, ()) == ()

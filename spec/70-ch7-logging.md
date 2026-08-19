@@ -64,6 +64,8 @@ command <cmd> failed: <message> (exit <n>)       # 未预期异常
 
 **v1.14 零增量声明（帧类构成档位与时间字段回填）**：两机制对本目录同样**零改动**——**零新通道**（通道枚举维持 11 值）、**零新事件**（不新增事件名，既有事件的 payload 亦不增键——档位面的全部观测经 `report.generate.stream.tiers` 承载、时间字段面零观测增量）、**零新错误 kind**（7.6 词表不动：蓝图覆盖违约是普通的 L2 违规，复用 `schema_violation` 进 M8 修复环，穷尽后复用既有的序列作废语义与 `plan_failures` 计数）。M1 侧新增的三条 WARN（配分零额、帧类未入档、绑定字段携带额外约束关键字）走既有的配置告警面（3.1.5），值-free 纪律不变——类名、帧类名、字段名与关键字名均为配置量而非数据内容。
 
+**v1.15 零增量声明（按类档位表）**：按类化对本目录同样**零改动**——**零新通道**（通道枚举维持 11 值）、**零新事件**（不新增事件名，既有事件的 payload 亦不增键：档位面的全部观测仍只经 `report.generate.stream.tiers` 承载，v1.15 改的是该子块的形状与其计数器键名，两者都不进事件目录）、**零新错误 kind**（7.6 词表不动）。M1 侧新增的按类表前提三子款（形态门 / 全局锚 / 空表拒收）走既有 CONFIG_ERROR 面，逐生效表化后的两条既有 WARN（配分零额、帧类未入档）走既有配置告警面（3.1.5），值-free 纪律不变——序列类名与帧类名同为配置量而非数据内容。
+
 † `reason` 仅当 `quality.judgment_reasons` 生效时存在（5.2）；`classify.decision` 的 `reason` 条件独立（v1.7）= `trace.enabled = true` 且 `trace.channels` 含 `"classify"`（零额外 token 原则，3.13.4 调用与校验行）；`segment.boundary` 的 `reason` 条件同款（v1.8）= `trace.enabled = true` 且 `trace.channels` 含 `"segment"`（对应窗口内部 Schema 的 with_reason 参数，零额外 token，3.14）。¶ `stitch.judge` / `stitch.thread` 的 `task_name` 与 `reason`（v1.9）无请求条件——`stitch_schema()` 恒含两键（判定量级小、votes 聚合需按多数簇取值，3.16.3），但作为 LLM 自由文本受 7.4 分级：`none` 档剥除、`refs` 档起携带（`task_name` 为 v1.9 新增自由文本键，7.4）。‡ / § 为 `extract.step` 的内容分档标记（v1.8，S27）：`description` 自 `"refs"` 档起、`target` / `value` 自 `"excerpt"` 档起携带（7.4）。全部自由文本字段（reason / critiques / violations 文本）受 7.4 脱敏档位控制。密钥相关事件（v1.6）只携环境变量**名**——密钥值在任何档位、任何通道均不落日志（7.4 规则不变）。
 
 ## 7.3 记录格式规范

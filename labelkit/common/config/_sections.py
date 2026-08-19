@@ -539,27 +539,32 @@ def _parse_classes(col: _Collector, file: str, raw: Any,
     return tuple(classes)
 
 
-def _parse_tiers(col: _Collector, file: str, raw: Any) -> tuple[TierSpec, ...]:
-    """v1.14: 解析 ``[[generate.stream.tiers]]`` 档位表数组(_parse_classes 同款形)。
+def _parse_tiers(col: _Collector, file: str, raw: Any,
+                 header: str) -> tuple[TierSpec, ...]:
+    """v1.14: 解析档位表数组(_parse_classes 同款形)。
 
     只做键级类型校验(三键的类型与下界); 身份连续性、构成互异与名集归属、逐非零配额对
     的长度可覆盖等结构约束留给形态约束簇。产物按 ``tier_rank`` 升序存放——
-    ``tiers[rank - 1]`` 直取是 M6 蓝图侧的取档方式。
+    ``tiers[rank - 1]`` 直取是 M6 蓝图侧的取档方式。v1.15(裁决·表级原子覆盖): 定位串
+    参数化, 同一实现同时服务全局表与 ``[[class.<name>.generate.tiers]]`` 按类表。
 
     @param col 错误聚合器
     @param file 报错定位用的 project.toml 路径字符串
-    @param raw ``[generate.stream].tiers`` 的原始值
+    @param raw 该档位表键的原始值
+    @param header 该表的表数组头, 如 ``"[[generate.stream.tiers]]"``; 键级定位串
+                  (整表形状错误用)由它派生为 ``"[<父节>].<键>"``
     @return 按 ``tier_rank`` 升序的 ``TierSpec`` 元组
     """
     if raw is _MISSING:
         return ()
     if not isinstance(raw, list):
-        col.error(f"{file}:[generate.stream].tiers: expected array of tables, "
+        parent, _, key = header.strip("[]").rpartition(".")
+        col.error(f"{file}:[{parent}].{key}: expected array of tables, "
                   f"got {_fmt(raw)}")
         return ()
     tiers: list[TierSpec] = []
     for i, sub in enumerate(raw, 1):
-        label = f"[[generate.stream.tiers]][{i}]"
+        label = f"{header}[{i}]"
         if not isinstance(sub, dict):
             col.error(f"{file}:{label}: expected table, got {_fmt(sub)}")
             continue
@@ -632,7 +637,8 @@ def _parse_generate_stream(col: _Collector, file: str, raw: Any) -> GenerateStre
         duplicates=t.get_int("duplicates", 0, minimum=0),
         frame_gap_s=_num_pair(t, "frame_gap_s", (5.0, 60.0)),
         ts_start=t.get_str("ts_start", _TS_START_DEFAULT, nonempty=True) or _TS_START_DEFAULT,
-        tiers=_parse_tiers(col, file, t.take("tiers")),          # v1.14 档位表
+        tiers=_parse_tiers(col, file, t.take("tiers"),           # v1.14 档位表
+                           "[[generate.stream.tiers]]"),
     )
     t.finish()
     return cfg

@@ -42,6 +42,9 @@
 | 31 | z.ai glm-5.2 接受 `allOf`/`contains` 作强制工具 input_schema | 实测记录 | ✅ 已确认（2026-08-18，L0 透传钉板） |
 | 32 | 工件重放判重档位的两分支现在都有实测：`exact` 与 `near_text` | 实测记录（第 27 条续） | 已记录（两分支并列叙述） |
 | 33 | v1.13 集成首例在真端点约 8 跑中偶发红一次 | 锐边记录（同第 6、26 条根因家族） | ⏸ 不改测试（处置理由见条目） |
+| 34 | v1.15 计数器键按类重冻结把 v1.14 集成第四例留成陈旧断言 | 测试适配（非偏差） | ✅ 已适配（2026-08-19） |
+| 35 | v1.15 验收当日 DeepSeek 端帧实现违约率抬头：6 跑中 5 跑各作废 1 条 | 实测记录（同第 26、33 条根因家族） | ⏸ 数据侧缓解（按设计处置） |
+| 36 | z.ai 账号周/月额度耗尽 ⇒ 两例 L0 透传钉板暂时无法执行 | 环境记录（非代码问题） | ⏸ 待额度重置后复跑 |
 
 ## P1 — 实现与规格的偏差
 
@@ -447,6 +450,41 @@ inode**，先启动进程 rename 交付的「主输出」实为后进程内容�
 **根因**：与第 26 条同源——服务端非确定性 + 生成对措辞极敏感，`temperature = 0.9` 下帧实现偶发违约；该用例把「零作废」写进断言，一旦命中即红。
 
 **处置（不改测试）与理由**：① 该断言正是这条锐边的**探针**——放宽为「允许作废」会让真正的回归（例如缩减 Schema 派生出错导致的系统性违约）无声通过，探针价值高于偶发红的成本；② 作废语义本身无缺陷：配额是**尝试配额**，作废序列不产 failed 记录、不进交织、守恒恒等式照常成立（第 26 条已确立）；③ 温度是两难旋钮，两端都有代价（低温 ⇒ 同类序列近重被相似度过滤淘汰，高温 ⇒ 帧实现违约），工具侧无案；④ 集成套件本就是**手动执行**的真端点面（离线套件从不触网），偶发红重跑即可，不进 CI 门禁。记录于此以免后来者把它当作新缺陷重新调查。
+
+### 34. v1.15 计数器键按类重冻结把 v1.14 集成第四例留成陈旧断言 —— ✅ 已适配（2026-08-19）
+
+**现象**：v1.15 生产代码与离线套件全绿（2005 passed）之后首次执行集成套件，v1.14 的档位例（`test_generate_stream_tiers_real_deepseek_composition_and_counters`）红在第一条断言：`ctx.metrics.counters.get("generate.stream.tiers.1.planned")` 取回 `None`，实际落账的键是 `generate.stream.tiers.ticket_booking.1.planned`。
+
+**根因**：裁决·计数器键按类重冻结把 M6 的喂数键从 `generate.stream.tiers.<rank>.*` 改成恒带类段的 `generate.stream.tiers.<class>.<rank>.*`（平面形报表改由编排器跨类求和装配）。离线套件里读这族键的用例随 Wave 1a 一并改了，**集成套件不在离线跑范围内**（`-m 'not integration'`），于是这条陈旧断言活到了 Wave 2。
+
+**处置**：按新键形修正该例的三处断言（单序列类 ⇒ 类段恒为 `ticket_booking`），并在其 docstring 里点明「M6 恒喂类段键、平面形由编排器跨类求和、嵌套形由新增的第七例钉住」。**不是产品缺陷**——报表的平面形数值与 v1.14 逐字节相等这一点由 `test_generate_stream_report_tiers_flat_form_sums_across_classes` 等离线用例钉住，本条只是测试面的滞后。教训归档：**改动被计数器键族时，集成套件与离线套件要一起搜**（`rg 'generate\.stream\.tiers'` 覆盖 `tests/` 全域，而不只是 `-m 'not integration'` 跑得到的那部分）。
+
+### 35. v1.15 验收当日 DeepSeek 端帧实现违约率抬头：6 跑中 5 跑各作废 1 条 —— ⏸ 数据侧缓解（第 26、33 条根因家族）
+
+**现象**：`examples/synth-stream` 验收当日连跑 6 次，其中 5 次各有 1 条序列在帧实现阶段作废（`realize_failures = 1`，`plan_failures` 恒 0），第 6 次干净（6/6）。作废落点不固定：`ticket_booking` 序数 2 两次、`smart_home` 序数 1 两次、`smart_home` 序数 2 一次。开 `trace`（channels `schema` + `llm`、content `full`）取到违约形态是 `schema.repair {"resolved_at": "rejected", "violations": ["/frames/0: type"]}`——该位契约要结构化帧对象，模型给了一句纯文本；修复环耗尽 ⇒ 整条作废。
+
+**根因与非根因**：根因与第 26 条同源（无 L0 端点 + `temperature = 0.9` + 逐位类型契约）。**明确排除按类档位表**：① 作废在两个序列类、三个不同序数上都出现过，不是「购票类二档那张按类表」的专属；② 违约位是 `/frames/0`（首帧类型），与档位构成无关——`plan_failures` 恒 0 说明蓝图侧的 `enum` + `contains` 覆盖约束全程无违约（第 30 条结论继续成立）；③ 干净那一跑的逐行构成对账 6/6 全通过（构成恰等，按类表与全局表各自生效）。当日违约率高于 v1.14 验收日，属服务端非确定性的日间波动，工具侧无案。
+
+**处置**：验收取干净那一跑作为手册主样本，把带 1 条作废的一跑保留为 `out-run1/`——它恰好是 `produced < planned` 在**类嵌套** `tiers` 下的真实读法样本（`ticket_booking` 的 `"2": {"planned": 2, "produced": 1}` 一眼定位到「确认直达」那一档）。手册第 27 章 27.5/27.9/27.10 均已声明「逐次运行掉 0～1 条是常态」，不把 6/6 写成保证。
+
+**同日集成侧的同族观测**：验收末轮全套复跑时，v1.15 按类档位例与 v1.13 基础例各遇一次**两条计划序列同时作废**（同样是 `call=realize kind=schema_violation violations=1`），触发两例共用的「至少一条幸存」哨兵断言（第 26 条先例，配额取 2 即为此容忍设计）；原样复跑五个 DeepSeek 例即全绿。这说明当日波动的幅度足以偶发吃掉两条，**容忍设计的下限是「不为 0」而非「必有幸存」**——集成例遇红先原样复跑一次再判，别当代码回归。
+
+### 36. z.ai 账号周/月额度耗尽 ⇒ 两例 L0 透传钉板暂时无法执行 —— ⏸ 待额度重置（环境记录）
+
+**现象**：v1.15 集成套件执行时，两个 z.ai 例（`test_realize_schema_prefixitems_passthrough_zai_structured_output`、`test_plan_schema_cover_all_passthrough_zai_structured_output`）稳定红在 `ProviderRetryableError: retries exhausted (2): HTTP 429 … [1310][Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-08-20 15:44:45]`。间隔重试两次，形态一致。
+
+**根因与处置**：**账号侧额度耗尽，不是代码问题**——两例是 v1.13/v1.14 的站立假设钉板（`prefixItems` 与 `allOf`/`contains` 随 L0 原样透传给供应商强制工具，第 31 条），v1.15 **零触碰**它们（既不改两个 Schema 构造器，也不改 L0 上行路径），SPEC-per-class-tiers §3.6 亦明记「z.ai `cover_all` L0 透传例保绿回归、无需新增」。工具侧的表现完全符合设计：429 走全抖动退避重试 → 预算耗尽 → `ProviderRetryableError`（`retry_after` 缺省时不做无界 park）。五个 DeepSeek 例（含 v1.15 新增的按类档位例）全绿，v1.15 的行为面因此有完整真端点覆盖。待额度重置后复跑这两例即可闭合。
+
+### 测试留痕（v1.15）
+
+| 套件 | 数量 | 备注 |
+|---|---|---|
+| 离线套件 | 2005 passed | v1.14 基线 1980；新增 25 例分布在 `test_loader_generate_stream.py`（rule 61 三子款正反例、白名单第七键、逐表身份连续性与跨类同构成、配额对吃生效表、并集化校验域、零额类结构校验不豁免、定位串带类名）、`test_generate_stream.py`（混合形态映射、`--limit` 逐类分块、蓝图取生效表档内子集、按类配分零 rng 钉板、同 seed 双跑字节一致、全缺省与 v1.14 等价）、`test_orchestrator.py`（平面形跨类求和、嵌套形双层键序、零配额类 0/0、混合触发谓词）、`test_config.py`（`ClassView.tiers` 默认 None、`effective_tiers` 三态） |
+| 集成套件（真端点） | 5 passed / 2 blocked | DeepSeek 五例全绿——v1.13 两例 + v1.14 两例 + **v1.15 新增按类档位一例**（混合形态：`ticket_booking` 自带单档表 `{task_request, confirmation}`、`smart_home` 回落全局两档表；断言逐行构成恰等吃**本行类**生效表、类段计数器落账、经生产装配器取到的嵌套 `tiers` 逐键对账含零额档 `0/0`、`generator.tier_rank` 与工件 `truth.tier_rank` 逐行一致）。v1.14 第四例的陈旧键断言按第 34 条修正；末轮复跑时两个 DeepSeek 例各遇一次全作废哨兵红、原样复跑即全绿（第 35 条同日观测）。两个 z.ai L0 透传例因账号额度耗尽暂无法执行（第 36 条，非代码问题） |
+| `examples/synth-stream` 真跑 | exit 0 | `counts.generated = emitted = 6`、`failed`/`dropped_*` 全 0；`generate.stream = {sessions 5, crossed_sessions 1, 两类各 planned 3/produced 3, tiers 类嵌套形 {ticket_booking: {"1": 1/1, "2": 2/2}, smart_home: {"1": 2/2, "2": 1/1}}, frames 23, noise_frames 2, duplicates 1, plan_calls 6, realize_calls 6, noise_calls 1, 三项 failures 0}`；`run.artifact.lines = 29`、`llm_usage.default.calls = 50`、`timing.wall_s = 70.311`；**逐行反推对账通过**——6 条序列的 `members[]` 帧类集合恰等于**本行序列类生效表**该 rank 的构成（购票二档两条均为 `{task_request, confirmation}`、智能家居二档一条为全三类，同 rank 两种构成），工件 29 行 `truth.tier_rank` 与 `generator.tier_rank` 逐行一致 |
+| 保留运行 `out-run1/` | exit 0 | `produced < planned` 在类嵌套 `tiers` 下的真实样本：1 条序列在帧实现作废（第 35 条）⇒ `ticket_booking {"1": 1/1, "2": 2/1}`、`smart_home {"1": 2/2, "2": 1/1}`、`crossed_sessions 0`、工件 25 行 |
+| 工件重放（process + segment） | exit 0 | 29 帧 → 6 会话 → 6 episodes、`absorbed 27`、`dropped_noise 2`、`dropped_dup 1`（本跑落 `exact`；**档位随分段判决浮动，两分支皆可能**，第 27、32 条）、`emitted 5`、`failed 0`、11 次调用 / 37.7 秒；23 个成员 id 与生成侧**逐个相同**，4/5 幸存 episode 的 id 与生成侧序列 id 恰等（对不上的那条是交叉会话整会话成段，其 id 恰等于生成侧的 `session_id`） |
+| dry-run golden | 八个**字节不动** | 按类档位零调用数变化 ⇒ `estimate_run` 零改动；示例扩展后 `dryrun-synth-stream.txt` 经 `cmp` 逐字节相等（`generate_calls=13`、`classify_calls=0`、`total=49`） |
 
 ### 测试留痕（v1.14）
 

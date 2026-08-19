@@ -30,6 +30,10 @@ tier_rank 升序占连续分块 ⇒ 每条序列的计划期定稿多带一个�
 子集 + ``cover_all`` 覆盖约束（enum 给「⊆」、contains 给「⊇」，合成构成恰等），档位序数
 落工件 truth、成员 ``ref.generator`` 与 ``report.generate.stream.tiers`` 三点。配分零 rng
 （抽签消费顺序表原文不动）；档位表缺省 ⇒ 三点全部不在场，与 v1.13 逐字节等价。
+v1.15（SPEC-per-class-tiers §3.2，``[[class.<name>.generate.tiers]]``）：取表点全部改经
+``effective_tiers``（按类表 ?? 全局表，表级原子覆盖），配分与序数分块逐类吃本类生效表；
+标识三点的装配面零改动，只有逐档计数器键改为类段形 ``…tiers.<类>.<档>.{planned,produced}``
+（平面报表由编排器跨类求和）。全局表恒为面开关（裁决·全局表为锚），故在场性判据不变。
 
 v1.14 时间字段面（SPEC-generation-tiers §3.3，``[frame.class.<name>.generate.time_fields]``
 在场时生效）：绑定的时间语义字段从 LLM 面向的逐位 Schema 与契约行中剔除
@@ -56,7 +60,7 @@ from typing import TYPE_CHECKING, Sequence
 
 from datasketch import MinHash, MinHashLSH
 
-from labelkit.common.config.model import apportion_tiers
+from labelkit.common.config.model import apportion_tiers, effective_tiers
 from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
@@ -934,7 +938,8 @@ def tier_rank_for_ordinal(sequences: int, tiers: "Sequence[TierSpec]",
 
     :param sequences: 该序列类的**全量**配额（``[class.<name>.generate].sequences``）；
         绝不能传 ``--limit`` 截断后的条数，否则分块会随截断漂移。
-    :param tiers: 按 tier_rank 升序存放的档位表；空 = 档位面不在场。
+    :param tiers: 该类的**生效**档位表（v1.15：``effective_tiers`` 的产物，按 tier_rank
+        升序存放）；空 = 档位面不在场。
     :param ordinal: 类内序数 0 基（= 工件 truth.sequence）。
     :returns: 该序数所属档的 tier_rank；档位表为空时 None。
     """
@@ -953,12 +958,15 @@ def plan_stream(cfg: "ResolvedConfig", rng: "random.Random") -> StreamPlan:
     ②逐序列 L = rng.randint(类有效 len_range) ③逐序列 (llm, style) 预抽——噪音批
     调用独立预抽，紧随序列预抽在同一 predraw 流内消费（round_robin 不耗 rng、
     weighted 逐位 rng.choices、styles 非空逐位 rng.choice；噪音批取全局 styles）。
-    v1.14 的档位赋值插在①与②之间，零 rng ⇒ 同 seed 下有无档位表的抽签流逐字节一致。
+    v1.14 的档位赋值插在①与②之间，零 rng ⇒ 同 seed 下有无档位表的抽签流逐字节一致；
+    v1.15 逐类改吃 ``effective_tiers``（按类表 ?? 全局表），仍是纯查表、零消费。
     """
     entries = expand_stream_quota(cfg)
-    tiers = cfg.generate_stream.tiers
-    ranks = [tier_rank_for_ordinal(cfg.class_views[name].generate.sequences,
-                                   tiers, ordinal) for name, ordinal in entries]
+    gs_tiers = cfg.generate_stream.tiers
+    ranks = [tier_rank_for_ordinal(
+        cfg.class_views[name].generate.sequences,
+        effective_tiers(cfg.class_views[name].tiers, gs_tiers), ordinal)
+        for name, ordinal in entries]
     lengths: list[int] = []
     for name, _ in entries:
         lo, hi = cfg.class_views[name].generate.len_range
@@ -1511,9 +1519,9 @@ class GenerateStage:
         for seq_plan in plan.sequences:
             ctx.metrics.count(
                 f"generate.stream.sequences.{seq_plan.class_name}.planned")
-            if seq_plan.tier_rank is not None:      # v1.14 逐档计划期计数
-                ctx.metrics.count(
-                    f"generate.stream.tiers.{seq_plan.tier_rank}.planned")
+            if seq_plan.tier_rank is not None:      # v1.14 逐档计划期计数（v1.15 类段键）
+                ctx.metrics.count(f"generate.stream.tiers.{seq_plan.class_name}"
+                                  f".{seq_plan.tier_rank}.planned")
         results = await asyncio.gather(
             *(self._stream_sequence_job(p, ctx) for p in plan.sequences),
             *(self._stream_noise_call(p, ctx) for p in plan.noise_plans))
@@ -1550,18 +1558,20 @@ class GenerateStage:
     def _plan_tier_face(self, plan: SequencePlan) -> tuple[tuple["ClassSpec", ...], bool]:
         """v1.14 蓝图调用的档位面（纯查表，零 rng）。
 
-        档位表在场 ⇒ 帧类表按声明序过滤出档内子集（档位表按 tier_rank 升序存放，
-        故 ``tiers[tier_rank - 1]`` 直取），并要求逐类覆盖；缺省 ⇒ 全表 + 不覆盖，
-        与 v1.13 逐字节一致。
+        档位表在场 ⇒ 帧类表按声明序过滤出档内子集（生效表按 tier_rank 升序存放且连续
+        覆盖 1..N，故 ``表[tier_rank - 1]`` 直取），并要求逐类覆盖；缺省 ⇒ 全表 + 不覆盖，
+        与 v1.13 逐字节一致。v1.15：取的是**本序列类的生效表**（按类表 ?? 全局表）。
 
         :param plan: 该序列的计划期定稿（携带档位序数）。
         :returns: (待渲染帧类表, 是否施加逐类覆盖约束)。
         """
-        classes = self._cfg.frame_classify.classes
+        cfg = self._cfg
+        classes = cfg.frame_classify.classes
         if plan.tier_rank is None:
             return tuple(classes), False
-        composition = set(self._cfg.generate_stream.tiers[plan.tier_rank - 1]
-                          .frame_classes)
+        table = effective_tiers(cfg.class_views[plan.class_name].tiers,
+                                cfg.generate_stream.tiers)
+        composition = set(table[plan.tier_rank - 1].frame_classes)
         return tuple(c for c in classes if c.name in composition), True
 
     async def _stream_plan_call(self, plan: SequencePlan,
@@ -1816,7 +1826,8 @@ class GenerateStage:
                               stats: "Mapping", ctx: "RunContext") -> None:
         """report.generate.stream 供数（counts-only；键集 = 裁决·观测面；planned
         已在计划期计数，本处补交织统计与按类 produced）。v1.14：逐档 produced 与按类
-        produced 同处计数，口径同为「最终进链的幸存序列」。"""
+        produced 同处计数，口径同为「最终进链的幸存序列」。v1.15（裁决·计数器键按类
+        重冻结）：逐档键恒带类段，平面报表由编排器跨类求和（单一喂数纪律，禁双写）。"""
         for key in ("sessions", "crossed_sessions", "frames", "noise_frames",
                     "duplicates"):
             if stats[key]:
@@ -1825,5 +1836,5 @@ class GenerateStage:
             ctx.metrics.count(
                 f"generate.stream.sequences.{seq.plan.class_name}.produced")
             if seq.plan.tier_rank is not None:
-                ctx.metrics.count(
-                    f"generate.stream.tiers.{seq.plan.tier_rank}.produced")
+                ctx.metrics.count(f"generate.stream.tiers.{seq.plan.class_name}"
+                                  f".{seq.plan.tier_rank}.produced")

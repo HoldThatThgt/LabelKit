@@ -1,22 +1,25 @@
-"""v1.13/v1.14 time-stream generation integration tests — REAL endpoints, no mocks.
+"""v1.13/v1.14/v1.15 time-stream generation integration tests — REAL endpoints, no mocks.
 
-SPEC-stream-generation.md §3.9 and SPEC-generation-tiers.md §3.7 integration
-rows. Two endpoints, by design:
+SPEC-stream-generation.md §3.9, SPEC-generation-tiers.md §3.7 and
+SPEC-per-class-tiers.md §3.6 integration rows. Two endpoints, by design:
 
-1./2./4./5. **DeepSeek** (``deepseek-v4-flash`` via api.deepseek.com/anthropic)
+1./2./4./5./7. **DeepSeek** (``deepseek-v4-flash`` via api.deepseek.com/anthropic)
    — the E2E face the stakeholder pinned for this feature (2026-08-13, carried
-   over to v1.14 on 2026-08-18). The route hard-rejects forced tool calls (400,
-   E2E-FINDINGS #24) ⇒ ``supports_structured_output = false`` ⇒ L0 is fully off
-   and the structural compliance of the blueprint / realize calls rests on the
-   two templates' embedded structure contracts, with the schema engine's L1
-   deterministic parse + L2 validation + L3 repair behind them. Case 1 drives
-   the whole ``generate_stream_all`` entry (one blueprint + one realize call for
-   a single two-to-three-step sequence, noise off) and pins the
+   over to v1.14 on 2026-08-18 and to v1.15 on 2026-08-19). The route hard-rejects
+   forced tool calls (400, E2E-FINDINGS #24) ⇒ ``supports_structured_output = false``
+   ⇒ L0 is fully off and the structural compliance of the blueprint / realize calls
+   rests on the two templates' embedded structure contracts, with the schema
+   engine's L1 deterministic parse + L2 validation + L3 repair behind them. Case 1
+   drives the whole ``generate_stream_all`` entry (one blueprint + one realize call
+   for a single two-to-three-step sequence, noise off) and pins the
    artifact/envelope contracts; case 2 drives ``annotate_record`` through a
    per-sequence-class annotation schema (裁决·按类标注 Schema); case 4 (v1.14)
    drives the same entry over a two-tier table and pins 裁决·构成恰等 on the
    surviving envelopes plus the per-rank counters; case 5 (v1.14) pins the
-   mechanical time-field backfill against the artifact's own timestamps.
+   mechanical time-field backfill against the artifact's own timestamps; case 7
+   (v1.15) drives the mixed per-class form (one class with its own table, one
+   falling back to the global one) and pins 裁决·表级原子覆盖 /
+   裁决·rank 类内身份 plus the class-nested report block.
 3./6. **z.ai** (``glm-5.2``) — the standing assumptions behind the two internal
    schema constructors under a vendor structured-output route (L0 on,
    ``supports_structured_output = true``): case 3 pins ``realize_schema``'s
@@ -27,7 +30,7 @@ Skips: the DeepSeek cases skip themselves when ``LABELKIT_DEEPSEEK_KEY`` is
 absent; the z.ai cases ride the conftest-wide ``LABELKIT_ZAI_KEY`` gate that
 skips every integration-marked test. Both variables are auto-loaded from the
 git-ignored repo-root ``.env`` by tests/conftest.py. Every case stays at
-temperature 0; the most expensive one (case 4) spends four real LLM calls.
+temperature 0; the most expensive ones (cases 4 and 7) spend four real LLM calls.
 """
 from __future__ import annotations
 
@@ -35,8 +38,10 @@ import hashlib
 import json
 import os
 import random
+from collections.abc import Mapping
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import jsonschema
 import pytest
@@ -67,6 +72,7 @@ from labelkit.common.config.model import (
     ToolConfig,
     TraceConfig,
     VerifyConfig,
+    effective_tiers,
 )
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import Record, RecordRef
@@ -83,6 +89,11 @@ from labelkit.operators.generate import (
     GenerateStage,
     canonical_json,
     render_plan_prompt_texts,
+)
+from labelkit.orchestration.orchestrator import (
+    Orchestrator,
+    RunServices,
+    _CounterView,
 )
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
@@ -194,6 +205,18 @@ TIMED_FOLLOWUP_INSTRUCTION = ("产出一句追问或修改：utterance 是用户
 NOISE_INSTRUCTION = ("生成与任何任务都无关的干扰输入：用户随口说的闲聊、感叹或跑题的"
                      "一句话，长度 5–20 字，不得包含任何可执行的诉求。")
 
+# ── v1.15 按类档位面（SPEC-per-class-tiers §3.1/§3.6）───────────────────────
+# 混合形态：ticket_booking 自带一张**单档**表，构成 {task_request, confirmation}
+# ——全局表里根本不存在的构成；smart_home 不声明、回落全局两档表。于是同一个
+# rank 1 在两类下是两种构成，这正是「表级原子覆盖 + rank 只是类内身份」的可判别面：
+# 取表点若误用全局表，ticket_booking 的帧里会冒出 followup、缺掉 confirmation。
+OWN_TIERS = (TierSpec(tier_rank=1, weight=1,
+                      frame_classes=("task_request", "confirmation")),)
+SMART_HOME_INSTRUCTION = (
+    "你在为智能家居场景合成真实用户与语音助手的一次指令序列。序列围绕同一个居家"
+    "场景展开：从一条设备控制指令开始，逐步追加或修改设备、房间、动作强度与定时"
+    "条件。要求口语化、中文、每帧一句话，前后帧信息连贯且有推进。")
+
 
 # ── fixtures: real profiles + a directly built ResolvedConfig (M1 shape) ────
 
@@ -219,16 +242,16 @@ def _zai_profile() -> LLMProfile:
         api_key=os.environ.get(ZAI_KEY_ENV, ""))
 
 
-def _class_view(name: str, *, sequences: int, schema=None,
-                len_range=(2, 3)) -> ClassView:
+def _class_view(name: str, *, sequences: int, schema=None, len_range=(2, 3),
+                instruction: str = CLASS_INSTRUCTION, tiers=None) -> ClassView:
     return ClassView(
         name=name, quality=QualityConfig(), rubric=Rubric(name="r", criteria=()),
         annotate=AnnotateConfig(enabled=True, llm="default",
                                 instruction=ANNOTATE_INSTRUCTION),
         generate=GenerateConfig(enabled=True, llms=("default",),
-                                instruction=CLASS_INSTRUCTION, temperature=0.0,
+                                instruction=instruction, temperature=0.0,
                                 sequences=sequences, len_range=len_range),
-        verify=VerifyConfig(), extract=ExtractConfig(), schema=schema)
+        verify=VerifyConfig(), extract=ExtractConfig(), schema=schema, tiers=tiers)
 
 
 def _frame_view(instruction: str, gen_schema=None,
@@ -314,6 +337,41 @@ def _timed_cfg() -> ResolvedConfig:
         generate_stream=replace(base.generate_stream, noise_ratio=0.5,
                                 duplicates=1,
                                 noise_instruction=NOISE_INSTRUCTION))
+
+
+def _per_class_tiers_cfg() -> ResolvedConfig:
+    """v1.15 按类档位面的最小真跑配置（examples/synth-stream 混合形态的缩微）：两个
+    序列类各 sequences = 1，ticket_booking 吃自带单档表、smart_home 回落全局两档表
+    （权重 1:1 × 配额 1 ⇒ 零抽签配分 (1, 0)，第 2 档零额 ⇒ 报表须呈 0/0）；
+    len_range = [3, 3]、噪音与重发全关 ⇒ 恰四次真实调用。"""
+    base = _cfg(_deepseek_profile())
+    views = dict(base.frame_class_views)
+    views["confirmation"] = _frame_view(CONFIRMATION_FRAME_INSTRUCTION)
+    return replace(
+        base,
+        classify=replace(base.classify, classes=(
+            ClassSpec(name="ticket_booking", description="高铁购票会话"),
+            ClassSpec(name="smart_home", description="智能家居指令会话"))),
+        class_views={
+            "ticket_booking": _class_view("ticket_booking", sequences=1,
+                                          len_range=(3, 3), tiers=OWN_TIERS),
+            "smart_home": _class_view("smart_home", sequences=1, len_range=(3, 3),
+                                      instruction=SMART_HOME_INSTRUCTION)},
+        frame_classify=replace(base.frame_classify,
+                               classes=FRAME_CLASSES + (CONFIRMATION,)),
+        frame_class_views=views,
+        generate_stream=replace(base.generate_stream, sessions=2, tiers=TIERS))
+
+
+def _assemble_report_tiers(cfg: ResolvedConfig, counters: Mapping) -> dict:
+    """经**生产装配器**取 ``report.generate.stream.tiers``（不在测试里复算一遍报表
+    逻辑，否则对账的是测试自己）。该方法只吃 cfg + 计数器快照，故编排器可裸装配：
+    算子表空、摄取器缺席、输出器只需一个可写 ``metrics`` 的鸭子对象。"""
+    services = RunServices(llm=None, schema_engine=None, metrics=None,
+                           run_id="integration",
+                           run_started_at=datetime.now(timezone.utc))
+    orch = Orchestrator(cfg, [], None, SimpleNamespace(), services)
+    return orch._report_stream_tiers(_CounterView(counters))
 
 
 class _RecordingMetrics:
@@ -492,6 +550,10 @@ async def test_generate_stream_tiers_real_deepseek_composition_and_counters():
     """档位真跑：**幸存**序列的 members[] 帧类真值集合恰等于其档声明的构成
     （enum 给「⊆」、contains 给「⊇」），逐档 planned/produced 如实落账。
 
+    v1.15（裁决·计数器键按类重冻结）：M6 恒喂**类段**键
+    ``generate.stream.tiers.<class>.<rank>.{planned,produced}``；本例单序列类，
+    平面形报表由编排器跨类求和装配（案例七钉嵌套形）。
+
     作废容忍（E2E-FINDINGS 第 26 条先例）：断言只压幸存面并要求至少一条幸存——
     L0 关端点上蓝图或帧实现偶发违约，按既有 plan_failures / realize_failures 作废
     并让该序列缺席，不是本用例要钉的行为。
@@ -502,8 +564,10 @@ async def test_generate_stream_tiers_real_deepseek_composition_and_counters():
     product = await GenerateStage(cfg).generate_stream_all(ctx)   # 4 real calls
 
     # 计划期逐档落账：零抽签配分（sequences = 2、权重 1:1）⇒ 每档恰一条
-    assert ctx.metrics.counters.get("generate.stream.tiers.1.planned") == 1
-    assert ctx.metrics.counters.get("generate.stream.tiers.2.planned") == 1
+    assert ctx.metrics.counters.get(
+        "generate.stream.tiers.ticket_booking.1.planned") == 1
+    assert ctx.metrics.counters.get(
+        "generate.stream.tiers.ticket_booking.2.planned") == 1
     assert product.envelopes, "两条计划序列全部作废，档位面无从断言"
 
     produced: dict[int, int] = {}
@@ -518,7 +582,8 @@ async def test_generate_stream_tiers_real_deepseek_composition_and_counters():
         assert labels == TIER_COMPOSITION[rank]     # 裁决·构成恰等
         produced[rank] = produced.get(rank, 0) + 1
     for rank, count in produced.items():
-        assert ctx.metrics.counters[f"generate.stream.tiers.{rank}.produced"] == count
+        assert ctx.metrics.counters[
+            f"generate.stream.tiers.ticket_booking.{rank}.produced"] == count
     assert sum(produced.values()) == len(product.envelopes) <= 2
 
     # 工件面：truth 键序冻结（tier_rank 在 sequence 之后、frame_class 之前），
@@ -646,3 +711,78 @@ async def test_plan_schema_cover_all_passthrough_zai_structured_output():
     jsonschema.Draft202012Validator(schema).validate(obj)
     assert attempts >= 1 and model
     assert usage.prompt_tokens > 0 and usage.completion_tokens > 0
+
+
+# ── 7. DeepSeek: v1.15 按类档位表（裁决·表级原子覆盖 + 裁决·rank 类内身份）──
+
+@needs_deepseek
+async def test_generate_stream_per_class_tiers_real_deepseek():
+    """按类档位表真跑，混合形态（一类自带表 / 一类回落全局表）：每条**幸存**序列的
+    帧类构成恰等于**本行序列类生效表**里该 rank 的构成。两类的 rank 1 构成刻意不同
+    （ticket_booking 走自带表的 {task_request, confirmation}、smart_home 走全局表的
+    {task_request, followup}），故取表点若误用全局表，蓝图当场产出错类的帧。
+
+    另钉两面：报表 ``tiers`` 转类嵌套形（外层声明序、内层该类生效表 rank 升序、
+    零额档 0/0 在场），``generator.tier_rank`` 与工件 ``truth.tier_rank`` 逐行一致。
+
+    作废容忍同案例四/五：断言只压幸存面并要求至少一条幸存。
+    """
+    cfg = _per_class_tiers_cfg()
+    ctx = _ctx(cfg)
+
+    product = await GenerateStage(cfg).generate_stream_all(ctx)   # 4 real calls
+
+    # 生效表（按类表 ?? 全局表）—— 断言的对账基准，逐类各取各的
+    composition = {
+        name: {spec.tier_rank: set(spec.frame_classes)
+               for spec in effective_tiers(view.tiers, cfg.generate_stream.tiers)}
+        for name, view in cfg.class_views.items()}
+    assert composition["ticket_booking"] == {1: {"task_request", "confirmation"}}
+    assert composition["smart_home"] == {
+        1: {"task_request", "followup"},
+        2: {"task_request", "followup", "confirmation"}}
+
+    # 计划期逐类落账（计数器键含类段）：配额 1 在各自生效表上都只投第 1 档
+    counters = ctx.metrics.counters
+    assert counters.get("generate.stream.tiers.ticket_booking.1.planned") == 1
+    assert counters.get("generate.stream.tiers.smart_home.1.planned") == 1
+    assert "generate.stream.tiers.smart_home.2.planned" not in counters
+    assert product.envelopes, "两条计划序列全部作废，按类档位面无从断言"
+
+    # ── 逐行构成恰等：吃的是本行**序列类**的生效表 ──
+    produced: dict[tuple[str, int], int] = {}
+    for item in product.envelopes:
+        label = item.classification.label
+        ranks = {member.ref.generator["tier_rank"] for member in item.record.members}
+        assert len(ranks) == 1                      # 一条序列恒属一档
+        rank = ranks.pop()
+        assert len(item.record.members) == 3        # len_range = [3, 3]
+        labels = {item.member_classifications[member.id].label
+                  for member in item.record.members}
+        assert labels == composition[label][rank]   # 裁决·构成恰等（按本类生效表）
+        produced[(label, rank)] = produced.get((label, rank), 0) + 1
+    for (label, rank), count in produced.items():
+        assert counters[f"generate.stream.tiers.{label}.{rank}.produced"] == count
+
+    # ── 工件面：truth 逐行自洽，且与 generator.tier_rank 同值（噪音/重发全关 ⇒
+    # 每一行都是某条幸存序列的成员行，行对象反算即得其成员 id）──
+    members = {member.id: member
+               for item in product.envelopes for member in item.record.members}
+    assert len(product.artifact_lines) == len(members)
+    for row in map(json.loads, product.artifact_lines):
+        truth = row["truth"]
+        assert (truth["frame_class"]
+                in composition[truth["sequence_class"]][truth["tier_rank"]])
+        member = members[hashlib.sha256(
+            canonical_json(row).encode("utf-8")).hexdigest()[:16]]
+        assert member.ref.generator["tier_rank"] == truth["tier_rank"]
+
+    # ── 报表：任一按类表在场即转类嵌套形，逐键对账（走生产装配器）──
+    tiers_block = _assemble_report_tiers(cfg, counters)
+    assert list(tiers_block) == ["ticket_booking", "smart_home"]   # 类表声明序
+    assert list(tiers_block["ticket_booking"]) == ["1"]            # 自带表：单档
+    assert list(tiers_block["smart_home"]) == ["1", "2"]           # 回落表：两档
+    assert tiers_block["smart_home"]["2"] == {"planned": 0, "produced": 0}
+    for label in ("ticket_booking", "smart_home"):
+        assert tiers_block[label]["1"] == {
+            "planned": 1, "produced": produced.get((label, 1), 0)}

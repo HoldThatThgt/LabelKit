@@ -7,6 +7,12 @@ forbidden-key probes, packing consistency, the weaving caps, the parked-section
 waivers, the classify.llm reference-set waiver, the S29 empty-selector
 extension, the per-class annotate Schema surface (which is form-INDEPENDENT)
 and the frame-class generate Schema surface. Pure config logic — zero LLM.
+
+v1.14 adds the tier table and the time-field binding cluster; v1.15
+(SPEC-per-class-tiers.md §3.1) adds the per-class tier table
+[[class.<name>.generate.tiers]]: rule 61's three sub-clauses, the per-effective-
+table identity/composition checks, the per-class quota pairs and the union-scoped
+frame-class checks.
 """
 from __future__ import annotations
 
@@ -672,11 +678,12 @@ def test_class_annotate_schema_keys_are_whitelisted(env):
 
 
 def test_class_generate_quota_keys_are_whitelisted(env):
+    # v1.15: 白名单第七键 tiers 入列（正例见按类档位表一节）
     errors = env.errors(project_text=env.project(
         body=CLASSIFY_TWO + "\n[class.qa.generate]\nsequence_count = 3\n"))
     has(errors, "[class.qa.generate].sequence_count: [class.*.generate] cannot override this "
                 "key (whitelist: instruction, styles, num_per_record, temperature, sequences, "
-                "len_range)")
+                "len_range, tiers)")
 
 
 def test_forbidden_generate_key_probe_skips_classes_without_a_generate_table(env):
@@ -1160,6 +1167,231 @@ def test_frame_gap_lower_bound_has_a_microsecond_floor(env):
     generate_ok = GS_GENERATE.replace("frame_gap_s = [5, 60]", "frame_gap_s = [0.000001, 60]")
     cfg = env.load(project_text=gs_project(env, gs_body(generate=generate_ok)))
     assert cfg.generate_stream.frame_gap_s == (1e-06, 60.0)
+
+
+# ── v1.15 按类档位表（[[class.<name>.generate.tiers]]；SPEC-per-class-tiers §3.1）─
+
+GS_CLASSIFY2 = GS_CLASSIFY + """
+[[classify.classes]]
+name = "smart_home"
+description = "智能家居控制序列"
+"""
+
+SMART_HOME = """
+[class.smart_home.generate]
+instruction = "生成一段智能家居控制的用户请求序列"
+sequences = 3
+len_range = [3, 5]
+"""
+
+# 教学面（SPEC §3.5）：整表原子覆盖 + 构成与权重双差异（权重方向与全局表相反）
+OWN_TIERS = ((1, 1, ("task_request", "followup")),
+             (2, 2, ("task_request", "confirmation")))
+
+
+def per_class_tiers(rows=OWN_TIERS, cname: str = "ticket_booking") -> str:
+    """``[[class.<name>.generate.tiers]]`` 片段：逐行 (tier_rank, weight, 构成)。"""
+    return "".join(
+        f"\n[[class.{cname}.generate.tiers]]\ntier_rank = {rank}\nweight = {weight}\n"
+        f"frame_classes = {json.dumps(list(names))}\n"
+        for rank, weight, names in rows)
+
+
+def mixed_body(*, own=OWN_TIERS, tiers: str = TIERS, generate: str = GS_GENERATE,
+               smart_home: str = SMART_HOME, frames: str = GS_FRAMES3) -> str:
+    """混合形态基线：ticket_booking 声明按类表、smart_home 回落全局表（各 3 条配额）。
+
+    sessions 抬到 3 以满足 sessions <= Σsequences(6) <= 2 × sessions。
+    """
+    generate = generate.replace("sessions = 2", "sessions = 3") + smart_home
+    own_toml = per_class_tiers(own) if own else ""
+    return gs_body(classify=GS_CLASSIFY2, generate=generate + tiers + own_toml,
+                   frames=frames)
+
+
+def test_per_class_tier_table_overrides_the_global_one_atomically(env, capsys):
+    cfg = env.load(project_text=gs_project(env, mixed_body()))
+    assert cfg.class_views["ticket_booking"].tiers == (
+        TierSpec(tier_rank=1, weight=1, frame_classes=("task_request", "followup")),
+        TierSpec(tier_rank=2, weight=2,
+                 frame_classes=("task_request", "confirmation")))
+    assert cfg.class_views["smart_home"].tiers is None       # 未声明 ⇒ 回落全局
+    assert cfg.generate_stream.tiers[1].frame_classes == (   # 全局表不被污染
+        "task_request", "followup", "confirmation")
+    assert "unknown key" not in capsys.readouterr().err      # 白名单第七键正例
+
+
+def test_per_class_tier_table_is_stored_by_ascending_rank(env):
+    # 生效表也走 tiers[rank - 1] 直取 ⇒ 存放序由 rank 定，而非书写序
+    shuffled = tuple(reversed(OWN_TIERS))
+    cfg = env.load(project_text=gs_project(env, mixed_body(own=shuffled)))
+    tiers = cfg.class_views["ticket_booking"].tiers
+    assert [t.tier_rank for t in tiers] == [1, 2]
+    assert [t.weight for t in tiers] == [1, 2]
+
+
+def test_per_class_tier_table_requires_the_time_stream_form(env):
+    # rule 61①（parked 探针）：形态关闭时任何 [class.*.generate] 含 tiers 键即定向报错
+    body = CLASSIFY_TWO + per_class_tiers(cname="qa")
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[class.qa.generate].tiers: the per-class tier table is only legal in the "
+                "time-stream generation form ([generate.stream].enabled = true) - it "
+                "overrides the global [[generate.stream.tiers]] table for sequences of "
+                "this class")
+
+
+def test_per_class_premise_probe_is_independent_of_the_parse(env):
+    # 探针走原始节：表内容非法（解析产物为空）也要照发前提错误
+    body = CLASSIFY_TWO + per_class_tiers(((0, 1, ("task_request",)),), cname="qa")
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[class.qa.generate].tiers: the per-class tier table is only legal in the "
+                "time-stream generation form")
+    has(errors, "[[class.qa.generate.tiers]][1].tier_rank: expected positive integer, got 0")
+
+
+def test_per_class_tier_table_requires_the_global_anchor(env):
+    # rule 61②：全局表是面开关兼未声明类的回落，缺席即 CONFIG_ERROR
+    errors = env.errors(project_text=gs_project(env, mixed_body(tiers="")))
+    has(errors, "[class.ticket_booking.generate].tiers: a per-class tier table overrides "
+                "the global [[generate.stream.tiers]] table, which is absent - declare the "
+                "global table (it is the fallback for classes without their own table and "
+                "the switch of the whole tier face)")
+
+
+def test_per_class_empty_tier_table_is_rejected(env):
+    # rule 61③：显式空表在面统一下没有合法语义（"本类无档"态不存在）
+    generate = GS_GENERATE + "tiers = []\n"
+    errors = env.errors(project_text=gs_project(env, tier_body(generate=generate)))
+    has(errors, "[class.ticket_booking.generate].tiers: expected a non-empty array of tier "
+                "tables - omit the key to fall back to the global "
+                "[[generate.stream.tiers]] table")
+
+
+def test_per_class_tier_table_shape_errors_name_the_class(env):
+    # 定位串参数化：整表形状错误落键级定位 [class.<name>.generate].tiers，
+    # 行级错误落该表的表数组头（用户写的就是这个头）
+    generate = GS_GENERATE + "tiers = 3\n"
+    errors = env.errors(project_text=gs_project(env, tier_body(generate=generate)))
+    has(errors, "[class.ticket_booking.generate].tiers: expected array of tables, got 3")
+    generate = GS_GENERATE + 'tiers = ["x"]\n'
+    errors = env.errors(project_text=gs_project(env, tier_body(generate=generate)))
+    has(errors, '[[class.ticket_booking.generate.tiers]][1]: expected table, got "x"')
+
+
+def test_rule_61_sub_clauses_2_and_3_are_mutually_exclusive(env):
+    # rule 61②/③ 互斥（实现期裁决 2026-08-19）：同一个键一条错误一个修复动作——
+    # 空表的修复动作（删键）与锚缺失的修复动作（补全局表）不同，叠报会误导
+    generate = GS_GENERATE + "tiers = []\n"
+    errors = env.errors(project_text=gs_project(env, tier_body("", generate=generate)))
+    has(errors, "[class.ticket_booking.generate].tiers: expected a non-empty array of tier "
+                "tables - omit the key to fall back to the global "
+                "[[generate.stream.tiers]] table")
+    assert not any("which is absent" in e for e in errors)
+
+
+def test_a_shape_failed_per_class_table_lands_as_undeclared(env):
+    # 形状错误（非数组）已在解析层报出且修复动作明确——按未声明落库，
+    # rule 61 的空表错与锚错都不叠报（全局表缺席也不报锚错）
+    generate = GS_GENERATE + "tiers = 3\n"
+    errors = env.errors(project_text=gs_project(env, tier_body("", generate=generate)))
+    has(errors, "[class.ticket_booking.generate].tiers: expected array of tables, got 3")
+    assert not any("non-empty array of tier tables" in e for e in errors)
+    assert not any("which is absent" in e for e in errors)
+
+
+def test_each_effective_table_covers_1_to_n_on_its_own(env):
+    # 裁决·rank 类内身份：每张生效表各自连续覆盖 1..N，N 可逐类不同
+    cfg = env.load(project_text=gs_project(
+        env, mixed_body(own=((1, 1, ("task_request", "followup")),))))
+    assert [t.tier_rank for t in cfg.class_views["ticket_booking"].tiers] == [1]
+    assert [t.tier_rank for t in cfg.generate_stream.tiers] == [1, 2]
+    # 反例：按类表自己缺号（定位串带类名）
+    gapped = ((1, 1, ("task_request", "followup")),
+              (3, 2, ("task_request", "confirmation")))
+    errors = env.errors(project_text=gs_project(env, mixed_body(own=gapped)))
+    has(errors, "[class.ticket_booking.generate].tiers.tier_rank: tier ranks must be unique "
+                "and cover 1..N contiguously (N = 2 = the number of tiers; the rank is the "
+                "identity of a tier, there is no name key), got [1, 3]")
+
+
+def test_same_composition_is_legal_across_tables_but_not_within_one(env):
+    # 跨类同构成合法（各类都可有自己的「全类档」）——基线按类表第 1 档就与全局第 1 档同构成
+    cfg = env.load(project_text=gs_project(env, mixed_body()))
+    assert (cfg.class_views["ticket_booking"].tiers[0].frame_classes
+            == cfg.generate_stream.tiers[0].frame_classes)
+    # 单表之内照旧两两互异（构成是集合：书写序不同、集合相同即语义重复）
+    dup = ((1, 1, ("task_request", "followup")),
+           (2, 2, ("followup", "task_request")))
+    errors = env.errors(project_text=gs_project(env, mixed_body(own=dup)))
+    has(errors, "[class.ticket_booking.generate].tiers(tier_rank = 2).frame_classes: the "
+                "composition is identical to the one of tier_rank = 1 - two tiers with the "
+                "same frame-class set are semantically duplicates")
+
+
+def test_quota_pairs_read_the_effective_table_of_each_class(env):
+    # 下界裁定吃本类生效表：按类表第 2 档构成 3 类 vs 本类下界 2 ⇒ 错误指向声明类；
+    # 回落全局表的 smart_home（下界 3）不受牵连
+    own = ((1, 1, ("task_request", "followup")),
+           (2, 2, ("task_request", "followup", "confirmation")))
+    generate = GS_GENERATE.replace("len_range = [3, 5]", "len_range = [2, 5]")
+    errors = env.errors(project_text=gs_project(
+        env, mixed_body(own=own, generate=generate)))
+    has(errors, "[class.ticket_booking.generate].len_range: the lower bound must be >= the "
+                "composition size of every tier this class draws from (tier_rank = 2 "
+                "declares 3 frame classes and is apportioned 2 of the 3 sequences, and each "
+                "of them must appear at least once), got lower bound 2")
+    assert not any("[class.smart_home.generate].len_range" in e for e in errors)
+
+
+def test_zero_quota_warning_lists_the_weights_of_the_effective_table(env, capsys):
+    # 按类权重悬殊：3 条按 (5, 1) 最大余额法配分 = (3, 0) ⇒ 本类第 2 档零额；
+    # 回落全局表的 smart_home 按 (2, 1) 配成 (2, 1)，无零额
+    own = ((1, 5, ("task_request", "followup")),
+           (2, 1, ("task_request", "confirmation")))
+    env.load(project_text=gs_project(env, mixed_body(own=own)))
+    err = capsys.readouterr().err
+    assert ('[[generate.stream.tiers]]: class "ticket_booking" apportions 0 sequences to '
+            "tier_rank = 2" in err)
+    assert "weights tier_rank 1: weight 5, tier_rank 2: weight 1" in err
+    assert "smart_home" not in err
+
+
+def test_dead_config_domain_is_the_union_of_the_effective_tables(env, capsys):
+    # 裁决·校验域并集化：两类都声明按类表 ⇒ 全局表沦为纯锚，其独有帧类判死配置
+    # （连生成指令都不必写），检查域精确反映"哪些帧类真会被蓝图选中"
+    frames = GS_FRAMES + """
+[[frame.classify.classes]]
+name = "confirmation"
+description = "确认下单的收尾帧"
+"""
+    own = ((1, 1, ("task_request", "followup")),)
+    body = mixed_body(own=own, frames=frames,
+                      smart_home=SMART_HOME + per_class_tiers(own, "smart_home"))
+    cfg = env.load(project_text=gs_project(env, body))
+    assert cfg.frame_class_views["confirmation"].gen_instruction is None
+    assert ('[frame.class.confirmation.generate]: frame class "confirmation" is in no tier '
+            "composition, so it can never be picked by a blueprint" in capsys.readouterr().err)
+    # 反证：只要**某个**参与类的生效表收了它，指令就重新必填
+    own_cf = ((1, 1, ("task_request", "confirmation")),)
+    errors = env.errors(project_text=gs_project(
+        env, mixed_body(own=own_cf, frames=frames,
+                        smart_home=SMART_HOME + per_class_tiers(own, "smart_home"))))
+    has(errors, "[frame.class.confirmation.generate].instruction: every frame class must "
+                "provide a non-empty generation instruction (the blueprint enum covers the "
+                "union of the tier compositions, so any frame class of a tier may be picked)")
+
+
+def test_a_zero_quota_class_still_gets_its_table_structurally_checked(env, capsys):
+    # 裁决·零额结构校验不豁免：坏配置早报，但配额对与零额 WARN 照旧豁免
+    zero = SMART_HOME.replace("sequences = 3", "sequences = 0")
+    ghost = ((1, 1, ("task_request", "ghost")),)
+    errors = env.errors(project_text=gs_project(env, mixed_body(
+        smart_home=zero + per_class_tiers(ghost, "smart_home"))))
+    has(errors, '[class.smart_home.generate].tiers(tier_rank = 1).frame_classes: frame class '
+                'name "ghost" is not in [[frame.classify.classes]], available: task_request, '
+                "followup, confirmation")
+    assert not any("[class.smart_home.generate].len_range" in e for e in errors)
+    assert 'class "smart_home" apportions 0 sequences' not in capsys.readouterr().err
 
 
 # ── v1.14 时间字段绑定表（[frame.class.<name>.generate.time_fields]）──────────

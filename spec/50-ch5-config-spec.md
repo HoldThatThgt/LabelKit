@@ -192,7 +192,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `generate.seed_examples` | array | [] | generate_only 专用（process 模式不得设置，3.1.4）：字符串数组种子池，非空即种子池形态（3.6.2）。 |
 | `generate.standalone_count` | int | 无 | generate_only 无种子形态必填（与 seed_examples 互斥）：目标产出条数，调用数 = ⌈standalone_count / num_per_call⌉。 |
 | `generate.sequences` | int | 0 | v1.13 新增（时间流形态）：序列**尝试配额**的全局默认，按类经 `[class.<name>.generate].sequences` 覆盖；0 = 该类不参与生成。M1 要求 `Σsequences ≥ 1`（各类有效值求和，3.1.4 时间流生成行）。语义同 `standalone_count`——**尝试**配额，无输出条数保证、无补齐回路（8.3 O6 辖区）。 |
-| `generate.len_range` | array | [3, 6] | v1.13 新增（时间流形态）：单序列步数的均匀采样区间 `[lo, hi]`（整数，`1 ≤ lo ≤ hi`），按类可覆盖；逐序列 `L = randint(lo, hi)`（计划期第②步抽签，3.6.5）。织造上限：`2 × max(各类 hi) ≤ stream.session_max_len`（M1 校验）。**v1.14 长度可覆盖交叉引用**：档位表在场时，逐 (参与类, 档) **非零配额对**另须满足 `lo ≥ len(该档 frame_classes)`（档内每类至少出现一次，步数不足即装不下；零额对豁免——见下方 `[[generate.stream.tiers]]` 表与 3.1.4）。 |
+| `generate.len_range` | array | [3, 6] | v1.13 新增（时间流形态）：单序列步数的均匀采样区间 `[lo, hi]`（整数，`1 ≤ lo ≤ hi`），按类可覆盖；逐序列 `L = randint(lo, hi)`（计划期第②步抽签，3.6.5）。织造上限：`2 × max(各类 hi) ≤ stream.session_max_len`（M1 校验）。**v1.14 长度可覆盖交叉引用**（v1.15 措辞按类化）：档位表在场时，逐 (参与类, 档) **非零配额对**另须满足 `lo ≥ len(该档 frame_classes)`——其中「档」取自**本类生效表**（`[[class.<name>.generate.tiers]]` 声明了就用它，否则回落全局 `[[generate.stream.tiers]]`）；档内每类至少出现一次，步数不足即装不下，零额对豁免（见下方两节档位表与 3.1.4）。 |
 | `generate.stream.enabled` | bool | false | v1.13 新增：**时间流生成形态**总开关（generate_only 第三形态，M6，3.6.5）。默认关——全关时全系统与 v1.12 **字节等价**（含七个既有 dry-run golden）。启用要求（M1 硬合取，3.1.4 时间流生成行）：`run.mode="generate_only"` ∧ `run.modality="text"` ∧ `generate.enabled` ∧ `classify.enabled` ∧ `stream.order_by="meta:<字段>"` ∧ `output.meta_mode != "none"`；与 `frame.classify.enabled` / `frame.annotate.enabled` **互斥**（帧类真值在蓝图层已知，定向 CONFIG_ERROR）。 |
 | `generate.stream.sessions` | int | 0 | v1.13：会话数（≥ 1）。交叉会话数 = `Σsequences − sessions`，故 M1 要求 `sessions ≤ Σsequences ≤ 2 × sessions`（交叉并发度恒 k ∈ {1,2}；更高并发度列 8.4 演进候选）。重发序列另落流尾新会话、**不计入本键**（无作废时工件实际会话数 = sessions + duplicates；有序列作废或被相似度淘汰时按 `sessions_eff = min(sessions, Σ幸存)` 装箱，实际会话数相应减少——见 `report.generate.stream.sessions`，3.6.5）。 |
 | `generate.stream.noise_ratio` | float | 0.0 | v1.13：噪音帧 / 任务帧 比例，∈ [0,1)；噪音帧数 = `round(noise_ratio × Σ任务帧数)`，调用数 = `⌈噪音帧数 / generate.num_per_call⌉`。> 0 时 `noise_instruction` 必填。噪音帧逐帧掷签 (会话, 槽位)，满员会话（`len ≥ stream.session_max_len`）退出签池（3.6.5）。 |
@@ -241,10 +241,44 @@ dims = 1024                         # 可选：返回向量维度校验
 | 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
 | `tier_rank` | int | 必填 | 档位序数（「第几个档位的要求」，即档位身份——本表**不设** `name` 键）。正整数、表内唯一、全表**连续覆盖 1..N**（N = 表长；缺号/重号 = CONFIG_ERROR）。它同时是配分平票与类内序数分块的确定性排序依据；**工具不赋予序数高低任何质量方向语义**——方向由用户在各档构成上自行赋予。 |
-| `weight` | int | 必填 | 配额权重（整数 ≥ 1）。每个参与类的 `sequences` 配额按各档权重走**整数域最大余额法**零抽签配分（3.6.5 档位构成行）；配分为 `(sequences, 权重表)` 的纯函数、不消费任何随机数。某 (参与类, 档) 配额为 0 是小配额 × 悬殊权重的自然结果 ⇒ M1 发 WARN（非错误，`report.generate.stream.tiers.<rank>.planned` 如实呈现 0）。 |
-| `frame_classes` | array | 必填 | 档位构成：该档序列**恰用**这些帧类（每类至少出现一次、不出现档外类）。非空、档内无重复、每名 ∈ `[[frame.classify.classes]]` 名集，各档构成**集合两两互异**（同构成即语义重复）。恰等语义由蓝图内部 Schema 双向保证——enum 限档内子集给「⊆」、逐类 `contains` 给「⊇」（3.8.1），故档位身份可从 `_meta.stream.members[]` 的帧类集合直接反推对账。长度前提：配额非零的 (类, 档) 对须满足该类 `len_range` 下界 ≥ 本档构成大小（M1 校验）。 |
+| `weight` | int | 必填 | 配额权重（整数 ≥ 1）。每个参与类的 `sequences` 配额按**该类生效表**（v1.15：本类的按类表或回落的本全局表）各档权重走**整数域最大余额法**零抽签配分（3.6.5 档位构成行）；配分为 `(sequences, 权重表)` 的纯函数、不消费任何随机数。某 (参与类, 档) 配额为 0 是小配额 × 悬殊权重的自然结果 ⇒ M1 发 WARN（非错误，报表 `tiers` 子块如实呈现 planned 0）。 |
+| `frame_classes` | array | 必填 | 档位构成：该档序列**恰用**这些帧类（每类至少出现一次、不出现档外类）。非空、档内无重复、每名 ∈ `[[frame.classify.classes]]` 名集，**同一张表内**各档构成**集合两两互异**（同构成即语义重复；v1.15：跨表——即跨类——同构成合法）。恰等语义由蓝图内部 Schema 双向保证——enum 限档内子集给「⊆」、逐类 `contains` 给「⊇」（3.8.1），故档位身份可从 `_meta.stream.members[]` 的帧类集合直接反推对账。长度前提：配额非零的 (类, 档) 对须满足该类 `len_range` 下界 ≥ 本档构成大小（M1 校验）。 |
 
-档位序数在**三处**落地（同一个值三个面，档位表缺省时三处全部不在场）：主输出每行的 `_meta.source.generator.tier_rank`（6.3）、时间流工件行的 `truth.tier_rank`（6.5）、报表的 `report.generate.stream.tiers.<rank>.{planned, produced}`（6.4）。另一条推论：`--limit` 在计划期配额层做前缀截断，而类内序数按 tier_rank 升序占连续区间，故截断是在每个类内**从最高档序数侧截起**。
+档位序数在**三处**落地（同一个值三个面，档位表缺省时三处全部不在场）：主输出每行的 `_meta.source.generator.tier_rank`（6.3）、时间流工件行的 `truth.tier_rank`（6.5）、报表的 `report.generate.stream.tiers`（6.4——v1.15 起该子块有平面与类嵌套两形，见下节）。另一条推论：`--limit` 在计划期配额层做前缀截断，而类内序数按 tier_rank 升序占连续区间，故截断是在每个类内**从最高档序数侧截起**。
+
+**`[[class.<name>.generate.tiers]]` 按类档位表（v1.15 新增，可选；数组表，仅时间流生成形态合法）。**行结构与上表**逐字段相同**（`tier_rank` / `weight` / `frame_classes` 三键，逐行校验同款），语义是**表级原子覆盖**——本类声明了就用本类的整张表，**不逐行合并**（行级合并会让 rank 身份跨表漂移；先例是仓库既有的两处按类重资产：`[class.*.quality].rubric` 内联子表整表替换、`[class.*.annotate].schema_*` 覆盖回落）。缺省（所有类都不声明）⇒ 生效表恒 = 全局表，与 v1.14 字节等价。四条语义要点：
+
+| 要点 | 规格 |
+|---|---|
+| 覆盖与回落 | 一个序列类的**生效表** = 该类声明的表；未声明（键缺省）⇒ 回落全局 `[[generate.stream.tiers]]`。配分、蓝图 `[帧类表]` 档内子集、`generator.tier_rank`、工件 `truth.tier_rank` 与报表逐类分账，全部按**本类生效表**取值（3.6.5）。 |
+| 全局表为锚 | 按类表**要求全局表在场**（缺省 = CONFIG_ERROR，指引补全局表）。档位面总开关恒 = 全局表非空 ⇒ 每个参与类恒有生效表，上文「三处落地」的在场性因此恒定、不因某类未声明按类表而逐行漂移。「本类不想分档」的表达式 = 给它一张单档表（`tier_rank = 1` + 任意构成）——退化形态，零机制成本。 |
+| rank 为类内身份 | `tier_rank` 在**每张生效表内**各自正整数、表内唯一、连续覆盖 1..N（N = 该表长，**逐类可不同**）；跨类同 rank **无任何工具语义**（工具本就不赋序数以质量方向），「各档构成两两互异」的辖区相应收窄为**单表之内**——跨类同构成完全合法（各类都可有自己的「全类档」）。消费侧行级消歧免费：主输出行携 `_meta.classification.label`、工件行携 `truth.sequence_class`，与 `tier_rank` 同行相邻。 |
+| 空表拒收 | 三态互斥：键缺省 = 未声明（回落全局）；`tiers = []` = 显式空表 ⇒ **CONFIG_ERROR**（指引删键回落——档位面统一之下不存在「本类无档」态）；非空 = 覆盖。 |
+
+```
+[[generate.stream.tiers]]                     # 全局表：锚 + 面开关 + 未声明类的回落
+tier_rank = 1
+weight = 2
+frame_classes = ["task_request", "followup"]
+
+[[generate.stream.tiers]]
+tier_rank = 2
+weight = 1
+frame_classes = ["task_request", "followup", "confirmation"]
+
+[[class.ticket_booking.generate.tiers]]       # 按类表：本类整表取代全局表（构成与权重双差异）
+tier_rank = 1
+weight = 1
+frame_classes = ["task_request", "followup"]
+
+[[class.ticket_booking.generate.tiers]]
+tier_rank = 2
+weight = 2
+frame_classes = ["task_request", "confirmation"]
+# smart_home 不声明 ⇒ 回落全局两档表（混合形态：一类独立表 / 一类回落）
+```
+
+M1 校验（3.1.4「按类档位表」行，规范源头 2.3.1 v1.15 段）：**按类表前提三子款**——形态门（`generate_stream.enabled = false` 时书写 = 定向 CONFIG_ERROR，原始节探针）、全局锚、空表拒收；上表的**身份连续性与构成合法性改逐生效来源表执行**（全局表 + 每张已声明按类表各跑一遍）；逐 (参与类, 档) 的长度可覆盖约束与配分零额 WARN 逐类改吃本类生效表；「帧类未入档」WARN 与「每帧类生成指令必填」的检查域**并集化**为 ∪（各参与类生效表构成）。零配额类（`sequences = 0`）声明的表照跑结构校验，仅豁免上述两项配额相关检查、其构成不入并集。观测面：`report.generate.stream.tiers` 在任一按类表在场时改**类嵌套形**（6.4），`_meta.source.generator.tier_rank` 与工件 `truth.tier_rank` 的键、序、在场判据**全部零改动**（值 = 本行序列类生效表内的档序数，跨类不可比）。
 
 **`[class.<name>.<section>]` 按类覆盖（v1.7）。**classify 启用时可按类覆盖下游算子参数：`<name>` 必须 ∈ classes；未出现的键一律继承全局节（不配任何覆盖即纯打标模式）。可覆盖键白名单（M1 强校验，白名单外的键报 `CONFIG_ERROR`——3.1.4「未知键报 warning」行的显式例外；白名单后续只增）：
 
@@ -252,7 +286,7 @@ dims = 1024                         # 可选：返回向量维度校验
 |---|---|---|
 | `[class.*.quality]` | mode, rounds, rubric（含 `[class.*.rubric]` 内联子表，结构同 5.3）, threshold, selection, top_ratio | llm / judges / both_orders / criteria_per_call / on_unscored——LLM 绑定属部署与成本面，类差异先用 rubric 表达（1.6 v1.7 对齐决策 ④） |
 | `[class.*.annotate]` | instruction, examples, **schema_path / schema_inline（v1.13 增，至多其一）** | llm / self_consistency / sc_temperature。v1.13 按类标注 Schema 语义：**覆盖**（类声明了就用类的，两键皆缺 = 回落全局 `output.schema`；同时声明报 CONFIG_ERROR）——装载走 `output.schema` 全套分支 + `_meta` 保留键禁令 + `$ref` 遍历 + **按类 few-shot 干跑**（3.1.4 按类覆盖合并行 ⑤）；运行期由 M5 的单点取值函数供给全部消费点、M11 按行终检同口径（3.5.2、3.11.2） |
-| `[class.*.generate]` | instruction, styles, num_per_record, temperature, **sequences / len_range（v1.13 增，时间流形态的按类配额与步数区间）** | llms / mixture / weights / seeds_per_call / num_per_call / sample_validator。v1.13 时间流形态下 `num_per_record` / `seeds_per_call` 从本行白名单语义中除名——显式书写是定向 CONFIG_ERROR（属平面生成形态，3.1.4 时间流生成行 ③） |
+| `[class.*.generate]` | instruction, styles, num_per_record, temperature, **sequences / len_range（v1.13 增，时间流形态的按类配额与步数区间）**, **tiers**（v1.15 增第七键：按类帧类构成档位表，数组表 `[[class.<name>.generate.tiers]]`，**表级原子覆盖**语义——见下方按类档位表节） | llms / mixture / weights / seeds_per_call / num_per_call / sample_validator。v1.13 时间流形态下 `num_per_record` / `seeds_per_call` 从本行白名单语义中除名——显式书写是定向 CONFIG_ERROR（属平面生成形态，3.1.4 时间流生成行 ③）。v1.15 注：`tiers` 同为**仅时间流生成形态合法**——`generate_stream.enabled = false` 时书写是定向 CONFIG_ERROR（原始节探针，3.1.4 按类档位表行），另要求全局 `[[generate.stream.tiers]]` 在场（全局表为锚） |
 | `[class.*.verify]` | extra_criteria | llm / judges / policy / max_repair_rounds |
 | `[class.*.extract]` | instruction（v1.8 增） | llm / include_diff / on_error——LLM 绑定与失败策略属部署与成本面（与 quality 行同理） |
 | `[frame.class.*.annotate]`（v1.12） | instruction, examples, enabled（enabled = false ⇒ 该帧类成员跳过帧标注——省成本面，members[] 呈现 status="skipped"，3.11.2） | llm / schema——LLM 绑定属部署与成本面；帧级标注 Schema 按粒度唯一（8.4 M13 行）。v1.12 时白名单仅此一节，v1.13 增 `generate` 节（下行）；两节之外的节名 ⇒ CONFIG_ERROR（3.1.4 帧粒度配置行） |

@@ -13,6 +13,11 @@ v1.14 档位面（SPEC-generation-tiers §3.2/§3.7）另覆盖：档位映射�
 档内子集表与覆盖句冻结文本、truth 键序三形态（任务/噪音/重发）、``ref.generator``
 三键、逐档 planned/produced 落账。
 
+v1.15 按类档位表（SPEC-per-class-tiers §3.2/§3.6）再覆盖：混合形态（一类声明 / 一类
+回落）的计划期 rank 映射与 ``--limit`` 逐类分块、蓝图取本类生效表的档内子集、truth 与
+``ref.generator`` 逐行与本类生效表一致、逐档计数器的类段键、按类配分仍零抽签消费、
+同 seed 双跑逐字节一致，以及"按类表逐字段等于全局表 ⇒ 与全部缺省等价"的退化面。
+
 v1.14 时间字段面（SPEC-generation-tiers §3.3/§3.7）再覆盖：缩减 Schema 派生
 （properties 删键 / required 差集 / 其余关键字原样 / 不污染 M1 冻结产物 / 两个面
 同源）、回填算术（首末边界 0.0、序内相邻口径含交叉夹帧、微秒精度、同 seed 双跑
@@ -128,13 +133,16 @@ def mk_cfg(*, quotas: dict[str, int] | None = None, sessions: int = 2,
            limit: int | None = None, generate: GenerateConfig | None = None,
            len_range=(2, 3), session_max_len: int = 200,
            llm_profiles=None, tiers: tuple[TierSpec, ...] = (),
+           class_tiers: dict | None = None,
            frame_classes: tuple[str, ...] = FRAME_TABLE,
            frame_schema=FRAME_SCHEMA, time_fields=None) -> ResolvedConfig:
     quotas = quotas if quotas is not None else {"booking": 2, "smalltalk": 1}
     base_generate = generate or GenerateConfig(enabled=True, num_per_call=2)
+    # v1.15: class_tiers 逐类给 ClassView.tiers（缺席 = None = 回落全局 tiers）
     views = {name: replace(mk_view(name, sequences=n, len_range=len_range),
                            generate=replace(base_generate, instruction=f"生成{name}",
-                                            sequences=n, len_range=len_range))
+                                            sequences=n, len_range=len_range),
+                           tiers=(class_tiers or {}).get(name))
              for name, n in quotas.items()}
     return ResolvedConfig(
         tool=ToolConfig(), console=ConsoleConfig(),
@@ -786,6 +794,9 @@ def test_real_product_flows_through_real_emitter(tmp_path):
 # ── v1.14 档位面：映射、零抽签消费、蓝图双向硬约束、标识三点、逐档计数 ────────
 
 TIERS = mk_tiers((2, FRAME_TABLE), (1, ("task_request",)))
+# v1.15 按类表：构成与权重都与全局表反向（3 条配额按 (1, 2) 配分 = 1 + 2，
+# 对照全局表的 (2, 1) 配分 = 2 + 1）——混合形态下两类的分块必然可区分。
+OWN_TIERS = mk_tiers((1, ("task_request",)), (2, FRAME_TABLE))
 
 
 def test_sequence_plan_tier_rank_defaults_to_none():
@@ -818,18 +829,27 @@ def test_tier_mapping_commutes_with_limit_and_cuts_from_the_top_rank():
 
 def test_tier_apportionment_consumes_no_rng():
     """配分零抽签（顺序表原文不动）：同 seed 下有无档位表，长度与 (llm, style)
-    预抽流逐字节一致，且 rng 消费位置相同。"""
+    预抽流逐字节一致，且 rng 消费位置相同。v1.15：按类表在场时同款成立——生效表
+    查找与配分都是纯查表，档位赋值仍是①与②之间的零消费步。"""
     plain = mk_cfg(quotas={"booking": 3, "smalltalk": 2}, sessions=3, noise_ratio=0.4)
     tiered = replace(plain, generate_stream=replace(plain.generate_stream, tiers=TIERS))
+    per_class = mk_cfg(quotas={"booking": 3, "smalltalk": 2}, sessions=3, noise_ratio=0.4,
+                       tiers=TIERS, class_tiers={"booking": OWN_TIERS})
     rng_plain = random.Random("0:0:generate")
     rng_tiered = random.Random("0:0:generate")
+    rng_class = random.Random("0:0:generate")
     a, b = plan_stream(plain, rng_plain), plan_stream(tiered, rng_tiered)
-    assert [(p.length, p.llm, p.style_name, p.style_prompt) for p in a.sequences] == \
-           [(p.length, p.llm, p.style_name, p.style_prompt) for p in b.sequences]
-    assert (a.noise_target, a.noise_plans) == (b.noise_target, b.noise_plans)
-    assert rng_plain.getstate() == rng_tiered.getstate()
+    c = plan_stream(per_class, rng_class)
+    draws = [[(p.length, p.llm, p.style_name, p.style_prompt) for p in plan.sequences]
+             for plan in (a, b, c)]
+    assert draws[0] == draws[1] == draws[2]
+    assert (a.noise_target, a.noise_plans) == (b.noise_target, b.noise_plans) \
+           == (c.noise_target, c.noise_plans)
+    assert rng_plain.getstate() == rng_tiered.getstate() == rng_class.getstate()
     assert [p.tier_rank for p in a.sequences] == [None] * len(a.sequences)
     assert [p.tier_rank for p in b.sequences] == [1, 1, 2, 1, 2]
+    # booking 改吃按类表 (1, 2) 分块 ⇒ 前三位变 [1, 2, 2]，smalltalk 两位不变
+    assert [p.tier_rank for p in c.sequences] == [1, 2, 2, 1, 2]
 
 
 def test_tier_face_only_adds_keys_to_the_v113_artifact_bytes():
@@ -976,18 +996,151 @@ def test_generator_tier_rank_flows_out_through_the_real_emitter(tmp_path):
 
 def test_tier_planned_and_produced_counters_land_per_rank():
     """逐档计数：planned 在计划期落账（含被作废的序列），produced 口径 = 最终进链
-    的幸存序列；档位表缺省 ⇒ 整族计数器不在场。"""
+    的幸存序列；档位表缺省 ⇒ 整族计数器不在场。v1.15（裁决·计数器键按类重冻结）：
+    键恒带类段 generate.stream.tiers.<类>.<档>.*，M6 只喂这一族（禁双写）。"""
     cfg = mk_cfg(quotas={"booking": 3}, sessions=2, tiers=TIERS)
     _, _, metrics = run_stream(cfg, engine=StreamEngine(fail_plans={3}))
-    assert metrics.counters["generate.stream.tiers.1.planned"] == 2
-    assert metrics.counters["generate.stream.tiers.2.planned"] == 1
+    assert metrics.counters["generate.stream.tiers.booking.1.planned"] == 2
+    assert metrics.counters["generate.stream.tiers.booking.2.planned"] == 1
     assert metrics.counters["generate.stream.sequences.booking.planned"] == 3
-    assert metrics.counters["generate.stream.tiers.1.produced"] == 2
+    assert metrics.counters["generate.stream.tiers.booking.1.produced"] == 2
     # 第三条（tier_rank 2）蓝图作废 ⇒ 该档 produced 不落账（报表侧按声明表零基铺开）
-    assert "generate.stream.tiers.2.produced" not in metrics.counters
+    assert "generate.stream.tiers.booking.2.produced" not in metrics.counters
+    # 单一喂数纪律：绝不同时喂 v1.14 的无类段键
+    assert "generate.stream.tiers.1.planned" not in metrics.counters
     _, _, plain = run_stream(mk_cfg(quotas={"booking": 3}, sessions=2))
     assert not [key for key in plain.counters
                 if key.startswith("generate.stream.tiers.")]
+
+
+# ── v1.15 按类档位表：混合形态的取表点（SPEC-per-class-tiers §3.2）───────────
+
+def mixed_cfg(**kwargs) -> ResolvedConfig:
+    """混合形态：booking 用按类表、smalltalk 回落全局表（各 3 条配额）。"""
+    kwargs.setdefault("quotas", {"booking": 3, "smalltalk": 3})
+    kwargs.setdefault("sessions", 4)
+    return mk_cfg(tiers=TIERS, class_tiers={"booking": OWN_TIERS}, **kwargs)
+
+
+def test_mixed_form_maps_each_class_off_its_own_effective_table():
+    """计划期逐类查本类生效表：声明类吃按类表 (1, 2) 分块，未声明类吃全局表
+    (2, 1) 分块——同一 rank 值在两类间无可比性（裁决·rank 类内身份）。"""
+    plan = plan_stream(mixed_cfg(), random.Random("0:0:generate"))
+    ranks = {(p.class_name, p.ordinal): p.tier_rank for p in plan.sequences}
+    assert [ranks[("booking", o)] for o in range(3)] == [1, 2, 2]
+    assert [ranks[("smalltalk", o)] for o in range(3)] == [1, 1, 2]
+
+
+def test_limit_truncation_cuts_from_each_class_top_rank_side():
+    """--limit 仍是配额层前缀截断、映射仍吃全量配额 ⇒ 交换律逐类原文成立；
+    类内序数按**本类**生效表分块，故从本类最高 rank 一侧截起。"""
+    cfg = mixed_cfg()
+    full = [(p.class_name, p.ordinal, p.tier_rank)
+            for p in plan_stream(cfg, random.Random("0:0:generate")).sequences]
+    for limit in (2, 4):
+        limited = [(p.class_name, p.ordinal, p.tier_rank) for p in
+                   plan_stream(replace(cfg, limit=limit),
+                               random.Random("0:0:generate")).sequences]
+        assert limited == full[:limit]
+    # booking 截到 2 条 ⇒ 只剩 rank 1 的一条与 rank 2 的头一条（尾部先掉）
+    assert [r for _, _, r in full[:2]] == [1, 2]
+
+
+def plan_call_of(engine: StreamEngine, cname: str):
+    """按 user 行里的序列类名取该类的蓝图调用（gather 序无关）。"""
+    for _, prompt, schema in engine.calls:
+        if ("steps" in schema["properties"]
+                and f"「{cname}」" in prompt.messages[1].parts[0].text):
+            return prompt, schema
+    raise AssertionError(f"no blueprint call for {cname}")
+
+
+def test_blueprint_reads_the_effective_table_of_the_sequence_class():
+    """蓝图取档 = 本类生效表[tier_rank - 1]：[帧类表]、enum 与 contains 覆盖分支
+    全部落在**本类**档内构成上，两类互不串档。"""
+    cfg = mk_cfg(quotas={"booking": 1, "smalltalk": 1}, sessions=2, len_range=(2, 2),
+                 frame_classes=("task_request", "followup", "confirmation"),
+                 tiers=mk_tiers((1, ("task_request", "confirmation"))),
+                 class_tiers={"booking": mk_tiers((1, ("task_request", "followup")))})
+    _, engine, _ = run_stream(cfg)
+    prompt_b, schema_b = plan_call_of(engine, "booking")
+    system_b = prompt_b.messages[0].parts[0].text
+    assert "[帧类表]\ntask_request: d\nfollowup: d\n" in system_b
+    assert "confirmation" not in system_b
+    assert (schema_b["properties"]["steps"]["items"]["properties"]["frame_class"]["enum"]
+            == ["task_request", "followup"])
+    _, schema_s = plan_call_of(engine, "smalltalk")     # 回落全局表的那一档
+    assert (schema_s["properties"]["steps"]["items"]["properties"]["frame_class"]["enum"]
+            == ["task_request", "confirmation"])
+    assert [branch["contains"]["properties"]["frame_class"]["const"]
+            for branch in schema_s["properties"]["steps"]["allOf"]] == [
+        "task_request", "confirmation"]
+
+
+def test_truth_and_generator_follow_the_class_effective_table_row_by_row():
+    """标识三点的值来源改了、装配面没改：逐行 truth.tier_rank 与成员
+    ref.generator.tier_rank 都等于**本行序列类**生效表内的档序数。"""
+    product, _, _ = run_stream(mixed_cfg())
+    tables = {"booking": OWN_TIERS, "smalltalk": TIERS}
+    rows = parse_lines(product)
+    for truth in (row["truth"] for row in rows):
+        if truth["noise"]:
+            assert truth["tier_rank"] is None       # 噪音帧不属任何序列
+            continue
+        assert truth["tier_rank"] == tier_rank_for_ordinal(
+            3, tables[truth["sequence_class"]], truth["sequence"])
+    # 两类的分块确实不同（本用例对"误用全局表"是可判的）
+    assert sorted({(t["sequence"], t["tier_rank"]) for t in
+                   (row["truth"] for row in rows)
+                   if t["sequence_class"] == "booking"}) == [(0, 1), (1, 2), (2, 2)]
+    for envelope in product.envelopes:
+        truth = envelope.record.members[0].raw["truth"]
+        expected = tier_rank_for_ordinal(3, tables[truth["sequence_class"]],
+                                         truth["sequence"])
+        assert all(m.ref.generator["tier_rank"] == expected
+                   for m in envelope.record.members)
+
+
+def test_per_class_counters_land_under_the_class_segment():
+    """裁决·计数器键按类重冻结：逐档 planned/produced 按 <类>.<档> 落账，
+    两类的同 rank 计数各自独立（平面报表的跨类求和由编排器负责）。"""
+    _, _, metrics = run_stream(mixed_cfg())
+    tiered = {k: v for k, v in metrics.counters.items()
+              if k.startswith("generate.stream.tiers.")}
+    assert tiered == {"generate.stream.tiers.booking.1.planned": 1,
+                      "generate.stream.tiers.booking.2.planned": 2,
+                      "generate.stream.tiers.booking.1.produced": 1,
+                      "generate.stream.tiers.booking.2.produced": 2,
+                      "generate.stream.tiers.smalltalk.1.planned": 2,
+                      "generate.stream.tiers.smalltalk.2.planned": 1,
+                      "generate.stream.tiers.smalltalk.1.produced": 2,
+                      "generate.stream.tiers.smalltalk.2.produced": 1}
+
+
+def test_per_class_tiers_double_run_is_byte_identical():
+    """同 seed 双跑逐字节一致（按类表在场）：生效表查找与配分都零 rng，交织期
+    抽签流不受按类化扰动。"""
+    cfg = mixed_cfg(noise_ratio=0.3, duplicates=1)
+    first, _, _ = run_stream(cfg)
+    second, _, _ = run_stream(cfg)
+    assert first.artifact_lines == second.artifact_lines
+    assert [e.record.id for e in first.envelopes] == [e.record.id
+                                                      for e in second.envelopes]
+
+
+def test_declaring_the_global_table_per_class_equals_falling_back():
+    """裁决·表级原子覆盖的退化面：按类表逐字段等于全局表 ⇒ 与全部缺省（v1.14
+    路径）的工件、信封 id 与计数器逐字节等价。"""
+    plain = mk_cfg(quotas={"booking": 2, "smalltalk": 1}, sessions=2,
+                   noise_ratio=0.3, duplicates=1, tiers=TIERS)
+    explicit = mk_cfg(quotas={"booking": 2, "smalltalk": 1}, sessions=2,
+                      noise_ratio=0.3, duplicates=1, tiers=TIERS,
+                      class_tiers={"booking": TIERS, "smalltalk": TIERS})
+    a, _, metrics_a = run_stream(plain)
+    b, _, metrics_b = run_stream(explicit)
+    assert a.artifact_lines == b.artifact_lines
+    assert [e.record.id for e in a.envelopes] == [e.record.id for e in b.envelopes]
+    assert metrics_a.counters == metrics_b.counters
 
 
 # ── v1.14 时间字段面：缩减 Schema 派生 ──────────────────────────────────────

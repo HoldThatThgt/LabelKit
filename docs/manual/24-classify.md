@@ -182,7 +182,7 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
 |---|---|---|
 | `[class.*.quality]` | `mode`、`rounds`、`rubric`（含 `[class.*.rubric]` 内联子表）、`threshold`、`selection`、`top_ratio` | `llm` / `judges` / `both_orders` / `criteria_per_call` / `on_unscored`——LLM 绑定属部署与成本面，类间差异优先用 rubric 表达 |
 | `[class.*.annotate]` | `instruction`、`examples`、**`schema_path` / `schema_inline`**（至多其一，v1.13） | `llm` / `self_consistency` / `sc_temperature` |
-| `[class.*.generate]` | `instruction`、`styles`、`num_per_record`、`temperature`；v1.13 时间流形态另加 **`sequences` / `len_range`**（该形态下 `num_per_record` / `seeds_per_call` 反过来禁设，第 27 章 27.4） | `llms` / `mixture` / `weights` / `seeds_per_call` / `num_per_call` / `sample_validator` |
+| `[class.*.generate]` | `instruction`、`styles`、`num_per_record`、`temperature`；v1.13 时间流形态另加 **`sequences` / `len_range`**，v1.15 再加 **`tiers`**（`[[class.<名>.generate.tiers]]` 按类档位表，整表取代全局 `[[generate.stream.tiers]]`）；该形态下 `num_per_record` / `seeds_per_call` 反过来禁设（第 27 章 27.4） | `llms` / `mixture` / `weights` / `seeds_per_call` / `num_per_call` / `sample_validator` |
 | `[class.*.verify]` | `extra_criteria` | `llm` / `judges` / `policy` / `max_repair_rounds` |
 | —— | —— | `run.*` / `input.*` / `dedup.*` / `classify.*` / `trace.*` 与 `[output]` 的其余键 **从不按类**——输出通道的形态（`meta_mode`、`rejects`、修复预算、`validator`）是运行级契约 |
 
@@ -242,7 +242,7 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
 
 三个细节：其一，`classification` 只落 `label` / `labels` / `source` 三键——判决理由和自洽采样统计不落主输出，要看去 trace（`classify.decision` 事件）；其二，`scores.pool` 与 `classification.label` 恒相等，pool 是打分池的自述，pairwise 模式下「批内相对分」从此变成「**池内**相对分」（见 24.7）；其三，本工程的输出 Schema 是全局的——类只改工艺、不改产出结构：本次真跑回流的合成样本带着种子的类标签（`source="inherited"`）、按类指令标注，但 `intent` 字段仍由标注算子从全局枚举里独立选出。
 
-**「产出结构必须全局唯一」这条在 v1.13 松开了。**`[class.<类名>.annotate]` 的白名单增加了 `schema_path` / `schema_inline`（24.4 的表与合并细则 3）：声明了就用类的、没声明的类回落全局。这解的是一类真实困境——类与类要抽的**字段集本就不同**（购票要出发地/目的地/日期，设备控制要设备/动作/位置），逼它们共用一份 Schema 只有两条烂路：写成并集（每类填一半空字段）或退化成宽松对象（等于没有结构约束）。代价是下游契约变了：**同一份主输出里不同类的行字段集可以不同**，按 `_meta.classification.label` 分流后再解析——这与 multi 扇出改变行唯一键是同级的通知事项。真实对照（两份字段集互不相同的产物行）见第 27 章 27.6。至于**永远不按类**的那些：`run.*` / `input.*` / `dedup.*` / `classify.*` / `trace.*` 与 `[output]` 的其余键——它们是运行级契约（一次运行只有一个输出通道、一套去重口径、一份分类器），不是「加工工艺」。
+**「产出结构必须全局唯一」这条在 v1.13 松开了。**`[class.<类名>.annotate]` 的白名单增加了 `schema_path` / `schema_inline`（24.4 的表与合并细则 3）：声明了就用类的、没声明的类回落全局。这解的是一类真实困境——类与类要抽的**字段集本就不同**（购票要出发地/目的地/日期，设备控制要设备/动作/位置），逼它们共用一份 Schema 只有两条烂路：写成并集（每类填一半空字段）或退化成宽松对象（等于没有结构约束）。代价是下游契约变了：**同一份主输出里不同类的行字段集可以不同**，按 `_meta.classification.label` 分流后再解析——这与 multi 扇出改变行唯一键是同级的通知事项。真实对照（两份字段集互不相同的产物行）见第 27 章 27.6。**v1.15 又给这一节添了一个「整体覆盖」成员**：`[[class.<类名>.generate.tiers]]` 按类档位表——语义与按类 Schema 同款（声明了就整表取代全局表，未声明回落），差别只在回落源必须在场（全局档位表既是回落源、又是档位面的开关）。它同样改下游读法：`tier_rank` 从此是**类内**序数，跨类不可比（第 27 章 27.4）。至于**永远不按类**的那些：`run.*` / `input.*` / `dedup.*` / `classify.*` / `trace.*` 与 `[output]` 的其余键——它们是运行级契约（一次运行只有一个输出通道、一套去重口径、一份分类器），不是「加工工艺」。
 
 **拒绝通道**每行多一个 `label` 键（真实运行产物第 1、3 行，逐字）：
 

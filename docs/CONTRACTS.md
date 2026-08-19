@@ -162,13 +162,21 @@ plain line formats — the golden-snapshot layer of the three-layer regression a
 v1.13 time-stream generation coverage belongs in `tests/operators/test_generate_stream.py`
 (planning draws, weaver mechanics, direct assembly, artifact replay equivalence),
 `tests/common/config/test_loader_generate_stream.py` (the M1 constraint matrix, §6.3 rules
-50–60 — v1.14's tier and binding clusters land in the same file) and
+50–61 — v1.14's tier and binding clusters and v1.15's per-class tier cluster land in the same
+file) and
 `tests/integration/test_generate_stream_llm.py` (real-LLM: the DeepSeek endpoint
 for blueprint/realize/per-class annotation and, v1.14, for tiers and time-field back-fill, plus
 z.ai `glm-5.2` cases pinning `prefixItems` and `allOf`/`contains` L0 pass-through). v1.14's
 `apportion_tiers` unit coverage belongs in `tests/common/config/` (it follows the function's
 `model.py` home), while the ordinal mapping and the `--limit` commutativity belong in
-`tests/operators/`.
+`tests/operators/`. v1.15's per-class tier coverage lands in exactly the SAME five files and
+creates NO new test file (the `EXPECTED_TEST_PY` allowlist is unchanged): `effective_tiers`
+and `ClassView.tiers` beside `apportion_tiers` in `tests/common/config/`, rule 61's three
+sub-clauses and the per-effective-table / union-scope checks in
+`test_loader_generate_stream.py`, mixed-form planning, blueprint subsetting and per-row
+truth/generator agreement in `tests/operators/test_generate_stream.py`, the report's two forms
+and their double key order in `tests/orchestration/test_orchestrator.py`, and one added
+DeepSeek case in `tests/integration/test_generate_stream_llm.py`.
 A separate compatibility-import test,
 `test_key_pool.py`, or
 `test_stream_ingest.py` is forbidden. The exact file allowlist is normative in
@@ -1081,24 +1089,34 @@ class TierSpec:                                   # v1.14 (spec 5.2 [[generate.s
                                                   # ONE frame-class composition tier. A tier IS its
                                                   # frame-class composition set — it carries NO
                                                   # quality instruction and does not govern
-                                                  # intra-frame semantics (裁决·档位即帧类构成)
+                                                  # intra-frame semantics (裁决·档位即帧类构成).
+                                                  # v1.15: the SAME row shape also backs the
+                                                  # per-class table [[class.<name>.generate.tiers]]
+                                                  # (ClassView.tiers) — the comments below are
+                                                  # therefore scoped to ONE EFFECTIVE TABLE
     tier_rank: int                                # the tier's IDENTITY (there is deliberately no
                                                   # `name` key): positive, unique in the table, and
-                                                  # the table must cover 1..N CONTIGUOUSLY (N =
-                                                  # table length). Also the deterministic tiebreak
+                                                  # EVERY EFFECTIVE TABLE must cover 1..N
+                                                  # CONTIGUOUSLY (N = THAT table's length, which
+                                                  # may differ per class — v1.15 裁决·rank 类内身份;
+                                                  # the same rank in two classes carries NO tool
+                                                  # semantics). Also the deterministic tiebreak
                                                   # key for apportionment and the ordering of the
                                                   # in-class ordinal blocks. The TOOL ASSIGNS NO
                                                   # quality direction to rank order (that is the
                                                   # user's, 裁决·tier_rank 即档位身份)
     weight: int                                   # quota weight, integer >= 1; a class's quota is
-                                                  # split across tiers by INTEGER-DOMAIN largest
-                                                  # remainder, zero rng (apportion_tiers below)
+                                                  # split across ITS EFFECTIVE table's tiers by
+                                                  # INTEGER-DOMAIN largest remainder, zero rng
+                                                  # (apportion_tiers below)
     frame_classes: tuple[str, ...]                # the composition: this tier's sequences use
                                                   # EXACTLY these frame classes (enum gives "⊆",
                                                   # per-class `contains` gives "⊇"). Non-empty, no
                                                   # dupes inside a tier, every name in the frame
                                                   # class table, and the composition SETS are
-                                                  # pairwise distinct across tiers (M1, §6.3)
+                                                  # pairwise distinct WITHIN ONE TABLE (M1, §6.3;
+                                                  # v1.15 narrows the scope to a single table —
+                                                  # identical compositions ACROSS classes are legal)
 
 
 def apportion_tiers(sequences: int, tiers: Sequence[TierSpec]) -> tuple[int, ...]:
@@ -1114,9 +1132,36 @@ def apportion_tiers(sequences: int, tiers: Sequence[TierSpec]) -> tuple[int, ...
     truth → artifact bytes → member ids, so it is a frozen surface and may not hang off
     float comparison semantics. Consumes ZERO rng — the frozen draw-order table (§7.5) is
     UNCHANGED, apportionment slots in between quota expansion ① and length drawing ② as a
-    zero-consumption step. Callers pass tiers in tier_rank ascending order (which is how
-    `GenerateStreamConfig.tiers` stores them) and get parts back in the same order; an empty
-    tier table returns ()."""
+    zero-consumption step. Callers pass tiers in tier_rank ascending order (which is how both
+    `GenerateStreamConfig.tiers` and `ClassView.tiers` store them) and get parts back in the same
+    order; an empty tier table returns ().
+
+    v1.15: the `tiers` argument is that class's EFFECTIVE table (`effective_tiers` below) —
+    the SIGNATURE AND BODY ARE UNCHANGED, only the call sites pass a different table. "The table
+    covers 1..N contiguously" therefore reads "every effective table does, each with its own N",
+    and apportionment still consumes zero rng."""
+
+
+def effective_tiers(class_tiers: tuple[TierSpec, ...] | None,
+                    global_tiers: tuple[TierSpec, ...]) -> tuple[TierSpec, ...]:
+    """v1.15 (裁决·表级原子覆盖 + 裁决·全局表为锚) — the SINGLE lookup point for a sequence
+    class's EFFECTIVE tier table [FROZEN HERE]. A class that declared its own table uses that
+    WHOLE table (never a row-level merge — a row merge would let rank identity drift across
+    tables); `None` falls back to the global one:
+
+        return global_tiers if class_tiers is None else class_tiers
+
+    Lives in `model.py` beside `apportion_tiers` and for the same layering reason: M1's
+    constraint cluster, M6's planning phase AND M10's report assembly all share ONE
+    implementation, and common may not import operators (M6/M10 import it backwards, the legal
+    direction). Pure, zero rng, zero IO.
+
+    Because a per-class table REQUIRES the global one to be present (§6.3 rule 61 sub-clause 2),
+    the tier FACE is present iff `global_tiers` is non-empty and every participating class is
+    therefore guaranteed a non-empty effective table — which is exactly why every v1.14
+    presence predicate (`generator.tier_rank`, `truth.tier_rank`, the report sub-block, the
+    noise-slot predicate) is UNCHANGED in v1.15. An empty tuple argument is returned as-is; the
+    display of a declared-but-empty per-class table is M1's job, not this function's."""
 
 
 @dataclass(frozen=True)
@@ -1291,6 +1336,28 @@ class ClassView:                                  # one class's effective config
                                                   # ⇒ falls back to the global output.schema
                                                   # (override semantics, mirroring the per-class
                                                   # rubric heavy-asset precedent)
+    tiers: tuple[TierSpec, ...] | None = None     # v1.15 (裁决·载体 ClassView 顶层字段) — DEFAULTED
+                                                  # tail field, the `schema` sibling: this class's
+                                                  # frame-class composition tier table, parsed from
+                                                  # [[class.<name>.generate.tiers]] and STORED IN
+                                                  # tier_rank ASCENDING ORDER (the global table's
+                                                  # implementation, reused verbatim).
+                                                  # THREE-STATE: None = not declared ⇒ falls back
+                                                  # to GenerateStreamConfig.tiers (裁决·表级原子
+                                                  # 覆盖 — the WHOLE table, never a row merge);
+                                                  # () = an explicit `tiers = []` ⇒ M1 REJECTS it
+                                                  # (裁决·空表拒收 — under a unified tier face
+                                                  # there is no "this class has no tiers" state;
+                                                  # "don't tier this class" is written as a
+                                                  # one-row table); non-empty = the override.
+                                                  # Deliberately NOT on GenerateConfig: that
+                                                  # carrier would make the orchestrator's
+                                                  # per-class-override probe treat a pure tier
+                                                  # override as an estimate-skewing one, and the
+                                                  # dry-run note must NOT fire for tiers (they
+                                                  # change no call count — 裁决·note 行不因档位
+                                                  # 触发); ClassView.schema is the carrier
+                                                  # precedent (v1.13, same None-fallback shape)
 
 
 # ── stream (v1.8, spec §5.2 [stream] + [segment] + [extract]; v1.9 + [stitch]) ──
@@ -1809,9 +1876,13 @@ apply only when `classify.enabled = true` unless stated):
     the per-section whitelist — `quality`: mode, rounds, rubric (incl. the `[class.*.rubric]`
     inline table), threshold, selection, top_ratio; `annotate`: instruction, examples,
     **schema_path, schema_inline** (v1.13); `generate`: instruction, styles, num_per_record,
-    temperature, **sequences, len_range** (v1.13); `verify`: extra_criteria.
+    temperature, **sequences, len_range** (v1.13), **tiers** (v1.15 — the SEVENTH key, an array
+    of tables `[[class.<name>.generate.tiers]]` whose row shape is the global table's; whole-table
+    override semantics, rule 61); `verify`: extra_criteria.
     Any key outside the whitelist → CONFIG_ERROR (R25 exception to rule 1's unknown-key
-    warning: `[classify]` / `[class.*]` are explicitly owned namespaces).
+    warning: `[classify]` / `[class.*]` are explicitly owned namespaces). Note the whitelist must
+    grow together with rule 61 — an unlisted `tiers` would be swallowed by this loop as a
+    CONFIG_ERROR before rule 61 ever ran.
 26. **按类选择组合并** — Per-class merge builds the frozen `class_views` (per-key provenance:
     keys the class
     provides override the global section, all others inherit). Selection GROUP (R6): a class
@@ -2025,11 +2096,17 @@ paths and the whole system is byte-equivalent to v1.12):
     (effective `sequences >= 1`) has a non-empty effective generate instruction;
     `[[frame.classify.classes]]` is non-empty and every frame class IN SCOPE has a non-empty
     `[frame.class.<name>.generate].instruction`. **Scope is conditional (v1.14, 裁决·指令必填域
-    收窄)**: with no tier table the scope is the WHOLE frame class table (the blueprint enum spans
-    it, so any class may be picked); with a tier table declared the scope narrows to the UNION of
-    the tiers' `frame_classes` (the closed set the blueprint can actually pick from) — a frame
-    class in no tier is exempt from the requirement, already-written instructions stay legal, and
-    rule 58 warns that its whole generate face is dead config.
+    收窄; v1.15, 裁决·校验域并集化)**: with no tier table the scope is the WHOLE frame class table
+    (the blueprint enum spans it, so any class may be picked); with a tier table declared the
+    scope narrows to the UNION over PARTICIPATING CLASSES (effective `sequences >= 1`) of THEIR
+    EFFECTIVE tables' `frame_classes` — i.e. `∪ {c.frame_classes for view in participating for c
+    in effective_tiers(view.tiers, gs.tiers)}`, the closed set the blueprint can actually pick
+    from. With no per-class table that union collapses to the global table's, byte-identical to
+    v1.14. A frame class outside the scope is exempt from the requirement, already-written
+    instructions stay legal, and rule 58 warns that its whole generate face is dead config.
+    Corollary worth stating: if EVERY participating class declares its own table, the global table
+    degenerates to a pure anchor and a frame class appearing only there is still dead config —
+    the scope tracks what a blueprint can really pick, not what is merely declared.
 52. **禁设键探针** — DIRECTED CONFIG_ERRORs (the v1.11 `use_vision` raw-section probe
     mechanism — never rule 1's unknown-key warning; every message names the replacement
     surface): an explicit `[generate].seed_examples` / `standalone_count` / `num_per_record` /
@@ -2081,6 +2158,16 @@ is byte-equivalent to v1.13 — the ONE exception is rule 59, a v1.13 defect rep
     within a row, every name is in `[[frame.classify.classes]]`, and the composition SETS are
     pairwise distinct across rows (identical compositions are semantic duplicates). The parse
     product is `GenerateStreamConfig.tiers`, sorted tier_rank ASCENDING.
+    **v1.15 PER-EFFECTIVE-TABLE (裁决·rank 类内身份)**: this identity-and-composition check set
+    runs ONCE PER SOURCE TABLE — the global table plus EVERY declared
+    `[[class.<name>.generate.tiers]]` — with error locations prefixed
+    `[[generate.stream.tiers]]` and `[class.<name>.generate].tiers` respectively. "Covers 1..N"
+    is therefore per table (N = that table's length, which may differ per class) and "pairwise
+    distinct compositions" narrows to WITHIN ONE TABLE: identical compositions in two different
+    classes are legal (every class may own its own "all frame classes" tier). A class with
+    `sequences = 0` that declares a table STILL runs this whole check set (裁决·零额结构校验不豁免
+    — bad config is reported early); only rule 58's quota-derived checks exempt it. Per-class
+    parse product: `ClassView.tiers` (§6.1), same ascending sort.
 58. **配分推论与两条 WARN** — `apportion_tiers` (§6.1) is a pure function, so M1 can compute every
     per-(participating class, tier) quota at load time and enforce **长度可覆盖**: for every pair
     whose quota is >= 1, that class's `len_range` LOWER bound must be >= `len(tier.frame_classes)`
@@ -2088,11 +2175,17 @@ is byte-equivalent to v1.13 — the ONE exception is rule 59, a v1.13 defect rep
     ZERO-quota pairs are EXEMPT (no raising a bound for a combination that will never be
     attempted). Two non-blocking WARNs, both value-free: **配分零额** — a (participating class,
     tier) pair apportioned 0 (the natural result of a small quota against lopsided weights;
-    `report.generate.stream.tiers.<rank>.planned` reports the 0 faithfully) names the class,
+    the report's `tiers` sub-block reports the 0 faithfully) names the class,
     the tier_rank and the weight table; **帧类未入档** — a frame class belonging to no tier's
     `frame_classes` names it and states that its whole `[frame.class.<name>.generate]` face
     (instruction, schema, time_fields) is dead config, since no blueprint can ever pick it. The
     latter is the rule-51 scope-narrowing counterpart.
+    **v1.15 PER-CLASS EFFECTIVE TABLE**: every pairing above iterates
+    `effective_tiers(view.tiers, gs.tiers)` for the class in question, so the length bound, the
+    zero-quota exemption and the 配分零额 WARN (whose weight listing likewise comes from THAT
+    class's effective table) are all read per class; the 帧类未入档 WARN's domain becomes the same
+    union rule 51 uses. Classes with `sequences = 0` take part in NONE of this rule (rule 57's
+    structural checks still cover their declared table).
 59. **微秒地板（v1.13 defect repair, NOT a switch face）** — rule 53's `frame_gap_s` bound
     `0 < lo` tightens to `lo >= 1e-6`. Sub-microsecond `lo` rounds the inter-frame `timedelta` to
     0 microseconds, which already punched a hole in v1.13's "timestamps increase STRICTLY" claim,
@@ -2118,6 +2211,50 @@ is byte-equivalent to v1.13 — the ONE exception is rule 59, a v1.13 defect rep
     by the timeline, not by the schema. Finally **剔除余量** — top-level `properties` count minus
     bound-key count must be >= 1 (the LLM must keep at least one field to generate; binding every
     field is a CONFIG_ERROR). Parse product: `FrameClassView.time_fields` (None = no bindings).
+
+Per-class tier tables (v1.15, spec 3.1.4 按类档位表 row + 2.3.1 v1.15 段; the cluster runs ONLY
+inside the time-stream form, and with no per-class table declared the loader takes zero new code
+paths and the whole system stays byte-equivalent to v1.14 — the report included):
+61. **按类档位表前提** — `[[class.<name>.generate.tiers]]` (parse product `ClassView.tiers`,
+    §6.1) is a WHOLE-TABLE override of the global `[[generate.stream.tiers]]` for that sequence
+    class (裁决·表级原子覆盖 — never a row-level merge, which would let rank identity drift across
+    tables). Row parsing reuses the global table's implementation (ascending sort, positive
+    `tier_rank`, `weight >= 1` enforced at parse time) with the location prefix
+    `[class.<name>.generate].tiers`; the identity/composition checks and the quota-derived checks
+    are rules 57/58 read PER EFFECTIVE TABLE. THIS rule adds the three prerequisites, all DIRECTED
+    CONFIG_ERRORs whose location string names the class:
+    1. **形态门** — with `generate_stream.enabled = false`, ANY `[class.*.generate]` raw section
+       carrying a `tiers` key is an error (the v1.11 `use_vision` RAW-SECTION probe mechanism —
+       never rule 1's unknown-key warning). The probe reads the raw section, so it fires even when
+       the table's own contents are malformed:
+       `{fp}:[class.{cname}.generate].tiers: the per-class tier table is only legal in the
+       time-stream generation form ([generate.stream].enabled = true) - it overrides the global
+       [[generate.stream.tiers]] table for sequences of this class`
+    2. **全局锚** — the form is on, at least one per-class table is present, and the global table
+       is absent (裁决·全局表为锚):
+       `{fp}:[class.{cname}.generate].tiers: a per-class tier table overrides the global
+       [[generate.stream.tiers]] table, which is absent - declare the global table (it is the
+       fallback for classes without their own table and the switch of the whole tier face)`
+    3. **空表拒收** — `view.tiers == ()`, i.e. an explicit `tiers = []` (裁决·空表拒收 — the three
+       TOML states are: key absent = not declared ⇒ fall back; `()` = rejected here; non-empty =
+       override):
+       `{fp}:[class.{cname}.generate].tiers: expected a non-empty array of tier tables - omit the
+       key to fall back to the global [[generate.stream.tiers]] table`
+    Sub-clauses 2 and 3 are MUTUALLY EXCLUSIVE (one key, one error, one repair action — an empty
+    table's repair is "delete the key" while a missing anchor's repair is "declare the global
+    table"; stacking both would mislead), and a SHAPE-FAILED value (non-array `tiers`) lands as
+    NOT DECLARED for this cluster's purposes: the parse layer already reported
+    `[class.<name>.generate].tiers: expected array of tables`, so neither the empty-table nor the
+    anchor error stacks on top (implementation adjudications, 2026-08-19).
+    Sub-clause 2 is what keeps the tier FACE a single switch: the face is present IFF the global
+    table is non-empty, so every participating class is guaranteed a non-empty effective table and
+    every v1.14 presence predicate (`generator.tier_rank`, `truth.tier_rank`, the report
+    sub-block, the noise-slot predicate) is UNCHANGED. "Do not tier this class" is written as a
+    ONE-ROW table (`tier_rank = 1` with any composition) — a degenerate form at zero mechanism
+    cost. ZERO CHANGE elsewhere: rule 59's microsecond floor, rule 60's binding cluster, the
+    `_FRAME_CLASS_SECTION_KEYS` whitelist, the frame class table's own rules, and the static budget
+    precheck (rule 56's blueprint segment still meters the WHOLE frame class table — any per-class
+    subset is still ≤ it, so the upper-bound property holds).
 
 Warnings (non-blocking): `verify` enabled and `verify.llm`'s `model` equals `annotate.llm`'s
 `model` → warn about self-enhancement bias (spec 3.7.2). v1.7 (R8): `classify.enabled = false`
@@ -2786,7 +2923,12 @@ def tier_rank_for_ordinal(sequences: int, tiers: Sequence[TierSpec],
     tier_rank side, and truncation commutes with the mapping. Deliberately a STANDALONE function
     rather than a third element on `expand_stream_quota`'s return — widening that tuple would
     break three existing two-tuple unpack assertions, which contradicts the verbatim draw-order
-    pin-board regression."""
+    pin-board regression.
+
+    v1.15: `tiers` is that class's EFFECTIVE table (`effective_tiers`, §6.1) — the SIGNATURE AND
+    BODY ARE UNCHANGED. The blocks are therefore per class, the returned rank is an IN-CLASS rank
+    (not comparable across classes), and the `--limit` corollary above holds verbatim PER CLASS,
+    each class cutting from its own highest rank."""
 
 
 def backfill_time_fields(sessions: list[list[_StreamSlot]], cfg: ResolvedConfig) -> None:
@@ -2823,7 +2965,9 @@ Normative behavior:
   `plan_schema(frame class names, L)` (internal treatment); exhaustion/unfittable ⇒ the sequence
   is voided, `generate.stream.plan_failures`. **With a tier table (v1.14)** the blueprint call
   becomes tier-conditional: the frame classes rendered into `[帧类表]` are the frame class table
-  FILTERED (in declaration order) to `tiers[plan.tier_rank - 1].frame_classes`, the user line
+  FILTERED (in declaration order) to `tiers[plan.tier_rank - 1].frame_classes` — where `tiers` is
+  that sequence class's EFFECTIVE table, `effective_tiers(view.tiers, gs.tiers)` (v1.15; every
+  effective table covers 1..N contiguously, so the index arithmetic is unchanged) — the user line
   takes the frozen cover variant (§10.14), and the schema becomes `plan_schema(that subset, L,
   cover_all=True)` — enum gives "⊆", the per-class `contains` gives "⊇", together the composition
   is EXACTLY EQUAL to the tier's declaration. A cover violation is an ordinary L2 violation that
@@ -2837,13 +2981,26 @@ Normative behavior:
   `render_prompt_texts(noise_instruction, style, num_per_call, ())` reusing §10.4 +
   `SAMPLES_SCHEMA`, `ceil(noise frames / num_per_call)` calls; a voided batch just leaves those
   frames absent (never regenerated).
-- **Tier apportionment and identity (v1.14).** A class's `sequences` quota is split across tiers
+- **Tier apportionment and identity (v1.14; per-class since v1.15).** A class's `sequences` quota
+  is split across tiers
   by `apportion_tiers` (§6.1, integer-domain largest remainder, zero rng); in-class ordinals
   occupy CONTIGUOUS blocks in tier_rank ascending order and `tier_rank_for_ordinal` is the
-  prefix-sum lookup. `SequencePlan` gains `tier_rank: int | None = None` (None = the tier face is
+  prefix-sum lookup. **v1.15: every tier lookup in this module goes through `effective_tiers`**
+  (§6.1, imported forwards from `labelkit.common.config.model` beside `apportion_tiers`) — the
+  planning phase computes
+  `tier_rank_for_ordinal(view.sequences, effective_tiers(view.tiers, gs.tiers), ordinal)` and the
+  blueprint's tier lookup indexes the same effective table. Neither helper's signature or body
+  changes; only what is passed does, and apportionment still consumes zero rng, so the draw-order
+  table above regresses verbatim. `SequencePlan` gains `tier_rank: int | None = None` (None = the
+  tier face is
   absent; the default-value assertion belongs in `tests/operators/test_generate_stream.py`, not
   test_config, because the dataclass is operator-owned). The rank lands in exactly THREE places,
-  all conditional on a non-empty tier table: `ref.generator` gains a third key `tier_rank`
+  all conditional on a non-empty GLOBAL tier table — v1.15's anchor rule (§6.3 rule 61 sub-clause
+  2) makes that predicate identical to "the tier face is present", so all three presence tests are
+  UNCHANGED, and the only thing per-class tables change is the VALUE (an IN-CLASS rank, not
+  comparable across classes; the row's own class name travels beside it as
+  `_meta.classification.label` / `truth.sequence_class`): `ref.generator` gains a third key
+  `tier_rank`
   (`{"llm", "style", "tier_rank"}` — the emitter's `_source_block` flows it out unchanged, and
   the rejects side's existing generator carry-through follows automatically), the artifact
   `truth` gains `tier_rank` at its frozen position (§9.5), and `report.generate.stream` gains the
@@ -2913,10 +3070,17 @@ Normative behavior:
   `duplicates` / `plan_calls` / `realize_calls` (including halved sub-calls) / `noise_calls`
   (all three call counters increment BEFORE dispatch, so they include calls the budget
   precheck rejected and never sent — the flat path's precedent) / `plan_failures` /
-  `realize_failures` / `validator_scrapped`. **v1.14 adds two** (present only with a tier table):
-  `tiers.<tier_rank>.planned` (incremented per planned sequence, alongside
-  `sequences.<class>.planned`) and `tiers.<tier_rank>.produced` (same four-gate reading as
-  `sequences.<class>.produced`); `<tier_rank>` is the DECIMAL STRING form of the rank. The
+  `realize_failures` / `validator_scrapped`. **v1.14 adds two** (present only with a tier table),
+  **RE-FROZEN PER CLASS IN v1.15 (裁决·计数器键按类重冻结)**:
+  `tiers.<class>.<tier_rank>.planned` (incremented per planned sequence, alongside
+  `sequences.<class>.planned`) and `tiers.<class>.<tier_rank>.produced` (same four-gate reading as
+  `sequences.<class>.produced`); `<class>` is the sequence class name verbatim and `<tier_rank>`
+  is the DECIMAL STRING form of the rank. M6 ALWAYS feeds the class-segmented keys — single-feed
+  discipline, writing both key families is forbidden — and the FLAT report form is produced by
+  M10 summing them across classes per rank (§7.9), which is numerically byte-identical to v1.14
+  (its flat counts were cross-class aggregates already). The v1.14 key family
+  `generate.stream.tiers.<tier_rank>.*` is thereby UNFROZEN and replaced; the unfreeze is
+  registered in §12 item 36. The
   counters are the raw feed only — the report sub-block itself is assembled EXPLICITLY by M10
   (§7.9), which is what makes zero-quota and fully-voided tiers present in the report at all.
   The time-field face owns NO counter: back-fill is a deterministic mechanical operation with no
@@ -3812,16 +3976,31 @@ v1.13 time-stream generation (SPEC-stream-generation §3.7; spec 3.10.3 时间�
   over `[[classify.classes]]` in declaration order — the `report.classify` convention). The
   `report.stream` node does NOT appear (that is segment's observability surface) and
   `report.classify`'s histogram is legitimately all-zero.
-  **`tiers` sub-block (v1.14, 裁决·报表显式装配).** This section is EXPLICIT KEY ASSEMBLY, not a
-  counter prefix tree, and the `tiers` sub-block must be assembled the same way: when
-  `cfg.generate_stream.tiers` is non-empty, iterate the DECLARED tier table (stored tier_rank
-  ascending, so iteration order IS rank order) and lay it out zero-based as
-  `{"<tier_rank>": {"planned": …, "produced": …}}`, where `"<tier_rank>"` is the decimal string
-  form; the report is written without `sort_keys`, so key order equals insertion order. **Key
-  position is FROZEN between `sequences` and `frames`** (adjacent to the quota family). Assembling
+  **`tiers` sub-block (v1.14, 裁决·报表显式装配; TWO FORMS since v1.15, 裁决·嵌套报表全类铺开).**
+  This section is EXPLICIT KEY ASSEMBLY, not a
+  counter prefix tree, and the `tiers` sub-block must be assembled the same way. Presence gate
+  (UNCHANGED): `cfg.generate_stream.tiers` non-empty — the global table is the anchor, so this
+  single test still decides the whole tier face. Form gate (v1.15):
+  `any(view.tiers is not None for view in cfg.class_views.values())`.
+  - **FLAT form** (no class declared its own table): iterate the DECLARED GLOBAL table (stored
+    tier_rank ascending, so iteration order IS rank order) and lay it out zero-based as
+    `{"<tier_rank>": {"planned": …, "produced": …}}`, each value being the SUM ACROSS CLASSES of
+    the `generate.stream.tiers.<class>.<rank>.*` counters at that rank (§7.5 — M6 always feeds the
+    class-segmented keys). Numerically byte-identical to v1.14, whose flat counters were
+    cross-class aggregates already.
+  - **CLASS-NESTED form** (at least one per-class table): lay out
+    `{"<class>": {"<tier_rank>": {"planned": …, "produced": …}}}` — the OUTER level zero-based
+    over ALL DECLARED classes in `[[classify.classes]]` declaration order (the
+    `sequences.<class>` / `report.classify` convention), the INNER level over that class's
+    EFFECTIVE table (`effective_tiers(view.tiers, cfg.generate_stream.tiers)`, §6.1) in rank
+    order. Zero-quota classes and fully-voided tiers appear as 0/0.
+
+  Both forms use decimal-string rank keys, and the report is written without `sort_keys`, so key
+  order equals insertion order in both. **Key position is FROZEN between `sequences` and `frames`**
+  (adjacent to the quota family) in both forms. Assembling
   from the declaration — rather than from whichever counters happened to fire — is what puts
   zero-quota tiers and fully-voided tiers in the report at all (`planned` 0 / `produced` 0,
-  faithfully). With no tier table the key is ABSENT. This is the same family of trap as
+  faithfully). With no global tier table the key is ABSENT. This is the same family of trap as
   E2E-FINDINGS #11 (a counter silently dropped by a report allow-list), caught at the spec layer
   this time.
 
@@ -5093,7 +5272,12 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
              "fields": {<output.passthrough_fields from Record.raw>},   // {} when none
              //   v1.14 conditional third key: with a time-stream tier table declared the object
              //   is {"llm", "style", "tier_rank"} (the sequence's tier rank, a positive int);
-             //   with no tier table it stays the two-key form — §6.3 envelope additive-only
+             //   with no tier table it stays the two-key form — §6.3 envelope additive-only.
+             //   v1.15 ZERO CHANGE here: the presence test is still "the GLOBAL
+             //   [[generate.stream.tiers]] is non-empty" (the anchor rule, §6.3 rule 61), and the
+             //   keys/order are untouched — only the VALUE is now read from the row's sequence
+             //   class's EFFECTIVE table, hence an IN-CLASS rank that is not comparable across
+             //   classes (the class name travels beside it in _meta.classification.label)
              "generator": null | {"llm": "<profile>", "style": "<name>"|null}},
 
   // v1.8 — ALWAYS-PRESENT key (null whenever segment is disabled — v1.13 widens the gate to
@@ -5304,17 +5488,33 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
   //                         "sequences": {"<class>": {"planned": 0, "produced": 0}},
   //                                                  // zero-based over [[classify.classes]] in
   //                                                  // declaration order (report.classify form)
-  //                         "tiers": {"<tier_rank>": {"planned": 0, "produced": 0}},
+  //                         "tiers": <flat form> | <class-nested form>,
   //                                                  // v1.14, PRESENT ONLY with a non-empty
-  //                                                  //   [[generate.stream.tiers]]; key position
-  //                                                  //   FROZEN between "sequences" and "frames"
-  //                                                  //   (quota family adjacency); keys are the
-  //                                                  //   DECIMAL STRING ranks in ascending order;
-  //                                                  //   same reading as "sequences" above.
-  //                                                  //   Laid out zero-based over the DECLARED
-  //                                                  //   tier table by M10 (§7.9) ⇒ zero-quota
-  //                                                  //   and fully-voided tiers are present with
-  //                                                  //   0/0, not missing
+  //                                                  //   GLOBAL [[generate.stream.tiers]] (the
+  //                                                  //   anchor rule keeps this gate unchanged in
+  //                                                  //   v1.15); key position FROZEN between
+  //                                                  //   "sequences" and "frames" (quota family
+  //                                                  //   adjacency) in BOTH forms; keys are
+  //                                                  //   DECIMAL STRING ranks; same reading as
+  //                                                  //   "sequences" above. Laid out by M10 from
+  //                                                  //   the DECLARATION (§7.9) ⇒ zero-quota and
+  //                                                  //   fully-voided tiers are present with
+  //                                                  //   0/0, not missing.
+  //                                                  // v1.15 TWO FORMS, chosen by
+  //                                                  //   any(view.tiers is not None):
+  //                                                  //   FLAT (no per-class table) —
+  //                                                  //     {"<tier_rank>": {"planned": 0,
+  //                                                  //                      "produced": 0}}
+  //                                                  //     over the global table in rank order;
+  //                                                  //     BYTE-IDENTICAL to v1.14 (M10 sums the
+  //                                                  //     class-segmented counters per rank)
+  //                                                  //   CLASS-NESTED (any per-class table) —
+  //                                                  //     {"<class>": {"<tier_rank>":
+  //                                                  //        {"planned": 0, "produced": 0}}}
+  //                                                  //     outer = ALL declared classes in
+  //                                                  //     [[classify.classes]] declaration
+  //                                                  //     order, inner = that class's EFFECTIVE
+  //                                                  //     table in rank order
   //                         "frames": 0,             // task frames (Σ steps of surviving sequences)
   //                         "noise_frames": 0,       // frames actually woven in (< target when the
   //                                                  //   draw pool ran out of non-full sessions)
@@ -5536,13 +5736,21 @@ generate_only DEGENERATE form `emitted + dropped_dup + dropped_lowq + dropped_ve
 ledger). The `resolved_at` identity is RESTATED rather than changed: "the sum = the number of
 RECORD-LEVEL annotation calls entering M5" — a per-class-schema call passes an explicit schema
 yet is user-treatment and IS counted (§7.7); frame-level and internal calls still are not.
-v1.14 additions (counter key names **[FROZEN HERE]**): two `generate.stream.tiers.<tier_rank>.*`
-keys, `planned` and `produced` (owner M6, §7.5), fed only when a tier table is declared and
+v1.14 additions (counter key names **[FROZEN HERE]**, ~~`generate.stream.tiers.<tier_rank>.*`~~
+— **UNFROZEN AND REPLACED IN v1.15, see the next paragraph**): two counter keys, `planned` and
+`produced` (owner M6, §7.5), fed only when a tier table is declared and
 surfaced through M10's EXPLICIT assembly of the conditional `report.generate.stream.tiers`
 sub-block above (§7.9) — the explicit assembly, not the counters, is what guarantees zero-quota
 and fully-voided tiers appear at all. The time-field back-fill face adds NO counter (a
 deterministic mechanical operation has no countable failure mode). `counts.*` again gains
 nothing, and `resolved_at` is untouched.
+v1.15 counter-key re-freeze (裁决·计数器键按类重冻结; the v1.14 key family above is explicitly
+UNFROZEN — registered in §12 item 36): the two keys become
+`generate.stream.tiers.<class>.<tier_rank>.planned` / `.produced` **[FROZEN HERE]**, where
+`<class>` is the sequence class name verbatim. M6 ALWAYS feeds the class-segmented form (single
+feed; writing both families is forbidden), and M10 produces the FLAT report form by summing them
+across classes per rank — numerically byte-identical to v1.14, whose flat counters were
+cross-class aggregates already. No other counter, `counts.*` key or identity changes.
 
 Counter OWNERSHIP (normative): `counts.*` keys are incremented ONLY by M10 (orchestrator),
 derived from batch tallies / EmitResult — stages must never touch them (double-count).
@@ -6428,7 +6636,12 @@ ceiling — so any further parameter must convert it to a parameter object. Bind
   demands a generation instruction for every frame class: any of them may be picked. With a tier
   table declared it is the TIER's SUBSET (the frame class table filtered, in declaration order,
   to that tier's `frame_classes`), the caller does the filtering, and rule 51's instruction
-  requirement correspondingly narrows to the UNION of the tiers' compositions.
+  requirement correspondingly narrows to the UNION of the tiers' compositions. **v1.15 one more
+  level of conditioning**: "that tier" is the row of the sequence class's EFFECTIVE table
+  (`effective_tiers(view.tiers, gs.tiers)`, §6.1) at `plan.tier_rank`, so two classes at the same
+  rank may render different frame tables; rule 51's union correspondingly runs over the
+  PARTICIPATING classes' effective tables. Template bytes are unaffected — this only changes which
+  rows the caller passes in.
 - On L0-off endpoints the structure block IS the structural guarantee, not a fallback: the
   `{"steps": [...]}` shape sentence plus the per-field explanation carry compliance (the
   DeepSeek anthropic route hard-rejects forced tool calls, so `supports_structured_output` is
@@ -7116,7 +7329,11 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       item-33 re-freeze), and `report.generate.stream` gains `tiers` between `sequences` and
       `frames` (§9.3) — the last one assembled EXPLICITLY from the declared tier table by M10
       (§7.9), which is what makes zero-quota and fully-voided tiers appear with 0/0 rather than
-      vanish (the E2E-FINDINGS #11 family of trap, caught at the spec layer);
+      vanish (the E2E-FINDINGS #11 family of trap, caught at the spec layer).
+      **v1.15 amendment (item 36):** the presence test of all three stays "the GLOBAL tier table
+      is non-empty" (the anchor rule) and their keys and order are unchanged; the rank VALUE
+      becomes an IN-CLASS one, and the report's `tiers` sub-block gains a second, class-nested
+      form while the counter keys behind it are re-frozen per class;
     - **binding vocabulary and back-fill** (§6.1 `FrameClassView.time_fields`, §7.5): the FROZEN
       four-word closed set `{ts, gap_prev_s, gap_next_s, elapsed_s}` with literal type equality
       (`"string"` for `ts`, `"number"` for the rest); bound fields are STRIPPED from the
@@ -7128,7 +7345,9 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       the `sample_validator` and sequence-similarity hooks keep seeing PRE-back-fill payloads;
     - **config surface** = §6.3 rules 57–60, plus the `_FRAME_CLASS_SECTION_KEYS["generate"]`
       whitelist growing from three keys to four (`time_fields`) and rule 51's
-      instruction-required scope narrowing to the union of tier compositions;
+      instruction-required scope narrowing to the union of tier compositions.
+      **v1.15 amendment (item 36):** rules 57/58 are re-read PER EFFECTIVE TABLE, rule 61 joins
+      the cluster, and rule 51's union runs over the participating classes' effective tables;
     - **v1.13 defect repair, not a switch face**: rule 59's `frame_gap_s.lo >= 1e-6` microsecond
       floor — zero impact on any project with `lo >= 1e-6` (every example uses 5);
     - **zero-change anchors**: the draw-order table (item 33's amendment), `estimate_run` and the
@@ -7137,5 +7356,61 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       channels/events, §7.6 error kinds, the status machine, the Stage-contract exceptions and
       the conservation identity. With both switches off the whole system is byte-equivalent to
       v1.13 (rule 59 excepted, as a defect repair).
+36. **按类档位表冻结点** — v1.15 (feature spec `docs/dev/SPEC-per-class-tiers.md`, adjudications
+    recorded by NAME — 表级原子覆盖 / 全局表为锚 / rank 类内身份 / 空表拒收 /
+    载体 ClassView 顶层字段 / note 行不因档位触发 / effective_tiers 下沉 common /
+    计数器键按类重冻结 / 嵌套报表全类铺开 / 校验域并集化 / 零额结构校验不豁免; 2026-08-19). The
+    PER-CLASS increment of v1.14's tier face, fully ORTHOGONAL to its time-field back-fill face
+    (zero contact). Key frozen points:
+    - **new config surface** `[[class.<name>.generate.tiers]]` (parse product `ClassView.tiers`,
+      §6.1 — three states: `None` not declared / `()` rejected / non-empty override) with
+      WHOLE-TABLE override semantics, never a row merge (裁决·表级原子覆盖; the precedents are
+      `[class.*.quality].rubric` and `[class.*.annotate].schema_*`). The `[class.*.generate]`
+      whitelist grows from six keys to seven (§6.3 rule 25 — an unlisted `tiers` would be
+      rejected by the whitelist loop before rule 61 ever ran), and the carrier is a ClassView
+      TOP-LEVEL field rather than `GenerateConfig`, so a pure tier override never trips the
+      dry-run per-class-override note — tiers change no call count (裁决·载体 ClassView 顶层字段 +
+      裁决·note 行不因档位触发);
+    - **`effective_tiers`** (§6.1) — the SINGLE tier lookup point, living in `model.py` beside
+      `apportion_tiers` for the same layering reason (M1's constraint cluster, M6's planning
+      phase and M10's report assembly share one implementation; common may not import operators,
+      so M6/M10 import it backwards). `apportion_tiers` and `tier_rank_for_ordinal` keep their
+      SIGNATURES AND BODIES — only what the call sites pass changes — and apportionment still
+      consumes ZERO rng;
+    - **§6.3 rule 61** — three DIRECTED CONFIG_ERROR sub-clauses with the verbatim messages
+      recorded there: the form gate (the v1.11 raw-section probe, so it fires even on a malformed
+      table), the GLOBAL ANCHOR (a per-class table requires the global one — which is what keeps
+      the tier face a single switch and every v1.14 presence predicate unchanged), and
+      empty-table rejection. Rules 57/58 are re-read PER EFFECTIVE TABLE ("covers 1..N" per table
+      with a per-class N, "pairwise distinct compositions" narrowed to WITHIN one table so
+      cross-class duplicates are legal, quota checks and the 配分零额 WARN per class), while rule
+      51's instruction scope and the 帧类未入档 WARN domain become the UNION over PARTICIPATING
+      classes' effective tables (裁决·校验域并集化). A zero-quota class's declared table still runs
+      the structural checks and is exempt only from the quota-derived ones
+      (裁决·零额结构校验不豁免);
+    - **counter keys UNFROZEN and RE-FROZEN PER CLASS** — v1.14's
+      `generate.stream.tiers.<tier_rank>.*` family is replaced by
+      `generate.stream.tiers.<class>.<tier_rank>.{planned, produced}` (§7.5/§9.3). M6 ALWAYS feeds
+      the class-segmented form (single-feed discipline; writing both families is forbidden). This
+      is the ONLY frozen surface v1.15 unfreezes, registered here per the §12 discipline;
+    - **report `tiers` gains a SECOND FORM** (§7.9/§9.3, 裁决·嵌套报表全类铺开) — FLAT when no
+      class declared a table (M10 sums the class-segmented counters per rank ⇒ BYTE-IDENTICAL to
+      v1.14, whose flat counts were cross-class aggregates already) and CLASS-NESTED
+      `{"<class>": {"<tier_rank>": {planned, produced}}}` when any did: outer level zero-based
+      over ALL declared classes in `[[classify.classes]]` declaration order, inner over that
+      class's EFFECTIVE table in rank order, zero-quota classes and fully-voided tiers present
+      with 0/0. The presence gate and the frozen key position between `sequences` and `frames`
+      hold in BOTH forms;
+    - **zero-change anchors**: the draw-order table (per-class apportionment is still the
+      zero-consumption step between ① and ②), `estimate_run` and the estimate line format, the
+      EIGHT dry-run goldens (byte-frozen, example extension included), the console key sets and
+      panel rows, `TEMPLATE_HEAD_TOKENS` and every §10 template BYTE (§10.14's extra conditioning
+      only changes which rows the caller passes in), `plan_schema` / `realize_schema`, trace
+      channels and events (§8.1), §7.6 error kinds (rule 61's errors ride the existing
+      CONFIG_ERROR face), `_meta.source.generator` and the artifact `truth` (keys, order and
+      presence tests all unchanged — only the VALUE becomes an in-class rank), the rejects
+      surface, the status machine, the Stage-contract exceptions and the conservation identity.
+      The v1.14 time-field back-fill face is untouched. With no per-class table declared the whole
+      system is byte-equivalent to v1.14, the report included.
 
 — End of contract. —

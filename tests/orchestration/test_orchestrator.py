@@ -915,10 +915,11 @@ async def test_generate_only_interrupt_stops_taking_batches_after_generation(tmp
 
 def stream_gen_cfg(tmp_path, *, batch_size=4, limit=None, quotas=None,
                    quality=False, annotate=False, verify=False,
-                   noise_ratio=0.0, tiers=()) -> ResolvedConfig:
+                   noise_ratio=0.0, tiers=(), class_tiers=None) -> ResolvedConfig:
     """M1 形状的时间流形态配置：classify 类表 = 配额载体（inherited 零调用），
     class_views 携按类 sequences/len_range，generate_stream 开启。v1.14：tiers
-    传入即档位面在场（按 tier_rank 升序存放，M1 解析产物的形状）。"""
+    传入即档位面在场（按 tier_rank 升序存放，M1 解析产物的形状）。v1.15：
+    class_tiers 逐类给 ClassView.tiers（缺席 = None = 回落全局表）。"""
     quotas = quotas or {"faq": 2, "chat": 1}
     base = make_cfg(tmp_path, mode="generate_only", batch_size=batch_size,
                     limit=limit, quality=quality, annotate=annotate, verify=verify,
@@ -932,7 +933,8 @@ def stream_gen_cfg(tmp_path, *, batch_size=4, limit=None, quotas=None,
         tiers=tuple(tiers)))
     overrides = {
         name: {"generate": replace(cfg.generate, instruction=f"生成{name}",
-                                   sequences=n, len_range=(2, 3))}
+                                   sequences=n, len_range=(2, 3)),
+               "tiers": (class_tiers or {}).get(name)}
         for name, n in quotas.items()}
     return with_views(cfg, overrides)
 
@@ -1096,11 +1098,14 @@ def tier_table() -> tuple[TierSpec, ...]:
 
 async def test_generate_stream_report_tiers_shape_and_key_order(tmp_path):
     """v1.14（裁决·报表显式装配）：tiers 子块按声明表 tier_rank 升序零基铺开
-    planned/produced，键位冻结在 sequences 之后、frames 之前（配额族相邻）。"""
-    counters = {"generate.stream.tiers.1.planned": 2,
-                "generate.stream.tiers.1.produced": 2,
-                "generate.stream.tiers.2.planned": 1,
-                "generate.stream.tiers.2.produced": 1}
+    planned/produced，键位冻结在 sequences 之后、frames 之前（配额族相邻）。v1.15：
+    无按类表 ⇒ 平面形，逐 rank 对**全部声明类**的类段计数跨类求和。"""
+    counters = {"generate.stream.tiers.faq.1.planned": 1,
+                "generate.stream.tiers.faq.1.produced": 1,
+                "generate.stream.tiers.chat.1.planned": 1,
+                "generate.stream.tiers.chat.1.produced": 1,
+                "generate.stream.tiers.faq.2.planned": 1,
+                "generate.stream.tiers.faq.2.produced": 1}
     gen = PureStreamGenerateStage([stream_envelope(1)], ["l1"], counters)
     cfg = stream_gen_cfg(tmp_path, tiers=tier_table())
     orch, _, emitter, _ = build(cfg, [gen])
@@ -1120,8 +1125,8 @@ async def test_generate_stream_report_tiers_shape_and_key_order(tmp_path):
 async def test_generate_stream_report_tiers_keeps_a_zero_quota_tier_present(tmp_path):
     """零额档/全作废档由装配保证在场（不依赖计数器首触序）：planned 与 produced
     如实呈现 0——E2E-FINDINGS 第 11 条（计数器被报表白名单静默丢弃）的同族防线。"""
-    counters = {"generate.stream.tiers.1.planned": 3,
-                "generate.stream.tiers.1.produced": 2}
+    counters = {"generate.stream.tiers.faq.1.planned": 3,
+                "generate.stream.tiers.faq.1.produced": 2}
     gen = PureStreamGenerateStage([stream_envelope(1)], [], counters)
     cfg = stream_gen_cfg(tmp_path, tiers=tier_table())
     orch, _, emitter, _ = build(cfg, [gen])
@@ -1139,6 +1144,73 @@ async def test_generate_stream_report_has_no_tiers_block_without_the_table(tmp_p
     orch, _, emitter, _ = build(cfg, [gen])
     await orch.run()
     assert "tiers" not in emitter.report["generate"]["stream"]
+
+
+# ── v1.15 报表双形（SPEC-per-class-tiers §3.3）──────────────────────────────
+
+def own_tier_table() -> tuple[TierSpec, ...]:
+    """faq 的按类表：单档（N 逐类可不同，跨类 rank 无可比性）。"""
+    return (TierSpec(tier_rank=1, weight=1, frame_classes=("task_request",)),)
+
+
+async def test_generate_stream_report_tiers_flat_form_sums_across_classes(tmp_path):
+    """平面形（全部类都回落全局表）= 逐 rank 对**全部声明类**的类段计数求和——
+    与 v1.14 的平面报表逐字节相等（彼时的计数本就是跨类聚合值）。"""
+    counters = {"generate.stream.tiers.faq.1.planned": 5,
+                "generate.stream.tiers.chat.1.planned": 4,
+                "generate.stream.tiers.chat.2.produced": 3}
+    gen = PureStreamGenerateStage([stream_envelope(1)], ["l1"], counters)
+    cfg = stream_gen_cfg(tmp_path, tiers=tier_table())
+    orch, _, emitter, _ = build(cfg, [gen])
+    await orch.run()
+    assert emitter.report["generate"]["stream"]["tiers"] == {
+        "1": {"planned": 9, "produced": 0},         # 5 + 4，未落账的字段呈 0
+        "2": {"planned": 0, "produced": 3}}
+
+
+async def test_generate_stream_report_tiers_nest_by_class_when_one_is_declared(tmp_path):
+    """任一按类表在场即切类嵌套形（裁决·嵌套报表全类铺开）：外层全部声明类按
+    声明序、内层该类**生效表** rank 升序；回落类照旧铺全局表的两档。"""
+    counters = {"generate.stream.tiers.faq.1.planned": 2,
+                "generate.stream.tiers.faq.1.produced": 2,
+                "generate.stream.tiers.chat.1.planned": 1,
+                "generate.stream.tiers.chat.2.planned": 1,
+                "generate.stream.tiers.chat.2.produced": 1}
+    gen = PureStreamGenerateStage([stream_envelope(1)], ["l1"], counters)
+    cfg = stream_gen_cfg(tmp_path, tiers=tier_table(),
+                         class_tiers={"faq": own_tier_table()})
+    orch, _, emitter, _ = build(cfg, [gen])
+    await orch.run()
+
+    stream_block = emitter.report["generate"]["stream"]
+    assert list(stream_block) == ["sessions", "crossed_sessions", "sequences",
+                                  "tiers", "frames", "noise_frames", "duplicates",
+                                  "plan_calls", "realize_calls", "noise_calls",
+                                  "plan_failures", "realize_failures",
+                                  "validator_scrapped"]
+    assert list(stream_block["tiers"]) == ["chat", "faq"]        # 类表声明序
+    assert list(stream_block["tiers"]["chat"]) == ["1", "2"]     # 回落全局表两档
+    assert list(stream_block["tiers"]["faq"]) == ["1"]           # 按类表单档
+    assert stream_block["tiers"] == {
+        "chat": {"1": {"planned": 1, "produced": 0},
+                 "2": {"planned": 1, "produced": 1}},
+        "faq": {"1": {"planned": 2, "produced": 2}}}
+
+
+async def test_generate_stream_report_tiers_nested_keeps_zero_quota_classes(tmp_path):
+    """嵌套形也是显式装配：零配额类与全作废档一律呈现 0/0（迭代声明表，不依赖
+    计数器首触序）——E2E-FINDINGS 第 11 条的同族防线。"""
+    counters = {"generate.stream.tiers.faq.1.planned": 3,
+                "generate.stream.tiers.faq.1.produced": 2}
+    gen = PureStreamGenerateStage([stream_envelope(1)], [], counters)
+    cfg = stream_gen_cfg(tmp_path, quotas={"faq": 3, "chat": 0}, tiers=tier_table(),
+                         class_tiers={"faq": own_tier_table()})
+    orch, _, emitter, _ = build(cfg, [gen])
+    await orch.run()
+    assert emitter.report["generate"]["stream"]["tiers"] == {
+        "chat": {"1": {"planned": 0, "produced": 0},
+                 "2": {"planned": 0, "produced": 0}},
+        "faq": {"1": {"planned": 3, "produced": 2}}}
 
 
 async def test_generate_stream_off_report_has_no_stream_block(tmp_path):

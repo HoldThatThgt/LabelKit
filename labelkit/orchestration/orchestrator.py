@@ -45,6 +45,7 @@ from itertools import islice
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 from labelkit import TOOL_VERSION, __version__
+from labelkit.common.config.model import effective_tiers
 from labelkit.common.contracts.stage import RunContext, Stage
 from labelkit.common.contracts.types import PipelineItem, Record
 from labelkit.common.errors import CircuitBreakerTripped, InternalError
@@ -52,7 +53,7 @@ from labelkit.common.runtime import budget
 from labelkit.orchestration.profile_usage import referenced_profiles
 
 if TYPE_CHECKING:
-    from labelkit.common.config.model import LLMProfile, ResolvedConfig
+    from labelkit.common.config.model import LLMProfile, ResolvedConfig, TierSpec
     from labelkit.common.observability.obslog import MetricsSink
     from labelkit.common.runtime.llm_client import LLMClient
     from labelkit.common.runtime.schema_engine import SchemaEngine
@@ -1453,20 +1454,41 @@ class Orchestrator:
         return block
 
     def _report_stream_tiers(self, c: _CounterView) -> dict:
-        """v1.14 档位配额子块：按声明档位表零基铺开 planned / produced。
+        """v1.14 档位配额子块：按声明档位表零基铺开 planned / produced（v1.15 双形）。
 
-        档位表按 tier_rank 升序存放（M1 解析期定序），故迭代序即 rank 升序；键为十进制
-        字符串的档位序数（report 落盘无 sort_keys ⇒ 键序 = 装配插入序）。
+        平面形（全部序列类都回落全局表）= v1.14 原形 ``{"<rank>": …}``，逐 rank 对**全部
+        声明类**的类段计数跨类求和 —— 与 v1.14 报表逐字节相等（彼时的平面计数本就是跨类
+        聚合值）。类嵌套形（任一按类表在场；裁决·嵌套报表全类铺开）=
+        ``{"<class>": {"<rank>": …}}``，外层全部声明类按声明序、内层该类**生效表** rank
+        升序。零配额类与全作废档一律呈现 0/0（显式装配，不依赖计数器首触序）。
 
         @param c: 计数器视图
-        @return: {"<tier_rank>": {"planned": …, "produced": …}} 字典
+        @return: 平面形或类嵌套形的 tiers 子块（十进制字符串键，键序 = 装配插入序）
+        """
+        cfg, views = self.cfg, self.cfg.class_views
+        names = [spec.name for spec in cfg.classify.classes]
+        if not any(view.tiers is not None for view in views.values()):
+            return self._tier_ranks(c, names, cfg.generate_stream.tiers)
+        return {name: self._tier_ranks(c, [name], effective_tiers(
+            views[name].tiers if name in views else None, cfg.generate_stream.tiers))
+            for name in names}
+
+    def _tier_ranks(self, c: _CounterView, names: list[str],
+                    table: "Sequence[TierSpec]") -> dict:
+        """把一张档位表铺成 ``{"<rank>": {planned, produced}}``，逐 rank 跨给定类段求和。
+
+        @param c: 计数器视图
+        @param names: 参与求和的序列类名（平面形 = 全部声明类；嵌套形 = 该类一个）
+        @param table: 该形态下的档位表（M1 解析期已按 tier_rank 升序定序）
+        @return: rank 升序的十进制字符串键字典
         """
         return {
             str(spec.tier_rank): {
-                "planned": c(f"generate.stream.tiers.{spec.tier_rank}.planned"),
-                "produced": c(f"generate.stream.tiers.{spec.tier_rank}.produced"),
+                field: sum(c(f"generate.stream.tiers.{name}.{spec.tier_rank}.{field}")
+                           for name in names)
+                for field in ("planned", "produced")
             }
-            for spec in self.cfg.generate_stream.tiers
+            for spec in table
         }
 
     def _report_classify(self, c: _CounterView) -> dict:

@@ -317,8 +317,11 @@ class TierSpec:
     """
 
     tier_rank: int                                # 档位序数（第几档的要求）：正整数、
-                                                  # 表内唯一、全表连续覆盖 1..N；也是
-                                                  # 配分平票与类内序数分块的确定性排序
+                                                  # 表内唯一、**每张生效表各自**连续
+                                                  # 覆盖 1..N（v1.15 裁决·rank 类内
+                                                  # 身份——按类表在场时 N 逐类可不同，
+                                                  # 跨类同 rank 无工具语义）；也是配分
+                                                  # 平票与类内序数分块的确定性排序
                                                   # 依据。工具**不赋予**序数高低任何
                                                   # 质量方向语义（方向归用户）
     weight: int                                   # 配额权重：整数 >= 1；类配额按整数域
@@ -342,8 +345,10 @@ def apportion_tiers(sequences: int, tiers: Sequence[TierSpec]) -> tuple[int, ...
     期共用同一实现，而分层纪律不许 common 依赖 operators（M6 反向导入）。
 
     @param sequences 该类的序列尝试配额（>= 0；0 = 该类不参与，逐档得 0）
-    @param tiers 档位表，调用方按 ``tier_rank`` 升序传入（``GenerateStreamConfig.tiers``
-                 的存放序即此序），每档 ``weight >= 1``（M1 解析期强制）
+    @param tiers 该类的**生效**档位表（v1.15：按类表 ?? 全局表，取自
+                 ``effective_tiers``），调用方按 ``tier_rank`` 升序传入
+                 （``GenerateStreamConfig.tiers`` / ``ClassView.tiers`` 的存放序即
+                 此序），每档 ``weight >= 1``（M1 解析期强制）
     @return 与入参同序（即 ``tier_rank`` 升序）的逐档配额元组；空档位表返回空元组
     """
     if not tiers:
@@ -357,6 +362,24 @@ def apportion_tiers(sequences: int, tiers: Sequence[TierSpec]) -> tuple[int, ...
     for i in order[:sequences - sum(quotas)]:
         quotas[i] += 1
     return tuple(quotas)
+
+
+def effective_tiers(class_tiers: tuple[TierSpec, ...] | None,
+                    global_tiers: tuple[TierSpec, ...]) -> tuple[TierSpec, ...]:
+    """v1.15（裁决·表级原子覆盖 + 裁决·全局表为锚）：取一个序列类的生效档位表。
+
+    表级原子覆盖——类声明了就用类的**整张表**，未声明（None）回落全局表；不做行级
+    合并（行级合并会让 rank 身份跨表漂移）。全局表为锚 ⇒ 档位面开关恒 = 全局表非空，
+    每个参与类恒有生效表。落点在 common 而非 operators：M1 约束簇、M6 计划期与 M10
+    报表装配三方共用同一实现，而分层纪律不许 common 依赖 operators（M6/M10 反向导入，
+    ``apportion_tiers`` 同款）。
+
+    @param class_tiers 该类的 ``[[class.<name>.generate.tiers]]`` 解析产物；
+                       None = 未声明（回落）；空元组 = 显式空表（M1 拒收，此处原样返回）
+    @param global_tiers 全局 ``[[generate.stream.tiers]]`` 档位表
+    @return 该类的生效档位表（按 ``tier_rank`` 升序）
+    """
+    return global_tiers if class_tiers is None else class_tiers
 
 
 @dataclass(frozen=True)
@@ -529,6 +552,16 @@ class ClassView:
                                                   # （至多其一）；None = 回落全局
                                                   # output.schema（覆盖语义，rubric 按类
                                                   # 重资产先例）
+    tiers: tuple[TierSpec, ...] | None = None     # v1.15（裁决·表级原子覆盖 + 裁决·载体
+                                                  # ClassView 顶层字段）：该类的档位表
+                                                  # （[[class.<name>.generate.tiers]]），按
+                                                  # tier_rank 升序存放。None = 未声明 ⇒ 回落
+                                                  # 全局 [[generate.stream.tiers]]（生效表查
+                                                  # 找恒经 effective_tiers）；空元组 = 显式
+                                                  # 空表 ⇒ M1 拒收。**不落** GenerateConfig：
+                                                  # 档位不改变任何调用数，dry-run 的按类覆盖
+                                                  # 注记不应因它触发（裁决·note 行不因档位
+                                                  # 触发）
 
 
 # ── 帧粒度（v1.12，spec §3.1 [frame.classify]/[frame.annotate]/[frame.class.*]）──

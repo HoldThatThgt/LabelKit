@@ -37,6 +37,7 @@ from labelkit.common.config._schemas import (
 from labelkit.common.config._sections import (
     _parse_examples,
     _parse_styles,
+    _parse_tiers,
     _parse_time_fields,
 )
 from labelkit.common.config.model import (
@@ -50,6 +51,7 @@ from labelkit.common.config.model import (
     GenerateConfig,
     QualityConfig,
     Rubric,
+    TierSpec,
     VerifyConfig,
 )
 
@@ -61,11 +63,13 @@ from labelkit.common.config.model import (
 # v1.13 增两族键: annotate 的 schema_path/schema_inline(裁决·按类标注 Schema,
 # 覆盖语义、缺省回落全局 output.schema)与 generate 的 sequences/len_range
 # (时间流形态的按类配额与序列长度区间载体)。
+# v1.15(裁决·表级原子覆盖)增 generate 第七键 tiers(按类档位表, 整表取代全局表;
+# 未声明即回落全局表)。
 _CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "quality": ("mode", "rounds", "rubric", "threshold", "selection", "top_ratio"),
     "annotate": ("instruction", "examples", "schema_path", "schema_inline"),
     "generate": ("instruction", "styles", "num_per_record", "temperature",
-                 "sequences", "len_range"),
+                 "sequences", "len_range", "tiers"),
     "verify": ("extra_criteria",),
     "extract": ("instruction",),
 }
@@ -123,6 +127,8 @@ class _MergedClass:
     examples_provided: bool     # 该类是否自带 few-shot 示例(决定是否干跑)
     schema_path: str | None     # v1.13 按类标注 Schema 的文件源
     schema_inline: str | None   # v1.13 按类标注 Schema 的内联源
+    tiers: tuple[TierSpec, ...] | None = None
+                                # v1.15 按类档位表; None = 未声明(回落全局表)
 
 
 @dataclass
@@ -223,15 +229,16 @@ def _merge_class_sections(col: _Collector, file: str, cname: str, sections: dict
     quality = _merge_class_quality(col, file, cname, _sect("quality"), bases.quality)
     annotate, examples_provided, schema_path, schema_inline = _merge_class_annotate(
         col, file, cname, _sect("annotate"), bases.annotate)
+    generate, tiers = _merge_class_generate(col, file, cname, _sect("generate"),
+                                            bases.generate)
     return _MergedClass(
-        quality=quality, annotate=annotate,
-        generate=_merge_class_generate(col, file, cname, _sect("generate"), bases.generate),
+        quality=quality, annotate=annotate, generate=generate,
         verify=_merge_class_verify(col, file, cname, _sect("verify"), bases.verify),
         extract=_merge_class_extract(col, file, cname, _sect("extract"), bases.extract),
         rubric_raw=(sections.get("rubric")
                     if isinstance(sections.get("rubric"), dict) else None),
         examples_provided=examples_provided,
-        schema_path=schema_path, schema_inline=schema_inline,
+        schema_path=schema_path, schema_inline=schema_inline, tiers=tiers,
     )
 
 
@@ -323,18 +330,23 @@ def _check_class_selection_group(col: _Collector, file: str, cname: str, q_over:
 
 
 def _merge_class_generate(col: _Collector, file: str, cname: str, g_over: dict,
-                          base: GenerateConfig) -> GenerateConfig:
+                          base: GenerateConfig,
+                          ) -> tuple[GenerateConfig, tuple[TierSpec, ...] | None]:
     """``[class.<name>.generate]`` 的合并(按键溯源)。
+
+    v1.15(裁决·载体 ClassView 顶层字段): 第七键 ``tiers`` 与其余六键分道——它**不落**
+    ``GenerateConfig``(否则纯档位覆盖会被编排器误判为"估算失真型按类覆盖"), 而是随
+    返回值另交给视图物化侧挂在 ``ClassView.tiers`` 上。
 
     @param col 错误聚合器
     @param file 报错定位用的 project.toml 路径字符串
     @param cname 序列类名
     @param g_over 该类的 generate 覆盖表
     @param base 全局生成基线
-    @return 合并后的 ``GenerateConfig``
+    @return (合并后的 ``GenerateConfig``, 按类档位表 | None——None = 未声明即回落全局)
     """
     t = _Tbl(col, file, f"[class.{cname}.generate]", g_over)
-    return replace(
+    merged = replace(
         base,
         instruction=t.get_str("instruction", base.instruction, nonempty=True),
         styles=(_parse_styles(col, file, t.take("styles"), section=f"class.{cname}.generate")
@@ -344,6 +356,15 @@ def _merge_class_generate(col: _Collector, file: str, cname: str, g_over: dict,
         sequences=t.get_int("sequences", base.sequences, minimum=0),
         len_range=_int_pair(t, "len_range", base.len_range),
     )
+    if "tiers" in g_over:
+        raw = t.take("tiers")
+        parsed = _parse_tiers(col, file, raw, f"[[class.{cname}.generate.tiers]]")
+        # 形状错误(键值非数组)已在解析层报出且修复动作明确(改写成数组表), 按未声明
+        # 落库——不再叠报 rule 61 的空表/锚错(同一个键一条错误一个修复动作, 互斥推论)。
+        tiers = parsed if isinstance(raw, list) else None
+    else:
+        tiers = None
+    return merged, tiers
 
 
 def _merge_class_verify(col: _Collector, file: str, cname: str, v_over: dict,
@@ -380,7 +401,7 @@ def _merge_class_extract(col: _Collector, file: str, cname: str, e_over: dict,
 
 
 def _inherit_class(bases: _ClassBases) -> _MergedClass:
-    """零覆盖的类: 全盘继承全局基线。
+    """零覆盖的类: 全盘继承全局基线(v1.15: 档位表得 None ⇒ 回落全局表)。
 
     @param bases 各节全局基线
     @return ``_MergedClass``
@@ -388,7 +409,8 @@ def _inherit_class(bases: _ClassBases) -> _MergedClass:
     return _MergedClass(quality=bases.quality, annotate=bases.annotate,
                         generate=bases.generate, verify=bases.verify,
                         extract=bases.extract, rubric_raw=None,
-                        examples_provided=False, schema_path=None, schema_inline=None)
+                        examples_provided=False, schema_path=None,
+                        schema_inline=None, tiers=None)
 
 
 def _class_sections(col: _Collector, file: str, cname: str, class_raw: Any) -> dict | None:
@@ -529,7 +551,7 @@ def _build_class_views(col: _Collector, classify: ClassifyConfig, class_raw: Any
         views[cname] = ClassView(name=cname, quality=merged.quality, rubric=rubric_c,
                                  annotate=merged.annotate, generate=merged.generate,
                                  verify=merged.verify, extract=merged.extract,
-                                 schema=schema_c)
+                                 schema=schema_c, tiers=merged.tiers)
     return views
 
 

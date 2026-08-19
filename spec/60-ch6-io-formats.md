@@ -62,6 +62,10 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
                "generator": null},   // v1.2 只增：生成记录为 {"llm", "style"}（3.6.2），否则 null；
                                      //   v1.14 键集条件形：时间流生成的档位表在场时增第三键
                                      //   tier_rank（该序列所属档位序数），档位表缺省时维持两键
+                                     //   v1.15 零改动：在场判据仍是**全局**档位表非空（全局表为锚），键与序
+                                     //   不动；仅值来源条件化——= 本行序列类**生效表**内的档序数
+                                     //   （生效表 = 该类的 [[class.<name>.generate.tiers]] 或回落全局表），
+                                     //   跨类同序数不可比，类名见同行 _meta.classification.label
     "stream": null,                  // v1.8 恒在键（位置：source 之后、scores 之前——链序镜像）；
                                      // = null 当 segment 与 generate_stream 均未启用（v1.13 门扩：
                                      //   segment.enabled ∨ generate_stream.enabled，3.11.2）。启用时（3.14/3.10.3）：
@@ -194,13 +198,24 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
   //                "stream": {"sessions",            // 交织出的会话数（**不含**重发尾会话）
   //                           "crossed_sessions",    // 其中的交叉会话数（= Σ幸存 − sessions_eff）
   //                           "sequences": {<class>: {"planned", "produced"}},  // 按 [[classify.classes]] 声明序零基铺开
-  //                           "tiers": {"<tier_rank>": {"planned", "produced"}}, // v1.14，**条件在场**：仅
-  //                                                  //   [[generate.stream.tiers]] 非空时出现；键位冻结在
-  //                                                  //   sequences 之后、frames 之前（配额族相邻），键为十进制
-  //                                                  //   字符串的档位序数、按 tier_rank 升序；口径同 sequences
-  //                                                  //   （planned 计于计划期、produced 数最终进链的条数）。
-  //                                                  //   由 M10 按声明档位表**显式铺开** ⇒ 零额档与全作废档也
-  //                                                  //   如实在场（planned 0 / produced 0），不依赖计数器首触序
+  //                           "tiers": {...},        // v1.14，**条件在场**：仅**全局** [[generate.stream.tiers]]
+  //                                                  //   非空时出现（全局表为锚，v1.15 判据零改动）；键位冻结在
+  //                                                  //   sequences 之后、frames 之前（配额族相邻）；口径同
+  //                                                  //   sequences（planned 计于计划期、produced 数最终进链的
+  //                                                  //   条数）。由 M10 **显式铺开** ⇒ 零额档与全作废档也如实
+  //                                                  //   在场（planned 0 / produced 0），不依赖计数器首触序。
+  //                                                  //   **v1.15 双形**（按任一按类档位表是否在场二选一）：
+  //                                                  //   ① 平面形（全部序列类均未声明按类表）——
+  //                                                  //      {"<tier_rank>": {"planned", "produced"}}，
+  //                                                  //      按全局表 rank 升序铺开；与 v1.14 报表**逐字节相等**
+  //                                                  //      （M6 恒喂类段计数器，本形由 M10 按 rank 跨类求和）
+  //                                                  //   ② 类嵌套形（任一 [[class.<name>.generate.tiers]] 在场）——
+  //                                                  //      {"<class>": {"<tier_rank>": {"planned", "produced"}}}，
+  //                                                  //      外层 = 全部声明序列类按**声明序**零基铺开
+  //                                                  //      （sequences.<class> 同款）、内层 = 该类**生效表**
+  //                                                  //      rank 升序；零配额类与全作废档同呈 0/0
+  //                                                  //   两形的键均为十进制字符串，落盘无 sort_keys ⇒ 键序 =
+  //                                                  //   装配插入序；键位在两形下都仍冻结于 sequences 与 frames 之间
   //                           "frames",              // 任务帧总数（幸存序列的步数之和）
   //                           "noise_frames",        // 实际织入的噪音帧数（签池耗尽时 < 目标数）
   //                           "duplicates",          // 实际重发的序列条数（按幸存数钳制后）
@@ -250,7 +265,7 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 | `session` | int | 全流会话序数，0 基（含重发尾会话）。 |
 | `sequence_class` | str \| null | 所属序列类名；噪音帧为 null。 |
 | `sequence` | int \| null | 该序列在其类内的序数，0 基（= 计划期标识）；噪音帧与**重发副本**为 null。 |
-| `tier_rank` | int \| null | **v1.14 新增，仅档位表（`[[generate.stream.tiers]]`）在场时出现**：该序列所属档位的序数。任务帧 = 本档序数；噪音帧为 null；重发帧**承源**（= 被重发序列的档位）。键位在 `sequence` 之后（序列身份组）、`frame_class` 之前——**键序重冻结**，行文件的字节序由此定（id 用 canonical JSON 键排序计算，不受键序影响）。 |
+| `tier_rank` | int \| null | **v1.14 新增，仅档位表（全局 `[[generate.stream.tiers]]`）在场时出现**：该序列所属档位的序数。任务帧 = 本档序数；噪音帧为 null；重发帧**承源**（= 被重发序列的档位）。键位在 `sequence` 之后（序列身份组）、`frame_class` 之前——**键序重冻结**，行文件的字节序由此定（id 用 canonical JSON 键排序计算，不受键序影响）。**v1.15 零改动**：在场判据（全局表非空，全局表为锚）、键、键序、三类帧的取值规则全部不动；仅值来源条件化——= 本行序列类**生效表**内的档序数（生效表 = 该类的 `[[class.<name>.generate.tiers]]` 或回落全局表），故**跨类同序数不可比**，逐行反推对账须先按同行 `sequence_class` 取该类生效表。 |
 | `frame_class` | str \| null | 该帧的帧类（蓝图定下的真值）；噪音帧为 null。 |
 | `noise` | bool | 插入型噪音帧标志；任务帧与重发帧恒 false。 |
 | `duplicate_of` | int | **仅重发序列的帧在场**：值 = 被重发的原序列的类内序数（重发副本无自身计划期身份，归属经本键对账）。 |

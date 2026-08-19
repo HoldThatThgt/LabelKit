@@ -240,7 +240,9 @@ def _load_class_schema(col: _Collector, file: str, cname: str, sp: str | None,
 
     语义是**至多其一**(两者均缺 = 覆盖未声明, 回落全局 output.schema); 声明了就走
     ``_load_schema_pair`` 全套, 再加 output.schema 同款的 ``"_meta"`` 保留键禁令与
-    ``$ref`` 可解析性遍历(运行期不取外部资源, 悬空引用必然每条记录都炸)。
+    ``$ref`` 可解析性遍历(运行期不取外部资源, 悬空引用必然每条记录都炸)。本函数的产物
+    是 ``ClassView`` 两个尾部按类载体之一(另一个是 v1.15 的 ``tiers`` 按类档位表, 解析在
+    ``_classviews._merge_class_generate``)——两者同款三态: None = 未声明即回落全局。
 
     @param col 错误聚合器
     @param file 报错定位用的 project.toml 路径字符串

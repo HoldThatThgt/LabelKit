@@ -25,13 +25,17 @@ class RecordRef:
     pair_index: int | None            # UI 模态：文件对 index
     generated_from: tuple[str, ...]   # process 模式生成样本：种子记录 id 列表；其余（含 generate_only 生成样本）为空元组——合成判据用 generator（v1.4）
     generator: Mapping | None = None  # v1.2：生成记录的 {"llm": profile 名, "style": name|None} 溯源（3.6.2）；非生成记录为 None
-                                      # 键集条件形（v1.14）：恒含 llm 与 style 两键；时间流生成的档位表
-                                      #   （[[generate.stream.tiers]]）在场时增第三键 tier_rank（该序列所属
-                                      #   档位序数，正整数），档位表缺省时维持两键——「信封只增字段」惯例（6.3）
+                                      # 键集条件形（v1.14）：恒含 llm 与 style 两键；时间流生成的**任一生效
+                                      #   档位表**在场时增第三键 tier_rank（该序列所属档位序数，正整数），
+                                      #   全缺省时维持两键——「信封只增字段」惯例（6.3）。v1.15 注：按类档位表
+                                      #   要求全局表在场（全局表为锚），故「任一生效表在场」⟺ 全局
+                                      #   [[generate.stream.tiers]] 非空——判据与 v1.14 逐字同义，只是
+                                      #   值取自本行序列类的生效表（跨类不可比，3.6.5）
                                       # v1.13 时间流生成侧构造约定（3.6.5）：成员帧的 ref =
                                       #   RecordRef(source_file=时间流工件路径, line_no=工件行号（1 基）,
                                       #   pair_index=None, generated_from=(), generator={"llm","style"}
-                                      #   ——档位表在场时为 {"llm","style","tier_rank"} 三键)
+                                      #   ——任一生效档位表在场（= 全局表非空）时为
+                                      #   {"llm","style","tier_rank"} 三键)
                                       #   ——工件是该帧的**真实来源文件**，故走 source_file/line_no 而非
                                       #   空源；序列 Record 的 ref 照 S24 继承首成员 ref（下方 Record 注）
 

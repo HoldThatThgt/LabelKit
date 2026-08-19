@@ -4,9 +4,9 @@
 ``_Collector`` 里记账, 从不提前抛出; 少数函数会回传被"回填/冻结"过的配置对象
 (classify.max_labels 回填、segment/frame_classify 的 vision_resolved 冻结)。
 
-拆分预案(≤ 2000 行硬约束的余量已很紧): 下次增簇时把 v1.13/v1.14 的生成形态簇
-(``_check_generate_stream`` 起至绑定簇止)整体迁往 ``_genstream.py``, ``validate``
-侧只留一次调用——切口沿形态边界, 与 2026-08-14 的 M1 拆分同款。
+拆分预案(v1.15 后 ≤ 2000 行的余量只剩个位数): 下次增簇**先**把 v1.13–v1.15 的生成形态簇
+(``_check_generate_stream`` 起至绑定簇止)整体迁往 ``_genstream.py``, ``validate`` 侧只留一
+次调用——切口沿形态边界, 与 2026-08-14 的 M1 拆分同款(须同步冻结的包布局清单)。
 """
 from __future__ import annotations
 
@@ -52,6 +52,7 @@ from labelkit.common.config.model import (
     Rubric,
     TierSpec,
     apportion_tiers,
+    effective_tiers,
 )
 from labelkit.common.extensions.hooks import resolve_hook
 from labelkit.common.runtime import budget
@@ -955,7 +956,8 @@ def _check_generate_stream(col: _Collector, fp: str, gs: GenerateStreamConfig,
     ``v`` 是调用方组装的取值捆包(mode / modality / generate / classify / class_views /
     stream / meta_mode / frame_classify / frame_annotate / frame_class_views /
     gen_provided / class_raw / seq_total / len_max / text_field, v1.14 增 tiers /
-    frame_gen_schema_declared)——形态约束横跨十余个节, 逐参传递会把签名撑爆。形态关闭
+    frame_gen_schema_declared, v1.15 增 tier_domain——``tiers`` 语义收窄为**全局**档位表,
+    按类表挂在 class_views 上)——形态约束横跨十余个节, 逐参传递会把签名撑爆。形态关闭
     时调用方不进入本簇: 相关键退化为停放配置, 全系统与 v1.12 字节等价。
 
     @param col 错误聚合器
@@ -968,7 +970,7 @@ def _check_generate_stream(col: _Collector, fp: str, gs: GenerateStreamConfig,
     _stream_form_quota(col, fp, v)
     _stream_form_packing(col, fp, gs, v)
     _stream_form_weaving(col, fp, gs, v)
-    _check_tier_table(col, fp, gs.tiers, v)      # v1.14 档位簇
+    _check_tier_table(col, fp, v)                # v1.14/v1.15 档位簇
     _check_time_fields(col, fp, v)               # v1.14 绑定簇
 
 
@@ -1110,16 +1112,17 @@ def _stream_form_quota(col: _Collector, fp: str, v: SimpleNamespace) -> None:
 def _check_frame_gen_instructions(col: _Collector, fp: str, v: SimpleNamespace) -> None:
     """每帧类的 ``[frame.class.<name>.generate].instruction`` 必填(及其检查域)。
 
-    v1.14(裁决·指令必填域收窄): 档位表在场时检查域收窄为 **∪各档 frame_classes**——
-    蓝图 enum 只在档内子集上取值, 未入档的帧类永不被选中(另有一条 WARN 点名其生成面
-    整体为死配置), 逼用户为它写死指令违反"禁止多此一举的配置"纪律。
+    v1.14(裁决·指令必填域收窄): 档位表在场时检查域收窄为 **∪各档 frame_classes**——蓝图
+    enum 只在档内子集上取值, 未入档的帧类永不被选中(另有一条 WARN 点名其生成面整体为死
+    配置), 逼用户为它写死指令违反"禁止多此一举的配置"纪律。v1.15(裁决·校验域并集化): 该
+    并集改跨**各参与类的生效表**取(捆包里的 ``tier_domain``)。
 
     @param col 错误聚合器
     @param fp 报错定位用的 project.toml 路径字符串
     @param v 跨节取值捆包
     """
     if v.tiers:
-        domain = {name for spec in v.tiers for name in spec.frame_classes}
+        domain = v.tier_domain
         reason = ("the blueprint enum covers the union of the tier compositions, so any "
                   "frame class of a tier may be picked")
     else:
@@ -1225,101 +1228,99 @@ def _stream_form_weaving(col: _Collector, fp: str, gs: GenerateStreamConfig,
                   f"UTC, matching the meta:<field> ingest rule), got {_fmt(gs.ts_start)}")
 
 
-# ── v1.14 档位面(SPEC-generation-tiers §3.1 档位表三行 + 两条 WARN) ───────────
+# ── v1.14/v1.15 档位面(SPEC-per-class-tiers §3.1: 逐生效来源表 + rule 61) ─────
 
 
-def _check_tier_table(col: _Collector, fp: str, tiers: tuple[TierSpec, ...],
-                      v: SimpleNamespace) -> None:
-    """v1.14 档位簇驱动器: 身份 → 构成 → 逐非零配额对 → 未入档 WARN。
+def _check_tier_table(col: _Collector, fp: str, v: SimpleNamespace) -> None:
+    """v1.14 档位簇驱动器: rule 61 两款 → 逐来源表结构 → 逐非零配额对 → 未入档 WARN。
 
-    档位表缺省 ⇒ 零执行(档位面整体不在场, 与 v1.13 字节等价)。
+    v1.15(裁决·表级原子覆盖): 结构校验逐**生效来源表**执行——全局表 + 每张已声明按类表(零
+    额类声明的表照跑), 定位前缀随表; 面开关恒 = 全局表非空(裁决·全局表为锚), 故配额对与
+    未入档 WARN 仍以它在场为门。
 
     @param col 错误聚合器
     @param fp 报错定位用的 project.toml 路径字符串
-    @param tiers 已按 tier_rank 升序解析的档位表
-    @param v 跨节取值捆包
+    @param v 跨节取值捆包(``tiers`` = 已按 tier_rank 升序解析的全局档位表)
     """
-    if not tiers:
-        return
+    tiers = v.tiers
     frame_names = tuple(spec.name for spec in v.frame_classify.classes)
-    _check_tier_identity(col, fp, tiers)
-    _check_tier_composition(col, fp, tiers, frame_names)
-    _check_tier_quota_pairs(col, fp, tiers, v.class_views)
-    _warn_frame_classes_without_tier(col, fp, tiers, frame_names)
+    _check_tier_source(col, f"{fp}:[[generate.stream.tiers]]", tiers, frame_names)
+    for cname, view in v.class_views.items():
+        if view.tiers is None:
+            continue                            # 未声明 = 回落全局表, 不重复裁定
+        loc = f"{fp}:[class.{cname}.generate].tiers"
+        if not view.tiers:                      # rule 61③ 空表拒收
+            col.error(f"{loc}: expected a non-empty array of tier tables - omit the key to "
+                      f"fall back to the global [[generate.stream.tiers]] table")
+        elif not tiers:                         # rule 61② 全局表为锚
+            col.error(f"{loc}: a per-class tier table overrides the global "
+                      f"[[generate.stream.tiers]] table, which is absent - declare the "
+                      f"global table (it is the fallback for classes without their own "
+                      f"table and the switch of the whole tier face)")
+        _check_tier_source(col, loc, view.tiers, frame_names)
+    if tiers:
+        _check_tier_quota_pairs(col, fp, v)
+        _warn_frame_classes_without_tier(col, fp, v.tier_domain, frame_names)
 
 
-def _check_tier_identity(col: _Collector, fp: str, tiers: tuple[TierSpec, ...]) -> None:
-    """档位身份(裁决·tier_rank 即档位身份): 表内唯一且连续覆盖 1..N。
+def _check_tier_source(col: _Collector, loc: str, tiers: tuple[TierSpec, ...],
+                       frame_names: tuple[str, ...]) -> None:
+    """单张生效来源表的结构: 身份连续性 + 构成合法性。
 
-    正整数与 ``weight >= 1`` 已在解析期强制; 此处只裁定全表形状——缺号/重号都会让
-    "第几档"失去身份语义(它同时是配分平票依据与类内序数分块依据)。
+    身份(裁决·tier_rank 即档位身份; v1.15 收窄为类内身份): 表内唯一且**本表**连续覆盖 1..N
+    ——缺号/重号会让"第几档"失去身份语义(它同时是配分平票与类内序数分块的依据)。构成(裁
+    决·构成恰等): 非空、档内互异、名 ∈ 帧类表、**单表内**两两互异——跨表同构成合法。
 
     @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param tiers 档位表
+    @param loc 该来源表的报错定位前缀(已含 project.toml 路径)
+    @param tiers 该来源表(按 tier_rank 升序)
+    @param frame_names 帧类表的名集(声明序)
     """
     ranks = sorted(spec.tier_rank for spec in tiers)
     if ranks != list(range(1, len(ranks) + 1)):
-        col.error(f"{fp}:[[generate.stream.tiers]].tier_rank: tier ranks must be unique and "
-                  f"cover 1..N contiguously (N = {len(ranks)} = the number of tiers; the "
-                  f"rank is the identity of a tier, there is no name key), "
-                  f"got {_fmt(ranks)}")
-
-
-def _check_tier_composition(col: _Collector, fp: str, tiers: tuple[TierSpec, ...],
-                            frame_names: tuple[str, ...]) -> None:
-    """档位构成(裁决·构成恰等): 非空、档内互异、名 ∈ 帧类表、各档构成两两互异。
-
-    定位按 tier_rank 而非下标(档位身份即 tier_rank, 且存放序已按 rank 重排)。
-
-    @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param tiers 档位表
-    @param frame_names 帧类表的名集(声明序)
-    """
+        col.error(f"{loc}.tier_rank: tier ranks must be unique and cover 1..N contiguously "
+                  f"(N = {len(ranks)} = the number of tiers; the rank is the identity of a "
+                  f"tier, there is no name key), got {_fmt(ranks)}")
     owners: dict[tuple[str, ...], int] = {}
     for spec in tiers:
-        loc = (f"{fp}:[[generate.stream.tiers]](tier_rank = {spec.tier_rank})"
-               f".frame_classes")
+        at = f"{loc}(tier_rank = {spec.tier_rank}).frame_classes"
         if not spec.frame_classes:
-            col.error(f"{loc}: expected a non-empty array of frame class names (a tier IS "
+            col.error(f"{at}: expected a non-empty array of frame class names (a tier IS "
                       f"its frame-class composition)")
             continue
         for i, name in enumerate(spec.frame_classes):
             if name in spec.frame_classes[:i]:
-                col.error(f"{loc}: frame class names must be distinct within a tier (the "
+                col.error(f"{at}: frame class names must be distinct within a tier (the "
                           f"composition is a set), got duplicate {_fmt(name)}")
             elif name not in frame_names:
-                col.error(f"{loc}: frame class name {_fmt(name)} is not in "
+                col.error(f"{at}: frame class name {_fmt(name)} is not in "
                           f"[[frame.classify.classes]], available: {_avail(frame_names)}")
         key = tuple(sorted(set(spec.frame_classes)))
         if key in owners:
-            col.error(f"{loc}: the composition is identical to the one of tier_rank = "
+            col.error(f"{at}: the composition is identical to the one of tier_rank = "
                       f"{owners[key]} - two tiers with the same frame-class set are "
                       f"semantically duplicates, got {_fmt(list(spec.frame_classes))}")
         else:
             owners[key] = spec.tier_rank
 
 
-def _check_tier_quota_pairs(col: _Collector, fp: str, tiers: tuple[TierSpec, ...],
-                            class_views: dict) -> None:
+def _check_tier_quota_pairs(col: _Collector, fp: str, v: SimpleNamespace) -> None:
     """长度可覆盖 + 配分零额告警: 逐 (参与类, 档) 配额对裁定。
 
-    配分是 ``(sequences, tiers)`` 的纯函数, M1 期可算(裁决·零抽签配分)。配额 >= 1 的
-    每一对须满足该类 ``len_range`` 下界 >= 该档构成大小(构成恰等要求每类至少出现一
-    次); **零额对豁免**——不为永不尝试的组合抬高下界, 与零额 WARN 语义对齐。
+    配分是 ``(sequences, 生效表)`` 的纯函数, M1 期可算(裁决·零抽签配分)。配额 >= 1 的每一对
+    须满足该类 ``len_range`` 下界 >= 该档构成大小(构成恰等要求每类至少出现一次); **零额对
+    豁免**(与零额 WARN 语义对齐)。v1.15: 逐类吃**该类生效表**, WARN 的权重清单同源。
 
     @param col 错误聚合器
     @param fp 报错定位用的 project.toml 路径字符串
-    @param tiers 档位表
-    @param class_views 序列类视图表(承载有效 sequences 与 len_range)
+    @param v 跨节取值捆包(``class_views`` 承载有效 sequences / len_range / 按类档位表)
     """
-    weights = ", ".join(f"tier_rank {spec.tier_rank}: weight {spec.weight}"
-                        for spec in tiers)
-    for cname, view in class_views.items():
+    for cname, view in v.class_views.items():
         if view.generate.sequences < 1:
             continue        # 不参与生成的类没有配额对
-        for spec, quota in zip(tiers, apportion_tiers(view.generate.sequences, tiers)):
+        table = effective_tiers(view.tiers, v.tiers)
+        weights = ", ".join(f"tier_rank {s.tier_rank}: weight {s.weight}" for s in table)
+        for spec, quota in zip(table, apportion_tiers(view.generate.sequences, table)):
             if quota < 1:
                 col.warn(f"{fp}:[[generate.stream.tiers]]: class {_fmt(cname)} apportions 0 "
                          f"sequences to tier_rank = {spec.tier_rank} (largest-remainder "
@@ -1336,16 +1337,15 @@ def _check_tier_quota_pairs(col: _Collector, fp: str, tiers: tuple[TierSpec, ...
                           f"{view.generate.len_range[0]}")
 
 
-def _warn_frame_classes_without_tier(col: _Collector, fp: str, tiers: tuple[TierSpec, ...],
+def _warn_frame_classes_without_tier(col: _Collector, fp: str, covered: set[str],
                                      frame_names: tuple[str, ...]) -> None:
-    """帧类未入档: 该帧类不会出现在任何蓝图中, 其生成面整体是死配置(WARN)。
+    """帧类未入任何生效表: 它不会出现在任何蓝图中, 生成面整体是死配置(WARN)。
 
     @param col 错误聚合器
     @param fp 报错定位用的 project.toml 路径字符串
-    @param tiers 档位表
+    @param covered 校验域(∪ 各参与类生效表的构成, 裁决·校验域并集化)
     @param frame_names 帧类表的名集(声明序)
     """
-    covered = {name for spec in tiers for name in spec.frame_classes}
     for name in frame_names:
         if name not in covered:
             col.warn(f"{fp}:[frame.class.{name}.generate]: frame class {_fmt(name)} is in "
@@ -1357,7 +1357,8 @@ def _warn_frame_classes_without_tier(col: _Collector, fp: str, tiers: tuple[Tier
 def _check_tiers_parked(ctx: _LoadCtx) -> None:
     """档位表前提(v1.11 原始节探针机制): 档位表**仅**时间流形态合法。
 
-    在场性取自原始节探针而非解析产物——表内容非法(解析产物为空)时也要照发。
+    在场性取自原始节探针而非解析产物——表内容非法(解析产物为空)时也要照发。v1.15 的 rule
+    61① 是它的按类同族款(探针走 ``[class.*.generate]`` 原始节), 同点执行。
 
     @param ctx 校验上下文
     """
@@ -1367,6 +1368,13 @@ def _check_tiers_parked(ctx: _LoadCtx) -> None:
                       f"- a tier declares the frame-class composition of the sequences "
                       f"drawn from it, and only that form plans sequences from a frame "
                       f"class table")
+    for cname, sections in (ctx.p.class_raw or {}).items():
+        g_over = sections.get("generate") if isinstance(sections, dict) else None
+        if isinstance(g_over, dict) and "tiers" in g_over:
+            ctx.col.error(f"{ctx.fp}:[class.{cname}.generate].tiers: the per-class tier "
+                          f"table is only legal in the time-stream generation form "
+                          f"([generate.stream].enabled = true) - it overrides the global "
+                          f"[[generate.stream.tiers]] table for sequences of this class")
 
 
 # ── v1.14 时间字段绑定面(SPEC-generation-tiers §3.1 绑定表三行) ───────────────
@@ -1499,7 +1507,12 @@ def _check_generate_stream_form(ctx: _LoadCtx, products: _Products) -> tuple[int
         gen_provided=p.gen_provided,
         class_raw=p.class_raw if isinstance(p.class_raw, dict) else {},
         seq_total=seq_total, len_max=len_max, text_field=p.input.text_field,
-        tiers=p.generate_stream.tiers,                                  # v1.14 档位面
+        tiers=p.generate_stream.tiers,                                  # v1.14 全局档位表
+        # v1.15(裁决·校验域并集化): 帧类校验域 = ∪(参与类生效表的构成); 全类回落全局表
+        # 时退化为全局构成并集(v1.14 字节一致)。参与类 = 有效 sequences >= 1。
+        tier_domain={name for cv in views.values() if cv.generate.sequences >= 1
+                     for spec in effective_tiers(cv.tiers, p.generate_stream.tiers)
+                     for name in spec.frame_classes},
         frame_gen_schema_declared=_frame_gen_schema_declared(p.frame_class_raw)))
     return seq_total, len_max
 
