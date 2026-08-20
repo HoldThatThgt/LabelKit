@@ -469,18 +469,20 @@ inode**，先启动进程 rename 交付的「主输出」实为后进程内容�
 
 **同日集成侧的同族观测**：验收末轮全套复跑时，v1.15 按类档位例与 v1.13 基础例各遇一次**两条计划序列同时作废**（同样是 `call=realize kind=schema_violation violations=1`），触发两例共用的「至少一条幸存」哨兵断言（第 26 条先例，配额取 2 即为此容忍设计）；原样复跑五个 DeepSeek 例即全绿。这说明当日波动的幅度足以偶发吃掉两条，**容忍设计的下限是「不为 0」而非「必有幸存」**——集成例遇红先原样复跑一次再判，别当代码回归。
 
-### 36. z.ai 账号周/月额度耗尽 ⇒ 两例 L0 透传钉板暂时无法执行 —— ⏸ 待额度重置（环境记录）
+### 36. z.ai 账号周/月额度耗尽 ⇒ 两例 L0 透传钉板暂时无法执行 —— ✅ 已闭合（环境记录，2026-08-20 复跑双绿）
 
 **现象**：v1.15 集成套件执行时，两个 z.ai 例（`test_realize_schema_prefixitems_passthrough_zai_structured_output`、`test_plan_schema_cover_all_passthrough_zai_structured_output`）稳定红在 `ProviderRetryableError: retries exhausted (2): HTTP 429 … [1310][Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-08-20 15:44:45]`。间隔重试两次，形态一致。
 
 **根因与处置**：**账号侧额度耗尽，不是代码问题**——两例是 v1.13/v1.14 的站立假设钉板（`prefixItems` 与 `allOf`/`contains` 随 L0 原样透传给供应商强制工具，第 31 条），v1.15 **零触碰**它们（既不改两个 Schema 构造器，也不改 L0 上行路径），SPEC-per-class-tiers §3.6 亦明记「z.ai `cover_all` L0 透传例保绿回归、无需新增」。工具侧的表现完全符合设计：429 走全抖动退避重试 → 预算耗尽 → `ProviderRetryableError`（`retry_after` 缺省时不做无界 park）。五个 DeepSeek 例（含 v1.15 新增的按类档位例）全绿，v1.15 的行为面因此有完整真端点覆盖。待额度重置后复跑这两例即可闭合。
 
+**闭合（2026-08-20）**：额度按期重置（15:44:45）后当日复跑两例，`2 passed in 17.40s`——`prefixItems` 与 `allOf`/`contains` 的 L0 原样透传钉板恢复在位，v1.15 集成面补齐为 **7/7**。与预判一致：纯账号额度问题，零代码改动、零重试外动作。
+
 ### 测试留痕（v1.15）
 
 | 套件 | 数量 | 备注 |
 |---|---|---|
-| 离线套件 | 2005 passed | v1.14 基线 1980；新增 25 例分布在 `test_loader_generate_stream.py`（rule 61 三子款正反例、白名单第七键、逐表身份连续性与跨类同构成、配额对吃生效表、并集化校验域、零额类结构校验不豁免、定位串带类名）、`test_generate_stream.py`（混合形态映射、`--limit` 逐类分块、蓝图取生效表档内子集、按类配分零 rng 钉板、同 seed 双跑字节一致、全缺省与 v1.14 等价）、`test_orchestrator.py`（平面形跨类求和、嵌套形双层键序、零配额类 0/0、混合触发谓词）、`test_config.py`（`ClassView.tiers` 默认 None、`effective_tiers` 三态） |
-| 集成套件（真端点） | 5 passed / 2 blocked | DeepSeek 五例全绿——v1.13 两例 + v1.14 两例 + **v1.15 新增按类档位一例**（混合形态：`ticket_booking` 自带单档表 `{task_request, confirmation}`、`smart_home` 回落全局两档表；断言逐行构成恰等吃**本行类**生效表、类段计数器落账、经生产装配器取到的嵌套 `tiers` 逐键对账含零额档 `0/0`、`generator.tier_rank` 与工件 `truth.tier_rank` 逐行一致）。v1.14 第四例的陈旧键断言按第 34 条修正；末轮复跑时两个 DeepSeek 例各遇一次全作废哨兵红、原样复跑即全绿（第 35 条同日观测）。两个 z.ai L0 透传例因账号额度耗尽暂无法执行（第 36 条，非代码问题） |
+| 离线套件 | 2007 passed | v1.14 基线 1980；开发期新增 25 例分布在 `test_loader_generate_stream.py`（rule 61 三子款正反例、白名单第七键、逐表身份连续性与跨类同构成、配额对吃生效表、并集化校验域、零额类结构校验不豁免、定位串带类名）、`test_generate_stream.py`（混合形态映射、`--limit` 逐类分块、蓝图取生效表档内子集、按类配分零 rng 钉板、同 seed 双跑字节一致、全缺省与 v1.14 等价）、`test_orchestrator.py`（平面形跨类求和、嵌套形双层键序、零配额类 0/0、混合触发谓词）、`test_config.py`（`ClassView.tiers` 默认 None、`effective_tiers` 三态）；检视闭环再 +2 例（rule 61 ②/③ 互斥只报空表错、形状错按未声明落库不叠报——同落 `test_loader_generate_stream.py`） |
+| 集成套件（真端点） | 7 passed | DeepSeek 五例全绿——v1.13 两例 + v1.14 两例 + **v1.15 新增按类档位一例**（混合形态：`ticket_booking` 自带单档表 `{task_request, confirmation}`、`smart_home` 回落全局两档表；断言逐行构成恰等吃**本行类**生效表、类段计数器落账、经生产装配器取到的嵌套 `tiers` 逐键对账含零额档 `0/0`、`generator.tier_rank` 与工件 `truth.tier_rank` 逐行一致）。v1.14 第四例的陈旧键断言按第 34 条修正；末轮复跑时两个 DeepSeek 例各遇一次全作废哨兵红、原样复跑即全绿（第 35 条同日观测）。两个 z.ai L0 透传例 2026-08-19 因账号额度耗尽被阻（第 36 条，非代码问题），2026-08-20 额度重置后复跑双绿闭合（`2 passed in 17.40s`）⇒ 集成面 **7/7** |
 | `examples/synth-stream` 真跑 | exit 0 | `counts.generated = emitted = 6`、`failed`/`dropped_*` 全 0；`generate.stream = {sessions 5, crossed_sessions 1, 两类各 planned 3/produced 3, tiers 类嵌套形 {ticket_booking: {"1": 1/1, "2": 2/2}, smart_home: {"1": 2/2, "2": 1/1}}, frames 23, noise_frames 2, duplicates 1, plan_calls 6, realize_calls 6, noise_calls 1, 三项 failures 0}`；`run.artifact.lines = 29`、`llm_usage.default.calls = 50`、`timing.wall_s = 70.311`；**逐行反推对账通过**——6 条序列的 `members[]` 帧类集合恰等于**本行序列类生效表**该 rank 的构成（购票二档两条均为 `{task_request, confirmation}`、智能家居二档一条为全三类，同 rank 两种构成），工件 29 行 `truth.tier_rank` 与 `generator.tier_rank` 逐行一致 |
 | 保留运行 `out-run1/` | exit 0 | `produced < planned` 在类嵌套 `tiers` 下的真实样本：1 条序列在帧实现作废（第 35 条）⇒ `ticket_booking {"1": 1/1, "2": 2/1}`、`smart_home {"1": 2/2, "2": 1/1}`、`crossed_sessions 0`、工件 25 行 |
 | 工件重放（process + segment） | exit 0 | 29 帧 → 6 会话 → 6 episodes、`absorbed 27`、`dropped_noise 2`、`dropped_dup 1`（本跑落 `exact`；**档位随分段判决浮动，两分支皆可能**，第 27、32 条）、`emitted 5`、`failed 0`、11 次调用 / 37.7 秒；23 个成员 id 与生成侧**逐个相同**，4/5 幸存 episode 的 id 与生成侧序列 id 恰等（对不上的那条是交叉会话整会话成段，其 id 恰等于生成侧的 `session_id`） |
