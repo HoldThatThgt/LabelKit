@@ -68,6 +68,9 @@ class LLMProfile:
                                                   # 窗口，绝不照抄厂商表值（V26——少报永远安全：
                                                   # 只是多裁剪，绝不溢出）
     temperature: float = 0.0                      # 默认温度（可复现性要求默认 0）
+    thinking: Literal["enabled", "disabled"] | None = None
+                                                  # v1.16：两种 provider 的顶层 thinking 开关；
+                                                  # None = 不写请求字段，保持既有请求体形态
     max_image_px: int = 2048                      # 图片长边像素**上限**（V21 升档天花板）
     default_image_px: int = 0                     # v1.11（V18）：图片采样默认**工作点**
                                                   # （长边像素）。0 = 取 max_image_px
@@ -309,6 +312,38 @@ class GenerateStyle:
 
 
 @dataclass(frozen=True)
+class CorrelationSpec:
+    """v1.16 序列规则的类型敏感相等关联条件。"""
+
+    operator: Literal["equal"] = "equal"         # 关联操作符，首版只允许 equal
+    source_field: str = ""                        # source 帧类 Schema 的顶层属性名
+    target_field: str = ""                        # target 帧类 Schema 的顶层属性名
+
+
+@dataclass(frozen=True)
+class SequenceRuleSpec:
+    """v1.16 一条序列规则的冻结配置镜像。"""
+
+    template: str                                  # 15 个 DECLARE 模板之一
+    frame_class: str | None = None                # 一元模板的帧类
+    source: str | None = None                      # 二元模板的 source 帧类
+    target: str | None = None                      # 二元模板的 target 帧类
+    count: int | None = None                       # existence/absence/exactly 的正整数
+    time_s: tuple[float, float] | None = None      # 半开秒区间 [lo, hi)
+    correlation: CorrelationSpec | None = None     # 可选的 typed equality 条件
+
+
+@dataclass(frozen=True)
+class SequenceWindowSpec:
+    """v1.16 一条帧类日历窗口的冻结配置镜像。"""
+
+    frame_class: str                              # 被约束的帧类
+    of_day: tuple[tuple[str, str], ...]            # 同日半开墙钟窗口表
+    of_week: tuple[str, ...] = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
+                                                   # 允许的星期，缺省为全周
+
+
+@dataclass(frozen=True)
 class TierSpec:
     """v1.14（裁决·档位即帧类构成）：``[[generate.stream.tiers]]`` 档位表的一项。
 
@@ -382,6 +417,28 @@ def effective_tiers(class_tiers: tuple[TierSpec, ...] | None,
     return global_tiers if class_tiers is None else class_tiers
 
 
+def effective_rules(class_rules: tuple[SequenceRuleSpec, ...] | None,
+                    global_rules: tuple[SequenceRuleSpec, ...]) -> tuple[SequenceRuleSpec, ...]:
+    """v1.16 按类 rules 的三态整表查找。
+
+    @param class_rules 按类声明的整张表；``None`` 表示继承，空元组表示显式清空
+    @param global_rules 全局整张规则表
+    @return 该序列类的生效规则表
+    """
+    return global_rules if class_rules is None else class_rules
+
+
+def effective_windows(class_windows: tuple[SequenceWindowSpec, ...] | None,
+                      global_windows: tuple[SequenceWindowSpec, ...]) -> tuple[SequenceWindowSpec, ...]:
+    """v1.16 按类 windows 的三态整表查找。
+
+    @param class_windows 按类声明的整张表；``None`` 表示继承，空元组表示显式清空
+    @param global_windows 全局整张窗口表
+    @return 该序列类的生效窗口表
+    """
+    return global_windows if class_windows is None else class_windows
+
+
 @dataclass(frozen=True)
 class GenerateStreamConfig:
     """v1.13（spec 5.2 [generate.stream]）：generate_only 的时间流形态。
@@ -404,14 +461,20 @@ class GenerateStreamConfig:
     duplicates: int = 0                           # 原样重发的序列条数（0 = 无；≤ Σsequences）
                                                   # ——重发帧逐字节同源，恒落流尾新会话
     frame_gap_s: tuple[float, float] = (5.0, 60.0)
-                                                  # 会话内帧间隔的均匀采样区间（秒）；
-                                                  # M1: 0 < lo ≤ hi < stream.gap_s（会话内
-                                                  # 间隔须小于会话切分阈值，否则自相矛盾）
+                                                  # 会话内帧间隔的均匀采样区间（秒）；字段本身
+                                                  # 只承载数值闭区间，不承载条件边界校验。
+                                                  # M1 按路径裁决：v1.15 默认路径，以及仅有
+                                                  # sequence_validator、无实际非零 rules/windows
+                                                  # 前缀的路径，要求 1e-6 ≤ lo ≤ hi < stream.gap_s；
+                                                  # 仅 --limit 后实际非零配额前缀有生效 rules/windows
+                                                  # 的 v1.16 联合路径允许 hi == stream.gap_s。
     ts_start: str = "2026-01-01T00:00:00Z"        # 时间流起点（ISO-8601；恒不取墙钟——
                                                   # 同 seed 双跑工件逐字节一致）
     tiers: tuple[TierSpec, ...] = ()              # v1.14 档位表（[[generate.stream.tiers]]），
                                                   # 按 tier_rank 升序存放；空元组 = 档位面
                                                   # 整体不在场（字节等价 v1.13）
+    rules: tuple[SequenceRuleSpec, ...] = ()      # v1.16 全局序列规则表
+    windows: tuple[SequenceWindowSpec, ...] = ()  # v1.16 全局帧类日历窗口表
 
 
 @dataclass(frozen=True)
@@ -434,6 +497,7 @@ class GenerateConfig:
     sample_validator: str | None = None           # v1.5 plan-A 钩子 "module:function"：
                                                   # fn(text) -> list[str]，样本级过滤
                                                   # （相似度过滤之前，spec 3.6.2）
+    sequence_validator: str | None = None          # v1.16 序列级钩子 "module:function"
     seed_examples: tuple[str, ...] = ()           # 仅 generate_only 的种子池形态
     standalone_count: int | None = None           # 仅 generate_only 的无种子形态；与
                                                   # seed_examples 互斥
@@ -562,6 +626,11 @@ class ClassView:
                                                   # 档位不改变任何调用数，dry-run 的按类覆盖
                                                   # 注记不应因它触发（裁决·note 行不因档位
                                                   # 触发）
+    rules: tuple[SequenceRuleSpec, ...] | None = None
+                                                  # v1.16：按类 rules；None = 继承全局，
+                                                  # 空元组 = 显式清空
+    windows: tuple[SequenceWindowSpec, ...] | None = None
+                                                  # v1.16：按类 windows；三态同 rules
 
 
 # ── 帧粒度（v1.12，spec §3.1 [frame.classify]/[frame.annotate]/[frame.class.*]）──

@@ -68,6 +68,15 @@ API 增量（均只增）：`MetricsSink.__init__` 增可选尾参 `listener`；
 | 文件语义 | **首个事件写出时**若 `trace.path` 已存在则截断覆盖并 stderr warn 一次（v1.5 惰性打开：构造不碰文件，死于配置/输入校验的运行不触碰旧 trace；保留历史请改名或另配 trace.path）。trace 不做 .part 原子改名——它是逐批 flush 的流式日志，异常终止时已 flush 的行即有效前缀（首行仍为本次 run.start）。 |
 | 帧粒度事件（v1.12） | 两个新事件（7.2 目录两行；事件名前缀自动路由既有 `classify` / `annotate` 通道，**通道枚举维持 11 值**）：① `classify.frame`——**每 episode 一发**（ids = (episode_id,)），payload = `members`（判决成员数）/ `windows`（分窗数）/ `fallback`（兜底帧数）三计数（3.13.7）；② `annotate.frame`——**每成员一发**（ids = (episode_id,)），payload = `member_id` / `status`（annotated \| skipped \| failed）/ `attempts`，标注内容仅经既有 `excerpt` 键按档位分级（excerpt/full 档 200 字截断，7.4），**不新增任何承载数据内容的 payload 键**（none 档预脱敏载荷直通 console 面板的红线，3.5.5）。 |
 
+**序列规则与联合规划（v1.16）**：规划器、声明式 evaluator 与序列钩子沿用既有运行日志
+通道，不新增 trace channel、事件名或 `StageError.kind`。planner 状态异常使用既有英文、
+值无关的 ERROR/WARN：`INFEASIBLE` / `UNKNOWN` 由 M1 聚合为配置错误，`MODEL_INVALID`
+或通过 M1 后的不变量破坏记录 ERROR 并交给既有 `InternalError` 退出面；noise 目标短缺只
+打一条值无关 WARN。序列钩子异常日志只含 hook 引用、异常类型，违规日志只含序列索引、
+类名和违规数；规则作废日志只含序列索引和类名。所有日志禁止载荷、输入文本、prompt、
+违规 message、时间表、相关字段值和 API key。规划器的 CP-SAT 求解经过已有 `llm.call`
+统计面以外不产生新 trace 记录，report 计数由 M6/M10 供给。
+
 ### 3.12.5 配置项
 
 见 5.1 `tool.log_format` 与 5.2 `[trace]` 节、`quality.judgment_reasons`。

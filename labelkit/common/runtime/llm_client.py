@@ -545,6 +545,8 @@ def _build_openai_body(profile: LLMProfile, prompt: PromptBundle,
             "type": "json_schema",
             "json_schema": {"name": "user_schema", "strict": True, "schema": response_schema},
         }
+    if profile.thinking is not None:
+        body["thinking"] = {"type": profile.thinking}
     return body
 
 
@@ -584,6 +586,8 @@ def _build_anthropic_body(profile: LLMProfile, prompt: PromptBundle,
         "temperature": _resolve_temperature(profile, prompt),
         "messages": messages,
     }
+    if profile.thinking is not None:
+        body["thinking"] = {"type": profile.thinking}
     if system_chunks:
         body["system"] = "\n".join(system_chunks)
     if response_schema is not None and profile.supports_structured_output:

@@ -92,6 +92,18 @@ class Classification:                 # v1.7：M13 分类结果（3.13）
     source: Literal["llm", "fallback", "inherited"]
     detail: Mapping                       # reason / sc 统计 / fallback 留痕（kind, message）
 
+@dataclass(frozen=True)
+class SequenceValidationFrame:         # v1.16：M6 序列级生成钩子的单帧输入（3.6.6）
+    position: int                       # 序列内零基位置
+    frame_class: str                    # planner 冻结的帧类名
+    payload: object                     # JSON-compatible 深拷贝；钩子修改不得回写内部载荷
+
+@dataclass(frozen=True)
+class SequenceValidationInput:         # v1.16：generate.sequence_validator 的输入（3.6.6）
+    sequence_class: str                 # 生成序列类名
+    tier_rank: int | None               # 该类生效档位序数；无档位面时为 None
+    frames: tuple[SequenceValidationFrame, ...]  # 按序列位置排列的成员帧
+
 @dataclass
 class PipelineItem:                   # 唯一可变信封；生命周期 = 一个批
     record: Record
@@ -255,3 +267,11 @@ def tree_diff(a: UITree | None, b: UITree | None, quantize_px: int) -> Mapping
 ```
 
 **预算原语契约引（v1.11）**：上下文预算的估算与装填原语（`margin` / `input_budget` / `embed_budget` / `est_text` / `est_image_prior` / `est_prompt` / `fit_text` / `min_window` / `classify_stage_error` 与 `ImageCostCalibrator`）为新共享模块 `labelkit/common/runtime/budget.py` 的模块级纯函数与类（common 层运行时，**非本章类型层**——签名与冻结常数以 CONTRACTS 的 budget 新节为准，机制见 3.9）；本章共享渲染层（`serialize` / `frame_digest` / `tree_diff`）签名零改动，装填器（贪心切窗等）属算子逻辑、落各算子模块。
+
+**序列规则与 Stage 契约（v1.16 零改动声明）**：v1.16 新增的
+`SequenceValidationFrame` / `SequenceValidationInput` 只描述 M6 调用用户序列钩子时传入的
+只读视图，不是新的 `PipelineItem` 或 `Stage` 例外。M6 仍返回富的生成子批（序列信封与
+工件行），不修改原批；每个序列信封出厂即为普通 `active` 信封，继续走既有下游链。规则、
+窗口、correlation、planner 状态和钩子违规不会写进 `Record`、`PipelineItem.errors` 或
+新的状态值；整条 attempt 作废只表现为缺席与既有计数器。钩子取得 payload 的深拷贝，
+任何用户修改都不能污染内部载荷、时间字段回填或 duplicate source。

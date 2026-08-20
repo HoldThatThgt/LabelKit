@@ -1,93 +1,29 @@
-# 时间流生成工程（spec v1.13，run.mode = "generate_only" + [generate.stream]）——
-# 无输入数据，从零合成一条**带时间戳的多会话请求流**，再让合成出来的序列直接走
-# 同一条治理管线。与 examples/text/project-synth.toml（种子池平面生成）的差别在
-# 产物形状：那边一次生成一条独立文本，这边一次生成一条**序列**，并把多条序列机械
-# 地交织成时间流。
+# 时间流生成教学工程（spec v1.16）。六条 primary 序列在五个 session 中预排，
+# 因此完整幸存时恰有一个真实 crossing；还会机械插入噪音，并把一条幸存
+# 序列原样重发到流尾。联合 planner 在任何 LLM 调用前同时冻结帧类词、session、
+# timestamp 与 noise 槽；内容作废只删整条序列，不重织、不重求解。
 #
-# 链序：generate 时间流形态（蓝图 → 帧实现 → 机械交织）→ dedup（序列级判重）→
-# classify（标签在生成期已知，inherited，零判决调用）→ quality（default:trajectory
-# 轨迹打分 + 阈值门）→ annotate（**按序列类各用一份独立 Schema**）→ verify（判决形
-# 评审 + 修复）→ emit。segment / stitch / extract 不参与（流是生成出来的，不需要
-# 再切分；抽取仅 UI 模态）。
+# v1.16 最小学习路径：
+#   task_request --chain_response [1200,2400)s + subject_id equal--> acknowledgement
+#   acknowledgement --response--> confirmation（且 confirmation 恒为 end）
+# request 只能落在工作日的两个日内窗口；ticket_booking 用按类整表覆盖缩窄窗口。
+# request.duration 继续绑定 gap_next_s，所以工件里可直接核对 20–40 分钟规则。
+# generate.sequence_validator 演示跨帧纯函数验证；它不读环境、网络、墙钟或随机数。
 #
-# LLM 只做两类内容调用——一序列一次**蓝图**（定步数、定每步帧类与要点）、一序列
-# 一次**帧实现**（按蓝图逐位产出帧内容），外加噪音帧的批量生成；会话装箱、交叉、
-# 噪音插入、重复重发、时间戳铺设全部由机械交织器（零 LLM）完成，同 seed 双跑逐
-# 字节一致。本工程的调用量 = 2 × 6 序列 + ⌈噪音帧数 / num_per_call⌉ 批噪音，精确
-# 数值可用 --dry-run 复演（估算与真跑同源同一套计划期纯函数）。
+# 内容调用的计划基数仍是每条 attempt 一次 brief + 一次 realize，另有噪音批次。
+# provider retry 与 Schema repair 可增加物理请求；真实模型双跑不承诺字节相等。
+# 固定 LLM 产物、同版本、同配置与同 seed 下，机械计划可复演。
 #
-# 会话账（Σsequences = 2 类 × 3 = 6，sessions = 5）：交叉会话数 = 6 − 5 = 1（全部序列
-# 存活时；有序列作废会使交叉退化——装箱按 sessions_eff = min(sessions, Σ幸存) 走，见
-# 手册排障）。那个交叉会话里两条序列交错出现，形如 A 段 + B 段 + A 余段，其余 4 个
-# 会话各装一条序列；重复重发的 1 条序列另落**流尾新会话**，故工件里共 6 个会话。
+# 产物：out/synth-labels.jsonl 是序列主输出；
+# out/synth-labels.stream.jsonl 是逐帧时间流工件。工件可作为 process 输入重放：
+# 沿用 order_by = "meta:ts" 和 gap_s = 3600，重发 session 应在序列级 dedup 命中
+# dropped_dup。duplicate 保留源 payload、tier_rank 与已回填 duration，不按新时间轴重算。
 #
-# 两份产物：
-#   out/synth-labels.jsonl         主输出（每行 = 一条序列的标注结果 + _meta）
-#   out/synth-labels.stream.jsonl  **时间流工件**（每行 = 一帧，含 ts / 文本 /
-#                                  truth 真值三件套），行号即 _meta.stream 的
-#                                  member_sources.line_no，可双向对账
+# 档位构成为恰等集合：两类每档都含 request / acknowledgement / confirmation，
+# 再以 followup / progress 区分。ticket_booking 整表覆盖全局档位表，smart_home
+# 继承全局表；因此读 tier_rank 时必须同时读 sequence_class。
 #
-# 工件即输入格式：把它拷成某个工程的 [run].input，配上同样的 [stream]
-# （order_by = "meta:ts"、gap_s = 900）就能按 examples/stream 的形态原样重放——
-# 交织器铺的会话间隔恒 > gap_s，摄取侧会切出与生成侧完全一致的会话。truth 字段
-# 不参与任何判定，需要时经 [output].passthrough_fields 透传出来做对照。
-#
-# 重复序列的判重演示位在**重放**，不在本次运行：重发帧只活在工件里（不构造信封），
-# 因此本次运行的守恒账里既没有它、也不会出现 dropped_dup。把工件重放（process
-# 模式 + segment）时，重发会话与原会话命中判重落 dropped_dup（实测：29 帧 → 6 会话
-# → 6 episode，dropped_dup = 1）；命中档位取决于原会话的噪音帧是否被 segment 剔除
-# ——剔除则两侧成员文本逐字节相同走 exact，被吸收则原 episode 多一帧走 near_text
-# （实测即此档）。重放时加 --strict 则预期退出码 1（有 rejects）。
-#
-# ── 帧类构成档位（spec v1.14，[[generate.stream.tiers]]）────────────────────
-# 一个档位的定义**就是**该档序列的帧类构成集合——它不带任何质量指令、不管帧内部
-# 写得好不好（那归各帧类的生成指令与温度）。全局表在本工程有两档：第 1 档只用
-# {task_request, followup} 两类，第 2 档用全三类。构成语义是**恰等**（蓝图 Schema
-# 的 enum 给「只能用这些类」、逐类 contains 给「每类至少一次」），因此每条序列的
-# _meta.stream.members[] 帧类集合恰等于其档声明的构成——档位身份可从数据直接反推
-# 对账，不必信任标签。
-# 档位序数（tier_rank）只是「第几档的要求」，工具不赋予高低任何质量方向语义，方向
-# 归你自己定；它在三处落地，同一个值三个面：主输出每行的
-# _meta.source.generator.tier_rank、工件行的 truth.tier_rank、报表的
-# report.generate.stream.tiers（形状见下段）。
-#
-# ── 按类档位表（spec v1.15，[[class.<name>.generate.tiers]]）───────────────
-# 序列类可以自带一张档位表，**整表原子取代**全局表（不逐行合并——行级合并会让 rank
-# 身份跨表漂移）。本工程 ticket_booking 声明了自己的两档（第 1 档
-# {task_request, followup} 权重 1、第 2 档 {task_request, confirmation} 权重 2 ⇒
-# 配额 3 配分 1 + 2），smart_home 不声明、回落全局表（权重 2 : 1 ⇒ 2 + 1）：两类的
-# 构成与权重方向都不同，这正是按类表的用武之地——购票类想要一档「确认帧直达、不带
-# 追问」的形态，全局表一张表根本表达不出来。
-# 全局表是**锚**：声明按类表要求全局表在场（缺了是 CONFIG_ERROR），故「档位面开没
-# 开」恒等于「全局表非空」，每个参与类恒有生效表，generator / truth / 报表三处的在
-# 场性不会逐行漂移。想让某个类「不分档」，给它一张单档表即可；写 tiers = [] 是显式
-# 空表，M1 拒收（指引删键回落）。
-# tier_rank 是**类内身份**：每张生效表各自连续覆盖 1..N，N 逐类可不同；跨类同 rank
-# 没有任何工具语义，跨类同构成也完全合法（各类都可以有自己的「全类档」）。所以读一
-# 行的档位必须连着它的类一起读——主输出行携 classification.label、工件行携
-# truth.sequence_class，与 tier_rank 同行相邻，行级消歧免费。
-# 报表随之两形：只有全局表时 report.generate.stream.tiers 是平面形
-# {"<rank>": {planned, produced}}；任一按类表在场即转**类嵌套形**
-# {"<class>": {"<rank>": {planned, produced}}}——外层是全部声明类按声明序、内层是该
-# 类生效表的 rank 升序，零配额类与全作废档一律呈现 0/0（显式装配，不靠计数器首触
-# 序）。本工程读作 ticket_booking 的 1 → 1 条、2 → 2 条，smart_home 的 1 → 2 条、
-# 2 → 1 条，两层各自求和都回到该类的 sequences = 3。
-# --limit 在配额层做前缀截断（类按类名字典序展开、类内按序数升序），而类内序数按
-# **本类生效表**的 rank 升序占连续区间，故截断落到哪个类身上，就从那个类的最高档序
-# 数侧截起。按类表在场时这笔账要逐类算：本工程 --limit 4 保住 smart_home 全 3 条
-# （rank 1 两条 + rank 2 一条），ticket_booking 只剩 rank 1 那一条，它的两条 rank 2
-# 序列全没了。
-#
-# ── 时间字段回填（spec v1.14，[frame.class.<name>.generate.time_fields]）────
-# 结构化帧的生成 Schema 里那些「时间语义」字段（本工程是 task_request 的 duration）
-# 与真实帧间隔本就对不上——LLM 没有时间轴，写出来的秒数是编的。绑定即剔除：绑定过
-# 的字段从 LLM 面向的逐位 Schema 与契约行里一并删掉，LLM 物理上生不出它；值由机械
-# 回填尾声在时间戳铺好之后按**本序列相邻成员**的 ts 差算出写回（round 到微秒）。
-# 回填先于行对象与 id 计算，所以工件重放逐字节同 id 同会话。
-# 重发会话承源：重发帧与源帧引用同一个载荷对象，其 duration 与 truth.tier_rank 都
-# 是**源会话**的值，不与自身那条时间轴对账（原样重发本就携带陈旧内容，语义自洽）。
-#
-# 运行（out/ 不入库，须先建；密钥见仓库根 .env，只经 api_key_env 名引用）：
+# 运行（凭据只由 config.toml 声明的环境变量名注入）：
 #   mkdir -p out && set -a && source ../../.env && set +a
 #   uv run labelkit run --config config.toml --project project.toml
 schema_version = 1
@@ -97,14 +33,16 @@ output = "./out/synth-labels.jsonl"
 modality = "text"                 # 时间流生成恒 text 模态（UI 模态为 v1.13 非目标）
 mode = "generate_only"
 batch_size = 8                    # 6 条序列 ⇒ 一批跑完
-seed = 20260813                   # 交织器单流抽签的唯一随机源：同 seed 双跑逐字节一致
+seed = 20260813                   # 机械规划的唯一随机源；固定 LLM 产物时同 seed 可复演
 
 [input]
 text_field = "text"               # 工件行的文本字段名（重放时 M2 按同一声明提取）
 
 [stream]                          # 生成侧的铺设契约（复用摄取侧词汇，故可重放）
 order_by = "meta:ts"              # 工件行的时间戳字段名由此声明（此处即 "ts"）
-gap_s = 900                       # 会话间隔恒 > 15 分钟；会话内帧间隔见 frame_gap_s
+gap_s = 3600                      # 大于显式 40 分钟上界，survivor 单独 replay 不拆 session
+session_max_len = 12              # crossing 中两条五帧序列与 noise 的联合上限
+session_max_span_s = 3000         # 容纳 20–40 分钟链边及其余默认边
 
 [dedup]
 enabled = true                    # 序列级判重（成员文本按序拼接的 episode 配方）。
@@ -119,6 +57,7 @@ llms = ["default"]
 num_per_call = 4                  # 本形态下仅噪音批量生成按此装箱（一批 4 条噪音）
 temperature = 0.9                 # 蓝图与帧实现同温；合成需要多样性——温度过低会让
                                   # 同类的三条序列彼此近重，被序列相似度过滤淘汰
+sequence_validator = "examples.synth-stream.hooks:validate_sequence"
 # 注：seed_examples / standalone_count / num_per_record / seeds_per_call 属平面生成
 # 形态，本形态显式书写它们是 CONFIG_ERROR——配额由 [class.*.generate].sequences 承载。
 
@@ -130,9 +69,52 @@ noise_instruction = """
 生成与任何任务都无关的干扰输入：用户随口说的闲聊、感叹、纯语气词或跑题的一句话
 （如聊天气、聊心情、无意义的重复字），长度 5–20 字，不得包含任何可执行的诉求。
 """
+
 duplicates = 1                    # 原样重发 1 条序列（逐字节同源）到流尾新会话
 frame_gap_s = [5, 60]             # 会话内帧间隔均匀采样（秒）；上界须 < stream.gap_s
 ts_start = "2026-01-05T09:00:00+08:00"   # 时间流起点（恒不取墙钟——双跑一致）
+
+# 标准 DECLARE 有限迹语义；time_s 为半开区间，correlation 为类型敏感相等。
+[[generate.stream.rules]]
+template = "init"
+frame_class = "task_request"
+
+[[generate.stream.rules]]
+template = "exactly"
+frame_class = "task_request"
+count = 1
+
+[[generate.stream.rules]]
+template = "chain_response"
+source = "task_request"
+target = "acknowledgement"
+time_s = [1200, 2400]
+correlation = { operator = "equal", source_field = "subject_id", target_field = "subject_id" }
+
+[[generate.stream.rules]]
+template = "exactly"
+frame_class = "acknowledgement"
+count = 1
+
+[[generate.stream.rules]]
+template = "response"
+source = "acknowledgement"
+target = "confirmation"
+
+[[generate.stream.rules]]
+template = "end"
+frame_class = "confirmation"
+
+[[generate.stream.rules]]
+template = "exactly"
+frame_class = "confirmation"
+count = 1
+
+# 日内分支为并集；每个 task_request occurrence 还必须在工作日。
+[[generate.stream.windows]]
+frame_class = "task_request"
+of_day = [["08:00", "11:00"], ["14:00", "17:00"]]
+of_week = ["mon", "tue", "wed", "thu", "fri"]
 
 # ── 全局档位表：一档 = 一种帧类构成（v1.14）─────────────────────────────────
 # 双重身份：档位面的总开关，以及未声明按类表的序列类的回落表。本工程只有 smart_home
@@ -140,18 +122,16 @@ ts_start = "2026-01-05T09:00:00+08:00"   # 时间流起点（恒不取墙钟—�
 # 配分：smart_home 的 sequences = 3 在权重 2 : 1 上按整数域最大余额法零抽签配分
 # ⇒ 2 + 1（2 条一档序列、1 条二档序列），配分是 (配额, 生效表) 的纯函数，不消费任何
 # 随机数。
-# 长度关系：len_range 下界 3 必须 ≥ **本类生效表**的最大构成大小（本表第 2 档三类各
-# 至少出现一次，三步才装得下）——这是 M1 逐 (类, 档) 非零配额对的硬约束，把下界改成
-# 2 会直接 CONFIG_ERROR 而不是悄悄产出缺类的序列。
+# 长度下界 4 恰好容纳三个规则帧类与一个 filler；第五帧可重复 filler。
 [[generate.stream.tiers]]
 tier_rank = 1                     # 档位身份（表内唯一、本表连续覆盖 1..N，无 name 键）
 weight = 2                        # 配额权重（整数 ≥ 1）
-frame_classes = ["task_request", "followup"]      # 该档序列恰用这两类
+frame_classes = ["task_request", "acknowledgement", "followup", "confirmation"]
 
 [[generate.stream.tiers]]
 tier_rank = 2
 weight = 1
-frame_classes = ["task_request", "followup", "confirmation"]   # 恰用全三类
+frame_classes = ["task_request", "acknowledgement", "progress", "confirmation"]
 
 [classify]
 enabled = true                    # 类表是配额与按类条件化的载体；生成侧标签直接继承
@@ -175,24 +155,27 @@ instruction = """
 连贯且有推进（不得原地重复）。
 """
 sequences = 3                     # 尝试配额（无输出条数保证，作废序列不补齐）
-len_range = [3, 5]                # 单序列步数的均匀采样区间
+len_range = [4, 5]                # planner 在一次联合求解中按随机偏好选择可行长度
 
 # 按类档位表（v1.15）：整表取代全局表——本类的序列只在下面这两档里取构成，全局表对它
-# 完全不生效。与全局表的差别是双重的：构成不同（第 2 档走 {task_request, confirmation}
-# ——确认帧直达、不带追问；全局第 2 档则是全三类）、权重方向也相反（1 : 2 对全局的
-# 2 : 1）⇒ 同样的配额 3 配分成 1 + 2。
-# 本表最大构成大小是 2，≤ len_range 下界 3，逐 (类, 档) 非零配额对的长度约束照过；
-# 这两档的构成互异只需在**本表之内**成立，与全局表撞车完全合法（第 1 档正是与全局第
-# 1 档同构成的例子）。
+# 完全不生效。本表交换 followup / progress 的 rank，权重方向也与全局表相反，
+# 直接展示 tier_rank 只是类内身份。
 [[class.ticket_booking.generate.tiers]]
 tier_rank = 1                     # 类内身份：本表自己连续覆盖 1..2，与全局表的 rank 不可比
 weight = 1
-frame_classes = ["task_request", "followup"]
+frame_classes = ["task_request", "acknowledgement", "progress", "confirmation"]
 
 [[class.ticket_booking.generate.tiers]]
 tier_rank = 2
 weight = 2
-frame_classes = ["task_request", "confirmation"]
+frame_classes = ["task_request", "acknowledgement", "followup", "confirmation"]
+
+# 按类 windows 与 tiers 一样是整表覆盖；两个窄窗仍与 smart_home 的全局窗有交集，
+# 因此联合 planner 仍可给两类安排 crossing。
+[[class.ticket_booking.generate.windows]]
+frame_class = "task_request"
+of_day = [["09:00", "11:00"], ["14:00", "16:00"]]
+of_week = ["mon", "tue", "wed", "thu", "fri"]
 
 [class.smart_home.generate]
 instruction = """
@@ -202,7 +185,7 @@ instruction = """
 推进（不得原地重复）。
 """
 sequences = 3
-len_range = [3, 5]
+len_range = [4, 5]
 
 # ── 按类标注：两类各用一份**独立**的标注 Schema（v1.13 裁决·按类标注 Schema）──
 # 覆盖语义：类声明了就用类的，未声明回落全局 [output].schema。两份 Schema 的字段
@@ -261,8 +244,16 @@ name = "task_request"
 description = "发起任务的首帧请求：说明诉求并给出已知要素"
 
 [[frame.classify.classes]]
+name = "acknowledgement"
+description = "助手对请求的结构化受理回执：复述同一 subject_id"
+
+[[frame.classify.classes]]
 name = "followup"
 description = "对进行中任务的追问、修改、补充约束"
+
+[[frame.classify.classes]]
+name = "progress"
+description = "助手或系统对当前处理进展的简短说明"
 
 [[frame.classify.classes]]
 name = "confirmation"
@@ -274,7 +265,8 @@ description = "对助手结果的确认、收尾或致谢"
 # realize_schema 的 prefixItems 作为子模式，故不写顶层 $schema 声明。
 [frame.class.task_request.generate]
 instruction = """
-产出发起任务的首帧：utterance 是用户说出的那一句话（口语、中文），entities 逐项
+产出发起任务的首帧：subject_id 是该序列唯一的简短 ASCII 标识；
+utterance 是用户说出的那一句话（口语、中文），entities 逐项
 列出这句话里出现的关键要素（地点、日期时段、设备、房间、车次坐席等），没有则给
 空数组。
 """
@@ -285,11 +277,12 @@ schema_inline = """
 {
   "type": "object",
   "properties": {
+    "subject_id": {"type": "string"},
     "utterance": {"type": "string"},
     "entities": {"type": "array", "items": {"type": "string"}},
     "duration": {"type": "number"}
   },
-  "required": ["utterance", "entities", "duration"],
+  "required": ["subject_id", "utterance", "entities", "duration"],
   "additionalProperties": false
 }
 """
@@ -304,10 +297,33 @@ schema_inline = """
 [frame.class.task_request.generate.time_fields]
 duration = "gap_next_s"
 
+[frame.class.acknowledgement.generate]
+instruction = """
+产出助手受理回执：subject_id 必须与 task_request 完全相同；utterance 用一句
+简短中文确认已受理该请求，不要创建新标识。
+"""
+schema_inline = """
+{
+  "type": "object",
+  "properties": {
+    "subject_id": {"type": "string"},
+    "utterance": {"type": "string"}
+  },
+  "required": ["subject_id", "utterance"],
+  "additionalProperties": false
+}
+"""
+
 [frame.class.followup.generate]
 instruction = """
 产出一句追问或修改：在已有诉求之上补充约束、更换要素或询问细节，口语、中文、
 一句话，须与蓝图给出的该步要点一致。
+"""
+
+[frame.class.progress.generate]
+instruction = """
+产出一句处理进展：说明正在查询、核对或执行什么，须与同序列上下文一致，
+中文、一句话。
 """
 
 [frame.class.confirmation.generate]

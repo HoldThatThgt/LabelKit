@@ -18,11 +18,16 @@ from labelkit.common.config import ResolvedConfig, default_rubric, load
 from labelkit.common.config import loader as loader_mod
 from labelkit.common.config.model import (
     CliOverrides,
+    CorrelationSpec,
     ConsoleConfig,
     GenerateStreamConfig,
+    SequenceRuleSpec,
+    SequenceWindowSpec,
     TierSpec,
     apportion_tiers,
+    effective_rules,
     effective_tiers,
+    effective_windows,
 )
 from labelkit.common.errors import ConfigError
 
@@ -159,6 +164,7 @@ def test_happy_path_defaults(env):
     assert cfg.tool.log_level == "info"
     assert cfg.llm_profiles["default"].max_concurrency == 8
     assert cfg.llm_profiles["default"].provider == "openai_compatible"
+    assert cfg.llm_profiles["default"].thinking is None
     # resolution duties
     assert cfg.quality.rubric == "default:text"        # auto by modality
     assert cfg.rubric.name == "default-text-v1"
@@ -178,6 +184,25 @@ def test_happy_path_defaults(env):
     assert cfg.generate_stream == GenerateStreamConfig()
     assert cfg.generate.sequences == 0
     assert cfg.generate.len_range == (3, 6)
+
+
+def test_llm_thinking_accepts_explicit_value(env):
+    config = BASE_CONFIG.replace(
+        'supports_structured_output = true\n',
+        'supports_structured_output = true\nthinking = "disabled"\n',
+    ).replace('[llm.judge]', '[llm.judge]\nthinking = "enabled"')
+    cfg = env.load(config_text=config)
+    assert cfg.llm_profiles["default"].thinking == "disabled"
+    assert cfg.llm_profiles["judge"].thinking == "enabled"
+
+
+def test_llm_thinking_rejects_unknown_value(env):
+    config = BASE_CONFIG.replace(
+        'model = "main-model"\n',
+        'model = "main-model"\nthinking = "automatic"\n',
+    )
+    errors = env.errors(config_text=config)
+    has(errors, '[llm.default].thinking: expected "enabled" | "disabled", got "automatic"')
 
 
 def test_digests_are_sha256_of_raw_bytes(env):
@@ -3324,6 +3349,23 @@ def test_class_views_v113_fields_default_off(env):
         assert view.schema is None
         assert view.generate.sequences == 0
         assert view.generate.len_range == (3, 6)
+
+
+def test_sequence_rule_and_window_models_are_frozen_and_have_three_state_helpers():
+    rule = SequenceRuleSpec(template="response", source="a", target="b",
+                            correlation=CorrelationSpec(source_field="id",
+                                                        target_field="id"))
+    window = SequenceWindowSpec(frame_class="a", of_day=(("09:00", "10:00"),))
+    global_rules = (rule,)
+    global_windows = (window,)
+    assert effective_rules(None, global_rules) == global_rules
+    assert effective_rules((), global_rules) == ()
+    assert effective_rules((rule,), global_rules) == (rule,)
+    assert effective_windows(None, global_windows) == global_windows
+    assert effective_windows((), global_windows) == ()
+    assert effective_windows((window,), global_windows) == (window,)
+    with pytest.raises(FrozenInstanceError):
+        rule.template = "init"
 
 
 def test_frame_class_views_v113_generate_face_default_none(env):

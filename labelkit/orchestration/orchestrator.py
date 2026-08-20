@@ -45,7 +45,7 @@ from itertools import islice
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 from labelkit import TOOL_VERSION, __version__
-from labelkit.common.config.model import effective_tiers
+from labelkit.common.config.model import effective_rules, effective_tiers, effective_windows
 from labelkit.common.contracts.stage import RunContext, Stage
 from labelkit.common.contracts.types import PipelineItem, Record
 from labelkit.common.errors import CircuitBreakerTripped, InternalError
@@ -521,8 +521,9 @@ class Orchestrator:
 
         v1.10（U17/U19/U20）：live 估算只在**确有可用估算**时发——process 模式带估算的
         计划，或 generate_only（plan=None，3.6.2 量公式是静态的、无需 scan）。文本模态未
-        开 console.estimate 时什么都不发（渲染器于是只显示「批 i」不带分母）。未挂 listener
-        时该汇方法是纯 no-op。
+        开 console.estimate 时什么都不发（渲染器于是只显示「批 i」不带分母）。v1.16
+        时间流估算会运行联合规划，因此未挂 listener 时跳过这次无人消费的规划；其余静态估算
+        仍保持既有调用路径。
 
         @param plan: 预扫描计划
         @param plan_estimated: 该计划是否带估算
@@ -532,7 +533,11 @@ class Orchestrator:
                                     "config_digest": self.cfg.config_digest,
                                     "project_digest": self.cfg.project_digest,
                                     "trace_schema_version": 1})
-        if self.cfg.run.mode == "generate_only" or plan_estimated:
+        should_estimate = self.cfg.run.mode == "generate_only" or plan_estimated
+        stream_listener_ready = (
+            not self.cfg.generate_stream.enabled or self.metrics.has_listener
+        )
+        if should_estimate and stream_listener_ready:
             self.metrics.run_estimate(estimate_run(self.cfg, plan))
         # v1.11（V13①，spec 3.10.3 上下文预算行）：启动期预算 INFO 归 M10 启动段所有
         # （绝不归 loader：加载期 logging 尚未按 CLI 覆盖定级）。--dry-run 走不到这里
@@ -1440,6 +1445,7 @@ class Orchestrator:
         }
         if self.cfg.generate_stream.tiers:
             block["tiers"] = self._report_stream_tiers(c)
+        self._append_stream_constraint_report(block, c)
         block.update({
             "frames": c("generate.stream.frames"),
             "noise_frames": c("generate.stream.noise_frames"),
@@ -1452,6 +1458,47 @@ class Orchestrator:
             "validator_scrapped": c("generate.stream.validator_scrapped"),
         })
         return block
+
+    def _append_stream_constraint_report(self, block: dict, c: _CounterView) -> None:
+        """按实际配额前缀追加 v1.16 条件报表块。
+
+        @param block: 正在组装的 generate.stream 子块
+        @param c: 计数器视图
+        """
+        rules_active, windows_active = self._stream_constraint_faces()
+        if rules_active:
+            block["rules"] = {
+                "sampled": c("generate.stream.rules.sampled"),
+                "correlation_scrapped": c("generate.stream.correlation_scrapped"),
+                "temporal_scrapped": c("generate.stream.temporal_scrapped"),
+            }
+        v116_face_active = (
+            rules_active or windows_active
+            or bool(self.cfg.generate.sequence_validator)
+        )
+        if v116_face_active and self.cfg.generate.sample_validator:
+            block["sample_validator_scrapped"] = c(
+                "generate.stream.sample_validator_scrapped")
+        if self.cfg.generate.sequence_validator:
+            block["sequence_validator_scrapped"] = c(
+                "generate.stream.sequence_validator_scrapped")
+        if windows_active:
+            block["windows"] = {"calendar_days_spanned": c(
+                "generate.stream.windows.calendar_days_spanned")}
+
+    def _stream_constraint_faces(self) -> tuple[bool, bool]:
+        """按实际 ``--limit`` 配额前缀判断 rules/windows 报表条件面。"""
+        from labelkit.operators.generate import expand_stream_quota
+
+        rules_active = False
+        windows_active = False
+        for name, _ordinal in expand_stream_quota(self.cfg):
+            view = self.cfg.class_views[name]
+            rules_active |= bool(effective_rules(
+                view.rules, self.cfg.generate_stream.rules))
+            windows_active |= bool(effective_windows(
+                view.windows, self.cfg.generate_stream.windows))
+        return rules_active, windows_active
 
     def _report_stream_tiers(self, c: _CounterView) -> dict:
         """v1.14 档位配额子块：按声明档位表零基铺开 planned / produced（v1.15 双形）。

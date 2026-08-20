@@ -49,7 +49,7 @@
 
 一条与脱敏档位无关的恒定规则（v1.6）：`llm.key_*` / `llm.pool_*` 事件与 `llm.call` 的 `key_env` 字段里，密钥恒以**环境变量名**标识——密钥值本身在任何档位（含 `full`）都不写入 trace、运行日志与报告。
 
-**v1.13 时间流生成：零新通道、零新事件、零新错误码。**第 27 章那个形态在上面这张表里**一行都不加**：蓝图与帧实现是普通的 LLM 调用，订阅 `llm` 通道就能在 `llm.call` 事件里看到它们的延迟、token 与重试（`full` 档还能看到提示词与响应全文——那是一份数据副本，用完即清）；序列作废、噪音批作废这类判决只走 stderr 的 WARN 与报告计数，不单开事件。通道枚举维持十一值，`error` 事件的错误码词表（第 18 章）零新增。它的账全在报告里——见下节末尾的两处新读数。
+**时间流生成继续保持零新通道、零新事件、零新错误码。**蓝图、v1.16 sampled brief 与帧实现都是普通 LLM 调用，订阅 `llm` 通道即可看延迟、token 与重试；机械联合规划不复制规则、payload 或密钥到 trace。序列作废与噪音调用缺额只走值无关 WARN 和报告计数。它的账全在报告里。
 
 ## 16.3 rubric 调优闭环：让准则跟着证据迭代
 
@@ -144,12 +144,14 @@ jq -c 'select(.ev=="quality.judgment" and (.record_ids | index("6e60ce3c2d59f04d
 
 想要完整的调用审计（每次请求的 token、延迟、重试、状态），订阅 trace 的 `llm` 通道即可——`llm.call` 事件字段命名对齐 OpenTelemetry GenAI 语义约定（`gen_ai.usage.input_tokens` 等），现成的 OTel 生态分析工具可以直接吃。
 
-### 时间流生成的两处报告读数（v1.13，v1.14 增档位子块）
+### 时间流生成的两处报告读数（v1.16 增规则与窗口条件块）
 
 这个形态（第 27 章）不加事件——v1.14 的两个增量同样零新通道、零新事件、零新错误码——观测面全部落在 `report.json` 的两处按需字段上：
 
 - **`run.artifact`**：时间流工件的摘要三件套 `{path, sha256, lines}`（主输出同款形态），仅工件实际写出时在场（`--dry-run` 不写工件，自然也没有它）。`lines` 是逐帧账的总闸——拿它与下面的帧数交叉验证；
-- **`generate.stream`**：`{sessions, crossed_sessions, sequences: {<类>: {planned, produced}}, frames, noise_frames, duplicates, plan_calls, realize_calls, noise_calls, plan_failures, realize_failures, validator_scrapped}`，counts-only。日常盯三个比值：`produced / planned`（作废率——三项 failures 与序列相似度过滤的合力）、`crossed_sessions`（交叉演示位还在不在，它 = Σ幸存 − sessions）、`noise_frames / frames`（掺噪比是否如你所愿）。声明了帧类构成档位（`[[generate.stream.tiers]]`，v1.14）时，这里**多一个 `tiers` 子块**——键位在 `sequences` 之后、`frames` 之前，**两种形状二选一**：全部序列类都吃全局表 ⇒ 平面形 `{"<tier_rank>": {planned, produced}}`；任一序列类声明了自己的 `[[class.<名>.generate.tiers]]`（v1.15 按类档位表）⇒ 类嵌套形 `{"<类名>": {"<tier_rank>": {planned, produced}}}`，外层按类表声明序、内层按该类**生效表**的 rank 升序。两形都是十进制字符串键、零配额档与全军作废档如实报 0（显式装配，不靠计数器首触序）；嵌套形的内层键集**逐类可以不同**，写消费脚本先探形状。它是同一笔配额的按档切法，与 `sequences` 的按类切法互为对照：`planned` 两边合计相等，作废时看缺口落在哪个类的哪一档（第 27 章 27.4）。档位表缺省时该键整块不在场；按类档位表与时间字段回填一样是**零观测增量**（无新计数键、无新 trace 事件、无新错误码）——它只改这一个子块的形状。
+- **`generate.stream`**：基础键仍是 session、序列、帧、调用与 failures 的 counts-only 账。`crossed_sessions` 现在按最终 survivor 投影后是否仍有真实 owner 交替计算，不能再用 `Σ幸存 − sessions` 反推。声明帧类构成档位时仍有两种 `tiers` 形状。v1.16 的增量均为条件在场：有生效规则时出现 `rules: {sampled, correlation_scrapped, temporal_scrapped}`；配置 `generate.sequence_validator` 时出现 `sequence_validator_scrapped`，并由它或实际配额前缀的 rules/windows 激活 v1.16 报表面；只有该面已激活且既有 `generate.sample_validator` 也配置时，才出现 `sample_validator_scrapped`，从而保持 sample-hook-only 的 v1.15 报表字节；有生效窗口时出现 `windows: {calendar_days_spanned}`。四个作废子计数之和必须等于 `validator_scrapped`，相似度淘汰不进入该等式。
+
+`noise_ratio` 给的是目标。联合 planner 在 session 长度与内部开区间约束下最大化实际槽数；报告的 `noise_frames` 只统计最终 survivor 投影后、且拿到模型 payload 的槽。目标无法全部放入时会有一条值无关 WARN，不会运行期重织或扩大 session。
 
 同一份报告里还有两处「反直觉但正确」的读数：`classify` 的逐类计数**恒全零**（标签生成期已知、继承，零判决调用），`stream` 节**不出现**（那是分段算子的观测面）。逐键解读与真跑数字见第 8 章 8.4 与第 27 章 27.7。
 

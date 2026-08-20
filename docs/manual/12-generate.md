@@ -82,7 +82,9 @@ modality = "text"
 
 [stream]                      # 生成侧的铺设契约（复用摄取侧词汇，故工件可重放）
 order_by = "meta:ts"
-gap_s = 900
+gap_s = 3600
+session_max_len = 12
+session_max_span_s = 3000
 
 [generate]
 enabled = true
@@ -96,23 +98,37 @@ duplicates = 1                # 原样重发几条序列（落流尾新会话）
 frame_gap_s = [5, 60]
 ts_start = "2026-01-05T09:00:00+08:00"
 
+[[generate.stream.rules]]
+template = "chain_response"
+source = "task_request"
+target = "acknowledgement"
+time_s = [1200, 2400]        # 半开区间：20 分钟可取，40 分钟不可取
+correlation = { operator = "equal", source_field = "subject_id", target_field = "subject_id" }
+
+[[generate.stream.windows]]
+frame_class = "task_request"
+of_day = [["08:00", "11:00"], ["14:00", "17:00"]]
+of_week = ["mon", "tue", "wed", "thu", "fri"]
+
 [class.ticket_booking.generate]
 instruction = """……"""        # 配额与长度按序列类挂
 sequences = 3
-len_range = [3, 5]
+len_range = [4, 5]
 ```
 
 与本章前两种形态的分工，一句话各表：
 
 | | 平面生成（12.3 两形态） | 时间流形态（v1.13） |
 |---|---|---|
-| 一次调用产出 | `num_per_call` 条独立文本 | 一条序列的**蓝图**，或这条序列的全部**帧内容** |
+| 一次调用产出 | `num_per_call` 条独立文本 | 默认路径是一条蓝图；启用规则/窗口时是固定帧类词对应的 brief。另一类调用实现这条序列的全部帧内容 |
 | 配额 | `num_per_record` / `standalone_count` | 按类 `sequences` × `len_range`（同为**尝试配额**，不补齐） |
-| 结构 | 无 | 会话装箱、两序列交叉、噪音插入、原样重发、时间戳铺设——**全部由零 LLM 的机械交织器完成** |
+| 结构 | 无 | 无规则/窗口时沿用机械交织；约束面在场时由联合 planner 在 LLM 前共同冻结 word、occurrence witness、session、crossing、timestamp 与 noise 槽 |
 | 产物 | 主输出 | 主输出（一行 = 一条序列）**+ 时间流工件**（一行 = 一帧，可当输入重放） |
 | 本章键的效力 | 全部生效 | `llms`/`mixture`/`weights`/`styles`/`temperature`/`sample_validator` 生效（作用面见第 27 章 27.4）；`num_per_call` 只管噪音批装箱；`seed_examples`/`standalone_count`/`num_per_record`/`seeds_per_call` **显式书写即配置错误** |
 
 其余照旧：序列级的相似度过滤（判重文本 = 成员文本按序拼接）照常内置执行、`survived_dedup` 照常记桶，合成序列照常走 dedup → classify（标签继承、零调用）→ quality → annotate → verify 全套治理，守恒恒等式仍是上面那条退化形（成员帧只活在工件里、不构造信封）。完整配置、两份产物的读法、工件重放与成本账见**第 27 章**。
+
+`time_s` 不是在默认 `frame_gap_s` 上再取交集。只有被已选正规则 witness 覆盖的相邻 owner 边改由显式区间控制；它仍必须不超过 `stream.gap_s`，保证另一条 crossing 序列作废后，单独 replay 也不会把幸存序列切断。未覆盖相邻边继续用闭区间 `frame_gap_s`。窗口分支均须在同一自然日，序列和 session 本身可以跨日。
 
 ## 12.4 多样性的三个旋钮
 

@@ -279,8 +279,12 @@ def build_cover(meta_rows: list[list[str]], rev_rows: list[list[str]]) -> str:
   <h1 class="no-break">LabelKit<br>采集数据自动标注工具</h1>
   <div class="sub">产品设计说明书（Product Design Specification）</div>
   <table class="meta-table kv">{kv}</table>
-  <table class="meta-table" style="width:76%; margin-top:24px; font-size:8.5pt;">{rev}</table>
 </div>
+<!-- ═══════════════════ 修订历史 ═══════════════════ -->
+<section class="revision-history">
+  <h1 class="no-break">修订历史</h1>
+  <table class="meta-table" style="font-size:8.5pt;">{rev}</table>
+</section>
 """
 
 

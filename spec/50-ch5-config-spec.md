@@ -21,6 +21,7 @@
 | `llm.*.max_output_tokens` | int | 4096 | 透传给 API。 |
 | `llm.*.context_window` | int | 0 | v1.11 新增（V6/V26，3.9.5）：模型上下文窗口（token）。`0` = 未声明：该 profile 上下文预算关闭（行为与 v1.10 一致），被启用阶段引用时 M1 WARN 一次（3.1.4）。> 0 时须满足 `context_window > max_output_tokens + margin`，否则 CONFIG_ERROR（预算非正）；`margin = max(256, ceil(0.10 × context_window))`。**声明部署实效窗口，勿照抄文档（V26/[C-59]，`docs/dev/PROPOSAL-context-budget.md`）**：同名模型随部署差数倍（Together 版 glm-5.2 为 256K、vLLM 由 `--max-model-len` 决定），且文档说法可能与端点实况相悖（z.ai anthropic 路由实测：裸 `glm-5.2` 实效窗即 `input+max_tokens ≤ 2^20`，官方博客的 `[1m]` 后缀反被拒——E2E-FINDINGS #16）——窗口只能按部署实测或保守欠声明；**欠声明恒安全**（只多裁不溢出）。 |
 | `llm.*.temperature` | float | 0.0 | profile 级默认；生成阶段建议在 project.toml 用 generate.temperature 调高。 |
+| `llm.*.thinking` | str | 缺省 | v1.16：可选 `"enabled"` \| `"disabled"`；显式值在 OpenAI 兼容与 Anthropic 两种请求的顶层写为 `{"thinking": {"type": <value>}}`，缺省不写该字段以保持既有请求体形态。 |
 | `llm.*.max_image_px` | int | 2048 | 图像长边上限，超出等比缩小（3.9.3）。v1.11 语义升格（V18/V27③，3.9.5）：**升级天花板 + provider 像素制硬限制域**——V21 判审升级路径的分辨率上探以本键封顶；像素是运载意图与 provider 硬限制（带宽/载荷；Anthropic 的 8000px 与 >20 图 ∧ >2000px 硬拒本身是像素制）的控制面。[C-62] 记载：gpt-5.6 级 openai 后端默认 `detail` 等效 `original`（服务端不再隐式钳制图片 token），本键与 `default_image_px` 因此成为该类后端**唯一的客户端成本闸**。 |
 | `llm.*.default_image_px` | int | 0 | v1.11 新增（V18，3.9.5）：图片采样**默认工作点**（长边 px）。`0` = 沿用 `max_image_px`（v1.10 行为逐字节不变）。> 0 时须 ≤ `max_image_px`（CONFIG_ERROR，3.1.4）；V21 升级路径可上探至 `max_image_px`。 |
 | `llm.*.price_per_mtok_in / _out` | float | 可选 | 每百万 token 单价；配置后报告输出成本估算。 |
@@ -79,6 +80,7 @@ provider = "anthropic"
 base_url = "https://api.anthropic.com"
 model = "claude-sonnet-5"
 api_key_env = "LABELKIT_KEY_JUDGE"
+# thinking = "disabled"             # v1.16：provider 顶层 thinking 开关；缺省不发送
 max_concurrency = 4
 supports_structured_output = true
 supports_vision = true
@@ -198,7 +200,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `generate.stream.noise_ratio` | float | 0.0 | v1.13：噪音帧 / 任务帧 比例，∈ [0,1)；噪音帧数 = `round(noise_ratio × Σ任务帧数)`，调用数 = `⌈噪音帧数 / generate.num_per_call⌉`。> 0 时 `noise_instruction` 必填。噪音帧逐帧掷签 (会话, 槽位)，满员会话（`len ≥ stream.session_max_len`）退出签池（3.6.5）。 |
 | `generate.stream.noise_instruction` | str | "" | v1.13：噪音帧的生成指令（`noise_ratio > 0` 时必填非空，M1 校验）；批量实现复用 3.6.2 的既有生成模板与输出 Schema。 |
 | `generate.stream.duplicates` | int | 0 | v1.13：**原样重发**的序列条数（0 = 无；M1 要求 ∈ [0, Σsequences]，运行期另按幸存数钳制 + WARN）。取自幸存序列、帧内容逐字节同源、恒落**流尾新会话**（避免同刻不定序）——重发帧只活在工件（不构造信封、不进本次运行的守恒账），判重演示位在**工件重放**（6.5）。 |
-| `generate.stream.frame_gap_s` | array | [5, 60] | v1.13：会话内帧间隔的均匀采样区间（秒，数值）；M1 要求 **`1e-6 ≤ lo ≤ hi < stream.gap_s`**（上界：否则会话内间隔自身就触发会话切分，自相矛盾；下界为 v1.14 补的**微秒地板**——isoformat 精度与 `round(·, 6)` 的分辨率下界，亚微秒 lo 下帧间隔 `timedelta` 取整为 0 微秒，破坏「ts 严格递增」并使时间语义词表的 0.0 边界哨兵失去无歧义性）。会话间隔取 `uniform(gap_s + lo, gap_s + hi)` 恒 > `gap_s` ⇒ 摄取侧按同一 `gap_s` 复演出相同会话切分（3.6.5）。 |
+| `generate.stream.frame_gap_s` | array | [5, 60] | v1.13：会话内帧间隔的均匀采样区间（秒，数值）；M1 默认 v1.15 路径（以及仅有 sequence_validator、无实际非零 rules/windows 前缀的路径）要求 **`1e-6 ≤ lo ≤ hi < stream.gap_s`**；仅当 `--limit` 后实际非零配额前缀存在生效 rules/windows 时，v1.16 联合规划路径才允许 **`hi ≤ stream.gap_s`**（上界等于阈值时由 replay guard 接管；下界为 v1.14 补的**微秒地板**——isoformat 精度与 `round(·, 6)` 的分辨率下界，亚微秒 lo 下帧间隔 `timedelta` 取整为 0 微秒，破坏「ts 严格递增」并使时间语义词表的 0.0 边界哨兵失去无歧义性）。会话间隔取 `uniform(gap_s + lo, gap_s + hi)` 恒 > `gap_s` ⇒ 摄取侧按同一 `gap_s` 复演出相同会话切分（3.6.5）。 |
 | `generate.stream.ts_start` | str | "2026-01-01T00:00:00Z" | v1.13：时间流起点（ISO-8601，M1 以 `datetime.fromisoformat` 校验可解析；无时区视为 UTC，与 `meta:<字段>` 摄取规则一致）。**恒不取墙钟**——同 seed 双跑工件逐字节一致的前提之一（2.6 可复现行）。 |
 | `annotate.enabled` | bool | true | — |
 | `annotate.llm / instruction` | str | default / 必填† | † enabled 时必填。 |
@@ -368,6 +370,89 @@ schema_inline = """
 }
 """
 ```
+
+### 5.2.1 v1.16 序列规则、日历窗口与序列级校验钩子
+
+v1.16 的约束表属于时间流 `generate_only` 形态。规则和窗口缺省时均为空，不改变
+v1.15 的默认生成路径；任一实际非零配额类的生效表非空时，M1、`estimate_run` 与 M6
+共同启用全流 CP-SAT planner。`--limit` 先在按类配额前缀上截断，完全截掉的类不激活
+planner 或对应 report 面，但零配额类的声明仍接受完整静态校验。
+
+| 键 | 类型 | 默认 | 说明 |
+|---|---|---|---|
+| `generate.sequence_validator` | str | 缺省 | 可选 `module:function`。函数签名为 `def validate_sequence(value: SequenceValidationInput) -> list[str]`；返回空列表表示通过，非空列表表示整条序列作废。钩子收到深拷贝，不得依赖工具隔离其同权限执行。 |
+| `generate.stream.rules` | array table | `[]` | 全局有限迹规则表；每行 `template` 必填，按模板使用 `frame_class` 或 `source` / `target`，可选 `count`、半开秒区间 `time_s = [lo, hi]` 与 typed `correlation`。 |
+| `generate.stream.windows` | array table | `[]` | 全局帧类日历窗口表；每个 `frame_class` 最多一行，`of_day` 为同日半开区间数组，`of_week` 缺省为整周。 |
+| `class.<name>.generate.rules` | array table | `None` | 类规则表的三态覆盖：键缺省继承全局，显式 `rules = []` 清空，非空表整体替换；允许只有类表而没有全局表。 |
+| `class.<name>.generate.windows` | array table | `None` | 与类规则表独立的同样三态覆盖；不与 rules 共享清空或继承状态。 |
+
+规则模板闭集为 `existence`、`absence`、`exactly`、`init`、`end`、
+`responded_existence`、`co_existence`、`response`、`precedence`、`succession`、
+`alternate_response`、`chain_response`、`chain_precedence`、`not_co_existence`、
+`not_succession`。存在性三模板要求正整数 `count`，其他模板禁止 `count`；二元模板要求
+不同的 `source` / `target`，且只有二元模板可写 `time_s` 与 `correlation`。同一生效表中
+完全重复的规则声明是 `CONFIG_ERROR`。规则的 occurrence 语义、activation/target 候选
+枚举和正负规则的时间方向见 3.1.4 与 `docs/dev/SPEC-sequence-rules.md`，planner witness
+不是运行期的 i 对 i 配对承诺。
+
+```toml
+[[generate.stream.rules]]
+template = "init"
+frame_class = "task_request"
+
+[[generate.stream.rules]]
+template = "chain_response"
+source = "task_request"
+target = "confirmation"
+time_s = [1.2, 4.8]
+correlation = { operator = "equal", source_field = "subject_id", target_field = "subject_id" }
+
+[[generate.stream.windows]]
+frame_class = "task_request"
+of_day = [["08:00", "11:00"], ["14:00:00", "17:00:00.000001"]]
+of_week = ["mon", "tue", "wed", "thu", "fri"]
+
+[generate]
+sequence_validator = "hooks:validate_sequence"
+
+[[class.ticket_booking.generate.rules]]
+template = "exactly"
+frame_class = "confirmation"
+count = 1
+
+[[class.smart_home.generate.windows]]
+frame_class = "task_request"
+of_day = [["09:00", "18:00"]]
+```
+
+`time_s = [lo, hi]` 的实际语义是半开 `[lo, hi)` 秒，端点必须可无损量化为微秒且满足
+`1us <= lo < hi`；有序模板使用 target 减 source，`responded_existence`、`co_existence`
+与 `not_co_existence` 使用绝对时间差。联合路径把 `frame_gap_s` 量化为
+`ceil(lo * 1e6)` 到 `floor(hi * 1e6)` 的整数区间，空区间是配置错误；显式链区间必须与
+相邻 replay guard `[1us, stream.gap_s]` 相交。
+
+`correlation` 只接受 `operator = "equal"`。字段必须位于两侧结构化生成 Schema 的顶层
+`properties` 与 `required`，两侧 `type` 关键字字面相等，且不能是 `time_fields` 绑定
+字段。运行期先按 JSON 类型敏感的 canonical bytes 比较，再按 `time_s` 过滤；对象键序
+不影响相等，数组顺序影响相等，`true`、`1`、`1.0` 不视为同值。纯文本帧不能参与
+correlation。
+
+窗口的 `of_day` 只接受 `HH:MM`、`HH:MM:SS`、微秒精度的同日半开区间，不能跨午夜且
+同一行内不得重叠；`of_week` 只能使用 `mon` 到 `sun`，不能重复，省略即整周。所有
+窗口以 `ts_start` 的固定 offset 解释，naive `ts_start` 按 UTC，不使用 IANA 时区或 DST。
+
+M1 对每个类、生效 tier、`len_range` 的每个候选长度执行局部潜在可满足性检查，并对
+实际配额前缀执行完整问题检查。planner 使用 OR-Tools `9.15.6755`，CP-SAT 单线程、
+固定 31-bit seed、`max_deterministic_time = 10.0`，模型 proto 超过 250,000 项直接报错；
+无 noise objective 时接受 `FEASIBLE` / `OPTIMAL`，有 noise objective 时必须 `OPTIMAL`。
+`INFEASIBLE` 或 `UNKNOWN` 是 `CONFIG_ERROR`，`MODEL_INVALID` 是 `InternalError`，不做
+运行期重抽、fallback 或重规划。
+
+`generate.sequence_validator` 的 hook 异常按违规处理；日志只允许引用、异常类型和违规
+数量。M6 的验证顺序为 realize Schema → `generate.sample_validator` → declarative
+correlation/time → sequence hook → sequence similarity。报告只在实际非零配额类的生效面
+加入 `rules` / validator 计数与 `windows.calendar_days_spanned`，规则、窗口、hook 返回
+文本和 planner 细节永不写入 artifact、truth、主输出或 report。
 
 ## 5.3 Rubric 结构（内联或默认包文件，同一 TOML 结构）
 

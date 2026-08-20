@@ -319,8 +319,10 @@ def _int_pair(t: _Tbl, key: str, default: tuple[int, int]) -> tuple[int, int]:
 def _num_pair(t: _Tbl, key: str, default: tuple[float, float]) -> tuple[float, float]:
     """v1.13: 读取 ``[lo, hi]`` 数值闭区间(frame_gap_s 形)。
 
-    要求长度恰 2、元素为数值、``0 < lo <= hi``; 跨节上界(hi < stream.gap_s)留给
-    形态约束簇裁定。
+    要求长度恰 2、元素为数值、``0 < lo <= hi``；跨节上界由形态约束簇裁定：默认
+    v1.15 路径（含仅 sequence_validator、无实际非零 rules/windows 前缀）要求
+    ``hi < stream.gap_s``，仅实际非零 rules/windows 配额前缀的 v1.16 联合路径允许
+    ``hi == stream.gap_s``。
 
     @param t 所属表读取器
     @param key 键名

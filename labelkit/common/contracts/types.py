@@ -202,6 +202,24 @@ class Classification:                      # v1.7：M13 classify 判决（spec 3
 
 
 @dataclass(frozen=True)
+class SequenceValidationFrame:
+    """序列级生成钩子看到的单帧只读输入。"""
+
+    position: int                           # 序列内零基位置
+    frame_class: str                        # planner 冻结的帧类
+    payload: object                         # JSON-compatible 深拷贝载荷
+
+
+@dataclass(frozen=True)
+class SequenceValidationInput:
+    """序列级生成钩子的冻结输入契约。"""
+
+    sequence_class: str                     # 生成序列类名
+    tier_rank: int | None                   # 生效档位序数；无档位时为 None
+    frames: tuple[SequenceValidationFrame, ...]  # 按序列位置排列的成员帧
+
+
+@dataclass(frozen=True)
 class DedupInfo:
     """M3 去重结论：本记录是唯一还是某簇的重复，以及簇头是谁。"""
 

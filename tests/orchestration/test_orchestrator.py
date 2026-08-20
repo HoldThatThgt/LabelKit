@@ -26,12 +26,12 @@ from labelkit.common.config.model import (
     DedupConfig,
     ConsoleConfig,
     EmbeddingProfile,
-    ExtractConfig, FrameAnnotateConfig, FrameClassifyConfig, GenerateConfig,
+    ExtractConfig, FrameAnnotateConfig, FrameClassifyConfig, FrameClassView, GenerateConfig,
     GenerateStreamConfig,
     InputConfig, LLMProfile, OutputConfig,
     QualityConfig,
     ResolvedConfig, Rubric, RunConfig, SegmentConfig, StitchConfig, StreamConfig,
-    TierSpec,
+    SequenceRuleSpec, SequenceWindowSpec, TierSpec,
     ToolConfig,
     TraceConfig, VerifyConfig,
 )
@@ -915,7 +915,9 @@ async def test_generate_only_interrupt_stops_taking_batches_after_generation(tmp
 
 def stream_gen_cfg(tmp_path, *, batch_size=4, limit=None, quotas=None,
                    quality=False, annotate=False, verify=False,
-                   noise_ratio=0.0, tiers=(), class_tiers=None) -> ResolvedConfig:
+                   noise_ratio=0.0, tiers=(), class_tiers=None, rules=(), windows=(),
+                   class_rules=None, class_windows=None, sample_validator=None,
+                   sequence_validator=None) -> ResolvedConfig:
     """M1 形状的时间流形态配置：classify 类表 = 配额载体（inherited 零调用），
     class_views 携按类 sequences/len_range，generate_stream 开启。v1.14：tiers
     传入即档位面在场（按 tier_rank 升序存放，M1 解析产物的形状）。v1.15：
@@ -923,20 +925,39 @@ def stream_gen_cfg(tmp_path, *, batch_size=4, limit=None, quotas=None,
     quotas = quotas or {"faq": 2, "chat": 1}
     base = make_cfg(tmp_path, mode="generate_only", batch_size=batch_size,
                     limit=limit, quality=quality, annotate=annotate, verify=verify,
-                    generate=GenerateConfig(enabled=True, num_per_call=2),
-                    classify=classify_cfg(classes=tuple(sorted(quotas))))
+                    generate=GenerateConfig(
+                        enabled=True, num_per_call=2,
+                        sample_validator=sample_validator,
+                        sequence_validator=sequence_validator),
+                    classify=classify_cfg(classes=tuple(sorted(quotas))),
+                    frame_classify=FrameClassifyConfig(
+                        classes=(ClassSpec(name="task_request", description="d"),
+                                 ClassSpec(name="followup", description="d"))))
+    base = replace(base, stream=StreamConfig(order_by="meta:ts", gap_s=300))
     cfg = replace(base, generate_stream=GenerateStreamConfig(
         enabled=True, sessions=max(1, sum(quotas.values()) - 1),
         noise_ratio=noise_ratio,
         noise_instruction="噪音" if noise_ratio > 0 else "",
         frame_gap_s=(5.0, 60.0), ts_start="2026-01-01T00:00:00Z",
-        tiers=tuple(tiers)))
+        tiers=tuple(tiers), rules=tuple(rules), windows=tuple(windows)))
     overrides = {
         name: {"generate": replace(cfg.generate, instruction=f"生成{name}",
                                    sequences=n, len_range=(2, 3)),
                "tiers": (class_tiers or {}).get(name)}
         for name, n in quotas.items()}
-    return with_views(cfg, overrides)
+    for name in overrides:
+        if class_rules and name in class_rules:
+            overrides[name]["rules"] = class_rules[name]
+        if class_windows and name in class_windows:
+            overrides[name]["windows"] = class_windows[name]
+    resolved = with_views(cfg, overrides)
+    frame_views = {
+        spec.name: FrameClassView(
+            instruction="", examples=(), enabled=False,
+            gen_instruction=f"生成{spec.name}")
+        for spec in resolved.frame_classify.classes
+    }
+    return replace(resolved, frame_class_views=frame_views)
 
 
 def stream_envelope(i: int, label: str = "faq") -> PipelineItem:
@@ -1019,6 +1040,24 @@ async def test_generate_stream_drives_artifact_then_batches(tmp_path):
         "faq": {"planned": 2, "produced": 2}}
     assert stream_block["noise_calls"] == 0        # 计数缺席 ⇒ 零基在场
     assert "stream" not in report                  # report.stream 不出现（segment 观测面）
+
+
+async def test_generate_stream_live_without_listener_skips_unused_estimate(
+        tmp_path, monkeypatch):
+    """时间流 live 无 listener 时不重复执行昂贵规划；估算无消费者即为纯 no-op。"""
+    gen = PureStreamGenerateStage([stream_envelope(1)], ["line"])
+    cfg = stream_gen_cfg(tmp_path, limit=1)
+
+    def unexpected_estimate(*_args, **_kwargs):
+        raise AssertionError("unused stream estimate must not run")
+
+    monkeypatch.setattr("labelkit.orchestration.orchestrator.estimate_run",
+                        unexpected_estimate)
+    orch, metrics, _, _ = build(cfg, [gen])
+    summary = await orch.run()
+
+    assert summary.exit_code == 0
+    assert metrics.run_estimates == []
 
 
 async def test_generate_stream_envelopes_keep_direct_assembly_fields(tmp_path):
@@ -1144,6 +1183,73 @@ async def test_generate_stream_report_has_no_tiers_block_without_the_table(tmp_p
     orch, _, emitter, _ = build(cfg, [gen])
     await orch.run()
     assert "tiers" not in emitter.report["generate"]["stream"]
+
+
+async def test_generate_stream_report_joint_faces_are_conditional_and_zero_based(tmp_path):
+    """v1.16 增量键按有效配置显式装配，计数器未首触时仍写零。"""
+    rule = SequenceRuleSpec(template="init", frame_class="task_request")
+    window = SequenceWindowSpec(frame_class="task_request",
+                                of_day=(("08:00:00", "12:00:00"),))
+    counters = {
+        "generate.stream.rules.sampled": 3,
+        "generate.stream.correlation_scrapped": 1,
+        "generate.stream.windows.calendar_days_spanned": 4,
+    }
+    gen = PureStreamGenerateStage([stream_envelope(1)], ["l1"], counters)
+    cfg = stream_gen_cfg(
+        tmp_path, rules=(rule,), windows=(window,),
+        sample_validator="tests.hook_samples:accept_all",
+        sequence_validator="tests.hook_samples:accept_sequence")
+    orch, _, emitter, _ = build(cfg, [gen])
+    await orch.run()
+
+    stream_block = emitter.report["generate"]["stream"]
+    assert list(stream_block)[3:7] == [
+        "rules", "sample_validator_scrapped",
+        "sequence_validator_scrapped", "windows"]
+    assert stream_block["rules"] == {
+        "sampled": 3, "correlation_scrapped": 1, "temporal_scrapped": 0}
+    assert stream_block["sample_validator_scrapped"] == 0
+    assert stream_block["sequence_validator_scrapped"] == 0
+    assert stream_block["windows"] == {"calendar_days_spanned": 4}
+
+
+async def test_generate_stream_report_sample_hook_alone_keeps_v115_shape(tmp_path):
+    """既有逐帧 hook 单独在场不激活 v1.16 报表面，保持 v1.15 报表字节形状。"""
+    cfg = stream_gen_cfg(
+        tmp_path, sample_validator="tests.hook_samples:accept_all")
+    gen = PureStreamGenerateStage([stream_envelope(1)], ["l1"])
+    orch, _, emitter, _ = build(cfg, [gen])
+    await orch.run()
+
+    stream_block = emitter.report["generate"]["stream"]
+    assert "sample_validator_scrapped" not in stream_block
+
+
+async def test_generate_stream_report_sequence_hook_activates_v116_face(tmp_path):
+    """序列 hook 自身激活 v1.16 面，并允许同报既有逐帧 hook 子计数。"""
+    cfg = stream_gen_cfg(
+        tmp_path,
+        sample_validator="tests.hook_samples:accept_all",
+        sequence_validator="tests.hook_samples:accept_sequence")
+    gen = PureStreamGenerateStage([stream_envelope(1)], ["l1"])
+    orch, _, emitter, _ = build(cfg, [gen])
+    await orch.run()
+
+    stream_block = emitter.report["generate"]["stream"]
+    assert stream_block["sample_validator_scrapped"] == 0
+    assert stream_block["sequence_validator_scrapped"] == 0
+
+
+async def test_generate_stream_report_ignores_constraints_outside_limit_prefix(tmp_path):
+    """只有 ``--limit`` 后实际 attempt 前缀里的按类规则才激活报表。"""
+    rule = SequenceRuleSpec(template="init", frame_class="task_request")
+    cfg = stream_gen_cfg(
+        tmp_path, limit=1, class_rules={"faq": (rule,), "chat": ()})
+    gen = PureStreamGenerateStage([stream_envelope(1)], ["l1"])
+    orch, _, emitter, _ = build(cfg, [gen])
+    await orch.run()
+    assert "rules" not in emitter.report["generate"]["stream"]
 
 
 # ── v1.15 报表双形（SPEC-per-class-tiers §3.3）──────────────────────────────

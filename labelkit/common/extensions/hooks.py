@@ -9,11 +9,16 @@
   挂接为结构引擎的 L2.5，仅作用于用户 Schema 的标注调用。
 - ``generate.sample_validator`` —— ``fn(text: str) -> list[str]``，
   在相似度过滤之前逐条过滤生成样本。
+- ``generate.sequence_validator`` —— ``fn(value: SequenceValidationInput) -> list[str]``，
+  在声明规则之后、序列相似度之前检查一条冻结序列。
 """
 from __future__ import annotations
 
+import copy
 from importlib import import_module
 from typing import Any, Callable
+
+from labelkit.common.contracts.types import SequenceValidationFrame, SequenceValidationInput
 
 
 def resolve_hook(ref: str) -> Callable[..., Any]:
@@ -57,3 +62,46 @@ def normalize_violations(result: Any, ref: str) -> list[str]:
         return [str(v) for v in result]
     raise TypeError(f"validator hook {ref!r} must return list[str] (empty = pass), "
                     f"got {type(result).__name__}")
+
+
+def resolve_sequence_hook(ref: str) -> Callable[[SequenceValidationInput], Any]:
+    """解析序列级校验钩子并保留其冻结输入类型契约。
+
+    @param ref ``module:function`` 形式的序列钩子引用
+    @return 接受 ``SequenceValidationInput`` 的用户函数
+    @raises ValueError 引用格式、模块、属性或可调用性非法
+    """
+    return resolve_hook(ref)
+
+
+def clone_sequence_input(value: SequenceValidationInput) -> SequenceValidationInput:
+    """深拷贝序列钩子输入，隔离用户函数对 payload 的修改。
+
+    @param value M6 组装的冻结序列视图
+    @return 元数据不变、payload 完全深拷贝的新序列视图
+    """
+    frames = tuple(SequenceValidationFrame(
+        position=frame.position,
+        frame_class=frame.frame_class,
+        payload=copy.deepcopy(frame.payload),
+    ) for frame in value.frames)
+    return SequenceValidationInput(
+        sequence_class=value.sequence_class,
+        tier_rank=value.tier_rank,
+        frames=frames,
+    )
+
+
+def invoke_sequence_hook(ref: str, value: SequenceValidationInput) -> list[str]:
+    """调用序列级钩子并统一规整违规返回值。
+
+    @param ref ``module:function`` 形式的序列钩子引用
+    @param value M6 生成的序列输入；传给用户函数前会深拷贝
+    @return 空列表表示通过，否则为稳定字符串违规列表
+    @raises ValueError 引用解析失败
+    @raises TypeError 用户返回值不是 None/list/tuple
+    @raises Exception 用户钩子异常原样交给 M6 记录为序列作废
+    """
+    hook = resolve_sequence_hook(ref)
+    result = hook(clone_sequence_input(value))
+    return normalize_violations(result, ref)

@@ -512,6 +512,21 @@ def plan_schema(names: Sequence[str], length: int, cover_all: bool = False) -> d
             "required": ["steps"], "additionalProperties": False}
 
 
+def brief_schema(length: int) -> dict:
+    """v1.16 联合规划蓝图的 sampled brief Schema。
+
+    @param length planner 已冻结的序列长度
+    @return 逐位只含 ``brief`` 的 draft 2020-12 Schema
+    """
+    if length < 1:
+        raise ValueError("brief schema length must be positive")
+    item = {"type": "object", "properties": {"brief": {"type": "string"}},
+            "required": ["brief"], "additionalProperties": False}
+    steps = {"type": "array", "items": item, "minItems": length, "maxItems": length}
+    return {"type": "object", "properties": {"steps": steps},
+            "required": ["steps"], "additionalProperties": False}
+
+
 def realize_schema(step_schemas: Sequence[dict]) -> dict:
     """v1.13 M6 时间流形态·帧实现调用的内部 Schema（裁决·蓝图实现内部 Schema）。
 
@@ -659,6 +674,8 @@ class SchemaEngine:
         None」——按序列类标注 Schema 显式传 schema 但同属记录级标注调用，照常记账
         （§6.4 恒等式：resolved_at 加总 = 进入 M5 的记录级标注调用数）；帧级标注等
         内部待遇调用仍不计。
+
+        @return 用户待遇调用的各类计数副本。
         """
         return dict(self._stats)
 

@@ -18,6 +18,8 @@ from labelkit.common.contracts.types import (
     PipelineItem,
     Record,
     RecordRef,
+    SequenceValidationFrame,
+    SequenceValidationInput,
     Status,
     Transition,
     UINode,
@@ -246,6 +248,24 @@ class TestClassification:
                            detail={"reason": "既问且聊"})
         assert (c.label, c.labels, c.source, c.detail) == (
             "faq", ("faq", "chitchat"), "inherited", {"reason": "既问且聊"})
+
+
+class TestSequenceValidationInput:
+    def test_fields_and_nested_frame_are_frozen(self):
+        frame = SequenceValidationFrame(0, "request", {"subject": "x"})
+        value = SequenceValidationInput("booking", 1, (frame,))
+        assert value.sequence_class == "booking"
+        assert value.tier_rank == 1
+        assert value.frames == (frame,)
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            value.sequence_class = "other"  # type: ignore[misc]
+        with pytest.raises(dataclasses.FrozenInstanceError):
+            frame.position = 1  # type: ignore[misc]
+
+    def test_empty_tier_and_frames_are_valid_contract_values(self):
+        value = SequenceValidationInput("chat", None, ())
+        assert value.tier_rank is None
+        assert value.frames == ()
 
 
 class TestFrozen:

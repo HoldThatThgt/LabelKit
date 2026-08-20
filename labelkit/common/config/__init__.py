@@ -8,9 +8,18 @@ from __future__ import annotations
 
 from typing import Any
 
-from labelkit.common.config.model import ResolvedConfig
+from labelkit.common.config.model import (
+    CorrelationSpec,
+    ResolvedConfig,
+    SequenceRuleSpec,
+    SequenceWindowSpec,
+    effective_rules,
+    effective_windows,
+)
 
-__all__ = ["load", "default_rubric", "ResolvedConfig"]
+__all__ = ["load", "default_rubric", "ResolvedConfig", "CorrelationSpec",
+           "SequenceRuleSpec", "SequenceWindowSpec", "effective_rules",
+           "effective_windows"]
 
 
 def __getattr__(name: str) -> Any:

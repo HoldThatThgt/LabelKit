@@ -104,6 +104,9 @@ emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed
 | `[[generate.stream.tiers]]` 在场 ⇒ `generate.stream` 必须开；**每张生效表**各自 `tier_rank` 连续覆盖 1..N、**表内**各档 `frame_classes` 两两互异、每个非零配额的 (类, 档) 组合须满足该类 `len_range` 下界 ≥ 该档构成大小（v1.14；v1.15 逐表化） | 档位即帧类构成，构成语义是**恰等**（档内每类至少出现一次）——步数装不下构成就必然产出缺类序列，故在启动时拦下；零配额组合豁免（不为永不尝试的组合抬高下界） |
 | `[[class.<名>.generate.tiers]]`（按类档位表，v1.15）在场 ⇒ 全局 `[[generate.stream.tiers]]` 必须在场；显式空表 `tiers = []` 拒收；仅时间流形态合法 | 类声明了就**整表取代**全局表，未声明回落全局表——全局表既是回落源、又是「档位面开没开」的唯一判据，缺了它按类表就没有锚；`tier_rank` 因此收窄为**类内身份**（跨类不可比、跨类同构成合法） |
 | `[frame.class.<名>.generate.time_fields]` 在场 ⇒ 该帧类必须声明 `schema_path` / `schema_inline`，绑定值 ∈ 闭集 `{ts, gap_prev_s, gap_next_s, elapsed_s}`，声明类型字面恰等（`ts` ⇒ string、其余 ⇒ number），且剔除后至少剩一个字段（v1.14） | 绑定字段从 LLM 面剔除、由时间轴机械回填——纯文本帧没有字段可绑，类型不符则回填值不满足用户 Schema，全绑定则这次调用没有任何内容要生成 |
+| `[[generate.stream.rules]]` / `[[generate.stream.windows]]`（v1.16）在场 ⇒ 只能用于时间流生成；规则引用和窗口帧类必须来自帧类真值表 | 任一非零配额类的生效表非空时，OR-Tools CP-SAT 在内容调用前联合冻结长度、帧类词、session、crossing、微秒时间戳与噪音槽；不是先生成再靠重试碰运气 |
+| `[[class.<名>.generate.rules]]` / `windows` 采用三态整表语义（v1.16） | 缺键继承全局表；显式空数组清空本类；非空数组整表取代全局表。两张表彼此独立，也不要求全局表充当锚 |
+| `generate.sequence_validator`（v1.16）只在时间流生成合法 | hook 每条序列调用一次，接收帧类与 payload 的深拷贝；它不激活联合 planner，异常或非空违规列表只作废该序列 |
 
 `classify`（v1.7，默认关）与上表各开关**正交**：分类不改变组合合法性，任意合法组合都可以叠加分类——multi 扇出后的每个信封走同一套阶段组合（第 24 章）。v1.12 的帧粒度双开关（`frame.classify` / `frame.annotate`）不是新算子，而是 classify / annotate 两个算子在流模式下的第二层粒度；帧级没有多标签也没有自洽采样——在 `[frame.classify]` 里写 `assignment` 或在 `[frame.annotate]` 里写 `self_consistency` 是定向配置错误（第 25 章 25.6）。
 

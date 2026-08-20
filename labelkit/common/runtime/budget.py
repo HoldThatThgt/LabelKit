@@ -76,6 +76,7 @@ TEMPLATE_HEAD_TOKENS: dict[str, int] = {
     # （V13③ 两新段）各自计量。
     "generate_plan": 189,      # §10.14 蓝图模板静态脚手架（wave 三校准定值）
     "generate_realize": 95,    # §10.15 帧实现模板静态脚手架（wave 三校准定值）
+    "generate_brief": 126,     # §5.1 sampled brief 联合规划固定脚手架
 }
 
 # CJK 判定（V8）：Unicode 汉字基本区 + 各扩展区 + 全角标点——区间逐个枚举

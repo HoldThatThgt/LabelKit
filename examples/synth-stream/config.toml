@@ -9,8 +9,8 @@
 # 隔离、互不牵连（examples/mix 自含 config.toml 的同款先例）。
 #
 # DeepSeek 端点实测（2026-08-13 探针复核）：文本调用可用、温度 0 可用、usage 在场；
-# 响应默认携带 thinking 内容块，M9 anthropic 解析器只收集 type=="text" 块，thinking
-# 被天然跳过，JSON 干净落在 text 块；该路由对指定工具强制返回 400（tool_choice
+# Anthropic profile 现在可用 thinking = "enabled" | "disabled" 显式控制思考模式，本例
+# 关闭 thinking 以把输出预算留给结构结果；该路由对指定工具强制返回 400（tool_choice
 # type="tool"，E2E-FINDINGS 第 24 条）⇒ supports_structured_output = false，L0 全关，
 # 蓝图/实现的结构服从性由两个模板的内嵌结构契约承担（提示词文本内的形状句 + 逐位
 # 契约），JSON 由 Schema 引擎 L1 确定性解析 + L2 校验 + L3 修复兜底。
@@ -32,6 +32,7 @@ max_retries = 5
 # E2E-FINDINGS 第 24 条）：结构化输出走 text 块 JSON + Schema 引擎 L1 确定性解析。
 supports_structured_output = false
 supports_vision = false           # 官方兼容表：image 内容块不支持
-max_output_tokens = 4096
+max_output_tokens = 8192            # 结构结果的实测安全预算
+thinking = "disabled"               # v1.16 显式关闭 DeepSeek thinking
 context_window = 131072 # 端点标称 1M，按既有 V26 惯例保守声明——实测后可上调
 temperature = 0.0

@@ -356,7 +356,7 @@ def test_template_head_tokens_quality_and_generate_inline_literals():
     assert generate_sentence in system_text
 
 
-def test_template_head_tokens_covers_all_twelve_stages():
+def test_template_head_tokens_covers_all_thirteen_stages():
     # v1.12：闭集加 frame_classify / frame_annotate 两键（值已由下方跨层
     # 等式测试与算子帧模板冻结常量逐字对齐）。
     # v1.13（裁决·预算头两键）：再加 generate_plan / generate_realize——时间流生成的
@@ -366,11 +366,13 @@ def test_template_head_tokens_covers_all_twelve_stages():
                                          "annotate", "verify", "generate",
                                          "stitch", "extract",
                                          "frame_classify", "frame_annotate",
-                                         "generate_plan", "generate_realize"}
+                                         "generate_plan", "generate_realize",
+                                         "generate_brief"}
     assert all(v > 0 for v in TEMPLATE_HEAD_TOKENS.values())
     # 两个生成键都比平面生成的结构句头大（蓝图/实现模板各自内嵌结构契约）
     assert TEMPLATE_HEAD_TOKENS["generate_plan"] > TEMPLATE_HEAD_TOKENS["generate"]
     assert TEMPLATE_HEAD_TOKENS["generate_realize"] > TEMPLATE_HEAD_TOKENS["generate"]
+    assert TEMPLATE_HEAD_TOKENS["generate_brief"] > TEMPLATE_HEAD_TOKENS["generate"]
 
 
 def test_template_head_tokens_generate_stream_match_operator_constants():
@@ -384,6 +386,8 @@ def test_template_head_tokens_generate_stream_match_operator_constants():
             == est_text(generate._PLAN_SYSTEM_STATIC))
     assert (TEMPLATE_HEAD_TOKENS["generate_realize"]
             == est_text(generate._REALIZE_SYSTEM_STATIC))
+    assert (TEMPLATE_HEAD_TOKENS["generate_brief"]
+            == est_text(generate._BRIEF_SYSTEM_STATIC))
     # 静态脚手架确内嵌于渲染事实（模板头常量活在装配路径上，§10.4 族证明形）
     system_text, _user = generate.render_plan_prompt_texts(
         "指令", (SimpleNamespace(name="a", description="d"),), "类", 3)
@@ -392,6 +396,10 @@ def test_template_head_tokens_generate_stream_match_operator_constants():
     system_text, _user = generate.render_realize_prompt_texts(
         "指令", "风格", [("a", "要点")], ["自由文本一段"])
     for piece in (generate._REALIZE_LABEL_STYLE, generate._REALIZE_STRUCTURE):
+        assert piece in system_text
+    system_text, _user = generate.render_brief_prompt_texts(
+        "指令", ("a", "b"), "类", 2, "rule=init:a")
+    for piece in (generate._BRIEF_SYSTEM_HEAD, generate._BRIEF_STRUCTURE):
         assert piece in system_text
 
 

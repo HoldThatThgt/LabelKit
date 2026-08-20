@@ -16,6 +16,19 @@ v1.15（按类档位表域）明确不做三条（均列 8.4 M6 行演进候选�
 
 v1.12（帧粒度域）明确不做七条：① **帧级 quality/dedup/verify/generate**——帧粒度仅分类与标注两面（成员帧的治理由 segment 噪声剔除与 episode 级质量门承担）；② **帧多标签与帧级扇出**——帧单一归属是手术/归因/守恒的公共地基（`[frame.classify]` 无 `assignment`，显式书写定向 CONFIG_ERROR，3.1.4）；③ **帧级 L2.5 回调**——`output.validator` 仅约束序列级用户 Schema 调用（演进候选 `frame.annotate.validator`，8.4 M5 行）；④ **帧级 self_consistency**——成本 ×n 且投票键须取自帧 Schema 需动投票主干（`[frame.annotate]` 无该键，显式书写定向 CONFIG_ERROR）；⑤ **摘要行帧标签回填**——演进候选，爆炸半径已勘明（8.4 M13 行）；⑥ **同内容帧标注备忘录**——演进候选（8.4 M5 行）；⑦ **按序列类分叉的帧类表**——帧类表全局一份，与序列类表相互独立、允许重名、互不约束（5.2）。
 
+v1.16（序列规则与联合规划域）明确不做以下范围：
+
+- 不合成缺失帧、插入中断或模拟丢帧后的业务恢复；planner 只冻结完整 attempt 的帧类、
+  owner、时间轴和 noise 槽，LLM 作废后做确定性投影。
+- 不提供跨业务的全流顺序声明、跨序列类的 `tier_rank` 对齐语义，也不把有限迹规则
+  扩展成 Allen interval algebra 或可配置的任意区间关系。
+- 不提供运行期 fallback、改抽长度、重求 skeleton、追加调用补齐 noise 或跨运行缓存；
+  `sequences` 仍是尝试配额，实际 survivor 可以更少。
+- 不把规则、窗口、correlation、planner witness 或用户 hook 输出写进 truth、artifact、
+  report 以外的内容面；不新增 generate 专属 trace 通道。
+- 不放开 UI 模态时间流生成，亦不自动执行 artifact 重放并与 truth 评分；两项仍归独立
+  工具或后续产品议题。
+
 ## 8.2 设计假设（若不成立需回到设计层）
 
 | # | 假设 | 若不成立的影响 |
@@ -55,3 +68,12 @@ v1.12（帧粒度域）明确不做七条：① **帧级 quality/dedup/verify/ge
 | M15 摘取（v1.8） | 相邻帧对 ⟨s_i, s_{i+1}⟩ LLM zero-shot 摘取（一请求 2 图 + OpenCUA 稳定帧锚定句 [42][43]）+ 树 diff 证据（结构键多重集匹配，代码侧确定性，3.15）；`action_type` 11 值词表 [45][62] | `extract.include_diff`（默认 true，可关做 A/B 消融——Sharingan 像素 diff 负结果、结构化树 diff 方向未定 [59]）；`extract.instruction` 域提示（`[class.<name>.extract]` 可按类覆盖） | 文本模态 extract（「转移摘要」弱语义档，v1 仅 UI 序列；触发：文本流工程出现真实需求，1.6 v1.8 决策 ⑦）；缺帧补全（Repairing Event Logs [51] 先验：缺失事件修复依赖跨轨迹习得的过程模型，v1 仅标记 `capture_gap`；触发：跨语料过程先验可用）；**本地 IDM profile**（专训逆动力学模型替代 zero-shot——Watch & Learn 实测专训 91.7% vs zero-shot 70.5% [58]，是「不训练/托管本地模型」负边界（2.1.2 ①）的已记录机会成本；触发：extract 错误率成为下游质量主瓶颈且允许自托管推理栈）；完成度末帧图（quality 轨迹打分的 completion 维度附末帧单图，+1 图/episode——忠于 OS-Genesis TRM 原型的输入配置（含末三帧截图）[41]；触发：完成度维与人工判定的失配集中于视觉终态证据）。 |
 | M16 缝合（v1.9） | 单调选池 LLM 判定 × 机械先验合取（析取三腿 + stale-gap 降格，bias="conservative"）+ 有界二遍复评 + 短段救援 + 接缝机械占位（3.16）[64][74][87] | `stitch.votes`（默认 1=关；≥3 奇数，(verdict, thread_ref) 严格多数决 [33]——置信度门槛的正规替代 [79]，3.16.4）；`stitch.bias="llm"` 纯 LLM 消融档；`stitch.rescue_short` / `stitch.repass` 双开关；`stitch.stale_gap_steps` 时间衰减（双职：先验降格 + 逐出优先腿 [66][81]） | `stitch.judges` 多模型评审团（O8 选型记录——现版拒绝理由与触发条件见 8.3；镜像 `verify.judges` 纯配置扩展）；完成感知封闭（收尾动作模式触发封闭——B-1 撤除因 extract 后置无动作证据（8.1 ⑥）；触发：M14 行「extract-先行次序」候选落地使动作证据先行）；复评面扩展至多碎片线索（现版复评候选仅单碎片线索——双多碎片线索误分裂与池截取排除目标不在修复面内、由真机门禁兜底（3.16.4 残差声明）；触发：门禁审计显示该形态占漏缝主体）。 |
 | 上下文预算（v1.11） | `context_window` 声明制（0=关）+ 零依赖启发式估算 + 动态贪心装填（条数参数降级为上限，w_min 静态护栏/估算上界）+ 图片成本测量-反应式三层（先验装填 → 溢出裁帧保清重试 → 判审裁帧升清重试 → usage 在线校准、批冻结快照）+ M9 咽喉终检（3.9，V6–V21） | `default_image_px` 图片采样工作点（默认 0 = 沿用 `max_image_px` 即 v1.10 行为；`max_image_px` 升格为升级天花板 + 像素制硬限制域，V18）；`context_window` 打折声明作通用 margin 放大器（唯一逃生门——margin / 估算系数 / 阶梯常数冻结于代码不开配置面，V7/V8/V18） | **运行中分母修正**（`metrics.run_estimate` 重复调用通道 / counters 每 tick 拉取通道——V12 已证实机械可行、v1 不用；触发：w_min 上界与 `report.stream.windows` 实际窗数长期偏差可观测）；**定向区域升清**（裁剪可疑区域而非整帧升清——Ferret-UI 双子图 / DirectX VRS foveation / AwaRes·MEGA-GUI 判审触发裁片升清，[C-52][C-56][C-67] 见 `docs/dev/PROPOSAL-context-budget.md`；触发：整帧升清仍不足以修复判审失败）；**per-profile 密度旋钮**（cl100k 旧词表中文 1.25–1.4 t/字不被 CJK×1.0 覆盖的记载局限；触发：该类 profile 部署出现且浪费/超窗可观测）；**输出侧预算**（`num_per_call` × 样本长 vs `max_output_tokens` 的输出预算；触发：`output_truncated` 桶占比可观测偏高）；**计数 API / usage 文本密度校准回路**（智谱 tokenizer API 抽样校准 + LangChain usage-scaling 同构，[C-63][C-71]；触发：文本估算偏差成为主要浪费源——cl100k 缺口的将来闭合路径）。 |
+
+**v1.16 M6 现行算法冻结补充**：规则/窗口生效时，M6 采用单一 CP-SAT 联合问题冻结
+完整流 skeleton，再调用 LLM 生成 brief 与 payload；无约束时保留 v1.15 默认路径。规划
+期为每个实际 attempt 恰抽一次循环长度偏好，联合模型以偏好名次和为主目标、可行 noise
+为次目标，一次求解同时定稿长度、帧类 word、session、timestamp 与 noise 槽；不能逐候选
+重求、按候选长度分别求解、把求解失败当作随机候选淘汰，也不能重规划或 fallback。planner、
+M1、estimate 共用问题入口。LLM 作废后的处理是删除 attempt、移除空 session、保留幸存
+timestamp 并投影 noise/duplicate。验证顺序、hook 深拷贝、报告恒等式和 artifact 不变面
+见 3.6.6、6.4、6.5。

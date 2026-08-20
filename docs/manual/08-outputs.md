@@ -13,7 +13,7 @@
 | `labels.rejects.jsonl` | `output.rejects ≠ "none"`（运行开始即创建；无淘汰时为 0 行空文件） | 拒绝通道：被淘汰记录的环节、原因与引用 |
 | `labels.report.json` | 恒有 | 运行报告：纯统计，无数据内容 |
 | `labels.trace.jsonl` | `trace.enabled = true` | 事件流（第 16 章专讲） |
-| `labels.stream.jsonl` | `[generate.stream].enabled = true`（v1.13，`--dry-run` 不写） | **时间流工件**：合成流的逐帧落盘（时间戳 + 文本 + 逐帧真值），行号即 `_meta.stream.member_sources[].line_no`；它是与主输出同级的数据输出通道，可当输入原样重放（第 27 章） |
+| `labels.stream.jsonl` | `[generate.stream].enabled = true`（v1.16，`--dry-run` 不写） | **时间流工件**：合成流的逐帧落盘（时间戳 + 文本 + 逐帧真值），行号即 `_meta.stream.member_sources[].line_no`；它是与主输出同级的数据输出通道，可当输入原样重放（第 27 章） |
 
 每条记录的终态决定它流进哪条路由；四条路由一图看全：
 
@@ -35,7 +35,7 @@ flowchart TD
     EVENTS["处理过程中的判定与调用事件（与终态正交）"] --> TRACE["trace 通道 labels.trace.jsonl<br/>（trace.enabled = true 时，第 16 章）"]
 ```
 
-注意 absorbed 成员帧与 stitched 壳只进报告计数、不落拒绝通道——它们的内容已由所属序列行经主输出承载（8.3 末尾与 8.4 的 `--strict` 交互提醒）。v1.13 的时间流工件与 trace 一样**与终态路由正交**：它写的是合成流的每一帧（含从不成为信封的噪音帧与重发帧），不参与守恒恒等式；合成序列的终态照常走上面四条路由（第 27 章）。
+注意 absorbed 成员帧与 stitched 壳只进报告计数、不落拒绝通道——它们的内容已由所属序列行经主输出承载（8.3 末尾与 8.4 的 `--strict` 交互提醒）。v1.16 的时间流工件与 trace 一样**与终态路由正交**：它写的是合成流的每一帧（含从不成为信封的噪音帧与重发帧），不参与守恒恒等式；合成序列的终态照常走上面四条路由（第 27 章）。
 
 主输出的交付是**原子**的：运行中写 `labels.jsonl.part`，全部完成后 fsync + 改名（时间流工件与它**同批** fsync + 改名，要么一起交付、要么一起留 `.part`）。运行结束后仍看到 `.part` 文件，说明那次运行没走到交付——进程硬崩溃或输出路径不可写留下的残骸。注意：Ctrl-C 的**优雅中断**会正常收尾交付（`.part` 被改名、报告标记 `interrupted: true`），不留残骸；v1.6 起**熔断中止也交付**——已完成批的 `.part` 同样 fsync + 原子改名，退出码仍是 4（此前版本熔断直接丢弃 `.part`，长跑末段一次配额死亡就赔掉全部已完成产出）。
 
@@ -118,21 +118,22 @@ flowchart TD
 ]
 ```
 
-**v1.13 时间流生成的 `_meta.stream`**：合成流（第 27 章）的一行也是一条序列，`_meta.stream` 用的是同一族键但形态更简——`order_span` 是**工件路径 + 行号**、`members[]` 只有 `{index, id, label}` 三键（label 是生成期就已知的**帧类真值**，没有 annotation / status 列）、`steps` 恒 `null`（extract 不参与）、`thread_id` / `fragments` 不出现（stitch 不参与）。真实样例（`examples/synth-stream` 本次真跑主输出第 1 行，节选）：
+**v1.16 时间流生成的 `_meta.stream`**：合成流（第 27 章）的一行也是一条序列，`_meta.stream` 用的是同一族键但形态更简——`order_span` 是**工件路径 + 行号**、`members[]` 只有 `{index, id, label}` 三键（label 是生成期就已知的**帧类真值**，没有 annotation / status 列）、`steps` 恒 `null`（extract 不参与）、`thread_id` / `fragments` 不出现（stitch 不参与）。以下是当前成功真跑 `examples/synth-stream/out/synth-labels.jsonl` 第 1 行的 `_meta` 节选；完整验收结果见第 27 章：
 
 ```json
-"source": {"file": "out/synth-labels.stream.jsonl", "line_no": 8, "generated_from": [],
-            "fields": {}, "generator": {"llm": "default", "style": null, "tier_rank": 1}},
+"source": {"file": "out/synth-labels.stream.jsonl", "line_no": 15, "generated_from": [],
+            "fields": {}, "generator": {"llm": "default", "style": null, "tier_rank": 2}},
 "stream": {
-  "episode_id": "900693648c71c950", "session_id": "ebc2f0dad882176b",
-  "order_span": ["out/synth-labels.stream.jsonl:8", "out/synth-labels.stream.jsonl:11"],
-  "member_count": 4,
-  "member_ids": ["15baeee0230af0ce", "8664d27281ee0c99", "d04f7d2baeba1fd0", "5819e8bfd339e563"],
-  "member_sources": [{"file": "out/synth-labels.stream.jsonl", "line_no": 8}, …共 4 项],
-  "members": [{"index": 0, "id": "15baeee0230af0ce", "label": "task_request"},
-               {"index": 1, "id": "8664d27281ee0c99", "label": "followup"},
-               {"index": 2, "id": "d04f7d2baeba1fd0", "label": "followup"},
-               {"index": 3, "id": "5819e8bfd339e563", "label": "followup"}],
+  "episode_id": "05ef6939e072415e", "session_id": "05ef6939e072415e",
+  "order_span": ["out/synth-labels.stream.jsonl:15", "out/synth-labels.stream.jsonl:19"],
+  "member_count": 5,
+  "member_ids": ["098e275fdd5fd45f", "15e6d7e16d06e65e", "34fe8a624e081b7c", "51aae0cad1a817b5", "bfef5f0641a5cab4"],
+  "member_sources": [{"file": "out/synth-labels.stream.jsonl", "line_no": 15}, …共 5 项],
+  "members": [{"index": 0, "id": "098e275fdd5fd45f", "label": "task_request"},
+               {"index": 1, "id": "15e6d7e16d06e65e", "label": "acknowledgement"},
+               {"index": 2, "id": "34fe8a624e081b7c", "label": "progress"},
+               {"index": 3, "id": "51aae0cad1a817b5", "label": "progress"},
+               {"index": 4, "id": "bfef5f0641a5cab4", "label": "confirmation"}],
   "session_split": false, "repaired": false, "degraded": null, "steps": null
 }
 ```
@@ -287,29 +288,34 @@ v1.12（帧级分类与标注，第 25 章 25.6）再增两个按需出现的子
 
 帧失败**不改变** `counts`、不产生 rejects 行（rejects 的 stage/reason 词表零新增）、不触发 `--strict`：members[] 的状态位加这两个子块就是帧粒度的全部账面（第 18 章的排查口径）。
 
-v1.13（时间流生成，第 27 章）再增两处按需出现的字段（形态关闭时报告与 v1.12 逐字段一致），另外**不出现** `stream` 节（那是分段算子的观测面，别拿它对账合成流）：
+v1.16（时间流生成，第 27 章）再增两处按需出现的字段（形态关闭时报告与 v1.12 逐字段一致），另外**不出现** `stream` 节（那是分段算子的观测面，别拿它对账合成流）：
 
-- **`run.artifact`**（仅工件实际写出时在场）：`{path, sha256, lines}`——与主输出同款的摘要三件套，拿 `lines` 与 `generate.stream` 的帧数对账。本次真跑：`{"path": "out/synth-labels.stream.jsonl", "sha256": "sha256:47580ed8…", "lines": 29}`；
+- **`run.artifact`**（仅工件实际写出时在场）：`{path, sha256, lines}`——与主输出同款的摘要三件套，拿 `lines` 与 `generate.stream` 的帧数对账。本次真跑：`{"path": "out/synth-labels.stream.jsonl", "sha256": "sha256:3786ba94808febd6fde9145418a87cb9805c10d0e22dba97ee84785250abc488", "lines": 30}`；
 - **`generate.stream`** 子块（仅形态开启时在场，counts-only）：
 
 ```json
 "stream": {
-  "sessions": 5, "crossed_sessions": 1,
-  "sequences": {"ticket_booking": {"planned": 3, "produced": 3},
+  "sessions": 5, "crossed_sessions": 0,
+  "sequences": {"ticket_booking": {"planned": 3, "produced": 2},
                  "smart_home":     {"planned": 3, "produced": 3}},
   "tiers": {                                           ← v1.14，仅档位表在场时；
-    "ticket_booking": {"1": {"planned": 1, "produced": 1},     此处是 v1.15 的类嵌套形
+    "ticket_booking": {"1": {"planned": 1, "produced": 0},     此处是 v1.15 的类嵌套形
                         "2": {"planned": 2, "produced": 2}},
     "smart_home":     {"1": {"planned": 2, "produced": 2},
                         "2": {"planned": 1, "produced": 1}}
   },
-  "frames": 23, "noise_frames": 2, "duplicates": 1,
+  "rules": {"sampled": 6, "correlation_scrapped": 0, "temporal_scrapped": 0},
+  "sequence_validator_scrapped": 0,
+  "windows": {"calendar_days_spanned": 8},
+  "frames": 23, "noise_frames": 3, "duplicates": 1,
   "plan_calls": 6, "realize_calls": 6, "noise_calls": 1,
-  "plan_failures": 0, "realize_failures": 0, "validator_scrapped": 0
+  "plan_failures": 0, "realize_failures": 1, "validator_scrapped": 0
 }
 ```
 
-读法：`planned` vs `produced` 的差额 = 作废序列数（三项 failures + 序列相似度过滤淘汰）；`sessions` **不含**重发的流尾会话（29 行工件 = 23 任务帧 + 2 噪音帧 + 4 重发帧，共 6 个会话）；`crossed_sessions = Σ幸存 − sessions`，作废多了它会退化为 0。同一次运行里 `classify` 节的逐类计数**恒全零**（标签在生成期已知、直接继承，零判决调用）——这是预期，不是分类失灵。
+读法：`planned` vs `produced` 的差额来自 plan/realize 作废、四类内容验证作废与序列相似度淘汰；`sessions` **不含**重发的流尾会话。v1.16 起 `crossed_sessions` 必须在最终 survivor 投影的固定时间轴上仍存在真实 A-B-A 或 B-A-B owner 交替，不能再由幸存数减 session 数反推。作废只删除整条 owner，不移动时间戳、不重新装箱。同一次运行里 `classify` 节的逐类计数恒全零（标签继承、零判决调用），这是预期。
+
+约束面在场时，`tiers` 后还会按条件加入 `rules`、`sample_validator_scrapped`、`sequence_validator_scrapped` 与 `windows`。`rules` 给出 sampled attempt、correlation 作废和 temporal 作废；`windows.calendar_days_spanned` 按 fixed offset 统计最终 primary 与 duplicate 所跨的本地自然日。四个 validator 子计数之和必须精确等于 `validator_scrapped`。实际配额前缀有 rules/windows 或配置了 sequence hook 才激活 v1.16 报表面；既有 sample hook 只有在该面激活时才加入自己的子计数，单独配置不改变 v1.15 报表字节。没有有效规则或窗口时不激活联合 planner；sequence hook 可以独立激活验证与报表，但不激活 planner。
 
 `tiers` 子块（v1.14）仅在声明了档位表时出现，键位固定在 `sequences` 之后、`frames` 之前。它有**两种形状**：全部序列类都吃全局 `[[generate.stream.tiers]]` 时是平面形 `{"<tier_rank>": {planned, produced}}`；任一序列类声明了自己的 `[[class.<名>.generate.tiers]]`（v1.15）时整块切成**类嵌套形** `{"<类名>": {"<tier_rank>": {planned, produced}}}`——外层按类表声明序、内层按该类**生效表**的 rank 升序（十进制字符串键）。两形都是零配额档与全军作废档照样在场、如实呈现 0，且内层键集**逐类可以不同**（各类档数不必一致），所以消费脚本先探形状再迭代、别写死键名。它与 `sequences` 是同一笔配额的**两个切法**（按档 vs 按类），`planned` 合计相等——作废时对照着看就知道缺口落在哪个类的哪一档（第 27 章 27.4）。
 

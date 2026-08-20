@@ -128,21 +128,99 @@ num_per_record = 2
 
 与上例（process 模式）的差异仅在入口与种子来源：无 M2 接入（IngestReport 全零、`report.counts.scanned = 0`），生成样本按 `run.batch_size` 切批走 M3→M4→M5→M7→M11；新 Record 的 `generated_from = []`、`generator` 照常携带（如 `{"llm": "default", "style": null}`）。6.4 计数不变量退化为 emitted + dropped_* + failed = generated，仍成立。
 
-#### 时间流形态走查（v1.13，真跑数据）
+#### 时间流形态静态走查（v1.16）
 
-`examples/synth-stream`（自含单 profile DeepSeek `config.toml`）2026-08-13 真跑，配置要点：两个序列类 `ticket_booking` / `smart_home` 各 `sequences = 3`、`len_range = [3, 5]`，三个帧类 `task_request`（带生成 Schema `{utterance, entities}`）/ `followup` / `confirmation`（后两者纯文本帧），`[generate.stream]` 取 `sessions = 5`、`noise_ratio = 0.1`、`duplicates = 1`、`frame_gap_s = [5, 60]`、`ts_start = "2026-01-05T09:00:00+08:00"`，`[stream]` 取 `order_by = "meta:ts"`、`gap_s = 900`，`[generate].num_per_call = 4`、`temperature = 0.9`。
+`examples/synth-stream` 是 v1.16 的可运行教学配置，不在本节写入任何一次运行的
+产出数量、耗时、哈希或调用统计。它固定展示规则、日历窗口、类型敏感关联、时间字段
+回填、按类档位表和序列验证钩子如何共同进入联合规划与下游校验。
 
-| 观测面 | 实测值 |
-|---|---|
-| 退出码 / 守恒 | 0；`counts.generated = emitted = 6`，`failed` 与三个 `dropped_*` 全 0（退化式成立） |
-| `report.generate.stream` | `sessions 5`、`crossed_sessions 1`、`sequences.ticket_booking = {planned 3, produced 3}`、`sequences.smart_home = {planned 3, produced 3}`、`frames 23`、`noise_frames 2`、`duplicates 1`、`plan_calls 6`、`realize_calls 6`、`noise_calls 1`、`plan_failures 0`、`realize_failures 0`、`validator_scrapped 0` |
-| 工件 | 29 行（= 23 任务帧 + 2 噪音帧 + 4 重发帧）= `report.run.artifact.lines`；含结构化帧（`task_request` 落 `{utterance, entities}` 对象）与纯文本帧、一段交叉会话（两条序列交错）、流尾重发会话 |
-| 主输出 | 6 行，按类分走两份**字段集互不相同**的标注 Schema；`_meta.run.rubric = "default:trajectory"`（空 rubric 自动解析生效）；`_meta.stream.members[]` 携帧类真值，`order_span` / `member_sources` 指向工件路径与行号 |
-| LLM 用量 | `llm_usage.default.calls = 52`（= 6 蓝图 + 6 实现 + 1 噪音批 + 24 pointwise 打分（6 序列 × 4 准则）+ 记录级标注与评审调用，含一轮 verify 修复重标注——`schema_engine.resolved_at` 加总 7 = 6 条记录 + 1 次修复重标注，正是「加总 = 记录级标注调用数」的口径，6.4）；`--dry-run` 的静态估算为 49（不含重试与修复调用） |
+工具级 profile 明确关闭 DeepSeek thinking，并为 L0 关闭的文本 JSON 路径保留结构结果
+预算；`max_output_tokens` 不是关闭 thinking 的替代方案：
 
-工件重放（把 `out/synth-labels.stream.jsonl` 拷为某 process 模式工程的 `[run].input`、配同一份 `[stream]` 并开 segment）：29 帧 → **6 会话**（= `sessions 5` + `duplicates 1`）→ 6 episodes，`absorbed 28`、`dropped_noise 1`、`dropped_dup 1`（重发会话与原会话判重命中；实测档位 `near_text`——原会话吸收了一帧噪音使两侧成员数差一，噪音帧被剔除时则为 `exact`），退出码 0；加 `--strict` 预期退 1（有 rejects）。
+```toml
+[llm.default]
+provider = "anthropic"
+base_url = "https://api.deepseek.com/anthropic"
+model = "deepseek-v4-flash"
+api_key_env = "LABELKIT_DEEPSEEK_KEY"
+supports_structured_output = false
+supports_vision = false
+max_output_tokens = 8192
+thinking = "disabled"
+```
 
-### 3.6.5 时间流形态（v1.13）
+当前工程的流铺设与配额面为：
+
+```toml
+[stream]
+order_by = "meta:ts"
+gap_s = 3600
+session_max_len = 12
+session_max_span_s = 3000
+
+[generate.stream]
+sessions = 5
+noise_ratio = 0.1
+duplicates = 1
+frame_gap_s = [5, 60]
+ts_start = "2026-01-05T09:00:00+08:00"
+
+[class.ticket_booking.generate]
+sequences = 3
+len_range = [4, 5]
+
+[class.smart_home.generate]
+sequences = 3
+len_range = [4, 5]
+```
+
+帧类闭集是 `task_request`、`acknowledgement`、`followup`、`progress`、`confirmation`。
+`task_request` 和 `acknowledgement` 是结构化帧，均含 `subject_id`；其余三类是纯文本帧。
+`task_request` 的 `duration` 绑定 `gap_next_s`，从 LLM 面向的 Schema 中剔除，并在时间轴
+定稿后按同一序列的下一成员回填。
+
+声明式规则固定为：`task_request` 初始化且恰有一次；它以
+`chain_response` 在 `[1200, 2400)` 秒内响应到 `acknowledgement`，两帧的
+`subject_id` 必须按运行时类型敏感规则相等；`acknowledgement` 恰有一次；它响应到
+`confirmation`；`confirmation` 是序列末帧且恰有一次。`task_request` 必须落在工作日的
+`[08:00, 11:00)` 或 `[14:00, 17:00)` 窗口；`ticket_booking` 的按类窗口整表覆盖为
+`[09:00, 11:00)` 或 `[14:00, 16:00)`，`smart_home` 继承全局窗口。序列级
+`generate.sequence_validator` 再校验位置连续、以 request 开始并以 confirmation 收尾。
+
+全局档位表和 `ticket_booking` 的按类档位表分别定义帧类构成；`smart_home` 使用全局表，
+`ticket_booking` 使用自身整表。`tier_rank` 只在所属序列类的生效表内有意义，读取工件
+真值或主输出元数据时必须同时读取 `sequence_class`。
+
+当实际 `--limit` 配额前缀包含有效 rules/windows 时，M6 在任何内容调用前调用共享
+planner：先为每个 attempt 恰抽一次长度偏好，再由一个 CP-SAT 联合模型以偏好名次和为
+主目标、可行 noise 为次目标，一次冻结长度、帧类 word、session、timestamp、crossing
+和 noise 槽。它不逐候选重求，不按候选长度分别求解，不重抽、不放宽约束，也不 fallback。冻结
+后每条 attempt 依次调用一次 brief 和一次 realize；LLM 作废只删除该 attempt 并投影幸存
+布局，不重规划。M1、dry-run estimate 和 M6 复用同一问题构造与求解入口。
+
+#### v1.16 最终真实验收事实（2026-08-20）
+
+使用上述当前配置和 DeepSeek profile 的最终完整真实生成 exit 0。报告观测为：
+`generated = 6`、`emitted = 5`、`dropped_verify = 1`、`failed = 0`；
+`planned = 6`，`ticket_booking = 3/3`、`smart_home = 3/3`；
+`tiers.ticket_booking.1 = 1/1`、`tiers.ticket_booking.2 = 2/2`、
+`tiers.smart_home.1 = 2/2`、`tiers.smart_home.2 = 1/1`；
+`sessions = 5`、`crossed_sessions = 1`、`frames = 27`、`noise_frames = 3`、
+`duplicates = 1`、`calendar_days_spanned = 8`、工件 34 行，
+`sha256:927e469e16df3f007f057357a267b8f8228506a5dfb279dc83bdfa1f1da672bf`。
+
+调用计数为 `plan_calls = 6`、`realize_calls = 6`、`noise_calls = 1`；规则计数为
+`sampled = 6`、`correlation_scrapped = 0`、`temporal_scrapped = 0`、
+`sequence_validator_scrapped = 0`。LLM 用量为 53 calls、12173 prompt、4487 completion、
+0 retries，耗时 `35.214s`。本次保留 planner 规划的真实 crossing；此前作废投影后
+`crossed_sessions = 0` 的运行属于历史证据，不是当前验收值。
+
+正式 `project-replay.toml` 重放上述 34 行工件也 exit 0：`scanned = ingested = 34`、
+`episodes = 6`、`absorbed = 31`、`dropped_noise = 3`、`dropped_dup = 1`、
+`emitted = 5`、`failed = 0`；`sessions = 6`、`mean_episode_len = 5.17`、
+`windows = 7`。LLM 用量 12 calls、4542 prompt、721 completion、0 retries，耗时 `5.475s`。
+
+### 3.6.5 时间流形态（v1.13–v1.16）
 
 `generate_stream.enabled = true` 时（M1 硬合取 generate_only ∧ text ∧ `generate.enabled` ∧ `classify.enabled` ∧ `stream.order_by = "meta:*"` ∧ `meta_mode != "none"`，3.1.4 时间流生成行），M10 的 generate_only 分支改调本节的时间流入口**恰一次**（`ctx.batch_no == 0`、`ctx.rng == Random(f"{seed}:0:generate")`，3.10.3），3.6.2 的平面路径（`generate_all`）不参与、代码面**零改动**。本形态的产物是一式两份：按交织序定稿的**时间流工件行**（交 M11 第五通道落盘，6.5）与**直装序列信封**（`kind = "sequence"`，带序列类与帧类两级 inherited 标签，按 `run.batch_size` 切批自 M3 起走链，3.10.3）。segment / stitch / extract 不参与——流本就是生成出来的，不需要再切分；stream × generate 互斥条文字面维持（2.3.1、8.3 O3 核销）。
 
@@ -206,10 +284,11 @@ def effective_tiers(class_tiers, global_tiers) -> tuple[TierSpec, ...]:
 
 要点（规格与理由）：
 
-- **抽签消费顺序表（冻结，测试钉住）**：全流程只用一条 `Random(f"{seed}:0:generate")`，按三段顺序消费——**计划期**（任何派发之前）① 配额按**类名字典序**展开为 (类名, 类内序数) 列表（`--limit` 在此做前缀截断，零 rng）② 逐序列 `L = randint(类有效 len_range)` ③ 逐序列 (llm, style) 预抽（`round_robin` 不耗 rng / `weighted` 逐位抽样；styles 非空时逐位均匀抽——噪音批调用紧随序列在同一预抽流内独立取全局 styles）；**派发期零 rng 消费**（3.6.2 既有纪律）；**交织期**（gather 之后、按幸存序列的计划序）④ 重复选取 ⑤ 装箱洗牌 + 前 `Σ幸存 − sessions_eff` 对成对交叉 ⑥ 逐交叉会话的切换点 ⑦ 逐噪音帧的 (会话, 槽位) 掷签 ⑧ 重发序列成流尾新会话（零 rng）⑨ ts 铺设。作废序列改变交织输入 ⇒ 确定性以 LLM 内容产出为条件（2.6 声明链）。**v1.14 零消费注记**：档位配分插在 ① 与 ② 之间、时间字段回填尾声接在 ⑨ 之后，两者**均零 rng 消费**——本顺序表原文不动（钉板测试原文回归），同 seed 下有无档位表与绑定表的抽签流逐字节一致。**v1.15 按类配分同为零消费**：配分改吃该类生效表（`effective_tiers`）仍是纯函数取值，顺序表原文继续不动，同 seed 下有无按类档位表的抽签流亦逐字节一致。
+- **抽签消费顺序表（按形态冻结）**：无有效 rules/windows 的实际前缀沿用 v1.15 默认路径：一条 `Random(f"{seed}:0:generate")` 先按类名字典序展开配额（`--limit` 在此做前缀截断，零 rng），再抽每条序列长度、(llm, style)，交织期再按既有顺序处理重复、装箱、交叉、噪音、重发与 ts。档位配分和时间字段回填仍是零 rng 纯函数，不改变该默认路径。
+  实际前缀含有效 rules/windows 时切换 v1.16 受约束顺序：配额展开 → 一个 31-bit solver seed → 每个 attempt 恰一次 `randrange` 循环长度偏好 → (llm, style) 预抽 → duplicate source 顺序预抽 → noise 内容调用计划；一个 CP-SAT 联合模型以长度偏好名次和为主目标、可行 noise 为次目标，一次冻结长度、frame-class word、session、timestamp、crossing 和 noise 槽，之后才派发内容调用。求解失败不触发重抽、逐候选重求、放宽约束或 fallback；内容作废只改变后续投影输入，确定性以 LLM 内容产出为条件（2.6 声明链）。
 - **档位构成（v1.14 全局表 `[[generate.stream.tiers]]`；v1.15 增按类表 `[[class.<name>.generate.tiers]]`；默认均不在场）**：一个档位的定义**就是**该档序列的帧类构成集合，不携带质量指令、不控制帧内部语义质量（那归帧类生成指令与温度）。**生效表（v1.15）**——档位表分两级，一个序列类的**生效表** = `effective_tiers(该类表, 全局表)`：类声明了就用类的整张表（**表级原子覆盖**，不逐行合并——行级合并会让 rank 身份跨表漂移），未声明则回落全局表。全局表是**锚**（按类表要求其在场，3.1.4），故「档位面在场」⟺ 全局表非空，且每个参与类恒有非空生效表；`tier_rank` 是**类内身份**——每张生效表各自连续覆盖 1..N（N 逐类可不同），跨类同 rank **无任何工具语义**、跨类同构成合法。**下文凡「档」与「档位表」均读作该序列类的生效表**；无任何按类表时生效表恒 = 全局表，本行与 v1.14 逐字同义。**配分**——每个参与类的 `sequences` 配额按**本类生效表**各档 `weight` 走**整数域最大余额法**配到各档（基额 = `(sequences × weight) // Σweight`、余额键 = `(sequences × weight) mod Σweight`，按余额键降序、平票按 `tier_rank` 升序逐档 +1 至配满；**禁止任何浮点中间量**——平票判定要一路喂给类内序数分块 → truth → 工件字节 → 成员 id，是冻结面）；类内序数按 tier_rank 升序占**连续区间**，`(类, 类内序数) → tier_rank` 即配分结果的前缀和查表。配分是 `(sequences, 生效表)` 的**纯函数、零 rng**：它插在抽签消费顺序表的 ①配额展开与 ②长度抽取之间作为零消费步，顺序表原文不动，同 seed 下有无档位表（含按类表）的抽签流逐字节一致。推论：`--limit` 的前缀截断只切掉尾部序数，即在每个类内**从最高档序数侧截起**（低档序数在前），截断与档位映射可交换——按类表下各类的分块各不相同，本推论**逐类原文成立**。**构成恰等**——蓝图 Schema 的 enum 限档内子集给「⊆」、`cover_all` 注入的逐类 `contains` 给「⊇」，合成「一条序列的 members[] 帧类集合 ≡ 其档声明的构成」，故档位身份可从数据反推对账（可审计性；按类表下反推须先按行的序列类取其生效表，行内 `classification.label` 与工件 `truth.sequence_class` 天然给出该类名）。**标识三点**——`_meta.source.generator.tier_rank`（6.3）、工件 `truth.tier_rank`（6.5）、`report.generate.stream.tiers`（6.4）；三点的在场判据是**全局表非空**（全局表为锚 ⇒ 在场性恒定，不因某类未声明按类表而逐行漂移），全局表缺省时三点全部不在场。**M1 侧**的身份连续性、构成互异（逐生效表执行）、逐非零配额对的长度可覆盖、两条 WARN 与按类表前提三子款见 3.1.4。
 - **蓝图调用**（一**计划期配额**序列一次——存活与否是此调用之后的事，故估算基数恒为 `2 × Σsequences`）：system = 计划器指令 + `[任务]` 类有效生成 instruction + `[帧类表]`（`name: description` 行）+ 结构句；user = 「请为一条「{类名}」序列产出 {L} 步蓝图。」；schema = `plan_schema(帧类名集, L)`（内部待遇，3.8.1）。**`[帧类表]` 的取值与 user 行随档位表条件化**（v1.14）：档位表缺省 ⇒ 表为**全类表**、user 行取上述原形（与 v1.13 逐字节一致）；档位表在场 ⇒ 表只渲染**档内子集**（帧类表按声明序过滤本序列所属档的 `frame_classes`；v1.15：所属档 = 该序列**类的生效表**内 `tier_rank` 对应的那一行——`effective_tiers(类表, 全局表)[tier_rank − 1]`，生效表连续覆盖 1..N 故下标法照旧）、user 行取冻结变体「请为一条「{类名}」序列产出 {L} 步蓝图，且 [帧类表] 中每个帧类都至少出现一次。」、schema 取 `plan_schema(档内名集, L, cover_all=True)`。修复穷尽 / 不可装填 ⇒ 该序列作废、计 `plan_failures`（覆盖违约不新增失败机制——它是普通的 L2 违规，进 M8 既有修复环）。模板 verbatim 冻结于 CONTRACTS §10.14——L0 关闭的端点（如 DeepSeek anthropic 路由硬拒强制工具调用）上，结构服从性靠模板内嵌的结构契约与覆盖句兜底，**这是硬要求不是兜底优化**。
-- **帧实现调用**（一蓝图一次）：system = `[任务]` 类有效 instruction + `[风格要求]`（预抽 style，可缺——蓝图不带风格）+ 结构句 + **逐位契约行**「第 i 帧（{帧类}）须符合：{该帧类生成 Schema 文本 | 自由文本一段}」；user = 蓝图逐步行 `i. [{帧类}] {brief}` + 「请实现全部 {L} 帧内容。」；schema = `realize_schema(逐步 Schema 序列)`（`prefixItems` 逐位包装，纯文本帧位取 `{"type": "string"}`）。**逐位 Schema 与契约行取的是缩减 Schema**（v1.14）——声明了时间字段绑定的帧类，其绑定键从「该帧类生成 Schema」中剔除后才进这两处（见下方「时间字段回填」行；无绑定帧类与纯文本帧位逐字节不变）。结构化帧的帧内容**以对象原样**落工件行的文本字段（纯文本帧落字符串），成员 `Record.text` 取其 M2 语义投影（对象 ⇒ canonical JSON，字符串 ⇒ 直取——与重放时 M2 的点路径抽取产出同一投影，6.5）。修复穷尽 / 降级穷尽 ⇒ 序列作废、计 `realize_failures`。模板 verbatim 冻结于 CONTRACTS §10.15。
+- **帧实现调用**（一蓝图一次）：system = `[任务]` 类有效 instruction + `[风格要求]`（预抽 style，可缺——蓝图不带风格）+ 结构句 + **逐位契约行**「第 i 帧（{帧类}）须符合：{该帧类生成 Schema 文本 | 自由文本契约}」；user = 蓝图逐步行 `i. [{帧类}] {brief}` + 「请实现全部 {L} 帧内容。」；schema = `realize_schema(逐步 Schema 序列)`（`prefixItems` 逐位包装，纯文本帧位取 `{"type": "string"}`）。默认 v1.15 路径的纯文本契约字面量仍为「自由文本一段」；受约束 v1.16 路径改为「JSON 字符串（如 "..."），不得用对象包裹」，只明确 JSON string 的表示方式，输出语义仍是自由文本，不改变调用次数或 Schema。**逐位 Schema 与契约行取的是缩减 Schema**（v1.14）——声明了时间字段绑定的帧类，其绑定键从「该帧类生成 Schema」中剔除后才进这两处（见下方「时间字段回填」行；无绑定帧类与纯文本帧位逐字节不变）。结构化帧的帧内容**以对象原样**落工件行的文本字段（纯文本帧落字符串），成员 `Record.text` 取其 M2 语义投影（对象 ⇒ canonical JSON，字符串 ⇒ 直取——与重放时 M2 的点路径抽取产出同一投影，6.5）。修复穷尽 / 降级穷尽 ⇒ 序列作废、计 `realize_failures`。模板 verbatim 冻结于 CONTRACTS §10.15。
 - **噪音批量实现**：复用 3.6.2 的既有生成模板与 `samples_schema`，调用数 = `⌈噪音帧数 / generate.num_per_call⌉`（噪音帧数 = `round(noise_ratio × Σ任务帧数)`）；单批作废 ⇒ 缺额帧从交织中缺席（**不补生成**）。
 - **逐帧钩子与序列相似度过滤**：`generate.sample_validator` 对帧实现产物**逐帧文本**执行——任一帧违规 ⇒ **整序列作废**（蓝图定长不可剔单帧，拒绝采样语义）并计 `validator_scrapped` 与桶 `rejected_by_validator`；随后 M6 内置的相似度过滤单元上移为**序列级**：判重文本 = 成员 text 按序 `"\x1e"` 拼接（M3 序列配方同式）、比对面 = 兄弟序列（本形态无种子）、参数取 `[dedup]` 三键，淘汰以桶 `survived_dedup` 差呈现（桶键在本形态为 `<class>×<llm>×<style>` 三段式——generate_only 首现类段）。
 - **机械交织器（零 LLM 零 IO）**：`sessions_eff = min(sessions, Σ幸存)`，交叉对数 = `Σ幸存 − sessions_eff`（M1 已静态保证 `sessions ≤ Σsequences ≤ 2 × sessions`，故交叉并发度恒 k ∈ {1,2}）；单个交叉会话形态 = **A 段 + B 段 + A 余段[+ B 余段]**（切点 `cut_a ∈ [1, |A|−1]`、`cut_b ∈ [1, |B|]` 保证真交叉；一方不足 2 帧时与另一方互换，两方都不足则退化为顺次拼接——纯长度条件、零 rng）；噪音帧逐帧掷签 (会话, 槽位)，**满员会话**（`len ≥ stream.session_max_len`）退出签池，签池耗尽 ⇒ 余帧缺席 + WARN；重发序列（`duplicates`，超出幸存数时钳制 + WARN）取自幸存集、帧内容逐字节同源、恒落**流尾新会话**；ts 铺设自 `ts_start` 起严格递增——会话内帧间隔 `uniform(frame_gap_s)`、跨会话间隔 `uniform(gap_s + lo, gap_s + hi)`（恒 > `stream.gap_s` ⇒ 摄取侧按同一 gap_s 复演出相同会话切分），微秒精度 ISO-8601 写出。交织尾声统一回填 `truth.session`（全流会话序数 0 基）。
@@ -219,3 +298,52 @@ def effective_tiers(class_tiers, global_tiers) -> tuple[TierSpec, ...]:
 - **作废语义**（3.6.1 边界的序列版）：蓝图 / 帧实现 / 逐帧钩子任一环节失败 ⇒ 该序列缺席，**不产 failed 记录、不写 `item.errors`**（种子概念不存在，无「原批」可损）；留痕 = 计数器 + 一行值-free stderr WARN（`seq=` 序号 / `class=` / `llm=` / `call=` / `kind=`）。
 - **预算与溢出纪律（v1.11 家族）**：三类调用发出前都做 `est(system) + est(user) + 2 × 消息包封 ≤ input_budget`（`supports_structured_output` 时另扣 response schema 文本）的预检——不可装填即**从不发出**（V10 先例，precheck **永不喂熔断**）；帧实现的反应式溢出走**序列对半分**（schema 与蓝图概要随切片同步减半，≤ 2 级 AIMD，每次计 `budget.degrade_retries`；单步跨度或级数耗尽 ⇒ 序列作废），reactive-400 终局在作废吞点经共享 `budget.feed_reactive_terminal` 补喂熔断**恰一次**（A7 纪律，7.6）。`TEMPLATE_HEAD_TOKENS` 增 `generate_plan` / `generate_realize` 两键（噪音批复用 `generate` 键值），M1 静态预检增对应两段（3.1.4）。
 - **计数与观测**：`report.generate.buckets` 照常（`calls` / `produced` / `survived_dedup` / `rejected_by_validator`）；新增 `report.generate.stream` 子块（counts-only 12 键：`sessions`（交织出的会话数，**不含重发尾会话**；作废序列会使其低于声明的 `sessions`——交织按 `sessions_eff = min(sessions, Σ幸存)` 装箱）/ `crossed_sessions` / `sequences.<class>.{planned, produced}`（`produced` = 该类**最终进链**的序列数，即过了蓝图、帧实现、逐帧钩子**与序列相似度过滤**四关的条数——`planned − produced` 的缺口按环节分摊在 `plan_failures` / `realize_failures` / `validator_scrapped` 与相似度淘汰上，后者只以桶 `survived_dedup` 差呈现）/ `frames`（幸存序列的任务帧总数，不含噪音帧与重发帧）/ `noise_frames`（实际织入数）/ `duplicates` / `plan_calls` / `realize_calls`（含对半降级后的分次调用）/ `noise_calls`（三个调用计数在**派发前**递增，故含被预算预检拦下、从未发出的调用——平面路径同款口径）/ `plan_failures` / `realize_failures` / `validator_scrapped`，6.4）；`report.run` 摘要族增工件条目（路径 / sha256 / 行数）。**v1.14 档位面增量**：`report.generate.stream` 增 `tiers` 子块（counts-only，条件在场 = **全局档位表非空**——全局表为锚故这一判据在 v1.15 下零改动；**键位冻结在 `sequences` 之后、`frames` 之前**（配额族相邻））——口径与 `sequences.<class>` 同款：`planned` 计于计划期逐序列、`produced` 数最终进链（过了蓝图、帧实现、逐帧钩子与序列相似度过滤四关）的条数。该子块由 M10 在报表装配时**按声明档位表显式铺开**（3.10.3），故零额档与全作废档也如实在场（planned 0 / produced 0），不依赖计数器首触序。**v1.15 双形**（裁决·嵌套报表全类铺开）：全部序列类都未声明按类表 ⇒ **平面形** `{"<tier_rank>": {planned, produced}}`，按全局表 rank 升序铺开，与 v1.14 报表**逐字节相等**；任一按类表在场 ⇒ **类嵌套形** `{"<class>": {"<tier_rank>": {planned, produced}}}`，外层 = **全部声明序列类按声明序**零基铺开（`sequences.<class>` 同款）、内层 = 该类生效表 rank 升序，键均为十进制字符串（落盘无 sort_keys ⇒ 键序 = 装配插入序），零配额类与全作废档同样如实呈现 0/0。两形下键位都仍冻结在 `sequences` 与 `frames` 之间。**计数器键按类重冻结**（裁决·计数器键按类重冻结）：M6 恒喂类段键 `generate.stream.tiers.<class>.<rank>.{planned, produced}`（单一喂数纪律，禁双写两族键），平面形由 M10 按 rank **跨类求和**装配——数值与 v1.14 逐字节相等（v1.14 的平面计数本就是跨类聚合值）。**时间字段面零观测增量**（确定性机械操作，无可计数的失败模式）。**零新 trace 通道、零新事件**（两类调用经 `llm.call` 可见；generate 专属通道列 8.4 演进候选）、**零新错误 kind**（7.6；覆盖违约复用 `schema_violation` 进修复环、作废复用 `plan_failures`；v1.15 的按类表前提错误走既有 CONFIG_ERROR 面）。**零调用数变化**——档位（含按类化）与时间字段三个机制均不改调用次数，`estimate_run`、估算行格式、八个 dry-run golden 与 console 键集全部零改动（3.10.3、7.8）。
+
+### 3.6.6 v1.16 序列规则与联合规划
+
+时间流生成的生效规则或日历窗口在实际 `--limit` 配额前缀中出现时，M6 在任何 LLM 调用
+之前进入全流联合规划路径。没有生效规则或窗口时，继续使用 v1.15 默认路径；序列级
+`generate.sequence_validator` 可以独立运行，不改变帧类词的规划开关。联合路径的入口、
+问题构造和求解与 M1、`estimate_run` 共用 `labelkit/common/runtime/sequence_planner.py`，
+不在 M6 内复制一套约束实现。
+
+规划期先展开按类名字典序的尝试配额，取一个 31-bit solver seed，再为每个 attempt 恰抽
+一次循环长度偏好。同一个模型以偏好名次和为主目标、最大可行 noise 为次目标，联合定稿
+长度、帧类 word、owner session、任务时间戳和可用 noise 槽；所有 task timestamp 全局唯一，
+session 间隔至少为 `stream.gap_s + 1us`，
+session 内相邻任务帧满足 replay guard。双 owner session 必须有真实的 A-B-A 或 B-A-B
+交替；noise 只放在存活任务帧首尾之间的开区间，不参与规则和窗口。求解器单线程、固定
+search seed、最大确定性时间预算 10 秒；model proto 超过 250,000 项、`INFEASIBLE` 或
+无法在预算内验证的 `UNKNOWN` 都由启动期 M1 拒绝，运行期不靠重抽长度或重规划补救。
+
+规划器先冻结 frame class，因此 LLM brief 调用不再返回类名。M8 使用
+`brief_schema(length)`，只接受固定长度的逐位 `{brief: string}` 对象；prompt 同时带入固定
+类词、生效 rules/windows/correlation 与按类 instruction。M6 将 brief 与固定类词合并，
+再用既有 `realize_schema(prefixItems)` 完成 payload。realize prompt 必须再次携带规则和
+correlation 说明；有 correlation 的序列禁止 reactive halving，溢出或截断直接沿既有
+`realize_failures` 作废整条序列，无 correlation 时保留既有有界对半降级。
+
+每条序列的验证顺序冻结为：realize Schema、逐帧 `generate.sample_validator`、声明式
+correlation/time、一次 `generate.sequence_validator`、序列相似度过滤，然后投影幸存
+primary、过滤 noise 槽、回填 primary `time_fields`，最后复制已回填 payload 给 duplicate
+并完成全局排序和组装。任一序列失败都只让该 attempt 缺席，不创建 failed 信封或写入
+`item.errors`；hook 输入是 `SequenceValidationInput` 的深拷贝，hook 异常视同违规。
+
+规则验证在冻结 skeleton 上重新枚举标准 occurrence 候选，不把 planner 的 potential
+witness 当作 i 对 i 的承诺。correlation 先按 JSON 运行时类型和 canonical bytes 相等过滤，
+再按半开 `time_s` 过滤；正规则分别计 `correlation_scrapped` 或 `temporal_scrapped`，
+负规则的相关性失败统一计前者。无 correlation 的运行期失败表示 planner 不变量破坏，记录
+ERROR 并抛 `InternalError`。`validator_scrapped` 恒等于
+`sample_validator_scrapped + correlation_scrapped + temporal_scrapped +
+sequence_validator_scrapped`，相似度淘汰不进入该等式。
+
+作废后的布局是已冻结 skeleton 的确定性投影：删除整条 attempt，移除空 session，按时间
+重新编号但绝不移动幸存时间戳；crossed 只有两位 owner 都幸存且仍有真实交替时保留。重复
+从调用前预抽的 source 排列中选取，复制 source 的 tier、frame class word 和已回填时间字段，
+按规则允许的最小时间平移放到流尾。noise 目标是最大化已规划槽位的目标值；目标无法全放下
+只记录一次值无关 WARN，不追加 LLM 调用。
+
+M6 不改变 artifact 的 truth 键集、主输出 Schema、Record/session/id 公式或既有 trace
+通道。规则和窗口不复制到工件；report 仅在实际非零配额类的生效面出现 `rules`、可选
+validator 计数与 `windows.calendar_days_spanned`，并置于既有 `tiers` 后、`frames` 前。
+`MODEL_INVALID` 或 M6 发现已通过 M1 的模型不变量被破坏时走既有 `InternalError` / 退出码 4。

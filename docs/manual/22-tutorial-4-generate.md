@@ -5,7 +5,7 @@
 > 从 3 条手写种子出发合成一个带标注的小数据集。（同目录 `project.toml` 里的 generate 是
 > **process 模式**的另一形态——过质量门的记录当种子、扩充样本回流治理，见第 12 章。）
 > 目标：理解纯生成模式的完整链路（合成 → 去重 → 打分 → 标注），学会用桶统计验收多样性，
-> 并掌握三种形态的选型：种子池 / 无种子（22.5）/ 时间流生成（22.6，v1.13，详见第 27 章）。
+> 并掌握三种形态的选型：种子池 / 无种子（22.5）/ 时间流生成（22.6，v1.16，详见第 27 章）。
 
 ## 22.1 工程配置解剖
 
@@ -151,20 +151,21 @@ standalone_count = 200            # 目标产出条数；调用数 = ⌈200/4⌉
 
 两者互斥（同时设置报配置错误）。无种子形态对 instruction 的写功要求更高——把「谁在说话、什么场景、什么体裁、什么长度」都写进去，再用 styles 分桶（12.7 节的收放心法）。
 
-## 22.6 变奏三：合成的不是一条文本，是一条时间流（v1.13）
+## 22.6 变奏三：合成的不是一条文本，是一条时间流（v1.16）
 
 前两个变奏调的都是「产多少条独立文本」。要的样本单位若是**一段活动**——多轮请求按时间先后连成一条会话、几条会话交织成一条带时间戳的流——就换 `generate_only` 的第三形态 `[generate.stream]`：
 
 ```toml
 [stream]                          # 生成侧的铺设契约（复用摄取侧词汇，故工件可重放）
 order_by = "meta:ts"
-gap_s = 900
+gap_s = 3600
 
 [generate.stream]
 enabled = true
-sessions = 5                      # 交叉会话数 = Σsequences − sessions
+sessions = 5                      # 目标会话数；最终 crossed_sessions 按 survivor projection 计
 noise_ratio = 0.1                 # 掺入无关干扰帧
 duplicates = 1                    # 原样重发一条序列（判重演示位）
+frame_gap_s = [5, 60]             # 未被显式 time_s 覆盖的相邻任务帧间隔
 
 [classify]
 enabled = true                    # 类表是配额载体；标签生成期已知、直接继承（零判决调用）
@@ -172,10 +173,26 @@ enabled = true                    # 类表是配额载体；标签生成期已�
 [class.ticket_booking.generate]
 instruction = """……"""
 sequences = 3                     # 配额与长度按序列类挂
-len_range = [3, 5]
+len_range = [4, 5]
 ```
 
-与本教程的种子池形态三点不同：**LLM 只出内容**（一序列一次蓝图定结构 + 一次帧实现填内容），会话装箱、交叉、噪音插入、原样重发、时间戳铺设全部由零 LLM 的机械交织器完成；**产物两份**——主输出一行 = 一条序列，另落一份**时间流工件**（一行 = 一帧，含逐帧真值，可当输入原样重放）；**不同序列类可以各用一份标注 Schema**（购票抽行程要素、设备控制抽动作要素，同一份主输出里字段集不同）。可运行工程是 `examples/synth-stream`（单端点 DeepSeek，6 条序列 / 29 行工件，本次真跑 50 次调用），它同时演示 v1.14 的两个增量——**帧类构成档位**（一档 = 一种帧类构成，类配额按权重零抽签配分）与**时间字段回填**（帧 Schema 里的时间量由时间轴算出，不由模型编）——以及 v1.15 的**按类档位表**（序列类可自带一张档位表整表取代全局表：工程里购票类走「请求 + 确认直达」的自定义构成，智能家居类回落全局表）。完整讲解见**第 27 章**。
+在最小可运行配置中还应显式给出帧间隔与约束面：
+
+```toml
+[[generate.stream.rules]]
+template = "chain_response"
+source = "task_request"
+target = "acknowledgement"
+time_s = [1200, 2400]
+correlation = { operator = "equal", source_field = "subject_id", target_field = "subject_id" }
+
+[[generate.stream.windows]]
+frame_class = "task_request"
+of_day = [["08:00", "11:00"], ["14:00", "17:00"]]
+of_week = ["mon", "tue", "wed", "thu", "fri"]
+```
+
+与本教程的种子池形态不同，时间流同时交付序列主输出与逐帧工件。可运行工程 `examples/synth-stream` 到 v1.16 还演示联合规则：request 必须紧邻 acknowledgement，二者相隔 20–40 分钟且 `subject_id` 类型敏感相等；request 只能落在工作日早/下午窗口，ticket_booking 用按类窗口整表覆盖；序列 hook 再检查首尾与位置连续性。每个 owner 内相邻任务帧还须满足闭合 replay guard（`1us ≤ delta < gap_s`），因此同一工件配同一 `[stream]` 声明可重放而不误切会话。帧类词、session、crossing、timestamp 与噪音槽在内容调用前冻结，模型只写 brief 和 payload。真实调用数与工件行数以第 27 章本版验收记录为准，不把旧版本样本数当保证。
 
 ## 22.7 本教程的可迁移结论
 

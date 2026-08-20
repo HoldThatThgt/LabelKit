@@ -1,9 +1,9 @@
-"""v1.13/v1.14/v1.15 time-stream generation integration tests — REAL endpoints, no mocks.
+"""v1.13/v1.14/v1.15/v1.16 time-stream generation integration tests — REAL endpoints, no mocks.
 
 SPEC-stream-generation.md §3.9, SPEC-generation-tiers.md §3.7 and
 SPEC-per-class-tiers.md §3.6 integration rows. Two endpoints, by design:
 
-1./2./4./5./7. **DeepSeek** (``deepseek-v4-flash`` via api.deepseek.com/anthropic)
+1./2./4./5./7./8. **DeepSeek** (``deepseek-v4-flash`` via api.deepseek.com/anthropic)
    — the E2E face the stakeholder pinned for this feature (2026-08-13, carried
    over to v1.14 on 2026-08-18 and to v1.15 on 2026-08-19). The route hard-rejects
    forced tool calls (400, E2E-FINDINGS #24) ⇒ ``supports_structured_output = false``
@@ -19,7 +19,9 @@ SPEC-per-class-tiers.md §3.6 integration rows. Two endpoints, by design:
    mechanical time-field backfill against the artifact's own timestamps; case 7
    (v1.15) drives the mixed per-class form (one class with its own table, one
    falling back to the global one) and pins 裁决·表级原子覆盖 /
-   裁决·rank 类内身份 plus the class-nested report block.
+   裁决·rank 类内身份 plus the class-nested report block；case 8（v1.16）验证
+   planner-active 路径：两帧 task_request → acknowledgement 链、半开时间区间、
+   typed subject_id correlation 与工作日日历窗。
 3./6. **z.ai** (``glm-5.2``) — the standing assumptions behind the two internal
    schema constructors under a vendor structured-output route (L0 on,
    ``supports_structured_output = true``): case 3 pins ``realize_schema``'s
@@ -30,7 +32,7 @@ Skips: the DeepSeek cases skip themselves when ``LABELKIT_DEEPSEEK_KEY`` is
 absent; the z.ai cases ride the conftest-wide ``LABELKIT_ZAI_KEY`` gate that
 skips every integration-marked test. Both variables are auto-loaded from the
 git-ignored repo-root ``.env`` by tests/conftest.py. Every case stays at
-temperature 0; the most expensive ones (cases 4 and 7) spend four real LLM calls.
+temperature 0；cases 4 and 7 各 spend four real LLM calls，case 8 spend two。
 """
 from __future__ import annotations
 
@@ -51,6 +53,7 @@ from labelkit.common.config.model import (
     ClassSpec,
     ClassView,
     ClassifyConfig,
+    CorrelationSpec,
     ConsoleConfig,
     DedupConfig,
     ExtractConfig,
@@ -65,6 +68,8 @@ from labelkit.common.config.model import (
     ResolvedConfig,
     Rubric,
     RunConfig,
+    SequenceRuleSpec,
+    SequenceWindowSpec,
     SegmentConfig,
     StitchConfig,
     StreamConfig,
@@ -76,8 +81,13 @@ from labelkit.common.config.model import (
 )
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import Record, RecordRef
-from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
-from labelkit.common.runtime.llm_client import LLMClient
+from labelkit.common.runtime.llm_client import (
+    LLMClient,
+    Message,
+    Part,
+    PromptBundle,
+    _build_anthropic_body,
+)
 from labelkit.common.runtime.schema_engine import (
     CallScope,
     SchemaEngine,
@@ -199,9 +209,22 @@ TIMED_SCHEMAS = {"task_request": TIMED_TASK_SCHEMA,
                  "followup": TIMED_FOLLOWUP_SCHEMA}
 TIME_BINDINGS = {"task_request": {"duration": "gap_next_s"},
                  "followup": {"wait_s": "gap_prev_s"}}
-TIMED_FOLLOWUP_INSTRUCTION = ("产出一句追问或修改：utterance 是用户说出的那一句话"
-                              "（在已有诉求之上补充约束、更换要素或询问细节，口语、"
-                              "中文、一句话）。")
+TIMED_CLASS_INSTRUCTION = (
+    "合成一条高铁购票请求序列，前后帧围绕同一次出行推进。每一帧都必须是 JSON"
+    " 对象，不得返回字符串、数组、Markdown 或说明文字；每个对象只能包含对应帧的"
+    " LLM-facing Schema 字段，禁止增加其他字段。duration 和 wait_s 是系统按时间轴"
+    "回填的绑定字段，模型不得生成。")
+TIMED_TASK_INSTRUCTION = (
+    "生成 task_request 帧，必须返回一个 JSON 对象，不得返回字符串、数组、Markdown"
+    " 或说明文字。对象只能包含 utterance 和 entities 两个 LLM-facing Schema 字段，"
+    "不得增加任何其他字段；utterance 是用户说出的中文购票请求，entities 逐项列出"
+    "地点、日期时段、车次或坐席等关键要素，没有则为空数组。duration 是系统回填字段，"
+    "禁止生成。")
+TIMED_FOLLOWUP_INSTRUCTION = (
+    "生成 followup 帧，必须返回一个 JSON 对象，不得返回字符串、数组、Markdown 或"
+    "说明文字。对象只能包含 utterance 一个 LLM-facing Schema 字段，不得增加任何其他"
+    "字段；utterance 是在已有诉求上补充约束、更换要素或询问细节的中文一句话。"
+    "wait_s 是系统回填字段，禁止生成。")
 NOISE_INSTRUCTION = ("生成与任何任务都无关的干扰输入：用户随口说的闲聊、感叹或跑题的"
                      "一句话，长度 5–20 字，不得包含任何可执行的诉求。")
 
@@ -216,19 +239,67 @@ SMART_HOME_INSTRUCTION = (
     "你在为智能家居场景合成真实用户与语音助手的一次指令序列。序列围绕同一个居家"
     "场景展开：从一条设备控制指令开始，逐步追加或修改设备、房间、动作强度与定时"
     "条件。要求口语化、中文、每帧一句话，前后帧信息连贯且有推进。")
+TIERED_CLASS_OBJECT_INSTRUCTION = (
+    "帧实现阶段，task_request、followup、confirmation 每一帧都必须返回一个 JSON"
+    "对象；每个对象只能包含本帧 LLM-facing Schema 的 utterance 和 entities 字段，"
+    "不得返回 JSON 字符串、数组、Markdown、说明文字或任何 Schema 未声明字段。")
+TIERED_TASK_FRAME_INSTRUCTION = (
+    "生成 task_request 帧，必须返回 JSON 对象，只能包含 utterance 和 entities 字段；"
+    "utterance 是用户发起的任务，entities 逐项列出地点、设备、日期或其他关键要素，"
+    "没有则为空数组。不得返回字符串、数组、Markdown 或额外字段。")
+TIERED_FOLLOWUP_FRAME_INSTRUCTION = (
+    "生成 followup 帧，必须返回 JSON 对象，只能包含 utterance 和 entities 字段；"
+    "utterance 是对当前任务的补充或修改，entities 逐项列出新增要素，没有则为空数组。"
+    "不得返回字符串、数组、Markdown 或额外字段。")
+TIERED_CONFIRMATION_FRAME_INSTRUCTION = (
+    "生成 confirmation 帧，必须返回 JSON 对象，只能包含 utterance 和 entities 字段；"
+    "utterance 是确认或收尾，entities 逐项列出相关要素，没有则为空数组。"
+    "不得返回字符串、数组、Markdown 或额外字段。")
+
+# ── v1.16 联合规划面（SPEC-sequence-rules §3.1/§5.1/§6）─────────────────────
+RULE_TASK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "subject_id": {"type": "string"},
+        "utterance": {"type": "string"},
+        "entities": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": ["subject_id", "utterance", "entities"],
+    "additionalProperties": False,
+}
+
+RULE_ACK_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "subject_id": {"type": "string"},
+        "utterance": {"type": "string"},
+    },
+    "required": ["subject_id", "utterance"],
+    "additionalProperties": False,
+}
+
+RULE_CLASS_INSTRUCTION = (
+    "合成一次高铁购票请求。序列固定只有 task_request 和 acknowledgement 两帧，"
+    "subject_id 必须在两帧中都使用字符串 booking-001。")
+RULE_TASK_INSTRUCTION = (
+    "生成购票请求帧。subject_id 必须是字符串 booking-001；utterance 是中文购票请求，"
+    "entities 列出地点、日期或座席等要素，没有则为空数组。")
+RULE_ACK_INSTRUCTION = (
+    "生成购票确认帧。subject_id 必须是字符串 booking-001，与 task_request 完全相同；"
+    "utterance 是中文确认或回应。")
 
 
 # ── fixtures: real profiles + a directly built ResolvedConfig (M1 shape) ────
 
 def _deepseek_profile() -> LLMProfile:
-    """examples/synth-stream/config.toml:[llm.default] 逐键镜像（retries 按测试
-    预算收紧）：L0 全关 ⇒ 结构服从性走模板内嵌契约 + 引擎 L1/L2/L3。"""
+    """逐键镜像 examples/synth-stream/config.toml（仅 retries 按测试预算收紧）。"""
     return LLMProfile(
         name="default", provider="anthropic", base_url=DEEPSEEK_BASE_URL,
         model=DEEPSEEK_MODEL, api_key_env=DEEPSEEK_KEY_ENV, max_concurrency=4,
         timeout_s=120, max_retries=2, supports_structured_output=False,
-        supports_vision=False, max_output_tokens=4096, context_window=131072,
-        temperature=0.0, api_key=os.environ.get(DEEPSEEK_KEY_ENV, ""))
+        supports_vision=False, max_output_tokens=8192, thinking="disabled",
+        context_window=131072, temperature=0.0,
+        api_key=os.environ.get(DEEPSEEK_KEY_ENV, ""))
 
 
 def _zai_profile() -> LLMProfile:
@@ -326,10 +397,11 @@ def _timed_cfg() -> ResolvedConfig:
     base = _cfg(_deepseek_profile())
     return replace(
         base,
-        class_views={"ticket_booking": _class_view("ticket_booking", sequences=2,
-                                                   len_range=(3, 3))},
+        class_views={"ticket_booking": _class_view(
+            "ticket_booking", sequences=2, len_range=(3, 3),
+            instruction=TIMED_CLASS_INSTRUCTION)},
         frame_class_views={
-            "task_request": _frame_view(TASK_FRAME_INSTRUCTION, TIMED_TASK_SCHEMA,
+            "task_request": _frame_view(TIMED_TASK_INSTRUCTION, TIMED_TASK_SCHEMA,
                                         TIME_BINDINGS["task_request"]),
             "followup": _frame_view(TIMED_FOLLOWUP_INSTRUCTION,
                                     TIMED_FOLLOWUP_SCHEMA,
@@ -346,21 +418,64 @@ def _per_class_tiers_cfg() -> ResolvedConfig:
     len_range = [3, 3]、噪音与重发全关 ⇒ 恰四次真实调用。"""
     base = _cfg(_deepseek_profile())
     views = dict(base.frame_class_views)
-    views["confirmation"] = _frame_view(CONFIRMATION_FRAME_INSTRUCTION)
+    views["task_request"] = _frame_view(TIERED_TASK_FRAME_INSTRUCTION, FRAME_GEN_SCHEMA)
+    views["followup"] = _frame_view(TIERED_FOLLOWUP_FRAME_INSTRUCTION, FRAME_GEN_SCHEMA)
+    views["confirmation"] = _frame_view(
+        TIERED_CONFIRMATION_FRAME_INSTRUCTION, FRAME_GEN_SCHEMA)
     return replace(
         base,
         classify=replace(base.classify, classes=(
             ClassSpec(name="ticket_booking", description="高铁购票会话"),
             ClassSpec(name="smart_home", description="智能家居指令会话"))),
         class_views={
-            "ticket_booking": _class_view("ticket_booking", sequences=1,
-                                          len_range=(3, 3), tiers=OWN_TIERS),
-            "smart_home": _class_view("smart_home", sequences=1, len_range=(3, 3),
-                                      instruction=SMART_HOME_INSTRUCTION)},
+            "ticket_booking": _class_view(
+                "ticket_booking", sequences=1, len_range=(3, 3), tiers=OWN_TIERS,
+                instruction=CLASS_INSTRUCTION + TIERED_CLASS_OBJECT_INSTRUCTION),
+            "smart_home": _class_view(
+                "smart_home", sequences=1, len_range=(3, 3),
+                instruction=SMART_HOME_INSTRUCTION + TIERED_CLASS_OBJECT_INSTRUCTION)},
         frame_classify=replace(base.frame_classify,
                                classes=FRAME_CLASSES + (CONFIRMATION,)),
         frame_class_views=views,
         generate_stream=replace(base.generate_stream, sessions=2, tiers=TIERS))
+
+
+def _planner_rules_cfg() -> ResolvedConfig:
+    """v1.16 联合规划的最小 DeepSeek 真跑配置：一条固定两帧序列、无噪音无重发。"""
+    base = _cfg(_deepseek_profile())
+    frame_classes = (
+        ClassSpec(name="task_request", description="发起购票请求"),
+        ClassSpec(name="acknowledgement", description="确认同一购票请求"),
+    )
+    rules = (
+        SequenceRuleSpec(template="init", frame_class="task_request"),
+        SequenceRuleSpec(template="exactly", frame_class="task_request", count=1),
+        SequenceRuleSpec(template="exactly", frame_class="acknowledgement", count=1),
+        SequenceRuleSpec(
+            template="chain_response", source="task_request", target="acknowledgement",
+            time_s=(1200.0, 2400.0),
+            correlation=CorrelationSpec(operator="equal", source_field="subject_id",
+                                        target_field="subject_id")),
+        SequenceRuleSpec(template="end", frame_class="acknowledgement"),
+    )
+    windows = (SequenceWindowSpec(
+        frame_class="task_request", of_day=(("08:00", "11:00"),),
+        of_week=("mon", "tue", "wed", "thu", "fri")),)
+    return replace(
+        base,
+        stream=replace(base.stream, gap_s=3600),
+        class_views={"ticket_booking": _class_view(
+            "ticket_booking", sequences=1, len_range=(2, 2),
+            instruction=RULE_CLASS_INSTRUCTION)},
+        frame_classify=replace(base.frame_classify, classes=frame_classes),
+        frame_class_views={
+            "task_request": _frame_view(RULE_TASK_INSTRUCTION, RULE_TASK_SCHEMA),
+            "acknowledgement": _frame_view(RULE_ACK_INSTRUCTION, RULE_ACK_SCHEMA),
+        },
+        generate_stream=replace(
+            base.generate_stream, ts_start="2026-01-05T08:00:00+08:00",
+            rules=rules, windows=windows),
+    )
 
 
 def _assemble_report_tiers(cfg: ResolvedConfig, counters: Mapping) -> dict:
@@ -786,3 +901,67 @@ async def test_generate_stream_per_class_tiers_real_deepseek():
     for label in ("ticket_booking", "smart_home"):
         assert tiers_block[label]["1"] == {
             "planned": 1, "produced": produced.get((label, 1), 0)}
+
+
+# ── 8. DeepSeek: v1.16 联合规划（规则 / 时间 / correlation / 日历窗）──────────
+
+@needs_deepseek
+async def test_generate_stream_rules_real_deepseek_planner_chain_correlation():
+    """联合规划真跑：固定 word、半开 time_s、typed correlation 与日历窗共同生效。"""
+    cfg = _planner_rules_cfg()
+    ctx = _ctx(cfg)
+
+    # v1.16 真跑锁定示例配置的 DeepSeek 输出预算与 thinking 请求面。
+    profile = cfg.llm_profiles["default"]
+    body = _build_anthropic_body(
+        profile,
+        PromptBundle(messages=(Message(
+            role="user", parts=(Part(kind="text", text="v1.16 request face"),)),)),
+        response_schema=None,
+    )
+    assert profile.max_output_tokens == 8192
+    assert profile.thinking == "disabled"
+    assert body["max_tokens"] == 8192
+    assert body["thinking"] == {"type": "disabled"}
+
+    product = await GenerateStage(cfg).generate_stream_all(ctx)   # 2 real calls
+
+    assert len(product.envelopes) >= 1, "the planner attempt was scrapped"
+    rows = [json.loads(line) for line in product.artifact_lines]
+    assert len(rows) == 2
+    assert [row["truth"]["frame_class"] for row in rows] == [
+        "task_request", "acknowledgement"]
+    assert all(set(row) == {"ts", "text", "truth"} for row in rows)
+    assert all(set(row["truth"]) == {
+        "session", "sequence_class", "sequence", "frame_class", "noise"}
+               for row in rows)
+    assert all(row["truth"] == {
+        "session": 0, "sequence_class": "ticket_booking", "sequence": 0,
+        "frame_class": row["truth"]["frame_class"], "noise": False}
+               for row in rows)
+
+    task, acknowledgement = rows
+    task_payload = task["text"]
+    acknowledgement_payload = acknowledgement["text"]
+    jsonschema.Draft202012Validator(RULE_TASK_SCHEMA).validate(task_payload)
+    jsonschema.Draft202012Validator(RULE_ACK_SCHEMA).validate(acknowledgement_payload)
+    assert type(task_payload["subject_id"]) is type(acknowledgement_payload["subject_id"])
+    assert task_payload["subject_id"] == acknowledgement_payload["subject_id"]
+
+    task_ts = datetime.fromisoformat(task["ts"])
+    acknowledgement_ts = datetime.fromisoformat(acknowledgement["ts"])
+    delta_s = (acknowledgement_ts - task_ts).total_seconds()
+    assert 1200 <= delta_s < 2400
+    assert task_ts.weekday() < 5 and 8 <= task_ts.hour < 11
+
+    counters = ctx.metrics.counters
+    assert counters.get("generate.stream.plan_calls") == 1
+    assert counters.get("generate.stream.realize_calls") == 1
+    assert counters.get("generate.stream.rules.sampled") == 1
+    assert counters.get("generate.stream.sequences.ticket_booking.planned") == 1
+    assert counters.get("generate.stream.sequences.ticket_booking.produced") >= 1
+    assert counters.get("generate.stream.sessions") == 1
+    assert counters.get("generate.stream.frames") == 2
+    assert counters.get("generate.stream.windows.calendar_days_spanned") == 1
+    assert counters.get("generate.stream.correlation_scrapped", 0) == 0
+    assert counters.get("generate.stream.temporal_scrapped", 0) == 0

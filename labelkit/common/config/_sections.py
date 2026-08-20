@@ -7,6 +7,7 @@ spec 3.1.4 的表行次序对齐。
 from __future__ import annotations
 
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 from labelkit.common.config._collect import (
@@ -43,6 +44,9 @@ from labelkit.common.config.model import (
     LLMProfile,
     OutputConfig,
     QualityConfig,
+    CorrelationSpec,
+    SequenceRuleSpec,
+    SequenceWindowSpec,
     SegmentConfig,
     StitchConfig,
     StreamConfig,
@@ -68,6 +72,13 @@ _STREAM_FORBIDDEN_CLASS_GEN_KEYS = ("num_per_record", "seeds_per_call")
 
 # [generate.stream].ts_start 缺省: 恒不取墙钟(同 seed 双跑工件逐字节一致)。
 _TS_START_DEFAULT = "2026-01-01T00:00:00Z"
+
+_SEQUENCE_TEMPLATES = (
+    "existence", "absence", "exactly", "init", "end", "responded_existence",
+    "co_existence", "response", "precedence", "succession", "alternate_response",
+    "chain_response", "chain_precedence", "not_co_existence", "not_succession",
+)
+_SEQUENCE_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
 
 @dataclass(frozen=True)
@@ -273,6 +284,7 @@ def _parse_llm_profile(col: _Collector, file: str, name: str, data: dict) -> LLM
         max_output_tokens=t.get_int("max_output_tokens", 4096, minimum=1),
         context_window=t.get_int("context_window", 0, minimum=0),
         temperature=t.get_float("temperature", 0.0, bound=_GE0),
+        thinking=t.get_str("thinking", None, enum=("enabled", "disabled")),
         max_image_px=t.get_int("max_image_px", 2048, minimum=1),
         default_image_px=t.get_int("default_image_px", 0, minimum=0),
         price_per_mtok_in=t.get_float("price_per_mtok_in", None, bound=_GE0),
@@ -582,6 +594,134 @@ def _parse_tiers(col: _Collector, file: str, raw: Any,
     return tuple(sorted(tiers, key=lambda spec: spec.tier_rank))
 
 
+def _parse_time_s(t: _Tbl, key: str) -> tuple[float, float] | None:
+    """解析规则的半开秒区间并确认端点可精确量化到微秒。"""
+    raw = t.take(key)
+    if raw is _MISSING:
+        return None
+    expected = "number range array of length 2 [lo, hi) with microsecond precision"
+    if (not isinstance(raw, list) or len(raw) != 2
+            or any(isinstance(value, bool) or not isinstance(value, (int, float))
+                   for value in raw)):
+        t.err(key, expected, raw)
+        return None
+    try:
+        decimals = [Decimal(str(value)) * Decimal(1_000_000) for value in raw]
+    except (InvalidOperation, ValueError):
+        t.err(key, expected, raw)
+        return None
+    if any(not value.is_finite() or value != value.to_integral_value() for value in decimals):
+        t.err(key, expected, raw)
+        return None
+    lo_us, hi_us = (int(value) for value in decimals)
+    if lo_us < 1 or lo_us >= hi_us:
+        t.err(key, "non-empty half-open range [lo, hi) with 1 microsecond <= lo < hi", raw)
+        return None
+    return float(raw[0]), float(raw[1])
+
+
+def _parse_correlation(t: _Tbl, key: str) -> CorrelationSpec | None:
+    """解析规则的 typed correlation inline table。"""
+    raw = t.take(key)
+    if raw is _MISSING:
+        return None
+    loc = f"{t.label}.{key}"
+    if not isinstance(raw, dict):
+        t.col.error(f"{t.file}:{loc}: expected table, got {_fmt(raw)}")
+        return None
+    nested = _Tbl(t.col, t.file, loc, raw)
+    operator = nested.get_str("operator", None, required=True, enum=("equal",))
+    source_field = nested.get_str("source_field", None, required=True, nonempty=True)
+    target_field = nested.get_str("target_field", None, required=True, nonempty=True)
+    nested.finish()
+    if operator is None or source_field is None or target_field is None:
+        return None
+    return CorrelationSpec(operator=operator, source_field=source_field,
+                           target_field=target_field)
+
+
+def _parse_sequence_rules(col: _Collector, file: str, raw: Any,
+                          header: str) -> tuple[SequenceRuleSpec, ...]:
+    """解析 ``rules`` 数组，跨字段模板语义留给约束簇。"""
+    if raw is _MISSING:
+        return ()
+    if not isinstance(raw, list):
+        parent, _, key = header.strip("[]").rpartition(".")
+        col.error(f"{file}:[{parent}].{key}: expected array of tables, got {_fmt(raw)}")
+        return ()
+    rules: list[SequenceRuleSpec] = []
+    for index, row in enumerate(raw, 1):
+        label = f"{header}[{index}]"
+        if not isinstance(row, dict):
+            col.error(f"{file}:{label}: expected table, got {_fmt(row)}")
+            continue
+        table = _Tbl(col, file, label, row)
+        template = table.get_str("template", None, required=True,
+                                 enum=_SEQUENCE_TEMPLATES)
+        frame_class = table.get_str("frame_class", None, nonempty=True)
+        source = table.get_str("source", None, nonempty=True)
+        target = table.get_str("target", None, nonempty=True)
+        count = table.get_int("count", None, minimum=1)
+        time_s = _parse_time_s(table, "time_s")
+        correlation = _parse_correlation(table, "correlation")
+        table.finish()
+        if template is not None:
+            rules.append(SequenceRuleSpec(template=template, frame_class=frame_class,
+                                          source=source, target=target, count=count,
+                                          time_s=time_s, correlation=correlation))
+    return tuple(rules)
+
+
+def _parse_day_ranges(col: _Collector, file: str, label: str,
+                      raw: Any) -> tuple[tuple[str, str], ...]:
+    """解析一个窗口表的同日半开时间分支。"""
+    expected = "a non-empty array of [start, end] time strings"
+    if raw is _MISSING:
+        col.error(f"{file}:{label}: missing required key, expected {expected}")
+        return ()
+    if not isinstance(raw, list) or not raw:
+        col.error(f"{file}:{label}: expected {expected}, got {_fmt(raw)}")
+        return ()
+    ranges: list[tuple[str, str]] = []
+    for index, item in enumerate(raw, 1):
+        item_label = f"{label}[{index}]"
+        if (not isinstance(item, list) or len(item) != 2
+                or any(not isinstance(value, str) for value in item)):
+            col.error(f"{file}:{item_label}: expected [start, end] string pair, got "
+                      f"{_fmt(item)}")
+            continue
+        ranges.append((item[0], item[1]))
+    return tuple(ranges)
+
+
+def _parse_sequence_windows(col: _Collector, file: str, raw: Any,
+                            header: str) -> tuple[SequenceWindowSpec, ...]:
+    """解析 ``windows`` 数组，日历值与重复/重叠留给约束簇。"""
+    if raw is _MISSING:
+        return ()
+    if not isinstance(raw, list):
+        parent, _, key = header.strip("[]").rpartition(".")
+        col.error(f"{file}:[{parent}].{key}: expected array of tables, got {_fmt(raw)}")
+        return ()
+    windows: list[SequenceWindowSpec] = []
+    for index, row in enumerate(raw, 1):
+        label = f"{header}[{index}]"
+        if not isinstance(row, dict):
+            col.error(f"{file}:{label}: expected table, got {_fmt(row)}")
+            continue
+        table = _Tbl(col, file, label, row)
+        frame_class = table.get_str("frame_class", None, required=True, nonempty=True)
+        day_raw = table.take("of_day")
+        of_day = _parse_day_ranges(col, file, f"{label}.of_day", day_raw)
+        of_week = table.get_str_tuple("of_week", _SEQUENCE_WEEKDAYS,
+                                      elem_enum=_SEQUENCE_WEEKDAYS)
+        table.finish()
+        if frame_class is not None and of_day:
+            windows.append(SequenceWindowSpec(frame_class=frame_class, of_day=of_day,
+                                              of_week=of_week))
+    return tuple(windows)
+
+
 def _parse_time_fields(col: _Collector, file: str, cname: str,
                        gen_sub: Any) -> dict[str, str] | None:
     """v1.14(裁决·时间字段回填方向): 解析 ``[frame.class.<name>.generate.time_fields]``。
@@ -639,6 +779,10 @@ def _parse_generate_stream(col: _Collector, file: str, raw: Any) -> GenerateStre
         ts_start=t.get_str("ts_start", _TS_START_DEFAULT, nonempty=True) or _TS_START_DEFAULT,
         tiers=_parse_tiers(col, file, t.take("tiers"),           # v1.14 档位表
                            "[[generate.stream.tiers]]"),
+        rules=_parse_sequence_rules(col, file, t.take("rules"),
+                                    "[[generate.stream.rules]]"),
+        windows=_parse_sequence_windows(col, file, t.take("windows"),
+                                        "[[generate.stream.windows]]"),
     )
     t.finish()
     return cfg
@@ -903,6 +1047,7 @@ def _parse_generate_block(col: _Collector, file: str,
         seed_min_score=t.get_float("seed_min_score", None, bound=_UNIT_CLOSED),
         temperature=t.get_float("temperature", 0.9, bound=_GE0),
         sample_validator=t.get_str("sample_validator", None, nonempty=True),
+        sequence_validator=t.get_str("sequence_validator", None, nonempty=True),
         seed_examples=t.get_str_tuple("seed_examples", ()),
         standalone_count=t.get_int("standalone_count", None, minimum=1),
         sequences=t.get_int("sequences", 0, minimum=0),          # v1.13 全局默认配额
@@ -919,6 +1064,10 @@ def _parse_generate_block(col: _Collector, file: str,
     # 合法)必须在表内容非法时也照样上报。
     gen_provided["stream_tiers"] = (isinstance(stream_section, dict)
                                     and "tiers" in stream_section)
+    gen_provided["stream_rules"] = (isinstance(stream_section, dict)
+                                     and "rules" in stream_section)
+    gen_provided["stream_windows"] = (isinstance(stream_section, dict)
+                                       and "windows" in stream_section)
     generate_stream = _parse_generate_stream(col, file, stream_section)
     t.finish()
     return generate, generate_stream, gen_provided

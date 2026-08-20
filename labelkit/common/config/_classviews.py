@@ -36,6 +36,8 @@ from labelkit.common.config._schemas import (
 )
 from labelkit.common.config._sections import (
     _parse_examples,
+    _parse_sequence_rules,
+    _parse_sequence_windows,
     _parse_styles,
     _parse_tiers,
     _parse_time_fields,
@@ -51,6 +53,8 @@ from labelkit.common.config.model import (
     GenerateConfig,
     QualityConfig,
     Rubric,
+    SequenceRuleSpec,
+    SequenceWindowSpec,
     TierSpec,
     VerifyConfig,
 )
@@ -69,7 +73,7 @@ _CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "quality": ("mode", "rounds", "rubric", "threshold", "selection", "top_ratio"),
     "annotate": ("instruction", "examples", "schema_path", "schema_inline"),
     "generate": ("instruction", "styles", "num_per_record", "temperature",
-                 "sequences", "len_range", "tiers"),
+                 "sequences", "len_range", "tiers", "rules", "windows"),
     "verify": ("extra_criteria",),
     "extract": ("instruction",),
 }
@@ -129,6 +133,10 @@ class _MergedClass:
     schema_inline: str | None   # v1.13 按类标注 Schema 的内联源
     tiers: tuple[TierSpec, ...] | None = None
                                 # v1.15 按类档位表; None = 未声明(回落全局表)
+    rules: tuple[SequenceRuleSpec, ...] | None = None
+                                # v1.16 按类 rules; None = 继承全局, 空元组 = 清空
+    windows: tuple[SequenceWindowSpec, ...] | None = None
+                                # v1.16 按类 windows; 三态同 rules
 
 
 @dataclass
@@ -229,8 +237,8 @@ def _merge_class_sections(col: _Collector, file: str, cname: str, sections: dict
     quality = _merge_class_quality(col, file, cname, _sect("quality"), bases.quality)
     annotate, examples_provided, schema_path, schema_inline = _merge_class_annotate(
         col, file, cname, _sect("annotate"), bases.annotate)
-    generate, tiers = _merge_class_generate(col, file, cname, _sect("generate"),
-                                            bases.generate)
+    generate, tiers, rules, windows = _merge_class_generate(
+        col, file, cname, _sect("generate"), bases.generate)
     return _MergedClass(
         quality=quality, annotate=annotate, generate=generate,
         verify=_merge_class_verify(col, file, cname, _sect("verify"), bases.verify),
@@ -239,6 +247,7 @@ def _merge_class_sections(col: _Collector, file: str, cname: str, sections: dict
                     if isinstance(sections.get("rubric"), dict) else None),
         examples_provided=examples_provided,
         schema_path=schema_path, schema_inline=schema_inline, tiers=tiers,
+        rules=rules, windows=windows,
     )
 
 
@@ -331,7 +340,9 @@ def _check_class_selection_group(col: _Collector, file: str, cname: str, q_over:
 
 def _merge_class_generate(col: _Collector, file: str, cname: str, g_over: dict,
                           base: GenerateConfig,
-                          ) -> tuple[GenerateConfig, tuple[TierSpec, ...] | None]:
+                          ) -> tuple[GenerateConfig, tuple[TierSpec, ...] | None,
+                                     tuple[SequenceRuleSpec, ...] | None,
+                                     tuple[SequenceWindowSpec, ...] | None]:
     """``[class.<name>.generate]`` 的合并(按键溯源)。
 
     v1.15(裁决·载体 ClassView 顶层字段): 第七键 ``tiers`` 与其余六键分道——它**不落**
@@ -343,7 +354,7 @@ def _merge_class_generate(col: _Collector, file: str, cname: str, g_over: dict,
     @param cname 序列类名
     @param g_over 该类的 generate 覆盖表
     @param base 全局生成基线
-    @return (合并后的 ``GenerateConfig``, 按类档位表 | None——None = 未声明即回落全局)
+    @return (合并后的生成配置, 按类档位表, 按类规则表, 按类窗口表)
     """
     t = _Tbl(col, file, f"[class.{cname}.generate]", g_over)
     merged = replace(
@@ -356,15 +367,22 @@ def _merge_class_generate(col: _Collector, file: str, cname: str, g_over: dict,
         sequences=t.get_int("sequences", base.sequences, minimum=0),
         len_range=_int_pair(t, "len_range", base.len_range),
     )
+    tiers = rules = windows = None
     if "tiers" in g_over:
         raw = t.take("tiers")
         parsed = _parse_tiers(col, file, raw, f"[[class.{cname}.generate.tiers]]")
         # 形状错误(键值非数组)已在解析层报出且修复动作明确(改写成数组表), 按未声明
         # 落库——不再叠报 rule 61 的空表/锚错(同一个键一条错误一个修复动作, 互斥推论)。
         tiers = parsed if isinstance(raw, list) else None
-    else:
-        tiers = None
-    return merged, tiers
+    if "rules" in g_over:
+        raw_rules = t.take("rules")
+        rules = _parse_sequence_rules(col, file, raw_rules,
+                                      f"[[class.{cname}.generate.rules]]")
+    if "windows" in g_over:
+        raw_windows = t.take("windows")
+        windows = _parse_sequence_windows(col, file, raw_windows,
+                                          f"[[class.{cname}.generate.windows]]")
+    return merged, tiers, rules, windows
 
 
 def _merge_class_verify(col: _Collector, file: str, cname: str, v_over: dict,
@@ -410,7 +428,7 @@ def _inherit_class(bases: _ClassBases) -> _MergedClass:
                         generate=bases.generate, verify=bases.verify,
                         extract=bases.extract, rubric_raw=None,
                         examples_provided=False, schema_path=None,
-                        schema_inline=None, tiers=None)
+                        schema_inline=None, tiers=None, rules=None, windows=None)
 
 
 def _class_sections(col: _Collector, file: str, cname: str, class_raw: Any) -> dict | None:
@@ -551,7 +569,8 @@ def _build_class_views(col: _Collector, classify: ClassifyConfig, class_raw: Any
         views[cname] = ClassView(name=cname, quality=merged.quality, rubric=rubric_c,
                                  annotate=merged.annotate, generate=merged.generate,
                                  verify=merged.verify, extract=merged.extract,
-                                 schema=schema_c, tiers=merged.tiers)
+                                 schema=schema_c, tiers=merged.tiers,
+                                 rules=merged.rules, windows=merged.windows)
     return views
 
 

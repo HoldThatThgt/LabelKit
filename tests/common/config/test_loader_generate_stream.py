@@ -13,16 +13,25 @@ v1.14 adds the tier table and the time-field binding cluster; v1.15
 [[class.<name>.generate.tiers]]: rule 61's three sub-clauses, the per-effective-
 table identity/composition checks, the per-class quota pairs and the union-scoped
 frame-class checks.
+
+v1.16 增加序列规则/窗口表、类型化 correlation、sequence_validator，以及全局/按类三态整表语义。
 """
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import pytest
 
 from labelkit.common.config import ResolvedConfig
-from labelkit.common.config.model import GenerateStreamConfig, TierSpec
-from labelkit.common.errors import ConfigError
+from labelkit.common.config.model import (
+    CorrelationSpec,
+    GenerateStreamConfig,
+    SequenceRuleSpec,
+    SequenceWindowSpec,
+    TierSpec,
+)
+from labelkit.common.errors import ConfigError, InternalError
 from tests.common.config.test_config import (  # noqa: F401 (env is a fixture)
     BASE_CONFIG,
     SCHEMA,
@@ -429,13 +438,31 @@ def test_frame_gap_structural_errors(env, value):
                 "hi] (0 < lo <= hi, seconds)")
 
 
-def test_frame_gap_upper_bound_below_session_gap(env):
+def test_frame_gap_upper_bound_is_strict_on_default_v15_path(env):
     generate = GS_GENERATE.replace("frame_gap_s = [5, 60]", "frame_gap_s = [5, 900]")
     errors = env.errors(project_text=gs_project(env, gs_body(generate=generate)))
-    has(errors, "[generate.stream].frame_gap_s: the upper bound must be < stream.gap_s (= 900")
+    has(errors, "[generate.stream].frame_gap_s: the upper bound must be < stream.gap_s")
+    generate = GS_GENERATE.replace("frame_gap_s = [5, 60]", "frame_gap_s = [5, 901]")
+    errors = env.errors(project_text=gs_project(env, gs_body(generate=generate)))
+    has(errors, "[generate.stream].frame_gap_s: the upper bound must be < stream.gap_s")
     generate = GS_GENERATE.replace("frame_gap_s = [5, 60]", "frame_gap_s = [5, 899]")
     cfg = env.load(project_text=gs_project(env, gs_body(generate=generate)))
     assert cfg.generate_stream.frame_gap_s == (5.0, 899.0)
+
+
+def test_frame_gap_upper_bound_at_session_gap_is_allowed_for_constrained_prefix(env):
+    generate = GS_GENERATE.replace("frame_gap_s = [5, 60]", "frame_gap_s = [5, 900]")
+    cfg = env.load(project_text=gs_project(env, sequence_tables_body(
+        generate=generate, rules=RULE_INIT)))
+    assert cfg.generate_stream.frame_gap_s == (5.0, 900.0)
+
+
+def test_sequence_validator_alone_keeps_default_frame_gap_boundary(env):
+    generate = GS_GENERATE.replace("frame_gap_s = [5, 60]", "frame_gap_s = [5, 900]")
+    generate = generate.replace("[generate]\nenabled = true", "[generate]\nenabled = true\n"
+                                'sequence_validator = "tests.hook_samples:sequence_ok"', 1)
+    errors = env.errors(project_text=gs_project(env, gs_body(generate=generate)))
+    has(errors, "[generate.stream].frame_gap_s: the upper bound must be < stream.gap_s")
 
 
 def test_frame_gap_defaults_when_absent(env):
@@ -678,12 +705,12 @@ def test_class_annotate_schema_keys_are_whitelisted(env):
 
 
 def test_class_generate_quota_keys_are_whitelisted(env):
-    # v1.15: 白名单第七键 tiers 入列（正例见按类档位表一节）
+    # v1.16: rules/windows 与 tiers 一并进入按类生成白名单
     errors = env.errors(project_text=env.project(
         body=CLASSIFY_TWO + "\n[class.qa.generate]\nsequence_count = 3\n"))
     has(errors, "[class.qa.generate].sequence_count: [class.*.generate] cannot override this "
                 "key (whitelist: instruction, styles, num_per_record, temperature, sequences, "
-                "len_range, tiers)")
+                "len_range, tiers, rules, windows)")
 
 
 def test_forbidden_generate_key_probe_skips_classes_without_a_generate_table(env):
@@ -852,6 +879,27 @@ def test_static_precheck_silent_with_room(env, capsys):
     err = capsys.readouterr().err
     assert "[generate.stream.plan]" not in err
     assert "[generate.stream.realize]" not in err
+
+
+def test_joint_realize_precheck_allows_bounded_halving_without_correlation(env):
+    """只有无 correlation 规则时，9000 上下文仍保留 realize 对半降级。"""
+    cfg = env.load(
+        config_text=_cw(9000),
+        project_text=gs_project(env, sequence_tables_body(rules=RULE_INIT)))
+    assert isinstance(cfg, ResolvedConfig)
+
+
+def test_joint_realize_precheck_reserves_the_sampled_brief_output_for_correlation(env):
+    """有 correlation 时，完整 sampled brief 输出必须计入不可拆 realize 预算。"""
+    correlation = ('correlation = {operator = "equal", source_field = "subject_id", '
+                   'target_field = "subject_id"}')
+    rules = RULE_RESPONSE.replace('target = "followup"',
+                                  'target = "followup"\n' + correlation)
+    constrained = env.errors(
+        config_text=_cw(9000),
+        project_text=gs_project(env, sequence_tables_body(
+            rules=rules, frames=structured_correlation_frames())))
+    has(constrained, "[generate.stream.realize]: static system-side prompt parts estimated")
 
 
 # ── V13③ annotate 段的按类取值修订（3.1.4 时间流生成末段「annotate 段口径修订」）─
@@ -1167,6 +1215,350 @@ def test_frame_gap_lower_bound_has_a_microsecond_floor(env):
     generate_ok = GS_GENERATE.replace("frame_gap_s = [5, 60]", "frame_gap_s = [0.000001, 60]")
     cfg = env.load(project_text=gs_project(env, gs_body(generate=generate_ok)))
     assert cfg.generate_stream.frame_gap_s == (1e-06, 60.0)
+
+
+def test_frame_gap_without_representable_microsecond_is_aggregated(env):
+    """不可表示的微秒闭区间必须在 M1 聚合为 CONFIG_ERROR。"""
+    generate = GS_GENERATE.replace("frame_gap_s = [5, 60]",
+                                   "frame_gap_s = [0.0000011, 0.0000012]")
+    errors = env.errors(project_text=gs_project(env, gs_body(generate=generate)))
+    has(errors, "[generate.stream].frame_gap_s: frame_gap_s has no representable "
+                "microsecond value")
+
+
+# ── v1.16 rules/windows 配置面 ─────────────────────────────────────────────
+
+RULE_INIT = """\
+[[generate.stream.rules]]
+template = "init"
+frame_class = "task_request"
+"""
+
+RULE_RESPONSE = """\
+[[generate.stream.rules]]
+template = "response"
+source = "task_request"
+target = "followup"
+"""
+
+WINDOW_REQUEST = """\
+[[generate.stream.windows]]
+frame_class = "task_request"
+of_day = [["08:00", "11:00"], ["14:00", "17:00"]]
+"""
+
+
+def sequence_tables_body(*, rules: str = "", windows: str = "", generate: str = GS_GENERATE,
+                         frames: str = GS_FRAMES) -> str:
+    """在基础时间流配置的 generate.stream 与按类表之间插入 v1.16 表。"""
+    marker = "\n[class.ticket_booking.generate]"
+    inserted = f"\n{rules}\n{windows}" if rules or windows else ""
+    assert marker in generate
+    return gs_body(generate=generate.replace(marker, inserted + marker, 1), frames=frames)
+
+
+def structured_correlation_frames(*, target_type: str = "string",
+                                  source_required: bool = True,
+                                  bind_subject: bool = False) -> str:
+    """构造 correlation 两侧结构化生成 Schema。"""
+    source_schema = {
+        "type": "object",
+        "properties": {"subject_id": {"type": "string"},
+                        "utterance": {"type": "string"}},
+        "required": ["subject_id", "utterance"],
+        "additionalProperties": False,
+    }
+    target_schema = {
+        "type": "object",
+        "properties": {"subject_id": {"type": target_type},
+                        "utterance": {"type": "string"}},
+        "required": (["subject_id", "utterance"] if source_required
+                      else ["utterance"]),
+        "additionalProperties": False,
+    }
+    source_text = json.dumps(source_schema, ensure_ascii=False)
+    target_text = json.dumps(target_schema, ensure_ascii=False)
+    frames = GS_FRAMES.replace(
+        'instruction = "生成一条发起购票任务的用户话语"',
+        'instruction = "生成一条发起购票任务的用户话语"\n'
+        f"schema_inline = '''\n{source_text}\n'''", 1)
+    frames = frames.replace(
+        'instruction = "生成一条补充信息的用户话语"',
+        'instruction = "生成一条补充信息的用户话语"\n'
+        f"schema_inline = '''\n{target_text}\n'''", 1)
+    if bind_subject:
+        frames += ('\n[frame.class.task_request.generate.time_fields]\n'
+                   'subject_id = "ts"\n')
+    return frames
+
+
+def test_sequence_rule_and_window_tables_parse(env):
+    cfg = env.load(project_text=gs_project(env, sequence_tables_body(
+        rules=RULE_INIT + RULE_RESPONSE, windows=WINDOW_REQUEST)))
+    assert cfg.generate_stream.rules == (
+        SequenceRuleSpec(template="init", frame_class="task_request"),
+        SequenceRuleSpec(template="response", source="task_request", target="followup"),
+    )
+    assert cfg.generate_stream.windows == (
+        SequenceWindowSpec(frame_class="task_request",
+                           of_day=(("08:00", "11:00"), ("14:00", "17:00"))),
+    )
+
+
+def test_sequence_rule_window_and_correlation_unknown_keys_warn(env, capsys):
+    rule = RULE_RESPONSE.replace(
+        'target = "followup"',
+        'target = "followup"\nfuture_rule_key = true\n'
+        'correlation = {operator = "equal", source_field = "subject_id", '
+        'target_field = "subject_id", future_predicate = "x"}')
+    windows = WINDOW_REQUEST.replace('of_day =', 'future_window_key = 1\nof_day =')
+    frames = structured_correlation_frames()
+    env.load(project_text=gs_project(env, sequence_tables_body(
+        rules=rule, windows=windows, frames=frames)))
+    err = capsys.readouterr().err
+    assert "future_rule_key: unknown key" in err
+    assert "correlation.future_predicate: unknown key" in err
+    assert "future_window_key: unknown key" in err
+
+
+def test_class_rules_and_windows_have_independent_three_state_tables(env):
+    generate = GS_GENERATE + "\nrules = []\nwindows = []\n"
+    cfg = env.load(project_text=gs_project(env, sequence_tables_body(
+        generate=generate, rules=RULE_INIT, windows=WINDOW_REQUEST)))
+    view = cfg.class_views["ticket_booking"]
+    assert view.rules == () and view.windows == ()
+    assert cfg.generate_stream.rules == (
+        SequenceRuleSpec(template="init", frame_class="task_request"),)
+    assert cfg.generate_stream.windows
+
+    class_rule = """\
+[[class.ticket_booking.generate.rules]]
+template = "response"
+source = "task_request"
+target = "followup"
+"""
+    generate = GS_GENERATE + class_rule + "\n"
+    cfg = env.load(project_text=gs_project(env, sequence_tables_body(
+        generate=generate, rules=RULE_INIT, windows=WINDOW_REQUEST)))
+    view = cfg.class_views["ticket_booking"]
+    assert view.rules == (SequenceRuleSpec(template="response", source="task_request",
+                                           target="followup"),)
+    assert view.windows is None
+
+
+def test_sequence_tables_and_validator_are_parked_when_form_is_off(env):
+    body = ("[generate]\nsequence_validator = \"tests.hook_samples:ok\"\n"
+            "\n[generate.stream]\nenabled = false\n\n" + RULE_INIT + WINDOW_REQUEST)
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[[generate.stream.rules]]: sequence rules are only legal")
+    has(errors, "[[generate.stream.windows]]: sequence windows are only legal")
+    has(errors, "[generate].sequence_validator: sequence_validator is only legal")
+
+
+def test_sequence_validator_reference_is_resolved_in_enabled_form(env):
+    body = sequence_tables_body(rules=RULE_INIT)
+    body = body.replace("[generate]\nenabled = true", "[generate]\nenabled = true\n"
+                        "sequence_validator = \"tests.hook_samples:sequence_ok\"", 1)
+    cfg = env.load(project_text=gs_project(env, body))
+    assert cfg.generate.sequence_validator == "tests.hook_samples:sequence_ok"
+
+    bad = body.replace("tests.hook_samples:sequence_ok", "tests.hook_samples:missing_fn")
+    errors = env.errors(project_text=gs_project(env, bad))
+    has(errors, "[generate].sequence_validator: attribute 'missing_fn' not found")
+
+
+@pytest.mark.parametrize(("hook", "expected"), [
+    ("tests.hook_samples:ok", "hook must accept exactly one positional"),
+    ("tests.hook_samples:sequence_bad_return", "dry-run returned an invalid value"),
+    ("tests.hook_samples:sequence_boom", "dry-run raised RuntimeError"),
+])
+def test_sequence_validator_signature_and_dry_run_are_checked_at_startup(env, hook, expected):
+    """M1 必须以代表性输入执行单参数钩子并规范化返回值。"""
+    body = sequence_tables_body(rules=RULE_INIT)
+    body = body.replace("[generate]\nenabled = true", "[generate]\nenabled = true\n"
+                        f"sequence_validator = \"{hook}\"", 1)
+    errors = env.errors(project_text=gs_project(env, body))
+    has(errors, f"[generate].sequence_validator: {expected}")
+
+
+def test_m1_reports_local_planner_infeasible_with_class_tier_and_length(env):
+    """M1 局部矩阵把不可行状态聚合为含定位信息的 CONFIG_ERROR。"""
+    impossible_rules = """\
+[[generate.stream.rules]]
+template = "init"
+frame_class = "task_request"
+
+[[generate.stream.rules]]
+template = "exactly"
+frame_class = "task_request"
+count = 2
+
+[[generate.stream.rules]]
+template = "end"
+frame_class = "followup"
+"""
+    tier = """\
+[[generate.stream.tiers]]
+tier_rank = 1
+weight = 1
+frame_classes = ["task_request", "followup"]
+"""
+    generate = GS_GENERATE.replace("len_range = [3, 5]", "len_range = [2, 2]")
+    generate = generate.replace("\n[class.ticket_booking.generate]", f"\n{tier}\n"
+                                "[class.ticket_booking.generate]", 1)
+    errors = env.errors(project_text=gs_project(env, sequence_tables_body(
+        generate=generate, rules=impossible_rules)))
+    text = "\n".join(errors)
+    has(errors, "[class.ticket_booking.generate].len_range: sequence planner found no "
+                "feasible potential")
+    has(errors, "tier_rank = 1")
+    has(errors, "length = 2")
+    has(errors, "INFEASIBLE")
+    assert "payload" not in text
+
+
+@pytest.mark.parametrize(
+    ("status_name", "required", "forbidden"),
+    [("UNKNOWN", "deterministic budget", ("infeasible", "no feasible", "unsatisfiable")),
+     ("INFEASIBLE", "no feasible", ("deterministic budget",))],
+)
+def test_m1_planner_status_wording_is_closed(monkeypatch, env, status_name, required, forbidden):
+    """M1 的 UNKNOWN 只表达预算未验证，INFEASIBLE 仍明确不可满足。"""
+    from labelkit.common.runtime import sequence_planner
+
+    status = sequence_planner.PlannerStatus[status_name]
+    monkeypatch.setattr(sequence_planner, "check_question", lambda _question: status)
+
+    def fail(*_args, **_kwargs):
+        raise sequence_planner.PlannerConfigError(status_name)
+
+    monkeypatch.setattr(sequence_planner, "select_feasible_plan", fail)
+    errors = env.errors(project_text=gs_project(
+        env, sequence_tables_body(rules=RULE_INIT)))
+    text = "\n".join(errors).lower()
+    assert required in text
+    for word in forbidden:
+        assert word not in text
+
+
+def test_m1_model_invalid_is_public_internal_error(monkeypatch, env):
+    """M1 的 MODEL_INVALID 必须只暴露公共 InternalError，且不带用户值。"""
+    from labelkit.common.runtime import sequence_planner
+
+    monkeypatch.setattr(sequence_planner, "_status_name",
+                        lambda *_args: sequence_planner.PlannerStatus.MODEL_INVALID)
+    with pytest.raises(InternalError) as caught:
+        env.load(project_text=gs_project(env, sequence_tables_body(rules=RULE_INIT)))
+    assert isinstance(caught.value, InternalError)
+    assert str(caught.value) == "CP-SAT returned MODEL_INVALID"
+    assert "payload" not in str(caught.value)
+
+
+@pytest.mark.parametrize(("rule", "expected"), [
+    ("template = \"missing\"\nframe_class = \"task_request\"",
+     "expected \"existence\""),
+    ("template = \"existence\"\nframe_class = \"task_request\"",
+     "count: required for template existence"),
+    ("template = \"response\"\nframe_class = \"task_request\"",
+     "source and target are required"),
+    ("template = \"response\"\nsource = \"task_request\"\n"
+     "target = \"followup\"\ncount = 1", "count: forbidden"),
+    ("template = \"response\"\nsource = \"task_request\"\n"
+     "target = \"task_request\"", "source and target must name different"),
+])
+def test_sequence_rule_template_parameter_matrix(env, rule, expected):
+    rules = f"[[generate.stream.rules]]\n{rule}\n"
+    errors = env.errors(project_text=gs_project(env, sequence_tables_body(rules=rules)))
+    has(errors, expected)
+
+
+def test_duplicate_sequence_rules_are_rejected(env):
+    rules = RULE_INIT + RULE_INIT
+    errors = env.errors(project_text=gs_project(env, sequence_tables_body(rules=rules)))
+    has(errors, "duplicate sequence rule declaration")
+
+
+def test_global_rule_error_is_not_repeated_for_inheriting_classes(env):
+    classify = GS_CLASSIFY + """
+[[classify.classes]]
+name = "smart_home"
+description = "智能家居序列"
+    """
+    bad_rule = RULE_RESPONSE.replace('source = "task_request"', 'source = "ghost"')
+    marker = "\n[class.ticket_booking.generate]"
+    generate = GS_GENERATE.replace(marker, f"\n{bad_rule}{marker}", 1)
+    body = gs_body(classify=classify, generate=generate)
+    errors = env.errors(project_text=gs_project(env, body))
+    assert sum("frame class \"ghost\" is not in [[frame.classify.classes]]" in e
+               for e in errors) == 1
+
+
+def test_rule_time_s_requires_exact_microseconds_and_half_open_range(env):
+    rule = RULE_RESPONSE.replace(
+        'target = "followup"', 'target = "followup"\ntime_s = [0.0000001, 1]')
+    errors = env.errors(project_text=gs_project(env, sequence_tables_body(rules=rule)))
+    has(errors, "time_s: expected number range array of length 2")
+    rule = RULE_RESPONSE.replace(
+        'target = "followup"', 'target = "followup"\ntime_s = [1, 1]')
+    errors = env.errors(project_text=gs_project(env, sequence_tables_body(rules=rule)))
+    has(errors, "time_s: expected non-empty half-open range")
+
+
+def test_sequence_window_validation_sorts_before_overlap_check(env):
+    windows = """\
+[[generate.stream.windows]]
+frame_class = "task_request"
+of_day = [["14:00", "17:00"], ["08:00", "11:00"]]
+"""
+    cfg = env.load(project_text=gs_project(env, sequence_tables_body(windows=windows)))
+    assert cfg.generate_stream.windows[0].of_day == (("14:00", "17:00"), ("08:00", "11:00"))
+
+    overlap = windows.replace('["08:00", "11:00"]', '["10:00", "15:00"]')
+    errors = env.errors(project_text=gs_project(env, sequence_tables_body(windows=overlap)))
+    has(errors, "branches must not overlap")
+
+
+def test_sequence_window_rejects_cross_midnight_duplicate_and_bad_weekday(env):
+    windows = """\
+[[generate.stream.windows]]
+frame_class = "task_request"
+of_day = [["22:00", "02:00"]]
+of_week = ["mon", "mon"]
+"""
+    errors = env.errors(project_text=gs_project(env, sequence_tables_body(windows=windows)))
+    has(errors, "window must satisfy start < end")
+    has(errors, "weekday values must be distinct")
+    bad_week = windows.replace('of_week = ["mon", "mon"]',
+                               'of_week = ["mon", "noday"]')
+    errors = env.errors(project_text=gs_project(env, sequence_tables_body(windows=bad_week)))
+    has(errors, "expected \"mon\" | \"tue\"")
+
+
+def test_correlation_requires_structured_required_same_type_and_unbound_fields(env):
+    correlation = ("correlation = {operator = \"equal\", source_field = \"subject_id\", "
+                   "target_field = \"subject_id\"}")
+    rules = RULE_RESPONSE.replace("target = \"followup\"",
+                                  "target = \"followup\"\n" + correlation)
+    frames = structured_correlation_frames()
+    cfg = env.load(project_text=gs_project(env, sequence_tables_body(rules=rules, frames=frames)))
+    assert cfg.generate_stream.rules[0].correlation == CorrelationSpec(
+        operator="equal", source_field="subject_id", target_field="subject_id")
+
+    mismatch = structured_correlation_frames(target_type="number")
+    errors = env.errors(project_text=gs_project(env, sequence_tables_body(
+        rules=rules, frames=mismatch)))
+    has(errors, "source_field and target_field must declare the same JSON Schema type")
+
+    missing_required = structured_correlation_frames(source_required=False)
+    errors = env.errors(project_text=gs_project(env, sequence_tables_body(
+        rules=rules, frames=missing_required)))
+    has(errors, "correlation.target_field")
+    has(errors, "must be listed in the required array")
+
+    bound = structured_correlation_frames(bind_subject=True)
+    errors = env.errors(project_text=gs_project(env, sequence_tables_body(
+        rules=rules, frames=bound)))
+    has(errors, "must not be a bound time_fields property")
 
 
 # ── v1.15 按类档位表（[[class.<name>.generate.tiers]]；SPEC-per-class-tiers §3.1）─
@@ -1521,3 +1913,22 @@ def test_time_fields_table_shape_errors(env):
     errors = env.errors(project_text=gs_project(env, gs_body(frames=frames)))
     has(errors, "[frame.class.task_request.generate.time_fields].duration: expected string "
                 "(a time vocabulary term), got 3")
+
+
+def test_full_planner_activation_uses_the_limited_quota_prefix():
+    """`--limit` 完全截掉约束类时不激活全流 planner。"""
+    from labelkit.common.config._generate_stream_constraints import (
+        _has_nonzero_constraints,
+    )
+
+    clear = SimpleNamespace(generate=SimpleNamespace(sequences=1), rules=(), windows=())
+    constrained = SimpleNamespace(
+        generate=SimpleNamespace(sequences=1),
+        rules=(SequenceRuleSpec(template="init", frame_class="task_request"),),
+        windows=(),
+    )
+    stream = SimpleNamespace(rules=(), windows=())
+    values = SimpleNamespace(class_views={"alpha": clear, "zeta": constrained}, limit=1)
+    assert not _has_nonzero_constraints(stream, values)
+    assert _has_nonzero_constraints(stream, SimpleNamespace(
+        class_views=values.class_views, limit=2))

@@ -30,16 +30,20 @@ import asyncio
 import copy
 import hashlib
 import json
+import logging
 import random
 from dataclasses import replace
 from datetime import datetime, timedelta
 from types import SimpleNamespace
+
+import pytest
 
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassSpec,
     ClassView,
     ClassifyConfig,
+    CorrelationSpec,
     ConsoleConfig,
     DedupConfig,
     ExtractConfig,
@@ -55,6 +59,8 @@ from labelkit.common.config.model import (
     Rubric,
     RunConfig,
     SegmentConfig,
+    SequenceRuleSpec,
+    SequenceWindowSpec,
     StitchConfig,
     StreamConfig,
     TierSpec,
@@ -63,8 +69,9 @@ from labelkit.common.config.model import (
     VerifyConfig,
     apportion_tiers,
 )
-from labelkit.common.errors import ContextOverflowError, SchemaViolation
+from labelkit.common.errors import ContextOverflowError, InternalError, SchemaViolation
 from labelkit.common.contracts.types import Usage
+from labelkit.common.runtime.sequence_planner import PlannerConfigError, PlannerInternalError
 from labelkit.operators.generate import (
     GenerateStage,
     NoiseCallPlan,
@@ -78,6 +85,7 @@ from labelkit.operators.generate import (
     plan_stream,
     predraw_llm_style,
     render_plan_prompt_texts,
+    render_realize_prompt_texts,
     stream_artifact_path,
     tier_rank_for_ordinal,
     weave_stream,
@@ -135,7 +143,9 @@ def mk_cfg(*, quotas: dict[str, int] | None = None, sessions: int = 2,
            llm_profiles=None, tiers: tuple[TierSpec, ...] = (),
            class_tiers: dict | None = None,
            frame_classes: tuple[str, ...] = FRAME_TABLE,
-           frame_schema=FRAME_SCHEMA, time_fields=None) -> ResolvedConfig:
+           frame_schema=FRAME_SCHEMA, time_fields=None,
+           rules: tuple[SequenceRuleSpec, ...] = (),
+           windows: tuple[SequenceWindowSpec, ...] = ()) -> ResolvedConfig:
     quotas = quotas if quotas is not None else {"booking": 2, "smalltalk": 1}
     base_generate = generate or GenerateConfig(enabled=True, num_per_call=2)
     # v1.15: class_tiers 逐类给 ClassView.tiers（缺席 = None = 回落全局 tiers）
@@ -177,7 +187,8 @@ def mk_cfg(*, quotas: dict[str, int] | None = None, sessions: int = 2,
             enabled=True, sessions=sessions, noise_ratio=noise_ratio,
             noise_instruction="生成噪音" if noise_ratio > 0 else "",
             duplicates=duplicates, frame_gap_s=(5.0, 60.0),
-            ts_start="2026-01-01T09:00:00+08:00", tiers=tiers),
+            ts_start="2026-01-01T09:00:00+08:00", tiers=tiers,
+            rules=rules, windows=windows),
     )
 
 
@@ -213,9 +224,13 @@ class StreamEngine:
             if self.plan_no in self.fail_plans:
                 raise SchemaViolation(["/steps: 枚举违规"], "{}")
             length = props["steps"]["minItems"]
-            names = props["steps"]["items"]["properties"]["frame_class"]["enum"]
-            steps = [{"frame_class": names[i % len(names)],
-                      "brief": f"step {self.plan_no}-{i}"} for i in range(length)]
+            item_props = props["steps"]["items"]["properties"]
+            if "frame_class" in item_props:
+                names = item_props["frame_class"]["enum"]
+                steps = [{"frame_class": names[i % len(names)],
+                          "brief": f"step {self.plan_no}-{i}"} for i in range(length)]
+            else:
+                steps = [{"brief": f"step {self.plan_no}-{i}"} for i in range(length)]
             return {"steps": steps}, Usage(1, 1), 1, "m"
         if "frames" in props:
             self.realize_no += 1
@@ -694,6 +709,7 @@ def test_sample_validator_scraps_whole_sequence(monkeypatch):
     product, _, metrics = run_stream(cfg)
     assert len(product.envelopes) == 1            # 首序列整条作废（拒绝采样语义）
     assert metrics.counters["generate.stream.validator_scrapped"] == 1
+    assert metrics.counters["generate.stream.sample_validator_scrapped"] == 1
     assert metrics.counters[
         "generate.buckets.booking×default×null.rejected_by_validator"] == 1
     assert generate_module is not None
@@ -1198,7 +1214,22 @@ def test_realize_faces_take_the_same_reduced_product_for_schema_and_contract():
     assert contracts[0] == json.dumps(schemas[0], ensure_ascii=False,
                                       separators=(", ", ": "))
     assert not [field for field in TIME_FIELDS if field in contracts[0]]
-    assert schemas[1] == {"type": "string"} and contracts[1] == "自由文本一段"
+    assert schemas[1] == {"type": "string"}
+    assert contracts[1] == "自由文本一段"
+
+
+def test_realize_prompt_requires_plain_frame_to_be_a_json_string():
+    """联合 realize prompt 明确禁止无 Schema 帧使用对象包装。"""
+    cfg = mk_timed_cfg(quotas={"booking": 1}, sessions=1)
+    steps = [("task_request", "请求要点"), ("followup", "补充要点")]
+    stage = GenerateStage(cfg)
+    _, contracts = stage._realize_step_faces(steps, constrained=True)
+    system, user = render_realize_prompt_texts(
+        "生成booking", None, steps, contracts, "none")
+    expected = '生成followup\n内容契约：JSON 字符串（如 "..."），不得用对象包裹'
+    assert contracts[1] == expected
+    assert f"第 2 帧（followup）须符合：{expected}" in system
+    assert user.endswith("请实现全部 2 帧内容。")
 
 
 def test_dispatched_realize_schema_carries_no_bound_field():
@@ -1522,3 +1553,247 @@ def test_hooks_and_the_similarity_filter_see_pre_backfill_payloads(monkeypatch):
                 if [field for field in TIME_FIELDS if field in text]]
     # 对照面：同一批载荷回填之后才带绑定字段
     assert [line for line in product.artifact_lines if '"duration"' in line]
+
+
+# ── v1.16 联合 planner、sampled brief 与序列验证─────────────────────
+
+JOINT_RULES = (
+    SequenceRuleSpec(template="init", frame_class="task_request"),
+    SequenceRuleSpec(template="exactly", frame_class="task_request", count=1),
+    SequenceRuleSpec(template="chain_response", source="task_request",
+                     target="followup", time_s=(10.0, 100.0)),
+    SequenceRuleSpec(template="exactly", frame_class="followup", count=1),
+    SequenceRuleSpec(template="end", frame_class="followup"),
+)
+
+
+def test_joint_path_freezes_word_prompts_noise_and_duplicate_before_calls():
+    """联合路径从 sampled brief 到 artifact 完整贯通且不回退到旧编织器。"""
+    cfg = mk_cfg(
+        quotas={"booking": 1}, sessions=1, len_range=(2, 2),
+        noise_ratio=0.5, duplicates=1, rules=JOINT_RULES,
+    )
+    product, engine, metrics = run_stream(cfg)
+    assert len(product.envelopes) == 1
+    assert metrics.counters["generate.stream.noise_frames"] == 1
+    assert metrics.counters["generate.stream.duplicates"] == 1
+    rows = parse_lines(product)
+    primary = [row for row in rows if not row["truth"]["noise"]
+               and "duplicate_of" not in row["truth"]]
+    duplicate = [row for row in rows if "duplicate_of" in row["truth"]]
+    assert [row["truth"]["frame_class"] for row in primary] == [
+        "task_request", "followup"]
+    delta = (datetime.fromisoformat(primary[1]["ts"])
+             - datetime.fromisoformat(primary[0]["ts"])).total_seconds()
+    assert 10 <= delta < 100
+    assert [row["text"] for row in duplicate] == [row["text"] for row in primary]
+    assert datetime.fromisoformat(duplicate[0]["ts"]) > datetime.fromisoformat(rows[-3]["ts"])
+    brief_call = next(call for call in engine.calls
+                      if "steps" in call[2]["properties"])
+    realize_call = next(call for call in engine.calls
+                        if "frames" in call[2]["properties"])
+    item_props = brief_call[2]["properties"]["steps"]["items"]["properties"]
+    assert set(item_props) == {"brief"}
+    brief_system = brief_call[1].messages[0].parts[0].text
+    realize_system = realize_call[1].messages[0].parts[0].text
+    assert "[固定帧类词]" in brief_system and "time_s=[10.0, 100.0)" in brief_system
+    assert "time_s=[10.0, 100.0)" in realize_system
+    assert "生成task_request" in realize_system and "生成followup" in realize_system
+
+
+def test_m6_maps_planner_config_error_without_payload(monkeypatch, caplog):
+    """M1 已通过后 planner 配置异常按内部错误映射且不泄露详情。"""
+    import labelkit.common.runtime.sequence_planner as planner
+
+    def fail(*_args, **_kwargs):
+        raise PlannerConfigError("payload must not reach the M6 boundary")
+
+    monkeypatch.setattr(planner, "select_feasible_plan", fail)
+    with caplog.at_level(logging.ERROR, logger="labelkit.generate"):
+        with pytest.raises(InternalError) as caught:
+            plan_stream(mk_cfg(quotas={"booking": 1}, sessions=1,
+                               len_range=(2, 2), rules=JOINT_RULES),
+                        random.Random("planner-config"))
+    assert "payload must not reach" not in str(caught.value)
+    assert "payload must not reach" not in caplog.text
+    assert "time-stream planner" in caplog.text
+
+
+def test_m6_maps_planner_internal_error_without_payload(monkeypatch, caplog):
+    """M6 将 planner 内部异常映射为 common InternalError 且不泄露详情。"""
+    import labelkit.common.runtime.sequence_planner as planner
+
+    def fail(*_args, **_kwargs):
+        raise PlannerInternalError("payload must not reach the M6 boundary")
+
+    monkeypatch.setattr(planner, "select_feasible_plan", fail)
+    with caplog.at_level(logging.ERROR, logger="labelkit.generate"):
+        with pytest.raises(InternalError) as caught:
+            plan_stream(mk_cfg(quotas={"booking": 1}, sessions=1,
+                               len_range=(2, 2), rules=JOINT_RULES),
+                        random.Random("planner-internal"))
+    assert "payload must not reach" not in str(caught.value)
+    assert "payload must not reach" not in caplog.text
+    assert "time-stream planner failed an internal invariant at M6 boundary" in caplog.text
+
+
+def test_sequence_validator_runs_without_rules_or_windows(monkeypatch):
+    """sequence_validator 独立生效，不得被 planner 开关误伤。"""
+    seen = []
+
+    def hook(value):
+        seen.append(value)
+        value.frames[0].payload["mutated"] = True
+        return ["reject sequence"]
+
+    monkeypatch.setattr("labelkit.common.extensions.hooks.resolve_hook",
+                        lambda _ref: hook)
+    generate = GenerateConfig(enabled=True, num_per_call=2,
+                              sequence_validator="mod:sequence")
+    cfg = mk_cfg(quotas={"booking": 1}, sessions=1, len_range=(2, 2),
+                 generate=generate)
+    product, engine, metrics = run_stream(cfg)
+    assert product.envelopes == [] and product.artifact_lines == []
+    assert seen and [frame.position for frame in seen[0].frames] == [0, 1]
+    assert metrics.counters["generate.stream.sequence_validator_scrapped"] == 1
+    assert metrics.counters["generate.stream.validator_scrapped"] == 1
+    plan_schema = next(call[2] for call in engine.calls
+                       if "steps" in call[2]["properties"])
+    assert "frame_class" in plan_schema["properties"]["steps"]["items"]["properties"]
+
+
+def test_sequence_validator_exception_log_is_value_free(monkeypatch, caplog):
+    """序列 hook 异常只记录类型，异常文本、payload 与 prompt 均不得进入日志。"""
+    payload_marker = "PAYLOAD_SECRET_7f2c"
+    prompt_marker = "PROMPT_SECRET_91ab"
+
+    def hook(_value):
+        raise RuntimeError(f"{payload_marker} {prompt_marker}")
+
+    monkeypatch.setattr("labelkit.common.extensions.hooks.resolve_hook",
+                        lambda _ref: hook)
+    generate = GenerateConfig(enabled=True, num_per_call=2,
+                              sequence_validator="mod:sequence")
+    cfg = mk_cfg(quotas={"booking": 1}, sessions=1, len_range=(2, 2),
+                 generate=generate)
+    with caplog.at_level(logging.WARNING, logger="labelkit.generate"):
+        product, _, _ = run_stream(cfg)
+    assert product.envelopes == []
+    assert payload_marker not in caplog.text
+    assert prompt_marker not in caplog.text
+    assert "type=RuntimeError" in caplog.text
+
+
+@pytest.mark.parametrize("first_failure", (
+    "none", "sample_validator", "correlation", "temporal", "sequence_validator",
+))
+def test_stream_validation_gates_stop_at_first_failure_and_preserve_order(
+        monkeypatch, first_failure):
+    """逐门观察 realize、样本、correlation、time、sequence hook 与相似度顺序。"""
+    import labelkit.common.runtime.declare as declare
+    import labelkit.operators.generate as generate_module
+
+    events: list[str] = []
+    sample_ref = "sample:validator"
+    sequence_ref = "sequence:validator"
+
+    def sample_hook(_text):
+        events.append("sample_validator")
+        return ["sample failure"] if first_failure == "sample_validator" else []
+
+    def sequence_hook(_value):
+        events.append("sequence_validator")
+        return ["sequence failure"] if first_failure == "sequence_validator" else []
+
+    def resolve(ref):
+        return sample_hook if ref == sample_ref else sequence_hook
+
+    monkeypatch.setattr("labelkit.common.extensions.hooks.resolve_hook", resolve)
+    equal = declare.canonical_equal
+    time_match = declare._time_match
+
+    def observe_equal(left, right):
+        events.append("correlation")
+        return False if first_failure == "correlation" else equal(left, right)
+
+    def observe_time(rule, pair, timestamps):
+        if timestamps is not None:
+            events.append("temporal")
+        return False if first_failure == "temporal" else time_match(rule, pair, timestamps)
+
+    monkeypatch.setattr(declare, "canonical_equal", observe_equal)
+    monkeypatch.setattr(declare, "_time_match", observe_time)
+    probe_and_add = generate_module.SimilarityFilter.probe_and_add
+
+    def observe_similarity(self, text):
+        del text
+        events.append("similarity")
+        return probe_and_add(self, "unique sequence probe")
+
+    monkeypatch.setattr(generate_module.SimilarityFilter, "probe_and_add", observe_similarity)
+    engine = StreamEngine()
+    complete = engine.complete_validated
+
+    async def observe_realize(profile, prompt, schema=None, *, scope):
+        if schema is not None and "frames" in schema["properties"]:
+            events.append("realize_schema")
+        return await complete(profile, prompt, schema=schema, scope=scope)
+
+    monkeypatch.setattr(engine, "complete_validated", observe_realize)
+    correlation = CorrelationSpec(operator="equal", source_field="id", target_field="id")
+    rules = (
+        SequenceRuleSpec(template="init", frame_class="task_request"),
+        SequenceRuleSpec(template="exactly", frame_class="task_request", count=1),
+        SequenceRuleSpec(template="exactly", frame_class="followup", count=1),
+        SequenceRuleSpec(template="chain_response", source="task_request",
+                         target="followup", time_s=(5.0, 10.0),
+                         correlation=correlation),
+    )
+    generate = GenerateConfig(enabled=True, num_per_call=2,
+                              sample_validator=sample_ref,
+                              sequence_validator=sequence_ref)
+    cfg = mk_cfg(quotas={"booking": 1}, sessions=1, len_range=(2, 2),
+                 generate=generate, rules=rules)
+    run_stream(cfg, engine=engine)
+    expected = ["realize_schema"]
+    if first_failure == "sample_validator":
+        expected.append("sample_validator")
+    else:
+        expected.extend(("sample_validator", "sample_validator"))
+        if first_failure == "correlation":
+            expected.append("correlation")
+        else:
+            expected.append("correlation")
+            if first_failure == "temporal":
+                expected.append("temporal")
+            else:
+                expected.append("temporal")
+                expected.append("sequence_validator")
+                if first_failure == "none":
+                    expected.append("similarity")
+    assert events == expected
+
+
+def test_rule_failure_counters_distinguish_correlation_and_time():
+    """M6 把 C0→Ce→Ct 的首错精确分流到两个条件计数器。"""
+    correlation = CorrelationSpec(
+        operator="equal", source_field="id", target_field="id")
+    rule = SequenceRuleSpec(
+        template="chain_response", source="task_request", target="followup",
+        time_s=(10.0, 20.0), correlation=correlation)
+    cfg = mk_cfg(quotas={"booking": 1}, sessions=1, len_range=(2, 2),
+                 rules=(rule,))
+    stage = GenerateStage(cfg)
+    plan = SequencePlan(
+        index=0, class_name="booking", ordinal=0, length=2, llm="default",
+        style_name=None, style_prompt=None,
+        frame_classes=("task_request", "followup"),
+        timestamps_us=(0, 15_000_000),
+    )
+    context = SimpleNamespace(metrics=Metrics(), batch_no=0)
+    assert not stage._stream_rules_valid(plan, ({"id": "a"}, {"id": "b"}), context)
+    assert context.metrics.counters["generate.stream.correlation_scrapped"] == 1
+    context = SimpleNamespace(metrics=Metrics(), batch_no=0)
+    late = replace(plan, timestamps_us=(0, 25_000_000))
+    assert not stage._stream_rules_valid(late, ({"id": "a"}, {"id": "a"}), context)
+    assert context.metrics.counters["generate.stream.temporal_scrapped"] == 1

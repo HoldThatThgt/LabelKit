@@ -66,6 +66,16 @@ command <cmd> failed: <message> (exit <n>)       # 未预期异常
 
 **v1.15 零增量声明（按类档位表）**：按类化对本目录同样**零改动**——**零新通道**（通道枚举维持 11 值）、**零新事件**（不新增事件名，既有事件的 payload 亦不增键：档位面的全部观测仍只经 `report.generate.stream.tiers` 承载，v1.15 改的是该子块的形状与其计数器键名，两者都不进事件目录）、**零新错误 kind**（7.6 词表不动）。M1 侧新增的按类表前提三子款（形态门 / 全局锚 / 空表拒收）走既有 CONFIG_ERROR 面，逐生效表化后的两条既有 WARN（配分零额、帧类未入档）走既有配置告警面（3.1.5），值-free 纪律不变——序列类名与帧类名同为配置量而非数据内容。
 
+**v1.16 零增量声明（序列规则与联合规划）**：本目录继续维持既有通道枚举、事件名与
+`StageError.kind` 闭集。CP-SAT planner 只使用值无关的英文 stderr WARN/ERROR，M1 的
+`INFEASIBLE` / `UNKNOWN` 属于配置错误聚合而不是 trace 事件；`MODEL_INVALID` 与通过
+M1 后发现的 planner 不变量破坏复用 `internal_error` 退出面。noise 目标未完全放置只发
+一次值无关 WARN。sequence-validator 异常日志只含 hook 引用与异常类型，违规日志只含
+序列索引、类名和违规数；declarative 作废日志只含序列索引与类名。任何 planner witness、
+时间表、correlation 值、规则文本、窗口文本、hook message、payload、prompt 和 API key
+都不得进入 stderr、trace、report 或 artifact。所有生成调用仍经既有 `llm.call` 事件可见，
+不建立 generate 专属通道。
+
 † `reason` 仅当 `quality.judgment_reasons` 生效时存在（5.2）；`classify.decision` 的 `reason` 条件独立（v1.7）= `trace.enabled = true` 且 `trace.channels` 含 `"classify"`（零额外 token 原则，3.13.4 调用与校验行）；`segment.boundary` 的 `reason` 条件同款（v1.8）= `trace.enabled = true` 且 `trace.channels` 含 `"segment"`（对应窗口内部 Schema 的 with_reason 参数，零额外 token，3.14）。¶ `stitch.judge` / `stitch.thread` 的 `task_name` 与 `reason`（v1.9）无请求条件——`stitch_schema()` 恒含两键（判定量级小、votes 聚合需按多数簇取值，3.16.3），但作为 LLM 自由文本受 7.4 分级：`none` 档剥除、`refs` 档起携带（`task_name` 为 v1.9 新增自由文本键，7.4）。‡ / § 为 `extract.step` 的内容分档标记（v1.8，S27）：`description` 自 `"refs"` 档起、`target` / `value` 自 `"excerpt"` 档起携带（7.4）。全部自由文本字段（reason / critiques / violations 文本）受 7.4 脱敏档位控制。密钥相关事件（v1.6）只携环境变量**名**——密钥值在任何档位、任何通道均不落日志（7.4 规则不变）。
 
 ## 7.3 记录格式规范

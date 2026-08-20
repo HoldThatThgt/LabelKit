@@ -44,7 +44,12 @@
 | 33 | v1.13 集成首例在真端点约 8 跑中偶发红一次 | 锐边记录（同第 6、26 条根因家族） | ⏸ 不改测试（处置理由见条目） |
 | 34 | v1.15 计数器键按类重冻结把 v1.14 集成第四例留成陈旧断言 | 测试适配（非偏差） | ✅ 已适配（2026-08-19） |
 | 35 | v1.15 验收当日 DeepSeek 端帧实现违约率抬头：6 跑中 5 跑各作废 1 条 | 实测记录（同第 26、33 条根因家族） | ⏸ 数据侧缓解（按设计处置） |
-| 36 | z.ai 账号周/月额度耗尽 ⇒ 两例 L0 透传钉板暂时无法执行 | 环境记录（非代码问题） | ⏸ 待额度重置后复跑 |
+| 36 | z.ai 账号周/月额度耗尽 ⇒ 两例 L0 透传钉板暂时无法执行 | 环境记录（非代码问题） | ✅ 已闭合（2026-08-20） |
+| 37 | v1.16 最小规则集 DeepSeek 单例通过 | 实测记录 | ✅ 已确认（1 passed，5.82s） |
+| 38 | v1.16 synth-stream 首跑：thinking 默认开启与 4096 输出预算导致全量作废 | 实测记录 | ⛔ failed-closed 诊断 |
+| 39 | v1.16 synth-stream 显式关闭 thinking 后的自由文本帧类型违约 | 实测记录 | ⛔ failed-closed 诊断 |
+| 40 | v1.16 synth-stream 规则生成成功验收 | 实测记录 | ✅ 已确认（2026-08-20） |
+| 41 | v1.16 synth-stream 正式 process replay 成功验收 | 实测记录 | ✅ 已确认（2026-08-20） |
 
 ## P1 — 实现与规格的偏差
 
@@ -329,11 +334,14 @@ inode**，先启动进程 rename 交付的「主输出」实为后进程内容�
 
 ### 22. DeepSeek anthropic 路由响应默认携带 thinking 内容块 —— 📌 已记录（M9 天然兼容，2026-08-12）
 
-**现象**：`https://api.deepseek.com/anthropic` + `deepseek-v4-flash` 的文本调用响应 `content` 数组默认携带 `type=="thinking"` 内容块（模型默认开思考，无请求侧关闭开关），`type=="text"` 块随后。两次真实探针一致；温度 0 可用、usage 在场。
+**现象**：`https://api.deepseek.com/anthropic` + `deepseek-v4-flash` 的文本调用响应 `content` 数组默认携带 `type=="thinking"` 内容块（当时请求未显式携带关闭字段，默认开启），`type=="text"` 块随后。两次真实探针一致；温度 0 可用、usage 在场。
 
-**后果**：零适配成本——M9 anthropic 解析器只收集 `type=="text"` 块拼接文本（`llm_client.py` 的响应解析循环，约 :451-456），thinking 块天然跳过，JSON 干净落在 text 块、确定性修复层无感。但该兼容性是**解析器按块类型过滤**这一实现选择的副产品：若未来改为「拼接全部内容块」，thinking 文本会污染确定性修复层解析面——记录在案防回归。
+**当日解析观测**：M9 anthropic 解析器只收集 `type=="text"` 块拼接文本（`llm_client.py` 的响应解析循环，约 :451-456），thinking 块天然跳过，JSON 干净落在 text 块、确定性修复层无感。但该兼容性是**解析器按块类型过滤**这一实现选择的副产品：若未来改为「拼接全部内容块」，thinking 文本会污染确定性修复层解析面——记录在案防回归。
 
 **处置**：`examples/mix/config.toml` 以该端点为默认 profile，文件头注记录本结论；无代码改动面。
+
+**v1.16 更新（见 §38–§40）**：profile 现在可显式设置 `thinking = "disabled"`。解析器继续按块类型跳过
+`thinking`、只收集 `text`，这是兼容已有响应形状的解析措施，不是关闭 thinking，也不是输出预算或截断问题的解决方案。
 
 ### 23. 该路由不支持图像内容块 —— ✅ 已适配（examples/mix 双 profile 混合接入，2026-08-12 需求方修订后更新）
 
@@ -488,13 +496,92 @@ inode**，先启动进程 rename 交付的「主输出」实为后进程内容�
 | 工件重放（process + segment） | exit 0 | 29 帧 → 6 会话 → 6 episodes、`absorbed 27`、`dropped_noise 2`、`dropped_dup 1`（本跑落 `exact`；**档位随分段判决浮动，两分支皆可能**，第 27、32 条）、`emitted 5`、`failed 0`、11 次调用 / 37.7 秒；23 个成员 id 与生成侧**逐个相同**，4/5 幸存 episode 的 id 与生成侧序列 id 恰等（对不上的那条是交叉会话整会话成段，其 id 恰等于生成侧的 `session_id`） |
 | dry-run golden | 八个**字节不动** | 按类档位零调用数变化 ⇒ `estimate_run` 零改动；示例扩展后 `dryrun-synth-stream.txt` 经 `cmp` 逐字节相等（`generate_calls=13`、`classify_calls=0`、`total=49`） |
 
-### 测试留痕（v1.14）
+## 追加条目：v1.16 规则规划与 DeepSeek 诊断（2026-08-20）
+
+### 37. 最小规则集的真实 DeepSeek 集成单例通过 —— ✅ 已确认
+
+为隔离规则规划器、类型敏感关联和半开时间约束，先运行单个真实 DeepSeek 用例，不依赖
+完整示例的五类帧和下游质量/标注调用。用例声明固定两帧 request → acknowledgement，
+`time_s = [1200, 2400)`、工作日窗口和 `subject_id` typed equal，并核对 planner 计数、
+artifact 和验证结果。
+
+实测结果：`tests/integration/test_generate_stream_llm.py` 该单例 **`1 passed in 5.82s`**。
+这是 v1.16 规则路径的最小 live pass；它不等价于完整 `examples/synth-stream` 验收。
+
+### 38. 完整示例首跑未关闭 thinking 且输出预算为 4096 —— ⛔ failed-closed 诊断
+
+第一次运行完整 `examples/synth-stream` 时，请求没有显式关闭 thinking，示例 profile 的
+`max_output_tokens` 仍为 4096。进程退出码为 0，但六条 attempt 全部作废：四条在 brief
+阶段因 `output_truncated` 作废，两条在 realize 阶段因 `schema_violation` 作废。
+
+报告与用量证据为：`generated = 0`、`emitted = 0`、artifact 行数为 0；`plan_calls = 6`、
+`realize_calls = 2`、`noise_calls = 1`，物理 LLM 请求 13 次；input tokens 6095、output
+tokens 24617，`wall_s = 92.817`。这次运行只证明失败闭环和计数语义，不能作为功能验收。
+
+处置是修改示例 profile 为显式 `thinking = "disabled"`，并把结构结果预算调到 8192。
+增加预算本身不是关闭 thinking 的替代方案；后续运行必须同时保留两个设置。
+
+### 39. 显式关闭 thinking 后自由文本帧仍被输出成 object —— ⛔ failed-closed 诊断
+
+第二次完整示例运行已经显式携带 `thinking = "disabled"`，并使用 `max_output_tokens =
+8192`。输出截断不再是主故障，但六条 realize 全部因为自由文本帧被模型输出成 object 而
+作废。trace `limit = 1` 显示 Schema repair 已执行两轮，仍未把类型修正为字符串；最终
+仍是 0 条主输出、0 条 artifact。
+
+这次结果把问题边界收窄为 DeepSeek L0-off 路径上的逐位自由文本类型服从性，而不是
+thinking 预算耗尽。它仍是 failed-closed 诊断，不是「关闭 thinking 后全量 E2E 已通过」的
+证据。需要在不改变规则契约、不增加 fallback 或 deferred 实现的前提下完成后续修复与
+重新验证。
+
+### 测试留痕（v1.16 当前阶段）
+
+| 套件 | 结果 | 结论 |
+|---|---|---|
+| v1.16 最小真实 DeepSeek 集成单例 | `1 passed in 5.82s` | 规则 planner、typed correlation、半开 time_s 的最小 live pass |
+| `examples/synth-stream` 首跑 | exit 0，但 0 输出 | failed-closed：thinking 未显式关闭，4096 造成 4 次 truncation + 2 次 realize schema violation |
+| `examples/synth-stream` 显式 disabled + 8192 | exit 0，但 0 输出 | failed-closed：6 次 realize 自由文本位输出 object，repair 两轮仍未修复 |
+
+当前不能从这三项证据推出完整示例成功，也不能把进程 exit 0 当作业务产物验收通过。
+
+### 40. v1.16 synth-stream 规则生成最终真实验收通过 —— ✅ 已确认（2026-08-20）
+
+在显式 `thinking = "disabled"`、`max_output_tokens = 8192` 的当前配置下重新运行完整
+示例，进程 exit 0。主链报告为 `counts.generated = 6`、`emitted = 5`、
+`dropped_verify = 1`、`failed = 0`；计划配额为 6，其中
+`ticket_booking = {planned: 3, produced: 3}`、`smart_home = {planned: 3, produced: 3}`。
+
+按类档位报告为：`ticket_booking` 的 rank 1 为 `1/1`、rank 2 为 `2/2`；
+`smart_home` 的 rank 1 为 `2/2`、rank 2 为 `1/1`。时间流统计为
+`sessions = 5`、`crossed_sessions = 1`、`frames = 27`、`noise_frames = 3`、
+`duplicates = 1`、`calendar_days_spanned = 8`。
+
+规划与内容计数为：`plan_calls = 6`、`realize_calls = 6`、`noise_calls = 1`；
+规则计数为 `rules.sampled = 6`、`correlation_scrapped = 0`、
+`temporal_scrapped = 0`、`sequence_validator_scrapped = 0`。工件为 34 行，
+`sha256:927e469e16df3f007f057357a267b8f8228506a5dfb279dc83bdfa1f1da672bf`。
+
+LLM 用量为 `calls = 53`、`prompt_tokens = 12173`、`completion_tokens = 4487`、
+`retries = 0`，`timing.wall_s = 35.214`。这次结果保留了 planner 规划的真实 crossing，
+不是此前作废投影后 `crossed_sessions = 0` 的历史运行。
+
+### 41. v1.16 正式 process replay 最终真实验收通过 —— ✅ 已确认（2026-08-20）
+
+使用正式 `project-replay.toml` 重放上述 34 行工件，进程 exit 0。输入侧
+`scanned = ingested = 34`，分段结果为 `episodes = 6`、`absorbed = 31`、
+`dropped_noise = 3`；流尾 duplicate 命中为 `dropped_dup = 1`，主链为
+`emitted = 5`、`failed = 0`。
+
+重放观测为 `sessions = 6`、`mean_episode_len = 5.17`、`windows = 7`。LLM 用量为
+`calls = 12`、`prompt_tokens = 4542`、`completion_tokens = 721`、`retries = 0`，
+`timing.wall_s = 5.475`。这次结果验证了正式 process 配置可以消费最终生成工件，并在
+流尾重发 session 上命中 episode-level dedup。
+
+### 测试留痕（v1.16 最终验收）
 
 | 套件 | 数量 | 备注 |
 |---|---|---|
-| 离线套件 | 1980 passed | v1.13 基线 1884；新增覆盖分布在 `test_loader_generate_stream.py`（M1 约束两簇逐条正反例）、`test_generate_stream.py`（映射与 `--limit` 交换律、蓝图渲染、缩减 Schema 派生、回填算术、truth 键序与条件在场、双关字节等价）、`test_config.py`（`tiers`/`time_fields` 默认值）、`test_schema_engine.py`（`cover_all` 形态与 `ALLOWED_KEYWORDS` 扩三词、`contains` 渲染分支）、`test_orchestrator.py`（`tiers` 形状/键序/零额在场/缺省不在场四向）、`tests/common/config/`（`apportion_tiers` 整数配分性质，随函数落点归属） |
-| 集成套件（真端点） | 6 passed | v1.13 三例 + v1.14 三例：DeepSeek 档位一例（逐行 `members[]` 帧类集合 ≡ 档声明构成、`tiers` 计数落账）、DeepSeek 时间字段一例（解析工件断言 `duration` = 序内相邻成员 ts 差，重发行除外）、z.ai glm-5.2 `cover_all` L0 透传一例（第 31 条）。偶发红锐边见第 33 条 |
-| `examples/synth-stream` 真跑 | exit 0 | `counts.generated = emitted = 6`、`failed`/`dropped_*` 全 0；`generate.stream = {sessions 5, crossed_sessions 1, 两类各 planned 3/produced 3, tiers {"1": 4/4, "2": 2/2}, frames 23, noise_frames 2, duplicates 1, plan_calls 6, realize_calls 6, noise_calls 1, 三项 failures 0}`；`run.artifact.lines = 29`、`llm_usage.default.calls = 51`；构成恰等逐行对账通过、`duration` = 序内相邻 ts 差逐帧对账通过、重发行载荷与源行字节一致 |
-| 保留运行 `out-run1/` | exit 0 | 尝试配额语义的真实样本：2 条序列在帧实现作废（`realize_failures = 2`）⇒ `tiers {"1": 4/3, "2": 2/1}`、`crossed_sessions 0`、工件 23 行（第 30 条） |
-| 工件重放（process + segment） | exit 0 | 29 帧 → 6 会话 → 6 episodes、`absorbed 27`、`dropped_noise 2`、`dropped_dup 1`（**`exact`**，第 32 条）、`emitted 5`、`failed 0` |
-| dry-run golden | 八个**字节不动** | 两机制零调用数变化 ⇒ `estimate_run` 零改动，含示例扩展后的 `dryrun-synth-stream.txt`（`generate_calls=13`、`classify_calls=0`、`total=49`） |
+| 离线套件 | 2128 passed，49 deselected | 最终离线门；规则规划、时间窗口、按类档位、生成与 replay 相关用例均在本轮通过 |
+| 集成套件（真端点） | 8 passed | 最终 DeepSeek 规则生成、既有时间流/档位/按类档位和 z.ai 结构化输出钉板均通过 |
+| `examples/synth-stream` 最终真跑 | exit 0 | 生成 6、emitted 5、`dropped_verify = 1`、failed 0；sessions 5、crossed_sessions 1、frames 27、noise 3、duplicates 1；工件 34 行，SHA-256 为 `927e469e16df3f007f057357a267b8f8228506a5dfb279dc83bdfa1f1da672bf` |
+| 工件重放（process + segment） | exit 0 | 34 帧 → 6 会话、6 episodes、`absorbed = 31`、`dropped_noise = 3`、`dropped_dup = 1`、`emitted = 5`、`failed = 0`；`mean_episode_len = 5.17`、`windows = 7`、12 次调用 / 5.475 秒 |
+| dry-run golden | 八个**字节不动** | 规则面不改变既有 golden 字节；live 用量以本次 report 为准 |

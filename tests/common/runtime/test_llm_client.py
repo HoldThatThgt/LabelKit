@@ -198,6 +198,8 @@ def test_anthropic_body_text_and_image_exact(png_image: ImageRef):
     ))
     b64 = base64.b64encode(png_image.path.read_bytes()).decode("ascii")
     body = _build_anthropic_body(prof, prompt, response_schema=SCHEMA)
+    assert prof.thinking is None
+    assert "thinking" not in body
     assert body == {
         "model": "test-model",
         "max_tokens": 4096,
@@ -234,6 +236,15 @@ def test_anthropic_temperature_defaults_to_profile():
     assert _build_anthropic_body(prof, prompt2, None)["temperature"] == 0.9
 
 
+@pytest.mark.parametrize("thinking", ["enabled", "disabled"])
+def test_anthropic_thinking_is_explicit_top_level_field(thinking):
+    prof = _llm_profile(provider="anthropic", thinking=thinking)
+    prompt = PromptBundle(messages=(
+        Message(role="user", parts=(Part(kind="text", text="hi"),)),))
+    body = _build_anthropic_body(prof, prompt, None)
+    assert body["thinking"] == {"type": thinking}
+
+
 def test_anthropic_headers():
     assert _build_headers("anthropic", "sk-test") == {
         "x-api-key": "sk-test",
@@ -256,6 +267,8 @@ def test_openai_body_text_and_image_exact(png_image: ImageRef):
     ))
     b64 = base64.b64encode(png_image.path.read_bytes()).decode("ascii")
     body = _build_openai_body(prof, prompt, response_schema=SCHEMA)
+    assert prof.thinking is None
+    assert "thinking" not in body
     assert body == {
         "model": "test-model",
         "temperature": 0.0,
@@ -280,6 +293,15 @@ def test_openai_schema_ignored_without_structured_support():
         Message(role="user", parts=(Part(kind="text", text="hi"),)),))
     body = _build_openai_body(prof, prompt, response_schema=SCHEMA)
     assert "response_format" not in body
+
+
+@pytest.mark.parametrize("thinking", ["enabled", "disabled"])
+def test_openai_thinking_is_explicit_top_level_field(thinking):
+    prof = _llm_profile(thinking=thinking)
+    prompt = PromptBundle(messages=(
+        Message(role="user", parts=(Part(kind="text", text="hi"),)),))
+    body = _build_openai_body(prof, prompt, None)
+    assert body["thinking"] == {"type": thinking}
 
 
 def test_openai_headers_bearer():

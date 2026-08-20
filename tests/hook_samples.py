@@ -38,3 +38,24 @@ NOT_CALLABLE = 42
 
 def always_reject(obj, record):            # output.validator: unsatisfiable
     return ["该输出永远不合格（用于耗尽修复预算的测试）"]
+
+
+def sequence_ok(value):                    # generate.sequence_validator: pass
+    return []
+
+
+def sequence_reject(value):                # generate.sequence_validator: violation
+    return ["sequence rejected"]
+
+
+def sequence_mutates(value):               # generate.sequence_validator: mutate probe
+    value.frames[0].payload["nested"]["value"] = "changed"
+    return []
+
+
+def sequence_boom(value):                  # generate.sequence_validator: exception
+    raise RuntimeError("sequence hook exploded")
+
+
+def sequence_bad_return(value):            # generate.sequence_validator: bad return
+    return "not-a-list"

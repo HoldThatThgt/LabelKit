@@ -147,3 +147,24 @@ JSON Pointer: /intent
 | L1→L2（重走） | 修复输出 | 同 L1 / L2 | 通过 ⇒ 返回对象；`attempts = 2`；`resolved_at.l3_1` 计 1 |
 
 若第 2 次 L3 修复后仍未通过 L2，则预算耗尽，抛 `SchemaViolation(errors, raw_last_output)`：该记录 `status = "failed"`、错误码 `schema_violation`（7.6）入 rejects 通道，并计入 `resolved_at.rejected`。
+
+### 3.8.5 v1.16 联合规划的 brief Schema
+
+v1.16 为 M6 的 sampled brief 增加内部构造器 `brief_schema(length)`。它返回一个顶层
+object，唯一属性为 `steps`；`steps` 是长度恰为 `length` 的数组，每个位置的 object 只
+有必填字符串属性 `brief`，并以 `additionalProperties = false` 封闭。该 Schema 不返回
+`frame_class`，因为帧类词已经由 CP-SAT planner 冻结，LLM 只能补充每个位置的自然语言
+概要。它是内部 Schema 待遇：经过 L0–L3，但不经过 `output.validator`，不计入
+`report.schema_engine.resolved_at`。
+
+```python
+def brief_schema(length: int) -> dict:
+    """构造 v1.16 联合规划的定长 brief 内部 Schema。"""
+```
+
+M6 将 brief 数组按规划器的固定 frame class 位置配对，再传给已有的
+`realize_schema(step_schemas)`；realize 的 `prefixItems` 仍逐位约束帧类生成 Schema，
+时间字段绑定后的缩减 Schema 仍由 M6 传入。默认无 rules/windows 的 v1.15 路径继续使用
+`plan_schema` 并返回 `frame_class + brief`，因此 brief Schema 不改变默认路径的 prompt 或
+Schema 字节。M8 不解析规则、窗口或 correlation，也不参与长度可行性判断；这些语义由
+M1/M6 的共享 planner 与声明式 evaluator 负责。

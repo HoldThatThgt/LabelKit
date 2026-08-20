@@ -4,16 +4,14 @@
 ``_Collector`` 里记账, 从不提前抛出; 少数函数会回传被"回填/冻结"过的配置对象
 (classify.max_labels 回填、segment/frame_classify 的 vision_resolved 冻结)。
 
-拆分预案(v1.15 后 ≤ 2000 行的余量只剩个位数): 下次增簇**先**把 v1.13–v1.15 的生成形态簇
-(``_check_generate_stream`` 起至绑定簇止)整体迁往 ``_genstream.py``, ``validate`` 侧只留一
-次调用——切口沿形态边界, 与 2026-08-14 的 M1 拆分同款(须同步冻结的包布局清单)。
+v1.13--v1.16 时间流生成约束位于 ``_generate_stream_constraints``，本模块只保留总驱动与
+其余配置组合约束。
 """
 from __future__ import annotations
 
 import json
 import os
 from dataclasses import dataclass, field, replace
-from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -29,6 +27,7 @@ from labelkit.common.config._classviews import (
     _build_frame_class_views,
 )
 from labelkit.common.config._collect import _Collector, _fmt
+from labelkit.common.config._generate_stream_constraints import check_generate_stream_form
 from labelkit.common.config._rubrics import _RubricSite, _check_pointwise_rubric, _resolve_rubric
 from labelkit.common.config._schemas import (
     _DryRun,
@@ -36,26 +35,21 @@ from labelkit.common.config._schemas import (
     _load_frame_schema,
     _load_user_schema,
 )
-from labelkit.common.config._sections import (
-    _STREAM_FORBIDDEN_CLASS_GEN_KEYS,
-    _STREAM_FORBIDDEN_GEN_KEYS,
-    _Project,
-)
+from labelkit.common.config._sections import _Project
 from labelkit.common.config.model import (
     ClassView,
     CliOverrides,
     EmbeddingProfile,
     FewShotExample,
     FrameClassView,
-    GenerateStreamConfig,
     LLMProfile,
     Rubric,
-    TierSpec,
-    apportion_tiers,
-    effective_tiers,
+    effective_rules,
+    effective_windows,
 )
 from labelkit.common.extensions.hooks import resolve_hook
 from labelkit.common.runtime import budget
+from labelkit.common.runtime.declare import render_constraint_text
 
 
 @dataclass(frozen=True)
@@ -439,7 +433,7 @@ def _resolve_api_keys(ctx: _LoadCtx, products: _Products) -> None:
 
 
 def _load_schema_and_hooks(ctx: _LoadCtx, products: _Products) -> None:
-    """规则 13–15 与规则 17: 用户 Schema、few-shot 干跑与两个用户校验钩子。
+    """规则 13–15 与规则 17: 用户 Schema、few-shot 干跑与用户校验钩子。
 
     @param ctx 校验上下文
     @param products 产物累加器(填充 ``user_schema`` 与 ``dryrun``)
@@ -934,589 +928,6 @@ def _check_frame_family(ctx: _LoadCtx, products: _Products) -> None:
     _check_frame_namespace(ctx, products)
 
 
-# ── v1.13 时间流生成形态的组合约束(SPEC-stream-generation §3.1 约束表) ────────
-
-# v1.14(裁决·语义词表四值): 时间语义词表是**冻结闭集**(扩词走 spec 修订)——键 = 词,
-# 值 = 该词要求绑定属性字面声明的 JSON 类型(ts 是 ISO 串, 其余是 round(ts 差秒, 6))。
-_TIME_FIELD_TERMS: dict[str, str] = {
-    "ts": "string",           # 本帧已铺时间戳(ISO 串; 重发帧承源值)
-    "gap_prev_s": "number",   # 与本序列上一帧的间隔秒(首帧 0.0)
-    "gap_next_s": "number",   # 与本序列下一帧的间隔秒(末帧 0.0)
-    "elapsed_s": "number",    # 距本序列首帧秒(首帧 0.0)
-}
-
-# v1.14(裁决·微秒地板): 帧间隔下界的分辨率地板——isoformat 精度与 round(·, 6) 的下界。
-_FRAME_GAP_FLOOR_S = 1e-6
-
-
-def _check_generate_stream(col: _Collector, fp: str, gs: GenerateStreamConfig,
-                           v: SimpleNamespace) -> None:
-    """时间流形态([generate.stream].enabled = true)的 M1 约束簇驱动器。
-
-    ``v`` 是调用方组装的取值捆包(mode / modality / generate / classify / class_views /
-    stream / meta_mode / frame_classify / frame_annotate / frame_class_views /
-    gen_provided / class_raw / seq_total / len_max / text_field, v1.14 增 tiers /
-    frame_gen_schema_declared, v1.15 增 tier_domain——``tiers`` 语义收窄为**全局**档位表,
-    按类表挂在 class_views 上)——形态约束横跨十余个节, 逐参传递会把签名撑爆。形态关闭
-    时调用方不进入本簇: 相关键退化为停放配置, 全系统与 v1.12 字节等价。
-
-    @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param gs 已解析的 [generate.stream] 节
-    @param v 跨节取值捆包
-    """
-    _stream_form_premise(col, fp, v)
-    _stream_form_probes(col, fp, v)
-    _stream_form_quota(col, fp, v)
-    _stream_form_packing(col, fp, gs, v)
-    _stream_form_weaving(col, fp, gs, v)
-    _check_tier_table(col, fp, v)                # v1.14/v1.15 档位簇
-    _check_time_fields(col, fp, v)               # v1.14 绑定簇
-
-
-def _stream_form_premise(col: _Collector, fp: str, v: SimpleNamespace) -> None:
-    """形态前提合取 + 工件键守卫。
-
-    合取项: generate_only ∧ text ∧ generate.enabled ∧ classify.enabled ∧
-    stream.order_by = "meta:<字段>" ∧ output.meta_mode != "none"——缺一即 CONFIG_ERROR,
-    报错文案给出形态语义指引。工件键守卫: ts 字段与文本字段不得含点(字面顶层键 vs
-    点路径解析, 往返不成立)、互不同名、均不得为 "truth"(工件行三个顶层键互斥)。
-
-    @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param v 跨节取值捆包
-    """
-    loc = f"{fp}:[generate.stream].enabled"
-    if v.mode != "generate_only":
-        col.error(f'{loc}: the time-stream form requires run.mode = "generate_only", got '
-                  f"{_fmt(v.mode)} - this form synthesizes a time stream from scratch and "
-                  f"consumes no input data")
-    if v.modality != "text":
-        col.error(f'{loc}: the time-stream form requires run.modality = "text", got '
-                  f"{_fmt(v.modality)} (UI-modality time-stream generation is a v1.13 "
-                  f"non-goal)")
-    if not v.generate.enabled:
-        col.error(f"{loc}: the time-stream form requires generate.enabled = true")
-    if not v.classify.enabled:
-        col.error(f"{loc}: the time-stream form requires classify.enabled = true - the "
-                  f"sequence class table carries the quota and per-class conditioning, and "
-                  f"generation-side labels are inherited (zero verdict calls)")
-    _stream_form_artifact_keys(col, fp, v)
-    if v.meta_mode == "none":
-        col.error(f'{fp}:[output].meta_mode: must not be "none" in the time-stream form - '
-                  f"frame-class ground truth and member reconciliation are carried only by "
-                  f"_meta.stream (sidecar is legal)")
-
-
-def _stream_form_artifact_keys(col: _Collector, fp: str, v: SimpleNamespace) -> None:
-    """工件行三个顶层键(时间戳字段 / 文本字段 / truth)的形状与互斥守卫。
-
-    @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param v 跨节取值捆包
-    """
-    order_by = v.stream.order_by
-    if not (order_by.startswith("meta:") and order_by[len("meta:"):]):
-        col.error(f'{fp}:[stream].order_by: the time-stream form requires "meta:<field>" '
-                  f"(that field is the timestamp key of the artifact row, replayable on the "
-                  f"ingest side under the same declaration), got {_fmt(order_by)}")
-    elif "." in order_by[len("meta:"):]:
-        # 工件行把 ts 字段名当字面顶层键写, 而 M2 按点路径解析——带点的字段名无法往返
-        # (重放侧整份判坏行), 本形态定向封死。
-        col.error(f'{fp}:[stream].order_by: the timestamp field name of the time-stream '
-                  f'form must not contain "." (the artifact row writes it as a literal '
-                  f"top-level key and a dotted path cannot round-trip on replay ingest), "
-                  f"got {_fmt(order_by)}")
-    if "." in v.text_field:
-        col.error(f'{fp}:[input].text_field: the text field name of the time-stream form '
-                  f'must not contain "." (the artifact row writes it as a literal '
-                  f"top-level key and a dotted path cannot round-trip on replay ingest), "
-                  f"got {_fmt(v.text_field)}")
-    ts_field = order_by[len("meta:"):] if order_by.startswith("meta:") else ""
-    # 工件行的三个顶层键(ts 字段、文本字段、truth)互斥——同名即键冲突, 行不成立。
-    if ts_field and ts_field == v.text_field:
-        col.error(f"{fp}:[input].text_field: must not have the same name as the timestamp "
-                  f"field of [stream].order_by in the time-stream form (the two artifact-row "
-                  f"keys would collide), got {_fmt(v.text_field)}")
-    for owner, field_name in (("[input].text_field", v.text_field),
-                              ("[stream].order_by", ts_field)):
-        if field_name == "truth":
-            col.error(f'{fp}:{owner}: the field name must not be "truth" in the time-stream '
-                      f"form (it would collide with the ground-truth key of the artifact row)")
-
-
-def _stream_form_probes(col: _Collector, fp: str, v: SimpleNamespace) -> None:
-    """定向禁设键探针(v1.11 原始节探针机制)。
-
-    [generate] 的四个「另一形态」键、[class.*.generate] 的两个同族键、以及帧粒度两
-    开关——本形态下显式书写均为 CONFIG_ERROR, 不走白名单外键的前向兼容 WARN, 报错
-    指明替代面。
-
-    @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param v 跨节取值捆包
-    """
-    for key in _STREAM_FORBIDDEN_GEN_KEYS:
-        if v.gen_provided.get(key):
-            col.error(f"{fp}:[generate].{key}: the time-stream form does not provide this "
-                      f"key - sequence quotas are carried by "
-                      f"[class.<name>.generate].sequences, sequence length by len_range and "
-                      f"noise batching by num_per_call; remove this key")
-    for cname, sections in (v.class_raw or {}).items():
-        g_over = sections.get("generate") if isinstance(sections, dict) else None
-        if not isinstance(g_over, dict):
-            continue
-        for key in _STREAM_FORBIDDEN_CLASS_GEN_KEYS:
-            if key in g_over:
-                col.error(f"{fp}:[class.{cname}.generate].{key}: the time-stream form does "
-                          f"not provide this key (per-record expansion / seeds per call "
-                          f"belong to the flat generation forms); use sequences / len_range "
-                          f"instead")
-    for name, on in (("frame.classify", v.frame_classify.enabled),
-                     ("frame.annotate", v.frame_annotate.enabled)):
-        if on:
-            col.error(f"{fp}:[{name}].enabled: mutually exclusive with the time-stream form "
-                      f"- frame-class ground truth is known at generation time (the "
-                      f"blueprint is the truth), so no frame-level verdict is needed; write "
-                      f"frame content contracts in [frame.class.<name>.generate]")
-
-
-def _stream_form_quota(col: _Collector, fp: str, v: SimpleNamespace) -> None:
-    """类表与配额约束。
-
-    至少一个序列类的有效 sequences ≥ 1; 参与类(有效 sequences ≥ 1)的有效生成指令
-    非空; 帧类表非空(帧类的生成指令必填域见 ``_check_frame_gen_instructions``)。
-
-    @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param v 跨节取值捆包
-    """
-    if v.seq_total < 1:
-        col.error(f"{fp}:[class.<name>.generate].sequences: the time-stream form requires "
-                  f"at least one sequence class with an effective sequences >= 1 (the "
-                  f"global [generate].sequences sets a default that classes may override), "
-                  f"got a total of {v.seq_total} across all classes")
-    for name, view in v.class_views.items():
-        if view.generate.sequences >= 1 and not view.generate.instruction.strip():
-            col.error(f"{fp}:[class.{name}.generate].instruction: a participating sequence "
-                      f"class (effective sequences = {view.generate.sequences}) must "
-                      f"provide a non-empty generation instruction (the global "
-                      f"[generate].instruction sets a default)")
-    if not v.frame_classify.classes:
-        col.error(f"{fp}:[[frame.classify.classes]]: the time-stream form requires a "
-                  f"non-empty frame class table (the blueprint picks each step from that "
-                  f"closed set; frame.classify.enabled stays false)")
-    _check_frame_gen_instructions(col, fp, v)
-
-
-def _check_frame_gen_instructions(col: _Collector, fp: str, v: SimpleNamespace) -> None:
-    """每帧类的 ``[frame.class.<name>.generate].instruction`` 必填(及其检查域)。
-
-    v1.14(裁决·指令必填域收窄): 档位表在场时检查域收窄为 **∪各档 frame_classes**——蓝图
-    enum 只在档内子集上取值, 未入档的帧类永不被选中(另有一条 WARN 点名其生成面整体为死
-    配置), 逼用户为它写死指令违反"禁止多此一举的配置"纪律。v1.15(裁决·校验域并集化): 该
-    并集改跨**各参与类的生效表**取(捆包里的 ``tier_domain``)。
-
-    @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param v 跨节取值捆包
-    """
-    if v.tiers:
-        domain = v.tier_domain
-        reason = ("the blueprint enum covers the union of the tier compositions, so any "
-                  "frame class of a tier may be picked")
-    else:
-        domain = {spec.name for spec in v.frame_classify.classes}
-        reason = "the blueprint enum covers the whole table, so any frame class may be picked"
-    for spec in v.frame_classify.classes:
-        if spec.name not in domain:
-            continue
-        view = v.frame_class_views.get(spec.name)
-        if view is None or not (view.gen_instruction or "").strip():
-            col.error(f"{fp}:[frame.class.{spec.name}.generate].instruction: every frame "
-                      f"class must provide a non-empty generation instruction ({reason}), "
-                      f"expected a non-empty string")
-
-
-def _stream_form_packing(col: _Collector, fp: str, gs: GenerateStreamConfig,
-                         v: SimpleNamespace) -> None:
-    """装箱一致性约束。
-
-    sessions ≥ 1 ∧ sessions ≤ Σsequences ≤ 2 × sessions(交叉并发度恒 k ∈ {1, 2},
-    交叉会话数 = Σsequences − sessions); duplicates ∈ [0, Σsequences];
-    noise_ratio ∈ [0,1) 且 > 0 时 noise_instruction 必填; frame_gap_s 下界 ≥ 微秒地板
-    (v1.14 裁决·微秒地板)且上界 < stream.gap_s。
-
-    @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param gs 已解析的 [generate.stream] 节
-    @param v 跨节取值捆包
-    """
-    total = v.seq_total
-    if gs.sessions < 1:
-        col.error(f"{fp}:[generate.stream].sessions: expected an integer >= 1 (number of "
-                  f"sessions), got {gs.sessions}")
-    elif not gs.sessions <= total <= 2 * gs.sessions:
-        col.error(f"{fp}:[generate.stream].sessions: expected sessions <= Σsequences <= "
-                  f"2 * sessions (crossed sessions = Σsequences - sessions, crossing "
-                  f"concurrency is always k in 1,2), got sessions = {gs.sessions}, "
-                  f"Σsequences = {total}")
-    if gs.duplicates > total:
-        col.error(f"{fp}:[generate.stream].duplicates: expected an integer in "
-                  f"[0, Σsequences] (re-sent sequences are drawn from the surviving ones), "
-                  f"got {gs.duplicates}, Σsequences = {total}")
-    if not 0 <= gs.noise_ratio < 1:
-        col.error(f"{fp}:[generate.stream].noise_ratio: expected a number in [0,1) (noise "
-                  f"frames / task frames ratio), got {_fmt(gs.noise_ratio)}")
-    elif gs.noise_ratio > 0 and not gs.noise_instruction.strip():
-        col.error(f"{fp}:[generate.stream].noise_instruction: required when "
-                  f"noise_ratio > 0, expected a non-empty string (the noise-frame "
-                  f"generation instruction)")
-    if gs.frame_gap_s[0] < _FRAME_GAP_FLOOR_S:
-        col.error(f"{fp}:[generate.stream].frame_gap_s: the lower bound must be >= "
-                  f"{_FRAME_GAP_FLOOR_S:g} s (one microsecond) - the laid-out timestamps "
-                  f"must be strictly increasing and a sub-microsecond gap rounds to a zero "
-                  f"timedelta, and the time vocabulary uses 0.0 as its first/last frame "
-                  f"boundary sentinel, got lower bound {_fmt(gs.frame_gap_s[0])}")
-    if gs.frame_gap_s[1] >= v.stream.gap_s:
-        col.error(f"{fp}:[generate.stream].frame_gap_s: the upper bound must be < "
-                  f"stream.gap_s (= {v.stream.gap_s}; otherwise the in-session frame gap "
-                  f"itself would trigger a session split), got upper bound "
-                  f"{_fmt(gs.frame_gap_s[1])}")
-
-
-def _stream_form_weaving(col: _Collector, fp: str, gs: GenerateStreamConfig,
-                         v: SimpleNamespace) -> None:
-    """织造上限与铺设契约约束。
-
-    2 × max(各类 len_range 上界) ≤ stream.session_max_len(交叉会话恒装两条序列);
-    stream.key 须为空数组、stream.gap_steps 须为 0(分区键与序差断开同生成侧的铺设
-    契约冲突); session_max_span_s > 0 时按最坏帧间隔做静态跨度校验; ts_start 须可
-    解析为 ISO-8601 时刻。
-
-    @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param gs 已解析的 [generate.stream] 节
-    @param v 跨节取值捆包
-    """
-    if 2 * v.len_max > v.stream.session_max_len:
-        col.error(f"{fp}:[stream].session_max_len: the time-stream form requires >= 2 * "
-                  f"max(len_range upper bound) (a crossed session always packs two "
-                  f"sequences), got {v.stream.session_max_len} < {2 * v.len_max}")
-    if v.stream.key:
-        col.error(f"{fp}:[stream].key: the time-stream form requires an empty array - "
-                  f"sessions are laid out directly by the weaver and partition keys do not "
-                  f"participate, got {_fmt(list(v.stream.key))}")
-    if v.stream.gap_steps:
-        col.error(f"{fp}:[stream].gap_steps: the time-stream form requires 0 - session "
-                  f"boundaries are laid out directly by the weaver (inter-session gaps are "
-                  f"always > gap_s) and step-gap splitting does not participate, got "
-                  f"{v.stream.gap_steps}")
-    span = v.stream.session_max_span_s
-    worst = (v.stream.session_max_len - 1) * gs.frame_gap_s[1]
-    if span > 0 and worst > span:
-        col.error(f"{fp}:[stream].session_max_span_s: worst-case session span "
-                  f"(session_max_len - 1) * frame_gap_s upper bound = {worst:g} s > "
-                  f"{span} s - the laid-out sessions would be hard-cut by span on the "
-                  f"ingest side; raise session_max_span_s, lower the frame_gap_s upper "
-                  f"bound or lower session_max_len")
-    try:
-        datetime.fromisoformat(gs.ts_start)
-    except ValueError:
-        col.error(f'{fp}:[generate.stream].ts_start: expected a parseable ISO-8601 instant '
-                  f'(e.g. "2026-01-01T09:00:00+08:00"; a missing timezone is treated as '
-                  f"UTC, matching the meta:<field> ingest rule), got {_fmt(gs.ts_start)}")
-
-
-# ── v1.14/v1.15 档位面(SPEC-per-class-tiers §3.1: 逐生效来源表 + rule 61) ─────
-
-
-def _check_tier_table(col: _Collector, fp: str, v: SimpleNamespace) -> None:
-    """v1.14 档位簇驱动器: rule 61 两款 → 逐来源表结构 → 逐非零配额对 → 未入档 WARN。
-
-    v1.15(裁决·表级原子覆盖): 结构校验逐**生效来源表**执行——全局表 + 每张已声明按类表(零
-    额类声明的表照跑), 定位前缀随表; 面开关恒 = 全局表非空(裁决·全局表为锚), 故配额对与
-    未入档 WARN 仍以它在场为门。
-
-    @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param v 跨节取值捆包(``tiers`` = 已按 tier_rank 升序解析的全局档位表)
-    """
-    tiers = v.tiers
-    frame_names = tuple(spec.name for spec in v.frame_classify.classes)
-    _check_tier_source(col, f"{fp}:[[generate.stream.tiers]]", tiers, frame_names)
-    for cname, view in v.class_views.items():
-        if view.tiers is None:
-            continue                            # 未声明 = 回落全局表, 不重复裁定
-        loc = f"{fp}:[class.{cname}.generate].tiers"
-        if not view.tiers:                      # rule 61③ 空表拒收
-            col.error(f"{loc}: expected a non-empty array of tier tables - omit the key to "
-                      f"fall back to the global [[generate.stream.tiers]] table")
-        elif not tiers:                         # rule 61② 全局表为锚
-            col.error(f"{loc}: a per-class tier table overrides the global "
-                      f"[[generate.stream.tiers]] table, which is absent - declare the "
-                      f"global table (it is the fallback for classes without their own "
-                      f"table and the switch of the whole tier face)")
-        _check_tier_source(col, loc, view.tiers, frame_names)
-    if tiers:
-        _check_tier_quota_pairs(col, fp, v)
-        _warn_frame_classes_without_tier(col, fp, v.tier_domain, frame_names)
-
-
-def _check_tier_source(col: _Collector, loc: str, tiers: tuple[TierSpec, ...],
-                       frame_names: tuple[str, ...]) -> None:
-    """单张生效来源表的结构: 身份连续性 + 构成合法性。
-
-    身份(裁决·tier_rank 即档位身份; v1.15 收窄为类内身份): 表内唯一且**本表**连续覆盖 1..N
-    ——缺号/重号会让"第几档"失去身份语义(它同时是配分平票与类内序数分块的依据)。构成(裁
-    决·构成恰等): 非空、档内互异、名 ∈ 帧类表、**单表内**两两互异——跨表同构成合法。
-
-    @param col 错误聚合器
-    @param loc 该来源表的报错定位前缀(已含 project.toml 路径)
-    @param tiers 该来源表(按 tier_rank 升序)
-    @param frame_names 帧类表的名集(声明序)
-    """
-    ranks = sorted(spec.tier_rank for spec in tiers)
-    if ranks != list(range(1, len(ranks) + 1)):
-        col.error(f"{loc}.tier_rank: tier ranks must be unique and cover 1..N contiguously "
-                  f"(N = {len(ranks)} = the number of tiers; the rank is the identity of a "
-                  f"tier, there is no name key), got {_fmt(ranks)}")
-    owners: dict[tuple[str, ...], int] = {}
-    for spec in tiers:
-        at = f"{loc}(tier_rank = {spec.tier_rank}).frame_classes"
-        if not spec.frame_classes:
-            col.error(f"{at}: expected a non-empty array of frame class names (a tier IS "
-                      f"its frame-class composition)")
-            continue
-        for i, name in enumerate(spec.frame_classes):
-            if name in spec.frame_classes[:i]:
-                col.error(f"{at}: frame class names must be distinct within a tier (the "
-                          f"composition is a set), got duplicate {_fmt(name)}")
-            elif name not in frame_names:
-                col.error(f"{at}: frame class name {_fmt(name)} is not in "
-                          f"[[frame.classify.classes]], available: {_avail(frame_names)}")
-        key = tuple(sorted(set(spec.frame_classes)))
-        if key in owners:
-            col.error(f"{at}: the composition is identical to the one of tier_rank = "
-                      f"{owners[key]} - two tiers with the same frame-class set are "
-                      f"semantically duplicates, got {_fmt(list(spec.frame_classes))}")
-        else:
-            owners[key] = spec.tier_rank
-
-
-def _check_tier_quota_pairs(col: _Collector, fp: str, v: SimpleNamespace) -> None:
-    """长度可覆盖 + 配分零额告警: 逐 (参与类, 档) 配额对裁定。
-
-    配分是 ``(sequences, 生效表)`` 的纯函数, M1 期可算(裁决·零抽签配分)。配额 >= 1 的每一对
-    须满足该类 ``len_range`` 下界 >= 该档构成大小(构成恰等要求每类至少出现一次); **零额对
-    豁免**(与零额 WARN 语义对齐)。v1.15: 逐类吃**该类生效表**, WARN 的权重清单同源。
-
-    @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param v 跨节取值捆包(``class_views`` 承载有效 sequences / len_range / 按类档位表)
-    """
-    for cname, view in v.class_views.items():
-        if view.generate.sequences < 1:
-            continue        # 不参与生成的类没有配额对
-        table = effective_tiers(view.tiers, v.tiers)
-        weights = ", ".join(f"tier_rank {s.tier_rank}: weight {s.weight}" for s in table)
-        for spec, quota in zip(table, apportion_tiers(view.generate.sequences, table)):
-            if quota < 1:
-                col.warn(f"{fp}:[[generate.stream.tiers]]: class {_fmt(cname)} apportions 0 "
-                         f"sequences to tier_rank = {spec.tier_rank} (largest-remainder "
-                         f"apportionment of {view.generate.sequences} sequences over "
-                         f"weights {weights}), so that tier is never exercised for this "
-                         f"class - raise sequences or rebalance the weights")
-            elif view.generate.len_range[0] < len(spec.frame_classes):
-                col.error(f"{fp}:[class.{cname}.generate].len_range: the lower bound must be "
-                          f">= the composition size of every tier this class draws from "
-                          f"(tier_rank = {spec.tier_rank} declares "
-                          f"{len(spec.frame_classes)} frame classes and is apportioned "
-                          f"{quota} of the {view.generate.sequences} sequences, and each of "
-                          f"them must appear at least once), got lower bound "
-                          f"{view.generate.len_range[0]}")
-
-
-def _warn_frame_classes_without_tier(col: _Collector, fp: str, covered: set[str],
-                                     frame_names: tuple[str, ...]) -> None:
-    """帧类未入任何生效表: 它不会出现在任何蓝图中, 生成面整体是死配置(WARN)。
-
-    @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param covered 校验域(∪ 各参与类生效表的构成, 裁决·校验域并集化)
-    @param frame_names 帧类表的名集(声明序)
-    """
-    for name in frame_names:
-        if name not in covered:
-            col.warn(f"{fp}:[frame.class.{name}.generate]: frame class {_fmt(name)} is in "
-                     f"no tier composition, so it can never be picked by a blueprint - its "
-                     f"whole generate face (instruction, schema, time_fields) is dead "
-                     f"config (the generation instruction is not required for it either)")
-
-
-def _check_tiers_parked(ctx: _LoadCtx) -> None:
-    """档位表前提(v1.11 原始节探针机制): 档位表**仅**时间流形态合法。
-
-    在场性取自原始节探针而非解析产物——表内容非法(解析产物为空)时也要照发。v1.15 的 rule
-    61① 是它的按类同族款(探针走 ``[class.*.generate]`` 原始节), 同点执行。
-
-    @param ctx 校验上下文
-    """
-    if ctx.p.gen_provided.get("stream_tiers"):
-        ctx.col.error(f"{ctx.fp}:[[generate.stream.tiers]]: the tier table is only legal in "
-                      f"the time-stream generation form ([generate.stream].enabled = true) "
-                      f"- a tier declares the frame-class composition of the sequences "
-                      f"drawn from it, and only that form plans sequences from a frame "
-                      f"class table")
-    for cname, sections in (ctx.p.class_raw or {}).items():
-        g_over = sections.get("generate") if isinstance(sections, dict) else None
-        if isinstance(g_over, dict) and "tiers" in g_over:
-            ctx.col.error(f"{ctx.fp}:[class.{cname}.generate].tiers: the per-class tier "
-                          f"table is only legal in the time-stream generation form "
-                          f"([generate.stream].enabled = true) - it overrides the global "
-                          f"[[generate.stream.tiers]] table for sequences of this class")
-
-
-# ── v1.14 时间字段绑定面(SPEC-generation-tiers §3.1 绑定表三行) ───────────────
-
-
-def _check_time_fields(col: _Collector, fp: str, v: SimpleNamespace) -> None:
-    """v1.14 绑定簇驱动器(裁决·绑定即剔除): 前提 → 键与类型 → 剔除余量。
-
-    绑定表仅结构化帧合法: 回填就地写入共享载荷对象, 要求载荷恒为 JSON 对象(生成
-    Schema 顶层 ``"type"`` 字面恰等 ``"object"`` 由 Schema 装载期强制, 联合类型与缺失
-    都在那里就地报错并使该帧类退化为"Schema 不可用"——此处不叠加误导性第二错)。
-
-    @param col 错误聚合器
-    @param fp 报错定位用的 project.toml 路径字符串
-    @param v 跨节取值捆包
-    """
-    for name, view in v.frame_class_views.items():
-        if view.time_fields is None:
-            continue
-        loc = f"{fp}:[frame.class.{name}.generate.time_fields]"
-        if view.gen_schema is None:
-            if name not in v.frame_gen_schema_declared:
-                col.error(f"{loc}: a time-field binding is only legal on a structured frame "
-                          f"class - declare schema_path / schema_inline for "
-                          f"[frame.class.{name}.generate] first (the backfill writes the "
-                          f"computed value into the frame payload in place, so the payload "
-                          f"must always be a JSON object; a plain-text frame has no field "
-                          f"to bind)")
-            continue        # 已声明但装载失败: 病因与报错都属该 Schema 自身
-        props = view.gen_schema.get("properties")
-        props = props if isinstance(props, dict) else {}
-        _check_binding_pairs(col, loc, view.time_fields, props)
-        # 剔除余量: 绑定字段整体从逐位 Schema 中剔除, 至少得给 LLM 剩一个字段可生成。
-        bound = sum(1 for key in view.time_fields if key in props)
-        if len(props) - bound < 1:
-            col.error(f"{loc}: the bindings would remove every top-level property of the "
-                      f"frame-class generation schema (top-level properties: {len(props)}, "
-                      f"bound: {bound}) - a bound field is stripped from the per-position "
-                      f"schema, so leave at least one property for the LLM to generate")
-
-
-def _check_binding_pairs(col: _Collector, loc: str, bindings: dict, props: dict) -> None:
-    """逐个绑定对: 键 ∈ 顶层 properties、值 ∈ 语义词表、属性 ``type`` 字面恰等。
-
-    字面恰等意味着联合类型数组、缺失的 ``type`` 与经 ``$ref``/组合关键字的间接声明
-    一律判不匹配(CONFIG_ERROR)——类型层满足是工具对用户完整生成 Schema 的唯一静态
-    保证; ``type`` 以外的关键字既不上行也不被强制(字段整体从 LLM 面向的逐位 Schema
-    中剔除), 逐个发一条值-free WARN。
-
-    @param col 错误聚合器
-    @param loc 该帧类绑定表的报错定位前缀
-    @param bindings 该帧类的绑定映射(字段名 → 语义词)
-    @param props 该帧类生成 Schema 的顶层 ``properties``
-    """
-    for key, term in bindings.items():
-        want = _TIME_FIELD_TERMS.get(term)
-        prop = props.get(key)
-        declared = prop.get("type") if isinstance(prop, dict) else prop
-        if want is None:
-            col.error(f"{loc}.{key}: expected one of the time vocabulary terms "
-                      f"{_avail(tuple(_TIME_FIELD_TERMS))} (a frozen closed set), "
-                      f"got {_fmt(term)}")
-        elif key not in props:
-            col.error(f"{loc}.{key}: {_fmt(key)} is not a top-level property of the "
-                      f"frame-class generation schema, available: {_avail(tuple(props))}")
-        elif declared != want:
-            col.error(f'{loc}.{key}: the bound property must declare "type": '
-                      f'{json.dumps(want)} literally for the term {_fmt(term)} (a union '
-                      f"type array, a missing type and an indirect declaration through "
-                      f"$ref or a combining keyword all count as a mismatch), got "
-                      f"{_fmt(declared)}")
-        else:
-            _warn_binding_extra_keywords(col, loc, key, prop)
-
-
-def _warn_binding_extra_keywords(col: _Collector, loc: str, key: str,
-                                 prop: dict) -> None:
-    """绑定字段上 ``type`` 以外的关键字: 逐个一条值-free WARN(帧类名 + 字段名 + 关键字名)。
-
-    @param col 错误聚合器
-    @param loc 该帧类绑定表的报错定位前缀
-    @param key 绑定的字段名
-    @param prop 该字段的属性 Schema
-    """
-    for keyword in prop:
-        if keyword != "type":
-            col.warn(f"{loc}.{key}: the bound field carries the keyword {_fmt(keyword)}, "
-                     f"which is neither sent to the LLM nor enforced - a bound field is "
-                     f"removed from the per-position schema and its value is computed from "
-                     f"the laid-out timeline (only the declared type is guaranteed)")
-
-
-def _frame_gen_schema_declared(raw: object) -> frozenset[str]:
-    """哪些帧类**声明过**生成 Schema 源键(与"装载是否成功"无关)——绑定表前提据此区分
-    "纯文本帧带绑定表"(定向 CONFIG_ERROR)与"Schema 自身装载失败"(不叠加第二条)。
-
-    @param raw ``[frame.class.<name>.*]`` 原始节
-    @return 声明过 ``schema_path``/``schema_inline`` 的帧类名集合
-    """
-    if not isinstance(raw, dict):
-        return frozenset()
-    return frozenset(
-        cname for cname, sections in raw.items()
-        if isinstance(sections, dict) and isinstance(sections.get("generate"), dict)
-        and any(k in sections["generate"] for k in ("schema_path", "schema_inline")))
-
-
-def _check_generate_stream_form(ctx: _LoadCtx, products: _Products) -> tuple[int, int]:
-    """v1.13 形态约束簇的入口: 组装跨节取值捆包并一次性裁定。
-
-    类视图与帧类视图都已物化后才调用; 形态关闭 ⇒ 除 v1.14 档位表前提外零执行、零行为
-    差异。Σsequences / max(len_range 上界)取自按类生效视图。
-
-    @param ctx 校验上下文
-    @param products 产物累加器
-    @return (Σsequences, max(len_range 上界)) —— 后续预算静态检查复用
-    """
-    views = products.class_views
-    seq_total = sum(cv.generate.sequences for cv in views.values())
-    len_max = max([1] + [cv.generate.len_range[1] for cv in views.values()])
-    p = ctx.p
-    if not p.generate_stream.enabled:
-        _check_tiers_parked(ctx)        # v1.14 档位表前提(形态关闭侧的唯一一条)
-        return seq_total, len_max
-    _check_generate_stream(ctx.col, ctx.fp, p.generate_stream, SimpleNamespace(
-        mode=ctx.mode, modality=ctx.modality, generate=p.generate,
-        classify=p.classify, class_views=views, stream=p.stream,
-        meta_mode=p.output.meta_mode, frame_classify=p.frame_classify,
-        frame_annotate=p.frame_annotate, frame_class_views=products.frame_class_views,
-        gen_provided=p.gen_provided,
-        class_raw=p.class_raw if isinstance(p.class_raw, dict) else {},
-        seq_total=seq_total, len_max=len_max, text_field=p.input.text_field,
-        tiers=p.generate_stream.tiers,                                  # v1.14 全局档位表
-        # v1.15(裁决·校验域并集化): 帧类校验域 = ∪(参与类生效表的构成); 全类回落全局表
-        # 时退化为全局构成并集(v1.14 字节一致)。参与类 = 有效 sequences >= 1。
-        tier_domain={name for cv in views.values() if cv.generate.sequences >= 1
-                     for spec in effective_tiers(cv.tiers, p.generate_stream.tiers)
-                     for name in spec.frame_classes},
-        frame_gen_schema_declared=_frame_gen_schema_declared(p.frame_class_raw)))
-    return seq_total, len_max
-
-
 # ── v1.11 — 上下文预算与 vision 推导(spec 3.1.4 上下文预算行) ────────────────
 
 
@@ -1755,6 +1166,21 @@ def _static_checks_generate(ctx: _LoadCtx, products: _Products,
                        budget.TEMPLATE_HEAD_TOKENS["generate"] + gen_instruction_est))
     if not p.generate_stream.enabled:
         return checks
+    joint_views = _joint_prefix_views(ctx, products)
+    joint_active = bool(joint_views and products.frame_class_views) and any(
+        effective_rules(view.rules, p.generate_stream.rules)
+        or effective_windows(view.windows, p.generate_stream.windows)
+        for view in joint_views)
+    if joint_active:
+        for name in p.generate.llms:
+            profile = ctx.llm_profiles.get(name)
+            if profile is None:
+                continue
+            brief_est, realize_est = _joint_prompt_estimates(
+                ctx, products, joint_views, len_max, profile)
+            checks.append(("generate.stream.plan", (name,), brief_est))
+            checks.append(("generate.stream.realize", (name,), realize_est))
+        return checks
     frame_gen_table_text = "\n".join(f"{c.name}\n{c.description}"
                                      for c in p.frame_classify.classes)
     gen_schema_max = max([0] + [
@@ -1767,6 +1193,133 @@ def _static_checks_generate(ctx: _LoadCtx, products: _Products,
                    budget.TEMPLATE_HEAD_TOKENS["generate_realize"] + gen_instruction_est
                    + len_max * gen_schema_max))
     return checks
+
+
+def _joint_prefix_views(ctx: _LoadCtx, products: _Products) -> list[ClassView]:
+    """按配额展开与 ``--limit`` 前缀返回联合路径实际参与类视图。"""
+    remaining = ctx.cli.limit
+    result: list[ClassView] = []
+    for name in sorted(products.class_views):
+        view = products.class_views[name]
+        count = view.generate.sequences
+        if remaining is not None:
+            count = min(count, max(remaining, 0))
+            remaining -= count
+        if count > 0:
+            result.append(view)
+        if remaining == 0:
+            break
+    return result
+
+
+def _joint_prompt_estimates(ctx: _LoadCtx, products: _Products,
+                            views: list[ClassView], len_max: int,
+                            profile: LLMProfile) -> tuple[int, int]:
+    """计算联合 brief 与不可拆 realize 的保守完整输入上界。"""
+    p = ctx.p
+    names = tuple(products.frame_class_views)
+    longest_frame = max(names, key=budget.est_text)
+    longest_class = max((view.name for view in views), key=budget.est_text)
+    instruction = max((view.generate.instruction for view in views),
+                      key=budget.est_text)
+    constraints = max((_joint_constraint_text(p, view) for view in views),
+                      key=budget.est_text)
+    positions = "\n".join(f"{index}: {longest_frame}"
+                           for index in range(1, len_max + 1))
+    brief_user = f"请为一条「{longest_class}」序列产出固定的 {len_max} 个 brief。"
+    brief = (budget.TEMPLATE_HEAD_TOKENS["generate_brief"]
+             + budget.est_text(instruction) + budget.est_text(constraints)
+             + budget.est_text(positions) + budget.est_text(brief_user)
+             + 2 * budget.MSG_OVERHEAD_TOKENS)
+    realize = _joint_realize_estimate(ctx, products, views, len_max, profile)
+    if profile.supports_structured_output:
+        brief += _brief_schema_estimate(len_max)
+    return brief, realize
+
+
+def _joint_constraint_text(project: _Project, view: ClassView) -> str:
+    """渲染一个序列类的生效规则与窗口预算文本。"""
+    rules = effective_rules(view.rules, project.generate_stream.rules)
+    windows = effective_windows(view.windows, project.generate_stream.windows)
+    return render_constraint_text(rules, windows)
+
+
+def _joint_has_correlation(project: _Project, views: list[ClassView]) -> bool:
+    """判断实际联合规划前缀是否存在 correlation。"""
+    return any(rule.correlation is not None
+               for view in views
+               for rule in effective_rules(view.rules, project.generate_stream.rules))
+
+
+def _joint_realize_estimate(ctx: _LoadCtx, products: _Products,
+                            views: list[ClassView], len_max: int,
+                            profile: LLMProfile) -> int:
+    """计算联合 realize 输入的保守上界。"""
+    p = ctx.p
+    longest_frame = max(products.frame_class_views, key=budget.est_text)
+    instruction = max((view.generate.instruction for view in views),
+                      key=budget.est_text)
+    constraints = max((_joint_constraint_text(p, view) for view in views),
+                      key=budget.est_text)
+    styles = [style.prompt for view in views for style in view.generate.styles]
+    style_est = max([0] + [budget.est_text(value) for value in styles])
+    contract, schema = _largest_frame_contract(products)
+    frame_line = f"第 {len_max} 帧（{longest_frame}）须符合：{contract}"
+    user_line = f"{len_max}. [{longest_frame}] "
+    result = (budget.TEMPLATE_HEAD_TOKENS["generate_realize"]
+              + budget.est_text(instruction) + style_est
+              + budget.est_text(constraints)
+              + len_max * (budget.est_text(frame_line) + budget.est_text(user_line))
+              + (profile.max_output_tokens if _joint_has_correlation(p, views) else 0)
+              + 2 * budget.MSG_OVERHEAD_TOKENS)
+    if profile.supports_structured_output:
+        result += _realize_schema_estimate(schema, len_max)
+    return result
+
+
+def _largest_frame_contract(products: _Products) -> tuple[str, dict]:
+    """取最坏逐帧内容契约与对应 Schema。"""
+    candidates: list[tuple[str, dict]] = []
+    for view in products.frame_class_views.values():
+        schema = _reduced_frame_schema(view)
+        shape = (json.dumps(schema, ensure_ascii=False, separators=(", ", ": "))
+                 if schema is not None else "自由文本一段")
+        contract = f"{view.gen_instruction or ''}\n内容契约：{shape}"
+        candidates.append((contract, schema or {"type": "string"}))
+    contract = max(candidates, key=lambda item: budget.est_text(item[0]))[0]
+    schema = max(candidates, key=lambda item: budget.est_text(
+        json.dumps(item[1], ensure_ascii=False)))[1]
+    return contract, schema
+
+
+def _reduced_frame_schema(view: FrameClassView) -> dict | None:
+    """按 v1.14 time_fields 规则派生 LLM 面向的生成 Schema。"""
+    if view.gen_schema is None:
+        return None
+    reduced = dict(view.gen_schema)
+    bound = set(view.time_fields or ())
+    if "properties" in reduced:
+        reduced["properties"] = {
+            name: value for name, value in reduced["properties"].items()
+            if name not in bound}
+    if "required" in reduced:
+        reduced["required"] = [name for name in reduced["required"] if name not in bound]
+    return reduced
+
+
+def _brief_schema_estimate(length: int) -> int:
+    """估算结构化输出 profile 上 sampled brief Schema 的上行成本。"""
+    from labelkit.common.runtime.schema_engine import brief_schema
+
+    return budget.est_text(json.dumps(brief_schema(length), ensure_ascii=False))
+
+
+def _realize_schema_estimate(schema: dict, length: int) -> int:
+    """估算结构化输出 profile 上最坏 realize Schema 的上行成本。"""
+    from labelkit.common.runtime.schema_engine import realize_schema
+
+    value = realize_schema([schema] * length)
+    return budget.est_text(json.dumps(value, ensure_ascii=False))
 
 
 def _static_checks_tail(ctx: _LoadCtx, products: _Products) -> list[tuple[str, tuple, int]]:
@@ -1990,7 +1543,7 @@ def validate(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
     _check_stage_matrix(ctx)
     _check_stream_family(ctx, products)
     _check_frame_family(ctx, products)
-    _, len_max = _check_generate_stream_form(ctx, products)
+    _, len_max = check_generate_stream_form(ctx, products)
     ctx = _check_budget_and_vision(ctx, products, len_max)
     _check_required_instructions(ctx)
     _check_paths(ctx, products)

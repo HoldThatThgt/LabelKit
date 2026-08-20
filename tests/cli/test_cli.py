@@ -86,6 +86,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/config/_classviews.py",   # M1 拆分（2026-08-14 规则整改：每文件 ≤2000 行）
     "labelkit/common/config/_collect.py",
     "labelkit/common/config/_constraints.py",
+    "labelkit/common/config/_generate_stream_constraints.py",  # v1.16 时间流约束簇
     "labelkit/common/config/_rubrics.py",
     "labelkit/common/config/_schemas.py",
     "labelkit/common/config/_sections.py",
@@ -98,14 +99,18 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/observability/console_format.py",
     "labelkit/common/observability/obslog.py",
     "labelkit/common/runtime/budget.py",           # v1.11 (CONTRACTS §7.17)
+    "labelkit/common/runtime/declare.py",          # v1.16 DECLARE 直接语义
     "labelkit/common/runtime/llm_client.py",
     "labelkit/common/runtime/schema_engine.py",
+    "labelkit/common/runtime/sequence_planner.py", # v1.16 联合 CP-SAT
+    "labelkit/common/runtime/temporal.py",         # v1.16 微秒与日历窗
     "labelkit/operators/annotate.py",
     "labelkit/operators/classify.py",
     "labelkit/operators/dedup.py",
     "labelkit/operators/emitter.py",
     "labelkit/operators/extract.py",
     "labelkit/operators/generate.py",
+    "labelkit/operators/generate_stream.py",       # M6 时间流纯逻辑物理拆分
     "labelkit/operators/ingest.py",
     "labelkit/operators/quality.py",
     "labelkit/operators/segment.py",
@@ -129,8 +134,11 @@ EXPECTED_TEST_PY = {
     "tests/common/observability/test_console_format.py",
     "tests/common/observability/test_obslog.py",
     "tests/common/runtime/test_budget.py",         # v1.11 (CONTRACTS §7.17)
+    "tests/common/runtime/test_declare.py",        # v1.16 十五模板与 occurrence
     "tests/common/runtime/test_llm_client.py",
     "tests/common/runtime/test_schema_engine.py",
+    "tests/common/runtime/test_sequence_planner.py",  # v1.16 联合模型 oracle
+    "tests/common/runtime/test_temporal.py",       # v1.16 微秒、日历与重发
     "tests/common/test_errors.py",
     "tests/conftest.py",
     "tests/hook_samples.py",
@@ -245,12 +253,18 @@ def test_package_layout_dependency_direction():
             own_module = relative.removesuffix(".py").replace("/", ".")
             # verify 的修复面懒加载白名单（CONTRACTS §1.1）：v1.12 第四向
             # classify.classify_frames（帧产物回收补跑）加入，3→4。
-            allowed_operator_calls = {
-                "labelkit.operators.annotate",
-                "labelkit.operators.classify",
-                "labelkit.operators.extract",
-                "labelkit.operators.segment",
-            } if own_module == "labelkit.operators.verify" else set()
+            if own_module == "labelkit.operators.verify":
+                allowed_operator_calls = {
+                    "labelkit.operators.annotate",
+                    "labelkit.operators.classify",
+                    "labelkit.operators.extract",
+                    "labelkit.operators.segment",
+                }
+            elif own_module == "labelkit.operators.generate":
+                # M6 的物理拆分：generate_stream 是同一算子的纯逻辑承载文件。
+                allowed_operator_calls = {"labelkit.operators.generate_stream"}
+            else:
+                allowed_operator_calls = set()
             for imported in imports:
                 if (imported.startswith("labelkit.operators.")
                         and imported != own_module

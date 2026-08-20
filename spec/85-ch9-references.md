@@ -217,3 +217,19 @@
 - [108] Kirchdorfer, L., Özdemir, K. et al. A Divide-and-Conquer Approach for Modeling Arrival Times in Business Process Simulation (AT-KDE). arXiv:2505.22381；扩展版 Arrival Times in Dynamic Environments: Modeling, Evaluation, and Benchmarking for Business Process Simulation. Process Science, 2026. DOI: 10.1007/s44311-026-00041-z. 开源：github.com/konradoezdemir/AT-KDE（静态到达间隔分布的局限与分段 KDE 的替代方案，20 个真实流程实测——v1.14 把 `frame_gap_s` 的间隔分布形扩展列为演进候选而非本版内置的依据，8.4 M6 行）
 
 - [109] JSON Schema. Draft 2020-12 Core / Validation 规范：`contains`、`allOf`、`const` 均为原生关键字（`contains` 断言数组中至少一个元素满足子模式，一个 Schema 对象只有一个 `contains` 键位故多条件须分 `allOf` 支）。json-schema.org/draft/2020-12（2026-08-18 访问；`jsonschema` ≥ 4.21 直接可校验，L2 无需翻译层）（v1.14 蓝图覆盖硬约束「enum 给 ⊆、contains 给 ⊇、合成构成恰等」的规范依据，3.8.1）
+
+- [110] De Giacomo, G., Vardi, M. Y. Linear Temporal Logic and Linear Dynamic Logic on Finite Traces. IJCAI 2013. https://www.ijcai.org/Proceedings/13/Papers/132.pdf（v1.16 有限迹、vacuity、终止位置与有限自动机语义；此前候选材料中的 `/Papers/226.pdf` 非本文链接，本规格固定为 `/Papers/132.pdf`）
+
+- [111] Declare4Py. Managing Process Models — DECLARE templates. https://declare4py.readthedocs.io/en/latest/tutorials/2.Managing_Process_Models.html（v1.16 的 15 个模板名称与标准有限迹 conformance 语义参考；本工具不引入 Declare4Py 的运行时依赖）
+
+- [112] Burattin, A., Maggi, F. M., Sperduti, A. Conformance Checking Based on Multi-Perspective Declarative Process Models. Expert Systems with Applications 65, 2016. https://arxiv.org/pdf/1503.04957（MP-Declare 的 activation、correlation 与 time 条件分工；本工具不引入其完整表达式语言）
+
+- [113] Dechter, R., Meiri, I., Pearl, J. Temporal Constraint Networks. Artificial Intelligence 49, 1991. https://cse.unl.edu/~choueiry/Documents/DechterMeiri-AIJ.pdf（时间约束网络与差分约束语义底座）
+
+- [114] Disjunctive Temporal Problems under Structural Restrictions. AAAI. https://ojs.aaai.org/index.php/AAAI/article/view/16489（日历析取导致的组合约束；v1.16 交由同一个 CP-SAT 模型联合求解）
+
+- [115] Google OR-Tools. CP-SAT Solver. https://developers.google.com/optimization/cp/cp_solver（v1.16 结构、时间、日历、会话、交叉与噪音槽联合规划的成熟求解器）
+
+- [116] Google OR-Tools. Python `AddAutomaton` API. https://or-tools.github.io/docs/pdoc/ortools/sat/python/cp_model（同一组位置变量上的有限自动机约束接口；不构造显式乘积 DFA）
+
+- [117] Google OR-Tools 9.15 PyPI metadata. https://pypi.org/project/ortools/（生产依赖精确锁定 `ortools==9.15.6755`，不按本机可用版本漂移）

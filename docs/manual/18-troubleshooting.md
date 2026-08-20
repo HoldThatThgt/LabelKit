@@ -30,7 +30,7 @@
 
 v1.12（流模式帧粒度，第 25 章 25.6）**零新增错误码**：帧级分类/标注的失败复用既有 kind（结构修复耗尽照旧是 `schema_violation` 等），且**不产生 rejects 行**——帧分类失败落兜底帧类（计 `report.stream.frame_classify.fallback` / `window_failures`），帧标注失败落 members[] 的 `status="failed"`（计 `frame_annotate.failed`），episode 信封照常发射。排查入口见 18.2 的「members 里大量 status="failed"」。
 
-v1.13（时间流生成，第 27 章）同样**零新增错误码**，且它的失败也**不进 rejects**：蓝图/帧实现的修复穷尽、逐帧校验钩子违规都按「该序列整条作废」处置——不产 failed 记录、不补生成，账记在 `report.generate.stream` 的 `plan_failures` / `realize_failures` / `validator_scrapped` 三项上（排查入口见 18.2 的「合成序列大批作废」）。噪音批调用作废则更轻：缺额的噪音帧从交织中缺席，仅此而已。
+时间流生成到 v1.16 仍**零新增错误码**，内容失败也不进 rejects：brief/realize 修复穷尽、逐帧 hook、correlation 或序列 hook 违规都按「该序列整条作废」处置，不产 failed 记录、不补生成。联合 planner 的 `INFEASIBLE` / deterministic-budget `UNKNOWN` 是启动配置错误；`MODEL_INVALID` 是实现缺陷，走退出码 4，不能伪装成用户配置不可满足。
 
 ## 18.2 按症状排查
 
@@ -146,7 +146,7 @@ jq -e '.run.interrupted == false and .run.circuit_broken == false' out/report.js
 
 ### 「工件重放时会话对不上」（v1.13）
 
-现象：把时间流工件（`{输出名}.stream.jsonl`，第 27 章）拷去当输入重放，摄取侧切出的会话数与生成侧的 `report.generate.stream.sessions` 对不上——多半是重放工程的 `[stream]` 没抄对。三处逐一核对：① `order_by` 必须是**同一个** `meta:<字段>`（字段名由生成侧的 `[stream].order_by` 决定，工件行的时间戳键就叫这个名字，写错即全员坏行、退出码 3）；② `gap_s` 必须与生成侧一致——交织器铺的会话间隔恒为 `gap_s + frame_gap_s` 区间内的一个值，比生成侧调大就会把相邻两个会话粘成一个，调小则可能把会话内的长间隔切开；③ 重放侧别设 `key` / `gap_steps`（生成侧要求它们为空/0，重放侧多设一条断开规则自然会多切）。还要记得**加上重发的那个尾会话**：生成侧的 `sessions` 不含它，实测 5 + 1 = 6（第 27 章 27.8）。
+现象：把时间流工件拷去重放，摄取侧会话数与生成报告对不上。先核对 `order_by`、`gap_s`、`key` 与 `gap_steps`。v1.16 还要注意：显式 `time_s` 可以让 owner 相邻帧超过 `frame_gap_s`，但绝不会超过同一份 `stream.gap_s`；摄取侧以 `delta > gap_s` 才切 session，等于阈值不会切。duplicate 恒另占流尾 session，生成报告的 primary `sessions` 不含它。
 
 ### 「按类标注 Schema 没生效」（v1.13）
 
@@ -154,7 +154,7 @@ jq -e '.run.interrupted == false and .run.circuit_broken == false' out/report.js
 
 ### 「合成序列大批作废 / 交叉演示位没了」（v1.13）
 
-现象：时间流生成的 `report.generate.stream` 里 `produced` 明显小于 `planned`，或 `crossed_sessions` 掉到 0。**开了帧类构成档位（v1.14）时先做一次分档定位**：`tiers` 里那一格的 `produced` 与 `planned` 缺口直接告诉你作废压在哪一档——连着几跑都压在同一格（多半是构成最全、要求每类都出现的那档），处置是给该档减一个帧类或放宽该类 `len_range` 上界；散落各格则与档位无关，按下面的三项 failures 治。读之前**先认形状**：全部序列类都吃全局表时 `tiers` 是平面形 `{"<rank>": …}`，任一类声明了 `[[class.<名>.generate.tiers]]`（v1.15 按类档位表）时是类嵌套形 `{"<类名>": {"<rank>": …}}`，后者要「先按类、再按档」两层定位，而且**跨类的同一个 rank 不是同一档**（各类的生效表可以完全不同）。`tiers` 与 `sequences` 是同一笔配额的按档/按类两个切法，两边 `planned` 合计相等，对照着读最省事（第 27 章 27.4 有一份真实缺口读法）。再分三项 failures 定位：`plan_failures`（蓝图阶段修复耗尽——帧类表太大或 Schema 对模型偏难）、`realize_failures`（帧实现违反逐位契约或写满输出上限——降 `generate.temperature`、缩 `len_range`、给帧类 Schema 减字段；结构化输出层关掉的端点上这条更敏感，第 27 章 27.5）、`validator_scrapped`（`generate.sample_validator` 逐帧执行，任一帧违规**整序列作废**——这是拒绝采样语义，不是 bug）。`crossed_sessions` 是**派生量**（= Σ幸存 − `sessions`），幸存少了它先被吃掉——先治作废率，别去调 `sessions`。反方向的症状是桶统计的 `survived_dedup ≪ produced`：同类序列彼此太像被序列级相似度过滤淘汰，处置是提温度、把类 instruction 写出更多可变要素，**不要**放松 `[dedup]` 阈值。作废路径全都有 stderr WARN（带序列序号与类名），要看提示词与响应就临时订阅 `llm` 通道 + `trace.content = "full"`（数据副本，用完即清）。
+现象：时间流生成的 `produced` 少于 `planned`，或 `crossed_sessions` 掉到 0。先按类与档位定位 plan/realize 缺口，再核四个 validator 子项。`correlation_scrapped` 表示模型生成的类型敏感相等关系未成立；`temporal_scrapped` 在正常实现里应为零，出现即保存配置与 seed 报缺陷；`sample_validator_scrapped` 与 `sequence_validator_scrapped` 分别指向两个用户 hook。`crossed_sessions` 按 survivor 固定时间轴上真实 A-B-A / B-A-B 交替计算，一条 owner 作废后会退化，但不会重新装箱。相似度淘汰仍看 `survived_dedup`，不要用放松 dedup 阈值掩盖内容同质化。
 
 ### 「运行频繁被 429 限流拖慢 / 中断」
 
