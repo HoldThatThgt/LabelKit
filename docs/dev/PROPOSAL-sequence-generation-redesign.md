@@ -1,11 +1,15 @@
 # LabelKit 序列生成内核重建设计方案
 
-> 状态：设计提案，尚未成为实现规格<br>
+> 状态：已由 SPEC-sequence-generation-redesign.md 取代，仅保留设计背景<br>
 > 日期：2026-08-21<br>
 > 目标版本：v1.18<br>
 > 概念基线：v1.12 已具备的序列记录、帧分类、帧标注、JSON Schema、LLM 与上下文预算能力<br>
 > 实施基线：完成 v1.17 后的主线，但 v1.17 的序列生成实现不进入新内核<br>
 > 兼容策略：不兼容 v1.13–v1.17 的任何序列生成配置、内部接口、随机数消费、提示词、报表或工件格式
+
+> 权威实现语义以同目录的 SPEC-sequence-generation-redesign.md 为准。正式 SPEC 经三路审查后删除了
+> subsequence/filler，改为逐事件 actor view 执行、protected prefix causal closure、整序列 replay 和
+> 全下游反事实集合事务；本提案中的冲突字段不得作为实现依据。
 
 ## 1. 结论
 
