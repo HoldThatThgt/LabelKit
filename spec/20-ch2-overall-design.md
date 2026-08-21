@@ -103,6 +103,21 @@ rules/windows 时，不激活此例外，仍执行严格 `<`。
 - **求解状态 fail closed**——M1 收到 INFEASIBLE 报配置不可满足；UNKNOWN 只说明固定确定性预算内无法验证，错误不得声称 unsatisfiable；MODEL_INVALID 转 InternalError（退出码 4）。普通问题接受 FEASIBLE/OPTIMAL，噪音槽最大化问题只接受 OPTIMAL。M6 若在 M1 已通过后出现非接受状态，发 value-free ERROR 并以 InternalError 终止，不生成替代结果。
 - **默认关闭锚**——没有实际非零配额生效 rules/windows 时，M1/M6/estimate 均走 v1.15 原分支；若同时没有 `sequence_validator`，其 RNG 消费、提示词、调用数、主输出、rejects、report、工件与 trace 全部保持 v1.15 逐字节等价（既有 `sample_validator` 单独配置也不得新增报告键）。仅配置 sequence validator 而无 rules/windows 不激活 CP-SAT，但按冻结验证顺序执行回调并出现对应报告计数。
 
+（v1.17）**场景规划与精确交付组合约束**（本节为总体规范源头，字段级定义见 5.2.2，执行语义见 3.6.5；处置 E2E-42~60）：
+
+- **形态门改写**——v1.13 ① 的形态前提合取（generate_only ∧ text ∧ generate ∧ classify ∧ `meta:*` 排序 ∧ meta_mode ≠ none ∧ 工件键守卫）维持不变；v1.13 ④「装箱一致性」中的 `sessions ≤ Σsequences ≤ 2 × sessions`、`ts_start` 可解析与 `noise_instruction` 必填三条款**废止**（`sessions` / `ts_start` / `noise_instruction` 三键按删除键表定向 CONFIG_ERROR，5.2.2），由本簇的 `crossed_sessions` / `[generate.stream.schedule]` / `[[generate.stream.noise]]` 条款取代；v1.13 ② 的「至少一类有效 `sequences ≥ 1`」配额载体改由 quota 表达（未被任何 quota 提及的 sequence class target 为 0）。v1.16 的 `_horizon` 每 session 一周递推删除——schedule 是唯一的隐式无二的时间上界。
+- **删除键定向探针**——上表 5.2.2 十项删除键（`generate.sequences`、`[class.*.generate].sequences`、`generate.stream.sessions`、`ts_start`、`noise_instruction`、`rules`→`frame_rules`、`windows`→`frame_windows`（含按类同名表）、`module:function` hook）显式书写 ⇒ 定向 CONFIG_ERROR，错误只指引新表达、不读旧值、不转换、无别名。
+- **quota 簇**——每张 `[[generate.stream.quotas]]` 必须有自然名称（`[a-z0-9_]+`，全表唯一）；quota 中 class ∈ `classify.classes`；多张 quota 约束同一批 occurrence、不相加不覆盖；counts 形态与 total/weights/allocation 形态互斥，weights 形态必填 `allocation`；`exact` 下 total 非 cohort 整数倍 ⇒ M1 同轮报告归一化权重、minimum exact cohort 与上下最近可精确 total；time-stream 形态开启时 quota 表必须至少一张，且全部表编译出的 sequence target 总和 ≥ 1：零表或全零 target 是定向 CONFIG_ERROR（零序列工程只剩 noise 与无源 duplicate，没有可交付内容）（5.2.2）。
+- **schedule 簇**——`[generate.stream.schedule]` start/end 必填（显式 `Z` 或 numeric offset、同 offset、`end > start`），半开 `[start, end)`；`exclude_dates` 重复值报错、区间外条目定向 CONFIG_ERROR；排除日上不能放 primary、noise 或 duplicate。
+- **crossed_sessions 簇**——`0 ≤ crossed_sessions ≤ floor(target_sequences / 2)`；session 数恒为 `target_sequences − crossed_sessions`；duplicates 另增流尾 session 不参与计数；`crossed_sessions = 0` 时 crossing builder 不调用（model stats 中 crossing variables/constraints 必须为 0，E2E-43）。
+- **`--limit` 拒收**——time-stream 形态不再接受 `--limit`（M1 定向 CONFIG_ERROR，exit 2）：quota 是整体契约，截断后的前缀不再声称满足 quota（E2E-60 面；2.4）。
+- **noise 簇**——`noise_ratio > 0` ⇒ `[[generate.stream.noise]]` 非空；`== 0` 时写表定向 CONFIG_ERROR；noise 帧类须在帧类表且有非空生成指令、不得入任何生效 tier / frame rule / frame window、不得声明 duration 或 resources；task 帧候选域排除 noise 类，排除后候选域空 ⇒ 定向 CONFIG_ERROR。
+- **sequence rule 簇**——source/target 为已由 quota 拥有、target > 0 的 sequence class 且两者不同；period ∈ day/week/schedule；`gap_s` 正向模板可选半开 `[lo, hi)`（`0 ≤ lo < hi`），not_co_existence 禁止。
+- **duration / resource 簇**——`duration_s` 闭区间 `1e-6 ≤ lo ≤ hi`（微秒量化后为空 = CONFIG_ERROR）、仅结构化帧类；`resources` 每项 `[a-z0-9_]+`、非空时 duration_s 必须在场；声明 duration 的帧类必须在 `time_fields` 至少绑定 `end_ts` 或 `duration_s`。
+- **名称唯一域**——quota、frame rule、frame window 与 sequence rule 的 `name` 共处一个全局唯一域；resource 不另加配置名称，assumption 键固定 `resource:<resource-name>`。
+- **派生检查单点**——`derive_stream_bounds` 纯函数返回全部错误、不因前一错误短路：length / span / gap 关联错误与 quota cohort、duration/resource 前置条件在一次 validate 中同轮出现（E2E-49）；跨度检查使用实际 slot length domain 与 crossed count，不用 `session_max_len` 反推另一个错误。
+- **求解与容量口径**——M1 只调 `compile_scenario` 一次（validate/dry-run/run/estimate 共用同一冻结 `ScenarioPlan`，E2E-46）；quota model 与 timeline model **各自**执行 entries ≤ 250,000（不相加）；越界为 `PlannerCapacityError`（exit 4）而非 v1.16 的 CONFIG_ERROR 口径，INFEASIBLE 汇入 ConfigError（exit 2）、budget/internal 为 exit 4——三错误面绝不混示（E2E-44，7.6）。
+
 ### 2.3.2 算子对输出集的影响分析
 
 设某批进入流水线的存活记录数为 N（全流程视角对应 6.4 的 counts 不变量 `emitted + dropped_* + failed + bad_input = scanned + generated`；熔断中止时左侧另加 `unprocessed`，v1.6，6.4）。每个算子对最终输出集的影响从四个维度刻画：**基数**（条数如何变）、**内容/构成**（行内容与数据分布如何变）、**判定依据的落点**（决策证据写入哪个 `_meta` 字段 / 哪个 trace 事件，事后可审计）、**被淘汰记录的去向**。总原则先行：**主输出只含存活记录；`dropped_dup` / `dropped_lowq` / `dropped_verify` / `failed` 一律不入主输出、按 `output.rejects` 进拒绝通道**（"none" | "refs"（默认）| "full"，写出规格见 3.11.2）；v1.8 增两态——`dropped_noise` 同走 rejects，`absorbed`（成员并入 episode）为第三路由：主输出与 rejects 均不写、仅计数（3.11.2）；v1.9 增一态——`stitched`（被并 episode 壳）为**第四路由**：同 absorbed 仅计数（其成员随幸存线索信封落盘，3.11.2）。
@@ -144,7 +159,7 @@ jq -c 'select(._meta.scores["__aggregate__"] >= 0.6) | del(._meta)' \
 ```
 labelkit run      --config <config.toml> --project <project.toml>
                   [--input PATH] [--output PATH]        # 覆盖 project.toml 中 run.input / run.output
-                  [--limit N]                           # 只处理前 N 条（试跑）；v1.13 时间流生成子句：单位 = **序列**，截断在 M6 计划期配额层（类段字典序前缀；作废序列不再生成、不进交织）⇒ 工件与主输出的覆盖面恒一致（3.6.5）；v1.8 stream 子句：帧级截断不变（islice 在 M2 解析流与会话装配器之间），截断视同 EOF——尾部未闭合会话按会话闭合下发并 WARN 一次「尾会话被 --limit 截断」（3.2.8）
+                  [--limit N]                           # 只处理前 N 条（试跑）；v1.13 时间流生成子句：单位 = **序列**，截断在 M6 计划期配额层（类段字典序前缀；作废序列不再生成、不进交织）⇒ 工件与主输出的覆盖面恒一致（3.6.5）；v1.8 stream 子句：帧级截断不变（islice 在 M2 解析流与会话装配器之间），截断视同 EOF——尾部未闭合会话按会话闭合下发并 WARN 一次「尾会话被 --limit 截断」（3.2.8）；v1.17：time-stream 形态不再接受 `--limit`（quota 是整体契约，截断后的前缀不再声称满足 quota，2.3.1）
                   [--dry-run]                           # 走完 M1/M2 校验与成本估算，不调用 LLM；报告写 {stem}.dryrun.report.json、trace 写「trace 文件名在扩展名前插 .dryrun」（默认 {stem}.trace.dryrun.jsonl），不覆盖上次真实运行的产物（v1.5）；generate_only 无 M2，成本按 3.6.2 调用次数公式静态估算；v1.7：classify 启用时估算增 classify_calls（公式与 multi/按类覆盖下的下界口径见 3.10.3 分类与扇出行）；v1.8：segment 启用时估算增 segment_calls / extract_calls——segment_calls = Σ ceil((L−1)/(w_min−1))（L 为会话长；L=1 或 strategy="rules" 计 0；v1.11 注：w_min = 预算最坏保证装填量，由 budget.min_window(cfg) 导出——上界语义，实际窗数 ≤ 估算；预算未声明时 w_min = window、与 v1.8 公式同构数值不变，V12/3.10.3）、extract_calls = Σ(L−1) 报上界，quality/annotate/verify 以 episodes ≈ sessions 报下界 + stderr 注明；批数按会话空跑实际装箱精确得出，文本模态行数统计与会话空跑单遍融合（3.10.3、3.2.8）；v1.9：估算增 stitch_calls = 会话数 × votes ×（2 若 repass 否则 1）（episodes ≈ sessions 下界基数，沿用既有 stderr 下界注；off 时恒 0 且该行无条件打印——segment_calls 先例，3.10.3）
                   # v1.16 时间流约束形态：--limit 先裁出实际配额前缀；dry-run 以同 seed 独立 RNG 副本调用 M1/M6 共用的联合规划入口，精确复演条件长度、噪音槽与内容调用计划，不推进运行期 RNG，不发起 LLM 调用（3.6.5、3.10.3）
                   [--strict]                            # 任何记录被拒绝即以退出码 1 结束；v1.9 补注：stitched 壳与被救援帧均不构成 rejects——同输入开启 stitch 后（短段被救援而不再落 rejects）strict 结果可能由 1 变 0，属预期（3.11.2、3.16.6）
@@ -158,7 +173,7 @@ labelkit rubric   [--show default:text | default:ui | default:trajectory]   # �
 | 退出码 | 含义 |
 |---|---|
 | 0 | 运行完成。可能存在被拒绝记录（详见 report.json 与 stderr 摘要）。 |
-| 1 | 运行完成但违反 `--strict`（存在 rejects），或报告写出失败。 |
+| 1 | 运行完成但违反 `--strict`（存在 rejects），或报告写出失败。v1.17 增：time-stream 形态 exact delivery 预算耗尽（任一 slot Exhausted）——原子交付已成功部分、report 标 `delivery.complete = false`，以退出码 1 收口，与 provider fatal / circuit breaker 的退出码 4 区分（7.6）。 |
 | 2 | 配置错误（TOML 语法/字段/引用的 profile 不存在/Schema 非法/rubric 非法/环境变量缺失）。 |
 | 3 | 输入错误，仅 process 模式（路径不存在、无任何合法记录、UI 模态 index 冲突且策略为 fail）；generate_only 无输入不触发本码——生成产出 0 条时照常 finalize（counts.generated = 0），以退出码 0 结束。 |
 | 4 | 致命运行错误（LLM 认证失败、连续不可恢复的 provider 错误超过熔断阈值、输出路径不可写）。v1.6：熔断中止仍原子交付已完成批的主输出与 rejects 并写报告（run.partial_delivery=true，3.10.3 熔断交付）；输出路径不可写则无任何交付。 |
@@ -174,6 +189,8 @@ labelkit rubric   [--show default:text | default:ui | default:trajectory]   # �
 
 参数优先级（高覆盖低）：**CLI 参数 > project.toml > config.toml 内的全局默认**。M1 在启动时完成三源合并并冻结为 `ResolvedConfig`，运行期只读。
 
+**v1.17 边界补注（路径与凭据）**：project.toml 内的相对路径自 v1.17 起一律相对 **project root**（= project 文件所在目录，读取成功后立即冻结）解析——覆盖 `run.input` / `run.output`、各 `schema_path`（output / 按类标注 / frame.annotate / frame.class 生成）、`trace.path` 与四个 hook 文件路径，本地 hook 与工程一起移动仍可运行；CLI `--input` / `--output` 是 shell 参数，相对路径先按调用 cwd 解析再参与三源优先级；无论来源，`ResolvedConfig` 内只保留绝对规范化路径（配置原文仍用于 digest，不改写文件）。config.toml 的 profile 只声明环境变量**名**——无 `--probe` 的 validate 与 dry-run 自 v1.17 起不调用任何环境变量 value reader、不发 missing-key WARN（secret-free 静态校验）；run 与 `validate --probe` 才聚合解析 key value，载体为不入 `ResolvedConfig` 的 `RuntimeCredentials`（3.1.4、3.9、7.6）。
+
 ## 2.6 非功能约束
 
 | 维度 | 约束与设计 |
@@ -188,3 +205,5 @@ labelkit rubric   [--show default:text | default:ui | default:trajectory]   # �
 | 容错 | 记录级隔离（1.3 节）；LLM 调用按 profile 配置重试（指数退避+全抖动）；v1.6 密钥池：profile 可声明多把 API Key（`api_key_envs`，5.1），429 按密钥冷却并即时轮换、认证失败按密钥禁用、全池冷却有界驻留（`run.max_park_s`，默认 3600s，超限按重试耗尽计），单密钥配置数据产出与熔断语义不变、429 等待路径有修订（3.9.3 重试行）；连续 `fatal_error_threshold`（默认 20）次不可恢复 provider 错误触发熔断（认证类 401/403 立即熔断、不计连续数，v1.5；v1.6 池化下 = 最后一把存活密钥被认证禁用时），以退出码 4 终止，写出已完成部分的报告并原子交付已完成批的主输出与 rejects（v1.6 熔断交付，3.10.3）。 |
 | 依赖面 | Python ≥ 3.11（tomllib 标准库）。第三方仅：`httpx`（异步 HTTP）、`jsonschema`（校验）、`datasketch`（MinHash-LSH）、`Pillow`+`imagehash`（pHash）、`json-repair`（确定性 JSON 修复）、`numpy`（BT 拟合）、`rich`（v1.10，7.7 console rich 档终端呈现；纯 Python，传递依赖 markdown-it-py + pygments 亦纯 Python；**懒 import**——仅 console 判定为 rich 档时于 CLI 层导入（M1 只以 find_spec 探测），导入失败自动降级 plain，operators/common 零触点；工业背书 pip vendored（`docs/dev/PROPOSAL-tui-console.md` [C-9]），对齐决策 1.6 U4）。无框架级依赖（rich 定性为终端呈现库；应用框架级的 textual 经调研否决——`docs/dev/SPEC-tui-console.md` §2 U4/U16）。 |
 | v1.16 依赖增量 | 精确新增并锁定 `ortools==9.15.6755`。OR-Tools 是序列规则联合规划专用的成熟算法库例外，不是应用框架；禁止运行时替代实现或按本机版本漂移。生产触点只在 common runtime 联合规划器，M1/M6/M10 通过共享接口调用；既有依赖及 `rich` 懒加载语义不变。 |
+| v1.17 有限 schedule 与 quota | 有限 `[generate.stream.schedule]`（半开 `[start, end)` + `exclude_dates`，5.2.2）是时间规划的**硬边界**：一天配置只能生成这一天内的 occurrence，排除日上不能放 primary、noise 或 duplicate，无第二个隐式时间上界（v1.16 `_horizon` 每 session 一周递推删除）。quota 自 v1.17 起表达**成功交付数量**（exact delivery 目标，取代 v1.13「尝试配额」语义——8.3 O6 时间流辖区核销）：sequence 与 structured noise 都在 `max_attempts_per_slot` 有界预算内补足，耗尽按 slot 记 shortfall、原子交付已成功部分并以退出码 1 收口（7.6）；time-stream 形态不再接受 `--limit`。quota/dry-run/estimate 与 M6 共用同一份冻结 `ScenarioPlan`（M1 单次编译，3.1.4、3.10.3）。 |
+| v1.17 规划容量与预算口径 | v1.16「单一 250,000 上限以 CONFIG_ERROR 拒绝」口径修订：quota model 与 timeline model **各自**执行 entries（variables + constraints）≤ 250,000，不相加误报；越界抛 `PlannerCapacityError`（运行期 exit 4，含 actual/limit/dominant family，**绝不显示为 INFEASIBLE**），deterministic budget（每层 10.0 冻结常数）内无法冻结最优抛 `PlannerBudgetError`（exit 4），用户硬约束无解为 `PlannerInfeasibleError`（汇入 ConfigError，exit 2）——三错误面与稳定英文 message 见 7.6（E2E-44）。 |

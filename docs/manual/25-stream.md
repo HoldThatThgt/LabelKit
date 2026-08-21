@@ -40,7 +40,7 @@ flowchart LR
 
 这套形态不是发明：从状态对反推动作是 OpenAI VPT 的逆动力学模型与 OS-Genesis 逆向任务合成的既有工序，滑窗 LLM 边界裁决是 2026 年 GUI 轨迹量产管线（Video2GUI 等）仍在用的形态之一，LabelKit 按自己的负边界（不训练本地模型）用运行时 LLM 充当这两个角色。**什么时候开**：输入是按时间排好的操作流（UI 模态的截图 + 树对，或带时间戳的文本事件流）、且你要的样本单位是「活动段」而非单条记录。开关是 `segment.enabled = true`，约束：仅 process 模式、必须开 annotate、与 generate 互斥；`extract` 再要求 UI 模态。默认全关——不开时行为与 v1.7 逐字节一致（输出只多一个恒为 null 的 `_meta.stream` 键）。
 
-**手上没有真实流呢？**时间流生成在 `generate_only` 下从零合成多会话流。两者是镜像关系：本章从帧流演绎序列，生成侧直接铺设序列，所以 segment / stitch / extract 不参与。v1.16 有规则或日历窗口时，结构不再由 LLM 蓝图与后置随机织造共同碰撞，而由联合 planner 在 LLM 前冻结。工件仍是本章的合法输入；owner 相邻帧始终满足 `delta <= stream.gap_s`，因此 crossing 同伴作废后重放也不会把幸存 owner 切断。
+**手上没有真实流呢？**时间流生成在 `generate_only` 下从零合成多会话流。两者是镜像关系：本章从帧流演绎序列，生成侧直接铺设序列，所以 segment / stitch / extract 不参与。v1.17 生成侧有 quota、规则或日历窗口时，结构不再由 LLM 蓝图与后置随机织造共同碰撞，而由 ScenarioPlan 在 LLM 前冻结；process stream 的 sessions/windows 语义仍由本章前面的 `[stream]` 与 segment 规则定义。工件仍是本章的合法输入；owner 相邻帧始终满足 `delta <= stream.gap_s`，因此 crossing 同伴作废后重放也不会把幸存 owner 切断。
 
 ## 25.2 快速上手：examples/stream 全流程
 

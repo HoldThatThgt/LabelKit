@@ -14,7 +14,8 @@ from labelkit.common.errors import (
     ProviderFatalError,
 )
 from labelkit.orchestration.factory import build_stages as _build_stages
-from labelkit.orchestration.profile_usage import referenced_profiles
+# v1.17 Wave 2b：referenced_profiles 收集器已下沉 common 层（CONTRACTS §7.19.3）。
+from labelkit.common.runtime.credentials import referenced_profiles
 
 from .commands import _cmd_rubric, _cmd_run, _cmd_validate
 from .main import _print_exception, exit_code_for, main

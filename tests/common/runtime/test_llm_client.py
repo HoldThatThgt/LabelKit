@@ -36,6 +36,7 @@ from labelkit.common.errors import (
     ProviderRetryableError,
 )
 from labelkit.common.runtime import budget, llm_client
+from labelkit.common.runtime.credentials import RuntimeCredentials
 from labelkit.common.runtime.llm_client import (
     ANTHROPIC_VERSION,
     KeySnapshot,
@@ -79,6 +80,11 @@ from tests.common.config.test_config import BASE_CONFIG, Env, env, has  # noqa: 
 
 # ── fixtures ────────────────────────────────────────────────────────────────
 
+def _creds(llm: dict | None = None, emb: dict | None = None) -> RuntimeCredentials:
+    """v1.17 Wave 2b 构造契约的最小凭据载体（默认空表 = 纯逻辑用例的静态面）。"""
+    return RuntimeCredentials(llm=llm or {}, embedding=emb or {})
+
+
 def _llm_profile(**over) -> LLMProfile:
     defaults = dict(
         name="default", provider="openai_compatible",
@@ -86,15 +92,14 @@ def _llm_profile(**over) -> LLMProfile:
         api_key_env="TEST_KEY", max_concurrency=2, timeout_s=30, max_retries=5,
         retry_base_delay_s=1.0, supports_structured_output=True,
         supports_vision=True, max_output_tokens=4096, temperature=0.0,
-        max_image_px=2048, api_key="sk-test")
+        max_image_px=2048)
     defaults.update(over)
     return LLMProfile(**defaults)
 
 
 def _embedding_profile(**over) -> EmbeddingProfile:
     defaults = dict(name="embed", base_url="https://emb.example.com/v1",
-                    model="embed-model", api_key_env="TEST_KEY", dims=4,
-                    api_key="sk-test")
+                    model="embed-model", api_key_env="TEST_KEY", dims=4)
     defaults.update(over)
     return EmbeddingProfile(**defaults)
 
@@ -474,7 +479,7 @@ def test_success_llm_call_event_merges_output_messages_over_trace_extra():
         def event(self, ev, *, stage, batch_no, record_ids=(), payload=None):
             events.append((ev, dict(payload or {})))
 
-    client = LLMClient({"default": _llm_profile()}, {}, metrics=_Recorder())
+    client = LLMClient({"default": _llm_profile()}, {}, _creds(), metrics=_Recorder())
     extra = {"gen_ai.input.messages": [{"role": "user", "content": []}]}
     merged = dict(extra)
     merged.update({"gen_ai.output.messages": _render_output_messages("hi", None)})
@@ -516,7 +521,7 @@ def test_usage_accounting_no_cost_without_both_prices():
 # ── client-level pure behavior (no network) ────────────────────────────────
 
 def test_unknown_llm_profile_raises_value_error():
-    client = LLMClient({}, {})
+    client = LLMClient({}, {}, _creds())
     prompt = PromptBundle(messages=(
         Message(role="user", parts=(Part(kind="text", text="hi"),)),))
     with pytest.raises(ValueError):
@@ -524,7 +529,7 @@ def test_unknown_llm_profile_raises_value_error():
 
 
 def test_embed_rejects_llm_profile_names():
-    client = LLMClient({"default": _llm_profile()}, {})
+    client = LLMClient({"default": _llm_profile()}, {}, _creds())
     with pytest.raises(ValueError, match=r"\[llm\.\*\] name"):
         asyncio.run(client.embed("default", ["x"]))
     with pytest.raises(ValueError):
@@ -532,7 +537,7 @@ def test_embed_rejects_llm_profile_names():
 
 
 def test_semaphore_shared_per_profile_with_configured_bound():
-    client = LLMClient({"default": _llm_profile(max_concurrency=2)}, {})
+    client = LLMClient({"default": _llm_profile(max_concurrency=2)}, {}, _creds())
     sem1 = client._semaphore("llm", "default", 2)
     sem2 = client._semaphore("llm", "default", 2)
     assert sem1 is sem2
@@ -543,7 +548,7 @@ def test_semaphore_shared_per_profile_with_configured_bound():
 
 
 def test_probe_unknown_profile_never_raises():
-    client = LLMClient({}, {})
+    client = LLMClient({}, {}, _creds())
     result = asyncio.run(client.probe("ghost"))
     assert result.ok is False
     assert result.profile == "ghost"
@@ -562,25 +567,24 @@ POOL_CONFIG = BASE_CONFIG.replace(
 # ── M1: api_key_envs parsing / validation / normalization ──────────────────
 
 
-def test_pool_parses_and_resolves_every_key(env, monkeypatch):
-    monkeypatch.setenv("LK_TEST_KEY_A", "sk-a")
-    monkeypatch.setenv("LK_TEST_KEY_B", "sk-b")
+def test_pool_parses_env_names_only(env, monkeypatch):
+    """v1.17 secret-free：静态 load 只归一环境变量名，不解析任何密钥值。"""
+    monkeypatch.delenv("LK_TEST_KEY_A", raising=False)
+    monkeypatch.delenv("LK_TEST_KEY_B", raising=False)
     cfg = env.load(config_text=POOL_CONFIG)
     prof = cfg.llm_profiles["default"]
     assert prof.api_key_envs == ("LK_TEST_KEY_A", "LK_TEST_KEY_B")
-    assert prof.api_keys == ("sk-a", "sk-b")
-    # api_key_env / api_key mirror element 0 (CONTRACTS §6.1, v1.6)
     assert prof.api_key_env == "LK_TEST_KEY_A"
-    assert prof.api_key == "sk-a"
+    assert not hasattr(prof, "api_keys")
 
 
-def test_scalar_form_normalizes_to_one_tuple(env):
-    """Existing single-key configs parse to a pool of one — v1.5 compat."""
+def test_scalar_form_normalizes_to_one_tuple(env, monkeypatch):
+    """Existing single-key configs parse to a pool of one — keyless load OK."""
+    monkeypatch.delenv("LK_TEST_KEY_DEFAULT", raising=False)
     cfg = env.load()
     prof = cfg.llm_profiles["default"]
     assert prof.api_key_envs == ("LK_TEST_KEY_DEFAULT",)
-    assert prof.api_keys == ("sk-default",)
-    assert prof.api_key == "sk-default"
+    assert not hasattr(prof, "api_key")
 
 
 def test_both_forms_is_config_error(env, monkeypatch):
@@ -621,19 +625,18 @@ def test_duplicate_env_names_are_config_error(env, monkeypatch):
     has(errors, "duplicate")
 
 
-def test_missing_env_vars_reported_per_element(env, monkeypatch):
-    """Rule 12 (v1.6): EVERY listed variable of a referenced profile must be
-    set — one aggregated error line per missing variable, [N] addressed."""
+def test_missing_env_values_are_not_static_errors(env, monkeypatch):
+    """v1.17 secret-free（SPEC-SP §5.2）：缺密钥值不再是静态 CONFIG_ERROR——
+    run/probe 期的 RuntimeCredentials 才物化凭据。"""
     monkeypatch.setenv("LK_TEST_KEY_B", "sk-b")
     monkeypatch.delenv("LK_TEST_KEY_A", raising=False)
     monkeypatch.delenv("LK_TEST_KEY_C", raising=False)
     three = BASE_CONFIG.replace(
         'api_key_env = "LK_TEST_KEY_DEFAULT"',
         'api_key_envs = ["LK_TEST_KEY_A", "LK_TEST_KEY_B", "LK_TEST_KEY_C"]', 1)
-    errors = env.errors(config_text=three)
-    has(errors, "[llm.default].api_key_envs[1]")
-    has(errors, "[llm.default].api_key_envs[3]")
-    assert not any("api_key_envs[2]" in e for e in errors)
+    cfg = env.load(config_text=three)
+    assert cfg.llm_profiles["default"].api_key_envs == (
+        "LK_TEST_KEY_A", "LK_TEST_KEY_B", "LK_TEST_KEY_C")
 
 
 def test_unreferenced_pooled_profile_needs_no_keys(env):
@@ -642,22 +645,20 @@ def test_unreferenced_pooled_profile_needs_no_keys(env):
         'api_key_env = "LK_TEST_KEY_JUDGE"',
         'api_key_envs = ["LK_TEST_KEY_J1", "LK_TEST_KEY_J2"]', 1)
     cfg = env.load(config_text=pooled_judge)   # judge unreferenced → no error
-    assert cfg.llm_profiles["judge"].api_keys == ()
+    assert cfg.llm_profiles["judge"].api_key_envs == ("LK_TEST_KEY_J1", "LK_TEST_KEY_J2")
 
 
-def test_embedding_pool_resolves_via_semantic_reference(env, monkeypatch):
-    monkeypatch.setenv("LK_TEST_KEY_E1", "sk-e1")
+def test_embedding_pool_keeps_env_names_keyless(env, monkeypatch):
+    """v1.17 secret-free：语义引用侧同样不解析密钥值。"""
+    monkeypatch.delenv("LK_TEST_KEY_E1", raising=False)
     monkeypatch.delenv("LK_TEST_KEY_E2", raising=False)
     emb_pool = BASE_CONFIG.replace(
         'api_key_env = "LK_TEST_KEY_EMB"',
         'api_key_envs = ["LK_TEST_KEY_E1", "LK_TEST_KEY_E2"]', 1)
     body = '[dedup]\nsemantic = true\nsemantic_embedding = "emb"'
-    errors = env.errors(config_text=emb_pool,
-                        project_text=env.project(body=body))
-    has(errors, "[embedding.emb].api_key_envs[2]")
-    monkeypatch.setenv("LK_TEST_KEY_E2", "sk-e2")
     cfg = env.load(config_text=emb_pool, project_text=env.project(body=body))
-    assert cfg.embedding_profiles["emb"].api_keys == ("sk-e1", "sk-e2")
+    assert cfg.embedding_profiles["emb"].api_key_envs == (
+        "LK_TEST_KEY_E1", "LK_TEST_KEY_E2")
 
 
 def test_max_park_s_default_parse_and_bounds(env):
@@ -729,43 +730,77 @@ def _prof(**over) -> LLMProfile:
     return LLMProfile(**defaults)
 
 
-def test_pool_members_normalized_profile():
-    prof = _prof(api_key_envs=("E1", "E2"), api_keys=("k1", "k2"))
-    assert _pool_members(prof) == [("E1", "k1"), ("E2", "k2")]
+def test_pool_members_come_from_credentials_not_the_environment(monkeypatch):
+    """v1.17 Wave 2b（CONTRACTS §7.19.3）：成员 (env 名, 密钥值) 序对来自
+    RuntimeCredentials——env 现读腿已删除，os.environ.get 在本模块零调用。"""
+    def _boom(name, default=None):  # noqa: ANN001
+        raise AssertionError(f"llm_client must not read env values (got {name!r})")
+
+    monkeypatch.setattr("os.environ.get", _boom)
+    prof = _prof(api_key_envs=("E1", "E2"))
+    creds = _creds(llm={"p": ("k1", "k2")})
+    assert _pool_members("llm", prof, creds) == [("E1", "k1"), ("E2", "k2")]
 
 
-def test_pool_members_single_key_fallback_matches_v15():
-    """Directly-constructed single-key profiles (tests, probe children) keep
-    the pre-v1.6 api_key → env fallback."""
-    assert _pool_members(_prof(api_key="k")) == [("E1", "k")]
-
-
-def test_pool_members_env_fallback(monkeypatch):
-    monkeypatch.setenv("E1", "k1")
-    monkeypatch.setenv("E2", "k2")
-    prof = _prof(api_key_envs=("E1", "E2"))             # api_keys unresolved
-    assert _pool_members(prof) == [("E1", "k1"), ("E2", "k2")]
+def test_pool_members_single_key_profile():
+    assert _pool_members("llm", _prof(), _creds(llm={"p": ("k1",)})) == [("E1", "k1")]
 
 
 def test_pool_members_embedding_profile():
     prof = EmbeddingProfile(name="e", base_url="https://x", model="m",
-                            api_key_env="E1", api_key_envs=("E1",),
-                            api_keys=("k1",))
-    assert _pool_members(prof) == [("E1", "k1")]
+                            api_key_env="E1", api_key_envs=("E1",))
+    assert _pool_members("embedding", prof, _creds(emb={"e": ("k1",)})) == [("E1", "k1")]
+
+
+def test_pool_members_duplicate_values_collapse_to_first_declaration():
+    """§7.19.3 值去重：同一密钥值被两个环境变量别名 ⇒ 池内一把键，首声明者
+    获得身份位（KeyUsage / trace / probe 的 key_env 语义）。"""
+    prof = _prof(api_key_envs=("E1", "E2"))
+    creds = _creds(llm={"p": ("k1",)})       # ("k1","k1") 已被构造期去重
+    assert _pool_members("llm", prof, creds) == [("E1", "k1")]
+
+
+def test_pool_members_absent_credentials_fail_closed():
+    """剖面缺席于凭据 ⇒ fail-closed（内部不变式破裂），绝不拿空串密钥静默组池。"""
+    with pytest.raises(ValueError, match="absent from runtime credentials"):
+        _pool_members("llm", _prof(), _creds())
 
 
 def test_pool_members_without_any_declared_env_name():
-    """完全没有环境变量名的剖面（直接构造）退化为一把无名密钥；身份位始终是空串，
-    绝不是密钥值。"""
-    assert _pool_members(_prof(api_key_env="", api_key="k")) == [("", "k")]
-    assert _pool_members(_prof(api_key_env="", api_key="")) == [("", "")]
+    """完全没有环境变量名的剖面（直接构造）退化为一把无名空密钥；身份位始终是
+    空串，绝不是密钥值。"""
+    assert _pool_members("llm", _prof(api_key_env=""), _creds()) == [("", "")]
+
+
+def test_client_construction_requires_credentials():
+    """v1.17 Wave 2b 构造契约：LLMClient 必须收 RuntimeCredentials——缺位即
+    TypeError，不存在任何 env/profile secret fallback。"""
+    with pytest.raises(TypeError):
+        LLMClient({}, {})
+
+
+def test_client_never_reads_the_environment_for_keys(monkeypatch):
+    """构造与快照（未材料化池的纯读面）全程零 os.environ.get——静态面纪律。"""
+    calls: list[str] = []
+
+    def _spy(name, default=None):  # noqa: ANN001
+        calls.append(name)
+        return None
+
+    monkeypatch.setattr("os.environ.get", _spy)
+    client = LLMClient({"default": _llm_profile(api_key_envs=("KEY_A", "KEY_B"))},
+                       {"embed": _embedding_profile()}, _creds())
+    snaps = client.snapshot()
+    assert client._pools == {}                    # 快照不材料化
+    assert [k.env for s in snaps for k in s.keys] == ["KEY_A", "KEY_B", "TEST_KEY"]
+    assert calls == []                            # 全程零环境变量读取
 
 
 # ── M9: usage merging / probe shape ─────────────────────────────────────────
 
 
 def test_merge_usage_merges_keys_and_park_stats():
-    client = LLMClient({}, {})
+    client = LLMClient({}, {}, _creds())
     src = ProfileUsage(calls=2, prompt_tokens=10, completion_tokens=5,
                        retries=1, parked_calls=1, parked_ms=1500,
                        keys={"E1": KeyUsage(calls=2, rate_limited=3),
@@ -788,8 +823,8 @@ def test_pool_creation_preseeds_key_usage_for_pools():
     """Report gate fix (review): every member of a pooled profile appears in
     ProfileUsage.keys from pool creation — serialized traffic that only ever
     selects key 0 must not make a pool look single-key in report.llm_usage."""
-    prof = _prof(api_key_envs=("E1", "E2"), api_keys=("k1", "k2"))
-    client = LLMClient({"p": prof}, {})
+    prof = _prof(api_key_envs=("E1", "E2"))
+    client = LLMClient({"p": prof}, {}, _creds(llm={"p": ("k1", "k2")}))
     client._pool("llm", prof)
     keys = client.usage_by_profile["p"].keys
     assert set(keys) == {"E1", "E2"}
@@ -798,8 +833,8 @@ def test_pool_creation_preseeds_key_usage_for_pools():
 
 
 def test_pool_creation_does_not_seed_single_key_profiles():
-    prof = _prof(api_key="k")
-    client = LLMClient({"p": prof}, {})
+    prof = _prof()
+    client = LLMClient({"p": prof}, {}, _creds(llm={"p": ("k1",)}))
     client._pool("llm", prof)
     usage = client.usage_by_profile.get("p")
     assert usage is None or not usage.keys
@@ -815,11 +850,11 @@ def test_max_park_s_reads_run_config(tmp_path):
 
     cfg = make_cfg(tmp_path)
     sink = MetricsSink(cfg, "t", EventLog(cfg.trace, "t"))
-    assert LLMClient({}, {}, sink)._max_park_s() == 3600.0
+    assert LLMClient({}, {}, _creds(), sink)._max_park_s() == 3600.0
     cfg0 = dc_replace(cfg, run=dc_replace(cfg.run, max_park_s=0))
     sink0 = MetricsSink(cfg0, "t", EventLog(cfg0.trace, "t"))
-    assert LLMClient({}, {}, sink0)._max_park_s() == 0.0
-    assert LLMClient({}, {})._max_park_s() == 3600.0
+    assert LLMClient({}, {}, _creds(), sink0)._max_park_s() == 0.0
+    assert LLMClient({}, {}, _creds())._max_park_s() == 3600.0
 
 
 # ── v1.10: snapshot() read-only console pull (spec 3.9.2/3.9.3 快照行) ──────
@@ -828,7 +863,7 @@ def test_max_park_s_reads_run_config(tmp_path):
 def test_snapshot_unmaterialized_pool_zero_values():
     """No traffic yet: keys derive from the DECLARED env names, everything
     else is zero/None — and snapshot() must NOT materialize self._pools."""
-    client = LLMClient({"default": _llm_profile()}, {"embed": _embedding_profile()})
+    client = LLMClient({"default": _llm_profile()}, {"embed": _embedding_profile()}, _creds(), _creds())
     snaps = client.snapshot()
     assert client._pools == {}                      # read never materializes
     assert [(s.kind, s.name) for s in snaps] == [("llm", "default"),
@@ -845,8 +880,8 @@ def test_snapshot_unmaterialized_pool_zero_values():
 
 
 def test_snapshot_unmaterialized_multi_key_pool_lists_declared_envs():
-    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"), api_keys=("ka", "kb"))
-    client = LLMClient({"default": prof}, {})
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"))
+    client = LLMClient({"default": prof}, {}, _creds())
     (snap,) = client.snapshot()
     assert snap.keys == (KeySnapshot(env="KEY_A", state="ok"),
                          KeySnapshot(env="KEY_B", state="ok"))
@@ -856,7 +891,7 @@ def test_snapshot_unmaterialized_multi_key_pool_lists_declared_envs():
 def test_snapshot_enumerates_llm_then_embedding_in_declaration_order():
     client = LLMClient(
         {"default": _llm_profile(), "judge": _llm_profile(name="judge")},
-        {"embed": _embedding_profile()})
+        {"embed": _embedding_profile()}, _creds())
     assert [(s.kind, s.name) for s in client.snapshot()] == [
         ("llm", "default"), ("llm", "judge"), ("embedding", "embed")]
 
@@ -865,9 +900,9 @@ def test_snapshot_key_states_cooldown_remaining_with_injected_now():
     """Pool three-state row (spec 3.9.2): disabled wins over a future cooldown;
     cooldown carries ceil remaining seconds; deadline-passed keys are ok.
     in_flight = Σ key in_flight."""
-    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B", "KEY_C"),
-                        api_keys=("ka", "kb", "kc"))
-    client = LLMClient({"default": prof}, {})
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B", "KEY_C"))
+    client = LLMClient({"default": prof}, {},
+                       _creds(llm={"default": ("ka", "kb", "kc")}))
     pool = client._pool("llm", prof)                # materialize (as traffic would)
     pool.states[0].in_flight = 2
     pool.states[1].in_flight = 1
@@ -889,7 +924,7 @@ def test_snapshot_key_states_cooldown_remaining_with_injected_now():
 
 
 def test_snapshot_usage_mirror_and_cost():
-    client = LLMClient({"default": _llm_profile()}, {})
+    client = LLMClient({"default": _llm_profile()}, {}, _creds())
     client._usage["default"] = ProfileUsage(
         calls=3, prompt_tokens=9552, completion_tokens=486, retries=2,
         est_cost_usd=0.0066)
@@ -900,7 +935,7 @@ def test_snapshot_usage_mirror_and_cost():
 
 
 def test_snapshot_p50_median_window_and_none_when_empty():
-    client = LLMClient({"default": _llm_profile()}, {})
+    client = LLMClient({"default": _llm_profile()}, {}, _creds())
     (snap,) = client.snapshot()
     assert snap.p50_latency_ms is None              # no samples yet
     client._latencies[("llm", "default")] = deque([100, 200, 300], maxlen=256)
@@ -913,7 +948,7 @@ def test_snapshot_p50_median_window_and_none_when_empty():
 
 
 def test_snapshot_p50_window_is_bounded_at_256():
-    client = LLMClient({"default": _llm_profile()}, {})
+    client = LLMClient({"default": _llm_profile()}, {}, _creds())
     window = client._latencies.setdefault(("llm", "default"), deque(maxlen=256))
     for v in range(300):                            # 0..299 → window keeps 44..299
         window.append(v)
@@ -926,7 +961,7 @@ def test_snapshot_kind_disambiguates_same_name_profiles():
     """spec 3.9.2: _usage buckets by NAME (existing quirk) — kind disambiguates
     the snapshot identity, and the p50 window is keyed by (kind, name)."""
     client = LLMClient({"shared": _llm_profile(name="shared")},
-                       {"shared": _embedding_profile(name="shared")})
+                       {"shared": _embedding_profile(name="shared")}, _creds())
     client._usage["shared"] = ProfileUsage(calls=3)
     client._latencies[("llm", "shared")] = deque([100], maxlen=256)
     client._latencies[("embedding", "shared")] = deque([300], maxlen=256)
@@ -939,9 +974,10 @@ def test_snapshot_kind_disambiguates_same_name_profiles():
 
 
 def test_snapshot_never_mutates_client_state():
-    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"), api_keys=("ka", "kb"))
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"))
     emb = _embedding_profile()
-    client = LLMClient({"default": prof}, {"embed": emb})
+    client = LLMClient({"default": prof}, {"embed": emb},
+                       _creds(llm={"default": ("ka", "kb")}))
     client._pool("llm", prof)                       # one materialized pool
     client._latencies[("llm", "default")] = deque([50, 60], maxlen=256)
     client._usage["default"].calls = 7
@@ -962,8 +998,9 @@ def test_snapshot_never_mutates_client_state():
 def test_snapshot_joins_per_key_usage_mirror():
     """KeySnapshot carries the per-key KeyUsage mirror (calls / rate_limited)
     — the panel's 'l' expanded view data source (spec 3.9.2 / §7.7)."""
-    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"), api_keys=("ka", "kb"))
-    client = LLMClient({"default": prof}, {})
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"))
+    client = LLMClient({"default": prof}, {},
+                       _creds(llm={"default": ("ka", "kb")}))
     client._pool("llm", prof)
     client._usage["default"].keys["KEY_A"].calls = 41
     client._usage["default"].keys["KEY_B"].calls = 12
@@ -977,8 +1014,9 @@ def test_snapshot_nonblocking_inside_running_loop():
     """spec §7.8 协议 row: snapshot() is a plain sync read — callable from a
     coroutine amid a concurrent gather without awaiting, locking, or blocking
     the event loop (U26: the render tick calls it between awaits)."""
-    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"), api_keys=("ka", "kb"))
-    client = LLMClient({"default": prof}, {})
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"))
+    client = LLMClient({"default": prof}, {},
+                       _creds(llm={"default": ("ka", "kb")}))
     client._pool("llm", prof)
 
     async def sampler() -> list:
@@ -1021,7 +1059,7 @@ def test_precheck_raises_context_overflow_before_any_network():
     created), nothing fed to the breaker, no llm.call event, no retry burned."""
     rec = _BreakerRecorder()
     prof = _llm_profile(context_window=512, max_output_tokens=256)
-    client = LLMClient({"default": prof}, {}, metrics=rec)
+    client = LLMClient({"default": prof}, {}, _creds(), metrics=rec)
     prompt = PromptBundle(messages=(
         Message(role="user", parts=(Part(kind="text", text="hello"),)),))
     with pytest.raises(ContextOverflowError) as ei:
@@ -1038,7 +1076,7 @@ def test_precheck_counts_images_via_the_calibrator_prior(png_image: ImageRef):
     # readout (ceil(1445 × 1.2) = 1734 each @2048) blow the 113868 budget.
     rec = _BreakerRecorder()
     prof = _llm_profile(context_window=131072)
-    client = LLMClient({"default": prof}, {}, metrics=rec)
+    client = LLMClient({"default": prof}, {}, _creds(), metrics=rec)
     parts = tuple(Part(kind="image", image=png_image) for _ in range(80))
     prompt = PromptBundle(messages=(Message(role="user", parts=parts),))
     with pytest.raises(ContextOverflowError) as ei:
@@ -1178,7 +1216,7 @@ def test_client_self_constructs_calibrator_with_working_points():
     client = LLMClient({
         "a": _llm_profile(name="a", provider="anthropic"),
         "o": _llm_profile(name="o", default_image_px=1024),
-    }, {})
+    }, {}, _creds())
     assert client.calibrator.cost("a") == 1882   # ceil(1568 × 1.2)
     assert client.calibrator.cost("o") == 918    # ceil(765 × 1.2)
 
@@ -1227,7 +1265,7 @@ def _target(prof, *, profile: str = "default", is_llm: bool = True,
 
 
 def test_probe_all_unknown_profile_never_raises():
-    results = asyncio.run(LLMClient({}, {}).probe_all("ghost"))
+    results = asyncio.run(LLMClient({}, {}, _creds()).probe_all("ghost"))
     assert len(results) == 1
     assert results[0].ok is False and results[0].key_env is None
     assert "unknown profile" in (results[0].error or "")
@@ -1236,7 +1274,8 @@ def test_probe_all_unknown_profile_never_raises():
 def test_probe_all_single_key_degrades_to_one_result(monkeypatch):
     child = _ProbeChild(model="glm-x")
     monkeypatch.setattr(LLMClient, "_probe_client", lambda self, target: child)
-    client = LLMClient({"default": _llm_profile()}, {})
+    client = LLMClient({"default": _llm_profile()}, {},
+                       _creds(llm={"default": ("ka",)}))
     results = asyncio.run(client.probe_all("default"))
     assert len(results) == 1
     assert results[0].ok is True and results[0].model == "glm-x"
@@ -1252,10 +1291,12 @@ def test_probe_all_pool_yields_one_result_per_key_in_declaration_order(monkeypat
         seen.append((target.env, target.key))
         return child
 
+    for env, key in (("KEY_A", "ka"), ("KEY_B", "kb"), ("KEY_C", "kc")):
+        monkeypatch.setenv(env, key)   # v1.17: 值经 env 物化
     monkeypatch.setattr(LLMClient, "_probe_client", _child)
-    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B", "KEY_C"),
-                        api_keys=("ka", "kb", "kc"))
-    client = LLMClient({"default": prof}, {})
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B", "KEY_C"))
+    client = LLMClient({"default": prof}, {},
+                       _creds(llm={"default": ("ka", "kb", "kc")}))
     results = asyncio.run(client.probe_all("default"))
     assert [r.key_env for r in results] == ["KEY_A", "KEY_B", "KEY_C"]
     assert seen == [("KEY_A", "ka"), ("KEY_B", "kb"), ("KEY_C", "kc")]
@@ -1268,36 +1309,40 @@ def test_probe_all_pool_yields_one_result_per_key_in_declaration_order(monkeypat
 def test_probe_all_embedding_profile_follows_the_same_rule(monkeypatch):
     child = _ProbeChild()
     monkeypatch.setattr(LLMClient, "_probe_client", lambda self, target: child)
-    emb = _embedding_profile(api_key_envs=("KEY_A", "KEY_B"), api_keys=("ka", "kb"))
-    results = asyncio.run(LLMClient({}, {"embed": emb}).probe_all("embed"))
+    emb = _embedding_profile(api_key_envs=("KEY_A", "KEY_B"))
+    results = asyncio.run(LLMClient(
+        {}, {"embed": emb}, _creds(emb={"embed": ("ka", "kb")})).probe_all("embed"))
     assert [r.key_env for r in results] == ["KEY_A", "KEY_B"]
     assert [r.model for r in results] == ["embed-model", "embed-model"]
 
 
 def test_probe_client_narrows_profile_to_one_key_and_shares_pool():
-    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"), api_keys=("ka", "kb"))
-    client = LLMClient({"default": prof}, {"embed": _embedding_profile()})
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"))
+    client = LLMClient({"default": prof}, {"embed": _embedding_profile()},
+                       _creds())
     child = client._probe_client(_ProbeTarget(
         profile="default", prof=prof, is_llm=True, env="KEY_B", key="kb",
         key_env="KEY_B"))
     narrowed = child._llm_profiles["default"]
-    assert narrowed.api_key_envs == ("KEY_B",) and narrowed.api_keys == ("kb",)
-    assert narrowed.api_key_env == "KEY_B" and narrowed.api_key == "kb"
+    assert narrowed.api_key_envs == ("KEY_B",)      # v1.17: 只收窄 env 名
+    assert narrowed.api_key_env == "KEY_B"
     assert narrowed.max_output_tokens == 1          # 1 token 活体调用
     assert child._embedding_profiles == {}
     assert child._http_client is client._http()     # 共享连接池
     assert child._semaphores is client._semaphores  # 共享剖面级限流器
+    assert child._credentials.llm["default"] == ("kb",)   # v1.17: 凭据收窄到单把密钥
 
     emb = client._embedding_profiles["embed"]
     echild = client._probe_client(_target(emb, profile="embed", is_llm=False))
     assert echild._llm_profiles == {}
     assert echild._embedding_profiles["embed"].api_key_envs == ("TEST_KEY",)
+    assert echild._credentials.embedding["embed"] == ("sk-test",)  # 单把密钥直达子端
     asyncio.run(client.aclose())
 
 
 def test_probe_call_llm_branch_sends_one_token_ping():
     prof = _llm_profile()
-    client = LLMClient({"default": prof}, {})
+    client = LLMClient({"default": prof}, {}, _creds())
     child = _ProbeChild(model="glm-x", latency_ms=42)
     model, latency_ms = asyncio.run(
         client._probe_call(child, _target(prof), time.monotonic()))
@@ -1312,7 +1357,7 @@ def test_probe_call_swallows_output_truncated_as_liveness():
     """v1.11 P6：max_output_tokens=1 的探针按构造必然终止于输出上限——那恰恰**就是**
     活体证明，不是探测失败。"""
     prof = _llm_profile()
-    client = LLMClient({"default": prof}, {})
+    client = LLMClient({"default": prof}, {}, _creds())
     child = _ProbeChild(raises=OutputTruncatedError(
         "cap", profile="default", finish="max_tokens"))
     model, latency_ms = asyncio.run(
@@ -1323,7 +1368,7 @@ def test_probe_call_swallows_output_truncated_as_liveness():
 
 def test_probe_call_embedding_branch_pings_embed():
     emb = _embedding_profile()
-    client = LLMClient({}, {"embed": emb})
+    client = LLMClient({}, {"embed": emb}, _creds())
     child = _ProbeChild()
     model, _latency = asyncio.run(client._probe_call(
         child, _target(emb, profile="embed", is_llm=False), time.monotonic()))
@@ -1335,7 +1380,7 @@ def test_probe_one_returns_failure_result_and_never_raises(monkeypatch):
     child = _ProbeChild(raises=RuntimeError("boom"))
     monkeypatch.setattr(LLMClient, "_probe_client", lambda self, target: child)
     prof = _llm_profile()
-    client = LLMClient({"default": prof}, {})
+    client = LLMClient({"default": prof}, {}, _creds())
     result = asyncio.run(client._probe_one(_target(prof, key_env="KEY_A")))
     assert result.ok is False and result.key_env == "KEY_A"
     assert result.model == "test-model" and "boom" in (result.error or "")
@@ -1347,7 +1392,7 @@ def test_probe_one_merges_child_usage_on_success(monkeypatch):
     child = _ProbeChild()
     monkeypatch.setattr(LLMClient, "_probe_client", lambda self, target: child)
     prof = _llm_profile()
-    client = LLMClient({"default": prof}, {})
+    client = LLMClient({"default": prof}, {}, _creds())
     result = asyncio.run(client._probe_one(_target(prof)))
     assert result.ok is True and result.error is None
     assert client.usage_by_profile["default"].calls == 1
@@ -1357,7 +1402,7 @@ def test_probe_one_merges_child_usage_on_success(monkeypatch):
 
 
 def test_http_client_is_a_lazy_shared_singleton():
-    client = LLMClient({}, {})
+    client = LLMClient({}, {}, _creds())
     assert client._http_client is None              # 用到之前不建立
     first = client._http()
     assert client._http() is first
@@ -1367,7 +1412,7 @@ def test_http_client_is_a_lazy_shared_singleton():
 
 
 def test_aclose_releases_and_is_idempotent():
-    client = LLMClient({}, {})
+    client = LLMClient({}, {}, _creds())
     client._http()
     asyncio.run(client.aclose())
     assert client._http_client is None
@@ -1392,7 +1437,7 @@ def _trace_metrics(**over) -> SimpleNamespace:
     (_trace_metrics(enabled=True, content="full", channels=("quality", "llm")), True),
 ])
 def test_full_content_trace_gate_is_a_three_way_conjunction(metrics, expected):
-    client = LLMClient({"default": _llm_profile()}, {}, metrics=metrics)
+    client = LLMClient({"default": _llm_profile()}, {}, _creds(), metrics=metrics)
     assert client._full_content_trace_enabled() is expected
 
 
@@ -1402,12 +1447,12 @@ def test_non_full_trace_tier_carries_no_gen_ai_message_keys():
     prof = _llm_profile()
     prompt = PromptBundle(messages=(
         Message(role="user", parts=(Part(kind="text", text="hi"),)),))
-    lean = LLMClient({"default": prof}, {},
+    lean = LLMClient({"default": prof}, {}, _creds(),
                      metrics=_trace_metrics(enabled=True, content="refs",
                                             channels=("llm",)))
     spec = lean._complete_spec(prof, prompt, None)
     assert spec.trace_extra == {} and spec.finalize_extra is None
-    full = LLMClient({"default": prof}, {},
+    full = LLMClient({"default": prof}, {}, _creds(),
                      metrics=_trace_metrics(enabled=True, content="full",
                                             channels=("llm",)))
     spec = full._complete_spec(prof, prompt, None)
@@ -1418,7 +1463,7 @@ def test_non_full_trace_tier_carries_no_gen_ai_message_keys():
 # ── key-pool events: payload discipline (spec 7.2 / 7.4) ───────────────────
 
 
-def test_key_pool_events_carry_env_names_only(tmp_path, caplog):
+def test_key_pool_events_carry_env_names_only(tmp_path, caplog, monkeypatch):
     """v1.6 的三条密钥池事件都落在 llm 通道，且只携带环境变量**名**——密钥**值**
     绝不出现在 trace 或 stderr 里（spec 7.4 红线）。"""
     from labelkit.common.observability.obslog import EventLog, MetricsSink
@@ -1429,7 +1474,12 @@ def test_key_pool_events_carry_env_names_only(tmp_path, caplog):
     cfg = make_cfg(tmp_path, trace=TraceConfig(
         enabled=True, path=str(trace_path), channels=("llm",), content="refs"))
     sink = MetricsSink(cfg, "abcdef123456", EventLog(cfg.trace, "abcdef123456"))
-    client = LLMClient({"default": _llm_profile(api_key=sentinel)}, {}, metrics=sink)
+    # v1.17 Wave 2b：哨兵密钥值经 RuntimeCredentials 进入客户端并材料化成池——
+    # 值驻留进程内，但绝不出现在任何 trace / 日志 / repr 面。
+    client = LLMClient({"default": _llm_profile()}, {},
+                       _creds(llm={"default": (sentinel,)}), metrics=sink)
+    client._pool("llm", _llm_profile())
+    assert sentinel not in repr(client._credentials)
 
     with caplog.at_level(logging.WARNING, logger="labelkit.llm"):
         client._emit_event("llm.key_cooldown",
@@ -1461,8 +1511,8 @@ def test_key_pool_events_carry_env_names_only(tmp_path, caplog):
 
 
 def test_emit_event_is_a_no_op_without_a_metrics_sink():
-    LLMClient({}, {})._emit_event("llm.key_cooldown", {"profile": "default"})
-    LLMClient({}, {}, metrics=SimpleNamespace())._emit_event(
+    LLMClient({}, {}, _creds())._emit_event("llm.key_cooldown", {"profile": "default"})
+    LLMClient({}, {}, _creds(), metrics=SimpleNamespace())._emit_event(
         "llm.key_cooldown", {"profile": "default"})
 
 
@@ -1585,7 +1635,7 @@ def _engine(prof=None, *, keys=(("KEY_A", "ka"),), metrics=None,
     @return (LLMClient, _RetryContext)
     """
     prof = prof if prof is not None else _llm_profile()
-    client = LLMClient({prof.name: prof}, {}, metrics=metrics)
+    client = LLMClient({prof.name: prof}, {}, _creds(llm={prof.name: tuple(k for _, k in keys)}), metrics=metrics)
     acc = client.usage_by_profile.setdefault(prof.name, ProfileUsage())
     ctx = _RetryContext(spec=spec or _spec(prof), pool=_KeyPool(list(keys)),
                         acc=acc, park_budget=park_budget)
@@ -2078,7 +2128,7 @@ def test_complete_spec_assembles_url_body_parser_per_provider():
         Message(role="user", parts=(Part(kind="text", text="hi"),)),))
 
     prof = _llm_profile(base_url="https://llm-gw.example.com/v1/")
-    spec = LLMClient({"default": prof}, {})._complete_spec(prof, prompt, SCHEMA)
+    spec = LLMClient({"default": prof}, {}, _creds())._complete_spec(prof, prompt, SCHEMA)
     assert spec.kind == "llm" and spec.operation is None
     assert spec.url == "https://llm-gw.example.com/v1/chat/completions"
     assert spec.build_body()["response_format"]["json_schema"]["schema"] == SCHEMA
@@ -2087,7 +2137,7 @@ def test_complete_spec_assembles_url_body_parser_per_provider():
         "x", None, Usage(0, 0), "m", "stop")
 
     prof = _llm_profile(provider="anthropic")
-    spec = LLMClient({"default": prof}, {})._complete_spec(prof, prompt, SCHEMA)
+    spec = LLMClient({"default": prof}, {}, _creds())._complete_spec(prof, prompt, SCHEMA)
     assert spec.url == "https://llm-gw.example.com/v1/v1/messages"
     assert spec.build_body()["tools"] == [{"name": "emit", "input_schema": SCHEMA}]
     assert spec.parse({"content": [{"type": "text", "text": "y"}]})[0] == "y"
@@ -2098,7 +2148,7 @@ def test_complete_spec_renders_both_message_faces_at_the_full_tier():
     prof = _llm_profile()
     prompt = PromptBundle(messages=(
         Message(role="user", parts=(Part(kind="text", text="hi"),)),))
-    client = LLMClient({"default": prof}, {}, metrics=_trace_metrics(
+    client = LLMClient({"default": prof}, {}, _creds(), metrics=_trace_metrics(
         enabled=True, content="full", channels=("llm",)))
     spec = client._complete_spec(prof, prompt, None)
     assert spec.trace_extra == {"gen_ai.input.messages": [
@@ -2114,7 +2164,7 @@ def test_complete_spec_renders_both_message_faces_at_the_full_tier():
 
 def test_feed_calibrator_samples_only_image_requests_with_usage(png_image: ImageRef):
     prof = _llm_profile()
-    client = LLMClient({"default": prof}, {})
+    client = LLMClient({"default": prof}, {}, _creds())
     prompt = PromptBundle(messages=(Message(role="user", parts=(
         Part(kind="text", text="[screenshot]"),
         Part(kind="image", image=png_image),
@@ -2135,7 +2185,7 @@ def test_feed_calibrator_warns_once_per_profile_when_usage_is_missing(png_image,
     """[C-64] 企业网关会回 usage: null——不记样本、每剖面只 WARN 一次，此后无限期
     停留在先验 × PRIOR_INFLATION 上。"""
     prof = _llm_profile()
-    client = LLMClient({"default": prof}, {})
+    client = LLMClient({"default": prof}, {}, _creds())
     prompt = PromptBundle(messages=(
         Message(role="user", parts=(Part(kind="image", image=png_image),)),))
     with caplog.at_level(logging.WARNING, logger="labelkit.llm"):
@@ -2156,7 +2206,7 @@ def test_record_provider_result_feeds_streak_and_hard_trip(tmp_path):
 
     cfg = make_cfg(tmp_path)                       # 阈值 fatal_error_threshold = 3
     sink = MetricsSink(cfg, "t", EventLog(cfg.trace, "t"))
-    client = LLMClient({}, {}, metrics=sink)
+    client = LLMClient({}, {}, _creds(), metrics=sink)
     client._record_provider_result(fatal=True)
     client._record_provider_result(fatal=True)
     assert sink.fatal_streak == 2 and sink.circuit_broken is False
@@ -2167,24 +2217,25 @@ def test_record_provider_result_feeds_streak_and_hard_trip(tmp_path):
     assert sink.circuit_broken is True
 
     hard_sink = MetricsSink(cfg, "t", EventLog(cfg.trace, "t"))
-    LLMClient({}, {}, metrics=hard_sink)._record_provider_result(fatal=True, hard=True)
+    LLMClient({}, {}, _creds(), metrics=hard_sink)._record_provider_result(fatal=True, hard=True)
     assert hard_sink.circuit_broken is True and hard_sink.fatal_streak == 1
 
 
 def test_record_provider_result_is_a_no_op_without_a_sink():
-    LLMClient({}, {})._record_provider_result(fatal=True)
-    LLMClient({}, {}, metrics=SimpleNamespace())._record_provider_result(fatal=True)
+    LLMClient({}, {}, _creds())._record_provider_result(fatal=True)
+    LLMClient({}, {}, _creds(), metrics=SimpleNamespace())._record_provider_result(fatal=True)
 
 
 def test_emit_llm_call_is_a_no_op_without_an_event_face():
     outcome = _CallOutcome(latency_ms=1, usage=Usage(1, 1), retries=0, status="ok")
-    LLMClient({}, {})._emit_llm_call(_llm_profile(), outcome)
-    LLMClient({}, {}, metrics=SimpleNamespace())._emit_llm_call(_llm_profile(), outcome)
+    LLMClient({}, {}, _creds())._emit_llm_call(_llm_profile(), outcome)
+    LLMClient({}, {}, _creds(), metrics=SimpleNamespace())._emit_llm_call(_llm_profile(), outcome)
 
 
 def test_pool_materializes_once_per_kind_and_profile():
-    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"), api_keys=("ka", "kb"))
-    client = LLMClient({"default": prof}, {})
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"))
+    client = LLMClient({"default": prof}, {},
+                       _creds(llm={"default": ("ka", "kb")}))
     first = client._pool("llm", prof)
     assert client._pool("llm", prof) is first          # 缓存命中，绝不重建
     client.usage_by_profile["default"].keys["KEY_A"].calls = 5
@@ -2193,7 +2244,7 @@ def test_pool_materializes_once_per_kind_and_profile():
 
 
 def test_merge_usage_sums_child_cost_estimates():
-    client = LLMClient({}, {})
+    client = LLMClient({}, {}, _creds())
     client._merge_usage({"p": ProfileUsage(calls=1, est_cost_usd=0.002)})
     client._merge_usage({"p": ProfileUsage(calls=1, est_cost_usd=0.004)})
     assert client.usage_by_profile["p"].est_cost_usd == pytest.approx(0.006)
@@ -2204,10 +2255,10 @@ def test_precheck_budget_skips_when_off_and_passes_when_it_fits():
         Message(role="user", parts=(Part(kind="text", text="hi"),)),))
     off = _llm_profile(context_window=0)
     # context_window == 0 → 该剖面预算关闭，整段终检跳过
-    assert LLMClient({"default": off}, {})._precheck_budget(off, prompt, None) is None
+    assert LLMClient({"default": off}, {}, _creds())._precheck_budget(off, prompt, None) is None
     # 声明了窗口且余量充足 → 不变式成立，什么都不抛
     roomy = _llm_profile(context_window=131072)
-    assert LLMClient({"default": roomy}, {})._precheck_budget(
+    assert LLMClient({"default": roomy}, {}, _creds())._precheck_budget(
         roomy, prompt, SCHEMA) is None
 
 
@@ -2237,7 +2288,7 @@ def test_complete_meters_the_call_and_returns_the_parsed_response(monkeypatch,
                                                                   png_image: ImageRef):
     _stub_engine(monkeypatch, ("{}", None, Usage(3184, 156), "qwen2.5", "stop"))
     prof = _llm_profile(price_per_mtok_in=0.6, price_per_mtok_out=1.8)
-    client = LLMClient({"default": prof}, {})
+    client = LLMClient({"default": prof}, {}, _creds())
     prompt = PromptBundle(messages=(Message(role="user", parts=(
         Part(kind="text", text="[screenshot]"),
         Part(kind="image", image=png_image))),))
@@ -2262,7 +2313,7 @@ def test_complete_disposes_the_finish_reason_after_accounting(monkeypatch, finis
     熔断永不喂。"""
     _stub_engine(monkeypatch, ("partial", None, Usage(10, 4), "m", finish), retries=0)
     rec = _BreakerRecorder()
-    client = LLMClient({"default": _llm_profile()}, {}, metrics=rec)
+    client = LLMClient({"default": _llm_profile()}, {}, _creds(), metrics=rec)
     prompt = PromptBundle(messages=(
         Message(role="user", parts=(Part(kind="text", text="hi"),)),))
     with pytest.raises(exc):
@@ -2276,7 +2327,7 @@ def test_complete_hides_the_schema_from_the_budget_when_l0_is_off(monkeypatch):
     supports_structured_output=false 的剖面不该为它买单。"""
     seen = _stub_engine(monkeypatch, ("{}", None, Usage(1, 1), "m", "stop"))
     prof = _llm_profile(supports_structured_output=False, context_window=131072)
-    client = LLMClient({"default": prof}, {})
+    client = LLMClient({"default": prof}, {}, _creds())
     prompt = PromptBundle(messages=(
         Message(role="user", parts=(Part(kind="text", text="hi"),)),))
     asyncio.run(client.complete("default", prompt, SCHEMA))
@@ -2288,7 +2339,7 @@ def test_embed_assembles_the_embeddings_call_and_meters_it(monkeypatch):
     seen = _stub_engine(monkeypatch, ((vectors, Usage(6, 0)),), latency_ms=12,
                         retries=0)
     prof = _embedding_profile()
-    client = LLMClient({}, {"embed": prof})
+    client = LLMClient({}, {"embed": prof}, _creds())
     assert asyncio.run(client.embed("embed", ["a", "b"])) == vectors
 
     (spec,) = seen
@@ -2306,7 +2357,7 @@ def test_embed_assembles_the_embeddings_call_and_meters_it(monkeypatch):
 def test_complete_and_embed_fast_fail_once_the_breaker_is_open():
     rec = _BreakerRecorder()
     rec.circuit_broken = True
-    client = LLMClient({"default": _llm_profile()}, {"embed": _embedding_profile()},
+    client = LLMClient({"default": _llm_profile()}, {"embed": _embedding_profile()}, _creds(),
                        metrics=rec)
     prompt = PromptBundle(messages=(
         Message(role="user", parts=(Part(kind="text", text="hi"),)),))
@@ -2323,7 +2374,7 @@ def test_embedding_profiles_share_the_same_engine_steps(monkeypatch):
     clock = _install_clock(monkeypatch, _Clock())
     emb = _embedding_profile(name="default")
     rec = _EngineRecorder()
-    client = LLMClient({"default": _llm_profile()}, {"default": emb}, metrics=rec)
+    client = LLMClient({"default": _llm_profile()}, {"default": emb}, _creds(llm={"default": ("k",)}, emb={"default": ("k",)}), metrics=rec)
     result = ((([0.0] * 4,), Usage(6, 0)),)
     ctx = _RetryContext(
         spec=_spec(emb, kind="embedding", operation="embedding",

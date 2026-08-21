@@ -72,7 +72,6 @@ def make_cfg(trace: TraceConfig | None = None) -> ResolvedConfig:
         max_retries=2,
         max_output_tokens=500,
         temperature=0.0,
-        api_key=os.environ.get(ZAI_KEY_ENV, ""),
     )
     return ResolvedConfig(
         tool=ToolConfig(),
@@ -219,13 +218,15 @@ class _RecordingMetrics:
 def make_ctx(cfg) -> RunContext:
     metrics = _RecordingMetrics()
     try:
+        from labelkit.common.runtime.credentials import resolve_credentials
         from labelkit.common.runtime.llm_client import LLMClient
         from labelkit.common.runtime.schema_engine import SchemaEngine
     except ImportError:
         llm = _MiniAnthropicClient(cfg.llm_profiles)
         engine = _MiniSchemaEngine(dict(cfg.user_schema), llm)
     else:
-        llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles, metrics=None)
+        llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles,
+                       resolve_credentials(cfg), metrics=None)
         engine = SchemaEngine(dict(cfg.user_schema), llm, cfg.output, metrics=None)
     return RunContext(cfg=cfg, llm=llm, schema_engine=engine, metrics=metrics,
                       rng=random.Random("0:1:annotate"), batch_no=1)

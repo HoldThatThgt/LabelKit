@@ -56,7 +56,6 @@ def make_profile(name: str, structured: bool) -> LLMProfile:
         supports_structured_output=structured,
         max_output_tokens=400,
         temperature=0.0,
-        api_key=os.environ.get(ZAI_KEY_ENV, ""),
     )
 
 
@@ -64,7 +63,9 @@ try:
     from labelkit.common.runtime.llm_client import LLMClient as _RealLLMClient
 
     def make_client(profiles: dict[str, LLMProfile]):
-        return _RealLLMClient(profiles, {})
+        from labelkit.common.runtime.credentials import RuntimeCredentials
+        return _RealLLMClient(profiles, {}, RuntimeCredentials(
+            llm={n: (os.environ[ZAI_KEY_ENV],) for n in profiles}, embedding={}))
 except ImportError:
     @dataclass(frozen=True)
     class _Resp:

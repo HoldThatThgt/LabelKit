@@ -168,3 +168,16 @@ M6 将 brief 数组按规划器的固定 frame class 位置配对，再传给已
 `plan_schema` 并返回 `frame_class + brief`，因此 brief Schema 不改变默认路径的 prompt 或
 Schema 字节。M8 不解析规则、窗口或 correlation，也不参与长度可行性判断；这些语义由
 M1/M6 的共享 planner 与声明式 evaluator 负责。
+
+### 3.8.6 v1.17 hook 冻结载体与 noise realization 复用
+
+v1.17 的 M8 增量是两句话级的面，四层保证、内部 Schema 族与修复环全部零改动：
+
+- **hook 不再按字符串二次 resolve**：M1 在 load 期把四个校验钩子（output / sample /
+  sequence / scenario）解析并冻结为 callable 载体 `ResolvedHook` / `ValidationHooks`
+  （3.1.4.2）；M6 与 schema engine 消费冻结 callable——`complete_validated` 的消费面
+  **零变化**（签名、`CallScope`、L2.5 时机与 `resolved_at` 记账全部不动；变化只在调用方
+  从解析引用字符串改为读 `cfg.validation_hooks` 的冻结 target）。
+- **帧 noise realization 复用既有 Schema 路径**：structured noise 帧的 realization 复用
+  既有 task-frame realization 的 Schema 路径（该帧类生成 Schema 的装载、预算检查与校验
+  同源，3.6.7），M8 不新增任何 Schema 构造器或待遇分支。

@@ -1,69 +1,88 @@
-"""M1 时间流生成约束。
+"""M1 时间流生成约束（v1.17 场景规划形态，SPEC-SP §4/§6.2/§8.3）。
 
-本模块承载 v1.13--v1.15 的时间流形态、档位与时间字段约束，并承载 v1.16 的规则、窗口
-语法与结构前提检查。完整可行性由运行期规划器提供同源的 M1 入口，配置层不依赖
-算子。
+本模块承载 v1.13–v1.15 的形态门、档位与时间字段约束；v1.17 起 quota 域、noise 域、
+schedule 前提与名称域在此裁定，并**装配 ``ScenarioConfig`` 调用 ``compile_scenario``
+一次**——成功 ⇒ ``ResolvedConfig.scenario_plan``；``PlannerInfeasibleError`` 汇入
+ConfigError（exit 2），capacity/budget/internal 映射 exit 4（沿 §8.3）。v1.16 的
+``_check_local_potential``/``_check_full_potential`` 与 ``select_feasible_plan`` 调用面
+已删除。
 """
 from __future__ import annotations
 
 import json
-from datetime import datetime
-from dataclasses import replace
-import inspect
-import random
+import math
+from decimal import Decimal, InvalidOperation
 from types import SimpleNamespace
 from typing import Any
 
 from labelkit.common.config._collect import _Collector, _fmt
 from labelkit.common.config._sections import (
-    _SEQUENCE_TEMPLATES,
     _STREAM_FORBIDDEN_CLASS_GEN_KEYS,
     _STREAM_FORBIDDEN_GEN_KEYS,
 )
 from labelkit.common.config.model import (
     GenerateStreamConfig,
-    SequenceRuleSpec,
-    SequenceWindowSpec,
     TierSpec,
-    apportion_tiers,
-    effective_rules,
+    effective_frame_rules,
+    effective_frame_windows,
     effective_tiers,
-    effective_windows,
+    effective_sequence_rules,
 )
+from labelkit.common.errors import InternalError
 from labelkit.common.contracts.types import (
     SequenceValidationFrame,
     SequenceValidationInput,
 )
-from labelkit.common.extensions.hooks import normalize_violations, resolve_hook
-from labelkit.common.runtime.temporal import quantize_frame_gap
+from labelkit.common.extensions.hooks import (
+    ResolvedHook,
+    check_hook_arity,
+    load_hook,
+    probe_hook,
+)
+from labelkit.common.runtime.scenario.diagnostics import (
+    PlannerBudgetError,
+    PlannerCapacityError,
+    PlannerInfeasibleError,
+)
+from labelkit.common.runtime.scenario.model import (
+    FrameClassDomain,
+    ScenarioConfig,
+    SequenceClassDomain,
+    TierDomain,
+)
+from labelkit.common.runtime.scenario.planner import compile_scenario
+from labelkit.common.runtime.scenario.rules import name_domain_violations
 
 
 _TIME_FIELD_TERMS: dict[str, str] = {
     "ts": "string",
+    "end_ts": "string",
     "gap_prev_s": "number",
     "gap_next_s": "number",
     "elapsed_s": "number",
+    "duration_s": "number",
 }
-_FRAME_GAP_FLOOR_S = 1e-6
 _UNARY_TEMPLATES = {"existence", "absence", "exactly", "init", "end"}
 _COUNT_TEMPLATES = {"existence", "absence", "exactly"}
-_BINARY_TEMPLATES = set(_SEQUENCE_TEMPLATES) - _UNARY_TEMPLATES
+_BINARY_TEMPLATES = {"responded_existence", "co_existence", "response", "precedence",
+                     "succession", "alternate_response", "chain_response",
+                     "chain_precedence", "not_co_existence", "not_succession",
+                     "contains"}
 
 
 def check_generate_stream_form(ctx: Any, products: Any) -> tuple[int, int]:
-    """校验时间流形态并返回序列总配额与最长长度。
+    """校验时间流形态并编译场景计划，返回序列目标总数与最长长度。
 
     @param ctx 当前配置收集上下文。
-    @param products 已解析的类视图与帧类视图产品。
-    @return 序列总配额与所有类的最长序列长度。
+    @param products 已解析的类视图与帧类视图产品（成功时写入 ``scenario_plan``）。
+    @return 序列目标总数（形态关闭时 0）与所有类的最长序列长度。
     """
     views = products.class_views
-    seq_total = sum(view.generate.sequences for view in views.values())
     len_max = max([1] + [view.generate.len_range[1] for view in views.values()])
     if not ctx.p.generate_stream.enabled:
         check_parked_stream_keys(ctx)
-        return seq_total, len_max
-    check_stream_constraints(ctx.col, ctx.fp, ctx.p.generate_stream, SimpleNamespace(
+        return 0, len_max
+    values = SimpleNamespace(
         mode=ctx.mode, modality=ctx.modality, generate=ctx.p.generate,
         classify=ctx.p.classify, class_views=views, stream=ctx.p.stream,
         meta_mode=ctx.p.output.meta_mode, frame_classify=ctx.p.frame_classify,
@@ -71,21 +90,21 @@ def check_generate_stream_form(ctx: Any, products: Any) -> tuple[int, int]:
         frame_class_views=products.frame_class_views,
         gen_provided=ctx.p.gen_provided,
         class_raw=ctx.p.class_raw if isinstance(ctx.p.class_raw, dict) else {},
-        seq_total=seq_total, len_max=len_max, text_field=ctx.p.input.text_field,
+        len_max=len_max, text_field=ctx.p.input.text_field,
         generate_stream=ctx.p.generate_stream, run_seed=ctx.p.run.get("seed", 0),
         limit=ctx.cli.limit,
         tiers=ctx.p.generate_stream.tiers,
-        tier_domain={name for view in views.values() if view.generate.sequences >= 1
-                     for spec in effective_tiers(view.tiers, ctx.p.generate_stream.tiers)
-                     for name in spec.frame_classes},
         frame_gen_schema_declared=_frame_gen_schema_declared(ctx.p.frame_class_raw),
-    ))
-    return seq_total, len_max
+        root=ctx.root, hooks=products.hooks,
+    )
+    check_stream_constraints(ctx.col, ctx.fp, ctx.p.generate_stream, values)
+    _compile_scenario_plan(ctx.col, ctx.fp, ctx.p.generate_stream, values, products)
+    return len(getattr(products.scenario_plan, "slots", ()) or ()), len_max
 
 
 def check_stream_constraints(col: _Collector, fp: str, gs: GenerateStreamConfig,
                              values: SimpleNamespace) -> None:
-    """校验时间流形态的跨节组合约束。
+    """校验时间流形态的跨节组合约束（编译前的静态门）。
 
     @param col 配置错误与警告收集器。
     @param fp 当前配置文件路径前缀。
@@ -94,9 +113,10 @@ def check_stream_constraints(col: _Collector, fp: str, gs: GenerateStreamConfig,
     """
     _stream_form_premise(col, fp, values)
     _stream_form_probes(col, fp, values)
+    _stream_form_limit(col, fp, values)
     _stream_form_quota(col, fp, values)
-    _stream_form_packing(col, fp, gs, values)
-    _stream_form_weaving(col, fp, gs, values)
+    _stream_form_schedule(col, fp, gs)
+    _stream_form_noise(col, fp, gs, values)
     _check_tier_table(col, fp, values)
     _check_time_fields(col, fp, values)
     _check_rule_window_tables(col, fp, gs, values)
@@ -151,18 +171,18 @@ def _stream_form_artifact_keys(col: _Collector, fp: str, values: SimpleNamespace
     for owner, field_name in (("[input].text_field", values.text_field),
                               ("[stream].order_by", ts_field)):
         if field_name == "truth":
-            col.error(f'{fp}:{owner}: the field name must not be "truth" in the time-stream '
+            col.error(f"{fp}:{owner}: the field name must not be \"truth\" in the time-stream "
                       f"form (it would collide with the ground-truth key of the artifact row)")
 
 
 def _stream_form_probes(col: _Collector, fp: str, values: SimpleNamespace) -> None:
-    """校验时间流形态下的定向禁设键。"""
+    """校验时间流形态下的定向禁设键与 scenario_validator 形态门。"""
     for key in _STREAM_FORBIDDEN_GEN_KEYS:
         if values.gen_provided.get(key):
             col.error(f"{fp}:[generate].{key}: the time-stream form does not provide this "
-                      f"key - sequence quotas are carried by [class.<name>.generate].sequences, "
-                      f"sequence length by len_range and noise batching by num_per_call; "
-                      f"remove this key")
+                      f"key - sequence quotas are carried by "
+                      f"[[generate.stream.quotas]], sequence length by len_range and "
+                      f"noise batching is per noise slot; remove this key")
     for cname, sections in values.class_raw.items():
         g_over = sections.get("generate") if isinstance(sections, dict) else None
         if not isinstance(g_over, dict):
@@ -171,143 +191,167 @@ def _stream_form_probes(col: _Collector, fp: str, values: SimpleNamespace) -> No
             if key in g_over:
                 col.error(f"{fp}:[class.{cname}.generate].{key}: the time-stream form does "
                           f"not provide this key (per-record expansion / seeds per call "
-                          f"belong to the flat generation forms); use sequences / len_range "
+                          f"belong to the flat generation forms); use quotas / len_range "
                           f"instead")
     for name, on in (("frame.classify", values.frame_classify.enabled),
                      ("frame.annotate", values.frame_annotate.enabled)):
         if on:
             col.error(f"{fp}:[{name}].enabled: mutually exclusive with the time-stream form "
-                      f"- frame-class ground truth is known at generation time (the blueprint "
-                      f"is the truth), so no frame-level verdict is needed; write frame "
+                      f"- frame-class ground truth is known at generation time (the planner "
+                      f"word is the truth), so no frame-level verdict is needed; write frame "
                       f"content contracts in [frame.class.<name>.generate]")
 
 
+def _stream_form_limit(col: _Collector, fp: str, values: SimpleNamespace) -> None:
+    """``--limit`` 与时间流形态互斥（rule 62 尾注：quota 是整体契约，截断前缀不再声称满足）。"""
+    if values.limit is not None:
+        col.error(f"{fp}:[generate.stream].enabled: mutually exclusive with --limit - the "
+                  f"quota is a whole contract and a truncated prefix no longer claims quota "
+                  f"satisfaction; remove --limit (rule 62)")
+
+
 def _stream_form_quota(col: _Collector, fp: str, values: SimpleNamespace) -> None:
-    """校验序列类配额和帧类生成面。"""
-    if values.seq_total < 1:
-        col.error(f"{fp}:[class.<name>.generate].sequences: the time-stream form requires "
-                  f"at least one sequence class with an effective sequences >= 1 (the "
-                  f"global [generate].sequences sets a default that classes may override), "
-                  f"got a total of {values.seq_total} across all classes")
-    for name, view in values.class_views.items():
-        if view.generate.sequences >= 1 and not view.generate.instruction.strip():
-            col.error(f"{fp}:[class.{name}.generate].instruction: a participating sequence "
-                      f"class (effective sequences = {view.generate.sequences}) must provide "
-                      f"a non-empty generation instruction (the global [generate].instruction "
-                      f"sets a default)")
+    """校验 quota 表在场性、类域与帧类表。"""
+    gs: GenerateStreamConfig = values.generate_stream
+    if not gs.quotas:
+        col.error(f"{fp}:[[generate.stream.quotas]]: the time-stream form requires at "
+                  f"least one quota table and a compiled sequence-target total >= 1 (a "
+                  f"zero-sequence project has only noise and sourceless duplicates, "
+                  f"nothing deliverable)")
+    class_names = {spec.name for spec in values.classify.classes}
+    for quota in gs.quotas:
+        for name in _quota_class_names(quota):
+            if name not in class_names:
+                col.error(f"{fp}:[[generate.stream.quotas]] (name = {quota.name!r}): "
+                          f"sequence class {_fmt(name)} is not in [[classify.classes]] "
+                          f"(rule 71 - this domain check runs before quota-form "
+                          f"arithmetic so a typo never surfaces as a solver "
+                          f"infeasibility)")
     if not values.frame_classify.classes:
         col.error(f"{fp}:[[frame.classify.classes]]: the time-stream form requires a non-empty "
-                  f"frame class table (the blueprint picks each step from that closed set; "
+                  f"frame class table (the planner picks each frame from that closed set; "
                   f"frame.classify.enabled stays false)")
-    _check_frame_gen_instructions(col, fp, values)
 
 
-def _check_frame_gen_instructions(col: _Collector, fp: str, values: SimpleNamespace) -> None:
-    """校验所有有效档位构成中的帧类生成指令。"""
-    if values.tiers:
-        domain = values.tier_domain
-        reason = ("the blueprint enum covers the union of the tier compositions, so any "
-                  "frame class of a tier may be picked")
-    else:
-        domain = {spec.name for spec in values.frame_classify.classes}
-        reason = "the blueprint enum covers the whole table, so any frame class may be picked"
-    for spec in values.frame_classify.classes:
-        if spec.name not in domain:
-            continue
-        view = values.frame_class_views.get(spec.name)
-        if view is None or not (view.gen_instruction or "").strip():
-            col.error(f"{fp}:[frame.class.{spec.name}.generate].instruction: every frame "
-                      f"class must provide a non-empty generation instruction ({reason}), "
-                      f"expected a non-empty string")
+def _quota_class_names(quota: Any) -> tuple[str, ...]:
+    """列出一张 quota 表引用的全部 sequence class 名。"""
+    names = [name for name, _ in (quota.counts or ())]
+    names.extend(name for name, _ in (quota.weights or ()))
+    return tuple(names)
 
 
-def _stream_form_packing(col: _Collector, fp: str, gs: GenerateStreamConfig,
-                         values: SimpleNamespace) -> None:
-    """校验会话数、噪音、重复和帧间隔。"""
-    total = values.seq_total
-    if gs.sessions < 1:
-        col.error(f"{fp}:[generate.stream].sessions: expected an integer >= 1 (number of "
-                  f"sessions), got {gs.sessions}")
-    elif not gs.sessions <= total <= 2 * gs.sessions:
-        col.error(f"{fp}:[generate.stream].sessions: expected sessions <= Σsequences <= "
-                  f"2 * sessions (crossed sessions = Σsequences - sessions, crossing "
-                  f"concurrency is always k in 1,2), got sessions = {gs.sessions}, "
-                  f"Σsequences = {total}")
-    if gs.duplicates > total:
-        col.error(f"{fp}:[generate.stream].duplicates: expected an integer in [0, Σsequences] "
-                  f"(re-sent sequences are drawn from the surviving ones), got {gs.duplicates}, "
-                  f"Σsequences = {total}")
+def _stream_form_schedule(col: _Collector, fp: str, gs: GenerateStreamConfig) -> None:
+    """schedule 必填门（形态开启时；形状与区间已在解析层裁定）。"""
+    if gs.schedule is None:
+        col.error(f"{fp}:[generate.stream.schedule]: required in the time-stream form - "
+                  f"declare start / end (both ISO-8601 with an explicit Z or numeric "
+                  f"offset, same offset, end > start) and optional exclude_dates; the "
+                  f"schedule is the only time boundary (the v1.16 per-session one-week "
+                  f"horizon recursion is deleted)")
+
+
+def _stream_form_noise(col: _Collector, fp: str, gs: GenerateStreamConfig,
+                       values: SimpleNamespace) -> None:
+    """noise 域检查（rule 69 的 M1 侧：ratio↔表双向、类域、指令、排除域）。"""
     if not 0 <= gs.noise_ratio < 1:
         col.error(f"{fp}:[generate.stream].noise_ratio: expected a number in [0,1) (noise "
                   f"frames / task frames ratio), got {_fmt(gs.noise_ratio)}")
-    elif gs.noise_ratio > 0 and not gs.noise_instruction.strip():
-        col.error(f"{fp}:[generate.stream].noise_instruction: required when noise_ratio > 0, "
-                  f"expected a non-empty string (the noise-frame generation instruction)")
-    if gs.frame_gap_s[0] < _FRAME_GAP_FLOOR_S:
-        col.error(f"{fp}:[generate.stream].frame_gap_s: the lower bound must be >= "
-                  f"{_FRAME_GAP_FLOOR_S:g} s (one microsecond) - the laid-out timestamps "
-                  f"must be strictly increasing and a sub-microsecond gap rounds to a zero "
-                  f"timedelta, and the time vocabulary uses 0.0 as its first/last frame "
-                  f"boundary sentinel, got lower bound {_fmt(gs.frame_gap_s[0])}")
-    _check_frame_gap_quantization(col, fp, gs)
-    constrained_prefix = _has_nonzero_constraints(gs, values)
-    at_or_above_gap = gs.frame_gap_s[1] > values.stream.gap_s
-    if not constrained_prefix:
-        at_or_above_gap = gs.frame_gap_s[1] >= values.stream.gap_s
-    if at_or_above_gap:
-        relation = "<=" if constrained_prefix else "<"
-        explanation = ("the constrained v1.16 planner permits equality at the replay boundary"
-                       if constrained_prefix else
-                       "the default v1.15 path requires a strict boundary")
-        col.error(f"{fp}:[generate.stream].frame_gap_s: the upper bound must be {relation} "
-                  f"stream.gap_s (= {values.stream.gap_s}; {explanation}), got "
-                  f"{_fmt(gs.frame_gap_s[1])}")
+    elif gs.noise_ratio > 0 and not gs.noise_classes:
+        col.error(f"{fp}:[[generate.stream.noise]]: required when noise_ratio > 0 - "
+                  f"declare at least one noise frame class with a positive integer "
+                  f"weight")
+    elif gs.noise_ratio == 0 and gs.noise_classes:
+        col.error(f"{fp}:[[generate.stream.noise]]: a noise table at noise_ratio = 0 is "
+                  f"a directed config error - raise noise_ratio above 0 or omit the "
+                  f"table")
+    frame_names = {spec.name for spec in values.frame_classify.classes}
+    noise_names = {spec.frame_class for spec in gs.noise_classes}
+    for spec in gs.noise_classes:
+        if spec.frame_class not in frame_names:
+            col.error(f"{fp}:[[generate.stream.noise]]: frame class {_fmt(spec.frame_class)}"
+                      f" is not in [[frame.classify.classes]]")
+            continue
+        view = values.frame_class_views.get(spec.frame_class)
+        if view is None or not (view.gen_instruction or "").strip():
+            col.error(f"{fp}:[frame.class.{spec.frame_class}.generate].instruction: a "
+                      f"noise frame class must provide a non-empty generation "
+                      f"instruction (schema parsing, budget checks and realization "
+                      f"reuse the task-frame path)")
+        if view is not None and (view.duration_us is not None or view.resources):
+            col.error(f"{fp}:[frame.class.{spec.frame_class}.generate]: noise frame class "
+                      f"must not declare duration_s or resources (noise occurrences are "
+                      f"point frames)")
+    if frame_names and noise_names and not (frame_names - noise_names):
+        col.error(f"{fp}:[[generate.stream.noise]]: the task-frame candidate domain is "
+                  f"empty after excluding the noise classes - at least one non-noise "
+                  f"frame class must remain for task positions")
+    _check_noise_exclusions(col, fp, gs, values, noise_names)
 
 
-def _check_frame_gap_quantization(col: _Collector, fp: str,
-                                  gs: GenerateStreamConfig) -> None:
-    """把 frame_gap_s 的整数微秒可表示性纳入 M1 聚合。"""
-    try:
-        quantize_frame_gap(gs.frame_gap_s)
-    except ValueError as exc:
-        col.error(f"{fp}:[generate.stream].frame_gap_s: {exc} - widen the range so that "
-                  "at least one integer microsecond is representable")
+def _check_noise_exclusions(col: _Collector, fp: str, gs: GenerateStreamConfig,
+                            values: SimpleNamespace, noise_names: set[str]) -> None:
+    """noise 帧类不得出现在任何生效 tier、frame rule 或 frame window。"""
+    for cname, view in values.class_views.items():
+        for spec in effective_tiers(view.tiers, gs.tiers):
+            for name in spec.frame_classes:
+                if name in noise_names:
+                    col.error(f"{fp}:[[generate.stream.tiers]]: noise frame class "
+                              f"{_fmt(name)} must not appear in a tier composition "
+                              f"(class {_fmt(cname)})")
+        for rule in effective_frame_rules(view.frame_rules, gs.frame_rules):
+            for name in filter(None, (rule.frame_class, rule.source, rule.target)):
+                if name in noise_names:
+                    col.error(f"{fp}:[[generate.stream.frame_rules]] (name = "
+                              f"{rule.name!r}): noise frame class {_fmt(name)} must "
+                              f"not appear in a frame rule")
+        for window in effective_frame_windows(view.frame_windows, gs.frame_windows):
+            if window.frame_class in noise_names:
+                col.error(f"{fp}:[[generate.stream.frame_windows]] (name = "
+                          f"{window.name!r}): noise frame class "
+                          f"{_fmt(window.frame_class)} must not appear in a frame window")
 
 
-def _stream_form_weaving(col: _Collector, fp: str, gs: GenerateStreamConfig,
-                         values: SimpleNamespace) -> None:
-    """校验会话装载上限、分区键、跨度和起始时间。"""
-    if 2 * values.len_max > values.stream.session_max_len:
-        col.error(f"{fp}:[stream].session_max_len: the time-stream form requires >= 2 * "
-                  f"max(len_range upper bound) (a crossed session always packs two "
-                  f"sequences), got {values.stream.session_max_len} < {2 * values.len_max}")
-    if values.stream.key:
-        col.error(f"{fp}:[stream].key: the time-stream form requires an empty array - sessions "
-                  f"are laid out directly by the weaver and partition keys do not participate, "
-                  f"got {_fmt(list(values.stream.key))}")
-    if values.stream.gap_steps:
-        col.error(f"{fp}:[stream].gap_steps: the time-stream form requires 0 - session "
-                  f"boundaries are laid out directly by the weaver (inter-session gaps are "
-                  f"always > gap_s) and step-gap splitting does not participate, got "
-                  f"{values.stream.gap_steps}")
-    span = values.stream.session_max_span_s
-    worst = (values.stream.session_max_len - 1) * gs.frame_gap_s[1]
-    if span > 0 and worst > span:
-        col.error(f"{fp}:[stream].session_max_span_s: worst-case session span "
-                  f"(session_max_len - 1) * frame_gap_s upper bound = {worst:g} s > {span} s - "
-                  f"the laid-out sessions would be hard-cut by span on the ingest side; raise "
-                  f"session_max_span_s, lower the frame_gap_s upper bound or lower "
-                  f"session_max_len")
-    try:
-        datetime.fromisoformat(gs.ts_start)
-    except (TypeError, ValueError):
-        col.error(f'{fp}:[generate.stream].ts_start: expected a parseable ISO-8601 instant '
-                  f'(e.g. "2026-01-01T09:00:00+08:00"; a missing timezone is treated as UTC, '
-                  f"matching the meta:<field> ingest rule), got {_fmt(gs.ts_start)}")
+def check_parked_stream_keys(ctx: Any) -> None:
+    """形态关闭时拒绝时间流专属的显式配置。
+
+    @param ctx 当前配置收集上下文。
+    """
+    if ctx.p.gen_provided.get("stream_tiers"):
+        ctx.col.error(f"{ctx.fp}:[[generate.stream.tiers]]: the tier table is only legal in "
+                      f"the time-stream generation form ([generate.stream].enabled = true) - "
+                      f"a tier declares the frame-class composition of the sequences drawn "
+                      f"from it, and only that form plans sequences from a frame class table")
+    if ctx.p.gen_provided.get("stream_section"):
+        ctx.col.error(f"{ctx.fp}:[generate.stream]: the stream sub-table is only legal in "
+                      f"the time-stream generation form ([generate.stream].enabled = "
+                      f"true) - quotas, schedule, noise, crossed_sessions, frame rules "
+                      f"and frame windows are planning inputs of that form")
+    for key in ("sequence_validator", "scenario_validator"):
+        if getattr(ctx.p.generate, key) is not None:
+            ctx.col.error(f"{ctx.fp}:[generate].{key}: {key} is only "
+                          f"legal in the time-stream generation form "
+                          f"([generate.stream].enabled = true)")
+    for cname, sections in (ctx.p.class_raw or {}).items():
+        g_over = sections.get("generate") if isinstance(sections, dict) else None
+        if not isinstance(g_over, dict):
+            continue
+        if "tiers" in g_over:
+            ctx.col.error(f"{ctx.fp}:[class.{cname}.generate].tiers: the per-class tier table "
+                          f"is only legal in the time-stream generation form "
+                          f"([generate.stream].enabled = true) - it overrides the global "
+                          f"[[generate.stream.tiers]] table for sequences of this class")
+        for key in ("frame_rules", "frame_windows"):
+            if key in g_over:
+                ctx.col.error(f"{ctx.fp}:[class.{cname}.generate].{key}: the per-class "
+                              f"{key} table is only legal in the time-stream generation "
+                              f"form ([generate.stream].enabled = true)")
+
+
+# ── 档位与时间字段（v1.14/v1.15 面，quota 对检查后移到计划期）────────────────
 
 
 def _check_tier_table(col: _Collector, fp: str, values: SimpleNamespace) -> None:
-    """校验全局与按类档位表及其配额对。"""
+    """校验全局与按类档位表的结构；配额对（长度下界）改由计划期按 slot 检查。"""
     tiers = values.tiers
     frame_names = tuple(spec.name for spec in values.frame_classify.classes)
     _check_tier_source(col, f"{fp}:[[generate.stream.tiers]]", tiers, frame_names)
@@ -324,9 +368,6 @@ def _check_tier_table(col: _Collector, fp: str, values: SimpleNamespace) -> None
                       f"table (it is the fallback for classes without their own table and the "
                       f"switch of the whole tier face)")
         _check_tier_source(col, loc, view.tiers, frame_names)
-    if tiers:
-        _check_tier_quota_pairs(col, fp, values)
-        _warn_frame_classes_without_tier(col, fp, values.tier_domain, frame_names)
 
 
 def _check_tier_source(col: _Collector, loc: str, tiers: tuple[TierSpec, ...],
@@ -359,76 +400,6 @@ def _check_tier_source(col: _Collector, loc: str, tiers: tuple[TierSpec, ...],
                       f"duplicates, got {_fmt(list(spec.frame_classes))}")
         else:
             owners[key] = spec.tier_rank
-
-
-def _check_tier_quota_pairs(col: _Collector, fp: str, values: SimpleNamespace) -> None:
-    """校验非零档位配额的长度下界并报告零配额警告。"""
-    for cname, view in values.class_views.items():
-        if view.generate.sequences < 1:
-            continue
-        table = effective_tiers(view.tiers, values.tiers)
-        weights = ", ".join(f"tier_rank {spec.tier_rank}: weight {spec.weight}"
-                             for spec in table)
-        for spec, quota in zip(table, apportion_tiers(view.generate.sequences, table)):
-            if quota < 1:
-                col.warn(f"{fp}:[[generate.stream.tiers]]: class {_fmt(cname)} apportions 0 "
-                         f"sequences to tier_rank = {spec.tier_rank} (largest-remainder "
-                         f"apportionment of {view.generate.sequences} sequences over weights "
-                         f"{weights}), so that tier is never exercised for this class - raise "
-                         f"sequences or rebalance the weights")
-            elif view.generate.len_range[0] < len(spec.frame_classes):
-                col.error(f"{fp}:[class.{cname}.generate].len_range: the lower bound must be "
-                          f">= the composition size of every tier this class draws from "
-                          f"(tier_rank = {spec.tier_rank} declares {len(spec.frame_classes)} "
-                          f"frame classes and is apportioned {quota} of the "
-                          f"{view.generate.sequences} sequences, and each of them must appear "
-                          f"at least once), got lower bound {view.generate.len_range[0]}")
-
-
-def _warn_frame_classes_without_tier(col: _Collector, fp: str, covered: set[str],
-                                     frame_names: tuple[str, ...]) -> None:
-    """报告不在任何有效档位构成中的帧类。"""
-    for name in frame_names:
-        if name not in covered:
-            col.warn(f"{fp}:[frame.class.{name}.generate]: frame class {_fmt(name)} is in no "
-                     f"tier composition, so it can never be picked by a blueprint - its "
-                     f"whole generate face (instruction, schema, time_fields) is dead config "
-                     f"(the generation instruction is not required for it either)")
-
-
-def check_parked_stream_keys(ctx: Any) -> None:
-    """形态关闭时拒绝时间流专属的显式配置。
-
-    @param ctx 当前配置收集上下文。
-    """
-    if ctx.p.gen_provided.get("stream_tiers"):
-        ctx.col.error(f"{ctx.fp}:[[generate.stream.tiers]]: the tier table is only legal in "
-                      f"the time-stream generation form ([generate.stream].enabled = true) - "
-                      f"a tier declares the frame-class composition of the sequences drawn "
-                      f"from it, and only that form plans sequences from a frame class table")
-    if ctx.p.gen_provided.get("stream_rules"):
-        ctx.col.error(f"{ctx.fp}:[[generate.stream.rules]]: sequence rules are only legal in "
-                      f"the time-stream generation form ([generate.stream].enabled = true)")
-    if ctx.p.gen_provided.get("stream_windows"):
-        ctx.col.error(f"{ctx.fp}:[[generate.stream.windows]]: sequence windows are only legal "
-                      f"in the time-stream generation form ([generate.stream].enabled = true)")
-    if ctx.p.generate.sequence_validator is not None:
-        ctx.col.error(f"{ctx.fp}:[generate].sequence_validator: sequence_validator is only "
-                      f"legal in the time-stream generation form ([generate.stream].enabled = true)")
-    for cname, sections in (ctx.p.class_raw or {}).items():
-        g_over = sections.get("generate") if isinstance(sections, dict) else None
-        if not isinstance(g_over, dict):
-            continue
-        if "tiers" in g_over:
-            ctx.col.error(f"{ctx.fp}:[class.{cname}.generate].tiers: the per-class tier table "
-                          f"is only legal in the time-stream generation form "
-                          f"([generate.stream].enabled = true) - it overrides the global "
-                          f"[[generate.stream.tiers]] table for sequences of this class")
-        for key in ("rules", "windows"):
-            if key in g_over:
-                ctx.col.error(f"{ctx.fp}:[class.{cname}.generate].{key}: sequence {key} are "
-                              f"only legal in the time-stream generation form "
-                              f"([generate.stream].enabled = true)")
 
 
 def _check_time_fields(col: _Collector, fp: str, values: SimpleNamespace) -> None:
@@ -502,65 +473,76 @@ def _frame_gen_schema_declared(raw: object) -> frozenset[str]:
                              for key in ("schema_path", "schema_inline")))
 
 
+# ── frame rule / frame window（v1.16 语义换名 + name 域）─────────────────────
+
+
 def _check_rule_window_tables(col: _Collector, fp: str, gs: GenerateStreamConfig,
                               values: SimpleNamespace) -> None:
-    """校验 v1.16 生效 rules/windows 的语法与 Schema 前提。"""
+    """校验生效 frame_rules/frame_windows 的语法、Schema 前提与全局名称域。"""
     frame_names = {spec.name for spec in values.frame_classify.classes}
-    _check_rules(col, f"{fp}:[[generate.stream.rules]]", gs.rules, frame_names, values)
-    _check_windows(col, f"{fp}:[[generate.stream.windows]]", gs.windows, frame_names)
+    _check_rules(col, f"{fp}:[[generate.stream.frame_rules]]", gs.frame_rules,
+                 frame_names, values)
+    _check_windows(col, f"{fp}:[[generate.stream.frame_windows]]", gs.frame_windows)
     for cname, view in values.class_views.items():
-        if view.rules is not None:
-            _check_rules(col, f"{fp}:[[class.{cname}.generate.rules]]", view.rules,
-                         frame_names, values)
-        if view.windows is not None:
-            _check_windows(col, f"{fp}:[[class.{cname}.generate.windows]]", view.windows,
-                           frame_names)
+        if view.frame_rules is not None:
+            _check_rules(col, f"{fp}:[[class.{cname}.generate.frame_rules]]",
+                         view.frame_rules, frame_names, values)
+        if view.frame_windows is not None:
+            _check_windows(col, f"{fp}:[[class.{cname}.generate.frame_windows]]",
+                           view.frame_windows)
+    _check_name_domain(col, fp, gs, values)
     _check_sequence_validator(col, fp, values.generate.sequence_validator, values)
-    if not len(col.errors):
-        _check_local_potential(col, fp, gs, values)
-        _check_full_potential(col, fp, gs, values)
+
+
+def _check_name_domain(col: _Collector, fp: str, gs: GenerateStreamConfig,
+                       values: SimpleNamespace) -> None:
+    """quota/frame rule/frame window（与 Wave 5 sequence rule）共享的全局唯一名称域。"""
+    # 名称域按**来源表**分别检查（全局表 + 每张按类声明表）——按类覆盖只换生效表，
+    # 不复制名称；用生效并集会把继承的全局行数两遍。
+    source_rules: list[Any] = list(gs.frame_rules)
+    source_windows: list[Any] = list(gs.frame_windows)
+    for view in values.class_views.values():
+        if view.frame_rules is not None:
+            source_rules.extend(view.frame_rules)
+        if view.frame_windows is not None:
+            source_windows.extend(view.frame_windows)
+    for problem in name_domain_violations(gs.quotas, source_rules,
+                                          source_windows, ()):
+        col.error(f"{fp}:[[generate.stream.quotas]]: shared name domain violation - "
+                  f"{problem} (quota, frame rule and frame window names share one "
+                  f"global-unique domain; a per-class override changes the effective "
+                  f"table, it never copies or renames natural names)")
 
 
 def _check_sequence_validator(col: _Collector, fp: str, ref: str | None,
                               values: SimpleNamespace) -> None:
-    """解析并干跑序列钩子，冻结其单位置参数与返回值契约。"""
+    """解析并干跑序列钩子，冻结其单位置参数与返回值契约。
+
+    v1.17(SPEC-SP §4.9)：引用统一 ``<python-file>:<attribute-path>``，按 project root
+    解析为 ``ResolvedHook`` 冻结载体（存入 ``values.hooks["sequence"]``，由 loader 冻结
+    进 ``ResolvedConfig.validation_hooks``）；M6 的 invoke 面不再按字符串二次 resolve。
+    """
     if ref is None:
         return
+    loc = f"{fp}:[generate].sequence_validator"
     try:
-        hook = resolve_hook(ref)
+        hook: ResolvedHook = load_hook(ref, values.root)
     except ValueError as exc:
-        col.error(f"{fp}:[generate].sequence_validator: {exc}")
+        col.error(f"{loc}: {exc}")
         return
-    try:
-        params = tuple(inspect.signature(hook).parameters.values())
-    except (TypeError, ValueError) as exc:
-        col.error(f"{fp}:[generate].sequence_validator: cannot inspect hook signature "
-                  f"({type(exc).__name__})")
+    problem = check_hook_arity(hook, 1)
+    if problem is None:
+        problem = probe_hook(hook, (_sequence_validator_probe(values),))
+    if problem is not None:
+        col.error(f"{loc}: {problem}")
         return
-    if len(params) != 1 or params[0].kind not in (
-            inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
-        col.error(f"{fp}:[generate].sequence_validator: hook must accept exactly one "
-                  "positional SequenceValidationInput parameter")
-        return
-    probe = _sequence_validator_probe(values)
-    try:
-        result = hook(probe)
-    except Exception as exc:
-        col.error(f"{fp}:[generate].sequence_validator: dry-run raised "
-                  f"{type(exc).__name__}")
-        return
-    try:
-        normalize_violations(result, ref)
-    except (TypeError, ValueError) as exc:
-        col.error(f"{fp}:[generate].sequence_validator: dry-run returned an invalid value: "
-                  f"{exc}")
+    values.hooks["sequence"] = hook
 
 
 def _sequence_validator_probe(values: SimpleNamespace) -> SequenceValidationInput:
     """构造不含用户数据的代表性序列钩子输入。"""
     participating = sorted(
-        (name, view) for name, view in values.class_views.items()
-        if view.generate.sequences > 0)
+        (name, view) for name, view in values.class_views.items())
     if not participating:
         return SequenceValidationInput(
             sequence_class="__m1_probe__", tier_rank=None,
@@ -583,141 +565,7 @@ def _sequence_validator_probe(values: SimpleNamespace) -> SequenceValidationInpu
             for index, frame_class in enumerate(selected)))
 
 
-def _check_local_potential(col: _Collector, fp: str, gs: GenerateStreamConfig,
-                           values: SimpleNamespace) -> None:
-    """用联合 planner 检查每个类、档位和每个长度候选的局部可行性。"""
-    from labelkit.common.runtime.sequence_planner import (
-        AttemptSpec,
-        PlannerConfigError,
-        PlannerInternalError,
-        PlannerStatus,
-        check_question,
-        question_from_config,
-    )
-
-    for cname in sorted(values.class_views):
-        view = values.class_views[cname]
-        rules = effective_rules(view.rules, gs.rules)
-        windows = effective_windows(view.windows, gs.windows)
-        if not rules and not windows:
-            continue
-        tiers = effective_tiers(view.tiers, gs.tiers) or (None,)
-        for tier in tiers:
-            for length in range(view.generate.len_range[0], view.generate.len_range[1] + 1):
-                attempt = AttemptSpec(
-                    index=0, class_name=cname, length=length,
-                    allowed_classes=tuple(tier.frame_classes) if tier else (),
-                    length_range=(length, length),
-                    tier_rank=tier.tier_rank if tier else None,
-                )
-                try:
-                    question = question_from_config(
-                        _local_config(values, gs, rules, windows), attempts=(attempt,))
-                    status = check_question(question)
-                except PlannerInternalError:
-                    raise
-                except PlannerConfigError as exc:
-                    _planner_config_error(
-                        col, f"{fp}:[class.{cname}.generate].len_range",
-                        tier, length, str(exc))
-                    continue
-                except ValueError as exc:
-                    _planner_config_error(
-                        col, f"{fp}:[class.{cname}.generate].len_range",
-                        tier, length, str(exc))
-                    continue
-                if status in {PlannerStatus.INFEASIBLE, PlannerStatus.UNKNOWN}:
-                    _planner_config_error(
-                        col, f"{fp}:[class.{cname}.generate].len_range",
-                        tier, length, status.value)
-
-
-def _local_config(values: SimpleNamespace, gs: GenerateStreamConfig,
-                  rules: tuple[SequenceRuleSpec, ...],
-                  windows: tuple[SequenceWindowSpec, ...]) -> SimpleNamespace:
-    """构造单 attempt 局部检查所需的 planner 适配器。"""
-    local_stream = SimpleNamespace(
-        sessions=1, frame_gap_s=gs.frame_gap_s, ts_start=gs.ts_start,
-        noise_ratio=0, rules=rules, windows=windows,
-    )
-    return SimpleNamespace(
-        frame_class_views=values.frame_class_views,
-        generate_stream=local_stream,
-        stream=values.stream,
-    )
-
-
-def _planner_config_error(col: _Collector, path: str, tier: TierSpec | None,
-                          length: int, detail: str) -> None:
-    """记录单个类、档位和长度的 planner 状态错误。"""
-    rank = "implicit" if tier is None else str(tier.tier_rank)
-    if _planner_error_is_unknown(detail):
-        col.error(f"{path}: sequence planner could not verify this potential within the "
-                  f"deterministic budget (status = UNKNOWN; tier_rank = {rank}, "
-                  f"length = {length})")
-        return
-    col.error(f"{path}: sequence planner found no feasible potential for tier_rank = "
-              f"{rank}, length = {length}: {detail}")
-
-
-def _planner_error_is_unknown(detail: str) -> bool:
-    """识别 planner 的 UNKNOWN 文案，避免把预算未验证写成不可满足。"""
-    text = detail.lower()
-    return "unknown" in text or "could not be verified" in text or "deterministic budget" in text
-
-
-def _check_full_potential(col: _Collector, fp: str, gs: GenerateStreamConfig,
-                          values: SimpleNamespace) -> None:
-    """对存在非零约束配额的流执行一次完整联合规划。"""
-    if not _has_nonzero_constraints(gs, values):
-        return
-    from labelkit.common.runtime.sequence_planner import (
-        PlannerConfigError,
-        PlannerInternalError,
-        question_from_config,
-        select_feasible_plan,
-    )
-
-    try:
-        rng = random.Random(f"{getattr(values, 'run_seed', 0)}:0:generate")
-        question = question_from_config(values)
-        question = replace(question, solver_seed=rng.getrandbits(31))
-        select_feasible_plan(question, rng)
-    except PlannerInternalError:
-        raise
-    except PlannerConfigError as exc:
-        if _planner_error_is_unknown(str(exc)):
-            col.error(f"{fp}:[generate.stream]: sequence planner could not verify the full "
-                      "prefix within the deterministic budget (status = UNKNOWN)")
-        else:
-            col.error(f"{fp}:[generate.stream]: sequence planner found no feasible full "
-                      f"prefix (status = INFEASIBLE): {exc}")
-        return
-    except ValueError as exc:
-        col.error(f"{fp}:[generate.stream]: sequence planner configuration could not be "
-                  f"constructed: {exc}")
-        return
-
-
-def _has_nonzero_constraints(gs: GenerateStreamConfig, values: SimpleNamespace) -> bool:
-    """判断实际配额前缀是否需要激活全流 planner。"""
-    remaining = getattr(values, "limit", None)
-    for cname in sorted(values.class_views):
-        view = values.class_views[cname]
-        count = view.generate.sequences
-        if remaining is not None:
-            count = min(count, max(remaining, 0))
-            remaining -= count
-        constrained = effective_rules(view.rules, gs.rules) or effective_windows(
-            view.windows, gs.windows)
-        if count > 0 and constrained:
-            return True
-        if remaining == 0:
-            break
-    return False
-
-
-def _check_rules(col: _Collector, prefix: str, rules: tuple[SequenceRuleSpec, ...],
+def _check_rules(col: _Collector, prefix: str, rules: tuple[Any, ...],
                  frame_names: set[str], values: SimpleNamespace) -> None:
     """校验规则模板参数、引用、重复和 correlation Schema 前提。"""
     seen: set[tuple[Any, ...]] = set()
@@ -726,41 +574,29 @@ def _check_rules(col: _Collector, prefix: str, rules: tuple[SequenceRuleSpec, ..
         _check_rule_shape(col, loc, rule)
         _check_rule_refs(col, loc, rule, frame_names)
         _check_rule_schema(col, loc, rule, values)
-        _check_rule_replay_guard(col, loc, rule, values)
-        identity = (rule.template, rule.frame_class, rule.source, rule.target,
-                    rule.count, rule.time_s, rule.correlation)
+        identity = (rule.name, rule.template, rule.frame_class, rule.source,
+                    rule.target, rule.count, rule.time_us, rule.correlation)
         if identity in seen:
-            col.error(f"{loc}: duplicate sequence rule declaration; the same rule is already "
+            col.error(f"{loc}: duplicate frame rule declaration; the same rule is already "
                       f"declared in this effective table")
         seen.add(identity)
 
 
-def _check_rule_replay_guard(col: _Collector, loc: str, rule: SequenceRuleSpec,
-                             values: SimpleNamespace) -> None:
-    """拒绝与相邻帧 replay guard 明显没有交集的有序时间规则。"""
-    if rule.time_s is None or rule.template not in {"chain_response", "chain_precedence"}:
-        return
-    lo, hi = rule.time_s
-    if lo > values.stream.gap_s or hi <= _FRAME_GAP_FLOOR_S:
-        col.error(f"{loc}.time_s: the declared half-open interval has no intersection with "
-                  f"the adjacent replay guard [1us, stream.gap_s = {values.stream.gap_s}s]")
-
-
-def _check_rule_shape(col: _Collector, loc: str, rule: SequenceRuleSpec) -> None:
-    """校验一条规则的模板参数矩阵。"""
+def _check_rule_shape(col: _Collector, loc: str, rule: Any) -> None:
+    """校验一条规则的模板参数矩阵（v1.16 语义 + contains）。"""
     template = rule.template
     if template in _UNARY_TEMPLATES:
         if rule.frame_class is None:
             col.error(f"{loc}.frame_class: required for unary template {template}")
         if any(value is not None for value in
-               (rule.source, rule.target, rule.time_s, rule.correlation)):
+               (rule.source, rule.target, rule.time_us, rule.correlation)):
             col.error(f"{loc}: source, target, time_s and correlation are only legal for "
                       f"binary templates, got template {template}")
     elif template in _BINARY_TEMPLATES:
         if rule.source is None or rule.target is None:
             col.error(f"{loc}: source and target are required for binary template {template}")
         if rule.frame_class is not None:
-            col.error(f"{loc}: frame_class is only legal for unary templates, got template "
+            col.error(f"{loc}.frame_class: only legal for unary templates, got template "
                       f"{template}")
     if template in _COUNT_TEMPLATES:
         if rule.count is None:
@@ -776,7 +612,7 @@ def _check_rule_shape(col: _Collector, loc: str, rule: SequenceRuleSpec) -> None
                   f"{_fmt(rule.source)}")
 
 
-def _check_rule_refs(col: _Collector, loc: str, rule: SequenceRuleSpec,
+def _check_rule_refs(col: _Collector, loc: str, rule: Any,
                      frame_names: set[str]) -> None:
     """校验规则引用的帧类属于闭集。"""
     for key, name in (("frame_class", rule.frame_class), ("source", rule.source),
@@ -787,7 +623,7 @@ def _check_rule_refs(col: _Collector, loc: str, rule: SequenceRuleSpec,
                       f"{', '.join(sorted(frame_names)) if frame_names else '(none)'}")
 
 
-def _check_rule_schema(col: _Collector, loc: str, rule: SequenceRuleSpec,
+def _check_rule_schema(col: _Collector, loc: str, rule: Any,
                        values: SimpleNamespace) -> None:
     """校验 correlation 两侧结构化 Schema 的字段、required、同型和绑定排除。"""
     corr = rule.correlation
@@ -846,9 +682,8 @@ def _check_correlation_fields(col: _Collector, loc: str, correlation: Any,
     return result[0][0], result[1][0], result[0][1], result[1][1]
 
 
-def _check_windows(col: _Collector, prefix: str,
-                   windows: tuple[SequenceWindowSpec, ...], frame_names: set[str]) -> None:
-    """校验窗口引用、星期、同日格式、重叠和跨午夜。"""
+def _check_windows(col: _Collector, prefix: str, windows: tuple[Any, ...]) -> None:
+    """校验窗口引用、星期、同日区间与重叠。"""
     seen: set[str] = set()
     for index, window in enumerate(windows, 1):
         loc = f"{prefix}[{index}]"
@@ -856,43 +691,180 @@ def _check_windows(col: _Collector, prefix: str,
             col.error(f"{loc}.frame_class: duplicate window declaration for frame class "
                       f"{_fmt(window.frame_class)}")
         seen.add(window.frame_class)
-        if window.frame_class not in frame_names:
-            col.error(f"{loc}.frame_class: frame class {_fmt(window.frame_class)} is not in "
-                      f"[[frame.classify.classes]]")
-        if not window.of_day:
-            col.error(f"{loc}.of_day: expected a non-empty array of same-day half-open "
-                      f"windows")
         intervals = []
-        for branch, (start, end) in enumerate(window.of_day, 1):
-            start_us = _clock_us(col, f"{loc}.of_day[{branch}][1]", start)
-            end_us = _clock_us(col, f"{loc}.of_day[{branch}][2]", end)
-            if start_us is not None and end_us is not None:
-                if start_us >= end_us:
-                    col.error(f"{loc}.of_day[{branch}]: window must satisfy start < end "
-                              f"within one natural day; cross-midnight windows are not legal")
+        for branch, (start_us, end_us) in enumerate(window.of_day_us, 1):
+            if start_us >= end_us:
+                col.error(f"{loc}.of_day[{branch}]: window must satisfy start < end "
+                          f"within one natural day; cross-midnight windows are not legal")
+            else:
                 intervals.append((start_us, end_us))
         for left, right in zip(sorted(intervals), sorted(intervals)[1:]):
             if left[1] > right[0]:
-                col.error(f"{loc}.of_day: branches must not overlap, got {_fmt(list(window.of_day))}")
-        if len(set(window.of_week)) != len(window.of_week):
-            col.error(f"{loc}.of_week: weekday values must be distinct, got "
-                      f"{_fmt(list(window.of_week))}")
+                col.error(f"{loc}.of_day: branches must not overlap")
         if not window.of_week:
             col.error(f"{loc}.of_week: expected a non-empty array of weekday names")
 
 
-def _clock_us(col: _Collector, loc: str, value: str) -> int | None:
-    """把一个 HH:MM[:SS[.ffffff]] 墙钟字符串转换为微秒。"""
-    import re
-    match = re.fullmatch(r"(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?", value)
-    if match is None:
-        col.error(f"{loc}: expected HH:MM, HH:MM:SS or microsecond-precision wall-clock "
-                  f"time, got {_fmt(value)}")
+# ── ScenarioConfig 装配与唯一编译入口 ───────────────────────────────────────
+
+
+def _quantize_frame_gap(col: _Collector, fp: str,
+                        gs: GenerateStreamConfig) -> tuple[int, int] | None:
+    """frame_gap_s 闭区间的 Decimal 量化（[ceil(lo×1e6), floor(hi×1e6)]）。"""
+    try:
+        lo = Decimal(str(gs.frame_gap_s[0])) * Decimal(1_000_000)
+        hi = Decimal(str(gs.frame_gap_s[1])) * Decimal(1_000_000)
+        lo_us = math.ceil(lo)
+        hi_us = math.floor(hi)
+    except (InvalidOperation, ValueError):
+        col.error(f"{fp}:[generate.stream].frame_gap_s: expected finite numbers")
         return None
-    hour, minute = int(match.group(1)), int(match.group(2))
-    second = int(match.group(3) or 0)
-    micros = int((match.group(4) or "").ljust(6, "0") or 0)
-    if hour > 23 or minute > 59 or second > 59:
-        col.error(f"{loc}: expected a valid same-day wall-clock time, got {_fmt(value)}")
+    if lo < Decimal(1) or lo_us < 1:
+        col.error(f"{fp}:[generate.stream].frame_gap_s: the lower bound must be >= "
+                  f"1e-6 s (one microsecond) - the laid-out timestamps must be strictly "
+                  f"increasing and a sub-microsecond gap rounds to a zero timedelta, got "
+                  f"lower bound {_fmt(gs.frame_gap_s[0])}")
         return None
-    return ((hour * 60 + minute) * 60 + second) * 1_000_000 + micros
+    if lo_us > hi_us:
+        col.error(f"{fp}:[generate.stream].frame_gap_s: the range quantizes to an empty "
+                  f"integer-microsecond interval - widen it so that at least one "
+                  f"microsecond is representable, got {_fmt(list(gs.frame_gap_s))}")
+        return None
+    return lo_us, hi_us
+
+
+def _scenario_config(col: _Collector, fp: str, gs: GenerateStreamConfig,
+                     values: SimpleNamespace) -> "ScenarioConfig | None":
+    """把已通过静态门的配置装配成 ``compile_scenario`` 的冻结参数对象。"""
+    gap = _quantize_frame_gap(col, fp, gs)
+    if gap is None:
+        return None
+    sequence_classes = tuple(
+        SequenceClassDomain(
+            name=spec.name,
+            length_range=(view.generate.len_range[0], view.generate.len_range[1]),
+            tiers=tuple(TierDomain(rank=tier.tier_rank, weight=tier.weight,
+                                   frame_classes=tuple(tier.frame_classes))
+                        for tier in effective_tiers(view.tiers, values.tiers)),
+            frame_rules=effective_frame_rules(view.frame_rules, gs.frame_rules),
+            frame_windows=effective_frame_windows(view.frame_windows, gs.frame_windows),
+            sequence_rules=effective_sequence_rules(view.sequence_rules, gs.sequence_rules),
+        )
+        for spec, view in ((spec, values.class_views[spec.name])
+                           for spec in values.classify.classes))
+    frame_classes = tuple(
+        FrameClassDomain(name=spec.name, duration_us=products_view.duration_us,
+                         resources=products_view.resources)
+        for spec, products_view in ((spec, values.frame_class_views[spec.name])
+                                    for spec in values.frame_classify.classes))
+    span_s = values.stream.session_max_span_s
+    return ScenarioConfig(
+        seed=values.run_seed,
+        schedule=gs.schedule,           # type: ignore[arg-type]
+        quotas=gs.quotas,
+        sequence_classes=sequence_classes,
+        frame_classes=frame_classes,
+        sequence_rules=gs.sequence_rules,
+        crossed_sessions=gs.crossed_sessions,
+        frame_gap_us=gap,
+        session_gap_us=int(values.stream.gap_s) * 1_000_000,
+        session_max_len=values.stream.session_max_len,
+        session_max_span_us=span_s * 1_000_000 if span_s > 0 else None,
+        noise_ratio=Decimal(str(gs.noise_ratio)),
+        noise_classes=gs.noise_classes,
+        duplicates=gs.duplicates,
+    )
+
+
+def _compile_scenario_plan(col: _Collector, fp: str, gs: GenerateStreamConfig,
+                           values: SimpleNamespace, products: Any) -> None:
+    """装配 ``ScenarioConfig`` 并调用 ``compile_scenario`` 一次（§6.2 唯一入口）。
+
+    静态门有错时不进入求解（避免对已判非法的配置输出 solver 噪声）；
+    ``PlannerInfeasibleError`` 汇入 ConfigError（exit 2）；capacity/budget/internal
+    映射 exit 4（§8.3，经 ``InternalError`` 通道上抛）。
+    """
+    if col.errors or gs.schedule is None:
+        return
+    config = _scenario_config(col, fp, gs, values)
+    if config is None:
+        return
+    try:
+        plan = compile_scenario(config)
+    except PlannerInfeasibleError as exc:
+        col.error(f"{fp}:[generate.stream]: scenario planning found no feasible plan "
+                  f"(status = INFEASIBLE): {exc}")
+        return
+    except (PlannerCapacityError, PlannerBudgetError) as exc:
+        raise InternalError(str(exc)) from exc
+    except RuntimeError as exc:            # PlannerInternalError 及解码不变量
+        raise InternalError(str(exc)) from exc
+    products.scenario_plan = plan
+    _check_plan_tier_pairs(col, fp, gs, values, plan)
+    _check_plan_instruction_domain(col, fp, gs, values, plan)
+
+
+def _check_plan_tier_pairs(col: _Collector, fp: str, gs: GenerateStreamConfig,
+                           values: SimpleNamespace, plan: Any) -> None:
+    """计划期配额对检查：每个非零 target 类的 len_range 下界 ≥ 生效档构成大小。"""
+    targets = {slot.sequence_class for slot in plan.slots}
+    for cname in targets:
+        view = values.class_views[cname]
+        table = effective_tiers(view.tiers, gs.tiers)
+        for spec in table:
+            if view.generate.len_range[0] < len(spec.frame_classes):
+                col.error(f"{fp}:[class.{cname}.generate].len_range: the lower bound must "
+                          f"be >= the composition size of every tier this class draws from "
+                          f"(tier_rank = {spec.tier_rank} declares "
+                          f"{len(spec.frame_classes)} frame classes and each of them must "
+                          f"appear at least once), got lower bound "
+                          f"{view.generate.len_range[0]}")
+
+
+def _check_plan_instruction_domain(col: _Collector, fp: str, gs: GenerateStreamConfig,
+                                   values: SimpleNamespace, plan: Any) -> None:
+    """计划期帧类指令域：参与类生效档构成 ∪（无档 = 非噪音全表）内指令必填。"""
+    participating = {slot.sequence_class for slot in plan.slots}
+    noise_names = {spec.frame_class for spec in gs.noise_classes}
+    domain: set[str] = set()
+    tiered = False
+    for cname in participating:
+        view = values.class_views[cname]
+        table = effective_tiers(view.tiers, gs.tiers)
+        if table:
+            tiered = True
+            domain.update(name for spec in table for name in spec.frame_classes)
+    if not tiered:
+        domain = {spec.name for spec in values.frame_classify.classes} - noise_names
+    domain -= noise_names
+    reason = ("the planner word covers the union of the participating classes' effective "
+              "tier compositions, so any frame class of a tier may be picked"
+              if tiered else
+              "the planner word spans the whole non-noise table, so any task frame "
+              "class may be picked")
+    for name in sorted(domain):
+        view = values.frame_class_views.get(name)
+        if view is None or not (view.gen_instruction or "").strip():
+            col.error(f"{fp}:[frame.class.{name}.generate].instruction: every task frame "
+                      f"class must provide a non-empty generation instruction ({reason}), "
+                      f"expected a non-empty string")
+    for cname, view in values.class_views.items():
+        if cname in participating and not view.generate.instruction.strip():
+            col.error(f"{fp}:[class.{cname}.generate].instruction: a participating "
+                      f"sequence class must provide a non-empty generation instruction "
+                      f"(the global [generate].instruction sets a default)")
+    if gs.tiers and not participating:
+        return
+    if gs.tiers:
+        covered = set()
+        for cname in participating:
+            covered.update(name for spec in effective_tiers(
+                values.class_views[cname].tiers, gs.tiers)
+                for name in spec.frame_classes)
+        for spec in values.frame_classify.classes:
+            if spec.name not in covered and spec.name not in noise_names:
+                col.warn(f"{fp}:[frame.class.{spec.name}.generate]: frame class "
+                         f"{_fmt(spec.name)} is in no effective tier composition of a "
+                         f"participating class, so it can never be picked - its whole "
+                         f"generate face (instruction, schema, time_fields) is dead "
+                         f"config")

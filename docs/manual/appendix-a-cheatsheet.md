@@ -49,7 +49,7 @@
 | `run.input` | process 必填 | 输入路径；**generate_only 必须不设**；--input 可覆盖 | 5/7 |
 | `run.output` | 必填 | 主输出路径；其余产物同目录派生；--output 可覆盖 | 7/8 |
 | `run.modality` | 必填 | "text" \| "ui" | 5/7 |
-| `run.mode` | "process" | \| "generate_only"（要求 generate 开；三形态：种子池 / 无种子 / **时间流生成**（v1.13，`[generate.stream]`，A.13）） | 7/12/27 |
+| `run.mode` | "process" | \| "generate_only"（要求 generate 开；三形态：种子池 / 无种子 / **时间流生成**（v1.17，`[generate.stream]`，A.13）） | 7/12/27 |
 | `run.batch_size` | 256 | 批大小 = **pairwise 比较池大小（质量口径参数）** | 7/10 |
 | `run.seed` | 0 | 全部随机行为的种子；同 seed 可复现 | 7 |
 | `run.fatal_error_threshold` | 20 | 熔断：**连续**致命 API 错误数达标 ⇒ 退出码 4（401/403 认证类首错即熔断，不计连续数；重试耗尽也计窗） | 7/17 |
@@ -113,8 +113,8 @@
 | `sample_validator` | 不设 | 样本级代码回调 "module:function"：过滤语义，剔除计入桶 rejected_by_validator | 12 |
 | `seed_examples` | [] | generate_only 种子池形态（process 不得设；**时间流形态显式书写 = 定向配置错误**） | 12/22/27 |
 | `standalone_count` | 不设 | generate_only 无种子形态目标条数（与 seed_examples 互斥；process 不得设；**时间流形态同上禁设**） | 12/22/27 |
-| `sequences` | 0 | v1.13 时间流形态：**全局默认**序列配额（按类 `[class.*.generate].sequences` 覆盖；至少一类有效值 ≥ 1） | 27 |
-| `len_range` | [3, 6] | v1.13 时间流形态：**全局默认**序列长度区间 [lo, hi]（1 ≤ lo ≤ hi；按类覆盖） | 27 |
+| `[[generate.stream.quotas]]` | [] | v1.17 时间流成功交付 target；按自然名称和 period 归因，至少一张表且总 target ≥ 1 | 27 |
+| `len_range` | [3, 6] | 时间流序列长度区间 [lo, hi]；在 `[class.<name>.generate]` 中按序列类声明 | 27 |
 | `[[generate.styles]]` | [] | 风格子表 {name, prompt}；每调用均匀抽 1 个追加为 [风格要求]（时间流形态：每序列预抽，作用于帧实现与噪音调用，蓝图不带风格） | 12/27 |
 
 ## A.6 project.toml — [annotate] / [verify]
@@ -158,7 +158,7 @@
 3. `generate` ⇒ modality="text"；process 模式下另 ⇒ `quality`
 4. `generate_only` ⇒ `generate.enabled` 且 `run.input` 缺省
 5. `quality.threshold` ⨯ `selection="top_ratio"` 互斥
-6. `generate_only` ⇒ `seed_examples` 与 `standalone_count` **恰好设置其一**（同时设置或均缺省都报错）；process 模式下两键均不得设置。**例外**：`generate.stream.enabled = true`（v1.13 时间流形态）时这条规则不适用——配额由 `[class.*.generate].sequences` 承载，两键显式书写反而是定向配置错误（A.8 第 33 条）
+6. `generate_only` ⇒ `seed_examples` 与 `standalone_count` **恰好设置其一**（同时设置或均缺省都报错）；process 模式下两键均不得设置。**例外**：`generate.stream.enabled = true`（v1.13 时间流形态）时这条规则不适用——配额由 `[[generate.stream.quotas]]` 承载，两键显式书写反而是定向配置错误（A.8 第 33 条）
 7. judges 数组非空须奇数且成员存在于 [llm.*]
 8. UI 模态被引用的 LLM profile 须 `supports_vision=true`
 9. `weighted` ⇒ weights 正数且长度=len(llms)
@@ -183,13 +183,13 @@
 28. `[frame.class.<名>]` 在场 ⇒ `frame.classify.enabled = true` **∨ `generate.stream.enabled = true`**（v1.13 放宽）∧ 节名 ∈ 帧类表；覆盖节白名单：帧分类形态下仅 `annotate` 一节（键仅 instruction / examples / enabled），时间流生成形态下仅 `generate` 一节（键仅 instruction / schema_path / schema_inline，A.13）——白名单外键/节 ⇒ 配置错误，同 A.9 的显式例外形制
 29. `[frame.classify]` 显式出现 `assignment`、`[frame.annotate]` 显式出现 `self_consistency` ⇒ **定向配置错误**（帧级无多标签、无自洽采样；同 A.8 第 22 条的定向探针形制）；`[frame.*]` 节在场 ∧ 均未启用 ∧ `segment.enabled = false` ∧ `generate.stream` 关 ⇒ 仅 **warning**（并入 A.8 第 19 条名单，v1.12/v1.13）
 30. `generate.stream.enabled = true` ⇒ **形态前提合取**（v1.13，缺一即配置错误）：`run.mode = "generate_only"` ∧ `run.modality = "text"` ∧ `generate.enabled` ∧ `classify.enabled` ∧ `stream.order_by = "meta:<字段>"` ∧ `output.meta_mode ≠ "none"`；同时 `frame.classify.enabled` / `frame.annotate.enabled` 必须为 false（帧类真值生成期已知，显式开启 = 定向配置错误）
-31. 时间流形态的**类表放宽与配额**（v1.13）：序列类表 **≥1 项**（放宽自 A.8 第 13 条的 ≥2）∧ `fallback_class` **免填**（写了仍须 ∈ 类表）∧ 至少一个类的有效 `sequences ≥ 1` ∧ 参与生成的类 `instruction` 非空；帧类表非空 ∧ **每个**帧类都有非空的 `[frame.class.<名>.generate].instruction`（蓝图 enum 覆盖全类表）；`classify.llm` 豁免密钥/probe 引用集（零判决调用）
-32. 时间流形态的**装箱与织造**（v1.13）：`sessions ≥ 1` ∧ `sessions ≤ Σsequences ≤ 2 × sessions`（交叉并发度恒 k ∈ {1,2}）；`duplicates ∈ [0, Σsequences]`；`noise_ratio ∈ [0,1)`（> 0 ⇒ `noise_instruction` 非空）；`frame_gap_s`：默认 v1.15 路径（以及仅有 sequence_validator、无实际非零 rules/windows 前缀的路径）为 **`1e-6 ≤ lo ≤ hi < stream.gap_s`**；仅当 `--limit` 后实际非零配额前缀存在生效 rules/windows 时，v1.16 联合路径才允许 **`hi ≤ stream.gap_s`**（v1.14 微秒地板——亚微秒间隔被时间戳精度取整成 0，破坏 ts 严格递增，也让词表的 0.0 边界失去意义）；`2 × max(各类 len_range 上界) ≤ stream.session_max_len`；`stream.key == []` ∧ `stream.gap_steps == 0`（定向配置错误——会话边界由交织器铺设）；`session_max_span_s > 0` ⇒ `(session_max_len − 1) × frame_gap_s 上界 ≤ session_max_span_s`；`ts_start` 须可解析为 ISO-8601
-33. 时间流形态的**禁设键探针**（v1.13，定向配置错误、不走「未知键仅 warning」）：`[generate]` 的 `seed_examples` / `standalone_count` / `num_per_record` / `seeds_per_call`；`[class.*.generate]` 的 `num_per_record` / `seeds_per_call`（配额改用 `sequences`、长度改用 `len_range`）
+31. 时间流形态的**类表放宽与配额**（v1.17）：序列类表 ≥1 项，至少一个 quota target ≥ 1，参与类 instruction 非空；quota 唯一承载成功交付目标，长度在 `[class.<name>.generate].len_range` 声明；帧类表非空且参与帧类有非空 generate instruction。
+32. 时间流形态的**精确交付与织造**（v1.17）：`crossed_sessions` 固定交叉数，session 数由 quota target 自动推导；`duplicates ∈ [0, target]`；`noise_ratio ∈ [0,1)`；`frame_gap_s` 使用微秒量化规则；有限 `[generate.stream.schedule]` 是唯一时间边界；`frame_rules` / `frame_windows` 与 `sequence_rules` 由 ScenarioPlan 统一规划。旧 `sessions`、`ts_start`、`noise_instruction`、`rules`、`windows`、`sequences` 仅作为 v1.17 定向 CONFIG_ERROR 负例，不是可复制配置
+33. 时间流形态的**禁设键探针**（v1.13，定向配置错误、不走「未知键仅 warning」）：`[generate]` 的 `seed_examples` / `standalone_count` / `num_per_record` / `seeds_per_call`；`[class.*.generate]` 的 `num_per_record` / `seeds_per_call`（配额改用 quota 表、长度改用 `len_range`）
 34. **帧类构成档位**（v1.14，`[[generate.stream.tiers]]`，A.13）：本表在场 ⇒ `generate.stream.enabled = true`（定向配置错误——仅时间流形态合法）；下列结构校验**逐生效表各跑一遍**（全局表 + 每张已声明的按类表，v1.15 第 36 条）：`tier_rank` 正整数、表内唯一、**本表连续覆盖 1..N**（N = 该表长；缺号/重号即错）；`weight` 整数 ≥ 1；`frame_classes` 非空、表内无重复、每名 ∈ `[[frame.classify.classes]]`，且**同一张表内各档构成集合两两互异**（同构成即语义重复；**跨表同构成合法**）；**长度可覆盖**——逐 (参与类, 档) 配额 ≥ 1 的组合须满足该类 `len_range` 下界 ≥ `len(该档 frame_classes)`，档表取该类**生效表**（档内每类至少出现一次才装得下；**零配额组合豁免**，零配额类声明的表仍照跑结构校验）。两条 **WARN**（非错误）：某 (类, 档) 按整数域最大余额法配额为 0；某帧类未被任何**生效表**收录（其 `[frame.class.<名>.generate]` 整节成为死配置）。附带效力：档位表在场时 A.8 第 31 条「每个帧类都必填 `generate.instruction`」的检查域**收窄为 ∪各参与类生效表的构成**，未入档帧类免填
 35. **时间字段回填**（v1.14，`[frame.class.<名>.generate.time_fields]`，A.13）：本子表仅当该帧类声明了 `schema_path` / `schema_inline`（结构化帧）时合法——纯文本帧带它是定向配置错误；每个绑定键 ∈ 该帧类生成 Schema 的顶层 `properties`；绑定值 ∈ 语义词表闭集 `{ts, gap_prev_s, gap_next_s, elapsed_s}`；**声明类型字面恰等**——`ts` ⇒ 该属性 Schema 写 `"type": "string"`、其余三值 ⇒ `"type": "number"`（联合类型数组、缺 `type`、经 `$ref`/组合关键字间接声明均判不匹配，定向配置错误）；**剔除余量**——顶层 `properties` 键数 − 绑定键数 ≥ 1（全绑定即错，LLM 至少得有一个字段可生成）。一条 **WARN**：绑定字段上带 `type` 以外的约束关键字（minimum/maximum/pattern …）——它们既不上行给模型也不被强制，时间量的值域由时间轴决定
 36. **按类档位表**（v1.15，`[[class.<名>.generate.tiers]]`，A.9/A.13）：行结构与全局表同三键。三条前提（均为定向配置错误）：**仅时间流形态合法**（`generate.stream.enabled = false` 时任何 `[class.*.generate]` 原始节含 `tiers` 键即报错）；**全局表为锚**——任一按类表在场时全局 `[[generate.stream.tiers]]` 必须在场（它既是未声明类的回落表，又是「档位面开没开」的唯一判据）；**显式空表 `tiers = []` 拒收**（无「本类不分档」态，指引删键回落；与锚缺失**互斥报错**，只报空表这条）。语义：**表级原子覆盖**——类声明了就整表取代全局表，不逐行合并；未声明（缺键）⇒ 回落全局表。收窄两条既有措辞：`tier_rank` 是**类内身份**（每张生效表各自连续覆盖 1..N，N 逐类可不同；跨类同 rank 无工具语义），「构成两两互异」的辖区是**单表之内**。第 34 条的全部结构校验与配额对约束按生效表逐表执行（见该条）
-37. **序列规则、日历窗口与序列 hook**（v1.16）：`rules` / `windows` / `generate.sequence_validator` 仅时间流形态合法。十五个规则模板的参数矩阵启动即查；二元规则可带微秒可表示的半开 `time_s=[lo,hi)` 与顶层 required 同型字段的 `correlation={operator="equal",source_field,target_field}`，correlation 字段不得是 time_fields。窗口按帧类唯一，`of_day` 是不重叠的同日半开多窗，`of_week` 是 mon–sun 非空集合；跨午夜单分支拒收，时区固定取 `ts_start` offset。按类 rules/windows 各自采用缺键继承、空表清空、非空整表覆盖，不要求全局锚。任一非零配额类的生效规则/窗口非空时，联合 CP-SAT 在 LLM 前冻结长度、帧类词、witness、session、crossing、timestamp 与最大可行 noise 槽；每个类×生效档×每个候选长度与实际全流都须可验证。solver 固定单 worker 与 deterministic budget；`INFEASIBLE` / `UNKNOWN` 是配置错误，`MODEL_INVALID` 是内部错误。hook 每序列一次，输入 payload 为深拷贝；异常按违规作废，不激活 planner
+37. **序列规则、日历窗口与序列 hook**（v1.17）：`frame_rules` / `frame_windows` / `sequence_rules` / `generate.sequence_validator` 仅时间流形态合法。`sequence_rules` 以 sequence class 为 source/target，按 day/week/schedule 归属；`duration_s` 与 `resources` 可为结构化 frame class 声明时长和互斥资源，由 ScenarioPlan 统一规划。
 
 ## A.9 project.toml — [classify] 与 [class.<name>.*] 按类覆盖（v1.7 追加）
 
@@ -212,7 +212,7 @@
 |---|---|---|
 | `[class.*.quality]` | mode / rounds / rubric（含 `[class.*.rubric]` 内联子表）/ threshold / selection / top_ratio | llm、judges、both_orders、criteria_per_call、on_unscored |
 | `[class.*.annotate]` | instruction / examples / **schema_path / schema_inline**（至多其一，v1.13：整份覆盖输出 Schema，缺省回落 `output.schema`） | llm、self_consistency、sc_temperature |
-| `[class.*.generate]` | instruction / styles / num_per_record / temperature；时间流形态另加 sequences / len_range、按类 `tiers`，以及 v1.16 的按类 `rules` / `windows` 三态整表 | llms、mixture、weights、seeds_per_call、num_per_call、sample_validator、sequence_validator |
+| `[class.*.generate]` | instruction / styles / temperature；时间流形态另加 `len_range`、按类 `tiers`、`frame_rules` / `frame_windows` 三态整表 | llms、mixture、weights、seeds_per_call、num_per_call、sample_validator、sequence_validator |
 | `[frame.class.*.generate]`（v1.13 时间流形态） | instruction / schema_path / schema_inline（后两者至多其一）/ **time_fields 子表**（v1.14 时间字段绑定，仅结构化帧合法——A.8 第 35 条） | 帧内容契约无 llm / 温度键（随所属序列的预抽 profile 与温度） |
 | `[class.*.verify]` | extra_criteria | llm、judges、policy、max_repair_rounds |
 | `[class.*.extract]`（v1.8） | instruction | llm、include_diff、on_error |
@@ -285,19 +285,19 @@
 | `[frame.class.<帧类名>.annotate].examples` | 继承全局 | 按帧类覆盖 few-shot；同样过帧级 Schema 干跑 | 24/25 |
 | `[frame.class.<帧类名>.annotate].enabled` | true | false ⇒ 该帧类成员跳过帧标注（members[] 呈现 status="skipped"——省成本面） | 24/25 |
 
-## A.13 project.toml — [generate.stream]、帧内容与序列约束（v1.16）
+## A.13 project.toml — [generate.stream]、帧内容与序列约束（v1.17）
 
-`[generate.stream]` 是 generate 算子的第三形态：`generate_only` 下交付序列主输出与可重放的逐帧工件。无有效规则/窗口时保留 v1.15 的蓝图和机械交织路径；v1.16 约束面在场时，联合 planner 在任何内容调用前冻结全流 skeleton，LLM 只补 brief 与 payload。可运行样板 `examples/synth-stream` 同时演示档位、时间字段、correlation、20–40 分钟 chain 规则、工作日日历窗口与序列 hook。
+`[generate.stream]` 是 generate 算子的第三形态：`generate_only` 下交付序列主输出与可重放的逐帧工件。无有效规则/窗口时保留 v1.15 的蓝图和机械交织路径；v1.17 约束面在场时，联合 planner 在任何内容调用前冻结全流 skeleton，LLM 只补 brief 与 payload。可运行样板 `examples/synth-stream` 同时演示档位、时间字段、correlation、20–40 分钟 chain 规则、工作日日历窗口与序列 hook。
 
 | 键 | 默认 | 一句话 | 章 |
 |---|---|---|---|
 | `generate.stream.enabled` | false | 形态总开关；开启即触发 A.8 第 30 条的六项前提合取 | 27 |
-| `generate.stream.sessions` | 0 | primary 会话数（≥ 1），须 `sessions ≤ Σsequences ≤ 2 × sessions`；完整计划有 `Σsequences − sessions` 个双 owner 会话，最终 crossed 仍按 survivor 的真实交替重算 | 27 |
+| `generate.stream.crossed_sessions` | 0 | primary 会话数（≥ 1），session 数由 target 与 `crossed_sessions` 推导；完整计划有 `Σsequences − sessions` 个双 owner 会话，最终 crossed 仍按 survivor 的真实交替重算 | 27 |
 | `generate.stream.noise_ratio` | 0.0 | 噪音槽目标 / 任务帧比例 ∈ [0,1)；联合路径取满足 session 内部开区间与容量的最大可行槽数 | 27 |
-| `generate.stream.noise_instruction` | "" | 噪音帧生成指令（走既有平面生成模板，按 `num_per_call` 批量装箱） | 27 |
+| `generate.stream.noise` | "" | 噪音帧生成指令（走既有平面生成模板，按 `num_per_call` 批量装箱） | 27 |
 | `generate.stream.duplicates` | 0 | 原样重发的序列条数 ∈ [0, Σsequences]；逐字节同源，**恒落流尾新会话**（判重演示位在重放，不在本跑） | 27 |
-| `generate.stream.frame_gap_s` | [5, 60] | 未被显式 timed positive witness 覆盖的 owner 相邻边使用的闭区间；默认 v1.15 路径（以及仅有 sequence_validator、无实际非零 rules/windows 前缀）为 `1µs ≤ lo ≤ hi < stream.gap_s`；仅当 `--limit` 后实际非零配额前缀存在生效 rules/windows 时，v1.16 联合路径才允许 `hi ≤ stream.gap_s` | 27 |
-| `generate.stream.ts_start` | `"2026-01-01T00:00:00Z"` | 时间流起点（ISO-8601，**恒不取墙钟**——同 seed 双跑工件才可能逐字节一致） | 27 |
+| `generate.stream.frame_gap_s` | [5, 60] | 未被显式 timed positive witness 覆盖的 owner 相邻边使用的闭区间；默认 v1.15 路径（以及仅有 sequence_validator、无实际非零 rules/windows 前缀）为 `1µs ≤ lo ≤ hi < stream.gap_s`；仅当 `--limit` 后实际非零配额前缀存在生效 rules/windows 时，v1.17 联合路径才允许 `hi ≤ stream.gap_s` | 27 |
+| `generate.stream.schedule.start/end` | `"2026-01-01T00:00:00Z"` | 时间流起点（ISO-8601，**恒不取墙钟**——同 seed 双跑工件才可能逐字节一致） | 27 |
 | `[frame.class.<帧类名>.generate].instruction` | 每个帧类必填 | 该帧类的内容契约（蓝图 enum 覆盖全类表，任一帧类都可能被选中；**开档位表后必填域收窄为 ∪各参与类生效表的构成**，A.8 第 34/36 条） | 27 |
 | `[frame.class.<帧类名>.generate].schema_path` / `schema_inline` | 至多其一 | 有 = **结构化帧**（帧内容是对象，按规范化 JSON 落工件行的文本字段；被逐位包进实现调用的 `prefixItems`，故不写顶层 `$schema`）；无 = 纯文本帧 | 14/27 |
 | `generate.sequence_validator` | 不设 | `module:function`，每条已通过逐帧与声明规则验证的序列调用一次；接收 JSON-compatible 深拷贝，返回违规字符串列表 | 12/27 |
@@ -307,21 +307,21 @@
 | 键 | 默认 | 一句话 | 章 |
 |---|---|---|---|
 | `[[generate.stream.tiers]].tier_rank` | 本表在场时必填 | 档位身份（正整数、表内唯一、**本表**连续覆盖 1..N；**无 `name` 键**）；同时是配分平票与类内序数分块的确定性排序依据，**工具不赋予序数高低任何质量语义**。v1.15 起是**类内**身份——跨类同 rank 无工具语义，读它须连着序列类一起读 | 27 |
-| `[[generate.stream.tiers]].weight` | 本表在场时必填 | 配额权重（整数 ≥ 1）：类配额按**整数域最大余额法**零抽签配分（基额 = `(sequences × weight) // Σweight`，余额键降序、平票按 tier_rank 升序补位），配分吃的是该类的**生效表** | 27 |
+| `[[generate.stream.tiers]].weight` | 本表在场时必填 | 配额权重（整数 ≥ 1）：类配额按**整数域最大余额法**零抽签配分（基额 = `(target × weight) // Σweight`，余额键降序、平票按 tier_rank 升序补位），配分吃的是该类的**生效表** | 27 |
 | `[[generate.stream.tiers]].frame_classes` | 本表在场时必填 | 档位**构成**：该档序列**恰用**这些帧类（蓝图 enum 给「⊆」+ 逐类 `contains` 给「⊇」）；⇒ `members[]` 帧类集合 ≡ **该行序列类生效表**里该档的声明，可反推对账。约束见 A.8 第 34 条（含 `len_range` 下界 ≥ 该类生效表最大构成大小） | 27 |
 | `[[class.<序列类名>.generate.tiers]]` | 不设（回落全局表） | **按类档位表**（v1.15）：行结构同上三键，**整表原子取代**全局 `[[generate.stream.tiers]]`；未声明 ⇒ 回落全局表，`tiers = []` ⇒ 配置错误。要求全局表在场（它是回落源 + 档位面开关）。约束见 A.8 第 36 条 | 27 |
 | `[frame.class.<帧类名>.generate.time_fields]` | 不设 | **时间字段绑定**（仅结构化帧合法）：键 = 生成 Schema 顶层字段名，值 ∈ 闭集 `{ts, gap_prev_s, gap_next_s, elapsed_s}`。绑定字段从 LLM 面向的逐位 Schema 与契约行**剔除**，值在时间戳铺好后按**本序列相邻成员**的 ts 差机械回填（`round(·, 6)`；首帧 gap_prev_s/elapsed_s = 0.0、末帧 gap_next_s = 0.0；重发帧承源值）。约束与 WARN 见 A.8 第 35 条 | 27 |
 
-**v1.16 序列约束表**：
+**v1.17 序列约束表**：
 
 | 键 | 默认 | 一句话 | 章 |
 |---|---|---|---|
-| `[[generate.stream.rules]].template` | 行内必填 | 闭集：existence / absence / exactly / init / end / responded_existence / co_existence / response / precedence / succession / alternate_response / chain_response / chain_precedence / not_co_existence / not_succession | 27 |
+| `[[generate.stream.frame_rules]].template` | 行内必填 | 闭集：existence / absence / exactly / init / end / responded_existence / co_existence / response / precedence / succession / alternate_response / chain_response / chain_precedence / not_co_existence / not_succession | 27 |
 | `frame_class` / `count` | 按模板 | 一元模板用 frame_class；三个基数模板另要求正整数 count | 27 |
 | `source` / `target` | 二元模板必填 | 两个不同帧类；precedence 家族仍按 source 在前、target 在后解释 | 27 |
 | `time_s` | 不设 | 二元规则的微秒可表示半开秒区间 `[lo, hi)`；正规则筛 witness，负规则只禁止落区间的 occurrence 对 | 27 |
 | `correlation` | 不设 | `{operator="equal", source_field, target_field}`；顶层 required 同型字段按 JSON 类型与 canonical bytes 比较 | 27 |
-| `[[generate.stream.windows]]` | [] | 每帧类至多一行；`of_day` 为同日半开多窗，`of_week` 缺省全周；固定 `ts_start` offset，无 DST | 27 |
-| `[[class.<类>.generate.rules]]` / `windows` | 缺键继承 | 空数组清空本类，非空数组整表覆盖；两张表分别裁定 | 27 |
+| `[[generate.stream.frame_windows]]` | [] | 每帧类至多一行；`of_day` 为同日半开多窗，`of_week` 缺省全周；固定 schedule offset，无 DST | 27 |
+| `[[class.<类>.generate.frame_rules]]` / `frame_windows` | 缺键继承 | 空数组清空本类，非空数组整表覆盖；两张表分别裁定 | 27 |
 
 配套读法：帧类表复用 `[[frame.classify.classes]]`，配额与长度按序列类声明，标注可按序列类使用独立 Schema。约束联合路径的逻辑内容调用仍是一 attempt 一次 brief + 一次 realize；真实 provider retry、Schema repair 与既有非 correlation 降级不在估算中。规则、窗口和 hook 不新增 trace 事件或错误码，报告按配置条件加入作废子计数与日历跨度。

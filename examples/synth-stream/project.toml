@@ -1,18 +1,22 @@
-# 时间流生成教学工程（spec v1.16）。六条 primary 序列在五个 session 中预排，
-# 因此完整幸存时恰有一个真实 crossing；还会机械插入噪音，并把一条幸存
-# 序列原样重发到流尾。联合 planner 在任何 LLM 调用前同时冻结帧类词、session、
-# timestamp 与 noise 槽；内容作废只删整条序列，不重织、不重求解。
+# 时间流生成教学工程（spec v1.17 场景规划形态）。六条 sequence slot 由
+# [[generate.stream.quotas]] 声明配额（ticket_booking 3 + smart_home 3），
+# crossed_sessions = 1 ⇒ 总 session 恒推导为 6 − 1 = 5（其中恰有一个真实交叉）；
+# 噪音按 noise_ratio = 0.1 精确交付到 [[generate.stream.noise]] 声明的噪音帧类，
+# 一条幸存序列原样重发到流尾。M1 在任何 LLM 调用前用 compile_scenario 一次性冻结
+# 帧类词、session、timestamp、noise 槽与 duplicate 平移；内容作废只删整条槽位，
+# 不重排计划、不重求解。
 #
-# v1.16 最小学习路径：
+# v1.17 最小学习路径：
 #   task_request --chain_response [1200,2400)s + subject_id equal--> acknowledgement
 #   acknowledgement --response--> confirmation（且 confirmation 恒为 end）
 # request 只能落在工作日的两个日内窗口；ticket_booking 用按类整表覆盖缩窄窗口。
 # request.duration 继续绑定 gap_next_s，所以工件里可直接核对 20–40 分钟规则。
 # generate.sequence_validator 演示跨帧纯函数验证；它不读环境、网络、墙钟或随机数。
 #
-# 内容调用的计划基数仍是每条 attempt 一次 brief + 一次 realize，另有噪音批次。
-# provider retry 与 Schema repair 可增加物理请求；真实模型双跑不承诺字节相等。
-# 固定 LLM 产物、同版本、同配置与同 seed 下，机械计划可复演。
+# 内容调用的计划基数是每条 sequence slot 一次 brief + 一次 realize、每条 noise slot
+# 一次 realize（复用帧类 realize 路径）；duplicates 零 LLM。provider retry 与
+# Schema repair 可增加物理请求；真实模型双跑不承诺字节相等。固定 LLM 产物、同版本、
+# 同配置与同 seed 下，机械计划可复演（plan_digest 回显于 report）。
 #
 # 产物：out/synth-labels.jsonl 是序列主输出；
 # out/synth-labels.stream.jsonl 是逐帧时间流工件。工件可作为 process 输入重放：
@@ -54,64 +58,90 @@ enabled = true                    # 序列级判重（成员文本按序拼接�
 [generate]
 enabled = true
 llms = ["default"]
-num_per_call = 4                  # 本形态下仅噪音批量生成按此装箱（一批 4 条噪音）
-temperature = 0.9                 # 蓝图与帧实现同温；合成需要多样性——温度过低会让
+num_per_call = 4                  # 平面生成形态的装箱键；时间流形态的 noise 已是逐槽交付
+temperature = 0.9                 # brief 与帧实现同温；合成需要多样性——温度过低会让
                                   # 同类的三条序列彼此近重，被序列相似度过滤淘汰
-sequence_validator = "examples.synth-stream.hooks:validate_sequence"
+sample_validator = "hooks.py:validate_sample"
+sequence_validator = "hooks.py:validate_sequence"
+scenario_validator = "hooks.py:validate_scenario"
 # 注：seed_examples / standalone_count / num_per_record / seeds_per_call 属平面生成
-# 形态，本形态显式书写它们是 CONFIG_ERROR——配额由 [class.*.generate].sequences 承载。
+# 形态，本形态显式书写它们是 CONFIG_ERROR——配额由 [[generate.stream.quotas]] 承载。
 
 [generate.stream]
 enabled = true
-sessions = 5                      # 会话数；交叉会话数 = Σsequences − sessions = 1
+crossed_sessions = 1              # 交叉 session 数；总 session 恒推导为 6 − 1 = 5
 noise_ratio = 0.1                 # 噪音帧 / 任务帧 ≈ 10%，帧数 = round(比例 × 任务帧数)
-noise_instruction = """
-生成与任何任务都无关的干扰输入：用户随口说的闲聊、感叹、纯语气词或跑题的一句话
-（如聊天气、聊心情、无意义的重复字），长度 5–20 字，不得包含任何可执行的诉求。
-"""
+                                  # ——v1.17 起为精确交付目标
+duplicates = 1                    # 原样重发 1 条序列（逐字节同源、零 LLM）到流尾新会话
+frame_gap_s = [5, 60]             # 会话内帧起点间隔闭区间（秒）；上界须可整量到微秒
+max_attempts_per_slot = 3         # 每个交付槽位的独立预算（本键仅 M6 delivery 消费）
 
-duplicates = 1                    # 原样重发 1 条序列（逐字节同源）到流尾新会话
-frame_gap_s = [5, 60]             # 会话内帧间隔均匀采样（秒）；上界须 < stream.gap_s
-ts_start = "2026-01-05T09:00:00+08:00"   # 时间流起点（恒不取墙钟——双跑一致）
+# 有限半开 schedule：唯一时间边界（v1.16 的每 session 一周递推已删除）。start/end
+# 必带同一显式 offset；排除日可按本地自然日整日剔除。两个工作日（周一、周二）足够
+# 容纳 5 个 session × 1 小时间隔 + 工作日窗口约束——单日 6 小时窗内放不下这条流。
+[generate.stream.schedule]
+start = "2026-01-05T08:00:00+08:00"
+end = "2026-01-06T23:00:00+08:00"
 
-# 标准 DECLARE 有限迹语义；time_s 为半开区间，correlation 为类型敏感相等。
-[[generate.stream.rules]]
+# 成功交付 quota（v1.17）：counts 直接给逐类精确目标；多张表约束同一批 occurrence。
+[[generate.stream.quotas]]
+name = "six_sequences"            # 自然名称（[a-z0-9_]+，与规则/窗口共享全局唯一域）
+period = "schedule"               # 对完整 schedule 应用一次
+counts = { ticket_booking = 3, smart_home = 3 }
+
+# 结构化噪音表：frame_class 必须在帧类表内且带非空生成指令，不得出现在任何档位、
+# 规则或窗口中；weight 为正整数，noise 目标按最大余额法零抽签分到各噪音类。
+[[generate.stream.noise]]
+frame_class = "chatter"
+weight = 1
+
+# 标准 DECLARE 有限迹语义（v1.17 更名 frame_rules，每条必填 name）；time_s 为半开
+# 区间，correlation 为类型敏感相等（v1.17 起无 operator 键，恒为 equal）。
+[[generate.stream.frame_rules]]
+name = "request_first"
 template = "init"
 frame_class = "task_request"
 
-[[generate.stream.rules]]
+[[generate.stream.frame_rules]]
+name = "request_exactly_once"
 template = "exactly"
 frame_class = "task_request"
 count = 1
 
-[[generate.stream.rules]]
+[[generate.stream.frame_rules]]
+name = "request_chains_to_ack"
 template = "chain_response"
 source = "task_request"
 target = "acknowledgement"
 time_s = [1200, 2400]
-correlation = { operator = "equal", source_field = "subject_id", target_field = "subject_id" }
+correlation = { source_field = "subject_id", target_field = "subject_id" }
 
-[[generate.stream.rules]]
+[[generate.stream.frame_rules]]
+name = "ack_exactly_once"
 template = "exactly"
 frame_class = "acknowledgement"
 count = 1
 
-[[generate.stream.rules]]
+[[generate.stream.frame_rules]]
+name = "ack_pulls_confirmation"
 template = "response"
 source = "acknowledgement"
 target = "confirmation"
 
-[[generate.stream.rules]]
+[[generate.stream.frame_rules]]
+name = "confirmation_closes"
 template = "end"
 frame_class = "confirmation"
 
-[[generate.stream.rules]]
+[[generate.stream.frame_rules]]
+name = "confirmation_exactly_once"
 template = "exactly"
 frame_class = "confirmation"
 count = 1
 
 # 日内分支为并集；每个 task_request occurrence 还必须在工作日。
-[[generate.stream.windows]]
+[[generate.stream.frame_windows]]
+name = "ticket_request_work_hours"
 frame_class = "task_request"
 of_day = [["08:00", "11:00"], ["14:00", "17:00"]]
 of_week = ["mon", "tue", "wed", "thu", "fri"]
@@ -119,7 +149,7 @@ of_week = ["mon", "tue", "wed", "thu", "fri"]
 # ── 全局档位表：一档 = 一种帧类构成（v1.14）─────────────────────────────────
 # 双重身份：档位面的总开关，以及未声明按类表的序列类的回落表。本工程只有 smart_home
 # 吃它（ticket_booking 另有按类表，见 [[class.ticket_booking.generate.tiers]]）。
-# 配分：smart_home 的 sequences = 3 在权重 2 : 1 上按整数域最大余额法零抽签配分
+# 配分：smart_home 的配额 3 在权重 2 : 1 上按整数域最大余额法零抽签配分
 # ⇒ 2 + 1（2 条一档序列、1 条二档序列），配分是 (配额, 生效表) 的纯函数，不消费任何
 # 随机数。
 # 长度下界 4 恰好容纳三个规则帧类与一个 filler；第五帧可重复 filler。
@@ -134,7 +164,7 @@ weight = 1
 frame_classes = ["task_request", "acknowledgement", "progress", "confirmation"]
 
 [classify]
-enabled = true                    # 类表是配额与按类条件化的载体；生成侧标签直接继承
+enabled = true                    # 类表是 quota 与按类条件化的载体；生成侧标签直接继承
                                   # （inherited，零判决调用 ⇒ report.classify 直方图
                                   # 恒全零是预期），本形态下 ≥1 类即可、fallback 免填
 
@@ -146,7 +176,7 @@ description = "高铁购票类会话：查车次、订票、改签退票、选�
 name = "smart_home"
 description = "智能家居指令类会话：控制灯光空调窗帘等设备、设定定时与场景、查询设备状态的连续指令"
 
-# ── 按类生成：配额 + 长度区间 + 该类的内容指令 ──────────────────────────────
+# ── 按类生成：长度区间 + 该类的内容指令（配额由 quota 表承载，sequences 键已删除）──
 [class.ticket_booking.generate]
 instruction = """
 你在为高铁购票场景合成真实用户与语音助手的一次对话序列。序列围绕**同一次出行**
@@ -154,8 +184,7 @@ instruction = """
 同行人、证件等要素，最后收尾确认。要求口语化、中文、每帧一句话，前后帧之间信息
 连贯且有推进（不得原地重复）。
 """
-sequences = 3                     # 尝试配额（无输出条数保证，作废序列不补齐）
-len_range = [4, 5]                # planner 在一次联合求解中按随机偏好选择可行长度
+len_range = [4, 5]                # length 在 slot 构建期由 scenario.preference 流冻结
 
 # 按类档位表（v1.15）：整表取代全局表——本类的序列只在下面这两档里取构成，全局表对它
 # 完全不生效。本表交换 followup / progress 的 rank，权重方向也与全局表相反，
@@ -170,9 +199,10 @@ tier_rank = 2
 weight = 2
 frame_classes = ["task_request", "acknowledgement", "followup", "confirmation"]
 
-# 按类 windows 与 tiers 一样是整表覆盖；两个窄窗仍与 smart_home 的全局窗有交集，
-# 因此联合 planner 仍可给两类安排 crossing。
-[[class.ticket_booking.generate.windows]]
+# 按类 frame_windows 与 tiers 一样是整表覆盖；两个窄窗仍与 smart_home 的全局窗有交集，
+# 因此 planner 仍可给两类安排 crossing。
+[[class.ticket_booking.generate.frame_windows]]
+name = "ticket_booking_request_hours"
 frame_class = "task_request"
 of_day = [["09:00", "11:00"], ["14:00", "16:00"]]
 of_week = ["mon", "tue", "wed", "thu", "fri"]
@@ -184,7 +214,6 @@ instruction = """
 联动条件，最后收尾确认。要求口语化、中文、每帧一句话，前后帧之间信息连贯且有
 推进（不得原地重复）。
 """
-sequences = 3
 len_range = [4, 5]
 
 # ── 按类标注：两类各用一份**独立**的标注 Schema（v1.13 裁决·按类标注 Schema）──
@@ -216,7 +245,7 @@ schema_inline = """
 
 [class.smart_home.annotate]
 instruction = """
-你是智能家居指令会话的标注员。阅读整段请求序列，抽出这次操作的意图（intent，一个
+你是智能家居指令会话的标注员。阅读整段指令序列，抽出这次操作的意图（intent，一个
 动宾短语）、被操作设备（device）、动作（action，如开启/关闭/调暗/设定温度）、
 所在位置（location，如客厅/卧室）与定时或联动条件（schedule，原文表述即可）。
 序列中未提及的字段填空字符串。
@@ -237,7 +266,7 @@ schema_inline = """
 }
 """
 
-# ── 帧类表：蓝图逐步在这个闭集上取值，帧类即帧级真值（随 members[] 落盘）──────
+# ── 帧类表：planner 词在这个闭集上取值，帧类即帧级真值（随 members[] 落盘）────
 # frame.classify.enabled 保持 false——真值在生成期已知，无需帧级判决调用。
 [[frame.classify.classes]]
 name = "task_request"
@@ -259,7 +288,11 @@ description = "助手或系统对当前处理进展的简短说明"
 name = "confirmation"
 description = "对助手结果的确认、收尾或致谢"
 
-# ── 按帧类的内容契约（每个帧类都必填 instruction；蓝图 enum 覆盖全类表）────────
+[[frame.classify.classes]]
+name = "chatter"
+description = "与任何任务无关的闲聊、感叹或跑题干扰输入"
+
+# ── 按帧类的内容契约（每个帧类都必填 instruction；planner 词覆盖非噪音全表）────
 # 声明 schema_* 的帧类 = 结构化帧（帧内容是对象，按 canonical JSON 落工件行的文本
 # 字段）；未声明的 = 纯文本帧（帧内容直接是一句话）。此处的 Schema 会被逐位包进
 # realize_schema 的 prefixItems 作为子模式，故不写顶层 $schema 声明。
@@ -317,7 +350,7 @@ schema_inline = """
 [frame.class.followup.generate]
 instruction = """
 产出一句追问或修改：在已有诉求之上补充约束、更换要素或询问细节，口语、中文、
-一句话，须与蓝图给出的该步要点一致。
+一句话，须与 brief 给出的该步要点一致。
 """
 
 [frame.class.progress.generate]
@@ -330,6 +363,14 @@ instruction = """
 instruction = """
 产出一句确认或收尾：认可助手给出的结果、拍板下单/执行，或补一句致谢，口语、
 中文、一句话。
+"""
+
+# 噪音帧类（v1.17 结构化噪音表）：纯文本帧 + 非空生成指令即可；每个 noise slot
+# 走一次该帧类的 realize 调用，工件 truth.frame_class 实名（不再是 null）。
+[frame.class.chatter.generate]
+instruction = """
+生成与任何任务都无关的干扰输入：用户随口说的闲聊、感叹、纯语气词或跑题的一句话
+（如聊天气、聊心情、无意义的重复字），长度 5–20 字，不得包含任何可执行的诉求。
 """
 
 [quality]
@@ -361,11 +402,10 @@ max_repair_rounds = 1
 extra_criteria = "补充审核约定：本序列是合成数据，成员帧之间信息连贯即可，不要求覆盖真实票务/设备系统的全部字段；标注中留空的字段若序列内确实未提及，属正常，不判为缺失"
 
 [output]
-meta_mode = "inline"              # 帧类真值与成员对账仅经 _meta.stream 承载（本形态
-                                  # 下不得为 "none"）
-rejects = "refs"
-# 全局回退 Schema：两个序列类都自带 Schema，实际用不到它；但 M1 规则「output.schema
-# 恰一」不因按类覆盖而豁免，故写一份宽松对象 Schema 占位。
+# 输出侧 Schema 业务校验：四类 file hook 均来自同一工程根目录的 hooks.py。
+# sample / sequence / scenario 分别覆盖样本、帧内序列与跨序列 accepted-prefix；
+# output 校验覆盖最终标注对象。四个 callable 都在 validate 阶段 synthetic probe。
+validator = "hooks.py:validate_output"
 schema_inline = """
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",

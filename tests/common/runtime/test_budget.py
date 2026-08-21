@@ -380,7 +380,7 @@ def test_template_head_tokens_generate_stream_match_operator_constants():
     == est_text(M6 蓝图/帧实现模板的系统侧完整静态脚手架常量，§10.14/§10.15)——
     修订模板即翻红，常量随 CONTRACTS 修订跟进；类生成指令、帧类表与逐位契约
     Schema 文本是配置量，在 M1 静态预算预检各自计量，不入头常量。"""
-    from labelkit.operators import generate
+    from labelkit.operators import generate, generate_stream
 
     assert (TEMPLATE_HEAD_TOKENS["generate_plan"]
             == est_text(generate._PLAN_SYSTEM_STATIC))
@@ -389,7 +389,7 @@ def test_template_head_tokens_generate_stream_match_operator_constants():
     assert (TEMPLATE_HEAD_TOKENS["generate_brief"]
             == est_text(generate._BRIEF_SYSTEM_STATIC))
     # 静态脚手架确内嵌于渲染事实（模板头常量活在装配路径上，§10.4 族证明形）
-    system_text, _user = generate.render_plan_prompt_texts(
+    system_text, _user = generate_stream.render_plan_prompt_texts(
         "指令", (SimpleNamespace(name="a", description="d"),), "类", 3)
     for piece in (generate._PLAN_SYSTEM_HEAD, generate._PLAN_STRUCTURE):
         assert piece in system_text

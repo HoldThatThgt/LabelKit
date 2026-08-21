@@ -43,6 +43,7 @@ from labelkit.common.config.model import (
     OutputConfig,
     QualityConfig,
     ResolvedConfig,
+    ResolvedPaths,
     Rubric,
     RunConfig,
     SegmentConfig,
@@ -74,6 +75,14 @@ def make_cfg(*, enabled=True, llm="default", max_open=4, bias="conservative",
              rescue_short=True, repass=True, stale_gap_steps=0,
              digest_max_chars=400, context="", votes=1, on_error="keep",
              output="out.jsonl") -> ResolvedConfig:
+    # v1.17（SPEC-SP §5.1）：paths 逐字段镜像 M1 的 loader._resolved_paths 派生
+    # 公式——emitter 只消费冻结路径（本测试族无 side 通道，trace 关闭）。
+    stem = str(Path(output).with_suffix(""))
+    paths = ResolvedPaths(
+        project="project.toml", project_root=".",
+        input=None, output=output, report=stem + ".report.json",
+        rejects=stem + ".rejects.jsonl", sidecar=None, trace=None,
+        stream_artifact=None)
     return ResolvedConfig(
         tool=ToolConfig(),
         console=ConsoleConfig(),
@@ -107,6 +116,7 @@ def make_cfg(*, enabled=True, llm="default", max_open=4, bias="conservative",
         project_path="project.toml",
         config_digest="sha256:0",
         project_digest="sha256:0",
+        paths=paths,
     )
 
 

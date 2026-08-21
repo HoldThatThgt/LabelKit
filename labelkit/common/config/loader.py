@@ -39,10 +39,12 @@ from labelkit.common.config.model import (
     CliOverrides,
     ConsoleConfig,
     ResolvedConfig,
+    ResolvedPaths,
     RunConfig,
     ToolConfig,
 )
 from labelkit.common.errors import ConfigError
+from labelkit.common.extensions.hooks import ValidationHooks
 
 __all__ = ["load", "default_rubric"]
 
@@ -106,11 +108,13 @@ def _resolve_console(ctx: _LoadCtx, head: _ToolSide) -> _ConsoleVerdict:
             return _ConsoleVerdict(effective_mode=effective_mode, mode_resolved="rich")
         ctx.col.warn("console: rich is not importable, demoted to plain")
         return _ConsoleVerdict(effective_mode=effective_mode, mode_resolved="plain")
-    # auto —— §7.7 的决策链, 全部走终端能力探针
+    # auto —— §7.7 的决策链, 全部走终端能力探针。v1.17 secret-free（SPEC-SP §5.2）:
+    # TERM 的非秘密读取改用 membership/indexing——不得经 os.environ.get 成为偷读
+    # credential 的旁路（validate/dry-run 的静态 face 全程零 value reader）。
     resolved = _auto_console_mode(
         isatty=sys.stderr.isatty(),
         log_format=head.tool.log_format,
-        term=os.environ.get("TERM"),
+        term=(os.environ["TERM"] if "TERM" in os.environ else None),
         rich_importable=_find_spec("rich") is not None,
     )
     return _ConsoleVerdict(effective_mode=effective_mode, mode_resolved=resolved)
@@ -153,6 +157,9 @@ def _assemble_console(head: _ToolSide, verdict: _ConsoleVerdict) -> ConsoleConfi
 def _trace_path(ctx: _LoadCtx, products: _Products) -> str:
     """未显式声明 trace.path 时, 由输出路径推出默认追踪文件名。
 
+    v1.17: 显式声明的相对路径已在解析期按 project root 绝对化; 默认名由**绝对**
+    生效输出派生, 故返回值恒为绝对路径。
+
     @param ctx 校验上下文
     @param products 产物累加器
     @return 追踪文件路径
@@ -161,6 +168,65 @@ def _trace_path(ctx: _LoadCtx, products: _Products) -> str:
     if not path and products.eff_output:
         return str(Path(products.eff_output).with_suffix("")) + ".trace.jsonl"
     return path
+
+
+def _resolved_paths(ctx: _LoadCtx, products: _Products) -> ResolvedPaths:
+    """v1.17(SPEC-SP §5.1): 一次性派生全部绝对路径(未启用通道为 None)。
+
+    live report 固定 ``<stem>.report.json``, dry-run report 固定
+    ``<stem>.dryrun.report.json``——由 M1 写入 ``ResolvedPaths.report``; rejects/
+    sidecar/trace/stream artifact 也只在 M1 派生一次。派生公式与 M11 落盘面一致。
+
+    @param ctx 校验上下文(其 ``root`` = project root)
+    @param products 产物累加器(生效输入/输出已绝对化)
+    @return 冻结的 ``ResolvedPaths``
+    """
+    p = ctx.p
+    stem = str(Path(products.eff_output).with_suffix(""))
+    suffix = ".dryrun.report.json" if ctx.cli.dry_run else ".report.json"
+    return ResolvedPaths(
+        project=str(Path(ctx.fp).resolve()),
+        project_root=str(ctx.root),
+        input=None if ctx.mode == "generate_only" else products.eff_input,
+        output=products.eff_output,
+        report=stem + suffix,
+        rejects=None if p.output.rejects == "none" else stem + ".rejects.jsonl",
+        sidecar=stem + ".meta.jsonl" if p.output.meta_mode == "sidecar" else None,
+        trace=_trace_path(ctx, products) if p.trace.enabled else None,
+        stream_artifact=stem + ".stream.jsonl" if p.generate_stream.enabled else None,
+    )
+
+
+def _log_paths(paths: ResolvedPaths) -> None:
+    """启动 INFO: 打印一次 output/report 及实际启用的 side channel 绝对路径。
+
+    装载期 M12 日志尚未配置(与 ``_flush_warnings`` 同款处境), 故直接写 stderr;
+    刻意不使用 ``dry-run`` 前缀——七个 plain golden 按行前缀 ``dry-run`` 比对,
+    新增前缀行会砸 golden; 也刻意不走 logging(经已关闭的 handler 发射会把调用方
+    源码行以 Logging-error 回溯泄进 stderr)。
+
+    @param paths 已冻结的绝对路径载体
+    """
+    sides = [f"{name}={value}" for name, value in (
+        ("rejects", paths.rejects), ("sidecar", paths.sidecar),
+        ("trace", paths.trace), ("stream_artifact", paths.stream_artifact)) if value]
+    suffix = (" " + " ".join(sides)) if sides else ""
+    print(f"run paths: output={paths.output} report={paths.report}{suffix}",
+          file=sys.stderr)
+
+
+def _validation_hooks(products: _Products) -> ValidationHooks:
+    """把 M1 解析期冻结的四个钩子载体装配成 ``ValidationHooks``。
+
+    @param products 产物累加器(其 ``hooks`` 键 = output/sample/sequence/scenario)
+    @return 冻结的 ``ValidationHooks``(未声明/未通过双检的键为 None)
+    """
+    return ValidationHooks(
+        output=products.hooks.get("output"),
+        sample=products.hooks.get("sample"),
+        sequence=products.hooks.get("sequence"),
+        scenario=products.hooks.get("scenario"),
+    )
 
 
 def _assemble(ctx: _LoadCtx, head: _ToolSide, products: _Products,
@@ -177,6 +243,7 @@ def _assemble(ctx: _LoadCtx, head: _ToolSide, products: _Products,
     """
     p, cli = ctx.p, ctx.cli
     config_raw, project_raw = digests
+    paths = _resolved_paths(ctx, products)
     return ResolvedConfig(
         tool=ToolConfig(
             log_level=cli.log_level if cli.log_level is not None else head.tool.log_level,
@@ -204,6 +271,9 @@ def _assemble(ctx: _LoadCtx, head: _ToolSide, products: _Products,
         config_path=ctx.fc, project_path=ctx.fp,
         config_digest="sha256:" + hashlib.sha256(config_raw or b"").hexdigest(),
         project_digest="sha256:" + hashlib.sha256(project_raw or b"").hexdigest(),
+        paths=paths,
+        validation_hooks=_validation_hooks(products),
+        scenario_plan=products.scenario_plan,
     )
 
 
@@ -221,11 +291,15 @@ def load(config_path: Path, project_path: Path,
     fc, fp = str(config_path), str(project_path)
     config_raw, config_data = _read_toml(col, Path(config_path), fc)
     project_raw, project_data = _read_toml(col, Path(project_path), fp)
+    # v1.17(SPEC-SP §5.1): project TOML 读取成功后立即冻结 project root——project
+    # 侧全部相对路径(输入/输出/四类 schema_path/trace.path/四个钩子文件)的解析基点。
+    project_root = Path(fp).resolve().parent
     head = (_parse_config_file(col, fc, config_data) if config_data is not None
             else _ToolSide(tool=ToolConfig(), console=ConsoleConfig(),
                            console_rich_explicit=False, llm_profiles={},
                            embedding_profiles={}))
-    project = _parse_project_file(col, fp, project_data) if project_data is not None else None
+    project = (_parse_project_file(col, fp, project_data, project_root)
+               if project_data is not None else None)
     if project is None:
         _flush_warnings(col)
         raise ConfigError(col.errors or [f"{fp}: config load failed"])
@@ -233,11 +307,13 @@ def load(config_path: Path, project_path: Path,
                    config_ok=config_data is not None, llm_profiles=head.llm_profiles,
                    embedding_profiles=head.embedding_profiles, p=project,
                    modality=project.run["modality"] or "text",
-                   mode=project.run["mode"] or "process")
+                   mode=project.run["mode"] or "process", root=project_root)
     products = _Products()
     ctx = validate(ctx, products)
     verdict = _resolve_console(ctx, head)
     _flush_warnings(col)
     if col.errors:
         raise ConfigError(col.errors)
-    return _assemble(ctx, head, products, verdict, (config_raw, project_raw))
+    cfg = _assemble(ctx, head, products, verdict, (config_raw, project_raw))
+    _log_paths(cfg.paths)
+    return cfg

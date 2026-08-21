@@ -196,7 +196,6 @@ def _cfg(trace: TraceConfig | None = None) -> ResolvedConfig:
     judge = LLMProfile(
         name="judge", provider="anthropic", base_url=ZAI_BASE_URL, model=ZAI_MODEL,
         api_key_env=ZAI_KEY_ENV, supports_structured_output=True, max_output_tokens=700,
-        api_key=os.environ[ZAI_KEY_ENV],
     )
     return ResolvedConfig(
         tool=ToolConfig(),

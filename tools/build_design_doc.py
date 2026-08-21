@@ -18,7 +18,9 @@ headless 从该 HTML 打印（见本文件 --pdf 说明）。
 from __future__ import annotations
 
 import html as _html
+import os
 import re
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -30,6 +32,7 @@ OUT_HTML = ROOT / "docs" / "design" / "labelkit-design-v1.html"
 OUT_PDF = ROOT / "docs" / "design" / "labelkit-design-v1.pdf"
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+PDF_TIMEOUT_SECONDS = 30
 
 # 章节装配顺序（00-frontmatter 单独消费为封面）。
 ORDER = [
@@ -343,7 +346,17 @@ def main() -> None:
                f"--user-data-dir={ROOT / '.chrome-pdf-profile'}",
                "--no-pdf-header-footer",
                f"--print-to-pdf={OUT_PDF}", OUT_HTML.as_uri()]
-        subprocess.run(cmd, check=True)
+        try:
+            with subprocess.Popen(cmd, start_new_session=True) as chrome:
+                chrome.wait(timeout=PDF_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired as exc:
+            os.killpg(chrome.pid, signal.SIGKILL)
+            raise SystemExit(
+                f"Chrome PDF export timed out after {PDF_TIMEOUT_SECONDS}s: "
+                f"html={OUT_HTML} pdf={OUT_PDF} profile={ROOT / '.chrome-pdf-profile'}"
+            ) from exc
+        if chrome.returncode:
+            raise subprocess.CalledProcessError(chrome.returncode, cmd)
         print(f"wrote {OUT_PDF} ({OUT_PDF.stat().st_size:,} bytes)")
 
 

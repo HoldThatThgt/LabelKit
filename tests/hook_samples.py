@@ -1,4 +1,8 @@
-"""Sample validation hooks used by the plan-A hook tests (spec 3.8.2 L2.5 / 3.6.2)."""
+"""Sample validation hooks used by the hook tests (spec 3.8.2 L2.5 / 3.6.2).
+
+v1.17：本文件既被 ``<python-file>:<attribute-path>`` 文件形态装载，也被过渡期
+invoke 面按 ``tests.hook_samples`` 模块导入——签名与返回值语义保持稳定。
+"""
 from __future__ import annotations
 
 
@@ -25,12 +29,18 @@ def sample_min10(text):                    # generate.sample_validator
     return [] if len(text) >= 10 else ["样本长度须 ≥ 10 字符"]
 
 
-def boom(*_a):                             # misbehaving hook: raises
+def boom(obj, record):                     # misbehaving hook: raises (2 positional)
     raise RuntimeError("hook exploded")
 
 
-def bad_return(*_a):                       # misbehaving hook: wrong return type
+def bad_return(obj, record):               # misbehaving hook: wrong return type
     return "not-a-list"
+
+
+def intent_raises(obj, record):            # synthetic 干跑通过、few-shot 干跑抛异常
+    if "intent" in obj:
+        raise RuntimeError("hook exploded")
+    return []
 
 
 NOT_CALLABLE = 42

@@ -50,6 +50,25 @@
 | 39 | v1.16 synth-stream 显式关闭 thinking 后的自由文本帧类型违约 | 实测记录 | ⛔ failed-closed 诊断 |
 | 40 | v1.16 synth-stream 规则生成成功验收 | 实测记录 | ✅ 已确认（2026-08-20） |
 | 41 | v1.16 synth-stream 正式 process replay 成功验收 | 实测记录 | ✅ 已确认（2026-08-20） |
+| 42 | 联合 planner 模型规模随序列数三次增长，12 条序列即触顶 | P1（规模硬伤） | ✅ v1.17 shipped（Wave 8 收口） |
+| 43 | 零交叉需求下仍构造全部交叉组合，占模型 67%–72% | P1（规模硬伤，第 42 条主因） | ✅ v1.17 shipped（Wave 8 收口） |
+| 44 | 容量拒绝被渲染成 INFEASIBLE，且不报实际规模 | P3（诊断误导） | ✅ v1.17 shipped（Wave 8 收口） |
+| 45 | 生成路径没有布局目标：9 条序列铺到 29 个自然日 | P2（布局不可预期） | ✅ v1.17 shipped（Wave 8 收口） |
+| 46 | 可行性入口与规划入口优化的不是同一目标 | P2（第 45 条同族） | ✅ v1.17 shipped（Wave 8 收口） |
+| 47 | 钩子模块不按 project TOML 目录解析 | P2（可移植性） | ✅ v1.17 shipped（Wave 8 收口） |
+| 48 | `session_max_len` 的 2× 下界忽略实际装箱计划 | P3（配置体验） | ✅ v1.17 shipped（Wave 8 收口） |
+| 49 | 派生约束逐层暴露，同一组关系要跑多轮才看全 | P3（配置体验） | ✅ v1.17 shipped（Wave 8 收口） |
+| 50 | 无 `--probe` 的 `validate` 仍要求密钥值存在 | P3（配置体验） | ✅ v1.17 shipped（Wave 8 收口） |
+| 51 | dry-run 估算只进 stderr，不进 report.json | P4（观测性） | ✅ v1.17 shipped（Wave 8 收口） |
+| 52 | 相对输出路径按启动目录解析且不回显绝对路径 | P3（配置体验） | ✅ v1.17 shipped（Wave 8 收口） |
+| 53 | `windows` 不能锁定唯一日期，horizon 无上界 | 能力缺口（须先改规格） | ✅ v1.17 shipped（Wave 8 收口） |
+| 54 | 噪音帧只能是纯文本，结构化负样本无入口 | 能力缺口（须先改规格） | ✅ v1.17 shipped（Wave 8 收口） |
+| 55 | 长周期行为配额无法声明 | 能力缺口（须先改规格） | ✅ v1.17 shipped（Wave 8 收口） |
+| 56 | 单日覆盖与多周比例的整数冲突无提示 | 能力缺口（须先改规格） | ✅ v1.17 shipped（Wave 8 收口） |
+| 57 | 跨序列类的先后、最小间隔与语义互斥 | 规格既有非目标 | ✅ v1.17 shipped（Wave 8 收口） |
+| 58 | App 使用区间严格包含屏幕 / 剪贴板证据 | 规格既有非目标 | ✅ v1.17 shipped（Wave 8 收口） |
+| 59 | 跨序列资源互斥（同设备音频焦点） | 规格既有非目标 | ✅ v1.17 shipped（Wave 8 收口） |
+| 60 | 失败序列不补足配额 | 规格既有非目标（报告面已够） | ✅ v1.17 shipped（Wave 8 收口） |
 
 ## P1 — 实现与规格的偏差
 
@@ -585,3 +604,339 @@ LLM 用量为 `calls = 53`、`prompt_tokens = 12173`、`completion_tokens = 4487
 | `examples/synth-stream` 最终真跑 | exit 0 | 生成 6、emitted 5、`dropped_verify = 1`、failed 0；sessions 5、crossed_sessions 1、frames 27、noise 3、duplicates 1；工件 34 行，SHA-256 为 `927e469e16df3f007f057357a267b8f8228506a5dfb279dc83bdfa1f1da672bf` |
 | 工件重放（process + segment） | exit 0 | 34 帧 → 6 会话、6 episodes、`absorbed = 31`、`dropped_noise = 3`、`dropped_dup = 1`、`emitted = 5`、`failed = 0`；`mean_episode_len = 5.17`、`windows = 7`、12 次调用 / 5.475 秒 |
 | dry-run golden | 八个**字节不动** | 规则面不改变既有 golden 字节；live 用量以本次 report 为准 |
+
+## 追加条目：外部数据工程实跑反馈分诊（2026-08-21）
+
+> 来源：`Dataset-Person` 白领一日 / 半日合一工程（五份意图序列工程合并 → 真实 DeepSeek 生成 →
+> 同日转换导出）的实跑记录，共 29 条反馈。逐条对照本仓库 HEAD（v1.17 已提交；本段历史反馈记录已由 v1.17 场景规划与精确交付 supersede）核实后
+> 按「谁能解决」分档，**其中 18 条的解法在 LabelKit 内**，即下列第 42–60 条（第 42、43 条同源但
+> 可分别处置，第 44 条是第 42 条的连带诊断项，故 18 条反馈落成 19 个条目）。
+>
+> 另 11 条不进本清单，理由如下：**2 条属提示词与钩子用法**——负样本理由补写输入中不存在的固定
+> 时长（一条娱乐负样本称「每个应用使用时长固定为 8 分钟」，而原始帧本身已有其他时长）、槽位值缺少
+> 可回指的成员帧证据（剪贴板只有优惠券和地址，标注器把优惠券文字写进 `actionInfo.items`）；两者
+> 的工具侧机制均已在位（`generate.sample_validator`、`generate.sequence_validator`、
+> `output.validator` 的 L2.5、verify 缺陷表），本轮只是没把这些语义写进提示词与钩子。**9 条属分支
+> 错配与自研脚本**——`time_profiles` / `ts_ms` / `end_ts_ms` 只存在于 v1.14 之后分家的另一条线
+> （`Downloads/LabelKit`，remote `HoldThatThgt/LabelKit`），本仓库用 `[[generate.stream.windows]]`
+> 与四词时间词表解决同一需求；`split.py` / `build_all_day_stream.py` / `export_stream_views.py`
+> 从不属于 LabelKit 交付面；`fit` 时长压缩、位置式窗口绑定、快照被建成 App 区间、导出访问器耦合
+> 精确类名均在自研转换器内；打卡 tier 漏列 POI 与公共时段帧属配置遗漏（档位构成本就是精确等值
+> 声明）；「固定 search strategy 未落地」一条**读错规格**——`SPEC-sequence-rules.md` 第 290 行写的
+> 就是「solver 固定 `num_search_workers = 1`，使用 CP-SAT 自动搜索」，`_configure_solver` 与之一致，
+> 该反馈已过时（其真正想指出的「无法保证选最早可行日期」是下列第 45 条）。
+>
+> 下列条目**全部未修复，本轮零代码改动**；只记录现象、核实到的代码事实与修法方向。凡涉及新增
+> 配置面、改动报告键集或触碰 §1.6 既有裁决的，按仓库纪律须先改规格再动代码。
+
+### 42. 联合 planner 模型规模随序列数三次增长，12 条序列即触顶 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：167 条序列 / 180 个任务帧 / 167 个会话的工程执行纯本地 `validate`，约 51 秒后返回
+`sequence planner model exceeds the 250000 proto entry limit`。符合数据比例的显式负样本工程
+因此完全无法通过校验；半日工程（9 条序列）通过。
+
+**核实到的事实**：本机直接构造 `PlannerQuestion` 并读 `_proto_entries`（`len = 4`、
+`gap_s = 3600`、`session_max_len = 8`、无规则无窗口、`attempts == sessions`）：
+
+| 序列数 = 会话数 | 任务帧 | 现状 proto 条目 | 零交叉短路后 |
+|---:|---:|---:|---:|
+| 8 | 32 | 57,747 | 18,995 |
+| 9 | 36 | 82,605 | — |
+| 12 | 48 | 197,763 | — |
+| 13 | 52 | **252,047**（超限） | — |
+| 16 | 64 | 472,547 | 140,387 |
+| 24 | 96 | 1,608,435 | 462,483 |
+| 32 | 128 | 3,829,443 | 1,083,587 |
+| 48 | 192 | 12,982,947 | 3,616,035 |
+
+拐点硬落在 12 → 13 条之间——当前实现在「一序列一会话」形态下最多只能规划 **12 条序列**。
+规模主项是 `_new_session_vars`：`_session_members` 为**每个 session** 铺开**全部**
+`(attempt, position)` 三元组（`Σ帧数` 个），随后 `itertools.combinations(current, 2)` 施加
+session 内跨度约束、`for left in current: for right in previous` 施加跨 session 顺序约束——
+两处都是 O(sessions × 帧²)，合计 O(n³)。第 43 条是其中最大且可整段消除的一块。
+
+**v1.17 裁决**：改用 owner slot permutation：每个 session 恒有一个 primary slot，只有实际声明的
+`crossed_sessions` 才建立 secondary slot；owner 与 slot 用 `AddInverse` 排列，session 起止用
+`AddElement` 选择。不能把整条 attempt 放进 `AddNoOverlap`——那会禁止合法 crossed session 的
+帧级交错。最终方案与规模门见 `SPEC-scenario-planning.md` §7、§13。
+
+### 43. 零交叉需求下仍构造全部交叉组合，占模型 67%–72% —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：第 42 条规模的最大可压缩项，且是纯白建。
+
+**核实到的事实**：`_add_crossing_constraints` 对**每个 session × 每对 attempt**
+（`itertools.combinations(range(len(attempts)), 2)`）建 `pair_{s}_{l}_{r}` 布尔变量，再由
+`_alternation_patterns` 为每对建 `2 × L_left × L_right` 量级的 A-B-A / B-A-B 三点模式变量。
+但同一模型里 `_new_session_vars` 已钉住 `sum(doubles) == len(attempts) - sessions`：
+`len(attempts) == sessions` 时每个 session 恰含一个 owner，`pair` 恒不可满足，所有模式变量
+都不可能被用到。实测占比稳定在 67%–72%（第 42 条表格右列为 monkeypatch 掉该段后的对照）。
+
+**v1.17 裁决**：`crossed_sessions = 0` 时 crossing builder 不调用，约束族规模必须为零；有交叉时
+只对 secondary slot 实际映射到的 owner pair 建 A-B-A / B-A-B witness。不能按
+`_hint_session_assignments` 剪枝——hint 不是约束，日历窗口可以合法地反转 owner 顺序。
+
+### 44. 容量拒绝被渲染成 INFEASIBLE，且不报实际规模 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：上述超限的用户可见输出是两行——日志
+`sequence planner model exceeds the 250000 proto entry limit`，加 M1 聚合错误
+`[generate.stream]: sequence planner found no feasible full prefix (status = INFEASIBLE)`。
+用户读到的是「配置无解」，实际是「模型过大」，处置方向相反（前者会去放宽约束，后者该去减规模）。
+
+**核实到的事实**：`solve_question` 与 `select_feasible_plan` 超限都抛 `PlannerConfigError`；
+M1 的 `_check_full_potential` 只用 `_planner_error_is_unknown()` 把 UNKNOWN 分流出去，其余
+一律落 INFEASIBLE 分支。错误文本既不含实际条目数与上限，也不说明交叉组合 / 日历窗口析取 /
+帧类独热各占多少规模。
+
+**v1.17 裁决**：拆出 `PlannerCapacityError`、`PlannerInfeasibleError` 与 `PlannerBudgetError`。
+capacity 消息带 actual、limit、dominant family 与逐族 variables/constraints；只有真实硬约束无解才
+使用 INFEASIBLE，并通过 assumptions 返回足以导致无解的具名约束集合。
+
+### 45. 生成路径没有布局目标：9 条序列铺到 29 个自然日 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：半日工程（下午至晚间九条序列、`of_week = ["mon"]`）静态校验与真实生成都成功，但原始
+流从 `2026-01-05T14:30:00+08:00` 跨到 `2026-02-02T20:00:50+08:00`，报告
+`calendar_days_spanned = 29`，涉及五个周一。配置里的「半日」窗口不能直接得到半日工件，必须额外
+重排时间。
+
+**核实到的事实**：三处叠加。① `_minimize_timeline_end` 只在 `ctx.noise_presence` 为空时挂上，
+有噪音就让位给 `Maximize(sum(noise_presence))`。② 真正的规划入口 `select_feasible_plan` 在
+`_new_context` 之后立刻 `ctx.model.ClearObjective()`，换成
+`Minimize(sum(costs) * (len(noise) + 1) - noise)`——**timeline-end 目标在生成路径上从不生效**。
+③ `_horizon` 每个 session 加一个 `_WEEK_US`，`_add_session_boundaries` 允许
+`start <= 前一 session 结束 + gap + _WEEK_US - 1`。于是「铺散」是模型允许、且在目标函数上零代价
+的解，求解器没有任何理由选最早那一天。
+
+**v1.17 裁决**：`[generate.stream.schedule].start/end` 成为有限硬边界；目标分 preference deviation、
+calendar days spanned、timeline end 三层独立求 OPTIMAL，逐层冻结，不用大权重折叠。dry-run estimate
+与 live report 都回显日期范围、objective 与 plan digest。
+
+### 46. 可行性入口与规划入口优化的不是同一目标 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：对同一问题直接调用可行性求解入口可得到 2026-01-05 单日布局，而生成路径把布局分散到
+多周。用户无法根据校验成功推断实际输出的日期跨度。
+
+**核实到的事实**：`check_question` → `solve_question` 走 `_new_context`，无噪音时带
+`Minimize(timeline_end)`；`select_feasible_plan` 把该目标清掉。M1 的 `_check_local_potential`
+（逐类、逐档、逐长度的局部潜在可行矩阵）用前者，`_check_full_potential` 与 M6 `plan_stream`
+用后者——**M1 与 M6 彼此一致**（这点与原始记录的推测不同），但局部可行性矩阵与全局规划各自
+优化一件事，第 45 条的现象正由此被放大成「校验说可以、结果却不是那样」。
+
+**v1.17 裁决**：M1 只调用一次 `compile_scenario` 并把冻结 `ScenarioPlan` 放入 ResolvedConfig；
+validate、dry-run、estimate 与 M6 只读同一对象。删除生产路径的局部候选矩阵和 M6 二次规划入口。
+
+### 47. 钩子模块不按 project TOML 目录解析 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：`sequence_validator = "half_day_hooks:validate_sequence"`，钩子文件与 project TOML
+同目录，`labelkit validate` 仍报
+`[generate].sequence_validator: cannot import module 'half_day_hooks': No module named 'half_day_hooks'`。
+显式 `PYTHONPATH=<project 目录>` 后通过。工程无法仅凭 TOML 与同目录钩子运行。
+
+**核实到的事实**：`resolve_hook` 直接 `import_module`，不介入 `sys.path`。实测在
+`examples/synth-stream` 下执行 `uv run python -c "…"`，`sys.path` 为
+`[stdlib…, .venv/lib/python3.12/site-packages, /Users/atishoo/Project/LabelKit]`——**cwd 不在
+其中**。示例的 `examples.synth-stream.hooks:validate_sequence` 能解析，靠的是 editable 安装把
+仓库根放进了 path；也就是说**示例的可运行性依赖开发态安装形式**，用户把 project TOML 放到仓库
+外时必然失败。
+
+**v1.17 裁决**：四个 hook 统一改成 `path.py:function`，相对 project root；使用
+`importlib.util.spec_from_file_location` 与绝对路径 hash module name，不修改 `sys.path`。M1 解析一次
+并冻结 callable；新增的第四个 hook 是跨序列 `generate.scenario_validator`。
+
+### 48. `session_max_len` 的 2× 下界忽略实际装箱计划 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：即使 `sessions` 等于序列数、不需要双序列会话，仍报
+`[stream].session_max_len: the time-stream form requires >= 2 * max(len_range upper bound) …,
+got 3 < 6`。单序列会话配置也必须人为放大容量。
+
+**核实到的事实**：`_stream_form_weaving` 无条件检查 `2 * values.len_max >
+values.stream.session_max_len`，理由就写在错误串里（"a crossed session always packs two
+sequences"）。但 planner 侧 `_new_session_vars` 钉的是
+`sum(doubles) == len(attempts) - sessions`——`Σsequences == sessions` 时 doubles 恒 0，永不存在
+双序列会话；模型里真正的容量约束是 `task_count + noise_count <= session_max_len`。
+
+**v1.17 裁决**：删除用户 `sessions`，只声明 `crossed_sessions`；session 数由成功交付 slot 推导。
+静态检查只报告数学必要的单 owner / 最小可交叉 owner 容量，完整容量与 exact noise reserve 由实际
+slot 长度域在同一个 planner 中验证，不再使用无条件 `2 × len_max`。
+
+### 49. 派生约束逐层暴露，同一组关系要跑多轮才看全 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：`session_max_len = 3` 时只报 2× 下界；改成 6 后**下一轮**才报
+`[stream].session_max_span_s: worst-case session span (session_max_len - 1) * frame_gap_s
+upper bound = 300 s > 120 s`。用户须反复运行才能拿到同一组派生约束。
+
+**核实到的事实**：`_stream_form_weaving` 的跨度检查用**用户写的** `session_max_len` 计算
+`worst`，而不是用同一函数上面几行刚算出的派生下界 `2 * len_max`。M1「一次报全部错误」的纪律
+在这组派生量上失效——不是聚合器的问题，是被检查量取错了基准。
+
+**v1.17 裁决**：新增纯函数 `derive_stream_bounds`，一次返回 target/crossing/session、长度、容量、
+noise、frame gap、session gap、span、schedule bucket 与 duration/resource 的全部派生错误，不因前一条
+错误短路。
+
+### 50. 无 `--probe` 的 `validate` 仍要求密钥值存在 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：不带 `--probe` 执行 `labelkit validate` 仍因
+`[llm.default].api_key_env: environment variable "LABELKIT_DEEPSEEK_KEY" is not set or empty`
+退出；无密钥环境无法执行纯配置、JSON Schema 与约束校验（CI 静态门因此不可用）。该工程的规避
+方式是传一个命令级假值。
+
+**核实到的事实**：`_resolve_api_keys`（M1 规则 12）只为**被引用的** profile 解析密钥，但与
+`--probe` 无关——`load` 一律执行，缺值即 `col.error`。`--probe` 只控制是否真发探测请求。
+
+**v1.17 裁决**：静态 load 完全不读取 key value，也不发 missing-key WARN；删除 profile 上的 secret
+字段。只有 run 与 `validate --probe` 调 `resolve_credentials` 生成独立 `RuntimeCredentials`，并继续
+对缺失 key 聚合硬错。
+
+### 51. dry-run 估算只进 stderr，不进 report.json —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：控制台显示九条记录、54 帧、27 次基础模型调用的估算，报告中对应计数仍为零。自动化
+无法只读报告做成本与规模门控。
+
+**核实到的事实**：`_run_dry` 调 `self._estimate()` 拿到 `est`，只交给 `_print_dry_estimate` 或
+`metrics.run_estimate`；随后 `_build_report(exit_code=0, …)` 完全从计数器组装，而 dry-run 什么
+都没跑，所以计数全零。报告里没有任何估算字段。
+
+**v1.17 裁决**：dry-run 的 `report.estimate` 直接使用 `estimate_run` 返回对象；console 只格式化该
+对象。time-stream estimate 另含 schedule、plan digest、planner families 与 objective，自动化无需
+解析 stderr。
+
+### 52. 相对输出路径按启动目录解析且不回显绝对路径 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：从 `Project/LabelKit` 启动、`--project` 指向 `Dataset-Person` 下的 TOML 时，
+`[run].output` 的相对路径写进了 `Project/LabelKit/out`。工件位置取决于调用者 cwd，容易污染源码
+仓库或误读旧结果。
+
+**核实到的事实**：M1 的可写性检查用 `Path(eff_output).resolve()`（相对 cwd），M11 `Emitter`
+用 `Path(cfg.run.output)`（同样相对 cwd），`stream_artifact_path` 由输出路径派生因而同源。错误
+串只回显用户写的原始相对串，全程没有一处打印规范化绝对路径。五个 example 都靠 `cd` 到示例目录
+运行，把这个行为完全遮住了。
+
+**v1.17 裁决**：project TOML 内的 input/output、四类 Schema、trace 与 hook 路径统一相对 project
+root；CLI input/output 仍按 shell cwd。合并后只保留 `ResolvedPaths` 绝对路径，M2/M11/trace/console
+不得二次按 cwd 推导；report 与启动输出回显全部启用通道。
+
+### 53. `windows` 不能锁定唯一日期，horizon 无上界 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：`ts_start` 只提供下界，`of_week = ["mon"]` 在规划地平线内每周重复；没有 `ts_end` 或
+指定日期窗口。「生成一天」依赖求解器恰好选中第一个周一，而不是配置契约保证（第 45 条即其后果）。
+
+**核实到的事实**：`CalendarWindow` 只有 `frame_class` / `of_day` / `of_week` 三个字段
+（`common/runtime/temporal.py`），没有日期维度；`window_day_options` 从 `ts_start` 起按
+`days = max(8, (horizon - ts_start) // _DAY_US + 9)` 枚举合法日内窗，而 `_horizon` 每个 session
+加一周——session 越多，可选日期越多，`_add_calendar_constraints` 的析取分支也越多。
+
+**v1.17 裁决**：删除 `ts_start`，改为必填、同 fixed offset 的
+`[generate.stream.schedule].start/end` 半开区间，并支持 `exclude_dates`。删除每 session 一周的隐式
+horizon；frame window 只枚举 schedule 内合法日期。
+
+### 54. 噪音帧只能是纯文本，结构化负样本无入口 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：要求每行 `text` 是对象的下游导出契约无法消费内建噪音，只能把社交、娱乐、健身、弱证据
+快照全部建成显式序列类，进一步放大规划模型（第 42 条的规模正由此而来）。
+
+**核实到的事实**：`_noise_slot(payload: str, tiered: bool)` 的载荷是字符串，噪音批调用复用扁平
+生成模板；`assemble_stream` 把 `slot.payload` 直接写进行对象的 `text_field`，而结构化帧类走的是
+`realize_schema` 逐位路径，两者不通。提示词层面无法弥补——行里的值是字符串而不是对象。
+
+**v1.17 裁决**：`[[generate.stream.noise]]` 以 frame class + integer weight 声明，复用该 frame
+class 的 instruction、Schema 与 realization。noise 仍是 point occurrence；`truth.noise = true` 且
+`truth.frame_class` 写实际类名，sequence/tier 字段保持 null。
+
+### 55. 长周期行为配额无法声明 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：无法直接声明「每工作日八个意图、每周末一次买菜、跨周比例 60/25/15」，只能手工展开
+日期与序列类，配置体积与规划复杂度同步上升——167 条序列的工程正是这样来的。
+
+**核实到的事实**：`rules` 只约束同一序列内部的帧关系（15 个有限迹 DECLARE 模板），`windows`
+只约束帧的发生时段；配额只有 `[generate].sequences` 与按类覆盖，没有日历周期维度。
+
+**v1.17 裁决**：`[[generate.stream.quotas]]` 支持 day、ISO week、schedule bucket，支持 exact counts
+或 integer weights；schedule 提供有限展开边界，quota 编译后生成稳定成功交付 slot。
+
+### 56. 单日覆盖与多周比例的整数冲突无提示 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：标准工作日八个规律意图，若单日再加入一个不规律意图只能得到 8:1；九条有效意图也不能
+精确拆成 60% / 25% / 15%。单日样本不可能同时精确满足长期比例与全部覆盖要求，而工具不区分
+「单日覆盖目标」与「多周统计目标」，也不报最小可精确满足样本数。
+
+**核实到的事实**：档位配分用整数域最大余数法（`apportion_tiers`），零配额只有 WARN
+（"apportions 0 sequences to tier_rank = …"）；没有「要精确满足这组权重最少需要多少条」的反向报告。
+
+**v1.17 裁决**：weights 先按最大公约数归一，报告 `minimum_exact_cohort` 与上下邻近可精确 total；
+用户显式选择 `exact` 或纯整数 `largest_remainder`。QuotaCompiler 在有限 local date 上联合执行逐日
+counts 与长期 ratio；同一 occurrence 可同时满足多张约束，兼容时通过，冲突时 assumptions core
+同时点名自然名称 quota。
+
+### 57. 跨序列类的先后、最小间隔与语义互斥 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：原半日窗口先在 18:20 导航回家、后在 18:50 下班打卡；18:19 晚餐外卖后又在 19:20 买菜。
+每条序列内部连贯，合并后的白领行为主线不成立。
+
+**核实到的事实**：`SPEC-sequence-rules.md` 第 11 节明确：「规则只约束同一任务序列，不新增
+『一条业务序列必须发生在另一条之后』的用户配置；session crossing 是生成布局约束，不是跨业务
+序列 DECLARE。」跨意图顺序当前只能靠各类独立 `windows` 拼时间轴，没有统一的因果约束或语义冲突
+检查。
+
+**v1.17 裁决**：新增 period-scoped sequence rule：`precedence`、`response`、`succession` 与
+`not_co_existence`，gap 仍用半开秒区间。payload 语义互斥由增量
+`scenario_validator(accepted, candidate)` 失败关闭，违规只重试 candidate。
+
+### 58. App 使用区间严格包含屏幕 / 剪贴板证据 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：同日转换后咖啡 App 区间为 15:00:07.500–12.500，而瑞幸屏幕证据在
+15:00:02.500–03.000；五条有效序列的屏幕或剪贴板证据全部落在对应 App 区间之外——事件声称用户
+尚未使用 App 时已看到该 App 页面或复制了内容。
+
+**核实到的事实**：`SPEC-sequence-rules.md` 第 11 节：「帧仍是时间点事件，不引入 duration
+interval 与 Allen 区间代数。」`rules` 的 `time_s` 是两个时间**点**之间的半开差值约束，无法表达
+「A 的区间包含 B 的时刻」。仅调整 project TOML 无法建立包含关系。
+
+**v1.17 裁决**：frame class 可声明机械 `duration_s`，artifact timestamp 是 interval start；时间字段
+新增 `end_ts` / `duration_s`。同序列 frame rule 新增严格 `contains`，边界相等不通过，不再依赖
+artifact 写出后的修复脚本。
+
+### 59. 跨序列资源互斥（同设备音频焦点） —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：不同序列的媒体播放 duration 没有统一资源互斥检查，可能出现音乐与视频同时播放，违反
+手机音频焦点与真实用户行为。
+
+**核实到的事实**：既跨序列（第 57 条边界）又是区间语义（第 58 条边界），双重非目标。
+
+**v1.17 裁决**：duration frame 声明 `resources = ["audio_focus"]` 等自然名称；planner 把全场景同名
+resource interval 交给 CP-SAT `AddNoOverlap`。一个 frame 可占多个 resource，不同 resource 可重叠。
+
+### 60. 失败序列不补足配额 —— 🧭 v1.17 方案已冻结（待实现）
+
+**现象**：首次真实运行有两条序列因规划响应不满足 JSON Schema 而缺席，最终只输出七条序列 /
+41 帧，配置请求的九条没有重试补足。一次偶发格式错误就改变数量与比例，长周期统计更难稳定。
+
+**核实到的事实**：spec §8.3 O6 把「精确输出配额 + 补足循环」列为非目标。但**报告侧的「尝试 vs
+交付」其实已可对账**：`report.generate.stream` 有 `plan_failures` / `realize_failures` /
+`validator_scrapped`，`tiers` 子块逐档给 `planned` / `produced`（v1.15 起按类嵌套），零配额档与
+全作废档显式呈现 0/0。原始记录里「报告应明确区分尝试配额与交付配额」这半条已经满足。
+
+**v1.17 裁决**：quota 改成成功交付目标；每个 frozen slot 使用
+`max_attempts_per_slot` 有界重跑完整 brief + realization + validators，layout 不变。任一 slot 耗尽后
+继续处理其余 slot、交付 partial artifact、`delivery.complete = false`、exit 1；不无限循环、不跨运行续跑。
+
+### v1.17 统一设计留痕
+
+- 业界依据、替代方案与拒绝理由：[`PROPOSAL-scenario-planning.md`](PROPOSAL-scenario-planning.md)。
+- 字段、模型、失败语义、报告、文件归属与验收门：
+  [`SPEC-scenario-planning.md`](SPEC-scenario-planning.md)。
+- 当前状态只是**方案冻结**。生产代码、主规格、CONTRACTS、examples、手册与真实 E2E 尚未改动，
+  所以 E2E-42 至 E2E-60 均不得标记为已修复。
+
+### 分诊留痕（2026-08-21）
+
+| 核实对象 | 方法 | 结论 |
+|---|---|---|
+| planner 规模曲线 | 直接构造 `PlannerQuestion` 读 `_proto_entries`，取 8/9/12/13/16/24/32/48 八个点；另跑一遍 monkeypatch 掉零交叉短路的对照组 | 拐点硬落在 12 → 13 条（197,763 → 252,047）；交叉组合稳定占 67%–72%（第 42、43 条） |
+| 目标函数落点 | 读 `_minimize_timeline_end` / `select_feasible_plan` / `_add_session_boundaries` / `_horizon` | 生成路径无 end 目标；session 起点允许比前一个结束晚整周（第 45、46 条） |
+| 钩子解析路径 | `cd examples/synth-stream && uv run python -c "…sys.path…"` | cwd **不在** `sys.path`；仓库根在（editable 安装）⇒ 示例可运行性依赖开发态安装（第 47 条） |
+| 两条线的分家点 | 两个工作区 `git log` 对比 | 同源于 `070e341`（v1.14）；本仓库走 v1.15 / v1.16，`Downloads/LabelKit` 走 `time_profiles` + 全天合成脚本 ⇒「配置契约不一致」非加载器缺陷 |
+| 非目标条文 | `SPEC-sequence-rules.md` 第 11 节、spec §8.3 O6 | 第 57–60 条落在既有边界内，不是遗漏 |
+| 「固定 search strategy」一条 | `SPEC-sequence-rules.md` 第 290 行 vs `_configure_solver` | 规格写的就是自动搜索，实现与之一致 ⇒ 该反馈已过时，真问题是第 45 条 |
+| 报告面「尝试 vs 交付」 | 读 `_report_generate_stream` / `_report_stream_tiers` | `plan_failures` / `realize_failures` / `validator_scrapped` + 逐档 `planned` / `produced` 已在场（第 60 条） |
+
+分诊实测阶段**零代码改动、零测试改动、零 golden 变更**。后续只新增 v1.17 proposal/spec 并更新
+状态为“方案已冻结”；生产实现与验收仍全部待做。

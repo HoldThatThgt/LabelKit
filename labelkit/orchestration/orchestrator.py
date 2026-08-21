@@ -42,15 +42,21 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import islice
+from pathlib import Path
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 from labelkit import TOOL_VERSION, __version__
-from labelkit.common.config.model import effective_rules, effective_tiers, effective_windows
+from labelkit.common.config.model import (
+    effective_frame_rules,
+    effective_frame_windows,
+    effective_tiers,
+)
 from labelkit.common.contracts.stage import RunContext, Stage
 from labelkit.common.contracts.types import PipelineItem, Record
 from labelkit.common.errors import CircuitBreakerTripped, InternalError
 from labelkit.common.runtime import budget
-from labelkit.orchestration.profile_usage import referenced_profiles
+# v1.17 Wave 2b：referenced_profiles 收集器已下沉 common 层（CONTRACTS §7.19.3）。
+from labelkit.common.runtime.credentials import referenced_profiles
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import LLMProfile, ResolvedConfig, TierSpec
@@ -189,21 +195,20 @@ class _CounterView:
 def _estimate_generate_only(cfg: "ResolvedConfig") -> tuple[int, int]:
     """generate_only 模式的生成量估算（3.6.2 量公式，静态、无需 scan）。
 
-    v1.13（裁决·估算精确复演）：``generate_stream.enabled`` 时改走 M6 计划期纯函数吃
-    cfg + seed 的**精确复演**（非上界）——records = Σsequences（limit 后）、
-    generate_calls = 蓝图 + 实现（各一序列一次）+ 噪音批 ⌈噪音帧数/num_per_call⌉（三类
-    调用全折入 generate_calls，行格式零改动）。orchestration → operators 是既定依赖
-    方向（懒导入）。
+    v1.17（SPEC-SP §10.2）：``generate_stream.enabled`` 时直读 M1 冻结的
+    ``cfg.scenario_plan``——records = len(slots)、generate_calls = 2 × len(slots) +
+    len(noise_slots)（每 sequence slot 一次 brief + 一次 realize，每 noise slot 一次
+    realize；duplicates 零 LLM）。不含 delivery retry、LLMClient 内 provider retry 与
+    Schema repair。
 
     @param cfg: 已解析配置
     @return: (生成调用数, 生成记录数)
     """
     g = cfg.generate
     if cfg.generate_stream.enabled:
-        from labelkit.operators.generate import plan_stream
-        stream_plan = plan_stream(cfg, random.Random(f"{cfg.run.seed}:0:generate"))
-        records = len(stream_plan.sequences)
-        return 2 * records + len(stream_plan.noise_plans), records
+        plan = cfg.scenario_plan
+        records = len(plan.slots)
+        return 2 * records + len(plan.noise_slots), records
     if g.seed_examples:
         calls = _ceil_div(len(g.seed_examples) * g.num_per_record, g.num_per_call)
     else:
@@ -379,7 +384,42 @@ def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
     for key in _ESTIMATE_CALL_ORDER:
         est[key] = calls[key]
     est["total_calls"] = sum(calls[key] for key in _ESTIMATE_CALL_ORDER)
+    if cfg.generate_stream.enabled and cfg.scenario_plan is not None:
+        est["scenario"] = _estimate_scenario(cfg)
     return est
+
+
+def _estimate_scenario(cfg: "ResolvedConfig") -> dict:
+    """v1.17（SPEC-SP §10.2）estimate 的 scenario 子块（冻结键序，直读计划）。
+
+    @param cfg: 已解析配置（``scenario_plan`` 已由 M1 冻结）
+    @return: 十键字典（models 的 families 值为 {variables, constraints} 映射）
+    """
+    from datetime import datetime, timedelta, timezone as tz
+
+    from labelkit.operators.generate_stream import _us_iso
+
+    plan = cfg.scenario_plan
+    schedule = cfg.generate_stream.schedule
+    models = {
+        name: {"entries": stats.variables + stats.constraints,
+               "families": {family: {"variables": row.variables,
+                                     "constraints": row.constraints}
+                            for family, row in stats.families.items()}}
+        for name, stats in plan.models.items()
+    }
+    return {
+        "target_sequences": len(plan.slots),
+        "task_frames": sum(len(layout.frames) for layout in plan.layouts),
+        "noise_frames": len(plan.noise_slots),
+        "sessions": len(plan.sessions),
+        "crossed_sessions": cfg.generate_stream.crossed_sessions,
+        "schedule_start": _us_iso(schedule.start_us, cfg),
+        "schedule_end": _us_iso(schedule.end_us, cfg),
+        "calendar_days_spanned": plan.objectives.calendar_days_spanned,
+        "plan_digest": plan.plan_digest,
+        "models": models,
+    }
 
 
 @dataclass(frozen=True)                            # [FROZEN in CONTRACTS.md §7.9]
@@ -461,6 +501,7 @@ class Orchestrator:
         self._installed_signals: list[int] = []
         self._timer_handles: list[asyncio.TimerHandle] = []
         self._t0 = 0.0
+        self._estimate_cache: dict | None = None
 
     # ── 对外入口 ───────────────────────────────────────────────────────────
 
@@ -538,7 +579,8 @@ class Orchestrator:
             not self.cfg.generate_stream.enabled or self.metrics.has_listener
         )
         if should_estimate and stream_listener_ready:
-            self.metrics.run_estimate(estimate_run(self.cfg, plan))
+            self._estimate_cache = estimate_run(self.cfg, plan)
+            self.metrics.run_estimate(self._estimate_cache)
         # v1.11（V13①，spec 3.10.3 上下文预算行）：启动期预算 INFO 归 M10 启动段所有
         # （绝不归 loader：加载期 logging 尚未按 CLI 覆盖定级）。--dry-run 走不到这里
         # （_run_dry 已在上游返回），故即便 examples 现已声明窗宽（V26），dry-run 的
@@ -1045,6 +1087,9 @@ class Orchestrator:
                                 or bool(getattr(self.metrics, "circuit_broken", False)))
         if self._circuit_broken:
             exit_code = 4
+        elif self.cfg.generate_stream.enabled and self.metrics.counters.get(
+                "generate.stream.delivery.incomplete", 0):
+            exit_code = 1
         elif self.cfg.strict and self._rejects_lines > 0:
             exit_code = 1
         else:
@@ -1076,6 +1121,9 @@ class Orchestrator:
         ingest_report = getattr(self.ingestor, "report", None) if self.ingestor else None
         counts = self._report_counts(c, ingest_report)
         report: dict = {"run": self._report_run_block(exit_code), "counts": counts}
+        if cfg.dry_run:
+            # dry-run 报告直接引用本次唯一 estimate_run 结果，避免 console/JSON 漂移。
+            report["estimate"] = self._estimate_cache or self._estimate()
         if cfg.segment.enabled:
             report["stream"] = self._report_stream(c, counts, ingest_report)
         if cfg.dedup.enabled:
@@ -1184,6 +1232,7 @@ class Orchestrator:
             "config_digest": cfg.config_digest,
             "project_digest": cfg.project_digest,
         }
+        run_block["paths"] = self._report_paths()
         artifact = getattr(self.emitter, "artifact_summary", None)
         if artifact:
             # v1.13（裁决·观测面）：run 摘要族的工件条目（路径/sha256/行数，主输出
@@ -1193,6 +1242,33 @@ class Orchestrator:
             # v1.6 熔断交付（spec 6.4，只增）：partial_delivery 仅熔断交付时在场。
             run_block["partial_delivery"] = True
         return run_block
+
+    def _report_paths(self) -> dict:
+        """输出九键绝对路径；旧 fixture 缺少 paths 时按已知字段归一化。"""
+        paths = getattr(self.cfg, "paths", None)
+        if paths is not None:
+            return {
+                "project": paths.project, "project_root": paths.project_root,
+                "input": paths.input, "output": paths.output,
+                "report": paths.report, "rejects": paths.rejects,
+                "sidecar": paths.sidecar, "trace": paths.trace,
+                "stream_artifact": paths.stream_artifact,
+            }
+        project = str(Path(self.cfg.project_path).resolve())
+        output = str(Path(self.cfg.run.output).resolve())
+        stem = str(Path(output).with_suffix(""))
+        return {
+            "project": project, "project_root": str(Path(project).parent),
+            "input": (str(Path(self.cfg.run.input).resolve())
+                      if self.cfg.run.input else None),
+            "output": output,
+            "report": stem + (".dryrun.report.json" if self.cfg.dry_run else ".report.json"),
+            "rejects": None if self.cfg.output.rejects == "none" else stem + ".rejects.jsonl",
+            "sidecar": stem + ".meta.jsonl" if self.cfg.output.meta_mode == "sidecar" else None,
+            "trace": (str(Path(self.cfg.trace.path).resolve())
+                      if self.cfg.trace.enabled and self.cfg.trace.path else None),
+            "stream_artifact": stem + ".stream.jsonl" if self.cfg.generate_stream.enabled else None,
+        }
 
     def _report_stream(self, c: _CounterView, counts: dict, ingest_report) -> dict:
         """组装 v1.8 stream 节（§9.3/spec §6.4：紧跟 counts 之后）。
@@ -1219,14 +1295,6 @@ class Orchestrator:
             "digest_poor_frames": c("segment.digest_poor_frames"),
             "segment_failures": c("segment.failures"),
         }
-        seg_prof = cfg.llm_profiles.get(cfg.segment.llm)
-        if seg_prof is not None and seg_prof.context_window > 0:
-            # v1.11（V13④，spec §6.4）：**实际**派发窗数——M14 属主的 segment.windows
-            # 计数器。**预算为门**的在场条件：仅当 segment 阶段的 profile 声明了窗宽时该键
-            # 才浮现（预算未声明时不在场）——计数发射本身无条件（进程内部），但全未声明的
-            # 报表必须与 v1.10 逐字节一致（CONTRACTS §9.3 条款）。它是用户侧对账 V12 上界
-            # segment_calls 估算的那一面。
-            block["windows"] = c("segment.windows")
         block.update(self._report_stream_operators(c))
         return block
 
@@ -1432,9 +1500,10 @@ class Orchestrator:
         @param c: 计数器视图
         @return: generate.stream 子块字典
         """
+        plan = self.cfg.scenario_plan
         block: dict = {
-            "sessions": c("generate.stream.sessions"),
-            "crossed_sessions": c("generate.stream.crossed_sessions"),
+            "sessions": len(plan.sessions),
+            "crossed_sessions": self.cfg.generate_stream.crossed_sessions,
             "sequences": {
                 spec.name: {
                     "planned": c(f"generate.stream.sequences.{spec.name}.planned"),
@@ -1450,14 +1519,77 @@ class Orchestrator:
             "frames": c("generate.stream.frames"),
             "noise_frames": c("generate.stream.noise_frames"),
             "duplicates": c("generate.stream.duplicates"),
-            "plan_calls": c("generate.stream.plan_calls"),
+            "brief_calls": c("generate.stream.brief_calls"),
             "realize_calls": c("generate.stream.realize_calls"),
             "noise_calls": c("generate.stream.noise_calls"),
-            "plan_failures": c("generate.stream.plan_failures"),
-            "realize_failures": c("generate.stream.realize_failures"),
-            "validator_scrapped": c("generate.stream.validator_scrapped"),
         })
+        self._append_stream_plan_report(block, c)
         return block
+
+    def _append_stream_plan_report(self, block: dict, c: _CounterView) -> None:
+        """追加 v1.17 planner、delivery 与 quota 报表面。"""
+        plan = self.cfg.scenario_plan
+        block["plan_digest"] = plan.plan_digest
+        block["planner"] = {
+            "models": {
+                name: {"entries": stats.variables + stats.constraints,
+                       "families": {family: {"variables": row.variables,
+                                             "constraints": row.constraints}
+                                    for family, row in stats.families.items()}}
+                for name, stats in plan.models.items()
+            },
+            "objectives": {
+                "preference_deviation": plan.objectives.preference_deviation,
+                "calendar_days_spanned": plan.objectives.calendar_days_spanned,
+                "timeline_end_us": plan.objectives.timeline_end_us,
+            },
+        }
+        target_sequences = len(plan.slots)
+        delivered_sequences = sum(
+            c(f"generate.stream.sequences.{spec.name}.produced")
+            for spec in self.cfg.classify.classes)
+        target_noise = len(plan.noise_slots)
+        delivered_noise = c("generate.stream.noise_frames")
+        target_duplicates = len(plan.duplicates)
+        delivered_duplicates = c("generate.stream.duplicates")
+        failure_keys = (
+            "brief", "realize", "noise", "context_overflow",
+            "sample_validator", "sample_validator_exception", "correlation",
+            "temporal", "sequence_validator", "sequence_validator_exception",
+            "similarity", "scenario_validator", "scenario_validator_exception")
+        failures = {key: c(f"generate.stream.delivery.failures.{key}")
+                    for key in failure_keys}
+        attempts = c("generate.stream.delivery.attempts")
+        complete = (c("generate.stream.delivery.incomplete") == 0
+                    and delivered_sequences == target_sequences
+                    and delivered_noise == target_noise
+                    and delivered_duplicates == target_duplicates)
+        block["delivery"] = {
+            "target_sequences": target_sequences,
+            "delivered_sequences": delivered_sequences,
+            "target_noise": target_noise,
+            "delivered_noise": delivered_noise,
+            "target_duplicates": target_duplicates,
+            "delivered_duplicates": delivered_duplicates,
+            "duplicate_shortfall": max(target_duplicates - delivered_duplicates, 0),
+            "attempts": attempts,
+            "complete": complete,
+            "interrupted": self._interrupted,
+            "exhausted_slots": c("generate.stream.delivery.exhausted"),
+            "failures": failures,
+        }
+        allocations = {quota.name: quota.allocation for quota in self.cfg.generate_stream.quotas}
+        block["quotas"] = [
+            {"name": row.name, "period": row.period, "bucket": row.bucket,
+             "class": row.sequence_class, "target": row.target,
+             "delivered": c(f"generate.stream.sequences.{row.sequence_class}.produced"),
+             "allocation": allocations.get(row.name),
+             "realized_ratio": (c(f"generate.stream.sequences.{row.sequence_class}.produced")
+                                 / row.target if row.target else 0.0),
+             "deviation": c(f"generate.stream.sequences.{row.sequence_class}.produced")
+                          - row.target}
+            for row in plan.quota_summary
+        ]
 
     def _append_stream_constraint_report(self, block: dict, c: _CounterView) -> None:
         """按实际配额前缀追加 v1.16 条件报表块。
@@ -1467,37 +1599,24 @@ class Orchestrator:
         """
         rules_active, windows_active = self._stream_constraint_faces()
         if rules_active:
-            block["rules"] = {
-                "sampled": c("generate.stream.rules.sampled"),
-                "correlation_scrapped": c("generate.stream.correlation_scrapped"),
-                "temporal_scrapped": c("generate.stream.temporal_scrapped"),
+            block["frame_rules"] = {
+                "sampled": c("generate.stream.frame_rules.sampled"),
             }
         v116_face_active = (
             rules_active or windows_active
             or bool(self.cfg.generate.sequence_validator)
         )
-        if v116_face_active and self.cfg.generate.sample_validator:
-            block["sample_validator_scrapped"] = c(
-                "generate.stream.sample_validator_scrapped")
-        if self.cfg.generate.sequence_validator:
-            block["sequence_validator_scrapped"] = c(
-                "generate.stream.sequence_validator_scrapped")
-        if windows_active:
-            block["windows"] = {"calendar_days_spanned": c(
-                "generate.stream.windows.calendar_days_spanned")}
 
     def _stream_constraint_faces(self) -> tuple[bool, bool]:
-        """按实际 ``--limit`` 配额前缀判断 rules/windows 报表条件面。"""
-        from labelkit.operators.generate import expand_stream_quota
-
+        """按冻结计划的参与类判断 frame_rules/frame_windows 报表条件面。"""
         rules_active = False
         windows_active = False
-        for name, _ordinal in expand_stream_quota(self.cfg):
-            view = self.cfg.class_views[name]
-            rules_active |= bool(effective_rules(
-                view.rules, self.cfg.generate_stream.rules))
-            windows_active |= bool(effective_windows(
-                view.windows, self.cfg.generate_stream.windows))
+        for slot in self.cfg.scenario_plan.slots:
+            view = self.cfg.class_views[slot.sequence_class]
+            rules_active |= bool(effective_frame_rules(
+                view.frame_rules, self.cfg.generate_stream.frame_rules))
+            windows_active |= bool(effective_frame_windows(
+                view.frame_windows, self.cfg.generate_stream.frame_windows))
         return rules_active, windows_active
 
     def _report_stream_tiers(self, c: _CounterView) -> dict:
@@ -1655,6 +1774,7 @@ class Orchestrator:
                                     "project_digest": cfg.project_digest,
                                     "trace_schema_version": 1})
         est = self._estimate()
+        self._estimate_cache = est
         if (cfg.console.mode_resolved == "rich"
                 and getattr(self.metrics, "has_listener", False)):
             # v1.10（U13）：rich 档且挂了 listener——估算打印行让位于渲染器的表格（数值

@@ -233,3 +233,23 @@
 - [116] Google OR-Tools. Python `AddAutomaton` API. https://or-tools.github.io/docs/pdoc/ortools/sat/python/cp_model（同一组位置变量上的有限自动机约束接口；不构造显式乘积 DFA）
 
 - [117] Google OR-Tools 9.15 PyPI metadata. https://pypi.org/project/ortools/（生产依赖精确锁定 `ortools==9.15.6755`，不按本机可用版本漂移）
+
+- [118] Google OR-Tools. CP-SAT Python API reference（`AddInverse`、`AddElement`、interval variable、`AddNoOverlap`、assumptions 与 model stats 的组合使用面）. https://or-tools.github.io/docs/pdoc/ortools/sat/python/cp_model.html（2026-08-21 访问）（v1.17 owner permutation、时间戳唯一 interval、聚合 noise reserve、assumption core 诊断与 family stats 的接口依据）
+
+- [119] Google OR-Tools. Job Shop Scheduling（precedence、resource no-overlap 与 makespan 的成熟分层）. https://developers.google.com/optimization/scheduling/job_shop（2026-08-21 访问）（v1.17 三层字典序目标中的 timeline end 与跨序列 resource `AddNoOverlap` 的调度谱系定位）
+
+- [120] Timefold Solver. Constraints and Score Overview: score levels（hard/soft 字典序与拒绝 score folding）. https://docs.timefold.ai/timefold-solver/1.x/constraints-and-score/overview（2026-08-21 访问）（v1.17 逐层冻结的字典序目标——先解硬约束层、冻结等式后再优化次层——的工业求解器先例）
+
+- [121] HashiCorp. Terraform CLI: `validate` command（静态一致性检查不访问远端服务）. https://developer.hashicorp.com/terraform/cli/commands/validate（2026-08-21 访问）（v1.17 secret-free 静态校验——无 `--probe` 的 validate/dry-run 不读任何 key value——的形态背书）
+
+- [122] Astral. Ruff Configuration（配置内相对路径相对 project root 解析）. https://docs.astral.sh/ruff/configuration/（2026-08-21 访问）（v1.17 project-root 相对路径解析——project TOML 内路径不受调用 cwd 影响——的配置工程先例）
+
+- [123] Python Software Foundation. `importlib` — The implementation of import（`spec_from_file_location` 的文件路径模块加载面）. https://docs.python.org/3/library/importlib.html（2026-08-21 访问）（v1.17 `path.py:function` hook 加载依据：按文件路径加载模块、不改 `sys.path`、不依赖 cwd）
+
+- [124] RFC 5545: Internet Calendaring and Scheduling Core Object Specification (iCalendar). https://www.rfc-editor.org/rfc/rfc5545.html（2026-08-21 访问）（recurrence 必须由 end/count 有限化、时间类型一致——v1.17 有限 schedule 必填 start/end 并删除隐式 horizon 的设计依据；完整 RRULE、IANA timezone 与 DST 为 v1.17 非目标，8.1）
+
+- [125] Hypothesis. Settings / API reference（satisfying target、discard 与 bounded generation 的分离观测）. https://hypothesis.readthedocs.io/en/latest/reference/api.html（2026-08-21 访问）（v1.17 quota 的 target / delivered / attempts 三字段分立记账——目标数、实交数与尝试数禁止混称——的观测形态背书）
+
+- [126] Synthea: Synthetic Patient Generation Simulator（module/schema 驱动的结构化合成记录）. https://github.com/synthetichealth/synthea（2026-08-21 访问）（v1.17 structured noise 复用帧类 generate instruction 与 JSON Schema、truth 保留其 frame class 的合成工程先例）
+
+- [127] Simod: automated discovery of business process simulation models（配置驱动过程模拟与 configuration-relative path）. https://github.com/AutomatedProcessImprovement/Simod（2026-08-21 访问）（v1.17 场景配置驱动时间规划的同类工具形态；论文本体见 [101]）

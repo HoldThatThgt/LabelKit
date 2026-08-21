@@ -2,7 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Literal, Mapping, Sequence
+
+if TYPE_CHECKING:
+    # 仅类型检查期导入——运行期禁止：scenario 包的 __init__ → quota.py 会反向导入
+    # 本模块的 apportion_tiers，config.model 顶层 import scenario 即成环（探针实测）。
+    # spec 对象的运行期构造落在 _sections（解析层）与 _generate_stream_constraints
+    # （ScenarioConfig 装配层），两侧经「先 config.model 后 scenario」的导入序天然安全。
+    from labelkit.common.extensions.hooks import ValidationHooks
+    from labelkit.common.runtime.scenario.model import ScenarioPlan
 
 
 # ── config.toml 侧 ─────────────────────────────────────────────────────────
@@ -79,16 +87,14 @@ class LLMProfile:
                                                   # 升档梯可一路探到 max_image_px
     price_per_mtok_in: float | None = None        # 每百万输入 token 单价（仅用于报告估算）
     price_per_mtok_out: float | None = None       # 每百万输出 token 单价（同上）
-    api_key: str = field(default="", repr=False)  # 由 M1 从环境变量解析；**绝不**入日志
-                                                  # （冻结面 [FROZEN HERE]）
     api_key_envs: tuple[str, ...] = ()            # v1.6 密钥池（spec 3.9.3）：TOML 侧
                                                   # api_key_env/api_key_envs 恰填其一；
                                                   # M1 把**两种**写法都归一进本元组
                                                   # （标量 → 单元素元组）；api_key_env
-                                                  # 镜像第 0 个元素
-    api_keys: tuple[str, ...] = field(default=(), repr=False)
-                                                  # v1.6：与 api_key_envs 对齐的解析值；
-                                                  # **绝不**入日志；api_key 镜像第 0 个元素
+                                                  # 镜像第 0 个元素。v1.17 secret-free：
+                                                  # profile 只保存环境变量**名**——
+                                                  # 密钥值由 run/probe 期的
+                                                  # RuntimeCredentials 物化，绝不入配置
 
 
 @dataclass(frozen=True)
@@ -110,10 +116,9 @@ class EmbeddingProfile:
                                                   # budget = context_window − margin
                                                   # （无输出预留；§7.17 embed_budget）
     dims: int | None = None                       # 若设置，embed() 校验返回维度
-    api_key: str = field(default="", repr=False)  # 由 M1 从环境变量解析
     api_key_envs: tuple[str, ...] = ()            # v1.6 密钥池——归一规则同
-                                                  # LLMProfile.api_key_envs
-    api_keys: tuple[str, ...] = field(default=(), repr=False)   # v1.6；**绝不**入日志
+                                                  # LLMProfile.api_key_envs；v1.17
+                                                  # secret-free：只保存环境变量名
 
 
 # ── project.toml 侧 ────────────────────────────────────────────────────────
@@ -307,40 +312,8 @@ class QualityConfig:
 class GenerateStyle:
     """生成风格表的一项：风格名 + 风格提示（spec 5.2）。"""
 
-    name: str                                     # 表内唯一
-    prompt: str                                   # 非空
-
-
-@dataclass(frozen=True)
-class CorrelationSpec:
-    """v1.16 序列规则的类型敏感相等关联条件。"""
-
-    operator: Literal["equal"] = "equal"         # 关联操作符，首版只允许 equal
-    source_field: str = ""                        # source 帧类 Schema 的顶层属性名
-    target_field: str = ""                        # target 帧类 Schema 的顶层属性名
-
-
-@dataclass(frozen=True)
-class SequenceRuleSpec:
-    """v1.16 一条序列规则的冻结配置镜像。"""
-
-    template: str                                  # 15 个 DECLARE 模板之一
-    frame_class: str | None = None                # 一元模板的帧类
-    source: str | None = None                      # 二元模板的 source 帧类
-    target: str | None = None                      # 二元模板的 target 帧类
-    count: int | None = None                       # existence/absence/exactly 的正整数
-    time_s: tuple[float, float] | None = None      # 半开秒区间 [lo, hi)
-    correlation: CorrelationSpec | None = None     # 可选的 typed equality 条件
-
-
-@dataclass(frozen=True)
-class SequenceWindowSpec:
-    """v1.16 一条帧类日历窗口的冻结配置镜像。"""
-
-    frame_class: str                              # 被约束的帧类
-    of_day: tuple[tuple[str, str], ...]            # 同日半开墙钟窗口表
-    of_week: tuple[str, ...] = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-                                                   # 允许的星期，缺省为全周
+    name: str                                      # 表内唯一
+    prompt: str                                    # 非空
 
 
 @dataclass(frozen=True)
@@ -417,9 +390,10 @@ def effective_tiers(class_tiers: tuple[TierSpec, ...] | None,
     return global_tiers if class_tiers is None else class_tiers
 
 
-def effective_rules(class_rules: tuple[SequenceRuleSpec, ...] | None,
-                    global_rules: tuple[SequenceRuleSpec, ...]) -> tuple[SequenceRuleSpec, ...]:
-    """v1.16 按类 rules 的三态整表查找。
+def effective_frame_rules(
+        class_rules: tuple[FrameRuleSpec, ...] | None,
+        global_rules: tuple[FrameRuleSpec, ...]) -> tuple[FrameRuleSpec, ...]:
+    """v1.17 按类 frame_rules 的三态整表查找（v1.16 rules 语义原样换名）。
 
     @param class_rules 按类声明的整张表；``None`` 表示继承，空元组表示显式清空
     @param global_rules 全局整张规则表
@@ -428,53 +402,137 @@ def effective_rules(class_rules: tuple[SequenceRuleSpec, ...] | None,
     return global_rules if class_rules is None else class_rules
 
 
-def effective_windows(class_windows: tuple[SequenceWindowSpec, ...] | None,
-                      global_windows: tuple[SequenceWindowSpec, ...]) -> tuple[SequenceWindowSpec, ...]:
-    """v1.16 按类 windows 的三态整表查找。
+def effective_frame_windows(
+        class_windows: tuple[FrameWindowSpec, ...] | None,
+        global_windows: tuple[FrameWindowSpec, ...]) -> tuple[FrameWindowSpec, ...]:
+    """v1.17 按类 frame_windows 的三态整表查找（v1.16 windows 语义原样换名）。
 
-    @param class_windows 按类声明的整张表；``None`` 表示继承，空元组表示显式清空
+    @param class_windows 按类声明的整张窗口表；``None`` 表示继承，空元组表示显式清空
     @param global_windows 全局整张窗口表
     @return 该序列类的生效窗口表
     """
     return global_windows if class_windows is None else class_windows
 
 
+def effective_sequence_rules(
+        class_rules: tuple[SequenceRuleSpec, ...] | None,
+        global_rules: tuple[SequenceRuleSpec, ...]) -> tuple[SequenceRuleSpec, ...]:
+    """v1.17 按类 sequence_rules 的三态整表查找。"""
+    return global_rules if class_rules is None else class_rules
+
+
+def render_constraint_text(rules: Sequence[FrameRuleSpec],
+                           windows: Sequence[FrameWindowSpec]) -> str:
+    """把生效 frame rule 与 frame window 渲染为内容模型可读的稳定约束文本。
+
+    v1.17 落点说明（裁决记录）：``render_constraint_text`` 是 M1 静态预算预检与
+    M6 brief/realize 提示词（CONTRACTS §10.17/§10.18）共用的纯函数；分层纪律不许
+    common 依赖 operators，故与 ``apportion_tiers`` 同款落 common/config/model.py
+    （M6/M10 反向导入）。spec 载体自 v1.17 起为 scenario.model 的 µs 域
+    ``FrameRuleSpec``/``FrameWindowSpec``，秒值与墙钟文本由本函数从 µs 换算渲染。
+
+    @param rules 生效的 frame rule 序列（声明序）
+    @param windows 生效的 frame window 序列（声明序）
+    @return 稳定约束文本；无规则和窗口时返回 ``"none"``
+    """
+
+    def _seconds(us: int) -> str:
+        """微秒 → 秒文本（整数值省小数位，保持 v1.16 观感）。"""
+        value = us / 1_000_000
+        return str(int(value)) if value == int(value) else f"{value:g}"
+
+    def _clock(us: int) -> str:
+        """日内微秒偏移 → HH:MM[:SS[.ffffff]] 墙钟文本。"""
+        total, micros = divmod(us, 1_000_000)
+        hour, rest = divmod(total, 3600)
+        minute, second = divmod(rest, 60)
+        text = f"{hour:02d}:{minute:02d}"
+        if second or micros:
+            text += f":{second:02d}"
+        if micros:
+            text += f".{micros:06d}".rstrip("0")
+        return text
+
+    lines: list[str] = []
+    for rule in rules:
+        fields = [f"template={rule.template}"]
+        if rule.name:
+            fields.insert(0, f"name={rule.name}")
+        fields.extend(f"{name}={value}" for name, value in (
+            ("frame_class", rule.frame_class), ("source", rule.source),
+            ("target", rule.target), ("count", rule.count),
+        ) if value is not None)
+        if rule.time_us is not None:
+            fields.append(f"time_s=[{_seconds(rule.time_us[0])}, "
+                          f"{_seconds(rule.time_us[1])}) 秒")
+        line = "规则：" + "；".join(fields)
+        if rule.correlation is not None:
+            corr = rule.correlation
+            if rule.template in {"not_co_existence", "not_succession"}:
+                line += (f"；correlation=equal，禁止 source.{corr.source_field} 与 "
+                         f"target.{corr.target_field} 的 JSON 类型及值相同；若该 "
+                         "occurrence 对同时满足其他结构与时间条件，则该对违规")
+            else:
+                line += (f"；correlation=equal，source.{corr.source_field} 与 "
+                         f"target.{corr.target_field} 的 JSON 类型及值必须相同")
+        lines.append(line)
+    for window in windows:
+        name = f"name={window.name}；" if window.name else ""
+        of_day = ", ".join(
+            f'[{_clock(start)}, {_clock(end)})' for start, end in window.of_day_us)
+        weekdays = (None, "mon", "tue", "wed", "thu", "fri", "sat", "sun")
+        of_week = ", ".join(weekdays[index] for index in window.of_week)
+        lines.append(f"窗口：{name}frame_class={window.frame_class}；"
+                     f"of_day={of_day}；of_week={of_week}")
+    return "\n".join(lines) if lines else "none"
+
+
 @dataclass(frozen=True)
 class GenerateStreamConfig:
-    """v1.13（spec 5.2 [generate.stream]）：generate_only 的时间流形态。
+    """v1.17（SPEC-SP §4.2）：generate_only 的时间流形态。
 
-    LLM 只做蓝图与帧实现两类内容调用，装箱/交叉/噪音/重复/时间戳全部由机械交织器
-    完成。默认关；全关 ⇒ 与 v1.12 字节等价。
+    LLM 只做逐槽位 brief 与帧实现（含 noise 槽位）两类内容调用；quota 求解、session
+    布局、时间戳、noise 槽位与 duplicate 平移全部由 ``compile_scenario`` 在 M1 冻结
+    （``ResolvedConfig.scenario_plan``）。默认关；全关 ⇒ 与 v1.12 字节等价。
+    v1.16 的 ``sessions``/``ts_start``/``noise_instruction``/``rules``/``windows`` 五键
+    已删除——显式书写是定向 CONFIG_ERROR（CONTRACTS §6.3 rule 62）。
     """
 
     enabled: bool = False                         # 形态总开关；true ⇒ generate_only ∧ text
                                                   # ∧ generate.enabled ∧ classify.enabled
                                                   # ∧ stream.order_by = "meta:<字段>"
                                                   # ∧ output.meta_mode != "none"（M1 硬合取）
-    sessions: int = 0                             # 会话数（≥ 1）；交叉会话数 =
-                                                  # Σsequences − sessions，故 M1 要求
-                                                  # sessions ≤ Σsequences ≤ 2 × sessions
-                                                  # （交叉并发度恒 k ∈ {1, 2}）
-    noise_ratio: float = 0.0                      # 噪音帧 / 任务帧 比例，[0,1)；
-                                                  # 噪音帧数 = round(noise_ratio × 任务帧数)
-    noise_instruction: str = ""                   # 噪音帧生成指令；noise_ratio > 0 时必填非空
-    duplicates: int = 0                           # 原样重发的序列条数（0 = 无；≤ Σsequences）
-                                                  # ——重发帧逐字节同源，恒落流尾新会话
+    crossed_sessions: int = 0                     # 交叉 session 数；0 ≤ v ≤ floor(target/2)；
+                                                  # 总 session 恒推导为 target − v（primary =
+                                                  # N−D、单主 = N−2D、交叉 = D；duplicate 尾
+                                                  # session 不计入）
+    noise_ratio: float = 0.0                      # 噪音帧 / 任务帧 比例，[0,1)；目标 =
+                                                  # round(比例 × planned_task_frames)
+                                                  # （ROUND_HALF_EVEN），v1.17 起为精确交付目标
+    duplicates: int = 0                           # 原样重发的序列条数（0 = 无；≤ target）；
+                                                  # source 与时间布局在 planner 前冻结、
+                                                  # 零 LLM，恒落流尾新 session
     frame_gap_s: tuple[float, float] = (5.0, 60.0)
-                                                  # 会话内帧间隔的均匀采样区间（秒）；字段本身
-                                                  # 只承载数值闭区间，不承载条件边界校验。
-                                                  # M1 按路径裁决：v1.15 默认路径，以及仅有
-                                                  # sequence_validator、无实际非零 rules/windows
-                                                  # 前缀的路径，要求 1e-6 ≤ lo ≤ hi < stream.gap_s；
-                                                  # 仅 --limit 后实际非零配额前缀有生效 rules/windows
-                                                  # 的 v1.16 联合路径允许 hi == stream.gap_s。
-    ts_start: str = "2026-01-01T00:00:00Z"        # 时间流起点（ISO-8601；恒不取墙钟——
-                                                  # 同 seed 双跑工件逐字节一致）
+                                                  # 会话内帧起点间隔的闭区间（秒）；M1 按
+                                                  # Decimal(str(·)) 闭区间量化为
+                                                  # [ceil(lo×1e6), floor(hi×1e6)] µs
+    max_attempts_per_slot: int = 3                # 每个 sequence slot 与 noise slot 的独立
+                                                  # 交付预算（≥ 1）；仅 M6 delivery 消费，
+                                                  # 不进入 ScenarioConfig（rule 63）
     tiers: tuple[TierSpec, ...] = ()              # v1.14 档位表（[[generate.stream.tiers]]），
                                                   # 按 tier_rank 升序存放；空元组 = 档位面
-                                                  # 整体不在场（字节等价 v1.13）
-    rules: tuple[SequenceRuleSpec, ...] = ()      # v1.16 全局序列规则表
-    windows: tuple[SequenceWindowSpec, ...] = ()  # v1.16 全局帧类日历窗口表
+                                                  # 整体不在场
+    schedule: ScheduleSpec | None = None          # v1.17 有限半开 schedule（µs 域冻结产物）；
+                                                  # 形态开启时必填（rule 64）
+    quotas: tuple[QuotaSpec, ...] = ()            # v1.17 成功交付 quota 表（双形态互斥）；
+                                                  # 形态开启时 ≥ 1 张且 Σtarget ≥ 1（rule 65）
+    noise_classes: tuple[NoiseClassSpec, ...] = ()    # v1.17 结构化噪音表；
+                                                  # noise_ratio > 0 ⇔ 表非空（rule 69）
+    frame_rules: tuple[FrameRuleSpec, ...] = ()   # v1.17 全局同序列规则表（v1.16 rules 换名，
+                                                  # 每条带必填自然名称 name）
+    frame_windows: tuple[FrameWindowSpec, ...] = ()   # v1.17 全局帧类日历窗口表（v1.16
+                                                  # windows 换名，每条带必填 name）
+    sequence_rules: tuple[SequenceRuleSpec, ...] = ()  # v1.17 跨 sequence 规则表
 
 
 @dataclass(frozen=True)
@@ -494,18 +552,23 @@ class GenerateConfig:
     seed_min_score: float | None = None           # None = 自动（取 quality.threshold，
                                                   # 否则取批内中位数）
     temperature: float = 0.9                      # 生成温度（默认高于判决路径）
-    sample_validator: str | None = None           # v1.5 plan-A 钩子 "module:function"：
-                                                  # fn(text) -> list[str]，样本级过滤
-                                                  # （相似度过滤之前，spec 3.6.2）
-    sequence_validator: str | None = None          # v1.16 序列级钩子 "module:function"
+    sample_validator: str | None = None           # v1.17 钩子引用 "<python-file>:
+                                                  # <attribute-path>"：fn(text) -> list[str]，
+                                                  # 样本级过滤（相似度过滤之前，spec 3.6.2）
+    sequence_validator: str | None = None          # v1.16 起的序列级钩子；v1.17 引用
+                                                  # 统一 "<python-file>:<attribute-path>"
+    scenario_validator: str | None = None          # v1.17 场景交付钩子（SPEC-SP §4.9）：
+                                                  # fn(ScenarioValidationInput) -> list[str]，
+                                                  # candidate 拒绝后同槽位重试
     seed_examples: tuple[str, ...] = ()           # 仅 generate_only 的种子池形态
     standalone_count: int | None = None           # 仅 generate_only 的无种子形态；与
-                                                  # seed_examples 互斥
-    sequences: int = 0                            # v1.13 时间流形态：该类的序列**尝试配额**
-                                                  # （全局设默认、[class.<name>.generate]
-                                                  # 覆盖）；0 = 该类不参与生成
-    len_range: tuple[int, int] = (3, 6)           # v1.13 时间流形态：单序列步数的均匀采样
-                                                  # 区间（1 ≤ lo ≤ hi；类覆盖照常）
+                                                  # seed_examples 互斥；v1.17 起
+                                                  # ``sequences`` 键已删除（rule 62，
+                                                  # 配额改由 [[generate.stream.quotas]] 承载）
+    len_range: tuple[int, int] = (3, 6)           # 时间流形态：单序列步数的**抽取域**
+                                                  # （1 ≤ lo ≤ hi；类覆盖照常；length 在
+                                                  # slot 构建期由 scenario.preference 流
+                                                  # 冻结为 length_target）
 
 
 @dataclass(frozen=True)
@@ -548,16 +611,18 @@ class VerifyConfig:
 class OutputConfig:
     """[output] 节：输出 Schema、_meta 形态与 rejects 详略（spec 5.2）。"""
 
-    schema_path: str | None = None                # schema_path / schema_inline 恰填其一
+    schema_path: str | None = None                # schema_path / schema_inline 恰填其一；
+                                                  # 相对路径相对 project root 解析（v1.17）
     schema_inline: str | None = None              # 内联 JSON Schema 文本
     max_repair_attempts: int = 2                  # Schema 引擎的 L3 修复预算
     repair_llm: str | None = None                 # None = 与调用方同档案
     meta_mode: Literal["inline", "sidecar", "none"] = "inline"      # _meta 落盘形态
     passthrough_fields: tuple[str, ...] = ()      # 从原始行原样透传到输出的字段
     rejects: Literal["none", "refs", "full"] = "refs"       # rejects 通道的详略档位
-    validator: str | None = None                  # v1.5 plan-A 钩子 "module:function"：
-                                                  # fn(obj, record|None) -> list[str]，
-                                                  # engine L2.5（仅用户 Schema，spec 3.8.2）
+    validator: str | None = None                  # v1.17 钩子引用 "<python-file>:
+                                                  # <attribute-path>"：fn(obj, record|None)
+                                                  # -> list[str]，engine L2.5（仅用户
+                                                  # Schema，spec 3.8.2）
 
 
 @dataclass(frozen=True)
@@ -626,11 +691,15 @@ class ClassView:
                                                   # 档位不改变任何调用数，dry-run 的按类覆盖
                                                   # 注记不应因它触发（裁决·note 行不因档位
                                                   # 触发）
-    rules: tuple[SequenceRuleSpec, ...] | None = None
-                                                  # v1.16：按类 rules；None = 继承全局，
+    frame_rules: tuple[FrameRuleSpec, ...] | None = None
+                                                  # v1.17：按类 frame_rules（v1.16 rules
+                                                  # 整表换名）；None = 继承全局，
                                                   # 空元组 = 显式清空
-    windows: tuple[SequenceWindowSpec, ...] | None = None
-                                                  # v1.16：按类 windows；三态同 rules
+    frame_windows: tuple[FrameWindowSpec, ...] | None = None
+                                                  # v1.17：按类 frame_windows；三态同
+                                                  # frame_rules
+    sequence_rules: tuple[SequenceRuleSpec, ...] | None = None
+                                                  # v1.17：按类 sequence_rules；三态整表
 
 
 # ── 帧粒度（v1.12，spec §3.1 [frame.classify]/[frame.annotate]/[frame.class.*]）──
@@ -695,16 +764,32 @@ class FrameClassView:
                                                   # （至多其一的 schema_path/schema_inline）；
                                                   # None = 纯文本帧（帧内容直取文本）
     time_fields: Mapping[str, str] | None = None  # v1.14（裁决·绑定即剔除）：时间语义字段
-                                                  # 绑定表（[frame.class.<name>.generate
-                                                  # .time_fields]）——键 = 生成 Schema 顶层
-                                                  # 字段名, 值 ∈ 语义词表 {ts, gap_prev_s,
-                                                  # gap_next_s, elapsed_s}; 绑定字段从
-                                                  # LLM 面向的逐位 Schema 与契约行中剔除,
-                                                  # 值由机械回填尾声按已铺时间轴写回。
-                                                  # None = 无绑定
+                                                  # v1.17 duration/resource 规划域
+    duration_us: tuple[int, int] | None = None
+    resources: tuple[str, ...] = ()
 
 
 # ── CLI 覆盖项与总聚合 ──────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ResolvedPaths:
+    """运行涉及的全部绝对路径（v1.17 SPEC-SP §5.1 / CONTRACTS §7.19.2 冻结块）。
+
+    由 M1 在装载期一次派生；未启用的通道为 None，绝不写相对路径。project_root =
+    ``Path(project_path).resolve().parent``，在 project TOML 读取成功后立即冻结。
+    """
+
+    project: str                                  # project.toml 绝对路径
+    project_root: str                             # 工程根目录绝对路径
+    input: str | None                             # 生效输入（process 模式；绝对）
+    output: str                                   # 生效主输出（绝对）
+    report: str                                   # live "<stem>.report.json" / dry-run
+                                                  # "<stem>.dryrun.report.json"（绝对）
+    rejects: str | None                           # "<stem>.rejects.jsonl"；通道关闭为 None
+    sidecar: str | None                           # "<stem>.meta.jsonl"；非 sidecar 形态为 None
+    trace: str | None                             # 追踪文件（绝对）；通道关闭为 None
+    stream_artifact: str | None                   # "<stem>.stream.jsonl"；形态关闭为 None
+
 
 @dataclass(frozen=True)
 class CliOverrides:
@@ -771,3 +856,17 @@ class ResolvedConfig:
                                                   # v1.13：时间流生成形态（默认关 = 字节等价
                                                   # v1.12；沿用 v1.12 帧粒度四字段的
                                                   # 「尾部追加带默认」惯例）
+    paths: ResolvedPaths | None = None
+                                                  # v1.17（SPEC-SP §5.1）：全部绝对路径的
+                                                  # 冻结 parse product。带默认值是**刻意
+                                                  # 设计**——全仓直接构造 ResolvedConfig 的
+                                                  # 测试 fixture 在迁移波保持绿；生产 loader
+                                                  # 恒显式填充
+    validation_hooks: "ValidationHooks | None" = None
+                                                  # v1.17（SPEC-SP §4.9）：四个校验钩子的
+                                                  # 冻结载体（M1 解析一次；report/trace/
+                                                  # digest 只允许 reference）；同上默认 None
+    scenario_plan: "ScenarioPlan | None" = None
+                                                  # v1.17：ScenarioPlan 冻结编译产物；
+                                                  # scenario 包由后续 wave 落地，此处仅
+                                                  # TYPE_CHECKING 字符串注解，不得 import

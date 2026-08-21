@@ -2,7 +2,6 @@
 
 from labelkit.orchestration.factory import build_stages
 from labelkit.orchestration.orchestrator import Orchestrator, RunServices, RunSummary
-from labelkit.orchestration.profile_usage import referenced_profiles
 from labelkit.orchestration.runtime import (
     execute_run,
     probe_referenced_profiles,
@@ -16,6 +15,5 @@ __all__ = [
     "build_stages",
     "execute_run",
     "probe_referenced_profiles",
-    "referenced_profiles",
     "validate_project",
 ]

@@ -6,8 +6,11 @@ spec 3.1.4 的表行次序对齐。
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
+import math
+import re
 from typing import Any, Literal
 
 from labelkit.common.config._collect import (
@@ -44,9 +47,6 @@ from labelkit.common.config.model import (
     LLMProfile,
     OutputConfig,
     QualityConfig,
-    CorrelationSpec,
-    SequenceRuleSpec,
-    SequenceWindowSpec,
     SegmentConfig,
     StitchConfig,
     StreamConfig,
@@ -70,13 +70,21 @@ _STREAM_FORBIDDEN_GEN_KEYS = ("seed_examples", "standalone_count",
 # 按类生成节的同族禁设键(num_per_record 在本形态从白名单语义中除名)。
 _STREAM_FORBIDDEN_CLASS_GEN_KEYS = ("num_per_record", "seeds_per_call")
 
-# [generate.stream].ts_start 缺省: 恒不取墙钟(同 seed 双跑工件逐字节一致)。
-_TS_START_DEFAULT = "2026-01-01T00:00:00Z"
+# v1.17 删除键(CONTRACTS §6.3 rule 62): 定向 CONFIG_ERROR 只指向新表达, 不读取旧值、
+# 不转换。解析层无条件报错——这些键已从配置语言整体移除, 与形态开关无关。
+_DELETED_STREAM_KEYS = {
+    "sessions": "[generate.stream].crossed_sessions (total sessions are derived)",
+    "ts_start": "[generate.stream].schedule.start / schedule.end",
+    "noise_instruction": "[[generate.stream.noise]] (per-noise-class table)",
+    "rules": "[[generate.stream.frame_rules]]",
+    "windows": "[[generate.stream.frame_windows]]",
+}
 
-_SEQUENCE_TEMPLATES = (
+_FRAME_TEMPLATES = (
     "existence", "absence", "exactly", "init", "end", "responded_existence",
     "co_existence", "response", "precedence", "succession", "alternate_response",
     "chain_response", "chain_precedence", "not_co_existence", "not_succession",
+    "contains",
 )
 _SEQUENCE_WEEKDAYS = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
 
@@ -594,8 +602,8 @@ def _parse_tiers(col: _Collector, file: str, raw: Any,
     return tuple(sorted(tiers, key=lambda spec: spec.tier_rank))
 
 
-def _parse_time_s(t: _Tbl, key: str) -> tuple[float, float] | None:
-    """解析规则的半开秒区间并确认端点可精确量化到微秒。"""
+def _parse_time_us(t: _Tbl, key: str) -> tuple[int, int] | None:
+    """解析规则 time_s 的半开秒区间并量化为无损整数微秒 [lo, hi)。"""
     raw = t.take(key)
     if raw is _MISSING:
         return None
@@ -614,14 +622,32 @@ def _parse_time_s(t: _Tbl, key: str) -> tuple[float, float] | None:
         t.err(key, expected, raw)
         return None
     lo_us, hi_us = (int(value) for value in decimals)
-    if lo_us < 1 or lo_us >= hi_us:
-        t.err(key, "non-empty half-open range [lo, hi) with 1 microsecond <= lo < hi", raw)
+    if lo_us < 0 or lo_us >= hi_us:
+        t.err(key, "half-open range [lo, hi) with 0 <= lo < hi in microsecond precision",
+              raw)
         return None
-    return float(raw[0]), float(raw[1])
+    return lo_us, hi_us
 
 
-def _parse_correlation(t: _Tbl, key: str) -> CorrelationSpec | None:
-    """解析规则的 typed correlation inline table。"""
+def _parse_clock_us(col: _Collector, loc: str, value: str) -> int | None:
+    """把一个 HH:MM[:SS[.ffffff]] 墙钟字符串转换为日内微秒偏移。"""
+    import re
+    match = re.fullmatch(r"(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?", value)
+    if match is None:
+        col.error(f"{loc}: expected HH:MM, HH:MM:SS or microsecond-precision wall-clock time, got {_fmt(value)}")
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    second = int(match.group(3) or 0)
+    micros = int((match.group(4) or "").ljust(6, "0") or 0)
+    if hour > 23 or minute > 59 or second > 59:
+        col.error(f"{loc}: expected a valid same-day wall-clock time, got {_fmt(value)}")
+        return None
+    return ((hour * 60 + minute) * 60 + second) * 1_000_000 + micros
+
+
+    """解析 frame rule 的 typed correlation inline table（v1.17 无 operator 键）。"""
+    from labelkit.common.runtime.scenario.model import CorrelationSpec
+
     raw = t.take(key)
     if raw is _MISSING:
         return None
@@ -630,51 +656,139 @@ def _parse_correlation(t: _Tbl, key: str) -> CorrelationSpec | None:
         t.col.error(f"{t.file}:{loc}: expected table, got {_fmt(raw)}")
         return None
     nested = _Tbl(t.col, t.file, loc, raw)
-    operator = nested.get_str("operator", None, required=True, enum=("equal",))
     source_field = nested.get_str("source_field", None, required=True, nonempty=True)
     target_field = nested.get_str("target_field", None, required=True, nonempty=True)
     nested.finish()
-    if operator is None or source_field is None or target_field is None:
+    if "operator" in raw:
+        t.col.error(f"{t.file}:{loc}.operator: unknown key - v1.17 correlation is "
+                    f"equal-only, declare source_field / target_field only")
+    if source_field is None or target_field is None:
         return None
-    return CorrelationSpec(operator=operator, source_field=source_field,
-                           target_field=target_field)
+    return CorrelationSpec(source_field=source_field, target_field=target_field)
 
 
-def _parse_sequence_rules(col: _Collector, file: str, raw: Any,
-                          header: str) -> tuple[SequenceRuleSpec, ...]:
-    """解析 ``rules`` 数组，跨字段模板语义留给约束簇。"""
+def _parse_natural_name(table: _Tbl, loc: str) -> str | None:
+    """解析规则/窗口/quota 行的必填自然名称（[a-z0-9_]+）。"""
+    name = table.get_str("name", None, required=True, nonempty=True)
+    if name is not None and not _KEY_RE.match(name):
+        table.col.error(f"{table.file}:{loc}.name: expected a match of [a-z0-9_]+, "
+                        f"got {_fmt(name)}")
+        return None
+    return name
+
+
+def _parse_correlation(t: _Tbl, key: str) -> Any | None:
+    """解析 typed correlation；v1.17 仅允许 source_field/target_field。"""
+    from labelkit.common.runtime.scenario.model import CorrelationSpec
+    raw = t.take(key)
+    if raw is _MISSING:
+        return None
+    loc = f"{t.label}.{key}"
+    if not isinstance(raw, dict):
+        t.col.error(f"{t.file}:{loc}: expected table, got {_fmt(raw)}")
+        return None
+    nested = _Tbl(t.col, t.file, loc, raw)
+    source = nested.get_str("source_field", None, required=True, nonempty=True)
+    target = nested.get_str("target_field", None, required=True, nonempty=True)
+    nested.finish()
+    if "operator" in raw:
+        t.col.error(f"{t.file}:{loc}.operator: unknown key - v1.17 correlation is equal-only")
+    if source is None or target is None:
+        return None
+    return CorrelationSpec(source_field=source, target_field=target)
+def _parse_frame_rules(col: _Collector, file: str, raw: Any,
+                       header: str) -> tuple[Any, ...]:
+    """解析 ``frame_rules`` 数组（每条必填 name；µs 域产物），跨字段语义留给约束簇。"""
+    from labelkit.common.runtime.scenario.model import FrameRuleSpec
+
     if raw is _MISSING:
         return ()
     if not isinstance(raw, list):
         parent, _, key = header.strip("[]").rpartition(".")
-        col.error(f"{file}:[{parent}].{key}: expected array of tables, got {_fmt(raw)}")
+        col.error(f"{file}:[{parent}].{key}: expected array of tables, "
+                  f"got {_fmt(raw)}")
         return ()
-    rules: list[SequenceRuleSpec] = []
+    rules: list[FrameRuleSpec] = []
     for index, row in enumerate(raw, 1):
         label = f"{header}[{index}]"
         if not isinstance(row, dict):
             col.error(f"{file}:{label}: expected table, got {_fmt(row)}")
             continue
         table = _Tbl(col, file, label, row)
+        name = _parse_natural_name(table, label)
         template = table.get_str("template", None, required=True,
-                                 enum=_SEQUENCE_TEMPLATES)
+                                 enum=_FRAME_TEMPLATES)
         frame_class = table.get_str("frame_class", None, nonempty=True)
         source = table.get_str("source", None, nonempty=True)
         target = table.get_str("target", None, nonempty=True)
         count = table.get_int("count", None, minimum=1)
-        time_s = _parse_time_s(table, "time_s")
+        time_us = _parse_time_us(table, "time_s")
         correlation = _parse_correlation(table, "correlation")
         table.finish()
-        if template is not None:
-            rules.append(SequenceRuleSpec(template=template, frame_class=frame_class,
-                                          source=source, target=target, count=count,
-                                          time_s=time_s, correlation=correlation))
+        if template is not None and name is not None:
+            rules.append(FrameRuleSpec(name=name, template=template,
+                                       frame_class=frame_class, source=source,
+                                       target=target, count=count, time_us=time_us,
+                                       correlation=correlation))
     return tuple(rules)
 
 
-def _parse_day_ranges(col: _Collector, file: str, label: str,
-                      raw: Any) -> tuple[tuple[str, str], ...]:
-    """解析一个窗口表的同日半开时间分支。"""
+def _parse_half_open_time_us(t: _Tbl, key: str) -> tuple[int, int] | None:
+    """解析半开微秒区间；sequence rule 与 frame rule 共用。"""
+    return _parse_time_us(t, key)
+
+
+def _parse_sequence_rules(col: _Collector, file: str, raw: Any,
+                          header: str) -> tuple[Any, ...]:
+    """解析跨 sequence 的四类 DECLARE 规则。"""
+    from labelkit.common.runtime.scenario.model import SequenceRuleSpec
+    if raw is _MISSING:
+        return ()
+    if not isinstance(raw, list):
+        col.error(f"{file}:{header}: expected array of tables, got {_fmt(raw)}")
+        return ()
+    result = []
+    for index, row in enumerate(raw, 1):
+        label = f"{header}[{index}]"
+        if not isinstance(row, dict):
+            col.error(f"{file}:{label}: expected table, got {_fmt(row)}")
+            continue
+        t = _Tbl(col, file, label, row)
+        name = _parse_natural_name(t, label)
+        template = t.get_str("template", None, required=True,
+                             enum=("precedence", "response", "succession", "not_co_existence"))
+        source = t.get_str("source", None, required=True, nonempty=True)
+        target = t.get_str("target", None, required=True, nonempty=True)
+        period = t.get_str("period", "day", enum=("day", "week", "schedule"))
+        gap = _parse_half_open_time_us(t, "gap_s")
+        t.finish()
+        if name and template and source and target and period:
+            result.append(SequenceRuleSpec(name=name, template=template, source=source,
+                                           target=target, period=period, gap_us=gap))
+    return tuple(result)
+
+
+def _parse_clock_us(col: _Collector, loc: str, value: str) -> int | None:
+    """把一个 HH:MM[:SS[.ffffff]] 墙钟字符串转换为日内微秒偏移。"""
+    import re
+
+    match = re.fullmatch(r"(\d{2}):(\d{2})(?::(\d{2})(?:\.(\d{1,6}))?)?", value)
+    if match is None:
+        col.error(f"{loc}: expected HH:MM, HH:MM:SS or microsecond-precision "
+                  f"wall-clock time, got {_fmt(value)}")
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2))
+    second = int(match.group(3) or 0)
+    micros = int((match.group(4) or "").ljust(6, "0") or 0)
+    if hour > 23 or minute > 59 or second > 59:
+        col.error(f"{loc}: expected a valid same-day wall-clock time, got {_fmt(value)}")
+        return None
+    return ((hour * 60 + minute) * 60 + second) * 1_000_000 + micros
+
+
+def _parse_day_ranges_us(col: _Collector, file: str, label: str,
+                         raw: Any) -> tuple[tuple[int, int], ...]:
+    """解析一个窗口表的同日半开时间分支并量化为微秒。"""
     expected = "a non-empty array of [start, end] time strings"
     if raw is _MISSING:
         col.error(f"{file}:{label}: missing required key, expected {expected}")
@@ -682,7 +796,7 @@ def _parse_day_ranges(col: _Collector, file: str, label: str,
     if not isinstance(raw, list) or not raw:
         col.error(f"{file}:{label}: expected {expected}, got {_fmt(raw)}")
         return ()
-    ranges: list[tuple[str, str]] = []
+    ranges: list[tuple[int, int]] = []
     for index, item in enumerate(raw, 1):
         item_label = f"{label}[{index}]"
         if (not isinstance(item, list) or len(item) != 2
@@ -690,52 +804,245 @@ def _parse_day_ranges(col: _Collector, file: str, label: str,
             col.error(f"{file}:{item_label}: expected [start, end] string pair, got "
                       f"{_fmt(item)}")
             continue
-        ranges.append((item[0], item[1]))
+        start = _parse_clock_us(col, f"{file}:{item_label}[1]", item[0])
+        end = _parse_clock_us(col, f"{file}:{item_label}[2]", item[1])
+        if start is not None and end is not None:
+            ranges.append((start, end))
     return tuple(ranges)
 
 
-def _parse_sequence_windows(col: _Collector, file: str, raw: Any,
-                            header: str) -> tuple[SequenceWindowSpec, ...]:
-    """解析 ``windows`` 数组，日历值与重复/重叠留给约束簇。"""
+def _parse_frame_windows(col: _Collector, file: str, raw: Any,
+                         header: str) -> tuple[Any, ...]:
+    """解析 ``frame_windows`` 数组（每条必填 name），重叠/跨午夜留给约束簇。"""
+    from labelkit.common.runtime.scenario.calendar import of_week_from_words
+    from labelkit.common.runtime.scenario.model import FrameWindowSpec
+
     if raw is _MISSING:
         return ()
     if not isinstance(raw, list):
         parent, _, key = header.strip("[]").rpartition(".")
-        col.error(f"{file}:[{parent}].{key}: expected array of tables, got {_fmt(raw)}")
+        col.error(f"{file}:[{parent}].{key}: expected array of tables, "
+                  f"got {_fmt(raw)}")
         return ()
-    windows: list[SequenceWindowSpec] = []
+    windows: list[FrameWindowSpec] = []
     for index, row in enumerate(raw, 1):
         label = f"{header}[{index}]"
         if not isinstance(row, dict):
             col.error(f"{file}:{label}: expected table, got {_fmt(row)}")
             continue
         table = _Tbl(col, file, label, row)
+        name = _parse_natural_name(table, label)
         frame_class = table.get_str("frame_class", None, required=True, nonempty=True)
         day_raw = table.take("of_day")
-        of_day = _parse_day_ranges(col, file, f"{label}.of_day", day_raw)
-        of_week = table.get_str_tuple("of_week", _SEQUENCE_WEEKDAYS,
-                                      elem_enum=_SEQUENCE_WEEKDAYS)
+        of_day = _parse_day_ranges_us(col, file, f"{label}.of_day", day_raw)
+        words = table.get_str_tuple("of_week", _SEQUENCE_WEEKDAYS,
+                                    elem_enum=_SEQUENCE_WEEKDAYS)
         table.finish()
-        if frame_class is not None and of_day:
-            windows.append(SequenceWindowSpec(frame_class=frame_class, of_day=of_day,
-                                              of_week=of_week))
+        try:
+            of_week = of_week_from_words(words)
+        except ValueError:
+            of_week = ()
+        if frame_class is not None and name is not None and of_day:
+            windows.append(FrameWindowSpec(name=name, frame_class=frame_class,
+                                           of_day_us=of_day, of_week=of_week))
     return tuple(windows)
+
+
+def _parse_schedule(col: _Collector, file: str, raw: Any) -> Any | None:
+    """解析 ``[generate.stream.schedule]`` 三键并冻结为 µs 域 ``ScheduleSpec``。
+
+    start/end 必带显式 ``Z`` 或 numeric offset 且同 offset、end > start；
+    exclude_dates 不得重复且不得落在 schedule 本地日范围之外（fail-fast）。
+
+    @param col 错误聚合器
+    @param file project.toml 路径字符串
+    @param raw ``[generate.stream].schedule`` 原始子表
+    @return 冻结的 ``ScheduleSpec``；形状失败时 None（错误已聚合）
+    """
+    from labelkit.common.runtime.scenario.calendar import (
+        out_of_range_exclusions,
+        parse_schedule_spec,
+    )
+    from labelkit.common.runtime.scenario.model import ScheduleSpec
+
+    if raw is _MISSING:
+        return None
+    if not isinstance(raw, dict):
+        col.error(f"{file}:[generate.stream.schedule]: expected table, got {_fmt(raw)}")
+        return None
+    t = _Tbl(col, file, "[generate.stream.schedule]", raw)
+    start = t.get_str("start", None, required=True, nonempty=True)
+    end = t.get_str("end", None, required=True, nonempty=True)
+    exclude = t.get_str_tuple("exclude_dates", ())
+    t.finish()
+    if start is None or end is None:
+        return None
+    try:
+        spec: ScheduleSpec = parse_schedule_spec(start, end, exclude)
+    except ValueError as exc:
+        col.error(f"{file}:[generate.stream.schedule]: {exc}")
+        return None
+    outside = out_of_range_exclusions(spec)
+    if outside:
+        col.error(f"{file}:[generate.stream.schedule].exclude_dates: entries outside "
+                  f"the schedule's local-date range are a directed config error "
+                  f"(fail-fast, never silently ignored), got {_fmt(list(outside))}")
+        return None
+    return spec
+
+
+def _parse_quotas(col: _Collector, file: str, raw: Any) -> tuple[Any, ...]:
+    """解析 ``[[generate.stream.quotas]]`` 双形态表（exact counts | integer weights）。"""
+    from labelkit.common.runtime.scenario.calendar import of_week_from_words
+    from labelkit.common.runtime.scenario.model import QuotaSpec
+
+    if raw is _MISSING:
+        return ()
+    if not isinstance(raw, list):
+        col.error(f"{file}:[generate.stream].quotas: expected array of tables, "
+                  f"got {_fmt(raw)}")
+        return ()
+    quotas: list[QuotaSpec] = []
+    for index, row in enumerate(raw, 1):
+        label = f"[[generate.stream.quotas]][{index}]"
+        if not isinstance(row, dict):
+            col.error(f"{file}:{label}: expected table, got {_fmt(row)}")
+            continue
+        t = _Tbl(col, file, label, row)
+        name = _parse_natural_name(t, label)
+        period = t.get_str("period", None, required=True,
+                           enum=("day", "week", "schedule"))
+        words = t.get_str_tuple("of_week", _SEQUENCE_WEEKDAYS,
+                                elem_enum=_SEQUENCE_WEEKDAYS)
+        counts_raw = t.take("counts")
+        total = t.get_int("total", None, minimum=1)
+        weights_raw = t.take("weights")
+        allocation = t.get_str("allocation", None,
+                               enum=("exact", "largest_remainder"))
+        t.finish()
+        if name is None or period is None:
+            continue
+        try:
+            of_week = of_week_from_words(words)
+        except ValueError:
+            of_week = ()
+        counts = _parse_quota_counts(col, file, label, counts_raw)
+        weights = _parse_quota_weights(col, file, label, weights_raw)
+        if counts is None and weights is None:
+            continue
+        quotas.append(QuotaSpec(name=name, period=period, of_week=of_week,
+                                counts=counts, total=total, weights=weights,
+                                allocation=allocation))
+    return tuple(quotas)
+
+
+def _parse_quota_counts(col: _Collector, file: str, label: str,
+                        raw: Any) -> tuple[tuple[str, int], ...] | None:
+    """解析 counts 形态（非空 {sequence_class = integer >= 0}）并裁定互斥。"""
+    if raw is _MISSING:
+        return None
+    if not isinstance(raw, dict) or not raw:
+        col.error(f"{file}:{label}.counts: expected a non-empty "
+                  f"{{sequence_class = integer >= 0}} inline table, got {_fmt(raw)}")
+        return None
+    pairs: list[tuple[str, int]] = []
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            col.error(f"{file}:{label}.counts.{key}: expected an integer >= 0, "
+                      f"got {_fmt(value)}")
+            return None
+        pairs.append((key, value))
+    return tuple(pairs)
+
+
+def _parse_quota_weights(col: _Collector, file: str, label: str,
+                         raw: Any) -> tuple[tuple[str, int], ...] | None:
+    """解析 weights 形态（至少两类正整数）并裁定与 counts 的互斥。"""
+    if raw is _MISSING:
+        return None
+    if not isinstance(raw, dict) or len(raw) < 2:
+        col.error(f"{file}:{label}.weights: expected an inline table of at least two "
+                  f"sequence classes with positive integer weights, got {_fmt(raw)}")
+        return None
+    pairs: list[tuple[str, int]] = []
+    for key, value in raw.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            col.error(f"{file}:{label}.weights.{key}: expected a positive integer, "
+                      f"got {_fmt(value)}")
+            return None
+        pairs.append((key, value))
+    return tuple(pairs)
+
+
+def _parse_noise_classes(col: _Collector, file: str, raw: Any) -> tuple[Any, ...]:
+    """解析 ``[[generate.stream.noise]]`` 表（frame_class + 正整数 weight）。"""
+    from labelkit.common.runtime.scenario.model import NoiseClassSpec
+
+    if raw is _MISSING:
+        return ()
+    if not isinstance(raw, list):
+        col.error(f"{file}:[generate.stream].noise: expected array of tables, "
+                  f"got {_fmt(raw)}")
+        return ()
+    classes: list[NoiseClassSpec] = []
+    for index, row in enumerate(raw, 1):
+        label = f"[[generate.stream.noise]][{index}]"
+        if not isinstance(row, dict):
+            col.error(f"{file}:{label}: expected table, got {_fmt(row)}")
+            continue
+        t = _Tbl(col, file, label, row)
+        frame_class = t.get_str("frame_class", None, required=True, nonempty=True)
+        weight = t.get_int("weight", None, minimum=1)
+        t.finish()
+        if frame_class is None:
+            continue
+        if weight is None:
+            col.error(f"{file}:{label}.weight: required, expected a positive integer")
+            continue
+        classes.append(NoiseClassSpec(frame_class=frame_class, weight=weight))
+    return tuple(classes)
+
+
+def _parse_duration_resources(col: _Collector, file: str, cname: str,
+                              gen_sub: Any) -> tuple[tuple[int, int] | None, tuple[str, ...]]:
+    """解析帧类 duration_s 闭区间及 resources。"""
+    if not isinstance(gen_sub, dict):
+        return None, ()
+    label = f"[frame.class.{cname}.generate]"
+    raw = gen_sub.get("duration_s")
+    duration_us = None
+    if raw is not None:
+        try:
+            if (not isinstance(raw, list) or len(raw) != 2
+                    or any(isinstance(v, bool) or not isinstance(v, (int, float)) for v in raw)):
+                raise ValueError
+            values = [Decimal(str(v)) * Decimal(1_000_000) for v in raw]
+            lo, hi = math.ceil(values[0]), math.floor(values[1])
+            if not all(v.is_finite() for v in values) or values[0] < 1 or lo > hi:
+                raise ValueError
+            duration_us = (lo, hi)
+        except (InvalidOperation, ValueError, OverflowError):
+            col.error(f"{file}:{label}.duration_s: expected finite closed range with 1e-6 <= lo <= hi, got {_fmt(raw)}")
+    raw_resources = gen_sub.get("resources", [])
+    resources: list[str] = []
+    if not isinstance(raw_resources, list):
+        col.error(f"{file}:{label}.resources: expected a string array, got {_fmt(raw_resources)}")
+    else:
+        for index, value in enumerate(raw_resources, 1):
+            if not isinstance(value, str) or not re.fullmatch(r"[a-z0-9_]+", value):
+                col.error(f"{file}:{label}.resources[{index}]: expected a non-empty [a-z0-9_]+ resource name, got {_fmt(value)}")
+            else:
+                resources.append(value)
+    if len(set(resources)) != len(resources):
+        col.error(f"{file}:{label}.resources: resource names must be unique")
+    if resources and duration_us is None:
+        col.error(f"{file}:{label}.resources: non-empty resources require duration_s")
+    return duration_us, tuple(resources)
 
 
 def _parse_time_fields(col: _Collector, file: str, cname: str,
                        gen_sub: Any) -> dict[str, str] | None:
-    """v1.14(裁决·时间字段回填方向): 解析 ``[frame.class.<name>.generate.time_fields]``。
-
-    子表语义是"生成 Schema 顶层字段名 → 语义词表取值"的字符串映射; 此处只做键级类型
-    校验(子表形状 + 逐项取值为字符串), 绑定键与生成 Schema 的对账、词表取值合法性、
-    声明类型字面恰等与剔除余量都留给形态约束簇。
-
-    @param col 错误聚合器
-    @param file 报错定位用的 project.toml 路径字符串
-    @param cname 帧类名
-    @param gen_sub 该帧类的 ``generate`` 覆盖表(非表视作缺省)
-    @return 绑定映射(空表 = 在场但为空); 未声明返回 None
-    """
+    """解析帧类时间字段绑定。"""
     raw = gen_sub.get("time_fields") if isinstance(gen_sub, dict) else None
     if raw is None:
         return None
@@ -743,22 +1050,33 @@ def _parse_time_fields(col: _Collector, file: str, cname: str,
     if not isinstance(raw, dict):
         col.error(f"{file}:{label}: expected table, got {_fmt(raw)}")
         return None
-    bindings: dict[str, str] = {}
+    result = {}
     for key, value in raw.items():
         if not isinstance(value, str):
-            col.error(f"{file}:{label}.{key}: expected string (a time vocabulary term), "
-                      f"got {_fmt(value)}")
-            continue
-        bindings[key] = value
-    return bindings
+            col.error(f"{file}:{label}.{key}: expected string (a time vocabulary term), got {_fmt(value)}")
+        else:
+            result[key] = value
+    return result
+
+
+
+
+
+def _check_deleted_stream_keys(t: _Tbl, raw: dict) -> None:
+    """v1.17 删除键的定向报错（rule 62）：只指向新表达，不读取旧值。"""
+    for key, target in _DELETED_STREAM_KEYS.items():
+        if key in raw:
+            t.seen.add(key)
+            t.col.error(f"{t.file}:[generate.stream].{key}: this key was removed in "
+                        f"v1.17 - use {target} instead")
 
 
 def _parse_generate_stream(col: _Collector, file: str, raw: Any) -> GenerateStreamConfig:
-    """v1.13: 解析 ``[generate.stream]`` 子表(_frame_sub 先例——子表经父表 take 取出)。
+    """v1.17: 解析 ``[generate.stream]`` 子表的全新键面（SPEC-SP §4.2）。
 
-    结构性校验(类型、区间数组形状、内在序关系)在此完成; 跨节与形态相关的约束
-    (sessions ≤ Σsequences、frame_gap 上界、织造上限……)留给形态约束簇——本形态关闭
-    时那些键只是停放配置, 不构成错误。
+    结构性校验（类型、区间数组形状、内在序关系）在此完成; 跨节与形态相关的约束
+    （quota 域、noise 域、schedule 前提……）留给形态约束簇——本形态关闭
+    时那些键只是停放配置, 不构成错误。五删除键无条件定向报错。
 
     @param col 错误聚合器
     @param file 报错定位用的 project.toml 路径字符串
@@ -768,21 +1086,28 @@ def _parse_generate_stream(col: _Collector, file: str, raw: Any) -> GenerateStre
     if raw is not _MISSING and not isinstance(raw, dict):
         col.error(f"{file}:[generate].stream: expected table, got {_fmt(raw)}")
         raw = _MISSING
-    t = _Tbl(col, file, "[generate.stream]", raw if isinstance(raw, dict) else None)
+    table = raw if isinstance(raw, dict) else None
+    t = _Tbl(col, file, "[generate.stream]", table)
+    if table is not None:
+        _check_deleted_stream_keys(t, table)
     cfg = GenerateStreamConfig(
         enabled=t.get_bool("enabled", False),
-        sessions=t.get_int("sessions", 0, minimum=0),
+        crossed_sessions=t.get_int("crossed_sessions", 0, minimum=0),
         noise_ratio=t.get_float("noise_ratio", 0.0),   # [0,1) 由形态约束簇裁定
-        noise_instruction=t.get_str("noise_instruction", "") or "",
         duplicates=t.get_int("duplicates", 0, minimum=0),
         frame_gap_s=_num_pair(t, "frame_gap_s", (5.0, 60.0)),
-        ts_start=t.get_str("ts_start", _TS_START_DEFAULT, nonempty=True) or _TS_START_DEFAULT,
+        max_attempts_per_slot=t.get_int("max_attempts_per_slot", 3, minimum=1),
         tiers=_parse_tiers(col, file, t.take("tiers"),           # v1.14 档位表
                            "[[generate.stream.tiers]]"),
-        rules=_parse_sequence_rules(col, file, t.take("rules"),
-                                    "[[generate.stream.rules]]"),
-        windows=_parse_sequence_windows(col, file, t.take("windows"),
-                                        "[[generate.stream.windows]]"),
+        schedule=_parse_schedule(col, file, t.take("schedule")),
+        quotas=_parse_quotas(col, file, t.take("quotas")),
+        noise_classes=_parse_noise_classes(col, file, t.take("noise")),
+        frame_rules=_parse_frame_rules(col, file, t.take("frame_rules"),
+                                       "[[generate.stream.frame_rules]]"),
+        frame_windows=_parse_frame_windows(col, file, t.take("frame_windows"),
+                                           "[[generate.stream.frame_windows]]"),
+        sequence_rules=_parse_sequence_rules(col, file, t.take("sequence_rules"),
+                                             "[[generate.stream.sequence_rules]]"),
     )
     t.finish()
     return cfg
@@ -1028,12 +1353,20 @@ def _parse_generate_block(col: _Collector, file: str,
                                                  dict[str, bool]]:
     """解析 ``[generate]`` 节及其 ``stream`` 子表, 并采集另一形态禁设键探针。
 
+    v1.17：``sequences`` 键已删除（rule 62）——显式书写是定向 CONFIG_ERROR，配额由
+    ``[[generate.stream.quotas]]`` 承载。
+
     @param col 错误聚合器
     @param file 报错定位用的 project.toml 路径字符串
     @param section 该节原始值
     @return (``GenerateConfig``, ``GenerateStreamConfig``, 禁设键在场探针表)
     """
     t = _Tbl(col, file, "[generate]", section)
+    if "sequences" in (section if isinstance(section, dict) else {}):
+        t.seen.add("sequences")
+        col.error(f"{file}:[generate].sequences: this key was removed in v1.17 - "
+                  f"sequence quotas are carried by [[generate.stream.quotas]] "
+                  f"(rule 62)")
     generate = GenerateConfig(
         enabled=t.get_bool("enabled", False),
         llms=t.get_str_tuple("llms", ("default",)) or ("default",),
@@ -1048,10 +1381,10 @@ def _parse_generate_block(col: _Collector, file: str,
         temperature=t.get_float("temperature", 0.9, bound=_GE0),
         sample_validator=t.get_str("sample_validator", None, nonempty=True),
         sequence_validator=t.get_str("sequence_validator", None, nonempty=True),
+        scenario_validator=t.get_str("scenario_validator", None, nonempty=True),
         seed_examples=t.get_str_tuple("seed_examples", ()),
         standalone_count=t.get_int("standalone_count", None, minimum=1),
-        sequences=t.get_int("sequences", 0, minimum=0),          # v1.13 全局默认配额
-        len_range=_int_pair(t, "len_range", (3, 6)),             # v1.13 全局默认区间
+        len_range=_int_pair(t, "len_range", (3, 6)),          # 全局默认抽取域
     )
     # 区分"显式设置"与"dataclass 默认"以支撑模式规则; v1.13 起同一张表兼作时间流
     # 形态的原始节禁设键探针(四键, _STREAM_FORBIDDEN_GEN_KEYS)。
@@ -1064,10 +1397,7 @@ def _parse_generate_block(col: _Collector, file: str,
     # 合法)必须在表内容非法时也照样上报。
     gen_provided["stream_tiers"] = (isinstance(stream_section, dict)
                                     and "tiers" in stream_section)
-    gen_provided["stream_rules"] = (isinstance(stream_section, dict)
-                                     and "rules" in stream_section)
-    gen_provided["stream_windows"] = (isinstance(stream_section, dict)
-                                       and "windows" in stream_section)
+    gen_provided["stream_section"] = isinstance(stream_section, dict)
     generate_stream = _parse_generate_stream(col, file, stream_section)
     t.finish()
     return generate, generate_stream, gen_provided
@@ -1377,14 +1707,56 @@ def _parse_delivery_family(col: _Collector, file: str, top: _Tbl) -> dict[str, A
     )
 
 
-def _parse_project_file(col: _Collector, file: str, data: dict) -> _Project:
+def _resolve_project_path(value: str | None, root: Path) -> str | None:
+    """v1.17(SPEC-SP §5.1): 把 project TOML 里的相对路径按 project root 绝对化。
+
+    绝对路径原样规范化返回; None / 空串原样返回(占位语义由各消费面解释)。
+
+    @param value 声明路径取值
+    @param root project root(``Path(project_path).resolve().parent``)
+    @return 绝对规范化路径字符串, 或原样 None
+    """
+    if not value:
+        return value
+    path = Path(value)
+    return str(path if path.is_absolute() else (root / path).resolve())
+
+
+def _absolutize_raw_schema_paths(raw: Any, root: Path, gen: bool) -> None:
+    """就地绝对化原始按类节里的 ``schema_path`` 声明值。
+
+    ``[class.<name>.annotate].schema_path``(``gen = false``)与
+    ``[frame.class.<name>.generate].schema_path``(``gen = true``)的值在后续
+    白名单合并/Schema 装载时才被读取; 在此统一按 project root 绝对化, 使所有
+    Schema 消费面拿到的都是绝对路径。键名不变, 白名单校验不受影响。
+
+    @param raw ``[class.*]`` 或 ``[frame.class.*]`` 的原始节字典
+    @param root project root
+    @param gen 是否走 generate 子表的 schema_path 面
+    """
+    if not isinstance(raw, dict):
+        return
+    for sections in raw.values():
+        if not isinstance(sections, dict):
+            continue
+        sub = sections.get("generate" if gen else "annotate")
+        if isinstance(sub, dict) and isinstance(sub.get("schema_path"), str):
+            sub["schema_path"] = _resolve_project_path(sub["schema_path"], root)
+
+
+def _parse_project_file(col: _Collector, file: str, data: dict,
+                        root: Path) -> _Project:
     """解析整份 project.toml, 逐节物化配置对象。
 
     节的解析次序即 spec 3.1.4 的表行次序——报错聚合次序由它决定, 不得调整。
+    v1.17: 四类 schema_path 与显式 trace.path 在此按 ``root``(project root)绝对化;
+    ``run.input``/``run.output`` 的解析留给约束簇(CLI 覆盖先按调用 cwd 解析、
+    再参与 CLI > project 优先级合并, 无法在纯解析期定锚)。
 
     @param col 错误聚合器
     @param file 报错定位用的 project.toml 路径字符串
     @param data 已 TOML 解析的顶层字典
+    @param root project root(相对路径解析基点)
     @return ``_Project``
     """
     top = _Tbl(col, file, "", data)
@@ -1395,4 +1767,14 @@ def _parse_project_file(col: _Collector, file: str, data: dict) -> _Project:
     parts.update(_parse_labeling_family(col, file, top))
     parts.update(_parse_delivery_family(col, file, top))
     top.finish()
+    parts["output"] = replace(parts["output"],
+                              schema_path=_resolve_project_path(
+                                  parts["output"].schema_path, root))
+    parts["trace"] = replace(
+        parts["trace"], path=_resolve_project_path(parts["trace"].path, root) or "")
+    parts["frame_annotate"] = replace(
+        parts["frame_annotate"],
+        schema_path=_resolve_project_path(parts["frame_annotate"].schema_path, root))
+    _absolutize_raw_schema_paths(parts["class_raw"], root, gen=False)
+    _absolutize_raw_schema_paths(parts["frame_class_raw"], root, gen=True)
     return _Project(**parts)

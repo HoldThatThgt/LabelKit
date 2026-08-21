@@ -16,7 +16,8 @@ from labelkit.common.config.model import (
     ExtractConfig, FrameAnnotateConfig, FrameClassifyConfig, GenerateConfig,
     GenerateStreamConfig,
     InputConfig, OutputConfig, QualityConfig,
-    ResolvedConfig, Rubric, RunConfig, SegmentConfig, StitchConfig, StreamConfig,
+    ResolvedConfig, ResolvedPaths, Rubric, RunConfig, SegmentConfig,
+    StitchConfig, StreamConfig,
     ToolConfig,
     TraceConfig, VerifyConfig,
 )
@@ -99,7 +100,23 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
     frame_schema = kw.pop("frame_schema", None)
     # v1.13：时间流形态（默认关 = 字节等价 v1.12）
     generate_stream = kw.pop("generate_stream", GenerateStreamConfig())
+    dry_run = kw.pop("dry_run", False)
     assert not kw, f"unknown overrides: {kw}"
+    # v1.17（SPEC-SP §5.1）：paths 逐字段镜像 M1 的 loader._resolved_paths 派生
+    # 公式（live/dry-run 的 report 后缀由这里一次裁决）——emitter 只消费它。
+    stem = str(Path(output).with_suffix(""))
+    paths = ResolvedPaths(
+        project=str(tmp_path / "project.toml"),
+        project_root=str(tmp_path),
+        input=None,
+        output=output,
+        report=stem + (".dryrun.report.json" if dry_run else ".report.json"),
+        rejects=None if rejects == "none" else stem + ".rejects.jsonl",
+        sidecar=stem + ".meta.jsonl" if meta_mode == "sidecar" else None,
+        trace=None,
+        stream_artifact=(stem + ".stream.jsonl"
+                         if generate_stream.enabled else None),
+    )
     return ResolvedConfig(
         tool=ToolConfig(log_format=log_format),
         console=console,
@@ -137,7 +154,7 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
         user_schema=USER_SCHEMA,
         limit=None,
         strict=False,
-        dry_run=False,
+        dry_run=dry_run,
         config_path="config.toml",
         project_path="project.toml",
         config_digest="sha256:c",
@@ -146,6 +163,7 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
         frame_annotate=frame_annotate,
         frame_schema=frame_schema,
         generate_stream=generate_stream,
+        paths=paths,
     )
 
 
@@ -1556,14 +1574,60 @@ def test_passthrough_empty_gives_empty_object(tmp_path):
 
 def test_dry_run_report_path_is_diverted(tmp_path):
     # P2-4: a rehearsal writes <stem>.dryrun.report.json, never the real ledger.
-    from dataclasses import replace
-    cfg = replace(make_cfg(tmp_path), dry_run=True)
+    cfg = make_cfg(tmp_path, dry_run=True)
     em = Emitter(cfg, engine=None, run_id="a" * 12,
                  run_started_at=datetime.now().astimezone())
     assert str(em._report_path).endswith(".dryrun.report.json")
     em_real = Emitter(make_cfg(tmp_path), engine=None, run_id="a" * 12,
                       run_started_at=datetime.now().astimezone())
     assert str(em_real._report_path).endswith("res.report.json")
+
+
+# ── v1.17（SPEC-SP §5.1）：通道路径只消费 ResolvedPaths，消灭 cwd 二次推导 ─────
+
+
+def test_channel_paths_are_cwd_invariant_via_resolved_paths(tmp_path,
+                                                            monkeypatch):
+    """run.output 是相对诱饵时，五个通道路径仍逐一等于 cfg.paths 的 M1 派生值，
+    且与构造时 cwd 无关（旧实现按 cwd 重解相对 output，会随目录漂移）。"""
+    cfg = make_cfg(tmp_path, meta_mode="sidecar", generate_stream=gs_on())
+    cfg = _dc_replace(
+        cfg, run=_dc_replace(cfg.run, output="out/res.jsonl"))  # 相对诱饵
+    seen = []
+    for cwd in (tmp_path / "cwd-a", tmp_path / "cwd-b"):
+        cwd.mkdir(parents=True, exist_ok=True)
+        monkeypatch.chdir(cwd)
+        em = Emitter(cfg, engine=None, run_id="a" * 12,
+                     run_started_at=datetime.now().astimezone())
+        seen.append((em._output_path, em._report_path, em._rejects_path,
+                     em._sidecar_path, em._artifact_path))
+    assert seen[0] == seen[1]
+    assert str(seen[0][0]) == cfg.paths.output
+    assert str(seen[0][1]) == cfg.paths.report
+    assert str(seen[0][2]) == cfg.paths.rejects
+    assert str(seen[0][3]) == cfg.paths.sidecar
+    assert str(seen[0][4]) == cfg.paths.stream_artifact
+
+
+def test_report_path_takes_m1_verdict_not_command_mode(tmp_path):
+    """report 命名只认 paths.report（live/dry-run 后缀已由 M1 一次裁决）——
+    emitter 不再按 cfg.dry_run 追加后缀：命令位与 M1 派生不一致时以 paths 为准。"""
+    cfg = make_cfg(tmp_path)                    # dry_run=False 的 live 命令位
+    dry_report = (str(Path(cfg.paths.output).with_suffix(""))
+                  + ".dryrun.report.json")
+    cfg = _dc_replace(cfg, paths=_dc_replace(cfg.paths, report=dry_report))
+    em = Emitter(cfg, engine=None, run_id="a" * 12,
+                 run_started_at=datetime.now().astimezone())
+    assert str(em._report_path) == dry_report
+
+
+def test_missing_paths_fails_fast_without_cwd_fallback(tmp_path):
+    """paths=None（直接构造 ResolvedConfig 的旧 fixture 面）构造即 ValueError
+    ——绝不静默回落按 cwd 推导。"""
+    cfg = _dc_replace(make_cfg(tmp_path), paths=None)
+    with pytest.raises(ValueError, match="paths"):
+        Emitter(cfg, engine=None, run_id="a" * 12,
+                run_started_at=datetime.now().astimezone())
 
 
 # ── v1.13 写前终检按行取类有效 Schema（裁决·按类标注 Schema，spec §6.3）───────
@@ -1658,8 +1722,7 @@ def test_prewrite_check_multi_fanout_rows_use_own_label(tmp_path):
 
 def gs_on() -> GenerateStreamConfig:
     """M1 形状的开启态 generate_stream（emitter 只读 enabled 位）。"""
-    return GenerateStreamConfig(enabled=True, sessions=1, noise_instruction="",
-                                frame_gap_s=(5.0, 60.0))
+    return GenerateStreamConfig(enabled=True, frame_gap_s=(5.0, 60.0))
 
 
 def artifact_member(rec_id: str, line_no: int) -> Record:

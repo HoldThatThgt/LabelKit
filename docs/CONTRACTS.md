@@ -2466,6 +2466,155 @@ v1.16 time-stream sequence-rule cluster (spec 2.3.1 / 3.1.4 / 5.2; implemented i
   planner/model invariant failures use existing `InternalError` (exit 4), and content failures use
   the existing generation scrap counters. v1.16 adds no `ErrorKind`, trace channel or trace event.
 
+v1.17 scenario-planning cluster (SPEC-scenario-planning §4; a DESTRUCTIVE revision — no
+compatibility layer, no migration, no legacy alias for any v1.16 time-stream key; the ten
+deleted keys below are directed errors that name the new expression and never read/convert the
+old value). Numbering continues from rule 61 (the v1.16 cluster above is deliberately
+unnumbered; these rules cite it as "the v1.16 cluster"):
+
+62. **删除键定向报错十项** — each of the following v1.16 keys is a DIRECTED CONFIG_ERROR in
+    v1.17 whose message points at the new expression only:
+
+    | 删除键 | 新表达 |
+    |---|---|
+    | `[generate].sequences` | `[[generate.stream.quotas]]` |
+    | `[class.<name>.generate].sequences` | `[[generate.stream.quotas]]` |
+    | `[generate.stream].sessions` | `[generate.stream].crossed_sessions`；总 session 数自动推导 |
+    | `[generate.stream].ts_start` | `[generate.stream.schedule].start/end` |
+    | `[generate.stream].noise_instruction` | `[[generate.stream.noise]]` |
+    | `[[generate.stream.rules]]` | `[[generate.stream.frame_rules]]` |
+    | `[[generate.stream.windows]]` | `[[generate.stream.frame_windows]]` |
+    | `[[class.<name>.generate.rules]]` | `[[class.<name>.generate.frame_rules]]` |
+    | `[[class.<name>.generate.windows]]` | `[[class.<name>.generate.frame_windows]]` |
+    | hook 的 `module:function` 引用 | `path.py:function`（rule 70） |
+
+    Beyond the ten deleted keys: `--limit` is MUTUALLY EXCLUSIVE with the time-stream form —
+    writing it on a time-stream run is an M1 DIRECTED CONFIG_ERROR (exit 2); the quota is a
+    whole contract and a truncated prefix no longer claims quota satisfaction.
+
+63. **[generate.stream] v1.17 键面** — `crossed_sessions` (default 0) requires
+    `0 <= value <= floor(target_sequences / 2)`; total sessions are always derived as
+    `target_sequences - value` (primary sessions = N - D, single-owner sessions = N - 2D,
+    crossed sessions = D — configuration semantics, never report arithmetic; duplicates add
+    tail sessions OUTSIDE this count). `noise_ratio` stays `float` in `[0,1)`; target noise =
+    `round(ratio x planned_task_frames)` with ROUND_HALF_EVEN semantics, and is now an EXACT
+    delivery target (planned_task_frames = the sum of all slot `length_target` values, a
+    pre-model constant). `duplicates` requires `0 <= value <= target_sequences` (verbatim tail
+    re-sends; source and time layout freeze before the planner and consume no LLM).
+    `frame_gap_s` keeps its `[number, number]` shape with default `[5, 60]` (closed
+    start-interval; the v1.16 `Decimal(str(value))` ceil/floor microsecond quantization
+    applies unchanged). `max_attempts_per_slot` (default 3) requires `>= 1` — the independent
+    delivery budget of every sequence slot and noise slot; carrier is
+    `GenerateStreamConfig.max_attempts_per_slot`, consumed by M6 delivery ONLY and never a
+    `ScenarioConfig` field.
+64. **[generate.stream.schedule] 必填与区间** — `start` and `end` are both REQUIRED ISO-8601
+    datetimes carrying an explicit `Z` or numeric offset; `end` must use the SAME offset as
+    `start` and satisfy `end > start`. The schedule is the half-open interval `[start, end)`:
+    every point timestamp satisfies `start <= ts < end`, every interval satisfies
+    `start <= interval.start < interval.end <= end`. `exclude_dates` is a local-date array
+    (default `[]`); duplicate entries are an error, and an entry falling OUTSIDE the schedule's
+    local-date range is a DIRECTED CONFIG_ERROR (fail-fast, never silently ignored). No
+    primary, noise or duplicate may occupy an excluded day (a duration interval may not
+    intersect the excluded day's local-day boundary interval); a sequence crossing midnight
+    applies the rule frame by frame. The v1.16 per-session one-week `_horizon` recursion is
+    DELETED — the schedule is the only time boundary; frame windows enumerate only in-schedule,
+    non-excluded local dates.
+65. **[[generate.stream.quotas]] 双形态** — every quota table carries a natural `name` matching
+    `[a-z0-9_]+`, UNIQUE over the GLOBAL domain shared by frame-rule, frame-window and
+    sequence-rule names (§6.3 rule 66/67; errors, assumptions and report rows all use it —
+    never a table path or array index). `period` is one of `day`, `week`, `schedule`;
+    `of_week` (both forms) defaults to all seven weekdays. The two forms are MUTUALLY
+    EXCLUSIVE: **exact counts** (`counts` = non-empty `{sequence_class = integer >= 0}`;
+    writing any of `total`/`weights`/`allocation` alongside is an error) versus **integer
+    weights** (`total` = integer >= 1; `weights` = at least two classes with positive-integer
+    weights, mutually exclusive with `counts`; `allocation` = `exact` or `largest_remainder`,
+    REQUIRED). Every quota-referenced class MUST exist in `[[classify.classes]]`; multiple
+    quotas may name the same class — they constrain the SAME occurrence set, never adding or
+    overriding; a class no quota names has target 0 and a noise-only frame class needs no
+    quota. `allocation = "exact"`: weights reduce by their GCD to a simplest integer ratio
+    whose sum is `minimum_exact_cohort`; `total` must be a multiple of that cohort, else M1
+    reports in the SAME round the normalized weights, the minimum exact cohort, the nearest
+    lower exactly-representable total (null when none) and the nearest higher one.
+    `allocation = "largest_remainder"` REUSES `apportion_tiers`' pure-integer largest-remainder
+    algorithm (§6.1): no floating point, no RNG consumption, ties broken by the quota table's
+    own class declaration order. When the time-stream form is enabled there must be AT LEAST
+    ONE quota table, and the sequence-target total compiled across ALL tables must be >= 1 —
+    zero tables or an all-zero total is a DIRECTED CONFIG_ERROR (零序列工程只剩 noise 与无源
+    duplicate，没有可交付内容).
+66. **frame_rules/frame_windows 重命名与 contains** — the v1.16 `rules`/`windows` tables are
+    RENAMED `frame_rules`/`frame_windows` (global on `[generate.stream]`, per-class on
+    `[class.<name>.generate]`); the v1.16 three-state whole-table override semantics are
+    preserved verbatim and the old keys never alias to the new ones (rule 62). The config
+    carrier `SequenceRuleSpec` is RENAMED `FrameRuleSpec` (§7.19) — the v1.17 `SequenceRuleSpec`
+    is a DIFFERENT class (rule 67) with no inheritance relation to the renamed one; the name is
+    recycled. Every frame-rule row and every frame-window row gains a REQUIRED `name`
+    (`[a-z0-9_]+`, the rule-65 shared global-unique domain) replacing array-index diagnostics.
+    The frame-rule template set gains `contains`: it REQUIRES the `source` frame class to
+    declare `duration_s` (rule 68) and, for every target occurrence, a same-sequence source
+    occurrence with `source.start < target.start` AND `target.end < source.end` (a point
+    target's `end == start`; equal boundaries never pass — strict containment). Resources
+    carry NO config name; their assumption and diagnostic key is fixed `resource:<resource-name>`.
+67. **[[generate.stream.sequence_rules]]** — each row: `name` `[a-z0-9_]+`, unique (the rule-65
+    shared domain); `template` exactly one of `precedence`, `response`, `succession`,
+    `not_co_existence`; `source`/`target` are sequence classes already owned by a quota with
+    target > 0, and the two differ; `period` one of `day`, `week`, `schedule`; `gap_s` OPTIONAL
+    on the positive templates as the half-open `[lo, hi)` with `0 <= lo < hi`, and FORBIDDEN on
+    `not_co_existence`. A sequence occurrence belongs to the local date of its `sequence_start`
+    (a midnight-crossing sequence still belongs to its start date's period bucket); semantics
+    run per period bucket: `precedence` = every target occurrence has a source witness with
+    source interval end earlier than target start and the gap inside the declared half-open
+    interval; `response` = every source occurrence has a later target witness (same gap rule);
+    `succession` = both; `not_co_existence` = source and target never co-occur in one bucket.
+    A source witness may serve multiple targets (standard DECLARE existence semantics) —
+    payload-level pairing belongs to the scenario validator, never to extra CP-layer pairing
+    config.
+68. **[frame.class.*.generate] duration 与 resources** — `duration_s` (absent = point frame)
+    is the closed interval `[lo, hi]` with `1e-6 <= lo <= hi`, legal ONLY on a structured
+    frame class; all second values pass through `Decimal(str(value))` and the closed interval
+    quantizes to `[ceil(lo x 1e6), floor(hi x 1e6)]` — empty after quantization is a
+    CONFIG_ERROR (frame gaps use the same rule; rule/table half-open intervals keep
+    `[exact(lo x 1e6), exact(hi x 1e6))` with both endpoints losslessly
+    integer-microsecond-representable). `resources` (default `[]`) — each item matches
+    `[a-z0-9_]+`; a non-empty list REQUIRES `duration_s` present. A duration-declaring frame
+    class MUST bind at least one of `end_ts` / `duration_s` in `time_fields` (no hidden
+    interval the artifact cannot observe). The `time_fields` closed vocabulary GROWS by two
+    words: `end_ts` (`"string"` — the interval end's ISO-8601) and `duration_s` (`"number"` —
+    `round((end - start) / 1e6, 6)`); a POINT frame class may bind NEITHER. The existing
+    `ts`, `gap_prev_s`, `gap_next_s`, `elapsed_s` words are unchanged; binding still means
+    stripping the field from the LLM-facing schema (the v1.14 rule-60 cluster applies to the
+    two new words identically).
+69. **[[generate.stream.noise]] 表** — `noise_ratio > 0` IFF the noise table is non-empty
+    (a table at ratio 0, or no table at ratio > 0, is a DIRECTED CONFIG_ERROR). Each row's
+    `frame_class` must exist in `[[frame.classify.classes]]` with a non-empty generate
+    instruction; structured and plain-text frame classes are both legal (schema parsing,
+    budget checks and realization reuse the task-frame path). A noise frame class must NOT
+    appear in any effective tier, frame rule or frame window, and must NOT declare
+    `duration_s` or `resources` (v1.17 noise stays point occurrence). The task-frame candidate
+    domain ALWAYS excludes the noise table's classes — even in a project without tiers; an
+    empty candidate domain at any task position is a DIRECTED CONFIG_ERROR. `weight` is a
+    positive integer; the noise target is apportioned across noise classes by the
+    largest-remainder rule, consuming no RNG. Noise truth: `truth.noise = true`,
+    `truth.frame_class = <实际类名>` (v1.17 changes the v1.16 null to the actual class name,
+    §9.5), `sequence_class` / `sequence` / `tier_rank` null. No `role`, `negative_type` or
+    second noise schema is added.
+70. **hook 引用统一 path.py:function** — all FOUR hook keys (`output.validator`,
+    `generate.sample_validator`, `generate.sequence_validator`, `generate.scenario_validator`)
+    take `<python-file>:<attribute-path>` (the v1.16 `module:function` form is deleted —
+    rule 62). A relative python-file resolves against the PROJECT ROOT (the `ResolvedPaths`
+    basis, §7.19.2); absolute paths are allowed; the file must be a `.py` regular file. M1 loads via
+    `importlib.util.spec_from_file_location` with a module name hashed from the absolute path,
+    mutates `sys.path` NEVER, depends on cwd NEVER and does no auto-discovery; multi-file
+    extensions install as normal Python packages (LabelKit never splices search paths). M1
+    freezes the resolved callable ONCE (the ResolvedHook carrier, §7.19) — M6 and the schema
+    engine never re-resolve strings. All four hooks get a positional-arity check plus a
+    synthetic-input dry run with no user data (the scenario probe uses `accepted = ()` and one
+    minimal candidate); exception types and illegal return values surface aggregated at
+    validate time, never at first real content.
+71. **quota class 域** — every sequence class named by any `counts` key or `weights` key of any
+    `[[generate.stream.quotas]]` table must exist in `[[classify.classes]]` (DIRECTED
+    CONFIG_ERROR naming the quota's natural name and the class); this domain check runs before
+    quota-form arithmetic so a typo never surfaces as a solver infeasibility.
+
 Warnings (non-blocking): `verify` enabled and `verify.llm`'s `model` equals `annotate.llm`'s
 `model` → warn about self-enhancement bias (spec 3.7.2). v1.7 (R8): `classify.enabled = false`
 while `[[classify.classes]]` and/or `[class.*]` tables are present → ONE warning naming the
@@ -5470,6 +5619,13 @@ Binding notes (from dev spec §3.2, normative):
 
 ### 7.18 Sequence-rule runtime — `labelkit/common/runtime/{declare,temporal,sequence_planner}.py`
 
+> **v1.17 SUPERSESSION.** This whole cluster is DELETED by the v1.17 scenario-planning revision:
+> `labelkit/common/runtime/sequence_planner.py`, `declare.py`, `temporal.py` and
+> `labelkit/orchestration/profile_usage.py` are removed with NO shim, re-export or
+> compatibility module; the still-needed semantics moved to the canonical
+> `labelkit/common/runtime/scenario/` package (§7.19). The text below remains the frozen v1.16
+> record only.
+
 This v1.16 common-runtime cluster is the sole implementation of sequence-rule semantics shared by
 M1, M6 and M10. It is not a Stage and has no IO, LLM call, persistence, cache or cross-run state.
 `sequence_planner.py` is the sole production import site for `ortools==9.15.6755`; no module may
@@ -5644,6 +5800,476 @@ def invoke_sequence_hook(ref: str, value: SequenceValidationInput) -> list[str]:
 passes only that clone and applies `normalize_violations`; user exceptions propagate to M6 for
 value-free sequence-scrap treatment. The hook is trusted same-process code, not sandboxed, and its
 external IO, wall clock and randomness are outside LabelKit's reproducibility guarantee.
+
+### 7.19 Scenario-planning runtime (v1.17) — `labelkit/common/runtime/scenario/` + `runtime/credentials.py`
+
+The v1.17 canonical package replacing §7.18. No third-party dependency is added (integer and
+time planning stay on the repo-locked `ortools==9.15.6755`; hook loading on stdlib `importlib`;
+fixed-offset calendar on stdlib `datetime`). Single responsibility per file:
+
+| 文件 | 单一职责 |
+|---|---|
+| `labelkit/common/runtime/scenario/model.py` | frozen quota/slot/layout/plan/stats dataclass |
+| `labelkit/common/runtime/scenario/quota.py` | period 展开、exact cohort、largest remainder、quota model 与逐类 target |
+| `labelkit/common/runtime/scenario/calendar.py` | fixed-offset schedule、frame window 与 period bucket |
+| `labelkit/common/runtime/scenario/rules.py` | frame rule 与 sequence rule 解析后的纯语义/evaluator |
+| `labelkit/common/runtime/scenario/planner.py` | `compile_scenario`、model assembly、solve、decode、digest |
+| `labelkit/common/runtime/scenario/sessions.py` | owner permutation、session/crossing/noise reserve builder |
+| `labelkit/common/runtime/scenario/diagnostics.py` | bounds、family stats、assumptions 与 exception |
+| `labelkit/common/runtime/scenario/noise.py` | frozen layout 上的 deterministic noise allocation |
+| `labelkit/common/runtime/credentials.py` | run/probe 的 secret materialization |
+
+#### 7.19.1 Hook carriers and scenario-validator inputs — verbatim
+
+落点：`ScenarioSequence`/`ScenarioValidationInput` → `labelkit/common/contracts/types.py`
+（SPEC-SP §4.9 明示，与既有 `SequenceValidationFrame`/`SequenceValidationInput` 同层并列——后者
+形状原样保留，`sequence_validator` 的输入契约零变化）；`ResolvedHook`/`ValidationHooks` →
+SPEC-SP §4.9 冻结形状的契约层载体（hook 解析层冻结，`ResolvedConfig.validation_hooks` 持有）。
+Planner-internal dataclass 一律落 `runtime/scenario/model.py`，两层不得混放。
+
+```python
+@dataclass(frozen=True)
+class ResolvedHook:
+    """一个已按工程根目录解析并通过 synthetic probe 的校验器。"""
+
+    reference: str
+    target: Callable[..., list[str]] = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class ValidationHooks:
+    """运行内四个校验阶段唯一使用的冻结 callable 集。"""
+
+    output: ResolvedHook | None = None
+    sample: ResolvedHook | None = None
+    sequence: ResolvedHook | None = None
+    scenario: ResolvedHook | None = None
+```
+
+`reference` is `<absolute-normalized-python-file>:<attribute-path>` for stable error location;
+the callable's repr and equality are both excluded. `ResolvedConfig.validation_hooks` holds this
+carrier, and report / trace / digest / config serialization may use ONLY the reference — never
+traverse or emit `target`. `scenario_validator(value) -> list[str]`; `accepted` is ordered by
+time then slot key, `candidate` is the current delivery slot; a non-empty violation list rejects
+ONLY the candidate and retries the SAME slot — accepted entries never roll back or reorder; a
+hook exception or illegal return value counts as a candidate violation (WARN once, independent
+failure bucket).
+
+```python
+@dataclass(frozen=True)
+class ScenarioSequence:
+    """场景校验器看到的一条已实现序列。"""
+
+    slot_key: str
+    sequence_class: str
+    start: str
+    end: str
+    frames: tuple[SequenceValidationFrame, ...]
+
+
+@dataclass(frozen=True)
+class ScenarioValidationInput:
+    """增量场景校验输入；candidate 是本次唯一可拒绝项。"""
+
+    accepted: tuple[ScenarioSequence, ...]
+    candidate: ScenarioSequence
+```
+
+#### 7.19.2 Paths parse product — verbatim
+
+落点：`labelkit/common/config/model.py`（`ResolvedConfig` 新增冻结 parse product 之一）。
+`project_root = Path(project_path).resolve().parent`，frozen right after the project TOML read
+succeeds; the relative paths of `run.input`/`run.output`, `output.schema_path`,
+`class.<name>.annotate.schema_path`, `frame.annotate.schema_path`,
+`frame.class.<name>.generate.schema_path`, `trace.path` and the four hook files all resolve
+against it. CLI `--input`/`--output` resolve against the invocation cwd FIRST, then join the
+CLI > project precedence. Whatever the source, `ResolvedConfig` keeps absolute normalized paths
+only (the raw text still feeds the digest; files are never rewritten). M2, M11, trace runtime,
+console and the stream-artifact helper consume `ResolvedPaths` ONLY — never re-derive
+cwd-relative paths. Live report is fixed `<output-stem>.report.json`, dry-run report
+`<output-stem>.dryrun.report.json`; M1 writes both into `ResolvedPaths.report` and emitter /
+console append no suffix by command mode; rejects / sidecar / trace / stream artifact are
+derived exactly once, in M1.
+
+```python
+@dataclass(frozen=True)
+class ResolvedPaths:
+    """运行涉及的全部绝对路径。"""
+
+    project: str
+    project_root: str
+    input: str | None
+    output: str
+    report: str
+    rejects: str | None
+    sidecar: str | None
+    trace: str | None
+    stream_artifact: str | None
+```
+
+`ResolvedConfig` gains exactly three frozen parse products: `paths: ResolvedPaths`,
+`validation_hooks: ValidationHooks`, `scenario_plan: ScenarioPlan | None` — raw config sections
+no longer carry callables, secret values, or strings awaiting downstream interpretation.
+
+#### 7.19.3 RuntimeCredentials and the secret-free config — verbatim
+
+**Deletion face:** `LLMProfile.api_key`, `LLMProfile.api_keys`, `EmbeddingProfile.api_key`,
+`EmbeddingProfile.api_keys` are DELETED (§6.1's frozen blocks shrink accordingly) — profiles
+keep environment-variable NAMES only. `LLMClient.__init__` now receives `RuntimeCredentials`
+(the internal env fallback and profile secret fallback are deleted). Static load validates env
+names, profile references and capabilities but NEVER calls `os.environ.get`; validate without
+`--probe` and dry-run end there and emit no missing-key WARN; run and `validate --probe`
+aggregate-resolve key values for every referenced profile (any miss still exit 2). Credentials
+never enter dataclass repr, logs, trace, report, exceptions or deepcopy.
+
+落点：`labelkit/common/runtime/credentials.py`（不属于 `ResolvedConfig`）。
+
+```python
+@dataclass(frozen=True, repr=False)
+class RuntimeCredentials:
+    """仅真实网络运行持有的 profile 密钥值。"""
+
+    llm: Mapping[str, tuple[str, ...]]
+    embedding: Mapping[str, tuple[str, ...]]
+```
+
+Both mappings are copied read-only at construction, keys sorted by profile name; values are
+deduplicated non-empty key tuples preserving the env-var declaration order. The object has no
+repr, exception or serialization path that displays a secret.
+
+**referenced_profiles 下沉 common 层：** exactly ONE collector
+`referenced_profiles(config)` lives in the common layer, shared by static validation,
+credential resolution, probe, runtime and estimate; `labelkit/orchestration/profile_usage.py`
+is DELETED with the second implementation — no shim (the §6.3 profile-navigation table's
+references to it re-point at the common-layer collector).
+
+#### 7.19.4 Scenario model dataclasses — verbatim (all land in `runtime/scenario/model.py`)
+
+```python
+@dataclass(frozen=True)
+class ScheduleSpec:
+    """planner 使用的有限 fixed-offset schedule。"""
+
+    start_us: int
+    end_us: int
+    utc_offset_minutes: int
+    exclude_dates: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class QuotaSpec:
+    """一张尚待展开 period bucket 的 quota。"""
+
+    name: str
+    period: Literal["day", "week", "schedule"]
+    of_week: tuple[int, ...]
+    counts: tuple[tuple[str, int], ...]
+    total: int | None
+    weights: tuple[tuple[str, int], ...]
+    allocation: Literal["exact", "largest_remainder"] | None
+
+
+@dataclass(frozen=True)
+class CorrelationSpec:
+    """frame rule 的类型敏感顶层字段相等约束。"""
+
+    source_field: str
+    target_field: str
+
+
+@dataclass(frozen=True)
+class FrameRuleSpec:
+    """一条带自然名称的同序列有限迹规则。"""
+
+    name: str
+    template: str
+    frame_class: str | None = None
+    source: str | None = None
+    target: str | None = None
+    count: int | None = None
+    time_us: tuple[int, int] | None = None
+    correlation: CorrelationSpec | None = None
+
+
+@dataclass(frozen=True)
+class FrameWindowSpec:
+    """一条带自然名称的 frame class 本地日历窗口。"""
+
+    name: str
+    frame_class: str
+    of_day_us: tuple[tuple[int, int], ...]
+    of_week: tuple[int, ...]
+
+
+@dataclass(frozen=True)
+class SequenceRuleSpec:
+    """一条跨 sequence occurrence 的周期规则。"""
+
+    name: str
+    template: Literal["precedence", "response", "succession", "not_co_existence"]
+    source: str
+    target: str
+    period: Literal["day", "week", "schedule"]
+    gap_us: tuple[int, int] | None = None
+
+
+@dataclass(frozen=True)
+class TierDomain:
+    """一个 sequence class 的一档 frame class 构成。"""
+
+    rank: int
+    weight: int
+    frame_classes: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SequenceClassDomain:
+    """一个 sequence class 的完整生效 planner 输入。"""
+
+    name: str
+    length_range: tuple[int, int]
+    tiers: tuple[TierDomain, ...]
+    frame_rules: tuple[FrameRuleSpec, ...]
+    frame_windows: tuple[FrameWindowSpec, ...]
+
+
+@dataclass(frozen=True)
+class FrameClassDomain:
+    """一个 frame class 的时间与 resource 域。"""
+
+    name: str
+    duration_us: tuple[int, int] | None
+    resources: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class NoiseClassSpec:
+    """一个 structured noise frame class 及其整数权重。"""
+
+    frame_class: str
+    weight: int
+
+
+@dataclass(frozen=True)
+class ScenarioConfig:
+    """compile_scenario 的唯一冻结参数对象。"""
+
+    seed: int
+    schedule: ScheduleSpec
+    quotas: tuple[QuotaSpec, ...]
+    sequence_classes: tuple[SequenceClassDomain, ...]
+    frame_classes: tuple[FrameClassDomain, ...]
+    sequence_rules: tuple[SequenceRuleSpec, ...]
+    crossed_sessions: int
+    frame_gap_us: tuple[int, int]
+    session_gap_us: int
+    session_max_len: int
+    session_max_span_us: int | None
+    noise_ratio: Decimal
+    noise_classes: tuple[NoiseClassSpec, ...]
+    duplicates: int
+
+
+@dataclass(frozen=True)
+class SequenceSlotSpec:
+    """QuotaCompiler 冻结 target 后的一条稳定成功交付槽位。"""
+
+    key: str
+    sequence_class: str
+    class_ordinal: int
+    tier_rank: int | None
+    length_target: int
+    length_range: tuple[int, int]
+
+
+@dataclass(frozen=True)
+class FrameLayout:
+    """一条已选中的 active frame occurrence 布局。"""
+
+    position: int
+    frame_class: str
+    start_us: int
+    end_us: int
+    duration_target_us: int | None
+    resources: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SequenceLayout:
+    """一条 sequence slot 的完整时间与 session 布局。"""
+
+    slot_key: str
+    session_index: int
+    owner_role: Literal["primary", "secondary"]
+    anchor_date: str
+    start_us: int
+    last_point_us: int
+    end_us: int
+    frames: tuple[FrameLayout, ...]
+
+
+@dataclass(frozen=True)
+class SessionLayout:
+    """一个 replay session 的 owner、边界与 noise 数量。"""
+
+    index: int
+    primary_slot_key: str
+    secondary_slot_key: str | None
+    start_us: int
+    last_point_us: int
+    end_us: int
+    noise_count: int
+
+
+@dataclass(frozen=True)
+class NoiseSlot:
+    """一条已冻结 class、session 与时间的 noise 交付槽位。"""
+
+    key: str
+    frame_class: str
+    class_ordinal: int
+    session_index: int
+    timestamp_us: int
+
+
+@dataclass(frozen=True)
+class DuplicateLayout:
+    """一条已冻结 source 与平移后时间的流尾 duplicate。"""
+
+    key: str
+    ordinal: int
+    source_slot_key: str
+    session_index: int
+    offset_us: int
+    frames: tuple[FrameLayout, ...]
+
+
+@dataclass(frozen=True)
+class QuotaSummary:
+    """一张 quota 展开后的一个 class/bucket target。"""
+
+    name: str
+    period: Literal["day", "week", "schedule"]
+    bucket: str
+    sequence_class: str
+    target: int
+
+
+@dataclass(frozen=True)
+class PlannerObjectives:
+    """三层字典序目标的冻结最优值。"""
+
+    preference_deviation: int
+    calendar_days_spanned: int
+    timeline_end_us: int
+
+
+@dataclass(frozen=True)
+class PlannerFamilyStats:
+    """一个约束族对模型规模的增量。"""
+
+    variables: int
+    constraints: int
+
+
+@dataclass(frozen=True)
+class PlannerModelStats:
+    """quota 或 timeline 模型的稳定规模统计。"""
+
+    variables: int
+    constraints: int
+    families: Mapping[str, PlannerFamilyStats]
+
+
+@dataclass(frozen=True)
+class ScenarioPlan:
+    """M1 唯一生成、estimate 与 M6 只读消费的冻结计划。"""
+
+    slots: tuple[SequenceSlotSpec, ...]
+    layouts: tuple[SequenceLayout, ...]
+    sessions: tuple[SessionLayout, ...]
+    noise_slots: tuple[NoiseSlot, ...]
+    duplicates: tuple[DuplicateLayout, ...]
+    quota_summary: tuple[QuotaSummary, ...]
+    objectives: PlannerObjectives
+    models: Mapping[str, PlannerModelStats]
+    plan_digest: str
+```
+
+Binding notes (SPEC-SP §6.1 tail, normative):
+
+- `ScenarioPlan.models` and every field declared `Mapping` above are copied read-only and
+  key-sorted at construction; a frozen dataclass never hides a mutable dict/list.
+- All `*_us` times are absolute integer microseconds on the Unix epoch; local dates and artifact
+  ISO-8601 convert through the schedule's fixed offset — naive datetime never mixes in.
+- Slot keys and plan order are frozen: sequence `sequence:<sequence-class>:<zero-based-class-ordinal>`
+  (by `classify.classes` declaration order, then in-class ordinal); noise
+  `noise:<frame-class>:<zero-based-class-ordinal>` (by noise-table declaration order, then
+  in-class ordinal); duplicate `duplicate:<zero-based-ordinal>`. Delivery order is ALL sequence
+  slots then ALL noise slots; duplicates are zero-LLM artifact layout and never enter delivery
+  attempt order.
+- `plan_digest` is fixed as `sha256:` + the UTF-8 SHA-256 of
+  `json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))` over the
+  canonical object covering ONLY quota targets, slot key, frame class word, start/end/duration,
+  resource, session owner, noise slot, duplicate source/layout and objective values — no
+  payload, callable, credential, report field or OR-Tools `ModelStats()` version text (stable
+  family counts feed the report only). validate console, dry-run report and live report all echo
+  the digest; identical config bytes + CLI overrides + seed + LabelKit/OR-Tools versions yield
+  the identical digest.
+
+#### 7.19.5 The single compile entry (planner.py) — verbatim
+
+```python
+def compile_scenario(config: ScenarioConfig) -> ScenarioPlan:
+    """编译 quota、求解时间布局并冻结 noise，不做网络调用。"""
+```
+
+One frozen parameter object (the ≤ 5-parameter rule). Execution order is fixed: parse + static
+checks → `derive_stream_bounds` → solve quota counts → build slot specs → build timeline model →
+lexicographic timeline solve → allocate exact noise → `ScenarioPlan` + digest.
+`ResolvedConfig.scenario_plan` is `None` off the time-stream form; when a complete plan cannot
+be produced, load NEVER returns a half product. `check_local_candidates` / `check_question`
+production call faces and M6's `select_feasible_plan` are DELETED — pure-rule unit tests call
+the new rule evaluator; user configuration only ever goes through the complete plan.
+
+#### 7.19.6 Exception taxonomy and exit mapping (diagnostics.py) — verbatim
+
+```python
+class PlannerInfeasibleError(ValueError):
+    """用户硬约束没有共同解。"""
+
+
+class PlannerCapacityError(RuntimeError):
+    """模型在求解前超过实现容量。"""
+
+
+class PlannerBudgetError(RuntimeError):
+    """deterministic solve budget 内无法冻结最优计划。"""
+
+
+class PlannerInternalError(RuntimeError):
+    """solver 解码或冻结计划违反实现不变量。"""
+```
+
+Mapping (CLI exit lane per §4): `PlannerInfeasibleError` folds into `ConfigError` → exit 2;
+`PlannerCapacityError`, `PlannerBudgetError` and `PlannerInternalError` → exit 4. Capacity is a
+face DISTINCT from infeasible — it never displays as INFEASIBLE; its message uses stable English
+fields (`sequence planner capacity exceeded: model=timeline entries=251891 limit=250000
+dominant=crossing families={crossing:170000,session_slot:60000,...}` — actual/limit/dominant
+family, no "reduce horizon" style guesses). Budget messages name `model=quota|timeline` and the
+timed-out layer. The quota model and the timeline model EACH run their own 250,000-entry
+(variables + constraints) capacity limit — the two small models' entries are never summed into
+a false capacity error. Solver parameters stay frozen (`num_search_workers = 1`,
+`random_seed = run.seed & 0x7fffffff`, per-layer `max_deterministic_time = 10.0`, CP-SAT
+automatic search, no hand-written decision strategy; every objective layer solves to OPTIMAL and
+freezes the equality before the next).
+
+**Delivery-lane exit additions:** exact-delivery exhaustion (any slot Exhausted) → CLI exit 1 —
+distinct from provider fatal / circuit breaker exit 4; the run still delivers the successful
+part atomically and marks `delivery.complete = false`. SIGINT during delivery stops launching
+new attempts, waits for bounded in-flight calls to settle, atomically delivers the completed
+part, writes `delivery.complete = false` + `delivery.interrupted = true`, exit 1; a provider
+fatal or breaker in the same round keeps its exit 4 precedence.
 
 ---
 
@@ -6330,6 +6956,61 @@ attempt feeds at most its first failing member of that sum. `rules.sampled` coun
 attempts after mechanical word planning. The day-span counter is a counts-only derived quantity,
 not data content. No `counts.*`, `llm_usage`, trace or ErrorKind key is added.
 
+v1.17 additions (SPEC-scenario-planning §10; report keys **[FROZEN HERE]**):
+
+- **`report.run.paths`** — ALWAYS present; key order frozen exactly as
+  `project` / `project_root` / `input` / `output` / `report` / `rejects` / `sidecar` / `trace` /
+  `stream_artifact`; every value is an absolute normalized path or `null` for a disabled
+  channel — never a relative path. Run-start INFO and dry-run plain/rich consume the same
+  `ResolvedPaths` object (§7.19.2).
+- **Dry-run `estimate` object** — the dry-run report gains a top-level `estimate` key whose
+  value IS the `estimate_run` returned object, referenced not recomputed (console and JSON are
+  key-for-key equal; tests compare the console parser output against the JSON deep-equal). The
+  estimate object gains one nested `scenario` sub-object, key order frozen:
+  `target_sequences` / `task_frames` / `noise_frames` / `sessions` / `crossed_sessions` /
+  `schedule_start` / `schedule_end` / `calendar_days_spanned` / `plan_digest` / `models`, where
+  `models` maps `"quota"` and `"timeline"` to `{"entries": …, "families": …}`. The existing
+  keys (`records` / `batches` / `generate_calls` / `total_calls` / the per-stage `*_calls`)
+  keep their names; the baseline generate estimate counts one realization per structured noise
+  slot and excludes delivery retries, LLMClient-internal provider retries and schema repair.
+- **`report.generate.stream` re-freeze** — the COMPLETE disposition of the v1.16-era keys:
+  SEVEN failure/scrap counters are DELETED — `plan_failures`, `realize_failures`,
+  `validator_scrapped`, `sample_validator_scrapped`, `sequence_validator_scrapped`,
+  `rules.correlation_scrapped`, `rules.temporal_scrapped` — the same failure fact is carried
+  solely by the `delivery.failures` 13-bucket closed set (keeping both would double-book one
+  fact). The `windows` sub-block is DELETED: its only key `calendar_days_spanned` moves into
+  `planner.objectives`, never double-reported. `plan_calls` is RENAMED `brief_calls` (planning
+  in v1.17 is a zero-LLM CP-SAT solve — the old name misleads), and the `rules` sub-block is
+  RENAMED `frame_rules` keeping only `sampled`. All other existing keys (`sequences`,
+  `sessions`, `crossed_sessions`, `frames`, `noise_frames`, `duplicates`, `realize_calls`,
+  `noise_calls`, `tiers`, …) keep their semantics. FOUR new keys append at
+  the block tail — the block's frozen key order ends `plan_digest` / `planner` / `delivery` /
+  `quotas`:
+  - `planner` = `{"models": {"quota": …, "timeline": …}, "objectives": {"preference_deviation":
+    …, "calendar_days_spanned": …, "timeline_end_us": …}}`;
+  - `delivery` = `target_sequences` / `delivered_sequences` / `target_noise` / `delivered_noise` /
+    `target_duplicates` / `delivered_duplicates` / `duplicate_shortfall` / `attempts` /
+    `complete` / `interrupted` / `exhausted_slots` / `failures` — `failures` carries ALL 13
+    sub-keys in the closed-set enum order (§9.4's v1.17 exhaustion block) even at zero: `brief`,
+    `realize`, `noise`,
+    `context_overflow`, `sample_validator`, `sample_validator_exception`, `correlation`,
+    `temporal`, `sequence_validator`, `sequence_validator_exception`, `similarity`,
+    `scenario_validator`, `scenario_validator_exception`. Every non-fatal complete attempt
+    satisfies exactly
+    `attempts = delivered_sequences + delivered_noise + sum(failures.values())`
+    (one sequence attempt's brief + realize calls are ONE delivery attempt; LLMClient-internal
+    provider retries never count). `delivery.exhausted_slots` counts the delivery slots
+    (sequence ∪ noise) that reached Exhausted; duplicate-source shortfall NEVER enters this
+    key — it is carried solely by `duplicate_shortfall`. Provider fatal and circuit breaker
+    exit 4 immediately and enter NO failure bucket.
+  - `quotas` = one row per quota `name` × period bucket × class (the natural key), each row
+    carrying target, delivered, allocation, realized ratio and integer deviation against
+    target — aggregate-only reporting without per-period attribution is FORBIDDEN.
+- **truth (artifact)** — noise rows change `truth.frame_class` from v1.16's null to the ACTUAL
+  noise frame-class name (`sequence_class` / `sequence` / `tier_rank` stay null on noise rows);
+  duration adds NO truth key — the mechanical values surface through the payload's
+  `time_fields` bindings (§9.5).
+
 Counter OWNERSHIP (normative): `counts.*` keys are incremented ONLY by M10 (orchestrator),
 derived from batch tallies / EmitResult — stages must never touch them (double-count).
 v1.7: this includes `counts.fanout` — M10 meters it as the len-delta around the classify
@@ -6363,6 +7044,46 @@ consumers judge run completeness by `report.run`: `interrupted=false` AND `circu
 (exit 4 at open) and unhandled crashes leave `.part`; graceful SIGINT finalize renames.
 v1.13: the stream artifact rides the SAME finalize batch and the same `_undeliverable`
 discipline (§7.10), so the guarantee above holds for it verbatim.
+
+**v1.17 exact-delivery exhaustion block.** Every sequence slot and noise slot carries an
+independent delivery budget of `max_attempts_per_slot` (§6.3 rule 63); each retry re-runs the
+SAME slot's full brief + realization with the frame word, timestamps, duration, session, quota
+and noise slot UNCHANGED, and an accepted payload never rolls back. A slot Exhausted (budget
+spent, or a deterministic precheck context overflow proven invariant for the fixed prompt)
+never aborts the run: remaining slots continue, ALL exhausted slots are collected, the main
+output / stream artifact / rejects deliver the successful part atomically under the §9.4
+discipline above, the report marks `delivery.complete = false`, and the CLI exits 1 (§7.19.6 —
+distinct from provider fatal / circuit-breaker exit 4). A duplicate whose frozen source slot
+went undelivered is OMITTED and counted as shortfall — never re-sourced, never re-laid.
+The delivery failure bucket is the following MUTUALLY EXCLUSIVE closed set of 13 keys, present
+in the report even at zero, in exactly this enum order (each attempt records only its FIRST
+failing stage):
+
+```text
+brief
+realize
+noise
+context_overflow
+sample_validator
+sample_validator_exception
+correlation
+temporal
+sequence_validator
+sequence_validator_exception
+similarity
+scenario_validator
+scenario_validator_exception
+```
+
+brief/realize bucket the schema-guarantee, provider-retryable-exhaustion and output-truncation
+failures of their call phase; `noise` buckets the noise realization call segment; a
+deterministic precheck overflow buckets `context_overflow` and consumes no further attempt.
+The candidate filter order is frozen: schema guarantee → `sample_validator` → correlation /
+temporal replay → `sequence_validator` → similarity probe → `scenario_validator` against the
+accepted prefix → similarity-state commit and accept (the probe/commit split keeps a scenario
+violation from polluting the similarity filter). Noise slots skip the sequence/scenario
+validators but keep schema, sample validator and similarity; a structured noise payload is
+projected to canonical JSON before `sample_validator(text)` and the similarity filter.
 
 ### 9.5 Stream artifact (v1.13, spec §6.5)
 
@@ -6406,6 +7127,12 @@ content gate leave no task-frame rows; survivor projection does not move timesta
 `noise=true` with the existing null truth fields. Duplicate rows retain the source payload,
 `tier_rank` and back-filled time fields and change only their row timestamps/session/
 `duplicate_of` through the existing shape.
+
+**v1.17 amendment.** On noise rows, `truth.frame_class` carries the ACTUAL noise frame-class
+name (v1.16 wrote null there; `sequence_class` / `sequence` / `tier_rank` stay null on noise
+rows, `noise = true`). Frame duration adds NO truth key: the mechanical `end_ts` /
+`duration_s` values surface through the payload's `time_fields` bindings (rule 68), and planner
+invariants are proven through report/trace and tests, not through truth.
 
 **Back-filled time fields (v1.14).** For a frame class with `time_fields` bindings, the bound keys
 inside the row's TEXT-FIELD OBJECT are not LLM output: they are mechanical quantities written by
@@ -7256,6 +7983,11 @@ ceiling — so any further parameter must convert it to a parameter object. Bind
   SEQUENCE (no failed record, §7.5). A coverage violation renders through `_render_error`'s
   `contains` branch as `steps: missing required frame_class "<name>"` so the L3 repair prompt
   names what is missing (§7.7).
+- **v1.17 boundary note (template bytes UNCHANGED).** When a `ScenarioPlan` is in effect (the
+  v1.17 scenario-planning form, §7.19), the constrained path asks the LLM for per-position
+  briefs ONLY, via the §10.17 sampled-brief template family — this blueprint template and
+  `plan_schema` (including the v1.14 cover-variant user line) are NOT used on that path. The
+  frozen text above remains the default-path (no-ScenarioPlan) contract verbatim.
 
 ### 10.15 M6 frame-realization prompt (spec 3.6.5, verbatim; v1.13)
 
@@ -8125,5 +8857,24 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       hook, v1.15 prompt bytes, Schema path, RNG order, estimate, report, artifact, ids and eight
       dry-run goldens are unchanged. No compatibility layer, migration, legacy alias or runtime
       fallback is part of this revision.
+38. **场景规划与精确交付冻结点** — v1.17 (feature spec
+    `docs/dev/SPEC-scenario-planning.md`; 2026-08-21). The v1.16 time-stream config face is
+    destructively replaced: ten deleted keys become directed CONFIG_ERRORs (§6.3 rule 62) and the
+    new key family — `[[generate.stream.quotas]]` (dual form), `[generate.stream.schedule]`,
+    `crossed_sessions`, `max_attempts_per_slot`, `[[generate.stream.sequence_rules]]`, renamed
+    `frame_rules`/`frame_windows` with required natural names and `contains`, frame
+    `duration_s`/`resources`, the `end_ts`/`duration_s` time-field words, `[[generate.stream.noise]]`
+    and the four unified `<python-file>:<attribute-path>` hook keys — is frozen in §6.3 rules
+    63–71. The v1.16 planner stack (`sequence_planner.py`/`declare.py`/`temporal.py` +
+    `orchestration/profile_usage.py`) is deleted with NO shim and replaced by
+    `labelkit/common/runtime/scenario/` with the single frozen entry
+    `compile_scenario(ScenarioConfig) -> ScenarioPlan` (§7.19); `ResolvedConfig` gains the
+    `paths` / `validation_hooks` / `scenario_plan` parse products; profiles are secret-free and
+    `RuntimeCredentials` materializes only on run/probe. `report.generate.stream` is RE-FROZEN:
+    `plan_failures`/`realize_failures`/`validator_scrapped` deleted, `plan_digest`/`planner`/
+    `delivery`/`quotas` appended with the 13-bucket failure closed set (§9.3/§9.4); dry-run gains
+    the top-level `estimate` object and `report.run.paths` is always present. Exit lanes extend:
+    PlannerInfeasible → 2, Capacity/Budget/Internal → 4, delivery exhaustion and delivery-time
+    SIGINT → 1. No compatibility layer, migration or legacy alias exists.
 
 — End of contract. —

@@ -17,7 +17,7 @@ labelkit run --config <config.toml> --project <project.toml>
 |---|---|
 | `--config` / `--project` | 两份配置的路径，**必填** |
 | `--input` / `--output` | 覆盖 `run.input` / `run.output`（CLI > project.toml）。注意 `generate_only` 模式下传 `--input` 同样是配置错误 |
-| `--limit N` | 只处理前 N 条（N ≥ 1；0 或负数在参数解析层就被拒绝）。**试跑神器**：小样本验证配置、rubric、Schema、成本，再放开跑全量。v1.16 时间流生成下单位是**序列**，截断发生在计划期的配额层（按类名字典序取前缀）——被砍掉的序列根本不生成、也不进交织，所以工件与主输出的覆盖面恒一致（第 27 章） |
+| `--limit N` | 只处理前 N 条（N ≥ 1；0 或负数在参数解析层就被拒绝）。**试跑神器**：小样本验证配置、rubric、Schema、成本，再放开跑全量。v1.17 时间流生成下单位是**序列**，截断发生在计划期的配额层（按类名字典序取前缀）——被砍掉的序列根本不生成、也不进交织，所以工件与主输出的覆盖面恒一致（第 27 章） |
 | `--dry-run` | 走完全部启动校验 + 输入扫描 + 成本估算，**不发一次 LLM 调用、不写主输出**。报告写 `{stem}.dryrun.report.json`；trace 写「trace 文件名在扩展名前插 .dryrun」（默认即 `{stem}.trace.dryrun.jsonl`），不覆盖上次真实运行的账本 |
 | `--strict` | 有任何记录被拒绝（dropped_* / failed 非零）⇒ 退出码 1。给 CI/定时任务用：让「有货被扔」成为可编程的失败信号。v1.9 交互补注：缝合产生的 `stitched` 壳与救援命中的帧**不构成 rejects**——同一份输入开启 `[stitch]` 后 strict 结果可能从 1 变 0（短段被救援、不再落 rejects），属预期（第 26 章） |
 | `--log-level` | 覆盖 `tool.log_level`。`debug` 会打出每次 LLM 调用摘要（延迟/token/重试） |
@@ -31,7 +31,7 @@ dry-run: estimated LLM calls — generate_calls=0 segment_calls=0 stitch_calls=0
 dry-run: no LLM calls made, no output written (report and trace only)
 ```
 
-v1.16 的时间流生成（第 27 章）在这一行里没有新键——蓝图、帧实现与噪音批量三类调用全部折进 `generate_calls`。`examples/synth-stream` 的真实输出（逐字节；本工程未开 trace，故末行是 `report only`）：
+v1.17 的时间流生成（第 27 章）在这一行里没有新键——蓝图、帧实现与噪音批量三类调用全部折进 `generate_calls`。`examples/synth-stream` 的真实输出（逐字节；本工程未开 trace，故末行是 `report only`）：
 
 ```
 dry-run: mode=generate_only estimated_records=6 batches=1

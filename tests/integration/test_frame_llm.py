@@ -57,6 +57,7 @@ from labelkit.common.config.model import (
     TraceConfig,
     VerifyConfig,
 )
+from labelkit.common.runtime.credentials import resolve_credentials
 from labelkit.common.runtime.llm_client import LLMClient
 from labelkit.common.runtime.schema_engine import SchemaEngine
 from labelkit.common.contracts.stage import RunContext
@@ -124,7 +125,6 @@ def _profile(max_output_tokens: int = 4096) -> LLMProfile:
         supports_vision=True,
         max_output_tokens=max_output_tokens,
         temperature=0.0,
-        api_key=os.environ.get(ZAI_KEY_ENV, ""),
     )
 
 
@@ -183,7 +183,8 @@ class _RecordingMetrics:
 
 def make_ctx(cfg) -> RunContext:
     metrics = _RecordingMetrics()
-    llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles, metrics=None)
+    llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles,
+                       resolve_credentials(cfg), metrics=None)
     engine = SchemaEngine(dict(cfg.user_schema), llm, cfg.output, metrics=None)
     return RunContext(cfg=cfg, llm=llm, schema_engine=engine, metrics=metrics,
                       rng=random.Random("42:1:frame"), batch_no=1)

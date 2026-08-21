@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from dataclasses import replace
+
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
@@ -24,6 +26,7 @@ from labelkit.common.config.model import (
     OutputConfig,
     QualityConfig,
     ResolvedConfig,
+    ResolvedPaths,
     Rubric,
     RunConfig,
     SegmentConfig,
@@ -41,13 +44,32 @@ PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 JPEG_MAGIC = b"\xff\xd8\xff"
 
 
+def _mk_paths(tmp_path: Path) -> ResolvedPaths:
+    """v1.17（SPEC-SP §5.1）：镜像 M1 的 loader._resolved_paths 派生公式——
+    M2 只消费 paths.input，不再从 run.input 字符串做 cwd 二次推导。"""
+    output = str(tmp_path / "out.jsonl")
+    stem = str(Path(output).with_suffix(""))
+    return ResolvedPaths(
+        project=str(tmp_path / "project.toml"),
+        project_root=str(tmp_path),
+        input=str(tmp_path / "in"),
+        output=output,
+        report=stem + ".report.json",
+        rejects=stem + ".rejects.jsonl",
+        sidecar=None,
+        trace=None,
+        stream_artifact=None,
+    )
+
+
 def make_cfg(tmp_path: Path, modality: str = "text", **input_kw) -> ResolvedConfig:
+    output = str(tmp_path / "out.jsonl")
     return ResolvedConfig(
         tool=ToolConfig(),
         console=ConsoleConfig(),
         llm_profiles={},
         embedding_profiles={},
-        run=RunConfig(output=str(tmp_path / "out.jsonl"), modality=modality,
+        run=RunConfig(output=output, modality=modality,
                       input=str(tmp_path / "in")),
         input=InputConfig(**input_kw),
         stream=StreamConfig(),
@@ -72,6 +94,7 @@ def make_cfg(tmp_path: Path, modality: str = "text", **input_kw) -> ResolvedConf
         project_path="project.toml",
         config_digest="sha256:0",
         project_digest="sha256:0",
+        paths=_mk_paths(tmp_path),
     )
 
 
@@ -103,6 +126,36 @@ def write_jsonl(path: Path, objs, raw_lines=()):
     lines = [json.dumps(o, ensure_ascii=False) for o in objs]
     lines.extend(raw_lines)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+# ── v1.17（SPEC-SP §5.1）：输入根只消费 ResolvedPaths，消灭 cwd 二次推导 ──────
+
+
+def test_input_root_comes_from_resolved_paths_not_run_input(tmp_path,
+                                                            monkeypatch):
+    """run.input 是相对诱饵时，记录仍取自 M1 冻结的 paths.input 绝对路径，且与
+    构造时 cwd 无关（旧实现按 run.input 相对 cwd 重解——诱饵不存在即 InputError，
+    诱饵存在则读错文件）。"""
+    real = tmp_path / "real.jsonl"
+    write_jsonl(real, SPEC_LINES)
+    cfg = make_cfg(tmp_path, text_field="instruction")
+    cfg = replace(cfg, run=replace(cfg.run, input="decoy.jsonl"),
+                  paths=replace(cfg.paths, input=str(real)))
+    ids = []
+    for cwd in (tmp_path / "cwd-a", tmp_path / "cwd-b"):
+        cwd.mkdir(parents=True, exist_ok=True)
+        monkeypatch.chdir(cwd)
+        ids.append([r.id for r in Ingestor(cfg).records()])
+    assert ids[0] == ids[1]
+    assert len(ids[0]) == 2                          # SPEC_LINES 的两条可取记录
+
+
+def test_ingest_missing_paths_fails_fast_without_cwd_fallback(tmp_path):
+    """paths=None（直接构造 ResolvedConfig 的旧 fixture 面）构造即 ValueError
+    ——M2 不再从 run.input 字符串做 cwd 二次推导，也不静默回落。"""
+    cfg = replace(make_cfg(tmp_path), paths=None)
+    with pytest.raises(ValueError, match="paths"):
+        Ingestor(cfg)
 
 
 def test_text_spec_example_ids_and_report(tmp_path):
@@ -815,6 +868,7 @@ def make_stream_cfg(tmp_path: Path, *, modality: str = "text",
         project_path="project.toml",
         config_digest="sha256:0",
         project_digest="sha256:0",
+        paths=_mk_paths(tmp_path),
     )
 
 

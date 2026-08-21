@@ -12,15 +12,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
 
-from labelkit.common.config.model import (
-    apportion_tiers,
-    effective_rules,
-    effective_tiers,
-    effective_windows,
-)
+from labelkit.common.config.model import effective_frame_rules, effective_frame_windows
 from labelkit.common.contracts.types import Classification, PipelineItem, Record, RecordRef
-from labelkit.common.errors import ContextOverflowError, InternalError
-from labelkit.common.runtime.sequence_planner import PlannerConfigError, PlannerInternalError
+from labelkit.common.errors import ContextOverflowError
 
 if TYPE_CHECKING:
     import random
@@ -34,6 +28,7 @@ if TYPE_CHECKING:
         TierSpec,
     )
     from labelkit.common.contracts.stage import RunContext
+    from labelkit.common.runtime.scenario.model import NoiseSlot, ScenarioPlan
 
 _log = logging.getLogger("labelkit.generate")
 
@@ -243,52 +238,54 @@ def _text_bundle(system_text: str, user_text: str,
         temperature=temperature)
 
 
-# v1.13 计划期纯函数：estimate_run 精确复演
+# v1.17 交付计划：cfg.scenario_plan（M1 冻结）→ M6 的逐槽位调用计划
 
 @dataclass(frozen=True)
 class SequencePlan:
-    """一条待生成序列的计划期定稿（蓝图与帧实现共用）。"""
-    index: int                  # 计划序全局序号 0 基（配额展开序）
+    """一条 sequence slot 的交付计划（brief 与帧实现共用）。"""
+    index: int                  # 计划序全局序号 0 基（= ScenarioPlan.slots 顺序）
     class_name: str             # 所属序列类
     ordinal: int                # 类内序数 0 基（= 工件 truth.sequence）
-    length: int                 # 步数 L（rng.randint(类有效 len_range)）
-    llm: str                    # 预抽 profile——蓝图+实现绑定同一 profile
-    style_name: str | None      # 预抽风格名（实现才生效，蓝图不带风格）
+    length: int                 # 步数 L（slot 冻结的 length_target）
+    llm: str                    # 预抽 profile——brief+实现绑定同一 profile
+    style_name: str | None      # 预抽风格名（实现才生效，brief 不带风格）
     style_prompt: str | None    # 预抽风格提示词
-    tier_rank: int | None = None    # v1.14 档位序数（配分的连续分块查表所得，零 rng）；
-                                    # None = 档位面不在场（档位表缺省）
-    frame_classes: tuple[str, ...] = ()  # v1.16 planner 冻结的逐位帧类词；默认路径为空
-    timestamps_us: tuple[int, ...] = ()  # v1.16 planner 冻结的任务帧微秒时间
+    slot_key: str = ""          # ScenarioPlan 的稳定槽位键（sequence:<class>:<ordinal>）
+    tier_rank: int | None = None    # 档位序数（slot spec 承源；None = 档位面不在场）
+    frame_classes: tuple[str, ...] = ()  # planner 冻结的逐位帧类词
+    timestamps_us: tuple[int, ...] = ()  # planner 冻结的任务帧微秒时间
 
 
 @dataclass(frozen=True)
 class NoiseCallPlan:
-    """一次噪音帧批量实现调用的计划期定稿（复用平面生成模板）。"""
-    index: int                  # 噪音批调用序号 0 基
-    llm: str                    # 独立预抽 profile（裁决·生成键效力矩阵）
+    """一个 noise slot 的交付计划（单槽一次 realize 调用，复用帧类 realize 路径）。"""
+    index: int                  # 噪音槽计划序号 0 基（= ScenarioPlan.noise_slots 顺序）
+    frame_class: str            # 该槽的噪音帧类（frame_class 真值实名）
+    llm: str                    # 独立预抽 profile
     style_name: str | None      # 预抽风格名（全局 styles 池）
     style_prompt: str | None    # 预抽风格提示词
 
 
 @dataclass(frozen=True)
 class StreamPlan:
-    """时间流生成的整轮计划期产物（M10 estimate_run 精确复演的同一对象）。"""
-    sequences: tuple[SequencePlan, ...]     # 计划序（类字典序 × 类内序数）
-    noise_target: int                       # round(noise_ratio × Σ length)
-    noise_plans: tuple[NoiseCallPlan, ...]  # ⌈noise_target / num_per_call⌉ 个
-    planner_active: bool = False            # 是否启用 v1.16 联合 planner 路径
-    planner_question: Any | None = None    # M6/estimate 共用的冻结问题
-    planner_layout: Any | None = None      # LLM 前冻结的 skeleton
-    duplicate_order: tuple[int, ...] = ()   # 预抽的 primary source 序列下标
-    noise_requested: int = 0                # noise_ratio 目标，可能高于最优可行槽数
+    """时间流生成的交付计划（计划面全部承源 ``cfg.scenario_plan``，零重排）。"""
+    sequences: tuple[SequencePlan, ...]     # 计划序（ScenarioPlan.slots 顺序）
+    noise_plans: tuple[NoiseCallPlan, ...]  # 计划序（ScenarioPlan.noise_slots 顺序）
 
 
 @dataclass(frozen=True)
 class RealizedSequence:
-    """蓝图 + 帧实现都成功后的一条序列（交织器与直装组装的输入单元）。"""
-    plan: SequencePlan                      # 该序列的计划期定稿
-    frame_classes: tuple[str, ...]          # 蓝图逐步帧类（帧级真值）
+    """brief + 帧实现都成功后的一条序列（装配的输入单元）。"""
+    plan: SequencePlan                      # 该序列的交付计划
+    frame_classes: tuple[str, ...]          # planner 冻结词（帧级真值）
     payloads: tuple = ()                    # 逐帧 text_field 值（str 或结构化帧对象）
+
+
+@dataclass(frozen=True)
+class RealizedNoise:
+    """一个交付成功的 noise slot（槽位身份 + 帧载荷）。"""
+    slot: "NoiseSlot"                       # ScenarioPlan 冻结的噪音槽位
+    payload: "str | Mapping"                # 帧内容（结构化噪音 = JSON 对象）
 
 
 @dataclass(frozen=True)
@@ -297,202 +294,68 @@ class StreamGenerateProduct:
     ``PipelineItem(record=r)`` 裸构造无法携带 session_id/classification/
     member_classifications，故必须整信封交付。"""
     envelopes: list[PipelineItem]           # 直装序列信封（计划序）
-    artifact_lines: list[str]               # 工件行（交织序定稿；行号 = 列表序 + 1）
+    artifact_lines: list[str]               # 工件行（时间序定稿；行号 = 列表序 + 1）
 
 
-def expand_stream_quota(cfg: "ResolvedConfig") -> list[tuple[str, int]]:
-    """计划期第①步（零 rng）：类按类名字典序展开配额为 (类名, 类内序数) 列表；
-    ``--limit`` 在此做前缀截断（配额层截断 ⇒ 作废序列不再生成、不进交织，工件与
-    主输出覆盖面恒一致）。
+def plan_delivery(cfg: "ResolvedConfig") -> StreamPlan:
+    """把 M1 冻结的 ``ScenarioPlan`` 展开为 M6 的逐槽位调用计划（§11 delivery.profile）。
 
-    @param cfg 已解析配置。
-    @return 按类名字典序排列的 (类名, 类内序数) 列表。
+    布局（word/length/session/timestamp/tier）零重排承源 ``cfg.scenario_plan``；
+    本函数只按 ``Random(f"{seed}:delivery.profile")`` 流预抽每槽位的 (llm, style)——
+    sequence 槽位在前（slot 顺序，风格池取类有效表）、noise 槽位在后（全局风格池），
+    同 seed 下与槽位交付成败无关地逐字节一致。
+
+    @param cfg 已解析配置（``scenario_plan`` 已由 M1 冻结）。
+    @return 交付计划。
     """
-    entries: list[tuple[str, int]] = []
-    for name in sorted(cfg.class_views):
-        for ordinal in range(cfg.class_views[name].generate.sequences):
-            entries.append((name, ordinal))
-    if cfg.limit is not None:
-        entries = entries[: cfg.limit]
-    return entries
+    import random as _random
 
-
-def tier_rank_for_ordinal(sequences: int, tiers: "Sequence[TierSpec]",
-                          ordinal: int) -> int | None:
-    """v1.14（裁决·零抽签配分）：把一个类内序数映射到它所属档位的序数。
-
-    配分结果（``apportion_tiers``，整数域最大余额法）按 tier_rank 升序把类配额切成
-    **连续分块**，类内序数落进哪一块就属哪一档——前缀和查表，零 rng。推论：``--limit``
-    的前缀截断只切掉尾部序数，即类内从最高 tier_rank 侧截起，截断与映射可交换。
-
-    @param sequences 该序列类的**全量**配额（``[class.<name>.generate].sequences``）；
-        绝不能传 ``--limit`` 截断后的条数，否则分块会随截断漂移。
-    @param tiers 该类的**生效**档位表（v1.15：``effective_tiers`` 的产物，按 tier_rank
-        升序存放）；空 = 档位面不在场。
-    @param ordinal 类内序数 0 基（= 工件 truth.sequence）。
-    @return 该序数所属档的 tier_rank；档位表为空时 None。
-    """
-    upper = 0
-    for spec, quota in zip(tiers, apportion_tiers(sequences, tiers)):
-        upper += quota
-        if ordinal < upper:
-            return spec.tier_rank
-    return None
-
-
-def _joint_constraints_active(cfg: "ResolvedConfig",
-                              entries: Sequence[tuple[str, int]]) -> bool:
-    """判断非零配额类是否有生效规则或窗口。"""
-    global_rules = cfg.generate_stream.rules
-    global_windows = cfg.generate_stream.windows
-    for name, _ in entries:
-        view = cfg.class_views[name]
-        if effective_rules(view.rules, global_rules) or effective_windows(
-                view.windows, global_windows):
-            return True
-    return False
-
-
-def _build_joint_plan(cfg: "ResolvedConfig", rng: "random.Random",
-                      entries: Sequence[tuple[str, int]]) -> StreamPlan:
-    """执行 v1.16 长度条件抽样、skeleton 冻结与调用预抽。"""
-    from labelkit.common.runtime.sequence_planner import (
-        question_from_config,
-        select_feasible_plan,
-    )
-
-    solver_seed = rng.getrandbits(31)
-    question = question_from_config(cfg, solver_seed=solver_seed)
-    question, layout = select_feasible_plan(question, rng)
-    if layout.planned_noise_slots < question.noise_target:
-        _log.warning("planner could not place the complete noise target: target=%d placed=%d",
-                     question.noise_target, layout.planned_noise_slots)
+    plan = cfg.scenario_plan
     g = cfg.generate
-    pairs = _predraw_joint_pairs(cfg, entries, layout, rng)
-    duplicate_order = _predraw_duplicate_order(cfg, len(entries), rng)
-    noise_count = math.ceil(layout.planned_noise_slots / g.num_per_call)
-    styles = [g.styles] * noise_count
-    noise_pairs = predraw_llm_style(g, noise_count, rng, styles_by_index=styles)
-    sequences = tuple(_sequence_plan_from_layout(
-        index, entries[index][1], item, layout, pairs[index])
-        for index, item in enumerate(question.attempts))
-    noises = tuple(_noise_plan(index, noise_pairs[index]) for index in range(noise_count))
-    return StreamPlan(sequences=sequences, noise_target=layout.planned_noise_slots,
-                      noise_plans=noises, planner_active=True,
-                      planner_question=question, planner_layout=layout,
-                      duplicate_order=duplicate_order,
-                      noise_requested=question.noise_target)
-
-
-def _predraw_joint_pairs(cfg: "ResolvedConfig", entries: Sequence[tuple[str, int]],
-                         layout: Any, rng: "random.Random") -> list[tuple[str, Any]]:
-    """按序列类有效风格池预抽联合路径的模型与风格。"""
-    styles = [cfg.class_views[name].generate.styles for name, _ in entries]
-    return predraw_llm_style(cfg.generate, len(layout.words), rng, styles)
-
-
-def _predraw_duplicate_order(cfg: "ResolvedConfig", count: int,
-                             rng: "random.Random") -> tuple[int, ...]:
-    """在任何内容调用前冻结 duplicate source 排列。"""
-    del cfg
-    return tuple(rng.sample(range(count), count)) if count else ()
-
-
-def _sequence_plan_from_layout(index: int, ordinal: int, attempt: Any,
-                               layout: Any, pair: tuple[str, Any]) -> SequencePlan:
-    """将 planner attempt 与预抽模型风格合成为 M6 序列计划。"""
-    style = pair[1]
-    return SequencePlan(index=index, class_name=attempt.class_name,
-                        ordinal=ordinal, length=attempt.length, llm=pair[0],
-                        style_name=style.name if style else None,
-                        style_prompt=style.prompt if style else None,
-                        tier_rank=attempt.tier_rank,
-                        frame_classes=tuple(layout.words[index]),
-                        timestamps_us=tuple(layout.timestamps_us[index]))
-
-
-def _noise_plan(index: int, pair: tuple[str, Any]) -> NoiseCallPlan:
-    """构造单个噪音调用计划。"""
-    style = pair[1]
-    return NoiseCallPlan(index=index, llm=pair[0],
-                         style_name=style.name if style else None,
-                         style_prompt=style.prompt if style else None)
-
-
-def plan_stream(cfg: "ResolvedConfig", rng: "random.Random") -> StreamPlan:
-    """计划期纯函数（M10 estimate_run 精确复演共用，裁决·估算精确复演）。
-
-    抽签消费顺序冻结（裁决·抽签消费顺序表，测试钉住）：①配额展开（截断，零 rng）
-    ②逐序列 L = rng.randint(类有效 len_range) ③逐序列 (llm, style) 预抽——噪音批
-    调用独立预抽，紧随序列预抽在同一 predraw 流内消费（round_robin 不耗 rng、
-    weighted 逐位 rng.choices、styles 非空逐位 rng.choice；噪音批取全局 styles）。
-    v1.14 的档位赋值插在①与②之间，零 rng ⇒ 同 seed 下有无档位表的抽签流逐字节一致；
-    v1.15 逐类改吃 ``effective_tiers``（按类表 ?? 全局表），仍是纯查表、零消费。
-
-    @param cfg 已解析配置。
-    @param rng 单流伪随机数生成器。
-    @return 时间流生成的冻结计划。
-    """
-    entries = expand_stream_quota(cfg)
-    if _joint_constraints_active(cfg, entries):
-        try:
-            return _build_joint_plan(cfg, rng, entries)
-        except PlannerConfigError as exc:
-            _log.error("time-stream planner violated an M1-validated invariant at M6 boundary")
-            raise InternalError("time-stream planner violated a validated invariant") from exc
-        except PlannerInternalError as exc:
-            _log.error("time-stream planner failed an internal invariant at M6 boundary")
-            raise InternalError("time-stream planner internal failure") from exc
-    return _plan_default_stream(cfg, rng, entries)
-
-
-def _plan_default_stream(cfg: "ResolvedConfig", rng: "random.Random",
-                         entries: Sequence[tuple[str, int]]) -> StreamPlan:
-    """按 v1.15 默认路径复演长度、档位、调用 profile 与风格。"""
-    gs_tiers = cfg.generate_stream.tiers
-    ranks = [tier_rank_for_ordinal(
-        cfg.class_views[name].generate.sequences,
-        effective_tiers(cfg.class_views[name].tiers, gs_tiers), ordinal)
-        for name, ordinal in entries]
-    lengths: list[int] = []
-    for name, _ in entries:
-        lo, hi = cfg.class_views[name].generate.len_range
-        lengths.append(rng.randint(lo, hi))
-    g = cfg.generate
-    noise_target = round(cfg.generate_stream.noise_ratio * sum(lengths))
-    n_noise = math.ceil(noise_target / g.num_per_call) if noise_target > 0 else 0
-    styles_by_index = ([cfg.class_views[name].generate.styles for name, _ in entries]
-                       + [g.styles] * n_noise)
-    pairs = predraw_llm_style(g, len(entries) + n_noise, rng,
+    noise_plans_src = plan.noise_slots
+    styles_by_index = ([cfg.class_views[slot.sequence_class].generate.styles
+                        for slot in plan.slots]
+                       + [g.styles] * len(noise_plans_src))
+    pairs = predraw_llm_style(g, len(plan.slots) + len(noise_plans_src),
+                              _random.Random(f"{cfg.run.seed}:delivery.profile"),
                               styles_by_index=styles_by_index)
+    words: dict[str, tuple[str, ...]] = {}
+    stamps: dict[str, tuple[int, ...]] = {}
+    for layout in plan.layouts:
+        words[layout.slot_key] = tuple(frame.frame_class for frame in layout.frames)
+        stamps[layout.slot_key] = tuple(frame.start_us for frame in layout.frames)
     sequences = tuple(
-        SequencePlan(index=i, class_name=name, ordinal=ordinal, length=lengths[i],
+        SequencePlan(index=i, slot_key=slot.key, class_name=slot.sequence_class,
+                     ordinal=slot.class_ordinal, length=slot.length_target,
                      llm=pairs[i][0],
                      style_name=pairs[i][1].name if pairs[i][1] else None,
                      style_prompt=pairs[i][1].prompt if pairs[i][1] else None,
-                     tier_rank=ranks[i])
-        for i, (name, ordinal) in enumerate(entries))
-    offset = len(entries)
+                     tier_rank=slot.tier_rank,
+                     frame_classes=words.get(slot.key, ()),
+                     timestamps_us=stamps.get(slot.key, ()))
+        for i, slot in enumerate(plan.slots))
+    offset = len(plan.slots)
     noise_plans = tuple(
-        NoiseCallPlan(index=j, llm=pairs[offset + j][0],
+        NoiseCallPlan(index=j, frame_class=slot.frame_class,
+                      llm=pairs[offset + j][0],
                       style_name=(pairs[offset + j][1].name
                                   if pairs[offset + j][1] else None),
                       style_prompt=(pairs[offset + j][1].prompt
                                     if pairs[offset + j][1] else None))
-        for j in range(n_noise))
-    return StreamPlan(sequences=sequences, noise_target=noise_target,
-                      noise_plans=noise_plans)
+        for j, slot in enumerate(noise_plans_src))
+    return StreamPlan(sequences=sequences, noise_plans=noise_plans)
 
 
-# v1.13 机械交织器：纯函数族，零 LLM、零 IO
+# v1.17 布局驱动装配：纯函数族，零 LLM、零 IO、零 rng
 
 @dataclass
 class _StreamSlot:
-    """交织后的一帧槽位（工件行装配前形态；仅本模块内部可变）。"""
+    """装配后的一帧槽位（工件行装配前形态；仅本模块内部可变）。"""
     payload: "str | Mapping"    # text_field 值（结构化帧 = 行内对象）
-    truth: dict                 # 冻结键集 truth（session 值交织尾声回填）
+    truth: dict                 # 冻结键集 truth（session 值装配尾声回填）
     owner: int | None           # 幸存序列下标（任务帧）；噪音/重复帧 = None
-    ts: str = ""                # ⑨ 铺设的 ISO-8601 时间戳
+    ts: str = ""                # planner µs 铺出的 ISO-8601 时间戳
+    ts_us: int = 0              # 该帧的绝对微秒（内部排序/回填用）
 
 
 def _tier_truth(tier_rank: int | None, tiered: bool) -> dict:
@@ -506,283 +369,119 @@ def _tier_truth(tier_rank: int | None, tiered: bool) -> dict:
     return {"tier_rank": tier_rank} if tiered else {}
 
 
-def _sequence_slots(index: int, seq: RealizedSequence) -> list[_StreamSlot]:
-    """一条幸存序列的任务帧槽位（truth.session 占位 −1，交织尾声回填）。v1.14：
-    档位表在场时 truth 带本序列的档位序数。"""
-    plan = seq.plan
-    tier = _tier_truth(plan.tier_rank, tiered=plan.tier_rank is not None)
-    return [_StreamSlot(payload=seq.payloads[i],
-                        truth={"session": -1, "sequence_class": plan.class_name,
-                               "sequence": plan.ordinal, **tier,
-                               "frame_class": seq.frame_classes[i], "noise": False},
-                        owner=index)
-            for i in range(len(seq.payloads))]
+def _us_iso(timestamp_us: int, cfg: "ResolvedConfig") -> str:
+    """把 planner 绝对微秒转换为 schedule 固定 offset 的 ISO 文本。"""
+    from datetime import datetime, timedelta, timezone as tz
 
-
-def _duplicate_slots(seq: RealizedSequence) -> list[_StreamSlot]:
-    """⑧ 一条重复序列的流尾新会话槽位：帧 text_field 值逐字节同源（同对象再序列
-    化），truth 带 duplicate_of = 原序列类内序数、sequence = null（重发副本无自身
-    计划期身份，归属经 duplicate_of 对账——裁决·工件行真值字段集）。v1.14：档位
-    序数承源（裁决·重发帧承源档与同源载荷）。"""
-    plan = seq.plan
-    tier = _tier_truth(plan.tier_rank, tiered=plan.tier_rank is not None)
-    return [_StreamSlot(payload=seq.payloads[i],
-                        truth={"session": -1, "sequence_class": plan.class_name,
-                               "sequence": None, **tier,
-                               "frame_class": seq.frame_classes[i],
-                               "noise": False, "duplicate_of": plan.ordinal},
-                        owner=None)
-            for i in range(len(seq.payloads))]
-
-
-def _noise_slot(payload: str, tiered: bool) -> _StreamSlot:
-    """一帧插入噪音的槽位（真值三 null + noise=true；档位表在场时档位序数亦 null
-    ——噪音帧不属任何序列，自然不承档）。"""
-    return _StreamSlot(payload=payload,
-                       truth={"session": -1, "sequence_class": None, "sequence": None,
-                              **_tier_truth(None, tiered=tiered),
-                              "frame_class": None, "noise": True},
-                       owner=None)
-
-
-def _cross_session(slots_a: list[_StreamSlot], slots_b: list[_StreamSlot],
-                   rng: "random.Random") -> list[_StreamSlot]:
-    """⑥ 单个交叉会话的切换点掷签：形态 A 段+B 段+A 余段[+B 余段]（裁决·会话装箱
-    定容）——cut_a ∈ [1, len(A)−1] 保证真交叉（A 必在 B 头部之后回续），cut_b ∈
-    [1, len(B)]（= len(B) 时无 B 余段）。A 不足 2 帧时与 B 互换；两者都不足 ⇒
-    真交叉不可构造，退化为顺次拼接（纯长度条件，确定性，零 rng 消费）。"""
-    if len(slots_a) < 2 <= len(slots_b):
-        slots_a, slots_b = slots_b, slots_a
-    if len(slots_a) < 2:
-        return slots_a + slots_b
-    cut_a = rng.randint(1, len(slots_a) - 1)
-    cut_b = rng.randint(1, len(slots_b))
-    return slots_a[:cut_a] + slots_b[:cut_b] + slots_a[cut_a:] + slots_b[cut_b:]
-
-
-def _pack_sessions(survivors: Sequence[RealizedSequence], declared: int,
-                   rng: "random.Random") -> tuple[list[list[_StreamSlot]], int]:
-    """⑤ 装箱定容：洗牌后前 Σ幸存 − sessions_eff 对成对交叉（sessions_eff =
-    min(sessions, Σ幸存)），其余单序列会话；会话序 = 洗牌序（交叉会话在前）。"""
-    order = list(range(len(survivors)))
-    rng.shuffle(order)
-    sessions_eff = min(declared, len(order))
-    n_cross = len(order) - sessions_eff
-    sessions: list[list[_StreamSlot]] = []
-    for pair in range(n_cross):
-        a, b = order[2 * pair], order[2 * pair + 1]
-        sessions.append(_cross_session(_sequence_slots(a, survivors[a]),
-                                       _sequence_slots(b, survivors[b]), rng))
-    for index in order[2 * n_cross:]:
-        sessions.append(_sequence_slots(index, survivors[index]))
-    return sessions, n_cross
-
-
-def _insert_noise(sessions: list[list[_StreamSlot]], slots: Sequence[_StreamSlot],
-                  session_max_len: int, rng: "random.Random") -> int:
-    """⑦ 逐噪音帧 (会话, 槽位) 掷签：满员会话（len ≥ session_max_len）退出签池；
-    签池耗尽 ⇒ 余帧从交织缺席（不补生成）。返回实际织入帧数。v1.14：槽位由持有
-    cfg 的 ``weave_stream`` 预先构造后传入（噪音真值要条件写档位键），本函数只掷签
-    落位——入参数不变。"""
-    woven = 0
-    for slot in slots:
-        pool = [session for session in sessions if len(session) < session_max_len]
-        if not pool:
-            _log.warning("noise weaving stopped: every session is at "
-                         "stream.session_max_len; %d noise frame(s) dropped",
-                         len(slots) - woven,
-                         extra={"stage": "generate", "batch": 0})
-            break
-        target = rng.choice(pool)
-        target.insert(rng.randint(0, len(target)), slot)
-        woven += 1
-    return woven
-
-
-def _lay_timestamps(sessions: list[list[_StreamSlot]], cfg: "ResolvedConfig",
-                    rng: "random.Random") -> None:
-    """⑨ ts 铺设：起点 ts_start（流首帧零消费）；帧间隔 uniform(frame_gap_s)、会话
-    间隔 uniform(gap_s + lo, gap_s + hi)（恒 > stream.gap_s ⇒ 摄取侧按同一 gap_s
-    复演出相同会话切分）；datetime + timedelta 正间隔累加 ⇒ 严格递增；isoformat
-    微秒精度写出。"""
-    lo, hi = cfg.generate_stream.frame_gap_s
-    gap = float(cfg.stream.gap_s)
-    current = datetime.fromisoformat(cfg.generate_stream.ts_start)
-    first = True
-    for session in sessions:
-        for position, slot in enumerate(session):
-            if first:
-                first = False
-            elif position == 0:
-                current += timedelta(seconds=rng.uniform(gap + lo, gap + hi))
-            else:
-                current += timedelta(seconds=rng.uniform(lo, hi))
-            slot.ts = current.isoformat(timespec="microseconds")
-
-
-def weave_stream(survivors: Sequence[RealizedSequence], noise_payloads: Sequence[str],
-                 cfg: "ResolvedConfig", rng: "random.Random",
-                 ) -> tuple[list[list[_StreamSlot]], dict]:
-    """机械交织器入口（纯函数族，零 LLM 零 IO；裁决·抽签消费顺序表④–⑨单流顺序
-    消费）：④重复选取 rng.sample ⑤装箱洗牌+成对交叉 ⑥逐交叉会话切换点 ⑦逐噪音帧
-    掷签 ⑧重复序列成流尾新会话（零 rng）⑨ts 铺设；尾声回填 truth.session 全流会话
-    序数。
-
-    @param survivors 通过序列校验与相似度过滤的序列。
-    @param noise_payloads 已生成的噪音帧文本。
-    @param cfg 已解析配置。
-    @param rng 单流伪随机数生成器。
-    @return (会话列表, 仅计数统计)；sessions 不含重复尾会话。
-    """
-    gs = cfg.generate_stream
-    dup_k = min(gs.duplicates, len(survivors))
-    if dup_k < gs.duplicates:
-        _log.warning("duplicates clamped to the surviving sequence count: %d -> %d",
-                     gs.duplicates, dup_k, extra={"stage": "generate", "batch": 0})
-    chosen = rng.sample(list(survivors), dup_k) if dup_k else []           # ④
-    sessions, crossed = _pack_sessions(survivors, gs.sessions, rng)        # ⑤⑥
-    noise_slots = [_noise_slot(payload, bool(gs.tiers))                    # 零 rng
-                   for payload in noise_payloads]
-    woven_noise = _insert_noise(sessions, noise_slots,
-                                cfg.stream.session_max_len, rng)           # ⑦
-    for source in chosen:                                                  # ⑧
-        sessions.append(_duplicate_slots(source))
-    for session_no, session in enumerate(sessions):
-        for slot in session:
-            slot.truth["session"] = session_no
-    _lay_timestamps(sessions, cfg, rng)                                    # ⑨
-    stats = {"sessions": len(sessions) - dup_k, "crossed_sessions": crossed,
-             "frames": sum(len(seq.payloads) for seq in survivors),
-             "noise_frames": woven_noise, "duplicates": dup_k}
-    return sessions, stats
-
-
-def _timestamp_text(timestamp_us: int, cfg: "ResolvedConfig") -> str:
-    """把 planner 微秒时间转换为固定 offset 的 ISO 文本。"""
-    from datetime import timezone
-    from labelkit.common.runtime.temporal import fixed_offset
-
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    value = epoch + timedelta(microseconds=timestamp_us)
-    return value.astimezone(fixed_offset(cfg.generate_stream.ts_start)).isoformat(
+    offset = tz(timedelta(minutes=cfg.generate_stream.schedule.utc_offset_minutes))
+    epoch = datetime(1970, 1, 1, tzinfo=tz.utc)
+    return (epoch + timedelta(microseconds=timestamp_us)).astimezone(offset).isoformat(
         timespec="microseconds")
 
 
-def _planned_task_slot(local_owner: int, sequence: RealizedSequence,
-                       position: int, timestamp_us: int) -> _StreamSlot:
-    """构造一条 planner task slot 并保持旧 truth 键序。"""
+def _task_slots(local_owner: int, sequence: RealizedSequence, layout: Any,
+                cfg: "ResolvedConfig") -> list[_StreamSlot]:
+    """一条幸存序列的任务帧槽位（truth.session 占位 −1，装配尾声回填）。"""
     plan = sequence.plan
     tier = _tier_truth(plan.tier_rank, tiered=plan.tier_rank is not None)
-    truth = {"session": -1, "sequence_class": plan.class_name,
-             "sequence": plan.ordinal, **tier,
-             "frame_class": sequence.frame_classes[position], "noise": False}
-    return _StreamSlot(payload=sequence.payloads[position], truth=truth,
-                       owner=local_owner)
+    return [_StreamSlot(payload=sequence.payloads[i],
+                        truth={"session": -1, "sequence_class": plan.class_name,
+                               "sequence": plan.ordinal, **tier,
+                               "frame_class": sequence.frame_classes[i], "noise": False},
+                        owner=local_owner,
+                        ts=_us_iso(frame.start_us, cfg),
+                        ts_us=frame.start_us)
+            for i, frame in enumerate(layout.frames)]
 
 
-def _planned_noise_slot(payload: str, tiered: bool) -> _StreamSlot:
-    """构造一条固定 timestamp 的噪音 slot。"""
-    return _noise_slot(payload, tiered)
+def _noise_frame_slot(realized: RealizedNoise,
+                      cfg: "ResolvedConfig") -> _StreamSlot:
+    """一帧 noise 槽位（v1.17：truth.frame_class = 实际噪音类名，其余三 null）。"""
+    return _StreamSlot(payload=realized.payload,
+                       truth={"session": -1, "sequence_class": None, "sequence": None,
+                              **_tier_truth(None, tiered=bool(cfg.generate_stream.tiers)),
+                              "frame_class": realized.slot.frame_class, "noise": True},
+                       owner=None,
+                       ts=_us_iso(realized.slot.timestamp_us, cfg),
+                       ts_us=realized.slot.timestamp_us)
 
 
-def _projected_primary_sessions(survivors: Sequence[RealizedSequence], plan: StreamPlan,
-                                noise_payloads: Sequence[str], cfg: "ResolvedConfig",
-                                ) -> tuple[list[list[_StreamSlot]], dict[int, int], int]:
-    """按 planner projection 组装未含 duplicate 的固定会话。"""
-    from labelkit.common.runtime.sequence_planner import project_survivors
+def _duplicate_slots(source: RealizedSequence, dup: Any,
+                     cfg: "ResolvedConfig") -> list[_StreamSlot]:
+    """一条流尾 duplicate 的槽位：载荷深拷贝（含已回填时间字段，裁决·双时间语义），
+    ts = DuplicateLayout.frames 的平移后时间；truth.duplicate_of = 源类内序数。"""
+    import copy as _copy
 
-    original = {seq.plan.index: seq for seq in survivors}
-    projected = project_survivors(plan.planner_layout, set(original))
-    ordered = tuple(sorted(survivors, key=lambda item: item.plan.index))
-    local = {seq.plan.index: index for index, seq in enumerate(ordered)}
-    noise_index = 0
-    sessions: list[list[_StreamSlot]] = []
-    for session in projected.sessions:
-        slots: list[_StreamSlot] = []
-        for frame in session.frames:
-            if frame.noise:
-                if noise_index >= len(noise_payloads):
-                    continue
-                slot = _planned_noise_slot(noise_payloads[noise_index],
-                                           bool(cfg.generate_stream.tiers))
-                noise_index += 1
-            else:
-                sequence = original[frame.owner]
-                slot = _planned_task_slot(local[frame.owner], sequence,
-                                          int(frame.position), frame.timestamp_us)
-            slot.ts = _timestamp_text(frame.timestamp_us, cfg)
-            slot.truth["session"] = len(sessions)
-            slots.append(slot)
-        if slots:
-            sessions.append(slots)
-    return sessions, local, projected.crossed_sessions
+    plan = source.plan
+    tier = _tier_truth(plan.tier_rank, tiered=plan.tier_rank is not None)
+    return [_StreamSlot(payload=_copy.deepcopy(source.payloads[frame.position]),
+                        truth={"session": -1, "sequence_class": plan.class_name,
+                               "sequence": None, **tier,
+                               "frame_class": frame.frame_class,
+                               "noise": False, "duplicate_of": plan.ordinal},
+                        owner=None,
+                        ts=_us_iso(frame.start_us, cfg),
+                        ts_us=frame.start_us)
+            for frame in dup.frames]
 
 
-def _duplicate_windows(sequence: RealizedSequence, cfg: "ResolvedConfig") -> dict:
-    """读取 duplicate source 所属类的生效窗口表。"""
-    from labelkit.common.runtime.temporal import normalize_calendar_windows
+def weave_scenario_stream(survivors: Sequence[RealizedSequence],
+                          noises: Sequence[RealizedNoise], plan: "ScenarioPlan",
+                          cfg: "ResolvedConfig") -> tuple[list[list[_StreamSlot]], dict]:
+    """把冻结 ``ScenarioPlan`` 投影为最终 primary、noise 与 duplicate 流（零 rng）。
 
-    view = cfg.class_views[sequence.plan.class_name]
-    windows = effective_windows(view.windows, cfg.generate_stream.windows)
-    return {item.frame_class: item for item in normalize_calendar_windows(windows)}
+    作废槽位只缺席（v1.16 void 语义过渡）：空 session 消失、幸存者保留 planner
+    时间戳、session 按时间重编号；noise 仅当严格落于其 session 幸存任务帧的
+    首末之间才存活；duplicate 的 source 未交付则整条省略（§9.4 shortfall 语义，
+    计数面挂 Wave 6/7 的 delivery 块）。
 
-
-def _append_planned_duplicates(sessions: list[list[_StreamSlot]],
-                               survivors: Sequence[RealizedSequence], plan: StreamPlan,
-                               local: dict[int, int], cfg: "ResolvedConfig") -> int:
-    """按预抽 source 顺序追加固定尾部 duplicate session。"""
-    from labelkit.common.runtime.temporal import minimal_duplicate_shift
-
-    by_plan = {seq.plan.index: seq for seq in survivors}
-    from labelkit.common.runtime.temporal import timestamp_us
-
-    tail = max((timestamp_us(frame.ts) for session in sessions for frame in session), default=0)
-    used = 0
-    for source_index in plan.duplicate_order:
-        if used >= cfg.generate_stream.duplicates:
-            break
-        source = by_plan.get(source_index)
-        if source is None:
-            continue
-        source_slots = [slot for session in sessions for slot in session
-                        if slot.owner == local[source_index]]
-        if not source_slots:
-            continue
-        source_times = tuple((timestamp_us(slot.ts), slot.truth["frame_class"])
-                             for slot in source_slots)
-        windows = _duplicate_windows(source, cfg)
-        shift = minimal_duplicate_shift(source_times, tail,
-                                        int(cfg.stream.gap_s * 1_000_000), windows,
-                                        cfg.generate_stream.ts_start)
-        duplicate: list[_StreamSlot] = []
-        for slot, (timestamp, frame_class) in zip(source_slots, source_times):
-            truth = {"session": len(sessions), "sequence_class": source.plan.class_name,
-                     "sequence": None, **_tier_truth(source.plan.tier_rank,
-                     source.plan.tier_rank is not None), "frame_class": frame_class,
-                     "noise": False, "duplicate_of": source.plan.ordinal}
-            item = _StreamSlot(payload=copy.deepcopy(slot.payload), truth=truth, owner=None)
-            item.ts = _timestamp_text(timestamp + shift, cfg)
-            duplicate.append(item)
-        sessions.append(duplicate)
-        tail = max(timestamp_us(item.ts) for item in duplicate)
-        used += 1
-    return used
-
-
-def weave_planned_stream(survivors: Sequence[RealizedSequence], noise_payloads: Sequence[str],
-                         plan: StreamPlan, cfg: "ResolvedConfig") -> tuple[list[list[_StreamSlot]], dict]:
-    """把已冻结 planner skeleton 投影为最终 primary、noise 与 duplicate 流。
-
-    @param survivors 通过序列校验与相似度过滤的序列。
-    @param noise_payloads 已生成的噪音帧文本。
-    @param plan 已冻结的时间流计划。
+    @param survivors 通过校验的序列（计划序）。
+    @param noises 交付成功的 noise 槽位。
+    @param plan M1 冻结的场景计划。
     @param cfg 已解析配置。
-    @return (会话列表, 仅计数统计)；sessions 不含重复尾会话。
+    @return (会话列表, 仅计数统计)。
     """
-    sessions, local, crossed = _projected_primary_sessions(survivors, plan,
-                                                            noise_payloads, cfg)
-    backfill_time_fields(sessions, cfg)
-    duplicates = _append_planned_duplicates(sessions, survivors, plan, local, cfg)
+    layout_by_slot = {layout.slot_key: layout for layout in plan.layouts}
+    local_index = {seq.plan.index: i for i, seq in enumerate(survivors)}
+    by_slot_key = {seq.plan.slot_key: seq for seq in survivors}
+    sessions: list[list[_StreamSlot]] = []
+    crossed = 0
+    for session in plan.sessions:
+        entries: list[tuple[int, _StreamSlot]] = []
+        for slot_key in (session.primary_slot_key, session.secondary_slot_key):
+            sequence = by_slot_key.get(slot_key) if slot_key is not None else None
+            if sequence is None:
+                continue
+            layout = layout_by_slot[slot_key]
+            entries.extend(zip(
+                (frame.start_us for frame in layout.frames),
+                _task_slots(local_index[sequence.plan.index], sequence, layout, cfg)))
+        task_times = [stamp for stamp, _ in entries]
+        for realized in noises:
+            if realized.slot.session_index != session.index or not task_times:
+                continue    # 任务帧全部作废的 session ⇒ noise 一并不存活
+            if not min(task_times) < realized.slot.timestamp_us < max(task_times):
+                continue
+            entries.append((realized.slot.timestamp_us,
+                            _noise_frame_slot(realized, cfg)))
+        if not any(slot.owner is not None for _, slot in entries):
+            continue            # 无任务帧 ⇒ session 消失
+        if (session.secondary_slot_key in by_slot_key
+                and session.primary_slot_key in by_slot_key):
+            crossed += 1
+        entries.sort(key=lambda item: item[0])
+        sessions.append([slot for _, slot in entries])
+    backfill_time_fields(sessions, cfg)     # 先回填：duplicate 深拷贝承源回填值
+    duplicates = 0
+    for dup in plan.duplicates:
+        source = by_slot_key.get(dup.source_slot_key)
+        if source is None:
+            continue            # 源槽位未交付 ⇒ 省略（shortfall 语义）
+        sessions.append(_duplicate_slots(source, dup, cfg))
+        duplicates += 1
+    for session_no, session in enumerate(sessions):
+        for slot in session:
+            slot.truth["session"] = session_no
     stats = {"sessions": len(sessions) - duplicates, "crossed_sessions": crossed,
              "frames": sum(len(seq.payloads) for seq in survivors),
              "noise_frames": sum(1 for session in sessions for slot in session
@@ -794,15 +493,15 @@ def weave_planned_stream(survivors: Sequence[RealizedSequence], noise_payloads: 
 
 def _calendar_days_spanned(sessions: Sequence[Sequence[_StreamSlot]],
                            cfg: "ResolvedConfig") -> int:
-    """计算联合流中非噪音任务帧覆盖的 fixed-offset 自然日数。"""
-    from labelkit.common.runtime.temporal import fixed_offset, timestamp_us
+    """计算流中非噪音任务帧（含 duplicate 尾）覆盖的固定 offset 自然日数。"""
+    from datetime import datetime, timedelta, timezone as tz
 
-    timestamps = [timestamp_us(slot.ts) for session in sessions for slot in session
+    timestamps = [slot.ts_us for session in sessions for slot in session
                   if not slot.truth["noise"]]
     if not timestamps:
         return 0
-    offset = fixed_offset(cfg.generate_stream.ts_start)
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    offset = tz(timedelta(minutes=cfg.generate_stream.schedule.utc_offset_minutes))
+    epoch = datetime(1970, 1, 1, tzinfo=tz.utc)
     first = (epoch + timedelta(microseconds=min(timestamps))).astimezone(offset).date()
     last = (epoch + timedelta(microseconds=max(timestamps))).astimezone(offset).date()
     return (last - first).days + 1

@@ -77,6 +77,8 @@ API 增量（均只增）：`MetricsSink.__init__` 增可选尾参 `listener`；
 违规 message、时间表、相关字段值和 API key。规划器的 CP-SAT 求解经过已有 `llm.call`
 统计面以外不产生新 trace 记录，report 计数由 M6/M10 供给。
 
+**场景规划与精确交付（v1.17）**：planner 错误使用稳定英文 message 模板——capacity 形如 `sequence planner capacity exceeded: model=timeline entries=251891 limit=250000 dominant=crossing families={crossing:170000,session_slot:60000,...}`（含 actual / limit / dominant family，**绝无 INFEASIBLE 字样**；不输出「减少 horizon」一类猜测建议——schedule 已是显式硬边界）；budget message 明确 `model=quota|timeline` 与超时的 layer 名；infeasible 错误列 assumption core 的自然名称集合，形如 `sequence planner infeasible: constraints=[weekday_coverage,navigate_before_clock_out,ticket_request_work_hours]`（不声称最小）；静态 arithmetic 错误优先于 solver core 且同轮聚合（3.1.4.2、7.6）。启动 INFO 回显 `ResolvedPaths` 启用通道——启动 INFO 与 dry-run 各打印一次 output、report 及实际启用的 side channel 绝对路径（数据无关；M2 / M11 / console 同源消费同一 `ResolvedPaths`，3.1.4.2）。trace 面零增量：ScenarioPlan 在 M1 创建时 EventLog 尚未构造，**不新增虚假 planner 事件、不新增 trace 通道或事件名**；运行期把 plan digest、objectives 与 family stats 的冻结摘要并入既有 `run.start` payload（3.10.3）；trace 不记录 hook payload、quota 内容样本或 credential。
+
 ### 3.12.5 配置项
 
 见 5.1 `tool.log_format` 与 5.2 `[trace]` 节、`quality.judgment_reasons`。
