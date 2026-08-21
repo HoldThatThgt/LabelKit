@@ -1,8 +1,10 @@
 # 提案：按类档位表——每个序列类独立配置帧类构成档位
 
-> **状态：superseded（v1.17 Wave 8 已收口）。** 本文仅保留 v1.15 的方案论证与决策溯源；当前行为以 v1.17 主规格为准。
+> **状态：superseded by v1.18 sequence generation。** 当前行为事实源为
+> `docs/dev/SPEC-sequence-generation-redesign.md`、`spec/*.md` 与 `docs/CONTRACTS.md`；
+> 本文其余内容仅保留历史方案论证，旧 SPEC 链接不代表当前行为。
 
-> **状态：已 SPEC 化（2026-08-19）。**最终开发规格见 `docs/dev/SPEC-per-class-tiers.md`——两路预实现审计（代码可行性/亲和性、文件修改清单穷尽）已于同日完成并折入其 §2 裁决表与 §4 清单（最重两条：噪音槽位在场谓词与计数器键冻结面，均由裁决·全局表为锚与裁决·计数器键按类重冻结收编），**凡与本文不一致处以 SPEC 为准**。本文保留为方案论证与决策溯源材料。
+> 本文记录 v1.15 当时的设计过程；对应旧开发 SPEC 已在 v1.18 clean break 删除。
 > 问题验证：v1.14 的档位表 `[[generate.stream.tiers]]` 是**全局唯一**的——所有参与序列类共享同一套档位定义（tier_rank / weight / frame_classes），每类配额按同一套权重配分；`[class.*.generate]` 白名单（六键）无档位面。意图不同则帧类语汇与构成天然不同（购票有确认帧、闲聊没有），全局表无法表达「每意图各一套构成/权重」。
 
 ---

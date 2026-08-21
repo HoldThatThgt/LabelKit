@@ -1,11 +1,12 @@
 # LabelKit v1.17 场景规划与精确交付提案
 
-> 状态：**superseded（v1.17 Wave 8 已收口）**。
+> 状态：**superseded by v1.18 sequence generation**。
 >
 > 范围：`docs/dev/E2E-FINDINGS.md` 的 E2E-42 至 E2E-60。
 >
-> 本文保留 v1.17 实现前的事实、业界依据、备选方案与取舍历史；决策正文与当前行为以主规格及
-> `docs/CONTRACTS.md` 为准。旧的“等待实现 / 当前 v1.16”表述是历史快照，不代表当前 shipped 状态。
+> 当前行为事实源为 `docs/dev/SPEC-sequence-generation-redesign.md`、`spec/*.md` 与
+> `docs/CONTRACTS.md`。本文其余内容只保留实现前的事实、业界依据、备选方案与取舍历史；
+> 旧 SPEC 链接和旧版本表述不代表当前 shipped 状态。
 
 ## 1. 问题不是十九个补丁
 

@@ -1,6 +1,8 @@
 # 提案：时间流生成（文本原子时间流合成与序列级标注）
 
-> **状态：superseded（v1.17 Wave 8 已收口）。** 本文保留 v1.13 的方案论证与决策溯源；当前行为以 v1.17 主规格为准。
+> **状态：superseded by v1.18 sequence generation。** 当前行为事实源为
+> `docs/dev/SPEC-sequence-generation-redesign.md`、`spec/*.md` 与 `docs/CONTRACTS.md`；
+> 本文其余内容仅保留历史方案论证，旧 SPEC 链接不代表当前行为。
 
 
 ---

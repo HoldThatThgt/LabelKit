@@ -1,55 +1,32 @@
 # 3. 模块详细设计
 
-本章每个模块按统一模板描述：**职责与边界 → 输入/输出 → 数据结构与 API → 算法与流程 → 配置项 → 错误处理 → 背书**。所有代码签名为 Python 3.11+，公共数据结构（`Record`、`PipelineItem` 等）的完整定义集中在第 4 章。
+本章每个模块按统一模板描述：**职责与边界 → 输入/输出 → 数据结构与 API → 算法与流程 → 配置项 → 错误处理 → 背书**。所有代码签名为 Python 3.11+，公共数据结构（`Record`、`PipelineItem` 与 v1.18 generation 契约）集中在第 4 章。
 
-## 3.0 v1.16 时间流序列规则的跨模块落点
+## 3.0 v1.18 序列生成内核的跨模块落点
 
-v1.16 不增加新的流水线 Stage 或模块编号。它在时间流生成的既有 M1/M6/M8/M10 接缝上增加共享 common 运行时算法；M11、M12、CLI、M9 与其他算子不增加行为分支。约束路径的单一依赖方向如下：
+v1.18 不增加 Stage 编号。flat generate 继续由 M6 的 `GenerateStage` 进入既有回流链；sequence generate_only 由 M10 的专用交付控制器驱动，不把全仓 Stage 协议改造成事务框架。
 
 ```mermaid
 flowchart LR
-    M1["M1 config<br/>解析、局部校验、全流预检"] --> P["common/runtime/sequence_planner.py<br/>唯一 CP-SAT 问题构造与求解"]
-    M10["M10 orchestrator<br/>estimate_run 与报告显式装配"] --> P
-    M6["M6 generate<br/>内容调用、验证、幸存投影与组装"] --> P
-    P --> D["common/runtime/declare.py<br/>15 模板、候选对、evaluator 与约束编译"]
-    P --> T["common/runtime/temporal.py<br/>微秒、固定偏移日历窗与重发位移"]
-    M6 --> M8["M8 schema-engine<br/>brief_schema 与逐帧结构保证"]
-    M6 --> H["common/extensions/hooks.py<br/>逐帧与序列回调归一化"]
+    M1["M1 config<br/>解析 SequenceGenerationConfig"] --> GC["operators/generation/program.py<br/>唯一 GenerationProgram 编译入口"]
+    GC --> P["operators/generation/planner.py<br/>唯一 ScenarioPlan 编译入口"]
+    P --> D["orchestration/generation_delivery.py<br/>slot 串行准入与 AttemptTransaction"]
+    D --> G["operators/generation/<br/>seed / event / state / render / evaluate / project"]
+    G --> M8["M8 schema-engine<br/>结构保证 + 可执行 post-validator"]
+    D --> DS["M3/M4/M5/M7<br/>attempt-local 下游试算"]
+    DS --> E["M11 SequenceDeliveryEmitter<br/>最终 SequenceRows"]
+    E --> R["ReplayProjector + CrossViewReconciler<br/>最终视图与 prospective 计费"]
+    R --> C["M11 prepare_product / commit<br/>report digest 唯一真值"]
+    M9["M9 LLM client<br/>fatal passthrough"] --> G
 ```
 
 | 责任面 | 规范落点 | 强制边界 |
 |---|---|---|
-| M1 配置 | 3.1：解析全局/按类 rules/windows 与 `sequence_validator`，校验 15 模板、correlation Schema、每个候选长度、全配额前缀和 planner 状态 | 用同 seed 独立 RNG 副本，不推进运行期随机源；UNKNOWN 不得伪报不可满足 |
-| M6 生成 | 3.6：实际前缀重放联合计划；约束路径生成 brief/frames，依次执行逐帧回调、声明式 evaluator、序列回调、相似度、幸存投影、噪音过滤、回填、重发与组装 | 首个 LLM 调用前冻结 word/session/timestamps/noise slots；失败后不重解、不重织、不补齐 |
-| M8 结构引擎 | 3.8：新增 `brief_schema(length)`；既有 `plan_schema` 完整保留给 v1.15 默认路径 | brief Schema 只允许逐位置 `brief`，不让约束路径 LLM 决定 frame class |
-| M10 编排 | 3.10：`estimate_run` 复用同一 planner；按固定键位显式装配 rules、回调 scrap 与 windows 报告块 | 不自行推导另一套计划；显式零值块不依赖计数器首触 |
-| common 配置/契约/扩展 | 第 4–5 章：冻结 `SequenceRuleSpec`、`CorrelationSpec`、`SequenceWindowSpec`、`SequenceValidationInput`、三态 effective helpers 与 hook 契约 | common 不导入 operators/orchestration；回调拿 JSON-compatible 深拷贝，突变不回写 |
-| M11 与 M12 | 第 6–7 章：沿用既有工件、报告交付、trace 与日志纪律 | 工件行形和 truth/generator 键序不变；零新 trace 通道、事件或错误 kind |
+| M1 配置 | 3.1、5.2：解析互斥的 declared / instruction-only 形状，冻结 `SequenceGenerationConfig`、ClassView 与六个绝对输出路径 | 旧 sequence-generation 键定向拒绝；不读取密钥值、不调用 LLM、不反向导入 operators；M1 后同一 compiler/model 供 validate、dry-run、run |
+| planner | 3.6：按完整 primary session 分 block，用固定单线程 CP-SAT 冻结 role/position、逻辑时间、投影时间、session、noise 与 replay | 只接受 OPTIMAL；INFEASIBLE 为 exit 2，FEASIBLE/UNKNOWN 与 MODEL_INVALID 为 exit 4；无 greedy fallback |
+| generation operators | 3.6、3.8：逐事件以 `EventExecutionContext` 为唯一根，按 ActorView → EventPlan → 原子 StateExecutor → Schema/hook → publish → FrameRenderer → 无 role EventDraft 执行；PatternEvaluator 绑定 actual role 后才构造 EventTruth；另有独立 state/blind semantic/noise evaluator 与 pre-downstream 投影 | declared 不暴露 hidden state；EventDraft 是唯一逐事件 history carrier；instruction-only 不声称机械 actor knowledge；semantic request 不携带 evaluator truth；反例只从目标点起重规划 causal suffix，protected prefix 只复用 draft 语义字段并重派生分支 ID/工件时间 |
+| delivery | 3.10：一个 counterfactual set 是一个 slot attempt；prospective dedup → pointwise quality → annotate → verify → M11 装配 `SequenceRows` → replay 投影 → CrossViewReconciler → retained-content check → group commit | `AttemptTransaction.items` 是唯一可变 item 真值；slot 与 variant 按声明序准入；失败丢弃全部 attempt-local 数据和 dataset counter delta，usage/resolved-at/trace 不回滚；fatal、熔断、取消原样穿透且不消耗 attempt |
+| M11 发射 | 3.11：`assemble_sequence` 以最终 item 装配零 I/O `SequenceRows`；`prepare_product` 唯一计算 digest 并构造 `GenerationProduct(main_rows, stream_rows, report)`；全部 sequence/noise/replay 接受后才打开正式通道 | `commit` 只读 report 的同一 digest；main、stream、report 各自 `.part` + fsync + replace，manifest 最后替换；commit-I/O 可留下固定路径混代，旧 manifest 保持；failed report 不能否定有效 manifest |
+| common 契约 | 第 4 章：冻结含 `EventDraft` 的 generation dataclass、request/result 与 `DedupProbeToken`；Mapping 构造时复制为只读视图 | `EventDraft` 不含 role，`EventTruth` 不得用作逐事件 history；删除旧 `GenerateStreamConfig`、`ScenarioConfig`、旧 `ScenarioPlan`、`SequencePlan`、`StreamPlan` 与序列 hook 输入，不留 alias 或 wrapper |
 
-联合规划器不是一个新算子：它在 M1、`estimate_run` 与 M6 之间共享同一个问题构造与求解入口。生产依赖精确锁定 `ortools==9.15.6755`，模型固定单线程与确定性预算；不提供自研替代实现、运行时版本替换或失败后的 fallback。没有实际生效 rules/windows 且没有 `sequence_validator` 时，调用链必须直接落回 v1.15 原分支并保持逐字节等价。
-
-## 3.0.1 v1.17 场景规划与精确交付的跨模块落点
-
-v1.17 同样不增加新的流水线 Stage 或模块编号。它在 M1/M6/M9/M10/M11/CLI 的接缝上重构时间流生成的规划、路径、凭据与交付面；共享运行时算法落新的 canonical 包 `labelkit/common/runtime/scenario/`，**取代并删除** v1.16 的 `common/runtime/sequence_planner.py`、`declare.py`、`temporal.py`（仍需逻辑先迁入新属主再删旧文件，不留 re-export、无平行实现）；`orchestration/profile_usage.py` 同批删除，引用收集器下沉 common 层。依赖方向与强制边界：
-
-```mermaid
-flowchart LR
-    M1["M1 config<br/>v1.17 键面解析、project root、secret-free<br/>compile_scenario 的唯一调用方"] --> SP["common/runtime/scenario/<br/>quota 编译 + timeline 规划 + 诊断"]
-    M1 --> PP["ResolvedPaths / ValidationHooks / ScenarioPlan<br/>ResolvedConfig 三个冻结 parse product"]
-    M10["M10 orchestrator<br/>estimate / report / delivery exit code"] --> PP
-    M6["M6 generate<br/>exact delivery 状态机、structured noise"] --> PP
-    M1 --> H["common/extensions/hooks.py<br/>path.py:function 加载、四冻结 callable"]
-    CR["common/runtime/credentials.py<br/>RuntimeCredentials（仅 run / validate --probe 物化）"] --> M9["M9 llm-client<br/>构造必收 RuntimeCredentials"]
-```
-
-| 责任面 | 规范落点 | 强制边界 |
-|---|---|---|
-| M1 配置 | 3.1：v1.17 键面（quotas / schedule / crossed_sessions / noise / sequence_rules / frame_rules / frame_windows / duration / resources，5.2.2）、project-root 相对路径与 `ResolvedPaths` 派生、四个 hook 的 `spec_from_file_location` 加载与 synthetic probe、`derive_stream_bounds` 一次性派生检查、`compile_scenario` 单次调用 | 静态校验不读任何环境变量 value reader；time-stream 形态无法生成完整计划时 load 不返回半成品；不再触发 `check_local_candidates` / `check_question` 旧调用面 |
-| scenario 包 | `scenario/model.py`（frozen dataclass 族，4 章）、`quota.py`（period 展开、exact cohort、largest remainder、quota model 与逐类 target）、`calendar.py`（fixed-offset schedule、frame window、period bucket）、`rules.py`（frame rule 与 sequence rule 解析后的纯语义/evaluator）、`planner.py`（`compile_scenario`、model assembly、solve、decode、digest）、`sessions.py`（owner permutation、session/crossing/noise reserve builder）、`diagnostics.py`（bounds、family stats、assumptions 与 exception）、`noise.py`（frozen layout 上的 deterministic noise allocation） | common 不导入 operators/orchestration；删除 v1.16 三个旧 planner 文件与 `orchestration/profile_usage.py`，不创建同名 shim、re-export 或 compatibility module |
-| 凭据 | `common/runtime/credentials.py`：`RuntimeCredentials` 仅 run 与 `validate --probe` 经 `resolve_credentials` 物化；common 层唯一 `referenced_profiles(config)` 收集器（static validation、credential resolution、probe、runtime 与 estimate 共用） | 删除 `LLMProfile` / `EmbeddingProfile` 的 `api_key` 字段（profile 只保存环境变量名）；LLMClient 构造必收 `RuntimeCredentials`，删除内部 env fallback 与 profile secret fallback；credentials 不进 repr、日志、trace、report、exception 或 deepcopy |
-| M6 生成 | 3.6：只读消费 `ScenarioPlan`——stable slot 交付状态机（brief / realize / validate × `max_attempts_per_slot`）、structured noise、幸存者投影（duplicate source 未交付只计 shortfall） | 不重新规划、不改 frame word / timestamps / session / quota / noise slot；slot 顺序 acceptance 与 similarity commit（并发调用可乱序完成，提交回 slot 序）；删除 M6 侧 `select_feasible_plan` |
-| M10 编排 | 3.10：dry-run 顶层 `report.estimate` 直接引用 estimate 对象（console 与 JSON 同源）；`report.run.paths`、`report.generate.stream` 新四键与 quota row 装配；delivery 耗尽 exit 1 | 不再触发 planner（plan 由 M1 冻结在 `ResolvedConfig.scenario_plan`）；estimate 不重复求解 |
-| M11 发射 | 3.11：只消费 `ResolvedPaths`；partial exact delivery 原子交付（已成功部分照常写主输出 / 工件 / rejects） | 不从字符串重新推导 cwd-relative 路径；report 文件名后缀不按命令模式追加 |
-| M8 / hooks | 3.8 与第 4 章：`ResolvedHook` / `ValidationHooks` 冻结 callable 载体；`ScenarioSequence` / `ScenarioValidationInput` 新冻结输入 | M6 与 schema engine 不再按字符串二次 resolve hook；序列化面只允许 reference，绝不遍历或输出 target |
-
-`ScenarioPlan` 在 M1 创建一次（`ResolvedConfig.scenario_plan`），validate console、dry-run report、live report 与 M6 消费同一对象并回显同一 `plan_digest`（相同配置字节、CLI override、seed、LabelKit/OR-Tools 版本必须得到相同 digest）。不新增第三方依赖：整数与时间规划继续使用已锁定的 `ortools==9.15.6755`，hook 文件加载使用 stdlib `importlib`，fixed-offset calendar 使用 stdlib `datetime`。RNG 侧自 v1.17 起分立五个具名、互不借位的随机流（`scenario.preference` / `scenario.noise` / `delivery.profile` / `delivery.content` / `artifact.duplicate`，各 `Random(f"{seed}:<name>")` 独立构造）——某 slot 多一次 content retry 不得改变其他 slot 的 length、timestamp、noise、profile 或 duplicate 抽签。
+依赖方向保持 `cli → orchestration → operators → common`。新增 `jsonpatch` 用于 RFC 6902 原子状态执行；既有 `ortools==9.15.6755` 保持精确锁定。sequence 生产代码落 `labelkit/operators/generation/` 与 `labelkit/orchestration/generation_delivery.py`，旧 `labelkit/common/runtime/scenario/`、`labelkit/operators/generate_stream.py` 和 `labelkit/common/config/_generate_stream_constraints.py` 整体删除，不保留并行实现。

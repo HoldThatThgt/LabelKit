@@ -5,6 +5,8 @@
 **做：**（v1.8 新增算子）对批内每个 `status="active"` 的序列信封（episode），逐对相邻成员帧 ⟨s_i, s_{i+1}⟩ 经 LLM 产出结构化动作（内部 Schema，3.15.3），写入 `item.transitions`；**转移数 = 成员数 − 1**（动作发生在相邻帧之间 [45]）。链序位于 classify 之后、quality 之前（3.10.3）——类标签先就位使 `[class.<name>.extract]` 按类 instruction 生效（3.15.4 multi 行）；轨迹 rubric 与序列标注在下游消费步骤序列。仅 UI 模态序列（M1 强制 `extract.enabled` 要求 `segment.enabled` ∧ `run.modality="ui"`，2.3.1；文本序列的「转移」语义弱，v1 不适用，列演进候选 8.4）。
 **不做：**不重分段（边界属 M14 上游；成员集是给定输入）；不产出用户 Schema 字段（步骤序列是工具内部结构——进 `_meta.stream.steps` 并注入下游提示词；用户 Schema 产出物属 M5）；不淘汰记录（修复耗尽的默认路径是兜底留痕而非丢弃，3.15.6）；不打分、不评审。
 
+**v1.18 sequence generation 边界：**sequence 生成与其文本 replay 都不调用 M15；本算子仍只接受 `segment.enabled` 且 UI 模态的普通 process episode。生成工件中的 `_meta.event` 时间与 provenance 不产生 Transition，也不改变本节 UI-only 约束。
+
 | 模块 | 职责 | 边界 | 依赖 |
 |---|---|---|---|
 | M15 extract | 对每个 active 序列信封的每对相邻成员帧 ⟨s_i, s_{i+1}⟩ 经 LLM 产出结构化动作（内部 Schema），写入 `item.transitions`；转移数 = 成员数 − 1 | 不重分段（M14 上游）；不产出用户 Schema 字段（M5）；不淘汰记录 | M1, M8, M9 |

@@ -16,7 +16,7 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 - 时区：aware 值换算为 UTC epoch；naive 值**按 UTC 解释**。内部序键 = float 秒。
 - 解析失败与乱序**同走 `stream.on_disorder`**（"skip" 默认：跳过并计 bad_input + `IngestReport.disorder`；"fail"：InputError，退出码 3；5.2）。
 - 流式单调性校验不做全量重排：单调性游标**按 `stream.key` 分区键各自维护**（S19，内存 = 键基数）——逐设备/逐来源拼接的输入不会被整体判乱序；键变即断会话，**输入须按分区键成组**（交错流为演进候选，8.4）。
-- **与时间流工件的对应（v1.13）**：时间流生成形态产出的工件（6.5）就是本节格式的一份实例——工件行的时间戳字段名即该工程 `stream.order_by = "meta:<field>"` 声明的 `<field>`、文本字段名即 `input.text_field`，写出值为微秒精度的 ISO-8601 字符串（本节字符串分支）；工件另带一个 `truth` 对象，对摄取侧而言只是行上的普通字段（参与 id 计算、不参与任何判定，可经 `output.passthrough_fields` 透传做对照）。配同一份 `[stream]` 声明重放时，M2 切出的会话与生成侧逐一对应（3.2.8 可重放注记）。
+- **v1.18 sequence stream 工件**：工件行顶层固定为 `payload` 与 `_meta`（6.5）；重放工程固定 `input.text_field = "payload"`、`stream.order_by = "meta:_meta.event.timestamp"`。M2 允许 object payload 并按 canonical JSON 生成文本，完整 envelope 留在 `Record.raw`；冻结 id 与同源验证见 3.2.5。
 
 ## 6.2 输入：UI 模态
 
@@ -59,16 +59,9 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
              "project_file": "project.toml", "rubric": "default:ui", "seed": 42},
     "source": {"file": "capture/2026-07-01/b/uitree_2.jsonl", "pair_index": 2,
                "generated_from": [], "fields": {},           // passthrough_fields 落点
-               "generator": null},   // v1.2 只增：生成记录为 {"llm", "style"}（3.6.2），否则 null；
-                                     //   v1.14 键集条件形：时间流生成的档位表在场时增第三键
-                                     //   tier_rank（该序列所属档位序数），档位表缺省时维持两键
-                                     //   v1.15 零改动：在场判据仍是**全局**档位表非空（全局表为锚），键与序
-                                     //   不动；仅值来源条件化——= 本行序列类**生效表**内的档序数
-                                     //   （生效表 = 该类的 [[class.<name>.generate.tiers]] 或回落全局表），
-                                     //   跨类同序数不可比，类名见同行 _meta.classification.label
+               "generator": null},   // v1.2 只增：flat 生成记录为 {"llm", "style"}（3.6.2），否则 null
     "stream": null,                  // v1.8 恒在键（位置：source 之后、scores 之前——链序镜像）；
-                                     // = null 当 segment 与 generate_stream 均未启用（v1.13 门扩：
-                                     //   segment.enabled ∨ generate_stream.enabled，3.11.2）。启用时（3.14/3.10.3）：
+                                     // = null 当 segment 未启用；process stream 启用时（3.14/3.10.3）：
                                      // {"episode_id", "session_id", "order_span": [first, last], "member_count",
                                      //  "member_ids": [...], "member_sources": [{file, pair_index|line_no}, ...],
                                      //  "members": [{index, id[, label][, annotation, status]}, ...],
@@ -80,11 +73,6 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
                                      //                            //   校验兜底见 3.11.2；真实示例见 3.11.3）；帧粒度全关时
                                      //                            //   本键不在场——本块与 v1.11 逐字节等价（退化锚）；
                                      //                            //   手术后原/克隆行 members 分叉由 repaired 位消歧（4.3）
-                                     //                            // v1.13 时间流生成形态：本块与 label 列的在场门同步扩
-                                     //                            //   `∨ generate_stream.enabled`——条目恒 {index, id, label}
-                                     //                            //   （label = 蓝图定下的帧类真值，source="inherited"；本形态
-                                     //                            //   与 frame.annotate 互斥 ⇒ 无 annotation/status 两列，
-                                     //                            //   v1.12 条件列规则相容，3.6.5/3.11.2）
                                      //  "session_split": false,   // 所属会话曾被 batch_size 硬切（S21，M7 缺帧判定降级依据）
                                      //  "repaired": false,        // verify 缺陷修复改写过成员集（3.7 stream 分支；
                                      //                            //   multi 扇出下消歧同 id 兄弟行的成员分叉，3.13）
@@ -121,7 +109,15 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 }
 ```
 
-**时间流生成形态的 `_meta.stream`（v1.13）**：直装序列行原样复用上述 stream 块，取值面如下——`episode_id` = `session_id` 之外的序列 record.id、`order_span` = `["<工件路径>:<首行号>", "<工件路径>:<末行号>"]`、`member_sources` 每项 = `{file: <工件路径>, line_no: <工件行号>}`（工件路径即 `run.output` 同款相对写法，行号 1 基、与工件行序一一对应 ⇒ 主输出与工件双向可对账）、`members[]` 见上、`session_split = false`、`repaired = false`、`degraded = null`、`steps = null`（extract 不参与）、**无** `thread_id` / `fragments`（stitch 不参与）。`_meta.run.rubric` 在本形态下的空选择器解析为 `"default:trajectory"`（3.11.2 rubric 镜像）。
+**v1.18 sequence 主输出。**sequence 形态的 main 每行是一条 primary sequence，
+`Record.id = sequence_id`，并在 `_meta.generation` 携带冻结的 sequence truth。declared 形态包含
+`validation_mode`、`actor_knowledge_validation`、scenario set/index/id、world branch、sequence class、
+pattern、variant、expected violation 与 actual violations；instruction-only 形态不得伪造 scenario set、
+pattern、variant 或 expected violation。M11 只从下游完成后的最终 `PipelineItem` 装配 `SequenceRows.main_row`，
+因此 inherited classification、quality score、sequence/frame annotation 与 verification 都属于正式 main、
+retained bytes 和 delivery digest；不得从 pre-downstream `ProjectedSequence.main_record` 重建输出。
+main 不含 noise 或 replay 行，且不再输出旧 `tier_rank`、`time_fields` 或 `generate.stream` 真值。
+默认空 rubric 选择器在 sequence 单元上解析为 `default:trajectory`；用户显式选择器优先（A.3）。
 
 ## 6.4 report.json 结构
 
@@ -131,9 +127,6 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
            "interrupted": false, "circuit_broken": false, "exit_code": 0,   // circuit_broken：v1.5 只增 "modality": "ui", "seed": 42,
            "config_digest": "sha256:...", "project_digest": "sha256:..."},   // 配置指纹（脱敏后）
   // run 节 v1.6 只增："partial_delivery": true —— 仅熔断交付（3.10.3）时出现，恒伴随 circuit_broken=true
-  // run 节 v1.13 只增："artifact": {"path", "sha256", "lines"} —— 时间流工件条目（主输出摘要同款形态：
-  //             sha256 按落盘字节计、带 "sha256:" 前缀）；**仅工件通道实际写入时在场**（形态关闭与
-  //             dry-run 恒缺席，3.11.2 工件通道行）
   "counts": {"scanned": 5000, "ingested": 4987, "bad_input": 13,
               "dropped_dup": 412, "dropped_lowq": 305, "dropped_verify": 41,
               "failed": 9, "generated": 0, "emitted": 4220},
@@ -193,41 +186,6 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
   // v1.2 可选块："annotate": {"sc_disagreements": 0}（self-consistency 启用时）；
   //             "generate": {"buckets": {"default×concise": {"calls", "produced", "survived_dedup"[, "rejected_by_validator" — v1.5，仅配置 generate.sample_validator 时]}}}（generate 启用时）
   //             generate.buckets v1.7：classify 启用时桶 key 扩展为 "<class>×<llm>×<style>"（3.6.2 按类种子池行；关闭时格式不变）
-  // v1.13 可选子块（generate.stream 启用时出现，位于 generate 节内、buckets 之后；counts-only，键集与键序冻结）：
-  //   "generate": {"buckets": {...},
-  //                "stream": {"sessions",            // 交织出的会话数（**不含**重发尾会话）
-  //                           "crossed_sessions",    // v1.15 默认固定一/二 owner 装箱可由
-  //                                                  // Σ幸存 − sessions_eff 导出；
-  //                                                  // v1.16 幸存者投影后按剩余 owner 时间序列的
-  //                                                  // 真实 A-B-A / B-A-B 交替重算，不沿用代数公式
-  //                           "sequences": {<class>: {"planned", "produced"}},  // 按 [[classify.classes]] 声明序零基铺开
-  //                           "tiers": {...},        // v1.14，**条件在场**：仅**全局** [[generate.stream.tiers]]
-  //                                                  //   非空时出现（全局表为锚，v1.15 判据零改动）；键位冻结在
-  //                                                  //   sequences 之后、frames 之前（配额族相邻）；口径同
-  //                                                  //   sequences（planned 计于计划期、produced 数最终进链的
-  //                                                  //   条数）。由 M10 **显式铺开** ⇒ 零额档与全作废档也如实
-  //                                                  //   在场（planned 0 / produced 0），不依赖计数器首触序。
-  //                                                  //   **v1.15 双形**（按任一按类档位表是否在场二选一）：
-  //                                                  //   ① 平面形（全部序列类均未声明按类表）——
-  //                                                  //      {"<tier_rank>": {"planned", "produced"}}，
-  //                                                  //      按全局表 rank 升序铺开；与 v1.14 报表**逐字节相等**
-  //                                                  //      （M6 恒喂类段计数器，本形由 M10 按 rank 跨类求和）
-  //                                                  //   ② 类嵌套形（任一 [[class.<name>.generate.tiers]] 在场）——
-  //                                                  //      {"<class>": {"<tier_rank>": {"planned", "produced"}}}，
-  //                                                  //      外层 = 全部声明序列类按**声明序**零基铺开
-  //                                                  //      （sequences.<class> 同款）、内层 = 该类**生效表**
-  //                                                  //      rank 升序；零配额类与全作废档同呈 0/0
-  //                                                  //   两形的键均为十进制字符串，落盘无 sort_keys ⇒ 键序 =
-  //                                                  //   装配插入序；键位在两形下都仍冻结于 sequences 与 frames 之间
-  //                           "frames",              // 任务帧总数（幸存序列的步数之和）
-  //                           "noise_frames",        // 实际织入的噪音帧数（签池耗尽时 < 目标数）
-  //                           "duplicates",          // 实际重发的序列条数（按幸存数钳制后）
-  //                           "plan_calls", "realize_calls", "noise_calls",     // 三类调用数（realize 含对半降级的分次调用）
-  //                           "plan_failures", "realize_failures",              // 作废序列数（按失败环节归类）
-  //                           "validator_scrapped"}} // sample_validator 逐帧违规作废的序列数
-  //   —— M6 属主（3.6.5）；工件行数不在本子块，登记于 run.artifact.lines（上文 run 节）；
-  //      `report.stream` 节在本形态下**不出现**（那是 segment 的观测面，避免混淆）；
-  //      `report.classify` 直方图恒全零属预期（标签 inherited、零判决调用，3.13.4）
   "trace": {"enabled": true, "path": "./out/ui-labels-0701.trace.jsonl",
              "events": 18342, "dropped_events": 0},
   "llm_usage": {"default": {"calls": 31240, "prompt_tokens": 8.1e7,
@@ -245,109 +203,211 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 
 `emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed + bad_input + absorbed + stitched = scanned + generated + fanout + episodes`
 
-（左侧新增 `dropped_noise` 与 `absorbed`（v1.8）及 `stitched`（v1.9 壳终态；fanout（右侧）计信封存在、stitched（左侧）计壳终态，二者分别记账无双记——经审计数值验证）、右侧新增 `episodes`；未启用的项恒 0，退化为上式）。`counts.threads` 不入守恒式——它是恒等式 `threads = episodes − stitched` 的导出量（M10 post-emit tally 单点上报，3.10.3；`rescued_short` 帧的 dropped_noise → absorbed 翻转发生在 emit 前、账目在路由时已定格，不破坏两侧平衡）。且 **stream 模式下 `counts.unprocessed` 的出现条件扩为「熔断 ∨ interrupted」**（S18：SIGINT 中断叠加会话缓冲会产生未走完流水线的残差；此时左侧另加 `unprocessed`，残差公式右侧 `+ episodes`、左侧 `+ absorbed + dropped_noise`（v1.9 另 `+ stitched`）同步扩展，failed 兜底公式减项同步——三处同步见 3.10.3 线索缝合行）；非 stream 模式中断残差恒 0、不加键（回归锚不动）。`schema_engine.resolved_at` 仅统计用户 Schema 的标注调用，加总 = 进入 M5 的记录数（4141+87+30+3+9 = 4270 = ingested 4987 − dropped_dup 412 − dropped_lowq 305）；裁决/评审/生成等内部 Schema 解析不计入。v1.12：**守恒恒等式与全部计数不变量零改动**——帧产物挂信封字段、不改任何信封状态（成员帧保持 absorbed，4.3 零改动声明），`frame_classify.*` / `frame_annotate.*` 是独立命名空间的新增计数、不进 counts 与守恒式；**`resolved_at` 恒等式不受帧标注影响**——帧标注走 `complete_validated` 的**显式 schema 参数**（= 内部 Schema 待遇，3.8.2 路由声明），与裁决/评审/生成同列不入桶，「加总 = 进入 M5 的记录数」在帧粒度开启时依然逐数成立。v1.13：**守恒恒等式零改动**——时间流生成形态取 generate_only 的**退化形** `emitted + dropped_dup + dropped_lowq + dropped_verify + failed = generated`（`generated` = 进链的直装序列条数；成员帧从不构造信封 ⇒ `absorbed` / `dropped_noise` / `stitched` / `episodes` 四项恒 0 不出现，噪音帧与重发帧只活在工件、不进任何账），`report.generate.stream.*` 与 `run.artifact.*` 同属独立命名空间的新增计数、不进 counts 与守恒式。**`resolved_at` 恒等式口径重述**（3.8.2 待遇参数）：「加总 = 进入 M5 的**记录级**标注调用数（用户待遇族）」——按序列类标注 Schema 的调用虽显式传 schema，仍属记录级标注、**照常计入**（`user_treatment=True`）；帧级标注等内部待遇调用仍不计。报告中无任何数据内容字段。
+（左侧新增 `dropped_noise` 与 `absorbed`（v1.8）及 `stitched`（v1.9 壳终态；fanout（右侧）计信封存在、stitched（左侧）计壳终态，二者分别记账无双记——经审计数值验证）、右侧新增 `episodes`；未启用的项恒 0，退化为上式）。`counts.threads` 不入守恒式——它是恒等式 `threads = episodes − stitched` 的导出量（M10 post-emit tally 单点上报，3.10.3；`rescued_short` 帧的 dropped_noise → absorbed 翻转发生在 emit 前、账目在路由时已定格，不破坏两侧平衡）。且 **stream 模式下 `counts.unprocessed` 的出现条件扩为「熔断 ∨ interrupted」**（S18：SIGINT 中断叠加会话缓冲会产生未走完流水线的残差；此时左侧另加 `unprocessed`，残差公式右侧 `+ episodes`、左侧 `+ absorbed + dropped_noise`（v1.9 另 `+ stitched`）同步扩展，failed 兜底公式减项同步——三处同步见 3.10.3 线索缝合行）；非 stream 模式中断残差恒 0、不加键（回归锚不动）。`schema_engine.resolved_at` 仅统计用户 Schema 的标注调用，加总 = 进入 M5 的记录数（4141+87+30+3+9 = 4270 = ingested 4987 − dropped_dup 412 − dropped_lowq 305）；裁决/评审/生成等内部 Schema 解析不计入。v1.12：**守恒恒等式与全部计数不变量零改动**——帧产物挂信封字段、不改任何信封状态（成员帧保持 absorbed，4.3 零改动声明），`frame_classify.*` / `frame_annotate.*` 是独立命名空间的新增计数、不进 counts 与守恒式；**`resolved_at` 恒等式不受帧标注影响**——帧标注走 `complete_validated` 的**显式 schema 参数**（= 内部 Schema 待遇，3.8.2 路由声明），与裁决/评审/生成同列不入桶，「加总 = 进入 M5 的记录数」在帧粒度开启时依然逐数成立。
 
-**rejects 通道 v1.8 增量**（完整格式规范属 3.11.2，此处登记 IO 面变化）：rejects 行的 (stage, reason) 组合新增三种——`segment / noise`（LLM 判噪声帧）、`segment / below_min_len`（短段丢弃帧，独立于 noise，S11）、`verify / off_task_member`（修复收缩弃帧，S31）；`--strict` 交互注意：stream 工程下噪声帧属预期产物，会触发退出码 1。**rejects 通道 v1.9 增量**：(stage, reason) 组合再增一种——`stitch / stitch_invalid`（仅 `stitch.on_error = "fail"` 时出现，3.16.6）；stitched 壳与被救援帧永不入 rejects（第四路由 / 翻转回 absorbed，3.11.2）——`--strict` 补注：同输入开启 stitch 后（短段被救援不再落 rejects）strict 结果可能由 1 变 0，属预期（2.4）。`output.rejects = "full"` 档对序列 Record 的原始载荷输出 `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}`（S25——单记录 `_raw_payload` 假设的序列分支；`raw_last_output` 的 reason 门维持 schema_violation 现状，既有缺口明文接受）。**rejects 通道 v1.11 增量**：reason 词表再增两值——`context_overflow`（上下文预算三形态：预检 / 最小单元不装 / 反应态降级耗尽，V10/V16/V24）与 `output_truncated`（响应以输出上限截断收尾的终局化，V11）；stage = 产生该错误的属主算子（任何 LLM 调用阶段皆可出现），语义、处置与熔断矩阵见 7.6；refs / full 档行形态不变（两 kind 均不携带 `raw_last_output`）。**rejects 通道 v1.12 零增量声明**：帧粒度对本通道**零改动**——(stage, reason) 组合不增、reason 词表不增、行键集闭集不动；**帧级失败的成员不产生 rejects 行**（帧分类失败落 `fallback_class`、帧标注失败落 members[] 条目 status="failed"，均为成员级留痕非信封失败，3.13.7/3.5.5/3.11.2），`--strict` 判定读信封状态计数，**不受帧失败影响**（裁决·成员失败不入 rejects）。**rejects 通道 v1.13 零增量声明**：时间流生成对本通道同样**零改动**——(stage, reason) 组合不增、reason 词表不增、行键集闭集不动；生成期**作废**的序列（蓝图/帧实现失败、逐帧钩子违规、序列相似度过滤淘汰）**不产生 rejects 行**——它们从未成为记录，留痕在 `report.generate.stream.*` 计数与值-free 的 stderr WARN（3.6.5 作废语义，`--strict` 不受影响）；进链后被淘汰的序列（`dropped_dup` / `dropped_lowq` / `dropped_verify` / `failed`）照既有规则入 rejects——判决形评审的 fail 收尾即 `verify / dropped_verify` 的既有形态（3.7.5）。
+v1.18 sequence 形态不复用上述渐进式 counts 守恒来宣称部分成功：整组 delivery 在正式 commit 前保持 attempt-local，slot 或 noise 耗尽即不替换 main、stream、成功 report 或 manifest。成功计数以 `report.generate.sequence` 的 planned/delivered 恒等式为准；main 只计 primary sequence，stream 另计 primary/noise/replay event。报告、manifest 与 failed report 都只含计数、摘要和路径，不含数据内容。
 
-**report.generate.stream v1.16 增量**：当实际非零配额类的生效规则非空时，在既有
-`tiers`（若在场）之后、`frames` 之前出现 `rules = {sampled, correlation_scrapped,
-temporal_scrapped}`；仅当 v1.16 report face 已由实际配额前缀的生效 rules/windows 或
-`generate.sequence_validator` 激活、且配置了 `generate.sample_validator` 时出现
-`sample_validator_scrapped`；`sample_validator` 单独配置不改变 v1.15 report bytes。
-配置了 `generate.sequence_validator` 时出现 `sequence_validator_scrapped`。当实际非零配额类
-的生效窗口非空时，同一位置出现 `windows = {calendar_days_spanned}`。这些块是 counts-only，
-条件在场时即使值为零也显式写出，零配额类的约束不会单独激活 report 面。
+**rejects 通道 v1.8 增量**（完整格式规范属 3.11.2，此处登记 IO 面变化）：rejects 行的 (stage, reason) 组合新增三种——`segment / noise`（LLM 判噪声帧）、`segment / below_min_len`（短段丢弃帧，独立于 noise，S11）、`verify / off_task_member`（修复收缩弃帧，S31）；`--strict` 交互注意：stream 工程下噪声帧属预期产物，会触发退出码 1。**rejects 通道 v1.9 增量**：(stage, reason) 组合再增一种——`stitch / stitch_invalid`（仅 `stitch.on_error = "fail"` 时出现，3.16.6）；stitched 壳与被救援帧永不入 rejects（第四路由 / 翻转回 absorbed，3.11.2）——`--strict` 补注：同输入开启 stitch 后（短段被救援不再落 rejects）strict 结果可能由 1 变 0，属预期（2.4）。`output.rejects = "full"` 档对序列 Record 的原始载荷输出 `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}`（S25——单记录 `_raw_payload` 假设的序列分支；`raw_last_output` 的 reason 门维持 schema_violation 现状，既有缺口明文接受）。**rejects 通道 v1.11 增量**：reason 词表再增两值——`context_overflow`（上下文预算三形态：预检 / 最小单元不装 / 反应态降级耗尽，V10/V16/V24）与 `output_truncated`（响应以输出上限截断收尾的终局化，V11）；stage = 产生该错误的属主算子（任何 LLM 调用阶段皆可出现），语义、处置与熔断矩阵见 7.6；refs / full 档行形态不变（两 kind 均不携带 `raw_last_output`）。**rejects 通道 v1.12 零增量声明**：帧粒度对本通道**零改动**——(stage, reason) 组合不增、reason 词表不增、行键集闭集不动；**帧级失败的成员不产生 rejects 行**（帧分类失败落 `fallback_class`、帧标注失败落 members[] 条目 status="failed"，均为成员级留痕非信封失败，3.13.7/3.5.5/3.11.2），`--strict` 判定读信封状态计数，**不受帧失败影响**（裁决·成员失败不入 rejects）。
 
-`sampled` 是完成机械 word 规划并进入 brief 调用的 attempt 数。冻结不变量为
-`validator_scrapped = sample_validator_scrapped + correlation_scrapped +
-temporal_scrapped + sequence_validator_scrapped`；序列相似度淘汰不进入该等式。
-约束阶段每条序列只在首个失败阶段递增一个子计数和一次总计数。`calendar_days_spanned`
-按 `ts_start` 的固定 offset 计算幸存非噪音任务帧从首日到末日的自然日跨度，首尾包含，
-没有 survivor 时为零。规则、窗口、correlation 与 hook 返回文本不复制到 report 之外的
-任何输出面。
+**v1.18 sequence rejects 边界：**sequence 形态的六路径集合令 `rejects = sidecar = null`。失败 attempt 从未成为正式 Record，不写 rejects；它只进入 `report.generate.sequence.rejected_attempts` 的唯一终态桶。任一 slot 耗尽写独立 failed report 并以退出码 1 结束，不提交已接受前缀。普通 process、flat generate 与 process stream 的 rejects 规则保持本段既有语义。
 
-**v1.16 守恒与 rejects 面**：时间流生成仍使用 generate-only 退化守恒式；planner、
-规则、窗口、sample-validator 或 sequence-validator 作废发生在 Record 构造前，不增加
-`failed`、`item.errors` 或 rejects 行。进链后的 `dropped_dup`、`dropped_lowq`、
-`dropped_verify` 与 `failed` 继续沿既有信封路由记账。`MODEL_INVALID` 和已通过启动校验后
-发现的不变量破坏仍走既有 `InternalError` / 退出码 4，不产生新错误 kind。
+### 6.4.1 v1.18 sequence success report
 
-**report v1.17 增量（场景规划与精确交付，E2E-46/50/51/52/54/60）**：
+sequence 形态不写旧 `report.generate.stream`。成功 report 的 `report.generate.sequence` 键序冻结如下；
+示例值同时冻结 `examples/sequence-generation` 的验收算术：2 sets、8 primary sequences、22 primary events、
+2 noise events、1 replay sequence 的 3 replay events，合计 27 stream rows；7 个 primary sessions 中
+1 个 crossed，另有 1 个 replay tail session。
 
-- **`report.run.paths` 恒在场**（v1.17 起，任何形态）：`{project, project_root, input, output, report, rejects, sidecar, trace, stream_artifact}` 九键全部为绝对规范化路径，未启用通道为 null、不写相对路径（值即 `ResolvedPaths`，3.1.4）。live report 固定为 `<output-stem>.report.json`、dry-run report 固定为 `<output-stem>.dryrun.report.json`，两者都由 M1 写入 `ResolvedPaths.report`，emitter 与 console 不再按命令模式追加后缀。run start INFO 与 dry-run plain/rich 各消费同一 `ResolvedPaths`。
-- **dry-run 顶层新增 `estimate`**：其值就是 `estimate_run` 返回对象，**不复制重算**——console 的 dry-run 数字与 scenario 日期都从这个对象格式化，测试必须把 console parser 结果与 JSON 逐键比较。generate_only 分支的对象含 `scenario` 子块（`target_sequences` / `task_frames` / `noise_frames` / `sessions` / `crossed_sessions` / `schedule_start` / `schedule_end` / `calendar_days_spanned` / `plan_digest` / `models`——quota 与 timeline 两模型的 entries 与 families）；`records` 是 sequence envelope 数、`generate_calls = 2 × target_sequences + noise target`（baseline 包含每个 structured noise slot 的一次 realization，不含 delivery retry、provider retry 或 Schema repair）。
-- **`report.generate.stream` 新四键与 v1.16 既有键完整处置**：**删除**七个失败/作废计数器 `plan_failures`、`realize_failures`、`validator_scrapped`、`sample_validator_scrapped`、`sequence_validator_scrapped`、`rules.correlation_scrapped`、`rules.temporal_scrapped`——同一失败事实由 `delivery.failures` 的 13 桶闭集唯一承接，保留两套即双记；**删除** `windows` 子块（其唯一键 `calendar_days_spanned` 移入 `planner.objectives`，不双报）；**更名** `plan_calls` → `brief_calls`（planning 在 v1.17 是零 LLM 的 CP-SAT 求解，旧名误导），`rules` 子块更名 `frame_rules` 且只保留 `sampled`；其余既有键（sequences、sessions、crossed_sessions、frames、noise_frames、duplicates、realize_calls、noise_calls、tiers 等）全部保留原语义。新键按 `plan_digest` / `planner` / `delivery` / `quotas` 的顺序**追加于块尾**，构成块的冻结键序：`plan_digest`（`sha256:` 前缀，validate console、dry-run report 与 live report 均回显同一值）；`planner`（`models`：quota/timeline 各自 entries + families；`objectives`：`preference_deviation` / `calendar_days_spanned` / `timeline_end_us` 三层冻结最优值）；`delivery`（`target_sequences` / `delivered_sequences` / `target_noise` / `delivered_noise` / `target_duplicates` / `delivered_duplicates` / `duplicate_shortfall` / `attempts` / `complete` / `interrupted` / `exhausted_slots` / `failures`——13 个子键按 7.6 闭集枚举序排列，即使为零也全部在场；`attempts` 同时计 sequence 与 noise slot 的 delivery attempt，不计 LLMClient 内部 provider retry，也不把一次 sequence attempt 的 brief/realize 两个 call 误计成两次；`exhausted_slots` 是到达 Exhausted 的交付 slot（sequence ∪ noise）计数，duplicate source shortfall 不计入该键、由 `duplicate_shortfall` 单独承载）；`quotas`（**逐 quota report row 以 quota `name`、period bucket、class 为自然键**，每行含 target、delivered、allocation、realized ratio 与相对目标的 integer deviation——禁止仅给 aggregate 数而丢掉周期归因）。
-- **delivery 守恒**：`delivery.delivered_sequences == counts.generated`（「delivered sequence」唯一表示 M6 已接纳该序列、写入 replay artifact 并交给下游 stage；quality/annotate/verify 可使最终 `counts.emitted` 更低，但不得反向触发 M6 refill，也不改变 quota 已交付事实）。每次完整非 fatal attempt 恰好满足 `attempts = delivered_sequences + delivered_noise + sum(failures.values())`；exact quota 指 primary sequence delivery，duplicates 不计入 quota（source slot 未交付 ⇒ 该 duplicate 省略并计 `duplicate_shortfall`，不改选另一 source）。
-- **守恒式与 rejects 面零改动**：exact delivery 的失败与耗尽发生在 Record 构造前——不产生 `failed`、`item.errors` 或 rejects 行，只进 delivery 桶与值-free WARN；generate-only 退化守恒式照旧。
-
-## 6.5 时间流工件格式（v1.13）
-
-时间流生成形态（`generate_stream.enabled`，3.6.5）的第二份产物，路径 `{output_stem}.stream.jsonl`（M11 第五输出通道，3.11.2）。UTF-8 JSONL，一行一帧，**行序 = 交织序**（时间戳严格递增），行号（1 基）即 `_meta.stream.member_sources[].line_no`。
-
-**行结构**（三键，键序冻结）：
-
+```json
+{
+  "mode": "declared",
+  "run_attempt_id": "89ab...",
+  "run_id": "0123...",
+  "delivery_digest": "4567...",
+  "artifacts_committed": true,
+  "program_digest": "...",
+  "planned_sets": 2,
+  "delivered_sets": 2,
+  "planned_sequences": 8,
+  "delivered_sequences": 8,
+  "primary_events": 22,
+  "primary_sessions": 7,
+  "crossed_primary_sessions": 1,
+  "noise_events": 2,
+  "replay_sequences": 1,
+  "replay_events": 3,
+  "replay_tail_sessions": 1,
+  "stream_rows": 27,
+  "sequence_slot_attempts": 2,
+  "noise_slot_attempts": 2,
+  "sequence_calls": {
+    "scenario_seed_calls": 0,
+    "baseline_event_plan_calls": 6,
+    "variant_event_plan_calls": 8,
+    "frame_render_calls": 14,
+    "semantic_evaluation_calls": 8,
+    "noise_render_calls": 2,
+    "noise_evaluation_calls": 2
+  },
+  "by_pattern": {
+    "booking_success": {
+      "positive": {"planned": 2, "delivered": 2},
+      "missing_acknowledgement": {"planned": 2, "delivered": 2},
+      "confirmation_before_acknowledgement": {"planned": 2, "delivered": 2},
+      "confirmation_timeout": {"planned": 2, "delivered": 2}
+    }
+  },
+  "rejected_attempts": {
+    "scenario_schema": 0,
+    "event_schema": 0,
+    "post_validator_invalid": 0,
+    "post_validator_exception": 0,
+    "state_transition": 0,
+    "frame_schema": 0,
+    "coupling_evaluation": 0,
+    "pattern_evaluation": 0,
+    "state_evaluation": 0,
+    "semantic_evaluation": 0,
+    "sequence_memory_budget": 0,
+    "context_overflow": 0,
+    "output_truncated": 0,
+    "provider_retryable_exhausted": 0,
+    "dedup": 0,
+    "quality": 0,
+    "annotate": 0,
+    "verify": 0,
+    "reconcile": 0,
+    "noise_schema": 0,
+    "noise_semantic": 0,
+    "noise_similarity": 0,
+    "noise_memory_budget": 0,
+    "noise_context_overflow": 0,
+    "noise_output_truncated": 0,
+    "noise_provider_retryable_exhausted": 0
+  }
+}
 ```
-{"<stream.order_by 的 meta 字段名>": "<ISO-8601 微秒精度时间戳>",
- "<input.text_field>": <帧内容：纯文本帧为字符串 | 结构化帧为对象>,
- "truth": {...}}
+
+成功时 `planned_sets = delivered_sets`、`planned_sequences = delivered_sequences`，且每个 variant
+的 planned 与 delivered 相等。`sequence_calls` 计逻辑 family 入口，包含失败 attempt；同一入口内的
+L3 repair 与 provider retry 继续只计既有 schema/usage 面。一次失败 attempt 只进入停止处的一个
+`rejected_attempts` 桶；noise slot 只使用 noise 前缀的七个桶。未列键不得动态追加；provider fatal、
+plan 与 commit-I/O 属 run terminal，只写 `terminal_error_kind`。
+
+failed report 使用相同 usage 与 `rejected_attempts` 口径，固定路径为
+`{output_stem}.failed.report.json`。它始终包含 `run_attempt_id`，另含 nullable `run_id`、
+`artifacts_committed = false`、nullable `failed_slot`、`attempts_used` 与 `terminal_error_kind`；
+不含 by-pattern 已交付前缀，因为没有数据提交。plan 尚未产生时 `run_id = null`。
+
+### 6.4.2 sequence 路径与成功提交
+
+M1 一次冻结六个路径：main = `run.output`、stream = `{output_stem}.stream.jsonl`、report =
+`{output_stem}.report.json`、manifest = `{output_stem}.manifest.json`、failed report =
+`{output_stem}.failed.report.json`、rejects = sidecar = null。成功前不打开 main、stream、report
+或 manifest；全部 slot、noise、replay 与 CrossViewReconciler 通过后，分别写同目录 `.part`、flush、
+fsync，按 main、stream、report 顺序 `os.replace`，最后单独原子替换 manifest。
+
+成功 manifest 键序固定为 `schema_version = 1`、`run_id`、`delivery_digest`、
+`artifacts_committed = true`、`main: {path, sha256, rows}`、`stream: {path, sha256, rows}`、
+`report: {path, sha256}`、`committed_at`。消费者只有在 manifest 摘要与三份工件一致时才接受提交。
+failed report 不属于成功 manifest，成功运行不删除历史 failed report；它只是最近一次失败诊断，
+不得否定摘要有效的 manifest。commit-I/O 失败可能已替换固定路径的一个子集，但旧 manifest 必须保持不变；
+此时 `artifacts_committed = false` 只表示没有可信任的新 manifest，消费者必须以摘要失配拒绝混代文件。
+
+`SequenceDeliveryEmitter.prepare_product` 是 `delivery_digest` 的唯一 owner。它对最终 main 与 stream 行只计算
+一次完整 64 位 SHA-256，并把值写入冻结 report；manifest 只读取 `product.report.delivery_digest`，不得重算或
+保存第二份摘要真值。摘要材料先写 ASCII header `labelkit:v1.18:delivery\n`，再按 main 视图行序、stream
+视图行序依次写 frame；每个 frame 恰为 canonical row byte 长度的十进制 ASCII、冒号与 row bytes。
+`canonical_delivery_row` 只移除发射期墙钟观测字段，包括 `_meta.run.started_at`、`finished_at`、
+`duration_ms` 与 manifest `committed_at`，再按 `sort_keys = true`、紧凑 separators、
+`ensure_ascii = false` 编码。摘要不写回 main/stream，也不参与任何 Record ID，因而不存在自引用。
+
+## 6.5 v1.18 sequence stream 工件
+
+sequence 生成的第二份数据产物固定为 `{output_stem}.stream.jsonl`。UTF-8 JSONL 一行一个
+event，顶层只允许 `payload` 与 `_meta`。primary member 至少具有以下结构：
+
+```json
+{
+  "payload": {
+    "request_id": "R-100",
+    "ticket_id": "T-100"
+  },
+  "_meta": {
+    "event": {
+      "event_id": "abcd...",
+      "event_key": "ef01...",
+      "owner_sequence_id": "2345...",
+      "role": "confirm",
+      "frame_class": "confirmation",
+      "actor": "system",
+      "logical_time_us": 960000000,
+      "timestamp": "2026-01-05T09:16:00.000000+08:00"
+    }
+  }
+}
 ```
 
-`truth` 键集（**冻结**，counts 与标识，不含任何工具内部 id）：
+primary row 同时携带与 main owner 一致的 `_meta.generation` sequence truth。declared role 来自
+PatternEvaluator 的 actual binding；instruction-only role 固定为 `position_000`、`position_001`
+等位置名，不伪装成业务 pattern role。timestamp、gap 与 elapsed 只属于 `_meta.event`，不向
+用户 payload Schema 回填 `time_fields`。
 
-| 键 | 类型 | 语义 |
+noise row 的 `owner_sequence_id`、role、scenario id 与 world branch id 均为 null，并显式
+`noise = true`。`NoiseSlot` 独立冻结 event key、ordinal、frame class、timestamp 与 session；不得用
+`PlannedEvent` 的 null/sentinel 冒充。
+
+`ReplayLayout` 独立冻结 source slot key、source positive variant name、replay ordinal、session 与逐事件
+integer 微秒 timestamp；timestamp 数量必须与 source positive sequence 的事件数完全相等。ReplayProjector
+只在 M11 已由最终 `PipelineItem` 装配出 `SequenceRows` 后运行，并从 source
+`primary_stream_rows` 逐行深拷贝。因此 payload、event key、role、frame class、actor、logical time、
+frame annotation 与其他下游 metadata 逐位保留，只替换 replay 身份、工件 timestamp 与 provenance。
+
+replay event 固定 `owner_sequence_id = null`，只用 `replay_sequence_id` 分组，并显式携带
+`replay_ordinal`、`duplicate_of_sequence_id` 与逐位 `duplicate_of_event_id`；event id 与 timestamp 新生。
+其 `_meta.generation` 固定含 `validation_mode = "replay"`、`source_validation_mode`、`sequence_class`、
+`scenario_id`、`source_pattern`、`source_variant` 与 `duplicate_of_sequence_id`，不得产生新的
+`world_branch_id` 或 primary variant 字段。replay timestamp 必须用 timeline 的 fixed UTC offset 和
+`datetime.isoformat(timespec="microseconds")`，不得使用本机时区或省略尾部微秒。
+
+除 `delivery_digest` 外，generation ID 统一调用 `derive_generation_id(domain, components)`：哈希材料恰为
+`canonical_json(["labelkit:v1.18", domain, components])` 的 UTF-8 bytes，结果取 SHA-256 小写 hex 前
+32 字符。components 是有序 JSON array；timestamp component 一律为 integer 微秒，payload component 是
+已验证 JSON object 本身，ordered event ids 是 JSON array，不得由调用方预序列化或拼接字符串。
+
+| ID | domain | components |
 |---|---|---|
-| `session` | int | 全流会话序数，0 基（含重发尾会话）。 |
-| `sequence_class` | str \| null | 所属序列类名；噪音帧为 null。 |
-| `sequence` | int \| null | 该序列在其类内的序数，0 基（= 计划期标识）；噪音帧与**重发副本**为 null。 |
-| `tier_rank` | int \| null | **v1.14 新增，仅档位表（全局 `[[generate.stream.tiers]]`）在场时出现**：该序列所属档位的序数。任务帧 = 本档序数；噪音帧为 null；重发帧**承源**（= 被重发序列的档位）。键位在 `sequence` 之后（序列身份组）、`frame_class` 之前——**键序重冻结**，行文件的字节序由此定（id 用 canonical JSON 键排序计算，不受键序影响）。**v1.15 零改动**：在场判据（全局表非空，全局表为锚）、键、键序、三类帧的取值规则全部不动；仅值来源条件化——= 本行序列类**生效表**内的档序数（生效表 = 该类的 `[[class.<name>.generate.tiers]]` 或回落全局表），故**跨类同序数不可比**，逐行反推对账须先按同行 `sequence_class` 取该类生效表。 |
-| `frame_class` | str \| null | 该帧的帧类（蓝图定下的真值）；噪音帧为 null。 |
-| `noise` | bool | 插入型噪音帧标志；任务帧与重发帧恒 false。 |
-| `duplicate_of` | int | **仅重发序列的帧在场**：值 = 被重发的原序列的类内序数（重发副本无自身计划期身份，归属经本键对账）。 |
+| declared scenario_id | `declared_scenario_id` | program_digest、counterfactual set name、scenario_index |
+| declared world_branch_id | `declared_world_branch_id` | scenario_id、variant name |
+| instruction scenario_id | `instruction_scenario_id` | program_digest、instruction slot name、scenario_index |
+| instruction world_branch_id | `instruction_world_branch_id` | scenario_id、字面值 instruction_only |
+| declared event_key | `declared_event_key` | scenario_id、baseline role name |
+| instruction event_key | `instruction_event_key` | scenario_id、instruction slot name、scenario_index、position |
+| primary event_id | `primary_event_id` | world_branch_id、event_key、artifact timestamp、canonical payload |
+| sequence_id | `sequence_id` | world_branch_id、ordered event_id list |
+| replay_sequence_id | `replay_sequence_id` | source sequence_id、replay ordinal |
+| replay event_id | `replay_event_id` | replay_sequence_id、source event_id、replay timestamp |
+| noise event_key | `noise_event_key` | program_digest、字面值 noise、noise ordinal |
+| noise event_id | `noise_event_id` | run_id、noise event_key、timestamp、canonical payload |
+| run_attempt_id | `run_attempt_id` | program_digest、seed |
+| run_id | `run_id` | run_attempt_id、ScenarioPlan.digest |
 
-**真值不携最终 id**（封死循环依赖）：序列归属只用计划期标识（`sequence_class` + `sequence`[+ `tier_rank`]），**禁止**携带装配后的 record id——成员 id 依赖行内容、序列 id 依赖成员 id，携带即成环；主输出 `_meta.stream` 与工件的对账靠 `member_sources` 的行号双向可查（3.6.5）。
+生成内存映射固定为 member `Record.raw = 完整 stream row`、`Record.text = canonical_json(payload)`、
+`Record.id = event_id`。M2 与 generation projector 共用同一个 `derive_generation_id` helper；M2 只凭同一
+stream 工件重算 primary event id、owner 的 ordered sequence id、replay sequence/event id，按显式
+`replay_sequence_id` 分组，并验证 `duplicate_of_event_id` 逐位存在于所指 primary source。它不读取 main、
+不从首次出现次序猜 replay ordinal、不信任格式或唯一性不合格的 id，也不回退旧公式。sequence exact dedup
+按 member text 顺序拼接，因此 replay 的新 event id 不妨碍整序列 duplicate 命中。
 
-**回填字段注记（v1.14）**：声明了时间字段绑定（`[frame.class.<name>.generate.time_fields]`）的帧类，其行内**文本字段对象**里的绑定键不是 LLM 产出而是 harness 按已铺时间轴回填的机械量（值 = `round(序内相邻成员 ts 差, 6)` 等，词表见 5.2）。回填发生在时间戳铺设之后、行对象与 id 计算**之前**，故这些值同样进 `Record.raw`、进成员 id 与序列 id ⇒ 工件重放逐字节同 id 同会话（下方重放契约①）。对账口径两条：① 值按**本序列相邻成员**计——交叉会话里夹进来的外序列帧与噪音帧不参与差值，逐行对账时须先按 `truth.sequence_class` + `truth.sequence` 归组；② **`duplicate_of` 在场的重发行除外**——其绑定值与 `tier_rank` 同为承源量，不与自身所在会话的时间轴对账。
+CrossViewReconciler 在 commit 前检查 main/stream 双向一致：每个 primary event 恰好对应一个 main
+owner，main 只含 primary sequence；noise 与 replay 只存在于 stream。`examples/sequence-generation` 的冻结
+账本为 main 8 行，stream 27 行 = 22 primary + 2 noise + 3 replay。把该 stream 工件送入普通 process
+replay 后，验收计数固定为 scanned 27、absorbed 25、dropped_noise 2、episodes 9、dropped_dup 1、
+emitted 8、failed 0；这证明完整 replay sequence 被 M3 删除，而不是按 provenance 短路。
 
-**重放契约**：工件本身就是一份合法的 6.1 文本模态输入。可往返性由 M1 工件键守卫在启动期保证（3.1.4 时间流生成行）：`input.text_field` 与 `stream.order_by` 的时间戳字段名均须为**平坦字段名**（工件行以该字符串原样作键，点路径在重放侧按 6.1 抽取时取不到、整份判坏行——含 `"."` 即 CONFIG_ERROR），两者互不同名、且均不得为 `"truth"`（工件行三个顶层键互斥）。把它拷为某工程的 `[run].input`、配同一份 `[stream]` 声明（`order_by = "meta:<同名字段>"`、同一 `gap_s`）并开 `segment`，即可原样重放——① 成员 `Record.id` 逐字节一致（M2 的 `sha256(canonical_json(raw))[:16]` 作用于同一份行对象，生成侧的成员 raw 就是工件行全对象，3.2.5）；② 会话切分一致（交织器铺设的会话间隔恒 > `gap_s`、会话内间隔恒 < `gap_s`），`session_id` 亦逐字节一致（M2 公式的输入含会话内**全部**帧，3.2.8）；③ `truth` 对摄取侧只是普通字段——参与 id 计算、**不参与任何判定**，需要时经 `output.passthrough_fields` 透传出来与重放结果比对（自动化的重放评测回路是明确非目标，2.1.2 ⑧）。
-
-**真实样例**（`examples/synth-stream` 2026-08-20 成功真跑工件的前三行摘录，`order_by = "meta:ts"`、`text_field = "text"`，档位表与时间字段绑定均在场；实际为单行 JSONL）：
-
-```
-// 第 1 行：task_request 结构化帧；ticket_booking 的类内 tier_rank = 1，sequence = 0。
-//          duration 是回填字段，值为同序列下一成员的 gap_next_s。
-{"ts": "2026-01-05T10:20:10.000000+08:00", "text": {"subject_id": "A1B2C3", "utterance": "你好，我想买一张明天从北京到上海的高铁票。", "entities": ["北京", "上海", "明天"], "duration": 2399.999998}, "truth": {"session": 0, "sequence_class": "ticket_booking", "sequence": 0, "tier_rank": 1, "frame_class": "task_request", "noise": false}}
-
-// 第 2 行：另一个 ticket_booking task_request；与第 1 行在同一 session 内交织。
-{"ts": "2026-01-05T10:20:10.000001+08:00", "text": {"subject_id": "trip001", "utterance": "你好，我想买一张高铁票，从北京到上海。", "entities": ["北京", "上海", "高铁票"], "duration": 2399.999999}, "truth": {"session": 0, "sequence_class": "ticket_booking", "sequence": 1, "tier_rank": 2, "frame_class": "task_request", "noise": false}}
-
-// 第 3 行：sequence=0 的 acknowledgement；subject_id 与第 1 行按类型敏感规则相等。
-{"ts": "2026-01-05T11:00:09.999998+08:00", "text": {"subject_id": "A1B2C3", "utterance": "好的，我来帮您查询。请问您想乘坐哪个时间段的车次呢？"}, "truth": {"session": 0, "sequence_class": "ticket_booking", "sequence": 0, "tier_rank": 1, "frame_class": "acknowledgement", "noise": false}}
-```
-
-三条可直接在工件上读出来的事实：① 第 1、2 行都是 `ticket_booking` 的结构化 `task_request`，但
-属于同一 `session = 0` 中交织的 `sequence = 0` 与 `sequence = 1`；② 第 3 行回到 `sequence = 0`，
-是与第 1 行 `subject_id` 相等的 `acknowledgement`，其时间差为 `2399.999998` 秒，落在
-`[1200, 2400)`；③ 三行均为任务帧（`noise = false`），第 1、3 行是同一序列的前两步，
-第 2 行则证明了真实 crossing 交织，而不是旧版噪音或重发样例。
-
-**v1.16 工件不变与对账规则**：规则/窗口约束只影响 planner 的 word、owner、timestamp
-与 noise 槽，不改变三顶层键、`truth` 键序、`tier_rank` 归属、`duplicate_of` 语义、
-成员 id 或序列 id 公式。planner 投影作废 attempt 后删除空 session、按时间重编号但不
-移动幸存 timestamp；crossed 只有两个 owner 都幸存且仍有真实交替时保留。回填发生在
-primary timestamp 铺设之后、行对象与 id 计算之前；duplicate 复制已经回填的 source
-payload，按固定规则平移到流尾，绝不按 duplicate 自身 timestamp 重算时间字段。
-
-规则、日历窗口、correlation、sequence-validator 结果和 CP-SAT witness 都不写入
-`truth` 或 artifact。对 artifact 的可验证事实仍是：同一 `[stream]` 重放时，session 内
-相邻 timestamp 差不超过 `gap_s`，跨 session 至少多出 `1us`，M2 严格大于 gap 的切分规则
-因此得到相同会话边界；`truth` 仅作为普通输入字段参与 Record id 的 canonical JSON
-计算，不参与规则或分段判定。
-
-**v1.17 工件增量（truth 键值语义，E2E-54）**：structured noise 帧的 `truth.frame_class`
-由 null 改为**实际类名**——`[[generate.stream.noise]]` 的 noise 类复用帧类的 generate
-instruction 与 JSON Schema（truth 保留其 frame class），`truth.noise = true` 时
-`sequence_class` / `sequence` / `tier_rank` 为 null（noise 无序列归属）。任务帧与
-duplicate 帧的 truth 语义保持不变；duration 帧不新增 truth 键（机械值经 payload 的
-`time_fields` 暴露，5.2.2）。行结构三顶层键、`truth` 键序与重放契约零改动——时间上界
-自 v1.17 起是显式有限 schedule（半开区间 + 排除日）而非隐式 horizon，工件行的时间戳
-分布据此收敛，但行格式与 id 公式不变（3.6.5）。
+`retained_content_bytes` 与 delivery digest 复用同一个 `canonical_delivery_row` helper，每行精确计
+`len(canonical_row_bytes) + 1`，其中一 byte 是 JSONL 换行。`SequenceRows` 只计自己的 final main row
+与 primary stream rows；`ReplayRows` 只计 replay rows；发射期墙钟字段既不驻留在产品行中，也不计入上限。
+prospective 总量包含全部已接受 SequenceRows、当前 set 的 SequenceRows 和由最终 source rows 预投影的全部
+ReplayRows。上限固定 536870912（512 MiB）；恰等于上限时允许提交，超一个 UTF-8 byte 时整个 slot 拒绝，
+且在 `group_commit` 前保持 dedup、dataset 与 replay 零提交。

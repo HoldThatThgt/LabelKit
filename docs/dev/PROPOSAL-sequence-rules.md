@@ -1,6 +1,8 @@
 # 提案记录：时间流生成的序列规则
 
-> **文档状态：superseded（v1.17 Wave 8 已收口）。** 本文保留 v1.16 的需求核查、方案比较与被否决原因；当前行为以 v1.17 主规格与 `docs/CONTRACTS.md` 为准。
+> **文档状态：superseded by v1.18 sequence generation。** 当前行为事实源为
+> `docs/dev/SPEC-sequence-generation-redesign.md`、`spec/*.md` 与 `docs/CONTRACTS.md`；
+> 本文其余内容仅保留历史方案论证，旧 SPEC 链接不代表当前行为。
 
 
 ## 需求与现状
@@ -131,8 +133,8 @@ rules 和 windows 均使用三态：未声明 `None` 继承全局表，显式空
 
 ## 实施文件边界
 
-完整的逐文件清单、零改动清单、验收矩阵与执行波次均已转入 `SPEC-sequence-rules.md`。本 proposal 不再
-保留“实现前假设”或“以后再决定”的项目；所有未进入 v1.16 的能力在 SPEC 的非目标中明确写出。
+当前逐文件清单、验收矩阵与执行波次以 `docs/dev/SPEC-sequence-generation-redesign.md` 为准。
+本文只保留 v1.16 的历史方案论证，不再维护实现口径。
 
 ## 保留的边界
 

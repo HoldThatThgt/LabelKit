@@ -29,7 +29,7 @@ UI 树序列化格式（`UITree.serialize()`，4.3 节）：深度缩进的每�
 |---|---|---|
 | `repair` | 修复上下文（`RepairContext`）；None = 首次标注 | v1.1 |
 | `temperature` | 采样温度；None = profile 默认（M5 内部设定，调用方置值忽略） | v1.1 |
-| `label` | 分类标签；v1.13 起同时选定按类标注 Schema | v1.7 |
+| `label` | classification 标签；有 inherited 标签时同样选定按类标注 Schema | v1.7 |
 | `transitions` | `[动作序列]` 步骤源；None = 整段省略 | v1.8 |
 | `fragment_lens` | 逐碎片成员数（按碎片配额降采样）；None = 全局均匀降采样 | v1.9 |
 | `k_eff` | 生效关键帧上限（V20 折半 / V21 修复梯） | v1.11 |
@@ -39,9 +39,12 @@ UI 树序列化格式（`UITree.serialize()`，4.3 节）：深度缩进的每�
 
 **按类取值（v1.7）。**classify 启用且记录带类标签时，本节模板的 `{annotate.instruction}` 与 few-shot `examples` 取该类有效配置（`class_views[label].annotate`，3.1.4 按类覆盖合并行）——模板结构不变，仅取值来源变化。取值载体为 `opts.label`（None = 全局配置）；stage 层传 `item.classification.label if item.classification else None`。trace `annotate.done` 事件 payload 增 `label` 字段（仅 classify 启用时携带，7.2 只增不改）。
 
-**按类标注 Schema（v1.13，裁决·按类标注 Schema）。**`label` 自 v1.13 起**同时选定标注 Schema**：类有效 Schema = `class_views[label].schema ?? cfg.user_schema`（`[class.<name>.annotate].schema_path`/`schema_inline` 的解析产物；类未声明覆盖、label 缺失或类表外的未知类一律回落全局，3.1.4 按类覆盖合并行 ⑤）。取值经**单点取值函数**实现，本模块的每个 Schema 消费点都读它——保证「计价的 Schema 恒等于调用的 Schema」，六处：
+**按类标注 Schema。**`label` 同时选定标注 Schema：类有效 Schema =
+`class_views[label].schema ?? cfg.user_schema`。process 的 LLM/fallback 标签与 v1.18 sequence projector 写入的
+inherited 标签走同一单点取值函数；不能以 `cfg.classify.enabled = false` 为由跳过 `ClassView`。类未声明覆盖、
+label 缺失或类表外未知类回落全局。每个 Schema 消费点都读该函数，保证计价 Schema 与调用 Schema 相同：
 
-| 消费点 | v1.13 取值 |
+| 消费点 | 按类有效取值 |
 |---|---|
 | 本节模板的 `{user_schema_json}` | 类有效 Schema 的 canonical 单行 dump（无覆盖时直取 M8 的 `user_schema_text` 属性，字节等价） |
 | 标注调用（首次 / 修复重标注两处） | 有覆盖 ⇒ 显式 `schema=类有效Schema` **且** `scope.user_treatment=True`（3.8.2 待遇参数：L2.5 与 `resolved_at` 记账双保留）；无覆盖 ⇒ `schema=None` 的既有推断路径 |
@@ -102,7 +105,20 @@ class AnnotateStage(Stage):
         """对每条 active 记录: prompt = build_prompt(rec); item.annotation = await ctx.schema_engine
            .complete_validated(profile, prompt, user_schema)  # M8 全责保证结构
            SchemaViolation(不可修复) ⇒ item.status='failed', 错误入 item.errors。"""
+
+    async def run_attempt(
+        self,
+        request: DownstreamAttemptRequest,
+    ) -> DownstreamAttemptResult:
+        """在 sequence attempt 内执行 sequence 与可选 frame 标注，不提交全局状态。"""
 ```
+
+v1.18 sequence 的 `run_attempt` 与普通 `run` 共用标注核心，但不先把异常降级为持久 `StageError`。
+`ProviderFatalError`、`CircuitBreakerTripped`、`KeyboardInterrupt` 与 `asyncio.CancelledError` 原样穿透；
+retryable exhaustion、Schema/context/truncation 或普通标注拒绝返回 `accepted=false`，由 M10 丢弃整个
+counterfactual set。annotation、frame annotation、item status 与 dataset counter delta 只存在于当次
+`AttemptTransaction`，只在组提交后合并；SchemaEngine resolved-at、LLM usage/retry/latency 与 trace event
+是已发生的运行事实，不随拒绝回滚。
 
 **背书：**「指令 + few-shot + 结构化输出」的 LLM 标注器是 distilabel（Argilla）[5] 与 Autolabel（Refuel）[12] 两个工业框架的核心抽象；UI 模态输入表示见 3.5.2 背书 [13][16][17]；self-consistency 字段级投票为 Wang et al.（ICLR 2023）的多路径采样多数决 [33]。
 

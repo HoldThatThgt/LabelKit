@@ -5,6 +5,8 @@
 **做：**（v1.8 新增算子）把批内候选会话精化为 episode：对 `status="active"` 的帧信封按 `session_id` 重组会话（M10 装箱时盖章，3.10.3），可选 LLM 滑窗边界裁决与逐帧噪声标记（3.14.4）；成员信封置 `absorbed`、噪声帧置 `dropped_noise`，按序键拼装序列 Record 并向批尾追加 episode 信封（4.3 契约 ②b）。链序位于链首（`_CHAIN_ORDER` 首位、dedup 之前，3.10.3）——episode 形成先于一切逐条算子：帧级判重语义在连续 UI 帧上失效，重复判定改为 episode 级（3.3）；类标签、质量分、标注全部以 episode 为单位。`segment.enabled = false`（默认）时本算子不入链，工具行为与 v1.7 一致（输出仅多 `_meta.stream: null` 恒在键，6.3）。
 **不做：**不排序、不会话化（`[stream]` 规则层属 M2，3.2；M14 收到的是已按整会话装箱的批）；不判重（M3）；不推断动作（M15）；不打任务标签（M5）；不改链结构（②b 改变的只是批内信封基数与状态，与 ②a 同为受控例外）。
 
+**v1.18 sequence generation 边界：**sequence `generate_only` 直接投影 primary sequence 与 stream event，不进入 M14。只有把生成的 stream 工件作为普通 process 输入并开启 `segment` 时，本算子才按本节既有规则处理；`owner_sequence_id`、role、noise 与 replay provenance 都不是分段 oracle。因而 replay 验收检验的是普通内容分段与噪声移除路径，不是生成真值直通。
+
 | 模块 | 职责 | 边界 | 依赖 |
 |---|---|---|---|
 | M14 segment | 把批内候选会话精化为 episode：可选 LLM 滑窗边界裁决与逐帧噪声标记；成员信封置 absorbed、噪声帧置 dropped_noise，按序键拼装序列 Record 并尾部追加 episode 信封（②b） | 不判重（M3）；不推断动作（M15）；不打任务标签（M5）；不改链结构 | M1, M8, M9 |

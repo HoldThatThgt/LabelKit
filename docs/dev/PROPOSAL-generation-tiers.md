@@ -1,7 +1,9 @@
 # 提案：时间流生成修订——帧类构成档位与时间字段回填
 
-> **状态：superseded（v1.17 Wave 8 已收口）。** 本文仅保留 v1.14 的方案论证与决策溯源；当前行为以 v1.17 主规格为准。
-> **状态：已 SPEC 化（2026-08-18）。**最终开发规格见 `docs/dev/SPEC-generation-tiers.md`——三方预实现审计（代码可行性/亲和性、文件修改清单穷尽、对抗性反证）已于同日完成并折入其 §2 裁决表与 §3/§4 正文（含最重一条：report.generate.stream 为 orchestrator 显式装配，「orchestration 零改动」修正为七文件清单），**凡与本文不一致处以 SPEC 为准**。本文保留为方案论证与决策溯源材料。**后续演进（2026-08-19）**：本文提出的档位表为全局唯一，其「按序列类各自配置档位」的自然延伸已由 spec v1.15「按类档位表」落地（`[[class.<name>.generate.tiers]]`，表级原子覆盖 + 全局表为锚），见 `docs/dev/PROPOSAL-per-class-tiers.md` 与 `docs/dev/SPEC-per-class-tiers.md`。问题验证：工程现状核查于 2026-08-18 完成（仓库与 remote 一致，HEAD = 2026-08-14 代码规则整改提交），结论：① 生成侧无档位概念——最近的既有面是风格条件化（无配额控制、无结构保证、不进蓝图）与按类条件化（类维度，与档位正交）；② 时间戳铺设自 v1.13 落地即为机械交织器职责（零 LLM），但**结构化帧生成 Schema 内的时间语义字段**（如 duration）由帧实现调用的 LLM 凭空生成——时间轴在交织期才存在，该值必然与实际帧间隔无关。
+> **状态：superseded by v1.18 sequence generation。** 当前行为事实源为
+> `docs/dev/SPEC-sequence-generation-redesign.md`、`spec/*.md` 与 `docs/CONTRACTS.md`；
+> 本文其余内容仅保留历史方案论证，旧 SPEC 链接不代表当前行为。
+> 本文记录 v1.14 与 v1.15 当时的设计过程；对应旧开发 SPEC 已在 v1.18 clean break 删除。
 
 ---
 
@@ -50,7 +52,7 @@ flowchart LR
 | M1 时间静态约束 | `frame_gap_s` 上界 < `stream.gap_s`（帧间隔不得自触发会话切分）、最坏会话跨度 ≤ `session_max_span_s`、`ts_start` ISO 可解析 | `labelkit/common/config/_constraints.py:1131-1135,1165-1178` |
 | 风格条件化可否挪作档位 | 否：均匀抽签无配额、不进蓝图（结构不受控）、无输出档位语义（`generator.style` 承载多样性观测，挪用即污染 buckets 语义） | `generate.py:236-237`、裁决·生成键效力矩阵 |
 | 构成约束的既有承载力 | draft 2020-12 原生 `contains`/`allOf` 可表达「每类至少一次」；M8 四层（供应商结构化输出→确定性修复→jsonschema→有界修复环）与修复穷尽作废语义（`plan_failures`）原样可用，零新失败机制 | `jsonschema` ≥ 4.21 draft 2020-12 支持（v1.13 prefixItems 同一结论）；`generate.py:1369-1409` |
-| 抽签面影响 | 档位配分与时间回填都可做成零 rng 纯函数——冻结的抽签消费顺序表（计划期①②③/派发期零/交织期④–⑨）原文不动 | 裁决·抽签消费顺序表（`SPEC-stream-generation.md` 裁决表） |
+| 抽签面影响 | 档位配分与时间回填都可做成零 rng 纯函数——冻结的抽签消费顺序表（计划期①②③/派发期零/交织期④–⑨）原文不动 | 当时 v1.13 的抽签消费顺序裁决 |
 | 观测与估算面影响 | 两项机制都不改变调用数 ⇒ `estimate_run` 精确复演不变、八个 dry-run golden 字节不动、console 键集不动 | 裁决·估算精确复演、裁决·golden 冻结锚不动 |
 
 ### 2.3 与既有决策的关系（为什么这不是翻案）

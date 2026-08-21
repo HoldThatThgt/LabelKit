@@ -25,11 +25,17 @@ UI 模态合成判定：`dedup.ui_dup_requires = "both"`（默认，树近似重
 
 第④级（语义，v1.2）与合成判定的关系：UI 模态下④作用于树规范序列化文本，在 `ui_dup_requires` 合成判定中**视同 tree 层命中**——"both" 下需（②或④）与③同时命中才判重；"tree" 下④单独命中即判重；"image" 下④不参与判定。判重由④贡献时记 `kind="near_semantic"`（④与③同时命中仍记 `near_both`）。④ 与 ② 的分工：② 抓 n-gram 重叠的表层改写，④ 抓措辞不同语义相同的深层重复（[26] 的动机），两级独立可关。
 
-**序列记录（v1.8，S10）。**stream 模式下抵达本模块的判重单元是 episode（`record.kind = "sequence"`，3.14）——episode 级重复 =「同样的操作流程」；成员帧不会单独抵达（链序 segment 在 dedup 之前，成员帧已置 absorbed / dropped_noise，3.10.3），帧级判重语义在 stream 模式下有意留空（连续 UI 帧上帧级判重本就失效）。**v1.13 适用性注记**：本段以「链序 segment 在 dedup 之前」为前提陈述序列记录的来源，但该前提**不是**序列分支的生效条件——时间流生成形态（`generate_stream.enabled`，segment 关闭）下 M6 直接产出 `kind = "sequence"` 的直装信封，同样按下列序列配方判重（判别式恒为 `record.kind`，与 segment 开关无关）；本形态下**没有**成员帧信封（噪音帧与重发帧只活在工件里，从不构造信封），故 absorbed / dropped_noise 两态不出现。另注：M6 在交织**之前**已用同一配方（成员文本按序 `"\x1e"` 拼接）对兄弟序列做过一次相似度过滤（3.6.5），本模块是该过滤之后的第二道、口径一致。四处适配，其余零改动：
+**序列记录。**process stream 的 episode 与 v1.18 sequence projector 产生的主序列都以
+`record.kind = "sequence"` 进入同一配方：成员逐条按单记录配方规范化，再按顺序以 `"\\x1e"`
+拼接。精确与 MinHash 在拼接文本上执行；sequence 没有顶层 image，pHash 自动跳过，
+`ui_dup_requires = "both"` 按 tree-only 降级；semantic 也使用完整拼接文本。
 
-- **①② dedup_text**：配方增 `kind == "sequence"` 分支（优先于模态分支）——成员逐条按其单记录配方（文本规则 / 树规范序列化，随成员模态）产出后按成员序拼接，分隔符 `"\x1e"`（ASCII Record Separator，0x1E：`isspace() == True`，而成员配方输出的规范化文本已将空白折叠为单空格、不可能含该字符——拼接串与任何单记录配方输出结构性零碰撞）；①精确与②近似两级在拼接文本上照常执行。
-- **③ pHash**：对序列记录自动跳过（序列 Record 的 `image is None`——既有跳过门，零新增代码路径）；`ui_dup_requires = "both"` 下序列记录的合成判定**降级按 `"tree"` 处理**（与图像解码失败的降级路径同款，3.3.4）。
-- **④ 语义**：参检判定与判种归类两处逻辑（实现为 `_semantic_participates` / `_semantic_verdict_kind`）各增序列 case——"both" 对序列走 tree-only 分支（与③的降级一致）；序列拼接文本超长导致 embedding 重试耗尽时，走既有 `embedding_failures` 跳过路径（3.3.4——该记录按①—③判定，不增新失败通道）。
+v1.18 exact delivery 不先污染全局索引。一个 counterfactual set 的所有 variant 按声明序放入
+`DedupGroupRequest`，组内配对变体相互豁免，只与已提交 set 比较。异步 `group_probe` 可以完成真实
+embedding 并返回一次性 token，但不得写 exact set、MinHash LSH 或 embedding store；whole-set 接受后
+`group_commit` 才在无 await 临界区验证 token、index generation 与 record digest，并原子写入全部索引。
+probe rejection 或后续 quality/annotate/verify、M11 装配、replay 投影、reconcile、retained-content
+prospective check 的任何 rejection 均零写入。
 
 **线索记录（v1.9）。**stitch 启用时抵达本模块的判重单元升维为**线索**（thread——M16 缝合后的幸存序列信封，链序 stitch 在 dedup 之前，3.10.3/3.16）：`dedup_text` 配方**机制原样**（上列 S10 序列分支零改动）——成员逐条按其单记录配方产出后按成员序以 `"\x1e"` 拼接，作用对象自然是**重绑后**的成员元组，线索级重复 =「同样的完整操作流程（含恢复段）」；被并 episode 壳（`status = "stitched"`）被既有 `status == "active"` 处理面过滤**天然排除**、不参检不入索引（absorbed 成员帧同理）——**本模块代码零改动**（T13，审计核查点 6）。
 
@@ -44,10 +50,25 @@ class DedupStage(Stage):
     async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]: ...
 
 class DedupIndex:
-    """运行内存索引：exact set[bytes] + MinHashLSH + list[(id, phash)]
-       （+ dedup.semantic=true 时 list[(id, unit_vec)]，v1.2）。scope=batch 时每批重建。"""
+    """运行内存索引：exact、MinHash、pHash 与可选 semantic 特征。"""
     def probe_and_add(self, rec: Record) -> DedupInfo: ...
+
+    async def group_probe(
+        self,
+        request: DedupGroupRequest,
+        context: RunContext,
+    ) -> DedupProbeToken:
+        """只读试算一个 sequence group，并返回一次性提交能力。"""
+
+    def group_commit(self, token: DedupProbeToken) -> None:
+        """验证并原子提交一个已接受 sequence group。"""
 ```
+
+sequence 的 `group_probe` 直接使用 DeliveryController 从唯一 `GenerationServices` 根派生的
+`RunContext`，不复用会把 fatal 降级为记录状态的 `DedupStage` 外壳。`ProviderFatalError`、
+`CircuitBreakerTripped`、`KeyboardInterrupt` 与 `asyncio.CancelledError` 原样穿透且不消耗 slot attempt；
+`ProviderRetryableError` 原样上抛，由 DeliveryController 记为当前 attempt 的
+`provider_retryable_exhausted`。
 
 配置见 5.2 `[dedup]`。错误处理：图像解码失败 ⇒ 该记录跳过 pHash 层（按树判定）并计入 `report.dedup.image_decode_failures`；embedding 调用失败（重试耗尽，3.9.3）⇒ 该记录跳过第④级（按①—③判定）并计入 `report.dedup.embedding_failures`（仅 `dedup.semantic = true` 时可能非零，v1.2）。
 

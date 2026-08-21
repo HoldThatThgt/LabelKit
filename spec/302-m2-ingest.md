@@ -46,7 +46,9 @@ class Ingestor:
 
 ### 3.2.5 文本模态解析
 
-每行必须是 JSON object（非 object 的合法 JSON 视为坏行）。标注/打分所用文本由 `input.text_field`（支持点路径，如 `"conversation.turns"`；默认 `"text"`）抽取：命中字符串则直接使用；命中数组/对象则按 canonical JSON（`sort_keys=True, ensure_ascii=False`，紧凑分隔符）序列化为文本；未命中字段 ⇒ 坏行。原始对象完整保留在 `Record.raw`，输出时可按 `output.passthrough_fields` 透传（见 6.3）。记录 id = `sha256(canonical_json(raw))[:16]`。坏行策略 `input.on_bad_line = "skip"`（默认）| `"fail"`。**v1.13 工件可重放注记**：时间流生成形态产出的时间流工件（6.5）按本节规则**逐字节可重放**——M6 构造成员 Record 时同样取「工件行全对象」为 `raw`（含 `truth` 字段）并套用本行 id 公式，故把工件当输入重跑时 M2 算出的成员 id 与生成侧完全一致；`truth` 字段只是行上的普通字段，参与 id 计算、不参与任何判定，需要时经 `output.passthrough_fields` 透传出来做对照（3.6.5、6.5）。
+每行必须是 JSON object（非 object 的合法 JSON 视为坏行）。标注/打分所用文本由 `input.text_field`（支持点路径，如 `"conversation.turns"`；默认 `"text"`）抽取：命中字符串则直接使用；命中数组/对象则按 canonical JSON（`sort_keys=True, ensure_ascii=False`，紧凑分隔符）序列化为文本；未命中字段 ⇒ 坏行。原始对象完整保留在 `Record.raw`，输出时可按 `output.passthrough_fields` 透传（见 6.3）。普通文本记录 id = `sha256(canonical_json(raw))[:16]`。坏行策略 `input.on_bad_line = "skip"`（默认）| `"fail"`。
+
+**v1.18 sequence stream envelope 映射。**sequence 生成工件的每行顶层固定为 `payload` 与 `_meta`；重放工程固定 `input.text_field = "payload"`。M2 允许 `payload` 为 object，使用与生成侧完全相同的 canonical JSON 得到 `Record.text`，完整行保留为 `Record.raw`，并令 `Record.id = _meta.event.event_id`。这个分支不套用普通文本记录的 16 字符 id 公式，也不信任工件自报标识：M2 仅凭同一份 stream 工件重算并验证 primary `event_id`、每个 owner 的有序 `sequence_id`、`replay_sequence_id`、replay `event_id`，并逐位验证 `duplicate_of_event_id` 确实指向声明的 primary source。格式、全文件唯一性、owner 分组或 replay 同源关系任一不符即在 ingest 阶段 fail closed；不得退回普通 id 公式，不读取 main 文件作为隐式旁输入（6.5）。
 
 ### 3.2.6 配置项
 
@@ -161,7 +163,7 @@ FrameLayout [0,0,1080,2340]
 - `stream.session_max_len`（默认 200，硬上限）/ `stream.session_max_span_s`（时间跨度硬上限，0 = 不启用；仅 meta:*）；
 - 流耗尽（eof）或 `--limit` 截断（limit）。
 
-会话闭合时发一条 `segment.session` trace 事件（**属主 M2**；事件名冠 segment 前缀、按前缀归 segment 通道，S1，7.2）——payload 含 `session_id`、`first` / `last`（首末序键）、`len`、`cause`（∈ `gap`\|`key`\|`max_len`\|`max_span`\|`eof`\|`limit`），并计 `IngestReport.sessions`。会话对象 `Session(session_id, records, cause)` 的形态冻结于 CONTRACTS §7.1：`session_id = sha256("\n".join(会话内记录 id))[:16]`（会话序）、`records` 为按会话序的成员 Record 元组、`cause` 即上述闭合词表。**v1.13 工件可重放注记**：时间流生成形态的交织器按同一 `session_id` 公式给直装信封盖章——口径含**会话内全部帧**（噪音帧与重发帧一并计入），且铺设的会话间隔恒 > `stream.gap_s`、会话内帧间隔恒 < `stream.gap_s`，故把工件当输入重放时本装配器按同一份 `[stream]` 声明切出的会话与生成侧**逐一对应、session_id 逐字节相同**（3.6.5）。
+会话闭合时发一条 `segment.session` trace 事件（**属主 M2**；事件名冠 segment 前缀、按前缀归 segment 通道，S1，7.2）——payload 含 `session_id`、`first` / `last`（首末序键）、`len`、`cause`（∈ `gap`\|`key`\|`max_len`\|`max_span`\|`eof`\|`limit`），并计 `IngestReport.sessions`。会话对象 `Session(session_id, records, cause)` 的形态冻结于 CONTRACTS §7.1：`session_id = sha256("\n".join(会话内记录 id))[:16]`（会话序）、`records` 为按会话序的成员 Record 元组、`cause` 即上述闭合词表。**v1.18 sequence 工件重放注记**：重放工程按 `_meta.event.timestamp` 排序，M2 只依据时间戳、`stream.key` 与 gap/上限规则会话化；`owner_sequence_id`、role、noise 或 replay provenance 均不是分段判定捷径。工件的 primary、noise 与 replay 行共同进入普通 process stream 管线，成员 id 使用 3.2.5 的 envelope 映射，因而 session id 仍由实际会话成员 id 顺序机械导出（6.5）。
 
 **--limit 帧级截断（S17）。**`--limit` 的单位不变、仍是**帧**（记录）：islice 位于解析流与会话装配器**之间**；截断视同 EOF——尾部未闭合会话按会话闭合下发（cause = "limit"）+ WARN 一次。`cause = "limit"` 的精确语义是「**该会话在 --limit 预算耗尽处闭合**」：预算恰好在流末耗尽（无真截断）与真截断不可区分——消歧需要多拉取并解析一条记录，会扰动 scanned/bad_input 台账，工具不做（v1.8 D3 裁决）；WARN 文案据此陈述预算耗尽而非断言截断（2.4 --limit 行 stream 子句）。
 
@@ -171,21 +173,14 @@ FrameLayout [0,0,1080,2340]
 
 **背书：**规则层会话化是流处理 session window 原语的对应物（Apache Flink `EventTimeSessionWindows` / Apache Beam `Sessions` [55]，1.5）——inactivity gap + 分区键 + 硬上限三件套照抄，纯代码零 LLM 成本；`gap_s` 默认偏大的结构性论证（欠分割可由 M14 的 LLM 边界精化拯救、过分割不可逆）见 5.2 gap_s 行。
 
-### 3.2.9 v1.16 生成工件的精确重放边界
+### 3.2.9 v1.18 sequence replay 边界
 
-v1.16 的联合规划器以微秒整数铺设生成任务帧时间，再由 M11 写成 ISO-8601 字符串。
-M2 的会话状态机仍使用既有严格大于关系：相邻序键差 `<= stream.gap_s` 留在同一候选
-会话，差值 `> stream.gap_s` 才闭合会话。生成器保证同一会话内的帧差不超过该边界，
-跨会话至少多出 `1us`，因此把时间流工件作为相同 `[stream]` 输入重放时，规则层会话
-边界与生成侧冻结的会话一致；该约束不改变 M2 对普通输入的排序、乱序或坏行处理。
+sequence 生成形态在 `generate_only` 运行中不调用 M2；只有把 `{output_stem}.stream.jsonl`
+作为 process 输入时才进入本模块。此时 M2 继续只消费 M1 冻结的绝对
+`ResolvedConfig.paths.input`，普通文本/UI 的扫描、排序、会话化与坏行策略不变。
 
-规划器投影作废序列时只移除槽位并保留幸存任务帧的原始时间戳，不重新压缩时间轴；
-空会话被删除并重新编号，幸存帧不会跨会话搬迁。重复序列沿用源载荷（包括已经回填的
-时间字段），其重发会话使用规划器为流尾安排的时间。M2 只读取工件行，不识别规则、
-日历窗口、相关性或序列校验钩子，这些约束在 M1/M6 已完成。
-
-### 3.2.10 v1.17 路径消费面
-
-v1.17 起 M2 只消费 `ResolvedConfig.paths.input`（M1 冻结的绝对输入路径解析产物，
-3.1.4.2），不再从 `run.input` 字符串按进程 cwd 推导相对路径；文本 / UI 模态的扫描、
-解析、排序、会话化与坏行处理行为零改动。
+生成工件中的 timestamp、gap 与 elapsed 信息只存在于 `_meta.event`；用户 `payload`
+不接收旧式 `time_fields` 回填。primary 行携带 `owner_sequence_id`，noise 行的 owner、role、
+scenario 与 world branch 均为 null 且 `noise = true`，replay 行携带 `replay_sequence_id`、
+`duplicate_of_sequence_id` 与 `duplicate_of_event_id`，且不创建新的 `world_branch_id`。
+M2 验证这些 envelope 关系，但不会使用 generation truth 绕过 M14/M16 的普通内容判定。

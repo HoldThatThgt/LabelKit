@@ -2,19 +2,61 @@
 
 ### 3.11.1 职责与边界
 
-**做：**三通道写出——主输出 JSONL（增量追加、终检、原子改名交付）、rejects 通道、report.json；组装 `_meta`；stderr 进度与结束摘要。 
-**不做：**不修改标注内容；不做结构校验之外的任何数据加工（写出前调用 `SchemaEngine.validate_only` 做最后一道终检，失败即 bug——fail loudly，转 rejects 并记 `internal_error`）；报告不含数据内容。
+**做：**process 与 flat 继续按批写主输出、rejects、sidecar 和 report；v1.18 sequence 在完整交付前只持有
+内存产品，成功时写 main、stream、report 与最后提交的 manifest，失败时只写独立 failed report。所有路径只读
+M1 冻结的 `ResolvedPaths`；组装 `_meta`、执行写前 Schema/双视图终检并维护内容摘要。
+
+**不做：**不修改 annotation、generation truth、payload、事件时间或 replay；不解释 pattern/state/evaluator
+业务语义；不为 sequence 写已接受前缀、rejects、sidecar 或无 manifest 的“成功”数据。
 
 ### 3.11.2 写出规格
 
 | 通道 | 规格 |
 |---|---|
-| 主输出 | 运行期写 `{output}.part`，每批 flush；finalize 时 fsync + 原子 rename 为目标名。行格式见 6.3。仅 `status="active"` 且（annotate 启用时）标注成功的记录写入。v1.6：熔断中止（退出码 4）的 finalize 同样执行交付（3.10.3 熔断交付）——已交付文件中每一行恒完整合法，运行是否完整处理了全部输入以 report.run 判定（interrupted=false 且 circuit_broken=false，3.11.3 ④）。v1.8：`status = "absorbed"`（成员帧已并入 episode，3.14）为**第三路由**——主输出与 rejects 均不写、**仅计数**（成员内容以 `members` 引用随其 episode 的序列行落盘）；分发规则变为 active → 主输出、absorbed → 仅计数、其余非 active 状态 → rejects。v1.9：`status = "stitched"`（被并 episode 壳，3.16）为**第四路由**——同 absorbed 仅计数（其成员随幸存线索信封的序列行落盘）；分发规则变为 active → 主输出、absorbed / stitched → 仅计数、其余非 active 状态 → rejects——壳**不得**落入兜底 else → rejects 分支（否则以 internal_error 之名污染 rejects 且 `--strict` 必退 1）。`_meta` 增**恒在键** `stream`（未启用 segment = null；键位在 source 之后、scores 之前——链序镜像；结构见 6.3）；stream 模式下 `_meta.verification` 另含恒在 `defects` 键（无缺陷 = []，6.3）。v1.9：stitch 启用时 `_meta.stream` 另含 `thread_id` / `fragments`（含 order_span 包络规范句）/ steps 行内 `resumed`（三者**仅启用时在场**——off 时行内容与 v1.8 逐字节等价，6.3、3.16.4 退化锚）。stderr 进度与结束摘要**不增键**（fanout 先例——episodes / absorbed / dropped_noise（及 v1.9 stitched / threads）经 report 与 batch.end 事件可见，3.10.3；v1.10 U18：不增键约束限 plain 面——rich 面板状态账展示 stitched/threads，7.7）。v1.10 console 让位（U21）：`_progress` / `_print_summary` 的行格式改经 common 层纯函数 `console_format`（输出与 v1.9 硬编码逐字节一致，黄金快照钉死）；两方法加静态门 `console.mode_resolved == "rich"` 时直接 return——plain 档原样执行（回归锚），rich 档信息由 CLI 层面板超集覆盖（终版摘要换渲染器表格版，数值来源不变，7.7）；中途降级/`q` 脱离后的 plain 行由渲染器以同一 `console_format` 续打。v1.12 **members 块**（任一帧开关启用时在场）：`_meta.stream` 增 `members[]`——**冻结位 = `member_sources` 之后、`session_split` 之前**（两处有序精确断言测试同步该位置）；逐成员按 `rec.members` 序各一条目，**条目字段序冻结** `index, id[, label][, annotation, status]`（`index` 0 基 = 成员在序列中的位次，`id` = 成员 record.id）。**在场规则**：`label` 键仅 `frame.classify.enabled` 时在场（`member_classifications` dict 为 None 或缺键 ⇒ null——覆盖降格跳过）；`annotation` / `status` 两键仅 `frame.annotate.enabled` 时在场。**status 闭集三值判定**（单一真相 = `member_annotations` dict 形态，3.5.5）：dict 缺键（或 dict 为 None）⇒ `"skipped"`（annotation=null）；值 None ⇒ `"failed"`（annotation=null）；对象 ⇒ **写前** `validate_only(obj, schema=frame_schema)` 兜底（3.8.2）——通过 ⇒ `"annotated"`，不通过 ⇒ `"failed"` + annotation 置 null + `frame_annotate.failed` 计数（非法帧对象**零落盘**；成员失败不改信封状态、不写 `item.errors`）。**沉没成本记账**：终态非 active 的序列信封仍携带 `member_annotations` ⇒ 按**非 None 条目数**累计 `frame_annotate.discarded`（已产出未交付，仅计数、不落盘，6.4）。`_meta` 顶层键序、四路由互斥、守恒恒等式**零改动**。v1.13（时间流生成形态，`generate_stream.enabled`）三处修订、其余零改动：① **写前终检按行取 Schema**——`validate_only` 的 Schema 实参改取**该行的类有效 Schema**（`item.classification.label` → 该类声明的标注 Schema 覆盖，未分类 / 未知类 / 该类未声明 ⇒ 走全局 `output.schema` 的既有缺省路径，字节等价 v1.12；multi 扇出的兄弟信封各带自己的标签，按行天然对齐）；本模块**不跨算子导入** M5 的取值函数，按 §2.2 依赖方向在内部持一份最小镜像（两侧取值语义须一致，测试钉住）。② **`_meta.stream` 块的门扩为 `segment.enabled ∨ generate_stream.enabled`**（`members[]` 在场门与其中的 `label` 列门同步扩）——直装序列行原样复用该块：`order_span` 与 `member_sources` 指向**工件路径与行号**（`order_span` 的两端渲染为 `"<工件路径>:<行号>"`，`member_sources` 每项为 `{file: <工件路径>, line_no: <行号>}`——既有渲染器直接可用）、`members[]` 条目 = `{index, id, label}`（label 取 `member_classifications` 的帧类真值；本形态与 `frame.annotate` 互斥 ⇒ 无 `annotation` / `status` 两列，v1.12 的条件列规则相容）、`session_split=false`、`repaired=false`、`degraded=null`、`steps=null`、无 `thread_id` / `fragments`。③ **rubric 镜像**——`_meta.run.rubric` 的空选择器解析镜像同步扩为 `segment.enabled ∨ generate_stream.enabled ⇒ "default:trajectory"`（与 loader 两处同改，3.1.4 S29 扩展）。**零改动（显式声明）**：`_meta` 顶层键序、四路由互斥（本形态只出现 active 与 dropped_* / failed 两类去向——无 absorbed / stitched：成员帧根本不构造信封）、守恒恒等式（取 generate_only 退化形，6.4）。 |
-| 时间流工件（v1.13） | **第五输出通道**，仅时间流生成形态出现：`write_stream_artifact(lines)` 把 M6 交付的、按交织序定稿的工件行写入 `{output_stem}.stream.jsonl.part`（写入 + flush；路径规则 = 主输出路径去末级后缀 + `.stream.jsonl`，与 M6 各自推导同一值——算子间不互导，两侧等式由测试钉住），finalize 时与主输出**同批** fsync + 原子改名（3.11.3 ④ 的时间线对工件同样成立：目标名出现即每行完整合法）。**共用 `_undeliverable` 纪律**——通道不可写或写失败即置位，此后 finalize 一律不改名（半截工件永不冒充成品，exit 4 家族）。**dry-run 天然不触达**（`_run_dry` 不驱动生成、不开 emitter 通道）。写入同时冻结 `report.run.artifact = {path, sha256, lines}`（sha256 按落盘字节计，`config_digest` 同款前缀形态；M10 组报告时读取，6.4）。行内容由 M6 定稿——本模块**不生成、不改写、不校验**工件行（格式规范见 6.5）。 |
-| rejects | `output.rejects = "none" \| "refs"（默认）\| "full"`。refs：每行仅 `{"_meta": {id, source, stage, reason, errors}}`——不含数据内容（source 亦不含 `passthrough_fields`，其值属数据内容），贴合不存储原则；full：额外含记录内容与最后一版非法输出（调试用，用户显式选择）。文件名 `{output_stem}.rejects.jsonl`。v1.7：classify 启用时 `_meta` 增 `label` 键（= 该信封路由标签；multi 扇出下同 `id` 的兄弟信封由此消歧，行唯一键 (`_meta.id`, label)，6.3），refs / full 两档均携带。v1.8：`dropped_noise` 行按翻转方留下的 duck-typed reason 标记归因分流（此类帧**不写 `item.errors`**，「归因取 `item.errors[0]`」规则无从服务），(stage, reason) 组合恰增**三种**——(`"segment"`, `"noise"`)（LLM 判噪声帧）、(`"segment"`, `"below_min_len"`)（短段丢弃帧，独立于 noise，S11）、(`"verify"`, `"off_task_member"`)（修复收缩弃帧，S31）；absorbed 信封永不入本文件（第三路由）。`--strict` 交互：stream 工程的噪声帧属预期产物，会因 rejects 非空退出 1（6.4）。v1.9：(stage, reason) 组合再增一种——(`"stitch"`, `"stitch_invalid"`)（仅 `stitch.on_error = "fail"` 时出现：判定修复耗尽的 episode 候选信封，3.16.6）；stitched 壳与被救援帧（dropped_noise → absorbed 翻转）**永不入本文件**——`--strict` 补注：同输入开启 stitch 后（短段被救援而不再落 rejects）strict 结果可能由 1 变 0，属预期（2.4、3.16.6）。full 档对序列 Record 的 `record` 载荷输出 `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}`（S25；`kind="single"` 载荷形态不变）；`raw_last_output` 仍仅 `schema_violation` 行携带——classification_invalid / segmentation_invalid / extraction_invalid 失败行不带原始输出（classify 起的既有缺口，明文接受）。v1.11：reason 词表再增**两值**——`context_overflow`（上下文预算三形态：预检/最小单元不装/反应态降级耗尽，V10/V16/V24）与 `output_truncated`（响应以输出上限截断收尾终局化，V11）；stage = 产生该错误的属主算子（任何 LLM 调用阶段皆可出现，语义与熔断矩阵见 7.6）；refs / full 档行形态不变，`raw_last_output` 门不扩（两 kind 均不携带原始输出，同上缺口口径）。v1.12：rejects 面**零改动**——行键集维持既有闭集（refs 五键 / full 六键，有序精确断言），(stage, reason) 组合、reason 词表均不增；**帧标注失败的成员不产生 rejects 行、不触发 `--strict`**（成员失败非信封失败——只落 members[] 条目 status="failed" + `frame_annotate.failed` 计数，裁决·成员失败不入 rejects；`--strict` 读信封状态计数，帧失败不改信封状态）。 |
-| report.json | `{output_stem}.report.json`。结构见 6.4：运行参数摘要（脱敏，无 key）、各阶段计数、分数分布直方图、去重簇统计、结构引擎各层命中、token/成本、耗时、失败分类计数。v1.7：classify 启用时增 `classify` 节（assignment / 逐类分布 / fallback_count / failures，multi 另含 multi_label_records）与 `quality.by_class` 按池视图，multi 时 counts 增 `fanout`（6.4）。v1.8：segment 启用时 counts 增 `episodes` / `absorbed` / `dropped_noise`，counts 之后新增 `stream` 节（sessions / episodes / mean_episode_len / absorbed / dropped_noise / below_min_len / digest_poor_frames / segment_failures + extract / verify 可选子块，6.4）。v1.9：stitch 启用时 counts 增 `stitched` / `threads`（= episodes − stitched 导出式，3.10.3），`stream` 节增 `stitch` 子块（stitched / rescued_short / seams / judgments / repass_judgments / failures，6.4）；全部 v1.9 新键**仅启用时在场**——off 时本模块三通道产物与 v1.8 逐字节等价（3.16.4 退化锚；唯一报告面例外 = stream×verify 缺陷词表 `wrong_stitch: 0` 行，词表为 3.7.2 四处同步闭集、不随开关条件化）。v1.11：上下文预算启用时增 `report.budget` 节（profiles / w_min / truncations / overflow_records / image_cost / degrade_retries / escalations——counts-only，M10 汇总，3.10.3、6.4），`stream` 节增 `windows`（segment 实际窗数，M14 属主——供对账 V12 上界估算，6.4）；预算全体未声明时两处不在场，报告与 v1.10 逐字节等价。 |
-| v1.16 规则/窗口联合面 | M11 不解释或复制规则、窗口、correlation、planner 状态和 sequence-validator 结果。M6 交付的时间流 artifact 仍由第五通道原样写入，主输出仍按既有类有效标注 Schema 写前 `validate_only`；整条 attempt 的 planner、realize、sample-validator、declarative 或 sequence-validator 作废都不会构造 failed 信封，因此不会被 M11 重新归因。`report.generate.stream` 的 `rules`、可选 validator 计数和 `windows` 子块由 M10 装配；M11 只写 report，不新增 truth、`_meta.stream`、Record id 或 artifact 行字段，规则配置不进入任何输出。 |
-| v1.17 场景规划交付面 | M11 只消费 `ResolvedPaths`（3.1.4.2）——主输出 / rejects / report / sidecar / 时间流工件五个通道的路径派生全部移至 M1（含 live `<output-stem>.report.json` 与 dry-run `<output-stem>.dryrun.report.json` 的命名裁决），emitter 与 console 不再按命令模式追加后缀、不再从字符串推导 cwd-relative 路径。**partial exact delivery 原子交付**：任一交付槽位耗尽或 delivery 期间 SIGINT 时，主输出、时间流工件与 rejects 照常按既有 finalize 纪律原子交付已成功部分（目标名出现即每行完整合法，3.11.3 ④ 时间线同样成立）——运行完整性以 `report.generate.stream.delivery.complete` 判定，退出码分流见 3.10.3。**duplicate 行的 truth 双时间语义**：duplicate 工件行的 payload / tier / frame word / `time_fields` 绑定键是 source 的深拷贝（携带 source 的时间字段值），而行 timestamp 与 resource interval 用 duplicate layout 的新时间——有意的双时间语义表示「在新 wrapper 时刻原样重发一份携带 source 时间字段的 payload」，consumer 经 `truth.duplicate_of` 识别该例外（M6 定稿，3.6.7、6.5）；M11 原样写行、不解释、不改写该语义。 |
+| process / flat 主输出 | 运行期写同目录 `.part` 并逐批 flush；finalize 时 fsync + 原子 replace。只写 active 且通过最终 Schema 的记录。absorbed/stitched 只计数，其他非 active 状态按 rejects 策略路由；既有熔断部分交付和中断语义保持不变。 |
+| process stream 元数据 | segment/stitch/frame 开关决定既有 `_meta.stream`、members、fragment、defect 形态；成员标注写前逐项 `validate_only`。该面不承担 sequence 生成真值。 |
+| process / flat rejects | `none` / `refs` / `full` 三档保持既有语义；refs 只写引用与 value-free error，full 是用户显式的数据内容调试面。sequence 配置强制 none 且从不打开该通道。 |
+| process / flat report | `<output-stem>.report.json`；聚合运行参数摘要、计数、质量、去重、Schema、usage、预算与耗时，不含业务数据。 |
+| sequence 内存阶段 | M6 先产生只服务于 dedup/downstream 的 `ProjectedSequence`；M11 再以最终 `PipelineItem` 组装 `SequenceRows`，replay 只从 source 的最终 primary rows 派生。在全部 primary/noise/replay slot 与 CrossViewReconciler 通过前，不打开 main、stream、success report 或 manifest；失败 attempt 同样不打开正式数据通道。main/stream/replay 共享冻结 payload 引用。 |
+| sequence main | 只含 primary sequence，每个 Record 在写前按 inherited sequence class 选择有效用户 Schema；classify 关闭不影响 ClassView 路由。declared 与 instruction-only 的 generation truth 按第 6 章写入。 |
+| sequence stream | 顶层固定为 `payload` 与 `_meta`。primary row 与 main owner 双向一致；noise 无 owner/role/pattern/variant；replay 是 whole-positive-sequence 同源投影，使用新 ID 与时间但逐位 payload、frame class、actual role 和顺序同源。 |
+| sequence success report | `report.generate.sequence` 只含身份、精确计划/交付计数、调用族、按 pattern 计数、usage 与冻结 rejection buckets；不含 state、patch、payload、prompt 或已交付数据前缀。 |
+| sequence manifest | main、stream、report 都写同目录 `.part`，flush + fsync 后依次 `os.replace(main, stream, report)`；manifest 最后单独写、fsync、replace。manifest 是唯一成功提交真值，包含 schema_version、run_id、delivery_digest、artifacts_committed、三个 artifact 的绝对路径/sha256/rows 与 committed_at。 |
+| sequence failed report | `<output-stem>.failed.report.json` 经同目录 `.part` 原子替换，只含 run_attempt_id、nullable run_id、artifacts_committed=false、failed_slot、attempts_used、terminal_error_kind、usage 与 rejection counts。它是最近一次失败诊断，不属于 manifest；即使 run_id 相同，也不能否定一个摘要有效的成功 manifest。 |
+| commit-I/O 失败 | main/stream/report 顺序 replace 可能留下新旧混合固定路径；旧 manifest 必须保持不变。消费者以 manifest 摘要核验并拒绝不匹配组合。failed-report 写失败不覆盖主异常；只有没有主异常时映射 exit 4。 |
+| stderr / console | 只打印进度、计数与 value-free 错误；rich/plain 仍共用 console_format。sequence 不打印 prompt、state、patch、payload、ActorView 或 key。 |
+
+`SequenceDeliveryEmitter.assemble_sequence(item, projection, batch_no)` 是纯内存、零 I/O 入口，
+复用普通 emitter 的用户对象、按类 Schema、scores、sequence/frame annotation 与 verification 装配规则，
+返回 `SequenceRows(main_row, primary_stream_rows, retained_content_bytes)`。`batch_no` 固定为从一开始的
+slot declaration ordinal，重试不变。`ProjectedSequence.main_record` 只是 dedup/downstream 输入，
+不得用它组装或计费最终 main row。
+
+ReplayProjector 在 `assemble_sequence` 之后才从 source `SequenceRows.primary_stream_rows` 深拷贝并机械
+替换 replay 身份与工件时间，因而 payload、frame annotation 与其他下游元数据逐位保留。
+`SequenceRows.retained_content_bytes` 只计其 main row 与 primary rows；`ReplayRows.retained_content_bytes`
+只计 replay rows。两者共用 `canonical_delivery_row`，每行计 `len(canonical_row_bytes) + 1`，
+其中一 byte 是 JSONL 换行。
+
+`SequenceDeliveryEmitter.prepare_product(main_rows, stream_rows, report)` 是 `delivery_digest` 的唯一属主。
+摘要使用完整 64-hex SHA-256：先写固定 ASCII header `labelkit:v1.18:delivery\n`，再按 main、
+stream 视图顺序及各自行序写入 `len(canonical_row_bytes)` 的十进制 ASCII、冒号与行字节。
+`canonical_delivery_row` 只移除 `_meta.run.started_at`、`finished_at`、`duration_ms` 和 manifest
+`committed_at` 等发射期墙钟观测字段；annotation、generation truth、payload、事件时间与 replay
+证据都纳入。`prepare_product` 只计算一次，把摘要写入 report 深拷贝，并返回
+`GenerationProduct(main_rows, stream_rows, report)`。产品不另存 digest 或 manifest input。
+所有 slot/noise/replay 交付完成与 report 计数在进入 `commit` 前已冻结；此后的失败只是
+commit-I/O run terminal，不消耗 attempt，不重试 slot，也不重新生成产品。
+
+`commit` 只从深度冻结的 `product.report.delivery_digest` 构造 manifest，不重算摘要；缺失或
+格式非法必须在打开任何 `.part` 前以 `generation_downstream_contract` 终止。摘要只写
+report/manifest，不写 main/stream，也不参与 Record ID。manifest 的 `committed_at` 是其唯一新增
+墙钟字段。
+
+正式提交前，`CrossViewReconciler` 以最终 `SequenceRows`、noise rows 与 `ReplayRows` 做双向核对，
+再验证 canonical row 字节数与 prospective retained-content 计费一致。任何 projector/emitter 增删、
+改写或漏写字段都以 `sequence_projection_mismatch` 拒绝当前 attempt；不能用 planner witness
+修补实际输出。
 
 **背书：**「主数据 + 拒绝通道 + 统计报告」三分法是 NeMo Curator / Dolma 管线产物的通行组织 [6][9]；原子改名交付为数据工程防半截文件的标准手法。
 

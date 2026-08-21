@@ -38,12 +38,28 @@
 
 每记录 1 次调用：提示词呈现该 criterion 的 6 级加性量表（0–5，逐级累加式描述，附录 A 给出全文），要求模型先给两句理由再给整数分（判分与理由分离缓解冗长偏差 [20]；加性量表为 FineWeb-Edu 验证的最优形式 [11]）。输出 `{"scores": [{"criterion": key, "reason": str, "score": 0..5}]}` 经 M8 校验；score 归一化为 /5。聚合与质量门同 pairwise。两种模式共用同一 rubric 的不同字段（pairwise_prompt / pointwise_levels），切换零迁移成本。
 
+**v1.18 sequence attempt 边界：**sequence 启用 quality 时只允许 pointwise 与固定 threshold；pairwise、
+top_ratio 或任何组内相互影响的 selection 都在 M1 拒绝。`run_attempt` 在 `AttemptTransaction` 内执行，
+不修改全局 batch 或 dataset counter；任一成员未通过则返回 rejected stage = quality，整个 counterfactual set
+丢弃。其 class 路由始终读取 projector 写入的 inherited `PipelineItem.classification`，不能以
+`cfg.classify.enabled = false` 为由忽略 `ClassView`。
+
+`ProviderFatalError`、`CircuitBreakerTripped`、`KeyboardInterrupt` 与 `asyncio.CancelledError` 从 attempt
+入口原样穿透；retryable exhaustion、Schema/context/truncation 与普通质量拒绝返回
+`DownstreamAttemptResult(accepted=false)`，消耗当前 slot attempt。
+
 ### 3.4.5 API 与配置
 
 ```
 class QualityStage(Stage):
     name = "quality"
     async def run(self, batch, ctx) -> list[PipelineItem]: ...
+
+    async def run_attempt(
+        self,
+        request: DownstreamAttemptRequest,
+    ) -> DownstreamAttemptResult:
+        """在 sequence attempt 内执行 pointwise 质量门，不提交全局状态。"""
 
 def fit_bradley_terry(n_items: int, comparisons: list[tuple[int, int, float]],
                       l2_pseudo: float = 0.1, tol: float = 1e-6, max_iter: int = 200) -> np.ndarray:

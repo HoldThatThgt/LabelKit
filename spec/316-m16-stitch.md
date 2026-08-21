@@ -5,6 +5,8 @@
 **做：**（v1.9 新增算子）对批内候选会话执行线索缝合：以「单调选池 LLM 判定 × 机械先验合取」把同一目标导向任务被穿插切开的碎片（episode）保守缝合为**线索（thread）**，有界二遍复评修正顺序贪心的漏缝（3.16.4）；被并 episode 信封壳置 `status="stitched"`、幸存信封 Record 重绑（4.3 契约 ②c）；`below_min_len` 短段按连续 run 重组为救援候选先进候选池，命中时成员帧 `dropped_noise → absorbed` 翻转（②c③）；对多碎片线索机械标定接缝（`seam_indexes` duck 标，零 LLM——接缝转移由 M15 按 T10 四键占位，3.15.4）。产出三级结构 **thread ⊃ fragment ⊃ step**（对齐 Ego4D Goal-Step goal⊃step⊃substep [69] 与 AndroidControl goal⊃instruction⊃action [45]）；帧永远单一归属——交叉用「平面分段 + 线索身份」表达（Goal-Step `is_continued` 同型 [69]；PIRA 把任务子轨迹形式化为**非连续帧子集** [64]），不引入帧多重归属。链序位于 segment 之后、dedup 之前（3.10.3）——缝合改变成员集，必须先于判重（线索判重面 = 重绑后成员配方，3.3.3）与摘取（接缝序数占位，3.15）。`stitch.enabled = false`（默认）时本算子不入链，**主输出、rejects、report.json 与 v1.8 逐字节等价**（退化锚，3.16.4 退化锚行；例外恰两处——dry-run stderr 的 `stitch_calls=0` 行与 stream×verify 缺陷词表的 `wrong_stitch: 0` 行，见退化锚行）。
 **不做：**不重分段（episode 边界属 M14 上游；本算子只合并、不切分）；不推断接缝动作内容（接缝是已知中断，零 LLM 机械占位属 M15 消费面，3.15.4）；不判重（M3）；不打任务标签（`task_name` 是摘要卡滚动线索名——工具内部结构，进 trace 与判定证据，用户 Schema 产出物属 M5）；不跨会话、不跨批缝合（hard-split 边界不可缝，3.16.4 作用域行）；不做真并发/帧多重归属（单前台屏无真并发 [65]，2.1.2 / 8.1）。
 
+**v1.18 sequence generation 边界：**sequence `generate_only` 不进入 M16。工件 replay 仅在 process 工程显式开启 `stitch` 时按本节普通会话内规则运行；replay/owner 元数据既不授权跨会话缝合，也不替代 LLM 判定与机械先验。完整 replay duplicate 由下游 M3 基于成员 payload 序列判重，不由 M16 按 provenance 合并。
+
 | 模块 | 职责 | 边界 | 依赖 |
 |---|---|---|---|
 | M16 stitch | 把会话内碎片保守缝合为线索：单调选池 LLM 判定 × 机械先验合取 + 有界二遍复评；被并 episode 壳置 stitched、幸存信封 Record 重绑、below_min_len 短段救援翻转（②c）；机械标定 `seam_indexes` | 不重分段（M14）；不摘取动作（M15）；不判重（M3）；不跨会话/跨批；不做帧多重归属 | M1, M8, M9 |

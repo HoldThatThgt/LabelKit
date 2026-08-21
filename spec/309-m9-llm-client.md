@@ -205,6 +205,21 @@ v1.11 新增（决策 V1–V27 见 `docs/dev/SPEC-context-budget.md`，调研引
 
 **背书**：预算不变式为业界共识形态（LlamaIndex `context_window − prompt − num_output` [C-5]、Claude Code `contextWindow − min(maxOut,20k) − 13k` [C-15]、OpenRouter「输入+补全」合并判定 [C-17]）；「首批先验 + 稳态测量校准」的两段结构对标 ABR 的 measure-don't-model 谱系（BBR windowed-max [C-54]、dash.js DYNAMIC 双阶段 [C-37]、FESTIVE p=0.85 装填折扣 [C-32]）。
 
-### 3.9.6 v1.17 RuntimeCredentials 构造契约
+### 3.9.6 RuntimeCredentials 与 v1.18 sequence 异常边界
 
-v1.17 起 `LLMClient` 的构造函数**必须**收到 `RuntimeCredentials`（`labelkit/common/runtime/credentials.py`，3.1.4.2）——删除内部 env fallback 与 profile secret fallback 两类旧路径：profile 自 v1.17 起只保存环境变量名称（`api_key` / `api_keys` 字段已删除），`_pool_members` 及全部密钥物化改读 credentials 的只读 key tuple。凭据由 CLI 层在 run 与 `validate --probe` 两条命令路径上解析注入；无 key 的静态 validate 与 dry-run 全程不构造网络运行、零 `os.environ.get`（console auto 对 `TERM` 的非秘密读取使用 membership/indexing，不得成为偷读 credential 的旁路）。credentials 不进入 dataclass repr、日志、trace、report、exception 或 deepcopy（载体 `repr=False`；KeySnapshot 等既有「只显环境变量名」纪律维持不变，3.9.2）。`complete` / `embed` / `probe` / `probe_all` 与密钥池轮换、冷却、禁用、驻留的行为语义全部零改动（3.9.3）。
+`LLMClient` 的构造函数必须收到 `RuntimeCredentials`（`labelkit/common/runtime/credentials.py`）并删除
+内部 env/profile secret fallback。profile 只保存环境变量名称，`_pool_members` 与密钥池物化只读 credentials
+的 key tuple。凭据由 CLI 在 run 与 `validate --probe` 分流后解析；静态 validate 与 dry-run 不读 key value。
+credentials 不进入 repr、日志、trace、report、exception 或 deepcopy。
+
+v1.18 sequence 的 generation、dedup probe 与下游 attempt 接口必须保留 M9 异常分类：
+
+- `ProviderFatalError`、`CircuitBreakerTripped`、`KeyboardInterrupt`、`asyncio.CancelledError` 原样穿透至
+  DeliveryController，立即按 run terminal 处理且不消耗 slot attempt。
+- `ProviderRetryableError` 在 generation/downstream 边界归 `provider_retryable_exhausted`，消耗当前 attempt；
+  dedup `group_probe` 原样上抛给 DeliveryController，不能先转成 `StageError`。
+- `ContextOverflowError` 与 `OutputTruncatedError` 保持 precheck/reactive 与熔断矩阵；sequence 真值不可通过
+  截断继续请求。普通可变内容失败可以消耗 attempt，确定性配置地板在启动期失败。
+
+若任何 attempt 路径把 provider fatal 降级到 `PipelineItem.errors`，DeliveryController 必须报
+`generation_downstream_contract` 内部错误并 exit 4，不能把系统性失败伪装成可重试 slot rejection。

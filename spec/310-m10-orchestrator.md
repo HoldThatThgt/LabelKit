@@ -51,9 +51,136 @@ class RunContext:      # 传入每个 stage.run 的上下文
 | console 旁路（v1.10） | **stage 信号**：批链循环内每 stage `run()` 之前调 `metrics.stage_begin(stage.name, batch_no)`——进程内旁路仅转发 ProgressListener，不产生 TraceEvent、不入 7.2 目录（3.12.3/U11）；`_request_stop` 内加一行 `metrics.stop_requested()`（中断横幅通路）。**估算导出（U20）**：静态估算公式抽出为纯函数 `estimate_run(cfg, plan)`（`_estimate()` 改薄封装；dry-run 与渲染器批级分母共用）；live 路径在 P2-4 预扫后经 `metrics.run_estimate(...)` 发送——process 模式**复用该次 scan**（UI 模态翻 `estimate=True`，配对表零额外 I/O；文本模态仅 `console.estimate = true` 时做行数估算，U17），**禁二次 scan**；generate_only 走 3.6.2 静态公式无 scan。**dry-run 呈现（U13；v1.11/V12 修订）**：rich 档下估算四行 print 让位于渲染器表格（数值逐项一致）；plain 档行式输出为逐字节锚——`segment_calls`/`stitch_calls` 维持**无条件打印**，其中 `segment_calls` 行的含义自 v1.11 起改为**按 w_min 报预算最坏装填上界**（本表时序流行；预算未声明或 w_min ≥ window 时数值与 v1.10 逐字节不变——examples 声明保守实效窗下当时的五个黄金文件不动，V26；v1.12 起黄金文件为**七个**且因估算行插入两帧粒度键全部重采，见本表帧粒度行）。listener = None 时以上全部为 no-op（v1.9 行为逐字节一致）。 |
 | 上下文预算（v1.11，仅预算启用时） | **批边界校准冻结（V19）**：每批处理完成、下一批装填开始前调用 `self.llm.calibrator.freeze_batch()`——聚合本批图片成本样本的 max（对无序集取 max，序无关）压入批最大值窗口、刷新可读快照（第 N 批装填只读 < N 批的聚合值，确定性护栏——批序串行 ⇒ 同输入同配置可复现；校准器由 `LLMClient` 自持，公开面 `llm.calibrator`，3.9）。**启动期预算 INFO 行（V13①）**：M10 于运行起点打印预算参数（如 `segment: w_min=6 window=20 (budget)`——数据无关、仅计数与参数；归属 M10 启动段而非 loader——加载期 logging 尚未按 CLI 覆盖定级，7.1）。**报表汇总**：finalize 时组装 `report.budget = {profiles, w_min, truncations, overflow_records, image_cost, degrade_retries, escalations}`（counts-only 键义见 6.4；truncations 由各算子逐裁剪点计数、overflow_records 按 7.6 词表归集、image_cost/degrade_retries/escalations 为 V17 三层的校准终值与反应频度对账，V13②⑤）+ `report.stream.windows`（segment 实际窗数，M14 属主计数、随 stream 节落盘——供用户对账 V12 上界估算，V13④，6.4）。 |
 | 帧粒度（v1.12） | **组链或门（裁决·组链双门）**：factory（`build_stages`）以**或门** `classify.enabled ∨ frame_classify.enabled` 决定 ClassifyStage 进链（链序与槽位不变——仅帧级开启时 ClassifyStage 仍须进链执行帧 pass；组链的 classify 槽位判定与该或门同口径）；stage 内序列级判决单独受 `classify.enabled` 门控——仅帧级开启时序列记录不产生 Classification、`_meta.classification` 维持 null（3.13.7）。**estimate_run 两键**：`frame_classify_calls` / `frame_annotate_calls` = **粗上界 = 预扫描帧总数 Σ session_lens**（数据源与 `segment_calls` 完全同源，复用同一次预扫描；帧分类实际按窗批量、帧标注跳过噪声成员与跳过类，实际调用数均 ≤ 帧总数）；对应开关关闭 ⇒ 0（帧粒度要求流模式（3.1.4），非流分支恒 0）；`total_calls` 扩项；**键序冻结**——`frame_classify_calls` 紧跟 `classify_calls`、`frame_annotate_calls` 紧跟 `annotate_calls`（返回键表冻结注释同步，CONTRACTS §7.13）。**dry-run 估算行改写**：估算行（stderr 第 2 行）按冻结键序插入两键，**无条件打印**（非流工程恒 = 0，v1.9 `stitch_calls` 先例）——是**改第 2 行**而非加行：五个既有 dry-run golden 重采 + `examples/mix` 主/姊妹双工程的 `dryrun-mix.txt` / `dryrun-mix-text.txt` 两个新 golden，共**七个**（7.8 回归锚，`tests/cli/goldens/`）。 |
-| 时间流生成（v1.13，仅 `generate_stream.enabled = true`） | **驱动分支**：generate_only 分支在 `_run_generate` 入口按本开关分流——时间流形态调 `generate_stream_all(ctx0)` **恰一次**（同为 guarded task 形态：SIGINT 的 30 s 计时器可取消，耗时照记 `timing.per_stage_s.generate`；中断即无产物、无工件、无批次，finalize 照常标 `interrupted=true`），平面路径（种子池 / 无种子两形态）代码零改动。成功返回后依次：① **工件先落盘**（本表工件属主行）② `counts.generated` = 进链序列条数（`--limit` 已在 M6 计划期配额层截断，此处 belt & braces 再截一次）③ 直装信封按 `run.batch_size` 切批走 `_compose_chain(include_generate=False)` 的链（M3→M13→M4→M5→M7→M11）——信封**整只**交付，绝不 `PipelineItem(record=r)` 裸构造重建（会丢 `session_id` / `classification` / `member_classifications` 三项）。**工件属主**：M6 定稿行内容、M11 持有通道与交付纪律、M10 只在两者之间转手一次（`emitter.write_stream_artifact(lines)`，先于任何批派发；finalize 时与主输出同批 fsync + 原子改名，3.11.2）；`report.run` 的工件条目（路径 / sha256 / 行数）由 M10 在组报告时自 emitter 读取——**仅工件实际写入时在场**（dry-run 与形态关闭恒缺席）。**estimate_run 精确复演**：generate_only 分支改**复用 M6 计划期纯函数** `plan_stream(cfg, Random(f"{seed}:0:generate"))`（吃 cfg + seed，精确复演长度与噪音采样，**非上界**）——`records = Σsequences`（limit 后）、`generate_calls = 2 × records + ⌈噪音帧数 / num_per_call⌉`（蓝图 + 实现 + 噪音批三类全折入既有键）、**`classify_calls = 0`**（标签 inherited，零判决调用，v1.7 R11 幂等哲学）、quality/annotate/verify 基数 = records、batches = `ceil(records / batch_size)`；**估算行格式零改动**（不加键；console 的 `_ESTIMATE_CALL_KEYS` / `_STAGE_CALL_KEYS` 与面板行零改动）——既有**七个** dry-run golden 字节不动，仅新增第八个 `dryrun-synth-stream.txt`（7.8 回归锚）。**report 子块**：`report.generate` 增 `stream`（counts-only 12 键，键集与键序冻结；`sequences` 直方图按 `[[classify.classes]]` 声明序零基铺开——`report.classify` 同款；计数面由 M6 以 `generate.stream.*` 前缀供给）；`report.stream` 节**不出现**（那是 segment 的观测面）；`report.classify` 直方图恒全零属预期（inherited 不经判决路径计数）。 |
-| 序列规则与日历窗口联合规划（v1.16，仅时间流生成的实际约束面） | M10 只负责选择同一个 M6 入口与接收富返回，不实现规则、窗口或 CP-SAT 业务算法。`estimate_run` 与 M6 共用 planner 的问题构造；每个 attempt 恰一次 `randrange` 循环长度偏好，全流由单个联合 CP-SAT 模型恰一次 `solve`。因此 dry-run 与真实运行共享配额前缀、solver seed 和长度冻结语义。规则/窗口在实际非零配额类生效时，M6 在 LLM 派发前冻结全部 word、owner session、任务 timestamp 与 noise 槽，随后返回直装信封与时间流工件；无约束时保留 v1.15 默认路径。M10 继续先写工件、再以原信封切批回流下游链，不重建信封。M1 的 `INFEASIBLE` / `UNKNOWN` 是启动期 `CONFIG_ERROR`，`MODEL_INVALID` 或运行期 planner 不变量破坏是 `InternalError` / 退出码 4；M10 不新增 stage、trace channel 或错误 kind。report 装配只在规则/窗口实际生效面插入 v1.16 counts-only 子块，不复制配置内容。 |
-| 场景规划与精确交付（v1.17，仅时间流生成形态） | **estimate 复用冻结计划、不再触发 planner**：`estimate_run` 的时间流分支不再复演 `plan_stream`、也不构造 planner 问题——改读 `cfg.scenario_plan`（M1 唯一编译，3.1.4.2）的冻结计数：`records` = sequence envelope 数（= target_sequences）、`batches = ceil(records / batch_size)`、**`generate_calls = 2 × slots + noise_slots`**（每 sequence slot 一次 brief + 一次 realize，每个冻结 noise slot 一次 realization；不含 delivery retry、LLMClient 内 provider retry 与 Schema repair）、`classify_calls = 0` 照旧。估算对象**新增 `scenario` 键**（对象形态：`target_sequences` / `task_frames` / `noise_frames` / `sessions` / `crossed_sessions` / `schedule_start` / `schedule_end` / `calendar_days_spanned` / `plan_digest` / `models`——`models` 含 `quota` 与 `timeline` 两模型各 `{entries, families}`）。**dry-run `report.estimate` 直引对象（E2E-51）**：dry-run report 顶层新增 `estimate`，其值就是 `estimate_run` 返回对象、不复制重算；console 的 dry-run 数字与 scenario 日期都从同一对象格式化，console parser 结果与 JSON 逐键相等由测试钉住。**delivery 报告四新键与 v1.16 既有键完整处置**：`report.generate.stream` 按 `plan_digest` / `planner` / `delivery` / `quotas` 顺序追加于块尾（构成块的冻结键序）；**删除**七个失败/作废计数器 `plan_failures`、`realize_failures`、`validator_scrapped`、`sample_validator_scrapped`、`sequence_validator_scrapped`、`rules.correlation_scrapped`、`rules.temporal_scrapped`——同一失败事实由 `delivery.failures` 的 13 桶闭集唯一承接，保留两套即双记（3.6.7）；**删除** `windows` 子块（其唯一键 `calendar_days_spanned` 移入 `planner.objectives`，不双报）；**更名** `plan_calls` → `brief_calls`（planning 在 v1.17 是零 LLM 的 CP-SAT 求解，旧名误导），`rules` 子块更名 `frame_rules` 且只保留 `sampled`；其余既有键（sequences / sessions / crossed_sessions / frames / noise_frames / duplicates / realize_calls / noise_calls / tiers 等计数面）全部保留原语义。`delivery` 子块含 target / delivered 的 sequence / noise / duplicates 对、`duplicate_shortfall`、`attempts`、`complete`、`interrupted`、`exhausted_slots` 与 13 桶 `failures`（零也在场）；`delivery.attempts` 同时计 sequence 与 noise slot、不计 LLMClient 内部 provider retry、不把一次 sequence attempt 的 brief / realize 两个 call 误计两次。每个 quota report row 以 quota `name`、period bucket、class 为自然键，包含 target / delivered / allocation / realized ratio 与 deviation——禁止仅给 aggregate 数而丢掉周期归因。**plan digest 并入 `run.start` payload**：ScenarioPlan 在 M1 创建时 EventLog 尚未构造（不新增虚假 planner 事件）；运行期在 EventLog 建立后，把 plan digest、objectives 与 family stats 的冻结摘要并入既有 `run.start` payload——planning 失败发生在 trace 生命周期之前，不承诺留下 trace 文件或 planner event。**exit 分流**：delivery 耗尽与 delivery 期间 SIGINT ⇒ 原子交付已成功部分 + `delivery.complete = false`（SIGINT 另标 `delivery.interrupted = true`）+ **exit 1**；provider fatal / circuit breaker 仍立即 **exit 4** 且在同轮优先于 exit 1（3.6.7、3.11.2）。M10 不新增 stage、不实现 planner 业务算法。 |
+| v1.18 sequence 精确交付 | `generate.form = "sequence"` 时，generate_only 分支在 M1 冻结 `SequenceGenerationConfig` 后调用唯一 `compile_generation_program` 与 `compile_scenario_plan`，再直接调用 `deliver_generation`；不进入 `GenerateStage` 或普通 `_process_batch`。M10 负责该入口、串行 slot admission、attempt transaction、运行终态和 M11 commit，不实现 compiler/planner 算法。classify 与 frame.classify 判定 stage 静态关闭，projector 写 inherited Classification；frame.annotate 可由 attempt-local 协作者执行。 |
+
+#### v1.18 sequence slot 状态机
+
+~~~mermaid
+stateDiagram-v2
+    [*] --> Planned
+    Planned --> Attempting
+    Attempting --> Generated
+    Generated --> Evaluated
+    Evaluated --> Downstream
+    Generated --> Retry
+    Evaluated --> Retry
+    Downstream --> Retry
+    Downstream --> Accepted
+    Retry --> Attempting
+    Retry --> Exhausted
+    Accepted --> Committed
+    Exhausted --> DeliveryError
+~~~
+
+slot 按 GenerationProgram declaration order 串行 admission；一个 counterfactual set 的 variant 也按声明序归并。
+无依赖 LLM 请求可以并发，但 seed/variant 结果归并、dedup probe、M11 装配、replay 投影、
+retained-content prospective check 与 commit 必须回到固定 slot 顺序。一个 slot 接受前不会领取
+下一个 slot。
+
+生成侧通过后，M6 先把每个 EventTrace 投影为 pre-downstream `ProjectedSequence`，再令完整 set
+进入同一 `AttemptTransaction`：
+
+~~~text
+DedupIndex.group_probe
+→ pointwise QualityStage.run_attempt
+→ AnnotateStage.run_attempt
+→ VerifyStage.run_attempt
+→ SequenceDeliveryEmitter.assemble_sequence(final PipelineItem + ProjectedSequence)
+→ ReplayProjector(source SequenceRows + ReplayLayout)
+→ CrossViewReconciler
+→ retained_content_bytes prospective check
+→ DedupIndex.group_commit
+→ dataset state commit
+~~~
+
+同组配对 variant 在 dedup 内互相豁免。`AttemptTransaction` 只持有 `items`、不可变 `class_views`
+与 `projected_sequences`；`items` 是当次 attempt 的唯一可变 `PipelineItem` 真值。各协作者就地更新
+该列表，`DownstreamAttemptResult` 只返回 `accepted`、`rejected_stage` 与 dataset counter delta，
+不复制 items 或 Schema stats。任何拒绝都丢弃整个事务及本地 dataset delta。LLM usage、latency、
+provider retry、成本、SchemaEngine resolved-at 与 trace event 是已发生的运行事实，不回滚。
+commit token 失效、index generation 或 digest 变化是
+`generation_dedup_transaction` 内部错误，不能重试为普通 duplicate。
+
+`SequenceRows` 只能由 M11 以当次协作者返回的最终 item 装配；因此 inherited classification、
+quality score、sequence/frame annotation 与 verification 全部进入最终 main row、retained-content、
+delivery digest 和正式输出。ReplayProjector 只从这些最终 `SequenceRows.primary_stream_rows`
+派生已规划 replay，不读 pre-downstream Record。prospective 字节数恰等于既有已接受累计、
+当前 set 全部 `SequenceRows.retained_content_bytes` 与本次 `ReplayRows.retained_content_bytes` 之和。
+
+~~~python
+async def deliver_generation(
+    request: DeliveryRequest,
+    services: DeliveryServices,
+) -> GenerationProduct:
+    """精确交付全部 sequence/noise slot，并返回一次性成功产品。"""
+~~~
+
+`GenerationServices(config, schema_engine, llm, metrics)` 是唯一运行服务根；
+`DeliveryServices(generation, dedup, quality, annotate, verify, emitter)` 不复制 `RunContext`。
+DeliveryController 为 dedup 和下游协作者派生 context 时，其 cfg、schema engine、LLM client 与
+metrics 必须分别与 `GenerationServices` 对应对象身份相同，只新建按 slot 派生的 rng 与固定
+batch number。`DeliveryRequest` 只携带 program、plan、paths、run attempt ID 与 run ID，不复制
+config 或 materialized credentials。
+
+#### attempt 与运行终态
+
+下表只适用于 `labelkit run` 的 sequence 形态。`validate` 与 `run --dry-run` 即使发现 plan 失败，
+也不写 main、stream、success report、manifest 或 failed report，只按同一 error kind 返回退出码。
+
+| 事件 | 消耗 attempt | 重试 slot | 退出码 | 正式成功路径 | failed report |
+|---|---|---|---:|---|---|
+| Schema、state、pattern、coupling、semantic 失败 | 是 | 是 | 耗尽为 1 | commit 前不替换 | 耗尽时原子写 |
+| dedup、quality、annotate、verify、reconcile、内存预算拒绝 | 是 | 是 | 耗尽为 1 | commit 前不替换 | 耗尽时原子写 |
+| output truncated、可恢复 context overflow、provider retryable exhausted | 是 | 是 | 耗尽为 1 | commit 前不替换 | 耗尽时原子写 |
+| provider fatal、auth pool exhausted、circuit trip | 否 | 否 | 4 | commit 前不替换 | 已解析路径时 best-effort 原子写 |
+| SIGINT、KeyboardInterrupt、CancelledError | 否 | 否 | 4 | commit 前不替换 | run 已初始化时 best-effort 原子写 |
+| 配置、hook、catalog、路径错误 | 否 | 否 | 2 | 不替换 | 不写 |
+| 输出目录或 `.part` 运行期不可写 | 否 | 否 | 4 | 不替换 | 尝试同目录写；仍不可写时只记英文 stderr kind |
+| planner INFEASIBLE | 否 | 否 | 2 | 不替换 | 原子写 |
+| planner FEASIBLE/UNKNOWN budget 或 MODEL_INVALID | 否 | 否 | 4 | 不替换 | 原子写 |
+| commit-I/O 失败 | 否 | 否 | 4 | 可能已替换 main/stream/report 子集，旧 manifest 不变 | best-effort 原子写 |
+| failed-report I/O 失败 | 否 | 否 | 不改主退出码 | 不改 | stderr 记录英文 kind |
+
+每个 attempt 的随机流由下式独立派生：
+
+~~~python
+int.from_bytes(
+    sha256(
+        canonical_json(
+            ["labelkit:v1.18", "attempt_random", [seed, slot_identity, attempt_index, purpose]]
+        ).encode("utf-8")
+    ).digest(),
+    "big",
+)
+~~~
+
+不得使用 Python `hash()` 或自行拼接字符串。重试可以改变 LLM seed 世界、intent、patch 与措辞；
+catalog 行不变。
+pattern、variant、role/position、全部计划时间、session、noise
+与 replay source 永不变化。普通内容/结构拒绝消耗 attempt；四类 run-terminal 异常必须原样穿透，不消耗 attempt。
+任一 slot 耗尽立即停止新 slot 并抛 `DeliveryError(sequence_delivery_exhausted)`；不交付已接受前缀。
+
+sequence 不使用 process/flat 的 partial-delivery 或优雅中断提交；`run.partial_delivery` 的有效策略恒为 false。
+失败只写 counts-only `failed_report`，不打开 main、stream、success report、manifest 或 rejects。成功要求全部
+primary/noise/replay 和 CrossViewReconciler 通过，再由 M11 `prepare_product` 生成带单一
+delivery digest 的 `GenerationProduct(main_rows, stream_rows, report)`，最后调用 commit 提交正式文件。
+
+#### estimate 与观测
+
+sequence 调用键按顺序为 scenario_seed、baseline_event_plan、variant_event_plan、frame_render、
+semantic_evaluation、noise_render、noise_evaluation、quality、annotate、frame_annotate、verify。
+catalog seed 调用为零，protected prefix 复用 `EventDraft` 语义字段，不重复计 plan/render。dry-run 从同一 GenerationProgram、
+block allocator 与 ScenarioPlan 计算一个成功 attempt 的逻辑下界和
+`max_slot_attempts` 上界，不含 M9 provider retry；不能另建近似 planner。
+
+report 的唯一块是 `report.generate.sequence`，包含 run/program/plan/delivery identity、planned/delivered set
+与 sequence、event/session/noise/replay 精确数量、调用族、按 pattern 交付计数和冻结 rejected_attempts 闭集。
+任何 attempt 只记最终停止边界一个 rejection bucket。旧的流配额、档位、概要/逐位实现、幸存/shortfall 与
+partial delivery 统计均不出现。
+
+普通日志只记录 slot key、attempt index、stage、error kind、profile、计数与 duration；state、patch、payload、
+ActorView、prompt 和 API key 只能按 trace 内容策略处理。
+
 
 **背书：**「编排器只做组合调度、算子无相互依赖」是 Data-Juicer 配方执行器 [4] 与 distilabel Pipeline 运行时 [5] 的共同架构；批式流转 + 增量写出与 Dolma toolkit 的并行分片处理模型一致 [6]。
 

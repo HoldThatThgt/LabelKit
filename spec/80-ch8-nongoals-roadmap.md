@@ -8,50 +8,26 @@ v1.9（线索缝合域）明确不做六条：① **真并发**（同屏双任�
 
 v1.10（console 域）明确不做三条：① **web/hosted viewer**——数据只去配置声明的 LLM 端点、无遥测红线（2.6）；② **面板内数据内容检视**——trace `excerpt`/`full` 档职责（7.4；面板信息纪律 U6/U22 红线，7.7）；③ **跨运行历史面板/持久化仪表**——无状态原则（2.6）。
 
-v1.13（时间流生成域）明确不做九条（均列 8.4 演进候选或维持既有归属）：① **重放评测回路**——工件可自行当输入重放（3.6.5 / 6.5），但「自动重放并与 `truth` 比对出分」是独立工具的职责（2.1.2 ⑧）；② **UI 模态时间流生成**——本形态恒 text 模态（截图无从合成，8.3 O3 维持该辖区）；③ **乱序与缺失两类噪音**——乱序与 M2 `on_disorder` 自相矛盾、缺失对合成无意义（只做插入与重复两类，3.6.5）；④ **交叉并发度 k > 2**——`sessions` 定容下恒 k ∈ {1,2}；⑤ **蓝图低温分档**——蓝图与帧实现同温（`temperature` 单键）；⑥ **一批多蓝图装箱**——一序列一次蓝图调用；⑦ **合成序列上开放 `[frame.annotate]`**——帧内容即生成物，再标注一遍无信息增益（与本形态互斥，3.1.4）；⑧ **generate 专属 trace 通道**——两类调用经 `llm.call` 可见（7.2 零增量声明）；⑨ **输出精确定量与补齐回路**——`sequences` 是尝试配额（8.3 O6 维持）。
-
-v1.14（帧类构成档位与时间字段回填域）明确不做十条（均列 8.4 M6 行演进候选或维持既有归属）：① **平面生成形态的档位**——档位附着于蓝图的帧类构成，平面生成无蓝图无帧类，档位无处附着；② **按档绑定 llm profile**——会扰动冻结的 (llm, style) 预抽流与密钥引用集语义（3.6.5 抽签消费顺序表）；③ **按档覆盖 `len_range` / `temperature`**——档位只表达构成，不表达长度与采样参数；④ **档间序约束与 tier_rank 的工具侧质量语义**——不校验「高档构成 ⊇ 低档构成」之类的子集链，也不赋予序数高低任何质量方向（方向归用户，裁决·tier_rank 即档位身份）；⑤ **宽松构成「至多这些类」**——现版恒等语义（去掉 `contains` 即得宽松形态），但宽松形态会使高低档的低配产物不可区分、档位身份不可从数据反推（等真实工程需求再裁）；⑥ **自由文本内的时间表述对齐**——把已铺时间语境注入提示词、让 LLM 在句子里说对时间，须改动冻结的抽签消费顺序表（时间轴须先于内容生成铺设），另裁；⑦ **序列级与标注 Schema 侧的时间字段绑定**——标注是抽取产物、非生成侧辖区；⑧ **`frame_gap_s` 的间隔分布形扩展**——现版恒为均匀采样，分布族（BIMP 的对数正态/伽马族 [106]、AT-KDE 的经验分布 [108]）与本版正交；⑨ **语义词表扩词**——四值是冻结闭集，扩词走 spec 修订；⑩ **绑定字段数值约束关键字的运行期强制**——现版只保证类型层（`ts` ⇒ string、其余 ⇒ number）并对多余关键字发 WARN，时间量的值域由时间轴决定（裁决·绑定即剔除）。
-
-v1.15（按类档位表域）明确不做三条（均列 8.4 M6 行演进候选）：① **按类权重速记糖**——形如 `tier_weights = [1, 2]` 的「只改权重、构成沿用全局表」缩写形态：它本质是行级合并的变体，与裁决·表级原子覆盖（本版的地基）冲突；② **跨类 rank 对齐声明**——不提供「各类 rank 语义须一致」的声明或校验，`tier_rank` 是**类内身份**、跨类无任何工具语义（v1.14「工具不赋序数以质量方向」的自然延伸）；③ **全局表 × 类过滤**——形如 `tier_ranks = [1, 3]` 的「从全局表挑子集」形态：与整表覆盖并存会产生第三种合成语义，本版只保留一种。v1.14 的十条非目标照旧停放——其中②（按档绑 llm profile）与③（按档覆盖 `len_range` / `temperature`）在按类面下同样不做：按类覆盖的辖区只是档位表本身（构成与权重），不外扩到序列级的 profile 与采样参数。
-
 v1.12（帧粒度域）明确不做七条：① **帧级 quality/dedup/verify/generate**——帧粒度仅分类与标注两面（成员帧的治理由 segment 噪声剔除与 episode 级质量门承担）；② **帧多标签与帧级扇出**——帧单一归属是手术/归因/守恒的公共地基（`[frame.classify]` 无 `assignment`，显式书写定向 CONFIG_ERROR，3.1.4）；③ **帧级 L2.5 回调**——`output.validator` 仅约束序列级用户 Schema 调用（演进候选 `frame.annotate.validator`，8.4 M5 行）；④ **帧级 self_consistency**——成本 ×n 且投票键须取自帧 Schema 需动投票主干（`[frame.annotate]` 无该键，显式书写定向 CONFIG_ERROR）；⑤ **摘要行帧标签回填**——演进候选，爆炸半径已勘明（8.4 M13 行）；⑥ **同内容帧标注备忘录**——演进候选（8.4 M5 行）；⑦ **按序列类分叉的帧类表**——帧类表全局一份，与序列类表相互独立、允许重名、互不约束（5.2）。
 
-v1.16（序列规则与联合规划域）明确不做以下范围：
+v1.18（sequence generation 域）明确以下负边界：
 
-- 不合成缺失帧、插入中断或模拟丢帧后的业务恢复；planner 只冻结完整 attempt 的帧类、
-  owner、时间轴和 noise 槽，LLM 作废后做确定性投影。
-- 不提供跨业务的全流顺序声明、跨序列类的 `tier_rank` 对齐语义，也不把有限迹规则
-  扩展成 Allen interval algebra 或可配置的任意区间关系。
-- 不提供运行期 fallback、改抽长度、重求 skeleton、追加调用补齐 noise 或跨运行缓存；
-  `sequences` 仍是尝试配额，实际 survivor 可以更少。
-- 不把规则、窗口、correlation、planner witness 或用户 hook 输出写进 truth、artifact、
-  report 以外的内容面；不新增 generate 专属 trace 通道。
-- 不放开 UI 模态时间流生成，亦不自动执行 artifact 重放并与 truth 评分；两项仍归独立
-  工具或后续产品议题。
-
-v1.17（场景规划与精确交付域）明确不做以下范围（处置 E2E-42~60；设计冻结于
-`docs/dev/SPEC-scenario-planning.md` §1.2）：
-
-- 不保留 v1.16 time-stream 配置兼容层，不写 migration，不接受旧键别名（5.2.2 删除键表，
-  十项删除键全部定向 CONFIG_ERROR）。
-- 不实现完整 iCalendar RRULE、IANA timezone 或 daylight saving time [124]；只支持带固定
-  offset 的 day、ISO week 与 schedule 三种 period。
-- 不把重叠 quota 相加成额外 occurrence 或 target；多张 quota 是同一批 occurrence 上的
-  同时约束（数学兼容时同时成立，冲突时 assumption core 同时点名两张 quota）。
-- 不增加超过两个 owner 的 crossed session（v1.13 候选「交叉并发度 k > 2」据此维持停放）。
-- 不把 LLM content、checkpoint 或 retry 状态写入磁盘；跨运行不续跑（无持久化红线不变，2.6）。
-- 不让模型自动推断 resource 名或语义冲突；resource 由配置声明，内容语义由 scenario
-  validator 判定。
-- 不改变 process 模式的生成配额语义；exact delivery 只作用于 time-stream generate-only。
-- time-stream 形态不再接受 `--limit`（quota 是整体契约，截断后的前缀不再声称满足 quota）。
-
-**v1.16 边界移动注记（v1.17）**：上方 v1.16 块中「帧只建模为时间点事件，不引入 duration
-interval 或 Allen 区间代数」与「不提供跨业务的全流顺序声明」两条边界由 v1.17 **部分打开**——
-frame 可声明 `duration_s` 区间（frame rule `contains` 严格包含与跨序列 resource
-`AddNoOverlap` 入 v1.17 配置面，5.2.2），跨业务顺序关系以
-`[[generate.stream.sequence_rules]]` 四模板（precedence / response / succession /
-not_co_existence）按 period bucket 落地；完整 Allen 区间代数、任意可配置区间关系与跨序列
-payload correlation 仍不做。
+- v1.18 是 clean breaking boundary。旧 `generate.stream`、tier、quota、frame rule/window、
+  `time_fields`、brief/realize 与旧 validator 配置不保留别名、迁移器、兼容解析或运行期 fallback；
+  未知旧键在 M1 定向报 `generation_config_invalid`。
+- sequence 形态仅属于 text `generate_only`，不改变普通 process、flat generate、M2/M14/M15/M16
+  的既有语义；UI sequence generation 仍不在本版范围。
+- 生成运行不借 segment/stitch 重建真值。EventProjector 只产生 pre-downstream `ProjectedSequence`；
+  M11 从最终 `PipelineItem` 装配 `SequenceRows`，ReplayProjector 再从最终 primary rows 产生 replay envelope。
+  只有 stream 工件 replay 进入普通 process pipeline，且 generation provenance 不能作为分段或缝合 oracle。
+- 不把 LLM content、world state、JSON Patch、ActorView、checkpoint 或 retry 状态写入普通日志、
+  report、manifest 或跨运行存储；完整审计内容只允许进入用户显式开启的 `trace.content = "full"`。
+- 不交付任何部分前缀。slot/noise exhaustion、provider fatal、circuit trip 与 SIGINT 都不能替换
+  main、stream、成功 report 或 manifest；failed report 只诊断失败，不是可消费数据集。
+- 不使用 main 作为 replay 的隐式旁输入；M2 必须仅凭同一 stream 工件验证 owner、event id 与
+  replay provenance。完整 replay duplicate 由普通 M3 内容判重，不按 metadata 直接删除。
+- 不以 mock transport、录制响应或本地 server 证明 LLM 路径；DeepSeek 与 z.ai 验收都调用真实端点。
+- 不新增 generate 专属 trace 通道；七类生成调用继续经既有 `llm.call` 与 usage 面观测。
 
 ## 8.2 设计假设（若不成立需回到设计层）
 
@@ -68,10 +44,10 @@ payload correlation 仍不做。
 |---|---|---|
 | O1 | 语义去重（SemDeDup [26]，需 Embedding API） | 已于 v1.2 落地为可选第④级（3.3.3，`dedup.semantic`），本行保留作决策溯源；默认仍关闭（`dedup.semantic = false`），零 embedding 依赖的默认行为与 v1.0 一致。 |
 | O2 | 跨批可比的 pairwise 分数（锚点样本法：每批混入固定锚点记录参与比较） | QuRating 原文以全局训练分类器回避该问题；运行时替代方案需实验验证后再纳入规格。 |
-| O3 | UI 模态生成（以现有截图为底、仅生成指令/任务侧文本，AgentTrek 式轨迹合成 [15]） | 本版生成仅文本模态；有明确需求后单独立项。v1.8 注记：stream × generate **互斥**（`segment.enabled` 要求 `generate.enabled=false`，2.3.1）——序列/轨迹合成仍不并入本议题的现版范围；届时须先裁决与 stream 模式的组合语义（互斥放开或串接）。**v1.13 部分核销**：上句遗留的「互斥放开或串接」之问已由 v1.13 给出答卷——**第三形态·直装**（时间流生成，3.6.5）：既不放开互斥、也不串接，而是让 M6 直接产出序列信封（流是生成出来的，无须再分段），互斥条文字面维持不动。**本议题的存续部分收窄为 UI 模态**：文本时序流合成已落地，截图侧合成（AgentTrek 式 [15]）仍待立项——触发条件不变。 |
+| O3 | UI 模态生成（以现有截图为底、仅生成指令/任务侧文本，AgentTrek 式轨迹合成 [15]） | v1.18 sequence generation 仅支持 text `generate_only`，由 projector 直接形成 sequence/main 与 event stream；普通 process stream 的 segment/stitch 互斥边界不变。截图侧生成未进入本版。 |
 | O4 | 断点续跑 | 与「不存储中间态」冲突，明确排除；超大任务靠分目录运行缓解。 |
 | O5 | `labelkit analyze` 子命令：读 trace.jsonl 产出标注质量分析 / rubric 诊断报告（自动计算 7.5 诊断指标、reason 关键词聚类） | 本版仅提供 jq 级手工分析（7.5）；trace 事件契约（7.2）稳定运行一个版本后立项。v1.10 注记（U16）：全屏交互 trace 浏览器品类与 textual 渲染库于本议题立项时一并重估（console 面板经验可迁移，`docs/dev/SPEC-tui-console.md` §5）。 |
-| O6 | 全局精确定量与生成补齐回路（`output.target_count`，输出恰好 N 条） | 设计草案：两阶段流水线——第一阶段全量接入 + 去重 + 打分并缓存分数；第二阶段全局 top-K 选出恰好 target_count 条，再仅对选中集执行标注与输出。前提：分数具全局可比性——pointwise 绝对刻度，或 pairwise 经 O2 锚点法校准后方可全局排序。配生成补齐回路：target 未达时从高分种子生成 → 去重 → pointwise 质量门 → 计入，停止条件 = 达标 ∨ max_backfill_rounds ∨ 本轮合格率 < 下限（生成器饱和时合格率持续衰减，即递归自生成数据的 model collapse 现象 [36]，故合格率下限停止条件必不可少）。现状：2026-07-02 评审对齐为演进路线——本版以 `quality.selection = "top_ratio"` 提供流式批内近似定量（3.4.3），不承诺全局恰好 N 条。触发条件：出现「必须恰好 N 条」的下游需求。v1.7 注记：generate_only 的按类生成配比（每类 standalone_count）经对齐划归本议题——属量目标语义，与全局定量一并立项（1.6 v1.7 对齐决策 ③）；v1.7 的按类参数仅为加工条件化（2.1.2 ⑥）。**v1.13 窄化注记**：时间流生成的按类 `sequences`（3.6.5）**已落地按类量目标的「尝试配额」半边**——按类可各自声明尝试条数、类段字典序展开、`--limit` 在配额层截断；本议题的存续辖区据此收窄为**输出侧的精确定量**（「每类输出恰好 N 条」）与**补齐回路**（未达标时续生成的停止条件族）——尝试配额无输出条数保证：蓝图/实现失败、逐帧钩子违规、序列相似度过滤与下游质量门/评审淘汰都会使实际产出低于配额，且本版**不补齐**（裁决·量目标辖区）。**v1.17 核销注记（time-stream 辖区）**：`[[generate.stream.quotas]]` + exact delivery 在时间流 generate-only 形态落地「成功交付 quota + 有界补足」——quota 表达成功交付数量，stable slot × `max_attempts_per_slot` 交付状态机在有限预算内补足，耗尽记 shortfall、原子交付已成功部分并以退出码 1 收口（3.6.5、7.6）——上句 v1.13 注记的存续辖区（输出侧精确定量 + 补齐回路）在**时间流形态**就此核销并指回 v1.17；process 模式的生成配额语义不变（8.1 v1.17 块），全局 top-K 输出侧精确定量在 process 形态的辖区仍开放。 |
+| O6 | 普通 process 的全局精确定量（`output.target_count`，输出恰好 N 条） | v1.18 sequence 形态已经以 planned set/sequence slot + 有界重试实现全有或全无的 exact delivery：成功时 planned = delivered，耗尽时不提交前缀。该契约不外推到普通 process 或 flat generate；批间全局 top-K 仍受 O2 的跨批可比性前提约束。 |
 | O7 | 多 API Key 负载均衡（单 profile 密钥池：最少在途轮换 / 每密钥 429 冷却 / 认证按密钥禁用 / 全池冷却有界驻留） | 已于 v1.6 落地（3.9.3 密钥池行、5.1 `api_key_envs`、5.2 `run.max_park_s`、7.2 三事件、6.4 keys 子块），本行保留作决策溯源（对齐记录见 1.6，2026-07-03）。触发条件即 8.1 所注「单机并发已被 API 限速主导」——无人值守长跑被单密钥用量限额中断。单密钥配置在数据产出、重试记账与熔断/退出语义上与 v1.5 一致（429 等待路径修订见 3.9.3 重试行）。业界同构：LiteLLM Router / 网关侧客户端多密钥轮换实践。**端点镜像池（多 base_url）经评审明确排除**：同 provider+model 的不同部署在 temperature=0 下仍有数值漂移（GPU kernel / batching 差异），会翻转 pairwise 裁决与语义去重边界判定、污染 7.5 同种子翻转率指标；如未来放开须先解决跨部署可比性。 |
 | O8 | `stitch.judges` 多模型评审团扩展（缝合判定的跨家族多数决，镜像既有 `verify.judges` / `quality.judges` 模式作纯配置扩展） | v1.9 选型记录（1.6，2026-07-16 / T18）：本版采「**单模型多次**」（`stitch.votes`，self-consistency [33]）而非「多模型评审团」（PoLL [32]）——缝合的两类误差病理分工明确：漂移（方差病）→ votes 采样多数决；过连接（偏差病）→ 机械先验合取（3.16.4）。评审团修不了过连接：PIRA 消融显示过连接是**跨家族共享偏差**（GPT 系与 Gemini 系同向 trigger-happy [64]），异构裁判会把共享偏差投成多数 [86]，且实测评审团有效独立票仅 ≈2 [89]；当前部署纪律为单端点单模型。触发条件：第二模型家族进入部署面，且真机门禁审计显示漂移（而非过连接）是漏缝/错缝主体。 |
 
@@ -84,31 +60,21 @@ payload correlation 仍不做。
 | M3 去重 | 规范化 SHA-256 精确 + MinHash-LSH 近似（3.3）；UI 模态加 pHash | SemDeDup 语义级可选第④级 [26]：`dedup.semantic`（默认 false），开启后经 `dedup.semantic_embedding` 引用的 `[embedding.<name>]` profile 取向量，余弦相似度 ≥ `dedup.semantic_threshold`（默认 0.95）判重 | 子串级精确去重（Lee et al. [3] 的 suffix-array 变体，捕获行内重复长片段）；MinHash 参数自适应（按批内文本长度分布自动调 ngram / num_perm）。触发：短文本上 MinHash 误杀/漏杀率超预期。 |
 | M4 打分 | pairwise+BT 与 pointwise 双模式（3.4），threshold 过滤 | 多评审团 `quality.judges`（默认 []；奇数个 profile 多数票 [32]）；双顺序裁决 `quality.both_orders`（默认 false，开启后每对正反两序各裁决一次以对消位置偏差 [20]，细节见 3.4.3）；批内定量优选 `quality.selection = "top_ratio"`（3.4.3） | O2 锚点跨批校准（每批混入固定锚点记录）；rubric 自动挖掘（CritiQ [31]，约 30 对人工偏好即可挖出可解释准则）；评审漂移监测（固定校准集定期回归，比对裁决一致率）。触发：需要跨批可比分数，或 rubric 迭代频繁。 |
 | M5 标注 | 提示词组装单次标注（3.5.2）；v1.12 增帧级逐帧标注（3.5.5） | self-consistency 标注 `annotate.self_consistency`（默认 0=关；n≥3 且为奇数，以 `annotate.sc_temperature` = 0.7 采样 n 次、字段级多数票聚合 [33]） | best-of-n 拒绝采样（同一记录标注 n 条取评审 top-1，打分器思想同 FineWeb-Edu [11]）。触发：标注一致性仍不达标。**帧级 L2.5 回调 `frame.annotate.validator`**（v1.12 候选）：镜像 `output.validator` 的帧级同胞——挂接帧 Schema 调用的 L2.5、违规回喂修复环；现版帧标注走内部 Schema 待遇、无 L2.5（3.8.2 路由声明）。触发：帧标注出现 Schema 表达不了的业务约束。**同内容帧标注备忘录**（v1.12 候选）：同一运行内内容完全相同的成员帧（文本行 verbatim 重复 / 截图+树同签名）复用同一帧标注结果，省逐帧调用成本；与「无跨运行状态」红线（2.6）相容——备忘录仅进程内存。触发：帧标注成本成为瓶颈且重复帧占比可观测偏高。**按类 L2.5 回调**（v1.13 候选）：`output.validator` 现为全局唯一——按序列类标注 Schema 已可分叉（3.5.2），但回调仍是一份，类间业务约束不同时只能在回调内自行按 label 分支；候选 = `[class.<name>.annotate].validator` 的按类覆盖（白名单只增原则）。触发：按类 Schema 的使用工程出现 Schema 表达不了、且各类互不相同的业务约束。 |
-| M6 生成 | Self-Instruct 式种子自举生成 [18]（3.6.2）；**v1.13 增时间流形态**（3.6.5）：蓝图 → 帧实现两阶段合成 [99][100] + 零 LLM 机械交织 [101][102]（装箱/交叉/噪音/重发/ts）+ 序列级相似度过滤 [104] | 多 LLM 混合 `generate.llms`（数组，`generate.mixture` = round_robin \| weighted）+ `[[generate.styles]]` 风格模板（3.6.2；persona / 受众×风格分桶的多样性思想 [34][35]）；`[generate.stream]` 时间流形态（v1.13，默认关——全关时与 v1.12 字节等价）；`[[generate.stream.tiers]]` 帧类构成档位表与 `[frame.class.*.generate.time_fields]` 时间字段绑定（v1.14，均默认不在场）；`[[class.<name>.generate.tiers]]` 按类档位表（v1.15，默认缺省——全缺省时与 v1.14 字节等价，含报表） | Evol-Instruct 自动深化/扩展算子 [19]（对种子指令做复杂化与广度改写）。触发：生成多样性或难度分布不足。**v1.13 时间流形态的六个演进候选**：**交叉并发度 k > 2**（现版 `sessions` 定容下恒 k ∈ {1,2}；触发：需要三线程以上穿插的评测集）；**蓝图低温分档**（蓝图取低温保结构、实现取高温保多样；现版同温单键；触发：蓝图结构性错误率可观测偏高）；**一批多蓝图装箱**（一次调用产出多条序列的蓝图以摊薄调用成本；触发：蓝图调用占比成为成本瓶颈）；**乱序噪音**（需与 M2 `on_disorder` 的处置语义先行对齐——现版乱序帧会被摄取侧直接丢弃，注入即自相矛盾；触发：出现「容忍轻度乱序」的重放评测需求，与 M14 行的「有界乱序重排窗」候选配对落地）；**重放评测回路**（自动重放工件并与 `truth` 比对出分；现版为明确非目标 2.1.2 ⑧，宜作独立工具；触发：合成数据集需要回归门禁）；**generate 专属 trace 通道**（现版两类调用经 `llm.call` 可见、零新通道 7.2；触发：需要逐序列复盘蓝图与实现的对应关系）。**v1.14 两机制的五个演进候选**：**宽松构成「至多这些类」**（去掉蓝图 Schema 的逐类 `contains` 即得——现版恒等语义使档位身份可从 `members[]` 反推对账，宽松形态会让高低档的低配产物不可区分；触发：出现「档位只设上界、不要求全覆盖」的真实工程）；**按档绑定 llm profile / 档案**（现版档位只表达帧类构成，profile 与采样参数均属序列级——按档绑定会扰动冻结的 (llm, style) 预抽流与密钥引用集语义；触发：出现「不同档位用不同模型合成」的成本或质量诉求）；**自由文本内的时间语境对齐**（把已铺 ts 注入提示词、让 LLM 在句子里也说对时间——须先裁决抽签消费顺序表的改动（时间轴须先于内容生成铺设）；触发：下游需要「文本表述与时间戳一致」的合成数据）；**`frame_gap_s` 的间隔分布形扩展**（现版恒为均匀采样；分布族与经验分布是过程仿真侧的成熟做法——BIMP 的分布族参数 [106]、AT-KDE 的分段 KDE [108]；触发：合成流的时间分布形态成为下游评测的敏感变量）；**语义词表扩词**（现版四值冻结闭集 `{ts, gap_prev_s, gap_next_s, elapsed_s}`，扩词走 spec 修订；候选词如「会话内相邻行间隔」「距会话首帧秒」等跨序列口径；触发：出现序内口径表达不了的真实时间语义）。**v1.15 按类档位表的三个演进候选**：**按类权重速记糖**（`tier_weights = [1, 2]` 形态——只改权重、构成沿用全局表；它是行级合并的变体，与裁决·表级原子覆盖的地基冲突，故本版不做；触发：真实工程里大量类只想调权重而构成完全一致，整表复制的冗余成为维护负担）；**跨类 rank 对齐声明**（声明并校验「各类同 rank 语义一致」使跨类 rank 可比——现版 rank 是类内身份、跨类无工具语义；触发：下游出现需要跨类按档聚合的评测口径）；**全局表 × 类过滤**（`tier_ranks = [1, 3]` 从全局表挑子集——与整表覆盖并存会产生第三种合成语义，本版只保留一种；触发：出现「各类只是启用全局表的不同子集」的规模化配置形态）。 |
+| M6 生成 | flat 形态继续使用 Self-Instruct 式种子自举 [18]；v1.18 sequence 形态由 GenerationProgramCompiler 冻结 scenario/pattern/catalog，ScenarioPlan 固定 slot、branch、declared role、timestamp、NoiseSlot 与 ReplayLayout；instruction-only 只冻结 position/time，frame class 与 actor 由该次 EventPlan 唯一选择。随后以 state-aware EventPlan、frame render、机械/语义 evaluator、attempt-local 下游事务和 CrossViewReconciler 完成全有或全无交付 [115][126][128][129][130][131][132] | flat 形态保留多 LLM mixture 与 style 模板（3.6.2）；sequence 形态通过 `generate.form = "sequence"` 与 `sequence_generation` 单一配置面启用，不复用旧时间流配置 | Evol-Instruct 自动深化/扩展算子 [19] 仍只属于 flat 生成多样性路线；sequence 形态的发布边界由真实 DeepSeek、structured output、instruction-only、failure injection、replay 与人工真实感门共同冻结，不以旧 tier/quota/rule 系列继续演进。 |
 | M7 校验 | 单 judge 独立评审 + 有界修复环 [20][21]（3.7） | 多评审团 `verify.judges`（默认 []；奇数个 profile 多数票，critiques 合并并标注来源 judge [32]，3.7.2） | 评审团分歧驱动的人工抽检队列（多数票非全票一致的记录进抽检清单，人机对齐界面思想出自 EvalGen [30]）。触发：评审团分歧率持续偏高。 |
 | M8 结构 | L0–L3 四层防线：供应商结构化输出 + 确定性修复 + 有界 LLM 修复环（3.8） | —（v1.2 无新增） | 约束解码引擎本地化（Outlines / XGrammar 类 grammar 引擎 [23][24]）：自托管推理时以解码期硬约束替代当前面向 API 场景的四层防线。触发：迁移至自托管/本地推理栈。 |
-| M13 分类（v1.7） | LLM 封闭集分类：类别表词表经内部 Schema enum 硬校验，单/多标签可配，失败归兜底类（3.13） | 可选 self-consistency 投票 `classify.self_consistency`（默认 0=关；n≥3 奇数，single 多数票 / multi 逐标签投票 [33]，3.13.4） | embedding 粗分 + LLM 精分两级分类降本（粗分近邻筛候选、LLM 只精判边界样本；触发：分类调用成本成为瓶颈）；开放集 tagging 仅打标不路由（InsTag 形态 [38]，标签进 `_meta` 供多样性/复杂度分析；触发：需要超出静态类表的语义分析）；~~按类输出 Schema~~（**v1.13 已核销**：`[class.<name>.annotate].schema_path` / `schema_inline` 落地为**覆盖语义**的按序列类标注 Schema——触发条件（单 Schema 的 `oneOf` 条件子模式表达不了按类差异）由 `examples/synth-stream` 的两个序列类兑现：购票抽行程要素、智能家居抽设备动作，字段集互不相同。M5 六消费点与 M11 写前终检统一按行取类有效 Schema（3.5.2/3.11.2），M8 以显式待遇参数保住 L2.5 与 `resolved_at` 记账（3.8.2）；**帧级**标注 Schema 仍按粒度唯一，5.2 白名单表尾行已同步改写）；逐类适用度打分档（0–5 分 + 阈值筛命中集合，替代集合判断；触发：需要可调的多标签灵敏度）；多标签仅打标不扇出档（labels 全集进 `_meta`、仍按首标签走单条管线，`assignment` 枚举留扩展位；触发：出现「要全集标签、不要多行输出」的真实场景，1.6 v1.7 对齐决策 ⑥）；**摘要行帧标签回填**（v1.12 候选，裁决·摘要行回填砍掉）：把帧级判决标签回填进成员摘要行（`frame_digest` 输出），使下游 quality/annotate/verify 的序列证据面携带帧类信号——v1.12 审计勘明真实爆炸半径 = **quality/annotate/verify/extract 四处渲染点 + CONTRACTS §10 多个逐字节冻结模板**（模板改动连带黄金快照与手册重采），收益不成比例而砍掉，帧标签仅经 `_meta.stream.members[]` 输出（3.11.2）。触发：出现「下游序列判定必须消费帧类信号」的真实工程且愿承担模板面重冻结成本。 |
+| M13 分类（v1.7） | LLM 封闭集分类：类别表词表经内部 Schema enum 硬校验，单/多标签可配，失败归兜底类（3.13）；sequence generation 直接继承冻结的 sequence class，不发分类判决 | 可选 self-consistency 投票 `classify.self_consistency`（默认 0=关；n≥3 奇数，single 多数票 / multi 逐标签投票 [33]，3.13.4）；按类输出 Schema 已由 `[class.<name>.annotate].schema_path` / `schema_inline` 实现 | embedding 粗分 + LLM 精分两级分类降本；开放集 tagging 仅打标不路由；逐类适用度打分；多标签只打标不扇出；摘要行帧标签回填。各项只在对应真实需求与可观测瓶颈出现时进入独立规格，不改变 v1.18 sequence inherited-class 边界。 |
 | M14 分段（v1.8） | gap/key/上限规则会话化（M2 会话流视图，3.2.8）+ 三步演绎滑窗裁决（双向上下文概括 → 五值封闭集关系分类 → 演绎查表映射边界/噪声；window=20、重叠 1 帧、确定性缝合，3.14）[47][48] | ~~`segment.use_vision`~~（**v1.11 移除**——窗口附图改由 `segment.llm` 所指 profile 的 `supports_vision` **能力推导**（parse product `vision_resolved`，3.14/V1）：树贫瘠场景的表达面 = 选 profile 即选能力 [63]，纯文本裁决 = 把 segment.llm 指向纯文本 profile；存量显式键定向 CONFIG_ERROR，V2）；`segment.context` 可选域上下文（非边界定义，判据模板内置零配置可用）；`segment.strategy="rules"` 零 LLM 纯规则档 | 有界乱序重排窗（k-帧滑窗重排，容忍采集端轻度乱序——现行为流式单调性校验 + `stream.on_disorder`；触发：真实输入出现轻度乱序，1.6 v1.8 决策 ⑬）；交错 episode（帧属并行任务而非噪声——RPA 交错例程难变体 [50]，需全局归属模型；触发：审计显示交错形态占噪声主体）；跨段边界仲裁（跨段搬帧修复，v1 只标记——代价是邻段级联重修与乒乓风险；触发：审计显示跨段形态占缺陷主体，S31）；**extract-先行次序**（先在会话内逐相邻对摘取、再在动作序列上一次分段——GUIDE / Watch & Learn / VideoAgentTrek / OpenCUA 的同行主流次序 [57][58][60][43]；以成本权衡裁决：dedup 前置节省 vs 分段证据质量，非环形依赖，S32；触发：帧摘要证据上的分段质量不达标）；嵌入变点检测（Embed-KCPD [47]：training-free 核变点检测，仅文本基准验证、GUI 流无先例，需 embedding profile；触发：LLM 分段调用成本成为瓶颈）；k>1 窗口重叠（重叠多帧多数决缝合压接缝误判；触发：接缝帧误判率可观测偏高）。 |
 | M15 摘取（v1.8） | 相邻帧对 ⟨s_i, s_{i+1}⟩ LLM zero-shot 摘取（一请求 2 图 + OpenCUA 稳定帧锚定句 [42][43]）+ 树 diff 证据（结构键多重集匹配，代码侧确定性，3.15）；`action_type` 11 值词表 [45][62] | `extract.include_diff`（默认 true，可关做 A/B 消融——Sharingan 像素 diff 负结果、结构化树 diff 方向未定 [59]）；`extract.instruction` 域提示（`[class.<name>.extract]` 可按类覆盖） | 文本模态 extract（「转移摘要」弱语义档，v1 仅 UI 序列；触发：文本流工程出现真实需求，1.6 v1.8 决策 ⑦）；缺帧补全（Repairing Event Logs [51] 先验：缺失事件修复依赖跨轨迹习得的过程模型，v1 仅标记 `capture_gap`；触发：跨语料过程先验可用）；**本地 IDM profile**（专训逆动力学模型替代 zero-shot——Watch & Learn 实测专训 91.7% vs zero-shot 70.5% [58]，是「不训练/托管本地模型」负边界（2.1.2 ①）的已记录机会成本；触发：extract 错误率成为下游质量主瓶颈且允许自托管推理栈）；完成度末帧图（quality 轨迹打分的 completion 维度附末帧单图，+1 图/episode——忠于 OS-Genesis TRM 原型的输入配置（含末三帧截图）[41]；触发：完成度维与人工判定的失配集中于视觉终态证据）。 |
 | M16 缝合（v1.9） | 单调选池 LLM 判定 × 机械先验合取（析取三腿 + stale-gap 降格，bias="conservative"）+ 有界二遍复评 + 短段救援 + 接缝机械占位（3.16）[64][74][87] | `stitch.votes`（默认 1=关；≥3 奇数，(verdict, thread_ref) 严格多数决 [33]——置信度门槛的正规替代 [79]，3.16.4）；`stitch.bias="llm"` 纯 LLM 消融档；`stitch.rescue_short` / `stitch.repass` 双开关；`stitch.stale_gap_steps` 时间衰减（双职：先验降格 + 逐出优先腿 [66][81]） | `stitch.judges` 多模型评审团（O8 选型记录——现版拒绝理由与触发条件见 8.3；镜像 `verify.judges` 纯配置扩展）；完成感知封闭（收尾动作模式触发封闭——B-1 撤除因 extract 后置无动作证据（8.1 ⑥）；触发：M14 行「extract-先行次序」候选落地使动作证据先行）；复评面扩展至多碎片线索（现版复评候选仅单碎片线索——双多碎片线索误分裂与池截取排除目标不在修复面内、由真机门禁兜底（3.16.4 残差声明）；触发：门禁审计显示该形态占漏缝主体）。 |
 | 上下文预算（v1.11） | `context_window` 声明制（0=关）+ 零依赖启发式估算 + 动态贪心装填（条数参数降级为上限，w_min 静态护栏/估算上界）+ 图片成本测量-反应式三层（先验装填 → 溢出裁帧保清重试 → 判审裁帧升清重试 → usage 在线校准、批冻结快照）+ M9 咽喉终检（3.9，V6–V21） | `default_image_px` 图片采样工作点（默认 0 = 沿用 `max_image_px` 即 v1.10 行为；`max_image_px` 升格为升级天花板 + 像素制硬限制域，V18）；`context_window` 打折声明作通用 margin 放大器（唯一逃生门——margin / 估算系数 / 阶梯常数冻结于代码不开配置面，V7/V8/V18） | **运行中分母修正**（`metrics.run_estimate` 重复调用通道 / counters 每 tick 拉取通道——V12 已证实机械可行、v1 不用；触发：w_min 上界与 `report.stream.windows` 实际窗数长期偏差可观测）；**定向区域升清**（裁剪可疑区域而非整帧升清——Ferret-UI 双子图 / DirectX VRS foveation / AwaRes·MEGA-GUI 判审触发裁片升清，[C-52][C-56][C-67] 见 `docs/dev/PROPOSAL-context-budget.md`；触发：整帧升清仍不足以修复判审失败）；**per-profile 密度旋钮**（cl100k 旧词表中文 1.25–1.4 t/字不被 CJK×1.0 覆盖的记载局限；触发：该类 profile 部署出现且浪费/超窗可观测）；**输出侧预算**（`num_per_call` × 样本长 vs `max_output_tokens` 的输出预算；触发：`output_truncated` 桶占比可观测偏高）；**计数 API / usage 文本密度校准回路**（智谱 tokenizer API 抽样校准 + LangChain usage-scaling 同构，[C-63][C-71]；触发：文本估算偏差成为主要浪费源——cl100k 缺口的将来闭合路径）。 |
 
-**v1.16 M6 现行算法冻结补充**：规则/窗口生效时，M6 采用单一 CP-SAT 联合问题冻结
-完整流 skeleton，再调用 LLM 生成 brief 与 payload；无约束时保留 v1.15 默认路径。规划
-期为每个实际 attempt 恰抽一次循环长度偏好，联合模型以偏好名次和为主目标、可行 noise
-为次目标，一次求解同时定稿长度、帧类 word、session、timestamp 与 noise 槽；不能逐候选
-重求、按候选长度分别求解、把求解失败当作随机候选淘汰，也不能重规划或 fallback。planner、
-M1、estimate 共用问题入口。LLM 作废后的处理是删除 attempt、移除空 session、保留幸存
-timestamp 并投影 noise/duplicate。验证顺序、hook 深拷贝、报告恒等式和 artifact 不变面
-见 3.6.6、6.4、6.5。
-
-**v1.17 M6 现行算法更新**：时间流生成形态的现行算法自 v1.17 起为「QuotaCompiler
-（class × local date 非负整数 occurrence count、具名 quota bucket equality、单目标最小化
-occurrence 总数）→ ScenarioPlanner（owner permutation `AddInverse`、1µs always-present
-interval `AddNoOverlap`、聚合 noise reserve、三层字典序目标逐层冻结）→ exact delivery
-状态机（stable slot × `max_attempts_per_slot` 有界重试 + 幸存者投影）」，取代 v1.16 的
-单模型联合规划叙事（3.6.5、`docs/dev/SPEC-scenario-planning.md` §6–§9）；上表 M6 行的
-v1.13 候选「交叉并发度 k > 2」按 v1.17 明确不做维持停放（crossed session 至多两个
-owner）；8.1 v1.17 块的其余不做项（RRULE/IANA timezone/DST、quota 相加、resource 语义
-自动推断、LLM content/checkpoint 落盘、process 模式配额语义变更、`--limit`）均为边界
-而非演进候选。
+**v1.18 M6 现行算法冻结补充。**sequence 形态先把 program、catalog 与 ClassView 编译为不可变
+GenerationProgram，再生成一次 ScenarioPlan；delivery 按声明序串行处理完整 counterfactual set，
+每个 attempt 执行 scenario seed、baseline/variant EventPlan、state transition、frame render、
+mechanical/semantic evaluation、prospective dedup、quality/annotate/verify 与 cross-view reconcile。
+只有完整 set 通过才一次提交 dedup 与 dataset counters；任何 rejection 丢弃整个 attempt-local
+transaction。slot 或 noise 耗尽即停止，保留旧成功 manifest，不交付已接受前缀；所有成功数据通道
+只在全局 reconcile 后打开并以 manifest-last 顺序提交。M11 从下游后的最终行唯一计算 delivery digest；
+ReplayProjector 从这些最终 primary rows 预投影 replay，retained-content prospective check 通过后才允许
+group commit（6.4–6.5）。普通 process、flat generate 与 M14/M15/M16 算法不因本形态改变。

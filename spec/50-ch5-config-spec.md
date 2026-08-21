@@ -113,7 +113,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `input.on_bad_line / on_missing_pair / on_index_conflict` | str | skip / skip / fail | "skip" \| "fail"（3.2.4–3.2.5）。 |
 | `input.max_image_mb` | int | 20 | 单图大小上限。 |
 | `input.ui_tree_max_chars` | int | 30000 | 提示词中树序列化长度上限。v1.11（V9，3.9.5）：升格为**绝对上限**——所引 profile 声明 `context_window` 后，单记录树渲染实参取 `min(ui_tree_max_chars, 预算折算份额)` 动态收缩（超预算按行丢尾、保留既有 truncated marker）；未声明预算时即固定上限（现行为）。 |
-| `stream.order_by` | str | "input_order" | v1.8 新增（`[stream]` 节 = stream 模式输入侧排序与会话化声明，M2 消费，3.2/3.14；**v1.13 措辞修订**：本节在 `segment.enabled` **∨** `generate_stream.enabled` 时生效——后者下本节兼作**生成侧铺设契约**（`order_by` 声明工件行的时间戳字段名、`gap_s` 定会话间隔下界、`session_max_len` 定织造上限；此时必须 `order_by = "meta:<字段>"` ∧ `key == []` ∧ `gap_steps == 0`，3.1.4 时间流生成行 ⑤），两开关皆关时本节入 R8 停放清单）。"input_order"（默认：文本 = 文件名字典序→行号，UI = pair_index 升序）\| "meta:<field>"（**仅文本模态**，M1 校验；时间戳解析规格见 6.1——数值秒/毫秒判定、ISO 字符串、时区归一；解析失败与乱序同走 on_disorder）。 |
+| `stream.order_by` | str | "input_order" | `[stream]` 仅描述 process 输入侧排序与会话化；"input_order" 为文本文件/行号或 UI pair_index 顺序，`"meta:<field>"` 仅文本模态并按第 6 章解析时间。sequence 生成不读取本节。 |
 | `stream.on_disorder` | str | "skip" | v1.8："skip"（默认：乱序/时间戳解析失败记录跳过——计 bad_input + IngestReport.disorder 子计数 + `ingest.disorder` 事件 + WARN 一次）\| "fail"（InputError，退出码 3）。单调性游标**按分区键各自维护**（S19；键变即断语义保留，输入须按键成组，6.1）。 |
 | `stream.key` | array | [] | v1.8：分区键列表，键变即断会话（groupby 语义非 keyBy）。元素 = "meta:<field>"（仅文本模态）\| "source_dir"（= ref.source_file 父目录派生，UI 模态可用——一次采集一目录惯例，S19）；元素合法性 M1 校验（3.1.4）。 |
 | `stream.gap_s` | int | 300 | v1.8：相邻记录时间差 > gap_s 秒即断开会话；仅 `order_by="meta:*"` 时生效——显式设置而非 meta 序 ⇒ M1 warning 一次（非阻断，键不生效；对照 `session_max_span_s` 行的 CONFIG_ERROR 级）。默认偏大的结构性论证：欠分割可由 LLM 边界精化拯救、过分割不可逆（3.14）。 |
@@ -178,30 +178,26 @@ dims = 1024                         # 可选：返回向量维度校验
 | `quality.judges` | array | [] | 评审团 profile 引用数组。空 = 单评审（用 `quality.llm`）；非空须为奇数个且每项存在于 config.toml `[llm.*]`（M1 校验），每次比较各 judge 独立裁决、per-criterion 多数票（3.4.3 多评审团行，PoLL [32]）。成本 ×\|judges\|。 |
 | `quality.both_orders` | bool | false | true 时同一对正反两种呈现顺序各裁决一次（每 judge），两次一致才记 winner、不一致按 tie（3.4.3 双顺序裁决行 [20]）。成本 ×2。 |
 | `quality.on_unscored` | str | "keep" | "keep" \| "drop"（3.4.3 裁决失败行）。 |
-| `quality.rubric` | str | 自动 | "default:text" \| "default:ui" \| "default:trajectory"（v1.8 增：轨迹四准则 rubric，包数据 `default_trajectory.toml`，附录 A.3）\| "inline"。缺省（空串）按模态选默认；**v1.8 空串解析规则：`segment.enabled = true` ⇒ 解析为 "default:trajectory"**（两模态一致；用户显式选择器恒优先；按类视图经 base selector 自动继承，S29）——**v1.13 条件扩为 `segment.enabled ∨ generate_stream.enabled`**（时间流生成形态打的同样是序列/轨迹的分；loader 与 M11 的 `_meta.run.rubric` 镜像两处同步，3.11.2）。trajectory rubric 与 `extract.enabled = false` 组合 ⇒ M1 warning 提示（rubric 模态中立、不预设 steps 在场——「步骤」退化读作「帧间变化」，S29）。写 inline 时必须提供 [[rubric.criteria]]。 |
+| `quality.rubric` | str | 自动 | "default:text" \| "default:ui" \| "default:trajectory" \| "inline"。缺省按模态选择；`segment.enabled = true` 时选 trajectory。sequence 若启用 quality，同样只消费已解析 rubric，但必须是 pointwise + 固定 threshold，不能使用 pairwise 或 top_ratio。写 inline 时必须提供 `[[rubric.criteria]]`。 |
 | `quality.judgment_reasons` | str/bool | "auto" | "auto" \| true \| false。生效时 pairwise 裁决 Schema 增加 `reason` 字段（3.4.3），写入 trace 供 rubric 优化（7.5）；"auto" = `trace.enabled=true` 且 `trace.channels` 含 "quality" 时开（trace 关闭则不请求 reason，零额外 token）。成本：每次裁决约增加 30–60 输出 token。 |
 | `rubric.criteria` | array | 可选 | 内联 rubric，字段见 5.3。 |
-| `generate.enabled` | bool | false | 仅文本模态（2.3.1 约束）。 |
-| `generate.llms / instruction` | array/str | ["default"] / 必填† | † enabled 时必填。`llms` 为 profile 引用数组（v1.2，取代 v1.1 单值键 `generate.llm`），每个元素须存在于 config.toml `[llm.*]`；每次生成调用按 `generate.mixture` 从中选 1 个（3.6.2 多模型混合行）。 |
-| `generate.mixture` | str | "round_robin" | "round_robin"（按调用序轮转）\| "weighted"（按 `generate.weights` 加权抽样，PRNG 用 `ctx.rng`，随 run.seed 可复现）。llms 仅 1 个元素时二者等价（即 v1.1 行为）。 |
-| `generate.weights` | array | [] | 正数权重；`mixture = "weighted"` 时必填且长度须等于 llms（M1 校验），round_robin 下忽略。 |
-| `[[generate.styles]]` | array | [] | 风格子表（可选）：每项含 `name`（str，表内唯一）与 `prompt`（str，非空）；非空时每次生成调用经 `ctx.rng` 均匀抽 1 个 style，其 prompt 追加进生成指令（3.6.2 风格条件化行）。 |
-| `generate.num_per_record` | int | 2 | 每种子期望产出条数。 |
-| `generate.seeds_per_call / num_per_call` | int | 3 / 4 | 3.6.2。v1.11（V9，3.9.5）：`seeds_per_call` 升格为**上限**——所引 profile 声明 `context_window` 后按 rng 采样序从尾部丢弃种子直到装下（确定性收缩，min 1）；未声明预算时即固定条数（现行为）。 |
-| `generate.seed_min_score` | float | 自动 | 种子门槛，默认取 quality.threshold 或批中位数。 |
-| `generate.temperature` | float | 0.9 | 生成需要多样性，覆盖 profile 默认。 |
-| `generate.sample_validator` | str | 无 | v1.5 校验回调（方案 A）：`"module:function"`，签名 `fn(text: str) -> list[str]`（空 = 通过）。对每条生成样本在相似度过滤**之前**执行，违规样本剔除（过滤语义，不触发重试、不产生 failed 记录），计入桶统计 `rejected_by_validator`（3.6.2/6.4）。M1 校验同 output.validator（无 few-shot 干跑）。回调抛异常 ⇒ 该样本按违规剔除并 stderr warn（过滤器不失败）。 |
-| `generate.seed_examples` | array | [] | generate_only 专用（process 模式不得设置，3.1.4）：字符串数组种子池，非空即种子池形态（3.6.2）。 |
-| `generate.standalone_count` | int | 无 | generate_only 无种子形态必填（与 seed_examples 互斥）：目标产出条数，调用数 = ⌈standalone_count / num_per_call⌉。 |
-| `generate.sequences` | int | 0 | v1.13 新增（时间流形态）：序列**尝试配额**的全局默认，按类经 `[class.<name>.generate].sequences` 覆盖；0 = 该类不参与生成。M1 要求 `Σsequences ≥ 1`（各类有效值求和，3.1.4 时间流生成行）。语义同 `standalone_count`——**尝试**配额，无输出条数保证、无补齐回路（8.3 O6 辖区）。 |
-| `generate.len_range` | array | [3, 6] | v1.13 新增（时间流形态）：单序列步数的均匀采样区间 `[lo, hi]`（整数，`1 ≤ lo ≤ hi`），按类可覆盖；逐序列 `L = randint(lo, hi)`（计划期第②步抽签，3.6.5）。织造上限：`2 × max(各类 hi) ≤ stream.session_max_len`（M1 校验）。**v1.14 长度可覆盖交叉引用**（v1.15 措辞按类化）：档位表在场时，逐 (参与类, 档) **非零配额对**另须满足 `lo ≥ len(该档 frame_classes)`——其中「档」取自**本类生效表**（`[[class.<name>.generate.tiers]]` 声明了就用它，否则回落全局 `[[generate.stream.tiers]]`）；档内每类至少出现一次，步数不足即装不下，零额对豁免（见下方两节档位表与 3.1.4）。 |
-| `generate.stream.enabled` | bool | false | v1.13 新增：**时间流生成形态**总开关（generate_only 第三形态，M6，3.6.5）。默认关——全关时全系统与 v1.12 **字节等价**（含七个既有 dry-run golden）。启用要求（M1 硬合取，3.1.4 时间流生成行）：`run.mode="generate_only"` ∧ `run.modality="text"` ∧ `generate.enabled` ∧ `classify.enabled` ∧ `stream.order_by="meta:<字段>"` ∧ `output.meta_mode != "none"`；与 `frame.classify.enabled` / `frame.annotate.enabled` **互斥**（帧类真值在蓝图层已知，定向 CONFIG_ERROR）。 |
-| `generate.stream.sessions` | int | 0 | v1.13：会话数（≥ 1）。交叉会话数 = `Σsequences − sessions`，故 M1 要求 `sessions ≤ Σsequences ≤ 2 × sessions`（交叉并发度恒 k ∈ {1,2}；更高并发度列 8.4 演进候选）。重发序列另落流尾新会话、**不计入本键**（无作废时工件实际会话数 = sessions + duplicates；有序列作废或被相似度淘汰时按 `sessions_eff = min(sessions, Σ幸存)` 装箱，实际会话数相应减少——见 `report.generate.stream.sessions`，3.6.5）。 |
-| `generate.stream.noise_ratio` | float | 0.0 | v1.13：噪音帧 / 任务帧 比例，∈ [0,1)；噪音帧数 = `round(noise_ratio × Σ任务帧数)`，调用数 = `⌈噪音帧数 / generate.num_per_call⌉`。> 0 时 `noise_instruction` 必填。噪音帧逐帧掷签 (会话, 槽位)，满员会话（`len ≥ stream.session_max_len`）退出签池（3.6.5）。 |
-| `generate.stream.noise_instruction` | str | "" | v1.13：噪音帧的生成指令（`noise_ratio > 0` 时必填非空，M1 校验）；批量实现复用 3.6.2 的既有生成模板与输出 Schema。 |
-| `generate.stream.duplicates` | int | 0 | v1.13：**原样重发**的序列条数（0 = 无；M1 要求 ∈ [0, Σsequences]，运行期另按幸存数钳制 + WARN）。取自幸存序列、帧内容逐字节同源、恒落**流尾新会话**（避免同刻不定序）——重发帧只活在工件（不构造信封、不进本次运行的守恒账），判重演示位在**工件重放**（6.5）。 |
-| `generate.stream.frame_gap_s` | array | [5, 60] | v1.13：会话内帧间隔的均匀采样区间（秒，数值）；M1 默认 v1.15 路径（以及仅有 sequence_validator、无实际非零 rules/windows 前缀的路径）要求 **`1e-6 ≤ lo ≤ hi < stream.gap_s`**；仅当 `--limit` 后实际非零配额前缀存在生效 rules/windows 时，v1.16 联合规划路径才允许 **`hi ≤ stream.gap_s`**（上界等于阈值时由 replay guard 接管；下界为 v1.14 补的**微秒地板**——isoformat 精度与 `round(·, 6)` 的分辨率下界，亚微秒 lo 下帧间隔 `timedelta` 取整为 0 微秒，破坏「ts 严格递增」并使时间语义词表的 0.0 边界哨兵失去无歧义性）。会话间隔取 `uniform(gap_s + lo, gap_s + hi)` 恒 > `gap_s` ⇒ 摄取侧按同一 `gap_s` 复演出相同会话切分（3.6.5）。 |
-| `generate.stream.ts_start` | str | "2026-01-01T00:00:00Z" | v1.13：时间流起点（ISO-8601，M1 以 `datetime.fromisoformat` 校验可解析；无时区视为 UTC，与 `meta:<字段>` 摄取规则一致）。**恒不取墙钟**——同 seed 双跑工件逐字节一致的前提之一（2.6 可复现行）。 |
+| `generate.enabled` | bool | false | 仅文本模态；process 可用 flat 回流，generate_only 必须开启。 |
+| `generate.form` | str | "flat" | `"flat"` 或 `"sequence"`。两种形态字段互斥，不能混写。 |
+| `generate.llms / instruction` | array/str | ["default"] / 必填† | flat 专用；profile 数组与生成指令。 |
+| `generate.mixture / weights` | str/array | "round_robin" / [] | flat 专用；round_robin 或 weighted，weighted 的正权重数与 llms 相等。 |
+| `[[generate.styles]]` | array | [] | flat 专用风格表，每项 name 唯一、prompt 非空。 |
+| `generate.num_per_record` | int | 2 | flat 专用，每个种子的期望产出数。 |
+| `generate.seeds_per_call / num_per_call` | int | 3 / 4 | flat 专用；上下文预算开启时 seeds_per_call 是确定性装填上限。 |
+| `generate.seed_min_score` | float | 自动 | flat process 专用，缺省取 quality threshold 或批中位数。 |
+| `generate.temperature` | float | 0.9 | flat 专用生成温度。 |
+| `generate.sample_validator` | str | 无 | flat 专用 `<python-file>:<attribute-path>` hook，签名 `fn(text: str) -> list[str]`；在相似度过滤前执行。 |
+| `generate.seed_examples` | array | [] | flat generate_only 种子池；与 standalone_count 互斥。 |
+| `generate.standalone_count` | int | 无 | flat generate_only 无种子形态的目标条数。 |
+| `generate.mode` | str | 必填† | † sequence 必填：`"declared"` 或 `"instruction_only"`。flat 禁止设置。 |
+| `generate.semantic_llm` | str | 必填† | † sequence 必填；文本 LLM profile，显式声明正 context_window。 |
+| `generate.evaluation_llm` | str | 必填† | † sequence 必填；名称必须与 semantic_llm 不同，显式声明正 context_window。 |
+| `generate.max_slot_attempts` | int | 3 | sequence 专用，范围 1..20；每个 slot 的 whole-attempt 上限。 |
+| `generate.state_validator` | str | 无 | sequence 专用 `<python-file>:<attribute-path>` hook，签名 `validate_state(StateTransitionInput) -> list[str]`。 |
 | `annotate.enabled` | bool | true | — |
 | `annotate.llm / instruction` | str | default / 必填† | † enabled 时必填。 |
 | `annotate.examples` | array | [] | few-shot：[{input, output}]，output 须过用户 Schema（M1 校验）。 |
@@ -213,7 +209,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `frame.classify.fallback_class` | str | 必填† | † enabled 时必填且 ∈ 帧类表 name 集（2.3.1 帧粒度约束）：修复穷尽 / 窗口失败的兜底类（3.13.7 失败语义；LLM 亦可主动选择它）。 |
 | `[[frame.classify.classes]]` | array | 必填† | † enabled 时经「fallback_class ∈ 类表」传递性要求非空（无独立 ≥ 2 类数下限，与 `[[classify.classes]]` 有意不同，3.1.4）。每项：`name`（`[a-z0-9_]+`，表内唯一）、`description`（非空）、`examples`（字符串数组，可选——**解析合法但帧级批量判决模板不渲染**（§10.12 只渲染类表，与序列级 few-shot 有意不同），在场时 M1 显名 WARN `class examples are not rendered by the batched frame-verdict template (§10.12), so this key is ignored`，静态预算预检口径同步不计，3.1.4）。**帧类表与序列类表相互独立、允许重名、互不约束**（计数命名空间同分离：`frame_classify.*` vs `classify.*`，6.4）。 |
 | ~~`frame.classify.assignment`~~ | — | —（不提供） | v1.12 定向探针键：显式书写 → CONFIG_ERROR——帧分类恒为单一归属（帧多标签/帧级扇出为 v1.12 非目标，8.1）；多标签扇出请用序列级 `[classify].assignment`（机制 = v1.11 `use_vision` 原始节探针同款，3.1.4）。 |
-| `frame.annotate.enabled` | bool | false | v1.12 新增：帧级逐帧标注开关（M5 帧粒度，3.5.5）——序列级标注成功后对成员帧逐帧产出符合帧级 Schema 的标注，产物落 `_meta.stream.members[].annotation/status`（6.3）。默认关。启用要求 `segment.enabled = true`；`frame.*` 任一启用 ⇒ `output.meta_mode != "none"`（帧产物仅经 `_meta.stream.members` 承载，sidecar 合法——2.3.1 帧粒度约束）。 |
+| `frame.annotate.enabled` | bool | false | v1.12 新增：帧级逐帧标注开关（M5 帧粒度，3.5.5）——序列级标注成功后对成员帧逐帧产出符合帧级 Schema 的标注，产物落 `_meta.stream.members[].annotation/status`（6.3）。默认关。process/flat 路径启用要求 `segment.enabled = true`；sequence 路径可脱离 segment 作为 attempt-local 下游。`frame.*` 任一启用 ⇒ `output.meta_mode != "none"`（帧产物仅经 `_meta.stream.members` 承载，sidecar 合法——2.3.1 帧粒度约束）。 |
 | `frame.annotate.llm` | str | "default" | profile 引用；enabled 时计入密钥解析 / `--probe` / 存在性引用集；ui 模态 ∧ enabled 时**无条件入 vision 必需集**（镜像序列级 annotate——截图是标注主证据，3.1.4 帧粒度配置行）。 |
 | `frame.annotate.instruction` | str | 必填† | † enabled 时必填（非空，M1 校验）。全局帧标注指令；`[frame.class.<name>.annotate]` 可按帧类覆盖（见按类覆盖表 v1.12 注）。 |
 | `frame.annotate.examples` | array | [] | few-shot：[{input, output}]，output 须过**帧级 Schema**（M1 干跑校验，3.1.4；帧级无 L2.5 hook）；形态镜像 `annotate.examples`。 |
@@ -229,7 +225,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `output.schema_inline` | str | 二选一 | TOML 多行字符串内嵌的 Schema JSON 文本。 |
 | `output.max_repair_attempts` | int | 2 | 结构引擎 L3 次数（3.8.2）。 |
 | `output.repair_llm` | str | 同调用方 | L3 修复用 profile。 |
-| `output.validator` | str | 无 | v1.5 校验回调（方案 A）：`"module:function"` 形式的 Python 可调用引用，签名 `fn(obj: dict, record: dict | None) -> list[str]`（返回违规描述列表，空 = 通过；record = Record.raw：文本/生成记录为该行原始对象，UI 记录为 None）。挂接为结构引擎 **L2.5**（3.8.2）：仅作用于用户 Schema 的标注调用，违规并入 L3 修复环、共享 max_repair_attempts 预算，耗尽 ⇒ 记录 failed（kind = `callback_violation`，7.6）。M1 启动校验：格式、可导入、可调用，且逐条 few-shot 示例 output 须过回调（干跑）。回调以运行者同权限执行任意用户代码（信任边界与配置文件一致）；回调内抛异常按记录级 `internal_error` 处理。 |
+| `output.validator` | str | 无 | `<python-file>:<attribute-path>` 形式的 L2.5 回调，签名 `fn(obj: dict, record: dict \| None) -> list[str]`；相对文件按 project root 解析。仅作用于用户 Schema 标注调用，违规进入同一 L3 repair 预算。 |
 | `output.meta_mode` | str | "inline" | "inline" \| "sidecar" \| "none"（6.3）。 |
 | `output.passthrough_fields` | array | [] | 从 Record.raw 透传进 _meta.source.fields 的字段名列表。 |
 | `output.rejects` | str | "refs" | "none" \| "refs" \| "full"（3.11.2）。 |
@@ -238,75 +234,22 @@ dims = 1024                         # 可选：返回向量维度校验
 | `trace.channels` | array | ["quality","verify","schema"] | 可选值 ingest \| segment（v1.8 增）\| stitch（v1.9 增）\| dedup \| classify（v1.7 增）\| extract（v1.8 增）\| quality \| annotate \| verify \| schema \| llm（十一个，7.2 事件目录；通道 = stage 名，S1）；默认值不变——分类事件须用户显式加 "classify"、分段/摘取/缝合事件须显式加 "segment" / "extract" / "stitch" 才写；run.*/batch.* 生命周期事件不受此过滤。 |
 | `trace.content` | str | "refs" | "none" \| "refs" \| "excerpt" \| "full" 内容脱敏四档（7.4）。 |
 
-**`[[generate.stream.tiers]]` 帧类构成档位表（v1.14 新增，可选；数组表，仅时间流生成形态合法）。**一个档位的定义**就是**该档序列的帧类构成集合：它不携带质量指令、不控制帧内部语义质量（那归各帧类的生成指令与温度）。缺省（表不在场）⇒ 档位面整体不在场，与 v1.13 字节等价。
-
-| 字段 | 类型 | 默认 | 说明 |
-|---|---|---|---|
-| `tier_rank` | int | 必填 | 档位序数（「第几个档位的要求」，即档位身份——本表**不设** `name` 键）。正整数、表内唯一、全表**连续覆盖 1..N**（N = 表长；缺号/重号 = CONFIG_ERROR）。它同时是配分平票与类内序数分块的确定性排序依据；**工具不赋予序数高低任何质量方向语义**——方向由用户在各档构成上自行赋予。 |
-| `weight` | int | 必填 | 配额权重（整数 ≥ 1）。每个参与类的 `sequences` 配额按**该类生效表**（v1.15：本类的按类表或回落的本全局表）各档权重走**整数域最大余额法**零抽签配分（3.6.5 档位构成行）；配分为 `(sequences, 权重表)` 的纯函数、不消费任何随机数。某 (参与类, 档) 配额为 0 是小配额 × 悬殊权重的自然结果 ⇒ M1 发 WARN（非错误，报表 `tiers` 子块如实呈现 planned 0）。 |
-| `frame_classes` | array | 必填 | 档位构成：该档序列**恰用**这些帧类（每类至少出现一次、不出现档外类）。非空、档内无重复、每名 ∈ `[[frame.classify.classes]]` 名集，**同一张表内**各档构成**集合两两互异**（同构成即语义重复；v1.15：跨表——即跨类——同构成合法）。恰等语义由蓝图内部 Schema 双向保证——enum 限档内子集给「⊆」、逐类 `contains` 给「⊇」（3.8.1），故档位身份可从 `_meta.stream.members[]` 的帧类集合直接反推对账。长度前提：配额非零的 (类, 档) 对须满足该类 `len_range` 下界 ≥ 本档构成大小（M1 校验）。 |
-
-档位序数在**三处**落地（同一个值三个面，档位表缺省时三处全部不在场）：主输出每行的 `_meta.source.generator.tier_rank`（6.3）、时间流工件行的 `truth.tier_rank`（6.5）、报表的 `report.generate.stream.tiers`（6.4——v1.15 起该子块有平面与类嵌套两形，见下节）。另一条推论：`--limit` 在计划期配额层做前缀截断，而类内序数按 tier_rank 升序占连续区间，故截断是在每个类内**从最高档序数侧截起**。
-
-**`[[class.<name>.generate.tiers]]` 按类档位表（v1.15 新增，可选；数组表，仅时间流生成形态合法）。**行结构与上表**逐字段相同**（`tier_rank` / `weight` / `frame_classes` 三键，逐行校验同款），语义是**表级原子覆盖**——本类声明了就用本类的整张表，**不逐行合并**（行级合并会让 rank 身份跨表漂移；先例是仓库既有的两处按类重资产：`[class.*.quality].rubric` 内联子表整表替换、`[class.*.annotate].schema_*` 覆盖回落）。缺省（所有类都不声明）⇒ 生效表恒 = 全局表，与 v1.14 字节等价。四条语义要点：
-
-| 要点 | 规格 |
-|---|---|
-| 覆盖与回落 | 一个序列类的**生效表** = 该类声明的表；未声明（键缺省）⇒ 回落全局 `[[generate.stream.tiers]]`。配分、蓝图 `[帧类表]` 档内子集、`generator.tier_rank`、工件 `truth.tier_rank` 与报表逐类分账，全部按**本类生效表**取值（3.6.5）。 |
-| 全局表为锚 | 按类表**要求全局表在场**（缺省 = CONFIG_ERROR，指引补全局表）。档位面总开关恒 = 全局表非空 ⇒ 每个参与类恒有生效表，上文「三处落地」的在场性因此恒定、不因某类未声明按类表而逐行漂移。「本类不想分档」的表达式 = 给它一张单档表（`tier_rank = 1` + 任意构成）——退化形态，零机制成本。 |
-| rank 为类内身份 | `tier_rank` 在**每张生效表内**各自正整数、表内唯一、连续覆盖 1..N（N = 该表长，**逐类可不同**）；跨类同 rank **无任何工具语义**（工具本就不赋序数以质量方向），「各档构成两两互异」的辖区相应收窄为**单表之内**——跨类同构成完全合法（各类都可有自己的「全类档」）。消费侧行级消歧免费：主输出行携 `_meta.classification.label`、工件行携 `truth.sequence_class`，与 `tier_rank` 同行相邻。 |
-| 空表拒收 | 三态互斥：键缺省 = 未声明（回落全局）；`tiers = []` = 显式空表 ⇒ **CONFIG_ERROR**（指引删键回落——档位面统一之下不存在「本类无档」态）；非空 = 覆盖。 |
-
-```
-[[generate.stream.tiers]]                     # 全局表：锚 + 面开关 + 未声明类的回落
-tier_rank = 1
-weight = 2
-frame_classes = ["task_request", "followup"]
-
-[[generate.stream.tiers]]
-tier_rank = 2
-weight = 1
-frame_classes = ["task_request", "followup", "confirmation"]
-
-[[class.ticket_booking.generate.tiers]]       # 按类表：本类整表取代全局表（构成与权重双差异）
-tier_rank = 1
-weight = 1
-frame_classes = ["task_request", "followup"]
-
-[[class.ticket_booking.generate.tiers]]
-tier_rank = 2
-weight = 2
-frame_classes = ["task_request", "confirmation"]
-# smart_home 不声明 ⇒ 回落全局两档表（混合形态：一类独立表 / 一类回落）
-```
-
-M1 校验（3.1.4「按类档位表」行，规范源头 2.3.1 v1.15 段）：**按类表前提三子款**——形态门（`generate_stream.enabled = false` 时书写 = 定向 CONFIG_ERROR，原始节探针）、全局锚、空表拒收；上表的**身份连续性与构成合法性改逐生效来源表执行**（全局表 + 每张已声明按类表各跑一遍）；逐 (参与类, 档) 的长度可覆盖约束与配分零额 WARN 逐类改吃本类生效表；「帧类未入档」WARN 与「每帧类生成指令必填」的检查域**并集化**为 ∪（各参与类生效表构成）。零配额类（`sequences = 0`）声明的表照跑结构校验，仅豁免上述两项配额相关检查、其构成不入并集。观测面：`report.generate.stream.tiers` 在任一按类表在场时改**类嵌套形**（6.4），`_meta.source.generator.tier_rank` 与工件 `truth.tier_rank` 的键、序、在场判据**全部零改动**（值 = 本行序列类生效表内的档序数，跨类不可比）。
-
-**`[class.<name>.<section>]` 按类覆盖（v1.7）。**classify 启用时可按类覆盖下游算子参数：`<name>` 必须 ∈ classes；未出现的键一律继承全局节（不配任何覆盖即纯打标模式）。可覆盖键白名单（M1 强校验，白名单外的键报 `CONFIG_ERROR`——3.1.4「未知键报 warning」行的显式例外；白名单后续只增）：
+**`[class.<name>.<section>]` 按类视图。**process 下由 classify 类表建立路由类；sequence 下由带
+description 的 `[class.<name>]` 直接声明 sequence class，classify 必须关闭。两种入口都在 M1 合并并冻结
+`ClassView`，未出现的通用下游键继承全局节；白名单外键报 `CONFIG_ERROR`。
 
 | 节 | 可覆盖键 | 不可覆盖（保持全局）及理由 |
 |---|---|---|
 | `[class.*.quality]` | mode, rounds, rubric（含 `[class.*.rubric]` 内联子表，结构同 5.3）, threshold, selection, top_ratio | llm / judges / both_orders / criteria_per_call / on_unscored——LLM 绑定属部署与成本面，类差异先用 rubric 表达（1.6 v1.7 对齐决策 ④） |
-| `[class.*.annotate]` | instruction, examples, **schema_path / schema_inline（v1.13 增，至多其一）** | llm / self_consistency / sc_temperature。v1.13 按类标注 Schema 语义：**覆盖**（类声明了就用类的，两键皆缺 = 回落全局 `output.schema`；同时声明报 CONFIG_ERROR）——装载走 `output.schema` 全套分支 + `_meta` 保留键禁令 + `$ref` 遍历 + **按类 few-shot 干跑**（3.1.4 按类覆盖合并行 ⑤）；运行期由 M5 的单点取值函数供给全部消费点、M11 按行终检同口径（3.5.2、3.11.2） |
-| `[class.*.generate]` | instruction, styles, num_per_record, temperature, **sequences / len_range（v1.13 增，时间流形态的按类配额与步数区间）**, **tiers**（v1.15 增第七键：按类帧类构成档位表，数组表 `[[class.<name>.generate.tiers]]`，**表级原子覆盖**语义——见下方按类档位表节） | llms / mixture / weights / seeds_per_call / num_per_call / sample_validator。v1.13 时间流形态下 `num_per_record` / `seeds_per_call` 从本行白名单语义中除名——显式书写是定向 CONFIG_ERROR（属平面生成形态，3.1.4 时间流生成行 ③）。v1.15 注：`tiers` 同为**仅时间流生成形态合法**——`generate_stream.enabled = false` 时书写是定向 CONFIG_ERROR（原始节探针，3.1.4 按类档位表行），另要求全局 `[[generate.stream.tiers]]` 在场（全局表为锚） |
+| `[class.*.annotate]` | instruction、examples、schema_path / schema_inline（至多其一） | 类声明 Schema 时整份覆盖，否则回落全局 output Schema；按类 few-shot 走有效 Schema 与 output validator。 |
+| `[class.*.generate]` | flat：instruction、styles、num_per_record、temperature；sequence declared：instruction、state_schema_path、initial_state_source、initial_state_catalog_path | flat 与 sequence 字段按 `generate.form` 互斥。sequence 的 llm source 禁止 catalog_path；catalog source 要求完整 ScenarioSeed JSONL。 |
 | `[class.*.verify]` | extra_criteria | llm / judges / policy / max_repair_rounds |
 | `[class.*.extract]` | instruction（v1.8 增） | llm / include_diff / on_error——LLM 绑定与失败策略属部署与成本面（与 quality 行同理） |
-| `[frame.class.*.annotate]`（v1.12） | instruction, examples, enabled（enabled = false ⇒ 该帧类成员跳过帧标注——省成本面，members[] 呈现 status="skipped"，3.11.2） | llm / schema——LLM 绑定属部署与成本面；帧级标注 Schema 按粒度唯一（8.4 M13 行）。v1.12 时白名单仅此一节，v1.13 增 `generate` 节（下行）；两节之外的节名 ⇒ CONFIG_ERROR（3.1.4 帧粒度配置行） |
-| `[frame.class.*.generate]`（v1.13；v1.14 增第四键） | instruction（**必填非空**——v1.13 为「每个帧类」，v1.14 起：档位表在场时检查域收窄为 **∪各档 `frame_classes`**，未入档帧类豁免必填并另发一条 WARN 提示其整个生成面为死配置）, schema_path / schema_inline（**至多其一**：声明 = 结构化帧（帧内容以**对象原样**落工件行的文本字段，成员 `Record.text` 取其 canonical JSON 投影，6.5）；均缺 = 纯文本帧）, **`time_fields`（v1.14 增，子表——见下方时间字段绑定表）** | llm / temperature / styles——生成侧 profile 与采样参数属序列级（蓝图与实现绑定同一 profile，3.6.5）。**本节仅时间流生成形态合法**：`generate_stream.enabled = false` 时出现是反向定向 CONFIG_ERROR（指引改写 `[frame.class.<name>.annotate]`，3.1.4）；帧类生成 Schema 走 `_load_schema_pair` 全套 + `$ref` 遍历，**无 `_meta` 分支**（帧内容落工件行文本字段，与 §6.3 信封字段无冲突面） |
-| —— | —— | run.* / input.* / stream.*（v1.8）/ dedup.* / segment.*（v1.8）/ stitch.*（v1.9）/ classify.* / trace.* 全部不可按类；`output.*` 中除**标注 Schema** 外全部不可按类——v1.13 修订：`output.schema` 自本版起**可按序列类覆盖**（`[class.<name>.annotate].schema_*`，上表 annotate 行；兑现 8.4 M13 行「按类输出 Schema」演进候选），`output.validator`（L2.5 回调）与 meta_mode / rejects / passthrough_fields 等其余输出面仍全局唯一，帧级标注 Schema（`frame.annotate.schema`）亦维持按粒度唯一 |
+| `[frame.class.*.annotate]`（v1.12） | instruction, examples, enabled（enabled = false ⇒ 该帧类成员跳过帧标注——省成本面，members[] 呈现 status="skipped"，3.11.2） | llm / schema——LLM 绑定属部署与成本面；帧级标注 Schema 按粒度唯一（8.4 M13 行）。v1.18 sequence 另声明下行 `generate` 节；两节之外的节名 ⇒ CONFIG_ERROR（3.1.4 帧粒度配置行） |
+| `[frame.class.*.generate]` | instruction、schema_path / schema_inline | sequence 引用到的每个 frame class 必须有非空 instruction，并恰选一个 object JSON Schema；不支持 string payload。flat/process 不读取本节。 |
+| —— | —— | run、input、stream、dedup、segment、stitch、classify、trace 均不可按类；output 中只有标注 Schema 可按 sequence class 覆盖，其余输出面保持全局唯一。 |
 
-v1.8 注：`segment.*` 不入白名单是**链序因果**而非取舍——链序为 segment → stitch → dedup → classify → extract →…（3.10.3），segment 在 classify **之前**执行，成段时类标签尚不存在，「按类分段」无从谈起；extract 在 classify 之后，故其 `instruction` 可按类覆盖（multi 扇出下兄弟信封各按其标签的有效 instruction 摘取，S9，3.15）。v1.9 注：`stitch.*` 不入白名单同为链序因果——stitch 亦在 classify 之前（3.10.3），`[class.<name>.stitch]` 不存在（3.1.4 线索缝合行）。v1.12 注：`[frame.class.<name>.annotate]` 按**帧类**覆盖（键控 `[[frame.classify.classes]]` 类表，要求 `frame.classify.enabled = true`，3.1.4 帧粒度配置行②），与 `[class.<name>.*]` 的序列类覆盖是两个独立命名空间——**帧类表与序列类表相互独立、允许重名、互不约束**（重名类各自作用于各自粒度，互不干扰）；合并产物为 `frame_class_views`（零覆盖类也各得一份视图，`class_views` 同款，运行期零回退）。
-
-**`[frame.class.<name>.generate.time_fields]` 时间字段绑定子表（v1.14 新增，可选；仅结构化帧合法）**——把该帧类生成 Schema 里的时间语义字段绑定到时间轴：**键 = 生成 Schema 顶层字段名，值 = 语义词表取值**。绑定即剔除——被绑定字段从 LLM 面向的逐位 Schema 与逐位契约行中一并删掉（LLM 物理上生不出它），值由机械回填尾声在时间戳铺好之后按**本序列相邻成员**的 ts 差算出写回（3.6.5 时间字段回填行）。语义词表是**冻结闭集**，扩词走 spec 修订：
-
-| 语义词 | 要求的字段类型 | 取值 |
-|---|---|---|
-| `ts` | `"string"` | 本帧已铺时间戳的 ISO-8601 串。任务帧上 = 该行的时间戳字段值；**重发帧承源值**（≠ 自身行 ts——原样重发本就携带陈旧内容）。 |
-| `gap_prev_s` | `"number"` | 与**本序列**上一帧的间隔秒；本序列首帧恒 `0.0`。 |
-| `gap_next_s` | `"number"` | 与**本序列**下一帧的间隔秒；本序列末帧恒 `0.0`。 |
-| `elapsed_s` | `"number"` | 距**本序列**首帧的秒数；首帧恒 `0.0`。 |
-
-口径与约束：间隔一律按**序内相邻成员**计——交叉会话夹入的外序列帧与噪音帧本就占用其间墙钟，序内差值才与下游从数据实测的口径一致；不提供「会话内相邻行」口径（那是重放侧可自行计算的流水量）。数值取 `round(·, 6)`（微秒精度，与 isoformat 写出的分辨率对齐；0.0 边界的无歧义性由 `frame_gap_s` 的微秒地板保证）。M1 校验（3.1.4 帧类构成档位与时间字段绑定行）：绑定表仅结构化帧合法（纯文本帧带绑定表 = 定向 CONFIG_ERROR）；每个绑定键 ∈ 生成 Schema 顶层 `properties`；绑定值 ∈ 上表四词；该属性 Schema 的 `type` 关键字**字面恰等**于上表要求（联合类型数组、缺失、经 `$ref`/组合关键字间接声明均判不匹配）；顶层 `properties` 键数 − 绑定键数 ≥ 1（全绑定 = CONFIG_ERROR）。绑定字段上再写 `minimum`/`maximum`/`pattern` 等约束关键字 ⇒ WARN——那些关键字既不上行也不被强制，**时间量的值域由时间轴决定，不受 Schema 数值约束辖制**。
+v1.8 注：`segment.*` 不入白名单是**链序因果**而非取舍——链序为 segment → stitch → dedup → classify → extract →…（3.10.3），segment 在 classify **之前**执行，成段时类标签尚不存在，「按类分段」无从谈起；extract 在 classify 之后，故其 `instruction` 可按类覆盖（multi 扇出下兄弟信封各按其标签的有效 instruction 摘取，S9，3.15）。v1.9 注：`stitch.*` 不入白名单同为链序因果——stitch 亦在 classify 之前（3.10.3），`[class.<name>.stitch]` 不存在（3.1.4 线索缝合行）。v1.12 process 注：`[frame.class.<name>.annotate]` 按**帧类**覆盖（键控 `[[frame.classify.classes]]` 类表，要求 `frame.classify.enabled = true`，3.1.4 帧粒度配置行②），与 `[class.<name>.*]` 的序列类覆盖是两个独立命名空间。v1.18 sequence 例外：`[frame.class.<name>]` 本身声明生成闭集，frame.classify 必须关闭；投影器写入 inherited frame Classification，frame.annotate 按该值选择 `frame_class_views`。两条路径均保持帧类与 sequence 类两个独立命名空间，允许重名、互不约束；零覆盖类也各得一份冻结视图，运行期零回退。
 
 合并优先级：`[class.<name>].<sect>.<key>` > project.toml `[<sect>].<key>` > 内置默认——这是 project.toml **内部**的条件化合并，不改变「CLI > project.toml > config.toml」三源优先级（2.5）。M1 启动时按逐键 provenance 静态合并、冻结为 `class_views`，运行期零查找成本；选择组互斥对剔除、per-class rubric 重解析、类 examples 干跑等精确语义见 3.1.4 按类覆盖合并行。
 
@@ -371,174 +314,251 @@ schema_inline = """
 """
 ```
 
-### 5.2.1 v1.16 序列规则、日历窗口与序列级校验钩子
+### 5.2.1 sequence 生成公共配置（v1.18）
 
-v1.16 的约束表属于时间流 `generate_only` 形态。规则和窗口缺省时均为空，不改变
-v1.15 的默认生成路径；任一实际非零配额类的生效表非空时，M1、`estimate_run` 与 M6
-共同启用全流 CP-SAT planner。`--limit` 先在按类配额前缀上截断，完全截掉的类不激活
-planner 或对应 report 面，但零配额类的声明仍接受完整静态校验。
+sequence 是 `generate.form = "sequence"` 的唯一入口；`generate.mode` 在 declared 与 instruction-only
+之间互斥。它要求 generate_only、text、global dedup、inline meta、rejects none、无 `--limit`，
+并静态关闭 classify 与 frame.classify；frame.annotate 可作为 attempt-local 下游。既有 `[stream]` 只属于
+process 摄取，不参与 sequence 时间线。
 
-| 键 | 类型 | 默认 | 说明 |
+#### declared sequence class 与初始世界
+
+~~~toml
+[class.ticket_booking]
+description = "一次订票请求与处理结果"
+
+[class.ticket_booking.generate]
+instruction = "保持路线、日期、乘客、请求和票号前后一致。"
+state_schema_path = "schemas/state.json"
+initial_state_source = "catalog"
+initial_state_catalog_path = "catalogs/ticket-booking.jsonl"
+~~~
+
+| 字段 | 类型 | 默认 | 说明 |
 |---|---|---|---|
-| `generate.sequence_validator` | str | 缺省 | 可选 `module:function`。函数签名为 `def validate_sequence(value: SequenceValidationInput) -> list[str]`；返回空列表表示通过，非空列表表示整条序列作废。钩子收到深拷贝，不得依赖工具隔离其同权限执行。 |
-| `generate.stream.rules` | array table | `[]` | 全局有限迹规则表；每行 `template` 必填，按模板使用 `frame_class` 或 `source` / `target`，可选 `count`、半开秒区间 `time_s = [lo, hi]` 与 typed `correlation`。 |
-| `generate.stream.windows` | array table | `[]` | 全局帧类日历窗口表；每个 `frame_class` 最多一行，`of_day` 为同日半开区间数组，`of_week` 缺省为整周。 |
-| `class.<name>.generate.rules` | array table | `None` | 类规则表的三态覆盖：键缺省继承全局，显式 `rules = []` 清空，非空表整体替换；允许只有类表而没有全局表。 |
-| `class.<name>.generate.windows` | array table | `None` | 与类规则表独立的同样三态覆盖；不与 rules 共享清空或继承状态。 |
+| `class.<name>.description` | str | 必填 | sequence class 的非空描述；name 匹配 `[a-z0-9_]+`。 |
+| `class.<name>.generate.instruction` | str | 必填† | † declared 非零 slot class 必填。 |
+| `class.<name>.generate.state_schema_path` | str | 必填† | † declared 必填；object JSON Schema，文件上限 65536 bytes。 |
+| `class.<name>.generate.initial_state_source` | str | 必填† | `llm` 或 `catalog`。 |
+| `class.<name>.generate.initial_state_catalog_path` | str | 条件必填 | catalog source 必填；每行是完整 `ScenarioSeed`，应用完整配置后按 slot 无放回分配。 |
 
-规则模板闭集为 `existence`、`absence`、`exactly`、`init`、`end`、
-`responded_existence`、`co_existence`、`response`、`precedence`、`succession`、
-`alternate_response`、`chain_response`、`chain_precedence`、`not_co_existence`、
-`not_succession`。存在性三模板要求正整数 `count`，其他模板禁止 `count`；二元模板要求
-不同的 `source` / `target`，且只有二元模板可写 `time_s` 与 `correlation`。同一生效表中
-完全重复的规则声明是 `CONFIG_ERROR`。规则的 occurrence 语义、activation/target 候选
-枚举和正负规则的时间方向见 3.1.4 与 `docs/dev/SPEC-sequence-rules.md`，planner witness
-不是运行期的 i 对 i 配对承诺。
+`ScenarioSeed` 固定包含 initial_state、actors、shared_facts.public、shared_facts.hidden、style 与 time_context。
+declared actors 恰等于该 pattern 全部 role.actor 与 observers 的并集；同一 class 的所有 pattern actor 集相同。
+seed 不得携带 variant、目标违规或分支结果。hidden 只供独立 evaluator 使用。
 
-```toml
-[[generate.stream.rules]]
-template = "init"
+#### frame class
+
+~~~toml
+[frame.class.task_request]
+description = "用户发起任务请求"
+
+[frame.class.task_request.generate]
+instruction = "请求者提出尚未完成的同一请求。"
+schema_path = "schemas/frame-request.json"
+~~~
+
+每个被 role、instruction-only 或 noise 引用的 frame class 都必须声明 description、非空 instruction，并用
+schema_path 或 schema_inline 恰选一个 object JSON Schema。sequence 不接受 string payload。
+
+#### pattern、role、binding 与 gap
+
+~~~toml
+[generate.pattern.booking_success]
+sequence_class = "ticket_booking"
+description = "请求者提交订票需求，系统确认受理并在允许时间内给出出票结果。"
+order = ["request", "acknowledge", "confirm"]
+max_span_s = 1800
+
+[[generate.pattern.booking_success.roles]]
+name = "request"
 frame_class = "task_request"
+actor = "requester"
+read_roots = ["/public", "/request", "/actors/requester"]
+write_roots = ["/request", "/actors/system/knowledge"]
+publish_roots = ["/request/id", "/request/status"]
+observers = ["requester", "system"]
+state_instruction = "创建 pending 请求。"
+pre_state_schema_path = "schemas/pre-request.json"
+payload_bindings = [
+  { payload_path = "/request_id", state_phase = "after", state_path = "/request/id" }
+]
 
-[[generate.stream.rules]]
-template = "chain_response"
-source = "task_request"
-target = "confirmation"
-time_s = [1.2, 4.8]
-correlation = { operator = "equal", source_field = "subject_id", target_field = "subject_id" }
+[[generate.pattern.booking_success.roles]]
+name = "acknowledge"
+frame_class = "acknowledgement"
+actor = "system"
+read_roots = ["/request", "/actors/system"]
+write_roots = ["/request", "/audit"]
+publish_roots = ["/request/id", "/request/acknowledged"]
+observers = ["requester", "system"]
+state_instruction = "确认已接收请求，不得声称已经出票。"
+payload_bindings = [
+  { payload_path = "/request_id", state_phase = "after", state_path = "/request/id" }
+]
 
-[[generate.stream.windows]]
-frame_class = "task_request"
-of_day = [["08:00", "11:00"], ["14:00:00", "17:00:00.000001"]]
-of_week = ["mon", "tue", "wed", "thu", "fri"]
-
-[generate]
-sequence_validator = "hooks:validate_sequence"
-
-[[class.ticket_booking.generate.rules]]
-template = "exactly"
+[[generate.pattern.booking_success.roles]]
+name = "confirm"
 frame_class = "confirmation"
+actor = "system"
+read_roots = ["/request", "/ticket", "/actors/system"]
+write_roots = ["/request", "/ticket", "/audit", "/sla"]
+publish_roots = ["/request/id", "/ticket/id", "/request/status"]
+observers = ["requester", "system"]
+state_instruction = "产生与当前分支相符的最终处理结果。"
+payload_bindings = [
+  { payload_path = "/request_id", state_phase = "after", state_path = "/request/id" },
+  { payload_path = "/ticket_id", state_phase = "after", state_path = "/ticket/id" }
+]
+
+[[generate.pattern.booking_success.gaps]]
+name = "request_to_acknowledge"
+before = "request"
+after = "acknowledge"
+min_gap_s = 0
+max_gap_s = 120
+
+[[generate.pattern.booking_success.gaps]]
+name = "acknowledge_to_confirm"
+before = "acknowledge"
+after = "confirm"
+min_gap_s = 30
+max_gap_s = 1200
+~~~
+
+| 面 | 约束 |
+|---|---|
+| pattern | description 非空；role name 唯一；order 恰排列全部 role；max_span_s 必填且大于零，闭区间。 |
+| adjacent gap | order 中每个相邻 pair 恰有一条具名 gap，max_gap_s 必填；min_gap_s 缺省零。 |
+| extra gap | 只允许沿 order 正向的唯一非相邻 pair。秒值最多六位小数并无损转整数微秒，边界闭合。 |
+| roots | RFC 6901 token 前缀；同一列表内禁止祖先/后代冗余，read/write/publish 列表之间可相交。 |
+| patch | 只允许 test/add/remove/replace，至少一个 test 且 test 连续位于写操作前；test 落 read roots，写操作落 write roots。 |
+| publish | publish roots 在事件后存在；observers 必须来自 seed actors。 |
+| binding | state_path 同时被当前 role 的 read 与 publish roots 覆盖；payload_path 禁止根路径、重复及任意祖先/后代冲突。binding 的精确 path/value 进入 renderer prompt；LLM 按完整 Draft 2020-12 frame Schema 返回完整 object，系统在深拷贝上按声明序以 RFC 6902 `add` 实例语义机械覆盖，再以同一完整 Schema 复验；不改写 Schema。 |
+| calendar | role 可选引用一个命名 `calendar_window`。 |
+| counterexample eligibility | missing 目标 frame class 在 pattern 内唯一；reordered 的目标 role 相邻且 frame class 不同。 |
+
+#### counterfactual set
+
+~~~toml
+[[generate.counterfactual_sets]]
+name = "booking_success_training"
+pattern = "booking_success"
+count = 2
+
+[[generate.counterfactual_sets.variants]]
+name = "positive"
+kind = "positive"
+outcome_schema_path = "schemas/outcome-positive.json"
+
+[[generate.counterfactual_sets.variants]]
+name = "missing_acknowledgement"
+kind = "missing"
+target_role = "acknowledge"
+outcome_schema_path = "schemas/outcome-missing.json"
+
+[[generate.counterfactual_sets.variants]]
+name = "confirmation_before_acknowledgement"
+kind = "reordered"
+target_before = "acknowledge"
+target_after = "confirm"
+outcome_schema_path = "schemas/outcome-reordered.json"
+
+[[generate.counterfactual_sets.variants]]
+name = "confirmation_timeout"
+kind = "interval_exceeded"
+target_gap = "acknowledge_to_confirm"
+min_excess_s = 1
+max_excess_s = 600
+outcome_schema_path = "schemas/outcome-timeout.json"
+~~~
+
+count 是精确 counterfactual set 数。每组至少一个 variant；variant name 与预期违规签名唯一，每个 variant
+都有 outcome Schema。positive 可缺省，但 baseline 始终生成和判定。missing、reordered、
+interval_exceeded 分别只允许 `target_role`、相邻 `target_before/target_after`、或 `target_gap` 加
+闭区间 excess。编译期必须证明目标变换与所有非目标 gap、max span、日历约束可同时满足。
+
+#### instruction-only
+
+~~~toml
+[[generate.instruction_only]]
+name = "open_booking"
+sequence_class = "ticket_booking"
 count = 1
+len_range = [3, 6]
+instruction = "生成一次完整、自然、状态连续的订票交互。"
+state_schema_path = "schemas/state.json"
+~~~
 
-[[class.smart_home.generate.windows]]
-frame_class = "task_request"
-of_day = [["09:00", "18:00"]]
-```
+name 唯一，sequence_class 有效，count 是精确序列数；len_range 两端位于 1..64。state Schema 可缺省为
+只要求 object 的固定 Schema。instruction-only 禁止 pattern、counterfactual set、role permission、outcome
+Schema 与 expected violation；每 attempt 调 ScenarioSeedGenerator，不支持 catalog。
 
-`time_s = [lo, hi]` 的实际语义是半开 `[lo, hi)` 秒，端点必须可无损量化为微秒且满足
-`1us <= lo < hi`；有序模板使用 target 减 source，`responded_existence`、`co_existence`
-与 `not_co_existence` 使用绝对时间差。联合路径把 `frame_gap_s` 量化为
-`ceil(lo * 1e6)` 到 `floor(hi * 1e6)` 的整数区间，空区间是配置错误；显式链区间必须与
-相邻 replay guard `[1us, stream.gap_s]` 相交。
+#### timeline、calendar 与 noise
 
-`correlation` 只接受 `operator = "equal"`。字段必须位于两侧结构化生成 Schema 的顶层
-`properties` 与 `required`，两侧 `type` 关键字字面相等，且不能是 `time_fields` 绑定
-字段。运行期先按 JSON 类型敏感的 canonical bytes 比较，再按 `time_s` 过滤；对象键序
-不影响相等，数组顺序影响相等，`true`、`1`、`1.0` 不视为同值。纯文本帧不能参与
-correlation。
+~~~toml
+[generate.timeline]
+timestamp_start = "2026-01-05T09:00:00+08:00"
+event_gap_s = [5, 60]
+primary_sessions = 7
+crossed_primary_sessions = 1
+session_max_events = 16
+session_max_span_s = 3600
+session_gap_s = 3600
+noise_events = 2
+duplicate_sequences = 1
 
-窗口的 `of_day` 只接受 `HH:MM`、`HH:MM:SS`、微秒精度的同日半开区间，不能跨午夜且
-同一行内不得重叠；`of_week` 只能使用 `mon` 到 `sun`，不能重复，省略即整周。所有
-窗口以 `ts_start` 的固定 offset 解释，naive `ts_start` 按 UTC，不使用 IANA 时区或 DST。
+[generate.calendar_window.service_hours]
+utc_offset = "+08:00"
+days = ["mon", "tue", "wed", "thu", "fri"]
+intervals = [["08:00:00", "12:00:00"], ["13:00:00", "18:00:00"]]
 
-M1 对每个类、生效 tier、`len_range` 的每个候选长度执行局部潜在可满足性检查，并对
-实际配额前缀执行完整问题检查。planner 使用 OR-Tools `9.15.6755`，CP-SAT 单线程、
-固定 31-bit seed、`max_deterministic_time = 10.0`，模型 proto 超过 250,000 项直接报错；
-无 noise objective 时接受 `FEASIBLE` / `OPTIMAL`，有 noise objective 时必须 `OPTIMAL`。
-`INFEASIBLE` 或 `UNKNOWN` 是 `CONFIG_ERROR`，`MODEL_INVALID` 是 `InternalError`，不做
-运行期重抽、fallback 或重规划。
+[generate.noise]
+frame_class = "noise"
+instruction = "生成与任何任务无关、没有可执行诉求的一条自然输入。"
+~~~
 
-`generate.sequence_validator` 的 hook 异常按违规处理；日志只允许引用、异常类型和违规
-数量。M6 的验证顺序为 realize Schema → `generate.sample_validator` → declarative
-correlation/time → sequence hook → sequence similarity。报告只在实际非零配额类的生效面
-加入 `rules` / validator 计数与 `windows.calendar_days_spanned`，规则、窗口、hook 返回
-文本和 planner 细节永不写入 artifact、truth、主输出或 report。
-
-### 5.2.2 v1.17 场景规划与精确交付配置面（破坏性修订）
-
-v1.17 对时间流生成形态的配置面做**破坏性修订**（不保留兼容层、不写 migration、不接受旧键别名——仓库铁律）。以下十项 v1.16 及更早的键自 v1.17 起为**定向 CONFIG_ERROR**（错误只告诉用户新的唯一表达，不读取旧值、不转换；机制 = v1.11 `use_vision` 的原始节探针）：
-
-| 删除键 | 新表达 |
-|---|---|
-| `[generate].sequences` | `[[generate.stream.quotas]]` |
-| `[class.<name>.generate].sequences` | `[[generate.stream.quotas]]` |
-| `[generate.stream].sessions` | `[generate.stream].crossed_sessions`；总 session 自动推导 |
-| `[generate.stream].ts_start` | `[generate.stream.schedule].start/end` |
-| `[generate.stream].noise_instruction` | `[[generate.stream.noise]]` |
-| `[[generate.stream.rules]]` | `[[generate.stream.frame_rules]]` |
-| `[[generate.stream.windows]]` | `[[generate.stream.frame_windows]]` |
-| `[[class.<name>.generate.rules]]` | `[[class.<name>.generate.frame_rules]]` |
-| `[[class.<name>.generate.windows]]` | `[[class.<name>.generate.frame_windows]]` |
-| hook 的 `module:function` 引用 | `path.py:function` |
-
-**`[generate.stream]` v1.17 键面**（与 5.2 主表 v1.13 行并读——`sessions` / `ts_start` / `noise_instruction` 三行废止；`enabled` 沿用 time-stream 形态门）：
-
-| 字段 | 类型 | 默认 | 约束与语义 |
-|---|---|---:|---|
-| `crossed_sessions` | int | 0 | `0 ≤ value ≤ floor(target_sequences / 2)`；session 数恒为 `target_sequences − value`（primary sessions = N − D、single-owner sessions = N − 2D、crossed sessions = D——配置语义而非 report 推测）；duplicates 另增流尾 session，不参与上述计数 |
-| `noise_ratio` | float | 0.0 | `[0,1)`；target noise = `round(ratio × planned_task_frames)`（`planned_task_frames` = 全部 slot 的 `length_target` 之和，建模前常数；ROUND_HALF_EVEN、planner 整数量化，3.6.5）——自 v1.17 起是**精确交付目标**（structured noise 在有限预算内补足） |
-| `duplicates` | int | 0 | `0 ≤ value ≤ target_sequences`；流尾原样重发，source 与时间布局在 planner 前冻结、不消耗 LLM；source slot 未交付 ⇒ 省略该 duplicate 并计 shortfall，不改选另一 source |
-| `frame_gap_s` | `[number, number]` | `[5, 60]` | 起点间隔闭区间；微秒量化规则沿用 v1.16（`Decimal(str(·))` 转整数微秒闭区间） |
-| `max_attempts_per_slot` | int | 3 | `≥ 1`；每个 sequence slot 与 noise slot 的独立交付预算；载体为 `GenerateStreamConfig.max_attempts_per_slot`，仅 M6 delivery 消费、不进入 `ScenarioConfig` |
-
-**`[generate.stream.schedule]` 有限日程**（time-stream 形态必填节，删除 v1.16 `_horizon` 的每 session 一周递推——没有第二个隐式时间上界）：
-
-| 字段 | 类型 | 默认 | 约束与语义 |
-|---|---|---|---|
-| `start` | ISO-8601 datetime | 必填 | 必须显式带 `Z` 或 numeric offset |
-| `end` | ISO-8601 datetime | 必填 | 与 start 使用相同 offset，且 `end > start` |
-| `exclude_dates` | local date array | `[]` | 排除 schedule 内对应本地自然日；重复值报错；落在 schedule 本地日范围之外的条目是定向 CONFIG_ERROR（fail-fast，不静默忽略） |
-
-schedule 是半开区间 `[start, end)`：所有 point timestamp 满足 `start ≤ ts < end`，所有 interval 满足 `start ≤ interval.start < interval.end ≤ end`；排除日上不能放 primary、noise 或 duplicate（point start 不得落在排除日，duration interval 不得与排除日的本地日界区间相交；sequence 跨午夜时其后续 frame 仍逐帧执行该规则）。
-
-**`[[generate.stream.quotas]]` 成功交付 quota**：每张表必须有自然名称；quota 中的 class 必须存在于 `classify.classes`；多张 quota 可引用同一个 sequence class——它们约束同一批 occurrence，**不相加、不覆盖**（数学兼容时同时满足，冲突时 assumption core 同时点名两张表）；未被任何 quota 提及的 sequence class target 为 0；noise-only frame class 不需要 quota。两种互斥形态：
-
-| 字段 | 适用形态 | 约束与语义 |
+| 字段 | 类型 | 约束 |
 |---|---|---|
-| `name` | 两者 | `[a-z0-9_]+`，全表唯一；错误、assumption 与 report 都用该名称 |
-| `period` | 两者 | `day` / `week` / `schedule`。展开规则：`day` 对 schedule 相交且未排除、`of_week` 命中的每个 local date 各应用一次；`week` 对每个 ISO Monday week 各一次（只统计该周 `of_week` 命中的合法日，排除日不取消整周）；`schedule` 对完整 schedule 应用一次。若某个展开 bucket 没有合法日期但 target > 0，该 quota 直接不可满足 |
-| `of_week` | 两者 | period bucket 内允许计数的 weekday；缺省为周一至周日 |
-| `counts` | counts 形态 | 非空 `{sequence_class = integer ≥ 0}`；与 total/weights/allocation 互斥 |
-| `total` | weights 形态 | integer ≥ 1；每个 period bucket 的总交付数 |
-| `weights` | weights 形态 | 至少两个 class 的正整数；与 counts 互斥；先除以全部 weight 的最大公约数得最简整数比（**minimum exact cohort = 最简整数比之和**） |
-| `allocation` | weights 形态 | `exact` 或 `largest_remainder`，必填。`exact` 要求 `total` 是 cohort 的整数倍，否则 M1 同轮报告归一化权重、cohort、小于 total 的最近正数可精确 total（不存在为 null）与大于 total 的最近可精确 total；`largest_remainder` 复用 `apportion_tiers` 的纯整数最大余额算法（零浮点、零 rng，平票按 quota 表内 class 声明顺序），report 写 expected count、realized ratio 与 integer deviation |
+| `timestamp_start` | offset datetime | 必填；不取墙钟。 |
+| `event_gap_s` | closed seconds range | instruction-only 相邻位置、noise 与 replay 的铺设间隔；不约束 declared role gap。 |
+| `primary_sessions` | int | primary 总数 N、crossed 数 D 时必须等于 N - D。 |
+| `crossed_primary_sessions` | int | 0..floor(N/2)；每个 crossing session 恰有两个不同 set owner。 |
+| `session_max_events` | int | 每个 primary session 的事件容量。 |
+| `session_max_span_s` | seconds | 必填正值；session 的闭区间跨度上限。 |
+| `session_gap_s` | seconds | 相邻 session 的最小间隔。 |
+| `noise_events` | int | 精确 noise slot 数；大于零时 generate.noise 必填。 |
+| `duplicate_sequences` | int | 精确 whole-positive-sequence replay 数；source 无放回，source 不足启动失败。 |
+| calendar window | table | 固定 UTC offset、weekday 闭集、同日半开 intervals；名称唯一。 |
+| noise | table | frame class 有 object Schema，且不得被任何 role 使用；noise 无 owner、state patch 或任务真值。 |
 
-time-stream 形态开启时 quota 表必须至少一张，且全部表编译出的 sequence target 总和 ≥ 1：零表或全零 target 是定向 CONFIG_ERROR（零序列工程只剩 noise 与无源 duplicate，没有可交付内容）。
+instruction-only 强制 crossed 为零、primary_sessions = N、duplicates 为零。每个 declared primary session 恰有
+一或两个不同 counterfactual set owner，同一 set 的 variants 永不共 session；每个 replay 独占尾部 session。
 
-**`[[generate.stream.frame_rules]]` / `[[generate.stream.frame_windows]]`**——v1.16 `rules` / `windows` 表的**更名**（`SequenceRuleSpec` 更名 `FrameRuleSpec`；全局与按类三态整表覆盖语义保留、旧键不别名到新键）。每条 rule / window 新增**必填自然名称** `name`（取代数组序号诊断）；quota、frame rule、frame window 与 sequence rule 的 `name` 共处一个全局唯一域（不能靠配置表路径或数组序号消歧；按类覆盖只改变生效表，不复制或改写自然名称）；resource 不另加配置名称，其 assumption 与诊断键固定为 `resource:<resource-name>`。frame rule 新增标准 interval relation `contains`（要求 source 帧类声明 duration；对每个 target occurrence 存在同序列 source occurrence 使 `source.start < target.start ∧ target.end < source.end`——严格包含，相等边界不通过；point target 的 `target.end == target.start`）。
+#### 固定上限与精确求解
 
-**`[[generate.stream.sequence_rules]]` 跨序列规则**：
+| 对象 | 上限 |
+|---|---:|
+| pattern roles | 32 |
+| variants per set | 8 |
+| instruction-only events | 64 |
+| ScenarioSeed / state or outcome Schema / frame Schema | 65536 bytes |
+| event patch | 16384 canonical JSON bytes |
+| rendered payload | 65536 canonical JSON bytes |
+| instruction | 32768 UTF-8 bytes |
+| `record_units` / `stream_rows` | 500000 |
+| `retained_content_bytes` | 536870912 |
 
-| 字段 | 约束 |
-|---|---|
-| `name` | `[a-z0-9_]+`，全表唯一 |
-| `template` | `precedence`、`response`、`succession`、`not_co_existence` |
-| `source` / `target` | 已由 quota 拥有、target > 0 的 sequence class；两者不同 |
-| `period` | `day`、`week`、`schedule` |
-| `gap_s` | 正向模板可选半开 `[lo, hi)`（`0 ≤ lo < hi`，端点可无损量化为整数微秒）；`not_co_existence` 禁止 |
+`record_units = primary_sequences + primary_events + noise_events + replay_events`；
+`stream_rows = primary_events + noise_events + replay_events`。计数先以 Python integer 检查，再进入 OR-Tools。
+retained bytes 在每个 attempt 的 dedup commit 前按最终 main/stream canonical bytes 精确计费。M11 先从
+最终 item 与 pre-downstream projection 装配 `SequenceRows`，ReplayProjector 再只从 source
+`SequenceRows.primary_stream_rows` 构造全部计划 `ReplayRows`。prospective 值恰等于既有已接受
+累计、当前 set 所有 SequenceRows 与本次 ReplayRows 的和；两者共用 `canonical_delivery_row`，
+每行按 canonical UTF-8 bytes 加一个 JSONL 换行 byte 计。超限 whole-slot rejection，不能裁剪 payload 或 truth。
 
-sequence occurrence 归属其 `sequence_start` 的 local date（跨午夜 sequence 仍只属起始 date 对应的 period）；语义按每个 period bucket 独立执行——`precedence`：每个 target occurrence 至少有一个 source witness（source interval end 早于 target start 且 gap 在声明半开区间内）；`response`：每个 source occurrence 至少有一个更晚的 target witness；`succession`：同时执行 precedence 与 response；`not_co_existence`：同一 bucket 不能同时出现 source 与 target。source witness 可服务多个 target（标准 DECLARE existence 语义）；需要 payload 级一一对应时用 scenario validator，不给 CP 层增加 pairing 配置。
-
-**`[frame.class.<name>.generate]` v1.17 增量**：
-
-| 字段 | 默认 | 约束与语义 |
-|---|---|---|
-| `duration_s` | 缺省（point frame） | 闭区间 `[lo, hi]`，`1e-6 ≤ lo ≤ hi`；量化为 `[ceil(lo × 1e6), floor(hi × 1e6)]`，量化后为空是 CONFIG_ERROR；只允许结构化 frame class。duration 与 sequence length 同用 seeded preference 机制（先按配置区间抽 target，planner 在硬约束不可兼得时最小化绝对 deviation）；artifact timestamp 表示 interval start；声明 duration 的 frame class 必须在 `time_fields` 至少绑定 `end_ts` 或 `duration_s`（不允许生成 artifact 无法观察的隐藏区间） |
-| `resources` | `[]` | 每项 `[a-z0-9_]+`；非空时 `duration_s` 必须在场；所有 resource 名相同的 active interval 进入同一个 CP-SAT `AddNoOverlap`（一个 frame 可同时占用多个 resource；resource interval 延伸计入 session span，replay 切分仍以 point timestamp 的 gap 为准） |
-
-时间字段词表（5.2 绑定子表）新增两词（闭集扩为六值，均 point frame 不得绑定）：`end_ts`（`"string"`——interval end 的 ISO-8601）、`duration_s`（`"number"`——`round((end − start) / 1e6, 6)`）；既有 `ts` / `gap_prev_s` / `gap_next_s` / `elapsed_s` 保留。
-
-**`[[generate.stream.noise]]` 结构化噪音表**（`frame_class` + `weight`，weight 正整数；noise target 按最大余额法分到各 noise class，不消费 RNG）：
-
-- `noise_ratio > 0` 时 noise 表必须非空；`noise_ratio == 0` 时写 noise 表是定向 CONFIG_ERROR。
-- frame_class 必须存在于 `[[frame.classify.classes]]`，并有非空 generate instruction；structured 与 plain-text frame class 都合法（Schema 解析、预算检查和 realization 复用 task frame 路径）。
-- noise frame class 不得出现在任何生效 tier、frame rule、frame window 中；不得声明 duration 或 resources（v1.17 noise 仍是 point occurrence）。
-- task frame 的候选域始终排除 noise 表声明的 frame class（即使该工程没有 tier）；排除后任一 task position 的候选域为空是定向 CONFIG_ERROR。
-- truth：`noise = true`、`frame_class = <实际类名>`、`sequence_class` / `sequence` / `tier_rank` 为 null（6.5）。不新增 `role`、`negative_type` 或第二套 noise Schema。
-
-**hook 引用形态与 `scenario_validator`**：所有 hook 键统一改用 `<python-file>:<attribute-path>`（如 `hooks.py:validate_output`）——相对 python-file 按 project root 解析、绝对路径允许、文件必须是 `.py` 普通文件；M1 用 `importlib.util.spec_from_file_location` 与绝对路径 hash 生成唯一 module name，不修改 `sys.path`、不依赖 cwd、不做自动发现；hook 文件可导入标准库与已安装依赖，多文件扩展应作为正常 Python 包安装。`[generate]` 新增 `scenario_validator = "hooks.py:validate_scenario"`（签名 `fn(value: ScenarioValidationInput) -> list[str]`；accepted 按时间与 slot key 排序、candidate 是当前交付槽位，非空违规只拒绝 candidate 并重试同一 slot——accepted 不回滚不重排；hook exception 与非法返回值都按 candidate violation 处理、WARN once、计入独立失败原因）。`output.validator` / `generate.sample_validator` / `generate.sequence_validator` 的引用形态同步改（签名与回调协议零变化）；M1 解析并冻结 callable（`ResolvedHook` / `ValidationHooks`，4 章），M6 与 schema engine 不再按字符串二次 resolve。M1 对四个 hook 都检查恰当的位置参数数量，并用不含用户数据的 synthetic input 干跑（异常类型与非法返回值在 validate 阶段聚合，不等首条真实 content 才暴露）。
-
-**v1.16 键面联动废止**：5.2.1 节的 `[[generate.stream.rules]]` / `[[generate.stream.windows]]` / `[[class.<name>.generate.rules]]` / `[[class.<name>.generate.windows]]` 四行键名自 v1.17 起按上表更名（规则模板闭集、correlation、`time_s` 与窗口语义本身不变，载体改 `FrameRuleSpec` / `FrameWindowSpec` 并各增必填 `name`）；`generate.sequence_validator` 的引用形态改 `path.py:function`（输入契约零变化）。
+planner 按完整 session 分 block，单 block 最多 4096 primary events。OR-Tools 单 worker、确定性 seed、
+每层 `max_deterministic_time = 10.0`；只解码 OPTIMAL。INFEASIBLE 是配置失败，FEASIBLE/UNKNOWN 是
+runtime budget failure，MODEL_INVALID 是内部错误；无 incumbent、替代求解器或近似 dry-run。
 
 ## 5.3 Rubric 结构（内联或默认包文件，同一 TOML 结构）
 

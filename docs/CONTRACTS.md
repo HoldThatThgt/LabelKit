@@ -2,26 +2,30 @@
 
 **Status: FROZEN.** This document is the single interface contract for parallel implementation of
 M1–M16 + CLI by independent engineers. It is derived from the design spec v1.4 base through the
-v1.16 time-stream sequence-rule revision (`spec/*.md`), which
+v1.18 sequence-generation redesign (`spec/*.md` and
+`docs/dev/SPEC-sequence-generation-redesign.md`), which
 remains the authority for *algorithms and behavior*; this document is the authority for *names,
 signatures, types, defaults, file formats, and prompt text*. Where the spec left a signature or
 format implicit, the decision is frozen here and tagged **[FROZEN HERE]** (all such decisions are
 also listed in §12). Any deviation requires editing this file first.
 
+The v1.18 source is commit `317a885`; the frozen specification SHA-256 is
+`61b5e5db288599c80270b59204985cc63aeb344a8e52867c3aa2c2bacea873ff`.
+
 Ground rules for every implementer:
 
 - Python ≥ 3.11. Deps: `httpx`, `jsonschema`, `datasketch`, `Pillow`, `imagehash`, `json_repair`,
-  `numpy`, stdlib `tomllib`, and — v1.10 (U4, spec §2.6 whitelist revision) — `rich`, CLI-layer
+  `numpy`, `jsonpatch`, stdlib `tomllib`, and — v1.10 (U4, spec §2.6 whitelist revision) — `rich`, CLI-layer
   only: lazily imported inside `labelkit/cli/console.py`, the sole touchpoint (operators/common
-  never import it; M1 probes importability via `find_spec` without importing); v1.16 adds the
+  never import it; M1 probes importability via `find_spec` without importing); v1.18 retains the
   narrow algorithm-library exception `ortools==9.15.6755`, imported only by
-  `labelkit/common/runtime/sequence_planner.py`. Nothing else. OR-Tools is not an application
+  `labelkit/operators/generation/planner.py`. Nothing else. OR-Tools is not an application
   framework, and there is no runtime substitute or version fallback.
 - Code identifiers: English. **Comments and docstrings: Chinese** (the 2026-08-14 code-rule
   remediation — see §12 and spec §1.6). **Everything a user or a machine reads — log lines, error
   messages, CLI output, exception text, report/trace payloads: English.** LLM prompt templates are
   the exception in the other direction: the exact Chinese text given in §10 of this document
-  (copied from the spec verbatim), together with the spec-frozen output data it produces
+  (the contract-level completion of the spec's frozen families), together with the spec-frozen output data it produces
   (`thread_seam` step text, defect-table `detail` strings, packaged rubric criteria), stays
   Chinese verbatim.
 - Do not rename any field, key, event, or error code defined here. Tests assert exact strings.
@@ -36,9 +40,8 @@ Ground rules for every implementer:
   `labelkit.common.runtime.schema_engine` imports the
   common runtime LLM client plus common errors/observability; `labelkit.common.contracts.stage`
   imports runtime/config/observability types under `typing.TYPE_CHECKING` only. Common never imports
-  operators or orchestration. v1.16's sibling common runtime modules `declare`, `temporal`, and
-  `sequence_planner` may import common config/contracts and each other in that direction;
-  M1/M6/M10 call their public surfaces, never a copied solver implementation. Operator modules
+  operators or orchestration. `labelkit.operators.generation` imports only common and its own
+  sibling generation modules; it never imports orchestration. Operator modules
   import common and declared stdlib/third-party
   dependencies, never orchestration and **never each other** — with the sanctioned lazy-import
   exceptions that `labelkit.operators.verify` calls the public repair surface from
@@ -86,10 +89,11 @@ labelkit/
 ├── common/
 │   ├── contracts/
 │   │   ├── types.py                    # Ch.4 shared data types and frame/tree helpers
-│   │   └── stage.py                    # Stage protocol and RunContext
+│   │   ├── stage.py                    # Stage protocol and RunContext
+│   │   └── generation.py               # v1.18 generation program/trace/request/result contracts
 │   ├── errors.py                       # cross-layer error vocabulary, exit codes, ErrorKind
 │   ├── config/
-│   │   ├── __init__.py                 # exports load/default_rubric/ResolvedConfig plus v1.16 rule/window types and effective helpers
+│   │   ├── __init__.py                 # exports load/default_rubric/ResolvedConfig/parse_generation_config only
 │   │   ├── model.py                    # all config dataclasses (M1)
 │   │   ├── loader.py                   # M1 public entry: load / default_rubric re-export, console-mode verdict, ResolvedConfig assembly
 │   │   ├── _collect.py                 # error/warning aggregator and typed table readers (package-private)
@@ -98,14 +102,12 @@ labelkit/
 │   │   ├── _rubrics.py                 # rubric resolution: inline table and packaged default:* selectors (package-private)
 │   │   ├── _classviews.py              # [class.*] / [frame.class.*] whitelist merge into class views (package-private)
 │   │   ├── _constraints.py             # cross-section constraint driver and parse products (package-private)
-│   │   └── _generate_stream_constraints.py # v1.16: v1.13-v1.16 time-stream syntax/schema/local/full-flow planner checks
+│   │   └── generation.py                # v1.18 sequence-generation parsing and typed config carriers
 │   ├── runtime/
 │   │   ├── budget.py                   # v1.11 context-budget primitives + ImageCostCalibrator (§7.17)
-│   │   ├── declare.py                  # v1.16: 15-template evaluator, candidate pairs and CP-SAT helpers (§7.18)
 │   │   ├── llm_client.py               # M9 transport, retry/key pools, concurrency, usage
 │   │   ├── schema_engine.py            # M8 L0-L3 guarantee, repair, schema validation/stats
-│   │   ├── sequence_planner.py         # v1.16: sole joint CP-SAT question/check/sample/layout entry (§7.18)
-│   │   └── temporal.py                 # v1.16: integer-us, fixed-offset calendar and duplicate shift helpers (§7.18)
+│   │   └── credentials.py              # secret materialization for run / validate --probe
 │   ├── observability/
 │   │   ├── obslog.py                   # M12 logs, trace, events, metrics, breaker state
 │   │   └── console_format.py           # v1.10 plain progress/summary line formats (U21) — pure functions, the single source shared by the M11 emitter and the CLI renderer; byte-frozen (re-frozen 2026-08-14 onto the English strings)
@@ -120,7 +122,16 @@ labelkit/
 │   ├── extract.py                      # M15
 │   ├── quality.py                      # M4
 │   ├── generate.py                     # M6
-│   ├── generate_stream.py              # M6 time-stream pure plan/weave/backfill/assembly logic
+│   ├── generation/
+│   │   ├── __init__.py
+│   │   ├── flat.py                     # v1.12 flat generation implementation
+│   │   ├── program.py                  # GenerationProgram compiler
+│   │   ├── planner.py                  # deterministic CP-SAT ScenarioPlan compiler
+│   │   ├── scenario.py                 # ScenarioSeed and per-event scenario loop
+│   │   ├── state.py                    # JSON Patch execution and state evaluation
+│   │   ├── render.py                   # frame/noise rendering
+│   │   ├── evaluate.py                 # pattern/semantic/noise evaluators
+│   │   └── project.py                  # main/stream projection and CrossView reconciliation
 │   ├── annotate.py                     # M5
 │   ├── verify.py                       # M7
 │   └── emitter.py                      # M11
@@ -128,7 +139,7 @@ labelkit/
 │   ├── __init__.py
 │   ├── orchestrator.py                 # M10 batch/stage lifecycle and report aggregation
 │   ├── factory.py                      # operator construction and frozen pipeline order
-│   ├── profile_usage.py                # validate --probe referenced-profile discovery
+│   ├── generation_delivery.py          # v1.18 exact slot delivery and attempt transactions
 │   └── runtime.py                      # runtime object-graph assembly and public run/validate entry
 └── data/rubrics/
     ├── default_text.toml
@@ -170,39 +181,32 @@ in `tests/common/runtime/test_llm_client.py`; stream-ingest coverage belongs in
 (renderer snapshots, keyboard, degradation) and
 `tests/common/observability/test_console_format.py` (byte-frozen golden snapshots of the
 plain line formats — the golden-snapshot layer of the three-layer regression anchor, U24);
-v1.13 time-stream generation coverage belongs in `tests/operators/test_generate_stream.py`
-(planning draws, weaver mechanics, direct assembly, artifact replay equivalence),
-`tests/common/config/test_loader_generate_stream.py` (the M1 constraint matrix, §6.3 rules
-50–61 — v1.14's tier and binding clusters and v1.15's per-class tier cluster land in the same
-file) and
-`tests/integration/test_generate_stream_llm.py` (real-LLM: the DeepSeek endpoint
-for blueprint/realize/per-class annotation and, v1.14, for tiers and time-field back-fill, plus
-z.ai `glm-5.2` cases pinning `prefixItems` and `allOf`/`contains` L0 pass-through). v1.14's
-`apportion_tiers` unit coverage belongs in `tests/common/config/` (it follows the function's
-`model.py` home), while the ordinal mapping and the `--limit` commutativity belong in
-`tests/operators/`. v1.15's per-class tier coverage lands in exactly the SAME five files and
-creates NO new test file (the `EXPECTED_TEST_PY` allowlist is unchanged): `effective_tiers`
-and `ClassView.tiers` beside `apportion_tiers` in `tests/common/config/`, rule 61's three
-sub-clauses and the per-effective-table / union-scope checks in
-`test_loader_generate_stream.py`, mixed-form planning, blueprint subsetting and per-row
-truth/generator agreement in `tests/operators/test_generate_stream.py`, the report's two forms
-and their double key order in `tests/orchestration/test_orchestrator.py`, and one added
-DeepSeek case in `tests/integration/test_generate_stream_llm.py`.
-v1.16 sequence-rule coverage adds `tests/common/runtime/test_declare.py`
-(all 15 templates against a direct finite-word oracle), `tests/common/runtime/test_temporal.py`
-(microseconds/calendar/duplicate shifts), and `tests/common/runtime/test_sequence_planner.py`
-(joint satisfiability, session/cross/noise layout, statuses, model-size cap and determinism).
-Config/hook/schema/budget/generation/orchestration deltas stay with their existing owners:
-`tests/common/config/test_config.py`, `test_loader_generate_stream.py`,
-`tests/common/contracts/test_types.py`, `tests/common/extensions/test_hooks.py`,
-`tests/common/runtime/test_schema_engine.py`, `test_budget.py`,
-`tests/operators/test_generate_stream.py`, `tests/operators/test_ingest.py`,
-`tests/orchestration/test_orchestrator.py`, and the real-endpoint
-`tests/integration/test_generate_stream_llm.py`. No mock LLM transport is introduced.
+v1.18 sequence-generation coverage mirrors its production owners: configuration in
+`tests/common/config/test_generation.py`; frozen carriers in
+`tests/common/contracts/test_generation.py`; pure compiler/planner/scenario/state/render/evaluate/
+project behavior in `tests/operators/generation/`; transactional delivery in
+`tests/orchestration/test_generation_delivery.py`; and real endpoint coverage in
+`tests/integration/test_sequence_generation_llm.py` plus
+`tests/integration/test_sequence_generation_structured_output_llm.py`. The exact pure files are
+`test_program.py`, `test_planner.py`, `test_scenario.py`, `test_state.py`, `test_render.py`,
+`test_evaluate.py`, and `test_project.py`; the CLI golden is
+`tests/cli/goldens/dryrun-sequence-generation.txt`. Integration tests use the
+real DeepSeek and z.ai routes prescribed by the repository guidance; no mock LLM transport is
+introduced. Existing seam coverage remains with `test_config.py`, `test_paths_hooks.py`,
+`test_types.py`, `test_hooks.py`, `test_budget.py`, `test_credentials.py`,
+`test_schema_engine.py`, `test_dedup.py`, `test_quality.py`, `test_annotate.py`,
+`test_verify.py`, `test_emitter.py`, `test_ingest.py`, `test_orchestrator.py`, and the CLI tests.
 A separate compatibility-import test,
 `test_key_pool.py`, or
 `test_stream_ingest.py` is forbidden. The exact file allowlist is normative in
 `docs/dev/SPEC-package-layer-reorganization.md` §6.1.
+
+`tests/cli/test_cli.py` owns both exact production- and test-file manifests. They must match the
+v1.18 tree and files above: every new generation package/test/golden is listed, every deleted
+sequence-generation package/test/golden is absent, and no undeclared compatibility module is
+permitted. The completed gate must demonstrate every v1.18 specification use case, interface and
+error lane at 100%, production function coverage 100%, line coverage at least 85% and branch
+coverage at least 75%; real-LLM tests remain outside the offline mutation/coverage denominator.
 
 ---
 
@@ -215,8 +219,9 @@ M8/M9 under `common.runtime`; M12 under `common.observability`; user hooks under
 `common.extensions`; and the cross-layer error vocabulary at the `common.errors` root. Canonical
 files: errors at `labelkit/common/errors.py`; SchemaEngine/LLMClient at
 `labelkit/common/runtime/schema_engine.py` and `labelkit/common/runtime/llm_client.py`; hooks at
-`labelkit/common/extensions/hooks.py`; v1.16 DECLARE/temporal/joint planning at
-`labelkit/common/runtime/declare.py`, `temporal.py`, and `sequence_planner.py`; obslog at
+`labelkit/common/extensions/hooks.py`; v1.18 generation contracts at
+`labelkit/common/contracts/generation.py`, algorithms at `labelkit/operators/generation/`, and
+exact delivery at `labelkit/orchestration/generation_delivery.py`; obslog at
 `labelkit/common/observability/obslog.py`. Operators
 (M2 ingest, M14 segment, M16 stitch, M3 dedup, M13 classify, M15 extract, M4 quality, M5 annotate,
 M6 generate, M7 verify, M11 emitter) depend only on common, subject solely to the four sanctioned
@@ -240,9 +245,13 @@ flowchart LR
         direction LR
         B1["dedup"] --> B2["classify"] --> B3["quality"] --> B4["annotate"] --> B5["verify"] --> B6["emit"]
     end
-    subgraph GENONLY["generate_only mode (v1.4) — no M2; GenerateStage.generate_all() produces all Records up front, split by run.batch_size"]
+    subgraph GENONLY["generate_only flat mode (v1.4) — no M2; GenerateStage.generate_all() produces all Records up front, split by run.batch_size"]
         direction LR
         C0["generate_all()"] --> C1["dedup"] --> C2["classify"] --> C3["quality"] --> C4["annotate"] --> C5["verify"] --> C6["emit"]
+    end
+    subgraph SEQUENCE["generate_only sequence mode (v1.18) — orchestration owns exact delivery; no ordinary Stage re-flow"]
+        direction LR
+        D0["GenerationProgram"] --> D1["ScenarioPlan"] --> D2["scenario/state/render/evaluate"] --> D3["attempt-local dedup/quality/annotate/verify"] --> D4["CrossView"] --> D5["manifest-last commit"]
     end
     A7 -.->|"sub-batch"| B1
 ```
@@ -412,22 +421,6 @@ class Classification:                      # v1.7: M13 classify verdict (spec 3.
                                            # single assignment: always one element)
     source: Literal["llm", "fallback", "inherited"]
     detail: Mapping                        # reason / sc stats / fallback trace (kind, message)
-
-
-@dataclass(frozen=True)
-class SequenceValidationFrame:             # v1.16: one frame exposed to the sequence hook
-    position: int                           # zero-based position in the task sequence
-    frame_class: str                        # planner-frozen frame class
-    payload: object                         # JSON-compatible DEEP COPY; user mutation cannot
-                                            # reach the internal generated payload
-
-
-@dataclass(frozen=True)
-class SequenceValidationInput:             # v1.16: generate.sequence_validator input
-    sequence_class: str                     # declared sequence class name
-    tier_rank: int | None                   # effective in-class tier rank; None without tiers
-    frames: tuple[SequenceValidationFrame, ...]
-                                            # declaration/position order, one entry per task frame
 
 
 @dataclass(frozen=True)
@@ -734,6 +727,21 @@ class InternalError(LabelKitError):
     kind='internal_error'; stack goes to stderr log at debug level."""
 
 
+class DeliveryError(LabelKitError):
+    """v1.18 sequence exact-delivery exhaustion. CLI exit code 1.
+
+    The message contains only ``kind``, ``slot_key`` and ``attempts_used``; generated state,
+    payload, prompt and provider text are never embedded.
+    """
+    def __init__(self, kind: str, slot_key: str, attempts_used: int):
+        self.kind = kind
+        self.slot_key = slot_key
+        self.attempts_used = attempts_used
+        super().__init__(
+            f"{kind}: slot={slot_key} attempts={attempts_used}"
+        )
+
+
 class CircuitBreakerTripped(LabelKitError):
     """Raised by LLMClient once MetricsSink.circuit_broken is set; Orchestrator converts it
     to a fatal run end (exit 4). [FROZEN HERE]"""
@@ -741,7 +749,7 @@ class CircuitBreakerTripped(LabelKitError):
 
 # ── CLI exit codes (spec §2.4) ─────────────────────────────────────────────
 EXIT_OK = 0              # run completed (rejects allowed)
-EXIT_STRICT = 1          # completed but --strict violated (rejects exist), or report write failed
+EXIT_STRICT = 1          # strict/rejects, report write failure, or v1.18 delivery exhaustion
 EXIT_CONFIG = 2          # ConfigError
 EXIT_INPUT = 3           # InputError (process mode only; generate_only never returns 3)
 EXIT_FATAL = 4           # provider auth failure / circuit breaker / output path unwritable
@@ -796,8 +804,42 @@ class ErrorKind(str, enum.Enum):
                                                              # output hit max_output_tokens →
                                                              # failed → rejects own bucket; never
                                                              # repaired, never feeds the breaker
+    GENERATION_CONFIG_INVALID = "generation_config_invalid"  # v1.18 M1/compiler → ConfigError
+    GENERATION_PLAN_INFEASIBLE = "generation_plan_infeasible"# v1.18 CP-SAT INFEASIBLE → exit 2
+    GENERATION_PLAN_BUDGET = "generation_plan_budget"        # FEASIBLE/UNKNOWN → exit 4
+    GENERATION_PLAN_INTERNAL = "generation_plan_internal"    # MODEL_INVALID/invariant → exit 4
+    GENERATION_DEDUP_TRANSACTION = "generation_dedup_transaction"
+                                                             # invalid/stale group token → exit 4
+    GENERATION_DOWNSTREAM_CONTRACT = "generation_downstream_contract"
+                                                             # attempt protocol breach → exit 4
+    POST_VALIDATOR_INVALID = "post_validator_invalid"        # current slot attempt rejection
+    POST_VALIDATOR_EXCEPTION = "post_validator_exception"    # current slot attempt rejection
+    SEQUENCE_DELIVERY_EXHAUSTED = "sequence_delivery_exhausted"
+                                                             # DeliveryError → exit 1
+    SEQUENCE_PROJECTION_MISMATCH = "sequence_projection_mismatch"
+                                                             # current attempt; exhaustion → exit 1
+    GENERATION_COMMIT_IO = "generation_commit_io"            # success artifact commit → exit 4
+    GENERATION_FAILED_REPORT_IO = "generation_failed_report_io"
+                                                             # preserves a primary error code
     INTERNAL_ERROR = "internal_error"                        # any unexpected exception
 ```
+
+v1.18 run-level mapping is exact:
+
+| Kind | Raised/recorded as | Exit |
+|---|---|---:|
+| `generation_config_invalid` | `ConfigError` | 2 |
+| `generation_plan_infeasible` | `ConfigError` | 2 |
+| `generation_plan_budget` | `InternalError` | 4 |
+| `generation_plan_internal` | `InternalError` | 4 |
+| `generation_dedup_transaction` | `InternalError` | 4 |
+| `generation_downstream_contract` | `InternalError` | 4 |
+| `post_validator_invalid`, `post_validator_exception` | current slot rejection; exhaustion becomes `DeliveryError` | 1 on exhaustion |
+| `sequence_delivery_exhausted` | `DeliveryError` | 1 |
+| `sequence_projection_mismatch` | current slot rejection; exhaustion becomes `DeliveryError` | 1 on exhaustion |
+| provider fatal or circuit trip | existing provider fatal | 4 |
+| `generation_commit_io` | `LabelKitError` | 4 |
+| `generation_failed_report_io` | preserve primary error; without one, `LabelKitError` | primary exit, otherwise 4 |
 
 Exception → exit-code mapping is implemented **only** in `labelkit/cli/main.py` (§7.12). No module calls
 `sys.exit`.
@@ -994,17 +1036,12 @@ class LLMProfile:
                                                   # escalation ladder may probe up to max_image_px
     price_per_mtok_in: float | None = None
     price_per_mtok_out: float | None = None
-    api_key: str = field(default="", repr=False)  # resolved from env by M1; NEVER logged
-                                                  # [FROZEN HERE]
     api_key_envs: tuple[str, ...] = ()            # v1.6 key pool (spec 3.9.3): TOML accepts
                                                   # exactly one of api_key_env/api_key_envs;
                                                   # M1 normalizes BOTH forms into this tuple
                                                   # (scalar → 1-tuple) — always non-empty after
-                                                  # load; api_key_env mirrors element 0
-    api_keys: tuple[str, ...] = field(default=(), repr=False)
-                                                  # v1.6: resolved values aligned with
-                                                  # api_key_envs; NEVER logged; api_key mirrors
-                                                  # element 0 for single-key readers
+                                                  # load; api_key_env mirrors element 0.
+                                                  # Secret values exist only in RuntimeCredentials.
 
 
 @dataclass(frozen=True)
@@ -1023,10 +1060,9 @@ class EmbeddingProfile:
                                                   # budget = context_window − margin (no output
                                                   # reservation; §7.17 embed_budget)
     dims: int | None = None                       # if set, embed() validates returned dims
-    api_key: str = field(default="", repr=False)  # resolved from env by M1
     api_key_envs: tuple[str, ...] = ()            # v1.6 key pool — same normalization as
-                                                  # LLMProfile.api_key_envs
-    api_keys: tuple[str, ...] = field(default=(), repr=False)   # v1.6, NEVER logged
+                                                  # LLMProfile.api_key_envs; secret values are
+                                                  # materialized only into RuntimeCredentials
 
 
 # ── project.toml side ──────────────────────────────────────────────────────
@@ -1103,208 +1139,188 @@ class GenerateStyle:
 
 @dataclass(frozen=True)
 class GenerateConfig:
+    """M6 common/flat surface. Sequence-only state lives in SequenceGenerationConfig."""
+
     enabled: bool = False
+    form: Literal["flat", "sequence"] = "flat"
     llms: tuple[str, ...] = ("default",)
-    instruction: str = ""                         # required iff enabled
+    instruction: str = ""
     mixture: Literal["round_robin", "weighted"] = "round_robin"
-    weights: tuple[float, ...] = ()               # required iff mixture="weighted"; len == len(llms)
+    weights: tuple[float, ...] = ()
     styles: tuple[GenerateStyle, ...] = ()
     num_per_record: int = 2
     seeds_per_call: int = 3
     num_per_call: int = 4
-    seed_min_score: float | None = None           # None = auto (quality.threshold, else batch median)
+    seed_min_score: float | None = None
     temperature: float = 0.9
-    sample_validator: str | None = None           # v1.5 plan-A hook: "module:function",
-                                                  # fn(text) -> list[str]; per-sample filter
-                                                  # BEFORE the similarity filter (spec 3.6.2)
-    sequence_validator: str | None = None         # v1.16: "module:function";
-                                                  # fn(SequenceValidationInput) -> list[str];
-                                                  # once per realized sequence AFTER declarative
-                                                  # correlation/time and BEFORE sequence similarity
-    seed_examples: tuple[str, ...] = ()           # generate_only seed-pool form only
-    standalone_count: int | None = None           # generate_only seedless form only; mutually
-                                                  # exclusive with seed_examples
-    sequences: int = 0                            # v1.13 time-stream form: this class's sequence
-                                                  # ATTEMPT quota (global default here, overridden
-                                                  # by [class.<name>.generate].sequences); 0 = the
-                                                  # class does not take part in generation
-    len_range: tuple[int, int] = (3, 6)           # v1.13 time-stream form: uniform sampling range
-                                                  # of a sequence's step count (1 <= lo <= hi;
-                                                  # per-class override as usual)
+    sample_validator: str | None = None
+    seed_examples: tuple[str, ...] = ()
+    standalone_count: int | None = None
 
 
 @dataclass(frozen=True)
-class CorrelationSpec:                            # v1.16 typed inline correlation table
-    operator: Literal["equal"] = "equal"          # the only legal operator
-    source_field: str = ""                        # source frame's top-level required property
-    target_field: str = ""                        # target frame's top-level required property
+class SequenceClassGenerationConfig:
+    """一个 declared sequence class 的 v1.18 生成专用配置。"""
+
+    instruction: str
+    state_schema: Mapping[str, object]
+    initial_state_source: Literal["llm", "catalog"]
+    initial_state_catalog_path: str | None
+    initial_state_catalog: tuple[Mapping[str, object], ...]
 
 
 @dataclass(frozen=True)
-class SequenceRuleSpec:                           # v1.16 [[*.generate.rules]] row
-    template: str                                 # one of the 15 frozen DECLARE template names
-    frame_class: str | None = None                # unary templates only
-    source: str | None = None                     # binary templates only
-    target: str | None = None                     # binary templates only
-    count: int | None = None                      # required only for existence/absence/exactly
-    time_s: tuple[float, float] | None = None      # half-open seconds [lo, hi), exact integer-us
-    correlation: CorrelationSpec | None = None    # optional type-sensitive equality condition
+class PayloadBindingSpec:
+    """一个从状态快照到渲染 payload 的机械 binding。"""
+
+    payload_path: str
+    state_phase: Literal["before", "after"]
+    state_path: str
 
 
 @dataclass(frozen=True)
-class SequenceWindowSpec:                         # v1.16 [[*.generate.windows]] row
-    frame_class: str                              # every occurrence of this class is constrained
-    of_day: tuple[tuple[str, str], ...]           # non-empty same-day half-open wall-clock windows
-    of_week: tuple[str, ...] = ("mon", "tue", "wed", "thu", "fri", "sat", "sun")
-                                                  # declaration-order tuple; no duplicates
+class RoleSpec:
+    """declared sequence pattern 中恰好出现一次的业务 role。"""
+
+    name: str
+    frame_class: str
+    actor: str
+    read_roots: tuple[str, ...]
+    write_roots: tuple[str, ...]
+    publish_roots: tuple[str, ...]
+    observers: tuple[str, ...]
+    state_instruction: str
+    pre_state_schema: Mapping[str, object] | None
+    payload_bindings: tuple[PayloadBindingSpec, ...]
+    calendar_window: str | None
 
 
 @dataclass(frozen=True)
-class TierSpec:                                   # v1.14 (spec 5.2 [[generate.stream.tiers]]):
-                                                  # ONE frame-class composition tier. A tier IS its
-                                                  # frame-class composition set — it carries NO
-                                                  # quality instruction and does not govern
-                                                  # intra-frame semantics (裁决·档位即帧类构成).
-                                                  # v1.15: the SAME row shape also backs the
-                                                  # per-class table [[class.<name>.generate.tiers]]
-                                                  # (ClassView.tiers) — the comments below are
-                                                  # therefore scoped to ONE EFFECTIVE TABLE
-    tier_rank: int                                # the tier's IDENTITY (there is deliberately no
-                                                  # `name` key): positive, unique in the table, and
-                                                  # EVERY EFFECTIVE TABLE must cover 1..N
-                                                  # CONTIGUOUSLY (N = THAT table's length, which
-                                                  # may differ per class — v1.15 裁决·rank 类内身份;
-                                                  # the same rank in two classes carries NO tool
-                                                  # semantics). Also the deterministic tiebreak
-                                                  # key for apportionment and the ordering of the
-                                                  # in-class ordinal blocks. The TOOL ASSIGNS NO
-                                                  # quality direction to rank order (that is the
-                                                  # user's, 裁决·tier_rank 即档位身份)
-    weight: int                                   # quota weight, integer >= 1; a class's quota is
-                                                  # split across ITS EFFECTIVE table's tiers by
-                                                  # INTEGER-DOMAIN largest remainder, zero rng
-                                                  # (apportion_tiers below)
-    frame_classes: tuple[str, ...]                # the composition: this tier's sequences use
-                                                  # EXACTLY these frame classes (enum gives "⊆",
-                                                  # per-class `contains` gives "⊇"). Non-empty, no
-                                                  # dupes inside a tier, every name in the frame
-                                                  # class table, and the composition SETS are
-                                                  # pairwise distinct WITHIN ONE TABLE (M1, §6.3;
-                                                  # v1.15 narrows the scope to a single table —
-                                                  # identical compositions ACROSS classes are legal)
+class GapSpec:
+    """两个正向 role 之间的一条闭区间整数微秒约束。"""
 
-
-def apportion_tiers(sequences: int, tiers: Sequence[TierSpec]) -> tuple[int, ...]:
-    """v1.14 (裁决·零抽签配分) — a TierSpec companion PURE function living in `model.py`, not in
-    operators: M1's per-nonzero-quota-pair constraint and M6's planning phase share ONE
-    implementation, and the layering rule forbids common → operators (M6 imports it backwards,
-    which is the legal direction). [FROZEN HERE]
-
-    Integer-domain largest remainder, arithmetic FROZEN — base = `(sequences * weight) //
-    Σweight`, remainder key = `(sequences * weight) % Σweight`, then +1 per tier by descending
-    remainder with ties broken by ASCENDING tier_rank until the parts sum to `sequences`. NO
-    floating-point intermediate is permitted: the tie verdict feeds the in-class ordinal blocks →
-    truth → artifact bytes → member ids, so it is a frozen surface and may not hang off
-    float comparison semantics. Consumes ZERO rng — the frozen draw-order table (§7.5) is
-    UNCHANGED, apportionment slots in between quota expansion ① and length drawing ② as a
-    zero-consumption step. Callers pass tiers in tier_rank ascending order (which is how both
-    `GenerateStreamConfig.tiers` and `ClassView.tiers` store them) and get parts back in the same
-    order; an empty tier table returns ().
-
-    v1.15: the `tiers` argument is that class's EFFECTIVE table (`effective_tiers` below) —
-    the SIGNATURE AND BODY ARE UNCHANGED, only the call sites pass a different table. "The table
-    covers 1..N contiguously" therefore reads "every effective table does, each with its own N",
-    and apportionment still consumes zero rng."""
-
-
-def effective_tiers(class_tiers: tuple[TierSpec, ...] | None,
-                    global_tiers: tuple[TierSpec, ...]) -> tuple[TierSpec, ...]:
-    """v1.15 (裁决·表级原子覆盖 + 裁决·全局表为锚) — the SINGLE lookup point for a sequence
-    class's EFFECTIVE tier table [FROZEN HERE]. A class that declared its own table uses that
-    WHOLE table (never a row-level merge — a row merge would let rank identity drift across
-    tables); `None` falls back to the global one:
-
-        return global_tiers if class_tiers is None else class_tiers
-
-    Lives in `model.py` beside `apportion_tiers` and for the same layering reason: M1's
-    constraint cluster, M6's planning phase AND M10's report assembly all share ONE
-    implementation, and common may not import operators (M6/M10 import it backwards, the legal
-    direction). Pure, zero rng, zero IO.
-
-    Because a per-class table REQUIRES the global one to be present (§6.3 rule 61 sub-clause 2),
-    the tier FACE is present iff `global_tiers` is non-empty and every participating class is
-    therefore guaranteed a non-empty effective table — which is exactly why every v1.14
-    presence predicate (`generator.tier_rank`, `truth.tier_rank`, the report sub-block, the
-    noise-slot predicate) is UNCHANGED in v1.15. An empty tuple argument is returned as-is; the
-    display of a declared-but-empty per-class table is M1's job, not this function's."""
-
-
-def effective_rules(class_rules: tuple[SequenceRuleSpec, ...] | None,
-                    global_rules: tuple[SequenceRuleSpec, ...]) -> tuple[SequenceRuleSpec, ...]:
-    """v1.16 SINGLE lookup point for a class's effective rules table [FROZEN HERE].
-
-    `None` means inherit the global WHOLE table; `()` means explicitly clear it; a non-empty
-    tuple atomically replaces it. There is NO global anchor requirement and NO row merge. Pure,
-    zero rng, zero IO. M1, M6 and M10 must call this helper rather than restating the three-state
-    rule."""
-
-
-def effective_windows(class_windows: tuple[SequenceWindowSpec, ...] | None,
-                      global_windows: tuple[SequenceWindowSpec, ...]) -> tuple[SequenceWindowSpec, ...]:
-    """v1.16 SINGLE lookup point for a class's effective windows table [FROZEN HERE].
-
-    The independent three states are identical to `effective_rules`: `None` inherits, `()`
-    clears, non-empty replaces. Rules and windows are resolved independently; declaring one says
-    nothing about the other. Pure, zero rng, zero IO."""
+    name: str
+    before: str
+    after: str
+    min_gap_us: int
+    max_gap_us: int
 
 
 @dataclass(frozen=True)
-class GenerateStreamConfig:                       # v1.13 (spec 5.2 [generate.stream]): the
-                                                  # generate_only TIME-STREAM form — the LLM makes
-                                                  # exactly two content calls per sequence
-                                                  # (blueprint + frame realization); session
-                                                  # packing / crossing / noise / duplication /
-                                                  # timestamps are all done by the mechanical
-                                                  # weaver. Default off; all-off is byte-equivalent
-                                                  # to v1.12
-    enabled: bool = False                         # true ⇒ generate_only ∧ text ∧ generate.enabled
-                                                  # ∧ classify.enabled ∧ stream.order_by =
-                                                  # "meta:<field>" ∧ output.meta_mode != "none"
-                                                  # (M1 hard conjunction, §6.3)
-    sessions: int = 0                             # session count (>= 1); v1.15 planned crossed
-                                                  # sessions = Σsequences − sessions, hence M1
-                                                  # requires sessions <= Σsequences <= 2 × sessions
-                                                  # (crossing concurrency is always k ∈ {1, 2});
-                                                  # v1.16 report crossing is recomputed after
-                                                  # survivor projection from the remaining owner
-                                                  # time sequence, not from this algebraic count
-    noise_ratio: float = 0.0                      # noise frames / task frames, ∈ [0,1);
-                                                  # noise frame count = round(ratio × task frames)
-    noise_instruction: str = ""                   # required non-empty iff noise_ratio > 0
-    duplicates: int = 0                           # verbatim re-sent sequences (0 = none;
-                                                  # <= Σsequences) — byte-identical frames, always
-                                                  # a NEW session at the tail of the stream
-    frame_gap_s: tuple[float, float] = (5.0, 60.0)
-                                                  # uniform sampling range of the intra-session
-                                                  # frame gap (seconds); shape is parsed here only.
-                                                  # M1 path validation requires, on the v1.15
-                                                  # default (including hook-only/no-effective-
-                                                  # rules/windows paths), 1e-6 <= lo <= hi <
-                                                  # stream.gap_s; only an actual nonzero --limit
-                                                  # prefix with effective rules/windows uses the
-                                                  # v1.16 path and allows hi == stream.gap_s.
-    ts_start: str = "2026-01-01T00:00:00Z"        # stream origin (ISO-8601; NEVER the wall clock —
-                                                  # same seed, byte-identical artifact)
-    tiers: tuple[TierSpec, ...] = ()              # v1.14 frame-class composition tier table,
-                                                  # STORED IN tier_rank ASCENDING ORDER (M1 sorts
-                                                  # at parse time, so iteration order IS rank
-                                                  # order everywhere downstream). Empty = the tier
-                                                  # face is absent entirely: no generator.tier_rank
-                                                  # key, no truth.tier_rank key, no report tiers
-                                                  # sub-block — byte-equivalent to v1.13
-    rules: tuple[SequenceRuleSpec, ...] = ()      # v1.16 GLOBAL rule table; empty = absent
-    windows: tuple[SequenceWindowSpec, ...] = ()  # v1.16 GLOBAL occurrence calendar table;
-                                                  # empty = absent. Class-only tables are legal.
+class SequencePattern:
+    """一个精确 declared role 全集、顺序、gap 集与跨度。"""
+
+    name: str
+    sequence_class: str
+    description: str
+    roles: tuple[RoleSpec, ...]
+    order: tuple[str, ...]
+    gaps: tuple[GapSpec, ...]
+    max_span_us: int
+
+
+@dataclass(frozen=True)
+class VariantSpec:
+    """一个派生 positive 或 counterfactual branch。"""
+
+    name: str
+    kind: Literal["positive", "missing", "reordered", "interval_exceeded"]
+    target: Mapping[str, str | int]
+    outcome_schema: Mapping[str, object]
+    expected_violation: Mapping[str, str]
+    divergence_role: str | None
+
+
+@dataclass(frozen=True)
+class CounterfactualSetSpec:
+    """一个共享 ScenarioSeed 的精确数量 declared 交付组。"""
+
+    name: str
+    pattern: str
+    count: int
+    variants: tuple[VariantSpec, ...]
+
+
+@dataclass(frozen=True)
+class InstructionOnlySpec:
+    """一条精确数量 instruction-only 交付声明。"""
+
+    name: str
+    sequence_class: str
+    count: int
+    len_range: tuple[int, int]
+    instruction: str
+    state_schema: Mapping[str, object]
+
+
+@dataclass(frozen=True)
+class TimelineSpec:
+    """冻结整数时间线与精确交付基数。"""
+
+    timestamp_start_us: int
+    utc_offset_minutes: int
+    event_gap_us: tuple[int, int]
+    primary_sessions: int
+    crossed_primary_sessions: int
+    session_max_events: int
+    session_max_span_us: int
+    session_gap_us: int
+    noise_events: int
+    duplicate_sequences: int
+
+
+@dataclass(frozen=True)
+class CalendarWindowSpec:
+    """一个固定 UTC offset 的命名 calendar window。"""
+
+    name: str
+    utc_offset_minutes: int
+    days: tuple[Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"], ...]
+    intervals_us: tuple[tuple[int, int], ...]
+
+
+@dataclass(frozen=True)
+class NoiseSpec:
+    """可选的精确 noise-slot 渲染声明。"""
+
+    frame_class: str
+    instruction: str
+
+
+@dataclass(frozen=True)
+class GenerationLimits:
+    """不可配置的 v1.18 编译期与 retained-content 上限。"""
+
+    pattern_roles: int = 32
+    variants_per_counterfactual_set: int = 8
+    instruction_only_events: int = 64
+    scenario_seed_bytes: int = 65536
+    state_or_outcome_schema_bytes: int = 65536
+    frame_schema_bytes: int = 65536
+    event_patch_bytes: int = 16384
+    rendered_payload_bytes: int = 65536
+    instruction_bytes: int = 32768
+    record_units: int = 500000
+    stream_rows: int = 500000
+    retained_content_bytes: int = 536870912
+
+
+@dataclass(frozen=True)
+class SequenceGenerationConfig:
+    """冻结的 v1.18 sequence-only 解析产物；flat generation 时不存在。"""
+
+    mode: Literal["declared", "instruction_only"]
+    semantic_profile: str
+    evaluation_profile: str
+    max_slot_attempts: int
+    state_validator: ResolvedHook | None
+    patterns: tuple[SequencePattern, ...]
+    counterfactual_sets: tuple[CounterfactualSetSpec, ...]
+    instruction_only: tuple[InstructionOnlySpec, ...]
+    timeline: TimelineSpec
+    calendar_windows: Mapping[str, CalendarWindowSpec]
+    noise: NoiseSpec | None
+    limits: GenerationLimits
 
 
 @dataclass(frozen=True)
@@ -1416,7 +1432,8 @@ class ClassifyConfig:
 
 @dataclass(frozen=True)
 class ClassView:                                  # one class's effective config;
-                                                  # class_views = {} when enabled=false
+                                                  # class_views = {} when classify is disabled,
+                                                  # except the v1.18 sequence registry
     name: str
     quality: QualityConfig                        # selection-GROUP merge semantics (R6);
                                                   # rubric selector already back-filled
@@ -1432,46 +1449,18 @@ class ClassView:                                  # one class's effective config
                                                   # has NO per-class view: it runs BEFORE classify,
                                                   # labels do not exist yet (chain-order causality,
                                                   # spec §5.2)
-    schema: Mapping | None = None                 # v1.13 (裁决·按类标注 Schema) — DEFAULTED tail
-                                                  # field: this class's annotation output schema,
-                                                  # the parsed product of
+    schema: Mapping | None = None                 # per-class annotation output schema, parsed from
                                                   # [class.<name>.annotate].schema_path /
                                                   # schema_inline (AT MOST ONE); None = no override
                                                   # ⇒ falls back to the global output.schema
                                                   # (override semantics, mirroring the per-class
                                                   # rubric heavy-asset precedent)
-    tiers: tuple[TierSpec, ...] | None = None     # v1.15 (裁决·载体 ClassView 顶层字段) — DEFAULTED
-                                                  # tail field, the `schema` sibling: this class's
-                                                  # frame-class composition tier table, parsed from
-                                                  # [[class.<name>.generate.tiers]] and STORED IN
-                                                  # tier_rank ASCENDING ORDER (the global table's
-                                                  # implementation, reused verbatim).
-                                                  # THREE-STATE: None = not declared ⇒ falls back
-                                                  # to GenerateStreamConfig.tiers (裁决·表级原子
-                                                  # 覆盖 — the WHOLE table, never a row merge);
-                                                  # () = an explicit `tiers = []` ⇒ M1 REJECTS it
-                                                  # (裁决·空表拒收 — under a unified tier face
-                                                  # there is no "this class has no tiers" state;
-                                                  # "don't tier this class" is written as a
-                                                  # one-row table); non-empty = the override.
-                                                  # Deliberately NOT on GenerateConfig: that
-                                                  # carrier would make the orchestrator's
-                                                  # per-class-override probe treat a pure tier
-                                                  # override as an estimate-skewing one, and the
-                                                  # dry-run note must NOT fire for tiers (they
-                                                  # change no call count — 裁决·note 行不因档位
-                                                  # 触发); ClassView.schema is the carrier
-                                                  # precedent (v1.13, same None-fallback shape)
-    rules: tuple[SequenceRuleSpec, ...] | None = None
-                                                  # v1.16 independent THREE-STATE whole-table
-                                                  # override: None = inherit global; () =
-                                                  # explicitly clear; non-empty = atomically
-                                                  # replace. Unlike tiers, an empty table is legal
-                                                  # and there is no required global anchor.
-    windows: tuple[SequenceWindowSpec, ...] | None = None
-                                                  # v1.16 independent THREE-STATE whole-table
-                                                  # override, identical state meanings to rules;
-                                                  # resolved only through effective_windows()
+    description: str = ""                         # v1.18 sequence registry description; required
+                                                  # and non-empty for every referenced sequence
+                                                  # class under generate.form="sequence"
+    sequence_generation: SequenceClassGenerationConfig | None = None
+                                                  # v1.18 declared class generation surface;
+                                                  # None for flat/process and instruction-only
 
 
 # ── stream (v1.8, spec §5.2 [stream] + [segment] + [extract]; v1.9 + [stitch]) ──
@@ -1683,39 +1672,23 @@ class FrameAnnotateConfig:                        # v1.12: M5 frame-level per-me
 
 
 @dataclass(frozen=True)
-class FrameClassView:                             # v1.12: one frame class's effective annotate
+class FrameClassView:                             # one frame class's effective annotate/generate
                                                   # config — global [frame.annotate] merged with
                                                   # the [frame.class.<name>.annotate] whitelist
                                                   # trio (keyed by frame class name); frozen by M1;
-                                                  # frame_class_views == {} unless
-                                                  # frame.classify.enabled (class_views convention)
+                                                  # frame_class_views == {} unless frame.classify
+                                                  # or v1.18 sequence generation is enabled
     instruction: str                              # effective instruction (class override > global)
     examples: tuple[FewShotExample, ...]          # effective few-shot (class override > global)
     enabled: bool                                 # false ⇒ members of this class skip frame
                                                   # annotation (cost-saving face; rendered
                                                   # status="skipped" in members[])
-    gen_instruction: str | None = None            # v1.13 (裁决·帧类生成面): this frame class's
-                                                  # CONTENT-generation instruction
-                                                  # ([frame.class.<name>.generate].instruction);
-                                                  # None = not declared — every frame class must
-                                                  # declare one under the time-stream form (M1)
-    gen_schema: Mapping | None = None             # v1.13: parsed generation schema of this frame
-                                                  # class (at most one of schema_path /
-                                                  # schema_inline); None = plain-text frame (the
-                                                  # frame content is the text itself)
-    time_fields: Mapping[str, str] | None = None  # v1.14 (裁决·绑定即剔除): time-semantics field
-                                                  # bindings ([frame.class.<name>.generate
-                                                  # .time_fields]) — key = a TOP-LEVEL field name
-                                                  # of gen_schema, value = one of the FROZEN
-                                                  # four-word vocabulary {ts, gap_prev_s,
-                                                  # gap_next_s, elapsed_s}. None = no bindings.
-                                                  # Legal on STRUCTURED frames only (gen_schema
-                                                  # declared). Bound fields are STRIPPED from the
-                                                  # LLM-facing per-position schema and contract
-                                                  # line and back-filled mechanically from the
-                                                  # laid timeline (§7.5); the whitelist tuple
-                                                  # _FRAME_CLASS_SECTION_KEYS["generate"] gains
-                                                  # this fourth key
+    description: str = ""                         # v1.18 frame registry description; required and
+                                                  # non-empty when sequence generation references it
+    gen_instruction: str | None = None            # v1.18 frame-render instruction; required for
+                                                  # every referenced or noise frame class
+    gen_schema: Mapping | None = None             # v1.18 object payload Schema; sequence generation
+                                                  # rejects absent and non-object schemas
 
 
 # ── CLI overrides and the aggregate ────────────────────────────────────────
@@ -1759,7 +1732,8 @@ class ResolvedConfig:
     rubric: Rubric                                # resolved (default pkg or inline)
     class_views: Mapping[str, ClassView]          # v1.7 — required, no default (R23);
                                                   # frozen per-class merged views, keyed by
-                                                  # class name; {} when classify disabled
+                                                  # class name; sequence generation materializes
+                                                  # its registry even with classify disabled
     user_schema: Mapping                          # parsed dict, meta-schema pre-validated
     limit: int | None                             # CLI --limit
     strict: bool
@@ -1778,26 +1752,30 @@ class ResolvedConfig:
     frame_annotate: FrameAnnotateConfig = FrameAnnotateConfig()
     frame_class_views: Mapping[str, FrameClassView] = field(default_factory=dict)
                                                   # v1.12: key = frame class name; materialized
-                                                  # per declared frame class iff
-                                                  # frame.classify.enabled (zero-override classes
-                                                  # included — class_views convention)
+                                                  # per declared frame class iff frame.classify
+                                                  # or v1.18 sequence generation is enabled
     frame_schema: Mapping | None = None           # v1.12: parsed frame-level output schema
                                                   # (user_schema sibling: meta-validated +
                                                   # few-shot dry-run); None while frame.annotate
                                                   # is disabled
-    generate_stream: GenerateStreamConfig = GenerateStreamConfig()
-                                                  # v1.13: the time-stream generation form
-                                                  # (default off = byte-equivalent to v1.12);
-                                                  # follows the same "defaulted tail field"
-                                                  # convention as the v1.12 frame quartet
+    sequence_generation: SequenceGenerationConfig | None = None
+                                                  # v1.18: present exactly when
+                                                  # generate.form="sequence"; flat/process do not
+                                                  # construct sequence-only default carriers
+    paths: ResolvedPaths | None = None             # loader-owned normalized path product; sequence
+                                                  # requires non-null main/stream/report/manifest/
+                                                  # failed-report paths and null rejects/sidecar
+    validation_hooks: ValidationHooks | None = None
+                                                  # loader-owned resolved output/sample/state hooks;
+                                                  # sequence uses only the state member in addition
+                                                  # to generic output/sample behavior
 ```
 
-The v1.16 public export set of `labelkit.common.config` is additive and exact:
-`load`, `default_rubric`, `ResolvedConfig`, `CorrelationSpec`, `SequenceRuleSpec`,
-`SequenceWindowSpec`, `effective_rules`, and `effective_windows`. Types/helpers are imported from
-`model.py`; the two loader functions retain the existing lazy re-export so importing the model
-does not execute loader assembly. `TierSpec`, `apportion_tiers`, and `effective_tiers` retain their
-existing canonical `labelkit.common.config.model` surface.
+The v1.18 public export set of `labelkit.common.config` is exact: `load`, `default_rubric`,
+`ResolvedConfig`, and `parse_generation_config`. Sequence-only carrier types are imported from
+`labelkit.common.config.generation`; the two loader functions retain the existing lazy re-export so
+importing the model does not execute loader assembly. No deleted sequence-generation type or helper
+is re-exported.
 
 `schema_version` (a required top-level int key in BOTH files, spec §5.1/§5.2 row 1) is validated
 by the file-structure-and-version-key rule (§6.3 rule 1) and deliberately **not** mirrored into
@@ -1809,10 +1787,11 @@ Resolution duties of M1 (beyond merging): resolve `quality.rubric` default by mo
 (`"default:text"` / `"default:ui"`) — v1.8 (S29): when `segment.enabled = true` the empty
 selector resolves to `"default:trajectory"` instead, both modalities, explicit selectors
 untouched; resolve `trace.path` default; resolve `run.input`/`run.output`
-CLI overrides; parse `output.schema_inline`/`schema_path` into `user_schema`; read every
-*referenced* profile's declared key env vars (`api_key_env`, or each element of
-`api_key_envs`) into `LLMProfile.api_keys`, mirroring element 0 into `api_key` (v1.6
-normalization, the key-pool rule — §6.3 rule 12); `tool.log_level` overridden by
+CLI overrides; parse `output.schema_inline`/`schema_path` into `user_schema`; validate and
+normalize each profile's key env-var **names** (`api_key_env`, or each element of
+`api_key_envs`) without reading their values (v1.6 key-pool declaration rule — §6.3 rule 12).
+Only `run` and `validate --probe` call `resolve_credentials()` after compile and planning;
+static `validate` and `run --dry-run` never materialize secret values. `tool.log_level` overridden by
 `--log-level`; v1.10: `console.mode` overridden by `--console` (spec §7.7 — the merged mode
 then feeds the auto chain M1 freezes into `console.mode_resolved` at load() end, the console
 rule — §6.3 rule 42). Precedence: CLI > project.toml > config.toml/built-in defaults.
@@ -1833,13 +1812,11 @@ merge every
 `frame_class_views` mapping (the frame-class-override rule, rule 44), and freeze
 `FrameClassifyConfig.vision_resolved` at
 load() end (the frame-granularity stream-mode rule, rule 43).
-v1.16: parse the global and per-class rules/windows tables without collapsing their presence
-state; `None`, `()`, and non-empty remain distinguishable on each `ClassView`. Resolve and dry-run
-`generate.sequence_validator` at startup; meta-validate every correlation field against the two
-frame generation schemas; run all-local candidate-length checks even for zero-quota classes; then,
-only when the actual post-`--limit` nonzero prefix has effective rules/windows, use an independent
-`Random(f"{run.seed}:0:generate")` copy to call the shared joint-planner build/sample/solve entry.
-This check may not advance the runtime RNG and may not replace UNKNOWN with an unsatisfiable claim.
+v1.18: `parse_generation_config` aggregates the complete sequence namespace, builds the frozen
+sequence/frame registries and ClassViews, resolves Schemas/catalog/hooks relative to project root,
+and stores only `ResolvedConfig.sequence_generation`. The program compiler and exact planner run
+after ordinary config assembly but before credential values are materialized. Validate, dry-run
+and run use the same compiler/planner; no runtime RNG is advanced by validation.
 
 ### 6.2 `labelkit/common/config/loader.py` — API (spec 3.1.3, verbatim)
 
@@ -1877,6 +1854,7 @@ Profile × reference-set × vision navigation table (non-normative consolidation
 | `stitch.llm` | iff `stitch.enabled`, no strategy condition (rule 40) | NEVER — pure-text judgment (T16, rule 40) |
 | `frame.classify.llm` | iff `frame.classify.enabled` (rule 43) | NEVER — vision-adaptive via the parse product `FrameClassifyConfig.vision_resolved` (rule 43) |
 | `frame.annotate.llm` | iff `frame.annotate.enabled` (rule 43) | UNCONDITIONAL under ui ∧ enabled — the sequence-annotate mirror (rule 43) |
+| `generate.semantic_llm`, `generate.evaluation_llm` | iff `generate.form="sequence"`; both exist, resolve credentials and declare `context_window > 0`; names differ | NEVER — all v1.18 generation prompts are text plus JSON |
 
 TOML structure:
 1. **文件结构与版本键** — Both files contain `schema_version = 1`. Missing required keys →
@@ -1896,8 +1874,8 @@ Profile references:
    v1.11 — segment's row is vision-ADAPTIVE, never a requirement, V1/V3).
 5. **语义去重要求 embedding** — `dedup.semantic = true` ⇒ `dedup.semantic_embedding` set,
    exists in `[embedding.*]`, and that
-   profile passes rule 12's key check (exactly one of `api_key_env`/`api_key_envs`, every
-   listed variable set and non-empty; v1.6).
+   profile passes rule 12's declaration check (exactly one of
+   `api_key_env`/`api_key_envs`, every declared variable name non-empty and distinct; v1.6).
 
 Cross-field constraints (v1.2):
 6. **top_ratio 与 threshold 互斥** — `quality.selection = "top_ratio"` ⇒ `quality.top_ratio`
@@ -1910,27 +1888,23 @@ Cross-field constraints (v1.2):
 
 Run mode (v1.4):
 10. **generate_only 前提** — `run.mode = "generate_only"` ⇒ `run.input` absent (also rejecting
-    CLI `--input`), `run.modality == "text"`, `generate.enabled == true`; exactly ONE of
-    `generate.seed_examples` (non-empty array of non-empty strings) and
-    `generate.standalone_count` (≥ 1) is provided. v1.13 THREE-WAY form split: under
-    `generate_stream.enabled = true` the "exactly one of seed_examples / standalone_count"
-    clause DOES NOT run (the time-stream form carries its quota on
-    `[class.<name>.generate].sequences × len_range`; writing either key explicitly is a
-    DIRECTED CONFIG_ERROR — rule 52). `generate.instruction`'s required-iff-enabled check is
-    likewise skipped under the time-stream form (per-class instructions carry the task;
-    rule 51 checks the participating classes instead).
+    CLI `--input`), `run.modality == "text"`, `generate.enabled == true`. With
+    `generate.form="flat"`, exactly one of non-empty `generate.seed_examples` and
+    `generate.standalone_count >= 1` is provided. With `generate.form="sequence"`, neither
+    flat seed field is legal; exact counts come only from the v1.18 sequence declaration.
 11. **process 禁种子形态** — `run.mode = "process"` ⇒ neither `generate.seed_examples` nor
     `generate.standalone_count` may be set.
 
 API keys:
-12. **密钥池恰一非空** — For every *referenced* profile, the `api_key_env` environment
-    variable exists and is
-    non-empty. Unreferenced profiles are not checked. v1.6 key pool (spec 3.1.4/5.1): exactly
-    one of `api_key_env` / `api_key_envs` is provided (both or neither → error);
-    `api_key_envs` must be a non-empty array of non-empty, distinct env-var names; for a
-    referenced profile EVERY listed variable must exist and be non-empty (one aggregated
-    error line per missing variable). M1 normalizes the scalar form to a 1-tuple so
-    `api_key_envs`/`api_keys` are always populated after load (§6.1).
+12. **密钥池声明与运行期物化分离** — Every profile provides exactly one of
+    `api_key_env` / `api_key_envs` (both or neither → error); `api_key_envs` must be a
+    non-empty array of non-empty, distinct env-var names. M1 validates names only and
+    normalizes the scalar form to a 1-tuple, so `api_key_envs` is always populated after
+    load (§6.1); no profile stores a secret value. After compile and planning, `run` and
+    `validate --probe` call `resolve_credentials()` for *referenced* profiles only: EVERY
+    declared variable must then exist and be non-empty, with one aggregated error line per
+    missing variable. Static `validate` and `run --dry-run` never read values; unreferenced
+    profiles are never resolved.
 
 User schema:
 13. **user schema 合法** — Valid JSON; passes `Draft202012Validator.check_schema`; top-level
@@ -1978,22 +1952,14 @@ apply only when `classify.enabled = true` unless stated):
     and is unique
     within the table; each `description` is non-empty; `examples`, when present, is an array
     of strings (input-side only). `classify.fallback_class` is required and must be one of
-    the class names. v1.13 RELAXATION, time-stream form only (裁决·序列类约束按形态放宽):
-    under `generate_stream.enabled = true` the minimum drops to **≥ 1 entry** and
-    `fallback_class` becomes **optional** (when written it must still be a declared class
-    name) — both rules protect the LLM verdict path, which does not exist under inherited
-    labels. Everything else (name/description/examples structure) is unchanged.
+    the class names. Sequence generation does not use this table: it requires
+    `classify.enabled=false` and obtains its registry from `[class.<name>]` (rule 51).
 23. **classify 引用集** — `classify.llm` must exist in `[llm.*]`; UI modality ⇒ that profile
     has
     `supports_vision = true`. The classify profile joins ALL THREE reference sets (R24):
     the loader's referenced set (rule 12 key resolution), the vision-check set (rule 4),
-    and `labelkit.orchestration.profile_usage.referenced_profiles()` (`validate --probe`).
-    v1.13 EXEMPTION: under `generate_stream.enabled = true` `classify.llm` does NOT join the
-    loader's KEY-RESOLUTION set (the S30 precedent — sequence labels are inherited, classify
-    makes zero verdict calls, so no live key may be demanded); EXISTENCE is still checked
-    (a misspelt profile name must still fail at startup) and
-    `profile_usage.referenced_profiles()` still lists it under `classify.enabled`, so an
-    explicit `validate --probe` still probes that profile.
+    and `labelkit.common.runtime.credentials.referenced_profiles()` (`validate --probe`).
+    Sequence generation disables classify, so this profile has no sequence-form reference.
 24. **classify 归属与上限** — `classify.assignment` ∈ {"single", "multi"};
     `classify.max_labels` may be set ONLY when
     `assignment = "multi"` and must be ∈ [2, len(classes)] — when absent M1 back-fills it to
@@ -2003,14 +1969,12 @@ apply only when `classify.enabled = true` unless stated):
     keys must be inside
     the per-section whitelist — `quality`: mode, rounds, rubric (incl. the `[class.*.rubric]`
     inline table), threshold, selection, top_ratio; `annotate`: instruction, examples,
-    **schema_path, schema_inline** (v1.13); `generate`: instruction, styles, num_per_record,
-    temperature, **sequences, len_range** (v1.13), **tiers** (v1.15 — the SEVENTH key, an array
-    of tables `[[class.<name>.generate.tiers]]` whose row shape is the global table's; whole-table
-    override semantics, rule 61); `verify`: extra_criteria.
-    Any key outside the whitelist → CONFIG_ERROR (R25 exception to rule 1's unknown-key
-    warning: `[classify]` / `[class.*]` are explicitly owned namespaces). Note the whitelist must
-    grow together with rule 61 — an unlisted `tiers` would be swallowed by this loop as a
-    CONFIG_ERROR before rule 61 ever ran.
+    **schema_path, schema_inline**; `generate`: flat owns instruction, styles,
+    num_per_record and temperature, while sequence owns exactly instruction,
+    state_schema_path, initial_state_source and initial_state_catalog_path; `verify`:
+    extra_criteria. Any key outside the active form's whitelist → CONFIG_ERROR (R25
+    exception to rule 1's unknown-key warning: `[classify]` / `[class.*]` are explicitly
+    owned namespaces).
 26. **按类选择组合并** — Per-class merge builds the frozen `class_views` (per-key provenance:
     keys the class
     provides override the global section, all others inherit). Selection GROUP (R6): a class
@@ -2053,7 +2017,7 @@ apply only when the named switch is on unless stated):
 33. **segment 引用集条件** — Reference sets (S30 — the "three sets" of rule 23 are FOUR for
     v1.8 profiles:
     key resolution (rule 12) / vision (rule 4/34) / `validate --probe`
-    (`labelkit.orchestration.profile_usage.referenced_profiles()`) / existence): `segment.llm`
+    (`labelkit.common.runtime.credentials.referenced_profiles()`) / existence): `segment.llm`
     joins the existence/key-resolution/probe sets ONLY when
     `segment.enabled` AND `segment.strategy ∈ {llm, hybrid}` (the rules strategy makes zero
     LLM calls — no key may be demanded; these three sets and their gate are UNCHANGED in
@@ -2105,7 +2069,7 @@ Stitch (v1.9, spec §5.2 [stitch] rows + spec 2.3.1; T17):
 40. **stitch 引用集纯文本** — Reference sets: `stitch.llm` joins the reference sets (rule 12
     key resolution /
     profile existence / `validate --probe` via
-    `labelkit.orchestration.profile_usage.referenced_profiles()`) whenever
+    `labelkit.common.runtime.credentials.referenced_profiles()`) whenever
     `stitch.enabled = true` — with NO strategy condition (unlike `segment.llm`, rule 33) —
     and NEVER joins the rule-4/34 vision set: the stitch judgment is pure text (summary
     cards, no images — T16), so `supports_vision` is never demanded of it. The rule-34
@@ -2140,24 +2104,24 @@ checks apply only when the named switch is on unless stated):
     `segment.enabled = true`; the error text points non-stream projects at
     `classify + [class.<name>.annotate]`. Reference sets: `frame.classify.llm` /
     `frame.annotate.llm` each join the existence/key-resolution/probe sets
-    (`labelkit.orchestration.profile_usage.referenced_profiles()`) iff their own switch is
+    (`labelkit.common.runtime.credentials.referenced_profiles()`) iff their own switch is
     on; the vision set takes ONLY `frame.annotate.llm` (ui ∧ enabled, unconditional — the
     sequence-annotate mirror) and NEVER `frame.classify.llm` — frame classify is
     vision-ADAPTIVE via the parse product `FrameClassifyConfig.vision_resolved` =
     (modality=="ui") ∧ enabled ∧ profile.supports_vision, frozen by M1 at load() end
     (segment V1 sibling, no strategy term).
-44. **帧类覆盖要求帧分类** — any `[frame.class.<name>]` table present ⇒
-    `frame.classify.enabled = true` **∨ `generate_stream.enabled = true`** (v1.13 widening; a
+44. **帧类覆盖要求帧分类或序列生成** — any `[frame.class.<name>]` table present ⇒
+    `frame.classify.enabled = true` **∨ `generate.form="sequence"`** (a
     CONFIG_ERROR — deliberately NOT the parked-config warning family, R8); `<name>` must be a
     declared frame class; the per-class section whitelist is TWO sections (v1.13) —
     `annotate` with keys `instruction` / `examples` / `enabled`, and `generate` with keys
     `instruction` / `schema_path` / `schema_inline` — anything else is a CONFIG_ERROR (the
     [frame.class.*] namespace is M1-owned, R25 family). The `generate` section is legal ONLY
-    under the time-stream form: present while `generate_stream.enabled = false` ⇒ a REVERSE
+    under the sequence form: present while `generate.form!="sequence"` ⇒ a REVERSE
     directed CONFIG_ERROR pointing at `[frame.class.<name>.annotate]` (the whitelist accepts
     the section name, so it must be intercepted by name or it would silently no-op). The
     merge materializes `frame_class_views` per declared frame class (zero-override classes
-    included) iff frame.classify **or** generate.stream is enabled; `enabled` defaults true
+    included) iff frame.classify **or** sequence generation is enabled; `enabled` defaults true
     per class.
 45. **帧 Schema 恰一** — `frame.annotate.enabled` ⇒ exactly one of
     `frame.annotate.schema_path` / `schema_inline`, mirroring the output.schema branch set
@@ -2191,430 +2155,185 @@ checks apply only when the named switch is on unless stated):
     frame switch on ∧
     `segment.enabled = false` ⇒ "[frame]" joins the v1.8 R8 parked-tables warning (one line
     naming the ignored tables); with either frame switch on, rule 43's CONFIG_ERROR takes
-    over and the parked entry never appears. v1.13: `generate_stream.enabled = true` ALSO
-    keeps `[frame]` out of the parked list (the frame class table and
-    `[frame.class.*.generate]` are live surfaces there), and likewise `[stream]` (the section
-    doubles as the generation-side laying contract) — `[segment]`/`[stitch]`/`[extract]` keep
-    warning as before (裁决·停放豁免精确化).
+    over and the parked entry never appears. `generate.form="sequence"` also keeps `[frame]`
+    out of the parked list because its frame registry is live; `[segment]`, `[stitch]` and
+    `[extract]` continue to warn.
 
-Time-stream generation (v1.13, spec 3.1.4 时间流生成 row + 2.3.1; every rule below runs ONLY
-when `generate_stream.enabled = true` — with the switch off the loader takes zero new code
-paths and the whole system is byte-equivalent to v1.12):
-50. **按类标注 Schema** — `[class.<name>.annotate]` accepts AT MOST ONE of `schema_path` /
-    `schema_inline` (both present → CONFIG_ERROR; neither = no override, falling back to the
-    global `output.schema`). A declared one loads through the full `output.schema` branch set
-    (rule 13/14 semantics: valid JSON / top-level object / draft 2020-12 meta-schema /
-    top-level `type: "object"`) PLUS the `_meta` reserved-key ban and the `$ref` resolvability
-    walk; error locations are prefixed `[class.<name>.annotate].schema_*`. The parse product
-    lands on `ClassView.schema` (None = no override). **This rule is NOT gated on the
-    time-stream form** — per-class annotation schemas are a standalone v1.13 capability usable
-    by any classify-enabled project; it is listed here because the form is its first consumer.
-51. **形态前提合取** — `generate_stream.enabled = true` requires ALL of: `run.mode =
-    "generate_only"`, `run.modality = "text"`, `generate.enabled`, `classify.enabled` (the
-    sequence class table is the quota + per-class conditioning carrier; labels are inherited),
-    `stream.order_by` matching `"meta:<field>"` with a non-empty field (that field is the
-    artifact's timestamp key — ingest replays by the same declaration), and
-    `output.meta_mode != "none"` (frame-class ground truth travels only via `_meta.stream`).
-    Artifact-key guard (v1.13, part of this rule): neither `input.text_field` nor the
-    `order_by` timestamp field may contain `"."` (artifact rows use them VERBATIM as top-level
-    keys while ingest resolves dotted paths — a dotted name cannot round-trip and every
-    replayed row would be a bad line), the two must differ, and neither may be `"truth"` (the
-    three artifact-row top-level keys are mutually exclusive).
-    Quota side: `Σ sequences` over the class-effective views ≥ 1; every PARTICIPATING class
-    (effective `sequences >= 1`) has a non-empty effective generate instruction;
-    `[[frame.classify.classes]]` is non-empty and every frame class IN SCOPE has a non-empty
-    `[frame.class.<name>.generate].instruction`. **Scope is conditional (v1.14, 裁决·指令必填域
-    收窄; v1.15, 裁决·校验域并集化)**: with no tier table the scope is the WHOLE frame class table
-    (the blueprint enum spans it, so any class may be picked); with a tier table declared the
-    scope narrows to the UNION over PARTICIPATING CLASSES (effective `sequences >= 1`) of THEIR
-    EFFECTIVE tables' `frame_classes` — i.e. `∪ {c.frame_classes for view in participating for c
-    in effective_tiers(view.tiers, gs.tiers)}`, the closed set the blueprint can actually pick
-    from. With no per-class table that union collapses to the global table's, byte-identical to
-    v1.14. A frame class outside the scope is exempt from the requirement, already-written
-    instructions stay legal, and rule 58 warns that its whole generate face is dead config.
-    Corollary worth stating: if EVERY participating class declares its own table, the global table
-    degenerates to a pure anchor and a frame class appearing only there is still dead config —
-    the scope tracks what a blueprint can really pick, not what is merely declared.
-52. **禁设键探针** — DIRECTED CONFIG_ERRORs (the v1.11 `use_vision` raw-section probe
-    mechanism — never rule 1's unknown-key warning; every message names the replacement
-    surface): an explicit `[generate].seed_examples` / `standalone_count` / `num_per_record` /
-    `seeds_per_call`; an explicit `[class.<name>.generate].num_per_record` / `seeds_per_call`;
-    and `frame.classify.enabled = true` or `frame.annotate.enabled = true` (mutually exclusive
-    with the form — frame-class ground truth is already known at blueprint time; frame CONTENT
-    contracts go in `[frame.class.<name>.generate]`).
-53. **装箱一致性** — `sessions >= 1` and `sessions <= Σsequences <= 2 × sessions` (v1.15
-    default packing plans crossed sessions as `Σsequences − sessions`; v1.16 report crossing
-    is recomputed after survivor projection from the remaining owner time sequence, so it must
-    not reuse that algebraic count; planned crossing concurrency is still k ∈ {1,2});
-    `duplicates ∈ [0, Σsequences]`; `noise_ratio ∈ [0,1)` and, when > 0, `noise_instruction`
-    non-empty; `frame_gap_s` is a 2-element numeric range. The v1.15 default path,
-    including a sequence-validator-only path with no effective rules/windows in the actual
-    nonzero `--limit` prefix, requires `1e-6 <= lo <= hi < stream.gap_s`; only that actual
-    prefix with effective rules/windows may use the v1.16 constrained path's `hi <= stream.gap_s`.
-54. **织造上限与铺设契约** — `2 × max(per-class len_range upper bound) <=
-    stream.session_max_len` (a crossed session always holds two sequences); `stream.key == []`
-    and `stream.gap_steps == 0` (partition keys and step-gap splitting contradict the
-    generation-side laying contract); when `stream.session_max_span_s > 0`, the worst-case
-    span `(session_max_len − 1) × frame_gap_s[1]` must not exceed it; `ts_start` must parse
-    via `datetime.fromisoformat`.
-55. **帧类生成 Schema** — `[frame.class.<name>.generate]` accepts AT MOST ONE of `schema_path`
-    / `schema_inline` (declared = structured frame, neither = plain-text frame); a declared
-    one loads through the same branch set as rule 50 plus the `$ref` walk, but WITHOUT the
-    `_meta` reserved-key branch (frame content lands in the artifact row's text field — no
-    envelope collision, the rule-45 precedent). Parse products land on
-    `FrameClassView.gen_instruction` / `gen_schema`.
-56. **S29 扩展与静态预算两段** — The empty-`quality.rubric` resolution condition widens from
-    `segment.enabled` to `segment.enabled ∨ generate_stream.enabled` ⇒ `"default:trajectory"`
-    (loader AND the emitter mirror change together, §7.10). The trajectory-rubric ∧
-    `extract.enabled = false` advisory WARN does NOT fire here — it lives in the
-    `segment.enabled` branch and segment is always off under this form (and there is nothing
-    to advise: extract is UI-only while the form is always text). The V13③ static budget precheck
-    gains two segments — `generate.stream.plan` = `TEMPLATE_HEAD_TOKENS["generate_plan"]` +
-    max(global, per-class) generate instruction + the frame class table text;
-    `generate.stream.realize` = `TEMPLATE_HEAD_TOKENS["generate_realize"]` + the same
-    instruction term + `max(len_range upper bound) × max(frame-class generation schema text)`
-    — under the existing verdict (est ≥ input_budget → CONFIG_ERROR, > 50% → WARN). The
-    `annotate` segment's schema term becomes PER-CLASS: the max now runs over the whole
-    per-view sum (schema + instruction + few-shot); with no per-class schema declared every
-    view resolves to the global one and the value is byte-identical to v1.12.
+Sequence generation (v1.18; every rule in this group is a clean breaking boundary):
 
-Frame-class composition tiers and time-field bindings (v1.14, spec 3.1.4 帧类构成档位与时间字段
-绑定 row + 2.3.1; both clusters run ONLY inside the time-stream form, and with neither the tier
-table nor a bindings sub-table declared the loader takes zero new code paths and the whole system
-is byte-equivalent to v1.13 — the ONE exception is rule 59, a v1.13 defect repair):
-57. **档位表前提与身份** — `[[generate.stream.tiers]]` present ⇒ `generate_stream.enabled = true`
-    (a DIRECTED CONFIG_ERROR: the table is legal only in the time-stream form). Inside the table:
-    `tier_rank` is a positive integer, unique across rows, and the set of ranks must cover
-    `1..N` CONTIGUOUSLY where N = table length (a gap or a duplicate is a CONFIG_ERROR naming the
-    offending rank); `weight` is an integer >= 1; `frame_classes` is non-empty, has no duplicates
-    within a row, every name is in `[[frame.classify.classes]]`, and the composition SETS are
-    pairwise distinct across rows (identical compositions are semantic duplicates). The parse
-    product is `GenerateStreamConfig.tiers`, sorted tier_rank ASCENDING.
-    **v1.15 PER-EFFECTIVE-TABLE (裁决·rank 类内身份)**: this identity-and-composition check set
-    runs ONCE PER SOURCE TABLE — the global table plus EVERY declared
-    `[[class.<name>.generate.tiers]]` — with error locations prefixed
-    `[[generate.stream.tiers]]` and `[class.<name>.generate].tiers` respectively. "Covers 1..N"
-    is therefore per table (N = that table's length, which may differ per class) and "pairwise
-    distinct compositions" narrows to WITHIN ONE TABLE: identical compositions in two different
-    classes are legal (every class may own its own "all frame classes" tier). A class with
-    `sequences = 0` that declares a table STILL runs this whole check set (裁决·零额结构校验不豁免
-    — bad config is reported early); only rule 58's quota-derived checks exempt it. Per-class
-    parse product: `ClassView.tiers` (§6.1), same ascending sort.
-58. **配分推论与两条 WARN** — `apportion_tiers` (§6.1) is a pure function, so M1 can compute every
-    per-(participating class, tier) quota at load time and enforce **长度可覆盖**: for every pair
-    whose quota is >= 1, that class's `len_range` LOWER bound must be >= `len(tier.frame_classes)`
-    (the tier's every class must appear at least once, which needs at least that many steps);
-    ZERO-quota pairs are EXEMPT (no raising a bound for a combination that will never be
-    attempted). Two non-blocking WARNs, both value-free: **配分零额** — a (participating class,
-    tier) pair apportioned 0 (the natural result of a small quota against lopsided weights;
-    the report's `tiers` sub-block reports the 0 faithfully) names the class,
-    the tier_rank and the weight table; **帧类未入档** — a frame class belonging to no tier's
-    `frame_classes` names it and states that its whole `[frame.class.<name>.generate]` face
-    (instruction, schema, time_fields) is dead config, since no blueprint can ever pick it. The
-    latter is the rule-51 scope-narrowing counterpart.
-    **v1.15 PER-CLASS EFFECTIVE TABLE**: every pairing above iterates
-    `effective_tiers(view.tiers, gs.tiers)` for the class in question, so the length bound, the
-    zero-quota exemption and the 配分零额 WARN (whose weight listing likewise comes from THAT
-    class's effective table) are all read per class; the 帧类未入档 WARN's domain becomes the same
-    union rule 51 uses. Classes with `sequences = 0` take part in NONE of this rule (rule 57's
-    structural checks still cover their declared table).
-59. **微秒地板（v1.13 defect repair, NOT a switch face）** — rule 53's `frame_gap_s` bound
-    `0 < lo` tightens to `lo >= 1e-6`. Sub-microsecond `lo` rounds the inter-frame `timedelta` to
-    0 microseconds, which already punched a hole in v1.13's "timestamps increase STRICTLY" claim,
-    and v1.14's 0.0 boundary sentinels in the time vocabulary tolerate a true zero gap even less;
-    the error message cites both grounds. Zero impact on every existing project with `lo >= 1e-6`
-    (all examples use 5) — a sub-microsecond configuration produced defective data under v1.13
-    already.
-60. **绑定表前提与键类型** — `[frame.class.<name>.generate.time_fields]` is legal ONLY on a
-    STRUCTURED frame class (one that declared `schema_path`/`schema_inline` per rule 55); a
-    plain-text frame class carrying the sub-table is a DIRECTED CONFIG_ERROR. "The payload is
-    always a JSON object" — the precondition for in-place back-fill — is already carried by rule
-    55's unconditional top-level `type: "object"` check, so this cluster stays SILENT on a frame
-    class that declared a schema source key but failed to load (no second error stacked on the
-    first; the discriminator is source-key PRESENCE, not load success). Inside the sub-table:
-    every key must be a TOP-LEVEL `properties` name of that class's generation schema; every
-    value must be one of the frozen vocabulary `{ts, gap_prev_s, gap_next_s, elapsed_s}`; and the
-    property's declared `type` keyword must be LITERALLY EQUAL to the required one — `"string"`
-    for `ts`, `"number"` for the other three (a union-type array, a missing `type`, or a type
-    reached indirectly through `$ref`/composition keywords all count as a mismatch, DIRECTED
-    CONFIG_ERROR). A bound field carrying constraint keywords BEYOND `type` (minimum/maximum/
-    pattern/…) raises a value-free WARN naming the frame class, the field and the keyword: those
-    keywords are neither sent upstream nor enforced, because a time quantity's range is decided
-    by the timeline, not by the schema. Finally **剔除余量** — top-level `properties` count minus
-    bound-key count must be >= 1 (the LLM must keep at least one field to generate; binding every
-    field is a CONFIG_ERROR). Parse product: `FrameClassView.time_fields` (None = no bindings).
+50. **Per-class annotation Schema remains generic** — `[class.<name>.annotate]` accepts at most
+    one of `schema_path` and `schema_inline`; neither means the global output Schema.
+    It keeps the full Draft 2020-12, object-root, reserved-`_meta`, local-`$ref` and
+    few-shot validation of rules 13–15. This generic process/flat capability is independent
+    of sequence generation.
 
-Per-class tier tables (v1.15, spec 3.1.4 按类档位表 row + 2.3.1 v1.15 段; the cluster runs ONLY
-inside the time-stream form, and with no per-class table declared the loader takes zero new code
-paths and the whole system stays byte-equivalent to v1.14 — the report included):
-61. **按类档位表前提** — `[[class.<name>.generate.tiers]]` (parse product `ClassView.tiers`,
-    §6.1) is a WHOLE-TABLE override of the global `[[generate.stream.tiers]]` for that sequence
-    class (裁决·表级原子覆盖 — never a row-level merge, which would let rank identity drift across
-    tables). Row parsing reuses the global table's implementation (ascending sort, positive
-    `tier_rank`, `weight >= 1` enforced at parse time) with the location prefix
-    `[class.<name>.generate].tiers`; the identity/composition checks and the quota-derived checks
-    are rules 57/58 read PER EFFECTIVE TABLE. THIS rule adds the three prerequisites, all DIRECTED
-    CONFIG_ERRORs whose location string names the class:
-    1. **形态门** — with `generate_stream.enabled = false`, ANY `[class.*.generate]` raw section
-       carrying a `tiers` key is an error (the v1.11 `use_vision` RAW-SECTION probe mechanism —
-       never rule 1's unknown-key warning). The probe reads the raw section, so it fires even when
-       the table's own contents are malformed:
-       `{fp}:[class.{cname}.generate].tiers: the per-class tier table is only legal in the
-       time-stream generation form ([generate.stream].enabled = true) - it overrides the global
-       [[generate.stream.tiers]] table for sequences of this class`
-    2. **全局锚** — the form is on, at least one per-class table is present, and the global table
-       is absent (裁决·全局表为锚):
-       `{fp}:[class.{cname}.generate].tiers: a per-class tier table overrides the global
-       [[generate.stream.tiers]] table, which is absent - declare the global table (it is the
-       fallback for classes without their own table and the switch of the whole tier face)`
-    3. **空表拒收** — `view.tiers == ()`, i.e. an explicit `tiers = []` (裁决·空表拒收 — the three
-       TOML states are: key absent = not declared ⇒ fall back; `()` = rejected here; non-empty =
-       override):
-       `{fp}:[class.{cname}.generate].tiers: expected a non-empty array of tier tables - omit the
-       key to fall back to the global [[generate.stream.tiers]] table`
-    Sub-clauses 2 and 3 are MUTUALLY EXCLUSIVE (one key, one error, one repair action — an empty
-    table's repair is "delete the key" while a missing anchor's repair is "declare the global
-    table"; stacking both would mislead), and a SHAPE-FAILED value (non-array `tiers`) lands as
-    NOT DECLARED for this cluster's purposes: the parse layer already reported
-    `[class.<name>.generate].tiers: expected array of tables`, so neither the empty-table nor the
-    anchor error stacks on top (implementation adjudications, 2026-08-19).
-    Sub-clause 2 is what keeps the tier FACE a single switch: the face is present IFF the global
-    table is non-empty, so every participating class is guaranteed a non-empty effective table and
-    every v1.14 presence predicate (`generator.tier_rank`, `truth.tier_rank`, the report
-    sub-block, the noise-slot predicate) is UNCHANGED. "Do not tier this class" is written as a
-    ONE-ROW table (`tier_rank = 1` with any composition) — a degenerate form at zero mechanism
-    cost. ZERO CHANGE elsewhere: rule 59's microsecond floor, rule 60's binding cluster, the
-    `_FRAME_CLASS_SECTION_KEYS` whitelist, the frame class table's own rules, and the static budget
-    precheck (rule 56's blueprint segment still meters the WHOLE frame class table — any per-class
-    subset is still ≤ it, so the upper-bound property holds).
+51. **Form separation is exact** — `generate.form` is exactly `flat|sequence` and defaults
+    to `flat`. Flat retains the v1.12 keys and behavior. Sequence requires explicit
+    `mode`, `semantic_llm`, `evaluation_llm` and the tables in this group. Any sequence
+    key under flat or any explicit `llms`, `styles`, `seed_examples`,
+    `standalone_count`, `num_per_record`, `seeds_per_call` or `num_per_call` under
+    sequence is `generation_config_invalid`. Deleted keys such as `generate.stream`,
+    `quota`, `tiers`, `rules`, `windows` and `time_fields` are directed CONFIG_ERRORs,
+    never unknown-key warnings. Deleted internal sequence Schema/helper names are not exported.
 
-v1.16 time-stream sequence-rule cluster (spec 2.3.1 / 3.1.4 / 5.2; implemented in
-`_generate_stream_constraints.py`, with `_constraints.py` retaining only the aggregate driver):
+52. **Sequence runtime conjunction** — `generate.form="sequence"` requires
+    `run.mode="generate_only"`, text modality, `generate.enabled=true`,
+    `classify.enabled=false`, `frame.classify.enabled=false`, sequence delivery policy fixed to
+    no partial delivery, `dedup.enabled=true`, `dedup.scope="global"`,
+    `output.meta_mode="inline"`, `output.rejects="none"` and no CLI `--limit`.
+    Segment, stitch and extract are disabled by the existing generate-only exclusions.
+    Sequence and frame classifications are mechanically inherited, so both classifier call
+    counts are zero.
 
-- **Shape gate and presence preservation.** Global `rules`/`windows` are arrays of tables on
-  `[generate.stream]`; per-class `rules`/`windows` are arrays of tables on
-  `[class.<name>.generate]`. All four and `generate.sequence_validator` are legal only while the
-  time-stream generate_only form is enabled; elsewhere each is a directed CONFIG_ERROR, never a
-  parked/no-op warning. The two per-class tables preserve independent three-state whole-table
-  semantics: absent → `None` → inherit; explicit `[]` → `()` → clear; non-empty → replace. No
-  global anchor is required. A malformed non-array is reported once by the typed table reader and
-  does not acquire an invented presence state.
-- **Template vocabulary.** `template` is exactly one of `existence`, `absence`, `exactly`, `init`,
-  `end`, `responded_existence`, `co_existence`, `response`, `precedence`, `succession`,
-  `alternate_response`, `chain_response`, `chain_precedence`, `not_co_existence`, or
-  `not_succession`. `last` is invalid; no alias exists. Unary rows carry exactly `frame_class`;
-  binary rows carry exactly `source` and `target`, both known and unequal. `existence`/`absence`/
-  `exactly` require a positive integer `count`; every other template forbids it. Identical rule
-  rows in one effective table are a CONFIG_ERROR.
-- **Rule time.** Optional `time_s` contains exactly two finite numeric endpoints, losslessly
-  integer-microsecond quantizable and satisfying `1us <= lo < hi`; its semantic interval is
-  `[lo, hi)`. The field is legal only on binary templates. Directed templates use
-  `target_ts-source_ts`; `responded_existence`, `co_existence`, and `not_co_existence` use absolute
-  difference. Positive templates require a matching witness in the interval; negative templates
-  prohibit matching pairs in it. Multiple selected explicit-time witnesses on an adjacent owner
-  edge intersect. Every adjacent owner pair also meets the closed replay guard
-  `1us <= delta <= stream.gap_s`.
-- **Default gap.** `frame_gap_s` remains a real-valued closed range, converted with
-  `Decimal(str(value))`, ceiling on the lower bound and floor on the upper bound. An empty integer-
-  microsecond range is a CONFIG_ERROR. It applies only to adjacent owner pairs not covered by a
-  selected positive explicit-time witness; a witness without `time_s` does not remove it. An
-  explicit interval replaces this default on that edge but still intersects the replay guard.
-- **Correlation.** The only legal inline table is
-  `{operator="equal", source_field=<name>, target_field=<name>}`. Both referenced frame classes
-  must be structured; each field must be a top-level `properties` member, be named in top-level
-  `required`, have the exact same literal JSON Schema `type`, and not be bound in `time_fields`.
-  `$ref`/composition is not followed to infer a type. This is static CONFIG_ERROR territory; the
-  runtime type-sensitive canonical comparison is §7.18.
-- **Occurrence calendar.** A windows table contains at most one row per frame class. `of_day` is a
-  required non-empty array of two-string ranges; endpoints accept `HH:MM`, `HH:MM:SS`, or up to six
-  fractional digits, each range is same-natural-day `[start,end)` with start < end, and ranges may
-  not overlap. `of_week` defaults to all seven lowercase names `mon`…`sun`, admits no duplicate,
-  and defines a set. Logical cross-midnight windows are rejected; a session itself may cross a
-  day. Every occurrence of the named frame class must fall in the union.
-- **Every candidate length.** For every declared class, every tier that can own a sequence, and
-  every integer in `len_range`, M1 checks local structural/time potential; existence of only one
-  viable length is insufficient. Zero-quota classes are included in syntax/schema/template/local-
-  length validation but excluded from full-flow activation and report presence.
-- **Full-flow prefix.** Apply `--limit` to the lexicographic class/ordinal quota prefix first. Only
-  if that actual nonzero prefix contains effective rules/windows does M1 copy the seeded generate
-  RNG, draw one 31-bit solver seed, draw exactly one cyclic length preference with `randrange` for
-  each attempt, and solve the single joint question shared with estimate/M6. The model minimizes
-  the sum of those preference ranks and then maximizes the feasible noise objective; it does not
-  retry a length candidate, derive candidate-specific feasibility, relax a constraint, or use a
-  fallback. A
-  constrained class fully cut by `--limit` cannot activate the planner.
-- **Default frame-gap boundary.** Rule 53's `hi < stream.gap_s` remains the v1.15 default
-  contract. Only the actual nonzero quota prefix described above may use the v1.16 constrained
-  replay guard's `hi <= stream.gap_s` boundary; `sequence_validator` without effective
-  rules/windows does not activate this exception. Thus the default path retains its strict
-  equality rejection.
-- **Planner limits and status mapping.** The sum of the model proto's variable count and
-  constraint count may be at most 250,000; that combined limit is checked before solve and produces
-  CONFIG_ERROR. Solver parameters are frozen at `num_search_workers=1`, CP-SAT automatic search,
-  `random_seed=<drawn 31-bit value>`, `max_deterministic_time=10.0`, no wall-clock limit.
-  INFEASIBLE in M1 is a configuration-unsatisfiable error; UNKNOWN says only that the deterministic
-  budget could not verify the question; MODEL_INVALID becomes InternalError/exit 4. Ordinary
-  questions accept FEASIBLE or OPTIMAL; a nonzero noise objective accepts only OPTIMAL. The tool
-  promises neither uniform feasible-solution sampling nor cross-OR-Tools-version identical plans.
-- **Context budget and hook startup checks.** Any effective correlation disables realization
-  splitting, so M1 must prove the largest correlated realize prompt fits the chosen deployment-
-  effective context window. `sequence_validator` is resolved/imported/callability-checked and run
-  against a JSON-compatible dry-run value through the existing hook normalization contract. A
-  hook configuration failure is CONFIG_ERROR; hook runtime exceptions are sequence violations,
-  not new ErrorKind values.
-- **No new error vocabulary.** All user declaration failures use existing `ConfigError` (exit 2),
-  planner/model invariant failures use existing `InternalError` (exit 4), and content failures use
-  the existing generation scrap counters. v1.16 adds no `ErrorKind`, trace channel or trace event.
+53. **Profiles and full context** — `semantic_llm` and `evaluation_llm` are non-empty,
+    distinct profile names; both profiles exist, resolve through rule 12 and explicitly
+    declare `context_window > 0`. Both are text profiles. M1 validates the complete minimum
+    prompt plus complete JSON Schema plus `max_output_tokens` plus the frozen margin for
+    every v1.18 family. Runtime prechecks use the complete actual prompt and Schema.
+    ScenarioSeed, ActorView, EventDraft semantic history, patch, payload, full state and direct
+    SemanticEvaluationRequest fields are never truncated or summarized to pass a budget.
+    EventTrace is never a prompt carrier.
 
-v1.17 scenario-planning cluster (SPEC-scenario-planning §4; a DESTRUCTIVE revision — no
-compatibility layer, no migration, no legacy alias for any v1.16 time-stream key; the ten
-deleted keys below are directed errors that name the new expression and never read/convert the
-old value). Numbering continues from rule 61 (the v1.16 cluster above is deliberately
-unnumbered; these rules cite it as "the v1.16 cluster"):
+54. **Sequence-class registry** — sequence classes come only from `[class.<name>]`, each
+    name matches `[a-z0-9_]+` and each description is non-empty. Every class gets one frozen
+    ClassView even though classify is disabled. In declared mode every referenced class has
+    non-empty `[class.<name>.generate].instruction`, an object-root
+    `state_schema_path`, and `initial_state_source = "llm"|"catalog"`. The parsed class
+    carrier is `SequenceClassGenerationConfig`.
 
-62. **删除键定向报错十项** — each of the following v1.16 keys is a DIRECTED CONFIG_ERROR in
-    v1.17 whose message points at the new expression only:
+55. **Catalog source** — `initial_state_source="catalog"` requires exactly one
+    `initial_state_catalog_path`; llm source forbids it. The project-root-relative JSONL
+    is read and fully validated before credentials are materialized. Each line is a complete
+    ScenarioSeed, canonical bytes are bounded, actors match the class-wide actor set, and
+    valid row count covers all class slots without replacement after all overrides. A slot
+    retry reuses its assigned row. Catalog source makes zero scenario-seed LLM calls.
 
-    | 删除键 | 新表达 |
-    |---|---|
-    | `[generate].sequences` | `[[generate.stream.quotas]]` |
-    | `[class.<name>.generate].sequences` | `[[generate.stream.quotas]]` |
-    | `[generate.stream].sessions` | `[generate.stream].crossed_sessions`；总 session 数自动推导 |
-    | `[generate.stream].ts_start` | `[generate.stream.schedule].start/end` |
-    | `[generate.stream].noise_instruction` | `[[generate.stream.noise]]` |
-    | `[[generate.stream.rules]]` | `[[generate.stream.frame_rules]]` |
-    | `[[generate.stream.windows]]` | `[[generate.stream.frame_windows]]` |
-    | `[[class.<name>.generate.rules]]` | `[[class.<name>.generate.frame_rules]]` |
-    | `[[class.<name>.generate.windows]]` | `[[class.<name>.generate.frame_windows]]` |
-    | hook 的 `module:function` 引用 | `path.py:function`（rule 70） |
+56. **Frame registry and payload shape** — sequence frame classes come only from
+    `[frame.class.<name>]`; each has a non-empty description and every referenced or noise
+    class has non-empty `[frame.class.<name>.generate].instruction` plus exactly one of
+    `schema_path|schema_inline`. Each Schema is valid Draft 2020-12, local-`$ref`
+    resolvable, object-rooted and within the fixed byte limit. String payloads and deleted
+    `time_fields` are rejected.
 
-    Beyond the ten deleted keys: `--limit` is MUTUALLY EXCLUSIVE with the time-stream form —
-    writing it on a time-stream run is an M1 DIRECTED CONFIG_ERROR (exit 2); the quota is a
-    whole contract and a truncated prefix no longer claims quota satisfaction.
+57. **Pattern identity and total order** — declared mode requires one or more uniquely named
+    `[generate.pattern.<name>]` entries. Each references a sequence class, has 1..32 unique
+    roles and a positive `max_span_s` converted losslessly from at most six decimal places
+    to integer microseconds. `order` is an exact permutation of all roles. Role names,
+    frame classes, actors, instructions, optional calendar windows and pre-state Schemas are
+    fully resolved at compile time.
 
-63. **[generate.stream] v1.17 键面** — `crossed_sessions` (default 0) requires
-    `0 <= value <= floor(target_sequences / 2)`; total sessions are always derived as
-    `target_sequences - value` (primary sessions = N - D, single-owner sessions = N - 2D,
-    crossed sessions = D — configuration semantics, never report arithmetic; duplicates add
-    tail sessions OUTSIDE this count). `noise_ratio` stays `float` in `[0,1)`; target noise =
-    `round(ratio x planned_task_frames)` with ROUND_HALF_EVEN semantics, and is now an EXACT
-    delivery target (planned_task_frames = the sum of all slot `length_target` values, a
-    pre-model constant). `duplicates` requires `0 <= value <= target_sequences` (verbatim tail
-    re-sends; source and time layout freeze before the planner and consume no LLM).
-    `frame_gap_s` keeps its `[number, number]` shape with default `[5, 60]` (closed
-    start-interval; the v1.16 `Decimal(str(value))` ceil/floor microsecond quantization
-    applies unchanged). `max_attempts_per_slot` (default 3) requires `>= 1` — the independent
-    delivery budget of every sequence slot and noise slot; carrier is
-    `GenerateStreamConfig.max_attempts_per_slot`, consumed by M6 delivery ONLY and never a
-    `ScenarioConfig` field.
-64. **[generate.stream.schedule] 必填与区间** — `start` and `end` are both REQUIRED ISO-8601
-    datetimes carrying an explicit `Z` or numeric offset; `end` must use the SAME offset as
-    `start` and satisfy `end > start`. The schedule is the half-open interval `[start, end)`:
-    every point timestamp satisfies `start <= ts < end`, every interval satisfies
-    `start <= interval.start < interval.end <= end`. `exclude_dates` is a local-date array
-    (default `[]`); duplicate entries are an error, and an entry falling OUTSIDE the schedule's
-    local-date range is a DIRECTED CONFIG_ERROR (fail-fast, never silently ignored). No
-    primary, noise or duplicate may occupy an excluded day (a duration interval may not
-    intersect the excluded day's local-day boundary interval); a sequence crossing midnight
-    applies the rule frame by frame. The v1.16 per-session one-week `_horizon` recursion is
-    DELETED — the schedule is the only time boundary; frame windows enumerate only in-schedule,
-    non-excluded local dates.
-65. **[[generate.stream.quotas]] 双形态** — every quota table carries a natural `name` matching
-    `[a-z0-9_]+`, UNIQUE over the GLOBAL domain shared by frame-rule, frame-window and
-    sequence-rule names (§6.3 rule 66/67; errors, assumptions and report rows all use it —
-    never a table path or array index). `period` is one of `day`, `week`, `schedule`;
-    `of_week` (both forms) defaults to all seven weekdays. The two forms are MUTUALLY
-    EXCLUSIVE: **exact counts** (`counts` = non-empty `{sequence_class = integer >= 0}`;
-    writing any of `total`/`weights`/`allocation` alongside is an error) versus **integer
-    weights** (`total` = integer >= 1; `weights` = at least two classes with positive-integer
-    weights, mutually exclusive with `counts`; `allocation` = `exact` or `largest_remainder`,
-    REQUIRED). Every quota-referenced class MUST exist in `[[classify.classes]]`; multiple
-    quotas may name the same class — they constrain the SAME occurrence set, never adding or
-    overriding; a class no quota names has target 0 and a noise-only frame class needs no
-    quota. `allocation = "exact"`: weights reduce by their GCD to a simplest integer ratio
-    whose sum is `minimum_exact_cohort`; `total` must be a multiple of that cohort, else M1
-    reports in the SAME round the normalized weights, the minimum exact cohort, the nearest
-    lower exactly-representable total (null when none) and the nearest higher one.
-    `allocation = "largest_remainder"` REUSES `apportion_tiers`' pure-integer largest-remainder
-    algorithm (§6.1): no floating point, no RNG consumption, ties broken by the quota table's
-    own class declaration order. When the time-stream form is enabled there must be AT LEAST
-    ONE quota table, and the sequence-target total compiled across ALL tables must be >= 1 —
-    zero tables or an all-zero total is a DIRECTED CONFIG_ERROR (零序列工程只剩 noise 与无源
-    duplicate，没有可交付内容).
-66. **frame_rules/frame_windows 重命名与 contains** — the v1.16 `rules`/`windows` tables are
-    RENAMED `frame_rules`/`frame_windows` (global on `[generate.stream]`, per-class on
-    `[class.<name>.generate]`); the v1.16 three-state whole-table override semantics are
-    preserved verbatim and the old keys never alias to the new ones (rule 62). The config
-    carrier `SequenceRuleSpec` is RENAMED `FrameRuleSpec` (§7.19) — the v1.17 `SequenceRuleSpec`
-    is a DIFFERENT class (rule 67) with no inheritance relation to the renamed one; the name is
-    recycled. Every frame-rule row and every frame-window row gains a REQUIRED `name`
-    (`[a-z0-9_]+`, the rule-65 shared global-unique domain) replacing array-index diagnostics.
-    The frame-rule template set gains `contains`: it REQUIRES the `source` frame class to
-    declare `duration_s` (rule 68) and, for every target occurrence, a same-sequence source
-    occurrence with `source.start < target.start` AND `target.end < source.end` (a point
-    target's `end == start`; equal boundaries never pass — strict containment). Resources
-    carry NO config name; their assumption and diagnostic key is fixed `resource:<resource-name>`.
-67. **[[generate.stream.sequence_rules]]** — each row: `name` `[a-z0-9_]+`, unique (the rule-65
-    shared domain); `template` exactly one of `precedence`, `response`, `succession`,
-    `not_co_existence`; `source`/`target` are sequence classes already owned by a quota with
-    target > 0, and the two differ; `period` one of `day`, `week`, `schedule`; `gap_s` OPTIONAL
-    on the positive templates as the half-open `[lo, hi)` with `0 <= lo < hi`, and FORBIDDEN on
-    `not_co_existence`. A sequence occurrence belongs to the local date of its `sequence_start`
-    (a midnight-crossing sequence still belongs to its start date's period bucket); semantics
-    run per period bucket: `precedence` = every target occurrence has a source witness with
-    source interval end earlier than target start and the gap inside the declared half-open
-    interval; `response` = every source occurrence has a later target witness (same gap rule);
-    `succession` = both; `not_co_existence` = source and target never co-occur in one bucket.
-    A source witness may serve multiple targets (standard DECLARE existence semantics) —
-    payload-level pairing belongs to the scenario validator, never to extra CP-layer pairing
-    config.
-68. **[frame.class.*.generate] duration 与 resources** — `duration_s` (absent = point frame)
-    is the closed interval `[lo, hi]` with `1e-6 <= lo <= hi`, legal ONLY on a structured
-    frame class; all second values pass through `Decimal(str(value))` and the closed interval
-    quantizes to `[ceil(lo x 1e6), floor(hi x 1e6)]` — empty after quantization is a
-    CONFIG_ERROR (frame gaps use the same rule; rule/table half-open intervals keep
-    `[exact(lo x 1e6), exact(hi x 1e6))` with both endpoints losslessly
-    integer-microsecond-representable). `resources` (default `[]`) — each item matches
-    `[a-z0-9_]+`; a non-empty list REQUIRES `duration_s` present. A duration-declaring frame
-    class MUST bind at least one of `end_ts` / `duration_s` in `time_fields` (no hidden
-    interval the artifact cannot observe). The `time_fields` closed vocabulary GROWS by two
-    words: `end_ts` (`"string"` — the interval end's ISO-8601) and `duration_s` (`"number"` —
-    `round((end - start) / 1e6, 6)`); a POINT frame class may bind NEITHER. The existing
-    `ts`, `gap_prev_s`, `gap_next_s`, `elapsed_s` words are unchanged; binding still means
-    stripping the field from the LLM-facing schema (the v1.14 rule-60 cluster applies to the
-    two new words identically).
-69. **[[generate.stream.noise]] 表** — `noise_ratio > 0` IFF the noise table is non-empty
-    (a table at ratio 0, or no table at ratio > 0, is a DIRECTED CONFIG_ERROR). Each row's
-    `frame_class` must exist in `[[frame.classify.classes]]` with a non-empty generate
-    instruction; structured and plain-text frame classes are both legal (schema parsing,
-    budget checks and realization reuse the task-frame path). A noise frame class must NOT
-    appear in any effective tier, frame rule or frame window, and must NOT declare
-    `duration_s` or `resources` (v1.17 noise stays point occurrence). The task-frame candidate
-    domain ALWAYS excludes the noise table's classes — even in a project without tiers; an
-    empty candidate domain at any task position is a DIRECTED CONFIG_ERROR. `weight` is a
-    positive integer; the noise target is apportioned across noise classes by the
-    largest-remainder rule, consuming no RNG. Noise truth: `truth.noise = true`,
-    `truth.frame_class = <实际类名>` (v1.17 changes the v1.16 null to the actual class name,
-    §9.5), `sequence_class` / `sequence` / `tier_rank` null. No `role`, `negative_type` or
-    second noise schema is added.
-70. **hook 引用统一 path.py:function** — all FOUR hook keys (`output.validator`,
-    `generate.sample_validator`, `generate.sequence_validator`, `generate.scenario_validator`)
-    take `<python-file>:<attribute-path>` (the v1.16 `module:function` form is deleted —
-    rule 62). A relative python-file resolves against the PROJECT ROOT (the `ResolvedPaths`
-    basis, §7.19.2); absolute paths are allowed; the file must be a `.py` regular file. M1 loads via
-    `importlib.util.spec_from_file_location` with a module name hashed from the absolute path,
-    mutates `sys.path` NEVER, depends on cwd NEVER and does no auto-discovery; multi-file
-    extensions install as normal Python packages (LabelKit never splices search paths). M1
-    freezes the resolved callable ONCE (the ResolvedHook carrier, §7.19) — M6 and the schema
-    engine never re-resolve strings. All four hooks get a positional-arity check plus a
-    synthetic-input dry run with no user data (the scenario probe uses `accepted = ()` and one
-    minimal candidate); exception types and illegal return values surface aggregated at
-    validate time, never at first real content.
-71. **quota class 域** — every sequence class named by any `counts` key or `weights` key of any
-    `[[generate.stream.quotas]]` table must exist in `[[classify.classes]]` (DIRECTED
-    CONFIG_ERROR naming the quota's natural name and the class); this domain check runs before
-    quota-form arithmetic so a typo never surfaces as a solver infeasibility.
+58. **Gap closure** — every adjacent ordered role pair has exactly one forward gap; optional
+    non-adjacent gaps are also forward and no before/after pair repeats. `max_gap_s` is
+    required, `min_gap_s` defaults to zero, both are closed bounds converted losslessly to
+    integer microseconds and `0 <= min <= max`. The compiled gap set and positive
+    `max_span_us` must be jointly satisfiable.
 
+59. **Pointer permissions and bindings** — role read/write/publish roots and payload/state
+    paths are valid RFC 6901 pointers compared by decoded tokens. A single roots list cannot
+    contain redundant ancestor/descendant entries. Binding state phase is exactly
+    `before|after`; its state path is covered by both role read and publish roots; its
+    payload path cannot be the root, repeat another binding path, or have an ancestor/descendant
+    relationship with another binding path. M1 validates only pointer syntax, permissions and
+    those conflicts; it does not attempt to prove an instance path through arbitrary `$ref`,
+    `allOf`, `if/then`, `dependentSchemas` or `unevaluatedProperties`. FrameRenderer receives the
+    unchanged complete Schema and the exact ordered binding values. After L2, code applies each
+    binding to the instance with RFC 6902 `add` semantics and revalidates that same complete
+    Schema; this runtime result is the only payload-shape criterion. Observers are valid actors.
+    Optional pre-state Schemas receive the same validation and byte checks as the base state
+    Schema.
+
+60. **Counterfactual sets** — declared mode requires one or more uniquely named
+    `[[generate.counterfactual_sets]]` rows, each referencing one pattern, with
+    `count >= 1` and 1..8 variants. Variant names and normalized expected-violation
+    signatures are unique in the set; every variant has an object-root outcome Schema.
+    `positive` has no target and an empty expected violation; `missing` targets a role
+    whose frame class is unique in its pattern; `reordered` targets two adjacent roles
+    with different frame classes; `interval_exceeded` targets a named gap and has closed
+    `0 < min_excess_us <= max_excess_us`. The compiler freezes the exact target,
+    expected violation and causal divergence role.
+
+61. **Instruction-only is exclusive** — `mode="instruction_only"` requires one or more
+    uniquely named `[[generate.instruction_only]]` rows and forbids patterns,
+    counterfactual sets, role permissions, outcome Schemas and expected violations. Every
+    row references a sequence class, has exact `count >= 1`, non-empty instruction,
+    `len_range` with `1 <= low <= high <= 64`, and an optional object-root state Schema
+    whose absent value compiles to the fixed object Schema. It never uses a catalog.
+    Declared mode forbids instruction-only rows.
+
+62. **Timeline exactness** — `timestamp_start` includes a fixed UTC offset and is converted
+    to integer microseconds; `event_gap_s=[min,max]` is closed and non-negative.
+    All cardinalities are integers. If N is the exact primary-sequence total and D is
+    `crossed_primary_sessions`, then `primary_sessions == N-D`. Each primary session owns
+    one or two different counterfactual sets, variants from the same set never share a
+    session, session capacity/span/gap and globally increasing timestamps must be feasible.
+    Instruction-only requires D=0 and `primary_sessions=N`.
+
+63. **Calendar windows** — named windows have one fixed `utc_offset`, non-empty unique day
+    names and non-empty, non-overlapping same-day half-open wall-clock intervals converted
+    to microseconds. Role references exist. The planner proves every declared role time
+    lies in its window; a target interval-exceeded branch still satisfies every calendar,
+    non-target gap and max-span constraint.
+
+64. **Noise and replay** — `noise_events > 0` iff `[generate.noise]` is present; its frame
+    class is not used by any role and has an object generation Schema. Noise instruction is
+    non-empty. `duplicate_sequences` non-replacement sources are positive primary
+    sequences chosen by declaration order then scenario index; insufficient sources fails
+    at compile time. Each replay owns a tail session. Instruction-only requires zero
+    duplicates. Noise, replay and their timestamps are exact planned slots, never best
+    effort.
+
+65. **Quality and downstream gates** — if quality is enabled in sequence form it is
+    pointwise with an explicitly configured non-null fixed threshold; pairwise, top_ratio and any effective class override
+    of mode/selection/threshold/top_ratio are CONFIG_ERRORs. Annotate, frame annotate and
+    verify retain their generic switches and ClassView routes. A disabled collaborator is
+    exactly zero calls. Output validator/sample validator remain generic; only
+    `state_validator` is the v1.18 state-transition hook.
+
+66. **Static size and cardinality limits** — the fixed limits are pattern roles 32, variants
+    per set 8, instruction-only events 64, ScenarioSeed 65536 canonical UTF-8 bytes,
+    state/outcome Schema 65536 bytes, frame Schema 65536 bytes, patch 16384 canonical bytes,
+    payload 65536 canonical bytes and instruction 32768 UTF-8 bytes. Derived
+    `record_units = primary_sequences + primary_events + noise_events + replay_events` and
+    `stream_rows = primary_events + noise_events + replay_events` each lie in
+    `1..500000`; Python integers are range-checked before creating OR-Tools IntVars.
+
+67. **Retained-content limit** — canonical bytes of every final main and stream row, including
+    duplicate view content, annotation, generation truth, replay and metadata but excluding
+    emitter-only wall-clock fields, must not exceed 536870912. After the real downstream
+    collaborators finish and M11 produces the source's final SequenceRows, ReplayProjector
+    preprojects every planned replay from those rows and the source transaction precharges all
+    resulting ReplayRows before its dedup commit. Exactly the limit passes; one additional UTF-8
+    byte rejects the whole source slot with zero dedup, dataset or replay commit. EventProjector
+    never constructs replay rows, and content is never truncated to meet this limit.
+
+68. **State validator** — `state_validator` resolves project-root-relative through the
+    standard hook loader to `validate_state(StateTransitionInput)->list[str]`. M1 invokes
+    it twice on independently deep-copied identical minority-probe input and requires
+    byte-identical normalized string-list results. Exception, illegal return and
+    nondeterminism are startup errors. Runtime hook input is a deep copy and contains only
+    slot, variant, nullable RoleSpec name, before/after state and patch; no credentials.
+    Declared mode supplies the real RoleSpec name. Instruction-only has no RoleSpec and supplies
+    `role=None`; it must not disguise its `position_NNN` EventTruth label as a declared role.
+
+69. **Program and plan are shared startup truth** — the compiler validates references,
+    delivery/catalog cardinality shells and complete budgets, then freezes the canonical program
+    digest before API key values are read or an LLM is called. ScenarioPlanner alone expands
+    DeliverySlots, assigns `catalog_row_index`, allocates blocks and builds the CP-SAT plan.
+    Validate, dry-run and run call the same compiler and the same single
+    `compile_scenario_plan(program, seed)` entry. Only OPTIMAL decodes; INFEASIBLE is exit 2,
+    FEASIBLE/UNKNOWN/MODEL_INVALID follow the frozen plan-budget/internal exit-4 matrix. There is
+    no greedy solver, incumbent use or runtime relaxation.
+
+70. **Sequence paths are conflict-free** — M1 freezes main, stream, report, manifest and
+    failed-report paths plus null rejects/sidecar. Fixed paths and every same-directory
+    `.part` path are pairwise distinct, parents exist and are writable. Sequence delivery
+    delays opening main/stream/report/manifest until all slots, projections and reconciliation
+    pass. Failed-report is the only failure channel and is opened only when a run has begun.
+
+71. **No old surface survives** — no old sequence config type, parser, planner, schema helper,
+    validation-hook name, prompt family, report key or wrapper is exported. Unknown-key
+    forward compatibility never applies to a deleted owned sequence key; it is rejected with
+    `generation_config_invalid` and no migration, alias or fallback.
 Warnings (non-blocking): `verify` enabled and `verify.llm`'s `model` equals `annotate.llm`'s
 `model` → warn about self-enhancement bias (spec 3.7.2). v1.7 (R8): `classify.enabled = false`
 while `[[classify.classes]]` and/or `[class.*]` tables are present → ONE warning naming the
@@ -2763,6 +2482,14 @@ nested style, else flat style. Images: magic-number + size check only (`≤ inpu
 Text parsing (3.2.5): non-object JSON line = bad line; `input.text_field` dotted path; string hit
 used as-is; array/object hit serialized with canonical JSON; miss = bad line; empty lines skipped
 silently (not counted as bad).
+
+v1.18 replay envelope mapping is an additional fail-closed branch of text parsing, activated when
+the input rows match §9.5's `payload` + `_meta.event` envelope. Object `payload` becomes canonical
+Record.text and Record.raw remains the full row. M2 validates event/owner/replay IDs, primary
+group ordering and duplicate provenance from that file before yielding sessions. It recomputes
+each formula in §7.18 and rejects the entire input on malformed, duplicate, missing-source or
+positionally mismatched evidence. It never consults main output and never uses a legacy ID
+fallback. Ordinary JSONL without the v1.18 event envelope keeps the existing parsing behavior.
 
 v1.8 stream ordering & monotonicity (spec §6.1, S19/S20 — active only when `segment.enabled`):
 
@@ -3034,7 +2761,7 @@ async def annotate_record(record: Record, ctx: RunContext,
     is byte-identical to v1.12]"""
 
 
-# ── v1.13 per-sequence-class annotation schema (SPEC-stream-generation §3.4) ─
+# ── per-sequence-class annotation Schema (generic ClassView surface) ───────
 # The SINGLE lookup point for the class-effective annotation schema. Every schema
 # consumer inside M5 reads through these three functions so the PRICED schema is
 # always the CALLED one; M7's V21 trial packing lazy-imports the same pair (an
@@ -3179,361 +2906,40 @@ no-raise contract. One `annotate.frame` event per member incl. skipped ones (§8
 Counters owned here: `frame_annotate.annotated`/`skipped`/`failed` (§9.3; failed is also
 fed by the M11 pre-write backstop, §7.10).
 
-### 7.5 M6 — `labelkit/operators/generate.py` + `labelkit/operators/generate_stream.py`
+### 7.5 M6 flat generation — `labelkit/operators/generate.py` + `generation/flat.py`
 
 ```python
 class GenerateStage(Stage):
+    """Run only the existing flat/process generation path."""
+
     name = "generate"
+
     def __init__(self, cfg: ResolvedConfig): ...
-    async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]:
-        """PROCESS MODE. Returns the sub-batch of NEW PipelineItems (input batch untouched).
-        A generation call that is invalid after M8 repair or exhausts retries is voided (bucket
-        `calls` counted, `produced` 0); no failed records are created; seed records unaffected."""
+
+    async def run(
+        self,
+        batch: list[PipelineItem],
+        ctx: RunContext,
+    ) -> list[PipelineItem]:
+        """Return generated flat sub-batch records without mutating source items."""
 
     async def generate_all(self, ctx: RunContext) -> list[Record]:
-        """GENERATE_ONLY MODE entry (called once by M10 before batching; ctx.batch_no == 0,
-        ctx.rng == Random(f"{seed}:0:generate")). Executes all calls per the 3.6.2 count
-        formulas; --limit truncates to the first ceil(limit / num_per_call) calls in pre-drawn
-        order and then to limit records. [FROZEN HERE]"""
+        """Generate the exact flat generate-only call plan before normal batching."""
 ```
 
-Normative behavior (3.6.2): seeds — process: batch items with `status=="active"` and aggregate ≥
-`seed_min_score` (default `quality.threshold`, else the batch median aggregate); generate_only:
-`seed_examples` strings, or seedless. Call count C = `ceil(len(seeds) * num_per_record /
-num_per_call)` (seed pool same formula) / `ceil(standalone_count / num_per_call)` (seedless).
-Before any concurrency, pre-draw the full `(llm, style)` assignment for call indexes `0..C-1`
-with `ctx.rng`: round_robin → `llms[i % len(llms)]`; weighted → `ctx.rng.choices` per index;
-style (if any) → uniform `ctx.rng.choice` per index; then per call sample
-`min(seeds_per_call, len(seeds))` seeds without replacement via `ctx.rng` — all draws happen in
-call-index order before dispatch so results are schedule-independent. Prompt per §10.4; output
-`{"samples": [...]}` validated by M8 (`SAMPLES_SCHEMA(num_per_call)`); temperature =
-`generate.temperature`. New records: `raw = {input.text_field: sample}`, id per M2 rule,
-`ref = RecordRef(source_file="", line_no=None, pair_index=None, generated_from=<seed ids tuple —
-process mode> | () <generate_only>, generator={"llm": name, "style": style_name_or_None})`.
-Bucket stats to metrics: key `f"{llm}×{style or 'None'}"` **[FROZEN HERE: bucket key format
-`<llm>×<style>` with literal `×`; style absent → the string `null` in report; v1.7 — when
-classify is enabled the key gains a class prefix, `<class>×<llm>×<style>` (three segments,
-same literal `×`); classify disabled keeps the two-segment form byte-identical** — see §9.3].
+This surface is the v1.12 flat contract and its process-mode per-class conditioning contract.
+Seed selection, call formulas, pre-drawn LLM/style/seed order, `SAMPLES_SCHEMA`, sample hook,
+record construction, inherited classification for process-generated class segments and existing
+bucket keys remain unchanged. `generate_all` still uses seed examples or seedless
+`standalone_count`; `--limit` retains its flat prefix semantics.
 
-v1.7 per-class generation (classify enabled, process mode; spec 3.6.2 按类种子池 row):
-
-- **Seeds & thresholds (R19).** `select_seeds` groups the seed pool by
-  `item.classification.label`. Per-class threshold chain: global `seed_min_score` → absent:
-  the CLASS-effective `quality.threshold` → absent: the median aggregate of that class's own
-  seed pool.
-- **Lexicographic segment concatenation (R18).** Participating classes (those with seeds)
-  occupy consecutive GLOBAL call-index ranges in class-name lexicographic order; per-class
-  budget `C_c = ceil(len(seeds_c) × num_per_record_c / num_per_call)`. ONE pass over
-  i = 0..C−1 pre-draws the plan: llm by global index exactly as before (round_robin consumes
-  zero rng; weighted consumes one `choices` per i); style drawn uniformly from the effective
-  styles OF THE CLASS OWNING index i; seed sampling per call in ascending global index order.
-  Classify disabled ⇒ a single anonymous segment = the pre-v1.7 behavior, byte-identical.
-- **Planner & records (R17).** The internal `CallPlan` gains a `class_name` field; each call
-  uses the class-effective `instruction`/`temperature` (`class_views[class_name].generate`);
-  `postprocess_samples` returns `list[tuple[Record, str | None]]` (record, class);
-  `GenerateStage.run` wraps new records in PipelineItems carrying
-  `Classification(label, (label,), "inherited", {})` — the chain's classify stage skips them
-  (idempotency, §7.13).
-- **generate_only:** the `generate_all` flat path is UNCHANGED (global instruction, no class
-  segments); its products are classified normally by the chain's classify stage. v1.13 branch
-  note: under `generate_stream.enabled` M10 calls `generate_stream_all` INSTEAD (below) —
-  `generate_all`'s frozen signature, its call-count formulas and its flat code path are
-  UNTOUCHED.
-
-v1.13 time-stream form (SPEC-stream-generation §3.2; spec 3.6.5). Public surface:
-
-```python
-@dataclass(frozen=True)                            # [FROZEN HERE]
-class StreamGenerateProduct:
-    envelopes: list[PipelineItem]                  # direct-assembly sequence envelopes (plan order)
-    artifact_lines: list[str]                      # artifact rows, weave order; line_no = index + 1
-
-
-async def generate_stream_all(ctx: RunContext) -> StreamGenerateProduct:
-    """GENERATE_ONLY TIME-STREAM entry (called once by M10; ctx.batch_no == 0,
-    ctx.rng == Random(f"{seed}:0:generate")) [FROZEN HERE]. Planning draws → dispatch
-    (per-sequence blueprint→realize jobs and the noise batches gather together) → per-frame
-    hook + sequence-level similarity filter → mechanical weave → direct assembly. A voided
-    sequence merely ABSENTS itself: no failed record, no item.errors. Returns the RICH product
-    because a bare `PipelineItem(record=r)` cannot carry session_id / classification /
-    member_classifications."""
-
-
-def plan_stream(cfg: ResolvedConfig, rng: random.Random) -> StreamPlan:
-    """The planning-phase PURE function (cfg + rng, no IO, no LLM) [FROZEN HERE]. M10's
-    estimate_run reuses it for the EXACT dry-run replay (§7.9) — not an upper bound."""
-
-
-def stream_artifact_path(cfg: ResolvedConfig) -> str:
-    """`Path(cfg.run.output).with_suffix("") + ".stream.jsonl"` [FROZEN HERE]. M11 derives the
-    same value INDEPENDENTLY (operators never import each other); the equality of the two
-    derivations is test-pinned."""
-
-
-# ── v1.14 additions (SPEC-generation-tiers §3.2 / §3.3) ──────────────────────
-
-def tier_rank_for_ordinal(sequences: int, tiers: Sequence[TierSpec],
-                          ordinal: int) -> int | None:
-    """Map an IN-CLASS ordinal to its tier's rank [FROZEN HERE]. `apportion_tiers` (§6.1) cuts a
-    class's quota into CONTIGUOUS blocks in tier_rank ascending order, so this is a prefix-sum
-    lookup — zero rng. `sequences` must be that class's FULL quota, never the `--limit`-truncated
-    count, or the blocks drift. Returns None when the tier table is empty. Corollary: `--limit`
-    prefix-truncation only removes trailing ordinals, i.e. it cuts from each class's HIGHEST
-    tier_rank side, and truncation commutes with the mapping. Deliberately a STANDALONE function
-    rather than a third element on `expand_stream_quota`'s return — widening that tuple would
-    break three existing two-tuple unpack assertions, which contradicts the verbatim draw-order
-    pin-board regression.
-
-    v1.15: `tiers` is that class's EFFECTIVE table (`effective_tiers`, §6.1) — the SIGNATURE AND
-    BODY ARE UNCHANGED. The blocks are therefore per class, the returned rank is an IN-CLASS rank
-    (not comparable across classes), and the `--limit` corollary above holds verbatim PER CLASS,
-    each class cutting from its own highest rank."""
-
-
-def backfill_time_fields(sessions: list[list[_StreamSlot]], cfg: ResolvedConfig) -> None:
-    """The mechanical back-fill coda [FROZEN HERE] — zero rng, zero LLM, zero IO. Call site is
-    INSIDE `generate_stream_all`, AFTER `weave_stream` and BEFORE `assemble_stream`, so the
-    back-filled values precede row-object and id computation (裁决·回填后计 id). Walks TASK-frame
-    slots only (`owner is not None`), groups them by owner (session order IS intra-sequence member
-    order — crossing slices never reorder within a sequence), and for a bound frame class writes
-    each binding IN PLACE into the shared payload object. Duplicate slots are neither walked nor
-    touched: they reference the SAME payload object as their source slots, so the back-fill takes
-    effect automatically and their `ts` binding is the SOURCE's, deliberately != their own row ts
-    (裁决·重发帧承源档与同源载荷). Noise frames and unbound frame classes are untouched; every
-    payload object is written EXACTLY once."""
-```
-
-Normative behavior:
-
-- **Draw-order table (FROZEN, test-pinned).** One `Random(f"{seed}:0:generate")` consumed in
-  three phases. Planning (before ANY dispatch): ① expand quotas into (class, ordinal) pairs in
-  class-name LEXICOGRAPHIC order (`--limit` prefix-truncates HERE, zero rng) ② per sequence
-  `L = rng.randint(class len_range)` ③ per sequence pre-draw (llm, style) — the noise-batch
-  draws follow the sequence draws in the SAME predraw stream (round_robin consumes zero rng,
-  weighted one `choices` per index, non-empty styles one `choice` per index; noise batches take
-  the GLOBAL styles). Dispatch: ZERO rng (the existing discipline). Weaving (after gather, in
-  surviving-sequence plan order): v1.15 default path ④ duplicate selection `rng.sample` ⑤
-  packing shuffle + the first `Σsurvivors − sessions_eff` pairs crossed ⑥ per-crossed-session
-  switch points ⑦ per noise frame (session, slot) draws ⑧ duplicates appended as NEW tail
-  sessions (zero rng) ⑨ timestamp laying. v1.16 planner path freezes crossing before dispatch;
-  survivor projection then recomputes the true alternation count from remaining owner timestamps,
-  with no second algebraic crossing draw. Voided sequences change the weave input, so determinism
-  is conditional on the LLM content (spec §2.6). **v1.14 zero-consumption note:** tier apportionment slots between
-  ① and ②, and the time-field back-fill coda follows ⑨ — BOTH consume zero rng, so this table is
-  UNCHANGED (the pin-board tests regress verbatim) and, at a given seed, the draw stream is
-  byte-identical with and without a tier table or a bindings sub-table.
-- **Two content calls + noise.** Blueprint (one per surviving quota sequence): §10.14 template,
-  `plan_schema(frame class names, L)` (internal treatment); exhaustion/unfittable ⇒ the sequence
-  is voided, `generate.stream.plan_failures`. **With a tier table (v1.14)** the blueprint call
-  becomes tier-conditional: the frame classes rendered into `[帧类表]` are the frame class table
-  FILTERED (in declaration order) to `tiers[plan.tier_rank - 1].frame_classes` — where `tiers` is
-  that sequence class's EFFECTIVE table, `effective_tiers(view.tiers, gs.tiers)` (v1.15; every
-  effective table covers 1..N contiguously, so the index arithmetic is unchanged) — the user line
-  takes the frozen cover variant (§10.14), and the schema becomes `plan_schema(that subset, L,
-  cover_all=True)` — enum gives "⊆", the per-class `contains` gives "⊇", together the composition
-  is EXACTLY EQUAL to the tier's declaration. A cover violation is an ordinary L2 violation that
-  enters M8's existing repair loop and, on exhaustion, the existing `plan_failures` voiding —
-  ZERO new failure mechanism. Realize (one per blueprint): §10.15 template with
-  the per-position contract line, `realize_schema(step schemas)` (plain-text positions take
-  `{"type": "string"}`); **the per-position schema and its contract line take the REDUCED schema**
-  (v1.14, see the bindings bullet below); reactive overflow ⇒ SEQUENCE HALVING (schema and step
-  digest sliced together, ≤ 2 AIMD levels, each halving counted into `budget.degrade_retries`),
-  exhaustion ⇒ voided, `generate.stream.realize_failures`. Noise:
-  `render_prompt_texts(noise_instruction, style, num_per_call, ())` reusing §10.4 +
-  `SAMPLES_SCHEMA`, `ceil(noise frames / num_per_call)` calls; a voided batch just leaves those
-  frames absent (never regenerated).
-- **Tier apportionment and identity (v1.14; per-class since v1.15).** A class's `sequences` quota
-  is split across tiers
-  by `apportion_tiers` (§6.1, integer-domain largest remainder, zero rng); in-class ordinals
-  occupy CONTIGUOUS blocks in tier_rank ascending order and `tier_rank_for_ordinal` is the
-  prefix-sum lookup. **v1.15: every tier lookup in this module goes through `effective_tiers`**
-  (§6.1, imported forwards from `labelkit.common.config.model` beside `apportion_tiers`) — the
-  planning phase computes
-  `tier_rank_for_ordinal(view.sequences, effective_tiers(view.tiers, gs.tiers), ordinal)` and the
-  blueprint's tier lookup indexes the same effective table. Neither helper's signature or body
-  changes; only what is passed does, and apportionment still consumes zero rng, so the draw-order
-  table above regresses verbatim. `SequencePlan` gains `tier_rank: int | None = None` (None = the
-  tier face is
-  absent; the default-value assertion belongs in `tests/operators/test_generate_stream.py`, not
-  test_config, because the dataclass is operator-owned). The rank lands in exactly THREE places,
-  all conditional on a non-empty GLOBAL tier table — v1.15's anchor rule (§6.3 rule 61 sub-clause
-  2) makes that predicate identical to "the tier face is present", so all three presence tests are
-  UNCHANGED, and the only thing per-class tables change is the VALUE (an IN-CLASS rank, not
-  comparable across classes; the row's own class name travels beside it as
-  `_meta.classification.label` / `truth.sequence_class`): `ref.generator` gains a third key
-  `tier_rank`
-  (`{"llm", "style", "tier_rank"}` — the emitter's `_source_block` flows it out unchanged, and
-  the rejects side's existing generator carry-through follows automatically), the artifact
-  `truth` gains `tier_rank` at its frozen position (§9.5), and `report.generate.stream` gains the
-  `tiers` sub-block (§7.9/§9.3). Noise slots carry `tier_rank: null` and duplicate slots carry
-  the SOURCE sequence's rank. Carrier note: noise-slot CONSTRUCTION moves up into `weave_stream`
-  (which holds cfg and therefore knows whether the tier face is present) and `_insert_noise` takes
-  the already-built slot list — its parameter count is unchanged (it was already at 4, and adding
-  one would hit the 5-parameter ceiling).
-- **Time-field bindings (v1.14).** Bound fields are STRIPPED from the LLM-facing surface: the
-  reduced schema deletes them from `properties` and subtracts them from `required` (set-difference
-  semantics, tolerating a bound key absent from `required`), leaving every other keyword as-is.
-  Derivation discipline: rebuild the TOP LEVEL and the `properties` level (other keywords and each
-  property sub-schema keep their original references) and NEVER mutate the shared
-  `FrameClassView.gen_schema` in place — that is an M1-frozen product read by the static budget
-  precheck and by contract-line rendering alike. The per-position schema face and the contract
-  TEXT face take the SAME derived product; plain-text positions and unbound frame classes are
-  byte-unchanged. M8 validates against the reduced schema (that is also what L0 carries), so an
-  LLM that emits a bound field anyway trips `additionalProperties` and the repair loop asks for
-  its removal — semantically correct. Values are back-filled by `backfill_time_fields` above:
-  `ts` = the slot's laid ISO string; `gap_prev_s`/`gap_next_s`/`elapsed_s` = the INTRA-SEQUENCE
-  neighbour/first-frame timestamp deltas at `round(·, 6)`, with the first frame's `gap_prev_s`
-  and `elapsed_s` and the last frame's `gap_next_s` pinned to 0.0. Intra-sequence is the frozen
-  reading: foreign-sequence frames and noise frames woven between them genuinely occupy that wall
-  clock, so an intra-sequence delta is what a downstream consumer measures from the data. Hook
-  scope is UNCHANGED and semantic: `generate.sample_validator` (per frame) and the sequence-level
-  similarity filter both run BEFORE weaving and therefore see the PRE-back-fill payloads — time
-  quantities are mechanical and take part in neither content validation nor content dedup.
-- **Filters.** `generate.sample_validator` runs PER FRAME of the realize product — any violation
-  scraps the WHOLE sequence (a fixed-length blueprint cannot drop one frame; rejection-sampling
-  semantics), counting `generate.stream.validator_scrapped` + the bucket's
-  `rejected_by_validator`. The built-in `SimilarityFilter` is lifted to SEQUENCE level: probe
-  text = member texts joined by `"\x1e"` in order (the M3 sequence recipe), compared against
-  SIBLING sequences only (no seeds), parameters from `[dedup]`; survivors count
-  `survived_dedup`. **Bucket keys** take the three-segment `<class>×<llm>×<style>` form here —
-  the FIRST generate_only appearance of the class segment (the two-segment form stays for the
-  noise batches, which have no class).
-- **Weaver (pure functions, zero LLM, zero IO).** v1.15 fixed one-/two-owner default path uses
-  `sessions_eff = min(sessions, Σsurvivors)` and crossed pairs = `Σsurvivors − sessions_eff`;
-  a crossed session is `A[:cut_a] + B[:cut_b] + A[cut_a:] + B[cut_b:]` with
-  `cut_a ∈ [1, |A|−1]`, `cut_b ∈ [1, |B|]` (sides swap when the first has < 2 frames; both < 2
-  degrades to concatenation — a pure length condition, zero rng). v1.16 does not reuse that
-  algebra after content gates: survivor projection deletes voided owners and empty sessions,
-  preserves survivor timestamps, and counts only projected sessions whose remaining owner time
-  sequence contains a real A-B-A or B-A-B alternation. Noise frames draw (session, slot) with
-  FULL sessions (`len >= stream.session_max_len`) out of the pool (pool exhausted ⇒ remaining
-  frames absent + WARN); `duplicates` (clamped to the survivor count + WARN) are byte-identical
-  re-sends appended as NEW tail sessions; timestamps start at `ts_start` and increase strictly —
-  `uniform(frame_gap_s)` within a session, `uniform(gap_s + lo, gap_s + hi)` across sessions,
-  microsecond-precision ISO-8601. The final pass back-fills `truth.session` with the whole-stream
-  session ordinal.
-- **Direct assembly.** Row = `{<ts field>: ts, <text_field>: payload, "truth": {...}}` (§9.5);
-  member `Record.raw` = THE WHOLE ROW, `id = sha256(canonical_json(raw))[:16]` (the M2 formula ⇒
-  replay-identical), `text` = the M2 projection of the text field (string as-is, object →
-  canonical JSON), `ref = RecordRef(source_file=<artifact path>, line_no=<1-based row>,
-  pair_index=None, generated_from=(), generator={"llm", "style"} — `{"llm", "style", "tier_rank"}`
-  with a tier table, v1.14)`; `session_id =
-  sha256("\n".join(all frame ids in the session))[:16]` (the M2 formula, INCLUDING noise and
-  duplicate frames); the sequence Record follows the S24 conventions with the M14 id formula;
-  the envelope carries `Classification(label, (label,), "inherited", {})` plus
-  `member_classifications = {member id: Classification(frame class, (frame class,),
-  "inherited", {})}`. Noise and duplicate frames live ONLY in the artifact — no envelopes.
-- **Counters owned here** (`generate.stream.*`, surfaced as `report.generate.stream`, §9.3):
-  `sessions` (woven sessions EXCLUDING the duplicate tails; voided sequences push it below
-  the declared `sessions` because packing uses `sessions_eff = min(sessions, Σsurvivors)`) /
-  `crossed_sessions` (v1.15 fixed one-/two-owner default packing = `Σsurvivors − sessions_eff`;
-  v1.16 = projected sessions with a real remaining-owner A-B-A / B-A-B alternation, recomputed
-  after survivor projection) /
-  `sequences.<class>.planned` / `.produced` (= the sequences that
-  actually reach the chain — past blueprint, realize, the per-frame hook AND the
-  sequence-level similarity filter; the `planned − produced` gap is therefore split across
-  `plan_failures` / `realize_failures` / `validator_scrapped` AND the similarity eliminations,
-  which only surface as the bucket's `survived_dedup` shortfall) / `frames` (task frames of
-  the surviving sequences — noise and duplicate frames excluded) / `noise_frames` /
-  `duplicates` / `plan_calls` / `realize_calls` (including halved sub-calls) / `noise_calls`
-  (all three call counters increment BEFORE dispatch, so they include calls the budget
-  precheck rejected and never sent — the flat path's precedent) / `plan_failures` /
-  `realize_failures` / `validator_scrapped`. **v1.14 adds two** (present only with a tier table),
-  **RE-FROZEN PER CLASS IN v1.15 (裁决·计数器键按类重冻结)**:
-  `tiers.<class>.<tier_rank>.planned` (incremented per planned sequence, alongside
-  `sequences.<class>.planned`) and `tiers.<class>.<tier_rank>.produced` (same four-gate reading as
-  `sequences.<class>.produced`); `<class>` is the sequence class name verbatim and `<tier_rank>`
-  is the DECIMAL STRING form of the rank. M6 ALWAYS feeds the class-segmented keys — single-feed
-  discipline, writing both key families is forbidden — and the FLAT report form is produced by
-  M10 summing them across classes per rank (§7.9), which is numerically byte-identical to v1.14
-  (its flat counts were cross-class aggregates already). The v1.14 key family
-  `generate.stream.tiers.<tier_rank>.*` is thereby UNFROZEN and replaced; the unfreeze is
-  registered in §12 item 36. The
-  counters are the raw feed only — the report sub-block itself is assembled EXPLICITLY by M10
-  (§7.9), which is what makes zero-quota and fully-voided tiers present in the report at all.
-  The time-field face owns NO counter: back-fill is a deterministic mechanical operation with no
-  countable failure mode.
-
-v1.16 constrained time-stream path (spec 3.6.5; `docs/dev/SPEC-sequence-rules.md` §§2–6).
-`generate.py` owns LLM dispatch and validation; `generate_stream.py` owns the operator-local
-planning carriers, pure layout projection, time-field back-fill and assembly. Neither file may
-reimplement DECLARE, calendar or CP-SAT semantics from common runtime (§7.18).
-
-`SequencePlan` gains the frozen planner products `frame_classes: tuple[str, ...] = ()` and
-`timestamps_us: tuple[int, ...] = ()`. `StreamPlan` gains `planner_active: bool = False`, the
-shared planner question/layout, the pre-drawn duplicate-source order, and the distinction between
-the requested noise target and the optimally placeable slot count. All new fields are defaulted
-tails: an unconstrained plan still follows the v1.15 object construction and draw order.
-
-- **Activation gate.** Apply the existing lexicographic quota expansion and `--limit` prefix
-  first. The joint planner is active iff at least one attempt in that actual nonzero prefix has a
-  non-empty effective rules or windows table. A constrained class fully removed by `--limit`
-  cannot activate the planner or its conditional report face. `sequence_validator` alone does not
-  activate CP-SAT; it is a content-validation hook on the time-stream form.
-- **Single planning route and RNG order.** M6 calls the same common-runtime question builder and
-  solver as M1 and `estimate_run`. The constrained draw stream is quota expansion (zero draws) →
-  one 31-bit solver seed → exactly one `randrange` preference per attempt in class-name/class-
-  ordinal order → the existing per-attempt llm/style pre-draws → a complete duplicate-source
-  permutation → the noise payload-call plan. CP-SAT never consumes Python RNG. An infeasible,
-  unknown, invalid or non-optimal noise-objective result cannot trigger a new length preference,
-  retry, relaxed model, legacy weaver or fallback.
-- **Frozen skeleton before content.** The accepted joint layout freezes every primary attempt's
-  length, frame-class word, session assignment, task timestamps, true crossing and candidate
-  noise slots before the first content call. Every two-owner primary session contains a real
-  `A-B-A` or `B-A-B` owner alternation. Session separation is
-  `next.start_us - previous.end_us >= stream.gap_s * 1_000_000 + 1`; each owner's adjacent task
-  frames satisfy the closed replay guard `1us <= delta <= stream.gap_s * 1_000_000`.
-- **Sampled brief and realization.** The constrained blueprint call uses §10.17 and
-  `brief_schema(length)`: M6 passes the planner-frozen frame-class word and the stable rendering
-  of all effective rules/windows/correlation requirements; the LLM returns only one `brief` per
-  position. M6 pairs those briefs with the frozen word and calls the existing positional
-  `realize_schema`. The realization prompt takes §10.15 plus the §10.18 constraint block and each
-  position's effective frame-class generation instruction/schema contract. A sequence carrying
-  any effective correlation must fit and realize in one call; reactive sequence halving is
-  forbidden. A sequence without correlation retains the existing bounded halving path. The plan
-  still budgets one brief call and one realization call per attempt; provider retries and schema
-  repairs remain physical extra requests, not new estimate categories.
-- **Runtime rule evaluation.** For every rule in effective declaration order, standard occurrence
-  candidates are enumerated in activation order; bidirectional duties run source→target then
-  target→source. The evaluator filters structure candidates by type-sensitive canonical
-  correlation equality, then by the half-open time interval. A correlated positive duty with no
-  correlation match increments `correlation_scrapped`; one with a correlation match but no timed
-  match increments `temporal_scrapped`. A matching correlated negative rule increments
-  `correlation_scrapped`. Failure of an uncorrelated rule after planning is an invariant breach:
-  log a value-free ERROR and raise `InternalError`, never count ordinary content scrap.
-- **Frozen content-validation order.** The exact order is realization Schema → per-frame
-  `generate.sample_validator` in position order → declarative correlation/time in rule order →
-  one `generate.sequence_validator` call → sequence similarity filter → primary-survivor layout
-  projection and noise-slot pruning → primary time-field back-fill → survivor selection through
-  the pre-drawn duplicate order → duplicate deep-copy/shift → global sort → row/Record/id
-  assembly. The first failing content gate stops later gates for that attempt.
-- **Projection, noise and duplicate.** Content failure removes the complete attempt from the
-  preplanned skeleton; it never changes another attempt's word/session/timestamps and never
-  invokes the solver again. Empty sessions disappear; survivors retain timestamps and sessions
-  are renumbered by time. Noise survives only when strictly interior to the earliest/latest
-  surviving task frames of its session. `planned_noise_slots < noise_target` emits one value-free
-  WARN and does not make the configuration infeasible; missing noise payloads delete remaining
-  slots without another call. Duplicate sources are taken in pre-drawn survivor order, at most
-  `min(duplicates, survivors)`; payload, frame word, tier and already back-filled time fields are
-  deep-copied. A windowed duplicate takes the minimum positive whole-week shift that also clears
-  the stream gap; an unwindowed duplicate takes the minimum microsecond shift. Duplicate
-  timestamps never trigger time-field recomputation.
-- **Hook isolation.** `generate.sequence_validator` receives a `SequenceValidationInput` whose
-  payloads are JSON-compatible deep copies (§3). Return normalization is the same
-  `normalize_violations` contract as other user hooks. An exception is a violation; value-free
-  diagnostics may include the hook reference, exception type and violation count, never exception
-  text, payload or prompt.
-- **Counters and identity.** `validator_scrapped` equals exactly
-  `sample_validator_scrapped + correlation_scrapped + temporal_scrapped +
-  sequence_validator_scrapped`; an attempt contributes to only its first failing subcounter.
-  Similarity elimination is outside this identity. `rules.sampled` counts attempts whose
-  mechanical word is frozen and which enter the sampled-brief call. All conditional report keys
-  are explicitly assembled by M10 (§7.9/§9.3), including zero values. Rules/windows do not add
-  row, truth, generator, trace-event, trace-channel or ErrorKind fields.
-- **Default anchor.** If the actual prefix has no effective rules/windows and neither sequence
-  hook is configured, the v1.15 prompt bytes, `plan_schema`, draw order, call counts, report,
-  artifact and ids are byte-equivalent. This path is a direct branch, not a compatibility layer.
-
+`GenerateStage` rejects `generate.form="sequence"` as an orchestration contract breach. It
+does not import the sequence compiler, planner, delivery controller or emitter. Sequence
+generation never enters `GenerateStage.run`, never calls `generate_all`, and never passes
+attempt-local products through `Orchestrator._process_batch`. The v1.18 sequence path is the
+orchestration-owned `deliver_generation` seam in §7.18. There is no
+deleted sequence-generation entry, tier helper, time-field backfill, multi-call expansion,
+survivor projection, sequence validator or compatibility wrapper exists.
 ### 7.6 M7 — `labelkit/operators/verify.py`
 
 ```python
@@ -3568,7 +2974,6 @@ class VerifyPromptOptions:
     boundary_margin: str = ""                           # [边界余量] body, pre-rendered by the driver
     fragment_structure: str = ""                        # [片段结构] body; "" omits the section (v1.9 T15)
     fit: _PromptFit | None = None                       # panel-minimum budget packing state; None = budget off (v1.11)
-    verdict_form: bool = False                          # v1.13 §10.16 verdict-form sequence variant
 ```
 
 The default instance is the pre-v1.7 single-record classic call. The builder is NOT part of the
@@ -3678,192 +3083,131 @@ byte-unchanged; sequence envelopes are driven by a stage-layer bypass driver:
   (per defect kind — six kinds incl. `wrong_stitch`, v1.9) → `report.stream.verify`.
   Defect summaries ride the `verify.verdict` event payload (content-tiered, §8.1).
 
-v1.13 verdict-form sequence review (裁决·直装评审判决形; spec 3.7.5). Sequence envelopes now
-have TWO origins — M14 episodes (driven by the stream driver above) and M6 direct-assembly
-sequences (`generate_stream.enabled`, segment OFF, §7.5). The latter travel the CLASSIC path,
-which must not reuse the non-sequence template (a sequence Record has no text/raw/ui_tree/image
-to render) nor the defect-table variant (its `defects` key is forbidden by `VERDICT_SCHEMA`):
-
-- **Selection = driver presence.** The `VerifyPromptOptions.verdict_form` flag (the
-  `boundary_margin`/`fragment_structure` construction) picks the variant; the classic path
-  passes `verdict_form=(record.kind == "sequence")`, the stream driver NEVER sets it, so the
-  §10.5 defect-table variant stays byte-identical. `schema` remains `VERDICT_SCHEMA` —
-  template and schema are paired by construction.
-- **Template** (§10.16, verbatim): system = the verdict instruction (three review dimensions:
-  instruction adherence / factual consistency with the member-frame digests / field semantics)
-  + the class-effective `extra_criteria` (empty ⇒ the whole line is omitted, the non-stream
-  rule) + the "opinions first, verdict last" line + the `VERDICT_SCHEMA` structure句; user =
-  `[任务指令]` → `[成员帧摘要]` → `[标注结果]`. NO defect table, NO `[边界余量]`, NO
-  `[片段结构]`, NO screenshots (direct-assembly sequences are text modality).
-- **Member digests.** `{m}. {frame_digest(member, 400)}` (m 1-based, member order), total
-  bounded by `input.ui_tree_max_chars` — first and last lines ALWAYS kept, middle lines dropped
-  whole with a `…(truncated N members)` marker (mirroring M5's sequence rendering; operators
-  never import each other, so M7 keeps its own identical copy).
-- **Packing.** With `fit` non-None the digest block is the ONLY trimmable slot (edges trim,
-  counted into `report.budget.truncations`); `[标注结果]` and the instruction are record-level
-  semantic assets — counted, never trimmed (V25③); an untrimmable floor over budget sets
-  `fit.overflow` (V10 — the caller rejects, the request is never sent).
-- **Public helper:** `verify_verdict_sequence_system_text(extra_criteria: str) -> str`
-  [FROZEN HERE] — the system段 assembler (three dimensions + verdict instruction + structure句;
-  no defect vocabulary).
-- **Zero-change declarations.** `VerificationResult.defects` stays EMPTY in this form and
-  M11's `_verification_block` defects gate is UNCHANGED (the key appears in stream mode only,
-  §9.1); the six-value defect vocabulary, its four-way sync and the whole member-surgery path
-  are untouched. Repair = the existing policy re-annotation (threading the same `label`, so the
-  per-class annotation schema flows through §7.4 for free); persistent fail ⇒ `dropped_verify`
-  — for synthetic data that IS rejection sampling: the losing sequence leaves the main output
-  while the artifact keeps its frames and truth (§9.5).
-
+v1.18 sequence attempts invoke VerifyStage through the `run_attempt` protocol in §7.18.
+They reuse the existing sequence-record verify core and class-effective criteria, but fatal
+provider/circuit/cancellation exceptions pass through unchanged and no attempt result is emitted
+to main or rejects. The old direct-assembly verdict prompt and its selection flag do not exist.
 ### 7.7 M8 — `labelkit/common/runtime/schema_engine.py`
 
+The existing flat/process L0 → L1 → L2 → optional L2.5 → bounded L3 contract and
+`complete_validated` return tuple remain unchanged. Deterministic repair, ordinary user output
+validator routing, user-treatment statistics and every pre-v1.18 internal Schema builder remain
+unchanged.
+
 ```python
-class SchemaEngine:
-    def __init__(self, user_schema: dict, llm: LLMClient, cfg: OutputConfig,
-                 metrics: MetricsSink | None = None): ...        # metrics [FROZEN HERE]
-
-    @property
-    def user_schema_text(self) -> str:
-        """Canonical user-schema text injected into prompts:
-        json.dumps(user_schema, ensure_ascii=False, separators=(", ", ": ")) — single line.
-        [FROZEN HERE]"""
-
-@dataclass(frozen=True)                            # [FROZEN HERE — 2026-08-14]
+@dataclass(frozen=True)
 class CallScope:
-    """Accounting/tracing scope of ONE schema-engine call — the public parameter object.
+    """一次 SchemaEngine 逻辑调用的计数与 trace 作用域。"""
 
-    The 2026-08-14 code-rule remediation (≤ 5 parameters per function) collapsed
-    `complete_validated`'s four keyword-only parameters into this frozen dataclass; field
-    names and semantics are unchanged, and the default instance is an internal-treatment
-    call with no owning record. It sits ALONGSIDE the private `_CallContext` rather than
-    replacing it: this object is what the CALLER declares, `_CallContext` additionally
-    carries the engine-derived `active` schema and `user_treated` verdict.
-    """
-    record_ids: tuple[str, ...] = ()   # records this call covers; trace events only
-    batch_no: int = 0                  # batch number; trace events and log extra only
-    record: Mapping | None = None      # the L2.5 hook's second argument (Record.raw); None if absent
-    user_treatment: bool | None = None # explicit treatment gate; None ⇒ inferred from `schema is None`
+    record_ids: tuple[str, ...] = ()
+    batch_no: int = 0
+    record: Mapping | None = None
+    user_treatment: bool | None = None
+
+
+@dataclass(frozen=True)
+class PostValidationResult:
+    """对一个候选恰好执行一次可执行后置验证的结果。"""
+
+    violations: tuple[str, ...]
+    event_execution: EventExecution | None
+
+
+CallPostValidator = Callable[[Mapping[str, object]], PostValidationResult]
+
+
+@dataclass(frozen=True)
+class PostValidatedCallRequest:
+    """一次要求在 L2 后执行可执行后置验证的内部调用。"""
+
+    profile: str
+    prompt: PromptBundle
+    schema: Mapping[str, object]
+    scope: CallScope
+    post_validator: CallPostValidator
+
+
+@dataclass(frozen=True)
+class ValidatedGenerationCall:
+    """已验证对象及为该同一对象产生的执行证明。"""
+
+    object: Mapping[str, object]
+    event_execution: EventExecution
+    resolved_at: Literal["l0_or_clean", "l1", "l3_1", "l3_2"]
+    usage: Usage
+    attempts: int
+    model: str
 
 
 class SchemaEngine:
-    ...
+    """验证不可信 LLM JSON 并执行有界修复。"""
 
-    async def complete_validated(self, profile: str, prompt: PromptBundle,
-                                 schema: dict | None = None, *,
-                                 scope: CallScope = CallScope(),
-                                 ) -> tuple[dict, Usage, int, str]:
-        """schema=None → user schema; internal schemas (judgment/pointwise/verdict/samples)
-        passed in by stages. Runs L0→L1→L2[→L2.5]→L3 (spec 3.8.2). ``scope.record`` (v1.5)
-        is the raw input mapping handed to the output.validator hook
-        at L2.5 — user-treatment calls only; callback violations are rendered
-        "(validator) <msg>", join the L3 repair prompt, and share the repair budget;
-        exhaustion with ONLY callback violations left raises
-        SchemaViolation(callback_only=True) → record kind callback_violation. Success: returns
-        (validated_obj, total_usage, attempts, model) where attempts = 1 + L3 repair calls
-        and total_usage sums the first call + repairs. Failure: raises SchemaViolation.
-        Counts resolved_at buckets for USER-TREATMENT calls only (spec §6.4); emits
-        `schema.repair` trace events (any non-clean resolution) with the scope's
-        record_ids/batch_no. The `scope` parameter and the tuple return are [FROZEN HERE]
-        (spec gives `-> dict`; callers need usage/attempts/model to build Annotation).
-        ``scope.user_treatment`` (v1.13 — 裁决·M8 显式待遇参数) DECOUPLES
-        treatment from how the schema is passed: None = the inference
-        `schema is None`; True = user treatment
-        (resolved_at accounting + the L2.5 hook) even with an explicit schema — the
-        per-sequence-class annotation schema route (§7.4); False = internal treatment."""
+    async def complete_validated(
+        self,
+        profile: str,
+        prompt: PromptBundle,
+        schema: dict | None = None,
+        *,
+        scope: CallScope = CallScope(),
+    ) -> tuple[dict, Usage, int, str]:
+        """执行既有通用 L0 至 L3 验证契约。
 
-    def validate_only(self, obj: dict, schema: dict | None = None) -> list[str]:
-        """Full-violation list (Draft202012Validator.iter_errors), rendered
-        '<json-pointer>: <message>'. Empty list = valid. Used by M1 (few-shot outputs) and
-        M11 (pre-write final check)."""
+        @param profile LLM profile 名称。
+        @param prompt 完整 prompt bundle。
+        @param schema 可选的完整 Draft 2020-12 Schema。
+        @param scope 调用计数与 trace 作用域。
+        @return 已验证对象、usage、尝试次数与模型名称。
+        """
 
-    @property
-    def stats(self) -> dict:
-        """{"l0_or_clean": int, "l1": int, "l3_1": int, "l3_2": int, "rejected": int}
-        — USER-TREATMENT calls only (v1.13 restatement of "user-schema calls only": a
-        per-sequence-class annotation call passes an explicit schema yet is still a
-        record-level annotation and IS counted; frame-level and internal-schema calls are
-        not — spec §6.4's identity becomes "the sum = the number of RECORD-LEVEL annotation
-        calls entering M5"). [FROZEN HERE]"""
+    async def complete_post_validated(
+        self,
+        request: PostValidatedCallRequest,
+    ) -> ValidatedGenerationCall:
+        """对每个 L2 候选恰验证一次并返回匹配的执行证明。
+
+        @param request 含 request-local 后置验证器的完整调用请求。
+        @return 已验证对象及该同一候选的执行证明。
+        """
 ```
 
-Layer definitions (normative, spec 3.8.2): **L0** — if the profile has
-`supports_structured_output`, pass `schema` to `LLMClient.complete(response_schema=...)`;
-validation still always runs. **L1** — pure function, in order: strip Markdown code fences → take
-the first balanced-braces substring → `json_repair.loads()`; expose it as
-`def deterministic_repair(text: str) -> dict | None` (module-level, unit-testable)
-**[FROZEN HERE]**. **L2** — `Draft202012Validator.iter_errors()`, all violations collected.
-**L3** — repair prompt per §10.6 as a single user message, profile = `cfg.repair_llm or
-calling profile`, at most `cfg.max_repair_attempts` rounds, each repair output re-runs L1→L2;
-exhausted → `SchemaViolation(errors, raw_last_output)`. Bucketing: clean L2 pass on first
-response (whether L0 was active or L1 trivially parsed with no fence/repair needed) →
-`l0_or_clean`; L1 had to fix something and L2 then passed → `l1`; passed after repair round 1/2 →
-`l3_1`/`l3_2`; exhausted → `rejected`. Internal schema constants (module-level in
-`labelkit/common/runtime/schema_engine.py`, imported by stages) — exact JSON in §10.7:
+For every first response or L3 candidate that passes L2, `complete_post_validated` calls the
+request's validator exactly once. Non-empty string violations with
+`event_execution is None` enter the same bounded L3 list with `(post-validator)` prefixes.
+Empty violations plus a non-null EventExecution are the only success shape. Any other shape,
+non-string violation or non-`PostValidationResult` return is `post_validator_invalid`;
+callback exceptions are `post_validator_exception`. Those two terminal candidate errors do
+not enter L3 and never include exception text or user content. L3 receives violations only,
+never state, EventExecution or hook exceptions. The accepted EventExecution is returned and the
+caller must not execute the patch or state hook again.
+
+Post-validators are request-local and are never stored on SchemaEngine. Scenario seed, frame
+render, semantic evaluation and noise use `complete_validated`; only event planning uses
+`complete_post_validated`. Existing `output.validator` L2.5 semantics do not apply to these
+internal generation Schemas. `ValidatedGenerationCall.resolved_at` records the successful
+candidate's exact internal path and never increments the global user-Schema
+`report.schema_engine.resolved_at` ledger.
+
+The v1.18 internal builders are exact and their JSON is frozen in §10.7:
 
 ```python
-def judgment_schema(criteria_keys: list[str], with_reason: bool) -> dict: ...
-def pointwise_schema(criterion_key: str) -> dict: ...
-VERDICT_SCHEMA: dict
-def samples_schema(num_per_call: int) -> dict: ...
-def classification_schema(class_names: list[str], assignment: str,
-                          max_labels: int, with_reason: bool) -> dict: ...   # v1.7 (M13), §10.7
-def segment_window_schema(frame_count: int, with_reason: bool) -> dict: ...  # v1.8 (M14), §10.7
-def action_schema() -> dict: ...                                             # v1.8 (M15), §10.7
-def stitch_schema() -> dict: ...                                             # v1.9 (M16), §10.7
-def defect_verdict_schema() -> dict: ...                                     # v1.8 (M7 stream);
-                                                                             # v1.9: kind enum
-                                                                             # +wrong_stitch, §10.7
-def frame_classify_schema(names: Sequence[str], n: int) -> dict: ...         # v1.12 (M13 frame), §10.7
-def plan_schema(names: Sequence[str], length: int,
-                cover_all: bool = False) -> dict: ...                        # v1.13 (M6 blueprint), §10.7;
-                                                                             # v1.14 adds cover_all
-def brief_schema(length: int) -> dict: ...                                    # v1.16 constrained M6
-                                                                             # sampled-brief call, §10.7
-def realize_schema(step_schemas: Sequence[dict]) -> dict: ...                # v1.13 (M6 realize), §10.7
+def scenario_seed_schema(
+    actor_names: Sequence[str] | None,
+    state_schema: Mapping[str, object],
+) -> dict: ...
+
+def event_plan_schema(
+    frame_names: Sequence[str],
+    actor_names: Sequence[str],
+) -> dict: ...
+
+def semantic_evaluation_schema() -> dict: ...
+def noise_semantic_evaluation_schema() -> dict: ...
 ```
 
-`plan_schema`'s `cover_all` (v1.14, 裁决·蓝图双向硬约束) is a keyword with default False, so the
-function stays at three parameters and every v1.13 call site and test is untouched: **False emits
-byte-identical output to v1.13**. True appends, to the `steps` array object, an `allOf` carrying
-ONE `contains` branch per name in the passed order — each branch being
-`{"contains": {"type": "object", "properties": {"frame_class": {"const": <name>}},
-"required": ["frame_class"]}}`. A schema object has exactly one `contains` slot, which is why
-multiple classes need separate `allOf` branches. The enum already spans the passed `names`, so
-the SUBSET semantics are carried entirely by what M6 passes (the constructor is subset-unaware);
-enum gives "⊆" and `contains` gives "⊇", composing to "the step frame-class set EQUALS the tier's
-declared composition". Keyword-freeze consequence: the frozen internal-schema keyword set gains
-`allOf` / `contains` / `const` (tests asserting the allow-list must widen, and a schema-keyword
-walker must recurse through `allOf`). `realize_schema` is UNCHANGED in signature and behavior —
-the v1.14 reduced schema is derived M6-side and passed in (§7.5).
-
-Violation rendering (v1.14, 裁决·渲染缺类可见): `_render_error` gains a **`contains` branch**
-beside the existing `enum` branch. A blueprint cover violation renders as
-`steps: missing required frame_class "<name>"`, taking the name from the `const` inside
-`error.validator_value`'s `frame_class` property; a `contains` violation of any OTHER shape (a
-user schema may legitimately use `contains`) falls back to jsonschema's own message. Rationale:
-on an L0-off endpoint the L3 repair prompt MUST name the missing frame class or its guidance
-value collapses to zero (the else branch renders a bare array repr). The text is English like
-every other rendered violation, and the value-free discipline is intact — a frame-class name is a
-CONFIG quantity, not data content.
-
-The three v1.8 builders, the v1.9 `stitch_schema`, the v1.12 `frame_classify_schema` and the
-two v1.13 builders are INTERNAL schemas like the rest: no `resolved_at` bucket counting, no
-L2.5 hook, and NO
-`uniqueItems` anywhere (R1 lesson — L0 strict-mode pass-through). The non-stream verify
-path keeps using the frozen `VERDICT_SCHEMA`; `defect_verdict_schema()` exists ALONGSIDE it
-(two verdict schemas co-exist, S7 — its defect-kind enum grows to six values in v1.9 with
-`wrong_stitch` appended last, T15).
-
-**Keyword-freeze scope (v1.13 rewrite of "keyword set ⊆ the frozen internal-schema keyword
-set").** The freeze covers **the LabelKit-side constructors' own scope** plus the `realize`
-wrapper's skeleton keys (`prefixItems`, `items: false`, `minItems`/`maxItems`,
-`additionalProperties`, `required`, `type`, `enum`) — it does NOT extend into
-`realize_schema`'s POSITIONAL SUB-SCHEMAS, which are USER-authored frame-class generation
-schemas (`[frame.class.<name>.generate].schema_*`, M1 meta-validated) wrapped verbatim and
-passed through L0 exactly like `output.schema` is today. There is deliberately NO keyword
-allow-list lint on them (裁决·用户生成 Schema 的 L0 待遇); the escape hatch for strict routes
-that reject `prefixItems` is configuration-level `supports_structured_output = false`, never a
-per-call parameter.
-
+Frame render and noise render pass the selected user-authored object frame Schema directly.
+The event planner Schema allows only `test|add|remove|replace`; executable ordering,
+permissions, Schema and hook checks belong to the post-validator. The schema engine does not
+define or recognize any deleted sequence-specific schema name.
 ### 7.8 M9 — `labelkit/common/runtime/llm_client.py`
 
 Dataclass-mirror language note (2026-08-14): the shapes below stay frozen field for field, but the
@@ -4391,112 +3735,38 @@ v1.12 frame-granularity estimate (SPEC-frame-annotation 裁决·估算上界与 
   `classify_calls + frame_classify_calls`, annotate ↦ `annotate_calls +
   frame_annotate_calls`; the panel gains no new rows — §7.12 territory).
 
-v1.13 time-stream generation (SPEC-stream-generation §3.7; spec 3.10.3 时间流生成 row):
+v1.18 sequence-delivery orchestration:
 
-- **Driver branch.** `_run_generate` forks on `cfg.generate_stream.enabled` at its entry:
-  the time-stream form awaits `gen.generate_stream_all(ctx0)` ONCE (as a guarded task, the
-  flat path's construction — a SIGINT's 30 s timer can cancel it; the elapsed time still
-  lands in `timing.per_stage_s.generate`; a mid-generation interrupt yields no product, no
-  artifact, no batches and finalize still runs with `interrupted=true`). The flat
-  seed-pool / seedless path is code-unchanged. On success, in order: ① the artifact is
-  staged FIRST (below) ② `counts.generated = len(envelopes)` ③ envelopes are sliced by
-  `run.batch_size` through `_compose_chain(include_generate=False)` — the ENVELOPES are
-  dispatched as-is, never rebuilt from their records (that would drop session_id /
-  classification / member_classifications). `--limit` already truncated at M6's planning-phase
-  quota layer; M10 re-truncates belt & braces.
-- **Artifact ownership.** M6 finalizes the row content, M11 owns the channel and the delivery
-  discipline (§7.10), and M10 hands over exactly once via
-  `emitter.write_stream_artifact(lines)` BEFORE any batch dispatch. `report.run.artifact`
-  (`path` / `sha256` / `lines`) is read back from the emitter at report-assembly time and is
-  present ONLY when the artifact was actually written (absent under dry-run and with the form
-  off).
-- **`estimate_run` EXACT replay.** The generate_only branch reuses M6's planning-phase pure
-  function `plan_stream(cfg, Random(f"{seed}:0:generate"))` — an exact replay of the length and
-  noise draws, NOT an upper bound: `records = Σsequences` (post-`--limit`),
-  `generate_calls = 2 × records + ceil(noise frames / num_per_call)` (blueprint + realize +
-  noise batches all folded into the EXISTING key), `classify_calls = 0` (inherited labels, zero
-  verdict calls — the v1.7 R11 idempotency philosophy), quality/annotate/verify bases =
-  `records`, `batches = ceil(records / batch_size)`. **The estimate line format is UNCHANGED**
-  (no new keys; `_ESTIMATE_CALL_KEYS` / `_STAGE_CALL_KEYS` and the panel rows are untouched) —
-  the SEVEN pre-existing dry-run goldens stay BYTE-FROZEN and only an eighth,
-  `tests/cli/goldens/dryrun-synth-stream.txt`, joins the pytest-enforced set (eight goldens
-  total, five example directories / eight projects, §7.12 + spec §7.8).
-- **`report.generate.stream`.** Assembled here from the `generate.stream.*` counters M6 feeds
-  (counts-only, key set and key order frozen; the `sequences` histogram is laid out zero-based
-  over `[[classify.classes]]` in declaration order — the `report.classify` convention). The
-  `report.stream` node does NOT appear (that is segment's observability surface) and
-  `report.classify`'s histogram is legitimately all-zero.
-  **`tiers` sub-block (v1.14, 裁决·报表显式装配; TWO FORMS since v1.15, 裁决·嵌套报表全类铺开).**
-  This section is EXPLICIT KEY ASSEMBLY, not a
-  counter prefix tree, and the `tiers` sub-block must be assembled the same way. Presence gate
-  (UNCHANGED): `cfg.generate_stream.tiers` non-empty — the global table is the anchor, so this
-  single test still decides the whole tier face. Form gate (v1.15):
-  `any(view.tiers is not None for view in cfg.class_views.values())`.
-  - **FLAT form** (no class declared its own table): iterate the DECLARED GLOBAL table (stored
-    tier_rank ascending, so iteration order IS rank order) and lay it out zero-based as
-    `{"<tier_rank>": {"planned": …, "produced": …}}`, each value being the SUM ACROSS CLASSES of
-    the `generate.stream.tiers.<class>.<rank>.*` counters at that rank (§7.5 — M6 always feeds the
-    class-segmented keys). Numerically byte-identical to v1.14, whose flat counters were
-    cross-class aggregates already.
-  - **CLASS-NESTED form** (at least one per-class table): lay out
-    `{"<class>": {"<tier_rank>": {"planned": …, "produced": …}}}` — the OUTER level zero-based
-    over ALL DECLARED classes in `[[classify.classes]]` declaration order (the
-    `sequences.<class>` / `report.classify` convention), the INNER level over that class's
-    EFFECTIVE table (`effective_tiers(view.tiers, cfg.generate_stream.tiers)`, §6.1) in rank
-    order. Zero-quota classes and fully-voided tiers appear as 0/0.
-
-  Both forms use decimal-string rank keys, and the report is written without `sort_keys`, so key
-  order equals insertion order in both. **Key position is FROZEN between `sequences` and `frames`**
-  (adjacent to the quota family) in both forms. Assembling
-  from the declaration — rather than from whichever counters happened to fire — is what puts
-  zero-quota tiers and fully-voided tiers in the report at all (`planned` 0 / `produced` 0,
-  faithfully). With no global tier table the key is ABSENT. This is the same family of trap as
-  E2E-FINDINGS #11 (a counter silently dropped by a report allow-list), caught at the spec layer
-  this time.
-
-v1.16 sequence-rule orchestration (spec 3.10.3 / 6.4):
-
-- **Estimate shares the plan.** `estimate_run` continues to call
-  `plan_stream(cfg, Random(f"{run.seed}:0:generate"))`; on the constrained branch that call uses
-  the same question construction, one-per-attempt length preferences, CP-SAT solve and optimal
-  noise-slot count as M1/M6. `records` remains the post-`--limit` attempt count and
-  `generate_calls = 2 * records + ceil(planned_noise_slots / generate.num_per_call)`. Rules,
-  correlation, windows and the sequence hook add no call category, estimate key, console row or
-  dry-run line. Dry-run performs the solve but sends no LLM request and cannot advance the live
-  RNG. The eight v1.15 dry-run goldens are byte-frozen when no actual-prefix constraint is active.
-- **No second formula.** M10 may read the returned `StreamPlan`; it may not derive feasible
-  lengths, frame words, crossings, noise slots or duplicate order itself. A disallowed solver
-  status follows §7.18 and aborts; estimate never substitutes a bound, old weaver or relaxed
-  schedule.
-- **Explicit conditional report assembly.** Define the v1.16 report face as active when the actual
-  prefix has effective rules/windows or `generate.sequence_validator` is configured. The existing
-  stream key order starts `sessions`,
-  `crossed_sessions`, `sequences`, optional `tiers`. Immediately after `tiers` (or after
-  `sequences` when tiers is absent) M10 conditionally inserts `rules`,
-  `sample_validator_scrapped`, `sequence_validator_scrapped`, and `windows`, in that order, then
-  resumes at `frames`. `rules` is present iff an attempt in the actual nonzero quota prefix has a
-  non-empty effective rule table; it is
-  `{"sampled", "correlation_scrapped", "temporal_scrapped"}` in that exact key order.
-  `sample_validator_scrapped` is present iff the v1.16 face is active for the actual nonzero quota
-  prefix (effective rules/windows or the sequence hook) and the pre-existing sample hook is
-  configured; sample-validator-only configuration preserves v1.15 report bytes.
-  `sequence_validator_scrapped` is present iff the sequence hook is configured. `windows` is present
-  iff an actual-prefix attempt has a non-empty effective window table and contains only
-  `calendar_days_spanned`. Every present block/key is emitted with explicit zero values rather
-  than relying on first counter touch. Zero-quota or prefix-truncated classes cannot create these
-  faces, though M1 still validates them.
-- **Calendar-day report source.** `calendar_days_spanned` counts fixed-offset local natural days
-  inclusively from the earliest to latest surviving non-noise task frame, including duplicate
-  tails; no survivor means zero. Rules/windows themselves remain absent from artifact rows and
-  main-output metadata.
-- **Scrap conservation.** M10 exposes M6's single-feed counters without recomputing them and
-  asserts/keeps the identity `validator_scrapped = sample_validator_scrapped +
-  correlation_scrapped + temporal_scrapped + sequence_validator_scrapped`. Similarity-filtered
-  sequences remain represented only by the existing bucket `survived_dedup` shortfall.
-- **No orchestration surface growth.** The driver, emitter handoff, artifact summary, stage chain,
-  trace catalog, status tally and conservation equation are unchanged. When all new conditions
-  are absent, report key presence/order and serialized bytes are v1.15-equivalent.
-
+- **Separate driver.** `Orchestrator.run` branches on
+  `cfg.generate.form == "sequence"` before the flat `_run_generate` path. It calls
+  `compile_generation_program(cfg)`, then `compile_scenario_plan(program, cfg.run.seed)`,
+  derives `run_attempt_id` and self-reference-free `run_id`, materializes
+  `RuntimeCredentials` only after compile succeeds, and invokes
+  `deliver_generation(DeliveryRequest(...), DeliveryServices(...))`. The sequence branch
+  never calls `GenerateStage`, `_process_batch` or `Emitter.emit_batch`.
+- **Layer direction.** `orchestrator.py` and
+  `orchestration/generation_delivery.py` may import common and operators. No generation
+  operator imports Orchestrator or orchestration. All complex arguments cross the seam as the
+  frozen request/service carriers in §7.18.
+- **Terminal ownership.** DeliveryError is exit 1. Provider fatal, breaker trip,
+  KeyboardInterrupt and CancelledError escape attempt collaborators unchanged and end the run
+  at exit 4 without consuming a slot attempt. Sequence SIGINT never delivers an accepted prefix.
+  Plan infeasible is exit 2; plan budget/internal, collaborator contract failure and commit I/O
+  are exit 4. Flat/process partial-delivery and graceful-interrupt behavior remain unchanged.
+- **Estimate.** `estimate_run(cfg, plan)` keeps the existing top-level key order and
+  `total_calls` formula. For sequence, `generate_calls` is the sum of the seven ordered
+  generation keys `scenario_seed_calls`, `baseline_event_plan_calls`,
+  `variant_event_plan_calls`, `frame_render_calls`,
+  `semantic_evaluation_calls`, `noise_render_calls`,
+  `noise_evaluation_calls`. These appear once under `sequence_calls`; they are not
+  separately added to `total_calls`. Existing top-level quality, annotate,
+  frame-annotate and verify keys are attempt upper bounds. Dry-run additionally exposes exact
+  planned sets, primary sequences/events, noise events, replay sequences and stream rows,
+  plus `successful_attempt_lower_bound` and the max-slot-attempt upper bound. Catalog seed
+  calls are zero; protected prefixes add no plan/render call.
+- **Report assembly.** The delivery controller supplies the frozen sequence report node and
+  usage accumulated across every attempt. M10 does not infer counters from terminal
+  PipelineItems and does not add old stream/quota/tier/brief/realize/shortfall keys.
 ### 7.10 M11 — `labelkit/operators/emitter.py`
 
 ```python
@@ -4532,22 +3802,6 @@ class Emitter:                                     # signatures [FROZEN HERE]
         immediately (the CLI panel owns the display; mid-run degradation and `q` detach are
         the RENDERER's job — it keeps printing plain lines from the same console_format)."""
 
-    def write_stream_artifact(self, lines: Sequence[str]) -> None:
-        """v1.13 FIFTH output channel (裁决·时间流工件通道) [FROZEN HERE]. Writes the
-        weave-order-final artifact rows handed over by M6 into
-        {output_stem}.stream.jsonl.part (write + flush); the path rule is
-        `Path(cfg.run.output).with_suffix("") + ".stream.jsonl"`, derived INDEPENDENTLY of
-        M6's `stream_artifact_path` (operators never import each other; the equality is
-        test-pinned). Delivery rides the SAME finalize batch as the main output (fsync +
-        atomic rename) and shares the `_undeliverable` discipline — an unwritable channel or
-        a failed write sets the flag, after which finalize renames nothing (a truncated
-        artifact never masquerades as a finished one; the exit-4 family). Dry-run never
-        reaches this method (`_run_dry` drives no generation and opens no channels). The call
-        also freezes `self.artifact_summary = {"path", "sha256", "lines"}` (sha256 over the
-        bytes as written, `config_digest`'s "sha256:" prefix form) for M10's
-        `report.run.artifact` (§9.3). The emitter neither produces nor validates artifact row
-        content — M6 finalizes it (§9.5)."""
-
     def finalize(self, report: Mapping, deliver: bool = True) -> None:
         """fsync + atomic os.rename {output}.part → {output} (and sidecar) when deliver=True;
         always writes {output_stem}.report.json (cfg.dry_run diverts to {output_stem}.dryrun.report.json,
@@ -4569,8 +3823,6 @@ class Emitter:                                     # signatures [FROZEN HERE]
 File names: main `run.output`; temp `run.output + ".part"` (same directory); sidecar
 `{output_stem}.meta.jsonl` (temp `+ ".part"`); rejects `{output_stem}.rejects.jsonl` (streamed,
 no .part — it is an append log like trace **[FROZEN HERE]**); report `{output_stem}.report.json`;
-v1.13 stream artifact `{output_stem}.stream.jsonl` (temp `+ ".part"`, delivered in the main
-output's finalize batch — time-stream generation form only **[FROZEN HERE]**).
 `output_stem` = output path minus final suffix. Line formats: §9.
 
 v1.7: `_assemble_meta` gains the ALWAYS-PRESENT `classification` key (`null` when classify is
@@ -4617,32 +3869,82 @@ off-mode byte-equivalence condition, m-11):
 - Stitched shells and rescue-flipped frames never produce output lines (fourth/third route);
   `--strict` semantics note in §9.2.
 
-v1.13 (spec 3.11.2 v1.13 rows) — three deltas, everything else zero-change:
+v1.18 sequence delivery adds a separate delayed emitter and leaves the ordinary Emitter
+contract above unchanged:
 
-- **Per-row pre-write schema.** `emit_batch`'s final `validate_only` takes the ROW's
-  CLASS-EFFECTIVE schema: `item.classification.label` → that class's declared annotation
-  schema override, else None ⇒ the existing global-`output.schema` default path (byte-identical
-  to v1.12). multi fan-out siblings each carry their own label, so rows align naturally. M11
-  does NOT import M5's lookup functions (operator isolation, spec §2.2) and keeps a MINIMAL
-  in-module mirror `{class name: schema}` built from `cfg.class_views`; the two sides'
-  semantics must agree (test-pinned).
-- **`_meta.stream` gate widening.** The block's gate becomes `segment.enabled ∨
-  generate_stream.enabled`, and so do the `members[]` presence gate and its `label` column.
-  Direct-assembly rows reuse the block verbatim: `order_span` /`member_sources` point at the
-  ARTIFACT path and line numbers, `members[]` entries are `{index, id, label}` (the label is
-  the blueprint's frame-class ground truth; the form is mutually exclusive with
-  `frame.annotate`, so the `annotation`/`status` columns are absent — the v1.12 conditional
-  column rule is compatible), `session_split=false`, `repaired=false`, `degraded=null`,
-  `steps=null`, no `thread_id`/`fragments`.
-- **Rubric mirror.** `_meta.run.rubric`'s empty-selector resolution mirror widens to
-  `segment.enabled ∨ generate_stream.enabled ⇒ "default:trajectory"` (changed together with
-  the loader, §6.3 rule 56).
+```python
+class SequenceDeliveryEmitter:
+    """装配最终序列行并把完整内存产物提交到固定工件路径。"""
 
-Zero-change (explicit): the `_meta` top-level key order, the four-route exclusivity (this form
-produces only active and dropped_*/failed — there are no absorbed/stitched envelopes because
-member frames are never enveloped), the rejects line key sets and (stage, reason) vocabulary,
-and the conservation identity (the generate_only degenerate form, §9.3).
+    def __init__(self, paths: ResolvedPaths):
+        """绑定 M1 已冻结的 sequence 输出路径。
 
+        @param paths 含 main、stream、report、manifest 与 failed-report 的冻结路径。
+        """
+
+    def assemble_sequence(
+        self,
+        item: PipelineItem,
+        projection: ProjectedSequence,
+        batch_no: int,
+    ) -> SequenceRows:
+        """从下游原地修改后的 item 装配最终内存行。
+
+        @param item 下游协作者处理后的唯一 PipelineItem。
+        @param projection 与该 item 对应的生成侧投影。
+        @param batch_no 交付批序号。
+        @return 最终 main/primary stream rows 与 retained-content 费用。
+        """
+
+    def prepare_product(
+        self,
+        main_rows: Sequence[Mapping[str, object]],
+        stream_rows: Sequence[Mapping[str, object]],
+        report: Mapping[str, object],
+    ) -> GenerationProduct:
+        """计算唯一 delivery digest，并冻结一个不可变产物。
+
+        @param main_rows 最终 main rows。
+        @param stream_rows 最终 primary、noise 与 replay rows。
+        @param report 尚未写入 delivery digest 的最终报告。
+        @return 含唯一 delivery digest 的不可变产物。
+        """
+
+    def commit(self, product: GenerationProduct) -> Mapping[str, object]:
+        """原子替换 main、stream 与 report，最后替换 manifest。
+
+        @param product 已冻结且带合法 delivery digest 的产物。
+        @return 已提交 manifest 对象。
+        """
+
+    def write_failed_report(self, report: Mapping[str, object]) -> None:
+        """原子替换不含数据的 failed report，且不触碰 success paths。
+
+        @param report 冻结失败报告对象。
+        @return None。
+        """
+```
+
+Construction and attempts open no main, stream, report, manifest, rejects or sidecar channel.
+`assemble_sequence` and `prepare_product` are pure-memory, zero-I/O methods with the exact
+§7.18.2 signatures. After every slot, noise, replay projection, retained-content check and
+CrossView reconciliation succeeds, `prepare_product` computes the sole delivery digest and
+deep-freezes the final report/rows. `commit` rejects an absent or malformed report digest before
+opening a `.part`; it never recalculates that digest. It writes canonical main, stream and report
+bytes to same-directory `.part` files, flushes and fsyncs each, then performs `os.replace` in the
+fixed order main → stream → report. It then computes the exact artifact SHA-256 values,
+writes/fsyncs the manifest `.part`, and replaces manifest last. The returned manifest has
+`artifacts_committed=true`. The only emitter-added wall-clock field is
+`manifest.committed_at`; it is excluded from IDs and delivery digest.
+
+A pre-commit DeliveryError, provider fatal, circuit trip, SIGINT or cancellation calls no
+`commit`; old fixed artifacts remain untouched. A rename failure after the first rename may
+leave mixed fixed paths, but the old manifest is never replaced, so its digests fail and
+consumers reject the set. No directory transaction or rollback is claimed. Failed report uses
+its own same-directory `.part`, flush, fsync and replace; it contains no data and never deletes
+or invalidates a valid prior manifest. Failure to write it preserves the primary exit code and
+logs only `generation_failed_report_io`, except when no primary error exists, where it is exit
+4.
 ### 7.11 M12 — `labelkit/common/observability/obslog.py`
 
 ```python
@@ -4862,7 +4164,7 @@ overrides: CliOverrides = CliOverrides()) -> ResolvedConfig`; `_cmd_validate` pa
 parsed overrides through, so `--console` reaches M1 and the jsonl × explicit-rich WARN
 (§6.3 Warnings) fires on the validate path too. With
 `--probe`, it calls `probe_referenced_profiles`, which uses
-`labelkit.orchestration.profile_usage.referenced_profiles` and `LLMClient.probe_all` on every
+`labelkit.common.runtime.credentials.referenced_profiles` and `LLMClient.probe_all` on every
 referenced profile (v1.6 — one line per key for pooled profiles; single-key output format
 unchanged); v1.10 (U13/U27): under `mode_resolved == "rich"` the probe result table is
 rendered as a table ONLY when stdout is a TTY — script consumers keep the current line
@@ -4875,7 +4177,7 @@ ALWAYS — its stdout is machine-consumed and never touched by console.mode (U13
 
 v1.8: `labelkit.orchestration.factory.build_stages` constructs `SegmentStage` and `ExtractStage`
 per their switches at their `_CHAIN_ORDER` slots (§7.9).
-`labelkit.orchestration.profile_usage.referenced_profiles()` (the `validate --probe` set) gains
+`labelkit.common.runtime.credentials.referenced_profiles()` (the `validate --probe` set) gains
 `segment.llm` ONLY when `segment.enabled` and `segment.strategy ∈ {llm, hybrid}`, and
 `extract.llm` whenever `extract.enabled` (S30, §6.3 rule 33 — the same conditions govern the
 existence/key-resolution/probe sets; v1.11 V3: `segment.llm` never joins the vision set —
@@ -5510,10 +4812,15 @@ TEMPLATE_HEAD_TOKENS: dict[str, int]                  # V22：per-stage 冻结�
                                                       #   _FRAME_SYSTEM_HEAD) / est_text(
                                                       #   annotate._FRAME_SYSTEM_STATIC)
                                                       #   （§10.12/§10.13 冻结模板头；
-                                                      #   M1 V13③ 两新段消费）；v1.16 增
-                                                      #   "generate_brief" = 126，钉住
-                                                      #   est_text(_BRIEF_SYSTEM_STATIC)，仅
-                                                      #   联合规划 sampled-brief 路径消费
+                                                      #   M1 V13③ 两新段消费）；v1.18 序列
+                                                      #   family 六键依次为
+                                                      #   "generation_scenario_seed" = 238、
+                                                      #   "generation_event_plan" = 280、
+                                                      #   "generation_frame_render" = 220、
+                                                      #   "generation_semantic_evaluate" = 282、
+                                                      #   "generation_noise_render" = 135、
+                                                      #   "generation_noise_evaluate" = 140，
+                                                      #   等于 §10.14–§10.19 system 全文 est_text
 
 def margin(context_window: int) -> int
 def input_budget(profile: LLMProfile) -> int          # cw − max_output_tokens − margin；cw==0 → 0（预算关）
@@ -5605,11 +4912,12 @@ Binding notes (from dev spec §3.2, normative):
   `_static_prompt_est` for every config (`segment.context` enters the guard as
   `est_text(context) + 1` covering its joining newline); the cross-layer test asserts
   against the same worst-case composition.
-- v1.16 adds `TEMPLATE_HEAD_TOKENS["generate_brief"] = 126`, exactly
-  `est_text(_BRIEF_SYSTEM_STATIC)` from §10.17. This is an additive key used only by the
-  constrained sampled-brief precheck; `generate_plan = 189`, `generate_realize = 95` and every
-  default-path budget constant remain unchanged. Effective correlation also makes the complete
-  realization prompt an indivisible static-precheck unit; runtime halving is not a fallback.
+- v1.18 removes every former sequence-generation budget key and freezes only the six
+  `generation_*` keys and values listed above. M1 checks the entire minimum PromptBundle plus
+  the entire active Schema, not merely the head. Runtime uses the actual complete prompt and
+  Schema. ScenarioSeed, ActorView, EventDraft semantic history, state, patch, payload and direct
+  semantic-review fields are indivisible; EventTrace is never a prompt carrier. No trimming,
+  summarization or halving is a sequence-generation fallback.
 - `feed_reactive_terminal` (v1.11 audit revision, A7): the shared exactly-once
   reactive-400 breaker feed — the `_breaker_fed` duck mark makes it idempotent per
   exception object; precheck and the 200-shaped finish oracle never feed. It lives in
@@ -5617,285 +4925,525 @@ Binding notes (from dev spec §3.2, normative):
   (schema_engine may not import operators); the M7 reclaim mark-only swallow point and
   the operators' overflow reject sites are the other feed points (§9.3 breaker matrix).
 
-### 7.18 Sequence-rule runtime — `labelkit/common/runtime/{declare,temporal,sequence_planner}.py`
+### 7.18 v1.18 sequence kernel and delivery seam
 
-> **v1.17 SUPERSESSION.** This whole cluster is DELETED by the v1.17 scenario-planning revision:
-> `labelkit/common/runtime/sequence_planner.py`, `declare.py`, `temporal.py` and
-> `labelkit/orchestration/profile_usage.py` are removed with NO shim, re-export or
-> compatibility module; the still-needed semantics moved to the canonical
-> `labelkit/common/runtime/scenario/` package (§7.19). The text below remains the frozen v1.16
-> record only.
+Physical ownership is fixed:
 
-This v1.16 common-runtime cluster is the sole implementation of sequence-rule semantics shared by
-M1, M6 and M10. It is not a Stage and has no IO, LLM call, persistence, cache or cross-run state.
-`sequence_planner.py` is the sole production import site for `ortools==9.15.6755`; no module may
-offer a handwritten solver, a second formulation, semantic alias, version adapter or fallback.
+- `common/config/generation.py` parses and validates the v1.18 sequence namespace.
+- `common/contracts/generation.py` owns the new v1.18 generation carriers in this section.
+- Existing generic carriers keep their single canonical owners: RuntimeCredentials in
+  `common/runtime/credentials.py`, ResolvedHook and ValidationHooks in
+  `common/extensions/hooks.py`, and ResolvedPaths in `common/config/model.py`. Their mirrors
+  below define the seam and never authorize duplicate declarations.
+- `operators/generation/program.py` compiles ResolvedConfig into GenerationProgram.
+- `operators/generation/planner.py` owns CP-SAT planning.
+- `operators/generation/scenario.py`, `state.py`, `render.py`, `evaluate.py` and
+  `project.py` own generation-side algorithms.
+- `orchestration/generation_delivery.py` owns slot attempts, downstream transactions,
+  terminal handling and delivery.
+- `operators/emitter.py` owns fixed-path commit and failed-report emission.
 
-`declare.py` stable surface:
+The dependency direction remains CLI → orchestration → operators → common. Generation modules
+may import common and their own sibling generation modules, but never orchestration. No module
+exports a deleted v1.13–v1.17 name.
 
-```python
-TEMPLATES: frozenset[str]  # exactly the 15 names below; no aliases
+#### 7.18.1 Exact shared carrier types
 
-@dataclass(frozen=True)
-class RuleSpec:
-    template: str
-    frame_class: str | None = None
-    source: str | None = None
-    target: str | None = None
-    count: int | None = None
-    time_s: tuple[Decimal, Decimal] | None = None
-    correlation: CorrelationSpec | None = None
-
-def validate_rules(rules: Sequence[RuleSpec | Mapping]) -> tuple[RuleSpec, ...]: ...
-def activation_positions(rule: RuleSpec | Mapping,
-                         word: Sequence[str]) -> tuple[int, ...]: ...
-def candidate_pairs(rule: RuleSpec | Mapping, word: Sequence[str],
-                    activation: int | None = None) -> tuple[CandidatePair, ...]: ...
-def evaluate_rule(rule: RuleSpec | Mapping, word: Sequence[str],
-                  timestamps: Sequence | None = None) -> RuleEvaluation: ...
-def canonical_equal(left: object, right: object) -> bool: ...
-def evaluate_payload_rules(rules: Sequence[RuleSpec | Mapping], word: Sequence[str],
-                           payloads: Sequence, timestamps: Sequence | None = None,
-                           ) -> PayloadEvaluation: ...
-def render_constraint_text(rules: Sequence, windows: Sequence) -> str: ...
-```
-
-The template set is exactly `existence`, `absence`, `exactly`, `init`, `end`,
-`responded_existence`, `co_existence`, `response`, `precedence`, `succession`,
-`alternate_response`, `chain_response`, `chain_precedence`, `not_co_existence`, and
-`not_succession`. A finite trace is non-empty. The cardinality templates implement `#A >= count`,
-`#A < count`, and `#A == count`; `init`/`end` inspect the first/last position. Implication
-templates are vacuously true when their activation set is empty. `co_existence` and `succession`
-evaluate both directions; a target occurrence has no capacity and may discharge multiple duties.
-`precedence` and `chain_precedence` activate on target positions while retaining the configured
-parameter order `source, target`. Crossing partners and noise never enter an owner's word, so
-`chain_*` adjacency is owner-sequence adjacency.
-
-Occurrence candidates are the standard structural candidates frozen in the dev spec: arbitrary
-other-position for responded/co-existence, later for response/succession/not-succession, earlier
-for precedence, before the next source for alternate-response, and the adjacent position for
-chain rules. Runtime evaluation derives `C0` from structure, `Ce` from type-sensitive correlation
-equality, and `Ct` from the time predicate, in that order. `canonical_equal` first compares JSON
-runtime type and then canonical JSON bytes (`sort_keys=True`, compact separators, no NaN): booleans,
-integers and floats remain distinct; object key order does not matter; array order does.
-
-`time_s=[lo, hi]` is the half-open integer-microsecond interval `[lo, hi)`. Directed templates
-measure `timestamp(target)-timestamp(source)`; responded-existence, co-existence and
-not-co-existence use absolute difference. The evaluator returns the first failure by effective
-rule declaration order, activation position, and source→target before target→source for
-bidirectional rules. Its `PayloadEvaluation` carries mutually exclusive per-attempt scrap
-attribution; an uncorrelated failure is an internal invariant failure rather than content scrap.
-
-`temporal.py` stable surface:
+All dataclasses are frozen. Mapping inputs are deep-copied to JSON-compatible values and exposed
+through `MappingProxyType`; tuple elements are immutable. Every production declaration carries
+a doxygen-style Chinese docstring and every production field a Chinese semantic comment.
 
 ```python
-@dataclass(frozen=True)
-class TimeInterval:
-    lo_us: int
-    hi_us: int
-    closed: bool = False
-    left_closed: bool | None = None
-    right_closed: bool | None = None
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Literal, Protocol, TypeAlias
+
+
+JsonObject: TypeAlias = Mapping[str, object]
+Violation: TypeAlias = Mapping[str, str]
+StateValidator: TypeAlias = Callable[["StateTransitionInput"], list[str]]
+ScenarioBlock: TypeAlias = Mapping[
+    tuple[str, str | None], tuple["PlannedEvent", ...]
+]  # 键为 (slot_key, variant_name)；hidden baseline 与 instruction-only 使用 None
+
 
 @dataclass(frozen=True)
-class DayWindow:
-    start_us: int
-    end_us: int
+class GenerationProgram:
+    mode: Literal["declared", "instruction_only"]
+    semantic_profile: str
+    evaluation_profile: str
+    max_slot_attempts: int
+    class_views: Mapping[str, ClassView]
+    frame_classes: Mapping[str, FrameClassView]
+    patterns: Mapping[str, SequencePattern]
+    counterfactual_sets: tuple[CounterfactualSetSpec, ...]
+    instruction_only: tuple[InstructionOnlySpec, ...]
+    timeline: TimelineSpec
+    calendar_windows: Mapping[str, CalendarWindowSpec]
+    noise: NoiseSpec | None
+    limits: GenerationLimits
+    state_validator: ResolvedHook | None
+    digest: str
+
 
 @dataclass(frozen=True)
-class CalendarWindow:
+class DeliverySlot:
+    slot_key: str
+    source_name: str
+    scenario_index: int
+    sequence_class: str
+    pattern_name: str | None
+    variant_names: tuple[str, ...]
+    catalog_row_index: int | None
+
+
+@dataclass(frozen=True)
+class PlannedEvent:
+    event_key: str
+    role: str
+    position: int
+    logical_time_us: int
+    timestamp_us: int
+    session_id: str
+
+
+@dataclass(frozen=True)
+class NoiseSlot:
+    event_key: str
+    ordinal: int
     frame_class: str
-    of_day: tuple[DayWindow, ...]
-    of_week: frozenset[int] = frozenset(range(7))
+    timestamp_us: int
+    session_id: str
 
-def quantize_time_s(bounds: Sequence) -> tuple[int, int]: ...
-def quantize_frame_gap(bounds: Sequence) -> TimeInterval: ...
-def timestamp_us(value: object) -> int: ...
-def timestamp_datetime(value: object) -> datetime: ...
-def fixed_offset(value: object) -> timezone: ...
-def parse_local_time(value: str) -> int: ...
-def normalize_calendar_window(value: object) -> CalendarWindow: ...
-def normalize_calendar_windows(values: Sequence) -> tuple[CalendarWindow, ...]: ...
-def in_calendar_window(value: object, window: object,
-                       offset: timezone | None = None) -> bool: ...
-def minimal_duplicate_shift(source_timestamps: Sequence, tail_end_us: int,
-                            stream_gap_us: int, windows: Mapping | None = None,
-                            ts_start: object | None = None) -> int: ...
-def replay_guard(frame_gap: TimeInterval, stream_gap_us: int) -> TimeInterval: ...
-```
 
-`quantize_time_s` rejects a non-exact microsecond endpoint and requires
-`1 <= lo_us < hi_us`. `quantize_frame_gap` uses `Decimal(str(value))`, ceiling for the lower
-endpoint and floor for the upper endpoint, and returns a closed interval. The replay guard is its
-intersection with closed `[1, stream_gap_s * 1_000_000]`. A selected positive witness carrying
-`time_s` removes the default frame-gap edge only when it covers that adjacent owner pair; its
-explicit interval still intersects the replay guard. A witness without `time_s` never removes the
-default edge. Non-adjacent explicit time measures total wall-clock difference while uncovered
-intermediate adjacent edges retain the default range.
+@dataclass(frozen=True)
+class ReplayLayout:
+    source_slot_key: str
+    source_variant_name: str
+    replay_ordinal: int
+    session_id: str
+    timestamps_us: tuple[int, ...]
 
-Calendar evaluation uses the fixed numeric ISO offset of `ts_start`; a naive `ts_start` means
-UTC. There is no IANA timezone or DST transition. Every occurrence of a named frame class must
-fall in one same-day half-open window and allowed weekday. `minimal_duplicate_shift` returns the
-smallest positive shift that clears the tail session gap: exact microseconds with no effective
-window, or an integer number of weeks when any effective window must be preserved.
 
-`sequence_planner.py` stable orchestration surface:
+@dataclass(frozen=True)
+class ScenarioPlan:
+    blocks: tuple[ScenarioBlock, ...]
+    delivery_slots: tuple[DeliverySlot, ...]
+    noise_slots: tuple[NoiseSlot, ...]
+    replay_layouts: tuple[ReplayLayout, ...]
+    primary_sessions: int
+    digest: str
 
-```python
-class PlannerStatus(str, Enum):
-    OPTIMAL = "OPTIMAL"
-    FEASIBLE = "FEASIBLE"
-    INFEASIBLE = "INFEASIBLE"
-    UNKNOWN = "UNKNOWN"
-    MODEL_INVALID = "MODEL_INVALID"
 
-def build_question(frame_classes: Sequence[str], attempts: Sequence,
-                   stream: object, generate_stream: object,
-                   solver_seed: int = 0) -> PlannerQuestion: ...
-def question_from_config(config: ResolvedConfig, attempts: Sequence | None = None,
-                         solver_seed: int = 0) -> PlannerQuestion: ...
-def check_local_candidates(config: ResolvedConfig) -> tuple[LocalCandidateResult, ...]: ...
-def solve_question(question: PlannerQuestion) -> PlannerResult: ...
-def select_feasible_plan(question: PlannerQuestion,
-                         rng: random.Random) -> tuple[PlannerQuestion, PlannerLayout]: ...
-def project_survivors(layout: PlannerLayout,
-                      survivors: Sequence[bool] | set[int]) -> ProjectedLayout: ...
-```
+@dataclass(frozen=True)
+class ScenarioSeed:
+    initial_state: JsonObject
+    actors: Mapping[str, JsonObject]
+    shared_facts: JsonObject
+    style: JsonObject
+    time_context: JsonObject
 
-`PlannerQuestion` is an immutable value containing the quota-prefix attempts, their allowed
-frame-class compositions/effective rules/effective windows/length domains, session and span
-limits, integer-microsecond time bounds, noise target and solver seed. `PlannerLayout` freezes the
-word and task timestamp tuple for every attempt, session ownership/frames, optimal noise slots,
-status and objective. M1, `estimate_run` and M6 construct semantically identical questions; M1
-uses an independent identically seeded RNG and cannot advance the runtime stream.
 
-`check_local_candidates` covers every declared class, each effective tier and every integer in
-`len_range`, including zero-quota classes. `select_feasible_plan` consumes one `rng.randrange`
-preference per actual attempt and solves one joint prefix-length/layout problem; it may not loop
-over candidates, derive candidate-specific feasibility, or retry a different preference. The same model
-couples active prefixes, word Booleans/automata, potential witnesses, timestamps, occurrence
-windows, session assignment, true crossing and noise presence. The sum of proto variable and
-constraint counts is capped at 250,000.
+@dataclass(frozen=True)
+class ActorView:
+    actor: str
+    goal: JsonObject
+    read_state: JsonObject
+    observations: tuple[JsonObject, ...]
+    logical_time_us: int
+    wait_since_previous_us: int
 
-Every solver uses CP-SAT automatic search with `num_search_workers=1`, the frozen 31-bit seed,
-`max_deterministic_time=10.0`, and no wall-clock timeout. Ordinary questions accept OPTIMAL or
-FEASIBLE; any noise-maximization question accepts OPTIMAL only. M1 maps INFEASIBLE to unsatisfied
-configuration and UNKNOWN to “not verified within deterministic budget”; MODEL_INVALID is
-`InternalError`. If M6 observes a disallowed status after M1 accepted the same question, it logs a
-value-free ERROR and raises `InternalError`; no status can enter a legacy or relaxed plan.
 
-`project_survivors` is the only post-content layout operation. It deletes failed owners and
-non-interior noise, removes empty sessions, renumbers surviving sessions by time and recomputes
-the true-crossed count without moving a timestamp. It does not solve or draw RNG.
+@dataclass(frozen=True)
+class EventPlan:
+    frame_class: str
+    actor: str
+    intent: str
+    patch: tuple[JsonObject, ...]
 
-The user-hook companion surface in `labelkit/common/extensions/hooks.py` is:
 
-```python
-def resolve_sequence_hook(ref: str) -> Callable[[SequenceValidationInput], object]: ...
-def clone_sequence_input(value: SequenceValidationInput) -> SequenceValidationInput: ...
-def invoke_sequence_hook(ref: str, value: SequenceValidationInput) -> list[str]: ...
-```
+@dataclass(frozen=True)
+class EventExecution:
+    state_before: JsonObject
+    state_after: JsonObject
+    state_before_hash: str
+    state_after_hash: str
+    publish_snapshot: JsonObject
+    normalized_patch: tuple[JsonObject, ...]
 
-`clone_sequence_input` deep-copies every payload. `invoke_sequence_hook` resolves the callable,
-passes only that clone and applies `normalize_violations`; user exceptions propagate to M6 for
-value-free sequence-scrap treatment. The hook is trusted same-process code, not sandboxed, and its
-external IO, wall clock and randomness are outside LabelKit's reproducibility guarantee.
 
-### 7.19 Scenario-planning runtime (v1.17) — `labelkit/common/runtime/scenario/` + `runtime/credentials.py`
+@dataclass(frozen=True)
+class EventDraft:
+    event_key: str
+    event_id: str
+    frame_class: str
+    actor: str
+    logical_time_us: int
+    timestamp_us: int
+    actor_view: ActorView
+    intent: str
+    patch: tuple[JsonObject, ...]
+    state_before_hash: str
+    state_after_hash: str
+    publish_snapshot: JsonObject
+    payload: JsonObject
 
-The v1.17 canonical package replacing §7.18. No third-party dependency is added (integer and
-time planning stay on the repo-locked `ortools==9.15.6755`; hook loading on stdlib `importlib`;
-fixed-offset calendar on stdlib `datetime`). Single responsibility per file:
 
-| 文件 | 单一职责 |
-|---|---|
-| `labelkit/common/runtime/scenario/model.py` | frozen quota/slot/layout/plan/stats dataclass |
-| `labelkit/common/runtime/scenario/quota.py` | period 展开、exact cohort、largest remainder、quota model 与逐类 target |
-| `labelkit/common/runtime/scenario/calendar.py` | fixed-offset schedule、frame window 与 period bucket |
-| `labelkit/common/runtime/scenario/rules.py` | frame rule 与 sequence rule 解析后的纯语义/evaluator |
-| `labelkit/common/runtime/scenario/planner.py` | `compile_scenario`、model assembly、solve、decode、digest |
-| `labelkit/common/runtime/scenario/sessions.py` | owner permutation、session/crossing/noise reserve builder |
-| `labelkit/common/runtime/scenario/diagnostics.py` | bounds、family stats、assumptions 与 exception |
-| `labelkit/common/runtime/scenario/noise.py` | frozen layout 上的 deterministic noise allocation |
-| `labelkit/common/runtime/credentials.py` | run/probe 的 secret materialization |
+@dataclass(frozen=True)
+class EventTruth:
+    event_key: str
+    event_id: str
+    role: str
+    frame_class: str
+    actor: str
+    logical_time_us: int
+    timestamp_us: int
+    actor_view: ActorView
+    intent: str
+    patch: tuple[JsonObject, ...]
+    state_before_hash: str
+    state_after_hash: str
+    publish_snapshot: JsonObject
+    payload: JsonObject
 
-#### 7.19.1 Hook carriers and scenario-validator inputs — verbatim
 
-落点：`ScenarioSequence`/`ScenarioValidationInput` → `labelkit/common/contracts/types.py`
-（SPEC-SP §4.9 明示，与既有 `SequenceValidationFrame`/`SequenceValidationInput` 同层并列——后者
-形状原样保留，`sequence_validator` 的输入契约零变化）；`ResolvedHook`/`ValidationHooks` →
-SPEC-SP §4.9 冻结形状的契约层载体（hook 解析层冻结，`ResolvedConfig.validation_hooks` 持有）。
-Planner-internal dataclass 一律落 `runtime/scenario/model.py`，两层不得混放。
+@dataclass(frozen=True)
+class ObservedEvent:
+    event_id: str
+    frame_class: str
+    timestamp_us: int
 
-```python
+
+@dataclass(frozen=True)
+class SemanticReviewEvent:
+    frame_class: str
+    actor: str
+    logical_time_us: int
+    wait_since_previous_us: int
+    actor_view: ActorView
+    intent: str
+    patch: tuple[JsonObject, ...]
+    state_before_hash: str
+    state_after_hash: str
+    publish_snapshot: JsonObject
+    payload: JsonObject
+
+
+@dataclass(frozen=True)
+class PatternEvaluation:
+    actual_bindings: Mapping[str, str]
+    actual_violations: tuple[Violation, ...]
+
+
+@dataclass(frozen=True)
+class StateEvaluation:
+    replay_hash: str
+    final_state_hash: str
+    bindings_valid: bool
+    outcome_valid: bool
+    protected_prefix_valid: bool
+
+
+_SEMANTIC_REASON_CODES = (
+    "causal_inconsistency",
+    "actor_knowledge_violation",
+    "goal_inconsistency",
+    "temporal_implausibility",
+    "cross_frame_inconsistency",
+    "unrealistic",
+)
+
+
+@dataclass(frozen=True)
+class SemanticEvaluation:
+    causal_consistency: bool
+    actor_knowledge: bool
+    goal_consistency: bool
+    temporal_plausibility: bool
+    cross_frame_consistency: bool
+    realism: bool
+    reason_codes: tuple[Literal[
+        "causal_inconsistency",
+        "actor_knowledge_violation",
+        "goal_inconsistency",
+        "temporal_implausibility",
+        "cross_frame_inconsistency",
+        "unrealistic",
+    ], ...]
+
+
+_NOISE_REASON_CODES = (
+    "related_to_declared_task",
+    "executable_task_present",
+    "unrealistic",
+)
+
+
+@dataclass(frozen=True)
+class NoiseSemanticEvaluation:
+    unrelated_to_declared_tasks: bool
+    no_executable_task: bool
+    realism: bool
+    reason_codes: tuple[Literal[
+        "related_to_declared_task",
+        "executable_task_present",
+        "unrealistic",
+    ], ...]
+
+
+@dataclass(frozen=True)
+class EventTrace:
+    scenario_id: str
+    world_branch_id: str
+    sequence_class: str
+    pattern_name: str | None
+    variant_name: str | None
+    scenario_seed: ScenarioSeed
+    events: tuple[EventTruth, ...]
+    final_state: JsonObject
+    pattern_evaluation: PatternEvaluation | None
+    state_evaluation: StateEvaluation
+    semantic_evaluation: SemanticEvaluation
+
+
+@dataclass(frozen=True)
+class GenerationParseContext:
+    project_root: Path
+    class_views: Mapping[str, ClassView]
+    frame_classes: Mapping[str, FrameClassView]
+    llm_profiles: Mapping[str, LLMProfile]
+    hook_loader: Callable[[str, Path], ResolvedHook]
+    collector: _Collector
+
+
+@dataclass(frozen=True)
+class ScenarioSeedRequest:
+    program: GenerationProgram
+    slot: DeliverySlot
+    attempt_index: int
+    random_seed: int
+
+
+@dataclass(frozen=True)
+class EventPlanRequest:
+    mode: Literal["declared", "instruction_only"]
+    semantic_profile: str
+    slot_key: str
+    planned_event: PlannedEvent
+    role: RoleSpec | None
+    generation_instruction: str
+    sequence_length: int
+    eligible_frame_classes: Mapping[str, FrameClassView]
+    eligible_actors: tuple[str, ...]
+    actor_view: ActorView | None
+    visible_state: JsonObject | None
+    history: tuple[EventDraft, ...] | None
+    actor_profiles: Mapping[str, JsonObject] | None
+    public_facts: JsonObject
+    attempt_index: int
+    variation_nonce: str
+
+
+@dataclass(frozen=True)
+class EventExecutionContext:
+    program: GenerationProgram
+    plan: ScenarioPlan
+    slot: DeliverySlot
+    variant_name: str | None
+    event_index: int
+    scenario_seed: ScenarioSeed
+    current_state: JsonObject
+    history: tuple[EventDraft, ...]
+
+
+@dataclass(frozen=True)
+class StateTransitionInput:
+    slot_key: str
+    variant: str | None
+    role: str | None
+    state_before: JsonObject
+    state_after: JsonObject
+    patch: tuple[JsonObject, ...]
+
+
+@dataclass(frozen=True)
+class PostValidationResult:
+    violations: tuple[str, ...]
+    event_execution: EventExecution | None
+
+
+CallPostValidator: TypeAlias = Callable[
+    [Mapping[str, object]], PostValidationResult
+]
+
+
+@dataclass(frozen=True)
+class PostValidatedCallRequest:
+    profile: str
+    prompt: PromptBundle
+    schema: JsonObject
+    scope: CallScope
+    post_validator: CallPostValidator
+
+
+@dataclass(frozen=True)
+class ValidatedGenerationCall:
+    object: JsonObject
+    event_execution: EventExecution
+    resolved_at: Literal["l0_or_clean", "l1", "l3_1", "l3_2"]
+    usage: Usage
+    attempts: int
+    model: str
+
+
+@dataclass(frozen=True)
+class RenderEventRequest:
+    semantic_profile: str
+    slot_key: str
+    planned_event: PlannedEvent
+    event_plan: EventPlan
+    actor_view: ActorView
+    publish_snapshot: JsonObject
+    state_before_hash: str
+    state_after_hash: str
+    binding_values: Mapping[str, object]
+    frame_spec: FrameClassView
+    role: RoleSpec | None
+    public_facts: JsonObject
+    attempt_index: int
+
+
+@dataclass(frozen=True)
+class StateEvaluationRequest:
+    program: GenerationProgram
+    slot: DeliverySlot
+    pattern: SequencePattern | None
+    variant: VariantSpec | None
+    scenario_seed: ScenarioSeed
+    events: tuple[EventTruth, ...]
+    baseline_events: tuple[EventTruth, ...]
+    final_state: JsonObject
+
+
+@dataclass(frozen=True)
+class CouplingEvaluationRequest:
+    variant: VariantSpec
+    baseline_events: tuple[EventTruth, ...]
+    events: tuple[EventTruth, ...]
+
+
+@dataclass(frozen=True)
+class SemanticEvaluationRequest:
+    evaluation_profile: str
+    mode: Literal["declared", "instruction_only"]
+    sequence_class: str
+    class_description: str
+    pattern_description: str
+    scenario_seed: ScenarioSeed
+    review_events: tuple[SemanticReviewEvent, ...]
+    final_state: JsonObject
+    attempt_index: int
+
+
+@dataclass(frozen=True)
+class NoiseRenderRequest:
+    semantic_profile: str
+    noise_slot: NoiseSlot
+    noise_spec: NoiseSpec
+    frame_spec: FrameClassView
+    class_descriptions: Mapping[str, str]
+    frame_descriptions: Mapping[str, str]
+    attempt_index: int
+
+
+@dataclass(frozen=True)
+class NoiseEvaluationRequest:
+    evaluation_profile: str
+    payload: JsonObject
+    class_descriptions: Mapping[str, str]
+    frame_descriptions: Mapping[str, str]
+    attempt_index: int
+
+
+@dataclass(frozen=True)
+class ProjectionRequest:
+    program: GenerationProgram
+    slot: DeliverySlot
+    trace: EventTrace
+
+
+@dataclass(frozen=True)
+class NoiseProjectionRequest:
+    program: GenerationProgram
+    run_id: str
+    noise_slot: NoiseSlot
+    payload: JsonObject
+
+
+@dataclass(frozen=True)
+class ReplayProjectionRequest:
+    program: GenerationProgram
+    layout: ReplayLayout
+    source: "SequenceRows"
+
+
+@dataclass(frozen=True)
+class ProjectedSequence:
+    main_record: Record
+    primary_stream_rows: tuple[JsonObject, ...]
+
+
+@dataclass(frozen=True)
+class SequenceRows:
+    main_row: JsonObject
+    primary_stream_rows: tuple[JsonObject, ...]
+    retained_content_bytes: int
+
+
+@dataclass(frozen=True)
+class ReplayRows:
+    rows: tuple[JsonObject, ...]
+    retained_content_bytes: int
+
+
+@dataclass(frozen=True)
+class ReconcileRequest:
+    plan: ScenarioPlan
+    sequences: tuple[SequenceRows, ...]
+    noise_rows: tuple[JsonObject, ...]
+    replay_rows: tuple[JsonObject, ...]
+
+
+@dataclass(frozen=True)
+class GenerationServices:
+    config: ResolvedConfig
+    schema_engine: SchemaEngine
+    llm: LLMClient
+    metrics: MetricsSink
+
+
+@dataclass(frozen=True, repr=False)
+class RuntimeCredentials:
+    llm: Mapping[str, tuple[str, ...]] = field(repr=False, compare=False)
+    embedding: Mapping[str, tuple[str, ...]] = field(repr=False, compare=False)
+
+
 @dataclass(frozen=True)
 class ResolvedHook:
-    """一个已按工程根目录解析并通过 synthetic probe 的校验器。"""
-
     reference: str
     target: Callable[..., list[str]] = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)
 class ValidationHooks:
-    """运行内四个校验阶段唯一使用的冻结 callable 集。"""
-
     output: ResolvedHook | None = None
     sample: ResolvedHook | None = None
-    sequence: ResolvedHook | None = None
-    scenario: ResolvedHook | None = None
-```
-
-`reference` is `<absolute-normalized-python-file>:<attribute-path>` for stable error location;
-the callable's repr and equality are both excluded. `ResolvedConfig.validation_hooks` holds this
-carrier, and report / trace / digest / config serialization may use ONLY the reference — never
-traverse or emit `target`. `scenario_validator(value) -> list[str]`; `accepted` is ordered by
-time then slot key, `candidate` is the current delivery slot; a non-empty violation list rejects
-ONLY the candidate and retries the SAME slot — accepted entries never roll back or reorder; a
-hook exception or illegal return value counts as a candidate violation (WARN once, independent
-failure bucket).
-
-```python
-@dataclass(frozen=True)
-class ScenarioSequence:
-    """场景校验器看到的一条已实现序列。"""
-
-    slot_key: str
-    sequence_class: str
-    start: str
-    end: str
-    frames: tuple[SequenceValidationFrame, ...]
+    state: ResolvedHook | None = None
 
 
-@dataclass(frozen=True)
-class ScenarioValidationInput:
-    """增量场景校验输入；candidate 是本次唯一可拒绝项。"""
-
-    accepted: tuple[ScenarioSequence, ...]
-    candidate: ScenarioSequence
-```
-
-#### 7.19.2 Paths parse product — verbatim
-
-落点：`labelkit/common/config/model.py`（`ResolvedConfig` 新增冻结 parse product 之一）。
-`project_root = Path(project_path).resolve().parent`，frozen right after the project TOML read
-succeeds; the relative paths of `run.input`/`run.output`, `output.schema_path`,
-`class.<name>.annotate.schema_path`, `frame.annotate.schema_path`,
-`frame.class.<name>.generate.schema_path`, `trace.path` and the four hook files all resolve
-against it. CLI `--input`/`--output` resolve against the invocation cwd FIRST, then join the
-CLI > project precedence. Whatever the source, `ResolvedConfig` keeps absolute normalized paths
-only (the raw text still feeds the digest; files are never rewritten). M2, M11, trace runtime,
-console and the stream-artifact helper consume `ResolvedPaths` ONLY — never re-derive
-cwd-relative paths. Live report is fixed `<output-stem>.report.json`, dry-run report
-`<output-stem>.dryrun.report.json`; M1 writes both into `ResolvedPaths.report` and emitter /
-console append no suffix by command mode; rejects / sidecar / trace / stream artifact are
-derived exactly once, in M1.
-
-```python
 @dataclass(frozen=True)
 class ResolvedPaths:
-    """运行涉及的全部绝对路径。"""
-
     project: str
     project_root: str
     input: str | None
@@ -5904,375 +5452,690 @@ class ResolvedPaths:
     rejects: str | None
     sidecar: str | None
     trace: str | None
-    stream_artifact: str | None
+    stream: str | None
+    manifest: str | None
+    failed_report: str | None
+
+
+@dataclass(frozen=True)
+class DeliveryRequest:
+    program: GenerationProgram
+    plan: ScenarioPlan
+    paths: ResolvedPaths
+    run_attempt_id: str
+    run_id: str
+
+
+@dataclass(frozen=True)
+class DeliveryServices:
+    generation: GenerationServices
+    dedup: DedupIndex
+    quality: DownstreamAttemptCollaborator | None
+    annotate: DownstreamAttemptCollaborator | None
+    verify: DownstreamAttemptCollaborator | None
+    emitter: SequenceDeliveryEmitter
+
+
+@dataclass(frozen=True)
+class AttemptTransaction:
+    items: tuple[PipelineItem, ...]
+    class_views: Mapping[str, ClassView]
+    projected_sequences: tuple[ProjectedSequence, ...]
+
+
+@dataclass(frozen=True)
+class DownstreamAttemptRequest:
+    transaction: AttemptTransaction
+    run_context: RunContext
+
+
+@dataclass(frozen=True)
+class DownstreamAttemptResult:
+    accepted: bool
+    rejected_stage: Literal["quality", "annotate", "verify"] | None
+    dataset_counters: Mapping[str, int]
+
+
+@dataclass(frozen=True)
+class DedupGroupRequest:
+    records: tuple[Record, ...]
+    exempt_pairs: frozenset[tuple[str, str]]
+    embedding_profile: str | None
+
+
+@dataclass(frozen=True)
+class DedupProbeToken:
+    capability_id: str
+    index_generation: int
+    record_digests: tuple[str, ...]
+    exact_features: tuple[str, ...]
+    minhash_features: tuple[object, ...]
+    embedding_features: tuple[tuple[float, ...], ...]
+
+
+@dataclass(frozen=True)
+class GenerationProduct:
+    main_rows: tuple[JsonObject, ...]
+    stream_rows: tuple[JsonObject, ...]
+    report: JsonObject
 ```
 
-`ResolvedConfig` gains exactly three frozen parse products: `paths: ResolvedPaths`,
-`validation_hooks: ValidationHooks`, `scenario_plan: ScenarioPlan | None` — raw config sections
-no longer carry callables, secret values, or strings awaiting downstream interpretation.
+The declaration order, annotations, nullable unions, tuple/Mapping containers, defaults,
+default factories and frozen property of every field above are normative. With the exception
+of public configuration defaults and the existing `CallScope` defaults, every nullable internal
+generation request/result field is explicitly supplied as `None`; no implicit default creates a
+second constructor surface. Tests compare `dataclasses.fields`, `typing.get_type_hints`, defaults
+and frozen parameters against a hand-written manifest rather than deriving expectations from the
+production class.
 
-#### 7.19.3 RuntimeCredentials and the secret-free config — verbatim
+`EventExecutionContext.history` is exactly `tuple[EventDraft, ...]` and
+`EventPlanRequest.history` is exactly `tuple[EventDraft, ...] | None`, non-null only for
+instruction-only mode. EventDraft deliberately has no `role`; EventTruth is not a generation-time
+history carrier and cannot be constructed for a declared branch before independent pattern
+binding succeeds.
 
-**Deletion face:** `LLMProfile.api_key`, `LLMProfile.api_keys`, `EmbeddingProfile.api_key`,
-`EmbeddingProfile.api_keys` are DELETED (§6.1's frozen blocks shrink accordingly) — profiles
-keep environment-variable NAMES only. `LLMClient.__init__` now receives `RuntimeCredentials`
-(the internal env fallback and profile secret fallback are deleted). Static load validates env
-names, profile references and capabilities but NEVER calls `os.environ.get`; validate without
-`--probe` and dry-run end there and emit no missing-key WARN; run and `validate --probe`
-aggregate-resolve key values for every referenced profile (any miss still exit 2). Credentials
-never enter dataclass repr, logs, trace, report, exceptions or deepcopy.
+`PostValidationResult`, `PostValidatedCallRequest` and `ValidatedGenerationCall` are declared
+once in `common/contracts/generation.py` and imported by M8; their repetition in §7.7 documents
+M8 ownership, not a second runtime class. RuntimeCredentials, ResolvedHook, ValidationHooks and
+ResolvedPaths remain declared only in the canonical generic modules named in §7.18; their shapes
+are mirrored here only because generation crosses those existing interfaces. `ScenarioBlock` keys are exactly
+`(slot_key, variant_name)`: hidden baseline and instruction-only use `None`; declared delivery
+branches use their configured variant name. `NoiseSlot` and `ReplayLayout` never enter a block
+and never impersonate `PlannedEvent`. A replay resolves its source only through
+`source_slot_key` plus `source_variant_name`; that variant must be positive, and the number of
+`timestamps_us` must equal the source event count.
 
-落点：`labelkit/common/runtime/credentials.py`（不属于 `ResolvedConfig`）。
+`ReconcileRequest.sequences` preserves delivery-slot/variant declaration order;
+`noise_rows` preserves NoiseSlot order; `replay_rows` is the flattened concatenation of each
+ReplayRows.rows in ReplayLayout order. The request carries final row objects, not pre-downstream
+records or ReplayRows wrappers.
+
+ValidationHooks contains only output, sample and state. There is no sequence/scenario validator.
+RuntimeCredentials is the only secret-bearing carrier; its dataclass repr is disabled and both
+fields are `repr=False, compare=False`. It is built after compile/plan and never enters report,
+prompt, trace, exception or ID material.
+
+#### 7.18.2 Exact interfaces
 
 ```python
-@dataclass(frozen=True, repr=False)
-class RuntimeCredentials:
-    """仅真实网络运行持有的 profile 密钥值。"""
+def parse_generation_config(
+    raw_project: Mapping[str, object],
+    context: GenerationParseContext,
+) -> SequenceGenerationConfig:
+    """解析 v1.18 序列配置并聚合全部配置错误。
 
-    llm: Mapping[str, tuple[str, ...]]
-    embedding: Mapping[str, tuple[str, ...]]
+    @param raw_project 原始项目配置。
+    @param context 配置解析所需的冻结上下文。
+    @return 完整校验后的序列生成配置。
+    """
+
+
+def compile_generation_program(config: ResolvedConfig) -> GenerationProgram:
+    """校验交付基数与 catalog 外壳，并冻结引用、预算和摘要。
+
+    @param config 完整解析配置。
+    @return 不含随机规划结果的冻结生成程序。
+    """
+
+
+def compile_scenario_plan(
+    program: GenerationProgram,
+    seed: int,
+) -> ScenarioPlan:
+    """求解并返回唯一可接受的 OPTIMAL 确定性 CP-SAT 计划。
+
+    @param program 冻结生成程序。
+    @param seed 运行随机种子。
+    @return 完整冻结的场景计划。
+    """
+
+
+def referenced_profiles(
+    config: ResolvedConfig,
+) -> tuple[list[str], list[str]]:
+    """收集活动路径按首次出现去重的 LLM 与 embedding profile 名称。
+
+    @param config 完整解析配置。
+    @return LLM profile 名称列表与 embedding profile 名称列表。
+    """
+
+
+def resolve_credentials(config: ResolvedConfig) -> RuntimeCredentials:
+    """仅在编译和规划成功后物化运行所需的 secret value。
+
+    @param config 完整解析配置。
+    @return repr 已脱敏的运行凭据。
+    """
+
+
+async def generate_scenario_seed(
+    request: ScenarioSeedRequest,
+    services: GenerationServices,
+) -> ScenarioSeed:
+    """生成或选择一个事件发生前的完整世界快照。
+
+    @param request 场景种子请求。
+    @param services 生成服务根。
+    @return 已通过 Schema 校验的场景种子。
+    """
+
+
+def build_event_plan_request(
+    context: EventExecutionContext,
+    attempt_index: int,
+    variation_nonce: str,
+) -> EventPlanRequest:
+    """从唯一执行上下文投影一个 prompt-safe 事件规划请求。
+
+    @param context 唯一事件执行上下文。
+    @param attempt_index 当前交付槽尝试序号。
+    @param variation_nonce 当前事件变化 nonce。
+    @return 不含隐藏或重复真值的事件规划请求。
+    """
+
+
+async def plan_event(
+    context: EventExecutionContext,
+    attempt_index: int,
+    variation_nonce: str,
+    services: GenerationServices,
+) -> tuple[EventPlan, EventExecution]:
+    """规划一个冻结事件并返回其唯一缓存执行证明。
+
+    @param context 唯一事件执行上下文。
+    @param attempt_index 当前交付槽尝试序号。
+    @param variation_nonce 当前事件变化 nonce。
+    @param services 生成服务根。
+    @return 事件计划与同一候选的执行证明。
+    """
+
+
+def execute_event(
+    context: EventExecutionContext,
+    event_plan: EventPlan,
+) -> EventExecution:
+    """在深拷贝状态上原子执行并校验一个事件。
+
+    @param context 唯一事件执行上下文。
+    @param event_plan 待执行的事件计划。
+    @return 规范化 patch 及执行前后证明。
+    """
+
+
+def post_validate_event_plan(
+    candidate: Mapping[str, object],
+    context: EventExecutionContext,
+) -> PostValidationResult:
+    """恰好一次后置校验一个 L2 候选并保留其执行证明。
+
+    @param candidate 已通过 L2 的候选对象。
+    @param context 唯一事件执行上下文。
+    @return 可修复违规或唯一成功执行证明。
+    """
+
+
+async def render_event(
+    request: RenderEventRequest,
+    services: GenerationServices,
+) -> Mapping[str, object]:
+    """渲染一个对象 payload，并按声明序机械覆盖 payload binding。
+
+    @param request 帧渲染请求。
+    @param services 生成服务根。
+    @return 通过完整帧 Schema 复验的 payload。
+    """
+
+
+def evaluate_pattern(
+    pattern: SequencePattern,
+    events: Sequence[ObservedEvent],
+) -> PatternEvaluation:
+    """在不读取 planner witness 的前提下绑定实际角色与违规。
+
+    @param pattern 待独立判定的序列模式。
+    @param events 按发生顺序排列的观察事件。
+    @return 实际角色绑定与实际违规闭集。
+    """
+
+
+def evaluate_state(request: StateEvaluationRequest) -> StateEvaluation:
+    """独立重放全部 patch，并校验状态、binding 与受保护前缀证明。
+
+    @param request 状态判定请求。
+    @return 独立状态判定结果。
+    """
+
+
+def evaluate_coupling(request: CouplingEvaluationRequest) -> bool:
+    """逐字节比较变体与基线的全部受保护前缀字段。
+
+    @param request 基线与变体耦合判定请求。
+    @return 全部受保护字段一致时为 true。
+    """
+
+
+async def evaluate_semantics(
+    request: SemanticEvaluationRequest,
+    services: GenerationServices,
+) -> SemanticEvaluation:
+    """使用 evaluation profile 判定完整且未裁剪的盲审语义输入。
+
+    @param request 不含结构目标与既有判定的语义审查请求。
+    @param services 生成服务根。
+    @return 六项布尔语义判定与闭集 reason code。
+    """
+
+
+async def render_noise(
+    request: NoiseRenderRequest,
+    services: GenerationServices,
+) -> Mapping[str, object]:
+    """使用 semantic profile 渲染一个独立 noise 对象。
+
+    @param request noise 渲染请求。
+    @param services 生成服务根。
+    @return 通过完整 noise 帧 Schema 的 payload。
+    """
+
+
+async def evaluate_noise(
+    request: NoiseEvaluationRequest,
+    services: GenerationServices,
+) -> NoiseSemanticEvaluation:
+    """独立于全部 primary 内容判定一个 noise payload。
+
+    @param request noise 语义判定请求。
+    @param services 生成服务根。
+    @return 三项布尔判定与闭集 reason code。
+    """
+
+
+def project_trace(request: ProjectionRequest) -> ProjectedSequence:
+    """把一个已接受 primary 分支投影为 main 与 primary stream 视图。
+
+    @param request primary 分支投影请求。
+    @return 尚未经过下游协作者装配的两个视图。
+    """
+
+
+def project_noise(request: NoiseProjectionRequest) -> Mapping[str, object]:
+    """把一个已接受 NoiseSlot payload 投影为最终 stream row。
+
+    @param request noise 投影请求。
+    @return 可直接交付的完整 noise stream row。
+    """
+
+
+def project_replay(request: ReplayProjectionRequest) -> ReplayRows:
+    """从最终装配的 source sequence rows 投影一次完整 replay。
+
+    @param request replay 投影请求。
+    @return 完整 replay rows 与其 retained-content 费用。
+    """
+
+
+def reconcile_views(request: ReconcileRequest) -> None:
+    """对 primary 双射、replay provenance 或 timeline 不一致 fail closed。
+
+    @param request 全量交付视图对账请求。
+    @return None。
+    """
+
+
+async def deliver_generation(
+    request: DeliveryRequest,
+    services: DeliveryServices,
+) -> GenerationProduct:
+    """以整次尝试的下游事务交付全部精确序列槽。
+
+    @param request 冻结计划、路径与运行身份。
+    @param services 唯一生成服务根及下游协作者。
+    @return 已成功提交的不可变生成产物。
+    """
+
+
+class DownstreamAttemptCollaborator(Protocol):
+    """不采用 Stage 记录隔离语义的 attempt-local 下游 gate。"""
+
+    async def run_attempt(
+        self,
+        request: DownstreamAttemptRequest,
+    ) -> DownstreamAttemptResult:
+        """执行一次事务 gate，并保持 run-terminal 异常原样穿透。
+
+        @param request 当前 attempt 唯一事务与运行上下文。
+        @return 接受状态、拒绝阶段与局部 dataset counter delta。
+        """
+
+
+class DedupIndex:
+    """支持 sequence-group 原子准入的全局 dedup index。"""
+
+    async def group_probe(
+        self,
+        request: DedupGroupRequest,
+        context: RunContext,
+    ) -> DedupProbeToken:
+        """无突变地计算 exact、MinHash 与可选 embedding 特征。
+
+        @param request 整组记录、豁免对与 embedding profile。
+        @param context 与 GenerationServices 共享对象身份的运行上下文。
+        @return 仅可被当前 index generation 消费一次的 probe token。
+        """
+
+    def group_commit(self, token: DedupProbeToken) -> None:
+        """无 await 地消费一个当前 token 并原子加入全部特征。
+
+        @param token 当前 index generation 的未消费 token。
+        @return None。
+        """
+
+
+class SequenceDeliveryEmitter:
+    """延迟打开输出的序列装配器与 manifest-last 固定路径提交器。"""
+
+    def assemble_sequence(
+        self,
+        item: PipelineItem,
+        projection: ProjectedSequence,
+        batch_no: int,
+    ) -> SequenceRows:
+        """从下游原地修改后的 item 装配最终内存行。
+
+        @param item 下游协作者处理后的唯一 PipelineItem。
+        @param projection 与该 item 对应的生成侧投影。
+        @param batch_no 交付批序号。
+        @return 最终 main/primary stream rows 与 retained-content 费用。
+        """
+
+    def prepare_product(
+        self,
+        main_rows: Sequence[Mapping[str, object]],
+        stream_rows: Sequence[Mapping[str, object]],
+        report: Mapping[str, object],
+    ) -> GenerationProduct:
+        """计算唯一 delivery digest，并冻结一个不可变产物。
+
+        @param main_rows 最终 main rows。
+        @param stream_rows 最终 primary、noise 与 replay rows。
+        @param report 尚未写入 delivery digest 的最终报告。
+        @return 含唯一 delivery digest 的不可变产物。
+        """
+
+    def commit(self, product: GenerationProduct) -> Mapping[str, object]:
+        """原子替换 main、stream 与 report，最后替换 manifest。
+
+        @param product 已冻结且带合法 delivery digest 的产物。
+        @return 已提交 manifest 对象。
+        """
+
+    def write_failed_report(self, report: Mapping[str, object]) -> None:
+        """尽力原子写入不含数据内容的 failed report。
+
+        @param report 冻结失败报告对象。
+        @return None。
+        """
+
+
+def derive_generation_id(
+    domain: str,
+    components: Sequence[object],
+) -> str:
+    """从冻结 canonical framed material 派生一个 v1.18 32-hex ID。
+
+    @param domain ID 域标签。
+    @param components 按声明顺序排列的 ID 组成值。
+    @return 32 位小写十六进制 ID。
+    """
+
+
+def canonical_delivery_row(row: Mapping[str, object]) -> bytes:
+    """移除 emitter-only wall-clock 字段后返回 canonical row bytes。
+
+    @param row 待参与 delivery digest 的输出行。
+    @return 固定 JSON 编码后的行字节。
+    """
+
+
+def validate_state(value: StateTransitionInput) -> list[str]:
+    """实现可选的用户状态转换校验 hook。
+
+    @param value 当前候选转换的只读深拷贝。
+    @return 空列表表示通过；非空 string 列表表示可修复违规。
+    """
 ```
 
-Both mappings are copied read-only at construction, keys sorted by profile name; values are
-deduplicated non-empty key tuples preserving the env-var declaration order. The object has no
-repr, exception or serialization path that displays a secret.
-
-**referenced_profiles 下沉 common 层：** exactly ONE collector
-`referenced_profiles(config)` lives in the common layer, shared by static validation,
-credential resolution, probe, runtime and estimate; `labelkit/orchestration/profile_usage.py`
-is DELETED with the second implementation — no shim (the §6.3 profile-navigation table's
-references to it re-point at the common-layer collector).
-
-#### 7.19.4 Scenario model dataclasses — verbatim (all land in `runtime/scenario/model.py`)
-
-```python
-@dataclass(frozen=True)
-class ScheduleSpec:
-    """planner 使用的有限 fixed-offset schedule。"""
-
-    start_us: int
-    end_us: int
-    utc_offset_minutes: int
-    exclude_dates: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class QuotaSpec:
-    """一张尚待展开 period bucket 的 quota。"""
-
-    name: str
-    period: Literal["day", "week", "schedule"]
-    of_week: tuple[int, ...]
-    counts: tuple[tuple[str, int], ...]
-    total: int | None
-    weights: tuple[tuple[str, int], ...]
-    allocation: Literal["exact", "largest_remainder"] | None
-
-
-@dataclass(frozen=True)
-class CorrelationSpec:
-    """frame rule 的类型敏感顶层字段相等约束。"""
-
-    source_field: str
-    target_field: str
-
-
-@dataclass(frozen=True)
-class FrameRuleSpec:
-    """一条带自然名称的同序列有限迹规则。"""
-
-    name: str
-    template: str
-    frame_class: str | None = None
-    source: str | None = None
-    target: str | None = None
-    count: int | None = None
-    time_us: tuple[int, int] | None = None
-    correlation: CorrelationSpec | None = None
-
-
-@dataclass(frozen=True)
-class FrameWindowSpec:
-    """一条带自然名称的 frame class 本地日历窗口。"""
-
-    name: str
-    frame_class: str
-    of_day_us: tuple[tuple[int, int], ...]
-    of_week: tuple[int, ...]
-
-
-@dataclass(frozen=True)
-class SequenceRuleSpec:
-    """一条跨 sequence occurrence 的周期规则。"""
-
-    name: str
-    template: Literal["precedence", "response", "succession", "not_co_existence"]
-    source: str
-    target: str
-    period: Literal["day", "week", "schedule"]
-    gap_us: tuple[int, int] | None = None
-
-
-@dataclass(frozen=True)
-class TierDomain:
-    """一个 sequence class 的一档 frame class 构成。"""
-
-    rank: int
-    weight: int
-    frame_classes: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class SequenceClassDomain:
-    """一个 sequence class 的完整生效 planner 输入。"""
-
-    name: str
-    length_range: tuple[int, int]
-    tiers: tuple[TierDomain, ...]
-    frame_rules: tuple[FrameRuleSpec, ...]
-    frame_windows: tuple[FrameWindowSpec, ...]
-
-
-@dataclass(frozen=True)
-class FrameClassDomain:
-    """一个 frame class 的时间与 resource 域。"""
-
-    name: str
-    duration_us: tuple[int, int] | None
-    resources: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class NoiseClassSpec:
-    """一个 structured noise frame class 及其整数权重。"""
-
-    frame_class: str
-    weight: int
-
-
-@dataclass(frozen=True)
-class ScenarioConfig:
-    """compile_scenario 的唯一冻结参数对象。"""
-
-    seed: int
-    schedule: ScheduleSpec
-    quotas: tuple[QuotaSpec, ...]
-    sequence_classes: tuple[SequenceClassDomain, ...]
-    frame_classes: tuple[FrameClassDomain, ...]
-    sequence_rules: tuple[SequenceRuleSpec, ...]
-    crossed_sessions: int
-    frame_gap_us: tuple[int, int]
-    session_gap_us: int
-    session_max_len: int
-    session_max_span_us: int | None
-    noise_ratio: Decimal
-    noise_classes: tuple[NoiseClassSpec, ...]
-    duplicates: int
-
-
-@dataclass(frozen=True)
-class SequenceSlotSpec:
-    """QuotaCompiler 冻结 target 后的一条稳定成功交付槽位。"""
-
-    key: str
-    sequence_class: str
-    class_ordinal: int
-    tier_rank: int | None
-    length_target: int
-    length_range: tuple[int, int]
-
-
-@dataclass(frozen=True)
-class FrameLayout:
-    """一条已选中的 active frame occurrence 布局。"""
-
-    position: int
-    frame_class: str
-    start_us: int
-    end_us: int
-    duration_target_us: int | None
-    resources: tuple[str, ...]
-
-
-@dataclass(frozen=True)
-class SequenceLayout:
-    """一条 sequence slot 的完整时间与 session 布局。"""
-
-    slot_key: str
-    session_index: int
-    owner_role: Literal["primary", "secondary"]
-    anchor_date: str
-    start_us: int
-    last_point_us: int
-    end_us: int
-    frames: tuple[FrameLayout, ...]
-
-
-@dataclass(frozen=True)
-class SessionLayout:
-    """一个 replay session 的 owner、边界与 noise 数量。"""
-
-    index: int
-    primary_slot_key: str
-    secondary_slot_key: str | None
-    start_us: int
-    last_point_us: int
-    end_us: int
-    noise_count: int
-
-
-@dataclass(frozen=True)
-class NoiseSlot:
-    """一条已冻结 class、session 与时间的 noise 交付槽位。"""
-
-    key: str
-    frame_class: str
-    class_ordinal: int
-    session_index: int
-    timestamp_us: int
-
-
-@dataclass(frozen=True)
-class DuplicateLayout:
-    """一条已冻结 source 与平移后时间的流尾 duplicate。"""
-
-    key: str
-    ordinal: int
-    source_slot_key: str
-    session_index: int
-    offset_us: int
-    frames: tuple[FrameLayout, ...]
-
-
-@dataclass(frozen=True)
-class QuotaSummary:
-    """一张 quota 展开后的一个 class/bucket target。"""
-
-    name: str
-    period: Literal["day", "week", "schedule"]
-    bucket: str
-    sequence_class: str
-    target: int
-
-
-@dataclass(frozen=True)
-class PlannerObjectives:
-    """三层字典序目标的冻结最优值。"""
-
-    preference_deviation: int
-    calendar_days_spanned: int
-    timeline_end_us: int
-
-
-@dataclass(frozen=True)
-class PlannerFamilyStats:
-    """一个约束族对模型规模的增量。"""
-
-    variables: int
-    constraints: int
-
-
-@dataclass(frozen=True)
-class PlannerModelStats:
-    """quota 或 timeline 模型的稳定规模统计。"""
-
-    variables: int
-    constraints: int
-    families: Mapping[str, PlannerFamilyStats]
-
-
-@dataclass(frozen=True)
-class ScenarioPlan:
-    """M1 唯一生成、estimate 与 M6 只读消费的冻结计划。"""
-
-    slots: tuple[SequenceSlotSpec, ...]
-    layouts: tuple[SequenceLayout, ...]
-    sessions: tuple[SessionLayout, ...]
-    noise_slots: tuple[NoiseSlot, ...]
-    duplicates: tuple[DuplicateLayout, ...]
-    quota_summary: tuple[QuotaSummary, ...]
-    objectives: PlannerObjectives
-    models: Mapping[str, PlannerModelStats]
-    plan_digest: str
+`validate_state` is the user hook signature, not a production export from generation modules.
+No legacy function, parameter adapter or forwarding wrapper exists.
+
+For sequence mode, `referenced_profiles` returns semantic then evaluation profile, followed by
+enabled pointwise-quality, sequence/frame-annotation, verify/repair and semantic-dedup profiles in
+their existing deterministic stage order, de-duplicated first-wins. Class-effective downstream
+profiles are included even though classifier stages are disabled. `resolve_credentials` reads
+only those environment-variable names, returns the redacted RuntimeCredentials carrier, and is
+never called by validate or dry-run.
+
+#### 7.18.3 Program, plan and identity invariants
+
+The compiler runs before credential materialization and LLM calls. It resolves every class,
+frame, pattern, role, gap, counterfactual set, instruction-only row, hook and catalog; validates
+the exact delivery cardinality, catalog cardinality, timeline identities and complete prompt
+budgets; and hashes one canonical GenerationProgram. The digest covers every semantic field,
+excludes itself and hook callables, and includes only each `ResolvedHook.reference`. The compiler
+performs no random draw, solver call, credential read, LLM call or downstream stage.
+
+`compile_scenario_plan(program, seed)` is the only planner entry. Before solving, it freezes
+DeliverySlots, `catalog_row_index` and block membership in declaration order; catalog allocation
+is a deterministic integer mapping and does not enter CP-SAT. The solver freezes declared
+baseline/variant presence, total order, closed integer gaps, max-span, calendar feasibility,
+instruction-only length and position times, primary sessions, crossing, globally increasing
+artifact timestamps, exact NoiseSlots and exact positive ReplayLayouts. `PlannedEvent` freezes
+only position, role, logical/artifact time and session; declared frame/actor come from RoleSpec,
+while instruction-only frame/actor are selected later by EventPlan. Session blocks contain at
+most 4096 primary events. The locked OR-Tools version runs with one worker, a deterministic seed
+derived from run seed/block identity, and `max_deterministic_time=10.0` per optimization layer.
+Only OPTIMAL decodes. INFEASIBLE is `generation_plan_infeasible`; FEASIBLE/UNKNOWN are
+`generation_plan_budget`; MODEL_INVALID is `generation_plan_internal`. There is no incumbent,
+relaxation, greedy fallback or re-solve after content failure. Program/plan/seed equality implies
+byte-identical program digest, DeliverySlots, ScenarioBlocks and plan digest across validate,
+dry-run and run.
+
+Except for `delivery_digest`, every ID is exactly
+`sha256(canonical_json(["labelkit:v1.18", domain, components]).encode("utf-8"))`
+lowercase hex truncated to 32 characters. Canonical JSON uses `sort_keys=True`, compact
+separators and `ensure_ascii=False`; components are a JSON array, never a caller-concatenated
+string.
+
+| ID | domain | ordered components |
+|---|---|---|
+| declared scenario ID | `declared_scenario_id` | program digest, counterfactual-set name, scenario index |
+| declared world branch ID | `declared_world_branch_id` | scenario ID, variant name |
+| instruction scenario ID | `instruction_scenario_id` | program digest, instruction-slot name, scenario index |
+| instruction world branch ID | `instruction_world_branch_id` | scenario ID, literal `instruction_only` |
+| declared event key | `declared_event_key` | scenario ID, baseline role name |
+| instruction event key | `instruction_event_key` | scenario ID, instruction-slot name, scenario index, position |
+| primary event ID | `primary_event_id` | world branch ID, event key, integer artifact timestamp, payload object |
+| sequence ID | `sequence_id` | world branch ID, ordered event-ID array |
+| replay sequence ID | `replay_sequence_id` | source sequence ID, replay ordinal |
+| replay event ID | `replay_event_id` | replay sequence ID, source event ID, integer replay timestamp |
+| noise event key | `noise_event_key` | program digest, literal `noise`, noise ordinal |
+| noise event ID | `noise_event_id` | run ID, noise event key, integer timestamp, payload object |
+| run attempt ID | `run_attempt_id` | program digest, seed |
+| run ID | `run_id` | run attempt ID, ScenarioPlan digest |
+
+`canonical_delivery_row` removes only emitter-added `_meta.run.started_at`,
+`_meta.run.finished_at` and `_meta.run.duration_ms`, when present, then returns canonical row
+bytes. It removes no user, stage or generation field. `manifest.committed_at` is not a product
+row and never enters this helper. Retained content charges `len(row_bytes) + 1` per JSONL row. The delivery digest is a
+full 64-hex SHA-256: M11 first hashes ASCII `labelkit:v1.18:delivery\n`, then every ordered main
+row followed by every ordered stream row as decimal byte length, a colon and the canonical row
+bytes. `SequenceDeliveryEmitter.prepare_product` is the only digest owner; it writes the digest
+into a deep-frozen report and returns GenerationProduct. `commit` reads that value to construct
+the manifest and never calculates a second digest. The digest appears only in report/manifest,
+never main/stream or ID material, so there is no self-reference.
+
+#### 7.18.4 Event generation and independent gates
+
+Every event has one root, `EventExecutionContext`. It carries the program, plan, slot, variant,
+event index, ScenarioSeed, current state and `tuple[EventDraft, ...]` history.
+`build_event_plan_request` first proves the slot belongs to the plan, the block key exists and the
+event index is valid, then mechanically projects every EventPlanRequest field. A mismatch is
+`generation_downstream_contract`, exit 4, with zero LLM call and zero attempt consumption.
+Callers cannot separately construct or pass a second request.
+
+Declared EventPlanner input contains the semantic profile, fixed RoleSpec, eligible frame views
+and actor names, non-null ActorView and public facts; complete state, history and actor profiles
+are `None`. Instruction-only input contains the full instruction, frozen sequence length,
+complete visible state, complete ordered EventDraft history, ordered actor goal/identity/style
+profiles and ordered eligible frame views; ActorView and RoleSpec are `None` until EventPlan
+chooses its actor. No planner prompt contains variant, expected violation, target or evaluator
+output.
+
+`plan_event(context, attempt_index, variation_nonce, services)` uses M8 executable
+post-validation. Each L2 candidate creates exactly one EventPlan and executes it against the same
+context. `test` paths are within declared read roots; mutations are `add|remove|replace` within
+write roots; at least one test precedes all mutations; instruction-only skips nonexistent root
+permissions. `jsonpatch` applies the complete patch with `in_place=false`. Pre-state Schema, base
+state Schema and state hook must pass before M8 returns one frozen EventExecution. `plan_event`
+returns that EventPlan and the same proof object; formal state commit must not rerun patch, Schema
+or hook. Publish roots must exist and are sent only to declared observers.
+
+FrameRenderer receives EventPlan, ActorView, public facts, publish snapshot, state hashes, full
+frame Schema and the ordered exact `payload_path -> authoritative value` bindings. It never
+receives state_before, state_after, EventExecution or the state hook. The model returns a complete
+object against the unchanged Draft 2020-12 Schema. Code then applies every binding in declaration
+order to a deep copy with RFC 6902 `add` semantics and validates the same complete Schema again.
+Schema rewriting, writable-schema deletion, root bindings, duplicate or ancestor/descendant
+binding paths, missing parents, silent overwrite failure and L3 repair of authoritative binding
+values are forbidden. Each successful plan/execute/render cycle constructs one EventDraft with no
+role field; this draft is the only event form admitted to subsequent generation-time history.
+
+Even when positive is not delivered, the baseline completes Pattern, State and Semantic
+evaluation. Positive reuses it. Every counterfactual reuses the protected EventDraft semantic
+fields before the frozen divergence role, re-executes its patch and verifies matching
+before/after hashes; branch event ID and artifact timestamp are re-derived rather than copied.
+Target and causal suffix are replanned. PatternEvaluator receives only ObservedEvent and
+independently rebinds actual roles. Its `actual_bindings` must cover every draft event ID exactly
+once with no missing, duplicate or extra binding before each EventDraft is converted to
+EventTruth; this binding is the sole source of declared `EventTruth.role`. Instruction-only skips
+PatternEvaluator and mechanically adds only its `position_NNN` truth role. EventTrace accepts
+only EventTruth and never EventDraft. Coupling evaluation then byte-compares the protected actor,
+view, intent, patch, payload, frame, derived role and logical-time fields, while excluding the
+re-derived branch ID and artifact timestamp. The normalized violation set must exactly equal the
+variant's frozen expected violation. StateEvaluator receives the DeliverySlot and baseline
+events, independently replays from initial state and validates bindings/outcome/prefix using
+`program.state_validator`.
+SemanticEvaluator receives direct blind fields—ScenarioSeed, ordered SemanticReviewEvents and
+final state—not EventTrace, variant/target, expected/actual violations, PatternEvaluation,
+StateEvaluation or a prior semantic verdict. Declared `pattern_description` is exactly
+SequencePattern.description; instruction-only uses InstructionOnlySpec.instruction. All six
+booleans must be true with closed, data-free reason codes before EventTrace is assembled.
+
+Instruction-only freezes length and times before LLM calls; its planner chooses only eligible
+frame/actor/intent/patch values for fixed positions and may see complete current state/EventDraft
+history.
+Its truth says `actor_knowledge_validation="semantic"`; declared says
+`"mechanical_and_semantic"`. It is a separate mode, never a fallback.
+
+#### 7.18.5 Dedup and downstream attempt transaction
+
+A generated counterfactual set is first projected to attempt-local ProjectedSequences, then
+reaches downstream as one AttemptTransaction in variant declaration order:
+
+```text
+group_probe
+→ pointwise quality
+→ sequence and frame annotation
+→ verify
+→ M11 assemble_sequence(final PipelineItem + ProjectedSequence)
+→ replay preprojection
+→ CrossViewReconciler
+→ retained-content prospective check
+→ group_commit
+→ merge attempt-local dataset counters
 ```
 
-Binding notes (SPEC-SP §6.1 tail, normative):
+The DedupGroupRequest exempts pairs inside the current set and compares every record with already
+committed sets. `group_probe(request, run_context)` may perform a real embedding request but
+writes no exact set, LSH, embedding store or other process-persistent dedup state. Its token
+contains the index generation, ordered record digests and every precomputed feature, never raw
+prompts or credentials. `group_commit` validates capability unconsumed, generation unchanged
+and record digests unchanged, then commits all three index families in one no-await critical
+section and invalidates the capability. Any validation failure is
+`generation_dedup_transaction`, exit 4, with zero partial insertion.
 
-- `ScenarioPlan.models` and every field declared `Mapping` above are copied read-only and
-  key-sorted at construction; a frozen dataclass never hides a mutable dict/list.
-- All `*_us` times are absolute integer microseconds on the Unix epoch; local dates and artifact
-  ISO-8601 convert through the schedule's fixed offset — naive datetime never mixes in.
-- Slot keys and plan order are frozen: sequence `sequence:<sequence-class>:<zero-based-class-ordinal>`
-  (by `classify.classes` declaration order, then in-class ordinal); noise
-  `noise:<frame-class>:<zero-based-class-ordinal>` (by noise-table declaration order, then
-  in-class ordinal); duplicate `duplicate:<zero-based-ordinal>`. Delivery order is ALL sequence
-  slots then ALL noise slots; duplicates are zero-LLM artifact layout and never enter delivery
-  attempt order.
-- `plan_digest` is fixed as `sha256:` + the UTF-8 SHA-256 of
-  `json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"))` over the
-  canonical object covering ONLY quota targets, slot key, frame class word, start/end/duration,
-  resource, session owner, noise slot, duplicate source/layout and objective values — no
-  payload, callable, credential, report field or OR-Tools `ModelStats()` version text (stable
-  family counts feed the report only). validate console, dry-run report and live report all echo
-  the digest; identical config bytes + CLI overrides + seed + LabelKit/OR-Tools versions yield
-  the identical digest.
+`GenerationServices` is the sole config/SchemaEngine/LLMClient/MetricsSink root. DeliveryServices
+does not duplicate RunContext or credentials. DeliveryController derives each collaborator's
+RunContext so those four shared objects are identity-equal to GenerationServices and only rng and
+batch number are new. RuntimeCredentials exists only while the factory builds the LLMClient.
 
-#### 7.19.5 The single compile entry (planner.py) — verbatim
+QualityStage, AnnotateStage and VerifyStage implement `run_attempt`; AnnotateStage handles frame
+annotation in the same attempt entry. Their attempt entry shares pure production cores with
+ordinary `Stage.run` but does not first convert exceptions into item.errors.
+`AttemptTransaction.items` is the only PipelineItem truth; collaborators mutate those items in
+place. DownstreamAttemptResult returns only accepted, rejected_stage and that stage's dataset
+counter delta. DeliveryController accumulates deltas in a local integer table and merges them
+only after group commit. Rejection discards the items, projections and all local deltas. Schema
+resolved-at statistics, trace, LLM usage, latency, retries, tokens and cost are run facts and are
+never rolled back.
 
-```python
-def compile_scenario(config: ScenarioConfig) -> ScenarioPlan:
-    """编译 quota、求解时间布局并冻结 noise，不做网络调用。"""
-```
+`ProviderFatalError`, `CircuitBreakerTripped`, `KeyboardInterrupt` and
+`asyncio.CancelledError` pass through every collaborator and group_probe unchanged; they
+terminate the run immediately and consume no attempt. A new item ErrorKind.PROVIDER_FATAL on an
+attempt path proves accidental Stage isolation and becomes `generation_downstream_contract`,
+exit 4. ProviderRetryableError from group_probe becomes the current attempt's
+`provider_retryable_exhausted`. SchemaViolation, recoverable ContextOverflowError,
+OutputTruncatedError and ordinary quality/annotation/verification rejections return an
+unaccepted result and consume the attempt.
 
-One frozen parameter object (the ≤ 5-parameter rule). Execution order is fixed: parse + static
-checks → `derive_stream_bounds` → solve quota counts → build slot specs → build timeline model →
-lexicographic timeline solve → allocate exact noise → `ScenarioPlan` + digest.
-`ResolvedConfig.scenario_plan` is `None` off the time-stream form; when a complete plan cannot
-be produced, load NEVER returns a half product. `check_local_candidates` / `check_question`
-production call faces and M6's `select_feasible_plan` are DELETED — pure-rule unit tests call
-the new rule evaluator; user configuration only ever goes through the complete plan.
+`SequenceDeliveryEmitter.assemble_sequence` is pure memory and zero I/O. It assembles final
+SequenceRows from the downstream-mutated PipelineItem, so inherited classification, quality,
+sequence/frame annotation and verification are present in the exact bytes used by CrossView,
+retained-content accounting, delivery digest and final output. A replay-source positive is
+projected only after this assembly, from the final primary stream rows. Prospective retained
+content is the previously accepted total plus every current SequenceRows and ReplayRows byte
+count. If it would exceed 536870912 bytes, the entire source slot is rejected as
+`sequence_memory_budget` with zero dedup, dataset and replay commit. Source and replay rows enter
+the same in-memory critical section after group commit; no uncharged replay is constructed later.
 
-#### 7.19.6 Exception taxonomy and exit mapping (diagnostics.py) — verbatim
+#### 7.18.6 Delivery, replay and run terminal behavior
 
-```python
-class PlannerInfeasibleError(ValueError):
-    """用户硬约束没有共同解。"""
+Slots are serially admitted in declaration order; variants within a slot use declaration order.
+Each attempt seed is the full integer digest of canonical
+`["labelkit:v1.18", "attempt_random", [seed, slot_identity, attempt_index, purpose]]`; Python
+`hash()` and caller-concatenated strings are forbidden.
+Retry restarts from ScenarioSeed; catalog retries keep the assigned row. Frozen pattern,
+variant, role, logical time, artifact time, session, noise slot and replay source never change.
 
+Noise runs only after all primary slots accept. It sees only noise instruction/schema, class/frame
+name-description registries, timestamp and attempt identity. It passes its object Schema, three-
+boolean independent semantic evaluation and an attempt-local SimilarityFilter preloaded with all
+primary member text plus accepted noise. It never runs quality, annotate, verify or main group
+dedup. Noise retained-byte overflow is `noise_memory_budget`.
 
-class PlannerCapacityError(RuntimeError):
-    """模型在求解前超过实现容量。"""
+Attempt exhaustion raises `DeliveryError(kind="sequence_delivery_exhausted", slot_key=...,
+attempts_used=...)` and exit 1. The exception contains no content. Before formal commit,
+DeliveryError, provider fatal, circuit trip, SIGINT and cancellation replace none of main,
+stream, success report or manifest. Sequence mode never delivers a partial prefix and never
+opens rejects. It best-effort atomically writes only the data-free failed report after run
+identity/path initialization.
 
+M1 freezes main, stream, report, manifest and failed-report paths while rejects and sidecar are
+`None`. SequenceDeliveryEmitter opens no success channel until all slots, CrossView checks and
+retained-byte checks pass. `prepare_product` freezes the final rows/report before I/O; commit
+writes same-directory parts, flushes and fsyncs, replaces main then stream then report, and writes
+and replaces manifest last. A commit-I/O failure may leave mixed fixed paths but leaves the old
+manifest unchanged, so consumers fail closed on artifact hashes. The separate failed report is
+best-effort atomic and never invalidates an already valid success manifest.
 
-class PlannerBudgetError(RuntimeError):
-    """deterministic solve budget 内无法冻结最优计划。"""
-
-
-class PlannerInternalError(RuntimeError):
-    """solver 解码或冻结计划违反实现不变量。"""
-```
-
-Mapping (CLI exit lane per §4): `PlannerInfeasibleError` folds into `ConfigError` → exit 2;
-`PlannerCapacityError`, `PlannerBudgetError` and `PlannerInternalError` → exit 4. Capacity is a
-face DISTINCT from infeasible — it never displays as INFEASIBLE; its message uses stable English
-fields (`sequence planner capacity exceeded: model=timeline entries=251891 limit=250000
-dominant=crossing families={crossing:170000,session_slot:60000,...}` — actual/limit/dominant
-family, no "reduce horizon" style guesses). Budget messages name `model=quota|timeline` and the
-timed-out layer. The quota model and the timeline model EACH run their own 250,000-entry
-(variables + constraints) capacity limit — the two small models' entries are never summed into
-a false capacity error. Solver parameters stay frozen (`num_search_workers = 1`,
-`random_seed = run.seed & 0x7fffffff`, per-layer `max_deterministic_time = 10.0`, CP-SAT
-automatic search, no hand-written decision strategy; every objective layer solves to OPTIMAL and
-freezes the equality before the next).
-
-**Delivery-lane exit additions:** exact-delivery exhaustion (any slot Exhausted) → CLI exit 1 —
-distinct from provider fatal / circuit breaker exit 4; the run still delivers the successful
-part atomically and marks `delivery.complete = false`. SIGINT during delivery stops launching
-new attempts, waits for bounded in-flight calls to settle, atomically delivers the completed
-part, writes `delivery.complete = false` + `delivery.interrupted = true`, exit 1; a provider
-fatal or breaker in the same round keeps its exit 4 precedence.
-
----
-
+M2 replay reads the v1.18 stream envelope with `input.text_field="payload"` and
+`stream.order_by="meta:_meta.event.timestamp"`. Object payload becomes canonical Record.text
+while Record.raw retains the complete row. M2 recomputes primary event IDs, each owner's ordered
+sequence ID, replay sequence/event IDs and duplicate-of provenance using only that stream file;
+IDs must be well-formed and globally unique. It verifies every duplicate source exists and every
+replay position exactly matches source payload/frame/role/order. Any mismatch fails closed; it
+does not read main or use an old ID formula. Sequence dedup joins member text in order, so new
+replay IDs do not prevent exact duplicate detection.
 ## 8. Observability contract (M12 + ch.7)
 
 ### 8.1 Event catalog (stable contract, `trace_schema_version = 1`, additive-only)
@@ -6331,11 +6194,12 @@ again). v1.12: the enumeration stays ELEVEN values — the two frame events
 classify/annotate channels (the S1 channel = event-name-prefix rule), zero enumeration and
 zero routing changes.
 
-v1.16 adds no row to the event catalog, no trace channel and no `trace_schema_version` change.
-Joint planning and survivor projection emit no TraceEvent; solver failures use value-free
-ordinary logging and the existing ConfigError/InternalError faces. Sequence-hook diagnostics
-never include exception messages, payloads or prompts. Rules, correlation, windows, solver seeds
-and API keys do not enter trace payloads.
+v1.18 adds no row to the event catalog, no trace channel and no `trace_schema_version` change.
+Program compilation, ScenarioPlanner and projection emit no TraceEvent; failures use value-free
+ordinary logging and the frozen error kinds. Sequence generation logs only slot key, attempt,
+stage, kind, counts, profile and duration. Prompt, ScenarioSeed, state, patch, payload, ActorView,
+EventTrace and hook/exception text never enter ordinary logs or report; existing `llm.call`
+content is available only under trace full and the llm channel. API keys appear at no tier.
 
 ### 8.2 Trace line format
 
@@ -6431,18 +6295,9 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
              "line_no": <int>, "pair_index": <int|null>,
              "generated_from": [<seed ids>],          // [] unless process-mode generated
              "fields": {<output.passthrough_fields from Record.raw>},   // {} when none
-             //   v1.14 conditional third key: with a time-stream tier table declared the object
-             //   is {"llm", "style", "tier_rank"} (the sequence's tier rank, a positive int);
-             //   with no tier table it stays the two-key form — §6.3 envelope additive-only.
-             //   v1.15 ZERO CHANGE here: the presence test is still "the GLOBAL
-             //   [[generate.stream.tiers]] is non-empty" (the anchor rule, §6.3 rule 61), and the
-             //   keys/order are untouched — only the VALUE is now read from the row's sequence
-             //   class's EFFECTIVE table, hence an IN-CLASS rank that is not comparable across
-             //   classes (the class name travels beside it in _meta.classification.label)
              "generator": null | {"llm": "<profile>", "style": "<name>"|null}},
 
-  // v1.8 — ALWAYS-PRESENT key (null whenever segment is disabled — v1.13 widens the gate to
-  // segment.enabled ∨ generate_stream.enabled); key position AFTER
+  // v1.8 — ALWAYS-PRESENT key (null whenever segment is disabled); key position AFTER
   // "source" and BEFORE "scores" — chain-order mirror (spec §6.3):
   "stream": null | {
       "episode_id": "<sequence record id>",
@@ -6459,10 +6314,7 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
       "member_ids": ["<member record id>", ...],
       "member_sources": [{"file": ..., "pair_index"|"line_no": ...}, ...],
       // v1.12 — the members array is present ONLY when frame.classify.enabled ∨
-      // frame.annotate.enabled (v1.13: ∨ generate_stream.enabled — the "label" column's
-      // gate widens identically, carrying the blueprint's frame-class ground truth with
-      // source="inherited"; that form is mutually exclusive with frame.annotate, so its
-      // rows carry NO annotation/status columns), frozen in this position: AFTER
+      // frame.annotate.enabled, frozen in this position: AFTER
       // member_sources, BEFORE session_split (SPEC-frame-annotation §3.6). One entry per member in
       // rec.members order, index 0-based; ENTRY FIELD ORDER FROZEN:
       // index, id[, label][, annotation, status] —
@@ -6537,16 +6389,9 @@ three stream additions (`thread_id`, `fragments`, per-step `resumed`) are presen
 v1.12: the `members` array is the SOLE addition and is present ONLY when
 `frame.classify.enabled ∨ frame.annotate.enabled` — with frame granularity fully off the
 main output is byte-identical to v1.11.
-v1.13: NO new keys at all — the only deltas are gate widenings (`stream` block, `members`
-array and its `label` column all take `∨ generate_stream.enabled`) plus the inline-mode
-validation semantics ("strip `_meta`, then pass **the row's CLASS-EFFECTIVE schema**" —
-`[class.<name>.annotate].schema_*` when declared, `output.schema` otherwise; §6.3 rule 50,
-§7.10). With the form off (the default) the main output is byte-identical to v1.12. Under the
-form the stream block's values are: `order_span` = `["<artifact path>:<first row>",
-"<artifact path>:<last row>"]`, `member_sources[]` = `{file: <artifact path>, line_no: <1-based
-row>}` (main output ↔ artifact are mutually reconcilable by line number), `session_split=false`,
-`repaired=false`, `degraded=null`, `steps=null`, no `thread_id`/`fragments`; and
-`_meta.run.rubric` resolves an empty selector to `"default:trajectory"` (§7.10 rubric mirror).
+v1.18 sequence generation uses the distinct primary-sequence and member-event envelopes in
+§9.5. It does not widen this generic process/flat stream block and does not add a tier or
+time-field generator face.
 
 ### 9.2 Rejects channel (spec 3.11.2)
 
@@ -6641,83 +6486,6 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
   // "annotate": {"sc_disagreements": 0}                       (self-consistency enabled)
   // "generate": {"buckets": {"<llm>×<style|null>": {"calls": 0, "produced": 0,
   //                                                 "survived_dedup": 0}}} (generate enabled)
-  // v1.13, ONLY when generate_stream.enabled — a sub-block INSIDE "generate", after
-  // "buckets"; counts-only, KEY SET AND KEY ORDER FROZEN (M6-owned counters, §7.5):
-  // "generate": {"buckets": {...},
-  //              "stream": {"sessions": 0,           // woven sessions, EXCLUDING duplicate tails
-  //                         "crossed_sessions": 0,   // v1.15 fixed one-/two-owner default packing
-  //                                                  // = Σsurvivors − sessions_eff;
-  //                                                  // v1.16 after survivor projection, count
-  //                                                  // remaining owner-time A-B-A / B-A-B sessions
-  //                                                  // and do not reuse the algebraic formula
-  //                         "sequences": {"<class>": {"planned": 0, "produced": 0}},
-  //                                                  // zero-based over [[classify.classes]] in
-  //                                                  // declaration order (report.classify form)
-  //                         "tiers": <flat form> | <class-nested form>,
-  //                                                  // v1.14, PRESENT ONLY with a non-empty
-  //                                                  //   GLOBAL [[generate.stream.tiers]] (the
-  //                                                  //   anchor rule keeps this gate unchanged in
-  //                                                  //   v1.15); key position FROZEN between
-  //                                                  //   "sequences" and "frames" (quota family
-  //                                                  //   adjacency) in BOTH forms; keys are
-  //                                                  //   DECIMAL STRING ranks; same reading as
-  //                                                  //   "sequences" above. Laid out by M10 from
-  //                                                  //   the DECLARATION (§7.9) ⇒ zero-quota and
-  //                                                  //   fully-voided tiers are present with
-  //                                                  //   0/0, not missing.
-  //                                                  // v1.15 TWO FORMS, chosen by
-  //                                                  //   any(view.tiers is not None):
-  //                                                  //   FLAT (no per-class table) —
-  //                                                  //     {"<tier_rank>": {"planned": 0,
-  //                                                  //                      "produced": 0}}
-  //                                                  //     over the global table in rank order;
-  //                                                  //     BYTE-IDENTICAL to v1.14 (M10 sums the
-  //                                                  //     class-segmented counters per rank)
-  //                                                  //   CLASS-NESTED (any per-class table) —
-  //                                                  //     {"<class>": {"<tier_rank>":
-  //                                                  //        {"planned": 0, "produced": 0}}}
-  //                                                  //     outer = ALL declared classes in
-  //                                                  //     [[classify.classes]] declaration
-  //                                                  //     order, inner = that class's EFFECTIVE
-  //                                                  //     table in rank order
-  //                         "rules": {"sampled": 0,
-  //                                   "correlation_scrapped": 0,
-  //                                   "temporal_scrapped": 0},
-  //                                                  // v1.16, PRESENT iff an attempt in the
-  //                                                  //   actual nonzero post-limit prefix has a
-  //                                                  //   non-empty effective rules table
-  //                         "sample_validator_scrapped": 0,
-  //                                                  // v1.16, PRESENT iff the v1.16 report face
-  //                                                  //   is active for the actual nonzero prefix
-  //                                                  //   (effective rules/windows or sequence hook)
-  //                                                  //   AND generate.sample_validator is configured;
-  //                                                  //   sample_validator alone preserves v1.15 shape
-  //                         "sequence_validator_scrapped": 0,
-  //                                                  // v1.16, PRESENT iff
-  //                                                  //   generate.sequence_validator is configured
-  //                         "windows": {"calendar_days_spanned": 0},
-  //                                                  // v1.16, PRESENT iff an actual-prefix
-  //                                                  //   attempt has effective windows; fixed-
-  //                                                  //   offset inclusive local-day span over
-  //                                                  //   survivor task frames + duplicates
-  //                                                  // The four conditional v1.16 positions are
-  //                                                  // FROZEN after tiers (or sequences when tiers
-  //                                                  // is absent) and before frames. Every present
-  //                                                  // key is explicitly emitted at zero.
-  //                         "frames": 0,             // task frames (Σ steps of surviving sequences)
-  //                         "noise_frames": 0,       // frames actually woven in (< target when the
-  //                                                  //   draw pool ran out of non-full sessions)
-  //                         "duplicates": 0,         // re-sent sequences (after survivor clamping)
-  //                         "plan_calls": 0, "realize_calls": 0, "noise_calls": 0,
-  //                                                  // realize_calls counts halved sub-calls too
-  //                         "plan_failures": 0, "realize_failures": 0,
-  //                         "validator_scrapped": 0}}
-  // run block: + "artifact": {"path": "...", "sha256": "sha256:...", "lines": 0} (v1.13,
-  //            present ONLY when the artifact channel actually wrote — absent under dry-run
-  //            and with the form off; the main-output summary's shape, §7.10);
-  //            the "stream" block below does NOT appear under this form (it is segment's
-  //            surface) and report.classify's histogram is legitimately all-zero (labels are
-  //            inherited, zero verdict calls);
   // v1.7, ONLY when classify.enabled:
   // "classify": {"assignment": "single"|"multi", "classes": {"<name>": 0, ...},
   //              "fallback_count": 0, "failures": 0
@@ -6912,105 +6680,6 @@ envelope's viewpoint only — fan-out clones share the dict and never re-count i
 CONDITIONAL `report.stream` sub-blocks above. `counts.*` gains NOTHING: frame products
 never change an envelope status, so the conservation identity carries no new term (the
 v1.12 zero-change anchor).
-v1.13 additions (counter key names **[FROZEN HERE]**): the twelve `generate.stream.*` keys
-`sessions` / `crossed_sessions` / `sequences.<class>.planned` / `sequences.<class>.produced` /
-`frames` / `noise_frames` / `duplicates` / `plan_calls` / `realize_calls` / `noise_calls` /
-`plan_failures` / `realize_failures` / `validator_scrapped` (owner M6, §7.5), surfacing as the
-conditional `report.generate.stream` sub-block above. `report.run.artifact` is NOT a counter —
-M11 freezes the triple when it stages the artifact and M10 reads it back at report assembly
-(§7.10). `counts.*` gains NOTHING here either: the conservation identity takes the
-generate_only DEGENERATE form `emitted + dropped_dup + dropped_lowq + dropped_verify + failed
-= generated` (member frames are never enveloped, so `absorbed` / `dropped_noise` / `stitched` /
-`episodes` stay 0 and absent; noise and duplicate frames live only in the artifact and enter no
-ledger). The `resolved_at` identity is RESTATED rather than changed: "the sum = the number of
-RECORD-LEVEL annotation calls entering M5" — a per-class-schema call passes an explicit schema
-yet is user-treatment and IS counted (§7.7); frame-level and internal calls still are not.
-v1.14 additions (counter key names **[FROZEN HERE]**, ~~`generate.stream.tiers.<tier_rank>.*`~~
-— **UNFROZEN AND REPLACED IN v1.15, see the next paragraph**): two counter keys, `planned` and
-`produced` (owner M6, §7.5), fed only when a tier table is declared and
-surfaced through M10's EXPLICIT assembly of the conditional `report.generate.stream.tiers`
-sub-block above (§7.9) — the explicit assembly, not the counters, is what guarantees zero-quota
-and fully-voided tiers appear at all. The time-field back-fill face adds NO counter (a
-deterministic mechanical operation has no countable failure mode). `counts.*` again gains
-nothing, and `resolved_at` is untouched.
-v1.15 counter-key re-freeze (裁决·计数器键按类重冻结; the v1.14 key family above is explicitly
-UNFROZEN — registered in §12 item 36): the two keys become
-`generate.stream.tiers.<class>.<tier_rank>.planned` / `.produced` **[FROZEN HERE]**, where
-`<class>` is the sequence class name verbatim. M6 ALWAYS feeds the class-segmented form (single
-feed; writing both families is forbidden), and M10 produces the FLAT report form by summing them
-across classes per rank — numerically byte-identical to v1.14, whose flat counters were
-cross-class aggregates already. No other counter, `counts.*` key or identity changes.
-
-v1.16 additions (counter key names **[FROZEN HERE]**):
-`generate.stream.rules.sampled`, `generate.stream.correlation_scrapped`,
-`generate.stream.temporal_scrapped`, `generate.stream.sample_validator_scrapped`,
-`generate.stream.sequence_validator_scrapped`, and
-`generate.stream.windows.calendar_days_spanned` (owner M6, §§7.5/7.18). M10 exposes them only
-through the conditionally declared positions in `report.generate.stream`; it explicitly inserts
-zeroes, so a configured face is visible even when no counter increment occurred. The sample-hook
-detail is present only when the v1.16 report face is active for the actual nonzero quota prefix
-(effective rules/windows or the sequence hook) and `generate.sample_validator` is configured;
-sample-validator-only configuration preserves the v1.15 report bytes. The existing
-`generate.stream.validator_scrapped` becomes the exact sum of the four scrap counters; each
-attempt feeds at most its first failing member of that sum. `rules.sampled` counts sampled-brief
-attempts after mechanical word planning. The day-span counter is a counts-only derived quantity,
-not data content. No `counts.*`, `llm_usage`, trace or ErrorKind key is added.
-
-v1.17 additions (SPEC-scenario-planning §10; report keys **[FROZEN HERE]**):
-
-- **`report.run.paths`** — ALWAYS present; key order frozen exactly as
-  `project` / `project_root` / `input` / `output` / `report` / `rejects` / `sidecar` / `trace` /
-  `stream_artifact`; every value is an absolute normalized path or `null` for a disabled
-  channel — never a relative path. Run-start INFO and dry-run plain/rich consume the same
-  `ResolvedPaths` object (§7.19.2).
-- **Dry-run `estimate` object** — the dry-run report gains a top-level `estimate` key whose
-  value IS the `estimate_run` returned object, referenced not recomputed (console and JSON are
-  key-for-key equal; tests compare the console parser output against the JSON deep-equal). The
-  estimate object gains one nested `scenario` sub-object, key order frozen:
-  `target_sequences` / `task_frames` / `noise_frames` / `sessions` / `crossed_sessions` /
-  `schedule_start` / `schedule_end` / `calendar_days_spanned` / `plan_digest` / `models`, where
-  `models` maps `"quota"` and `"timeline"` to `{"entries": …, "families": …}`. The existing
-  keys (`records` / `batches` / `generate_calls` / `total_calls` / the per-stage `*_calls`)
-  keep their names; the baseline generate estimate counts one realization per structured noise
-  slot and excludes delivery retries, LLMClient-internal provider retries and schema repair.
-- **`report.generate.stream` re-freeze** — the COMPLETE disposition of the v1.16-era keys:
-  SEVEN failure/scrap counters are DELETED — `plan_failures`, `realize_failures`,
-  `validator_scrapped`, `sample_validator_scrapped`, `sequence_validator_scrapped`,
-  `rules.correlation_scrapped`, `rules.temporal_scrapped` — the same failure fact is carried
-  solely by the `delivery.failures` 13-bucket closed set (keeping both would double-book one
-  fact). The `windows` sub-block is DELETED: its only key `calendar_days_spanned` moves into
-  `planner.objectives`, never double-reported. `plan_calls` is RENAMED `brief_calls` (planning
-  in v1.17 is a zero-LLM CP-SAT solve — the old name misleads), and the `rules` sub-block is
-  RENAMED `frame_rules` keeping only `sampled`. All other existing keys (`sequences`,
-  `sessions`, `crossed_sessions`, `frames`, `noise_frames`, `duplicates`, `realize_calls`,
-  `noise_calls`, `tiers`, …) keep their semantics. FOUR new keys append at
-  the block tail — the block's frozen key order ends `plan_digest` / `planner` / `delivery` /
-  `quotas`:
-  - `planner` = `{"models": {"quota": …, "timeline": …}, "objectives": {"preference_deviation":
-    …, "calendar_days_spanned": …, "timeline_end_us": …}}`;
-  - `delivery` = `target_sequences` / `delivered_sequences` / `target_noise` / `delivered_noise` /
-    `target_duplicates` / `delivered_duplicates` / `duplicate_shortfall` / `attempts` /
-    `complete` / `interrupted` / `exhausted_slots` / `failures` — `failures` carries ALL 13
-    sub-keys in the closed-set enum order (§9.4's v1.17 exhaustion block) even at zero: `brief`,
-    `realize`, `noise`,
-    `context_overflow`, `sample_validator`, `sample_validator_exception`, `correlation`,
-    `temporal`, `sequence_validator`, `sequence_validator_exception`, `similarity`,
-    `scenario_validator`, `scenario_validator_exception`. Every non-fatal complete attempt
-    satisfies exactly
-    `attempts = delivered_sequences + delivered_noise + sum(failures.values())`
-    (one sequence attempt's brief + realize calls are ONE delivery attempt; LLMClient-internal
-    provider retries never count). `delivery.exhausted_slots` counts the delivery slots
-    (sequence ∪ noise) that reached Exhausted; duplicate-source shortfall NEVER enters this
-    key — it is carried solely by `duplicate_shortfall`. Provider fatal and circuit breaker
-    exit 4 immediately and enter NO failure bucket.
-  - `quotas` = one row per quota `name` × period bucket × class (the natural key), each row
-    carrying target, delivered, allocation, realized ratio and integer deviation against
-    target — aggregate-only reporting without per-period attribution is FORBIDDEN.
-- **truth (artifact)** — noise rows change `truth.frame_class` from v1.16's null to the ACTUAL
-  noise frame-class name (`sequence_class` / `sequence` / `tier_rank` stay null on noise rows);
-  duration adds NO truth key — the mechanical values surface through the payload's
-  `time_fields` bindings (§9.5).
-
 Counter OWNERSHIP (normative): `counts.*` keys are incremented ONLY by M10 (orchestrator),
 derived from batch tallies / EmitResult — stages must never touch them (double-count).
 v1.7: this includes `counts.fanout` — M10 meters it as the len-delta around the classify
@@ -7020,9 +6689,6 @@ v1.8: likewise `counts.episodes` (len-delta around the segment stage) and
 increments any `counts.*` key.
 v1.9: likewise `counts.stitched` (post-emit tally) belongs to M10, and `counts.threads` is
 derived by M10 at report assembly — M16 never increments any `counts.*` key.
-v1.13: `counts.generated` under the time-stream form is likewise M10's — it is set from
-`len(product.envelopes)` after the `--limit` belt-and-braces truncation (§7.9); M6 owns only
-the `generate.*` stage-scoped keys.
 Stage-scoped keys are incremented only by their stage: `dedup.*` by M3, `quality.judgment_failures`
 by M4, `annotate.sc_disagreements` by M5, `generate.buckets.*` by M6 (`survived_dedup` = records
 surviving M6's own MinHash novelty filter against seeds + siblings; M3 still dedups generated
@@ -7031,138 +6697,292 @@ records on re-flow), `classify.*` by M13 (v1.7), `quality.tie_*` by M4, `segment
 by M7 (v1.8), `stitch.*` by M16 (v1.9), `frame_classify.*` by M13 and `frame_annotate.*` by
 M5/M11 per the v1.12 split above.
 
-### 9.4 Atomic delivery
-
-Main output (and sidecar) is appended to `<name>.part` with per-batch flush; finalize = fsync +
-`os.rename` to the target name. At any instant the directory holds either the `.part` or the
-final file, never a half-written final file — every delivered line is complete and valid.
-v1.6: a circuit-break finalize ALSO renames (partial delivery of completed batches, spec 3.10.3
-熔断交付), so the final name appearing no longer implies the whole input was processed —
-consumers judge run completeness by `report.run`: `interrupted=false` AND `circuit_broken=false`
-(the exit code alone is insufficient — a graceful-SIGINT run delivers and exits 0), with
-`counts.unprocessed` quantifying the breaker-trip gap. Unwritable output
-(exit 4 at open) and unhandled crashes leave `.part`; graceful SIGINT finalize renames.
-v1.13: the stream artifact rides the SAME finalize batch and the same `_undeliverable`
-discipline (§7.10), so the guarantee above holds for it verbatim.
-
-**v1.17 exact-delivery exhaustion block.** Every sequence slot and noise slot carries an
-independent delivery budget of `max_attempts_per_slot` (§6.3 rule 63); each retry re-runs the
-SAME slot's full brief + realization with the frame word, timestamps, duration, session, quota
-and noise slot UNCHANGED, and an accepted payload never rolls back. A slot Exhausted (budget
-spent, or a deterministic precheck context overflow proven invariant for the fixed prompt)
-never aborts the run: remaining slots continue, ALL exhausted slots are collected, the main
-output / stream artifact / rejects deliver the successful part atomically under the §9.4
-discipline above, the report marks `delivery.complete = false`, and the CLI exits 1 (§7.19.6 —
-distinct from provider fatal / circuit-breaker exit 4). A duplicate whose frozen source slot
-went undelivered is OMITTED and counted as shortfall — never re-sourced, never re-laid.
-The delivery failure bucket is the following MUTUALLY EXCLUSIVE closed set of 13 keys, present
-in the report even at zero, in exactly this enum order (each attempt records only its FIRST
-failing stage):
-
-```text
-brief
-realize
-noise
-context_overflow
-sample_validator
-sample_validator_exception
-correlation
-temporal
-sequence_validator
-sequence_validator_exception
-similarity
-scenario_validator
-scenario_validator_exception
-```
-
-brief/realize bucket the schema-guarantee, provider-retryable-exhaustion and output-truncation
-failures of their call phase; `noise` buckets the noise realization call segment; a
-deterministic precheck overflow buckets `context_overflow` and consumes no further attempt.
-The candidate filter order is frozen: schema guarantee → `sample_validator` → correlation /
-temporal replay → `sequence_validator` → similarity probe → `scenario_validator` against the
-accepted prefix → similarity-state commit and accept (the probe/commit split keeps a scenario
-violation from polluting the similarity filter). Noise slots skip the sequence/scenario
-validators but keep schema, sample validator and similarity; a structured noise payload is
-projected to canonical JSON before `sample_validator(text)` and the similarity filter.
-
-### 9.5 Stream artifact (v1.13, spec §6.5)
-
-`{output_stem}.stream.jsonl` — the time-stream generation form's second product. UTF-8 JSONL,
-one row per frame, ROW ORDER = weave order (strictly increasing timestamps); the 1-based row
-number is exactly `_meta.stream.member_sources[].line_no`.
+v1.18 sequence mode does not feed this generic process/flat conservation ledger. Its accepted
+attempt counters are merged exactly once by the delivery controller; LLM usage and latency from
+all attempts remain in the generic run usage ledger. The frozen sequence report follows.
 
 ```jsonc
-{"<stream.order_by's meta field name>": "<ISO-8601 timestamp, microsecond precision>",
- "<input.text_field>": <string for a plain-text frame | object for a structured frame>,
- "truth": {"session": 0,                 // whole-stream session ordinal, 0-based (duplicate
-                                         //   tail sessions included)
-           "sequence_class": "<class>",  // null on noise frames
-           "sequence": 0,                // 0-based ordinal WITHIN its class (the planning-phase
-                                         //   identity); null on noise frames AND duplicate copies
-           "tier_rank": 1,               // v1.14, PRESENT ONLY with a declared tier table:
-                                         //   the sequence's tier rank. Task frames carry their
-                                         //   own tier, noise frames carry null, duplicate frames
-                                         //   INHERIT THE SOURCE's tier. Key position is FROZEN
-                                         //   AFTER "sequence" (the sequence-identity group) and
-                                         //   BEFORE "frame_class"
-           "frame_class": "<frame class>",  // null on noise frames
-           "noise": false                // true on inserted noise frames (which carry the
-                                         //   nulls above)
-           [, "duplicate_of": 0]}}       // PRESENT ONLY on the frames of a re-sent sequence:
-                                         //   the ORIGINAL sequence's in-class ordinal
+"generate": {
+  "sequence": {
+    "mode": "declared",
+    "run_attempt_id": "<32 lowercase hex>",
+    "run_id": "<32 lowercase hex>",
+    "delivery_digest": "<64 lowercase hex>",
+    "artifacts_committed": true,
+    "program_digest": "<64 lowercase hex>",
+    "planned_sets": 2,
+    "delivered_sets": 2,
+    "planned_sequences": 8,
+    "delivered_sequences": 8,
+    "primary_events": 22,
+    "primary_sessions": 7,
+    "crossed_primary_sessions": 1,
+    "noise_events": 2,
+    "replay_sequences": 1,
+    "replay_events": 3,
+    "replay_tail_sessions": 1,
+    "stream_rows": 27,
+    "sequence_slot_attempts": 2,
+    "noise_slot_attempts": 2,
+    "sequence_calls": {
+      "scenario_seed_calls": 0,
+      "baseline_event_plan_calls": 6,
+      "variant_event_plan_calls": 8,
+      "frame_render_calls": 14,
+      "semantic_evaluation_calls": 8,
+      "noise_render_calls": 2,
+      "noise_evaluation_calls": 2
+    },
+    "by_pattern": {
+      "<pattern>": {
+        "<variant>": {"planned": 2, "delivered": 2}
+      }
+    },
+    "rejected_attempts": {
+      "scenario_schema": 0,
+      "event_schema": 0,
+      "post_validator_invalid": 0,
+      "post_validator_exception": 0,
+      "state_transition": 0,
+      "frame_schema": 0,
+      "coupling_evaluation": 0,
+      "pattern_evaluation": 0,
+      "state_evaluation": 0,
+      "semantic_evaluation": 0,
+      "sequence_memory_budget": 0,
+      "context_overflow": 0,
+      "output_truncated": 0,
+      "provider_retryable_exhausted": 0,
+      "dedup": 0,
+      "quality": 0,
+      "annotate": 0,
+      "verify": 0,
+      "reconcile": 0,
+      "noise_schema": 0,
+      "noise_semantic": 0,
+      "noise_similarity": 0,
+      "noise_memory_budget": 0,
+      "noise_context_overflow": 0,
+      "noise_output_truncated": 0,
+      "noise_provider_retryable_exhausted": 0
+    }
+  }
+}
 ```
 
-The `truth` key set is **[FROZEN HERE]** — and RE-FROZEN in v1.14 by the insertion above
-(裁决·真值键序重冻结): row byte order follows this key order, while ids are computed over
-canonical JSON (sorted keys) and are therefore unaffected by it. Truth carries NO post-assembly
-ids (裁决·真值不携最终 id): a member id hashes the row and a sequence id hashes the member ids, so
-embedding either would be circular — main output ↔ artifact reconcile through `member_sources`
-line numbers instead.
+Key order is exactly as shown. Success satisfies planned sets/sequences and every variant's
+planned count equal delivered. `sequence_calls` counts logical family entries, including failed
+attempts; L3 and provider retries stay in the existing Schema/usage ledgers. One failed attempt
+enters exactly its final boundary bucket. The closed rejected-attempt key set cannot grow at
+runtime. Provider fatal, planner and commit I/O are run terminals represented by
+`terminal_error_kind`, never a rejection bucket.
 
-**v1.16 zero-format amendment.** Sequence rules, correlation, occurrence windows, potential
-witnesses and planner/session diagnostics add no artifact key and are never copied into `truth` or
-the row. They are auditable from the existing `sequence_class`, `tier_rank`, `frame_class`,
-timestamp and payload plus the conditional report aggregates. Primary attempts that fail a
-content gate leave no task-frame rows; survivor projection does not move timestamps. Noise remains
-`noise=true` with the existing null truth fields. Duplicate rows retain the source payload,
-`tier_rank` and back-filled time fields and change only their row timestamps/session/
-`duplicate_of` through the existing shape.
+The sequence estimate carries the same ordered seven-key `sequence_calls`, the existing top-level
+quality/annotate/frame-annotate/verify keys, exact planned sets/sequences/events/noise/replay/rows,
+`successful_attempt_lower_bound`, and the `max_slot_attempts` upper bound. Existing top-level
+estimate key order and total formula remain unchanged; the seven nested generation keys sum to
+`generate_calls` and are not double-counted.
 
-**v1.17 amendment.** On noise rows, `truth.frame_class` carries the ACTUAL noise frame-class
-name (v1.16 wrote null there; `sequence_class` / `sequence` / `tier_rank` stay null on noise
-rows, `noise = true`). Frame duration adds NO truth key: the mechanical `end_ts` /
-`duration_s` values surface through the payload's `time_fields` bindings (rule 68), and planner
-invariants are proven through report/trace and tests, not through truth.
+The failed report always contains `run_attempt_id`, nullable `run_id`,
+`artifacts_committed=false`, nullable `failed_slot`, integer `attempts_used`,
+`terminal_error_kind`, the same usage object and the same closed `rejected_attempts` object. It
+contains no delivered prefix, by-pattern delivery, state, payload, patch, prompt or exception
+text. Before a plan exists, `run_id` is null.
 
-**Back-filled time fields (v1.14).** For a frame class with `time_fields` bindings, the bound keys
-inside the row's TEXT-FIELD OBJECT are not LLM output: they are mechanical quantities written by
-`backfill_time_fields` (§7.5) from the laid timeline, before the row object and every id are
-computed — so they participate in the member id, the sequence id and the session id, and the
-replay contract below holds unchanged. Two reconciliation rules for anyone auditing an artifact:
-values are INTRA-SEQUENCE deltas (group rows by `truth.sequence_class` + `truth.sequence` first —
-foreign-sequence frames and noise frames woven between them do not participate), and rows
-carrying `truth.duplicate_of` are EXCLUDED (their bound values, like their `tier_rank`, are
-inherited from the source and do not reconcile against their own session's timeline).
+### 9.4 Atomic delivery
 
-Replay contract: the artifact IS a valid §6.1 text-modality input. Round-trippability is
-enforced at startup by the M1 artifact-key guard (§6.3 rule 51): `input.text_field` and the
-`order_by` timestamp field must be flat names (the row uses them verbatim as top-level keys, so
-a dotted path — legal per §6.1 — would make every replayed row a bad line), must differ from
-each other, and neither may be `"truth"` (the three artifact-row top-level keys are mutually
-exclusive). Copied to a project's
-`[run].input` with the SAME `[stream]` declaration (`order_by = "meta:<same field>"`, same
-`gap_s`) and segment on, it replays exactly — ① member `Record.id`s are byte-identical (M2's
-`sha256(canonical_json(raw))[:16]` over the same row object, because the generation side used
-the WHOLE ROW as `raw`); ② session splitting is identical (woven inter-session gaps are always
-> `gap_s`, intra-session gaps are always `<= gap_s`; the v1.15 default path remains strictly
-below) and so are the `session_id`s (the M2 formula's input
-includes ALL frames of the session); ③ `truth` is an ordinary field to the ingest side — it
-participates in the id hash and in NO decision, and can be surfaced through
-`output.passthrough_fields` for comparison. An automated replay-and-score loop is an explicit
-non-goal (spec 2.1.2 ⑧).
+Ordinary process/flat output keeps the existing `.part`, per-batch flush, fsync/final rename,
+partial-delivery and graceful-interrupt behavior documented in §7.10. v1.18 does not change it.
 
----
+Sequence mode uses the stricter manifest-last contract. M1 freezes:
+`output`, `stream`, `report`, `manifest`, `failed_report`, with rejects and sidecar
+null. Delivery does not open the first four until all primary/noise slots, replay projection,
+retained-byte checks and CrossView reconciliation succeed. Before any I/O,
+`SequenceDeliveryEmitter.prepare_product` canonicalizes the exact final rows, calculates the sole
+delivery digest, writes it into a deep-frozen report copy and returns GenerationProduct. Commit
+rejects a missing or malformed report digest before opening a `.part`, and never recalculates it.
+Commit then writes, flushes and fsyncs same-directory parts; replaces main → stream → report;
+computes their final artifact hashes; and replaces manifest last. A consumer accepts a run only
+when the manifest is valid and all three named artifact hashes match. A post-first-rename I/O
+failure may leave a mixed set, but cannot produce a manifest claiming that set is committed. No
+rollback, directory transaction or prior-file preservation after commit I/O begins is promised.
 
+Before commit, slot exhaustion, provider fatal, circuit trip, SIGINT and cancellation replace no
+success path. The data-free failed report is a separate best-effort atomic diagnostic channel and
+never participates in a successful manifest.
+### 9.5 v1.18 main, stream, replay and manifest
+
+Main contains primary sequences only. With annotate enabled, its user object is the accepted
+sequence annotation under the class-effective Schema; with annotate disabled it follows §9.1's
+existing filtered-raw output rule. Inline `_meta` carries generic scores, annotation and
+verification plus the following exact generation truth.
+
+Declared:
+
+```json
+{
+  "validation_mode": "declared",
+  "actor_knowledge_validation": "mechanical_and_semantic",
+  "scenario_set": "booking_success_training",
+  "scenario_index": 0,
+  "scenario_id": "0123456789abcdef0123456789abcdef",
+  "world_branch_id": "456789abcdef0123456789abcdef0123",
+  "sequence_class": "ticket_booking",
+  "pattern": "booking_success",
+  "variant": "confirmation_timeout",
+  "expected_violation": {
+    "kind": "gap_above_max",
+    "target": "acknowledge_to_confirm"
+  },
+  "actual_violations": [
+    {"kind": "gap_above_max", "target": "acknowledge_to_confirm"}
+  ]
+}
+```
+
+Instruction-only omits scenario_set, pattern, variant and expected/actual violations:
+
+```json
+{
+  "validation_mode": "instruction_only",
+  "actor_knowledge_validation": "semantic",
+  "instruction_slot": "open_booking",
+  "scenario_index": 0,
+  "scenario_id": "0123456789abcdef0123456789abcdef",
+  "world_branch_id": "456789abcdef0123456789abcdef0123",
+  "sequence_class": "ticket_booking"
+}
+```
+
+Every primary stream line has exactly two top-level keys in this order, `payload` then
+`_meta`. Payload is the complete accepted frame object. Primary event metadata is:
+
+```json
+{
+  "payload": {"request_id": "R-100", "ticket_id": "T-100"},
+  "_meta": {
+    "event": {
+      "event_id": "abcdabcdabcdabcdabcdabcdabcdabcd",
+      "event_key": "ef01ef01ef01ef01ef01ef01ef01ef01",
+      "owner_sequence_id": "23452345234523452345234523452345",
+      "role": "confirm",
+      "frame_class": "confirmation",
+      "actor": "system",
+      "logical_time_us": 960000000,
+      "timestamp": "2026-01-05T09:16:00.000000+08:00"
+    },
+    "generation": {
+      "validation_mode": "declared",
+      "actor_knowledge_validation": "mechanical_and_semantic",
+      "scenario_set": "booking_success_training",
+      "scenario_index": 0,
+      "scenario_id": "0123456789abcdef0123456789abcdef",
+      "world_branch_id": "456789abcdef0123456789abcdef0123",
+      "sequence_class": "ticket_booking",
+      "pattern": "booking_success",
+      "variant": "confirmation_timeout"
+    }
+  }
+}
+```
+
+Member `raw` is this complete row, `text=canonical_json(payload)` and `id=event_id`.
+A main sequence Record has `id=sequence_id` and ordered members. PatternEvaluator's
+`actual_bindings` is the only source of declared role truth. Instruction-only roles are
+`position_000`, `position_001`, and so on.
+
+`ProjectedSequence` is only the pre-downstream Record plus primary rows. After the real attempt
+collaborators mutate its PipelineItem, `SequenceDeliveryEmitter.assemble_sequence` produces the
+only final `SequenceRows`: `main_row`, `primary_stream_rows`, `retained_content_bytes`. Main,
+CrossView, replay projection, memory accounting, delivery digest and files all consume these same
+rows; none may reconstruct output from `ProjectedSequence.main_record`.
+
+A replay deep-copies the final source `SequenceRows.primary_stream_rows`, preserving payload,
+frame annotation and every other downstream metadata field. It replaces only replay identity and
+artifact time. Its exact event and generation objects are:
+
+```json
+{
+  "event": {
+    "event_id": "abcdabcdabcdabcdabcdabcdabcdabcd",
+    "event_key": "ef01ef01ef01ef01ef01ef01ef01ef01",
+    "owner_sequence_id": null,
+    "role": "confirm",
+    "frame_class": "confirmation",
+    "actor": "system",
+    "logical_time_us": 960000000,
+    "timestamp": "2026-01-05T12:16:00.000000+08:00",
+    "replay_sequence_id": "34563456345634563456345634563456",
+    "replay_ordinal": 0,
+    "duplicate_of_sequence_id": "23452345234523452345234523452345",
+    "duplicate_of_event_id": "01230123012301230123012301230123"
+  },
+  "generation": {
+    "validation_mode": "replay",
+    "source_validation_mode": "declared",
+    "sequence_class": "ticket_booking",
+    "scenario_id": "0123456789abcdef0123456789abcdef",
+    "source_pattern": "booking_success",
+    "source_variant": "positive",
+    "duplicate_of_sequence_id": "23452345234523452345234523452345"
+  }
+}
+```
+
+The shown objects replace `_meta.event` and `_meta.generation` inside the copied row; top-level
+key order remains `payload`, `_meta`. `event_key`, role, frame_class, actor and logical time are
+copied byte-for-byte. `event_id`, timestamp and replay sequence identity are newly derived from
+ReplayLayout. `owner_sequence_id` is always null; only `replay_sequence_id` groups replay rows.
+No `replay=true`, new world_branch_id, primary `pattern`/`variant`, expected/actual violation or
+new scenario truth is emitted. `replay_sequence_id` never appears in main. Every replay owns one
+tail session.
+
+A noise line has the same two top-level keys. Its event object has event_id/event_key,
+`owner_sequence_id=null`, `role=null`, the configured frame_class, `actor=null`,
+`logical_time_us=null`, its timestamp and `noise=true`. Its generation value is null. Noise
+has no scenario, world branch, owner, pattern, variant or state patch.
+
+Primary stream timestamps exactly equal ScenarioPlan projection timestamps and are globally
+strictly increasing across primary, noise and replay rows. Timestamp/gap/elapsed truth exists
+only under `_meta.event`; no deleted `time_fields` are injected into payload.
+
+Replay ingest is self-contained. With `input.text_field="payload"` an object payload becomes
+canonical Record.text and raw remains the full row. M2 validates 32-lowercase-hex IDs, global
+event-ID uniqueness, primary owner grouping, ordered source sequence ID, replay sequence/event
+ID formulas and every duplicate-of positional reference from this stream alone. Any missing,
+extra or mismatched source fails closed. It does not read main and does not fall back to a
+content-derived legacy ID.
+
+Successful manifest path is `output_stem.manifest.json`; key order and nested key order are:
+
+```json
+{
+  "schema_version": 1,
+  "run_id": "0123456789abcdef0123456789abcdef",
+  "delivery_digest": "456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123",
+  "artifacts_committed": true,
+  "main": {
+    "path": "/abs/out/labels.jsonl",
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "rows": 8
+  },
+  "stream": {
+    "path": "/abs/out/labels.stream.jsonl",
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "rows": 27
+  },
+  "report": {
+    "path": "/abs/out/labels.report.json",
+    "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  "committed_at": "2026-08-21T00:00:00.000000Z"
+}
+```
+
+`committed_at` is manifest's only new wall-clock field. Existing report run timestamps retain
+observational meaning. Wall-clock observations participate in no program/plan/run/record/delivery
+digest. Manifest is replaced only after the named final files have been fsynced, renamed and
+hashed.
 ## 10. Prompt templates (verbatim, normative)
 
 Placeholders in `{...}` are substituted; everything else is emitted byte-for-byte. All templates
@@ -7569,73 +7389,160 @@ The S7/R1 binding notes above apply unchanged (all keys required, nullable union
 (the §8.1 ¶ note); an out-of-range or non-integer `thread_ref` is resolved code-side to the
 conservative `new` outcome (§7.16), never a schema failure.
 
-v1.13 adds two M6 builders (verbatim from `labelkit/common/runtime/schema_engine.py`):
+v1.18 adds four generation builders; these are the exact JSON constructors:
 
 ```python
-def plan_schema(names: Sequence[str], length: int, cover_all: bool = False) -> dict:
-    # v1.13 M6 blueprint call (裁决·蓝图实现内部 Schema): one sequence's `length`-step plan —
-    # each step names its frame class (closed set = the frame class table) and a one-sentence
-    # brief for the realize call to expand. minItems = maxItems pins the step count
-    # (judgment_schema / frame_classify_schema precedent); NO uniqueItems — one frame class may
-    # legitimately recur within a sequence (R1: strict gateways hard-reject the keyword anyway).
-    # v1.14 (裁决·蓝图双向硬约束): cover_all=True appends allOf + one contains branch per name,
-    # in the PASSED order. enum gives "⊆ the passed name set", contains gives "⊇", composing to
-    # composition EQUALITY. A schema object has ONE contains slot, hence the allOf branches.
-    # cover_all=False emits byte-identical output to v1.13.
-    steps: dict = {"type": "array",
-                   "items": {"type": "object",
-                             "properties": {"frame_class": {"type": "string",
-                                                            "enum": list(names)},
-                                            "brief": {"type": "string"}},
-                             "required": ["frame_class", "brief"],
-                             "additionalProperties": False},
-                   "minItems": length, "maxItems": length}
-    if cover_all:
-        steps["allOf"] = [{"contains": {"type": "object",
-                                        "properties": {"frame_class": {"const": name}},
-                                        "required": ["frame_class"]}}
-                          for name in names]
-    return {"type": "object", "properties": {"steps": steps},
-            "required": ["steps"], "additionalProperties": False}
+_ACTOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "goal": {"type": "object"},
+        "identity": {"type": "object"},
+        "style": {"type": "object"},
+    },
+    "required": ["goal", "identity", "style"],
+    "additionalProperties": False,
+}
 
 
-def brief_schema(length: int) -> dict:
-    # v1.16 constrained M6 sampled-brief call. The planner has already frozen the word, so the
-    # LLM returns only one brief per position. A non-positive length is a programmer error and
-    # raises ValueError("brief schema length must be positive").
-    if length < 1:
-        raise ValueError("brief schema length must be positive")
-    item = {"type": "object", "properties": {"brief": {"type": "string"}},
-            "required": ["brief"], "additionalProperties": False}
-    steps = {"type": "array", "items": item,
-             "minItems": length, "maxItems": length}
-    return {"type": "object", "properties": {"steps": steps},
-            "required": ["steps"], "additionalProperties": False}
+def scenario_seed_schema(actor_names, state_schema):
+    if actor_names is None:
+        actors = {
+            "type": "object",
+            "additionalProperties": _ACTOR_SCHEMA,
+            "minProperties": 1,
+            "maxProperties": 8,
+        }
+    else:
+        actors = {
+            "type": "object",
+            "properties": {name: _ACTOR_SCHEMA for name in actor_names},
+            "required": list(actor_names),
+            "additionalProperties": False,
+        }
+    return {
+        "type": "object",
+        "properties": {
+            "initial_state": dict(state_schema),
+            "actors": actors,
+            "shared_facts": {
+                "type": "object",
+                "properties": {
+                    "public": {"type": "object"},
+                    "hidden": {"type": "object"},
+                },
+                "required": ["public", "hidden"],
+                "additionalProperties": False,
+            },
+            "style": {"type": "object"},
+            "time_context": {"type": "object"},
+        },
+        "required": [
+            "initial_state", "actors", "shared_facts", "style", "time_context",
+        ],
+        "additionalProperties": False,
+    }
 
 
-def realize_schema(step_schemas: Sequence[dict]) -> dict:
-    # v1.13 M6 frame-realization call: a POSITIONAL wrapper — frame i obeys the USER generation
-    # schema of blueprint step i's frame class (the caller passes {"type": "string"} for
-    # plain-text frames). `prefixItems` is a native draft 2020-12 keyword (jsonschema >= 4.21
-    # validates it directly — no translation layer at L2), `"items": False` seals the tail
-    # against over-long arrays, and minItems = maxItems pins the length once more. The user
-    # generation schemas pass through L0 verbatim — NO keyword allow-list lint (§7.7).
-    steps = list(step_schemas)
-    return {"type": "object",
-            "properties": {"frames": {"type": "array",
-                "prefixItems": steps,
-                "minItems": len(steps), "maxItems": len(steps),
-                "items": False}},
-            "required": ["frames"], "additionalProperties": False}
+def event_plan_schema(frame_names, actor_names):
+    mutation_with_value = {
+        "type": "object",
+        "properties": {
+            "op": {"type": "string", "enum": ["test", "add", "replace"]},
+            "path": {"type": "string"},
+            "value": {},
+        },
+        "required": ["op", "path", "value"],
+        "additionalProperties": False,
+    }
+    remove = {
+        "type": "object",
+        "properties": {
+            "op": {"type": "string", "const": "remove"},
+            "path": {"type": "string"},
+        },
+        "required": ["op", "path"],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "frame_class": {"type": "string", "enum": list(frame_names)},
+            "actor": {"type": "string", "enum": list(actor_names)},
+            "intent": {"type": "string"},
+            "patch": {
+                "type": "array",
+                "items": {"oneOf": [mutation_with_value, remove]},
+                "minItems": 2,
+            },
+        },
+        "required": ["frame_class", "actor", "intent", "patch"],
+        "additionalProperties": False,
+    }
+
+
+def semantic_evaluation_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "causal_consistency": {"type": "boolean"},
+            "actor_knowledge": {"type": "boolean"},
+            "goal_consistency": {"type": "boolean"},
+            "temporal_plausibility": {"type": "boolean"},
+            "cross_frame_consistency": {"type": "boolean"},
+            "realism": {"type": "boolean"},
+            "reason_codes": {
+                "type": "array",
+                "items": {"type": "string", "enum": [
+                    "causal_inconsistency",
+                    "actor_knowledge_violation",
+                    "goal_inconsistency",
+                    "temporal_implausibility",
+                    "cross_frame_inconsistency",
+                    "unrealistic",
+                ]},
+            },
+        },
+        "required": [
+            "causal_consistency", "actor_knowledge", "goal_consistency",
+            "temporal_plausibility", "cross_frame_consistency", "realism",
+            "reason_codes",
+        ],
+        "additionalProperties": False,
+    }
+
+
+def noise_semantic_evaluation_schema():
+    return {
+        "type": "object",
+        "properties": {
+            "unrelated_to_declared_tasks": {"type": "boolean"},
+            "no_executable_task": {"type": "boolean"},
+            "realism": {"type": "boolean"},
+            "reason_codes": {
+                "type": "array",
+                "items": {"type": "string", "enum": [
+                    "related_to_declared_task",
+                    "executable_task_present",
+                    "unrealistic",
+                ]},
+            },
+        },
+        "required": [
+            "unrelated_to_declared_tasks", "no_executable_task", "realism",
+            "reason_codes",
+        ],
+        "additionalProperties": False,
+    }
 ```
 
-All three are INTERNAL schemas in the established sense (no `resolved_at` counting, no L2.5
-hook, no `uniqueItems`). The v1.16 `brief_schema` is used only on the joint-planner path;
-`plan_schema` remains byte-identical and remains the default v1.15 blueprint schema. The keyword
-freeze covers the constructors' own scope plus the realize
-wrapper's skeleton keys; `realize_schema`'s positional sub-schemas are user-authored and are
-deliberately NOT linted (§7.7 keyword-freeze scope).
-
+These are internal-treatment Schemas: no output-validator L2.5 and no user-treatment
+`resolved_at` counting. ScenarioSeed additionally receives code-side canonical-size,
+class-actor-closure and user state-Schema checks. EventPlan receives code-side test-before-
+mutation, JSON Pointer permission and StateExecutor post-validation. Frame and noise render use
+the complete selected user frame Schema unchanged. Frame binding never rewrites Draft 2020-12:
+after the LLM returns a full Schema-valid object, code applies the ordered exact binding values
+to a deep copy with RFC 6902 `add` semantics and validates the same complete Schema again. No
+deleted sequence-specific Schema-builder symbol exists.
 ### 10.8 M13 classification prompt (spec 3.13.3, verbatim)
 
 ```
@@ -7928,212 +7835,431 @@ constants REUSED (`_LABEL_EXAMPLE_IN`/`_LABEL_EXAMPLE_OUT`/`_LABEL_SCREENSHOT`/
 - Response validated against `cfg.frame_schema` through `complete_validated(schema=…)` —
   internal-schema treatment: no L2.5, no resolved_at (§7.4/§7.7).
 
-### 10.14 M6 blueprint prompt (spec 3.6.5, verbatim; v1.13)
+### 10.14 `generation.scenario_seed` prompt
 
-```
-system:
-  你是时间流数据规划器。给定任务描述与帧类表，为一条序列规划逐步蓝图：每一步选定一个帧类，并用一句话写明该步内容要点。
-  [任务] {class-effective generate.instruction}
-  [帧类表]
-  {name}: {description}                         ← 按 [[frame.classify.classes]] 声明序逐类一行
-  输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
-  {"steps": [{"frame_class": <帧类名>, "brief": <一句话要点>}, ...]}
-  字段说明：steps 恰为要求的步数，一步一项，按时间顺序排列；frame_class 必须取自 [帧类表] 中的帧类名；brief 用一句话写明该步内容要点，供逐帧实现展开。
-user:                                           ← cover_all=False（无档位表）
-  请为一条「{sequence class name}」序列产出 {L} 步蓝图。
-user:                                           ← cover_all=True（v1.14，档位表在场）
-  请为一条「{sequence class name}」序列产出 {L} 步蓝图，且 [帧类表] 中每个帧类都至少出现一次。
-```
+For `initial_state_source="llm"`, exactly two messages are sent, system then user, through
+`request.program.semantic_profile`. Catalog source sends no prompt and performs no LLM call.
+Every dynamic object and Schema in the six v1.18 prompt families uses canonical JSON
+(`ensure_ascii=False`, `sort_keys=True`, compact separators). No variant, pattern, role order,
+expected violation or outcome is rendered.
 
-Module constants in `labelkit/operators/generate.py`, transcribed VERBATIM above and
-**[FROZEN HERE]**: `_PLAN_SYSTEM_HEAD`, `_PLAN_LABEL_TASK` (`[任务]`),
-`_PLAN_LABEL_FRAME_TABLE` (`[帧类表]`), `_PLAN_STRUCTURE`, and the composed
-`_PLAN_SYSTEM_STATIC` = the four joined by `"\n"` — the template's FULL static system
-scaffolding (the class instruction and the frame class table are config quantities, metered
-separately by M1's static budget precheck, §6.3 rule 56).
-Both user lines are **[FROZEN HERE] VERBATIM**; the cover variant is v1.14's only template change
-and it is a pure ADDITION (with no tier table the emitted bytes are the v1.13 line exactly).
-`TEMPLATE_HEAD_TOKENS["generate_plan"] = 189 = est_text(_PLAN_SYSTEM_STATIC)` is pinned by the
-cross-layer equality test (§7.17) and is UNCHANGED in v1.14 — the cover sentence lives on the
-dynamic user line, not in the frozen static system scaffolding. Assembly is
-`render_plan_prompt_texts(instruction, frame_classes, class_name, length, cover_all=False)
--> (system, user)` (public, §7.5); the four system parts join with `"\n"`, the frame-table rows
-join with `"\n"` inside the `[帧类表]` part. That signature now sits at FIVE parameters — the
-ceiling — so any further parameter must convert it to a parameter object. Binding notes:
-
-- The system section order is frozen: head → `[任务]` line → `[帧类表]` + rows → structure
-  block. **What goes into the frame table is CONDITIONAL (v1.14).** With no tier table it is the
-  WHOLE table, exactly as in v1.13 — the blueprint enum spans it, which is why §6.3 rule 51
-  demands a generation instruction for every frame class: any of them may be picked. With a tier
-  table declared it is the TIER's SUBSET (the frame class table filtered, in declaration order,
-  to that tier's `frame_classes`), the caller does the filtering, and rule 51's instruction
-  requirement correspondingly narrows to the UNION of the tiers' compositions. **v1.15 one more
-  level of conditioning**: "that tier" is the row of the sequence class's EFFECTIVE table
-  (`effective_tiers(view.tiers, gs.tiers)`, §6.1) at `plan.tier_rank`, so two classes at the same
-  rank may render different frame tables; rule 51's union correspondingly runs over the
-  PARTICIPATING classes' effective tables. Template bytes are unaffected — this only changes which
-  rows the caller passes in.
-- On L0-off endpoints the structure block IS the structural guarantee, not a fallback: the
-  `{"steps": [...]}` shape sentence plus the per-field explanation carry compliance (the
-  DeepSeek anthropic route hard-rejects forced tool calls, so `supports_structured_output` is
-  false there — E2E-FINDINGS). Under `cover_all` the user line's cover sentence is the same kind
-  of hard requirement for the coverage half of the constraint.
-- Response validated against `plan_schema(frame class names, L)` — `plan_schema(tier subset, L,
-  cover_all=True)` with a tier table (§10.7) — internal treatment; repair exhaustion voids THE
-  SEQUENCE (no failed record, §7.5). A coverage violation renders through `_render_error`'s
-  `contains` branch as `steps: missing required frame_class "<name>"` so the L3 repair prompt
-  names what is missing (§7.7).
-- **v1.17 boundary note (template bytes UNCHANGED).** When a `ScenarioPlan` is in effect (the
-  v1.17 scenario-planning form, §7.19), the constrained path asks the LLM for per-position
-  briefs ONLY, via the §10.17 sampled-brief template family — this blueprint template and
-  `plan_schema` (including the v1.14 cover-variant user line) are NOT used on that path. The
-  frozen text above remains the default-path (no-ScenarioPlan) contract verbatim.
-
-### 10.15 M6 frame-realization prompt (spec 3.6.5, verbatim; v1.13)
-
-```
-system:
-  [任务] {class-effective generate.instruction}
-  [风格要求] {pre-drawn style prompt}            ← 无风格时整行省略（蓝图不带风格，实现才带）
-  输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
-  {"frames": [<第 1 帧内容>, <第 2 帧内容>, ...]}
-  字段说明：frames 恰为蓝图步数，一帧一项，与蓝图步序逐位对应；逐帧内容契约如下：
-  第 {i} 帧（{frame_class}）须符合：{contract}   ← 每步一行，i 自 1 起；contract = 该帧类生成
-                                                  Schema 的单行 dump，或纯文本帧的自由文本契约
-                                                  （默认：「自由文本一段」；约束路径：「JSON 字符串（如 "..."），不得用对象包裹」）
-user:
-  {i}. [{frame_class}] {brief}                  ← 蓝图步逐行，i 自 1 起
-  请实现全部 {L} 帧内容。
-```
-
-Module constants in `labelkit/operators/generate.py`, transcribed VERBATIM above and
-**[FROZEN HERE]**: `_REALIZE_LABEL_TASK` (`[任务]`), `_REALIZE_LABEL_STYLE` (`[风格要求]`),
-`_REALIZE_STRUCTURE`, `_REALIZE_FREE_TEXT` (`自由文本一段` on the default path), and the composed
-`_REALIZE_SYSTEM_STATIC` = the three labels/blocks joined by `"\n"`.
-`TEMPLATE_HEAD_TOKENS["generate_realize"] = 95 = est_text(_REALIZE_SYSTEM_STATIC)` is pinned by
-the same cross-layer equality test (§7.17). Assembly is
-`render_realize_prompt_texts(instruction, style_prompt, steps, contracts) -> (system, user)`
-(public, §7.5). Binding notes:
-
-- The PER-POSITION contract lines are the structural contract on an L0-off endpoint (they
-  repeat the frame-class schema text once per step, which is why M1's realize precheck prices
-  `max(len_range upper bound) × max(schema text)`, §6.3 rule 56). A frame class without a
-  generation schema contributes the literal `自由文本一段` on the default v1.15 path; the
-  constrained v1.16 path contributes the exact literal `JSON 字符串（如 "..."），不得用对象包裹`.
-  This only specifies the JSON-string representation of free text; the output remains free text,
-  not an object, and calls plus `realize_schema` are unchanged.
-- Under the reactive-overflow SEQUENCE HALVING (§7.5) the steps/contracts slices are re-rendered
-  with LOCAL 1-based numbering and `realize_schema` is rebuilt for the slice — the halves are
-  independent calls whose frame lists concatenate in span order.
-- Response validated against `realize_schema(step schemas)` (§10.7) — internal treatment for
-  the wrapper, verbatim pass-through for the user sub-schemas. A structured frame's object is
-  stored AS AN OBJECT in the artifact row's text field; `Record.text` takes its M2 projection
-  (canonical JSON), §9.5.
-
-### 10.16 M7 verdict-form sequence review prompt (spec 3.7.5, verbatim; v1.13)
-
-```
-system:
-  你是标注质量审核员。给定任务指令、成员帧摘要与标注结果，独立判断该序列（episode）的标注是否合格。
-  评审维度: ① 是否遵循任务指令 ② 与成员帧摘要证据的事实一致性 ③ 字段语义是否正确填写
-  {class-effective verify.extra_criteria}        ← 为空时整行省略
-  先逐维度给出简短意见，再给结论。
-  输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
-  {"critiques": [{"aspect": <维度>, "opinion": <一句话意见>}, ...],
-   "verdict": "pass"|"fail"}
-user (three text parts, in this order):
-  [任务指令] {class-effective annotate.instruction}
-  [成员帧摘要]
-  {m}. {frame_digest(member, 400)}               ← 每成员一行，m 自 1 起；总量超
-                                                    input.ui_tree_max_chars 时中段整行丢弃，
-                                                    以 …(truncated {N} members) 标记闭合
-  [标注结果] {json.dumps(annotation.output, ensure_ascii=False)}
-```
-
-Module constants in `labelkit/operators/verify.py`, transcribed VERBATIM above and
-**[FROZEN HERE]**: `_VERDICT_SEQ_SYSTEM_HEAD`, `_VERDICT_SEQ_SYSTEM_DIMS`,
-`_VERDICT_SEQ_SYSTEM_STRUCTURE`, `_LABEL_MEMBER_DIGESTS` (`[成员帧摘要]`), plus the REUSED
-`_SYSTEM_TAIL` (`先逐维度给出简短意见，再给结论。` — the §10.5 non-stream constant, same bytes)
-and `_MEMBER_DIGEST_MAX_CHARS = 400`. The system段 assembler is the public
-`verify_verdict_sequence_system_text(extra_criteria)` (§7.6). Binding notes:
-
-- NO defect table, NO `[边界余量]`, NO `[片段结构]`, NO screenshot parts — this variant is
-  reached ONLY from the classic path (`verdict_form=True`), never from the stream driver, so
-  the §10.5 defect-table variant stays byte-identical.
-- Response validated against the frozen `VERDICT_SCHEMA` (§10.7) — template and schema are
-  paired by construction (the defect-table variant's `defects` key is forbidden there).
-- The member-digest block is the ONLY trimmable slot under budget packing; `[标注结果]` and the
-  instruction are counted-never-trimmed (V25③), and an untrimmable floor over budget sets
-  `fit.overflow` (§7.6).
-
-### 10.17 M6 sampled-brief prompt (spec 3.6.5, verbatim; v1.16 constrained path)
+**System message:**
 
 ```text
-system:
-  你是时间流数据规划器。根据已冻结的帧类词，为每一步写一句内容要点。
-  [任务] {class-effective generate.instruction}
-  [固定帧类词]
-  {i}: {frame_class}                              ← planner word，i 自 1 起，一位置一行
-  [约束]
-  {render_constraint_text(effective rules, effective windows)}
-  输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
-  {"steps": [{"brief": <一句话要点>}, ...]}
-  字段说明：steps 恰为要求的步数，每项只包含 brief，按时间顺序对应固定帧类。
-user:
-  请为一条「{sequence class name}」序列产出固定的 {L} 个 brief。
+你是场景世界初始化器。创建一个在任何目标事件发生之前就已经存在、内部一致的世界快照。
+只依据给定的序列类别、类别指令、参与者闭集和状态 Schema 工作。
+initial_state 必须满足状态 Schema；actors 必须描述每个参与者的目标、身份和表达风格；
+shared_facts.public 是后续事件可公开使用的事实，shared_facts.hidden 只供独立判定使用；
+style 与 time_context 必须在同一次尝试的全部分支中保持稳定。
+不得写入模式名、变体名、角色顺序、目标违规、最终结果或尚未发生的事件。
+只返回一个 JSON 对象，不要 Markdown、代码围栏、解释或额外字段。
 ```
 
-Module constants in `labelkit/operators/generate_stream.py`, transcribed verbatim and
-**[FROZEN HERE]**: `_BRIEF_SYSTEM_HEAD`, `_BRIEF_LABEL_TASK` (`[任务]`),
-`_BRIEF_LABEL_WORD` (`[固定帧类词]`), `_BRIEF_LABEL_CONSTRAINTS` (`[约束]`),
-`_BRIEF_STRUCTURE`, and their newline-joined `_BRIEF_SYSTEM_STATIC`. Assembly is
-`render_brief_prompt_texts(instruction, frame_classes, class_name, length, constraints="") ->
-(system, user)`. The signature is at the five-parameter ceiling.
-
-The section order is head → task → fixed word → constraints → structure. The caller passes the
-planner word, never a user-selectable class table. `render_constraint_text` preserves effective
-rule declaration order followed by effective window declaration order and includes template
-parameters, half-open `time_s`, correlation field equality and calendar restrictions. An empty
-constraint string renders the literal `none`; the joint planner path always passes the common
-renderer result. Response treatment is internal and uses `brief_schema(L)` (§10.7); exhaustion
-increments the existing plan-failure family and voids the attempt without a failed envelope.
-
-`TEMPLATE_HEAD_TOKENS["generate_brief"] = 126 = est_text(_BRIEF_SYSTEM_STATIC)` is frozen and
-cross-layer tested (§7.17). This key is additive: §10.14, `plan_schema` and
-`TEMPLATE_HEAD_TOKENS["generate_plan"]` remain the v1.15 default path byte-for-byte.
-
-### 10.18 M6 constrained realization amendment (spec 3.6.5, verbatim; v1.16)
-
-The constrained path reuses §10.15 with exactly one additive system block after the optional style
-line and before the existing structure block:
+**User message, interpolation order is exact:**
 
 ```text
-system insertion:
-  [约束]
-  {the same render_constraint_text used by §10.17}
+[交付槽]
+mode={mode}
+slot_key={slot_key}
+source_name={source_name}
+scenario_index={scenario_index}
+attempt_index={attempt_index}
 
-per-position contract line under the existing §10.15 structure:
-  第 {i} 帧（{frame_class}）须符合：{frame-class-effective generate instruction}
-  内容契约：{reduced generation Schema single-line dump | JSON 字符串（如 "..."），不得用对象包裹}
+[序列类别]
+name={sequence_class}
+description={class_description}
+
+[生成指令]
+{generation_instruction}
+
+[参与者约束]
+{actor_contract_json}
+
+[状态 Schema]
+{state_schema_json}
+
+[输出契约]
+严格返回：
+{"initial_state":{},"actors":{},"shared_facts":{"public":{},"hidden":{}},"style":{},"time_context":{}}
+字段形状必须通过随请求提供的 JSON Schema。
 ```
 
-The existing assembler becomes
-`render_realize_prompt_texts(instruction, style_prompt, steps, contracts, constraints="") ->
-(system, user)` **[FROZEN HERE]**. `constraints=""` emits the exact v1.15 bytes. On the constrained
-path, M6 passes the same stable text as §10.17 and builds each `contracts` entry from the effective
-frame-class generation instruction followed by the literal `内容契约：` and the same reduced
-Schema/free-text face passed to `realize_schema`. For a plain-text frame this face is the exact
-literal `JSON 字符串（如 "..."），不得用对象包裹`; it specifies only JSON-string representation,
-while the semantic output remains free text and is not wrapped as an object. This repetition is
-required on L0-off endpoints; brief text is not trusted to preserve correlation fields.
+`mode`, the class description, generation instruction, actor contract and state Schema are
+mechanically projected from `ScenarioSeedRequest.program` plus `.slot`; callers do not supply a
+second prompt carrier. In declared mode `generation_instruction` is the selected
+`SequenceClassGenerationConfig.instruction`, `state_schema_json` is its state Schema and
+`actor_contract_json` is the exact ordered actor-name array; returned actors must equal it. In
+instruction-only mode the instruction and state Schema come from the selected
+`InstructionOnlySpec`, and `actor_contract_json` is
+`{"minimum_actor_count":1,"maximum_actor_count":8,"actor_name":"non-empty string"}`.
+L0-off receives the textual output contract above; a structured profile also receives
+`scenario_seed_schema(...)` unchanged. The request's `random_seed` controls attempt randomness
+but is never rendered into prompt text or ID material.
 
-Any effective correlation makes the complete sequence one indivisible realization call. M1's
-static budget check must prove the worst full prompt fits; overflow/truncation then voids the
-attempt through `realize_failures`, with no halving. Without correlation, the existing at-most-two-
-level bounded halving remains. The frozen `generate_realize = 95` template-head constant is
-unchanged because the constraints and per-frame instruction are dynamic blocks.
+### 10.15 `generation.event_plan` prompt
 
----
+Exactly two messages are sent through `EventPlanRequest.semantic_profile`. The request is built
+only by `build_event_plan_request(context, attempt_index, variation_nonce)`. Declared mode never
+renders complete state, hidden facts or another actor's goal; instruction-only renders complete
+current state, the complete semantic projection of EventDraft history and all actor profiles in
+explicitly labeled blocks.
+
+**System message:**
+
+```text
+你是逐事件状态规划器。为一个已经冻结逻辑位置的事件规划 frame_class、actor、intent 和 JSON Patch。
+不得增删事件、改变位置或逻辑时间；不得生成或推断工件 timestamp、session 或其他投影坐标。
+declared 模式只能读取 ActorView 和 public facts：test 操作必须位于 read_roots，
+add、remove、replace 操作必须位于 write_roots；至少一个 test，且全部 test 连续位于变更操作之前。
+patch 只允许 test、add、remove、replace，不允许 move 或 copy。
+instruction_only 模式可以读取明确提供的完整当前状态、历史和参与者档案，但 frame_class 和 actor 仍必须来自闭集。
+不要生成 payload，不要声称状态已经提交。只返回一个 JSON 对象，不要 Markdown、代码围栏、解释或额外字段。
+```
+
+**User message, interpolation order is exact:**
+
+```text
+[尝试身份]
+mode={mode}
+slot_key={slot_key}
+attempt_index={attempt_index}
+variation_nonce={variation_nonce}
+
+[冻结事件]
+event_key={event_key}
+role={role}
+position={position}
+sequence_length={sequence_length}
+logical_time_us={logical_time_us}
+wait_since_previous_us={wait_since_previous_us}
+
+[生成指令]
+{generation_instruction}
+
+[角色契约]
+{role_contract_json_or_null}
+
+[可选帧类别]
+{eligible_frame_classes_json}
+
+[可选参与者]
+{eligible_actors_json}
+
+[ActorView]
+{actor_view_json_or_null}
+
+[完整可见状态]
+{visible_state_json_or_null}
+
+[既有事件历史]
+{history_json_or_null}
+
+[参与者档案]
+{actor_profiles_json_or_null}
+
+[公开事实]
+{public_facts_json}
+
+[输出契约]
+严格返回：
+{"frame_class":"...","actor":"...","intent":"...","patch":[{"op":"test","path":"/...","value":null},{"op":"replace","path":"/...","value":null}]}
+结果必须通过随请求提供的 JSON Schema，并能在当前状态副本上原子执行。
+```
+
+`role_contract_json_or_null` is either literal `null` or an object with exactly these keys:
+`name`, `frame_class`, `actor`, `read_roots`, `write_roots`, `publish_roots`, `observers`,
+`state_instruction`, `pre_state_schema`. It deliberately excludes `payload_bindings` and
+`calendar_window`, which are not planner inputs. `eligible_frame_classes_json` is an array in the
+request Mapping order; each element is exactly
+`{"name":...,"description":...,"generation_instruction":...}` and is derived from one
+`FrameClassView`. `eligible_actors_json` is the request tuple as a JSON array.
+
+The line `role={role}` is exactly `request.planned_event.role`. It is distinct from
+`request.role`, the nullable RoleSpec serialized only as `role_contract_json_or_null`. In
+instruction-only mode the former is the positional prompt/truth label while the latter remains
+null; StateTransitionInput.role also remains null because there is no declared RoleSpec.
+
+For instruction-only, `history_json_or_null` preserves EventDraft order and renders each draft's
+complete semantic projection with exactly `event_key`, `frame_class`, `actor`,
+`logical_time_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`,
+`publish_snapshot` and `payload`. It deliberately omits EventDraft `event_id` and
+`timestamp_us`; EventDraft has no role field. Prompt snapshot tests assert that no historical or
+current event ID, artifact timestamp, session ID or other projection coordinate is present.
+
+`wait_since_previous_us` is not a second carrier field: declared mode reads the exact value from
+the non-null ActorView; instruction-only derives it from `planned_event.logical_time_us` minus
+the last EventDraft's logical time, or zero for the first event. Although PlannedEvent retains
+`timestamp_us` and `session_id` for projection, neither value nor any other artifact coordinate is
+rendered into this prompt.
+
+Declared mode renders a non-null role contract and ActorView; `visible_state`, `history` and
+`actor_profiles` are literal `null`. Its eligible frame/actor arrays each contain only the
+role-fixed value, and `event_plan_schema` uses the same one-element enums. Instruction-only
+renders literal `null` for the RoleSpec and ActorView, uses `position_NNN` only for the prompt's
+`role` and later EventTruth label, and renders the complete `visible_state`, complete semantic
+projection of ordered EventDraft `history`, and ordered actor goal/identity/style profiles;
+its eligible arrays are the full closed sets. `generation_instruction` is respectively the
+declared class instruction or instruction-only slot instruction. Public facts never include
+`shared_facts.hidden`.
+
+No field named variant, target, expected violation, actual violation, PatternEvaluation,
+StateEvaluation or semantic verdict enters the request or prompt. L0-off uses the full textual
+contract; structured output receives `event_plan_schema(...)` unchanged. Every L2 candidate then
+goes through the request-local executable post-validator exactly once; the returned
+`EventExecution` is the proof later committed for that same candidate.
+
+### 10.16 `generation.frame_render` prompt
+
+Exactly two messages are sent through `RenderEventRequest.semantic_profile`. The selected
+`FrameClassView.gen_schema` is supplied structurally unchanged as the complete Draft 2020-12
+instance Schema; no path or keyword is removed, rewritten or translated.
+
+**System message:**
+
+```text
+你是单事件载荷渲染器。把已经通过状态执行的一个事件写成自然、真实且与当前 actor 已知信息一致的 JSON object。
+只能表达给定 intent、ActorView、公开事实和 publish snapshot 中可见的内容。
+不得改变 frame_class、actor、role、intent、patch、状态哈希、逻辑时间或事件数量。
+不得生成或推断工件 timestamp、session 或其他投影坐标。
+不得猜测 hidden facts。机械绑定值必须出现在返回对象的指定 path，且等于给定值。
+只返回满足给定完整帧 Schema 的一个完整 JSON 对象，不要 Markdown、代码围栏、解释或额外字段。
+```
+
+**User message, interpolation order is exact:**
+
+```text
+[尝试身份]
+slot_key={slot_key}
+attempt_index={attempt_index}
+
+[冻结事件]
+event_key={event_key}
+role={role}
+position={position}
+frame_class={frame_class}
+actor={actor}
+logical_time_us={logical_time_us}
+wait_since_previous_us={wait_since_previous_us}
+intent={intent}
+patch={patch_json}
+
+[ActorView]
+{actor_view_json}
+
+[公开事实]
+{public_facts_json}
+
+[本事件发布快照]
+{publish_snapshot_json}
+
+[状态哈希]
+before={state_before_hash}
+after={state_after_hash}
+
+[帧生成指令]
+{frame_instruction}
+
+[帧类别描述]
+{frame_description}
+
+[机械绑定值]
+{binding_values_json}
+
+[完整帧 Schema]
+{frame_schema_json}
+
+[输出契约]
+只返回一个通过完整帧 Schema 的完整 JSON object；机械绑定 path 的值必须与上方给定值完全相同。
+```
+
+`patch_json` is the exact `EventPlan.patch`. `binding_values_json` is an array in
+`RoleSpec.payload_bindings` declaration order whose elements are exactly
+`{"payload_path":...,"value":...}`. Each value is a deep copy read from the selected before/after
+state snapshot before the request is built. `RenderEventRequest.binding_values` must have exactly
+the RoleSpec payload-path key set, with no missing or extra key; instruction-only has no RoleSpec,
+requires an empty Mapping and renders `[]`.
+The RoleSpec itself, state_before, state_after, EventExecution, state validator, hidden facts,
+variant and target are never serialized.
+
+The frame's `role={role}` line is exactly `request.planned_event.role`; the nullable
+`request.role` RoleSpec is used only to validate the declared fixed frame/actor and to order
+mechanical bindings. Instruction-only therefore renders its positional event label while still
+having no RoleSpec or state-hook role.
+
+`wait_since_previous_us` is exactly `RenderEventRequest.actor_view.wait_since_previous_us`.
+Although `planned_event` retains `timestamp_us` and `session_id` for later projection, neither
+field nor any other artifact coordinate is rendered into this prompt. Event semantics use only
+logical time and relative wait in this prompt; ScenarioSeed time context remains separate frozen
+world truth, and artifact placement never replaces or changes it.
+
+The model returns a complete object and M8 first validates it against the unchanged full Schema.
+Code then deep-copies that object, applies every ordered binding with RFC 6902 `add` instance
+semantics and validates the resulting complete object against the same full Schema. The target
+member may be added or replaced, but every non-root parent must already exist. Missing parents,
+mechanical patch failure or final full-Schema failure is `frame_schema` for the current slot
+attempt; it does not enter L3 and no authoritative state value is added to a repair violation.
+L0-off sees the complete Schema text; structured output receives exactly the same complete
+Schema. Payload, ActorView, ScenarioSeed-derived facts and full prompt are never truncated.
+
+### 10.17 `generation.semantic_evaluate` prompt
+
+Exactly two messages are sent through `SemanticEvaluationRequest.evaluation_profile`. The review
+is built directly from the request's blind fields and never from an `EventTrace`. It deliberately
+excludes expected/actual violation, planner witness, PatternEvaluation, StateEvaluation, target
+identity and any prior semantic verdict.
+
+**System message:**
+
+```text
+你是独立序列语义判定器，不参与生成。根据完整、未裁剪的场景种子、逐事件 ActorView、事件意图、
+patch、状态哈希、发布快照、逻辑等待、最终载荷和最终状态，独立判断六项语义性质。
+causal_consistency：因果与状态变化一致；actor_knowledge：每个 actor 只使用其当时可知的信息；
+goal_consistency：行为与 actor goal 一致；temporal_plausibility：等待与时间语义合理；
+cross_frame_consistency：跨帧实体、请求与结果一致；realism：整体像真实交互。
+每一项只能返回 boolean。任一 false 必须加入对应闭集 reason code；全部 true 时 reason_codes 必须为空。
+reason_codes 不得包含用户数据、实体值或自由文本。只返回 JSON，不要 Markdown、代码围栏、解释或额外字段。
+```
+
+**User message, interpolation order is exact:**
+
+```text
+[审查身份]
+mode={mode}
+sequence_class={sequence_class}
+attempt_index={attempt_index}
+
+[类别描述]
+{class_description}
+
+[模式或生成指令描述]
+{pattern_description}
+
+[完整场景种子]
+{scenario_seed_json}
+
+[顺序语义事件]
+{semantic_review_events_json}
+
+[最终状态]
+{final_state_json}
+
+[输出契约]
+严格返回：
+{"causal_consistency":true,"actor_knowledge":true,"goal_consistency":true,"temporal_plausibility":true,"cross_frame_consistency":true,"realism":true,"reason_codes":[]}
+reason_codes 只能取：
+["causal_inconsistency","actor_knowledge_violation","goal_inconsistency","temporal_implausibility","cross_frame_inconsistency","unrealistic"]
+```
+
+`semantic_review_events_json` is the request tuple serialized as an array, preserving event
+order. Each element contains exactly these `SemanticReviewEvent` fields: `frame_class`, `actor`, `logical_time_us`,
+`wait_since_previous_us`, `actor_view`, `intent`, `patch`, `state_before_hash`,
+`state_after_hash`, `publish_snapshot`, `payload`. It contains no event ID, role, artifact
+timestamp, scenario-set name, variant, target, expected/actual violation, planner binding or
+evaluator result. The projection comes directly from ordered EventDraft semantic fields, not from
+EventTruth or EventTrace. `scenario_seed_json` and `final_state_json` are separate complete objects; no
+wrapper resembling EventTrace is constructed. Declared `pattern_description` is exactly
+`SequencePattern.description`; instruction-only uses exactly `InstructionOnlySpec.instruction`.
+
+All six booleans must be true. Only after this independent verdict succeeds may code compare the
+separately computed structural truth and assemble EventTrace. Structured output receives
+`semantic_evaluation_schema()` unchanged; L0-off relies on the full textual contract.
+
+### 10.18 `generation.noise_render` prompt
+
+Exactly two messages are sent through `NoiseRenderRequest.semantic_profile`. The request uses a
+real `NoiseSlot`; it never accepts or constructs a PlannedEvent sentinel.
+
+**System message:**
+
+```text
+你是独立噪声事件渲染器。生成一条自然、真实，但与所有已声明任务无关且不包含可执行诉求的输入。
+不得复用任何主序列的实体、请求、票号、设备、目标、状态或措辞；不得生成任务的起点、进展或结果。
+只能返回满足给定噪声帧 Schema 的一个 JSON 对象，不要 Markdown、代码围栏、解释或额外字段。
+```
+
+**User message, interpolation order is exact:**
+
+```text
+[尝试身份]
+event_key={event_key}
+noise_ordinal={noise_ordinal}
+attempt_index={attempt_index}
+frame_class={frame_class}
+timestamp_us={timestamp_us}
+session_id={session_id}
+
+[已声明序列类别]
+{class_descriptions_json}
+
+[已声明帧类别]
+{frame_descriptions_json}
+
+[噪声指令]
+{noise_instruction}
+
+[帧生成指令]
+{frame_instruction}
+
+[噪声帧 Schema]
+{noise_frame_schema_json}
+
+[输出契约]
+只返回一个通过噪声帧 Schema 的 JSON object。
+```
+
+The attempt identity fields are projected exactly from `NoiseRenderRequest.noise_slot` and
+`.attempt_index`; `noise_instruction` comes from `.noise_spec`, while frame instruction and the
+complete frame Schema come from `.frame_spec`. `class_descriptions_json` and
+`frame_descriptions_json` are the request mappings rendered as complete canonical JSON objects.
+The prompt receives no PlannedEvent, ScenarioSeed, EventTrace, primary payload, actor profile,
+state or variant truth. L0-off sees the full frame Schema; structured output receives that same
+Schema unchanged. Returned payload and the complete prompt are never truncated.
+
+### 10.19 `generation.noise_evaluate` prompt
+
+Exactly two messages are sent through `NoiseEvaluationRequest.evaluation_profile`.
+
+**System message:**
+
+```text
+你是独立噪声语义判定器，不参与生成。判断候选是否与全部已声明任务无关、是否不含可执行任务、
+以及是否自然真实。三项只能返回 boolean；任一 false 必须加入对应闭集 reason code，
+全部 true 时 reason_codes 必须为空。reason_codes 不得包含候选内容或自由文本。
+只返回 JSON，不要 Markdown、代码围栏、解释或额外字段。
+```
+
+**User message, interpolation order is exact:**
+
+```text
+[审查身份]
+attempt_index={attempt_index}
+
+[已声明序列类别]
+{class_descriptions_json}
+
+[已声明帧类别]
+{frame_descriptions_json}
+
+[候选 payload]
+{payload_json}
+
+[输出契约]
+严格返回：
+{"unrelated_to_declared_tasks":true,"no_executable_task":true,"realism":true,"reason_codes":[]}
+reason_codes 只能取：
+["related_to_declared_task","executable_task_present","unrealistic"]
+```
+
+The descriptions and candidate payload are the direct request fields rendered as complete
+canonical JSON. The prompt receives no NoiseSlot, PlannedEvent, ScenarioSeed, EventTrace, primary
+payload set, state or variant truth. All three booleans must be true. Structured output receives
+`noise_semantic_evaluation_schema()` unchanged; L0-off relies on the complete text contract.
+
+Across all six families, profile choice comes only from the request/program fields named above.
+All use the unchanged §10.6 L3 repair message after L1/L2 failure. Repair receives the same
+complete Schema and only normalized, data-minimized violations. Event-plan post-validation never
+injects state, EventExecution or hook exception text into repair. Frame binding application and
+its final full-Schema revalidation occur after M8 success and never enter L3.
 
 ## 11. Cross-cutting conventions (binding)
 
@@ -8198,8 +8324,9 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
    `run_started_at` travel via the Orchestrator/Emitter/MetricsSink constructors instead
    (2026-08-14: on the Orchestrator side they ride the `RunServices` parameter object, §7.9).
    One RunContext per (batch, stage) invocation.
-6. **profile 名与配置摘要** — `LLMProfile`/`EmbeddingProfile` carry `name` and resolved
-   `api_key` (`repr=False`);
+6. **profile 名与配置摘要** — `LLMProfile`/`EmbeddingProfile` carry `name` and normalized
+   environment-variable names only; secret values live exclusively in the non-repr,
+   non-serializable `RuntimeCredentials` on `run` and `validate --probe` paths.
    `EmbeddingProfile.retry_base_delay_s` defaults 1.0 (spec §5.1 lists it; same full-jitter
    retry mechanism as llm profiles). Config digests = sha256 of raw file bytes, rendered `"sha256:<hex>"`.
 7. **complete_validated 四元返回** — `SchemaEngine.complete_validated` returns
@@ -8295,8 +8422,9 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     inside the prefix), and the same spec row declares linear-scan latency acceptable
     at the ≤ 500k scale target. Correctness wins over the suggested optimization.
 25. **密钥池与轮换** — v1.6 key pool (spec 3.9.3, decisions spec 1.6 2026-07-03):
-    `api_key_envs`/`api_keys`
-    are normalized tuples (scalar form → 1-tuple; `api_key_env`/`api_key` mirror element 0);
+    profile `api_key_envs` is a normalized tuple of environment-variable names (scalar form
+    → 1-tuple; `api_key_env` mirrors element 0); `RuntimeCredentials` holds the corresponding
+    secret-value tuples only after `resolve_credentials()` on `run` / `validate --probe`;
     per-attempt least-in-flight key selection, declaration-order tie-break (deterministic,
     seed-exempt); per-key 429 cooldown (Retry-After in full, else jittered exponential capped
     at 300 s); auth failure disables the key and is absorbed silently by rotation (no retry
@@ -8617,73 +8745,15 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
       `vision_resolved` parse product);
     - the new template sections are numbered §10.12/§10.13 AFTER the pre-existing
       §10.11 (same anchor-stability rationale as v1.7/v1.8/v1.9).
-33. **时间流生成冻结点** — v1.13 time-stream generation (feature spec
-    `docs/dev/SPEC-stream-generation.md`, adjudications recorded by NAME — 形态与分工 /
-    抽签消费顺序表 / 时间流工件通道 / 工件行即 raw / 真值不携最终 id / 工件行真值字段集 /
-    会话装箱定容 / 噪音只做插入与重复 / 量目标辖区 / 序列类约束按形态放宽 / 按类标注 Schema /
-    M8 显式待遇参数 / 蓝图实现内部 Schema / 用户生成 Schema 的 L0 待遇 / 直装评审判决形 /
-    轨迹准则自动解析扩展 / 生成键效力矩阵 / 序列相似度过滤 / 估算精确复演 /
-    golden 冻结锚不动 / 预算头两键 / 观测面 / members 呈现真值门 / 停放豁免精确化 /
-    织造上限静态校验 / meta_mode 护栏 / 帧类生成面 / 互斥语义答卷 / 示例工程形态 et al.;
-    2026-08-13). Key frozen points:
-    - **artifact row format & truth key set** (§9.5): `{<ts field>, <text_field>, "truth"}`
-      with truth keys `session` / `sequence_class` / `sequence` / `frame_class` / `noise`
-      [+ `duplicate_of` on re-sent frames ONLY] — a CLOSED set carrying NO post-assembly ids
-      (member ids hash the row, sequence ids hash the member ids ⇒ embedding either is
-      circular); the artifact is the FIFTH output channel `{output_stem}.stream.jsonl`,
-      delivered in the main output's finalize batch under the shared `_undeliverable`
-      discipline, never touched by dry-run (§7.10, spec §2.6's writable-object list gains its
-      fifth entry). **v1.14 amendment (item 35):** the key set is RE-FROZEN with a conditional
-      `tier_rank` inserted after `sequence` and before `frame_class`; the "no post-assembly ids"
-      rule and the closed-set discipline are unchanged;
-    - **draw-order table** (§7.5): one `Random(f"{seed}:0:generate")`, three phases —
-      planning ①quota expansion in class-name lexicographic order (`--limit` truncates HERE)
-      ②per-sequence length ③per-sequence (llm, style) with the noise batches drawn in the same
-      predraw stream; dispatch consumes ZERO rng; v1.15 default weaving ④duplicate selection
-      ⑤packing
-      shuffle + pairwise crossing ⑥per-crossed-session switch points ⑦per-noise-frame draws
-      ⑧duplicates as tail sessions (zero rng) ⑨timestamp laying. On v1.16 the planner freezes
-      crossing before dispatch and survivor projection recomputes the true alternation count from
-      remaining owner timestamps; no algebraic crossing count is reused. Test-pinned against
-      drift; determinism is conditional on the LLM content (voided sequences change the weave
-      input).
-      **v1.14 amendment (item 35):** the table itself is UNCHANGED — tier apportionment (between
-      ① and ②) and the time-field back-fill coda (after ⑨) both consume ZERO rng;
-    - **M8 treatment parameter** (§7.7): `user_treatment: bool | None = None` (since
-      2026-08-14 a `CallScope` field rather than a standalone kwarg)
-      — None keeps the pre-v1.13 `schema is None` inference (every pre-existing call
-      site unchanged), True means user treatment WITH an explicit schema (L2.5 + resolved_at
-      preserved — the per-sequence-class annotation schema route), False means internal. The
-      `stats` / §9.3 identity is restated as "the sum = RECORD-LEVEL annotation calls entering
-      M5"; the keyword-freeze sentence is rescoped to the LabelKit-side constructors plus the
-      realize wrapper's skeleton keys (user generation sub-schemas pass through L0 unlinted);
-    - **three new verbatim templates** §10.14 (blueprint) / §10.15 (frame realization, with
-      the per-position contract lines) / §10.16 (verdict-form sequence review), numbered AFTER
-      the pre-existing §10.13 (anchor stability); `TEMPLATE_HEAD_TOKENS` gains
-      `"generate_plan" = 189` / `"generate_realize" = 95`, test-pinned to `est_text` of the
-      corresponding frozen system scaffolding (§7.17);
-    - **two internal schema builders** `plan_schema` / `realize_schema` (§10.7) — the latter
-      uses native draft 2020-12 `prefixItems` + `"items": false`; no `uniqueItems`, no
-      resolved_at, no L2.5;
-    - **estimate & goldens** (§7.9): the generate_only branch replays M6's planning-phase pure
-      function EXACTLY (`records = Σsequences`, `generate_calls = 2 × records + ceil(noise /
-      num_per_call)`, `classify_calls = 0`); the estimate LINE FORMAT and the console key sets
-      are ZERO CHANGE, the seven pre-existing dry-run goldens stay BYTE-FROZEN, and only
-      `dryrun-synth-stream.txt` joins — eight goldens over five example directories / eight
-      projects;
-    - **observability** (§9.3): `report.generate.stream` (twelve counts-only keys, frozen key
-      order) + `report.run.artifact` (path/sha256/lines, present only when written);
-      `report.stream` does NOT appear; ZERO new trace channels, ZERO new events, ZERO new
-      error kinds (§8.1, spec §7.6) — voided sequences produce no StageError at all.
-      **v1.14 amendment (item 35):** a THIRTEENTH key `tiers` joins that block CONDITIONALLY, at
-      the frozen position between `sequences` and `frames`, assembled explicitly by M10 (§7.9);
-      the other twelve keys, their order, and every zero-increment statement above are unchanged;
-    - **zero-change anchors**: Stage contract exceptions (the rich return value is still the
-      generate exception's "returns a new sub-batch" form, §4.3), the status machine, the
-      `_meta` top-level key order, the four-route exclusivity, the rejects surface, and the
-      conservation identity (generate_only degenerate form). With
-      `generate.stream.enabled = false` (the default) the whole system is byte-equivalent to
-      v1.12.
+33. **v1.18 序列生成内核冻结点** — `generate.form="sequence"` is a clean breaking
+    boundary replacing every v1.13–v1.17 sequence-generation surface. It freezes named exact
+    patterns, continuing state, actor-scoped views, JSON Patch execution, independently bound
+    structural/state/semantic gates, shared-seed counterfactual sets, exact noise/replay planning,
+    whole-set downstream transactions, retained-content admission, manifest-last delivery and a
+    self-contained replay artifact. Instruction-only is an independent declared mode, not a
+    fallback. The complete carriers and interfaces are §6.1/§7.18; exact prompts and Schemas are
+    §10.7/§10.14–§10.19; output/report/failure contracts are §9.3–§9.5. No alias, compatibility
+    parser, migration, fallback, old report key or old exported symbol survives.
 34. **代码规则整改冻结点** — the 2026-08-14 code-rule remediation (spec §1.6, same date).
     Behavior, field names, keys, event names, error kinds, report shapes, chain order and the
     prompt templates of §10 are ALL unchanged; what moved is the carrier and the language:
@@ -8706,175 +8776,4 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     - **re-frozen byte anchors**: the eight `tests/cli/goldens/dryrun-*.txt` files and the two
       `console_format` plain lines (progress line + final-summary header) are re-frozen onto
       the English strings; key sets, line structure and information content are unchanged.
-35. **帧类构成档位与时间字段回填冻结点** — v1.14 (feature spec
-    `docs/dev/SPEC-generation-tiers.md`, adjudications recorded by NAME — 档位即帧类构成 /
-    tier_rank 即档位身份 / 时间字段回填方向 / 零抽签配分 / 蓝图双向硬约束 / 构成恰等 /
-    档位标识三点落位 / 报表显式装配 / 真值键序重冻结 / 重发帧承源档与同源载荷 / 配分零额告警 /
-    语义词表四值 / 序内间隔口径 / 绑定即剔除 / 回填后计 id / 回填前钩子口径 /
-    观测零增量与冻结锚不动 / 静态预检上界照旧 / L0 待遇沿用 / 渲染缺类可见 / 微秒地板 /
-    指令必填域收窄; 2026-08-18). Two ORTHOGONAL mechanisms sharing one revision number, both
-    default-off. Key frozen points:
-    - **integer-domain apportionment** (§6.1 `apportion_tiers`): base =
-      `(sequences * weight) // Σweight`, remainder key = `(sequences * weight) % Σweight`,
-      +1 by descending remainder with ties broken by ASCENDING tier_rank. NO floating-point
-      intermediate is permitted — the tie verdict feeds in-class ordinal blocks → truth →
-      artifact bytes → member ids. The function lives in `model.py` (common), NOT in operators,
-      because M1's per-nonzero-quota-pair constraint and M6's planning phase share it and common
-      may not import operators; `tier_rank_for_ordinal` (§7.5, operators) is the prefix-sum
-      lookup, kept as a STANDALONE function so `expand_stream_quota`'s two-tuple return and its
-      three existing unpack assertions stay intact;
-    - **composition equality** (§10.7): `plan_schema(names, length, cover_all=False)` — True
-      appends `allOf` + one `contains` branch per name in the PASSED order; enum "⊆" ∧ contains
-      "⊇" ⇒ EQUALITY. `cover_all=False` is byte-identical to v1.13. The frozen internal-schema
-      keyword set grows by `allOf` / `contains` / `const`. `_render_error` gains a `contains`
-      branch rendering `steps: missing required frame_class "<name>"` (§7.7);
-    - **the blueprint template's conditional faces** (§10.14): the `[帧类表]` rows are the whole
-      table with no tier table and the TIER SUBSET with one; the user line has TWO verbatim
-      variants (plain / cover), the cover variant being v1.14's only template change and a pure
-      addition. `TEMPLATE_HEAD_TOKENS` is UNCHANGED (`generate_plan = 189`) — the cover sentence
-      is on the dynamic user line; `render_plan_prompt_texts` now sits at FIVE parameters, the
-      ceiling;
-    - **three landing points for the rank** (all conditional on a non-empty tier table):
-      `_meta.source.generator` becomes the three-key `{"llm", "style", "tier_rank"}` (§9.1),
-      the artifact `truth` gains `tier_rank` between `sequence` and `frame_class` (§9.5, the
-      item-33 re-freeze), and `report.generate.stream` gains `tiers` between `sequences` and
-      `frames` (§9.3) — the last one assembled EXPLICITLY from the declared tier table by M10
-      (§7.9), which is what makes zero-quota and fully-voided tiers appear with 0/0 rather than
-      vanish (the E2E-FINDINGS #11 family of trap, caught at the spec layer).
-      **v1.15 amendment (item 36):** the presence test of all three stays "the GLOBAL tier table
-      is non-empty" (the anchor rule) and their keys and order are unchanged; the rank VALUE
-      becomes an IN-CLASS one, and the report's `tiers` sub-block gains a second, class-nested
-      form while the counter keys behind it are re-frozen per class;
-    - **binding vocabulary and back-fill** (§6.1 `FrameClassView.time_fields`, §7.5): the FROZEN
-      four-word closed set `{ts, gap_prev_s, gap_next_s, elapsed_s}` with literal type equality
-      (`"string"` for `ts`, `"number"` for the rest); bound fields are STRIPPED from the
-      LLM-facing per-position schema AND its contract line (hierarchical copy — the shared
-      `FrameClassView.gen_schema` is never mutated); values are `round(·, 6)` INTRA-SEQUENCE
-      deltas with 0.0 first/last boundaries, written IN PLACE into the shared payload after ⑨ and
-      BEFORE assembly, so ids are computed over back-filled payloads and artifact replay stays
-      byte-identical; duplicate slots inherit by OBJECT IDENTITY (never walked, never touched);
-      the `sample_validator` and sequence-similarity hooks keep seeing PRE-back-fill payloads;
-    - **config surface** = §6.3 rules 57–60, plus the `_FRAME_CLASS_SECTION_KEYS["generate"]`
-      whitelist growing from three keys to four (`time_fields`) and rule 51's
-      instruction-required scope narrowing to the union of tier compositions.
-      **v1.15 amendment (item 36):** rules 57/58 are re-read PER EFFECTIVE TABLE, rule 61 joins
-      the cluster, and rule 51's union runs over the participating classes' effective tables;
-    - **v1.13 defect repair, not a switch face**: rule 59's `frame_gap_s.lo >= 1e-6` microsecond
-      floor — zero impact on any project with `lo >= 1e-6` (every example uses 5);
-    - **zero-change anchors**: the draw-order table (item 33's amendment), `estimate_run` and the
-      estimate line format, the EIGHT dry-run goldens (byte-frozen, example extension included),
-      the console key sets and panel rows, `TEMPLATE_HEAD_TOKENS`, `realize_schema`, trace
-      channels/events, §7.6 error kinds, the status machine, the Stage-contract exceptions and
-      the conservation identity. With both switches off the whole system is byte-equivalent to
-      v1.13 (rule 59 excepted, as a defect repair).
-36. **按类档位表冻结点** — v1.15 (feature spec `docs/dev/SPEC-per-class-tiers.md`, adjudications
-    recorded by NAME — 表级原子覆盖 / 全局表为锚 / rank 类内身份 / 空表拒收 /
-    载体 ClassView 顶层字段 / note 行不因档位触发 / effective_tiers 下沉 common /
-    计数器键按类重冻结 / 嵌套报表全类铺开 / 校验域并集化 / 零额结构校验不豁免; 2026-08-19). The
-    PER-CLASS increment of v1.14's tier face, fully ORTHOGONAL to its time-field back-fill face
-    (zero contact). Key frozen points:
-    - **new config surface** `[[class.<name>.generate.tiers]]` (parse product `ClassView.tiers`,
-      §6.1 — three states: `None` not declared / `()` rejected / non-empty override) with
-      WHOLE-TABLE override semantics, never a row merge (裁决·表级原子覆盖; the precedents are
-      `[class.*.quality].rubric` and `[class.*.annotate].schema_*`). The `[class.*.generate]`
-      whitelist grows from six keys to seven (§6.3 rule 25 — an unlisted `tiers` would be
-      rejected by the whitelist loop before rule 61 ever ran), and the carrier is a ClassView
-      TOP-LEVEL field rather than `GenerateConfig`, so a pure tier override never trips the
-      dry-run per-class-override note — tiers change no call count (裁决·载体 ClassView 顶层字段 +
-      裁决·note 行不因档位触发);
-    - **`effective_tiers`** (§6.1) — the SINGLE tier lookup point, living in `model.py` beside
-      `apportion_tiers` for the same layering reason (M1's constraint cluster, M6's planning
-      phase and M10's report assembly share one implementation; common may not import operators,
-      so M6/M10 import it backwards). `apportion_tiers` and `tier_rank_for_ordinal` keep their
-      SIGNATURES AND BODIES — only what the call sites pass changes — and apportionment still
-      consumes ZERO rng;
-    - **§6.3 rule 61** — three DIRECTED CONFIG_ERROR sub-clauses with the verbatim messages
-      recorded there: the form gate (the v1.11 raw-section probe, so it fires even on a malformed
-      table), the GLOBAL ANCHOR (a per-class table requires the global one — which is what keeps
-      the tier face a single switch and every v1.14 presence predicate unchanged), and
-      empty-table rejection. Rules 57/58 are re-read PER EFFECTIVE TABLE ("covers 1..N" per table
-      with a per-class N, "pairwise distinct compositions" narrowed to WITHIN one table so
-      cross-class duplicates are legal, quota checks and the 配分零额 WARN per class), while rule
-      51's instruction scope and the 帧类未入档 WARN domain become the UNION over PARTICIPATING
-      classes' effective tables (裁决·校验域并集化). A zero-quota class's declared table still runs
-      the structural checks and is exempt only from the quota-derived ones
-      (裁决·零额结构校验不豁免);
-    - **counter keys UNFROZEN and RE-FROZEN PER CLASS** — v1.14's
-      `generate.stream.tiers.<tier_rank>.*` family is replaced by
-      `generate.stream.tiers.<class>.<tier_rank>.{planned, produced}` (§7.5/§9.3). M6 ALWAYS feeds
-      the class-segmented form (single-feed discipline; writing both families is forbidden). This
-      is the ONLY frozen surface v1.15 unfreezes, registered here per the §12 discipline;
-    - **report `tiers` gains a SECOND FORM** (§7.9/§9.3, 裁决·嵌套报表全类铺开) — FLAT when no
-      class declared a table (M10 sums the class-segmented counters per rank ⇒ BYTE-IDENTICAL to
-      v1.14, whose flat counts were cross-class aggregates already) and CLASS-NESTED
-      `{"<class>": {"<tier_rank>": {planned, produced}}}` when any did: outer level zero-based
-      over ALL declared classes in `[[classify.classes]]` declaration order, inner over that
-      class's EFFECTIVE table in rank order, zero-quota classes and fully-voided tiers present
-      with 0/0. The presence gate and the frozen key position between `sequences` and `frames`
-      hold in BOTH forms;
-    - **zero-change anchors**: the draw-order table (per-class apportionment is still the
-      zero-consumption step between ① and ②), `estimate_run` and the estimate line format, the
-      EIGHT dry-run goldens (byte-frozen, example extension included), the console key sets and
-      panel rows, `TEMPLATE_HEAD_TOKENS` and every §10 template BYTE (§10.14's extra conditioning
-      only changes which rows the caller passes in), `plan_schema` / `realize_schema`, trace
-      channels and events (§8.1), §7.6 error kinds (rule 61's errors ride the existing
-      CONFIG_ERROR face), `_meta.source.generator` and the artifact `truth` (keys, order and
-      presence tests all unchanged — only the VALUE becomes an in-class rank), the rejects
-      surface, the status machine, the Stage-contract exceptions and the conservation identity.
-      The v1.14 time-field back-fill face is untouched. With no per-class table declared the whole
-      system is byte-equivalent to v1.14, the report included.
-37. **时间流序列规则冻结点** — v1.16 (feature spec
-    `docs/dev/SPEC-sequence-rules.md`; 2026-08-20). Key frozen points:
-    - **configuration and activation** (§6.1/§6.3): global `rules`/`windows`, independent
-      per-class `None`/`()`/non-empty whole-table semantics without a global anchor, and
-      `generate.sequence_validator`; all are legal only in time-stream generate_only. M1 validates
-      every candidate length even for zero quota, but only the actual post-`--limit` nonzero prefix
-      can activate joint planning or rules/windows report faces;
-    - **finite-trace semantics** (§7.18): exactly 15 DECLARE templates with `end` and no `last`
-      alias; standard activation/vacuity/occurrence candidates, target reuse, declaration-order
-      first failure, half-open exact-microsecond `time_s`, top-level same-type canonical equality,
-      every-occurrence fixed-offset same-day calendar windows, and the frozen C0→Ce→Ct runtime
-      attribution;
-    - **joint planner** (§7.18): exact `ortools==9.15.6755`, one shared M1/M6/M10 question and
-      solve route, variables-plus-constraints cap 250,000, one worker, 31-bit seed,
-      `max_deterministic_time=10.0`, no wall timeout/fallback, precise status mapping and OPTIMAL-
-      only noise objective. The model jointly freezes length/word/witness/session/true crossing/
-      task timestamps/noise slots before content;
-    - **time and survival** (§7.5/§7.18): closed ceil/floor `frame_gap_s`, half-open `time_s`,
-      replay guard through `stream.gap_s`, session separation by `gap_s + 1us`; content failure is
-      deletion-only projection with unchanged survivor timestamps. Noise is interior/maximized;
-      duplicate source order is pre-drawn, payload/time fields are copied after source back-fill,
-      and a windowed source shifts by the minimum valid whole week;
-    - **LLM and hooks** (§7.5/§10.17/§10.18): planner-fixed word + `brief_schema`, repeated stable
-      constraint text in brief and realization, per-frame generation instruction in the content
-      contract, no realization halving under correlation, deep-copied
-      `SequenceValidationInput`, and the exact content-validation order frozen in §7.5;
-    - **observability** (§7.9/§9.3): conditional `rules`, hook scrap keys and `windows` appear
-      after optional `tiers` and before `frames`, with explicit zero values and the exact scrap-sum
-      identity. There are no new trace channels/events, ErrorKind values, statuses, artifact/truth
-      keys, main-output metadata fields or call-estimate categories;
-    - **default anchor**: when the actual prefix has no effective rules/windows and no sequence
-      hook, v1.15 prompt bytes, Schema path, RNG order, estimate, report, artifact, ids and eight
-      dry-run goldens are unchanged. No compatibility layer, migration, legacy alias or runtime
-      fallback is part of this revision.
-38. **场景规划与精确交付冻结点** — v1.17 (feature spec
-    `docs/dev/SPEC-scenario-planning.md`; 2026-08-21). The v1.16 time-stream config face is
-    destructively replaced: ten deleted keys become directed CONFIG_ERRORs (§6.3 rule 62) and the
-    new key family — `[[generate.stream.quotas]]` (dual form), `[generate.stream.schedule]`,
-    `crossed_sessions`, `max_attempts_per_slot`, `[[generate.stream.sequence_rules]]`, renamed
-    `frame_rules`/`frame_windows` with required natural names and `contains`, frame
-    `duration_s`/`resources`, the `end_ts`/`duration_s` time-field words, `[[generate.stream.noise]]`
-    and the four unified `<python-file>:<attribute-path>` hook keys — is frozen in §6.3 rules
-    63–71. The v1.16 planner stack (`sequence_planner.py`/`declare.py`/`temporal.py` +
-    `orchestration/profile_usage.py`) is deleted with NO shim and replaced by
-    `labelkit/common/runtime/scenario/` with the single frozen entry
-    `compile_scenario(ScenarioConfig) -> ScenarioPlan` (§7.19); `ResolvedConfig` gains the
-    `paths` / `validation_hooks` / `scenario_plan` parse products; profiles are secret-free and
-    `RuntimeCredentials` materializes only on run/probe. `report.generate.stream` is RE-FROZEN:
-    `plan_failures`/`realize_failures`/`validator_scrapped` deleted, `plan_digest`/`planner`/
-    `delivery`/`quotas` appended with the 13-bucket failure closed set (§9.3/§9.4); dry-run gains
-    the top-level `estimate` object and `report.run.paths` is always present. Exit lanes extend:
-    PlannerInfeasible → 2, Capacity/Budget/Internal → 4, delivery exhaustion and delivery-time
-    SIGINT → 1. No compatibility layer, migration or legacy alias exists.
-
 — End of contract. —

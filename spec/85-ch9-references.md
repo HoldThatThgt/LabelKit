@@ -228,7 +228,7 @@
 
 - [114] Disjunctive Temporal Problems under Structural Restrictions. AAAI. https://ojs.aaai.org/index.php/AAAI/article/view/16489（日历析取导致的组合约束；v1.16 交由同一个 CP-SAT 模型联合求解）
 
-- [115] Google OR-Tools. CP-SAT Solver. https://developers.google.com/optimization/cp/cp_solver（v1.16 结构、时间、日历、会话、交叉与噪音槽联合规划的成熟求解器）
+- [115] Google OR-Tools. CP-SAT Solver. https://developers.google.com/optimization/cp/cp_solver（v1.18 ScenarioPlanner 对 role/gap、时间、session、crossing、noise、replay 与 exact count 的有限整数约束，以及固定单 worker、确定性预算求解的基础）
 
 - [116] Google OR-Tools. Python `AddAutomaton` API. https://or-tools.github.io/docs/pdoc/ortools/sat/python/cp_model（同一组位置变量上的有限自动机约束接口；不构造显式乘积 DFA）
 
@@ -250,6 +250,16 @@
 
 - [125] Hypothesis. Settings / API reference（satisfying target、discard 与 bounded generation 的分离观测）. https://hypothesis.readthedocs.io/en/latest/reference/api.html（2026-08-21 访问）（v1.17 quota 的 target / delivered / attempts 三字段分立记账——目标数、实交数与尝试数禁止混称——的观测形态背书）
 
-- [126] Synthea: Synthetic Patient Generation Simulator（module/schema 驱动的结构化合成记录）. https://github.com/synthetichealth/synthea（2026-08-21 访问）（v1.17 structured noise 复用帧类 generate instruction 与 JSON Schema、truth 保留其 frame class 的合成工程先例）
+- [126] Synthea: Synthetic Patient Generation Simulator（module/schema 驱动的结构化合成记录）. https://github.com/synthetichealth/synthea（2026-08-21 访问）（v1.18 先运行持续世界状态、再投影可见记录的合成工程先例）
 
 - [127] Simod: automated discovery of business process simulation models（配置驱动过程模拟与 configuration-relative path）. https://github.com/AutomatedProcessImprovement/Simod（2026-08-21 访问）（v1.17 场景配置驱动时间规划的同类工具形态；论文本体见 [101]）
+
+- [128] RFC 6902: JavaScript Object Notation Patch. https://datatracker.ietf.org/doc/html/rfc6902（2026-08-21 访问）（v1.18 EventPlan 以标准 `test` / `add` / `remove` / `replace` 顺序操作表达状态转移，不自造 patch 语言）
+
+- [129] python-json-patch. https://github.com/stefankoegl/python-json-patch（2026-08-21 访问）（v1.18 生产代码执行 RFC 6902 patch 的维护中实现，`in_place = false`）
+
+- [130] WebArena. https://webarena.dev/（2026-08-21 访问）（v1.18 在可执行环境状态上验证中间条件与任务结果，而非只检查文本形状的先例）
+
+- [131] τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains. https://arxiv.org/abs/2406.12045（2026-08-21 访问）（v1.18 以最终数据库状态与目标状态比较任务是否完成的 state-aware evaluator 先例）
+
+- [132] Park, J. S. et al. Generative Agents: Interactive Simulacra of Human Behavior. https://arxiv.org/abs/2304.03442（2026-08-21 访问）（v1.18 让 actor 的观察、计划与历史共同约束行为内容，避免局部 prompt 提前泄露世界事实）

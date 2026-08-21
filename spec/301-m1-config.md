@@ -2,160 +2,86 @@
 
 ### 3.1.1 职责与边界
 
-**做：**装载并语法/语义校验 config.toml 与 project.toml；合并 CLI 覆盖项；解析 rubric（内联或默认包）；装载并预校验用户 JSON Schema；读取 API Key 环境变量；产出全局唯一的不可变 `ResolvedConfig`。 
-**不做：**不接触输入数据；不发起网络请求（`--probe` 连通性探测委托 M9）；运行期不提供任何可变配置。
+**做：**装载并语法、语义校验 config.toml 与 project.toml；合并 CLI 覆盖项；解析 rubric、用户 JSON Schema 与
+project-root hook；冻结路径、按类视图与控制台/视觉推导结果。flat 形态沿用既有配置解析；sequence 形态额外解析
+并冻结 `SequenceGenerationConfig`。M1 完成后，由编排层调用 operators 层唯一 program compiler 与 planner。
+
+**不做：**不读取业务输入；不在配置阶段调用 LLM；不在静态装载期间读取 API key value；不为已删除的序列生成字段
+提供别名、转换或默认回退；运行期不提供可变配置。
 
 ### 3.1.2 输入 / 输出
 
 | 方向 | 内容 |
 |---|---|
-| 输入 | config.toml 路径、project.toml 路径、CLI 参数字典（input/output/limit/strict/log_level/dry_run）、进程环境（仅读取 profile 声明的 `api_key_env` / `api_key_envs`（v1.6）所列变量）。 |
-| 输出 | `ResolvedConfig`（frozen dataclass 树：第 5 章两文件全部键的类型化镜像，另含 CLI 专属项 limit/strict/dry_run 与 log_level 覆盖，以及 load() 收尾冻结的解析产物：`ConsoleConfig.mode_resolved`（v1.10，3.1.4 console 行）、`SegmentConfig.vision_resolved`（v1.11，3.1.4 上下文预算与视觉推导行）、`FrameClassifyConfig.vision_resolved`（v1.12，3.1.4 帧粒度配置行）；v1.12 增四字段——`frame_classify: FrameClassifyConfig`、`frame_annotate: FrameAnnotateConfig`、`frame_class_views: Mapping[str, FrameClassView]`（键 = 帧类名，仅 `frame.classify.enabled` 时物化，零覆盖类也各得一份视图——`class_views` 同款、运行期零回退）、`frame_schema: Mapping \| None`（帧级输出 Schema 解析产物，`user_schema` 同胞：元校验 + few-shot 干跑；`frame.annotate` 关闭时恒 None）——四字段带默认值（有意偏离 stream/stitch 的「必填无默认」惯例：全关默认 = 字节等价 v1.11，既有构造点零波及；loader 恒显式传入）；v1.13 增第五个带默认字段 `generate_stream: GenerateStreamConfig`（时间流生成形态，默认关 = 字节等价 v1.12，沿用同一惯例），另有三处既有结构的扩字段——`GenerateConfig` 增 `sequences`/`len_range`（按类配额与序列长度区间的载体）、`ClassView` 增 `schema`（按序列类标注 Schema 解析产物，None = 回落全局）、`FrameClassView` 增 `gen_instruction`/`gen_schema`（帧类内容契约，后者 None = 纯文本帧）），或抛出 `ConfigError`（附带全部而非首个校验错误，一次性反馈）。 |
+| 输入 | config.toml 路径、project.toml 路径、CLI 覆盖项，以及不含 secret value 的进程与终端能力信息。 |
+| 输出 | `ResolvedConfig` 冻结树；其中 `generate` 只保存通用字段和 flat 配置，`sequence_generation` 仅在 `generate.form = "sequence"` 时保存 `SequenceGenerationConfig`，否则为 null。sequence 形态同时冻结全部输出路径，但不在 common 配置树复制 `GenerationProgram` 或 `ScenarioPlan`；配置错误以完整 `ConfigError` 列表返回。 |
+| 运行期凭据 | `RuntimeCredentials` 在 run 或 `validate --probe` 分流后独立物化，不属于 `ResolvedConfig`，validate 与 dry-run 不读取 key value。 |
+
+`ResolvedConfig` 继续保存 process 与 flat 形态需要的 `class_views`、`frame_class_views`、用户/帧 Schema、
+`ConsoleConfig.mode_resolved`、`SegmentConfig.vision_resolved` 和
+`FrameClassifyConfig.vision_resolved`。sequence 形态的 class view 由 M1 完整冻结，compiler 不再合并配置。
 
 ### 3.1.3 API
 
-```
+~~~python
 def load(config_path: Path, project_path: Path, cli_overrides: CliOverrides) -> ResolvedConfig:
-    """三源合并 + 全量校验。失败抛 ConfigError(errors: list[str])，CLI 以退出码 2 结束。"""
+    """装载三源配置、聚合校验并冻结全部解析产物。"""
+
 
 def default_rubric(name: Literal["default:text", "default:ui", "default:trajectory"]) -> Rubric:
-    """从包内数据文件（labelkit/data/rubrics/*.toml）装载系统默认 rubric。
-       "default:trajectory" 为 v1.8 轨迹 rubric（default_trajectory.toml，附录 A.3）。"""
-```
+    """装载包内默认 rubric。"""
 
-**模块内文件组织（2026-08-14 代码规则整改）：**公开面仍是 `labelkit/common/config/` 包导出的
-`load` / `default_rubric` / `ResolvedConfig` 三个名字，实现按职责拆为「公开入口 + 六个包内私有模块」：
 
-```
+def parse_generation_config(
+    raw_project: Mapping[str, object],
+    context: GenerationParseContext,
+) -> SequenceGenerationConfig:
+    """解析并校验 sequence 生成配置。"""
+~~~
+
+**模块内文件组织：**公开面仍由 `labelkit/common/config/` 导出；新增的 sequence 配置解析单独落
+`generation.py`，不把互斥形态塞进一个可空字段长表。
+
+~~~text
 labelkit/common/config/
-├── __init__.py      公开再导出：load / default_rubric / ResolvedConfig
-├── model.py         全部配置 dataclass（分工不变）
-├── loader.py        公开入口：三源合并驱动 → console 模式裁定 → ResolvedConfig 装配
-│   ├── _collect     错误/警告聚合器与类型化表读取（全程共用）
-│   ├── _sections    逐节 TOML 解析 → 各配置 dataclass
-│   └── _constraints 跨节组合约束与解析产物冻结，内部再调用：
-│       ├── _schemas     用户 / 帧 / 按类 Schema 元校验 + few-shot 干跑
-│       ├── _rubrics     内联 rubric 解析与 default:* 包数据装载
-│       └── _classviews  [class.*] / [frame.class.*] 白名单合并为按类视图
-└──（六个下划线开头的模块均为包内私有，外部只经 loader 的公开入口进入）
-```
-
-拆分只搬代码不改语义：校验顺序、错误文案、聚合反馈行为与 `ResolvedConfig` 结构均与拆分前一致
-（model.py 承载全部配置 dataclass 的分工不变）。
+├── __init__.py
+├── model.py
+├── loader.py
+├── generation.py
+├── _collect.py
+├── _sections.py
+├── _constraints.py
+├── _schemas.py
+├── _rubrics.py
+└── _classviews.py
+~~~
 
 ### 3.1.4 校验规则（启动时全量执行）
 
 | 类别 | 规则 |
 |---|---|
-| TOML 结构 | 两文件均须含 `schema_version = 1`；未知键报 warning（前向兼容）、缺失必填键报 error；类型逐字段核对（第 5 章字段表即校验依据）。v1.7 例外：`[classify]` 与 `[class.*]` 为显式接管的节——`[class.*]` 内白名单（5.2 按类覆盖白名单表）之外的键报 `CONFIG_ERROR` 而非 warning（见下方「按类覆盖合并」行）。 |
-| Profile 引用 | `quality.llm / annotate.llm / generate.llms（数组，逐元素校验）/ verify.llm / output.repair_llm`，以及 `quality.judges / verify.judges`（数组，非空时须为奇数个）引用的 profile 必须存在于 config.toml `[llm.*]`；启用视觉输入的阶段（UI 模态的 quality/annotate/verify）要求其 profile `supports_vision = true`。v1.2：`dedup.semantic = true` 时 `dedup.semantic_embedding` 必须存在于 config.toml `[embedding.*]` 且其密钥配置通过本表「API Key」行校验（v1.6：`api_key_env` / `api_key_envs` 恰其一；5.1）。 |
-| 交叉字段约束（v1.2） | `quality.selection = "top_ratio"` 时 `quality.top_ratio` 必填且 ∈ (0,1]，且不得再设 `quality.threshold`（互斥，报 CONFIG_ERROR）；`annotate.self_consistency` 为 0 或 ≥3 的奇数；`generate.mixture = "weighted"` 时 `generate.weights` 必填、逐项为正且长度 = `generate.llms`；`[[generate.styles]]` 各项 name 表内唯一、prompt 非空（5.2 各行标注的 M1 校验在此汇总执行）。 |
-| 运行模式（v1.4；v1.13 三态） | `run.mode="generate_only"` 时：`run.input` 必须缺省、`run.modality` 必须 "text"、`generate.enabled` 必须 true。**形态判定三态**（v1.13）：`generate_stream.enabled = true` ⇒ **时间流形态**——种子池/独立计数两族键均不适用（`seed_examples` / `standalone_count` 的「恰好提供其一」规则**在本形态下不执行**，配额改由 `[class.<name>.generate].sequences × len_range` 承载；显式书写该两键连同 `num_per_record` / `seeds_per_call` 由本表「时间流生成」行定向报错）；否则维持 v1.4 二态——`generate.seed_examples`（非空字符串数组，逐项非空）与 `generate.standalone_count`（≥ 1）**恰好提供其一**（互斥，分别对应种子池 / 无种子形态）。process 模式下这两键均不得设置。另：`generate.instruction` 的「enabled 时必填」在时间流形态下退化为可选默认——任务描述放在按类生成指令上，「参与类 instruction 非空」由「时间流生成」行按类裁定。 |
-| 分类（v1.7） | `classify.enabled = true` 时：`[[classify.classes]]` ≥ 2 项，每项 `name` 匹配 `[a-z0-9_]+` 且表内唯一、`description` 非空、`examples`（可选）为字符串数组；`classify.fallback_class` 必填且 ∈ classes；`classify.assignment` ∈ {"single","multi"}；`classify.max_labels` 仅 multi 可设且 ∈ [2, 类别数]（缺省解析后回填为类别数）；`classify.self_consistency` 为 0 或 ≥3 的奇数；`classify.on_error` ∈ {"fallback","fail"}；`classify.llm` 引用的 profile 必须存在（UI 模态须 `supports_vision = true`），并计入密钥解析、vision 校验与 `--probe` 三处 profile 引用集（本表「Profile 引用」「API Key」行同法覆盖）。`classify.enabled = false` 而 `[[classify.classes]]` / `[class.*]` 在场 ⇒ warning（一次、点名被忽略的表——「留配置、关开关」合法，对齐 top_ratio 未生效等 no-op 键分级惯例），不报 error。 |
-| 按类覆盖合并（v1.7） | `[class.<name>.<section>]` 的 `<name>` 必须 ∈ classes；覆盖键 ∈ 白名单（5.2 按类覆盖白名单表），白名单外键报 `CONFIG_ERROR`（本表「TOML 结构」行「未知键报 warning」的显式例外）。合并语义（启动时静态合并、冻结为 `class_views`，运行期零查找）：① 逐键 provenance 合并——类显式提供的键覆盖全局、未提供的键继承全局；② **选择组**——类显式提供 selection / threshold / top_ratio 任一 ⇒ 合并视图剔除全局侧的互斥对键，threshold 与 top_ratio 互斥校验跑在**合并后视图**上（防止「全局 threshold + 类 top_ratio」逐键 replace 后两键并存的误报）；③ **rubric**——合并 selector 后重解析为该类有效 rubric，pointwise 6 级校验跑在（类有效 mode × 类有效 rubric）组合上；`[class.X.rubric]` 在场但该类 selector 非 "inline" ⇒ 忽略并 warning（同全局惯例）；④ 类 examples 干跑**该类有效 Schema** 与全局 `output.validator`（v1.13 修正：此前恒过全局用户 Schema——类自带标注 Schema 时会误判；类自带 Schema 时继承来的全局示例也按类 Schema 复跑一遍，因为运行期就是按类 Schema 发出去的。错误定位写作 `[[class.<name>.annotate.examples]][N]`，Schema 定位前缀相应取 `[class.<name>.annotate].schema_*`；类自带 Schema 的 `$ref` 死链只使该类停跑，不牵连全局层）。⑤ **按类标注 Schema（v1.13）**——`[class.<name>.annotate]` 白名单增 `schema_path` / `schema_inline`（**至多其一**：两者皆缺 = 未声明覆盖，回落全局 `output.schema`；同时声明报 CONFIG_ERROR），声明了即走 `output.schema` 全套装载分支（读取 / JSON 解析 / draft 2020-12 元校验 / 顶层 type = object）+ `_meta` 保留键禁令 + `$ref` 可解析性遍历；解析产物挂 `ClassView.schema`（None = 无覆盖）。⑥ **按类档位表（v1.15）**——`[class.<name>.generate]` 白名单增 `tiers`（数组表，行结构同全局 `[[generate.stream.tiers]]` 三键），语义为**表级原子覆盖**（声明了就用类的整张表、不逐行合并，未声明 = 回落全局表，显式空表报 CONFIG_ERROR）；解析复用全局表同一实现（rank 升序存放，正整数与 `weight ≥ 1` 解析期强制），报错定位串取 `[class.<name>.generate].tiers`；解析产物挂 `ClassView.tiers`（None = 未声明），零覆盖类经继承同得 `None`。前提三子款与逐生效表化校验见本表「按类档位表」行。 |
-| 时序流（v1.8） | **组合约束**：`segment.enabled = true`（stream 模式总开关）要求 `run.mode = "process"` ∧ `generate.enabled = false`（generate_only 经本表「运行模式」行传递闭合——该行要求 generate.enabled = true，故 stream × generate_only 不可能同时过验）∧ `annotate.enabled = true`（序列记录无 passthrough 输出形态，2.3.1）；`extract.enabled = true` 要求 `segment.enabled = true` ∧ `run.modality = "ui"`（文本序列 v1 不适用）。**`[stream]` 字段**：`stream.order_by` ∈ {"input_order", "meta:<field>"} 且 "meta:*" 仅文本模态；显式设置 `stream.session_max_span_s` 要求 `order_by = "meta:*"`（违反报 CONFIG_ERROR）；显式设置 `stream.gap_s` 而非 meta 序 ⇒ warning 一次（非阻断，键不生效）；`stream.key` 逐元素 ∈ {"meta:<field>"（仅文本模态）, "source_dir"（两模态可用）}。**数值界**：`segment.window ≥ 2`；`2 ≤ annotate.sequence_frames ≤ 100`（越界报 CONFIG_ERROR）。**引用集四处（S30）**：v1.8 起 profile 引用集口径为四处——密钥解析（本表「API Key」行）/ vision 校验 / `--probe` / 存在性（v1.7 分类行「三处」口径的显式扩展）：`segment.llm` **仅** `segment.enabled` ∧ `segment.strategy ∈ {llm, hybrid}` 时计入密钥解析 / `--probe` / 存在性三处（rules 策略零 LLM 调用，不得强制配键），**恒不入 vision 校验集**（v1.11 修订（V3）：v1.8–v1.10 为「仅 `segment.use_vision = true` 时入」，该键已移除——segment 从「要求视觉」改为「适配视觉」，校验命题失去可失败性；附图由解析产物 `vision_resolved` 推导，见本表上下文预算行；报错文案的 stages 集合中 "segment" 自 v1.11 不再可能出现）；`extract.llm` 启用时**恒**计入四处且恒入 vision 集（每转移一请求 2 图，无纯文本档）。**vision 逐阶段表（S30）**：UI 模态 ∧ `segment.enabled = true` 时取代本表「Profile 引用」行的整体 vision 规则——classify ✓（首帧截图，3.13.3）、annotate ✓（多图序列模板，3.5.2）、verify ✓（首末帧截图，3.7.2）、extract ✓（恒）、segment ✗ 恒不要求（v1.11 修订（V1/V3）：原「仅 `use_vision = true` 时 ✓」——附图改由 `vision_resolved` 能力推导自动适配，非校验要求）、**quality ✗**（序列打分纯文本——放宽项，3.4.3 序列行；v1.9 起 **stitch 亦 ✗** 恒不要求（摘要卡纯文本，3.16.3）——「唯一放宽」措辞自 v1.9 失效，见本表线索缝合行）。**按类白名单**：`[class.<name>.extract]` 可覆盖键仅 `instruction`（扩展本表「按类覆盖合并」行引用的 5.2 白名单表，白名单外键同报 CONFIG_ERROR）；`[class.<name>.segment]` **不存在**——链序 segment 在 classify 之前（3.10.3），成段时类标签尚不存在（链序因果，5.2 注），该表按白名单外键处理。**rubric**：selector 枚举扩为 `"default:text"` \| `"default:ui"` \| `"default:trajectory"`（v1.8，包数据 `default_trajectory.toml`，附录 A.3）\| `"inline"`；空串解析 v1.8 修订（S29）：`segment.enabled = true` ⇒ `""` 解析为 `"default:trajectory"`（两模态一致；用户显式选择器恒优先；按类视图经 base selector 自动继承）——**v1.13 条件扩为 `segment.enabled ∨ generate_stream.enabled`**（本表「时间流生成」行）；本表「Rubric」行的全部校验（含 pointwise 6 级）对 trajectory rubric 照常适用。**`[stream]` 在时间流生成形态的语义翻转**（v1.13）：该节由「摄取侧声明」兼作**生成侧铺设契约**——`order_by` 必须 `"meta:<字段>"`（声明工件行的时间戳字段名）、`gap_s` 定会话间隔下界、`session_max_len` 定织造上限，而 `key` 与 `gap_steps` 必须取空/0（本表「时间流生成」行 ⑤）。 |
-| 线索缝合（v1.9） | **组合约束**：`stitch.enabled = true` 要求 `segment.enabled = true`（缝合的输入是 episode；stream 前置约束——process 模式 ∧ generate off ∧ annotate on——经此传递闭合，2.3.1）。**数值界**：`stitch.votes` 为 1 或 ≥3 的奇数（**偶数报 CONFIG_ERROR**——(verdict, thread_ref) 严格多数决需破平局，3.16.4）；`stitch.max_open ≥ 1`、`stitch.digest_max_chars ≥ 1`、`stitch.stale_gap_steps ≥ 0`（越界报 CONFIG_ERROR）；`stitch.bias` ∈ {"conservative","llm"}、`stitch.on_error` ∈ {"keep","fail"}。**引用集**：`stitch.llm` 仅 `stitch.enabled = true` 时计入密钥解析 / `--probe` / 存在性引用集，**不入 vision 校验集**（缝合判定证据为纯文本摘要卡、无视觉档，3.16.3——vision 逐阶段表（S30）增一行：stitch ✗ 恒不要求）。**按类白名单**：`[class.<name>.stitch]` **不存在**——链序 stitch 在 classify 之前（3.10.3），缝合时类标签尚不存在（链序因果，`[class.<name>.segment]` 同则，5.2 注），该表按白名单外键处理。 |
-| 时序流警告（v1.8，非阻断） | 同 R8 no-op 分级家族（对齐分类行「留配置、关开关」惯例），均 warning 一次、不报 error：① `[stream]` / `[segment]` / `[extract]` / `[stitch]`（v1.9 增）任一节在场而 `segment.enabled = false` ⇒ 点名被忽略的表；② `segment.strategy = "rules"` ∧ 显式 `noise_filter = true` ⇒ no-op（rules 下 noise_filter / min_len 不生效，3.14）；③ `annotate.sequence_frames` 显式设置而 `segment.enabled = false` ⇒ no-op；④ 有效 rubric 为 trajectory（含空串解析所得）而 `extract.enabled = false` ⇒ 组合提示（rubric 模态中立、不预设步骤在场——「步骤」退化读作「帧间变化」，S29，3.4.3 序列行）；⑤ `stream.session_max_len > run.batch_size` ⇒ 静态 WARN（S21：此类会话将被 M10 硬切 + `session_split` 标，3.10.3）；⑥ `annotate.sequence_frames > 20` ∧ 所引 annotate profile `max_image_px > 2000` ⇒ WARN（S28：Anthropic 对 >20 图请求中任一图 >2000px 返回 400 硬拒（非缩放），默认 max_image_px = 2048 恰在拒绝域——指引改 ≤ 2000 或降 sequence_frames；20 图阈值按请求内全部 image block 计；openai_compatible 无此联动、不设独立上限）。（v1.9 增两条，同分级：⑦ `segment.enabled = true` ∧ `stitch.enabled = false` 而 `[stitch]` 节有 payload ⇒ **单独** no-op warning（`annotate.sequence_frames` 显式设置的同形制，不落 ① 的点名名单分支——① 归属 segment 关闭分支）；⑧ `stitch.enabled = true` ∧ `segment.strategy = "rules"` ⇒ 组合提示（规则粗切段未经语义精化，缝合证据质量下降，3.16）。）（v1.11 增一条，同分级：⑨ `vision_resolved` ∧ `segment.window > 20` ∧ 所引 segment profile `max_image_px > 2000` ⇒ WARN（V5：⑥ 的 S28 姊妹——同一 Anthropic「>20 图 ∧ 单图 >2000px」400 硬拒域，⑥ 只盖 annotate.sequence_frames、本条盖 segment 窗口多图；默认 window = 20 恰在边界内侧，不触发）。） |
-| console（v1.10） | `console.mode` ∈ {"auto","rich","plain"}；`console.refresh_hz` ∈ [1,10]（越界 = CONFIG_ERROR）；`console.heartbeat_s ≥ 0`（< 0 = CONFIG_ERROR）；`estimate` / `interactive` 为 bool（第 5 章字段表即校验依据）。**解析产物**：load() 收尾把 auto 判定链（7.7——stderr TTY ∧ log_format ∧ TERM ∧ `importlib.util.find_spec("rich")` 探测，不真 import）冻结为 `ConsoleConfig.mode_resolved` ∈ {"rich","plain"}。**警告（非阻断，独立于 R8 家族）**：`tool.log_format = "jsonl"` ∧ 显式 rich（CLI `--console rich` 或 config `console.mode = "rich"`）⇒ WARN 一次 + 强制 plain（7.7 铁律；5.1）。 |
-| 上下文预算与视觉推导（v1.11） | **`context_window` 校验（V6；llm 与 embedding profile，5.1）**：`0` 合法（未声明 = 该 profile 预算关闭，行为与 v1.10 一致）；负值报 CONFIG_ERROR；> 0 时须 `context_window > max_output_tokens + margin`（`margin = max(256, ceil(0.10 × context_window))`，3.9.5；embedding 无输出预留，预算 = `context_window − margin` 须为正），否则报 CONFIG_ERROR（预算非正）。**引用 WARN（V6）**：被启用阶段引用的 profile 未声明 `context_window` ⇒ 一次性 WARN（含建议值指引；非阻断——该 profile 预算关闭）。**`default_image_px` 校验（V18，5.1）**：`0` 合法（沿用 `max_image_px`）；> 0 时须 ≤ `max_image_px`，否则报 CONFIG_ERROR。**移除键定向报错（V2）**：`[segment]` 内显式出现 `use_vision` ⇒ CONFIG_ERROR（文案 = 5.2 移除行的迁移指引：键已移除、附图改由 `segment.llm` 所指 profile 的 `supports_vision` 自动决定、需纯文本请指向纯文本 profile），**不走**本表「TOML 结构」行「未知键报 warning」的前向兼容路径——实现机制 = loader 既有**原始节探针**先例（V27②，`segment_provided` 同款）：解析删除后于原始 `[segment]` dict 上探键存在性。**解析产物（V1）**：load() 收尾以 `dataclasses.replace` 冻结 `SegmentConfig.vision_resolved = (modality=="ui") ∧ segment.enabled ∧ strategy∈{llm,hybrid} ∧ llm_profiles[segment.llm].supports_vision`（解析产物家族第二员，`ConsoleConfig.mode_resolved` 先例——本表 console 行）。**segment 装填静态护栏（V9）**：`w_min = ⌊(input_budget − est_static_system) / per_frame_max⌋`（最坏保证装填量：per_frame_max = est_text(digest_max_chars 最坏串) + DIFF_MAX_TOKENS + 每图成本先验（仅 vision_resolved 时计），3.9.5；未声明预算时 w_min = window、本护栏不触发）；`w_min < floor` ⇒ CONFIG_ERROR，`floor = 3 if (verify.enabled ∧ verify.policy == "repair" ∧ segment.enabled) else 2`（在**先验计价**下保证任意帧装得进 floor 帧窗与 verify 三帧回收复裁窗——护栏基于每图成本先验（3.9.5 校准值可合法超过先验 ×1.2，无钳制），校准超先验或退化个案时装填器强制 2 帧封窗、由 M9 终检降到**记录级** `context_overflow`（3.14.4），永不 run 级（v1.11 审计修订）；policy="drop" 不构造复裁窗、不做三帧要求）；`w_min == floor` ⇒ WARN（窗数放大退化警示：每帧皆接缝、逐帧双裁决）；w_min 随启动 INFO 打印（V13①，M10 启动段）。**静态系统侧预检（V13③）**：每个启用阶段的静态 prompt 部件（模板头 + instruction + rubric/类表/schema/few-shot——模板头经 V22 冻结常数 `TEMPLATE_HEAD_TOKENS` 取得，其余从 ResolvedConfig 直取，3.9.5）est ≥ input_budget ⇒ CONFIG_ERROR（任何记录都装不下、必错无疑），> 50% ⇒ WARN（系统侧过半、单记录可用空间减半的质量退化预警）。预算类校验仅对声明了 `context_window` 的被引用 profile 执行。 |
-| 帧粒度配置（v1.12） | **组合约束七条（规范源头 2.3.1，全部 CONFIG_ERROR，⑦ 为 warning）**：① 帧粒度要求流模式——`frame.classify.enabled ∨ frame.annotate.enabled` ⇒ `segment.enabled = true`（报错文案指引 `outside stream mode use classify + [class.<name>.annotate] per-class annotation`）；② 帧类覆盖要求帧分类——`[frame.class.*]` 在场 ⇒ `frame.classify.enabled = true`，节名 ⊆ 帧类表、覆盖白名单仅 `annotate` 节三键（instruction / examples / enabled，5.2 白名单表），白名单外键/节报 CONFIG_ERROR（「TOML 结构」行前向兼容的显式例外，`[class.*]` 同族）；③ 帧 Schema 恰一——`frame.annotate.enabled = true` ⇒ `schema_path` / `schema_inline` 恰一 + draft 2020-12 元校验 + `[[frame.annotate.examples]]` 干跑（镜像 `output.schema` 全套分支；帧级**无 L2.5 hook**，干跑仅对帧 Schema）；④ meta_mode 护栏——`frame.*` 任一启用 ⇒ `output.meta_mode != "none"`（帧产物仅经 `_meta.stream.members` 承载，sidecar 合法）；⑤ fallback 合法——`frame.classify.enabled = true` 时 `fallback_class` 必填且 ∈ 帧类表 name 集（传递性地要求类表非空——v1.12 无独立 ≥2 类数下限，与 `[classify]` 有意不同）；⑥ 定向探针——`[frame.classify].assignment` / `[frame.annotate].self_consistency` 显式书写 ⇒ 定向 CONFIG_ERROR（帧级无多标签、无自洽采样；机制 = loader 原始节探针，v1.11 `use_vision` 同款（V27②），不走「未知键报 warning」前向兼容路径）；⑦ no-op 提示——`[frame.*]` 节在场 ∧ 均未启用 ∧ `segment.enabled = false` ⇒ 并入 segment 关闭的 no-op warning 停放清单（R8 家族；任一帧开关启用时由 ① 接管）。**帧类表**：`[[frame.classify.classes]]` 与 `[[classify.classes]]` 同构逐项校验（name 匹配 `[a-z0-9_]+` 且表内唯一、description 非空、examples 可选字符串数组——**解析合法但帧级批量判决模板不渲染**（§10.12 只渲染类表），任一帧类携带 examples 时显名 WARN `[frame.classify].classes: class examples are not rendered by the batched frame-verdict template (§10.12), so this key is ignored`）；帧类表与序列类表相互独立、允许重名、互不约束。**必填**：`frame.annotate.enabled = true` ⇒ `instruction` 非空（5.2 † 家族的帧级镜像）。**帧类覆盖合并**：`[frame.class.<name>.annotate]` 逐键 provenance 合并冻结为 `frame_class_views`（键 = 帧类名；零覆盖类也各得一份视图，「按类覆盖合并」行 `class_views` 同款）；类提供的 examples 对帧级 Schema 干跑（错误定位写作 `[[frame.class.<name>.annotate.examples]][N]`）。**vision 集分列**：`frame.annotate.llm` 在 ui 模态 ∧ enabled 时**无条件**入 vision 必需集（镜像序列级 annotate——截图是标注主证据）；`frame.classify.llm` **永不**入 vision 必需集——附图由解析产物 `FrameClassifyConfig.vision_resolved` = (modality=="ui") ∧ `frame.classify.enabled` ∧ `llm_profiles[frame.classify.llm].supports_vision` 自动推导（load() 收尾以 `dataclasses.replace` 冻结，解析产物家族第三员，segment V1 同款；成本控制面 = 指向纯文本 profile，判决仅凭摘要行）；两键 enabled 时均计入密钥解析 / `--probe` / 存在性引用集（`referenced_profiles`，预算报表经 profile 聚合自动覆盖）。**静态预算预检两段（V13③ 表新增）**：`frame.classify` 段 = 冻结模板头 `TEMPLATE_HEAD_TOKENS["frame_classify"]` + 帧类表文本（name/description，**不计 examples**——口径与渲染事实对齐，多算会误触发预检；`[frame.classify]` 无 instruction 键——提示词模板确定性内建）；`frame.annotate` 段 = 冻结模板头 `TEMPLATE_HEAD_TOKENS["frame_annotate"]` + 帧级 Schema 文本 + max(全局与各帧类视图的 instruction + few-shot)；est ≥ input_budget ⇒ CONFIG_ERROR、> 50% ⇒ WARN（「上下文预算与视觉推导」行同一判则，仅对声明预算的被引用 profile 执行）。**v1.13 放宽两处**：约束② 的前提改为 `frame.classify.enabled ∨ generate_stream.enabled`（时间流生成形态经 `[frame.class.<name>.generate]` 声明帧内容契约，帧类命名空间照常物化 `frame_class_views`），白名单相应扩为**两节**——`annotate` 三键（instruction/examples/enabled）+ `generate` 三键（instruction / schema_path / schema_inline，**仅时间流生成形态合法**，非本形态出现是反向定向 CONFIG_ERROR）；约束⑤ 的 `fallback_class` 必填仅在 `frame.classify.enabled = true` 时执行（时间流形态不启用帧级判决，无兜底对象）。 |
-| 时间流生成（v1.13） | **组合约束八条（规范源头 2.3.1，全部 CONFIG_ERROR）**：① 形态前提合取——`generate_stream.enabled = true` ⇒ `run.mode="generate_only"` ∧ `run.modality="text"` ∧ `generate.enabled` ∧ `classify.enabled` ∧ `stream.order_by = "meta:<字段>"` ∧ `output.meta_mode != "none"`，另含**工件键守卫**：`input.text_field` 与 `order_by` 的时间戳字段名均不得含 `"."`（工件行以字段名为**字面顶层键**，点路径在重放摄取时无法往返、整份判坏行，6.5）、两者互不同名、且均不得为 `"truth"`（工件行三个顶层键互斥）；② 类表与配额——序列类表 ≥ 1（放宽自 ≥ 2，仅本形态）∧ `fallback_class` 免填（写了须 ∈ 类表）∧ `Σsequences ≥ 1` ∧ 参与类（有效 `sequences ≥ 1`）的有效 `instruction` 非空 ∧ 帧类表非空 ∧ **每个**帧类的 `[frame.class.<name>.generate].instruction` 非空；③ 禁设键探针——`[generate]` 的 `seed_examples`/`standalone_count`/`num_per_record`/`seeds_per_call` 与 `[class.*.generate]` 的 `num_per_record`/`seeds_per_call` 显式书写、`frame.classify.enabled`/`frame.annotate.enabled` = true ⇒ 定向 CONFIG_ERROR（机制 = v1.11 `use_vision` 原始节探针，不走「未知键报 warning」前向兼容路径；文案给替代面指引）；④ 装箱一致性——`sessions ≥ 1` ∧ `sessions ≤ Σsequences ≤ 2 × sessions` ∧ `duplicates ∈ [0, Σsequences]` ∧ `noise_ratio ∈ [0,1)`（> 0 ⇒ `noise_instruction` 非空）∧ `frame_gap_s` 满足 `1e-6 ≤ lo ≤ hi < stream.gap_s`；仅当 `--limit` 后的实际非零配额前缀存在生效 rules/windows 时，v1.16 联合规划路径才允许 `hi == stream.gap_s`（即 `hi ≤ stream.gap_s`）；只有 sequence_validator 而没有实际非零 rules/windows 前缀时仍执行严格 `<`；⑤ 织造上限与铺设契约——`2 × max(各类 len_range 上界) ≤ stream.session_max_len` ∧ `stream.key == []` ∧ `stream.gap_steps == 0` ∧（`session_max_span_s > 0` 时）`(session_max_len − 1) × frame_gap_s 上界 ≤ session_max_span_s` ∧ `ts_start` 可 `datetime.fromisoformat` 解析；⑥ Schema 元校验——帧类生成 Schema 走 `_load_schema_pair` 全套 + `$ref` 遍历（**无 `_meta` 分支**——帧内容落工件行的文本字段，与 §6.3 信封字段无冲突面），按类标注 Schema 见本表「按类覆盖合并」行 ⑤；⑦ 引用集与豁免——`classify.llm` 在本形态**仅豁免密钥解析集**（序列标签直接继承、classify 零判决调用，援引 S30 先例：零调用不强制配活密钥）；**存在性检查照旧**（拼错 profile 名仍在启动期揪出），`--probe` 引用集亦照旧（`referenced_profiles()` 按 `classify.enabled` 收录——显式探测时该 profile 仍需可连通）；⑧ 停放豁免精确化——`[stream]` 与 `[frame.*]` 在本形态是生效面，移出 R8 no-op 停放清单（`[segment]`/`[stitch]`/`[extract]` 照旧停放告警）。**rubric 空串解析扩展（S29 扩展）**：条件由 `segment.enabled` 扩为 `segment.enabled ∨ generate_stream.enabled` ⇒ `""` 解析为 `"default:trajectory"`（loader 与 M11 镜像两处同步，3.11.2；本形态打的同样是序列分）。注意「trajectory rubric ∧ `extract.enabled = false`」的组合提示 WARN（本表时序流警告行 ④）**在本形态下不出现**——该提示归属 `segment.enabled` 分支，而本形态 segment 恒关；语义上也无提示对象：extract 是 UI 模态专属、本形态恒 text，「步骤」本就读作帧间变化。**静态预算预检两段（V13③ 表新增）**：`generate.stream.plan` 段 = 冻结模板头 `TEMPLATE_HEAD_TOKENS["generate_plan"]` + max(全局与各类视图的生成 instruction) + 帧类表文本；`generate.stream.realize` 段 = 冻结模板头 `TEMPLATE_HEAD_TOKENS["generate_realize"]` + 同一 instruction 项 + `max(len_range 上界) × max(帧类生成 Schema 文本)`（逐位契约把 Schema 文本按步重复）；噪音批量实现复用既有 `generate` 段。判则同「上下文预算与视觉推导」行（est ≥ input_budget ⇒ CONFIG_ERROR、> 50% ⇒ WARN）。**annotate 段口径修订**：该段的 Schema 项改**按类取值**——max 跑在「Schema + instruction + few-shot」的整份和上（无按类 Schema 时逐类回落全局，数值与 v1.12 字节等价）。 |
-| 帧类构成档位与时间字段绑定（v1.14） | **档位簇六条（规范源头 2.3.1 v1.14 段，除注明 WARN 外全部 CONFIG_ERROR）**——v1.15 逐生效表化注记：下列 ②③ 的辖区是「一张生效档位表」、④⑤⑥ 的辖区是「逐参与类的生效表」，生效表 = 该类声明的按类表、未声明则为全局表（详见下方「按类档位表」行；无任何按类表时生效表恒 = 全局表，本簇与 v1.14 逐字同义）：① 档位表前提——`[[generate.stream.tiers]]` 在场 ⇒ `generate_stream.enabled = true`（定向报错：本表仅时间流形态合法）；② 档位身份——`tier_rank` 正整数、表内唯一、全表**连续覆盖 1..N**（N = 表长；缺号/重号报错并点名缺失序数），`weight` 整数 ≥ 1；③ 档位构成——`frame_classes` 非空、档内无重复、每名 ∈ 帧类表 name 集，各档构成**集合两两互异**；④ 长度可覆盖——逐 (参与类, 档) **非零配额对**裁定（配分为纯函数，M1 期即可算出逐档配额）：配额 ≥ 1 的每对须满足该类 `len_range` 下界 ≥ `len(该档 frame_classes)`，**零额对豁免**；⑤ 配分零额 ⇒ **WARN**（值-free：类名 + tier_rank + 权重表；非错误）；⑥ 帧类未入档 ⇒ **WARN**（该帧类不会出现在任何蓝图中、其 `[frame.class.<name>.generate]` 面为死配置），同时把本表「时间流生成」行约束② 的「**每个**帧类的生成 instruction 非空」检查域收窄为 **∪各档 frame_classes**（未入档帧类豁免必填，已写照常合法）。**绑定簇三条**：⑦ 绑定表前提——`[frame.class.<name>.generate.time_fields]` 仅结构化帧（该帧类声明了 `schema_path`/`schema_inline`）合法，纯文本帧带绑定表 ⇒ 定向 CONFIG_ERROR；「载荷恒为 JSON 对象」由既有的帧类生成 Schema 顶层 `type = object` 必检承担（本表「用户 Schema」行同族），对「声明过 Schema 源键但装载失败」的帧类本簇保持沉默、不叠加第二错；⑧ 绑定键与类型——每个绑定键 ∈ 该帧类生成 Schema 顶层 `properties`、绑定值 ∈ 语义词表 `{ts, gap_prev_s, gap_next_s, elapsed_s}`、该属性 Schema 的 `type` 关键字**字面恰等**于要求值（`ts` ⇒ `"string"`、其余三值 ⇒ `"number"`；联合类型数组、缺失、经 `$ref`/组合关键字间接声明均判不匹配），绑定字段携带 `type` 以外的约束关键字 ⇒ **WARN**（值-free：帧类名 + 字段名 + 关键字名——那些关键字既不上行也不被强制）；⑨ 剔除余量——生成 Schema 顶层 `properties` 键数 − 绑定键数 ≥ 1（全绑定 ⇒ CONFIG_ERROR）。**解析产物**：`GenerateStreamConfig.tiers`（按 tier_rank 升序存放的 `TierSpec` 元组，空 = 档位面不在场）与 `FrameClassView.time_fields`（None = 无绑定）；`[frame.class.<name>.generate]` 的白名单由三键扩为**四键**（instruction / schema_path / schema_inline / time_fields，本表「帧粒度配置」行 v1.13 放宽段的同步修订——不扩键则子表被白名单循环判为 CONFIG_ERROR）。**微秒地板（v1.13 缺陷修补）**：本表「时间流生成」行约束④ 的 `0 < lo` 收紧为 `lo ≥ 1e-6`（isoformat 精度与 `round(·, 6)` 的分辨率下界；亚微秒 lo 使帧间隔 `timedelta` 取整为 0 微秒，破坏 ts 严格递增并使语义词表的 0.0 边界哨兵失去无歧义性——报错文案给出这两条依据）。**静态预算预检零改动**：「时间流生成」行的 `generate.stream.plan` 段照旧按**全帧类表**计量（档内子集恒 ≤ 全表，上界性质保持），`generate.stream.realize` 段在绑定剔除后只降不升，`TEMPLATE_HEAD_TOKENS` 无新键。 |
-| 按类档位表（v1.15） | **按类表前提三子款（规范源头 2.3.1 v1.15 段，全部 CONFIG_ERROR，定位串带类名）**：① **形态门**——`generate_stream.enabled = false` 时任一 `[class.*.generate]` 节写了 `tiers` ⇒ 定向 CONFIG_ERROR（机制 = v1.11 `use_vision` 的**原始节探针**，与 v1.12 帧级两键同族，不走本表「TOML 结构」行的前向兼容 warning；探针在解析删除后于原始 `[class.<name>.generate]` dict 上探键存在性，故表内容本身非法时也照发本错）；② **全局锚**——形态开启、任一按类表在场而全局 `[[generate.stream.tiers]]` 缺省 ⇒ CONFIG_ERROR（档位面总开关恒 = 全局表非空，文案指引补全局表并说明它兼作未声明类的回落）；③ **空表拒收**——显式 `tiers = []`（解析产物为空元组）⇒ CONFIG_ERROR，指引删除该键以回落全局表。**逐生效表化（修订上一行档位簇）**：档位身份连续性（②）与构成合法性（③）改**逐生效来源表**执行——全局表 + 每张已声明按类表各跑一遍，报错定位前缀分别为 `[[generate.stream.tiers]]` 与 `[class.<name>.generate].tiers`，「构成两两互异」的辖区收窄为**单表之内**（跨类同构成合法）；逐 (参与类, 档) 的长度可覆盖约束（④）与配分零额 WARN（⑤）改吃 `effective_tiers(该类表, 全局表)`，WARN 文案的权重清单同取**该类生效表**；「帧类未入档」WARN 与「每帧类生成指令必填」的检查域**并集化**为 ∪（各参与类生效表构成，⑥）——全部参与类都声明按类表时全局表沦为纯锚，其独有帧类照样判死配置。**零额类不豁免结构校验**：`sequences = 0` 的类声明的表照跑本行与 ②③ 的结构校验（坏配置早报），仅 ④⑤ 豁免，且其构成**不入**检查域并集。**解析产物**：`ClassView.tiers`（按 tier_rank 升序存放的 `TierSpec` 元组；`None` = 未声明 ⇒ 回落全局，空元组 = 显式空表 ⇒ 由 ③ 拒收）与纯函数 `effective_tiers(类表, 全局表)`（`apportion_tiers` 旁的零 rng 纯函数，M1 约束簇 / M6 计划期 / M10 报表装配三方共用，3.6.5）；`[class.<name>.generate]` 白名单由六键扩为**七键**（增 `tiers`，5.2 按类覆盖白名单表——不扩键则该数组表被白名单循环判为 CONFIG_ERROR）。**零改动确认**：微秒地板（rule 59 家族）、时间字段绑定簇、`[frame.class.*.generate]` 白名单、帧类表本身的规则、静态预算预检（蓝图段照旧按全帧类表计量，上界性质在按类子集下同样保持）全部不动。 |
-| API Key | 每个被引用 profile 的 `api_key_env` 环境变量必须存在且非空。v1.6 密钥池：`api_key_env` 与 `api_key_envs`（5.1）恰提供其一（两者皆有或皆无均报错）；`api_key_envs` 须为非空数组、逐项非空且互异；被引用 profile 的**每个**列出变量均须存在且非空（逐个缺失逐条聚合报错）。M1 归一化：标量形式解析为长度 1 的密钥池，运行时只有一条代码路径（3.9.3 密钥池行）。 |
-| 用户 Schema | 必须是合法 JSON 且通过 JSON Schema draft 2020-12 元 Schema 校验（jsonschema 库 `Draft202012Validator.check_schema`）；顶层 type 必须为 object；顶层不得声明保留键 `_meta`。**同族两处**：v1.12 的帧级 Schema（`[frame.annotate].schema_*`，恰一，无 `_meta` 分支）与 v1.13 的**按序列类标注 Schema**（`[class.<name>.annotate].schema_*`，至多其一，`_meta` 禁令与 `$ref` 遍历照旧）走同一套装载分支——三者的解析产物分别是 `user_schema` / `frame_schema` / `ClassView.schema`（本表「按类覆盖合并」行 ⑤、「帧粒度配置」行 ③）。 |
-| Rubric | criteria 非空、key 唯一且为 `[a-z0-9_]+`、weight > 0；pointwise 模式要求每条 criterion 提供 `pointwise_levels`（恰好 6 级，0–5）。 |
-| 阶段组合 | 2.3.1 节的四条组合约束（①–④；④ 与本表「运行模式」行联动）。 |
-| 路径 | process 模式：input 存在且可读，且 output 不得位于 input 目录内部（防止自吞）；generate_only 模式无 input，本行仅执行 output 检查（见「运行模式」行）。两种模式均要求 output 父目录存在且可写。 |
-
-### 3.1.4.1 v1.16 序列规则、日历窗口与联合规划
-
-时间流生成新增的约束面在启动期一次性冻结。全局
-`[[generate.stream.rules]]` / `[[generate.stream.windows]]` 与
-`[[class.<name>.generate.rules]]` / `[[class.<name>.generate.windows]]` 都只在
-`generate_stream.enabled = true` 的 `generate_only` 文本工程中合法；关闭该形态时显式
-写入这些键是定向 `CONFIG_ERROR`，不是静默停放。类表采用三态原子语义：类节缺省为继承
-全局表，显式空表表示清空，非空表整体替换全局表，不逐行合并；因此可以只有类表而没有
-全局约束表。对实际 `--limit` 前缀没有非零配额的类，约束不激活联合规划。
-
-规则模板是有限集：`existence`、`absence`、`exactly`、`init`、`end`，以及
-`responded_existence`、`co_existence`、`response`、`precedence`、`succession`、
-`alternate_response`、`chain_response`、`chain_precedence`、`not_co_existence`、
-`not_succession`。一元模板使用 `frame_class`，二元模板使用不同的 `source` / `target`；
-只有存在性三模板接受正整数 `count`，只有二元模板接受半开 `time_s = [lo, hi)` 与
-`correlation`。同一生效表内的完全重复声明是配置错误。时间值以无损微秒整数求解，
-必须满足 `1us <= lo < hi`；相邻重放边界为 `1us <= delta <= stream.gap_s`，有序链规则的
-显式时间区间必须与该边界相交。
-
-`correlation` 只接受 `{operator = "equal", source_field = "...", target_field = "..."}`。
-两侧必须是结构化帧生成 Schema 的顶层 `properties` 且同时 `required`，不得是
-`time_fields` 绑定字段，Schema 的 `type` 关键字必须字面相等。运行时在时间字段回填前
-比较 JSON 类型和值（对象键序不敏感、数组顺序敏感），正相关未命中与仅时间不满足分别
-计入 `correlation_scrapped` / `temporal_scrapped`；负相关未命中计入前者。
-
-窗口表每个帧类最多一条。`of_day` 必须是非空的同日半开区间，接受
-`HH:MM`、`HH:MM:SS` 或微秒精度，不能跨午夜且不得重叠；`of_week` 只能使用
-`mon` 到 `sun` 且不得重复，缺省表示整周。窗口以 `ts_start` 的固定 UTC offset 解释，
-不引入 IANA 时区或夏令时。
-
-`[generate].sequence_validator` 是可选的 `module:function`，目标函数签名为
-`def validate_sequence(value: SequenceValidationInput) -> list[str]`。M1 只解析引用并确认
-可调用；运行时收到序列类、`tier_rank` 与按序位置/帧类/JSON-compatible 深拷贝载荷。
-钩子异常按违规处理，日志只允许引用、异常类型和违规数，不得泄露返回文本或载荷。
-
-只要实际生效规则或窗口存在，M1 即对每个参与类、每个生效档位和 `len_range` 的每个候选
-长度做局部可行性检查，并对完整的 `--limit` 配额前缀做联合检查。M1、`estimate_run` 与
-M6 共用同一个 OR-Tools CP-SAT 问题入口；单线程、固定搜索种子、最大确定性时间预算为
-10 秒，模型 proto 条目超过 250,000 直接 `CONFIG_ERROR`。`INFEASIBLE` 或预算内无法
-验证的 `UNKNOWN` 是配置错误，`MODEL_INVALID` 是 `InternalError`（退出码 4）；带噪音
-目标时仅 `OPTIMAL` 可接受。没有任何非零规则/窗口且未配置序列钩子时，规划面完全关闭，
-时间流生成保持 v1.15 的默认路径与抽签顺序。
-
-### 3.1.4.2 v1.17 场景规划、project root 与 secret-free 装载
-
-v1.17（场景规划与精确交付，裁决详表见 `docs/dev/SPEC-scenario-planning.md`）重构 M1 的四个面：project root 与全部路径的解析、静态装载与运行期凭据分离、时间流生成的新配置面（quota / 有限 schedule / sequence rule / duration / resource / noise 表），以及唯一一次 `compile_scenario` 调用。新配置面的字段总表与 period 展开语义在第 5 章；时间流生成形态**不再接受 `--limit`**（M1 定向 CONFIG_ERROR，exit 2）——quota 是整体契约，截断后的前缀不再声称满足 quota。不保留 v1.16 time-stream 配置兼容层，不写 migration，不接受旧键别名。
-
-**删除键（十项，全部定向 CONFIG_ERROR）**——错误只告诉用户新的唯一表达，不读取旧值、不转换，不走「TOML 结构」行的前向兼容 warning 路径（机制沿用 v1.11 `use_vision` 的原始节探针先例）：
-
-| 删除键 | 新表达 |
-|---|---|
-| `[generate].sequences` | `[[generate.stream.quotas]]` |
-| `[class.<name>.generate].sequences` | `[[generate.stream.quotas]]` |
-| `[generate.stream].sessions` | `[generate.stream].crossed_sessions`（总 session 数自动推导） |
-| `[generate.stream].ts_start` | `[generate.stream.schedule].start/end` |
-| `[generate.stream].noise_instruction` | `[[generate.stream.noise]]` |
-| `[[generate.stream.rules]]` | `[[generate.stream.frame_rules]]` |
-| `[[generate.stream.windows]]` | `[[generate.stream.frame_windows]]` |
-| `[[class.<name>.generate.rules]]` | `[[class.<name>.generate.frame_rules]]` |
-| `[[class.<name>.generate.windows]]` | `[[class.<name>.generate.frame_windows]]` |
-| hook 的 `module:function` 引用 | `<python-file>:<attribute-path>`（如 `hooks.py:validate_output`） |
-
-**新配置面解析**（逐字段约束在第 5 章，此处只列解析归属）：
-
-- `[[generate.stream.quotas]]`——成功交付 quota，两种互斥形态：exact counts（`counts` 直接给逐类整数）与 integer weights（`total` + `weights` + `allocation ∈ {"exact","largest_remainder"}` 必填）；period ∈ {day, week, schedule}，`of_week` 缺省整周；每张表必有 `[a-z0-9_]+` 自然名称且全局唯一。`exact` 要求 `total` 是最简整数比之和（minimum exact cohort）的整数倍，否则同轮报告 normalized weights、cohort 与上下邻近可精确 total；`largest_remainder` 复用 `apportion_tiers` 的纯整数最大余额算法（零 rng，平票按 quota 表内声明序）。多张 quota 可引用同一 sequence class：约束同一批 occurrence，不相加、不覆盖；未被任何 quota 提及的类 target 为 0，noise-only frame class 不需要 quota。time-stream 形态开启时 quota 表必须至少一张，且全部表编译出的 sequence target 总和 ≥ 1：零表或全零 target 是定向 CONFIG_ERROR（零序列工程只剩 noise 与无源 duplicate，没有可交付内容）。
-- `[generate.stream.schedule]`——有限半开时间区间：`start` / `end` 必填（ISO-8601，显式 `Z` 或 numeric offset，同 offset 且 `end > start`）、`exclude_dates` 本地自然日数组（重复报错；落在 schedule 本地日范围之外是定向 CONFIG_ERROR，fail-fast 不静默忽略）。删除 v1.16 `_horizon` 的每 session 一周递推——schedule 是唯一时间上界，frame window 只枚举 schedule 内未排除的 local date。
-- `[generate.stream]`——`crossed_sessions`（int，默认 0，`0 ≤ value ≤ floor(target_sequences / 2)`；session 总数 = `target_sequences − crossed_sessions`，duplicates 另增流尾 session、不参与该计数）与 `max_attempts_per_slot`（int ≥ 1，默认 3；载体 `GenerateStreamConfig.max_attempts_per_slot`，仅 M6 delivery 消费，不进 `ScenarioConfig`）。
-- `[[generate.stream.noise]]`——noise 表（`frame_class` + 正整数 `weight`）：`noise_ratio > 0` 时必须非空，`noise_ratio == 0` 时书写该表是定向 CONFIG_ERROR；frame class 须存在于 `[[frame.classify.classes]]` 且有非空 generate instruction；noise frame class 不得出现在任何生效 tier、frame rule、frame window，不得声明 duration 或 resources；noise target 按最大余额法分到各 noise class，零 rng。
-- `frame_rules` / `frame_windows`——v1.16 `rules` / `windows` 的更名面（三态整表覆盖语义保留，旧键不别名）；每条 rule / window 新增必填自然名称，与 quota、sequence rule 的 name 同处**一个全局唯一域**（不能靠配置表路径或数组序号消歧）；frame rule 新增 `contains` 模板（严格包含 `source.start < target.start ∧ target.end < source.end`，相等边界不通过，要求 source 帧类声明 duration）。
-- `[[generate.stream.sequence_rules]]`——跨 sequence occurrence 的周期规则：template ∈ {`precedence`, `response`, `succession`, `not_co_existence`}，period 同 quota，positive 模板可选半开 `gap_s`（not_co_existence 禁止）；source / target 必须是已由 quota 拥有且 target > 0 的 sequence class，两者不同。sequence occurrence 归属其 `sequence_start` 的 local date。
-- `[frame.class.<name>.generate]` 增 `duration_s`（闭区间 `[lo,hi]`，`1e-6 ≤ lo ≤ hi`，仅结构化帧类合法；缺省 = point frame）与 `resources`（每项 `[a-z0-9_]+`；非空时 duration 必须在场）；声明 duration 的帧类必须在 `time_fields` 至少绑定 `end_ts` 或 `duration_s`（不允许生成 artifact 无法观察的隐藏区间）；时间字段语义词表增 `end_ts`（`"string"`，interval end）与 `duration_s`（`"number"`），point frame 不得绑定这两值。
-- `[generate].scenario_validator`——新增第四个 hook 键（见下方「hook 引用与冻结载体」）。
-
-**project root 与 `ResolvedPaths`**：`project_root = Path(project_path).resolve().parent` 在读取 project TOML 成功后立即冻结；project TOML 内的全部相对路径一律相对 project root 解析（清单：`run.input`、`run.output`、`output.schema_path`、`class.<name>.annotate.schema_path`、`frame.annotate.schema_path`、`frame.class.<name>.generate.schema_path`、`trace.path` 与四个 hook 文件路径）——不受调用 cwd 影响，本地 hook 与工程一起移动仍可运行。CLI `--input` / `--output` 是 shell 参数：相对路径先按调用 cwd 解析，再参与 CLI > project 优先级。无论来源，`ResolvedConfig` 内只保留绝对规范化路径；配置原文仍用于 digest，不改写文件。新增冻结 parse product `ResolvedPaths{project, project_root, input, output, report, rejects, sidecar, trace, stream_artifact}`（未启用通道为 None）——M2、M11、trace 运行时、console 与 stream artifact helper 只能消费 `ResolvedPaths`，不得重新从字符串推导 cwd-relative 路径。**命名裁决**：live report 固定 `<output-stem>.report.json`，dry-run report 固定 `<output-stem>.dryrun.report.json`，两者都由 M1 写入 `ResolvedPaths.report`——emitter 与 console 不再根据命令模式追加后缀；rejects、sidecar、trace 与 stream artifact 也只在 M1 派生一次。
-
-**secret-free 静态装载**：删除 `LLMProfile.api_key` / `LLMProfile.api_keys` / `EmbeddingProfile.api_key` / `EmbeddingProfile.api_keys`——profile 只保存环境变量名称。新增运行期载体 `RuntimeCredentials`（落 `labelkit/common/runtime/credentials.py`；frozen、`repr=False`，`llm` / `embedding` 两个按 profile name 排序的只读 mapping，value = 去重后保持环境变量声明顺序的非空 key tuple；无任何显示 secret 的 repr、异常或序列化方法），**不属于 `ResolvedConfig`**。命令分流：静态 load 校验 env 名、profile 引用与 capability，但不调用 `os.environ.get`；validate 与 dry-run 到此结束、不发 missing-key WARN；run 与 `validate --probe` 对所有 referenced profile 聚合解析 key value，任一缺失仍是 exit 2；LLMClient 构造函数必须收到 `RuntimeCredentials`（3.9.6）。引用收集器 `referenced_profiles(config)` 下沉 common 层唯一一份（static validation、credential resolution、probe、runtime 与 estimate 共用），删除 orchestration 内的第二份实现（`labelkit/orchestration/profile_usage.py` 整文件删除）。
-
-**hook 引用与冻结载体**：四个 hook 键（`output.validator`、`generate.sample_validator`、`generate.sequence_validator`、`generate.scenario_validator`）统一改用 `<python-file>:<attribute-path>`；相对 python-file 按 project root 解析，绝对路径允许，文件必须是 `.py` 普通文件。M1 用 `importlib.util.spec_from_file_location` + 绝对路径 hash 生成唯一 module name，不修改 `sys.path`、不依赖 cwd、不做自动发现。M1 解析并冻结 callable——载体 `ResolvedHook{reference, target}` 与 `ValidationHooks{output, sample, sequence, scenario}`（`reference` = `<绝对规范化 python-file>:<attribute-path>`，用于稳定错误定位，callable 的 repr 与 equality 均排除）；report、trace、digest 与配置序列化只允许使用 reference，绝不遍历或输出 target；M6 与 schema engine 不再按字符串二次 resolve（3.8.6）。M1 对四个 hook 都检查恰当的位置参数数量，并用不含用户数据的 synthetic input 干跑（scenario probe 用 `accepted = ()` 与一条最小 candidate）；异常类型与非法返回值在 validate 阶段聚合，不等首条真实 content 才暴露。scenario validator 的冻结输入 `ScenarioSequence` / `ScenarioValidationInput` 落 `labelkit/common/contracts/types.py`（与既有 `SequenceValidationFrame` / `SequenceValidationInput` 同层并列，后者形状原样保留——`sequence_validator` 的输入契约零变化）；planner 内部 dataclass 一律落 `labelkit/common/runtime/scenario/model.py`，两层不得混放。
-
-**`ResolvedConfig` 三个新冻结 parse product**：`paths: ResolvedPaths`、`validation_hooks: ValidationHooks`、`scenario_plan: ScenarioPlan | None`——原始 config section 不再保存可调用对象、secret value 或待下游解释的相对路径。
-
-**M1 只调一次 `compile_scenario`**：时间流生成形态下 M1 把全部场景输入收成冻结参数对象 `ScenarioConfig`（seed / schedule / quotas / sequence_classes / frame_classes / sequence_rules / crossed_sessions / frame_gap / session_gap / session_max_len / session_max_span / noise_ratio / noise_classes / duplicates），调用 `compile_scenario(config) -> ScenarioPlan` **恰一次**（执行顺序冻结：parse + static checks → `derive_stream_bounds` → solve quota counts → build slot specs → build timeline model → lexicographic timeline solve → allocate exact noise → ScenarioPlan + digest），产物挂 `ResolvedConfig.scenario_plan`。QuotaCompiler 冻结每个 class 的 target count 并按 `classify.classes` 声明序与类内 ordinal 建 sequence slot——length 在 slot 构建时冻结为 `SequenceSlotSpec.length_target`（`len_range` 只是抽取域与诊断输入）；ScenarioPlanner 用这些有限 slot 重新执行全部 quota bucket equality，在 frame window、sequence rule 与 resource 同时在场时选择具体日期与时间。validate、dry-run、run 与 M6 全部只读消费同一份冻结计划与 `plan_digest`，不重复规划、不漂移目标。非时间流形态 `scenario_plan = None`；无法生成完整计划时 load 不返回半成品。
-
-**`derive_stream_bounds` 纯函数（一次性派生检查）**：返回全部派生错误、不因前一错误短路——至少同时计算 target sequence / crossed session / derived session 数，每个 required slot 的 min / max task frames，零交叉的单 owner 最小容量与有交叉时任意合法 owner pair 的最小容量（有交叉时声明域必须提供足量 `lo ≥ 2` 的 slot 覆盖 `D` 个 crossed session——结构前提在此做长度域级校验），total session frame capacity 与 exact noise target，frame gap、session gap、session max span 的数值关系，schedule 可用微秒、排除日与 quota bucket 数，exact quota cohort 与 total 兼容性，duration / resource 与 `contains` 的前置条件。跨度检查使用实际 slot length domain 与 crossed count，不用用户 `session_max_len` 反推另一个错误——`session_max_len`、frame gap 与 session max span 的关联问题在一次 validate 中全部出现。
-
-**四个 planner 异常与退出码分流**（三个错误面绝不混淆，capacity 绝不显示为 INFEASIBLE）：`PlannerInfeasibleError`（用户硬约束没有共同解；assumption core 经 `SufficientAssumptionsForInfeasibility()` 返回「足以导致不可行」的自然名称集合，不声称最小）汇入 `ConfigError`、exit 2；`PlannerCapacityError`（求解前超实现容量；quota 与 timeline 模型各自独立执行 250,000 entry 上限，不得把两个小模型的 entries 相加后误报）与 `PlannerBudgetError`（deterministic solve budget 内无法冻结最优计划；message 明确 `model=quota|timeline` 与超时的 layer 名）映射 runtime exit 4——配置未被判无解；`PlannerInternalError`（solver 解码或冻结计划违反实现不变量）仍 exit 4。静态 arithmetic 错误优先于 solver core，且同一纯检查阶段聚合全部 arithmetic 错误；能被 `derive_stream_bounds` 静态拦截的冲突不会走到 solver core。
-
-**删除 v1.16 局部可行性检查的生产面**：`_check_local_potential` / `_check_full_potential`（`_generate_stream_constraints.py`）的生产调用面删除，连同旧 planner 的 `check_local_candidates` / `check_question` 与 M6 的 `select_feasible_plan` 一起退出生产路径——纯规则单元测试改调新的 rule evaluator，用户配置只走完整计划（3.6.7）。旧 canonical 文件 `labelkit/common/runtime/sequence_planner.py` / `declare.py` / `temporal.py` 删除、不留 re-export，新实现落 `labelkit/common/runtime/scenario/` 包（model / quota / calendar / rules / planner / sessions / diagnostics / noise 分属主，§12 生产文件归属表）。
+| TOML 与类型 | 两文件均须含 `schema_version = 1`；缺失必填键、类型错误及受管节未知键均聚合为 CONFIG_ERROR。第 5 章字段表是唯一字段依据。已删除的序列生成键必须定向报错，不能落入未知键 warning，也不能读取旧值。 |
+| Profile 与凭据声明 | 所有启用阶段引用的 LLM/embedding profile 必须存在；视觉请求必须引用 `supports_vision = true` 的 profile。每个 profile 的 `api_key_env` 与 `api_key_envs` 恰有一个，数组非空且元素唯一。静态装载只校验变量名；run 与 `validate --probe` 才聚合读取被引用 profile 的值。 |
+| 通用阶段组合 | process、segment、stitch、extract、frame classify/annotate、quality、annotate、verify 的既有组合约束不变。quality 的 `threshold` 与 `top_ratio` 互斥；self-consistency 与 judge 数保持奇数约束；用户、帧与按类 Schema 均通过 draft 2020-12 元校验及对应 few-shot 干跑。 |
+| process 时序输入 | `[stream]` 只描述 process 摄取和 sessionization，不承担 sequence 生成时间线。segment 要求 process、annotate 开启且 generate 关闭；extract 要求 segment 与 UI；stitch 要求 segment。既有 no-op warning、视觉推导和上下文预算检查不变。 |
+| flat 生成 | `generate.form` 缺省 `flat`。flat 继续使用 `llms`、`styles`、`seed_examples`、`standalone_count`、`num_per_record`、`seeds_per_call` 与 `num_per_call`；种子池与无种子计数恰选一种。flat 显式书写 sequence 专用字段是 CONFIG_ERROR。 |
+| sequence 入口 | `generate.form = "sequence"` 要求 generate_only、text、`generate.enabled = true`、`run.partial_delivery = false`、`dedup.enabled = true`、`dedup.scope = "global"`、`output.meta_mode = "inline"`、`output.rejects = "none"`，并禁止 `--limit`。classify 与 frame.classify 必须关闭；frame.annotate 可作为 attempt-local 下游。M6 projector 为 sequence 与 frame 写 inherited Classification，`[frame.class.*]` 不要求 frame.classify 开启。sequence 显式书写任何 flat 字段是 CONFIG_ERROR。 |
+| sequence 模式与 profile | `generate.mode` 必须为 `declared` 或 `instruction_only`；`semantic_llm` 与 `evaluation_llm` 必填、名称不同、支持文本且均显式声明正 `context_window`；`max_slot_attempts` 在 1..20，缺省 3。 |
+| declared class 与 seed | 每个有交付 slot 的 sequence class 都声明非空 instruction、object state Schema；`initial_state_source` 只能是 `llm` 或 `catalog`。catalog 额外要求 JSONL 路径，按应用完整配置后的 slot 数无放回分配；行数不足或任一完整 `ScenarioSeed` 无效均在启动期失败。同一 class 的所有 pattern 必须声明同一 actor 集。 |
+| frame class | 每个 role、instruction-only 闭集或 noise 引用的 frame class 都必须有非空生成 instruction 和 object JSON Schema；sequence 不接受 string payload。 |
+| pattern | description 非空；role 名唯一且每个恰出现一次；`order` 恰好排列全部 role；`max_span_s > 0` 必填。每个相邻 role pair 恰有一条具名 gap，`max_gap_s` 必填；可加唯一、正向的非相邻 gap。秒值最多六位小数并无损转微秒，边界为闭区间。missing 目标 frame class 在 pattern 内唯一；reordered 目标相邻且 frame class 不同。 |
+| role 权限与 binding | roots 按 RFC 6901 token 前缀校验，同一列表内禁止祖先/后代冗余，三个列表之间可相交。patch 只允许 `test/add/remove/replace` 且至少以一个 `test` 开头；test 落 read roots，写操作落 write roots。publish roots 在事件后必须存在。binding 的 state path 同时被 read 与 publish roots 覆盖；payload path 禁止根路径、重复及任意祖先/后代冲突。LLM 始终面向完整 Draft 2020-12 frame Schema 生成完整 object，系统再按声明序以 RFC 6902 `add` 实例语义机械覆盖 binding，并用同一完整 Schema 复验；不改写 Schema。 |
+| counterfactual set | 每组至少一个 variant；name 与预期违规签名唯一；每个 variant 都有 outcome Schema。positive 可不声明但 baseline 永远存在。missing、reordered、interval_exceeded 只能产生对应唯一结构违规；编译器必须证明目标变换仍满足所有非目标 gap、`max_span_s` 与日历约束。 |
+| instruction-only | 每行 name 有效，count 为精确序列数，`len_range` 在 1..64。禁止 pattern、counterfactual set、role permission、outcome Schema 与 expected violation；只允许 LLM 从已声明 object frame class 闭集选类和 seed actor。缺省 state Schema 只要求 object；不支持 catalog。 |
+| timeline 与 calendar | `timestamp_start` 含显式 offset；`event_gap_s` 只作用于 instruction-only 相邻位置、noise 和 replay。primary 总数为 N、crossed 数为 D 时必须 `primary_sessions = N - D`；instruction-only 还要求 D = 0、`primary_sessions = N`、`duplicate_sequences = 0`。命名日历窗口使用固定 offset 和同日半开区间。 |
+| noise 与 replay | `noise_events > 0` 时 `generate.noise` 必填；noise frame class 不得被 role 使用，noise 无 owner、无 patch。replay 数量从已规划 positive primary sequence 按 declaration order 和 scenario index 无放回选源；正例不足在启动期失败；每个 replay 独占尾部 session。 |
+| 静态上限 | roles ≤ 32，variants/set ≤ 8，instruction-only events ≤ 64；seed、Schema、patch、payload、instruction 分别执行第 6 章固定字节上限。派生 `record_units` 与 `stream_rows` 均不超过 500000；`retained_content_bytes` 上限 536870912 在运行期 whole-attempt 预收费。 |
+| quality | sequence 若启用 quality，只允许 pointwise、固定 threshold；pairwise、`top_ratio`、任何会让同一组成员互相影响的 selection 及任何生效的按类 quality override 均为 CONFIG_ERROR。 |
+| 路径 | project TOML 的相对路径统一相对 `project_root`；CLI input/output 相对调用 cwd 后再覆盖。sequence 一次冻结 main、stream、report、manifest 与 failed_report，rejects 与 sidecar 为 null；全部路径冲突、非同目录 `.part` 或不可写均在启动期失败。 |
+| hook | 所有 hook 使用 `<python-file>:<attribute-path>`，相对文件按 project root 解析；M1 用文件路径加载并冻结 callable，不改 `sys.path`。sequence 的 `state_validator` 签名是 `validate_state(StateTransitionInput) -> list[str]`，只接收不可变副本。 |
+| program 编译接缝 | M1 返回后，operators 层 `GenerationProgramCompiler` 在凭据物化前只读 `ResolvedConfig.sequence_generation` 与 M1 冻结的 ClassView，解析引用、Schema、Pointer、hook 和 catalog，冻结 expected violation、校验 delivery slot 精确数量与声明序、计算调用上界与 canonical digest；不构造 `DeliverySlot`、不抽样、不调用 LLM、不执行下游 stage。实际 slot 及 `catalog_row_index` 只由 `ScenarioPlan` 按 class、声明序与 scenario index 确定性冻结；LLM source 的索引为 null，slot 重试不换行。 |
+| planner 接缝 | 编排层让 validate、dry-run、run 共用 operators 层 `compile_scenario_plan(program, seed)`、block allocator 与 CP-SAT model builder。单 block 最多 4096 primary events；OR-Tools 单 worker，确定性 seed，每个优化层 `max_deterministic_time = 10.0`。只有 OPTIMAL 可解码；INFEASIBLE 为 exit 2，FEASIBLE/UNKNOWN 与 MODEL_INVALID 为 exit 4；不使用 incumbent 或替代 planner。 |
+| console 与上下文预算 | 既有 console 推导、静态模板预算和逐请求完整预算不变。sequence 的 seed、ActorView、patch、payload、完整轨迹证据与 blind semantic review 输入禁止裁剪或摘要；不适配完整上下文时配置失败或消耗当前 slot attempt。semantic request 本身不得携带 `EventTrace`、variant/target/expected/actual violation 或其他 evaluator truth。 |
 
 ### 3.1.5 错误处理
 

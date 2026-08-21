@@ -2,7 +2,11 @@
 
 ### 3.8.1 职责与边界
 
-**做：**持有经预校验的用户 Schema 与各内部小 Schema（裁决、评分、评审、生成输出；v1.7 增分类 `classification_schema(class_names, assignment, max_labels, with_reason)`——按 `classify.assignment` 二态、类名词表以 enum 硬约束，关键字集 ⊆ 既有内部 Schema 关键字集且**无 uniqueItems**：该关键字会被 OpenAI strict 模式与部分约束解码网关硬拒，重复标签由 classify 代码在 M8 验证后确定性归一化，全文见 3.13.3；**v1.8 增三项**——分段窗口 `segment_window_schema(frame_count, with_reason)`（M14，全文见 3.14.3）、动作 `action_schema()`（M15，11 值动作词表 enum 硬约束，全文见 3.15.3）、stream 缺陷评审 `defect_verdict_schema()`（M7 stream 分支，三顶键 `{critiques, defects, verdict}` + 缺陷词表——v1.8 五值，v1.9 起六值（+`wrong_stitch`，3.7.2），全文见 3.7.2）；**v1.9 增一项**——缝合判定 `stitch_schema()`（M16，五键 `{verdict, thread_ref, task_name, reason, confidence}` 全 required、thread_ref 可空联合，全文见 3.16.3）；**v1.12 增一项**——帧级批量判决 `frame_classify_schema(names, n)`（M13 帧粒度，单键 `{"labels": [enum×n]}`、`minItems = maxItems = n` 钉死窗内成员数组长度、帧标签词表 enum 硬约束，同族**无 uniqueItems**（帧标签本就允许重复）；长度/索引对齐后校验在代码侧（first-wins，缺项 ⇒ 该帧 `fallback_class`），全文见 3.13.7）。四者逐字 JSON 冻结于 CONTRACTS §10.7，规则同族：关键字集 ⊆ 既有内部 Schema 关键字集、同样**无 uniqueItems**（重复 index / 标签由调用方代码在 M8 验证后确定性收窄——3.14.4 的 first-wins 建表、3.13.4 的归一化行）；可选性一律以可空联合 type 数组 `["array","null"]` / `["string","null"]` 表达、**全键 required**（OpenAI strict 模式硬拒可选属性，L0 无条件透传 Schema）；`minItems = maxItems` 钉死窗口数组长度（judgment_schema 同款）。`defect_verdict_schema` 与既有评审 Schema **并存**——非 stream 评审路径继续用后者（回归锚，S7）。四者与其余内部 Schema 同级：不计入 `report.schema_engine.resolved_at`、不经过 L2.5）；**v1.13 增两项**——时间流生成的蓝图 `plan_schema(names, length, cover_all=False)`（M6，单键 `{"steps": [{frame_class: enum, brief: string}]}`、`minItems = maxItems = length` 钉死步数、帧类名词表 enum 硬约束，同族**无 uniqueItems**（同一帧类在一条序列里本就可重复出现）；**v1.14 增第三入参** `cover_all`——True 时在 steps 数组对象上追加 `allOf` + **逐名一项 `contains`**（子模式形如 `{"properties": {"frame_class": {"const": <名>}}, "required": ["frame_class"]}`，按传入名集序；一个 Schema 对象只有一个 contains 键位，故多类分 allOf 支），与 enum 合成帧类构成的**恰等**约束（enum 给「⊆」、contains 给「⊇」，3.6.5 档位构成行）；`names` 取值由调用方决定（档位表在场即传档内子集），构造器零感知；缺省 False 的输出与 v1.13 逐字节一致。全文见 3.6.5）与帧实现 `realize_schema(step_schemas)`（M6，**逐位包装器**：单键 `{"frames": [...]}`，第 i 位服从蓝图第 i 步帧类的用户生成 Schema——纯文本帧位取 `{"type": "string"}`；以 draft 2020-12 原生关键字 `prefixItems` 表达逐位约束（jsonschema ≥ 4.21 直接可校验、无翻译层）、`"items": false` 封尾禁超长、`minItems = maxItems` 再钉一次长度）；两者逐字 JSON 冻结于 CONTRACTS §10.7，与前述内部 Schema 同族同级。**用户生成 Schema 的 L0 待遇（v1.13）**：`realize_schema` 的逐位子模式是**用户手写**的帧类生成 Schema（`[frame.class.<name>.generate].schema_*`，M1 元校验），包装后随 L0 原样透传——**不做关键字白名单 lint**（与 `output.schema` 今日同款暴露面）；某些 strict 路由拒 `prefixItems` 的排障面是配置级 `supports_structured_output = false`，不新增调用级参数）；提供「LLM 调用 → 合法 JSON 对象」的唯一入口 `complete_validated()`，内部实现四层结构保证；统计各层修复命中率。 
+**做：**持有经 M1 预校验的用户 Schema 和内部 Schema；为分类、分段、动作、评审、flat 生成及
+v1.18 sequence 的 seed/event-plan/frame-render/semantic/noise 调用提供统一 L0–L3 结构保证。内部 Schema
+由调用方按标准 draft 2020-12 JSON Schema 传入；schema engine 不认识任何 sequence 规划器专名。
+EventPlan 额外使用 `complete_post_validated`，把 L2 合法候选交给一次性后置验证器执行 patch、权限、
+state Schema 与 state validator，并把冻结 `EventExecution` 与合法对象一起返回。
 **不做：**不组装业务提示词（调用方传入完整 prompt）；不解释业务语义；不放行任何未通过校验的对象——这是它对全系统的硬契约。
 
 ### 3.8.2 四层保证与修复环
@@ -13,7 +17,7 @@
 |---|---|
 | L0 | profile `supports_structured_output=true` 时：OpenAI 兼容 provider 传 `response_format={"type":"json_schema", "json_schema":{...strict:true}}`；Anthropic provider 以单工具 `tool_choice` 强制工具调用、Schema 作为工具入参。L0 只是「使 L1/L3 少触发」的优化，不豁免 L2——供应商实现存在覆盖缺口（JSONSchemaBench 实测各引擎均有不支持的 Schema 特性 [24]），校验永远执行。 |
 | L1 | 顺序执行：① 剥离 Markdown 代码围栏；② 取首个花括号平衡子串；③ `json_repair.loads()`（工业库，处理截断/单引号/尾逗号/裸换行 [8]）。全部失败 ⇒ 直接进 L3。L1 为纯函数，无副作用、可单测穷举。 |
-| L2 | `Draft202012Validator.iter_errors()` 收集全部违规（非首个），每条含 JSON Pointer 路径、期望与实际。通过 ⇒ 返回；未通过 ⇒ L3。**违规渲染的两个显名分支**（渲染文本进 L3 修复清单，也进 `StageError` / rejects 错误报告面，故统一英文）：`enum` 违规按「期望/实际」措辞自行渲染（3.8.4 逐字实例）；**`contains` 违规（v1.14）**点名缺失的帧类——蓝图覆盖约束的 contains 子模式形如 `{"properties": {"frame_class": {"const": <名>}}, …}`，直接取该 const 值渲染为 `steps: missing required frame_class "<名>"`（不是该形状时——用户 Schema 也可以写 contains——回落 jsonschema 原始消息）。理由：L0 关闭的端点上，L3 修复提示不点名缺失帧类则修复指导性趋零（裸数组 repr 无信息量）；帧类名是配置量非数据内容，值-free 纪律不变。其余关键字直接携带 jsonschema 原始消息。 |
+| L2 | `Draft202012Validator.iter_errors()` 收集全部违规，每条含 JSON Pointer 路径、期望与实际。通过后进入可选用户回调或调用级后置验证；未通过进入 L3。enum 等错误统一渲染为英文、值受 trace/content 规则保护。 |
 | L2.5（v1.5，可选） | `output.validator` 配置时、且仅对用户 Schema 调用：L2 通过后执行用户回调 `fn(obj, record)`。返回非空违规列表 ⇒ 违规以 `(validator) <消息>` 形式并入违规清单、与 Schema 违规同路进入 L3 修复环（回调意见回喂模型自我修正——回调既是门卫也是修复环的教练）；返回空 ⇒ 通过。L3 每轮修复输出重走 L1→L2→L2.5。预算耗尽且剩余违规**全部**来自回调 ⇒ `SchemaViolation(callback_only=True)`，记录 kind = `callback_violation`（7.6），否则仍为 `schema_violation`。回调抛异常不吞：向上传播、按记录级 `internal_error` 收敛（3.5.3）。内部 Schema（裁决/评分/评审/生成/分类（v1.7）/分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9））不经过 L2.5。 |
 | L3 | 修复提示词 = 单条 user 消息，按 `[原始输出]` / `[违规清单]` 分节标签组织，末尾指令「只输出修正后的 JSON」（逐字实例见 3.8.4）。使用 `output.repair_llm`（默认同调用方 profile）。每次修复输出重走 L1→L2。尝试次数耗尽 ⇒ 抛 `SchemaViolation(errors, raw_last_output)`。修复调用计入 token 计量，命中层级分布计入报告（`report.schema_engine.resolved_at = {l0_or_clean, l1, l3_1, l3_2, rejected}`）。**上下文预算交互（v1.11，V25①）**：修复调用经 M9 终检（3.9）抛出 `ContextOverflowError(phase="precheck")` 时**捕获并记该轮修复失败**——修复 prompt 恒定 ⇒ 余轮必然同败，**短路至预算耗尽**；reject 归因维持既有 `schema_violation` / `callback_violation`（**不新增 reject 值、不计 `report.budget.overflow_records`**，7.6 注）；`[原始输出]` 修复原文**永不截断**——截断即破坏修复语义；该吞点即异常终局——reactive-400 形态在此经共享 `budget.feed_reactive_terminal` 补喂熔断**恰一次**（7.6 熔断矩阵；`_breaker_fed` duck 标防重喂，precheck/200 形态永不喂，v1.11 审计修订）。 |
 
@@ -23,12 +27,12 @@
 - **帧标注**（M5 逐帧标注，3.5.5）：传入**用户声明的帧级 Schema** `cfg.frame_schema`（显式 schema 参数，裁决·帧 Schema 显式路由）——虽为用户 Schema 的同胞（M1 元校验 + few-shot 干跑，3.1.4），但按**内部 Schema 待遇**路由：L0–L3 四层全在、**无 L2.5**（`output.validator` 仅约束序列级用户 Schema 调用；帧级回调列 8.4 演进候选）、**不计 `resolved_at`**——保住 6.4 恒等式「resolved_at 加总 = 进入 M5 的记录数」不被帧调用污染。
 - **写前兜底**（M11，3.11.2）：emitter 对每个非 null 帧标注对象跑 `validate_only(obj, schema=cfg.frame_schema)`——通过 ⇒ status="annotated"，不通过 ⇒ 翻 "failed" + annotation 置 null + 计数，非法帧对象**永不落盘**（主输出 `validate_only` 终检的帧级镜像）。
 
-**显式待遇参数与三类路由声明（v1.13，裁决·M8 显式待遇参数）**：v1.12 的路由把「显式 schema 参数」与「内部 Schema 待遇」绑死，导致 v1.13 的按序列类标注 Schema 无处安放——它是用户 Schema 的另一份实例（记录级标注调用），却必须显式传参。裁决：`complete_validated` 增待遇门 `user_treatment: bool | None = None` 把**待遇**与**传参方式**解耦（2026-08-14 代码规则整改后它是 `CallScope` 的一个字段，与 `record_ids` / `batch_no` / `record` 同乘一个参数对象；语义逐字不变）——
+**显式 Schema 待遇：**`CallScope.user_treatment` 把用户待遇与显式 schema 参数解耦；按类标注 Schema 虽显式传入，仍执行 L2.5 与 `resolved_at` 记账：
 
 | 路由 | schema 参数 | scope.user_treatment | L2.5 | `resolved_at` 记账 |
 |---|---|---|---|---|
 | 用户 Schema（全局 `output.schema`） | None（引擎持有） | None ⇒ 推断为真 | ✓（配置了 `output.validator` 时） | ✓ |
-| **按序列类标注 Schema（v1.13）** | 显式传该类 Schema | **True** | ✓ | ✓ |
+| **按 sequence class 标注 Schema** | 显式传该类 Schema | **True** | ✓ | ✓ |
 | 帧级 Schema 与全部内部 Schema | 显式传 | None ⇒ 推断为假（帧级/内部调用不显式传 True） | ✗ | ✗ |
 
 `None` 即现行 `schema is None` 推断 ⇒ **既有全部调用点零改动**；`stats` 的口径句相应重述为「**用户待遇族**调用」而非「schema 参数为 None 的调用」，§6.4 恒等式重述为「`resolved_at` 加总 = 进入 M5 的**记录级**标注调用数」（按类 Schema 的记录级标注照常计入，帧级标注仍不计——恒等式不被帧调用污染，6.4）。
@@ -52,9 +56,7 @@ class SchemaEngine:
                                  scope: CallScope = CallScope()) -> dict:
         """schema=None 时用用户 Schema；内部 Schema（裁决/评分/评审/生成/分类（v1.7）/
            分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9）/帧级判决（v1.12）/
-           蓝图与帧实现（v1.13））由各 Stage 传入。
-           v1.13 scope.user_treatment：None = 按 schema is None 推断（既有调用点零改动）；
-           True = 用户待遇（计 resolved_at + 启 L2.5）——按序列类标注 Schema 即此形；
+           sequence 的 seed/event-plan/frame-render/semantic/noise Schema）由调用方传入。\n           scope.user_treatment：None = 按 schema is None 推断；\n           True = 用户待遇（计 resolved_at + 启 L2.5）——按序列类标注 Schema 即此形；
            False = 内部待遇。成功返回已通过 L2 的 dict；失败抛 SchemaViolation。"""
     def validate_only(self, obj: dict, schema: dict | None = None) -> list[str]:
         """M1 校验 few-shot 示例输出、M11 写出前终检用；v1.12：M11 帧标注写前
@@ -148,36 +150,50 @@ JSON Pointer: /intent
 
 若第 2 次 L3 修复后仍未通过 L2，则预算耗尽，抛 `SchemaViolation(errors, raw_last_output)`：该记录 `status = "failed"`、错误码 `schema_violation`（7.6）入 rejects 通道，并计入 `resolved_at.rejected`。
 
-### 3.8.5 v1.16 联合规划的 brief Schema
+### 3.8.5 v1.18 调用级后置验证
 
-v1.16 为 M6 的 sampled brief 增加内部构造器 `brief_schema(length)`。它返回一个顶层
-object，唯一属性为 `steps`；`steps` 是长度恰为 `length` 的数组，每个位置的 object 只
-有必填字符串属性 `brief`，并以 `additionalProperties = false` 封闭。该 Schema 不返回
-`frame_class`，因为帧类词已经由 CP-SAT planner 冻结，LLM 只能补充每个位置的自然语言
-概要。它是内部 Schema 待遇：经过 L0–L3，但不经过 `output.validator`，不计入
-`report.schema_engine.resolved_at`。
+既有 `complete_validated` 返回类型不变。需要执行状态转移的 EventPlan 使用独立内部入口：
 
-```python
-def brief_schema(length: int) -> dict:
-    """构造 v1.16 联合规划的定长 brief 内部 Schema。"""
-```
+~~~python
+CallPostValidator = Callable[[Mapping[str, object]], PostValidationResult]
 
-M6 将 brief 数组按规划器的固定 frame class 位置配对，再传给已有的
-`realize_schema(step_schemas)`；realize 的 `prefixItems` 仍逐位约束帧类生成 Schema，
-时间字段绑定后的缩减 Schema 仍由 M6 传入。默认无 rules/windows 的 v1.15 路径继续使用
-`plan_schema` 并返回 `frame_class + brief`，因此 brief Schema 不改变默认路径的 prompt 或
-Schema 字节。M8 不解析规则、窗口或 correlation，也不参与长度可行性判断；这些语义由
-M1/M6 的共享 planner 与声明式 evaluator 负责。
 
-### 3.8.6 v1.17 hook 冻结载体与 noise realization 复用
+async def complete_post_validated(
+    request: PostValidatedCallRequest,
+) -> ValidatedGenerationCall:
+    """对每个结构合法候选执行恰一次调用级后置验证。"""
+~~~
 
-v1.17 的 M8 增量是两句话级的面，四层保证、内部 Schema 族与修复环全部零改动：
+`PostValidatedCallRequest` 冻结 profile、prompt、Schema、`CallScope` 与后置验证器。每个首轮或 L3
+候选通过 L2 后恰调用一次：
 
-- **hook 不再按字符串二次 resolve**：M1 在 load 期把四个校验钩子（output / sample /
-  sequence / scenario）解析并冻结为 callable 载体 `ResolvedHook` / `ValidationHooks`
-  （3.1.4.2）；M6 与 schema engine 消费冻结 callable——`complete_validated` 的消费面
-  **零变化**（签名、`CallScope`、L2.5 时机与 `resolved_at` 记账全部不动；变化只在调用方
-  从解析引用字符串改为读 `cfg.validation_hooks` 的冻结 target）。
-- **帧 noise realization 复用既有 Schema 路径**：structured noise 帧的 realization 复用
-  既有 task-frame realization 的 Schema 路径（该帧类生成 Schema 的装载、预算检查与校验
-  同源，3.6.7），M8 不新增任何 Schema 构造器或待遇分支。
+- 非空 `violations` 且 `event_execution is None` 是可修复结果，以
+  `(post-validator)` 前缀进入同一 L3 违规清单。
+- 空 `violations` 且携带 `EventExecution` 是唯一成功形态；结果随
+  `ValidatedGenerationCall` 返回，正式事件提交不得再次执行 patch 或 hook。
+- 其他形状、非 string 违规、回调异常或错误返回类型分别归
+  `post_validator_invalid` / `post_validator_exception`，直接拒绝当前 slot attempt，不进入 L3。
+- L3 prompt 只携带值受控的 violations；不能写入 `EventExecution`、state 或 hook 异常文本。
+
+只有 EventPlan 使用该入口；ScenarioSeed、FrameRenderer、SemanticEvaluator 与 noise 继续调用
+`complete_validated`。后置验证器只存在于当前 request，M8 不保存跨调用状态，并行请求不会串用 state/hook。
+`ValidatedGenerationCall` 按字段顺序携带 `object`、`event_execution`、`resolved_at`、`usage`、
+`attempts`、`model`；`resolved_at` 闭集只有 `l0_or_clean`、`l1`、`l3_1`、`l3_2`，用于标识当次
+成功对象的解析路径，不写入只属于用户 Schema annotate 的全局 `resolved_at` 计数。
+
+state validator 必须确定、无副作用，签名为
+`validate_state(StateTransitionInput) -> list[str]`。M1 用同一深拷贝输入连续调用两次并比较归一化违规字节。
+普通非空 string list 进入 L3；异常与非法返回分别终结 attempt。sequence 与 scenario 级旧 hook 不存在。
+
+### 3.8.6 v1.18 sequence Schema 所有权
+
+固定 family 为 `generation.scenario_seed`、`generation.event_plan`、
+`generation.frame_render`、`generation.semantic_evaluate`、`generation.noise_render` 与
+`generation.noise_evaluate`。模板与输出 Schema 冻结在 CONTRACTS，各 generation 模块只定义一次。
+M8 只消费调用方传入的标准 JSON Schema，不提供蓝图、概要、批量逐位实现或字段回填构造器。
+
+ScenarioSeed、ActorView、patch、payload、完整轨迹证据与 semantic evaluator 输入不能裁剪或以摘要替代。
+semantic evaluator 只接收盲化 `SemanticEvaluationRequest`，不得因完整性要求改传 `EventTrace`、
+variant/target/expected/actual violation、pattern/state evaluation 或其他 evaluator truth。
+precheck overflow 不发请求；内容相关 overflow、truncation 或 repair 耗尽按当前 sequence/noise attempt
+错误矩阵返回。provider fatal、circuit trip、KeyboardInterrupt 与 CancelledError 不在 M8 降级为记录错误。

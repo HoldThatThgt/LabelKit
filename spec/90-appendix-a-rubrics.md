@@ -116,7 +116,7 @@ pointwise_levels = [
 
 ## A.3 default:trajectory（v1.8）
 
-序列/轨迹打分的内置 rubric（`labelkit/data/rubrics/default_trajectory.toml`）：`quality.rubric` 缺省（空串）且**打分单元是序列**时自动选用——条件为 `segment.enabled = true`（v1.8 stream 模式）**∨** `generate_stream.enabled = true`（v1.13 时间流生成形态：直装序列同样按轨迹四准则打分，3.6.5）；两模态一致，用户显式选择器恒优先（3.4.3、3.1.4 S29 扩展）。判据说明三则：① 四个准则全部**任务无关**——锚定 episode 的内部结构（终态证据、步骤承接、方向性、离题占比）而非外部任务语义，无需知道任务是什么即可打分；措辞模态中立、不预设步骤在场（extract 关闭时「步骤」读作「帧间变化」，3.4.3）。② completion 与 coherence 源自 OS-Genesis trajectory reward model 的 Completion + Coherence 两维 [41]——TRM 原文为 **1–5 五级**整数分制，本表 **0–5 六级**是 LabelKit 家规（default:text 量表形态）的改制，多出的一级用于区分「彻底不可用」与「早期夭折」。③ purposefulness 与 noise_residue 无 TRM 原文背书、背书分开挂：前者自 Coherence 的 "toward the goal" 语义拆分独立成维，后者源自 RPA UI 日志分割对「不属任何例程的噪声事件」的显式处理（Leno et al. [50]）。
+序列/轨迹打分的内置 rubric（`labelkit/data/rubrics/default_trajectory.toml`）：`quality.rubric` 缺省（空串）且**打分单元是序列**时自动选用——普通 process 的条件为 `segment.enabled = true`，v1.18 generation 的条件为 `generate.form = "sequence"` 且 `ResolvedConfig.sequence_generation != null`；两模态一致，用户显式选择器恒优先（3.4.3、3.1.4）。判据说明三则：① 四个准则全部**任务无关**——锚定 episode/sequence 的内部结构（终态证据、步骤承接、方向性、离题占比）而非外部任务语义，无需知道任务是什么即可打分；措辞模态中立、不预设步骤在场（extract 关闭时「步骤」读作「帧间变化」，3.4.3）。② completion 与 coherence 源自 OS-Genesis trajectory reward model 的 Completion + Coherence 两维 [41]——TRM 原文为 **1–5 五级**整数分制，本表 **0–5 六级**是 LabelKit 家规（default:text 量表形态）的改制，多出的一级用于区分「彻底不可用」与「早期夭折」。③ purposefulness 与 noise_residue 无 TRM 原文背书、背书分开挂：前者自 Coherence 的 "toward the goal" 语义拆分独立成维，后者源自 RPA UI 日志分割对「不属任何例程的噪声事件」的显式处理（Leno et al. [50]）。
 
 ```
 name = "default-trajectory-v1"
@@ -174,4 +174,4 @@ pointwise_levels = [
   "5: 在 4 的基础上，全部步骤均属主线，无任何噪声残留。"]
 ```
 
-— 文档结束。LabelKit 产品设计说明书 v1.16 · 2026-08-20 —
+— 文档结束。LabelKit 产品设计说明书 v1.18 · 2026-08-21 —

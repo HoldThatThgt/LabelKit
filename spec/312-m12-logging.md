@@ -68,16 +68,18 @@ API 增量（均只增）：`MetricsSink.__init__` 增可选尾参 `listener`；
 | 文件语义 | **首个事件写出时**若 `trace.path` 已存在则截断覆盖并 stderr warn 一次（v1.5 惰性打开：构造不碰文件，死于配置/输入校验的运行不触碰旧 trace；保留历史请改名或另配 trace.path）。trace 不做 .part 原子改名——它是逐批 flush 的流式日志，异常终止时已 flush 的行即有效前缀（首行仍为本次 run.start）。 |
 | 帧粒度事件（v1.12） | 两个新事件（7.2 目录两行；事件名前缀自动路由既有 `classify` / `annotate` 通道，**通道枚举维持 11 值**）：① `classify.frame`——**每 episode 一发**（ids = (episode_id,)），payload = `members`（判决成员数）/ `windows`（分窗数）/ `fallback`（兜底帧数）三计数（3.13.7）；② `annotate.frame`——**每成员一发**（ids = (episode_id,)），payload = `member_id` / `status`（annotated \| skipped \| failed）/ `attempts`，标注内容仅经既有 `excerpt` 键按档位分级（excerpt/full 档 200 字截断，7.4），**不新增任何承载数据内容的 payload 键**（none 档预脱敏载荷直通 console 面板的红线，3.5.5）。 |
 
-**序列规则与联合规划（v1.16）**：规划器、声明式 evaluator 与序列钩子沿用既有运行日志
-通道，不新增 trace channel、事件名或 `StageError.kind`。planner 状态异常使用既有英文、
-值无关的 ERROR/WARN：`INFEASIBLE` / `UNKNOWN` 由 M1 聚合为配置错误，`MODEL_INVALID`
-或通过 M1 后的不变量破坏记录 ERROR 并交给既有 `InternalError` 退出面；noise 目标短缺只
-打一条值无关 WARN。序列钩子异常日志只含 hook 引用、异常类型，违规日志只含序列索引、
-类名和违规数；规则作废日志只含序列索引和类名。所有日志禁止载荷、输入文本、prompt、
-违规 message、时间表、相关字段值和 API key。规划器的 CP-SAT 求解经过已有 `llm.call`
-统计面以外不产生新 trace 记录，report 计数由 M6/M10 供给。
+**v1.18 sequence generation。**本形态沿用既有运行日志与 `llm.call` trace，不新增 generate
+专属 channel 或事件名；scenario seed、event plan、frame render、semantic evaluation、noise render
+与 noise evaluation 六个固定 family 都通过既有 `llm.call` 与 usage 面可见。普通 stderr
+只允许 slot key、attempt index、stage、error kind、计数、profile 与 duration，禁止输出
+prompt、world state、JSON Patch、payload、ActorView、模型响应内容或 API key。密钥环境变量名
+可按既有密钥池契约出现，密钥值在任一日志、trace、report、manifest 与异常中都禁止出现。
 
-**场景规划与精确交付（v1.17）**：planner 错误使用稳定英文 message 模板——capacity 形如 `sequence planner capacity exceeded: model=timeline entries=251891 limit=250000 dominant=crossing families={crossing:170000,session_slot:60000,...}`（含 actual / limit / dominant family，**绝无 INFEASIBLE 字样**；不输出「减少 horizon」一类猜测建议——schedule 已是显式硬边界）；budget message 明确 `model=quota|timeline` 与超时的 layer 名；infeasible 错误列 assumption core 的自然名称集合，形如 `sequence planner infeasible: constraints=[weekday_coverage,navigate_before_clock_out,ticket_request_work_hours]`（不声称最小）；静态 arithmetic 错误优先于 solver core 且同轮聚合（3.1.4.2、7.6）。启动 INFO 回显 `ResolvedPaths` 启用通道——启动 INFO 与 dry-run 各打印一次 output、report 及实际启用的 side channel 绝对路径（数据无关；M2 / M11 / console 同源消费同一 `ResolvedPaths`，3.1.4.2）。trace 面零增量：ScenarioPlan 在 M1 创建时 EventLog 尚未构造，**不新增虚假 planner 事件、不新增 trace 通道或事件名**；运行期把 plan digest、objectives 与 family stats 的冻结摘要并入既有 `run.start` payload（3.10.3）；trace 不记录 hook payload、quota 内容样本或 credential。
+`trace.content = "full"` 时可以在既有独立 trace 通道记录生成审计内容；其余档位继续服从
+7.4 的脱敏规则。`DeliveryError` 文本只含 slot identity、attempt count 与 error kind。
+失败 attempt、post-validator 异常和 commit 失败均使用稳定英文 kind，不复制 validator
+message、state、patch 或 artifact row。成功与失败的报告只承载计数和摘要（6.4），不把
+failed report 当作成功 manifest 的否定信号。
 
 ### 3.12.5 配置项
 

@@ -24,20 +24,9 @@ class RecordRef:
     line_no: int | None               # 文本模态：1-based 行号
     pair_index: int | None            # UI 模态：文件对 index
     generated_from: tuple[str, ...]   # process 模式生成样本：种子记录 id 列表；其余（含 generate_only 生成样本）为空元组——合成判据用 generator（v1.4）
-    generator: Mapping | None = None  # v1.2：生成记录的 {"llm": profile 名, "style": name|None} 溯源（3.6.2）；非生成记录为 None
-                                      # 键集条件形（v1.14）：恒含 llm 与 style 两键；时间流生成的**任一生效
-                                      #   档位表**在场时增第三键 tier_rank（该序列所属档位序数，正整数），
-                                      #   全缺省时维持两键——「信封只增字段」惯例（6.3）。v1.15 注：按类档位表
-                                      #   要求全局表在场（全局表为锚），故「任一生效表在场」⟺ 全局
-                                      #   [[generate.stream.tiers]] 非空——判据与 v1.14 逐字同义，只是
-                                      #   值取自本行序列类的生效表（跨类不可比，3.6.5）
-                                      # v1.13 时间流生成侧构造约定（3.6.5）：成员帧的 ref =
-                                      #   RecordRef(source_file=时间流工件路径, line_no=工件行号（1 基）,
-                                      #   pair_index=None, generated_from=(), generator={"llm","style"}
-                                      #   ——任一生效档位表在场（= 全局表非空）时为
-                                      #   {"llm","style","tier_rank"} 三键)
-                                      #   ——工件是该帧的**真实来源文件**，故走 source_file/line_no 而非
-                                      #   空源；序列 Record 的 ref 照 S24 继承首成员 ref（下方 Record 注）
+    generator: Mapping | None = None  # flat 生成记录的 {"llm": profile 名, "style": name|None} 溯源；
+                                      # sequence 的生成真值位于 _meta.generation / _meta.event，
+                                      # 不在 RecordRef 增加另一套结构字段
 
 @dataclass(frozen=True)
 class ImageRef:
@@ -59,7 +48,7 @@ class UITree:
 
 @dataclass(frozen=True)
 class Record:
-    id: str                           # sha256 前 16 hex（M2 定义的确定性规则）
+    id: str                           # process/flat 使用既有 M2 公式；v1.18 sequence 使用冻结的 32-hex ID 公式
     modality: Literal["text", "ui"]
     text: str | None                  # 文本模态：抽取文本；UI 模态：None
     raw: Mapping | None               # 文本模态：原始行对象
@@ -77,13 +66,10 @@ class Record:
                                       #   line_no=首成员 line_no, pair_index=首成员 pair_index,
                                       #   generated_from=(), generator=None)——完整成员溯源由
                                       #   _meta.stream.member_sources 承担（6.3）
-                                      # v1.13 生成侧构造约定（时间流形态，3.6.5）：序列 Record 的第二
-                                      #   来源——M6 直装组装（非 M14 拼装），字段约定与公式**逐条同 S24**
-                                      #   （id = sha256("\n".join(member ids))[:16]、text/raw/ui_tree/
-                                      #   image = None、ref = 首成员 ref）；成员 Record 的 raw = 工件行
-                                      #   **全对象**（含 truth 字段）、id = M2 公式 sha256(canonical_json
-                                      #   (raw))[:16]、text = text_field 值的 M2 语义投影（字符串直取 /
-                                      #   对象 canonical JSON）——工件重放时成员 id 逐字节一致（6.5）
+                                      # sequence 生成侧：sequence Record.id = sequence_id；成员
+                                      #   Record.id = event_id、raw = 完整 stream row、text =
+                                      #   canonical_json(payload)。两类 ID 均为第 11 章冻结的 32-hex 公式，
+                                      #   不复用 M2 的 16-hex 摄取公式
 
 @dataclass(frozen=True)
 class Classification:                 # v1.7：M13 分类结果（3.13）
@@ -91,18 +77,6 @@ class Classification:                 # v1.7：M13 分类结果（3.13）
     labels: tuple[str, ...]               # 该记录命中全集（声明序；single 恒单元素）
     source: Literal["llm", "fallback", "inherited"]
     detail: Mapping                       # reason / sc 统计 / fallback 留痕（kind, message）
-
-@dataclass(frozen=True)
-class SequenceValidationFrame:         # v1.16：M6 序列级生成钩子的单帧输入（3.6.6）
-    position: int                       # 序列内零基位置
-    frame_class: str                    # planner 冻结的帧类名
-    payload: object                     # JSON-compatible 深拷贝；钩子修改不得回写内部载荷
-
-@dataclass(frozen=True)
-class SequenceValidationInput:         # v1.16：generate.sequence_validator 的输入（3.6.6）
-    sequence_class: str                 # 生成序列类名
-    tier_rank: int | None               # 该类生效档位序数；无档位面时为 None
-    frames: tuple[SequenceValidationFrame, ...]  # 按序列位置排列的成员帧
 
 @dataclass
 class PipelineItem:                   # 唯一可变信封；生命周期 = 一个批
@@ -130,9 +104,9 @@ class PipelineItem:                   # 唯一可变信封；生命周期 = 一�
     member_classifications: dict[str, Classification] | None = None
                                       # v1.12 只增：M13 帧级批量判决写入（首标签序列信封，3.13.7）；
                                       #   键 = 成员 record.id、值恒单标签（labels = (label,)，
-                                      #   source ∈ {"llm","fallback"}；v1.13 增第三值 "inherited"
-                                      #   ——时间流生成的帧类真值在蓝图层已知，由 M6 直装写入，
-                                      #   值形态与帧级判决产物完全一致，3.6.5/3.13.7）；None = 帧 pass 未运行
+                                      #   source ∈ {"llm","fallback","inherited"}；sequence projector
+                                      #   按实际事件 frame class 直装 inherited 值，classify 调用为零；
+                                      #   None = 帧 pass 未运行
                                       #   （帧分类关闭 / 降格会话 / 非首标签克隆）——幂等门 is None；
                                       #   扇出克隆按引用共享同一 dict（record/dedup 同族，3.13.7）
     member_annotations: dict[str, Annotation] | None = None
@@ -229,12 +203,16 @@ LabelKitError
  ├─ InputError                                 # M2 fail 策略触发，退出码 3
  ├─ ProviderRetryableError / ProviderFatalError# M9
  ├─ SchemaViolation(errors, raw_last_output)   # M8，记录级
+ ├─ DeliveryError                              # sequence slot 耗尽，退出码 1
  └─ InternalError                              # 不变量破坏（如 M11 终检失败）
 ```
 
 **帧粒度与 Stage 契约（v1.12 零改动声明）**：帧级分类/标注（3.13.7、3.5.5）对本契约**零改动**——契约例外维持 ②a/②b/②c 三条原文，不新增例外条款：帧产物只写入信封自身的 `member_classifications` / `member_annotations` 两字段（属 ①④ 的正常字段写入），不改成员帧状态机（成员保持 `absorbed`）、不增删列表元素、不改链序与守恒恒等式（6.4）。**克隆共享语义补注**（②a 的 v1.12 侧注）：classify multi 扇出克隆对两字段**按引用共享**（与 `record` / `dedup` 同族，3.13.7 扇出共享行）——帧产物描述成员帧本身而非信封路由，原/克隆行渲染同一 dict；帧级两 pass 只在首标签信封上执行（克隆判据 = `classification.label != classification.labels[0]`，verify S8 同款），M7 帧产物同步亦无克隆分支（克隆信封永不手术，3.7.3）；手术后原/克隆行 members 分叉由既有 `repaired` 位消歧（6.3 补注）。
 
-**时间流生成与 Stage 契约（v1.13 零改动声明）**：时间流形态（3.6.5）对本契约**零改动**——契约例外维持 ②a/②b/②c 三条原文，不新增例外条款。理由逐条：① M6 仍遵守既有的 generate 例外（「返回新子批而非原地改状态」）——返回值只是从 `list[Record]` 升格为「信封列表 + 工件行列表」的富返回（`PipelineItem(record=r)` 裸构造无法携带 `session_id` / `classification` / `member_classifications`，故必须整只交付），**平面路径 `generate_all` 的冻结签名与行为不动**；② 直装序列信封自出厂即是**普通 active 信封**，下游六个算子按既有规则处理，无任何序列专属的状态迁移；③ **成员帧从不构造信封**（噪音帧与重发帧只活在工件里），故 `absorbed` / `dropped_noise` / `stitched` 三态在本形态下不出现，②b/②c 的适用面为空；④ 状态机、链序与守恒恒等式（取 generate_only 退化形，6.4）全部不动。
+**sequence 与 Stage 契约：**flat 继续使用 generate 的新增子批例外。sequence 不调用 `GenerateStage.run`，
+由 M10 以 `AttemptTransaction` 串行 admission；候选在事务内调用 M3/M4/M5/M7 的 attempt 接口，只有整个
+counterfactual set 接受后才提交 dedup 与 dataset 状态。因此 sequence 不新增 `PipelineItem.status`，也不借用
+segment/stitch 的成员状态转换；slot rejection 不写半成品 `item.errors`。
 
 `UITree.serialize()` 的规范定义（M3 去重与 M5 提示词共用，M3 传 `quantize_px=dedup.bounds_quantize_px`）：深度优先遍历可见节点；每行 = `" "*depth + role + (' "'+text+'"' if text) + (' desc="'+content_desc+'"' if content_desc) + ' ['+l,t,r,b+']' + 非空 extra 的 k=v 列表`；坐标除以 quantize_px 取整（0 = 不量化）；超长截断规则见 3.5.2。该线性化即 ScreenAI 的 screen-schema 表示思想 [13]。
 
@@ -268,31 +246,315 @@ def tree_diff(a: UITree | None, b: UITree | None, quantize_px: int) -> Mapping
 
 **预算原语契约引（v1.11）**：上下文预算的估算与装填原语（`margin` / `input_budget` / `embed_budget` / `est_text` / `est_image_prior` / `est_prompt` / `fit_text` / `min_window` / `classify_stage_error` 与 `ImageCostCalibrator`）为新共享模块 `labelkit/common/runtime/budget.py` 的模块级纯函数与类（common 层运行时，**非本章类型层**——签名与冻结常数以 CONTRACTS 的 budget 新节为准，机制见 3.9）；本章共享渲染层（`serialize` / `frame_digest` / `tree_diff`）签名零改动，装填器（贪心切窗等）属算子逻辑、落各算子模块。
 
-**序列规则与 Stage 契约（v1.16 零改动声明）**：v1.16 新增的
-`SequenceValidationFrame` / `SequenceValidationInput` 只描述 M6 调用用户序列钩子时传入的
-只读视图，不是新的 `PipelineItem` 或 `Stage` 例外。M6 仍返回富的生成子批（序列信封与
-工件行），不修改原批；每个序列信封出厂即为普通 `active` 信封，继续走既有下游链。规则、
-窗口、correlation、planner 状态和钩子违规不会写进 `Record`、`PipelineItem.errors` 或
-新的状态值；整条 attempt 作废只表现为缺席与既有计数器。钩子取得 payload 的深拷贝，
-任何用户修改都不能污染内部载荷、时间字段回填或 duplicate source。
+**v1.18 sequence 冻结类型：**下表类型全部为 frozen dataclass；Mapping 在构造时深拷贝为
+JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是接口契约，生产 typedef/dataclass
+每个字段都要有中文语义注释。
 
-**v1.17 新增数据结构（场景规划与精确交付）**：分三层落档。全字段定义冻结在
-`docs/dev/SPEC-scenario-planning.md` §6.1 与 `docs/CONTRACTS.md`，此处只列名字、一句话
-职责与落点文件——主规格不复制全字段。
+| 类型 | 按声明顺序冻结的字段 |
+|---|---|
+| `SequenceClassGenerationConfig` | `instruction`, `state_schema`, `initial_state_source`, `initial_state_catalog_path`, `initial_state_catalog` |
+| `PayloadBindingSpec` | `payload_path`, `state_phase`, `state_path` |
+| `RoleSpec` | `name`, `frame_class`, `actor`, `read_roots`, `write_roots`, `publish_roots`, `observers`, `state_instruction`, `pre_state_schema`, `payload_bindings`, `calendar_window` |
+| `GapSpec` | `name`, `before`, `after`, `min_gap_us`, `max_gap_us` |
+| `SequencePattern` | `name`, `sequence_class`, `description`, `roles`, `order`, `gaps`, `max_span_us` |
+| `VariantSpec` | `name`, `kind`, `target`, `outcome_schema`, `expected_violation`, `divergence_role` |
+| `CounterfactualSetSpec` | `name`, `pattern`, `count`, `variants` |
+| `InstructionOnlySpec` | `name`, `sequence_class`, `count`, `len_range`, `instruction`, `state_schema` |
+| `TimelineSpec` | `timestamp_start_us`, `utc_offset_minutes`, `event_gap_us`, `primary_sessions`, `crossed_primary_sessions`, `session_max_events`, `session_max_span_us`, `session_gap_us`, `noise_events`, `duplicate_sequences` |
+| `CalendarWindowSpec` | `name`, `utc_offset_minutes`, `days`, `intervals_us` |
+| `NoiseSpec` | `frame_class`, `instruction` |
+| `GenerationLimits` | `pattern_roles`, `variants_per_counterfactual_set`, `instruction_only_events`, `scenario_seed_bytes`, `state_or_outcome_schema_bytes`, `frame_schema_bytes`, `event_patch_bytes`, `rendered_payload_bytes`, `instruction_bytes`, `record_units`, `stream_rows`, `retained_content_bytes` |
+| `SequenceGenerationConfig` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `state_validator`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `calendar_windows`, `noise`, `limits` |
+| `GenerationProgram` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `class_views`, `frame_classes`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `calendar_windows`, `noise`, `limits`, `state_validator`, `digest` |
+| `DeliverySlot` | `slot_key`, `source_name`, `scenario_index`, `sequence_class`, `pattern_name`, `variant_names`, `catalog_row_index` |
+| `PlannedEvent` | `event_key`, `role`, `position`, `logical_time_us`, `timestamp_us`, `session_id` |
+| `NoiseSlot` | `event_key`, `ordinal`, `frame_class`, `timestamp_us`, `session_id` |
+| `ReplayLayout` | `source_slot_key`, `source_variant_name`, `replay_ordinal`, `session_id`, `timestamps_us` |
+| `ScenarioPlan` | `blocks`, `delivery_slots`, `noise_slots`, `replay_layouts`, `primary_sessions`, `digest` |
+| `ScenarioSeed` | `initial_state`, `actors`, `shared_facts`, `style`, `time_context` |
+| `ActorView` | `actor`, `goal`, `read_state`, `observations`, `logical_time_us`, `wait_since_previous_us` |
+| `EventPlan` | `frame_class`, `actor`, `intent`, `patch` |
+| `EventExecution` | `state_before`, `state_after`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `normalized_patch` |
+| `EventDraft` | `event_key`, `event_id`, `frame_class`, `actor`, `logical_time_us`, `timestamp_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
+| `EventTruth` | `event_key`, `event_id`, `role`, `frame_class`, `actor`, `logical_time_us`, `timestamp_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
+| `ObservedEvent` | `event_id`, `frame_class`, `timestamp_us` |
+| `SemanticReviewEvent` | `frame_class`, `actor`, `logical_time_us`, `wait_since_previous_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
+| `PatternEvaluation` | `actual_bindings`, `actual_violations` |
+| `StateEvaluation` | `replay_hash`, `final_state_hash`, `bindings_valid`, `outcome_valid`, `protected_prefix_valid` |
+| `SemanticEvaluation` | `causal_consistency`, `actor_knowledge`, `goal_consistency`, `temporal_plausibility`, `cross_frame_consistency`, `realism`, `reason_codes` |
+| `NoiseSemanticEvaluation` | `unrelated_to_declared_tasks`, `no_executable_task`, `realism`, `reason_codes` |
+| `EventTrace` | `scenario_id`, `world_branch_id`, `sequence_class`, `pattern_name`, `variant_name`, `scenario_seed`, `events`, `final_state`, `pattern_evaluation`, `state_evaluation`, `semantic_evaluation` |
+| `GenerationParseContext` | `project_root`, `class_views`, `frame_classes`, `llm_profiles`, `hook_loader`, `collector` |
+| `ScenarioSeedRequest` | `program`, `slot`, `attempt_index`, `random_seed` |
+| `EventPlanRequest` | `mode`, `semantic_profile`, `slot_key`, `planned_event`, `role`, `generation_instruction`, `sequence_length`, `eligible_frame_classes`, `eligible_actors`, `actor_view`, `visible_state`, `history`, `actor_profiles`, `public_facts`, `attempt_index`, `variation_nonce` |
+| `EventExecutionContext` | `program`, `plan`, `slot`, `variant_name`, `event_index`, `scenario_seed`, `current_state`, `history` |
+| `StateTransitionInput` | `slot_key`, `variant`, `role`, `state_before`, `state_after`, `patch` |
+| `PostValidationResult` | `violations`, `event_execution` |
+| `PostValidatedCallRequest` | `profile`, `prompt`, `schema`, `scope`, `post_validator` |
+| `ValidatedGenerationCall` | `object`, `event_execution`, `resolved_at`, `usage`, `attempts`, `model` |
+| `RenderEventRequest` | `semantic_profile`, `slot_key`, `planned_event`, `event_plan`, `actor_view`, `publish_snapshot`, `state_before_hash`, `state_after_hash`, `binding_values`, `frame_spec`, `role`, `public_facts`, `attempt_index` |
+| `StateEvaluationRequest` | `program`, `slot`, `pattern`, `variant`, `scenario_seed`, `events`, `baseline_events`, `final_state` |
+| `CouplingEvaluationRequest` | `variant`, `baseline_events`, `events` |
+| `SemanticEvaluationRequest` | `evaluation_profile`, `mode`, `sequence_class`, `class_description`, `pattern_description`, `scenario_seed`, `review_events`, `final_state`, `attempt_index` |
+| `NoiseRenderRequest` | `semantic_profile`, `noise_slot`, `noise_spec`, `frame_spec`, `class_descriptions`, `frame_descriptions`, `attempt_index` |
+| `NoiseEvaluationRequest` | `evaluation_profile`, `payload`, `class_descriptions`, `frame_descriptions`, `attempt_index` |
+| `ProjectionRequest` | `program`, `slot`, `trace` |
+| `NoiseProjectionRequest` | `program`, `run_id`, `noise_slot`, `payload` |
+| `ReplayProjectionRequest` | `program`, `layout`, `source` |
+| `ProjectedSequence` | `main_record`, `primary_stream_rows` |
+| `SequenceRows` | `main_row`, `primary_stream_rows`, `retained_content_bytes` |
+| `ReplayRows` | `rows`, `retained_content_bytes` |
+| `ReconcileRequest` | `plan`, `sequences`, `noise_rows`, `replay_rows` |
+| `GenerationServices` | `config`, `schema_engine`, `llm`, `metrics` |
+| `RuntimeCredentials` | `llm`, `embedding` |
+| `ResolvedHook` | `reference`, `target` |
+| `ValidationHooks` | `output`, `sample`, `state` |
+| `ResolvedPaths` | `project`, `project_root`, `input`, `output`, `report`, `rejects`, `sidecar`, `trace`, `stream`, `manifest`, `failed_report` |
+| `DeliveryRequest` | `program`, `plan`, `paths`, `run_attempt_id`, `run_id` |
+| `DeliveryServices` | `generation`, `dedup`, `quality`, `annotate`, `verify`, `emitter` |
+| `AttemptTransaction` | `items`, `class_views`, `projected_sequences` |
+| `DownstreamAttemptRequest` | `transaction`, `run_context` |
+| `DownstreamAttemptResult` | `accepted`, `rejected_stage`, `dataset_counters` |
+| `DedupGroupRequest` | `records`, `exempt_pairs`, `embedding_profile` |
+| `DedupProbeToken` | `capability_id`, `index_generation`, `record_digests`, `exact_features`, `minhash_features`, `embedding_features` |
+| `GenerationProduct` | `main_rows`, `stream_rows`, `report` |
 
-contracts 层（`labelkit/common/contracts/types.py`，与既有 `SequenceValidationFrame` /
-`SequenceValidationInput` 同层并列——后两者形状原样保留，`sequence_validator` 的输入
-契约零变化）：
+`ScenarioBlock` 是只读 Mapping，键为 `tuple[str, str | None]`，值为 `PlannedEvent` tuple。
+`None` 只表示 instruction-only block。`ScenarioPlan` 是 `DeliverySlot` 的唯一属主；
+`GenerationProgram` 不复制 slot，`DeliverySlot.catalog_row_index` 是 catalog 行的唯一分配真值。
+`PlannedEvent` 只冻结位置与时间结构；declared 的 frame class/actor 从 role 解析，instruction-only
+的 frame class/actor 由当次 `EventPlan` 选择，两者都不在计划事件上伪造预置值。
 
-- `ResolvedHook` —— 一个已按工程根目录解析并通过 synthetic probe 的校验器（`reference: str` 用于稳定错误定位 + `target: Callable`，callable 的 repr 与 equality 均被排除）。
-- `ValidationHooks` —— 运行内四个校验阶段唯一使用的冻结 callable 集（`output` / `sample` / `sequence` / `scenario` 四槽，各 `ResolvedHook | None`）；挂 `ResolvedConfig.validation_hooks`，report、trace、digest 与配置序列化只允许使用 reference。
-- `ScenarioSequence` —— 场景校验器看到的一条已实现序列（`slot_key` / `sequence_class` / `start` / `end` / `frames`）。
-- `ScenarioValidationInput` —— 增量场景校验输入：accepted 前缀 + 本次唯一可拒绝的 `candidate`（accepted 不回滚、不重排）。
+`EventExecutionContext.history` 恰为 `tuple[EventDraft, ...]`；`EventPlanRequest.history` 恰为
+`tuple[EventDraft, ...] | None`，且只在 instruction-only 非 null。`EventDraft` 刻意没有 role，
+是逐事件生成期唯一 history carrier。declared branch 在独立 PatternEvaluator 完成一对一 binding 前
+不得构造 `EventTruth`；只有完整 `actual_bindings` 覆盖全部 event_id 后，才为每个 draft 增加唯一 role。
 
-`ResolvedConfig` 冻结 parse product 与运行期载体：
+`NoiseSlot` 只描述独立 noise 事件；`ReplayLayout` 只描述一次完整 replay 的 source、variant、
+ordinal、session 与逐事件 timestamp，两者均不进入 `ScenarioBlock`。`ReplayLayout.timestamps_us`
+的长度必须等于 source positive sequence 的事件数；source 只按 `slot_key` 与
+`source_variant_name` 解析，不得按 payload、位置或临时 list index 猜测。
 
-- `ResolvedConfig` 新增三个冻结 parse product：`paths: ResolvedPaths`、`validation_hooks: ValidationHooks`、`scenario_plan: ScenarioPlan | None`（非 time-stream 形态为 None；time-stream 形态无法生成完整计划时 load 不返回半成品）——原始 config section 不再保存可调用对象、secret value 或待下游解释的相对路径。
-- `ResolvedPaths` —— 运行涉及的全部绝对路径（`project` / `project_root` / `input` / `output` / `report` / `rejects` / `sidecar` / `trace` / `stream_artifact` 九字段）；M2、M11、trace runtime、console 与 stream artifact helper 只消费它，不得重新从字符串推导 cwd-relative 路径。
-- `RuntimeCredentials` —— **不入 `ResolvedConfig`** 的运行期载体：仅真实网络运行持有的 profile 密钥值（`llm` / `embedding` 两个只读 mapping，构造时复制、key 按 profile name 排序、value 为去重后保持声明顺序的非空 key tuple）；没有显示 secret 的 repr、异常或序列化方法，不进日志 / trace / report / exception / deepcopy。
+`ResolvedPaths` 对 sequence 冻结 main、stream、report、manifest、failed_report，rejects 与 sidecar 为 null。
+`RuntimeCredentials` 只服务于 factory 构造 LLMClient，随后不进入 delivery request；其与
+`ResolvedHook.target` 的 repr/compare 均不得暴露 callable 或 secret value。
 
-scenario 包 dataclass 族（`labelkit/common/runtime/scenario/model.py`；planner 内部 dataclass 一律落此文件，与 contracts 层不得混放）。输入 spec 族：`ScheduleSpec`（planner 使用的有限 fixed-offset schedule）、`QuotaSpec`（一张尚待展开 period bucket 的 quota）、`CorrelationSpec`（frame rule 的类型敏感顶层字段相等约束）、`FrameRuleSpec`（一条带自然名称的同序列有限迹规则——v1.16 `SequenceRuleSpec` 的更名；`SequenceRuleSpec` 名字自 v1.17 起回收给跨序列规则，与被更名类**没有任何继承关系**）、`FrameWindowSpec`（一条带自然名称的 frame class 本地日历窗口）、`SequenceRuleSpec`（一条跨 sequence occurrence 的周期规则：precedence / response / succession / not_co_existence）、`TierDomain`（一个 sequence class 的一档 frame class 构成）、`SequenceClassDomain`（一个 sequence class 的完整生效 planner 输入）、`FrameClassDomain`（一个 frame class 的时间与 resource 域）、`NoiseClassSpec`（一个 structured noise frame class 及其整数权重）、`ScenarioConfig`（`compile_scenario` 的唯一冻结参数对象）。计划产物族：`SequenceSlotSpec`（QuotaCompiler 冻结 target 后的一条稳定成功交付槽位——**length 在 slot 构建时冻结为 `length_target`**，planner 不再改变 active length）、`FrameLayout`（一条已选中的 active frame occurrence 布局）、`SequenceLayout`（一条 sequence slot 的完整时间与 session 布局）、`SessionLayout`（一个 replay session 的 owner、边界与 noise 数量）、`NoiseSlot`（一条已冻结 class、session 与时间的 noise 交付槽位）、`DuplicateLayout`（一条已冻结 source 与平移后时间的流尾 duplicate）、`QuotaSummary`（一张 quota 展开后的一个 class/bucket target）、`PlannerObjectives`（三层字典序目标的冻结最优值：preference_deviation / calendar_days_spanned / timeline_end_us）、`PlannerFamilyStats` / `PlannerModelStats`（quota 与 timeline 模型的稳定规模统计，family counts 只用于 report、不参与 digest）、`ScenarioPlan`（M1 唯一生成、estimate 与 M6 只读消费的冻结计划：slots / layouts / sessions / noise_slots / duplicates / quota_summary / objectives / models / plan_digest）。所有 `*_us` 时间为 Unix epoch 的绝对整数微秒（本地日期与 artifact ISO-8601 用 schedule 的固定 offset 转换）；声明为 Mapping 的字段都在构造点复制为只读、按 key 排序的 mapping——冻结 dataclass 内不得藏可变 dict/list。
+`SequenceValidationInput`、`ScenarioValidationInput`、`GenerateStreamConfig`、`ScenarioConfig`、
+`SequencePlan`、`StreamPlan`、`ExecuteEventRequest` 均不存在；不得保留同名 alias、wrapper 或转换层。
+
+**v1.18 sequence 冻结接口：**
+
+~~~python
+def parse_generation_config(
+    raw_project: Mapping[str, object],
+    context: GenerationParseContext,
+) -> SequenceGenerationConfig:
+    """解析 sequence 生成配置。"""
+
+
+def compile_generation_program(config: ResolvedConfig) -> GenerationProgram:
+    """编译唯一生成程序。"""
+
+
+def compile_scenario_plan(program: GenerationProgram, seed: int) -> ScenarioPlan:
+    """冻结确定性场景计划。"""
+
+
+async def generate_scenario_seed(
+    request: ScenarioSeedRequest,
+    services: GenerationServices,
+) -> ScenarioSeed:
+    """生成或读取一个完整初始世界。"""
+
+
+def build_event_plan_request(
+    context: EventExecutionContext,
+    attempt_index: int,
+    variation_nonce: str,
+) -> EventPlanRequest:
+    """校验事件引用并机械投影 prompt-safe 请求。"""
+
+
+async def plan_event(
+    context: EventExecutionContext,
+    attempt_index: int,
+    variation_nonce: str,
+    services: GenerationServices,
+) -> tuple[EventPlan, EventExecution]:
+    """从唯一执行根规划事件并返回同候选的执行证明。"""
+
+
+def execute_event(
+    context: EventExecutionContext,
+    event_plan: EventPlan,
+) -> EventExecution:
+    """在执行根的状态副本上原子执行并验证状态转移。"""
+
+
+def post_validate_event_plan(
+    candidate: Mapping[str, object],
+    context: EventExecutionContext,
+) -> PostValidationResult:
+    """从当次候选构造唯一 EventPlan 并返回执行证明。"""
+
+
+async def render_event(
+    request: RenderEventRequest,
+    services: GenerationServices,
+) -> Mapping[str, object]:
+    """以发布快照与机械 binding 渲染 frame payload。"""
+
+
+def evaluate_pattern(
+    pattern: SequencePattern,
+    events: Sequence[ObservedEvent],
+) -> PatternEvaluation:
+    """从观察事件独立绑定实际 role 与违规。"""
+
+
+def evaluate_state(request: StateEvaluationRequest) -> StateEvaluation:
+    """从 program 真值独立重放并验证事件轨迹。"""
+
+
+def evaluate_coupling(request: CouplingEvaluationRequest) -> bool:
+    """机械验证反事实受保护前缀。"""
+
+
+async def evaluate_semantics(
+    request: SemanticEvaluationRequest,
+    services: GenerationServices,
+) -> SemanticEvaluation:
+    """以独立 profile 对盲化评审事件判定轨迹语义。"""
+
+
+async def render_noise(
+    request: NoiseRenderRequest,
+    services: GenerationServices,
+) -> Mapping[str, object]:
+    """以独立 noise slot 渲染 noise payload。"""
+
+
+async def evaluate_noise(
+    request: NoiseEvaluationRequest,
+    services: GenerationServices,
+) -> NoiseSemanticEvaluation:
+    """以独立 profile 判定 noise payload 的固定语义。"""
+
+
+def project_trace(request: ProjectionRequest) -> ProjectedSequence:
+    """把通过判定的轨迹投影为下游前 sequence Record 与 primary stream 基础行。"""
+
+
+def project_noise(request: NoiseProjectionRequest) -> Mapping[str, object]:
+    """把已验证 noise payload 投影为独立 stream 行。"""
+
+
+def project_replay(request: ReplayProjectionRequest) -> ReplayRows:
+    """从最终 source SequenceRows 投影完整 replay 行。"""
+
+
+def reconcile_views(request: ReconcileRequest) -> None:
+    """提交前机械核对最终 main、primary、noise 与 replay 视图。"""
+
+
+async def deliver_generation(
+    request: DeliveryRequest,
+    services: DeliveryServices,
+) -> GenerationProduct:
+    """执行 sequence 精确交付并返回仅在成功时可提交的产品。"""
+
+
+class DownstreamAttemptCollaborator(Protocol):
+    """定义 sequence 下游 attempt-local 协作者。"""
+
+    async def run_attempt(
+        self,
+        request: DownstreamAttemptRequest,
+    ) -> DownstreamAttemptResult:
+        """在事务内运行已开启的下游阶段且不提交全局状态。"""
+
+
+class DedupIndex:
+    """管理 sequence 交付期的探测与原子索引提交。"""
+
+    async def group_probe(
+        self,
+        request: DedupGroupRequest,
+        context: RunContext,
+    ) -> DedupProbeToken:
+        """无写入地试算整组去重并返回一次性能力。"""
+
+    def group_commit(self, token: DedupProbeToken) -> None:
+        """在无 await 临界区一次写入已探测索引特征。"""
+
+
+class SequenceDeliveryEmitter:
+    """组装并提交 sequence 的最终产品。"""
+
+    def assemble_sequence(
+        self,
+        item: PipelineItem,
+        projection: ProjectedSequence,
+        batch_no: int,
+    ) -> SequenceRows:
+        """从最终 item 与基础投影组装零 I/O 的完整 sequence 行。"""
+
+    def prepare_product(
+        self,
+        main_rows: Sequence[Mapping[str, object]],
+        stream_rows: Sequence[Mapping[str, object]],
+        report: Mapping[str, object],
+    ) -> GenerationProduct:
+        """唯一地计算 delivery digest 并构造深度冻结产品。"""
+
+    def commit(self, product: GenerationProduct) -> Mapping[str, object]:
+        """按固定顺序提交产品并最后替换 manifest。"""
+
+    def write_failed_report(self, report: Mapping[str, object]) -> None:
+        """原子写入不属于成功 manifest 的失败诊断。"""
+
+
+def derive_generation_id(
+    domain: str,
+    components: Sequence[object],
+) -> str:
+    """以域分离 canonical JSON 组件派生 32-hex generation ID。"""
+
+
+def canonical_delivery_row(row: Mapping[str, object]) -> bytes:
+    """移除发射期墙钟观测字段并返回 canonical UTF-8 行。"""
+
+
+def validate_state(value: StateTransitionInput) -> list[str]:
+    """实现可选的确定性状态转换校验 hook。"""
+~~~
+
+`EventExecutionContext` 是 event plan 的唯一根。`build_event_plan_request` 先验证 slot 属于 plan、
+block key 存在且 event index 合法，再机械投影 prompt-safe request；`plan_event` 不接收另一份
+request。任一内部引用失配均是 `generation_downstream_contract`、exit 4、零 LLM call 且不消耗
+slot attempt。`post_validate_event_plan` 是唯一从 candidate 构造 `EventPlan` 的入口；通过后返回的
+`EventExecution` 是正式提交直接消费的同一执行证明，不得重放 patch/hook。
+
+`SemanticEvaluationRequest` 不得携带 `EventTrace`、variant/target/expected/actual violation、
+`PatternEvaluation`、`StateEvaluation` 或任何 evaluator truth。declared 的 `EventTruth.role` 只能在
+pattern evaluation 之后从 `actual_bindings` 机械回填；instruction-only 的 role 机械为 `position_NNN`。
+`EventTrace.events` 只接受 `EventTruth`，不接受 `EventDraft`。
+
+`ProjectionRequest` 不复制 `PatternEvaluation`。`ProjectedSequence` 只是 dedup 与下游前载体；
+只有 M11 用最终 `PipelineItem` 组装的 `SequenceRows` 才是 main/primary 最终行与计费真值。
+replay 必须在此后只从 source `SequenceRows.primary_stream_rows` 派生，不得从 pre-downstream
+Record 或 `ProjectedSequence` 构造。
+
+`GenerationServices` 是唯一运行服务根；`DeliveryServices` 不复制 `RunContext`。为协作者派生的
+`RunContext.cfg/llm/schema_engine/metrics` 必须与 `GenerationServices` 对应对象身份相同，只新建 rng 与
+batch number。`AttemptTransaction.items` 是当次 attempt 内唯一可变 item 真值；
+`DownstreamAttemptResult` 不复制 items 或 Schema stats。dataset counter delta 属 attempt-local；LLM usage、
+retry、latency、SchemaEngine resolved-at 与 trace 是全局运行事实，不随事务回滚。
+
+`SequenceDeliveryEmitter.prepare_product` 是 `delivery_digest` 的唯一属主：它只计算一次并写入
+report 的深拷贝。`GenerationProduct` 不复制 digest 或 manifest input；`commit` 只从深度冻结的
+`product.report.delivery_digest` 构造 manifest，不得重算第二份摘要。缺失或格式非法必须在打开 `.part`
+前以 `generation_downstream_contract` 终止。
+
+复杂接口使用冻结 request dataclass，函数不超过五个参数；全部接口声明须有 doxygen style 中文 docstring。
+generation 包不导出旧函数名或参数转换 wrapper。

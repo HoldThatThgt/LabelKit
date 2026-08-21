@@ -60,29 +60,16 @@ command <cmd> failed: <message> (exit <n>)       # 未预期异常
 
 配置错误另经 stdout/stderr 打印聚合抬头 `ConfigError: {n} config error(s) (all aggregated)` 加逐条错误行（3.1.5），`validate` 通过时打印一行 `configuration valid`。
 
-**v1.13 零增量声明（时间流生成）**：本目录对时间流生成形态**零改动**——**零新通道**（通道枚举维持 11 值；蓝图、帧实现与噪音批三类调用经既有 `llm.call` 完全可见，generate 专属通道列 8.4 演进候选）、**零新事件**（不新增任何事件名，既有事件的 payload 亦不增键）、**零新错误 kind**（7.6 词表不动：蓝图/实现的结构失败复用 `schema_violation`、预算面复用 `context_overflow` / `output_truncated`，且这些失败**不产生记录级 StageError**——序列直接作废，留痕在 `report.generate.stream.*` 计数与值-free 的 stderr WARN，3.6.5）。
+**v1.18 sequence generation 声明。**通道枚举维持 11 值，不新增 generate 专属通道或事件名。
+scenario seed、baseline/variant event plan、frame render、semantic evaluation、noise render 与 noise
+evaluation 的真实调用均通过既有 `llm.call`、usage 与 latency 面可见；同一逻辑入口内的 L3 repair
+和 provider retry 仍由既有 schema/usage 计数表达。
 
-**v1.14 零增量声明（帧类构成档位与时间字段回填）**：两机制对本目录同样**零改动**——**零新通道**（通道枚举维持 11 值）、**零新事件**（不新增事件名，既有事件的 payload 亦不增键——档位面的全部观测经 `report.generate.stream.tiers` 承载、时间字段面零观测增量）、**零新错误 kind**（7.6 词表不动：蓝图覆盖违约是普通的 L2 违规，复用 `schema_violation` 进 M8 修复环，穷尽后复用既有的序列作废语义与 `plan_failures` 计数）。M1 侧新增的三条 WARN（配分零额、帧类未入档、绑定字段携带额外约束关键字）走既有的配置告警面（3.1.5），值-free 纪律不变——类名、帧类名、字段名与关键字名均为配置量而非数据内容。
-
-**v1.15 零增量声明（按类档位表）**：按类化对本目录同样**零改动**——**零新通道**（通道枚举维持 11 值）、**零新事件**（不新增事件名，既有事件的 payload 亦不增键：档位面的全部观测仍只经 `report.generate.stream.tiers` 承载，v1.15 改的是该子块的形状与其计数器键名，两者都不进事件目录）、**零新错误 kind**（7.6 词表不动）。M1 侧新增的按类表前提三子款（形态门 / 全局锚 / 空表拒收）走既有 CONFIG_ERROR 面，逐生效表化后的两条既有 WARN（配分零额、帧类未入档）走既有配置告警面（3.1.5），值-free 纪律不变——序列类名与帧类名同为配置量而非数据内容。
-
-**v1.16 零增量声明（序列规则与联合规划）**：本目录继续维持既有通道枚举、事件名与
-`StageError.kind` 闭集。CP-SAT planner 只使用值无关的英文 stderr WARN/ERROR，M1 的
-`INFEASIBLE` / `UNKNOWN` 属于配置错误聚合而不是 trace 事件；`MODEL_INVALID` 与通过
-M1 后发现的 planner 不变量破坏复用 `internal_error` 退出面。noise 目标未完全放置只发
-一次值无关 WARN。sequence-validator 异常日志只含 hook 引用与异常类型，违规日志只含
-序列索引、类名和违规数；declarative 作废日志只含序列索引与类名。任何 planner witness、
-时间表、correlation 值、规则文本、窗口文本、hook message、payload、prompt 和 API key
-都不得进入 stderr、trace、report 或 artifact。所有生成调用仍经既有 `llm.call` 事件可见，
-不建立 generate 专属通道。
-
-**v1.17 增量声明（场景规划与精确交付）**：通道枚举维持 11 值、零新事件名——planner 摘要
-（plan digest、status、objective、family stats 与 assumption names）在 EventLog 建立后并入
-既有 `run.start` payload（`ScenarioPlan` 在 M1 创建，此时 EventLog 尚未构造，故不新增虚假的
-planner 事件；planning 失败发生在 trace 生命周期之前，不承诺留下 trace 文件或 planner
-event，3.10.3）；trace 不记录 hook payload、quota 内容样本或 credential。错误面增量见 7.6
-——四个 planner 异常与 delivery 耗尽是运行级/启动期异常面，不进记录级 `StageError.kind`
-词表，也不产生 rejects 行（exact delivery 的失败按 13 桶只进 report，6.4）。
+普通 stderr 只记录 slot key、attempt index、stage、error kind、计数、profile 与 duration。
+prompt、world state、JSON Patch、payload、ActorView、模型响应内容与 API key 禁止进入 stderr、
+report、manifest 或异常文本；密钥环境变量名可按既有密钥池契约出现，但密钥值在任一通道与档位
+都禁止出现。只有 `trace.content = "full"` 的既有独立 trace 通道可以记录生成审计内容，并继续承担
+7.4 的完整隐私警告。`DeliveryError` 只含 slot identity、attempt count 与 error kind。
 
 † `reason` 仅当 `quality.judgment_reasons` 生效时存在（5.2）；`classify.decision` 的 `reason` 条件独立（v1.7）= `trace.enabled = true` 且 `trace.channels` 含 `"classify"`（零额外 token 原则，3.13.4 调用与校验行）；`segment.boundary` 的 `reason` 条件同款（v1.8）= `trace.enabled = true` 且 `trace.channels` 含 `"segment"`（对应窗口内部 Schema 的 with_reason 参数，零额外 token，3.14）。¶ `stitch.judge` / `stitch.thread` 的 `task_name` 与 `reason`（v1.9）无请求条件——`stitch_schema()` 恒含两键（判定量级小、votes 聚合需按多数簇取值，3.16.3），但作为 LLM 自由文本受 7.4 分级：`none` 档剥除、`refs` 档起携带（`task_name` 为 v1.9 新增自由文本键，7.4）。‡ / § 为 `extract.step` 的内容分档标记（v1.8，S27）：`description` 自 `"refs"` 档起、`target` / `value` 自 `"excerpt"` 档起携带（7.4）。全部自由文本字段（reason / critiques / violations 文本）受 7.4 脱敏档位控制。密钥相关事件（v1.6）只携环境变量**名**——密钥值在任何档位、任何通道均不落日志（7.4 规则不变）。
 
@@ -170,19 +157,55 @@ jq -s '[.[] | select(.ev=="quality.judgment") | .payload.judgments[]
 | `provider_fatal` | 运行级 | M9 不可重试错误。400/404 等计入连续熔断计数，连续达阈值 ⇒ 退出码 4；**401/403 认证类立即熔断**（v1.5，3.9.3）。v1.6 密钥池：认证失败先按密钥禁用（`llm.key_disabled`），池内尚有存活密钥时不产生本错误、不计入熔断——仅当禁用的是该 profile 最后一把存活密钥时才抛出并立即熔断（3.9.3 密钥池行）。 |
 | `internal_error` | 记录级 | 任何未预期异常（含 M11 终检失败）；记录 failed，堆栈入日志（debug 级）。 |
 
-v1.11 两注：① M8 L3 修复调用内的 precheck 溢出**不落本词表**（V25①：该轮记修复失败并短路至耗尽，reject 归因维持 `schema_violation` / `callback_violation`，3.8.2）；② z.ai 扩展终止值 `sensitive` / `network_error` 及未知值不做专项处置（V11③——沿现行管线流转，垃圾输出由 M8 校验兜住）。v1.12 注：帧粒度**零新错误 kind**——帧分类失败落 `fallback_class`（不产生 StageError 入信封）、帧标注失败复用既有词表分类（`schema_violation` / `provider_*` / `image_decode_error` / `context_overflow` / `output_truncated` / `internal_error`）仅用于 WARN 日志与计数归因，成员失败**不写 `item.errors`、不入 rejects**（3.5.5/3.13.7；帧 Schema 走内部 Schema 待遇、无 L2.5 ⇒ `callback_violation` 在帧路径不可达）；熔断矩阵零改动——帧调用的 precheck/最小单元不喂连击、reactive-400 终局由属主算子补喂恰一次（A7 同则）。**v1.13 注：时间流生成同样零新错误 kind**——蓝图/帧实现/噪音批三类调用的失败**不产生记录级 StageError**（此时尚无记录：整条序列作废、直接缺席），失败按既有词表分类仅用于值-free 的 stderr WARN 与 `report.generate.stream.{plan_failures, realize_failures}` 计数归因；熔断矩阵零改动——两类调用的 precheck / 不可装填**不喂连击**（V10 先例），reactive-400 终局在作废吞点经共享 `budget.feed_reactive_terminal` 补喂**恰一次**（A7 同则，3.6.5 预算与溢出纪律）。
+v1.11 两注：① M8 L3 修复调用内的 precheck 溢出**不落本词表**（V25①：该轮记修复失败并短路至耗尽，reject 归因维持 `schema_violation` / `callback_violation`，3.8.2）；② z.ai 扩展终止值 `sensitive` / `network_error` 及未知值不做专项处置（V11③——沿现行管线流转，垃圾输出由 M8 校验兜住）。v1.12 注：帧粒度**零新错误 kind**——帧分类失败落 `fallback_class`（不产生 StageError 入信封）、帧标注失败复用既有词表分类（`schema_violation` / `provider_*` / `image_decode_error` / `context_overflow` / `output_truncated` / `internal_error`）仅用于 WARN 日志与计数归因，成员失败**不写 `item.errors`、不入 rejects**（3.5.5/3.13.7；帧 Schema 走内部 Schema 待遇、无 L2.5 ⇒ `callback_violation` 在帧路径不可达）；熔断矩阵零改动——帧调用的 precheck/最小单元不喂连击、reactive-400 终局由属主算子补喂恰一次（A7 同则）。
 
-**v1.17 planner 异常与交付耗尽面（运行级/启动期异常，不进上表记录级词表）**：v1.17 结束 v1.13–v1.16 的「零新错误 kind」惯性——以下四个 planner 异常与 delivery 耗尽经 ConfigError 聚合或 CLI 顶层收口，不产生记录级 StageError、不写 rejects（3.1.5、3.6.5）：
+**v1.18 sequence generation 运行级错误面。**这些 kind 不加入记录级 `StageError.kind`，不写 rejects；
+它们由配置聚合、delivery 状态机或 CLI 顶层收口：
 
-| 异常 / 事件 | 退出码 | 语义与稳定英文 message |
-|---|---:|---|
-| `PlannerInfeasibleError(ValueError)` | 2 | 用户硬约束没有共同解；汇入 ConfigError。INFEASIBLE 时调用 `SufficientAssumptionsForInfeasibility()` 返回「足以导致不可行」的具名 assumption 集合（quota / frame rule / frame window / sequence rule 的自然名称与 `resource:<resource-name>` 键；**不声称最小**），message 形态：`sequence planner infeasible: constraints=[weekday_coverage,navigate_before_clock_out,ticket_request_work_hours]`。静态 arithmetic 错误优先于 solver core，且同一纯检查阶段聚合全部 arithmetic 错误；core 诊断以求解器在 deterministic budget 内**证得** INFEASIBLE 为前提——预算内只能得到 UNKNOWN 时按 `PlannerBudgetError` 上报，不降格、不伪装成 core。 |
-| `PlannerCapacityError(RuntimeError)` | 4 | 模型在**求解前**超过实现容量——quota model 与 timeline model **各自**执行 entries（variables + constraints）≤ 250,000，不能把两个小模型的 entries 相加后误报；错误含 actual / limit / dominant family 与 family 计数，**绝不显示为 INFEASIBLE**。message 模板（英文稳定字段，照抄冻结）：`sequence planner capacity exceeded: model=timeline entries=251891 limit=250000 dominant=crossing families={crossing:170000,session_slot:60000,...}`。不输出「减少 horizon」一类猜测建议——schedule 已是显式硬边界。 |
-| `PlannerBudgetError(RuntimeError)` | 4 | deterministic solve budget（每层 `max_deterministic_time = 10.0` 冻结常数，不放宽换绿灯）内无法冻结最优计划；message 明确 `model=quota\|timeline` 与超时的 layer 名。 |
-| `PlannerInternalError(RuntimeError)` | 4 | solver 解码或冻结计划违反实现不变量（如模型声称有 noise reserve 而 allocator 找不到位置、owner 配对后的实例性校验违反）。 |
-| exact delivery 耗尽 | 1 | 任一 slot Exhausted：继续处理其余 slot（收集全部 exhausted slot）、原子交付已成功部分（主输出 / stream artifact / rejects）、report 标 `delivery.complete = false`，CLI exit 1——与 provider fatal / circuit breaker 的 exit 4 区分。既有 provider 边界保持：provider retryable exhausted 可消耗下一次 delivery attempt；provider fatal 与 circuit breaker 立即 exit 4，不被 quota refill 吞掉。SIGINT 发生在 delivery 期间：停止启动新 attempt、等待已发出的有界调用收束、原子交付已成功部分、`delivery.interrupted = true`、exit 1（收束完成的 attempt 正常记账；放弃的在途 attempt不计入 `attempts` 也不入任何桶；同轮已发生 provider fatal 或 circuit breaker 则 exit 4 优先）。 |
+| kind | 异常 / 处置 | 退出码 |
+|---|---|---:|
+| `generation_config_invalid` | `ConfigError`，静态 program/catalog/hook/路径错误 | 2 |
+| `generation_plan_infeasible` | `ConfigError`，有限硬约束无共同解 | 2 |
+| `generation_plan_budget` | `InternalError`，确定性求解预算内不能完成 | 4 |
+| `generation_plan_internal` | `InternalError`，planner 解码或冻结不变量破坏 | 4 |
+| `generation_dedup_transaction` | `InternalError`，group token 过期、变异或提交不变量破坏 | 4 |
+| `generation_downstream_contract` | `InternalError`，attempt-local 下游事务越界 | 4 |
+| `post_validator_invalid` / `post_validator_exception` | 当前 slot rejection；耗尽后 `DeliveryError` | 1 |
+| `sequence_delivery_exhausted` | `DeliveryError`；停止领取新 slot，不提交任何新成功工件 | 1 |
+| `sequence_projection_mismatch` | 当前 slot rejection；耗尽后 `DeliveryError` | 1 |
+| provider fatal / circuit trip / SIGINT | 立即终止，不提交已接受前缀 | 4 |
+| `generation_commit_io` | `LabelKitError`；旧 manifest 保持不变，固定路径可能已替换子集 | 4 |
+| `generation_failed_report_io` | 保留主异常；无主异常时 `LabelKitError` | 主退出码，否则 4 |
 
-**delivery failure 13 桶闭集**（`report.generate.stream.delivery.failures`，互斥、只记第一个失败阶段、为零也全部在场，枚举序冻结）：`brief`、`realize`、`noise`、`context_overflow`、`sample_validator`、`sample_validator_exception`、`correlation`、`temporal`、`sequence_validator`、`sequence_validator_exception`、`similarity`、`scenario_validator`、`scenario_validator_exception`。brief/realize 的 Schema guarantee、provider retryable exhaustion 与 output truncation 归到当时的 call phase；noise realization 的对应失败归 `noise`；对同一固定 prompt 可证明不变的确定性 precheck overflow 归 `context_overflow`（直接 Exhausted、计入 attempts、不再消耗后续 attempt）。守恒等式：每次完整非 fatal attempt 恰好满足 `attempts = delivered_sequences + delivered_noise + sum(failures.values())`（6.4）。
+下表冻结 `labelkit run` 的 sequence 形态终态；`validate` 与 `run --dry-run` 即使发现 plan 失败也不写
+main、stream、success report、manifest 或 failed report，只返回同一 error kind 与退出码。
+
+| 事件 | 消耗 attempt | 重试 slot | 退出码 | 固定正式路径 | failed report |
+|---|---|---|---:|---|---|
+| Schema、state、pattern、coupling、semantic 失败 | 是 | 是 | 耗尽为 1 | commit 前不替换 | 耗尽时原子写 |
+| dedup、quality、annotate、verify、reconcile 拒绝 | 是 | 是 | 耗尽为 1 | commit 前不替换 | 耗尽时原子写 |
+| `output_truncated`、可恢复 context overflow、provider retryable exhausted | 是 | 是 | 耗尽为 1 | commit 前不替换 | 耗尽时原子写 |
+| provider fatal、auth pool exhausted、circuit trip | 否 | 否 | 4 | commit 前不替换 | 已解析路径时 best-effort 原子写 |
+| SIGINT / CancelledError | 否 | 否 | 4 | commit 前不替换 | 已初始化 run 时 best-effort 原子写 |
+| 启动期配置、hook、catalog 或路径验证错误 | 否 | 否 | 2 | 不替换 | 不写，运行尚未成立 |
+| 输出目录或 `.part` 不可写 | 否 | 否 | 4 | 不替换 | 尝试同目录写；不可写则只记英文 stderr kind |
+| plan infeasible | 否 | 否 | 2 | 不替换 | 原子写 |
+| plan budget 或 planner internal | 否 | 否 | 4 | 不替换 | 原子写 |
+| 任一固定正式路径的 commit-I/O 失败 | 否 | 否 | 4 | 可能已替换子集，旧 manifest 不变 | best-effort 原子写 |
+| failed report 写入失败 | 否 | 否 | 不改主退出码 | 不改主结果 | stderr 记录英文 kind |
+
+slot/noise attempt 的最终停止边界只进入 `report.generate.sequence.rejected_attempts` 的一个桶。
+sequence 桶按序为 `scenario_schema`、`event_schema`、`post_validator_invalid`、
+`post_validator_exception`、`state_transition`、`frame_schema`、`coupling_evaluation`、
+`pattern_evaluation`、`state_evaluation`、`semantic_evaluation`、`sequence_memory_budget`、
+`context_overflow`、`output_truncated`、`provider_retryable_exhausted`、`dedup`、`quality`、
+`annotate`、`verify`、`reconcile`；noise 专用桶为 `noise_schema`、`noise_semantic`、
+`noise_similarity`、`noise_memory_budget`、`noise_context_overflow`、`noise_output_truncated`、
+`noise_provider_retryable_exhausted`。provider fatal、plan 与 commit-I/O 只写 `terminal_error_kind`。
+
+成功 commit 前的任何失败均不替换 main、stream、成功 report 或 manifest。commit-I/O 可能留下
+固定路径混代，但旧 manifest 不变，消费者必须以摘要失配拒绝读取。failed report best-effort 原子写，
+`artifacts_committed = false` 只表示没有可信任的新 manifest，不声称固定路径绝无部分 rename。
 
 ## 7.7 进度显示与结束摘要（v1.10：三态 console）
 
@@ -253,7 +276,39 @@ generate_only：批进度区退化为 `generate ▶ calls i/N · produced n`（c
 | 层 | 要求 |
 |---|---|
 | 单元 | L1 确定性修复穷举样例集（围栏/截断/单引号/尾逗号/前后缀噪声）；BT 拟合对已知解析解（两元素、全胜、tie-only）误差 < 1e-4；配对采样在固定 seed 下逐字节可复现；UI 配对表（图 3-1）全分支：冲突/缺对/跨目录/前导零。 |
-| 集成 | 以 mock provider（录制响应）跑通 2.3.1 全部组合矩阵；断言 report 不变量、主输出全行过用户 Schema、rejects=refs 时文件不含任何输入内容子串。 |
-| 契约 | 对真实 API 的 probe 冒烟（CI 可选）；结构化输出 L0 关闭/开启两态等价性（最终输出结构一致）。 |
+| DeepSeek | 禁止 mock transport、录制响应与本地 LLM server。Anthropic `deepseek-v4-flash` 以 `supports_structured_output = false` 真实交付一个 declared set 的四个 variant；断言 envelopes/variant 恰为四项、protected prefix 耦合、patch 可重放、actual violations 精确、hidden sentinel 不泄漏、1/1 set、4/4 sequences、各 profile usage 非零。production body 必须精确含 `"thinking": {"type": "disabled"}` 且不含 tools/tool_choice。instruction-only 另跑非空 slot，断言 main 恰一条，scenario seed/event plan/frame render/semantic evaluation/token usage 全部大于零，truth 不伪造 pattern、variant 或 expected violation。 |
+| failure injection | 在 production `CrossViewReconciler` 边界装饰一次性 rejection：attempt 0 完成生成、全部 evaluator、全部启用下游和原 reconciler 后，wrapper 才返回固定拒绝；attempt 1 完全委托原实现。两次 observed attempt index 恰为 `{0, 1}`，各含完整四 variant，最终 `sequence_slot_attempts = 2`、injected rejection = 1、1 set/4 sequences，attempt 0 零 output/dedup/dataset commit，usage calls ≥ `2 * estimate.successful_attempt_lower_bound`。另一真实用例只在 EventPlan production state 后置验证边界注入一次 violation，断言目标 `ValidatedGenerationCall.resolved_at` 匹配 `l3_[12]`，正式提交消费的 `EventExecution` 与最后一次成功后置验证返回的是同一冻结实例；不与另一场无注入 live run 比较。两者均保留真实网络、LLMClient、SchemaEngine 与下游事务。 |
+| structured output | z.ai Anthropic `glm-5.2` 真实覆盖 ScenarioSeed、EventPlan、frame 与 SemanticEvaluation 四类组合 Schema：单一强制 tool、`input_schema` 与当次 Schema 深等、`tool_choice` 强制该 tool、thinking 与 profile 声明的 body 形状精确相等、真实 `LLMResponse.structured` 非 null，prompt/completion token 均大于零。DeepSeek 与 z.ai marker 独立；缺某 endpoint key 只跳过对应 marker，不得把跳过当通过。 |
+| example / replay | `examples/sequence-generation` 主例固定 main 8、primary events 22、noise 2、replay 3、stream 27；主输出全行过 Schema，report/manifest 摘要一致。普通 process replay 固定 scanned 27、absorbed 25、dropped_noise 2、episodes 9、dropped_dup 1、emitted 8、failed 0，且重复必须由普通 M3 内容判重。 |
+| secret | 两个 endpoint 的 API key value 只作内存 sentinel；捕获的 stderr、trace、main、stream、report、manifest、failed report 与 pytest failure message 均做布尔泄漏检查。失败断言只输出固定英文消息，不把 sentinel 放入 assertion repr。 |
+| sequence 人工门 | 发布抽取 `min(50, delivered_sequences)`，少于 50 全量；开发主例 8 条全量双人盲审，最终发布至少 13 sets / 52 sequences。隐藏 variant truth，检查不可解释状态跃迁、actor 提前知情、模板拼接、等待语义与 set 前缀一致性；任一隐藏知识泄漏/不可能跃迁，或同一缺陷维度跨至少两个独立 scenario，均阻断；其余明显不真实比例 ≤ 10%，分歧由第三人裁决。`docs/dev/evidence/v1.18-sequence-realism-review.jsonl` 首行写 artifact digest、selection seed、样本数、评审人数与解盲时间；逐条写 sequence/scenario id、评审者假名、五维 verdict、value-free defect codes、总 verdict、adjudicator 与 adjudication verdict，不写完整 payload、用户数据或 secret。 |
 | 日志（v1.1 新增） | trace 每行可被 `json.loads` 解析且恰含 ts / run_id / batch_no / stage / ev / record_ids / payload 七字段；对 7.2 事件目录逐事件断言 payload 字段齐全；首行为 run.start 且携带 trace_schema_version=1；`trace.content="refs"` 时 trace 文件不含任何输入内容子串（与 rejects=refs 同法断言）；注入写失败（不可写路径 / mock OSError）断言运行不中断、warn 恰打印一次、`report.trace.dropped_events` 计数正确。 |
-| console（v1.10 新增） | 定宽渲染快照断言（`Console(width=100, force_terminal=True)`，喂 MetricsSink 计数器状态而非 LLM 响应——不违反真实 LLM 测试纪律）：九态账 / 密钥池三态 / 熔断横幅 / 中断横幅 / 窄终端退化 / generate_only 形态 / `l`·`e` 展开态；**回归锚（三层，U24——实跑逐字节 diff 经 refute 审计证伪：行携时间戳与 duration_ms、温度 0 端点非逐字节确定）**：① 单元层——固定时钟注入下 plain 行格式纯函数（`console_format`）黄金快照逐字节断言；② dry-run 层——examples **五目录八工程**（v1.13 起：text 两工程 / ui / stream 两工程 / mix 两工程 / synth-stream；v1.12 为四目录七工程）`--dry-run --console plain` 的 stderr 估算行（无时间戳字段）逐字节 diff 为空（**八个黄金文件**入库、离线套件逐运行钉死——`dryrun-mix.txt` / `dryrun-mix-text.txt` 为 v1.12 新增的 mix 主/姊妹双工程 golden，`dryrun-synth-stream.txt` 为 v1.13 新增的时间流生成工程 golden；**v1.13 的七个既有 golden 字节不动**——估算行格式零改动，三类生成调用全折入 `generate_calls`，3.10.3 时间流生成行；**2026-08-14 代码规则整改把八个黄金文件整体重冻结**到英文估算行与英文注记行上——键、键序、数值与行序全部不变，仅文案语言变，此后八文件继续逐字节钉死）；③ 实跑层——八工程实跑 stderr 归一化（时间戳/耗时/token/延迟/计数值 → 占位符，cargo 测试套 `[ELAPSED]` 遮蔽同法）后与基线**结构等价**（行序与固定文案逐字节一致）；`log_format="jsonl"` 下 stderr 逐行可解析且显式 rich 被拒并 WARN；降级注入：渲染 tick 抛异常 ⇒ 运行照常完成、退出码不变、恰一条 WARN、自动转 plain（rich 档下 emitter 已静态让位——余下 plain 进度/摘要行由渲染器以 `console_format` 续打，q 脱离同路径）；键盘：伪 TTY 注入键序断言 `q` 脱离 / `p` 暂停期日志照常 / termios 属性退出后逐字节复原 / cbreak 下 Ctrl-C 仍触发 SIGINT 优雅中断；协议：`listener=None` 路径零行为变化、全回调 O(1) 无 I/O。 |
+| console（v1.10 新增） | 定宽渲染快照断言（`Console(width=100, force_terminal=True)`，只喂 MetricsSink 计数状态）：九态账、密钥池三态、熔断/中断横幅、窄终端退化、generate_only 与 `l`/`e` 展开态。三层回归锚保持：固定时钟下 `console_format` 逐字节 golden；examples 五目录的八份 `--dry-run --console plain` golden，其中 sequence 形态固定为 `dryrun-sequence-generation.txt`；真实运行 stderr 只在归一化时间戳、耗时、token、延迟与计数后比较结构。另断言 jsonl 可逐行解析、rich 冲突 WARN、渲染异常一次 WARN 后降级 plain、`q`/`p`/Ctrl-C 与 termios 恢复、`listener=None` 零行为变化、全部回调 O(1) 无 I/O。 |
+
+sequence 的真实命令门固定为：
+
+```bash
+cd examples/sequence-generation
+mkdir -p out
+uv run labelkit validate --config config.toml --project project.toml --console plain
+uv run labelkit run --config config.toml --project project.toml --dry-run --console plain
+set -a
+source ../../.env
+set +a
+uv run labelkit validate --config config.toml --project project.toml --probe --console plain
+uv run labelkit run --config config.toml --project project.toml --console plain
+uv run python check_output.py
+uv run labelkit run --config config.toml --project project-replay.toml --console plain
+uv run python check_output.py --replay
+uv run labelkit run --config config.toml --project project-instruction-only.toml --console plain
+uv run python check_output.py --instruction-only
+cd ../..
+uv run --python 3.12 pytest -q -m 'not integration'
+uv run --python 3.12 pytest tests/integration/test_sequence_generation_llm.py -q \
+  -m 'integration and deepseek'
+uv run --python 3.12 pytest tests/integration/test_sequence_generation_structured_output_llm.py -q \
+  -m 'integration and zai'
+```
+
+最终代码或配置变化后须重跑完整 offline、DeepSeek integration、structured output、主例、
+instruction-only 与 replay。429、5xx 或额度耗尽是环境失败；slot exhaustion 是产品失败，不得靠重跑抹去。
