@@ -27,7 +27,7 @@ flowchart LR
 
 - declared 模式显式声明完整帧组、完整顺序、每个相邻角色的最大间隔和序列总跨度。
 - positive、missing、reordered、interval_exceeded 都由同一个模式派生。
-- 同一反事实集合共享完整 ScenarioSeed；目标点前的 EventTruth 全量复用。
+- 同一反事实集合共享完整 ScenarioSeed；目标点前的 EventDraft 全量复用，判定后派生相同 EventTruth。
 - declared 模式中，LLM 每次只看到当前 actor 被授权读取的状态与已经发布给它的历史。
 - JSON Patch 在副本上原子执行；每一步经过基础状态 Schema、可选前置 Schema 和可选 state validator。
 - PatternEvaluator 从最终事件重新绑定实际角色，不读取 planner 的角色 witness。
@@ -77,7 +77,7 @@ flowchart LR
 ### 2.4 反事实耦合
 
 每个 slot attempt 都先完整生成并判定一条 positive baseline，即使配置没有交付 positive 变体。
-每个反例的最早目标点之前复用完整 EventTruth：
+每个反例的最早目标点之前复用完整 EventDraft，结构判定后再派生 EventTruth：
 
 - actor、intent、logical_time_us、ActorView、JSON Patch、状态哈希和 rendered payload 完全相同。
 - event_key 相同；world_branch_id、event_id 和投影 timestamp 按分支重新派生。
@@ -124,6 +124,7 @@ duplicate 的单位冻结为完整序列 replay，不是单事件。每条 repla
 | variant | positive、missing、reordered 或 interval_exceeded |
 | ScenarioSeed | initial_state、actors、shared_facts、style 和 time_context 的冻结对象 |
 | ActorView | 当前 actor 被允许读取的状态和此前发布给它的事件快照 |
+| EventDraft | 逐事件生成期的完整事件草稿；没有 role，不声明结构判定结果 |
 | EventTruth | 一个事件的角色、actor、时间、视图、意图、patch、状态哈希和载荷 |
 | EventTrace | 一个 world branch 的初始状态、顺序 EventTruth、最终状态和判定 |
 | delivery slot | 一个 counterfactual set 与 scenario_index 的精确提交单位 |
@@ -612,13 +613,18 @@ flowchart TD
     B --> J["baseline mechanical + semantic evaluation"]
     J --> V["按 variant 声明序构造 branch"]
     V --> C{"位于 protected prefix?"}
-    C -- 是 --> R["复用 EventTruth，重派生 branch id/time"]
+    C -- 是 --> R["复用 EventDraft，重派生 branch id/time"]
     C -- 否 --> P["逐事件 plan/execute/render"]
     R --> E["branch evaluation"]
     P --> E
 ~~~
 
 variant 若为 positive，直接使用 baseline branch。若配置无 positive，baseline 不进入主输出或下游，但仍必须完整通过生成侧判定。
+
+逐事件循环每成功执行并渲染一个事件就构造 EventDraft。它包含后续 actor history、状态重放和 semantic review 所需的
+全部事件内容，但刻意没有 role。declared branch 完成全部 draft 后，PatternEvaluator 只从其 ObservedEvent 投影重新绑定
+actual role；通过后才为每个 draft 增加该唯一 role 并构造 EventTruth。instruction-only 不运行 PatternEvaluator，
+由位置机械增加 position_NNN role。EventTrace 只接受 EventTruth，不接受 EventDraft。
 
 ### 9.3 ActorView
 
@@ -644,7 +650,7 @@ state_instruction、frame instruction、pre-state Schema 摘要和允许的 JSON
 它不接收完整 initial_state、其他 actor goal 或 hidden shared fact。
 
 instruction-only 的 EventPlanner 接收该 instruction slot 的完整 generation instruction、冻结 sequence length、
-完整当前 state、完整既有 history，以及 ScenarioSeed 中按声明序排列的 actor goal/identity/style profile，并在 truth 中
+完整当前 state、完整既有 EventDraft history，以及 ScenarioSeed 中按声明序排列的 actor goal/identity/style profile，并在 truth 中
 明确 semantic knowledge guarantee。它在选择 actor 之前没有 ActorView；请求中的 actor_view 固定为 null，actor
 选定后再从完整 history 构造供 FrameRenderer 使用的 ActorView。declared 请求的 actor_view 必须非 null，
 visible_state、history 与 actor_profiles 固定为 null；其 prompt 只能读取 ActorView 与 public facts。
@@ -729,12 +735,13 @@ path 的祖先或后代、或根路径 binding 都在 M1 拒绝，避免声明�
 
 instruction-only 没有 RoleSpec，EventExecutionContext 从 program/slot 解析出的 role 固定为 null；StateExecutor 跳过不存在的 root containment、
 pre-state Schema、publish_roots 和 observers，只执行 patch operation 闭集、test 前缀、原子 JSON Patch、基础 state Schema
-与可选 state validator。该模式没有 payload binding；后续 actor history 直接来自完整既有 EventTruth。
+与可选 state validator。该模式没有 payload binding；后续 actor history 直接来自完整既有 EventDraft。
 
 ### 9.7 protected prefix
 
-复用 EventTruth 时，state patch 在新的 branch initial_state 上重新执行，并校验 before/after hash 等于 baseline。
-payload、ActorView、intent、actor、frame_class、role、logical_time_us 与 baseline canonical bytes 相同。
+复用 EventDraft 时，state patch 在新的 branch initial_state 上重新执行，并校验 before/after hash 等于 baseline。
+payload、ActorView、intent、actor、frame_class、logical_time_us 与 baseline canonical bytes 相同；PatternEvaluator
+通过后派生的 protected-prefix EventTruth.role 也必须相同。
 event_key 相同；event_id、owner_sequence_id、world_branch_id 和 artifact timestamp 不属于复用字节。
 
 CouplingEvaluator 独立比较 protected prefix。任何一个受保护字段改变都产生 coupling_violation，并使整个 attempt 失败。
@@ -1027,7 +1034,7 @@ estimate 和 console 的调用键按下列顺序冻结：
 | scenario_seed_calls | llm initial_state source 的 seed 调用 |
 | baseline_event_plan_calls | baseline 新事件规划 |
 | variant_event_plan_calls | causal suffix 新事件规划 |
-| frame_render_calls | 新 EventTruth 的 payload 渲染 |
+| frame_render_calls | 新 EventDraft 的 payload 渲染 |
 | semantic_evaluation_calls | baseline/交付 branch 语义判定 |
 | noise_render_calls | noise 精确槽 |
 | noise_evaluation_calls | noise 独立语义判定 |
@@ -1314,6 +1321,7 @@ DeliveryError 新增到 labelkit/common/errors.py，不继承 ConfigError。异�
 | ActorView | `actor`, `goal`, `read_state`, `observations`, `logical_time_us`, `wait_since_previous_us` |
 | EventPlan | `frame_class`, `actor`, `intent`, `patch` |
 | EventExecution | `state_before`, `state_after`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `normalized_patch` |
+| EventDraft | `event_key`, `event_id`, `frame_class`, `actor`, `logical_time_us`, `timestamp_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
 | EventTruth | `event_key`, `event_id`, `role`, `frame_class`, `actor`, `logical_time_us`, `timestamp_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
 | ObservedEvent | `event_id`, `frame_class`, `timestamp_us` |
 | SemanticReviewEvent | `frame_class`, `actor`, `logical_time_us`, `wait_since_previous_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
@@ -1365,6 +1373,8 @@ docs/CONTRACTS.md 冻结上述每个字段的完整 Python annotation、`T | Non
 default_factory、constructor positional order 与 frozen 属性；这里只列字段顺序不是放宽类型。除公共配置明确声明的
 缺省和 CallScope 等既有公共默认外，generation 内部 request/result 的可空字段也必须由调用者显式传 null，不得用
 隐式 default 形成第二套构造面。类型测试以手写 literal manifest 为期望，不从生产 dataclass 反向生成期望。
+EventExecutionContext.history 固定为 `tuple[EventDraft, ...]`；EventPlanRequest.history 固定为
+`tuple[EventDraft, ...] | None`，且只在 instruction-only 非 null。EventTruth 不得作为逐事件生成期 history carrier。
 
 NoiseSlot 只描述独立 noise 事件；ReplayLayout 只描述一次完整 replay 的 source、variant、ordinal、session 与逐事件 timestamp。
 两者均不进入 ScenarioBlock。ReplayLayout.timestamps_us 的长度必须等于 source positive sequence 的事件数，且 source
@@ -1901,6 +1911,8 @@ hidden_sentinel 不泄漏、replay 同源和 report/manifest digest。
 - catalog 两行按声明序产生稳定的 catalog_row_index；同一 slot 连续失败重试时索引不变，也不读取下一行。
 - instruction-only 的 PlannedEvent 不含 frame_class/actor；EventPlanRequest.actor_view 为 null，EventPlan 才在闭集内
   产生 frame_class/actor，随后 renderer ActorView 与 EventTruth 只使用这一个选择结果。
+- declared 逐事件生成的 history 只能包含 EventDraft，且 dataclass 中不存在 role 字段；PatternEvaluator 通过前构造
+  EventTruth 必须失败。actual_bindings 完整覆盖 event_id 后才逐项生成 EventTruth，缺失、重复或额外 binding 都 fail closed。
 - NoiseSlot 与 ReplayLayout 各自做 canonical JSON round-trip，ID、session、source slot 与 replay timestamps 不借用
   PlannedEvent sentinel，且 replay timestamp 数量与 source 事件数不等时 fail closed。
 
