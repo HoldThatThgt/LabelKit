@@ -1884,8 +1884,10 @@ project-replay.toml 读取 27 行 stream，process replay 的冻结目标：
 | emitted | 8 |
 | failed | 0 |
 
-check_output.py 只读工件并断言全部精确恒等式、patch 重放、pattern violations、main/stream 双向对账、
-hidden_sentinel 不泄漏、replay 同源和 report/manifest digest。
+check_output.py 只读用户可见工件并断言全部精确恒等式、pattern violations、main/stream 双向对账、
+hidden_sentinel 不泄漏、replay 同源和 report/manifest digest。世界 state 与 patch 按第 11 节不写训练工件；
+patch 重放由第 22.3 节离线测试与第 23.1 节真实集成测试直接读取 attempt 内存 EventTrace 完成，不能让
+example checker 假装从不可见字段获得证明。
 
 ## 22. 离线验收
 
