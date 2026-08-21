@@ -347,3 +347,61 @@ M6 不改变 artifact 的 truth 键集、主输出 Schema、Record/session/id �
 通道。规则和窗口不复制到工件；report 仅在实际非零配额类的生效面出现 `rules`、可选
 validator 计数与 `windows.calendar_days_spanned`，并置于既有 `tiers` 后、`frames` 前。
 `MODEL_INVALID` 或 M6 发现已通过 M1 的模型不变量被破坏时走既有 `InternalError` / 退出码 4。
+
+### 3.6.7 v1.17 场景规划与精确交付
+
+时间流生成形态在 v1.17 重写为「M1 冻结计划 + M6 有界精确交付」：M6 不再规划、不再交织、不再按尝试配额静默作废——它消费 `ResolvedConfig.scenario_plan` 的只读布局，把每个交付槽位跑一个有界状态机直到 quota 精确交付或预算耗尽。3.6.5 的 `plan_stream` / `weave_stream` 计划期与交织器公开面、3.6.6 的联合规划入口按 v1.17 裁决退出生产路径（历史段保留为版本史）——时间戳铺设、会话装配、交叉与 noise 槽选取由 ScenarioPlanner 在 M1 冻结；直装组装、工件行定稿、`time_fields` 回填与序列信封构造延续为 M6 职责。平面生成路径（3.6.2）与本节零交互。裁决详表见 `docs/dev/SPEC-scenario-planning.md`。
+
+**ScenarioPlan 只读消费**：`slots` / `layouts` / `sessions` / `noise_slots` / `duplicates` 全部只读——length 已在 slot 构建时冻结为 `SequenceSlotSpec.length_target`，帧类词、时间戳、duration、session 归属、noise 槽与 duplicate source / 平移布局均已由 M1 定稿（3.1.4.2）。交付失败只重试该槽位的内容生成，绝不重排时间、不重选 duplicate source、不回填其他 class、不触发任何再规划。受约束路径 LLM 只被问 **per-position briefs**：沿用 `brief_schema(length)`（3.8.5）只取逐位 `{brief: string}`，帧实现复用 `realize_schema`——帧类词与时间轴不由 LLM 决定。
+
+**delivery 状态机（每个 sequence slot 与 noise slot 独立运行）**，attempt 预算 = `generate.stream.max_attempts_per_slot`：
+
+```text
+Pending → Brief → Realize → Validate → Delivered（终态）
+Brief / Realize / Validate 失败（违规或 provider 可重试失败）→ Pending：重跑同一 slot 的完整 brief + realization
+Brief / Realize → Exhausted（终态）：对同一固定 prompt 可证明不变的确定性 precheck context overflow 捷径
+Pending → Exhausted（终态）：attempts == max_attempts_per_slot
+```
+
+边注是概览；失败桶的唯一定义是下方 13 桶闭集——Validate 阶段任一子过滤器（sample / correlation / temporal / sequence / scenario / similarity）违规都走同一条 Validate→Pending 回边，桶按「只记第一个失败阶段」取。每次回到 Pending 都重跑完整 brief + realization：frame word、timestamps、duration、session、quota 与 noise slot 不变；accepted payload 不回滚。「delivered sequence」唯一表示 M6 已接纳该 sequence、写入 replay artifact 并交给下游 stage——因此 `delivery.delivered_sequences == counts.generated`；quality / annotate / verify 可以让最终 `counts.emitted` 更低，但不得反向触发 M6 refill，也不改变 quota 已交付事实。
+
+**过滤顺序（冻结）**：schema guarantee → `sample_validator` → correlation / temporal replay → `sequence_validator` → similarity filter probe → `scenario_validator` against accepted prefix → commit similarity state and accept。similarity probe 与 commit 分离——scenario violation 不得污染 similarity filter。
+
+**13 桶 failure 闭集与守恒等式**：delivery attempt 只记第一个失败阶段，failure bucket 是互斥闭集，report 中即使为零也全部在场（枚举序冻结）：
+
+```text
+brief, realize, noise, context_overflow,
+sample_validator, sample_validator_exception,
+correlation, temporal,
+sequence_validator, sequence_validator_exception,
+similarity,
+scenario_validator, scenario_validator_exception
+```
+
+brief / realize 的 Schema guarantee、provider retryable exhaustion 与 output truncation 归到当时的 call phase；noise realization 的对应失败归 `noise`；确定性 precheck overflow 归 `context_overflow`；provider fatal 与 circuit breaker 立即 exit 4、不进入 failure bucket。每次非 fatal attempt 恰好满足 `attempts = delivered_sequences + delivered_noise + sum(failures.values())`。
+
+**slot 顺序与 commit 纪律**：处理顺序固定为 `ScenarioPlan.slots` 顺序——全部 sequence slot 后接全部 noise slot；duplicate 是零 LLM 的工件布局，不进入 delivery attempt 顺序。同一 attempt 内可按 profile 并发调用，但 acceptance 与 similarity filter commit 必须回到 slot 顺序——网络完成顺序不影响结果。
+
+**noise delivery**：每个冻结 noise slot 按同一 `max_attempts_per_slot` 调其帧类 realization——**structured noise 复用 frame class 的 instruction 与 JSON Schema**，Schema 解析、预算检查和 realization 复用 task frame 路径（3.8.6）。noise 不走 sequence / scenario validator，仍走 Schema、`sample_validator` 与 similarity filter（structured payload 先投影为 canonical JSON 字符串，再传 `sample_validator(text)` 与相似度过滤）。noise slot 的失败归桶与 sequence slot 同用闭集与「只记第一个失败阶段」：realization 调用段（Schema guarantee、provider retryable exhaustion、output truncation）归 `noise` 桶，之后的 sample validator / similarity 违规各自归 `sample_validator` / `similarity` 桶；noise acceptance 也按 slot 顺序 commit。truth 语义：`truth.noise = true`、`truth.frame_class = <实际类名>`、`sequence_class` / `sequence` / `tier_rank` 为 null（6.5）。
+
+**`scenario_validator` 增量校验**：输入为 `ScenarioValidationInput{accepted, candidate}`——candidate 是本次唯一可拒绝项（当前交付槽位对应的 `ScenarioSequence{slot_key, sequence_class, start, end, frames}`），accepted 按时间、slot key 排序。非空违规只拒绝 candidate 并重试同一 slot：既有 accepted 不回滚、不重排。hook exception 与非法返回值都按 candidate violation 处理、WARN once、计入独立失败原因（`scenario_validator` / `scenario_validator_exception` 桶）。M1 启动期 synthetic probe 见 3.1.4.2。
+
+**exhaustion**：任一 slot Exhausted 时——继续处理其他 slot，收集全部 exhausted slot；主输出、stream artifact 与 rejects 交付已成功部分（原子交付纪律，3.11.2）；report 标 `delivery.complete = false`；CLI **exit 1**（与 provider fatal / circuit breaker 的 exit 4 区分，3.10.3）；duplicate source 已在 ScenarioPlan 冻结——source slot 未交付就省略该 duplicate 并计 shortfall（`delivery.duplicate_shortfall`），禁止改选另一个 delivered source；不重排 ScenarioPlan、不回填其他 class、不无限循环。全部 target sequence 与 noise slot Delivered 时 `delivery.complete = true`（exact quota 指 primary sequence delivery，duplicates 不计入 quota）。SIGINT 发生在 delivery 期间：停止启动新 attempt、等待已发出的有界调用收束、原子交付已成功部分，写 `delivery.complete = false` 与 `delivery.interrupted = true`、exit 1；收束完成的 attempt 按正常桶记账，等待超时被放弃的在途 attempt 不计入 `attempts` 也不入任何 failure 桶（守恒等式只覆盖完整的非 fatal attempt）；同轮已发生 provider fatal 或 circuit breaker 时 exit 4 优先。
+
+**provider 边界保持**：provider retryable exhausted 可以消耗下一次 delivery attempt；provider fatal 与 circuit breaker 仍立即走 exit 4，不被 quota refill 吞掉。对同一固定 prompt 可证明不会变化的 precheck context overflow 不重复派发（Brief / Realize → Exhausted 捷径 + `context_overflow` 桶，不再消耗后续 attempt）；由 realization content 引起的可变预算失败可以进入下一次 attempt。
+
+**时间字段与 duplicate 的双时间语义**：幸存 primary 的 `time_fields` 绑定键在 duplicate 深拷贝与组装**之前**回填；duplicate 的 payload、tier、frame word 与全部 `time_fields` 绑定键是 source 深拷贝（携带 source 的时间字段值），artifact 行 timestamp 与 resource interval 使用 duplicate layout 的新时间——这个有意的双时间语义表示「在新 wrapper 时刻原样重发一份携带 source 时间字段的 payload」，保证 structured payload 仍可按 canonical JSON 精确判重；consumer 经 `truth.duplicate_of` 识别该例外（3.11.2、6.5）。
+
+**RNG 流表（五流，互不借位）**：从 run seed 派生具名随机流，`Random(f"{seed}:<name>")` 独立构造——某 slot 多一次 content retry 不得改变其他 slot 的 length、timestamp、noise、profile 或 duplicate 抽签；slot retry 随机流由稳定 slot key 与 attempt count 派生：
+
+| 随机流 | 唯一用途 |
+|---|---|
+| `scenario.preference` | length 与 duration target |
+| `scenario.noise` | frozen noise timestamp 的空位选择 |
+| `delivery.profile` | LLM profile / style 选择 |
+| `delivery.content` | 各 slot attempt 的生成抽签 |
+| `artifact.duplicate` | duplicate source 选择 |
+
+**`--limit` 边界**：时间流形态不再接受 `--limit`——quota 是整体契约，截断后的前缀不再声称满足 quota（3.1.4.2、2.4）。
+
+**观测面**：delivery 计数与 13 桶由 M6 供给、M10 装配——`report.generate.stream` 追加 `plan_digest` / `planner` / `delivery` / `quotas` 四新键并删除 `plan_failures` / `realize_failures` / `validator_scrapped` 三个旧计数器（其语义由 13 桶闭集唯一承接，3.10.3、6.4）；`delivery.attempts` 同时计 sequence 与 noise slot 的 delivery attempt，不计 LLMClient 内部 provider retry，也不把一次 sequence attempt 的 brief / realize 两个 call 误计成两次 delivery attempt。作废语义升级为交付语义：内容失败不再让序列静默缺席，而是在有界 attempt 内重试、耗尽后进 partial 交付——仍不产 failed 记录、不写 `item.errors`、不入 rejects（3.6.1 边界维持）。零新 trace 通道、零新事件、零新错误 kind（3.12.4 v1.17 段）。

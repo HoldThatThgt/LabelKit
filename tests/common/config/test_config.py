@@ -16,18 +16,20 @@ import pytest
 
 from labelkit.common.config import ResolvedConfig, default_rubric, load
 from labelkit.common.config import loader as loader_mod
+from labelkit.common.runtime.scenario.model import (
+    CorrelationSpec,
+    FrameRuleSpec,
+    FrameWindowSpec,
+)
 from labelkit.common.config.model import (
     CliOverrides,
-    CorrelationSpec,
     ConsoleConfig,
     GenerateStreamConfig,
-    SequenceRuleSpec,
-    SequenceWindowSpec,
     TierSpec,
     apportion_tiers,
-    effective_rules,
+    effective_frame_rules,
+    effective_frame_windows,
     effective_tiers,
-    effective_windows,
 )
 from labelkit.common.errors import ConfigError
 
@@ -139,6 +141,10 @@ def has(errors: list[str], sub: str) -> bool:
     return True
 
 
+# v1.17：钩子引用统一 <python-file>:<attribute-path>——样本钩子文件按绝对路径引用。
+HOOK_PY = str(Path(__file__).resolve().parents[2] / "hook_samples.py")
+
+
 # ── happy path: merge, defaults, resolution ────────────────────────────────
 
 
@@ -168,8 +174,10 @@ def test_happy_path_defaults(env):
     # resolution duties
     assert cfg.quality.rubric == "default:text"        # auto by modality
     assert cfg.rubric.name == "default-text-v1"
-    assert cfg.llm_profiles["default"].api_key == "sk-default"   # referenced
-    assert cfg.llm_profiles["judge"].api_key == ""               # unreferenced
+    # v1.17 secret-free：profile 只存环境变量名——值字段已删除（SPEC-SP §5.2）
+    assert cfg.llm_profiles["default"].api_key_envs == ("LK_TEST_KEY_DEFAULT",)
+    assert not hasattr(cfg.llm_profiles["default"], "api_key")
+    assert not hasattr(cfg.llm_profiles["judge"], "api_keys")
     assert cfg.run.input == str(env.input_file)
     assert cfg.run.output == str(env.output)
     assert cfg.trace.path == str(env.out_dir / "result.trace.jsonl")
@@ -182,7 +190,6 @@ def test_happy_path_defaults(env):
     assert cfg.frame_schema is None
     # v1.13 时间流生成：整节缺省 = 全关（字节等价 v1.12），配额两键取内建默认
     assert cfg.generate_stream == GenerateStreamConfig()
-    assert cfg.generate.sequences == 0
     assert cfg.generate.len_range == (3, 6)
 
 
@@ -250,7 +257,7 @@ def test_explicit_rubric_selector_beats_modality(env):
 def test_trace_explicit_path_kept(env):
     cfg = env.load(project_text=env.project(
         body='[trace]\nenabled = true\npath = "custom.trace.jsonl"'))
-    assert cfg.trace.path == "custom.trace.jsonl"
+    assert cfg.trace.path == str(env.tmp / "custom.trace.jsonl")
     assert cfg.trace.enabled is True
 
 
@@ -566,7 +573,7 @@ def test_semantic_dedup_unknown_embedding(env):
 def test_semantic_dedup_ok_resolves_embedding_key(env):
     body = '[dedup]\nsemantic = true\nsemantic_embedding = "emb"'
     cfg = env.load(project_text=env.project(body=body))
-    assert cfg.embedding_profiles["emb"].api_key == "sk-emb"
+    assert cfg.embedding_profiles["emb"].api_key_envs == ("LK_TEST_KEY_EMB",)
 
 
 def test_semantic_dedup_key_resolution_skips_a_profile_with_no_declaration(env):
@@ -762,22 +769,24 @@ def test_process_mode_forbids_generate_only_keys(env):
 # ── rule 12: API keys, referenced profiles only ────────────────────────────
 
 
-def test_referenced_profile_needs_env_key(env, monkeypatch):
+def test_referenced_profile_needs_no_key_at_static_load(env, monkeypatch):
+    """v1.17 secret-free：无 key 的静态 load 成功（SPEC-SP §5.2 / §13.1 credential 锚）。"""
     monkeypatch.delenv("LK_TEST_KEY_DEFAULT")
-    errors = env.errors()
-    has(errors, '[llm.default].api_key_env: environment variable "LK_TEST_KEY_DEFAULT" is not set or empty')
+    cfg = env.load()
+    assert cfg.llm_profiles["default"].api_key_envs == ("LK_TEST_KEY_DEFAULT",)
 
 
-def test_unreferenced_profile_key_not_required(env, monkeypatch):
+def test_unreferenced_profile_needs_no_key_at_static_load(env, monkeypatch):
     monkeypatch.delenv("LK_TEST_KEY_JUDGE")   # verify disabled → judge unreferenced
     cfg = env.load()
-    assert cfg.llm_profiles["judge"].api_key == ""
+    assert cfg.llm_profiles["judge"].api_key_envs == ("LK_TEST_KEY_JUDGE",)
 
 
-def test_verify_enabled_makes_judge_referenced(env, monkeypatch):
+def test_verify_enabled_loads_keyless(env, monkeypatch):
+    """v1.17 secret-free：judge 被引用也只在 run/probe 期需要密钥值。"""
     monkeypatch.delenv("LK_TEST_KEY_JUDGE")
-    errors = env.errors(project_text=env.project(body="[verify]\nenabled = true"))
-    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
+    cfg = env.load(project_text=env.project(body="[verify]\nenabled = true"))
+    assert cfg.verify.enabled
 
 
 # ── rules 13–15: user schema + few-shot ────────────────────────────────────
@@ -978,7 +987,7 @@ def test_fewshot_dryrun_reports_a_raising_validator_callback(env):
         annotate_body=('instruction = "标注意图"\n'
                        'examples = [{input = "问路", '
                        'output = {intent = "qa", topic = "问路"}}]'),
-        body=_output_with('validator = "tests.hook_samples:boom"'),
+        body=_output_with(f'validator = "{HOOK_PY}:intent_raises"'),
         include_output=False,
     ))
     has(errors, "[output].validator: the callback raised while dry-running few-shot "
@@ -1281,13 +1290,12 @@ def test_pointwise_judges_warns_noop(env, capsys):
     assert "warning:" in err and "judges panel has no effect" in err
 
 
-def test_pointwise_judges_key_checked_on_quality_llm(env, tmp_path, monkeypatch):
-    # Review finding: in pointwise mode the runtime uses quality.llm, so rule 12
-    # must demand ITS key even when a judges panel is configured.
+def test_pointwise_judges_panel_loads_keyless(env, tmp_path, monkeypatch):
+    # v1.17 secret-free：静态面不再解析任何密钥值（run/probe 期才物化）。
     monkeypatch.delenv("LK_TEST_KEY_DEFAULT", raising=False)
-    errors = env.errors(project_text=env.project(
+    cfg = env.load(project_text=env.project(
         body='[quality]\nmode = "pointwise"\njudges = ["judge", "judge", "judge"]'))
-    has(errors, "[llm.default].api_key_env")
+    assert cfg.quality.judges == ("judge", "judge", "judge")
 
 
 # ── v1.5 plan A: validation hooks (rule 17) ─────────────────────────────────
@@ -1301,19 +1309,19 @@ def test_output_validator_loads_and_dryruns_examples(env):
         annotate_body=('instruction = "标注意图"\n'
                        'examples = [{input = "问路", '
                        'output = {intent = "qa", topic = "问路"}}]'),
-        body=_output_with('validator = "tests.hook_samples:topic_max6"'),
+        body=_output_with(f'validator = "{HOOK_PY}:topic_max6"'),
         include_output=False,
     ))
-    assert cfg.output.validator == "tests.hook_samples:topic_max6"
+    assert cfg.output.validator == f"{HOOK_PY}:topic_max6"
 
 
 def test_output_validator_bad_ref_is_config_error(env):
     errors = env.errors(project_text=env.project(
-        body=_output_with('validator = "no_such_module_xyz:fn"'),
+        body=_output_with('validator = "no_such_file_xyz.py:fn"'),
         include_output=False,
     ))
     has(errors, "[output].validator")
-    has(errors, "cannot import module")
+    has(errors, "does not exist")
 
 
 def test_output_validator_rejecting_fewshot_is_config_error(env):
@@ -1321,7 +1329,7 @@ def test_output_validator_rejecting_fewshot_is_config_error(env):
         annotate_body=('instruction = "标注意图"\n'
                        'examples = [{input = "问", '
                        'output = {intent = "qa", topic = "这是一个特别长的主题短语"}}]'),
-        body=_output_with('validator = "tests.hook_samples:topic_max6"'),
+        body=_output_with(f'validator = "{HOOK_PY}:topic_max6"'),
         include_output=False,
     ))
     has(errors, "failed the output.validator callback")
@@ -1331,7 +1339,7 @@ def test_sample_validator_checked_when_generate_enabled(env):
     errors = env.errors(project_text=env.project(
         body=('[quality]\nthreshold = 0.5\n\n'
               '[generate]\nenabled = true\ninstruction = "生成"\n'
-              'sample_validator = "tests.hook_samples:NOT_CALLABLE"'),
+              f'sample_validator = "{HOOK_PY}:NOT_CALLABLE"'),
     ))
     has(errors, "[generate].sample_validator")
     has(errors, "is not callable")
@@ -1524,11 +1532,12 @@ def test_classify_llm_not_checked_when_disabled(env):
     assert cfg.classify.llm == "ghost"            # inert reference, like verify.llm
 
 
-def test_classify_llm_key_resolved_when_enabled(env, monkeypatch):
+def test_classify_llm_keyless_load_when_enabled(env, monkeypatch):
+    """v1.17 secret-free：classify 引用 judge 也只在 run/probe 期需要密钥值。"""
     monkeypatch.delenv("LK_TEST_KEY_JUDGE")
     body = CLASSIFY_BODY.replace("enabled = true", 'enabled = true\nllm = "judge"')
-    errors = env.errors(project_text=env.project(body=body))
-    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.classify.llm == "judge"
 
 
 def test_classify_ui_modality_requires_vision(env):
@@ -1748,16 +1757,16 @@ examples = [{input = "问路", output = {intent = "nope", topic = "问路"}}]
 
 
 def test_class_annotate_examples_dryrun_through_validator_hook(env):
-    body = CLASSIFY_BODY + """
+    body = (CLASSIFY_BODY + f"""
 [output]
-validator = "tests.hook_samples:topic_max6"
+validator = "{HOOK_PY}:topic_max6"
 schema_inline = '''
 """ + SCHEMA + """
 '''
 
 [class.qa.annotate]
 examples = [{input = "问", output = {intent = "qa", topic = "这是一个特别长的主题短语"}}]
-"""
+""")
     errors = env.errors(project_text=env.project(body=body, include_output=False))
     has(errors, "[[class.qa.annotate.examples]][1].output: failed the output.validator callback")
 
@@ -2206,27 +2215,26 @@ def test_segment_llm_existence_only_for_llm_strategies(env):
     assert cfg.segment.llm == "ghost"
 
 
-def test_segment_llm_key_required_only_for_llm_strategies(env, monkeypatch):
+def test_segment_llm_keyless_for_llm_strategies(env, monkeypatch):
+    """v1.17 secret-free：llm 策略引用 judge 的静态 load 无需密钥值。"""
     monkeypatch.delenv("LK_TEST_KEY_JUDGE")
-    errors = env.errors(project_text=env.project(body=SEG_ON + 'llm = "judge"'))
-    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
-    cfg = env.load(project_text=env.project(
-        body=SEG_ON + 'strategy = "rules"\nllm = "judge"'))
-    assert cfg.llm_profiles["judge"].api_key == ""    # unreferenced, key not resolved
+    cfg = env.load(project_text=env.project(body=SEG_ON + 'llm = "judge"'))
+    assert cfg.segment.llm == "judge"
+    assert cfg.llm_profiles["judge"].api_key_envs == ("LK_TEST_KEY_JUDGE",)
 
 
 def test_segment_llm_not_referenced_when_disabled(env, monkeypatch):
     monkeypatch.delenv("LK_TEST_KEY_JUDGE")
     cfg = env.load(project_text=env.project(body='[segment]\nllm = "judge"'))
-    assert cfg.llm_profiles["judge"].api_key == ""
+    assert not hasattr(cfg.llm_profiles["judge"], "api_keys")
 
 
-def test_extract_llm_existence_and_key_when_enabled(env, monkeypatch):
-    monkeypatch.delenv("LK_TEST_KEY_JUDGE")
+def test_extract_llm_existence_and_keyless_load_when_enabled(env, monkeypatch):
     body = SEG_ON + 'strategy = "rules"\n\n[extract]\nenabled = true\nllm = "judge"'
     project = env.project(input_path=env.input_dir, modality="ui", body=body)
-    errors = env.errors(project_text=project)
-    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
+    monkeypatch.delenv("LK_TEST_KEY_JUDGE")
+    cfg = env.load(project_text=project)
+    assert cfg.extract.llm == "judge"
 
 
 NOVISION_PROFILE = """
@@ -2406,18 +2414,18 @@ def test_stitch_trace_channel_accepted_eleven_values(env):
     assert cfg.trace.channels == ("stitch", "segment")
 
 
-def test_stitch_llm_existence_and_key_when_enabled(env, monkeypatch):
+def test_stitch_llm_existence_and_keyless_load_when_enabled(env, monkeypatch):
     errors = env.errors(project_text=env.project(body=STITCH_ON + 'llm = "ghost"'))
     has(errors, '[stitch].llm: referenced profile "ghost" does not exist in config.toml [llm.*]')
     monkeypatch.delenv("LK_TEST_KEY_JUDGE")
-    errors = env.errors(project_text=env.project(body=STITCH_ON + 'llm = "judge"'))
-    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
+    cfg = env.load(project_text=env.project(body=STITCH_ON + 'llm = "judge"'))
+    assert cfg.stitch.llm == "judge"
 
 
 def test_stitch_llm_not_referenced_when_disabled(env, monkeypatch):
     monkeypatch.delenv("LK_TEST_KEY_JUDGE")
     cfg = env.load(project_text=env.project(body=SEG_ON + '\n[stitch]\nllm = "judge"'))
-    assert cfg.llm_profiles["judge"].api_key == ""    # unreferenced, key not resolved
+    assert not hasattr(cfg.llm_profiles["judge"], "api_keys")
 
 
 def test_stitch_llm_never_needs_vision(env):
@@ -3285,11 +3293,11 @@ def test_frame_llm_existence_and_key_when_enabled(env, monkeypatch):
     monkeypatch.delenv("LK_TEST_KEY_JUDGE")
     body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY.replace(
         "enabled = true", 'enabled = true\nllm = "judge"')
-    errors = env.errors(project_text=env.project(body=body))
-    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.frame_classify.llm == "judge"
     body = SEG_ON + "\n" + FRAME_ANNOTATE_ONLY + 'llm = "judge"\n'
-    errors = env.errors(project_text=env.project(body=body))
-    has(errors, 'environment variable "LK_TEST_KEY_JUDGE" is not set or empty')
+    cfg = env.load(project_text=env.project(body=body))
+    assert cfg.frame_annotate.llm == "judge"
 
 
 def test_frame_llm_not_referenced_when_disabled(env, monkeypatch):
@@ -3297,7 +3305,7 @@ def test_frame_llm_not_referenced_when_disabled(env, monkeypatch):
     body = (SEG_ON + '\n[frame.classify]\nllm = "judge"\n\n'
             '[frame.annotate]\nllm = "judge"\n')
     cfg = env.load(project_text=env.project(body=body))
-    assert cfg.llm_profiles["judge"].api_key == ""    # unreferenced, key not resolved
+    assert not hasattr(cfg.llm_profiles["judge"], "api_keys")
 
 
 def test_frame_annotate_instruction_required_when_enabled(env):
@@ -3347,23 +3355,24 @@ def test_class_views_v113_fields_default_off(env):
     assert set(cfg.class_views) == {"writing", "qa", "other"}
     for view in cfg.class_views.values():
         assert view.schema is None
-        assert view.generate.sequences == 0
         assert view.generate.len_range == (3, 6)
 
 
-def test_sequence_rule_and_window_models_are_frozen_and_have_three_state_helpers():
-    rule = SequenceRuleSpec(template="response", source="a", target="b",
-                            correlation=CorrelationSpec(source_field="id",
-                                                        target_field="id"))
-    window = SequenceWindowSpec(frame_class="a", of_day=(("09:00", "10:00"),))
+def test_frame_rule_and_window_models_are_frozen_and_have_three_state_helpers():
+    rule = FrameRuleSpec(name="r1", template="response", source="a", target="b",
+                         correlation=CorrelationSpec(source_field="id",
+                                                     target_field="id"))
+    window = FrameWindowSpec(name="w1", frame_class="a",
+                             of_day_us=((9 * 3600 * 1_000_000,
+                                         10 * 3600 * 1_000_000),), of_week=(1,))
     global_rules = (rule,)
     global_windows = (window,)
-    assert effective_rules(None, global_rules) == global_rules
-    assert effective_rules((), global_rules) == ()
-    assert effective_rules((rule,), global_rules) == (rule,)
-    assert effective_windows(None, global_windows) == global_windows
-    assert effective_windows((), global_windows) == ()
-    assert effective_windows((window,), global_windows) == (window,)
+    assert effective_frame_rules(None, global_rules) == global_rules
+    assert effective_frame_rules((), global_rules) == ()
+    assert effective_frame_rules((rule,), global_rules) == (rule,)
+    assert effective_frame_windows(None, global_windows) == global_windows
+    assert effective_frame_windows((), global_windows) == ()
+    assert effective_frame_windows((window,), global_windows) == (window,)
     with pytest.raises(FrozenInstanceError):
         rule.template = "init"
 

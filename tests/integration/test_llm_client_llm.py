@@ -33,6 +33,7 @@ from labelkit.common.config.model import (
     VerifyConfig,
 )
 from labelkit.common.errors import ProviderFatalError
+from labelkit.common.runtime.credentials import RuntimeCredentials
 from labelkit.common.runtime.llm_client import LLMClient, Message, Part, PromptBundle
 from labelkit.common.observability.obslog import EventLog, MetricsSink
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
@@ -54,10 +55,14 @@ def _profile(**over) -> LLMProfile:
         supports_structured_output=True,
         max_output_tokens=512,
         temperature=0.0,
-        api_key=os.environ.get(ZAI_KEY_ENV, ""),
     )
     defaults.update(over)
     return LLMProfile(**defaults)
+
+
+def _creds(**llm: str) -> RuntimeCredentials:
+    """v1.17 Wave 2b：集成面凭据（profile 名 → 单把密钥值）。"""
+    return RuntimeCredentials(llm={n: (v,) for n, v in llm.items()}, embedding={})
 
 
 def _prompt(text: str) -> PromptBundle:
@@ -68,7 +73,8 @@ def _prompt(text: str) -> PromptBundle:
 
 
 async def test_plain_completion_returns_text_and_usage():
-    client = LLMClient({"default": _profile()}, {})
+    client = LLMClient({"default": _profile()}, {},
+                        _creds(default=os.environ[ZAI_KEY_ENV]))
     try:
         resp = await client.complete("default", _prompt("1+1 等于几？只回答数字。"))
     finally:
@@ -96,7 +102,8 @@ async def test_forced_tool_structured_output_is_schema_valid():
         "required": ["answer", "confident"],
         "additionalProperties": False,
     }
-    client = LLMClient({"default": _profile()}, {})
+    client = LLMClient({"default": _profile()}, {},
+                        _creds(default=os.environ[ZAI_KEY_ENV]))
     try:
         resp = await client.complete(
             "default",
@@ -111,7 +118,8 @@ async def test_forced_tool_structured_output_is_schema_valid():
 
 
 async def test_concurrency_smoke_4_calls_under_semaphore_2():
-    client = LLMClient({"default": _profile(max_concurrency=2, max_output_tokens=128)}, {})
+    client = LLMClient({"default": _profile(max_concurrency=2, max_output_tokens=128)},
+                        {}, _creds(default=os.environ[ZAI_KEY_ENV]))
     sem = client._semaphore("llm", "default", 2)
     assert sem._value == 2
     prompts = [_prompt(f"{n}+{n} 等于几？只回答数字。") for n in (1, 2, 3, 4)]
@@ -169,7 +177,8 @@ async def test_full_content_trace_carries_input_and_output_messages(tmp_path):
     cfg = _full_trace_cfg(tmp_path, profile)
     event_log = EventLog(cfg.trace, "0123456789ab")
     sink = MetricsSink(cfg, "0123456789ab", event_log)
-    client = LLMClient({"default": profile}, {}, metrics=sink)
+    client = LLMClient({"default": profile}, {},
+                        _creds(default=os.environ[ZAI_KEY_ENV]), metrics=sink)
     prompt = _prompt("1+1 等于几？只回答数字。")
     try:
         resp = await client.complete("default", prompt)
@@ -199,8 +208,8 @@ async def test_full_content_trace_carries_input_and_output_messages(tmp_path):
 async def test_wrong_key_is_provider_fatal_not_retried():
     # Key env deliberately points at a bogus variable → empty/invalid credential.
     bogus = _profile(name="bogus", api_key_env="LABELKIT_ZAI_KEY_DOES_NOT_EXIST",
-                     api_key="", max_retries=3)
-    client = LLMClient({"bogus": bogus}, {})
+                     max_retries=3)
+    client = LLMClient({"bogus": bogus}, {}, _creds(bogus=""))
     try:
         with pytest.raises(ProviderFatalError) as ei:
             await client.complete("bogus", _prompt("ping"))
@@ -225,7 +234,8 @@ async def test_auth_fatal_trips_breaker_and_queued_calls_fail_fast(tmp_path):
     os.environ["LABELKIT_BAD_KEY_TEST"] = "definitely-not-a-key"
     prof = prof.__class__(**{**prof.__dict__, "api_key": "definitely-not-a-key"})
     sink = MetricsSink(obslog_cfg(tmp_path), "itest", EventLog(obslog_cfg(tmp_path).trace, "itest"))
-    client = LLMClient({"default": prof}, {}, sink)
+    client = LLMClient({"default": prof}, {},
+                        _creds(default=os.environ[ZAI_KEY_ENV]), sink)
     prompt = PromptBundle(messages=(
         Message(role="user", parts=(Part(kind="text", text="hi", image=None),)),))
 

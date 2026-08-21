@@ -182,7 +182,7 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
 |---|---|---|
 | `[class.*.quality]` | `mode`、`rounds`、`rubric`（含 `[class.*.rubric]` 内联子表）、`threshold`、`selection`、`top_ratio` | `llm` / `judges` / `both_orders` / `criteria_per_call` / `on_unscored`——LLM 绑定属部署与成本面，类间差异优先用 rubric 表达 |
 | `[class.*.annotate]` | `instruction`、`examples`、**`schema_path` / `schema_inline`**（至多其一，v1.13） | `llm` / `self_consistency` / `sc_temperature` |
-| `[class.*.generate]` | `instruction`、`styles`、`num_per_record`、`temperature`；v1.13 时间流形态另加 **`sequences` / `len_range`**，v1.15 再加 **`tiers`**（`[[class.<名>.generate.tiers]]` 按类档位表，整表取代全局 `[[generate.stream.tiers]]`）；该形态下 `num_per_record` / `seeds_per_call` 反过来禁设（第 27 章 27.4） | `llms` / `mixture` / `weights` / `seeds_per_call` / `num_per_call` / `sample_validator` |
+| `[class.*.generate]` | `instruction`、`styles`、`num_per_record`、`temperature`；v1.13 时间流形态另加 **`[[generate.stream.quotas]]` / `len_range`**，v1.15 再加 **`tiers`**；v1.17 配额改由 `[[generate.stream.quotas]]` 承载（`[[class.<名>.generate.tiers]]` 按类档位表，整表取代全局 `[[generate.stream.tiers]]`）；该形态下 `num_per_record` / `seeds_per_call` 反过来禁设（第 27 章 27.4） | `llms` / `mixture` / `weights` / `seeds_per_call` / `num_per_call` / `sample_validator` |
 | `[class.*.verify]` | `extra_criteria` | `llm` / `judges` / `policy` / `max_repair_rounds` |
 | —— | —— | `run.*` / `input.*` / `dedup.*` / `classify.*` / `trace.*` 与 `[output]` 的其余键 **从不按类**——输出通道的形态（`meta_mode`、`rejects`、修复预算、`validator`）是运行级契约 |
 
@@ -286,7 +286,7 @@ jq -r '._meta | "\(.label)\t\(.stage)/\(.reason)"' out/text-labels.rejects.jsonl
 
 ## 24.7 调优与排障
 
-**三种 `source`，先分清谁是谁。**`"llm"` = 分拣员正常判决（含主动选中兜底类——本次真跑那条笑声进 other 就是 `source="llm"`，所以 `fallback_count=0`）；`"fallback"` = 分类输出经结构修复耗尽仍非法、被**兜底机制**塞进 `fallback_class`；`"inherited"` = generate 按类生成的样本天生带标签、回流时幂等跳过分类（零额外调用；v1.13 时间流生成的序列同理——整条链上一次分类调用都不发，所以那种工程的 `report.classify` 逐类计数**恒全零**，是预期不是失灵，第 27 章）。诊断口径：`report.classify.fallback_count` 持续偏高，说明的不是「数据难分」而是「**分类调用的输出结构不稳**」或类别表口径盖不住数据——先查 trace 的 error 事件，再审 description。
+**三种 `source`，先分清谁是谁。**`"llm"` = 分拣员正常判决（含主动选中兜底类——本次真跑那条笑声进 other 就是 `source="llm"`，所以 `fallback_count=0`）；`"fallback"` = 分类输出经结构修复耗尽仍非法、被**兜底机制**塞进 `fallback_class`；`"inherited"` = generate 按类生成的样本天生带标签、回流时幂等跳过分类（零额外调用；v1.17 时间流生成的序列同理——整条链上一次分类调用都不发，所以那种工程的 `report.classify` 逐类计数**恒全零**，是预期不是失灵，第 27 章）。诊断口径：`report.classify.fallback_count` 持续偏高，说明的不是「数据难分」而是「**分类调用的输出结构不稳**」或类别表口径盖不住数据——先查 trace 的 error 事件，再审 description。
 
 **`classification_invalid` 的两副面孔**（对应 `classify.on_error`）：
 

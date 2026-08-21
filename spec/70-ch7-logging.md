@@ -76,6 +76,14 @@ M1 后发现的 planner 不变量破坏复用 `internal_error` 退出面。noise
 都不得进入 stderr、trace、report 或 artifact。所有生成调用仍经既有 `llm.call` 事件可见，
 不建立 generate 专属通道。
 
+**v1.17 增量声明（场景规划与精确交付）**：通道枚举维持 11 值、零新事件名——planner 摘要
+（plan digest、status、objective、family stats 与 assumption names）在 EventLog 建立后并入
+既有 `run.start` payload（`ScenarioPlan` 在 M1 创建，此时 EventLog 尚未构造，故不新增虚假的
+planner 事件；planning 失败发生在 trace 生命周期之前，不承诺留下 trace 文件或 planner
+event，3.10.3）；trace 不记录 hook payload、quota 内容样本或 credential。错误面增量见 7.6
+——四个 planner 异常与 delivery 耗尽是运行级/启动期异常面，不进记录级 `StageError.kind`
+词表，也不产生 rejects 行（exact delivery 的失败按 13 桶只进 report，6.4）。
+
 † `reason` 仅当 `quality.judgment_reasons` 生效时存在（5.2）；`classify.decision` 的 `reason` 条件独立（v1.7）= `trace.enabled = true` 且 `trace.channels` 含 `"classify"`（零额外 token 原则，3.13.4 调用与校验行）；`segment.boundary` 的 `reason` 条件同款（v1.8）= `trace.enabled = true` 且 `trace.channels` 含 `"segment"`（对应窗口内部 Schema 的 with_reason 参数，零额外 token，3.14）。¶ `stitch.judge` / `stitch.thread` 的 `task_name` 与 `reason`（v1.9）无请求条件——`stitch_schema()` 恒含两键（判定量级小、votes 聚合需按多数簇取值，3.16.3），但作为 LLM 自由文本受 7.4 分级：`none` 档剥除、`refs` 档起携带（`task_name` 为 v1.9 新增自由文本键，7.4）。‡ / § 为 `extract.step` 的内容分档标记（v1.8，S27）：`description` 自 `"refs"` 档起、`target` / `value` 自 `"excerpt"` 档起携带（7.4）。全部自由文本字段（reason / critiques / violations 文本）受 7.4 脱敏档位控制。密钥相关事件（v1.6）只携环境变量**名**——密钥值在任何档位、任何通道均不落日志（7.4 规则不变）。
 
 ## 7.3 记录格式规范
@@ -163,6 +171,18 @@ jq -s '[.[] | select(.ev=="quality.judgment") | .payload.judgments[]
 | `internal_error` | 记录级 | 任何未预期异常（含 M11 终检失败）；记录 failed，堆栈入日志（debug 级）。 |
 
 v1.11 两注：① M8 L3 修复调用内的 precheck 溢出**不落本词表**（V25①：该轮记修复失败并短路至耗尽，reject 归因维持 `schema_violation` / `callback_violation`，3.8.2）；② z.ai 扩展终止值 `sensitive` / `network_error` 及未知值不做专项处置（V11③——沿现行管线流转，垃圾输出由 M8 校验兜住）。v1.12 注：帧粒度**零新错误 kind**——帧分类失败落 `fallback_class`（不产生 StageError 入信封）、帧标注失败复用既有词表分类（`schema_violation` / `provider_*` / `image_decode_error` / `context_overflow` / `output_truncated` / `internal_error`）仅用于 WARN 日志与计数归因，成员失败**不写 `item.errors`、不入 rejects**（3.5.5/3.13.7；帧 Schema 走内部 Schema 待遇、无 L2.5 ⇒ `callback_violation` 在帧路径不可达）；熔断矩阵零改动——帧调用的 precheck/最小单元不喂连击、reactive-400 终局由属主算子补喂恰一次（A7 同则）。**v1.13 注：时间流生成同样零新错误 kind**——蓝图/帧实现/噪音批三类调用的失败**不产生记录级 StageError**（此时尚无记录：整条序列作废、直接缺席），失败按既有词表分类仅用于值-free 的 stderr WARN 与 `report.generate.stream.{plan_failures, realize_failures}` 计数归因；熔断矩阵零改动——两类调用的 precheck / 不可装填**不喂连击**（V10 先例），reactive-400 终局在作废吞点经共享 `budget.feed_reactive_terminal` 补喂**恰一次**（A7 同则，3.6.5 预算与溢出纪律）。
+
+**v1.17 planner 异常与交付耗尽面（运行级/启动期异常，不进上表记录级词表）**：v1.17 结束 v1.13–v1.16 的「零新错误 kind」惯性——以下四个 planner 异常与 delivery 耗尽经 ConfigError 聚合或 CLI 顶层收口，不产生记录级 StageError、不写 rejects（3.1.5、3.6.5）：
+
+| 异常 / 事件 | 退出码 | 语义与稳定英文 message |
+|---|---:|---|
+| `PlannerInfeasibleError(ValueError)` | 2 | 用户硬约束没有共同解；汇入 ConfigError。INFEASIBLE 时调用 `SufficientAssumptionsForInfeasibility()` 返回「足以导致不可行」的具名 assumption 集合（quota / frame rule / frame window / sequence rule 的自然名称与 `resource:<resource-name>` 键；**不声称最小**），message 形态：`sequence planner infeasible: constraints=[weekday_coverage,navigate_before_clock_out,ticket_request_work_hours]`。静态 arithmetic 错误优先于 solver core，且同一纯检查阶段聚合全部 arithmetic 错误；core 诊断以求解器在 deterministic budget 内**证得** INFEASIBLE 为前提——预算内只能得到 UNKNOWN 时按 `PlannerBudgetError` 上报，不降格、不伪装成 core。 |
+| `PlannerCapacityError(RuntimeError)` | 4 | 模型在**求解前**超过实现容量——quota model 与 timeline model **各自**执行 entries（variables + constraints）≤ 250,000，不能把两个小模型的 entries 相加后误报；错误含 actual / limit / dominant family 与 family 计数，**绝不显示为 INFEASIBLE**。message 模板（英文稳定字段，照抄冻结）：`sequence planner capacity exceeded: model=timeline entries=251891 limit=250000 dominant=crossing families={crossing:170000,session_slot:60000,...}`。不输出「减少 horizon」一类猜测建议——schedule 已是显式硬边界。 |
+| `PlannerBudgetError(RuntimeError)` | 4 | deterministic solve budget（每层 `max_deterministic_time = 10.0` 冻结常数，不放宽换绿灯）内无法冻结最优计划；message 明确 `model=quota\|timeline` 与超时的 layer 名。 |
+| `PlannerInternalError(RuntimeError)` | 4 | solver 解码或冻结计划违反实现不变量（如模型声称有 noise reserve 而 allocator 找不到位置、owner 配对后的实例性校验违反）。 |
+| exact delivery 耗尽 | 1 | 任一 slot Exhausted：继续处理其余 slot（收集全部 exhausted slot）、原子交付已成功部分（主输出 / stream artifact / rejects）、report 标 `delivery.complete = false`，CLI exit 1——与 provider fatal / circuit breaker 的 exit 4 区分。既有 provider 边界保持：provider retryable exhausted 可消耗下一次 delivery attempt；provider fatal 与 circuit breaker 立即 exit 4，不被 quota refill 吞掉。SIGINT 发生在 delivery 期间：停止启动新 attempt、等待已发出的有界调用收束、原子交付已成功部分、`delivery.interrupted = true`、exit 1（收束完成的 attempt 正常记账；放弃的在途 attempt不计入 `attempts` 也不入任何桶；同轮已发生 provider fatal 或 circuit breaker 则 exit 4 优先）。 |
+
+**delivery failure 13 桶闭集**（`report.generate.stream.delivery.failures`，互斥、只记第一个失败阶段、为零也全部在场，枚举序冻结）：`brief`、`realize`、`noise`、`context_overflow`、`sample_validator`、`sample_validator_exception`、`correlation`、`temporal`、`sequence_validator`、`sequence_validator_exception`、`similarity`、`scenario_validator`、`scenario_validator_exception`。brief/realize 的 Schema guarantee、provider retryable exhaustion 与 output truncation 归到当时的 call phase；noise realization 的对应失败归 `noise`；对同一固定 prompt 可证明不变的确定性 precheck overflow 归 `context_overflow`（直接 Exhausted、计入 attempts、不再消耗后续 attempt）。守恒等式：每次完整非 fatal attempt 恰好满足 `attempts = delivered_sequences + delivered_noise + sum(failures.values())`（6.4）。
 
 ## 7.7 进度显示与结束摘要（v1.10：三态 console）
 

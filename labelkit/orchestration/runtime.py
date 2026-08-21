@@ -16,11 +16,15 @@ from typing import TYPE_CHECKING
 from labelkit.common.config import load
 from labelkit.common.config.model import CliOverrides, ResolvedConfig
 from labelkit.common.observability.obslog import EventLog, MetricsSink, setup_logging
+from labelkit.common.runtime.credentials import (
+    RuntimeCredentials,
+    referenced_profiles,
+    resolve_credentials,
+)
 from labelkit.common.runtime.llm_client import LLMClient
 from labelkit.common.runtime.schema_engine import SchemaEngine
 from labelkit.orchestration.factory import build_stages
 from labelkit.orchestration.orchestrator import Orchestrator, RunServices
-from labelkit.orchestration.profile_usage import referenced_profiles
 from labelkit.operators.emitter import Emitter
 
 if TYPE_CHECKING:
@@ -60,20 +64,57 @@ def _activate_listener(listener: "ProgressListener", cfg: ResolvedConfig,
 
 
 def _trace_config(cfg: ResolvedConfig) -> "TraceConfig":
-    """取本轮实际使用的 trace 配置：dry-run 时把路径改道到 ``<name>.dryrun<suffix>``
-    （P2-4——空跑绝不覆盖上一轮的 trace 文件）。
+    """取本轮实际使用的 trace 配置。
 
-    @param cfg: 已解析配置
-    @return: trace 配置（非 dry-run 时原样返回）
+    v1.17（Wave 2b）：路径改从 ``cfg.paths.trace`` 消费——装载期一次派生的绝对
+    路径（显式相对路径按 project root 绝对化），不再从字符串按 cwd 推导。
+    dry-run 时仍改道到 ``<name>.dryrun<suffix>``（P2-4——空跑绝不覆盖上一轮的
+    trace 文件）。
+
+    @param cfg 已解析配置
+    @return trace 配置（通道未启用时原样返回）
     """
     trace_cfg = cfg.trace
-    if cfg.dry_run and trace_cfg.enabled and trace_cfg.path:
-        path = Path(trace_cfg.path)
-        trace_cfg = replace(
-            trace_cfg,
-            path=str(path.with_name(path.stem + ".dryrun" + path.suffix)),
-        )
-    return trace_cfg
+    paths = getattr(cfg, "paths", None)
+    resolved = paths.trace if paths is not None else None
+    if not (trace_cfg.enabled and resolved):
+        return trace_cfg
+    path = Path(resolved)
+    if cfg.dry_run:
+        path = path.with_name(path.stem + ".dryrun" + path.suffix)
+    return replace(trace_cfg, path=str(path))
+
+
+def _l25_validator(cfg: ResolvedConfig):
+    """从 M1 冻结载体取 ``output.validator`` 的 L2.5 冻结 callable。
+
+    v1.17（Wave 2b）：schema engine 的 L2.5 腿载体化——装配方在此读
+    ``ResolvedConfig.validation_hooks.output.target`` 传入，引擎内不再按
+    字符串二次 resolve（CONTRACTS §7.19.3 / rule 70）。
+
+    @param cfg 已解析配置
+    @return 冻结 callable；未配置 output.validator 时为 None
+    """
+    hooks = getattr(cfg, "validation_hooks", None)
+    if hooks is not None and hooks.output is not None:
+        return hooks.output.target
+    return None
+
+
+def _run_credentials(cfg: ResolvedConfig) -> RuntimeCredentials:
+    """按命令分流物化凭据（SPEC-SP §5.2 命令路径 mermaid）。
+
+    ``run``（真实网络）聚合解析所有被引用 profile 的密钥值，任一缺失即
+    ConfigError（exit 2 面）；``run --dry-run`` 是纯静态面——传**空**凭据对象，
+    零环境变量 value 读取、零密钥驻留（若空跑意外派发，池物化会 fail-closed）。
+
+    @param cfg 已解析配置
+    @return 运行期凭据
+    @raises ConfigError 真实运行且任一被引用密钥缺失（聚合全部缺失项）
+    """
+    if cfg.dry_run:
+        return RuntimeCredentials(llm={}, embedding={})
+    return resolve_credentials(cfg)
 
 
 def _build_ingestor(cfg: ResolvedConfig, metrics: MetricsSink) -> "Ingestor | None":
@@ -117,8 +158,10 @@ def execute_run(
 
     event_log = EventLog(_trace_config(cfg), run_id)
     metrics = MetricsSink(cfg, run_id, event_log, listener=listener)
-    llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles, metrics)
-    schema_engine = SchemaEngine(dict(cfg.user_schema), llm, cfg.output, metrics)
+    llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles,
+                    _run_credentials(cfg), metrics)
+    schema_engine = SchemaEngine(dict(cfg.user_schema), llm, cfg.output, metrics,
+                                 validator=_l25_validator(cfg))
     services = RunServices(llm=llm, schema_engine=schema_engine, metrics=metrics,
                            run_id=run_id, run_started_at=run_started_at)
     orchestrator = Orchestrator(
@@ -158,11 +201,17 @@ def validate_project(
 def probe_referenced_profiles(cfg: ResolvedConfig) -> tuple["ProbeResult", ...]:
     """探测被启用阶段实际引用的每一个 profile。
 
-    @param cfg: 已解析配置
-    @return: 按 (LLM, embedding) 顺序排布的探测结果元组
+    v1.17（Wave 2b，SPEC-SP §5.2）：``validate --probe`` 属真实网络路径——探测前
+    先对所有被引用 profile 聚合解析密钥值，任一缺失即 ConfigError（exit 2 面，
+    绝不拿空密钥去撞端点）。
+
+    @param cfg 已解析配置
+    @return 按 (LLM, embedding) 顺序排布的探测结果元组
+    @raises ConfigError 任一被引用密钥缺失（聚合全部缺失项）
     """
     llm_names, emb_names = referenced_profiles(cfg)
-    client = LLMClient(cfg.llm_profiles, cfg.embedding_profiles, None)
+    client = LLMClient(cfg.llm_profiles, cfg.embedding_profiles,
+                       resolve_credentials(cfg), None)
 
     async def _probe_all() -> list[ProbeResult]:
         """依次探测全部被引用 profile。

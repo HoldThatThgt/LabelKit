@@ -275,3 +275,24 @@ def tree_diff(a: UITree | None, b: UITree | None, quantize_px: int) -> Mapping
 窗口、correlation、planner 状态和钩子违规不会写进 `Record`、`PipelineItem.errors` 或
 新的状态值；整条 attempt 作废只表现为缺席与既有计数器。钩子取得 payload 的深拷贝，
 任何用户修改都不能污染内部载荷、时间字段回填或 duplicate source。
+
+**v1.17 新增数据结构（场景规划与精确交付）**：分三层落档。全字段定义冻结在
+`docs/dev/SPEC-scenario-planning.md` §6.1 与 `docs/CONTRACTS.md`，此处只列名字、一句话
+职责与落点文件——主规格不复制全字段。
+
+contracts 层（`labelkit/common/contracts/types.py`，与既有 `SequenceValidationFrame` /
+`SequenceValidationInput` 同层并列——后两者形状原样保留，`sequence_validator` 的输入
+契约零变化）：
+
+- `ResolvedHook` —— 一个已按工程根目录解析并通过 synthetic probe 的校验器（`reference: str` 用于稳定错误定位 + `target: Callable`，callable 的 repr 与 equality 均被排除）。
+- `ValidationHooks` —— 运行内四个校验阶段唯一使用的冻结 callable 集（`output` / `sample` / `sequence` / `scenario` 四槽，各 `ResolvedHook | None`）；挂 `ResolvedConfig.validation_hooks`，report、trace、digest 与配置序列化只允许使用 reference。
+- `ScenarioSequence` —— 场景校验器看到的一条已实现序列（`slot_key` / `sequence_class` / `start` / `end` / `frames`）。
+- `ScenarioValidationInput` —— 增量场景校验输入：accepted 前缀 + 本次唯一可拒绝的 `candidate`（accepted 不回滚、不重排）。
+
+`ResolvedConfig` 冻结 parse product 与运行期载体：
+
+- `ResolvedConfig` 新增三个冻结 parse product：`paths: ResolvedPaths`、`validation_hooks: ValidationHooks`、`scenario_plan: ScenarioPlan | None`（非 time-stream 形态为 None；time-stream 形态无法生成完整计划时 load 不返回半成品）——原始 config section 不再保存可调用对象、secret value 或待下游解释的相对路径。
+- `ResolvedPaths` —— 运行涉及的全部绝对路径（`project` / `project_root` / `input` / `output` / `report` / `rejects` / `sidecar` / `trace` / `stream_artifact` 九字段）；M2、M11、trace runtime、console 与 stream artifact helper 只消费它，不得重新从字符串推导 cwd-relative 路径。
+- `RuntimeCredentials` —— **不入 `ResolvedConfig`** 的运行期载体：仅真实网络运行持有的 profile 密钥值（`llm` / `embedding` 两个只读 mapping，构造时复制、key 按 profile name 排序、value 为去重后保持声明顺序的非空 key tuple）；没有显示 secret 的 repr、异常或序列化方法，不进日志 / trace / report / exception / deepcopy。
+
+scenario 包 dataclass 族（`labelkit/common/runtime/scenario/model.py`；planner 内部 dataclass 一律落此文件，与 contracts 层不得混放）。输入 spec 族：`ScheduleSpec`（planner 使用的有限 fixed-offset schedule）、`QuotaSpec`（一张尚待展开 period bucket 的 quota）、`CorrelationSpec`（frame rule 的类型敏感顶层字段相等约束）、`FrameRuleSpec`（一条带自然名称的同序列有限迹规则——v1.16 `SequenceRuleSpec` 的更名；`SequenceRuleSpec` 名字自 v1.17 起回收给跨序列规则，与被更名类**没有任何继承关系**）、`FrameWindowSpec`（一条带自然名称的 frame class 本地日历窗口）、`SequenceRuleSpec`（一条跨 sequence occurrence 的周期规则：precedence / response / succession / not_co_existence）、`TierDomain`（一个 sequence class 的一档 frame class 构成）、`SequenceClassDomain`（一个 sequence class 的完整生效 planner 输入）、`FrameClassDomain`（一个 frame class 的时间与 resource 域）、`NoiseClassSpec`（一个 structured noise frame class 及其整数权重）、`ScenarioConfig`（`compile_scenario` 的唯一冻结参数对象）。计划产物族：`SequenceSlotSpec`（QuotaCompiler 冻结 target 后的一条稳定成功交付槽位——**length 在 slot 构建时冻结为 `length_target`**，planner 不再改变 active length）、`FrameLayout`（一条已选中的 active frame occurrence 布局）、`SequenceLayout`（一条 sequence slot 的完整时间与 session 布局）、`SessionLayout`（一个 replay session 的 owner、边界与 noise 数量）、`NoiseSlot`（一条已冻结 class、session 与时间的 noise 交付槽位）、`DuplicateLayout`（一条已冻结 source 与平移后时间的流尾 duplicate）、`QuotaSummary`（一张 quota 展开后的一个 class/bucket target）、`PlannerObjectives`（三层字典序目标的冻结最优值：preference_deviation / calendar_days_spanned / timeline_end_us）、`PlannerFamilyStats` / `PlannerModelStats`（quota 与 timeline 模型的稳定规模统计，family counts 只用于 report、不参与 digest）、`ScenarioPlan`（M1 唯一生成、estimate 与 M6 只读消费的冻结计划：slots / layouts / sessions / noise_slots / duplicates / quota_summary / objectives / models / plan_digest）。所有 `*_us` 时间为 Unix epoch 的绝对整数微秒（本地日期与 artifact ISO-8601 用 schedule 的固定 offset 转换）；声明为 Mapping 的字段都在构造点复制为只读、按 key 排序的 mapping——冻结 dataclass 内不得藏可变 dict/list。

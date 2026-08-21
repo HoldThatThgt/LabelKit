@@ -65,9 +65,9 @@ from labelkit.common.errors import (
     ProviderRetryableError,
     SchemaViolation,
 )
+from labelkit.common.runtime.credentials import referenced_profiles
 from labelkit.common.runtime.llm_client import LLMClient, ProbeResult
 from labelkit.orchestration.factory import build_stages
-from labelkit.orchestration.profile_usage import referenced_profiles
 from labelkit.orchestration.runtime import execute_run, probe_referenced_profiles
 
 # labelkit.cli 把 main 这个**函数**导出到包命名空间，遮住了同名子模块——兜底出口
@@ -99,11 +99,18 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/observability/console_format.py",
     "labelkit/common/observability/obslog.py",
     "labelkit/common/runtime/budget.py",           # v1.11 (CONTRACTS §7.17)
-    "labelkit/common/runtime/declare.py",          # v1.16 DECLARE 直接语义
+    "labelkit/common/runtime/credentials.py",      # v1.17 secret-free 凭据载体
     "labelkit/common/runtime/llm_client.py",
     "labelkit/common/runtime/schema_engine.py",
-    "labelkit/common/runtime/sequence_planner.py", # v1.16 联合 CP-SAT
-    "labelkit/common/runtime/temporal.py",         # v1.16 微秒与日历窗
+    "labelkit/common/runtime/scenario/__init__.py",    # v1.17 场景规划纯函数层
+    "labelkit/common/runtime/scenario/calendar.py",    # v1.17 fixed-offset 日历
+    "labelkit/common/runtime/scenario/diagnostics.py",  # v1.17 planner 异常与 message
+    "labelkit/common/runtime/scenario/model.py",       # v1.17 场景模型 (CONTRACTS §7.19.4)
+    "labelkit/common/runtime/scenario/noise.py",       # v1.17 确定性 noise 分配
+    "labelkit/common/runtime/scenario/planner.py",     # v1.17 compile_scenario
+    "labelkit/common/runtime/scenario/quota.py",       # v1.17 quota 算术与见证模型
+    "labelkit/common/runtime/scenario/rules.py",       # v1.17 规则纯求值器
+    "labelkit/common/runtime/scenario/sessions.py",    # v1.17 session/crossing/reserve builder
     "labelkit/operators/annotate.py",
     "labelkit/operators/classify.py",
     "labelkit/operators/dedup.py",
@@ -119,7 +126,6 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/orchestration/__init__.py",
     "labelkit/orchestration/factory.py",
     "labelkit/orchestration/orchestrator.py",
-    "labelkit/orchestration/profile_usage.py",
     "labelkit/orchestration/runtime.py",
 }
 
@@ -128,17 +134,24 @@ EXPECTED_TEST_PY = {
     "tests/cli/test_console.py",
     "tests/common/config/test_config.py",
     "tests/common/config/test_loader_generate_stream.py",   # v1.13 (SPEC-stream-generation §3.1)
+    "tests/common/config/test_paths_hooks.py",     # v1.17 (SPEC-scenario-planning §5.1/§4.9)
     "tests/common/contracts/test_stage.py",
     "tests/common/contracts/test_types.py",
     "tests/common/extensions/test_hooks.py",
     "tests/common/observability/test_console_format.py",
     "tests/common/observability/test_obslog.py",
     "tests/common/runtime/test_budget.py",         # v1.11 (CONTRACTS §7.17)
-    "tests/common/runtime/test_declare.py",        # v1.16 十五模板与 occurrence
+    "tests/common/runtime/test_credentials.py",    # v1.17 secret-free 凭据面
     "tests/common/runtime/test_llm_client.py",
     "tests/common/runtime/test_schema_engine.py",
-    "tests/common/runtime/test_sequence_planner.py",  # v1.16 联合模型 oracle
-    "tests/common/runtime/test_temporal.py",       # v1.16 微秒、日历与重发
+    "tests/common/runtime/scenario/test_calendar.py",    # v1.17 场景日历
+    "tests/common/runtime/scenario/test_diagnostics.py",  # v1.17 planner 诊断
+    "tests/common/runtime/scenario/test_model.py",       # v1.17 场景模型
+    "tests/common/runtime/scenario/test_noise.py",       # v1.17 noise 分配
+    "tests/common/runtime/scenario/test_planner.py",     # v1.17 compile_scenario 与 scale gate
+    "tests/common/runtime/scenario/test_quota.py",       # v1.17 quota 算术
+    "tests/common/runtime/scenario/test_rules.py",       # v1.17 规则求值器
+    "tests/common/runtime/scenario/test_sessions.py",    # v1.17 session 层 builder
     "tests/common/test_errors.py",
     "tests/conftest.py",
     "tests/hook_samples.py",
@@ -962,6 +975,7 @@ def test_probe_referenced_profiles_walks_llm_then_embedding_in_order(monkeypatch
     """spec §2.4 `validate --probe` / 3.9.2 probe_all（「成本 = 各被引用 profile
     池大小之和 次探测调用」）：探测顺序 = 引用集的 (LLM…, embedding…) 拼接，池化
     profile 的多条结果被**展开**而非嵌套，返回 tuple。"""
+    monkeypatch.setenv("K", "k")   # v1.17 Wave 2b：探测前先物化凭据（缺 key ⇒ exit 2）
     probed: list[str] = []
 
     async def fake_probe_all(self, name):     # noqa: ANN001 — 对象层桩，非传输层

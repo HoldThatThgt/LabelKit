@@ -1,13 +1,10 @@
-# 第 27 章　时间流生成：用规则约束合成可重放的多会话流
+# 第 27 章　时间流生成：用有限场景规划约束合成可重放的多会话流
 
 时间流生成是 generate_only 的时间序列形态：没有输入文件，从零生成带时间戳的多会话请求流。
 LLM 只负责自然语言内容；LabelKit 负责规则、日历窗口、类型敏感关联、时间轴、会话交叉、
 噪音、重复重发和产物组装。
 
-v1.16 的关键变化是：当实际配额前缀存在有效 rules/windows 时，LabelKit 在首个内容调用前
-用一个 CP-SAT 联合模型冻结整条流的长度、帧类、会话、时间戳、真实 crossing 和 noise 槽。
-LLM 不再决定帧类，也没有逐候选重求、重抽、放宽约束或 fallback。本章使用
-examples/synth-stream；运行数字以本次 report 为准，不是固定保证。
+v1.17 将时间流升级为有限场景规划与精确交付：先冻结 finite schedule、配额、帧规则/窗口、跨序列规则、duration/resource、noise 槽与 duplicate 布局，再按固定 slot 有界重试内容。LLM 只负责自然语言内容；LabelKit 负责规则、日历窗口、类型敏感关联、时间轴、会话交叉、结构化噪音、重复重发和产物组装。
 
 ## 27.1 什么时候使用时间流生成
 
@@ -15,10 +12,10 @@ examples/synth-stream；运行数字以本次 report 为准，不是固定保证
 
 ~~~mermaid
 flowchart LR
-    Q[按类尝试配额] --> P[联合 planner]
-    P --> B[每条 attempt 一次 brief]
-    B --> R[每条 attempt 一次 realize]
-    R --> V[Schema / validator / rule / correlation]
+    Q[day/week/schedule quota] --> P[ScenarioPlan planner]
+    P --> B[每个 sequence slot 有界 brief]
+    B --> R[每个 slot realize]
+    R --> V[Schema / sample / sequence / scenario validator]
     V --> W[确定性投影与时间字段回填]
     W --> A[stream.jsonl 工件]
     W --> S[序列信封]
@@ -30,8 +27,7 @@ classify.enabled = true、stream.order_by = meta:<field> 且 output.meta_mode !=
 它不消费 run.input，也不启用 segment、stitch 或 extract；project-replay.toml 才会在
 process 模式重新走 ingest、segment 和 dedup。
 
-实际 --limit 截断后无有效 rules/windows 时，生成保持 v1.15 默认时间流路径。
-sequence_validator 可以单独启用，它是内容钩子，不会单独打开 CP-SAT 规划。
+有限 schedule 是唯一时间边界；day、week、schedule 三种 quota 共同约束同一批成功交付 occurrence。`crossed_sessions` 声明交叉数，总 session 由 target sequence slot 数自动推导。每个 sequence 与 structured noise 都有独立 `max_attempts_per_slot`，内容失败只重试同一 slot，不重排已冻结时间。
 
 ## 27.2 快速上手：当前教学工程
 
@@ -88,15 +84,17 @@ sequence_validator = "examples.synth-stream.hooks:validate_sequence"
 
 [generate.stream]
 enabled = true
-sessions = 5
+crossed_sessions = 1
 noise_ratio = 0.1
 duplicates = 1
 frame_gap_s = [5, 60]
-ts_start = "2026-01-05T09:00:00+08:00"
+[generate.stream.schedule]
+start = "2026-01-05T08:00:00+08:00"
+end = "2026-01-06T23:00:00+08:00"
 ~~~
 
-两个序列类各声明三条 attempt，len_range = [4, 5]；这是尝试配额，不是最终输出保证。
-attempt 作废后不补齐、不重抽、不重新调用 planner。
+quota 表声明两个序列类各 3 个 delivery target，len_range = [4, 5]；固定 slot 失败时在同一 slot 内按 `max_attempts_per_slot` 有界重试，直到 target 交付或报告 delivery failure。
+规划布局不会因 slot 失败而重排、重求解或改选其他 slot。
 
 ## 27.3 联合 planner
 
@@ -126,12 +124,17 @@ frame class word、owner session、任务 timestamp、真实 crossing 和 noise 
 ## 27.4 配额、长度和档位
 
 ~~~toml
+[[generate.stream.quotas]]
+name = "six_sequences"
+period = "schedule"
+counts = { ticket_booking = 3, smart_home = 3 }
+
 [class.ticket_booking.generate]
-sequences = 3
+instruction = "围绕同一次购票请求生成连贯的多帧对话。"
 len_range = [4, 5]
 
 [class.smart_home.generate]
-sequences = 3
+instruction = "围绕同一个居家场景生成连贯的多帧设备指令。"
 len_range = [4, 5]
 ~~~
 
@@ -198,11 +201,11 @@ frame_class、noise；档位生效时增加 tier_rank，duplicate 增加 duplica
 
 主输出每行是一条序列 Record，序列类标签是 inherited classification；按类标注 Schema
 分别作用于 ticket_booking 和 smart_home。报告只写 counts、usage、timing、失败桶和
-工件摘要，不写 API key、提示词或原始内容。rules/windows、sequence validator 和
+工件摘要，不写 API key、提示词或原始内容。frame_rules/frame_windows、sequence validator 和
 calendar_days_spanned 只在实际生效面出现。
 
-validator_scrapped 的分解是 sample_validator_scrapped、correlation_scrapped、
-temporal_scrapped 和 sequence_validator_scrapped；序列相似度淘汰单独记在 dedup 桶。
+报告使用 `brief_calls`、`planner.objectives`、`delivery`、`delivery.failures` 和 `quotas`；
+`delivery.failures` 按首个失败阶段归桶，序列相似度淘汰单独记在 dedup 桶。
 
 ## 27.8 工件重放
 
@@ -259,7 +262,7 @@ duplicate 核对源 payload、tier_rank 和 duration 被继承。重放后用报
 ## 27.10 本次真实验收记录
 
 2026-08-20 使用当前 examples/synth-stream 配置和 DeepSeek profile 完成最终真实生成与
-process replay。本节数字是该次运行的观测值，不是尝试配额的输出保证；此前 failed-closed
+process replay。本节数字是该次运行的观测值，不是slot target的输出保证；此前 failed-closed
 运行见 `docs/dev/E2E-FINDINGS.md` 第 38、39 条，不能改写为本次成功。
 
 生成命令为：
@@ -274,11 +277,11 @@ uv run labelkit run --config config.toml --project project.toml --console plain
 | 观测面 | 本次结果 |
 |---|---|
 | 主链计数 | generated 6、emitted 5、dropped_verify 1、failed 0 |
-| 尝试配额 | planned 6；ticket_booking 3/3，smart_home 3/3 |
+| slot target | planned 6；ticket_booking 3/3，smart_home 3/3 |
 | 类内档位 | ticket_booking：rank 1 为 1/1、rank 2 为 2/2；smart_home：rank 1 为 2/2、rank 2 为 1/1 |
 | 时间流布局 | sessions 5、crossed_sessions 1、frames 27、noise_frames 3、duplicates 1、calendar_days_spanned 8 |
-| 生成调用 | plan_calls 6、realize_calls 6、noise_calls 1 |
-| 规则计数 | sampled 6、correlation_scrapped 0、temporal_scrapped 0、sequence_validator_scrapped 0 |
+| 生成调用 | brief_calls 6、realize_calls 6、noise_calls 1 |
+| 交付报表使用 `brief_calls`、`planner.objectives`、`delivery`、`delivery.failures` 和 `quotas`；失败按首个阶段归桶，序列相似度淘汰单独记在 dedup 桶。
 | 工件 | 34 行；sha256:927e469e16df3f007f057357a267b8f8228506a5dfb279dc83bdfa1f1da672bf |
 | LLM 用量 | calls 53、prompt 12173、completion 4487、retries 0 |
 | 时延 | wall_s 35.214 |
@@ -302,7 +305,7 @@ attempt；不要用增加 token 代替显式关闭 thinking。
 的 top-level required 属性；窗口必须是同一天半开区间，不能跨午夜。
 
 **没有输出。** 区分配置不可满足和内容作废：前者应在 validate 阶段失败，后者应在
-plan_failures、realize_failures、validator_scrapped 或 dedup 桶中体现。规则验证失败不会
+delivery.failures 的对应阶段桶或 dedup 桶中体现。规则验证失败不会
 触发重规划或 fallback。
 
 **重放没有 duplicate。** 确认运行的是 project-replay.toml、输入路径未被覆盖、gap_s

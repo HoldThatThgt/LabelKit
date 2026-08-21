@@ -1,8 +1,12 @@
 """v1.6 key-pool integration tests against the REAL endpoint (glm-5.2 via
 api.z.ai). No mocks — per project policy the rotation / auth-disable paths are
-exercised with real HTTP: pool members alias the one real key (rotation), and
-the 401-disable path uses a deliberately INVALID key value in a second env var
-(a genuine 401 from the provider, zero mock infrastructure).
+exercised with real HTTP: distinct key values rotate across pool members, and
+the 401-disable path uses a deliberately INVALID key value (a genuine 401 from
+the provider, zero mock infrastructure).
+
+v1.17 Wave 2b（CONTRACTS §7.19.3）：密钥值经 RuntimeCredentials 进入客户端——
+两个环境变量别名**同一**密钥值时，凭据构造期的值去重让池内只剩一把键（首声明
+者获得 key_env 身份位）；跨**不同**密钥值的轮换/鉴权禁用语义与 v1.6 一致。
 
 Auto-skipped by tests/conftest.py when LABELKIT_ZAI_KEY is absent.
 """
@@ -15,6 +19,7 @@ import pytest
 
 from labelkit.common.config.model import LLMProfile
 from labelkit.common.errors import ProviderFatalError
+from labelkit.common.runtime.credentials import RuntimeCredentials
 from labelkit.common.runtime.llm_client import LLMClient, Message, Part, PromptBundle
 from labelkit.common.observability.obslog import EventLog, MetricsSink
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
@@ -25,22 +30,16 @@ pytestmark = pytest.mark.integration
 BOGUS_KEY = "definitely-not-a-key"
 
 
-def _pool_profile(envs_keys: list[tuple[str, str]], **over) -> LLMProfile:
-    """Pooled profile whose members are (env-var name, key value) pairs; the
-    env vars are exported so the M1-normalized shape is faithful."""
-    for env, key in envs_keys:
-        os.environ[env] = key
-    envs = tuple(env for env, _ in envs_keys)
-    keys = tuple(key for _, key in envs_keys)
+def _pool_profile(envs: list[str], **over) -> LLMProfile:
+    """Pooled profile declaring the given env-var names (values live in creds)."""
+    names = tuple(envs)
     defaults = dict(
         name="default",
         provider="anthropic",
         base_url=ZAI_BASE_URL,
         model=ZAI_MODEL,
-        api_key_env=envs[0],
-        api_key=keys[0],
-        api_key_envs=envs,
-        api_keys=keys,
+        api_key_env=names[0],
+        api_key_envs=names,
         max_concurrency=2,
         timeout_s=120,
         max_retries=2,
@@ -61,26 +60,30 @@ def _real_key() -> str:
     return os.environ[ZAI_KEY_ENV]
 
 
-async def test_rotation_two_aliases_of_real_key():
-    """Both pool members alias the ONE real key: least-in-flight selection must
-    spread concurrent calls across both, and every call succeeds."""
-    prof = _pool_profile([("LK_POOL_ITEST_A", _real_key()),
-                          ("LK_POOL_ITEST_B", _real_key())])
-    client = LLMClient({"default": prof}, {})
-    prompts = [_prompt(f"{n}+{n} 等于几？只回答数字。") for n in (1, 2, 3, 4)]
+def _pool_creds(values: list[str]) -> RuntimeCredentials:
+    """凭据携带池成员的密钥值——§7.19.3 构造期值去重的真实落点。"""
+    return RuntimeCredentials(llm={"default": tuple(values)}, embedding={})
+
+
+async def test_duplicate_key_values_collapse_into_one_pool_member():
+    """v1.17 §7.19.3 值去重真面：两个环境变量别名**同一**真实密钥 ⇒ 凭据构造期
+    去重让池内只剩一把键，首声明者获得 key_env 身份位；流量全部成功。"""
+    prof = _pool_profile(["LK_POOL_ITEST_A", "LK_POOL_ITEST_B"])
+    client = LLMClient({"default": prof}, {},
+                       _pool_creds([_real_key(), _real_key()]))
+    pool = client._pool("llm", prof)
+    assert pool.size == 1                       # 同值别名坍缩成一把键
+    assert pool.states[0].env == "LK_POOL_ITEST_A"
+    prompts = [_prompt(f"{n}+{n} 等于几？只回答数字。") for n in (1, 2)]
     try:
         responses = await asyncio.gather(
             *(client.complete("default", p) for p in prompts))
     finally:
         await client.aclose()
-    assert len(responses) == 4 and all(r.text.strip() for r in responses)
+    assert len(responses) == 2 and all(r.text.strip() for r in responses)
     usage = client.usage_by_profile["default"]
-    assert usage.calls == 4
-    key_calls = {env: ku.calls for env, ku in usage.keys.items()}
-    assert sum(key_calls.values()) == 4
-    # max_concurrency=2 + in-flight accounting → both keys carry traffic
-    assert key_calls.get("LK_POOL_ITEST_A", 0) >= 1
-    assert key_calls.get("LK_POOL_ITEST_B", 0) >= 1
+    assert usage.calls == 2
+    assert set(usage.keys) == {"LK_POOL_ITEST_A"}   # 身份位 = 首个声明者
     assert not any(ku.disabled for ku in usage.keys.values())
 
 
@@ -93,15 +96,15 @@ async def test_bogus_first_key_absorbed_and_rotates(tmp_path):
 
     from labelkit.common.config.model import TraceConfig
 
-    prof = _pool_profile([("LK_POOL_ITEST_BAD", BOGUS_KEY),
-                          ("LK_POOL_ITEST_GOOD", _real_key())],
+    prof = _pool_profile(["LK_POOL_ITEST_BAD", "LK_POOL_ITEST_GOOD"],
                          max_concurrency=1)
+    creds = _pool_creds([BOGUS_KEY, _real_key()])
     trace_path = tmp_path / "pool.trace.jsonl"
     cfg = obslog_cfg(tmp_path, trace=TraceConfig(
         enabled=True, path=str(trace_path), channels=("llm",)))
     log = EventLog(cfg.trace, "itest")
     sink = MetricsSink(cfg, "itest", log)
-    client = LLMClient({"default": prof}, {}, sink)
+    client = LLMClient({"default": prof}, {}, creds, sink)
     try:
         resp = await client.complete("default", _prompt("1+1 等于几？只回答数字。"))
     finally:
@@ -128,12 +131,12 @@ async def test_all_keys_bogus_last_live_key_hard_trips(tmp_path):
     """Pool generalization of the P2-3 guarantee: when the LAST live key
     auth-fails, the run trips immediately (hard) — a fully-revoked pool can
     never grind on silently."""
-    prof = _pool_profile([("LK_POOL_ITEST_BAD1", BOGUS_KEY),
-                          ("LK_POOL_ITEST_BAD2", BOGUS_KEY + "-2")],
+    prof = _pool_profile(["LK_POOL_ITEST_BAD1", "LK_POOL_ITEST_BAD2"],
                          max_concurrency=1)
+    creds = _pool_creds([BOGUS_KEY, BOGUS_KEY + "-2"])
     cfg = obslog_cfg(tmp_path)
     sink = MetricsSink(cfg, "itest", EventLog(cfg.trace, "itest"))
-    client = LLMClient({"default": prof}, {}, sink)
+    client = LLMClient({"default": prof}, {}, creds, sink)
     try:
         with pytest.raises(ProviderFatalError) as ei:
             await client.complete("default", _prompt("ping"))
@@ -147,16 +150,17 @@ async def test_all_keys_bogus_last_live_key_hard_trips(tmp_path):
     assert usage.keys["LK_POOL_ITEST_BAD2"].disabled is True
 
 
-async def test_probe_all_pooled_probes_every_key():
-    prof = _pool_profile([("LK_POOL_ITEST_P1", _real_key()),
-                          ("LK_POOL_ITEST_P2", _real_key())])
-    client = LLMClient({"default": prof}, {})
+async def test_probe_all_deduped_pool_probes_the_unique_key_once():
+    """v1.17 §7.19.3：同值别名坍缩后，probe_all 只探那把唯一键（key_env = 首个
+    声明者）；probe() 保持单条结果形态（key_env=None）。"""
+    prof = _pool_profile(["LK_POOL_ITEST_P1", "LK_POOL_ITEST_P2"])
+    client = LLMClient({"default": prof}, {},
+                       _pool_creds([_real_key(), _real_key()]))
     try:
         results = await client.probe_all("default")
         single = await client.probe("default")
     finally:
         await client.aclose()
-    assert [r.key_env for r in results] == ["LK_POOL_ITEST_P1", "LK_POOL_ITEST_P2"]
+    assert [r.key_env for r in results] == ["LK_POOL_ITEST_P1"]
     assert all(r.ok for r in results), [r.error for r in results]
-    # probe() keeps the legacy single-result shape (first key, key_env=None)
     assert single.ok and single.key_env is None

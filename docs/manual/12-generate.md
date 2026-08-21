@@ -65,9 +65,7 @@ standalone_count = 500        # 目标产出条数（与 seed_examples 互斥）
 
 提示词不含示例段，多样性完全来自 instruction 的开放度和 styles 的分桶（12.4）。适合「我要的类型可以被描述清楚，但没有现成例句」的场景。
 
-两种形态下合成记录的 `generated_from` 恒为空数组（种子不是记录、没有记录 id；种子本身留在 project.toml 里可审计），`generator` 照常携带——所以**判断一条记录是否合成，只看 `generator ≠ null`**。
-
-守恒恒等式退化为 `emitted + dropped_* + failed = generated`；产出 0 条不算错误（照常写报告、退出码 0）。
+`generate.stream` 的 v1.17 quota 是成功交付目标，不再是 旧 `sequences` 尝试数（v1.17 仅作 CONFIG_ERROR 负例）；finite schedule 是硬边界。`day`、`week`、`schedule` quota 可同时约束同一 occurrence，`crossed_sessions` 推导 session 数，内容失败只重试固定 slot。旧键 `sessions`、`ts_start`、`rules`、`windows`、旧 `[class.*.generate].sequences` 在 v1.17 定向报错，不提供兼容别名。
 
 `generate_only` 还有**第三形态**——时间流生成（v1.13），见下。
 
@@ -92,27 +90,41 @@ temperature = 0.9
 
 [generate.stream]
 enabled = true
-sessions = 5                  # 会话数；交叉会话数 = Σsequences − sessions
-noise_ratio = 0.1             # 掺入的无关干扰帧占任务帧的比例
-duplicates = 1                # 原样重发几条序列（落流尾新会话）
+crossed_sessions = 1
+noise_ratio = 0.1
+max_attempts_per_slot = 3
+duplicates = 1
 frame_gap_s = [5, 60]
-ts_start = "2026-01-05T09:00:00+08:00"
 
-[[generate.stream.rules]]
+[generate.stream.schedule]
+start = "2026-01-05T08:00:00+08:00"
+end = "2026-01-06T23:00:00+08:00"
+
+[[generate.stream.quotas]]
+name = "six_sequences"
+period = "schedule"
+counts = { ticket_booking = 3, smart_home = 3 }
+
+[[generate.stream.noise]]
+frame_class = "chatter"
+weight = 1
+
+[[generate.stream.frame_rules]]
+name = "request_chains_to_ack"
 template = "chain_response"
 source = "task_request"
 target = "acknowledgement"
-time_s = [1200, 2400]        # 半开区间：20 分钟可取，40 分钟不可取
-correlation = { operator = "equal", source_field = "subject_id", target_field = "subject_id" }
+time_s = [1200, 2400]
+correlation = { source_field = "subject_id", target_field = "subject_id" }
 
-[[generate.stream.windows]]
+[[generate.stream.frame_windows]]
+name = "ticket_request_work_hours"
 frame_class = "task_request"
 of_day = [["08:00", "11:00"], ["14:00", "17:00"]]
 of_week = ["mon", "tue", "wed", "thu", "fri"]
 
 [class.ticket_booking.generate]
-instruction = """……"""        # 配额与长度按序列类挂
-sequences = 3
+instruction = "……"
 len_range = [4, 5]
 ```
 
@@ -120,8 +132,8 @@ len_range = [4, 5]
 
 | | 平面生成（12.3 两形态） | 时间流形态（v1.13） |
 |---|---|---|
-| 一次调用产出 | `num_per_call` 条独立文本 | 默认路径是一条蓝图；启用规则/窗口时是固定帧类词对应的 brief。另一类调用实现这条序列的全部帧内容 |
-| 配额 | `num_per_record` / `standalone_count` | 按类 `sequences` × `len_range`（同为**尝试配额**，不补齐） |
+| 一次调用产出 | `num_per_call` 条独立文本 | 默认路径是一条蓝图；启用规则/窗口时是固定帧类词对应的 brief。另一类调用实现这条序列的全部帧内容；delivery attempt 按 slot 计，不能把 brief/realize 两个调用误当成两次 slot attempt |
+| 配额 | `num_per_record` / `standalone_count` | 按 `[[generate.stream.quotas]]` 的 target × `len_range`（固定 slot 有界重试，精确交付） |
 | 结构 | 无 | 无规则/窗口时沿用机械交织；约束面在场时由联合 planner 在 LLM 前共同冻结 word、occurrence witness、session、crossing、timestamp 与 noise 槽 |
 | 产物 | 主输出 | 主输出（一行 = 一条序列）**+ 时间流工件**（一行 = 一帧，可当输入重放） |
 | 本章键的效力 | 全部生效 | `llms`/`mixture`/`weights`/`styles`/`temperature`/`sample_validator` 生效（作用面见第 27 章 27.4）；`num_per_call` 只管噪音批装箱；`seed_examples`/`standalone_count`/`num_per_record`/`seeds_per_call` **显式书写即配置错误** |
@@ -214,10 +226,15 @@ temperature = 0.9             # 生成温度（覆盖 profile）
 sample_validator = ""         # 可选：样本级代码校验回调 "module:function"（见下）
 seed_examples = []            # generate_only 种子池形态专用（process 模式不得设置）
 standalone_count = 500        # generate_only 无种子形态专用（与 seed_examples 互斥）
-sequences = 0                 # v1.13 时间流形态：全局默认序列配额（按类覆盖）
-len_range = [3, 6]            # v1.13 时间流形态：全局默认序列长度区间（按类覆盖）
-# [[generate.styles]] 子表见 12.4
-# [generate.stream] 子表（时间流形态七键）见第 27 章 27.3 与附录 A.13
+# 时间流形态的配额唯一写在 [[generate.stream.quotas]]；旧 sequences 键仅用于 CONFIG_ERROR 负例
+[[generate.stream.quotas]]
+name = "six_sequences"
+period = "schedule"
+counts = { ticket_booking = 3, smart_home = 3 }
+# len_range 在每个参与 sequence class 的 [class.<name>.generate] 中声明
+
+# 仅平面生成形态的参数；时间流的 quota、schedule、frame_rules/frame_windows 与 sequence_rules 见上文
+
 ```
 
 ## 12.7 instruction 写作要点

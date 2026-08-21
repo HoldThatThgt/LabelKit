@@ -30,7 +30,7 @@
 
 v1.12（流模式帧粒度，第 25 章 25.6）**零新增错误码**：帧级分类/标注的失败复用既有 kind（结构修复耗尽照旧是 `schema_violation` 等），且**不产生 rejects 行**——帧分类失败落兜底帧类（计 `report.stream.frame_classify.fallback` / `window_failures`），帧标注失败落 members[] 的 `status="failed"`（计 `frame_annotate.failed`），episode 信封照常发射。排查入口见 18.2 的「members 里大量 status="failed"」。
 
-时间流生成到 v1.16 仍**零新增错误码**，内容失败也不进 rejects：brief/realize 修复穷尽、逐帧 hook、correlation 或序列 hook 违规都按「该序列整条作废」处置，不产 failed 记录、不补生成。联合 planner 的 `INFEASIBLE` / deterministic-budget `UNKNOWN` 是启动配置错误；`MODEL_INVALID` 是实现缺陷，走退出码 4，不能伪装成用户配置不可满足。
+时间流生成到 v1.17 仍**零新增错误码**，内容失败也不进 rejects：brief/realize 修复穷尽、逐帧 hook、correlation 或序列 hook 违规都按「该序列整条作废」处置，不产 failed 记录、不补生成。联合 planner 的 `INFEASIBLE` / deterministic-budget `UNKNOWN` 是启动配置错误；`MODEL_INVALID` 是实现缺陷，走退出码 4，不能伪装成用户配置不可满足。
 
 ## 18.2 按症状排查
 
@@ -146,7 +146,7 @@ jq -e '.run.interrupted == false and .run.circuit_broken == false' out/report.js
 
 ### 「工件重放时会话对不上」（v1.13）
 
-现象：把时间流工件拷去重放，摄取侧会话数与生成报告对不上。先核对 `order_by`、`gap_s`、`key` 与 `gap_steps`。v1.16 还要注意：显式 `time_s` 可以让 owner 相邻帧超过 `frame_gap_s`，但绝不会超过同一份 `stream.gap_s`；摄取侧以 `delta > gap_s` 才切 session，等于阈值不会切。duplicate 恒另占流尾 session，生成报告的 primary `sessions` 不含它。
+现象：把时间流工件拷去重放，摄取侧会话数与生成报告对不上。先核对 `order_by`、`gap_s`、`key` 与 `gap_steps`。v1.17 还要注意：显式 `time_s` 可以让 owner 相邻帧超过 `frame_gap_s`，但绝不会超过同一份 `stream.gap_s`；摄取侧以 `delta > gap_s` 才切 session，等于阈值不会切。duplicate 恒另占流尾 session，生成报告的 primary `sessions` 不含它。
 
 ### 「按类标注 Schema 没生效」（v1.13）
 
@@ -154,7 +154,7 @@ jq -e '.run.interrupted == false and .run.circuit_broken == false' out/report.js
 
 ### 「合成序列大批作废 / 交叉演示位没了」（v1.13）
 
-现象：时间流生成的 `produced` 少于 `planned`，或 `crossed_sessions` 掉到 0。先按类与档位定位 plan/realize 缺口，再核四个 validator 子项。`correlation_scrapped` 表示模型生成的类型敏感相等关系未成立；`temporal_scrapped` 在正常实现里应为零，出现即保存配置与 seed 报缺陷；`sample_validator_scrapped` 与 `sequence_validator_scrapped` 分别指向两个用户 hook。`crossed_sessions` 按 survivor 固定时间轴上真实 A-B-A / B-A-B 交替计算，一条 owner 作废后会退化，但不会重新装箱。相似度淘汰仍看 `survived_dedup`，不要用放松 dedup 阈值掩盖内容同质化。
+现象：时间流生成的 `produced` 少于 `planned`，或 `crossed_sessions` 掉到 0。先先看 `report.generate.stream.delivery` 的 target/delivered/complete，再按 `delivery.failures` 定位 brief、realize、noise、correlation、temporal、sequence_validator、similarity 或 scenario_validator 缺口；`planner.objectives` 记录规划目标，`quotas` 记录周期归因。`crossed_sessions` 按 survivor 固定时间轴上真实 A-B-A / B-A-B 交替计算，一条 owner 作废后会退化，但不会重新装箱。相似度淘汰仍看 `survived_dedup`，不要用放松 dedup 阈值掩盖内容同质化。
 
 ### 「运行频繁被 429 限流拖慢 / 中断」
 

@@ -68,10 +68,9 @@ from typing import TYPE_CHECKING, Any, Sequence
 from datasketch import MinHash, MinHashLSH
 
 from labelkit.common.config.model import (
-    apportion_tiers,
-    effective_rules,
-    effective_tiers,
-    effective_windows,
+    effective_frame_rules,
+    effective_frame_windows,
+    render_constraint_text,
 )
 from labelkit.common.errors import (
     CircuitBreakerTripped,
@@ -90,16 +89,17 @@ from labelkit.common.contracts.types import (
     RecordRef,
     SequenceValidationFrame,
     SequenceValidationInput,
+    ScenarioSequence,
+    ScenarioValidationInput,
 )
 from labelkit.common.runtime import budget
-from labelkit.common.runtime.declare import render_constraint_text
 from labelkit.common.runtime.schema_engine import CallScope
 from labelkit.operators.generate_stream import (
     NoiseCallPlan,
+    RealizedNoise,
     RealizedSequence,
     SequencePlan,
     StreamGenerateProduct,
-    StreamPlan,
     _BRIEF_STRUCTURE,
     _BRIEF_SYSTEM_HEAD,
     _BRIEF_SYSTEM_STATIC,
@@ -123,16 +123,13 @@ from labelkit.operators.generate_stream import (
     _text_bundle,
     assemble_stream,
     backfill_time_fields,
-    expand_stream_quota,
-    plan_stream,
+    plan_delivery,
     predraw_llm_style,
-    render_plan_prompt_texts,
     render_brief_prompt_texts,
     render_realize_prompt_texts,
     stream_artifact_path,
-    tier_rank_for_ordinal,
-    weave_planned_stream,
-    weave_stream,
+    weave_scenario_stream,
+    _us_iso,
 )
 
 if TYPE_CHECKING:
@@ -157,6 +154,13 @@ if TYPE_CHECKING:
 _log = logging.getLogger("labelkit.generate")
 
 _REALIZE_FREE_TEXT_JSON = 'JSON 字符串（如 "..."），不得用对象包裹'
+
+_DELIVERY_FAILURES = (
+    "brief", "realize", "noise", "context_overflow", "sample_validator",
+    "sample_validator_exception", "correlation", "temporal",
+    "sequence_validator", "sequence_validator_exception", "similarity",
+    "scenario_validator", "scenario_validator_exception",
+)
 
 
 # ── 规范化辅助 ──
@@ -437,13 +441,22 @@ class SimilarityFilter:
         @param text 待判定文本。
         @return True = 新颖（已入库）；False = 近重（未入库）。
         """
-        m = self._minhash(text)
-        if self._is_duplicate(m):
+        novel, signature = self.probe(text)
+        if not novel:
             return False
-        key = f"s{len(self._sigs)}"
-        self._sigs[key] = m
-        self._lsh.insert(key, m)
+        self.commit(signature)
         return True
+
+    def probe(self, text: str) -> tuple[bool, MinHash]:
+        """探测文本是否近重，但不修改索引。"""
+        signature = self._minhash(text)
+        return not self._is_duplicate(signature), signature
+
+    def commit(self, signature: MinHash) -> None:
+        """提交已经通过探测的签名。"""
+        key = f"s{len(self._sigs)}"
+        self._sigs[key] = signature
+        self._lsh.insert(key, signature)
 
 
 # ── 种子选取（process 模式，spec 3.6.2 种子选取 / v1.7 按类种子池）─────────
@@ -543,16 +556,24 @@ class _SampleGate:
     直接剔除（不重试、不产 failed 记录），按桶计数由调用方负责；回调自身抛异常视同
     违规，并只提示一次。未配置钩子时闸门常开。"""
 
-    def __init__(self, hook_ref: str | None):
+    def __init__(self, hook_ref: str | None, target=None):
         """解析并持有回调。
 
-        :param hook_ref: ``generate.sample_validator`` 的 ``module:function``
-            引用；None 或空串 ⇒ 闸门常开。
+        【临时接线·v1.17 Wave 2a】``target`` 是 M1 冻结载体
+        (``ResolvedConfig.validation_hooks.sample``)里的 callable——M1 装载的
+        配置恒有；直接构造 ResolvedConfig 的旧调用面不传, 回落旧字符串解析。
+        v1.17 后续 wave 把 invoke 面全部改读冻结载体后, ``hook_ref`` 解析腿删除。
+
+        :param hook_ref: ``generate.sample_validator`` 引用串；None 或空串 ⇒
+            闸门常开。
+        :param target: M1 冻结的 callable（优先）；缺省回落 ``hook_ref`` 解析。
         """
         # 懒导入 + 每次解析：钩子解析面允许被测试替换，构造期解析保持单次开销。
         self._hook_ref = hook_ref
         self._hook = None
-        if hook_ref:
+        if target is not None:
+            self._hook = target
+        elif hook_ref:
             from labelkit.common.extensions.hooks import resolve_hook
             self._hook = resolve_hook(hook_ref)
         self._warned = False
@@ -619,8 +640,11 @@ def postprocess_samples(plans: Sequence[CallPlan],
                             num_perm=d.minhash_num_perm, ngram=d.ngram)
     for text in seed_texts:
         filt.add(text)
-    pc = _PostprocessContext(gate=_SampleGate(cfg.generate.sample_validator),
-                             filt=filt, cfg=cfg, metrics=metrics)
+    frozen = cfg.validation_hooks.sample if cfg.validation_hooks else None
+    pc = _PostprocessContext(
+        gate=_SampleGate(cfg.generate.sample_validator,
+                         target=frozen.target if frozen else None),
+        filt=filt, cfg=cfg, metrics=metrics)
     records: list[tuple[Record, str | None]] = []
     for plan, samples in zip(plans, results):
         key = bucket_key(plan.llm, plan.style_name, plan.class_name)
@@ -794,11 +818,37 @@ class GenerateStage:
         """
         self._cfg = cfg
         self._sequence_validator_ref = cfg.generate.sequence_validator
+        self._scenario_validator_ref = cfg.generate.scenario_validator
         self._sequence_validator = None
+        self._scenario_validator = None
         if self._sequence_validator_ref:
-            from labelkit.common.extensions.hooks import resolve_hook
+            # 【临时接线·v1.17 Wave 2a】M1 冻结载体优先；直接构造 cfg 的旧调用面
+            # （validation_hooks = None）回落旧字符串解析, 后续 wave 统一改读载体。
+            frozen = (cfg.validation_hooks.sequence
+                      if cfg.validation_hooks else None)
+            if frozen is not None:
+                self._sequence_validator = frozen.target
+            else:
+                from labelkit.common.extensions.hooks import resolve_hook
 
-            self._sequence_validator = resolve_hook(self._sequence_validator_ref)
+                self._sequence_validator = resolve_hook(self._sequence_validator_ref)
+        if self._scenario_validator_ref:
+            frozen = (cfg.validation_hooks.scenario
+                      if cfg.validation_hooks else None)
+            if frozen is not None:
+                self._scenario_validator = frozen.target
+            else:
+                from labelkit.common.extensions.hooks import resolve_hook
+                self._scenario_validator = resolve_hook(self._scenario_validator_ref)
+        self._delivery_failures = {key: 0 for key in _DELIVERY_FAILURES}
+        self._delivery_attempts = 0
+        self._delivery_exhausted = 0
+        self._delivery_sequences = 0
+        self._delivery_noise = 0
+        self._delivery_interrupted = False
+        self._scenario_accepted: list[ScenarioSequence] = []
+        self._last_stream_failure = None
+        self._stream_similarity: SimilarityFilter | None = None
 
     async def run(self, batch: list[PipelineItem], ctx: "RunContext") -> list[PipelineItem]:
         """process 模式入口：返回由新 PipelineItem 组成的子批（输入批丝毫不动）。
@@ -945,46 +995,175 @@ class GenerateStage:
     # ── v1.13 时间流形态（SPEC-stream-generation §3.2）──
 
     async def generate_stream_all(self, ctx: "RunContext") -> StreamGenerateProduct:
-        """GENERATE_ONLY 时间流形态入口（M10 分支调用一次；ctx.batch_no == 0，
-        ctx.rng == Random(f"{seed}:0:generate")）。计划期抽签（①②③）→ 派发
-        （零 rng：逐序列蓝图→实现作业与噪音批并发）→ 逐帧钩子与序列相似度过滤 →
-        机械交织（④–⑨）→ v1.14 时间字段回填尾声（零 rng，先于行对象与 id 计算）→
-        直装组装。作废序列只缺席，不产 failed 记录。
+        """GENERATE_ONLY 时间流形态入口（M10 分支调用一次；ctx.batch_no == 0）。
 
-        @param ctx 运行上下文（rng / metrics / schema_engine）。
+        v1.17：布局（word/length/session/timestamp/tier/noise/duplicate）零重排承源
+        M1 冻结的 ``cfg.scenario_plan``；本入口只做逐槽位交付——每 sequence slot 一次
+        brief + 一次 realize、每 noise slot 一次 realize（Wave 6 才引入状态机/重试/
+        13 桶，本波失败即槽位作废，v1.16 void 语义过渡）——payload 经
+        sample_validator / sequence_validator / 相似度过滤（沿 2a 冻结载体优先面），
+        然后布局驱动装配 + v1.14 时间字段回填（先回填后 duplicate 深拷贝）。作废槽位
+        只缺席，不产 failed 记录。
+
+        @param ctx 运行上下文（metrics / schema_engine；rng 不参与计划面）。
         @return 时间流生成产物（成员信封与可重放工件行）。
         """
-        plan = plan_stream(self._cfg, ctx.rng)
-        for seq_plan in plan.sequences:
+        delivery = plan_delivery(self._cfg)
+        plan = self._cfg.scenario_plan
+        for seq_plan in delivery.sequences:
             ctx.metrics.count(
                 f"generate.stream.sequences.{seq_plan.class_name}.planned")
             if seq_plan.tier_rank is not None:      # v1.14 逐档计划期计数（v1.15 类段键）
                 ctx.metrics.count(f"generate.stream.tiers.{seq_plan.class_name}"
                                   f".{seq_plan.tier_rank}.planned")
-        results = await asyncio.gather(
-            *(self._stream_sequence_job(p, ctx) for p in plan.sequences),
-            *(self._stream_noise_call(p, ctx) for p in plan.noise_plans))
-        realized = [r for r in results[: len(plan.sequences)] if r is not None]
-        noise: list[str] = []
-        for samples in results[len(plan.sequences):]:
-            noise.extend(samples or ())
-        survivors = self._filter_stream_sequences(realized, ctx)
-        if plan.planner_active:
-            sessions, stats = weave_planned_stream(
-                survivors, noise[: plan.noise_target], plan, self._cfg)
-        else:
-            sessions, stats = weave_stream(survivors, noise[: plan.noise_target],
-                                           self._cfg, ctx.rng)
-            backfill_time_fields(sessions, self._cfg)
+        realized = []
+        self._scenario_accepted = []
+        d = self._cfg.dedup
+        self._stream_similarity = SimilarityFilter(
+            threshold=d.minhash_threshold, num_perm=d.minhash_num_perm, ngram=d.ngram)
+        for seq_plan in delivery.sequences:
+            result = await self._retry_sequence_slot(seq_plan, ctx)
+            if result is not None:
+                realized.append(result)
+        noises = []
+        for noise_plan, slot in zip(delivery.noise_plans, plan.noise_slots):
+            result = await self._retry_noise_slot(noise_plan, slot, ctx)
+            if result is not None:
+                noises.append(result)
+                self._delivery_noise += 1
+        survivors = realized
+        self._delivery_sequences = len(survivors)
+        self._publish_delivery_metrics(ctx, len(delivery.sequences),
+                                       len(delivery.noise_plans))
+        sessions, stats = weave_scenario_stream(survivors, noises, plan, self._cfg)
         lines, envelopes = assemble_stream(sessions, survivors, self._cfg)
         self._count_stream_product(survivors, stats, ctx)
         return StreamGenerateProduct(envelopes=envelopes, artifact_lines=lines)
+
+    def _publish_delivery_metrics(self, ctx, target_sequences: int,
+                                  target_noise: int) -> None:
+        """发布交付尝试、失败桶和完成状态计数。"""
+        for key, value in self._delivery_failures.items():
+            if value:
+                ctx.metrics.count(f"generate.stream.delivery.failures.{key}", value)
+        ctx.metrics.count("generate.stream.delivery.attempts", self._delivery_attempts)
+        ctx.metrics.count("generate.stream.delivery.exhausted", self._delivery_exhausted)
+        if self._delivery_sequences != target_sequences or self._delivery_noise != target_noise:
+            ctx.metrics.count("generate.stream.delivery.incomplete")
+
+    async def _retry_sequence_slot(self, plan, ctx):
+        """按 slot 顺序重试完整序列候选。"""
+        for _ in range(self._cfg.generate_stream.max_attempts_per_slot):
+            self._delivery_attempts += 1
+            self._last_stream_failure = None
+            steps = await self._stream_brief_call(plan, ctx)
+            if steps is None:
+                if self._last_stream_failure == "context_overflow":
+                    break
+                continue
+            payloads = await self._stream_realize_call(plan, steps, ctx)
+            if payloads is None or len(payloads) != len(steps):
+                self._stream_failure("realize")
+                continue
+            if not self._stream_sequence_valid(plan, steps, payloads, ctx):
+                continue
+            candidate = RealizedSequence(plan=plan,
+                                         frame_classes=tuple(fc for fc, _ in steps),
+                                         payloads=tuple(payloads))
+            probe = "\x1e".join(_payload_text(p) for p in candidate.payloads)
+            novel, signature = self._stream_similarity.probe(probe)
+            if not novel:
+                self._stream_failure("similarity")
+                continue
+            if not self._stream_scenario_valid(candidate, self._scenario_accepted, ctx):
+                continue
+            self._stream_similarity.commit(signature)
+            self._scenario_accepted.append(self._scenario_input(candidate, ()).candidate)
+            return candidate
+        self._delivery_exhausted += 1
+        return None
+
+    async def _retry_noise_slot(self, plan, slot, ctx):
+        """按 slot 顺序重试 noise realization。"""
+        for _ in range(self._cfg.generate_stream.max_attempts_per_slot):
+            self._delivery_attempts += 1
+            self._last_stream_failure = None
+            result = await self._stream_noise_call(plan, slot, ctx)
+            if result is not None:
+                return result
+            if self._last_stream_failure == "context_overflow":
+                break
+        self._delivery_exhausted += 1
+        return None
+
+    def _stream_failure(self, bucket: str) -> None:
+        """记录当前 attempt 的首个失败桶。"""
+        if self._last_stream_failure is not None:
+            return
+        self._last_stream_failure = bucket
+        self._delivery_failures[bucket] += 1
+
+    def _stream_call_failure(self, phase: str, exc: LabelKitError) -> None:
+        """按调用阶段记录一次 attempt 的首个失败。"""
+        if isinstance(exc, ContextOverflowError) and exc.phase == "precheck":
+            self._stream_failure("context_overflow")
+            return
+        self._stream_failure(phase)
+
+    def _scenario_input(self, seq, accepted):
+        """组装 scenario validator 的 clone-safe 增量输入。"""
+        stamps = seq.plan.timestamps_us
+        candidate = ScenarioSequence(
+            slot_key=seq.plan.slot_key, sequence_class=seq.plan.class_name,
+            start=_us_iso(stamps[0], self._cfg), end=_us_iso(stamps[-1], self._cfg),
+            frames=tuple(SequenceValidationFrame(
+                i, fc, copy.deepcopy(payload))
+                for i, (fc, payload) in enumerate(zip(seq.frame_classes, seq.payloads))))
+        return ScenarioValidationInput(
+            accepted=tuple(sorted(accepted, key=lambda item: (item.start, item.slot_key))),
+            candidate=copy.deepcopy(candidate))
+
+    def _stream_scenario_valid(self, seq, accepted, ctx) -> bool:
+        """执行 frozen scenario hook；异常和违规使用独立桶。"""
+        if self._scenario_validator is None:
+            return True
+        from labelkit.common.extensions.hooks import normalize_violations
+        try:
+            violations = normalize_violations(
+                self._scenario_validator(self._scenario_input(seq, accepted)),
+                self._scenario_validator_ref)
+        except Exception:
+            self._stream_failure("scenario_validator_exception")
+            return False
+        if violations:
+            self._stream_failure("scenario_validator")
+            return False
+        return True
+
+    def _stream_replay_valid(self, plan, payloads) -> bool:
+        """回放 frame rule，区分 correlation 与 temporal 失败。"""
+        from labelkit.common.runtime.scenario.rules import EvalFrame, evaluate_frame_rule
+        view = self._cfg.class_views[plan.class_name]
+        rules = effective_frame_rules(view.frame_rules, self._cfg.generate_stream.frame_rules)
+        frames = tuple(EvalFrame(fc, plan.timestamps_us[i], plan.timestamps_us[i],
+                                 payload if isinstance(payload, dict) else None)
+                       for i, (fc, payload) in enumerate(zip(plan.frame_classes, payloads)))
+        for rule in rules:
+            try:
+                verdict = evaluate_frame_rule(rule, frames)
+            except Exception:
+                self._stream_failure("temporal")
+                return False
+            if not verdict.valid:
+                self._stream_failure("correlation" if rule.correlation else "temporal")
+                return False
+        return True
 
     async def _stream_sequence_job(self, plan: SequencePlan,
                                    ctx: "RunContext") -> RealizedSequence | None:
         """一条序列的蓝图 → 帧实现 → 逐帧钩子作业；任一环节作废 ⇒ None（作废语义
         同平面路径 3.6.3：计数 + 值-free 日志，不产 failed 记录）。"""
-        steps = await self._stream_plan_call(plan, ctx)
+        steps = await self._stream_brief_call(plan, ctx)
         if steps is None:
             return None
         payloads = await self._stream_realize_call(plan, steps, ctx)
@@ -998,81 +1177,14 @@ class GenerateStage:
                                 frame_classes=tuple(fc for fc, _ in steps),
                                 payloads=tuple(payloads))
 
-    def _plan_tier_face(self, plan: SequencePlan) -> tuple[tuple["ClassSpec", ...], bool]:
-        """v1.14 蓝图调用的档位面（纯查表，零 rng）。
-
-        档位表在场 ⇒ 帧类表按声明序过滤出档内子集（生效表按 tier_rank 升序存放且连续
-        覆盖 1..N，故 ``表[tier_rank - 1]`` 直取），并要求逐类覆盖；缺省 ⇒ 全表 + 不覆盖，
-        与 v1.13 逐字节一致。v1.15：取的是**本序列类的生效表**（按类表 ?? 全局表）。
-
-        :param plan: 该序列的计划期定稿（携带档位序数）。
-        :returns: (待渲染帧类表, 是否施加逐类覆盖约束)。
-        """
-        cfg = self._cfg
-        classes = cfg.frame_classify.classes
-        if plan.tier_rank is None:
-            return tuple(classes), False
-        table = effective_tiers(cfg.class_views[plan.class_name].tiers,
-                                cfg.generate_stream.tiers)
-        composition = set(table[plan.tier_rank - 1].frame_classes)
-        return tuple(c for c in classes if c.name in composition), True
-
-    async def _stream_plan_call(self, plan: SequencePlan,
-                                ctx: "RunContext") -> list[tuple[str, str]] | None:
-        """蓝图调用（一序列一次；§10.14 模板 + plan_schema 内部待遇）。
-
-        修复穷尽或不可装填 ⇒ 序列作废并计 plan_failures（不产 failed 记录）。
-        v1.14（裁决·蓝图双向硬约束）：档位表在场时帧类表、enum 与覆盖约束都收窄到
-        档内构成，user 行取覆盖变体。
-
-        :param plan: 该序列的计划期定稿。
-        :param ctx: 运行上下文。
-        :returns: 蓝图步序 [(frame_class, brief), ...]；None = 序列作废。
-        """
-        if plan.frame_classes:
-            return await self._stream_brief_call(plan, ctx)
-        cfg = self._cfg
-        gen_c = cfg.class_views[plan.class_name].generate
-        classes, cover_all = self._plan_tier_face(plan)
-        system_text, user_text = render_plan_prompt_texts(
-            gen_c.instruction, classes, plan.class_name, plan.length,
-            cover_all=cover_all)
-        schema = _plan_schema([c.name for c in classes], plan.length,
-                              cover_all=cover_all)
-        bucket = bucket_key(plan.llm, plan.style_name, plan.class_name)
-        ctx.metrics.count(f"generate.buckets.{bucket}.calls")
-        ctx.metrics.count("generate.stream.plan_calls")
-        if cfg.generate.sample_validator:
-            ctx.metrics.count(f"generate.buckets.{bucket}.rejected_by_validator", 0)
-        if not self._stream_fits((system_text, user_text), plan.llm, schema):
-            # V10 先例：最小单元不可装填——从不发出注定失败的请求；precheck 不喂熔断
-            _log.warning(self._void_stream_sequence(plan, ContextOverflowError(
-                "plan call unfittable under the input budget", phase="precheck",
-                profile=plan.llm), "plan", ctx),
-                extra={"stage": self.name, "batch": ctx.batch_no})
-            return None
-        prompt = _text_bundle(system_text, user_text, gen_c.temperature)
-        try:
-            obj, _usage, _attempts, _model = await ctx.schema_engine.complete_validated(
-                plan.llm, prompt, schema=schema,
-                scope=CallScope(batch_no=ctx.batch_no))
-            return [(step["frame_class"], str(step["brief"]))
-                    for step in obj["steps"]]
-        except CircuitBreakerTripped:
-            raise
-        except LabelKitError as exc:
-            _log.warning(self._void_stream_sequence(plan, exc, "plan", ctx),
-                         extra={"stage": self.name, "batch": ctx.batch_no})
-            return None
-
     async def _stream_brief_call(self, plan: SequencePlan,
                                  ctx: "RunContext") -> list[tuple[str, str]] | None:
         """执行 planner 固定帧类词下的 sampled brief 调用。"""
-        from labelkit.common.config.model import effective_rules, effective_windows
-
         view = self._cfg.class_views[plan.class_name]
-        rules = effective_rules(view.rules, self._cfg.generate_stream.rules)
-        windows = effective_windows(view.windows, self._cfg.generate_stream.windows)
+        rules = effective_frame_rules(view.frame_rules,
+                                      self._cfg.generate_stream.frame_rules)
+        windows = effective_frame_windows(view.frame_windows,
+                                          self._cfg.generate_stream.frame_windows)
         constraints = render_constraint_text(rules, windows)
         system_text, user_text = render_brief_prompt_texts(
             view.generate.instruction, plan.frame_classes, plan.class_name,
@@ -1080,11 +1192,12 @@ class GenerateStage:
         schema = _brief_schema(plan.length)
         bucket = bucket_key(plan.llm, plan.style_name, plan.class_name)
         ctx.metrics.count(f"generate.buckets.{bucket}.calls")
-        ctx.metrics.count("generate.stream.plan_calls")
-        ctx.metrics.count("generate.stream.rules.sampled")
+        ctx.metrics.count("generate.stream.brief_calls")
+        ctx.metrics.count("generate.stream.frame_rules.sampled")
         if not self._stream_fits((system_text, user_text), plan.llm, schema):
             exc = ContextOverflowError("brief call unfittable under the input budget",
                                        phase="precheck", profile=plan.llm)
+            self._stream_call_failure("brief", exc)
             _log.warning(self._void_stream_sequence(plan, exc, "plan", ctx),
                          extra={"stage": self.name, "batch": ctx.batch_no})
             return None
@@ -1096,7 +1209,10 @@ class GenerateStage:
                     for index, item in enumerate(obj["steps"])]
         except CircuitBreakerTripped:
             raise
+        except ProviderFatalError:
+            raise
         except LabelKitError as exc:
+            self._stream_call_failure("brief", exc)
             _log.warning(self._void_stream_sequence(plan, exc, "plan", ctx),
                          extra={"stage": self.name, "batch": ctx.batch_no})
             return None
@@ -1142,9 +1258,8 @@ class GenerateStage:
         :returns: 逐帧内容列表；None = 序列作废。
         """
         gen_c = self._cfg.class_views[plan.class_name].generate
-        constrained = bool(plan.frame_classes)
-        schemas, contracts = self._realize_step_faces(steps, constrained)
-        constraint_text = self._stream_constraint_text(plan) if constrained else ""
+        schemas, contracts = self._realize_step_faces(steps, True)
+        constraint_text = self._stream_constraint_text(plan)
         bucket = bucket_key(plan.llm, plan.style_name, plan.class_name)
 
         async def realize(span: tuple[int, int]) -> list:
@@ -1178,7 +1293,10 @@ class GenerateStage:
             return [frame for leaf in leaves for frame in leaf]
         except CircuitBreakerTripped:
             raise
+        except ProviderFatalError:
+            raise
         except LabelKitError as exc:
+            self._stream_call_failure("realize", exc)
             _log.warning(self._void_stream_sequence(plan, exc, "realize", ctx),
                          extra={"stage": self.name, "batch": ctx.batch_no})
             return None
@@ -1186,50 +1304,96 @@ class GenerateStage:
     def _stream_has_correlation(self, plan: SequencePlan) -> bool:
         """判断序列生效规则是否含 correlation。"""
         view = self._cfg.class_views[plan.class_name]
-        rules = effective_rules(view.rules, self._cfg.generate_stream.rules)
+        rules = effective_frame_rules(view.frame_rules,
+                                      self._cfg.generate_stream.frame_rules)
         return any(rule.correlation is not None for rule in rules)
 
     def _stream_constraint_text(self, plan: SequencePlan) -> str:
         """渲染联合路径的生效规则与窗口。"""
         view = self._cfg.class_views[plan.class_name]
-        rules = effective_rules(view.rules, self._cfg.generate_stream.rules)
-        windows = effective_windows(view.windows, self._cfg.generate_stream.windows)
+        rules = effective_frame_rules(view.frame_rules,
+                                      self._cfg.generate_stream.frame_rules)
+        windows = effective_frame_windows(view.frame_windows,
+                                          self._cfg.generate_stream.frame_windows)
         return render_constraint_text(rules, windows)
 
-    async def _stream_noise_call(self, plan: NoiseCallPlan,
-                                 ctx: "RunContext") -> list[str] | None:
-        """噪音批量实现：复用平面生成模板与 samples_schema（裁决·噪音只做插入与
-        重复）；作废 ⇒ None，缺额帧从交织缺席（不补生成）。"""
-        g = self._cfg.generate
-        instruction = self._cfg.generate_stream.noise_instruction
-        system_text, user_text = render_prompt_texts(instruction, plan.style_prompt,
-                                                     g.num_per_call, ())
-        schema = _samples_schema(g.num_per_call)
+    async def _stream_noise_call(self, plan: "NoiseCallPlan", slot: Any,
+                                 ctx: "RunContext") -> "RealizedNoise | None":
+        """单个 noise slot 的一次 realize 调用（复用帧类 realize 路径，plain/structured
+        同走 realize_schema/文本模板；裁决·noise realization 本波提前）。作废 ⇒ None，
+        该槽位从装配缺席（不补生成；重试/失败桶归 Wave 6 的 delivery 面）。"""
+        view = self._cfg.frame_class_views[plan.frame_class]
+        instruction = view.gen_instruction or ""
+        steps = [(plan.frame_class, instruction)]
+        schemas, contracts = self._realize_step_faces(steps, True)
+        schema = _realize_schema(schemas)
         bucket = bucket_key(plan.llm, plan.style_name)
         ctx.metrics.count(f"generate.buckets.{bucket}.calls")
         ctx.metrics.count("generate.stream.noise_calls")
+        system_text, user_text = render_realize_prompt_texts(
+            instruction, plan.style_prompt, steps, contracts)
         if not self._stream_fits((system_text, user_text), plan.llm, schema):
-            _log.warning("noise call voided: unfittable under the input budget "
-                         "call=%d llm=%s", plan.index, plan.llm,
+            self._stream_failure("context_overflow")
+            _log.warning("noise slot voided: unfittable under the input budget "
+                         "slot=%s llm=%s", plan.index, plan.llm,
                          extra={"stage": self.name, "batch": ctx.batch_no})
             return None
-        prompt = build_generate_prompt(instruction, plan.style_prompt,
-                                       g.num_per_call, (), g.temperature)
         try:
             obj, _usage, _attempts, _model = await ctx.schema_engine.complete_validated(
-                plan.llm, prompt, schema=schema,
-                scope=CallScope(batch_no=ctx.batch_no))
-            samples = [str(sample) for sample in obj["samples"]]
-            ctx.metrics.count(f"generate.buckets.{bucket}.produced", len(samples))
-            return samples
+                plan.llm, _text_bundle(system_text, user_text,
+                                       self._cfg.generate.temperature),
+                schema=schema, scope=CallScope(batch_no=ctx.batch_no))
         except CircuitBreakerTripped:
             raise
+        except ProviderFatalError:
+            raise
         except LabelKitError as exc:
+            self._stream_call_failure("noise", exc)
             budget.feed_reactive_terminal(exc, ctx.metrics)
-            _log.warning("noise call voided: call=%d llm=%s kind=%s", plan.index,
-                         plan.llm, _error_kind(exc),
+            _log.warning("noise slot voided: slot=%s class=%s llm=%s kind=%s",
+                         plan.index, plan.frame_class, plan.llm, _error_kind(exc),
                          extra={"stage": self.name, "batch": ctx.batch_no})
             return None
+        payload = obj["frames"][0]
+        if self._stream_noise_valid(plan, payload, ctx):
+            novel, signature = self._stream_similarity.probe(_payload_text(payload))
+            if not novel:
+                self._stream_failure("similarity")
+                return None
+            self._stream_similarity.commit(signature)
+            ctx.metrics.count(f"generate.buckets.{bucket}.produced")
+            return RealizedNoise(slot=slot, payload=payload)
+        return None
+
+    def _stream_noise_valid(self, plan: "NoiseCallPlan", payload: Any,
+                            ctx: "RunContext") -> bool:
+        """noise 帧的 sample_validator 闸门（违规 ⇒ 槽位作废；钩子缺陷视同违规）。"""
+        hook_ref = self._cfg.generate.sample_validator
+        if not hook_ref:
+            return True
+        from labelkit.common.extensions.hooks import normalize_violations, resolve_hook
+
+        # 【临时接线·v1.17 Wave 2a】M1 冻结载体优先, 旧字符串解析仅服务于直接构造
+        # cfg 的调用面; 后续 wave 统一改读冻结载体后本腿删除。
+        frozen = self._cfg.validation_hooks.sample if self._cfg.validation_hooks else None
+        hook = frozen.target if frozen is not None else resolve_hook(hook_ref)
+        try:
+            violations = normalize_violations(hook(_payload_text(payload)), hook_ref)
+        except Exception as exc:
+            _log.warning("generate.sample_validator raised on a noise frame; the "
+                         "noise slot is scrapped: type=%s", type(exc).__name__,
+                         extra={"stage": self.name, "batch": ctx.batch_no})
+            self._stream_failure("sample_validator_exception")
+            violations = ["callback raised"]
+        if violations:
+            bucket = bucket_key(plan.llm, plan.style_name)
+            self._stream_failure("sample_validator")
+            ctx.metrics.count(f"generate.buckets.{bucket}.rejected_by_validator")
+            _log.warning("noise slot scrapped by sample_validator: slot=%d class=%s",
+                         plan.index, plan.frame_class,
+                         extra={"stage": self.name, "batch": ctx.batch_no})
+            return False
+        return True
 
     def _stream_fits(self, texts: tuple[str, str], llm: str, schema: dict) -> bool:
         """``_fit_plan_seeds`` 先例的时间流预检：est(system) + est(user) + 2×消息
@@ -1261,7 +1425,6 @@ class GenerateStage:
         :param ctx: 运行上下文。
         :returns: 值-free 的单行 stderr 摘要。
         """
-        ctx.metrics.count(f"generate.stream.{call_kind}_failures")
         budget.feed_reactive_terminal(exc, ctx.metrics)
         message = (f"stream sequence voided: seq={plan.index} "
                    f"class={plan.class_name} llm={plan.llm} call={call_kind} "
@@ -1281,7 +1444,10 @@ class GenerateStage:
             return True
         from labelkit.common.extensions.hooks import normalize_violations, resolve_hook
 
-        hook = resolve_hook(hook_ref)
+        # 【临时接线·v1.17 Wave 2a】M1 冻结载体优先, 旧字符串解析仅服务于直接构造
+        # cfg 的调用面; 后续 wave 统一改读冻结载体后本腿删除。
+        frozen = self._cfg.validation_hooks.sample if self._cfg.validation_hooks else None
+        hook = frozen.target if frozen is not None else resolve_hook(hook_ref)
         for position, payload in enumerate(payloads):
             try:
                 violations = normalize_violations(hook(_payload_text(payload)),
@@ -1291,12 +1457,12 @@ class GenerateStage:
                     "generate.sample_validator raised on a stream frame; the "
                     "sequence is scrapped: type=%s", type(exc).__name__,
                     extra={"stage": self.name, "batch": ctx.batch_no})
+                self._stream_failure("sample_validator_exception")
                 violations = ["callback raised"]
             if violations:
                 bucket = bucket_key(plan.llm, plan.style_name, plan.class_name)
+                self._stream_failure("sample_validator")
                 ctx.metrics.count(f"generate.buckets.{bucket}.rejected_by_validator")
-                ctx.metrics.count("generate.stream.validator_scrapped")
-                ctx.metrics.count("generate.stream.sample_validator_scrapped")
                 _log.warning(
                     "stream sequence scrapped by sample_validator: seq=%d "
                     "class=%s frame=%d violations=%d", plan.index,
@@ -1311,52 +1477,10 @@ class GenerateStage:
         """按冻结顺序执行逐帧、声明规则与序列钩子校验。"""
         if not self._stream_frames_valid(plan, payloads, ctx):
             return False
-        if plan.frame_classes and not self._stream_rules_valid(plan, payloads, ctx):
+        # v1.17 delivery filters rule replay before sequence hook.
+        if not self._stream_replay_valid(plan, payloads):
             return False
         return self._stream_sequence_hook_valid(plan, steps, payloads, ctx)
-
-    def _stream_rules_valid(self, plan: SequencePlan, payloads: Sequence,
-                            ctx: "RunContext") -> bool:
-        """在 planner skeleton 上执行 correlation/time 与窗口重放。"""
-        from labelkit.common.runtime.declare import evaluate_payload_rules
-        from labelkit.common.runtime.temporal import (
-            fixed_offset,
-            in_calendar_window,
-            normalize_calendar_windows,
-        )
-
-        view = self._cfg.class_views[plan.class_name]
-        rules = effective_rules(view.rules, self._cfg.generate_stream.rules)
-        windows = effective_windows(view.windows, self._cfg.generate_stream.windows)
-        if rules:
-            result = evaluate_payload_rules(rules, plan.frame_classes, payloads,
-                                            plan.timestamps_us)
-            if not result.valid:
-                return self._scrap_rule_sequence(plan, result, ctx)
-        if windows:
-            offset = fixed_offset(self._cfg.generate_stream.ts_start)
-            for frame_class, timestamp in zip(plan.frame_classes, plan.timestamps_us):
-                candidate = next((item for item in normalize_calendar_windows(windows)
-                                  if item.frame_class == frame_class), None)
-                if candidate is not None and not in_calendar_window(timestamp, candidate, offset):
-                    _log.error("planner window invariant failed for stream sequence")
-                    raise InternalError("planner window invariant failed")
-        return True
-
-    def _scrap_rule_sequence(self, plan: SequencePlan, result: Any,
-                             ctx: "RunContext") -> bool:
-        """记录声明规则首错计数并终止当前序列。"""
-        bucket = bucket_key(plan.llm, plan.style_name, plan.class_name)
-        if result.correlation_scrapped:
-            ctx.metrics.count("generate.stream.correlation_scrapped")
-        if result.temporal_scrapped:
-            ctx.metrics.count("generate.stream.temporal_scrapped")
-        ctx.metrics.count("generate.stream.validator_scrapped")
-        ctx.metrics.count(f"generate.buckets.{bucket}.rejected_by_validator")
-        _log.warning("stream sequence scrapped by declarative rules: seq=%d class=%s",
-                     plan.index, plan.class_name,
-                     extra={"stage": self.name, "batch": ctx.batch_no})
-        return False
 
     def _stream_sequence_hook_valid(self, plan: SequencePlan,
                                     steps: Sequence[tuple[str, str]], payloads: Sequence,
@@ -1380,12 +1504,12 @@ class GenerateStage:
             _log.warning("generate.sequence_validator raised: ref=%s type=%s",
                          self._sequence_validator_ref, type(exc).__name__,
                          extra={"stage": self.name, "batch": ctx.batch_no})
+            self._stream_failure("sequence_validator_exception")
             violations = ["callback raised"]
         if not violations:
             return True
         bucket = bucket_key(plan.llm, plan.style_name, plan.class_name)
-        ctx.metrics.count("generate.stream.sequence_validator_scrapped")
-        ctx.metrics.count("generate.stream.validator_scrapped")
+        self._stream_failure("sequence_validator")
         ctx.metrics.count(f"generate.buckets.{bucket}.rejected_by_validator")
         _log.warning("stream sequence scrapped by sequence_validator: seq=%d class=%s violations=%d",
                      plan.index, plan.class_name, len(violations),
@@ -1426,9 +1550,6 @@ class GenerateStage:
                     "duplicates"):
             if stats[key]:
                 ctx.metrics.count(f"generate.stream.{key}", stats[key])
-        if stats.get("calendar_days_spanned"):
-            ctx.metrics.count("generate.stream.windows.calendar_days_spanned",
-                              stats["calendar_days_spanned"])
         for seq in survivors:
             ctx.metrics.count(
                 f"generate.stream.sequences.{seq.plan.class_name}.produced")

@@ -4,7 +4,8 @@
 - 主输出 JSONL：逐批追加写入 ``{output}.part`` 并 flush，finalize 时 fsync + 原子改名
   交付；
 - rejects 通道 ``{output_stem}.rejects.jsonl``（流式追加日志，无 ``.part``）；
-- ``{output_stem}.report.json``（finalize 时恒写）。
+- ``{output_stem}.report.json``（finalize 时恒写；v1.17 SPEC-SP §5.1：live 与
+  dry-run 的 report 命名由 M1 一次裁决写进 ``ResolvedPaths.report``，发射器只消费）。
 
 按状态分发（v1.9 四路，spec 3.11.2）：``active`` → 主输出；``absorbed`` → 两个通道都不
 进，只计数（成员内容活在其 episode 的序列记录里）；``stitched`` → 两个通道都不进，只
@@ -83,29 +84,58 @@ class Emitter:
         self._init_schemas(cfg)
 
     def _init_paths(self, cfg: "ResolvedConfig") -> None:
-        """推导五个输出通道的路径与 ``.part`` 暂存名，并复位全部文件句柄。
+        """v1.17（SPEC-SP §5.1）：五个输出通道路径只消费 M1 冻结的 ``cfg.paths``。
+
+        live/dry-run 的 report 命名已由 M1 一次裁决写进 ``paths.report``——此处
+        不再按命令模式追加后缀，也不再从 ``run.output`` 字符串做 cwd 二次推导；
+        未启用通道在 M1 侧为 None，``.part`` 暂存名仍由最终路径拼接派生。
 
         :param cfg: 已解析配置。
+        :raises ValueError: ``cfg.paths`` 缺席（直接构造 ResolvedConfig 的旧
+            fixture 面），或通道开闭与 M1 派生产物不一致。
         """
-        output = Path(cfg.run.output)
-        self._output_path = output
-        self._output_part = Path(str(output) + ".part")
-        stem = output.with_suffix("")  # 输出路径去掉末级后缀
-        self._sidecar_path = Path(str(stem) + ".meta.jsonl")
-        self._sidecar_part = Path(str(self._sidecar_path) + ".part")
-        self._rejects_path = Path(str(stem) + ".rejects.jsonl")
-        # v1.13（裁决·时间流工件通道）：第五输出通道——路径规则与 M6 的
-        # generate.stream_artifact_path 各自推导同一值（算子间不互导，测试钉住）。
-        self._artifact_path = Path(str(stem) + ".stream.jsonl")
-        self._artifact_part = Path(str(self._artifact_path) + ".part")
-        # dry-run 的报告写到另一个文件名，使一次彩排绝不覆盖上一次真实运行的账本
-        # （E2E finding P2-4）。
-        self._report_path = Path(str(stem) + (".dryrun.report.json" if cfg.dry_run
-                                              else ".report.json"))
+        if cfg.paths is None:
+            raise ValueError("ResolvedConfig.paths is None: emitter consumes "
+                             "M1-derived absolute paths only (no cwd fallback)")
+        paths = cfg.paths
+        self._output_path = Path(paths.output)
+        self._output_part = Path(str(self._output_path) + ".part")
+        self._report_path = Path(paths.report)
+        if cfg.output.meta_mode == "sidecar" and paths.sidecar is None:
+            raise ValueError("paths.sidecar is None but output.meta_mode == "
+                             "'sidecar'")
+        self._sidecar_path = self._with_part_source(paths.sidecar)
+        self._sidecar_part = self._with_part(self._sidecar_path)
+        if cfg.output.rejects != "none" and paths.rejects is None:
+            raise ValueError("paths.rejects is None but output.rejects is on")
+        self._rejects_path = self._with_part_source(paths.rejects)
+        if cfg.generate_stream.enabled and paths.stream_artifact is None:
+            raise ValueError("paths.stream_artifact is None but generate "
+                             "stream form is enabled")
+        self._artifact_path = self._with_part_source(paths.stream_artifact)
+        self._artifact_part = self._with_part(self._artifact_path)
         self._main_fh = None
         self._sidecar_fh = None
         self._rejects_fh = None
         self._artifact_fh = None
+
+    @staticmethod
+    def _with_part_source(raw: str | None) -> Path | None:
+        """把 M1 的通道路径串转成 Path（未启用通道保持 None）。
+
+        :param raw: ``ResolvedPaths`` 上的通道路径串；None = 通道关闭。
+        :returns: 通道最终路径；未启用通道为 None。
+        """
+        return Path(raw) if raw is not None else None
+
+    @staticmethod
+    def _with_part(path: Path | None) -> Path | None:
+        """通道最终路径 → ``.part`` 暂存名（None 通道保持 None）。
+
+        :param path: 通道最终路径。
+        :returns: 追加了 ``.part`` 的暂存路径；未启用通道为 None。
+        """
+        return Path(str(path) + ".part") if path is not None else None
 
     def _init_counters(self) -> None:
         """初始化批间累计计数、通道状态标志与装配期注入的鸭子面。"""
@@ -305,6 +335,11 @@ class Emitter:
         fsync + 原子改名；``_undeliverable`` 纪律共用）。dry-run 天然不触达
         （``_run_dry`` 不驱动生成、不开 emitter 通道）。同时冻结 run 摘要条目
         （路径/sha256/行数——sha256 按落盘字节计，config_digest 同款前缀形态）。"""
+        if self._artifact_part is None:
+            # M1 保证形态开启 ⇒ paths.stream_artifact 必非 None（构造期已核对）；
+            # 此处只是绝不把 None 拼成 cwd 下的 "None.part" 的硬闸。
+            raise LabelKitError("stream artifact channel not configured "
+                                "(ResolvedPaths.stream_artifact is None)")
         try:
             self._artifact_fh = open(self._artifact_part, "w", encoding="utf-8")
         except OSError as exc:

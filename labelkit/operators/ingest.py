@@ -377,6 +377,20 @@ def _rehearse_parse(line_bytes: bytes, text_field: str) -> dict | None:
     return raw
 
 
+def _input_root(cfg: ResolvedConfig) -> Path | None:
+    """v1.17（SPEC-SP §5.1）：从 M1 冻结的 ResolvedPaths 取输入根。
+
+    @param cfg 已解析配置
+    @return 输入根路径；generate_only 形态（``paths.input`` 为 None）为 None
+    @raises ValueError ``cfg.paths`` 缺席——M2 只消费 M1 派生的绝对路径，
+        绝不静默回落按 cwd 重解 ``run.input``
+    """
+    if cfg.paths is None:
+        raise ValueError("ResolvedConfig.paths is None: ingest consumes "
+                         "M1-derived absolute paths only (no cwd fallback)")
+    return Path(cfg.paths.input) if cfg.paths.input else None
+
+
 class Ingestor:
     """M2 摄取器。不是 Stage —— 它没有 ctx；CLI / 编排层在调用 ``records()`` 前
     设置公开属性 ``ingestor.metrics``（默认 None），使摄取期 trace 事件以
@@ -385,10 +399,15 @@ class Ingestor:
     def __init__(self, cfg: ResolvedConfig):
         """构造摄取器。
 
+        v1.17（SPEC-SP §5.1）：输入根只消费 M1 冻结的 ``cfg.paths.input``——
+        不再从 ``run.input`` 字符串做 cwd 二次推导，也不静默回落。
+
         @param cfg M1 解析冻结后的运行配置
+        @raises ValueError ``cfg.paths`` 缺席（直接构造 ResolvedConfig 的旧
+            fixture 面）
         """
         self._cfg = cfg
-        self._root = Path(cfg.run.input) if cfg.run.input else None
+        self._root = _input_root(cfg)
         self._report = IngestReport()
         self.metrics = None  # MetricsSink | None，由外部接线（CONTRACTS §7.1）
         self._disorder_warned = False  # 全运行仅一条 stderr WARN（spec 7.2、S19）
@@ -876,8 +895,8 @@ class Ingestor:
     def _require_root(self) -> Path:
         """取输入根路径并做存在性检查。
 
-        @return run.input 对应的 Path
-        @raises InputError run.input 未设置或路径不存在
+        @return ``paths.input`` 对应的 Path（v1.17：M1 冻结的绝对输入路径）
+        @raises InputError 输入未设置或路径不存在
         """
         if self._root is None:
             raise InputError("run.input is not set (required in process mode)")

@@ -15,7 +15,6 @@ import asyncio
 import json
 import logging
 import math
-import os
 import random
 import statistics
 import time
@@ -38,6 +37,10 @@ from labelkit.common.errors import (
 )
 from labelkit.common.runtime import budget
 from labelkit.common.runtime.budget import ImageCostCalibrator
+from labelkit.common.runtime.credentials import (
+    RuntimeCredentials,
+    _declared_env_names,
+)
 
 if TYPE_CHECKING:
     from labelkit.common.observability.obslog import MetricsSink
@@ -311,24 +314,40 @@ def _key_cooldown_upper(base_delay_s: float, consec_429: int) -> float:
     return min(_MAX_KEY_COOLDOWN_S, base_delay_s * (2.0 ** consec_429))
 
 
-def _pool_members(prof: "LLMProfile | EmbeddingProfile") -> list[tuple[str, str]]:
-    """解析剖面的密钥池成员（v1.6）。经 M1 归一的剖面带对齐的
-    api_key_envs/api_keys；直接构造的剖面（测试、探针子客户端）回落到 api_key
-    或环境变量，与 v1.6 之前的单键行为一致。
+def _pool_members(kind: str, prof: "LLMProfile | EmbeddingProfile",
+                  credentials: RuntimeCredentials) -> list[tuple[str, str]]:
+    """解析剖面的密钥池成员（v1.6 成员形状不变；v1.17 来源改凭据对象）。
 
+    v1.17（Wave 2b，CONTRACTS §7.19.3）：删除 Wave 2a 按 env 名现读
+    ``os.environ`` 的过渡接线——key tuple 的唯一来源是 ``RuntimeCredentials``，
+    本模块不再有任何环境变量读取或 profile secret fallback。凭据构造期的值去重
+    可能让唯一键数少于声明的环境变量数（同一密钥值被两个环境变量别名）：按
+    声明序 zip 截断，首个声明者获得身份位（KeyUsage / trace / probe 的 key_env）。
+
+    @param kind 剖面种类（"llm" / "embedding"）
     @param prof [llm.*] 或 [embedding.*] 剖面
+    @param credentials 运行期凭据（run/probe 装配期物化）
     @return (环境变量名, 已解析密钥值) 序对列表
+    @raises ValueError 剖面缺席于凭据（未被物化——内部不变式破裂，fail-closed）
     """
-    envs = tuple(prof.api_key_envs) or ((prof.api_key_env,) if prof.api_key_env else ())
+    envs = _declared_env_names(prof)
     if not envs:
-        return [("", prof.api_key or "")]
-    keys = tuple(prof.api_keys)
-    if len(keys) != len(envs):
-        if len(envs) == 1:
-            keys = (prof.api_key or os.environ.get(envs[0], ""),)
-        else:
-            keys = tuple(os.environ.get(e, "") for e in envs)
-    return list(zip(envs, keys))
+        return [("", "")]
+    table = credentials.llm if kind == "llm" else credentials.embedding
+    values = table.get(prof.name)
+    if values is None:
+        _logger.error("profile %r (%s) is absent from runtime credentials; "
+                      "credentials must be resolved before any network dispatch",
+                      prof.name, kind)
+        raise ValueError(
+            f"profile {prof.name!r} ({kind}) is absent from runtime credentials")
+    members = list(zip(envs, values))
+    if len(members) < len(envs):
+        _logger.warning(
+            "profile %s declares %d key envs but carries %d unique keys; "
+            "duplicate key values collapse to their first declaration",
+            prof.name, len(envs), len(values))
+    return members
 
 
 # ── 内部参数对象（重试引擎与探针的入参收拢面） ─────────────────────────────
@@ -823,15 +842,23 @@ class LLMClient:
 
     def __init__(self, llm_profiles: Mapping[str, LLMProfile],
                  embedding_profiles: Mapping[str, EmbeddingProfile],
+                 credentials: RuntimeCredentials,
                  metrics: "MetricsSink | None" = None):
         """建立进程内的剖面表、限流器、密钥池与校准器（全部只在内存，spec §2.6）。
 
+        v1.17（Wave 2b，CONTRACTS §7.19.3）：构造函数必须收到
+        ``RuntimeCredentials``——密钥值的唯一来源；内部 env fallback 与 profile
+        secret fallback 均已删除。dry-run 的静态面传空凭据对象（零 env 读、零
+        密钥驻留），真实派发路径则由装配方先 ``resolve_credentials``。
+
         @param llm_profiles [llm.*] 剖面表，按声明顺序
         @param embedding_profiles [embedding.*] 剖面表，按声明顺序
+        @param credentials 运行期凭据（不进 repr / 日志 / trace / report / 异常）
         @param metrics 观测汇（M12）；None 表示不发事件、不喂熔断
         """
         self._llm_profiles: dict[str, LLMProfile] = dict(llm_profiles)
         self._embedding_profiles: dict[str, EmbeddingProfile] = dict(embedding_profiles)
+        self._credentials = credentials
         self._metrics = metrics
         self._usage: dict[str, ProfileUsage] = {}
         # 每剖面一个信号量，被**所有**调用共享（含修复、verify、probe）。键为
@@ -1079,7 +1106,18 @@ class LLMClient:
                                 error=f"unknown profile: {profile!r}")]
         prof = (self._llm_profiles[profile] if is_llm
                 else self._embedding_profiles[profile])
-        members = _pool_members(prof)
+        kind = "llm" if is_llm else "embedding"
+        table = self._credentials.llm if is_llm else self._credentials.embedding
+        if prof.name not in table:
+            # 凭据缺席（剖面未被 resolve 物化）——fail-closed 地落进结果而不是
+            # 拿空密钥去撞端点，同时保住 probe 永不抛出的冻结承诺。
+            _logger.error("profile %r has no materialized credentials; "
+                          "resolve credentials before probing", profile)
+            return [ProbeResult(profile=profile, ok=False, model=prof.model,
+                                latency_ms=0, error=(
+                                    f"no materialized credentials for profile "
+                                    f"{profile!r}"))]
+        members = _pool_members(kind, prof, self._credentials)
         pooled = len(members) > 1 and not first_only
         if first_only:
             members = members[:1]
@@ -1117,13 +1155,18 @@ class LLMClient:
         @param target 探测目标
         @return 一次性子客户端
         """
-        mod = replace(target.prof, api_key_env=target.env, api_key=target.key,
-                      api_key_envs=(target.env,), api_keys=(target.key,))
+        # v1.17（Wave 2b，CONTRACTS §7.19.3）：子客户端持收窄到单把密钥的
+        # RuntimeCredentials——env 名现读与 profile secret fallback 已删除。
+        mod = replace(target.prof, api_key_env=target.env,
+                      api_key_envs=(target.env,))
+        creds = (RuntimeCredentials(llm={target.profile: (target.key,)}, embedding={})
+                 if target.is_llm else
+                 RuntimeCredentials(llm={}, embedding={target.profile: (target.key,)}))
         if target.is_llm:
             client = LLMClient({target.profile: replace(mod, max_output_tokens=1)},
-                               {}, self._metrics)
+                               {}, creds, self._metrics)
         else:
-            client = LLMClient({}, {target.profile: mod}, self._metrics)
+            client = LLMClient({}, {target.profile: mod}, creds, self._metrics)
         client._http_client = self._http()   # 共享连接池
         client._semaphores = self._semaphores
         return client
@@ -1197,9 +1240,10 @@ class LLMClient:
         @return (密钥行序列, Σ in_flight)
         """
         if pool is None:
-            # 纯读：按池构造器**会**使用的成员列表推导，且不材料化 self._pools（spec 3.9.2）。
+            # 纯读：按剖面**声明的**环境变量名推导（不触凭据、不材料化 self._pools，
+            # spec 3.9.2——快照对未物化的剖面同样成立）。
             return tuple(KeySnapshot(env=env, state="ok")
-                         for env, _key in _pool_members(prof)), 0
+                         for env in (_declared_env_names(prof) or ("",))), 0
         return (tuple(_key_snapshot(s, ts, key_usages) for s in pool.states),
                 sum(s.in_flight for s in pool.states))
 
@@ -1215,7 +1259,7 @@ class LLMClient:
         key = (kind, prof.name)
         pool = self._pools.get(key)
         if pool is None:
-            pool = _KeyPool(_pool_members(prof))
+            pool = _KeyPool(_pool_members(kind, prof, self._credentials))
             self._pools[key] = pool
             if pool.size > 1:
                 # 每个成员预置一条 KeyUsage：report.llm_usage 必须列出池化剖面的**每一把**

@@ -172,7 +172,7 @@ class Recorder:
 def make_cfg(quality: QualityConfig) -> ResolvedConfig:
     profile = LLMProfile(name="default", provider="anthropic", base_url=ZAI_BASE_URL,
                          model=ZAI_MODEL, api_key_env=ZAI_KEY_ENV,
-                         api_key=os.environ.get(ZAI_KEY_ENV, ""))
+)
     return ResolvedConfig(
         tool=ToolConfig(),
         console=ConsoleConfig(),

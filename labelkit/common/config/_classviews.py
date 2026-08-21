@@ -7,6 +7,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from decimal import Decimal, InvalidOperation
+import math
+import re
 from typing import Any
 
 from jsonschema.validators import Draft202012Validator
@@ -36,11 +39,13 @@ from labelkit.common.config._schemas import (
 )
 from labelkit.common.config._sections import (
     _parse_examples,
+    _parse_frame_rules,
+    _parse_frame_windows,
     _parse_sequence_rules,
-    _parse_sequence_windows,
     _parse_styles,
     _parse_tiers,
     _parse_time_fields,
+    _parse_duration_resources,
 )
 from labelkit.common.config.model import (
     AnnotateConfig,
@@ -53,8 +58,6 @@ from labelkit.common.config.model import (
     GenerateConfig,
     QualityConfig,
     Rubric,
-    SequenceRuleSpec,
-    SequenceWindowSpec,
     TierSpec,
     VerifyConfig,
 )
@@ -73,7 +76,7 @@ _CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "quality": ("mode", "rounds", "rubric", "threshold", "selection", "top_ratio"),
     "annotate": ("instruction", "examples", "schema_path", "schema_inline"),
     "generate": ("instruction", "styles", "num_per_record", "temperature",
-                 "sequences", "len_range", "tiers", "rules", "windows"),
+                 "len_range", "tiers", "frame_rules", "frame_windows", "sequence_rules"),
     "verify": ("extra_criteria",),
     "extract": ("instruction",),
 }
@@ -93,7 +96,8 @@ _SELECTION_GROUP = ("selection", "threshold", "top_ratio")
 # 该子表会被下面的白名单循环判成未知键 CONFIG_ERROR。
 _FRAME_CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "annotate": ("instruction", "examples", "enabled"),
-    "generate": ("instruction", "schema_path", "schema_inline", "time_fields"),
+    "generate": ("instruction", "schema_path", "schema_inline", "time_fields",
+                  "duration_s", "resources"),
 }
 _FRAME_CLASS_SECTIONS = tuple(_FRAME_CLASS_SECTION_KEYS)
 
@@ -133,10 +137,12 @@ class _MergedClass:
     schema_inline: str | None   # v1.13 按类标注 Schema 的内联源
     tiers: tuple[TierSpec, ...] | None = None
                                 # v1.15 按类档位表; None = 未声明(回落全局表)
-    rules: tuple[SequenceRuleSpec, ...] | None = None
-                                # v1.16 按类 rules; None = 继承全局, 空元组 = 清空
-    windows: tuple[SequenceWindowSpec, ...] | None = None
-                                # v1.16 按类 windows; 三态同 rules
+    frame_rules: tuple[Any, ...] | None = None
+                                # v1.17 按类 frame_rules; None = 继承全局, 空元组 = 清空
+    frame_windows: tuple[Any, ...] | None = None
+                                # v1.17 按类 frame_windows; 三态同 frame_rules
+    sequence_rules: tuple[Any, ...] | None = None
+                                # v1.17 按类 sequence_rules; 三态整表
 
 
 @dataclass
@@ -201,8 +207,15 @@ def _check_class_whitelist(col: _Collector, file: str, cname: str,
         if sect == "rubric":
             continue   # 结构由 _resolve_rubric 校验(与全局 [rubric] 同款)
         allowed = _CLASS_SECTION_KEYS[sect]
+        directed = {"sequences": "[[generate.stream.quotas]]",
+                    "rules": f"[[class.{cname}.generate.frame_rules]]",
+                    "windows": f"[[class.{cname}.generate.frame_windows]]"}
         for k in sub:
             if k not in allowed:
+                if sect == "generate" and k in directed:
+                    col.error(f"{file}:[class.{cname}.generate].{k}: this key was "
+                              f"removed in v1.17 - use {directed[k]} instead (rule 62)")
+                    continue
                 col.error(f"{file}:[class.{cname}.{sect}].{k}: [class.*.{sect}] cannot "
                           f"override this key (whitelist: {_avail(allowed)})")
 
@@ -237,7 +250,7 @@ def _merge_class_sections(col: _Collector, file: str, cname: str, sections: dict
     quality = _merge_class_quality(col, file, cname, _sect("quality"), bases.quality)
     annotate, examples_provided, schema_path, schema_inline = _merge_class_annotate(
         col, file, cname, _sect("annotate"), bases.annotate)
-    generate, tiers, rules, windows = _merge_class_generate(
+    generate, tiers, frame_rules, frame_windows, sequence_rules = _merge_class_generate(
         col, file, cname, _sect("generate"), bases.generate)
     return _MergedClass(
         quality=quality, annotate=annotate, generate=generate,
@@ -247,7 +260,8 @@ def _merge_class_sections(col: _Collector, file: str, cname: str, sections: dict
                     if isinstance(sections.get("rubric"), dict) else None),
         examples_provided=examples_provided,
         schema_path=schema_path, schema_inline=schema_inline, tiers=tiers,
-        rules=rules, windows=windows,
+        frame_rules=frame_rules, frame_windows=frame_windows,
+        sequence_rules=sequence_rules,
     )
 
 
@@ -341,8 +355,9 @@ def _check_class_selection_group(col: _Collector, file: str, cname: str, q_over:
 def _merge_class_generate(col: _Collector, file: str, cname: str, g_over: dict,
                           base: GenerateConfig,
                           ) -> tuple[GenerateConfig, tuple[TierSpec, ...] | None,
-                                     tuple[SequenceRuleSpec, ...] | None,
-                                     tuple[SequenceWindowSpec, ...] | None]:
+                                     tuple[Any, ...] | None,
+                                     tuple[Any, ...] | None,
+                                     tuple[Any, ...] | None]:
     """``[class.<name>.generate]`` 的合并(按键溯源)。
 
     v1.15(裁决·载体 ClassView 顶层字段): 第七键 ``tiers`` 与其余六键分道——它**不落**
@@ -364,25 +379,28 @@ def _merge_class_generate(col: _Collector, file: str, cname: str, g_over: dict,
                 if "styles" in g_over else base.styles),
         num_per_record=t.get_int("num_per_record", base.num_per_record, minimum=1),
         temperature=t.get_float("temperature", base.temperature, bound=_GE0),
-        sequences=t.get_int("sequences", base.sequences, minimum=0),
         len_range=_int_pair(t, "len_range", base.len_range),
     )
-    tiers = rules = windows = None
+    tiers = frame_rules = frame_windows = sequence_rules = None
     if "tiers" in g_over:
         raw = t.take("tiers")
         parsed = _parse_tiers(col, file, raw, f"[[class.{cname}.generate.tiers]]")
         # 形状错误(键值非数组)已在解析层报出且修复动作明确(改写成数组表), 按未声明
         # 落库——不再叠报 rule 61 的空表/锚错(同一个键一条错误一个修复动作, 互斥推论)。
         tiers = parsed if isinstance(raw, list) else None
-    if "rules" in g_over:
-        raw_rules = t.take("rules")
-        rules = _parse_sequence_rules(col, file, raw_rules,
-                                      f"[[class.{cname}.generate.rules]]")
-    if "windows" in g_over:
-        raw_windows = t.take("windows")
-        windows = _parse_sequence_windows(col, file, raw_windows,
-                                          f"[[class.{cname}.generate.windows]]")
-    return merged, tiers, rules, windows
+    if "frame_rules" in g_over:
+        frame_rules = _parse_frame_rules(
+            col, file, t.take("frame_rules"),
+            f"[[class.{cname}.generate.frame_rules]]")
+    if "frame_windows" in g_over:
+        frame_windows = _parse_frame_windows(
+            col, file, t.take("frame_windows"),
+            f"[[class.{cname}.generate.frame_windows]]")
+    if "sequence_rules" in g_over:
+        sequence_rules = _parse_sequence_rules(
+            col, file, t.take("sequence_rules"),
+            f"[[class.{cname}.generate.sequence_rules]]")
+    return merged, tiers, frame_rules, frame_windows, sequence_rules
 
 
 def _merge_class_verify(col: _Collector, file: str, cname: str, v_over: dict,
@@ -428,7 +446,8 @@ def _inherit_class(bases: _ClassBases) -> _MergedClass:
                         generate=bases.generate, verify=bases.verify,
                         extract=bases.extract, rubric_raw=None,
                         examples_provided=False, schema_path=None,
-                        schema_inline=None, tiers=None, rules=None, windows=None)
+                        schema_inline=None, tiers=None, frame_rules=None,
+                        frame_windows=None, sequence_rules=None)
 
 
 def _class_sections(col: _Collector, file: str, cname: str, class_raw: Any) -> dict | None:
@@ -570,7 +589,9 @@ def _build_class_views(col: _Collector, classify: ClassifyConfig, class_raw: Any
                                  annotate=merged.annotate, generate=merged.generate,
                                  verify=merged.verify, extract=merged.extract,
                                  schema=schema_c, tiers=merged.tiers,
-                                 rules=merged.rules, windows=merged.windows)
+                                 frame_rules=merged.frame_rules,
+                                 frame_windows=merged.frame_windows,
+                                 sequence_rules=merged.sequence_rules)
     return views
 
 
@@ -626,6 +647,8 @@ def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
     t = _Tbl(col, file, f"[frame.class.{cname}.annotate]", a_over)
     examples_provided = "examples" in a_over
     gen_instruction, gen_schema = _load_frame_gen(col, file, cname, sections)
+    duration_us, resources = _parse_duration_resources(
+        col, file, cname, sections.get("generate"))
     view = FrameClassView(
         instruction=t.get_str("instruction", base.instruction, nonempty=True),
         examples=(_parse_examples(col, file, t.take("examples"),
@@ -635,6 +658,8 @@ def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
         gen_instruction=gen_instruction,
         gen_schema=gen_schema,
         time_fields=_parse_time_fields(col, file, cname, sections.get("generate")),
+        duration_us=duration_us,
+        resources=resources,
     )
     return view, examples_provided
 

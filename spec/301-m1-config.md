@@ -111,6 +111,52 @@ M6 共用同一个 OR-Tools CP-SAT 问题入口；单线程、固定搜索种子
 目标时仅 `OPTIMAL` 可接受。没有任何非零规则/窗口且未配置序列钩子时，规划面完全关闭，
 时间流生成保持 v1.15 的默认路径与抽签顺序。
 
+### 3.1.4.2 v1.17 场景规划、project root 与 secret-free 装载
+
+v1.17（场景规划与精确交付，裁决详表见 `docs/dev/SPEC-scenario-planning.md`）重构 M1 的四个面：project root 与全部路径的解析、静态装载与运行期凭据分离、时间流生成的新配置面（quota / 有限 schedule / sequence rule / duration / resource / noise 表），以及唯一一次 `compile_scenario` 调用。新配置面的字段总表与 period 展开语义在第 5 章；时间流生成形态**不再接受 `--limit`**（M1 定向 CONFIG_ERROR，exit 2）——quota 是整体契约，截断后的前缀不再声称满足 quota。不保留 v1.16 time-stream 配置兼容层，不写 migration，不接受旧键别名。
+
+**删除键（十项，全部定向 CONFIG_ERROR）**——错误只告诉用户新的唯一表达，不读取旧值、不转换，不走「TOML 结构」行的前向兼容 warning 路径（机制沿用 v1.11 `use_vision` 的原始节探针先例）：
+
+| 删除键 | 新表达 |
+|---|---|
+| `[generate].sequences` | `[[generate.stream.quotas]]` |
+| `[class.<name>.generate].sequences` | `[[generate.stream.quotas]]` |
+| `[generate.stream].sessions` | `[generate.stream].crossed_sessions`（总 session 数自动推导） |
+| `[generate.stream].ts_start` | `[generate.stream.schedule].start/end` |
+| `[generate.stream].noise_instruction` | `[[generate.stream.noise]]` |
+| `[[generate.stream.rules]]` | `[[generate.stream.frame_rules]]` |
+| `[[generate.stream.windows]]` | `[[generate.stream.frame_windows]]` |
+| `[[class.<name>.generate.rules]]` | `[[class.<name>.generate.frame_rules]]` |
+| `[[class.<name>.generate.windows]]` | `[[class.<name>.generate.frame_windows]]` |
+| hook 的 `module:function` 引用 | `<python-file>:<attribute-path>`（如 `hooks.py:validate_output`） |
+
+**新配置面解析**（逐字段约束在第 5 章，此处只列解析归属）：
+
+- `[[generate.stream.quotas]]`——成功交付 quota，两种互斥形态：exact counts（`counts` 直接给逐类整数）与 integer weights（`total` + `weights` + `allocation ∈ {"exact","largest_remainder"}` 必填）；period ∈ {day, week, schedule}，`of_week` 缺省整周；每张表必有 `[a-z0-9_]+` 自然名称且全局唯一。`exact` 要求 `total` 是最简整数比之和（minimum exact cohort）的整数倍，否则同轮报告 normalized weights、cohort 与上下邻近可精确 total；`largest_remainder` 复用 `apportion_tiers` 的纯整数最大余额算法（零 rng，平票按 quota 表内声明序）。多张 quota 可引用同一 sequence class：约束同一批 occurrence，不相加、不覆盖；未被任何 quota 提及的类 target 为 0，noise-only frame class 不需要 quota。time-stream 形态开启时 quota 表必须至少一张，且全部表编译出的 sequence target 总和 ≥ 1：零表或全零 target 是定向 CONFIG_ERROR（零序列工程只剩 noise 与无源 duplicate，没有可交付内容）。
+- `[generate.stream.schedule]`——有限半开时间区间：`start` / `end` 必填（ISO-8601，显式 `Z` 或 numeric offset，同 offset 且 `end > start`）、`exclude_dates` 本地自然日数组（重复报错；落在 schedule 本地日范围之外是定向 CONFIG_ERROR，fail-fast 不静默忽略）。删除 v1.16 `_horizon` 的每 session 一周递推——schedule 是唯一时间上界，frame window 只枚举 schedule 内未排除的 local date。
+- `[generate.stream]`——`crossed_sessions`（int，默认 0，`0 ≤ value ≤ floor(target_sequences / 2)`；session 总数 = `target_sequences − crossed_sessions`，duplicates 另增流尾 session、不参与该计数）与 `max_attempts_per_slot`（int ≥ 1，默认 3；载体 `GenerateStreamConfig.max_attempts_per_slot`，仅 M6 delivery 消费，不进 `ScenarioConfig`）。
+- `[[generate.stream.noise]]`——noise 表（`frame_class` + 正整数 `weight`）：`noise_ratio > 0` 时必须非空，`noise_ratio == 0` 时书写该表是定向 CONFIG_ERROR；frame class 须存在于 `[[frame.classify.classes]]` 且有非空 generate instruction；noise frame class 不得出现在任何生效 tier、frame rule、frame window，不得声明 duration 或 resources；noise target 按最大余额法分到各 noise class，零 rng。
+- `frame_rules` / `frame_windows`——v1.16 `rules` / `windows` 的更名面（三态整表覆盖语义保留，旧键不别名）；每条 rule / window 新增必填自然名称，与 quota、sequence rule 的 name 同处**一个全局唯一域**（不能靠配置表路径或数组序号消歧）；frame rule 新增 `contains` 模板（严格包含 `source.start < target.start ∧ target.end < source.end`，相等边界不通过，要求 source 帧类声明 duration）。
+- `[[generate.stream.sequence_rules]]`——跨 sequence occurrence 的周期规则：template ∈ {`precedence`, `response`, `succession`, `not_co_existence`}，period 同 quota，positive 模板可选半开 `gap_s`（not_co_existence 禁止）；source / target 必须是已由 quota 拥有且 target > 0 的 sequence class，两者不同。sequence occurrence 归属其 `sequence_start` 的 local date。
+- `[frame.class.<name>.generate]` 增 `duration_s`（闭区间 `[lo,hi]`，`1e-6 ≤ lo ≤ hi`，仅结构化帧类合法；缺省 = point frame）与 `resources`（每项 `[a-z0-9_]+`；非空时 duration 必须在场）；声明 duration 的帧类必须在 `time_fields` 至少绑定 `end_ts` 或 `duration_s`（不允许生成 artifact 无法观察的隐藏区间）；时间字段语义词表增 `end_ts`（`"string"`，interval end）与 `duration_s`（`"number"`），point frame 不得绑定这两值。
+- `[generate].scenario_validator`——新增第四个 hook 键（见下方「hook 引用与冻结载体」）。
+
+**project root 与 `ResolvedPaths`**：`project_root = Path(project_path).resolve().parent` 在读取 project TOML 成功后立即冻结；project TOML 内的全部相对路径一律相对 project root 解析（清单：`run.input`、`run.output`、`output.schema_path`、`class.<name>.annotate.schema_path`、`frame.annotate.schema_path`、`frame.class.<name>.generate.schema_path`、`trace.path` 与四个 hook 文件路径）——不受调用 cwd 影响，本地 hook 与工程一起移动仍可运行。CLI `--input` / `--output` 是 shell 参数：相对路径先按调用 cwd 解析，再参与 CLI > project 优先级。无论来源，`ResolvedConfig` 内只保留绝对规范化路径；配置原文仍用于 digest，不改写文件。新增冻结 parse product `ResolvedPaths{project, project_root, input, output, report, rejects, sidecar, trace, stream_artifact}`（未启用通道为 None）——M2、M11、trace 运行时、console 与 stream artifact helper 只能消费 `ResolvedPaths`，不得重新从字符串推导 cwd-relative 路径。**命名裁决**：live report 固定 `<output-stem>.report.json`，dry-run report 固定 `<output-stem>.dryrun.report.json`，两者都由 M1 写入 `ResolvedPaths.report`——emitter 与 console 不再根据命令模式追加后缀；rejects、sidecar、trace 与 stream artifact 也只在 M1 派生一次。
+
+**secret-free 静态装载**：删除 `LLMProfile.api_key` / `LLMProfile.api_keys` / `EmbeddingProfile.api_key` / `EmbeddingProfile.api_keys`——profile 只保存环境变量名称。新增运行期载体 `RuntimeCredentials`（落 `labelkit/common/runtime/credentials.py`；frozen、`repr=False`，`llm` / `embedding` 两个按 profile name 排序的只读 mapping，value = 去重后保持环境变量声明顺序的非空 key tuple；无任何显示 secret 的 repr、异常或序列化方法），**不属于 `ResolvedConfig`**。命令分流：静态 load 校验 env 名、profile 引用与 capability，但不调用 `os.environ.get`；validate 与 dry-run 到此结束、不发 missing-key WARN；run 与 `validate --probe` 对所有 referenced profile 聚合解析 key value，任一缺失仍是 exit 2；LLMClient 构造函数必须收到 `RuntimeCredentials`（3.9.6）。引用收集器 `referenced_profiles(config)` 下沉 common 层唯一一份（static validation、credential resolution、probe、runtime 与 estimate 共用），删除 orchestration 内的第二份实现（`labelkit/orchestration/profile_usage.py` 整文件删除）。
+
+**hook 引用与冻结载体**：四个 hook 键（`output.validator`、`generate.sample_validator`、`generate.sequence_validator`、`generate.scenario_validator`）统一改用 `<python-file>:<attribute-path>`；相对 python-file 按 project root 解析，绝对路径允许，文件必须是 `.py` 普通文件。M1 用 `importlib.util.spec_from_file_location` + 绝对路径 hash 生成唯一 module name，不修改 `sys.path`、不依赖 cwd、不做自动发现。M1 解析并冻结 callable——载体 `ResolvedHook{reference, target}` 与 `ValidationHooks{output, sample, sequence, scenario}`（`reference` = `<绝对规范化 python-file>:<attribute-path>`，用于稳定错误定位，callable 的 repr 与 equality 均排除）；report、trace、digest 与配置序列化只允许使用 reference，绝不遍历或输出 target；M6 与 schema engine 不再按字符串二次 resolve（3.8.6）。M1 对四个 hook 都检查恰当的位置参数数量，并用不含用户数据的 synthetic input 干跑（scenario probe 用 `accepted = ()` 与一条最小 candidate）；异常类型与非法返回值在 validate 阶段聚合，不等首条真实 content 才暴露。scenario validator 的冻结输入 `ScenarioSequence` / `ScenarioValidationInput` 落 `labelkit/common/contracts/types.py`（与既有 `SequenceValidationFrame` / `SequenceValidationInput` 同层并列，后者形状原样保留——`sequence_validator` 的输入契约零变化）；planner 内部 dataclass 一律落 `labelkit/common/runtime/scenario/model.py`，两层不得混放。
+
+**`ResolvedConfig` 三个新冻结 parse product**：`paths: ResolvedPaths`、`validation_hooks: ValidationHooks`、`scenario_plan: ScenarioPlan | None`——原始 config section 不再保存可调用对象、secret value 或待下游解释的相对路径。
+
+**M1 只调一次 `compile_scenario`**：时间流生成形态下 M1 把全部场景输入收成冻结参数对象 `ScenarioConfig`（seed / schedule / quotas / sequence_classes / frame_classes / sequence_rules / crossed_sessions / frame_gap / session_gap / session_max_len / session_max_span / noise_ratio / noise_classes / duplicates），调用 `compile_scenario(config) -> ScenarioPlan` **恰一次**（执行顺序冻结：parse + static checks → `derive_stream_bounds` → solve quota counts → build slot specs → build timeline model → lexicographic timeline solve → allocate exact noise → ScenarioPlan + digest），产物挂 `ResolvedConfig.scenario_plan`。QuotaCompiler 冻结每个 class 的 target count 并按 `classify.classes` 声明序与类内 ordinal 建 sequence slot——length 在 slot 构建时冻结为 `SequenceSlotSpec.length_target`（`len_range` 只是抽取域与诊断输入）；ScenarioPlanner 用这些有限 slot 重新执行全部 quota bucket equality，在 frame window、sequence rule 与 resource 同时在场时选择具体日期与时间。validate、dry-run、run 与 M6 全部只读消费同一份冻结计划与 `plan_digest`，不重复规划、不漂移目标。非时间流形态 `scenario_plan = None`；无法生成完整计划时 load 不返回半成品。
+
+**`derive_stream_bounds` 纯函数（一次性派生检查）**：返回全部派生错误、不因前一错误短路——至少同时计算 target sequence / crossed session / derived session 数，每个 required slot 的 min / max task frames，零交叉的单 owner 最小容量与有交叉时任意合法 owner pair 的最小容量（有交叉时声明域必须提供足量 `lo ≥ 2` 的 slot 覆盖 `D` 个 crossed session——结构前提在此做长度域级校验），total session frame capacity 与 exact noise target，frame gap、session gap、session max span 的数值关系，schedule 可用微秒、排除日与 quota bucket 数，exact quota cohort 与 total 兼容性，duration / resource 与 `contains` 的前置条件。跨度检查使用实际 slot length domain 与 crossed count，不用用户 `session_max_len` 反推另一个错误——`session_max_len`、frame gap 与 session max span 的关联问题在一次 validate 中全部出现。
+
+**四个 planner 异常与退出码分流**（三个错误面绝不混淆，capacity 绝不显示为 INFEASIBLE）：`PlannerInfeasibleError`（用户硬约束没有共同解；assumption core 经 `SufficientAssumptionsForInfeasibility()` 返回「足以导致不可行」的自然名称集合，不声称最小）汇入 `ConfigError`、exit 2；`PlannerCapacityError`（求解前超实现容量；quota 与 timeline 模型各自独立执行 250,000 entry 上限，不得把两个小模型的 entries 相加后误报）与 `PlannerBudgetError`（deterministic solve budget 内无法冻结最优计划；message 明确 `model=quota|timeline` 与超时的 layer 名）映射 runtime exit 4——配置未被判无解；`PlannerInternalError`（solver 解码或冻结计划违反实现不变量）仍 exit 4。静态 arithmetic 错误优先于 solver core，且同一纯检查阶段聚合全部 arithmetic 错误；能被 `derive_stream_bounds` 静态拦截的冲突不会走到 solver core。
+
+**删除 v1.16 局部可行性检查的生产面**：`_check_local_potential` / `_check_full_potential`（`_generate_stream_constraints.py`）的生产调用面删除，连同旧 planner 的 `check_local_candidates` / `check_question` 与 M6 的 `select_feasible_plan` 一起退出生产路径——纯规则单元测试改调新的 rule evaluator，用户配置只走完整计划（3.6.7）。旧 canonical 文件 `labelkit/common/runtime/sequence_planner.py` / `declare.py` / `temporal.py` 删除、不留 re-export，新实现落 `labelkit/common/runtime/scenario/` 包（model / quota / calendar / rules / planner / sessions / diagnostics / noise 分属主，§12 生产文件归属表）。
+
 ### 3.1.5 错误处理
 
 所有校验错误聚合为一个 `ConfigError`，逐条打印（格式 `config.toml:[llm.default].timeout_s: expected positive integer, got "abc"`；数组表元素定位写作 `[[rubric.criteria]][N]`，N 为 1 起序号），退出码 2。报错文案为英文（2026-08-14 代码规则整改；`<文件>:[节].键:` 定位前缀机器稳定不变），不存在运行期配置错误——这是 M1 对其他模块的契约。

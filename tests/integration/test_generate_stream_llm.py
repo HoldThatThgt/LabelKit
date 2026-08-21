@@ -43,6 +43,7 @@ import random
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
+from decimal import Decimal
 from types import SimpleNamespace
 
 import jsonschema
@@ -53,7 +54,6 @@ from labelkit.common.config.model import (
     ClassSpec,
     ClassView,
     ClassifyConfig,
-    CorrelationSpec,
     ConsoleConfig,
     DedupConfig,
     ExtractConfig,
@@ -68,8 +68,6 @@ from labelkit.common.config.model import (
     ResolvedConfig,
     Rubric,
     RunConfig,
-    SequenceRuleSpec,
-    SequenceWindowSpec,
     SegmentConfig,
     StitchConfig,
     StreamConfig,
@@ -78,9 +76,25 @@ from labelkit.common.config.model import (
     TraceConfig,
     VerifyConfig,
     effective_tiers,
+    effective_frame_rules,
+    effective_frame_windows,
 )
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import Record, RecordRef
+from labelkit.common.runtime.credentials import resolve_credentials
+from labelkit.common.runtime.scenario.model import (
+    CorrelationSpec,
+    FrameRuleSpec as SequenceRuleSpec,
+    FrameWindowSpec as SequenceWindowSpec,
+    NoiseClassSpec,
+    QuotaSpec,
+    ScheduleSpec,
+    ScenarioConfig,
+    SequenceClassDomain,
+    FrameClassDomain,
+    TierDomain,
+)
+from labelkit.common.runtime.scenario.planner import compile_scenario
 from labelkit.common.runtime.llm_client import (
     LLMClient,
     Message,
@@ -98,8 +112,8 @@ from labelkit.operators.annotate import AnnotatePromptOptions, annotate_record
 from labelkit.operators.generate import (
     GenerateStage,
     canonical_json,
-    render_plan_prompt_texts,
 )
+from labelkit.operators.generate_stream import render_plan_prompt_texts
 from labelkit.orchestration.orchestrator import (
     Orchestrator,
     RunServices,
@@ -179,7 +193,7 @@ CONFIRMATION = ClassSpec(name="confirmation",
                          description="对助手结果的确认、收尾或致谢")
 CONFIRMATION_FRAME_INSTRUCTION = ("产出一句确认或收尾：认可助手给出的结果、拍板下单，"
                                   "或补一句致谢，口语、中文、一句话。")
-# 权重 1:1 × sequences = 2 ⇒ 整数域最大余额法配分 (1, 1)：两档各真跑一条序列。
+# 权重 1:1 × count = 2 ⇒ 整数域最大余额法配分 (1, 1)：两档各真跑一条序列。
 TIERS = (TierSpec(tier_rank=1, weight=1,
                   frame_classes=("task_request", "followup")),
          TierSpec(tier_rank=2, weight=1,
@@ -299,7 +313,7 @@ def _deepseek_profile() -> LLMProfile:
         timeout_s=120, max_retries=2, supports_structured_output=False,
         supports_vision=False, max_output_tokens=8192, thinking="disabled",
         context_window=131072, temperature=0.0,
-        api_key=os.environ.get(DEEPSEEK_KEY_ENV, ""))
+)
 
 
 def _zai_profile() -> LLMProfile:
@@ -310,10 +324,46 @@ def _zai_profile() -> LLMProfile:
         model=ZAI_MODEL, api_key_env=ZAI_KEY_ENV, max_concurrency=4,
         timeout_s=120, max_retries=2, supports_structured_output=True,
         supports_vision=True, max_output_tokens=4096, temperature=0.0,
-        api_key=os.environ.get(ZAI_KEY_ENV, ""))
+)
 
 
-def _class_view(name: str, *, sequences: int, schema=None, len_range=(2, 3),
+def _compile_plan(cfg: ResolvedConfig, counts: tuple[tuple[str, int], ...],
+                  *, rules=(), windows=(), crossed=0) -> ResolvedConfig:
+    """按 examples/synth-stream 的 v1.17 quota/schedule 形态冻结 ScenarioPlan。"""
+    start = datetime.fromisoformat("2026-01-05T08:00:00+08:00")
+    end = datetime.fromisoformat("2026-01-06T23:00:00+08:00")
+    schedule = ScheduleSpec(int(start.timestamp() * 1_000_000),
+                            int(end.timestamp() * 1_000_000), 480, ())
+    quota = QuotaSpec("test_schedule", "schedule", (), counts, None, (), None)
+    stream = replace(cfg.generate_stream, schedule=schedule, quotas=(quota,),
+                     crossed_sessions=crossed, frame_rules=tuple(rules),
+                     frame_windows=tuple(windows))
+    classes = tuple(
+        SequenceClassDomain(
+            name=name, length_range=view.generate.len_range,
+            tiers=tuple(TierDomain(rank=t.tier_rank, weight=t.weight,
+                                   frame_classes=tuple(t.frame_classes))
+                        for t in effective_tiers(view.tiers, stream.tiers)),
+            frame_rules=effective_frame_rules(view.frame_rules, stream.frame_rules),
+            frame_windows=effective_frame_windows(view.frame_windows,
+                                                   stream.frame_windows))
+        for name, view in cfg.class_views.items())
+    frames = tuple(FrameClassDomain(spec.name, None, ())
+                   for spec in cfg.frame_classify.classes)
+    scenario = ScenarioConfig(
+        seed=cfg.run.seed, schedule=schedule, quotas=(quota,),
+        sequence_classes=classes, frame_classes=frames, sequence_rules=(),
+        crossed_sessions=crossed, frame_gap_us=(5_000_000, 60_000_000),
+        session_gap_us=int(cfg.stream.gap_s * 1_000_000),
+        session_max_len=12, session_max_span_us=3_000_000_000,
+        noise_ratio=Decimal(str(stream.noise_ratio)),
+        noise_classes=stream.noise_classes,
+        duplicates=stream.duplicates)
+    return replace(cfg, generate_stream=stream,
+                   scenario_plan=compile_scenario(scenario))
+
+
+def _class_view(name: str, *, count: int, schema=None, len_range=(2, 3),
                 instruction: str = CLASS_INSTRUCTION, tiers=None) -> ClassView:
     return ClassView(
         name=name, quality=QualityConfig(), rubric=Rubric(name="r", criteria=()),
@@ -321,7 +371,7 @@ def _class_view(name: str, *, sequences: int, schema=None, len_range=(2, 3),
                                 instruction=ANNOTATE_INSTRUCTION),
         generate=GenerateConfig(enabled=True, llms=("default",),
                                 instruction=instruction, temperature=0.0,
-                                sequences=sequences, len_range=len_range),
+                                len_range=len_range),
         verify=VerifyConfig(), extract=ExtractConfig(), schema=schema, tiers=tiers)
 
 
@@ -333,9 +383,9 @@ def _frame_view(instruction: str, gen_schema=None,
 
 
 def _cfg(profile: LLMProfile, *, class_schema=None) -> ResolvedConfig:
-    """examples/synth-stream 的最小同构配置：一个序列类 × sequences = 1、
+    """examples/synth-stream 的最小同构配置：一个序列类 × count = 1、
     len_range = [2,3]、帧类表两类（其一带生成 Schema）、噪音关（调用量最小）。"""
-    return ResolvedConfig(
+    base = ResolvedConfig(
         tool=ToolConfig(), console=ConsoleConfig(),
         llm_profiles={"default": profile}, embedding_profiles={},
         run=RunConfig(output="out/synth-labels.jsonl", modality="text",
@@ -355,7 +405,7 @@ def _cfg(profile: LLMProfile, *, class_schema=None) -> ResolvedConfig:
         verify=VerifyConfig(),
         output=OutputConfig(schema_inline=json.dumps(GLOBAL_SCHEMA)),
         trace=TraceConfig(), rubric=Rubric(name="default:trajectory", criteria=()),
-        class_views={"ticket_booking": _class_view("ticket_booking", sequences=1,
+        class_views={"ticket_booking": _class_view("ticket_booking", count=1,
                                                    schema=class_schema)},
         user_schema=GLOBAL_SCHEMA, limit=None, strict=False, dry_run=False,
         config_path="config.toml", project_path="project.toml",
@@ -365,40 +415,42 @@ def _cfg(profile: LLMProfile, *, class_schema=None) -> ResolvedConfig:
             "task_request": _frame_view(TASK_FRAME_INSTRUCTION, FRAME_GEN_SCHEMA),
             "followup": _frame_view(FOLLOWUP_FRAME_INSTRUCTION)},
         generate_stream=GenerateStreamConfig(
-            enabled=True, sessions=1, noise_ratio=0.0, duplicates=0,
-            frame_gap_s=(5.0, 60.0), ts_start="2026-01-05T09:00:00+08:00"),
+            enabled=True, crossed_sessions=0, noise_ratio=0.0, duplicates=0,
+            frame_gap_s=(5.0, 60.0)),
     )
-
+    return _compile_plan(base, (("ticket_booking", 1),))
 
 def _tiered_cfg() -> ResolvedConfig:
     """v1.14 档位面的最小真跑配置（examples/synth-stream 的档位表同构缩微）：帧类
-    表三类、两档（构成两类 / 全三类、权重 1:1），单序列类 sequences = 2 ⇒ 逐档各
+    表三类、两档（构成两类 / 全三类、权重 1:1），单序列类 count = 2 ⇒ 逐档各
     一条；len_range = [3, 3] 恰等最大构成大小（M1 长度可覆盖的下界），噪音与重发
     全关 ⇒ 恰四次真实调用。"""
     base = _cfg(_deepseek_profile())
     views = dict(base.frame_class_views)
     views["confirmation"] = _frame_view(CONFIRMATION_FRAME_INSTRUCTION)
-    return replace(
+    return _compile_plan(replace(
         base,
-        class_views={"ticket_booking": _class_view("ticket_booking", sequences=2,
+        class_views={"ticket_booking": _class_view("ticket_booking", count=2,
                                                    len_range=(3, 3))},
         frame_classify=replace(base.frame_classify,
                                classes=FRAME_CLASSES + (CONFIRMATION,)),
         frame_class_views=views,
-        generate_stream=replace(base.generate_stream, sessions=2, tiers=TIERS))
+        generate_stream=replace(base.generate_stream, crossed_sessions=1,
+                                tiers=TIERS)), (("ticket_booking", 2),),
+                       crossed=1)
 
 
 def _timed_cfg() -> ResolvedConfig:
-    """v1.14 时间字段面的最小真跑配置：单序列类 sequences = 2、len_range = [3, 3]，
+    """v1.14 时间字段面的最小真跑配置：单序列类 count = 2、len_range = [3, 3]，
     两个帧类都结构化且各绑一个语义词；噪音开、单会话（⇒ 两条序列交叉，序内口径要有
     外来帧夹入才检得出）、重发一条（承源载荷面）⇒ 五次真实调用（两轮蓝图 + 帧实现
     + 一批噪音）。配额取 2 而非 1 是作废容忍所需：一条序列偶发作废时另一条仍能承载
     全部断言。"""
     base = _cfg(_deepseek_profile())
-    return replace(
+    return _compile_plan(replace(
         base,
         class_views={"ticket_booking": _class_view(
-            "ticket_booking", sequences=2, len_range=(3, 3),
+            "ticket_booking", count=2, len_range=(3, 3),
             instruction=TIMED_CLASS_INSTRUCTION)},
         frame_class_views={
             "task_request": _frame_view(TIMED_TASK_INSTRUCTION, TIMED_TASK_SCHEMA,
@@ -408,12 +460,13 @@ def _timed_cfg() -> ResolvedConfig:
                                     TIME_BINDINGS["followup"])},
         generate_stream=replace(base.generate_stream, noise_ratio=0.5,
                                 duplicates=1,
-                                noise_instruction=NOISE_INSTRUCTION))
+                                noise_classes=(NoiseClassSpec("followup", 1),)),
+    ), (("ticket_booking", 2),), crossed=1)
 
 
 def _per_class_tiers_cfg() -> ResolvedConfig:
     """v1.15 按类档位面的最小真跑配置（examples/synth-stream 混合形态的缩微）：两个
-    序列类各 sequences = 1，ticket_booking 吃自带单档表、smart_home 回落全局两档表
+    序列类各 count = 1，ticket_booking 吃自带单档表、smart_home 回落全局两档表
     （权重 1:1 × 配额 1 ⇒ 零抽签配分 (1, 0)，第 2 档零额 ⇒ 报表须呈 0/0）；
     len_range = [3, 3]、噪音与重发全关 ⇒ 恰四次真实调用。"""
     base = _cfg(_deepseek_profile())
@@ -422,22 +475,24 @@ def _per_class_tiers_cfg() -> ResolvedConfig:
     views["followup"] = _frame_view(TIERED_FOLLOWUP_FRAME_INSTRUCTION, FRAME_GEN_SCHEMA)
     views["confirmation"] = _frame_view(
         TIERED_CONFIRMATION_FRAME_INSTRUCTION, FRAME_GEN_SCHEMA)
-    return replace(
+    return _compile_plan(replace(
         base,
         classify=replace(base.classify, classes=(
             ClassSpec(name="ticket_booking", description="高铁购票会话"),
             ClassSpec(name="smart_home", description="智能家居指令会话"))),
         class_views={
             "ticket_booking": _class_view(
-                "ticket_booking", sequences=1, len_range=(3, 3), tiers=OWN_TIERS,
+                "ticket_booking", count=1, len_range=(3, 3), tiers=OWN_TIERS,
                 instruction=CLASS_INSTRUCTION + TIERED_CLASS_OBJECT_INSTRUCTION),
             "smart_home": _class_view(
-                "smart_home", sequences=1, len_range=(3, 3),
+                "smart_home", count=1, len_range=(3, 3),
                 instruction=SMART_HOME_INSTRUCTION + TIERED_CLASS_OBJECT_INSTRUCTION)},
         frame_classify=replace(base.frame_classify,
                                classes=FRAME_CLASSES + (CONFIRMATION,)),
         frame_class_views=views,
-        generate_stream=replace(base.generate_stream, sessions=2, tiers=TIERS))
+        generate_stream=replace(base.generate_stream, crossed_sessions=0,
+                                tiers=TIERS)),
+        (("ticket_booking", 1), ("smart_home", 1)))
 
 
 def _planner_rules_cfg() -> ResolvedConfig:
@@ -448,34 +503,37 @@ def _planner_rules_cfg() -> ResolvedConfig:
         ClassSpec(name="acknowledgement", description="确认同一购票请求"),
     )
     rules = (
-        SequenceRuleSpec(template="init", frame_class="task_request"),
-        SequenceRuleSpec(template="exactly", frame_class="task_request", count=1),
-        SequenceRuleSpec(template="exactly", frame_class="acknowledgement", count=1),
+        SequenceRuleSpec(name="request_first", template="init",
+                         frame_class="task_request"),
+        SequenceRuleSpec(name="request_exactly", template="exactly",
+                         frame_class="task_request", count=1),
+        SequenceRuleSpec(name="ack_exactly", template="exactly",
+                         frame_class="acknowledgement", count=1),
         SequenceRuleSpec(
-            template="chain_response", source="task_request", target="acknowledgement",
-            time_s=(1200.0, 2400.0),
-            correlation=CorrelationSpec(operator="equal", source_field="subject_id",
-                                        target_field="subject_id")),
-        SequenceRuleSpec(template="end", frame_class="acknowledgement"),
+            name="request_chains_ack", template="chain_response",
+            source="task_request", target="acknowledgement",
+            time_us=(1_200_000_000, 2_400_000_000),
+            correlation=CorrelationSpec("subject_id", "subject_id")),
+        SequenceRuleSpec(name="ack_ends", template="end",
+                         frame_class="acknowledgement"),
     )
     windows = (SequenceWindowSpec(
-        frame_class="task_request", of_day=(("08:00", "11:00"),),
-        of_week=("mon", "tue", "wed", "thu", "fri")),)
-    return replace(
+        name="request_work_hours", frame_class="task_request",
+        of_day_us=((8 * 3600 * 1_000_000, 11 * 3600 * 1_000_000),),
+        of_week=(1, 2, 3, 4, 5)),)
+    return _compile_plan(replace(
         base,
         stream=replace(base.stream, gap_s=3600),
         class_views={"ticket_booking": _class_view(
-            "ticket_booking", sequences=1, len_range=(2, 2),
+            "ticket_booking", count=1, len_range=(2, 2),
             instruction=RULE_CLASS_INSTRUCTION)},
         frame_classify=replace(base.frame_classify, classes=frame_classes),
         frame_class_views={
             "task_request": _frame_view(RULE_TASK_INSTRUCTION, RULE_TASK_SCHEMA),
             "acknowledgement": _frame_view(RULE_ACK_INSTRUCTION, RULE_ACK_SCHEMA),
         },
-        generate_stream=replace(
-            base.generate_stream, ts_start="2026-01-05T08:00:00+08:00",
-            rules=rules, windows=windows),
-    )
+        generate_stream=replace(base.generate_stream),
+    ), (("ticket_booking", 1),), rules=rules, windows=windows)
 
 
 def _assemble_report_tiers(cfg: ResolvedConfig, counters: Mapping) -> dict:
@@ -506,7 +564,8 @@ class _RecordingMetrics:
 
 def _ctx(cfg: ResolvedConfig, *, stage: str = "generate") -> RunContext:
     metrics = _RecordingMetrics()
-    llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles, metrics=None)
+    llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles,
+                     resolve_credentials(cfg), metrics=None)
     engine = SchemaEngine(dict(cfg.user_schema), llm, cfg.output, metrics=None)
     return RunContext(cfg=cfg, llm=llm, schema_engine=engine, metrics=metrics,
                       rng=random.Random(f"{cfg.run.seed}:0:{stage}"), batch_no=0)

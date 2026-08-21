@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field, replace
+from typing import Any
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,12 +45,18 @@ from labelkit.common.config.model import (
     FrameClassView,
     LLMProfile,
     Rubric,
-    effective_rules,
-    effective_windows,
+    effective_frame_rules,
+    effective_frame_windows,
+    render_constraint_text,
 )
-from labelkit.common.extensions.hooks import resolve_hook
+from labelkit.common.extensions.hooks import (
+    ResolvedHook,
+    check_hook_arity,
+    load_hook,
+    probe_hook,
+    scenario_probe_input,
+)
 from labelkit.common.runtime import budget
-from labelkit.common.runtime.declare import render_constraint_text
 
 
 @dataclass(frozen=True)
@@ -61,11 +68,12 @@ class _LoadCtx:
     fp: str                                            # project.toml 路径字符串
     cli: CliOverrides                                  # CLI 覆盖值(优先级最高)
     config_ok: bool                                    # config.toml 是否解析成功
-    llm_profiles: dict[str, LLMProfile]                # LLM profile 表(密钥回填就地改)
+    llm_profiles: dict[str, LLMProfile]                # LLM profile 表(secret-free: 只有名)
     embedding_profiles: dict[str, EmbeddingProfile]    # 嵌入 profile 表
     p: _Project                                        # project.toml 的解析产物
     modality: str                                      # 生效模态
     mode: str                                          # 生效运行模式
+    root: Path = Path(".")                             # v1.17 project root(相对路径基点)
 
 
 @dataclass
@@ -81,8 +89,14 @@ class _Products:
     class_views: dict[str, ClassView] = field(default_factory=dict)          # 序列类视图
     frame_schema: dict | None = None                    # 帧级输出 Schema
     frame_class_views: dict[str, FrameClassView] = field(default_factory=dict)  # 帧类视图
-    eff_input: str | None = None                        # 生效输入路径(CLI > project)
-    eff_output: str | None = None                       # 生效输出路径(CLI > project)
+    eff_input: str | None = None                        # 生效输入路径(CLI > project, 绝对)
+    eff_output: str | None = None                       # 生效输出路径(CLI > project, 绝对)
+    hooks: dict[str, ResolvedHook] = field(default_factory=dict)
+                                                        # v1.17 已解析冻结的钩子载体
+                                                        # (键 = output/sample/sequence/scenario)
+    scenario_plan: Any = None
+                                                        # v1.17 compile_scenario 的冻结计划
+                                                        # (形态开启且静态门干净时装配)
 
 
 def _check_llm_ref(ctx: _LoadCtx, loc: str, name: str) -> None:
@@ -311,7 +325,7 @@ def _check_generate_only_mode(ctx: _LoadCtx) -> None:
     if not p.generate.enabled:
         col.error(f'{fp}:[generate].enabled: run.mode = "generate_only" requires '
                   f"generate.enabled = true")
-    # v1.13: 时间流形态自带配额面(按类 sequences × len_range)——种子池与独立计数两族键
+    # v1.17: 时间流形态自带 quota 面([[generate.stream.quotas]])——种子池与独立计数两族键
     # 都不适用(显式书写由形态约束簇定向报错), 互斥校验仅平面形态执行。
     if not p.generate_stream.enabled:
         _check_flat_generate_only(ctx)
@@ -382,61 +396,57 @@ def _collect_referenced(ctx: _LoadCtx) -> set[str]:
     return referenced
 
 
-def _resolve_keys(ctx: _LoadCtx, kind: str, prof_name: str,
-                  envs: tuple[str, ...]) -> tuple[str, ...] | None:
-    """解析一个被引用 profile 的**全部**环境变量(v1.6 密钥池)。
+def _collect_referenced_profiles(ctx: _LoadCtx, products: _Products) -> None:
+    """v1.17 secret-free(SPEC-SP §5.2): 静态 load 只收集被引用的 profile 名。
 
-    每个缺失变量各出一条聚合错误。
-
-    @param ctx 校验上下文
-    @param kind profile 族("llm" | "embedding")
-    @param prof_name profile 名
-    @param envs 声明的环境变量名元组
-    @return 对齐的密钥元组; 任一变量缺失/为空时返回 None
-    """
-    pooled = len(envs) > 1
-    keys: list[str] = []
-    ok = True
-    for i, env in enumerate(envs, 1):
-        key = os.environ.get(env, "")
-        if not key:
-            loc = (f"{ctx.fc}:[{kind}.{prof_name}].api_key_envs[{i}]" if pooled
-                   else f"{ctx.fc}:[{kind}.{prof_name}].api_key_env")
-            ctx.col.error(f"{loc}: environment variable {_fmt(env)} is not set or empty")
-            ok = False
-        keys.append(key)
-    return tuple(keys) if ok else None
-
-
-def _resolve_api_keys(ctx: _LoadCtx, products: _Products) -> None:
-    """规则 12: 只为被引用的 profile 解析 API 密钥, 并就地回填到 profile 表。
+    密钥**值**不再于静态校验期解析——env 名/引用/capability 检查保留, 无 ``--probe``
+    的 validate 与 dry-run 全程零 ``os.environ.get``; run/probe 期的凭据物化是
+    ``RuntimeCredentials`` 的职责(v1.17 后续 wave)。
 
     @param ctx 校验上下文
     @param products 产物累加器(填充 ``referenced``)
     """
     products.referenced = _collect_referenced(ctx)
-    for name in sorted(products.referenced):
-        prof = ctx.llm_profiles.get(name)
-        if prof is None or not prof.api_key_envs:
-            continue    # profile 缺失 / 密钥声明非法都已在别处报过
-        keys = _resolve_keys(ctx, "llm", name, prof.api_key_envs)
-        if keys is not None:
-            ctx.llm_profiles[name] = replace(prof, api_key=keys[0], api_keys=keys)
-    dedup = ctx.p.dedup
-    if dedup.semantic and dedup.semantic_embedding in ctx.embedding_profiles:
-        prof_e = ctx.embedding_profiles[dedup.semantic_embedding]
-        if prof_e.api_key_envs:
-            keys = _resolve_keys(ctx, "embedding", prof_e.name, prof_e.api_key_envs)
-            if keys is not None:
-                ctx.embedding_profiles[prof_e.name] = replace(
-                    prof_e, api_key=keys[0], api_keys=keys)
+
+
+def _resolve_and_probe_hook(ctx: _LoadCtx, loc: str, ref: str, arity: int,
+                            probe_args: tuple) -> ResolvedHook | None:
+    """统一解析一个 ``<python-file>:<attribute-path>`` 钩子引用并做启动期双检。
+
+    双检 = 位置参数数量检查 + 不含用户数据的 synthetic 干跑(SPEC-SP §4.9 /
+    CONTRACTS rule 70); 异常与非法返回值聚合进 ConfigError。
+
+    @param ctx 校验上下文(其 ``root`` 是相对钩子文件的解析基点)
+    @param loc 报错定位前缀(如 ``"<fp>:[output].validator"``)
+    @param ref 钩子引用字符串
+    @param arity 期望的位置参数个数
+    @param probe_args synthetic 干跑的位置参数元组
+    @return 解析成功的冻结载体; 解析或双检失败时 None(错误已聚合上报)
+    """
+    try:
+        hook = load_hook(ref, ctx.root)
+    except ValueError as e:
+        ctx.col.error(f"{loc}: {e}")
+        return None
+    problem = check_hook_arity(hook, arity)
+    if problem is None:
+        problem = probe_hook(hook, probe_args)
+    if problem is not None:
+        ctx.col.error(f"{loc}: {problem}")
+        return None
+    return hook
 
 
 def _load_schema_and_hooks(ctx: _LoadCtx, products: _Products) -> None:
     """规则 13–15 与规则 17: 用户 Schema、few-shot 干跑与用户校验钩子。
 
+    v1.17(SPEC-SP §4.9): output.validator / generate.sample_validator /
+    generate.scenario_validator 三个钩子键在此解析为 ``ResolvedHook`` 冻结载体并做
+    位置参数数量检查 + synthetic 干跑; ``generate.sequence_validator`` 由时间流
+    形态约束簇解析(需要类表构造代表性 probe 输入)。
+
     @param ctx 校验上下文
-    @param products 产物累加器(填充 ``user_schema`` 与 ``dryrun``)
+    @param products 产物累加器(填充 ``user_schema``/``dryrun``/``hooks``)
     """
     col, fp, p = ctx.col, ctx.fp, ctx.p
     user_schema, schema_ok = _load_user_schema(col, fp, p.output)
@@ -450,18 +460,26 @@ def _load_schema_and_hooks(ctx: _LoadCtx, products: _Products) -> None:
         dr.schema_alive, _ = _dryrun_fewshot(col, p.annotate.examples, _DryRun(
             file=fp, elem_label="annotate.examples", validator=dr.validator,
             schema_key=skey))
-    # 规则 17 — 校验钩子(v1.5 方案 A, spec 3.8.2/3.6.2)
+    # 规则 17 + v1.17 rule 70 — 三个钩子键的统一 file-form 解析面
     if p.output.validator is not None:
-        try:
-            dr.hook = resolve_hook(p.output.validator)
-        except ValueError as e:
-            col.error(f"{fp}:[output].validator: {e}")
-    dr.hook_ref = p.output.validator
+        hook = _resolve_and_probe_hook(ctx, f"{fp}:[output].validator",
+                                       p.output.validator, 2, ({"topic": "probe"}, None))
+        if hook is not None:
+            dr.hook = hook.target
+            dr.hook_ref = hook.reference
+            products.hooks["output"] = hook
     if p.generate.enabled and p.generate.sample_validator is not None:
-        try:
-            resolve_hook(p.generate.sample_validator)
-        except ValueError as e:
-            col.error(f"{fp}:[generate].sample_validator: {e}")
+        hook = _resolve_and_probe_hook(ctx, f"{fp}:[generate].sample_validator",
+                                       p.generate.sample_validator, 1,
+                                       ("m1-probe-sample",))
+        if hook is not None:
+            products.hooks["sample"] = hook
+    if p.generate.scenario_validator is not None:
+        hook = _resolve_and_probe_hook(ctx, f"{fp}:[generate].scenario_validator",
+                                       p.generate.scenario_validator, 1,
+                                       (scenario_probe_input(),))
+        if hook is not None:
+            products.hooks["scenario"] = hook
     if dr.hook is not None and schema_ok and p.annotate.examples:
         _, dr.hook_alive = _dryrun_fewshot(col, p.annotate.examples, _DryRun(
             file=fp, elem_label="annotate.examples", schema_key=skey,
@@ -1166,50 +1184,31 @@ def _static_checks_generate(ctx: _LoadCtx, products: _Products,
                        budget.TEMPLATE_HEAD_TOKENS["generate"] + gen_instruction_est))
     if not p.generate_stream.enabled:
         return checks
-    joint_views = _joint_prefix_views(ctx, products)
-    joint_active = bool(joint_views and products.frame_class_views) and any(
-        effective_rules(view.rules, p.generate_stream.rules)
-        or effective_windows(view.windows, p.generate_stream.windows)
-        for view in joint_views)
-    if joint_active:
-        for name in p.generate.llms:
-            profile = ctx.llm_profiles.get(name)
-            if profile is None:
-                continue
-            brief_est, realize_est = _joint_prompt_estimates(
-                ctx, products, joint_views, len_max, profile)
-            checks.append(("generate.stream.plan", (name,), brief_est))
-            checks.append(("generate.stream.realize", (name,), realize_est))
+    # v1.17: 时间流形态恒走 brief+realize 两段（planner 已在 M1 冻结 word）；
+    # 参与类与最长长度取自冻结计划（scenario_plan），约束文本经换名后的
+    # render_constraint_text（config.model）渲染。
+    plan = products.scenario_plan
+    if plan is None or not plan.slots:
         return checks
-    frame_gen_table_text = "\n".join(f"{c.name}\n{c.description}"
-                                     for c in p.frame_classify.classes)
-    gen_schema_max = max([0] + [
-        budget.est_text(json.dumps(fv.gen_schema, ensure_ascii=False))
-        for fv in products.frame_class_views.values() if fv.gen_schema])
-    checks.append(("generate.stream.plan", tuple(p.generate.llms),
-                   budget.TEMPLATE_HEAD_TOKENS["generate_plan"] + gen_instruction_est
-                   + budget.est_text(frame_gen_table_text)))
-    checks.append(("generate.stream.realize", tuple(p.generate.llms),
-                   budget.TEMPLATE_HEAD_TOKENS["generate_realize"] + gen_instruction_est
-                   + len_max * gen_schema_max))
+    seen_classes: list[str] = []
+    joint_views = []
+    for slot in plan.slots:
+        name = slot.sequence_class
+        if name in products.class_views and name not in seen_classes:
+            seen_classes.append(name)
+            joint_views.append(products.class_views[name])
+    if not joint_views:
+        return checks
+    slot_len_max = max(slot.length_target for slot in plan.slots)
+    for name in p.generate.llms:
+        profile = ctx.llm_profiles.get(name)
+        if profile is None:
+            continue
+        brief_est, realize_est = _joint_prompt_estimates(
+            ctx, products, joint_views, slot_len_max, profile)
+        checks.append(("generate.stream.plan", (name,), brief_est))
+        checks.append(("generate.stream.realize", (name,), realize_est))
     return checks
-
-
-def _joint_prefix_views(ctx: _LoadCtx, products: _Products) -> list[ClassView]:
-    """按配额展开与 ``--limit`` 前缀返回联合路径实际参与类视图。"""
-    remaining = ctx.cli.limit
-    result: list[ClassView] = []
-    for name in sorted(products.class_views):
-        view = products.class_views[name]
-        count = view.generate.sequences
-        if remaining is not None:
-            count = min(count, max(remaining, 0))
-            remaining -= count
-        if count > 0:
-            result.append(view)
-        if remaining == 0:
-            break
-    return result
 
 
 def _joint_prompt_estimates(ctx: _LoadCtx, products: _Products,
@@ -1239,8 +1238,9 @@ def _joint_prompt_estimates(ctx: _LoadCtx, products: _Products,
 
 def _joint_constraint_text(project: _Project, view: ClassView) -> str:
     """渲染一个序列类的生效规则与窗口预算文本。"""
-    rules = effective_rules(view.rules, project.generate_stream.rules)
-    windows = effective_windows(view.windows, project.generate_stream.windows)
+    rules = effective_frame_rules(view.frame_rules, project.generate_stream.frame_rules)
+    windows = effective_frame_windows(view.frame_windows,
+                                      project.generate_stream.frame_windows)
     return render_constraint_text(rules, windows)
 
 
@@ -1248,7 +1248,8 @@ def _joint_has_correlation(project: _Project, views: list[ClassView]) -> bool:
     """判断实际联合规划前缀是否存在 correlation。"""
     return any(rule.correlation is not None
                for view in views
-               for rule in effective_rules(view.rules, project.generate_stream.rules))
+               for rule in effective_frame_rules(view.frame_rules,
+                                                 project.generate_stream.frame_rules))
 
 
 def _joint_realize_estimate(ctx: _LoadCtx, products: _Products,
@@ -1469,20 +1470,35 @@ def _check_required_instructions(ctx: _LoadCtx) -> None:
                   f"expected a non-empty string")
 
 
-def _check_paths(ctx: _LoadCtx, products: _Products) -> None:
-    """规则 21: 输入/输出路径的存在性关系与输出父目录可写性。
+def _effective_path(cli_value: str | None, toml_value: str | None, root: Path,
+                    ) -> str | None:
+    """v1.17(SPEC-SP §5.1): 按来源解析一个输入/输出路径并绝对规范化。
 
-    输入路径的**存在性/可读性**在此故意不校验: 按 spec §2.4(路径缺失 → 退出码 3,
-    仅 process 模式)与冻结的 InputError 契约("运行起点处路径缺失"), 那项检查属于 M2
-    的 Ingestor.scan()/records()。M1 只查输出与输入的路径关系(输入不存在时尽力而为:
-    is_dir()/is_file() 都为 False)。
+    CLI 值是 shell 参数——先按**调用 cwd** 解析; TOML 值按 **project root** 解析;
+    两者先各自定锚, 再参与 CLI > project 优先级。绝对路径原样规范化。
+
+    @param cli_value CLI 覆盖值(``--input``/``--output``)
+    @param toml_value project.toml 声明值
+    @param root project root
+    @return 绝对规范化路径字符串; 两侧均未声明时 None
+    """
+    if cli_value is not None:
+        return str((Path.cwd() / cli_value).resolve()) if cli_value else cli_value
+    if toml_value:
+        path = Path(toml_value)
+        return str(path.resolve() if path.is_absolute() else (root / path).resolve())
+    return None
+
+
+def _check_paths(ctx: _LoadCtx, products: _Products) -> None:
+    """规则 20: 生效输入/输出路径(CLI > project; v1.17 一律绝对规范化)。
 
     @param ctx 校验上下文
     @param products 产物累加器(填充生效输入/输出路径)
     """
     col, fp, p = ctx.col, ctx.fp, ctx.p
-    eff_input = ctx.cli.input if ctx.cli.input is not None else p.run["input"]
-    eff_output = ctx.cli.output if ctx.cli.output is not None else p.run["output"]
+    eff_input = _effective_path(ctx.cli.input, p.run["input"], ctx.root)
+    eff_output = _effective_path(ctx.cli.output, p.run["output"], ctx.root)
     products.eff_input, products.eff_output = eff_input, eff_output
     if eff_output is None:
         col.error(f"{fp}:[run].output: missing required key, expected string (may be "
@@ -1536,7 +1552,7 @@ def validate(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
     _check_dedup_semantic(ctx)
     _check_cross_field(ctx)
     _check_run_mode(ctx)
-    _resolve_api_keys(ctx, products)
+    _collect_referenced_profiles(ctx, products)
     _load_schema_and_hooks(ctx, products)
     _resolve_global_rubric(ctx, products)
     ctx = _check_classify_and_views(ctx, products)

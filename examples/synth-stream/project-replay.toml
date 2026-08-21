@@ -1,14 +1,12 @@
-# 时间流生成工件的 process 重放教学工程（spec v1.16）。
-# 输入是 project.toml 生成的逐帧工件；M2 按 ts 排序并用同一 gap_s 复演会话。
+# 时间流生成工件的 process 重放教学工程（v1.17）。
+# 输入是主工程生成的逐帧工件；M2 按 ts 排序并用同一 gap_s 复演会话。
 # segment 把帧组装为序列后，dedup 在全局范围判重，流尾原样重发应出现 dropped_dup。
-# exact 或 near_text 取决于 segment 对噪声帧的过滤结果；两者都表示命中重发序列。
+# structured noise 的 truth.frame_class 透传到 _meta.source.fields，便于对账；truth 不参与
+# 排序、分段或判重。输出词干独立，不覆盖生成产物。
 #
-# truth 对 process 侧只是普通输入字段，不参与排序、分段或判重；这里透传到 _meta.source.fields，
-# 方便把重放结果与生成工件的计划真值对账。输出文件使用独立词干，不覆盖生成产物。
-#
-# 运行（凭据只由 config.toml 声明的环境变量名注入）：
-#   LABELKIT_DEEPSEEK_KEY=... uv run labelkit run --config config.toml \
-#     --project project-replay.toml
+# 运行（密钥只由 config.toml 声明的环境变量名注入）：
+#   set -a && source ../../.env && set +a
+#   uv run labelkit run --config config.toml --project project-replay.toml --console plain
 schema_version = 1
 
 [run]

@@ -454,6 +454,92 @@ correlation/time → sequence hook → sequence similarity。报告只在实际�
 加入 `rules` / validator 计数与 `windows.calendar_days_spanned`，规则、窗口、hook 返回
 文本和 planner 细节永不写入 artifact、truth、主输出或 report。
 
+### 5.2.2 v1.17 场景规划与精确交付配置面（破坏性修订）
+
+v1.17 对时间流生成形态的配置面做**破坏性修订**（不保留兼容层、不写 migration、不接受旧键别名——仓库铁律）。以下十项 v1.16 及更早的键自 v1.17 起为**定向 CONFIG_ERROR**（错误只告诉用户新的唯一表达，不读取旧值、不转换；机制 = v1.11 `use_vision` 的原始节探针）：
+
+| 删除键 | 新表达 |
+|---|---|
+| `[generate].sequences` | `[[generate.stream.quotas]]` |
+| `[class.<name>.generate].sequences` | `[[generate.stream.quotas]]` |
+| `[generate.stream].sessions` | `[generate.stream].crossed_sessions`；总 session 自动推导 |
+| `[generate.stream].ts_start` | `[generate.stream.schedule].start/end` |
+| `[generate.stream].noise_instruction` | `[[generate.stream.noise]]` |
+| `[[generate.stream.rules]]` | `[[generate.stream.frame_rules]]` |
+| `[[generate.stream.windows]]` | `[[generate.stream.frame_windows]]` |
+| `[[class.<name>.generate.rules]]` | `[[class.<name>.generate.frame_rules]]` |
+| `[[class.<name>.generate.windows]]` | `[[class.<name>.generate.frame_windows]]` |
+| hook 的 `module:function` 引用 | `path.py:function` |
+
+**`[generate.stream]` v1.17 键面**（与 5.2 主表 v1.13 行并读——`sessions` / `ts_start` / `noise_instruction` 三行废止；`enabled` 沿用 time-stream 形态门）：
+
+| 字段 | 类型 | 默认 | 约束与语义 |
+|---|---|---:|---|
+| `crossed_sessions` | int | 0 | `0 ≤ value ≤ floor(target_sequences / 2)`；session 数恒为 `target_sequences − value`（primary sessions = N − D、single-owner sessions = N − 2D、crossed sessions = D——配置语义而非 report 推测）；duplicates 另增流尾 session，不参与上述计数 |
+| `noise_ratio` | float | 0.0 | `[0,1)`；target noise = `round(ratio × planned_task_frames)`（`planned_task_frames` = 全部 slot 的 `length_target` 之和，建模前常数；ROUND_HALF_EVEN、planner 整数量化，3.6.5）——自 v1.17 起是**精确交付目标**（structured noise 在有限预算内补足） |
+| `duplicates` | int | 0 | `0 ≤ value ≤ target_sequences`；流尾原样重发，source 与时间布局在 planner 前冻结、不消耗 LLM；source slot 未交付 ⇒ 省略该 duplicate 并计 shortfall，不改选另一 source |
+| `frame_gap_s` | `[number, number]` | `[5, 60]` | 起点间隔闭区间；微秒量化规则沿用 v1.16（`Decimal(str(·))` 转整数微秒闭区间） |
+| `max_attempts_per_slot` | int | 3 | `≥ 1`；每个 sequence slot 与 noise slot 的独立交付预算；载体为 `GenerateStreamConfig.max_attempts_per_slot`，仅 M6 delivery 消费、不进入 `ScenarioConfig` |
+
+**`[generate.stream.schedule]` 有限日程**（time-stream 形态必填节，删除 v1.16 `_horizon` 的每 session 一周递推——没有第二个隐式时间上界）：
+
+| 字段 | 类型 | 默认 | 约束与语义 |
+|---|---|---|---|
+| `start` | ISO-8601 datetime | 必填 | 必须显式带 `Z` 或 numeric offset |
+| `end` | ISO-8601 datetime | 必填 | 与 start 使用相同 offset，且 `end > start` |
+| `exclude_dates` | local date array | `[]` | 排除 schedule 内对应本地自然日；重复值报错；落在 schedule 本地日范围之外的条目是定向 CONFIG_ERROR（fail-fast，不静默忽略） |
+
+schedule 是半开区间 `[start, end)`：所有 point timestamp 满足 `start ≤ ts < end`，所有 interval 满足 `start ≤ interval.start < interval.end ≤ end`；排除日上不能放 primary、noise 或 duplicate（point start 不得落在排除日，duration interval 不得与排除日的本地日界区间相交；sequence 跨午夜时其后续 frame 仍逐帧执行该规则）。
+
+**`[[generate.stream.quotas]]` 成功交付 quota**：每张表必须有自然名称；quota 中的 class 必须存在于 `classify.classes`；多张 quota 可引用同一个 sequence class——它们约束同一批 occurrence，**不相加、不覆盖**（数学兼容时同时满足，冲突时 assumption core 同时点名两张表）；未被任何 quota 提及的 sequence class target 为 0；noise-only frame class 不需要 quota。两种互斥形态：
+
+| 字段 | 适用形态 | 约束与语义 |
+|---|---|---|
+| `name` | 两者 | `[a-z0-9_]+`，全表唯一；错误、assumption 与 report 都用该名称 |
+| `period` | 两者 | `day` / `week` / `schedule`。展开规则：`day` 对 schedule 相交且未排除、`of_week` 命中的每个 local date 各应用一次；`week` 对每个 ISO Monday week 各一次（只统计该周 `of_week` 命中的合法日，排除日不取消整周）；`schedule` 对完整 schedule 应用一次。若某个展开 bucket 没有合法日期但 target > 0，该 quota 直接不可满足 |
+| `of_week` | 两者 | period bucket 内允许计数的 weekday；缺省为周一至周日 |
+| `counts` | counts 形态 | 非空 `{sequence_class = integer ≥ 0}`；与 total/weights/allocation 互斥 |
+| `total` | weights 形态 | integer ≥ 1；每个 period bucket 的总交付数 |
+| `weights` | weights 形态 | 至少两个 class 的正整数；与 counts 互斥；先除以全部 weight 的最大公约数得最简整数比（**minimum exact cohort = 最简整数比之和**） |
+| `allocation` | weights 形态 | `exact` 或 `largest_remainder`，必填。`exact` 要求 `total` 是 cohort 的整数倍，否则 M1 同轮报告归一化权重、cohort、小于 total 的最近正数可精确 total（不存在为 null）与大于 total 的最近可精确 total；`largest_remainder` 复用 `apportion_tiers` 的纯整数最大余额算法（零浮点、零 rng，平票按 quota 表内 class 声明顺序），report 写 expected count、realized ratio 与 integer deviation |
+
+time-stream 形态开启时 quota 表必须至少一张，且全部表编译出的 sequence target 总和 ≥ 1：零表或全零 target 是定向 CONFIG_ERROR（零序列工程只剩 noise 与无源 duplicate，没有可交付内容）。
+
+**`[[generate.stream.frame_rules]]` / `[[generate.stream.frame_windows]]`**——v1.16 `rules` / `windows` 表的**更名**（`SequenceRuleSpec` 更名 `FrameRuleSpec`；全局与按类三态整表覆盖语义保留、旧键不别名到新键）。每条 rule / window 新增**必填自然名称** `name`（取代数组序号诊断）；quota、frame rule、frame window 与 sequence rule 的 `name` 共处一个全局唯一域（不能靠配置表路径或数组序号消歧；按类覆盖只改变生效表，不复制或改写自然名称）；resource 不另加配置名称，其 assumption 与诊断键固定为 `resource:<resource-name>`。frame rule 新增标准 interval relation `contains`（要求 source 帧类声明 duration；对每个 target occurrence 存在同序列 source occurrence 使 `source.start < target.start ∧ target.end < source.end`——严格包含，相等边界不通过；point target 的 `target.end == target.start`）。
+
+**`[[generate.stream.sequence_rules]]` 跨序列规则**：
+
+| 字段 | 约束 |
+|---|---|
+| `name` | `[a-z0-9_]+`，全表唯一 |
+| `template` | `precedence`、`response`、`succession`、`not_co_existence` |
+| `source` / `target` | 已由 quota 拥有、target > 0 的 sequence class；两者不同 |
+| `period` | `day`、`week`、`schedule` |
+| `gap_s` | 正向模板可选半开 `[lo, hi)`（`0 ≤ lo < hi`，端点可无损量化为整数微秒）；`not_co_existence` 禁止 |
+
+sequence occurrence 归属其 `sequence_start` 的 local date（跨午夜 sequence 仍只属起始 date 对应的 period）；语义按每个 period bucket 独立执行——`precedence`：每个 target occurrence 至少有一个 source witness（source interval end 早于 target start 且 gap 在声明半开区间内）；`response`：每个 source occurrence 至少有一个更晚的 target witness；`succession`：同时执行 precedence 与 response；`not_co_existence`：同一 bucket 不能同时出现 source 与 target。source witness 可服务多个 target（标准 DECLARE existence 语义）；需要 payload 级一一对应时用 scenario validator，不给 CP 层增加 pairing 配置。
+
+**`[frame.class.<name>.generate]` v1.17 增量**：
+
+| 字段 | 默认 | 约束与语义 |
+|---|---|---|
+| `duration_s` | 缺省（point frame） | 闭区间 `[lo, hi]`，`1e-6 ≤ lo ≤ hi`；量化为 `[ceil(lo × 1e6), floor(hi × 1e6)]`，量化后为空是 CONFIG_ERROR；只允许结构化 frame class。duration 与 sequence length 同用 seeded preference 机制（先按配置区间抽 target，planner 在硬约束不可兼得时最小化绝对 deviation）；artifact timestamp 表示 interval start；声明 duration 的 frame class 必须在 `time_fields` 至少绑定 `end_ts` 或 `duration_s`（不允许生成 artifact 无法观察的隐藏区间） |
+| `resources` | `[]` | 每项 `[a-z0-9_]+`；非空时 `duration_s` 必须在场；所有 resource 名相同的 active interval 进入同一个 CP-SAT `AddNoOverlap`（一个 frame 可同时占用多个 resource；resource interval 延伸计入 session span，replay 切分仍以 point timestamp 的 gap 为准） |
+
+时间字段词表（5.2 绑定子表）新增两词（闭集扩为六值，均 point frame 不得绑定）：`end_ts`（`"string"`——interval end 的 ISO-8601）、`duration_s`（`"number"`——`round((end − start) / 1e6, 6)`）；既有 `ts` / `gap_prev_s` / `gap_next_s` / `elapsed_s` 保留。
+
+**`[[generate.stream.noise]]` 结构化噪音表**（`frame_class` + `weight`，weight 正整数；noise target 按最大余额法分到各 noise class，不消费 RNG）：
+
+- `noise_ratio > 0` 时 noise 表必须非空；`noise_ratio == 0` 时写 noise 表是定向 CONFIG_ERROR。
+- frame_class 必须存在于 `[[frame.classify.classes]]`，并有非空 generate instruction；structured 与 plain-text frame class 都合法（Schema 解析、预算检查和 realization 复用 task frame 路径）。
+- noise frame class 不得出现在任何生效 tier、frame rule、frame window 中；不得声明 duration 或 resources（v1.17 noise 仍是 point occurrence）。
+- task frame 的候选域始终排除 noise 表声明的 frame class（即使该工程没有 tier）；排除后任一 task position 的候选域为空是定向 CONFIG_ERROR。
+- truth：`noise = true`、`frame_class = <实际类名>`、`sequence_class` / `sequence` / `tier_rank` 为 null（6.5）。不新增 `role`、`negative_type` 或第二套 noise Schema。
+
+**hook 引用形态与 `scenario_validator`**：所有 hook 键统一改用 `<python-file>:<attribute-path>`（如 `hooks.py:validate_output`）——相对 python-file 按 project root 解析、绝对路径允许、文件必须是 `.py` 普通文件；M1 用 `importlib.util.spec_from_file_location` 与绝对路径 hash 生成唯一 module name，不修改 `sys.path`、不依赖 cwd、不做自动发现；hook 文件可导入标准库与已安装依赖，多文件扩展应作为正常 Python 包安装。`[generate]` 新增 `scenario_validator = "hooks.py:validate_scenario"`（签名 `fn(value: ScenarioValidationInput) -> list[str]`；accepted 按时间与 slot key 排序、candidate 是当前交付槽位，非空违规只拒绝 candidate 并重试同一 slot——accepted 不回滚不重排；hook exception 与非法返回值都按 candidate violation 处理、WARN once、计入独立失败原因）。`output.validator` / `generate.sample_validator` / `generate.sequence_validator` 的引用形态同步改（签名与回调协议零变化）；M1 解析并冻结 callable（`ResolvedHook` / `ValidationHooks`，4 章），M6 与 schema engine 不再按字符串二次 resolve。M1 对四个 hook 都检查恰当的位置参数数量，并用不含用户数据的 synthetic input 干跑（异常类型与非法返回值在 validate 阶段聚合，不等首条真实 content 才暴露）。
+
+**v1.16 键面联动废止**：5.2.1 节的 `[[generate.stream.rules]]` / `[[generate.stream.windows]]` / `[[class.<name>.generate.rules]]` / `[[class.<name>.generate.windows]]` 四行键名自 v1.17 起按上表更名（规则模板闭集、correlation、`time_s` 与窗口语义本身不变，载体改 `FrameRuleSpec` / `FrameWindowSpec` 并各增必填 `name`）；`generate.sequence_validator` 的引用形态改 `path.py:function`（输入契约零变化）。
+
 ## 5.3 Rubric 结构（内联或默认包文件，同一 TOML 结构）
 
 | 键 | 类型 | 默认 | 说明 |

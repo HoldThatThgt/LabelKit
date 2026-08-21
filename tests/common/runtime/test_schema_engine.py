@@ -35,6 +35,7 @@ from labelkit.common.runtime.schema_engine import (
     stitch_schema,
 )
 from labelkit.common.contracts.types import Usage
+from tests import hook_samples
 
 # The spec 3.8.4 worked-example user schema.
 SPEC_SCHEMA = {
@@ -51,9 +52,11 @@ SPEC_SCHEMA = {
 }
 
 
-def make_engine(user_schema=None, cfg=None) -> SchemaEngine:
+def make_engine(user_schema=None, cfg=None, validator=None) -> SchemaEngine:
     # llm=None: these tests never trigger an LLM call (pure-logic paths only).
-    return SchemaEngine(user_schema or SPEC_SCHEMA, llm=None, cfg=cfg or OutputConfig())
+    # v1.17 Wave 2b: L2.5 回调以冻结 callable 传入（不再从 cfg.validator 字符串 resolve）。
+    return SchemaEngine(user_schema or SPEC_SCHEMA, llm=None, cfg=cfg or OutputConfig(),
+                        validator=validator)
 
 
 def _ctx(*, user_treated: bool, schema=None, record=None) -> _CallContext:
@@ -888,13 +891,16 @@ def test_l1_lossy_not_flagged_for_ascii_escaped_json():
     assert l1_repair_is_lossy(obj, raw) is False
 
 
-# ── v1.5 plan A: L2.5 hook plumbing (pure paths; full loop → integration) ────
+# ── v1.5 plan A / v1.17 Wave 2b 载体化: L2.5 hook plumbing（纯路径；全环 → 集成）──
+# v1.17 Wave 2b：L2.5 回调以冻结 callable 传入（装配方从
+# ``ResolvedConfig.validation_hooks.output.target`` 取），引擎不再按字符串二次
+# resolve——测试直接传 ``tests.hook_samples`` 的可调用对象。
 
 class TestL25Hook:
-    def _engine(self, ref="tests.hook_samples:topic_max6"):
-        return make_engine(cfg=OutputConfig(validator=ref))
+    def _engine(self, hook=hook_samples.topic_max6):
+        return make_engine(validator=hook)
 
-    def test_hook_resolved_at_init_and_renders_prefix(self):
+    def test_hook_carried_in_and_renders_prefix(self):
         eng = self._engine()
         out = eng._callback_violations({"topic": "这是一个很长很长的主题"}, None)
         assert len(out) == 1 and out[0].startswith("(validator) ")
@@ -904,7 +910,7 @@ class TestL25Hook:
         assert eng._callback_violations({"topic": "请假条"}, None) == []
 
     def test_hook_receives_record_context(self):
-        eng = self._engine("tests.hook_samples:needs_record")
+        eng = self._engine(hook_samples.needs_record)
         obj = {"topic": "帮我写一条请假条"}
         assert eng._callback_violations(obj, None) == ["(validator) record 缺失"]
         assert eng._callback_violations(
@@ -920,20 +926,20 @@ class TestL25Hook:
             obj["mutated"] = True
             return []
 
-        eng = make_engine(cfg=OutputConfig(validator="tests.hook_samples:ok"))
+        eng = make_engine(validator=hook_samples.ok)
         eng._validator = spy                     # direct injection for the copy check
         original = {"topic": "请假条"}
         eng._callback_violations(original, None)
         assert "mutated" not in original         # hook saw a copy, not the object
 
     def test_hook_exception_propagates(self):
-        eng = self._engine("tests.hook_samples:boom")
+        eng = self._engine(hook_samples.boom)
         import pytest as _pytest
         with _pytest.raises(RuntimeError, match="hook exploded"):
             eng._callback_violations({"topic": "x"}, None)
 
     def test_hook_bad_return_raises_type_error(self):
-        eng = self._engine("tests.hook_samples:bad_return")
+        eng = self._engine(hook_samples.bad_return)
         import pytest as _pytest
         with _pytest.raises(TypeError, match="must return list"):
             eng._callback_violations({"topic": "x"}, None)
@@ -1163,7 +1169,7 @@ CLASS_SCHEMA = {"type": "object",
                 "properties": {"topic": {"type": "string"}},
                 "required": ["topic"], "additionalProperties": False}
 
-HOOK_REF = "tests.hook_samples:topic_max6"          # topic > 6 字符即违规
+# v1.17 Wave 2b：L2.5 回调以冻结 callable（hook_samples.topic_max6）传入。
 ZERO_STATS = {"l0_or_clean": 0, "l1": 0, "l3_1": 0, "l3_2": 0, "rejected": 0}
 
 
@@ -1177,7 +1183,7 @@ def _run_engine(engine, schema=None, **scope_kw):
 def test_user_treatment_default_keeps_the_schema_is_none_inference():
     # 显式 schema + 缺省 user_treatment ⇒ 内部待遇（15 个既有调用点零改动的语义）
     llm = _FixedLLM('{"topic": "这是一个很长很长的主题"}')
-    eng = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(validator=HOOK_REF))
+    eng = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(), validator=hook_samples.topic_max6)
     obj, _usage, attempts, _model = _run_engine(eng, schema=CLASS_SCHEMA)
     assert obj == {"topic": "这是一个很长很长的主题"}   # hook 未跑，否则会被判违规
     assert attempts == 1 and llm.calls == 1
@@ -1186,7 +1192,7 @@ def test_user_treatment_default_keeps_the_schema_is_none_inference():
 
 def test_user_treatment_true_counts_the_bucket_on_an_explicit_schema():
     llm = _FixedLLM('{"topic": "请假条"}')
-    eng = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(validator=HOOK_REF))
+    eng = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(), validator=hook_samples.topic_max6)
     obj, _usage, attempts, _model = _run_engine(eng, schema=CLASS_SCHEMA,
                                                 user_treatment=True)
     assert obj == {"topic": "请假条"} and attempts == 1
@@ -1200,7 +1206,8 @@ def test_user_treatment_true_also_runs_the_l25_hook():
 
     llm = _FixedLLM('{"topic": "这是一个很长很长的主题"}')     # 过 L2、被 hook 拒
     eng = SchemaEngine(SPEC_SCHEMA, llm=llm,
-                       cfg=OutputConfig(max_repair_attempts=1, validator=HOOK_REF))
+                       cfg=OutputConfig(max_repair_attempts=1),
+                       validator=hook_samples.topic_max6)
     with pytest.raises(SchemaViolation) as ei:
         _run_engine(eng, schema=CLASS_SCHEMA, user_treatment=True)
     assert ei.value.callback_only is True              # 剩余违规全部来自 L2.5
@@ -1212,7 +1219,7 @@ def test_user_treatment_true_also_runs_the_l25_hook():
 def test_user_treatment_false_turns_a_user_schema_call_internal():
     llm = _FixedLLM('{"intent": "qa", "topic": "这是一个很长很长的主题", '
                     '"difficulty": "easy"}')
-    eng = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(validator=HOOK_REF))
+    eng = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(), validator=hook_samples.topic_max6)
     obj, _usage, _attempts, _model = _run_engine(eng, user_treatment=False)
     assert obj["intent"] == "qa"                       # hook 未跑
     assert eng.stats == ZERO_STATS
@@ -1221,7 +1228,7 @@ def test_user_treatment_false_turns_a_user_schema_call_internal():
 
 def test_plain_user_schema_call_is_byte_equivalent_to_v1_12():
     llm = _FixedLLM('{"intent": "qa", "topic": "请假条", "difficulty": "easy"}')
-    eng = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(validator=HOOK_REF))
+    eng = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(), validator=hook_samples.topic_max6)
     _obj, _usage, _attempts, _model = _run_engine(eng)
     assert eng.stats["l0_or_clean"] == 1
     assert llm.schemas == [SPEC_SCHEMA]

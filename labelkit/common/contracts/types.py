@@ -220,6 +220,25 @@ class SequenceValidationInput:
 
 
 @dataclass(frozen=True)
+class ScenarioSequence:                     # v1.17：场景校验器看到的一条已实现序列
+    """场景校验器看到的一条已实现序列（SPEC-SP §4.9 / CONTRACTS §7.19.1 冻结块）。"""
+
+    slot_key: str                           # 交付槽位键
+    sequence_class: str                     # 序列类名
+    start: str                              # 序列起点 ISO-8601
+    end: str                                # 序列终点 ISO-8601
+    frames: tuple[SequenceValidationFrame, ...]  # 按序列位置排列的成员帧
+
+
+@dataclass(frozen=True)
+class ScenarioValidationInput:              # v1.17：增量场景校验输入
+    """增量场景校验输入；candidate 是本次唯一可拒绝项（CONTRACTS §7.19.1 冻结块）。"""
+
+    accepted: tuple[ScenarioSequence, ...]  # 已接受的序列（按时间、slot key 排序）
+    candidate: ScenarioSequence             # 当前交付槽位的候选序列
+
+
+@dataclass(frozen=True)
 class DedupInfo:
     """M3 去重结论：本记录是唯一还是某簇的重复，以及簇头是谁。"""
 

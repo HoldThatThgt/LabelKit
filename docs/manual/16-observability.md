@@ -144,7 +144,7 @@ jq -c 'select(.ev=="quality.judgment" and (.record_ids | index("6e60ce3c2d59f04d
 
 想要完整的调用审计（每次请求的 token、延迟、重试、状态），订阅 trace 的 `llm` 通道即可——`llm.call` 事件字段命名对齐 OpenTelemetry GenAI 语义约定（`gen_ai.usage.input_tokens` 等），现成的 OTel 生态分析工具可以直接吃。
 
-### 时间流生成的两处报告读数（v1.16 增规则与窗口条件块）
+### 时间流生成的两处报告读数（v1.17 planner、delivery 与 quota 条件块）
 
 这个形态（第 27 章）不加事件——v1.14 的两个增量同样零新通道、零新事件、零新错误码——观测面全部落在 `report.json` 的两处按需字段上：
 

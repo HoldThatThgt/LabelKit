@@ -19,7 +19,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 import json_repair
 from jsonschema import Draft202012Validator
@@ -621,26 +621,32 @@ class SchemaEngine:
     """
 
     def __init__(self, user_schema: dict, llm: "LLMClient", cfg,
-                 metrics: "MetricsSink | None" = None):
-        """装配结构引擎，并在此解析一次 L2.5 用户校验回调。
+                 metrics: "MetricsSink | None" = None, *,
+                 validator: "Callable[[dict, Any], Any] | None" = None):
+        """装配结构引擎；L2.5 用户校验回调由装配方以冻结 callable 传入。
+
+        v1.17（Wave 2b，CONTRACTS §7.19.3 / rule 70）：删除了按 ``cfg.validator``
+        字符串二次 resolve 的旧腿——装配方（orchestration 装配面）从 M1 冻结载体
+        ``ResolvedConfig.validation_hooks.output.target`` 取 callable 传入；引擎内
+        不再 import 解析器。
 
         @param user_schema 用户输出 Schema（缺省待遇下的生效 Schema）。
         @param llm M9 客户端，承担 L0 与各轮实际调用。
-        @param cfg 输出配置（读取 validator / repair_llm / max_repair_attempts）。
+        @param cfg 输出配置（读取 repair_llm / max_repair_attempts）。
         @param metrics 指标汇；None 时不发 trace 事件（validate 等无指标路径）。
+        @param validator L2.5 回调的冻结 callable（``fn(obj, record) -> list[str]``）；
+               None = 未配置 output.validator。
         """
         self._user_schema = user_schema
         self._llm = llm
         self._cfg = cfg
         self._metrics = metrics
         self._stats = {"l0_or_clean": 0, "l1": 0, "l3_1": 0, "l3_2": 0, "rejected": 0}
-        # L2.5（v1.5 方案 A）：output.validator 钩子只在此解析一次。M1 启动时已校验过
-        # 该引用；此处才失败属于部署竞态，直接以其本来的 ValueError 形态暴露。
-        self._validator = None
-        self._validator_ref = getattr(cfg, "validator", None)
-        if self._validator_ref:
-            from labelkit.common.extensions.hooks import resolve_hook
-            self._validator = resolve_hook(self._validator_ref)
+        # L2.5（v1.5 方案 A）：回调以冻结 callable 直达；错误定位标签从 callable
+        # 自身派生（只含函数名，不含任何配置原文或数据面）。
+        self._validator = validator
+        self._validator_ref = (getattr(validator, "__qualname__", None)
+                               or "<validator>")
 
     _CB_PREFIX = "(validator) "
 

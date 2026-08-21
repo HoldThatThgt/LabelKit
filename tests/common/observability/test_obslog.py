@@ -963,3 +963,25 @@ def test_fatal_streak_property_tracks_breaker_window(tmp_path):
     assert sink.fatal_streak == 2
     sink.record_provider_result(fatal=False)
     assert sink.fatal_streak == 0                   # success resets the streak
+
+
+# ── v1.17（SPEC-SP §5.1）：trace 路径零 cwd 推导——EventLog 只消费传入路径串 ────
+
+
+def test_trace_writes_exact_absolute_path_under_any_cwd(tmp_path, monkeypatch):
+    """obslog 侧确认零 cwd 推导：EventLog 不 resolve、不拼 cwd——绝对路径在两个
+    不同 cwd 下逐字节落在同一位置（路径装配/绝对化归 M1+runtime 层，SPEC-SP
+    §5.1 的 trace runtime 消费面）。"""
+    trace = tmp_path / "trace" / "run.trace.jsonl"
+    trace.parent.mkdir(parents=True)
+    for cwd in (tmp_path / "cwd-a", tmp_path / "cwd-b"):
+        cwd.mkdir(parents=True, exist_ok=True)
+        monkeypatch.chdir(cwd)
+        log = EventLog(TraceConfig(enabled=True, path=str(trace)),
+                       "f3a9c04b7d21")
+        log.emit(ev("run.start", stage="run", batch_no=0))
+        log.flush()
+    assert trace.exists()
+    assert len(trace.read_text(encoding="utf-8").splitlines()) == 1
+    assert not (tmp_path / "cwd-a" / "run.trace.jsonl").exists()
+    assert not (tmp_path / "cwd-b" / "run.trace.jsonl").exists()

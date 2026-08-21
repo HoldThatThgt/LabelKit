@@ -272,6 +272,14 @@ temporal_scrapped + sequence_validator_scrapped`；序列相似度淘汰不进�
 `dropped_verify` 与 `failed` 继续沿既有信封路由记账。`MODEL_INVALID` 和已通过启动校验后
 发现的不变量破坏仍走既有 `InternalError` / 退出码 4，不产生新错误 kind。
 
+**report v1.17 增量（场景规划与精确交付，E2E-46/50/51/52/54/60）**：
+
+- **`report.run.paths` 恒在场**（v1.17 起，任何形态）：`{project, project_root, input, output, report, rejects, sidecar, trace, stream_artifact}` 九键全部为绝对规范化路径，未启用通道为 null、不写相对路径（值即 `ResolvedPaths`，3.1.4）。live report 固定为 `<output-stem>.report.json`、dry-run report 固定为 `<output-stem>.dryrun.report.json`，两者都由 M1 写入 `ResolvedPaths.report`，emitter 与 console 不再按命令模式追加后缀。run start INFO 与 dry-run plain/rich 各消费同一 `ResolvedPaths`。
+- **dry-run 顶层新增 `estimate`**：其值就是 `estimate_run` 返回对象，**不复制重算**——console 的 dry-run 数字与 scenario 日期都从这个对象格式化，测试必须把 console parser 结果与 JSON 逐键比较。generate_only 分支的对象含 `scenario` 子块（`target_sequences` / `task_frames` / `noise_frames` / `sessions` / `crossed_sessions` / `schedule_start` / `schedule_end` / `calendar_days_spanned` / `plan_digest` / `models`——quota 与 timeline 两模型的 entries 与 families）；`records` 是 sequence envelope 数、`generate_calls = 2 × target_sequences + noise target`（baseline 包含每个 structured noise slot 的一次 realization，不含 delivery retry、provider retry 或 Schema repair）。
+- **`report.generate.stream` 新四键与 v1.16 既有键完整处置**：**删除**七个失败/作废计数器 `plan_failures`、`realize_failures`、`validator_scrapped`、`sample_validator_scrapped`、`sequence_validator_scrapped`、`rules.correlation_scrapped`、`rules.temporal_scrapped`——同一失败事实由 `delivery.failures` 的 13 桶闭集唯一承接，保留两套即双记；**删除** `windows` 子块（其唯一键 `calendar_days_spanned` 移入 `planner.objectives`，不双报）；**更名** `plan_calls` → `brief_calls`（planning 在 v1.17 是零 LLM 的 CP-SAT 求解，旧名误导），`rules` 子块更名 `frame_rules` 且只保留 `sampled`；其余既有键（sequences、sessions、crossed_sessions、frames、noise_frames、duplicates、realize_calls、noise_calls、tiers 等）全部保留原语义。新键按 `plan_digest` / `planner` / `delivery` / `quotas` 的顺序**追加于块尾**，构成块的冻结键序：`plan_digest`（`sha256:` 前缀，validate console、dry-run report 与 live report 均回显同一值）；`planner`（`models`：quota/timeline 各自 entries + families；`objectives`：`preference_deviation` / `calendar_days_spanned` / `timeline_end_us` 三层冻结最优值）；`delivery`（`target_sequences` / `delivered_sequences` / `target_noise` / `delivered_noise` / `target_duplicates` / `delivered_duplicates` / `duplicate_shortfall` / `attempts` / `complete` / `interrupted` / `exhausted_slots` / `failures`——13 个子键按 7.6 闭集枚举序排列，即使为零也全部在场；`attempts` 同时计 sequence 与 noise slot 的 delivery attempt，不计 LLMClient 内部 provider retry，也不把一次 sequence attempt 的 brief/realize 两个 call 误计成两次；`exhausted_slots` 是到达 Exhausted 的交付 slot（sequence ∪ noise）计数，duplicate source shortfall 不计入该键、由 `duplicate_shortfall` 单独承载）；`quotas`（**逐 quota report row 以 quota `name`、period bucket、class 为自然键**，每行含 target、delivered、allocation、realized ratio 与相对目标的 integer deviation——禁止仅给 aggregate 数而丢掉周期归因）。
+- **delivery 守恒**：`delivery.delivered_sequences == counts.generated`（「delivered sequence」唯一表示 M6 已接纳该序列、写入 replay artifact 并交给下游 stage；quality/annotate/verify 可使最终 `counts.emitted` 更低，但不得反向触发 M6 refill，也不改变 quota 已交付事实）。每次完整非 fatal attempt 恰好满足 `attempts = delivered_sequences + delivered_noise + sum(failures.values())`；exact quota 指 primary sequence delivery，duplicates 不计入 quota（source slot 未交付 ⇒ 该 duplicate 省略并计 `duplicate_shortfall`，不改选另一 source）。
+- **守恒式与 rejects 面零改动**：exact delivery 的失败与耗尽发生在 Record 构造前——不产生 `failed`、`item.errors` 或 rejects 行，只进 delivery 桶与值-free WARN；generate-only 退化守恒式照旧。
+
 ## 6.5 时间流工件格式（v1.13）
 
 时间流生成形态（`generate_stream.enabled`，3.6.5）的第二份产物，路径 `{output_stem}.stream.jsonl`（M11 第五输出通道，3.11.2）。UTF-8 JSONL，一行一帧，**行序 = 交织序**（时间戳严格递增），行号（1 基）即 `_meta.stream.member_sources[].line_no`。
@@ -334,3 +342,12 @@ payload，按固定规则平移到流尾，绝不按 duplicate 自身 timestamp 
 相邻 timestamp 差不超过 `gap_s`，跨 session 至少多出 `1us`，M2 严格大于 gap 的切分规则
 因此得到相同会话边界；`truth` 仅作为普通输入字段参与 Record id 的 canonical JSON
 计算，不参与规则或分段判定。
+
+**v1.17 工件增量（truth 键值语义，E2E-54）**：structured noise 帧的 `truth.frame_class`
+由 null 改为**实际类名**——`[[generate.stream.noise]]` 的 noise 类复用帧类的 generate
+instruction 与 JSON Schema（truth 保留其 frame class），`truth.noise = true` 时
+`sequence_class` / `sequence` / `tier_rank` 为 null（noise 无序列归属）。任务帧与
+duplicate 帧的 truth 语义保持不变；duration 帧不新增 truth 键（机械值经 payload 的
+`time_fields` 暴露，5.2.2）。行结构三顶层键、`truth` 键序与重放契约零改动——时间上界
+自 v1.17 起是显式有限 schedule（半开区间 + 排除日）而非隐式 horizon，工件行的时间戳
+分布据此收敛，但行格式与 id 公式不变（3.6.5）。

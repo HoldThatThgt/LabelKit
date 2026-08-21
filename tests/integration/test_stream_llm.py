@@ -54,6 +54,7 @@ from labelkit.common.config.model import (
 )
 from labelkit.operators.extract import extract_transition
 from labelkit.operators.ingest import _parse_ui_tree
+from labelkit.common.runtime.credentials import resolve_credentials
 from labelkit.common.runtime.llm_client import LLMClient
 from labelkit.common.runtime.schema_engine import SchemaEngine
 from labelkit.operators.segment import judge_window
@@ -120,7 +121,6 @@ def _profile(name: str, max_output_tokens: int) -> LLMProfile:
         supports_vision=True,
         max_output_tokens=max_output_tokens,
         temperature=0.0,
-        api_key=os.environ.get(ZAI_KEY_ENV, ""),
     )
 
 
@@ -182,7 +182,8 @@ class _RecordingMetrics:
 
 def make_ctx(cfg) -> RunContext:
     metrics = _RecordingMetrics()
-    llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles, metrics=None)
+    llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles,
+                       resolve_credentials(cfg), metrics=None)
     engine = SchemaEngine(dict(cfg.user_schema), llm, cfg.output, metrics=None)
     return RunContext(cfg=cfg, llm=llm, schema_engine=engine, metrics=metrics,
                       rng=random.Random("42:1:stream"), batch_no=1)

@@ -29,6 +29,30 @@ v1.16（序列规则与联合规划域）明确不做以下范围：
 - 不放开 UI 模态时间流生成，亦不自动执行 artifact 重放并与 truth 评分；两项仍归独立
   工具或后续产品议题。
 
+v1.17（场景规划与精确交付域）明确不做以下范围（处置 E2E-42~60；设计冻结于
+`docs/dev/SPEC-scenario-planning.md` §1.2）：
+
+- 不保留 v1.16 time-stream 配置兼容层，不写 migration，不接受旧键别名（5.2.2 删除键表，
+  十项删除键全部定向 CONFIG_ERROR）。
+- 不实现完整 iCalendar RRULE、IANA timezone 或 daylight saving time [124]；只支持带固定
+  offset 的 day、ISO week 与 schedule 三种 period。
+- 不把重叠 quota 相加成额外 occurrence 或 target；多张 quota 是同一批 occurrence 上的
+  同时约束（数学兼容时同时成立，冲突时 assumption core 同时点名两张 quota）。
+- 不增加超过两个 owner 的 crossed session（v1.13 候选「交叉并发度 k > 2」据此维持停放）。
+- 不把 LLM content、checkpoint 或 retry 状态写入磁盘；跨运行不续跑（无持久化红线不变，2.6）。
+- 不让模型自动推断 resource 名或语义冲突；resource 由配置声明，内容语义由 scenario
+  validator 判定。
+- 不改变 process 模式的生成配额语义；exact delivery 只作用于 time-stream generate-only。
+- time-stream 形态不再接受 `--limit`（quota 是整体契约，截断后的前缀不再声称满足 quota）。
+
+**v1.16 边界移动注记（v1.17）**：上方 v1.16 块中「帧只建模为时间点事件，不引入 duration
+interval 或 Allen 区间代数」与「不提供跨业务的全流顺序声明」两条边界由 v1.17 **部分打开**——
+frame 可声明 `duration_s` 区间（frame rule `contains` 严格包含与跨序列 resource
+`AddNoOverlap` 入 v1.17 配置面，5.2.2），跨业务顺序关系以
+`[[generate.stream.sequence_rules]]` 四模板（precedence / response / succession /
+not_co_existence）按 period bucket 落地；完整 Allen 区间代数、任意可配置区间关系与跨序列
+payload correlation 仍不做。
+
 ## 8.2 设计假设（若不成立需回到设计层）
 
 | # | 假设 | 若不成立的影响 |
@@ -47,7 +71,7 @@ v1.16（序列规则与联合规划域）明确不做以下范围：
 | O3 | UI 模态生成（以现有截图为底、仅生成指令/任务侧文本，AgentTrek 式轨迹合成 [15]） | 本版生成仅文本模态；有明确需求后单独立项。v1.8 注记：stream × generate **互斥**（`segment.enabled` 要求 `generate.enabled=false`，2.3.1）——序列/轨迹合成仍不并入本议题的现版范围；届时须先裁决与 stream 模式的组合语义（互斥放开或串接）。**v1.13 部分核销**：上句遗留的「互斥放开或串接」之问已由 v1.13 给出答卷——**第三形态·直装**（时间流生成，3.6.5）：既不放开互斥、也不串接，而是让 M6 直接产出序列信封（流是生成出来的，无须再分段），互斥条文字面维持不动。**本议题的存续部分收窄为 UI 模态**：文本时序流合成已落地，截图侧合成（AgentTrek 式 [15]）仍待立项——触发条件不变。 |
 | O4 | 断点续跑 | 与「不存储中间态」冲突，明确排除；超大任务靠分目录运行缓解。 |
 | O5 | `labelkit analyze` 子命令：读 trace.jsonl 产出标注质量分析 / rubric 诊断报告（自动计算 7.5 诊断指标、reason 关键词聚类） | 本版仅提供 jq 级手工分析（7.5）；trace 事件契约（7.2）稳定运行一个版本后立项。v1.10 注记（U16）：全屏交互 trace 浏览器品类与 textual 渲染库于本议题立项时一并重估（console 面板经验可迁移，`docs/dev/SPEC-tui-console.md` §5）。 |
-| O6 | 全局精确定量与生成补齐回路（`output.target_count`，输出恰好 N 条） | 设计草案：两阶段流水线——第一阶段全量接入 + 去重 + 打分并缓存分数；第二阶段全局 top-K 选出恰好 target_count 条，再仅对选中集执行标注与输出。前提：分数具全局可比性——pointwise 绝对刻度，或 pairwise 经 O2 锚点法校准后方可全局排序。配生成补齐回路：target 未达时从高分种子生成 → 去重 → pointwise 质量门 → 计入，停止条件 = 达标 ∨ max_backfill_rounds ∨ 本轮合格率 < 下限（生成器饱和时合格率持续衰减，即递归自生成数据的 model collapse 现象 [36]，故合格率下限停止条件必不可少）。现状：2026-07-02 评审对齐为演进路线——本版以 `quality.selection = "top_ratio"` 提供流式批内近似定量（3.4.3），不承诺全局恰好 N 条。触发条件：出现「必须恰好 N 条」的下游需求。v1.7 注记：generate_only 的按类生成配比（每类 standalone_count）经对齐划归本议题——属量目标语义，与全局定量一并立项（1.6 v1.7 对齐决策 ③）；v1.7 的按类参数仅为加工条件化（2.1.2 ⑥）。**v1.13 窄化注记**：时间流生成的按类 `sequences`（3.6.5）**已落地按类量目标的「尝试配额」半边**——按类可各自声明尝试条数、类段字典序展开、`--limit` 在配额层截断；本议题的存续辖区据此收窄为**输出侧的精确定量**（「每类输出恰好 N 条」）与**补齐回路**（未达标时续生成的停止条件族）——尝试配额无输出条数保证：蓝图/实现失败、逐帧钩子违规、序列相似度过滤与下游质量门/评审淘汰都会使实际产出低于配额，且本版**不补齐**（裁决·量目标辖区）。 |
+| O6 | 全局精确定量与生成补齐回路（`output.target_count`，输出恰好 N 条） | 设计草案：两阶段流水线——第一阶段全量接入 + 去重 + 打分并缓存分数；第二阶段全局 top-K 选出恰好 target_count 条，再仅对选中集执行标注与输出。前提：分数具全局可比性——pointwise 绝对刻度，或 pairwise 经 O2 锚点法校准后方可全局排序。配生成补齐回路：target 未达时从高分种子生成 → 去重 → pointwise 质量门 → 计入，停止条件 = 达标 ∨ max_backfill_rounds ∨ 本轮合格率 < 下限（生成器饱和时合格率持续衰减，即递归自生成数据的 model collapse 现象 [36]，故合格率下限停止条件必不可少）。现状：2026-07-02 评审对齐为演进路线——本版以 `quality.selection = "top_ratio"` 提供流式批内近似定量（3.4.3），不承诺全局恰好 N 条。触发条件：出现「必须恰好 N 条」的下游需求。v1.7 注记：generate_only 的按类生成配比（每类 standalone_count）经对齐划归本议题——属量目标语义，与全局定量一并立项（1.6 v1.7 对齐决策 ③）；v1.7 的按类参数仅为加工条件化（2.1.2 ⑥）。**v1.13 窄化注记**：时间流生成的按类 `sequences`（3.6.5）**已落地按类量目标的「尝试配额」半边**——按类可各自声明尝试条数、类段字典序展开、`--limit` 在配额层截断；本议题的存续辖区据此收窄为**输出侧的精确定量**（「每类输出恰好 N 条」）与**补齐回路**（未达标时续生成的停止条件族）——尝试配额无输出条数保证：蓝图/实现失败、逐帧钩子违规、序列相似度过滤与下游质量门/评审淘汰都会使实际产出低于配额，且本版**不补齐**（裁决·量目标辖区）。**v1.17 核销注记（time-stream 辖区）**：`[[generate.stream.quotas]]` + exact delivery 在时间流 generate-only 形态落地「成功交付 quota + 有界补足」——quota 表达成功交付数量，stable slot × `max_attempts_per_slot` 交付状态机在有限预算内补足，耗尽记 shortfall、原子交付已成功部分并以退出码 1 收口（3.6.5、7.6）——上句 v1.13 注记的存续辖区（输出侧精确定量 + 补齐回路）在**时间流形态**就此核销并指回 v1.17；process 模式的生成配额语义不变（8.1 v1.17 块），全局 top-K 输出侧精确定量在 process 形态的辖区仍开放。 |
 | O7 | 多 API Key 负载均衡（单 profile 密钥池：最少在途轮换 / 每密钥 429 冷却 / 认证按密钥禁用 / 全池冷却有界驻留） | 已于 v1.6 落地（3.9.3 密钥池行、5.1 `api_key_envs`、5.2 `run.max_park_s`、7.2 三事件、6.4 keys 子块），本行保留作决策溯源（对齐记录见 1.6，2026-07-03）。触发条件即 8.1 所注「单机并发已被 API 限速主导」——无人值守长跑被单密钥用量限额中断。单密钥配置在数据产出、重试记账与熔断/退出语义上与 v1.5 一致（429 等待路径修订见 3.9.3 重试行）。业界同构：LiteLLM Router / 网关侧客户端多密钥轮换实践。**端点镜像池（多 base_url）经评审明确排除**：同 provider+model 的不同部署在 temperature=0 下仍有数值漂移（GPU kernel / batching 差异），会翻转 pairwise 裁决与语义去重边界判定、污染 7.5 同种子翻转率指标；如未来放开须先解决跨部署可比性。 |
 | O8 | `stitch.judges` 多模型评审团扩展（缝合判定的跨家族多数决，镜像既有 `verify.judges` / `quality.judges` 模式作纯配置扩展） | v1.9 选型记录（1.6，2026-07-16 / T18）：本版采「**单模型多次**」（`stitch.votes`，self-consistency [33]）而非「多模型评审团」（PoLL [32]）——缝合的两类误差病理分工明确：漂移（方差病）→ votes 采样多数决；过连接（偏差病）→ 机械先验合取（3.16.4）。评审团修不了过连接：PIRA 消融显示过连接是**跨家族共享偏差**（GPT 系与 Gemini 系同向 trigger-happy [64]），异构裁判会把共享偏差投成多数 [86]，且实测评审团有效独立票仅 ≈2 [89]；当前部署纪律为单端点单模型。触发条件：第二模型家族进入部署面，且真机门禁审计显示漂移（而非过连接）是漏缝/错缝主体。 |
 
@@ -77,3 +101,14 @@ v1.16（序列规则与联合规划域）明确不做以下范围：
 M1、estimate 共用问题入口。LLM 作废后的处理是删除 attempt、移除空 session、保留幸存
 timestamp 并投影 noise/duplicate。验证顺序、hook 深拷贝、报告恒等式和 artifact 不变面
 见 3.6.6、6.4、6.5。
+
+**v1.17 M6 现行算法更新**：时间流生成形态的现行算法自 v1.17 起为「QuotaCompiler
+（class × local date 非负整数 occurrence count、具名 quota bucket equality、单目标最小化
+occurrence 总数）→ ScenarioPlanner（owner permutation `AddInverse`、1µs always-present
+interval `AddNoOverlap`、聚合 noise reserve、三层字典序目标逐层冻结）→ exact delivery
+状态机（stable slot × `max_attempts_per_slot` 有界重试 + 幸存者投影）」，取代 v1.16 的
+单模型联合规划叙事（3.6.5、`docs/dev/SPEC-scenario-planning.md` §6–§9）；上表 M6 行的
+v1.13 候选「交叉并发度 k > 2」按 v1.17 明确不做维持停放（crossed session 至多两个
+owner）；8.1 v1.17 块的其余不做项（RRULE/IANA timezone/DST、quota 相加、resource 语义
+自动推断、LLM content/checkpoint 落盘、process 模式配额语义变更、`--limit`）均为边界
+而非演进候选。
