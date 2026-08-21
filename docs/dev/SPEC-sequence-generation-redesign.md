@@ -44,7 +44,8 @@ flowchart LR
 的运行期映射、迁移器或兼容解析器。
 
 旧 generate.stream、quota、frame rule、sequence rule、frame window、time_fields、brief_schema、
-realize_schema、ScenarioPlan、SequencePlan、survivor projection 和旧 artifact truth 均删除。
+realize_schema、旧 ScenarioPlan 字段与构造契约、SequencePlan、survivor projection 和旧 artifact truth 均删除。
+v1.18 重新定义同名 ScenarioPlan；它只实现本规格第 8 节与第 16 节冻结的新契约，不保留旧字段或构造入口。
 
 ### 2.2 instruction-only
 
@@ -251,6 +252,7 @@ frame payload；所有 payload 必须是 JSON object，避免混合载荷破坏 
 ~~~toml
 [generate.pattern.booking_success]
 sequence_class = "ticket_booking"
+description = "请求者提交订票需求，系统确认受理并在允许时间内给出出票结果。"
 order = ["request", "acknowledge", "confirm"]
 max_span_s = 1800
 
@@ -324,7 +326,8 @@ pattern 的强制语义：
 - test 操作的 path 必须落入 read_roots；add、remove、replace 的 path 必须落入 write_roots。
 - publish_roots 必须在事件后存在；observers 必须是 ScenarioSeed actor。
 - pre_state_schema_path 可选；在 patch 前对完整 state 验证。
-- payload binding 字段从 LLM 可写 Schema 移除，渲染后机械注入并再次验证完整 Schema。
+- payload binding 的精确 path/value 进入 FrameRenderer prompt；LLM 返回完整 Schema object，系统再按声明序
+  用 RFC 6902 add 语义机械覆盖并复验同一完整 Schema，不改写用户 Schema。
 - payload binding 的 state_path 必须同时被当前 role.read_roots 与 publish_roots 覆盖；binding 不能成为
   hidden state 的旁路解密或发布机制。
 
@@ -396,7 +399,8 @@ state_schema_path = "schemas/state.json"
 下界不大于上界。state_schema_path 可选；缺省使用只要求 JSON object 的固定 Schema。
 
 instruction-only 不允许 pattern、counterfactual_sets、role permission、outcome Schema 或 expected violation。
-每条 slot 是一个单序列精确提交组。LLM 选择的 frame class 必须来自已声明且具有 object 生成 Schema 的闭集。
+每条 slot 是一个单序列精确提交组。LLM 选择的 frame class 必须来自已声明、具有 object 生成 Schema 且不是
+`generate.noise.frame_class` 的闭集；至少保留一个可选 frame class。
 每个 attempt 固定调用 ScenarioSeedGenerator；它使用 instruction 与可选 state Schema 生成完整 ScenarioSeed，
 不支持 catalog source。EventPlanner 可读完整 current state，但 actor 必须来自该 seed 的 actors。
 
@@ -454,7 +458,7 @@ instruction-only 同时要求 crossed_primary_sessions = 0、primary_sessions = 
 
 配置期对 instruction、Schema 和最小固定模板执行完整预算检查。运行期在每次调用前以实际完整 prompt、
 实际 JSON Schema、max_output_tokens 与冻结 margin 验证现有上下文不变式。ScenarioSeed、ActorView、patch、payload、
-完整 EventTrace 和 semantic evaluation 输入既不截断，也不使用摘要或替代 Schema 通过预检。
+完整 EventTrace 和 semantic blind-review 输入既不截断，也不使用摘要或替代 Schema 通过预检。
 
 派生 record_units = primary_sequences + primary_events + noise_events + replay_events。record_units 必须在
 1..500000；compile 期超过上限直接 CONFIG_ERROR。stream_rows = primary_events + noise_events + replay_events，
@@ -464,18 +468,20 @@ instruction-only 同时要求 crossed_primary_sessions = 0、primary_sessions = 
 每行 canonical UTF-8 字节数之和计算，因此保守重复计入两个视图中的同一 payload，也计入
 annotation、generation truth、replay 和所有元数据；只排除发射时才增加的墙钟观测字段。
 每个 AttemptTransaction 在 dedup commit 前精确试算接受后的累计值。ScenarioPlan 已冻结每个 replay source；
-当某个 positive candidate 是 replay source 时，EventProjector 在该 source 所在 AttemptTransaction 内一并构造
-全部已规划 replay row，并在 group_commit 前将它们的完整字节计入 prospective retained_content_bytes。
-超限归 sequence_memory_budget 并重试整个 source slot，零 dedup/dataset/replay commit。通过后 replay projection
+当某个 positive candidate 是 replay source 时，DeliveryController 必须先让 M11 从最终 PipelineItem 装配
+SequenceRows，再从其中的最终 primary_stream_rows 构造全部已规划 ReplayRows。prospective retained_content_bytes
+恰等于既有已接受累计、当前 set 的每个 SequenceRows.retained_content_bytes 与本次 ReplayRows.retained_content_bytes
+之和。超限归 sequence_memory_budget 并重试整个 source slot，零 dedup/dataset/replay commit。通过后 replay rows
 与 source 在同一内存临界区提交，后续不再构造未计费 replay row。noise slot 超限归 noise_memory_budget。
 不截断 payload、annotation 或 truth 来规避上限。
 
 结构真值、状态、patch、Schema、ActorView 和完整 EventTrace 不允许裁剪后继续判定通过。超限或完整调用不适配时，
 配置对象在启动期失败，生成内容在运行期消耗当前 slot attempt。只有非真值的可选风格提示可以删除；删除规则固定且记录计数。
 
-规划按 session block 求解；delivery 按 slot declaration order 处理。每个 slot 提交后立即释放完整状态快照和 LLM 中间对象，
-只保留主输出 Record、时间流投影所需事件、dedup 索引和汇总计数。primary main member 与 stream primary row
-在内存中引用同一个冻结 event payload 对象；replay 引用 source payload，不再深拷贝。
+规划按 session block 求解；delivery 按 slot declaration order 处理。每个 slot 提交后立即释放完整状态快照、
+LLM 中间对象、ProjectedSequence、PipelineItem 与 AttemptTransaction，只保留最终 main rows、最终 stream rows、
+dedup 索引和汇总计数。primary main member 与 stream primary row 在装配前引用同一个冻结 event payload 对象；
+replay projection 从最终 source row 复制其值，不保留另一份世界执行对象。
 
 实现门同时包含 record_units = 500000 的最小载荷结构压测、接近 512 MiB 输出字节包络的混合载荷压测，
 两者 peak RSS 都不超过 4 GiB。独立用例钉住 500001 record units 在 compile 期拒绝，以及
@@ -488,10 +494,12 @@ GenerationProgramCompiler 在任何凭据物化和 LLM 请求之前完成：
 - 解析 sequence class、frame class、pattern、role、gap、counterfactual set 和 instruction-only 引用。
 - 验证全部 JSON Schema、JSON Pointer、hook 签名、catalog 外壳与 catalog cardinality。
 - 为每个 variant 冻结唯一 expected_violation 和 causal divergence role。
-- 展开 delivery slot，并按配置声明顺序与 scenario_index 排序。
+- 校验 delivery slot 的精确 cardinality 与声明序；实际 DeliverySlot 只由 ScenarioPlan 冻结，并在其中写入
+  catalog_row_index（LLM source 为 null）。catalog 按 class、声明序、scenario_index 无放回分配，slot 重试不换行。
 - 校验 timeline 精确恒等式、crossing、noise、replay source 和 session 容量。
 - 计算每种调用的完整最小上下文预算与调用上界。
-- 生成 canonical program digest，供 validate、dry-run、run、ID 与 report 共用。
+- 生成 canonical program digest，供 validate、dry-run、run、ID 与 report 共用。digest 输入覆盖全部语义字段，
+  排除 `digest` 自身与 hook callable，只写 `ResolvedHook.reference`；ScenarioPlan.digest 同样排除自身。
 
 编译阶段不随机抽样、不读 API key value、不调用 LLM、不执行下游 stage。
 
@@ -508,6 +516,14 @@ ScenarioPlanner 只有一个生产入口：
 ~~~python
 def compile_scenario_plan(program: GenerationProgram, seed: int) -> ScenarioPlan:
     ...
+
+def referenced_profiles(
+    config: ResolvedConfig,
+) -> tuple[list[str], list[str]]:
+    ...
+
+def resolve_credentials(config: ResolvedConfig) -> RuntimeCredentials:
+    ...
 ~~~
 
 validate、dry-run 和 run 必须调用相同的 program compiler、block allocator 和 CP-SAT model builder。
@@ -515,7 +531,8 @@ dry-run 可以丢弃 decoded payload-free plan，但不能只做近似检查。
 
 ### 8.2 CP-SAT 边界
 
-CP-SAT 负责：
+ScenarioPlanner 先按声明序冻结 DeliverySlot、catalog_row_index 与 block membership；catalog 分配是确定性整数映射，
+不进入 solver。随后 CP-SAT 负责：
 
 - declared baseline 的 role presence、完整 order、logical_time_us、gap 和 max_span。
 - missing、reordered 和 interval_exceeded 的机械变换与非目标约束。
@@ -544,6 +561,12 @@ solver 必须证明每个变体的所有非目标 gap、max_span 和 calendar wi
 block allocator 先用整数算术按完整 primary session 分配全局 count；最后一个 block 接收余数。一个 crossed session
 的两个 owner 永远在同一 block。单 block 最多 4096 个 primary event；超出时从下一个完整 session 起新 block。
 
+ScenarioBlock 的键固定为 `(slot_key, variant_name)`：隐藏 baseline 与 instruction-only 唯一 branch 的
+`variant_name = None`，声明 variant 使用其配置名。positive 不复制另一份计划，而是显式复用同 slot 的 baseline。
+planner 只冻结位置、role、逻辑时间、工件时间与 session；frame class 和 actor 不进入 PlannedEvent：declared
+从 RoleSpec 机械解析，instruction-only 在 seed 产生后由 EventPlan 选择。noise 与 replay 分别使用 NoiseSlot 和
+ReplayLayout，不用空字符串、null actor 或其他 PlannedEvent sentinel 冒充。
+
 OR-Tools 固定为 pyproject 锁定版本，num_search_workers = 1，random_seed 由 run seed 和 block identity 派生。
 每个优化层使用 max_deterministic_time = 10.0，不使用 wall-time budget。只有 OPTIMAL 可解码；
 INFEASIBLE 抛 generation_plan_infeasible 并 exit 2；FEASIBLE 或 UNKNOWN 抛 generation_plan_budget 并 exit 4；
@@ -551,6 +574,9 @@ MODEL_INVALID 抛 generation_plan_internal 并 exit 4；
 不改走贪心或使用 incumbent。
 
 相同版本、program、seed 的 ScenarioPlan 必须逐字节相同。LLM 输出不在该复现承诺内。
+validate、dry-run 与 run 对相同 ResolvedConfig 和 seed 产生的 GenerationProgram.digest、DeliverySlot、
+catalog_row_index、ScenarioBlock 与 ScenarioPlan.digest 必须逐字节相同；slot 重试不得重新编译 program、重新规划，
+或改变 catalog_row_index。
 
 ### 8.5 独立 oracle
 
@@ -617,7 +643,11 @@ EventPlanner 只接收 ActorView、ScenarioSeed.shared_facts 中明确标记 pub
 state_instruction、frame instruction、pre-state Schema 摘要和允许的 JSON Patch operation Schema。
 它不接收完整 initial_state、其他 actor goal 或 hidden shared fact。
 
-instruction-only 的 EventPlanner 接收完整当前 state 与完整既有 history，并在 truth 中明确 semantic knowledge guarantee。
+instruction-only 的 EventPlanner 接收该 instruction slot 的完整 generation instruction、冻结 sequence length、
+完整当前 state、完整既有 history，以及 ScenarioSeed 中按声明序排列的 actor goal/identity/style profile，并在 truth 中
+明确 semantic knowledge guarantee。它在选择 actor 之前没有 ActorView；请求中的 actor_view 固定为 null，actor
+选定后再从完整 history 构造供 FrameRenderer 使用的 ActorView。declared 请求的 actor_view 必须非 null，
+visible_state、history 与 actor_profiles 固定为 null；其 prompt 只能读取 ActorView 与 public facts。
 
 ### 9.4 EventPlanner 输出
 
@@ -639,6 +669,16 @@ instruction-only 的 EventPlanner 接收完整当前 state 与完整既有 histo
 declared 输出的 frame_class 和 actor 必须恰等于冻结 role。instruction-only 输出必须落在闭集 frame class，
 actor 为非空 string。patch 只允许 test、add、remove、replace，至少一个 test，且所有 test 连续位于变更操作之前。
 move 与 copy 拒绝。
+
+EventPlanner prompt 不呈现 variant name、expected violation、target 或 evaluator 结果；variant name 只保留在
+EventExecutionContext 中供 state_validator 定位。EventExecutionContext 是唯一根输入，携带 program、plan、slot、
+variant、event_index、ScenarioSeed、current state 与 history。`build_event_plan_request` 先验证 slot 确实属于 plan、
+block key 存在且 event_index 有效，再从该根机械派生 prompt-safe EventPlanRequest；调用者不能另传一份 request。
+任何内部引用失配都归 generation_downstream_contract、exit 4、零 LLM call 且不消耗 slot attempt。
+
+EventExecutionContext 不含 EventPlan；M8 后置验证每次只从当次 candidate 构造唯一 EventPlan，再与同一个 context
+一起执行。`plan_event` 必须同时返回 EventPlan 与 M8 对该候选缓存的 EventExecution，调用者不得丢弃 proof
+后再执行一次 patch。
 
 test 只承诺原子 guard；基础 Schema、pre-state Schema、outcome Schema 和 state validator 只证明用户声明与 hook
 的一致性。LabelKit 不声称宽松 Schema 足以表达业务正确性。
@@ -669,15 +709,27 @@ state validator 必须确定性且无副作用；M1 少数验证以相同深拷�
 
 ### 9.6 payload binding 与 FrameRenderer
 
-FrameRenderer 每个新事件调用一次。它只接收 ActorView、intent、事件执行后的 publish snapshot、
-此前该 actor 已观察摘要、frame instruction 和剥离 binding 字段后的 frame Schema。
+FrameRenderer 每个新事件调用一次。它只接收 ActorView、EventPlan、publish snapshot、state before/after hash、
+此前该 actor 已观察摘要、frame instruction、完整 frame Schema 与机械算出的 binding values。完整 state_before、
+state_after、EventExecution 和 state validator 都不进入 RenderEventRequest。
 
 它不能增删事件、改变 frame_class、actor、patch、时间或 role。返回 object payload 后：
 
-- 系统按 binding 的 before/after state snapshot 读取 state_path。
-- 机械写入 payload_path；LLM 返回 binding 字段本身是 Schema 错误。
-- 用完整 frame Schema 再验证。
+- 系统按 binding 的 before/after state snapshot 读取 state_path，并把精确的 payload_path/value 映射写入 prompt。
+- LLM 仍按完整 frame Schema 返回完整 object；系统按声明序在深拷贝上机械覆盖 payload_path。
+- 用同一完整 frame Schema 再验证；父路径缺失、覆盖失败或复验失败都归 frame_schema 并拒绝当前 attempt。
 - canonical payload 超过上限或完整 prompt 不适配 context budget 时 attempt 失败，不裁剪真值。
+
+LabelKit 不尝试把任意 Draft 2020-12 Schema 改写成所谓 writable Schema；`$ref`、`allOf`、`oneOf`、`if`、
+`dependentSchemas` 与 `unevaluatedProperties` 下不存在一般等价的“删一个 instance path”变换。jsonpatch 只执行
+实例 patch，不承担 Schema 翻译。M1 只验证 binding pointer、权限和冲突；最终完整 Schema 是唯一输出判据。
+binding 使用 RFC 6902 `add` 的实例语义：目标成员存在时覆盖，目标成员不存在时新增，但除根路径外的所有父容器
+必须已经存在。多个 binding 按 RoleSpec.payload_bindings 声明序串行应用；同一 payload_path 重复、一个 path 是另一个
+path 的祖先或后代、或根路径 binding 都在 M1 拒绝，避免声明序产生两套可见真值。
+
+instruction-only 没有 RoleSpec，EventExecutionContext 从 program/slot 解析出的 role 固定为 null；StateExecutor 跳过不存在的 root containment、
+pre-state Schema、publish_roots 和 observers，只执行 patch operation 闭集、test 前缀、原子 JSON Patch、基础 state Schema
+与可选 state validator。该模式没有 payload binding；后续 actor history 直接来自完整既有 EventTruth。
 
 ### 9.7 protected prefix
 
@@ -705,7 +757,9 @@ NoiseSemanticEvaluator 使用 evaluation_llm 独立返回 unrelated_to_declared_
 ### 10.1 PatternEvaluator
 
 PatternEvaluator 只接收最终 primary owner 的 ObservedEvent(event_id、frame_class、timestamp)，不接收 planner role witness、
-expected binding 或 variant transformation。它按 pattern role frame class 与出现次序执行一对一实际绑定，输出：
+expected binding 或 variant transformation。它按 frame class 分组，并把 pattern order 中该类第 k 次出现的 role
+稳定绑定到 observed order 中该类第 k 次出现的 event；随后按完整 pattern order 判 cardinality、order、gap 与 span。
+missing 目标 frame class 唯一、reordered 两端 frame class 不同的配置约束保证目标反例没有歧义。输出：
 
 ~~~json
 {
@@ -719,7 +773,8 @@ expected binding 或 variant transformation。它按 pattern role frame class �
 违规按依赖顺序归一化：role cardinality、adjacent order、applicable gaps、max span。缺 role 时不重复报关联 order/gap；
 目标 reordered 时不重复报该边的 gap。variant 通过条件是 actual_violations 与 expected_violation 恰等，不是包含。
 
-actual_bindings 是 EventProjector 写 role truth 的唯一来源。planner witness 不得传给 projector。
+actual_bindings 是 declared EventTruth.role 的唯一来源。PatternEvaluator 通过后才构造 EventTruth；planner witness
+不得写入 EventTrace 或传给 projector。instruction-only 的 EventTruth.role 由冻结位置机械写成 position_NNN。
 
 ### 10.2 StateEvaluator
 
@@ -733,10 +788,20 @@ StateEvaluator 从 ScenarioSeed.initial_state 重新执行全部 branch patch，
 - final_state 满足 variant outcome Schema；instruction-only 只验证基础 Schema。
 - protected prefix 的状态与 payload耦合成立。
 
+StateEvaluationRequest 显式携带当前 DeliverySlot 与 baseline_events。slot 使 instruction-only 在多个声明行时仍能
+唯一选择 state Schema；baseline_events 使 protected_prefix_valid 可以独立计算，不能从当前 branch 或 planner
+witness 反推一个伪 baseline。state validator 只从 program.state_validator 读取，不在 request 中复制。
+CouplingEvaluator 另以 CouplingEvaluationRequest 对同一 protected prefix 做字段级 byte compare；两个 oracle
+均通过才进入 downstream。
+
 ### 10.3 SemanticEvaluator
 
-SemanticEvaluator 使用 evaluation_llm 和独立固定 Schema，一次读取完整 EventTrace、所有 ActorView、
-ScenarioSeed、逻辑等待和最终 payload。不得裁剪状态或事件后继续返回 pass。
+SemanticEvaluator 使用 evaluation_llm 和独立固定 Schema，一次读取完整 semantic blind-review view：
+ScenarioSeed、顺序 SemanticReviewEvent、所有 ActorView、逻辑等待、最终 payload 与 final_state。该请求不携带 EventTrace、
+variant/target、expected 或 actual violation、PatternEvaluation、StateEvaluation 或既有 SemanticEvaluation，因而
+不会与 EventTrace.semantic_evaluation 构成自引用。不得裁剪状态或事件后继续返回 pass。
+declared 的 pattern_description 恰为 SequencePattern.description；instruction-only 恰为 InstructionOnlySpec.instruction，
+调用方不得另行摘要或拼接。SemanticEvaluation 通过后才把它与既有机械 verdict 组装成最终 EventTrace。
 
 ~~~json
 {
@@ -766,34 +831,51 @@ EventProjector 完成后，CrossViewReconciler 是提交前的第二道纯机械
 
 ## 11. ID 与投影
 
-所有散列使用 UTF-8 canonical JSON、sort_keys = true、separators = comma/colon、SHA-256 小写 hex 前 32 字符。
+除 delivery_digest 外，所有 ID 统一调用 `derive_generation_id(domain, components)`：材料恰为
+`canonical_json(["labelkit:v1.18", domain, components])` 的 UTF-8 bytes，canonical JSON 固定
+sort_keys = true、separators = comma/colon、ensure_ascii = false；结果为 SHA-256 小写 hex 前 32 字符。
+domain 与 components 按下表逐字节冻结，components 是按顺序排列的 JSON array，禁止调用方自行连接字符串。
 
-| ID | 输入 |
-|---|---|
-| declared scenario_id | program_digest、counterfactual set name、scenario_index |
-| declared world_branch_id | scenario_id、variant name |
-| instruction scenario_id | program_digest、instruction slot name、scenario_index |
-| instruction world_branch_id | scenario_id、常量 instruction_only |
-| declared event_key | scenario_id、baseline role name |
-| instruction event_key | scenario_id、instruction slot name、scenario_index、position |
-| event_id | world_branch_id、event_key、artifact timestamp、canonical payload |
-| sequence_id | world_branch_id、ordered event_id list |
-| replay_sequence_id | source sequence_id、replay ordinal |
-| replay event_id | replay_sequence_id、source event_id、replay timestamp |
-| noise event_key | program_digest、常量 noise、noise ordinal |
-| noise event_id | run_id、noise event_key、timestamp、canonical payload |
-| run_attempt_id | program_digest、seed |
-| run_id | run_attempt_id、ScenarioPlan.digest |
+| ID | domain | components |
+|---|---|---|
+| declared scenario_id | `declared_scenario_id` | program_digest、counterfactual set name、scenario_index |
+| declared world_branch_id | `declared_world_branch_id` | scenario_id、variant name |
+| instruction scenario_id | `instruction_scenario_id` | program_digest、instruction slot name、scenario_index |
+| instruction world_branch_id | `instruction_world_branch_id` | scenario_id、常量 instruction_only |
+| declared event_key | `declared_event_key` | scenario_id、baseline role name |
+| instruction event_key | `instruction_event_key` | scenario_id、instruction slot name、scenario_index、position |
+| primary event_id | `primary_event_id` | world_branch_id、event_key、artifact timestamp、canonical payload |
+| sequence_id | `sequence_id` | world_branch_id、ordered event_id list |
+| replay_sequence_id | `replay_sequence_id` | source sequence_id、replay ordinal |
+| replay event_id | `replay_event_id` | replay_sequence_id、source event_id、replay timestamp |
+| noise event_key | `noise_event_key` | program_digest、常量 noise、noise ordinal |
+| noise event_id | `noise_event_id` | run_id、noise event_key、timestamp、canonical payload |
+| run_attempt_id | `run_attempt_id` | program_digest、seed |
+| run_id | `run_id` | run_attempt_id、ScenarioPlan.digest |
+
+表中的 artifact/replay/noise timestamp 一律是 integer 微秒；canonical payload component 是已验证 JSON object 本身，
+不是预先序列化的 string；ordered event_id list 是 JSON array。常量 instruction_only 与 noise 是表中不带反引号的
+字面 string。M2 与 generation projector 共用同一个 derive_generation_id，不复制公式。
 
 missing branch 没有目标 role event_key。
-delivery_digest 单独散列按交付序的完整 main row 与完整 stream row；散列前只移除发射器增加的
-_meta.run.started_at 等墙钟观测字段。用户 annotation、generation truth、payload、时间与 replay 证据都在摘要内。
-它写入 report/manifest，不写 main/stream，也不参与任何 Record ID，避免内容摘要自引用。
+delivery_digest 使用完整 64 位 SHA-256，由 M11 唯一计算。哈希先写固定 ASCII header
+`labelkit:v1.18:delivery\n`，再按 main、stream 的视图顺序和各自行序写入一个 frame；每个 frame 是
+`len(canonical_row_bytes)` 的十进制 ASCII、冒号和 canonical_row_bytes。canonical_row_bytes 由共享
+`canonical_delivery_row` 先移除 `_meta.run.started_at`、`finished_at`、`duration_ms`、manifest committed_at 等
+仅在发射时添加的墙钟观测字段，再按上述 canonical JSON 规则编码。用户 annotation、generation truth、payload、
+时间与 replay 证据都在摘要内。摘要只写入 report，manifest 从 report 读取同一值；不写 main/stream，也不参与
+任何 Record ID，避免内容摘要自引用。
+
+retained_content_bytes 与 delivery digest 复用同一个 canonical_delivery_row helper；每行计
+`len(canonical_row_bytes) + 1`，其中一 byte 是 JSONL 换行。SequenceRows 只计自己的 main_row 和
+primary_stream_rows；ReplayRows 只计自己的 rows。发射期墙钟观测字段既不驻留在产品行中，也不计入该内存上限。
 Record.id = sequence_id，member Record.id = event_id。M2 replay 读取 _meta.event.event_id 时验证格式、全文件唯一性和
 与同一 stream 工件中 owner grouping/replay provenance 的一致性；不信任不合格 id，也不改用旧公式。
 
-EventProjector 先产生 main primary sequence，再产生 stream primary events、noise 和 replay。世界 state 与 patch
-默认不写训练输出；trace.content = full 时写既有独立 trace 通道。
+EventProjector 只从当前 DeliverySlot 与 EventTrace 产生 pre-downstream ProjectedSequence；它不产生 noise、replay
+或最终输出 bytes。NoiseProjector 从 NoiseSlot 产生 noise row；ReplayProjector 只在 M11 装配结束后，从 source
+SequenceRows.primary_stream_rows 与 ReplayLayout 产生 ReplayRows。世界 state 与 patch 默认不写训练输出；
+trace.content = full 时写既有独立 trace 通道。
 
 ## 12. 精确交付
 
@@ -821,14 +903,19 @@ slot 按 GenerationProgram declaration order 串行进入 admission。一个 slo
 
 ### 12.2 下游事务
 
-生成侧通过后，完整 counterfactual set 作为 attempt-local batch 依次试算：
+生成侧通过后，generation.project 先把每个 EventTrace 投影成只在内存存在的 sequence Record 与基础 primary
+stream rows；这些 ProjectedSequence 只服务于 dedup/downstream，尚不宣称最终输出字节。完整 counterfactual set
+随后作为 attempt-local batch 依次试算：
 
 ~~~text
 prospective dedup
 → pointwise quality
 → annotate
 → verify
+→ M11 assemble_sequence(final PipelineItem + ProjectedSequence)
+→ replay preprojection
 → CrossViewReconciler
+→ retained-content prospective check
 → group commit
 ~~~
 
@@ -855,18 +942,35 @@ DedupProbeToken 是冻结一次性能力，包含 index_generation、ordered rec
 可恢复外部 I/O，所以它是单进程内的原子状态变换。sequence admission 串行，正常路径不会产生过期 token；
 一旦出现归 generation_dedup_transaction 内部错误并终止运行，不重试为普通重复。
 
-quality、sequence/frame annotation、verification、Schema stats 和 item status 存在 attempt-local metrics。失败时丢弃，不写 main/rejects；
-成功时才合并 dataset counters。LLM usage、调用延迟、token、provider retry 和成本属于运行事实，所有 attempt 都累计，
-不得随事务回滚。
+quality、sequence/frame annotation、verification 和 item status 存在 attempt-local transaction；各 stage 的 dataset
+counter delta 由 DeliveryController 在同一 attempt 的局部整数表累加。失败时全部丢弃，不写 main/rejects；成功时才
+合并 dataset counters。LLM usage、调用延迟、token、provider retry、成本、
+SchemaEngine resolved-at 统计与 trace event 属于运行事实，所有 attempt 都累计，不得随事务回滚。
 
 下游只调用配置中开启的协作者；关闭的 quality、annotate、frame.annotate 或 verify 是明确的零调用。
 quality、annotate、verify 的 class 路由以 PipelineItem.classification 中的 inherited sequence class 为真值，
 不再用 cfg.classify.enabled 作为是否读取 ClassView 的门。Emitter 同理：只要 classification 存在就写入闭集类真值，
 不因 classify stage 关闭而删掉生成器的 inherited classification。
 
-每个协作者接收 AttemptTransaction，它持有临时 PipelineItem、Schema stats、status counters 和不可变 ClassView。
+每个协作者接收 AttemptTransaction，它持有临时 PipelineItem、status counters、ProjectedSequence 和不可变 ClassView。
 不得把 attempt-local item 加入 Orchestrator 的全局 batch 或直接调用 Emitter.emit。接受时一次合并这些纯内存结果；
 拒绝时丢弃整个 AttemptTransaction，但其 MetricsSink 已记录的 LLM 运行事实不回滚。
+
+SequenceDeliveryEmitter 的 `assemble_sequence` 是纯内存、零 I/O 的 M11 装配入口：它复用普通 emitter 的用户对象、
+按类 Schema、scores、annotation、frame annotation 与 verification 规则，返回最终 SequenceRows。每个 delivery slot
+的 `batch_no` 固定为一基 declaration ordinal，重试不改变。只有 SequenceRows 才参与 CrossView、replay 字节构造、
+retained-content 计费和 GenerationProduct；`GenerationProduct.main_rows` 保存最终 JSON object，不用 Record 伪装落盘行。
+ProjectedSequence.main_record 只作为 dedup、quality、annotate 与 verify 的输入载体；不得从它计算最终 main bytes。
+SequenceRows.main_row 必须由这些协作者返回的最终 PipelineItem 装配，因此 annotation、frame annotation、quality score、
+verification 与 inherited classification 都是 retained-content、delivery_digest 和正式 main output 的组成部分。
+
+ReplayProjector 先深拷贝最终 source primary row，再机械替换 replay 身份与工件时间，因此 source 的 payload、
+frame annotation 和其他下游元数据逐位保留。replay `_meta.event.owner_sequence_id = null`，组身份只由
+`replay_sequence_id` 表达；它显式写 replay_ordinal、duplicate_of_sequence_id 与 duplicate_of_event_id。
+event_key、role、frame_class、actor、logical_time_us 逐位复制；event_id 与 timestamp 新生。`_meta.generation`
+固定写 validation_mode = replay、source_validation_mode、sequence_class、scenario_id、source_pattern、source_variant
+与 duplicate_of_sequence_id，不产生新的 world_branch_id 或 primary variant 字段。timestamp 统一用 timeline 的
+fixed UTC offset 和 `datetime.isoformat(timespec="microseconds")`，不得按本机时区或省略尾部微秒。
 
 普通 process 与 flat generate 继续使用既有 Stage 协议。DeliveryController 不把全仓 Stage 改造成事务框架，
 也不调用会立即写 emitter 的 Orchestrator._process_batch。
@@ -890,7 +994,10 @@ main、stream、success report、manifest 或 failed report，只按同一 error
 | 任一固定正式路径的 commit-I/O 失败 | 否 | 否 | 4 | 可能已替换子集，旧 manifest 不变 | best-effort 原子写 |
 | failed report 写入失败 | 否 | 否 | 不改主退出码 | 不改主结果 | stderr 记录英文 kind |
 
-每个 attempt 使用 SHA-256(seed、slot identity、attempt index、purpose) 派生的独立 Random。重试可以改变
+每个 attempt 的 Random 种子是
+`int.from_bytes(sha256(canonical_json(["labelkit:v1.18", "attempt_random", [seed, slot_identity,
+attempt_index, purpose]])).encode("utf-8")).digest(), "big")`；不得复用 Python `hash()` 或自行连接字符串。
+重试可以改变
 ScenarioSeed 的 LLM 内容、事件意图、patch 和措辞；catalog source 不换行。pattern、variant、role、logical time、
 artifact timestamp、session、noise 和 replay source 永不改变。
 
@@ -1031,7 +1138,8 @@ role 来自 PatternEvaluator.actual_bindings。instruction-only role 固定为 p
 不伪装成业务 pattern role。
 
 noise event 固定 owner_sequence_id、role、scenario_id、world_branch_id 为 null，noise = true。
-replay event 带 replay_sequence_id、duplicate_of_sequence_id 和 duplicate_of_event_id；它不带新的 world_branch_id。
+replay event 固定 owner_sequence_id = null，带 replay_sequence_id、replay_ordinal、duplicate_of_sequence_id 和
+duplicate_of_event_id；它不带新的 world_branch_id。M2 只用 replay_sequence_id 分组 replay，不从首次出现次序猜 ordinal。
 
 timestamp、gap 和 elapsed 只在 _meta.event；不向用户 payload Schema 回填 time_fields。
 
@@ -1133,7 +1241,8 @@ report.generate.sequence 键序冻结：
 成功时 planned_sets = delivered_sets、planned_sequences = delivered_sequences，且每个 variant planned = delivered。
 旧 report.generate.stream、quota、tier、brief、realize、survivor、partial delivery 和 shortfall 键全部删除。
 sequence_calls 计逻辑 family 入口次数，包含失败 attempt，不把同一入口内的 L3 修复或 provider retry
-重复计数；后两者继续由既有 usage、schema_engine 和 provider retry 计数表达。
+重复计数；后两者继续由既有 usage、schema.repair trace 和 provider retry 计数表达。既有
+report.schema_engine.resolved_at 仍只统计用户 Schema annotate 调用，不被 generation 内部 Schema 污染。
 一次失败 attempt 只按它停止的最终边界进入上述一个 rejected_attempts 桶，不同时计中间修复违规。
 noise slot 使用 noise 前缀的七个专用桶，不混入 sequence slot 的同名终态。未列键禁止动态追加；
 provider fatal、plan 和 commit-I/O 是 run terminal，写 terminal_error_kind 而不写 rejected_attempts。
@@ -1182,23 +1291,32 @@ DeliveryError 新增到 labelkit/common/errors.py，不继承 ConfigError。异�
 
 | 类型 | 按声明顺序冻结的字段 |
 |---|---|
+| SequenceClassGenerationConfig | `instruction`, `state_schema`, `initial_state_source`, `initial_state_catalog_path`, `initial_state_catalog` |
+| PayloadBindingSpec | `payload_path`, `state_phase`, `state_path` |
 | RoleSpec | `name`, `frame_class`, `actor`, `read_roots`, `write_roots`, `publish_roots`, `observers`, `state_instruction`, `pre_state_schema`, `payload_bindings`, `calendar_window` |
 | GapSpec | `name`, `before`, `after`, `min_gap_us`, `max_gap_us` |
-| SequencePattern | `name`, `sequence_class`, `roles`, `order`, `gaps`, `max_span_us` |
+| SequencePattern | `name`, `sequence_class`, `description`, `roles`, `order`, `gaps`, `max_span_us` |
 | VariantSpec | `name`, `kind`, `target`, `outcome_schema`, `expected_violation`, `divergence_role` |
 | CounterfactualSetSpec | `name`, `pattern`, `count`, `variants` |
 | InstructionOnlySpec | `name`, `sequence_class`, `count`, `len_range`, `instruction`, `state_schema` |
+| TimelineSpec | `timestamp_start_us`, `utc_offset_minutes`, `event_gap_us`, `primary_sessions`, `crossed_primary_sessions`, `session_max_events`, `session_max_span_us`, `session_gap_us`, `noise_events`, `duplicate_sequences` |
+| CalendarWindowSpec | `name`, `utc_offset_minutes`, `days`, `intervals_us` |
+| NoiseSpec | `frame_class`, `instruction` |
+| GenerationLimits | `pattern_roles`, `variants_per_counterfactual_set`, `instruction_only_events`, `scenario_seed_bytes`, `state_or_outcome_schema_bytes`, `frame_schema_bytes`, `event_patch_bytes`, `rendered_payload_bytes`, `instruction_bytes`, `record_units`, `stream_rows`, `retained_content_bytes` |
 | SequenceGenerationConfig | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `state_validator`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `calendar_windows`, `noise`, `limits` |
-| GenerationProgram | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `class_views`, `frame_classes`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `noise`, `limits`, `state_validator`, `digest` |
-| DeliverySlot | `slot_key`, `source_name`, `scenario_index`, `sequence_class`, `pattern_name`, `variant_names` |
-| PlannedEvent | `event_key`, `role`, `position`, `frame_class`, `actor`, `logical_time_us`, `timestamp_us`, `session_id` |
+| GenerationProgram | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `class_views`, `frame_classes`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `calendar_windows`, `noise`, `limits`, `state_validator`, `digest` |
+| DeliverySlot | `slot_key`, `source_name`, `scenario_index`, `sequence_class`, `pattern_name`, `variant_names`, `catalog_row_index` |
+| PlannedEvent | `event_key`, `role`, `position`, `logical_time_us`, `timestamp_us`, `session_id` |
+| NoiseSlot | `event_key`, `ordinal`, `frame_class`, `timestamp_us`, `session_id` |
+| ReplayLayout | `source_slot_key`, `source_variant_name`, `replay_ordinal`, `session_id`, `timestamps_us` |
 | ScenarioPlan | `blocks`, `delivery_slots`, `noise_slots`, `replay_layouts`, `primary_sessions`, `digest` |
 | ScenarioSeed | `initial_state`, `actors`, `shared_facts`, `style`, `time_context` |
 | ActorView | `actor`, `goal`, `read_state`, `observations`, `logical_time_us`, `wait_since_previous_us` |
 | EventPlan | `frame_class`, `actor`, `intent`, `patch` |
 | EventExecution | `state_before`, `state_after`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `normalized_patch` |
-| EventTruth | `event_key`, `event_id`, `planned_role`, `actual_role`, `frame_class`, `actor`, `logical_time_us`, `timestamp_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
+| EventTruth | `event_key`, `event_id`, `role`, `frame_class`, `actor`, `logical_time_us`, `timestamp_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
 | ObservedEvent | `event_id`, `frame_class`, `timestamp_us` |
+| SemanticReviewEvent | `frame_class`, `actor`, `logical_time_us`, `wait_since_previous_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
 | PatternEvaluation | `actual_bindings`, `actual_violations` |
 | StateEvaluation | `replay_hash`, `final_state_hash`, `bindings_valid`, `outcome_valid`, `protected_prefix_valid` |
 | SemanticEvaluation | `causal_consistency`, `actor_knowledge`, `goal_consistency`, `temporal_plausibility`, `cross_frame_consistency`, `realism`, `reason_codes` |
@@ -1206,28 +1324,52 @@ DeliveryError 新增到 labelkit/common/errors.py，不继承 ConfigError。异�
 | EventTrace | `scenario_id`, `world_branch_id`, `sequence_class`, `pattern_name`, `variant_name`, `scenario_seed`, `events`, `final_state`, `pattern_evaluation`, `state_evaluation`, `semantic_evaluation` |
 | GenerationParseContext | `project_root`, `class_views`, `frame_classes`, `llm_profiles`, `hook_loader`, `collector` |
 | ScenarioSeedRequest | `program`, `slot`, `attempt_index`, `random_seed` |
-| EventPlanRequest | `slot_key`, `variant_name`, `planned_event`, `actor_view`, `current_state`, `public_facts`, `attempt_index`, `variation_nonce` |
-| ExecuteEventRequest | `slot_key`, `variant_name`, `planned_event`, `event_plan`, `current_state`, `state_schema`, `pre_state_schema`, `role`, `state_validator` |
+| EventPlanRequest | `mode`, `semantic_profile`, `slot_key`, `planned_event`, `role`, `generation_instruction`, `sequence_length`, `eligible_frame_classes`, `eligible_actors`, `actor_view`, `visible_state`, `history`, `actor_profiles`, `public_facts`, `attempt_index`, `variation_nonce` |
+| EventExecutionContext | `program`, `plan`, `slot`, `variant_name`, `event_index`, `scenario_seed`, `current_state`, `history` |
 | StateTransitionInput | `slot_key`, `variant`, `role`, `state_before`, `state_after`, `patch` |
 | PostValidationResult | `violations`, `event_execution` |
 | PostValidatedCallRequest | `profile`, `prompt`, `schema`, `scope`, `post_validator` |
-| ValidatedGenerationCall | `object`, `event_execution`, `usage`, `attempts`, `model` |
-| RenderEventRequest | `slot_key`, `variant_name`, `planned_event`, `actor_view`, `intent`, `event_execution`, `frame_spec`, `attempt_index` |
-| StateEvaluationRequest | `program`, `pattern`, `variant`, `scenario_seed`, `events`, `final_state`, `state_validator` |
-| SemanticEvaluationRequest | `trace`, `mode`, `class_description`, `pattern_description`, `attempt_index` |
-| NoiseEvaluationRequest | `payload`, `class_descriptions`, `frame_descriptions`, `attempt_index` |
-| ProjectionRequest | `program`, `plan`, `trace`, `pattern_evaluation` |
-| ProjectedSequence | `main_record`, `primary_stream_rows`, `source_event_ids`, `retained_content_bytes` |
-| ReconcileRequest | `plan`, `main_records`, `primary_stream_rows`, `noise_rows`, `replay_rows` |
-| GenerationServices | `schema_engine`, `llm`, `metrics`, `state_validator` |
-| DeliveryRequest | `config`, `program`, `plan`, `credentials`, `paths`, `run_attempt_id`, `run_id` |
-| DeliveryServices | `generation`, `run_context`, `dedup`, `quality`, `annotate`, `verify`, `emitter` |
-| AttemptTransaction | `items`, `class_views`, `schema_stats`, `dataset_counters`, `verdicts`, `projected_sequences`, `replay_rows`, `retained_content_bytes` |
+| ValidatedGenerationCall | `object`, `event_execution`, `resolved_at`, `usage`, `attempts`, `model` |
+| RenderEventRequest | `semantic_profile`, `slot_key`, `planned_event`, `event_plan`, `actor_view`, `publish_snapshot`, `state_before_hash`, `state_after_hash`, `binding_values`, `frame_spec`, `role`, `public_facts`, `attempt_index` |
+| StateEvaluationRequest | `program`, `slot`, `pattern`, `variant`, `scenario_seed`, `events`, `baseline_events`, `final_state` |
+| CouplingEvaluationRequest | `variant`, `baseline_events`, `events` |
+| SemanticEvaluationRequest | `evaluation_profile`, `mode`, `sequence_class`, `class_description`, `pattern_description`, `scenario_seed`, `review_events`, `final_state`, `attempt_index` |
+| NoiseRenderRequest | `semantic_profile`, `noise_slot`, `noise_spec`, `frame_spec`, `class_descriptions`, `frame_descriptions`, `attempt_index` |
+| NoiseEvaluationRequest | `evaluation_profile`, `payload`, `class_descriptions`, `frame_descriptions`, `attempt_index` |
+| ProjectionRequest | `program`, `slot`, `trace` |
+| NoiseProjectionRequest | `program`, `run_id`, `noise_slot`, `payload` |
+| ReplayProjectionRequest | `program`, `layout`, `source` |
+| ProjectedSequence | `main_record`, `primary_stream_rows` |
+| SequenceRows | `main_row`, `primary_stream_rows`, `retained_content_bytes` |
+| ReplayRows | `rows`, `retained_content_bytes` |
+| ReconcileRequest | `plan`, `sequences`, `noise_rows`, `replay_rows` |
+| GenerationServices | `config`, `schema_engine`, `llm`, `metrics` |
+| RuntimeCredentials | `llm`, `embedding` |
+| ResolvedHook | `reference`, `target` |
+| ValidationHooks | `output`, `sample`, `state` |
+| ResolvedPaths | `project`, `project_root`, `input`, `output`, `report`, `rejects`, `sidecar`, `trace`, `stream`, `manifest`, `failed_report` |
+| DeliveryRequest | `program`, `plan`, `paths`, `run_attempt_id`, `run_id` |
+| DeliveryServices | `generation`, `dedup`, `quality`, `annotate`, `verify`, `emitter` |
+| AttemptTransaction | `items`, `class_views`, `projected_sequences` |
 | DownstreamAttemptRequest | `transaction`, `run_context` |
-| DownstreamAttemptResult | `accepted`, `rejected_stage`, `items`, `schema_stats`, `dataset_counters` |
+| DownstreamAttemptResult | `accepted`, `rejected_stage`, `dataset_counters` |
 | DedupGroupRequest | `records`, `exempt_pairs`, `embedding_profile` |
 | DedupProbeToken | `capability_id`, `index_generation`, `record_digests`, `exact_features`, `minhash_features`, `embedding_features` |
-| GenerationProduct | `main_records`, `stream_rows`, `report`, `manifest_input`, `delivery_digest` |
+| GenerationProduct | `main_rows`, `stream_rows`, `report` |
+
+ScenarioBlock 是只读 Mapping，键类型固定为 `tuple[str, str | None]`，值为 PlannedEvent tuple；None 语义见 8.4。
+所有 Mapping 输入在构造时深拷贝为 JSON-compatible 值再暴露为 MappingProxyType。RuntimeCredentials 与
+ResolvedHook.target 的 repr/compare 均不得暴露 callable 或 secret value。
+
+docs/CONTRACTS.md 冻结上述每个字段的完整 Python annotation、`T | None`、tuple/Mapping 容器、default、
+default_factory、constructor positional order 与 frozen 属性；这里只列字段顺序不是放宽类型。除公共配置明确声明的
+缺省和 CallScope 等既有公共默认外，generation 内部 request/result 的可空字段也必须由调用者显式传 null，不得用
+隐式 default 形成第二套构造面。类型测试以手写 literal manifest 为期望，不从生产 dataclass 反向生成期望。
+
+NoiseSlot 只描述独立 noise 事件；ReplayLayout 只描述一次完整 replay 的 source、variant、ordinal、session 与逐事件 timestamp。
+两者均不进入 ScenarioBlock。ReplayLayout.timestamps_us 的长度必须等于 source positive sequence 的事件数，且 source
+只按 DeliverySlot.slot_key 与 source_variant_name 解析；该 variant 的 kind 必须恰为 positive。projector 不允许按
+payload、位置或临时 list index 猜测 source。
 
 SequenceValidationInput、ScenarioValidationInput、GenerateStreamConfig、ScenarioConfig、SequencePlan 和 StreamPlan 不再存在。
 
@@ -1252,18 +1394,30 @@ async def generate_scenario_seed(
 ) -> ScenarioSeed:
     ...
 
-async def plan_event(
-    request: EventPlanRequest,
-    services: GenerationServices,
-) -> EventPlan:
+def build_event_plan_request(
+    context: EventExecutionContext,
+    attempt_index: int,
+    variation_nonce: str,
+) -> EventPlanRequest:
     ...
 
-def execute_event(request: ExecuteEventRequest) -> EventExecution:
+async def plan_event(
+    context: EventExecutionContext,
+    attempt_index: int,
+    variation_nonce: str,
+    services: GenerationServices,
+) -> tuple[EventPlan, EventExecution]:
+    ...
+
+def execute_event(
+    context: EventExecutionContext,
+    event_plan: EventPlan,
+) -> EventExecution:
     ...
 
 def post_validate_event_plan(
     candidate: Mapping[str, object],
-    request: ExecuteEventRequest,
+    context: EventExecutionContext,
 ) -> PostValidationResult:
     ...
 
@@ -1282,10 +1436,19 @@ def evaluate_pattern(
 def evaluate_state(request: StateEvaluationRequest) -> StateEvaluation:
     ...
 
+def evaluate_coupling(request: CouplingEvaluationRequest) -> bool:
+    ...
+
 async def evaluate_semantics(
     request: SemanticEvaluationRequest,
     services: GenerationServices,
 ) -> SemanticEvaluation:
+    ...
+
+async def render_noise(
+    request: NoiseRenderRequest,
+    services: GenerationServices,
+) -> Mapping[str, object]:
     ...
 
 async def evaluate_noise(
@@ -1295,6 +1458,12 @@ async def evaluate_noise(
     ...
 
 def project_trace(request: ProjectionRequest) -> ProjectedSequence:
+    ...
+
+def project_noise(request: NoiseProjectionRequest) -> Mapping[str, object]:
+    ...
+
+def project_replay(request: ReplayProjectionRequest) -> ReplayRows:
     ...
 
 def reconcile_views(request: ReconcileRequest) -> None:
@@ -1312,10 +1481,67 @@ class DownstreamAttemptCollaborator(Protocol):
         request: DownstreamAttemptRequest,
     ) -> DownstreamAttemptResult:
         ...
+
+class DedupIndex:
+    async def group_probe(
+        self,
+        request: DedupGroupRequest,
+        context: RunContext,
+    ) -> DedupProbeToken:
+        ...
+
+    def group_commit(self, token: DedupProbeToken) -> None:
+        ...
+
+class SequenceDeliveryEmitter:
+    def assemble_sequence(
+        self,
+        item: PipelineItem,
+        projection: ProjectedSequence,
+        batch_no: int,
+    ) -> SequenceRows:
+        ...
+
+    def prepare_product(
+        self,
+        main_rows: Sequence[Mapping[str, object]],
+        stream_rows: Sequence[Mapping[str, object]],
+        report: Mapping[str, object],
+    ) -> GenerationProduct:
+        ...
+
+    def commit(self, product: GenerationProduct) -> Mapping[str, object]:
+        ...
+
+    def write_failed_report(self, report: Mapping[str, object]) -> None:
+        ...
+
+def derive_generation_id(
+    domain: str,
+    components: Sequence[object],
+) -> str:
+    ...
+
+def canonical_delivery_row(row: Mapping[str, object]) -> bytes:
+    ...
 ~~~
 
 所有接口声明有 doxygen style 中文 docstring；每个函数不超过五个参数，所以复杂调用使用冻结 request dataclass。
 generation 包不导出旧函数名或参数转换 wrapper。
+
+SequenceDeliveryEmitter.prepare_product 是 delivery_digest 的唯一 owner：它按第 11 节计算一次摘要，写入 report
+的深拷贝并返回 GenerationProduct。GenerationProduct 不再保存第二份 digest 或 manifest_input；commit 从
+深度冻结的 product.report.delivery_digest 构造 manifest，若缺失或格式非法则在打开 `.part` 前以
+generation_downstream_contract 终止；commit 不另算第二份摘要。
+
+DeliveryServices 只有一个 GenerationServices 根；后者的 config、llm、schema_engine、metrics 也是所有生成调用、
+dedup 与下游 stage 的唯一对象。DeliveryController 为每个协作者派生 RunContext 时，这四个字段必须分别与
+GenerationServices 对应字段对象身份相同，只新建 rng 与 batch_no。DeliveryRequest 不复制 config 或 materialized
+credentials；RuntimeCredentials 只服务于 factory 构造上述 LLMClient，随后不进入 delivery request。
+
+AttemptTransaction.items 是当前 attempt 内唯一 PipelineItem 真值，协作者原地更新这些 item；DownstreamAttemptResult
+只返回 accepted、rejected_stage 与该 stage 的 dataset counter delta，不复制 items。DeliveryController 在局部整数表中
+累加 delta，直到 group commit 才合并运行级 dataset counters；任一拒绝直接丢弃 transaction 与局部 delta。
 
 QualityStage、AnnotateStage 与 VerifyStage 均实现 run_attempt，frame annotation 由 AnnotateStage
 的同一 attempt 入口处理。该入口与普通 Stage.run 共用生产核心函数，但不把异常先降级成 StageError。
@@ -1356,9 +1582,10 @@ StateTransitionInput 包含 slot_key、variant、role、state_before、state_aft
 模板全文冻结在 docs/CONTRACTS.md；生产代码只在对应 generation 模块定义一次。CONTRACTS 同时冻结：
 
 - system/user message 顺序。
-- attempt、slot、role 与 actor view 的插值位置。
+- attempt、slot、role 与 actor view 的插值位置；event plan/frame render/semantic review 不渲染 variant target。
 - DeepSeek L0-off 的纯文本 JSON 契约。
 - structured output profile 的 JSON Schema 透传。
+- FrameRenderer 的完整 Schema、按声明序精确 binding values、机械覆盖与最终完整 Schema 复验。
 - deterministic repair 与 L3 repair prompt。
 - reason code 闭集和普通日志禁止字段。
 
@@ -1369,14 +1596,17 @@ M8 新增仅供需要可执行后置判定的内部调用面，不改变既有 c
 ~~~python
 CallPostValidator = Callable[[Mapping[str, object]], PostValidationResult]
 
-async def complete_post_validated(
-    request: PostValidatedCallRequest,
-) -> ValidatedGenerationCall:
-    ...
+class SchemaEngine:
+    async def complete_post_validated(
+        self,
+        request: PostValidatedCallRequest,
+    ) -> ValidatedGenerationCall:
+        ...
 ~~~
 
 PostValidatedCallRequest 冻结 profile、prompt、schema、CallScope 和 CallPostValidator。M8 对每个 L2 通过的
-首轮或 L3 候选恰调用一次后置验证：
+首轮或 L3 候选恰调用一次后置验证；EventPlan 的 callback 从该 candidate 唯一构造 EventPlan，再与闭包捕获的
+EventExecutionContext 执行，context 内不存在另一份 event_plan：
 
 - violations 非空且 EventExecution 为 null 是可修复结果，以 `(post-validator)` 前缀进入同一 L3 违规清单。
 - violations 为空且 EventExecution 非 null 是唯一成功结果，该 EventExecution 写入 ValidatedGenerationCall。
@@ -1385,7 +1615,9 @@ PostValidatedCallRequest 冻结 profile、prompt、schema、CallScope 和 CallPo
 - L3 修复只使用 violations，不把 EventExecution、state 或 hook 异常写进 prompt。
 
 ScenarioSeed、FrameRenderer、SemanticEvaluator 与 noise 仍调用 complete_validated；只有 EventPlan 调用
-complete_post_validated。M8 不保存跨调用后置验证器，因此并行请求不会串用 state 或 hook。
+complete_post_validated。ValidatedGenerationCall.resolved_at 的闭集固定为 l0_or_clean、l1、l3_1、l3_2，
+明确标出该成功对象的解析路径，但不写入只属于用户 Schema annotate 的全局 resolved_at 计数。M8 不保存
+跨调用后置验证器，因此并行请求不会串用 state 或 hook。
 
 ## 19. 物理文件清单
 
@@ -1653,6 +1885,10 @@ hidden_sentinel 不泄漏、replay 同源和 report/manifest digest。
 - 缺任一相邻 max gap、缺 max_span、非法 Pointer、权限重叠、catalog 不足均启动失败。
 - generate.stream、tiers、tier_rank、subsequence、filler、time_fields、old validator、brief 和 realize 键均拒绝。
 - 搜索证明旧生产文件、旧类型、旧 prompt、旧 report key 和旧 artifact truth 不存在。
+- tests/common/contracts/test_generation.py 用 dataclasses.fields、typing.get_type_hints、default/default_factory 与
+  frozen 检查逐个对照手写 carrier manifest；再用 inspect.signature、inspect.iscoroutinefunction 与 get_type_hints
+  对照第 17 节每个函数与方法（包括 Protocol 和 concrete class methods），以及第 18 节
+  SchemaEngine.complete_post_validated 的参数 kind、顺序、async 与返回类型，任何字段或接口漂移必须失败。
 
 ### 22.2 planner 与 pattern
 
@@ -1660,6 +1896,13 @@ hidden_sentinel 不泄漏、replay 同源和 report/manifest digest。
 - CP-SAT 与独立枚举 oracle 对齐 role、gap、span、session、crossing、noise、replay 和 exact count。
 - 同 seed 相同 plan；修改 attempt failure 不改变其他 slot 的 plan。
 - 同 set variant 不共 session、不交织。
+- `calendar_windows` 从真实 M1 配置进入 GenerationProgram，并由 validate、dry-run、run 的同一个
+  compile_scenario_plan 入口约束到 role timestamp；三条路径的 plan digest、slot 与窗口 witness 完全相同。
+- catalog 两行按声明序产生稳定的 catalog_row_index；同一 slot 连续失败重试时索引不变，也不读取下一行。
+- instruction-only 的 PlannedEvent 不含 frame_class/actor；EventPlanRequest.actor_view 为 null，EventPlan 才在闭集内
+  产生 frame_class/actor，随后 renderer ActorView 与 EventTruth 只使用这一个选择结果。
+- NoiseSlot 与 ReplayLayout 各自做 canonical JSON round-trip，ID、session、source slot 与 replay timestamps 不借用
+  PlannedEvent sentinel，且 replay timestamp 数量与 source 事件数不等时 fail closed。
 
 ### 22.3 state 与 actor knowledge
 
@@ -1667,8 +1910,26 @@ hidden_sentinel 不泄漏、replay 同源和 report/manifest digest。
 - patch 后段失败不修改 current state。
 - pre-state、base state、outcome Schema 与 hook 每个失败面都有用例。
 - 未 observer 的 published fact 不在 ActorView；publish 后精确出现。
-- hidden state 不进入 event planner 或 renderer request。
+- declared hidden state 不进入 EventPlanRequest、RenderEventRequest 或两者 prompt；它只存在于不可渲染的
+  EventExecutionContext.current_state 与独立 evaluator 输入。执行所需 planned event、RoleSpec、state Schema、
+  pre-state Schema 与 hook 分别从 context.plan、event_index、program 和 slot 解析，不在 context 重复保存。
 - protected prefix 的 ActorView、intent、patch 或 payload 任一字节变化均被 CouplingEvaluator 拒绝。
+- declared EventPlanRequest 明确携带 profile、RoleSpec、frame view、actor 闭集、ActorView 与 public facts，但不含
+  state Schema、hook 或完整 state；这些只可从独立 EventExecutionContext 的 program/plan/slot/current_state 解析。
+  instruction-only request 明确携带
+  generation_instruction、sequence_length、完整 visible_state/history、actor_profiles 和有序 frame instruction 映射。
+  prompt snapshot 证明 variant、expected、target 不可见。
+- build_event_plan_request 对 declared 与 instruction-only 的每个字段做 exact projection 测试；构造 slot 不属于 plan、
+  block key 不存在或 event_index 越界的 context，必须在零 LLM call、零 attempt consumption 下以
+  generation_downstream_contract 终止，证明 prompt 与后置执行不存在两份事件真值。
+- complete_post_validated 返回的 EventExecution 与正式提交消费的是同一冻结实例；patch、Schema 与 state validator
+  对成功候选各执行恰一次，不允许丢弃 proof 后重放。
+- SemanticEvaluationRequest 只含 blind-review 字段，不可构造或引用 EventTrace，也不含 variant、target、expected、actual、
+  PatternEvaluation 或 StateEvaluation；先得到 verdict，随后才能组装 EventTrace。
+- frame Schema 使用包含本地 `$ref`、`allOf`、`if/then`、`dependentSchemas` 与 `unevaluatedProperties` 的组合用例，
+  证明系统原样传完整 Schema、不改写 Schema，并按声明序以精确 state value 覆盖实例后用完整 Schema 复验。
+- binding 父路径缺失、重复/祖先冲突、机械覆盖失败或最终完整 Schema 失败分别 fail closed；权威 state value 不进入 L3，
+  frame render 的下一个 slot attempt 才能重新请求。
 
 ### 22.4 delivery 与输出
 
@@ -1684,6 +1945,13 @@ hidden_sentinel 不泄漏、replay 同源和 report/manifest digest。
 - retained_content_bytes 恰为 512 MiB 时接受，超一 UTF-8 byte 时整个 slot 失败且零 dedup/dataset commit。
 - 单独构造“source primary 未超限，加上它的 replay rows 恰超一 byte”的用例，必须在 source
   group_commit 前命中 sequence_memory_budget，零 dedup、dataset 与 replay commit。
+- 从 ProjectedSequence 经过真实 attempt collaborators 到 SequenceRows，最终 main_row 必须包含 inherited
+  classification、quality score、sequence/frame annotation 与 verification；CrossView、retained bytes、delivery digest
+  和正式 main 文件使用同一 SequenceRows 字节，不得回退读取 pre-downstream Record。
+- 失败 attempt 的 SchemaEngine resolved-at、LLM usage、provider retry 与 trace 统计继续累积；同一用例中的 dataset counters、
+  item status、annotation、dedup token 和 projected rows 全部回滚，成功重试后只合并最终 attempt 的 dataset counters。
+- NoiseRenderRequest 使用 semantic profile 与 NoiseSlot，NoiseEvaluationRequest 使用 evaluation profile；两条真实接口都
+  不接受 PlannedEvent、ScenarioSeed 或 EventTrace，缺任一 profile 时在编译期失败。
 
 ### 22.5 覆盖率
 
@@ -1719,7 +1987,8 @@ instruction-only 使用真实 DeepSeek 另跑一个非空 slot，必须断言：
 
 ### 23.2 真实 failure injection
 
-不增加测试配置键。测试在 production deterministic evaluator 边界装饰一次性 rejection wrapper：
+不增加测试配置键。测试在 production CrossViewReconciler 边界装饰一次性 rejection wrapper；注入点位于 attempt 0
+的 generation、全部 evaluator 与全部启用下游完成之后、group_commit 之前：
 
 - attempt 0 的完整四 variant 走真实 DeepSeek、真实 SchemaEngine 和原 evaluator 后，wrapper 返回固定拒绝。
 - attempt 1 完全委托原 evaluator，再次执行完整真实生成。
@@ -1729,8 +1998,9 @@ instruction-only 使用真实 DeepSeek 另跑一个非空 slot，必须断言：
 - report.llm_usage 各 profile 的 calls 合计大于等于 `2 * estimate.successful_attempt_lower_bound`。
 
 另一个真实用例在 EventPlan 的 production state 后置验证边界装饰一次性 violation，触发 M8 L3 repair 后放行；
-精确断言 wrapper 只注入一次、schema_engine resolved_at.l3_1 比无注入基线恰增加 1、最终提交的
-EventExecution 即后置验证返回的冻结对象。该用例证明 DeepSeek supports_structured_output = false 路径的
+精确断言 wrapper 只注入一次、目标调用的 ValidatedGenerationCall.resolved_at 匹配 `l3_[12]`，且最终提交的 EventExecution
+与最后一次成功后置验证返回的冻结对象身份相同。不与另一场无注入 live run 比较，避免模型非确定性污染证据。
+该用例证明 DeepSeek supports_structured_output = false 路径的
 文本 JSON、确定性解析和真实修复环，不用模型偶发违约充当注入。
 
 两个 wrapper 都只装饰已有 production collaborator，不替换任何网络组件，不增加状态化用户 hook，不产生生产 fallback。
