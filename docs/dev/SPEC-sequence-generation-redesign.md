@@ -27,7 +27,8 @@ flowchart LR
 
 - declared 模式显式声明完整帧组、完整顺序、每个相邻角色的最大间隔和序列总跨度。
 - positive、missing、reordered、interval_exceeded 都由同一个模式派生。
-- 同一反事实集合共享完整 ScenarioSeed；目标点前的 EventDraft 全量复用，判定后派生相同 EventTruth。
+- 同一反事实集合共享完整 ScenarioSeed；目标点前的 EventDraft 语义字段全量复用，只重派生分支 ID 与工件时间，
+  判定后派生相同角色绑定的 EventTruth。
 - declared 模式中，LLM 每次只看到当前 actor 被授权读取的状态与已经发布给它的历史。
 - JSON Patch 在副本上原子执行；每一步经过基础状态 Schema、可选前置 Schema 和可选 state validator。
 - PatternEvaluator 从最终事件重新绑定实际角色，不读取 planner 的角色 witness。
@@ -77,7 +78,7 @@ flowchart LR
 ### 2.4 反事实耦合
 
 每个 slot attempt 都先完整生成并判定一条 positive baseline，即使配置没有交付 positive 变体。
-每个反例的最早目标点之前复用完整 EventDraft，结构判定后再派生 EventTruth：
+每个反例的最早目标点之前复用 EventDraft 的语义字段，结构判定后再派生 EventTruth：
 
 - actor、intent、logical_time_us、ActorView、JSON Patch、状态哈希和 rendered payload 完全相同。
 - event_key 相同；world_branch_id、event_id 和投影 timestamp 按分支重新派生。
