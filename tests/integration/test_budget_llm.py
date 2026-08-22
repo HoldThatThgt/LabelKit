@@ -42,10 +42,9 @@ from labelkit.common.errors import (
     ProviderFatalError,
 )
 from labelkit.common.observability.obslog import EventLog, MetricsSink
-from labelkit.common.runtime import budget
-from labelkit.common.runtime.credentials import RuntimeCredentials
-from labelkit.common.runtime.llm_client import (
-    LLMClient,
+from labelkit.common.inference import budget
+from labelkit.common.inference.credentials import RuntimeCredentials
+from labelkit.common.inference.llm_client import (
     Message,
     Part,
     PromptBundle,
@@ -54,6 +53,7 @@ from labelkit.common.runtime.llm_client import (
 from labelkit.common.contracts.types import ImageRef
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 from tests.common.observability.test_obslog import make_cfg as obslog_cfg
+from tests.llm_client_helpers import make_llm_client as _client
 
 pytestmark = pytest.mark.integration
 
@@ -146,7 +146,7 @@ async def test_overflow_classified_reactive_budget_off():
     """The finish-oracle disposition is NOT budget-gated (V11/V24 终局化,
     declared no-switch in SPEC §1): even a context_window=0 profile classifies
     the 200-shaped overflow as ContextOverflowError(phase="reactive")."""
-    client = LLMClient({"default": _profile()}, {},
+    client = _client({"default": _profile()}, {},
                         _creds(default=os.environ[ZAI_KEY_ENV]))
     try:
         with pytest.raises(ContextOverflowError) as ei:
@@ -169,7 +169,7 @@ async def test_overflow_with_declared_budget_passes_precheck_and_streak_untouche
     cleared it (llm.call stays status="ok", F9)."""
     sink = _sink(tmp_path)
     prof = _profile(context_window=10_000_000)
-    client = LLMClient({"default": prof}, {},
+    client = _client({"default": prof}, {},
                         _creds(default=os.environ[ZAI_KEY_ENV]), sink)
     text = _text_of_est(EST_OVERFLOW)
     # Precheck arithmetic (same source complete() uses): must pass statically.
@@ -197,7 +197,7 @@ async def test_effective_window_ladder_and_1m_suffix_probe():
     (real ≈ 1.18M tokens) OVERFLOWS. Plus the [1m] model-name probe.
     Assertions are structural (fit/overflow/monotone), not content."""
     # Budget OFF so reality — not our precheck — judges every rung.
-    client = LLMClient({"default": _profile()}, {},
+    client = _client({"default": _profile()}, {},
                         _creds(default=os.environ[ZAI_KEY_ENV]))
     outcomes: dict[int, str] = {}
     billed: dict[int, int] = {}
@@ -245,7 +245,7 @@ async def test_effective_window_ladder_and_1m_suffix_probe():
     # business code 1211 "Unknown Model". Accepted-someday is tolerated (the
     # endpoint adding the alias is not a defect) — but it must be one of the
     # two shapes, never e.g. a silent fallback to a different model error.
-    suffix_client = LLMClient(
+    suffix_client = _client(
         {"1m": _profile(name="1m", model=ZAI_MODEL + "[1m]",
                         max_output_tokens=16)}, {},
         _creds(**{"1m": os.environ[ZAI_KEY_ENV]}))
@@ -273,7 +273,7 @@ async def test_small_window_precheck_fires_before_network_and_never_feeds_breake
     (usage untouched); neither path feeds the breaker streak (V16)."""
     sink = _sink(tmp_path)
     prof = _profile(context_window=2048, max_output_tokens=128)
-    client = LLMClient({"default": prof}, {},
+    client = _client({"default": prof}, {},
                         _creds(default=os.environ[ZAI_KEY_ENV]), sink)
     try:
         resp = await client.complete("default", _prompt("1+1 等于几？只回答数字。"))
@@ -322,7 +322,7 @@ async def test_image_cost_calibration_converges_from_real_usage(tmp_path):
 
     prof = _profile(name="vision", context_window=131_072,
                     max_output_tokens=64, supports_vision=True)
-    client = LLMClient({"vision": prof}, {}, _creds(vision=os.environ[ZAI_KEY_ENV]))
+    client = _client({"vision": prof}, {}, _creds(vision=os.environ[ZAI_KEY_ENV]))
     calibrator = client.calibrator
 
     prior_readout = calibrator.cost("vision")

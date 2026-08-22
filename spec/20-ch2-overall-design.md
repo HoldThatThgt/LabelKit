@@ -15,7 +15,7 @@ LabelKit 是一个**单机、单进程、无状态**的 Python CLI 批处理工�
 | 线索缝合 | 可选，默认关 | v1.9（`stitch.enabled = true`，要求 stream 模式）：M16 stitch 在会话内把同一目标导向任务被穿插切开的碎片（episode）保守缝合为**线索 thread**——单调选池 LLM 判定 × 机械先验合取（App 交集 / 实体重叠 / 返回同一页面析取三腿）+ 有界二遍复评修正贪心漏缝（3.16）；`below_min_len` 短段按连续 run 重组先进候选池救援；被并 episode 壳置 `stitched`（仅计数不落盘，3.11.2）、幸存信封 Record 重绑；多碎片线索机械标定接缝（`seam_indexes`），M15 对接缝序数零 LLM 生成占位步（`detail.kind = "thread_seam"`，3.15.4）。产出三级结构 thread ⊃ fragment ⊃ step（`_meta.stream.fragments` 溯源，6.3）；关闭时主输出 / rejects / report.json 与 v1.8 逐字节等价（3.16.4 退化锚）。 |
 | 质量打分 | 可选，默认开 | QuRating 双模式：pairwise（批内 k 轮随机配对 → LLM 判胜负 → BT 拟合 → 百分位归一化到 [0,1]）与 pointwise（0–5 加性 rubric 打分归一化）。Rubric 用户提供或用系统默认（文本/UI 各一套）。可按聚合分阈值过滤。v1.7：classify 启用时批内按类分池打分，rubric/门槛/选择机制均可按类覆盖（3.4.3 按类分池行）。 |
 | 自动标注 | 可选，默认开 | 按 project.toml 的任务指令 + few-shot 示例组装提示词；UI 模态附截图（base64）与序列化 UI 树；输出受用户 JSON Schema 约束，经结构引擎（M8）保证合法。v1.2 增可选 self-consistency：同一记录以 `annotate.sc_temperature` 独立采样 n 次（`annotate.self_consistency`，n≥3 奇数）后字段级多数投票，成本 ×n（3.5.2）。 |
-| 数据生成 | 可选，默认关 | 仅文本模态。`generate.form="flat"` 保持既有 Self-Instruct / seedless 独立样本生成、llms×styles 多样化与单遍下游回流。`form="sequence"` 是 v1.18 破坏性新内核：declared 以命名 pattern 的精确 role/order/gap/max-span 与 counterfactual set 生成受控 positive/missing/reordered/interval-exceeded 数据；instruction-only 在 LLM 前冻结 slot/长度/位置/逻辑与投影时间。两者逐事件执行 persistent world state；每个 slot 整组经过 prospective dedup、pointwise quality、annotate、verify、M11 最终行装配、replay 投影、CrossViewReconciler 与 retained-content 预收费后一次提交（3.6、3.10、3.11）。 |
+| 数据生成 | 可选，默认关 | 仅文本模态。`generate.form="flat"` 保持既有 Self-Instruct / seedless 独立样本生成、llms×styles 多样化与单遍下游回流。`form="sequence"` 使用 v1.18 生成真值与 v1.19 执行模型：declared 生成受控 counterfactual set，instruction-only 在 LLM 前冻结完整布局；多个 slot 可并发完成 generation、evaluation、dedup reservation 与完整下游，声明序 head 才做去重重验证、增量 CrossView、retained 累加和原子 commit（3.6、3.10、3.11、3.17）。 |
 | 二次校验 | 可选，默认关 | LLM-as-a-Judge 用独立 profile 评审 (记录, 标注) 是否合格，产出 verdict + 批评意见；失败策略可选丢弃或有界修复（批评意见回喂标注模型，最多 N 轮）。 |
 | 结构保证 | 必选 | 输出每行必然通过用户 JSON Schema 校验，四层防线：供应商原生结构化输出 → 确定性修复 → jsonschema 校验 → 有界 LLM 修复环；仍失败则该记录进 rejects 通道，绝不写入主输出。 |
 | 输出 | 必选 | 主输出 JSONL（用户结构 + 可配置 `_meta` 元信息）；`report.json` 运行报告（仅统计，无数据内容）；可选 rejects 通道。 |
@@ -27,9 +27,9 @@ LabelKit 是一个**单机、单进程、无状态**的 Python CLI 批处理工�
 
 ## 2.2 总体架构与模块清单
 
-系统分四层：**入口层**（CLI）、**编排层**（M10）、**算子层**（M2–M7、M11、M13–M16）、**服务层**（M1、M8、M9、M12 与 common 契约）。v1.18 的 sequence 业务实现落在 `labelkit/operators/generation/`，M10 只经 `orchestration/generation_delivery.py` 驱动；`operators/generation/planner.py` 是唯一计划构造入口。common 不反向导入 operators/orchestration；算子层除既有修复白名单外互不导入业务逻辑。
+系统分五层：**入口层**（CLI）、**编排层**（M10）、**算子层**（M2–M7、M11、M13–M16）、**执行运行时层**（M17）、**common 服务与契约层**（M1、M8、M9、M12）。sequence 业务实现落在 `labelkit/operators/generation/`，M10 经 `orchestration/sequence_workflow.py` 驱动；`operators/generation/planner.py` 是唯一计划构造入口。依赖方向为 `cli → orchestration → operators/runtime → common`；runtime 与 operators 互不导入，operators 只看 common 的 TaskExecutor 协议。
 
-图 2-1 LabelKit 总体架构（四层）。实线为算子层主链数据流；紫色虚线为 M6 生成的旁路（取种子 / 子批回流，v1.3 拆分为独立模块）。v1.7 算子层增 M13 classify（3.13，主链工位在 M3 与 M4 之间）。v1.8 算子层增 M14 segment 与 M15 extract（3.14、3.15，默认关）：M14 工位在主链最前（M3 之前，消费 M2 会话流视图产出 episode），M15 工位在 M13 与 M4 之间（对序列信封写入转移）。v1.9 算子层增 M16 stitch（3.16，默认关）：工位在 M14 与 M3 之间（把会话内碎片缝合为线索——缝合改成员集，先于判重与摘取）。
+图 2-1 LabelKit 总体架构（五层）。实线为算子层主链数据流；紫色虚线为 M6 生成的旁路。M17 只接纳纯叶任务、限制资源、管理结构化取消并按输入序返回，不拥有阶段依赖、业务重试、去重、CrossView 或提交。
 
 ### 2.2.1 模块清单与职责边界一览
 
@@ -43,18 +43,19 @@ LabelKit 是一个**单机、单进程、无状态**的 Python CLI 批处理工�
 | M6 generate | flat：以种子或条件化提示生成独立 Record 并交 M10 回流。sequence：编译 program/plan，逐事件生成 ScenarioSeed、无 role EventDraft 与 Frame payload，执行状态、权限、pattern/state/semantic/noise 判定；actual binding 后构造 EventTruth，并只投影 pre-downstream primary 数据。 | 仅文本模态；flat 单轮不递归；sequence 不直接写盘、不投影 replay 或最终输出字节、不绕过冻结计划、不在失败后放宽规则或重排已冻结时间。 | M1, M8, M9, generation package |
 | M7 verify | LLM-as-a-Judge 评审标注；失败按策略丢弃或驱动有界修复。 | 不直接改标注（修复仍由 M5 重新标注、M8 校验）。 | M1, M8, M9 |
 | M8 schema-engine | 用户与内部 JSON Schema 的四层保证；v1.18 新增 `complete_post_validated`，让 EventPlan 候选在每轮 L2/L3 后执行一次无副作用的状态权限/patch 后置判定并返回 `EventExecution`。 | 不保存跨调用 validator；不执行 planner；不认识已删除的 plan/brief/realize 专名。 | M1, M9 |
-| M9 llm-client | Profile 化的统一 LLM 访问：OpenAI 兼容/Anthropic 两类 provider、多模态消息、结构化输出参数、指数退避重试、并发信号量、token/成本计量。 | 不理解业务语义；不解析业务结构（返回原始文本/原生结构化结果）。 | M1 |
-| M10 orchestrator | process/flat 的既有批生命周期；sequence 时在 M1 后调用唯一 program compiler/planner，再创建 DeliveryController，按 slot 声明序执行 attempt-local dedup/quality/annotate/verify、M11 行装配、replay、reconcile、retained-content 预收费、原子索引/数据集提交及终态分流。 | 不实现生成算法、planner 或 stage 业务；不把未接受 attempt 加入全局 batch；不交付成功前缀。 | 全部 |
+| M9 llm-client | Profile 化的统一 LLM 访问：OpenAI 兼容/Anthropic provider、多模态消息、结构化输出、指数退避、ResourceManager profile/origin 许可、共享 HTTP 连接池、token/成本计量。 | 不理解业务语义；不拥有任务接纳或业务阶段顺序。 | M1, M17 |
+| M10 orchestration | `Application` 装配唯一 runtime/services；`ProcessWorkflow` 保持普通批生命周期与阶段屏障；`SequenceWorkflow` 管理连续候选缓冲、coordinator TaskGroup、attempt、声明序提交与终态。 | 不实现生成算法、planner 或叶调用业务；不交付成功前缀。 | 全部 |
 | M11 emitter | process/flat 保持主输出/rejects/report 交付；sequence 先以最终 item 零 I/O 装配 `SequenceRows`，再由 `prepare_product` 唯一计算 delivery digest；成功时依次提交 main、stream、report，最后替换 manifest，失败仅 best-effort 写独立 failed report。 | 不生成或解释 sequence truth；不从 pre-downstream Record 装配最终行；不在 commit-I/O 后声称多文件原子；有效 manifest 优先于 failed report。 | M1 |
 | M12 logging | 进程内唯一日志设施：stderr 运行日志（标准 logging，text\|jsonl 两种格式）；trace 事件流 `EventLog`（JSONL，行缓冲，每批随 M11 flush 同步 flush），由 MetricsSink 持有、各 Stage 经 `RunContext.metrics` 发事件。 | 不做跨运行聚合分析（后续 analyze 工具职责，8.3 O5）；不上传遥测；写失败不中断运行（warn 一次并关闭通道，计入 report）；API Key 永不落日志。 | M1 |
 | M13 classify（v1.7） | 按用户类别表对批内存活记录做 LLM 封闭集分类（单/多标签可配，可选 self-consistency 投票）；结果写 `item.classification`；multi 模式按标签向批尾扇出兄弟信封（3.13）。（v1.12）帧粒度：`frame.classify.enabled` 时对流模式序列信封的成员帧做批量闭集判决（帧类表独立于序列类表、恒单标签），结果写 `item.member_classifications`（3.13.7）。 | 不淘汰记录（分类不是质量门；multi 扇出只增不减）；不定义类别语义（来自配置）；不做标注（用户 Schema 产出物属 M5）；不改链结构（扇出只改批内信封基数）。 | M1, M8, M9 |
 | M14 segment（v1.8） | 把批内候选会话精化为 episode：可选 LLM 滑窗边界裁决与逐帧噪声标记；成员信封置 `absorbed`、噪声帧置 `dropped_noise`，按序键拼装序列 Record 并尾部追加 episode 信封（契约 ②b，4.3；3.14）。 | 不判重（M3）；不推断动作（M15）；不打任务标签（M5）；不改链结构。 | M1, M8, M9 |
 | M15 extract（v1.8） | 对每个 active 序列信封的每对相邻成员帧 ⟨s_i, s_{i+1}⟩ 经 LLM 产出结构化动作（内部 Schema），写入 `item.transitions`；转移数 = 成员数 − 1（3.15）。 | 不重分段（M14 上游）；不产出用户 Schema 字段（M5）；不淘汰记录。 | M1, M8, M9 |
 | M16 stitch（v1.9） | 把会话内碎片保守缝合为线索：单调选池 LLM 判定 × 机械先验合取 + 有界二遍复评；被并 episode 壳置 `stitched`、幸存信封 Record 重绑、below_min_len 短段救援翻转（契约 ②c，4.3）；机械标定 `seam_indexes`（3.16）。 | 不重分段（M14）；不摘取动作（M15）；不判重（M3）；不跨会话/跨批；不做帧多重归属。 | M1, M8, M9 |
+| M17 execution-runtime（v1.19） | 按 ResourceKey 全 execution domain 有界接纳纯叶任务；TaskGroup 结构化取消；组内按输入序返回；ResourceManager 冻结 profile 与 HTTP origin 容量；输出 runtime 高水位和等待统计。 | 不实现业务 DAG、retry、operator reduce、sequence attempt、dedup、CrossView、retained 或工件 commit；不提供公开 TaskHandle。 | common contracts |
 
 ## 2.3 端到端数据流与阶段开关
 
-图 2-2 端到端数据流（process 模式）保持既有链：segment → stitch → dedup → classify → extract → quality → annotate → verify。flat generate_only 仍由 M6 生成独立样本后从 M3 回流。v1.18 sequence generate_only 不经过 segment/stitch/extract/classify stage；M1 冻结配置后，M10 调用唯一 program compiler/planner，并按 slot 声明序驱动 generation → 独立 evaluator → pre-downstream projection → prospective dedup → pointwise quality → annotate → verify → M11 `SequenceRows` 装配 → replay 投影 → CrossViewReconciler → retained-content 预收费 → group/dataset commit。全部 slot、noise 与 replay 接受后，M11 才构造并提交 main、stream、report 与最后写入的 manifest。
+图 2-2 端到端数据流（process 模式）保持既有链：segment → stitch → dedup → classify → extract → quality → annotate → verify。每阶段采用同步计划、M17 有界纯叶任务组、输入序同步归并，批次仍串行。flat generate_only 由 M6 生成后从 M3 回流。sequence generate_only 不经过 segment/stitch/extract/classify stage；M10 先冻结唯一 program/plan，再让连续候选缓冲内的 slot 跨槽并发执行 generation → evaluator → projection → dedup reservation → quality → annotate → verify → M11 行装配 → replay → candidate-local CrossView。声明序 head 在无 await 临界区执行 dedup revalidate → frontier → retained check → commit；最后一次 full CrossView 通过后，M11 才提交 main、stream、report 与 manifest-last。
 
 ### 2.3.1 阶段开关矩阵
 
@@ -161,7 +162,7 @@ labelkit rubric   [--show default:text | default:ui | default:trajectory]   # �
 | 隐私与网络 | 数据只发送至 config.toml 显式声明的 LLM API 端点；无遥测、无自动更新检查。API Key 只经环境变量进入内存，不写日志、不入报告。 |
 | 规模与内存 | 设计目标：单次运行 ≤ 50 万条记录（默认配置下全局 LSH 索引 + 信封对象约占 2–4 GB RSS）。图像字节懒加载：仅在构造该记录的 LLM 请求时读盘并编码，用后即弃，不常驻。超过规模建议按目录分次运行，或设 `dedup.scope="batch"` 降低索引内存。`dedup.semantic=true` 且 scope=global 时另需常驻向量索引，约增加 条数 × 向量维度 × 4 字节（50 万条 × 1024 维 ≈ 2 GB），须计入 RSS 预算。v1.8 注记：序列 Record 以 `members` 元组持成员 Record 的**引用**（frozen 对象共享、零拷贝），episode 化不改变批内存量级；懒加载不变（extract 峰值 2 图/请求、序列 annotate ≤ `sequence_frames` 图/请求）。 |
 | v1.18 规划与内容规模 | 每个 CP-SAT block 最多 4096 primary events；record_units 与 stream_rows 各 ≤ 500000。最终 main+stream canonical UTF-8 的 `retained_content_bytes ≤ 536870912`。M11 以最终 item 装配 `SequenceRows`，replay 在此后只从 source final primary rows 派生；两者必须在 source positive commit 前用同一 canonical helper 精确计费。500k 最小载荷与近 512 MiB 混合载荷的 peak RSS 都 ≤ 4 GiB。 |
-| 吞吐 | 瓶颈为 LLM API。并发由每 profile 的 `max_concurrency` 信号量控制；同一阶段内记录级并发，阶段之间在批内串行（屏障），保证 pairwise 打分所需的批完整性与实现简单性。 |
+| 吞吐 | 瓶颈通常为 LLM API。M17 按 profile 的 `max_concurrency` 做全域接纳，ResourceManager 同时限制真实逻辑调用与 HTTP origin attempt；普通阶段屏障与输入序 reducer 保持业务确定性，sequence 只串行依赖已提交前缀的短 commit。 |
 | 幂等与可复现 | process/flat 保持既有 seed 条件化语义。sequence 的 program、plan、slot、事件位置、逻辑/投影时间、session、noise 与 replay source 由同版本+同配置+seed 确定；CP-SAT 固定单 worker/seed/deterministic-time 且只解码 OPTIMAL。每个 attempt 以 slot identity、attempt index、purpose 派生独立随机源；一个 slot 多一次重试不得改变其他 slot。LLM 服务端内容非确定性不在逐字节保证内。 |
 | 容错 | 记录级隔离（1.3 节）；LLM 调用按 profile 配置重试（指数退避+全抖动）；v1.6 密钥池：profile 可声明多把 API Key（`api_key_envs`，5.1），429 按密钥冷却并即时轮换、认证失败按密钥禁用、全池冷却有界驻留（`run.max_park_s`，默认 3600s，超限按重试耗尽计），单密钥配置数据产出与熔断语义不变、429 等待路径有修订（3.9.3 重试行）；连续 `fatal_error_threshold`（默认 20）次不可恢复 provider 错误触发熔断（认证类 401/403 立即熔断、不计连续数，v1.5；v1.6 池化下 = 最后一把存活密钥被认证禁用时），以退出码 4 终止，写出已完成部分的报告并原子交付已完成批的主输出与 rejects（v1.6 熔断交付，3.10.3）。 |
 | 依赖面 | Python ≥ 3.11（tomllib 标准库）。第三方仅：`httpx`（异步 HTTP）、`jsonschema`（校验）、`datasketch`（MinHash-LSH）、`Pillow`+`imagehash`（pHash）、`json-repair`（确定性 JSON 修复）、`numpy`（BT 拟合）、`rich`（v1.10，7.7 console rich 档终端呈现；纯 Python，传递依赖 markdown-it-py + pygments 亦纯 Python；**懒 import**——仅 console 判定为 rich 档时于 CLI 层导入（M1 只以 find_spec 探测），导入失败自动降级 plain，operators/common 零触点；工业背书 pip vendored（`docs/dev/PROPOSAL-tui-console.md` [C-9]），对齐决策 1.6 U4）。无框架级依赖（rich 定性为终端呈现库；应用框架级的 textual 经调研否决——`docs/dev/SPEC-tui-console.md` §2 U4/U16）。 |

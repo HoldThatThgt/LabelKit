@@ -21,15 +21,16 @@ from labelkit.common.config.model import (
     ResolvedPaths,
 )
 from labelkit.common.contracts import generation as contracts_generation
+from labelkit.common.contracts.execution import TaskExecutor
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import PipelineItem, Record, Usage
 from labelkit.common.extensions.hooks import ResolvedHook
 from labelkit.common.observability.obslog import MetricsSink
-from labelkit.common.runtime.llm_client import LLMClient, PromptBundle
-from labelkit.common.runtime.schema_engine import CallScope, SchemaEngine
+from labelkit.common.inference.llm_client import LLMClient, PromptBundle
+from labelkit.common.inference.schema_engine import CallScope, SchemaEngine
 from labelkit.operators import annotate, dedup, emitter, quality, verify
 from labelkit.operators.generation import evaluate, planner, program, project, render, scenario, state
-from labelkit.orchestration import generation_delivery
+from labelkit.orchestration import sequence_workflow
 
 
 CONFIG_FIELDS = {
@@ -250,21 +251,37 @@ CONTRACT_FIELDS = {
         "main_record_id", "generation_digest", "member_sources_digest",
         "primary_base_digests",
     ),
+    "PrimaryCandidateReconcileRequest": (
+        "program", "plan", "run_id", "slot", "projection_witnesses", "sequences",
+        "replay_layouts", "replays", "retained_content_bytes",
+    ),
+    "NoiseCandidateReconcileRequest": (
+        "program", "run_id", "noise_slot", "payload_digest", "row",
+        "retained_content_bytes",
+    ),
     "ReconcileRequest": (
         "program", "plan", "run_id", "projection_witnesses", "sequences",
         "noise_payload_digests", "noise_rows", "replays", "retained_content_bytes",
     ),
-    "GenerationServices": ("config", "schema_engine", "llm", "metrics"),
+    "GenerationServices": ("config", "schema_engine", "llm", "metrics", "tasks"),
     "DeliveryRequest": ("program", "plan", "paths", "run_attempt_id", "run_id"),
     "DeliveryServices": ("generation", "dedup", "quality", "annotate", "verify", "emitter"),
     "AttemptTransaction": ("items", "class_views", "projected_sequences"),
     "DownstreamAttemptRequest": ("transaction", "run_context"),
     "DownstreamAttemptResult": ("accepted", "rejected_stage", "dataset_counters"),
     "DedupGroupRequest": ("records", "exempt_pairs", "embedding_profile"),
-    "DedupProbeToken": (
-        "capability_id", "index_generation", "record_digests", "exact_features",
-        "minhash_features", "embedding_features",
+    "DedupReservation": (
+        "capability_id", "epoch", "record_digests", "exact_cluster_keys",
     ),
+    "PreparedCandidate": (
+        "slot", "attempt_index", "projection_witnesses", "sequences", "replays",
+        "reservation", "dataset_counters", "retained_content_bytes", "digest",
+    ),
+    "PreparedNoiseCandidate": (
+        "noise_slot", "attempt_index", "payload_digest", "row",
+        "similarity_signature", "dataset_counters", "retained_content_bytes", "digest",
+    ),
+    "CrossViewDelta": ("phase", "ordinal", "event_ids", "timestamps_us", "source_keys"),
     "GenerationProduct": ("main_rows", "stream_rows", "report"),
 }
 
@@ -280,6 +297,8 @@ _CARRIER_DOC_FIELDS = {
         "ProjectionRequest",
         "ReplayProjectionRequest",
         "SequenceAssemblyRequest",
+        "PrimaryCandidateReconcileRequest",
+        "NoiseCandidateReconcileRequest",
         "ReconcileRequest",
     )
 }
@@ -503,13 +522,25 @@ CONTRACT_TYPES = {
     ),
     "ReplayRows": (tuple[_JSON_OBJECT, ...], int),
     "ProjectionWitness": (str, str, str, tuple[str, ...]),
+    "PrimaryCandidateReconcileRequest": (
+        contracts_generation.GenerationProgram, contracts_generation.ScenarioPlan, str,
+        contracts_generation.DeliverySlot,
+        tuple[contracts_generation.ProjectionWitness, ...],
+        tuple[contracts_generation.SequenceRows, ...],
+        tuple[contracts_generation.ReplayLayout, ...],
+        tuple[contracts_generation.ReplayRows, ...], int,
+    ),
+    "NoiseCandidateReconcileRequest": (
+        contracts_generation.GenerationProgram, str, contracts_generation.NoiseSlot,
+        str, _JSON_OBJECT, int,
+    ),
     "ReconcileRequest": (
         contracts_generation.GenerationProgram, contracts_generation.ScenarioPlan, str,
         tuple[contracts_generation.ProjectionWitness, ...],
         tuple[contracts_generation.SequenceRows, ...], tuple[str, ...],
         tuple[_JSON_OBJECT, ...], tuple[contracts_generation.ReplayRows, ...], int,
     ),
-    "GenerationServices": (ResolvedConfig, SchemaEngine, LLMClient, MetricsSink),
+    "GenerationServices": (ResolvedConfig, SchemaEngine, LLMClient, MetricsSink, TaskExecutor),
     "DeliveryRequest": (
         contracts_generation.GenerationProgram, contracts_generation.ScenarioPlan,
         ResolvedPaths, str, str,
@@ -530,9 +561,20 @@ CONTRACT_TYPES = {
         bool, Literal["quality", "annotate", "verify"] | None, Mapping[str, int]),
     "DedupGroupRequest": (
         tuple[Record, ...], frozenset[tuple[str, str]], str | None),
-    "DedupProbeToken": (
-        str, int, tuple[str, ...], tuple[str, ...], tuple[object, ...],
-        tuple[tuple[float, ...], ...],
+    "DedupReservation": (str, int, tuple[str, ...], tuple[str, ...]),
+    "PreparedCandidate": (
+        contracts_generation.DeliverySlot, int,
+        tuple[contracts_generation.ProjectionWitness, ...],
+        tuple[contracts_generation.SequenceRows, ...],
+        tuple[contracts_generation.ReplayRows, ...],
+        contracts_generation.DedupReservation, Mapping[str, int], int, str,
+    ),
+    "PreparedNoiseCandidate": (
+        contracts_generation.NoiseSlot, int, str, _JSON_OBJECT, tuple[int, ...],
+        Mapping[str, int], int, str,
+    ),
+    "CrossViewDelta": (
+        Literal["primary", "noise"], int, tuple[str, ...], tuple[int, ...], tuple[str, ...],
     ),
     "GenerationProduct": (
         tuple[_JSON_OBJECT, ...], tuple[_JSON_OBJECT, ...], _JSON_OBJECT),
@@ -670,10 +712,15 @@ INTERFACE_MANIFEST = (
     (project.reconcile_views, False, ("request",), {
         "request": contracts_generation.ReconcileRequest, "return": type(None),
     }),
-    (project.reconcile_prospective_views, False, ("request",), {
-        "request": contracts_generation.ReconcileRequest, "return": type(None),
+    (project.reconcile_primary_candidate, False, ("request",), {
+        "request": contracts_generation.PrimaryCandidateReconcileRequest,
+        "return": type(None),
     }),
-    (generation_delivery.deliver_generation, True, ("request", "services"), {
+    (project.reconcile_noise_candidate, False, ("request",), {
+        "request": contracts_generation.NoiseCandidateReconcileRequest,
+        "return": type(None),
+    }),
+    (sequence_workflow.deliver_generation, True, ("request", "services"), {
         "request": contracts_generation.DeliveryRequest,
         "services": contracts_generation.DeliveryServices,
         "return": contracts_generation.GenerationProduct,
@@ -693,13 +740,22 @@ METHOD_MANIFEST = (
          "request": contracts_generation.DownstreamAttemptRequest,
          "return": contracts_generation.DownstreamAttemptResult,
      }),
-    (contracts_generation.DedupIndex.group_probe, True,
+    (contracts_generation.DedupIndex.group_reserve, True,
      ("self", "request", "context"), {
          "request": contracts_generation.DedupGroupRequest, "context": RunContext,
-         "return": contracts_generation.DedupProbeToken,
+         "return": contracts_generation.DedupReservation,
      }),
-    (contracts_generation.DedupIndex.group_commit, False, ("self", "token"), {
-        "token": contracts_generation.DedupProbeToken, "return": type(None),
+    (contracts_generation.DedupIndex.group_revalidate, False,
+     ("self", "reservation"), {
+         "reservation": contracts_generation.DedupReservation, "return": type(None),
+     }),
+    (contracts_generation.DedupIndex.group_commit, False,
+     ("self", "reservation"), {
+         "reservation": contracts_generation.DedupReservation, "return": type(None),
+     }),
+    (contracts_generation.DedupIndex.group_discard, False,
+     ("self", "reservation"), {
+         "reservation": contracts_generation.DedupReservation, "return": type(None),
     }),
     (contracts_generation.SequenceDeliveryEmitter.assemble_sequence, False,
      ("self", "request"), {
@@ -731,12 +787,29 @@ METHOD_MANIFEST = (
         "request": contracts_generation.DownstreamAttemptRequest,
         "return": contracts_generation.DownstreamAttemptResult,
     }),
-    (dedup.DedupIndex.group_probe, True, ("self", "request", "context"), {
+    (dedup.DedupIndex.group_reserve, True, ("self", "request", "context"), {
         "request": contracts_generation.DedupGroupRequest, "context": RunContext,
-        "return": contracts_generation.DedupProbeToken,
+        "return": contracts_generation.DedupReservation,
     }),
-    (dedup.DedupIndex.group_commit, False, ("self", "token"), {
-        "token": contracts_generation.DedupProbeToken, "return": type(None),
+    (dedup.DedupIndex.group_revalidate, False, ("self", "reservation"), {
+        "reservation": contracts_generation.DedupReservation, "return": type(None),
+    }),
+    (dedup.DedupIndex.group_commit, False, ("self", "reservation"), {
+        "reservation": contracts_generation.DedupReservation, "return": type(None),
+    }),
+    (dedup.DedupIndex.group_discard, False, ("self", "reservation"), {
+        "reservation": contracts_generation.DedupReservation, "return": type(None),
+    }),
+    (project.CrossViewFrontier.check_primary, False, ("self", "candidate"), {
+        "candidate": contracts_generation.PreparedCandidate,
+        "return": contracts_generation.CrossViewDelta,
+    }),
+    (project.CrossViewFrontier.check_noise, False, ("self", "candidate"), {
+        "candidate": contracts_generation.PreparedNoiseCandidate,
+        "return": contracts_generation.CrossViewDelta,
+    }),
+    (project.CrossViewFrontier.commit, False, ("self", "delta"), {
+        "delta": contracts_generation.CrossViewDelta, "return": type(None),
     }),
     (emitter.SequenceDeliveryEmitter.assemble_sequence, False,
      ("self", "request"), {
@@ -812,6 +885,48 @@ def test_internal_generation_carriers_have_no_implicit_defaults():
         for item in dataclasses.fields(getattr(config_generation, name)):
             assert item.default is dataclasses.MISSING
             assert item.default_factory is dataclasses.MISSING
+
+
+def test_prepared_candidate_carriers_recursively_freeze_rows_and_counters():
+    """候选进入乱序缓冲后不再共享调用方可变 JSON 或 dataset delta。"""
+    slot = contracts_generation.DeliverySlot(
+        "source/000000", "source", 0, "sequence", "pattern", ("positive",), 0,
+    )
+    witness = contracts_generation.ProjectionWitness(
+        "a" * 32, "b" * 64, "c" * 64, ("d" * 64,),
+    )
+    sequence = contracts_generation.SequenceRows(
+        {"_meta": {"id": "a" * 32}},
+        ({"payload": {"text": "primary"}, "_meta": {}},),
+        1,
+    )
+    reservation = contracts_generation.DedupReservation(
+        "capability", 3, ("record",), ("cluster",),
+    )
+    counters = {"generated": 1}
+    primary = contracts_generation.PreparedCandidate(
+        slot, 1, (witness,), (sequence,), (), reservation, counters, 1, "digest",
+    )
+    noise_row = {"payload": {"text": "noise"}, "_meta": {"event": {"noise": True}}}
+    noise_counters = {"generated": 1}
+    noise = contracts_generation.PreparedNoiseCandidate(
+        contracts_generation.NoiseSlot("e" * 32, 0, "noise", "weather", 1, "noise_0"),
+        1,
+        "f" * 64,
+        noise_row,
+        (1, 2),
+        noise_counters,
+        1,
+        "noise-digest",
+    )
+
+    counters["generated"] = 9
+    noise_counters["generated"] = 9
+    noise_row["payload"]["text"] = "changed"
+
+    assert primary.dataset_counters == {"generated": 1}
+    assert noise.dataset_counters == {"generated": 1}
+    assert noise.row["payload"]["text"] == "noise"
 
 
 def test_generation_limit_defaults_are_exact():
@@ -917,12 +1032,14 @@ def test_contracts_frame_only_and_segment_exception_semantics_are_frozen():
     )
     required_member_failure = (
         "In ordinary process/flat member isolation",
-        "recoverable content, Schema and provider errors",
+        "content, Schema and ordinary",
+        "provider failures including ProviderFatalError",
         "return None; the envelope may continue",
         "`SchemaViolation`, `ContextOverflowError`, `OutputTruncatedError`",
         "`ProviderRetryableError`",
         "are re-raised to `run_attempt` rather than converted to None",
         "retries the whole set",
+        "`ProviderFatalError` is re-raised as a terminal sequence error",
     )
     assert all(fragment in annotate_member for fragment in required_member_failure)
 
@@ -937,10 +1054,10 @@ def test_contracts_frame_only_and_segment_exception_semantics_are_frozen():
         "writes an inherited frame classification for every generated member",
         "`GenerationProgram.frame_classes[label]`",
         "Only a genuinely absent member classification in ordinary process/flat input",
-        "`asyncio.gather(return_exceptions=True)`",
-        "waits for every started member to settle",
-        "same member declaration order and raises the first exception",
-        "controller then performs whole-set retry",
+        "submits pure pending-member TaskSpec leaves in declaration order",
+        "recoverable member failures are typed frozen outcomes",
+        "aligned results reduce in member declaration order",
+        "whole-set retry",
     )
     assert all(fragment in frame_pass for fragment in required_frame_pass)
     assert "after a sequence envelope's OWN annotation succeeds — and only then" not in frame_pass
@@ -968,7 +1085,7 @@ def test_contracts_frame_only_and_segment_exception_semantics_are_frozen():
 
 def test_sequence_report_rejection_fields_match_all_authoritative_sources():
     root = Path(__file__).parents[3]
-    assert tuple(generation_delivery._REJECTION_KEYS) == _REPORT_REJECTION_FIELDS
+    assert tuple(sequence_workflow._REJECTION_KEYS) == _REPORT_REJECTION_FIELDS
     sources = (
         (root / "docs/dev/SPEC-sequence-generation-redesign.md", "### 14.4 report"),
         (root / "spec/60-ch6-io-formats.md", "### 6.4.1 v1.18 sequence success report"),

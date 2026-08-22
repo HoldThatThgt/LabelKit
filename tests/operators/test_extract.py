@@ -37,7 +37,7 @@ from labelkit.common.config.model import (
     VerifyConfig,
 )
 from labelkit.common.errors import ProviderRetryableError, SchemaViolation
-from labelkit.common.runtime.schema_engine import action_schema
+from labelkit.common.inference.schema_engine import action_schema
 from labelkit.common.contracts.types import (
     Classification,
     ImageRef,
@@ -156,9 +156,7 @@ INPUT = {"action_type": "input_text", "target": "搜索框", "value": "麻辣烫
 # ── in-process complete_validated stubs (no LLM, test_classify 惯例) ─────────
 
 class QueueEngine:
-    """Pops queued outcomes in call order — the ONE flat gather creates its
-    coroutines in (episode batch position, pair ordinal) order and the stubs
-    never yield, so pop order is deterministic."""
+    """按 TaskSpec 输入序弹出冻结结果。"""
 
     def __init__(self, outcomes):
         self.outcomes = list(outcomes)
@@ -189,6 +187,29 @@ class PairEngine:
         return out, Usage(), 1, "glm-5.2"
 
 
+class ReversePairEngine(PairEngine):
+    """让第二个相邻对先完成，以验证归并屏障不依赖完成顺序。"""
+
+    def __init__(self, by_pair, first_pair):
+        super().__init__(by_pair)
+        self.first_pair = first_pair
+        self.second_started = asyncio.Event()
+        self.completion_order: list[tuple[str, ...]] = []
+
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        record_ids = scope.record_ids
+        self.calls.append((profile, prompt, schema, record_ids))
+        if record_ids == self.first_pair:
+            await self.second_started.wait()
+        else:
+            self.second_started.set()
+        self.completion_order.append(record_ids)
+        out = self.by_pair[record_ids]
+        if isinstance(out, Exception):
+            raise out
+        return out, Usage(), 1, "glm-5.2"
+
+
 class ExplodingEngine:
     async def complete_validated(self, *a, **k):
         raise AssertionError("complete_validated must not be called")
@@ -206,9 +227,26 @@ class RecordingMetrics:
         self.counters[key] = self.counters.get(key, 0) + n
 
 
+class TaskRunner:
+    """Executes test leaves concurrently and returns input-order results."""
+
+    async def run_group(self, request):
+        results = [None] * len(request.tasks)
+
+        async def run_one(index, spec):
+            results[index] = await spec.operation()
+
+        async with asyncio.TaskGroup() as group:
+            for index, spec in enumerate(request.tasks):
+                group.create_task(run_one(index, spec))
+        return tuple(results)
+
+
 def make_ctx(cfg, engine):
     return SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
-                           metrics=RecordingMetrics(), rng=None, batch_no=1)
+                           metrics=RecordingMetrics(), tasks=TaskRunner(),
+                           task_namespace="run:batch:1:stage:extract",
+                           rng=None, batch_no=1)
 
 
 def run_stage(cfg, batch, engine):
@@ -388,7 +426,7 @@ def test_stage_transition_count_is_members_minus_one_indices_zero_based():
                                     "extract.by_type.click": 2}
 
 
-def test_stage_flat_gather_order_and_step_event_payload_shape():
+def test_stage_task_order_and_step_event_payload_shape():
     cfg = make_cfg()
     f0, f1, f2 = (frame("f0" * 8, "首页"), frame("f1" * 8, "搜索结果页"),
                   frame("f2" * 8, "餐厅页"))
@@ -397,7 +435,7 @@ def test_stage_flat_gather_order_and_step_event_payload_shape():
     ep2 = PipelineItem(record=episode([g0, g1], eid="e2" * 8))
     engine = QueueEngine([INPUT, CLICK, CLICK])
     out, ctx = run_stage(cfg, [ep1, ep2], engine)
-    # ONE flat gather: calls in (episode batch position, pair ordinal) order
+    # 一个冻结任务组：调用与归并均按（episode 批内位置, pair ordinal）排序。
     assert [c[3] for c in engine.calls] == [
         (f0.id, f1.id), (f1.id, f2.id), (g0.id, g1.id)]
     steps = [e for e in ctx.metrics.events if e[0] == "extract.step"]
@@ -412,6 +450,23 @@ def test_stage_flat_gather_order_and_step_event_payload_shape():
                            "action_type": "click",
                            "description": "点击「去结算」进入下单确认页",
                            "target": "去结算", "value": None}
+
+
+def test_stage_reverse_completion_keeps_transition_and_event_order():
+    cfg = make_cfg()
+    f0, f1, f2 = (frame("f0" * 8, "首页"), frame("f1" * 8, "搜索结果页"),
+                  frame("f2" * 8, "餐厅页"))
+    item = PipelineItem(record=episode([f0, f1, f2]))
+    first_pair = (f0.id, f1.id)
+    second_pair = (f1.id, f2.id)
+    engine = ReversePairEngine({first_pair: INPUT, second_pair: CLICK}, first_pair)
+
+    _out, ctx = run_stage(cfg, [item], engine)
+
+    assert engine.completion_order == [second_pair, first_pair]
+    assert [transition.action for transition in item.transitions] == [INPUT, CLICK]
+    steps = [event for event in ctx.metrics.events if event[0] == "extract.step"]
+    assert [event[2] for event in steps] == [first_pair, second_pair]
 
 
 # ── stage: on_error two paths (S16) ──────────────────────────────────────────
@@ -453,8 +508,11 @@ def test_stage_on_error_fail_fails_episode_and_discards_other_steps():
                   frame("f2" * 8, "餐厅页"))
     item = PipelineItem(record=episode([f0, f1, f2]))
     violation = SchemaViolation(["/action_type: 枚举违规"], "{}")
-    engine = PairEngine({(f0.id, f1.id): CLICK, (f1.id, f2.id): violation})
+    first_pair = (f0.id, f1.id)
+    second_pair = (f1.id, f2.id)
+    engine = ReversePairEngine({first_pair: CLICK, second_pair: violation}, first_pair)
     out, ctx = run_stage(cfg, [item], engine)
+    assert engine.completion_order == [second_pair, first_pair]
     assert item.status == "failed"
     assert item.transitions is None                    # pair-0 result discarded
     (err,) = item.errors
@@ -464,6 +522,25 @@ def test_stage_on_error_fail_fails_episode_and_discards_other_steps():
     (ev, stage, record_ids, payload), = ctx.metrics.events
     assert (ev, record_ids) == ("error", (item.record.id,))
     assert payload["kind"] == "extraction_invalid" and payload["retryable"] is False
+
+
+def test_episode_failure_discards_sibling_fallback_fact():
+    cfg = make_cfg()
+    f0, f1, f2 = (frame("f0" * 8, "首页"), frame("f1" * 8, "搜索结果页"),
+                  frame("f2" * 8, "餐厅页"))
+    item = PipelineItem(record=episode([f0, f1, f2]))
+    violation = SchemaViolation(["/action_type: 枚举违规"], "{}")
+    provider = ProviderRetryableError("timeout", profile="default", retries=5)
+    engine = PairEngine({(f0.id, f1.id): violation, (f1.id, f2.id): provider})
+
+    _out, ctx = run_stage(cfg, [item], engine)
+
+    assert item.status == "failed"
+    assert item.transitions is None
+    assert ctx.metrics.counters == {"extract.failures": 1}
+    assert [event[0] for event in ctx.metrics.events] == ["error"]
+    assert ctx.metrics.events[0][2] == (item.record.id,)
+    assert ctx.metrics.events[0][3]["kind"] == "provider_retryable_exhausted"
 
 
 def test_provider_error_fails_episode_without_breaking_siblings():
@@ -657,7 +734,9 @@ def test_reactive_400_fallback_feeds_breaker_once():
     exc = ContextOverflowError("sniff", phase="reactive")   # origin defaults http_400
     ctx = SimpleNamespace(cfg=cfg, llm=None,
                           schema_engine=PairEngine({(f0.id, f1.id): exc}),
-                          metrics=FeedMetrics(), rng=None, batch_no=1)
+                          metrics=FeedMetrics(), tasks=TaskRunner(),
+                          task_namespace="run:batch:1:stage:extract",
+                          rng=None, batch_no=1)
     asyncio.run(ExtractStage(cfg).run([item], ctx))
     assert item.status == "active"                          # fallback kept it alive
     assert ctx.metrics.fed == [True]
@@ -667,6 +746,8 @@ def test_reactive_400_fallback_feeds_breaker_once():
     item2 = PipelineItem(record=episode([f0, f1]), status="active")
     ctx2 = SimpleNamespace(cfg=cfg, llm=None,
                            schema_engine=PairEngine({(f0.id, f1.id): exc200}),
-                           metrics=FeedMetrics(), rng=None, batch_no=1)
+                           metrics=FeedMetrics(), tasks=TaskRunner(),
+                           task_namespace="run:batch:1:stage:extract",
+                           rng=None, batch_no=1)
     asyncio.run(ExtractStage(cfg).run([item2], ctx2))
     assert ctx2.metrics.fed == []

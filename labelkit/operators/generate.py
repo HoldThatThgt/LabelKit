@@ -1,14 +1,15 @@
 """M6 平面生成 Stage（spec 3.6，CONTRACTS §7.5）。"""
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
+from functools import partial
 from typing import TYPE_CHECKING, Sequence
 
+from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
 from labelkit.common.contracts.types import Classification, PipelineItem, Record
 from labelkit.common.errors import CircuitBreakerTripped, ContextOverflowError, InternalError, LabelKitError
-from labelkit.common.runtime.schema_engine import CallScope
+from labelkit.common.inference.schema_engine import CallScope
 from labelkit.operators.generation.flat import (
     CallPlan,
     ClassSegment,
@@ -114,10 +115,7 @@ class GenerateStage:
         plans = build_segment_plans(generate, segments, ctx.rng, exec_calls)
         schema = _samples_schema(generate.num_per_call)
         fitted = self._fit_plans(plans, ctx)
-        results = await asyncio.gather(
-            *(self._one_generate_call(plan, unfittable, schema, ctx)
-              for plan, unfittable in fitted)
-        )
+        results = await self._dispatch_plans(fitted, schema, ctx)
         sent_plans = [plan for plan, _ in fitted]
         seed_texts = [text for segment in segments for _, text in segment.seeds]
         records = postprocess_samples(sent_plans, results, seed_texts, self._cfg, ctx.metrics)
@@ -142,24 +140,60 @@ class GenerateStage:
             fitted.append((candidate, unfittable))
         return fitted
 
+    async def _dispatch_plans(
+        self,
+        fitted: Sequence[tuple[CallPlan, bool]],
+        schema: dict,
+        ctx: "RunContext",
+    ) -> list[list[str] | None]:
+        """提交可执行计划并按原计划位置对齐结果。
+
+        @param fitted 装填计划与不可装填标志。
+        @param schema 本轮共用的 samples Schema。
+        @param ctx 运行上下文。
+        @return 与 fitted 输入序对位的样本结果。
+        """
+        tasks: list[TaskSpec[list[str] | None]] = []
+        for plan, unfittable in fitted:
+            if unfittable:
+                self._log_unfittable(plan, ctx)
+                continue
+            tasks.append(self._task_spec(plan, schema, ctx))
+        dispatched: tuple[list[str] | None, ...] = ()
+        if tasks:
+            dispatched = await ctx.tasks.run_group(TaskGroupRequest(tasks=tuple(tasks)))
+        outcomes = iter(dispatched)
+        return [None if unfittable else next(outcomes) for _, unfittable in fitted]
+
+    def _task_spec(self, plan: CallPlan, schema: dict, ctx: "RunContext") -> TaskSpec[list[str] | None]:
+        """把一个冻结调用计划映射为纯叶任务。
+
+        @param plan 装填后的冻结调用计划。
+        @param schema 本轮共用的 samples Schema。
+        @param ctx 运行上下文。
+        @return 可提交给唯一 TaskExecutor 的任务计划。
+        """
+        return TaskSpec(
+            task_id=f"{ctx.task_namespace}:{self.name}:{plan.index}",
+            declaration_key=(ctx.batch_no, 6, plan.index),
+            stage=self.name,
+            resource_key=("llm", plan.llm),
+            operation=partial(self._one_generate_call, plan, schema, ctx),
+        )
+
     async def _one_generate_call(
         self,
         plan: CallPlan,
-        unfittable: bool,
         schema: dict,
         ctx: "RunContext",
     ) -> list[str] | None:
         """派发一次平面生成调用。
 
         @param plan 装填后的调用计划。
-        @param unfittable 是否在一条种子处仍超预算。
         @param schema 本轮共用的 samples Schema。
         @param ctx 运行上下文。
         @return 样本文本或 None。
         """
-        if unfittable:
-            self._log_unfittable(plan, ctx)
-            return None
         generate = effective_generate(self._cfg, plan.class_name)
         prompt = build_generate_prompt(
             generate.instruction,

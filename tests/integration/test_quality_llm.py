@@ -169,6 +169,21 @@ class Recorder:
         return [p for ev, p in self.events if ev == ev_name]
 
 
+class TaskRunner:
+    """Run real endpoint leaves concurrently and return declaration-order results."""
+
+    async def run_group(self, request):
+        results = [None] * len(request.tasks)
+
+        async def run_one(index, spec):
+            results[index] = await spec.operation()
+
+        async with asyncio.TaskGroup() as group:
+            for index, spec in enumerate(request.tasks):
+                group.create_task(run_one(index, spec))
+        return tuple(results)
+
+
 def make_cfg(quality: QualityConfig) -> ResolvedConfig:
     profile = LLMProfile(name="default", provider="anthropic", base_url=ZAI_BASE_URL,
                          model=ZAI_MODEL, api_key_env=ZAI_KEY_ENV,
@@ -216,7 +231,9 @@ def make_item(rec_id: str, text: str) -> PipelineItem:
 def make_ctx(cfg: ResolvedConfig, metrics: Recorder) -> RunContext:
     engine = RealEndpointEngine(os.environ[ZAI_KEY_ENV])
     return RunContext(cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
-                      rng=random.Random(f"{cfg.run.seed}:1:quality"), batch_no=1)
+                      rng=random.Random(f"{cfg.run.seed}:1:quality"), batch_no=1,
+                      tasks=TaskRunner(),
+                      task_namespace="integration:batch:1:stage:quality")
 
 
 POINTWISE_TEXTS = [
@@ -307,7 +324,9 @@ async def test_pairwise_provider_fatal_fails_records_real_endpoint():
              make_item("f2", "帮我写一条请假条，明天上午要去医院")]
     engine = RealEndpointEngine("labelkit-invalid-key-provider-fatal-test")
     ctx = RunContext(cfg=cfg, llm=None, schema_engine=engine, metrics=rec,
-                     rng=random.Random(f"{cfg.run.seed}:1:quality"), batch_no=1)
+                     rng=random.Random(f"{cfg.run.seed}:1:quality"), batch_no=1,
+                     tasks=TaskRunner(),
+                     task_namespace="integration:batch:1:stage:quality")
     out = await QualityStage(cfg).run(batch, ctx)
     assert out is batch
     for item in batch:

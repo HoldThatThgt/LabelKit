@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, field, fields, is_dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 from pathlib import Path
 from types import MappingProxyType
 from typing import Literal, Protocol, TypeAlias
@@ -32,9 +32,10 @@ from labelkit.common.config.model import (
 )
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import PipelineItem, Record, Usage
+from labelkit.common.contracts.execution import TaskExecutor
 from labelkit.common.extensions.hooks import ResolvedHook
 from labelkit.common.observability.obslog import MetricsSink
-from labelkit.common.runtime.llm_client import LLMClient, PromptBundle
+from labelkit.common.inference.llm_client import LLMClient, PromptBundle
 
 
 JsonObject: TypeAlias = Mapping[str, object]
@@ -657,6 +658,33 @@ class ProjectionWitness(_ImmutableCarrier):
 
 
 @dataclass(frozen=True)
+class PrimaryCandidateReconcileRequest(_ImmutableCarrier):
+    """当前 primary 候选的封闭本地 CrossView 请求。"""
+
+    program: GenerationProgram                    # 独立身份派生程序
+    plan: ScenarioPlan                            # 已验证且摘要自洽的唯一计划
+    run_id: str                                   # 当前运行身份
+    slot: DeliverySlot                            # 当前声明序交付槽
+    projection_witnesses: tuple[ProjectionWitness, ...]  # 严格 variant 序摘要
+    sequences: tuple[SequenceRows, ...]           # 严格 variant 序最终行
+    replay_layouts: tuple[ReplayLayout, ...]      # 当前 source 的完整 replay 布局
+    replays: tuple[ReplayRows, ...]                # 与布局一一对应的 replay 行
+    retained_content_bytes: int                   # 当前候选全部行的费用
+
+
+@dataclass(frozen=True)
+class NoiseCandidateReconcileRequest(_ImmutableCarrier):
+    """当前 noise 候选的封闭本地 CrossView 请求。"""
+
+    program: GenerationProgram                    # 独立身份派生程序
+    run_id: str                                   # 当前运行身份
+    noise_slot: NoiseSlot                         # 当前声明序 noise 槽
+    payload_digest: str                           # post-gate payload 摘要
+    row: JsonObject                               # 最终 noise stream 行
+    retained_content_bytes: int                   # 当前 noise 行费用
+
+
+@dataclass(frozen=True)
 class ReconcileRequest(_ImmutableCarrier):
     """CrossViewReconciler 的最终全量行请求。"""
 
@@ -668,7 +696,7 @@ class ReconcileRequest(_ImmutableCarrier):
     noise_payload_digests: tuple[str, ...]         # post-gate noise payload 摘要
     noise_rows: tuple[JsonObject, ...]            # NoiseSlot 顺序行
     replays: tuple[ReplayRows, ...]                # ReplayLayout 顺序分组行
-    retained_content_bytes: int                   # prospective 或最终总费用
+    retained_content_bytes: int                   # 最终全部行总费用
 
 
 @dataclass(frozen=True)
@@ -679,6 +707,7 @@ class GenerationServices(_ImmutableCarrier):
     schema_engine: SchemaEngine                   # 唯一 M8 实例
     llm: LLMClient                                # 唯一 M9 实例
     metrics: MetricsSink                          # 唯一 M12 实例
+    tasks: TaskExecutor                           # Application 拥有的唯一任务执行器
 
 
 @dataclass(frozen=True)
@@ -710,23 +739,39 @@ class DownstreamAttemptCollaborator(Protocol):
 class DedupIndex(Protocol):
     """sequence-group 原子准入所需的全局 dedup 协议。"""
 
-    async def group_probe(
+    async def group_reserve(
         self,
         request: "DedupGroupRequest",
         context: RunContext,
-    ) -> "DedupProbeToken":
-        """无突变地计算整组特征并返回一次性 token。
+    ) -> "DedupReservation":
+        """无正式索引突变地计算特征并创建 pending reservation。
 
         @param request 整组记录、豁免对与 embedding profile
         @param context 与 GenerationServices 共享身份的运行上下文
-        @return 当前 index generation 的一次性 token
+        @return 当前 coordinator 唯一拥有的 reservation capability
         """
         ...
 
-    def group_commit(self, token: "DedupProbeToken") -> None:
-        """无 await 地原子消费并提交一个当前 token。
+    def group_revalidate(self, reservation: "DedupReservation") -> None:
+        """无 await 地对最新正式索引重验并进入 Validated 状态。
 
-        @param token 未消费的当前 generation token
+        @param reservation 当前 epoch 的 Reserved capability
+        @return None
+        """
+        ...
+
+    def group_commit(self, reservation: "DedupReservation") -> None:
+        """无 await 地消费并提交一个当前 generation 的 Validated reservation。
+
+        @param reservation 当前 generation 已重验的 capability
+        @return None
+        """
+        ...
+
+    def group_discard(self, reservation: "DedupReservation") -> None:
+        """严格消费一次未提交 reservation，且不修改正式索引。
+
+        @param reservation 当前 coordinator 或候选缓冲拥有的 capability
         @return None
         """
         ...
@@ -818,7 +863,7 @@ class DownstreamAttemptResult(_ImmutableCarrier):
 
 @dataclass(frozen=True)
 class DedupGroupRequest(_ImmutableCarrier):
-    """整组原子 dedup probe 请求。"""
+    """整组原子 dedup reservation 请求。"""
 
     records: tuple[Record, ...]                   # 当前 set 的全部 Record
     exempt_pairs: frozenset[tuple[str, str]]      # set 内豁免记录对
@@ -826,15 +871,53 @@ class DedupGroupRequest(_ImmutableCarrier):
 
 
 @dataclass(frozen=True)
-class DedupProbeToken(_ImmutableCarrier):
-    """绑定 index generation 与内容摘要的一次性能力。"""
+class DedupReservation(_ImmutableCarrier):
+    """绑定 registry 与 reset epoch 的一次性 reservation capability。"""
 
     capability_id: str                            # 不可猜测能力标识
-    index_generation: int                         # probe 时 index generation
-    record_digests: tuple[str, ...]               # 记录内容摘要
-    exact_features: tuple[str, ...]               # exact 特征
-    minhash_features: tuple[object, ...]          # MinHash 特征
-    embedding_features: tuple[tuple[float, ...], ...]  # semantic 特征
+    epoch: int                                    # reset 后递增的 registry epoch
+    record_digests: tuple[str, ...]               # 记录内容绑定摘要
+    exact_cluster_keys: tuple[str, ...]           # 小型 exact 簇键
+
+
+@dataclass(frozen=True)
+class PreparedCandidate(_ImmutableCarrier):
+    """candidate-local 成功后深度冻结的 primary 候选。"""
+
+    slot: DeliverySlot                            # 当前声明序交付槽
+    attempt_index: int                            # 当前槽一基 attempt 序号
+    projection_witnesses: tuple[ProjectionWitness, ...]  # 严格 variant 序摘要
+    sequences: tuple[SequenceRows, ...]           # 严格 variant 序最终行
+    replays: tuple[ReplayRows, ...]                # 当前 source 的全部 replay 行
+    reservation: DedupReservation                 # 唯一拥有的 pending dedup reservation
+    dataset_counters: Mapping[str, int]            # 提交时合并的 dataset delta
+    retained_content_bytes: int                   # 当前候选全部行的费用
+    digest: str                                   # 除自身外全部字段的规范摘要
+
+
+@dataclass(frozen=True)
+class PreparedNoiseCandidate(_ImmutableCarrier):
+    """candidate-local 成功后深度冻结的 noise 候选。"""
+
+    noise_slot: NoiseSlot                         # 当前声明序 noise 槽
+    attempt_index: int                            # 当前槽一基 attempt 序号
+    payload_digest: str                           # post-gate payload 摘要
+    row: JsonObject                               # 最终 noise stream 行
+    similarity_signature: tuple[int, ...]         # 提交时消费的相似度签名
+    dataset_counters: Mapping[str, int]            # 提交时合并的 dataset delta
+    retained_content_bytes: int                   # 当前 noise 行费用
+    digest: str                                   # 除自身外全部字段的规范摘要
+
+
+@dataclass(frozen=True)
+class CrossViewDelta(_ImmutableCarrier):
+    """CrossViewFrontier 检查后尚未应用的当前候选增量。"""
+
+    phase: Literal["primary", "noise"]           # 当前 frontier phase
+    ordinal: int                                  # 当前 phase 声明序 ordinal
+    event_ids: tuple[str, ...]                     # 当前候选新增 event ID
+    timestamps_us: tuple[int, ...]                 # 当前候选新增工件时间
+    source_keys: tuple[str, ...]                   # 当前候选新增 source 身份
 
 
 @dataclass(frozen=True)
@@ -848,7 +931,7 @@ class GenerationProduct(_ImmutableCarrier):
 
 # 解析函数位于 config.generation；延迟补全其公开注解的运行期命名空间。
 from labelkit.common.config import generation as _config_generation  # noqa: E402
-from labelkit.common.runtime import schema_engine as _schema_engine  # noqa: E402
+from labelkit.common.inference import schema_engine as _schema_engine  # noqa: E402
 
 _config_generation.GenerationParseContext = GenerationParseContext
 CallScope = _schema_engine.CallScope

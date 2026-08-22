@@ -7,8 +7,9 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import ResolvedConfig
-    from labelkit.common.runtime.llm_client import LLMClient
-    from labelkit.common.runtime.schema_engine import SchemaEngine
+    from labelkit.common.contracts.execution import TaskExecutor
+    from labelkit.common.inference.llm_client import LLMClient
+    from labelkit.common.inference.schema_engine import SchemaEngine
     from labelkit.common.observability.obslog import MetricsSink
     from labelkit.common.contracts.types import PipelineItem
 
@@ -17,16 +18,18 @@ if TYPE_CHECKING:
 class RunContext:
     """交给每次 stage.run() 调用的上下文。
 
-    由 M10 orchestrator 构造，**每（批次, 阶段）调用一个**——因为 rng 是按批次与阶段派生的。
-    字段恰为 spec 3.10.3 的六个：spec 3.12.3 明确禁止扩展本签名；run_id / run_started_at
-    改走 MetricsSink / Emitter / Orchestrator 的构造函数传递（§7.9–§7.11）。
+    由 ProcessWorkflow 构造，**每（批次, 阶段）调用一个**——因为 rng 与 task_namespace
+    都按批次与阶段派生。TaskExecutor 身份在同一 execution domain 的所有上下文中保持一致；
+    run_id / run_started_at 继续经 MetricsSink / Emitter / RunServices 传递。
     """
     cfg: ResolvedConfig           # 本次运行的不可变解析配置（M1 产物）
-    llm: LLMClient                # M9 LLM 客户端；并发/重试/熔断/密钥池均在其内部
+    llm: LLMClient                # M9 LLM 客户端；重试、熔断与密钥池均在其内部
     schema_engine: SchemaEngine   # M8 Schema 引擎；四层保证的唯一入口
-    metrics: MetricsSink          # M12 计数器与 trace 事件汇；阶段一切埋点经此发出
     rng: random.Random            # random.Random(f"{cfg.run.seed}:{batch_no}:{stage_name}")
     batch_no: int                 # 从 1 开始；运行级事件用 0
+    metrics: MetricsSink          # M12 计数器与 trace 事件汇；阶段一切埋点经此发出
+    tasks: TaskExecutor           # Application 所有的唯一 execution-domain TaskExecutor
+    task_namespace: str           # run、批次与阶段派生的不含数据任务身份前缀
 
 
 class Stage(Protocol):

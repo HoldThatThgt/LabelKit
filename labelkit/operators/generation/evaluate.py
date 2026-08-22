@@ -27,12 +27,12 @@ from labelkit.common.contracts.generation import (
 )
 from labelkit.common.errors import SchemaViolation
 from labelkit.common.extensions.hooks import clone_state_input, normalize_state_violations
-from labelkit.common.runtime.generation_prompts import (
+from labelkit.common.inference.generation_prompts import (
     enforce_prompt_value_limit,
     noise_evaluation_prompt,
     semantic_evaluation_prompt,
 )
-from labelkit.common.runtime.schema_engine import (
+from labelkit.common.inference.schema_engine import (
     CallScope,
     noise_semantic_evaluation_schema,
     semantic_evaluation_schema,

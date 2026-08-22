@@ -32,6 +32,7 @@ import dataclasses
 import logging
 from typing import TYPE_CHECKING, Mapping, Sequence
 
+from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
 from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
@@ -45,10 +46,10 @@ from labelkit.common.contracts.types import (
     frame_digest,
     tree_diff,
 )
-from labelkit.common.runtime import budget
+from labelkit.common.inference import budget
 
-from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
-from labelkit.common.runtime.schema_engine import CallScope, stitch_schema
+from labelkit.common.inference.llm_client import Message, Part, PromptBundle
+from labelkit.common.inference.schema_engine import CallScope, stitch_schema
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import ResolvedConfig
@@ -367,18 +368,19 @@ def aggregate_votes(samples: Sequence[Mapping]) -> Mapping | None:
 
 async def judge_stitch(thread_cards: Sequence[str], candidate_card: str,
                        ctx: "RunContext",
-                       record_ids: tuple[str, ...] = ()) -> Mapping | None:
+                       record_ids: tuple[str, ...],
+                       call_ordinal: tuple[int, int, int]) -> Mapping | None:
     """对一个候选做一次判决，经 complete_validated(schema=stitch_schema())。
 
     votes == 1（默认）：按 profile 默认温度发一次调用。votes > 1（T18）：同一提示词并发采
-    n 个样本，按 M-4 严格多数聚合；SchemaViolation 的样本视为弃权，provider/内部错误照常
-    上抛（沿用 classify 自一致的纪律）——存活样本为零时重抛最后一次违规，交由阶段的
-    on_error 处置。
+    n 个样本，按 M-4 严格多数聚合；SchemaViolation 的样本视为弃权，其他普通异常作为输入序
+    outcome 交由 candidate 的 on_error 处置；控制异常原样逃逸。存活样本为零时重抛最后一次违规。
 
     @param thread_cards 已排好序的线索摘要卡
     @param candidate_card 候选摘要卡
     @param ctx 运行上下文
     @param record_ids 计入 llm.call 的记录 id（候选首个成员帧）
+    @param call_ordinal （会话序号, pass 序号, 判决时钟）
     @return 获胜的判决对象；票数分裂不足严格多数时为 None
     @raises SchemaViolation votes > 1 且全部样本都违规时重抛最后一次违规
     """
@@ -387,15 +389,18 @@ async def judge_stitch(thread_cards: Sequence[str], candidate_card: str,
     schema = stitch_schema()
     n = cfg.stitch.votes
     scope = CallScope(record_ids=record_ids, batch_no=ctx.batch_no)
-    if n == 1:
-        obj, _usage, _attempts, _model = await ctx.schema_engine.complete_validated(
-            cfg.stitch.llm, prompt, schema, scope=scope)
-        return obj
-
-    results = await asyncio.gather(
-        *(ctx.schema_engine.complete_validated(
-            cfg.stitch.llm, prompt, schema, scope=scope) for _ in range(n)),
-        return_exceptions=True)
+    ordinal_text = ":".join(str(value) for value in call_ordinal)
+    specs = tuple(
+        TaskSpec(
+            task_id=f"{ctx.task_namespace}:stitch:{ordinal_text}:vote:{vote}",
+            declaration_key=(ctx.batch_no, 1, *call_ordinal, vote),
+            stage="stitch",
+            resource_key=("llm", cfg.stitch.llm),
+            operation=lambda: _sample_stitch(ctx, prompt, schema, scope),
+        )
+        for vote in range(n)
+    )
+    results = await ctx.tasks.run_group(TaskGroupRequest(specs))
     samples: list[Mapping] = []
     last_violation: SchemaViolation | None = None
     for res in results:
@@ -410,6 +415,26 @@ async def judge_stitch(thread_cards: Sequence[str], candidate_card: str,
         raise last_violation if last_violation is not None else SchemaViolation(
             ["stitch votes: all samples failed"], "")
     return aggregate_votes(samples)
+
+
+async def _sample_stitch(ctx: "RunContext", prompt: PromptBundle, schema: Mapping,
+                         scope: CallScope) -> tuple | Exception:
+    """执行一个不修改业务状态的投票叶任务。
+
+    @param ctx 运行上下文
+    @param prompt 冻结提示词
+    @param schema stitch 输出 Schema
+    @param scope 调用归属
+    @return 校验成功的完整调用结果，或待归并的普通异常
+    """
+    try:
+        return await ctx.schema_engine.complete_validated(
+            ctx.cfg.stitch.llm, prompt, schema, scope=scope,
+        )
+    except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+        raise
+    except Exception as exc:
+        return exc
 
 
 # ── 会话内状态 ──────────────────────────────────────────────────────────────
@@ -503,6 +528,7 @@ class _SessionState:
     """单会话缝合过程的载体：只读上下文 + 会话内可变的线索集合。"""
 
     sid: str                               # 会话 id
+    ordinal: int                           # 本批会话声明序号
     ctx: "RunContext"                      # 运行上下文（配置 / 指标 / Schema 引擎）
     position_of: Mapping[str, int]         # 帧 id → 会话序位置（首次出现为准）
     threads: list[_Thread]                 # 线索创建序列表，含被淘汰出池者
@@ -648,29 +674,31 @@ class StitchStage:
                     and item.thread_id is None):
                 episodes_by_sid[item.session_id].append(item)
 
-        for sid in order:
+        for session_ordinal, sid in enumerate(order):
             if not episodes_by_sid[sid]:
                 continue
-            await self._run_session(sid, frames_by_sid[sid],
+            await self._run_session((session_ordinal, sid), frames_by_sid[sid],
                                     episodes_by_sid[sid], ctx)
         return batch                            # 同一个列表对象（②c）
 
     # ── 单会话驱动 ───────────────────────────────────────────────────────────
 
-    async def _run_session(self, sid: str, frames: list[PipelineItem],
+    async def _run_session(self, session_key: tuple[int, str], frames: list[PipelineItem],
                            episodes: list[PipelineItem],
                            ctx: "RunContext") -> None:
         """跑完一个会话：候选流 → 单调池判决 → 可选二次重判 → 收尾标记。
 
-        @param sid 会话 id
+        @param session_key （本批声明序号, 会话 id）
         @param frames 该会话的全部帧信封，按会话序
         @param episodes 该会话尚未缝过的活跃 episode 信封
         @param ctx 运行上下文
         """
+        session_ordinal, sid = session_key
         position_of: dict[str, int] = {}
         for i, frame in enumerate(frames):
             position_of.setdefault(frame.record.id, i)
-        session = _SessionState(sid=sid, ctx=ctx, position_of=position_of,
+        session = _SessionState(sid=sid, ordinal=session_ordinal, ctx=ctx,
+                                position_of=position_of,
                                 threads=[], pool=[])
 
         candidates = self._assemble_candidates(frames, episodes, position_of)
@@ -764,7 +792,8 @@ class StitchStage:
                                           self.cfg)
         try:
             outcome = await judge_stitch(cards, cand_card, session.ctx,
-                                         record_ids=(cand.members[0].id,))
+                                         (cand.members[0].id,),
+                                         (session.ordinal, 0, clock))
         except (CircuitBreakerTripped, KeyboardInterrupt,
                 asyncio.CancelledError):
             raise
@@ -1005,8 +1034,7 @@ class StitchStage:
                           others: list[_Thread], clock: int) -> int:
         """对一条单碎片线索跑一次 pass-2 判决。
 
-        目标集超过 max_open 时按跨度距离截断到最近的 max_open 条（M-2：不是区间相交），
-        再按最近活跃降序展示。合并方向**反转**（T6 存活规则）：候选信封变成空壳，目标线索
+        目标集超过 max_open 时按跨度距离截断，再按最近活跃降序展示。合并方向**反转**：候选信封变成空壳，目标线索
         存活并把碎片按会话序重排。
 
         @param session 本会话状态
@@ -1033,7 +1061,8 @@ class StitchStage:
                                           self.cfg)
         try:
             outcome = await judge_stitch(cards, cand_card, session.ctx,
-                                         record_ids=(cand.members[0].id,))
+                                         (cand.members[0].id,),
+                                         (session.ordinal, 1, clock))
         except (CircuitBreakerTripped, KeyboardInterrupt,
                 asyncio.CancelledError):
             raise

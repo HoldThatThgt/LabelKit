@@ -12,7 +12,7 @@
 | `llm.*.model` | str | 必填 | 模型名，原样透传。 |
 | `llm.*.api_key_env` | str | 必填* | 持有 API Key 的环境变量名（API Key 是唯一的环境变量用途，2.5）。* v1.6：与 `api_key_envs` 恰提供其一（互斥，M1 校验 3.1.4）。 |
 | `llm.*.api_key_envs` | array | 无 | v1.6 密钥池（3.9.3）：持有 API Key 的环境变量名数组（≥1 项，逐项非空且互异），与 `api_key_env` 互斥。池内密钥共享本 profile 其余全部字段（同 base_url、同 model——同构池，密钥选择不改变产出数据内容）；被引用 profile 的**每个**列出变量都须存在且非空（M1 校验）。单元素数组与 `api_key_env` 等价；`max_concurrency` 仍为池内总在途上限。 |
-| `llm.*.max_concurrency` | int | 8 | 该 profile 并发上限（信号量）。 |
+| `llm.*.max_concurrency` | int | 8 | 该 profile 的唯一容量真值：同时限制 TaskExecutor 对该 `("llm", name)` 资源通道的已接纳叶任务数，以及 ResourceManager 的实际逻辑调用数。许可覆盖 retry/backoff/cooldown/parking；不按 task group 重建。 |
 | `llm.*.timeout_s` | int | 120 | 单次请求超时。 |
 | `llm.*.max_retries` | int | 5 | 可重试错误的最大重试次数。 |
 | `llm.*.retry_base_delay_s` | float | 1.0 | 全抖动指数退避基数（3.9.3）。 |
@@ -31,7 +31,7 @@
 | `embedding.*.model` | str | 必填 | embedding 模型名，原样透传。 |
 | `embedding.*.api_key_env` | str | 必填* | 持有 API Key 的环境变量名；被 `dedup.semantic_embedding` 引用时须存在且非空（M1 校验，3.1.4）。* v1.6：与 `embedding.*.api_key_envs` 恰提供其一。 |
 | `embedding.*.api_key_envs` | array | 无 | v1.6：同 `llm.*.api_key_envs`——embedding profile 的密钥池，机制一致（3.9.3 密钥池行）。 |
-| `embedding.*.max_concurrency` | int | 8 | 该 profile 并发上限（信号量，与 llm.* 同机制，3.9.3）。 |
+| `embedding.*.max_concurrency` | int | 8 | 该 embedding profile 的唯一容量真值：同时限制对应资源通道的已接纳叶任务数与实际逻辑调用数；与同名 LLM profile 是不同 ResourceKey。 |
 | `embedding.*.timeout_s` | int | 60 | 单次请求超时。 |
 | `embedding.*.max_retries` | int | 5 | 可重试错误的最大重试次数（重试规则同 3.9.3）。 |
 | `embedding.*.retry_base_delay_s` | float | 1.0 | 全抖动指数退避基数（与 `llm.*` 同名键同机制，3.9.3）。 |
@@ -43,6 +43,12 @@
 | `console.heartbeat_s` | int | 0 | v1.10：仅 plain 且非 TTY 生效——每 N 秒一行数据无关汇总心跳（固定键集 `heartbeat batch= stage= llm_calls= elapsed=`，7.7）；0 = 关（默认，保回归锚；对齐决策 1.6 U14）；< 0 = CONFIG_ERROR。 |
 | `console.estimate` | bool | false | v1.10：仅文本模态生效——启动时做估算扫描（`Ingestor.scan(estimate=True)`，全量多读一遍输入）换取批总数分母与 ETA（7.7；对齐决策 1.6 U17）；UI 模态分母天然廉价（live 预扫复用）、恒显示，本键无效。 |
 | `console.interactive` | bool | true | v1.10：rich ∧ stdin TTY ∧ termios 可用时启用键盘开关（封闭键集 `? l e + - p q`（`h` 为 `?` 同义键），7.7）；false = 纯渲染（stdin 完全不被占用——buck2 `--no-interactive-console` 对应物）。 |
+
+v1.19 不新增 `[runtime]`、workers、queue_size、thread_count 或 HTTP pool 配置。Application 从本轮实际引用的
+LLM/embedding profiles 派生 ResourceKey 与规范化 HTTP origin；同 origin 容量等于其引用 profile 容量之和，
+共享 HTTPX 连接池容量等于全部 origin 容量之和。repair、probe 与生成路径引用的 profile 都计入，重复引用只计
+一次。静态 validate 与 estimate 不构造 ExecutionRuntime；dry-run 只可构造不进入 execution domain、且不创建
+leaf 的惰性 ExecutionRuntime 身份载体。三者都不构造 HTTP client。
 
 ```
 # ─── config.toml 完整示例 ───
@@ -547,7 +553,7 @@ instruction-only 强制 crossed 为零、primary_sessions = N、duplicates 为�
 | ScenarioSeed / state or outcome Schema / frame Schema | 65536 bytes |
 | event patch | 16384 canonical JSON bytes |
 | rendered payload | 65536 canonical JSON bytes |
-| one runtime prompt value | 32768 UTF-8 bytes |
+| one dynamic prompt value | 32768 UTF-8 bytes |
 | one L3 newly appended message-body set | 32768 UTF-8 bytes |
 | one generation prompt text | 32768 UTF-8 bytes |
 | `record_units` / `stream_rows` | 500000 |
@@ -561,15 +567,16 @@ canonical bytes 选择唯一最小 witness，并要求其不超过对应 prompt-
 PromptBundle，再加动态值与 L3 新增正文 byte 包络证明首轮/repair profile；运行期恰好上限可派发，多一 byte 零派发拒绝。
 六个 family 的 2D/5D/5D+P/6D+P/S+2D/Y、`ceil(bytes/3)`、structured Schema 与 repair replay
 精确公式以 3.1.4「console 与上下文预算」后的规范段为唯一实现口径。
-retained bytes 在每个 attempt 的 dedup commit 前按最终 main/stream canonical bytes 精确计费。M11 先从
-最终 item 与 pre-downstream projection 装配 `SequenceRows`，ReplayProjector 再只从 source
-`SequenceRows.primary_stream_rows` 构造全部计划 `ReplayRows`。prospective 值恰等于既有已接受
-累计、当前 set 所有 SequenceRows 与本次 ReplayRows 的和；两者共用 `canonical_delivery_row`，
-每行按 canonical UTF-8 bytes 加一个 JSONL 换行 byte 计。超限 whole-slot rejection，不能裁剪 payload 或 truth。
+retained bytes 在当前声明序 head 的无 `await` 提交临界区、dedup commit 前，按最终 main/stream canonical bytes
+精确计费。M11 先从最终 item 与 pre-downstream projection 装配 `SequenceRows`，ReplayProjector 再只从 source
+`SequenceRows.primary_stream_rows` 构造全部计划 `ReplayRows`。比较值恰等于已提交累计加当前 prepared
+candidate 的实际 retained bytes；两者共用 `canonical_delivery_row`，每行按 canonical UTF-8 bytes 加一个
+JSONL 换行 byte 计。超限拒绝当前 whole-slot attempt，不能裁剪 payload 或 truth，也不能提交 reservation、
+dataset counters 或 frontier delta。
 
 planner 按完整 session 分 block，单 block 最多 4096 primary events。OR-Tools 单 worker、确定性 seed、
 每层 `max_deterministic_time = 10.0`；只解码 OPTIMAL。INFEASIBLE 是配置失败，FEASIBLE/UNKNOWN 是
-runtime budget failure，MODEL_INVALID 是内部错误；无 incumbent、替代求解器或近似 dry-run。
+planner deterministic-budget failure，MODEL_INVALID 是内部错误；无 incumbent、替代求解器或近似 dry-run。
 
 ## 5.3 Rubric 结构（内联或默认包文件，同一 TOML 结构）
 

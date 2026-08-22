@@ -131,12 +131,13 @@ user（窗内逐帧，一帧一段）:
 
 **会话首帧恒为段首**：rel[0] 的边界值不参与判决（无论 LLM 输出何值，帧 0 都开启首段）；noise[0] 照常生效。
 
-**调用与校验**：每窗 1 次调用，经 `complete_validated(schema=segment_window_schema(...))`（3.8.3）；temperature 恒 0；批内全部窗口（跨会话）并入一个 `asyncio.gather`（profile 信号量约束，3.4.3 骨架同款）——缝合是判决收齐后的同步 pass，结果按窗口位置定位、与完成顺序无关；无 rng 消耗（种子豁免面不变，2.6）。episode 构成以 LLM 输出为条件（classify 分池同款条件化声明，2.6 幂等行）；同输入同 seed 逐字节可复现。
+**调用与校验**：每窗 1 次调用，经 `complete_validated(schema=segment_window_schema(...))`（3.8.3）；temperature 恒 0。planner 先按 session/item/window ordinal 同步预计算摘要、diff 成本与全部窗口，再把跨会话窗口冻结为一个 `TaskGroupRequest`。TaskExecutor 经 `segment.llm` 资源通道有界执行；叶任务只返回与窗口对齐的 relation outcome，不写 session、成员状态、episode、events 或 counters。全部 outcome 收齐后，reducer 按 session/window ordinal 执行接缝覆写、成段、状态迁移与尾部追加；结果与完成顺序无关。无 rng 消耗（种子豁免面不变，2.6）。rules 与孤帧路径提交零任务。普通 ProviderFatal 转为既有会话 keep/fail outcome，不取消 sibling；逃逸 internal/control 异常结构化取消 execution domain。episode 构成以 LLM 输出为条件（classify 分池同款条件化声明，2.6 幂等行）；同输入同 seed 逐字节可复现。
 
 **滑窗缝合**（确定性；全窗判决收齐后执行。v1.11（V9）：切窗从定长改为**预算贪心装填**——预算未声明时逐字节退化为 v1.10 定长窗；窗口边界由此成为 (输入, 配置) 的确定函数——digest/diff 是记录内容纯函数、本算子零 rng，同输入同配置逐字节可复现不破）：
 
 ```
-def refine(session: list[Record]) -> list[str]:        # 返回逐帧 relation（长度 = len(session)）
+def refine(session: list[Record], outcomes: Mapping[tuple[int, int], list[str]]) -> list[str]:
+                                                       # reducer：返回逐帧 relation（长度 = len(session)）
     if strategy == "rules" or len(session) == 1:       # rules / 孤帧退化：原样成段，零 LLM
         return ["continues"] * len(session)
     digests = [frame_digest(f, digest_max_chars)       # v1.11（V9）：会话级逐帧摘要预计算——前移到
@@ -162,8 +163,8 @@ def refine(session: list[Record]) -> list[str]:        # 返回逐帧 relation�
                                                        #   永不 run 级、永不死循环，v1.11 审计修订）；
                                                        #   预算未声明 ⇒ end = min(start + window,
                                                        #   len(session))，逐字节退化为定长窗
-        verdicts = judge_window(session[start:end])    # 一窗一调用（并发下收齐后按位缝合）；
-                                                       #   返回值已在 judge_window 内完成后校验：
+        verdicts = outcomes[(start, end)]              # planner 已冻结窗口、TaskExecutor 已按输入序收齐；
+                                                       #   outcome 已在 judge_window 内完成后校验：
                                                        #   按 index first-wins 建表（同窗重复 index
                                                        #   取首个出现者）、缺席帧缺省 "continues"
                                                        #   （保守中性，quality「缺席准则→tie」同款）

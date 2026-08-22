@@ -18,10 +18,15 @@ import pytest
 
 from labelkit.common.contracts.generation import (
     ActorView,
+    DedupReservation,
     EventTrace,
     EventTruth,
+    NoiseCandidateReconcileRequest,
     NoiseProjectionRequest,
     PatternEvaluation,
+    PreparedCandidate,
+    PreparedNoiseCandidate,
+    PrimaryCandidateReconcileRequest,
     ProjectedSequence,
     ProjectionRequest,
     ReconcileRequest,
@@ -33,13 +38,13 @@ from labelkit.common.contracts.generation import (
     StateEvaluation,
 )
 from labelkit.common.contracts.types import Record, RecordRef
-from labelkit.common.errors import DeliveryError, GenerationProjectionMismatch, InternalError
-from labelkit.operators.generation import GenerationAttemptRejected
+from labelkit.common.errors import GenerationProjectionMismatch, InternalError
 from labelkit.operators.generation.planner import compile_scenario_plan
 from labelkit.operators.generation.program import generation_program_digest
 from labelkit.operators.generation.project import (
     _timestamp_text,
     _timestamp_us,
+    CrossViewFrontier,
     canonical_json,
     canonical_delivery_row,
     derive_generation_id,
@@ -49,13 +54,11 @@ from labelkit.operators.generation.project import (
     project_trace,
     projection_witness,
     _reconcile_declared_role,
-    reconcile_prospective_views,
+    reconcile_noise_candidate,
+    reconcile_primary_candidate,
     reconcile_views,
     scenario_plan_digest,
 )
-from labelkit.orchestration.generation_delivery import _DeliveryController
-
-
 _RETAINED_CAP = 536_870_912
 _RSS_LIMIT_BYTES = 4 * 1024**3
 
@@ -110,99 +113,6 @@ def _independent_row_bytes(row) -> int:
     return len(encoded) + 1
 
 
-class _LimitMetrics:
-    """只记录 dataset 正式合并的限额测试 metrics。"""
-
-    def __init__(self):
-        self.merged = []
-
-    def merge_counts(self, counters) -> None:
-        """记录正式 dataset commit。"""
-        self.merged.append(dict(counters))
-
-
-class _LimitDedup:
-    """只记录 group commit 的限额测试 dedup。"""
-
-    def __init__(self):
-        self.commits = []
-
-    def group_commit(self, token) -> None:
-        """记录正式 dedup commit。"""
-        self.commits.append(token)
-
-
-class _LimitEmitter:
-    """返回指定 source 费用且不触碰文件。"""
-
-    def __init__(self, retained: int):
-        self.retained = retained
-        self.calls = 0
-
-    def assemble_sequence(self, _request):
-        """构造一个轻量虚拟 source SequenceRows。"""
-        self.calls += 1
-        return SequenceRows({"source": True}, (), self.retained)
-
-
-def _limit_controller(source_retained: int):
-    """构造仅执行 prospective/commit 顺序的真实控制器。"""
-    metrics = _LimitMetrics()
-    dedup = _LimitDedup()
-    emitter = _LimitEmitter(source_retained)
-    program = SimpleNamespace(
-        max_slot_attempts=1,
-        limits=SimpleNamespace(retained_content_bytes=_RETAINED_CAP),
-    )
-    request = SimpleNamespace(program=program, plan=SimpleNamespace())
-    generation = SimpleNamespace(metrics=metrics, schema_engine=object())
-    services = SimpleNamespace(
-        generation=generation,
-        dedup=dedup,
-        quality=None,
-        annotate=None,
-        verify=None,
-        emitter=emitter,
-    )
-    return _DeliveryController(request, services), metrics, dedup, emitter
-
-
-def _wire_limit_attempt(monkeypatch, controller, replay_retained: int):
-    """把真实 attempt 驱动绑定到轻量 deterministic 协作者。"""
-    calls = []
-
-    async def generate(_slot, _attempt):
-        calls.append("generate")
-        return ("trace",)
-
-    async def probe(_transaction, _context):
-        calls.append("dedup_probe")
-        return "dedup-token"
-
-    async def downstream(_transaction, _slot, _attempt, _batch):
-        calls.append("downstream")
-        return {"generated": 1}
-
-    def replays(slot, rows):
-        calls.append("replay")
-        replay = ReplayRows(({"replay": True},), replay_retained)
-        return (replay,), (((slot.slot_key, None), rows[0]),)
-
-    monkeypatch.setattr(controller, "_generate_traces", generate)
-    monkeypatch.setattr(controller, "_project_traces", lambda *_args: ("projection",))
-    monkeypatch.setattr(controller, "_projection_witnesses", lambda *_args: ("witness",))
-    monkeypatch.setattr(
-        controller,
-        "_transaction",
-        lambda *_args: SimpleNamespace(items=(object(),)),
-    )
-    monkeypatch.setattr(controller, "_context", lambda *_args: object())
-    monkeypatch.setattr(controller, "_dedup_probe", probe)
-    monkeypatch.setattr(controller, "_run_downstream", downstream)
-    monkeypatch.setattr(controller, "_project_replays", replays)
-    return calls
-
-
 def _branch(plan, slot_key: str, variant: str):
     """读取唯一可见 branch。"""
     return next(block[(slot_key, variant)] for block in plan.blocks
@@ -221,16 +131,18 @@ def _payload(role: str) -> dict:
     }
 
 
-def _trace(program, plan):
-    """从计划 witness 构造一个完整 positive EventTrace。"""
+def _trace(program, plan, variant_name: str = "positive"):
+    """从计划 witness 构造一个完整 declared EventTrace。"""
     slot = plan.delivery_slots[0]
-    planned = _branch(plan, slot.slot_key, "positive")
+    planned = _branch(plan, slot.slot_key, variant_name)
     pattern = program.patterns[slot.pattern_name]
+    source = next(item for item in program.counterfactual_sets if item.name == slot.source_name)
+    variant = next(item for item in source.variants if item.name == variant_name)
     roles = {role.name: role for role in pattern.roles}
     scenario_id = derive_generation_id(
         "declared_scenario_id", [program.digest, slot.source_name, slot.scenario_index]
     )
-    world_id = derive_generation_id("declared_world_branch_id", [scenario_id, "positive"])
+    world_id = derive_generation_id("declared_world_branch_id", [scenario_id, variant_name])
     events = []
     bindings = {}
     for item in planned:
@@ -250,9 +162,10 @@ def _trace(program, plan):
     seed = ScenarioSeed(**dict(config.initial_state_catalog[slot.catalog_row_index]))
     semantic = SemanticEvaluation(True, True, True, True, True, True, ())
     state = StateEvaluation("hash", "hash", True, True, True)
+    violations = () if not variant.expected_violation else (variant.expected_violation,)
     return slot, EventTrace(
-        scenario_id, world_id, slot.sequence_class, slot.pattern_name, "positive",
-        seed, tuple(events), seed.initial_state, PatternEvaluation(bindings, ()),
+        scenario_id, world_id, slot.sequence_class, slot.pattern_name, variant_name,
+        seed, tuple(events), seed.initial_state, PatternEvaluation(bindings, violations),
         state, semantic,
     )
 
@@ -312,20 +225,36 @@ def _sequence_rows(projection, planned) -> SequenceRows:
 @pytest.fixture
 def projected_set(declared_program):
     """返回一组 primary/noise/replay 的冻结合法投影。"""
-    plan = compile_scenario_plan(declared_program)
-    slot, trace = _trace(declared_program, plan)
+    source = declared_program.counterfactual_sets[0]
+    positive = next(variant for variant in source.variants if variant.kind == "positive")
+    timeline = replace(
+        declared_program.timeline,
+        primary_sessions=1,
+        crossed_primary_sessions=0,
+        noise_events=2,
+        duplicate_sequences=1,
+    )
+    base = replace(
+        declared_program,
+        counterfactual_sets=(replace(source, count=1, variants=(positive,)),),
+        timeline=timeline,
+        digest="",
+    )
+    program = replace(base, digest=generation_program_digest(base))
+    plan = compile_scenario_plan(program)
+    slot, trace = _trace(program, plan)
     projection = project_trace(ProjectionRequest(
-        declared_program, plan, slot, trace
+        program, plan, slot, trace
     ))
     planned = _branch(plan, slot.slot_key, "positive")
     sequence = _sequence_rows(projection, planned)
     noise = project_noise(NoiseProjectionRequest(
-        declared_program, "a" * 32, plan.noise_slots[0], {"utterance": "天气很好"},
+        program, "a" * 32, plan.noise_slots[0], {"utterance": "天气很好"},
     ))
     replay = project_replay(ReplayProjectionRequest(
-        declared_program, plan, plan.replay_layouts[0], sequence,
+        program, plan, plan.replay_layouts[0], sequence,
     ))
-    return declared_program, plan, projection, sequence, noise, replay
+    return program, plan, projection, sequence, noise, replay
 
 
 def _thaw(value):
@@ -406,6 +335,49 @@ def _primary_only_request(program, plan, projection, sequence):
     )
 
 
+def _reconcile_candidate_bundle(request: ReconcileRequest) -> None:
+    """把旧聚合测试夹具拆成 canonical primary/noise candidate-local 请求。"""
+    noise_bytes = sum(len(canonical_delivery_row(row)) + 1 for row in request.noise_rows)
+    has_primary = bool(
+        request.projection_witnesses or request.sequences or request.replays
+    )
+    if has_primary:
+        slot = request.plan.delivery_slots[0]
+        layouts = tuple(
+            item for item in request.plan.replay_layouts
+            if item.source_slot_key == slot.slot_key
+        )
+        reconcile_primary_candidate(PrimaryCandidateReconcileRequest(
+            request.program,
+            request.plan,
+            request.run_id,
+            slot,
+            request.projection_witnesses,
+            request.sequences,
+            layouts,
+            request.replays,
+            request.retained_content_bytes - noise_bytes,
+        ))
+    if len(request.noise_rows) != len(request.noise_payload_digests):
+        raise GenerationProjectionMismatch("noise candidate source count differs")
+    if len(request.noise_rows) > len(request.plan.noise_slots):
+        raise GenerationProjectionMismatch("noise candidate slot count differs")
+    for row, payload_digest, slot in zip(
+        request.noise_rows,
+        request.noise_payload_digests,
+        request.plan.noise_slots[:len(request.noise_rows)],
+        strict=True,
+    ):
+        reconcile_noise_candidate(NoiseCandidateReconcileRequest(
+            request.program,
+            request.run_id,
+            slot,
+            payload_digest,
+            row,
+            len(canonical_delivery_row(row)) + 1,
+        ))
+
+
 def _single_final_request(program):
     """从完整编译语义构造一槽、一 positive、一 noise、一 replay 最终计划。"""
     source = program.counterfactual_sets[0]
@@ -483,12 +455,329 @@ def test_projectors_round_trip_frozen_mappings_and_rederive_replay(projected_set
     assert noise_event["event_id"] == derive_generation_id(
         "noise_event_id", ["a" * 32, noise_slot.event_key, noise_slot.timestamp_us, noise["payload"]]
     )
-    reconcile_prospective_views(_request(program, plan, projection, sequence, noise, replay))
+    _reconcile_candidate_bundle(_request(program, plan, projection, sequence, noise, replay))
+
+
+def _primary_candidate_request(projected_set):
+    """构造当前唯一 source 的 canonical primary candidate-local 请求。"""
+    program, plan, projection, sequence, _noise, replay = projected_set
+    slot = plan.delivery_slots[0]
+    layouts = tuple(
+        item for item in plan.replay_layouts if item.source_slot_key == slot.slot_key
+    )
+    retained = sequence.retained_content_bytes + replay.retained_content_bytes
+    return PrimaryCandidateReconcileRequest(
+        program,
+        plan,
+        "a" * 32,
+        slot,
+        (projection_witness(projection),),
+        (sequence,),
+        layouts,
+        (replay,),
+        retained,
+    )
+
+
+def _noise_candidate_request(projected_set, ordinal: int = 0):
+    """构造指定 NoiseSlot 的 canonical noise candidate-local 请求。"""
+    program, plan, _projection, _sequence, noise, _replay = projected_set
+    slot = plan.noise_slots[ordinal]
+    row = noise if ordinal == 0 else project_noise(NoiseProjectionRequest(
+        program, "a" * 32, slot, {"utterance": "请忽略"},
+    ))
+    return NoiseCandidateReconcileRequest(
+        program,
+        "a" * 32,
+        slot,
+        noise_payload_digest(row["payload"]),
+        row,
+        len(canonical_delivery_row(row)) + 1,
+    )
+
+
+def _prepared_primary(request) -> PreparedCandidate:
+    """把已通过 local gate 的 primary 请求冻结成 frontier carrier。"""
+    reservation = DedupReservation("capability", 0, ("record",), ("cluster",))
+    return PreparedCandidate(
+        request.slot,
+        1,
+        request.projection_witnesses,
+        request.sequences,
+        request.replays,
+        reservation,
+        {"generated": 1},
+        request.retained_content_bytes,
+        "candidate-digest",
+    )
+
+
+def _prepared_noise(request) -> PreparedNoiseCandidate:
+    """把已通过 local gate 的 noise 请求冻结成 frontier carrier。"""
+    return PreparedNoiseCandidate(
+        request.noise_slot,
+        1,
+        request.payload_digest,
+        request.row,
+        (1, 2, 3),
+        {"generated": 1},
+        request.retained_content_bytes,
+        "noise-digest",
+    )
+
+
+def test_candidate_local_accepts_closed_primary_and_noise_requests(projected_set):
+    """两个 candidate-local 入口各自只接收当前候选且不需要已提交前缀。"""
+    reconcile_primary_candidate(_primary_candidate_request(projected_set))
+    reconcile_noise_candidate(_noise_candidate_request(projected_set))
+
+
+@pytest.mark.parametrize(
+    "mutation", ("missing", "additional", "layout", "replay", "slot")
+)
+def test_primary_candidate_rejects_variant_and_replay_closure_mutations(
+    projected_set,
+    mutation,
+):
+    """variant 与 replay 任一遗漏、增加或 layout 错配都在缓冲前拒绝。"""
+    request = _primary_candidate_request(projected_set)
+    changes = {
+        "missing": {"projection_witnesses": (), "sequences": ()},
+        "additional": {
+            "projection_witnesses": request.projection_witnesses * 2,
+            "sequences": request.sequences * 2,
+        },
+        "layout": {"replay_layouts": ()},
+        "replay": {"replays": ()},
+        "slot": {"slot": replace(request.slot, scenario_index=99)},
+    }
+    with pytest.raises(GenerationProjectionMismatch):
+        reconcile_primary_candidate(replace(request, **changes[mutation]))
+
+
+def test_primary_candidate_requires_exact_declared_variant_order(declared_program):
+    """即使 witness 与 sequence 成对交换，自洽内容也不能改变声明 variant 顺序。"""
+    plan = compile_scenario_plan(declared_program)
+    slot = plan.delivery_slots[0]
+    projections = []
+    sequences = []
+    for variant_name in slot.variant_names:
+        _slot, trace = _trace(declared_program, plan, variant_name)
+        projection = project_trace(ProjectionRequest(
+            declared_program, plan, slot, trace,
+        ))
+        projections.append(projection)
+        sequences.append(_sequence_rows(
+            projection, _branch(plan, slot.slot_key, variant_name)
+        ))
+    layouts = tuple(
+        item for item in plan.replay_layouts if item.source_slot_key == slot.slot_key
+    )
+    source_by_variant = dict(zip(slot.variant_names, sequences, strict=True))
+    replays = tuple(project_replay(ReplayProjectionRequest(
+        declared_program,
+        plan,
+        layout,
+        source_by_variant[layout.source_variant_name],
+    )) for layout in layouts)
+    retained = sum(item.retained_content_bytes for item in (*sequences, *replays))
+    request = PrimaryCandidateReconcileRequest(
+        declared_program,
+        plan,
+        "a" * 32,
+        slot,
+        tuple(projection_witness(item) for item in projections),
+        tuple(sequences),
+        layouts,
+        replays,
+        retained,
+    )
+    reconcile_primary_candidate(request)
+    order = (1, 0, *range(2, len(sequences)))
+    changed = replace(
+        request,
+        projection_witnesses=tuple(request.projection_witnesses[index] for index in order),
+        sequences=tuple(request.sequences[index] for index in order),
+    )
+    with pytest.raises(GenerationProjectionMismatch, match="delivery slot"):
+        reconcile_primary_candidate(changed)
+
+
+@pytest.mark.parametrize("mutation", ("topic", "ordinal", "digest", "bytes"))
+def test_noise_candidate_rejects_local_identity_and_accounting_mutations(
+    projected_set,
+    mutation,
+):
+    """noise topic/ordinal、payload source 与 canonical bytes 均独立闭合。"""
+    request = _noise_candidate_request(projected_set)
+    changes = {
+        "topic": {"noise_slot": replace(request.noise_slot, topic="forged")},
+        "ordinal": {"noise_slot": replace(request.noise_slot, ordinal=99)},
+        "digest": {"payload_digest": "0" * 64},
+        "bytes": {"retained_content_bytes": request.retained_content_bytes + 1},
+    }
+    with pytest.raises(GenerationProjectionMismatch):
+        reconcile_noise_candidate(replace(request, **changes[mutation]))
+
+
+def test_candidate_local_converts_malformed_plan_and_noise_slot_to_rejection(projected_set):
+    """内部 carrier 的结构类型错误也只能成为当前候选的 reconcile rejection。"""
+    primary = _primary_candidate_request(projected_set)
+    malformed_plan = replace(primary.plan, blocks=({
+        (primary.slot.slot_key, primary.slot.variant_names[0]): None,
+    },))
+    with pytest.raises(GenerationProjectionMismatch, match="primary candidate"):
+        reconcile_primary_candidate(replace(primary, plan=malformed_plan))
+
+    noise = _noise_candidate_request(projected_set)
+    malformed_slot = replace(noise.noise_slot, timestamp_us="invalid")
+    with pytest.raises(GenerationProjectionMismatch, match="noise candidate"):
+        reconcile_noise_candidate(replace(noise, noise_slot=malformed_slot))
+
+
+def test_frontier_check_is_non_mutating_and_commit_advances_phase(projected_set):
+    """check 只返回 delta；commit 后才写集合并从 primary 切换到 noise。"""
+    primary_request = _primary_candidate_request(projected_set)
+    frontier = CrossViewFrontier(primary_request.plan)
+    first_noise = _noise_candidate_request(projected_set)
+    second_noise = _noise_candidate_request(projected_set, 1)
+    with pytest.raises(InternalError, match="noise phase is closed"):
+        frontier.check_noise(_prepared_noise(first_noise))
+    delta = frontier.check_primary(_prepared_primary(primary_request))
+
+    assert delta.phase == "primary" and delta.ordinal == 0
+    main_id = primary_request.sequences[0].main_row["_meta"]["id"]
+    replay_id = primary_request.replays[0].rows[0]["_meta"]["event"]["replay_sequence_id"]
+    assert delta.source_keys == (f"primary:{main_id}", f"replay:{replay_id}")
+    assert frontier._event_ids == set()
+    assert frontier._timestamps_us == set()
+    assert frontier._source_keys == set()
+    assert frontier._next_ordinal == 0
+
+    frontier.commit(delta)
+    assert frontier._phase == "noise"
+    assert frontier._next_ordinal == 0
+    assert frontier._event_ids == set(delta.event_ids)
+    assert frontier._timestamps_us == set(delta.timestamps_us)
+    assert frontier._source_keys == set(delta.source_keys)
+    with pytest.raises(InternalError, match="primary phase is closed"):
+        frontier.check_primary(_prepared_primary(primary_request))
+    with pytest.raises(InternalError, match="noise ordinal is out of order"):
+        frontier.check_noise(_prepared_noise(second_noise))
+
+    noise_delta = frontier.check_noise(_prepared_noise(first_noise))
+    assert noise_delta.source_keys == (f"noise:{first_noise.noise_slot.event_key}",)
+    frontier.commit(noise_delta)
+    assert frontier._next_ordinal == 1
+    second_delta = frontier.check_noise(_prepared_noise(second_noise))
+    frontier.commit(second_delta)
+    with pytest.raises(InternalError, match="noise phase is closed"):
+        frontier.check_noise(_prepared_noise(second_noise))
+
+
+def test_frontier_rejects_out_of_order_and_cross_candidate_collision_without_mutation(
+    projected_set,
+):
+    """scheduler 顺序错误是内部失败，候选身份冲突是可恢复且不推进 frontier。"""
+    request = _primary_candidate_request(projected_set)
+    second_slot = replace(request.slot, slot_key="second/000000")
+    plan = replace(request.plan, delivery_slots=(request.slot, second_slot))
+    frontier = CrossViewFrontier(plan)
+    duplicate = replace(_prepared_primary(request), slot=second_slot)
+
+    with pytest.raises(InternalError, match="out of order"):
+        frontier.check_primary(duplicate)
+
+    first_delta = frontier.check_primary(_prepared_primary(request))
+    frontier.commit(first_delta)
+    with pytest.raises(GenerationProjectionMismatch, match="committed CrossView"):
+        frontier.check_primary(duplicate)
+
+    assert frontier._next_ordinal == 1
+    assert frontier._event_ids == set(first_delta.event_ids)
+    assert frontier._timestamps_us == set(first_delta.timestamps_us)
+    assert frontier._source_keys == set(first_delta.source_keys)
+
+
+def test_frontier_rejects_malformed_or_invalid_primary_facts(projected_set):
+    """frontier 对绕过 local gate 的坏 carrier 仍 fail closed，且不推进状态。"""
+    request = _primary_candidate_request(projected_set)
+    prepared = _prepared_primary(request)
+    sequence = prepared.sequences[0]
+
+    malformed = replace(prepared, sequences=(replace(sequence, main_row={}),))
+    with pytest.raises(GenerationProjectionMismatch, match="frontier facts are malformed"):
+        CrossViewFrontier(request.plan).check_primary(malformed)
+
+    rows = _thaw(sequence.primary_stream_rows)
+    rows[0]["_meta"]["event"]["event_id"] = "invalid"
+    invalid_id = replace(
+        prepared,
+        sequences=(replace(sequence, primary_stream_rows=tuple(rows)),),
+    )
+    with pytest.raises(GenerationProjectionMismatch, match="event ID is invalid"):
+        CrossViewFrontier(request.plan).check_primary(invalid_id)
+
+    replay = prepared.replays[0]
+    replay_rows = _thaw(replay.rows)
+    for row in replay_rows:
+        row["_meta"]["event"]["replay_sequence_id"] = "invalid"
+    invalid_replay = replace(prepared, replays=(replace(replay, rows=tuple(replay_rows)),))
+    with pytest.raises(GenerationProjectionMismatch, match="replay frontier source"):
+        CrossViewFrontier(request.plan).check_primary(invalid_replay)
+
+
+def test_frontier_rejects_malformed_or_invalid_noise_facts(projected_set):
+    """noise frontier 对缺失行结构和伪造 source identity 都不正式突变。"""
+    primary = _primary_candidate_request(projected_set)
+    frontier = CrossViewFrontier(primary.plan)
+    frontier.commit(frontier.check_primary(_prepared_primary(primary)))
+    noise = _prepared_noise(_noise_candidate_request(projected_set))
+
+    with pytest.raises(GenerationProjectionMismatch, match="frontier facts are malformed"):
+        frontier.check_noise(replace(noise, row={}))
+
+    row = _thaw(noise.row)
+    row["_meta"]["event"]["event_key"] = "invalid"
+    with pytest.raises(GenerationProjectionMismatch, match="noise frontier source"):
+        frontier.check_noise(replace(noise, row=row))
+
+    assert frontier._next_ordinal == 0
+
+
+@pytest.mark.parametrize(("mutation", "message"), (
+    ("duplicate", "unchecked conflicting delta"),
+    ("empty", "unchecked conflicting delta"),
+    ("invalid_id", "unchecked invalid event ID"),
+    ("phase", "out of order"),
+))
+def test_frontier_commit_rejects_a_forged_unchecked_delta(
+    projected_set,
+    mutation,
+    message,
+):
+    """只有 check 产生的闭合当前 delta 可进入无 await commit 路径。"""
+    request = _primary_candidate_request(projected_set)
+    frontier = CrossViewFrontier(request.plan)
+    checked = frontier.check_primary(_prepared_primary(request))
+    changes = {
+        "duplicate": {"event_ids": (*checked.event_ids, checked.event_ids[0])},
+        "empty": {"event_ids": (), "timestamps_us": (), "source_keys": ()},
+        "invalid_id": {"event_ids": ("invalid", *checked.event_ids[1:])},
+        "phase": {"phase": "noise"},
+    }
+    forged = replace(checked, **changes[mutation])
+
+    with pytest.raises(InternalError, match=message):
+        frontier.commit(forged)
+
+    assert frontier._next_ordinal == 0
+    assert frontier._event_ids == set()
 
 
 @pytest.mark.parametrize("delta", (-1, 1))
 def test_reconcile_recomputes_sequence_and_total_retained_bytes(projected_set, delta):
-    """同步篡改 sequence 字段与 prospective 总数仍由 canonical rows 杀死。"""
+    """同步篡改 sequence 字段与候选总数仍由 canonical rows 杀死。"""
     program, plan, projection, sequence, noise, replay = projected_set
     request = _request(program, plan, projection, sequence, noise, replay)
     tampered = replace(
@@ -496,7 +785,7 @@ def test_reconcile_recomputes_sequence_and_total_retained_bytes(projected_set, d
         retained_content_bytes=sequence.retained_content_bytes + delta,
     )
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(replace(
+        _reconcile_candidate_bundle(replace(
             request,
             sequences=(tampered,),
             retained_content_bytes=request.retained_content_bytes + delta,
@@ -505,7 +794,7 @@ def test_reconcile_recomputes_sequence_and_total_retained_bytes(projected_set, d
 
 @pytest.mark.parametrize("delta", (-1, 1))
 def test_reconcile_recomputes_replay_and_total_retained_bytes(projected_set, delta):
-    """同步篡改 replay 字段与 prospective 总数仍由分组 canonical rows 杀死。"""
+    """同步篡改 replay 字段与候选总数仍由分组 canonical rows 杀死。"""
     program, plan, projection, sequence, noise, replay = projected_set
     request = _request(program, plan, projection, sequence, noise, replay)
     tampered = replace(
@@ -513,7 +802,7 @@ def test_reconcile_recomputes_replay_and_total_retained_bytes(projected_set, del
         retained_content_bytes=replay.retained_content_bytes + delta,
     )
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(replace(
+        _reconcile_candidate_bundle(replace(
             request,
             replays=(tampered,),
             retained_content_bytes=request.retained_content_bytes + delta,
@@ -525,7 +814,7 @@ def test_reconcile_recomputes_noise_and_global_retained_total(projected_set):
     program, plan, projection, sequence, noise, replay = projected_set
     request = _request(program, plan, projection, sequence, noise, replay)
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(replace(
+        _reconcile_candidate_bundle(replace(
             request, retained_content_bytes=request.retained_content_bytes + 1
         ))
 
@@ -1376,7 +1665,7 @@ def test_reconcile_rejects_primary_top_level_contract_tamper(projected_set, muta
     retained = sum(_independent_row_bytes(row) for row in (main, *rows))
     tampered = SequenceRows(main, tuple(rows), retained)
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(_primary_only_request(
+        _reconcile_candidate_bundle(_primary_only_request(
             program, plan, projection, tampered
         ))
 
@@ -1387,7 +1676,7 @@ def test_reconcile_rejects_noise_top_level_contract_tamper(projected_set, mutati
     program, plan, projection, sequence, noise, replay = projected_set
     changed = _tamper_stream_top(noise, mutation)
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(_request(
+        _reconcile_candidate_bundle(_request(
             program, plan, projection, sequence, changed, replay
         ))
 
@@ -1400,7 +1689,7 @@ def test_reconcile_rejects_replay_top_level_contract_tamper(projected_set, mutat
     rows[0] = _tamper_stream_top(rows[0], mutation)
     changed = ReplayRows(tuple(rows), sum(_independent_row_bytes(row) for row in rows))
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(_request(
+        _reconcile_candidate_bundle(_request(
             program, plan, projection, sequence, noise, changed
         ))
 
@@ -1417,7 +1706,7 @@ def test_reconcile_rejects_main_metadata_contract_tamper(projected_set, mutation
     retained = sum(_independent_row_bytes(row) for row in (main, *rows))
     tampered = SequenceRows(main, tuple(rows), retained)
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(_primary_only_request(
+        _reconcile_candidate_bundle(_primary_only_request(
             program, plan, projection, tampered
         ))
 
@@ -1473,7 +1762,7 @@ def test_reconcile_rejects_each_primary_identity_tamper(projected_set, field, va
     rows[0]["_meta"]["event"][field] = value
     tampered = SequenceRows(main, tuple(rows), 0)
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(_primary_only_request(program, plan, projection, tampered))
+        _reconcile_candidate_bundle(_primary_only_request(program, plan, projection, tampered))
 
 
 def test_reconcile_rejects_primary_actor_tamper_against_replay_source(projected_set):
@@ -1482,7 +1771,7 @@ def test_reconcile_rejects_primary_actor_tamper_against_replay_source(projected_
     rows[0]["_meta"]["event"]["actor"] = "system"
     tampered = SequenceRows(main, tuple(rows), 0)
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(_request(program, plan, projection, tampered, noise, replay))
+        _reconcile_candidate_bundle(_request(program, plan, projection, tampered, noise, replay))
 
 
 def test_reconcile_rejects_payload_main_members_and_generation_tamper(projected_set):
@@ -1508,7 +1797,7 @@ def test_reconcile_rejects_payload_main_members_and_generation_tamper(projected_
     mutations.append(SequenceRows(main, tuple(rows), 0))
     for tampered in mutations:
         with pytest.raises(GenerationProjectionMismatch):
-            reconcile_prospective_views(
+            _reconcile_candidate_bundle(
                 _primary_only_request(program, plan, projection, tampered)
             )
 
@@ -1535,7 +1824,7 @@ def test_reconcile_rejects_synchronized_primary_payload_and_id_rewrite(projected
     for index, member in enumerate(stream["members"]):
         member["id"] = event_ids[index]
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(_primary_only_request(
+        _reconcile_candidate_bundle(_primary_only_request(
             program, plan, projection, SequenceRows(main, tuple(rows), 0)
         ))
 
@@ -1558,7 +1847,7 @@ def test_reconcile_closes_member_sources_classification_and_annotation(projected
     mutations.append(SequenceRows(main, tuple(rows), 0))
     for tampered in mutations:
         with pytest.raises(GenerationProjectionMismatch):
-            reconcile_prospective_views(
+            _reconcile_candidate_bundle(
                 _primary_only_request(program, plan, projection, tampered)
             )
 
@@ -1570,7 +1859,7 @@ def test_reconcile_closes_member_sources_classification_and_annotation(projected
     retained = sum(
         len(canonical_delivery_row(row)) + 1 for row in (main, *final_rows)
     )
-    reconcile_prospective_views(_primary_only_request(
+    _reconcile_candidate_bundle(_primary_only_request(
         program, plan, projection, SequenceRows(main, final_rows, retained)
     ))
 
@@ -1582,7 +1871,7 @@ def test_reconcile_requires_exact_planned_main_session(projected_set, session_id
     main["_meta"]["stream"]["session_id"] = session_id
     tampered = SequenceRows(main, sequence.primary_stream_rows, 0)
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(_primary_only_request(
+        _reconcile_candidate_bundle(_primary_only_request(
             program, plan, projection, tampered
         ))
 
@@ -1606,7 +1895,7 @@ def test_reconcile_rejects_each_replay_identity_tamper(projected_set, field, val
     rows[0]["_meta"]["event"][field] = value
     with pytest.raises(GenerationProjectionMismatch):
         request = _request(program, plan, projection, sequence, noise, replay)
-        reconcile_prospective_views(replace(
+        _reconcile_candidate_bundle(replace(
             request, replays=(replace(replay, rows=tuple(rows)),)
         ))
 
@@ -1626,7 +1915,7 @@ def test_reconcile_rejects_replay_payload_generation_and_extra_field(projected_s
     for rows in mutations:
         with pytest.raises(GenerationProjectionMismatch):
             request = _request(program, plan, projection, sequence, noise, replay)
-            reconcile_prospective_views(replace(
+            _reconcile_candidate_bundle(replace(
                 request, replays=(replace(replay, rows=tuple(rows)),)
             ))
 
@@ -1641,7 +1930,7 @@ def test_reconcile_rejects_equivalent_replay_instant_with_wrong_offset(projected
     ).isoformat(timespec="microseconds")
     request = _request(program, plan, projection, sequence, noise, replay)
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(replace(
+        _reconcile_candidate_bundle(replace(
             request, replays=(replace(replay, rows=tuple(rows)),)
         ))
 
@@ -1660,7 +1949,7 @@ def test_reconcile_rejects_each_noise_identity_tamper(projected_set, field, valu
     row = _thaw(noise)
     row["_meta"]["event"][field] = value
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(
+        _reconcile_candidate_bundle(
             _request(program, plan, projection, sequence, row, replay)
         )
 
@@ -1676,7 +1965,7 @@ def test_reconcile_rejects_noise_generation_and_extra_branch_truth(projected_set
     rows.append(row)
     for row in rows:
         with pytest.raises(GenerationProjectionMismatch):
-            reconcile_prospective_views(
+            _reconcile_candidate_bundle(
                 _request(program, plan, projection, sequence, row, replay)
             )
 
@@ -1692,7 +1981,7 @@ def test_reconcile_rejects_synchronized_noise_payload_id_and_offset_rewrite(proj
         "noise_event_id", ["a" * 32, slot.event_key, slot.timestamp_us, row["payload"]]
     )
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(replace(request, noise_rows=(row,)))
+        _reconcile_candidate_bundle(replace(request, noise_rows=(row,)))
 
     row = _thaw(noise)
     timestamp = row["_meta"]["event"]["timestamp"]
@@ -1700,7 +1989,7 @@ def test_reconcile_rejects_synchronized_noise_payload_id_and_offset_rewrite(proj
         timezone.utc
     ).isoformat(timespec="microseconds")
     with pytest.raises(GenerationProjectionMismatch):
-        reconcile_prospective_views(replace(request, noise_rows=(row,)))
+        _reconcile_candidate_bundle(replace(request, noise_rows=(row,)))
 
 
 def test_projection_contract_errors_are_terminal_not_reconcile_rejections(projected_set):
@@ -2001,63 +2290,3 @@ print(len(items), rss_bytes)
     count, rss_bytes = (int(value) for value in result.stdout.split())
     assert count == 500000
     assert rss_bytes < _RSS_LIMIT_BYTES
-
-
-def test_retained_gate_accepts_exact_512_mib_and_rejects_one_utf8_byte(monkeypatch):
-    """真实 prospective gate 接受上限，并把单个 ASCII UTF-8 byte 视为越界。"""
-    controller, metrics, dedup, _emitter = _limit_controller(0)
-    reconciled = []
-    monkeypatch.setattr(
-        controller,
-        "_reconcile",
-        lambda *args, **kwargs: reconciled.append((args, kwargs)),
-    )
-    controller._prospective_sequence((), (), (), _RETAINED_CAP)
-    assert len("a".encode("utf-8")) == 1
-    with pytest.raises(GenerationAttemptRejected) as caught:
-        controller._prospective_sequence((), (), (), _RETAINED_CAP + 1)
-    assert caught.value.kind == "sequence_memory_budget"
-    assert len(reconciled) == 2
-    assert metrics.merged == [] and dedup.commits == []
-    assert controller.state.retained_bytes == 0
-
-
-async def test_replay_plus_one_rejects_source_before_every_commit(monkeypatch):
-    """source 单独未超限时，planned replay 的 +1 在 group commit 前拒绝整个 slot。"""
-    controller, metrics, dedup, emitter = _limit_controller(_RETAINED_CAP - 1)
-    calls = _wire_limit_attempt(monkeypatch, controller, 2)
-    reconciled = []
-    monkeypatch.setattr(controller, "_reconcile", lambda *args: reconciled.append(args))
-    slot = SimpleNamespace(slot_key="source/000000", scenario_index=0)
-    with pytest.raises(DeliveryError, match="sequence_delivery_exhausted"):
-        await controller._accept_sequence_slot(slot, 1)
-
-    assert calls == ["generate", "dedup_probe", "downstream", "replay"]
-    assert emitter.calls == 1
-    assert controller.state.rejected["sequence_memory_budget"] == 1
-    assert controller.state.sequences == []
-    assert controller.state.replays == [] and controller.state.sources == {}
-    assert controller.state.retained_bytes == 0
-    assert dedup.commits == [] and metrics.merged == []
-    assert len(reconciled) == 1
-
-
-async def test_source_and_replay_at_exact_cap_commit_together(monkeypatch):
-    """source 加 planned replay 恰为 512 MiB 时，接受后只在显式临界区共同提交。"""
-    controller, metrics, dedup, emitter = _limit_controller(_RETAINED_CAP - 1)
-    calls = _wire_limit_attempt(monkeypatch, controller, 1)
-    monkeypatch.setattr(controller, "_reconcile", lambda *_args, **_kwargs: None)
-    slot = SimpleNamespace(slot_key="source/000000", scenario_index=0)
-    accepted = await controller._accept_sequence_slot(slot, 1)
-
-    assert accepted.retained_bytes == _RETAINED_CAP
-    assert calls == ["generate", "dedup_probe", "downstream", "replay"]
-    assert emitter.calls == 1
-    assert dedup.commits == [] and metrics.merged == []
-    assert controller.state.replays == [] and controller.state.retained_bytes == 0
-
-    controller._commit_sequence_attempt(accepted)
-    assert dedup.commits == ["dedup-token"]
-    assert metrics.merged == [{"generated": 1}]
-    assert controller.state.replays == [ReplayRows(({"replay": True},), 1)]
-    assert controller.state.retained_bytes == _RETAINED_CAP

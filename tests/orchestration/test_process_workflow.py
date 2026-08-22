@@ -1,4 +1,4 @@
-"""M10 orchestrator offline tests (CONTRACTS.md §7.9, spec 3.10).
+"""M10 process_workflow offline tests (CONTRACTS.md §7.9, spec 3.10).
 
 No mock LLMs anywhere. The stages used here are tiny REAL Stage
 implementations of pure logic (exact-text dedup, deterministic failure,
@@ -34,13 +34,15 @@ from labelkit.common.config.model import (
     TraceConfig, VerifyConfig,
 )
 from labelkit.common.errors import CircuitBreakerTripped, InternalError
-from labelkit.common.runtime import budget
+from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
+from labelkit.common.inference import budget
 from labelkit.common.observability.obslog import EventLog, MetricsSink, TraceEvent
-from labelkit.common.runtime.llm_client import LLMClient
-from labelkit.orchestration.orchestrator import (
-    Orchestrator, RunServices, RunSummary, estimate_run,
+from labelkit.common.inference.llm_client import LLMClient
+from labelkit.orchestration.process_workflow import (
+    ProcessWorkflow, RunServices, RunSummary, estimate_run,
 )
-from labelkit.orchestration.runtime import execute_run, validate_project
+from labelkit.orchestration.application import execute_run, validate_project
+from labelkit.runtime import ExecutionRuntime, ResourceManager
 from labelkit.common.contracts.types import (
     Classification, DedupInfo, PipelineItem, QualityScore, Record, RecordRef,
     StageError,
@@ -184,6 +186,12 @@ class FakeMetrics:
         self.run_estimates: list[dict] = []             # v1.10 (U17/U19/U20)
         self.stop_requests = 0                          # v1.10 (U19)
         self.has_listener = listener                    # v1.10 (U13 dry-run gate)
+        self._runtime_report = {
+            "queue_high_water": 0, "running_high_water": 0,
+            "resource_wait_high_water": 0, "commit_waiting_high_water": 0,
+            "candidate_bytes_high_water": 0, "cancelled_tasks": 0,
+            "resource_wait_ms": 0, "http_pool_wait_ms": 0, "commit_ms": 0,
+        }
 
     def event(self, ev, *, stage, batch_no, record_ids=(), payload=None):
         self.events.append((ev, stage, batch_no, tuple(record_ids), dict(payload or {})))
@@ -214,6 +222,17 @@ class FakeMetrics:
     @property
     def circuit_broken(self):
         return self._fatal_streak >= self._threshold
+
+    @property
+    def runtime_report(self):
+        return dict(self._runtime_report)
+
+    def observe_runtime_high_water(self, key, value):
+        report_key = f"{key}_high_water"
+        self._runtime_report[report_key] = max(self._runtime_report[report_key], value)
+
+    def add_runtime_total(self, key, value):
+        self._runtime_report[key] += value
 
     def flush(self):
         self.flushes += 1
@@ -596,11 +615,60 @@ class BreakerStage:
         return batch
 
 
+class RuntimeBreakerStage:
+    """第二批从真实 TaskExecutor 叶任务抛出熔断控制信号。"""
+
+    name = "annotate"
+    key = ("llm", "breaker")
+
+    def __init__(self):
+        self.cleaned = asyncio.Event()
+        self.breaker = CircuitBreakerTripped("fatal-error threshold reached")
+
+    async def run(self, batch, ctx):
+        if ctx.batch_no == 1:
+            return batch
+        ready = asyncio.Event()
+        started = 0
+
+        async def mark_started():
+            nonlocal started
+            started += 1
+            if started == 2:
+                ready.set()
+            await ready.wait()
+
+        async def trip():
+            await mark_started()
+            raise self.breaker
+
+        async def blocker():
+            await mark_started()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cleaned.set()
+
+        await ctx.tasks.run_group(TaskGroupRequest(tasks=(
+            TaskSpec("run:breaker:trip", (ctx.batch_no, 0), self.name, self.key, trip),
+            TaskSpec("run:breaker:blocker", (ctx.batch_no, 1), self.name, self.key, blocker),
+        )))
+        return batch
+
+
 # ── wiring helper ───────────────────────────────────────────────────────────
+
+class InlineTaskExecutor:
+    """Executes test leaf plans inline in request order."""
+
+    async def run_group(self, request):
+        return tuple([await task.operation() for task in request.tasks])
+
 
 def services(metrics, llm=None, schema_engine=None):
     """收拢编排器构造的运行期服务参数对象（生产侧 RunServices 的测试口径）。"""
     return RunServices(llm=llm, schema_engine=schema_engine, metrics=metrics,
+                       tasks=InlineTaskExecutor(),
                        run_id=RUN_ID, run_started_at=datetime.now().astimezone())
 
 
@@ -609,7 +677,7 @@ def build(cfg, stages, records=None, *, ingestor=None, llm=None, schema_engine=N
     emitter = FakeEmitter(cfg)
     if ingestor is None and cfg.run.mode == "process":
         ingestor = FakeIngestor(records or [])
-    orch = Orchestrator(cfg, stages, ingestor, emitter,
+    orch = ProcessWorkflow(cfg, stages, ingestor, emitter,
                         services(metrics, llm, schema_engine))
     return orch, metrics, emitter, ingestor
 
@@ -733,7 +801,7 @@ async def test_generate_reflow_single_round(tmp_path):
     gen = PureGenerateStage(per_batch=3)
     orch, metrics, emitter, _ = build(cfg, [dedup, quality, gen],
                                       [rec(i) for i in range(1, 9)])
-    summary = await orch.run()
+    summary = await asyncio.wait_for(orch.run(), timeout=5)
 
     # generate ran once per MAIN batch only — never on re-flow sub-batches.
     assert gen.run_batch_nos == [1, 3]
@@ -971,6 +1039,30 @@ async def test_circuit_breaker_exit_4_partial_delivery(tmp_path):
     assert run_end[0] == "run.end" and run_end[4]["exit_code"] == 4
 
 
+async def test_runtime_leaf_breaker_finalizes_partial_delivery_after_cleanup(tmp_path):
+    cfg = make_cfg(tmp_path, batch_size=4, annotate=True)
+    stage = RuntimeBreakerStage()
+    orch, metrics, emitter, _ = build(cfg, [stage], [rec(i) for i in range(1, 11)])
+    resources = ResourceManager(
+        {stage.key: 2},
+        {stage.key: ("https", "breaker.example", 443)},
+        metrics,
+    )
+    runtime = ExecutionRuntime(resources, metrics)
+    orch.tasks = runtime
+
+    summary = await runtime.run(orch.run)
+
+    assert summary.exit_code == 4
+    assert summary.output_lines == 4
+    assert stage.cleaned.is_set()
+    assert emitter.deliver is True
+    assert emitter.output.exists() and len(emitter.output.read_text().splitlines()) == 4
+    assert emitter.report["run"]["circuit_broken"] is True
+    assert emitter.report["run"]["partial_delivery"] is True
+    assert emitter.report_path.exists()
+
+
 async def test_clean_run_report_has_no_partial_delivery_fields(tmp_path):
     """partial_delivery / counts.unprocessed are 只增 fields present ONLY on
     breaker-trip runs (spec 6.4) — healthy runs keep the v1.5 report shape."""
@@ -1052,7 +1144,7 @@ async def test_dry_run_trace_enabled_message_and_lifecycle_events(tmp_path, caps
     metrics = MetricsSink(cfg, RUN_ID, event_log)
     emitter = FakeEmitter(cfg)
     ingestor = FakeIngestor([rec(1)])
-    orch = Orchestrator(cfg, [], ingestor, emitter, services(metrics))
+    orch = ProcessWorkflow(cfg, [], ingestor, emitter, services(metrics))
     summary = await orch.run()
     event_log.close()
 
@@ -1173,7 +1265,7 @@ async def test_report_shape_and_llm_usage(tmp_path):
 async def test_report_trace_events_counts_run_end(tmp_path):
     """report.trace must describe the FINAL trace file: the terminal run.end
     line is written only after the report is assembled (§8.1 — run.end is the
-    trace's last line, after finalize), so the orchestrator pre-counts it."""
+    trace's last line, after finalize), so the process_workflow pre-counts it."""
     trace_path = tmp_path / "t.trace.jsonl"
     cfg = make_cfg(tmp_path, batch_size=4,
                    trace=TraceConfig(enabled=True, path=str(trace_path)))
@@ -1181,7 +1273,7 @@ async def test_report_trace_events_counts_run_end(tmp_path):
     metrics = MetricsSink(cfg, RUN_ID, event_log)
     emitter = FakeEmitter(cfg)
     ingestor = FakeIngestor([rec(1), rec(2)])
-    orch = Orchestrator(cfg, [ExactDedupStage()], ingestor, emitter,
+    orch = ProcessWorkflow(cfg, [ExactDedupStage()], ingestor, emitter,
                         services(metrics))
     summary = await orch.run()
     event_log.close()
@@ -1211,7 +1303,7 @@ async def test_report_trace_run_end_counted_dropped_when_channel_closed(tmp_path
     metrics = MetricsSink(cfg, RUN_ID, event_log)
     emitter = FakeEmitter(cfg)
     ingestor = FakeIngestor([rec(1), rec(2)])
-    orch = Orchestrator(cfg, [ExactDedupStage()], ingestor, emitter,
+    orch = ProcessWorkflow(cfg, [ExactDedupStage()], ingestor, emitter,
                         services(metrics))
     await orch.run()
 
@@ -1795,7 +1887,7 @@ async def test_stream_oversized_session_hard_split_and_marks(tmp_path, caplog):
     cfg = stream_cfg(tmp_path, batch_size=8)
     probe = SplitProbe()
     ingestor = FakeSessionIngestor([sess("s1", 1, 10), sess("s2", 21, 9)])
-    with caplog.at_level(logging.WARNING, logger=".".join(("labelkit", "orchestrator"))):
+    with caplog.at_level(logging.WARNING, logger=".".join(("labelkit", "process_workflow"))):
         orch, _, emitter, _ = build(cfg, [probe], ingestor=ingestor)
         summary = await orch.run()
 
@@ -2263,6 +2355,26 @@ async def test_chain_frame_only_or_gate_includes_classify_slot(tmp_path):
     assert order == ["segment", "dedup"]        # 帧全关 ⇒ classify 槽位仍被排除
 
 
+async def test_chain_frame_only_or_gate_includes_annotate_slot(tmp_path):
+    """序列级标注关闭但帧标注开启时，普通 stream 链仍执行 annotate 槽位。"""
+    order: list[str] = []
+    base = stream_cfg(tmp_path, batch_size=8)
+    assert not base.annotate.enabled
+    cfg = replace(base, frame_annotate=frame_annotate_cfg())
+    stages = [Probe(n, order) for n in ("annotate", "dedup", "segment")]
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
+    orch, _, _, _ = build(cfg, stages, ingestor=ingestor)
+    await orch.run()
+    assert order == ["segment", "dedup", "annotate"]
+
+    order.clear()
+    stages = [Probe(n, order) for n in ("annotate", "dedup", "segment")]
+    ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
+    orch, _, _, _ = build(base, stages, ingestor=ingestor)
+    await orch.run()
+    assert order == ["segment", "dedup"]
+
+
 async def test_stitched_tally_threads_derivation_and_report_block(tmp_path):
     """T7/T16: counts.stitched from the post-emit tally; counts.threads =
     episodes − stitched (single-point derivation); the failed fallback formula
@@ -2511,7 +2623,7 @@ def test_estimate_run_quality_calls_scale_with_both_orders_and_criteria_per_call
     `criteria_per_call = "all"`（默认）| `"single"` 可切回原文行为——逐 criterion
     一次调用）与「双顺序裁决」行（正反两序各为一次独立裁决，成本 ×2；多评审团下
     每 judge 各判两次）：pairwise 估算 = Σ_批 rounds×⌊b/2⌋ × per_call × judges ×
-    orders（实现 spec 3.10.3 dry-run 估算，orchestrator._estimate_quality_calls）。
+    orders（实现 spec 3.10.3 dry-run 估算，process_workflow._estimate_quality_calls）。
 
     口径（与运行期侧 tests/operators/test_quality.py 的实测调用数交叉对齐）：
     比较基数按 spec 3.10.3「全部估算假定零丢弃（上界）且不含重试与修复调用」取
@@ -2732,7 +2844,7 @@ async def test_dry_run_rich_with_listener_suppresses_prints_emits_estimate(
     metrics = FakeMetrics(listener=True)
     emitter = FakeEmitter(cfg)
     ingestor = FakeIngestor([rec(i) for i in range(1, 4)])
-    orch = Orchestrator(cfg, [], ingestor, emitter, services(metrics))
+    orch = ProcessWorkflow(cfg, [], ingestor, emitter, services(metrics))
     summary = await orch.run()
 
     assert summary.exit_code == 0
@@ -2763,7 +2875,7 @@ async def test_dry_run_plain_with_listener_prints_byte_identical(tmp_path, capsy
     metrics = FakeMetrics(listener=True)
     emitter = FakeEmitter(cfg)
     ingestor = FakeIngestor([rec(i) for i in range(1, 4)])
-    orch = Orchestrator(cfg, [], ingestor, emitter, services(metrics))
+    orch = ProcessWorkflow(cfg, [], ingestor, emitter, services(metrics))
     await orch.run()
     lines = [line for line in capsys.readouterr().err.splitlines()
              if line.startswith("dry-run")]
@@ -2816,7 +2928,7 @@ async def test_stage_begin_forwards_on_stage_before_stage_effects(tmp_path):
     metrics = MetricsSink(cfg, RUN_ID, event_log, listener=listener)
     emitter = FakeEmitter(cfg)
     ingestor = FakeIngestor([rec(1), rec(2)])
-    orch = Orchestrator(cfg, [EmittingDedup()], ingestor, emitter,
+    orch = ProcessWorkflow(cfg, [EmittingDedup()], ingestor, emitter,
                         services(metrics))
     summary = await orch.run()
     event_log.close()
@@ -3221,7 +3333,8 @@ async def test_report_budget_node_shape_per_contracts(tmp_path):
     assert b["degrade_retries"] == 1
     assert b["escalations"] == 0
     keys = list(emitter.report)
-    assert keys.index("budget") == keys.index("trace") - 1
+    assert keys.index("budget") == keys.index("runtime") - 1
+    assert keys.index("runtime") == keys.index("trace") - 1
     # M14 内部 segment.windows 仍计数，但不再作为旧 report key 发射。
     stream = emitter.report["stream"]
     assert "windows" not in stream
@@ -3291,7 +3404,7 @@ async def test_report_budget_profiles_include_referenced_embedding(
                   dedup=DedupConfig(enabled=True, semantic=True,
                                     semantic_embedding="emb"))
     orch, _, emitter, _ = build(cfg, [ExactDedupStage()], [rec(1)])
-    with caplog.at_level(logging.INFO, logger="labelkit.orchestrator"):
+    with caplog.at_level(logging.INFO, logger="labelkit.process_workflow"):
         await orch.run()
     b = emitter.report["budget"]
     # margin(8192) = 820 → embed budget 7372 (V15)
@@ -3309,7 +3422,7 @@ async def test_startup_budget_info_lines_and_gating(tmp_path, caplog):
     `segment: w_min=… window=… (budget)` line when the segment profile is
     budgeted; budget-off and --dry-run runs log NEITHER (v1.10/golden
     byte-equivalence)."""
-    logger = "labelkit.orchestrator"
+    logger = "labelkit.process_workflow"
 
     cfg = budget_stream_cfg(tmp_path, 5600, batch_size=8, annotate=True)
     ingestor = FakeSessionIngestor([sess("s1", 1, 2)])
@@ -3353,7 +3466,7 @@ async def test_startup_budget_info_lines_and_gating(tmp_path, caplog):
                    for m in (r.getMessage() for r in caplog.records))
 
 
-def _sequence_orchestrator(monkeypatch, *, poison_seed: bool = False):
+def _sequence_process_workflow(monkeypatch, *, poison_seed: bool = False):
     """经真实 M1/compiler/planner 构造不接触端点与文件的 sequence M10。"""
     from labelkit.cli.parser import CliOverrides
     from labelkit.common.config import load
@@ -3382,65 +3495,66 @@ def _sequence_orchestrator(monkeypatch, *, poison_seed: bool = False):
         llm=SimpleNamespace(usage_by_profile={}),
         schema_engine=SimpleNamespace(stats={}),
         metrics=metrics,
+        tasks=InlineTaskExecutor(),
         run_id=run_id,
         run_started_at=datetime.now().astimezone(),
     )
-    orchestrator = Orchestrator(cfg, stages, None, emitter, runtime_services)
-    orchestrator._bind_sequence_plan(program, plan)
-    orchestrator._t0 = 0.0
-    return orchestrator, metrics, program, plan
+    process_workflow = ProcessWorkflow(cfg, stages, None, emitter, runtime_services)
+    process_workflow._bind_sequence_plan(program, plan)
+    process_workflow._t0 = 0.0
+    return process_workflow, metrics, program, plan
 
 
 def test_sequence_run_identity_uses_program_seed_after_config_mutation(monkeypatch):
     """runtime 与 M10 request 的 run 身份只绑定编译期 planner seed。"""
-    orchestrator, _metrics, program, plan = _sequence_orchestrator(
+    process_workflow, _metrics, program, plan = _sequence_process_workflow(
         monkeypatch, poison_seed=True,
     )
     from labelkit.operators.generation.project import derive_generation_id
-    from labelkit.orchestration.runtime import _runtime_run_id
+    from labelkit.orchestration.application import _runtime_run_id
 
     attempt_id = derive_generation_id(
         "run_attempt_id", [program.digest, program.planner_seed]
     )
     expected = derive_generation_id("run_id", [attempt_id, plan.digest])
-    request = orchestrator._sequence_request()
-    assert orchestrator.cfg.run.seed != program.planner_seed
+    request = process_workflow._sequence_request()
+    assert process_workflow.cfg.run.seed != program.planner_seed
     assert request.run_attempt_id == attempt_id and request.run_id == expected
-    assert _runtime_run_id(orchestrator.cfg, (program, plan)) == expected
+    assert _runtime_run_id(process_workflow.cfg, (program, plan)) == expected
 
 
 def test_generation_contract_error_logs_before_raising(caplog):
     """序列编排契约错误必须先留英文错误日志。"""
-    from labelkit.orchestration import orchestrator as orchestrator_module
+    from labelkit.orchestration import process_workflow as process_workflow_module
 
     message = "generation_downstream_contract: test failure"
-    with caplog.at_level(logging.ERROR, logger="labelkit.orchestrator"):
+    with caplog.at_level(logging.ERROR, logger="labelkit.process_workflow"):
         with pytest.raises(InternalError, match="test failure"):
-            orchestrator_module._generation_contract_error(message)
+            process_workflow_module._generation_contract_error(message)
     assert [record.getMessage() for record in caplog.records] == [message]
 
 
-async def test_sequence_orchestrator_builds_services_and_returns_committed_summary(
+async def test_sequence_process_workflow_builds_services_and_returns_committed_summary(
         monkeypatch):
     """M10 sequence 薄入口绑定同一计划、服务根，并从已提交产品返回摘要。"""
-    orchestrator, metrics, program, plan = _sequence_orchestrator(monkeypatch)
-    from labelkit.orchestration import generation_delivery
+    process_workflow, metrics, program, plan = _sequence_process_workflow(monkeypatch)
+    from labelkit.orchestration import sequence_workflow
 
     async def delivered(request, delivery_services):
         assert request.program is program and request.plan is plan
         assert delivery_services.generation.metrics is metrics
-        assert delivery_services.dedup is orchestrator.stages[0].index
+        assert delivery_services.dedup is process_workflow.stages[0].index
         return SimpleNamespace(
             main_rows=tuple({"row": index} for index in range(8)),
             report={"counts": {"generated": 8, "emitted": 8}},
         )
 
-    monkeypatch.setattr(generation_delivery, "deliver_generation", delivered)
-    summary = await orchestrator._run_sequence()
+    monkeypatch.setattr(sequence_workflow, "deliver_generation", delivered)
+    summary = await process_workflow._run_sequence()
 
     assert summary.exit_code == 0 and summary.output_lines == 8
     assert summary.counts == {"generated": 8, "emitted": 8}
-    assert orchestrator._current_task is None
+    assert process_workflow._current_task is None
     assert metrics.events[-1][-1] == {
         "counts": {"generated": 8, "emitted": 8}, "exit_code": 0,
     }
@@ -3451,13 +3565,13 @@ async def test_sequence_orchestrator_builds_services_and_returns_committed_summa
     pytest.param("delivery", 1, id="delivery-exhausted"),
     pytest.param("provider", 4, id="provider-fatal"),
 ))
-async def test_sequence_orchestrator_emits_terminal_before_propagating_failure(
+async def test_sequence_process_workflow_emits_terminal_before_propagating_failure(
         monkeypatch, failure, exit_code):
     """交付耗尽与 fatal 均原样上抛，但先发对应运行终态且零成功计数。"""
     from labelkit.common.errors import DeliveryError, ProviderFatalError
-    from labelkit.orchestration import generation_delivery
+    from labelkit.orchestration import sequence_workflow
 
-    orchestrator, metrics, _program, _plan = _sequence_orchestrator(monkeypatch)
+    process_workflow, metrics, _program, _plan = _sequence_process_workflow(monkeypatch)
     error = (
         DeliveryError("sequence_delivery_exhausted", "slot", 2)
         if failure == "delivery"
@@ -3467,27 +3581,27 @@ async def test_sequence_orchestrator_emits_terminal_before_propagating_failure(
     async def failed(request, delivery_services):
         raise error
 
-    monkeypatch.setattr(generation_delivery, "deliver_generation", failed)
+    monkeypatch.setattr(sequence_workflow, "deliver_generation", failed)
     with pytest.raises(type(error)) as caught:
-        await orchestrator._run_sequence()
+        await process_workflow._run_sequence()
     assert caught.value is error
     assert metrics.events[-1][-1] == {"counts": {}, "exit_code": exit_code}
     assert metrics.flushes == 1
-    assert orchestrator._current_task is None
+    assert process_workflow._current_task is None
 
 
-async def test_sequence_orchestrator_signal_cancellation_has_no_partial_summary(monkeypatch):
+async def test_sequence_process_workflow_signal_cancellation_has_no_partial_summary(monkeypatch):
     """仅本进程 signal 取消转为 interrupted exit 4，且不报告任何部分交付。"""
-    from labelkit.orchestration import generation_delivery
+    from labelkit.orchestration import sequence_workflow
 
-    orchestrator, metrics, _program, _plan = _sequence_orchestrator(monkeypatch)
-    orchestrator._stop = True
+    process_workflow, metrics, _program, _plan = _sequence_process_workflow(monkeypatch)
+    process_workflow._stop = True
 
     async def cancelled(request, delivery_services):
         raise asyncio.CancelledError()
 
-    monkeypatch.setattr(generation_delivery, "deliver_generation", cancelled)
-    summary = await orchestrator._run_sequence()
+    monkeypatch.setattr(sequence_workflow, "deliver_generation", cancelled)
+    summary = await process_workflow._run_sequence()
     assert summary.interrupted is True and summary.exit_code == 4
     assert summary.counts == {} and summary.output_lines == 0
     assert metrics.events[-1][-1] == {"counts": {}, "exit_code": 4}

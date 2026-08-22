@@ -34,7 +34,9 @@ from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
     ErrorKind,
+    InternalError,
 )
+from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
 from labelkit.common.contracts.types import (
     PipelineItem,
     Record,
@@ -45,10 +47,10 @@ from labelkit.common.contracts.types import (
     tree_diff,
 )
 
-from labelkit.common.runtime import budget as budget_mod
-from labelkit.common.runtime.budget import pack_windows
-from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
-from labelkit.common.runtime.schema_engine import CallScope, segment_window_schema
+from labelkit.common.inference import budget as budget_mod
+from labelkit.common.inference.budget import pack_windows
+from labelkit.common.inference.llm_client import Message, Part, PromptBundle
+from labelkit.common.inference.schema_engine import CallScope, segment_window_schema
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import ResolvedConfig
@@ -251,26 +253,15 @@ def _align_relations(entries: Sequence[Mapping],
     return table, verdicts
 
 
-def _boundary_payload(frames: Sequence[Record], verdicts: Sequence[str],
-                      model: str, session_id: str | None,
-                      span: tuple[int, int]) -> dict:
-    """组装 segment.boundary 事件载荷（不含可选的 reason 列表）。
+@dataclasses.dataclass(frozen=True, slots=True)
+class _WindowVerdict:
+    """叶任务返回的不可变窗口裁决。"""
 
-    @param frames 窗内帧记录
-    @param verdicts 与 frames 对齐的关系列表
-    @param model 本次调用实际使用的模型名
-    @param session_id 会话 id；公开直调面为 None
-    @param span 窗口跨度 [start, end)
-    @return 事件载荷字典
-    """
-    return {
-        "session_id": session_id,
-        "window": [span[0], span[1]],
-        "member_ids": [frame.id for frame in frames],
-        "relations": [{"index": i, "relation": relation}
-                      for i, relation in enumerate(verdicts)],
-        "model": model,
-    }
+    span: tuple[int, int]       # 会话内窗口跨度
+    member_ids: tuple[str, ...] # 窗内成员身份
+    verdicts: tuple[str, ...]   # 与成员对齐的关系
+    model: str                  # 实际响应模型
+    reasons: tuple[str, ...]    # 可选理由，未请求或缺席时为空
 
 
 async def judge_window(frames: Sequence[Record], ctx: "RunContext") -> list[str]:
@@ -286,27 +277,26 @@ async def judge_window(frames: Sequence[Record], ctx: "RunContext") -> list[str]
     @param ctx 运行上下文
     @return 与 frames 对齐的逐帧关系列表
     """
-    return await _judge_window(frames, ctx, session_id=None,
-                               span=(0, len(frames)))
+    outcome = await _call_window(frames, ctx, span=(0, len(frames)))
+    _emit_boundary(ctx, outcome, session_id=None)
+    return list(outcome.verdicts)
 
 
-async def _judge_window(frames: Sequence[Record], ctx: "RunContext", *,
-                        session_id: str | None,
-                        span: tuple[int, int],
-                        digests: Sequence[str] | None = None) -> list[str]:
-    """``judge_window`` 与阶段内窗口调用共用的实现。
+async def _call_window(frames: Sequence[Record], ctx: "RunContext", *,
+                       span: tuple[int, int],
+                       digests: Sequence[str] | None = None) -> _WindowVerdict:
+    """执行一次纯窗口调用并返回待声明序归并的冻结裁决。
 
-    仅限关键字的额外参数携带冻结的公开签名装不下的事件载荷上下文（会话 id + 窗口跨度），
-    以及 v1.11 按会话预计算的 ``digests`` 切片（V9）。``digests=None`` 即公开
+    仅限关键字的额外参数携带窗口跨度，以及 v1.11 按会话预计算的 ``digests`` 切片。
+    ``digests=None`` 即公开
     judge_window 路径（M7 的 ≤3 帧重判表）：摘要表在此自行计算，从而保持公开签名不变
     （CONTRACTS §7.14）。
 
     @param frames 窗内帧记录，按会话序
     @param ctx 运行上下文
-    @param session_id 会话 id；公开直调面传 None
     @param span 窗口跨度 [start, end)，进事件载荷
     @param digests 与 frames 对齐的摘要切片；None 表示本函数自行计算
-    @return 与 frames 对齐的逐帧关系列表
+    @return 不修改业务对象或发业务事件的冻结窗口裁决
     """
     cfg = ctx.cfg
     with_reason = _reason_requested(cfg)
@@ -321,15 +311,39 @@ async def _judge_window(frames: Sequence[Record], ctx: "RunContext", *,
         scope=CallScope(record_ids=(frames[0].id,), batch_no=ctx.batch_no))
 
     table, verdicts = _align_relations(obj["frames"], len(frames))
-    payload = _boundary_payload(frames, verdicts, model, session_id, span)
+    reasons: tuple[str, ...] = ()
     if with_reason:
-        reasons = [table[i]["reason"] for i in range(len(frames))
-                   if i in table and "reason" in table[i]]
-        if reasons:
-            payload["reason"] = reasons
+        reasons = tuple(table[i]["reason"] for i in range(len(frames))
+                        if i in table and "reason" in table[i])
+    return _WindowVerdict(
+        span=span,
+        member_ids=tuple(frame.id for frame in frames),
+        verdicts=tuple(verdicts),
+        model=model,
+        reasons=reasons,
+    )
+
+
+def _emit_boundary(ctx: "RunContext", outcome: _WindowVerdict,
+                   session_id: str | None) -> None:
+    """在归并屏障按声明序发出窗口业务事件。
+
+    @param ctx 运行上下文
+    @param outcome 冻结窗口裁决
+    @param session_id 会话身份；公开直调面为 None
+    """
+    payload = {
+        "session_id": session_id,
+        "window": [outcome.span[0], outcome.span[1]],
+        "member_ids": list(outcome.member_ids),
+        "relations": [{"index": i, "relation": relation}
+                      for i, relation in enumerate(outcome.verdicts)],
+        "model": outcome.model,
+    }
+    if outcome.reasons:
+        payload["reason"] = list(outcome.reasons)
     ctx.metrics.event(_EV_BOUNDARY, stage="segment", batch_no=ctx.batch_no,
                       record_ids=(), payload=payload)
-    return verdicts
 
 
 def _window_spans(n: int, window: int) -> list[tuple[int, int]]:
@@ -362,7 +376,7 @@ def _window_spans(n: int, window: int) -> list[tuple[int, int]]:
 
 async def _judge_span_degrading(judge, span: tuple[int, int],
                                 ctx: "RunContext", *,
-                                level: int = 0) -> list[tuple[tuple[int, int], list[str]]]:
+                                level: int = 0) -> list[tuple[tuple[int, int], _WindowVerdict]]:
     """V20 窗口分半降级重试（spec 3.14.4 溢出降级重试；SPEC-context-budget V20/V24/A7）。
 
     ``judge`` = 异步可调用 callable(span) -> 该跨度的逐帧关系（依赖注入——正是这道缝
@@ -450,7 +464,7 @@ class SegmentStage:
                   ctx: "RunContext") -> list[PipelineItem]:
         """按会话精化本批次帧信封，并尾追加 episode 信封。
 
-        三步：① 按 session_id 重新聚合活跃帧；② 一次 gather 跑完所有会话的所有窗口；
+        三步：① 按 session_id 重新聚合活跃帧；② 经 TaskExecutor 跑完所有会话的所有窗口；
         ③ 按批内会话序做同步确定性结算。返回的永远是入参那**同一个**列表对象（②b）。
 
         @param batch 本批次信封列表（原地改状态并尾追加，绝不删除元素）
@@ -462,7 +476,7 @@ class SegmentStage:
             return batch
         refine = self.cfg.segment.strategy in ("llm", "hybrid")
         jobs_meta, jobs = self._plan_windows(sessions, ctx, refine)
-        outcomes = await self._gather_windows(jobs_meta, jobs)
+        outcomes = await self._run_windows(jobs_meta, jobs, ctx)
         self._settle_sessions(batch, ctx, sessions, outcomes, refine)
         return batch                               # 同一个列表对象（②b）
 
@@ -488,8 +502,8 @@ class SegmentStage:
 
     def _plan_windows(self, sessions: dict[str, list[PipelineItem]],
                       ctx: "RunContext",
-                      refine: bool) -> tuple[list[tuple[str, tuple[int, int]]], list]:
-        """为每个需要精化的会话切窗并造出待 gather 的协程（第一阶段）。
+                      refine: bool) -> tuple[list[tuple[str, tuple[int, int]]], list[_WindowJob]]:
+        """为每个需要精化的会话切窗并冻结叶任务输入（第一阶段）。
 
         v1.11（V9）：当且仅当 segment profile 声明了上下文窗口，切分才走预算装箱；未声明
         则回到 v1.10 的固定切分，字节一致。静态提示词估计与逐图成本都是配置/批次冻结值，
@@ -506,7 +520,7 @@ class SegmentStage:
         pack_budget = (budget_mod.input_budget(prof) - _static_prompt_est(self.cfg)
                        if budget_on else 0)
         jobs_meta: list[tuple[str, tuple[int, int]]] = []
-        jobs: list = []
+        jobs: list[_WindowJob] = []
         for sid, items in sessions.items():
             if not refine or len(items) == 1:      # 规则 / 单帧会话：零 LLM
                 continue
@@ -521,9 +535,13 @@ class SegmentStage:
                      else _window_spans(len(items), seg.window))
             for span in spans:
                 jobs_meta.append((sid, span))
-                jobs.append(self._run_window(
-                    _WindowJob(records=records, digests=digests, sid=sid,
-                               span=span, degrade=budget_on), ctx))
+                jobs.append(_WindowJob(
+                    records=records,
+                    digests=digests,
+                    sid=sid,
+                    span=span,
+                    degrade=budget_on,
+                ))
         return jobs_meta, jobs
 
     def _guard_digest_poverty(self, items: list[PipelineItem],
@@ -561,22 +579,32 @@ class SegmentStage:
                  + image_cost for digest in digests]
         return pack_windows(costs, pack_budget, seg.window)
 
-    @staticmethod
-    async def _gather_windows(
-            jobs_meta: list[tuple[str, tuple[int, int]]],
-            jobs: list) -> dict[str, list[tuple[tuple[int, int], object]]]:
-        """一次 gather 跑完全批窗口，结果按会话归拢（沿用 M4 第二阶段骨架）。
+    async def _run_windows(self, jobs_meta: list[tuple[str, tuple[int, int]]],
+                           jobs: list[_WindowJob], ctx: "RunContext"
+                           ) -> dict[str, list[tuple[tuple[int, int], object]]]:
+        """经共享 TaskExecutor 跑完全批窗口，并按输入序归拢。
 
         缝合是随后的同步遍历，按窗口跨度定位——与调度无关、零 rng。
 
         @param jobs_meta 与 jobs 对齐的 (会话 id, 跨度) 元信息
-        @param jobs 待并发执行的窗口协程
+        @param jobs 冻结窗口计划
+        @param ctx 运行上下文
         @return 会话 id → [(子跨度, 关系列表 | 失败异常), ...]
         """
         outcomes: dict[str, list[tuple[tuple[int, int], object]]] = {}
         if not jobs:
             return outcomes
-        results = await asyncio.gather(*jobs)
+        specs = tuple(
+            TaskSpec(
+                task_id=f"{ctx.task_namespace}:segment:{ordinal}",
+                declaration_key=(ctx.batch_no, 0, ordinal),
+                stage=self.name,
+                resource_key=("llm", self.cfg.segment.llm),
+                operation=lambda job=job: self._run_window(job, ctx),
+            )
+            for ordinal, job in enumerate(jobs)
+        )
+        results = await ctx.tasks.run_group(TaskGroupRequest(specs))
         for (sid, span), result in zip(jobs_meta, results):
             bucket = outcomes.setdefault(sid, [])
             if isinstance(result, BaseException):
@@ -606,15 +634,22 @@ class SegmentStage:
                 continue
             session = _SessionPass(batch=batch, ctx=ctx, sid=sid, items=items,
                                    split=split)
-            failures = [result for _, result in outcomes[sid]
+            session_outcomes = outcomes[sid]
+            for _, result in session_outcomes:
+                if isinstance(result, _WindowVerdict):
+                    _emit_boundary(ctx, result, session_id=sid)
+            failures = [result for _, result in session_outcomes
                         if isinstance(result, BaseException)]
             if failures:
                 self._dispose_failed(session, failures)
                 continue
             rel: list[str | None] = [None] * len(items)
-            for (start, end), verdicts in outcomes[sid]:
+            for (start, end), outcome in session_outcomes:
+                if not isinstance(outcome, _WindowVerdict):
+                    _logger.error("segment reducer received an invalid window outcome")
+                    raise InternalError("segment reducer received an invalid window outcome")
                 for i in range(end - start):       # 无条件覆写 ⇒
-                    rel[start + i] = verdicts[i]   # 接缝帧归后一窗
+                    rel[start + i] = outcome.verdicts[i]  # 接缝帧归后一窗
             self._assemble(session, rel)
 
     async def _run_window(self, job: _WindowJob, ctx: "RunContext"):
@@ -630,16 +665,15 @@ class SegmentStage:
         @param ctx 运行上下文
         @return 叶子结果 [(子跨度, 关系列表), ...]，或捕获到的失败异常对象
         """
-        async def judge(sub: tuple[int, int]) -> list[str]:
+        async def judge(sub: tuple[int, int]) -> _WindowVerdict:
             """派发一个（子）窗口并计数。
 
             @param sub 子窗口跨度 [start, end)
-            @return 该子窗口的逐帧关系列表
+            @return 该子窗口的冻结裁决
             """
             ctx.metrics.count(_COUNTER_WINDOWS)
-            return await _judge_window(job.records[sub[0]:sub[1]], ctx,
-                                       session_id=job.sid, span=sub,
-                                       digests=job.digests[sub[0]:sub[1]])
+            return await _call_window(job.records[sub[0]:sub[1]], ctx,
+                                      span=sub, digests=job.digests[sub[0]:sub[1]])
 
         try:
             if job.degrade:

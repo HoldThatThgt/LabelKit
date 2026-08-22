@@ -7,7 +7,7 @@ import logging
 from collections.abc import Mapping
 
 from labelkit.common.errors import ContextOverflowError
-from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
+from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 
 
 _log = logging.getLogger("labelkit.generation.prompts")

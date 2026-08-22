@@ -160,13 +160,26 @@ sequence 形态的核心账在 `report.generate.sequence`：
 一次失败 attempt 只进入最终停止边界对应的一个 rejected bucket；内部 L3 repair 与 provider retry 不重复增加
 family call。provider fatal、plan 与 commit-I/O 是 terminal，写 `terminal_error_kind` 而不塞进 attempt bucket。
 
+成功与 failed report 都有同形状 `runtime` 块：`queue_high_water` / `running_high_water` 看调度接纳，
+`resource_wait_high_water` / `resource_wait_ms` 看 profile 许可，`http_pool_wait_ms` 看显式 HTTP origin admission，
+`commit_waiting_high_water` / `candidate_bytes_high_water` / `commit_ms` 看 sequence 声明序提交是否形成队头背压，
+`cancelled_tasks` 用来核对结构化取消是否完成 cleanup。`candidate_bytes_high_water` 是所有已完成但尚未提交候选的
+canonical bytes 同时驻留总和，不是进程 RSS，也不含 provider response、Python 对象、dedup registry 或 HTTP buffer。
+
 成功消费者以 `*.manifest.json` 为唯一真值，并校验 main、stream、report 的路径、SHA-256、行数、run ID 与
 delivery digest。failed report 是独立诊断；成功运行不删除旧 failed report，它也不能否定摘要有效的 manifest。
 
-keyless 计划与真实主例都验证为 2/8/22+2+3=27。真实主例的两个 successful set 没有 rejected attempt：
+以下数字是 v1.18 串行基线，不是 v1.19 runtime 验收：keyless 计划与真实主例都验证为 2/8/22+2+3=27。
+真实主例的两个 successful set 没有 rejected attempt：
 default profile 为 38 calls、34470 input tokens、2511 output tokens，judge profile 为 10 calls、9541 input
 tokens、484 output tokens，provider retries 均为 0。发布规模运行有 3 次 semantic rejection、其他 rejection 为 0，
 最终仍只提交 13 个完整 sets；失败 attempt 只进入计数与 usage，不进入正式数据。
+
+v1.19 本地四槽真实模型连续三次均通过：每次 34 calls、4 attempts、0 rejections，llama-server request
+high-water 精确为 4；shell wall 为 50.560 / 58.520 / 52.380 秒，peak RSS 为 188514304 / 188416000 /
+179191808 bytes。旧 checkout 同 fixture 的 request high-water 为 1，三次 wall 为 61.960 / 41.750 / 41.315 秒；
+旧串行热运行获得更强 prompt-cache 复用，因此不能把 v1.19 结果写成纯 scheduler 加速。完整 calls/tokens 与
+六百槽合成压力账见 `docs/dev/E2E-FINDINGS.md`；六百 coroutine 只证明内部调度，不冒充 endpoint 六百请求能力。
 
 ### 密钥池的分密钥视角（v1.6）
 

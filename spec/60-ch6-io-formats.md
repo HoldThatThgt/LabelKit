@@ -186,6 +186,17 @@ main 不含 noise 或 replay 行，且不再输出旧 `tier_rank`、`time_fields
   // v1.2 可选块："annotate": {"sc_disagreements": 0}（self-consistency 启用时）；
   //             "generate": {"buckets": {"default×concise": {"calls", "produced", "survived_dedup"[, "rejected_by_validator" — v1.5，仅配置 generate.sample_validator 时]}}}（generate 启用时）
   //             generate.buckets v1.7：classify 启用时桶 key 扩展为 "<class>×<llm>×<style>"（3.6.2 按类种子池行；关闭时格式不变）
+  "runtime": {
+    "queue_high_water": 0,
+    "running_high_water": 0,
+    "resource_wait_high_water": 0,
+    "commit_waiting_high_water": 0,
+    "candidate_bytes_high_water": 0,
+    "cancelled_tasks": 0,
+    "resource_wait_ms": 0,
+    "http_pool_wait_ms": 0,
+    "commit_ms": 0
+  },
   "trace": {"enabled": true, "path": "./out/ui-labels-0701.trace.jsonl",
              "events": 18342, "dropped_events": 0},
   "llm_usage": {"default": {"calls": 31240, "prompt_tokens": 8.1e7,
@@ -198,6 +209,16 @@ main 不含 noise 或 replay 行，且不再输出旧 `tier_rank`、`time_fields
               "annotate": 1800, "verify": 620}}
 }
 ```
+
+`runtime` 是成功 report 与 failed report 共有的顶层固定块。`queue_high_water` 是全部资源通道等待接纳的
+任务最高值，`running_high_water` 是同时运行叶任务最高值，`resource_wait_high_water` 是等待 profile
+许可的逻辑调用最高值，`commit_waiting_high_water` 是已经完成且等待声明序提交的候选最高值，
+`candidate_bytes_high_water` 是所有已完成且尚未提交候选 canonical bytes 同时驻留总和的最高值。
+`cancelled_tasks` 只计完成 cleanup 的取消叶任务；三个 `*_ms` 分别累计 profile 许可等待、HTTP origin
+许可等待和无 `await` 声明序提交临界区耗时。静态 dry-run 只可构造不进入 execution domain、且不创建 leaf 的
+惰性 `ExecutionRuntime` 身份载体，以相同键序写零值；
+validate 与 estimate 同样不启动 runtime，也不新增数据工件。该块不得包含 endpoint、origin、prompt、payload、
+state、callable repr 或 API key。
 
 不变量：`emitted + dropped_* + failed + bad_input = scanned + generated`。熔断中止（v1.6 熔断交付，3.10.3）时扩展为 `emitted + dropped_* + failed + bad_input + unprocessed = scanned + generated`——`unprocessed` 仅此时出现，= 已扫描/已生成但因中止未走完流水线的记录数（M10 在 finalize 时按差额计算）。v1.7：`classify.assignment="multi"` 时右侧另加 `fanout`——`emitted + dropped_* + failed + bad_input = scanned + generated + fanout`；与熔断中止叠加时两项扩展并存（左侧 `+ unprocessed`、右侧 `+ fanout`，熔断残差公式同步，3.10.3 分类与扇出行）。v1.8/v1.9：segment 启用时守恒式为全展开形（3.10.3；`stitched` 为 v1.9 增项，仅 stitch 启用时非零在场）——
 
@@ -216,7 +237,8 @@ v1.18 sequence 形态不复用上述渐进式 counts 守恒来宣称部分成功
 sequence 形态不写旧 `report.generate.stream`。成功 report 的 `report.generate.sequence` 键序冻结如下；
 示例值同时冻结 `examples/sequence-generation` 的验收算术：2 sets、8 primary sequences、22 primary events、
 2 noise events、1 replay sequence 的 3 replay events，合计 27 stream rows；8 个 primary sessions
-彼此独立，另有 1 个 noise session 与 1 个 replay tail session。
+彼此独立，另有 1 个 noise session 与 1 个 replay tail session。下例只展开 `generate.sequence`；顶层
+`runtime` 仍按 6.4 的固定形状在场，不能嵌入本块。
 
 ```json
 {
@@ -298,7 +320,9 @@ plan 与 commit-I/O 属 run terminal，只写 `terminal_error_kind`。
 failed report 使用相同 usage 与 `rejected_attempts` 口径，固定路径为
 `{output_stem}.failed.report.json`。它始终包含 `run_attempt_id`，另含 nullable `run_id`、
 `artifacts_committed = false`、nullable `failed_slot`、`attempts_used` 与 `terminal_error_kind`；
-不含 by-pattern 已交付前缀，因为没有数据提交。plan 尚未产生时 `run_id = null`。
+不含 by-pattern 已交付前缀，因为没有数据提交。plan 尚未产生时 `run_id = null`。coordinator 与全部
+叶任务 cleanup 完成后才冻结 failed report 及其顶层 `runtime`；因低槽耗尽而取消的高槽候选、reservation
+与 dataset counters 不得泄漏为已提交计数，但已经发生的 usage、retry、Schema、trace、等待与取消仍是运行事实。
 
 ### 6.4.2 sequence 路径与成功提交
 
@@ -411,6 +435,7 @@ emitted 8、failed 0；这证明完整 replay sequence 被 M3 删除，而不是
 `retained_content_bytes` 与 delivery digest 复用同一个 `canonical_delivery_row` helper，每行精确计
 `len(canonical_row_bytes) + 1`，其中一 byte 是 JSONL 换行。`SequenceRows` 只计自己的 final main row
 与 primary stream rows；`ReplayRows` 只计 replay rows；发射期墙钟字段既不驻留在产品行中，也不计入上限。
-prospective 总量包含全部已接受 SequenceRows、当前 set 的 SequenceRows 和由最终 source rows 预投影的全部
-ReplayRows。上限固定 536870912（512 MiB）；恰等于上限时允许提交，超一个 UTF-8 byte 时整个 slot 拒绝，
-且在 `group_commit` 前保持 dedup、dataset 与 replay 零提交。
+声明序提交时只比较“已提交实际 bytes + 当前 `PreparedCandidate` 的实际 bytes”。当前候选已经闭包自己的
+final `SequenceRows` 与由最终 source rows 投影的全部 `ReplayRows`；更高 ordinal 的已准备候选不计入当前
+retained gate。上限固定 536870912（512 MiB）；恰等于上限时允许提交，超一个 UTF-8 byte 时整个 slot
+拒绝，且在 `group_commit` 前保持 dedup、dataset 与 replay 零提交。

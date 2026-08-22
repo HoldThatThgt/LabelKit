@@ -461,9 +461,9 @@ on_error = "keep"        # "keep" | "fail"（fail 仅施于 episode 候选信封
 | `labelkit/common/errors.py` | 改 | +STITCH_INVALID |
 | `labelkit/common/config/model.py` | 改 | +StitchConfig（链序位插 Segment 与 Extract 间）；ResolvedConfig+stitch；Trace 注 10→11 |
 | `labelkit/common/config/loader.py` | 改 | `_TRACE_CHANNELS` +stitch；[stitch] 解析 + 三约束；引用集两处 +stitch.llm（不入视觉必需集）；no-op 警告归属分支按裁决·缝合配置约束（stitch 关 ∧ segment 开的组合仿 sequence_frames 单独警告） |
-| `labelkit/common/runtime/schema_engine.py` | 改 | +stitch_schema()；defect kinds +wrong_stitch（wrong_stitch 四处同步的 defect schema 处） |
+| `labelkit/common/inference/schema_engine.py` | 改 | +stitch_schema()；defect kinds +wrong_stitch（wrong_stitch 四处同步的 defect schema 处） |
 | `labelkit/common/observability/obslog.py` | 改 | `_FREE_TEXT_KEYS` +task_name；事件名常量 +EV_STITCH_JUDGE/EV_STITCH_THREAD（裁决·缝合观测条件在场的实现定稿事件名常量则） |
-| `labelkit/orchestration/orchestrator.py` | 改 | `_CHAIN_ORDER` 插 stitch **且 `_compose_chain` enabled 映射 +`"stitch": cfg.stitch.enabled`**（可行性审计：只插元组必要不充分）；模块 docstring 链序句；`_DEFECT_KINDS`+1（wrong_stitch 四处同步的 report 词表处）；计量/batch.end/failed 兜底与残差 −stitched/counts+threads（=episodes−stitched 导出）/report.stream+stitch/dry-run+stitch_calls（`_estimate()` 按裁决·缝合观测条件在场的估算式） |
+| `labelkit/orchestration/process_workflow.py` | 改 | `_CHAIN_ORDER` 插 stitch **且 `_compose_chain` enabled 映射 +`"stitch": cfg.stitch.enabled`**（可行性审计：只插元组必要不充分）；模块 docstring 链序句；`_DEFECT_KINDS`+1（wrong_stitch 四处同步的 report 词表处）；计量/batch.end/failed 兜底与残差 −stitched/counts+threads（=episodes−stitched 导出）/report.stream+stitch/dry-run+stitch_calls（`_estimate()` 按裁决·缝合观测条件在场的估算式） |
 | `labelkit/orchestration/factory.py` | 改 | build_stages segment 与 dedup 间插 stitch 实例化 |
 | `labelkit/orchestration/profile_usage.py` | 改 | referenced_profiles +stitch.llm |
 | `labelkit/operators/emitter.py` | 改 | 第四路由；`_stream_block` +thread_id/fragments/resumed+包络 |
@@ -474,7 +474,7 @@ on_error = "keep"        # "keep" | "fail"（fail 仅施于 episode 候选信封
 | `labelkit/operators/extract.py` | 改 | seam 序数占位跳过（幂等门/len 不变量不动）；**平铺 gather 记账重构**（spans/切片假设每 pair 一协程——实质改动，裁决·接缝判据异线索帧）；seam 占位**不进** `_register` 计数器（extract.transitions/by_type 排除，裁决·接缝判据异线索帧的口径） |
 | `labelkit/__init__.py` | 改 | 模块 docstring 链序句更新（v1.6 形态陈旧债，v1.9「凡枚举算子处皆同步」原则一并清偿） |
 | `labelkit/cli/parser.py` | 改 | argparse 描述算子枚举句更新（v1.7 形态陈旧债，同上清偿；原「cli/ 零改动」声明相应收窄） |
-| 零改动 | — | **operators/segment.py**（裁决·短段救援连续重组的连续 run 语义裁决后无需段身份 duck 标——审计两表缺席问题闭合）、operators/{dedup,ingest,generate}、common/extensions/hooks、common/runtime/llm_client、`labelkit/cli/{main,commands}.py`（referenced_profiles 职责已归 profile_usage）、`labelkit/data/rubrics/` |
+| 零改动 | — | **operators/segment.py**（裁决·短段救援连续重组的连续 run 语义裁决后无需段身份 duck 标——审计两表缺席问题闭合）、operators/{dedup,ingest,generate}、common/extensions/hooks、common/inference/llm_client、`labelkit/cli/{main,commands}.py`（referenced_profiles 职责已归 profile_usage）、`labelkit/data/rubrics/` |
 
 #### tests/（23 改 + 2 新，v1.1 深层镜像布局；manual 线审计修正：test_errors 零改动被证伪、test_cli 冻结集合为第三处白名单镜像、test_stage 条件项实测落空归零）
 
@@ -482,14 +482,14 @@ on_error = "keep"        # "keep" | "fail"（fail 仅施于 episode 候选信封
 |---|---|---|
 | `tests/operators/test_stitch.py` | 新 | §3.6 全清单 |
 | `tests/integration/test_stitch_llm.py` | 新 | 真实 glm-5.2 四判例 |
-| ResolvedConfig 构造补 stitch 字段（19 文件，grep 精确核实） | 改 | operators 9（ingest/segment/classify/extract/quality/generate/annotate/verify/emitter）+ integration 7（annotate/classify/generate/quality/verify/stream/llm_client 的 *_llm）+ cli/test_cli、common/observability/test_obslog、orchestration/test_orchestrator（ResolvedConfig 无字段默认值，新增 stitch 字段必击穿全部 19 处） |
+| ResolvedConfig 构造补 stitch 字段（19 文件，grep 精确核实） | 改 | operators 9（ingest/segment/classify/extract/quality/generate/annotate/verify/emitter）+ integration 7（annotate/classify/generate/quality/verify/stream/llm_client 的 *_llm）+ cli/test_cli、common/observability/test_obslog、orchestration/test_process_workflow（ResolvedConfig 无字段默认值，新增 stitch 字段必击穿全部 19 处） |
 | `tests/cli/test_cli.py`（改动点追加） | 改 | 除 ResolvedConfig 外：**`EXPECTED_PRODUCTION_PY` +`labelkit/operators/stitch.py`、`EXPECTED_TEST_PY` +两个新测试文件**（`test_package_layout_matches_frozen_spec` 机器冻结集合，不改离线套件必红）；`test_package_layout_dependency_direction` 的 verify 懒加载白名单零改动（与懒加载例外零增补的布局裁决自洽） |
 | `tests/common/test_errors.py` | 改（**原零改动被证伪**） | ErrorKind 穷举 wire-code 断言（14 项字典全等）+`STITCH_INVALID` |
 | `tests/common/contracts/test_types.py` | 改 | Status 7→8 值断言 + thread_id 用例 |
 | `tests/common/config/test_config.py` | 改 | [stitch] 解析/缺省/三约束/channels/引用集用例 |
-| `tests/common/runtime/test_schema_engine.py` | 改 | stitch_schema + kinds 六值 |
+| `tests/common/inference/test_schema_engine.py` | 改 | stitch_schema + kinds 六值 |
 | 六个实质用例文件 | 改 | emitter 第四路由、verify 七段+wrong_stitch+滤壳、extract seam 占位、classify duck 复制、annotate 配额、quality 接缝后缀 |
-| `tests/orchestration/test_orchestrator.py` | 改 | counts_invariant +stitched；链序/计量/report/batch.end/dry-run 用例 |
+| `tests/orchestration/test_process_workflow.py` | 改 | counts_invariant +stitched；链序/计量/report/batch.end/dry-run 用例 |
 | 零改动 | — | test_dedup、runtime/test_llm_client、extensions/test_hooks、**contracts/test_stage**（实测只断言协议结构不含例外清单文本——条件项落空）、integration/test_key_pool_llm、test_schema_engine_llm、conftest、hook_samples |
 
 #### examples/ 与根文件

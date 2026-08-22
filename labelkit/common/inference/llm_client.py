@@ -27,17 +27,19 @@ from typing import TYPE_CHECKING, Any, Callable, Literal, Mapping
 import httpx
 
 from labelkit.common.config.model import EmbeddingProfile, LLMProfile
+from labelkit.common.contracts.execution import ResourceKey, ResourceLimiter
 from labelkit.common.contracts.types import ImageRef, Usage
 from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
+    InternalError,
     OutputTruncatedError,
     ProviderFatalError,
     ProviderRetryableError,
 )
-from labelkit.common.runtime import budget
-from labelkit.common.runtime.budget import ImageCostCalibrator
-from labelkit.common.runtime.credentials import (
+from labelkit.common.inference import budget
+from labelkit.common.inference.budget import ImageCostCalibrator
+from labelkit.common.inference.credentials import (
     RuntimeCredentials,
     _declared_env_names,
 )
@@ -213,6 +215,7 @@ class ProfileUsage:
 @dataclass(frozen=True)
 class ProbeResult:
     """单把密钥的探测结果（``validate --probe`` 的展示单元）。"""
+    kind: Literal["llm", "embedding"]              # 资源类型；与 profile 共同确定唯一身份
     profile: str                                   # 被探测的剖面名
     ok: bool                                       # 是否连通
     model: str                                     # 回报或回落的模型名
@@ -360,7 +363,7 @@ def _pool_members(kind: str, prof: "LLMProfile | EmbeddingProfile",
 @dataclass(frozen=True)
 class _CallSpec:
     """一次逻辑调用的请求装配契约（``_post_with_retries`` 的唯一入参）。"""
-    kind: Literal["llm", "embedding"]              # 剖面种类；与信号量、密钥池、p50 窗口同键，
+    kind: Literal["llm", "embedding"]              # 剖面种类；与资源许可、密钥池、p50 窗口同键，
                                                    # 使同名的 llm 与 embedding 剖面互不串用
     prof: LLMProfile | EmbeddingProfile            # 目标剖面（并发/重试/超时/密钥池来源）
     url: str                                       # 完整 POST 端点
@@ -852,8 +855,9 @@ class LLMClient:
     def __init__(self, llm_profiles: Mapping[str, LLMProfile],
                  embedding_profiles: Mapping[str, EmbeddingProfile],
                  credentials: RuntimeCredentials,
+                 resources: ResourceLimiter,
                  metrics: "MetricsSink | None" = None):
-        """建立进程内的剖面表、限流器、密钥池与校准器（全部只在内存，spec §2.6）。
+        """建立进程内的剖面表、密钥池与校准器（全部只在内存，spec §2.6）。
 
         v1.17（Wave 2b，CONTRACTS §7.19.3）：构造函数必须收到
         ``RuntimeCredentials``——密钥值的唯一来源；内部 env fallback 与 profile
@@ -863,17 +867,16 @@ class LLMClient:
         @param llm_profiles [llm.*] 剖面表，按声明顺序
         @param embedding_profiles [embedding.*] 剖面表，按声明顺序
         @param credentials 运行期凭据（不进 repr / 日志 / trace / report / 异常）
+        @param resources Application 拥有的唯一逻辑资源与 HTTP origin 限制器
         @param metrics 观测汇（M12）；None 表示不发事件、不喂熔断
         """
         self._llm_profiles: dict[str, LLMProfile] = dict(llm_profiles)
         self._embedding_profiles: dict[str, EmbeddingProfile] = dict(embedding_profiles)
         self._credentials = credentials
+        self._resources = resources
         self._metrics = metrics
         self._usage: dict[str, ProfileUsage] = {}
-        # 每剖面一个信号量，被**所有**调用共享（含修复、verify、probe）。键为
-        # (kind, name)，使同名的 llm 与 embedding 剖面永不共用限流器。
-        self._semaphores: dict[tuple[str, str], asyncio.Semaphore] = {}
-        # v1.6 密钥池状态，键与信号量一致（仅内存，spec §2.6——无持久化）。
+        # v1.6 密钥池状态，键与 ResourceKey 一致（仅内存，spec §2.6——无持久化）。
         self._pools: dict[tuple[str, str], _KeyPool] = {}
         # v1.10 p50 延迟窗口（spec 3.9.3 快照行）：每 (kind, name) 一条有界样本队列，
         # 只收成功的逻辑调用——**唯一**新增采集点；既不入 report.json 也不入任何事件。
@@ -890,6 +893,8 @@ class LLMClient:
         # 抖动随机源刻意**不**由 seed 派生——纯时序 [FROZEN §7.8]。
         self._jitter_rng = random.Random()
         self._http_client: httpx.AsyncClient | None = None
+        self._owns_http_client = True
+        self._closed = False
 
     # -- 公开 API ------------------------------------------------------------
 
@@ -970,25 +975,25 @@ class LLMClient:
                           usage, retries, None, None)
         return vectors
 
-    async def probe(self, profile: str) -> ProbeResult:
+    async def probe(self, resource_key: ResourceKey) -> ProbeResult:
         """validate --probe：对 llm 剖面做一次最小的 1 token 活体调用，对 embedding
         剖面做一次单文本嵌入。永不抛出，失败落在 .error 里。池化剖面只探**第一把**密钥
-        （v1.6）——其余由 probe_all 覆盖。
+        （v1.6）——其余由 probe_all 覆盖。资源类型使同名 llm 与 embedding 剖面互不混淆。
 
-        @param profile 剖面名
+        @param resource_key 资源类型与剖面名
         @return 单条探测结果
         """
-        return (await self._probe_keys(profile, first_only=True))[0]
+        return (await self._probe_keys(resource_key, first_only=True))[0]
 
-    async def probe_all(self, profile: str) -> list[ProbeResult]:
+    async def probe_all(self, resource_key: ResourceKey) -> list[ProbeResult]:
         """v1.6：按声明顺序对池内每把密钥各探一次，llm 与 embedding 剖面同规——池化
-        （>1 键）剖面的结果带 key_env。单键剖面退化为 [await probe(profile)] 且
+        （>1 键）剖面的结果带 key_env。单键剖面退化为 [await probe(resource_key)] 且
         key_env=None。供 ``validate --probe`` 使用。永不抛出。
 
-        @param profile 剖面名
+        @param resource_key 资源类型与剖面名
         @return 每把密钥一条探测结果
         """
-        return await self._probe_keys(profile, first_only=False)
+        return await self._probe_keys(resource_key, first_only=False)
 
     @property
     def usage_by_profile(self) -> dict[str, ProfileUsage]:
@@ -1013,10 +1018,14 @@ class LLMClient:
                      for name, prof in profiles.items())
 
     async def aclose(self) -> None:
-        """释放共享的 httpx.AsyncClient（工具方法；运行结束时调用）。"""
-        if self._http_client is not None:
-            await self._http_client.aclose()
-            self._http_client = None
+        """由根实例幂等且物理恰一次地释放共享 HTTPX 客户端。"""
+        if not self._owns_http_client or self._closed:
+            return
+        self._closed = True
+        client = self._http_client
+        self._http_client = None
+        if client is not None:
+            await client.aclose()
 
     # -- complete() 的分解 ----------------------------------------------------
 
@@ -1102,27 +1111,27 @@ class LLMClient:
 
     # -- 探针 -----------------------------------------------------------------
 
-    async def _probe_keys(self, profile: str, *, first_only: bool) -> list[ProbeResult]:
+    async def _probe_keys(self, resource_key: ResourceKey, *, first_only: bool) -> list[ProbeResult]:
         """按声明顺序逐把密钥探测。
 
-        @param profile 剖面名（[llm.*] 或 [embedding.*]）
+        @param resource_key 资源类型与剖面名
         @param first_only True = 只探第一把密钥（probe），False = 全池（probe_all）
         @return 每把密钥一条结果；未知剖面回单条 ok=False 结果
         """
-        is_llm = profile in self._llm_profiles
-        if not is_llm and profile not in self._embedding_profiles:
-            return [ProbeResult(profile=profile, ok=False, model="", latency_ms=0,
-                                error=f"unknown profile: {profile!r}")]
-        prof = (self._llm_profiles[profile] if is_llm
-                else self._embedding_profiles[profile])
-        kind = "llm" if is_llm else "embedding"
+        kind, profile = resource_key
+        is_llm = kind == "llm"
+        profiles = self._llm_profiles if is_llm else self._embedding_profiles
+        if profile not in profiles:
+            return [ProbeResult(kind=kind, profile=profile, ok=False, model="", latency_ms=0,
+                                error=f"unknown [{kind}.*] profile: {profile!r}")]
+        prof = profiles[profile]
         table = self._credentials.llm if is_llm else self._credentials.embedding
         if prof.name not in table:
             # 凭据缺席（剖面未被 resolve 物化）——fail-closed 地落进结果而不是
             # 拿空密钥去撞端点，同时保住 probe 永不抛出的冻结承诺。
             _logger.error("profile %r has no materialized credentials; "
                           "resolve credentials before probing", profile)
-            return [ProbeResult(profile=profile, ok=False, model=prof.model,
+            return [ProbeResult(kind=kind, profile=profile, ok=False, model=prof.model,
                                 latency_ms=0, error=(
                                     f"no materialized credentials for profile "
                                     f"{profile!r}"))]
@@ -1150,15 +1159,17 @@ class LLMClient:
             # 排障用的低噪声痕迹（不改 stderr 的默认可见输出）。
             _logger.debug("probe failed for profile %s: %s", target.profile, exc)
             self._merge_usage(client._usage)
-            return ProbeResult(profile=target.profile, ok=False, model=target.prof.model,
+            kind = "llm" if target.is_llm else "embedding"
+            return ProbeResult(kind=kind, profile=target.profile, ok=False, model=target.prof.model,
                                latency_ms=int((time.monotonic() - start) * 1000),
                                error=str(exc), key_env=target.key_env)
         self._merge_usage(client._usage)
-        return ProbeResult(profile=target.profile, ok=True, model=model,
+        kind = "llm" if target.is_llm else "embedding"
+        return ProbeResult(kind=kind, profile=target.profile, ok=True, model=model,
                            latency_ms=latency_ms, key_env=target.key_env)
 
     def _probe_client(self, target: _ProbeTarget) -> "LLMClient":
-        """构造把剖面收窄到单把密钥的一次性子客户端（共享连接池与信号量，因此剖面级的
+        """构造把剖面收窄到单把密钥的一次性子客户端（共享连接池与 ResourceManager，因此剖面级的
         聚合并发上限仍然生效）。
 
         @param target 探测目标
@@ -1173,11 +1184,11 @@ class LLMClient:
                  RuntimeCredentials(llm={}, embedding={target.profile: (target.key,)}))
         if target.is_llm:
             client = LLMClient({target.profile: replace(mod, max_output_tokens=1)},
-                               {}, creds, self._metrics)
+                               {}, creds, self._resources, self._metrics)
         else:
-            client = LLMClient({}, {target.profile: mod}, creds, self._metrics)
+            client = LLMClient({}, {target.profile: mod}, creds, self._resources, self._metrics)
         client._http_client = self._http()   # 共享连接池
-        client._semaphores = self._semaphores
+        client._owns_http_client = False
         return client
 
     async def _probe_call(self, client: "LLMClient", target: _ProbeTarget,
@@ -1289,25 +1300,25 @@ class LLMClient:
         run = getattr(cfg, "run", None)
         return float(getattr(run, "max_park_s", 3600))
 
-    def _semaphore(self, kind: str, name: str, max_concurrency: int) -> asyncio.Semaphore:
-        """按 (kind, name) 取或建剖面限流器。
-
-        @param kind 剖面种类
-        @param name 剖面名
-        @param max_concurrency 剖面声明的并发上限
-        @return 该剖面共享的信号量
-        """
-        key = (kind, name)
-        sem = self._semaphores.get(key)
-        if sem is None:
-            sem = asyncio.Semaphore(max_concurrency)
-            self._semaphores[key] = sem
-        return sem
-
     def _http(self) -> httpx.AsyncClient:
-        """@return 共享的 httpx 客户端（首次使用时建立；超时按调用传入）。"""
+        """返回按全部 origin 总容量显式配置的惰性共享 HTTPX 客户端。
+
+        @return 根实例创建或 probe child 共享的 AsyncClient
+        @raises InternalError 客户端已关闭或本轮没有 HTTP 容量
+        """
+        if self._closed:
+            _logger.error("HTTP client requested after LLMClient close")
+            raise InternalError("HTTP client requested after LLMClient close")
         if self._http_client is None:
-            self._http_client = httpx.AsyncClient(timeout=None)
+            capacity = self._resources.http_connection_capacity
+            if capacity <= 0:
+                _logger.error("HTTP client requested without declared origin capacity")
+                raise InternalError("HTTP client requested without declared origin capacity")
+            limits = httpx.Limits(
+                max_connections=capacity,
+                max_keepalive_connections=capacity,
+            )
+            self._http_client = httpx.AsyncClient(timeout=None, limits=limits)
         return self._http_client
 
     def _check_breaker(self) -> None:
@@ -1409,12 +1420,12 @@ class LLMClient:
     # 就全额遵从，否则按该键跨调用的连续 429 计数做全抖动、封顶 300 s），下一次尝试立即
     # 轮换——只要还有活键就零等待。401/403 禁用该键：还有兄弟键时静默吸收（不消耗重试、
     # 不喂熔断）；打光最后一把活键则硬熔断，池大小为 1 时逐字节保持 v1.5 语义。全部活键
-    # 都在冷却 ⇒ 在已持有的信号量槽位内驻留，按 ≤60 s 分片、每片复检熔断，单次逻辑调用
+    # 都在冷却 ⇒ 在已持有的 ResourceKey 资源许可内驻留，按 ≤60 s 分片、每片复检熔断，单次逻辑调用
     # 的总驻留受 run.max_park_s 约束——超限走重试耗尽路径（P1-1）。400/404 与解析致命
     # 都与密钥无关：不轮换、立即致命，与 v1.5 完全一致。
 
     async def _post_with_retries(self, spec: _CallSpec) -> tuple[tuple, int, int]:
-        """共享重试引擎：信号量 → 逐尝试选键 → 尝试环 → 计量钩子 + 每种结局的 llm.call。
+        """共享重试引擎：资源许可 → 逐尝试选键 → 尝试环 → 计量钩子与 llm.call。
 
         @param spec 本次逻辑调用的请求装配契约
         @return (parse 结果元组, 末次尝试耗时 ms, 已消耗重试次数)
@@ -1427,7 +1438,8 @@ class LLMClient:
         ctx = _RetryContext(spec=spec, pool=self._pool(spec.kind, prof),
                             acc=self._usage.setdefault(prof.name, ProfileUsage()),
                             park_budget=self._max_park_s())
-        async with self._semaphore(spec.kind, prof.name, prof.max_concurrency):
+        resource_key = (spec.kind, prof.name)
+        async with self._resources.resource_limit(resource_key):
             while True:
                 self._guard_breaker(ctx)
                 ks = await self._select_key(ctx)
@@ -1451,8 +1463,8 @@ class LLMClient:
                                                    self._jitter_rng))
 
     def _guard_breaker(self, ctx: _RetryContext) -> None:
-        """每次尝试前、**取得信号量之后**复检熔断：gather() 下每个排队协程都在任何 HTTP
-        完成之前通过了 complete() 的入口检查，没有这道复检，排在"打开熔断那次调用"后面的
+        """每次尝试前、取得 profile 许可之后复检熔断：任务通道中的等待调用都可能在任何 HTTP
+        完成之前通过 complete() 的入口检查；没有这道复检，排在打开熔断调用之后的
         请求仍会发出注定失败的请求（快速失败契约，spec 3.9.2）。
 
         @param ctx 本次逻辑调用的可变状态
@@ -1506,7 +1518,7 @@ class LLMClient:
 
     async def _park(self, ctx: _RetryContext, wait: float, live_keys: int,
                     started: float) -> None:
-        """在已持有的信号量槽位内驻留到最早一把活键退出冷却。
+        """在已持有的 ResourceKey 资源许可内驻留到最早一把活键退出冷却。
 
         @param ctx 本次逻辑调用的可变状态（parked_calls / parked_ms 在此累加）
         @param wait 需等待的秒数
@@ -1547,12 +1559,21 @@ class LLMClient:
         headers = _build_headers(ctx.prof.provider, ks.key)
         # 图像字节在此、逐尝试加载，并在请求结束时随 `body` 一同释放（惰性加载契约，spec §2.6）。
         body = ctx.spec.build_body()
-        start = time.monotonic()
         ks.in_flight += 1
         try:
-            resp = await self._http().post(
-                ctx.spec.url, json=body, headers=headers,
-                timeout=httpx.Timeout(ctx.prof.timeout_s))
+            resource_key = (ctx.spec.kind, ctx.prof.name)
+            origin = self._resources.origin_for(resource_key)
+            async with self._resources.origin_limit(origin):
+                start = time.monotonic()
+                try:
+                    resp = await self._http().post(
+                        ctx.spec.url, json=body, headers=headers,
+                        timeout=httpx.Timeout(ctx.prof.timeout_s))
+                except httpx.PoolTimeout as exc:
+                    _logger.error("HTTP pool exhausted after explicit origin admission")
+                    raise InternalError(
+                        "HTTP pool exhausted after explicit origin admission"
+                    ) from exc
         except (httpx.TimeoutException, httpx.TransportError) as exc:
             ctx.latency_ms = int((time.monotonic() - start) * 1000)
             _logger.warning("provider transport failure on profile %s: %s",

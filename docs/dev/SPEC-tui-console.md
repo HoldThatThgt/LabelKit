@@ -205,7 +205,7 @@ def format_progress_line(batch_no: int, emitted_total: int, totals: Mapping[str,
 def format_summary_lines(counts: Mapping[str, int]) -> list[str]: ...
 # emitter 与 ConsoleRenderer 双方 import；输出与 v1.9 硬编码字符串逐字节一致（U24 ① 层黄金快照钉死）
 
-# labelkit/common/runtime/llm_client.py（v1.10 增，只读）
+# labelkit/common/inference/llm_client.py（v1.10 增，只读）
 @dataclass(frozen=True)
 class KeySnapshot:
     env: str                                  # 环境变量名——唯一可展示身份
@@ -233,11 +233,11 @@ class LLMClient:
     # 纯读、无 await、无锁；仅从渲染 tick（事件循环线程内）调用——U26 下无跨线程争用。
     # p50 喂点：_post_with_retries 成功 return 前 append 到 per-(kind,name) deque(256)——唯一新增采集点。
 
-# labelkit/orchestration/orchestrator.py（v1.10 导出复用，U20）
+# labelkit/orchestration/process_workflow.py（v1.10 导出复用，U20）
 def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict: ...
 # _estimate()（dry-run）与渲染器批级分母共用；live 路径传入 P2-4 预扫 plan（UI 模态翻 estimate=True），禁二次 scan
 
-# labelkit/orchestration/runtime.py（v1.10 只增）
+# labelkit/orchestration/application.py（v1.10 只增）
 def execute_run(config_path, project_path, overrides,
                 listener: ProgressListener | None = None) -> int: ...
 def validate_project(config_path, project_path,
@@ -363,14 +363,14 @@ A-13 勘误·提案存档不改——PROPOSAL 不改（存档）✅。
 | common | `labelkit/common/config/model.py` / `loader.py` | `ConsoleConfig`（五用户键 + 产物 `mode_resolved`）+ `ResolvedConfig.console` 必填字段 + `CliOverrides.console`；loader 解析/校验/WARN + load() 收尾 `mode_resolved` 判定（find_spec 探测）；波及 21 个测试文件 24 个 `ResolvedConfig(` 构造点（机械补参） |
 | common | `labelkit/common/observability/obslog.py` | `ProgressListener` 五回调协议 + MetricsSink 尾参与 `stage_begin`/`run_estimate`/`stop_requested`/`fatal_streak` + none 档预脱敏转发（裁决·转发前预脱敏机制）+ 异常自吞（裁决·转发异常关监听器） |
 | common | `labelkit/common/observability/console_format.py`（新） | plain 进度行/终版摘要行格式纯函数（裁决·plain 行格式单一事实源；与 v1.9 硬编码逐字节一致） |
-| common | `labelkit/common/runtime/llm_client.py` | `KeySnapshot`/`ProfileSnapshot`/`snapshot(now=None)` + p50 deque(256) 喂点（唯一新增采集点） |
-| 编排 | `labelkit/orchestration/orchestrator.py` | `estimate_run(cfg, plan)` 纯函数抽出（_estimate 改薄封装）；stage 循环 `stage_begin`；`_request_stop` 转发；live 预扫 UI 模态翻 `estimate=True` + `run_estimate` 发送；dry-run rich 档 4 行 print 让位（plain 逐字节锚） |
-| 编排 | `labelkit/orchestration/runtime.py` | `execute_run(..., listener=None)` 装配 + `on_run_context` 时序；`validate_project(..., overrides=)`（裁决·validate 通路增尾参） |
+| common | `labelkit/common/inference/llm_client.py` | `KeySnapshot`/`ProfileSnapshot`/`snapshot(now=None)` + p50 deque(256) 喂点（唯一新增采集点） |
+| 编排 | `labelkit/orchestration/process_workflow.py` | `estimate_run(cfg, plan)` 纯函数抽出（_estimate 改薄封装）；stage 循环 `stage_begin`；`_request_stop` 转发；live 预扫 UI 模态翻 `estimate=True` + `run_estimate` 发送；dry-run rich 档 4 行 print 让位（plain 逐字节锚） |
+| 编排 | `labelkit/orchestration/application.py` | `execute_run(..., listener=None)` 装配 + `on_run_context` 时序；`validate_project(..., overrides=)`（裁决·validate 通路增尾参） |
 | 算子 | `labelkit/operators/emitter.py` | `_progress`/`_print_summary` 改用 `console_format` + `mode_resolved` 静态门（裁决·plain 行格式单一事实源） |
 | CLI | `labelkit/cli/console.py`（新） | ConsoleRenderer 惰性壳：Live 画布（裁决·单线程刷新钉死的参数）、六区块渲染、括号归属累计、键盘（cbreak+select）、日志流接管/恢复（针对证伪·日志路由失效的加固）、降级、plain 心跳监听器、validate/dry-run/终版表格 |
 | CLI | `labelkit/cli/parser.py` / `commands.py` | `--console`（run/validate）；构造 renderer 传入 `execute_run`/`validate_project`；probe 表 stdout-TTY 门（裁决·表格化仅 rich 档、裁决·validate 通路增尾参） |
 | 契约 | `docs/CONTRACTS.md` | 13 锚点（文档审计 B-2 表）：§1 布局树 + §1.2 测试归属；§6.1 ToolConfig 注释/ConsoleConfig/CliOverrides/ResolvedConfig；§6.2 优先级句；§6.3 rule 42（console 界与冻结规则）+ Warnings v1.10 句；§7.8 snapshot 签名；§7.9 stage_begin/stop 行为句；§7.10 emitter 让位注；§7.11 ProgressListener + MetricsSink；§7.12 CLI 行 + wiring 段；§8.4 措辞重写；§12 冻结件登记（ConsoleConfig 字段序、p50 窗 256、心跳固定键集） |
-| 测试 | `tests/cli/test_console.py`（新，含裁决·回归锚三层化 dry-run 层的 `test_dry_run_plain_golden_files` + `tests/cli/goldens/dryrun-*.txt` 五 golden 文件）、`tests/common/observability/test_console_format.py`（新，裁决·回归锚三层化单元层 golden 快照）、`tests/cli/test_cli.py`（冻结集+parser）、`tests/common/observability/test_obslog.py`（listener 组）、`tests/common/runtime/test_llm_client.py`（snapshot 组）、`tests/common/config/test_config.py`（[console] 组）、`tests/operators/test_emitter.py`（rich 让位组）、`tests/orchestration/`（estimate_run/wiring） | §3.7 各层 |
+| 测试 | `tests/cli/test_console.py`（新，含裁决·回归锚三层化 dry-run 层的 `test_dry_run_plain_golden_files` + `tests/cli/goldens/dryrun-*.txt` 五 golden 文件）、`tests/common/observability/test_console_format.py`（新，裁决·回归锚三层化单元层 golden 快照）、`tests/cli/test_cli.py`（冻结集+parser）、`tests/common/observability/test_obslog.py`（listener 组）、`tests/common/inference/test_llm_client.py`（snapshot 组）、`tests/common/config/test_config.py`（[console] 组）、`tests/operators/test_emitter.py`（rich 让位组）、`tests/orchestration/`（estimate_run/wiring） | §3.7 各层 |
 | 手册 | `docs/manual/06-config-toml.md`（§6.2 扩题 + [console] 五键表 + §6.1 骨架 + §6.6 速查）、`15-cli.md`（§15.1 用法/参数表 + §15.2 validate 注 + §15.6 三态改写）、`16-observability.md`（§16.1 表行改写 + §16.4 措辞 + 新增 §16.6 面板章含实跑定格样例）、`appendix-a-cheatsheet.md`（A.1 log_format 措辞 + 五键行）、`23-tutorial-5-production.md:27`（jsonl 注释措辞）、`03-quickstart.md`（可选一句指引；样例零改动）、`08-outputs.md`（明确零改动） | 文档审计 B-3 表；§16.6 定格面板样例经 pty 真跑采集（`script -q /dev/null uv run labelkit run ...` 于 examples/stream，剥 ANSI 后收录定格帧） |
 | spec 状态翻转 | `spec/00-frontmatter.md`（状态格 + v1.10 行注记）、`spec/10-ch1` §1.6（spec-only 措辞）、`spec/70` §7.7 开头句、本文头部状态行、`docs/dev/PROPOSAL-tui-console.md` 头部一词 | 「规格定稿、实现另行排期」家族 → 「已实现（2026-07-17）」 |
 | spec 内容补 | `spec/309-m9-llm-client.md` 3.9.2/3.9.3（snapshot/KeySnapshot/ProfileSnapshot 字段表 + p50 窗行——spec 是字段名单一事实源）、`spec/310-m10-orchestrator.md` 3.10.3 增 v1.10 行（stage_begin/stop 转发/估算复用/dry-run plain 锚限定）、`spec/311-m11-emitter.md` 3.11 让位注 | 文档审计 B-1 表 |

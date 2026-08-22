@@ -14,12 +14,12 @@ from labelkit.common.contracts.generation import (
     RenderEventRequest,
 )
 from labelkit.common.errors import InternalError, SchemaViolation
-from labelkit.common.runtime.generation_prompts import (
+from labelkit.common.inference.generation_prompts import (
     enforce_prompt_value_limit,
     frame_render_prompt,
     noise_render_prompt,
 )
-from labelkit.common.runtime.schema_engine import CallScope
+from labelkit.common.inference.schema_engine import CallScope
 from labelkit.operators.generation import GenerationAttemptRejected
 from labelkit.operators.generation.project import canonical_json
 

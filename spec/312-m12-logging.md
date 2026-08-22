@@ -30,7 +30,25 @@ class EventLog:
         """行缓冲写入 trace 文件；通道未启用或已因写失败关闭时为 no-op（调用方无需判断）。"""
 ```
 
-接入方式：`EventLog` 由 `MetricsSink` 持有并转发——各 Stage 通过既有的 `RunContext.metrics`（3.10.3）发事件，**不改 RunContext 签名**。stderr 侧直接使用标准 `logging` 模块，handler 由 M12 在启动时按 `log_format` 安装。
+接入方式：`EventLog` 由 `MetricsSink` 持有并转发——各 Stage 通过 `RunContext.metrics`（3.10.3）发事件。
+v1.19 的 `RunContext` 显式新增 `tasks` 与 `task_namespace`；`metrics` 字段及对象身份不变。stderr 侧直接使用
+标准 `logging` 模块，handler 由 M12 在启动时按 `log_format` 安装。
+
+**v1.19 Metrics ContextVar capture。**`MetricsSink` 删除实例级共享 `_captured_counts`，改用 ContextVar 保存
+当前 collaborator 的 attempt-local dataset counter dict 与 reset token：
+
+- 每个 collaborator 在进入 attempt 或可回滚业务段时创建一个局部 dict，并在 `finally` 中 reset token；
+- TaskExecutor 在 `run_group()` 入口捕获一次 context，每个叶任务使用独立的 context copy；同一 collaborator 的
+  叶任务可引用同一 attempt-local counter dict，但其他 ContextVar 写入不得泄漏给 sibling；
+- child task 继承所属 capture；不同 slot、attempt、stage 的 capture 隔离，nested capture fail closed；
+- `budget.*`、LLM/embedding calls 与 tokens、Schema validation/repair、provider retry、breaker、
+  resource/origin wait、provider latency、runtime cancellation 与 trace call events 绕过 capture，实时记录；
+- dataset counters 只能由 ordinary reducer 或 sequence 成功 `group_commit` 合并；被拒绝、取消或丢弃的 speculative
+  candidate 不得把 capture 合并进报告。
+
+runtime 高水位与耗时由 MetricsSink 以计数/时长记录，不产生新 trace channel，也不携带 endpoint、origin、prompt、
+payload、state、callable repr 或 API key。`llm.call` 等叶调用事件按真实完成时序；dataset、stage 与工件事件只在
+reducer/commit 时序发出。capacity 改变可以改变 provider 完成序和 trace 行序，但不得改变数据提交顺序。
 
 **v1.10 增：ProgressListener 进程内旁路**（console 面板的唯一数据通路，7.7；实现归 CLI 层 `labelkit/cli/console.py`，协议归本层——依赖方向 `cli → orchestration → operators → common` 不变）：
 

@@ -402,7 +402,7 @@ def test_instruction_only_default_state_uses_fixed_empty_witness(tmp_path):
 
 
 def test_declared_llm_budget_schema_uses_observer_actor_union(tmp_path, monkeypatch):
-    from labelkit.common.runtime import schema_engine as schema_module
+    from labelkit.common.inference import schema_engine as schema_module
 
     root = tmp_path / "sequence-generation"
     shutil.copytree(EXAMPLE_ROOT, root)
@@ -1154,7 +1154,7 @@ def test_context_budget_enumerates_each_declared_noise_topic(monkeypatch):
     cfg = _load_example()
     topics = cfg.sequence_generation.noise.topics
     frame_schema = cfg.frame_class_views[cfg.sequence_generation.noise.frame_class].gen_schema
-    from labelkit.common.runtime.schema_engine import noise_semantic_evaluation_schema
+    from labelkit.common.inference.schema_engine import noise_semantic_evaluation_schema
 
     expected = (
         (

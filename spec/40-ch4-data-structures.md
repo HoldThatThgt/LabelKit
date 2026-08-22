@@ -167,6 +167,51 @@ class StageError: stage: str; kind: str                    # 错误分类码（7
 
 ## 4.3 Stage 协议与异常层级
 
+`labelkit/common/contracts/execution.py` 是 operators 与执行运行时之间的唯一协议面：
+
+```python
+ResourceKey = tuple[Literal["llm", "embedding"], str]
+HttpOrigin = tuple[str, str, int]
+
+
+@dataclass(frozen=True)
+class TaskSpec(Generic[T]):
+    task_id: str
+    declaration_key: tuple[int, ...]
+    stage: str
+    resource_key: ResourceKey
+    operation: Callable[[], Awaitable[T]] = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class TaskGroupRequest(Generic[T]):
+    tasks: tuple[TaskSpec[T], ...]
+
+
+class TaskExecutor(Protocol):
+    async def run_group(self, request: TaskGroupRequest[T]) -> tuple[T, ...]: ...
+
+
+class ResourceLimiter(Protocol):
+    def resource_limit(self, resource_key: ResourceKey) -> AsyncContextManager[None]: ...
+    def origin_for(self, resource_key: ResourceKey) -> HttpOrigin: ...
+    def origin_limit(self, origin: HttpOrigin) -> AsyncContextManager[None]: ...
+
+    @property
+    def http_connection_capacity(self) -> int: ...
+```
+
+`TaskSpec.operation` 不进入 repr、日志、trace、报告、哈希或序列化。`task_id` 在一个 execution domain 内全局
+唯一；重复 ID 必须在创建叶任务前 fail closed。`TaskGroupRequest` 的结果按输入序返回；可恢复业务失败必须成为
+普通冻结 outcome，只有逃逸的 fatal/control/internal 异常触发结构化取消。叶任务不得再次调用 `run_group()`。
+
+`RunContext` 的字段按声明序冻结为 `cfg`、`llm`、`schema_engine`、`rng`、`batch_no`、`metrics`、
+`tasks`、`task_namespace`。`RunServices` 的字段按声明序冻结为 `llm`、`schema_engine`、
+`metrics`、`tasks`、`run_id`、`run_started_at`。`tasks` 必须与 Application 创建并注入
+`GenerationServices` 的唯一 TaskExecutor 对象身份相同；`task_namespace` 由 run/batch/stage 或
+run/phase/slot/attempt/stage 派生。这两个 RunContext 新字段都没有默认值、空 executor、隐式
+ContextVar 身份或旧六字段构造形式。
+
 ```
 class Stage(Protocol):
     name: str
@@ -210,9 +255,11 @@ LabelKitError
 **帧粒度与 Stage 契约（v1.12 零改动声明）**：帧级分类/标注（3.13.7、3.5.5）对本契约**零改动**——契约例外维持 ②a/②b/②c 三条原文，不新增例外条款：帧产物只写入信封自身的 `member_classifications` / `member_annotations` 两字段（属 ①④ 的正常字段写入），不改成员帧状态机（成员保持 `absorbed`）、不增删列表元素、不改链序与守恒恒等式（6.4）。**克隆共享语义补注**（②a 的 v1.12 侧注）：classify multi 扇出克隆对两字段**按引用共享**（与 `record` / `dedup` 同族，3.13.7 扇出共享行）——帧产物描述成员帧本身而非信封路由，原/克隆行渲染同一 dict；帧级两 pass 只在首标签信封上执行（克隆判据 = `classification.label != classification.labels[0]`，verify S8 同款），M7 帧产物同步亦无克隆分支（克隆信封永不手术，3.7.3）；手术后原/克隆行 members 分叉由既有 `repaired` 位消歧（6.3 补注）。
 
 **sequence 与 Stage 契约：**flat 继续使用 generate 的新增子批例外。sequence 不调用 `GenerateStage.run`，
-由 M10 以 `AttemptTransaction` 串行 admission；候选在事务内调用 M3/M4/M5/M7 的 attempt 接口，只有整个
-counterfactual set 接受后才提交 dedup 与 dataset 状态。因此 sequence 不新增 `PipelineItem.status`，也不借用
-segment/stitch 的成员状态转换；slot rejection 不写半成品 `item.errors`。
+由 `SequenceWorkflow` 在连续候选缓冲中以 slot coordinator 推进完整 attempt。不同 slot 可以并发准备；每个
+attempt 内仍调用 M3/M4/M5/M7 的 attempt 接口，且同一阶段只允许纯叶调用并发，随后按冻结 ordinal 修改
+`AttemptTransaction.items`。只有当前声明序 head 可重验证并提交 dedup、dataset 与 DeliveryState。因此 sequence
+不新增 `PipelineItem.status`，也不借用 segment/stitch 的成员状态转换；slot rejection 不写半成品
+`item.errors`。高 ordinal 的 recoverable outcome 在轮到前不消费 attempt、不写 rejection/report。
 
 `UITree.serialize()` 的规范定义（M3 去重与 M5 提示词共用，M3 传 `quantize_px=dedup.bounds_quantize_px`）：深度优先遍历可见节点；每行 = `" "*depth + role + (' "'+text+'"' if text) + (' desc="'+content_desc+'"' if content_desc) + ' ['+l,t,r,b+']' + 非空 extra 的 k=v 列表`；坐标除以 quantize_px 取整（0 = 不量化）；超长截断规则见 3.5.2。该线性化即 ScreenAI 的 screen-schema 表示思想 [13]。
 
@@ -244,7 +291,7 @@ def tree_diff(a: UITree | None, b: UITree | None, quantize_px: int) -> Mapping
     #  app_changed:bool, title_changed:bool}
 ```
 
-**预算原语契约引（v1.11）**：上下文预算的估算与装填原语（`margin` / `input_budget` / `embed_budget` / `est_text` / `est_image_prior` / `est_prompt` / `fit_text` / `min_window` / `classify_stage_error` 与 `ImageCostCalibrator`）为新共享模块 `labelkit/common/runtime/budget.py` 的模块级纯函数与类（common 层运行时，**非本章类型层**——签名与冻结常数以 CONTRACTS 的 budget 新节为准，机制见 3.9）；本章共享渲染层（`serialize` / `frame_digest` / `tree_diff`）签名零改动，装填器（贪心切窗等）属算子逻辑、落各算子模块。
+**预算原语契约引（v1.11）**：上下文预算的估算与装填原语（`margin` / `input_budget` / `embed_budget` / `est_text` / `est_image_prior` / `est_prompt` / `fit_text` / `min_window` / `classify_stage_error` 与 `ImageCostCalibrator`）位于 `labelkit/common/inference/budget.py`，是模块级纯函数与类（**非执行运行时类型层**——签名与冻结常数以 CONTRACTS 的 budget 新节为准，机制见 3.9）；本章共享渲染层（`serialize` / `frame_digest` / `tree_diff`）签名零改动，装填器（贪心切窗等）属算子逻辑、落各算子模块。
 
 **v1.18 sequence 冻结类型：**下表类型全部为 frozen dataclass；Mapping 在构造时深拷贝为
 JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是接口契约，生产 typedef/dataclass
@@ -306,8 +353,12 @@ JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是�
 | `SequenceAssemblyRequest` | `program`, `schema_engine`, `item`, `projection`, `batch_no` |
 | `ReplayRows` | `rows`, `retained_content_bytes` |
 | `ProjectionWitness` | `main_record_id`, `generation_digest`, `member_sources_digest`, `primary_base_digests` |
+| `PrimaryCandidateReconcileRequest` | `program`, `plan`, `run_id`, `slot`, `projection_witnesses`, `sequences`, `replay_layouts`, `replays`, `retained_content_bytes` |
+| `NoiseCandidateReconcileRequest` | `program`, `run_id`, `noise_slot`, `payload_digest`, `row`, `retained_content_bytes` |
+| `PreparedCandidate` | `slot`, `attempt_index`, `projection_witnesses`, `sequences`, `replays`, `reservation`, `dataset_counters`, `retained_content_bytes`, `digest` |
+| `PreparedNoiseCandidate` | `noise_slot`, `attempt_index`, `payload_digest`, `row`, `similarity_signature`, `dataset_counters`, `retained_content_bytes`, `digest` |
 | `ReconcileRequest` | `program`, `plan`, `run_id`, `projection_witnesses`, `sequences`, `noise_payload_digests`, `noise_rows`, `replays`, `retained_content_bytes` |
-| `GenerationServices` | `config`, `schema_engine`, `llm`, `metrics` |
+| `GenerationServices` | `config`, `schema_engine`, `llm`, `metrics`, `tasks` |
 | `RuntimeCredentials` | `llm`, `embedding` |
 | `ResolvedHook` | `reference`, `target` |
 | `ValidationHooks` | `output`, `sample`, `state` |
@@ -318,7 +369,7 @@ JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是�
 | `DownstreamAttemptRequest` | `transaction`, `run_context` |
 | `DownstreamAttemptResult` | `accepted`, `rejected_stage`, `dataset_counters` |
 | `DedupGroupRequest` | `records`, `exempt_pairs`, `embedding_profile` |
-| `DedupProbeToken` | `capability_id`, `index_generation`, `record_digests`, `exact_features`, `minhash_features`, `embedding_features` |
+| `DedupReservation` | `capability_id`, `epoch`, `record_digests`, `exact_cluster_keys` |
 | `GenerationProduct` | `main_rows`, `stream_rows`, `report` |
 
 `ScenarioBlock` 是只读 Mapping，键为 `tuple[str, str | None]`，值为 `PlannedEvent` tuple。
@@ -481,11 +532,15 @@ def validate_plan_identity(program: GenerationProgram, plan: ScenarioPlan) -> No
 
 
 def reconcile_views(request: ReconcileRequest) -> None:
-    """提交前机械核对最终 main、primary、noise 与 replay 视图。"""
+    """全部内存提交后独立核对最终 main、primary、noise 与 replay 视图。"""
 
 
-def reconcile_prospective_views(request: ReconcileRequest) -> None:
-    """机械核对当前尚未提交的连续交付前缀。"""
+def reconcile_primary_candidate(request: PrimaryCandidateReconcileRequest) -> None:
+    """只核对当前 primary 候选及其 replay，不读取已提交前缀。"""
+
+
+def reconcile_noise_candidate(request: NoiseCandidateReconcileRequest) -> None:
+    """只核对当前 noise 候选，不读取已提交前缀。"""
 
 
 async def deliver_generation(
@@ -506,17 +561,23 @@ class DownstreamAttemptCollaborator(Protocol):
 
 
 class DedupIndex:
-    """管理 sequence 交付期的探测与原子索引提交。"""
+    """管理 sequence 交付期 reservation registry 与正式索引。"""
 
-    async def group_probe(
+    async def group_reserve(
         self,
         request: DedupGroupRequest,
         context: RunContext,
-    ) -> DedupProbeToken:
-        """无写入地试算整组去重并返回一次性能力。"""
+    ) -> DedupReservation:
+        """异步冻结组特征并创建零正式突变的一次性 reservation。"""
 
-    def group_commit(self, token: DedupProbeToken) -> None:
-        """在无 await 临界区一次写入已探测索引特征。"""
+    def group_revalidate(self, reservation: DedupReservation) -> None:
+        """在无 await 临界区针对最新正式索引重验证 reservation。"""
+
+    def group_commit(self, reservation: DedupReservation) -> None:
+        """只消费当前 generation 已验证的 reservation 并写入正式索引。"""
+
+    def group_discard(self, reservation: DedupReservation) -> None:
+        """严格消费一次未提交 reservation 并释放 registry 所有权。"""
 
 
 class SequenceDeliveryEmitter:
@@ -584,19 +645,32 @@ Record 或 `ProjectedSequence` 构造。
 验证一次后只用包内 validated helper，内容重试不重新运行 CP-SAT。四类 render/evaluate request 的 `limits` 都必须
 来自 `GenerationProgram.limits`，是编译后提示、repair 与 payload 上限的唯一运行真值。
 
-`GenerationServices` 是唯一 source config、LLM、SchemaEngine 与 metrics 根；`DeliveryServices` 不复制
-`RunContext`。dedup context 的 cfg 直接复用该 source config；Quality、Annotate 与 Verify 的 context.cfg 则从它
-派生，并用 `GenerationProgram.class_views/frame_classes/frame_schema` 替换同名 sequence/frame 视图与帧标注
-Schema，所有正常与 repair 路径只读该 attempt-local cfg。其余 `llm/schema_engine/metrics` 仍与
-`GenerationServices` 对应对象身份相同，只新建 rng 与 batch number。`AttemptTransaction.items` 是当次 attempt
-内唯一可变 item 真值；
+`GenerationServices` 是唯一 source config、LLM、SchemaEngine、MetricsSink 与 TaskExecutor 根；
+`DeliveryServices` 不复制 `RunContext`。dedup context 的 cfg 直接复用该 source config；Quality、Annotate 与
+Verify 的 context.cfg 则从它派生，并用 `GenerationProgram.class_views/frame_classes/frame_schema` 替换同名
+sequence/frame 视图与帧标注 Schema，所有正常与 repair 路径只读该 attempt-local cfg。派生 context 的
+`llm/schema_engine/metrics/tasks` 与 `GenerationServices` 对应对象身份相同，只新建 rng、batch number 与显式
+task namespace。`AttemptTransaction.items` 是当次 attempt 内唯一可变 item 真值；
 `DownstreamAttemptResult` 不复制 items 或 Schema stats。dataset counter delta 属 attempt-local；LLM usage、
 retry、latency、SchemaEngine resolved-at 与 trace 是全局运行事实，不随事务回滚。
 
-`ReconcileRequest.replays` 保留 ReplayLayout 顺序的 `ReplayRows` 分组，不能预先展平；
-`retained_content_bytes` 携带 prospective 或最终全量费用。CrossView 必须直接从实际 sequence main/primary、noise
-与 replay canonical rows 独立复算每个分组和总费用，不能信任或只相加 carrier 内已有计数。M11 终检或
-CrossView 失败都归 `sequence_projection_mismatch`，拒绝并回滚整个当前 set attempt。
+`PrimaryCandidateReconcileRequest` 只携带当前 slot 的严格 variant 对齐 witnesses、SequenceRows、完整
+ReplayLayouts、实际 ReplayRows 与候选 retained bytes；它不得读取 DeliveryState 前缀。
+`NoiseCandidateReconcileRequest` 是独立 carrier，不与 primary 请求共用可空字段。candidate-local 通过后，
+workflow 才递归深冻结 `PreparedCandidate` 或 `PreparedNoiseCandidate` 并把 reservation/capture 所有权转移到
+连续候选缓冲；随后立即释放 AttemptTransaction、PipelineItem 与投影中间对象。
+
+`CrossViewFrontier` 保存 phase、下一 ordinal、已提交 event ID、timestamp 与 source key。当前 head 的提交协调器
+只根据 prepared carrier 生成不可失败 delta，并在同一无 `await` 临界区随 dedup、retained、counter 与
+DeliveryState 一起应用。全部 primary/noise/replay 内存提交后，`ReconcileRequest` 只代表最终 full reconcile；
+其 `replays` 保留 ReplayLayout 顺序分组，`retained_content_bytes` 只携带最终全量费用，不再表达中间前缀。
+CrossView 必须直接从实际 canonical rows 独立复算每个分组和总费用。candidate-local/frontier 拒绝当前
+attempt；最终 full reconcile 失败是 `InternalError`，不消费 attempt，也不得重新包装为普通 rejection。
+
+`DedupReservation` 外部只携 opaque capability、epoch、record digests 与小型 exact cluster keys；MinHash、
+embedding、Record 引用与完整冻结特征只在 DedupIndex registry 保留一份。reservation 必须严格经历
+reserve → revalidate → commit 或 reserve/validated → discard；任何重复消费、旧 epoch、内容变异或
+revalidate 后 generation 变化都是 `InternalError`。取消、耗尽与运行结束后 registry 必须为空。
 
 `SequenceDeliveryEmitter.prepare_product` 是 `delivery_digest` 的唯一属主：它只计算一次并写入
 report 的深拷贝。`GenerationProduct` 不复制 digest 或 manifest input；`commit` 只从深度冻结的

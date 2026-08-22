@@ -32,14 +32,14 @@ from labelkit.common.errors import (
     PostValidatorInvalidError,
     SchemaViolation,
 )
-from labelkit.common.runtime.budget import feed_reactive_terminal
+from labelkit.common.inference.budget import feed_reactive_terminal
 
 if TYPE_CHECKING:
-    from labelkit.common.runtime.llm_client import LLMClient
+    from labelkit.common.inference.llm_client import LLMClient
     from labelkit.common.observability.obslog import MetricsSink
 
 from labelkit.common.observability.obslog import EV_SCHEMA_REPAIR
-from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
+from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 
 _logger = logging.getLogger("labelkit.schema")
 

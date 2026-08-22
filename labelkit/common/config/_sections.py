@@ -49,7 +49,7 @@ from labelkit.common.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.common.runtime import budget
+from labelkit.common.inference import budget
 
 # v1.9: 11 个取值——"stitch" 加入(T16; 通道 = 阶段名, S1: 事件名首段自动路由,
 # 沿用 classify 先例)。

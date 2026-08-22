@@ -49,20 +49,21 @@ from labelkit import TOOL_VERSION, __version__
 from labelkit.common.contracts.stage import RunContext, Stage
 from labelkit.common.contracts.types import PipelineItem, Record
 from labelkit.common.errors import CircuitBreakerTripped, DeliveryError, InternalError
-from labelkit.common.runtime import budget
+from labelkit.common.inference import budget
 # v1.17 Wave 2b：referenced_profiles 收集器已下沉 common 层（CONTRACTS §7.19.3）。
-from labelkit.common.runtime.credentials import referenced_profiles
-from labelkit.orchestration.generation_delivery import (
+from labelkit.common.inference.credentials import referenced_profiles
+from labelkit.orchestration.sequence_workflow import (
     estimate_sequence,
     estimate_sequence_products,
 )
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import LLMProfile, ResolvedConfig
+    from labelkit.common.contracts.execution import TaskExecutor
     from labelkit.common.contracts.generation import GenerationProgram, ScenarioPlan
     from labelkit.common.observability.obslog import MetricsSink
-    from labelkit.common.runtime.llm_client import LLMClient
-    from labelkit.common.runtime.schema_engine import SchemaEngine
+    from labelkit.common.inference.llm_client import LLMClient
+    from labelkit.common.inference.schema_engine import SchemaEngine
     from labelkit.operators.emitter import Emitter
     from labelkit.operators.ingest import IngestPlan, Ingestor
 
@@ -89,7 +90,7 @@ _ACTION_TYPES = ("click", "long_press", "input_text", "scroll", "drag", "open_ap
 _DEFECT_KINDS = ("label_mismatch", "off_task_members", "missing_head",
                  "missing_tail", "missing_members", "wrong_stitch")
 
-_log = logging.getLogger("labelkit.orchestrator")
+_log = logging.getLogger("labelkit.process_workflow")
 
 
 def _generation_contract_error(message: str) -> NoReturn:
@@ -98,7 +99,7 @@ def _generation_contract_error(message: str) -> NoReturn:
     @param message 固定英文错误文本。
     @return 不返回。
     """
-    _log.error(message, extra={"stage": "orchestrator", "batch": 0})
+    _log.error(message, extra={"stage": "process_workflow", "batch": 0})
     raise InternalError(message)
 
 # report.json 的 quality.aggregate_histogram 桶标签——冻结（§9.3）。
@@ -371,7 +372,7 @@ def _estimate_quality_calls(cfg: "ResolvedConfig", scale: _EstimateScale) -> int
 
 
 def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
-    """静态记录数 / LLM 调用数估算——v1.10（U20）把原 ``Orchestrator._estimate`` 的函数体
+    """静态记录数 / LLM 调用数估算——v1.10（U20）把原 ``ProcessWorkflow._estimate`` 的函数体
     导出为吃 (cfg, plan) 的**模块级纯函数**，由 dry-run、live 的 ``metrics.run_estimate``
     与渲染器的批级分母共用。``plan`` 是 M2 的扫描结果（``IngestPlan``）；generate_only 传
     None（3.6.2 量公式是静态的，不需要 scan）。**返回键集与键序冻结**（见
@@ -429,11 +430,12 @@ class RunServices:
     llm: "LLMClient"                               # M9 LLM 客户端（用量/校准器读取面）
     schema_engine: "SchemaEngine"                  # M8 Schema 引擎（resolved_at 统计面）
     metrics: "MetricsSink"                         # M12 计数与事件汇（含 console 旁路）
+    tasks: "TaskExecutor"                          # Application 拥有的唯一任务执行器
     run_id: str                                    # 本次运行标识
     run_started_at: datetime                       # 运行起点（带时区）
 
 
-class Orchestrator:
+class ProcessWorkflow:
     """驱动整轮运行的编排器；构造签名冻结于 CONTRACTS.md §7.9。"""
 
     def __init__(self, cfg: ResolvedConfig, stages: list[Stage],
@@ -454,12 +456,12 @@ class Orchestrator:
         self.llm = services.llm
         self.schema_engine = services.schema_engine
         self.metrics = services.metrics
+        self.tasks = services.tasks
         self.run_id = services.run_id
         self.run_started_at = services.run_started_at
         # v1.12：向 M11 注入帧计数通路（frame_annotate.failed/discarded ——
         # Ingestor.metrics 同款装配期鸭子面；emitter 构造签名冻结不改）。
         emitter.metrics = services.metrics
-
         # 运行级汇总状态（不含数据内容，spec 3.10.3）。
         self._stage_time: dict[str, float] = {}
         self._agg_hist = [0] * 10
@@ -603,7 +605,7 @@ class Orchestrator:
 
         @return 成功或本进程信号中断的运行摘要。
         """
-        from labelkit.orchestration.generation_delivery import deliver_generation
+        from labelkit.orchestration.sequence_workflow import deliver_generation
 
         request = self._sequence_request()
         services = self._sequence_services()
@@ -671,6 +673,7 @@ class Orchestrator:
             schema_engine=self.schema_engine,
             llm=self.llm,
             metrics=self.metrics,
+            tasks=self.tasks,
         )
         return DeliveryServices(
             generation=generation,
@@ -1068,10 +1071,17 @@ class Orchestrator:
         @param stage_name: 阶段名
         @return: 该 (批, 阶段) 的运行上下文
         """
-        return RunContext(cfg=self.cfg, llm=self.llm, schema_engine=self.schema_engine,
-                          metrics=self.metrics,
-                          rng=random.Random(f"{self.cfg.run.seed}:{batch_no}:{stage_name}"),
-                          batch_no=batch_no)
+        namespace = f"{self.run_id}:batch:{batch_no}:stage:{stage_name}"
+        return RunContext(
+            cfg=self.cfg,
+            llm=self.llm,
+            schema_engine=self.schema_engine,
+            rng=random.Random(f"{self.cfg.run.seed}:{batch_no}:{stage_name}"),
+            batch_no=batch_no,
+            metrics=self.metrics,
+            tasks=self.tasks,
+            task_namespace=namespace,
+        )
 
     def _freeze_calibrator(self) -> None:
         """v1.11（V19/V23②，§7.17）：把刚跑完这批的按 profile 图片成本样本桶折进校准器的
@@ -1154,7 +1164,8 @@ class Orchestrator:
             "quality": cfg.quality.enabled,
             "generate": (cfg.generate.enabled and include_generate
                          and cfg.run.mode == "process"),
-            "annotate": cfg.annotate.enabled,
+            # 序列级标注关闭而帧标注开启时仍必须保留同一 AnnotateStage。
+            "annotate": cfg.annotate.enabled or cfg.frame_annotate.enabled,
             "verify": cfg.verify.enabled,
         }
         by_name = {s.name: s for s in self.stages}
@@ -1261,6 +1272,7 @@ class Orchestrator:
         budget_block = self._report_budget(c)
         if budget_block is not None:
             report["budget"] = budget_block
+        report["runtime"] = dict(self.metrics.runtime_report)
         report["trace"] = self._report_trace()
         report["llm_usage"] = self._report_llm_usage()
         report["timing"] = {

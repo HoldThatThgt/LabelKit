@@ -8,14 +8,16 @@ from dataclasses import fields
 from labelkit.common.contracts.stage import RunContext, Stage
 
 
-def test_run_context_has_exactly_six_required_fields_in_contract_order():
+def test_run_context_has_exactly_eight_required_fields_in_contract_order():
     assert [field.name for field in fields(RunContext)] == [
         "cfg",
         "llm",
         "schema_engine",
-        "metrics",
         "rng",
         "batch_no",
+        "metrics",
+        "tasks",
+        "task_namespace",
     ]
     assert all(
         parameter.default is inspect.Parameter.empty
@@ -29,8 +31,19 @@ def test_run_context_preserves_supplied_runtime_objects():
     schema_engine = object()
     metrics = object()
     rng = random.Random(17)
+    tasks = object()
+    task_namespace = "run:test:batch:3:stage:identity"
 
-    ctx = RunContext(cfg, llm, schema_engine, metrics, rng, 3)
+    ctx = RunContext(
+        cfg,
+        llm,
+        schema_engine,
+        rng,
+        3,
+        metrics,
+        tasks,
+        task_namespace,
+    )
 
     assert (ctx.cfg, ctx.llm, ctx.schema_engine, ctx.metrics) == (
         cfg,
@@ -40,6 +53,8 @@ def test_run_context_preserves_supplied_runtime_objects():
     )
     assert ctx.rng is rng
     assert ctx.batch_no == 3
+    assert ctx.tasks is tasks
+    assert ctx.task_namespace == task_namespace
 
 
 def test_stage_protocol_freezes_name_and_async_run_signature():

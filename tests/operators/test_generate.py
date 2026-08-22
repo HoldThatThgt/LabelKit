@@ -37,8 +37,10 @@ from labelkit.common.config.model import (
     VerifyConfig,
 )
 from labelkit.common.errors import (
+    CircuitBreakerTripped,
     ContextOverflowError,
     InternalError,
+    ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
 )
@@ -84,6 +86,25 @@ class Recorder:
 
     def record_provider_result(self, *, fatal: bool) -> None:
         self.provider_results.append(fatal)
+
+
+class InlineTaskExecutor:
+    """Executes submitted leaves while recording the frozen request."""
+
+    def __init__(self, rng: random.Random | None = None):
+        self.requests: list = []
+        self.rng = rng
+        self.rng_state_at_submit = None
+        self.rng_state_after_leaves = None
+
+    async def run_group(self, request):
+        self.requests.append(request)
+        if self.rng is not None:
+            self.rng_state_at_submit = self.rng.getstate()
+        results = tuple([await task.operation() for task in request.tasks])
+        if self.rng is not None:
+            self.rng_state_after_leaves = self.rng.getstate()
+        return results
 
 
 def mk_cfg(generate: GenerateConfig | None = None, quality: QualityConfig | None = None,
@@ -206,11 +227,14 @@ class SamplesEngine:
 
 
 def run_stage(cfg: ResolvedConfig, batch: list[PipelineItem], *, rng_seed="0:1:generate",
-              num_per_call: int | None = None) -> tuple[list[PipelineItem], SamplesEngine, Recorder]:
+              num_per_call: int | None = None,
+              tasks: InlineTaskExecutor | None = None) -> tuple[list[PipelineItem], SamplesEngine, Recorder]:
     engine = SamplesEngine(num_per_call or cfg.generate.num_per_call)
     metrics = Recorder()
+    executor = tasks or InlineTaskExecutor()
     ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
-                          rng=random.Random(rng_seed), batch_no=1)
+                          rng=random.Random(rng_seed), batch_no=1, tasks=executor,
+                          task_namespace="test:run:batch:1:stage:generate")
     items = asyncio.run(GenerateStage(cfg).run(batch, ctx))
     return items, engine, metrics
 
@@ -527,7 +551,7 @@ def test_postprocess_bucket_accounting_and_voided_call():
     assert metrics.counters["generate.buckets.a×s1.survived_dedup"] == 3
     assert metrics.counters["generate.buckets.b×null.calls"] == 1
     assert "generate.buckets.b×null.produced" not in metrics.counters  # voided → no produced
-    # counts.generated is owned by M10 (orchestrator); M6 must not touch counts.*
+    # counts.generated is owned by M10 (ProcessWorkflow); M6 must not touch counts.*
     assert "counts.generated" not in metrics.counters
     # M6 emits NO trace events: the §8.1 catalog defines none for generate, and a voided
     # call produces no StageError (spec 3.6.3) — bucket counters only.
@@ -886,8 +910,10 @@ def test_generate_all_flat_path_ignores_classes():
                               "other": mk_view("other")})
     engine = SamplesEngine(g.num_per_call)
     metrics = Recorder()
+    tasks = InlineTaskExecutor()
     ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
-                          rng=random.Random("0:0:generate"), batch_no=0)
+                          rng=random.Random("0:0:generate"), batch_no=0, tasks=tasks,
+                          task_namespace="test:run:batch:0:stage:generate")
     records = asyncio.run(GenerateStage(cfg).generate_all(ctx))
 
     assert len(engine.calls) == 2                     # ceil(3×2/4)
@@ -909,19 +935,183 @@ def test_generate_all_seedless_honours_limit_before_dispatch():
     cfg = mk_cfg(generate=generate, mode="generate_only", limit=3)
     engine = SamplesEngine(generate.num_per_call)
     metrics = Recorder()
+    tasks = InlineTaskExecutor()
     ctx = SimpleNamespace(
         cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
-        rng=random.Random(0), batch_no=0,
+        rng=random.Random(0), batch_no=0, tasks=tasks,
+        task_namespace="test:run:batch:0:stage:generate",
     )
     records = asyncio.run(GenerateStage(cfg).generate_all(ctx))
     assert len(engine.calls) == 1
     assert len(records) == 3
 
 
+def test_flat_generate_submits_frozen_plans_and_consumes_no_rng_in_leaves():
+    generate = GenerateConfig(
+        enabled=True, instruction="gen", llms=("a", "b"), seeds_per_call=1,
+        num_per_record=1, num_per_call=1,
+    )
+    cfg = mk_cfg(generate=generate, quality=QualityConfig(threshold=0.5))
+    rng = random.Random(23)
+    tasks = InlineTaskExecutor(rng)
+    engine = SamplesEngine(1)
+    metrics = Recorder()
+    ctx = SimpleNamespace(
+        cfg=cfg, llm=None, schema_engine=engine, metrics=metrics, rng=rng,
+        batch_no=1, tasks=tasks, task_namespace="run-x:batch:1:stage:generate",
+    )
+    batch = [mk_item("id-a", "足够长的种子样本甲", 0.9),
+             mk_item("id-b", "足够长的种子样本乙", 0.9)]
+
+    items = asyncio.run(GenerateStage(cfg).run(batch, ctx))
+
+    assert len(items) == 2
+    assert len(tasks.requests) == 1
+    specs = tasks.requests[0].tasks
+    assert [spec.task_id for spec in specs] == [
+        "run-x:batch:1:stage:generate:generate:0",
+        "run-x:batch:1:stage:generate:generate:1",
+    ]
+    assert [spec.declaration_key for spec in specs] == [(1, 6, 0), (1, 6, 1)]
+    assert [spec.stage for spec in specs] == ["generate", "generate"]
+    assert [spec.resource_key for spec in specs] == [("llm", "a"), ("llm", "b")]
+    assert tasks.rng_state_at_submit == tasks.rng_state_after_leaves
+
+
+def test_flat_generate_reverse_completion_reduces_in_plan_order():
+    class ReverseTaskExecutor:
+        """Completes leaves from the highest request index to the lowest."""
+
+        def __init__(self):
+            self.completion_order: list[int] = []
+
+        async def run_group(self, request):
+            turn = len(request.tasks) - 1
+            condition = asyncio.Condition()
+            results = [None] * len(request.tasks)
+
+            async def run_one(index, task):
+                nonlocal turn
+                async with condition:
+                    await condition.wait_for(lambda: turn == index)
+                    results[index] = await task.operation()
+                    self.completion_order.append(index)
+                    turn -= 1
+                    condition.notify_all()
+
+            async with asyncio.TaskGroup() as group:
+                for index, task in enumerate(request.tasks):
+                    group.create_task(run_one(index, task))
+            return tuple(results)
+
+    class ProfileEngine:
+        async def complete_validated(self, profile, _prompt, schema=None, *, scope):
+            samples = {
+                "a": "第一条足够长且与另一条不同的平面生成结果",
+                "b": "第二条足够长且独立表达的平面生成结果",
+            }
+            return {"samples": [samples[profile]]}, None, 1, "m"
+
+    generate = GenerateConfig(
+        enabled=True, instruction="gen", llms=("a", "b"), seeds_per_call=1,
+        num_per_record=1, num_per_call=1,
+    )
+    cfg = mk_cfg(generate=generate, quality=QualityConfig(threshold=0.5))
+    tasks = ReverseTaskExecutor()
+    ctx = SimpleNamespace(
+        cfg=cfg, llm=None, schema_engine=ProfileEngine(), metrics=Recorder(),
+        rng=random.Random(4), batch_no=1, tasks=tasks,
+        task_namespace="run-x:batch:1:stage:generate",
+    )
+    batch = [mk_item("id-a", "足够长的种子样本甲", 0.9),
+             mk_item("id-b", "足够长的种子样本乙", 0.9)]
+
+    items = asyncio.run(GenerateStage(cfg).run(batch, ctx))
+
+    assert tasks.completion_order == [1, 0]
+    assert [item.record.text for item in items] == [
+        "第一条足够长且与另一条不同的平面生成结果",
+        "第二条足够长且独立表达的平面生成结果",
+    ]
+
+
+def test_flat_generate_runtime_rejection_has_no_direct_execution_fallback():
+    class RejectingTaskExecutor:
+        async def run_group(self, _request):
+            raise RuntimeError("runtime rejected group")
+
+    generate = GenerateConfig(
+        enabled=True, instruction="gen", seeds_per_call=1,
+        num_per_record=1, num_per_call=1,
+    )
+    cfg = mk_cfg(generate=generate, quality=QualityConfig(threshold=0.5))
+    engine = SamplesEngine(1)
+    ctx = SimpleNamespace(
+        cfg=cfg, llm=None, schema_engine=engine, metrics=Recorder(), rng=random.Random(0),
+        batch_no=1, tasks=RejectingTaskExecutor(), task_namespace="run-x:batch:1:stage:generate",
+    )
+
+    with pytest.raises(RuntimeError, match="runtime rejected group"):
+        asyncio.run(GenerateStage(cfg).run([mk_item("id", "足够长的种子样本", 0.9)], ctx))
+    assert engine.calls == []
+
+
+def test_flat_generate_provider_fatal_remains_a_voided_call(caplog):
+    class FatalEngine:
+        async def complete_validated(self, *_args, **_kwargs):
+            raise ProviderFatalError("provider rejected request", "default", 401)
+
+    generate = GenerateConfig(
+        enabled=True, instruction="gen", seeds_per_call=1,
+        num_per_record=1, num_per_call=1,
+    )
+    cfg = mk_cfg(generate=generate, quality=QualityConfig(threshold=0.5))
+    tasks = InlineTaskExecutor()
+    ctx = SimpleNamespace(
+        cfg=cfg, llm=None, schema_engine=FatalEngine(), metrics=Recorder(), rng=random.Random(0),
+        batch_no=1, tasks=tasks, task_namespace="run-x:batch:1:stage:generate",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="labelkit.generate"):
+        items = asyncio.run(
+            GenerateStage(cfg).run([mk_item("id", "足够长的种子样本", 0.9)], ctx)
+        )
+    assert items == []
+    assert len(tasks.requests) == 1
+    assert any("kind=provider_fatal" in record.message for record in caplog.records)
+
+
+def test_flat_generate_circuit_breaker_escapes_the_leaf():
+    class BrokenEngine:
+        async def complete_validated(self, *_args, **_kwargs):
+            raise CircuitBreakerTripped("circuit open")
+
+    generate = GenerateConfig(
+        enabled=True, instruction="gen", seeds_per_call=1,
+        num_per_record=1, num_per_call=1,
+    )
+    cfg = mk_cfg(generate=generate, quality=QualityConfig(threshold=0.5))
+    ctx = SimpleNamespace(
+        cfg=cfg, llm=None, schema_engine=BrokenEngine(), metrics=Recorder(), rng=random.Random(0),
+        batch_no=1, tasks=InlineTaskExecutor(), task_namespace="run-x:batch:1:stage:generate",
+    )
+
+    with pytest.raises(CircuitBreakerTripped, match="circuit open"):
+        asyncio.run(GenerateStage(cfg).run([mk_item("id", "足够长的种子样本", 0.9)], ctx))
+
+
+def test_flat_generate_operator_source_has_no_asyncio_gather():
+    import inspect
+
+    source = inspect.getsource(GenerateStage)
+    assert "asyncio.gather" not in source
+
+
 def test_stage_empty_seed_pool_and_sequence_form_guard():
     cfg = mk_cfg(quality=QualityConfig(threshold=0.5))
-    items, engine, _metrics = run_stage(cfg, [])
-    assert items == [] and engine.calls == []
+    tasks = InlineTaskExecutor()
+    items, engine, _metrics = run_stage(cfg, [], tasks=tasks)
+    assert items == [] and engine.calls == [] and tasks.requests == []
     sequence = mk_cfg(generate=GenerateConfig(enabled=True, form="sequence"))
     with pytest.raises(InternalError, match="cannot enter GenerateStage"):
         GenerateStage(sequence)
@@ -955,7 +1145,7 @@ def _seed_plan(seeds=None, llm="default") -> CallPlan:
 
 
 def test_fit_plan_seeds_tail_drop_deterministic():
-    from labelkit.common.runtime import budget as budget_mod
+    from labelkit.common.inference import budget as budget_mod
     from labelkit.operators.generate import _fit_plan_seeds
 
     cfg = _budget_cfg(700)
@@ -1026,15 +1216,48 @@ def test_stage_unfittable_call_voided_with_context_overflow_kind(caplog):
                        num_per_record=4, num_per_call=4)
     cfg = _budget_cfg(530, generate=g, quality=QualityConfig(threshold=0.5))
     batch = [mk_item(f"id{i}", f"种子{i}" + "字" * 100, 0.9) for i in range(4)]
+    tasks = InlineTaskExecutor()
     with caplog.at_level(logging.WARNING, logger="labelkit.generate"):
-        items, engine, metrics = run_stage(cfg, batch)
+        items, engine, metrics = run_stage(cfg, batch, tasks=tasks)
     assert items == []                             # every call voided, no records
     assert engine.calls == []                      # doomed requests never sent
+    assert tasks.requests == []                    # no empty runtime group submitted
     # existing void semantics: bucket calls counted, produced 0, precise kind
     assert metrics.counters["generate.buckets.default×null.calls"] == 4
     assert "generate.buckets.default×null.produced" not in metrics.counters
     assert "budget.truncations.generate" not in metrics.counters
     assert any("kind=context_overflow" in r.message for r in caplog.records)
+
+
+def test_stage_mixed_unfittable_and_dispatched_results_stay_positionally_aligned():
+    import dataclasses
+
+    generate = GenerateConfig(
+        enabled=True, instruction="gen", llms=("tiny", "wide"), seeds_per_call=1,
+        num_per_record=1, num_per_call=1,
+    )
+    cfg = mk_cfg(generate=generate, quality=QualityConfig(threshold=0.5))
+    cfg = dataclasses.replace(
+        cfg,
+        llm_profiles={
+            "tiny": _budget_profile(530, "tiny"),
+            "wide": _budget_profile(100_000, "wide"),
+        },
+    )
+    batch = [mk_item("id-a", "种子甲" + "字" * 100, 0.9),
+             mk_item("id-b", "种子乙" + "字" * 100, 0.9)]
+    tasks = InlineTaskExecutor()
+
+    items, engine, metrics = run_stage(cfg, batch, num_per_call=1, tasks=tasks)
+
+    assert len(engine.calls) == 1
+    assert [call[0] for call in engine.calls] == ["wide"]
+    assert [item.record.text for item in items] == [DISTINCT_SAMPLES[0]]
+    assert [spec.task_id for spec in tasks.requests[0].tasks] == [
+        "test:run:batch:1:stage:generate:generate:1"
+    ]
+    assert metrics.counters["generate.buckets.tiny×null.calls"] == 1
+    assert metrics.counters["generate.buckets.wide×null.calls"] == 1
 
 
 def test_stage_reactive_context_overflow_feeds_breaker_once(caplog):
@@ -1052,9 +1275,11 @@ def test_stage_reactive_context_overflow_feeds_breaker_once(caplog):
     )
     cfg = mk_cfg(generate=generate, quality=QualityConfig(threshold=0.5))
     metrics = Recorder()
+    tasks = InlineTaskExecutor()
     ctx = SimpleNamespace(
         cfg=cfg, llm=None, schema_engine=OverflowEngine(), metrics=metrics,
-        rng=random.Random(0), batch_no=1,
+        rng=random.Random(0), batch_no=1, tasks=tasks,
+        task_namespace="test:run:batch:1:stage:generate",
     )
     batch = [mk_item("id", "足够长的种子样本文本", 0.9)]
     with caplog.at_level(logging.WARNING, logger="labelkit.generate"):

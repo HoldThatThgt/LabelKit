@@ -59,7 +59,7 @@ class LLMProfile:
     base_url: str                                 # 端点根地址
     model: str                                    # 模型串（原样发给 provider）
     api_key_env: str                              # 密钥所在的环境变量**名**（值绝不入配置）
-    max_concurrency: int = 8                      # 每档案一个 Semaphore 的并发上限
+    max_concurrency: int = 8                      # ResourceManager 中该档案的逻辑调用容量
     timeout_s: int = 120                          # 单次 HTTP 请求超时（秒）
     max_retries: int = 5                          # 可重试错误的最大重试次数
     retry_base_delay_s: float = 1.0               # 全抖动指数退避的基准延迟（秒）
@@ -107,7 +107,7 @@ class EmbeddingProfile:
     api_key_env: str                              # 密钥所在的环境变量**名**
     provider: Literal["openai_compatible"] = "openai_compatible"
                                                   # 协议族（向量侧只支持 openai_compatible）
-    max_concurrency: int = 8                      # 并发上限（与 llm.* 同机制）
+    max_concurrency: int = 8                      # ResourceManager 中该档案的逻辑调用容量
     timeout_s: int = 60                           # 单次请求超时（秒）
     max_retries: int = 5                          # 最大重试次数
     retry_base_delay_s: float = 1.0               # 退避基准延迟，与 llm.* 同机制 [FROZEN HERE]

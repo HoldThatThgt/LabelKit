@@ -12,11 +12,12 @@ import asyncio
 import hashlib
 import math
 import random
+from dataclasses import replace
 
 import pytest
 from PIL import Image
 
-from labelkit.common.config.model import DedupConfig
+from labelkit.common.config.model import DedupConfig, EmbeddingProfile
 from labelkit.common.contracts.generation import DedupGroupRequest
 from labelkit.operators.dedup import (
     DedupGroupRejected,
@@ -32,7 +33,13 @@ from labelkit.operators.dedup import (
 )
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import ImageRef, PipelineItem, Record, RecordRef, UINode, UITree
-from labelkit.common.errors import InternalError, ProviderFatalError, ProviderRetryableError
+from labelkit.common.errors import (
+    CircuitBreakerTripped,
+    ContextOverflowError,
+    InternalError,
+    ProviderFatalError,
+    ProviderRetryableError,
+)
 
 # ── fixtures / helpers ─────────────────────────────────────────────────────
 
@@ -57,9 +64,21 @@ class FakeMetrics:
         self.counters[key] = self.counters.get(key, 0) + n
 
 
+class InlineTaskExecutor:
+    """Executes planned leaves inline while preserving the TaskExecutor contract."""
+
+    def __init__(self):
+        self.requests = []
+
+    async def run_group(self, request):
+        self.requests.append(request)
+        return tuple([await task.operation() for task in request.tasks])
+
+
 def make_ctx(batch_no: int = 1) -> RunContext:
     return RunContext(cfg=None, llm=None, schema_engine=None,
-                      metrics=FakeMetrics(), rng=random.Random(0), batch_no=batch_no)
+                      metrics=FakeMetrics(), rng=random.Random(0), batch_no=batch_no,
+                      tasks=InlineTaskExecutor(), task_namespace="test:dedup")
 
 
 def text_record(text: str, rid: str, line_no: int = 1) -> Record:
@@ -786,8 +805,7 @@ def test_semantic_verdict_kind_sequence_cases():
 
 # ── v1.11 embed-input budget truncation (V15, spec 3.3.3 嵌入输入预算截断) ──
 
-def _emb_profile(context_window: int) -> "EmbeddingProfile":
-    from labelkit.common.config.model import EmbeddingProfile
+def _emb_profile(context_window: int) -> EmbeddingProfile:
     return EmbeddingProfile(name="emb", base_url="http://x", model="m",
                             api_key_env="K", context_window=context_window)
 
@@ -806,11 +824,12 @@ class _EmbedRecorder:
         return [[1.0, 0.0]]
 
 
-def _semantic_ctx(context_window: int, llm: _EmbedRecorder) -> RunContext:
+def _semantic_ctx(context_window: int, llm: _EmbedRecorder, tasks=None) -> RunContext:
     from types import SimpleNamespace
     cfg = SimpleNamespace(embedding_profiles={"emb": _emb_profile(context_window)})
     return RunContext(cfg=cfg, llm=llm, schema_engine=None, metrics=FakeMetrics(),
-                      rng=random.Random(0), batch_no=1)
+                      rng=random.Random(0), batch_no=1, tasks=tasks or InlineTaskExecutor(),
+                      task_namespace="test:dedup:semantic")
 
 
 def _long_text_item() -> PipelineItem:
@@ -820,7 +839,7 @@ def _long_text_item() -> PipelineItem:
 
 
 def test_semantic_embed_input_head_truncated_under_declared_window():
-    from labelkit.common.runtime import budget as budget_mod
+    from labelkit.common.inference import budget as budget_mod
 
     cfg = DedupConfig(semantic=True, semantic_embedding="emb")
     llm = _EmbedRecorder()
@@ -889,6 +908,149 @@ def test_context_overflow_from_embed_classified_precisely():
     assert ev and ev[0][4]["kind"] == "context_overflow"
 
 
+class _ReverseTaskExecutor:
+    """Runs every leaf in reverse order and returns input-ordered outcomes."""
+
+    def __init__(self):
+        self.task_ids: list[str] = []
+
+    async def run_group(self, request):
+        results = [None] * len(request.tasks)
+        for index in range(len(request.tasks) - 1, -1, -1):
+            task = request.tasks[index]
+            self.task_ids.append(task.task_id)
+            results[index] = await task.operation()
+        return tuple(results)
+
+
+class _TextEmbedding:
+    """Records text dispatch order and returns one shared semantic vector."""
+
+    def __init__(self):
+        self.texts: list[str] = []
+
+    async def embed(self, _profile, texts):
+        self.texts.extend(texts)
+        return [[1.0, 0.0]]
+
+
+class _SequenceEmbedding:
+    """Returns configured values or exceptions in call order."""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.texts: list[str] = []
+
+    async def embed(self, _profile, texts):
+        self.texts.extend(texts)
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return [outcome]
+
+
+def test_semantic_reverse_completion_keeps_input_order_first_writer():
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    executor = _ReverseTaskExecutor()
+    llm = _TextEmbedding()
+    ctx = _semantic_ctx(0, llm, executor)
+    texts = ["alpha northern lighthouse", "beta desert railway", "gamma ocean observatory"]
+    items = [PipelineItem(record=text_record(text, f"id-{index}"))
+             for index, text in enumerate(texts)]
+
+    run_stage(DedupStage(cfg, DedupIndex(cfg, "text")), items, ctx)
+
+    assert llm.texts == list(reversed(texts))
+    assert executor.task_ids == [
+        "test:dedup:semantic:semantic:2",
+        "test:dedup:semantic:semantic:1",
+        "test:dedup:semantic:semantic:0",
+    ]
+    assert items[0].status == "active"
+    assert [item.dedup.kept_id for item in items[1:]] == ["id-0", "id-0"]
+    assert [item.dedup.kind for item in items[1:]] == ["near_semantic", "near_semantic"]
+
+
+def test_semantic_exact_twins_are_both_dispatched_before_reduce():
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    executor = InlineTaskExecutor()
+    llm = _TextEmbedding()
+    ctx = _semantic_ctx(0, llm, executor)
+    items = [PipelineItem(record=text_record("same static candidate", f"id-{index}"))
+             for index in range(2)]
+
+    run_stage(DedupStage(cfg, DedupIndex(cfg, "text")), items, ctx)
+
+    assert len(executor.requests) == 1
+    assert len(executor.requests[0].tasks) == 2
+    assert [task.declaration_key for task in executor.requests[0].tasks] == [
+        (1, 2, 0), (1, 2, 1),
+    ]
+    assert llm.texts == ["same static candidate", "same static candidate"]
+    assert items[1].status == "dropped_dup" and items[1].dedup.kind == "exact"
+
+
+def test_unused_speculative_error_does_not_mutate_duplicate_item_or_index():
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    error = ContextOverflowError("unused", phase="precheck")
+    llm = _SequenceEmbedding([[1.0, 0.0], error])
+    ctx = _semantic_ctx(0, llm)
+    index = DedupIndex(cfg, "text")
+    items = [PipelineItem(record=text_record("same candidate", f"id-{index}"))
+             for index in range(2)]
+
+    run_stage(DedupStage(cfg, index), items, ctx)
+
+    assert items[1].status == "dropped_dup" and items[1].dedup.kept_id == "id-0"
+    assert items[1].errors == []
+    assert "budget.overflow_records" not in ctx.metrics.counters
+    assert index.semantic_probe([1.0, 0.0])[0] == "id-0"
+
+
+def test_unused_provider_failure_remains_observed_after_exact_rejection():
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    error = ProviderRetryableError("unused", "emb", 1)
+    llm = _SequenceEmbedding([[1.0, 0.0], error])
+    ctx = _semantic_ctx(0, llm)
+    items = [PipelineItem(record=text_record("same provider candidate", f"id-{index}"))
+             for index in range(2)]
+
+    run_stage(DedupStage(cfg, DedupIndex(cfg, "text")), items, ctx)
+
+    assert items[1].status == "dropped_dup" and items[1].errors == []
+    assert ctx.metrics.counters["dedup.embedding_failures"] == 1
+
+
+def test_semantic_off_submits_no_task_group():
+    class _RejectingExecutor:
+        async def run_group(self, _request):
+            raise AssertionError("hash-only dedup submitted a task group")
+
+    cfg = DedupConfig(semantic=False)
+    ctx = make_ctx()
+    ctx.tasks = _RejectingExecutor()
+    item = PipelineItem(record=text_record("hash only", "id-0"))
+
+    run_stage(DedupStage(cfg, DedupIndex(cfg, "text")), [item], ctx)
+
+    assert item.status == "active" and item.dedup.kind == "unique"
+
+
+def test_semantic_circuit_breaker_escapes_before_any_reduce():
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    llm = _EmbedRecorder(exc=CircuitBreakerTripped("open"))
+    ctx = _semantic_ctx(0, llm)
+    index = DedupIndex(cfg, "text")
+    items = [PipelineItem(record=text_record("first", "id-0")),
+             PipelineItem(record=text_record("second", "id-1"))]
+
+    with pytest.raises(CircuitBreakerTripped, match="open"):
+        run_stage(DedupStage(cfg, index), items, ctx)
+
+    assert all(item.status == "active" and item.dedup is None for item in items)
+    assert index.probe_and_add(text_record("first", "fresh")).kind == "unique"
+
+
 class _GroupEmbedder:
     """返回测试指定向量表的 group embedding 协作者。"""
 
@@ -914,9 +1076,10 @@ class _GroupEmbedder:
 @pytest.mark.parametrize("error", (
     ProviderFatalError("fatal", "emb"),
     ProviderRetryableError("retry", "emb", 0),
+    asyncio.CancelledError(),
 ))
-def test_group_probe_propagates_provider_terminal_without_pending_token(error):
-    """semantic group probe 不把 provider 终态降级为普通 duplicate。"""
+def test_group_reserve_propagates_terminal_or_cancellation_without_reservation(error):
+    """semantic reservation 不把 provider 终态或 cancellation 降级为 duplicate。"""
     cfg = DedupConfig(semantic=True, semantic_embedding="emb")
     index = DedupIndex(cfg, "text")
     record = text_record("provider boundary", "9" * 16)
@@ -929,15 +1092,16 @@ def test_group_probe_propagates_provider_terminal_without_pending_token(error):
 
     ctx.llm = FailingEmbedder()
     with pytest.raises(type(error)) as caught:
-        asyncio.run(index.group_probe(request, ctx))
+        asyncio.run(index.group_reserve(request, ctx))
     assert caught.value is error
-    assert index._pending_groups == {}
+    assert index._group_reservations == {}
     assert index._group_exact == {}
     assert index._group_minhashes == {}
     assert index._group_vec_count == 0
 
 
-def test_group_commit_rejects_mixed_vector_dimensions_before_any_index_write():
+def test_group_reserve_rejects_mixed_vector_dimensions_before_registry_write():
+    """非法 semantic 特征在 reservation 暴露前终止且不写任何状态。"""
     cfg = DedupConfig()
     index = DedupIndex(cfg, "text")
     records = (text_record("alpha unique", "a" * 16),
@@ -949,41 +1113,119 @@ def test_group_commit_rejects_mixed_vector_dimensions_before_any_index_write():
     )
     ctx = make_ctx()
     ctx.llm = _GroupEmbedder([[1.0, 0.0], [1.0, 0.0, 0.0]])
-    token = asyncio.run(index.group_probe(request, ctx))
-
     with pytest.raises(InternalError, match="embedding dimension mismatch"):
-        index.group_commit(token)
+        asyncio.run(index.group_reserve(request, ctx))
 
+    assert index._group_reservations == {}
     assert index._group_exact == {}
     assert index._group_minhashes == {}
     assert index._group_vec_buf is None
     assert index._group_vec_ids == []
     assert index._group_vec_count == 0
-    assert index._group_generation == token.index_generation
 
 
-def test_group_probe_token_minhash_is_independent_and_tampering_is_rejected():
-    """调用方修改 token 的 MinHash 不能同步改变 pending 私有真值。"""
+def test_group_reserve_rejects_duplicate_record_ids_before_registry_write():
+    """组内 record identity 必须唯一，即使文本和豁免关系都不冲突。"""
+    index = DedupIndex(DedupConfig(), "text")
+    records = (
+        text_record("first distinct content", "a" * 16),
+        text_record("second distinct content", "a" * 16),
+    )
+    request = DedupGroupRequest(
+        records, frozenset({(records[0].id, records[1].id)}), None,
+    )
+
+    with pytest.raises(InternalError, match="duplicate record id"):
+        asyncio.run(index.group_reserve(request, make_ctx()))
+
+    assert index._group_reservations == {}
+
+
+@pytest.mark.parametrize(("vectors", "message"), (
+    ([], "embedding count mismatch"),
+    ([[float("nan"), 0.0]], "invalid embedding value"),
+))
+def test_group_reserve_rejects_invalid_embedding_shape_or_value(vectors, message):
+    """embedding 数量与有限值在 reservation 暴露前完成终态校验。"""
+    index = DedupIndex(DedupConfig(), "text")
+    ctx = make_ctx()
+
+    class RawEmbedder:
+        async def embed(self, profile, texts):
+            assert profile == "emb" and len(texts) == 1
+            return vectors
+
+    ctx.llm = RawEmbedder()
+    request = DedupGroupRequest(
+        (text_record("embedding candidate", "2" * 16),), frozenset(), "emb",
+    )
+
+    with pytest.raises(InternalError, match=message):
+        asyncio.run(index.group_reserve(request, ctx))
+
+    assert index._group_reservations == {}
+
+
+def test_group_reserve_rejects_dimension_mismatch_with_committed_index():
+    """新 reservation 的 semantic 维度必须与正式向量索引一致。"""
+    index = DedupIndex(DedupConfig(), "text")
+    ctx = make_ctx()
+    ctx.llm = _GroupEmbedder([[1.0, 0.0]])
+    committed = asyncio.run(index.group_reserve(DedupGroupRequest(
+        (text_record("semantic anchor", "3" * 16),), frozenset(), "emb",
+    ), ctx))
+    index.group_revalidate(committed)
+    index.group_commit(committed)
+    ctx.llm = _GroupEmbedder([[1.0, 0.0, 0.0]])
+
+    with pytest.raises(InternalError, match="embedding dimension mismatch"):
+        asyncio.run(index.group_reserve(DedupGroupRequest(
+            (text_record("different dimension", "4" * 16),), frozenset(), "emb",
+        ), ctx))
+
+    assert len(index._group_exact) == 1
+    assert index._group_reservations == {}
+
+
+def test_group_revalidate_rejects_corrupted_private_feature_alignment():
+    """registry 私有重特征若失配，重验不能推进为 Validated。"""
+    index = DedupIndex(DedupConfig(), "text")
+    reservation = asyncio.run(index.group_reserve(DedupGroupRequest(
+        (text_record("private feature", "5" * 16),), frozenset(), None,
+    ), make_ctx()))
+    entry = index._group_reservations[reservation.capability_id]
+    original = entry.features
+    entry.features = replace(original, minhash_features=())
+
+    with pytest.raises(InternalError, match="feature count mismatch"):
+        index.group_revalidate(reservation)
+
+    entry.features = original
+    index.group_discard(reservation)
+
+
+@pytest.mark.parametrize("field", ("record_digests", "exact_cluster_keys"))
+def test_group_reservation_rejects_external_capability_tampering(field):
+    """外部 capability 不携带重特征，且任一公开摘要篡改都被拒绝。"""
     cfg = DedupConfig()
     index = DedupIndex(cfg, "text")
     record = text_record("independent immutable feature", "c" * 16)
     request = DedupGroupRequest((record,), frozenset(), None)
-    token = asyncio.run(index.group_probe(request, make_ctx()))
-    signature = token.minhash_features[0]
-    assert signature is not None
-    signature.hashvalues[:] = 0
+    reservation = asyncio.run(index.group_reserve(request, make_ctx()))
+    changed = replace(reservation, **{field: ("altered",)})
 
-    with pytest.raises(InternalError, match="altered capability"):
-        index.group_commit(token)
+    with pytest.raises(InternalError, match="altered reservation"):
+        index.group_revalidate(changed)
 
     assert index._group_exact == {}
     assert index._group_minhashes == {}
     assert index._group_vec_buf is None
-    assert index._group_generation == token.index_generation
+    assert reservation.capability_id in index._group_reservations
+    index.group_discard(reservation)
 
 
-def test_group_commit_atomically_populates_all_indexes_and_future_probe_hits():
-    """commit 同步写 exact、LSH、向量索引，后续组通过正式索引命中。"""
+def test_group_commit_requires_revalidation_and_populates_every_formal_index():
+    """只有 Validated reservation 能同步写 exact、LSH 与向量索引。"""
     cfg = DedupConfig(semantic=True, semantic_embedding="emb")
     index = DedupIndex(cfg, "text")
     records = (
@@ -995,12 +1237,17 @@ def test_group_commit_atomically_populates_all_indexes_and_future_probe_hits():
     )
     ctx = make_ctx()
     ctx.llm = _GroupEmbedder([[1.0, 0.0], [0.0, 1.0]])
-    token = asyncio.run(index.group_probe(request, ctx))
+    reservation = asyncio.run(index.group_reserve(request, ctx))
     assert index._group_exact == {}
     assert index._group_minhashes == {}
     assert index._group_vec_count == 0
+    with pytest.raises(InternalError, match="invalid reservation state"):
+        index.group_commit(reservation)
 
-    index.group_commit(token)
+    index.group_revalidate(reservation)
+    index.group_commit(reservation)
+    with pytest.raises(InternalError, match="invalid reservation"):
+        index.group_commit(reservation)
 
     assert len(index._group_exact) == 2
     assert len(index._group_minhashes) == 2
@@ -1010,30 +1257,32 @@ def test_group_commit_atomically_populates_all_indexes_and_future_probe_hits():
     duplicate_request = DedupGroupRequest((duplicate,), frozenset(), "emb")
     ctx.llm = _GroupEmbedder([[1.0, 0.0]])
     with pytest.raises(DedupGroupRejected):
-        asyncio.run(index.group_probe(duplicate_request, ctx))
+        asyncio.run(index.group_reserve(duplicate_request, ctx))
+    assert index._group_reservations == {}
 
 
 def test_group_semantic_index_rejects_distinct_text_with_matching_vector():
-    """正式向量索引参与未来 group probe，不依赖 exact 或 MinHash 全扫描。"""
+    """正式向量索引参与未来 reservation，不依赖 exact 或 MinHash 全扫描。"""
     cfg = DedupConfig(semantic=True, semantic_embedding="emb")
     index = DedupIndex(cfg, "text")
     first = text_record("committed semantic anchor", "1" * 16)
     ctx = make_ctx()
     ctx.llm = _GroupEmbedder([[1.0, 0.0]])
-    token = asyncio.run(index.group_probe(
+    reservation = asyncio.run(index.group_reserve(
         DedupGroupRequest((first,), frozenset(), "emb"), ctx
     ))
-    index.group_commit(token)
+    index.group_revalidate(reservation)
+    index.group_commit(reservation)
 
     candidate = text_record("lexically unrelated future candidate", "2" * 16)
     ctx.llm = _GroupEmbedder([[0.99, 0.01]])
     with pytest.raises(DedupGroupRejected):
-        asyncio.run(index.group_probe(
+        asyncio.run(index.group_reserve(
             DedupGroupRequest((candidate,), frozenset(), "emb"), ctx
         ))
 
 
-def test_group_probe_rejects_non_exempt_semantic_duplicate_inside_current_set():
+def test_group_reserve_rejects_non_exempt_semantic_duplicate_inside_current_set():
     """当前 set 的非豁免 pair 使用 attempt-local 特征比较，拒绝前零索引写入。"""
     cfg = DedupConfig(semantic=True, semantic_embedding="emb")
     index = DedupIndex(cfg, "text")
@@ -1044,9 +1293,137 @@ def test_group_probe_rejects_non_exempt_semantic_duplicate_inside_current_set():
     ctx = make_ctx()
     ctx.llm = _GroupEmbedder([[1.0, 0.0], [1.0, 0.0]])
     with pytest.raises(DedupGroupRejected):
-        asyncio.run(index.group_probe(
+        asyncio.run(index.group_reserve(
             DedupGroupRequest(records, frozenset(), "emb"), ctx
         ))
+    assert index._group_reservations == {}
     assert index._group_exact == {}
     assert index._group_minhashes == {}
     assert index._group_vec_count == 0
+
+
+def test_pending_reservations_are_invisible_until_ordered_revalidation():
+    """相同投机候选可并存，低序 commit 后高序才按最新前缀拒绝。"""
+    index = DedupIndex(DedupConfig(), "text")
+    first = text_record("same speculative content", "5" * 16)
+    second = text_record("same speculative content", "6" * 16)
+    low = asyncio.run(index.group_reserve(
+        DedupGroupRequest((first,), frozenset(), None), make_ctx()
+    ))
+    high = asyncio.run(index.group_reserve(
+        DedupGroupRequest((second,), frozenset(), None), make_ctx()
+    ))
+
+    index.group_revalidate(low)
+    index.group_commit(low)
+    with pytest.raises(DedupGroupRejected):
+        index.group_revalidate(high)
+
+    assert index._group_reservations[high.capability_id].state == "reserved"
+    index.group_discard(high)
+    assert index._group_reservations == {}
+
+
+def test_commit_consumes_only_its_reservation_and_distinct_pending_survives():
+    """较低 declaration commit 不清空较高 declaration 的独立 reservation。"""
+    index = DedupIndex(DedupConfig(), "text")
+    low = asyncio.run(index.group_reserve(DedupGroupRequest(
+        (text_record("lower unique", "7" * 16),), frozenset(), None
+    ), make_ctx()))
+    high = asyncio.run(index.group_reserve(DedupGroupRequest(
+        (text_record("higher unique", "8" * 16),), frozenset(), None
+    ), make_ctx()))
+
+    index.group_revalidate(low)
+    index.group_commit(low)
+    assert tuple(index._group_reservations) == (high.capability_id,)
+    index.group_revalidate(high)
+    index.group_commit(high)
+
+    assert index._group_reservations == {}
+    assert len(index._group_exact) == 2
+
+
+def test_validated_reservation_rejects_intervening_generation_change():
+    """revalidate 与 commit 间若有其他 commit，旧 validation 不能被消费。"""
+    index = DedupIndex(DedupConfig(), "text")
+    first = asyncio.run(index.group_reserve(DedupGroupRequest(
+        (text_record("first unique", "a" * 16),), frozenset(), None
+    ), make_ctx()))
+    second = asyncio.run(index.group_reserve(DedupGroupRequest(
+        (text_record("second unique", "b" * 16),), frozenset(), None
+    ), make_ctx()))
+    index.group_revalidate(first)
+    index.group_revalidate(second)
+    index.group_commit(first)
+
+    with pytest.raises(InternalError, match="stale validated reservation"):
+        index.group_commit(second)
+
+    index.group_discard(second)
+    assert index._group_reservations == {}
+
+
+def test_discard_is_exactly_once_for_reserved_and_validated_states():
+    """Reserved 与 Validated 都能 discard，任何重复消费都暴露所有权错误。"""
+    index = DedupIndex(DedupConfig(), "text")
+    reserved = asyncio.run(index.group_reserve(DedupGroupRequest(
+        (text_record("discard reserved", "d" * 16),), frozenset(), None
+    ), make_ctx()))
+    index.group_discard(reserved)
+    with pytest.raises(InternalError, match="invalid reservation"):
+        index.group_discard(reserved)
+
+    validated = asyncio.run(index.group_reserve(DedupGroupRequest(
+        (text_record("discard validated", "e" * 16),), frozenset(), None
+    ), make_ctx()))
+    index.group_revalidate(validated)
+    with pytest.raises(InternalError, match="invalid reservation state"):
+        index.group_revalidate(validated)
+    index.group_discard(validated)
+    assert index._group_reservations == {}
+    assert index._group_exact == {}
+
+
+def test_reset_invalidates_old_epoch_and_clears_registry():
+    """reset 递增 epoch、清空 registry，旧 capability 永远不能复活。"""
+    index = DedupIndex(DedupConfig(), "text")
+    reservation = asyncio.run(index.group_reserve(DedupGroupRequest(
+        (text_record("epoch bound", "f" * 16),), frozenset(), None
+    ), make_ctx()))
+    prior_epoch = reservation.epoch
+
+    index.reset()
+
+    assert index._group_epoch == prior_epoch + 1
+    assert index._group_reservations == {}
+    with pytest.raises(InternalError, match="invalid reservation"):
+        index.group_revalidate(reservation)
+
+
+def test_reservation_epoch_and_capability_are_registry_bound():
+    """现存 entry 也拒绝伪造 epoch 与 capability，原所有者仍可完成 cleanup。"""
+    index = DedupIndex(DedupConfig(), "text")
+    reservation = asyncio.run(index.group_reserve(DedupGroupRequest(
+        (text_record("registry bound", "1" * 16),), frozenset(), None
+    ), make_ctx()))
+    with pytest.raises(InternalError, match="stale reservation"):
+        index.group_revalidate(replace(reservation, epoch=reservation.epoch + 1))
+    with pytest.raises(InternalError, match="invalid reservation"):
+        index.group_revalidate(replace(reservation, capability_id="forged"))
+    index.group_discard(reservation)
+
+
+def test_record_change_after_reserve_is_a_terminal_ownership_violation():
+    """registry 保存的 Record 内容变化不能降级成普通 duplicate rejection。"""
+    index = DedupIndex(DedupConfig(), "text")
+    record = text_record("content before reserve", "0" * 16)
+    reservation = asyncio.run(index.group_reserve(
+        DedupGroupRequest((record,), frozenset(), None), make_ctx()
+    ))
+    object.__setattr__(record, "text", "content after reserve")
+
+    with pytest.raises(InternalError, match="stale reservation"):
+        index.group_revalidate(reservation)
+    object.__setattr__(record, "text", "content before reserve")
+    index.group_discard(reservation)

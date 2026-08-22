@@ -103,7 +103,7 @@ uv run labelkit validate --config config.toml --project project.toml --probe
 
 ```
 configuration valid
-probe default: ok model=glm-5.2 latency_ms=7291
+probe llm.default: ok model=glm-5.2 latency_ms=7291
 ```
 
 **为什么这一步重要**：密钥/权限错误（HTTP 401/403）会在第一次调用时**立即熔断**、以退出码 4 终止——这类故障不会自愈，工具不再浪费一分钱。但另一类配置事故：模型名拼错、路径不对（HTTP 400/404）仍按「连续 N 次致命错误」熔断（默认 20），小批量试跑可能攒不满阈值，表现为记录纷纷失败而运行「成功」结束。一次 30 秒的 probe 把两类问题都提前暴露。养成习惯：**新环境、换密钥、换网关之后，先 probe**。

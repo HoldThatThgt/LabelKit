@@ -18,6 +18,7 @@ import logging
 import os
 import sys
 from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import IO, TYPE_CHECKING, Callable, Mapping, Protocol
@@ -25,7 +26,7 @@ from typing import IO, TYPE_CHECKING, Callable, Mapping, Protocol
 from labelkit.common.config.model import ResolvedConfig, TraceConfig
 
 if TYPE_CHECKING:  # v1.10：字符串注解切断 obslog↔llm_client 的循环依赖（§3.3）
-    from labelkit.common.runtime.llm_client import ProfileSnapshot
+    from labelkit.common.inference.llm_client import ProfileSnapshot
 
 # ── 事件名常量（§7.11，字符串精确）──────────────────────────────────────────
 
@@ -62,6 +63,26 @@ EV_ERROR = "error"
 TRACE_SCHEMA_VERSION = 1
 
 _logger = logging.getLogger("labelkit.obslog")
+
+_RUNTIME_HIGH_WATER_KEYS = frozenset({
+    "queue", "running", "resource_wait", "commit_waiting", "candidate_bytes",
+})
+_RUNTIME_TOTAL_KEYS = frozenset({
+    "cancelled_tasks", "resource_wait_ms", "http_pool_wait_ms", "commit_ms",
+})
+_REALTIME_COUNTER_PREFIXES = (
+    "budget.", "llm.", "embedding.", "schema.", "provider.", "resource.", "origin.", "runtime.",
+    "generate.sequence.calls.",
+)
+
+
+def _non_negative_int(value: object) -> bool:
+    """判断运行观测值是否为非负整数。
+
+    @param value 待检查值
+    @return 是否为非负整数且非 bool
+    """
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 # ── TraceEvent ──────────────────────────────────────────────────────────────
@@ -328,7 +349,7 @@ class EventLog:
     def closed(self) -> bool:
         """通道是否已被写失败关闭（3.12.4）。
 
-        orchestrator 组装 ``report.trace`` 时读取它，以便为终局的 ``run.end``
+        ProcessWorkflow 组装 ``report.trace`` 时读取它，以便为终局的 ``run.end``
         事件正确记账——该事件在 report 构建之后才发出（§9.3）。
 
         @return True = 通道已因写失败关闭
@@ -431,7 +452,11 @@ class MetricsSink:
         self.event_log = event_log
         self.counters: dict[str, int] = {}
         self.stage_times: dict[str, float] = {}
-        self._captured_counts: dict[str, int] | None = None
+        self._captured_counts: ContextVar[dict[str, int] | None] = ContextVar(
+            f"labelkit_metrics_capture_{run_id}", default=None,
+        )
+        self._runtime_high_water = {key: 0 for key in _RUNTIME_HIGH_WATER_KEYS}
+        self._runtime_totals = {key: 0 for key in _RUNTIME_TOTAL_KEYS}
         self._fatal_streak = 0
         self._circuit_broken = False
         self._listener: ProgressListener | None = listener
@@ -568,8 +593,9 @@ class MetricsSink:
         @param key 计数器键（report.json 的计数来源）
         @param n 增量，默认 1
         """
-        captured = self._captured_counts
-        target = captured if captured is not None and not key.startswith("budget.") else self.counters
+        captured = self._captured_counts.get()
+        realtime = key.startswith(_REALTIME_COUNTER_PREFIXES)
+        target = captured if captured is not None and not realtime else self.counters
         target[key] = target.get(key, 0) + n
 
     @contextmanager
@@ -583,15 +609,15 @@ class MetricsSink:
         @return 当前捕获区的可变计数表。
         @raises RuntimeError 已存在活动捕获区。
         """
-        if self._captured_counts is not None:
+        if self._captured_counts.get() is not None:
             _logger.error("metrics count capture is already active")
             raise RuntimeError("metrics count capture is already active")
         captured: dict[str, int] = {}
-        self._captured_counts = captured
+        token = self._captured_counts.set(captured)
         try:
             yield captured
         finally:
-            self._captured_counts = None
+            self._captured_counts.reset(token)
 
     def merge_counts(self, counters: Mapping[str, int]) -> None:
         """在 sequence group commit 后一次合并 attempt-local counters。
@@ -600,7 +626,7 @@ class MetricsSink:
         @return None。
         @raises RuntimeError 捕获区仍活动，或增量不是非负整数。
         """
-        if self._captured_counts is not None:
+        if self._captured_counts.get() is not None:
             _logger.error("cannot merge metrics while count capture is active")
             raise RuntimeError("cannot merge metrics while count capture is active")
         for key, value in counters.items():
@@ -608,6 +634,48 @@ class MetricsSink:
                 _logger.error("metrics counter delta must be a non-negative integer")
                 raise RuntimeError("metrics counter delta must be a non-negative integer")
             self.counters[key] = self.counters.get(key, 0) + value
+
+    def observe_runtime_high_water(self, key: str, value: int) -> None:
+        """更新一个运行期高水位。
+
+        @param key queue、running、resource_wait、commit_waiting 或 candidate_bytes
+        @param value 当前非负观测值
+        @raises RuntimeError 键未知或值不是非负整数
+        """
+        if key not in _RUNTIME_HIGH_WATER_KEYS or not _non_negative_int(value):
+            _logger.error("invalid runtime high-water observation")
+            raise RuntimeError("invalid runtime high-water observation")
+        self._runtime_high_water[key] = max(self._runtime_high_water[key], value)
+
+    def add_runtime_total(self, key: str, value: int) -> None:
+        """累加一个运行期整数总量。
+
+        @param key cancelled_tasks、resource_wait_ms、http_pool_wait_ms 或 commit_ms
+        @param value 非负增量
+        @raises RuntimeError 键未知或值不是非负整数
+        """
+        if key not in _RUNTIME_TOTAL_KEYS or not _non_negative_int(value):
+            _logger.error("invalid runtime total observation")
+            raise RuntimeError("invalid runtime total observation")
+        self._runtime_totals[key] += value
+
+    @property
+    def runtime_report(self) -> Mapping[str, int]:
+        """返回成功与失败报告共用的精确九字段运行节点。
+
+        @return 独立且只含整数的运行指标映射
+        """
+        return {
+            "queue_high_water": self._runtime_high_water["queue"],
+            "running_high_water": self._runtime_high_water["running"],
+            "resource_wait_high_water": self._runtime_high_water["resource_wait"],
+            "commit_waiting_high_water": self._runtime_high_water["commit_waiting"],
+            "candidate_bytes_high_water": self._runtime_high_water["candidate_bytes"],
+            "cancelled_tasks": self._runtime_totals["cancelled_tasks"],
+            "resource_wait_ms": self._runtime_totals["resource_wait_ms"],
+            "http_pool_wait_ms": self._runtime_totals["http_pool_wait_ms"],
+            "commit_ms": self._runtime_totals["commit_ms"],
+        }
 
     def add_stage_time(self, stage: str, seconds: float) -> None:
         """累加某阶段的累计耗时。

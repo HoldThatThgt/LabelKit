@@ -11,33 +11,38 @@ import secrets
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable, TypeVar, cast
+
+import httpx
 
 from labelkit.common.config import load
 from labelkit.common.config.model import CliOverrides, ResolvedConfig
-from labelkit.common.errors import LabelKitError
+from labelkit.common.errors import InternalError, LabelKitError
 from labelkit.common.observability.obslog import EventLog, MetricsSink, setup_logging
-from labelkit.common.runtime.credentials import (
+from labelkit.common.inference.credentials import (
     RuntimeCredentials,
     referenced_profiles,
     resolve_credentials,
 )
-from labelkit.common.runtime.llm_client import LLMClient
-from labelkit.common.runtime.schema_engine import SchemaEngine
+from labelkit.common.inference.llm_client import LLMClient
+from labelkit.common.inference.schema_engine import SchemaEngine
 from labelkit.orchestration.factory import build_stages
-from labelkit.orchestration.orchestrator import Orchestrator, RunServices
+from labelkit.orchestration.process_workflow import ProcessWorkflow, RunServices
 from labelkit.operators.emitter import Emitter
+from labelkit.runtime import ExecutionRuntime, ResourceManager
 
 if TYPE_CHECKING:
     from labelkit.common.observability.obslog import ProgressListener
-    from labelkit.common.runtime.llm_client import ProbeResult
+    from labelkit.common.inference.llm_client import ProbeResult
     from labelkit.common.config.model import TraceConfig
     from labelkit.common.contracts.generation import GenerationProgram, ScenarioPlan
     from labelkit.operators.ingest import Ingestor
 
 __all__ = ["execute_run", "probe_referenced_profiles", "validate_project"]
 
-_log = logging.getLogger("labelkit.runtime")
+_log = logging.getLogger("labelkit.application")
+_T = TypeVar("_T")
+_MISSING = object()
 
 
 class _SequencePlanFailure(Exception):
@@ -182,7 +187,7 @@ def _sequence_plan_for_run(
         return _compile_sequence_plan(cfg)
     except _SequencePlanFailure as failure:
         if not cfg.dry_run:
-            from labelkit.orchestration.generation_delivery import _write_plan_failed_report
+            from labelkit.orchestration.sequence_workflow import _write_plan_failed_report
 
             _write_plan_failed_report(cfg, failure.program, failure.cause)
         raise failure.cause from failure
@@ -205,6 +210,135 @@ def _runtime_run_id(
     program, plan = sequence_plan
     attempt_id = derive_generation_id("run_attempt_id", [program.digest, program.planner_seed])
     return derive_generation_id("run_id", [attempt_id, plan.digest])
+
+
+def _normalize_origin(base_url: str) -> tuple[str, str, int]:
+    """使用 HTTPX 规则冻结一个 profile base URL 的 origin。
+
+    @param base_url 已通过配置解析的端点根地址
+    @return 小写 scheme、IDNA host 与有效端口
+    @raises InternalError URL 不含受支持的 HTTP origin
+    """
+    try:
+        url = httpx.URL(base_url)
+        scheme = url.scheme.lower()
+        host = url.raw_host.decode("ascii").lower()
+    except (AttributeError, UnicodeError, httpx.InvalidURL) as exc:
+        _log.error("invalid profile HTTP origin")
+        raise InternalError("invalid profile HTTP origin") from exc
+    if scheme not in {"http", "https"} or not host:
+        _log.error("invalid profile HTTP origin")
+        raise InternalError("invalid profile HTTP origin")
+    port = url.port if url.port is not None else (443 if scheme == "https" else 80)
+    return scheme, host, port
+
+
+def _resource_maps(cfg: ResolvedConfig) -> tuple[dict, dict]:
+    """收集本轮唯一引用的逻辑容量与规范化 origin。
+
+    @param cfg 冻结运行配置
+    @return capacities 与 origins 映射
+    @raises InternalError 引用的 profile 不存在
+    """
+    llm_names, embedding_names = referenced_profiles(cfg)
+    capacities: dict = {}
+    origins: dict = {}
+    groups = (("llm", llm_names, cfg.llm_profiles),
+              ("embedding", embedding_names, cfg.embedding_profiles))
+    for kind, names, profiles in groups:
+        for name in names:
+            profile = profiles.get(name)
+            if profile is None:
+                _log.error("referenced runtime profile is missing")
+                raise InternalError("referenced runtime profile is missing")
+            key = (kind, name)
+            capacities[key] = profile.max_concurrency
+            origins[key] = _normalize_origin(profile.base_url)
+    return capacities, origins
+
+
+def _build_resources(cfg: ResolvedConfig, metrics: MetricsSink | None) -> ResourceManager:
+    """按冻结引用集构造唯一 ResourceManager。
+
+    @param cfg 冻结运行配置
+    @param metrics 可选运行观测汇
+    @return 本轮资源所有者
+    """
+    capacities, origins = _resource_maps(cfg)
+    return ResourceManager(capacities, origins, metrics)
+
+
+async def _run_and_close(client: LLMClient, workflow: Callable[[], Awaitable[_T]],
+                         runtime: ExecutionRuntime | None) -> _T:
+    """在同一事件循环运行工作流并保持主异常高于关闭失败。
+
+    @param client Application 拥有的根 LLMClient
+    @param workflow live 或静态工作流
+    @param runtime live 时的唯一 execution runtime；静态路径为 None
+    @return 工作流结果
+    """
+    result: object = _MISSING
+    primary: BaseException | None = None
+    try:
+        result = await (runtime.run(workflow) if runtime is not None else workflow())
+    except BaseException as exc:
+        primary = exc
+    try:
+        await client.aclose()
+    except Exception as exc:  # 关闭失败不能覆盖既有主异常或 cancellation
+        if primary is None:
+            _log.error("LLM client close failed")
+            raise InternalError("LLM client close failed") from exc
+        _log.error("LLM client close failed while preserving primary error: %s", type(exc).__name__)
+    if primary is not None:
+        raise primary
+    if result is _MISSING:
+        _log.error("application workflow ended without a result")
+        raise InternalError("application workflow ended without a result")
+    return cast(_T, result)
+
+
+async def _close_after_setup_failure(client: LLMClient, primary: BaseException) -> None:
+    """对象图装配失败时关闭根客户端，且不覆盖原异常。
+
+    @param client Application 已取得所有权的根客户端
+    @param primary 对象图装配原异常
+    @return None
+    """
+    try:
+        await client.aclose()
+    except Exception as exc:  # 关闭失败不能覆盖装配异常
+        _log.error("LLM client close failed while preserving setup error: %s", type(exc).__name__)
+    raise primary
+
+
+def _compose_process_workflow(
+    cfg: ResolvedConfig,
+    sequence_plan: "tuple[GenerationProgram, ScenarioPlan] | None",
+    services: RunServices,
+    schema_engine: SchemaEngine,
+    listener: "ProgressListener | None",
+) -> ProcessWorkflow:
+    """装配普通与序列运行共用的唯一工作流。
+
+    @param cfg 冻结运行配置
+    @param sequence_plan 可选序列程序与计划
+    @param services 本轮共享服务
+    @param schema_engine 唯一 Schema 引擎
+    @param listener 可选进度监听器
+    @return 已绑定计划与监听器的工作流
+    """
+    workflow = ProcessWorkflow(
+        cfg, build_stages(cfg),
+        _build_ingestor(cfg, services.metrics),
+        Emitter(cfg, schema_engine, services.run_id, services.run_started_at),
+        services,
+    )
+    if sequence_plan is not None:
+        workflow._bind_sequence_plan(*sequence_plan)
+    if listener is not None:
+        _activate_listener(listener, cfg, services.llm, services.metrics)
+    return workflow
 
 
 def execute_run(
@@ -232,29 +366,29 @@ def execute_run(
     run_started_at = datetime.now().astimezone()
 
     event_log = EventLog(_trace_config(cfg), run_id)
-    metrics = MetricsSink(cfg, run_id, event_log, listener=listener)
-    llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles,
-                    _run_credentials(cfg), metrics)
-    schema_engine = SchemaEngine(dict(cfg.user_schema), llm, cfg.output, metrics,
-                                 validator=_l25_validator(cfg))
-    services = RunServices(llm=llm, schema_engine=schema_engine, metrics=metrics,
-                           run_id=run_id, run_started_at=run_started_at)
-    orchestrator = Orchestrator(
-        cfg,
-        build_stages(cfg),
-        _build_ingestor(cfg, metrics),
-        Emitter(cfg, schema_engine, run_id, run_started_at),
-        services,
-    )
-    if sequence_plan is not None:
-        orchestrator._bind_sequence_plan(*sequence_plan)
-    if listener is not None:
-        _activate_listener(listener, cfg, llm, metrics)
     try:
-        summary = asyncio.run(orchestrator.run())
+        metrics = MetricsSink(cfg, run_id, event_log, listener=listener)
+        resources = _build_resources(cfg, metrics)
+        runtime = ExecutionRuntime(resources, metrics)
+        llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles,
+                        _run_credentials(cfg), resources, metrics)
+        try:
+            schema_engine = SchemaEngine(dict(cfg.user_schema), llm, cfg.output, metrics,
+                                         validator=_l25_validator(cfg))
+            services = RunServices(
+                llm=llm, schema_engine=schema_engine, metrics=metrics, tasks=runtime,
+                run_id=run_id, run_started_at=run_started_at,
+            )
+            process_workflow = _compose_process_workflow(
+                cfg, sequence_plan, services, schema_engine, listener,
+            )
+        except BaseException as primary:
+            asyncio.run(_close_after_setup_failure(llm, primary))
+        active_runtime = None if cfg.dry_run else runtime
+        summary = asyncio.run(_run_and_close(llm, process_workflow.run, active_runtime))
+        return summary.exit_code
     finally:
         event_log.close()
-    return summary.exit_code
 
 
 def validate_project(
@@ -292,17 +426,20 @@ def probe_referenced_profiles(cfg: ResolvedConfig) -> tuple["ProbeResult", ...]:
     @raises ConfigError 任一被引用密钥缺失（聚合全部缺失项）
     """
     llm_names, emb_names = referenced_profiles(cfg)
+    resources = _build_resources(cfg, None)
     client = LLMClient(cfg.llm_profiles, cfg.embedding_profiles,
-                       resolve_credentials(cfg), None)
+                       resolve_credentials(cfg), resources, None)
 
-    async def _probe_all() -> list[ProbeResult]:
+    async def _probe_all() -> tuple[ProbeResult, ...]:
         """依次探测全部被引用 profile。
 
-        @return: 探测结果列表
+        @return 探测结果 tuple
         """
         results: list[ProbeResult] = []
-        for name in (*llm_names, *emb_names):
-            results.extend(await client.probe_all(name))
-        return results
+        for name in llm_names:
+            results.extend(await client.probe_all(("llm", name)))
+        for name in emb_names:
+            results.extend(await client.probe_all(("embedding", name)))
+        return tuple(results)
 
-    return tuple(asyncio.run(_probe_all()))
+    return asyncio.run(_run_and_close(client, _probe_all, None))

@@ -1,6 +1,6 @@
 """v1.18 生成提示词的冻结行为测试。"""
 
-from labelkit.common.runtime.generation_prompts import (
+from labelkit.common.inference.generation_prompts import (
     noise_evaluation_prompt,
     noise_render_prompt,
 )

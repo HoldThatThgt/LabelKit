@@ -24,6 +24,7 @@ from labelkit.operators.stitch import (
     app_set,
     build_stitch_prompt,
     entity_set,
+    judge_stitch,
     page_identity,
     prior_hits,
     render_candidate_card,
@@ -54,11 +55,12 @@ from labelkit.common.config.model import (
     VerifyConfig,
 )
 from labelkit.common.errors import (
+    ProviderFatalError,
     ContextOverflowError,
     OutputTruncatedError,
     SchemaViolation,
 )
-from labelkit.common.runtime.schema_engine import stitch_schema
+from labelkit.common.inference.schema_engine import stitch_schema
 from labelkit.common.contracts.types import (
     ImageRef,
     PipelineItem,
@@ -194,6 +196,52 @@ class ExplodingEngine:
         raise AssertionError("complete_validated must not be called")
 
 
+class ReverseVoteEngine:
+    """让同一组投票严格按声明序的反序完成。"""
+
+    def __init__(self, outcomes):
+        self.outcomes = list(outcomes)
+        self.calls: list = []
+        self.gates = [asyncio.Event() for _ in range(max(0, len(outcomes) - 1))]
+        self.completion_order: list[int] = []
+
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        index = len(self.calls)
+        self.calls.append((profile, prompt, schema, scope.record_ids))
+        if index < len(self.outcomes) - 1:
+            await self.gates[index].wait()
+        self.completion_order.append(index)
+        if index > 0:
+            self.gates[index - 1].set()
+        return self.outcomes[index], Usage(), 1, "glm-5.2"
+
+
+class TaskRunner:
+    """并发执行测试叶任务并按输入序返回。"""
+
+    def __init__(self):
+        self.requests = []
+
+    async def run_group(self, request):
+        self.requests.append(request)
+        results = [None] * len(request.tasks)
+
+        async def run_one(index, spec):
+            try:
+                results[index] = await spec.operation()
+            except BaseException as exc:
+                results[index] = exc
+
+        async with asyncio.TaskGroup() as group:
+            for index, spec in enumerate(request.tasks):
+                group.create_task(run_one(index, spec))
+        failure = next((result for result in results
+                        if isinstance(result, BaseException)), None)
+        if failure is not None:
+            raise failure
+        return tuple(results)
+
+
 class RecordingMetrics:
     def __init__(self):
         self.events: list = []             # (ev, stage, record_ids, payload)
@@ -205,10 +253,18 @@ class RecordingMetrics:
     def count(self, key, n=1):
         self.counters[key] = self.counters.get(key, 0) + n
 
+    def observe_runtime_high_water(self, key, value):
+        pass
+
+    def add_runtime_total(self, key, value):
+        pass
+
 
 def make_ctx(cfg, engine):
     return SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
-                           metrics=RecordingMetrics(), rng=None, batch_no=1)
+                           metrics=RecordingMetrics(), tasks=TaskRunner(),
+                           task_namespace="run:batch:1:stage:stitch",
+                           rng=None, batch_no=1)
 
 
 def run_stage(cfg, batch, engine):
@@ -376,8 +432,6 @@ def test_conservative_bias_requires_resume_and_prior_conjunction():
     """LLM resume WITHOUT a prior hit must NOT merge under bias=conservative
     (opens a thread instead); bias=llm merges on the bare verdict."""
     sid = "s1"
-    fa = [envelope(ui_frame("a0", 0, app="com.food"), sid)]
-    fb = [envelope(ui_frame("b0", 1, app="com.taxi", texts=("打车",)), sid)]
     for bias, expect_merge in (("conservative", False), ("llm", True)):
         frames_a = [envelope(ui_frame("a0", 0, app="com.food"), sid)]
         frames_b = [envelope(ui_frame("b0", 1, app="com.taxi",
@@ -729,6 +783,33 @@ def test_on_error_keep_opens_thread_without_item_errors():
     assert "stitch.judgments" not in ctx.metrics.counters
 
 
+async def test_real_runtime_keeps_ordinary_provider_fatal_candidate_local():
+    from labelkit.runtime.resources import ResourceManager
+    from labelkit.runtime.scheduler import ExecutionRuntime
+
+    sid = "s1"
+    frames = [envelope(ui_frame("a0", 0), sid)]
+    episode = episode_of(frames, sid)
+    batch = [*frames, episode]
+    error = ProviderFatalError("bad request", profile="default")
+    cfg = make_cfg(on_error="keep", repass=False)
+    ctx = make_ctx(cfg, QueueEngine([error]))
+    manager = ResourceManager(
+        {("llm", "default"): 1},
+        {("llm", "default"): ("https", "default.example", 443)},
+        ctx.metrics,
+    )
+    runtime = ExecutionRuntime(manager, ctx.metrics)
+    ctx.tasks = runtime
+
+    result = await runtime.run(lambda: StitchStage(cfg).run(batch, ctx))
+
+    assert result is batch
+    assert episode.status == "active" and episode.errors == []
+    assert episode.thread_id == episode.record.id
+    assert ctx.metrics.counters == {"stitch.failures": 1}
+
+
 def test_idempotent_reentry_costs_zero_calls():
     batch, a1, b, a2 = v2_batch()
     engine = QueueEngine([obj("new"), obj("new"), obj("new")])
@@ -868,6 +949,27 @@ def test_aggregate_votes_strict_majority_on_complete_pair():
     assert aggregate_votes([obj("resume", ref=1), obj("new"),
                             obj("resume", ref=2)]) is None
     assert aggregate_votes([obj("new")]) is not None   # n=1 trivially wins
+
+
+def test_votes_reverse_completion_keeps_declaration_order_winner():
+    first = obj("resume", ref=1, task="声明序首个")
+    second = obj("new", task="少数")
+    third = obj("resume", ref=1, task="声明序末个")
+    engine = ReverseVoteEngine([first, second, third])
+    ctx = make_ctx(make_cfg(votes=3), engine)
+
+    outcome = asyncio.run(judge_stitch(
+        ["thread"], "candidate", ctx, (), (0, 0, 0),
+    ))
+
+    assert engine.completion_order == [2, 1, 0]
+    assert outcome is first
+    (request,) = ctx.tasks.requests
+    assert [spec.declaration_key for spec in request.tasks] == [
+        (1, 1, 0, 0, 0, 0),
+        (1, 1, 0, 0, 0, 1),
+        (1, 1, 0, 0, 0, 2),
+    ]
 
 
 def test_votes_three_samples_strict_majority_drives_merge():
@@ -1057,7 +1159,9 @@ def test_reactive_400_terminal_feeds_breaker_once_keep_path():
     engine = QueueEngine([ContextOverflowError("sniff", phase="reactive")])
     cfg = make_cfg(on_error="keep", repass=False)
     ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
-                          metrics=FeedMetrics(), rng=None, batch_no=1)
+                          metrics=FeedMetrics(), tasks=TaskRunner(),
+                          task_namespace="run:batch:1:stage:stitch",
+                          rng=None, batch_no=1)
     asyncio.run(StitchStage(cfg).run([*frames, ep], ctx))
     assert ctx.metrics.fed == [True]                   # A7: exactly once
 
@@ -1092,7 +1196,9 @@ def _repass_failure_run(exc, *, cfg=None):
         exc, obj("new", task="打车"), obj("new", task="点外卖收尾"),
     ])
     ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
-                          metrics=_FeedMetrics(), rng=None, batch_no=1)
+                          metrics=_FeedMetrics(), tasks=TaskRunner(),
+                          task_namespace="run:batch:1:stage:stitch",
+                          rng=None, batch_no=1)
     out = asyncio.run(StitchStage(cfg).run(batch, ctx))
     assert out is batch                                # 契约②c：同一列表对象
     return a1, b, a2, engine, ctx

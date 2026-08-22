@@ -40,6 +40,7 @@ testpaths = ["tests"]
 markers = [
     "integration: hits a real configured LLM endpoint; endpoint-specific markers control credentials",
     "deepseek: requires the real DeepSeek endpoint and LABELKIT_DEEPSEEK_KEY",
+    "local_llm: requires the real local llama-server endpoint and LABELKIT_LOCAL_KEY",
     "zai: requires the real z.ai endpoint and LABELKIT_ZAI_KEY",
 ]
 

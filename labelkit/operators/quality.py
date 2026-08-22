@@ -13,7 +13,7 @@ v1.7 按类分池（spec 3.4.3 按类分池、CONTRACTS.md §7.3）：classify �
 按 item.classification.label 划分为按类池，各池在 cfg.class_views 给出的类生效
 (QualityConfig, Rubric) 下打分与门控。两阶段执行（R13）：所有池的配对计划按类名字典序
 同步预抽（全阶段唯一的 ctx.rng 消费——抽签顺序只取决于池顺序，与调用调度无关），随后所有
-池的 LLM 判定调用合并进一次 gather（跨池全并发）。池间失败隔离（R15）。classify 关闭 =
+池的 LLM 判定调用冻结进一个 TaskGroupRequest（跨池有界并发）。池间失败隔离（R15）。classify 关闭 =
 唯一匿名池，与 v1.7 之前逐字节一致（扁平计数键，payload 无 "pool" 字段）。
 
 v1.8 序列打分（spec 3.4.3 sequence 行、CONTRACTS §7.3 / §10.2 / §10.3）：episode 信封
@@ -49,6 +49,7 @@ from labelkit.common.errors import (
     ProviderRetryableError,
     SchemaViolation,
 )
+from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
 from labelkit.common.contracts.generation import DownstreamAttemptRequest, DownstreamAttemptResult
 from labelkit.common.contracts.types import (
     PipelineItem,
@@ -58,15 +59,26 @@ from labelkit.common.contracts.types import (
     Transition,
     frame_digest,
 )
+from labelkit.operators.quality_calls import (
+    PairwiseQualityCall,
+    PairwiseQualityOutcome,
+    PointwiseQualityCall,
+    PointwiseQualityOutcome,
+    QualityCall,
+    QualityCallFailure,
+    QualityCallOutcome,
+    QualityFitRequest,
+    QualityJudgment,
+)
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import Criterion, LLMProfile, QualityConfig, ResolvedConfig
     from labelkit.common.contracts.stage import RunContext
 
 # M9（llm_client）/ M8（schema_engine）公开面，见 CONTRACTS.md §7.8 / §7.7。
-from labelkit.common.runtime import budget
-from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
-from labelkit.common.runtime.schema_engine import (
+from labelkit.common.inference import budget
+from labelkit.common.inference.llm_client import Message, Part, PromptBundle
+from labelkit.common.inference.schema_engine import (
     CallScope,
     _thaw_json,
     judgment_schema,
@@ -766,22 +778,6 @@ class _Pool:
         return "pairwise_bt" if self.q.mode == "pairwise" else "pointwise"
 
 
-@dataclass(frozen=True)
-class _JudgeCall:
-    """一次成对判定 LLM 调用的全部参数（比较身份 + 评委 + 准则组 + 归属池）。"""
-    comp_idx: int                       # 比较在配对计划中的序号
-    first_idx: int                      # 抽样序第一条记录的下标（事件 record_ids 用）
-    second_idx: int                     # 抽样序第二条记录的下标
-    a_idx: int                          # 呈现序 A 位的记录下标
-    b_idx: int                          # 呈现序 B 位的记录下标
-    judge: str                          # 评委 LLM profile 名
-    flipped: bool                       # 是否为 both_orders 的翻转序调用
-    group: tuple["Criterion", ...]      # 本次调用覆盖的准则组
-    with_reason: bool                   # 是否要求裁决附带理由
-    multi_judge: bool                   # 是否多评委（决定事件 payload 是否带 judge 字段）
-    pool: str | None                    # 归属池名；None = 匿名池
-
-
 @dataclass
 class _CriterionTally:
     """单条准则在池内全部比较上的合成结果与统计。"""
@@ -923,35 +919,44 @@ class QualityStage:
                 self._fail_pool(pool, ctx, exc)
 
     async def _judge_pools(self, pools: list["_Pool"], ctx: "RunContext") -> None:
-        """第二阶段（R13）：把所有池的 LLM 判定调用合并进一次 gather（跨池全并发）。
+        """第二阶段：经共享 TaskExecutor 执行纯叶调用，再按声明序归并。
 
         @param pools 池列表
         @param ctx 运行上下文
         """
-        tagged = self._collect_calls(pools, ctx)
-        for pool, result, exc in await asyncio.gather(
-                *(self._guarded_call(pool, call, ctx) for pool, call in tagged)):
-            if exc is not None:
-                if not pool.dead:
-                    self._fail_pool(pool, ctx, exc)
-            elif result is not None:
-                pool.results.append(result)
+        plans = self._collect_calls(pools, ctx)
+        specs = tuple(
+            TaskSpec(
+                task_id=f"{ctx.task_namespace}:quality:{plan.ordinal}",
+                declaration_key=(ctx.batch_no, 5, plan.ordinal),
+                stage=self.name,
+                resource_key=("llm", plan.profile),
+                operation=lambda plan=plan: self._run_call(plan, ctx),
+            )
+            for plan in plans
+        )
+        outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
+        for plan, outcome in zip(plans, outcomes, strict=True):
+            self._reduce_call(pools, plan, outcome, ctx)
 
     def _collect_calls(self, pools: list["_Pool"],
-                       ctx: "RunContext") -> list[tuple["_Pool", object]]:
-        """逐池装配判定协程，并给每个协程打上归属池标记（供 R15 隔离）。
+                       ctx: "RunContext") -> list[QualityCall]:
+        """按池与调用声明序冻结全部纯叶计划。
 
         @param pools 池列表
         @param ctx 运行上下文
-        @return (池, 待 await 的协程) 列表，按池顺序排列
+        @return 按池、比较或记录、评委、呈现序与准则展开的调用计划
         """
-        tagged: list[tuple[_Pool, object]] = []
-        for pool in pools:
+        plans: list[QualityCall] = []
+        for pool_ordinal, pool in enumerate(pools):
             if pool.dead:
                 continue
             try:
-                calls = (self._pairwise_calls(pool, ctx) if pool.mode == "pairwise_bt"
-                         else self._pointwise_calls(pool, ctx))
+                calls = (
+                    self._pairwise_calls(pool, pool_ordinal, len(plans))
+                    if pool.mode == "pairwise_bt"
+                    else self._pointwise_calls(pool, pool_ordinal, len(plans))
+                )
             except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as exc:
@@ -962,8 +967,49 @@ class QualityStage:
                               extra={"stage": self.name, "batch": ctx.batch_no})
                 self._fail_pool(pool, ctx, exc)
                 continue
-            tagged.extend((pool, call) for call in calls)
-        return tagged
+            plans.extend(calls)
+        return plans
+
+    async def _run_call(self, plan: QualityCall,
+                        ctx: "RunContext") -> QualityCallOutcome:
+        """执行一个不写共享业务对象、dataset 事件或错误的叶调用。
+
+        @param plan 冻结调用计划
+        @param ctx 运行上下文
+        @return 成功结果或有类型的普通失败
+        """
+        try:
+            if isinstance(plan, PairwiseQualityCall):
+                return await self._run_pairwise_call(plan, ctx)
+            return await self._run_pointwise_call(plan, ctx)
+        except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            if _ATTEMPT_MODE.get():
+                raise
+            _logger.error("quality judging leaf failed: ordinal=%d exc=%s",
+                          plan.ordinal, type(exc).__name__,
+                          extra={"stage": self.name, "batch": ctx.batch_no})
+            return QualityCallFailure(exc, "pool")
+
+    def _reduce_call(self, pools: list["_Pool"], plan: QualityCall,
+                     outcome: QualityCallOutcome, ctx: "RunContext") -> None:
+        """按 TaskGroupRequest 声明序提交一个叶结果。
+
+        @param pools 当前批冻结池表
+        @param plan 当前调用计划
+        @param outcome 当前纯叶结果
+        @param ctx 运行上下文
+        """
+        pool = pools[plan.pool_ordinal]
+        if isinstance(outcome, QualityCallFailure) and outcome.scope == "pool":
+            if not pool.dead:
+                self._fail_pool(pool, ctx, outcome.error)
+            return
+        if isinstance(plan, PairwiseQualityCall):
+            self._reduce_pairwise_call(pool, plan, outcome, ctx)
+            return
+        self._reduce_pointwise_call(pool, plan, outcome, ctx)
 
     def _finish_pools(self, pools: list["_Pool"], ctx: "RunContext") -> None:
         """第三阶段：逐池后处理（裁决合成 / BT 拟合 / 百分位归一化 / 聚合）与门控。
@@ -1039,32 +1085,6 @@ class QualityStage:
                 it.errors.append(err)
                 it.status = "failed"
                 self._emit_error(ctx, (it.record.id,), err)
-
-    async def _guarded_call(self, pool: "_Pool", call,
-                            ctx: "RunContext") -> tuple["_Pool", object, Exception | None]:
-        """给第二阶段的协程打上归属池标记，并捕获逃逸的非致命异常。
-
-        _judge_once / _pointwise_once 自己吸收单次调用的 provider / schema 失败，所以能逃到
-        这里的都是池内不变式破损，只应毒化该池（R15）。致命控制流异常继续上抛，中断合并
-        gather。
-
-        @param pool 归属池
-        @param call 待 await 的判定协程
-        @param ctx 运行上下文（日志归属）
-        @return (归属池, 协程结果或 None, 逃逸异常或 None)
-        @raises CircuitBreakerTripped 熔断器已跳闸
-        """
-        try:
-            return pool, await call, None
-        except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
-            raise
-        except Exception as exc:
-            if _ATTEMPT_MODE.get():
-                raise
-            _logger.error("quality judging call escaped its handlers: pool=%s exc=%s",
-                          pool.pool, type(exc).__name__,
-                          extra={"stage": self.name, "batch": ctx.batch_no})
-            return pool, None, exc
 
     # ── 共用管道 ────────────────────────────────────────────────────────────
 
@@ -1152,8 +1172,8 @@ class QualityStage:
 
     # ── v1.11 预算管道（spec 3.4.3 v1.11 行） ───────────────────────────────
 
-    def _call_fit(self, ctx: "RunContext", judge: str, system_text: str,
-                  schema: dict, records: Sequence[Record]) -> _CallFit | None:
+    def _call_fit(self, ctx: "RunContext",
+                  request: QualityFitRequest) -> _CallFit | None:
         """按某个评委的 profile 预算构造记录侧装填状态。
 
         quality 按 (比较, 评委) 装填：每次调用各自贴合本评委的预算（V25② 对照）。schema 估算
@@ -1162,24 +1182,74 @@ class QualityStage:
         每条记录占一个槽位，故切分份数 = len(records)。
 
         @param ctx 运行上下文（提供图片成本标定器）
-        @param judge 评委 LLM profile 名
-        @param system_text 本次调用的系统消息文本（静态侧估算）
-        @param schema 结构化输出 schema
-        @param records 本次调用涉及的记录
+        @param request profile、系统文本、Schema 与记录快照
         @return 装填状态；profile 缺失或未声明 context_window 时返回 None（预算关闭）
         """
-        prof: "LLMProfile | None" = self.cfg.llm_profiles.get(judge)
+        prof: "LLMProfile | None" = self.cfg.llm_profiles.get(request.profile)
         if prof is None or prof.context_window <= 0:
             return None
-        static = budget.est_text(system_text) + 2 * budget.MSG_OVERHEAD_TOKENS
+        static = budget.est_text(request.system_text) + 2 * budget.MSG_OVERHEAD_TOKENS
         if prof.supports_structured_output:
-            static += budget.est_text(json.dumps(_thaw_json(schema), ensure_ascii=False))
-        n_images = sum(1 for r in records
+            schema = json.dumps(_thaw_json(request.schema), ensure_ascii=False)
+            static += budget.est_text(schema)
+        n_images = sum(1 for r in request.records
                        if r.kind != "sequence" and r.modality == "ui"
                        and r.image is not None)
         image_est = n_images * ctx.llm.calibrator.cost(prof.name) if n_images else 0
         return _CallFit(record_budget=budget.input_budget(prof) - static - image_est,
-                        sides=len(records))
+                        sides=len(request.records))
+
+    @staticmethod
+    def _precheck_failure(fit: _CallFit | None, attempt: _Attempt,
+                          ctx: "RunContext", kind: str) -> QualityCallFailure | None:
+        """结算一次装填结果，并把最小单元溢出冻结成纯失败。
+
+        @param fit 本次尝试的装填状态
+        @param attempt 本调用的降档状态
+        @param ctx 运行上下文
+        @param kind pairwise 或 pointwise
+        @return 无溢出时为 None，否则为发送前失败
+        """
+        if fit is None:
+            return None
+        if fit.truncations:
+            ctx.metrics.count("budget.truncations.quality", fit.truncations)
+        if not fit.overflow:
+            return None
+        if attempt.overflow_exc is not None:
+            budget.feed_reactive_terminal(attempt.overflow_exc, ctx.metrics)
+        message = f"{kind} slot exceeds the record-side budget at the minimal unit"
+        return QualityCallFailure(
+            ContextOverflowError(message, phase="precheck"), "call", precheck=True,
+        )
+
+    @staticmethod
+    def _call_failure(exc: Exception, attempt: _Attempt, ctx: "RunContext",
+                      ordinal: int) -> QualityCallFailure | None:
+        """把一次模型失败收敛为重试或纯结果，保留 sequence/control 边界。
+
+        @param exc 模型调用异常
+        @param attempt 本调用的降档状态
+        @param ctx 运行上下文
+        @param ordinal 调用声明序，仅用于无数据日志
+        @return None 表示已降档应重试，否则为冻结调用失败
+        """
+        _logger.warning("quality scoring call failed: ordinal=%d exc=%s",
+                        ordinal, type(exc).__name__,
+                        extra={"stage": "quality", "batch": ctx.batch_no})
+        if isinstance(exc, ContextOverflowError):
+            if attempt.degrade(ctx, exc):
+                return None
+            budget.feed_reactive_terminal(exc, ctx.metrics)
+        recoverable = (
+            ProviderRetryableError,
+            SchemaViolation,
+            ContextOverflowError,
+            OutputTruncatedError,
+        )
+        if _ATTEMPT_MODE.get() and not isinstance(exc, recoverable):
+            raise exc
+        return QualityCallFailure(exc, "call")
 
     def _overflow_tie(self, ctx: "RunContext", items: Sequence[PipelineItem],
                       message: str) -> None:
@@ -1220,14 +1290,14 @@ class QualityStage:
 
     # ── pairwise 模式（按 R13 拆成 计划 / 派发 / 收尾 三段） ────────────────
 
-    def _pairwise_calls(self, pool: "_Pool", ctx: "RunContext") -> list:
-        """派发段：按池内预抽计划生成判定协程——每 (比较, 评委, 呈现序, 准则组) 一次调用。
-
+    def _pairwise_calls(self, pool: "_Pool", pool_ordinal: int,
+                        start_ordinal: int) -> list[PairwiseQualityCall]:
+        """按池内预抽计划冻结成对判定调用。
         单条池不发起调用（其 N=1 规则在 _pairwise_finish 里生效）。
-
         @param pool 待判定的池（携带 items / q / criteria / plan）
-        @param ctx 运行上下文
-        @return 待 await 的协程列表
+        @param pool_ordinal 当前池声明序
+        @param start_ordinal 当前池首个全批任务序号
+        @return 按比较、评委、呈现序与准则组展开的冻结计划
         """
         if len(pool.items) == 1:
             return []
@@ -1240,17 +1310,35 @@ class QualityStage:
         else:
             crit_groups = [(c,) for c in pool.criteria]
 
-        calls = []
+        calls: list[PairwiseQualityCall] = []
         for comp_idx, (_round_no, i, j, first_is_a) in enumerate(pool.plan):
             for judge in judges:
                 for flipped in orders:
                     a_idx, b_idx = (i, j) if (first_is_a != flipped) else (j, i)
                     for group in crit_groups:
-                        calls.append(self._judge_once(ctx, pool.items, _JudgeCall(
-                            comp_idx=comp_idx, first_idx=i, second_idx=j,
-                            a_idx=a_idx, b_idx=b_idx, judge=judge, flipped=flipped,
-                            group=group, with_reason=with_reason,
-                            multi_judge=len(judges) > 1, pool=pool.pool)))
+                        a_item = pool.items[a_idx]
+                        b_item = pool.items[b_idx]
+                        calls.append(PairwiseQualityCall(
+                            ordinal=start_ordinal + len(calls),
+                            pool_ordinal=pool_ordinal,
+                            comparison_ordinal=comp_idx,
+                            first_item_ordinal=i,
+                            second_item_ordinal=j,
+                            a_item_ordinal=a_idx,
+                            b_item_ordinal=b_idx,
+                            record_a=a_item.record,
+                            record_b=b_item.record,
+                            transitions_a=(tuple(a_item.transitions)
+                                           if a_item.transitions is not None else None),
+                            transitions_b=(tuple(b_item.transitions)
+                                           if b_item.transitions is not None else None),
+                            profile=judge,
+                            flipped=flipped,
+                            criteria=group,
+                            with_reason=with_reason,
+                            multi_judge=len(judges) > 1,
+                            pool=pool.pool,
+                        ))
         return calls
 
     def _pairwise_finish(self, pool: "_Pool", ctx: "RunContext") -> None:
@@ -1443,165 +1531,167 @@ class QualityStage:
                 return cls
         return "tie"
 
-    async def _judge_once(self, ctx: "RunContext", items: list[PipelineItem],
-                          call: _JudgeCall
-                          ) -> tuple[int, str, bool, dict[str, int | str | None]]:
-        """一次 LLM 成对判定调用。
+    async def _run_pairwise_call(self, call: PairwiseQualityCall,
+                                 ctx: "RunContext") -> QualityCallOutcome:
+        """执行一次不修改 item、pool、event 或 error 的成对判定。
 
+        @param call 冻结成对计划
         @param ctx 运行上下文
-        @param items 本池的信封列表（按下标寻址）
-        @param call 本次调用的全部参数
-        @return (comp_idx, 评委, 是否翻转, {准则: 胜者下标 | 'tie' | None（失败）})
+        @return 成功裁决或普通失败
         """
-        keys = [c.key for c in call.group]
+        keys = [criterion.key for criterion in call.criteria]
         schema = judgment_schema(keys, call.with_reason)
-        obj, model = await self._judge_dispatch(ctx, items, call, schema)
-        if obj is None:
-            return call.comp_idx, call.judge, call.flipped, {k: None for k in keys}
-        by_key = _judgments_by_key(obj)
-        self._emit_judgment(ctx, items, call, by_key, model)
-        return (call.comp_idx, call.judge, call.flipped,
-                _judgment_verdicts(by_key, keys, call.a_idx, call.b_idx))
-
-    async def _judge_dispatch(self, ctx: "RunContext", items: list[PipelineItem],
-                              call: _JudgeCall,
-                              schema: dict) -> tuple[Mapping | None, str]:
-        """成对判定的发送循环：装填 → 最小单元预检 → 发送；失败交 _judge_failure 处置。
-
-        @param ctx 运行上下文
-        @param items 本池的信封列表
-        @param call 本次调用的全部参数
-        @param schema 裁决 schema
-        @return (已校验的裁决对象, 模型名)；不可恢复失败时为 (None, "")
-        @raises CircuitBreakerTripped 熔断器已跳闸
-        """
-        involved = (items[call.first_idx], items[call.second_idx])
-        ids = tuple(it.record.id for it in involved)
-        attempt = _Attempt(self._pairwise_fit(ctx, items, call, schema))
+        fit = self._call_fit(ctx, QualityFitRequest(
+            profile=call.profile,
+            system_text=_pairwise_system_text(call.criteria, call.with_reason),
+            schema=schema,
+            records=(call.record_a, call.record_b),
+        ))
+        attempt = _Attempt(fit)
         while True:
-            fit = attempt.next_fit()
-            prompt = self._pairwise_prompt(items, call, fit)
-            if self._pairwise_unfittable(ctx, involved, fit, attempt):
-                return None, ""
+            current = attempt.next_fit()
+            prompt = self._pairwise_prompt(call, current)
+            precheck = self._precheck_failure(current, attempt, ctx, "pairwise")
+            if precheck is not None:
+                return precheck
             try:
                 obj, _usage, _attempts, model = await ctx.schema_engine.complete_validated(
-                    call.judge, prompt, schema,
-                    scope=CallScope(record_ids=ids, batch_no=ctx.batch_no))
-                return obj, model
+                    call.profile, prompt, schema,
+                    scope=CallScope(record_ids=self._pairwise_ids(call), batch_no=ctx.batch_no),
+                )
             except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as exc:
-                _logger.warning("pairwise judgment call failed: judge=%s exc=%s",
-                                call.judge, type(exc).__name__,
-                                extra={"stage": self.name, "batch": ctx.batch_no})
-                if self._judge_failure(ctx, involved, exc, attempt):
+                failure = self._call_failure(exc, attempt, ctx, call.ordinal)
+                if failure is None:
                     continue
-                return None, ""
+                return failure
+            return self._pairwise_success(obj, keys, model)
 
-    def _pairwise_fit(self, ctx: "RunContext", items: list[PipelineItem],
-                      call: _JudgeCall, schema: dict) -> _CallFit | None:
-        """v1.11：按「本评委」的预算为这次成对调用构造装填状态。
-
-        @param ctx 运行上下文
-        @param items 本池的信封列表
-        @param call 本次调用的全部参数
-        @param schema 裁决 schema
-        @return 装填状态；None = 预算关闭，后续构建与 v1.10 逐字节一致
-        """
-        return self._call_fit(ctx, call.judge,
-                              _pairwise_system_text(call.group, call.with_reason),
-                              schema,
-                              (items[call.a_idx].record, items[call.b_idx].record))
-
-    def _pairwise_prompt(self, items: list[PipelineItem], call: _JudgeCall,
+    def _pairwise_prompt(self, call: PairwiseQualityCall,
                          fit: _CallFit | None) -> PromptBundle:
-        """装配本次成对调用的提示词。
+        """从冻结调用计划装配本次成对提示词。
 
-        v1.8（S5 邻接）：信封上的 transitions 一路下传到序列渲染；单条记录带 None，提示词与
-        v1.7 逐字节一致。
-
-        @param items 本池的信封列表
-        @param call 本次调用的全部参数
-        @param fit 本次尝试的装填状态；None = 预算关闭
+        @param call 冻结成对计划
+        @param fit 本次尝试的装填状态
         @return 提示词
         """
-        pair = _Comparison(rec_a=items[call.a_idx].record,
-                           rec_b=items[call.b_idx].record,
-                           transitions_a=items[call.a_idx].transitions,
-                           transitions_b=items[call.b_idx].transitions)
-        return _build_pairwise_prompt(pair, call.group, call.with_reason,
-                                      self.cfg.input.ui_tree_max_chars, fit)
+        pair = _Comparison(
+            rec_a=call.record_a,
+            rec_b=call.record_b,
+            transitions_a=call.transitions_a,
+            transitions_b=call.transitions_b,
+        )
+        return _build_pairwise_prompt(
+            pair, call.criteria, call.with_reason,
+            self.cfg.input.ui_tree_max_chars, fit,
+        )
 
-    def _pairwise_unfittable(self, ctx: "RunContext", involved: Sequence[PipelineItem],
-                             fit: _CallFit | None, attempt: _Attempt) -> bool:
-        """发送前预检：记账截断次数，并判断最小语义单元是否仍装不下。
+    @staticmethod
+    def _pairwise_ids(call: PairwiseQualityCall) -> tuple[str, str]:
+        """返回成对调用的抽样序记录身份。
 
-        V10：两条记录的最小单元装不下就绝不发出注定失败的请求；若是反应式 400 把我们逼到
-        这一步，此刻结算它的终态（A7）。
+        @param call 冻结成对计划
+        @return 抽样序记录 id
+        """
+        if call.first_item_ordinal == call.a_item_ordinal:
+            return call.record_a.id, call.record_b.id
+        return call.record_b.id, call.record_a.id
+
+    @staticmethod
+    def _pairwise_success(obj: Mapping, keys: Sequence[str],
+                          model: str) -> PairwiseQualityOutcome:
+        """把可变 Schema 结果冻结为准则声明序裁决。
+
+        @param obj 已通过 M8 校验的对象
+        @param keys 本调用的准则声明序
+        @param model 实际应答模型名
+        @return 冻结成功结果
+        """
+        by_key = _judgments_by_key(obj)
+        judgments = []
+        for key in keys:
+            entry = by_key.get(key)
+            if entry is None:
+                continue
+            judgments.append(QualityJudgment(
+                criterion=key,
+                winner=entry["winner"],
+                reason=entry.get("reason"),
+            ))
+        return PairwiseQualityOutcome(tuple(judgments), model)
+
+    def _reduce_pairwise_call(self, pool: "_Pool", call: PairwiseQualityCall,
+                              outcome: QualityCallOutcome, ctx: "RunContext") -> None:
+        """按调用声明序提交一次成对结果及其事件与错误。
+
+        @param pool 归属池
+        @param call 冻结成对计划
+        @param outcome 纯叶结果
+        @param ctx 运行上下文
+        """
+        involved = (pool.items[call.first_item_ordinal],
+                    pool.items[call.second_item_ordinal])
+        keys = [criterion.key for criterion in call.criteria]
+        if isinstance(outcome, QualityCallFailure):
+            self._reduce_pairwise_failure(ctx, involved, outcome)
+            verdicts = {key: None for key in keys}
+        elif isinstance(outcome, PairwiseQualityOutcome):
+            by_key = self._judgment_map(outcome.judgments)
+            self._emit_judgment(ctx, pool.items, call, outcome)
+            verdicts = _judgment_verdicts(
+                by_key, keys, call.a_item_ordinal, call.b_item_ordinal,
+            )
+        else:
+            _logger.error("quality pairwise outcome mismatch: ordinal=%d", call.ordinal,
+                          extra={"stage": self.name, "batch": ctx.batch_no})
+            raise InternalError("quality pairwise outcome mismatch")
+        pool.results.append((call.comparison_ordinal, call.profile,
+                             call.flipped, verdicts))
+
+    def _reduce_pairwise_failure(self, ctx: "RunContext",
+                                 involved: Sequence[PipelineItem],
+                                 failure: QualityCallFailure) -> None:
+        """把成对叶失败转成既有比较或记录级事实。
 
         @param ctx 运行上下文
         @param involved 涉及的两个信封
-        @param fit 本次尝试的装填状态；None = 预算关闭
-        @param attempt 重试状态（携带触发降档的反应式异常）
-        @return True = 已按平局终态处置，调用方必须放弃本次调用
+        @param failure 冻结调用失败
         """
-        if fit is None:
-            return False
-        if fit.truncations:
-            ctx.metrics.count("budget.truncations.quality", fit.truncations)
-        if not fit.overflow:
-            return False
-        if attempt.overflow_exc is not None:
-            budget.feed_reactive_terminal(attempt.overflow_exc, ctx.metrics)
-        if _ATTEMPT_MODE.get():
-            raise ContextOverflowError(
-                "pairwise slot exceeds the record-side budget at the minimal unit",
-                phase="precheck")
-        self._overflow_tie(ctx, involved,
-                           "pairwise slot exceeds the record-side budget at the "
-                           "minimal unit (2 records)")
-        return True
-
-    def _judge_failure(self, ctx: "RunContext", involved: Sequence[PipelineItem],
-                       exc: Exception, attempt: _Attempt) -> bool:
-        """成对判定调用失败的分流处置。
-
-        上下文溢出：V20 至多一次收紧重试（记录侧文本份额减半后重渲染）；额度用尽（或预算
-        关闭——200 形态的 finish 判据仍可能触发）走 _overflow_tie 平局终态，并「恰好一次」
-        补喂反应式 400 的熔断器（A7）。schema 不合法：M8 修复后仍不合法，本比较按平局计
-        （spec 3.4.3）。其余：provider / 内部失败，涉及记录直接失败。
-
-        @param ctx 运行上下文
-        @param involved 涉及的两个信封
-        @param exc 失败异常
-        @param attempt 重试状态
-        @return True = 已降档，调用方应重发；False = 已终态处置
-        """
+        exc = failure.error
         if isinstance(exc, ContextOverflowError):
-            if attempt.degrade(ctx, exc):
-                return True
-            budget.feed_reactive_terminal(exc, ctx.metrics)
-            if _ATTEMPT_MODE.get():
-                raise exc
-            self._overflow_tie(
-                ctx, involved,
-                f"pairwise judgment overflow terminal ({type(exc).__name__}): {exc}")
-            return False
-        if isinstance(exc, SchemaViolation):
-            if _ATTEMPT_MODE.get():
-                raise exc
+            message = (
+                "pairwise slot exceeds the record-side budget at the minimal unit (2 records)"
+                if failure.precheck
+                else f"pairwise judgment overflow terminal ({type(exc).__name__}): {exc}"
+            )
+            self._overflow_tie(ctx, involved, message)
+        elif isinstance(exc, SchemaViolation):
             self._record_judgment_failure(
                 ctx, involved,
-                f"pairwise judgment failed (SchemaViolation): {_violation_summary(exc)}")
-            return False
-        if _ATTEMPT_MODE.get():
-            raise exc
-        self._record_call_failure(ctx, involved, exc, "pairwise judgment call failed")
-        return False
+                f"pairwise judgment failed (SchemaViolation): {_violation_summary(exc)}",
+            )
+        else:
+            self._record_call_failure(ctx, involved, exc, "pairwise judgment call failed")
+
+    @staticmethod
+    def _judgment_map(judgments: Sequence[QualityJudgment]) -> dict[str, dict]:
+        """把冻结裁决还原成 reducer 内的事件与 verdict 视图。
+
+        @param judgments 准则声明序冻结裁决
+        @return 准则键到事件条目的映射
+        """
+        out: dict[str, dict] = {}
+        for judgment in judgments:
+            entry: dict = {"criterion": judgment.criterion, "winner": judgment.winner}
+            if judgment.reason is not None:
+                entry["reason"] = judgment.reason
+            out[judgment.criterion] = entry
+        return out
 
     def _emit_judgment(self, ctx: "RunContext", items: list[PipelineItem],
-                       call: _JudgeCall, by_key: Mapping[str, Mapping],
-                       model: str) -> None:
+                       call: PairwiseQualityCall,
+                       outcome: PairwiseQualityOutcome) -> None:
         """发出 quality.judgment 事件。
 
         record_ids 用「抽样序」，不是呈现的 A/B 序（§8.1）。
@@ -1609,18 +1699,18 @@ class QualityStage:
         @param ctx 运行上下文
         @param items 本池的信封列表
         @param call 本次调用的全部参数
-        @param by_key 准则 key → 裁决条目
-        @param model 实际应答的模型名
+        @param outcome 冻结裁决与实际应答模型
         """
-        rec_first = items[call.first_idx].record
-        rec_second = items[call.second_idx].record
-        keys = [c.key for c in call.group]
-        payload: dict = {"order": {"A": items[call.a_idx].record.id,
-                                   "B": items[call.b_idx].record.id},
-                         "model": model,
+        rec_first = items[call.first_item_ordinal].record
+        rec_second = items[call.second_item_ordinal].record
+        keys = [criterion.key for criterion in call.criteria]
+        by_key = self._judgment_map(outcome.judgments)
+        payload: dict = {"order": {"A": items[call.a_item_ordinal].record.id,
+                                   "B": items[call.b_item_ordinal].record.id},
+                         "model": outcome.model,
                          "judgments": [dict(by_key[k]) for k in keys if k in by_key]}
         if call.multi_judge:
-            payload["judge"] = call.judge
+            payload["judge"] = call.profile
         if call.pool is not None:  # v1.7（R16）：仅 classify 开启时
             payload["pool"] = call.pool
         excerpt = self._excerpt_payload((rec_first, rec_second))
@@ -1631,152 +1721,134 @@ class QualityStage:
 
     # ── pointwise 模式 ──────────────────────────────────────────────────────
 
-    def _pointwise_calls(self, pool: "_Pool", ctx: "RunContext") -> list:
-        """一个池的逐条打分协程（不消费 rng）；聚合在收尾段逐池完成。
+    def _pointwise_calls(self, pool: "_Pool", pool_ordinal: int,
+                         start_ordinal: int) -> list[PointwiseQualityCall]:
+        """按记录与准则声明序冻结逐条打分调用。
 
         @param pool 待打分的池
-        @param ctx 运行上下文
-        @return 待 await 的协程列表
+        @param pool_ordinal 当前池声明序
+        @param start_ordinal 当前池首个全批任务序号
+        @return 冻结逐条调用计划
         """
-        return [self._pointwise_once(ctx, item, crit, pool.q, pool.pool)
-                for item in pool.items for crit in pool.criteria]
+        calls: list[PointwiseQualityCall] = []
+        for item_ordinal, item in enumerate(pool.items):
+            for criterion in pool.criteria:
+                calls.append(PointwiseQualityCall(
+                    ordinal=start_ordinal + len(calls),
+                    pool_ordinal=pool_ordinal,
+                    item_ordinal=item_ordinal,
+                    record=item.record,
+                    transitions=(tuple(item.transitions)
+                                 if item.transitions is not None else None),
+                    criterion=criterion,
+                    profile=pool.q.llm,
+                    pool=pool.pool,
+                ))
+        return calls
 
-    async def _pointwise_once(self, ctx: "RunContext", item: PipelineItem,
-                              criterion: "Criterion", q: "QualityConfig",
-                              pool: str | None = None) -> None:
-        """一次逐条打分调用：写入归一化分并发出 quality.pointwise 事件。
+    async def _run_pointwise_call(self, call: PointwiseQualityCall,
+                                  ctx: "RunContext") -> QualityCallOutcome:
+        """执行一次不修改 item、pool、event 或 error 的逐条判定。
 
+        @param call 冻结逐条计划
         @param ctx 运行上下文
-        @param item 被打分的信封
-        @param criterion 本次调用的单条准则
-        @param q 本池生效的质量配置
-        @param pool 池名；None = 匿名池
+        @return 成功打分或普通失败
         """
-        schema = pointwise_schema(criterion.key)
-        obj = await self._pointwise_dispatch(ctx, item, criterion, q, schema)
-        if obj is None:
-            return
-        entry = obj["scores"][0]
-        raw = int(entry["score"])
-        score = QualityScore(criterion=criterion.key, score=raw / 5.0, mode="pointwise",
-                             detail={"raw_score": raw, "reason": entry.get("reason", "")})
-        item.scores[criterion.key] = score
-        self._emit_pointwise(ctx, item.record, score, pool)
-
-    async def _pointwise_dispatch(self, ctx: "RunContext", item: PipelineItem,
-                                  criterion: "Criterion", q: "QualityConfig",
-                                  schema: dict) -> Mapping | None:
-        """逐条打分的发送循环：装填 → 最小单元预检 → 发送；失败交 _pointwise_failure 处置。
-
-        @param ctx 运行上下文
-        @param item 被打分的信封
-        @param criterion 本次调用的单条准则
-        @param q 本池生效的质量配置（提供 llm profile 名）
-        @param schema 打分 schema
-        @return 已校验的打分对象；不可恢复失败时为 None
-        @raises CircuitBreakerTripped 熔断器已跳闸
-        """
-        rec = item.record
-        # v1.11：单记录家族——与成对同一套装填，切分份数为 1（整个记录侧就是一个槽位）。
-        attempt = _Attempt(self._call_fit(ctx, q.llm, _pointwise_system_text(criterion),
-                                          schema, (rec,)))
+        schema = pointwise_schema(call.criterion.key)
+        fit = self._call_fit(ctx, QualityFitRequest(
+            profile=call.profile,
+            system_text=_pointwise_system_text(call.criterion),
+            schema=schema,
+            records=(call.record,),
+        ))
+        attempt = _Attempt(fit)
         while True:
-            fit = attempt.next_fit()
-            prompt = _build_pointwise_prompt(rec, criterion,
-                                             self.cfg.input.ui_tree_max_chars,
-                                             transitions=item.transitions, fit=fit)
-            if self._pointwise_unfittable(ctx, item, criterion, fit, attempt):
-                return None
+            current = attempt.next_fit()
+            prompt = _build_pointwise_prompt(
+                call.record, call.criterion, self.cfg.input.ui_tree_max_chars,
+                transitions=call.transitions, fit=current,
+            )
+            precheck = self._precheck_failure(current, attempt, ctx, "pointwise")
+            if precheck is not None:
+                return precheck
             try:
                 obj, _usage, _attempts, _model = await ctx.schema_engine.complete_validated(
-                    q.llm, prompt, schema,
-                    scope=CallScope(record_ids=(rec.id,), batch_no=ctx.batch_no))
-                return obj
+                    call.profile, prompt, schema,
+                    scope=CallScope(record_ids=(call.record.id,), batch_no=ctx.batch_no),
+                )
             except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as exc:
-                _logger.warning("pointwise scoring call failed: criterion=%s exc=%s",
-                                criterion.key, type(exc).__name__,
-                                extra={"stage": self.name, "batch": ctx.batch_no})
-                if self._pointwise_failure(ctx, item, criterion, exc, attempt):
+                failure = self._call_failure(exc, attempt, ctx, call.ordinal)
+                if failure is None:
                     continue
-                return None
+                return failure
+            entry = obj["scores"][0]
+            return PointwiseQualityOutcome(int(entry["score"]), entry.get("reason", ""))
 
-    def _pointwise_unfittable(self, ctx: "RunContext", item: PipelineItem,
-                              criterion: "Criterion", fit: _CallFit | None,
-                              attempt: _Attempt) -> bool:
-        """发送前预检：记账截断次数，并判断单记录最小单元是否仍装不下。
+    def _reduce_pointwise_call(self, pool: "_Pool", call: PointwiseQualityCall,
+                               outcome: QualityCallOutcome, ctx: "RunContext") -> None:
+        """按调用声明序提交一次逐条结果及其事件与错误。
 
-        V10：单条记录装不下走记录级 reject；若是反应式 400 把我们逼到这一步，此刻结算（A7）。
+        @param pool 归属池
+        @param call 冻结逐条计划
+        @param outcome 纯叶结果
+        @param ctx 运行上下文
+        """
+        item = pool.items[call.item_ordinal]
+        if isinstance(outcome, QualityCallFailure):
+            self._reduce_pointwise_failure(ctx, item, call, outcome)
+            return
+        if not isinstance(outcome, PointwiseQualityOutcome):
+            _logger.error("quality pointwise outcome mismatch: ordinal=%d", call.ordinal,
+                          extra={"stage": self.name, "batch": ctx.batch_no})
+            raise InternalError("quality pointwise outcome mismatch")
+        score = QualityScore(
+            criterion=call.criterion.key,
+            score=outcome.raw_score / 5.0,
+            mode="pointwise",
+            detail={"raw_score": outcome.raw_score, "reason": outcome.reason},
+        )
+        item.scores[call.criterion.key] = score
+        self._emit_pointwise(ctx, item.record, score, call.pool)
+
+    def _reduce_pointwise_failure(self, ctx: "RunContext", item: PipelineItem,
+                                  call: PointwiseQualityCall,
+                                  failure: QualityCallFailure) -> None:
+        """把逐条叶失败转成既有记录级事实。
 
         @param ctx 运行上下文
-        @param item 被打分的信封
-        @param criterion 本次调用的单条准则
-        @param fit 本次尝试的装填状态；None = 预算关闭
-        @param attempt 重试状态
-        @return True = 已按记录级终态处置，调用方必须放弃本次调用
+        @param item 涉及的信封
+        @param call 冻结逐条计划
+        @param failure 冻结调用失败
         """
-        if fit is None:
-            return False
-        if fit.truncations:
-            ctx.metrics.count("budget.truncations.quality", fit.truncations)
-        if not fit.overflow:
-            return False
-        if attempt.overflow_exc is not None:
-            budget.feed_reactive_terminal(attempt.overflow_exc, ctx.metrics)
-        if _ATTEMPT_MODE.get():
-            raise ContextOverflowError(
-                "pointwise slot exceeds the record-side budget at the minimal unit",
-                phase="precheck")
-        self._overflow_fail_record(
-            ctx, item,
-            f"pointwise slot for criterion {criterion.key} exceeds "
-            "the record-side budget at the minimal unit (1 record)")
-        return True
-
-    def _pointwise_failure(self, ctx: "RunContext", item: PipelineItem,
-                           criterion: "Criterion", exc: Exception,
-                           attempt: _Attempt) -> bool:
-        """逐条打分调用失败的分流处置。
-
-        上下文溢出：V20 至多一次收紧重试；额度用尽（或预算关闭）走记录级 context_overflow
-        终态。schema 不合法：M8 修复后仍不合法 ⇒ 分置空，由 on_unscored 决定去留
-        （spec 3.4.3）。其余：provider / 内部失败，记录直接失败。
-
-        @param ctx 运行上下文
-        @param item 被打分的信封
-        @param criterion 本次调用的单条准则
-        @param exc 失败异常
-        @param attempt 重试状态
-        @return True = 已降档，调用方应重发；False = 已终态处置
-        """
+        exc = failure.error
+        key = call.criterion.key
         if isinstance(exc, ContextOverflowError):
-            if attempt.degrade(ctx, exc):
-                return True
-            budget.feed_reactive_terminal(exc, ctx.metrics)
-            if _ATTEMPT_MODE.get():
-                raise exc
-            self._overflow_fail_record(
-                ctx, item,
-                f"pointwise scoring overflow terminal for criterion "
-                f"{criterion.key} ({type(exc).__name__}): {exc}")
-            return False
+            message = (
+                f"pointwise slot for criterion {key} exceeds the record-side budget "
+                "at the minimal unit (1 record)"
+                if failure.precheck
+                else f"pointwise scoring overflow terminal for criterion {key} "
+                     f"({type(exc).__name__}): {exc}"
+            )
+            self._overflow_fail_record(ctx, item, message)
+            return
         if isinstance(exc, SchemaViolation):
-            if _ATTEMPT_MODE.get():
-                raise exc
             self._record_judgment_failure(
                 ctx, (item,),
-                f"pointwise scoring failed for criterion {criterion.key} "
-                f"(SchemaViolation): {_violation_summary(exc)}")
-            item.scores[criterion.key] = QualityScore(
-                criterion=criterion.key, score=None, mode="pointwise", detail={})
-            return False
-        if _ATTEMPT_MODE.get():
-            raise exc
+                f"pointwise scoring failed for criterion {key} "
+                f"(SchemaViolation): {_violation_summary(exc)}",
+            )
+            item.scores[key] = QualityScore(
+                criterion=key, score=None, mode="pointwise", detail={},
+            )
+            if _ATTEMPT_MODE.get():
+                item.status = "failed"
+            return
         self._record_call_failure(
-            ctx, (item,), exc,
-            f"pointwise scoring call failed for criterion {criterion.key}")
-        return False
+            ctx, (item,), exc, f"pointwise scoring call failed for criterion {key}",
+        )
 
     def _emit_pointwise(self, ctx: "RunContext", record: Record,
                         score: QualityScore, pool: str | None) -> None:

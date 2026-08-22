@@ -65,10 +65,10 @@ from labelkit.common.errors import (
     ProviderRetryableError,
     SchemaViolation,
 )
-from labelkit.common.runtime.credentials import referenced_profiles
-from labelkit.common.runtime.llm_client import LLMClient, ProbeResult
+from labelkit.common.inference.credentials import referenced_profiles
+from labelkit.common.inference.llm_client import LLMClient, ProbeResult
 from labelkit.orchestration.factory import build_stages
-from labelkit.orchestration.runtime import execute_run, probe_referenced_profiles
+from labelkit.orchestration.application import execute_run, probe_referenced_profiles
 
 # labelkit.cli 把 main 这个**函数**导出到包命名空间，遮住了同名子模块——兜底出口
 # 的 monkeypatch 要打在真模块对象上。
@@ -93,6 +93,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/config/generation.py",
     "labelkit/common/config/loader.py",
     "labelkit/common/config/model.py",
+    "labelkit/common/contracts/execution.py",
     "labelkit/common/contracts/generation.py",
     "labelkit/common/contracts/stage.py",
     "labelkit/common/contracts/types.py",
@@ -100,11 +101,11 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/extensions/hooks.py",
     "labelkit/common/observability/console_format.py",
     "labelkit/common/observability/obslog.py",
-    "labelkit/common/runtime/budget.py",           # v1.11 (CONTRACTS §7.17)
-    "labelkit/common/runtime/credentials.py",      # v1.17 secret-free 凭据载体
-    "labelkit/common/runtime/generation_prompts.py",  # v1.18 六家族共享完整提示词
-    "labelkit/common/runtime/llm_client.py",
-    "labelkit/common/runtime/schema_engine.py",
+    "labelkit/common/inference/budget.py",           # v1.11 (CONTRACTS §7.17)
+    "labelkit/common/inference/credentials.py",      # v1.17 secret-free 凭据载体
+    "labelkit/common/inference/generation_prompts.py",  # v1.18 六家族共享完整提示词
+    "labelkit/common/inference/llm_client.py",
+    "labelkit/common/inference/schema_engine.py",
     "labelkit/operators/annotate.py",
     "labelkit/operators/classify.py",
     "labelkit/operators/dedup.py",
@@ -122,14 +123,19 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/operators/generation/state.py",
     "labelkit/operators/ingest.py",
     "labelkit/operators/quality.py",
+    "labelkit/operators/quality_calls.py",
     "labelkit/operators/segment.py",
     "labelkit/operators/stitch.py",
+    "labelkit/operators/stream_verify.py",
     "labelkit/operators/verify.py",
+    "labelkit/runtime/__init__.py",
+    "labelkit/runtime/resources.py",
+    "labelkit/runtime/scheduler.py",
     "labelkit/orchestration/__init__.py",
+    "labelkit/orchestration/application.py",
     "labelkit/orchestration/factory.py",
-    "labelkit/orchestration/generation_delivery.py",
-    "labelkit/orchestration/orchestrator.py",
-    "labelkit/orchestration/runtime.py",
+    "labelkit/orchestration/process_workflow.py",
+    "labelkit/orchestration/sequence_workflow.py",
 }
 
 EXPECTED_TEST_PY = {
@@ -138,23 +144,26 @@ EXPECTED_TEST_PY = {
     "tests/common/config/test_config.py",
     "tests/common/config/test_generation.py",
     "tests/common/config/test_paths_hooks.py",     # v1.17 (SPEC-scenario-planning §5.1/§4.9)
+    "tests/common/contracts/test_execution.py",
     "tests/common/contracts/test_stage.py",
     "tests/common/contracts/test_generation_contracts.py",
     "tests/common/contracts/test_types.py",
     "tests/common/extensions/test_hooks.py",
     "tests/common/observability/test_console_format.py",
     "tests/common/observability/test_obslog.py",
-    "tests/common/runtime/test_budget.py",         # v1.11 (CONTRACTS §7.17)
-    "tests/common/runtime/test_credentials.py",    # v1.17 secret-free 凭据面
-    "tests/common/runtime/test_generation_prompts.py",
-    "tests/common/runtime/test_llm_client.py",
-    "tests/common/runtime/test_schema_engine.py",
+    "tests/common/inference/test_budget.py",         # v1.11 (CONTRACTS §7.17)
+    "tests/common/inference/test_credentials.py",    # v1.17 secret-free 凭据面
+    "tests/common/inference/test_generation_prompts.py",
+    "tests/common/inference/test_llm_client.py",
+    "tests/common/inference/test_schema_engine.py",
     "tests/common/test_errors.py",
     "tests/conftest.py",
     "tests/hook_samples.py",
+    "tests/llm_client_helpers.py",
     "tests/integration/test_annotate_llm.py",
     "tests/integration/test_budget_llm.py",
     "tests/integration/test_classify_llm.py",
+    "tests/integration/test_execution_runtime_local_llm.py",
     "tests/integration/test_frame_llm.py",         # v1.12 (SPEC-frame-annotation §3.9)
     "tests/integration/test_generate_llm.py",
     "tests/integration/test_sequence_generation_llm.py",
@@ -185,14 +194,23 @@ EXPECTED_TEST_PY = {
     "tests/operators/test_segment.py",
     "tests/operators/test_stitch.py",
     "tests/operators/test_verify.py",
-    "tests/orchestration/test_orchestrator.py",
-    "tests/orchestration/test_generation_delivery.py",
+    "tests/orchestration/test_application.py",
+    "tests/orchestration/test_process_workflow.py",
+    "tests/orchestration/test_sequence_workflow.py",
+    "tests/runtime/test_resources.py",
+    "tests/runtime/test_scheduler.py",
 }
 
 REMOVED_MODULES = (
     "labelkit.annotate",
     "labelkit.classify",
     "labelkit.config",
+    "labelkit.common.runtime",
+    "labelkit.common.runtime.budget",
+    "labelkit.common.runtime.credentials",
+    "labelkit.common.runtime.generation_prompts",
+    "labelkit.common.runtime.llm_client",
+    "labelkit.common.runtime.schema_engine",
     "labelkit.dedup",
     "labelkit.emitter",
     "labelkit.errors",
@@ -203,6 +221,9 @@ REMOVED_MODULES = (
     "labelkit.llm_client",
     "labelkit.obslog",
     "labelkit.orchestrator",
+    "labelkit.orchestration.generation_delivery",
+    "labelkit.orchestration.orchestrator",
+    "labelkit.orchestration.runtime",
     "labelkit.quality",
     "labelkit.schema_engine",
     "labelkit.segment",
@@ -235,7 +256,7 @@ def test_package_layout_matches_frozen_spec():
             spec = importlib.util.find_spec(module)
         except ModuleNotFoundError:
             spec = None
-        assert spec is None, f"legacy import path still resolves: {module}"
+        assert spec is None, f"removed import path still resolves: {module}"
 
 
 def test_package_layout_dependency_direction():
@@ -254,13 +275,20 @@ def test_package_layout_dependency_direction():
                 imports.append(node.module)
 
         if relative.startswith("labelkit/common/"):
+            forbidden = (
+                "labelkit.cli",
+                "labelkit.operators",
+                "labelkit.orchestration",
+                "labelkit.runtime",
+            )
+        elif relative.startswith("labelkit/runtime/"):
             forbidden = ("labelkit.cli", "labelkit.operators", "labelkit.orchestration")
         elif relative.startswith("labelkit/operators/"):
-            forbidden = ("labelkit.cli", "labelkit.orchestration")
+            forbidden = ("labelkit.cli", "labelkit.orchestration", "labelkit.runtime")
         elif relative.startswith("labelkit/orchestration/"):
             forbidden = ("labelkit.cli",)
         elif relative.startswith("labelkit/cli/"):
-            forbidden = ("labelkit.operators",)
+            forbidden = ("labelkit.operators", "labelkit.runtime")
         else:
             forbidden = ()
 
@@ -278,7 +306,18 @@ def test_package_layout_dependency_direction():
                     "labelkit.operators.classify",
                     "labelkit.operators.extract",
                     "labelkit.operators.segment",
+                    "labelkit.operators.stream_verify",
                 }
+            elif own_module == "labelkit.operators.stream_verify":
+                allowed_operator_calls = {
+                    "labelkit.operators.annotate",
+                    "labelkit.operators.classify",
+                    "labelkit.operators.extract",
+                    "labelkit.operators.segment",
+                    "labelkit.operators.verify",
+                }
+            elif own_module == "labelkit.operators.quality":
+                allowed_operator_calls = {"labelkit.operators.quality_calls"}
             elif own_module == "labelkit.operators.generate":
                 # flat 与 sequence 都是 M6 的物理子模块。
                 allowed_operator_calls = {"labelkit.operators.generation.flat"}
@@ -409,7 +448,7 @@ def test_parser_console_invalid_value_rejected():
 @pytest.mark.parametrize("bad", ["0", "-1", "-100", "abc", "1.5"])
 def test_limit_rejects_non_positive_or_non_int(bad, capsys):
     """Zero/negative/non-integer --limit is a usage error → exit 2 (spec §2.4),
-    never a runtime ValueError inside the orchestrator (spec 3.1.5)."""
+    never a runtime ValueError inside ProcessWorkflow (spec 3.1.5)."""
     with pytest.raises(SystemExit) as excinfo:
         cli.build_parser().parse_args(
             ["run", "--config", "c.toml", "--project", "p.toml", "--limit", bad])
@@ -870,9 +909,9 @@ def test_validate_missing_config_file_exits_2(tmp_path, capsys):
 
 
 def test_run_nonexistent_input_exits_3(tmp_path, capsys, monkeypatch):
-    for mod in ("labelkit.common.config.loader", "labelkit.common.observability.obslog", "labelkit.common.runtime.llm_client",
-                "labelkit.common.runtime.schema_engine", "labelkit.operators.ingest", "labelkit.operators.dedup",
-                "labelkit.operators.quality", "labelkit.operators.emitter", "labelkit.orchestration.orchestrator"):
+    for mod in ("labelkit.common.config.loader", "labelkit.common.observability.obslog", "labelkit.common.inference.llm_client",
+                "labelkit.common.inference.schema_engine", "labelkit.operators.ingest", "labelkit.operators.dedup",
+                "labelkit.operators.quality", "labelkit.operators.emitter", "labelkit.orchestration.process_workflow"):
         pytest.importorskip(mod)
     monkeypatch.setenv("LABELKIT_CLI_TEST_KEY", "test-key")
     config = tmp_path / "config.toml"
@@ -933,9 +972,9 @@ def _write_pair(tmp_path, input_path: str) -> tuple:
 
 
 def test_bad_input_run_preserves_previous_trace(tmp_path, monkeypatch, capsys):
-    for mod in ("labelkit.common.config.loader", "labelkit.common.observability.obslog", "labelkit.common.runtime.llm_client",
-                "labelkit.common.runtime.schema_engine", "labelkit.operators.ingest", "labelkit.operators.dedup",
-                "labelkit.operators.quality", "labelkit.operators.emitter", "labelkit.orchestration.orchestrator"):
+    for mod in ("labelkit.common.config.loader", "labelkit.common.observability.obslog", "labelkit.common.inference.llm_client",
+                "labelkit.common.inference.schema_engine", "labelkit.operators.ingest", "labelkit.operators.dedup",
+                "labelkit.operators.quality", "labelkit.operators.emitter", "labelkit.orchestration.process_workflow"):
         pytest.importorskip(mod)
     monkeypatch.setenv("LABELKIT_CLI_TEST_KEY", "test-key")
     config, project, out_dir = _write_pair(tmp_path, str(tmp_path / "missing.jsonl"))
@@ -950,9 +989,9 @@ def test_bad_input_run_preserves_previous_trace(tmp_path, monkeypatch, capsys):
 
 
 def test_dry_run_diverts_trace_and_report(tmp_path, monkeypatch, capsys):
-    for mod in ("labelkit.common.config.loader", "labelkit.common.observability.obslog", "labelkit.common.runtime.llm_client",
-                "labelkit.common.runtime.schema_engine", "labelkit.operators.ingest", "labelkit.operators.dedup",
-                "labelkit.operators.quality", "labelkit.operators.emitter", "labelkit.orchestration.orchestrator"):
+    for mod in ("labelkit.common.config.loader", "labelkit.common.observability.obslog", "labelkit.common.inference.llm_client",
+                "labelkit.common.inference.schema_engine", "labelkit.operators.ingest", "labelkit.operators.dedup",
+                "labelkit.operators.quality", "labelkit.operators.emitter", "labelkit.orchestration.process_workflow"):
         pytest.importorskip(mod)
     monkeypatch.setenv("LABELKIT_CLI_TEST_KEY", "test-key")
     data = tmp_path / "in.jsonl"
@@ -979,7 +1018,7 @@ def test_execute_run_without_a_listener_is_the_pre_v110_path(tmp_path, monkeypat
     """v1.10（U19）：``listener`` 是尾参——不传（v1.10 之前的全部调用方）时旁路
     整轮不挂，运行照常收敛退出码（这里走 dry-run，零 LLM 调用）。"""
     for mod in ("labelkit.common.config.loader", "labelkit.operators.ingest",
-                "labelkit.orchestration.orchestrator"):
+                "labelkit.orchestration.process_workflow"):
         pytest.importorskip(mod)
     monkeypatch.setenv("LABELKIT_CLI_TEST_KEY", "test-key")
     data = tmp_path / "in.jsonl"
@@ -997,11 +1036,11 @@ def test_execute_run_without_a_listener_is_the_pre_v110_path(tmp_path, monkeypat
 # 这里 monkeypatch 的是 Python 对象层的 probe_all 协程，绝不桩 HTTP 传输层。
 
 
-def _probe(profile: str, *, ok: bool = True, model: str = "glm-5.2",
+def _probe(profile: str, *, kind: str = "llm", ok: bool = True, model: str = "glm-5.2",
            latency_ms: int = 421, error: str | None = None,
            key_env: str | None = None) -> ProbeResult:
-    """构造一条探测结果（spec 3.9.2 ProbeResult 六字段）。"""
-    return ProbeResult(profile=profile, ok=ok, model=model,
+    """构造一条带资源类型的探测结果。"""
+    return ProbeResult(kind=kind, profile=profile, ok=ok, model=model,
                        latency_ms=latency_ms, error=error, key_env=key_env)
 
 
@@ -1022,14 +1061,15 @@ def test_probe_referenced_profiles_walks_llm_then_embedding_in_order(monkeypatch
     池大小之和 次探测调用」）：探测顺序 = 引用集的 (LLM…, embedding…) 拼接，池化
     profile 的多条结果被**展开**而非嵌套，返回 tuple。"""
     monkeypatch.setenv("K", "k")   # v1.17 Wave 2b：探测前先物化凭据（缺 key ⇒ exit 2）
-    probed: list[str] = []
+    probed: list[tuple[str, str]] = []
 
-    async def fake_probe_all(self, name):     # noqa: ANN001 — 对象层桩，非传输层
-        probed.append(name)
+    async def fake_probe_all(self, resource_key):  # noqa: ANN001 — 对象层桩，非传输层
+        kind, name = resource_key
+        probed.append(resource_key)
         if name == "judge":                   # 池化 profile：逐键一条，声明序
-            return [_probe(name, key_env="LABELKIT_KEY_A"),
-                    _probe(name, ok=False, error="401", key_env="LABELKIT_KEY_B")]
-        return [_probe(name)]
+            return [_probe(name, kind=kind, key_env="LABELKIT_KEY_A"),
+                    _probe(name, kind=kind, ok=False, error="401", key_env="LABELKIT_KEY_B")]
+        return [_probe(name, kind=kind)]
 
     monkeypatch.setattr(LLMClient, "probe_all", fake_probe_all)
     cfg = _probe_cfg()
@@ -1037,7 +1077,8 @@ def test_probe_referenced_profiles_walks_llm_then_embedding_in_order(monkeypatch
 
     llms, embs = referenced_profiles(cfg)
     assert (llms, embs) == (["default", "judge", "fixer"], ["emb"])
-    assert probed == [*llms, *embs]           # 引用集顺序即探测顺序
+    assert probed == [*(("llm", name) for name in llms),
+                      *(("embedding", name) for name in embs)]
     assert isinstance(results, tuple)
     assert [r.profile for r in results] == ["default", "judge", "judge",
                                             "fixer", "emb"]
@@ -1065,8 +1106,8 @@ _PROBE_RESULTS = (
            error="401 unauthorized", key_env="LABELKIT_KEY_B"),
 )
 
-_PROBE_LINES = ["probe default: ok model=glm-5.2 latency_ms=421",
-                "probe judge[LABELKIT_KEY_B]: FAIL 401 unauthorized"]
+_PROBE_LINES = ["probe llm.default: ok model=glm-5.2 latency_ms=421",
+                "probe llm.judge[LABELKIT_KEY_B]: FAIL 401 unauthorized"]
 
 
 def _validate_args(*extra: str):
@@ -1152,10 +1193,10 @@ def test_print_probe_table_renders_five_columns(monkeypatch):
     assert cli_commands._print_probe_table(_PROBE_RESULTS) is True
     lines = [ln for ln in fake_out.getvalue().splitlines() if ln.strip()]
     header = next(ln for ln in lines if "status" in ln)
-    for column in ("profile[key]", "status", "model", "latency_ms", "error"):
+    for column in ("kind.profile[key]", "status", "model", "latency_ms", "error"):
         assert column in header, column
     ok_row = next(ln for ln in lines if "default" in ln and "ok" in ln)
-    fail_row = next(ln for ln in lines if "judge[LABELKIT_KEY_B]" in ln)
+    fail_row = next(ln for ln in lines if "llm.judge[LABELKIT_KEY_B]" in ln)
     assert "glm-5.2" in ok_row and "421" in ok_row
     assert "FAIL" in fail_row and "401 unauthorized" in fail_row
     # 右对齐：latency_ms 值贴着本格右边界（后面只剩边框与空格）

@@ -33,10 +33,11 @@ from labelkit.common.config.model import (
     VerifyConfig,
 )
 from labelkit.common.errors import ProviderFatalError
-from labelkit.common.runtime.credentials import RuntimeCredentials
-from labelkit.common.runtime.llm_client import LLMClient, Message, Part, PromptBundle
+from labelkit.common.inference.credentials import RuntimeCredentials
+from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 from labelkit.common.observability.obslog import EventLog, MetricsSink
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
+from tests.llm_client_helpers import make_llm_client as _client
 
 pytestmark = pytest.mark.integration
 
@@ -73,7 +74,7 @@ def _prompt(text: str) -> PromptBundle:
 
 
 async def test_plain_completion_returns_text_and_usage():
-    client = LLMClient({"default": _profile()}, {},
+    client = _client({"default": _profile()}, {},
                         _creds(default=os.environ[ZAI_KEY_ENV]))
     try:
         resp = await client.complete("default", _prompt("1+1 等于几？只回答数字。"))
@@ -102,7 +103,7 @@ async def test_forced_tool_structured_output_is_schema_valid():
         "required": ["answer", "confident"],
         "additionalProperties": False,
     }
-    client = LLMClient({"default": _profile()}, {},
+    client = _client({"default": _profile()}, {},
                         _creds(default=os.environ[ZAI_KEY_ENV]))
     try:
         resp = await client.complete(
@@ -117,11 +118,10 @@ async def test_forced_tool_structured_output_is_schema_valid():
     assert resp.usage.prompt_tokens > 0
 
 
-async def test_concurrency_smoke_4_calls_under_semaphore_2():
-    client = LLMClient({"default": _profile(max_concurrency=2, max_output_tokens=128)},
-                        {}, _creds(default=os.environ[ZAI_KEY_ENV]))
-    sem = client._semaphore("llm", "default", 2)
-    assert sem._value == 2
+async def test_concurrency_smoke_4_calls_under_profile_limit_2():
+    client = _client({"default": _profile(max_concurrency=2, max_output_tokens=128)},
+                     {}, _creds(default=os.environ[ZAI_KEY_ENV]))
+    assert client._resources.admission_capacity(("llm", "default")) == 2
     prompts = [_prompt(f"{n}+{n} 等于几？只回答数字。") for n in (1, 2, 3, 4)]
     try:
         responses = await asyncio.gather(
@@ -131,7 +131,7 @@ async def test_concurrency_smoke_4_calls_under_semaphore_2():
     assert len(responses) == 4
     assert all(r.text.strip() for r in responses)
     assert client.usage_by_profile["default"].calls == 4
-    assert sem._value == 2                        # semaphore fully released
+    assert client._resources.admission_capacity(("llm", "default")) == 2
 
 
 def _full_trace_cfg(tmp_path, profile: LLMProfile) -> ResolvedConfig:
@@ -177,7 +177,7 @@ async def test_full_content_trace_carries_input_and_output_messages(tmp_path):
     cfg = _full_trace_cfg(tmp_path, profile)
     event_log = EventLog(cfg.trace, "0123456789ab")
     sink = MetricsSink(cfg, "0123456789ab", event_log)
-    client = LLMClient({"default": profile}, {},
+    client = _client({"default": profile}, {},
                         _creds(default=os.environ[ZAI_KEY_ENV]), metrics=sink)
     prompt = _prompt("1+1 等于几？只回答数字。")
     try:
@@ -209,7 +209,7 @@ async def test_wrong_key_is_provider_fatal_not_retried():
     # Key env deliberately points at a bogus variable → empty/invalid credential.
     bogus = _profile(name="bogus", api_key_env="LABELKIT_ZAI_KEY_DOES_NOT_EXIST",
                      max_retries=3)
-    client = LLMClient({"bogus": bogus}, {}, _creds(bogus=""))
+    client = _client({"bogus": bogus}, {}, _creds(bogus=""))
     try:
         with pytest.raises(ProviderFatalError) as ei:
             await client.complete("bogus", _prompt("ping"))
@@ -232,7 +232,7 @@ async def test_auth_fatal_trips_breaker_and_queued_calls_fail_fast(tmp_path):
 
     prof = _profile(api_key_env="LABELKIT_BAD_KEY_TEST", max_concurrency=1)
     sink = MetricsSink(obslog_cfg(tmp_path), "itest", EventLog(obslog_cfg(tmp_path).trace, "itest"))
-    client = LLMClient({"default": prof}, {},
+    client = _client({"default": prof}, {},
                         _creds(default="definitely-not-a-key"), sink)
     prompt = PromptBundle(messages=(
         Message(role="user", parts=(Part(kind="text", text="hi", image=None),)),))

@@ -66,18 +66,20 @@ project.toml:[quality].llm: referenced profile "gpt4" does not exist in config.t
 
 ```
 configuration valid
-probe default: ok model=glm-5.2 latency_ms=7291
-probe judge: FAIL HTTP 401: {"error":{"message":"token expired or incorrect",...}}
+probe llm.default: ok model=glm-5.2 latency_ms=7291
+probe llm.judge: FAIL HTTP 401: {"error":{"message":"token expired or incorrect",...}}
 ```
 
 **注意：probe 失败不改变退出码**（仍为 0）——它是诊断信息，不是判决。脚本里要判 probe 结果得 grep 输出。为什么仍然值得写进 checklist：密钥错误（401/403）如今会立即熔断（退出码 4），但模型名拼错这类 400/404 错误在小数据量下仍可能「静默失败 + 退出码 0」（第 2 章）——probe 一次把两类问题都免费暴露。
 
-**密钥池逐密钥探测（v1.6）**：profile 以 `api_key_envs` 声明了密钥池（第 6 章）时，`--probe` 会按声明序**对池内每把密钥各发一次** 1-token 试调用，每把密钥打一行——profile 名后以方括号标注该密钥的环境变量名（永远是变量**名**，密钥值不会出现在任何输出里）。单密钥 profile 的输出行格式不变：
+**密钥池逐密钥探测（v1.6）**：profile 以 `api_key_envs` 声明了密钥池（第 6 章）时，`--probe` 会按声明序**对池内每把密钥各发一次** 1-token 试调用，每把密钥打一行。标签使用
+`<kind>.<profile>`，所以同名 LLM 与 embedding profile 也不会混淆；池化 profile 再以方括号标注
+密钥环境变量名（永远是变量**名**，密钥值不会出现在任何输出里）：
 
 ```
-probe <profile>: ok model=... latency_ms=...             # 单密钥 profile，同上例
-probe <profile>[<ENV名>]: ok model=... latency_ms=...    # 池化 profile，每密钥一行
-probe <profile>[<ENV名>]: FAIL <错误信息>
+probe <kind>.<profile>: ok model=... latency_ms=...
+probe <kind>.<profile>[<ENV名>]: ok model=... latency_ms=...
+probe <kind>.<profile>[<ENV名>]: FAIL <错误信息>
 ```
 
 相应地，探测成本 = **各被引用 profile 的池大小之和**次试调用。两个判读提醒：

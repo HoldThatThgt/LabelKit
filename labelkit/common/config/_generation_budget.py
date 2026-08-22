@@ -6,8 +6,8 @@ from typing import Mapping
 
 from jsonschema import Draft202012Validator
 
-from labelkit.common.runtime import budget
-from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
+from labelkit.common.inference import budget
+from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 
 
 def check_generation_content_limits(state, config) -> None:

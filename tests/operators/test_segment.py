@@ -33,7 +33,7 @@ from labelkit.operators.segment import (
 
 # v1.12 装箱器下沉：_pack_windows 原样迁为 budget.pack_windows（行为字节等价），
 # 别名导入保持既有装箱断言原样不动。
-from labelkit.common.runtime.budget import pack_windows as _pack_windows
+from labelkit.common.inference.budget import pack_windows as _pack_windows
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
@@ -60,8 +60,8 @@ from labelkit.common.errors import (
     OutputTruncatedError,
     SchemaViolation,
 )
-from labelkit.common.runtime import budget as budget_mod
-from labelkit.common.runtime.schema_engine import segment_window_schema
+from labelkit.common.inference import budget as budget_mod
+from labelkit.common.inference.schema_engine import segment_window_schema
 from labelkit.common.contracts.types import (
     ImageRef,
     PipelineItem,
@@ -220,6 +220,24 @@ class SpanEngine:
         return out, Usage(), 1, "glm-5.2"
 
 
+class ReverseEngine:
+    """Completes the second declared window before the first."""
+
+    def __init__(self, by_first_frame):
+        self.by_first_frame = dict(by_first_frame)
+        self.second_started = asyncio.Event()
+        self.completion_order: list[str] = []
+
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        first = scope.record_ids[0]
+        if first == "f0":
+            await self.second_started.wait()
+        else:
+            self.second_started.set()
+        self.completion_order.append(first)
+        return self.by_first_frame[first], Usage(), 1, "glm-5.2"
+
+
 class ExplodingEngine:
     async def complete_validated(self, *a, **k):
         raise AssertionError("complete_validated must not be called")
@@ -241,6 +259,21 @@ class RecordingMetrics:
         self.provider_results.append((fatal, hard))
 
 
+class TaskRunner:
+    """Executes immutable test leaves concurrently and returns input-order results."""
+
+    async def run_group(self, request):
+        results = [None] * len(request.tasks)
+
+        async def run_one(index, spec):
+            results[index] = await spec.operation()
+
+        async with asyncio.TaskGroup() as group:
+            for index, spec in enumerate(request.tasks):
+                group.create_task(run_one(index, spec))
+        return tuple(results)
+
+
 class StubCalibrator:
     """ctx.llm.calibrator stand-in — a frozen per-image cost readout (V19
     batch-frozen snapshot); records reads to pin the once-per-session read."""
@@ -256,7 +289,9 @@ class StubCalibrator:
 
 def make_ctx(cfg, engine, llm=None):
     return SimpleNamespace(cfg=cfg, llm=llm, schema_engine=engine,
-                           metrics=RecordingMetrics(), rng=None, batch_no=1)
+                           metrics=RecordingMetrics(), tasks=TaskRunner(),
+                           task_namespace="run:batch:1:stage:segment",
+                           rng=None, batch_no=1)
 
 
 def run_stage(cfg, batch, engine, stage=None, llm=None):
@@ -558,6 +593,23 @@ def test_stitching_seam_frame_belongs_to_later_window():
     assert status_tally(batch[:3]) == {"absorbed": 3}   # nothing dropped as noise
     (episode,) = batch[3:]
     assert [r.id for r in episode.record.members] == ["f0", "f1", "f2"]
+
+
+def test_reverse_window_completion_reduces_and_emits_in_declaration_order():
+    cfg = make_cfg(window=2, min_len=1)
+    frames = [ui_frame("f0", 0), ui_frame("f1", 1), ui_frame("f2", 2)]
+    batch = [envelope(record) for record in frames]
+    engine = ReverseEngine({
+        "f0": window_obj("continues", "interruption"),
+        "f1": window_obj("advances", "continues"),
+    })
+
+    out, ctx = run_stage(cfg, batch, engine)
+
+    assert out is batch
+    assert engine.completion_order == ["f1", "f0"]
+    assert boundary_windows(ctx) == [(0, 2), (1, 3)]
+    assert [record.id for record in batch[-1].record.members] == ["f0", "f1", "f2"]
 
 
 # ── segment assembly: boundary / first frame / noise / min_len ───────────────

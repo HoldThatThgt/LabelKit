@@ -45,18 +45,46 @@ user:   [任务指令] {annotate.instruction}
 | `verify.policy = "drop"`（默认） | fail ⇒ `status="dropped_verify"`，批评意见摘要入 `_meta.verification` 与 rejects 通道。 |
 | `verify.policy = "repair"` | fail ⇒ 将批评意见追加进标注提示词（`[上一版标注] ... [审核意见] ... 请修正后重新输出`），M5 重标注、M8 重校验、M7 重评审；最多 `verify.max_repair_rounds`（默认 1）轮，仍 fail 按 drop 处理。评审轮数记入 `_meta.verification.rounds`（含首评，一次通过 =1；修复后复评 =2），各轮意见按序累积于 `VerificationResult.critiques`（4.2），实例见 3.7.4。 |
 
-**stream 修复路由：两阶段批级成员手术（v1.8，S8/S31）。**`policy = "repair"` 下序列信封的修复不止重标注——按缺陷表（3.7.2）路由三类动作：**标签重标**（label_mismatch：常规批评意见回喂重标注）、**成员收缩**（off_task_members）与**成员回收**（missing_head / missing_tail / missing_members）。为保证并发 gather 下的确定性（相邻 episode 争抢同一噪声帧、multi 兄弟互撕共享成员集），每轮修复为**两阶段批级结构**（classify 扇出「先同步后并发」先例）：
+**stream 修复路由：严格波次（v1.19）。**`policy = "repair"` 下序列信封按缺陷表路由标签重标、成员收缩
+与成员回收。实现位于 `labelkit/operators/stream_verify.py`；`verify.py` 保留 classic judge/repair 核心。每轮
+严格执行下列屏障，禁止把存在数据依赖的相邻波次合并为一个任务组：
 
-1. **并发评审**全部待审 episode；
-2. **同步按批位置序执行全部成员手术**（「先到先得」变为确定性「位次得」）——**收缩**：`defect.members` 指认帧 `absorbed → dropped_noise` + duck-typed `off_task_member` 标（rejects 归因 stage="verify"、reason="off_task_member"，3.11.2）；**回收**（三级判定）：同 `session_id` 的批内 `dropped_noise` 噪声池帧经 `segment.judge_window` 直调复裁（3.14.3；relation ∈ {continues, advances} 即回收 `dropped_noise → absorbed`、按序键插回 `members`）→ 缺帧在相邻 episode 手中：**只标记、不跨段夺帧**（boundary_flags 计数）→ 无处可寻：缺陷条目增顶层键 `suspected = "capture_gap"`（代码侧标注，非 LLM 输出——`detail` 在 Schema 中为字符串，故 suspected 以兄弟键落在缺陷条目上；所属会话曾被 batch_size 硬切的帧改标 `"session_split"`——判定依据即 `_meta.stream.session_split`，S21，3.10.3）；
-3. **并发接缝重摘取**：手术触点经 `extract.extract_transition` 直调重摘（3.15.3；1–2 次/手术，重建 Transition 带 `detail.reseamed = true` 溯源）；
-4. **同步重建**：record 以新成员集重建（替换 `members`；序列 **id 不重算**，3.14.4 拼装行）、transitions 重编号——`Transition.index` 恒 = 元组下标、不变量 `len(transitions) = len(members) − 1` 恒真（4.2，S31）；
-5. **并发重标注与复审**：`annotate_record(record, ctx, AnnotatePromptOptions(transitions=重建值, …))`（3.5.2 transitions 取值段）→ 下一轮评审。
+```mermaid
+flowchart LR
+    REVIEW[review leaves] --> ROUTE[route reduce]
+    ROUTE --> CLAIM[claim leaves / reduce]
+    CLAIM --> RESEAM[reseam leaves / rebuild]
+    RESEAM --> FC[frame-classify leaves / reduce]
+    FC --> FA[frame-annotate leaves / reduce]
+    FA --> RA[reannotate leaves / reduce]
+    RA --> NEXT[next round]
+```
 
-**帧产物同步（v1.12）**：第 4 步同步重建之后、第 5 步重标注之前，对本轮执行了成员手术的 episode 同步两个帧产物 dict（`member_classifications` / `member_annotations`，4.1）——手术改了成员集，帧产物必须随成员集走，否则 members[] 落盘时出现无主条目或缺帧：
+| 波次 | 叶任务 | 冻结 ordinal reducer |
+|---|---|---|
+| review | 每个 episode × judge 独立返回 verdict/critiques/defects | 按批位置、judge ordinal 合成评审团结果与确定性 defects 并集 |
+| route | 无 | 按批位置应用 `off_task_members` 收缩；为 missing 缺陷冻结 noise-pool claim 请求；相邻 episode 已持有的帧只标记 boundary flag，不跨段夺帧；无候选时标 `capture_gap`，硬切会话标 `session_split` |
+| claim | 每个冻结 claim 通过 `segment.judge_window` 复裁，只返回 relation outcome | 按 episode、defect、candidate ordinal 更新唯一 claim table；只有 `{continues, advances}` 的首个声明序 claim 可执行 `dropped_noise → absorbed`，其余只标记 |
+| reseam | 每个手术触点通过 `extract.extract_transition` 返回重摘 outcome | 按触点 ordinal 重建 Record 与 transitions；序列 id 不重算，`Transition.index` 恒等元组下标且 `len(transitions) = len(members) − 1` |
+| frame-classify | 仅为回收后缺位成员执行单成员 `classify_frames` | 按成员 ordinal 补写既有 member classification map |
+| frame-annotate | 仅在帧分类 reducer 完成后为缺位成员执行 `annotate_member` | 按成员 ordinal 与最新帧类补写既有 member annotation map |
+| reannotate | 对需修复的 episode 调用 `annotate_record`，只返回新 annotation outcome | 按批位置写入 annotation、verification 与事件；随后进入下一轮 review |
+
+所有叶任务只返回冻结 outcome，不得修改 claim table、PipelineItem、episode/member map、events 或 counters，也
+不得嵌套 `run_group()`。TaskExecutor 必须等任务组及 cleanup 完整收敛后才进入 reducer。ordinary
+ProviderFatal 由叶调用转换为既有记录级 outcome，不取消 sibling；CircuitBreaker、CancelledError 或逃逸的
+internal/control 异常结构化取消当前 execution domain。
+
+**帧产物同步（v1.12）**：reseam reducer 重建之后、reannotate 波次之前，对本轮执行了成员手术的 episode
+同步两个帧产物 dict（`member_classifications` / `member_annotations`，4.1）——手术改了成员集，帧产物必须随
+成员集走，否则 members[] 落盘时出现无主条目或缺帧：
 
 - **收缩删键**：不再属于 `record.members` 的成员 id 从两 dict 删键，**含值为 None 的 failed 占位键**（不留无主条目）；仅当对应 dict 非 None 时操作；dict 对象本身**从不更换**（扇出克隆按引用共享同一 dict 的前提，4.3 补注）。
-- **回收补跑**（懒加载，幂等只补缺位）：新入 `record.members` 且键缺位的成员先经 `classify.classify_frames([member], ctx)` **单元素调用**补帧分类（`frame.classify.enabled` ∧ dict 非 None 时；窗口失败在 classify_frames 内落 `fallback_class`，契约上不抛记录级异常，3.13.7），再经 `annotate.annotate_member(member, ctx, label)` 补帧标注（`frame.annotate.enabled` ∧ dict 非 None 时；帧标注补跑必须在帧分类补跑落键之后——帧类取新鲜判决；帧类视图 `enabled=false` ⇒ **跳过类不占键**（emitter 按缺键推导 skipped）；`frame.classify` 关 ⇒ label=None 走全局指令；不可修复返回 None ⇒ 占键 None，同 3.5.5 失败语义）。并发形态与记录级隔离镜像接缝重摘取（gather + dead 集合）。
+- **回收补跑**（幂等只补缺位）：新入 `record.members` 且键缺位的成员依次经过独立的 frame-classify
+  TaskGroup 与 reducer、frame-annotate TaskGroup 与 reducer。`frame.classify.enabled` 且 dict 非 None 时，
+  单成员窗口失败落 `fallback_class`；`frame.annotate.enabled` 且 dict 非 None 时，标注必须读取前一 reducer
+  的新鲜帧类。帧类视图 `enabled=false` 的成员跳过且不占键；frame classify 关闭时 label=None 走全局指令；
+  不可修复的帧标注占键 None。
 - **dict None 全程不触碰**：dict 为 None = 帧 pass 未运行（降格会话 / 帧粒度关闭 / 非首标签），收缩与补跑均不触碰——降格语义保持、永不无中生有。
 - **克隆无同步分支**：克隆信封永不手术（既有 S8——multi 扇出克隆的 membership 类手术只标记，仅原信封可执行），故帧产物同步不需要克隆分支；懒加载直调面由三个扩为**四个**（`classify.classify_frames` 为算子间导入白名单第四向；`annotate_member` 并入既有 annotate 修复面族——CONTRACTS §1.1）。
 
@@ -186,8 +214,13 @@ class VerifyStage(Stage):
 attempt-local 标注核心。任何一个 variant 最终 fail 都返回 rejected stage = verify，整个 counterfactual set
 连同 main/stream 投影一起丢弃；不得留下 stream truth、rejects 行或部分 dataset counter。
 
+sequence 配置强制 segment disabled，因此 `run_attempt` 只能走 classic 路径。每个 round 先把全部
+item × judge 冻结为 judge wave，按 item/judge ordinal reducer 合成 verdict；只有 reducer 冻结需修复集合后，
+才能启动 repair annotation wave，归并完成后进入下一 round。judge 与 repair 波次不得合并，叶任务不得写
+PipelineItem、共享 critiques 或 verification；attempt dataset counters 只在最终 sequence commit 后合并。
+
 `ProviderFatalError`、`CircuitBreakerTripped`、`KeyboardInterrupt` 与 `asyncio.CancelledError`
-原样穿透到 DeliveryController，不消耗 slot attempt。ProviderRetryableError、SchemaViolation、
+原样穿透到 `SequenceWorkflow`，取消 execution domain 且不消耗 slot attempt。ProviderRetryableError、SchemaViolation、
 ContextOverflowError、OutputTruncatedError 与普通 verdict fail 返回 `accepted=false` 并消耗当前 attempt。
 若 attempt 路径出现新增的 provider-fatal `item.errors`，属于 `generation_downstream_contract`
 内部错误，不得当作可重试拒绝。

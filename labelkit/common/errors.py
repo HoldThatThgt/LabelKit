@@ -184,7 +184,7 @@ class DeliveryError(LabelKitError):
 
 
 class CircuitBreakerTripped(LabelKitError):
-    """MetricsSink.circuit_broken 置位后由 LLMClient 抛出；Orchestrator 将其转为
+    """MetricsSink.circuit_broken 置位后由 LLMClient 抛出；ProcessWorkflow 将其转为
     致命的运行结束（退出码 4）。[FROZEN HERE]"""
 
 

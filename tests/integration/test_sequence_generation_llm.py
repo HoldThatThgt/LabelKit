@@ -1,4 +1,4 @@
-"""v1.18 序列生成在真实 DeepSeek Anthropic 端点上的验收测试。"""
+"""v1.19 序列生成在真实 DeepSeek Anthropic 端点上的验收测试。"""
 from __future__ import annotations
 
 import hashlib
@@ -17,15 +17,15 @@ from labelkit.cli.parser import CliOverrides
 from labelkit.common.config import load
 from labelkit.common.contracts.generation import EventExecution, PostValidationResult
 from labelkit.common.observability.obslog import MetricsSink
-from labelkit.common.runtime.schema_engine import SchemaEngine
+from labelkit.common.inference.schema_engine import SchemaEngine
 from labelkit.operators.dedup import DedupIndex
 from labelkit.common.errors import GenerationProjectionMismatch
 from labelkit.operators.generation.planner import compile_scenario_plan
 from labelkit.operators.generation.program import compile_generation_program
 from labelkit.operators.generation.project import canonical_delivery_row, canonical_json
 from labelkit.operators.generation.state import resolve_planned_events
-from labelkit.orchestration.generation_delivery import estimate_sequence_products
-from labelkit.orchestration.runtime import execute_run
+from labelkit.orchestration.sequence_workflow import estimate_sequence_products
+from labelkit.orchestration.application import execute_run
 
 from tests.conftest import (
     DEEPSEEK_BASE_URL,
@@ -117,7 +117,7 @@ def _assert_hidden_absent(value: object, message: str, sentinel: str) -> None:
 
 def _install_body_observer(monkeypatch):
     """装饰生产 Anthropic 序列化器并只记录无内容布尔证据。"""
-    from labelkit.common.runtime import llm_client
+    from labelkit.common.inference import llm_client
 
     original = llm_client._build_anthropic_body
     observations: list[dict[str, bool]] = []
@@ -278,6 +278,24 @@ def _assert_report_usage(report: Mapping[str, object]) -> None:
         assert entry["completion_tokens"] > 0
 
 
+def _assert_runtime_report(report: Mapping[str, object]) -> None:
+    """检查真实序列交付写出冻结顺序与九字段 runtime 节点。"""
+    assert list(report) == [
+        "run", "counts", "schema_engine", "generate", "runtime", "trace",
+        "llm_usage", "timing",
+    ]
+    runtime = report["runtime"]
+    assert isinstance(runtime, Mapping)
+    assert list(runtime) == [
+        "queue_high_water", "running_high_water", "resource_wait_high_water",
+        "commit_waiting_high_water", "candidate_bytes_high_water", "cancelled_tasks",
+        "resource_wait_ms", "http_pool_wait_ms", "commit_ms",
+    ]
+    assert all(type(value) is int and value >= 0 for value in runtime.values())
+    assert runtime["commit_waiting_high_water"] >= 1
+    assert runtime["candidate_bytes_high_water"] >= 1
+
+
 def _assert_main_stream_round_trip(main: list[dict], stream: list[dict]) -> None:
     """检查 main 成员与 primary stream 的双向 owner/id 对账。"""
     primary = [row for row in stream if row["_meta"]["event"].get("owner_sequence_id")]
@@ -306,6 +324,7 @@ def _delivery_digest(main: list[dict], stream: list[dict]) -> str:
 
 def _assert_manifest(cfg, main: list[dict], stream: list[dict], report: dict) -> None:
     """独立对账 manifest、正式文件与 report 中的交付身份。"""
+    _assert_runtime_report(report)
     manifest = _load_json(cfg.paths.manifest)
     sequence = report["generate"]["sequence"]
     assert manifest["schema_version"] == 1
@@ -488,7 +507,7 @@ def test_cross_view_one_shot_retries_whole_real_attempt(monkeypatch, tmp_path, c
     attempts, _programs, _planner, _renderer = _install_trace_observer(monkeypatch)
     from labelkit.operators.generation import project
 
-    original_reconcile = project.reconcile_prospective_views
+    original_reconcile = project.reconcile_primary_candidate
     original_commit = DedupIndex.group_commit
     original_merge = MetricsSink.merge_counts
     from labelkit.operators.emitter import SequenceDeliveryEmitter
@@ -525,7 +544,7 @@ def test_cross_view_one_shot_retries_whole_real_attempt(monkeypatch, tmp_path, c
         prepared_ids.update(id(row) for row in main_rows)
         return original_prepare(emitter, main_rows, stream_rows, report)
 
-    monkeypatch.setattr(project, "reconcile_prospective_views", reconcile)
+    monkeypatch.setattr(project, "reconcile_primary_candidate", reconcile)
     monkeypatch.setattr(DedupIndex, "group_commit", commit)
     monkeypatch.setattr(MetricsSink, "merge_counts", merge)
     monkeypatch.setattr(SequenceDeliveryEmitter, "assemble_sequence", assemble)

@@ -19,11 +19,12 @@ import pytest
 
 from labelkit.common.config.model import LLMProfile
 from labelkit.common.errors import ProviderFatalError
-from labelkit.common.runtime.credentials import RuntimeCredentials
-from labelkit.common.runtime.llm_client import LLMClient, Message, Part, PromptBundle
+from labelkit.common.inference.credentials import RuntimeCredentials
+from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 from labelkit.common.observability.obslog import EventLog, MetricsSink
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 from tests.common.observability.test_obslog import make_cfg as obslog_cfg
+from tests.llm_client_helpers import make_llm_client as _client
 
 pytestmark = pytest.mark.integration
 
@@ -69,7 +70,7 @@ async def test_duplicate_key_values_collapse_into_one_pool_member():
     """v1.17 §7.19.3 值去重真面：两个环境变量别名**同一**真实密钥 ⇒ 凭据构造期
     去重让池内只剩一把键，首声明者获得 key_env 身份位；流量全部成功。"""
     prof = _pool_profile(["LK_POOL_ITEST_A", "LK_POOL_ITEST_B"])
-    client = LLMClient({"default": prof}, {},
+    client = _client({"default": prof}, {},
                        _pool_creds([_real_key(), _real_key()]))
     pool = client._pool("llm", prof)
     assert pool.size == 1                       # 同值别名坍缩成一把键
@@ -104,7 +105,7 @@ async def test_bogus_first_key_absorbed_and_rotates(tmp_path):
         enabled=True, path=str(trace_path), channels=("llm",)))
     log = EventLog(cfg.trace, "itest")
     sink = MetricsSink(cfg, "itest", log)
-    client = LLMClient({"default": prof}, {}, creds, sink)
+    client = _client({"default": prof}, {}, creds, sink)
     try:
         resp = await client.complete("default", _prompt("1+1 等于几？只回答数字。"))
     finally:
@@ -136,7 +137,7 @@ async def test_all_keys_bogus_last_live_key_hard_trips(tmp_path):
     creds = _pool_creds([BOGUS_KEY, BOGUS_KEY + "-2"])
     cfg = obslog_cfg(tmp_path)
     sink = MetricsSink(cfg, "itest", EventLog(cfg.trace, "itest"))
-    client = LLMClient({"default": prof}, {}, creds, sink)
+    client = _client({"default": prof}, {}, creds, sink)
     try:
         with pytest.raises(ProviderFatalError) as ei:
             await client.complete("default", _prompt("ping"))
@@ -154,11 +155,11 @@ async def test_probe_all_deduped_pool_probes_the_unique_key_once():
     """v1.17 §7.19.3：同值别名坍缩后，probe_all 只探那把唯一键（key_env = 首个
     声明者）；probe() 保持单条结果形态（key_env=None）。"""
     prof = _pool_profile(["LK_POOL_ITEST_P1", "LK_POOL_ITEST_P2"])
-    client = LLMClient({"default": prof}, {},
+    client = _client({"default": prof}, {},
                        _pool_creds([_real_key(), _real_key()]))
     try:
-        results = await client.probe_all("default")
-        single = await client.probe("default")
+        results = await client.probe_all(("llm", "default"))
+        single = await client.probe(("llm", "default"))
     finally:
         await client.aclose()
     assert [r.key_env for r in results] == ["LK_POOL_ITEST_P1"]

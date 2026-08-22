@@ -1536,8 +1536,8 @@ def _minimum_actor_view(actor: str, logical: int, observations=()):
 
 def _scenario_budget_cases(state, config) -> list[_BudgetCase]:
     """枚举会真实调用 LLM 的 ScenarioSeed 最小 PromptBundle。"""
-    from labelkit.common.runtime.generation_prompts import scenario_seed_prompt
-    from labelkit.common.runtime.schema_engine import scenario_seed_schema
+    from labelkit.common.inference.generation_prompts import scenario_seed_prompt
+    from labelkit.common.inference.schema_engine import scenario_seed_schema
 
     patterns = {item.name: item for item in config.patterns}
     cases = []
@@ -1608,8 +1608,8 @@ def _event_budget_cases(state, config) -> list[_BudgetCase]:
 
 def _declared_event_cases(state, config) -> list[_BudgetCase]:
     """枚举 declared EventPlan 调用。"""
-    from labelkit.common.runtime.generation_prompts import event_plan_prompt
-    from labelkit.common.runtime.schema_engine import event_plan_schema
+    from labelkit.common.inference.generation_prompts import event_plan_prompt
+    from labelkit.common.inference.schema_engine import event_plan_schema
 
     patterns, cases = {item.name: item for item in config.patterns}, []
     for source in config.counterfactual_sets:
@@ -1651,8 +1651,8 @@ def _declared_event_fields(view, role, frames, actors, outcome) -> dict[str, obj
 
 def _instruction_event_cases(state, config) -> list[_BudgetCase]:
     """枚举 instruction-only EventPlan 调用。"""
-    from labelkit.common.runtime.generation_prompts import event_plan_prompt
-    from labelkit.common.runtime.schema_engine import event_plan_schema
+    from labelkit.common.inference.generation_prompts import event_plan_prompt
+    from labelkit.common.inference.schema_engine import event_plan_schema
 
     noise = None if config.noise is None else config.noise.frame_class
     names = tuple(name for name, view in state.context.frame_classes.items()
@@ -1746,7 +1746,7 @@ def _instruction_frame_cases(state, config) -> list[_BudgetCase]:
 
 def _frame_case(config, source, event, frame_entry, role) -> _BudgetCase:
     """构造一个 FrameRenderer 最小预算 case。"""
-    from labelkit.common.runtime.generation_prompts import frame_render_prompt
+    from labelkit.common.inference.generation_prompts import frame_render_prompt
 
     role_name, position, actor, observations = event
     frame_name, frame = frame_entry
@@ -1783,8 +1783,8 @@ def _frame_case(config, source, event, frame_entry, role) -> _BudgetCase:
 
 def _semantic_budget_cases(state, config) -> list[_BudgetCase]:
     """枚举 SemanticEvaluator 的实际 branch 长度最小 PromptBundle。"""
-    from labelkit.common.runtime.generation_prompts import semantic_evaluation_prompt
-    from labelkit.common.runtime.schema_engine import semantic_evaluation_schema
+    from labelkit.common.inference.generation_prompts import semantic_evaluation_prompt
+    from labelkit.common.inference.schema_engine import semantic_evaluation_schema
 
     patterns, cases = {item.name: item for item in config.patterns}, []
     for source in config.counterfactual_sets:
@@ -1815,8 +1815,8 @@ def _semantic_budget_cases(state, config) -> list[_BudgetCase]:
 
 def _instruction_semantic_cases(state, config) -> list[_BudgetCase]:
     """枚举 instruction-only SemanticEvaluator 调用。"""
-    from labelkit.common.runtime.generation_prompts import semantic_evaluation_prompt
-    from labelkit.common.runtime.schema_engine import semantic_evaluation_schema
+    from labelkit.common.inference.generation_prompts import semantic_evaluation_prompt
+    from labelkit.common.inference.schema_engine import semantic_evaluation_schema
 
     cases = []
     for source in config.instruction_only:
@@ -1867,11 +1867,11 @@ def _semantic_fields(config, identity, content):
 
 def _noise_budget_cases(state, config) -> list[_BudgetCase]:
     """构造 NoiseRenderer 与 NoiseEvaluator 的两个最小 PromptBundle。"""
-    from labelkit.common.runtime.generation_prompts import (
+    from labelkit.common.inference.generation_prompts import (
         noise_evaluation_prompt,
         noise_render_prompt,
     )
-    from labelkit.common.runtime.schema_engine import noise_semantic_evaluation_schema
+    from labelkit.common.inference.schema_engine import noise_semantic_evaluation_schema
 
     if config.noise is None:
         return []

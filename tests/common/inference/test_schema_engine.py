@@ -20,13 +20,13 @@ from labelkit.common.contracts.generation import (
     PostValidationResult,
 )
 from labelkit.common.errors import SchemaViolation
-from labelkit.common.runtime.llm_client import (
+from labelkit.common.inference.llm_client import (
     Message,
     Part,
     PromptBundle,
     _build_anthropic_body,
 )
-from labelkit.common.runtime.schema_engine import (
+from labelkit.common.inference.schema_engine import (
     VERDICT_SCHEMA,
     CallScope,
     SchemaEngine,
@@ -787,7 +787,7 @@ def test_usage_summing_shape():
 # ── P2-5: lossy-L1 heuristic (json_repair quote-truncation detection) ────────
 
 def test_l1_lossy_flags_large_content_drop():
-    from labelkit.common.runtime.schema_engine import l1_repair_is_lossy
+    from labelkit.common.inference.schema_engine import l1_repair_is_lossy
     tail = "，这一段是被未转义引号截断后整体丢失的很长的批评意见文本" * 4
     raw = '{"aspect": "事实一致性", "opinion": "页面标题"' + tail + '"}'
     obj = {"aspect": "事实一致性", "opinion": "页面标题"}   # what json_repair keeps
@@ -795,14 +795,14 @@ def test_l1_lossy_flags_large_content_drop():
 
 
 def test_l1_lossy_not_flagged_for_small_fixes():
-    from labelkit.common.runtime.schema_engine import l1_repair_is_lossy
+    from labelkit.common.inference.schema_engine import l1_repair_is_lossy
     raw = '```json\n{"intent": "writing_assist", "topic": "请假条代写",}\n```'
     obj = {"intent": "writing_assist", "topic": "请假条代写"}
     assert l1_repair_is_lossy(obj, raw) is False
 
 
 def test_l1_lossy_end_to_end_via_deterministic_repair():
-    from labelkit.common.runtime.schema_engine import deterministic_repair, l1_repair_is_lossy
+    from labelkit.common.inference.schema_engine import deterministic_repair, l1_repair_is_lossy
     tail = "x" * 120
     raw = '{"opinion": "标题"未转义' + tail + '"}'
     import json as _json
@@ -818,7 +818,7 @@ def test_l1_lossy_not_flagged_for_fenced_pretty_json():
     # Review finding: fence + indent is the most common "clean" non-structured
     # output shape — zero content is lost, must not warn.
     import json as _json
-    from labelkit.common.runtime.schema_engine import l1_repair_is_lossy
+    from labelkit.common.inference.schema_engine import l1_repair_is_lossy
     obj = {"scores": [{"criterion": "educational_value",
                        "reason": "该指令是意图明确的写作示范任务，包含时间与事由等具体要素。"
                                  "但任务简单，不涉及推理或专业知识，可学习内容有限。",
@@ -830,7 +830,7 @@ def test_l1_lossy_not_flagged_for_fenced_pretty_json():
 def test_l1_lossy_falls_back_to_the_length_heuristic_when_the_region_differs():
     # 花括号区段本身能干净解析、但解析结果与修复对象不是同一个（L1 真出手改了内容）
     # ⇒ 不能直接判无损，转由长度启发式裁定。
-    from labelkit.common.runtime.schema_engine import l1_repair_is_lossy
+    from labelkit.common.inference.schema_engine import l1_repair_is_lossy
     raw = '{"opinion": "' + "长" * 200 + '"}'
     assert l1_repair_is_lossy({"opinion": "短"}, raw) is True
     assert l1_repair_is_lossy({"opinion": "长" * 199}, raw) is False
@@ -839,14 +839,14 @@ def test_l1_lossy_falls_back_to_the_length_heuristic_when_the_region_differs():
 def test_l1_lossy_is_false_without_a_brace_region():
     # 长度启发式的基线是"花括号区段"；原始文本里根本没有花括号时无从比较，
     # 按定义判无损（结构化输出直接给对象、原始文本为空即此形）。
-    from labelkit.common.runtime.schema_engine import l1_repair_is_lossy
+    from labelkit.common.inference.schema_engine import l1_repair_is_lossy
     assert l1_repair_is_lossy({"intent": "qa", "topic": "请假条"}, "") is False
     assert l1_repair_is_lossy({"intent": "qa"}, "抱歉，我无法完成该任务。") is False
 
 
 def test_l1_lossy_not_flagged_for_ascii_escaped_json():
     import json as _json
-    from labelkit.common.runtime.schema_engine import l1_repair_is_lossy
+    from labelkit.common.inference.schema_engine import l1_repair_is_lossy
     obj = {"critiques": [{"aspect": "事实一致性",
                           "opinion": "标注结果与原始数据逐项一致，未见编造内容。"}],
            "verdict": "pass"}

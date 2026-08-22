@@ -9,7 +9,7 @@ import os
 
 import pytest
 
-from labelkit.common.runtime.schema_engine import (
+from labelkit.common.inference.schema_engine import (
     CallScope,
     Message,
     Part,
@@ -17,11 +17,12 @@ from labelkit.common.runtime.schema_engine import (
     SchemaEngine,
 )
 from labelkit.common.config.model import LLMProfile, OutputConfig
-from labelkit.common.runtime.credentials import RuntimeCredentials
-from labelkit.common.runtime.llm_client import LLMClient
+from labelkit.common.inference.credentials import RuntimeCredentials
+from labelkit.common.inference.llm_client import LLMClient
 
 from tests import hook_samples
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
+from tests.llm_client_helpers import make_llm_client as _client
 
 pytestmark = pytest.mark.integration
 
@@ -60,7 +61,7 @@ def make_client(profiles: dict[str, LLMProfile]) -> LLMClient:
         llm={name: (os.environ[ZAI_KEY_ENV],) for name in profiles},
         embedding={},
     )
-    return LLMClient(profiles, {}, credentials)
+    return _client(profiles, {}, credentials)
 
 
 def user_message(text: str) -> Message:

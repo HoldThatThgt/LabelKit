@@ -50,10 +50,24 @@ class _SchemaEngine:
         return [error.message for error in Draft202012Validator(schema).iter_errors(value)]
 
 
+class _InlineTaskExecutor:
+    """按声明序执行冻结叶任务并返回输入序结果。"""
+
+    async def run_group(self, request):
+        return tuple([await task.operation() for task in request.tasks])
+
+
 def _services(config, payload):
     """构造 renderer 专用离线服务。"""
     engine, metrics = _SchemaEngine(payload), _Metrics()
-    return GenerationServices(config, engine, object(), metrics), engine, metrics
+    services = GenerationServices(
+        config,
+        engine,
+        object(),
+        metrics,
+        _InlineTaskExecutor(),
+    )
+    return services, engine, metrics
 
 
 def _planned(plan, slot_key: str, variant: str, role: str):

@@ -336,7 +336,7 @@ provider 交互之前、不产生连击；计入连击只作用于三层防御�
 生命周期、QuRating 对比池基数与 stream 装箱容量；**从不影响单次 prompt
 体积**——单次调用容量由各算子条数上限与上下文预算（§3.9.x）共同决定」。
 
-### 3.2 预算模块（新文件 `labelkit/common/runtime/budget.py`，CONTRACTS 新节）
+### 3.2 预算模块（新文件 `labelkit/common/inference/budget.py`，CONTRACTS 新节）
 
 ```
 # 全部纯函数、零第三方依赖；常数冻结（V7/V8/V22），修改即 spec 修订
@@ -521,7 +521,7 @@ rejects reason 词表增两值。§7.2 事件目录**零增**（无新 trace 通
 ### 3.7 测试与验收
 
 **离线单测**
-- `tests/common/runtime/test_budget.py`（新）：est_text 中/英/混排/JSON 样例
+- `tests/common/inference/test_budget.py`（新）：est_text 中/英/混排/JSON 样例
   钉死；est_image_prior 双 provider 双 px 档（含 openai 最坏纵横比 1445
   @2048——调查·竖屏图块先验低估）；margin/input_budget 边界（floor、非正
   预算）；fit_text 两模式行边界与幂等；min_window 矩阵（未声明/大窗/小窗/
@@ -541,7 +541,7 @@ rejects reason 词表增两值。§7.2 事件目录**零增**（无新 trace 通
   裁决·动态装填静态护栏的 floor 2/3 两态
   （机制发现·护栏下限随修复策略：policy="drop" 不升 floor）
   （BASE_CONFIG 串替换模式）。
-- `tests/common/runtime/test_llm_client.py`：终检先于网络触发
+- `tests/common/inference/test_llm_client.py`：终检先于网络触发
   （ContextOverflowError(phase="precheck")，零网络可测）；终止原因归一解析
   （`finish_reason=length` / `stop_reason=max_tokens` → OutputTruncatedError；
   双协议 `model_context_window_exceeded` → ContextOverflowError(
@@ -558,7 +558,7 @@ rejects reason 词表增两值。§7.2 事件目录**零增**（无新 trace 通
   （裁决·视觉能力自动推导）；WARN 文案改写断言
   （裁决·贫瘠指引改选 profile）；新增"预算开启下同输入重跑窗界逐字节一致"
   用例。
-- `tests/orchestration/test_orchestrator.py`：四个 segment_calls 估算测试
+- `tests/orchestration/test_process_workflow.py`：四个 segment_calls 估算测试
   （:2021-2069、:2340-2354）增预算开/关两态分支（关 = 现值回归锚；开 =
   w_min 上界公式）。
 - `tests/operators/test_{quality,annotate,classify,verify,dedup}.py`：微型
@@ -593,10 +593,10 @@ rejects reason 词表增两值。§7.2 事件目录**零增**（无新 trace 通
 |---|---|
 | `labelkit/common/config/model.py` | LLMProfile/EmbeddingProfile +`context_window`；LLMProfile +`default_image_px`（裁决·图片工作点与天花板）；SegmentConfig −`use_vision` +`vision_resolved` |
 | `labelkit/common/config/loader.py` | 解析/校验/移除键定向报错（裁决·移除键定向报错，经裁决·杂项审计钉板的原始节探针分支）/视觉必需集删分段支集合改造（裁决·视觉校验集删分段支）/裁决·窗图硬拒姊妹告警·裁决·窗口声明制零即关·静态预算预检表三处告警与预检/**裁决·动态装填静态护栏（w_min < floor(2/3) → CONFIG_ERROR、== floor → WARN，机制发现·护栏下限随修复策略的条件）**/`default_image_px ≤ max_image_px` 校验/收尾 replace 冻结 |
-| `labelkit/common/runtime/budget.py`（新） | §3.2 全部纯函数与常数（含 TEMPLATE_HEAD_TOKENS——裁决·模板头冻结常数、DIFF_MAX_TOKENS、classify_stage_error helper——裁决·杂项审计钉板的错误分类分支）+ `ImageCostCalibrator`（裁决·在线校准批冻结快照，批最大值 deque(8)——机制发现·校准窗口单位为批） |
-| `labelkit/common/runtime/llm_client.py` | 裁决·终检归 M9 咽喉的终检（precheck）；终止原因归一解析（length/max_tokens → OutputTruncatedError；`model_context_window_exceeded` 双协议 → ContextOverflowError(reactive)——裁决·输出截断终局化/裁决·溢出信号统一分相）；ContextOverflow/OutputTruncated 不喂 `_record_provider_result(fatal=True)`；裁决·溢出裁帧保清重试的超窗错误体 pattern 集（调查·五家溢出错误体实证的种子；完整 resp.text 上匹配、预算门控；命中抛 reactive 不喂 streak——机制发现·嗅探全文与补喂分裂）；每响应喂校准样本（裁决·在线校准批冻结快照；usage 缺失不记样本 + WARN 一次）；图片编码生效 px = `bundle.image_px or default_image_px or max_image_px` 钳 max（裁决·图片工作点与天花板/裁决·判审裁帧升清重试/裁决·客户端载体面三处的 image_px 载体分支）；`PromptBundle.image_px` + `LLMResponse.finish` 追加字段与 `_result_usage` 形状适配（裁决·客户端载体面三处/机制发现·响应终止字段适配）；`LLMClient.calibrator` 公开面（裁决·客户端载体面三处的校准器自持分支，自持构造——factory 零改动） |
+| `labelkit/common/inference/budget.py`（新） | §3.2 全部纯函数与常数（含 TEMPLATE_HEAD_TOKENS——裁决·模板头冻结常数、DIFF_MAX_TOKENS、classify_stage_error helper——裁决·杂项审计钉板的错误分类分支）+ `ImageCostCalibrator`（裁决·在线校准批冻结快照，批最大值 deque(8)——机制发现·校准窗口单位为批） |
+| `labelkit/common/inference/llm_client.py` | 裁决·终检归 M9 咽喉的终检（precheck）；终止原因归一解析（length/max_tokens → OutputTruncatedError；`model_context_window_exceeded` 双协议 → ContextOverflowError(reactive)——裁决·输出截断终局化/裁决·溢出信号统一分相）；ContextOverflow/OutputTruncated 不喂 `_record_provider_result(fatal=True)`；裁决·溢出裁帧保清重试的超窗错误体 pattern 集（调查·五家溢出错误体实证的种子；完整 resp.text 上匹配、预算门控；命中抛 reactive 不喂 streak——机制发现·嗅探全文与补喂分裂）；每响应喂校准样本（裁决·在线校准批冻结快照；usage 缺失不记样本 + WARN 一次）；图片编码生效 px = `bundle.image_px or default_image_px or max_image_px` 钳 max（裁决·图片工作点与天花板/裁决·判审裁帧升清重试/裁决·客户端载体面三处的 image_px 载体分支）；`PromptBundle.image_px` + `LLMResponse.finish` 追加字段与 `_result_usage` 形状适配（裁决·客户端载体面三处/机制发现·响应终止字段适配）；`LLMClient.calibrator` 公开面（裁决·客户端载体面三处的校准器自持分支，自持构造——factory 零改动） |
 | `labelkit/common/errors.py` | `ContextOverflowError(phase: Literal["precheck","reactive"])`（裁决·溢出信号统一分相）；`OutputTruncatedError`（裁决·输出截断终局化）；ErrorKind 增 `CONTEXT_OVERFLOW`/`OUTPUT_TRUNCATED` |
-| `labelkit/common/runtime/schema_engine.py` | LLM 修复环调用捕获 ContextOverflowError → 轮失败 + 短路耗尽，归因不变（§3.3 的 LLM 修复环装填点/裁决·三处装填规则钉死的 LLM 修复环短路分支） |
+| `labelkit/common/inference/schema_engine.py` | LLM 修复环调用捕获 ContextOverflowError → 轮失败 + 短路耗尽，归因不变（§3.3 的 LLM 修复环装填点/裁决·三处装填规则钉死的 LLM 修复环短路分支） |
 | `labelkit/operators/segment.py` | vision_resolved 判据；会话级帧摘要预计算前移 + 贪心装填器 `_pack_windows`（替换 `_window_spans` 的定长切分，保留重叠/接缝语义）；裁决·溢出裁帧保清重试的溢出窗对半改切重试（终局补喂熔断——裁决·溢出信号统一分相）；贫瘠文案（贫瘠护栏计算路径独立不动）；**实际窗数计数 → report.stream.windows（裁决·预算观测最小增量的实际窗数分支，M14 属主）**；错误分类器 overflow/truncated 分支（裁决·杂项审计钉板的错误分类分支） |
 | `labelkit/operators/quality.py` / `classify.py` / `verify.py` | 动态裁剪（§3.3 的单记录树渲染、quality pairwise、序列步骤行三个装填点；quality per-judge、verify min-over-panel——裁决·三处装填规则钉死的评审团最小预算分支）；verify 的判审升级触发（裁决·判审裁帧升清重试：fail ∧ repair 时向 annotate 修复面传阶梯参数，经 annotate_record 追加尾参——机制发现·阶梯参数追加尾参）；不可裁块计入估算（裁决·三处装填规则钉死的不可裁剪动态块分支）；错误分类器分支（裁决·杂项审计钉板的错误分类分支）；**逐裁剪点计数 `budget.truncations.<stage>`** |
 | `labelkit/operators/annotate.py` | 份额定序 + k_eff（§3.3 的 annotate 关键帧装填点）+ 裁决·溢出裁帧保清重试的减帧重试 + 裁决·判审裁帧升清重试的升级换档（`build_annotate_prompt`/`annotate_record` 追加尾参——机制发现·阶梯参数追加尾参）；错误分类器分支；truncations 计数 |
@@ -604,7 +604,7 @@ rejects reason 词表增两值。§7.2 事件目录**零增**（无新 trace 通
 | `labelkit/operators/dedup.py` | embed 输入截断（裁决·嵌入输入预算截断）；truncations 计数 |
 | `labelkit/operators/extract.py` / `stitch.py` | 错误分类器 overflow/truncated 分支（裁决·杂项审计钉板的错误分类分支；extract 走既有 fallback、stitch 走 on_error="keep"——§3.3 的 stitch 卡池与无收缩项两调用点语义不变） |
 | `labelkit/common/contracts/types.py` | `digest_is_poor` docstring（裁决·贫瘠指引改选 profile）；`ImageRef.load_base64` 签名不变（builder 传入生效 px）；serialize 实参链不变 |
-| `labelkit/orchestration/orchestrator.py` | estimate_run 用 min_window（先验估）+ stream 注行增补句（:1106-1111）；批边界调 `self.llm.calibrator.freeze_batch()`（裁决·在线校准批冻结快照）；report.budget 汇总（profiles/w_min/truncations/overflow_records/image_cost/degrade_retries/escalations）+ report.stream.windows；**启动期预算 INFO 行（裁决·预算观测最小增量的启动 INFO 分支，归属 M10 启动段）** |
+| `labelkit/orchestration/process_workflow.py` | estimate_run 用 min_window（先验估）+ stream 注行增补句（:1106-1111）；批边界调 `self.llm.calibrator.freeze_batch()`（裁决·在线校准批冻结快照）；report.budget 汇总（profiles/w_min/truncations/overflow_records/image_cost/degrade_retries/escalations）+ report.stream.windows；**启动期预算 INFO 行（裁决·预算观测最小增量的启动 INFO 分支，归属 M10 启动段）** |
 | `labelkit/orchestration/factory.py` / `runtime.py` | **显式无改动**（校准器由 LLMClient 自持——裁决·客户端载体面三处的校准器自持分支裁定，此行防实现者臆造装配点） |
 | `pyproject.toml` | **显式无改动**（零新依赖；budget.py 纯 stdlib——审计核验） |
 **规格与契约**
@@ -656,7 +656,7 @@ rejects reason 词表增两值。§7.2 事件目录**零增**（无新 trace 通
 orchestrator/console goldens/集成）；audit TESTS 枚举为逐断言执行细目
 （test_segment.py :58-73 fixture 键替换、:279-293 两态重键、:366/:373/:574/
 :603/:636/:689 装填器参数化重建、:703 WARN 文案、test_config.py :1515/
-:1526-1564/:1920-1930 三处既有断言改造、test_orchestrator.py 四估算测试两态
+:1526-1564/:1920-1930 三处既有断言改造、test_process_workflow.py 四估算测试两态
 分支、test_console.py :597-617 golden 锚不动、test_annotate.py :657-731/
 :765-832、test_quality.py :433-462/:962-1076、test_classify.py :331-343、
 test_dedup.py :637-658、test_generate.py :247-266、test_verify.py
@@ -678,7 +678,7 @@ test_dedup.py :637-658、test_generate.py :247-266、test_verify.py
 
 **P1 公共层基础**（M1 + budget.py + errors）——完成 2026-07-22
 - [x] model.py/loader.py：context_window ×2、default_image_px、vision_resolved、移除键定向报错（原始节探针分支）、视觉必需集集合改造、窗图硬拒姊妹告警/窗口声明制引用 WARN/静态预算预检表三处告警预检、动态装填静态护栏（floor 2/3，机制发现·护栏下限随修复策略的条件）、收尾 replace 冻结
-- [x] labelkit/common/runtime/budget.py：常数（含 TEMPLATE_HEAD_TOKENS/DIFF_MAX_TOKENS）+ est_* + fit_text + min_window + classify_stage_error + ImageCostCalibrator（批最大值 deque(8)）
+- [x] labelkit/common/inference/budget.py：常数（含 TEMPLATE_HEAD_TOKENS/DIFF_MAX_TOKENS）+ est_* + fit_text + min_window + classify_stage_error + ImageCostCalibrator（批最大值 deque(8)）
 - [x] errors.py：ContextOverflowError(phase) + OutputTruncatedError + ErrorKind 两值
 - 出口门：`uv run pytest tests/common -q` 全绿（含新 test_budget.py 与 test_config.py 增例；裁决·模板头冻结常数的跨层等式测试在算子装填改造工序后启用断言）✅
 
@@ -686,7 +686,7 @@ test_dedup.py :637-658、test_generate.py :247-266、test_verify.py
 - [x] complete() 终检（裁决·终检归 M9 咽喉的 precheck）；终止原因归一解析（裁决·输出截断终局化：length/max_tokens + 双协议 model_context_window_exceeded——调查·超窗二百形态词值/调查·端点终止原因枚举）；LLMResponse.finish + _result_usage 适配（机制发现·响应终止字段适配）
 - [x] 裁决·溢出裁帧保清重试的超窗错误体 pattern 集（调查·五家溢出错误体实证的种子 + 可扩；完整 resp.text 匹配；预算门控）；overflow/截断不喂 fatal（机制发现·嗅探全文与补喂分裂：M9 抛 reactive 不喂、属主算子终局补喂——裁决·反应终局计入熔断）
 - [x] 每响应喂校准样本（usage 缺失兜底）；PromptBundle.image_px 载体 + 图片编码生效 px（裁决·图片工作点与天花板/裁决·判审裁帧升清重试/裁决·客户端载体面三处的 image_px 载体分支）；LLMClient.calibrator 自持（裁决·客户端载体面三处的校准器自持分支）
-- 出口门：`uv run pytest tests/common/runtime/test_llm_client.py -q` 全绿（终检先于网络、解析纯函数级、pattern 集钉死）✅
+- 出口门：`uv run pytest tests/common/inference/test_llm_client.py -q` 全绿（终检先于网络、解析纯函数级、pattern 集钉死）✅
 
 **P3 算子装填改造**——完成 2026-07-23
 - [x] segment.py：帧摘要前移 + `_pack_windows` 贪心装填（重叠/接缝不变）+ 溢出窗对半改切重试（终局补喂——裁决·溢出裁帧保清重试）+ vision_resolved 判据 + 贫瘠文案 + windows 计数
@@ -695,7 +695,7 @@ test_dedup.py :637-658、test_generate.py :247-266、test_verify.py
 - [x] generate.py 种子尾丢（generate 种子装填点）；dedup.py embed 截断（裁决·嵌入输入预算截断）；schema_engine 的 LLM 修复环溢出短路（LLM 修复环装填点/裁决·三处装填规则钉死的修复短路分支）
 - [x] verify.py：判审升级触发（裁决·判审裁帧升清重试：fail ∧ repair → 阶梯参数传 annotate 修复面）
 - [x] 全算子错误分类器 overflow/truncated 分支（裁决·杂项审计钉板的错误分类分支）+ truncations 计数
-- 出口门：`uv run pytest tests/operators tests/common/runtime/test_budget.py -q` 全绿（含 §3.7 逐函数改造清单与裁决·模板头冻结常数的跨层等式）✅
+- 出口门：`uv run pytest tests/operators tests/common/inference/test_budget.py -q` 全绿（含 §3.7 逐函数改造清单与裁决·模板头冻结常数的跨层等式）✅
 
 **P4 编排与观测**——完成 2026-07-23
 - [x] estimate_run 用 min_window + stream 注行增补；批边界 `self.llm.calibrator.freeze_batch()`

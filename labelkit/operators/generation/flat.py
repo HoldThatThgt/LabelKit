@@ -24,14 +24,14 @@ from labelkit.common.errors import (
     SchemaViolation,
     InternalError,
 )
-from labelkit.common.runtime import budget
+from labelkit.common.inference import budget
 
 if TYPE_CHECKING:
     import random
     from collections.abc import Mapping
 
     from labelkit.common.config.model import GenerateConfig, GenerateStyle, ResolvedConfig
-    from labelkit.common.runtime.llm_client import PromptBundle
+    from labelkit.common.inference.llm_client import PromptBundle
 
 
 _log = logging.getLogger("labelkit.generate")
@@ -133,7 +133,7 @@ def build_generate_prompt(
     @param temperature 类有效温度。
     @return 可直接发送的提示对象。
     """
-    from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
+    from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 
     system_text, user_text = render_prompt_texts(
         instruction, style_prompt, num_per_call, seed_texts
@@ -153,7 +153,7 @@ def samples_schema(num_per_call: int) -> dict:
     @param num_per_call 单次要求样本数。
     @return Draft 2020-12 Schema。
     """
-    from labelkit.common.runtime.schema_engine import samples_schema as build_schema
+    from labelkit.common.inference.schema_engine import samples_schema as build_schema
 
     return build_schema(num_per_call)
 

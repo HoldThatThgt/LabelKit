@@ -48,7 +48,7 @@ from labelkit.common.errors import (
     LabelKitError,
 )
 from labelkit.common.contracts.types import PipelineItem, Record, StageError
-from labelkit.common.runtime.schema_engine import SchemaEngine, _thaw_json
+from labelkit.common.inference.schema_engine import SchemaEngine, _thaw_json
 # v1.10（U21）：plain 模式的进度/摘要行格式活在 common 层的纯函数模块里，与 CLI
 # 渲染器共用（operators → common 是许可的依赖方向；cli ↛ operators 依旧成立）。
 from labelkit.common.observability import console_format

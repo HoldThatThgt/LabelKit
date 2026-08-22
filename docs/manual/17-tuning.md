@@ -46,19 +46,28 @@ count，其次减少 pattern roles/sequence length；不要通过放宽验证或
 
 ## 17.2 时间账：为什么慢、怎么快
 
-**吞吐模型**：同一算子内记录级并发，算子间批内串行（屏障）。所以：
+**普通路径吞吐模型**：operator 内纯叶任务有界并发，结果按输入序归并；operator 与批之间仍有业务屏障：
 
 ```
 批耗时 ≈ Σ各算子耗时；算子耗时 ≈ ⌈该算子调用数 / 有效并发⌉ × 单次调用延迟
 ```
 
-真实参照（第 3 章的运行，14 条、并发 4）：quality 76 秒、annotate 11 秒、dedup 0.004 秒——**quality 几乎总是时间大头**，因为调用数最多（52 次 = 去重后 13 条 × 4 条准则；dry-run 按 14 条估算为 56）而并发只有 4。
+sequence 的昂贵链路可跨候选槽并发，墙钟近似由关键路径、profile/origin 等待和声明序 commit 队头等待共同决定；
+不能再用“所有 slot 各阶段时间相加”估算。普通侧旧实跑里 quality 是调用量大头的结论仍可作定位参考，但不是
+v1.19 性能证据。
 
 提速抓手：
 
-1. **`max_concurrency`**（config.toml，按 profile）：最直接的旋钮。从网关限流值的 50–70% 起步，观察 `retries` 计数——重试开始增多说明顶到限流了，回调一点。多个算子引用同一 profile 时共享这个额度；给 verify/quality 配不同 profile（哪怕同一模型）可以各拿一份并发额度；
+1. **`max_concurrency`**（config.toml，按 profile）：以端点公开额度和同形状实测为准，不使用固定百分比经验值。多个
+   算子引用同一 profile 时共享额度；不同 profile 有独立任务通道，但指向同一 origin 时仍由共享 HTTP origin 容量
+   观测。看 `resource_wait_ms`、`http_pool_wait_ms`、provider latency 与 retries 决定调高还是调低；
 2. **`batch_size`**：批越大，屏障摊销越好、并发越吃得满。但 pairwise 用户注意——批大小首先是**质量口径参数**（第 10 章），别纯为吞吐调它。pointwise 无此顾虑，可以放心加大；
 3. **网络位置**：延迟高的跨境端点，单次调用 5–8 秒很常见；同机房网关能砍一个量级。
+
+并发能力不是吞吐承诺。v1.19 的本地单 GPU 四槽 fixture 确实把 server request high-water 从 1 提到 4，但三次 wall
+中位数由旧串行的 41.750 秒变为 52.380 秒：串行热运行获得更强 prompt cache，四槽同时推理还会争用同一设备。
+因此容量应逐级压测；若 wall 不降、prompt token/cache 形状恶化或延迟上升，就应回调该 endpoint 的
+`max_concurrency`，即使 scheduler 本身还能接纳更多任务。
 
 ## 17.3 内存账：50 万条的 RSS 预算
 
@@ -69,6 +78,7 @@ count，其次减少 pattern roles/sequence length；不要通过放宽验证或
 | 语义去重向量索引（可选） | 条数 × 维度 × 8B（float64 存储；50 万 × 1024 维 ≈ 4 GB，缓冲倍增扩容瞬间峰值更高） | scope=global 时常驻，要计入预算 |
 | 图像字节 | **不常驻** | 接入算 id、去重算 pHash、构造请求时各读一次，用完即弃（第 5 章） |
 | sequence final rows | 受 `record_units` / `stream_rows` 500000 与 retained 536870912 bytes 双上限约束 | retained 是 main+stream canonical UTF-8 紧凑核算，不是 512 MiB 物理预分配 |
+| sequence candidate buffer | 数量不超过本阶段不同 ResourceKey 容量之和并钳制到剩余槽位 | `candidate_bytes_high_water` 只观测已完成候选 canonical bytes；六百候选不等于任意 Schema 下有 RSS 硬保证 |
 
 普通输入超过 50 万条的正确姿势是切分多次运行。sequence plan 超过上限会在 compile 阶段直接失败，不能分批
 破坏精确时间线。已验证的 500000 record-unit planner probe 为 16.889 秒，peak RSS 839221248 bytes。

@@ -96,6 +96,17 @@ label 缺失或类表外未知类回落全局。每个 Schema 消费点都读该
 
 **上下文预算装填与修复升级换档（v1.11）。**标注 profile 声明 `context_window` 时按上下文预算装填单次标注调用（未声明 = 预算关闭，行为与 v1.10 一致；预算/估算/校准机制见 3.9）。**份额定序**（确定性，V9）：① 系统侧静态部件（instruction / 用户 Schema / few-shot）**不裁剪**——用户语义资产，由 M1 静态预检把关（3.1.4，V13③）；② 文本块（步骤行 + 成员摘要块；单记录 UI 树渲染同 3.13.4 的动态封顶语义）按其既有绝对上限渲染并计 est；③ 图片吃剩余：`k_eff = min(sequence_frames, max(2, ⌊剩余 / est_image⌋))`——**首末帧恒保留**、中间均匀下采样（本节降采样公式与按碎片配额语义不变，仅 k 收缩；图片单价读校准器，3.9）；④ k = 2 仍超预算 → 回头按「首末恒保留、丢中段」裁文本块直至装下；⑤ 仍不下 → 该记录记 `context_overflow` 入 rejects（V10，7.6）。**图片先于文本让步**：文本摘要是裁决兜底证据、token 效率高于像素。**溢出反应（V20）**：识别到 provider 上下文溢出 → 关键帧减半重试（k 减半，min 2；有界 ≤ 2 次降级），耗尽仍溢出按 V10 处置。**修复轮升级换档（V21）**：`verify.policy = "repair"` 的修复重标注按质量阶梯换档——关键帧数减半（k → max(2, ⌈k/2⌉)，首末恒保）+ 分辨率上探一档（`default_image_px` × 1.5ⁿ/维，≤ `max_image_px`），预算约束经校准估算复核后不变；阶梯参数经 `opts.k_eff` / `opts.image_px` 两字段传入（M7 以 `dataclasses.replace` 换档，F3）；单向有界——升级仅发生于修复路径、每记录 ≤ `verify.max_repair_rounds` 次（触发条件见 3.7.3）。**不可裁剪动态块（V25③）**：修复轮追加的 `[上一版标注] / [审核意见]` 尾注为语义资产——**计入 est、永不裁剪**；全部可裁份额耗尽仍超 → V10。逐裁剪点计入 `report.budget.truncations`（6.4）。
 
+**v1.19 执行形态。**普通 stage 先按批内 item ordinal 同步冻结 sequence sample 计划；TaskExecutor 返回
+冻结 sample outcome 后，reducer 才按 item/sample ordinal 投票并写 annotation、status、errors、events 与
+counters。帧 pass 必须等 sequence reducer 完成，再对稳定成员集合按首次出现的 member id 冻结叶任务；叶任务只
+返回成员 outcome，reducer 按 member ordinal 原位补写既有 member map。同 id 成员只计划一次，不能靠并发完成序
+争抢 first-wins。`annotate.enabled=false, frame.annotate.enabled=true` 时 sequence 任务组为空，帧 pass 仍执行。
+
+sequence attempt 复用同一 planner/leaf/reducer，但全部写入 AttemptTransaction 与 attempt-local Metrics capture；
+sequence samples 归并成功后才能启动 frame members。普通 ProviderFatal 转为既有记录/member 失败 outcome，不取消
+sibling；sequence ProviderFatal 原样逃逸。任何叶任务都不得写 PipelineItem、member map、events 或 counters，
+也不得嵌套调用 `run_group()`。
+
 ### 3.5.3 API 与错误处理
 
 ```
@@ -213,6 +224,6 @@ def build_frame_annotate_prompt(member: Record, cfg: ResolvedConfig, schema_text
 - **模板段序（冻结）**：system = `[任务]` + 生效指令（类覆盖或全局，含 few-shot 各一条 user 消息、配置序）+ Schema 约束句 + **帧 Schema 文本嵌入**（`cfg.frame_schema` 的 canonical 单行 dump，镜像序列级 `build_annotate_prompt` 的 schema_text 嵌入手法）→ 成员内容 user 消息：text 模态 = `[成员帧] {行文本}`；ui 模态 = `[屏幕截图]` + image part + `[UI 控件树]` + 树摘要**三段形**（本模块单记录 ui 标注同款；树渲染绝对上限 `input.ui_tree_max_chars`，预算声明时动态帽收缩——树是唯一可裁块，生效指令 / few-shot / 帧 Schema 文本是静态语义资产只计不裁，3.1.4 V13③ 预检领地）。
 - **Schema 显式路由**（裁决·帧 Schema 显式路由）：`complete_validated(frame.annotate.llm, prompt, schema=cfg.frame_schema, ...)`——内部 Schema 待遇：L0–L3 四层全在、**无 L2.5、不计 `resolved_at`**（6.4 恒等式「resolved_at 加总 = 进入 M5 的记录数」不被帧调用污染，3.8.2）。
 - **幂等只补缺位**：帧 pass 一旦运行即把 `member_annotations` 初始化为 `{}`（区别于「未运行」的 None——emitter 在场规则的单一真相，4.1；multi 扇出场景下该容器由 M13 在扇出前预先钉住共享，裁决·扇出共享时序补丁，§1.6）；已有 dict **只补缺位、从不换对象**（扇出克隆按引用共享同一 dict 的前提）；仅当成员 id 不在 dict 时才调用（M7 回收补跑同款）；**同 id 成员只调用一次**（first-wins，裁决·同 id 成员 first-wins——防同键并发双付费与计数虚高，3.13.7 同口径）。
-- **跳过与失败语义**：帧类视图 `enabled=false` ⇒ 该成员 skipped、**不占键**、计 `frame_annotate.skipped`。process/flat 中，修复穷尽或不可恢复错误使该成员占键 None、计 `frame_annotate.failed`，episode 可继续发射。sequence attempt 中，任一应标注成员失败都使 `run_attempt.accepted=false`、`rejected_stage="annotate"`，M10 丢弃并重试整个 counterfactual set；失败 attempt 的成员标注与 dataset counters 不提交，已经发生的 Schema/usage/retry/trace 证据保留。并发 frame 调用必须全部收敛后再返回失败，禁止兄弟任务在 attempt 结束后继续修改状态。成功成员占键 Annotation。
+- **跳过与失败语义**：帧类视图 `enabled=false` ⇒ 该成员 skipped、**不占键**、计 `frame_annotate.skipped`。process/flat 中，修复穷尽或不可恢复错误使该成员占键 None、计 `frame_annotate.failed`，episode 可继续发射。sequence attempt 中，任一应标注成员失败都使 `run_attempt.accepted=false`、`rejected_stage="annotate"`，M10 丢弃并重试整个 counterfactual set；失败 attempt 的成员标注与 dataset counters 不提交，已经发生的 Schema/usage/retry/trace 证据保留。TaskExecutor 必须等待全部 frame 叶任务及 cleanup 收敛，reducer 才能返回失败；叶任务不得在 attempt 结束后继续运行或修改状态。成功成员占键 Annotation。
 - **无降级梯（最小单元）**：帧 prompt 本身就是最小单元——单成员、至多单图，无窗可分、无关键帧可减；预算装填裁树后仍超限 ⇒ `ContextOverflowError(phase="precheck")`，按成员失败处置（注定失败的请求永不发出）、**永不喂熔断**；反应式终端镜像本模块 A7 纪律（仅 http_400 反应式恰一次喂）。图像成本恒取 profile 工作点（`default_image_px`——校准器按 profile 聚合的前提，帧调用不设独立尺寸）。
 - **事件载荷纪律**：`annotate.frame` 每成员一发（ids=(episode_id,)，3.12.4）；payload 仅 `member_id` / `status` / `attempts`——标注内容只经既有 `excerpt` 键按档位截断（excerpt/full 档 200 字，7.4），**不新增任何承载数据内容的 payload 键**（none 档预脱敏载荷直通 console 面板的红线）。

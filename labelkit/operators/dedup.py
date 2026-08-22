@@ -24,10 +24,11 @@ from labelkit.common.errors import (
     ProviderFatalError,
     ProviderRetryableError,
 )
-from labelkit.common.contracts.generation import DedupGroupRequest, DedupProbeToken
+from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
+from labelkit.common.contracts.generation import DedupGroupRequest, DedupReservation
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import DedupInfo, PipelineItem, Record, StageError
-from labelkit.common.runtime import budget
+from labelkit.common.inference import budget
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import DedupConfig
@@ -53,7 +54,7 @@ def _dedup_contract_error(message: str) -> NoReturn:
     raise InternalError(message)
 
 
-# ── 纯函数辅助 ─────────────────────────────────────────────────────────────
+# ── 纯函数辅助
 
 
 def _normalize_text(text: str) -> str:
@@ -178,6 +179,24 @@ class _ProbeDetail:
 
 
 @dataclass(frozen=True)
+class _PreparedRecord:
+    """普通去重归并前的一条纯计算记录计划。"""
+
+    ordinal: int                                        # active 输入序
+    item: PipelineItem                                  # 只在归并阶段修改的信封
+    detail: _ProbeDetail                                # 冻结 CPU 特征
+    embedding_input: str | None                         # 静态参与语义层时的输入
+
+
+@dataclass(frozen=True)
+class _EmbeddingOutcome:
+    """一次普通 semantic embedding 叶调用的冻结结果。"""
+
+    vector: tuple[float, ...] | None                    # 成功时的单位向量
+    error: Exception | None                             # 记录级失败；未失败时为空
+
+
+@dataclass(frozen=True)
 class _GroupFeatures:
     """一次已提交 sequence set 的三族判重特征。"""
 
@@ -188,15 +207,19 @@ class _GroupFeatures:
     embedding_features: tuple[tuple[float, ...], ...]   # 单位语义向量；关闭时为空
 
 
-@dataclass(frozen=True)
-class _PendingGroup:
-    """尚未提交且只能由一个 capability 消费的 sequence set。"""
+@dataclass
+class _ReservationEntry:
+    """DedupIndex 私有 registry 中的一次 pending reservation。"""
 
-    records: tuple[Record, ...]                         # 冻结记录引用，提交前复算摘要
-    features: _GroupFeatures                            # probe 阶段预计算的完整特征
+    records: tuple[Record, ...]                         # 记录引用，提交前复算摘要
+    features: _GroupFeatures                            # reserve 阶段预计算的完整特征
+    exempt_pairs: frozenset[tuple[str, str]]            # 当前组内豁免对
+    epoch: int                                          # 创建时 reset epoch
+    state: Literal["reserved", "validated"]            # 当前状态
+    validated_generation: int | None                    # 成功重验的正式索引代次
 
 
-# ── 索引 ───────────────────────────────────────────────────────────────────
+# ── 索引
 
 
 class DedupIndex:
@@ -241,8 +264,9 @@ class DedupIndex:
         self._group_vec_ids: list[str] = []                      # sequence semantic 标识
         self._group_vec_buf: np.ndarray | None = None            # sequence 单位向量索引
         self._group_vec_count = 0                                # 已提交 semantic 向量数
-        self._pending_groups: dict[str, _PendingGroup] = {}     # 未消费能力表
-        self._group_generation = getattr(self, "_group_generation", -1) + 1
+        self._group_reservations: dict[str, _ReservationEntry] = {}  # pending registry
+        self._group_epoch = getattr(self, "_group_epoch", -1) + 1
+        self._group_generation = 0
 
     @property
     def last_similarity(self) -> float | None:
@@ -254,45 +278,66 @@ class DedupIndex:
         return self._last_similarity
 
     def probe_and_add(self, rec: Record) -> DedupInfo:
-        """①②（③）级探测；判为唯一时把该记录的键 / 签名 / pHash 写入索引（先到先得）。
+        """①②（③）级探测；判为唯一时把记录的键 / 签名 / pHash 写入索引。
 
         @param rec 待判重记录
         @return 该记录的 DedupInfo 判决
+        """
+        detail = self.prepare(rec)
+        info = self.probe_prepared(detail)
+        if info.kind == "unique":
+            self._add(rec.id, detail)
+        return info
+
+    def prepare(self, rec: Record) -> _ProbeDetail:
+        """不查询或修改正式索引地冻结一条记录的全部 CPU 特征。
+
+        @param rec 待判重记录
+        @return exact、MinHash、pHash 与静态身份特征
         """
         text = _dedup_text(rec, self.cfg)
         digest = hashlib.sha256(text.encode("utf-8")).digest()
         detail = _ProbeDetail(dedup_text=text, digest=digest, own_key=digest.hex()[:16],
                               is_sequence=rec.kind == "sequence")
-        self._last_probe = detail
+        detail.minhash = _build_minhash(text, self.cfg.ngram, self.cfg.minhash_num_perm)
+        if self.modality == "ui" and rec.image is not None:
+            self._prepare_image(rec.image.path, detail)
+        return detail
 
-        # ① 精确级 —— 命中即无条件判重，两个模态一视同仁
-        kept = self._exact.get(digest)
+    def probe_prepared(self, detail: _ProbeDetail) -> DedupInfo:
+        """按最新正式索引探测冻结特征，但不提交唯一记录。
+
+        @param detail 由 prepare 产生的 CPU 特征
+        @return 当前正式前缀下的判决
+        """
+        self._last_probe = detail
+        kept = self._exact.get(detail.digest)
         if kept is not None:
             self._last_similarity = None
             info = DedupInfo(kind="exact", cluster_key=detail.own_key, kept_id=kept)
             detail.verdict = info
             return info
-
-        self._probe_near_text(text, detail)
-        if self.modality == "ui" and rec.image is not None:
-            self._probe_near_image(rec.image.path, detail)
-
+        self._query_near_text(detail)
+        self._query_near_image(detail)
         info = self._compose(detail)
         detail.verdict = info
-        if info.kind == "unique":
-            self._add(rec.id, detail)
         return info
 
-    def _probe_near_text(self, text: str, detail: _ProbeDetail) -> None:
-        """② 近文本级：字符 n-gram MinHash 签名 → LSH 取候选 → 用签名估计的 Jaccard
-        复核（候选按插入序检查，取最优者）。
+    def commit_prepared(self, rec_id: str, detail: _ProbeDetail) -> None:
+        """把已完成全层判决的唯一记录写入正式 CPU 索引。
 
-        @param text 判重文本
+        @param rec_id 被保留记录标识
+        @param detail 已探测的冻结特征
+        """
+        self._add(rec_id, detail)
+
+    def _query_near_text(self, detail: _ProbeDetail) -> None:
+        """用预计算 MinHash 查询最新正式近文本索引。
+
         @param detail 本记录的探测便签（就地写入 minhash / tree_hit）
         @return 无
         """
-        mh = _build_minhash(text, self.cfg.ngram, self.cfg.minhash_num_perm)
-        detail.minhash = mh
+        mh = detail.minhash
         if mh is None:
             return
         best: tuple[str, str, float] | None = None
@@ -308,15 +353,12 @@ class DedupIndex:
                 best = (cand_id, entry[1], est)
         detail.tree_hit = best
 
-    def _probe_near_image(self, image_path, detail: _ProbeDetail) -> None:
-        """③ 近图像级（仅 UI 模态）：64 位 pHash，对已保留哈希做线性扫描。
-
-        （spec 3.3.3 提到可用 16 位前缀分桶加速；精确前缀分桶对汉明 ≤ 8 并不可靠，
-        因此保留同一 spec 行同样认可的、正确的线性扫描。）
+    @staticmethod
+    def _prepare_image(image_path, detail: _ProbeDetail) -> None:
+        """不查询正式索引地计算一条 UI 记录的 pHash。
 
         @param image_path 本记录的图像路径
-        @param detail 本记录的探测便签（就地写入 phash / image_hit / 解码失败标记）
-        @return 无
+        @param detail 本记录的冻结特征
         """
         try:
             detail.phash = _phash_int(image_path)
@@ -324,6 +366,12 @@ class DedupIndex:
             detail.image_decode_failed = True
             _LOGGER.debug("image decode failed, dedup judges this record by tree alone: %s",
                           type(exc).__name__, extra=_LOG_EXTRA)
+
+    def _query_near_image(self, detail: _ProbeDetail) -> None:
+        """用预计算 pHash 查询最新正式图像索引。
+
+        @param detail 本记录的探测便签（就地写入 image_hit）
+        """
         if detail.phash is None:
             return
         best_img: tuple[str, str, int] | None = None
@@ -418,7 +466,7 @@ class DedupIndex:
                               type(exc).__name__, extra=_LOG_EXTRA)
         self._phashes = [e for e in self._phashes if e[1] != rec_id]
 
-    # ── 语义级 ④（仅 cfg.semantic 开启时使用）──────────────────────────────
+    # ── 语义级 ④（仅 cfg.semantic 开启时使用）
 
     def semantic_probe(self, vec: list[float]) -> tuple[str, str, float] | None:
         """在向量索引里找余弦 >= 阈值的最优匹配。
@@ -458,20 +506,18 @@ class DedupIndex:
         self._vec_keys.append(cluster_key)
         self._vec_count += 1
 
-    async def group_probe(
+    async def group_reserve(
         self,
         request: "DedupGroupRequest",
         context: "RunContext",
-    ) -> "DedupProbeToken":
-        """无突变地探测一整组 sequence records 并返回一次性能力。
+    ) -> "DedupReservation":
+        """无正式索引突变地探测整组记录并创建一次性 reservation。
 
         @param request 当前 set 的记录、组内豁免对与可选 embedding profile。
         @param context 与 GenerationServices 共享对象身份的运行上下文。
-        @return 可被 :meth:`group_commit` 消费一次的冻结 token。
+        @return 当前 coordinator 唯一拥有的冻结 reservation。
         @raises DedupGroupRejected 与已提交组或非豁免组内记录重复。
         """
-        from labelkit.common.contracts.generation import DedupProbeToken
-
         records = tuple(request.records)
         texts = tuple(_dedup_text(record, self.cfg) for record in records)
         exact = tuple(hashlib.sha256(text.encode("utf-8")).hexdigest() for text in texts)
@@ -485,67 +531,88 @@ class DedupIndex:
             minhash_features=minhash,
             embedding_features=embeddings,
         )
+        self._validate_group_commit(features)
         self._reject_group_duplicate(features, request.exempt_pairs)
         capability_id = secrets.token_hex(16)
-        self._pending_groups[capability_id] = _PendingGroup(records=records, features=features)
-        return DedupProbeToken(
+        self._group_reservations[capability_id] = _ReservationEntry(
+            records=records,
+            features=features,
+            exempt_pairs=request.exempt_pairs,
+            epoch=self._group_epoch,
+            state="reserved",
+            validated_generation=None,
+        )
+        return DedupReservation(
             capability_id=capability_id,
-            index_generation=self._group_generation,
+            epoch=self._group_epoch,
             record_digests=features.record_digests,
-            exact_features=features.exact_features,
-            minhash_features=tuple(
-                value.copy() if value is not None else None
-                for value in features.minhash_features
-            ),
-            embedding_features=features.embedding_features,
+            exact_cluster_keys=tuple(value[:16] for value in features.exact_features),
         )
 
-    def group_commit(self, token: "DedupProbeToken") -> None:
-        """校验并原子消费一个 sequence group probe token。
+    def group_revalidate(self, reservation: "DedupReservation") -> None:
+        """对最新正式索引重验一个 Reserved reservation。
 
-        @param token 当前 index generation 的未消费能力。
+        @param reservation 当前 epoch 的 Reserved capability。
         @return None。
-        @raises InternalError token 缺失、过期、被篡改或记录摘要改变。
+        @raises DedupGroupRejected 最新正式前缀与当前组冲突。
+        @raises InternalError capability 缺失、过期、被篡改或状态非法。
         """
-        pending = self._pending_groups.get(token.capability_id)
-        if pending is None:
-            _dedup_contract_error("generation_dedup_transaction: invalid capability")
-        features = pending.features
-        current = self._group_record_digests(pending.records)
-        if token.index_generation != self._group_generation or current != features.record_digests:
-            _dedup_contract_error("generation_dedup_transaction: stale capability")
-        scalars_match = (
-            token.record_digests == features.record_digests
-            and token.exact_features == features.exact_features
-            and token.embedding_features == features.embedding_features
-        )
-        if not scalars_match or not self._group_minhash_equal(
-            token.minhash_features, features.minhash_features
-        ):
-            _dedup_contract_error("generation_dedup_transaction: altered capability")
-        self._commit_group_features(features)
+        entry = self._reservation_entry(reservation, {"reserved"})
+        self._validate_group_commit(entry.features)
+        self._reject_group_duplicate(entry.features, entry.exempt_pairs)
+        entry.state = "validated"
+        entry.validated_generation = self._group_generation
+
+    def group_commit(self, reservation: "DedupReservation") -> None:
+        """消费当前 generation 已重验的 reservation 并写入正式索引。
+
+        @param reservation 当前 generation 的 Validated capability。
+        @return None。
+        @raises InternalError capability 无效、状态非法或 generation 已变化。
+        """
+        entry = self._reservation_entry(reservation, {"validated"})
+        if entry.validated_generation != self._group_generation:
+            _dedup_contract_error("generation_dedup_transaction: stale validated reservation")
+        self._commit_group_features(entry.features)
+        del self._group_reservations[reservation.capability_id]
         self._group_generation += 1
-        self._pending_groups.clear()
 
-    @staticmethod
-    def _group_minhash_equal(left, right) -> bool:
-        """按 hashvalues 比较 token 副本与私有特征。
+    def group_discard(self, reservation: "DedupReservation") -> None:
+        """严格消费一个 Reserved 或 Validated reservation，且不写正式索引。
 
-        @param left token 携带的对象表。
-        @param right pending 私有对象表。
-        @return 长度、类型与全部 hashvalues 都相同时为 True。
+        @param reservation 当前 coordinator 或候选缓冲拥有的 capability。
+        @return None。
+        @raises InternalError capability 无效、过期、被篡改或已消费。
         """
-        if len(left) != len(right):
-            return False
-        for lhs, rhs in zip(left, right, strict=True):
-            if lhs is None or rhs is None:
-                if lhs is not rhs:
-                    return False
-            elif not isinstance(lhs, MinHash) or not np.array_equal(
-                lhs.hashvalues, rhs.hashvalues
-            ):
-                return False
-        return True
+        self._reservation_entry(reservation, {"reserved", "validated"})
+        del self._group_reservations[reservation.capability_id]
+
+    def _reservation_entry(
+        self,
+        reservation: "DedupReservation",
+        states: set[str],
+    ) -> _ReservationEntry:
+        """校验外部 capability 并返回唯一 registry entry。
+
+        @param reservation 外部冻结 capability。
+        @param states 当前操作允许的内部状态集合。
+        @return 与 capability 一一对应的私有 entry。
+        """
+        entry = self._group_reservations.get(reservation.capability_id)
+        if entry is None:
+            _dedup_contract_error("generation_dedup_transaction: invalid reservation")
+        if reservation.epoch != self._group_epoch or entry.epoch != self._group_epoch:
+            _dedup_contract_error("generation_dedup_transaction: stale reservation")
+        exact_keys = tuple(value[:16] for value in entry.features.exact_features)
+        if reservation.record_digests != entry.features.record_digests:
+            _dedup_contract_error("generation_dedup_transaction: altered reservation")
+        if reservation.exact_cluster_keys != exact_keys:
+            _dedup_contract_error("generation_dedup_transaction: altered reservation")
+        if self._group_record_digests(entry.records) != entry.features.record_digests:
+            _dedup_contract_error("generation_dedup_transaction: stale reservation")
+        if entry.state not in states:
+            _dedup_contract_error("generation_dedup_transaction: invalid reservation state")
+        return entry
 
     def _commit_group_features(self, features: _GroupFeatures) -> None:
         """在全部能力预检通过后同步写入三类正式索引。
@@ -553,7 +620,6 @@ class DedupIndex:
         @param features 只有 DedupIndex 持有的特征。
         @return None。
         """
-        self._validate_group_commit(features)
         generation = self._group_generation
         for index, record_id in enumerate(features.record_ids):
             exact = features.exact_features[index]
@@ -731,7 +797,7 @@ class DedupGroupRejected(Exception):
     """当前 sequence set 未通过正常 group dedup 准入。"""
 
 
-# ── 算子 ───────────────────────────────────────────────────────────────────
+# ── 算子
 
 
 class DedupStage:
@@ -750,7 +816,7 @@ class DedupStage:
         self._counted_clusters: set[str] = set()   # 运行级去重后的重复簇集合
 
     async def run(self, batch: list[PipelineItem], ctx: "RunContext") -> list[PipelineItem]:
-        """处理一批信封：逐条判重，单条失败绝不逃逸到批级。
+        """投机取得静态 semantic 结果，再按输入序完成全层判重提交。
 
         @param batch 本批信封列表
         @param ctx 运行上下文
@@ -759,18 +825,94 @@ class DedupStage:
         """
         if self.cfg.scope == "batch":
             self.index.reset()
+        prepared: list[_PreparedRecord] = []
         for item in batch:
             if item.status != "active":
                 continue
             try:
-                await self._process(item, ctx)
+                detail = self.index.prepare(item.record)
+                embed_input = None
+                if self.cfg.semantic and self._semantic_participates(detail):
+                    embed_input = self._embed_input(detail, ctx)
+                prepared.append(_PreparedRecord(len(prepared), item, detail, embed_input))
             except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as exc:  # 单条失败绝不逃逸到批级
                 _LOGGER.debug("record-level dedup failure: %s", type(exc).__name__,
                               extra={"stage": self.name, "batch": ctx.batch_no})
                 self._fail_item(item, exc, ctx)
+        outcomes = await self._run_embeddings(prepared, ctx)
+        self._record_embedding_failures(outcomes, ctx)
+        for value in prepared:
+            try:
+                self._reduce_one(value, outcomes.get(value.ordinal), ctx)
+            except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception as exc:
+                _LOGGER.debug("record-level dedup failure: %s", type(exc).__name__,
+                              extra={"stage": self.name, "batch": ctx.batch_no})
+                self._fail_item(value.item, exc, ctx)
         return batch
+
+    async def _run_embeddings(
+        self, prepared: list[_PreparedRecord], ctx: "RunContext"
+    ) -> dict[int, _EmbeddingOutcome]:
+        """把全部静态参与项一次性提交给 embedding 资源通道。
+
+        @param prepared 当前批纯计算计划
+        @param ctx 当前运行上下文
+        @return active ordinal 到真实叶结果的映射
+        """
+        active = [value for value in prepared if value.embedding_input is not None]
+        tasks = tuple(TaskSpec(
+            task_id=f"{ctx.task_namespace}:semantic:{value.ordinal}",
+            declaration_key=(ctx.batch_no, 2, value.ordinal),
+            stage=self.name,
+            resource_key=("embedding", self.cfg.semantic_embedding),
+            operation=lambda value=value: self._embed_one(value, ctx),
+        ) for value in active)
+        if not tasks:
+            return {}
+        results = await ctx.tasks.run_group(TaskGroupRequest(tasks=tasks))
+        return {value.ordinal: result for value, result in zip(active, results, strict=True)}
+
+    async def _embed_one(
+        self, prepared: _PreparedRecord, ctx: "RunContext"
+    ) -> _EmbeddingOutcome:
+        """执行一个不修改信封或索引的 embedding 叶调用。
+
+        @param prepared 单条纯计算计划
+        @param ctx 当前运行上下文
+        @return 单位向量或记录级异常
+        """
+        assert prepared.embedding_input is not None
+        try:
+            values = await ctx.llm.embed(self.cfg.semantic_embedding, [prepared.embedding_input])
+            if len(values) != 1:
+                raise InternalError("dedup embedding count mismatch")
+            vector = _l2_normalize(values[0])
+            if vector.ndim != 1 or not np.all(np.isfinite(vector)):
+                raise InternalError("invalid dedup embedding vector")
+            return _EmbeddingOutcome(tuple(float(value) for value in vector), None)
+        except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as exc:
+            return _EmbeddingOutcome(None, exc)
+
+    def _record_embedding_failures(
+        self, outcomes: dict[int, _EmbeddingOutcome], ctx: "RunContext"
+    ) -> None:
+        """记录全部已派发 provider 失败，不因其结果随后未使用而回滚。
+
+        @param outcomes 全部静态参与项的叶结果
+        @param ctx 当前运行上下文
+        """
+        for outcome in outcomes.values():
+            if not isinstance(outcome.error, (ProviderRetryableError, ProviderFatalError)):
+                continue
+            _LOGGER.debug("level-4 embedding call failed, verdict stands on levels 1-3: %s",
+                          type(outcome.error).__name__, extra=_LOG_EXTRA)
+            ctx.metrics.count("dedup.embedding_failures")
 
     def _fail_item(self, item: PipelineItem, exc: Exception, ctx: "RunContext") -> None:
         """把单条失败落到信封上：判错误 kind、按矩阵喂熔断、记 StageError 并发 error 事件。
@@ -812,35 +954,84 @@ class DedupStage:
                      "message": err.message, "retryable": err.retryable},
         )
 
-    async def _process(self, item: PipelineItem, ctx: "RunContext") -> None:
-        """判定单条记录：唯一则挂 DedupInfo，重复则改状态并发事件。
+    def _reduce_one(
+        self, prepared: _PreparedRecord, outcome: _EmbeddingOutcome | None,
+        ctx: "RunContext",
+    ) -> None:
+        """按输入序使用最新正式索引归并一条推测结果。
+
+        @param prepared 单条纯计算计划
+        @param outcome 静态参与 semantic 时的真实叶结果
+        @param ctx 当前运行上下文
+        """
+        item = prepared.item
+        rec = item.record
+        detail = prepared.detail
+        if detail.image_decode_failed:
+            ctx.metrics.count("dedup.image_decode_failures")
+        info = self.index.probe_prepared(detail)
+        if info.kind != "unique":
+            self._apply_verdict(item, info, self._metric_for(info, detail), ctx)
+            return
+        if prepared.embedding_input is None:
+            self.index.commit_prepared(rec.id, detail)
+            self._apply_verdict(item, info, None, ctx)
+            return
+        if outcome is None:
+            _LOGGER.error("dedup semantic outcome is missing", extra=_LOG_EXTRA)
+            raise InternalError("dedup semantic outcome is missing")
+        semantic = self._resolve_semantic(prepared, outcome)
+        if semantic is None:
+            self.index.commit_prepared(rec.id, detail)
+            self._apply_verdict(item, info, None, ctx)
+            return
+        semantic_info, vector, metric = semantic
+        if semantic_info is None:
+            self.index.commit_prepared(rec.id, detail)
+            self.index.add_vector(rec.id, detail.own_key, list(vector))
+            self._apply_verdict(item, info, None, ctx)
+            return
+        detail.verdict = semantic_info
+        self._apply_verdict(item, semantic_info, metric, ctx)
+
+    def _resolve_semantic(
+        self, prepared: _PreparedRecord, outcome: _EmbeddingOutcome,
+    ) -> tuple[DedupInfo | None, tuple[float, ...], tuple[str, float] | None] | None:
+        """在最新 semantic 索引上解释一个已保存叶结果。
+
+        @param prepared 当前输入序记录计划
+        @param outcome 对应真实 embedding 结果
+        @return provider 跳过为 None；否则返回判决、向量与可选度量
+        """
+        if isinstance(outcome.error, (ProviderRetryableError, ProviderFatalError)):
+            return None
+        if outcome.error is not None:
+            raise outcome.error
+        if outcome.vector is None:
+            _LOGGER.error("dedup semantic vector is missing", extra=_LOG_EXTRA)
+            raise InternalError("dedup semantic vector is missing")
+        hit = self.index.semantic_probe(list(outcome.vector))
+        kind = None if hit is None else self._semantic_verdict_kind(prepared.detail)
+        if kind is None:
+            return None, outcome.vector, None
+        kept_id, cluster_key, cosine = hit
+        info = DedupInfo(kind=kind, cluster_key=cluster_key, kept_id=kept_id)
+        return info, outcome.vector, ("cosine", cosine)
+
+    def _apply_verdict(
+        self, item: PipelineItem, info: DedupInfo,
+        metric: tuple[str, int | float] | None, ctx: "RunContext",
+    ) -> None:
+        """把一个已按输入序冻结的判决写入信封与观测。
 
         @param item 当前信封
-        @param ctx 运行上下文
-        @return 无
+        @param info 最终判决
+        @param metric 重复判决的唯一度量
+        @param ctx 当前运行上下文
         """
-        rec = item.record
-        info = self.index.probe_and_add(rec)
-        detail = self.index._last_probe
-        assert detail is not None
-        if detail.image_decode_failed:
-            # 本记录跳过 pHash 层（按树判定）；记录保持 active，不产 StageError
-            # —— 契约见 CONTRACTS.md §7.2 [FROZEN HERE]
-            ctx.metrics.count("dedup.image_decode_failures")
-
-        metric: tuple[str, int | float] | None = None
-        if info.kind == "unique" and self.cfg.semantic and self._semantic_participates(detail):
-            sem = await self._semantic_level(rec, detail, ctx)
-            if sem is not None:
-                info, metric = sem
-                self.index._retract(rec.id)
-        elif info.kind != "unique":
-            metric = self._metric_for(info, detail)
-
         if info.kind == "unique":
             item.dedup = info
             return
-
         item.status = "dropped_dup"
         item.dedup = info
         payload: dict = {"kind": info.kind, "cluster_key": info.cluster_key,
@@ -851,7 +1042,7 @@ class DedupStage:
             _EV_DEDUP_DUPLICATE,
             stage=self.name,
             batch_no=ctx.batch_no,
-            record_ids=(rec.id,),
+            record_ids=(item.record.id,),
             payload=payload,
         )
         ctx.metrics.count(f"dedup.{info.kind}")
@@ -927,37 +1118,3 @@ class DedupStage:
             return text
         ctx.metrics.count("budget.truncations.dedup")
         return budget.fit_text(text, cap, keep="head")
-
-    async def _semantic_level(
-        self, rec: Record, detail: _ProbeDetail, ctx: "RunContext"
-    ) -> tuple[DedupInfo, tuple[str, float]] | None:
-        """④ 级：为本记录发一次 embed() 调用，再按复合规则出判决。
-
-        @param rec 待判重记录
-        @param detail 本记录的探测便签
-        @param ctx 运行上下文
-        @return (重复判决 DedupInfo, ('cosine', 余弦值))；记录保持唯一时返回 None
-        """
-        try:
-            vecs = await ctx.llm.embed(self.cfg.semantic_embedding,
-                                       [self._embed_input(detail, ctx)])
-        except (ProviderRetryableError, ProviderFatalError) as exc:
-            # 本次调用重试耗尽 / 致命：本记录跳过 ④ 级，判决停在 ①–③（spec 3.3.4）。
-            # 熔断记账是 M9 的职责。
-            _LOGGER.debug("level-4 embedding call failed, verdict stands on levels 1-3: %s",
-                          type(exc).__name__, extra=_LOG_EXTRA)
-            ctx.metrics.count("dedup.embedding_failures")
-            return None
-        vec = _l2_normalize(vecs[0])
-        hit = self.index.semantic_probe(list(vec))
-        kind = None if hit is None else self._semantic_verdict_kind(detail)
-
-        if kind is None:
-            # 保留：其向量加入索引（先到先得）
-            self.index.add_vector(rec.id, detail.own_key, list(vec))
-            return None
-        kept_id, cluster_key, cosine = hit
-        return (
-            DedupInfo(kind=kind, cluster_key=cluster_key, kept_id=kept_id),
-            ("cosine", cosine),
-        )

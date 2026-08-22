@@ -12,10 +12,15 @@ from typing import Mapping, Sequence
 
 from labelkit.common.config.generation import is_generation_frame_eligible
 from labelkit.common.contracts.generation import (
+    CrossViewDelta,
     DeliverySlot,
     GenerationProgram,
+    NoiseCandidateReconcileRequest,
     NoiseProjectionRequest,
     PlannedEvent,
+    PreparedCandidate,
+    PreparedNoiseCandidate,
+    PrimaryCandidateReconcileRequest,
     ProjectionWitness,
     ProjectedSequence,
     ProjectionRequest,
@@ -717,37 +722,82 @@ def reconcile_views(request: ReconcileRequest) -> None:
     @param request 全量最终行对账请求。
     @return None；内容不一致时抛可恢复投影拒绝。
     """
-    _reconcile_request(request, complete=True)
+    _reconcile_request(request)
 
 
-def reconcile_prospective_views(request: ReconcileRequest) -> None:
-    """机械对账当前已接受前缀，不声称最终 plan 已完整交付。
+def reconcile_primary_candidate(request: PrimaryCandidateReconcileRequest) -> None:
+    """只对当前 primary 候选执行闭包与本地 CrossView 校验。
 
-    @param request 当前事务加入后的连续交付前缀。
-    @return None；前缀内容不一致时抛可恢复投影拒绝。
+    @param request 不含已提交前缀的当前候选请求。
+    @return None；候选内容不一致时抛可恢复投影拒绝。
     """
-    _reconcile_request(request, complete=False)
+    try:
+        _validate_candidate_slot(request.plan, request.slot)
+        targets = _primary_slot_targets(request.plan, request.slot)
+        sources = _reconcile_primary(
+            request.program,
+            request.projection_witnesses,
+            request.sequences,
+            targets,
+        )
+        expected_layouts = tuple(
+            layout for layout in request.plan.replay_layouts
+            if layout.source_slot_key == request.slot.slot_key
+        )
+        if request.replay_layouts != expected_layouts:
+            _projection_mismatch("candidate replay layouts differ from the plan")
+        _reconcile_replay(sources, request.replays, request.replay_layouts, request.program)
+        replay_rows = [row for replay in request.replays for row in replay.rows]
+        rows = [row for sequence in request.sequences for row in sequence.primary_stream_rows]
+        rows.extend(replay_rows)
+        _reconcile_timeline(rows)
+        _reconcile_candidate_bytes(request, replay_rows)
+    except GenerationProjectionMismatch:
+        raise
+    except (KeyError, TypeError, ValueError, IndexError):
+        _projection_mismatch("primary candidate rows are malformed")
 
 
-def _reconcile_request(request: ReconcileRequest, *, complete: bool) -> None:
-    """执行 final 或 prospective 的共享逐行对账。"""
-    if complete:
-        validate_plan_identity(request.program, request.plan)
+def reconcile_noise_candidate(request: NoiseCandidateReconcileRequest) -> None:
+    """只对当前 noise 候选执行 payload、身份、行闭包与字节校验。
+
+    @param request 当前 NoiseSlot 的独立候选请求。
+    @return None；候选内容不一致时抛可恢复投影拒绝。
+    """
+    try:
+        _validate_noise_slot(request.program, request.noise_slot)
+        _reconcile_noise_row(
+            request.row,
+            request.payload_digest,
+            request.noise_slot,
+            (request.program, request.run_id),
+        )
+        _reconcile_timeline((request.row,))
+        if request.retained_content_bytes != _canonical_rows_bytes((request.row,)):
+            _projection_mismatch("noise candidate retained-content bytes are invalid")
+    except GenerationProjectionMismatch:
+        raise
+    except (KeyError, TypeError, ValueError, IndexError):
+        _projection_mismatch("noise candidate row is malformed")
+
+
+def _reconcile_request(request: ReconcileRequest) -> None:
+    """执行最终全量逐行对账。"""
+    validate_plan_identity(request.program, request.plan)
     targets = _primary_targets(request.plan)
     try:
         sources = _reconcile_primary(
-            request.program, request.projection_witnesses, request.sequences, targets, complete
+            request.program, request.projection_witnesses, request.sequences, targets
         )
         _reconcile_noise(
             request.noise_rows,
             request.noise_payload_digests,
             request.plan.noise_slots,
             (request.program, request.run_id),
-            complete,
         )
         _reconcile_replay(
             sources, request.replays, request.plan.replay_layouts,
-            request.program, complete,
+            request.program,
         )
         replay_rows = [row for replay in request.replays for row in replay.rows]
         rows = [row for sequence in request.sequences for row in sequence.primary_stream_rows]
@@ -759,6 +809,190 @@ def _reconcile_request(request: ReconcileRequest, *, complete: bool) -> None:
         raise
     except (KeyError, TypeError, ValueError, IndexError):
         _projection_mismatch("final rows are malformed")
+
+
+def _validate_candidate_slot(plan: ScenarioPlan, slot: DeliverySlot) -> None:
+    """要求候选槽与计划声明表中的唯一槽逐字段相等。"""
+    matches = [item for item in plan.delivery_slots if item.slot_key == slot.slot_key]
+    if len(matches) != 1 or matches[0] != slot:
+        _projection_mismatch("candidate delivery slot differs from the plan")
+
+
+def _primary_slot_targets(plan, slot) -> tuple[tuple[object, str | None, tuple], ...]:
+    """只解析当前槽严格 variant 序的计划目标。"""
+    return tuple(
+        (slot, variant, _branch_events(plan, slot.slot_key, variant))
+        for variant in slot.variant_names or (None,)
+    )
+
+
+def _validate_noise_slot(program: GenerationProgram, slot) -> None:
+    """把 noise slot 的 topic、ordinal 与 frame 绑定回程序声明。"""
+    noise = program.noise
+    valid_ordinal = 0 <= slot.ordinal < len(noise.topics) if noise is not None else False
+    if not valid_ordinal:
+        _projection_mismatch("noise slot ordinal differs from the program")
+    if slot.topic != noise.topics[slot.ordinal] or slot.frame_class != noise.frame_class:
+        _projection_mismatch("noise slot topic or frame differs from the program")
+
+
+def _reconcile_candidate_bytes(request, replay_rows) -> None:
+    """从当前 primary 候选全部实际行独立复算 canonical bytes。"""
+    rows = []
+    for sequence in request.sequences:
+        rows.append(sequence.main_row)
+        rows.extend(sequence.primary_stream_rows)
+    rows.extend(replay_rows)
+    if request.retained_content_bytes != _canonical_rows_bytes(rows):
+        _projection_mismatch("primary candidate retained-content bytes are invalid")
+
+
+class CrossViewFrontier:
+    """按声明序维护已提交 CrossView 身份集合与当前 phase。"""
+
+    def __init__(self, plan: ScenarioPlan):
+        """构造空 frontier，并冻结当前计划的声明序边界。
+
+        @param plan 当前运行唯一冻结计划。
+        @return None。
+        """
+        self._plan = plan
+        self._phase = "primary" if plan.delivery_slots else "noise"
+        self._next_ordinal = 0
+        self._event_ids: set[str] = set()
+        self._timestamps_us: set[int] = set()
+        self._source_keys: set[str] = set()
+
+    def check_primary(self, candidate: PreparedCandidate) -> CrossViewDelta:
+        """对当前 primary head 生成零正式突变的冻结 delta。
+
+        @param candidate 已通过 candidate-local 校验并深度冻结的当前候选。
+        @return 只含当前候选新增事实的 delta。
+        """
+        if self._phase != "primary" or self._next_ordinal >= len(self._plan.delivery_slots):
+            _frontier_contract_error("crossview_frontier: primary phase is closed")
+        expected = self._plan.delivery_slots[self._next_ordinal]
+        if candidate.slot != expected:
+            _frontier_contract_error("crossview_frontier: primary ordinal is out of order")
+        try:
+            delta = _primary_frontier_delta(candidate, self._next_ordinal)
+            self._check_delta_conflicts(delta)
+            return delta
+        except GenerationProjectionMismatch:
+            raise
+        except (KeyError, TypeError, ValueError, IndexError):
+            _projection_mismatch("primary frontier facts are malformed")
+
+    def check_noise(self, candidate: PreparedNoiseCandidate) -> CrossViewDelta:
+        """对当前 noise head 生成零正式突变的冻结 delta。
+
+        @param candidate 已通过 noise-local 校验并深度冻结的当前候选。
+        @return 只含当前候选新增事实的 delta。
+        """
+        if self._phase != "noise" or self._next_ordinal >= len(self._plan.noise_slots):
+            _frontier_contract_error("crossview_frontier: noise phase is closed")
+        expected = self._plan.noise_slots[self._next_ordinal]
+        if candidate.noise_slot != expected:
+            _frontier_contract_error("crossview_frontier: noise ordinal is out of order")
+        try:
+            delta = _noise_frontier_delta(candidate, self._next_ordinal)
+            self._check_delta_conflicts(delta)
+            return delta
+        except GenerationProjectionMismatch:
+            raise
+        except (KeyError, TypeError, ValueError, IndexError):
+            _projection_mismatch("noise frontier facts are malformed")
+
+    def commit(self, delta: CrossViewDelta) -> None:
+        """无 await 地消费已检查的当前 phase/ordinal delta。
+
+        @param delta 当前 check_primary 或 check_noise 返回的冻结增量。
+        @return None。
+        """
+        if delta.phase != self._phase or delta.ordinal != self._next_ordinal:
+            _frontier_contract_error("crossview_frontier: delta is out of order")
+        if not _delta_is_well_formed(delta) or self._delta_conflicts(delta):
+            _frontier_contract_error("crossview_frontier: unchecked conflicting delta")
+        if not all(_is_id(value) for value in delta.event_ids):
+            _frontier_contract_error("crossview_frontier: unchecked invalid event ID")
+        self._event_ids.update(delta.event_ids)
+        self._timestamps_us.update(delta.timestamps_us)
+        self._source_keys.update(delta.source_keys)
+        self._next_ordinal += 1
+        if self._phase == "primary" and self._next_ordinal == len(self._plan.delivery_slots):
+            self._phase = "noise"
+            self._next_ordinal = 0
+
+    def _check_delta_conflicts(self, delta: CrossViewDelta) -> None:
+        """把候选内或相对已提交集合的冲突转为当前 attempt 拒绝。"""
+        if not _delta_is_well_formed(delta) or self._delta_conflicts(delta):
+            _projection_mismatch("candidate conflicts with the committed CrossView frontier")
+        if not all(_is_id(value) for value in delta.event_ids):
+            _projection_mismatch("candidate frontier event ID is invalid")
+
+    def _delta_conflicts(self, delta: CrossViewDelta) -> bool:
+        """判断增量是否与三个正式身份集合相交。"""
+        return bool(
+            self._event_ids.intersection(delta.event_ids)
+            or self._timestamps_us.intersection(delta.timestamps_us)
+            or self._source_keys.intersection(delta.source_keys)
+        )
+
+
+def _primary_frontier_delta(candidate: PreparedCandidate, ordinal: int) -> CrossViewDelta:
+    """从已冻结 primary 候选提取 frontier 最小增量。"""
+    rows = [row for sequence in candidate.sequences for row in sequence.primary_stream_rows]
+    rows.extend(row for replay in candidate.replays for row in replay.rows)
+    event_ids, timestamps = _frontier_event_facts(rows)
+    source_keys = [
+        f"primary:{sequence.main_row['_meta']['id']}" for sequence in candidate.sequences
+    ]
+    for replay in candidate.replays:
+        replay_ids = {
+            row["_meta"]["event"]["replay_sequence_id"] for row in replay.rows
+        }
+        if len(replay_ids) != 1 or not _is_id(next(iter(replay_ids))):
+            _projection_mismatch("replay frontier source identity is invalid")
+        source_keys.append(f"replay:{next(iter(replay_ids))}")
+    return CrossViewDelta("primary", ordinal, event_ids, timestamps, tuple(source_keys))
+
+
+def _delta_is_well_formed(delta: CrossViewDelta) -> bool:
+    """判断 frontier delta 非空、逐行对齐且三族身份各自唯一。"""
+    return (
+        bool(delta.event_ids and delta.timestamps_us and delta.source_keys)
+        and len(delta.event_ids) == len(delta.timestamps_us)
+        and len(delta.event_ids) == len(set(delta.event_ids))
+        and len(delta.timestamps_us) == len(set(delta.timestamps_us))
+        and len(delta.source_keys) == len(set(delta.source_keys))
+    )
+
+
+def _noise_frontier_delta(
+    candidate: PreparedNoiseCandidate,
+    ordinal: int,
+) -> CrossViewDelta:
+    """从已冻结 noise 候选提取 frontier 最小增量。"""
+    event_ids, timestamps = _frontier_event_facts((candidate.row,))
+    event_key = candidate.row["_meta"]["event"]["event_key"]
+    if not _is_id(event_key):
+        _projection_mismatch("noise frontier source identity is invalid")
+    return CrossViewDelta(
+        "noise", ordinal, event_ids, timestamps, (f"noise:{event_key}",)
+    )
+
+
+def _frontier_event_facts(rows) -> tuple[tuple[str, ...], tuple[int, ...]]:
+    """提取一组 stream rows 的 event ID 与整数工件时间。"""
+    event_ids = tuple(row["_meta"]["event"]["event_id"] for row in rows)
+    timestamps = tuple(_timestamp_us(row["_meta"]["event"]["timestamp"]) for row in rows)
+    return event_ids, timestamps
+
+
+def _frontier_contract_error(message: str) -> None:
+    """记录并抛出 frontier 调用顺序或消费不变式错误。"""
+    _log.error(message)
+    raise InternalError(message)
 
 
 def _primary_targets(plan) -> tuple[tuple[object, str | None, tuple], ...]:
@@ -779,16 +1013,12 @@ def _branch_events(plan, slot_key: str, variant: str | None) -> tuple:
     return tuple(matches[0])
 
 
-def _reconcile_primary(
-    program, witnesses, sequences, targets, complete: bool,
-) -> dict[tuple[str, str | None], object]:
-    """校验交付前缀的 main、primary、计划与 ID 双向闭包。"""
-    count_invalid = (len(sequences) != len(targets) if complete
-                     else len(sequences) > len(targets))
-    if len(sequences) != len(witnesses) or count_invalid:
+def _reconcile_primary(program, witnesses, sequences, targets):
+    """校验当前闭包的 main、primary、计划与 ID 双向关系。"""
+    if len(sequences) != len(witnesses) or len(sequences) != len(targets):
         _projection_mismatch("primary sequence sources differ from final rows")
     sources = {}
-    for witness, sequence, target in zip(witnesses, sequences, targets, strict=False):
+    for witness, sequence, target in zip(witnesses, sequences, targets, strict=True):
         _reconcile_sequence(program, witness, sequence, target)
         slot, variant, _ = target
         sources[(slot.slot_key, variant)] = sequence
@@ -1057,12 +1287,11 @@ def _reconcile_member(member, row, event_id: str, index: int) -> None:
             _projection_mismatch("main member annotation status is invalid")
 
 
-def _reconcile_noise(rows, payload_digests, slots, identity, complete: bool) -> None:
-    """校验 noise 前缀与 NoiseSlot 逐位一致。"""
-    count_invalid = (len(rows) != len(slots) if complete else len(rows) > len(slots))
-    if len(rows) != len(payload_digests) or count_invalid:
+def _reconcile_noise(rows, payload_digests, slots, identity) -> None:
+    """校验 noise rows 与 NoiseSlot 逐位闭合。"""
+    if len(rows) != len(payload_digests) or len(rows) != len(slots):
         _projection_mismatch("noise sources differ from final rows")
-    for row, payload_digest, slot in zip(rows, payload_digests, slots, strict=False):
+    for row, payload_digest, slot in zip(rows, payload_digests, slots, strict=True):
         _reconcile_noise_row(row, payload_digest, slot, identity)
 
 
@@ -1107,10 +1336,8 @@ def _reconcile_noise_row(row, source_digest: str, slot, identity) -> None:
         _projection_mismatch("noise row carries invalid identity truth")
 
 
-def _reconcile_replay(sources, replays, layouts, program, complete: bool) -> None:
+def _reconcile_replay(sources, replays, layouts, program) -> None:
     """校验所有已具备 source 的 replay 分组、费用与逐位内容。"""
-    if complete and len(replays) != len(layouts):
-        _projection_mismatch("replay group count differs from final plan")
     expected = [layout for layout in layouts
                 if (layout.source_slot_key, layout.source_variant_name) in sources]
     if len(replays) != len(expected):
@@ -1126,9 +1353,9 @@ def _reconcile_replay(sources, replays, layouts, program, complete: bool) -> Non
 
 
 def _reconcile_retained_bytes(request, replay_rows) -> None:
-    """从最终 canonical rows 独立复算 prospective retained-content 总费用。
+    """从最终 canonical rows 独立复算 retained-content 总费用。
 
-    @param request 当前 prospective 或最终 CrossView 请求。
+    @param request 当前最终 CrossView 请求。
     @param replay_rows 按 ReplayRows 分组展平后的实际行。
     @return None；计费不一致时拒绝当前 attempt。
     """

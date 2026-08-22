@@ -33,12 +33,12 @@ from labelkit.common.contracts.generation import (
 )
 from labelkit.common.config.generation import declared_actor_names, is_generation_frame_eligible
 from labelkit.common.errors import InternalError, SchemaViolation
-from labelkit.common.runtime.generation_prompts import (
+from labelkit.common.inference.generation_prompts import (
     enforce_prompt_value_limit,
     event_plan_prompt,
     scenario_seed_prompt,
 )
-from labelkit.common.runtime.schema_engine import CallScope, event_plan_schema, scenario_seed_schema
+from labelkit.common.inference.schema_engine import CallScope, event_plan_schema, scenario_seed_schema
 from labelkit.operators.generation import GenerationAttemptRejected
 from labelkit.operators.generation.evaluate import (
     evaluate_coupling,

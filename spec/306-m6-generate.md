@@ -44,7 +44,7 @@ class GenerateStage(Stage):
 ```
 [generate]                                  # project.toml 追加片段
 enabled = true
-llm = "default"
+llms = ["default", "judge"]
 instruction = """你是中文输入法的真实用户。模仿示例指令的口吻与场景，生成全新的一句话中文指令：
 日常场景、口语化、诉求明确；只借鉴风格与题材范围，不得复述示例内容。"""
 num_per_record = 2
@@ -52,10 +52,9 @@ seeds_per_call = 3
 num_per_call = 4                            # temperature 取默认 0.9
 ```
 
-v1.2 键名迁移与多样性设定补充：上述片段中的单值键 `llm = "default"` 在 v1.2 写作数组键 `llms`（5.2 配置表），本示例取双模型轮转 + 两个风格模板（种子选取、调用次数与下方样本文本均不变）：
+本示例采用轮转混合与两个风格模板：
 
 ```
-llms = ["default", "judge"]                 # v1.2：取代 llm = "default"；元素须为 [llm.*] profile
 mixture = "round_robin"                     # 第 1 次调用走 llms[0]="default"，第 2 次走 llms[1]="judge"
 
 [[generate.styles]]                         # 可选；每次调用经 ctx.rng 均匀抽 1 个 style
@@ -194,9 +193,9 @@ generation/
 ~~~
 
 `generate.py` 只保留 flat `GenerateStage`。sequence 由
-`Orchestrator._run_generate_only` 调用 `generation_delivery.deliver_generation`；后者把
-M6 生成服务与 M3/M4/M5/M7/M11 协作者组装成串行 slot admission。M6 不 import orchestration，
-也不在内部打开正式输出文件。
+`SequenceWorkflow` 调用 `sequence_workflow.deliver_generation`；后者把 M6 生成服务与
+M3/M4/M5/M7/M11 协作者组装成有界候选准备和声明序短提交。M6 不 import orchestration，不在内部打开正式
+输出文件，也不直接创建 `asyncio` task；全部模型叶调用通过 `GenerationServices.tasks` 提交。
 
 配置装载后，所有入口共用同一 `compile_generation_program(config)` 和
 `compile_scenario_plan(program)`；`run.seed` 已是 program-bound `planner_seed`。planner 冻结 delivery slot、variant、role 或位置、逻辑时间、
@@ -342,9 +341,12 @@ counterfactual set 或 positive replay source。
   机械 verdict 组装最终 EventTrace。判定器对终态重开、终态近义复述、actor 收发关系倒置与错误等待主体执行
   反例优先审查；缺帧、错序或长等待本身不自动失败。
 - `CouplingEvaluator` 机械比较反事实 protected prefix。
-- `CrossViewReconciler` 在提交前验证 main sequence 与 primary stream owner 双向一一对应，以及 replay/noise
-  边界与全局时间顺序；它保留 replay 分组并从实际 canonical rows 独立复算每个分组和全量 retained-content，
-  不信任控制器或 row carrier 提供的计数。
+- primary candidate-local validator 只验证当前 DeliverySlot、严格 variant 顺序的 `SequenceRows`、全部已规划
+  `ReplayLayout` 与对应 `ReplayRows`；它不读取已提交前缀。`CrossViewFrontier.check_primary` 与
+  `check_noise` 在声明序短提交中增量验证当前 candidate 与已提交 event ID、timestamp、source 和
+  phase/ordinal，返回冻结 `CrossViewDelta`；`commit(delta)` 无普通失败分支。全部 primary、noise 与 replay
+  内存提交后，`reconcile_views` 再从最终 rows 独立重建全部事实一次。三层均从实际 canonical rows 复算
+  retained-content，不信任控制器或 row carrier 提供的计数。
 
 declared 的 `EventTruth.role` 只在 `PatternEvaluator` 产出 `actual_bindings` 后机械写入，不使用 planner
 witness；缺失、重复或额外 binding 都 fail closed，PatternEvaluator 通过前不得为 declared branch 构造
@@ -360,7 +362,7 @@ program/variant 重建精确 role word，逐事件核对 RoleSpec 的 frame clas
 `actual_bindings == {event_id: role}`，并要求 actual violation 与唯一期望违规恰等。任一伪造都是
 `generation_downstream_contract`，不能靠投影视图自洽通过。
 公开 `project_trace` 与 `project_replay` 同时携带 program 和完整 plan，先验证 canonical plan，再要求 slot/layout
-与该 plan 中唯一成员完整相等并复核事件、来源与身份。DeliveryController 只在交付边界验证一次，后续调用包内
+与该 plan 中唯一成员完整相等并复核事件、来源与身份。SequenceWorkflow 只在交付边界验证一次，后续调用包内
 validated helper；内容重试不得重新运行 CP-SAT。
 
 所有 v1.18 generation ID 均对 canonical JSON array
@@ -368,44 +370,61 @@ validated helper；内容重试不得重新运行 CP-SAT。
 JSON array，timestamp 是 integer 微秒，payload component 是已验证 JSON object，不得字符串拼接。
 declared 与 instruction-only 分别使用冻结 domain 与 component 序列；`Record.id = sequence_id`，
 member `Record.id = event_id`。replay 与 noise 使用各自 domain。缺失分支没有目标 role 的 `event_key`。
-完整 domain/component 表见第 6 章，不得回退到输入摄取 ID 公式。
+完整 domain/component 表见第 6 章；generation ID 只使用该冻结公式。
 
 ### 3.6.10 noise、replay 与内存边界
 
-全部 primary slot 接受后，noise slot 按 ordinal 串行执行。planner 把与 noise_events 等长的非空唯一
-`generate.noise.topics` 按 ordinal 冻结到 NoiseSlot.topic。`NoiseRenderer` 只接收 noise instruction、
-frame Schema、sequence/frame class 的 name/description 闭集、NoiseSlot.topic、冻结时间与 attempt identity；
+全部 primary slot 内存提交后进入 noise phase。noise slot 使用连续有界候选缓冲；render 与独立 semantic
+evaluation 可跨 slot 并发，结果仍按 `NoiseSlot.ordinal` 提交。planner 把与 noise_events 等长的非空唯一
+`generate.noise.topics` 按 ordinal 冻结到 `NoiseSlot.topic`。`NoiseRenderer` 只接收 noise instruction、
+frame Schema、sequence/frame class 的 name/description 闭集、`NoiseSlot.topic`、冻结时间与 attempt identity；
 不接收 seed、trace、primary payload 或既有 noise payload。renderer 必须把计划话题作为唯一话题，
-不得改换、混合或泛化；它在内部构造 attempt index + 2 个符合该话题的自然表达角度，
-再选择下标 attempt index 对应的角度。不同 attempt 必须使用明显不同措辞，不得输出候选表或
-内部标识；Schema examples 只描述形状，禁止复制或改写其内容。
+不得改换、混合或泛化；它在内部构造 attempt index + 2 个符合该话题的自然表达角度，再选择 attempt index
+对应的角度。不同 attempt 必须使用明显不同措辞，不得输出候选表或内部标识；Schema examples 只描述形状，
+禁止复制或改写其内容。
+
 `NoiseSemanticEvaluator` 独立要求 unrelated-to-declared-tasks、no-executable-task、realism 与
-matches-planned-topic 全为 true；候选不忠实计划话题时使用 `planned_noise_topic_mismatch`。
-noise 再经过 attempt-local SimilarityFilter；
-通过后才 commit 签名。noise 不进 quality、annotate、
-verify 或 main dedup group。
+matches-planned-topic 全为 true；候选不忠实计划话题时使用 `planned_noise_topic_mismatch`。attempt-local
+路径只冻结 similarity signature，不写 `SimilarityFilter`。`PreparedNoiseCandidate` 闭包 `NoiseSlot`、
+post-gate payload digest、最终 row、signature、dataset counter delta、实际 retained bytes 与 frozen digest。
+`NoiseCandidateReconcileRequest` 在进入缓冲前验证 payload、topic/ordinal、timestamp、ID 派生、字段闭包与
+canonical bytes。成为 head 后，提交协调器先对最新全部 primary 与较低 ordinal noise 做 similarity probe，
+再执行 frontier 与 retained-content 检查；signature commit 后不得再有普通可恢复失败。noise 不进 quality、
+annotate、verify 或 main dedup group。
 
 replay 是完整 positive sequence 的原样重发，不是单帧重复。planner 按 declaration order 与 scenario index
 冻结 source；每个 replay 独占尾部 session，使用新 replay sequence/event ID 与新 artifact timestamp，但 payload、
-frame class、actual role 和顺序逐位同源。source 不足在启动期失败，source delivery 失败时不能改选。
+frame class、actual role 和顺序逐位同源。source 不足在启动期失败，source delivery 失败时不能改选。Replay
+不调用 LLM，也不进入独立 coordinator；它与 source primary candidate 一起校验和提交。
 
-下游接受后，M11 先通过
+下游接受后，M11 通过
 `SequenceAssemblyRequest(program, schema_engine, item, projection, batch_no)` 零 I/O 装配 `SequenceRows`，
 并以 program-bound sequence/frame annotation Schema 终检实际待交付对象；不得回读 source ResolvedConfig。
 终检失败归 `sequence_projection_mismatch` 并重试整个 source slot，零 dedup、dataset、row 或 replay commit。
-然后 ReplayProjector 只从该最终 source 行派生全部已规划 `ReplayRows`。两者分别以同一
-`canonical_delivery_row` 计算自身行的 UTF-8 byte 数加一个 JSONL 换行 byte。dedup `group_commit` 前的
-prospective `retained_content_bytes` 等于既有已接受累计、当前 set 所有 `SequenceRows` 与本次按
-ReplayLayout 分组的 `ReplayRows` 之和，上限为 536870912。CrossView 再从 sequence main/primary、noise 与
-replay 实际 canonical rows 独立复算该总费用；超限归 `sequence_memory_budget` 并重试整个 source slot，零 dedup
-或 dataset commit。接受后 payload 在 main/stream/replay 间共享冻结引用，不深拷贝；立即释放
-`ProjectedSequence`、`PipelineItem`、`AttemptTransaction`、state 和 LLM 中间对象，只保留最终 main/stream
-rows、dedup features 与计数。
+ReplayProjector 只从该最终 source 行派生全部已规划 `ReplayRows`。两者分别以同一
+`canonical_delivery_row` 计算自身行的 UTF-8 byte 数加一个 JSONL 换行 byte。
+
+`PrimaryCandidateReconcileRequest` 要求 `SequenceRows` 与 slot 的 variant 数量和顺序完全一致，并要求计划中
+该 source 的全部 `ReplayLayout` 与 `ReplayRows` 一一对应。它从当前 candidate 的实际 main、primary 与 replay
+rows 独立复算 bytes，不读取已提交前缀。通过后，`PreparedCandidate` 深度冻结 witnesses、`SequenceRows`、
+全部 `ReplayRows`、`DedupReservation`、dataset counter delta、实际 retained bytes 与 candidate digest；
+随后立即释放 `ProjectedSequence`、`PipelineItem`、`AttemptTransaction`、state 和 LLM 中间对象。
+
+该 candidate 成为 head 时，retained-content 检查比较“已提交实际 bytes + 当前 candidate 实际 bytes”，上限为
+536870912。恰好上限接受，多一 UTF-8 byte 归 `sequence_memory_budget` 并重试整个 source slot，零 dedup 或
+dataset commit。成功后 replay 与 source 一起提交，payload 在 main/stream/replay 间共享冻结引用。
+`CrossViewFrontier.check_primary/check_noise` 只增量检查当前 candidate 与已提交前缀，返回冻结
+`CrossViewDelta`，`commit(delta)` 无普通失败分支；全部 rows 内存提交后，`reconcile_views` 从最终
+sequence main/primary、noise 与 replay 实际 canonical rows 独立执行一次完整对账。
 
 `record_units = primary_sequences + primary_events + noise_events + replay_events` 与
 `stream_rows = primary_events + noise_events + replay_events` 各自不得超过 500000。单 block 最多 4096
-primary events；delivery 完成一个 slot 后释放 state 快照和 LLM 中间对象。500000 最小载荷与接近 512 MiB
-混合载荷的 peak RSS 都必须不超过 4 GiB。
+primary events。候选缓冲限制 preparing、prepared 与 recoverable outcome 的槽位总数；记录
+`candidate_bytes_high_water` 时计算全部已完成但尚未提交候选 canonical bytes 的同时驻留总和。它不包含在途
+provider response、`AttemptTransaction`、Python 对象开销、dedup registry 或 HTTP buffer。
+500000 最小载荷与接近 512 MiB 混合载荷继续验证最终 compact output 包络；六百候选另以固定结果形状记录
+peak RSS 与候选字节高水位。由于用户 Schema 与 provider response 没有统一 byte 上限，该压力门只证明固定
+工作负载，不声称任意合法工程在六百候选下都不会耗尽物理内存。
 
 sequence 的 exact delivery、attempt 消耗、下游 transaction、正式文件提交与失败矩阵由 M10 和 M11 定义；
 M6 只返回完整候选、独立判定和投影结果，任何失败都不得产生半个 counterfactual set。

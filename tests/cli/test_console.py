@@ -57,8 +57,8 @@ from labelkit.common.config.model import (
 )
 from labelkit.common.observability import console_format
 from labelkit.common.observability.obslog import TraceEvent
-from labelkit.common.runtime.llm_client import KeySnapshot, ProfileSnapshot
-from labelkit.orchestration.orchestrator import Orchestrator
+from labelkit.common.inference.llm_client import KeySnapshot, ProfileSnapshot
+from labelkit.orchestration.process_workflow import ProcessWorkflow
 
 RICH = ConsoleConfig(mode="rich", mode_resolved="rich")
 
@@ -1099,20 +1099,20 @@ def _classify_cfg_with_views(overrides: dict | None = None) -> ResolvedConfig:
 
 
 def _mirrored_verdict(cfg: ResolvedConfig) -> bool:
-    """两侧同名判定必须逐例相等（console 侧注释自称是 Orchestrator 的镜像）。
+    """两侧同名判定必须逐例相等（console 侧注释自称是 ProcessWorkflow 的镜像）。
 
-    Orchestrator 侧只读 `self.cfg`，故以最小 self 直调未绑定方法——避免为一个
+    ProcessWorkflow 侧只读 `self.cfg`，故以最小 self 直调未绑定方法——避免为一个
     纯判定装配整个运行期对象图。
     """
     console_verdict = console_mod._class_overrides_exist(cfg)
-    orchestrator_verdict = Orchestrator._class_overrides_exist(
+    process_workflow_verdict = ProcessWorkflow._class_overrides_exist(
         SimpleNamespace(cfg=cfg))
-    assert console_verdict == orchestrator_verdict
+    assert console_verdict == process_workflow_verdict
     return console_verdict
 
 
 @pytest.mark.parametrize("field", sorted(_MIRROR_OVERRIDES))
-def test_class_overrides_mirror_matches_the_orchestrator_predicate(field):
+def test_class_overrides_mirror_matches_the_process_workflow_predicate(field):
     """六个被检查字段各自都能单独触发 True，且两侧判定逐例相等。"""
     cfg = _classify_cfg_with_views({field: _MIRROR_OVERRIDES[field](_cfg(RICH))})
     assert _mirrored_verdict(cfg) is True

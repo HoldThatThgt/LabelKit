@@ -12,12 +12,12 @@ from jsonschema import Draft202012Validator
 
 from labelkit.cli.parser import CliOverrides
 from labelkit.common.config import load
-from labelkit.common.runtime.llm_client import (
+from labelkit.common.inference.llm_client import (
     STRUCTURED_TOOL_DESCRIPTION,
     STRUCTURED_TOOL_NAME,
 )
 from labelkit.operators.generation.project import canonical_json
-from labelkit.orchestration.runtime import execute_run
+from labelkit.orchestration.application import execute_run
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 
@@ -71,8 +71,8 @@ def _schema_kind(schema: dict) -> str | None:
 
 def _install_structured_observers(monkeypatch):
     """装饰生产 body serializer 与 structured extractor，保留真实网络路径。"""
-    from labelkit.common.runtime import llm_client
-    from labelkit.common.runtime import schema_engine
+    from labelkit.common.inference import llm_client
+    from labelkit.common.inference import schema_engine
 
     original_body = llm_client._build_anthropic_body
     original_extract = schema_engine._extract_object

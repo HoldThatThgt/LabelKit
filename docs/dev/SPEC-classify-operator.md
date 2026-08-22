@@ -20,7 +20,7 @@
 | M5/M7/M11/M12 | feasible_with_frictions | 6 | 以只增为主；M5/M7 需先修 CONTRACTS §7.4 签名（提案量级「小」上调为「中」）；multi 下 rejects/trace 需 label 消歧 |
 | 文档盘点 | — | — | 盘点 67 文件；与其余五域清单合并去重后共 **70**（spec 18、CONTRACTS 1、手册 18、代码 15、测试 13、examples 2、根 3——盘点域漏了 `cli.py` 与 `test_cli.py`/`test_obslog.py`，由 M1/M13/M5 域补齐）；提案 §5 有 8 类遗漏，已并入 §4 |
 
-编排者亲自核实过的承重事实：`counts.*` 仅 M10 可增（CONTRACTS §11 冻结，docs/CONTRACTS.md 约 1702 行）；rejects 归因取 `item.errors[0]`（现位于 `labelkit/operators/emitter.py`）；openai_compatible 结构化输出层无条件 `strict: true` 透传 Schema（现位于 `labelkit/common/runtime/llm_client.py`）；trace 通道合法值唯一硬编码于 `labelkit/common/config/loader.py`；report 桶字段白名单漏 `rejected_by_validator`（现涉及 `labelkit/orchestration/orchestrator.py` 与 `labelkit/operators/generate.py`，既有问题见 §6）。
+编排者亲自核实过的承重事实：`counts.*` 仅 M10 可增（CONTRACTS §11 冻结，docs/CONTRACTS.md 约 1702 行）；rejects 归因取 `item.errors[0]`（现位于 `labelkit/operators/emitter.py`）；openai_compatible 结构化输出层无条件 `strict: true` 透传 Schema（现位于 `labelkit/common/inference/llm_client.py`）；trace 通道合法值唯一硬编码于 `labelkit/common/config/loader.py`；report 桶字段白名单漏 `rejected_by_validator`（现涉及 `labelkit/orchestration/process_workflow.py` 与 `labelkit/operators/generate.py`，既有问题见 §6）。
 
 ## 2. 设计裁决记录（对提案的修正与细化；终审后并入 spec §1.6）
 
@@ -108,7 +108,7 @@ def classification_schema(class_names: list[str], assignment: str,
 
 | 设计点 | 定义 |
 |---|---|
-| 调用与校验 | 每记录 1 次调用（自洽采样时 ×n），经 `complete_validated(schema=classification_schema(...))`——内部 Schema：不计 resolved_at、不过代码回调校验层。reason 请求条件见裁决·分类事件仅入 trace。temperature 0（自洽采样取 `classify.sc_temperature`）。批内记录级并发（asyncio.gather + profile 信号量，骨架同 M5） |
+| 调用与校验 | 每记录 1 次调用（自洽采样时 ×n），经 `complete_validated(schema=classification_schema(...))`——内部 Schema：不计 resolved_at、不过代码回调校验层。reason 请求条件见裁决·分类事件仅入 trace。temperature 0（自洽采样取 `classify.sc_temperature`）。批内记录级纯叶任务通过统一执行运行时按 profile 有界并发，结果按声明序归并。 |
 | 归一化（M8 之后，确定性，顺序固定） | ① 标签映射到类别表声明序并**去重**；② 兜底类与具体类同现 ⇒ 剔除兜底类（纯兜底保留）。归一化只收窄已验证集合 |
 | 自洽采样投票 | `self_consistency = n`（0 关；≥3 奇数）：n 次独立采样（SchemaViolation 样本弃权，分母仍 n）。single：多数票，无过半 ⇒ 归兜底类；multi：逐标签保留出现于 > n/2 个采样集合者，全落选 ⇒ 归兜底类。`detail.sc = {"n", "agreement_ratio"}`（single = 胜出类票占比；multi = 保留标签中最低票占比） |
 | 失败与兜底 | M8 修复耗尽：`on_error="fallback"`（默认）⇒ 归兜底类，`source="fallback"`，留痕写 `Classification.detail`（不写 item.errors，裁决·fallback 留痕不写 errors）+ error 事件（kind=`classification_invalid`）+ 计数器；`on_error="fail"` ⇒ `status="failed"`、StageError 入 item.errors ⇒ rejects |
@@ -326,7 +326,7 @@ class ClassView:                           # 一类的有效配置；enabled=fal
 | `test_config.py` | 解析/白名单/合并视图（含选择组回归 `test_class_selection_group_merge_not_spuriously_exclusive`）/校验清单/防呆 warning/channels |
 | `test_quality.py` | 池字典序/池内 top_ratio 名额/混模式共存/N=1 池/rng 消费序/tie 计数器池维/事件 pool 字段/关闭单池零变化 |
 | `test_generate.py` | 类段预算与字典序/round_robin 全局序/按类 style 抽取/inherited 构造/桶 key 前缀/单类退化回归；存量 postprocess 用例适配返回值 |
-| `test_orchestrator.py` | 链序/回流跳过/fanout 计数与不变量/残差含 fanout/桶 key 解析/**桶白名单含 rejected_by_validator（顺带修回归）**/dry-run 两模式公式/limit 与扇出 |
+| `test_process_workflow.py` | 链序/回流跳过/fanout 计数与不变量/残差含 fanout/桶 key 解析/**桶白名单含 rejected_by_validator（顺带修回归）**/dry-run 两模式公式/limit 与扇出 |
 | `test_emitter.py` | **存量 `_meta` 键全集断言须加 classification**；null 语义/pool/rejects label 键 |
 | `test_annotate.py` | 类有效 instruction/examples；label=None 回退全局；stage 传 label |
 | `test_verify.py` | 类有效 [任务指令]+extra_criteria；repair 线程化 label |
@@ -355,7 +355,7 @@ class ClassView:                           # 一类的有效配置；enabled=fal
 | 0 | 按 §4 清单合入 spec / CONTRACTS 修订（文档先行） | 文档交叉引用自洽（§5.2 表 ↔ §6.3 校验清单 ↔ §7.2 事件目录逐条对得上） |
 | 1 | M1：model + loader（解析/白名单/选择组合并/rubric 重解析/三处引用集/防呆） | `test_config.py` 全绿；`labelkit validate` 对 examples/classify 通过 |
 | 2 | types/stage/errors/schema_engine + `classify.py` 本体 | `test_classify.py` / `test_types.py` / `test_schema_engine.py` 全绿 |
-| 3 | M10 链插入 + fanout 计量 + 估算；M11 `_meta`/rejects；channels | `test_orchestrator.py` / `test_emitter.py` / `test_obslog.py` 全绿 |
+| 3 | M10 链插入 + fanout 计量 + 估算；M11 `_meta`/rejects；channels | `test_process_workflow.py` / `test_emitter.py` / `test_obslog.py` 全绿 |
 | 4 | M4 分池（两阶段 + 参数下穿 + 池维计数） | `test_quality.py` 全绿，单池路径存量用例原样通过（零变化锚） |
 | 5 | M5/M7 label 线程化 | `test_annotate.py` / `test_verify.py` 全绿 |
 | 6 | M6 类段（预算/预抽/继承/桶 key）+ 顺带修桶白名单 bug | `test_generate.py` 全绿 + 白名单回归用例先红后绿 |

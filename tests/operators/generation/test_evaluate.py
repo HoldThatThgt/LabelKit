@@ -189,6 +189,13 @@ class _SemanticEngine:
         return (self.value,)
 
 
+class _InlineTaskExecutor:
+    """按声明序执行冻结叶任务并返回输入序结果。"""
+
+    async def run_group(self, request):
+        return tuple([await task.operation() for task in request.tasks])
+
+
 def _semantic_request():
     """构造不携带任何结构目标的最小盲审请求。"""
     seed = ScenarioSeed({}, {"actor": {"goal": {}}}, {"public": {}, "hidden": {}}, {}, {})
@@ -204,7 +211,13 @@ def _semantic_services(value=None, error=None):
     config = SimpleNamespace(
         sequence_generation=SimpleNamespace(limits=GenerationLimits())
     )
-    services = GenerationServices(config, engine, object(), metrics)
+    services = GenerationServices(
+        config,
+        engine,
+        object(),
+        metrics,
+        _InlineTaskExecutor(),
+    )
     return services, engine, metrics
 
 

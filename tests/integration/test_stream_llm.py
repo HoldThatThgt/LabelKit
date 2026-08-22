@@ -20,9 +20,9 @@ frames 1-8 with the frame-5 social interruption screen; task B 打车 frames 9-1
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
-import os
 import random
 from dataclasses import replace
 from pathlib import Path
@@ -54,9 +54,8 @@ from labelkit.common.config.model import (
 )
 from labelkit.operators.extract import extract_transition
 from labelkit.operators.ingest import _parse_ui_tree
-from labelkit.common.runtime.credentials import resolve_credentials
-from labelkit.common.runtime.llm_client import LLMClient
-from labelkit.common.runtime.schema_engine import SchemaEngine
+from labelkit.common.inference.credentials import resolve_credentials
+from labelkit.common.inference.schema_engine import SchemaEngine
 from labelkit.operators.segment import judge_window
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import (
@@ -71,6 +70,7 @@ from labelkit.common.contracts.types import (
 from labelkit.operators.verify import VerifyStage, boundary_margin_text
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
+from tests.llm_client_helpers import make_llm_client as _client
 
 pytestmark = pytest.mark.integration
 
@@ -180,13 +180,28 @@ class _RecordingMetrics:
         self.events.append((ev, stage, batch_no, record_ids, payload or {}))
 
 
+class _DirectTasks:
+    async def run_group(self, request):
+        results = [None] * len(request.tasks)
+
+        async def run_one(index, spec):
+            results[index] = await spec.operation()
+
+        async with asyncio.TaskGroup() as group:
+            for index, spec in enumerate(request.tasks):
+                group.create_task(run_one(index, spec))
+        return tuple(results)
+
+
 def make_ctx(cfg) -> RunContext:
     metrics = _RecordingMetrics()
-    llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles,
+    llm = _client(cfg.llm_profiles, cfg.embedding_profiles,
                        resolve_credentials(cfg), metrics=None)
     engine = SchemaEngine(dict(cfg.user_schema), llm, cfg.output, metrics=None)
-    return RunContext(cfg=cfg, llm=llm, schema_engine=engine, metrics=metrics,
-                      rng=random.Random("42:1:stream"), batch_no=1)
+    return RunContext(cfg=cfg, llm=llm, schema_engine=engine,
+                      rng=random.Random("42:1:stream"), batch_no=1,
+                      metrics=metrics, tasks=_DirectTasks(),
+                      task_namespace="integration:stream:1")
 
 
 # ── real fixture loading (examples/stream/data/s1-serial-noise, M2 rules) ──
@@ -353,12 +368,16 @@ async def test_defect_verdict_schema_roundtrip():
     assert "去向: noise" in margin                     # margin evidence assembled
 
     stage = VerifyStage(cfg)
-    # 2026-08-14 收参整改：_judge_round_sequence 改走 _EpisodeReview 台账
-    # （rounds=0 ⇒ round_no=1，标注/类标签取自 item 本身），空串 = 无 [片段结构] 段。
+    # v1.19 走普通 stream verify 的真实 review 波次；不保留旧单轮兼容入口。
     from labelkit.operators.verify import _EpisodeReview
-    state = _EpisodeReview(item)
-    verdict, merged, fail_critiques, defects = await stage._judge_round_sequence(
-        state, ctx, margin, "")  # ONE real call
+    from labelkit.operators.stream_verify import StreamVerifyDriver
+    state = _EpisodeReview(item, 0)
+    reviewed = await StreamVerifyDriver(stage)._review_round([state], batch, ctx)
+    assert reviewed == [state]
+    verdict = state.verdict
+    merged = state.critiques
+    fail_critiques = state.fail_critiques
+    defects = state.defects
 
     assert verdict in {"pass", "fail"}
     # Real semantic assertion: the annotation claims 点外卖 while steps and

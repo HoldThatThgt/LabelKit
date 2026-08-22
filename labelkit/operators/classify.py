@@ -30,13 +30,13 @@ from labelkit.common.contracts.types import (
     PipelineItem,
     Record,
     StageError,
-    Usage,
     frame_digest,
 )
+from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
 
-from labelkit.common.runtime import budget
-from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
-from labelkit.common.runtime.schema_engine import (
+from labelkit.common.inference import budget
+from labelkit.common.inference.llm_client import Message, Part, PromptBundle
+from labelkit.common.inference.schema_engine import (
     CallScope,
     classification_schema,
     frame_classify_schema,
@@ -101,6 +101,54 @@ _FRAME_STRUCTURE = ('{"labels": [<第 1 帧类名>, <第 2 帧类名>, ...]}'
 _LABEL_FRAME_MEMBERS = "[会话成员帧]"
 _LABEL_MEMBER_SCREENSHOT = "[成员 {i} 截图]"
 _FRAME_MEMBER_LINE = "{m}. {digest}"
+
+
+@dataclass(frozen=True)
+class _ClassifyPlan:
+    """一条信封的冻结样本计划。"""
+
+    record: Record
+    item_ordinal: int
+    prompt: PromptBundle
+    schema: dict
+    with_reason: bool
+    sample_count: int
+
+
+@dataclass(frozen=True)
+class _ClassifySampleOutcome:
+    """一个纯样本叶任务的结果或普通记录级异常。"""
+
+    value: Mapping | BaseException
+
+
+@dataclass(frozen=True)
+class _FrameEpisodePlan:
+    """一条 episode 的冻结帧窗口计划。"""
+
+    item_ordinal: int
+    episode_id: str
+    members: tuple[Record, ...]
+    digests: tuple[str, ...]
+    spans: tuple[tuple[int, int], ...]
+    budget_on: bool
+
+
+@dataclass
+class _FrameRunStats:
+    """单个原始窗口叶任务的局部调用统计。"""
+
+    calls: int = 0
+    degrade_retries: int = 0
+
+
+@dataclass(frozen=True)
+class _FrameWindowOutcome:
+    """一个原始帧窗口叶任务的纯结果。"""
+
+    leaves: tuple[tuple[tuple[int, int], object], ...]
+    calls: int
+    degrade_retries: int
 
 
 def _reason_requested(cfg: "ResolvedConfig") -> bool:
@@ -527,77 +575,58 @@ def _classify_prompt(record: Record, ctx: "RunContext", schema: dict,
     return prompt
 
 
-async def _classify_single(record: Record, ctx: "RunContext", prompt: PromptBundle,
-                           schema: dict, with_reason: bool) -> Classification:
-    """self_consistency == 0 的单样本路径：一次调用 + 一次归一。
+def _plan_classification(record: Record, ctx: "RunContext",
+                         item_ordinal: int) -> _ClassifyPlan:
+    """同步冻结一条记录的 schema、prompt 与样本数。
 
     @param record 待判决记录
-    @param ctx 本次（批次, 阶段）运行上下文
-    @param prompt 已装配的提示词包
-    @param schema 本次调用的内部分类 schema
-    @param with_reason 是否索取一句话理由
-    @return 判决产物
-    """
-    c = ctx.cfg.classify
-    obj, _usage, _attempts, _model = await ctx.schema_engine.complete_validated(
-        c.llm, prompt, schema,
-        scope=CallScope(record_ids=(record.id,), batch_no=ctx.batch_no))
-    labels = _normalize_labels(_hit_labels(obj, c.assignment), c)
-    detail: dict = {}
-    if with_reason:
-        detail["reason"] = obj["reason"]
-    return Classification(label=labels[0], labels=labels, source="llm",
-                          detail=detail)
-
-
-async def _collect_sc_samples(
-        record: Record, ctx: "RunContext", prompt: PromptBundle,
-        schema: dict) -> tuple[list[tuple[str, ...]], list[str]]:
-    """自洽采样：n 个独立样本按 classify.sc_temperature 各走完整 M8 保证。
-
-    SchemaViolation 样本弃权（投票分母仍为 n，spec 3.13.4）；provider / 内部错误
-    原样上抛。
-
-    @param record 待判决记录
-    @param ctx 本次（批次, 阶段）运行上下文
-    @param prompt 已装配的提示词包（此处按 sc_temperature 复制一份）
-    @param schema 本次调用的内部分类 schema
-    @return (各有效样本归一后的标签集合, 各有效样本的理由)
-    @raises SchemaViolation 全部样本均失败
+    @param ctx 本次运行上下文
+    @param item_ordinal 批内输入序
+    @return 不含共享写入的样本计划
     """
     c = ctx.cfg.classify
     with_reason = _reason_requested(ctx.cfg)
-    sc_prompt = replace(prompt, temperature=c.sc_temperature)
+    names = [spec.name for spec in c.classes]
+    schema = classification_schema(names, c.assignment, c.max_labels, with_reason)
+    prompt = _classify_prompt(record, ctx, schema, with_reason)
+    sample_count = c.self_consistency or 1
+    if c.self_consistency:
+        prompt = replace(prompt, temperature=c.sc_temperature)
+    return _ClassifyPlan(record, item_ordinal, prompt, schema, with_reason,
+                         sample_count)
 
-    async def one_sample() -> tuple[dict, Usage, int, str]:
-        """发出一个自洽样本调用（完整 M8 保证）。
 
-        @return complete_validated 的四元组产物
-        """
-        return await ctx.schema_engine.complete_validated(
-            c.llm, sc_prompt, schema,
-            scope=CallScope(record_ids=(record.id,), batch_no=ctx.batch_no))
+async def _call_classify_sample(plan: _ClassifyPlan,
+                                ctx: "RunContext") -> Mapping:
+    """执行一个不写 PipelineItem 或 stage 事件的分类样本。
 
-    results = await asyncio.gather(
-        *(one_sample() for _ in range(c.self_consistency)), return_exceptions=True)
+    @param plan 冻结样本计划
+    @param ctx 本次运行上下文
+    @return M8 已校验的分类对象
+    """
+    obj, _usage, _attempts, _model = await ctx.schema_engine.complete_validated(
+        ctx.cfg.classify.llm, plan.prompt, plan.schema,
+        scope=CallScope(record_ids=(plan.record.id,), batch_no=ctx.batch_no))
+    return obj
 
-    sample_sets: list[tuple[str, ...]] = []
-    reasons: list[str] = []
-    last_violation: SchemaViolation | None = None
-    for res in results:
-        if isinstance(res, SchemaViolation):
-            last_violation = res                   # 该样本弃权
-        elif isinstance(res, BaseException):
-            raise res                              # provider / 内部错误上抛
-        else:
-            sample_sets.append(_normalize_labels(
-                _hit_labels(res[0], c.assignment), c))
-            if with_reason:
-                reasons.append(res[0]["reason"])
-    if not sample_sets:
-        raise last_violation if last_violation is not None else SchemaViolation(
-            ["self-consistency: all samples failed"], "")
-    return sample_sets, reasons
+
+async def _run_classify_sample(plan: _ClassifyPlan,
+                               ctx: "RunContext") -> _ClassifySampleOutcome:
+    """把普通记录级失败收敛为纯 outcome，保留运行级控制流。
+
+    @param plan 冻结样本计划
+    @param ctx 本次运行上下文
+    @return 分类对象或普通记录级异常
+    """
+    try:
+        return _ClassifySampleOutcome(await _call_classify_sample(plan, ctx))
+    except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+        raise
+    except Exception as exc:  # noqa: BLE001 — 普通记录级异常交给 reducer
+        _logger.debug("classification sample failed: item=%d exc=%s",
+                      plan.item_ordinal, type(exc).__name__,
+                      extra={"stage": "classify", "batch": ctx.batch_no})
+        return _ClassifySampleOutcome(exc)
 
 
 def _vote_labels(sample_sets: Sequence[tuple[str, ...]], c: "ClassifyConfig",
@@ -624,8 +653,77 @@ def _vote_labels(sample_sets: Sequence[tuple[str, ...]], c: "ClassifyConfig",
                    "agreement_ratio": min(votes[label] for label in final) / n}
 
 
+def _single_classification(plan: _ClassifyPlan, outcome: _ClassifySampleOutcome,
+                           c: "ClassifyConfig") -> Classification:
+    """把单样本 outcome 归并为冻结 Classification。
+
+    @param plan 记录级冻结计划
+    @param outcome 唯一样本 outcome
+    @param c 分类配置
+    @return 分类产物
+    @raises Exception 样本携带的普通记录级异常
+    """
+    if isinstance(outcome.value, BaseException):
+        raise outcome.value
+    labels = _normalize_labels(_hit_labels(outcome.value, c.assignment), c)
+    detail = {"reason": outcome.value["reason"]} if plan.with_reason else {}
+    return Classification(label=labels[0], labels=labels, source="llm",
+                          detail=detail)
+
+
+def _sc_classification(plan: _ClassifyPlan,
+                       outcomes: Sequence[_ClassifySampleOutcome],
+                       c: "ClassifyConfig") -> Classification:
+    """按样本输入序归并自洽投票，完成序不参与语义。
+
+    @param plan 记录级冻结计划
+    @param outcomes 按 sample ordinal 排列的 outcome
+    @param c 分类配置
+    @return 投票后的分类产物
+    @raises SchemaViolation 所有样本均弃权
+    @raises Exception 首个样本序普通记录级异常
+    """
+    sample_sets: list[tuple[str, ...]] = []
+    reasons: list[str] = []
+    last_violation: SchemaViolation | None = None
+    for outcome in outcomes:
+        value = outcome.value
+        if isinstance(value, SchemaViolation):
+            last_violation = value
+        elif isinstance(value, BaseException):
+            raise value
+        else:
+            sample_sets.append(_normalize_labels(_hit_labels(value, c.assignment), c))
+            if plan.with_reason:
+                reasons.append(value["reason"])
+    if not sample_sets:
+        raise last_violation if last_violation is not None else SchemaViolation(
+            ["self-consistency: all samples failed"], "")
+    names = [spec.name for spec in c.classes]
+    final, sc_detail = _vote_labels(sample_sets, c, names)
+    detail = {"sc": sc_detail}
+    if plan.with_reason:
+        detail["reason"] = reasons[0]
+    return Classification(label=final[0], labels=final, source="llm", detail=detail)
+
+
+def _reduce_classification(plan: _ClassifyPlan,
+                           outcomes: Sequence[_ClassifySampleOutcome],
+                           c: "ClassifyConfig") -> Classification:
+    """按 sample ordinal 把叶结果归并为一条记录级判决。
+
+    @param plan 记录级冻结计划
+    @param outcomes 与计划样本一一对应的输入序结果
+    @param c 分类配置
+    @return 分类产物
+    """
+    if c.self_consistency == 0:
+        return _single_classification(plan, outcomes[0], c)
+    return _sc_classification(plan, outcomes, c)
+
+
 async def classify_record(record: Record, ctx: "RunContext") -> Classification:
-    """单条记录的完整判决路径，含自洽投票与归一；on_error 策略由 stage 层施加。
+    """单条公开调用面：复用 planner/leaf/reducer，样本按序执行。
 
     @param record 待判决记录（单条或序列）
     @param ctx 本次（批次, 阶段）运行上下文
@@ -635,23 +733,11 @@ async def classify_record(record: Record, ctx: "RunContext") -> Classification:
     @raises ProviderFatalError provider 不可重试错误
     @raises ContextOverflowError 最小单元不可装填（phase="precheck"，V10）
     """
-    cfg = ctx.cfg
-    c = cfg.classify
-    with_reason = _reason_requested(cfg)
-    names = [spec.name for spec in c.classes]
-    schema = classification_schema(names, c.assignment, c.max_labels, with_reason)
-    prompt = _classify_prompt(record, ctx, schema, with_reason)
-
-    if c.self_consistency == 0:
-        return await _classify_single(record, ctx, prompt, schema, with_reason)
-
-    sample_sets, reasons = await _collect_sc_samples(record, ctx, prompt, schema)
-    final, sc_detail = _vote_labels(sample_sets, c, names)
-    detail: dict = {}
-    if with_reason:
-        detail["reason"] = reasons[0]              # 首个有效样本（gather 保序）
-    detail["sc"] = sc_detail
-    return Classification(label=final[0], labels=final, source="llm", detail=detail)
+    plan = _plan_classification(record, ctx, 0)
+    outcomes = []
+    for _sample_ordinal in range(plan.sample_count):
+        outcomes.append(await _run_classify_sample(plan, ctx))
+    return _reduce_classification(plan, outcomes, ctx.cfg.classify)
 
 
 # ── v1.12 帧级批量判决（SPEC-frame-annotation §3.2） ─────────────────────────
@@ -837,7 +923,7 @@ async def _judge_frame_window(window_members: Sequence[Record],
 
 
 async def _judge_frames_degrading(
-        judge, span: tuple[int, int], ctx: "RunContext", *,
+        judge, span: tuple[int, int], stats: _FrameRunStats, *,
         level: int = 0) -> list[tuple[tuple[int, int], list[str | None]]]:
     """V20 对半降级重试的帧级镜像（segment._judge_span_degrading 同形，零重叠版）。
 
@@ -850,7 +936,7 @@ async def _judge_frames_degrading(
 
     @param judge 单窗判决协程工厂（接受跨度，返回按位标签表）
     @param span 本级的窗口跨度 [start, end)
-    @param ctx 本次（批次, 阶段）运行上下文
+    @param stats 当前叶任务的局部调用统计
     @param level 当前对半级数（内部递归用，外部恒取默认 0）
     @return 叶结果列表 [(跨度, 标签表)]
     @raises ContextOverflowError 不可再降级时原样上抛
@@ -862,11 +948,11 @@ async def _judge_frames_degrading(
         if (exc.phase != "reactive" or end - start < 2
                 or level >= _MAX_FRAME_DEGRADE_LEVELS):
             raise
-        ctx.metrics.count(_COUNTER_DEGRADE_RETRIES)
+        stats.degrade_retries += 1
         mid = (start + end) // 2
-        results = await _judge_frames_degrading(judge, (start, mid), ctx,
+        results = await _judge_frames_degrading(judge, (start, mid), stats,
                                                 level=level + 1)
-        results.extend(await _judge_frames_degrading(judge, (mid, end), ctx,
+        results.extend(await _judge_frames_degrading(judge, (mid, end), stats,
                                                      level=level + 1))
         return results
 
@@ -967,82 +1053,98 @@ async def classify_frames(members: Sequence[Record],
     @param ctx 本次（批次, 阶段）运行上下文
     @return 成员判决表 {member.id: Classification}
     """
-    result, _windows, _fallback = await _classify_frames(members, ctx)
+    plan = _plan_frame_episode(members, ctx, members[0].id, 0)
+    outcomes = []
+    for span in plan.spans:
+        outcomes.append(await _run_frame_plan(plan, span, ctx))
+    result, _windows, _fallback = _reduce_frame_plan(plan, outcomes, ctx)
     return result
 
 
-async def _run_frame_window(judge, span: tuple[int, int], ctx: "RunContext",
-                            budget_on: bool):
-    """执行一个原始窗口（含预算态的对半降级重试），窗口失败永不外溢。
+def _plan_frame_episode(members: Sequence[Record], ctx: "RunContext",
+                        episode_id: str, item_ordinal: int) -> _FrameEpisodePlan:
+    """同步冻结一条 episode 的摘要、预算态与原始窗口。
 
-    降级重试是预算态反应（segment degrade=budget_on 同款）；失败以**原始窗**为
-    兜底单元——降级树任一终局失败即整窗 fallback（"该窗全部成员"语义）。
-
-    @param judge 单窗判决协程工厂（接受跨度，返回按位标签表）
-    @param span 原始窗口跨度 [start, end)
-    @param ctx 本次（批次, 阶段）运行上下文
-    @param budget_on 预算是否开启（决定是否走对半降级重试）
-    @return 叶结果列表 [(跨度, 标签表 | 异常)]
+    @param members episode 成员序列
+    @param ctx 本次运行上下文
+    @param episode_id stage 事件归属 id
+    @param item_ordinal 批内输入序
+    @return 帧窗口计划
     """
+    frozen_members = tuple(members)
+    digests = tuple(frame_digest(member, ctx.cfg.segment.digest_max_chars)
+                    for member in frozen_members)
+    prof = ctx.cfg.llm_profiles.get(ctx.cfg.frame_classify.llm)
+    budget_on = prof is not None and prof.context_window > 0
+    spans = (_frame_windows(frozen_members, digests, ctx.cfg, ctx) if budget_on
+             else [(0, len(frozen_members))])
+    return _FrameEpisodePlan(item_ordinal, episode_id, frozen_members, digests,
+                             tuple(spans), budget_on)
+
+
+async def _run_frame_plan(plan: _FrameEpisodePlan, span: tuple[int, int],
+                          ctx: "RunContext") -> _FrameWindowOutcome:
+    """执行一个纯原始帧窗口叶任务，普通失败收敛为 outcome。
+
+    @param plan episode 冻结计划
+    @param span 原始窗口跨度
+    @param ctx 本次运行上下文
+    @return 窗口叶结果与局部调用统计
+    """
+    stats = _FrameRunStats()
+
+    async def judge(current: tuple[int, int]) -> list[str | None]:
+        """执行降级树中的一次局部窗调用并累计叶内统计。
+
+        @param current 当前局部窗口跨度
+        @return 与局部窗口成员序对齐的标签表
+        """
+        stats.calls += 1
+        start, end = current
+        return await _judge_frame_window(plan.members[start:end],
+                                         plan.digests[start:end], ctx,
+                                         (plan.episode_id,))
+
     try:
-        if budget_on:
-            return await _judge_frames_degrading(judge, span, ctx)
-        return [(span, await judge(span))]
+        if plan.budget_on:
+            leaves = await _judge_frames_degrading(judge, span, stats)
+        else:
+            leaves = [(span, await judge(span))]
     except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
         raise
-    except Exception as exc:  # noqa: BLE001 — 窗口失败永不外溢为 episode 失败
-        # 该窗无 rejects 面（整窗落 fallback_class），故此处是唯一的人可见错误
-        # 出口：只留 id 与异常类型，绝不携带数据内容（annotate 帧标注失败同款）。
+    except Exception as exc:  # noqa: BLE001 — 普通窗口失败由 reducer 兜底
         _logger.warning("frame classification window failed: span=%d-%d exc=%s",
                         span[0], span[1], type(exc).__name__,
                         extra={"stage": "classify", "batch": ctx.batch_no})
-        return [(span, exc)]
+        leaves = [(span, exc)]
+    return _FrameWindowOutcome(tuple(leaves), stats.calls, stats.degrade_retries)
 
 
-async def _classify_frames(members: Sequence[Record], ctx: "RunContext", *,
-                           episode_id: str | None = None,
-                           ) -> tuple[dict[str, Classification], int, int]:
-    """classify_frames 与 stage 帧 pass 背后的共享实现。
+def _reduce_frame_plan(plan: _FrameEpisodePlan,
+                       outcomes: Sequence[_FrameWindowOutcome],
+                       ctx: "RunContext") -> tuple[dict[str, Classification], int, int]:
+    """按 window ordinal 归并一条 episode 的纯叶结果。
 
-    keyword-only 尾参承载事件归属所需的 episode_id（缺省取首成员 id：公开面 /
-    verify 回收路径的归属），是冻结公开签名之外的扩展位（segment._judge_window
-    kwargs 同款手法）。
-
-    @param members 待判决的成员帧记录序列（按帧序）
-    @param ctx 本次（批次, 阶段）运行上下文
-    @param episode_id 事件归属的 episode id；None 取首成员 id
-    @return (成员判决表, 实际派发窗口数, fallback 帧数)
+    @param plan episode 冻结计划
+    @param outcomes 与原始窗口一一对应的输入序 outcome
+    @param ctx 本次运行上下文
+    @return (成员判决表, 实际调用数, fallback 帧数)
     """
-    cfg = ctx.cfg
-    fc = cfg.frame_classify
-    digests = [frame_digest(member, cfg.segment.digest_max_chars)
-               for member in members]
-    ids = (episode_id,) if episode_id is not None else (members[0].id,)
-    prof = cfg.llm_profiles.get(fc.llm)
-    budget_on = prof is not None and prof.context_window > 0
-    spans = (_frame_windows(members, digests, cfg, ctx) if budget_on
-             else [(0, len(members))])
-    dispatched = 0
-
-    async def judge(span: tuple[int, int]) -> list[str | None]:
-        """派发一次窗口判决并计 frame_classify.calls。
-
-        @param span 窗口跨度 [start, end)
-        @return 与窗内成员对齐的标签表（缺项为 None）
-        """
-        nonlocal dispatched
-        dispatched += 1
-        ctx.metrics.count(_COUNTER_FRAME_CALLS)
-        return await _judge_frame_window(members[span[0]:span[1]],
-                                         digests[span[0]:span[1]], ctx, ids)
-
-    outcomes = await asyncio.gather(
-        *(_run_frame_window(judge, span, ctx, budget_on) for span in spans))
-    aligned, detail = _fold_window_outcomes(outcomes, ctx)
-    result, fallback = _assemble_frame_results(members, fc, aligned, detail)
+    calls = sum(outcome.calls for outcome in outcomes)
+    degrade_retries = sum(outcome.degrade_retries for outcome in outcomes)
+    if calls:
+        ctx.metrics.count(_COUNTER_FRAME_CALLS, calls)
+    if degrade_retries:
+        ctx.metrics.count(_COUNTER_DEGRADE_RETRIES, degrade_retries)
+    aligned, detail = _fold_window_outcomes(
+        [outcome.leaves for outcome in outcomes], ctx,
+    )
+    result, fallback = _assemble_frame_results(
+        plan.members, ctx.cfg.frame_classify, aligned, detail,
+    )
     if fallback:
         ctx.metrics.count(_COUNTER_FRAME_FALLBACK, fallback)
-    return result, dispatched, fallback
+    return result, calls, fallback
 
 
 # ── stage ────────────────────────────────────────────────────────────────────
@@ -1071,30 +1173,113 @@ class ClassifyStage:
         @param ctx 本次（批次, 阶段）运行上下文
         @return 传入的同一列表对象（契约 ②a）
         """
-        # 幂等：classification 非 None（例如 generate 回流时的 "inherited" 记录）
-        # 直接跳过——零额外调用（spec 3.13.4）。
-        # v1.12 双门：classify.enabled=false ∧ frame.classify.enabled=true 时
-        # 组链经 factory 或门仍含本 stage，序列级判决在此按开关静默跳过。
         todo: list[PipelineItem] = []
         if self.cfg.classify.enabled:
             todo = [item for item in batch
                     if item.status == "active" and item.classification is None]
-        if todo:
-            await asyncio.gather(*(self._classify_item(item, ctx) for item in todo))
-        if self.cfg.frame_classify.enabled:
-            # v1.12 帧级批量判决 pass（SPEC-frame-annotation §3.2）：序列级判决
-            # 写完之后、multi 扇出之前执行——克隆构造时按引用共享已就位的
-            # member_classifications（扇出共享裁决）。
-            frame_todo = self._frame_gate(batch, ctx)
-            if frame_todo:
-                await asyncio.gather(*(self._frame_pass(item, ctx)
-                                       for item in frame_todo))
+        plans = self._plan_sequence_wave(todo, ctx)
+        sample_outcomes = await self._run_sequence_wave(plans, ctx)
+        self._reduce_sequence_wave(todo, plans, sample_outcomes, ctx)
+
+        frame_plans = self._plan_frame_wave(batch, ctx)
+        frame_outcomes = await self._run_frame_wave(frame_plans, ctx)
+        self._reduce_frame_wave(frame_plans, frame_outcomes, ctx)
         if todo and self.cfg.classify.assignment == "multi":
-            # 确定性扇出：gather **之后**的一次同步遍历（绝不在协程内做），
-            # 按批内位置序 → 标签声明序（spec 3.13.4 multi 扇出）。
             self._pin_shared_annotations(todo)
             self._fan_out(batch, todo)
-        return batch                               # 传入的同一列表对象（契约 ②a）
+        return batch
+
+    def _plan_sequence_wave(self, todo: list[PipelineItem],
+                            ctx: "RunContext") -> list[_ClassifyPlan | BaseException]:
+        """按 item ordinal 同步冻结第一波样本计划。
+
+        @param todo 待判决信封输入序
+        @param ctx 本次运行上下文
+        @return 与 todo 对齐的计划或同步计划异常
+        """
+        plans: list[_ClassifyPlan | BaseException] = []
+        for item_ordinal, item in enumerate(todo):
+            try:
+                plans.append(_plan_classification(item.record, ctx, item_ordinal))
+            except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception as exc:  # noqa: BLE001 — reducer 施加记录级策略
+                _logger.debug("classification planning failed: item=%d exc=%s",
+                              item_ordinal, type(exc).__name__,
+                              extra={"stage": self.name, "batch": ctx.batch_no})
+                plans.append(exc)
+        return plans
+
+    async def _run_sequence_wave(
+            self, plans: Sequence[_ClassifyPlan | BaseException],
+            ctx: "RunContext") -> tuple[_ClassifySampleOutcome, ...]:
+        """经共享 TaskExecutor 执行全批第一波分类样本。
+
+        @param plans 与待判决信封对齐的计划表
+        @param ctx 本次运行上下文
+        @return 按 item/sample ordinal 排列的纯 outcome
+        """
+        specs: list[TaskSpec[_ClassifySampleOutcome]] = []
+        for plan in plans:
+            if isinstance(plan, BaseException):
+                continue
+            for sample_ordinal in range(plan.sample_count):
+                specs.append(TaskSpec(
+                    task_id=(f"{ctx.task_namespace}:classify:sample:"
+                             f"{plan.item_ordinal}:{sample_ordinal}"),
+                    declaration_key=(ctx.batch_no, 3, 0, plan.item_ordinal,
+                                     sample_ordinal),
+                    stage=self.name,
+                    resource_key=("llm", self.cfg.classify.llm),
+                    operation=lambda plan=plan: _run_classify_sample(plan, ctx),
+                ))
+        return await ctx.tasks.run_group(TaskGroupRequest(tuple(specs)))
+
+    def _reduce_sequence_wave(
+            self, todo: list[PipelineItem],
+            plans: Sequence[_ClassifyPlan | BaseException],
+            outcomes: Sequence[_ClassifySampleOutcome], ctx: "RunContext") -> None:
+        """按 item/sample ordinal 提交分类、失败、计数与事件。
+
+        @param todo 待判决信封输入序
+        @param plans 与 todo 对齐的计划或同步计划异常
+        @param outcomes 扁平输入序样本结果
+        @param ctx 本次运行上下文
+        @return 无
+        """
+        offset = 0
+        for item, plan in zip(todo, plans):
+            if isinstance(plan, BaseException):
+                self._settle_classification(item, plan, (), ctx)
+                continue
+            selected = outcomes[offset:offset + plan.sample_count]
+            offset += plan.sample_count
+            self._settle_classification(item, plan, selected, ctx)
+
+    def _settle_classification(
+            self, item: PipelineItem, plan: _ClassifyPlan | BaseException,
+            outcomes: Sequence[_ClassifySampleOutcome], ctx: "RunContext") -> None:
+        """同步提交一条记录的分类或既有失败策略。
+
+        @param item 目标信封
+        @param plan 冻结计划或同步计划异常
+        @param outcomes 该记录的输入序样本结果
+        @param ctx 本次运行上下文
+        @return 无
+        """
+        try:
+            if isinstance(plan, BaseException):
+                raise plan
+            classification = _reduce_classification(plan, outcomes,
+                                                     self.cfg.classify)
+        except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as exc:  # noqa: BLE001 — 记录级隔离由 reducer 落盘
+            classification = self._dispose_failure(item, ctx, exc)
+            if classification is None:
+                return
+        item.classification = classification
+        self._register(item, ctx, classification)
 
     def _pin_shared_annotations(self, todo: list[PipelineItem]) -> None:
         """扇出共享裁决的时序补丁（终审缺陷修复）：帧标注 pass 在 M5 才运行，
@@ -1116,8 +1301,72 @@ class ClassifyStage:
                     and getattr(item, "segment_degraded", None) is None):
                 item.member_annotations = {}
 
+    def _plan_frame_wave(
+            self, batch: list[PipelineItem],
+            ctx: "RunContext") -> list[tuple[PipelineItem, _FrameEpisodePlan]]:
+        """在 sequence reducer 后按稳定分类冻结第二波 episode 窗口。
+
+        @param batch 已完成序列级提交的批次
+        @param ctx 本次运行上下文
+        @return 首标签信封与对应帧计划
+        """
+        if not self.cfg.frame_classify.enabled:
+            return []
+        return [
+            (item, _plan_frame_episode(item.record.members, ctx,
+                                       item.record.id, item_ordinal))
+            for item_ordinal, item in self._frame_gate(batch, ctx)
+        ]
+
+    async def _run_frame_wave(
+            self, plans: Sequence[tuple[PipelineItem, _FrameEpisodePlan]],
+            ctx: "RunContext") -> tuple[_FrameWindowOutcome, ...]:
+        """经共享 TaskExecutor 执行全批第二波原始帧窗口。
+
+        @param plans 输入序 episode 计划
+        @param ctx 本次运行上下文
+        @return 按 episode/window ordinal 排列的纯窗口 outcome
+        """
+        specs: list[TaskSpec[_FrameWindowOutcome]] = []
+        for _item, plan in plans:
+            for window_ordinal, span in enumerate(plan.spans):
+                specs.append(TaskSpec(
+                    task_id=(f"{ctx.task_namespace}:classify:frame:"
+                             f"{plan.item_ordinal}:{window_ordinal}"),
+                    declaration_key=(ctx.batch_no, 3, 1, plan.item_ordinal,
+                                     window_ordinal),
+                    stage=self.name,
+                    resource_key=("llm", self.cfg.frame_classify.llm),
+                    operation=(lambda plan=plan, span=span:
+                               _run_frame_plan(plan, span, ctx)),
+                ))
+        return await ctx.tasks.run_group(TaskGroupRequest(tuple(specs)))
+
+    def _reduce_frame_wave(
+            self, plans: Sequence[tuple[PipelineItem, _FrameEpisodePlan]],
+            outcomes: Sequence[_FrameWindowOutcome], ctx: "RunContext") -> None:
+        """按 episode/window ordinal 提交 member map、计数与事件。
+
+        @param plans 输入序 episode 计划
+        @param outcomes 扁平输入序窗口结果
+        @param ctx 本次运行上下文
+        @return 无
+        """
+        offset = 0
+        for item, plan in plans:
+            selected = outcomes[offset:offset + len(plan.spans)]
+            offset += len(plan.spans)
+            result, windows, fallback = _reduce_frame_plan(plan, selected, ctx)
+            item.member_classifications = result
+            ctx.metrics.event(
+                _EV_FRAME, stage=self.name, batch_no=ctx.batch_no,
+                record_ids=(plan.episode_id,),
+                payload={"members": len(plan.members), "windows": windows,
+                         "fallback": fallback},
+            )
+
     def _frame_gate(self, batch: list[PipelineItem],
-                    ctx: "RunContext") -> list[PipelineItem]:
+                    ctx: "RunContext") -> list[tuple[int, PipelineItem]]:
         """帧级 pass 执行门（SPEC §3.2）：active ∧ kind=="sequence" ∧ 首标签信封
         （克隆判据 classification.label != classification.labels[0]，verify S8
         同款；classification 为 None 视同非克隆——克隆恒携 classification）∧
@@ -1127,10 +1376,10 @@ class ClassifyStage:
 
         @param batch 本批信封列表
         @param ctx 本次（批次, 阶段）运行上下文
-        @return 需要执行帧级 pass 的信封列表
+        @return (批内位置, 信封) 输入序列表
         """
-        todo: list[PipelineItem] = []
-        for item in batch:
+        todo: list[tuple[int, PipelineItem]] = []
+        for item_ordinal, item in enumerate(batch):
             if item.status != "active" or item.record.kind != "sequence":
                 continue
             cls = item.classification
@@ -1141,53 +1390,8 @@ class ClassifyStage:
             if getattr(item, "segment_degraded", None) is not None:
                 ctx.metrics.count(_COUNTER_FRAME_SKIPPED_DEGRADED)
                 continue
-            todo.append(item)
+            todo.append((item_ordinal, item))
         return todo
-
-    async def _frame_pass(self, item: PipelineItem, ctx: "RunContext") -> None:
-        """一 episode 一次帧级批量判决：窗口失败已在 _classify_frames 内落
-        fallback_class，永不使 episode failed；产物挂 item.member_classifications；
-        事件 classify.frame 每 episode 一发（ids=(episode_id,)，payload 仅
-        members/windows/fallback 三个计数——不携带任何数据内容，trace 载荷纪律）。
-
-        @param item 目标序列信封
-        @param ctx 本次（批次, 阶段）运行上下文
-        @return 无（产物写入 item.member_classifications）
-        """
-        record = item.record
-        result, windows, fallback = await _classify_frames(
-            record.members, ctx, episode_id=record.id)
-        item.member_classifications = result
-        ctx.metrics.event(_EV_FRAME, stage=self.name, batch_no=ctx.batch_no,
-                          record_ids=(record.id,),
-                          payload={"members": len(record.members),
-                                   "windows": windows, "fallback": fallback})
-
-    async def _classify_item(self, item: PipelineItem, ctx: "RunContext") -> None:
-        """对单条信封执行序列级判决并落产物；失败按 on_error 策略处置。
-
-        @param item 目标信封（active 且 classification 缺位）
-        @param ctx 本次（批次, 阶段）运行上下文
-        @return 无（判决写入 item.classification，失败落 item.errors）
-        """
-        record = item.record
-        try:
-            classification = await classify_record(record, ctx)
-        except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
-            raise
-        except Exception as exc:  # noqa: BLE001 — 记录级隔离是绝对的
-            # 权威错误面是 item.errors → rejects 与 error trace 事件（由
-            # _dispose_failure 内部发出）；stderr 只承载聚合报告，故此处以 debug
-            # 级留一条英文诊断（_collect.py 同款取舍）——既不改可见输出，也不
-            # 携带任何数据内容。
-            _logger.debug("classification failed: record=%s exc=%s", record.id,
-                          type(exc).__name__,
-                          extra={"stage": self.name, "batch": ctx.batch_no})
-            classification = self._dispose_failure(item, ctx, exc)
-            if classification is None:
-                return
-        item.classification = classification
-        self._register(item, ctx, classification)
 
     def _dispose_failure(self, item: PipelineItem, ctx: "RunContext",
                          exc: BaseException) -> Classification | None:

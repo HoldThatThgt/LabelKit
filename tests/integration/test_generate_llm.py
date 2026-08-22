@@ -1,87 +1,21 @@
-"""M6 integration test against the REAL z.ai endpoint (glm-5.2). No mock LLMs.
-
-generate_only mode with 2 seed_examples; one small generation call; asserts at least one
-novel sample comes back with generator provenance set and non-empty text.
-
-M8/M9 may not be implemented yet by their owners: when their modules are missing, this
-file registers CONTRACT-VERBATIM stand-ins (the frozen §7.7/§7.8/§10.7 dataclasses and
-samples_schema — pure data containers, not mocks) and drives the real endpoint through a
-minimal Anthropic-protocol engine implementing ``complete_validated``.
-"""
-import json
+"""M6 generate_only 通过真实 z.ai endpoint 验证 seed pool 与 v1.19 TaskExecutor 契约。"""
+import asyncio
 import os
 import random
-import sys
-import types
-from dataclasses import dataclass
 
 import httpx
 import json_repair
 import pytest
 from jsonschema import Draft202012Validator
 
+from labelkit.common.contracts.stage import RunContext
 from labelkit.common.errors import SchemaViolation
 from labelkit.common.contracts.types import Usage
+from labelkit.operators.generate import GenerateStage
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 
 pytestmark = pytest.mark.integration
-
-
-# ── contract-verbatim stand-ins for not-yet-landed service modules ─────────
-
-def _ensure_llm_client_module():
-    try:
-        import labelkit.common.runtime.llm_client  # noqa: F401
-        return
-    except ImportError:
-        pass
-    mod = types.ModuleType("labelkit.common.runtime.llm_client")
-
-    @dataclass(frozen=True)
-    class Part:
-        kind: str
-        text: str | None = None
-        image: object | None = None
-
-    @dataclass(frozen=True)
-    class Message:
-        role: str
-        parts: tuple = ()
-
-    @dataclass(frozen=True)
-    class PromptBundle:
-        messages: tuple = ()
-        temperature: float | None = None
-
-    mod.Part, mod.Message, mod.PromptBundle = Part, Message, PromptBundle
-    sys.modules["labelkit.common.runtime.llm_client"] = mod
-
-
-def _ensure_schema_engine_module():
-    try:
-        import labelkit.common.runtime.schema_engine  # noqa: F401
-        return
-    except ImportError:
-        pass
-    mod = types.ModuleType("labelkit.common.runtime.schema_engine")
-
-    def samples_schema(num_per_call):                  # exact JSON per CONTRACTS §10.7
-        return {"type": "object",
-                "properties": {"samples": {"type": "array", "items": {"type": "string"},
-                                           "minItems": num_per_call,
-                                           "maxItems": num_per_call}},
-                "required": ["samples"], "additionalProperties": False}
-
-    mod.samples_schema = samples_schema
-    sys.modules["labelkit.common.runtime.schema_engine"] = mod
-
-
-_ensure_llm_client_module()
-_ensure_schema_engine_module()
-
-from labelkit.operators.generate import GenerateStage  # noqa: E402  (needs the modules above)
-from labelkit.common.contracts.stage import RunContext  # noqa: E402
 
 
 # ── minimal REAL engine: Anthropic messages protocol against z.ai ──────────
@@ -168,6 +102,21 @@ class Recorder:
                             "record_ids": tuple(record_ids), "payload": payload or {}})
 
 
+class _TaskRunner:
+    """真实 operator integration 使用的输入序 TaskExecutor。"""
+
+    async def run_group(self, request):
+        results = [None] * len(request.tasks)
+
+        async def run_one(index, spec):
+            results[index] = await spec.operation()
+
+        async with asyncio.TaskGroup() as group:
+            for index, spec in enumerate(request.tasks):
+                group.create_task(run_one(index, spec))
+        return tuple(results)
+
+
 SEEDS = ("帮我写一条请假条，明天上午要去医院", "写一份周报模板")
 
 
@@ -213,8 +162,12 @@ async def test_generate_only_seed_pool_real_llm():
     cfg = _mk_cfg()
     engine = RealSamplesEngine(os.environ[ZAI_KEY_ENV])
     metrics = Recorder()
-    ctx = RunContext(cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
-                     rng=random.Random(f"{cfg.run.seed}:0:generate"), batch_no=0)
+    ctx = RunContext(
+        cfg=cfg, llm=None, schema_engine=engine,
+        rng=random.Random(f"{cfg.run.seed}:0:generate"), batch_no=0,
+        metrics=metrics, tasks=_TaskRunner(),
+        task_namespace="integration:batch:0:stage:generate",
+    )
     records = await GenerateStage(cfg).generate_all(ctx)
 
     assert len(records) >= 1, "real endpoint produced no novel sample"

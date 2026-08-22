@@ -20,9 +20,8 @@ frames 9-13; frame 14 the trailing launcher screen) — the four §3.6 judgment 
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
-import json
-import os
 import random
 from pathlib import Path
 
@@ -50,9 +49,8 @@ from labelkit.common.config.model import (
     VerifyConfig,
 )
 from labelkit.operators.ingest import _parse_ui_tree
-from labelkit.common.runtime.credentials import resolve_credentials
-from labelkit.common.runtime.llm_client import LLMClient
-from labelkit.common.runtime.schema_engine import SchemaEngine
+from labelkit.common.inference.credentials import resolve_credentials
+from labelkit.common.inference.schema_engine import SchemaEngine
 from labelkit.operators.stitch import (
     ThreadCard,
     judge_stitch,
@@ -64,6 +62,7 @@ from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import ImageRef, Record, RecordRef
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
+from tests.llm_client_helpers import make_llm_client as _client
 
 pytestmark = pytest.mark.integration
 
@@ -143,13 +142,37 @@ class _RecordingMetrics:
         self.events.append((ev, stage, batch_no, record_ids, payload or {}))
 
 
+class _TaskRunner:
+    """Operator integration 的输入序 TaskExecutor。"""
+
+    async def run_group(self, request):
+        results = [None] * len(request.tasks)
+
+        async def run_one(index, spec):
+            try:
+                results[index] = await spec.operation()
+            except BaseException as exc:
+                results[index] = exc
+
+        async with asyncio.TaskGroup() as group:
+            for index, spec in enumerate(request.tasks):
+                group.create_task(run_one(index, spec))
+        failure = next((result for result in results
+                        if isinstance(result, BaseException)), None)
+        if failure is not None:
+            raise failure
+        return tuple(results)
+
+
 def make_ctx(cfg) -> RunContext:
     metrics = _RecordingMetrics()
-    llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles,
+    llm = _client(cfg.llm_profiles, cfg.embedding_profiles,
                        resolve_credentials(cfg), metrics=None)
     engine = SchemaEngine(dict(cfg.user_schema), llm, cfg.output, metrics=None)
-    return RunContext(cfg=cfg, llm=llm, schema_engine=engine, metrics=metrics,
-                      rng=random.Random("42:1:stitch"), batch_no=1)
+    return RunContext(cfg=cfg, llm=llm, schema_engine=engine,
+                      rng=random.Random("42:1:stitch"), batch_no=1,
+                      metrics=metrics, tasks=_TaskRunner(),
+                      task_namespace="integration:stitch")
 
 
 # ── real fixture loading (examples/stream/data/s1-serial-noise, M2 id rules) ─
@@ -205,7 +228,7 @@ async def test_clear_resume_names_the_open_thread():
     cand_card = render_candidate_card("episode", candidate, (5, 7), cfg)
 
     outcome = await judge_stitch(cards, cand_card, ctx,
-                                 record_ids=(candidate[0].id,))  # ONE real call
+                                 (candidate[0].id,), (0, 0, 0))
 
     assert outcome is not None
     assert outcome["verdict"] in VERDICT_VOCAB
@@ -232,7 +255,7 @@ async def test_clear_new_task_opens_thread():
     cand_card = render_candidate_card("episode", candidate, (8, 10), cfg)
 
     outcome = await judge_stitch(cards, cand_card, ctx,
-                                 record_ids=(candidate[0].id,))  # ONE real call
+                                 (candidate[0].id,), (0, 0, 0))
 
     assert outcome is not None
     assert outcome["verdict"] == "new", outcome
@@ -252,7 +275,7 @@ async def test_ambiguous_candidate_refused_conservatively():
     cand_card = render_candidate_card("rescue", candidate, (4, 4), cfg)
 
     outcome = await judge_stitch(cards, cand_card, ctx,
-                                 record_ids=(candidate[0].id,))  # ONE real call
+                                 (candidate[0].id,), (0, 0, 0))
 
     assert outcome is not None
     # Conservative bias (T9/[N-6][N-7]): an unrelated single-frame insert must
@@ -274,9 +297,9 @@ async def test_candidate_position_perturbation_keeps_target():
     order2 = [taxi_thread_card(cfg, candidate[0], index=1),
               food_thread_card(cfg, candidate[0], index=2)]
     outcome1 = await judge_stitch(order1, cand_card, ctx,
-                                  record_ids=(candidate[0].id,))
+                                  (candidate[0].id,), (0, 0, 0))
     outcome2 = await judge_stitch(order2, cand_card, ctx,
-                                  record_ids=(candidate[0].id,))
+                                  (candidate[0].id,), (0, 0, 1))
 
     assert outcome1 is not None and outcome2 is not None
     assert outcome1["verdict"] == "resume", outcome1

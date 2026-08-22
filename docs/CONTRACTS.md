@@ -1,16 +1,18 @@
 # LabelKit — Cross-Module Interface Contract (CONTRACTS.md)
 
 **Status: FROZEN.** This document is the single interface contract for parallel implementation of
-M1–M16 + CLI by independent engineers. It is derived from the design spec v1.4 base through the
-v1.18 sequence-generation redesign (`spec/*.md` and
-`docs/dev/SPEC-sequence-generation-redesign.md`), which
-remains the authority for *algorithms and behavior*; this document is the authority for *names,
-signatures, types, defaults, file formats, and prompt text*. Where the spec left a signature or
-format implicit, the decision is frozen here and tagged **[FROZEN HERE]** (all such decisions are
-also listed in §12). Any deviation requires editing this file first.
+M1–M17 + CLI by independent engineers. It is derived from the design spec v1.4 base through the
+v1.18 sequence-generation redesign and the v1.19 execution-runtime revision (`spec/*.md`,
+`docs/dev/SPEC-sequence-generation-redesign.md` and `docs/dev/SPEC-execution-runtime.md`). Those
+documents remain the authority for *algorithms and behavior*; this document is the authority for
+*names, signatures, types, defaults, file formats, and prompt text*. Where a spec left a signature
+or format implicit, the decision is frozen here and tagged **[FROZEN HERE]** (all such decisions
+are also listed in §12). Any deviation requires editing this file first.
 
-The v1.18 source is commit `ce6b1f2`; the frozen specification SHA-256 is
-`f9cc60754cdcbdbe92eac37835e7f7db7a7cdd7ea7310a9a26bfe490e1685f97`.
+The v1.18 sequence baseline is commit `ce6b1f2`; its frozen specification SHA-256 is
+`f9cc60754cdcbdbe92eac37835e7f7db7a7cdd7ea7310a9a26bfe490e1685f97`. The v1.19 runtime contract
+is the current `docs/dev/SPEC-execution-runtime.md`; implementation and this document must change
+together.
 
 Ground rules for every implementer:
 
@@ -29,18 +31,16 @@ Ground rules for every implementer:
   (`thread_seam` step text, defect-table `detail` strings, packaged rubric criteria), stays
   Chinese verbatim.
 - Do not rename any field, key, event, or error code defined here. Tests assert exact strings.
-- Import discipline (no cycles): production imports use only the layered package paths below;
-  the former flat modules and `labelkit.config` package do not exist.
-  `labelkit.common.contracts.types` and `labelkit.common.errors` import nothing from `labelkit`;
-  `labelkit.common.config.model` imports nothing from `labelkit` except
-  shared contract types if needed; `labelkit.common.runtime.llm_client` imports only common-layer
-  contracts, errors, config, observability, and — v1.11 — the sibling
-  `labelkit.common.runtime.budget` (which itself references llm_client's `PromptBundle` under
-  `typing.TYPE_CHECKING` only — the stage.py convention, so no cycle);
-  `labelkit.common.runtime.schema_engine` imports the
-  common runtime LLM client plus common errors/observability; `labelkit.common.contracts.stage`
-  imports runtime/config/observability types under `typing.TYPE_CHECKING` only. Common never imports
-  operators or orchestration. `labelkit.operators.generation` imports only common and its own
+- Import discipline (no cycles): production imports use only the layered package paths below.
+  `labelkit.common.contracts.types` and `labelkit.common.errors` import
+  nothing from `labelkit`; `labelkit.common.config.model` imports nothing from `labelkit` except
+  shared contract types if needed. `labelkit.common.inference.llm_client` imports only common-layer
+  contracts, errors, config, observability and the sibling `labelkit.common.inference.budget`;
+  `labelkit.common.inference.schema_engine` imports the inference LLM client plus common
+  errors/observability. `labelkit.common.contracts.stage` imports inference/config/observability and
+  execution protocol types under `typing.TYPE_CHECKING` only. Common never imports runtime,
+  operators or orchestration. Runtime imports common only. `labelkit.operators.generation` imports
+  only common and its own
   sibling generation modules; it never imports orchestration. Operator modules
   import common and declared stdlib/third-party
   dependencies, never orchestration and **never each other** — with the sanctioned lazy-import
@@ -51,9 +51,10 @@ Ground rules for every implementer:
   `labelkit.operators.classify.classify_frames` (the fourth sanctioned operator-to-operator
   import — verify's member-reclaim frame-product re-run, §7.13/§7.6; the sibling reclaim
   surface `annotate.annotate_member` is NOT a fifth direction — it joins the §7.4 annotate
-  repair-face family on the first leg). Orchestration may import common and
-  operators. CLI imports orchestration's public entry points plus common error/config contracts,
-  and never imports or instantiates operators.
+  repair-face family on the first leg). Operators may depend on
+  `labelkit.common.contracts.execution`, never on `labelkit.runtime`. Orchestration is the only
+  layer that imports common, runtime and operators together. CLI imports orchestration's public
+  entry points plus common error/config contracts, and never imports or instantiates operators.
 
 The same discipline as a dependency graph (the bullet above stays the normative wording;
 solid = layered production imports, dotted = the sanctioned lazy exceptions):
@@ -63,8 +64,10 @@ flowchart TD
     CLI["labelkit.cli"] --> ORCH["labelkit.orchestration"]
     CLI -->|"common error/config contracts only — never operators"| COMMON["labelkit.common"]
     ORCH --> OPS["labelkit.operators"]
+    ORCH --> RUNTIME["labelkit.runtime"]
     ORCH --> COMMON
     OPS --> COMMON
+    RUNTIME --> COMMON
     subgraph LAZY["the four sanctioned lazy operator-to-operator exceptions (all owned by verify)"]
         VERIFY["operators.verify"] -.->|"annotate repair surface + annotate_member (§7.4/§7.6)"| ANNOTATE["operators.annotate"]
         VERIFY -.->|"judge_window (§7.14)"| SEGMENT["operators.segment"]
@@ -90,6 +93,7 @@ labelkit/
 │   ├── contracts/
 │   │   ├── types.py                    # Ch.4 shared data types and frame/tree helpers
 │   │   ├── stage.py                    # Stage protocol and RunContext
+│   │   ├── execution.py                # v1.19 TaskSpec/TaskExecutor/ResourceLimiter contracts
 │   │   └── generation.py               # v1.18 generation program/trace/request/result contracts
 │   ├── errors.py                       # cross-layer error vocabulary, exit codes, ErrorKind
 │   ├── config/
@@ -104,10 +108,10 @@ labelkit/
 │   │   ├── _constraints.py             # cross-section constraint driver and parse products (package-private)
 │   │   ├── _generation_budget.py       # v1.18 sequence content limits and six-family budget proof
 │   │   └── generation.py                # v1.18 sequence-generation parsing and typed config carriers
-│   ├── runtime/
+│   ├── inference/
 │   │   ├── budget.py                   # v1.11 context-budget primitives + ImageCostCalibrator (§7.17)
 │   │   ├── generation_prompts.py       # v1.18 六个 sequence family 的共享精确构造器
-│   │   ├── llm_client.py               # M9 transport, retry/key pools, concurrency, usage
+│   │   ├── llm_client.py               # M9 transport, retry/key pools, resource/origin use, usage
 │   │   ├── schema_engine.py            # M8 L0-L3 guarantee, repair, schema validation/stats
 │   │   └── credentials.py              # secret materialization for run / validate --probe
 │   ├── observability/
@@ -123,6 +127,7 @@ labelkit/
 │   ├── classify.py                     # M13
 │   ├── extract.py                      # M15
 │   ├── quality.py                      # M4
+│   ├── quality_calls.py                # M4 pure call plans and outcomes
 │   ├── generate.py                     # M6
 │   ├── generation/
 │   │   ├── __init__.py
@@ -136,13 +141,18 @@ labelkit/
 │   │   └── project.py                  # main/stream projection and CrossView reconciliation
 │   ├── annotate.py                     # M5
 │   ├── verify.py                       # M7
+│   ├── stream_verify.py                # M7 ordinary stream verify driver
 │   └── emitter.py                      # M11
+├── runtime/
+│   ├── __init__.py                     # M17 canonical runtime exports
+│   ├── scheduler.py                    # ExecutionRuntime and structured task admission
+│   └── resources.py                    # ResourceManager and origin-capacity ownership
 ├── orchestration/
 │   ├── __init__.py
-│   ├── orchestrator.py                 # M10 batch/stage lifecycle and report aggregation
+│   ├── application.py                  # composition root, public run/validate/probe lifecycle
 │   ├── factory.py                      # operator construction and frozen pipeline order
-│   ├── generation_delivery.py          # v1.18 exact slot delivery and attempt transactions
-│   └── runtime.py                      # runtime object-graph assembly and public run/validate entry
+│   ├── process_workflow.py             # M10 ordinary batch/stage workflow and report aggregation
+│   └── sequence_workflow.py            # v1.19 bounded sequence preparation and ordered commit
 └── data/rubrics/
     ├── default_text.toml
     ├── default_ui.toml
@@ -150,7 +160,8 @@ labelkit/
 ```
 
 `labelkit/common/errors.py`, `labelkit/common/contracts/types.py`,
-`labelkit/common/contracts/stage.py`, and `labelkit/common/config/model.py` are the canonical homes
+`labelkit/common/contracts/stage.py`, `labelkit/common/contracts/execution.py`, and
+`labelkit/common/config/model.py` are the canonical homes
 of the verbatim frozen material in sections 3–6. Changes to their frozen content still require
 updating this file first.
 
@@ -166,17 +177,19 @@ forwarder may recreate them. Consumers must import the layered canonical modules
 coexisting `labelkit/cli.py`. Its `__init__.py` exports the established CLI entry surfaces, and the
 console-script target `labelkit.cli:main` remains unchanged. Public direct-call surfaces such as
 `annotate_record`, `build_*_prompt`, `judge_window`, `extract_transition`, `classify_frames`
-(v1.12 — the fourth sanctioned operator-to-operator import, ground rules above), `RunContext`,
-`LLMClient`, and `SchemaEngine` retain their frozen signatures and behavior at their canonical
-layered paths only.
+(the four sanctioned stream-repair calls), `RunContext`,
+`TaskExecutor`, `LLMClient`, and `SchemaEngine` exist only at their canonical layered paths.
+`quality.py` with `quality_calls.py` is one M4 operator; `verify.py` with `stream_verify.py` is one
+M7 operator. Imports inside either physical pair do not create a cross-operator dependency.
 
 ### 1.2 Test ownership
 
 Offline tests physically mirror the production owners: contracts under `tests/common/contracts/`,
-config under `tests/common/config/`, runtime under `tests/common/runtime/`, observability under
+config under `tests/common/config/`, inference under `tests/common/inference/`, runtime under
+`tests/runtime/`, observability under
 `tests/common/observability/`, extensions under `tests/common/extensions/`, operators under
 `tests/operators/`, and orchestration under `tests/orchestration/`. Key-pool unit coverage belongs
-in `tests/common/runtime/test_llm_client.py`; stream-ingest coverage belongs in
+in `tests/common/inference/test_llm_client.py`; stream-ingest coverage belongs in
 `tests/operators/test_ingest.py`; v1.9 M16 stitch coverage belongs in
 `tests/operators/test_stitch.py` (offline) and `tests/integration/test_stitch_llm.py`
 (real-LLM judgments); v1.10 console coverage belongs in `tests/cli/test_console.py`
@@ -186,9 +199,10 @@ plain line formats — the golden-snapshot layer of the three-layer regression a
 v1.18 sequence-generation coverage mirrors its production owners: configuration in
 `tests/common/config/test_generation.py`; frozen carriers in
 `tests/common/contracts/test_generation_contracts.py`; shared prompt contracts in
-`tests/common/runtime/test_generation_prompts.py`; pure compiler/planner/scenario/state/render/evaluate/
+`tests/common/inference/test_generation_prompts.py`; pure compiler/planner/scenario/state/render/evaluate/
 project behavior in `tests/operators/generation/`; transactional delivery in
-`tests/orchestration/test_generation_delivery.py`; and real endpoint coverage in
+`tests/orchestration/test_sequence_workflow.py`; execution admission/resources in
+`tests/runtime/test_scheduler.py` and `tests/runtime/test_resources.py`; and real endpoint coverage in
 `tests/integration/test_sequence_generation_llm.py` plus
 `tests/integration/test_sequence_generation_structured_output_llm.py`. The exact pure files are
 `test_program.py`, `test_planner.py`, `test_scenario.py`, `test_state.py`, `test_render.py`,
@@ -199,15 +213,13 @@ introduced. Existing seam coverage remains with `test_config.py`, `test_paths_ho
 `test_types.py`, `test_hooks.py`, `test_budget.py`, `test_credentials.py`,
 `test_generation_prompts.py`,
 `test_schema_engine.py`, `test_dedup.py`, `test_quality.py`, `test_annotate.py`,
-`test_verify.py`, `test_emitter.py`, `test_ingest.py`, `test_orchestrator.py`, and the CLI tests.
+`test_verify.py`, `test_emitter.py`, `test_ingest.py`, `test_process_workflow.py`, and the CLI tests.
 A separate compatibility-import test,
 `test_key_pool.py`, or
-`test_stream_ingest.py` is forbidden. The exact file allowlist is normative in
-`docs/dev/SPEC-package-layer-reorganization.md` §6.1.
-
-`tests/cli/test_cli.py` owns both exact production- and test-file manifests. They must match the
-v1.18 tree and files above: every new generation package/test/golden is listed, every deleted
-sequence-generation package/test/golden is absent, and no undeclared compatibility module is
+`test_stream_ingest.py` is forbidden. `tests/cli/test_cli.py` is the single normative owner of
+both exact production- and test-file manifests. They must match the
+v1.19 tree and files above: every runtime, inference and generation package/test/golden is listed,
+every removed path is absent, and no undeclared compatibility module is
 permitted. The completed gate must demonstrate every v1.18 specification use case, interface and
 error lane at 100%, production function coverage 100%, line coverage at least 85% and branch
 coverage at least 75%; real-LLM tests remain outside the offline mutation/coverage denominator.
@@ -216,25 +228,28 @@ coverage at least 75%; real-LLM tests remain outside the offline mutation/covera
 
 ## 2. Architecture recap (normative)
 
-Four physical layers (spec §2.2 and package-layer reorganization spec):
-`labelkit.cli → labelkit.orchestration → labelkit.operators → labelkit.common`. Common contains
+The physical dependency graph is
+`labelkit.cli → labelkit.orchestration → labelkit.operators → labelkit.common`, with the sibling
+execution edge `labelkit.orchestration → labelkit.runtime → labelkit.common`. Common contains
 cross-layer contracts and shared capabilities, not data-processing business logic: M1 config;
-M8/M9 under `common.runtime`; M12 under `common.observability`; user hooks under
+M8/M9 under `common.inference`; M12 under `common.observability`; user hooks under
 `common.extensions`; and the cross-layer error vocabulary at the `common.errors` root. Canonical
 files: errors at `labelkit/common/errors.py`; SchemaEngine/LLMClient at
-`labelkit/common/runtime/schema_engine.py` and `labelkit/common/runtime/llm_client.py`; hooks at
+`labelkit/common/inference/schema_engine.py` and `labelkit/common/inference/llm_client.py`; hooks at
 `labelkit/common/extensions/hooks.py`; v1.18 generation contracts at
 `labelkit/common/contracts/generation.py`, algorithms at `labelkit/operators/generation/`, and
-exact delivery at `labelkit/orchestration/generation_delivery.py`; obslog at
+exact delivery at `labelkit/orchestration/sequence_workflow.py`; execution at `labelkit/runtime/`;
+obslog at
 `labelkit/common/observability/obslog.py`. Operators
 (M2 ingest, M14 segment, M16 stitch, M3 dedup, M13 classify, M15 extract, M4 quality, M5 annotate,
 M6 generate, M7 verify, M11 emitter) depend only on common, subject solely to the four sanctioned
-lazy operator calls (verify→annotate/segment/extract/classify, §7.4/§7.6/§7.14/§7.15/§7.13 —
+  lazy operator calls (verify→annotate/segment/extract/classify, §7.4/§7.6/§7.14/§7.15/§7.13 —
 the classify leg is v1.12's `classify_frames`). Orchestration may
-depend on common and operators and owns construction/order/lifecycle; CLI calls orchestration's
-public runtime entry points and owns only parsing, user interaction, and the sole exception-to-exit-
-code mapping. Common depends on neither operators nor orchestration; operators never depend on
-orchestration; CLI never imports operators.
+depend on common, runtime and operators and owns construction/order/lifecycle; CLI calls
+orchestration's Application entry points and owns only parsing, user interaction, and the sole
+exception-to-exit-code mapping. Common depends on neither runtime, operators nor orchestration;
+runtime depends only on common; operators never depend on runtime or orchestration; CLI never
+imports operators.
 
 Pipeline order per batch — the three chain forms (process superset / generation re-flow /
 `generate_only`):
@@ -747,7 +762,7 @@ class DeliveryError(LabelKitError):
 
 
 class CircuitBreakerTripped(LabelKitError):
-    """Raised by LLMClient once MetricsSink.circuit_broken is set; Orchestrator converts it
+    """Raised by LLMClient once MetricsSink.circuit_broken is set; Application converts it
     to a fatal run end (exit 4). [FROZEN HERE]"""
 
 
@@ -862,25 +877,27 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import ResolvedConfig
-    from labelkit.common.runtime.llm_client import LLMClient
-    from labelkit.common.runtime.schema_engine import SchemaEngine
+    from labelkit.common.contracts.execution import TaskExecutor
+    from labelkit.common.inference.llm_client import LLMClient
+    from labelkit.common.inference.schema_engine import SchemaEngine
     from labelkit.common.observability.obslog import MetricsSink
     from labelkit.common.contracts.types import PipelineItem
 
 
 @dataclass
 class RunContext:
-    """Context handed to every stage.run() invocation. Constructed by M10 orchestrator,
-    ONE PER (batch, stage) INVOCATION, because rng is derived per batch and stage.
-    Exactly the six fields of spec 3.10.3 — spec 3.12.3 explicitly forbids extending this
-    signature; run_id/run_started_at travel via the MetricsSink/Emitter/Orchestrator
-    constructors instead (§7.9–§7.11)."""
+    """Context handed to every stage.run() invocation. Constructed by ProcessWorkflow,
+    one per (batch, stage) invocation because rng and task_namespace are stage-bound.
+    The TaskExecutor identity is shared by every context in one execution domain;
+    run_id/run_started_at still travel through MetricsSink/Emitter/RunServices."""
     cfg: ResolvedConfig
     llm: LLMClient
     schema_engine: SchemaEngine
-    metrics: MetricsSink
     rng: random.Random            # random.Random(f"{cfg.run.seed}:{batch_no}:{stage_name}")
     batch_no: int                 # 1-based; run-level events use 0
+    metrics: MetricsSink
+    tasks: TaskExecutor
+    task_namespace: str
 
 
 class Stage(Protocol):
@@ -915,7 +932,7 @@ class Stage(Protocol):
 
 Binding rules:
 
-- **RNG ownership.** Only the orchestrator seeds RNGs. Derivation string is exactly
+- **RNG ownership.** Only ProcessWorkflow seeds RNGs. Derivation string is exactly
   `f"{cfg.run.seed}:{batch_no}:{stage_name}"` (spec 3.10.3). Stages use `ctx.rng` for ALL
   randomness (pair sampling, A/B order, seed sampling, style/llm draws) and never call
   `random.*` module functions or create their own `Random`. `generate_only` pre-draw uses
@@ -1971,7 +1988,7 @@ apply only when `classify.enabled = true` unless stated):
     has
     `supports_vision = true`. The classify profile joins ALL THREE reference sets (R24):
     the loader's referenced set (rule 12 key resolution), the vision-check set (rule 4),
-    and `labelkit.common.runtime.credentials.referenced_profiles()` (`validate --probe`).
+    and `labelkit.common.inference.credentials.referenced_profiles()` (`validate --probe`).
     Sequence generation disables classify, so this profile has no sequence-form reference.
 24. **classify 归属与上限** — `classify.assignment` ∈ {"single", "multi"};
     `classify.max_labels` may be set ONLY when
@@ -2030,7 +2047,7 @@ apply only when the named switch is on unless stated):
 33. **segment 引用集条件** — Reference sets (S30 — the "three sets" of rule 23 are FOUR for
     v1.8 profiles:
     key resolution (rule 12) / vision (rule 4/34) / `validate --probe`
-    (`labelkit.common.runtime.credentials.referenced_profiles()`) / existence): `segment.llm`
+    (`labelkit.common.inference.credentials.referenced_profiles()`) / existence): `segment.llm`
     joins the existence/key-resolution/probe sets ONLY when
     `segment.enabled` AND `segment.strategy ∈ {llm, hybrid}` (the rules strategy makes zero
     LLM calls — no key may be demanded; these three sets and their gate are UNCHANGED in
@@ -2082,7 +2099,7 @@ Stitch (v1.9, spec §5.2 [stitch] rows + spec 2.3.1; T17):
 40. **stitch 引用集纯文本** — Reference sets: `stitch.llm` joins the reference sets (rule 12
     key resolution /
     profile existence / `validate --probe` via
-    `labelkit.common.runtime.credentials.referenced_profiles()`) whenever
+    `labelkit.common.inference.credentials.referenced_profiles()`) whenever
     `stitch.enabled = true` — with NO strategy condition (unlike `segment.llm`, rule 33) —
     and NEVER joins the rule-4/34 vision set: the stitch judgment is pure text (summary
     cards, no images — T16), so `supports_vision` is never demanded of it. The rule-34
@@ -2120,7 +2137,7 @@ checks apply only when the named switch is on unless stated):
     process/flat 的错误文本把非流工程指向 `classify + [class.<name>.annotate]`。Reference sets:
     `frame.classify.llm` /
     `frame.annotate.llm` each join the existence/key-resolution/probe sets
-    (`labelkit.common.runtime.credentials.referenced_profiles()`) iff their own switch is
+    (`labelkit.common.inference.credentials.referenced_profiles()`) iff their own switch is
     on; the vision set takes ONLY `frame.annotate.llm` (ui ∧ enabled, unconditional — the
     sequence-annotate mirror) and NEVER `frame.classify.llm` — frame classify is
     vision-ADAPTIVE via the parse product `FrameClassifyConfig.vision_resolved` =
@@ -2209,7 +2226,7 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
     prompt scaffold plus complete JSON Schema and fixed dynamic-value byte envelopes, together
     with `max_output_tokens` and the frozen margin, for every v1.18 family. This includes every
     parsed VariantSpec outcome Schema; a raw TOML path string is not a substitute. The shared
-    builders in `common/runtime/generation_prompts.py` are the sole prompt construction source
+    builders in `common/inference/generation_prompts.py` are the sole prompt construction source
     for M1 and runtime. Runtime prechecks first enforce each complete dynamic value and then use
     the complete actual prompt and Schema.
     ScenarioSeed, ActorView, EventDraft semantic history, patch, payload, full state and direct
@@ -2501,8 +2518,8 @@ class Ingestor:
 ```
 
 Wiring note **[FROZEN HERE]**: `Ingestor` is not a `Stage` and has no `ctx`;
-`labelkit/orchestration/runtime.py` sets `ingestor.metrics = metrics_sink` (public attribute,
-default `None`) before the orchestrator calls `records()` so ingest trace events can be emitted
+`labelkit/orchestration/application.py` sets `ingestor.metrics = metrics_sink` (public attribute,
+default `None`) before ProcessWorkflow calls `records()` so ingest trace events can be emitted
 with `batch_no=0`.
 
 Pairing rules (spec 3.2.4, normative): recursive scan; one shared index namespace across
@@ -2677,9 +2694,11 @@ v1.7 per-class pooling (classify enabled; spec 3.4.3 按类分池 row):
 
 - **Two-phase execution (R13).** Phase 1, synchronous: iterate the pools in class-name
   lexicographic order and pre-draw each pool's full pairing plan (this is the only `ctx.rng`
-  consumption — the consumption ORDER is therefore pool-order-deterministic); phase 2: merge
-  every pool's LLM judging calls into ONE `asyncio.gather` (full cross-pool concurrency).
-  Internally `_run_pairwise` splits into plan/dispatch phases.
+  consumption — the consumption ORDER is therefore pool-order-deterministic); phase 2 builds one
+  immutable TaskSpec per judging call and submits the complete cross-pool TaskGroupRequest through
+  `ctx.tasks`. ResourceKey channels dispatch independently; aligned outcomes reduce by the frozen
+  pool/comparison/judge/order declaration key. Internally `_run_pairwise` splits into plan,
+  dispatch and reduce phases.
 - **Per-pool effective config.** Each pool reads `class_views[label]`'s (QualityConfig, Rubric):
   mode/rounds/rubric/threshold/selection/top_ratio take the class-effective values;
   judges/both_orders/criteria_per_call/llm/on_unscored always stay global.
@@ -2854,13 +2873,15 @@ async def annotate_member(member: Record, ctx: RunContext,
     schema=cfg.frame_schema, scope=CallScope(...)) EXPLICITLY — internal-schema
     treatment: L0–L3 all present, NO L2.5 hook, NO resolved_at counting (the §9.3 identity
     "resolved_at sum = records entering M5" stays unpolluted). Failure behavior is execution-
-    surface specific. In ordinary process/flat member isolation, recoverable content, Schema and
-    provider errors count frame_annotate.failed, emit ONE data-free stderr WARN and return None;
+    surface specific. In ordinary process/flat member isolation, content, Schema and ordinary
+    provider failures including ProviderFatalError count frame_annotate.failed, emit ONE data-free
+    stderr WARN and return None;
     the envelope may continue. In a sequence attempt, `SchemaViolation`, `ContextOverflowError`,
     `OutputTruncatedError`, `ProviderRetryableError` and other recoverable content/provider errors
     are re-raised to `run_attempt` rather than converted to None, so the controller rejects and
-    retries the whole set. `CircuitBreakerTripped`, `ProviderFatalError`, `KeyboardInterrupt` and
-    `CancelledError` remain run-level control flow and propagate on both surfaces. Success counts
+    retries the whole set; `ProviderFatalError` is re-raised as a terminal sequence error without
+    consuming an attempt. `CircuitBreakerTripped`, `KeyboardInterrupt` and `CancelledError` remain
+    run-level control flow and propagate on both surfaces. Success counts
     frame_annotate.annotated. The frame prompt is the MINIMAL UNIT
     (single member, ≤ 1 image — no window to split, no keyframes to shrink),
     so there is NO degrade ladder: a post-trim overflow is precheck-shaped and
@@ -2887,8 +2908,9 @@ take sample #1 entirely and count `report.annotate.sc_disagreements`; a failed s
 SUCCESSFUL samples (a failed sample aborts via SchemaViolation, which carries no attempts/usage
 through `complete_validated` — its attempts are unrecoverable by design); `Annotation.usage`
 likewise sums successful samples only; `Annotation.sc = {"n": n, "agreement_ratio": matches/n}`. Trace: `annotate.done` with
-payload `{attempts[, sc]}`. Concurrency: records within the stage run concurrently via
-`asyncio.gather` (bounded by the profile semaphore in M9).
+payload `{attempts[, sc]}`. Concurrency: the stage plans record/sample TaskSpec leaves in
+declaration order, submits them through `ctx.tasks` and reduces aligned frozen outcomes in that
+same order. ResourceManager, not LLMClient-private state, bounds each logical provider call.
 
 v1.7 label semantics (R2): `label = None` ⇒ globally configured instruction/examples (exactly
 the pre-v1.7 behavior); `label` non-None ⇒ both are read from `class_views[label].annotate`.
@@ -2952,11 +2974,12 @@ failure (failed 占键为 None，skipped 不占键). In a sequence attempt, a re
 is propagated instead of occupying the key. Existing
 keys are never re-run (idempotent — the M7 backfill fills gaps only, §7.6) and the dict
 OBJECT is never replaced (fan-out clones share it by reference, §7.13). Concurrency:
-`_frame_pass` submits pending members in declaration order through
-`asyncio.gather(return_exceptions=True)`, waits for every started member to settle, then scans the
-aligned results in the same member declaration order and raises the first exception. This prevents
-siblings from mutating attempt-local annotations or counters after `run_attempt` returns; the
-controller then performs whole-set retry. One `annotate.frame` event per member incl. skipped
+`_frame_pass` submits pure pending-member TaskSpec leaves in declaration order through
+`ctx.tasks`; recoverable member failures are typed frozen outcomes, while an escaping fatal or
+control exception triggers structured sibling cancellation. The aligned results reduce in member
+declaration order only after every child has settled. This prevents siblings from mutating
+attempt-local annotations or counters after `run_attempt` returns; SequenceWorkflow then performs
+whole-set retry. One `annotate.frame` event per member incl. skipped
 ones (§8.1).
 Counters owned here: `frame_annotate.annotated`/`skipped`/`failed` (§9.3; failed is also
 fed by the M11 pre-write backstop, §7.10).
@@ -2989,12 +3012,11 @@ bucket keys remain unchanged. `generate_all` still uses seed examples or seedles
 `standalone_count`; `--limit` retains its flat prefix semantics.
 
 `GenerateStage` rejects `generate.form="sequence"` as an orchestration contract breach. It
-does not import the sequence compiler, planner, delivery controller or emitter. Sequence
+does not import the sequence compiler, planner, SequenceWorkflow or emitter. Sequence
 generation never enters `GenerateStage.run`, never calls `generate_all`, and never passes
-attempt-local products through `Orchestrator._process_batch`. The v1.18 sequence path is the
-orchestration-owned `deliver_generation` seam in §7.18. There is no
-deleted sequence-generation entry, tier helper, time-field backfill, multi-call expansion,
-survivor projection, sequence validator or compatibility wrapper exists.
+attempt-local products through `ProcessWorkflow`. The sequence path is owned exclusively by
+SequenceWorkflow in §7.18. No alternate sequence-generation entry, tier helper, time-field
+backfill, multi-call expansion, survivor projection or sequence validator exists.
 ### 7.6 M7 — `labelkit/operators/verify.py`
 
 ```python
@@ -3142,7 +3164,7 @@ v1.18 sequence attempts invoke VerifyStage through the `run_attempt` protocol in
 They reuse the existing sequence-record verify core and class-effective criteria, but fatal
 provider/circuit/cancellation exceptions pass through unchanged and no attempt result is emitted
 to main or rejects. The old direct-assembly verdict prompt and its selection flag do not exist.
-### 7.7 M8 — `labelkit/common/runtime/schema_engine.py`
+### 7.7 M8 — `labelkit/common/inference/schema_engine.py`
 
 The existing flat/process L0 → L1 → L2 → optional L2.5 → bounded L3 contract and
 `complete_validated` return tuple remain unchanged. Deterministic repair, ordinary user output
@@ -3291,7 +3313,7 @@ Frame render and noise render pass the selected user-authored object frame Schem
 The event planner Schema allows only `test|add|remove|replace`; executable ordering,
 permissions, Schema and hook checks belong to the post-validator. The schema engine does not
 define or recognize any deleted sequence-specific schema name.
-### 7.8 M9 — `labelkit/common/runtime/llm_client.py`
+### 7.8 M9 — `labelkit/common/inference/llm_client.py`
 
 Dataclass-mirror language note (2026-08-14): the shapes below stay frozen field for field, but the
 inline comments here are the CONTRACT's English gloss — the production mirrors in
@@ -3368,6 +3390,7 @@ class ProfileUsage:
 
 @dataclass(frozen=True)                             # [FROZEN HERE]
 class ProbeResult:
+    kind: Literal["llm", "embedding"]
     profile: str
     ok: bool
     model: str
@@ -3409,9 +3432,7 @@ class ProfileSnapshot:                             # v1.10 (spec 3.9.2): one con
 class LLMClient:
     calibrator: ImageCostCalibrator                # v1.11 public attribute (V23②): the per-profile
                                                    # per-image online cost calibrator (§7.17),
-                                                   # SELF-CONSTRUCTED in __init__ — zero factory/
-                                                   # runtime assembly changes, and RunContext's
-                                                   # frozen six fields stay untouched. Read paths:
+                                                   # SELF-CONSTRUCTED in __init__. Read paths:
                                                    # M9 feeds observe() per response (usage
                                                    # missing → no sample + ONE WARN per profile);
                                                    # operators read ctx.llm.calibrator.cost(
@@ -3420,7 +3441,10 @@ class LLMClient:
 
     def __init__(self, llm_profiles: Mapping[str, LLMProfile],
                  embedding_profiles: Mapping[str, EmbeddingProfile],
-                 metrics: MetricsSink | None = None): ...        # [FROZEN HERE: split dicts + metrics]
+                 credentials: RuntimeCredentials,
+                 resources: ResourceLimiter,
+                 metrics: MetricsSink | None = None): ...
+        # [FROZEN HERE: split profiles + explicit credentials/resources + optional metrics]
 
     async def complete(self, profile: str, prompt: PromptBundle,
                        response_schema: dict | None = None) -> LLMResponse:
@@ -3468,16 +3492,24 @@ class LLMClient:
         one llm.call trace event per call with payload operation="embedding". Retry/limit
         rules identical to complete()."""
 
-    async def probe(self, profile: str) -> ProbeResult:
+    async def probe(self, resource_key: ResourceKey) -> ProbeResult:
         """validate --probe: minimal 1-token live call (llm profiles) or 1-text embed
         (embedding profiles). Never raises; failures land in ProbeResult.error.
-        Pooled profiles: probes the first key."""
+        Pooled profiles: probes the first key. ResourceKey keeps same-named llm and
+        embedding profiles distinct."""
 
-    async def probe_all(self, profile: str) -> list[ProbeResult]:
+    async def probe_all(self, resource_key: ResourceKey) -> list[ProbeResult]:
         """v1.6: one probe per pool key, declaration order, for llm AND embedding profiles
         (each result carries key_env). Single-key profiles → 1-element list equal to
-        [await probe(profile)] with key_env=None. Used by `validate --probe` (§7.12);
+        [await probe(resource_key)] with key_env=None. ProbeResult.kind preserves the resource
+        identity when both profile tables declare the same name. Used by `validate --probe` (§7.12);
         cost = pool size probes per referenced profile. Never raises."""
+
+    async def aclose(self) -> None:
+        """幂等关闭根实例拥有的共享 AsyncClient；probe child 没有关闭权。
+
+        @return None。
+        """
 
     @property
     def usage_by_profile(self) -> dict[str, ProfileUsage]: ...
@@ -3542,19 +3574,23 @@ most once each); disabling the LAST live key → ProviderFatalError +
 first-401 behavior exactly). Quota signaled as 403 is treated as auth (no body sniffing —
 spec 1.6 decision). When ALL live keys are cooling, the call PARKS until the earliest cooldown
 end (sleeping in ≤ 60 s slices, re-checking the breaker each slice — preserving the v1.5
-post-semaphore re-check; emits `llm.pool_parked` + stderr WARN); parking consumes no retry
+post-resource-permit re-check; emits `llm.pool_parked` + stderr WARN); parking consumes no retry
 budget but is capped per logical call by `run.max_park_s` (default 3600; 0 = no parking —
 NOTE: 0 on a single-key profile makes every 429 an immediate retry-exhaustion failure) —
 overrun → the normal retry-exhaustion path; when the earliest cooldown end provably exceeds the
 remaining park budget, fail immediately via the same path (no dead wall-clock). Parking happens
-INSIDE the acquired semaphore slot and holds it (throughput is zero anyway while a whole pool
-cools); `run.max_park_s` counts park time only, never semaphore queueing. Retry exhaustion
+INSIDE the acquired ResourceKey permit and holds it (throughput is zero anyway while a whole pool
+cools); `run.max_park_s` counts park time only, never resource-admission waiting. Retry exhaustion
 feeds the breaker window (`record_provider_result(fatal=True)`), unchanged (the
 retry-exhaustion breaker feed of E2E-FINDINGS item 1).
 
-One `asyncio.Semaphore(max_concurrency)` per profile shared by ALL calls (incl. repairs,
-verify, probe) — for pools this is the AGGREGATE in-flight cap across all keys of the profile
-(v1.6). Image bytes loaded/scaled/encoded per call and released. Metering: accumulate
+M9 owns no profile semaphore. Every complete/embed/repair/probe logical call acquires
+`ResourceLimiter.resource_limit((kind, profile))`; the permit spans provider attempts, key
+rotation, retry backoff, 429 cooldown and parking until the logical call succeeds or terminates.
+For pooled credentials, `max_concurrency` remains the aggregate cap across all keys. LLM and
+embedding profiles with the same name use different ResourceKeys. Resource-permit waiting is
+recorded in `runtime.resource_wait_ms` and excluded from provider latency. Image bytes are
+loaded/scaled/encoded per call and released. Metering: accumulate
 usage from response; cost = `prompt_tokens/1e6*price_in + completion_tokens/1e6*price_out` when
 both prices set; v1.6 adds per-key `KeyUsage` and `parked_calls`/`parked_ms` to `ProfileUsage`
 (report emits them only for pools > 1). Breaker interplay: every ProviderFatalError →
@@ -3568,6 +3604,22 @@ must accept the keyword-only `hard` parameter. When `metrics.circuit_broken`, `c
 `CircuitBreakerTripped` at entry. Trace: `llm.call` after every call (incl. failures) with the
 §8.2 payload (+ `key_env` for pools > 1, v1.6); API keys never enter any log path — key
 identity is always the env-var NAME.
+
+Application freezes every referenced profile's HTTP origin as lowercase scheme, IDNA host and
+effective port through `httpx.URL`. ResourceManager aggregates LLM, embedding, repair and probe
+profile capacities by origin and exposes one explicit origin permit per aggregate. The shared
+AsyncClient is lazy and uses `httpx.Limits(max_connections=N, max_keepalive_connections=N)`, where
+`N = ResourceLimiter.http_connection_capacity`; a static zero-origin path creates no client. Each
+HTTP attempt acquires `origin_limit(origin_for(resource_key))` before dispatch. The explicit wait
+feeds `runtime.http_pool_wait_ms`; provider latency begins after the permit. An `httpx.PoolTimeout`
+after origin admission is an InternalError and is classified before generic timeout handling.
+
+The root LLMClient owns `aclose()`; probe children share its ResourceManager and connection pool
+without close ownership. Close is idempotent and physically occurs once. On normal completion a
+close failure is InternalError. If a primary exception or external cancellation already exists,
+Application logs the close failure in English, waits for cleanup, and preserves the primary
+exception or original CancelledError. Live run and `validate --probe` close in the same event loop
+that created the client; static validate, dry-run and estimate never create it.
 
 v1.11 breaker matrix (V16/V24/A7 — the closed who-feeds-what table for the two new
 exceptions; normative):
@@ -3594,7 +3646,7 @@ missing-usage gateway fallback [C-64]). Image encoding: the effective long-edge 
 signature is unchanged; the
 builder passes the effective value in).
 
-### 7.9 M10 — `labelkit/orchestration/orchestrator.py`
+### 7.9 M10 — `labelkit/orchestration/process_workflow.py`
 
 ```python
 @dataclass(frozen=True)                            # [FROZEN HERE]
@@ -3615,27 +3667,27 @@ class RunSummary:
 
 @dataclass(frozen=True)                            # [FROZEN HERE — 2026-08-14]
 class RunServices:
-    """The orchestrator's shared runtime services and run identity, as ONE parameter object.
+    """ProcessWorkflow 的共享运行服务与运行身份参数对象。
 
     The 2026-08-14 code-rule remediation (≤ 5 parameters per function) collapsed the five
     trailing constructor parameters into this dataclass. It is EXPORTED from
-    `labelkit.orchestration` (alongside `Orchestrator` / `RunSummary` / `build_stages` / the
-    runtime entry points), so callers construct it by name.
+    `labelkit.orchestration` with ProcessWorkflow, RunSummary, build_stages and the
+    Application entry points.
     """
     llm: LLMClient                                 # M9 client (usage / calibrator read face)
     schema_engine: SchemaEngine                    # M8 engine (resolved_at stats face)
     metrics: MetricsSink                           # M12 counter/event sink (incl. the console bypass)
+    tasks: TaskExecutor                            # M17 execution-domain TaskExecutor identity
     run_id: str                                    # this run's identifier
     run_started_at: datetime                       # run start (timezone-aware)
 
 
-class Orchestrator:
+class ProcessWorkflow:
     def __init__(self, cfg: ResolvedConfig, stages: list[Stage],
                  ingestor: Ingestor | None, emitter: Emitter,
                  services: RunServices): ...
-        # spec 3.10.3 lists (cfg, stages, ingestor, emitter, llm); the rest ride `services` and
-        # are [FROZEN HERE] — schema_engine/metrics are needed to build RunContext; run_id/
-        # run_started_at feed report assembly and run-level events (NOT RunContext, spec 3.12.3).
+        # schema_engine/metrics/tasks are needed to build RunContext; run_id/run_started_at feed
+        # report assembly and run-level events.
 
     async def run(self) -> RunSummary: ...
 ```
@@ -3653,7 +3705,7 @@ stream stage; `_compose_chain`'s enabled map carries the matching `"stitch":
 cfg.stitch.enabled` entry — inserting the tuple name alone is necessary but not sufficient;
 it includes classify in the main,
 re-flow AND generate_only chains — items already classified rely on M13's idempotent skip):
-build a fresh `RunContext`
+build a fresh eight-field `RunContext`
 (rng derived per §5) and `await stage.run(batch, ctx)`; `generate.run`'s return value is enqueued as
 new batch(es) (split at `batch_size`, consecutive `batch_no`, no generate stage); after stages,
 `emitter.emit_batch(batch, batch_no)`, then `metrics.flush()` (trace flush follows output flush),
@@ -3668,7 +3720,7 @@ completed batches are delivered; report gains `run.partial_delivery=true` and th
 still delivers nothing. SIGINT/SIGTERM: stop taking new
 batches, wait current batch ≤ 30 s then cancel, finalize normally (rename happens; report
 `interrupted=true` **[FROZEN HERE]**). Tail batch processed as-is. Report assembly is owned by
-the orchestrator: it builds the §9.3 dict from `ingestor.report`, `metrics`, `schema_engine.stats`,
+ProcessWorkflow: it builds the §9.3 dict from `ingestor.report`, `metrics`, `schema_engine.stats`,
 `llm.usage_by_profile` and timing, then calls `emitter.finalize(report)`; `report.run.exit_code`
 = `RunSummary.exit_code` incl. the `--strict` escalation (4 on circuit break, else 1 when
 `cfg.strict` and total rejects > 0, else 0) **[FROZEN HERE]**. Dry-run: after M1/M2
@@ -3778,7 +3830,7 @@ MetricsSink carries no listener — byte-identical to v1.9):
   banner path, forwarded to `on_stop_requested`).
 - **Estimate export (U20).** The static estimate formula is exported as the PURE function
   `estimate_run(cfg: ResolvedConfig, plan: IngestPlan | None) -> dict` (module level,
-  `labelkit/orchestration/orchestrator.py`); `_estimate()` becomes a thin wrapper. It is
+  `labelkit/orchestration/process_workflow.py`); `_estimate()` becomes a thin wrapper. It is
   shared by dry-run AND the renderer's RUN-LEVEL stage-board denominators (the `*_calls`
   keys of the one `run_estimate` emission, displayed as「估算」— U20 explicitly rejected
   per-batch recomputation).
@@ -3821,19 +3873,17 @@ v1.12 frame-granularity estimate (SPEC-frame-annotation 裁决·估算上界与 
   `classify_calls + frame_classify_calls`, annotate ↦ `annotate_calls +
   frame_annotate_calls`; the panel gains no new rows — §7.12 territory).
 
-v1.18 sequence-delivery orchestration:
+v1.19 Application and sequence-delivery orchestration:
 
-- **Separate driver.** `Orchestrator.run` branches on
-  `cfg.generate.form == "sequence"` before the flat `_run_generate` path. It calls
-  `compile_generation_program(cfg)`, then `compile_scenario_plan(program)`,
-  derives `run_attempt_id` and self-reference-free `run_id`, materializes
-  `RuntimeCredentials` only after compile succeeds, and invokes
-  `deliver_generation(DeliveryRequest(...), DeliveryServices(...))`. The sequence branch
-  never calls `GenerateStage`, `_process_batch` or `Emitter.emit_batch`.
-- **Layer direction.** `orchestrator.py` and
-  `orchestration/generation_delivery.py` may import common and operators. No generation
-  operator imports Orchestrator or orchestration. All complex arguments cross the seam as the
-  frozen request/service carriers in §7.18.
+- **Separate workflows.** Application compiles `GenerationProgram` and `ScenarioPlan`, derives
+  `run_attempt_id` and self-reference-free `run_id`, and materializes RuntimeCredentials only
+  after compilation succeeds. It then enters the unique `ExecutionRuntime.run(workflow)` domain:
+  flat/process uses ProcessWorkflow; sequence uses SequenceWorkflow and never calls
+  GenerateStage, ProcessWorkflow's batch loop or `Emitter.emit_batch`.
+- **Layer direction.** `application.py`, `process_workflow.py` and `sequence_workflow.py` may
+  import common, runtime and operators. No operator imports ProcessWorkflow, SequenceWorkflow or
+  runtime implementation. All complex arguments cross the seam as frozen request/service
+  carriers in §7.18 and execution protocols in §7.19.
 - **Terminal ownership.** DeliveryError is exit 1. Provider fatal, breaker trip,
   KeyboardInterrupt and CancelledError escape attempt collaborators unchanged and end the run
   at exit 4 without consuming a slot attempt. Sequence SIGINT never delivers an accepted prefix.
@@ -3852,8 +3902,8 @@ v1.18 sequence-delivery orchestration:
   one successful attempt for every planned delivery slot plus every noise slot and enabled
   downstream call across the full run; the upper bound lets each delivery slot consume
   `max_slot_attempts`. Catalog seed calls are zero; protected prefixes add no plan/render call.
-- **Report assembly.** The delivery controller supplies the frozen sequence report node and
-  usage accumulated across every attempt. M10 does not infer counters from terminal
+- **Report assembly.** SequenceWorkflow supplies the frozen sequence report node and usage
+  accumulated across every attempt. ProcessWorkflow does not infer counters from terminal
   PipelineItems and does not add old stream/quota/tier/brief/realize/shortfall keys.
 ### 7.10 M11 — `labelkit/operators/emitter.py`
 
@@ -4153,6 +4203,25 @@ class MetricsSink:
                                                        # rich-yield gate reads it; flips False
                                                        # permanently after the U23 forward trip
     def count(self, key: str, n: int = 1) -> None      # counter keys listed in §9.3
+    def capture_counts(self) -> ContextManager[dict[str, int]]
+        # attempt-local ContextVar capture; nested capture in the same Context fails closed
+    def merge_counts(self, captured: Mapping[str, int]) -> None
+        # only the declaration-order commit coordinator merges accepted dataset counters
+    def observe_runtime_high_water(
+        self,
+        key: Literal["queue", "running", "resource_wait", "commit_waiting", "candidate_bytes"],
+        value: int,
+    ) -> None
+        # records max(current high-water, value); value must be non-negative
+    def add_runtime_total(
+        self,
+        key: Literal["cancelled_tasks", "resource_wait_ms", "http_pool_wait_ms", "commit_ms"],
+        value: int,
+    ) -> None
+        # adds a non-negative runtime total
+    @property
+    def runtime_report(self) -> Mapping[str, int]: ...
+        # exact nine-key report node from §9.3
     def add_stage_time(self, stage: str, seconds: float) -> None
     def record_provider_result(self, fatal: bool, *, hard: bool = False) -> None
         # hard=True (auth-class 401/403 fatals) opens the breaker IMMEDIATELY (v1.5)
@@ -4169,6 +4238,15 @@ def setup_logging(cfg: ResolvedConfig) -> None:
     Modules log via logging.getLogger('labelkit.<module>') with extra={'stage':..., 'batch':...}.
     [FROZEN HERE: extras mechanism]"""
 ```
+
+The old instance-wide mutable capture slot does not exist. Each `capture_counts()` creates one
+attempt-local dict, sets it through a ContextVar and resets the exact token in `finally`.
+ExecutionRuntime gives every leaf a distinct copied Context, so sibling non-metrics ContextVar
+bindings are isolated while the capture dict reference is intentionally shared inside one
+collaborator task group. Captures belonging to different slot/stage coordinators are invisible to
+one another. `budget.*`, Schema statistics, LLM/embedding usage, provider retry/breaker, resource
+and origin wait, provider latency, runtime cancellation and trace call events bypass dataset count
+capture and remain real run facts. Only accepted dataset counters are merged after ordered commit.
 
 Behavior (3.12.4): trace file first line is always the `run.start` header event carrying
 `trace_schema_version: 1` (only there); existing `trace.path` truncated with one stderr warn; no
@@ -4227,37 +4305,36 @@ exception rendering, and the sole exception-to-exit-code mapping; `labelkit/cli/
 preserves the established public imports and `labelkit.cli:main` console-script target.
 
 Wiring order for `run`: CLI parses arguments and calls
-`labelkit.orchestration.runtime.execute_run` — v1.10 signature (trailing param only, U19):
+`labelkit.orchestration.application.execute_run` — v1.10 signature (trailing param only, U19):
 `execute_run(config_path, project_path, overrides, listener: ProgressListener | None = None)
 -> int`; `labelkit/cli/commands.py` constructs the LAZY-SHELL `ConsoleRenderer`
 (`labelkit/cli/console.py` — the SOLE rich import point in the codebase, imported lazily at
 activation; operators/common keep zero rich touchpoints, M1 probes importability via
-find_spec only, §6.3 rule 42) and passes it as `listener`. That orchestration runtime owns
+find_spec only, §6.3 rule 42) and passes it as `listener`. Application owns
 `labelkit.common.config.load()` →
 `setup_logging` → `run_id = secrets.token_hex(6)`,
-`run_started_at = datetime.now().astimezone()` → `EventLog` + `MetricsSink` (v1.10: the
-listener rides its trailing param, §7.11 — the Orchestrator constructor stays frozen,
-untouched) → `LLMClient` →
-`SchemaEngine` → `labelkit.orchestration.factory.build_stages()` → `Ingestor` (process mode) →
-`Emitter` → `Orchestrator` → v1.10: `listener.on_run_context(cfg, snapshot, counters,
-fatal_streak)` once — `LLMClient.snapshot` plus the MetricsSink read-only closures — after
-assembly and before
-`asyncio.run` (U19 — the lazy shell activates here) → `asyncio.run(orch.run())`. The factory
-owns operator instantiation,
-including `DedupIndex`, and the frozen stage order; CLI never imports or constructs those objects.
+`run_started_at = datetime.now().astimezone()` → `EventLog` + `MetricsSink` →
+`ResourceManager` → `LLMClient` → `SchemaEngine` →
+`labelkit.orchestration.factory.build_stages()` → `Ingestor` (process mode) → `Emitter` →
+`ExecutionRuntime` → `ProcessWorkflow` or `SequenceWorkflow`. The listener receives
+`on_run_context(cfg, snapshot, counters, fatal_streak)` once after assembly and before
+Application enters the event loop (U19 — the lazy shell activates here). The live workflow runs
+inside `ExecutionRuntime.run`; Application closes the root LLMClient in that same event loop on
+success, error and cancellation. The factory owns operator instantiation, including `DedupIndex`,
+and the frozen stage order; CLI never imports or constructs those objects.
 Renderer construction or rendering failure self-swallows, warns once, and degrades to plain —
 it NEVER alters exit codes or data output (U7; the sink-side forward guard (U23) is §7.11's).
 `labelkit/cli/main.py` then maps the unchanged outcomes: `ConfigError`→2, `InputError`→3, fatal
 (`RunSummary.exit_code==4` / unwritable output / auth failure)→4, `--strict` and rejects>0 → 1
 (already folded into `RunSummary.exit_code` by M10, §7.9), report write failure → 1, else 0.
 
-`validate`: the command handler calls `labelkit.orchestration.runtime.validate_project` —
+`validate`: the command handler calls `labelkit.orchestration.application.validate_project` —
 v1.10 signature (trailing param only, U27): `validate_project(config_path, project_path,
 overrides: CliOverrides = CliOverrides()) -> ResolvedConfig`; `_cmd_validate` passes its
 parsed overrides through, so `--console` reaches M1 and the jsonl × explicit-rich WARN
 (§6.3 Warnings) fires on the validate path too. With
 `--probe`, it calls `probe_referenced_profiles`, which uses
-`labelkit.common.runtime.credentials.referenced_profiles` and `LLMClient.probe_all` on every
+`labelkit.common.inference.credentials.referenced_profiles` and `LLMClient.probe_all` on every
 referenced profile (v1.6 — one line per key for pooled profiles; single-key output format
 unchanged); v1.10 (U13/U27): under `mode_resolved == "rich"` the probe result table is
 rendered as a table ONLY when stdout is a TTY — script consumers keep the current line
@@ -4270,7 +4347,7 @@ ALWAYS — its stdout is machine-consumed and never touched by console.mode (U13
 
 v1.8: `labelkit.orchestration.factory.build_stages` constructs `SegmentStage` and `ExtractStage`
 per their switches at their `_CHAIN_ORDER` slots (§7.9).
-`labelkit.common.runtime.credentials.referenced_profiles()` (the `validate --probe` set) gains
+`labelkit.common.inference.credentials.referenced_profiles()` (the `validate --probe` set) gains
 `segment.llm` ONLY when `segment.enabled` and `segment.strategy ∈ {llm, hybrid}`, and
 `extract.llm` whenever `extract.enabled` (S30, §6.3 rule 33 — the same conditions govern the
 existence/key-resolution/probe sets; v1.11 V3: `segment.llm` never joins the vision set —
@@ -4354,9 +4431,9 @@ Normative behavior:
   `SchemaEngine.complete_validated(schema=classification_schema(...))` (§10.7) — an INTERNAL
   schema: no `resolved_at` bucket counting, no L2.5 hook. Temperature 0; sc samples use
   `classify.sc_temperature`. `reason` is requested iff `trace.enabled` and `"classify"` in
-  `trace.channels` (R29). Record-level concurrency via `asyncio.gather` bounded by the
-  profile semaphore (skeleton mirrors M5 — own voting code, NOT `annotate._majority_vote`,
-  R26).
+  `trace.channels` (R29). Record/sample calls become immutable TaskSpec leaves and run through
+  `ctx.tasks`; ResourceManager bounds the logical calls. Classification keeps its own voting code,
+  not `annotate._majority_vote` (R26).
 - **Normalization (after M8, deterministic, fixed order).** ① map labels onto class-table
   declaration order and DE-DUPLICATE; ② the fallback class co-occurring with concrete
   classes ⇒ drop the fallback class (a pure-fallback result is kept). Normalization only
@@ -4519,9 +4596,9 @@ Normative behavior (spec 3.14.4):
   unconditional overwrite during stitching. Budget off (`context_window == 0`): fixed
   windows, step = window − 1, byte-identical to v1.10. `len(session) == 1` degrades to
   rules (zero LLM).
-- **Calls & stitching.** One call per window; ALL windows across ALL sessions of the batch
-  join ONE `asyncio.gather` (profile semaphore bound); stitching is a synchronous pass after
-  all verdicts arrive, positioned by window index — schedule-independent; zero rng.
+- **Calls & stitching.** One call per window; all windows across all sessions become one frozen
+  TaskGroupRequest and run through `ctx.tasks`. Stitching is a synchronous reduce after all
+  verdicts arrive, positioned by session/window declaration key — schedule-independent; zero rng.
 - **Deductive mapping (code-side lookup — the LLM never answers the boundary question):**
   `continues`/`advances` → non-boundary; `returns_to_entry`/`context_switch` → boundary
   (THAT frame is the first frame of a new segment); `interruption` → noise. The session's
@@ -4618,9 +4695,9 @@ Normative behavior (spec 3.15.4):
 - **Output invariant.** `item.transitions` length == `len(record.members) − 1`, ascending
   by pair ordinal; a single failed transition never breaks the invariant (fallback
   placeholder, §4 extraction_invalid). Batch cardinality unchanged.
-- **Concurrency.** ALL transitions across ALL episodes of the batch join ONE
-  `asyncio.gather` (M4 pairwise phase-2 skeleton); results written back by (episode batch
-  position, pair ordinal) — schedule-independent, zero rng. Temperature 0. One request
+- **Concurrency.** All transitions across all episodes of the batch become pure TaskSpec leaves
+  submitted through `ctx.tasks`; results are written back by (episode batch position, pair
+  ordinal) — schedule-independent, zero rng. Temperature 0. One request
   carries exactly 2 images.
 - **Multi fan-out (S9).** Each sibling extracts independently under its own label
   (per-label `instruction`); `transitions` is per-envelope self-contained; dry-run reports
@@ -4793,8 +4870,8 @@ private.)
 
 Normative behavior (spec 3.16):
 
-- **Selection & idempotency.** Sessions are processed STRICTLY in batch position order
-  (= session order) and SEQUENTIALLY — the pool is a serial decision process, giving a
+- **Selection & idempotency.** Sessions are processed strictly one at a time in batch position
+  order (= session order) — each decision observes the preceding pool state, giving a
   deterministic event/judgment order with zero rng (concurrency exists only inside a
   votes > 1 sample gather). Episode candidates = active sequence envelopes with
   `thread_id is None` (`thread_id` is stamped at thread opening, so re-entry costs zero
@@ -4865,12 +4942,12 @@ Normative behavior (spec 3.16):
   `counts.stitched` (post-emit shell tally) and the derived `counts.threads` are M10's
   (§7.9) — M16 never touches `counts.*`.
 
-### 7.17 Budget — `labelkit/common/runtime/budget.py` (v1.11)
+### 7.17 Budget — `labelkit/common/inference/budget.py` (v1.11)
 
-(New common-runtime module, spec 3.9.x context-budget revision / dev spec
+(Common inference module, spec 3.9.x context-budget revision / dev spec
 `docs/dev/SPEC-context-budget.md` §3.2. Numbered AFTER the pre-existing §7.16 so every
 frozen §7.x anchor stays valid — the v1.7/v1.8/v1.9 convention; physically it sits beside
-`llm_client.py`/`schema_engine.py` under `labelkit/common/runtime/` (§1).)
+`llm_client.py`/`schema_engine.py` under `labelkit/common/inference/` (§1).)
 
 Responsibilities: the context-budget primitives — margin/budget arithmetic, the
 zero-dependency text/image token estimators, deterministic text fitting, the static
@@ -4974,8 +5051,8 @@ Binding notes (from dev spec §3.2, normative):
   Unified Ideographs and its extensions + fullwidth punctuation (the implementation
   enumerates the ranges; tests pin exact samples).
 - `ImageCostCalibrator` determinism guard (V19/F8): the calibration snapshot is FROZEN
-  PER BATCH — batch N's packing reads only the < N batches' aggregate (batches are
-  serial ⇒ same input + same config reproduces byte-identically); samples arrive in
+  PER BATCH — batch N's packing reads only the < N batches' aggregate (only one batch is active,
+  so the same input + same config reproduces byte-identically); samples arrive in
   asyncio completion order, so `freeze_batch()` aggregates the batch max over the
   UNORDERED sample set (order-free) into the `deque(maxlen=8)` batch-max window;
   per-response `observe()` during batch N never affects batch N's own `cost()` reads.
@@ -5000,7 +5077,7 @@ Binding notes (from dev spec §3.2, normative):
   against the same worst-case composition.
 - v1.18 removes every former sequence-generation budget key and does not add six integer
   `generation_*` head constants. The six families share their exact system text, complete user
-  scaffold and interpolation order through `common/runtime/generation_prompts.py`; M1 and the
+  scaffold and interpolation order through `common/inference/generation_prompts.py`; M1 and the
   operators call those same builders. `common/config/_generation_budget.py` owns the content-limit
   checks and static proof; it is not a second prompt builder. M1 checks each actual configured
   minimum PromptBundle with
@@ -5036,17 +5113,17 @@ Physical ownership is fixed:
 - `common/config/_generation_budget.py` owns root examples, fixed content limits and the shared
   six-family context proof.
 - `common/contracts/generation.py` owns the new v1.18 generation carriers in this section.
-- `common/runtime/generation_prompts.py` owns all six exact sequence system/user builders shared
+- `common/inference/generation_prompts.py` owns all six exact sequence system/user builders shared
   by M1 budget checks and generation operators.
 - Existing generic carriers keep their single canonical owners: RuntimeCredentials in
-  `common/runtime/credentials.py`, ResolvedHook and ValidationHooks in
+  `common/inference/credentials.py`, ResolvedHook and ValidationHooks in
   `common/extensions/hooks.py`, and ResolvedPaths in `common/config/model.py`. Their mirrors
   below define the seam and never authorize duplicate declarations.
 - `operators/generation/program.py` compiles ResolvedConfig into GenerationProgram.
 - `operators/generation/planner.py` owns CP-SAT planning.
 - `operators/generation/scenario.py`, `state.py`, `render.py`, `evaluate.py` and
   `project.py` own generation-side algorithms.
-- `orchestration/generation_delivery.py` owns slot attempts, downstream transactions,
+- `orchestration/sequence_workflow.py` owns slot attempts, downstream transactions,
   terminal handling and delivery.
 - `operators/emitter.py` owns fixed-path commit and failed-report emission.
 
@@ -5549,6 +5626,29 @@ class ProjectionWitness:
 
 
 @dataclass(frozen=True)
+class PrimaryCandidateReconcileRequest:
+    program: GenerationProgram
+    plan: ScenarioPlan
+    run_id: str
+    slot: DeliverySlot
+    projection_witnesses: tuple[ProjectionWitness, ...]
+    sequences: tuple[SequenceRows, ...]
+    replay_layouts: tuple[ReplayLayout, ...]
+    replays: tuple[ReplayRows, ...]
+    retained_content_bytes: int
+
+
+@dataclass(frozen=True)
+class NoiseCandidateReconcileRequest:
+    program: GenerationProgram
+    run_id: str
+    noise_slot: NoiseSlot
+    payload_digest: str
+    row: JsonObject
+    retained_content_bytes: int
+
+
+@dataclass(frozen=True)
 class ReconcileRequest:
     program: GenerationProgram
     plan: ScenarioPlan
@@ -5567,6 +5667,7 @@ class GenerationServices:
     schema_engine: SchemaEngine
     llm: LLMClient
     metrics: MetricsSink
+    tasks: TaskExecutor
 
 
 @dataclass(frozen=True, repr=False)
@@ -5650,13 +5751,45 @@ class DedupGroupRequest:
 
 
 @dataclass(frozen=True)
-class DedupProbeToken:
+class DedupReservation:
     capability_id: str
-    index_generation: int
+    epoch: int
     record_digests: tuple[str, ...]
-    exact_features: tuple[str, ...]
-    minhash_features: tuple[object, ...]
-    embedding_features: tuple[tuple[float, ...], ...]
+    exact_cluster_keys: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class PreparedCandidate:
+    slot: DeliverySlot
+    attempt_index: int
+    projection_witnesses: tuple[ProjectionWitness, ...]
+    sequences: tuple[SequenceRows, ...]
+    replays: tuple[ReplayRows, ...]
+    reservation: DedupReservation
+    dataset_counters: Mapping[str, int]
+    retained_content_bytes: int
+    digest: str
+
+
+@dataclass(frozen=True)
+class PreparedNoiseCandidate:
+    noise_slot: NoiseSlot
+    attempt_index: int
+    payload_digest: str
+    row: JsonObject
+    similarity_signature: tuple[int, ...]
+    dataset_counters: Mapping[str, int]
+    retained_content_bytes: int
+    digest: str
+
+
+@dataclass(frozen=True)
+class CrossViewDelta:
+    phase: Literal["primary", "noise"]
+    ordinal: int
+    event_ids: tuple[str, ...]
+    timestamps_us: tuple[int, ...]
+    source_keys: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -5698,16 +5831,27 @@ instance, the final attempt-local item, its corresponding projection and the fix
 The emitter remains constructible from paths alone so planner failure can still write an
 independent failed report before runtime services exist.
 
-`ReconcileRequest.projection_witnesses` and `.sequences` preserve the same
-delivery-slot/variant declaration order and have equal length; the former contains compact
-full-SHA-256 source witnesses, while the latter contains final rows. `noise_payload_digests`
-contains the corresponding full-SHA-256 objects accepted by the noise semantic gate before
-projection, and it aligns exactly with `noise_rows` in NoiseSlot order. `replays` preserves one
-`ReplayRows` group per available `ReplayLayout`, in layout order; it is never flattened in the
-carrier. `retained_content_bytes` is the controller's prospective or final total across sequence
-main/primary rows, noise rows and replay rows. CrossView independently canonicalizes the actual
-rows and requires both every nested byte count and this total to match. `program` and `run_id` are
-mandatory independent ID inputs.
+`PrimaryCandidateReconcileRequest` is strictly candidate-local. Its witnesses and sequences align
+with the current slot's variant declaration order; its replays align with every ReplayLayout for
+that source, and retained bytes cover this candidate's main, primary and replay rows only. It does
+not carry or read a committed prefix. `NoiseCandidateReconcileRequest` is a separate closed carrier
+for one NoiseSlot, post-gate payload digest, final row and actual row bytes; it cannot impersonate a
+primary request.
+
+`PreparedCandidate` and `PreparedNoiseCandidate` are the only values admitted to the completed
+candidate buffer. Each closes slot/attempt identity, all local truth, actual retained bytes and a
+digest over every field except the digest itself. PreparedCandidate additionally owns exactly one
+DedupReservation and its attempt-local dataset counter delta. Recursive freezing succeeds before
+ownership enters the buffer; afterward no nested mapping, row, witness, reservation field or
+counter can change. AttemptTransaction, PipelineItems and projection intermediates are released at
+that boundary.
+
+Final `ReconcileRequest.projection_witnesses` and `.sequences` preserve complete
+delivery-slot/variant declaration order and have equal length. `noise_payload_digests` aligns with
+all final noise rows; `replays` preserves one ReplayRows group per available ReplayLayout in layout
+order. Its retained bytes are the final total across sequence main/primary, noise and replay rows.
+The final independent CrossView canonicalizes actual rows and requires every nested byte count and
+the total to match. `program` and `run_id` are mandatory independent ID inputs.
 
 ValidationHooks contains only output, sample and state. There is no sequence/scenario validator.
 RuntimeCredentials is the only secret-bearing carrier; its dataclass repr is disabled and both
@@ -6018,10 +6162,18 @@ def reconcile_views(request: ReconcileRequest) -> None:
     """
 
 
-def reconcile_prospective_views(request: ReconcileRequest) -> None:
-    """对当前连续交付前缀执行非最终 CrossView 对账。
+def reconcile_primary_candidate(request: PrimaryCandidateReconcileRequest) -> None:
+    """只对当前 primary 候选执行闭包与本地 CrossView 校验。
 
-    @param request 尚未提交的 prospective 前缀。
+    @param request 不含已提交前缀的当前候选请求。
+    @return None。
+    """
+
+
+def reconcile_noise_candidate(request: NoiseCandidateReconcileRequest) -> None:
+    """只对当前 noise 候选执行 payload、身份、行闭包与字节校验。
+
+    @param request 当前 NoiseSlot 的独立候选请求。
     @return None。
     """
 
@@ -6055,22 +6207,69 @@ class DownstreamAttemptCollaborator(Protocol):
 class DedupIndex:
     """支持 sequence-group 原子准入的全局 dedup index。"""
 
-    async def group_probe(
+    async def group_reserve(
         self,
         request: DedupGroupRequest,
         context: RunContext,
-    ) -> DedupProbeToken:
-        """无突变地计算 exact、MinHash 与可选 embedding 特征。
+    ) -> DedupReservation:
+        """无正式索引突变地计算特征并创建 pending reservation。
 
         @param request 整组记录、豁免对与 embedding profile。
         @param context 与 GenerationServices 共享对象身份的运行上下文。
-        @return 仅可被当前 index generation 消费一次的 probe token。
+        @return 当前 coordinator 唯一拥有的 reservation capability。
         """
 
-    def group_commit(self, token: DedupProbeToken) -> None:
-        """无 await 地消费一个当前 token 并原子加入全部特征。
+    def group_revalidate(self, reservation: DedupReservation) -> None:
+        """无 await 地对最新正式索引重验并进入 Validated 状态。
 
-        @param token 当前 index generation 的未消费 token。
+        @param reservation 当前 epoch 的 Reserved capability。
+        @return None。
+        """
+
+    def group_commit(self, reservation: DedupReservation) -> None:
+        """无 await 地消费一个 Validated reservation 并原子加入全部特征。
+
+        @param reservation 当前 generation 已重验的 capability。
+        @return None。
+        """
+
+    def group_discard(self, reservation: DedupReservation) -> None:
+        """严格消费一次未提交 reservation，不修改正式索引。
+
+        @param reservation 当前 coordinator 或候选缓冲拥有的 capability。
+        @return None。
+        """
+
+
+class CrossViewFrontier:
+    """按声明序维护全局 ID、timestamp、source 与 phase ordinal 的增量状态。"""
+
+    def __init__(self, plan: ScenarioPlan): ...
+
+    def check_primary(
+        self,
+        candidate: PreparedCandidate,
+    ) -> CrossViewDelta:
+        """对当前 primary head 生成零正式突变的冻结 delta。
+
+        @param candidate 已通过 candidate-local 校验并深度冻结的当前 primary 候选。
+        @return 只含当前候选新增事实的 delta。
+        """
+
+    def check_noise(
+        self,
+        candidate: PreparedNoiseCandidate,
+    ) -> CrossViewDelta:
+        """对当前 noise head 生成零正式突变的冻结 delta。
+
+        @param candidate 已通过 noise-local 校验并深度冻结的当前 noise 候选。
+        @return 只含当前候选新增事实的 delta。
+        """
+
+    def commit(self, delta: CrossViewDelta) -> None:
+        """无失败、无 await 地消费当前 phase/ordinal 的已验证 delta。
+
+        @param delta 当前 frontier 的 check_primary/check_noise 返回值。
         @return None。
         """
 
@@ -6341,7 +6540,7 @@ Public `project_trace` and `project_replay` requests carry both GenerationProgra
 ScenarioPlan. Each first calls `validate_plan_identity`, then requires its complete DeliverySlot or
 ReplayLayout dataclass to occur exactly once in the canonical plan and rechecks canonical event,
 layout and source relationships. Coordinated digest, event-ID or row changes cannot establish a
-new root. DeliveryController validates the plan once at the delivery boundary and then calls only
+new root. SequenceWorkflow validates the plan once at the delivery boundary and then calls only
 package-private validated helpers; content retries do not rerun CP-SAT.
 
 Instruction-only freezes length and times before LLM calls; its planner chooses only eligible
@@ -6356,34 +6555,41 @@ A generated counterfactual set is first projected to attempt-local ProjectedSequ
 reaches downstream as one AttemptTransaction in variant declaration order:
 
 ```text
-group_probe
+group_reserve
 → pointwise quality
 → sequence and frame annotation
 → verify
 → M11 assemble_sequence(SequenceAssemblyRequest)
 → replay preprojection
-→ CrossViewReconciler
-→ retained-content prospective check
-→ group_commit
-→ merge attempt-local dataset counters
+→ reconcile_primary_candidate(PrimaryCandidateReconcileRequest)
+→ recursive freeze as PreparedCandidate
 ```
 
 The DedupGroupRequest exempts pairs inside the current set and compares every record with already
-committed sets. `group_probe(request, run_context)` may perform a real embedding request but
-writes no exact set, LSH, embedding store or other process-persistent dedup state. Its token
-contains the index generation, ordered record digests and every precomputed feature, never raw
-prompts or credentials. `group_commit` validates capability unconsumed, generation unchanged
-and record digests unchanged, then commits all three index families in one no-await critical
-section and invalidates the capability. Any validation failure is
-`generation_dedup_transaction`, exit 4, with zero partial insertion.
+committed sets. `group_reserve(request, run_context)` may perform a real embedding request and
+creates one registry-backed DedupReservation without writing the formal exact set, LSH, embedding
+store or pHash state. Pending reservations do not compare with or invalidate one another. The
+external reservation carries only opaque capability, epoch, record digests and compact exact
+cluster keys; MinHash, embedding, Record references and full frozen features exist once in the
+DedupIndex registry.
 
-`GenerationServices` is the sole source config/SchemaEngine/LLMClient/MetricsSink root.
-DeliveryServices does not duplicate RunContext or credentials. Dedup uses a context whose four
-shared objects are identity-equal to GenerationServices. For Quality, Annotate and Verify,
-DeliveryController derives an attempt-local cfg from the same source config but replaces
+Reservation state is exactly Reserved→Validated→Committed, Reserved→Discarded or
+Validated→Discarded. `group_revalidate` is no-await and checks the newest formal index. A conflict
+leaves the reservation Reserved so the same rejection path can discard it. Success records the
+current generation and enters Validated without formal mutation. `group_commit` accepts only that
+current Validated reservation, atomically inserts all index families, and consumes only itself.
+Generation drift after revalidation, repeated discard/commit, changed record digests or an illegal
+state is `generation_dedup_transaction`, exit 4. `reset()` empties the registry and increments the
+epoch; every success, exhaustion, fatal and cancellation cleanup leaves no pending reservation.
+
+`GenerationServices` is the sole source config/SchemaEngine/LLMClient/MetricsSink/TaskExecutor
+root. DeliveryServices does not duplicate RunContext, tasks or credentials. Dedup uses a context
+whose shared service identities equal GenerationServices. For Quality, Annotate and Verify,
+SequenceWorkflow derives an attempt-local cfg from the same source config but replaces
 `class_views`, `frame_class_views` and `frame_schema` with `GenerationProgram.class_views`,
 `GenerationProgram.frame_classes` and `GenerationProgram.frame_schema`; SchemaEngine, LLMClient
-and MetricsSink remain identity-equal, and only rng and batch number are otherwise new. Every
+MetricsSink and TaskExecutor remain identity-equal, while rng, batch number and task_namespace are
+attempt-specific. Every
 normal, frame and verify-repair path reads that attempt-local cfg; the source config's same-named
 views and Schema are not consulted or mutated.
 RuntimeCredentials exists only while the factory builds the LLMClient.
@@ -6391,18 +6597,20 @@ RuntimeCredentials exists only while the factory builds the LLMClient.
 QualityStage, AnnotateStage and VerifyStage implement `run_attempt`; AnnotateStage handles frame
 annotation in the same attempt entry. Their attempt entry shares pure production cores with
 ordinary `Stage.run` but does not first convert exceptions into item.errors.
-`AttemptTransaction.items` is the only PipelineItem truth; collaborators mutate those items in
-place. DownstreamAttemptResult returns only accepted, rejected_stage and that stage's dataset
-counter delta. DeliveryController accumulates deltas in a local integer table and merges them
-only after group commit. Rejection discards the items, projections and all local deltas. Schema
-resolved-at statistics, trace, LLM usage, latency, retries, tokens and cost are run facts and are
-never rolled back.
+`AttemptTransaction.items` is the only PipelineItem truth, but leaf calls return frozen outcomes
+and never mutate an item, pool, member map, event list or error list. The owning collaborator
+reduces outcomes by frozen item/criterion/sample/member/judge ordinal before advancing to the next
+business wave. DownstreamAttemptResult returns only accepted, rejected_stage and that attempt's
+dataset-counter delta. Metrics capture is ContextVar-local to the collaborator and merges only
+after ordered group commit. Rejection discards items, projections and dataset deltas. Schema
+statistics, trace, LLM usage, latency, retries, tokens, cost and resource/origin waits are run facts
+and never roll back.
 
 `ProviderFatalError`, `CircuitBreakerTripped`, `KeyboardInterrupt` and
-`asyncio.CancelledError` pass through every collaborator and group_probe unchanged; they
+`asyncio.CancelledError` pass through every collaborator and group_reserve unchanged; they
 terminate the run immediately and consume no attempt. A new item ErrorKind.PROVIDER_FATAL on an
 attempt path proves accidental Stage isolation and becomes `generation_downstream_contract`,
-exit 4. ProviderRetryableError from group_probe becomes the current attempt's
+exit 4. ProviderRetryableError from group_reserve becomes the current attempt's
 `provider_retryable_exhausted`. SchemaViolation, recoverable ContextOverflowError,
 OutputTruncatedError and ordinary quality/annotation/verification rejections return an
 unaccepted result and consume the attempt.
@@ -6417,17 +6625,50 @@ annotation against `GenerationProgram.frame_schema`. `FrameClassView.gen_schema`
 generation Schema and is never an annotation fallback. A final annotation violation raises
 `sequence_projection_mismatch`, consumes the current whole-set attempt and leaves dedup, dataset,
 rows and replay state unchanged. A replay-source positive is projected only after this assembly,
-from the final primary stream rows. Prospective retained content is the previously accepted total
-plus every current SequenceRows and ReplayRows byte count. If it would exceed 536870912 bytes, the
-entire source slot is rejected as `sequence_memory_budget` with zero dedup, dataset and replay
-commit. Source and replay rows enter the same in-memory critical section after group commit; no
-uncharged replay is constructed later.
+from the final primary stream rows. Candidate-local reconciliation requires every variant-aligned
+witness/SequenceRows and every ReplayLayout-aligned ReplayRows, recomputes the candidate's actual
+canonical bytes, and never reads the committed prefix. A missing/extra variant or replay, forged
+digest/identity/row or local byte mismatch is the current attempt's reconcile rejection.
+
+After local success, PreparedCandidate recursively freezes slot/attempt identity, witnesses,
+SequenceRows, all ReplayRows, reservation, dataset-counter delta, actual retained bytes and the
+candidate digest. Only then does reservation ownership transfer from the coordinator to the
+candidate buffer. An untransferred coordinator discards in `finally` exactly once. The freeze
+boundary releases AttemptTransaction, PipelineItems and projection intermediates; later mutation
+is impossible.
+
+At the declaration-order head, the no-await commit path is exactly:
+
+```text
+group_revalidate
+→ frozen candidate digest validation
+→ CrossViewFrontier.check_primary
+→ committed bytes + candidate bytes retained-content check
+→ prevalidate dataset/DeliveryState/frontier delta
+→ group_commit
+→ CrossViewFrontier.commit + dataset/rows/replays/retained state commit
+```
+
+Dedup revalidation precedes all other recoverable gates. A downstream recoverable failure that
+occurred after reservation keeps the reservation until its ordinal is head: a newly committed
+lower candidate can therefore turn its final disposition into dedup, matching declaration-order
+first-writer semantics. Only if revalidation still passes is the saved downstream failure recorded
+and discarded. Once group_commit succeeds, all remaining state swaps are prevalidated and cannot
+raise an ordinary rejection. Source and replay rows enter the same critical section; no replay is
+constructed later or escapes retained accounting.
 
 CrossView never accepts final rows merely because their IDs are mutually self-consistent.
-`ReconcileRequest` carries the GenerationProgram, run ID, immutable ProjectionWitness values
-aligned with final SequenceRows, post-gate noise-payload digests aligned with final noise rows,
-ReplayRows grouped in ReplayLayout order, and the controller's prospective or final retained-byte
-total. It compares full-SHA-256 digests of every final primary payload/base
+PrimaryCandidateReconcileRequest and NoiseCandidateReconcileRequest prove each candidate's closed
+local truth. CrossViewFrontier then stores phase/next ordinal and committed event ID, timestamp and
+source sets. `check_primary` and `check_noise` inspect only the current head against those sets and
+return a frozen CrossViewDelta with no formal mutation; `commit(delta)` is no-await and
+failure-free for that exact current delta. Each slot therefore does work proportional only to its
+own rows. Primary completion switches to noise without clearing global uniqueness sets.
+
+After all in-memory commits, final `ReconcileRequest` carries the GenerationProgram, run ID,
+immutable ProjectionWitness values aligned with final SequenceRows, post-gate noise-payload
+digests aligned with final noise rows, ReplayRows grouped in ReplayLayout order and final retained
+bytes. It compares full-SHA-256 digests of every final primary payload/base
 event/generation tuple and every final noise payload with its source witness, while allowing only
 downstream classification and annotation additions on primary rows. It independently re-derives
 scenario, world-branch, primary event, sequence, noise event-key and noise event IDs from the
@@ -6437,30 +6678,52 @@ actual canonical rows; summing trusted carrier counters is insufficient. Declare
 role/frame/actor values must also match the RoleSpec. A synchronized payload-plus-ID rewrite,
 arbitrary valid-looking noise ID or forged byte total is therefore a reconcile rejection.
 
+This full `reconcile_views()` independently rebuilds all facts exactly once. A disagreement with
+candidate-local/frontier state is an InternalError, exit 4, consumes no attempt, uses
+`failed_slot=null`/`attempts_used=0`, opens no success output and cannot replace a manifest. There
+is no prospective-prefix reconciliation API.
+
 `projection_witness(projection)` is called while the attempt-local ProjectedSequence still
 exists. ProjectionWitness contains only `main_record_id`, `generation_digest`,
 `member_sources_digest` and ordered `primary_base_digests`; no payload, Record or row survives in
 it. Each digest is full SHA-256 over canonical
 `["labelkit:v1.18", domain, value]`, with domains `projection_main_generation`,
-`projection_member_sources`, `projection_primary_base` and `noise_payload`. After slot commit,
-ProjectedSequence, PipelineItem and AttemptTransaction are released. The 500000-unit RSS gate
+`projection_member_sources`, `projection_primary_base` and `noise_payload`. At the PreparedCandidate
+freeze boundary, ProjectedSequence, PipelineItem and AttemptTransaction are released. The
+500000-unit RSS gate
 includes all compact witnesses.
 
 #### 7.18.6 Delivery, replay and run terminal behavior
 
-Slots are serially admitted in declaration order; variants within a slot use declaration order.
+SequenceWorkflow owns one coordinator TaskGroup inside the execution domain. The candidate window
+is the continuous declaration-order interval beginning at `next_commit`; its capacity is the sum
+of distinct ResourceKey capacities referenced by the current phase, capped by remaining slots.
+One window permit is acquired before a coordinator is created and held across attempt preparation,
+PreparedCandidate/recoverable outcome, ordered wait and retry until that ordinal commits or the
+run terminates. A high ordinal that finishes early remains in its original window position and
+does not admit a tail beyond the interval. Expensive complete attempts run concurrently across
+slots; variants within each slot retain declaration order and event state dependencies.
 Each attempt seed is the full integer digest of canonical
 `["labelkit:v1.18", "attempt_random", [seed, slot_identity, attempt_index, purpose]]`; Python
 `hash()` and caller-concatenated strings are forbidden.
 Retry restarts from ScenarioSeed; catalog retries keep the assigned row. Frozen pattern,
 variant, role, logical time, artifact time, session, noise slot and replay source never change.
 
-Noise runs only after all primary slots accept. Each slot carries the unique topic declared at
-the same ordinal. It sees only noise instruction/schema, that topic, class/frame name-description
-registries, timestamp and attempt identity. It passes its object Schema, four-boolean independent
-semantic evaluation and an attempt-local SimilarityFilter preloaded with all
-primary member text plus accepted noise. It never runs quality, annotate, verify or main group
-dedup. Noise retained-byte overflow is `noise_memory_budget`.
+Noise runs only after all primary slots commit. Noise generation and independent semantic
+evaluation prepare concurrently in a new continuous window. Each slot carries the unique topic at
+the same ordinal and sees only noise instruction/schema, that topic, class/frame name-description
+registries, timestamp and attempt identity. It passes its object Schema and four-boolean semantic
+gate before `reconcile_noise_candidate` recursively freezes a PreparedNoiseCandidate containing
+slot/attempt identity, payload digest, final row, immutable similarity signature, the frozen
+dataset-counter delta, actual retained bytes and digest. It never runs quality, annotate, verify or
+main-group dedup.
+
+At the noise head, SimilarityFilter probes the latest primary plus lower committed noise, then the
+no-await path verifies candidate digest, obtains CrossViewFrontier.check_noise delta, checks
+retained bytes, prevalidates state, commits the similarity signature, and finally commits frontier,
+row and retained state. Similarity conflict or retained overflow rejects only that noise attempt;
+no ordinary rejection can occur after similarity commit. Replay has no coordinator or model call:
+it derives only from final source SequenceRows and travels with that source candidate.
 
 Attempt exhaustion raises `DeliveryError(kind="sequence_delivery_exhausted", slot_key=...,
 attempts_used=...)` and exit 1. The exception contains no content. Before formal commit,
@@ -6468,6 +6731,14 @@ DeliveryError, provider fatal, circuit trip, SIGINT and cancellation replace non
 stream, success report or manifest. Sequence mode never delivers a partial prefix and never
 opens rejects. It best-effort atomically writes only the data-free failed report after run
 identity/path initialization.
+
+When the current head exhausts, SequenceWorkflow stops admission, cancels and awaits all higher
+coordinators, discards every reservation/candidate/capture and verifies zero pending registry,
+admission and resource/origin permits before freezing the failed report. Recoverable outcomes from
+higher ordinals never enter slot-attempt or rejection buckets. Already observed usage, retry,
+Schema, trace and provider timing remain run facts. Concurrent fatal selection uses the smallest
+stable phase/slot/attempt/declaration key after all cleanup; external cancellation uses
+`failed_slot=null`, `attempts_used=0` and preserves CancelledError.
 
 M1 freezes main, stream, report, manifest and failed-report paths while rejects and sidecar are
 `None`. SequenceDeliveryEmitter opens no success channel until all slots, CrossView checks and
@@ -6485,6 +6756,147 @@ IDs must be well-formed and globally unique. It verifies every duplicate source 
 replay position exactly matches source payload/frame/role/order. Any mismatch fails closed; it
 does not read main or use an old ID formula. Sequence dedup joins member text in order, so new
 replay IDs do not prevent exact duplicate detection.
+
+### 7.19 M17 — `labelkit/runtime/`
+
+#### 7.19.1 Exact execution contracts
+
+`labelkit/common/contracts/execution.py` is the only cross-layer execution contract. It uses
+Python 3.11-compatible TypeVar/Generic syntax:
+
+```python
+T = TypeVar("T")
+ResourceKey = tuple[Literal["llm", "embedding"], str]
+HttpOrigin = tuple[str, str, int]
+
+
+@dataclass(frozen=True)
+class TaskSpec(Generic[T]):
+    task_id: str
+    declaration_key: tuple[int, ...]
+    stage: str
+    resource_key: ResourceKey
+    operation: Callable[[], Awaitable[T]] = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class TaskGroupRequest(Generic[T]):
+    tasks: tuple[TaskSpec[T], ...]
+
+
+class TaskExecutor(Protocol):
+    async def run_group(self, request: TaskGroupRequest[T]) -> tuple[T, ...]: ...
+
+
+class ResourceLimiter(Protocol):
+    def resource_limit(self, resource_key: ResourceKey) -> AsyncContextManager[None]: ...
+    def origin_for(self, resource_key: ResourceKey) -> HttpOrigin: ...
+    def origin_limit(self, origin: HttpOrigin) -> AsyncContextManager[None]: ...
+
+    @property
+    def http_connection_capacity(self) -> int: ...
+```
+
+`operation` is excluded from repr/comparison and never enters logs, trace, reports, hashes or
+serialization. An empty request returns an empty tuple without creating a task or HTTP client.
+Results preserve request input order. A recoverable business failure is a typed result; only
+fatal/control/internal exceptions escape. task_id is unique across one execution domain and
+contains only run/batch-or-slot/attempt/stage/ordinal identity. Duplicate IDs and unknown resources
+fail before any leaf starts. declaration_key is globally comparable and selects simultaneous
+fatals only; it never changes reduction order.
+
+RunContext has exactly the eight §5 fields. RunServices and GenerationServices each carry the same
+explicit TaskExecutor identity. There is no default executor, implicit task identity, ContextVar
+task namespace or old constructor form.
+
+#### 7.19.2 Concrete runtime and resources
+
+```python
+class ResourceManager(ResourceLimiter):
+    def __init__(self, capacities: Mapping[ResourceKey, int],
+                 origins: Mapping[ResourceKey, HttpOrigin],
+                 metrics: MetricsSink | None): ...
+    def admission_capacity(self, resource_key: ResourceKey) -> int: ...
+    def resource_limit(self, resource_key: ResourceKey) -> AsyncContextManager[None]: ...
+    def origin_for(self, resource_key: ResourceKey) -> HttpOrigin: ...
+    def origin_limit(self, origin: HttpOrigin) -> AsyncContextManager[None]: ...
+
+    @property
+    def http_connection_capacity(self) -> int: ...
+
+
+class ExecutionRuntime(TaskExecutor):
+    def __init__(self, resources: ResourceManager, metrics: MetricsSink): ...
+    async def run(self, workflow: Callable[[], Awaitable[T]]) -> T: ...
+    async def run_group(self, request: TaskGroupRequest[T]) -> tuple[T, ...]: ...
+```
+
+Application creates one ResourceManager, one ExecutionRuntime and one LLMClient for a live run.
+`ExecutionRuntime.run()` is the sole execution-domain entry. A `run_group()` outside that domain,
+inside a leaf, or after shutdown fails closed; nested `run()` also fails. All groups and sequence
+coordinators finish inside the root structured scope, so `run()` cannot return with a live child.
+
+Each ResourceKey owns one execution-domain admission counter shared by every run_group. Requests
+split by ResourceKey before blocking so an A=1 lane cannot prevent an independent B=599 lane from
+starting. A leaf is created only after admission. Permit ownership transfers to its task done
+callback, which releases the slot even if cancellation happens before the coroutine body starts; aggregate
+admitted leaves for a resource never exceed that profile's max_concurrency across concurrent
+groups. TaskSpec tuples are bounded business plans, not created leaves. Runtime does not promise
+cross-group FIFO or starvation freedom for one resource.
+
+scheduler captures one Context at run_group entry and passes a distinct `captured.copy()` to every
+TaskGroup child. Mutable attempt metrics can intentionally be the same referenced dict across
+those copies; all other ContextVar writes stay sibling-local. Leaf wrappers catch ordinary
+Exception only. CircuitBreakerTripped uses a dedicated group-control wrapper: it cancels and cleans
+up siblings in the current run_group, then re-raises to the owning workflow without entering the
+root fatal ledger. This preserves ProcessWorkflow's frozen partial-delivery finalization while a
+sequence workflow can still treat the same control as terminal. TaskGroup cancellation waits for cleanup; after the full execution domain settles,
+the smallest declaration_key's original error is re-raised without ExceptionGroup. KeyboardInterrupt,
+SystemExit and CancelledError retain language semantics. A leaf that raises CancelledError directly
+or cancels its own asyncio task aborts the execution domain as cancellation, never as InternalError.
+External cancellation stops admission, cancels all created children, waits for cleanup and restores
+every admission/resource/origin permit before re-raising CancelledError.
+
+Resource capacities are exactly active profile max_concurrency values. Logical resource permits
+span the entire LLM/embed call including retry, cooldown and parking. Application normalizes all
+referenced base URLs through `httpx.URL` to `(lowercase scheme, IDNA host, effective port)` and
+sums profile capacities by origin. ResourceManager freezes those mappings and origin permits.
+An explicit parsed port is preserved; only an absent port receives the scheme default, and
+ResourceManager rejects a non-positive port instead of folding it into the default origin.
+Shared AsyncClient capacity is the sum of origin capacities for both max connections and keepalive
+connections. Explicit origin admission is the sole `http_pool_wait_ms` measurement. PoolTimeout
+after admission is InternalError, never retryable. Zero-origin static paths create no client.
+`resource_wait_ms` and `http_pool_wait_ms` include elapsed waits that end in cancellation; a
+cancelled waiter contributes once and never consumes a permit.
+
+No `[runtime]`, workers, queue-size, thread-count or HTTP-pool setting exists. No production
+dependency is added. All production gathers are removed from operators; pure leaves use
+TaskExecutor and reducers mutate shared business state in frozen ordinal order.
+
+#### 7.19.3 Lifecycle, determinism and evidence
+
+Static validate and estimate create neither ExecutionRuntime nor AsyncClient. Dry-run may construct the
+single inert ExecutionRuntime required by the exact RunServices TaskExecutor identity, but never enters its
+execution domain, creates leaves or constructs AsyncClient.
+`validate --probe` creates ResourceManager and the root LLMClient, passes an exact ResourceKey for
+every referenced profile, uses the same profile/origin permits and closes in `finally`. Same-named
+LLM and embedding profiles are independent probe targets and their results retain `kind`. A live run
+constructs runtime only after config/program/plan
+freeze. Application is the only close owner. Root close is idempotent and physically once; normal
+close failure is InternalError, while a primary exception/cancellation remains primary after
+logged close cleanup.
+
+Capacity cannot alter task identity, RNG consumption, first-writer, attempt reduction or final
+sorting. Ordinary batch/stage barriers remain. Sequence coordinators prepare complete attempts in
+the continuous bounded window and the sole ordered commit coordinator mutates dedup/frontier/
+DeliveryState. Provider response bytes and completion-time trace order remain nondeterministic.
+
+Scheduler tests use controlled coroutines for six hundred-task admission, reverse completion,
+resource isolation and cancellation; they do not claim endpoint capacity. The only local-endpoint
+exception is real Qwen3.5-4B-Q6_K through llama-server for the four-slot v1.19 E2E and same-shape
+before/after performance evidence. It supplements and never replaces the real DeepSeek sequence
+and z.ai structured-output release gates; mock transports and recorded responses remain forbidden.
+
 ## 8. Observability contract (M12 + ch.7)
 
 ### 8.1 Event catalog (stable contract, `trace_schema_version = 1`, additive-only)
@@ -6913,6 +7325,10 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
   //     (L3-repair-internal overflows excluded, V25①); image_cost = each profile's
   //     calibration END value (V19 — reconciles against usage); degrade_retries = V20
   //     overflow degrade retries; escalations = V21 ladder escalations
+  "runtime": {"queue_high_water": 0, "running_high_water": 0,
+              "resource_wait_high_water": 0, "commit_waiting_high_water": 0,
+              "candidate_bytes_high_water": 0, "cancelled_tasks": 0,
+              "resource_wait_ms": 0, "http_pool_wait_ms": 0, "commit_ms": 0},
   "trace": {"enabled": true, "path": "...", "events": 0, "dropped_events": 0},
   "llm_usage": {"<profile>": {"calls": 0, "prompt_tokens": 0, "completion_tokens": 0,
                               "est_cost_usd": 0.0, "retries": 0
@@ -6926,6 +7342,16 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
                                           "verify": 0 /* enabled stages only */}}
 }
 ```
+
+The top-level `runtime` object is present on every live success report and failed report. A static
+dry-run emits the same ordered nine keys with zero values because it does not construct the runtime.
+`queue_high_water`, `running_high_water` and `resource_wait_high_water` are runtime-global task
+gauges; `commit_waiting_high_water` and `candidate_bytes_high_water` measure completed candidates
+waiting for their deterministic commit turn, with candidate bytes equal to the sum of their compact
+canonical final payload bytes. `cancelled_tasks` counts runtime-owned leaf tasks cancelled by
+structured shutdown. The three `*_ms` values are cumulative monotonic durations: resource-permit
+wait, explicit origin-connection-pool wait and ordered-commit time. This object contains no data,
+callable, endpoint, normalized origin or API-key value.
 
 **Counts invariant (test-asserted):**
 `emitted + dropped_dup + dropped_lowq + dropped_verify + failed + bad_input = scanned + generated
@@ -7046,8 +7472,8 @@ records on re-flow), `classify.*` by M13 (v1.7), `quality.tie_*` by M4, `segment
 by M7 (v1.8), `stitch.*` by M16 (v1.9), `frame_classify.*` by M13 and `frame_annotate.*` by
 M5/M11 per the v1.12 split above.
 
-v1.18 sequence mode does not feed this generic process/flat conservation ledger. Its accepted
-attempt counters are merged exactly once by the delivery controller; LLM usage and latency from
+v1.19 sequence mode does not feed this generic process/flat conservation ledger. Its accepted
+attempt counters are merged exactly once by the ordered commit coordinator; LLM usage and latency from
 all attempts remain in the generic run usage ledger. The frozen sequence report follows.
 
 ```jsonc
@@ -7137,8 +7563,9 @@ one delivery slot; neither includes L3 or provider retries.
 The failed report always contains `run_attempt_id`, nullable `run_id`,
 `artifacts_committed=false`, nullable `failed_slot`, integer `attempts_used`,
 `terminal_error_kind`, the same usage object and the same closed `rejected_attempts` object. It
-contains no delivered prefix, by-pattern delivery, state, payload, patch, prompt or exception
-text. Before a plan exists, `run_id` is null.
+contains the same top-level ordered nine-key `runtime` object as a success report and contains no
+delivered prefix, by-pattern delivery, state, payload, patch, prompt or exception text. Before a
+plan exists, `run_id` is null.
 
 ### 9.4 Atomic delivery
 
@@ -8155,7 +8582,7 @@ alignment parenthesis), `_LABEL_FRAME_MEMBERS`, `_LABEL_MEMBER_SCREENSHOT`,
   budget estimation prices the UN-substituted constant form — the 1–2-char substitution
   delta is absorbed by the margin (the segment §10.9 precedent, V7).
   `TEMPLATE_HEAD_TOKENS["frame_classify"] = 81 = est_text(_FRAME_SYSTEM_HEAD)` is pinned
-  by the cross-layer equality test (`tests/common/runtime/test_budget.py`, §7.17).
+  by the cross-layer equality test (`tests/common/inference/test_budget.py`, §7.17).
 - One call per WINDOW (`budget.pack_windows` zero-overlap invocation form under a
   declared budget; budget off ⇒ one window = all members, §7.13/§7.17). Response
   validated against `frame_classify_schema(names, n)` — exact JSON in §7.13; positional
@@ -8695,8 +9122,11 @@ its final full-Schema revalidation occur after M8 success and never enter L3.
 ## 11. Cross-cutting conventions (binding)
 
 1. **Async everywhere LLM is involved.** `Stage.run`, `complete_validated`, `complete`, `embed`,
-   `probe`, `Orchestrator.run` are `async def`. Record-level concurrency inside a stage via
-   `asyncio.gather`; stages are serial within a batch (barrier); batches are serial.
+   `probe`, `ProcessWorkflow.run`, `ExecutionRuntime.run` and `TaskExecutor.run_group` are
+   asynchronous. Ordinary processing has one active batch and strict stage barriers. A stage
+   synchronously plans immutable TaskSpec leaves, dispatches them through the shared TaskExecutor,
+   then reduces results in declaration order. Production operators submit concurrency only through
+   TaskExecutor.
 2. **Stages never remove items** — status flips only; `generate` returns a new list instead
    (the v1.7 multi-label fan-out exception: classify multi may tail-append; the v1.8
    segment-absorption exception: segment may tail-append sequence
@@ -8749,12 +9179,12 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
    operand is `0`, else
    `NotImplemented`) so plain `sum(usage_list)` works; per-profile accumulator
    `ProfileUsage{calls, prompt_tokens, completion_tokens, retries, est_cost_usd}`.
-5. **RunContext 六字段** — `RunContext` is exactly the spec's six fields (cfg, llm,
-   schema_engine, rng, batch_no,
-   metrics — spec 3.10.3); spec 3.12.3 forbids changing its signature, so `run_id` /
-   `run_started_at` travel via the Orchestrator/Emitter/MetricsSink constructors instead
-   (2026-08-14: on the Orchestrator side they ride the `RunServices` parameter object, §7.9).
-   One RunContext per (batch, stage) invocation.
+5. **RunContext 八字段与任务身份** — `RunContext` is exactly `cfg`, `llm`, `schema_engine`,
+   `rng`, `batch_no`, `metrics`, `tasks` and `task_namespace`. `RunServices`, every RunContext,
+   every GenerationServices and each derived context retain the Application-owned TaskExecutor
+   object identity. `run_id` and `run_started_at` travel through RunServices, Emitter and
+   MetricsSink. One RunContext exists per (batch, stage) invocation; `task_namespace` is derived
+   from the frozen run/batch/stage identity.
 6. **profile 名与配置摘要** — `LLMProfile`/`EmbeddingProfile` carry `name` and normalized
    environment-variable names only; secret values live exclusively in the non-repr,
    non-serializable `RuntimeCredentials` on `run` and `validate --probe` paths.
@@ -8766,8 +9196,12 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
    §7.7); constructor takes optional `metrics`;
    `user_schema_text` = single-line `json.dumps(..., ensure_ascii=False, separators=(", ", ": "))`;
    L1 exposed as module-level `deterministic_repair()`; internal schema JSONs of §10.7.
-8. **LLMClient 构造与 emit 工具** — `LLMClient.__init__` takes split
-   `llm_profiles`/`embedding_profiles` dicts + `metrics`;
+8. **LLMClient 构造、资源与 emit 工具** — `LLMClient.__init__` takes split
+   `llm_profiles`/`embedding_profiles`, `RuntimeCredentials`, the Application-owned
+   `ResourceLimiter` and optional `MetricsSink`. LLMClient has no profile semaphore; every
+   complete logical provider call holds the matching ResourceManager permit. HTTP clients are
+   lazy, shared by normalized origin, explicitly bounded to the sum of profile capacities at that
+   origin and closed exactly once by Application;
    Anthropic structured output uses a tool named `"emit"` and header
    `anthropic-version: 2023-06-01`; retry jitter RNG is not seed-derived;
    `CircuitBreakerTripped` exception + fail-fast at call entry once the breaker is open.
@@ -8808,9 +9242,11 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     name); disabled stages →
     `null` in `_meta`; histogram bucket labels `"0.0-0.1"`…`"0.9-1.0"`; report `quality.mode`
     uses the `pairwise_bt`/`pointwise` strings; MetricsSink counter-key vocabulary.
-17. **Orchestrator 构造与退出码** — Orchestrator extra constructor params (`schema_engine`,
-    `metrics`, `run_id`, `run_started_at`) — carried since 2026-08-14 by the exported
-    `RunServices` parameter object (§7.9), `RunSummary` shape, report assembly owned by M10 —
+17. **Application、ProcessWorkflow 与退出码** — Application owns the sole ExecutionRuntime,
+    ResourceManager and LLMClient lifecycle. `schema_engine`, `metrics`, `run_id`,
+    `run_started_at` and `tasks` travel in the exported RunServices parameter object (§7.9).
+    ProcessWorkflow owns ordinary batch/stage flow and report assembly; SequenceWorkflow owns
+    sequence preparation and ordered commit. `RunSummary` remains the result carrier —
     `RunSummary.exit_code` / `report.run.exit_code` fold in the `--strict` escalation
     (1 when cfg.strict and rejects > 0; report-write failure is the only exit-1 cause not
     representable in the report),
@@ -9207,4 +9643,16 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     - **re-frozen byte anchors**: the eight `tests/cli/goldens/dryrun-*.txt` files and the two
       `console_format` plain lines (progress line + final-summary header) are re-frozen onto
       the English strings; key sets, line structure and information content are unchanged.
+35. **v1.19 统一执行运行时冻结点** — Application enters one ExecutionRuntime domain and shares
+    one TaskExecutor and ResourceManager with ordinary and sequence workflows. Resource-aware
+    channels enforce one execution-domain admission bound per ResourceKey; ResourceManager owns
+    logical-call permits and normalized-origin HTTP permits. TaskGroup cancellation is structured,
+    leaf ContextVars are copied independently, results reduce in request order and reports expose
+    the frozen nine-key runtime block. Sequence uses a continuous bounded candidate window,
+    DedupReservation, immutable PreparedCandidate or PreparedNoiseCandidate values, candidate-local
+    CrossView checks, incremental CrossViewFrontier deltas and a no-await declaration-order commit.
+    Package ownership is `labelkit/runtime`, `labelkit/common/inference`,
+    `labelkit/orchestration/application.py`, `process_workflow.py` and `sequence_workflow.py`.
+    The real local Qwen3.5-4B-Q6_K gate supplements runtime E2E and performance evidence; it never
+    replaces the real DeepSeek or z.ai release gates.
 — End of contract. —

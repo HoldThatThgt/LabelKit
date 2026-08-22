@@ -19,7 +19,12 @@
 | ① 精确 | 去重键 = `sha256(dedup_text)`。`dedup_text`：文本模态为抽取文本经 NFC 规范化、连续空白折叠为单空格、strip 后的字节；UI 模态为 UI 树规范序列化（4.3 节 `UITree.serialize()`，不含坐标抖动位——坐标按 `dedup.bounds_quantize_px`（默认 4px）量化后参与序列化）。哈希入 `set`，O(1) 查询。 | 哈希相等 |
 | ② 近似 | MinHash：`dedup_text` 的字符 n-gram（默认 n=5，对中英混合文本鲁棒；空白折叠后取滑窗）shingle 集合 → 128-permutation 签名 → `datasketch.MinHashLSH(threshold=0.85)` 查询候选 → 对候选精算签名估计 Jaccard，≥ 阈值判重。首见者入索引（first-writer-wins，保留簇内最早记录，与 Lee et al. 的 cluster-keep-one 策略一致 [3]）。 | 估计 Jaccard ≥ `dedup.minhash_threshold` |
 | ③ 图像（仅 UI 模态） | 截图缩放解码 → 64-bit pHash（imagehash 默认 DCT 实现）→ 与索引中全部已保留 pHash 求汉明距离（64-bit 异或 popcount，50 万条线性扫描 < 100ms/查询，可接受；实现里按 16-bit 前缀分桶加速）。 | 汉明距离 ≤ `dedup.image_phash_max_distance`（默认 8） |
-| ④ 语义（可选） | `dedup.semantic = true` 时启用（默认 false，5.2）：`dedup_text` → 经 config.toml `[embedding.<name>]` profile（由 `dedup.semantic_embedding` 引用，5.1）取句向量（M9 `embed()`，3.9.2；向量 L2 归一化后余弦 = 点积）→ 与索引中全部已保留向量求余弦相似度（批内与全局索引通查，实现为向量矩阵化点积的线性扫描（pHash 的 16-bit 前缀分桶依赖汉明位结构，不适用于稠密向量），规模上限见 2.6 注）→ 达阈判重，kind=`"near_semantic"`（4.2）；未判重者向量入索引（first-writer-wins，同②）。执行序在①②③之后，仅当前级已构成判重（含 UI 模态合成判定成立）时才短路——UI 模态 `ui_dup_requires="both"` 下③单独命中不构成判重、不短路④；仅对尚未判重的记录发起 embedding。UI 模态：作用于树规范序列化文本（与①②同一 `dedup_text`），在合成判定中视同 tree 层命中（见下段）。成本：每条参检记录 1 次 embedding 调用（走 M9 计量与重试，3.9.3）。 | 余弦相似度 ≥ `dedup.semantic_threshold`（默认 0.95，SemDeDup 论文的高相似区间 [26]） |
+| ④ 语义（可选） | `dedup.semantic = true` 时启用（默认 false，5.2）：`dedup_text` 经 `[embedding.<name>]` profile（由 `dedup.semantic_embedding` 引用）取得 L2 归一化句向量，再与全部已保留向量做矩阵化余弦点积。归并前对所有按 modality、`ui_dup_requires`、图像解码状态与 sequence 身份静态判定为 participating 的 item 投机并发取得 embedding；这包括随后可能被较低 ordinal 的 exact、MinHash、pHash 或 semantic 判决淘汰的 item。归并屏障仍按输入序执行①→②→③→④，只有真正到达④才消费预计算 vector。未使用 outcome 不修改 `PipelineItem` 或 `DedupIndex`，但调用 usage、provider result、breaker、latency 与 embedding failure 是运行事实。 | 余弦相似度 ≥ `dedup.semantic_threshold`（默认 0.95，SemDeDup 论文的高相似区间 [26]） |
+
+普通批次先同步冻结每个 active item 的 exact、MinHash、pHash、图像解码状态、sequence 身份与 embedding input；
+CPU 特征不提交叶任务。semantic 开启时，embedding 通过 `RunContext.tasks` 的资源通道执行，结果按输入 ordinal
+归并。semantic 关闭、hash-only 与 UI image-only 路径提交零叶任务。capacity 变化不得改变 participating task 集合、
+first-writer 或最终判决。
 
 UI 模态合成判定：`dedup.ui_dup_requires = "both"`（默认，树近似重 **且** 图近似重才判重——最保守，避免同一界面模板不同内容被误杀）| `"tree"` | `"image"`。精确层（①）命中则无条件判重。生成样本回流批同样经过本模块，天然实现 Self-Instruct 的「新样本与已有样本相似度过滤」[18]（以 MinHash-Jaccard 替代其 ROUGE-L，二者同为 n-gram 重叠度量，MinHash 可索引化）。
 
@@ -30,12 +35,26 @@ UI 模态合成判定：`dedup.ui_dup_requires = "both"`（默认，树近似重
 拼接。精确与 MinHash 在拼接文本上执行；sequence 没有顶层 image，pHash 自动跳过，
 `ui_dup_requires = "both"` 按 tree-only 降级；semantic 也使用完整拼接文本。
 
-v1.18 exact delivery 不先污染全局索引。一个 counterfactual set 的所有 variant 按声明序放入
-`DedupGroupRequest`，组内配对变体相互豁免，只与已提交 set 比较。异步 `group_probe` 可以完成真实
-embedding 并返回一次性 token，但不得写 exact set、MinHash LSH 或 embedding store；whole-set 接受后
-`group_commit` 才在无 await 临界区验证 token、index generation 与 record digest，并原子写入全部索引。
-probe rejection 或后续 quality/annotate/verify、M11 装配、replay 投影、reconcile、retained-content
-prospective check 的任何 rejection 均零写入。
+sequence exact delivery 不先污染全局索引。一个 counterfactual set 的所有 variant 按声明序放入
+`DedupGroupRequest`，组内配对变体相互豁免，只与已提交 set 比较。异步 `group_reserve` 计算 exact、MinHash
+与可选 embedding 特征，检查当前正式索引和组内非豁免重复，然后在 `DedupIndex` registry 创建
+`DedupReservation`，不写任何正式索引。pending reservation 彼此不参与早期判重；只有较低 declaration
+ordinal 的候选真正提交后，较高 ordinal 才在自己成为当前提交槽时重新验证。这同时保持确定性
+first-writer-wins 与完整昂贵 attempt 的跨槽并发。
+
+reservation 状态只按 `Reserved → Validated → Committed`、`Reserved → Discarded` 或
+`Validated → Discarded` 推进。对外 `DedupReservation` 只携带 opaque capability、epoch、record digests
+和小型 exact cluster keys；MinHash、embedding、Record 引用与完整冻结特征只在 registry 保留一份。
+`group_revalidate` 无 `await`，对最新正式索引重查；冲突时 reservation 保持 Reserved，调用方在同一
+无 `await` 拒绝路径 discard。成功时才进入 Validated，仍为零正式索引突变。
+
+`group_commit` 只接受当前 generation 的 Validated reservation，原子写入全部索引并只消费自己，不清理其他
+pending reservation。revalidate 成功后 generation 变化或 commit 失败是 `generation_dedup_transaction`
+内部错误，不得转为普通 duplicate rejection。`group_reserve` 返回后由当前 slot coordinator 唯一拥有
+reservation；只有深度冻结候选成功放入候选缓冲后，所有权才转移给缓冲与提交协调器。coordinator 在未转移
+终态的 `finally` 中恰好执行一次 `group_discard`。`group_discard` 严格消费一次，重复 discard 是所有权错误。
+`reset` 清空 registry 并递增 epoch；旧 epoch、Record 内容变化或非法状态均为内部错误。成功、耗尽、fatal
+与 cancellation cleanup 后 registry 均必须为空。
 
 **线索记录（v1.9）。**stitch 启用时抵达本模块的判重单元升维为**线索**（thread——M16 缝合后的幸存序列信封，链序 stitch 在 dedup 之前，3.10.3/3.16）：`dedup_text` 配方**机制原样**（上列 S10 序列分支零改动）——成员逐条按其单记录配方产出后按成员序以 `"\x1e"` 拼接，作用对象自然是**重绑后**的成员元组，线索级重复 =「同样的完整操作流程（含恢复段）」；被并 episode 壳（`status = "stitched"`）被既有 `status == "active"` 处理面过滤**天然排除**、不参检不入索引（absorbed 成员帧同理）——**本模块代码零改动**（T13，审计核查点 6）。
 
@@ -53,21 +72,27 @@ class DedupIndex:
     """运行内存索引：exact、MinHash、pHash 与可选 semantic 特征。"""
     def probe_and_add(self, rec: Record) -> DedupInfo: ...
 
-    async def group_probe(
+    async def group_reserve(
         self,
         request: DedupGroupRequest,
         context: RunContext,
-    ) -> DedupProbeToken:
-        """只读试算一个 sequence group，并返回一次性提交能力。"""
+    ) -> DedupReservation:
+        """试算一个 sequence group 并创建未提交 reservation。"""
 
-    def group_commit(self, token: DedupProbeToken) -> None:
-        """验证并原子提交一个已接受 sequence group。"""
+    def group_revalidate(self, reservation: DedupReservation) -> None:
+        """对最新正式索引重验 reservation。"""
+
+    def group_commit(self, reservation: DedupReservation) -> None:
+        """原子提交一个已重验 sequence group。"""
+
+    def group_discard(self, reservation: DedupReservation) -> None:
+        """严格消费一个未提交 reservation。"""
 ```
 
-sequence 的 `group_probe` 直接使用 DeliveryController 从唯一 `GenerationServices` 根派生的
+sequence 的 `group_reserve` 直接使用 SequenceWorkflow 从唯一 `GenerationServices` 根派生的
 `RunContext`，不复用会把 fatal 降级为记录状态的 `DedupStage` 外壳。`ProviderFatalError`、
 `CircuitBreakerTripped`、`KeyboardInterrupt` 与 `asyncio.CancelledError` 原样穿透且不消耗 slot attempt；
-`ProviderRetryableError` 原样上抛，由 DeliveryController 记为当前 attempt 的
+`ProviderRetryableError` 原样上抛，由 SequenceWorkflow 记为当前 attempt 的
 `provider_retryable_exhausted`。
 
 配置见 5.2 `[dedup]`。错误处理：图像解码失败 ⇒ 该记录跳过 pHash 层（按树判定）并计入 `report.dedup.image_decode_failures`；embedding 调用失败（重试耗尽，3.9.3）⇒ 该记录跳过第④级（按①—③判定）并计入 `report.dedup.embedding_failures`（仅 `dedup.semantic = true` 时可能非零，v1.2）。

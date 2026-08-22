@@ -26,7 +26,7 @@ if TYPE_CHECKING:
         LLMProfile,
         ResolvedConfig,
     )
-    from labelkit.common.runtime.llm_client import PromptBundle
+    from labelkit.common.inference.llm_client import PromptBundle
 
 # ── 冻结常量（V7/V8/V22——改动其中任一取值都属于 spec 修订） ─────────────────
 
@@ -45,7 +45,7 @@ PRIOR_INFLATION = 1.2         # 首批先验保守放大（V17）
 # V22（跨层依赖豁免）：common 不得导入算子，因此各阶段冻结提示词模板头以
 # 「冻结整型常量」的形式落在这里，供 M1 静态预检（V13③）与 V9 保证使用。
 # 每个取值 = est_text(该阶段算子模板中最大的那条冻结 system/模板头常量)
-# （CONTRACTS §10 冻结文本）；tests/common/runtime/test_budget.py 以跨层等式
+# （CONTRACTS §10 冻结文本）；tests/common/inference/test_budget.py 以跨层等式
 # 断言 est_text(算子常量) == 本字典取值——修订 §10 模板会让该测试变红，常量
 # 随 CONTRACTS 修订同步。
 # 例外——"segment" 覆盖的是提示词的「完整最坏情况静态脚手架」而非仅模板头：

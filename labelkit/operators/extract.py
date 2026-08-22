@@ -12,8 +12,8 @@ quality（标签已就位，故 [class.<label>.extract] 的按类指令得以生
 兄弟信封各自按自己的标签独立摘取（S9——绝不按 record id 去重）。仅 UI 模态序列
 （由 M1 强制，此处再防御式复核）。
 
-并发：全批所有 episode 的所有步骤合进**同一个** asyncio.gather（M4 pairwise 第二
-阶段骨架）；结果按（episode 批内位置, 步骤序号）回写——与调度顺序无关、零 rng。
+并发：全批所有 episode 的所有步骤冻结为一个 TaskGroupRequest；结果按
+（episode 批内位置, 步骤序号）回写——与完成顺序无关、零 rng。
 
 ``extract_transition`` 是**公开直调面**：M7 手术后的接缝重摘直接调用它（每次手术
 1–2 次调用；stage 本身永不重跑——``transitions is not None`` 即跳过，重入零调用）。
@@ -22,8 +22,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Mapping
 
+from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
 from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
@@ -41,10 +43,10 @@ from labelkit.common.contracts.types import (
     frame_digest,
     tree_diff,
 )
-from labelkit.common.runtime import budget
+from labelkit.common.inference import budget
 
-from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
-from labelkit.common.runtime.schema_engine import CallScope, action_schema
+from labelkit.common.inference.llm_client import Message, Part, PromptBundle
+from labelkit.common.inference.schema_engine import CallScope, action_schema
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import ResolvedConfig
@@ -201,31 +203,58 @@ def _feed_reactive_terminal(exc: BaseException, metrics) -> None:
         metrics.record_provider_result(fatal=True)
 
 
-def _fallback_transition(index: int, ids: tuple[str, str], ctx: "RunContext",
-                         message: str, attempts: int) -> Transition:
-    """S16 代码侧兜底步骤：计 extract.fallback_steps、发 error 事件并构造占位步骤。
+@dataclass(frozen=True, slots=True)
+class _FallbackFact:
+    """待归并屏障提交的兜底计数与错误事件事实。"""
+
+    ids: tuple[str, str] # 前后帧身份
+    message: str         # 冻结错误消息
+
+
+@dataclass(frozen=True, slots=True)
+class _ExtractOutcome:
+    """一个纯叶调用的冻结摘取结果。"""
+
+    transition: Transition              # 正常或机械兜底步骤
+    fallback: _FallbackFact | None      # 仅兜底时在场
+
+
+@dataclass(frozen=True, slots=True)
+class _PairJob:
+    """一个相邻成员调用的冻结输入。"""
+
+    prev: Record        # 前一帧
+    curr: Record        # 后一帧
+    index: int          # episode 内步骤序号
+    label: str | None   # 可选分类标签
+
+
+def _fallback_transition(index: int, ids: tuple[str, str], message: str,
+                         attempts: int, batch_no: int) -> _ExtractOutcome:
+    """构造不修改共享指标或业务对象的机械兜底结果。
 
     兜底取证只进 Transition.detail，**绝不**进 item.errors（rejects 归属读的是
     errors[0]，R4）；model="" 表示不存在通过校验的输出——动作是代码侧构造物。
 
     @param index 步骤序号（相邻对序号）
     @param ids （前一帧 id, 后一帧 id）
-    @param ctx 本次（批次, 阶段）运行上下文
     @param message 英文错误消息
     @param attempts 该终局形态下已消耗的调用预算
-    @return 兜底步骤记录
+    @param batch_no 当前批号，只用于无数据日志
+    @return 兜底步骤及其待提交事实
     """
     kind = ErrorKind.EXTRACTION_INVALID.value
     _logger.debug("transition extraction fell back: index=%d kind=%s", index, kind,
-                  extra={"stage": _STAGE_NAME, "batch": ctx.batch_no})
-    ctx.metrics.count(_COUNTER_FALLBACK_STEPS)
-    ctx.metrics.event(_EV_ERROR, stage=_STAGE_NAME, batch_no=ctx.batch_no,
-                      record_ids=ids,
-                      payload={"stage": _STAGE_NAME, "kind": kind,
-                               "message": message, "retryable": False})
-    return Transition(index=index, action=dict(_FALLBACK_ACTION), model="",
-                      attempts=attempts,
-                      detail={"kind": kind, "message": message})
+                  extra={"stage": _STAGE_NAME, "batch": batch_no})
+    transition = Transition(
+        index=index,
+        action=dict(_FALLBACK_ACTION),
+        model="",
+        attempts=attempts,
+        detail={"kind": kind, "message": message},
+    )
+    return _ExtractOutcome(transition=transition,
+                           fallback=_FallbackFact(ids=ids, message=message))
 
 
 async def extract_transition(prev: Record, curr: Record, index: int,
@@ -247,6 +276,22 @@ async def extract_transition(prev: Record, curr: Record, index: int,
     @return 步骤记录（正常摘取产物，或代码侧兜底占位）
     @raises SchemaViolation on_error="fail" 时的修复穷尽 / 溢出 / 截断原样上抛
     """
+    outcome = await _extract_transition_outcome(prev, curr, index, ctx, label)
+    _commit_extract_outcome(outcome, ctx)
+    return outcome.transition
+
+
+async def _extract_transition_outcome(prev: Record, curr: Record, index: int,
+                                      ctx: "RunContext", label: str | None) -> _ExtractOutcome:
+    """执行一次摘取调用并返回不带业务突变的冻结结果。
+
+    @param prev 前一帧记录
+    @param curr 后一帧记录
+    @param index episode 内步骤序号
+    @param ctx 运行上下文
+    @param label 可选分类标签
+    @return 正常或兜底结果
+    """
     cfg = ctx.cfg
     prompt = build_extract_prompt(prev, curr, cfg, label)
     ids = (prev.id, curr.id)
@@ -258,8 +303,8 @@ async def extract_transition(prev: Record, curr: Record, index: int,
         if cfg.extract.on_error == "fail":
             raise
         # attempts=1+L3 预算：反映已耗尽的调用预算。
-        return _fallback_transition(index, ids, ctx, str(e),
-                                    1 + cfg.output.max_repair_attempts)
+        return _fallback_transition(index, ids, str(e),
+                                    1 + cfg.output.max_repair_attempts, ctx.batch_no)
     except (ContextOverflowError, OutputTruncatedError) as e:
         # v1.11（spec 3.15.4「上下文预算」行）：恒定的 2 帧 / 2 图调用无物可缩——
         # 无装填、无降级面，由 M9 咽喉 / finish 处置兜底（V16）；溢出与截断原样
@@ -271,27 +316,52 @@ async def extract_transition(prev: Record, curr: Record, index: int,
         # 恰喂一次熔断。attempts=1：溢出 / 截断在任何 L3 修复轮开跑之前就终结了
         # 本次调用（V11/V25①——绝非"已修复"）。
         _feed_reactive_terminal(e, ctx.metrics)
-        return _fallback_transition(index, ids, ctx, str(e), 1)
+        return _fallback_transition(index, ids, str(e), 1, ctx.batch_no)
     if obj.get("action_type") == "scroll" and isinstance(obj.get("value"), str):
         obj = {**obj, "value": obj["value"].lower()}
-    return Transition(index=index, action=obj, model=model, attempts=attempts,
-                      detail={})
+    transition = Transition(index=index, action=obj, model=model, attempts=attempts,
+                            detail={})
+    return _ExtractOutcome(transition=transition, fallback=None)
 
 
-def _plan_episode_pairs(todo: list[PipelineItem], ctx: "RunContext"):
-    """为每个待摘取 episode 排布相邻对，并生成全批的扁平协程表。
+def _commit_extract_outcome(outcome: _ExtractOutcome, ctx: "RunContext") -> None:
+    """按声明序提交一个叶结果携带的兜底事实。
 
-    协程顺序 =（episode 批内位置, 步骤序号），gather 保序，故调用方的回写与调度
-    顺序无关。v1.9（T20）：落在接缝序号上的相邻对被**跳过**——它们不进 gather
+    @param outcome 冻结摘取结果
+    @param ctx 运行上下文
+    """
+    fallback = outcome.fallback
+    if fallback is None:
+        return
+    ctx.metrics.count(_COUNTER_FALLBACK_STEPS)
+    ctx.metrics.event(
+        _EV_ERROR,
+        stage=_STAGE_NAME,
+        batch_no=ctx.batch_no,
+        record_ids=fallback.ids,
+        payload={
+            "stage": _STAGE_NAME,
+            "kind": ErrorKind.EXTRACTION_INVALID.value,
+            "message": fallback.message,
+            "retryable": False,
+        },
+    )
+
+
+def _plan_episode_pairs(todo: list[PipelineItem]) -> tuple[
+        list[tuple[PipelineItem, int, frozenset[int]]], list[_PairJob]]:
+    """为每个待摘取 episode 排布相邻对，并冻结扁平任务表。
+
+    计划顺序 =（episode 批内位置, 步骤序号），TaskExecutor 按输入序返回，故调用方的回写与调度
+    顺序无关。v1.9（T20）：落在接缝序号上的相邻对被**跳过**——它们不进 TaskGroupRequest
     （零 LLM），在收尾阶段取机械的 T10 占位；v1.9 之前"一对一协程"的切片口径正
     因此换成了按 episode 的已判决对数记账。
 
     @param todo 本批待摘取的序列信封（按批内位置序）
-    @param ctx 本次（批次, 阶段）运行上下文
-    @return （每 episode 的 (信封, 相邻对数, 接缝序号集) 列表, 扁平协程表）
+    @return 每 episode 的跨度表与扁平相邻对计划
     """
     spans: list[tuple[PipelineItem, int, frozenset[int]]] = []
-    coros = []
+    jobs: list[_PairJob] = []
     for item in todo:
         members = item.record.members
         label = item.classification.label if item.classification else None
@@ -302,9 +372,8 @@ def _plan_episode_pairs(todo: list[PipelineItem], ctx: "RunContext"):
         for i in range(pairs):
             if i in seams:
                 continue
-            coros.append(extract_transition(members[i], members[i + 1], i,
-                                            ctx, label=label))
-    return spans, coros
+            jobs.append(_PairJob(members[i], members[i + 1], i, label))
+    return spans, jobs
 
 
 def _finalize_transitions(row: list, pairs: int, seams: frozenset[int],
@@ -336,7 +405,7 @@ def _finalize_transitions(row: list, pairs: int, seams: frozenset[int],
 class ExtractStage:
     """M15 extract 阶段的 Stage 实现（spec 3.15.2）。
 
-    全批所有 episode 的所有相邻对合进同一次 gather，随后按批内位置序同步收尾。
+    全批所有 episode 的所有相邻对合进同一个 TaskGroupRequest，随后按批内位置序同步收尾。
     """
 
     name = "extract"
@@ -366,13 +435,8 @@ class ExtractStage:
         if not todo:
             return batch
 
-        spans, coros = _plan_episode_pairs(todo, ctx)
-        results = await asyncio.gather(*coros, return_exceptions=True)
-
-        for res in results:
-            if isinstance(res, (CircuitBreakerTripped, KeyboardInterrupt,
-                                asyncio.CancelledError)):
-                raise res
+        spans, jobs = _plan_episode_pairs(todo)
+        results = await self._run_jobs(jobs, ctx)
 
         # 按批内位置序同步收尾：任一步骤异常外溢的 episode 整体失败（它其余步骤的
         # 结果一并丢弃——步骤元组是全有或全无的不变式）；否则 len(transitions) ==
@@ -380,16 +444,61 @@ class ExtractStage:
         pos = 0
         for item, pairs, seams in spans:
             judged = pairs - len(seams)
-            row = results[pos:pos + judged]
+            outcomes = results[pos:pos + judged]
             pos += judged
-            exc = next((r for r in row if isinstance(r, BaseException)), None)
+            exc = next((result for result in outcomes
+                        if isinstance(result, BaseException)), None)
             if exc is not None:
                 self._fail(item, ctx, exc)
                 continue
+            for outcome in outcomes:
+                if isinstance(outcome, _ExtractOutcome):
+                    _commit_extract_outcome(outcome, ctx)
+            row = [result.transition for result in outcomes
+                   if isinstance(result, _ExtractOutcome)]
             interrupted = tuple(getattr(item, "seam_interrupted_by", ()) or ())
             item.transitions = _finalize_transitions(row, pairs, seams, interrupted)
             self._register(item, ctx)
         return batch                            # 传入的同一列表对象（契约 ②）
+
+    async def _run_jobs(self, jobs: list[_PairJob], ctx: "RunContext") -> tuple[object, ...]:
+        """经共享 TaskExecutor 执行全部纯相邻对叶任务。
+
+        @param jobs 输入序冻结任务表
+        @param ctx 运行上下文
+        @return 输入序摘取结果或记录级异常
+        """
+        specs = tuple(
+            TaskSpec(
+                task_id=f"{ctx.task_namespace}:extract:{ordinal}",
+                declaration_key=(ctx.batch_no, 4, ordinal),
+                stage=self.name,
+                resource_key=("llm", self.cfg.extract.llm),
+                operation=lambda job=job: self._run_job(job, ctx),
+            )
+            for ordinal, job in enumerate(jobs)
+        )
+        return await ctx.tasks.run_group(TaskGroupRequest(specs))
+
+    @staticmethod
+    async def _run_job(job: _PairJob, ctx: "RunContext") -> object:
+        """把记录级异常收敛为普通 outcome，保留 control 语义。
+
+        @param job 冻结相邻对计划
+        @param ctx 运行上下文
+        @return 摘取结果或记录级异常
+        """
+        try:
+            return await _extract_transition_outcome(
+                job.prev, job.curr, job.index, ctx, job.label,
+            )
+        except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except Exception as exc:  # 记录级隔离，归并屏障负责 item 写入
+            _logger.error("extract transition failed: index=%d exc=%s", job.index,
+                          type(exc).__name__, extra={"stage": _STAGE_NAME,
+                                                    "batch": ctx.batch_no})
+            return exc
 
     def _register(self, item: PipelineItem, ctx: "RunContext") -> None:
         """计数器 + 每个最终步骤一发的 extract.step 事件（兜底步骤也在内，§8.1）。

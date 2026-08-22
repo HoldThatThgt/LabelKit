@@ -1,16 +1,18 @@
-# LabelKit v1.18 序列生成内核实现规格
+# LabelKit v1.18 序列生成真值与 v1.19 执行规格
 
 > 状态：实现规格，字段、术语、边界与完成门已冻结<br>
-> 日期：2026-08-21<br>
+> 日期：2026-08-23<br>
 > 实施基线：main 已合入 feat/v1.17-scenario-planning，基线提交 2138de2<br>
 > 替换范围：一次性删除 v1.13–v1.17 的全部序列生成专用面<br>
-> 兼容策略：不兼容旧配置、内部接口、随机数消费、提示词、报表、真值和时间流工件<br>
+> 破坏边界：旧配置、内部接口、随机数消费、提示词、报表、真值和时间流工件全部删除<br>
 > 设计来源：PROPOSAL-sequence-generation-redesign.md，经语义、代码亲和性、示例与 E2E 三路审查修订
 
 ## 1. 交付结论
 
 v1.18 把序列生成从 brief、realize、tier 和 weave 链路替换为一条以命名序列模式、持续世界状态、
 事件真值、独立判定和反事实集合精确交付为中心的路径。
+v1.19 保持这些数据、ID、随机数与 whole-set 真值不变，把完整昂贵 attempt 改为有界跨槽并发准备，
+只在声明序无 `await` 临界区修改 dedup、CrossView frontier、retained-content 与 DeliveryState。
 
 ~~~mermaid
 flowchart LR
@@ -42,7 +44,7 @@ flowchart LR
 
 正式规格不包含 tier、tier_rank、subsequence 或 filler。一个命名 pattern 表示一种精确帧组；长度或构成不同的
 旧 tier 必须由用户重写为不同的命名 pattern 和不同的精确 counterfactual set count。不存在 tier 到 pattern
-的运行期映射、迁移器或兼容解析器。
+的运行期映射、旧键解析器或字段转换入口。
 
 旧 generate.stream、quota、frame rule、sequence rule、frame window、time_fields、brief_schema、
 realize_schema、旧 ScenarioPlan 字段与构造契约、SequencePlan、survivor projection 和旧 artifact truth 均删除。
@@ -149,10 +151,10 @@ sequence 形态要求：
 - 每条 sequence 与 frame 在进入下游前机械写入 inherited Classification。
 - sequence class 仍建立 ClassView，使 per-class quality、annotate 与 verify 按既有路由生效。
 - run.partial_delivery 必须为 false。
-- dedup.enabled 必须为 true 且 dedup.scope 必须为 global；这是 counterfactual set 串行原子准入的前提。
+- dedup.enabled 必须为 true 且 dedup.scope 必须为 global；这是 counterfactual set 声明序原子准入的前提。
 - output.meta_mode 必须为 inline，output.rejects 必须为 none；反例 attempt 只写聚合计数，不打开 rejects 通道。
 - limit 禁止使用；测试和小运行通过较小 count 配置表达，不截断全局精确时间线。
-- quality 若开启，只允许 pointwise 和固定 threshold；pairwise、top_ratio 及任何生效 class override 均报错。
+- quality 若开启，只允许 pointwise 和固定 threshold；pairwise、top_ratio 及任何生效按类覆盖均报错。
 
 ## 5. 公共配置
 
@@ -504,33 +506,38 @@ blind-review 输入既不截断，也不使用摘要或替代 Schema 通过预�
 另冻结 retained_content_bytes 上限 536870912（512 MiB）。该值以最终将写入的 main 和 stream
 每行 canonical UTF-8 字节数之和计算，因此保守重复计入两个视图中的同一 payload，也计入
 annotation、generation truth、replay 和所有元数据；只排除发射时才增加的墙钟观测字段。
-每个 AttemptTransaction 在 dedup commit 前精确试算接受后的累计值。ScenarioPlan 已冻结每个 replay source；
-当某个 positive candidate 是 replay source 时，DeliveryController 必须先让 M11 从最终 PipelineItem 装配
-SequenceRows，再从其中的最终 primary_stream_rows 构造全部已规划 ReplayRows。prospective retained_content_bytes
-恰等于既有已接受累计、当前 set 的每个 SequenceRows.retained_content_bytes 与本次 ReplayRows.retained_content_bytes
-之和。超限归 sequence_memory_budget 并重试整个 source slot，零 dedup/dataset/replay commit。通过后 replay rows
-与 source 在同一内存临界区提交，后续不再构造未计费 replay row。noise slot 超限归 noise_memory_budget。
-不截断 payload、annotation 或 truth 来规避上限。
+ScenarioPlan 已冻结每个 replay source；当某个 positive candidate 是 replay source 时，SequenceWorkflow 先让
+M11 从最终 PipelineItem 装配 SequenceRows，再从其中的最终 primary_stream_rows 构造全部已规划 ReplayRows。
+`PrimaryCandidateReconcileRequest` 必须闭包该 source 的完整 ReplayLayout 与 ReplayRows，遗漏、增加或乱序都在
+candidate-local 阶段拒绝当前 attempt。
 
-SequenceRows 与 ReplayRows 上的 `retained_content_bytes` 只是便携证据，不是 reconciler 的第二份
-真值。CrossViewReconciler 必须分别从每个 carrier 的实际行重算 canonical bytes，再从当前全部
-sequence main、primary stream、noise 和分组 replay 行独立重算全局合计，并与
-`ReconcileRequest.retained_content_bytes` 比较。任一 carrier 值与行同步改写、任一分组拉平丢失边界、
-或全局合计偏移一 byte，均必须在 commit 前失败。
+SequenceRows 与 ReplayRows 上的 `retained_content_bytes` 只是便携证据。primary candidate-local validator 分别
+从当前 candidate 的实际 main、primary 与分组 replay 行重算 canonical bytes；noise-local validator 从当前 noise
+row 重算。candidate 成为声明序 head 时，retained-content 检查只比较“已提交实际 bytes + 当前 candidate 实际
+bytes”。恰好上限接受，多一 UTF-8 byte 分别归 `sequence_memory_budget` 或 `noise_memory_budget`，并重试当前
+whole slot，零 dedup、dataset、row 或 replay commit。通过后 source 与 replay 在同一无 `await` 内存临界区提交，
+后续不再构造未计费 replay row。不截断 payload、annotation 或 truth 来规避上限。
 
 结构真值、状态、patch、Schema、ActorView 和完整 EventTrace 不允许裁剪后继续判定通过。超限或完整调用不适配时，
 配置对象在启动期失败，生成内容在运行期消耗当前 slot attempt。只有非真值的可选风格提示可以删除；删除规则固定且记录计数。
 
-规划按 session block 求解；delivery 按 slot declaration order 处理。每个 slot 通过 CrossView 并提交后立即释放完整
-状态快照、LLM 中间对象、ProjectedSequence、PipelineItem 与 AttemptTransaction，只保留最终 main rows、最终
-stream rows、固定大小的 ProjectionWitness、noise payload digest、dedup 索引和汇总计数。ProjectionWitness 不保留
-payload、Record 或 primary row，仅保存源投影的 full SHA-256 摘要与 main_record_id。primary main member 与 stream
-primary row 在装配前引用同一个冻结 event payload 对象；replay projection 从最终 source row 复制其值，不保留另一份
-世界执行对象。500000 record_units 的 peak RSS 门必须包含全部 compact witness。
+规划按 session block 求解；delivery 使用连续有界候选缓冲并按 slot declaration order 提交。candidate-local 通过后，
+`PreparedCandidate` 深度冻结最终 rows、ProjectionWitness、DedupReservation、dataset counter delta、实际 bytes
+与 digest，随即释放完整状态快照、LLM 中间对象、ProjectedSequence、PipelineItem 与 AttemptTransaction。
+提交后再释放 PreparedCandidate，只保留最终 main rows、最终 stream rows、固定大小的 ProjectionWitness、noise
+payload digest、dedup 正式索引和汇总计数。ProjectionWitness 不保留 payload、Record 或 primary row，仅保存源投影
+的 full SHA-256 摘要与 main_record_id。primary main member 与 stream primary row 在装配前引用同一个冻结 event
+payload 对象；replay projection 从最终 source row 复制其值，不保留另一份世界执行对象。
 
-实现门同时包含 record_units = 500000 的最小载荷结构压测、接近 512 MiB 输出字节包络的混合载荷压测，
-两者 peak RSS 都不超过 4 GiB。独立用例钉住 500001 record units 在 compile 期拒绝，以及
-retained_content_bytes 恰为上限时通过、超一 UTF-8 byte 时 whole-slot 拒绝。
+候选缓冲容量只证明 preparing、prepared 与 recoverable outcome 的槽位数量上界。`candidate_bytes_high_water`
+记录全部已完成但尚未提交 candidate canonical bytes 的同时驻留总和；它不包含在途 provider response、
+AttemptTransaction、Python 对象开销、dedup registry 或 HTTP buffer。用户 Schema 与 provider response 没有统一
+byte 上限，因此规格不声称任意工程都能同时驻留六百个完整候选。
+
+实现门保留 record_units = 500000 的最小载荷结构压测与接近 512 MiB 输出字节包络的混合载荷压测，并增加固定
+candidate 形状的六百槽反向完成压测，记录 peak RSS、候选缓冲高水位和 `candidate_bytes_high_water`。这些结果只
+证明各自固定工作负载。独立用例钉住 500001 record units 在 compile 期拒绝，以及 retained_content_bytes 恰为
+上限时通过、超一 UTF-8 byte 时 whole-slot 拒绝。
 
 ## 7. GenerationProgram 编译
 
@@ -548,13 +555,13 @@ GenerationProgramCompiler 在任何凭据物化和 LLM 请求之前完成：
   `digest` 自身与 hook callable，只写 `ResolvedHook.reference`；ScenarioPlan.digest 同样排除自身。
 - 把生成上限、sequence ClassView、frame ClassView 与全局 frame annotation Schema 一并深冻结进
   GenerationProgram；每个 program ClassView.schema 必须物化为类覆盖 Schema 或全局 `output.schema`，
-  不保留 null 回落语义。编译成功后，slot attempt、
+  且不得为 null。编译成功后，slot attempt、
   ID、随机种子、运行标识、提示预算和下游类路由只读 program，不再读取 ResolvedConfig 中的同名源字段。
 
 编译阶段不随机抽样、不读 API key value、不调用 LLM、不执行下游 stage。
 
 同一 sequence class 可以被多个 pattern 使用。M1 在 ResolvedConfig 中冻结全部 sequence ClassView；
-GenerationProgramCompiler 只消费这些视图，不再解析或合并 class override。EventProjector 写 inherited Classification，
+GenerationProgramCompiler 只消费这些视图，不再解析或合并按类源配置。EventProjector 写 inherited Classification，
 classify stage 必须静态跳过且调用数为零。
 
 ## 8. ScenarioPlanner
@@ -866,8 +873,9 @@ CouplingEvaluator 独立比较 protected prefix。任何一个受保护字段改
 
 ### 9.8 noise 交付
 
-noise slot 在全部 primary slot 接受后按 ordinal 串行执行。planner 把 `generate.noise.topics[ordinal]`
-冻结为 NoiseSlot.topic。NoiseRenderer 只接收 noise instruction、noise frame Schema、全部 sequence/frame class
+全部 primary 内存提交后进入 noise phase。noise slot 在连续有界候选缓冲内并发准备并按 ordinal 提交。
+planner 把 `generate.noise.topics[ordinal]` 冻结为 NoiseSlot.topic。NoiseRenderer 只接收 noise instruction、
+noise frame Schema、全部 sequence/frame class
 的名称与 description 闭集、NoiseSlot.topic、冻结 timestamp 与 attempt identity；它不接收任何
 ScenarioSeed、EventTrace、primary payload 或既有 noise payload。输出经 M8 和 noise frame Schema 后，
 NoiseSemanticEvaluator 使用 evaluation_llm 独立返回 unrelated_to_declared_tasks、no_executable_task、
@@ -880,10 +888,11 @@ NoiseRenderer 必须把计划话题作为当前 ordinal 的唯一话题，不得
 对应的角度；不同 attempt 必须使用明显不同措辞，不得输出候选表或内部标识。
 Schema examples 只描述形状，禁止复制或改写其内容。
 
-最后用 dedup.minhash_threshold、dedup.minhash_num_perm 和 dedup.ngram 建立 attempt-local SimilarityFilter，
-先加入全部 primary member.text 和已接受 noise，再对 canonical_json(payload) probe。命中近重归 noise_similarity
-并重试该 slot；通过后才 commit 它的签名。noise 不进 quality、annotate、verify 或 main dedup group，
-只作为时间流中可被 segment 机械删除的精确干扰帧。
+attempt-local 路径只用 dedup.minhash_threshold、dedup.minhash_num_perm 和 dedup.ngram 计算并冻结 signature，
+不写 SimilarityFilter。候选成为 head 后，提交协调器才针对全部 primary member.text 与较低 ordinal noise
+重新 probe；命中近重归 noise_similarity 并重试该 slot。通过 frontier 与 retained-content 后才 commit signature，
+且此后无普通失败分支。noise 不进 quality、annotate、verify 或 main dedup group，只作为时间流中可被 segment
+机械删除的精确干扰帧。
 
 ## 10. 独立判定
 
@@ -961,26 +970,45 @@ declared 的 pattern_description 恰为 SequencePattern.description；instructio
 六项必须全 true，reason_codes 必须来自固定闭集且不得包含用户数据。evaluation profile 与 generation profile
 使用不同 system prompt、不同 Schema 和不同 profile 名；不能让生成调用自报通过。
 
-### 10.4 CrossViewReconciler
+### 10.4 Candidate-local、CrossView frontier 与最终对账
 
-EventProjector 完成后，CrossViewReconciler 是提交前的第二道纯机械边界：
+CrossView 分为 candidate-local、声明序 frontier 与最终 full reconcile 三层；不得为每个 slot 重新扫描全部已提交
+前缀。
 
-- ReconcileRequest 携带 GenerationProgram、run_id、与当前 prospective 或最终 SequenceRows 逐位对齐的不可变 ProjectionWitness，
-  以及与 noise_rows 逐位对齐的 post-gate noise payload digest、保留 ReplayRows 分组边界的
-  `replays` 和全视图 `retained_content_bytes`；不得只在最终行之间检查自洽关系。
-- 每个 primary main sequence 与 stream primary owner 双向一一对应。
-- 最终 primary 的 payload、基础 event metadata 与 generation truth 必须匹配对应 ProjectionWitness 的 full SHA-256；
-  仅允许下游增加 classification 与 annotation 元数据。
-- scenario_id、world_branch_id、event_id、sequence_id 与 noise event_key/event_id 必须分别从
-  GenerationProgram、run_id、计划坐标和源 payload 独立重算，不能接受同步改写后的自洽 ID 集合。
-- owner、actual role、frame_class、actor、payload 和顺序一致；declared 的 role/frame_class/actor 还必须
-  与 GenerationProgram 中的 RoleSpec 一致，instruction-only 的 frame/actor 由 ProjectionWitness 证明未被下游改写。
-- stream timestamp 与 plan 一致且全局严格递增。
-- replay_sequence_id 不出现在 main，且逐位同源关系成立。
-- noise 无 owner、role、pattern 或 variant。
-- SequenceRows、ReplayRows 的计费值与全局计费值均必须从实际待写行独立重算，同步篡改
-  carrier 与请求合计不能通过。
-- projector 产生任何缺失、额外或篡改字段都拒绝当前 attempt，不允许以 planner 真值修复。
+`PrimaryCandidateReconcileRequest` 携带当前 DeliverySlot、variant-aligned ProjectionWitness、严格 variant
+顺序的 SequenceRows、计划中该 source 的完整 ReplayLayout、按 layout 顺序的 ReplayRows 与 candidate 实际
+retained bytes。它不读取 DeliveryState 前缀，执行下列当前候选事实：
+
+- SequenceRows 数量与 variant 顺序必须和 slot 完全相等；ReplayRows 必须和全部 ReplayLayout 一一相等。
+- primary payload、基础 event metadata 与 generation truth 必须匹配 ProjectionWitness full SHA-256。
+- scenario_id、world_branch_id、event_id、sequence_id、owner、actual role、frame_class、actor、payload 与顺序
+  必须从 program、run_id、计划坐标和源 payload 独立重算。
+- replay_sequence_id 不出现在 main，replay source、逐位同源关系、ID、timestamp 与完整 layout 闭包必须成立。
+- candidate 内 event ID 与 timestamp 唯一；每个 SequenceRows、ReplayRows 与 candidate 总 bytes 都从实际
+  canonical rows 独立重算。
+- projector 产生任何缺失、额外或篡改字段都拒绝当前 attempt，不允许以 planner truth 修补实际输出。
+
+`NoiseCandidateReconcileRequest` 是独立接口，携带 NoiseSlot、post-gate payload digest、最终 row 与实际 retained
+bytes。它验证 payload、topic/ordinal、timestamp、event key/ID、noise 字段闭包与 canonical bytes；noise 必须没有
+owner、role、pattern 或 variant。primary 与 noise 不共用一个含糊 carrier。
+
+candidate-local 通过后分别创建深度冻结的 `PreparedCandidate` 与 `PreparedNoiseCandidate`。前者闭包
+slot/attempt identity、严格 variant 顺序的 witnesses/SequenceRows、完整 ReplayRows、DedupReservation、已验证
+dataset counter delta、实际 retained bytes 与 candidate digest；后者闭包 NoiseSlot、row、post-gate digest、
+similarity signature、dataset counter delta、实际 retained bytes 与 frozen digest。冻结并完成所有权转移后，任何代码
+不得修改 carrier；提交时只验证 frozen digest。
+
+`CrossViewFrontier` 保存 phase、该 phase 的 next ordinal、全部已提交 event ID、timestamp 与 source key。primary
+完成后切换到 noise phase，但 ID、timestamp 与 source 集合不清空。`check_primary(candidate)` 与
+`check_noise(candidate)` 只检查当前 carrier 与最新前缀，并返回冻结 `CrossViewDelta`；check 不修改 frontier。
+primary delta 同时包含 source replay，noise delta 同样参与全局 ID 与 timestamp 唯一性。提交协调器在全部可能
+rejection 通过后调用 `commit(delta)`；该方法只消费尚未应用的 delta，且没有普通失败分支。
+
+全部 primary、noise 与 replay 内存提交后，`reconcile_views(ReconcileRequest)` 从最终 rows 独立重建上述全部事实
+并只执行一次。incremental frontier 与 full reconcile 必须用属性式反例证明等价。candidate-specific mismatch
+必须在 local 或 frontier 阶段成为当前 attempt 的 `reconcile` rejection；最终 full reconcile 失败是运行级
+InternalError，exit 4，不消费 attempt，failed report 使用 `failed_slot=null`、`attempts_used=0`，不得打开输出或
+包装为 `GenerationAttemptRejected`。
 
 ProjectionWitness 在 ProjectedSequence 尚存时唯一计算，字段为 main_record_id、generation_digest、
 member_sources_digest 与逐行 primary_base_digests。摘要材料统一为
@@ -1048,76 +1076,105 @@ evaluator carrier 不能越过 projector。
 公开 `project_trace` 与 `project_replay` 的 request 同时携带 GenerationProgram 和完整 ScenarioPlan。两者先运行
 `validate_plan_identity`，再要求传入 DeliverySlot 或 ReplayLayout 与 canonical plan 中唯一成员完整 dataclass 相等，
 并复验 canonical event/layout/source 身份；只同步重算 digest、event ID 或 row 字段不能建立新事实根。
-DeliveryController 在交付入口验证一次完整 plan，随后只调用包内 validated helper，内容重试不会重新运行 CP-SAT。
+SequenceWorkflow 在交付入口验证一次完整 plan，随后只调用包内 validated helper，内容重试不会重新运行 CP-SAT。
 
 ## 12. 精确交付
 
-### 12.1 slot 状态机
+### 12.1 有界全 attempt 准备
 
 ~~~mermaid
 stateDiagram-v2
     [*] --> Planned
-    Planned --> Attempting
-    Attempting --> Generated
-    Generated --> Evaluated
-    Evaluated --> Downstream
-    Downstream --> Accepted
-    Generated --> Retry
-    Evaluated --> Retry
-    Downstream --> Retry
-    Retry --> Attempting
-    Retry --> Exhausted
-    Accepted --> Committed
+    Planned --> Preparing
+    Preparing --> RecoverableOutcome
+    Preparing --> PreparedCandidate
+    RecoverableOutcome --> HeadAdjudication
+    PreparedCandidate --> HeadAdjudication
+    HeadAdjudication --> Preparing: retry in same ordinal
+    HeadAdjudication --> Committed
+    HeadAdjudication --> Exhausted
     Exhausted --> DeliveryError
 ~~~
 
-slot 按 GenerationProgram declaration order 串行进入 admission。一个 slot attempt 内的 variant 也按声明序执行；
-实现可以并发无依赖的真实 LLM 请求，但结果归并、dedup probe 和 commit 必须回到固定顺序。
+primary 与 noise 各有一个候选缓冲阶段。候选缓冲容量等于该阶段引用的不同 ResourceKey 容量之和，再钳制到剩余
+slot 数；它始终是连续声明序区间：
+
+~~~text
+[next_commit, min(total_slots, next_commit + candidate_buffer_capacity))
+~~~
+
+区间内每个 ordinal 恰有一个 running、prepared 或 recoverable-outcome 占位。创建 slot coordinator 前先取得候选
+缓冲 permit；permit 跨 attempt、preparing、prepared、recoverable outcome 与等待提交全程保留，只在该 ordinal
+成功提交或运行终止清理后释放。只有 head 成功 commit 后窗口才右移并接纳一个新 tail；head retry 在原 ordinal
+替换占位。高 ordinal 提前完成或失败都继续占位，不得因为叶任务已结束而接纳窗口外 tail。
+
+每个 slot coordinator 同一时刻只运行一个 attempt。同一 branch 的事件按 state_after 依赖串行；declared baseline
+完成后，不同 counterfactual suffix 可以并发，结果按 variant 声明序归并。quality → annotate → verify 的阶段屏障
+不变，前一 gate 拒绝后不支付后一 gate。不同 attempt 使用不同 PipelineItem；同一 attempt 的叶调用只返回冻结
+outcome，再按 slot、attempt、stage 与叶 ordinal 归并。
+
+高 ordinal 的 recoverable failure 提前完成后只保留结果，不自行重试或写报告。只有轮到该 ordinal 时，提交协调器
+才消费 attempt、记录 rejection 并启动下一 attempt。任意 provider fatal、circuit、internal 或 cancellation 立即
+取消全 sequence execution domain，等待 coordinator、叶任务与 cleanup 全部结束后原样传播，且不消耗 attempt。
 
 ### 12.2 下游事务
 
-生成侧通过后，generation.project 先把每个 EventTrace 投影成只在内存存在的 sequence Record 与基础 primary
-stream rows；这些 ProjectedSequence 只服务于 dedup/downstream，尚不宣称最终输出字节。完整 counterfactual set
-随后作为 attempt-local batch 依次试算：
+生成侧通过后，generation.project 把每个 EventTrace 投影成只在内存存在的 sequence Record 与基础 primary
+stream rows；ProjectedSequence 只服务于 dedup/downstream，尚不宣称最终输出字节。完整 counterfactual set
+随后作为 attempt-local batch 执行：
 
 ~~~text
-prospective dedup
-→ pointwise quality
-→ annotate
-→ verify
-→ M11 assemble_sequence(final PipelineItem + ProjectedSequence)
-→ replay preprojection
-→ CrossViewReconciler
-→ retained-content prospective check
-→ group commit
+generation / evaluation
+→ projection / ProjectionWitness
+→ DedupIndex.group_reserve
+→ pointwise QualityStage.run_attempt
+→ AnnotateStage.run_attempt
+→ VerifyStage.run_attempt
+→ SequenceDeliveryEmitter.assemble_sequence
+→ ReplayProjector
+→ PrimaryCandidateReconcileRequest
+→ PreparedCandidate
 ~~~
 
-DedupIndex 提供 group_probe 与 group_commit，覆盖 exact、MinHash 和启用时的 semantic embedding。
-同一 set 内的配对变体互相豁免；与已提交 set 比较。接口冻结为：
+DedupIndex 提供 `group_reserve`、`group_revalidate`、`group_commit` 与 `group_discard`，覆盖 exact、MinHash
+和启用时的 semantic embedding。同一 set 内配对 variant 相互豁免；pending reservation 彼此不参与早期判重。
+接口冻结为：
 
 ~~~python
-async def group_probe(
+async def group_reserve(
     request: DedupGroupRequest,
     context: RunContext,
-) -> DedupProbeToken:
+) -> DedupReservation:
     ...
 
-def group_commit(token: DedupProbeToken) -> None:
+def group_revalidate(reservation: DedupReservation) -> None:
+    ...
+
+def group_commit(reservation: DedupReservation) -> None:
+    ...
+
+def group_discard(reservation: DedupReservation) -> None:
     ...
 ~~~
 
-DedupGroupRequest 携带按 variant 声明序排列的完整 sequence Record。RunContext 是 embedding profile、
-LLMClient、MetricsSink 与 breaker 记账的唯一运行来源。probe 可执行真实 embedding 调用，
-但不写 exact set、MinHash LSH、embedding candidate store 或其他持久在本进程的去重状态。
-DedupProbeToken 是冻结一次性能力，包含 index_generation、ordered record digests 与全部预计算特征；
-不包含 API key 或原始 prompt。group_commit 先验证 token 未消费、index_generation 未变和 record digest 未变，
-再在一个无 await 的临界区同时写入三类索引并使 token 失效。任一预检失败时零写入；写入中不存在
-可恢复外部 I/O，所以它是单进程内的原子状态变换。sequence admission 串行，正常路径不会产生过期 token；
-一旦出现归 generation_dedup_transaction 内部错误并终止运行，不重试为普通重复。
+`group_reserve` 异步计算 exact、MinHash 与可选 embedding 特征，检查当前正式索引和组内非豁免重复，并在
+DedupIndex registry 创建 Reserved reservation，零正式索引突变。对外 DedupReservation 只携带 opaque
+capability、epoch、ordered record digests 与小型 exact cluster keys；完整特征和 Record 引用只在 registry
+保留一份。
+
+`group_revalidate` 无 `await`，对最新正式索引重查；冲突时 reservation 保持 Reserved，调用方在同一拒绝路径
+discard。成功时进入 Validated，仍不写正式索引。`group_commit` 只接受当前 generation 的 Validated
+reservation，原子写全部索引并只消费自己。revalidate 成功后的 generation 变化或 commit failure 都是
+`generation_dedup_transaction` 内部错误，不得产生普通 duplicate rejection。`group_discard` 严格消费一次；
+重复 discard 暴露所有权错误。`reset` 清空 registry 并递增 epoch，旧 epoch capability 非法。
+
+`group_reserve` 返回后 reservation 由 slot coordinator 唯一拥有；只有深度冻结 outcome 成功放入候选缓冲后，
+所有权才转移给缓冲与提交协调器。coordinator 在未转移终态的 `finally` 中恰好 discard 一次。耗尽、fatal 与
+cancellation cleanup 完成后 registry 必须为空。
 
 quality、sequence/frame annotation、verification 和 item status 存在 attempt-local transaction；各 stage 的 dataset
-counter delta 由 DeliveryController 在同一 attempt 的局部整数表累加。失败时全部丢弃，不写 main/rejects；成功时才
-合并 dataset counters。LLM usage、调用延迟、token、provider retry、成本、
+counter delta 由 SequenceWorkflow 在同一 attempt 的局部整数表累加。失败时全部丢弃，不写 main/rejects；只有
+声明序 dedup commit 成功后才合并 dataset counters。LLM usage、调用延迟、token、provider retry、成本、
 SchemaEngine resolved-at 统计与 trace event 属于运行事实，所有 attempt 都累计，不得随事务回滚。
 
 下游只调用配置中开启的协作者；关闭的 quality、annotate、frame.annotate 或 verify 是明确的零调用。
@@ -1131,22 +1188,22 @@ quality、annotate、verify 的 class 路由以 PipelineItem.classification 中�
 不因 classify stage 关闭而删掉生成器的 inherited classification。
 
 每个协作者接收 AttemptTransaction，它持有临时 PipelineItem、status counters、ProjectedSequence 和不可变 ClassView。
-DeliveryController 由源 ResolvedConfig 派生 attempt-local cfg，但必须用 `GenerationProgram.class_views`、
+SequenceWorkflow 由源 ResolvedConfig 派生 attempt-local cfg，但必须用 `GenerationProgram.class_views`、
 `GenerationProgram.frame_classes` 与 `GenerationProgram.frame_schema` 替换其中同名视图与 Schema。
 Quality、Annotate 与 Verify 的正常、frame 与 repair 路径都只读
 该 attempt-local cfg；源 ResolvedConfig 中同名 class/frame 视图即使不同也不得影响当次结果或被修改。
-不得把 attempt-local item 加入 Orchestrator 的全局 batch 或直接调用 Emitter.emit。接受时一次合并这些纯内存结果；
+不得把 attempt-local item 加入 ProcessWorkflow 的普通批次或直接调用 Emitter.emit。接受时一次合并这些纯内存结果；
 拒绝时丢弃整个 AttemptTransaction，但其 MetricsSink 已记录的 LLM 运行事实不回滚。
 
 SequenceDeliveryEmitter 的 `assemble_sequence(request: SequenceAssemblyRequest)` 是纯内存、零 I/O 的 M11 装配入口。
 request 闭包 GenerationProgram、SchemaEngine、最终 PipelineItem、ProjectedSequence 与 batch_no，emitter 构造器
 仍只接收 ResolvedPaths。M11 先装配实际待写 main/member/primary 对象，再始终显式传入 program 物化的
-按类用户 Schema 与 frame Schema 做写前终检；不得传 null 回落 SchemaEngine 构造期 Schema，也不得把
+按类用户 Schema 与 frame Schema 做写前终检；`schema=None` 非法，也不得把
 `FrameClassView.gen_schema` 当成 frame annotation Schema。sequence annotation 关闭时，不调用用户 Schema 且
 `item.annotation` 必须为 null；frame annotation 开启时，main member 与 primary row 两份实际对象都必须逐位验证。
-任一未知类、缺失标注、意外标注或 Schema violation 招致 `GenerationProjectionMismatch`，controller 统一映射为
+任一未知类、缺失标注、意外标注或 Schema violation 招致 `GenerationProjectionMismatch`，SequenceWorkflow 统一映射为
 `sequence_projection_mismatch` 并将当前 whole set 归入 `rejected_attempts.reconcile`；局部 rows、replay、dedup
-token 和 dataset delta 全部丢弃。通过终检后才返回最终 SequenceRows。每个 delivery slot
+reservation 和 dataset delta 全部丢弃。通过终检后才返回最终 SequenceRows。每个 delivery slot
 的 `batch_no` 固定为一基 declaration ordinal，重试不改变。只有 SequenceRows 才参与 CrossView、replay 字节构造、
 retained-content 计费和 GenerationProduct；`GenerationProduct.main_rows` 保存最终 JSON object，不用 Record 伪装落盘行。
 ProjectedSequence.main_record 只作为 dedup、quality、annotate 与 verify 的输入载体；不得从它计算最终 main bytes。
@@ -1161,10 +1218,71 @@ event_key、role、frame_class、actor、logical_time_us 逐位复制；event_id
 与 duplicate_of_sequence_id，不产生新的 world_branch_id 或 primary variant 字段。timestamp 统一用 timeline 的
 fixed UTC offset 和 `datetime.isoformat(timespec="microseconds")`，不得按本机时区或省略尾部微秒。
 
-普通 process 与 flat generate 继续使用既有 Stage 协议。DeliveryController 不把全仓 Stage 改造成事务框架，
-也不调用会立即写 emitter 的 Orchestrator._process_batch。
+`group_reserve` 之后发生 downstream 或 candidate-local recoverable failure 时，coordinator 把冻结
+RecoverableOutcome 与 reservation 放入原缓冲位置，不立即记账。当该 ordinal 成为 head 时先
+`group_revalidate`；若最新正式前缀产生 duplicate，则按 dedup bucket 记账，否则才记录已保存的 downstream
+或 reconcile rejection。两条路径都 discard reservation 并原位重试。这样同一候选同时存在 dedup 与后续失败时，
+dedup 始终保持更高拒绝优先级。
 
-### 12.3 attempt 与运行终态矩阵
+`PrimaryCandidateReconcileRequest` 通过后创建唯一深度冻结 `PreparedCandidate`，闭包 slot/attempt identity、
+严格 variant 顺序的 ProjectionWitness 与 SequenceRows、按 layout 顺序的全部 ReplayRows、DedupReservation、
+已验证 dataset counter delta、实际 retained bytes 与 candidate digest。递归冻结并转移 reservation 所有权后，
+立即释放 AttemptTransaction、PipelineItem 与投影中间对象。任何代码不得再修改 candidate；提交临界区只校验
+frozen digest。
+
+### 12.3 声明序短提交、noise 与最终对账
+
+唯一提交协调器只消费 `next_commit`。primary head 的完整顺序冻结为：
+
+~~~text
+DedupIndex.group_revalidate
+→ frozen candidate digest validation
+→ CrossViewFrontier.check_primary → CrossViewDelta
+→ retained-content check
+→ prevalidate dataset counters and DeliveryState delta
+→ DedupIndex.group_commit
+→ CrossViewFrontier.commit(delta)
+→ counters / rows / sources / replays / retained commit
+~~~
+
+这段代码无 `await`。dedup 重验证先于 CrossView 与 retained-content，保持 first-writer 和拒绝优先级。
+`check_primary` 只检查当前 carrier 与最新已提交前缀，返回尚未应用的 CrossViewDelta；`commit(delta)` 与
+group commit 后的 DeliveryState 交换不得再有普通可恢复失败。commit-time dedup、CrossView 或 retained-content
+rejection 只让当前 head 原位重建下一 attempt；更高 prepared candidate 保留到轮到时再重验证。
+
+attempt 只在 head 被判定为本地 recoverable rejection、commit-time rejection 或成功 commit 时恰消费一次。高槽
+speculative outcome 因低槽耗尽、fatal 或 cancellation 被丢弃时，不进入 slot attempts 或 rejection bucket。
+高槽 recoverable failure 只有轮到时才记账并重试。provider fatal、circuit、internal 与 cancellation 不消耗 attempt。
+
+全部 primary 内存提交后，NoiseSlot 使用同样的并发准备、连续候选缓冲和声明序记账。NoiseRenderer 与独立
+NoiseSemanticEvaluator 可跨 slot 并发。`PreparedNoiseCandidate` 闭包 NoiseSlot、post-gate payload digest、
+最终 row、similarity signature、dataset counter delta、实际 retained bytes 与 frozen digest；进入缓冲前，
+`NoiseCandidateReconcileRequest` 验证 payload、topic/ordinal、timestamp、ID 派生、字段闭包与 canonical bytes。
+
+noise head 的完整顺序冻结为：
+
+~~~text
+SimilarityFilter.probe(latest primary + lower noise)
+→ frozen noise digest validation
+→ CrossViewFrontier.check_noise → CrossViewDelta
+→ retained-content check
+→ prevalidate DeliveryState delta
+→ SimilarityFilter.commit
+→ CrossViewFrontier.commit(delta)
+→ noise rows / digest / retained commit
+~~~
+
+这段代码同样无 `await`。SimilarityFilter 正式突变后不得再有普通 rejection；高 ordinal 提前计算的 signature
+不能直接 commit。Replay 不调用 LLM，不进入独立 coordinator，只随 source PreparedCandidate 校验和提交。
+
+全部 primary、noise 与 replay 内存提交后，`reconcile_views` 从最终 rows 独立执行一次完整对账。该 full reconcile
+失败是运行级 InternalError，exit 4，不消耗 attempt，不打开输出，failed report 使用 `failed_slot=null`、
+`attempts_used=0`，且不得包装为 `GenerationAttemptRejected`。
+
+普通 process 与 flat generate 继续使用既有 Stage 协议。SequenceWorkflow 不把全仓 Stage 改造成事务框架，
+也不调用会立即写 emitter 的 `ProcessWorkflow._process_batch`。
+
+### 12.4 attempt 与运行终态矩阵
 
 下表仅适用于 `labelkit run` 的 sequence 形态。`validate` 与 `run --dry-run` 即使发现 plan 失败也不写
 main、stream、success report、manifest 或 failed report，只按同一 error kind 返回退出码。
@@ -1176,6 +1294,7 @@ main、stream、success report、manifest 或 failed report，只按同一 error
 | output_truncated、可恢复 context overflow、provider retryable exhausted | 是 | 是 | 耗尽为 1 | commit 前不替换 | 耗尽时原子写 |
 | provider fatal、auth pool exhausted、circuit trip | 否 | 否 | 4 | commit 前不替换 | 已解析路径时 best-effort 原子写 |
 | SIGINT / CancelledError | 否 | 否 | 4 | commit 前不替换 | 已初始化 run 时 best-effort 原子写 |
+| 最终 full CrossView 内部错误 | 否 | 否 | 4 | commit 前不替换 | `failed_slot=null`、`attempts_used=0` |
 | 启动期配置、hook、catalog 或路径验证错误 | 否 | 否 | 2 | 不替换 | 不写，运行尚未成立 |
 | 启动后权限/文件类型变化导致 `.part` 不可写 | 否 | 否 | 4 | 不替换 | 尝试同目录写；失败只记英文 stderr kind |
 | plan infeasible | 否 | 否 | 2 | 不替换 | 原子写 |
@@ -1190,11 +1309,19 @@ attempt_index, purpose]])).encode("utf-8")).digest(), "big")`；不得复用 Pyt
 ScenarioSeed 的 LLM 内容、事件意图、patch 和措辞；catalog source 不换行。pattern、variant、role、logical time、
 artifact timestamp、session、noise 和 replay source 永不改变。
 
-### 12.4 exhaustion 与 failed report
+### 12.5 exhaustion 与 failed report
 
-任一 sequence slot 或 noise slot 耗尽后立即停止领取新 slot，抛 DeliveryError(kind =
-sequence_delivery_exhausted)。在正式 commit 边界之前，Emitter.finalize(deliver = false)，主、stream、success report
-和 manifest 均不替换；sequence 形态本就不打开 rejects。
+任一 sequence slot 或 noise slot 耗尽后立即停止接纳，取消并等待所有更高 coordinator，discard 全部 reservation，
+丢弃其 dataset counter delta 与候选，然后抛 DeliveryError(kind = sequence_delivery_exhausted)。这些 speculative
+高槽已经发生的 usage、retry、Schema、trace 与 provider latency 仍是运行事实，但不进入 attempt/rejection bucket。
+在正式 commit 边界之前，Emitter.finalize(deliver = false)，主、stream、success report 和 manifest 均不替换；
+sequence 形态本就不打开 rejects。
+
+failed report 在全部 coordinator、叶任务和 cleanup 完成后冻结。exhaustion 的当前槽恰记录
+`max_slot_attempts`。多个 coordinator 同时逃逸 fatal 时，按
+`(phase declaration order, slot ordinal, attempt index, leaf declaration key)` 选择最小原始异常；
+`failed_slot` 使用被选 slot，`attempts_used` 是该槽此前已消费的 recoverable attempts。外部 cancellation 与最终
+full CrossView 内部错误固定使用 `failed_slot=null`、`attempts_used=0`。
 
 output_stem.failed.report.json 通过同目录 `.part`、flush、fsync 和 os.replace 原子写入。它只含
 run identity、artifacts_committed、计数、终态 kind 和 usage，不含数据内容。commit-I/O 失败时
@@ -1204,7 +1331,7 @@ artifacts_committed = false 仅表示没有可以信任的新 manifest，不声�
 commit-I/O 失败不承诺保持这三个固定路径，消费者必须用旧 manifest 摘要检出不匹配并拒绝读取。
 
 这是 sequence generate_only 的显式中断语义：它不使用 v1.17 普通 process/flat 的优雅 SIGINT 部分收尾，
-也不在 circuit trip 后交付已接受前缀。Orchestrator 将这两类终态透传为不可交付的 exit 4；
+也不在 circuit trip 后交付已接受前缀。SequenceWorkflow 将这两类终态透传为不可交付的 exit 4；
 flat 和 process 的既有 partial-delivery/中断行为不因本规格改变。
 
 ## 13. 调用估算与观测
@@ -1238,6 +1365,10 @@ replay sequences 和 stream rows。
 
 普通日志只记录 slot key、attempt index、阶段、error kind、计数、profile 和 duration，不记录 prompt、state、patch、payload、
 actor view 或 API key。trace full 才可记录生成审计内容，并沿用既有隐私警告。
+
+成功与失败 report 的 `runtime` 块记录 queue/running/resource-wait/commit-waiting 高水位、
+`candidate_bytes_high_water`、cancelled tasks、resource/http wait 毫秒与 `commit_ms`。
+`candidate_bytes_high_water` 是全部已完成但尚未提交 candidate canonical bytes 同时驻留总和的峰值。
 
 ## 14. 输出契约
 
@@ -1322,8 +1453,9 @@ primary source。模式探测扫描全部非空行；任一可解析行含 `_met
 因此更早的 malformed 或普通行不能借 `input.on_bad_line = "skip"` 绕过 provenance 验证。任一格式、唯一性或同源
 失配在 ingest 阶段 fail closed。
 
-CrossViewReconciler 在生成运行写文件前对内存 main/stream 执行双向检查。check_output.py 在运行后
-对两个已落盘视图重复该检查；独立 process replay 不需要也不读取 main 作为隐式旁输入。
+生成运行先对每个 candidate 执行 local/frontier 检查，再在写文件前用 `reconcile_views` 对最终内存
+main/stream 执行一次双向检查。check_output.py 在运行后对两个已落盘视图重复该检查；独立 process replay
+不需要也不读取 main 作为隐式旁输入。
 
 role 来自 PatternEvaluator.actual_bindings。instruction-only role 固定为 position_000、position_001 等位置名，
 不伪装成业务 pattern role。
@@ -1462,7 +1594,8 @@ output_stem.failed.report.json，rejects = sidecar = null。路径冲突、非�
 任一既存 fixed/part 目标必须是非符号链接、可写普通文件；目录、设备、符号链接或不可写文件均在 M1
 聚合失败，不能推迟到 M11 commit。
 
-SequenceDeliveryEmitter 在全部 slot、noise、replay 与 CrossViewReconciler 通过前不打开 main、stream、report
+SequenceDeliveryEmitter 在全部 slot、noise、replay、CrossView frontier 与最终 `reconcile_views` 通过前
+不打开 main、stream、report
 或 manifest；失败 attempt 也不打开任何数据通道。成功后才分别写同目录 `.part`，flush 与 fsync，
 按 main、stream、report 的顺序 os.replace，最后单独写入并替换 manifest。failed_report 不在成功 manifest 内，
 成功运行不删除历史 failed_report。消费者始终以摘要有效的 manifest 为成功提交真值；failed_report
@@ -1548,8 +1681,11 @@ DeliveryError 新增到 labelkit/common/errors.py，不继承 ConfigError。异�
 | SequenceRows | `main_row`, `primary_stream_rows`, `retained_content_bytes` |
 | ReplayRows | `rows`, `retained_content_bytes` |
 | ProjectionWitness | `main_record_id`, `generation_digest`, `member_sources_digest`, `primary_base_digests` |
+| PrimaryCandidateReconcileRequest | `program`, `plan`, `run_id`, `slot`, `projection_witnesses`, `sequences`, `replay_layouts`, `replays`, `retained_content_bytes` |
+| NoiseCandidateReconcileRequest | `program`, `run_id`, `noise_slot`, `payload_digest`, `row`, `retained_content_bytes` |
 | ReconcileRequest | `program`, `plan`, `run_id`, `projection_witnesses`, `sequences`, `noise_payload_digests`, `noise_rows`, `replays`, `retained_content_bytes` |
-| GenerationServices | `config`, `schema_engine`, `llm`, `metrics` |
+| CrossViewDelta | `phase`, `ordinal`, `event_ids`, `timestamps_us`, `source_keys` |
+| GenerationServices | `config`, `schema_engine`, `llm`, `metrics`, `tasks` |
 | RuntimeCredentials | `llm`, `embedding` |
 | ResolvedHook | `reference`, `target` |
 | ValidationHooks | `output`, `sample`, `state` |
@@ -1561,7 +1697,9 @@ DeliveryError 新增到 labelkit/common/errors.py，不继承 ConfigError。异�
 | DownstreamAttemptRequest | `transaction`, `run_context` |
 | DownstreamAttemptResult | `accepted`, `rejected_stage`, `dataset_counters` |
 | DedupGroupRequest | `records`, `exempt_pairs`, `embedding_profile` |
-| DedupProbeToken | `capability_id`, `index_generation`, `record_digests`, `exact_features`, `minhash_features`, `embedding_features` |
+| DedupReservation | `capability_id`, `epoch`, `record_digests`, `exact_cluster_keys` |
+| PreparedCandidate | `slot`, `attempt_index`, `projection_witnesses`, `sequences`, `replays`, `reservation`, `dataset_counters`, `retained_content_bytes`, `digest` |
+| PreparedNoiseCandidate | `noise_slot`, `attempt_index`, `payload_digest`, `row`, `similarity_signature`, `dataset_counters`, `retained_content_bytes`, `digest` |
 | GenerationProduct | `main_rows`, `stream_rows`, `report` |
 
 ScenarioBlock 是只读 Mapping，键类型固定为 `tuple[str, str | None]`，值为 PlannedEvent tuple；None 语义见 8.4。
@@ -1718,10 +1856,13 @@ def validate_plan_identity(
 ) -> None:
     ...
 
-def reconcile_views(request: ReconcileRequest) -> None:
+def reconcile_primary_candidate(request: PrimaryCandidateReconcileRequest) -> None:
     ...
 
-def reconcile_prospective_views(request: ReconcileRequest) -> None:
+def reconcile_noise_candidate(request: NoiseCandidateReconcileRequest) -> None:
+    ...
+
+def reconcile_views(request: ReconcileRequest) -> None:
     ...
 
 async def deliver_generation(
@@ -1738,14 +1879,30 @@ class DownstreamAttemptCollaborator(Protocol):
         ...
 
 class DedupIndex:
-    async def group_probe(
+    async def group_reserve(
         self,
         request: DedupGroupRequest,
         context: RunContext,
-    ) -> DedupProbeToken:
+    ) -> DedupReservation:
         ...
 
-    def group_commit(self, token: DedupProbeToken) -> None:
+    def group_revalidate(self, reservation: DedupReservation) -> None:
+        ...
+
+    def group_commit(self, reservation: DedupReservation) -> None:
+        ...
+
+    def group_discard(self, reservation: DedupReservation) -> None:
+        ...
+
+class CrossViewFrontier:
+    def check_primary(self, candidate: PreparedCandidate) -> CrossViewDelta:
+        ...
+
+    def check_noise(self, candidate: PreparedNoiseCandidate) -> CrossViewDelta:
+        ...
+
+    def commit(self, delta: CrossViewDelta) -> None:
         ...
 
 class SequenceDeliveryEmitter:
@@ -1780,33 +1937,41 @@ def canonical_delivery_row(row: Mapping[str, object]) -> bytes:
 ~~~
 
 所有接口声明有 doxygen style 中文 docstring；每个函数不超过五个参数，所以复杂调用使用冻结 request dataclass。
-generation 包不导出旧函数名或参数转换 wrapper。
+generation 包不导出旧函数名或参数转换入口。
 
 SequenceDeliveryEmitter.prepare_product 是 delivery_digest 的唯一 owner：它按第 11 节计算一次摘要，写入 report
 的深拷贝并返回 GenerationProduct。GenerationProduct 不再保存第二份 digest 或 manifest_input；commit 从
 深度冻结的 product.report.delivery_digest 构造 manifest，若缺失或格式非法则在打开 `.part` 前以
 generation_downstream_contract 终止；commit 不另算第二份摘要。
 
-DeliveryServices 只有一个 GenerationServices 根；后者的 config、llm、schema_engine、metrics 也是所有生成调用、
-dedup 与下游 stage 的唯一对象。DeliveryController 为每个协作者派生 RunContext 时，这四个字段必须分别与
-GenerationServices 对应字段对象身份相同，只新建 rng 与 batch_no。DeliveryRequest 不复制 config 或 materialized
-credentials；RuntimeCredentials 只服务于 factory 构造上述 LLMClient，随后不进入 delivery request。
+DeliveryServices 只有一个 GenerationServices 根；后者的 config、llm、schema_engine、metrics、tasks 也是所有
+生成调用、dedup 与下游 stage 的唯一对象。SequenceWorkflow 为每个协作者派生 RunContext 时，这五个字段必须
+分别与 GenerationServices 对应字段对象身份相同，只新建 rng、batch_no 与
+`run/phase/slot/attempt/stage` 派生的 task namespace。DeliveryRequest 不复制 config 或 materialized
+credentials；RuntimeCredentials 只服务于 factory 构造 LLMClient，随后不进入 delivery request。
 
 AttemptTransaction.items 是当前 attempt 内唯一 PipelineItem 真值，协作者原地更新这些 item；DownstreamAttemptResult
-只返回 accepted、rejected_stage 与该 stage 的 dataset counter delta，不复制 items。DeliveryController 在局部整数表中
+只返回 accepted、rejected_stage 与该 stage 的 dataset counter delta，不复制 items。SequenceWorkflow 在局部整数表中
 累加 delta，直到 group commit 才合并运行级 dataset counters；任一拒绝直接丢弃 transaction 与局部 delta。
+
+quality、annotate 与 verify 的叶调用不得直接修改 PipelineItem、pool、member map、events 或 errors，只返回冻结
+outcome；operator 在每个业务屏障按声明 ordinal 归并。每个 collaborator 使用独立 MetricsSink ContextVar capture，
+dataset counters 随 PreparedCandidate/PreparedNoiseCandidate 冻结，只有声明序成功提交者合并。LLM/embedding
+calls、tokens、Schema repair、provider retry、breaker、资源等待、provider latency 与 trace call events 绕过
+attempt capture，作为已经发生的运行事实实时累计。
 
 QualityStage、AnnotateStage 与 VerifyStage 均实现 run_attempt，frame annotation 由 AnnotateStage
 的同一 attempt 入口处理。该入口与普通 Stage.run 共用生产核心函数，但不把异常先降级成 StageError。
 ProviderFatalError、CircuitBreakerTripped、KeyboardInterrupt 与 asyncio.CancelledError 必须原样穿透到
-DeliveryController，立即按 run-terminal 处理，不消耗 attempt；ProviderRetryableError、SchemaViolation、
+SequenceWorkflow，立即按 run-terminal 处理，不消耗 attempt；ProviderRetryableError、SchemaViolation、
 ContextOverflowError、OutputTruncatedError 与普通质量/校验拒绝返回 accepted = false 的 DownstreamAttemptResult。
 若 attempt 路径上出现新增 ErrorKind.PROVIDER_FATAL 的 item error，说明误用 Stage 隔离入口，归
 generation_downstream_contract 内部错误并 exit 4，不当作可重试 slot rejection。
 
-DedupIndex.group_probe 直接接收同一 RunContext，不复用当前会把 fatal 编辑为记录状态的
+DedupIndex.group_reserve 直接接收同一 RunContext，不复用当前会把 fatal 编辑为记录状态的
 DedupStage._semantic_level 外壳。它对上述四类 run-terminal 使用相同穿透规则；对 ProviderRetryableError
-原样上抛，由 DeliveryController 记为当前 attempt 的 provider_retryable_exhausted 并消耗 attempt。
+原样上抛，由 SequenceWorkflow 在该 slot 成为 head 时记为当前 attempt 的
+provider_retryable_exhausted 并消耗 attempt。
 
 state_validator 的冻结签名：
 
@@ -1835,7 +2000,7 @@ StateTransitionInput 包含 slot_key、variant、role、state_before、state_aft
 | generation.noise_evaluate | evaluation_llm | NoiseSemanticEvaluation |
 
 模板全文冻结在 docs/CONTRACTS.md；六个 family 的 system/user 精确构造器只定义在
-`labelkit/common/runtime/generation_prompts.py`，M1 上下文预算与 generation operators 调用同一构造器。
+`labelkit/common/inference/generation_prompts.py`，M1 上下文预算与 generation operators 调用同一构造器。
 CONTRACTS 同时冻结：
 
 - system/user message 顺序。
@@ -1891,7 +2056,7 @@ complete_post_validated。ValidatedGenerationCall.resolved_at 的闭集固定为
 labelkit/common/config/generation.py
 labelkit/common/config/_generation_budget.py
 labelkit/common/contracts/generation.py
-labelkit/common/runtime/generation_prompts.py
+labelkit/common/inference/generation_prompts.py
 labelkit/operators/generation/__init__.py
 labelkit/operators/generation/flat.py
 labelkit/operators/generation/program.py
@@ -1901,12 +2066,12 @@ labelkit/operators/generation/state.py
 labelkit/operators/generation/render.py
 labelkit/operators/generation/evaluate.py
 labelkit/operators/generation/project.py
-labelkit/orchestration/generation_delivery.py
+labelkit/orchestration/sequence_workflow.py
 ~~~
 
 flat.py 接收原 generate.py 中 v1.12 独立样本实现。generate.py 只保留 flat generate 的薄 Stage 入口并调用
-generation.flat，不 import orchestration，也不保留旧 stream 分支。sequence 形态由
-Orchestrator._run_generate_only 直接调用 generation_delivery.deliver_generation；依赖方向仍为
+generation.flat，不 import orchestration，也不保留旧 stream 分支。sequence 形态由 Application 创建的
+SequenceWorkflow 调用 sequence_workflow.deliver_generation；依赖方向仍为
 cli → orchestration → operators → common。
 
 ### 19.2 整文件删除
@@ -1953,10 +2118,10 @@ labelkit/common/contracts/types.py
 labelkit/common/errors.py
 labelkit/common/extensions/hooks.py
 labelkit/common/observability/obslog.py
-labelkit/common/runtime/budget.py
-labelkit/common/runtime/credentials.py
-labelkit/common/runtime/llm_client.py
-labelkit/common/runtime/schema_engine.py
+labelkit/common/inference/budget.py
+labelkit/common/inference/credentials.py
+labelkit/common/inference/llm_client.py
+labelkit/common/inference/schema_engine.py
 labelkit/operators/annotate.py
 labelkit/operators/dedup.py
 labelkit/operators/emitter.py
@@ -1966,12 +2131,12 @@ labelkit/operators/quality.py
 labelkit/operators/verify.py
 labelkit/orchestration/__init__.py
 labelkit/orchestration/factory.py
-labelkit/orchestration/orchestrator.py
-labelkit/orchestration/runtime.py
+labelkit/orchestration/process_workflow.py
+labelkit/orchestration/application.py
 ~~~
 
 calendar、fixed-offset window、CP-SAT deterministic diagnostics、RuntimeCredentials、ResolvedPaths、
-SchemaEngine、LLMClient、SimilarityFilter probe/commit 与 Emitter .part/fsync/rename 的通用算法可以移植或保留；
+SchemaEngine、LLMClient、SimilarityFilter probe/commit 与 Emitter .part/fsync/rename 的通用算法继续使用；
 不得保留 common/runtime/scenario 的旧物理包或旧类型。
 
 pyproject 新增维护中的 jsonpatch 与 jsonpointer 直接依赖，保留 ortools 精确锁定。实现调用成熟库，不复制 JSON
@@ -2001,7 +2166,7 @@ tests/cli/goldens/dryrun-synth-stream.txt
 ~~~text
 tests/common/config/test_generation.py
 tests/common/contracts/test_generation_contracts.py
-tests/common/runtime/test_generation_prompts.py
+tests/common/inference/test_generation_prompts.py
 tests/operators/generation/conftest.py
 tests/operators/generation/test_program.py
 tests/operators/generation/test_planner.py
@@ -2010,7 +2175,7 @@ tests/operators/generation/test_state.py
 tests/operators/generation/test_render.py
 tests/operators/generation/test_evaluate.py
 tests/operators/generation/test_project.py
-tests/orchestration/test_generation_delivery.py
+tests/orchestration/test_sequence_workflow.py
 tests/integration/test_sequence_generation_llm.py
 tests/integration/test_sequence_generation_structured_output_llm.py
 tests/cli/goldens/dryrun-sequence-generation.txt
@@ -2027,10 +2192,10 @@ tests/common/config/test_paths_hooks.py
 tests/common/contracts/test_types.py
 tests/common/extensions/test_hooks.py
 tests/common/observability/test_obslog.py
-tests/common/runtime/test_budget.py
-tests/common/runtime/test_credentials.py
-tests/common/runtime/test_llm_client.py
-tests/common/runtime/test_schema_engine.py
+tests/common/inference/test_budget.py
+tests/common/inference/test_credentials.py
+tests/common/inference/test_llm_client.py
+tests/common/inference/test_schema_engine.py
 tests/common/test_errors.py
 tests/hook_samples.py
 tests/operators/test_annotate.py
@@ -2041,7 +2206,7 @@ tests/operators/test_ingest.py
 tests/operators/test_quality.py
 tests/operators/test_stitch.py
 tests/operators/test_verify.py
-tests/orchestration/test_orchestrator.py
+tests/orchestration/test_process_workflow.py
 ~~~
 
 tests/cli/test_cli.py 的 production/test manifest 与层间依赖检查必须同步。integration marker 拆成 deepseek 与 zai；
@@ -2246,39 +2411,57 @@ example checker 假装从不可见字段获得证明。
 
 ### 22.4 delivery 与输出
 
-- 每个失败阶段都触发 whole-set retry；成功后 planned = delivered。
-- 首个完整通过生成与独立 evaluator 的 attempt 在 downstream 被固定拒绝，其数据不进入任何正式索引或输出；
-  此前若真实模型自然触发 generation/evaluator rejection，必须照常计数且不能让测试把它误判为注入失败。
-- group dedup probe 不写 exact、MinHash 或 embedding index；group commit 原子写全部。
-- 耗尽保留此前成功 manifest 和固定输出，failed report 独立且 artifacts_committed = false。
-- provider fatal 不消耗 attempt，exit 4。
-- quality、annotate、frame annotate、verify 和 semantic dedup 的 attempt 入口分别注入 ProviderFatalError，
-  均必须零 slot retry、零正式 commit 并 exit 4；ProviderRetryableError 则恰消耗一次 attempt。
-- projector 入口携带失败 StateEvaluation/SemanticEvaluation、instruction-only PatternEvaluation，或 declared 的伪 role word、
-  frame/actor、event_id、actual_bindings、actual_violations 时，在构造 Record 前终态失败。
-- projector 篡改 role、owner、event_id 或成员集合时 CrossViewReconciler 失败。
-- 最大允许完整轨迹通过，超一 byte/event/role/variant fail closed；不存在裁剪后 pass。
-- retained_content_bytes 恰为 512 MiB 时接受，超一 UTF-8 byte 时整个 slot 失败且零 dedup/dataset commit。
-- 分别把 SequenceRows、ReplayRows 的 carrier 计费值与请求全局计费值同步偏移一 byte，
-  CrossView 仍必须从实际行独立重算后拒绝；多组 ReplayRows 不得在请求边界被拉平。
-- 单独构造“source primary 未超限，加上它的 replay rows 恰超一 byte”的用例，必须在 source
-  group_commit 前命中 sequence_memory_budget，零 dedup、dataset 与 replay commit。
-- 从 ProjectedSequence 经过真实 attempt collaborators 到 SequenceRows，最终 main_row 必须包含 inherited
-  classification、quality score、sequence/frame annotation 与 verification；CrossView、retained bytes、delivery digest
-  和正式 main 文件使用同一 SequenceRows 字节，不得回退读取 pre-downstream Record。
-- M11 对最终 sequence annotation、main member annotation 与 primary annotation 都显式使用 program
-  物化 Schema；任一份失效都将整个 set 归 `reconcile` 并重试，失败 attempt 零 rows/replay/
-  dedup/dataset commit。SchemaEngine 的构造期 user Schema 和 `FrameClassView.gen_schema` 用 poison 值证明未被回落。
-- frame-only 真实 loader 配置必须组装 `dedup → quality → annotate`，segment 和 sequence annotate 仍关闭。
-  真实 AnnotateStage 证明 sequence 调用为零、成员调用恰等于 primary event 数、item.annotation 为 null、
-  全部 member annotations 完整；源 frame view/schema 的 poison 不能影响 program-bound 结果。
-- 多个 counterfactual source 复用同一 pattern/variant 的 `by_pattern.delivered` 必须按实际 sequence
-  只计一次；final commit-I/O 失败的 failed report 必须为 `failed_slot = null`、`attempts_used = 0`。
-- 失败 attempt 的 SchemaEngine resolved-at、LLM usage、provider retry 与 trace 统计继续累积；同一用例中的 dataset counters、
-  item status、annotation、dedup token 和 projected rows 全部回滚，成功重试后只合并最终 attempt 的 dataset counters。
+- 每个失败阶段都触发 whole-set retry；成功后 planned = delivered。不同 slot 的 quality、annotate 与 verify 真实
+  重叠，但同一 branch 的 event N+1 不早于 event N 的 state_after。
+- 候选缓冲只接纳连续 `[next_commit, next_commit + capacity)` 区间；六百槽反向完成时 running、prepared 与
+  recoverable outcome 总数不超过容量，高槽完成不能持续接纳窗口外 tail。
+- 六百槽反向完成仍严格按零至五百九十九提交。高槽先 recoverable rejection、低槽随后耗尽时，高槽 attempt
+  与 rejection 不进入 report；其 task、reservation、Metrics capture 与 candidate 全部清零。
+- attempt 只在 head 的本地 rejection、commit-time rejection 或成功 commit 时消费。高槽 speculative outcome
+  被丢弃、provider fatal、circuit 与 cancellation 都不消费 attempt。
+- 多个同时 fatal 按 `(phase, slot ordinal, attempt index, leaf declaration key)` 稳定选择原异常；等待全部
+  cleanup 后 failed report 才冻结。外部 cancellation 与最终 full CrossView 内部错误使用
+  `failed_slot=null`、`attempts_used=0`。
+- `group_reserve` 不写 exact、MinHash 或 embedding 正式索引；六百 pending reservation 可共存，低槽 commit 不使
+  高槽 stale。`group_commit` 只消费自己，结束时 registry 必须为空。
+- 六百相同 candidate 只有最低 declaration ordinal 提交，其余在 `group_revalidate` 被拒绝并原位重试。
+  高槽已保存 quality failure、低槽随后提交相同内容时，高槽轮到后必须先记 dedup rejection。
+- reservation 只有 coordinator 或 candidate buffer 一个 owner；转移前 fatal/cancellation 的 `finally` 恰 discard
+  一次，转移后由提交协调器恰 commit 或 discard 一次。重复 discard、旧 epoch 和非法状态必须暴露内部错误。
+- `PrimaryCandidateReconcileRequest` 遗漏/增加/乱序 variant、遗漏/增加 replay、错配 ReplayLayout、篡改
+  candidate digest、role、owner、event_id、member 或 canonical bytes 都在当前 attempt 拒绝，正式 dedup 仍为空。
+- `NoiseCandidateReconcileRequest` 对伪造 payload digest、topic/ordinal、ID、timestamp、字段或 bytes 都在当前
+  noise attempt 拒绝。多个相似 noise 反向完成时仍由最低 ordinal first-writer，提交前必须对最新 primary 与较低
+  noise 重新 probe。
+- `CrossViewFrontier.check_primary/check_noise` 返回尚未应用的 `CrossViewDelta`；rejection 不修改 frontier，
+  `commit(delta)` 不得失败。故意遗漏一次 frontier delta 时，最终 full reconcile 只产生 exit 4 内部错误，不消费
+  attempt 或打开输出。
+- 一百、三百、六百 slot 的 candidate-local/frontier 调用量只能随当前 rows 线性增长，不得出现每槽全前缀重扫。
+  属性测试随机破坏 ID、timestamp、source、replay 与 retained bytes，增量 frontier 和最终 full reconcile 判定相等。
+- retained_content_bytes 恰为 512 MiB 时接受，超一 UTF-8 byte 时当前 whole slot 失败且零 dedup/dataset commit。
+  source primary 未超限但加 replay 恰超一 byte时，必须在 source group commit 前拒绝。
+- 分别同步篡改 SequenceRows、ReplayRows carrier 计费值和 request 总值仍必须被 actual canonical rows 拒绝；
+  多组 ReplayRows 不得在 request 边界拉平。
+- 从 ProjectedSequence 经真实 attempt collaborators 到 SequenceRows，最终 main_row 包含 inherited
+  classification、quality score、sequence/frame annotation 与 verification；CrossView、retained bytes、
+  delivery digest 和正式 main 文件只使用该 SequenceRows 字节。
+- M11 对最终 sequence annotation、main member annotation 与 primary annotation 显式使用 program 物化 Schema；
+  任一失效都归 `reconcile` 并重试，失败 attempt 零 rows/replay/dedup/dataset commit。构造期 user Schema 与
+  `FrameClassView.gen_schema` 使用 poison 值证明它们不参与该检查。
+- frame-only 真实 loader 配置组装 `dedup → quality → annotate`，segment 和 sequence annotate 关闭；真实
+  AnnotateStage 证明 sequence 调用为零、成员调用恰等于 primary event 数、item.annotation 为 null 且全部 member
+  annotations 完整。
+- 多个 counterfactual source 复用同一 pattern/variant 时，`by_pattern.delivered` 按实际 sequence 只计一次；
+  final commit-I/O 失败使用 `failed_slot=null`、`attempts_used=0`。
+- 失败 attempt 的 SchemaEngine resolved-at、LLM usage、provider retry 与 trace 继续累计；dataset counters、
+  item status、annotation、reservation 与 projected rows 回滚，成功重试后只合并最终提交 attempt 的 dataset counters。
+- capacity 一与六百使用同一确定性 provider outcome 时，最终 delivery digest、first-writer、attempt ledger 与
+  artifact 行序相同；trace 完成序不要求逐字节相同。
 - NoiseRenderRequest 使用 semantic profile 与含 topic 的 NoiseSlot，NoiseEvaluationRequest 使用 evaluation profile
-  与同一 planned_topic；两条真实接口都不接受 PlannedEvent、ScenarioSeed、EventTrace、primary payload
-  或既有 noise payload；缺任一 profile 时在编译期失败。
+  与同一 planned_topic；两条接口都不接受 PlannedEvent、ScenarioSeed、EventTrace、primary payload 或既有
+  noise payload；缺任一 profile 时编译失败。
+- 耗尽保留此前成功 manifest 和固定输出，failed report 独立且 artifacts_committed = false。每个 commit fault
+  point 都必须保持旧 manifest 为唯一成功真值。
 
 ### 22.5 覆盖率
 
@@ -2314,11 +2497,10 @@ instruction-only 使用真实 DeepSeek 另跑一个非空 slot，必须断言：
 
 ### 23.2 真实 failure injection
 
-不增加测试配置键。测试在 production CrossViewReconciler 边界装饰一次性 rejection wrapper；注入点位于首个
-完整通过 generation 与独立 evaluator 的 attempt
-的 generation、全部 evaluator 与全部启用下游完成之后、group_commit 之前：
+不增加测试配置键。测试在 production `reconcile_primary_candidate` 边界装饰一次性 rejection；注入点位于首个
+完整通过 generation、独立 evaluator 与全部启用下游的 attempt，在 PreparedCandidate 冻结和 group commit 之前：
 
-- 该完整 attempt 的四 variant 走真实 DeepSeek、真实 SchemaEngine 和原 evaluator 后，wrapper 返回固定拒绝。
+- 该完整 attempt 的四 variant 走真实 DeepSeek、真实 SchemaEngine 和原 evaluator 后，装饰函数返回固定拒绝。
 - 后续完整 attempt 完全委托原 evaluator，再次执行完整真实生成。
 - 观测到恰有两次完整四 variant attempt，index 严格递增；此前允许存在报告已记录的自然拒绝。
 - sequence_slot_attempts 等于最终成功 attempt index 加一，injected rejection = 1，全部拒绝数等于
@@ -2327,12 +2509,13 @@ instruction-only 使用真实 DeepSeek 另跑一个非空 slot，必须断言：
 - report.llm_usage 各 profile 的 calls 合计大于等于 `2 * estimate.successful_attempt_lower_bound`。
 
 另一个真实用例在 EventPlan 的 production state 后置验证边界装饰一次性 violation，触发 M8 L3 repair 后放行；
-精确断言 wrapper 只注入一次、目标调用的 ValidatedGenerationCall.resolved_at 匹配 `l3_[12]`，且最终提交的 EventExecution
+精确断言装饰函数只注入一次、目标调用的 ValidatedGenerationCall.resolved_at 匹配 `l3_[12]`，且最终提交的 EventExecution
 与最后一次成功后置验证返回的冻结对象身份相同。不与另一场无注入 live run 比较，避免模型非确定性污染证据。
 该用例证明 DeepSeek supports_structured_output = false 路径的
 文本 JSON、确定性解析和真实修复环，不用模型偶发违约充当注入。
 
-两个 wrapper 都只装饰已有 production collaborator，不替换任何网络组件，不增加状态化用户 hook，不产生生产 fallback。
+两个测试装饰函数都只作用于已有 production collaborator，不替换任何网络组件，也不增加状态化用户 hook 或
+生产执行分支。
 
 ### 23.3 structured output
 
@@ -2439,13 +2622,14 @@ spec/306-m6-generate.md
 spec/307-m7-verify.md
 spec/308-m8-schema-engine.md
 spec/309-m9-llm-client.md
-spec/310-m10-orchestrator.md
+spec/310-m10-orchestration.md
 spec/311-m11-emitter.md
 spec/312-m12-logging.md
 spec/313-m13-classify.md
 spec/314-m14-segment.md
 spec/315-m15-extract.md
 spec/316-m16-stitch.md
+spec/317-m17-execution-runtime.md
 spec/40-ch4-data-structures.md
 spec/50-ch5-config-spec.md
 spec/60-ch6-io-formats.md
@@ -2477,7 +2661,7 @@ flowchart LR
 ~~~
 
 每个波次都沿最终 GenerationProgram → ScenarioPlan → EventTrace → Evaluation → Delivery → Projection 路径，
-不建立临时 generator、兼容层、migration 或 fallback。任何 SPEC 描述能力都必须在相应测试中闭合，不留 TODO。
+只实现冻结的 canonical 路径。任何 SPEC 描述能力都必须在相应测试中闭合，不留 TODO。
 
 ## 27. 需求账本
 
@@ -2492,10 +2676,10 @@ flowchart LR
 | 世界连续性 | ScenarioSeed、逐事件 ActorView、JSON Patch | replay、Schema、hook、knowledge 隔离 |
 | 反事实可比较性 | protected prefix + causal suffix | CouplingEvaluator |
 | 人看不假 | SemanticEvaluator + 独立真实感门 | 六维全 true + 盲审 |
-| 精确条数 | whole-set DeliveryController | planned = delivered 或整个运行失败 |
+| 精确条数 | whole-set SequenceWorkflow | planned = delivered 或整个运行失败 |
 | instruction 自主判定 | instruction-only 独立 truth | 无 pattern claim、语义级 knowledge |
 | 教学可复演 | sequence-generation example | 8 main、27 stream、replay dropped_dup = 1 |
-| 无旧兼容 | 删除清单与未知键拒绝 | code search + config negatives |
+| 旧面归零 | 删除清单与未知键拒绝 | code search + config negatives |
 
 ## 28. 完成定义
 

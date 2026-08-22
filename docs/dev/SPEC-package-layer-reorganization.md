@@ -8,6 +8,10 @@
 
 > **2026-08-14 整改修订注记**：M1 的 `loader.py` 已按「每文件 ≤ 2000 行、每函数 ≤ 50 行」拆为「公开入口 + 六个包内私有模块」（`_collect` / `_sections` / `_schemas` / `_rubrics` / `_classviews` / `_constraints`，见 §3 目录树）。分层方向、模块归属与公开面（`load` / `default_rubric` / `ResolvedConfig`）零改动；本文其余内容保留为历史重构记录。
 
+> **2026-08-23 v1.19 修订注记**：四层依赖方向保持不变；当前物理路径、八字段 `RunContext`、execution runtime
+> 和精确文件 manifest 由 `docs/dev/SPEC-execution-runtime.md`、`docs/CONTRACTS.md` 与
+> `tests/cli/test_cli.py` 共同收口。下文 v1.1 的历史实施记录不覆盖这些较新的权威契约。
+
 ## 1. 目的
 
 将当前平铺在 `labelkit/` 下的生产代码按职责整理为四个可识别的层：
@@ -39,9 +43,11 @@ cli → orchestration → operators → common
 
 ### 2.2 明确不做
 
-- 不拆分 `loader.py`、`ingest.py`、`verify.py`、`orchestrator.py` 内部业务算法。
+- v1.1 本次重构不拆分当时的 `loader.py`、`ingest.py`、`verify.py`、`orchestrator.py` 内部业务算法；后续权威
+  版本允许按生产职责拆分或改名。
 - 不改变任何业务算法或阶段顺序。
-- 不改变 `Stage.run()` 签名、`RunContext` 六字段结构或 `PipelineItem` 状态机。
+- v1.1 本次重构不改变 `Stage.run()` 签名、当时的 `RunContext` 结构或 `PipelineItem` 状态机；v1.19 的八字段
+  `RunContext` 以 execution runtime 规格为准。
 - 不新增缓存、临时数据持久化、遥测或新的外部依赖。
 - 不把 `obslog`、`schema_engine` 或 `hooks` 混入配置加载逻辑。
 - 不以“向后兼容”为理由保留任何旧平铺生产模块或测试文件。
@@ -61,15 +67,21 @@ labelkit/
 │   │   └── 进程入口、异常到退出码映射、最终退出结果
 │   ├── parser.py
 │   │   └── argparse 参数定义和 CliOverrides 转换
+│   ├── console.py
+│   │   └── plain/rich 进度与最终摘要渲染
 │   └── commands.py
 │       └── run、validate、rubric 命令的用户交互处理
 │
 ├── common/
 │   ├── contracts/
+│   │   ├── execution.py
+│   │   │   └── ResourceKey、TaskSpec、TaskGroupRequest 与 TaskExecutor 协议
+│   │   ├── generation.py
+│   │   │   └── sequence generation 冻结载体与接口
 │   │   ├── types.py
 │   │   │   └── Record、PipelineItem、UI 类型、共享 frame/tree helper
 │   │   └── stage.py
-│   │       └── Stage、RunContext 和阶段调用不变量
+│   │       └── Stage、八字段 RunContext 和阶段调用不变量
 │   │
 │   ├── errors.py
 │   │   └── LabelKitError、ErrorKind、退出码常量和错误分类
@@ -91,16 +103,25 @@ labelkit/
 │   │   │   └── 内联 rubric 解析与 default:* 包数据装载（2026-08-14 拆分）
 │   │   ├── _classviews.py
 │   │   │   └── [class.*] / [frame.class.*] 白名单合并为按类视图（2026-08-14 拆分）
-│   │   └── _constraints.py
-│   │       └── 跨节组合约束与解析产物冻结（2026-08-14 拆分）
+│   │   ├── _constraints.py
+│   │   │   └── 跨节组合约束与解析产物冻结（2026-08-14 拆分）
+│   │   ├── _generation_budget.py
+│   │   │   └── sequence 六家族上下文预算证明
+│   │   └── generation.py
+│   │       └── sequence generation 配置载体解析
 │   │
-│   ├── runtime/
+│   ├── inference/
+│   │   ├── budget.py
+│   │   ├── credentials.py
+│   │   ├── generation_prompts.py
 │   │   ├── llm_client.py
 │   │   │   └── LLM/Embedding transport、重试、密钥池、并发、用量计量
 │   │   └── schema_engine.py
 │   │       └── 结构化输出层到 LLM 修复环的四层保证、JSON 修复、Schema 校验和 repair 统计
 │   │
 │   ├── observability/
+│   │   ├── console_format.py
+│   │   │   └── console 文本清洗与宽度处理
 │   │   └── obslog.py
 │   │       └── stderr log、trace JSONL、事件、计数器、阶段耗时和 circuit breaker
 │   │
@@ -121,25 +142,39 @@ labelkit/
 │   │   └── 相邻 UI 帧动作提取
 │   ├── quality.py
 │   │   └── pairwise/pointwise 质量评分和质量门
+│   ├── quality_calls.py
+│   │   └── M4 质量模型叶调用
 │   ├── generate.py
 │   │   └── 样本生成、种子池、validator 和相似度过滤
 │   ├── annotate.py
 │   │   └── 用户 Schema 标注、自一致性和标注修复
 │   ├── verify.py
-│   │   └── 标注审核、repair、episode member surgery
+│   │   └── 普通与 sequence 标注审核、repair
+│   ├── stream_verify.py
+│   │   └── stream episode member surgery
+│   ├── stitch.py
+│   │   └── session 线索缝合
+│   ├── generation/
+│   │   └── compiler、planner、state、render、evaluate 与 projector
 │   └── emitter.py
 │       └── main output、rejects、report、sidecar 和原子交付
 │
+├── runtime/
+│   ├── resources.py
+│   │   └── ResourceKey 许可与 HTTP origin pool
+│   └── scheduler.py
+│       └── 有界接纳、TaskGroup 生命周期与输入序结果
+│
 └── orchestration/
     ├── __init__.py
-    ├── orchestrator.py
-    │   └── 批处理、阶段执行、generation re-flow、生命周期和报告汇总
+    ├── application.py
+    │   └── 对象图、进程生命周期、profile probe 与最终清理
     ├── factory.py
     │   └── 根据 ResolvedConfig 实例化算子并固定 pipeline 顺序
-    ├── profile_usage.py
-    │   └── 计算 validate --probe 实际引用的 profile 集合
-    └── runtime.py
-        └── 组装配置、日志、LLM、SchemaEngine、Ingestor、Emitter 和 Orchestrator
+    ├── process_workflow.py
+    │   └── 普通批处理、阶段执行、generation re-flow 与报告汇总
+    └── sequence_workflow.py
+        └── sequence attempt、声明序提交与 manifest-last 交付
 ```
 
 `examples/stream/tools/gen_fixtures.py` 保持在示例目录；它不是生产包的一部分。
@@ -165,7 +200,7 @@ CLI 不得直接实例化算子、LLMClient、SchemaEngine、Emitter 或 Ingesto
 - `common/contracts`：共享数据结构和阶段协议。
 - `common/errors.py`：跨层错误词汇；不属于配置模块，因为错误涵盖输入、provider、schema、内部状态和熔断。
 - `common/config`：启动期配置解析和校验；不得发起网络请求或读取输入记录内容。
-- `common/runtime`：运行期 LLM transport 和结构化输出保证。
+- `common/inference`：LLM transport 和结构化输出保证。
 - `common/observability`：stderr 日志、trace、指标和熔断状态；不得依赖任何算子。
 - `common/extensions`：用户 hook 的解析和执行辅助；配置加载器、SchemaEngine、GenerateStage 共用，不归配置目录所有。
 
@@ -173,19 +208,28 @@ Common 不得依赖 `operators` 或 `orchestration`。
 
 ### 4.3 Operators
 
-算子只能依赖 common 和标准库/声明的第三方库。算子不得依赖 orchestration，也不得通过导入其他算子来取得业务逻辑。
+算子只能依赖 common 和标准库/声明的第三方库。算子不得依赖 orchestration，也不得通过导入不相关算子来取得业务逻辑。
 
-以下是冻结契约允许的三个例外，必须保留并使用懒加载：
+以下是冻结契约允许的跨算子调用，必须保留并使用懒加载：
 
 - `verify` 调用 `annotate` 的公开 repair surface；
+- `verify` 调用 `classify.classify_frames`；
 - `verify` 调用 `segment.judge_window`；
 - `verify` 调用 `extract.extract_transition`。
 
-这些例外属于既有 stream repair contract，不得为了目录洁癖改写业务行为。
+这些调用属于既有 stream repair contract，不得为了目录洁癖改写业务行为。
+`quality.py`/`quality_calls.py` 共同构成 M4，`verify.py`/`stream_verify.py` 共同构成 M7；同一算子的
+物理拆分可以相互导入，不算跨算子依赖。
 
-### 4.4 Orchestration
+### 4.4 Execution runtime
 
-编排层可以依赖 common 和 operators，负责：
+`labelkit/runtime` 只依赖 common，负责 ResourceKey 接纳、TaskGroup 结构化寿命、输入序结果、ResourceManager 与
+runtime 观测。它不得依赖 operators、orchestration 或 cli，也不得实现业务阶段、retry、dedup、CrossView、
+retained 或 commit。operators 只依赖 `common/contracts/execution.py` 的 TaskExecutor 协议，不导入 runtime 实现。
+
+### 4.5 Orchestration
+
+编排层可以依赖 common、runtime 和 operators，负责：
 
 - stage 实例化和顺序；
 - process、generate_only、dry-run 分支；
@@ -207,10 +251,11 @@ Common 不得依赖 `operators` 或 `orchestration`。
 | `labelkit.common.contracts.*` | `labelkit/common/contracts/` |
 | `labelkit.common.errors` | `labelkit/common/errors.py` |
 | `labelkit.common.config.*` | `labelkit/common/config/` |
-| `labelkit.common.runtime.*` | `labelkit/common/runtime/` |
+| `labelkit.common.inference.*` | `labelkit/common/inference/` |
 | `labelkit.common.observability.obslog` | `labelkit/common/observability/obslog.py` |
 | `labelkit.common.extensions.hooks` | `labelkit/common/extensions/hooks.py` |
 | `labelkit.operators.*` | `labelkit/operators/` |
+| `labelkit.runtime.*` | `labelkit/runtime/` |
 | `labelkit.orchestration.*` | `labelkit/orchestration/` |
 
 `labelkit.cli` 是 canonical package 名，不属于旧路径；`labelkit/cli.py` 不得存在，console script 继续指向 `labelkit.cli:main`。
@@ -221,65 +266,20 @@ Common 不得依赖 `operators` 或 `orchestration`。
 - `labelkit/config/` 必须不存在。
 - `labelkit/types.py`、`stage.py`、`errors.py`、`llm_client.py`、`schema_engine.py`、`obslog.py`、`hooks.py`、`ingest.py`、`segment.py`、`dedup.py`、`classify.py`、`extract.py`、`quality.py`、`generate.py`、`annotate.py`、`verify.py`、`emitter.py` 和 `orchestrator.py` 必须不存在。
 - canonical 模块中的 `TYPE_CHECKING`、懒加载和普通 import 必须全部使用新路径。
-- `annotate_record`、`build_*_prompt`、`judge_window`、`extract_transition`、`RunContext`、`LLMClient`、`SchemaEngine` 等 direct-call surface 只在各自 canonical 模块保留既有签名和行为。
+- `annotate_record`、`build_*_prompt`、`judge_window`、`extract_transition`、`RunContext`、`LLMClient`、`SchemaEngine` 等 direct-call surface 只在各自 canonical 模块存在；v1.19 签名以 `docs/dev/SPEC-execution-runtime.md` 为准，不保留旧签名 wrapper。
 - 任何测试、文档或内部代码不得继续通过旧路径 import；`tests/common/test_compat_imports.py` 必须删除。
 
 ## 6. 测试和文档迁移
 
 ### 6.1 测试目录
 
-测试文件必须按生产职责镜像到以下路径；除共享的 `conftest.py`、`hook_samples.py` 和必要的 package marker 外，不允许出现未列出的 Python 测试模块：
+测试继续按生产职责分布在 `tests/cli`、`tests/common`、`tests/operators`、`tests/runtime`、
+`tests/orchestration` 与 `tests/integration`。共享 fixture 只放在 `tests/conftest.py`、`tests/hook_samples.py`、
+`tests/llm_client_helpers.py` 或相应职责子目录。`tests/cli/test_cli.py` 中的 `EXPECTED_PRODUCTION_PY` 与
+`EXPECTED_TEST_PY` 是精确文件集合的唯一权威，并机械对照磁盘；本历史规格不再复制一份会漂移的封闭清单。
 
-```text
-tests/
-├── conftest.py
-├── hook_samples.py
-├── cli/
-│   └── test_cli.py
-├── common/
-│   ├── contracts/
-│   │   ├── test_types.py
-│   │   └── test_stage.py
-│   ├── test_errors.py
-│   ├── config/
-│   │   └── test_config.py
-│   ├── runtime/
-│   │   ├── test_llm_client.py
-│   │   └── test_schema_engine.py
-│   ├── observability/
-│   │   └── test_obslog.py
-│   └── extensions/
-│       └── test_hooks.py
-├── operators/
-│   ├── test_ingest.py
-│   ├── test_segment.py
-│   ├── test_stitch.py
-│   ├── test_dedup.py
-│   ├── test_classify.py
-│   ├── test_extract.py
-│   ├── test_quality.py
-│   ├── test_generate.py
-│   ├── test_annotate.py
-│   ├── test_verify.py
-│   └── test_emitter.py
-├── orchestration/
-│   └── test_orchestrator.py
-└── integration/
-    ├── test_llm_client_llm.py
-    ├── test_schema_engine_llm.py
-    ├── test_annotate_llm.py
-    ├── test_classify_llm.py
-    ├── test_generate_llm.py
-    ├── test_quality_llm.py
-    ├── test_verify_llm.py
-    ├── test_stream_llm.py
-    ├── test_stitch_llm.py
-    └── test_key_pool_llm.py
-```
-
-`test_key_pool.py` 的离线密钥池测试必须并入 `common/runtime/test_llm_client.py`；`test_stream_ingest.py` 必须并入 `operators/test_ingest.py`。迁移不得删除或弱化任何既有测试用例；`test_stage.py` 和 `test_errors.py` 必须覆盖对应公共契约。所有 fixture import 必须切换到新的测试路径。
-
-v1.9（M16 线索缝合，2026-07-16）向本封闭白名单登记两个新测试文件：`tests/operators/test_stitch.py` 与 `tests/integration/test_stitch_llm.py`（已列入上方目录树；白名单封闭语义不变——未列出的测试模块仍不允许出现）。注：§10 计数为 2026-07-16 时点历史记录（30/31），v1.9 后实为 31/33，不回改。
+兼容导入测试、独立 `test_key_pool.py` 和独立 `test_stream_ingest.py` 仍被禁止。密钥池离线测试属于
+`tests/common/inference/test_llm_client.py`，stream ingest 测试属于 `tests/operators/test_ingest.py`。
 
 ### 6.2 必须更新的文档
 
@@ -301,7 +301,7 @@ v1.9（M16 线索缝合，2026-07-16）向本封闭白名单登记两个新测�
 flowchart TD
     W0["Wave 0 冻结 spec：主 agent 写入并提交本文件"]
     W1["Wave 1 公共契约和配置：common/contracts、common/config、common/errors.py（删除旧 config/ 与对应旧平铺文件）"]
-    W2["Wave 2 运行时公共能力：common/runtime、common/observability、common/extensions（删除对应旧平铺文件）"]
+    W2["Wave 2 推理公共能力：common/inference、common/observability、common/extensions（删除对应旧平铺文件）"]
     subgraph W3["Wave 3 算子迁移（五组互不相交，可并行）"]
         G1["输入/流：ingest.py、segment.py"]
         G2["数据筛选：dedup.py、classify.py"]
@@ -334,11 +334,11 @@ flowchart TD
 
 交付：common canonical modules 可直接 import，旧路径不可 import，契约内容不变。
 
-### Wave 2：运行时公共能力
+### Wave 2：推理与观测公共能力
 
 文件所有权：
 
-- `labelkit/common/runtime/`；
+- `labelkit/common/inference/`；
 - `labelkit/common/observability/`；
 - `labelkit/common/extensions/`；
 - 删除旧 `labelkit/llm_client.py`、`labelkit/schema_engine.py`、`labelkit/obslog.py`、`labelkit/hooks.py`。
@@ -371,7 +371,8 @@ flowchart TD
 
 ### Wave 5：测试、契约和开发文档
 
-严格按 §6.1 移动/合并测试，删除兼容导入测试，补目录形态与依赖边界断言，并更新 `docs/CONTRACTS.md`、`AGENTS.md`、`CLAUDE.md` 和命中的开发文档。
+严格按 `tests/cli/test_cli.py` 的 executable manifest 移动或合并测试，删除兼容导入测试，补目录形态与依赖边界
+断言，并更新 `docs/CONTRACTS.md`、`AGENTS.md`、`CLAUDE.md` 和命中的开发文档。
 
 ### Wave 6：对抗评审
 
@@ -379,7 +380,8 @@ flowchart TD
 
 - 所有 canonical modules 都位于目标目录；
 - `labelkit/` 根目录只剩 `__init__.py`，旧 `labelkit/config/` 和全部 shim 已从 Git 与构建产物删除；
-- `tests/` 的业务测试文件逐项符合 §6.1，没有平铺 common 测试、`test_compat_imports.py`、独立 `test_key_pool.py` 或独立 `test_stream_ingest.py`；
+- `tests/` 的业务测试文件逐项符合 executable manifest，没有平铺 common 测试、`test_compat_imports.py`、独立
+  `test_key_pool.py` 或独立 `test_stream_ingest.py`；
 - CLI 不再直接创建算子；
 - operators 没有新增未授权的相互依赖；
 - `verify` 的三个契约例外仍然可用；
@@ -406,8 +408,8 @@ git diff --check
 ```text
 labelkit 根目录 Python 文件 = {__init__.py}
 labelkit/config 不存在
-§3 中每个 canonical 生产文件存在，且不存在未列出的业务模块
-§6.1 中每个测试文件存在，且不存在未列出的测试模块
+executable production manifest 中每个文件存在，且不存在未列出的业务模块
+executable test manifest 中每个文件存在，且不存在未列出的测试模块
 旧平铺 import path 全部 find_spec(...) is None
 构建出的 wheel/sdist 不含旧平铺文件或 labelkit/config
 ```

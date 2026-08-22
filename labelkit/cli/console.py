@@ -78,7 +78,7 @@ from labelkit.common.observability.obslog import (
 if TYPE_CHECKING:
     from labelkit.common.config.model import ResolvedConfig
     from labelkit.common.observability.obslog import TraceEvent
-    from labelkit.common.runtime.llm_client import ProfileSnapshot
+    from labelkit.common.inference.llm_client import ProfileSnapshot
 
 __all__ = ["ConsoleRenderer"]
 
@@ -148,7 +148,7 @@ def _fmt_tok(n: int) -> str:
 
 
 def _class_overrides_exist(cfg: "ResolvedConfig") -> bool:
-    """Orchestrator._class_overrides_exist 的镜像（R28 dry-run 注记门）。
+    """ProcessWorkflow._class_overrides_exist 的镜像（R28 dry-run 注记门）。
 
     @param cfg M1 解析出的 ResolvedConfig。
     @return 存在任一 per-class 覆盖时 True。

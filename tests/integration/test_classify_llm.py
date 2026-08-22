@@ -8,8 +8,8 @@ any parseable JSON, so L1/L3 exhaust for real — same trick family as the key-p
 401 test)."""
 from __future__ import annotations
 
+import asyncio
 import json
-import os
 import random
 
 import pytest
@@ -37,13 +37,13 @@ from labelkit.common.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.common.runtime.credentials import resolve_credentials
-from labelkit.common.runtime.llm_client import LLMClient
-from labelkit.common.runtime.schema_engine import SchemaEngine
+from labelkit.common.inference.credentials import resolve_credentials
+from labelkit.common.inference.schema_engine import SchemaEngine
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import PipelineItem, Record, RecordRef
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
+from tests.llm_client_helpers import make_llm_client as _client
 
 pytestmark = pytest.mark.integration
 
@@ -121,13 +121,29 @@ class _RecordingMetrics:
         self.events.append((ev, stage, batch_no, record_ids, payload or {}))
 
 
+class _TaskRunner:
+    async def run_group(self, request):
+        results = [None] * len(request.tasks)
+
+        async def run_one(index, spec):
+            results[index] = await spec.operation()
+
+        async with asyncio.TaskGroup() as group:
+            for index, spec in enumerate(request.tasks):
+                group.create_task(run_one(index, spec))
+        return tuple(results)
+
+
 def make_ctx(cfg) -> RunContext:
     metrics = _RecordingMetrics()
-    llm = LLMClient(cfg.llm_profiles, cfg.embedding_profiles,
-                       resolve_credentials(cfg), metrics=None)
+    llm = _client(cfg.llm_profiles, cfg.embedding_profiles,
+                  resolve_credentials(cfg), metrics=None)
     engine = SchemaEngine(dict(cfg.user_schema), llm, cfg.output, metrics=None)
-    return RunContext(cfg=cfg, llm=llm, schema_engine=engine, metrics=metrics,
-                      rng=random.Random("42:1:classify"), batch_no=1)
+    return RunContext(
+        cfg=cfg, llm=llm, schema_engine=engine,
+        rng=random.Random("42:1:classify"), batch_no=1, metrics=metrics,
+        tasks=_TaskRunner(), task_namespace="integration:batch:1:stage:classify",
+    )
 
 
 def text_record(rec_id: str, text: str) -> Record:

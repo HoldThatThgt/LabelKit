@@ -7,14 +7,14 @@ stage item-selection behavior and verify.verdict trace-event payload tier gating
 v1.8 stream branch (S7/S8/S31): the sequence-variant review prompt (six-section
 order, boundary-margin fate states, [动作序列] omission), defect-table collection
 and normalization, and the two-phase batch-level member surgery — driven through
-in-process complete_validated stubs (test_segment 惯例) with
-``segment.judge_window`` / ``extract.extract_transition`` /
-``annotate.annotate_record`` monkeypatched at their direct-call surfaces.
+in-process complete_validated stubs (test_segment 惯例) with the segment,
+extract, classify and annotate pure-leaf seams monkeypatched directly.
 """
 from __future__ import annotations
 
 import asyncio
 import json
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,11 +48,14 @@ from labelkit.common.config.model import (
 )
 from labelkit.common.errors import (
     CircuitBreakerTripped,
+    ContextOverflowError,
+    OutputTruncatedError,
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
 )
-from labelkit.common.runtime.schema_engine import VERDICT_SCHEMA, defect_verdict_schema
+from labelkit.common.inference import budget as budget_mod
+from labelkit.common.inference.schema_engine import VERDICT_SCHEMA, defect_verdict_schema
 from labelkit.common.contracts.types import (
     Annotation,
     Classification,
@@ -69,9 +72,11 @@ from labelkit.common.contracts.types import (
 )
 from labelkit.operators.verify import (
     _DEFAULT_FAIL_DEFECT,
+    _EpisodeReview,
     DEFECT_KINDS,
     VerifyPromptOptions,
     VerifyStage,
+    _PromptFit,
     _VerdictEvent,
     _classify_error,
     boundary_margin_text,
@@ -87,6 +92,7 @@ from labelkit.operators.verify import (
     verify_user_text,
     verify_verdict_sequence_system_text,
 )
+from labelkit.operators.stream_verify import StreamVerifyDriver
 
 
 def _annotation(output=None, model="m", attempts=1) -> Annotation:
@@ -366,6 +372,92 @@ class _CapturingMetrics:
         self.counters[key] = self.counters.get(key, 0) + n
 
 
+class _TaskRunner:
+    """按输入序返回结果的结构化单元测试执行器。"""
+
+    def __init__(self):
+        self.groups = []
+
+    async def run_group(self, request):
+        self.groups.append(request.tasks)
+        results = [None] * len(request.tasks)
+
+        async def run_one(index, spec):
+            results[index] = await spec.operation()
+
+        async with asyncio.TaskGroup() as group:
+            for index, spec in enumerate(request.tasks):
+                group.create_task(run_one(index, spec))
+        return tuple(results)
+
+
+class _ReverseTaskRunner:
+    """让叶任务逆声明序完成，并在返回 reducer 前校验业务快照不变。"""
+
+    def __init__(self, snapshot=None):
+        self.groups = []
+        self.completion_orders = []
+        self.snapshot = snapshot
+
+    async def run_group(self, request):
+        before = self.snapshot() if self.snapshot is not None else None
+        self.groups.append(tuple(spec.task_id for spec in request.tasks))
+        results = [None] * len(request.tasks)
+        completion_order = []
+        condition = asyncio.Condition()
+        ready = 0
+        turn = len(request.tasks) - 1
+
+        async def run_one(index, spec):
+            nonlocal ready, turn
+            results[index] = await spec.operation()
+            async with condition:
+                ready += 1
+                condition.notify_all()
+                await condition.wait_for(
+                    lambda: ready == len(request.tasks) and turn == index,
+                )
+                completion_order.append(index)
+                turn -= 1
+                condition.notify_all()
+
+        async with asyncio.TaskGroup() as group:
+            for index, spec in enumerate(request.tasks):
+                group.create_task(run_one(index, spec))
+        if self.snapshot is not None:
+            assert self.snapshot() == before
+        self.completion_orders.append(completion_order)
+        return tuple(results)
+
+
+class _SerialTaskRunner:
+    """原样传播控制异常的最小 TaskExecutor。"""
+
+    def __init__(self):
+        self.groups = []
+
+    async def run_group(self, request):
+        self.groups.append(request.tasks)
+        return tuple([await spec.operation() for spec in request.tasks])
+
+
+class _RejectTaskRunner:
+    """任何任务组提交都会令测试失败。"""
+
+    async def run_group(self, request):
+        raise AssertionError("zero-call verify submitted a task group")
+
+
+def _task_context(**fields):
+    """建立带 v1.19 TaskExecutor 身份的简化 RunContext。"""
+    tasks = fields.pop("tasks", _TaskRunner())
+    return SimpleNamespace(
+        tasks=tasks,
+        task_namespace="test:batch:1:stage:verify",
+        **fields,
+    )
+
+
 def _emit(*, enabled=True, content="refs", verdict="pass", judge=None, text="hello"):
     cfg = trace_cfg(enabled=enabled, content=content)
     metrics = _CapturingMetrics()
@@ -476,28 +568,25 @@ def test_multi_judge_schema_violation_preserves_majority():
     engine = MockEngine()
     engine.complete_validated = mock_complete_validated
 
-    ctx = SimpleNamespace(
+    ctx = _task_context(
         cfg=cfg,
         schema_engine=engine,
         batch_no=1,
         metrics=_CapturingMetrics(),
     )
-
-    verdict, merged, fail_critiques = asyncio.run(
-        stage._judge_round(rec, ann, 1, ctx)
-    )
-    assert verdict == "pass", f"Expected pass (majority 2/3), got {verdict}"
+    item = PipelineItem(record=rec, annotation=ann)
+    asyncio.run(stage.run([item], ctx))
+    assert item.verification.verdict == "pass"
     # j2's exception should appear as a fail critique with aspect="judge_error"
-    judge_errors = [c for c in fail_critiques if c.get("aspect") == "judge_error"]
+    judge_errors = [c for c in item.verification.critiques
+                    if c.get("aspect") == "judge_error"]
     assert len(judge_errors) >= 1, (
-        f"Expected at least one judge_error critique, got fail_critiques={fail_critiques}"
+        f"Expected at least one judge_error critique, got {item.verification.critiques}"
     )
 
 
-def test_single_judge_schema_violation_propagates_to_classify():
-    """In single-judge mode, SchemaViolation (and other non-critical exceptions)
-    must be re-raised from _judge_round so that _verify_item's _classify_error
-    can map it to the correct ErrorKind (schema_violation, not judge_error)."""
+def test_single_judge_schema_violation_becomes_record_outcome():
+    """单评委 SchemaViolation 由 reducer 精确归类为记录级失败。"""
     cfg = ResolvedConfig(
         tool=ToolConfig(),
         console=ConsoleConfig(),
@@ -537,15 +626,16 @@ def test_single_judge_schema_violation_propagates_to_classify():
     engine = MockEngine()
     engine.complete_validated = mock_complete_validated
 
-    ctx = SimpleNamespace(
+    ctx = _task_context(
         cfg=cfg,
         schema_engine=engine,
         batch_no=1,
         metrics=_CapturingMetrics(),
     )
-
-    with pytest.raises(SchemaViolation):
-        asyncio.run(stage._judge_round(rec, ann, 1, ctx))
+    item = PipelineItem(record=rec, annotation=ann)
+    asyncio.run(stage.run([item], ctx))
+    assert item.status == "failed"
+    assert [error.kind for error in item.errors] == ["schema_violation"]
 
 
 # ── v1.7 label threading (R3/R5): class-effective [任务指令] + extra_criteria ─
@@ -651,8 +741,8 @@ def test_verdict_event_label_only_when_classify_enabled():
     assert payload2["label"] == "writing"
 
 
-def test_verify_item_threads_label_through_judges_and_repair(monkeypatch):
-    """_verify_item injects item.classification.label into both closures: every
+def test_classic_waves_thread_label_through_judges_and_repair(monkeypatch):
+    """classic driver injects item.classification.label into both waves: every
     judge prompt is class-effective, repair re-annotation gets label=..., and
     verify.verdict events carry the label."""
     cfg = _classified_cfg(policy="repair", max_repair_rounds=1)
@@ -683,11 +773,16 @@ def test_verify_item_threads_label_through_judges_and_repair(monkeypatch):
         captured["repair"] = opts.repair
         return _annotation({"intent": "修正后"})
 
-    monkeypatch.setattr("labelkit.operators.annotate.annotate_record", fake_annotate_record)
+    monkeypatch.setattr(
+        "labelkit.operators.annotate.annotate_record_leaf",
+        fake_annotate_record,
+    )
 
     metrics = _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
-    asyncio.run(stage._verify_item(item, ctx))
+    ctx = _task_context(
+        cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1,
+    )
+    asyncio.run(stage.run([item], ctx))
 
     assert item.status == "active"
     assert item.verification.verdict == "pass" and item.verification.rounds == 2
@@ -811,11 +906,19 @@ class SeqJudgeEngine:
 def _stub_judge_window(monkeypatch, relation="continues"):
     calls = []
 
-    async def fake(frames, ctx):
-        calls.append([f.id for f in frames])
-        return [relation] * len(frames)
+    async def fake(frames, ctx, *, span, digests=None):
+        from labelkit.operators.segment import _WindowVerdict
 
-    monkeypatch.setattr("labelkit.operators.segment.judge_window", fake)
+        calls.append([f.id for f in frames])
+        return _WindowVerdict(
+            span=span,
+            member_ids=tuple(frame.id for frame in frames),
+            verdicts=tuple(relation for _frame in frames),
+            model="stub",
+            reasons=(),
+        )
+
+    monkeypatch.setattr("labelkit.operators.segment._call_window", fake)
     return calls
 
 
@@ -823,14 +926,20 @@ def _stub_extract(monkeypatch):
     calls = []
 
     async def fake(prev, curr, index, ctx, label=None):
-        calls.append((prev.id, curr.id, index, label))
-        return Transition(index=index,
-                          action={"action_type": "other", "target": None,
-                                  "value": None,
-                                  "description": f"{prev.id}->{curr.id}"},
-                          model="stub", attempts=1, detail={})
+        from labelkit.operators.extract import _ExtractOutcome
 
-    monkeypatch.setattr("labelkit.operators.extract.extract_transition", fake)
+        calls.append((prev.id, curr.id, index, label))
+        transition = Transition(
+            index=index,
+            action={"action_type": "other", "target": None, "value": None,
+                    "description": f"{prev.id}->{curr.id}"},
+            model="stub",
+            attempts=1,
+            detail={},
+        )
+        return _ExtractOutcome(transition=transition, fallback=None)
+
+    monkeypatch.setattr("labelkit.operators.extract._extract_transition_outcome", fake)
     return calls
 
 
@@ -844,14 +953,16 @@ def _stub_annotate(monkeypatch, output=None):
                                      fragment_lens=opts.fragment_lens))
         return _annotation(output or {"task_label": "修正"})
 
-    monkeypatch.setattr("labelkit.operators.annotate.annotate_record", fake)
+    monkeypatch.setattr("labelkit.operators.annotate.annotate_record_leaf", fake)
     return calls
 
 
 def _run_verify(cfg, batch, engine):
     metrics = _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
-                          metrics=metrics, rng=None, batch_no=1)
+    ctx = _task_context(
+        cfg=cfg, llm=None, schema_engine=engine,
+        metrics=metrics, rng=None, batch_no=1,
+    )
     out = asyncio.run(VerifyStage(cfg).run(batch, ctx))
     assert out is batch                    # stage contract: same list object
     return metrics
@@ -1333,6 +1444,77 @@ def test_missing_tail_reclaim_full_chain(monkeypatch):
     assert "verify.boundary_flags" not in metrics.counters
 
 
+def _stub_reseam_failure(monkeypatch):
+    """让真实 stream repair 驱动在 reseam 叶稳定返回 ordinary 失败。"""
+    calls = []
+
+    async def fail(prev, curr, index, ctx, label=None):
+        calls.append((prev.id, curr.id, index, label))
+        raise ProviderRetryableError("reseam failed", "default", 5)
+
+    monkeypatch.setattr(
+        "labelkit.operators.extract._extract_transition_outcome", fail,
+    )
+    return calls
+
+
+def test_reseam_failure_rolls_back_reclaim_envelope_atomically(monkeypatch):
+    """回收已通过但 reseam 失败时，候选信封与 repair counter 一并回到尝试前。"""
+    cfg = _stream_cfg()
+    _stub_judge_window(monkeypatch, relation="continues")
+    reseam_calls = _stub_reseam_failure(monkeypatch)
+    first, second, candidate = _frame("f0"), _frame("f1"), _frame("f2")
+    noise = _env(candidate, status="dropped_noise")
+    noise.noise_attribution = ("segment", "noise")
+    original_transition = _transition(0)
+    episode = _episode([first, second], transitions=(original_transition,))
+    engine = SeqJudgeEngine({episode.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_tail")]),
+    ]})
+
+    metrics = _run_verify(
+        cfg, [_env(first), _env(second), noise, episode], engine,
+    )
+
+    assert reseam_calls == [("f1", "f2", 1, None)]
+    assert episode.status == "failed"
+    assert [member.id for member in episode.record.members] == ["f0", "f1"]
+    assert episode.transitions == (original_transition,)
+    assert noise.status == "dropped_noise"
+    assert noise.noise_attribution == ("segment", "noise")
+    assert "verify.membership_repairs" not in metrics.counters
+
+
+def test_reseam_failure_rolls_back_shrink_envelope_atomically(monkeypatch):
+    """收缩已路由但 reseam 失败时，成员信封状态与动态归因均不泄漏。"""
+    cfg = _stream_cfg()
+    reseam_calls = _stub_reseam_failure(monkeypatch)
+    first, removed, last = _frame("f0"), _frame("f1"), _frame("f2")
+    first_env, removed_env, last_env = _env(first), _env(removed), _env(last)
+    original_transitions = (_transition(0), _transition(1))
+    episode = _episode(
+        [first, removed, last], transitions=original_transitions,
+    )
+    engine = SeqJudgeEngine({episode.record.id: [
+        _seq_obj(
+            "fail",
+            defects=[_defect("off_task_members", members=["f1"])],
+        ),
+    ]})
+
+    metrics = _run_verify(
+        cfg, [first_env, removed_env, last_env, episode], engine,
+    )
+
+    assert reseam_calls == [("f0", "f2", 0, None)]
+    assert episode.status == "failed"
+    assert [member.id for member in episode.record.members] == ["f0", "f1", "f2"]
+    assert episode.transitions == original_transitions
+    assert removed_env.status == "absorbed"
+    assert not hasattr(removed_env, "noise_attribution")
+    assert "verify.membership_repairs" not in metrics.counters
+
+
 def test_reclaim_rejected_by_rejudgment_marks_boundary_flag(monkeypatch):
     cfg = _stream_cfg()
     jw_calls = _stub_judge_window(monkeypatch, relation="context_switch")
@@ -1372,11 +1554,11 @@ def _reclaim_overflow_run(monkeypatch, origin):
         def record_provider_result(self, fatal, *, hard=False):
             self.fed.append(fatal)
 
-    async def overflowing_judge(frames, ctx):
+    async def overflowing_judge(frames, ctx, *, span, digests=None):
         raise ContextOverflowError("prompt is too long", phase="reactive",
                                    profile="default", origin=origin)
 
-    monkeypatch.setattr("labelkit.operators.segment.judge_window",
+    monkeypatch.setattr("labelkit.operators.segment._call_window",
                         overflowing_judge)
     _stub_annotate(monkeypatch)
     f0, f1, f2 = _frame("f0"), _frame("f1"), _frame("f2")
@@ -1387,8 +1569,10 @@ def _reclaim_overflow_run(monkeypatch, origin):
         _seq_obj("fail", defects=[_defect("missing_tail")]),
     ]})
     metrics = FeedMetrics()
-    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
-                          metrics=metrics, rng=None, batch_no=1)
+    ctx = _task_context(
+        cfg=cfg, llm=None, schema_engine=engine,
+        metrics=metrics, rng=None, batch_no=1,
+    )
     asyncio.run(VerifyStage(cfg).run([_env(f0), _env(f1), e2, ep], ctx))
     return e2, metrics
 
@@ -1794,11 +1978,6 @@ def test_extract_disabled_shrink_keeps_transitions_none(monkeypatch):
 
 # ── v1.11 context-budget packing (spec 3.7.2/3.7.3 v1.11 rows, V25②③/V21/V27①) ─
 
-from labelkit.common.errors import ContextOverflowError, OutputTruncatedError
-from labelkit.common.runtime import budget as budget_mod
-from labelkit.operators.verify import _PromptFit
-
-
 def _budget_profile(name: str, context_window: int, *, default_image_px: int = 0,
                     max_image_px: int = 2048, supports_structured_output=False):
     from labelkit.common.config.model import LLMProfile
@@ -1858,8 +2037,8 @@ def test_build_verify_prompt_ui_tree_dynamic_cap_and_frozen_off_path():
     assert not fit.overflow and fit.truncations == 1
     tail = bundle.messages[1].parts[2].text
     tree_lines = tail.split("\n")
-    marker_lines = [l for l in tree_lines if l.startswith("…(truncated ")
-                    and l.endswith(" nodes)")]
+    marker_lines = [line for line in tree_lines if line.startswith("…(truncated ")
+                    and line.endswith(" nodes)")]
     assert marker_lines                                    # §3.3③ marker in place
     assert tree_lines[-1].startswith("[标注结果] ")         # V25③ JSON kept verbatim
     # deterministic rerun
@@ -1892,8 +2071,8 @@ def test_sequence_step_block_edges_trim_annotation_json_counted_not_trimmed():
     step_lines = steps_part.split("\n")[1:]
     assert step_lines[0].startswith("0. ")                 # first step kept
     assert step_lines[-1].startswith("11. ")               # last step kept
-    assert any(l.startswith("…(truncated ") and l.endswith(" lines)")
-               for l in step_lines)                        # §3.3⑤ in-place marker
+    assert any(line.startswith("…(truncated ") and line.endswith(" lines)")
+               for line in step_lines)                     # §3.3⑤ in-place marker
     assert parts[-1].text == '[标注结果] {"task_label": "外卖"}'   # V25③ untouched
 
 
@@ -1910,9 +2089,10 @@ def test_minimal_unit_unfittable_rejects_record_no_call():
             raise AssertionError("must not be called")
 
     metrics = _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(1)),
-                          schema_engine=Exploding(), metrics=metrics, rng=None,
-                          batch_no=1)
+    ctx = _task_context(
+        cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(1)),
+        schema_engine=Exploding(), metrics=metrics, rng=None, batch_no=1,
+    )
     asyncio.run(VerifyStage(cfg).run([item], ctx))
     assert item.status == "failed"
     assert item.errors[0].kind == "context_overflow"
@@ -1942,8 +2122,10 @@ def test_classify_error_budget_vocabulary_first_and_stage_disposition():
 
     item = PipelineItem(record=_record(), annotation=_annotation())
     metrics = FeedMetrics()
-    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=Overflowing(),
-                          metrics=metrics, rng=None, batch_no=1)
+    ctx = _task_context(
+        cfg=cfg, llm=None, schema_engine=Overflowing(),
+        metrics=metrics, rng=None, batch_no=1,
+    )
     asyncio.run(VerifyStage(cfg).run([item], ctx))
     assert item.status == "failed"
     assert item.errors[0].kind == "context_overflow"
@@ -1968,10 +2150,14 @@ def _ladder_cfg(*, annotate_cw=200_000, default_px=1024, max_px=2048,
 
 
 def _ladder_ctx(cfg, engine, metrics=None, image_cost: int = 100):
-    return SimpleNamespace(cfg=cfg, llm=SimpleNamespace(
-                               calibrator=_FixedCalibrator(image_cost)),
-                           schema_engine=engine, metrics=metrics or _CapturingMetrics(),
-                           rng=None, batch_no=1)
+    return _task_context(
+        cfg=cfg,
+        llm=SimpleNamespace(calibrator=_FixedCalibrator(image_cost)),
+        schema_engine=engine,
+        metrics=metrics or _CapturingMetrics(),
+        rng=None,
+        batch_no=1,
+    )
 
 
 def _stub_annotate_v21(monkeypatch, output=None):
@@ -1986,7 +2172,7 @@ def _stub_annotate_v21(monkeypatch, output=None):
                                      k_eff=opts.k_eff, image_px=opts.image_px))
         return _annotation(output or {"task_label": "修正"})
 
-    monkeypatch.setattr("labelkit.operators.annotate.annotate_record", fake)
+    monkeypatch.setattr("labelkit.operators.annotate.annotate_record_leaf", fake)
     return calls
 
 
@@ -2002,7 +2188,7 @@ def test_repair_ladder_math_px_rung_and_gates():
     metrics = _CapturingMetrics()
     ctx = SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(100)),
                           schema_engine=engine, metrics=metrics, batch_no=1)
-    opts = stage._repair_ladder(ep, ctx, base)
+    opts = StreamVerifyDriver(stage)._repair_ladder(ep, ctx, base)
     assert opts.k_eff == 10                        # max(2, ceil(20/2))
     assert opts.image_px == 1536                   # 1024 × 1.5, under the cap
     assert metrics.counters["budget.escalations"] == 1
@@ -2012,14 +2198,16 @@ def test_repair_ladder_math_px_rung_and_gates():
     metrics2 = _CapturingMetrics()
     ctx2 = SimpleNamespace(cfg=cfg2, llm=SimpleNamespace(calibrator=_FixedCalibrator(100)),
                            schema_engine=engine, metrics=metrics2, batch_no=1)
-    assert VerifyStage(cfg2)._repair_ladder(ep, ctx2, base).image_px == 2048
+    assert StreamVerifyDriver(VerifyStage(cfg2))._repair_ladder(
+        ep, ctx2, base,
+    ).image_px == 2048
 
     # default_image_px == 0: the working point IS max_image_px — no rung exists
     cfg3 = _ladder_cfg(default_px=0)
     metrics3 = _CapturingMetrics()
     ctx3 = SimpleNamespace(cfg=cfg3, llm=SimpleNamespace(calibrator=_FixedCalibrator(100)),
                            schema_engine=engine, metrics=metrics3, batch_no=1)
-    opts3 = VerifyStage(cfg3)._repair_ladder(ep, ctx3, base)
+    opts3 = StreamVerifyDriver(VerifyStage(cfg3))._repair_ladder(ep, ctx3, base)
     assert (opts3.k_eff, opts3.image_px) == (10, None)   # k halving stands alone
     assert "budget.escalations" not in metrics3.counters
 
@@ -2027,7 +2215,7 @@ def test_repair_ladder_math_px_rung_and_gates():
     cfg4 = replace(_ladder_cfg(),
                    llm_profiles={"default": _budget_profile("default", 0),
                                  "judge": _budget_profile("judge", 0)})
-    assert VerifyStage(cfg4)._repair_ladder(ep, ctx, base) is base
+    assert StreamVerifyDriver(VerifyStage(cfg4))._repair_ladder(ep, ctx, base) is base
 
 
 def test_repair_ladder_escalation_dropped_when_budget_refuses():
@@ -2042,7 +2230,9 @@ def test_repair_ladder_escalation_dropped_when_budget_refuses():
     ctx = SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(800)),
                           schema_engine=SimpleNamespace(user_schema_text="{}"),
                           metrics=metrics, batch_no=1)
-    opts = stage._repair_ladder(ep, ctx, AnnotatePromptOptions(repair=repair))
+    opts = StreamVerifyDriver(stage)._repair_ladder(
+        ep, ctx, AnnotatePromptOptions(repair=repair),
+    )
     assert (opts.k_eff, opts.image_px) == (10, None)
     assert "budget.escalations" not in metrics.counters
 
@@ -2128,31 +2318,76 @@ def _member_cls(label="task_request") -> Classification:
 
 
 def _stub_classify_frames(monkeypatch, label="task_request"):
-    """帧分类直调面桩：记录每次调用的成员 id 列表，全员判给定帧类
-    （classify_frames 契约上不抛记录级异常，窗口失败在内部落 fallback）。"""
+    """帧分类纯窗口桩：记录每次调用的成员 id 列表，全员判给定帧类。"""
     calls = []
 
-    async def fake(members, ctx):
-        calls.append([m.id for m in members])
-        return {m.id: Classification(label=label, labels=(label,),
-                                     source="llm", detail={})
-                for m in members}
+    async def fake(plan, span, ctx):
+        from labelkit.operators.classify import _FrameWindowOutcome
 
-    monkeypatch.setattr("labelkit.operators.classify.classify_frames", fake)
+        members = plan.members[span[0]:span[1]]
+        calls.append([member.id for member in members])
+        return _FrameWindowOutcome(
+            leaves=((span, [label for _member in members]),),
+            calls=1,
+            degrade_retries=0,
+        )
+
+    monkeypatch.setattr("labelkit.operators.classify._run_frame_plan", fake)
     return calls
 
 
 def _stub_annotate_member(monkeypatch, *, fail=False):
-    """帧标注直调面桩：记录 (member_id, label)；fail=True ⇒ 返回 None
-    （不可修复失败语义——annotate_member 契约上不抛，None 由调用方占键）。"""
+    """帧标注纯叶桩：记录 (member_id, label)；fail=True 时抛 ordinary 失败。"""
     calls = []
 
     async def fake(member, ctx, label=None):
         calls.append((member.id, label))
-        return None if fail else _annotation({"intent": "帧", "entities": []})
+        if fail:
+            raise SchemaViolation(["/intent: invalid"], "{}")
+        return _annotation({"intent": "帧", "entities": []})
 
-    monkeypatch.setattr("labelkit.operators.annotate.annotate_member", fake)
+    monkeypatch.setattr("labelkit.operators.annotate.annotate_member_leaf", fake)
     return calls
+
+
+def test_verify_backfill_duplicate_member_id_is_first_wins(monkeypatch):
+    """帧分类与帧标注补跑按成员 id first-wins，只派发首个重复成员。"""
+    cfg = _frame_stream_cfg()
+    classify_calls = _stub_classify_frames(monkeypatch)
+    annotate_calls = _stub_annotate_member(monkeypatch)
+    first = _frame("duplicate", pair_index=0)
+    duplicate = _frame("duplicate", pair_index=1)
+    episode = _episode([first, duplicate])
+    episode.member_classifications = {}
+    episode.member_annotations = {}
+    state = _EpisodeReview(episode, 0)
+    state.rounds = 1
+    metrics = _CapturingMetrics()
+    runner = _TaskRunner()
+    ctx = _task_context(
+        cfg=cfg,
+        llm=None,
+        schema_engine=None,
+        metrics=metrics,
+        rng=None,
+        batch_no=1,
+        tasks=runner,
+    )
+    driver = StreamVerifyDriver(VerifyStage(cfg))
+
+    planned, dead = driver._plan_frame_classify_jobs([state], ctx)
+    assert dead == set()
+    assert len(planned) == 1 and planned[0].member is first
+    assert asyncio.run(driver._backfill_frame_classify([state], ctx)) == set()
+    annotate_jobs = driver._frame_annotate_jobs(state, ctx)
+    assert len(annotate_jobs) == 1 and annotate_jobs[0][1] is first
+    assert asyncio.run(driver._backfill_frame_annotate([state], ctx)) == set()
+
+    assert classify_calls == [["duplicate"]]
+    assert annotate_calls == [("duplicate", "task_request")]
+    assert [len(group) for group in runner.groups] == [1, 1]
+    assert set(episode.member_classifications) == {"duplicate"}
+    assert set(episode.member_annotations) == {"duplicate"}
 
 
 def test_shrink_deletes_stale_keys_including_none_values(monkeypatch):
@@ -2407,7 +2642,7 @@ def _ladder_opts(cfg, label, metrics):
 
     repair = RepairContext(previous_output={"task_label": "旧"}, critiques_text="c")
     ctx = _ladder_ctx(cfg, SimpleNamespace(user_schema_text="{}"), metrics)
-    return VerifyStage(cfg)._repair_ladder(
+    return StreamVerifyDriver(VerifyStage(cfg))._repair_ladder(
         _episode([_frame("f0")]), ctx,
         AnnotatePromptOptions(repair=repair, label=label))
 
@@ -2577,8 +2812,10 @@ def test_classic_path_sequence_pairs_verdict_form_with_verdict_schema():
     engine = _VerdictEngine({"e" * 16: [_verdict_obj("pass")],
                              "f" * 16: [_verdict_obj("fail")]})
     metrics = _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
-                          rng=None, batch_no=1)
+    ctx = _task_context(
+        cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
+        rng=None, batch_no=1,
+    )
     asyncio.run(VerifyStage(cfg).run([passing, failing], ctx))
 
     for _, prompt, schema, _ids in engine.calls:
@@ -2611,8 +2848,10 @@ def test_classic_path_sequence_repair_policy_reannotates(monkeypatch):
                                         _verdict_obj("pass")]})
     calls = _stub_annotate(monkeypatch, output={"intent": "修正"})
     metrics = _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
-                          rng=None, batch_no=1)
+    ctx = _task_context(
+        cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
+        rng=None, batch_no=1,
+    )
     asyncio.run(VerifyStage(cfg).run([item], ctx))
 
     assert item.status == "active"
@@ -2632,8 +2871,10 @@ def test_stream_driver_path_unperturbed_by_verdict_form():
              _episode(members, eid="e" * 16)]
     engine = SeqJudgeEngine({"e" * 16: [_seq_obj("pass")]})
     metrics = _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
-                          rng=None, batch_no=1)
+    ctx = _task_context(
+        cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
+        rng=None, batch_no=1,
+    )
     asyncio.run(VerifyStage(cfg).run(batch, ctx))
 
     ((_, prompt, schema, _ids),) = [engine.calls[0]]
@@ -2698,8 +2939,10 @@ def test_verify_attempt_seam_propagates_terminal_errors_without_dataset_commit(
     metrics = AttemptMetrics()
     item = PipelineItem(record=_record(), annotation=_annotation())
     transaction = AttemptTransaction((item,), {}, ())
-    context = SimpleNamespace(cfg=cfg, llm=None, schema_engine=None, metrics=metrics,
-                              rng=None, batch_no=1)
+    context = _task_context(
+        cfg=cfg, llm=None, schema_engine=None, metrics=metrics,
+        rng=None, batch_no=1,
+    )
     request = DownstreamAttemptRequest(transaction, context)
     stage = VerifyStage(cfg)
 
@@ -2712,3 +2955,281 @@ def test_verify_attempt_seam_propagates_terminal_errors_without_dataset_commit(
         asyncio.run(stage.run_attempt(request))
     assert caught.value is error
     assert metrics.counters == {}
+
+
+# ── v1.19 verify runtime 波次、纯叶与错误拓扑 ──────────────────────────────
+
+def _business_snapshot(batch, metrics):
+    """冻结叶任务禁止修改的 verify 业务状态。"""
+    items = []
+    for item in batch:
+        classifications = (
+            None if item.member_classifications is None
+            else tuple(sorted(item.member_classifications.items()))
+        )
+        annotations = (
+            None if item.member_annotations is None
+            else tuple(sorted(item.member_annotations.items()))
+        )
+        items.append((
+            item.status,
+            item.record,
+            item.annotation,
+            item.verification,
+            tuple(item.errors),
+            item.transitions,
+            classifications,
+            annotations,
+            getattr(item, "noise_attribution", None),
+            getattr(item, "stream_repaired", None),
+        ))
+    return tuple(items), tuple(metrics.events), tuple(sorted(metrics.counters.items()))
+
+
+def _group_phase(task_ids):
+    """从不含数据内容的任务身份读取 stream 波次名。"""
+    task_id = task_ids[0]
+    for phase in (
+        "frame-classify",
+        "frame-annotate",
+        "reannotate",
+        "reseam",
+        "claim",
+        "review",
+    ):
+        if f":{phase}:" in task_id:
+            return phase
+    raise AssertionError(f"unknown verify task phase: {task_id}")
+
+
+def test_classic_reverse_completion_preserves_input_reduce_and_round_barriers(
+        monkeypatch):
+    """judge/repair 叶逆序完成仍按输入序归并，且三组保持 round 屏障。"""
+    cfg = replace(
+        trace_cfg(enabled=True),
+        verify=VerifyConfig(enabled=True, llm="default", policy="repair",
+                            max_repair_rounds=1),
+    )
+    first = PipelineItem(record=_record("a" * 16), annotation=_annotation({"v": 0}))
+    second = PipelineItem(record=_record("b" * 16), annotation=_annotation({"v": 0}))
+    batch = [first, second]
+    engine = _VerdictEngine({
+        first.record.id: [_verdict_obj("fail"), _verdict_obj("pass")],
+        second.record.id: [_verdict_obj("fail"), _verdict_obj("pass")],
+    })
+
+    async def repair(record, ctx, opts):
+        return _annotation({"v": 1})
+
+    monkeypatch.setattr("labelkit.operators.annotate.annotate_record_leaf", repair)
+    metrics = _CapturingMetrics()
+    runner = _ReverseTaskRunner(lambda: _business_snapshot(batch, metrics))
+    ctx = _task_context(
+        cfg=cfg,
+        llm=None,
+        schema_engine=engine,
+        metrics=metrics,
+        rng=None,
+        batch_no=1,
+        tasks=runner,
+    )
+
+    asyncio.run(VerifyStage(cfg).run(batch, ctx))
+
+    assert runner.completion_orders == [[1, 0], [1, 0], [1, 0]]
+    assert [":repair:" in group[0] for group in runner.groups] == [False, True, False]
+    verdict_ids = [event[3][0] for event in metrics.events
+                   if event[0] == "verify.verdict"]
+    assert verdict_ids == [first.record.id, second.record.id] * 2
+    assert [item.verification.rounds for item in batch] == [2, 2]
+    assert [item.annotation.output for item in batch] == [{"v": 1}, {"v": 1}]
+
+
+def test_stream_strict_waves_use_pure_leaves_and_fresh_frame_results(monkeypatch):
+    """完整回收修复链保持严格波次；每个 TaskGroup 返回前业务状态均未被叶修改。"""
+    cfg = _frame_stream_cfg(extract_enabled=True)
+    _stub_judge_window(monkeypatch, relation="continues")
+    _stub_extract(monkeypatch)
+    _stub_classify_frames(monkeypatch, label="task_request")
+    member_calls = _stub_annotate_member(monkeypatch)
+    _stub_annotate(monkeypatch, output={"task_label": "修正"})
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("verify called a grouped operator surface from a leaf")
+
+    monkeypatch.setattr("labelkit.operators.segment.judge_window", forbidden)
+    monkeypatch.setattr("labelkit.operators.extract.extract_transition", forbidden)
+    monkeypatch.setattr("labelkit.operators.classify.classify_frames", forbidden)
+    monkeypatch.setattr("labelkit.operators.annotate.annotate_record", forbidden)
+    monkeypatch.setattr("labelkit.operators.annotate.annotate_member", forbidden)
+
+    first, second, reclaimed = _frame("f0"), _frame("f1"), _frame("f2")
+    noise = _env(reclaimed, status="dropped_noise")
+    noise.noise_attribution = ("segment", "noise")
+    episode = _episode([first, second], transitions=(_transition(0),))
+    episode.member_classifications = {
+        first.id: _member_cls(),
+        second.id: _member_cls(),
+    }
+    episode.member_annotations = {
+        first.id: _annotation({"intent": "帧"}),
+        second.id: _annotation({"intent": "帧"}),
+    }
+    batch = [_env(first), _env(second), noise, episode]
+    engine = SeqJudgeEngine({episode.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_tail")]),
+        _seq_obj("pass"),
+    ]})
+    metrics = _CapturingMetrics()
+    runner = _ReverseTaskRunner(lambda: _business_snapshot(batch, metrics))
+    ctx = _task_context(
+        cfg=cfg,
+        llm=None,
+        schema_engine=engine,
+        metrics=metrics,
+        rng=None,
+        batch_no=1,
+        tasks=runner,
+    )
+
+    asyncio.run(VerifyStage(cfg).run(batch, ctx))
+
+    assert [_group_phase(group) for group in runner.groups] == [
+        "review",
+        "claim",
+        "reseam",
+        "frame-classify",
+        "frame-annotate",
+        "reannotate",
+        "review",
+    ]
+    assert noise.status == "absorbed"
+    assert [member.id for member in episode.record.members] == ["f0", "f1", "f2"]
+    assert episode.member_classifications["f2"].label == "task_request"
+    assert member_calls == [("f2", "task_request")]
+    assert episode.member_annotations["f2"].output == {"intent": "帧", "entities": []}
+    assert episode.verification.verdict == "pass"
+
+
+def test_ordinary_provider_fatal_isolated_without_cancelling_sibling():
+    """普通 verify 把 ProviderFatal 转成记录级失败，兄弟仍按输入序提交。"""
+    cfg = trace_cfg(enabled=True)
+    failed = PipelineItem(record=_record("a" * 16), annotation=_annotation())
+    passing = PipelineItem(record=_record("b" * 16), annotation=_annotation())
+    fatal = ProviderFatalError("fatal", "default", 401)
+    engine = _VerdictEngine({
+        failed.record.id: [fatal],
+        passing.record.id: [_verdict_obj("pass")],
+    })
+    metrics = _CapturingMetrics()
+    ctx = _task_context(
+        cfg=cfg,
+        llm=None,
+        schema_engine=engine,
+        metrics=metrics,
+        rng=None,
+        batch_no=1,
+    )
+
+    asyncio.run(VerifyStage(cfg).run([failed, passing], ctx))
+
+    assert failed.status == "failed"
+    assert failed.errors[0].kind == "provider_fatal"
+    assert passing.status == "active"
+    assert passing.verification.verdict == "pass"
+
+
+class _AttemptMetrics(_CapturingMetrics):
+    """隔离 attempt dataset counters 的 verify 测试指标汇。"""
+
+    def __init__(self):
+        super().__init__()
+        self.captured = None
+
+    @contextmanager
+    def capture_counts(self):
+        captured = {}
+        self.captured = captured
+        try:
+            yield captured
+        finally:
+            self.captured = None
+
+    def count(self, key, n=1):
+        target = self.captured if self.captured is not None else self.counters
+        target[key] = target.get(key, 0) + n
+
+
+class _RaisingEngine:
+    """每次结构化调用原样抛出指定异常。"""
+
+    def __init__(self, error):
+        self.error = error
+
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        raise self.error
+
+
+def _attempt_case(error):
+    """建立走真实 classic driver 的单 variant attempt。"""
+    from labelkit.common.contracts.generation import (
+        AttemptTransaction,
+        DownstreamAttemptRequest,
+    )
+
+    cfg = _verdict_cfg()
+    metrics = _AttemptMetrics()
+    item = PipelineItem(record=_assembled_sequence(), annotation=_annotation())
+    transaction = AttemptTransaction((item,), {}, ())
+    ctx = _task_context(
+        cfg=cfg,
+        llm=None,
+        schema_engine=_RaisingEngine(error),
+        metrics=metrics,
+        rng=None,
+        batch_no=1,
+        tasks=_SerialTaskRunner(),
+    )
+    request = DownstreamAttemptRequest(transaction, ctx)
+    return VerifyStage(cfg), request, item, metrics
+
+
+@pytest.mark.parametrize("error", [
+    ProviderFatalError("fatal", "judge", 401),
+    CircuitBreakerTripped("breaker"),
+    asyncio.CancelledError("cancelled"),
+])
+def test_sequence_attempt_fatal_and_control_errors_escape_unchanged(error):
+    """sequence ProviderFatal、熔断与取消不变形穿透且不提交 dataset counter。"""
+    stage, request, _item, metrics = _attempt_case(error)
+
+    with pytest.raises(type(error)) as caught:
+        asyncio.run(stage.run_attempt(request))
+
+    assert caught.value is error
+    assert metrics.counters == {}
+
+
+def test_sequence_attempt_retryable_error_is_recoverable_outcome():
+    """sequence ProviderRetryable 消耗当前 attempt，而不是升级 runtime fatal。"""
+    error = ProviderRetryableError("retryable", "judge", 5)
+    stage, request, item, metrics = _attempt_case(error)
+
+    result = asyncio.run(stage.run_attempt(request))
+
+    assert result.accepted is False
+    assert result.rejected_stage == "verify"
+    assert result.dataset_counters == {}
+    assert item.status == "failed"
+    assert item.errors[0].kind == "provider_retryable_exhausted"
+    assert metrics.counters == {}
+
+
+def test_zero_call_verify_submits_no_task_group():
+    """没有 eligible 记录时返回原批次，且不会提交空任务组。"""
+    batch = [PipelineItem(record=_record(), status="active", annotation=None)]
+    ctx = _task_context(tasks=_RejectTaskRunner())
+
+    result = asyncio.run(VerifyStage(None).run(batch, ctx))
+
+    assert result is batch

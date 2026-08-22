@@ -219,8 +219,11 @@ frame class、actor、logical time 与 timestamp。noise 的 owner 为空；repl
 source sequence/event ID。process replay 的 M2 ingest 会从同一 stream 文件重算并验证全部 ID 与 provenance，
 不把 main 文件当隐式旁输入。
 
-CrossViewReconciler 在写文件前验证 main 与 stream 双向一致。main 内成员按 owner 顺序保留；最终 stream 按 timestamp
-全局稳定排序，因此 crossed session 能呈现真实 A-B-A 或 B-A-B。
+CrossView 分三层保持线性工作量：每个 PreparedCandidate/PreparedNoiseCandidate 进入缓冲前做 candidate-local 校验；
+声明序 head 用 CrossViewFrontier 检查全局 ID、timestamp、source 与 phase/ordinal 并生成 delta；全部 primary、replay、
+noise 内存提交后，再由 full CrossViewReconciler 从最终 rows 独立重建一次全部事实。前两层负责把候选错误变成当前
+attempt 可重试 rejection，最终层失败是运行级内部不变式破坏。main 内成员按 owner 顺序保留；最终 stream 按
+timestamp 全局稳定排序，因此 crossed session 能呈现真实 A-B-A 或 B-A-B。
 
 ## 27.9 retained bytes 与原子提交
 
@@ -232,8 +235,16 @@ instruction-only 单序列最多 8 个事件。单个完整运行期 prompt valu
 新增消息正文集合都以 32768 UTF-8 bytes 为闭上限；恰好上限可以派发，多一 byte 在 provider 调用前拒绝。
 系统不会通过截断 ScenarioSeed、ActorView、EventDraft history、patch、payload 或 repair 原输出来“挤进窗口”。
 
-每个 attempt 在 dedup commit 前试算整个提交组。若 source 本身未超限、加入它的 replay 后超限，source、replay、
-dedup 和 dataset counters 仍全部回滚。通过后才提交最终 rows，后续不再构造未计费 replay。
+sequence 使用从当前 `next_commit` 开始的连续候选缓冲。generation、evaluation、dedup reservation、quality、annotate、
+verify、最终行装配、replay 与 candidate-local CrossView 可跨槽并发；running、prepared 和 recoverable outcome 都占用
+同一个槽位，只有 head 成功 commit 才滑入一个新 tail。head 在无 await 临界区按
+`dedup revalidate → frontier → retained prospective check → commit` 执行。若 source 本身未超限、加入它的 replay 后
+超限，source、replay、reservation 和 dataset counters 仍全部回滚；通过后才提交最终 rows，后续不再构造未计费 replay。
+
+这个语义边界不随 profile 容量从 4 调到 600 而变化。容量 4 的真实模型门证明请求可以重叠；容量 600 的合成门证明
+反序完成、reservation、候选缓冲、线性 frontier 与声明序提交在该规模仍闭合。后者不证明外部 endpoint 能处理
+600 个真实请求。高容量部署还必须满足 commit service rate 高于 prepared-candidate arrival rate，并让
+`candidate_bytes_high_water` 与进程 RSS 留在机器预算内。
 
 成功时依次原子替换 main、stream、report，最后替换 manifest。manifest 是唯一成功提交真值；它记录 run ID、delivery
 digest、三个工件的绝对路径、SHA-256 和行数。failed report 是独立诊断文件，不能否定一个摘要有效的成功 manifest。
@@ -297,12 +308,16 @@ expected violation 或模型自评。
 `d3247306770068be716aabf3c94c133a74a561b0ac87f4e0c5b8be185fdc250f`，逐评审账本在
 `docs/dev/evidence/v1.18-sequence-realism-review.jsonl`；账本不保存完整 payload 或 secret。
 
-## 27.12 已验证的非 live 证据
+## 27.12 已验证的发布证据
 
 - v1.18 变更前离线基线：2157 tests。
-- 当前离线套件：2610 passed、47 deselected。
-- 合并覆盖率：line 95.71%、branch 91.30%；1548/1548 个可执行生产函数已进入。
-- 完整真实端点 integration suite：47 passed in 438.37s，无 skip。
+- v1.18 pre-revision 离线套件：2610 passed、47 deselected。
+- v1.19 当前离线套件：2772 passed、48 deselected。
+- v1.18 合并覆盖率基线：line 95.71%、branch 91.30%；1548/1548 个可执行生产函数已进入。
+- v1.19 完整真实端点 integration suite：47 passed、1 skipped in 370.53s；skip 只因该 shell 未设置本地模型专用 key，
+  同一 checkout 的本地 Qwen3.5-4B 四槽门已独立连续通过三次。
+- 六百槽合成门：running/commit-waiting high-water 均为 600；固定 64 KiB 候选缓冲 high-water 39321600 bytes，
+  peak RSS 183468032 bytes；该工作负载 commit service rate 33761.210/s，高于候选到达率 5396.529/s。
 - 500000 record-unit planner 压测：16.889 秒，peak RSS 839221248 bytes。
 - 512 MiB retained limit 是紧凑输出字节核算，不是物理内存分配。
 

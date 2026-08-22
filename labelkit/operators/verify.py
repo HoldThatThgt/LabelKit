@@ -5,7 +5,6 @@ import asyncio
 import dataclasses
 import json
 import logging
-import math
 import re
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Mapping, Sequence
@@ -15,12 +14,12 @@ from labelkit.common.errors import (
     ContextOverflowError,
     ErrorKind,
     InternalError,
-    OutputTruncatedError,
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
 )
 from labelkit.common.contracts.generation import DownstreamAttemptRequest, DownstreamAttemptResult
+from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
 from labelkit.common.contracts.types import (
     Annotation,
     PipelineItem,
@@ -30,14 +29,14 @@ from labelkit.common.contracts.types import (
     VerificationResult,
     frame_digest,
 )
-from labelkit.common.runtime import budget
-from labelkit.common.runtime.schema_engine import _thaw_json
+from labelkit.common.inference import budget
+from labelkit.common.inference.schema_engine import _thaw_json
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import LLMProfile, ResolvedConfig
-    from labelkit.common.runtime.llm_client import PromptBundle
+    from labelkit.common.inference.llm_client import PromptBundle
     from labelkit.common.contracts.stage import RunContext
-    from labelkit.operators.annotate import AnnotatePromptOptions, RepairContext
+    from labelkit.operators.annotate import RepairContext
 
 _log = logging.getLogger("labelkit.verify")
 _ATTEMPT_MODE: ContextVar[bool] = ContextVar("verify_attempt_mode", default=False)
@@ -45,14 +44,23 @@ _ATTEMPT_CONFIG: ContextVar[object | None] = ContextVar("verify_attempt_config",
 EV_VERIFY_VERDICT = "verify.verdict"
 EV_ERROR = "error"
 
-_SYSTEM_HEAD = "你是标注质量审核员。给定任务指令、原始数据与标注结果，独立判断标注是否合格。"
-_SYSTEM_DIMS = "评审维度: ① 是否遵循任务指令 ② 与原始数据的事实一致性 ③ 字段语义是否正确填写"
+_SYSTEM_HEAD = (
+    "你是标注质量审核员。给定任务指令、原始数据与标注结果，独立判断标注是否合格。"
+)
+_SYSTEM_DIMS = (
+    "评审维度: ① 是否遵循任务指令 ② 与原始数据的事实一致性 ③ 字段语义是否正确填写"
+)
 _SYSTEM_TAIL = "先逐维度给出简短意见，再给结论。"
 
-_SEQ_SYSTEM_HEAD = ("你是标注质量审核员。给定任务指令、动作序列、边界余量与首末帧截图，独立判断该序列\n"
-                    "（episode）的标注是否合格。")
-_SEQ_SYSTEM_DIMS = ("评审维度: ① 是否遵循任务指令 ② 与动作序列及首末帧证据的事实一致性 ③ 字段语义是否正确填写\n"
-                    "④ 段边界与成员构成是否成立（对照下列缺陷类型）")
+_SEQ_SYSTEM_HEAD = (
+    "你是标注质量审核员。给定任务指令、动作序列、边界余量与首末帧截图，独立判断该序列\n"
+    "（episode）的标注是否合格。"
+)
+_SEQ_SYSTEM_DIMS = (
+    "评审维度: ① 是否遵循任务指令 ② 与动作序列及首末帧证据的事实一致性 "
+    "③ 字段语义是否正确填写\n"
+    "④ 段边界与成员构成是否成立（对照下列缺陷类型）"
+)
 _SEQ_SYSTEM_DEFECT_TYPES = (
     "缺陷类型（发现即列入 defects，可为空数组）:\n"
     "- label_mismatch: 标注的任务标签与序列证据不符\n"
@@ -76,8 +84,10 @@ _LABEL_FIRST_FRAME = "[首帧截图]"
 _LABEL_LAST_FRAME = "[末帧截图]"
 _MEMBER_DIGEST_MAX_CHARS = 400   # 序列 excerpt 档摘要上限（镜像 M4 §7.3）
 
-_VERDICT_SEQ_SYSTEM_HEAD = ("你是标注质量审核员。给定任务指令、成员帧摘要与标注结果，独立判断该序列"
-                            "（episode）的标注是否合格。")
+_VERDICT_SEQ_SYSTEM_HEAD = (
+    "你是标注质量审核员。给定任务指令、成员帧摘要与标注结果，独立判断该序列"
+    "（episode）的标注是否合格。"
+)
 _VERDICT_SEQ_SYSTEM_DIMS = ("评审维度: ① 是否遵循任务指令 ② 与成员帧摘要证据的事实一致性 "
                             "③ 字段语义是否正确填写")
 _VERDICT_SEQ_SYSTEM_STRUCTURE = (
@@ -115,7 +125,7 @@ class VerifyPromptOptions:
     """``build_verify_prompt`` 的可选装配项；缺省实例是经典单记录调用形态。"""
     label: str | None = None                            # 类标签；None = 取全局指令与准则（v1.7 R3）
     transitions: tuple[Transition, ...] | None = None   # 序列步表；None = 整段省略 [动作序列]（v1.8 S7）
-    boundary_margin: str = ""                           # [边界余量] 段正文（驱动器预渲染，持批上下文）
+    boundary_margin: str = ""              # [边界余量] 段正文（驱动器预渲染）
     fragment_structure: str = ""                        # [片段结构] 段正文；空串 = 整段省略（v1.9 T15）
     fit: "_PromptFit | None" = None                     # 面板最小预算装填状态；None = 预算关（v1.11）
     verdict_form: bool = False                          # 生成序列走 §10.16 判决形变体
@@ -157,9 +167,10 @@ class _LadderTrial:
 
 
 def _feed_reactive_terminal(exc: BaseException, metrics) -> None:
-    """A7/§7.8 熔断矩阵：只有 reactive-400（body-sniff）溢出终态喂熔断连击，且每个异常对象恰喂
-    一次（duck 标记挡住同一异常跨算子重复喂食，如 M7→M5 修复链）；precheck 与 200 形态的 finish
-    判据永不喂。``origin`` 防御性读取（默认 "http_400"）。
+    """A7/§7.8 熔断矩阵：只有 reactive-400 溢出终态喂熔断连击。
+
+    每个异常对象恰喂一次；precheck 与 200 形态的 finish 判据永不喂。
+    ``origin`` 防御性读取（默认 "http_400"）。
     @param exc 记录级终态异常
     @param metrics M12 计数器汇（record_provider_result 入口）
     """
@@ -205,7 +216,7 @@ def _fit_tree_text(rendered: str, budget_tokens: int) -> tuple[str, bool]:
     return candidate(lo), True
 
 
-# ── 纯提示词文本装配（可单测，无服务导入）────────────────────────────────────
+# ── 纯提示词文本装配（可单测，无服务导入）────────────────────────────
 
 def verify_system_text(extra_criteria: str) -> str:
     """§10.5 评审提示词的 system 段；``verify.extra_criteria`` 为空时整行省略。
@@ -260,9 +271,9 @@ def verify_verdict_sequence_system_text(extra_criteria: str) -> str:
 
 
 def _member_digest_lines(members: Sequence[Record], max_total_chars: int) -> list[str]:
-    """[成员帧摘要] 行——逐成员 ``{m}. {frame_digest(member, 400)}``（m 1 基，成员序）。总量受
-    max_total_chars 约束：首末行恒保留，中段整行丢弃并以 ``…(truncated N members)`` 收口（镜像 M5
-    渲染——算子间不互导，M7 自持副本，annotate._member_digest_lines 同式）。
+    """构造逐成员的成员帧摘要行。
+
+    总量受 max_total_chars 约束：首末行恒保留，中段整行丢弃并以截断标记收口。
     @param members 成员帧记录（成员序）
     @param max_total_chars 摘要块总字符上限（input.ui_tree_max_chars）
     @return 摘要行列表
@@ -283,11 +294,9 @@ def _member_digest_lines(members: Sequence[Record], max_total_chars: int) -> lis
 
 
 def sequence_step_line(transition: Transition) -> str:
-    """一行 [动作序列] 步行，§10.1 冻结格式
-    ``{index}. {action_type}（对象: {target|—}；值: {value|—}）{description}``（null 渲染成 "—"）。
-    评审证据不带（摘取兜底）后缀——S16 标记只属于 M4 评分段（M5 规则，此处镜像）。v1.9（T14，对
-    无后缀规则的刻意修订）：线索接缝占位步（detail.kind == "thread_seam"）确实带「（线索接缝：
-    被 X 打断）」后缀——没有它评审者会把机械占位读成无解释跳变而误报缺陷。
+    """构造一行 [动作序列] 步文本。
+
+    普通评审证据不带摘取兜底后缀；线索接缝占位步保留打断来源。
     @param transition 步记录
     @return 单行步文本
     """
@@ -305,9 +314,9 @@ def sequence_step_line(transition: Transition) -> str:
 
 
 def normalize_defects(entries: Sequence[Mapping]) -> list[dict]:
-    """S31 确定性规范化（多 judge 并集的）缺陷表：按 (kind 枚举序, position, members) 排序去重。
-    ``sorted`` 稳定，故同键条目由并集顺序（judge 配置序，再条目序）决定幸存者——与调度无关；
-    条目做浅拷贝（后续路由标注的是副本，绝不写 judge 的原始载荷）。
+    """按 kind、position 与 members 确定性排序并去重缺陷表。
+
+    同键条目由 judge 配置序与条目序决定幸存者；结果做浅拷贝。
     @param entries 多 judge 判 fail 时给出的缺陷条目并集
     @return 规范化后的缺陷表
     """
@@ -333,8 +342,7 @@ def normalize_defects(entries: Sequence[Mapping]) -> list[dict]:
 
 def _session_frame_envelopes(batch: Sequence[PipelineItem],
                              session_id: str | None) -> list[PipelineItem]:
-    """本会话的帧信封，按批位序（= 会话序，M10 整会话装批；S4：邻域查询 = session_id 过滤 +
-    批列表位置序）。
+    """按批位序取得本会话的帧信封。
     @param batch 本批信封列表
     @param session_id 会话 id
     @return 该会话的单记录信封列表
@@ -345,9 +353,9 @@ def _session_frame_envelopes(batch: Sequence[PipelineItem],
 
 def _session_episodes(batch: Sequence[PipelineItem],
                       session_id: str | None) -> list[PipelineItem]:
-    """本会话的 episode 信封，按批位序、按 record id 去重（扇出克隆共享 id 并折叠到原信封，故段
-    序号在扇出下仍稳定）。v1.9（T15，major-5）：stitched 壳被排除——壳的陈旧成员集会污染
-    「第 n 段」序号与余量去向。
+    """按批位序取得本会话的 episode 信封，并按 record id 去重。
+
+    stitched 壳被排除，避免陈旧成员集污染段序与余量去向。
     @param batch 本批信封列表
     @param session_id 会话 id
     @return 该会话的序列信封列表
@@ -379,9 +387,9 @@ def _seam_position_line(item: PipelineItem) -> str:
 
 
 def fragment_structure_text(item: PipelineItem, digest_max_chars: int) -> str:
-    """[片段结构] 段正文（v1.9 T15——§10.5 序列模板的第七段）：每碎片一行（线索内序号、成员下标区
-    间、成员数、首帧摘要），末行接缝位置表。读 M16 duck 标记；stitch 未触碰的线索（或手术前的不
-    匹配）降级为单个隐含碎片。纯代码读信封状态——零 LLM 调用、零随机。
+    """构造 [片段结构] 段正文。
+
+    每碎片一行，末行给出接缝位置；未缝合或不匹配时降级为单个隐含碎片。
     @param item 线索/episode 信封
     @param digest_max_chars 首帧摘要字符上限
     @return 多行段正文
@@ -532,7 +540,7 @@ def _build_verdict_sequence_prompt(record: Record, output: Mapping,
     @param fit v1.11 面板最小预算装填状态；None = 预算关
     @return 两条消息的提示词包
     """
-    from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
+    from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 
     instruction, extra_criteria = texts
     system_text = verify_verdict_sequence_system_text(extra_criteria)
@@ -567,7 +575,7 @@ def _fit_sequence_parts(parts: list, system_text: str, steps_at: int,
     @param n_images 图像段数量（UI 序列为 2，text 为 0）
     @param fit 面板最小预算装填状态
     """
-    from labelkit.common.runtime.llm_client import Part
+    from labelkit.common.inference.llm_client import Part
 
     fixed = (budget.est_text(system_text)
              + sum(budget.est_text(p.text or "") for i, p in enumerate(parts)
@@ -602,7 +610,7 @@ def _build_defect_sequence_prompt(record: Record, output: Mapping,
     @param options 装配项（步表 / 边界余量 / 片段结构 / 预算装填）
     @return 两条消息的提示词包
     """
-    from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
+    from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 
     instruction, extra_criteria = texts
     system_text = verify_sequence_system_text(extra_criteria)
@@ -668,7 +676,7 @@ def _build_single_record_prompt(record: Record, output: Mapping,
     @param fit 面板最小预算装填状态；None = 预算关（v1.10 逐字节路径）
     @return 两条消息的提示词包
     """
-    from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
+    from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 
     instruction, extra_criteria = texts
     system_text = verify_system_text(extra_criteria)
@@ -797,7 +805,7 @@ class _EpisodeReview:
 
     # 跨轮字段：被评审信封、类标签（首标签）、已评轮数、累计意见、本轮面板结论、本轮判
     # fail 的意见（回灌 M5）、本轮规范化缺陷表。
-    __slots__ = ("item", "label", "rounds", "critiques", "verdict", "fail_critiques",
+    __slots__ = ("item", "ordinal", "label", "rounds", "critiques", "verdict", "fail_critiques",
                  "defects",
                  # 轮内手术字段（begin_round 重置）：手术前成员元组（重建时比对相邻对）、
                  # 成员工作副本、帧 id → 会话内批位序、需重标注标志（label_mismatch）、
@@ -805,11 +813,13 @@ class _EpisodeReview:
                  "orig_members", "working_members", "session_positions",
                  "needs_reannotate", "surgical", "claims", "reseams")
 
-    def __init__(self, item: PipelineItem):
+    def __init__(self, item: PipelineItem, ordinal: int):
         """建立一个 episode 的评审台账。
         @param item 待评审的序列信封
+        @param ordinal episode 在批内的声明序位置
         """
         self.item = item
+        self.ordinal = ordinal
         self.label = item.classification.label if item.classification else None
         self.rounds = 0
         self.critiques: list[dict] = []
@@ -879,6 +889,57 @@ def _next_image_rung(prof: "LLMProfile") -> int | None:
 _BIG_THREE = (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError)
 
 
+@dataclasses.dataclass
+class _ClassicReview:
+    """classic verify 的单信封跨轮台账。"""
+
+    item: PipelineItem
+    ordinal: int
+    label: str | None
+    annotation: Annotation
+    rounds: int = 0
+    critiques: list[dict] = dataclasses.field(default_factory=list)
+    verdict: str = ""
+    fail_critiques: list[dict] = dataclasses.field(default_factory=list)
+
+
+@dataclasses.dataclass(frozen=True)
+class _ClassicJudgePlan:
+    """classic judge 波次中的一个 item 与 panel 计划。"""
+
+    state: _ClassicReview
+    prompt: "PromptBundle"
+    judges: tuple[str, ...]
+    schema: Mapping
+
+
+async def _judge_leaf(plan: _ClassicJudgePlan, judge: str,
+                      ctx: "RunContext") -> object:
+    """执行一个不写业务对象、事件或错误的 judge 叶调用。
+
+    @param plan 冻结的记录评审计划
+    @param judge 当前评委 profile
+    @param ctx 本次运行上下文
+    @return 成功四元组或普通记录级异常
+    """
+    from labelkit.common.inference.schema_engine import CallScope
+
+    record = plan.state.item.record
+    try:
+        return await ctx.schema_engine.complete_validated(
+            judge, plan.prompt, schema=plan.schema,
+            scope=CallScope(record_ids=(record.id,), batch_no=ctx.batch_no),
+        )
+    except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+        raise
+    except ProviderFatalError as exc:
+        if _ATTEMPT_MODE.get():
+            raise
+        return exc
+    except Exception as exc:  # 叶任务只回传 ordinary 记录级失败
+        return exc
+
+
 class VerifyStage:
     """M7 评审阶段：经典逐条路径 + v1.8 流式序列驱动器（spec 3.7）。"""
 
@@ -909,15 +970,15 @@ class VerifyStage:
                     if it.status == "active" and it.annotation is not None]
         if not eligible:
             return batch
-        episodes = [it for it in eligible if it.record.kind == "sequence"]
+        episodes = [item for item in eligible if item.record.kind == "sequence"]
         if episodes and self.cfg.segment.enabled:
-            singles = [it for it in eligible if it.record.kind != "sequence"]
-            if singles:
-                await asyncio.gather(*(self._verify_item(item, ctx)
-                                       for item in singles))
-            await self._run_stream_driver(batch, episodes, ctx)
+            singles = [item for item in eligible if item.record.kind != "sequence"]
+            await self._run_classic(singles, ctx)
+            from labelkit.operators.stream_verify import StreamVerifyDriver
+
+            await StreamVerifyDriver(self).run(batch, episodes, ctx)
             return batch
-        await asyncio.gather(*(self._verify_item(item, ctx) for item in eligible))
+        await self._run_classic(eligible, ctx)
         return batch
 
     async def run_attempt(
@@ -1009,85 +1070,258 @@ class VerifyStage:
                 "verify prompt exceeds the panel-min input budget at the "
                 "minimal unit (single record)", phase="precheck")
 
-    # ── 经典逐条驱动 ──────────────────────────────────────────────────────
+    # ── classic 全批波次驱动 ─────────────────────────────────────────────
 
-    async def _verify_item(self, item: PipelineItem, ctx: "RunContext") -> None:
-        """经典路径：跑评审/修复循环并落地终态（判 fail ⇒ dropped_verify）。
-        @param item 待评审信封（active 且已有标注）
-        @param ctx 运行上下文
-        @raises CircuitBreakerTripped/KeyboardInterrupt/CancelledError 原样上抛
+    async def _run_classic(self, items: list[PipelineItem],
+                           ctx: "RunContext") -> None:
+        """按 judge wave、输入序归并、repair wave 与 round 屏障推进 classic 记录。
+
+        @param items 输入序待评审信封
+        @param ctx 本次运行上下文
         """
-        vcfg = self.cfg.verify
-        label = item.classification.label if item.classification else None  # v1.7 R3
-        try:
-            verdict, rounds, critiques, annotation = await run_verify_loop(
-                item.annotation,
-                judge_round=lambda ann, rnd: self._judge_round(
-                    item.record, ann, rnd, ctx, label=label),
-                reannotate=lambda ann, fc: self._reannotate(
-                    item.record, ann, fc, ctx, label=label),
-                policy=vcfg.policy,
-                max_repair_rounds=vcfg.max_repair_rounds,
+        pending = [
+            _ClassicReview(
+                item=item,
+                ordinal=ordinal,
+                label=item.classification.label if item.classification else None,
+                annotation=item.annotation,
             )
-        except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
-            raise
-        except Exception as exc:  # 单条失败不外逃（阶段契约④）
-            if _ATTEMPT_MODE.get():
-                raise
-            kind = self._fail_item(item, exc, ctx)
-            _log.error("verify review failed for one record: kind=%s", kind)
-            return
-        item.annotation = annotation  # 修复后的标注顶替原标注（§7.6）
-        item.verification = VerificationResult(verdict=verdict, rounds=rounds,
-                                               critiques=tuple(critiques))
-        if verdict == "fail":
-            item.status = "dropped_verify"
+            for ordinal, item in enumerate(items)
+        ]
+        while pending:
+            reviewed = await self._classic_review_wave(pending, ctx)
+            repairs = self._reduce_classic_round(reviewed, ctx)
+            pending = await self._classic_repair_wave(repairs, ctx)
 
-    # ── 一轮评审（全 judge，多数表决）───────────────────────────────────
+    async def _classic_review_wave(
+            self, pending: list[_ClassicReview],
+            ctx: "RunContext") -> list[_ClassicReview]:
+        """冻结本轮全部 item 与 judge 计划并经共享执行器运行。
 
-    async def _judge_round(
-        self, record: Record, annotation: Annotation, round_no: int, ctx: "RunContext",
-        label: str | None = None,
-    ) -> tuple[str, list[dict], list[dict]]:
-        """经典路径的一轮评审：schema 恒 VERDICT_SCHEMA。遇生成序列信封走判决形模板；
-        普通 segmentation 序列由其驱动器评审，不进入本函数。
-        @param record 被评审记录
-        @param annotation 本轮送审的标注
-        @param round_no 轮次（1 基）
-        @param ctx 运行上下文
-        @param label 类标签；None = 全局取值
-        @return (面板结论, 合并意见, 判 fail 意见)
+        @param pending 本轮输入序台账
+        @param ctx 本次运行上下文
+        @return 成功完成 panel 归并的台账
         """
-        from labelkit.common.runtime.schema_engine import VERDICT_SCHEMA
+        plans = self._plan_classic_review(pending, ctx)
+        if not plans:
+            return []
+        specs = self._classic_judge_specs(plans, ctx)
+        outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
+        return self._reduce_classic_reviews(plans, outcomes, ctx)
 
-        # v1.11：min-over-panel 装填那一份广播提示词；fit=None = 预算关，逐字节构建。
-        fit = self._panel_fit(ctx, record, VERDICT_SCHEMA)
-        prompt = build_verify_prompt(
-            record, annotation.output, ctx.cfg,
-            VerifyPromptOptions(label=label, fit=fit,
-                                verdict_form=(record.kind == "sequence")))
-        self._settle_fit(fit, ctx)
-        results = await self._broadcast_to_judges(prompt, VERDICT_SCHEMA, record, ctx)
-        return self._fold_verdict_round(record, results, round_no, ctx, label)
+    def _plan_classic_review(
+            self, pending: list[_ClassicReview],
+            ctx: "RunContext") -> list[_ClassicJudgePlan]:
+        """按 item 输入序构建共享 panel 提示词与 Schema。
 
-    async def _broadcast_to_judges(self, prompt: "PromptBundle", schema: Mapping,
-                                   record: Record, ctx: "RunContext") -> list:
-        """把同一份提示词并发广播给整个面板。
-        @param prompt 本轮提示词包
-        @param schema 结构化输出 Schema
-        @param record 被评审记录（record_ids 归因）
-        @param ctx 运行上下文
-        @return 与面板同序的结果列表（异常以对象形式返回，不外逃）
+        @param pending 本轮输入序台账
+        @param ctx 本次运行上下文
+        @return 可执行的 item 评审计划
         """
-        from labelkit.common.runtime.schema_engine import CallScope
+        from labelkit.common.inference.schema_engine import VERDICT_SCHEMA
 
         judges, _multi = self._judge_panel()
-        scope = CallScope(record_ids=(record.id,), batch_no=ctx.batch_no)
-        return await asyncio.gather(
-            *(ctx.schema_engine.complete_validated(judge, prompt, schema=schema,
-                                                   scope=scope)
-              for judge in judges),
-            return_exceptions=True)
+        plans: list[_ClassicJudgePlan] = []
+        for state in pending:
+            try:
+                fit = self._panel_fit(ctx, state.item.record, VERDICT_SCHEMA)
+                prompt = build_verify_prompt(
+                    state.item.record, state.annotation.output, ctx.cfg,
+                    VerifyPromptOptions(
+                        label=state.label, fit=fit,
+                        verdict_form=state.item.record.kind == "sequence",
+                    ),
+                )
+                self._settle_fit(fit, ctx)
+            except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception as exc:
+                self._settle_classic_error(state, exc, ctx)
+                continue
+            plans.append(_ClassicJudgePlan(
+                state=state, prompt=prompt, judges=tuple(judges),
+                schema=VERDICT_SCHEMA,
+            ))
+        return plans
+
+    def _classic_judge_specs(
+            self, plans: list[_ClassicJudgePlan], ctx: "RunContext",
+            ) -> tuple[TaskSpec[object], ...]:
+        """把本轮 item 与 judge 笛卡尔积冻结为声明序任务。
+
+        @param plans 输入序 item 评审计划
+        @param ctx 本次运行上下文
+        @return 扁平 TaskSpec tuple
+        """
+        specs: list[TaskSpec[object]] = []
+        for plan in plans:
+            for judge_ordinal, judge in enumerate(plan.judges):
+                key = (ctx.batch_no, 8, plan.state.rounds, plan.state.ordinal,
+                       judge_ordinal)
+                specs.append(TaskSpec(
+                    task_id=(f"{ctx.task_namespace}:verify:judge:"
+                             f"{plan.state.rounds}:{plan.state.ordinal}:"
+                             f"{judge_ordinal}"),
+                    declaration_key=key,
+                    stage=self.name,
+                    resource_key=("llm", judge),
+                    operation=lambda plan=plan, judge=judge: _judge_leaf(
+                        plan, judge, ctx),
+                ))
+        return tuple(specs)
+
+    def _reduce_classic_reviews(
+            self, plans: list[_ClassicJudgePlan], outcomes: tuple[object, ...],
+            ctx: "RunContext") -> list[_ClassicReview]:
+        """按 item 与 judge ordinal 归并本轮 panel 结果。
+
+        @param plans 输入序 item 计划
+        @param outcomes TaskExecutor 输入序结果
+        @param ctx 本次运行上下文
+        @return 可进入轮次决策的台账
+        """
+        reviewed: list[_ClassicReview] = []
+        offset = 0
+        for plan in plans:
+            selected = list(outcomes[offset:offset + len(plan.judges)])
+            offset += len(plan.judges)
+            if _ATTEMPT_MODE.get() and any(
+                    isinstance(result, BaseException) for result in selected):
+                error = next(result for result in selected
+                             if isinstance(result, BaseException))
+                self._settle_classic_error(plan.state, error, ctx)
+                continue
+            try:
+                self._fold_classic_plan(plan, selected, ctx)
+            except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception as exc:
+                self._settle_classic_error(plan.state, exc, ctx)
+                continue
+            reviewed.append(plan.state)
+        return reviewed
+
+    def _fold_classic_plan(self, plan: _ClassicJudgePlan,
+                           selected: list[object], ctx: "RunContext") -> None:
+        """归并一个 item 的 panel 结果并更新其私有台账。
+
+        @param plan 当前 item 评审计划
+        @param selected 当前 item 的 judge 输入序结果
+        @param ctx 本次运行上下文
+        """
+        state = plan.state
+        verdict, critiques, failed = self._fold_verdict_round(state, selected, ctx)
+        state.rounds += 1
+        state.verdict = verdict
+        state.critiques.extend(critiques)
+        state.fail_critiques = failed
+
+    def _reduce_classic_round(
+            self, reviewed: list[_ClassicReview],
+            ctx: "RunContext") -> list[_ClassicReview]:
+        """冻结本轮终局与 repair 集合，任何写入只按输入序发生。
+
+        @param reviewed panel 已归并台账
+        @param ctx 本次运行上下文
+        @return 输入序 repair 台账
+        """
+        repairs: list[_ClassicReview] = []
+        vcfg = self.cfg.verify
+        for state in reviewed:
+            repairable = (
+                state.verdict == "fail"
+                and vcfg.policy == "repair"
+                and state.rounds - 1 < vcfg.max_repair_rounds
+            )
+            if repairable:
+                repairs.append(state)
+            else:
+                self._finalize_classic(state)
+        return repairs
+
+    async def _classic_repair_wave(
+            self, repairs: list[_ClassicReview],
+            ctx: "RunContext") -> list[_ClassicReview]:
+        """执行整轮 repair 叶任务并按 item 输入序提交新标注。
+
+        @param repairs 本轮输入序修复台账
+        @param ctx 本次运行上下文
+        @return 成功修复、进入下一 judge round 的台账
+        """
+        if not repairs:
+            return []
+        specs = tuple(self._classic_repair_spec(state, ctx) for state in repairs)
+        outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
+        pending: list[_ClassicReview] = []
+        for state, outcome in zip(repairs, outcomes, strict=True):
+            if isinstance(outcome, BaseException):
+                self._settle_classic_error(state, outcome, ctx)
+                continue
+            state.annotation = outcome
+            pending.append(state)
+        return pending
+
+    def _classic_repair_spec(self, state: _ClassicReview,
+                             ctx: "RunContext") -> TaskSpec[object]:
+        """冻结一条 classic repair 任务。
+
+        @param state 当前待修复台账
+        @param ctx 本次运行上下文
+        @return 纯修复叶任务
+        """
+        return TaskSpec(
+            task_id=(f"{ctx.task_namespace}:verify:repair:"
+                     f"{state.rounds}:{state.ordinal}"),
+            declaration_key=(ctx.batch_no, 8, state.rounds, state.ordinal),
+            stage=self.name,
+            resource_key=("llm", self.cfg.annotate.llm),
+            operation=lambda: self._reannotate_state(state, ctx),
+        )
+
+    async def _reannotate_state(self, state: _ClassicReview,
+                                ctx: "RunContext") -> object:
+        """执行不写共享业务对象的单调用 repair 叶。
+
+        @param state 当前待修复台账
+        @param ctx 本次运行上下文
+        @return 新 Annotation 或 ordinary 记录级异常
+        """
+        try:
+            return await self._reannotate_leaf(state, ctx)
+        except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+            raise
+        except ProviderFatalError as exc:
+            if _ATTEMPT_MODE.get():
+                raise
+            return exc
+        except Exception as exc:
+            return exc
+
+    def _settle_classic_error(self, state: _ClassicReview,
+                              exc: BaseException, ctx: "RunContext") -> None:
+        """在 reducer 按输入序提交一条 classic 记录失败。
+
+        @param state 失败台账
+        @param exc 记录级异常
+        @param ctx 本次运行上下文
+        """
+        self._fail_item(state.item, exc, ctx)
+
+    @staticmethod
+    def _finalize_classic(state: _ClassicReview) -> None:
+        """把台账终态提交到 PipelineItem。
+
+        @param state 已完成全部轮次的台账
+        """
+        item = state.item
+        item.annotation = state.annotation
+        item.verification = VerificationResult(
+            verdict=state.verdict,
+            rounds=state.rounds,
+            critiques=tuple(state.critiques),
+        )
+        if state.verdict == "fail":
+            item.status = "dropped_verify"
 
     @staticmethod
     def _judge_error_entry(exc: BaseException, judge: str, multi: bool) -> dict:
@@ -1099,6 +1333,7 @@ class VerifyStage:
         @return judge_error 意见条目
         @raises BaseException 大三样原样上抛；单 judge 面板亦原样上抛，交 _classify_error 归类
         """
+        _log.error("verify judge failed: kind=%s", type(exc).__name__)
         if isinstance(exc, _BIG_THREE):
             raise exc
         if _ATTEMPT_MODE.get():
@@ -1107,18 +1342,18 @@ class VerifyStage:
             raise exc
         return {"aspect": "judge_error", "opinion": str(exc), "judge": judge}
 
-    def _fold_verdict_round(self, record: Record, results: list, round_no: int,
-                            ctx: "RunContext",
-                            label: str | None) -> tuple[str, list[dict], list[dict]]:
+    def _fold_verdict_round(
+            self, state: _ClassicReview, results: list,
+            ctx: "RunContext") -> tuple[str, list[dict], list[dict]]:
         """折叠 VERDICT_SCHEMA 形的一轮结果（经典路径，回归锚）。
-        @param record 被评审记录
+        @param state 当前记录的跨轮台账
         @param results 与面板同序的结果列表
-        @param round_no 轮次（1 基）
         @param ctx 运行上下文
-        @param label 类标签
         @return (面板结论, 合并意见, 判 fail 意见)
         """
         judges, multi = self._judge_panel()
+        record = state.item.record
+        round_no = state.rounds + 1
         merged: list[dict] = []
         fail_critiques: list[dict] = []
         verdicts: list[str] = []
@@ -1139,7 +1374,8 @@ class VerifyStage:
             self._emit_verdict_event(
                 _VerdictEvent(record=record, verdict=verdict, round_no=round_no,
                               critiques=obj["critiques"],
-                              judge=judge if multi else None, label=label), ctx)
+                              judge=judge if multi else None,
+                              label=state.label), ctx)
         return majority_verdict(verdicts), merged, fail_critiques
 
     def _emit_verdict_event(self, event: _VerdictEvent, ctx: "RunContext") -> None:
@@ -1177,792 +1413,29 @@ class VerifyStage:
 
     # ── 回灌 M5 的修复钩子（获授权的跨算子导入，§7.4/§7.6）───────────────
 
-    async def _reannotate(
-        self, record: Record, annotation: Annotation, fail_critiques: list[dict],
-        ctx: "RunContext", label: str | None = None,
-    ) -> Annotation:
+    async def _reannotate_leaf(
+            self, state: _ClassicReview, ctx: "RunContext") -> Annotation:
         """把判 fail 的意见回灌 M5 标注器重标注一次。
-        @param record 被评审记录
-        @param annotation 上一轮标注（进 RepairContext.previous_output）
-        @param fail_critiques 判 fail 的意见
+        @param state 当前记录的跨轮台账
         @param ctx 运行上下文
-        @param label 类标签
         @return 重标注结果
         """
-        from labelkit.operators.annotate import (AnnotatePromptOptions,
-                                                 RepairContext, annotate_record)
-
-        repair = RepairContext(
-            previous_output=annotation.output,
-            critiques_text=render_critiques_text(fail_critiques),
+        from labelkit.operators.annotate import (
+            AnnotatePromptOptions,
+            RepairContext,
+            annotate_record_leaf,
         )
-        return await annotate_record(
-            record, ctx, AnnotatePromptOptions(repair=repair, label=label))
-
-    # ── v1.8 流式驱动器：序列评审 + 两阶段批级修复（S7/S8）──────────────
-    # 确定性契约（S8）：零随机；LLM 调用只发生在几处 gather 内——(a) 评审、(c) 回收复判、
-    # (d) 接缝重抽、(e2) v1.12 帧产物补跑、(f) 重标注；一切状态写入都发生在它们之间的同步
-    # 段，且按批位序进行（对标 classify 扇出先例）。
-
-    async def _run_stream_driver(self, batch: list[PipelineItem],
-                                 episodes: list[PipelineItem],
-                                 ctx: "RunContext") -> None:
-        """流式驱动器主循环：并发评审 → 同步路由手术 → 并发修复 → 下一轮复评。
-        @param batch 本批信封列表（邻域与成员信封来源）
-        @param episodes 本批待评审的序列信封（批位序）
-        @param ctx 运行上下文
-        """
-        pending = [_EpisodeReview(item) for item in episodes]   # 批位序
-        while pending:
-            reviewed = await self._review_round(pending, batch, ctx)        # (a)
-            finalize, routed = self._route_round(reviewed, batch, ctx)      # (b)
-            await self._resolve_claims(routed, ctx)                         # (c)
-            repairing: list[_EpisodeReview] = []
-            for state in routed:
-                if state.surgical or state.needs_reannotate:
-                    repairing.append(state)
-                else:
-                    finalize.append(state)   # 无可修复项——fail 结论维持
-            dead = await self._reseam_episodes(repairing, ctx)              # (d)
-            for state in repairing:                                         # (e)
-                if id(state) in dead or not state.surgical:
-                    continue
-                self._rebuild_episode(state)
-            dead |= await self._sync_frame_products(repairing, dead, ctx)   # (e2)
-            next_pending = await self._reannotate_round(                    # (f)
-                [state for state in repairing if id(state) not in dead], ctx)
-            for state in finalize:
-                self._finalize_episode(state, ctx)
-            pending = next_pending                                          # (g)
-
-    async def _review_round(self, pending: list[_EpisodeReview],
-                            batch: list[PipelineItem],
-                            ctx: "RunContext") -> list[_EpisodeReview]:
-        """(a) 并发评审全部待评 episode，并在评审时记缺陷直方图（D4：报告要呈现 judge 指认过的
-        每条缺陷含后续轮修掉的，与 membership_repairs/boundary_flags 的路由时语义一致）。
-        @param pending 本轮待评审台账
-        @param batch 本批信封列表
-        @param ctx 运行上下文
-        @return 评审成功的台账（失败者已落 failed，不再参与本轮后续阶段）
-        @raises BaseException 大三样原样上抛
-        """
-        results = await asyncio.gather(
-            *(self._review_episode(state, batch, ctx) for state in pending),
-            return_exceptions=True)
-        reviewed: list[_EpisodeReview] = []
-        for state, result in zip(pending, results):
-            if isinstance(result, BaseException):
-                if isinstance(result, _BIG_THREE):
-                    raise result
-                self._fail_item(state.item, result, ctx)
-                continue
-            verdict, merged, fail_critiques, defects = result
-            state.rounds += 1
-            state.critiques.extend(merged)
-            state.verdict = verdict
-            state.fail_critiques = fail_critiques
-            state.defects = defects
-            for defect in defects:
-                ctx.metrics.count(f"{_COUNTER_DEFECTS_PREFIX}{defect['kind']}")
-            reviewed.append(state)
-        return reviewed
-
-    def _route_round(self, reviewed: list[_EpisodeReview], batch: list[PipelineItem],
-                     ctx: "RunContext") -> tuple[list[_EpisodeReview],
-                                                 list[_EpisodeReview]]:
-        """(b) 同步缺陷路由与成员手术，严格按批位序（"先到"被定死成"位序先到"，S8）。
-        @param reviewed 评审成功的台账
-        @param batch 本批信封列表
-        @param ctx 运行上下文
-        @return (进入终审的台账, 已路由待修复的台账)
-        """
-        vcfg = self.cfg.verify
-        finalize: list[_EpisodeReview] = []
-        routed: list[_EpisodeReview] = []
-        claimed: set[int] = set()      # 本轮已预定的噪声信封 id()
-        for state in reviewed:
-            state.begin_round()
-            if state.verdict == "pass":
-                finalize.append(state)
-                continue
-            repairs_done = state.rounds - 1
-            if vcfg.policy != "repair" or repairs_done >= vcfg.max_repair_rounds:
-                finalize.append(state)   # 预算/策略：fail 结论维持（现行语义）
-                continue
-            self._route_defects(state, batch, claimed, ctx)
-            routed.append(state)
-        return finalize, routed
-
-    async def _resolve_claims(self, routed: list[_EpisodeReview],
-                              ctx: "RunContext") -> None:
-        """(c) 经 segment.judge_window 并发复判回收候选，并按预定序同步落地。复判失败降级为仅
-        标记（记录级隔离）；这一吞是该异常的终态——回收窗口没有降级面（V24），故 reactive-400
-        溢出的 A7「恰好一次」熔断喂食在此结清（duck 标记幂等；precheck 与 finish 判据永不喂）。
-        @param routed 已路由待修复的台账
-        @param ctx 运行上下文
-        @raises BaseException 大三样原样上抛
-        """
-        claims = [(state, claim) for state in routed for claim in state.claims]
-        if not claims:
-            return
-        outcomes = await asyncio.gather(
-            *(self._rejudge_claim(claim, ctx) for _, claim in claims),
-            return_exceptions=True)
-        for (state, claim), outcome in zip(claims, outcomes):
-            if isinstance(outcome, BaseException):
-                if isinstance(outcome, _BIG_THREE):
-                    raise outcome
-                _feed_reactive_terminal(outcome, ctx.metrics)
-                ctx.metrics.count(_COUNTER_BOUNDARY_FLAGS)
-                continue
-            if outcome in _RECLAIM_RELATIONS:
-                self._apply_reclaim(state, claim, ctx)
-            else:
-                ctx.metrics.count(_COUNTER_BOUNDARY_FLAGS)
-
-    async def _reannotate_round(self, jobs: list[_EpisodeReview],
-                                ctx: "RunContext") -> list[_EpisodeReview]:
-        """(f) 并发重标注手术过/判 label_mismatch 的 episode。
-        @param jobs 待重标注的台账
-        @param ctx 运行上下文
-        @return 进入下一轮复评的台账
-        @raises BaseException 大三样原样上抛
-        """
-        next_pending: list[_EpisodeReview] = []
-        if not jobs:
-            return next_pending
-        outcomes = await asyncio.gather(
-            *(self._reannotate_episode(state, ctx) for state in jobs),
-            return_exceptions=True)
-        for state, outcome in zip(jobs, outcomes):
-            if isinstance(outcome, BaseException):
-                if isinstance(outcome, _BIG_THREE):
-                    raise outcome
-                self._fail_item(state.item, outcome, ctx)
-                continue
-            state.item.annotation = outcome
-            next_pending.append(state)
-        return next_pending
-
-    async def _review_episode(self, state: _EpisodeReview,
-                              batch: list[PipelineItem], ctx: "RunContext"):
-        """单 episode 的一轮评审：先渲染批上下文证据段，再送判。
-        @param state episode 台账
-        @param batch 本批信封列表（边界余量取邻域）
-        @param ctx 运行上下文
-        @return (面板结论, 合并意见, 判 fail 意见, 规范化缺陷表)
-        """
-        margin = boundary_margin_text(state.item, batch,
-                                      self.cfg.segment.digest_max_chars)
-        structure = (fragment_structure_text(state.item,
-                                             self.cfg.stitch.digest_max_chars)
-                     if self.cfg.stitch.enabled else "")   # v1.9（T15/m-11）
-        return await self._judge_round_sequence(state, ctx, margin, structure)
-
-    async def _judge_round_sequence(
-        self, state: _EpisodeReview, ctx: "RunContext", boundary_margin: str,
-        fragment_structure: str,
-    ) -> tuple[str, list[dict], list[dict], list[dict]]:
-        """序列的一轮评审：_judge_round 骨架换成 defect_verdict_schema()；v1.11 同款
-        min-over-panel 装填——序列变体里 [动作序列] 块是可裁槽位。
-        @param state episode 台账（取信封、标注、轮次与类标签）
-        @param ctx 运行上下文
-        @param boundary_margin [边界余量] 段正文
-        @param fragment_structure [片段结构] 段正文；空串 = 整段省略
-        @return (面板结论, 合并意见, 判 fail 意见, 规范化缺陷表)
-        """
-        from labelkit.common.runtime.schema_engine import defect_verdict_schema
-
-        item = state.item
-        record = item.record
-        schema = defect_verdict_schema()
-        fit = self._panel_fit(ctx, record, schema)
-        prompt = build_verify_prompt(
-            record, item.annotation.output, ctx.cfg,
-            VerifyPromptOptions(label=state.label, transitions=item.transitions,
-                                boundary_margin=boundary_margin,
-                                fragment_structure=fragment_structure, fit=fit))
-        self._settle_fit(fit, ctx)
-        results = await self._broadcast_to_judges(prompt, schema, record, ctx)
-        return self._fold_defect_round(state, results, ctx)
-
-    def _fold_defect_round(self, state: _EpisodeReview, results: list,
-                           ctx: "RunContext") -> tuple[str, list[dict],
-                                                       list[dict], list[dict]]:
-        """折叠缺陷词表形的一轮结果：意见照旧收集，缺陷取判 fail 者的并集并按 S31 确定性规范化；
-        终局判 fail 而缺陷表为空时补一条默认 label_mismatch（S7）。
-        @param state episode 台账
-        @param results 与面板同序的结果列表
-        @param ctx 运行上下文
-        @return (面板结论, 合并意见, 判 fail 意见, 规范化缺陷表)
-        """
-        judges, multi = self._judge_panel()
-        record = state.item.record
-        round_no = state.rounds + 1
-        merged: list[dict] = []
-        fail_critiques: list[dict] = []
-        verdicts: list[str] = []
-        defects_union: list[Mapping] = []
-        for judge, result in zip(judges, results):
-            if isinstance(result, BaseException):
-                entry = self._judge_error_entry(result, judge, multi)
-                verdicts.append("fail")
-                merged.append(entry)
-                fail_critiques.append(entry)
-                continue
-            obj, _usage, _attempts, _model = result
-            verdict = obj["verdict"]
-            verdicts.append(verdict)
-            entries = _critique_entries(obj["critiques"], judge if multi else None)
-            merged.extend(entries)
-            if verdict == "fail":
-                fail_critiques.extend(entries)
-                defects_union.extend(obj["defects"])
-            self._emit_verdict_event(
-                _VerdictEvent(record=record, verdict=verdict, round_no=round_no,
-                              critiques=obj["critiques"],
-                              judge=judge if multi else None, label=state.label,
-                              defects=obj["defects"]), ctx)
-        final = majority_verdict(verdicts)
-        defects = normalize_defects(defects_union)
-        if final == "fail" and not defects:
-            defects = [dict(_DEFAULT_FAIL_DEFECT)]
-        return final, merged, fail_critiques, defects
-
-    # ── (b) 缺陷路由（同步；收缩就地执行，回收只作为预定留给 (c) 的 gather）──
-
-    def _route_defects(self, state: _EpisodeReview, batch: list[PipelineItem],
-                       claimed: set[int], ctx: "RunContext") -> None:
-        """建立本 episode 的路由作用域，并逐条路由缺陷表。
-        @param state episode 台账
-        @param batch 本批信封列表
-        @param claimed 本轮已预定的噪声信封 id()（跨 episode 共享，位序优先）
-        @param ctx 运行上下文
-        """
-        item = state.item
-        frames = _session_frame_envelopes(batch, item.session_id)
-        positions: dict[str, int] = {}
-        for i, frame in enumerate(frames):
-            positions.setdefault(frame.record.id, i)
-        state.session_positions = positions
-        # S8：多标签扇出的克隆兄弟（classification.label 不是命中集首项）永不执行成员手术
-        # ——共享的成员帧属于原信封。
-        classification = item.classification
-        scope = _RoutingScope(
-            frames=frames, claimed=claimed,
-            clone=bool(classification is not None and classification.labels
-                       and classification.label != classification.labels[0]),
-            split=bool(getattr(item, "session_split", False)))
-        for idx in range(len(state.defects)):
-            self._route_one_defect(state, idx, scope, ctx)
-
-    def _route_one_defect(self, state: _EpisodeReview, idx: int,
-                          scope: _RoutingScope, ctx: "RunContext") -> None:
-        """单条缺陷的路由：重标注 / 仅标记 / 收缩 / 三级回收判定。
-        @param state episode 台账
-        @param idx 缺陷在 state.defects 中的下标（就地写回 suspected 标记）
-        @param scope 批级路由作用域
-        @param ctx 运行上下文
-        """
-        defect = state.defects[idx]
-        kind = defect["kind"]
-        if kind == "label_mismatch":
-            state.needs_reannotate = True
-            return
-        if kind == "wrong_stitch":
-            # v1.9（T15）：独立的仅标记 + fail 分支——不存在拆缝手术（§4 非目标 4），缺陷留在表
-            # 里、不触发任何修复动作、fail 结论维持；它不在 _MISSING_KINDS 里，绝不进回收扫描。
-            return
-        if scope.clone:
-            # 仅标记降级；missing_* 计作边界判定，off_task 收缩降级不计数（只统计边界类缺陷）。
-            if kind in _MISSING_KINDS:
-                ctx.metrics.count(_COUNTER_BOUNDARY_FLAGS)
-            return
-        if kind == "off_task_members":
-            self._shrink_off_task(state, defect, scope, ctx)
-            return
-        # missing_head / missing_tail / missing_members——三级回收判定（噪声池 → 邻段 → 无处可寻）。
-        if scope.split:
-            # 会话在 batch_size 处被硬切（S21）：缺失帧可能落在别的批——回收降级为仅标记。
-            state.defects[idx] = {**defect, "suspected": "session_split"}
-            ctx.metrics.count(_COUNTER_BOUNDARY_FLAGS)
-            return
-        found = self._find_reclaim_candidate(kind, defect, state, scope)
-        if isinstance(found, _ReclaimClaim):
-            scope.claimed.add(id(found.envelope))
-            state.claims.append(found)
-        elif found == "neighbor":
-            # 相邻帧已被别的 episode 吸收：仅标记，绝不跨段抢帧（S8）。
-            ctx.metrics.count(_COUNTER_BOUNDARY_FLAGS)
-        else:
-            state.defects[idx] = {**defect, "suspected": "capture_gap"}
-            ctx.metrics.count(_COUNTER_BOUNDARY_FLAGS)
-
-    def _shrink_off_task(self, state: _EpisodeReview, defect: Mapping,
-                         scope: _RoutingScope, ctx: "RunContext") -> None:
-        """off_task_members 收缩：把被指认的成员帧移出段并翻成 dropped_noise（②b M7 豁免）；无可
-        指认对象、或 judge 点名了每个成员（空 episode 不可存在，改由 fail 结论整段丢弃）时不动手。
-        @param state episode 台账
-        @param defect 缺陷条目
-        @param scope 批级路由作用域
-        @param ctx 运行上下文
-        """
-        named = set(defect.get("members") or ())
-        shrink_ids = {m.id for m in state.working_members if m.id in named}
-        if not shrink_ids or len(shrink_ids) == len(state.working_members):
-            return
-        state.working_members = [m for m in state.working_members
-                                 if m.id not in shrink_ids]
-        for frame in scope.frames:
-            if frame.status == "absorbed" and frame.record.id in shrink_ids:
-                frame.status = "dropped_noise"
-                frame.noise_attribution = ("verify", "off_task_member")  # type: ignore[attr-defined]
-        state.surgical = True
-        ctx.metrics.count(_COUNTER_MEMBERSHIP_REPAIRS)
-
-    def _find_reclaim_candidate(self, kind: str, defect: Mapping,
-                                state: _EpisodeReview,
-                                scope: _RoutingScope) -> "_ReclaimClaim | str | None":
-        """在缺陷邻域内确定性地找回收候选（批位序）：head = 段首成员之前一帧，tail = 段尾成员之后
-        一帧（连续性——跨过非成员帧回收会打洞），members = 段内首个内部噪声帧（judge 点名时限定
-        在 defect.members 内）。
-        @param kind 缺陷种类（missing_head / missing_tail / missing_members）
-        @param defect 缺陷条目
-        @param state episode 台账
-        @param scope 批级路由作用域
-        @return 回收预定 / "neighbor"（帧被别的 episode 持有）/ None（无候选）
-        """
-        positions = state.session_positions
-        member_positions = sorted(positions[m.id] for m in state.working_members
-                                  if m.id in positions)
-        if not member_positions:
-            return None
-        head, tail = member_positions[0], member_positions[-1]
-        if kind == "missing_head":
-            return self._edge_claim(state, scope, head - 1)
-        if kind == "missing_tail":
-            return self._edge_claim(state, scope, tail + 1)
-        return self._interior_claim(state, scope, defect, (head, tail))
-
-    def _edge_claim(self, state: _EpisodeReview, scope: _RoutingScope,
-                    position: int) -> "_ReclaimClaim | str | None":
-        """段首/段尾外的单帧回收判定。
-        @param state episode 台账
-        @param scope 批级路由作用域
-        @param position 候选帧的会话内批位序
-        @return 回收预定 / "neighbor" / None
-        """
-        frames = scope.frames
-        if not 0 <= position < len(frames):
-            return None
-        frame = frames[position]
-        if _qualifies_for_reclaim(frame, scope.claimed):
-            return self._make_claim(state, frame, position)
-        if frame.status == "absorbed" or id(frame) in scope.claimed:
-            # 被别的 episode 持有——要么已被吸收，要么在本同步段里被更早的 episode 预定
-            # （位序优先，S8）：属二级"neighbor"，不是采集空洞（D5）。
-            return "neighbor"
-        return None
-
-    def _interior_claim(self, state: _EpisodeReview, scope: _RoutingScope,
-                        defect: Mapping,
-                        span: tuple[int, int]) -> "_ReclaimClaim | str | None":
-        """段内部（首末成员之间）的缺失成员回收判定。
-        @param state episode 台账
-        @param scope 批级路由作用域
-        @param defect 缺陷条目（members 点名时作为筛选）
-        @param span (段首成员位序, 段尾成员位序)
-        @return 回收预定 / "neighbor"（本轮被更早 episode 预定）/ None
-        """
-        head, tail = span
-        named = set(defect.get("members") or ())
-        contended = False
-        for pos in range(head + 1, tail):
-            frame = scope.frames[pos]
-            if not _qualifies_for_reclaim(frame, scope.claimed):
-                if id(frame) in scope.claimed:
-                    contended = True       # 本轮被更早的 episode 预定走了
-                continue
-            if named and frame.record.id not in named:
-                continue
-            return self._make_claim(state, frame, pos)
-        return "neighbor" if contended else None
-
-    @staticmethod
-    def _make_claim(state: _EpisodeReview, frame: PipelineItem,
-                    position: int) -> _ReclaimClaim:
-        """按候选帧的会话位置取 [前成员, 候选, 后成员] 复判窗口（边缘候选无前/后成员）。
-        @param state episode 台账
-        @param frame 候选噪声帧信封
-        @param position 候选帧的会话内批位序
-        @return 回收预定
-        """
-        positions = state.session_positions
-        prev_member = next_member = None
-        for member in state.working_members:
-            member_pos = positions.get(member.id)
-            if member_pos is None:
-                continue
-            if member_pos < position:
-                prev_member = member                 # 位序在下方的最后一个胜出
-            elif member_pos > position and next_member is None:
-                next_member = member
-        window: list[Record] = []
-        if prev_member is not None:
-            window.append(prev_member)
-        candidate_index = len(window)
-        window.append(frame.record)
-        if next_member is not None:
-            window.append(next_member)
-        return _ReclaimClaim(frame, position, window, candidate_index)
-
-    async def _rejudge_claim(self, claim: _ReclaimClaim, ctx: "RunContext") -> str:
-        """直调 M14 的公开复判面（CONTRACTS §7.14 获授权的导入例外）。
-        @param claim 回收预定
-        @param ctx 运行上下文
-        @return 候选帧的关系判定值
-        """
-        from labelkit.operators.segment import judge_window
-
-        relations = await judge_window(claim.window, ctx)
-        return relations[claim.candidate_index]
-
-    def _apply_reclaim(self, state: _EpisodeReview, claim: _ReclaimClaim,
-                       ctx: "RunContext") -> None:
-        """回收通过：噪声信封翻回 absorbed（②b M7 豁免——绝不翻回 active），记录按批位序插回。
-        @param state episode 台账
-        @param claim 回收预定
-        @param ctx 运行上下文
-        """
-        claim.envelope.status = "absorbed"
-        positions = state.session_positions
-        insert_at = 0
-        for i, member in enumerate(state.working_members):
-            if positions.get(member.id, -1) < claim.position:
-                insert_at = i + 1
-        state.working_members.insert(insert_at, claim.envelope.record)
-        state.surgical = True
-        ctx.metrics.count(_COUNTER_MEMBERSHIP_REPAIRS)
-
-    # ── (d)/(e) 接缝重抽 + 重建 ───────────────────────────────────────────
-
-    def _affected_pairs(self,
-                        state: _EpisodeReview) -> list[tuple[int, Record, Record]]:
-        """手术前成员表里不存在的重建相邻对——需重抽接缝的触点（每次手术 1–2 处）。
-        @param state episode 台账
-        @return [(重建后的步序号, 左成员, 右成员)]
-        """
-        old_adjacent = {(a.id, b.id)
-                        for a, b in zip(state.orig_members, state.orig_members[1:])}
-        return [(j, a, b)
-                for j, (a, b) in enumerate(zip(state.working_members,
-                                               state.working_members[1:]))
-                if (a.id, b.id) not in old_adjacent]
-
-    async def _reseam_episodes(self, repairing: list[_EpisodeReview],
-                               ctx: "RunContext") -> set[int]:
-        """经 M15 公开直调面并发重抽接缝（CONTRACTS §7.15；仅 extract.enabled）。
-        @param repairing 本轮待修复的台账
-        @param ctx 运行上下文
-        @return 因重抽出错而阵亡的台账 id() 集合（记录级隔离）
-        @raises BaseException 大三样原样上抛
-        """
-        jobs: list[tuple[_EpisodeReview, int, Record, Record]] = []
-        for state in repairing:
-            if not state.surgical:
-                continue
-            if not (self.cfg.extract.enabled and state.item.transitions is not None):
-                continue
-            for j, a, b in self._affected_pairs(state):
-                jobs.append((state, j, a, b))
-        dead: set[int] = set()
-        if not jobs:
-            return dead
-        from labelkit.operators.extract import extract_transition
-
-        outcomes = await asyncio.gather(
-            *(extract_transition(a, b, j, ctx, label=state.label)
-              for state, j, a, b in jobs),
-            return_exceptions=True)
-        for (state, j, _a, _b), outcome in zip(jobs, outcomes):
-            if isinstance(outcome, BaseException):
-                if isinstance(outcome, _BIG_THREE):
-                    raise outcome
-                if id(state) not in dead:
-                    dead.add(id(state))
-                    self._fail_item(state.item, outcome, ctx)
-                continue
-            state.reseams[j] = outcome
-        return dead
-
-    def _rebuild_episode(self, state: _EpisodeReview) -> None:
-        """全部收缩/回收完成后的同步重建：新成员元组 + 全量重编号的步表。序列 id 永不重算（spec
-        3.14.4）；未触碰的步保留原 Transition 只改写 index，手术触点换成新抽取结果并把
-        {"reseamed": True} 并入 detail。不变式：len(transitions) == len(members) − 1。
-        @param state episode 台账
-        """
-        item = state.item
-        new_members = tuple(state.working_members)
-        item.record = dataclasses.replace(item.record, members=new_members)
-        if item.transitions is not None:
-            old_by_pair = {
-                (a.id, b.id): t
-                for (a, b), t in zip(zip(state.orig_members, state.orig_members[1:]),
-                                     item.transitions)
-            }
-            rebuilt: list[Transition] = []
-            for j, (a, b) in enumerate(zip(new_members, new_members[1:])):
-                if j in state.reseams:
-                    fresh = state.reseams[j]
-                    rebuilt.append(dataclasses.replace(
-                        fresh, index=j,
-                        detail={**dict(fresh.detail), "reseamed": True}))
-                else:
-                    rebuilt.append(dataclasses.replace(old_by_pair[(a.id, b.id)],
-                                                       index=j))
-            item.transitions = tuple(rebuilt)
-        item.stream_repaired = True  # type: ignore[attr-defined]  # → _meta.stream.repaired
-
-    # ── (e2) v1.12 帧产物同步（SPEC-frame-annotation §3.4 手术同步）──────────
-
-    async def _sync_frame_products(self, repairing: list[_EpisodeReview],
-                                   dead: set[int], ctx: "RunContext") -> set[int]:
-        """帧产物同步：先收缩删键（同步、批位序），再回收补跑（帧分类先行、帧标注后随）。克隆信封被
-        既有 S8 判据挡在手术之外（_route_defects 对克隆永不置 surgical），故帧产物同步天然只发生在
-        首标签信封上，无克隆分支——克隆按引用共享同一 dict，随之生效。
-        @param repairing 本轮待修复的台账
-        @param dead 先前阶段已阵亡的台账 id()
-        @param ctx 运行上下文
-        @return 本阶段新阵亡的台账 id() 集合
-        """
-        synced = [state for state in repairing
-                  if id(state) not in dead and state.surgical]
-        for state in synced:
-            self._shrink_frame_products(state.item)
-        newly_dead = await self._backfill_frame_classify(synced, ctx)
-        newly_dead |= await self._backfill_frame_annotate(
-            [state for state in synced if id(state) not in newly_dead], ctx)
-        return newly_dead
-
-    @staticmethod
-    def _shrink_frame_products(item: PipelineItem) -> None:
-        """收缩同步：成员手术后不再属于 record.members 的成员 id 从两个帧产物 dict 中删键（含值为
-        None 的 failed 占位键，不留无主条目）。仅当对应 dict 非 None 时操作（dict None = 帧 pass
-        未运行：降格会话/帧粒度关闭/非首标签，语义必须保持）；dict 对象本身从不更换——扇出克隆
-        按引用共享同一 dict 的前提。
-        @param item 手术后的序列信封
-        """
-        kept = {member.id for member in item.record.members}
-        for products in (item.member_classifications, item.member_annotations):
-            if products is None:
-                continue
-            for member_id in [k for k in products if k not in kept]:
-                del products[member_id]
-
-    async def _backfill_frame_classify(self, states: list[_EpisodeReview],
-                                       ctx: "RunContext") -> set[int]:
-        """回收补跑·帧分类：新入 record.members 且缺键的成员经 classify_frames 单元素补分类，只补缺
-        位（幂等），门 = frame_classify.enabled ∧ dict 非 None。窗口失败在 classify_frames 内落
-        fallback_class（§3.2 语义，契约上不抛记录级异常）；gather + dead 集合形态镜像
-        _reseam_episodes（记录级隔离，兜底大三样之外的意外逃逸）。
-        @param states 已完成收缩删键的台账
-        @param ctx 运行上下文
-        @return 本步新阵亡的台账 id() 集合
-        @raises BaseException 大三样原样上抛
-        """
-        jobs: list[tuple[_EpisodeReview, Record]] = []
-        if self.cfg.frame_classify.enabled:
-            for state in states:
-                classifications = state.item.member_classifications
-                if classifications is None:
-                    continue
-                jobs.extend((state, member)
-                            for member in state.item.record.members
-                            if member.id not in classifications)
-        dead: set[int] = set()
-        if not jobs:
-            return dead
-        # 懒加载 M13 公开直调面（CONTRACTS §1.1 算子间导入白名单第四向）。
-        from labelkit.operators.classify import classify_frames
-
-        outcomes = await asyncio.gather(
-            *(classify_frames([member], ctx) for _, member in jobs),
-            return_exceptions=True)
-        for (state, member), outcome in zip(jobs, outcomes):
-            if isinstance(outcome, BaseException):
-                if isinstance(outcome, _BIG_THREE):
-                    raise outcome
-                if id(state) not in dead:
-                    dead.add(id(state))
-                    self._fail_item(state.item, outcome, ctx)
-                continue
-            state.item.member_classifications[member.id] = outcome[member.id]
-        return dead
-
-    async def _backfill_frame_annotate(self, states: list[_EpisodeReview],
-                                       ctx: "RunContext") -> set[int]:
-        """回收补跑·帧标注：member_annotations 缺键的成员按帧类走 annotate_member。门 =
-        frame_annotate.enabled ∧ dict 非 None，只补缺位（幂等）；必须在帧分类补跑落键之后运行
-        （帧类取新鲜判决）。annotate_member 不可修复返回 None ⇒ 占键 None（failed 语义）；
-        gather + dead 集合形态镜像 _reseam_episodes（annotate_member 契约上不抛，兜底同上）。
-        @param states 已完成帧分类补跑的台账
-        @param ctx 运行上下文
-        @return 本步新阵亡的台账 id() 集合
-        @raises BaseException 大三样原样上抛
-        """
-        jobs: list[tuple[_EpisodeReview, Record, str | None]] = []
-        if self.cfg.frame_annotate.enabled:
-            for state in states:
-                jobs.extend(self._frame_annotate_jobs(state, ctx))
-        dead: set[int] = set()
-        if not jobs:
-            return dead
-        # 懒加载 M5 修复面族成员（CONTRACTS §1.1 算子间导入白名单第四向）。
-        from labelkit.operators.annotate import annotate_member
-
-        outcomes = await asyncio.gather(
-            *(annotate_member(member, ctx, label=label)
-              for _, member, label in jobs),
-            return_exceptions=True)
-        for (state, member, _label), outcome in zip(jobs, outcomes):
-            if isinstance(outcome, BaseException):
-                if isinstance(outcome, _BIG_THREE):
-                    raise outcome
-                if id(state) not in dead:
-                    dead.add(id(state))
-                    self._fail_item(state.item, outcome, ctx)
-                continue
-            state.item.member_annotations[member.id] = outcome
-        return dead
-
-    def _frame_annotate_jobs(
-        self, state: _EpisodeReview, ctx: "RunContext",
-    ) -> list[tuple[_EpisodeReview, Record, str | None]]:
-        """单 episode 的帧标注补跑工单：缺键成员 × 帧类视图门。label 与视图判定镜像 M5 帧 pass 的成
-        员槽位规则（annotate._frame_member），含跳过类的 frame_annotate.skipped 计数（与 M5 供数点
-        同口径，report 与 members[] 状态直方图可对账）；视图 enabled=false ⇒ 跳过类不占键（emitter
-        按缺键推导 skipped），frame.classify 关 ⇒ label=None 走全局指令。
-        @param state episode 台账
-        @param ctx 运行上下文（跳过计数）
-        @return [(台账, 成员记录, 帧类标签)]
-        """
-        item = state.item
-        if item.member_annotations is None:
-            return []
-        jobs: list[tuple[_EpisodeReview, Record, str | None]] = []
-        for member in item.record.members:
-            if member.id in item.member_annotations:
-                continue
-            cls = (item.member_classifications or {}).get(member.id)
-            label = cls.label if cls is not None else None
-            view = (self.cfg.frame_class_views.get(label)
-                    if label is not None else None)
-            if view is not None and not view.enabled:
-                ctx.metrics.count("frame_annotate.skipped")
-                continue                     # 跳过类不占键（skipped 语义）
-            jobs.append((state, member, label))
-        return jobs
-
-    # ── (f) 重标注 + 终审 ─────────────────────────────────────────────────
-
-    def _rung_fits(self, trial: _LadderTrial, prof: "LLMProfile",
-                   ctx: "RunContext") -> bool:
-        """升档试装：按 (k 减半, 升档像素) 建一次提示词并估算，看是否仍在输入预算内。单图成本取
-        max(标定读数, 供应商先验 @ 升档像素 × PRIOR_INFLATION)。试装的 Schema 文本与计价
-        对象都取类有效 Schema——否则试装估算与真实重标注调用不同源。
-        @param trial 试装参数
-        @param prof annotate profile（预算与像素上限来源）
-        @param ctx 运行上下文（标定器与按类 Schema 查询）
-        @return True = 升档站得住；False = 只保留 k 减半
-        """
-        from labelkit.operators.annotate import (AnnotatePromptOptions,
-                                                 build_annotate_prompt,
-                                                 class_effective_schema,
-                                                 class_schema_text)
-
-        item = trial.item
-        prompt = build_annotate_prompt(
-            item.record, ctx.cfg, class_schema_text(ctx, trial.label),
-            AnnotatePromptOptions(
-                repair=trial.repair, label=trial.label,
-                transitions=item.transitions, fragment_lens=trial.fragment_lens,
-                k_eff=trial.k_eff, image_px=trial.image_px))
-        cost_up = max(ctx.llm.calibrator.cost(prof.name),
-                      math.ceil(budget.est_image_prior(prof, trial.image_px)
-                                * budget.PRIOR_INFLATION))
-        schema_eff = (dict(class_effective_schema(ctx.cfg, trial.label))
-                      if prof.supports_structured_output else None)
-        est = budget.est_prompt(prompt, prof, schema_eff, image_cost=cost_up)
-        return est <= budget.input_budget(prof)
-
-    def _repair_ladder(self, item: PipelineItem, ctx: "RunContext",
-                       opts: "AnnotatePromptOptions") -> "AnnotatePromptOptions":
-        """V21 修复梯：为判 fail ∧ policy="repair" 的重标注算出换档取值（spec 3.7.3「修复路径与
-        上下文预算的交互 ①」的唯一触发面，此处正是那条路径）。以 annotate profile 预算为门（cw ==
-        0 保持 v1.10 调用形逐字节不变），只有 UI 序列带关键帧面。梯级：k → max(2,
-        ⌈sequence_frames/2⌉)（F3）；px → 工作点上一级（见 _next_image_rung），经
-        _rung_fits 复核，越预算则丢掉 px 档只保留 k 减半。budget.escalations 每次真正升档记一次；
-        单发——由既有 max_repair_rounds 循环限界。
-        @param item 待重标注的序列信封
-        @param ctx 运行上下文
-        @param opts 本次重标注的基准装配变体参数（修复上下文 / 类标签 / 碎片配额）
-        @return 换档后的装配变体参数（预算关或非 UI 序列时原样返回 opts）
-        """
-        record = item.record
-        acfg = self.cfg.annotate
-        prof = self.cfg.llm_profiles.get(acfg.llm)
-        if (prof is None or prof.context_window <= 0
-                or record.kind != "sequence" or record.modality != "ui"):
-            return opts
-        k_half = max(2, math.ceil(acfg.sequence_frames / 2))
-        px_up = _next_image_rung(prof)
-        if px_up is not None and not self._rung_fits(
-                _LadderTrial(item=item, repair=opts.repair, label=opts.label,
-                             fragment_lens=opts.fragment_lens, k_eff=k_half,
-                             image_px=px_up), prof, ctx):
-            px_up = None
-        if px_up is not None:
-            ctx.metrics.count("budget.escalations")
-        return dataclasses.replace(opts, k_eff=k_half, image_px=px_up)
-
-    async def _reannotate_episode(self, state: _EpisodeReview,
-                                  ctx: "RunContext") -> Annotation:
-        """重标注一个手术过/判 label_mismatch 的 episode。v1.9（T14 穿参义务）：每碎片关键帧配额
-        从 M16 duck 标记穿到两个 annotate 调用点——此处丢掉它会把修复重标注悄悄降级成均匀降采样。
-        v1.11（V21/F3）：换档取值只在修复梯活着（预算开 + UI 序列）时改写基准变体参数，预算关
-        时原样透传，调用形保持逐字节不变。
-        @param state episode 台账
-        @param ctx 运行上下文
-        @return 重标注结果
-        """
-        from labelkit.operators.annotate import (AnnotatePromptOptions,
-                                                 RepairContext, annotate_record)
 
         repair = RepairContext(
-            previous_output=state.item.annotation.output,
+            previous_output=state.annotation.output,
             critiques_text=render_critiques_text(state.fail_critiques),
         )
-        fragments = getattr(state.item, "stitch_fragments", None)
-        fragment_lens = (tuple(int(f["member_count"]) for f in fragments)
-                         if fragments else None)
-        opts = AnnotatePromptOptions(repair=repair, label=state.label,
-                                     transitions=state.item.transitions,
-                                     fragment_lens=fragment_lens)
-        return await annotate_record(state.item.record, ctx,
-                                     self._repair_ladder(state.item, ctx, opts))
+        return await annotate_record_leaf(
+            state.item.record, ctx,
+            AnnotatePromptOptions(repair=repair, label=state.label),
+        )
 
-    def _finalize_episode(self, state: _EpisodeReview, ctx: "RunContext") -> None:
-        """终审落地：写 VerificationResult，判 fail 即 dropped_verify。verify.defects.<kind> 在
-        评审时计数（D4），不在这里——被修掉的缺陷也必须进报告直方图。
-        @param state episode 台账
-        @param ctx 运行上下文（保留签名一致性，终审本身不计数）
-        """
-        item = state.item
-        item.verification = VerificationResult(
-            verdict=state.verdict, rounds=state.rounds,
-            critiques=tuple(state.critiques), defects=tuple(state.defects))
-        if state.verdict == "fail":
-            item.status = "dropped_verify"
+    # ── classic 与 stream 共享的失败归并 ─────────────────────────────
 
     def _fail_item(self, item: PipelineItem, exc: BaseException,
                    ctx: "RunContext") -> str:
@@ -1974,6 +1447,7 @@ class VerifyStage:
         @return 归类得到的 StageError.kind（调用方据此写错误日志）
         """
         kind, retryable = _classify_error(exc, item.record.modality)
+        _log.error("verify record failed: kind=%s", kind)
         if isinstance(exc, SchemaViolation):
             # M11 为 rejects 的 "full" 档读取的 duck 通道（§9.2）。
             item.raw_last_output = exc.raw_last_output  # type: ignore[attr-defined]

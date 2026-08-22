@@ -1,4 +1,4 @@
-"""Offline unit tests for the v1.11 budget module (labelkit/common/runtime/budget.py,
+"""Offline unit tests for the v1.11 budget module (labelkit/common/inference/budget.py,
 CONTRACTS §7.17 / dev spec SPEC-context-budget.md §3.2) — pure logic only:
 est_text pinned samples, est_image_prior for both providers, margin/input_budget
 boundaries, fit_text both modes, the min_window matrix, the V22 cross-layer
@@ -18,8 +18,8 @@ from labelkit.common.errors import (
     OutputTruncatedError,
     SchemaViolation,
 )
-from labelkit.common.runtime import budget
-from labelkit.common.runtime.budget import (
+from labelkit.common.inference import budget
+from labelkit.common.inference.budget import (
     CALIBRATION_MIN_SAMPLES,
     CALIBRATION_WINDOW_BATCHES,
     DIFF_MAX_TOKENS,
@@ -37,7 +37,7 @@ from labelkit.common.runtime.budget import (
     min_window,
     pack_windows,
 )
-from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
+from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 
 
 def _llm(**over) -> LLMProfile:

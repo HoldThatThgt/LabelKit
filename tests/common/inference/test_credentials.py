@@ -12,13 +12,13 @@ import pytest
 
 from labelkit.common.config.model import CliOverrides
 from labelkit.common.errors import EXIT_OK, ConfigError
-from labelkit.common.runtime import credentials as creds_mod
-from labelkit.common.runtime.credentials import (
+from labelkit.common.inference import credentials as creds_mod
+from labelkit.common.inference.credentials import (
     RuntimeCredentials,
     referenced_profiles,
     resolve_credentials,
 )
-from labelkit.orchestration.runtime import execute_run, probe_referenced_profiles
+from labelkit.orchestration.application import execute_run, probe_referenced_profiles
 from tests.common.config.test_config import BASE_CONFIG, Env, env  # noqa: F401 (fixture)
 from tests.cli.test_cli import _cfg  # 下沉等价黄金用例复用同一配置工厂
 
@@ -84,13 +84,13 @@ def test_referenced_profiles_judges_replace_goldens():
 
 def test_referenced_profiles_source_is_the_common_layer_only():
     """CONTRACTS §7.19.3：收集器全仓唯一——旧 orchestration 模块已删除（无 shim），
-    runtime 与 orchestrator 消费的都下沉后的同一函数对象。"""
+    Application 与 ProcessWorkflow 消费的都是下沉后的同一函数对象。"""
     import labelkit.orchestration
-    import labelkit.orchestration.orchestrator as orchestrator_mod
-    import labelkit.orchestration.runtime as runtime_mod
+    import labelkit.orchestration.process_workflow as process_workflow_mod
+    import labelkit.orchestration.application as runtime_mod
 
     assert runtime_mod.referenced_profiles is referenced_profiles
-    assert orchestrator_mod.referenced_profiles is referenced_profiles
+    assert process_workflow_mod.referenced_profiles is referenced_profiles
     assert not hasattr(labelkit.orchestration, "referenced_profiles")
     with pytest.raises(ModuleNotFoundError):
         import labelkit.orchestration.profile_usage  # noqa: F401
@@ -231,7 +231,7 @@ def test_static_validate_and_dry_run_never_read_env_values(env, monkeypatch, cap
     情况下完整走通——orchestration/cli 侧不存在第二条 credential value 读路径。
     毒化按名定向：第三方库（如 numpy 首次导入时读自家的调优变量）的非秘密 env
     读不属于本纪律（SPEC-SP §5.2 的对象是密钥 value reader）。"""
-    import labelkit.orchestration.runtime as runtime_mod
+    import labelkit.orchestration.application as runtime_mod
 
     env.load()  # 静态装载 keyless（Wave 2a），先写出 config/project 文件
     key_envs = {"LK_TEST_KEY_DEFAULT", "LK_TEST_KEY_JUDGE", "LK_TEST_KEY_EMB",

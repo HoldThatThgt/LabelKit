@@ -34,12 +34,13 @@ from labelkit.common.config.model import (
 )
 from labelkit.common.contracts.types import Annotation, PipelineItem, Record, RecordRef, Usage
 from labelkit.common.contracts.stage import RunContext
-from labelkit.common.runtime.credentials import RuntimeCredentials
-from labelkit.common.runtime.llm_client import LLMClient
-from labelkit.common.runtime.schema_engine import SchemaEngine
+from labelkit.common.inference.credentials import RuntimeCredentials
+from labelkit.common.inference.schema_engine import SchemaEngine
 from labelkit.operators.verify import VerifyStage
+from labelkit.runtime.scheduler import ExecutionRuntime
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
+from tests.llm_client_helpers import make_llm_client as _client
 
 pytestmark = pytest.mark.integration
 
@@ -47,10 +48,24 @@ pytestmark = pytest.mark.integration
 class CollectingMetrics:
     def __init__(self):
         self.events = []
+        self.counters = {}
+        self.runtime_high_water = {}
+        self.runtime_totals = {}
 
     def event(self, ev, *, stage, batch_no, record_ids=(), payload=None):
         self.events.append({"ev": ev, "stage": stage, "batch_no": batch_no,
                             "record_ids": record_ids, "payload": payload or {}})
+
+    def count(self, key, n=1):
+        self.counters[key] = self.counters.get(key, 0) + n
+
+    def observe_runtime_high_water(self, key, value):
+        self.runtime_high_water[key] = max(
+            self.runtime_high_water.get(key, 0), value,
+        )
+
+    def add_runtime_total(self, key, value):
+        self.runtime_totals[key] = self.runtime_totals.get(key, 0) + value
 
 
 # ── fixtures ────────────────────────────────────────────────────────────────
@@ -119,15 +134,17 @@ def _run_verify(item: PipelineItem, trace: TraceConfig | None = None):
     credentials = RuntimeCredentials(
         llm={"judge": (os.environ[ZAI_KEY_ENV],)}, embedding={}
     )
-    client = LLMClient(cfg.llm_profiles, {}, credentials)
+    client = _client(cfg.llm_profiles, {}, credentials)
     engine = SchemaEngine(cfg.user_schema, client, cfg.output)
+    runtime = ExecutionRuntime(client._resources, metrics)
     ctx = RunContext(cfg=cfg, llm=client, schema_engine=engine,
-                     metrics=metrics, rng=None, batch_no=1)
+                     metrics=metrics, rng=None, batch_no=1, tasks=runtime,
+                     task_namespace="integration:batch:1:stage:verify")
     stage = VerifyStage(cfg)
 
     async def run() -> None:
         try:
-            await stage.run([item], ctx)
+            await runtime.run(lambda: stage.run([item], ctx))
         finally:
             await client.aclose()
 

@@ -1,7 +1,7 @@
 # E2E 测试发现与证据状态
 
 > 本文件只记录可复核证据。已验证事实、权威验收目标、环境失败和待运行项分开书写。
-> 当前序列生成以 v1.18 规格与 `examples/sequence-generation` 为准。
+> 当前序列生成以 v1.18 行为规格、v1.19 execution runtime 规格与 `examples/sequence-generation` 为准。
 
 ## 证据纪律
 
@@ -31,6 +31,70 @@
 | z.ai structured output | 已验证 | 1 passed in 60.81s |
 | 完整真实端点 integration suite | 已验证 | 47 passed in 438.37s，无 skip |
 | 52-sequence blind review | 已验证 | 两名评审各 52/52；五类缺陷与系统性缺陷均为 0 |
+
+## v1.19 execution runtime 闭包看板
+
+| 证据面 | 当前状态 | 已知事实 |
+|---|---|---|
+| v1.18 pre-revision offline | 已验证 | 2610 passed，47 deselected |
+| v1.19 offline | 已验证 | 2774 passed，48 deselected，33.78 秒 |
+| runtime/resource/ordinary/sequence 对抗窄门 | 已验证 | 917 passed；CircuitBreaker cleanup 后 admission/profile/origin 许可恢复 2/2/2 |
+| 六百槽合成门 | 已验证 | 10 passed；running 与 commit-waiting high-water 均为 600；声明序与 capacity 1/600 digest 等价 |
+| 六百槽固定候选压力 | 已验证 | 每候选 65536 bytes，candidate bytes high-water 39321600；peak RSS 183468032 bytes |
+| 六百槽短提交吞吐 | 已验证 | 受控候选到达率 5396.529/s；commit service rate 33761.210/s；本工作负载未形成持续背压 |
+| 本地 Qwen3.5-4B 四槽 E2E | 已验证 | 三次均通过；34 calls、4 attempts、0 rejections；server request high-water 精确为 4 |
+| 同 fixture v1.18/v1.19 性能 | 已验证但不宣称加速 | v1.18 median 41.75 秒；v1.19 median 52.38 秒；并发改变 prompt-cache/设备争用形状 |
+| DeepSeek sequence | 已验证 | 5 passed in 107.49s，无 skip |
+| z.ai structured output | 已验证 | 1 passed in 52.31s，无 skip |
+| 完整真实端点 suite | 已验证 | 47 passed、1 skipped in 370.53s；skip 仅因该 shell 未设置本地模型专用 key |
+| Uncle Bob mutation review | 已验证 | 33 个独立语义变异全部 killed；survived、invalid、inconclusive 均为 0 |
+
+### 周工程一小时现象的归因
+
+`white-collar-week.report.json` 记录 wall 4720.439 秒，其中 generate 4049.871 秒、annotate 636.202 秒；
+365 个 exact sets、1360 个 primary events，无 provider retry 与 attempt rejection。default 与 judge 合计
+3540 calls、4815622 prompt tokens、277052 completion tokens。v1.18 的 `_deliver_primary_slots()` 又要求一个槽完成
+generation、evaluation、dedup、quality、annotate、verify、CrossView 与 commit 后才启动下一槽。因此退化来自调用量与
+token 规模扩大叠加跨槽串行，不是“从一天到七天所以只应乘七”，也不能只归因于 scheduler。
+
+### 同一四槽 fixture 的前后对照
+
+模型固定为 `Qwen3.5-4B-Q6_K.gguf`，SHA-256
+`fdedd781c9ce676ab66b018ca247ff78e8a33c98098a822c1e2d5075e7718f66`；llama-server v9200，
+`-c 393216 -np 4`。工程固定为 4 sets、12 primary events、1 noise、3 replay events、34 calls、4 attempts、
+0 rejections。每组从空 prompt cache 开始连续运行三次。
+
+| checkout | shell wall 三次 | median / range | peak RSS 三次 | server high-water |
+|---|---|---|---|---|
+| v1.18 `c66816a` | 61.960 / 41.750 / 41.315 秒 | 41.750 / 41.315–61.960 秒 | 153796608 / 153911296 / 154845184 bytes | 1 |
+| v1.19 runtime | 50.560 / 58.520 / 52.380 秒 | 52.380 / 50.560–58.520 秒 | 188514304 / 188416000 / 179191808 bytes | 4 |
+
+v1.19 三次报告的总 prompt tokens 为 41635 / 41223 / 41340，completion tokens 为 2220 / 2219 / 2226；
+v1.18 为 41247 / 2818 / 1842 与恒定 2213。后两次旧运行因串行 prompt cache 复用显著减少计费 prompt 形状，
+所以本对照只证明真实四槽重叠、结构正确和资源观测闭合，不能声称纯 scheduler 加速。单 GPU 上同时执行四个请求还会
+争用相同计算资源；部署容量必须按目标 endpoint 的吞吐、cache、429、延迟和内存实测选择。
+
+### 六百槽合成门的使用边界
+
+合成门不替换网络 transport，也没有发起六百个模型请求。它证明 scheduler 可同时接纳六百 leaf、反序完成仍按输入序
+返回；sequence 六百候选反序准备仍按零至五百九十九提交，六百 reservation 可共存，primary frontier 与 noise
+similarity 的调用数分别随一百、三百、六百线性增长。固定 64 KiB candidate 的缓冲与 RSS 只代表该候选大小；合法
+Schema 产生更大 provider response 或 Python 对象时必须重新测量。
+
+### Uncle Bob mutation review
+
+权威范围为 `SPEC-execution-runtime.md` 的冻结执行契约、资源通道与 transport、普通标记工作流、sequence 候选缓冲、
+声明序提交、dedup reservation、CrossView 线性化、取消拓扑和验收矩阵。干净已提交树在 detached worktree 的 offline
+baseline 通过；每个变异只修改一个生产行为，运行预先声明的窄测试后立即反向恢复，并以 `git diff --exit-code` 与完整
+status 证明零残留。结果为 33 个 mapped requirements、0 个 implementation missing、0 个 implementation diverged、
+33 killed、0 survived、0 invalid、0 inconclusive。
+
+变异覆盖 profile 独立通道、全域接纳上界、输入序、Context 复制、nested submit、取消许可、CircuitBreaker、profile 与
+origin 许可、HTTPX 显式 pool、repair 首轮通道、同名 LLM/embedding、单 runtime 身份、关闭异常优先级、frame-only
+annotate、ordinary ProviderFatal、普通 semantic dedup 并发与 first-writer、unused speculative outcome、quality 声明序、
+verify 纯叶、generated child、candidate window、昂贵下游跨槽重叠、六百槽 head、reservation 共存、commit-time
+revalidate、拒绝优先级、retained 边界、primary/noise 线性检查和最终 full CrossView。所有 detached worktree 均通过
+正常 `git worktree remove` 清理；caller checkout 的 HEAD 与完整 status 在清理后复核。
 
 ## 已验证的 keyless 计划
 

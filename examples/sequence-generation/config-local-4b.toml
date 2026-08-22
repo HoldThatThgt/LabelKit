@@ -1,0 +1,36 @@
+schema_version = 1
+
+[tool]
+log_level = "info"
+log_format = "text"
+
+# 四个 llama-server 物理 slot 由两个逻辑 profile 各占两个，验证跨 profile 调度与同 origin 聚合。
+[llm.default]
+provider = "anthropic"
+base_url = "http://127.0.0.1:18081"
+model = "Qwen3.5-4B-Q6_K"
+api_key_env = "LABELKIT_LOCAL_KEY"
+max_concurrency = 2
+timeout_s = 180
+max_retries = 1
+supports_structured_output = false
+supports_vision = false
+max_output_tokens = 2048
+thinking = "disabled"
+context_window = 98304
+temperature = 0.0
+
+[llm.judge]
+provider = "anthropic"
+base_url = "http://127.0.0.1:18081"
+model = "Qwen3.5-4B-Q6_K"
+api_key_env = "LABELKIT_LOCAL_KEY"
+max_concurrency = 2
+timeout_s = 180
+max_retries = 1
+supports_structured_output = false
+supports_vision = false
+max_output_tokens = 2048
+thinking = "disabled"
+context_window = 98304
+temperature = 0.0

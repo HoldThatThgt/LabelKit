@@ -61,7 +61,7 @@ def classification_schema(class_names: list[str], assignment: str,
 
 | 设计点 | 定义 |
 |---|---|
-| 调用与校验 | 每记录 1 次调用（self-consistency 启用时 ×n），经 `complete_validated(schema=classification_schema(...))`（3.8.3）——内部 Schema：不计入 `report.schema_engine.resolved_at`、不经过 L2.5（3.8.2）。`reason` 仅当 `trace.enabled = true` 且 `trace.channels` 含 `"classify"` 时请求（零额外 token 原则，对齐 `quality.judgment_reasons` 的 "auto" 语义；7.2）。temperature 恒 0（sc 采样取 `classify.sc_temperature`）。批内记录级并发（asyncio.gather + profile 信号量，骨架同 M5）。 |
+| 调用与校验 | 每记录 1 次调用（self-consistency 启用时 ×n），经 `complete_validated(schema=classification_schema(...))`（3.8.3）——内部 Schema：不计入 `report.schema_engine.resolved_at`、不经过 L2.5（3.8.2）。`reason` 仅当 `trace.enabled = true` 且 `trace.channels` 含 `"classify"` 时请求（零额外 token 原则，对齐 `quality.judgment_reasons` 的 "auto" 语义；7.2）。temperature 恒 0（sc 采样取 `classify.sc_temperature`）。stage 按 item/sample ordinal 冻结 `TaskGroupRequest`，TaskExecutor 经 profile 资源通道有界执行；结果仍按计划顺序返回。 |
 | 归一化（M8 之后，确定性，顺序固定） | ① 标签映射到类别表声明序并**去重**；② 兜底类与具体类同现 ⇒ 剔除兜底类（纯兜底保留——「其余」与具体类命中矛盾）。归一化只收窄已验证集合（词表合法性由内部 Schema enum 保证，3.13.3）。 |
 | sc 投票 | `classify.self_consistency = n`（0 关；≥3 奇数，M1 校验）：n 次独立采样（某次采样 SchemaViolation ⇒ 该样本弃权，分母仍为 n）。single：多数票，无过半 ⇒ 归兜底类；multi：逐标签保留出现于 > n/2 个采样集合者，全落选 ⇒ 归兜底类。`Classification.detail.sc = {"n", "agreement_ratio"}`（single = 胜出类票占比；multi = 保留标签中最低票占比）。本投票不复用 3.5.2 的字段级投票——其「全体分歧回退首样本」语义不适用于分类（无过半应归兜底而非取首样本）。 |
 | 失败与兜底 | M8 修复耗尽：`classify.on_error = "fallback"`（默认）⇒ 归兜底类 `classify.fallback_class`，`source="fallback"`，留痕写 `Classification.detail`（含 kind 与消息）——**不写 `item.errors`**（记录存活；rejects 归因取 `item.errors[0]`，写入会在该记录后续阶段失败时污染归因，3.11.2）+ error 事件（kind = `classification_invalid`，7.6）+ 计数器 `classify.fallback`；`on_error = "fail"` ⇒ `status="failed"`、StageError 入 `item.errors` ⇒ rejects。 |
@@ -70,6 +70,17 @@ def classification_schema(class_names: list[str], assignment: str,
 | 幂等与 sequence 边界 | `classification is not None` 的项跳过，覆盖 flat 回流样本的 inherited 分类与任何重入。v1.18 sequence 要求 `classify.enabled = false`，ClassifyStage 不进链；sequence class 直接由 `[class.<name>]` 声明，EventProjector 在主序列与成员事件上写 `source="inherited"` 的实际类真值。因此 sequence 的分类调用恒为零，但 M4/M5/M7/M11 必须继续读取 inherited Classification 选择 ClassView。 |
 | 事件与计数 | 每记录一条 `classify.decision` trace 事件（classify 通道 / trace-only，payload：`label`、`labels`（multi 携带全集）、`source`、`reason`†、`sc`†；条件与字段定义见 7.2）；计数器（M13 属主）：`classify.classes.<name>`（逐标签计）、`classify.fallback`、`classify.failures`、`classify.multi_label_records`；`counts.fanout` 由 M10 计量（counts.* 所有权属 M10，3.10.3）。report `classify` 节见 6.4。 |
 | 上下文预算装填（v1.11） | 分类 profile 声明 `context_window` 时按上下文预算装填分类调用（未声明 = 预算关闭，行为与 v1.10 一致；预算/估算/校准机制见 3.9）：「当前记录」的单记录 UI 树渲染动态封顶——`UITree.serialize(max_chars=…)` 实参从固定 `input.ui_tree_max_chars` 改为 `min(ui_tree_max_chars, 预算折算字符)`（渲染后按 est 复核，超则按行丢尾、保留既有 `…(truncated N nodes)` 标记；`ui_tree_max_chars` 保留为绝对上限，V9；序列分支的摘要段封顶为同族语义）。**类别示例是系统侧静态部件（V13③）**：`[类别示例·{name}]` 段与类表、`classify.instruction` 一律**不动态裁剪**（用户语义资产）——由 M1 静态预检把关（est ≥ input_budget → CONFIG_ERROR、> 50% → WARN，3.1.4）。连最小单元（单记录）都装不下 → 该记录记 `context_overflow` 入 rejects（V10，7.6）。逐裁剪点计入 `report.budget.truncations`（6.4）。 |
+
+**v1.19 planner / leaf / reducer。**planner 按批内 item 序冻结 sequence sample 任务，只消费同步计划阶段的
+RNG。叶任务返回冻结分类 sample outcome，不得写 classification、member map、errors、events 或 counters。
+sequence reducer 按 item/sample ordinal 完成投票、归一化和 fallback，再写原信封分类。
+
+sequence 分类 reducer 完成后、multi fanout 之前，stage 才从稳定分类结果与成员摘要冻结 frame window 任务；
+frame 叶任务返回窗口 outcome，frame reducer 按 episode/window/member ordinal 写入同一个
+`member_classifications` dict。随后 multi reducer 才按原 item 位置与标签声明序向批尾追加兄弟信封。这个屏障保证
+克隆只共享已定案的帧产物，不会重复付费。无 sequence 分类调用或无 frame window 时对应任务组为空；
+ProviderFatal 在普通路径转为现有 fallback/fail outcome，不取消 sibling，逃逸 internal/control 异常才取消
+execution domain。
 
 ### 3.13.5 API 与配置
 

@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """docs/design/ 设计文档构建脚本（stdlib-only，确定性）。
 
-把 spec/*.md（v1.9 现行设计规格，实现级、与代码同步）汇编为单文件自包含
+把 spec/*.md（v1.19 现行设计规格，实现级、与代码同步）汇编为单文件自包含
 HTML 设计说明书 docs/design/labelkit-design-v1.html：
 
   封面（版本/修订历史取自 spec/00-frontmatter.md）→ 目录（h1/h2 自动生成）
-  → 正文（ch1–ch9 + 模块 3.1–3.16 + 附录 A，Markdown 子集确定性转换）
+  → 正文（ch1–ch9 + 模块 M1–M17 + 附录 A，Markdown 子集确定性转换）
   → 插图（tools/design_figures/fig-*.svg 按「图 N-N」标题行内联注入）。
 
 样式沿用 v1.4 原版 CSS（tools/design_figures/_style.css）。PDF 由 Chrome
@@ -42,9 +42,9 @@ ORDER = [
     "301-m1-config", "302-m2-ingest", "303-m3-dedup",
     "304-m4-qualityqurating", "305-m5-annotate", "306-m6-generate",
     "307-m7-verify", "308-m8-schema-engine", "309-m9-llm-client",
-    "310-m10-orchestrator", "311-m11-emitter", "312-m12-logging",
+    "310-m10-orchestration", "311-m11-emitter", "312-m12-logging",
     "313-m13-classify", "314-m14-segment", "315-m15-extract",
-    "316-m16-stitch",
+    "316-m16-stitch", "317-m17-execution-runtime",
     "40-ch4-data-structures", "50-ch5-config-spec", "60-ch6-io-formats",
     "70-ch7-logging", "80-ch8-nongoals-roadmap", "85-ch9-references",
     "90-appendix-a-rubrics",

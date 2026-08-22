@@ -28,7 +28,7 @@ from labelkit.common.contracts.generation import (
 )
 from labelkit.common.errors import ContextOverflowError, InternalError, SchemaViolation
 from labelkit.common.extensions.hooks import ResolvedHook
-from labelkit.common.runtime.schema_engine import event_plan_schema
+from labelkit.common.inference.schema_engine import event_plan_schema
 from labelkit.operators.generation import GenerationAttemptRejected
 from labelkit.operators.generation.evaluate import evaluate_state
 from labelkit.operators.generation.evaluate import evaluate_noise
@@ -41,7 +41,7 @@ from labelkit.operators.generation.project import (
     scenario_plan_digest,
 )
 from labelkit.operators.generation.render import render_noise
-from labelkit.orchestration.generation_delivery import estimate_sequence_products
+from labelkit.orchestration.sequence_workflow import estimate_sequence_products
 from labelkit.operators.generation.scenario import (
     build_event_plan_request,
     generate_scenario_seed,
@@ -226,10 +226,24 @@ class _OfflineSchemaEngine:
         }
 
 
+class _InlineTaskExecutor:
+    """按声明序执行冻结叶任务并返回输入序结果。"""
+
+    async def run_group(self, request):
+        return tuple([await task.operation() for task in request.tasks])
+
+
 def _services(config):
     """构造不含网络调用的真实 GenerationServices carrier。"""
     engine, metrics = _OfflineSchemaEngine(), _Metrics()
-    return GenerationServices(config, engine, object(), metrics), engine, metrics
+    services = GenerationServices(
+        config,
+        engine,
+        object(),
+        metrics,
+        _InlineTaskExecutor(),
+    )
+    return services, engine, metrics
 
 
 def _user_text(request) -> str:

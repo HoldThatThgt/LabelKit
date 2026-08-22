@@ -42,8 +42,8 @@ from labelkit.common.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.common.errors import ProviderRetryableError, SchemaViolation
-from labelkit.common.runtime.schema_engine import (
+from labelkit.common.errors import ProviderFatalError, ProviderRetryableError, SchemaViolation
+from labelkit.common.inference.schema_engine import (
     classification_schema,
     frame_classify_schema,
 )
@@ -189,13 +189,69 @@ class RecordingMetrics:
         self.counters[key] = self.counters.get(key, 0) + n
 
 
-def make_ctx(cfg, engine):
+class TaskRunner:
+    """并发执行冻结叶任务并按请求输入序返回。"""
+
+    def __init__(self):
+        self.groups: list = []
+
+    async def run_group(self, request):
+        self.groups.append(request)
+        results = [None] * len(request.tasks)
+
+        async def run_one(index, spec):
+            results[index] = await spec.operation()
+
+        async with asyncio.TaskGroup() as group:
+            for index, spec in enumerate(request.tasks):
+                group.create_task(run_one(index, spec))
+        return tuple(results)
+
+
+class ReverseTaskRunner(TaskRunner):
+    """让每组叶任务按声明序的严格逆序完成。"""
+
+    def __init__(self, on_group=None, on_complete=None):
+        super().__init__()
+        self.on_group = on_group
+        self.on_complete = on_complete
+        self.completion_order: list[str] = []
+
+    async def run_group(self, request):
+        self.groups.append(request)
+        if self.on_group is not None:
+            self.on_group(request)
+        results = [None] * len(request.tasks)
+        gates = [asyncio.Event() for _ in request.tasks]
+        if gates:
+            gates[-1].set()
+
+        async def run_one(index, spec):
+            value = await spec.operation()
+            await gates[index].wait()
+            results[index] = value
+            self.completion_order.append(spec.task_id)
+            if self.on_complete is not None:
+                self.on_complete(spec)
+            if index:
+                gates[index - 1].set()
+
+        async with asyncio.TaskGroup() as group:
+            for index, spec in enumerate(request.tasks):
+                group.create_task(run_one(index, spec))
+        return tuple(results)
+
+
+def make_ctx(cfg, engine, tasks=None):
+    tasks = tasks or TaskRunner()
     return SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
-                           metrics=RecordingMetrics(), rng=None, batch_no=1)
+                           metrics=RecordingMetrics(), tasks=tasks,
+                           task_namespace="run:batch:1:stage:classify",
+                           rng=None, batch_no=1)
 
 
-def run_stage(cfg, batch, engine):
-    ctx = make_ctx(cfg, engine)
+def run_stage(cfg, batch, engine, tasks=None):
+    ctx = make_ctx(cfg, engine, tasks)
     out = asyncio.run(ClassifyStage(cfg).run(batch, ctx))
     return out, ctx
 
@@ -720,6 +776,29 @@ def test_provider_retryable_exhausted_fails_item():
     assert ctx.metrics.counters == {"classify.failures": 1}
 
 
+def test_provider_fatal_is_record_outcome_and_does_not_cancel_peer():
+    cfg = make_cfg()
+    first = text_record(rid="fatal-record")
+    second = text_record("另一条", rid="healthy-record")
+    items = [PipelineItem(record=first), PipelineItem(record=second)]
+    engine = MapEngine({
+        first.id: ProviderFatalError("unauthorized", "default", 401),
+        second.id: {"class": "qa"},
+    })
+
+    out, ctx = run_stage(cfg, items, engine, ReverseTaskRunner())
+
+    assert out is items
+    assert items[0].status == "failed"
+    assert items[0].errors[0].kind == "provider_fatal"
+    assert items[1].status == "active"
+    assert items[1].classification.label == "qa"
+    assert ctx.metrics.counters == {
+        "classify.failures": 1,
+        "classify.classes.qa": 1,
+    }
+
+
 # ── v1.11 context-budget packing (spec 3.13.4 上下文预算装填 row, V27①) ───────
 
 def budget_cfg(context_window: int, **kw) -> ResolvedConfig:
@@ -741,9 +820,9 @@ class _FixedCalibrator:
 
 
 def budget_ctx(cfg, engine, image_cost: int = 100) -> SimpleNamespace:
-    return SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(image_cost)),
-                           schema_engine=engine, metrics=RecordingMetrics(),
-                           rng=None, batch_no=1)
+    ctx = make_ctx(cfg, engine)
+    ctx.llm = SimpleNamespace(calibrator=_FixedCalibrator(image_cost))
+    return ctx
 
 
 def big_ui_record(n: int = 80) -> Record:
@@ -758,7 +837,7 @@ def big_ui_record(n: int = 80) -> Record:
 
 
 async def test_budget_dynamic_tree_cap_trims_with_node_marker():
-    from labelkit.common.runtime import budget as budget_mod
+    from labelkit.common.inference import budget as budget_mod
 
     cfg = budget_cfg(1200, modality="ui")
     rec = big_ui_record()
@@ -876,8 +955,8 @@ def test_reactive_400_terminal_feeds_breaker_exactly_once():
 
     exc = ContextOverflowError("sniff hit", phase="reactive")   # origin defaults http_400
     item = PipelineItem(record=rec)
-    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=MapEngine({rec.id: exc}),
-                          metrics=FeedMetrics(), rng=None, batch_no=1)
+    ctx = make_ctx(cfg, MapEngine({rec.id: exc}))
+    ctx.metrics = FeedMetrics()
     asyncio.run(ClassifyStage(cfg).run([item], ctx))
     assert item.errors[0].kind == "context_overflow"
     assert ctx.metrics.fed == [(True, False)]
@@ -885,8 +964,8 @@ def test_reactive_400_terminal_feeds_breaker_exactly_once():
     exc200 = ContextOverflowError("finish oracle", phase="reactive")
     exc200.origin = "finish"                                    # 200-shaped: never fed
     item2 = PipelineItem(record=rec)
-    ctx2 = SimpleNamespace(cfg=cfg, llm=None, schema_engine=MapEngine({rec.id: exc200}),
-                           metrics=FeedMetrics(), rng=None, batch_no=1)
+    ctx2 = make_ctx(cfg, MapEngine({rec.id: exc200}))
+    ctx2.metrics = FeedMetrics()
     asyncio.run(ClassifyStage(cfg).run([item2], ctx2))
     assert item2.errors[0].kind == "context_overflow"
     assert ctx2.metrics.fed == []
@@ -1175,6 +1254,67 @@ def test_classify_frames_precheck_overflow_skips_window_without_dispatch():
 
 # ── stage 帧 pass：产物、事件、计数与执行门四条件 ────────────────────────────
 
+def test_reverse_completion_reduces_between_sequence_and_frame_waves():
+    cfg = frame_cfg(assignment="multi", classes=CLASSES4, max_labels=4)
+    first = seq_record(
+        [text_record("甲一", rid="a1"), text_record("甲二", rid="a2")],
+        rid="episode-a",
+    )
+    second = seq_record(
+        [text_record("乙一", rid="b1"), text_record("乙二", rid="b2")],
+        rid="episode-b",
+    )
+    items = [PipelineItem(record=first), PipelineItem(record=second)]
+    engine = FrameStageEngine({
+        "episode-a": {"classes": ["qa", "writing"]},
+        "episode-b": {"classes": ["code", "qa"]},
+    })
+    runner = ReverseTaskRunner()
+    ctx = make_ctx(cfg, engine, runner)
+    group_snapshots: list = []
+
+    def on_group(request):
+        group_snapshots.append((
+            [spec.task_id for spec in request.tasks],
+            [item.classification.label if item.classification else None
+             for item in items],
+        ))
+
+    def on_complete(spec):
+        if ":sample:" in spec.task_id:
+            assert all(item.classification is None for item in items)
+            assert ctx.metrics.events == []
+            return
+        assert [item.classification.label for item in items] == ["writing", "qa"]
+        assert all(item.member_classifications is None for item in items)
+        assert not [event for event in ctx.metrics.events
+                    if event[0] == "classify.frame"]
+
+    runner.on_group = on_group
+    runner.on_complete = on_complete
+    out = asyncio.run(ClassifyStage(cfg).run(items, ctx))
+
+    assert [task_id.rsplit(":", 2)[-2:] for task_id in runner.completion_order] == [
+        ["1", "0"], ["0", "0"], ["1", "0"], ["0", "0"],
+    ]
+    assert [":".join(task_id.split(":")[-4:-2])
+            for task_id in runner.completion_order] == [
+        "classify:sample", "classify:sample", "classify:frame", "classify:frame",
+    ]
+    assert group_snapshots[0][1] == [None, None]
+    assert group_snapshots[1][1] == ["writing", "qa"]
+    assert [(item.record.id, item.classification.label) for item in out] == [
+        ("episode-a", "writing"), ("episode-b", "qa"),
+        ("episode-a", "qa"), ("episode-b", "code"),
+    ]
+    decisions = [event[2] for event in ctx.metrics.events
+                 if event[0] == "classify.decision"]
+    frames = [event[2] for event in ctx.metrics.events
+              if event[0] == "classify.frame"]
+    assert decisions == [("episode-a",), ("episode-b",)]
+    assert frames == [("episode-a",), ("episode-b",)]
+
+
 def test_stage_frame_pass_writes_member_classifications_and_event():
     cfg = frame_cfg()
     members = frame_members(3)
@@ -1256,8 +1396,8 @@ def test_stage_frame_gate_idempotent_on_existing_dict():
 
 def test_stage_frame_only_dual_gate_skips_sequence_classification():
     # v1.12 双门（SPEC §3.2）：classify.enabled=false ∧ frame.classify.enabled=true
-    # 时序列级判决静默跳过、帧 pass 照常运行（组链或门由 test_cli 的 factory
-    # 测试守护）；空 by_record 引擎保证序列级若被误调必挂（KeyError → failed）。
+    # 时第一波为空、帧窗口第二波照常运行；空 by_record 引擎保证序列级若被误调
+    # 必挂（KeyError → failed）。
     from dataclasses import replace as _replace
     cfg = frame_cfg()
     cfg = _replace(cfg, classify=_replace(cfg.classify, enabled=False))
@@ -1270,6 +1410,11 @@ def test_stage_frame_only_dual_gate_skips_sequence_classification():
     assert len(engine.frame_calls) == 1
     assert engine.calls == engine.frame_calls          # 序列级零调用
     assert ctx.metrics.counters["frame_classify.calls"] == 1
+    assert len(ctx.tasks.groups) == 2
+    assert ctx.tasks.groups[0].tasks == ()
+    (frame_task,) = ctx.tasks.groups[1].tasks
+    assert frame_task.task_id.endswith(":classify:frame:0:0")
+    assert frame_task.resource_key == ("llm", "default")
 
 
 def test_stage_frame_pass_disabled_by_switch():
@@ -1283,6 +1428,8 @@ def test_stage_frame_pass_disabled_by_switch():
     assert engine.frame_calls == []
     assert not any(key.startswith("frame_classify.")
                    for key in ctx.metrics.counters)
+    assert len(ctx.tasks.groups) == 2
+    assert ctx.tasks.groups[1].tasks == ()
 
 
 # ── _fan_out：两 dict 按引用共享（扇出共享裁决） ─────────────────────────────

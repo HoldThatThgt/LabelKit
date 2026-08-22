@@ -1,0 +1,208 @@
+schema_version = 1
+
+[run]
+output = "./out/runtime-four-slot-labels.jsonl"
+modality = "text"
+mode = "generate_only"
+batch_size = 4
+seed = 20260823
+
+[dedup]
+enabled = true
+scope = "global"
+minhash_threshold = 0.85
+minhash_num_perm = 128
+ngram = 5
+
+[classify]
+enabled = false
+
+[frame.classify]
+enabled = false
+
+[quality]
+enabled = false
+
+[annotate]
+enabled = true
+llm = "default"
+instruction = "阅读完整订票序列，按实际内容标注意图、结果、请求编号、票号与摘要。"
+
+[verify]
+enabled = false
+
+[generate]
+enabled = true
+form = "sequence"
+mode = "declared"
+semantic_llm = "default"
+evaluation_llm = "judge"
+max_slot_attempts = 4
+state_validator = "hooks.py:validate_state"
+
+[output]
+schema_path = "schemas/annotation.json"
+validator = "hooks.py:validate_output"
+meta_mode = "inline"
+rejects = "none"
+
+[class.ticket_booking]
+description = "一次铁路订票请求从提出到最终结果的自然交互"
+
+[class.ticket_booking.generate]
+instruction = "围绕 catalog 中同一个请求生成自然中文订票交互，忠实表达状态，不得输出内部状态术语。"
+state_schema_path = "schemas/state.json"
+initial_state_source = "catalog"
+initial_state_catalog_path = "catalogs/ticket-booking.jsonl"
+
+[class.ticket_booking.annotate]
+instruction = """
+标注这次订票交互的 intent、outcome、request_id、ticket_id 与 summary。
+outcome 只能是 ticketed、not_ticketed 或 expired；未出票时 ticket_id 使用空字符串。
+"""
+schema_path = "schemas/annotation.json"
+
+[[class.ticket_booking.annotate.examples]]
+input = "订票请求 R-EXAMPLE 已完成出票，票号为 T-EXAMPLE。"
+
+[class.ticket_booking.annotate.examples.output]
+intent = "book_train_ticket"
+outcome = "ticketed"
+request_id = "R-EXAMPLE"
+ticket_id = "T-EXAMPLE"
+summary = "订票请求已成功出票。"
+
+[frame.class.task_request]
+description = "请求者提出一条订票需求"
+
+[frame.class.task_request.generate]
+instruction = "写成请求者自然提出订票需求的一句话，不得提前声称成功。"
+schema_path = "schemas/frame-request.json"
+
+[frame.class.acknowledgement]
+description = "系统确认已经接收请求"
+
+[frame.class.acknowledgement.generate]
+instruction = "写成系统自然确认已收到同一请求的一句话，不得提前声称出票。"
+schema_path = "schemas/frame-acknowledgement.json"
+
+[frame.class.confirmation]
+description = "系统给出与当前状态一致的最终结果"
+
+[frame.class.confirmation.generate]
+instruction = "写成系统对同一请求给出最终结果的一句话；不得虚构事实，出票一词最多出现一次。"
+schema_path = "schemas/frame-confirmation.json"
+
+[frame.class.noise]
+description = "与订票任务无关且不包含可执行诉求的自然闲聊"
+
+[frame.class.noise.generate]
+instruction = "生成一句与任何订票或设备任务无关、没有可执行诉求的自然闲聊。"
+schema_path = "schemas/frame-noise.json"
+
+[generate.pattern.booking_success]
+sequence_class = "ticket_booking"
+description = "请求者提出需求，系统确认受理并给出一致的出票结果。"
+order = ["request", "acknowledge", "confirm"]
+max_span_s = 2400
+
+[[generate.pattern.booking_success.roles]]
+name = "request"
+frame_class = "task_request"
+actor = "requester"
+read_roots = ["/public", "/goal", "/request", "/actors/requester"]
+write_roots = ["/request/status"]
+publish_roots = ["/request/id", "/request/status", "/goal/origin", "/goal/destination", "/goal/travel_date"]
+observers = ["requester", "system"]
+state_instruction = """
+只先 test `/request/status` 为 `new`，再 replace `/request/status` 为 `pending`。
+不得修改任何其他 path，不得改变 request.id、goal、actor knowledge、audit 或 hidden_sentinel。
+"""
+pre_state_schema_path = "schemas/pre-request.json"
+payload_bindings = [
+  { payload_path = "/request_id", state_phase = "after", state_path = "/request/id" },
+  { payload_path = "/status", state_phase = "after", state_path = "/request/status" }
+]
+calendar_window = "service_hours"
+
+[[generate.pattern.booking_success.roles]]
+name = "acknowledge"
+frame_class = "acknowledgement"
+actor = "system"
+read_roots = ["/request", "/goal", "/actors/system"]
+write_roots = ["/request/acknowledged", "/request/status"]
+publish_roots = ["/request/id", "/request/status", "/request/acknowledged"]
+observers = ["requester", "system"]
+state_instruction = """
+只先 test 当前 `/request/status` 为 `pending`，再 replace `/request/acknowledged` 为 true，
+并把 `/request/status` 改为 `acknowledged`。不得修改任何其他 path。
+"""
+pre_state_schema_path = "schemas/pre-acknowledgement.json"
+payload_bindings = [
+  { payload_path = "/request_id", state_phase = "after", state_path = "/request/id" },
+  { payload_path = "/status", state_phase = "after", state_path = "/request/status" }
+]
+
+[[generate.pattern.booking_success.roles]]
+name = "confirm"
+frame_class = "confirmation"
+actor = "system"
+read_roots = ["/request", "/ticket", "/goal", "/actors/system", "/sla"]
+write_roots = ["/request/status", "/ticket/id", "/ticket/status", "/sla/expired"]
+publish_roots = ["/request/id", "/request/status", "/ticket/id", "/ticket/status"]
+observers = ["requester", "system"]
+state_instruction = """
+只先 test 当前 `/request/acknowledged` 为 true，再 replace `/request/status` 为 `ticketed`、
+`/ticket/id` 为非空票号、`/ticket/status` 为 `issued`。不得修改任何其他 path。
+"""
+pre_state_schema_path = "schemas/pre-confirmation.json"
+payload_bindings = [
+  { payload_path = "/request_id", state_phase = "after", state_path = "/request/id" },
+  { payload_path = "/ticket_id", state_phase = "after", state_path = "/ticket/id" },
+  { payload_path = "/status", state_phase = "after", state_path = "/request/status" }
+]
+
+[[generate.pattern.booking_success.gaps]]
+name = "request_to_acknowledge"
+before = "request"
+after = "acknowledge"
+min_gap_s = 5
+max_gap_s = 120
+
+[[generate.pattern.booking_success.gaps]]
+name = "acknowledge_to_confirm"
+before = "acknowledge"
+after = "confirm"
+min_gap_s = 30
+max_gap_s = 1200
+
+[[generate.counterfactual_sets]]
+name = "runtime_four_slot"
+pattern = "booking_success"
+count = 4
+
+[[generate.counterfactual_sets.variants]]
+name = "positive"
+kind = "positive"
+outcome_schema_path = "schemas/outcome-positive.json"
+
+[generate.timeline]
+timestamp_start = "2026-01-05T09:00:00+08:00"
+event_gap_s = [15, 120]
+primary_sessions = 4
+crossed_primary_sessions = 0
+session_max_events = 8
+session_max_span_s = 1800
+session_gap_s = 3600
+noise_events = 1
+duplicate_sequences = 1
+
+[generate.noise]
+frame_class = "noise"
+instruction = "生成与任何任务无关、没有可执行诉求的一句自然闲聊。"
+topics = ["夜空中的月相观察"]
+
+[generate.calendar_window.service_hours]
+utc_offset = "+08:00"
+days = ["mon", "tue", "wed", "thu", "fri"]
+intervals = [["08:00:00", "12:00:00"], ["13:00:00", "18:00:00"]]

@@ -8,9 +8,16 @@ through the single/self-consistency/repair paths and the stage layer, and the
 single-record default-kwarg regression anchor."""
 from __future__ import annotations
 
+import asyncio
+import asyncio as _asyncio
 import json
-from dataclasses import replace
+from dataclasses import replace, replace as _dc_replace
 from pathlib import Path
+from types import SimpleNamespace, SimpleNamespace as _NS
+
+import pytest as _pytest
+
+from labelkit.common.contracts.execution import TaskGroupRequest
 
 from labelkit.operators.annotate import (
     AnnotateStage,
@@ -20,9 +27,14 @@ from labelkit.operators.annotate import (
     _member_digest_lines,
     _voted_keys,
     annotate_member,
+    annotate_member_leaf,
     annotate_record,
+    annotate_record_leaf,
     build_annotate_prompt,
     build_frame_annotate_prompt,
+    class_annotate_schema,
+    class_effective_schema,
+    class_schema_text,
 )
 from labelkit.operators.annotate import AnnotatePromptOptions
 from labelkit.common.config.model import (
@@ -65,9 +77,13 @@ from labelkit.common.contracts.types import (
 )
 from labelkit.common.errors import (
     CircuitBreakerTripped,
+    ContextOverflowError,
+    OutputTruncatedError,
     ProviderFatalError,
     ProviderRetryableError,
+    SchemaViolation,
 )
+from labelkit.common.inference import budget as budget_mod
 
 USER_SCHEMA = {
     "type": "object",
@@ -82,6 +98,34 @@ USER_SCHEMA = {
 }
 
 SCHEMA_TEXT = json.dumps(USER_SCHEMA, ensure_ascii=False, separators=(", ", ": "))
+
+
+class _InlineTasks:
+    """TaskExecutor-shaped concurrent test runner with input-order results."""
+
+    def __init__(self):
+        self.requests: list[TaskGroupRequest] = []
+
+    async def run_group(self, request):
+        self.requests.append(request)
+        results = [None] * len(request.tasks)
+
+        async def run_one(index, spec):
+            results[index] = await spec.operation()
+
+        try:
+            async with asyncio.TaskGroup() as group:
+                for index, spec in enumerate(request.tasks):
+                    group.create_task(run_one(index, spec))
+        except BaseExceptionGroup as errors:
+            raise errors.exceptions[0] from None
+        return tuple(results)
+
+
+def _test_ctx(**values):
+    values.setdefault("tasks", _InlineTasks())
+    values.setdefault("task_namespace", "test:run:batch:1:stage:annotate")
+    return SimpleNamespace(**values)
 
 
 def make_cfg(*, modality="text", instruction="你是意图标注员。", examples=(),
@@ -412,7 +456,6 @@ def test_vote_no_voted_fields_takes_first_sample_without_disagreement():
 
 def test_callback_violation_kind_mapping(tmp_path):
     import asyncio
-    from types import SimpleNamespace
     from labelkit.common.errors import SchemaViolation
     from labelkit.common.contracts.types import PipelineItem
 
@@ -431,8 +474,8 @@ def test_callback_violation_kind_mapping(tmp_path):
         def count(self, key, n=1):
             pass
 
-    ctx = SimpleNamespace(cfg=cfg, schema_engine=RaisingEngine(), metrics=Metrics(),
-                          batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=RaisingEngine(), metrics=Metrics(),
+                    batch_no=1)
     stage = AnnotateStage(cfg)
     item = PipelineItem(record=text_record())
     asyncio.run(stage._annotate_item(item, ctx))
@@ -442,7 +485,6 @@ def test_callback_violation_kind_mapping(tmp_path):
 
 def test_schema_violation_kind_unchanged_without_flag(tmp_path):
     import asyncio
-    from types import SimpleNamespace
     from labelkit.common.errors import SchemaViolation
     from labelkit.common.contracts.types import PipelineItem
 
@@ -457,8 +499,8 @@ def test_schema_violation_kind_unchanged_without_flag(tmp_path):
         def event(self, ev, **kw): pass
         def count(self, key, n=1): pass
 
-    ctx = SimpleNamespace(cfg=cfg, schema_engine=RaisingEngine(), metrics=Metrics(),
-                          batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=RaisingEngine(), metrics=Metrics(),
+                    batch_no=1)
     stage = AnnotateStage(cfg)
     item = PipelineItem(record=text_record())
     asyncio.run(stage._annotate_item(item, ctx))
@@ -563,12 +605,11 @@ class _CapturingMetrics:
 
 def test_stage_passes_classification_label_and_event_carries_it():
     import asyncio
-    from types import SimpleNamespace
     from labelkit.common.contracts.types import PipelineItem
 
     cfg = make_classified_cfg()
     engine, metrics = _CapturingEngine(), _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
     item = PipelineItem(record=text_record(), classification=_classification("writing"))
     asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
 
@@ -583,12 +624,11 @@ def test_stage_passes_classification_label_and_event_carries_it():
 
 def test_annotate_done_without_classification_has_no_label():
     import asyncio
-    from types import SimpleNamespace
     from labelkit.common.contracts.types import PipelineItem
 
     cfg = make_classified_cfg()
     engine, metrics = _CapturingEngine(), _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
     item = PipelineItem(record=text_record())          # classification is None
     asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
 
@@ -601,11 +641,10 @@ def test_annotate_done_without_classification_has_no_label():
 
 def test_annotate_record_threads_label_through_sc_path():
     import asyncio
-    from types import SimpleNamespace
 
     cfg = make_classified_cfg(self_consistency=3)
     engine, metrics = _CapturingEngine(), _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
     ann = asyncio.run(annotate_record(text_record(), ctx,
                                       AnnotatePromptOptions(label="writing")))
 
@@ -827,7 +866,6 @@ def test_stage_threads_fragment_lens_from_stitch_duck_mark():
     from the stitch_fragments duck mark and threads it into the prompt — the
     quota keyframe set reaches the request."""
     import asyncio
-    from types import SimpleNamespace
     from labelkit.common.contracts.types import PipelineItem
 
     cfg = make_cfg(modality="ui", sequence_frames=4)
@@ -842,7 +880,7 @@ def test_stage_threads_fragment_lens_from_stitch_duck_mark():
          "source_episode": None},
     )
     engine, metrics = _CapturingEngine(), _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
     asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
     assert item.annotation is not None
     prompt = engine.prompts[0]
@@ -905,11 +943,10 @@ def test_sequence_repair_suffix_lands_on_digest_part_keeps_images():
 
 def test_annotate_record_threads_transitions_through_sc_path():
     import asyncio
-    from types import SimpleNamespace
 
     cfg = make_cfg(modality="ui", self_consistency=3)
     engine, metrics = _CapturingEngine(), _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
     ann = asyncio.run(annotate_record(
         ui_episode(3), ctx, AnnotatePromptOptions(transitions=SEQ_TRANSITIONS)))
 
@@ -924,11 +961,10 @@ def test_annotate_record_threads_transitions_through_sc_path():
 
 def test_annotate_record_threads_transitions_through_repair_path():
     import asyncio
-    from types import SimpleNamespace
 
     cfg = make_cfg(modality="ui")
     engine, metrics = _CapturingEngine(), _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
     repair = RepairContext(previous_output={"intent": "qa"}, critiques_text="a: b")
     asyncio.run(annotate_record(ui_episode(2), ctx,
                                 AnnotatePromptOptions(
@@ -946,12 +982,11 @@ def test_annotate_record_threads_transitions_through_repair_path():
 
 def test_stage_passes_item_transitions():
     import asyncio
-    from types import SimpleNamespace
     from labelkit.common.contracts.types import PipelineItem
 
     cfg = make_cfg(modality="ui")
     engine, metrics = _CapturingEngine(), _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
     item = PipelineItem(record=ui_episode(2), transitions=SEQ_TRANSITIONS)
     asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
 
@@ -984,13 +1019,6 @@ def test_single_record_transitions_default_none_regression():
 
 
 # ── v1.11 context-budget packing (spec 3.5.2 v1.11 段, §3.3⑥/V20/V27①) ───────
-
-import asyncio as _asyncio
-from dataclasses import replace as _dc_replace
-from types import SimpleNamespace as _NS
-
-from labelkit.common.errors import ContextOverflowError, OutputTruncatedError
-from labelkit.common.runtime import budget as budget_mod
 
 
 def _budget_profile(context_window: int, name: str = "default"):
@@ -1030,8 +1058,8 @@ class _BudgetMetrics:
 
 
 def budget_ctx(cfg, engine, image_cost: int = 300) -> _NS:
-    return _NS(cfg=cfg, llm=_NS(calibrator=_FixedCalibrator(image_cost)),
-               schema_engine=engine, metrics=_BudgetMetrics(), batch_no=1)
+    return _test_ctx(cfg=cfg, llm=_NS(calibrator=_FixedCalibrator(image_cost)),
+                     schema_engine=engine, metrics=_BudgetMetrics(), batch_no=1)
 
 
 class _PromptEngine:
@@ -1196,8 +1224,8 @@ def test_budget_off_no_degrade_and_precise_kinds():
             raise exc
 
     engine = _Overflowing()
-    ctx = _NS(cfg=cfg, llm=None, schema_engine=engine,
-              metrics=_BudgetMetrics(), batch_no=1)
+    ctx = _test_ctx(cfg=cfg, llm=None, schema_engine=engine,
+                    metrics=_BudgetMetrics(), batch_no=1)
     from labelkit.common.contracts.types import PipelineItem
     item = PipelineItem(record=text_record())
     _asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
@@ -1213,16 +1241,14 @@ def test_budget_off_no_degrade_and_precise_kinds():
         async def complete_validated(self, *a, **k):
             raise OutputTruncatedError("cap")
 
-    ctx2 = _NS(cfg=cfg, llm=None, schema_engine=_Truncating(),
-               metrics=_BudgetMetrics(), batch_no=1)
+    ctx2 = _test_ctx(cfg=cfg, llm=None, schema_engine=_Truncating(),
+                     metrics=_BudgetMetrics(), batch_no=1)
     _asyncio.run(AnnotateStage(cfg)._annotate_item(item2, ctx2))
     assert item2.errors[0].kind == "output_truncated"
     assert "budget.overflow_records" not in ctx2.metrics.counters
 
 
 # ── v1.12 frame-level per-member annotation (SPEC-frame-annotation §3.3) ─────
-
-from labelkit.common.errors import SchemaViolation
 
 FRAME_SCHEMA = {
     "type": "object",
@@ -1316,7 +1342,7 @@ class _FrameMetrics:
 def run_annotate_item(cfg, item, engine=None, metrics=None):
     engine = engine or _FrameEngine()
     metrics = metrics or _FrameMetrics()
-    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
     _asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
     return engine, metrics
 
@@ -1392,7 +1418,7 @@ def test_frame_prompt_class_view_override_and_global_fallback():
 def test_annotate_member_routes_explicit_frame_schema():
     cfg = make_frame_cfg()
     engine, metrics = _FrameEngine(), _FrameMetrics()
-    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=3)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=3)
     member = text_member(0)
     ann = _asyncio.run(annotate_member(member, ctx))
     assert ann is not None
@@ -1410,7 +1436,7 @@ def test_annotate_member_failure_swallows_counts_and_returns_none():
     member = text_member(0)
     engine = _FrameEngine(fail_ids={member.id})
     metrics = _FrameMetrics()
-    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
     ann = _asyncio.run(annotate_member(member, ctx))    # 不抛（成员级隔离）
     assert ann is None
     assert metrics.counters == {"frame_annotate.failed": 1}
@@ -1687,14 +1713,6 @@ def test_frame_event_excerpt_discipline_by_tier():
 
 # ── v1.13 按序列类标注 Schema（裁决·按类标注 Schema，SPEC §3.4 六消费点）─────
 
-import pytest as _pytest
-
-from labelkit.operators.annotate import (
-    class_annotate_schema,
-    class_effective_schema,
-    class_schema_text,
-)
-
 CLASS_SCHEMA = {
     "type": "object",
     "properties": {
@@ -1764,8 +1782,8 @@ def test_class_schema_text_computed_per_class():
 def test_class_schema_call_routes_explicit_schema_with_user_treatment():
     cfg = schema_cfg()
     engine = _SchemaRoutingEngine()
-    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(),
-              batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(),
+                    batch_no=1)
     record = text_record()
     item = PipelineItem(record=record,
                         classification=_classification("writing"))
@@ -1786,8 +1804,8 @@ def test_class_schema_call_routes_explicit_schema_with_user_treatment():
 def test_class_without_schema_keeps_v112_call_shape():
     cfg = schema_cfg()
     engine = _SchemaRoutingEngine()
-    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(),
-              batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(),
+                    batch_no=1)
     zero_override = PipelineItem(record=text_record(),
                                  classification=_classification("qa"))
     unclassified = PipelineItem(record=text_record())       # classification None
@@ -1809,16 +1827,16 @@ def test_self_consistency_vote_uses_class_effective_schema():
     cfg = schema_cfg(self_consistency=3)
 
     engine = _SchemaRoutingEngine(list(samples))
-    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(),
-              batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(),
+                    batch_no=1)
     ann = _asyncio.run(annotate_record(text_record(), ctx,
                                        AnnotatePromptOptions(label="writing")))
     assert ann.output == {"task": "B", "kind": "cancel"}      # kind 多数派
     assert ann.sc == {"n": 3, "agreement_ratio": 2 / 3}
 
     engine2 = _SchemaRoutingEngine(list(samples))
-    ctx2 = _NS(cfg=cfg, schema_engine=engine2, metrics=_CapturingMetrics(),
-               batch_no=1)
+    ctx2 = _test_ctx(cfg=cfg, schema_engine=engine2, metrics=_CapturingMetrics(),
+                     batch_no=1)
     ann2 = _asyncio.run(annotate_record(text_record(), ctx2,
                                         AnnotatePromptOptions(label="qa")))
     assert ann2.output == {"task": "A", "kind": "book"}       # 无分歧，取样本 #1
@@ -1873,7 +1891,7 @@ def _run_stage(cfg, batch, engine=None, metrics=None):
     """
     engine = engine or _FrameEngine()
     metrics = metrics or _FrameMetrics()
-    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
     returned = _asyncio.run(AnnotateStage(cfg).run(batch, ctx))
     return returned, engine, metrics
 
@@ -1951,7 +1969,7 @@ def test_sc_full_disagreement_counts_the_report_counter():
     cfg = make_cfg(self_consistency=3)
     engine = _SchemaRoutingEngine(list(samples))
     metrics = _FrameMetrics()
-    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
     ann = _asyncio.run(annotate_record(text_record(), ctx))
 
     assert ann.output == samples[0]              # 平局回退首样本
@@ -1966,7 +1984,7 @@ def test_sc_agreement_leaves_the_disagreement_counter_untouched():
     cfg = make_cfg(self_consistency=3)
     engine = _SchemaRoutingEngine(list(agreeing))
     metrics = _FrameMetrics()
-    ctx = _NS(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
     ann = _asyncio.run(annotate_record(text_record(), ctx))
 
     assert ann.sc == {"n": 3, "agreement_ratio": 2 / 3}   # 明显多数派
@@ -2007,8 +2025,8 @@ def test_annotate_attempt_seam_propagates_terminal_errors_without_dataset_commit
     metrics = AttemptMetrics()
     item = PipelineItem(record=text_record())
     transaction = AttemptTransaction((item,), {}, ())
-    context = _NS(cfg=cfg, llm=None, schema_engine=None, metrics=metrics,
-                  rng=None, batch_no=1)
+    context = _test_ctx(cfg=cfg, llm=None, schema_engine=None, metrics=metrics,
+                        rng=None, batch_no=1)
     request = DownstreamAttemptRequest(transaction, context)
     stage = AnnotateStage(cfg)
 
@@ -2017,9 +2035,13 @@ def test_annotate_attempt_seam_propagates_terminal_errors_without_dataset_commit
         raise error
 
     monkeypatch.setattr(stage, "run", fail)
-    with _pytest.raises(type(error)) as caught:
-        _asyncio.run(stage.run_attempt(request))
-    assert caught.value is error
+    if isinstance(error, ProviderRetryableError):
+        result = _asyncio.run(stage.run_attempt(request))
+        assert not result.accepted and result.rejected_stage == "annotate"
+    else:
+        with _pytest.raises(type(error)) as caught:
+            _asyncio.run(stage.run_attempt(request))
+        assert caught.value is error
     assert metrics.counters == {}
 
 
@@ -2070,15 +2092,19 @@ def test_frame_annotate_attempt_seam_propagates_provider_errors_without_commit(e
     item = PipelineItem(record=text_episode(3))
     transaction = AttemptTransaction((item,), {}, ())
     engine = FailingFrameEngine()
-    context = _NS(
+    context = _test_ctx(
         cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
         rng=None, batch_no=1,
     )
     request = DownstreamAttemptRequest(transaction, context)
 
-    with _pytest.raises(type(error)) as caught:
-        _asyncio.run(AnnotateStage(cfg).run_attempt(request))
-    assert caught.value is error
+    if isinstance(error, ProviderRetryableError):
+        result = _asyncio.run(AnnotateStage(cfg).run_attempt(request))
+        assert not result.accepted and result.rejected_stage == "annotate"
+    else:
+        with _pytest.raises(type(error)) as caught:
+            _asyncio.run(AnnotateStage(cfg).run_attempt(request))
+        assert caught.value is error
     assert item.annotation is not None
     assert engine.started == 3
     assert metrics.counters == {}
@@ -2114,7 +2140,7 @@ def test_frame_only_attempt_has_zero_sequence_calls_and_accepts_all_members():
     item = PipelineItem(record=text_episode(3))
     transaction = AttemptTransaction((item,), {}, ())
     engine, metrics = _FrameEngine(), AttemptMetrics()
-    context = _NS(
+    context = _test_ctx(
         cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
         rng=None, batch_no=1,
     )
@@ -2127,3 +2153,181 @@ def test_frame_only_attempt_has_zero_sequence_calls_and_accepts_all_members():
     assert all(value is not None for value in item.member_annotations.values())
     assert result.dataset_counters == {"frame_annotate.annotated": 3}
     assert metrics.counters == {}
+
+
+def test_self_consistency_reverse_completion_keeps_declaration_first_sample():
+    """sample 2→1→0 完成仍以 sample 0 的自由文本定稿。"""
+    class ReverseEngine:
+        user_schema_text = SCHEMA_TEXT
+
+        def __init__(self):
+            self.started = 0
+            self.completion = []
+            self.release = [asyncio.Event(), asyncio.Event()]
+
+        async def complete_validated(self, *args, **kwargs):
+            index = self.started
+            self.started += 1
+            if index < 2:
+                await self.release[index].wait()
+            self.completion.append(index)
+            if index == 2:
+                self.release[1].set()
+            elif index == 1:
+                self.release[0].set()
+            obj = {"intent": "qa", "topic": f"sample-{index}", "difficulty": "easy"}
+            return obj, Usage(1, 1), 1, "m"
+
+    cfg = make_cfg(self_consistency=3)
+    engine, metrics, tasks = ReverseEngine(), _FrameMetrics(), _InlineTasks()
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1,
+                    tasks=tasks)
+    annotation = asyncio.run(annotate_record(text_record(), ctx))
+
+    assert engine.completion == [2, 1, 0]
+    assert annotation.output["topic"] == "sample-0"
+    assert [[task.task_id for task in request.tasks] for request in tasks.requests] == [[
+        "test:run:batch:1:stage:annotate:annotate:0",
+        "test:run:batch:1:stage:annotate:annotate:1",
+        "test:run:batch:1:stage:annotate:annotate:2",
+    ]]
+
+
+def test_self_consistency_schema_violation_abstains_without_cancelling_samples():
+    """SchemaViolation 样本弃权，其他样本仍全部完成并参与投票。"""
+    class AbstainEngine:
+        user_schema_text = SCHEMA_TEXT
+
+        def __init__(self):
+            self.calls = 0
+
+        async def complete_validated(self, *args, **kwargs):
+            index = self.calls
+            self.calls += 1
+            if index == 0:
+                raise SchemaViolation(["/intent: invalid"], "{}")
+            obj = {"intent": "qa", "topic": f"valid-{index}", "difficulty": "easy"}
+            return obj, Usage(1, 1), 1, "m"
+
+    cfg, engine = make_cfg(self_consistency=3), AbstainEngine()
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=_FrameMetrics(), batch_no=1)
+    annotation = asyncio.run(annotate_record(text_record(), ctx))
+
+    assert engine.calls == 3
+    assert annotation.output["topic"] == "valid-1"
+    assert annotation.sc == {"n": 3, "agreement_ratio": 2 / 3}
+
+
+def test_stage_waits_for_sample_wave_before_frame_wave():
+    """frame 叶只能在全部 sequence samples 完成后启动。"""
+    class BarrierEngine(_FrameEngine):
+        def __init__(self):
+            super().__init__()
+            self.sequence_started = 0
+            self.sequence_completed = 0
+            self.sequence_gate = asyncio.Event()
+            self.frame_started_before_barrier = False
+
+        async def complete_validated(self, profile, prompt, schema=None, *, scope):
+            if schema is not None:
+                self.frame_started_before_barrier |= self.sequence_completed != 3
+                return await super().complete_validated(
+                    profile, prompt, schema=schema, scope=scope,
+                )
+            self.sequence_started += 1
+            if self.sequence_started == 3:
+                self.sequence_gate.set()
+            await self.sequence_gate.wait()
+            self.sequence_completed += 1
+            return await super().complete_validated(
+                profile, prompt, schema=schema, scope=scope,
+            )
+
+    cfg = make_frame_cfg(self_consistency=3)
+    item = PipelineItem(record=text_episode(2))
+    engine, metrics, tasks = BarrierEngine(), _FrameMetrics(), _InlineTasks()
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1,
+                    tasks=tasks)
+    asyncio.run(AnnotateStage(cfg).run([item], ctx))
+
+    assert not engine.frame_started_before_barrier
+    assert [len(request.tasks) for request in tasks.requests] == [3, 2]
+    assert item.annotation is not None and len(item.member_annotations) == 2
+
+
+def test_ordinary_provider_fatal_isolates_record_and_keeps_sibling():
+    """ordinary ProviderFatal 是记录 outcome，不取消同批 sibling。"""
+    class FatalEngine(_FrameEngine):
+        async def complete_validated(self, profile, prompt, schema=None, *, scope):
+            if scope.record_ids == ("fatal-record",):
+                raise ProviderFatalError("fatal", "default", 401)
+            return await super().complete_validated(
+                profile, prompt, schema=schema, scope=scope,
+            )
+
+    cfg = make_cfg()
+    fatal = PipelineItem(record=replace(text_record(), id="fatal-record"))
+    sibling = PipelineItem(record=replace(text_record("sibling"), id="sibling-record"))
+    returned, _engine, _metrics = _run_stage(cfg, [fatal, sibling], engine=FatalEngine())
+
+    assert returned == [fatal, sibling]
+    assert fatal.status == "failed" and fatal.errors[0].kind == "provider_fatal"
+    assert sibling.status == "active" and sibling.annotation is not None
+
+
+def test_circuit_breaker_cancels_sibling_and_waits_for_cleanup():
+    """CircuitBreaker 逃逸时 sibling finally 已收敛。"""
+    class CancelEngine(_FrameEngine):
+        def __init__(self):
+            super().__init__()
+            self.started = 0
+            self.all_started = asyncio.Event()
+            self.cancelled = False
+
+        async def complete_validated(self, profile, prompt, schema=None, *, scope):
+            self.started += 1
+            if self.started == 2:
+                self.all_started.set()
+            await self.all_started.wait()
+            if scope.record_ids == ("breaker-record",):
+                raise CircuitBreakerTripped("breaker")
+            try:
+                await asyncio.Event().wait()
+            finally:
+                self.cancelled = True
+
+    cfg = make_cfg()
+    breaker = PipelineItem(record=replace(text_record(), id="breaker-record"))
+    sibling = PipelineItem(record=replace(text_record("sibling"), id="waiting-record"))
+    engine = CancelEngine()
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=_FrameMetrics(), batch_no=1)
+    with _pytest.raises(CircuitBreakerTripped):
+        asyncio.run(AnnotateStage(cfg).run([breaker, sibling], ctx))
+    assert engine.cancelled
+
+
+def test_disabled_annotate_and_frame_stage_submits_zero_tasks():
+    """两个开关都关闭时不提交空叶或构造调用。"""
+    cfg = replace(make_cfg(), annotate=replace(make_cfg().annotate, enabled=False))
+    tasks = _InlineTasks()
+    ctx = _test_ctx(cfg=cfg, schema_engine=_FrameEngine(), metrics=_FrameMetrics(),
+                    batch_no=1, tasks=tasks)
+    item = PipelineItem(record=text_episode(2))
+    asyncio.run(AnnotateStage(cfg).run([item], ctx))
+    assert tasks.requests == [] and item.annotation is None
+    assert item.member_annotations is None
+
+
+def test_verify_leaf_seams_never_submit_nested_task_groups():
+    """无调度 seam 可作为 verify TaskSpec.operation，不会 nested submit。"""
+    cfg = make_frame_cfg()
+    engine, tasks = _FrameEngine(), _InlineTasks()
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=_FrameMetrics(),
+                    batch_no=1, tasks=tasks)
+    repair = RepairContext(previous_output={"intent": "qa"}, critiques_text="a: b")
+    record_annotation = asyncio.run(annotate_record_leaf(
+        text_record(), ctx, AnnotatePromptOptions(repair=repair),
+    ))
+    member_annotation = asyncio.run(annotate_member_leaf(text_member(0), ctx))
+    assert record_annotation is not None and member_annotation is not None
+    assert tasks.requests == []

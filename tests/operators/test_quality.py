@@ -21,8 +21,8 @@ single-record default-kwarg regression anchor.
 from __future__ import annotations
 
 import asyncio
-import math
 import random
+import re
 from dataclasses import replace
 from pathlib import Path
 
@@ -54,13 +54,17 @@ from labelkit.common.config.model import (
 )
 from labelkit.common.errors import (
     CircuitBreakerTripped,
+    ContextOverflowError,
+    OutputTruncatedError,
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
 )
+from labelkit.common.inference import budget as budget_mod
 from labelkit.operators.quality import (
     AGGREGATE_KEY,
     QualityStage,
+    _CallFit,
     _build_pairwise_prompt,
     _Comparison,
     _build_pointwise_prompt,
@@ -162,6 +166,31 @@ class Recorder:
         return [p for ev, p in self.events if ev == ev_name]
 
 
+class TaskRunner:
+    """Execute immutable test leaves concurrently and return input-order results."""
+
+    def __init__(self):
+        self.requests = []
+
+    async def run_group(self, request):
+        self.requests.append(request)
+        results = [None] * len(request.tasks)
+        created = []
+
+        async def run_one(index, spec):
+            results[index] = await spec.operation()
+
+        try:
+            async with asyncio.TaskGroup() as group:
+                for index, spec in enumerate(request.tasks):
+                    created.append(group.create_task(run_one(index, spec)))
+        except BaseExceptionGroup as group:
+            raise group.exceptions[0]
+        if any(task.cancelled() for task in created):
+            raise asyncio.CancelledError
+        return tuple(results)
+
+
 def make_record(rec_id: str, text: str = "样例文本") -> Record:
     return Record(id=rec_id, modality="text", text=text, raw={"text": text},
                   ui_tree=None, image=None,
@@ -178,10 +207,12 @@ def make_item(rec_id: str, aggregate: float | None,
 
 
 def make_ctx(cfg: ResolvedConfig, metrics: Recorder | None = None,
-             seed: str = "0:1:quality", engine=None) -> RunContext:
+             seed: str = "0:1:quality", engine=None, tasks=None) -> RunContext:
     return RunContext(cfg=cfg, llm=None, schema_engine=engine,
                       metrics=metrics or Recorder(),
-                      rng=random.Random(seed), batch_no=1)
+                      rng=random.Random(seed), batch_no=1,
+                      tasks=tasks or TaskRunner(),
+                      task_namespace="run:batch:1:stage:quality")
 
 
 @pytest.mark.parametrize("error", [
@@ -230,6 +261,49 @@ def test_quality_attempt_seam_propagates_terminal_errors_without_dataset_commit(
         asyncio.run(stage.run_attempt(request))
     assert caught.value is error
     assert metrics.counters == {}
+
+
+async def test_sequence_attempt_provider_fatal_cancels_but_retryable_rejects():
+    from contextlib import contextmanager
+    from labelkit.common.contracts.generation import (
+        AttemptTransaction,
+        DownstreamAttemptRequest,
+    )
+
+    class AttemptRecorder(Recorder):
+        @contextmanager
+        def capture_counts(self):
+            counters = {}
+            yield counters
+
+    class FailingEngine:
+        def __init__(self, error):
+            self.error = error
+
+        async def complete_validated(self, *args, **kwargs):
+            raise self.error
+
+    cfg = make_cfg(QualityConfig(enabled=True, mode="pointwise"))
+    fatal = ProviderFatalError("fatal", "default", 401)
+    fatal_item = PipelineItem(record=make_record("fatal"))
+    fatal_request = DownstreamAttemptRequest(
+        AttemptTransaction((fatal_item,), {}, ()),
+        make_ctx(cfg, AttemptRecorder(), engine=FailingEngine(fatal)),
+    )
+    with pytest.raises(ProviderFatalError) as caught:
+        await QualityStage(cfg).run_attempt(fatal_request)
+    assert caught.value is fatal
+    assert fatal_item.status == "active" and fatal_item.errors == []
+
+    retryable = ProviderRetryableError("retryable", "default", 5)
+    retryable_item = PipelineItem(record=make_record("retryable"))
+    retryable_request = DownstreamAttemptRequest(
+        AttemptTransaction((retryable_item,), {}, ()),
+        make_ctx(cfg, AttemptRecorder(), engine=FailingEngine(retryable)),
+    )
+    result = await QualityStage(cfg).run_attempt(retryable_request)
+    assert result.accepted is False and result.rejected_stage == "quality"
+    assert retryable_item.errors[0].kind == "provider_retryable_exhausted"
 
 
 # ── Bradley-Terry fit ─────────────────────────────────────────────────────────
@@ -471,6 +545,26 @@ async def test_pairwise_batch_of_one_fixed_half():
         "comparisons": 0, "wins": 0, "ties": 0, "log_theta": 0.0}
     assert item.scores[AGGREGATE_KEY].score == 0.5
     assert item.scores[AGGREGATE_KEY].detail == {}
+
+
+async def test_pairwise_single_item_submits_an_empty_task_group():
+    cfg = make_cfg(QualityConfig(mode="pairwise"))
+    tasks = TaskRunner()
+    batch = [PipelineItem(record=make_record("solo"))]
+
+    await QualityStage(cfg).run(batch, make_ctx(cfg, tasks=tasks))
+
+    request, = tasks.requests
+    assert request.tasks == ()
+
+
+async def test_empty_active_batch_does_not_submit_a_task_group():
+    cfg = make_cfg(QualityConfig(mode="pointwise"))
+    tasks = TaskRunner()
+
+    await QualityStage(cfg).run([], make_ctx(cfg, tasks=tasks))
+
+    assert tasks.requests == []
 
 
 async def test_stage_skips_non_active_items():
@@ -1179,12 +1273,6 @@ def test_single_record_paths_unchanged_by_default_kwargs():
 
 # ── v1.11 context-budget packing (spec 3.4.3 上下文预算装填 row, V10/V20/V27①) ─
 
-import re
-
-from labelkit.common.errors import ContextOverflowError, OutputTruncatedError
-from labelkit.common.runtime import budget as budget_mod
-from labelkit.operators.quality import _CallFit, _pairwise_system_text
-
 
 def _budget_profile(context_window: int, name: str = "default"):
     from labelkit.common.config.model import LLMProfile
@@ -1220,7 +1308,9 @@ def budget_ctx(cfg, metrics=None, engine=None, image_cost: int = 100) -> RunCont
     return RunContext(cfg=cfg,
                       llm=SimpleNamespace(calibrator=_FixedCalibrator(image_cost)),
                       schema_engine=engine, metrics=metrics or Recorder(),
-                      rng=random.Random("0:1:quality"), batch_no=1)
+                      rng=random.Random("0:1:quality"), batch_no=1,
+                      tasks=TaskRunner(),
+                      task_namespace="run:batch:1:stage:quality")
 
 
 def big_ui_record(rec_id: str, n: int = 80) -> Record:
@@ -1286,7 +1376,7 @@ def test_sequence_step_lines_edges_trimmed_under_share():
     step_lines = lines[steps_start:steps_end]
     assert step_lines[0].startswith("0. click")            # first step kept
     assert step_lines[-1].startswith("11. click")          # last step kept
-    assert any(re.fullmatch(r"…\(truncated \d+ lines\)", l) for l in step_lines)
+    assert any(re.fullmatch(r"…\(truncated \d+ lines\)", line) for line in step_lines)
     # digest block intact (not the trim target here)
     assert lines[steps_end + 1].startswith("1. ")
 
@@ -1473,6 +1563,63 @@ FACTUALITY = Criterion(
 THREE_CRITERIA = (EDU, CLARITY, FACTUALITY)
 
 
+class ReversePointwiseEngine:
+    """Finish three criterion calls in reverse declaration order."""
+
+    def __init__(self, item, metrics):
+        self.item = item
+        self.metrics = metrics
+        self.release_first = asyncio.Event()
+        self.release_second = asyncio.Event()
+        self.completion_order = []
+
+    async def complete_validated(self, profile, prompt, schema=None, *, scope):
+        key = schema["properties"]["scores"]["items"]["properties"][
+            "criterion"]["enum"][0]
+        if key == EDU.key:
+            await self.release_first.wait()
+            self.completion_order.append(key)
+            raise ProviderRetryableError("first failed", profile, 5)
+        if key == CLARITY.key:
+            await self.release_second.wait()
+            self.completion_order.append(key)
+            self.release_first.set()
+            return ({"scores": [{"criterion": key, "reason": "ok", "score": 4}]},
+                    None, 1, "stub-model")
+        assert self.item.errors == [] and self.item.scores == {}
+        assert self.metrics.events == []
+        self.completion_order.append(key)
+        self.release_second.set()
+        raise ProviderFatalError("third failed", profile, 401)
+
+
+async def test_pointwise_reverse_completion_reduces_shared_writes_in_declaration_order():
+    cfg = make_cfg(QualityConfig(mode="pointwise"), criteria=THREE_CRITERIA)
+    item = PipelineItem(record=make_record("reverse"))
+    metrics = Recorder()
+    engine = ReversePointwiseEngine(item, metrics)
+    tasks = TaskRunner()
+
+    await QualityStage(cfg).run(
+        [item], make_ctx(cfg, metrics, engine=engine, tasks=tasks),
+    )
+
+    assert engine.completion_order == [FACTUALITY.key, CLARITY.key, EDU.key]
+    assert [error.kind for error in item.errors] == [
+        "provider_retryable_exhausted", "provider_fatal"]
+    assert "educational_value" in item.errors[0].message
+    assert "factuality" in item.errors[1].message
+    assert list(item.scores) == [CLARITY.key, AGGREGATE_KEY]
+    assert item.scores[CLARITY.key].score == 0.8
+    assert item.scores[AGGREGATE_KEY].score == 0.8
+    assert item.status == "failed"
+    assert [event for event, _payload in metrics.events] == [
+        "error", "quality.pointwise", "error"]
+    request, = tasks.requests
+    assert [spec.declaration_key for spec in request.tasks] == [
+        (1, 5, 0), (1, 5, 1), (1, 5, 2)]
+
+
 def _system_texts(engine) -> list[str]:
     return [p.messages[0].parts[0].text for p in engine.prompts]
 
@@ -1541,7 +1688,7 @@ async def test_criteria_per_call_all_keeps_one_call_for_every_criterion():
 
 async def test_criteria_per_call_switch_is_score_equivalent():
     # spec 3.4.4 末句「切换零迁移成本」的成对侧读法：两档的抽签、BT 输入与最终分逐条
-    # 相等——只有调用数不同。估算侧（orchestrator._estimate_quality_calls）的
+    # 相等——只有调用数不同。估算侧（ProcessWorkflow._estimate_quality_calls）的
     # per_call 乘子取 n_criteria，与此处实测调用数在零丢弃前提下**取等号**。
     all_batch, all_engine, all_rec = await _run_criteria_per_call("all")
     single_batch, single_engine, single_rec = await _run_criteria_per_call("single")
@@ -1646,12 +1793,14 @@ async def test_multi_judge_writes_one_judgment_event_per_judge():
     # 呈现顺序」独立裁决，trace 中每 judge 各写一条 quality.judgment 事件。
     cfg = make_cfg(QualityConfig(mode="pairwise", rounds=1,
                                  judges=("a", "b", "c")))
+    cfg = replace(cfg, output=replace(cfg.output, repair_llm="repair"))
     batch = _two_record_batch()
     engine = OrderAwareEngine({("a", "r0"): "r0", ("a", "r1"): "r0",
                                ("b", "r0"): "r0", ("b", "r1"): "r0",
                                ("c", "r0"): "r1", ("c", "r1"): "r1"})
     rec = Recorder()
-    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=engine))
+    tasks = TaskRunner()
+    await QualityStage(cfg).run(batch, make_ctx(cfg, rec, engine=engine, tasks=tasks))
 
     events = rec.of("quality.judgment")
     assert len(events) == 3                            # 每 judge 一条
@@ -1659,6 +1808,9 @@ async def test_multi_judge_writes_one_judgment_event_per_judge():
     # 同一呈现顺序广播全团：三条事件的 order 字段完全相同
     assert len({frozenset(p["payload"]["order"].items()) for p in events}) == 1
     assert [profile for profile, _ in engine.seen] == ["a", "b", "c"]
+    request, = tasks.requests
+    assert [spec.resource_key for spec in request.tasks] == [
+        ("llm", "a"), ("llm", "b"), ("llm", "c")]
     # BT 取多数结果：a、b 判 r0 胜（2/3 过半）⇒ r0 得 1.0、r1 得 0.0
     scores = {it.record.id: it.scores[AGGREGATE_KEY].score for it in batch}
     assert scores == {"r0": 1.0, "r1": 0.0}
@@ -1713,10 +1865,10 @@ def _poison_pool_stage(monkeypatch, which: str, victim: str | None):
         return
     real_method = getattr(QualityStage, _POOL_STAGES[which])
 
-    def broken(self, pool, ctx):
+    def broken(self, pool, *args):
         if pool.pool == victim:
             raise _Boom(f"{which} broken")
-        return real_method(self, pool, ctx)
+        return real_method(self, pool, *args)
     monkeypatch.setattr(QualityStage, _POOL_STAGES[which], broken)
 
 
@@ -1811,10 +1963,8 @@ async def test_pool_guards_never_swallow_run_level_control_flow(
 
 
 @pytest.mark.parametrize("exc_cls", [CircuitBreakerTripped, asyncio.CancelledError])
-async def test_guarded_call_never_swallows_run_level_control_flow(exc_cls):
-    # 第五道兜底（_guarded_call）：逃出单次判定处置的运行级控制流照样上抛，
-    # 中断合并 gather——吞掉它会让熔断器形同虚设。（KeyboardInterrupt 在 gather 子
-    # 任务里由 asyncio 直接重抛进事件循环，不经本兜底，故只在同步四段上断言。）
+async def test_quality_leaf_never_swallows_run_level_control_flow(exc_cls):
+    # 叶任务的运行级控制流必须逃出普通 outcome，交给 TaskExecutor 做结构化取消。
     cfg = make_pooled_cfg({"a": QualityConfig(mode="pairwise", rounds=1)})
 
     class ControlFlowEngine:

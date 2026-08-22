@@ -166,13 +166,18 @@ role、owner、world branch、source ID 或行数都会 fail closed；不要通�
 再结合 `sequence_slot_attempts`、`noise_slot_attempts`、`sequence_calls`、`llm_usage` 和 trace 区分：
 
 - state/frame/coupling/pattern/semantic：修指令、Schema、权限或声明，不要放宽独立 evaluator；
-- dedup/quality/annotate/verify：失败发生在真实下游，整组数据与 dedup token 已回滚；
+- dedup/quality/annotate/verify：失败发生在真实下游；DedupReservation、候选数据与 dataset delta 已清理；
 - reconcile：main/stream 的 role、owner、ID 或成员集合不一致；
 - memory budget：按最终 main+stream canonical UTF-8 核算，不能截断 truth 通过；
 - provider retryable exhausted：消耗一次 attempt；provider fatal 则直接 exit 4、零 retry。
 
 耗尽后检查独立 failed report；此前成功 main、stream、report、manifest 应保持不变。commit-I/O 失败则可能留下
 固定路径混代，必须以旧 manifest 的 hashes 检出并拒绝。
+
+如果“端点很快但整轮仍慢”，先读 report 的 `runtime`：`resource_wait_ms` 高说明逻辑 profile 饱和；
+`http_pool_wait_ms` 高说明同 origin 的 HTTP attempt 在排队；`commit_waiting_high_water` 持续高且 `commit_ms` 占墙钟大，
+说明声明序短 commit 的增量索引需要优化；`queue_high_water` 高而 `running_high_water` 低，检查 TaskSpec 指向的首轮
+ResourceKey 是否正确。不要通过放松声明序、跳过 dedup/CrossView 或把昂贵下游重新串行化来“消除”队列。
 
 ### 「运行频繁被 429 限流拖慢 / 中断」
 

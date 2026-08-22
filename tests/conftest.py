@@ -28,6 +28,7 @@ ZAI_KEY_ENV = "LABELKIT_ZAI_KEY"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
 DEEPSEEK_MODEL = "deepseek-v4-flash"
 DEEPSEEK_KEY_ENV = "LABELKIT_DEEPSEEK_KEY"
+LOCAL_LLM_KEY_ENV = "LABELKIT_LOCAL_KEY"
 
 
 def pytest_collection_modifyitems(config, items):
@@ -43,9 +44,12 @@ def pytest_collection_modifyitems(config, items):
         if "deepseek" in item.keywords and not os.environ.get(DEEPSEEK_KEY_ENV):
             reason = f"{DEEPSEEK_KEY_ENV} not set; DeepSeek integration requires the real endpoint"
             item.add_marker(pytest.mark.skip(reason=reason))
+        elif "local_llm" in item.keywords and not os.environ.get(LOCAL_LLM_KEY_ENV):
+            reason = f"{LOCAL_LLM_KEY_ENV} not set; local LLM integration requires the real endpoint"
+            item.add_marker(pytest.mark.skip(reason=reason))
         elif "zai" in item.keywords and not os.environ.get(ZAI_KEY_ENV):
             reason = f"{ZAI_KEY_ENV} not set; z.ai integration requires the real endpoint"
             item.add_marker(pytest.mark.skip(reason=reason))
-        elif not ({"deepseek", "zai"} & set(item.keywords)) and not os.environ.get(ZAI_KEY_ENV):
+        elif not ({"deepseek", "local_llm", "zai"} & set(item.keywords)) and not os.environ.get(ZAI_KEY_ENV):
             reason = f"{ZAI_KEY_ENV} not set; integration requires the real z.ai endpoint"
             item.add_marker(pytest.mark.skip(reason=reason))

@@ -56,7 +56,7 @@ from labelkit.common.extensions.hooks import (
     load_hook,
     probe_hook,
 )
-from labelkit.common.runtime import budget
+from labelkit.common.inference import budget
 
 
 @dataclass(frozen=True)

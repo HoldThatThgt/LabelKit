@@ -52,6 +52,7 @@ from labelkit.common.errors import (
     ProviderRetryableError,
     SchemaViolation,
 )
+from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
 from labelkit.common.contracts.generation import DownstreamAttemptRequest, DownstreamAttemptResult
 from labelkit.common.contracts.types import (
     Annotation,
@@ -63,9 +64,9 @@ from labelkit.common.contracts.types import (
     frame_digest,
 )
 
-from labelkit.common.runtime import budget
-from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
-from labelkit.common.runtime.schema_engine import CallScope, _thaw_json
+from labelkit.common.inference import budget
+from labelkit.common.inference.llm_client import Message, Part, PromptBundle
+from labelkit.common.inference.schema_engine import CallScope, _thaw_json
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import AnnotateConfig, LLMProfile, ResolvedConfig
@@ -106,7 +107,7 @@ _FRAME_LABEL_MEMBER = "[成员帧]"
 # 跨层等式载体：帧级系统侧完整静态脚手架（[任务] 标签 + Schema 约束句——生效
 # 指令与帧 Schema 文本是配置量，在 M1 静态预算预检（V13③）各自计量）。
 # budget.TEMPLATE_HEAD_TOKENS["frame_annotate"] 钉住 est_text(本常量)，
-# tests/common/runtime/test_budget.py 的跨层等式测试守护两侧同步。
+# tests/common/inference/test_budget.py 的跨层等式测试守护两侧同步。
 _FRAME_SYSTEM_STATIC = f"{_FRAME_LABEL_TASK}\n{_SCHEMA_SENTENCE}"
 
 # 算子模块之间互不依赖（spec §2.2）：M4 quality 自持一份同格式的步骤行模板（外加
@@ -927,6 +928,125 @@ def _majority_vote(samples: Sequence[Mapping],
 
 # ── 记录级标注路径（M7 的公开修复面）──────────────────────────────────────
 
+@dataclass(frozen=True, slots=True)
+class _SamplePlan:
+    """一个记录级标注样本的纯叶计划。
+
+    @param record 待标注记录
+    @param schema_text 类有效 Schema 文本
+    @param options 本样本的装配参数
+    """
+
+    record: Record                         # 待标注记录
+    schema_text: str                       # 类有效 Schema 文本
+    options: AnnotatePromptOptions         # 本样本的装配参数
+
+
+@dataclass(frozen=True, slots=True)
+class _SampleOutcome:
+    """一个样本的冻结成功值或普通失败。
+
+    @param value M8 成功四元组
+    @param error 待声明序归并的失败
+    """
+
+    value: tuple[dict, Usage, int, str] | None  # M8 成功四元组
+    error: Exception | None                    # 待声明序归并的失败
+
+
+def _sample_plans(record: Record, ctx: "RunContext",
+                  opts: AnnotatePromptOptions) -> tuple[_SamplePlan, ...]:
+    """按声明序冻结一条记录的采样计划。
+
+    @param record 待标注记录
+    @param ctx 运行上下文
+    @param opts 装配变体参数
+    @return 单次或自洽样本计划
+    """
+    base = replace(opts, temperature=None)
+    count = ctx.cfg.annotate.self_consistency if opts.repair is None else 0
+    if count == 0:
+        count = 1
+        sample_options = base
+    else:
+        sample_options = replace(base, temperature=ctx.cfg.annotate.sc_temperature)
+    schema_text = class_schema_text(ctx, opts.label)
+    return tuple(_SamplePlan(record, schema_text, sample_options)
+                 for _ in range(count))
+
+
+async def _run_sample(plan: _SamplePlan, ctx: "RunContext",
+                      isolate: bool) -> _SampleOutcome:
+    """执行一个不写共享业务对象的标注样本叶。
+
+    @param plan 冻结样本计划
+    @param ctx 运行上下文
+    @param isolate 是否把普通失败收敛为 outcome
+    @return 成功值或普通失败
+    """
+    try:
+        value = await _budgeted_call(
+            plan.record, ctx, plan.schema_text, plan.options,
+        )
+        return _SampleOutcome(value=value, error=None)
+    except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+        raise
+    except SchemaViolation as exc:
+        return _SampleOutcome(value=None, error=exc)
+    except ProviderFatalError as exc:
+        if _ATTEMPT_MODE.get() or not isolate:
+            raise
+        return _SampleOutcome(value=None, error=exc)
+    except Exception as exc:  # 纯叶只回传冻结失败
+        if not isolate:
+            raise
+        return _SampleOutcome(value=None, error=exc)
+
+
+async def _execute_samples(plans: Sequence[_SamplePlan], ctx: "RunContext",
+                           isolate: bool, start: int = 0) -> tuple[_SampleOutcome, ...]:
+    """通过共享 TaskExecutor 执行一个完整采样波次。
+
+    @param plans 声明序样本计划
+    @param ctx 运行上下文
+    @param isolate 是否收敛普通失败
+    @param start 本波次在 annotate stage 内的起始 ordinal
+    @return 与 plans 对齐的输入序结果
+    """
+    if not plans:
+        return ()
+    specs = tuple(
+        TaskSpec(
+            task_id=f"{ctx.task_namespace}:annotate:{start + ordinal}",
+            declaration_key=(ctx.batch_no, 7, start + ordinal),
+            stage="annotate",
+            resource_key=("llm", ctx.cfg.annotate.llm),
+            operation=lambda plan=plan: _run_sample(plan, ctx, isolate),
+        )
+        for ordinal, plan in enumerate(plans)
+    )
+    return await ctx.tasks.run_group(TaskGroupRequest(specs))
+
+
+async def annotate_record_leaf(record: Record, ctx: "RunContext",
+                               opts: AnnotatePromptOptions) -> Annotation:
+    """verify TaskSpec 可直接调用的无调度单记录纯叶面。
+
+    @param record 待标注记录
+    @param ctx verify 波次派生的运行上下文
+    @param opts 单调用装配参数；verify repair 必须携带 repair
+    @return 单次 M8 调用的 Annotation
+    @raises InternalError 请求了必须由外层调度的自洽采样
+    """
+    if opts.repair is None and ctx.cfg.annotate.self_consistency > 0:
+        _logger.error("annotation leaf cannot execute self-consistency")
+        raise InternalError("annotation leaf cannot execute self-consistency")
+    shape = replace(opts, temperature=None)
+    schema_text = class_schema_text(ctx, shape.label)
+    obj, usage, attempts, model = await _budgeted_call(record, ctx, schema_text, shape)
+    return Annotation(output=obj, model=model, attempts=attempts, usage=usage)
+
+
 async def annotate_record(record: Record, ctx: "RunContext",
                           opts: AnnotatePromptOptions = _DEFAULT_PROMPT_OPTIONS,
                           ) -> Annotation:
@@ -934,7 +1054,7 @@ async def annotate_record(record: Record, ctx: "RunContext",
 
     @param record 待标注记录（序列记录 raw = None，故 L2.5 回调收到 record=None——
         已知限制）
-    @param ctx 运行上下文
+    @param ctx 为本次公开调用派生唯一 task_namespace 的运行上下文
     @param opts 装配变体参数（``AnnotatePromptOptions``）：``repair`` 非 None 时
         **跳过**自洽（修复重标注恒为 profile 默认温度下的单次调用）；``label``
         选择按类指令/few-shot 与标注
@@ -956,74 +1076,63 @@ async def annotate_record(record: Record, ctx: "RunContext",
     缺省对象即与引入这些取值之前的调用形字节等价。M7 的修复重标注传同一个 label，
     故按类 Schema 无需修复侧改动。
     """
-    opts = replace(opts, temperature=None)         # 温度归 M5 自己设定
-    repair, label = opts.repair, opts.label
-    schema_text = class_schema_text(ctx, label)    # 按类 Schema 文本
-    if repair is not None or ctx.cfg.annotate.self_consistency == 0:
-        obj, usage, attempts, model = await _budgeted_call(record, ctx,
-                                                           schema_text, opts)
-        return Annotation(output=obj, model=model, attempts=attempts, usage=usage)
-    return await _self_consistent_annotation(record, ctx, schema_text, opts)
+    plans = _sample_plans(record, ctx, opts)
+    outcomes = await _execute_samples(plans, ctx, isolate=False)
+    return _annotation_from_samples(outcomes, ctx, opts)
 
 
-def _split_sc_results(results: Sequence[object]
+def _split_sc_results(results: Sequence[_SampleOutcome]
                       ) -> tuple[list[tuple[dict, Usage, int, str]],
                                  SchemaViolation | None]:
-    """把自洽采样的 gather 结果拆成有效样本与最后一条弃权违规。
+    """把自洽采样结果拆成有效样本与最后一条弃权违规。
 
-    @param results ``asyncio.gather(return_exceptions=True)`` 的结果序列
+    @param results TaskExecutor 按声明序返回的样本结果
     @return (有效样本列表, 最后一条 SchemaViolation 或 None)
     @raises BaseException 非 SchemaViolation 的异常原样上抛（provider / 内部错误升级）
     """
     valid: list[tuple[dict, Usage, int, str]] = []
     last_violation: SchemaViolation | None = None
-    for res in results:
-        if isinstance(res, SchemaViolation):
-            last_violation = res                   # 该样本弃权
-        elif isinstance(res, BaseException):
-            raise res                              # provider / 内部错误升级
-        else:
-            valid.append(res)
+    for outcome in results:
+        if isinstance(outcome.error, SchemaViolation):
+            last_violation = outcome.error
+        elif outcome.error is not None:
+            raise outcome.error
+        elif outcome.value is not None:
+            valid.append(outcome.value)
     return valid, last_violation
 
 
-async def _self_consistent_annotation(record: Record, ctx: "RunContext",
-                                      schema_text: str,
-                                      opts: AnnotatePromptOptions) -> Annotation:
-    """自洽采样路径（spec 3.5.2）：n 个独立样本各走完整 M8 保证，字段级投票定稿。
+def _annotation_from_samples(outcomes: Sequence[_SampleOutcome], ctx: "RunContext",
+                             opts: AnnotatePromptOptions) -> Annotation:
+    """按声明序归并一条记录的样本并定稿。
 
-    @param record 待标注记录
+    @param outcomes TaskExecutor 返回的输入序样本结果
     @param ctx 运行上下文
-    @param schema_text 类有效 Schema 文本
-    @param opts 装配变体参数（温度在此按 sc_temperature 覆写）
+    @param opts 装配变体参数
     @return 定稿 Annotation（sc 携带 n 与一致率）
     @raises SchemaViolation 全部样本都违规（抛最后一条；无违规记录时抛占位违规）
 
     SchemaViolation 样本弃权（分母仍为 n）；provider / 内部异常直接上抛。
     """
-    cfg = ctx.cfg
-    n = cfg.annotate.self_consistency
-    sc_opts = replace(opts, temperature=cfg.annotate.sc_temperature)
-
-    async def one_sample() -> tuple[dict, Usage, int, str]:
-        """跑一个自洽样本。
-
-        @return 该样本的 complete_validated 四元组
-        """
-        return await _budgeted_call(record, ctx, schema_text, sc_opts)
-
-    results = await asyncio.gather(*(one_sample() for _ in range(n)),
-                                   return_exceptions=True)
-    valid, last_violation = _split_sc_results(results)
+    if len(outcomes) == 1:
+        outcome = outcomes[0]
+        if outcome.error is not None:
+            raise outcome.error
+        if outcome.value is None:
+            raise InternalError("annotation sample completed without a value")
+        obj, usage, attempts, model = outcome.value
+        return Annotation(output=obj, model=model, attempts=attempts, usage=usage)
+    valid, last_violation = _split_sc_results(outcomes)
     if not valid:
         raise last_violation if last_violation is not None else SchemaViolation(
             ["self-consistency: all samples failed"], "")
 
     # 可投票字段取自类有效 Schema（按类 Schema 的字段集可与全局不同）。
     chosen, matches, disagreed = _majority_vote(
-        [obj for obj, _, _, _ in valid], class_effective_schema(cfg, opts.label))
+        [obj for obj, _, _, _ in valid], class_effective_schema(ctx.cfg, opts.label))
     if disagreed:
         ctx.metrics.count("annotate.sc_disagreements")
+    n = len(outcomes)
     return Annotation(output=chosen, model=valid[0][3],
                       attempts=sum(attempts for _, _, attempts, _ in valid),
                       usage=sum((usage for _, usage, _, _ in valid), Usage()),
@@ -1184,12 +1293,109 @@ def _frame_error_kind(member: Record, exc: BaseException) -> str:
 # 补跑共享 ordinary 路径。溢出纪律：precheck/finish 永不喂熔断；ordinary 路径的反应
 # 式 http_400 终端才经 _feed_reactive_terminal 恰一次喂入（A7）。
 
+@dataclass(frozen=True, slots=True)
+class _MemberOutcome:
+    """一个成员标注叶的冻结成功值或普通失败。
+
+    @param annotation 成功标注
+    @param error 待声明序归并的失败
+    """
+
+    annotation: Annotation | None          # 成功标注
+    error: Exception | None                # 待声明序归并的失败
+
+
+async def annotate_member_leaf(member: Record, ctx: "RunContext",
+                               label: str | None = None) -> Annotation:
+    """verify TaskSpec 可直接调用的无调度单成员纯叶面。
+
+    @param member 待标注成员帧
+    @param ctx verify 波次派生的运行上下文
+    @param label 成员类标签；None 使用全局帧指令
+    @return 成功 Annotation；异常原样上抛
+    """
+    cfg = ctx.cfg
+    schema = _thaw_json(cfg.frame_schema)
+    schema_text = json.dumps(schema, ensure_ascii=False, separators=(", ", ": "))
+    prof = cfg.llm_profiles.get(cfg.frame_annotate.llm)
+    if prof is None or prof.context_window <= 0:
+        prompt = build_frame_annotate_prompt(member, cfg, schema_text, label=label)
+    else:
+        prompt = _pack_frame_prompt(member, ctx, prof, schema_text, label)
+    obj, usage, attempts, model = await ctx.schema_engine.complete_validated(
+        cfg.frame_annotate.llm, prompt, schema=schema,
+        scope=CallScope(record_ids=(member.id,), batch_no=ctx.batch_no))
+    return Annotation(output=obj, model=model, attempts=attempts, usage=usage)
+
+
+async def _run_member(member: Record, ctx: "RunContext",
+                      label: str | None) -> _MemberOutcome:
+    """执行纯成员叶，把可隔离失败收敛为普通结果。
+
+    @param member 待标注成员帧
+    @param ctx 运行上下文
+    @param label 成员类标签
+    @return 成功值或普通失败
+    """
+    try:
+        return _MemberOutcome(await annotate_member_leaf(member, ctx, label), None)
+    except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+        raise
+    except ProviderFatalError as exc:
+        if _ATTEMPT_MODE.get():
+            raise
+        return _MemberOutcome(None, exc)
+    except Exception as exc:  # 纯叶只回传冻结失败
+        return _MemberOutcome(None, exc)
+
+
+async def _execute_members(members: Sequence[tuple[Record, str | None]],
+                           ctx: "RunContext", start: int) -> tuple[_MemberOutcome, ...]:
+    """通过共享 TaskExecutor 执行一个成员标注波次。
+
+    @param members 成员记录与类标签对
+    @param ctx 运行上下文
+    @param start 本波次在 annotate stage 内的起始 ordinal
+    @return 与 members 对齐的输入序结果
+    """
+    if not members:
+        return ()
+    profile = ctx.cfg.frame_annotate.llm
+    specs = tuple(
+        TaskSpec(
+            task_id=f"{ctx.task_namespace}:annotate:{start + ordinal}",
+            declaration_key=(ctx.batch_no, 7, start + ordinal),
+            stage="annotate",
+            resource_key=("llm", profile),
+            operation=lambda member=member, label=label: _run_member(member, ctx, label),
+        )
+        for ordinal, (member, label) in enumerate(members)
+    )
+    return await ctx.tasks.run_group(TaskGroupRequest(specs))
+
+
+def _record_member_failure(member: Record, ctx: "RunContext", exc: Exception) -> None:
+    """提交一个 ordinary 成员失败的计数与无数据日志。
+
+    @param member 失败成员帧
+    @param ctx 运行上下文
+    @param exc 待分类失败
+    """
+    if isinstance(exc, ContextOverflowError):
+        _feed_reactive_terminal(exc, ctx.metrics)
+    kind = budget.classify_stage_error(exc) or _frame_error_kind(member, exc)
+    ctx.metrics.count("frame_annotate.failed")
+    _logger.warning("frame annotation failed: member=%s kind=%s exc=%s",
+                    member.id, kind, type(exc).__name__,
+                    extra={"stage": "annotate", "batch": ctx.batch_no})
+
+
 async def annotate_member(member: Record, ctx: "RunContext",
                           label: str | None = None) -> Annotation | None:
     """v1.12 帧级逐帧标注的公开直调面（SPEC-frame-annotation §3.3/§3.4，签名冻结）。
 
     @param member 单个成员帧记录
-    @param ctx 运行上下文
+    @param ctx 为本次公开调用派生唯一 task_namespace 的运行上下文
     @param label 帧类标签：非 None ⇒ 指令/few-shot 取 ``cfg.frame_class_views[label]``
         （类覆盖）；None ⇒ 全局 [frame.annotate]。类视图 enabled=false 的跳过判定归
         调用方（M5 帧 pass / M7 回收），本面不重复判定
@@ -1200,38 +1406,53 @@ async def annotate_member(member: Record, ctx: "RunContext",
     @raises CircuitBreakerTripped 运行级控制流在所有模式照常上抛（KeyboardInterrupt /
         CancelledError 同理）
     """
-    cfg = ctx.cfg
-    schema = _thaw_json(cfg.frame_schema)  # program 视图可能递归冻结为 MappingProxyType
-    schema_text = json.dumps(schema, ensure_ascii=False, separators=(", ", ": "))
-    prof = cfg.llm_profiles.get(cfg.frame_annotate.llm)
-    try:
-        if prof is None or prof.context_window <= 0:   # 预算未声明：直装配
-            prompt = build_frame_annotate_prompt(member, cfg, schema_text,
-                                                 label=label)
-        else:
-            prompt = _pack_frame_prompt(member, ctx, prof, schema_text, label)
-        obj, usage, attempts, model = await ctx.schema_engine.complete_validated(
-            cfg.frame_annotate.llm, prompt, schema=schema,
-            scope=CallScope(record_ids=(member.id,), batch_no=ctx.batch_no))
-    except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
-        raise
-    except Exception as exc:  # noqa: BLE001 — ordinary 隔离；attempt 原样传播
+    (outcome,) = await _execute_members(((member, label),), ctx, 0)
+    if outcome.error is not None:
         if _ATTEMPT_MODE.get():
-            raise
-        if isinstance(exc, ContextOverflowError):
-            # precheck/finish 形永不喂；仅反应式 http_400 恰一次喂熔断（A7）。
-            _feed_reactive_terminal(exc, ctx.metrics)
-        kind = budget.classify_stage_error(exc) or _frame_error_kind(member, exc)
-        ctx.metrics.count("frame_annotate.failed")
-        _logger.warning("frame annotation failed: member=%s kind=%s exc=%s",
-                        member.id, kind, type(exc).__name__,
-                        extra={"stage": "annotate", "batch": ctx.batch_no})
+            raise outcome.error
+        _record_member_failure(member, ctx, outcome.error)
         return None
     ctx.metrics.count("frame_annotate.annotated")
-    return Annotation(output=obj, model=model, attempts=attempts, usage=usage)
+    if outcome.annotation is None:
+        raise InternalError("frame annotation completed without a value")
+    return outcome.annotation
 
 
 # ── Stage 实现 ───────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True, slots=True)
+class _RecordSpan:
+    """一个信封在全批 sample 波次中的输入序切片。
+
+    @param item 待归并信封
+    @param options 本信封的装配参数
+    @param start sample 结果起始位置
+    @param count sample 结果数
+    """
+
+    item: PipelineItem                    # 待归并信封
+    options: AnnotatePromptOptions        # 本信封的装配参数
+    start: int                            # sample 结果起始位置
+    count: int                            # sample 结果数
+
+
+@dataclass(frozen=True, slots=True)
+class _FramePlan:
+    """一个唯一成员的声明序归并计划。
+
+    @param item 所属序列信封
+    @param member 待标注成员
+    @param label 成员类标签
+    @param skipped 类视图是否禁用
+    @param call_index 成员叶结果位置
+    """
+
+    item: PipelineItem                    # 所属序列信封
+    member: Record                        # 待标注成员
+    label: str | None                     # 成员类标签
+    skipped: bool                         # 类视图是否禁用
+    call_index: int | None                # 成员叶结果位置
+
 
 class AnnotateStage:
     """M5 标注阶段（spec §4.3 阶段契约：只处理 active 信封，绝不增删列表元素，
@@ -1253,28 +1474,25 @@ class AnnotateStage:
         return self._cfg if active is None else active  # type: ignore[return-value]
 
     async def run(self, batch: list[PipelineItem], ctx: "RunContext") -> list[PipelineItem]:
-        """并发标注本批全部 active 信封。
+        """先并发全批 sequence samples，归并后再并发 frame members。
 
         @param batch 本批信封列表（只改状态，绝不增删元素）
         @param ctx 运行上下文
         @return 同一个 batch 列表
         """
         active = [item for item in batch if item.status == "active"]
-        if active:
-            await asyncio.gather(*(self._run_item(item, ctx) for item in active))
+        next_ordinal = await self._sequence_wave(active, ctx)
+        await self._frame_wave(active, ctx, next_ordinal)
         return batch
 
-    async def _run_item(self, item: PipelineItem, ctx: "RunContext") -> None:
-        """按独立开关执行 sequence annotation 或直接执行 frame pass。
+    async def _annotate_item(self, item: PipelineItem, ctx: "RunContext") -> None:
+        """公开测试面：对单信封执行同样的两波标注。
 
-        @param item 当前 active 信封。
-        @param ctx 运行上下文。
-        @return None。
+        @param item 待标注信封
+        @param ctx 运行上下文
         """
-        if self.cfg.annotate.enabled:
-            await self._annotate_item(item, ctx)
-        else:
-            await self._frame_pass(item, ctx)
+        next_ordinal = await self._sequence_wave([item], ctx)
+        await self._frame_wave([item], ctx, next_ordinal)
 
     async def run_attempt(
         self,
@@ -1293,7 +1511,8 @@ class AnnotateStage:
                 with request.run_context.metrics.capture_counts() as counters:
                     try:
                         await self.run(items, request.run_context)
-                    except SchemaViolation:
+                    except (SchemaViolation, ContextOverflowError,
+                            OutputTruncatedError, ProviderRetryableError):
                         return DownstreamAttemptResult(
                             accepted=False, rejected_stage="annotate",
                             dataset_counters=dict(counters))
@@ -1342,36 +1561,70 @@ class AnnotateStage:
                 return False
         return True
 
-    async def _annotate_item(self, item: PipelineItem, ctx: "RunContext") -> None:
-        """单信封槽位：成功即发事件并追加帧 pass，失败即记录级隔离落 failed。
+    def _sequence_plans(self, items: Sequence[PipelineItem], ctx: "RunContext"
+                        ) -> tuple[list[_RecordSpan], list[_SamplePlan]]:
+        """按 item/sample 声明序冻结全批 sequence 采样。
 
-        @param item 待标注信封
+        @param items 进入标注阶段的 active 信封
         @param ctx 运行上下文
-        @return 无
+        @return 信封切片与样本计划
         """
-        record = item.record
-        label = item.classification.label if item.classification else None
-        # v1.9（T14）：逐片段关键帧配额搭 M16 的 duck 标位。
-        fragments = getattr(item, "stitch_fragments", None)
-        fragment_lens = (tuple(int(f["member_count"]) for f in fragments)
-                         if fragments else None)
-        try:
-            item.annotation = await annotate_record(
-                record, ctx,
-                AnnotatePromptOptions(label=label, transitions=item.transitions,
-                                      fragment_lens=fragment_lens))
-        except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
-            raise                                  # 运行级控制流：照常上抛
-        except Exception as exc:  # noqa: BLE001 — 记录级隔离绝对
-            if _ATTEMPT_MODE.get():
+        spans: list[_RecordSpan] = []
+        samples: list[_SamplePlan] = []
+        if not self.cfg.annotate.enabled:
+            return spans, samples
+        for item in items:
+            label = item.classification.label if item.classification else None
+            fragments = getattr(item, "stitch_fragments", None)
+            fragment_lens = (tuple(int(f["member_count"]) for f in fragments)
+                             if fragments else None)
+            options = AnnotatePromptOptions(
+                label=label, transitions=item.transitions, fragment_lens=fragment_lens,
+            )
+            planned = _sample_plans(item.record, ctx, options)
+            spans.append(_RecordSpan(item, options, len(samples), len(planned)))
+            samples.extend(planned)
+        return spans, samples
+
+    async def _sequence_wave(self, items: Sequence[PipelineItem],
+                             ctx: "RunContext") -> int:
+        """执行全批 sample 波次并按 item/sample 声明序归并。
+
+        @param items 进入标注阶段的 active 信封
+        @param ctx 运行上下文
+        @return 下一波次的起始 ordinal
+        """
+        spans, samples = self._sequence_plans(items, ctx)
+        outcomes = await _execute_samples(samples, ctx, isolate=True)
+        for span in spans:
+            result_slice = outcomes[span.start:span.start + span.count]
+            try:
+                annotation = _annotation_from_samples(result_slice, ctx, span.options)
+            except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
                 raise
-            kind, message, retryable = self._classify_failure(item, exc)
-            _logger.warning("annotation failed: record=%s kind=%s exc=%s",
-                            record.id, kind, type(exc).__name__,
-                            extra={"stage": self.name, "batch": ctx.batch_no})
-            self._fail(item, ctx, kind, message, retryable)
-        else:
-            await self._on_annotated(item, ctx, label)
+            except Exception as exc:  # 归并屏障才决定记录失败
+                if _ATTEMPT_MODE.get():
+                    raise
+                self._settle_annotation_failure(span.item, ctx, exc)
+            else:
+                span.item.annotation = annotation
+                self._commit_annotation(span.item, ctx)
+        return len(samples)
+
+    def _settle_annotation_failure(self, item: PipelineItem, ctx: "RunContext",
+                                   exc: Exception) -> None:
+        """在归并屏障提交一个 ordinary 记录失败。
+
+        @param item 失败信封
+        @param ctx 运行上下文
+        @param exc 待分类失败
+        """
+        failure = self._classify_failure(item, exc)
+        kind = failure[0]
+        _logger.warning("annotation failed: record=%s kind=%s exc=%s",
+                        item.record.id, kind, type(exc).__name__,
+                        extra={"stage": self.name, "batch": ctx.batch_no})
+        self._fail(item, ctx, failure)
 
     def _classify_failure(self, item: PipelineItem,
                           exc: BaseException) -> tuple[str, str, bool]:
@@ -1400,16 +1653,15 @@ class AnnotateStage:
                     f"{type(exc).__name__}: {exc}", False)
         return ErrorKind.INTERNAL_ERROR.value, f"{type(exc).__name__}: {exc}", False
 
-    async def _on_annotated(self, item: PipelineItem, ctx: "RunContext",
-                            label: str | None) -> None:
-        """标注成功后的收尾：发 annotate.done 事件，再追加 v1.12 帧级 pass。
+    def _commit_annotation(self, item: PipelineItem, ctx: "RunContext") -> None:
+        """按 item 声明序提交 annotate.done 事件。
 
         @param item 已标注的信封
         @param ctx 运行上下文
-        @param label 该记录的分类标签（v1.7 R5：classify 开启时进 payload）
         @return 无
         """
         record = item.record
+        label = item.classification.label if item.classification else None
         payload: dict = {"attempts": item.annotation.attempts}
         if item.annotation.sc is not None:
             payload["sc"] = dict(item.annotation.sc)
@@ -1420,94 +1672,137 @@ class AnnotateStage:
             payload["excerpt"] = excerpt
         ctx.metrics.event(EV_ANNOTATE_DONE, stage=self.name, batch_no=ctx.batch_no,
                           record_ids=(record.id,), payload=payload)
-        # v1.12：帧级逐帧标注 pass 只在序列级标注成功后追加（§3.3 链位：质量门
-        # 之后、成员逐帧——序列级失败的信封永不付帧标注费）。
-        await self._frame_pass(item, ctx)
 
     async def _frame_pass(self, item: PipelineItem, ctx: "RunContext") -> None:
-        """v1.12 帧级逐帧标注 pass（SPEC-frame-annotation §3.3）。
+        """公开测试面：对单信封执行帧标注波次。
 
-        @param item 待执行帧标注的序列信封；sequence attempt 可没有序列级 annotation
+        @param item 待执行帧 pass 的信封
         @param ctx 运行上下文
-        @return 无
-
-        执行门 = active ∧ kind=="sequence" ∧ 首标签信封（classification.label ==
-        labels[0]；无 classification 视为首标签）∧ 非降格（segment_degraded duck 标
-        在场即跳——降格 = 噪声未剔，不为垃圾帧付费）∧ frame_annotate.enabled。产物
-        dict 语义：pass 一旦运行即初始化为 {}（区别于「未运行」的 None——emitter 在场
-        规则的单一真相）；降格/非首标签跳过保持 None；已有 dict 只补缺位、从不换对象
-        （扇出克隆按引用共享同一 dict 的前提）。幂等 = 仅当 member.id 不在 dict 时
-        调用（M7 回收补跑同款只补缺位）。成员级并发 gather 使用
-        return_exceptions=True 等全部 pending 成员收敛；结果保持 pending 成员序，随后
-        按该顺序传播第一个异常。ordinary process/flat 由 annotate_member 隔离失败并
-        返回 None；sequence attempt 模式允许异常进入上述传播路径。
         """
-        if not (self.cfg.frame_annotate.enabled
-                and item.record.kind == "sequence"):
-            return
+        await self._frame_wave([item], ctx, 0)
+
+    def _frame_plans(self, items: Sequence[PipelineItem]
+                     ) -> tuple[list[_FramePlan], list[tuple[Record, str | None]]]:
+        """按 item/member 序冻结唯一成员与跳过事实。
+
+        @param items sequence 归并后仍 active 的信封
+        @return 归并计划与需要真实调用的成员对
+        """
+        plans: list[_FramePlan] = []
+        calls: list[tuple[Record, str | None]] = []
+        for item in items:
+            if not self._frame_gate(item):
+                continue
+            occupied = item.member_annotations or {}
+            seen: set[str] = set()
+            for member in item.record.members:
+                if member.id in occupied or member.id in seen:
+                    continue
+                seen.add(member.id)
+                label = self._member_label(item, member)
+                view = self.cfg.frame_class_views.get(label) if label is not None else None
+                skipped = view is not None and not view.enabled
+                call_index = None if skipped else len(calls)
+                plans.append(_FramePlan(item, member, label, skipped, call_index))
+                if not skipped:
+                    calls.append((member, label))
+        return plans, calls
+
+    def _frame_gate(self, item: PipelineItem) -> bool:
+        """判定一个信封是否进入帧标注 pass。
+
+        @param item 待判定信封
+        @return 是否进入帧 pass
+        """
+        if (item.status != "active" or not self.cfg.frame_annotate.enabled
+                or item.record.kind != "sequence"):
+            return False
         cls = item.classification
         if cls is not None and cls.labels and cls.label != cls.labels[0]:
-            return                       # 非首标签克隆不执行（裁决·扇出共享与首标签执行）
-        if getattr(item, "segment_degraded", None) is not None:
-            return                       # 降格会话跳过（裁决·降格会话跳过）
-        if item.member_annotations is None:
-            item.member_annotations = {}
-        pending: list[Record] = []
-        seen: set[str] = set()
-        for m in item.record.members:
-            # 同 id 成员（内容哈希碰撞，ingest D2 已知面）只调用一次——
-            # first-wins 与 M13 帧判决落表同口径（终审缺陷修复：防同键并发
-            # 双付费与 annotated 计数虚高）。
-            if m.id in item.member_annotations or m.id in seen:
-                continue
-            seen.add(m.id)
-            pending.append(m)
-        if pending:
-            results = await asyncio.gather(
-                *(self._frame_member(item, member, ctx) for member in pending),
-                return_exceptions=True,
-            )
-            for result in results:
-                if isinstance(result, BaseException):
-                    raise result
+            return False
+        return getattr(item, "segment_degraded", None) is None
 
-    async def _frame_member(self, item: PipelineItem, member: Record,
-                            ctx: "RunContext") -> None:
-        """单成员槽位：帧类视图 enabled=false ⇒ skipped（不占键）；否则经
-        annotate_member 占键。ordinary process/flat 成功写 Annotation、隔离失败写 None；
-        sequence attempt 的异常上抛给收敛后的成员序传播路径。
+    @staticmethod
+    def _member_label(item: PipelineItem, member: Record) -> str | None:
+        """读取一个成员的新鲜帧类标签。
 
-        @param item 所属序列信封（事件 ids 取 episode id）
-        @param member 该成员帧记录
-        @param ctx 运行上下文
-        @return 无
-
-        事件 annotate.frame 每成员一发；payload 仅 member_id/status/attempts——标注
-        内容只经既有 excerpt 键按档位截断（excerpt/full 档 200 字），不新增任何数据
-        内容 payload 键。
+        @param item 所属序列信封
+        @param member 成员帧
+        @return 成员类标签；未分类时为 None
         """
-        cls = (item.member_classifications or {}).get(member.id)
-        # ordinary process/flat 未启用 frame.classify 时 label=None，使用全局指令；
-        # sequence 读取 inherited classification，并按 attempt-local program view 路由。
-        label = cls.label if cls is not None else None
-        view = (self.cfg.frame_class_views.get(label)
-                if label is not None else None)
-        if view is not None and not view.enabled:
+        classification = (item.member_classifications or {}).get(member.id)
+        return classification.label if classification is not None else None
+
+    async def _frame_wave(self, items: Sequence[PipelineItem], ctx: "RunContext",
+                          start: int) -> None:
+        """在 sequence 归并屏障后执行全批成员叶并声明序提交。
+
+        @param items sequence 归并后的信封
+        @param ctx 运行上下文
+        @param start 本波次起始 ordinal
+        """
+        plans, calls = self._frame_plans(items)
+        outcomes = await _execute_members(calls, ctx, start)
+        for plan in plans:
+            outcome = None if plan.skipped else outcomes[plan.call_index]
+            self._settle_frame(plan, outcome, ctx)
+
+    def _settle_frame(self, plan: _FramePlan, outcome: _MemberOutcome | None,
+                      ctx: "RunContext") -> None:
+        """按 item/member 声明序提交成员表、计数与事件。
+
+        @param plan 成员归并计划
+        @param outcome 成员叶结果；skipped 时为 None
+        @param ctx 运行上下文
+        """
+        member = plan.member
+        annotations = plan.item.member_annotations
+        if annotations is None:
+            annotations = {}
+            plan.item.member_annotations = annotations
+        if plan.skipped:
             ctx.metrics.count("frame_annotate.skipped")
-            payload: dict = {"member_id": member.id, "status": "skipped",
-                             "attempts": 0}
+            payload: dict = {"member_id": member.id, "status": "skipped", "attempts": 0}
         else:
-            ann = await annotate_member(member, ctx, label=label)
-            item.member_annotations[member.id] = ann
+            if outcome is None:
+                raise InternalError("frame annotation result is missing")
+            annotation = self._settle_member_outcome(plan, outcome, ctx)
+            annotations[member.id] = annotation
             payload = {"member_id": member.id,
-                       "status": "annotated" if ann is not None else "failed",
-                       "attempts": ann.attempts if ann is not None else 0}
-            if (ann is not None and self.cfg.trace.enabled
-                    and self.cfg.trace.content in ("excerpt", "full")):
-                payload["excerpt"] = {member.id: _dumps(ann.output)[:200]}
-        ctx.metrics.event(EV_ANNOTATE_FRAME, stage=self.name,
-                          batch_no=ctx.batch_no, record_ids=(item.record.id,),
-                          payload=payload)
+                       "status": "annotated" if annotation is not None else "failed",
+                       "attempts": annotation.attempts if annotation is not None else 0}
+            if self._frame_excerpt_enabled(annotation):
+                payload["excerpt"] = {member.id: _dumps(annotation.output)[:200]}
+        ctx.metrics.event(EV_ANNOTATE_FRAME, stage=self.name, batch_no=ctx.batch_no,
+                          record_ids=(plan.item.record.id,), payload=payload)
+
+    def _settle_member_outcome(self, plan: _FramePlan, outcome: _MemberOutcome,
+                               ctx: "RunContext") -> Annotation | None:
+        """把一个成员叶结果提交为 ordinary 或 attempt 语义。
+
+        @param plan 成员归并计划
+        @param outcome 成员叶结果
+        @param ctx 运行上下文
+        @return 成功 Annotation 或 ordinary 失败 None
+        """
+        if outcome.error is not None:
+            if _ATTEMPT_MODE.get():
+                raise outcome.error
+            _record_member_failure(plan.member, ctx, outcome.error)
+            return None
+        if outcome.annotation is None:
+            raise InternalError("frame annotation completed without a value")
+        ctx.metrics.count("frame_annotate.annotated")
+        return outcome.annotation
+
+    def _frame_excerpt_enabled(self, annotation: Annotation | None) -> bool:
+        """判定成员事件是否可以附带截断标注。
+
+        @param annotation 待输出的成员标注
+        @return 是否附带 excerpt
+        """
+        return (annotation is not None and self.cfg.trace.enabled
+                and self.cfg.trace.content in ("excerpt", "full"))
 
     def _excerpt_payload(self, record: Record) -> dict | None:
         """算出 annotate.done 事件的 `excerpt` payload 增项。
@@ -1533,17 +1828,16 @@ class AnnotateStage:
             record.ui_tree.serialize() if record.ui_tree is not None else "")
         return (content or "")[:200]
 
-    def _fail(self, item: PipelineItem, ctx: "RunContext", kind: str, message: str,
-              retryable: bool) -> None:
+    def _fail(self, item: PipelineItem, ctx: "RunContext",
+              failure: tuple[str, str, bool]) -> None:
         """把信封落为记录级失败（写 item.errors、置 failed、发 error 事件）。
 
         @param item 失败的信封
         @param ctx 运行上下文
-        @param kind §7.6 错误 kind
-        @param message 英文错误消息
-        @param retryable 是否属于「重试耗尽」类
+        @param failure (kind, message, retryable) 三元组
         @return 无
         """
+        kind, message, retryable = failure
         err = StageError(stage=self.name, kind=kind, message=message, retryable=retryable)
         item.errors.append(err)
         item.status = "failed"

@@ -416,7 +416,7 @@ sequence_frames = 20              # 序列标注单请求最大帧数；[2,100]�
 ### tests/（13 改 + 4 新）
 
 新增覆盖现归档于：`tests/operators/test_ingest.py`（时间戳解析/单调性/会话闭合/装箱/limit）、`tests/operators/test_segment.py`（摘要/diff/Schema 形状/缝合确定性/分段吸收例外/min_len/守恒恒等式）、`tests/operators/test_extract.py`（Schema/fallback 留痕不写 errors/转移数不变量/by_type）、`tests/integration/test_stream_llm.py`（真实 glm-5.2：边界词表内/噪声判定/动作摘取/25→20 帧降采样成功）。
-改：16 文件 ResolvedConfig 补参（三必填字段）+ 6 处 ClassView 构造补 extract★；`test_config.py`★（三节解析/约束/白名单/rubric/引用集）；`test_types.py`（新类型/Status 全集断言★/helper）；`test_ingest.py`（会话流适配）；`test_dedup.py`（序列拼接/图像层跳过/语义 case）；`test_quality.py`（序列分支/trajectory）；`test_annotate.py`（降采样/模板段序/repair 拼接不变量）；`test_verify.py`（缺陷 Schema/路由/两阶段确定性）；`test_classify.py`（序列分支）；`test_orchestrator.py`（装箱/计量/守恒/估算/interrupted 残差）；`test_emitter.py`（第三路由/_meta 键全集+stream/reason 三分支/full 序列载荷）；`test_obslog.py`（通道 10/三事件路由/_DATA_KEYS 脱敏）；`test_schema_engine.py`（三 builder）；`test_cli.py`（profiles/rubric 三值）。
+改：16 文件 ResolvedConfig 补参（三必填字段）+ 6 处 ClassView 构造补 extract★；`test_config.py`★（三节解析/约束/白名单/rubric/引用集）；`test_types.py`（新类型/Status 全集断言★/helper）；`test_ingest.py`（会话流适配）；`test_dedup.py`（序列拼接/图像层跳过/语义 case）；`test_quality.py`（序列分支/trajectory）；`test_annotate.py`（降采样/模板段序/repair 拼接不变量）；`test_verify.py`（缺陷 Schema/路由/两阶段确定性）；`test_classify.py`（序列分支）；`test_process_workflow.py`（装箱/计量/守恒/估算/interrupted 残差）；`test_emitter.py`（第三路由/_meta 键全集+stream/reason 三分支/full 序列载荷）；`test_obslog.py`（通道 10/三事件路由/_DATA_KEYS 脱敏）；`test_schema_engine.py`（三 builder）；`test_cli.py`（profiles/rubric 三值）。
 
 ### examples/ 与根目录
 
@@ -428,7 +428,7 @@ sequence_frames = 20              # 序列标注单请求最大帧数；[2,100]�
 |---|---|---|
 | 0 | spec/ + CONTRACTS 修订全量合入（文档先行） | 交叉引用自洽（键表↔校验清单↔事件目录↔守恒恒等式对得上） |
 | 1 | types/stage/errors + M1（model/loader 全量）| test_types/test_config 全绿；对 examples/stream 的 project.toml validate 通过 |
-| 2 | M8 三 Schema + M2 会话化 + M10 装箱/计量/守恒 | test_schema_engine/test_ingest/test_orchestrator 全绿（stream ingest 已并入 test_ingest） |
+| 2 | M8 三 Schema + M2 会话化 + M10 装箱/计量/守恒 | test_schema_engine/test_ingest/test_process_workflow 全绿（stream ingest 已并入 test_ingest） |
 | 3 | M14 segment 本体 + M11 三路由/_meta + M12 通道/脱敏 | test_segment/test_emitter/test_obslog 全绿 |
 | 4 | M3 序列 dedup + M13 序列分支 + M15 extract 本体 | test_dedup/test_classify/test_extract 全绿 |
 | 5 | M4 序列打分 + trajectory rubric + M5 序列模板/降采样/签名 | test_quality/test_annotate 全绿 |

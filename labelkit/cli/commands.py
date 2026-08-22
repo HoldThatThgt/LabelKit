@@ -8,7 +8,7 @@ from importlib import resources
 
 from labelkit.common.config.model import CliOverrides
 from labelkit.common.errors import EXIT_OK
-from labelkit.orchestration.runtime import (
+from labelkit.orchestration.application import (
     execute_run,
     probe_referenced_profiles,
     validate_project,
@@ -54,11 +54,8 @@ def _cmd_validate(args: argparse.Namespace) -> int:
             if _print_probe_table(results):
                 return EXIT_OK
         for result in results:
-            label = (
-                f"{result.profile}[{result.key_env}]"
-                if result.key_env
-                else result.profile
-            )
+            identity = f"{result.kind}.{result.profile}"
+            label = f"{identity}[{result.key_env}]" if result.key_env else identity
             if result.ok:
                 print(
                     f"probe {label}: ok model={result.model} "
@@ -89,12 +86,12 @@ def _print_probe_table(results) -> bool:
         _logger.debug("cli: rich unavailable for the probe table: %s", exc)
         return False
     table = Table(title="validate --probe")
-    for column in ("profile[key]", "status", "model", "latency_ms", "error"):
+    for column in ("kind.profile[key]", "status", "model", "latency_ms", "error"):
         table.add_column(Text(column),
                          justify="right" if column == "latency_ms" else "left")
     for result in results:
-        label = (f"{result.profile}[{result.key_env}]" if result.key_env
-                 else result.profile)
+        identity = f"{result.kind}.{result.profile}"
+        label = f"{identity}[{result.key_env}]" if result.key_env else identity
         status = (Text("ok", style="green") if result.ok
                   else Text("FAIL", style="red"))
         table.add_row(Text(label), status, Text(result.model),

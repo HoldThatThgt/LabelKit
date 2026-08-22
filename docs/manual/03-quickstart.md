@@ -153,8 +153,8 @@ uv run labelkit validate --config ../config.toml --project project.toml --probe
 
 ```
 configuration valid
-probe default: ok model=glm-5.2 latency_ms=4031
-probe judge: ok model=glm-5.2 latency_ms=1808
+probe llm.default: ok model=glm-5.2 latency_ms=4031
+probe llm.judge: ok model=glm-5.2 latency_ms=1808
 ```
 
 **第二步：dry-run**（`--dry-run`：把配置和输入完整校验一遍、估算成本，但一次 LLM 都不调）：
