@@ -325,6 +325,27 @@ def test_scalar_type_mismatch_per_reader_kind(env):
     has(errors, '[quality].enabled: expected boolean, got "yes"')
 
 
+@pytest.mark.parametrize("threshold", [0.99, 1.0])
+def test_minhash_threshold_rejects_unconstructible_lsh_pair(env, threshold):
+    project = env.project(body=f"[dedup]\nminhash_threshold = {threshold}\n")
+    errors = env.errors(project_text=project)
+    has(
+        errors,
+        "[dedup].minhash_threshold: expected a value compatible with "
+        f"minhash_num_perm = 128 (lower minhash_threshold or increase "
+        f"minhash_num_perm), got {threshold}",
+    )
+
+
+def test_minhash_threshold_accepts_constructible_lsh_pair(env):
+    project = env.project(
+        body="[dedup]\nminhash_threshold = 0.95\nminhash_num_perm = 64\n"
+    )
+    cfg = env.load(project_text=project)
+    assert cfg.dedup.minhash_threshold == 0.95
+    assert cfg.dedup.minhash_num_perm == 64
+
+
 def test_array_readers_report_the_offending_element_position(env):
     # 数组读取器逐元素定位（`key[N]`，N 从 1 起）：字符串数组的非串元素 / 枚举外
     # 元素 / 数值数组的非数值元素，外加"整个值根本不是数组"的上层形态。

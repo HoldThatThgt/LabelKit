@@ -830,6 +830,34 @@ schema_inline = '''{{"type": "object", "properties": {{"_meta": {{"type": "objec
     assert "_meta" in err
 
 
+def test_validate_rejects_unconstructible_minhash_threshold(tmp_path, capsys, monkeypatch):
+    pytest.importorskip("labelkit.common.config.loader")
+    monkeypatch.setenv("LABELKIT_CLI_TEST_KEY", "test-key")
+    config = tmp_path / "config.toml"
+    project = tmp_path / "project.toml"
+    input_path = tmp_path / "input.jsonl"
+    output_dir = tmp_path / "out"
+    output_dir.mkdir()
+    input_path.write_text('{"text": "sample"}\n', encoding="utf-8")
+    config.write_text(_VALID_CONFIG, encoding="utf-8")
+    project_text = _project_toml(str(input_path), str(output_dir / "result.jsonl"))
+    project.write_text(
+        project_text.replace(
+            "[quality]",
+            "[dedup]\nminhash_threshold = 1.0\n\n[quality]",
+        ),
+        encoding="utf-8",
+    )
+
+    rc = cli.main(["validate", "--config", str(config), "--project", str(project)])
+    err = capsys.readouterr().err
+    assert rc == EXIT_CONFIG
+    assert "[dedup].minhash_threshold: expected a value compatible with " in err
+    assert "minhash_num_perm = 128" in err
+    assert "The number of bands are too small" not in err
+    assert "Traceback" not in err
+
+
 def test_validate_missing_config_file_exits_2(tmp_path, capsys):
     pytest.importorskip("labelkit.common.config.loader")
     rc = cli.main([

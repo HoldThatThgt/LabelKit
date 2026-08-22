@@ -15,6 +15,7 @@ from typing import Any
 from pathlib import Path
 from types import SimpleNamespace
 
+from datasketch import MinHashLSH
 from jsonschema.validators import Draft202012Validator
 
 from labelkit.common.config._classviews import (
@@ -117,6 +118,28 @@ def _check_cli_overrides(ctx: _LoadCtx) -> None:
     if level is not None and level not in ("debug", "info", "warn", "error"):
         ctx.col.error(f'cli:--log-level: expected "debug" | "info" | "warn" | "error", '
                       f"got {_fmt(level)}")
+
+
+def _check_minhash_threshold(ctx: _LoadCtx) -> None:
+    """用生产依赖校验 MinHash 阈值与置换数能否共同建立 LSH 索引。
+
+    @param ctx 校验上下文
+    """
+    locations = (
+        f"{ctx.fp}:[dedup].minhash_threshold:",
+        f"{ctx.fp}:[dedup].minhash_num_perm:",
+    )
+    if any(error.startswith(loc) for error in ctx.col.errors for loc in locations):
+        return
+    dedup = ctx.p.dedup
+    try:
+        MinHashLSH(threshold=dedup.minhash_threshold, num_perm=dedup.minhash_num_perm)
+    except ValueError:
+        ctx.col.error(
+            f"{ctx.fp}:[dedup].minhash_threshold: expected a value compatible with "
+            f"minhash_num_perm = {dedup.minhash_num_perm} (lower minhash_threshold or "
+            f"increase minhash_num_perm), got {_fmt(dedup.minhash_threshold)}"
+        )
 
 
 def _check_profile_refs(ctx: _LoadCtx) -> None:
@@ -1505,6 +1528,7 @@ def validate(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
     @return 完成回填与冻结后的上下文
     """
     _check_cli_overrides(ctx)
+    _check_minhash_threshold(ctx)
     _check_profile_refs(ctx)
     _check_vision_profiles(ctx)
     _check_dedup_semantic(ctx)

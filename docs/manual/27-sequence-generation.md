@@ -300,7 +300,7 @@ expected violation 或模型自评。
 ## 27.12 已验证的非 live 证据
 
 - v1.18 变更前离线基线：2157 tests。
-- 当前离线套件：2606 passed、47 deselected。
+- 当前离线套件：2610 passed、47 deselected。
 - 合并覆盖率：line 95.71%、branch 91.30%；1548/1548 个可执行生产函数已进入。
 - 完整真实端点 integration suite：47 passed in 438.37s，无 skip。
 - 500000 record-unit planner 压测：16.889 秒，peak RSS 839221248 bytes。

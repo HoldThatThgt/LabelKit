@@ -144,7 +144,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `stitch.on_error` | str | "keep" | 单判定结构修复耗尽的处置："keep"（默认：episode 候选开新线索存活 + 留痕两件（事件+计数器）；救援候选维持 dropped_noise + 同款留痕）\| "fail"（**仅施于 episode 候选信封**——failed → rejects，kind = stitch_invalid，7.6；救援候选不适用 fail 路径，3.16.6）。 |
 | `dedup.enabled` | bool | true | — |
 | `dedup.scope` | str | "global" | "global" \| "batch"（2.6 内存权衡）。 |
-| `dedup.minhash_threshold` | float | 0.85 | Jaccard 判重阈值（工业通行 0.8–0.9 [3][6]）。 |
+| `dedup.minhash_threshold` | float | 0.85 | Jaccard 判重阈值，基础范围 (0,1]；它与 `minhash_num_perm` 必须能共同产生有效 LSH 分带，M1 在 `validate` 阶段校验，失败定位到本键（工业通行 0.8–0.9 [3][6]）。 |
 | `dedup.minhash_num_perm / ngram` | int | 128 / 5 | 签名精度 / 字符 shingle 宽度。 |
 | `dedup.image_phash_max_distance` | int | 8 | 64-bit pHash 汉明距离阈值。 |
 | `dedup.ui_dup_requires` | str | "both" | "both" \| "tree" \| "image"（3.3.3）。 |

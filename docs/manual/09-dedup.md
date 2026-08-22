@@ -129,6 +129,10 @@ semantic_embedding = "default_emb"  # semantic=true 时必填，指向 [embeddin
 semantic_threshold = 0.95
 ```
 
+`minhash_threshold` 与 `minhash_num_perm` 会共同决定 LSH 分带，并不是两个彼此独立的范围开关。
+`labelkit validate` 会用这对值预建空索引；若组合不可用，会把配置错误定位到
+`minhash_threshold`，此时应降低阈值或增加置换数。
+
 ### scope：全局还是批内
 
 - `"global"`（默认）：去重索引跨批累积，整个运行范围内判重。**这是你几乎总是想要的**；

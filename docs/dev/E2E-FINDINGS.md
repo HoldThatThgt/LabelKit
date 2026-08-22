@@ -17,7 +17,7 @@
 | 证据面 | 当前状态 | 已知事实 / 占位 |
 |---|---|---|
 | 变更前 offline baseline | 已验证 | 2157 tests |
-| 当前 offline suite | 已验证 | 2606 passed，47 deselected |
+| 当前 offline suite | 已验证 | 2610 passed，47 deselected |
 | merged coverage | 已验证 | line 95.71%、branch 91.30%；1548/1548 可执行生产函数已进入 |
 | keyless compile / dry-run | 已验证 | 2 sets、8 primary sequences、22 primary events、2 noise events、3 replay events、27 stream rows |
 | 500000 record-unit planner probe | 已验证 | 16.889 秒，peak RSS 839221248 bytes |
@@ -235,6 +235,14 @@ selection seed 为 20260822；盲样本只保留 review key、匿名 group key�
 - commit-I/O 可留下固定路径混代，但旧 manifest 保持；hash mismatch 必须让消费者拒绝。
 - failed report 的 usage 键与成功报告一样是 `llm_usage`；精确键集测试不得接受别名。
 - provider fatal/circuit breaker 零 attempt；retryable exhausted 恰消耗一次 attempt。
+
+## 已验证的 MinHash 配置闭包
+
+`uv run --python 3.12 pytest -q tests/common/config/test_config.py tests/cli/test_cli.py` 结果为
+401 passed。CLI 的生产 `labelkit validate` 入口测试现在会把 `minhash_threshold = 1.0` 与默认
+`minhash_num_perm = 128` 的组合拒绝为 CONFIG_ERROR，stderr 不含 datasketch 异常或 traceback；同一配置层还验证了
+`0.99 + 128` 被拒绝、`0.95 + 64` 正常装载。完整离线命令
+`uv run --python 3.12 pytest -q -m 'not integration'` 结果为 2610 passed、47 deselected。
 
 ## 历史非序列 findings 摘要
 

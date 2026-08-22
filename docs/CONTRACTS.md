@@ -1869,6 +1869,9 @@ Profile × reference-set × vision navigation table (non-normative consolidation
 TOML structure:
 1. **文件结构与版本键** — Both files contain `schema_version = 1`. Missing required keys →
    error; type mismatches per §5 tables → error; unknown keys → warning.
+   `dedup.minhash_threshold` must be in `(0,1]`, and its combination with
+   `dedup.minhash_num_perm` must initialize the production `MinHashLSH` index during M1;
+   an incompatible combination is an error located at `dedup.minhash_threshold`.
 
 Profile references:
 2. **profile 引用存在** — `quality.llm`, `annotate.llm`, each element of `generate.llms`,
@@ -2585,7 +2588,9 @@ normalization, whitespace-run collapse to single space, strip; UI modality:
 `cluster_key` = first 16 hex of the cluster head's exact key (unique records: own key).
 Approximate layer:
 character n-grams (n=`ngram`) over the collapsed text, `minhash_num_perm` permutations, LSH at
-`minhash_threshold`, verify candidates by signature-estimated Jaccard. Image layer (UI): 64-bit
+`minhash_threshold`, verify candidates by signature-estimated Jaccard. M1 initializes an empty
+production `MinHashLSH` with the same threshold/permutation pair so `validate` cannot accept a
+combination that `run` cannot initialize. Image layer (UI): 64-bit
 pHash, Hamming ≤ `image_phash_max_distance`; matched by linear scan over all kept hashes — a
 recorded deviation from spec 3.3.3's 16-bit-prefix bucketing (see §12 #24, the pHash
 linear-scan ruling). UI composite verdict via
