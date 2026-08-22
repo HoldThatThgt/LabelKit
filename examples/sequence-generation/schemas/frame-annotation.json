@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "examples": [
+    {
+      "request_id": "R-EXAMPLE",
+      "observed_status": "pending",
+      "summary": "请求者提交了订票需求。"
+    }
+  ],
+  "properties": {
+    "request_id": {"type": "string", "minLength": 1},
+    "observed_status": {
+      "enum": ["pending", "acknowledged", "ticketed", "blocked", "expired"]
+    },
+    "summary": {"type": "string", "minLength": 1, "maxLength": 160}
+  },
+  "required": ["request_id", "observed_status", "summary"],
+  "additionalProperties": false
+}

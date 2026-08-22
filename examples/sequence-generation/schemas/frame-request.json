@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "examples": [{"utterance": "请帮我预订车票。", "request_id": "R-EXAMPLE", "status": "pending"}],
+  "properties": {
+    "utterance": {"type": "string", "minLength": 1, "maxLength": 240},
+    "request_id": {"type": "string", "minLength": 1},
+    "status": {"const": "pending"}
+  },
+  "required": ["utterance", "request_id", "status"],
+  "additionalProperties": false
+}

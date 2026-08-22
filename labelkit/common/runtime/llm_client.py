@@ -54,8 +54,13 @@ from labelkit.common.observability.obslog import (
 
 _logger = logging.getLogger("labelkit.llm")
 
-ANTHROPIC_VERSION = "2023-06-01"          # [FROZEN in CONTRACTS.md §7.8]
-STRUCTURED_TOOL_NAME = "emit"             # [FROZEN in CONTRACTS.md §7.8]
+ANTHROPIC_VERSION = "2023-06-01"          # CONTRACTS.md §7.8 冻结
+STRUCTURED_TOOL_NAME = "emit"             # CONTRACTS.md §7.8 冻结
+STRUCTURED_TOOL_DESCRIPTION = (            # CONTRACTS.md §7.8 冻结
+    "Use this tool to return the final JSON object requested by the user. "
+    "Populate every required field according to input_schema. "
+    "Do not answer with prose or Markdown. Call the tool exactly once."
+)
 _MAX_BACKOFF_S = 60.0                     # 退避封顶（spec 3.9.3）——v1.6 起只覆盖非 429 可重试错误
 _MAX_KEY_COOLDOWN_S = 300.0               # 无 Retry-After 时的每键 429 冷却封顶（spec 3.9.3）
 _PARK_SLICE_S = 60.0                      # 驻留分片时长；每片复检熔断（v1.6）
@@ -610,7 +615,11 @@ def _build_anthropic_body(profile: LLMProfile, prompt: PromptBundle,
     if system_chunks:
         body["system"] = "\n".join(system_chunks)
     if response_schema is not None and profile.supports_structured_output:
-        body["tools"] = [{"name": STRUCTURED_TOOL_NAME, "input_schema": response_schema}]
+        body["tools"] = [{
+            "name": STRUCTURED_TOOL_NAME,
+            "description": STRUCTURED_TOOL_DESCRIPTION,
+            "input_schema": response_schema,
+        }]
         body["tool_choice"] = {"type": "tool", "name": STRUCTURED_TOOL_NAME}
     return body
 
@@ -1118,7 +1127,7 @@ class LLMClient:
                                     f"no materialized credentials for profile "
                                     f"{profile!r}"))]
         members = _pool_members(kind, prof, self._credentials)
-        pooled = len(members) > 1 and not first_only
+        pooled = len(_declared_env_names(prof)) > 1 and not first_only
         if first_only:
             members = members[:1]
         return [await self._probe_one(_ProbeTarget(

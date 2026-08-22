@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "request": {
+      "type": "object",
+      "properties": {"status": {"enum": ["pending", "acknowledged"]}},
+      "required": ["id", "status", "acknowledged"]
+    },
+    "ticket": {
+      "type": "object",
+      "properties": {"status": {"const": "none"}},
+      "required": ["id", "status"]
+    }
+  },
+  "required": ["request", "ticket", "sla"]
+}

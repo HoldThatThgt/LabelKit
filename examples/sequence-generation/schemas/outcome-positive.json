@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "examples": [{"request": {"status": "ticketed", "acknowledged": true}, "ticket": {"id": "T-EXAMPLE", "status": "issued"}}],
+  "properties": {
+    "request": {
+      "type": "object",
+      "properties": {"status": {"const": "ticketed"}, "acknowledged": {"const": true}},
+      "required": ["status", "acknowledged"]
+    },
+    "ticket": {
+      "type": "object",
+      "properties": {"id": {"type": "string", "minLength": 1}, "status": {"const": "issued"}},
+      "required": ["id", "status"]
+    }
+  },
+  "required": ["request", "ticket"]
+}

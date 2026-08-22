@@ -77,7 +77,8 @@ v1.11 补两条边界规则：
 
 ## 14.3 读懂修复分布：resolved_at
 
-报告的 `schema_engine.resolved_at` 是模型「结构纪律」的体检单（仅统计**用户 Schema** 的标注调用——含 v1.13 走按序列类 Schema 的调用；裁决/评审/生成等内部结构不计入，v1.12 走独立帧 Schema 的帧级标注同样不计入——三者的分界见 14.5 末尾那张表）：
+报告的 `schema_engine.resolved_at` 是模型「结构纪律」的体检单。它只统计**用户 Schema** 的记录级标注调用，
+包括按 sequence class 选择的有效 Schema；内部裁决、评审、生成与帧级标注不进入这个聚合桶。
 
 ```json
 "schema_engine": {"resolved_at": {"l0_or_clean": 4141, "l1": 87, "l3_1": 30, "l3_2": 3, "rejected": 9}}
@@ -155,17 +156,20 @@ def check_annotation(obj: dict, record: dict | None) -> list[str]:
 
 ### 三种用户 Schema，三种待遇
 
-到 v1.13 为止，「你声明的 Schema」有三份，各自的待遇不同——这张表是它们的分界线：
+用户可声明三类 Schema，它们的待遇不同：
 
 | Schema | 声明在哪 | 管什么 | 四层防线 | 代码回调校验层 | 计入 `resolved_at` | 失败去哪 |
 |---|---|---|---|:-:|:-:|---|
 | 全局输出 Schema | `[output].schema_path` / `schema_inline` | 主输出每一行的标注对象 | 全在 | ✓ | ✓ | rejects（`schema_violation` / `callback_violation`） |
-| **按序列类输出 Schema**（v1.13） | `[class.<类名>.annotate].schema_path` / `schema_inline`（至多其一） | **该类**的行；未声明的类回落全局 | 全在 | ✓ | ✓ | 同上 |
-| 帧级 Schema（v1.12） | `[frame.annotate].schema_path` / `schema_inline` | `_meta.stream.members[]` 里的帧标注对象 | 全在 | ✗ | ✗ | members[] 的 `status="failed"`，**不入 rejects** |
+| **按 sequence class 输出 Schema** | `[class.<类名>.annotate].schema_path` / `schema_inline`（至多其一） | **该类**的行；未声明的类回落全局 | 全在 | ✓ | ✓ | 同上 |
+| 帧级 Schema | `[frame.annotate].schema_path` / `schema_inline` | `_meta.stream.members[]` 里的帧标注对象 | 全在 | ✗ | ✗ | members[] 的 `status="failed"`，**不入 rejects** |
 
-**按类 Schema 与全局 Schema 待遇完全相同**（v1.13 特意如此：显式换一份 Schema 不该顺带丢掉回调校验与账目）——回调照常执行、`resolved_at` 照常计数，第 8 章那条「`resolved_at` 加总 = 进入标注算子的记录级标注调用数」的恒等式因此不变。它多出来的只有启动期的两条校验：每份类 Schema 各自过 draft 2020-12 元校验与 `_meta` 禁令，且**该类的 few-shot 示例用该类的 Schema 干跑**（v1.13 修掉了旧版「类示例统一过全局 Schema」的错配）。落盘前 emitter 还会按**该行类的有效 Schema** 再纯校验一次。用法与真实对照见第 27 章 27.6。
+**按类 Schema 与全局 Schema 待遇完全相同**：回调照常执行，`resolved_at` 照常计数。每份类 Schema
+各自过 draft 2020-12 元校验与 `_meta` 禁令，该类 few-shot 也用该类的有效 Schema 干跑。emitter 落盘前
+再按该行的有效 Schema 做纯校验。
 
-帧级 Schema 是那个特例（v1.12，第 25 章 25.6）：它与 `output.schema` 互相独立（各自元校验、各自的 few-shot 各自干跑、互不引用），但调用**不经过代码回调校验层**（`output.validator` 只管主输出行的标注对象），也不计入 `resolved_at`（14.3）。结构化输出层、确定性修复层、jsonschema 校验层与 LLM 修复环四层照常全在；修复穷尽的成员落 members[] 的 `failed` 状态位而非 rejects（第 11、25 章），emitter 落盘前同样有一次纯校验兜底——非法帧对象永不落盘。
+帧级 Schema 是特例（第 25 章）：它与 `output.schema` 互相独立，不经过 `output.validator`，也不计入
+`resolved_at`。四层结构保证仍完整在场；修复耗尽的成员落 members[] 的 `failed` 状态位而不是 rejects。
 
 ## 14.6 配置参考
 
@@ -183,14 +187,25 @@ max_repair_attempts = 2           # LLM 修复环轮数预算（代码回调校�
 
 ## 14.7 内部结构也走同一个引擎
 
-一个容易忽略的事实：不只你的标注 Schema，**LabelKit 自己的内部输出**——质量裁决 `{"judgments": [...]}`、pointwise 评分、评审结论 `{"critiques": [...], "verdict"}`、生成样本 `{"samples": [...]}`、分类结果 `{"class": ...}` / multi 模式的 `{"classes": [...]}`（v1.7），以及 v1.8/v1.9 stream 一族的四个：分段的**窗口关系表** `{"frames": [{index, relation}]}`（逐帧关系用封闭五词表枚举锁死，LLM 答不出词表外的边界判断）、摘取的**动作对象** `{"action_type", "target", "value", "description"}`（动作类型用 11 值词表锁死，target/value 是可空联合）、序列评审的**缺陷表** `{"critiques", "defects", "verdict"}`（缺陷种类用六值枚举锁死——v1.9 起含 `wrong_stitch`，意见与缺陷在前、结论在后）、缝合的**判定对象** `{"verdict", "thread_ref", "task_name", "reason", "confidence"}`（v1.9：resume/new 二值 verdict 加可空线索编号，编号越界由代码侧收窄为保守的 new），v1.12 帧分类的**帧标签数组** `{"labels": [<帧类枚举>, …]}`（enum 锁死帧类词表、条目数锁死为窗口成员数，缺项由代码侧落兜底帧类），以及时间流生成的内部对象也全部经由同一个 `complete_validated()` 入口、同一套四层防线。默认时间流路径的蓝图仍是 `{"steps": [{frame_class, brief}]}`；v1.16 联合 planner 已经冻结帧类词时，蓝图收窄为 **brief 表** `{"steps": [{brief}]}`，条目数仍锁死为 L，模型不能改位置或帧类。帧实现继续用 draft 2020-12 的 `prefixItems` 给每个位置套上对应帧类 Schema；时间字段先从这一面剔除，待时间轴冻结后机械回填。所以：
+不只用户标注，LabelKit 的内部 LLM 输出也走 SchemaEngine：质量裁决、pointwise 评分、评审结论、
+flat 生成样本、闭集分类、分段关系、动作对象、缝合判定，以及 sequence generation 的 ScenarioSeed、
+EventPlan、frame payload、SemanticEvaluation 和 noise 判定。内部 Schema 不计入用户 `resolved_at`，但它们的
+repair、token 与 trace 仍完整记账。
 
 - 裁决输出偶尔非法不会炸：修不好按平局计（`judgment_invalid`，对 Bradley-Terry 中性），计入 `report.quality.judgment_failures`；
 - 内部修复调用同样计入 token 计量与 `llm.call` trace 事件——账一分不少；
-- 分类结果的内部 Schema（v1.7）用 enum 封闭集锁死类名词表——标签不可能落在你的类别表之外；multi 模式刻意**不写** `uniqueItems`（部分供应商的结构化输出实现会硬拒该关键字），重复标签由 classify 算子在校验通过后做确定性去重归一化；
-- 帧实现的 `prefixItems`（v1.13）是 draft 2020-12 的正规关键字、jsonschema 校验层原生支持，但个别对结构化输出关键字挑剔的路由可能对含它的请求直接 400——处置是配置级的：把该 profile 的 `supports_structured_output` 声明为 `false`，让这类调用走「文本 + 确定性修复层解析」的路径（`examples/synth-stream` 的 DeepSeek 端点就是这么配的，第 27 章 27.5）。
-- **v1.14 的档位覆盖约束走同一条路**（第 27 章 27.4）：声明了帧类构成档位后，蓝图的内部 Schema 多一组 `allOf` + 逐类 `contains`，用来硬保证「档内每个帧类至少出现一次」。三句实操结论。① **L0 关掉的端点上，覆盖靠提示词 + 修复环**：结构化输出层不上行时，服从性由蓝图提示词里那句「[帧类表] 中每个帧类都至少出现一次」承担，违约由校验层逮住后进修复环——修复提示会**点名缺了哪个帧类**（形如 `steps: missing required frame_class "confirmation"`，不是一坨裸数组），所以修复轮有指导性；与 `prefixItems` 是同一套纪律。② **strict 路由拒收的形态是快速失败，不是逐序列作废**：对 `allOf` / `contains` 挑剔的网关会让**第一个蓝图调用就吃 HTTP 400**，而这类错误计入熔断连击——连续 400 会以退出码 4 收场，而不是安静地把序列一条条作废（看到「刚开跑就 4」先怀疑这里）。③ **处置同款且只有一处**：把该 profile 的 `supports_structured_output` 声明为 `false`；`openai_compatible` 的 strict 结构化输出网关在文档里就明载不支持 `allOf` / `contains`，遇上照此处置，不需要动任何调用级参数、也不需要改档位表。
-- **v1.16 的 brief Schema 更窄**：规则或窗口激活联合 planner 后，`brief_schema(L)` 只允许每个位置返回一个 `brief`。帧类、长度、时间轴、session 与 crossing 都不是模型输出，Schema repair 也无权改变它们。
-- **correlation 序列不做实现调用对半拆分**：需要比较的字段必须在一次 realization 中看到完整上下文。若整条实现装不进 profile 的输入预算，M1 在启动时拒绝；运行期仍遇到溢出或截断则作废整条序列，不引入拆分后再猜字段相等的兼容路径。
+- 分类结果的内部 Schema 用 enum 封闭集锁死类名；multi 重复标签在 Schema 通过后确定性归一化。
+- sequence 的每个 frame class 必须是完整 object Schema。系统按 payload binding 覆盖权威 state value 后，
+  用同一完整 Schema 复验，不能通过改写 Schema 或把 authoritative value 送进 L3 来掩盖冲突。
+- instruction-only 的 `EventPlanRequest` 显式携带并呈现完整 `state_schema`，让真实 L3 repair 能看到合法枚举；
+  declared request 的该字段固定为 null，权威 Schema 从冻结 program/context 解析。
+- pre-state 与 base-state 进入 L3 的违规文本固定为
+  `<kind>:<json-pointer>:<validator-keyword>`，不包含 actual/expected value。
+- declared 最后事件的 outcome post-validation 由 hidden baseline 机械选择 positive Schema、交付 branch 选择
+  当前 variant Schema；L3 同样只接收 value-free pointer/keyword。StateEvaluator 随后独立重放复验。
+- production post-validator 返回的冻结 `EventExecution` 就是正式提交消费的同一实例，不能丢弃证据后重放。
+- DeepSeek 示例声明 `supports_structured_output = false`，验证文本 JSON、确定性解析与真实修复环；
+  z.ai 用例验证原生 structured-output body。最终真实端点结果为 DeepSeek 5 passed in 119.26s、
+  z.ai 1 passed in 60.81s；显式双-noise 与两条 failure injection 均走生产 LLMClient 与真实服务端。
 
 这就是「LLM 输出不可信」原则的完整落地：**没有任何一条 LLM 文本能绕过校验进入任何下游**。

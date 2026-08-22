@@ -1,0 +1,170 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "examples": [
+    {
+      "public": {"service": "rail_ticketing"},
+      "actors": {
+        "requester": {"knowledge": []},
+        "system": {"knowledge": []}
+      },
+      "goal": {
+        "origin": "上海",
+        "destination": "北京",
+        "travel_date": "2026-01-08"
+      },
+      "request": {"id": "R-EXAMPLE", "status": "new", "acknowledged": false},
+      "ticket": {"id": null, "status": "none"},
+      "audit": [],
+      "sla": {"max_ack_to_confirm_us": 1200000000, "expired": false},
+      "hidden_sentinel": "example-secret"
+    }
+  ],
+  "properties": {
+    "public": {
+      "type": "object",
+      "properties": {"service": {"const": "rail_ticketing"}},
+      "required": ["service"],
+      "additionalProperties": false
+    },
+    "actors": {
+      "type": "object",
+      "properties": {
+        "requester": {"$ref": "#/$defs/actor_state"},
+        "system": {"$ref": "#/$defs/actor_state"}
+      },
+      "required": ["requester", "system"],
+      "additionalProperties": false
+    },
+    "goal": {
+      "type": "object",
+      "properties": {
+        "origin": {"type": "string", "minLength": 1},
+        "destination": {"type": "string", "minLength": 1},
+        "travel_date": {"type": "string", "minLength": 1}
+      },
+      "required": ["origin", "destination", "travel_date"],
+      "additionalProperties": false
+    },
+    "request": {
+      "type": "object",
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "status": {
+          "enum": ["new", "pending", "acknowledged", "ticketed", "blocked", "expired"]
+        },
+        "acknowledged": {"type": "boolean"}
+      },
+      "required": ["id", "status", "acknowledged"],
+      "additionalProperties": false
+    },
+    "ticket": {
+      "type": "object",
+      "properties": {
+        "id": {"type": ["string", "null"]},
+        "status": {"enum": ["none", "issued", "not_issued"]}
+      },
+      "required": ["id", "status"],
+      "additionalProperties": false
+    },
+    "audit": {"type": "array", "items": {"type": "string"}, "maxItems": 32},
+    "sla": {
+      "type": "object",
+      "properties": {
+        "max_ack_to_confirm_us": {"type": "integer", "const": 1200000000},
+        "expired": {"type": "boolean"}
+      },
+      "required": ["max_ack_to_confirm_us", "expired"],
+      "additionalProperties": false
+    },
+    "hidden_sentinel": {"type": "string", "minLength": 1}
+  },
+  "required": ["public", "actors", "goal", "request", "ticket", "audit", "sla", "hidden_sentinel"],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "request": {
+            "properties": {"status": {"const": "ticketed"}},
+            "required": ["status"]
+          }
+        },
+        "required": ["request"]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "properties": {"acknowledged": {"const": true}},
+            "required": ["acknowledged"]
+          },
+          "ticket": {
+            "properties": {
+              "id": {"type": "string", "minLength": 1},
+              "status": {"const": "issued"}
+            },
+            "required": ["id", "status"]
+          },
+          "sla": {
+            "properties": {"expired": {"const": false}},
+            "required": ["expired"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "request": {
+            "properties": {"status": {"const": "blocked"}},
+            "required": ["status"]
+          }
+        },
+        "required": ["request"]
+      },
+      "then": {
+        "properties": {
+          "ticket": {
+            "properties": {"id": {"type": "null"}, "status": {"const": "not_issued"}},
+            "required": ["id", "status"]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "request": {
+            "properties": {"status": {"const": "expired"}},
+            "required": ["status"]
+          }
+        },
+        "required": ["request"]
+      },
+      "then": {
+        "properties": {
+          "request": {
+            "properties": {"acknowledged": {"const": true}},
+            "required": ["acknowledged"]
+          },
+          "ticket": {
+            "properties": {"id": {"type": "null"}, "status": {"const": "not_issued"}},
+            "required": ["id", "status"]
+          },
+          "sla": {
+            "properties": {"expired": {"const": true}},
+            "required": ["expired"]
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "actor_state": {
+      "type": "object",
+      "properties": {"knowledge": {"type": "array", "items": {"type": "string"}, "maxItems": 32}},
+      "required": ["knowledge"],
+      "additionalProperties": false
+    }
+  }
+}

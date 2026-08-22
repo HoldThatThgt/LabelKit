@@ -12,7 +12,7 @@ profile 只保存环境变量名；密钥值仅在 ``run`` 与 ``validate --prob
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Mapping
 
@@ -48,8 +48,10 @@ def _freeze_pool(table: Mapping[str, tuple[str, ...]],
 class RuntimeCredentials:
     """仅真实网络运行持有的 profile 密钥值（CONTRACTS §7.19.3 冻结块）。"""
 
-    llm: Mapping[str, tuple[str, ...]]
-    embedding: Mapping[str, tuple[str, ...]]
+    llm: Mapping[str, tuple[str, ...]] = field(    # LLM profile 到密钥值池
+        repr=False, compare=False)
+    embedding: Mapping[str, tuple[str, ...]] = field(  # embedding profile 到密钥值池
+        repr=False, compare=False)
 
     def __post_init__(self) -> None:
         """两个 mapping 复制为键排序的只读映射；value 去重保序且非空。"""
@@ -67,6 +69,8 @@ def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
     @param cfg: 已解析配置
     @return: (LLM profile 名列表, embedding profile 名列表)
     """
+    if cfg.generate.form == "sequence":
+        return _sequence_profiles(cfg)
     llm_names: list[str] = []
     if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
         llm_names.append(cfg.segment.llm)
@@ -103,6 +107,33 @@ def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
     emb_names: list[str] = []
     if cfg.dedup.enabled and cfg.dedup.semantic and cfg.dedup.semantic_embedding:
         emb_names.append(cfg.dedup.semantic_embedding)
+    return list(dict.fromkeys(llm_names)), list(dict.fromkeys(emb_names))
+
+
+def _sequence_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
+    """按 v1.18 固定阶段顺序收集 sequence 运行 profile。
+
+    @param cfg 完整解析配置
+    @return 首次出现去重的 LLM 与 embedding profile 表
+    """
+    sequence = cfg.sequence_generation
+    llm_names: list[str] = []
+    if sequence is not None:
+        llm_names.extend((sequence.semantic_profile, sequence.evaluation_profile))
+    views = tuple(cfg.class_views.values())
+    if cfg.quality.enabled:
+        llm_names.extend(view.quality.llm for view in views)
+    if cfg.annotate.enabled:
+        llm_names.extend(view.annotate.llm for view in views)
+    if cfg.frame_annotate.enabled:
+        llm_names.append(cfg.frame_annotate.llm)
+    if cfg.verify.enabled:
+        for view in views:
+            llm_names.extend(view.verify.judges or (view.verify.llm,))
+    if cfg.output.repair_llm:
+        llm_names.append(cfg.output.repair_llm)
+    emb_names = ([cfg.dedup.semantic_embedding]
+                 if cfg.dedup.semantic and cfg.dedup.semantic_embedding else [])
     return list(dict.fromkeys(llm_names)), list(dict.fromkeys(emb_names))
 
 

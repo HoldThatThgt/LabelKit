@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import os
 import pickle
+from pathlib import Path
 
 import pytest
 
@@ -207,9 +208,19 @@ def test_credentials_have_no_secret_display_or_serialization_surface():
         dataclasses.asdict(creds)                  # asdict 内部 deepcopy 同样被拒
 
 
-def test_credentials_equality_is_value_based():
-    assert (RuntimeCredentials(llm={"p": ("k",)}, embedding={})
-            == RuntimeCredentials(llm={"p": ("k",)}, embedding={}))
+def test_credentials_equality_never_compares_secret_values():
+    assert (RuntimeCredentials(llm={"p": ("first-secret",)}, embedding={})
+            == RuntimeCredentials(llm={"p": ("different-secret",)}, embedding={}))
+
+
+def test_sequence_referenced_profiles_follow_the_fixed_stage_order():
+    root = Path(__file__).resolve().parents[3] / "examples" / "sequence-generation"
+    from labelkit.common.config import load
+
+    cfg = load(root / "config.toml", root / "project.toml", CliOverrides())
+    llms, embeddings = referenced_profiles(cfg)
+    assert llms == ["default", "judge"]
+    assert embeddings == []
 
 
 # ── 命令分流：静态面零环境变量 value 读（SPEC-SP §5.2） ─────────────────────

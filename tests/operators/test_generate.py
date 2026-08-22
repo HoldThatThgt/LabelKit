@@ -7,8 +7,11 @@ follow the test_annotate.py precedent: a duck-typed SchemaEngine stand-in + asyn
 import asyncio
 import hashlib
 import json
+import logging
 import random
 from types import SimpleNamespace
+
+import pytest
 
 from labelkit.common.config.model import (
     AnnotateConfig,
@@ -33,7 +36,13 @@ from labelkit.common.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.common.errors import ProviderRetryableError, SchemaViolation
+from labelkit.common.errors import (
+    ContextOverflowError,
+    InternalError,
+    ProviderRetryableError,
+    SchemaViolation,
+)
+from labelkit.common.extensions.hooks import ResolvedHook, ValidationHooks
 from labelkit.operators.generate import (
     CallPlan,
     ClassSegment,
@@ -53,6 +62,7 @@ from labelkit.operators.generate import (
     void_log_message,
 )
 from labelkit.common.contracts.types import Classification, PipelineItem, QualityScore, Record, RecordRef
+from tests import hook_samples
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -63,6 +73,7 @@ class Recorder:
     def __init__(self):
         self.counters: dict[str, int] = {}
         self.events: list[dict] = []
+        self.provider_results: list[bool] = []
 
     def count(self, key: str, n: int = 1) -> None:
         self.counters[key] = self.counters.get(key, 0) + n
@@ -70,6 +81,9 @@ class Recorder:
     def event(self, ev, *, stage, batch_no, record_ids=(), payload=None) -> None:
         self.events.append({"ev": ev, "stage": stage, "batch_no": batch_no,
                             "record_ids": tuple(record_ids), "payload": payload or {}})
+
+    def record_provider_result(self, *, fatal: bool) -> None:
+        self.provider_results.append(fatal)
 
 
 def mk_cfg(generate: GenerateConfig | None = None, quality: QualityConfig | None = None,
@@ -465,6 +479,15 @@ def test_canonical_json_matches_m2_rule():
     assert canonical_json({"b": 1, "a": "中"}) == '{"a":"中","b":1}'
 
 
+def test_flat_deepcopy_json_does_not_share_nested_values():
+    from labelkit.operators.generation.flat import deepcopy_json
+
+    source = {"nested": [{"value": 1}]}
+    copied = deepcopy_json(source)
+    copied["nested"][0]["value"] = 2
+    assert source == {"nested": [{"value": 1}]}
+
+
 # ── bucket accounting + events (pure postprocess) ──────────────────────────
 
 def test_bucket_key_format():
@@ -682,8 +705,14 @@ def test_select_seeds_ignores_labels_when_classify_disabled():
 def test_postprocess_sample_validator_filters_and_counts():
     from dataclasses import replace
     cfg = mk_cfg()
-    cfg = replace(cfg, generate=replace(
-        cfg.generate, sample_validator="tests.hook_samples:sample_min10"))
+    reference = "tests/hook_samples.py:sample_min10"
+    cfg = replace(
+        cfg,
+        generate=replace(cfg.generate, sample_validator=reference),
+        validation_hooks=ValidationHooks(
+            sample=ResolvedHook(reference, hook_samples.sample_min10)
+        ),
+    )
     metrics = Recorder()
     plans = [_plan(0, "a", "s1")]
     results = [["太短", "这一条样本足够长可以通过回调校验器的长度要求"]]
@@ -698,8 +727,14 @@ def test_postprocess_sample_validator_zero_touch_and_exception(caplog):
     import logging
     from dataclasses import replace
     cfg = mk_cfg()
-    cfg = replace(cfg, generate=replace(
-        cfg.generate, sample_validator="tests.hook_samples:boom"))
+    reference = "tests/hook_samples.py:boom"
+    cfg = replace(
+        cfg,
+        generate=replace(cfg.generate, sample_validator=reference),
+        validation_hooks=ValidationHooks(
+            sample=ResolvedHook(reference, hook_samples.boom)
+        ),
+    )
     metrics = Recorder()
     plans = [_plan(0, "a", None)]
     results = [["这一条样本足够长但回调会爆炸把它当违规剔除"]]
@@ -867,6 +902,31 @@ def test_generate_all_flat_path_ignores_classes():
             assert key.split(".")[2].count("×") == 1  # two-segment keys
 
 
+def test_generate_all_seedless_honours_limit_before_dispatch():
+    generate = GenerateConfig(
+        enabled=True, instruction="全局生成指令", standalone_count=5, num_per_call=4,
+    )
+    cfg = mk_cfg(generate=generate, mode="generate_only", limit=3)
+    engine = SamplesEngine(generate.num_per_call)
+    metrics = Recorder()
+    ctx = SimpleNamespace(
+        cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
+        rng=random.Random(0), batch_no=0,
+    )
+    records = asyncio.run(GenerateStage(cfg).generate_all(ctx))
+    assert len(engine.calls) == 1
+    assert len(records) == 3
+
+
+def test_stage_empty_seed_pool_and_sequence_form_guard():
+    cfg = mk_cfg(quality=QualityConfig(threshold=0.5))
+    items, engine, _metrics = run_stage(cfg, [])
+    assert items == [] and engine.calls == []
+    sequence = mk_cfg(generate=GenerateConfig(enabled=True, form="sequence"))
+    with pytest.raises(InternalError, match="cannot enter GenerateStage"):
+        GenerateStage(sequence)
+
+
 # ── v1.11 seed packing (spec 3.6.2 上下文预算装填 row / §3.3⑦, V27①) ─────────
 
 def _budget_profile(context_window: int, name: str = "default"):
@@ -962,8 +1022,6 @@ def test_stage_trims_seeds_and_counts_truncations():
 
 
 def test_stage_unfittable_call_voided_with_context_overflow_kind(caplog):
-    import logging
-
     g = GenerateConfig(enabled=True, instruction="gen", seeds_per_call=4,
                        num_per_record=4, num_per_call=4)
     cfg = _budget_cfg(530, generate=g, quality=QualityConfig(threshold=0.5))
@@ -977,6 +1035,32 @@ def test_stage_unfittable_call_voided_with_context_overflow_kind(caplog):
     assert "generate.buckets.default×null.produced" not in metrics.counters
     assert "budget.truncations.generate" not in metrics.counters
     assert any("kind=context_overflow" in r.message for r in caplog.records)
+
+
+def test_stage_reactive_context_overflow_feeds_breaker_once(caplog):
+    class OverflowEngine:
+        """始终返回一次 reactive HTTP 400 context overflow。"""
+
+        async def complete_validated(self, *_args, **_kwargs):
+            raise ContextOverflowError(
+                "context exceeded", phase="reactive", profile="default", origin="http_400",
+            )
+
+    generate = GenerateConfig(
+        enabled=True, instruction="gen", seeds_per_call=1,
+        num_per_record=1, num_per_call=1,
+    )
+    cfg = mk_cfg(generate=generate, quality=QualityConfig(threshold=0.5))
+    metrics = Recorder()
+    ctx = SimpleNamespace(
+        cfg=cfg, llm=None, schema_engine=OverflowEngine(), metrics=metrics,
+        rng=random.Random(0), batch_no=1,
+    )
+    batch = [mk_item("id", "足够长的种子样本文本", 0.9)]
+    with caplog.at_level(logging.WARNING, logger="labelkit.generate"):
+        assert asyncio.run(GenerateStage(cfg).run(batch, ctx)) == []
+    assert metrics.provider_results == [True]
+    assert any("kind=context_overflow" in record.message for record in caplog.records)
 
 
 def test_error_kind_routes_budget_vocabulary_first():

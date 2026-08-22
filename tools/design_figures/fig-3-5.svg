@@ -1,0 +1,47 @@
+<svg viewBox="0 0 1000 430" xmlns="http://www.w3.org/2000/svg" font-family="PingFang SC, sans-serif">
+  <defs>
+    <marker id="arr35" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7"
+            orient="auto-start-reverse">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#4b5563"/>
+    </marker>
+  </defs>
+  <g fill="none" stroke="#4b5563" stroke-width="2" marker-end="url(#arr35)">
+    <line x1="180" y1="75" x2="245" y2="75"/>
+    <line x1="405" y1="75" x2="470" y2="75"/>
+    <line x1="630" y1="75" x2="695" y2="75"/>
+    <line x1="775" y1="110" x2="775" y2="157"/>
+    <path d="M 695 215 H 570 V 285 H 480"/>
+    <path d="M 855 215 H 930 V 285 H 840"/>
+    <line x1="480" y1="285" x2="455" y2="285"/>
+    <line x1="840" y1="285" x2="815" y2="285"/>
+    <path d="M 315 320 V 365 H 455"/>
+    <path d="M 675 320 V 365 H 535"/>
+  </g>
+  <g font-size="15" text-anchor="middle">
+    <rect x="40" y="40" width="140" height="70" rx="8" fill="#eef3fa" stroke="#2456a6"/>
+    <text x="110" y="70">ScenarioSeed</text>
+    <text x="110" y="93" font-size="13">完整世界初态</text>
+    <rect x="245" y="40" width="160" height="70" rx="8" fill="#eef8f0" stroke="#2e8b57"/>
+    <text x="325" y="66">baseline</text>
+    <text x="325" y="89" font-size="13">plan → execute → render</text>
+    <rect x="470" y="40" width="160" height="70" rx="8" fill="#fdf7ee" stroke="#c9861a"/>
+    <text x="550" y="66">baseline 判定</text>
+    <text x="550" y="89" font-size="13">机械规则 + 语义评估</text>
+    <rect x="695" y="40" width="160" height="70" rx="8" fill="#f6f1fb" stroke="#7a4fb5"/>
+    <text x="775" y="66">variant 分支</text>
+    <text x="775" y="89" font-size="13">按声明顺序执行</text>
+    <polygon points="775,157 855,215 775,273 695,215" fill="#fff7ed" stroke="#c9861a"/>
+    <text x="775" y="208" font-size="13">protected</text>
+    <text x="775" y="227" font-size="13">prefix?</text>
+    <rect x="175" y="250" width="280" height="70" rx="8" fill="#eef8f0" stroke="#2e8b57"/>
+    <text x="315" y="278">复用 EventDraft 语义字段</text>
+    <text x="315" y="301" font-size="13">重派生分支 ID 与工件时间</text>
+    <rect x="535" y="250" width="280" height="70" rx="8" fill="#fff1f2" stroke="#b04a4a"/>
+    <text x="675" y="278">从 divergence 重新生成</text>
+    <text x="675" y="301" font-size="13">plan → execute → render</text>
+    <rect x="455" y="340" width="80" height="50" rx="25" fill="#eef3fa" stroke="#2456a6"/>
+    <text x="495" y="370">独立判定</text>
+    <text x="626" y="205" fill="#2e8b57" font-size="13">是</text>
+    <text x="909" y="205" fill="#b04a4a" font-size="13">否</text>
+  </g>
+</svg>

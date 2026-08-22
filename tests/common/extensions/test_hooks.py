@@ -1,4 +1,4 @@
-"""Offline unit tests for labelkit/common/extensions/hooks.py (v1.17 SPEC-SP §4.9).
+"""Offline unit tests for labelkit/common/extensions/hooks.py.
 
 file-form 钩子面（``<python-file>:<attribute-path>``）纯逻辑测试——不涉 LLM。
 fixture 用 tmp 目录下的真实 .py 文件（文件形态装载的真实执行路径）。
@@ -10,20 +10,17 @@ from pathlib import Path
 
 import pytest
 
-from labelkit.common.contracts.types import (
-    ScenarioValidationInput,
-    SequenceValidationFrame,
-    SequenceValidationInput,
-)
+from labelkit.common.contracts.generation import StateTransitionInput
 from labelkit.common.extensions.hooks import (
     ResolvedHook,
     ValidationHooks,
     check_hook_arity,
-    clone_sequence_input,
+    clone_state_input,
     load_hook,
+    normalize_state_violations,
     normalize_violations,
     probe_hook,
-    scenario_probe_input,
+    state_probe_input,
 )
 
 # 仓库根下的样本钩子文件（文件形态装载面复用它）。
@@ -157,7 +154,7 @@ def test_resolved_hook_repr_and_equality_exclude_target(hook_dir):
 
 def test_validation_hooks_defaults_are_none():
     hooks = ValidationHooks()
-    assert (hooks.output, hooks.sample, hooks.sequence, hooks.scenario) == 4 * (None,)
+    assert (hooks.output, hooks.sample, hooks.state) == 3 * (None,)
 
 
 def test_check_hook_arity(hook_dir):
@@ -184,38 +181,45 @@ def test_normalize_violations():
         normalize_violations("nope", "r")
 
 
-def _sequence_input() -> SequenceValidationInput:
-    """构造序列级钩子测试输入。"""
-    return SequenceValidationInput(
-        sequence_class="booking",
-        tier_rank=2,
-        frames=(SequenceValidationFrame(
-            position=0,
-            frame_class="request",
-            payload={"nested": {"value": "original"}, "items": [1]},
-        ),),
+def _state_input() -> StateTransitionInput:
+    """构造状态转换钩子测试输入。"""
+    return StateTransitionInput(
+        slot_key="slot-1",
+        variant="minority",
+        role=None,
+        state_before={"nested": {"value": "original"}, "items": [1]},
+        state_after={"nested": {"value": "changed"}, "items": [1, 2]},
+        patch=({"op": "replace", "path": "/nested", "value": {"items": [2]}},),
     )
 
 
-def test_clone_sequence_input_deep_copies_payload_and_preserves_metadata():
-    original = _sequence_input()
-    cloned = clone_sequence_input(original)
+def test_clone_state_input_recursively_thaws_and_preserves_metadata():
+    original = _state_input()
+    cloned = clone_state_input(original)
     assert cloned is not original
-    assert cloned.sequence_class == "booking"
-    assert cloned.tier_rank == 2
-    assert cloned.frames[0] is not original.frames[0]
-    cloned.frames[0].payload["nested"]["value"] = "changed"
-    cloned.frames[0].payload["items"].append(2)
-    assert original.frames[0].payload == {
-        "nested": {"value": "original"}, "items": [1]}
+    assert (cloned.slot_key, cloned.variant, cloned.role) == ("slot-1", "minority", None)
+    assert cloned.state_before == original.state_before
+    assert cloned.patch == original.patch
+    assert cloned.state_before is not original.state_before
+    assert cloned.patch[0] is not original.patch[0]
+    assert cloned.patch[0]["value"] is not original.patch[0]["value"]
 
 
-def test_scenario_probe_input_is_minimal_and_user_data_free():
-    probe = scenario_probe_input()
-    assert isinstance(probe, ScenarioValidationInput)
-    assert probe.accepted == ()
-    assert probe.candidate.slot_key == "__m1_probe__"
-    assert probe.candidate.frames[0].payload == {}
+def test_state_probe_input_is_nested_and_user_data_free():
+    probe = state_probe_input()
+    assert isinstance(probe, StateTransitionInput)
+    assert probe.slot_key == "__m1_probe__"
+    assert probe.role is None
+    assert probe.state_before["nested"]["values"] == (1, 2)
+    assert probe.patch[0]["value"]["result"] == (3,)
+
+
+def test_normalize_state_violations_is_strict():
+    assert normalize_state_violations([], "r") == ()
+    assert normalize_state_violations(["bad"], "r") == ("bad",)
+    for invalid in (None, (), [""], [1], "bad"):
+        with pytest.raises(TypeError, match="must return list"):
+            normalize_state_violations(invalid, "r")
 
 
 def test_repo_hook_samples_file_form_still_loads():

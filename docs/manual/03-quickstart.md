@@ -1,6 +1,7 @@
 # 第 3 章　五分钟上手：第一个标注工程
 
-> 本章用仓库自带的 `examples/text` 工程走一遍完整流程。时间流 v1.17 的 quickstart 见第 27 章；其配置只读取 `LABELKIT_DEEPSEEK_KEY` 这个环境变量名，不把密钥值写入文件。
+> 本章用仓库自带的 `examples/text` 工程走一遍普通处理流程。序列生成 quickstart 见第 27 章；
+> 它只在运行时读取 `LABELKIT_DEEPSEEK_KEY` 的值，不把凭据写入配置或产物。
 
 ## 3.1 任务与数据
 

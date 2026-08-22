@@ -55,22 +55,7 @@ class RunContext:      # 传入每个 stage.run 的上下文
 
 #### v1.18 sequence slot 状态机
 
-~~~mermaid
-stateDiagram-v2
-    [*] --> Planned
-    Planned --> Attempting
-    Attempting --> Generated
-    Generated --> Evaluated
-    Evaluated --> Downstream
-    Generated --> Retry
-    Evaluated --> Retry
-    Downstream --> Retry
-    Downstream --> Accepted
-    Retry --> Attempting
-    Retry --> Exhausted
-    Accepted --> Committed
-    Exhausted --> DeliveryError
-~~~
+图 3-6 sequence slot attempt 与交付状态机
 
 slot 按 GenerationProgram declaration order 串行 admission；一个 counterfactual set 的 variant 也按声明序归并。
 无依赖 LLM 请求可以并发，但 seed/variant 结果归并、dedup probe、M11 装配、replay 投影、
@@ -85,7 +70,7 @@ DedupIndex.group_probe
 → pointwise QualityStage.run_attempt
 → AnnotateStage.run_attempt
 → VerifyStage.run_attempt
-→ SequenceDeliveryEmitter.assemble_sequence(final PipelineItem + ProjectedSequence)
+→ SequenceDeliveryEmitter.assemble_sequence(SequenceAssemblyRequest)
 → ReplayProjector(source SequenceRows + ReplayLayout)
 → CrossViewReconciler
 → retained_content_bytes prospective check
@@ -101,11 +86,19 @@ provider retry、成本、SchemaEngine resolved-at 与 trace event 是已发生�
 commit token 失效、index generation 或 digest 变化是
 `generation_dedup_transaction` 内部错误，不能重试为普通 duplicate。
 
+`SequenceAssemblyRequest` 把冻结 program、共享 SchemaEngine、最终 item、对应 projection 与固定 batch number
+闭包为 M11 的单一入参；emitter 构造器仍只绑定 paths，因此 planner failure 可在运行服务尚未构造时写 failed report。
+M11 终检失败抛 `sequence_projection_mismatch`，归 report 的 `reconcile` rejection bucket，并回滚整个当前 set
+attempt；它不是 AnnotateStage 已经接受后的第二个 `annotate` rejection。此时 dedup token、dataset delta、
+SequenceRows 与 replay 均未提交。
+
 `SequenceRows` 只能由 M11 以当次协作者返回的最终 item 装配；因此 inherited classification、
 quality score、sequence/frame annotation 与 verification 全部进入最终 main row、retained-content、
 delivery digest 和正式输出。ReplayProjector 只从这些最终 `SequenceRows.primary_stream_rows`
 派生已规划 replay，不读 pre-downstream Record。prospective 字节数恰等于既有已接受累计、
-当前 set 全部 `SequenceRows.retained_content_bytes` 与本次 `ReplayRows.retained_content_bytes` 之和。
+当前 set 全部 `SequenceRows.retained_content_bytes` 与本次按 ReplayLayout 分组的
+`ReplayRows.retained_content_bytes` 之和。`ReconcileRequest.retained_content_bytes` 携带该 prospective 总数，
+CrossView 必须从实际 sequence main/primary、noise 与 replay canonical rows 独立复算并要求完全相等。
 
 ~~~python
 async def deliver_generation(
@@ -117,10 +110,12 @@ async def deliver_generation(
 
 `GenerationServices(config, schema_engine, llm, metrics)` 是唯一运行服务根；
 `DeliveryServices(generation, dedup, quality, annotate, verify, emitter)` 不复制 `RunContext`。
-DeliveryController 为 dedup 和下游协作者派生 context 时，其 cfg、schema engine、LLM client 与
-metrics 必须分别与 `GenerationServices` 对应对象身份相同，只新建按 slot 派生的 rng 与固定
-batch number。`DeliveryRequest` 只携带 program、plan、paths、run attempt ID 与 run ID，不复制
-config 或 materialized credentials。
+DeliveryController 为 dedup 派生的 context 直接复用 source cfg；为 Quality、Annotate 与 Verify 派生的
+attempt-local cfg 必须把 `class_views`、`frame_class_views`、`frame_schema` 替换为
+`GenerationProgram.class_views`、`GenerationProgram.frame_classes`、`GenerationProgram.frame_schema`，正常、
+frame 与 repair 路径都不得再读 source cfg 的同名视图或 Schema。schema engine、LLM client 与 metrics 仍与
+`GenerationServices` 对应对象身份相同，只新建按 slot 派生的 rng 与固定 batch number。`DeliveryRequest` 只携带
+program、plan、paths、run attempt ID 与 run ID，不复制 config 或 materialized credentials。
 
 #### attempt 与运行终态
 

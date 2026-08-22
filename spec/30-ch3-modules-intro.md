@@ -29,4 +29,8 @@ flowchart LR
 | M11 发射 | 3.11：`assemble_sequence` 以最终 item 装配零 I/O `SequenceRows`；`prepare_product` 唯一计算 digest 并构造 `GenerationProduct(main_rows, stream_rows, report)`；全部 sequence/noise/replay 接受后才打开正式通道 | `commit` 只读 report 的同一 digest；main、stream、report 各自 `.part` + fsync + replace，manifest 最后替换；commit-I/O 可留下固定路径混代，旧 manifest 保持；failed report 不能否定有效 manifest |
 | common 契约 | 第 4 章：冻结含 `EventDraft` 的 generation dataclass、request/result 与 `DedupProbeToken`；Mapping 构造时复制为只读视图 | `EventDraft` 不含 role，`EventTruth` 不得用作逐事件 history；删除旧 `GenerateStreamConfig`、`ScenarioConfig`、旧 `ScenarioPlan`、`SequencePlan`、`StreamPlan` 与序列 hook 输入，不留 alias 或 wrapper |
 
-依赖方向保持 `cli → orchestration → operators → common`。新增 `jsonpatch` 用于 RFC 6902 原子状态执行；既有 `ortools==9.15.6755` 保持精确锁定。sequence 生产代码落 `labelkit/operators/generation/` 与 `labelkit/orchestration/generation_delivery.py`，旧 `labelkit/common/runtime/scenario/`、`labelkit/operators/generate_stream.py` 和 `labelkit/common/config/_generate_stream_constraints.py` 整体删除，不保留并行实现。
+依赖方向保持 `cli → orchestration → operators → common`。新增 `jsonpatch` 用于 RFC 6902 原子状态执行，并把生产代码
+直接使用的 `jsonpointer` 列为直接依赖；既有 `ortools==9.15.6755` 保持精确锁定。sequence 生产代码落
+`labelkit/operators/generation/` 与 `labelkit/orchestration/generation_delivery.py`，旧
+`labelkit/common/runtime/scenario/`、`labelkit/operators/generate_stream.py` 和
+`labelkit/common/config/_generate_stream_constraints.py` 整体删除，不保留并行实现。

@@ -702,6 +702,38 @@ def test_dry_run_rich_renders_estimate_tables(_finalize_renderers):
     assert "dry-run:" not in text            # the plain-anchor prefix is not ours
 
 
+def test_dry_run_rich_renders_exact_sequence_arithmetic_and_call_families(
+        _finalize_renderers):
+    """rich 静态表完整呈现 sequence 精确数量、attempt 边界与七类调用。"""
+    renderer, buf = _rich_renderer(_cfg(RICH, dry_run=True))
+    _finalize_renderers.append(renderer)
+    renderer.on_event(_ev("run.start"))
+    families = {
+        "scenario_seed_calls": 0,
+        "baseline_event_plan_calls": 6,
+        "variant_event_plan_calls": 8,
+        "frame_render_calls": 14,
+        "semantic_evaluation_calls": 8,
+        "noise_render_calls": 2,
+        "noise_evaluation_calls": 2,
+    }
+    sequence = {
+        "planned_sets": 2, "planned_sequences": 8, "primary_events": 22,
+        "noise_events": 2, "replay_sequences": 1, "replay_events": 3,
+        "stream_rows": 27, "successful_attempt_lower_bound": 48,
+        "max_slot_attempts_upper_bound": 384, "sequence_calls": families,
+    }
+    renderer.on_estimate({
+        "records": 8, "batches": 2, "total_calls": 48, "sequence": sequence,
+    })
+    renderer.on_event(_ev("run.end", payload={"counts": {}, "exit_code": 0}))
+    text = buf.getvalue()
+    for key, value in {**sequence, **families}.items():
+        if key != "sequence_calls":
+            assert key in text and str(value) in text
+    assert "sequence generation calls" in text
+
+
 # ── U24 layer ② — dry-run golden files (spec §7.8 回归锚 row) ───────────────
 #
 # The eight goldens under tests/cli/goldens/ keep the plain dry-run stderr
@@ -709,9 +741,8 @@ def test_dry_run_rich_renders_estimate_tables(_finalize_renderers):
 # were re-captured at v1.12 (the estimate line gained the two frame keys —
 # 裁决·估算上界与六 golden); dryrun-mix.txt (the examples/mix UI main project,
 # both frame passes on) and dryrun-mix-text.txt (its pure-DeepSeek text
-# sibling) are the v1.12-born mix pair; dryrun-synth-stream.txt is the
-# v1.13-born eighth (examples/synth-stream, the time-stream generate_only
-# form — 裁决·golden 冻结锚不动 keeps the seven older files byte-identical).
+# sibling) are the v1.12-born mix pair; dryrun-sequence-generation.txt is the
+# v1.18 sequence-delivery example while the seven older files stay byte-identical.
 # Real example fixtures are scanned (M2), but NO LLM call is made (dry-run).
 
 _EXAMPLES = Path(__file__).resolve().parents[2] / "examples"
@@ -726,7 +757,7 @@ _GOLDENS = Path(__file__).parent / "goldens"
     ("stream", "project-text.toml", "dryrun-stream-text.txt"),
     ("mix", "project.toml", "dryrun-mix.txt"),
     ("mix", "project-text.toml", "dryrun-mix-text.txt"),
-    ("synth-stream", "project.toml", "dryrun-synth-stream.txt"),
+    ("sequence-generation", "project.toml", "dryrun-sequence-generation.txt"),
 ])
 def test_dry_run_plain_golden_files(subdir, project, golden,
                                     monkeypatch, tmp_path, capsys):
@@ -736,10 +767,10 @@ def test_dry_run_plain_golden_files(subdir, project, golden,
     monkeypatch.setenv("LABELKIT_DEEPSEEK_KEY", "dummy")  # mix 同款 dummy（v1.12）
     monkeypatch.chdir(_EXAMPLES / subdir)
     # examples/mix 独立成套（两工程同用本目录 config.toml——DeepSeek+z.ai
-    # 双端点，§3.8）；examples/synth-stream 同样自含（单 profile DeepSeek——
-    # v1.13 的 E2E 端点由需求方指定，共享的 ../config.toml 是 z.ai）；
+    # 双端点，§3.8）；examples/sequence-generation 同样自含（双 profile
+    # DeepSeek——v1.18 的 E2E 端点由需求方指定，共享的 ../config.toml 是 z.ai）；
     # 其余五例共享 ../config.toml。
-    config = ("config.toml" if subdir in {"mix", "synth-stream"}
+    config = ("config.toml" if subdir in {"mix", "sequence-generation"}
               else "../config.toml")
     code = main(["run", "--config", config, "--project", project,
                  "--output", str(tmp_path / "o.jsonl"),

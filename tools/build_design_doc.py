@@ -23,6 +23,7 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -33,6 +34,7 @@ OUT_PDF = ROOT / "docs" / "design" / "labelkit-design-v1.pdf"
 
 CHROME = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
 PDF_TIMEOUT_SECONDS = 30
+PDF_STABLE_POLLS = 5
 
 # 章节装配顺序（00-frontmatter 单独消费为封面）。
 ORDER = [
@@ -312,6 +314,68 @@ def build_toc(headings: list[tuple[int, str, str | None]]) -> str:
     return "\n".join(out)
 
 
+def _pdf_state() -> tuple[int, int] | None:
+    """读取当前 PDF 的大小与修改时间。"""
+    if not OUT_PDF.is_file():
+        return None
+    stat = OUT_PDF.stat()
+    return stat.st_size, stat.st_mtime_ns
+
+
+def _pdf_is_complete(previous: tuple[int, int] | None) -> bool:
+    """判断 Chrome 是否已原子地写出一份新的完整 PDF。"""
+    current = _pdf_state()
+    if current is None or current == previous or current[0] < 8:
+        return False
+    with OUT_PDF.open("rb") as stream:
+        if stream.read(5) != b"%PDF-":
+            return False
+        stream.seek(max(0, current[0] - 1024))
+        return b"%%EOF" in stream.read()
+
+
+def _stop_chrome(chrome: subprocess.Popen) -> None:
+    """在 PDF 已完整写出后收尾仍驻留的 Chrome 进程组。"""
+    if chrome.poll() is not None:
+        return
+    os.killpg(chrome.pid, signal.SIGTERM)
+    try:
+        chrome.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        os.killpg(chrome.pid, signal.SIGKILL)
+        chrome.wait()
+
+
+def _export_pdf(cmd: list[str]) -> None:
+    """等待 Chrome 正常退出，或在完整 PDF 稳定落盘后主动收尾。"""
+    previous = _pdf_state()
+    chrome = subprocess.Popen(cmd, start_new_session=True)
+    deadline = time.monotonic() + PDF_TIMEOUT_SECONDS
+    stable_polls = 0
+    last_state = None
+    while time.monotonic() < deadline:
+        complete = _pdf_is_complete(previous)
+        current = _pdf_state()
+        stable_polls = stable_polls + 1 if complete and current == last_state else 0
+        last_state = current
+        if complete and stable_polls >= PDF_STABLE_POLLS:
+            _stop_chrome(chrome)
+            return
+        returncode = chrome.poll()
+        if returncode is not None:
+            if returncode != 0:
+                raise subprocess.CalledProcessError(returncode, cmd)
+            if not complete:
+                raise SystemExit(f"Chrome exited without a complete PDF: {OUT_PDF}")
+            return
+        time.sleep(0.1)
+    _stop_chrome(chrome)
+    raise SystemExit(
+        f"Chrome PDF export timed out after {PDF_TIMEOUT_SECONDS}s: "
+        f"html={OUT_HTML} pdf={OUT_PDF} profile={ROOT / '.chrome-pdf-profile'}"
+    )
+
+
 def main() -> None:
     title_line, meta_rows, rev_rows = parse_frontmatter()
     headings: list[tuple[int, str, str | None]] = []
@@ -320,7 +384,9 @@ def main() -> None:
         md = (SPEC / f"{stem}.md").read_text()
         sections.append(convert(md, ref_list=(stem == "85-ch9-references"),
                                 headings=headings))
-    missing = {"2-1", "2-2", "3-1", "3-2", "3-3", "3-4", "7-1"} - _injected_figs
+    missing = {
+        "2-1", "2-2", "3-1", "3-2", "3-3", "3-4", "3-5", "3-6", "7-1",
+    } - _injected_figs
     if missing:
         raise SystemExit(f"figures not injected (caption line not found): {missing}")
     css = (FIG_DIR / "_style.css").read_text()
@@ -346,17 +412,7 @@ def main() -> None:
                f"--user-data-dir={ROOT / '.chrome-pdf-profile'}",
                "--no-pdf-header-footer",
                f"--print-to-pdf={OUT_PDF}", OUT_HTML.as_uri()]
-        try:
-            with subprocess.Popen(cmd, start_new_session=True) as chrome:
-                chrome.wait(timeout=PDF_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired as exc:
-            os.killpg(chrome.pid, signal.SIGKILL)
-            raise SystemExit(
-                f"Chrome PDF export timed out after {PDF_TIMEOUT_SECONDS}s: "
-                f"html={OUT_HTML} pdf={OUT_PDF} profile={ROOT / '.chrome-pdf-profile'}"
-            ) from exc
-        if chrome.returncode:
-            raise subprocess.CalledProcessError(chrome.returncode, cmd)
+        _export_pdf(cmd)
         print(f"wrote {OUT_PDF} ({OUT_PDF.stat().st_size:,} bytes)")
 
 

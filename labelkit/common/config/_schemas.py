@@ -1,9 +1,8 @@
 """M1 的 JSON Schema 装载/元校验与 few-shot 示例干跑(CONTRACTS §6.3 规则 13/14/17)。
 
-四个 Schema 面共用同一套装载主体(``_load_schema_pair``): ``[output]`` 用户 Schema、
-``[frame.annotate]`` 帧级 Schema、``[class.<name>.annotate]`` 按类标注 Schema(v1.13)
-与 ``[frame.class.<name>.generate]`` 帧类生成 Schema(v1.13); 各自的专属分支(保留键
-``"_meta"`` 禁令、``$ref`` 可解析性遍历)留在各自的包装函数里, 以保持既有报错次序。
+普通输出、帧标注与按类标注 Schema，以及 v1.18 状态、结果和帧生成 Schema，共用
+``_load_schema_pair`` 装载主体；各自的专属分支（byte 上限、保留键禁令与本地
+``$ref`` 可解析性遍历）留在包装函数中，以保持稳定报错定位。
 """
 from __future__ import annotations
 
@@ -11,7 +10,7 @@ import json
 import logging
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Mapping
 from urllib.parse import urljoin
 
 from jsonschema.exceptions import SchemaError
@@ -20,8 +19,10 @@ from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
 from labelkit.common.config._collect import _Collector, _fmt, _Tbl
-from labelkit.common.config.model import FewShotExample, FrameAnnotateConfig, OutputConfig
 from labelkit.common.extensions.hooks import normalize_violations
+
+if TYPE_CHECKING:
+    from labelkit.common.config.model import FewShotExample, FrameAnnotateConfig, OutputConfig
 
 _logger = logging.getLogger("labelkit.config")
 
@@ -37,6 +38,18 @@ class _SchemaSite:
     file: str      # 报错定位用的配置文件路径字符串
     section: str   # 节名, 如 "output" / "frame.annotate" / "class.<name>.annotate"
     noun: str      # 该 Schema 在报错文案里的名词, 如 "user schema"
+
+
+@dataclass(frozen=True)
+class _GenerationSchemaRequest:
+    """一份 v1.18 生成 Schema 的装载请求。"""
+
+    file: str                                      # project.toml 定位路径
+    section: str                                   # 不带方括号的节定位
+    path: object                                   # schema_path 原始值
+    inline: object                                 # schema_inline 原始值
+    project_root: Path                             # 相对路径解析根
+    max_bytes: int                                 # 原始 UTF-8 byte 上限
 
 
 @dataclass(frozen=True)
@@ -113,7 +126,7 @@ def _unresolvable_refs(schema: dict) -> list[tuple[str, str]]:
 
 def _load_schema_pair(col: _Collector, site: _SchemaSite, sp: str | None,
                       si: str | None) -> tuple[dict, bool, str]:
-    """通用 Schema 装载主体(§6.3 规则 13/14 分支, 四个 Schema 面共用)。
+    """通用 Schema 装载主体（§6.3 规则 13/14 与 v1.18 生成面共用）。
 
     依次执行: 恰一约束 → 读文件 → JSON 解析 → 顶层对象 → draft 2020-12 元校验 →
     顶层 ``type = "object"``。专属分支(``"_meta"`` 保留键、``$ref`` 遍历)留在包装函数。
@@ -152,6 +165,81 @@ def _load_schema_pair(col: _Collector, site: _SchemaSite, sp: str | None,
                   f"the top level, got {_fmt(schema)}")
         return {}, False, key
     return schema, _check_schema_shape(col, site, key, schema), key
+
+
+def _load_generation_schema(
+    col: _Collector,
+    request: _GenerationSchemaRequest,
+) -> Mapping[str, object] | None:
+    """装载一份 v1.18 object-root Draft 2020-12 Schema。
+
+    @param col 错误聚合器
+    @param request 路径、定位与上限请求
+    @return 通过元校验、本地引用与 byte 上限的 Schema，失败为 None
+    """
+    if request.path is None and request.inline is None:
+        col.error(f"{request.file}:[{request.section}].schema_path: exactly one of "
+                  "schema_path or schema_inline must be provided, got neither")
+        return None
+    path, inline = _generation_schema_sources(col, request)
+    if path is None and inline is None:
+        return None
+    site = _SchemaSite(request.file, request.section, "generation schema")
+    schema, ok, key = _load_schema_pair(col, site, path, inline)
+    if schema and _schema_bytes(schema) > request.max_bytes:
+        col.error(f"{request.file}:[{request.section}].{key}: generation schema exceeds "
+                  f"{request.max_bytes} canonical UTF-8 bytes")
+        ok = False
+    if ok:
+        ok = _check_schema_refs(col, site, key, schema)
+    return schema if ok else None
+
+
+def _generation_schema_sources(
+    col: _Collector,
+    request: _GenerationSchemaRequest,
+) -> tuple[str | None, str | None]:
+    """校验并规范化生成 Schema 的 path/inline 原始值。
+
+    @param col 错误聚合器
+    @param request Schema 请求
+    @return 绝对 path 与 inline 文本
+    """
+    path = request.path
+    inline = request.inline
+    if path is not None and (not isinstance(path, str) or not path.strip()):
+        col.error(f"{request.file}:[{request.section}].schema_path: expected non-empty string, "
+                  f"got {_fmt(path)}")
+        path = None
+    if inline is not None and (not isinstance(inline, str) or not inline.strip()):
+        col.error(f"{request.file}:[{request.section}].schema_inline: expected non-empty string, "
+                  f"got {_fmt(inline)}")
+        inline = None
+    if isinstance(path, str):
+        candidate = Path(path)
+        path = str(candidate if candidate.is_absolute() else request.project_root / candidate)
+        try:
+            if Path(path).stat().st_size > request.max_bytes:
+                col.error(f"{request.file}:[{request.section}].schema_path: schema file exceeds "
+                          f"{request.max_bytes} bytes")
+                return None, None
+        except OSError:
+            pass
+    if isinstance(inline, str) and len(inline.encode("utf-8")) > request.max_bytes:
+        col.error(f"{request.file}:[{request.section}].schema_inline: schema text exceeds "
+                  f"{request.max_bytes} UTF-8 bytes")
+        return None, None
+    return path, inline
+
+
+def _schema_bytes(schema: Mapping[str, object]) -> int:
+    """计算 Schema 的 canonical UTF-8 byte 数。
+
+    @param schema 已解析 Schema
+    @return canonical JSON byte 数
+    """
+    text = json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return len(text.encode("utf-8"))
 
 
 def _check_schema_shape(col: _Collector, site: _SchemaSite, key: str,
@@ -236,13 +324,12 @@ def _load_user_schema(col: _Collector, file: str,
 
 def _load_class_schema(col: _Collector, file: str, cname: str, sp: str | None,
                        si: str | None) -> dict | None:
-    """v1.13(裁决·按类标注 Schema): 装载 ``[class.<name>.annotate]`` 的按类标注 Schema。
+    """装载 ``[class.<name>.annotate]`` 的按类标注 Schema。
 
     语义是**至多其一**(两者均缺 = 覆盖未声明, 回落全局 output.schema); 声明了就走
     ``_load_schema_pair`` 全套, 再加 output.schema 同款的 ``"_meta"`` 保留键禁令与
-    ``$ref`` 可解析性遍历(运行期不取外部资源, 悬空引用必然每条记录都炸)。本函数的产物
-    是 ``ClassView`` 两个尾部按类载体之一(另一个是 v1.15 的 ``tiers`` 按类档位表, 解析在
-    ``_classviews._merge_class_generate``)——两者同款三态: None = 未声明即回落全局。
+    ``$ref`` 可解析性遍历(运行期不取外部资源, 悬空引用必然每条记录都炸)。产物进入
+    ``ClassView.schema``；None 表示未声明并回落全局 Schema。
 
     @param col 错误聚合器
     @param file 报错定位用的 project.toml 路径字符串
@@ -263,37 +350,28 @@ def _load_class_schema(col: _Collector, file: str, cname: str, sp: str | None,
 
 
 def _load_frame_gen(col: _Collector, file: str, cname: str,
-                    sections: dict) -> tuple[str | None, dict | None]:
-    """v1.13(裁决·帧类生成面): 解析 ``[frame.class.<name>.generate]`` 白名单三键。
-
-    ``instruction``(时间流生成形态下每个帧类必填, 缺失由形态约束簇上报)与
-    ``schema_path``/``schema_inline``(**至多其一**; 均缺 = 纯文本帧)。Schema 走
-    ``_load_schema_pair`` 全套 + ``$ref`` 可解析性遍历; 无 ``"_meta"`` 分支——帧内容
-    落工件行的文本字段, 与 §6.3 信封字段无冲突面(帧级 Schema 同理)。v1.14 的第四键
-    ``time_fields`` 不在此消费: 它由帧类视图侧的 ``_parse_time_fields`` 解析(本函数
-    不做未知键 finish(), 白名单校验独立执行, 故无重复上报面)。
+                    sections: dict) -> tuple[str | None, Mapping[str, object] | None]:
+    """解析 v1.18 frame class 的对象生成契约。
 
     @param col 错误聚合器
     @param file 报错定位用的 project.toml 路径字符串
     @param cname 帧类名
     @param sections 该帧类的原始覆盖节字典
-    @return (生成指令 | None, 生成 Schema | None)
+    @return 生成指令与完整对象 Schema
     """
     sub = sections.get("generate")
     if not isinstance(sub, dict):
         return None, None            # 缺节 / 非表(非表已由白名单校验定位上报)
-    site = _SchemaSite(file=file, section=f"frame.class.{cname}.generate",
-                       noun="frame-class generation schema")
-    t = _Tbl(col, file, f"[{site.section}]", sub)
+    section = f"frame.class.{cname}.generate"
+    t = _Tbl(col, file, f"[{section}]", sub)
     instruction = t.get_str("instruction", None, nonempty=True)
-    sp = t.get_str("schema_path", None, nonempty=True)
-    si = t.get_str("schema_inline", None, nonempty=True)
-    if sp is None and si is None:
-        return instruction, None
-    schema, ok, key = _load_schema_pair(col, site, sp, si)
-    if ok:
-        ok = _check_schema_refs(col, site, key, schema)
-    return instruction, (schema if ok else None)
+    path = t.get_str("schema_path", None, nonempty=True)
+    inline = t.get_str("schema_inline", None, nonempty=True)
+    schema = _load_generation_schema(col, _GenerationSchemaRequest(
+        file=file, section=section, path=path, inline=inline,
+        project_root=Path(file).resolve().parent, max_bytes=65536,
+    ))
+    return instruction, schema
 
 
 def _load_frame_schema(col: _Collector, file: str,

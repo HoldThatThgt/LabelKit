@@ -49,7 +49,9 @@
 
 一条与脱敏档位无关的恒定规则（v1.6）：`llm.key_*` / `llm.pool_*` 事件与 `llm.call` 的 `key_env` 字段里，密钥恒以**环境变量名**标识——密钥值本身在任何档位（含 `full`）都不写入 trace、运行日志与报告。
 
-**时间流生成继续保持零新通道、零新事件、零新错误码。**蓝图、v1.16 sampled brief 与帧实现都是普通 LLM 调用，订阅 `llm` 通道即可看延迟、token 与重试；机械联合规划不复制规则、payload 或密钥到 trace。序列作废与噪音调用缺额只走值无关 WARN 和报告计数。它的账全在报告里。
+sequence generation 复用既有日志与 trace 通道，并用既有 `llm.call`、schema repair、retry 和 error 事件记账。
+GenerationProgram/ScenarioPlan、完整 state、ActorView、payload 与 API key value 不复制进运行日志。失败 attempt 的
+usage/schema/retry/trace 会累计，而 dataset/item/dedup/rows 状态回滚；正式交付账在 report 与 manifest。
 
 ## 16.3 rubric 调优闭环：让准则跟着证据迭代
 
@@ -144,16 +146,27 @@ jq -c 'select(.ev=="quality.judgment" and (.record_ids | index("6e60ce3c2d59f04d
 
 想要完整的调用审计（每次请求的 token、延迟、重试、状态），订阅 trace 的 `llm` 通道即可——`llm.call` 事件字段命名对齐 OpenTelemetry GenAI 语义约定（`gen_ai.usage.input_tokens` 等），现成的 OTel 生态分析工具可以直接吃。
 
-### 时间流生成的两处报告读数（v1.17 planner、delivery 与 quota 条件块）
+### sequence generation 的报告与提交观测
 
-这个形态（第 27 章）不加事件——v1.14 的两个增量同样零新通道、零新事件、零新错误码——观测面全部落在 `report.json` 的两处按需字段上：
+sequence 形态的核心账在 `report.generate.sequence`：
 
-- **`run.artifact`**：时间流工件的摘要三件套 `{path, sha256, lines}`（主输出同款形态），仅工件实际写出时在场（`--dry-run` 不写工件，自然也没有它）。`lines` 是逐帧账的总闸——拿它与下面的帧数交叉验证；
-- **`generate.stream`**：基础键仍是 session、序列、帧、调用与 failures 的 counts-only 账。`crossed_sessions` 现在按最终 survivor 投影后是否仍有真实 owner 交替计算，不能再用 `Σ幸存 − sessions` 反推。声明帧类构成档位时仍有两种 `tiers` 形状。v1.16 的增量均为条件在场：有生效规则时出现 `rules: {sampled, correlation_scrapped, temporal_scrapped}`；配置 `generate.sequence_validator` 时出现 `sequence_validator_scrapped`，并由它或实际配额前缀的 rules/windows 激活 v1.16 报表面；只有该面已激活且既有 `generate.sample_validator` 也配置时，才出现 `sample_validator_scrapped`，从而保持 sample-hook-only 的 v1.15 报表字节；有生效窗口时出现 `windows: {calendar_days_spanned}`。四个作废子计数之和必须等于 `validator_scrapped`，相似度淘汰不进入该等式。
+- planned/delivered sets 与 sequences；
+- primary/noise/replay event 和 session 计数；
+- `sequence_calls` 七个逻辑 family 入口；
+- `by_pattern` 的每个 variant planned/delivered；
+- 固定闭集 `rejected_attempts`；
+- 顶层 `llm_usage` 的物理 calls、tokens 与 retries。
 
-`noise_ratio` 给的是目标。联合 planner 在 session 长度与内部开区间约束下最大化实际槽数；报告的 `noise_frames` 只统计最终 survivor 投影后、且拿到模型 payload 的槽。目标无法全部放入时会有一条值无关 WARN，不会运行期重织或扩大 session。
+一次失败 attempt 只进入最终停止边界对应的一个 rejected bucket；内部 L3 repair 与 provider retry 不重复增加
+family call。provider fatal、plan 与 commit-I/O 是 terminal，写 `terminal_error_kind` 而不塞进 attempt bucket。
 
-同一份报告里还有两处「反直觉但正确」的读数：`classify` 的逐类计数**恒全零**（标签生成期已知、继承，零判决调用），`stream` 节**不出现**（那是分段算子的观测面）。逐键解读与真跑数字见第 8 章 8.4 与第 27 章 27.7。
+成功消费者以 `*.manifest.json` 为唯一真值，并校验 main、stream、report 的路径、SHA-256、行数、run ID 与
+delivery digest。failed report 是独立诊断；成功运行不删除旧 failed report，它也不能否定摘要有效的 manifest。
+
+keyless 计划与真实主例都验证为 2/8/22+2+3=27。真实主例的两个 successful set 没有 rejected attempt：
+default profile 为 38 calls、34470 input tokens、2511 output tokens，judge profile 为 10 calls、9541 input
+tokens、484 output tokens，provider retries 均为 0。发布规模运行有 3 次 semantic rejection、其他 rejection 为 0，
+最终仍只提交 13 个完整 sets；失败 attempt 只进入计数与 usage，不进入正式数据。
 
 ### 密钥池的分密钥视角（v1.6）
 

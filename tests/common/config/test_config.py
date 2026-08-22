@@ -16,20 +16,9 @@ import pytest
 
 from labelkit.common.config import ResolvedConfig, default_rubric, load
 from labelkit.common.config import loader as loader_mod
-from labelkit.common.runtime.scenario.model import (
-    CorrelationSpec,
-    FrameRuleSpec,
-    FrameWindowSpec,
-)
 from labelkit.common.config.model import (
     CliOverrides,
     ConsoleConfig,
-    GenerateStreamConfig,
-    TierSpec,
-    apportion_tiers,
-    effective_frame_rules,
-    effective_frame_windows,
-    effective_tiers,
 )
 from labelkit.common.errors import ConfigError
 
@@ -188,9 +177,8 @@ def test_happy_path_defaults(env):
     assert cfg.frame_annotate.enabled is False
     assert cfg.frame_class_views == {}
     assert cfg.frame_schema is None
-    # v1.13 时间流生成：整节缺省 = 全关（字节等价 v1.12），配额两键取内建默认
-    assert cfg.generate_stream == GenerateStreamConfig()
-    assert cfg.generate.len_range == (3, 6)
+    # v1.18 序列生成：未声明 sequence 形态时不产生序列配置。
+    assert cfg.sequence_generation is None
 
 
 def test_llm_thinking_accepts_explicit_value(env):
@@ -2994,11 +2982,10 @@ enabled = false
     assert cfg.frame_annotate.instruction == "标注帧意图"
 
 
-def test_frame_requires_stream_mode(env):
-    # 约束·帧粒度要求流模式（两开关各自定位报错 + 非流模式指引）
+def test_frame_switches_require_segment_outside_sequence_generation(env):
+    # frame classify 始终依赖 segment；frame annotate 的 sequence 例外另由 generation 测试覆盖。
     errors = env.errors(project_text=env.project(body=FRAME_CLASSIFY_ONLY))
     has(errors, "[frame.classify].enabled: frame.classify.enabled = true requires segment.enabled = true")
-    has(errors, "classify + [class.<name>.annotate]")
     errors = env.errors(project_text=env.project(body=FRAME_ANNOTATE_ONLY))
     has(errors, "[frame.annotate].enabled: frame.annotate.enabled = true requires segment.enabled = true")
 
@@ -3027,8 +3014,7 @@ llm = "judge"
 instruction = "任务请求帧标注指令。"
 """)
     errors = env.errors(project_text=env.project(body=body))
-    # v1.13：节白名单增 generate（时间流生成形态的帧内容契约；非本形态出现该节由
-    # 定向 CONFIG_ERROR 接管，见 test_loader_generate_stream.py）
+    # v1.18：节白名单包含 sequence 帧生成契约；具体合法组合由 generation 配置测试覆盖。
     has(errors, "[frame.class.task_request.quality]: section is not in the [frame.class.*] "
                 "override whitelist (available: annotate, generate)")
     has(errors, "[frame.class.task_request.annotate].llm: [frame.class.*.annotate] cannot "
@@ -3344,151 +3330,3 @@ def test_frame_static_precheck_silent_with_room(env, capsys):
     err = capsys.readouterr().err
     assert "[frame.classify]: static system-side prompt parts estimated" not in err
     assert "[frame.annotate]: static system-side prompt parts estimated" not in err
-
-
-# ── v1.13: 新字段在时间流生成关闭时的缺省（形态覆盖见 test_loader_generate_stream） ──
-
-
-def test_class_views_v113_fields_default_off(env):
-    # 按类标注 Schema 未声明 ⇒ None（回落全局 output.schema）；配额两键取全局默认
-    cfg = env.load(project_text=env.project(body=CLASSIFY_BODY))
-    assert set(cfg.class_views) == {"writing", "qa", "other"}
-    for view in cfg.class_views.values():
-        assert view.schema is None
-        assert view.generate.len_range == (3, 6)
-
-
-def test_frame_rule_and_window_models_are_frozen_and_have_three_state_helpers():
-    rule = FrameRuleSpec(name="r1", template="response", source="a", target="b",
-                         correlation=CorrelationSpec(source_field="id",
-                                                     target_field="id"))
-    window = FrameWindowSpec(name="w1", frame_class="a",
-                             of_day_us=((9 * 3600 * 1_000_000,
-                                         10 * 3600 * 1_000_000),), of_week=(1,))
-    global_rules = (rule,)
-    global_windows = (window,)
-    assert effective_frame_rules(None, global_rules) == global_rules
-    assert effective_frame_rules((), global_rules) == ()
-    assert effective_frame_rules((rule,), global_rules) == (rule,)
-    assert effective_frame_windows(None, global_windows) == global_windows
-    assert effective_frame_windows((), global_windows) == ()
-    assert effective_frame_windows((window,), global_windows) == (window,)
-    with pytest.raises(FrozenInstanceError):
-        rule.template = "init"
-
-
-def test_frame_class_views_v113_generate_face_default_none(env):
-    body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY + "\n" + FRAME_ANNOTATE_ONLY
-    cfg = env.load(project_text=env.project(body=body))
-    for view in cfg.frame_class_views.values():
-        assert view.gen_instruction is None
-        assert view.gen_schema is None
-
-
-# ── v1.14: 档位面与绑定面的缺省（在场覆盖见 test_loader_generate_stream） ────
-
-
-def test_generate_stream_tiers_default_is_absent(env):
-    # 档位面整体不在场 ⇒ 空元组（与 v1.13 字节等价的那一半）
-    assert GenerateStreamConfig().tiers == ()
-    cfg = env.load()
-    assert cfg.generate_stream.tiers == ()
-
-
-def test_frame_class_view_time_fields_default_none(env):
-    # 绑定面不在场 ⇒ None（无绑定），零覆盖帧类的视图也一样
-    body = SEG_ON + "\n" + FRAME_CLASSIFY_ONLY + "\n" + FRAME_ANNOTATE_ONLY
-    cfg = env.load(project_text=env.project(body=body))
-    for view in cfg.frame_class_views.values():
-        assert view.time_fields is None
-
-
-def test_tier_spec_carries_rank_weight_and_composition():
-    spec = TierSpec(tier_rank=1, weight=2, frame_classes=("task_request", "followup"))
-    assert (spec.tier_rank, spec.weight) == (1, 2)
-    assert spec.frame_classes == ("task_request", "followup")
-    with pytest.raises(FrozenInstanceError):
-        spec.weight = 3                              # 冻结面：解析后不可变
-
-
-# ── v1.14 apportion_tiers：整数域最大余额法的性质（裁决·零抽签配分）─────────
-
-
-def _tiers(*weights: int) -> tuple[TierSpec, ...]:
-    """A tier table with the given weights, ranked 1..N in the declared order."""
-    return tuple(TierSpec(tier_rank=i, weight=w, frame_classes=("f",))
-                 for i, w in enumerate(weights, 1))
-
-
-@pytest.mark.parametrize("sequences, weights", [
-    (0, (1,)), (1, (1, 1)), (3, (2, 1)), (7, (3, 2, 2)), (10, (1, 1, 1)),
-    (100, (5, 3, 1)), (1, (9, 1)), (2, (1, 1, 1, 1)),
-])
-def test_apportionment_sums_to_the_class_quota(sequences, weights):
-    quotas = apportion_tiers(sequences, _tiers(*weights))
-    assert len(quotas) == len(weights)
-    assert sum(quotas) == sequences
-    assert all(q >= 0 for q in quotas)
-
-
-def test_apportionment_is_exact_when_the_weights_divide_the_quota():
-    # 整除形：全部配额落基额，零余额分配
-    assert apportion_tiers(9, _tiers(2, 1)) == (6, 3)
-    assert apportion_tiers(12, _tiers(1, 1, 1, 1)) == (3, 3, 3, 3)
-
-
-def test_apportionment_pins_the_integer_arithmetic_when_not_divisible():
-    # 不整除形：基额 = (s × w) // Σw，余额键 = (s × w) mod Σw，按余额键降序 +1
-    # s = 7, weights (3, 2, 2), Σw = 7 ⇒ scaled (21, 14, 14) ⇒ base (3, 2, 2)，全零余额
-    assert apportion_tiers(7, _tiers(3, 2, 2)) == (3, 2, 2)
-    # s = 5, weights (3, 2, 2), Σw = 7 ⇒ scaled (15, 10, 10) ⇒ base (2, 1, 1)，
-    # 余额 (1, 3, 3)，缺 1 席 ⇒ 最大余额 3 平票，tier_rank 升序取第 2 档
-    assert apportion_tiers(5, _tiers(3, 2, 2)) == (2, 2, 1)
-    # s = 4, weights (5, 1), Σw = 6 ⇒ scaled (20, 4) ⇒ base (3, 0)，余额 (2, 4)
-    # ⇒ 缺 1 席给余额最大的第 2 档
-    assert apportion_tiers(4, _tiers(5, 1)) == (3, 1)
-
-
-def test_apportionment_breaks_ties_by_ascending_tier_rank():
-    # 全等权重、缺 1 席 ⇒ 余额三档全等，平票判定必须落在 tier_rank 升序上
-    assert apportion_tiers(4, _tiers(1, 1, 1)) == (2, 1, 1)
-    assert apportion_tiers(5, _tiers(1, 1, 1)) == (2, 2, 1)
-    # 传入序被打乱也按 rank 定平票（返回序恒对齐入参序）
-    shuffled = (TierSpec(tier_rank=2, weight=1, frame_classes=("f",)),
-                TierSpec(tier_rank=1, weight=1, frame_classes=("f",)))
-    assert apportion_tiers(1, shuffled) == (0, 1)
-
-
-def test_apportionment_can_hand_a_tier_zero_and_stays_a_pure_function():
-    # 小配额 × 权重悬殊 ⇒ 零额档（最大余额法的自然结果，M1 发 WARN 而非报错）
-    tiers = _tiers(5, 1)
-    assert apportion_tiers(1, tiers) == (1, 0)
-    assert apportion_tiers(0, tiers) == (0, 0)       # 不参与的类：逐档零额
-    assert apportion_tiers(3, ()) == ()              # 档位面不在场
-    assert apportion_tiers(3, tiers) == apportion_tiers(3, tiers)   # 零 rng
-
-
-# ── v1.15 按类档位表：载体缺省与 effective_tiers 三态（SPEC-per-class-tiers §3.1）─
-
-
-def test_class_view_tiers_default_is_absent(env):
-    # 载体缺省 = None（未声明 ⇒ 回落全局表）；零覆盖的类经 _inherit_class 亦得 None
-    body = ('[classify]\nenabled = true\nfallback_class = "other"\n'
-            '[[classify.classes]]\nname = "qa"\ndescription = "问答"\n'
-            '[[classify.classes]]\nname = "other"\ndescription = "其它"\n')
-    cfg = env.load(project_text=env.project(body=body))
-    assert set(cfg.class_views) == {"qa", "other"}
-    for view in cfg.class_views.values():
-        assert view.tiers is None
-
-
-def test_effective_tiers_covers_the_three_carrier_states():
-    # 裁决·表级原子覆盖：None = 回落全局整张表；非空 = 类表整表取代（不做行级合并）
-    glob = _tiers(2, 1)
-    own = (TierSpec(tier_rank=1, weight=7, frame_classes=("g",)),)
-    assert effective_tiers(None, glob) is glob
-    assert effective_tiers(own, glob) is own
-    assert effective_tiers(own, ()) is own
-    # 显式空表原样回传——拒收归 M1（rule 61③），查找点不替用户做决定
-    assert effective_tiers((), glob) == ()
-    assert effective_tiers(None, ()) == ()

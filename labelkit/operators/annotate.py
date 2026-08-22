@@ -15,22 +15,21 @@ annotate.sequence_frames；text 模态序列跳过 ②）→ ③ **恒在**的�
 fragment_lens——线索（thread）的逐片段关键帧配额（每个片段至少保留一个关键帧）；
 None 保持 v1.8 的均匀降采样。
 
-v1.12 帧级逐帧标注（SPEC-frame-annotation §3.3）：序列信封自身的标注**成功之后**，
-本算子追加一趟逐成员帧 pass（仅首标签信封，降格 episode 跳过），经公开直调面
-``annotate_member`` 填充 ``item.member_annotations``——修复面族的新成员（M7 verify
-的成员回收补跑懒加载直调它）。帧调用把 ``cfg.frame_schema`` 显式路由进
-``complete_validated(schema=...)``：内部 Schema 待遇——无 L2.5、不计 resolved_at。
-两个序列级公开面不受影响。
+v1.12 帧级逐帧标注（SPEC-frame-annotation §3.3）：process 序列在自身标注成功后追加
+逐成员帧 pass；v1.18 sequence attempt 在序列标注关闭时直接执行同一 pass，序列标注调用
+精确为零。公开直调面 ``annotate_member`` 填充 ``item.member_annotations``——修复面族的
+新成员（M7 verify 的成员回收补跑懒加载直调它）。帧调用把 ``cfg.frame_schema`` 显式路由
+进 ``complete_validated(schema=...)``：内部 Schema 待遇——无 L2.5、不计 resolved_at。
 
-v1.13 按序列类标注 Schema（SPEC-stream-generation §3.4，裁决·按类标注 Schema）：
+按序列类标注 Schema：
 某个类可经 ``[class.<name>.annotate].schema_path/schema_inline`` 覆盖全局
 ``output.schema``。``class_annotate_schema`` 是**单点**取值函数（label →
 ``cfg.class_views[label].schema``；label 缺失、类表外的未知类或无覆盖的类一律回落
 全局 Schema），本模块每个 Schema 消费点都经它取值——两处标注调用、提示词 Schema
-文本、自洽投票与 v1.11 装填计价——保证「计价的 Schema 就是调用的 Schema」。按类
+文本、自洽投票与预算装填计价——保证「计价的 Schema 就是调用的 Schema」。按类
 Schema 的调用显式路由 ``schema=<类 Schema>`` 且 ``CallScope(user_treatment=True)``
-（裁决·M8 显式待遇参数）：记录级标注恒属用户待遇族，L2.5 与 resolved_at 记账保留。未配置任何
-按类 Schema 时，全部调用形与 v1.12 逐字节一致。
+（裁决·M8 显式待遇参数）：记录级标注恒属用户待遇族，L2.5 与 resolved_at 记账保留。
+未配置任何按类 Schema 时，统一使用全局 Schema。
 """
 from __future__ import annotations
 
@@ -39,6 +38,7 @@ import json
 import logging
 import math
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Mapping, Sequence
 
@@ -46,11 +46,13 @@ from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
     ErrorKind,
+    InternalError,
     OutputTruncatedError,
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
 )
+from labelkit.common.contracts.generation import DownstreamAttemptRequest, DownstreamAttemptResult
 from labelkit.common.contracts.types import (
     Annotation,
     PipelineItem,
@@ -63,7 +65,7 @@ from labelkit.common.contracts.types import (
 
 from labelkit.common.runtime import budget
 from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
-from labelkit.common.runtime.schema_engine import CallScope
+from labelkit.common.runtime.schema_engine import CallScope, _thaw_json
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import AnnotateConfig, LLMProfile, ResolvedConfig
@@ -76,6 +78,10 @@ EV_ANNOTATE_FRAME = "annotate.frame"   # v1.12：帧级逐帧标注事件（每�
 EV_ERROR = "error"
 
 _logger = logging.getLogger("labelkit.annotate")
+_ATTEMPT_MODE: ContextVar[bool] = ContextVar("annotate_attempt_mode", default=False)
+_ATTEMPT_CONFIG: ContextVar[object | None] = ContextVar(
+    "annotate_attempt_config", default=None
+)
 
 # 中文提示词片段——逐字取自 CONTRACTS.md §10.1/§10.5（spec 3.5.2/3.7.3）。
 _SCHEMA_SENTENCE = "输出必须是符合以下 JSON Schema 的单个 JSON 对象，不输出任何其他内容："
@@ -212,7 +218,7 @@ class AnnotatePromptOptions:
 
     repair: RepairContext | None = None            # §10.5 修复上下文；None = 首次标注
     temperature: float | None = None               # 采样温度；None = profile 默认
-    label: str | None = None                       # v1.7 分类标签（v1.13 起同时选按类 Schema）
+    label: str | None = None                       # 分类标签，同时选择按类 Schema
     transitions: tuple[Transition, ...] | None = None   # v1.8 [动作序列] 步骤；None = 整段省略
     fragment_lens: tuple[int, ...] | None = None   # v1.9（T14）逐片段成员数；None = 均匀降采样
     k_eff: int | None = None                       # v1.11（V20/V21）关键帧上限的外部收窄值
@@ -228,10 +234,10 @@ def _dumps(obj: object) -> str:
     @param obj 待序列化对象
     @return 单行 JSON 文本（不转义非 ASCII）
     """
-    return json.dumps(obj, ensure_ascii=False)
+    return json.dumps(_thaw_json(obj), ensure_ascii=False)
 
 
-# ── v1.13 按序列类标注 Schema（裁决·按类标注 Schema，SPEC §3.4）──────────────
+# ── 按序列类标注 Schema ───────────────────────────────────────────────────
 #
 # 三个取值函数是本特性在 M5 侧的单点真相：调用 Schema、提示词 Schema 文本、
 # 预算计价与自洽投票全部经此取值，保证「计价的 Schema 就是调用的 Schema」。
@@ -279,7 +285,7 @@ def class_schema_text(ctx: "RunContext", label: str | None) -> str:
     override = class_annotate_schema(ctx.cfg, label)
     if override is None:
         return ctx.schema_engine.user_schema_text
-    return json.dumps(override, ensure_ascii=False, separators=(", ", ": "))
+    return json.dumps(_thaw_json(override), ensure_ascii=False, separators=(", ", ": "))
 
 
 async def _complete_annotation(ctx: "RunContext", record: Record,
@@ -426,7 +432,7 @@ def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: st
     @param record 待标注记录（单记录或 v1.8 序列 episode）
     @param cfg 已解析配置
     @param schema_text 类有效 Schema 文本（``class_schema_text`` 取值：无按类覆盖时
-        即 M8 的 ``SchemaEngine.user_schema_text`` 属性，v1.13）
+        即 M8 的 ``SchemaEngine.user_schema_text`` 属性）
     @param opts 装配变体参数（``AnnotatePromptOptions``）：``repair`` §10.5 修复上
         下文；``temperature`` 采样温度；``label`` v1.7（R2）分类标签，非 None ⇒
         指令/few-shot 取 ``cfg.class_views[label].annotate``；``transitions``
@@ -635,7 +641,7 @@ def _pack_prompt(record: Record, ctx: "RunContext", prof: "LLMProfile",
     """
     cfg = ctx.cfg
     b = budget.input_budget(prof)
-    # v1.13：计价对象 = 类有效 Schema（与本次调用实际传出的 Schema 同源）。
+    # 计价对象 = 类有效 Schema（与本次调用实际传出的 Schema 同源）。
     schema_est = (budget.est_text(_dumps(class_effective_schema(cfg, opts.label)))
                   if prof.supports_structured_output else 0)
     bundle = _assemble_prompt(record, cfg, schema_text, opts)   # ①② 按请求上限全量计量
@@ -743,8 +749,8 @@ async def _budgeted_call(record: Record, ctx: "RunContext", schema_text: str,
     @raises ContextOverflowError 装填 V10 或反应式溢出终态
 
     预算未声明（cw == 0）⇒ 走 v1.11 之前的装配/调用路径，字节等价（200 形态的溢出
-    仍可能浮现，直接上抛且不喂熔断）；已声明 ⇒ 交给 _degrading_call。v1.13：两个
-    调用点都经 _complete_annotation，携带按类 Schema 覆盖。
+    仍可能浮现，直接上抛且不喂熔断）；已声明 ⇒ 交给 _degrading_call。两个调用点
+    都经 _complete_annotation，携带按类 Schema 覆盖。
     """
     cfg = ctx.cfg
     prof = cfg.llm_profiles.get(cfg.annotate.llm)
@@ -771,7 +777,7 @@ async def _degrading_call(record: Record, ctx: "RunContext", schema_text: str,
     关键帧折半（k → max(2, ⌈k/2⌉)），至多 2 次降级并计 budget.degrade_retries；
     终态遵循 §3.5 熔断矩阵——反应式 400 恰喂一次熔断。
     """
-    schema = class_annotate_schema(ctx.cfg, opts.label)   # v1.13：按类 Schema 覆盖
+    schema = class_annotate_schema(ctx.cfg, opts.label)   # 按类 Schema 覆盖
     shape = opts
     degrades = 0
     pending: ContextOverflowError | None = None
@@ -931,7 +937,7 @@ async def annotate_record(record: Record, ctx: "RunContext",
     @param ctx 运行上下文
     @param opts 装配变体参数（``AnnotatePromptOptions``）：``repair`` 非 None 时
         **跳过**自洽（修复重标注恒为 profile 默认温度下的单次调用）；``label``
-        v1.7（R2）选按类指令/few-shot，v1.13（裁决·按类标注 Schema）起同时选标注
+        选择按类指令/few-shot 与标注
         Schema——提示词文本、M8 调用、自洽投票与预算计价四处同源取值，按类 Schema
         调用保留用户待遇（L2.5 + resolved_at），而 llm / self_consistency /
         sc_temperature 仍取全局（白名单）；``transitions`` v1.8（S5）步骤源，M7 穿
@@ -952,7 +958,7 @@ async def annotate_record(record: Record, ctx: "RunContext",
     """
     opts = replace(opts, temperature=None)         # 温度归 M5 自己设定
     repair, label = opts.repair, opts.label
-    schema_text = class_schema_text(ctx, label)    # v1.13：按类 Schema 文本
+    schema_text = class_schema_text(ctx, label)    # 按类 Schema 文本
     if repair is not None or ctx.cfg.annotate.self_consistency == 0:
         obj, usage, attempts, model = await _budgeted_call(record, ctx,
                                                            schema_text, opts)
@@ -1013,7 +1019,7 @@ async def _self_consistent_annotation(record: Record, ctx: "RunContext",
         raise last_violation if last_violation is not None else SchemaViolation(
             ["self-consistency: all samples failed"], "")
 
-    # v1.13：可投票字段取自类有效 Schema（按类 Schema 的字段集可与全局不同）。
+    # 可投票字段取自类有效 Schema（按类 Schema 的字段集可与全局不同）。
     chosen, matches, disagreed = _majority_vote(
         [obj for obj, _, _, _ in valid], class_effective_schema(cfg, opts.label))
     if disagreed:
@@ -1172,12 +1178,11 @@ def _frame_error_kind(member: Record, exc: BaseException) -> str:
 # resolved_at（§6.4 恒等式「resolved_at 加总 = 进入 M5 的记录数」不被帧调用污染）；
 # 勿改走 schema=None。
 #
-# 失败语义（成员失败非信封失败）：内部计 frame_annotate.failed + WARN 日志（只含成员
-# id / 错误 kind / 异常类型——绝不含数据内容或提示词），item.errors 不写、rejects
-# 不入、--strict 不触发（裁决·成员失败不入 rejects）。成功则计
-# frame_annotate.annotated（M7 回收补跑共享同一计数语义）。溢出纪律：precheck 溢出 =
-# 最小单元失败（帧 prompt 极小，无降级梯），永不喂熔断；反应式终端镜像本文件
-# _feed_reactive_terminal 纪律（仅 http_400 反应式恰一次喂，A7）。
+# 失败语义分路径：ordinary process/flat 隔离成员失败，计 frame_annotate.failed 并写
+# WARN；sequence attempt 把异常原样交给 whole-set 重试，既不提前计失败也不局部接收。
+# 两条路径都不把数据内容或提示词写进日志。成功计 frame_annotate.annotated；M7 回收
+# 补跑共享 ordinary 路径。溢出纪律：precheck/finish 永不喂熔断；ordinary 路径的反应
+# 式 http_400 终端才经 _feed_reactive_terminal 恰一次喂入（A7）。
 
 async def annotate_member(member: Record, ctx: "RunContext",
                           label: str | None = None) -> Annotation | None:
@@ -1188,13 +1193,15 @@ async def annotate_member(member: Record, ctx: "RunContext",
     @param label 帧类标签：非 None ⇒ 指令/few-shot 取 ``cfg.frame_class_views[label]``
         （类覆盖）；None ⇒ 全局 [frame.annotate]。类视图 enabled=false 的跳过判定归
         调用方（M5 帧 pass / M7 回收），本面不重复判定
-    @return 成功的 Annotation；修复穷尽/不可恢复时返回 None（调用方按「failed 占键
-        None」落 dict），**不抛**记录级异常
-    @raises CircuitBreakerTripped 运行级控制流，照常上抛（KeyboardInterrupt /
+    @return 成功的 Annotation；ordinary process/flat 路径在修复穷尽或不可恢复时
+        隔离失败并返回 None，由调用方按「failed 占键 None」落 dict
+    @raises Exception sequence attempt 模式把 Schema、上下文、截断、provider 与其他
+        成员级异常原样上抛，由 M5 拒绝当前 whole-set attempt
+    @raises CircuitBreakerTripped 运行级控制流在所有模式照常上抛（KeyboardInterrupt /
         CancelledError 同理）
     """
     cfg = ctx.cfg
-    schema = dict(cfg.frame_schema)        # M1 保证 enabled ⇒ frame_schema 非 None
+    schema = _thaw_json(cfg.frame_schema)  # program 视图可能递归冻结为 MappingProxyType
     schema_text = json.dumps(schema, ensure_ascii=False, separators=(", ", ": "))
     prof = cfg.llm_profiles.get(cfg.frame_annotate.llm)
     try:
@@ -1208,7 +1215,9 @@ async def annotate_member(member: Record, ctx: "RunContext",
             scope=CallScope(record_ids=(member.id,), batch_no=ctx.batch_no))
     except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
         raise
-    except Exception as exc:  # noqa: BLE001 — 成员级隔离绝对（契约：本面不抛）
+    except Exception as exc:  # noqa: BLE001 — ordinary 隔离；attempt 原样传播
+        if _ATTEMPT_MODE.get():
+            raise
         if isinstance(exc, ContextOverflowError):
             # precheck/finish 形永不喂；仅反应式 http_400 恰一次喂熔断（A7）。
             _feed_reactive_terminal(exc, ctx.metrics)
@@ -1235,7 +1244,13 @@ class AnnotateStage:
 
         @param cfg 已解析配置
         """
-        self.cfg = cfg
+        self._cfg = cfg
+
+    @property
+    def cfg(self) -> "ResolvedConfig":
+        """@return 当前 attempt 的程序视图配置；普通批次返回构造期配置。"""
+        active = _ATTEMPT_CONFIG.get()
+        return self._cfg if active is None else active  # type: ignore[return-value]
 
     async def run(self, batch: list[PipelineItem], ctx: "RunContext") -> list[PipelineItem]:
         """并发标注本批全部 active 信封。
@@ -1246,8 +1261,86 @@ class AnnotateStage:
         """
         active = [item for item in batch if item.status == "active"]
         if active:
-            await asyncio.gather(*(self._annotate_item(item, ctx) for item in active))
+            await asyncio.gather(*(self._run_item(item, ctx) for item in active))
         return batch
+
+    async def _run_item(self, item: PipelineItem, ctx: "RunContext") -> None:
+        """按独立开关执行 sequence annotation 或直接执行 frame pass。
+
+        @param item 当前 active 信封。
+        @param ctx 运行上下文。
+        @return None。
+        """
+        if self.cfg.annotate.enabled:
+            await self._annotate_item(item, ctx)
+        else:
+            await self._frame_pass(item, ctx)
+
+    async def run_attempt(
+        self,
+        request: DownstreamAttemptRequest,
+    ) -> DownstreamAttemptResult:
+        """执行一次 whole-set 标注 gate，不把异常降级为 item error。
+
+        @param request 当前 AttemptTransaction 与共享运行上下文。
+        @return 接受状态、标注拒绝归因与 attempt-local dataset counters。
+        """
+        items = list(request.transaction.items)
+        config_token = _ATTEMPT_CONFIG.set(request.run_context.cfg)
+        try:
+            token = _ATTEMPT_MODE.set(True)
+            try:
+                with request.run_context.metrics.capture_counts() as counters:
+                    try:
+                        await self.run(items, request.run_context)
+                    except SchemaViolation:
+                        return DownstreamAttemptResult(
+                            accepted=False, rejected_stage="annotate",
+                            dataset_counters=dict(counters))
+            finally:
+                _ATTEMPT_MODE.reset(token)
+            self._assert_no_provider_fatal(items)
+            accepted = all(self._attempt_item_accepted(item) for item in items)
+            return DownstreamAttemptResult(
+                accepted=accepted,
+                rejected_stage=None if accepted else "annotate",
+                dataset_counters=dict(counters),
+            )
+        finally:
+            _ATTEMPT_CONFIG.reset(config_token)
+
+    @staticmethod
+    def _assert_no_provider_fatal(items: list[PipelineItem]) -> None:
+        """把 attempt 路径上的 provider-fatal item error 升为协议破坏。
+
+        @param items 当前 attempt 的唯一信封真值。
+        @return None。
+        @raises RuntimeError 发现被错误隔离的 provider fatal。
+        """
+        if any(error.kind == ErrorKind.PROVIDER_FATAL.value
+               for item in items for error in item.errors):
+            _logger.error("generation_downstream_contract: isolated provider fatal")
+            raise InternalError("generation_downstream_contract: isolated provider fatal")
+
+    def _attempt_item_accepted(self, item: PipelineItem) -> bool:
+        """判断一个 sequence item 是否通过序列与帧标注。
+
+        @param item 下游原地修改后的信封。
+        @return 所有启用的标注面均成功则 True。
+        """
+        if item.status != "active":
+            return False
+        if self.cfg.annotate.enabled and item.annotation is None:
+            return False
+        if not self.cfg.frame_annotate.enabled or item.record.kind != "sequence":
+            return True
+        annotations = item.member_annotations or {}
+        for member in item.record.members:
+            cls = (item.member_classifications or {}).get(member.id)
+            view = self.cfg.frame_class_views.get(cls.label) if cls is not None else None
+            if (view is None or view.enabled) and annotations.get(member.id) is None:
+                return False
+        return True
 
     async def _annotate_item(self, item: PipelineItem, ctx: "RunContext") -> None:
         """单信封槽位：成功即发事件并追加帧 pass，失败即记录级隔离落 failed。
@@ -1270,6 +1363,8 @@ class AnnotateStage:
         except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
             raise                                  # 运行级控制流：照常上抛
         except Exception as exc:  # noqa: BLE001 — 记录级隔离绝对
+            if _ATTEMPT_MODE.get():
+                raise
             kind, message, retryable = self._classify_failure(item, exc)
             _logger.warning("annotation failed: record=%s kind=%s exc=%s",
                             record.id, kind, type(exc).__name__,
@@ -1318,7 +1413,7 @@ class AnnotateStage:
         payload: dict = {"attempts": item.annotation.attempts}
         if item.annotation.sc is not None:
             payload["sc"] = dict(item.annotation.sc)
-        if self.cfg.classify.enabled and label is not None:  # v1.7 R5
+        if label is not None:
             payload["label"] = label
         excerpt = self._excerpt_payload(record)
         if excerpt is not None:
@@ -1332,7 +1427,7 @@ class AnnotateStage:
     async def _frame_pass(self, item: PipelineItem, ctx: "RunContext") -> None:
         """v1.12 帧级逐帧标注 pass（SPEC-frame-annotation §3.3）。
 
-        @param item 已标注成功的序列信封
+        @param item 待执行帧标注的序列信封；sequence attempt 可没有序列级 annotation
         @param ctx 运行上下文
         @return 无
 
@@ -1342,8 +1437,10 @@ class AnnotateStage:
         dict 语义：pass 一旦运行即初始化为 {}（区别于「未运行」的 None——emitter 在场
         规则的单一真相）；降格/非首标签跳过保持 None；已有 dict 只补缺位、从不换对象
         （扇出克隆按引用共享同一 dict 的前提）。幂等 = 仅当 member.id 不在 dict 时
-        调用（M7 回收补跑同款只补缺位）。成员级并发 gather；隔离由 annotate_member
-        不抛保证。
+        调用（M7 回收补跑同款只补缺位）。成员级并发 gather 使用
+        return_exceptions=True 等全部 pending 成员收敛；结果保持 pending 成员序，随后
+        按该顺序传播第一个异常。ordinary process/flat 由 annotate_member 隔离失败并
+        返回 None；sequence attempt 模式允许异常进入上述传播路径。
         """
         if not (self.cfg.frame_annotate.enabled
                 and item.record.kind == "sequence"):
@@ -1366,13 +1463,19 @@ class AnnotateStage:
             seen.add(m.id)
             pending.append(m)
         if pending:
-            await asyncio.gather(*(self._frame_member(item, m, ctx)
-                                   for m in pending))
+            results = await asyncio.gather(
+                *(self._frame_member(item, member, ctx) for member in pending),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, BaseException):
+                    raise result
 
     async def _frame_member(self, item: PipelineItem, member: Record,
                             ctx: "RunContext") -> None:
         """单成员槽位：帧类视图 enabled=false ⇒ skipped（不占键）；否则经
-        annotate_member（不抛，成员级隔离）占键——成功 Annotation / 失败 None。
+        annotate_member 占键。ordinary process/flat 成功写 Annotation、隔离失败写 None；
+        sequence attempt 的异常上抛给收敛后的成员序传播路径。
 
         @param item 所属序列信封（事件 ids 取 episode id）
         @param member 该成员帧记录
@@ -1384,7 +1487,9 @@ class AnnotateStage:
         内容 payload 键。
         """
         cls = (item.member_classifications or {}).get(member.id)
-        label = cls.label if cls is not None else None   # frame.classify 关 ⇒ 全局指令
+        # ordinary process/flat 未启用 frame.classify 时 label=None，使用全局指令；
+        # sequence 读取 inherited classification，并按 attempt-local program view 路由。
+        label = cls.label if cls is not None else None
         view = (self.cfg.frame_class_views.get(label)
                 if label is not None else None)
         if view is not None and not view.enabled:

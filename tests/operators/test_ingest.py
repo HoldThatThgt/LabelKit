@@ -39,6 +39,7 @@ from labelkit.common.config.model import (
 from labelkit.common.errors import InputError
 from labelkit.common.contracts.types import ImageRef, Record, UITree
 from labelkit.operators.ingest import Ingestor, Session, _parse_order_key
+from labelkit.operators.generation.project import derive_generation_id
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
 JPEG_MAGIC = b"\xff\xd8\xff"
@@ -58,7 +59,9 @@ def _mk_paths(tmp_path: Path) -> ResolvedPaths:
         rejects=stem + ".rejects.jsonl",
         sidecar=None,
         trace=None,
-        stream_artifact=None,
+        stream=None,
+        manifest=None,
+        failed_report=None,
     )
 
 
@@ -126,6 +129,361 @@ def write_jsonl(path: Path, objs, raw_lines=()):
     lines = [json.dumps(o, ensure_ascii=False) for o in objs]
     lines.extend(raw_lines)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def _artifact_timestamp(timestamp_us: int) -> str:
+    return datetime.fromtimestamp(timestamp_us / 1_000_000, tz=timezone.utc).isoformat(
+        timespec="microseconds"
+    )
+
+
+def _generation_stream_rows() -> list[dict]:
+    world_id = "1" * 32
+    scenario_id = "2" * 32
+    payloads = ({"text": "request"}, {"text": "confirmation"})
+    primary_times = (1_767_585_600_000_000, 1_767_585_660_000_000)
+    event_keys = ("3" * 32, "4" * 32)
+    event_ids = [
+        derive_generation_id("primary_event_id", [world_id, key, timestamp, payload])
+        for key, timestamp, payload in zip(event_keys, primary_times, payloads, strict=True)
+    ]
+    owner = derive_generation_id("sequence_id", [world_id, event_ids])
+    generation = {
+        "validation_mode": "declared",
+        "actor_knowledge_validation": "mechanical_and_semantic",
+        "scenario_set": "booking",
+        "scenario_index": 0,
+        "scenario_id": scenario_id,
+        "world_branch_id": world_id,
+        "sequence_class": "ticket",
+        "pattern": "booking",
+        "variant": "positive",
+    }
+    rows = []
+    for index, (payload, timestamp, key, event_id) in enumerate(
+            zip(payloads, primary_times, event_keys, event_ids, strict=True)):
+        event = {
+            "event_id": event_id,
+            "event_key": key,
+            "owner_sequence_id": owner,
+            "role": ("request", "confirm")[index],
+            "frame_class": ("task_request", "confirmation")[index],
+            "actor": ("user", "system")[index],
+            "logical_time_us": index * 60_000_000,
+            "timestamp": _artifact_timestamp(timestamp),
+        }
+        rows.append({"payload": payload, "_meta": {
+            "event": event, "generation": dict(generation),
+            "classification": {
+                "label": event["frame_class"],
+                "labels": [event["frame_class"]],
+                "source": "inherited",
+            },
+        }})
+    replay_id = derive_generation_id("replay_sequence_id", [owner, 0])
+    for source, timestamp in zip(rows[:2], (1_767_589_200_000_000, 1_767_589_260_000_000),
+                                 strict=True):
+        source_event = source["_meta"]["event"]
+        event_id = derive_generation_id(
+            "replay_event_id", [replay_id, source_event["event_id"], timestamp]
+        )
+        event = dict(source_event)
+        event.update({
+            "event_id": event_id,
+            "owner_sequence_id": None,
+            "timestamp": _artifact_timestamp(timestamp),
+            "replay_sequence_id": replay_id,
+            "replay_ordinal": 0,
+            "duplicate_of_sequence_id": owner,
+            "duplicate_of_event_id": source_event["event_id"],
+        })
+        replay_generation = {
+            "validation_mode": "replay",
+            "source_validation_mode": "declared",
+            "sequence_class": "ticket",
+            "scenario_id": scenario_id,
+            "source_pattern": "booking",
+            "source_variant": "positive",
+            "duplicate_of_sequence_id": owner,
+        }
+        rows.append({"payload": dict(source["payload"]), "_meta": {
+            "event": event, "generation": replay_generation,
+            "classification": dict(source["_meta"]["classification"]),
+        }})
+    return rows
+
+
+def test_generation_stream_envelope_recomputes_primary_and_replay_ids(tmp_path):
+    rows = _generation_stream_rows()
+    cfg = make_cfg(tmp_path, text_field="payload")
+    write_jsonl(tmp_path / "in" / "generated.stream.jsonl", rows)
+
+    ingestor = Ingestor(cfg)
+    assert ingestor.scan(estimate=False).estimated_records == 0
+    records = list(ingestor.records())
+
+    assert [record.id for record in records] == [
+        row["_meta"]["event"]["event_id"] for row in rows
+    ]
+    assert records[0].text == '{"text":"request"}'
+    assert records[2].text == records[0].text
+    assert records[2].raw == rows[2]
+    assert (ingestor.report.scanned, ingestor.report.ingested,
+            ingestor.report.bad_input) == (4, 4, 0)
+
+
+@pytest.mark.parametrize("case", [
+    "primary_event_id",
+    "owner_sequence_id",
+    "world_branch_id",
+    "duplicate_event_id",
+    "replay_sequence_id",
+    "replay_event_id",
+    "duplicate_of_sequence_id",
+    "duplicate_of_event_id",
+    "replay_ordinal",
+    "replay_payload",
+    "replay_downstream_meta",
+    "replay_generation",
+    "replay_event_count",
+    "timestamp",
+    "primary_event_extra",
+    "primary_event_missing",
+    "primary_generation_extra",
+    "primary_generation_missing",
+    "primary_meta_extra",
+    "primary_top_order",
+    "replay_event_extra",
+    "replay_event_missing",
+    "replay_meta_extra",
+    "synchronized_meta_extra",
+])
+def test_generation_stream_envelope_provenance_fails_closed(tmp_path, case):
+    rows = _generation_stream_rows()
+    primary, replay = rows[0], rows[2]
+    if case == "primary_event_id":
+        primary["_meta"]["event"]["event_id"] = "0" * 32
+    elif case == "owner_sequence_id":
+        primary["_meta"]["event"]["owner_sequence_id"] = "0" * 32
+    elif case == "world_branch_id":
+        primary["_meta"]["generation"]["world_branch_id"] = "0" * 32
+    elif case == "duplicate_event_id":
+        replay["_meta"]["event"]["event_id"] = primary["_meta"]["event"]["event_id"]
+    elif case == "replay_sequence_id":
+        replay["_meta"]["event"]["replay_sequence_id"] = "0" * 32
+    elif case == "replay_event_id":
+        replay["_meta"]["event"]["event_id"] = "0" * 32
+    elif case == "duplicate_of_sequence_id":
+        replay["_meta"]["event"]["duplicate_of_sequence_id"] = "0" * 32
+    elif case == "duplicate_of_event_id":
+        replay["_meta"]["event"]["duplicate_of_event_id"] = "0" * 32
+    elif case == "replay_ordinal":
+        replay["_meta"]["event"]["replay_ordinal"] = 1
+    elif case == "replay_payload":
+        replay["payload"]["text"] = "tampered"
+    elif case == "replay_downstream_meta":
+        replay["_meta"]["classification"]["label"] = "tampered"
+    elif case == "replay_generation":
+        replay["_meta"]["generation"]["source_variant"] = "tampered"
+    elif case == "replay_event_count":
+        rows.pop()
+    elif case == "primary_event_extra":
+        primary["_meta"]["event"]["unexpected"] = True
+    elif case == "primary_event_missing":
+        primary["_meta"]["event"].pop("actor")
+    elif case == "primary_generation_extra":
+        primary["_meta"]["generation"]["unexpected"] = True
+    elif case == "primary_generation_missing":
+        primary["_meta"]["generation"].pop("pattern")
+    elif case == "primary_meta_extra":
+        primary["_meta"]["unexpected"] = True
+    elif case == "primary_top_order":
+        rows[0] = {"_meta": primary["_meta"], "payload": primary["payload"]}
+    elif case == "replay_event_extra":
+        replay["_meta"]["event"]["unexpected"] = True
+    elif case == "replay_event_missing":
+        replay["_meta"]["event"].pop("actor")
+    elif case == "replay_meta_extra":
+        replay["_meta"]["unexpected"] = True
+    elif case == "synchronized_meta_extra":
+        primary["_meta"]["unexpected"] = replay["_meta"]["unexpected"] = True
+    else:
+        replay["_meta"]["event"]["timestamp"] = "2026-01-05T00:00:00Z"
+    cfg = make_cfg(tmp_path, text_field="payload")
+    write_jsonl(tmp_path / "in" / "generated.stream.jsonl", rows)
+
+    with pytest.raises(InputError, match="generation_input_invalid"):
+        Ingestor(cfg).scan(estimate=False)
+    ingestor = Ingestor(cfg)
+    with pytest.raises(InputError, match="generation_input_invalid"):
+        list(ingestor.records())
+    assert ingestor.report.ingested == 0
+    assert ingestor.report.bad_input == 1
+
+
+def _generation_noise_row() -> dict:
+    """构造一行字段闭合的 generation noise envelope。"""
+    return {"payload": {"text": "background"}, "_meta": {
+        "event": {
+            "event_id": "a" * 32,
+            "event_key": "b" * 32,
+            "owner_sequence_id": None,
+            "role": None,
+            "frame_class": "noise",
+            "actor": None,
+            "logical_time_us": None,
+            "timestamp": _artifact_timestamp(1_767_585_600_000_000),
+            "noise": True,
+        },
+        "generation": None,
+    }}
+
+
+def test_generation_stream_noise_envelope_is_self_contained(tmp_path):
+    """完整 noise envelope 可独立 replay ingest。"""
+    row = _generation_noise_row()
+    cfg = make_cfg(tmp_path, text_field="payload")
+    write_jsonl(tmp_path / "in" / "generated.stream.jsonl", [row])
+    records = list(Ingestor(cfg).records())
+    assert len(records) == 1 and records[0].raw == row
+
+
+@pytest.mark.parametrize("case", (
+    "meta_extra", "event_extra", "event_key_missing", "frame_class_missing",
+    "top_order", "generation", "role", "event_key",
+))
+def test_generation_stream_noise_shape_fails_closed(tmp_path, case):
+    """noise 的顶层、meta、event 缺失/额外/篡改字段均整流拒绝。"""
+    row = _generation_noise_row()
+    if case == "meta_extra":
+        row["_meta"]["unexpected"] = True
+    elif case == "event_extra":
+        row["_meta"]["event"]["unexpected"] = True
+    elif case == "event_key_missing":
+        row["_meta"]["event"].pop("event_key")
+    elif case == "frame_class_missing":
+        row["_meta"]["event"].pop("frame_class")
+    elif case == "top_order":
+        row = {"_meta": row["_meta"], "payload": row["payload"]}
+    elif case == "generation":
+        row["_meta"]["generation"] = {}
+    elif case == "role":
+        row["_meta"]["event"]["role"] = "noise"
+    else:
+        row["_meta"]["event"]["event_key"] = "invalid"
+    cfg = make_cfg(tmp_path, text_field="payload")
+    write_jsonl(tmp_path / "in" / "generated.stream.jsonl", [row])
+    with pytest.raises(InputError, match="generation_input_invalid"):
+        list(Ingestor(cfg).records())
+
+
+@pytest.mark.parametrize("field", (
+    "scenario_id", "scenario_set", "scenario_index", "sequence_class", "pattern", "variant",
+))
+def test_generation_stream_owner_rejects_mixed_sequence_truth(tmp_path, field):
+    """同一 owner 的每行必须携带完全相同的 primary generation truth。"""
+    rows = _generation_stream_rows()
+    changed = 1 if field == "scenario_index" else "changed"
+    rows[1]["_meta"]["generation"][field] = changed
+    replay_key = {
+        "scenario_id": "scenario_id",
+        "sequence_class": "sequence_class",
+        "pattern": "source_pattern",
+        "variant": "source_variant",
+    }.get(field)
+    if replay_key is not None:
+        rows[3]["_meta"]["generation"][replay_key] = changed
+    cfg = make_cfg(tmp_path, text_field="payload")
+    write_jsonl(tmp_path / "in" / "generated.stream.jsonl", rows)
+    with pytest.raises(InputError, match="generation_input_invalid"):
+        list(Ingestor(cfg).records())
+
+
+def test_generation_stream_malformed_json_fails_scan_and_live(tmp_path):
+    rows = _generation_stream_rows()
+    path = tmp_path / "in" / "generated.stream.jsonl"
+    write_jsonl(path, rows[:1], raw_lines=("{broken",))
+    cfg = make_cfg(tmp_path, text_field="payload")
+
+    with pytest.raises(InputError, match="generation_input_invalid"):
+        Ingestor(cfg).scan(estimate=False)
+    with pytest.raises(InputError, match="generation_input_invalid"):
+        list(Ingestor(cfg).records())
+
+
+def test_generation_stream_detection_cannot_be_bypassed_by_bad_first_line(tmp_path):
+    """首行坏 JSON、后续 envelope 时，即使 skip 策略也严格拒绝整份工件。"""
+    rows = _generation_stream_rows()
+    rows[0]["_meta"]["event"]["event_id"] = "0" * 32
+    encoded = ["{broken", *(json.dumps(row, ensure_ascii=False) for row in rows)]
+    path = tmp_path / "in" / "generated.stream.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(encoded) + "\n", encoding="utf-8")
+    cfg = make_cfg(tmp_path, text_field="payload", on_bad_line="skip")
+
+    with pytest.raises(InputError, match="generation_input_invalid"):
+        Ingestor(cfg).scan(estimate=False)
+    ingestor = Ingestor(cfg)
+    with pytest.raises(InputError, match="generation_input_invalid"):
+        list(ingestor.records())
+    assert ingestor.report.ingested == 0
+    assert ingestor.report.bad_input == 1
+
+
+def _crossing_primary_rows(world: str, offset: int) -> list[dict]:
+    payloads = ({"text": f"{world}-first"}, {"text": f"{world}-second"})
+    timestamps = (1_767_585_600_000_000 + offset,
+                  1_767_585_600_000_000 + offset + 2_000_000)
+    keys = (world * 32, chr(ord(world) + 1) * 32)
+    ids = [
+        derive_generation_id("primary_event_id", [world * 32, key, stamp, payload])
+        for key, stamp, payload in zip(keys, timestamps, payloads, strict=True)
+    ]
+    owner = derive_generation_id("sequence_id", [world * 32, ids])
+    generation = {
+        "validation_mode": "instruction_only",
+        "actor_knowledge_validation": "semantic",
+        "instruction_slot": world,
+        "scenario_index": 0,
+        "scenario_id": "f" * 32,
+        "world_branch_id": world * 32,
+        "sequence_class": "ticket",
+    }
+    output = []
+    for index, (payload, timestamp, key, event_id) in enumerate(
+            zip(payloads, timestamps, keys, ids, strict=True)):
+        event = {
+            "event_id": event_id,
+            "event_key": key,
+            "owner_sequence_id": owner,
+            "role": f"position_{index:03d}",
+            "frame_class": "message",
+            "actor": "user",
+            "logical_time_us": index * 2_000_000,
+            "timestamp": _artifact_timestamp(timestamp),
+        }
+        output.append({"payload": payload, "_meta": {
+            "event": event,
+            "generation": generation,
+            "classification": {
+                "label": "message", "labels": ["message"], "source": "inherited",
+            },
+        }})
+    return output
+
+
+def test_generation_stream_crossing_preserves_each_owner_event_order(tmp_path):
+    left = _crossing_primary_rows("a", 0)
+    right = _crossing_primary_rows("c", 1_000_000)
+    crossing = [left[0], right[0], left[1], right[1]]
+    cfg = make_cfg(tmp_path, text_field="payload")
+    write_jsonl(tmp_path / "in" / "generated.stream.jsonl", crossing)
+
+    records = list(Ingestor(cfg).records())
+
+    assert [record.id for record in records] == [
+        row["_meta"]["event"]["event_id"] for row in crossing
+    ]
 
 
 # ── v1.17（SPEC-SP §5.1）：输入根只消费 ResolvedPaths，消灭 cwd 二次推导 ──────

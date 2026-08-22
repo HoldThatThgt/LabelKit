@@ -11,6 +11,7 @@ from labelkit.common.errors import (
     EXIT_STRICT,
     CircuitBreakerTripped,
     ConfigError,
+    DeliveryError,
     InputError,
     LabelKitError,
     ProviderFatalError,
@@ -36,6 +37,8 @@ def exit_code_for(exc: BaseException) -> int:
         return EXIT_CONFIG
     if isinstance(exc, InputError):
         return EXIT_INPUT
+    if isinstance(exc, DeliveryError):
+        return EXIT_STRICT
     if isinstance(exc, (ProviderFatalError, CircuitBreakerTripped)):
         return EXIT_FATAL
     if isinstance(exc, LabelKitError) and str(exc) == _REPORT_WRITE_FAILED_MSG:

@@ -1,0 +1,1299 @@
+"""v1.18 generation ID、双视图投影与提交前机械对账。"""
+from __future__ import annotations
+
+import dataclasses
+import hashlib
+import json
+import logging
+import re
+from collections.abc import Mapping as MappingABC
+from datetime import datetime, timedelta, timezone
+from typing import Mapping, Sequence
+
+from labelkit.common.config.generation import is_generation_frame_eligible
+from labelkit.common.contracts.generation import (
+    DeliverySlot,
+    GenerationProgram,
+    NoiseProjectionRequest,
+    PlannedEvent,
+    ProjectionWitness,
+    ProjectedSequence,
+    ProjectionRequest,
+    ReconcileRequest,
+    ReplayProjectionRequest,
+    ReplayRows,
+    ScenarioPlan,
+)
+from labelkit.common.contracts.types import Record, RecordRef
+from labelkit.common.errors import GenerationProjectionMismatch, InternalError
+
+
+_log = logging.getLogger("labelkit.generation.project")
+
+
+def canonical_json(value: object) -> str:
+    """返回 v1.18 使用的规范 JSON。
+
+    @param value JSON-compatible 值。
+    @return 键序稳定且无空白的 JSON。
+    """
+    return json.dumps(
+        _thaw_json(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+
+
+def _thaw_json(value: object) -> object:
+    """把冻结 carrier 的 JSON 子树递归复制为可变容器。
+
+    @param value MappingProxyType/tuple 或 JSON 标量。
+    @return 不与输入共享容器的 JSON 值。
+    """
+    if dataclasses.is_dataclass(value):
+        return {
+            field.name: _thaw_json(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+        }
+    if isinstance(value, MappingABC):
+        return {str(key): _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_thaw_json(item) for item in value]
+    return value
+
+
+def derive_generation_id(domain: str, components: Sequence[object]) -> str:
+    """以域分离 canonical JSON 组件派生 generation ID。
+
+    @param domain 冻结 ID 域。
+    @param components 按规范顺序排列的组件。
+    @return 32 位小写十六进制 ID。
+    """
+    material = canonical_json(["labelkit:v1.18", domain, list(components)])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+
+
+def scenario_plan_digest(plan: ScenarioPlan) -> str:
+    """计算排除 digest 自身的完整 ScenarioPlan 摘要。
+
+    @param plan 待校验或尚未写入 digest 的冻结计划
+    @return 64 位小写十六进制摘要
+    """
+    blocks = [[
+        {
+            "slot_key": key[0],
+            "variant_name": key[1],
+            "events": [dataclasses.asdict(event) for event in events],
+        }
+        for key, events in block.items()
+    ] for block in plan.blocks]
+    material = {
+        "blocks": blocks,
+        "delivery_slots": [dataclasses.asdict(item) for item in plan.delivery_slots],
+        "noise_slots": [dataclasses.asdict(item) for item in plan.noise_slots],
+        "replay_layouts": [dataclasses.asdict(item) for item in plan.replay_layouts],
+        "primary_sessions": plan.primary_sessions,
+    }
+    return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
+
+
+def validate_planned_events(
+    program: GenerationProgram,
+    slot: DeliverySlot,
+    variant_name: str | None,
+    events: Sequence[PlannedEvent],
+) -> None:
+    """把一个 branch 的位置、role 与 event key 重新绑定到程序。
+
+    @param program 当前冻结生成程序
+    @param slot 当前交付槽
+    @param variant_name 当前 branch 变体名；hidden baseline 与 instruction-only 为 None
+    @param events 当前 branch 的完整事件序列
+    @return None；任何不一致均抛终态 InternalError
+    """
+    scenario_domain = (
+        "declared_scenario_id" if program.mode == "declared" else "instruction_scenario_id"
+    )
+    scenario_id = derive_generation_id(
+        scenario_domain, [program.digest, slot.source_name, slot.scenario_index]
+    )
+    expected_roles = _expected_branch_roles(program, slot, variant_name, len(events))
+    seen_keys: set[str] = set()
+    for position, (event, expected_role) in enumerate(zip(events, expected_roles)):
+        if program.mode == "instruction_only":
+            expected_key = derive_generation_id("instruction_event_key", [
+                scenario_id, slot.source_name, slot.scenario_index, position,
+            ])
+        else:
+            expected_key = derive_generation_id(
+                "declared_event_key", [scenario_id, expected_role]
+            )
+        if event.position != position or event.role != expected_role:
+            _contract_error("planned event position or role is not bound to the program")
+        if event.event_key != expected_key:
+            _contract_error("planned event key is not bound to the program")
+        if event.event_key in seen_keys:
+            _contract_error("planned event key is duplicated within a branch")
+        seen_keys.add(event.event_key)
+
+
+def _expected_branch_roles(program, slot, variant_name, event_count: int) -> tuple[str, ...]:
+    """从程序独立重建一个 branch 的精确 role word。"""
+    if program.mode == "instruction_only":
+        source = next(
+            (item for item in program.instruction_only if item.name == slot.source_name), None
+        )
+        if source is None or not source.len_range[0] <= event_count <= source.len_range[1]:
+            _contract_error("instruction branch event count differs from the program")
+        return tuple(f"position_{position:03d}" for position in range(event_count))
+    pattern = program.patterns.get(slot.pattern_name)
+    source = next(
+        (item for item in program.counterfactual_sets if item.name == slot.source_name), None
+    )
+    if pattern is None or source is None:
+        _contract_error("declared branch source is absent from the program")
+    roles = list(pattern.order)
+    if variant_name is not None:
+        variant = next((item for item in source.variants if item.name == variant_name), None)
+        if variant is None:
+            _contract_error("declared branch variant is absent from the program")
+        if variant.kind == "missing":
+            roles.remove(variant.target["role"])
+        elif variant.kind == "reordered":
+            before = roles.index(variant.target["before"])
+            after = roles.index(variant.target["after"])
+            roles[before], roles[after] = roles[after], roles[before]
+    if len(roles) != event_count:
+        _contract_error("declared branch event count differs from the program")
+    return tuple(roles)
+
+
+def validate_plan_identity(program: GenerationProgram, plan: ScenarioPlan) -> None:
+    """以 program-bound seed 重建并逐字段复验 canonical ScenarioPlan。
+
+    @param program 当前冻结生成程序
+    @param plan 待执行或最终对账的冻结计划
+    @return None；任何不一致均抛终态 InternalError
+    """
+    from labelkit.operators.generation.planner import compile_scenario_plan
+    from labelkit.operators.generation.program import generation_program_digest
+
+    if program.digest != generation_program_digest(program):
+        _contract_error("generation program digest is invalid")
+    if plan.digest != scenario_plan_digest(plan):
+        _contract_error("scenario plan digest is invalid")
+    if plan != compile_scenario_plan(program):
+        _contract_error("scenario plan differs from canonical planner output")
+
+
+def _witness_digest(domain: str, value: object) -> str:
+    """以冻结 domain 对 canonical source value 计算完整 SHA-256。"""
+    material = canonical_json(["labelkit:v1.18", domain, value])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def noise_payload_digest(payload: Mapping[str, object]) -> str:
+    """计算 post-gate noise payload 的 compact source witness。
+
+    @param payload 已通过完整 Schema 与独立语义 gate 的 noise object。
+    @return 不含源内容的完整 SHA-256。
+    """
+    return _witness_digest("noise_payload", payload)
+
+
+def canonical_delivery_row(row: Mapping[str, object]) -> bytes:
+    """移除发射期墙钟字段后返回 canonical UTF-8 行。
+
+    @param row 待摘要的输出行。
+    @return 规范行字节。
+    """
+    value = _thaw_json(row)
+    meta = value.get("_meta")
+    if isinstance(meta, dict):
+        run = meta.get("run")
+        if isinstance(run, dict):
+            for key in ("started_at", "finished_at", "duration_ms"):
+                run.pop(key, None)
+    return canonical_json(value).encode("utf-8")
+
+
+def project_trace(request: ProjectionRequest) -> ProjectedSequence:
+    """把已接受 primary trace 投影为下游 Record 与基础 stream rows。
+
+    @param request 当前 slot 与 EventTrace。
+    @return 下游前双视图投影。
+    """
+    validate_plan_identity(request.program, request.plan)
+    return _project_trace_from_validated_plan(request)
+
+
+def _project_trace_from_validated_plan(request: ProjectionRequest) -> ProjectedSequence:
+    """仅供已在运行边界验证过完整 plan 的控制器投影 trace。"""
+    _validate_projection_request(request)
+    generation = _generation_truth(request)
+    event_ids = [event.event_id for event in request.trace.events]
+    sequence_id = derive_generation_id(
+        "sequence_id", [request.trace.world_branch_id, event_ids]
+    )
+    rows = tuple(
+        _primary_row(event, sequence_id, generation, request.program.timeline.utc_offset_minutes)
+        for event in request.trace.events
+    )
+    members = tuple(_member_record(row) for row in rows)
+    record = Record(
+        id=sequence_id,
+        modality="text",
+        text=None,
+        raw={"_meta": {"generation": generation}},
+        ui_tree=None,
+        image=None,
+        ref=_generated_ref(),
+        kind="sequence",
+        members=members,
+    )
+    return ProjectedSequence(main_record=record, primary_stream_rows=rows)
+
+
+def projection_witness(projection: ProjectedSequence) -> ProjectionWitness:
+    """把 attempt-local projector 内容压缩为 CrossView 源证明。
+
+    @param projection 尚未释放的不可变 ProjectedSequence。
+    @return 不含 payload、Record 或 row 的 full-SHA-256 witness。
+    """
+    generation = _projection_generation(projection)
+    member_sources = [_member_source(member) for member in projection.main_record.members]
+    base = tuple(_witness_digest("projection_primary_base", _primary_base(row))
+                 for row in projection.primary_stream_rows)
+    return ProjectionWitness(
+        projection.main_record.id,
+        _witness_digest("projection_main_generation", generation),
+        _witness_digest("projection_member_sources", member_sources),
+        base,
+    )
+
+
+def _primary_base(row) -> dict[str, object]:
+    """提取 projector 与最终 primary 共享的三个基础字段。"""
+    meta = row.get("_meta") if isinstance(row, MappingABC) else None
+    if not isinstance(meta, MappingABC):
+        _projection_mismatch("primary base metadata is missing")
+    return {
+        "payload": row.get("payload"),
+        "event": meta.get("event"),
+        "generation": meta.get("generation"),
+    }
+
+
+def _validate_projection_request(request: ProjectionRequest) -> None:
+    """校验 trace 与当前交付槽一致。
+
+    @param request 当前投影请求。
+    @return None。
+    """
+    trace = request.trace
+    slot = request.slot
+    if sum(item == slot for item in request.plan.delivery_slots) != 1:
+        _contract_error("projection slot is absent from the scenario plan")
+    valid_variant = trace.variant_name in slot.variant_names
+    if request.program.mode == "instruction_only":
+        valid_variant = trace.variant_name is None and slot.variant_names == ()
+    if (
+        trace.sequence_class != slot.sequence_class
+        or trace.pattern_name != slot.pattern_name
+        or not valid_variant
+        or not trace.events
+    ):
+        _contract_error("trace does not match its delivery slot")
+    _validate_trace_identity(request)
+    _validate_trace_evaluations(request)
+
+
+def _validate_trace_identity(request: ProjectionRequest) -> None:
+    """从程序与已验证 branch 重派 trace、事件和时间身份。"""
+    trace = request.trace
+    planned = _projection_branch(request)
+    if len(trace.events) != len(planned):
+        _contract_error("trace event count differs from its planned branch")
+    validate_planned_events(request.program, request.slot, trace.variant_name, planned)
+    scenario_id, world_id = _branch_ids(
+        request.program, request.slot, trace.variant_name
+    )
+    if trace.scenario_id != scenario_id or trace.world_branch_id != world_id:
+        _contract_error("trace branch identity is not bound to the program")
+    for event, witness in zip(trace.events, planned, strict=True):
+        planned_fields = (
+            event.event_key == witness.event_key,
+            event.role == witness.role,
+            event.logical_time_us == witness.logical_time_us,
+            event.timestamp_us == witness.timestamp_us,
+        )
+        expected_id = derive_generation_id(
+            "primary_event_id",
+            [world_id, witness.event_key, witness.timestamp_us, event.payload],
+        )
+        if not all(planned_fields) or event.event_id != expected_id:
+            _contract_error("trace event identity differs from its planned branch")
+        if request.program.mode == "instruction_only":
+            frame = request.program.frame_classes.get(event.frame_class)
+            noise = request.program.noise
+            if (frame is None or not is_generation_frame_eligible(frame)
+                    or (noise is not None and event.frame_class == noise.frame_class)):
+                _contract_error("instruction trace frame class is outside the registry")
+            if event.actor not in trace.scenario_seed.actors:
+                _contract_error("instruction trace actor is outside the scenario")
+
+
+def _projection_branch(request: ProjectionRequest) -> tuple[PlannedEvent, ...]:
+    """从请求的唯一完整计划解析当前 branch。"""
+    key = (request.slot.slot_key, request.trace.variant_name)
+    branches = [block[key] for block in request.plan.blocks if key in block]
+    if len(branches) != 1:
+        _contract_error("trace planned branch is missing or duplicated")
+    return branches[0]
+
+
+def _validate_trace_evaluations(request: ProjectionRequest) -> None:
+    """复验投影入口携带的独立 gate 结论与事件真值一致。"""
+    trace = request.trace
+    state = trace.state_evaluation
+    semantic = trace.semantic_evaluation
+    state_valid = (
+        state.replay_hash == state.final_state_hash
+        and state.bindings_valid
+        and state.outcome_valid
+        and state.protected_prefix_valid
+    )
+    semantic_valid = (
+        semantic.causal_consistency
+        and semantic.actor_knowledge
+        and semantic.goal_consistency
+        and semantic.temporal_plausibility
+        and semantic.cross_frame_consistency
+        and semantic.realism
+        and not semantic.reason_codes
+    )
+    if not state_valid or not semantic_valid:
+        _contract_error("trace carries a failed evaluation")
+    if request.program.mode == "instruction_only":
+        if trace.pattern_evaluation is not None:
+            _contract_error("instruction-only trace carries a pattern evaluation")
+        return
+    _validate_declared_trace_truth(request)
+
+
+def _validate_declared_trace_truth(request: ProjectionRequest) -> None:
+    """复验 declared role word、绑定与预期违规。"""
+    trace = request.trace
+    evaluation = trace.pattern_evaluation
+    variant = _variant_for(request)
+    pattern = request.program.patterns.get(request.slot.pattern_name)
+    if evaluation is None or pattern is None:
+        _contract_error("declared trace truth is incomplete")
+    roles = {item.name: item for item in pattern.roles}
+    expected_word = _variant_role_word(pattern.order, variant)
+    actual_word = tuple(event.role for event in trace.events)
+    if actual_word != expected_word:
+        _contract_error("declared trace role word differs from its variant")
+    for event in trace.events:
+        role = roles.get(event.role)
+        if role is None or event.frame_class != role.frame_class or event.actor != role.actor:
+            _contract_error("declared trace event differs from its role")
+    expected_bindings = {event.event_id: event.role for event in trace.events}
+    if len(expected_bindings) != len(trace.events):
+        _contract_error("declared trace event ids are duplicated")
+    if dict(evaluation.actual_bindings) != expected_bindings:
+        _contract_error("declared trace bindings differ from event truth")
+    expected = () if not variant.expected_violation else (dict(variant.expected_violation),)
+    if tuple(dict(item) for item in evaluation.actual_violations) != expected:
+        _contract_error("declared trace violations differ from expected truth")
+
+
+def _variant_role_word(order, variant) -> tuple[str, ...]:
+    """从声明 order 与 variant 机械派生实际 role word。"""
+    roles = list(order)
+    if variant.kind == "missing":
+        roles.remove(variant.target["role"])
+    elif variant.kind == "reordered":
+        left = roles.index(variant.target["before"])
+        right = roles.index(variant.target["after"])
+        roles[left], roles[right] = roles[right], roles[left]
+    return tuple(roles)
+
+
+def _generation_truth(request: ProjectionRequest) -> dict[str, object]:
+    """构造 primary 的 generation truth。
+
+    @param request 当前投影请求。
+    @return 按输出契约排序的字典。
+    """
+    trace, slot = request.trace, request.slot
+    if request.program.mode == "instruction_only":
+        return {
+            "validation_mode": "instruction_only",
+            "actor_knowledge_validation": "semantic",
+            "instruction_slot": slot.source_name,
+            "scenario_index": slot.scenario_index,
+            "scenario_id": trace.scenario_id,
+            "world_branch_id": trace.world_branch_id,
+            "sequence_class": trace.sequence_class,
+        }
+    variant = _variant_for(request)
+    return {
+        "validation_mode": "declared",
+        "actor_knowledge_validation": "mechanical_and_semantic",
+        "scenario_set": slot.source_name,
+        "scenario_index": slot.scenario_index,
+        "scenario_id": trace.scenario_id,
+        "world_branch_id": trace.world_branch_id,
+        "sequence_class": trace.sequence_class,
+        "pattern": trace.pattern_name,
+        "variant": trace.variant_name,
+        "expected_violation": dict(variant.expected_violation),
+        "actual_violations": [dict(item) for item in trace.pattern_evaluation.actual_violations],
+    }
+
+
+def _variant_for(request: ProjectionRequest):
+    """解析投影 branch 的 VariantSpec。
+
+    @param request 当前投影请求。
+    @return 唯一 VariantSpec。
+    """
+    source = next(
+        (item for item in request.program.counterfactual_sets
+         if item.name == request.slot.source_name),
+        None,
+    )
+    variant = next(
+        (item for item in source.variants if item.name == request.trace.variant_name),
+        None,
+    ) if source is not None else None
+    if variant is None or request.trace.pattern_evaluation is None:
+        _contract_error("declared projection cannot resolve variant truth")
+    return variant
+
+
+def _primary_row(event, sequence_id: str, generation: Mapping[str, object], offset: int) -> dict:
+    """构造一行 primary stream 数据。
+
+    @param event 当前 EventTruth。
+    @param sequence_id owner sequence ID。
+    @param generation owner generation truth。
+    @param offset 固定 UTC offset 分钟。
+    @return 完整 primary row。
+    """
+    event_meta = {
+        "event_id": event.event_id,
+        "event_key": event.event_key,
+        "owner_sequence_id": sequence_id,
+        "role": event.role,
+        "frame_class": event.frame_class,
+        "actor": event.actor,
+        "logical_time_us": event.logical_time_us,
+        "timestamp": _timestamp_text(event.timestamp_us, offset),
+    }
+    stream_generation = dict(generation)
+    stream_generation.pop("expected_violation", None)
+    stream_generation.pop("actual_violations", None)
+    return {
+        "payload": event.payload,
+        "_meta": {"event": event_meta, "generation": stream_generation},
+    }
+
+
+def _member_record(row: Mapping[str, object]) -> Record:
+    """从 primary row 构造 sequence member Record。
+
+    @param row 完整 primary stream row。
+    @return member Record。
+    """
+    event = row["_meta"]["event"]
+    payload = row["payload"]
+    return Record(
+        id=event["event_id"],
+        modality="text",
+        text=canonical_json(payload),
+        raw=row,
+        ui_tree=None,
+        image=None,
+        ref=_generated_ref(),
+    )
+
+
+def _generated_ref() -> RecordRef:
+    """返回 sequence generation 的通用空输入溯源。
+
+    @return 生成记录溯源。
+    """
+    return RecordRef(
+        source_file="",
+        line_no=None,
+        pair_index=None,
+        generated_from=(),
+        generator=None,
+    )
+
+
+def project_noise(request: NoiseProjectionRequest) -> Mapping[str, object]:
+    """把一个 NoiseSlot payload 投影为最终 stream row。
+
+    @param request 已接受 noise payload 的投影请求。
+    @return 完整 noise row。
+    """
+    slot = request.noise_slot
+    event_id = derive_generation_id(
+        "noise_event_id", [request.run_id, slot.event_key, slot.timestamp_us, request.payload]
+    )
+    event = {
+        "event_id": event_id,
+        "event_key": slot.event_key,
+        "owner_sequence_id": None,
+        "role": None,
+        "frame_class": slot.frame_class,
+        "actor": None,
+        "logical_time_us": None,
+        "timestamp": _timestamp_text(
+            slot.timestamp_us, request.program.timeline.utc_offset_minutes
+        ),
+        "noise": True,
+    }
+    return {"payload": request.payload, "_meta": {"event": event, "generation": None}}
+
+
+def project_replay(request: ReplayProjectionRequest) -> ReplayRows:
+    """从最终 source primary rows 投影一次完整 replay。
+
+    @param request 冻结 replay 布局与最终 source rows。
+    @return replay rows 与 retained-content 费用。
+    """
+    validate_plan_identity(request.program, request.plan)
+    return _project_replay_from_validated_plan(request)
+
+
+def _project_replay_from_validated_plan(request: ReplayProjectionRequest) -> ReplayRows:
+    """仅供已在运行边界验证过完整 plan 的控制器投影 replay。"""
+    _validate_replay_request(request)
+    source_rows = request.source.primary_stream_rows
+    if len(source_rows) != len(request.layout.timestamps_us) or not source_rows:
+        _contract_error("replay source row count does not match planned timestamps")
+    source_id = _single_owner(source_rows)
+    replay_id = derive_generation_id(
+        "replay_sequence_id", [source_id, request.layout.replay_ordinal]
+    )
+    rows = tuple(
+        _replay_row(request, row, index, source_id, replay_id)
+        for index, row in enumerate(source_rows)
+    )
+    retained = sum(len(canonical_delivery_row(row)) + 1 for row in rows)
+    return ReplayRows(rows=rows, retained_content_bytes=retained)
+
+
+def _validate_replay_request(request: ReplayProjectionRequest) -> None:
+    """把 replay layout 与已验证计划、positive 声明和 source truth 精确绑定。"""
+    if request.plan.digest != scenario_plan_digest(request.plan):
+        _contract_error("replay plan digest is invalid")
+    matches = [item for item in request.plan.replay_layouts if item == request.layout]
+    if len(matches) != 1:
+        _contract_error("replay layout is absent from the planned replay table")
+    slot = next(
+        (item for item in request.plan.delivery_slots
+         if item.slot_key == request.layout.source_slot_key),
+        None,
+    )
+    source = next(
+        (item for item in request.program.counterfactual_sets
+         if slot is not None and item.name == slot.source_name),
+        None,
+    )
+    variant = next(
+        (item for item in source.variants
+         if item.name == request.layout.source_variant_name),
+        None,
+    ) if source is not None else None
+    if slot is None or variant is None or variant.kind != "positive":
+        _contract_error("replay source is not a planned positive variant")
+    generation = request.source.main_row.get("_meta", {}).get("generation", {})
+    expected = {
+        "scenario_set": slot.source_name,
+        "scenario_index": slot.scenario_index,
+        "pattern": slot.pattern_name,
+        "variant": variant.name,
+        "sequence_class": slot.sequence_class,
+    }
+    if any(generation.get(key) != value for key, value in expected.items()):
+        _contract_error("replay source truth differs from its planned positive variant")
+
+
+def _single_owner(rows: Sequence[Mapping[str, object]]) -> str:
+    """读取并验证 source primary 的唯一 owner。
+
+    @param rows source primary rows。
+    @return owner sequence ID。
+    """
+    owners = {row["_meta"]["event"]["owner_sequence_id"] for row in rows}
+    if len(owners) != 1 or not isinstance(next(iter(owners)), str):
+        _contract_error("replay source has no unique primary owner")
+    return next(iter(owners))
+
+
+def _replay_row(
+    request: ReplayProjectionRequest,
+    source_row: Mapping[str, object],
+    index: int,
+    source_id: str,
+    replay_id: str,
+) -> Mapping[str, object]:
+    """重写一行 source primary 成 replay row。
+
+    @param request replay 投影请求。
+    @param source_row source primary row。
+    @param index source 事件位置。
+    @param source_id source sequence ID。
+    @param replay_id 新 replay sequence ID。
+    @return 完整 replay row。
+    """
+    row = _thaw_json(source_row)
+    source_event = source_row["_meta"]["event"]
+    source_generation = source_row["_meta"]["generation"]
+    timestamp_us = request.layout.timestamps_us[index]
+    timestamp = (
+        timestamp_us,
+        _timestamp_text(timestamp_us, request.program.timeline.utc_offset_minutes),
+    )
+    event = _replay_event(
+        source_event, source_id, replay_id, request.layout.replay_ordinal, timestamp
+    )
+    generation = {
+        "validation_mode": "replay",
+        "source_validation_mode": source_generation["validation_mode"],
+        "sequence_class": source_generation["sequence_class"],
+        "scenario_id": source_generation["scenario_id"],
+        "source_pattern": source_generation.get("pattern"),
+        "source_variant": source_generation.get("variant"),
+        "duplicate_of_sequence_id": source_id,
+    }
+    row["_meta"]["event"] = event
+    row["_meta"]["generation"] = generation
+    return row
+
+
+def _replay_event(
+    source,
+    source_id: str,
+    replay_id: str,
+    ordinal: int,
+    timestamp: tuple[int, str],
+) -> dict:
+    """构造 replay 的 event metadata。
+
+    @param source source event metadata。
+    @param source_id source sequence ID。
+    @param replay_id replay sequence ID。
+    @param ordinal replay ordinal。
+    @param timestamp replay 工件时间的整数与 ISO 文本。
+    @return replay event metadata。
+    """
+    timestamp_us, timestamp_text = timestamp
+    event_id = derive_generation_id("replay_event_id", [
+        replay_id, source["event_id"], timestamp_us,
+    ])
+    return {
+        "event_id": event_id,
+        "event_key": source["event_key"],
+        "owner_sequence_id": None,
+        "role": source["role"],
+        "frame_class": source["frame_class"],
+        "actor": source["actor"],
+        "logical_time_us": source["logical_time_us"],
+        "timestamp": timestamp_text,
+        "replay_sequence_id": replay_id,
+        "replay_ordinal": ordinal,
+        "duplicate_of_sequence_id": source_id,
+        "duplicate_of_event_id": source["event_id"],
+    }
+
+
+def reconcile_views(request: ReconcileRequest) -> None:
+    """机械对账 primary、noise、replay 与全局时间线。
+
+    @param request 全量最终行对账请求。
+    @return None；内容不一致时抛可恢复投影拒绝。
+    """
+    _reconcile_request(request, complete=True)
+
+
+def reconcile_prospective_views(request: ReconcileRequest) -> None:
+    """机械对账当前已接受前缀，不声称最终 plan 已完整交付。
+
+    @param request 当前事务加入后的连续交付前缀。
+    @return None；前缀内容不一致时抛可恢复投影拒绝。
+    """
+    _reconcile_request(request, complete=False)
+
+
+def _reconcile_request(request: ReconcileRequest, *, complete: bool) -> None:
+    """执行 final 或 prospective 的共享逐行对账。"""
+    if complete:
+        validate_plan_identity(request.program, request.plan)
+    targets = _primary_targets(request.plan)
+    try:
+        sources = _reconcile_primary(
+            request.program, request.projection_witnesses, request.sequences, targets, complete
+        )
+        _reconcile_noise(
+            request.noise_rows,
+            request.noise_payload_digests,
+            request.plan.noise_slots,
+            (request.program, request.run_id),
+            complete,
+        )
+        _reconcile_replay(
+            sources, request.replays, request.plan.replay_layouts,
+            request.program, complete,
+        )
+        replay_rows = [row for replay in request.replays for row in replay.rows]
+        rows = [row for sequence in request.sequences for row in sequence.primary_stream_rows]
+        rows.extend(request.noise_rows)
+        rows.extend(replay_rows)
+        _reconcile_timeline(rows)
+        _reconcile_retained_bytes(request, replay_rows)
+    except GenerationProjectionMismatch:
+        raise
+    except (KeyError, TypeError, ValueError, IndexError):
+        _projection_mismatch("final rows are malformed")
+
+
+def _primary_targets(plan) -> tuple[tuple[object, str | None, tuple], ...]:
+    """按交付声明序解析每个可见 primary branch 的唯一计划。"""
+    targets = []
+    for slot in plan.delivery_slots:
+        for variant in slot.variant_names or (None,):
+            targets.append((slot, variant, _branch_events(plan, slot.slot_key, variant)))
+    return tuple(targets)
+
+
+def _branch_events(plan, slot_key: str, variant: str | None) -> tuple:
+    """从 plan blocks 唯一解析一个可见 branch。"""
+    matches = [block[(slot_key, variant)] for block in plan.blocks
+               if (slot_key, variant) in block]
+    if len(matches) != 1:
+        _contract_error("ScenarioPlan branch is missing or duplicated")
+    return tuple(matches[0])
+
+
+def _reconcile_primary(
+    program, witnesses, sequences, targets, complete: bool,
+) -> dict[tuple[str, str | None], object]:
+    """校验交付前缀的 main、primary、计划与 ID 双向闭包。"""
+    count_invalid = (len(sequences) != len(targets) if complete
+                     else len(sequences) > len(targets))
+    if len(sequences) != len(witnesses) or count_invalid:
+        _projection_mismatch("primary sequence sources differ from final rows")
+    sources = {}
+    for witness, sequence, target in zip(witnesses, sequences, targets, strict=False):
+        _reconcile_sequence(program, witness, sequence, target)
+        slot, variant, _ = target
+        sources[(slot.slot_key, variant)] = sequence
+    return sources
+
+
+@dataclasses.dataclass(frozen=True)
+class _PrimaryIdentity:
+    """一条 primary 分支对账使用的冻结身份根。"""
+
+    program: object                               # 冻结 GenerationProgram
+    slot: object                                  # 当前 DeliverySlot
+    variant: str | None                           # 当前可见分支名
+    owner: str                                    # 最终 sequence ID
+    world_id: str                                 # 独立派生 world branch ID
+    generation: Mapping[str, object]              # projector 生成真值
+
+
+def _reconcile_sequence(program, witness, sequence, target) -> None:
+    """校验一条 main 与其 primary rows 的全部机械身份。"""
+    slot, variant, planned = target
+    main = sequence.main_row
+    meta = main.get("_meta")
+    generation = meta.get("generation") if isinstance(meta, MappingABC) else None
+    if not isinstance(meta, MappingABC) or not isinstance(generation, MappingABC):
+        _projection_mismatch("primary main metadata is missing")
+    _require_keys(meta, {
+        "id", "source", "stream", "scores", "dedup", "classification",
+        "annotation", "verification", "generation",
+    }, "primary main metadata fields differ from contract")
+    classification = {
+        "label": slot.sequence_class,
+        "labels": [slot.sequence_class],
+        "source": "inherited",
+    }
+    if canonical_json(meta.get("classification")) != canonical_json(classification):
+        _projection_mismatch("primary main classification is invalid")
+    _reconcile_generation(generation, program, slot, variant)
+    if _witness_digest("projection_main_generation", generation) != witness.generation_digest:
+        _projection_mismatch("primary generation truth differs from projection")
+    main_id, world_id = meta.get("id"), generation.get("world_branch_id")
+    expected_scenario, expected_world = _branch_ids(program, slot, variant)
+    if generation.get("scenario_id") != expected_scenario or world_id != expected_world:
+        _projection_mismatch("primary scenario or world identity is invalid")
+    if main_id != witness.main_record_id or not _is_id(main_id):
+        _projection_mismatch("primary main identity differs from projection")
+    rows = tuple(sequence.primary_stream_rows)
+    retained = _canonical_rows_bytes((main, *rows))
+    if sequence.retained_content_bytes != retained:
+        _projection_mismatch("primary retained-content bytes are invalid")
+    if len(rows) != len(planned) or len(rows) != len(witness.primary_base_digests) or not rows:
+        _projection_mismatch("primary event count differs from plan")
+    identity = _PrimaryIdentity(program, slot, variant, main_id, world_id, generation)
+    event_ids = _reconcile_primary_rows(
+        rows, witness.primary_base_digests, planned, identity
+    )
+    if derive_generation_id("sequence_id", [world_id, event_ids]) != main_id:
+        _projection_mismatch("sequence ID does not match ordered event IDs")
+    _reconcile_main_stream(
+        meta.get("stream"), rows, event_ids, planned, witness
+    )
+
+
+def _projection_generation(projection) -> Mapping[str, object]:
+    """读取不可变 projector main generation truth。"""
+    raw = projection.main_record.raw
+    meta = raw.get("_meta") if isinstance(raw, MappingABC) else None
+    generation = meta.get("generation") if isinstance(meta, MappingABC) else None
+    if not isinstance(generation, MappingABC):
+        _projection_mismatch("projection generation truth is missing")
+    return generation
+
+
+def _branch_ids(program, slot, variant: str | None) -> tuple[str, str]:
+    """从程序与交付槽独立派生可见分支身份。"""
+    scenario_domain = (
+        "declared_scenario_id" if program.mode == "declared" else "instruction_scenario_id"
+    )
+    scenario = derive_generation_id(
+        scenario_domain, [program.digest, slot.source_name, slot.scenario_index]
+    )
+    if program.mode == "instruction_only":
+        world = derive_generation_id("instruction_world_branch_id", [scenario, "instruction_only"])
+    else:
+        world = derive_generation_id("declared_world_branch_id", [scenario, variant])
+    return scenario, world
+
+
+def _reconcile_generation(generation, program, slot, variant) -> None:
+    """校验 main generation truth 与声明序目标一致。"""
+    common = {
+        "scenario_index": slot.scenario_index,
+        "sequence_class": slot.sequence_class,
+    }
+    if slot.variant_names:
+        expected = {
+            "validation_mode": "declared",
+            "actor_knowledge_validation": "mechanical_and_semantic",
+            "scenario_set": slot.source_name,
+            "pattern": slot.pattern_name,
+            "variant": variant,
+            **common,
+        }
+        required = {"scenario_id", "world_branch_id", "expected_violation", "actual_violations"}
+    else:
+        expected = {
+            "validation_mode": "instruction_only",
+            "actor_knowledge_validation": "semantic",
+            "instruction_slot": slot.source_name,
+            **common,
+        }
+        required = {"scenario_id", "world_branch_id"}
+    if any(generation.get(key) != value for key, value in expected.items()):
+        _projection_mismatch("main generation truth differs from delivery slot")
+    if set(generation) != set(expected) | required:
+        _projection_mismatch("main generation truth has missing or extra fields")
+    if not _is_id(generation.get("scenario_id")):
+        _projection_mismatch("scenario ID is invalid")
+
+
+def _reconcile_primary_rows(rows, source_digests, planned, identity) -> tuple[str, ...]:
+    """逐位校验 primary row 并返回有序 event IDs。"""
+    event_ids = []
+    stream_generation = dict(identity.generation)
+    stream_generation.pop("expected_violation", None)
+    stream_generation.pop("actual_violations", None)
+    entries = zip(rows, source_digests, planned, strict=True)
+    for row, source_digest, event_plan in entries:
+        event_ids.append(
+            _reconcile_primary_row(
+                row, source_digest, event_plan, identity, stream_generation
+            )
+        )
+    if len(event_ids) != len(set(event_ids)):
+        _projection_mismatch("primary event IDs are duplicated")
+    return tuple(event_ids)
+
+
+def _reconcile_primary_row(row, source_digest, planned, identity, generation) -> str:
+    """校验一行 primary 的计划 witness、owner 与 canonical ID。"""
+    _require_row_fields(row, "primary row fields differ from contract")
+    meta, payload = row.get("_meta"), row.get("payload")
+    event = meta.get("event") if isinstance(meta, MappingABC) else None
+    if not isinstance(event, MappingABC) or not isinstance(payload, MappingABC):
+        _projection_mismatch("primary row shape is invalid")
+    _require_keys(event, {
+        "event_id", "event_key", "owner_sequence_id", "role", "frame_class",
+        "actor", "logical_time_us", "timestamp",
+    }, "primary event fields differ from contract")
+    allowed = (
+        {"event", "generation", "classification"},
+        {"event", "generation", "classification", "annotation"},
+    )
+    if set(meta) not in allowed:
+        _projection_mismatch("primary row metadata has extra fields")
+    expected = {
+        "event_key": planned.event_key,
+        "owner_sequence_id": identity.owner,
+        "role": planned.role,
+        "logical_time_us": planned.logical_time_us,
+    }
+    if any(event.get(key) != value for key, value in expected.items()):
+        _projection_mismatch("primary row differs from planned event")
+    if _timestamp_us(event.get("timestamp")) != planned.timestamp_us:
+        _projection_mismatch("primary timestamp differs from plan")
+    event_id = derive_generation_id(
+        "primary_event_id", [identity.world_id, planned.event_key, planned.timestamp_us, payload]
+    )
+    if event.get("event_id") != event_id:
+        _projection_mismatch("primary event ID is invalid")
+    _reconcile_source_row(row, source_digest)
+    _reconcile_declared_role(identity, planned, event)
+    frame = event.get("frame_class")
+    classification = {"label": frame, "labels": [frame], "source": "inherited"}
+    if canonical_json(meta.get("classification")) != canonical_json(classification):
+        _projection_mismatch("primary frame classification is invalid")
+    if canonical_json(meta.get("generation")) != canonical_json(generation):
+        _projection_mismatch("primary generation truth differs from main")
+    return event_id
+
+
+def _reconcile_source_row(row, source_digest: str) -> None:
+    """要求最终 primary 基础内容与不可变投影摘要相等。"""
+    actual = _witness_digest("projection_primary_base", _primary_base(row))
+    if actual != source_digest:
+        _projection_mismatch("primary base content differs from projection witness")
+
+
+def _reconcile_declared_role(identity, planned, event) -> None:
+    """独立证明 declared role 的 frame class 与 actor 契约。"""
+    if identity.program.mode == "instruction_only":
+        if not _nonempty(event.get("frame_class")) or not _nonempty(event.get("actor")):
+            _projection_mismatch("instruction primary frame or actor is invalid")
+        return
+    pattern = identity.program.patterns.get(identity.slot.pattern_name)
+    role = None if pattern is None else next(
+        (item for item in pattern.roles if item.name == planned.role), None
+    )
+    if role is None or (event.get("frame_class"), event.get("actor")) != (
+        role.frame_class, role.actor
+    ):
+        _projection_mismatch("primary frame or actor differs from declared role")
+
+
+def _reconcile_main_stream(stream, rows, event_ids, planned, witness) -> None:
+    """校验 main stream 索引与 primary row 顺序、类别和 session。"""
+    if not isinstance(stream, MappingABC):
+        _projection_mismatch("main stream index is missing")
+    _require_keys(stream, {
+        "episode_id", "session_id", "member_count", "member_ids",
+        "member_sources", "members",
+    }, "main stream index fields differ from contract")
+    expected = {
+        "episode_id": rows[0]["_meta"]["event"]["owner_sequence_id"],
+        "member_count": len(rows),
+        "member_ids": list(event_ids),
+    }
+    if any(canonical_json(stream.get(key)) != canonical_json(value)
+           for key, value in expected.items()):
+        _projection_mismatch("main member index differs from primary rows")
+    source_digest = _witness_digest(
+        "projection_member_sources", stream.get("member_sources")
+    )
+    if source_digest != witness.member_sources_digest:
+        _projection_mismatch("main member sources differ from projection witness")
+    members = stream.get("members")
+    if not isinstance(members, (tuple, list)) or len(members) != len(rows):
+        _projection_mismatch("main member products are incomplete")
+    for index, (member, row) in enumerate(zip(members, rows, strict=True)):
+        _reconcile_member(member, row, event_ids[index], index)
+    sessions = {item.session_id for item in planned}
+    if len(sessions) != 1 or stream.get("session_id") != next(iter(sessions)):
+        _projection_mismatch("main session differs from plan")
+
+
+def _member_source(member: Record) -> dict[str, object]:
+    """从 projector member ref 重建唯一输出来源块。"""
+    source: dict[str, object] = {"file": member.ref.source_file}
+    if member.ref.line_no is not None:
+        source["line_no"] = member.ref.line_no
+    else:
+        source["pair_index"] = member.ref.pair_index
+    return source
+
+
+def _reconcile_member(member, row, event_id: str, index: int) -> None:
+    """校验 main member 与对应 primary frame product。"""
+    if not isinstance(member, MappingABC):
+        _projection_mismatch("main member product is malformed")
+    has_annotation = "annotation" in row["_meta"]
+    expected_fields = ({"index", "id", "label", "annotation", "status"}
+                       if has_annotation else {"index", "id", "label"})
+    if set(member) != expected_fields:
+        _projection_mismatch("main member fields differ from contract")
+    event = row["_meta"]["event"]
+    if (member.get("index"), member.get("id"), member.get("label")) != (
+        index, event_id, event.get("frame_class")
+    ):
+        _projection_mismatch("main member identity differs from primary row")
+    if has_annotation:
+        annotation = row["_meta"].get("annotation")
+        if canonical_json(member.get("annotation")) != canonical_json(annotation):
+            _projection_mismatch("main member annotation differs from primary row")
+        valid_status = ({"annotated"} if annotation is not None else {"failed", "skipped"})
+        if member.get("status") not in valid_status:
+            _projection_mismatch("main member annotation status is invalid")
+
+
+def _reconcile_noise(rows, payload_digests, slots, identity, complete: bool) -> None:
+    """校验 noise 前缀与 NoiseSlot 逐位一致。"""
+    count_invalid = (len(rows) != len(slots) if complete else len(rows) > len(slots))
+    if len(rows) != len(payload_digests) or count_invalid:
+        _projection_mismatch("noise sources differ from final rows")
+    for row, payload_digest, slot in zip(rows, payload_digests, slots, strict=False):
+        _reconcile_noise_row(row, payload_digest, slot, identity)
+
+
+def _reconcile_noise_row(row, source_digest: str, slot, identity) -> None:
+    """校验一行 noise 的专型身份与计划坐标。"""
+    program, run_id = identity
+    _require_row_fields(row, "noise row fields differ from contract")
+    meta, payload = row.get("_meta"), row.get("payload")
+    event = meta.get("event") if isinstance(meta, MappingABC) else None
+    if not isinstance(event, MappingABC) or not isinstance(payload, MappingABC):
+        _projection_mismatch("noise row shape is invalid")
+    _require_keys(event, {
+        "event_id", "event_key", "owner_sequence_id", "role", "frame_class",
+        "actor", "logical_time_us", "timestamp", "noise",
+    }, "noise event fields differ from contract")
+    _require_keys(meta, {"event", "generation"}, "noise metadata fields differ from contract")
+    expected = {
+        "event_key": slot.event_key,
+        "owner_sequence_id": None,
+        "role": None,
+        "frame_class": slot.frame_class,
+        "actor": None,
+        "logical_time_us": None,
+        "noise": True,
+    }
+    if any(event.get(key) != value for key, value in expected.items()):
+        _projection_mismatch("noise row differs from planned slot")
+    expected_timestamp = _timestamp_text(slot.timestamp_us, program.timeline.utc_offset_minutes)
+    if event.get("timestamp") != expected_timestamp:
+        _projection_mismatch("noise timestamp differs from plan")
+    event_key = derive_generation_id(
+        "noise_event_key", [program.digest, "noise", slot.ordinal]
+    )
+    event_id = derive_generation_id(
+        "noise_event_id", [run_id, event_key, slot.timestamp_us, payload]
+    )
+    if noise_payload_digest(payload) != source_digest:
+        _projection_mismatch("noise payload differs from accepted source")
+    if slot.event_key != event_key or event.get("event_id") != event_id:
+        _projection_mismatch("noise artifact identity is invalid")
+    if meta.get("generation") is not None:
+        _projection_mismatch("noise row carries invalid identity truth")
+
+
+def _reconcile_replay(sources, replays, layouts, program, complete: bool) -> None:
+    """校验所有已具备 source 的 replay 分组、费用与逐位内容。"""
+    if complete and len(replays) != len(layouts):
+        _projection_mismatch("replay group count differs from final plan")
+    expected = [layout for layout in layouts
+                if (layout.source_slot_key, layout.source_variant_name) in sources]
+    if len(replays) != len(expected):
+        _projection_mismatch("replay group count differs from available layouts")
+    for replay, layout in zip(replays, expected, strict=True):
+        source = sources[(layout.source_slot_key, layout.source_variant_name)]
+        rows = tuple(replay.rows)
+        if replay.retained_content_bytes != _canonical_rows_bytes(rows):
+            _projection_mismatch("replay retained-content bytes are invalid")
+        _reconcile_replay_group(
+            rows, source, layout, program.timeline.utc_offset_minutes
+        )
+
+
+def _reconcile_retained_bytes(request, replay_rows) -> None:
+    """从最终 canonical rows 独立复算 prospective retained-content 总费用。
+
+    @param request 当前 prospective 或最终 CrossView 请求。
+    @param replay_rows 按 ReplayRows 分组展平后的实际行。
+    @return None；计费不一致时拒绝当前 attempt。
+    """
+    rows = []
+    for sequence in request.sequences:
+        rows.append(sequence.main_row)
+        rows.extend(sequence.primary_stream_rows)
+    rows.extend(request.noise_rows)
+    rows.extend(replay_rows)
+    if request.retained_content_bytes != _canonical_rows_bytes(rows):
+        _projection_mismatch("retained-content total is invalid")
+
+
+def _canonical_rows_bytes(rows) -> int:
+    """计算一组实际交付行的 canonical JSONL byte 费用。
+
+    @param rows 待写出的 JSON object 序列。
+    @return 含每行一个换行符的 UTF-8 byte 总数。
+    """
+    return sum(len(canonical_delivery_row(row)) + 1 for row in rows)
+
+
+def _reconcile_replay_group(rows, source, layout, utc_offset_minutes: int) -> None:
+    """校验一个 replay group 的组身份与逐位 source 关系。"""
+    source_id = source.main_row["_meta"]["id"]
+    replay_id = derive_generation_id(
+        "replay_sequence_id", [source_id, layout.replay_ordinal]
+    )
+    for index, (row, source_row) in enumerate(
+        zip(rows, source.primary_stream_rows, strict=True)
+    ):
+        _reconcile_replay_row(
+            row, source_row, layout, (index, source_id, replay_id), utc_offset_minutes
+        )
+
+
+def _reconcile_replay_row(row, source, layout, identity, utc_offset_minutes: int) -> None:
+    """校验一行 replay 的新时间、新 ID 与 source 语义。"""
+    index, source_id, replay_id = identity
+    _require_row_fields(row, "replay row fields differ from contract")
+    meta, source_meta = row.get("_meta"), source.get("_meta")
+    event = meta.get("event") if isinstance(meta, MappingABC) else None
+    source_event = source_meta.get("event") if isinstance(source_meta, MappingABC) else None
+    if not isinstance(event, MappingABC) or not isinstance(source_event, MappingABC):
+        _projection_mismatch("replay row shape is invalid")
+    _require_keys(event, {
+        "event_id", "event_key", "owner_sequence_id", "role", "frame_class",
+        "actor", "logical_time_us", "timestamp", "replay_sequence_id",
+        "replay_ordinal", "duplicate_of_sequence_id", "duplicate_of_event_id",
+    }, "replay event fields differ from contract")
+    timestamp_us = layout.timestamps_us[index]
+    expected = {
+        "event_key": source_event.get("event_key"),
+        "owner_sequence_id": None,
+        "role": source_event.get("role"),
+        "frame_class": source_event.get("frame_class"),
+        "actor": source_event.get("actor"),
+        "logical_time_us": source_event.get("logical_time_us"),
+        "replay_sequence_id": replay_id,
+        "replay_ordinal": layout.replay_ordinal,
+        "duplicate_of_sequence_id": source_id,
+        "duplicate_of_event_id": source_event.get("event_id"),
+    }
+    if any(event.get(key) != value for key, value in expected.items()):
+        _projection_mismatch("replay provenance differs from source")
+    event_id = derive_generation_id(
+        "replay_event_id", [replay_id, source_event.get("event_id"), timestamp_us]
+    )
+    timestamp = _timestamp_text(timestamp_us, utc_offset_minutes)
+    if event.get("event_id") != event_id or event.get("timestamp") != timestamp:
+        _projection_mismatch("replay artifact identity is invalid")
+    _reconcile_replay_content(row, source, source_id)
+
+
+def _reconcile_replay_content(row, source, source_id: str) -> None:
+    """校验 replay payload、下游 frame 产物与 generation 同源。"""
+    if canonical_json(row.get("payload")) != canonical_json(source.get("payload")):
+        _projection_mismatch("replay payload differs from source")
+    row_extra = {key: value for key, value in row["_meta"].items()
+                 if key not in {"event", "generation"}}
+    source_extra = {key: value for key, value in source["_meta"].items()
+                    if key not in {"event", "generation"}}
+    if canonical_json(row_extra) != canonical_json(source_extra):
+        _projection_mismatch("replay downstream products differ from source")
+    source_generation = source["_meta"]["generation"]
+    generation = {
+        "validation_mode": "replay",
+        "source_validation_mode": source_generation["validation_mode"],
+        "sequence_class": source_generation["sequence_class"],
+        "scenario_id": source_generation["scenario_id"],
+        "source_pattern": source_generation.get("pattern"),
+        "source_variant": source_generation.get("variant"),
+        "duplicate_of_sequence_id": source_id,
+    }
+    if canonical_json(row["_meta"].get("generation")) != canonical_json(generation):
+        _projection_mismatch("replay generation truth differs from source")
+
+
+def _reconcile_timeline(rows: Sequence[Mapping[str, object]]) -> None:
+    """校验所有工件时间和 event ID 全局唯一，不依赖 owner 分组顺序。"""
+    timestamps = [_timestamp_us(row["_meta"]["event"]["timestamp"]) for row in rows]
+    event_ids = [row["_meta"]["event"]["event_id"] for row in rows]
+    if len(timestamps) != len(set(timestamps)):
+        _projection_mismatch("artifact timestamps are not globally unique")
+    if len(event_ids) != len(set(event_ids)) or not all(_is_id(value) for value in event_ids):
+        _projection_mismatch("event IDs are not globally unique")
+
+
+def _timestamp_us(value: object) -> int:
+    """严格解析带六位微秒与数值 offset 的工件时间。"""
+    pattern = r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}[+-]\d{2}:\d{2}$"
+    if not isinstance(value, str) or re.fullmatch(pattern, value) is None:
+        _projection_mismatch("artifact timestamp format is invalid")
+    parsed = datetime.fromisoformat(value)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = parsed.astimezone(timezone.utc) - epoch
+    return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _is_id(value: object) -> bool:
+    """判断值是否为规范 32 位 generation ID。"""
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{32}", value) is not None
+
+
+def _nonempty(value: object) -> bool:
+    """判断值是否为非空字符串。"""
+    return isinstance(value, str) and bool(value)
+
+
+def _require_keys(value, expected: set[str], reason: str) -> None:
+    """要求机械投影对象字段集完全相等。"""
+    if not isinstance(value, MappingABC) or set(value) != expected:
+        _projection_mismatch(reason)
+
+
+def _require_row_fields(value, reason: str) -> None:
+    """要求 sequence stream 行顶层字段及声明序完全相等。"""
+    if not isinstance(value, MappingABC) or tuple(value) != ("payload", "_meta"):
+        _projection_mismatch(reason)
+
+
+def _projection_mismatch(reason: str):
+    """记录并抛出可恢复的双视图不一致。"""
+    _log.warning("sequence_projection_mismatch: %s", reason)
+    raise GenerationProjectionMismatch(reason)
+
+
+def _timestamp_text(timestamp_us: int, offset_minutes: int) -> str:
+    """把整数微秒渲染为固定 offset ISO8601。
+
+    @param timestamp_us UTC epoch 微秒。
+    @param offset_minutes 固定 offset 分钟。
+    @return 带六位微秒的 ISO8601 文本。
+    """
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    zone = timezone(timedelta(minutes=offset_minutes))
+    value = (epoch + timedelta(microseconds=timestamp_us)).astimezone(zone)
+    return value.isoformat(timespec="microseconds")
+
+
+def _contract_error(message: str):
+    """记录并抛出 generation downstream contract 错误。
+
+    @param message 不含数据内容的英文原因。
+    @return 不返回。
+    """
+    _log.error("generation_downstream_contract: %s", message)
+    raise InternalError(f"generation_downstream_contract: {message}")

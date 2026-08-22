@@ -2,27 +2,30 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from jsonschema import Draft202012Validator
 
 from labelkit import TOOL_VERSION
 from labelkit.common.config.model import (
-    AnnotateConfig, ClassifyConfig, ClassSpec, Criterion, DedupConfig,
+    AnnotateConfig, ClassifyConfig, ClassSpec, ClassView, Criterion, DedupConfig,
     ConsoleConfig,
     ExtractConfig, FrameAnnotateConfig, FrameClassifyConfig, GenerateConfig,
-    GenerateStreamConfig,
     InputConfig, OutputConfig, QualityConfig,
     ResolvedConfig, ResolvedPaths, Rubric, RunConfig, SegmentConfig,
     StitchConfig, StreamConfig,
     ToolConfig,
     TraceConfig, VerifyConfig,
 )
-from labelkit.operators.emitter import EmitResult, Emitter
-from labelkit.common.errors import LabelKitError
+from labelkit.operators.emitter import EmitResult, Emitter, SequenceDeliveryEmitter
+from labelkit.common.contracts.generation import ProjectedSequence, SequenceAssemblyRequest
+from labelkit.common.errors import GenerationProjectionMismatch, InternalError, LabelKitError
 from labelkit.common.contracts.types import (
     Annotation, Classification, DedupInfo, ImageRef, PipelineItem, QualityScore,
     Record, RecordRef, StageError, Transition, UINode, UITree, Usage,
@@ -98,8 +101,6 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
     frame_classify = kw.pop("frame_classify", FrameClassifyConfig())
     frame_annotate = kw.pop("frame_annotate", FrameAnnotateConfig())
     frame_schema = kw.pop("frame_schema", None)
-    # v1.13：时间流形态（默认关 = 字节等价 v1.12）
-    generate_stream = kw.pop("generate_stream", GenerateStreamConfig())
     dry_run = kw.pop("dry_run", False)
     assert not kw, f"unknown overrides: {kw}"
     # v1.17（SPEC-SP §5.1）：paths 逐字段镜像 M1 的 loader._resolved_paths 派生
@@ -114,8 +115,9 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
         rejects=None if rejects == "none" else stem + ".rejects.jsonl",
         sidecar=stem + ".meta.jsonl" if meta_mode == "sidecar" else None,
         trace=None,
-        stream_artifact=(stem + ".stream.jsonl"
-                         if generate_stream.enabled else None),
+        stream=None,
+        manifest=None,
+        failed_report=None,
     )
     return ResolvedConfig(
         tool=ToolConfig(log_format=log_format),
@@ -162,7 +164,6 @@ def make_cfg(tmp_path: Path, **kw) -> ResolvedConfig:
         frame_classify=frame_classify,
         frame_annotate=frame_annotate,
         frame_schema=frame_schema,
-        generate_stream=generate_stream,
         paths=paths,
     )
 
@@ -1588,9 +1589,9 @@ def test_dry_run_report_path_is_diverted(tmp_path):
 
 def test_channel_paths_are_cwd_invariant_via_resolved_paths(tmp_path,
                                                             monkeypatch):
-    """run.output 是相对诱饵时，五个通道路径仍逐一等于 cfg.paths 的 M1 派生值，
+    """run.output 是相对诱饵时，普通四通道路径仍逐一等于 M1 派生值，
     且与构造时 cwd 无关（旧实现按 cwd 重解相对 output，会随目录漂移）。"""
-    cfg = make_cfg(tmp_path, meta_mode="sidecar", generate_stream=gs_on())
+    cfg = make_cfg(tmp_path, meta_mode="sidecar")
     cfg = _dc_replace(
         cfg, run=_dc_replace(cfg.run, output="out/res.jsonl"))  # 相对诱饵
     seen = []
@@ -1600,13 +1601,12 @@ def test_channel_paths_are_cwd_invariant_via_resolved_paths(tmp_path,
         em = Emitter(cfg, engine=None, run_id="a" * 12,
                      run_started_at=datetime.now().astimezone())
         seen.append((em._output_path, em._report_path, em._rejects_path,
-                     em._sidecar_path, em._artifact_path))
+                     em._sidecar_path))
     assert seen[0] == seen[1]
     assert str(seen[0][0]) == cfg.paths.output
     assert str(seen[0][1]) == cfg.paths.report
     assert str(seen[0][2]) == cfg.paths.rejects
     assert str(seen[0][3]) == cfg.paths.sidecar
-    assert str(seen[0][4]) == cfg.paths.stream_artifact
 
 
 def test_report_path_takes_m1_verdict_not_command_mode(tmp_path):
@@ -1633,8 +1633,6 @@ def test_missing_paths_fails_fast_without_cwd_fallback(tmp_path):
 # ── v1.13 写前终检按行取类有效 Schema（裁决·按类标注 Schema，spec §6.3）───────
 
 from dataclasses import replace as _dc_replace                    # noqa: E402
-
-from labelkit.common.config.model import ClassView                # noqa: E402
 
 # faq 类 Schema：不要求 difficulty（全局 USER_SCHEMA 要求）——按类取值时才放行
 FAQ_SCHEMA = {
@@ -1718,148 +1716,459 @@ def test_prewrite_check_multi_fanout_rows_use_own_label(tmp_path):
     assert (reject["id"], reject["label"]) == ("4" * 16, "chat")
 
 
-# ── v1.13 时间流形态：工件通道 / _stream_block 或门 / members 真值 / rubric ──
-
-def gs_on() -> GenerateStreamConfig:
-    """M1 形状的开启态 generate_stream（emitter 只读 enabled 位）。"""
-    return GenerateStreamConfig(enabled=True, frame_gap_s=(5.0, 60.0))
-
-
-def artifact_member(rec_id: str, line_no: int) -> Record:
-    """直装成员帧：ref 指向工件路径 + 行号、generator 携带预抽溯源。"""
-    raw = {"ts": f"2026-01-01T09:00:0{line_no}.000000+08:00",
-           "text": f"帧 {line_no}", "truth": {"session": 0}}
-    return Record(id=rec_id, modality="text", text=raw["text"], raw=raw,
-                  ui_tree=None, image=None,
-                  ref=RecordRef(source_file="out/res.stream.jsonl", line_no=line_no,
-                                pair_index=None, generated_from=(),
-                                generator={"llm": "default", "style": None}))
-
-
-def stream_form_item() -> PipelineItem:
-    members = [artifact_member("1" * 16, 1), artifact_member("2" * 16, 2)]
-    seq = Record(id="e" * 16, modality="text", text=None, raw=None, ui_tree=None,
-                 image=None, ref=members[0].ref, kind="sequence",
-                 members=tuple(members))
-    item = make_item(record=seq,
-                     classification=Classification(label="faq", labels=("faq",),
-                                                   source="inherited", detail={}))
-    item.session_id = "s" * 16
-    item.member_classifications = {
-        "1" * 16: Classification(label="task_request", labels=("task_request",),
-                                 source="inherited", detail={}),
-        "2" * 16: Classification(label="followup", labels=("followup",),
-                                 source="inherited", detail={}),
-    }
-    return item
-
-
-def test_stream_artifact_channel_part_rename_and_summary(tmp_path):
-    cfg = make_cfg(tmp_path, generate_stream=gs_on())
-    lines = ['{"ts": "t1", "text": "帧一"}', '{"ts": "t2", "text": "帧二"}']
-    em = Emitter(cfg, EngineStub(), run_id="ab12cd34ef56",
-                 run_started_at=RUN_STARTED_AT)
-    em.open()
-    em.write_stream_artifact(lines)
-    artifact = tmp_path / "out" / "res.stream.jsonl"
-    part = Path(str(artifact) + ".part")
-    assert part.exists() and not artifact.exists()     # finalize 前只有 .part
-    assert em.artifact_summary["path"] == str(artifact)
-    assert em.artifact_summary["lines"] == 2
-    em.finalize({"counts": {}}, deliver=True)
-    assert artifact.exists() and not part.exists()     # 与主输出同批原子改名
-    data = artifact.read_bytes()
-    assert data.decode("utf-8") == "\n".join(lines) + "\n"
-    import hashlib as hashlib_module
-
-    assert em.artifact_summary["sha256"] == (
-        "sha256:" + hashlib_module.sha256(data).hexdigest())
-
-
-def test_stream_artifact_undeliverable_never_renames(tmp_path):
-    cfg = make_cfg(tmp_path, generate_stream=gs_on())
-    em = Emitter(cfg, EngineStub(), run_id="ab12cd34ef56",
-                 run_started_at=RUN_STARTED_AT)
-    em.open()
-    # 以目录占位 .part 路径 ⇒ open 失败：_undeliverable 纪律共用（exit 4 家族）
-    (tmp_path / "out" / "res.stream.jsonl.part").mkdir()
-    with pytest.raises(LabelKitError):
-        em.write_stream_artifact(["x"])
-    em.finalize({"counts": {}}, deliver=True)
-    assert not (tmp_path / "out" / "res.jsonl").exists()   # 主 .part 不改名
-    assert em.artifact_summary is None
-
-
-def test_stream_artifact_absent_without_write(tmp_path):
-    """dry-run 天然豁免面：未调用 write_stream_artifact ⇒ 工件零落盘、摘要 None
-    （_run_dry 不驱动生成、不触达通道——无专门代码）。"""
-    cfg = make_cfg(tmp_path, generate_stream=gs_on())
-    em, _ = run_emitter(cfg, [make_item()])
-    assert em.artifact_summary is None
-    assert not (tmp_path / "out" / "res.stream.jsonl").exists()
-    assert not (tmp_path / "out" / "res.stream.jsonl.part").exists()
-
-
-def test_stream_block_or_gate_members_truth_and_default_semantics(tmp_path):
-    """裁决·members 呈现真值门：segment 关、generate_stream 开 ⇒ _meta.stream 在
-    场；members[] = {index, id, label}（label = member_classifications 真值，无
-    annotation/status 列）；session_split=false / repaired=false / degraded=null /
-    steps=null 缺省语义；无 thread_id/fragments；order_span/member_sources 指向
-    工件路径 + 行号。"""
-    cfg = make_cfg(tmp_path, generate_stream=gs_on())
-    run_emitter(cfg, [stream_form_item()])
-    meta = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]
-    stream = meta["stream"]
-    assert list(stream) == ["episode_id", "session_id", "order_span",
-                            "member_count", "member_ids", "member_sources",
-                            "members", "session_split", "repaired", "degraded",
-                            "steps"]
-    assert stream["episode_id"] == "e" * 16
-    assert stream["session_id"] == "s" * 16
-    assert stream["order_span"] == ["out/res.stream.jsonl:1",
-                                    "out/res.stream.jsonl:2"]
-    assert stream["member_sources"] == [
-        {"file": "out/res.stream.jsonl", "line_no": 1},
-        {"file": "out/res.stream.jsonl", "line_no": 2}]
-    assert stream["members"] == [
-        {"index": 0, "id": "1" * 16, "label": "task_request"},
-        {"index": 1, "id": "2" * 16, "label": "followup"}]
-    assert (stream["session_split"], stream["repaired"],
-            stream["degraded"], stream["steps"]) == (False, False, None, None)
-    assert "thread_id" not in stream and "fragments" not in stream
-    # 生成溯源：source.generator 随首成员 ref 落 _meta.source
-    assert meta["source"]["generator"] == {"llm": "default", "style": None}
-
-
-def test_stream_block_gate_off_is_null_when_form_disabled(tmp_path):
-    """零改动声明面：形态关闭（segment 也关）⇒ 序列行 stream 恒 null。"""
-    cfg = make_cfg(tmp_path)
-    run_emitter(cfg, [stream_form_item()])
-    assert read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"] is None
-
-
-def test_verification_block_defects_gate_untouched_in_stream_form(tmp_path):
-    """_verification_block defects 门零改动：判决形 defects 恒空且 segment 关 ⇒
-    verification 块无 defects 键（v1.8 非流规则字面维持）。"""
-    cfg = make_cfg(tmp_path, generate_stream=gs_on())
-    item = stream_form_item()
-    item.verification = VerificationResult(verdict="pass", rounds=1, critiques=())
-    run_emitter(cfg, [item])
-    verification = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["verification"]
-    assert verification == {"verdict": "pass", "rounds": 1}
-
-
-def test_rubric_selector_mirror_resolves_trajectory_in_stream_form(tmp_path):
-    """S29 emitter 镜像（裁决·轨迹准则自动解析扩展）：空选择子 ∧ generate_stream
-    开 ⇒ "default:trajectory"（与 loader 侧对齐）。"""
-    cfg = make_cfg(tmp_path, generate_stream=gs_on(), quality_rubric="")
-    run_emitter(cfg, [stream_form_item()])
-    meta = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]
-    assert meta["run"]["rubric"] == "default:trajectory"
-
-
 def test_rubric_selector_off_form_keeps_modality_default(tmp_path):
     cfg = make_cfg(tmp_path, quality_rubric="")
     run_emitter(cfg, [make_item()])
     meta = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]
     assert meta["run"]["rubric"] == "default:text"
+
+
+# ── v1.18 sequence manifest-last delivery ────────────────────────────────────────
+
+
+def _sequence_emitter(tmp_path: Path) -> SequenceDeliveryEmitter:
+    """构造六个固定路径都存在的 sequence emitter。"""
+    cfg = make_cfg(tmp_path)
+    stem = tmp_path / "out" / "sequence"
+    paths = _dc_replace(
+        cfg.paths,
+        output=str(stem.with_suffix(".jsonl")),
+        stream=str(stem.with_suffix(".stream.jsonl")),
+        report=str(stem.with_suffix(".report.json")),
+        manifest=str(stem.with_suffix(".manifest.json")),
+        failed_report=str(stem.with_suffix(".failed.report.json")),
+        rejects=None,
+        sidecar=None,
+    )
+    return SequenceDeliveryEmitter(paths)
+
+
+def _sequence_assembly_request(tmp_path, item, projection, batch_no: int):
+    """构造仅含 M11 终检所需程序真值的闭包请求。"""
+    cfg = make_cfg(tmp_path)
+    class_view = ClassView(
+        name="ticket_booking", quality=cfg.quality, rubric=cfg.rubric,
+        annotate=cfg.annotate, generate=cfg.generate, verify=cfg.verify,
+        extract=cfg.extract, schema=USER_SCHEMA,
+    )
+    frame_schema = {
+        "type": "object",
+        "properties": {"frame": {"type": "string"}},
+        "required": ["frame"],
+        "additionalProperties": False,
+    }
+    frame_views = {
+        name: SimpleNamespace(enabled=True) for name in ("request", "confirm")
+    }
+    program = SimpleNamespace(
+        class_views={"ticket_booking": class_view},
+        frame_classes=frame_views,
+        frame_schema=frame_schema,
+    )
+    return SequenceAssemblyRequest(
+        program, EngineStub(), item, projection, batch_no
+    )
+
+
+def _sequence_projection_and_item():
+    """构造含全部下游产物的最终信封与 pre-downstream 投影。"""
+    first = make_record("1" * 32, 1, {"utterance": "request"})
+    second = make_record("2" * 32, 2, {"utterance": "confirmed"})
+    sequence = make_seq_record((first, second), "3" * 32)
+    truth = {
+        "validation_mode": "declared", "sequence_class": "ticket_booking",
+        "scenario_id": "4" * 32, "world_branch_id": "5" * 32,
+        "pattern": "booking_success", "variant": "positive",
+        "expected_violation": {}, "actual_violations": [],
+    }
+    sequence = _dc_replace(sequence, raw={"_meta": {"generation": truth}})
+    primary = (
+        {"payload": {"utterance": "request"}, "_meta": {"event": {
+            "event_id": first.id, "frame_class": "request",
+        }, "generation": {"validation_mode": "declared"}}},
+        {"payload": {"utterance": "confirmed"}, "_meta": {"event": {
+            "event_id": second.id, "frame_class": "confirm",
+        }, "generation": {"validation_mode": "declared"}}},
+    )
+    projection = ProjectedSequence(sequence, primary)
+    item = make_item(
+        record=sequence, scores=True, verified=True,
+        classification=Classification(
+            "ticket_booking", ("ticket_booking",), "inherited", {}
+        ),
+        output={"intent": "book_ticket", "topic": "rail", "difficulty": "easy"},
+    )
+    item.session_id = "primary_000000"
+    item.member_classifications = {
+        first.id: Classification("request", ("request",), "inherited", {}),
+        second.id: Classification("confirm", ("confirm",), "inherited", {}),
+    }
+    item.member_annotations = {
+        first.id: Annotation({"frame": "request"}, "deepseek-v4-flash", 1, Usage()),
+        second.id: Annotation({"frame": "confirm"}, "deepseek-v4-flash", 1, Usage()),
+    }
+    return projection, item, truth
+
+
+def test_sequence_assembly_uses_final_item_for_every_output_byte(tmp_path):
+    """最终 main/primary 与 retained 只来自同一 final item + projection。"""
+    from labelkit.operators.generation.project import canonical_delivery_row
+
+    emitter = _sequence_emitter(tmp_path)
+    projection, item, truth = _sequence_projection_and_item()
+    rows = emitter.assemble_sequence(
+        _sequence_assembly_request(tmp_path, item, projection, 7)
+    )
+
+    main = json.loads(canonical_delivery_row(rows.main_row))
+    meta = main["_meta"]
+    assert main["intent"] == "book_ticket"
+    assert meta["generation"] == truth
+    assert meta["classification"] == {
+        "label": "ticket_booking", "labels": ["ticket_booking"], "source": "inherited",
+    }
+    assert meta["scores"] == {
+        "clarity": 0.72, "__aggregate__": 0.72,
+        "mode": "pairwise_bt", "batch_no": 7, "pool": "ticket_booking",
+    }
+    assert meta["annotation"] == {"model": "glm-5.2", "attempts": 1}
+    assert meta["verification"] == {"verdict": "pass", "rounds": 1}
+    assert meta["stream"]["session_id"] == "primary_000000"
+    assert [member["label"] for member in meta["stream"]["members"]] == [
+        "request", "confirm",
+    ]
+    assert [member["annotation"] for member in meta["stream"]["members"]] == [
+        {"frame": "request"}, {"frame": "confirm"},
+    ]
+    primary = [json.loads(canonical_delivery_row(row)) for row in rows.primary_stream_rows]
+    assert [row["_meta"]["annotation"] for row in primary] == [
+        {"frame": "request"}, {"frame": "confirm"},
+    ]
+    expected = len(canonical_delivery_row(rows.main_row)) + 1
+    expected += sum(len(canonical_delivery_row(row)) + 1
+                    for row in rows.primary_stream_rows)
+    assert rows.retained_content_bytes == expected
+    assert projection.primary_stream_rows[0]["_meta"].get("annotation") is None
+
+
+def test_sequence_assembly_uses_only_program_annotation_schemas(tmp_path):
+    """M11 不回落 engine 默认 Schema，也不混用 frame generate Schema。"""
+    emitter = _sequence_emitter(tmp_path)
+    projection, item, _truth = _sequence_projection_and_item()
+    request = _sequence_assembly_request(tmp_path, item, projection, 1)
+
+    class CountingEngine(EngineStub):
+        """以 poison 默认 Schema 记录显式终检路由。"""
+
+        def __init__(self):
+            super().__init__({"type": "object", "required": ["poison"]})
+            self.schemas = []
+
+        def validate_only(self, obj, schema=None):
+            self.schemas.append(schema)
+            return super().validate_only(obj, schema=schema)
+
+    engine = CountingEngine()
+    frame_views = {
+        name: SimpleNamespace(
+            enabled=True,
+            gen_schema={"type": "object", "required": ["poison"]},
+        )
+        for name in ("request", "confirm")
+    }
+    program = SimpleNamespace(
+        class_views=request.program.class_views,
+        frame_classes=frame_views,
+        frame_schema=request.program.frame_schema,
+    )
+    emitter.assemble_sequence(
+        SequenceAssemblyRequest(program, engine, item, projection, 1)
+    )
+    assert len(engine.schemas) == 5
+    assert engine.schemas[0] == USER_SCHEMA
+    assert all(schema == request.program.frame_schema for schema in engine.schemas[1:])
+
+
+def test_sequence_assembly_rejects_invalid_sequence_annotation_as_projection(tmp_path):
+    """最终 sequence annotation 违规时整条装配不返回任何 rows。"""
+    emitter = _sequence_emitter(tmp_path)
+    projection, item, _truth = _sequence_projection_and_item()
+    item.annotation = Annotation(
+        {"intent": "book_ticket"}, "offline", 1, Usage()
+    )
+    request = _sequence_assembly_request(tmp_path, item, projection, 1)
+    with pytest.raises(GenerationProjectionMismatch):
+        emitter.assemble_sequence(request)
+
+
+def test_sequence_assembly_rejects_invalid_frame_annotation_as_projection(tmp_path):
+    """任一实际 frame annotation 违规时不得降格或返回局部 rows。"""
+    emitter = _sequence_emitter(tmp_path)
+    projection, item, _truth = _sequence_projection_and_item()
+    first = item.record.members[0]
+    item.member_annotations[first.id] = Annotation(
+        {"unexpected": True}, "offline", 1, Usage()
+    )
+    request = _sequence_assembly_request(tmp_path, item, projection, 1)
+    with pytest.raises(GenerationProjectionMismatch):
+        emitter.assemble_sequence(request)
+
+
+@pytest.mark.parametrize("missing", ("sequence_schema", "frame_schema"))
+def test_sequence_assembly_rejects_missing_program_schema_as_contract(
+        tmp_path, missing):
+    """缺失 program Schema 是终止契约错误，不消耗数据重试。"""
+    emitter = _sequence_emitter(tmp_path)
+    projection, item, _truth = _sequence_projection_and_item()
+    request = _sequence_assembly_request(tmp_path, item, projection, 1)
+    class_views = dict(request.program.class_views)
+    frame_schema = request.program.frame_schema
+    if missing == "sequence_schema":
+        view = class_views["ticket_booking"]
+        class_views["ticket_booking"] = _dc_replace(view, schema=None)
+    else:
+        frame_schema = None
+    program = SimpleNamespace(
+        class_views=class_views,
+        frame_classes=request.program.frame_classes,
+        frame_schema=frame_schema,
+    )
+    with pytest.raises(InternalError, match="generation_downstream_contract"):
+        emitter.assemble_sequence(
+            SequenceAssemblyRequest(program, request.schema_engine, item, projection, 1)
+        )
+
+
+@pytest.mark.parametrize("missing", ("sequence_view", "frame_view"))
+def test_sequence_assembly_retries_unknown_program_class_view(tmp_path, missing):
+    """未知 sequence 或 frame class view 属于整组可重试的投影不一致。"""
+    emitter = _sequence_emitter(tmp_path)
+    projection, item, _truth = _sequence_projection_and_item()
+    request = _sequence_assembly_request(tmp_path, item, projection, 1)
+    class_views = dict(request.program.class_views)
+    frame_classes = dict(request.program.frame_classes)
+    if missing == "sequence_view":
+        class_views.clear()
+    else:
+        frame_classes.pop("request")
+    program = SimpleNamespace(
+        class_views=class_views,
+        frame_classes=frame_classes,
+        frame_schema=request.program.frame_schema,
+    )
+    with pytest.raises(GenerationProjectionMismatch):
+        emitter.assemble_sequence(
+            SequenceAssemblyRequest(program, request.schema_engine, item, projection, 1)
+        )
+
+
+def test_sequence_assembly_frame_only_skips_user_schema_and_validates_both_views(tmp_path):
+    """frame-only 只终检两份帧对象，序列 annotation 与用户 Schema 调用为零。"""
+    emitter = _sequence_emitter(tmp_path)
+    projection, item, _truth = _sequence_projection_and_item()
+    request = _sequence_assembly_request(tmp_path, item, projection, 1)
+    class_view = request.program.class_views["ticket_booking"]
+    class_view = _dc_replace(
+        class_view,
+        annotate=_dc_replace(class_view.annotate, enabled=False),
+    )
+
+    class CountingEngine(EngineStub):
+        """记录所有显式终检 Schema。"""
+
+        def __init__(self):
+            super().__init__({"type": "object", "required": ["poison"]})
+            self.schemas = []
+
+        def validate_only(self, obj, schema=None):
+            self.schemas.append(schema)
+            return super().validate_only(obj, schema=schema)
+
+    engine = CountingEngine()
+    program = SimpleNamespace(
+        class_views={"ticket_booking": class_view},
+        frame_classes=request.program.frame_classes,
+        frame_schema=request.program.frame_schema,
+    )
+    item.annotation = None
+    rows = emitter.assemble_sequence(
+        SequenceAssemblyRequest(program, engine, item, projection, 1)
+    )
+    assert rows.main_row["_meta"]["annotation"] is None
+    assert len(engine.schemas) == 4
+    assert all(schema == request.program.frame_schema for schema in engine.schemas)
+
+
+def _success_report() -> dict:
+    """返回尚未由 M11 写 digest 的最小成功报告。"""
+    return {"generate": {"sequence": {
+        "run_id": "a" * 32,
+        "delivery_digest": None,
+        "artifacts_committed": False,
+    }}}
+
+
+def test_sequence_prepare_and_commit_use_one_digest_and_manifest_last(tmp_path, monkeypatch):
+    """prepare 唯一计算 digest，三件工件落盘后 manifest 引用同一值。"""
+    emitter = _sequence_emitter(tmp_path)
+    paths = emitter._paths
+    operations = []
+    original_replace = os.replace
+    original_write = emitter._write_part
+
+    def observe_write(target, data):
+        operations.append(("write", Path(target)))
+        original_write(target, data)
+
+    def observe_replace(source, target):
+        operations.append(("replace", Path(target)))
+        original_replace(source, target)
+
+    monkeypatch.setattr(emitter, "_write_part", observe_write)
+    monkeypatch.setattr(os, "replace", observe_replace)
+    projection, item, _truth = _sequence_projection_and_item()
+    rows = emitter.assemble_sequence(
+        _sequence_assembly_request(tmp_path, item, projection, 1)
+    )
+    product = emitter.prepare_product(
+        (rows.main_row,), rows.primary_stream_rows, _success_report()
+    )
+    manifest = emitter.commit(product)
+    assert operations == [
+        ("write", Path(paths.output)),
+        ("write", Path(paths.stream)),
+        ("write", Path(paths.report)),
+        ("replace", Path(paths.output)),
+        ("replace", Path(paths.stream)),
+        ("replace", Path(paths.report)),
+        ("write", Path(paths.manifest)),
+        ("replace", Path(paths.manifest)),
+    ]
+
+    digest = product.report["generate"]["sequence"]["delivery_digest"]
+    assert len(digest) == 64
+    assert manifest["delivery_digest"] == digest
+    assert manifest["run_id"] == "a" * 32
+    assert manifest["main"]["rows"] == 1
+    assert manifest["stream"]["rows"] == 2
+    report_doc = json.loads(Path(paths.report).read_text())
+    assert tuple(report_doc["generate"]["sequence"]) == (
+        "run_id", "delivery_digest", "artifacts_committed",
+    )
+    assert report_doc["generate"]["sequence"] == {
+        "artifacts_committed": True,
+        "delivery_digest": digest,
+        "run_id": "a" * 32,
+    }
+    from labelkit.operators.generation.project import canonical_json
+
+    assert read_jsonl(Path(paths.output)) == [json.loads(canonical_json(rows.main_row))]
+    assert read_jsonl(Path(paths.stream)) == [
+        json.loads(canonical_json(row)) for row in rows.primary_stream_rows
+    ]
+    stream_doc = [json.loads(line) for line in Path(paths.stream).read_text().splitlines()]
+    assert all(tuple(row) == ("payload", "_meta") for row in stream_doc)
+    manifest_doc = json.loads(Path(paths.manifest).read_text())
+    assert tuple(manifest_doc) == (
+        "schema_version", "run_id", "delivery_digest", "artifacts_committed",
+        "main", "stream", "report", "committed_at",
+    )
+    assert tuple(manifest_doc["main"]) == ("path", "sha256", "rows")
+    assert tuple(manifest_doc["stream"]) == ("path", "sha256", "rows")
+    assert tuple(manifest_doc["report"]) == ("path", "sha256")
+    assert manifest_doc["delivery_digest"] == digest
+    assert manifest["main"]["sha256"] == hashlib.sha256(
+        Path(paths.output).read_bytes()
+    ).hexdigest()
+
+
+def test_sequence_manifest_replace_failure_preserves_previous_success_marker(
+        tmp_path, monkeypatch):
+    """子工件可能已替换时，manifest 失败仍保留上一轮可信 marker。"""
+    emitter = _sequence_emitter(tmp_path)
+    paths = emitter._paths
+    Path(paths.manifest).write_text("old-manifest", encoding="utf-8")
+    product = emitter.prepare_product(({"main": 1},), ({"stream": 1},), _success_report())
+    original_replace = os.replace
+
+    def fail_manifest(source, target):
+        if Path(target) == Path(paths.manifest):
+            raise OSError("injected manifest failure")
+        original_replace(source, target)
+
+    monkeypatch.setattr(os, "replace", fail_manifest)
+    with pytest.raises(LabelKitError, match="generation_commit_io"):
+        emitter.commit(product)
+
+    assert Path(paths.manifest).read_text(encoding="utf-8") == "old-manifest"
+    assert read_jsonl(Path(paths.output)) == [{"main": 1}]
+    assert read_jsonl(Path(paths.stream)) == [{"stream": 1}]
+
+
+@pytest.mark.parametrize("failed_name", ("output", "stream", "report"))
+def test_sequence_artifact_replace_failure_never_advances_manifest(
+    tmp_path, monkeypatch, failed_name,
+):
+    """任一前置工件替换失败都不能发布新 manifest。"""
+    emitter = _sequence_emitter(tmp_path)
+    paths = emitter._paths
+    Path(paths.manifest).write_text("old-manifest", encoding="utf-8")
+    product = emitter.prepare_product(({"main": 1},), ({"stream": 1},), _success_report())
+    original_replace = os.replace
+
+    def fail_artifact(source, target):
+        if Path(target) == Path(getattr(paths, failed_name)):
+            raise OSError("injected artifact failure")
+        original_replace(source, target)
+
+    monkeypatch.setattr(os, "replace", fail_artifact)
+    with pytest.raises(LabelKitError, match="generation_commit_io"):
+        emitter.commit(product)
+    assert Path(paths.manifest).read_text(encoding="utf-8") == "old-manifest"
+
+
+def test_sequence_failed_report_is_atomic_and_does_not_touch_success_artifacts(tmp_path):
+    """独立 failed report 替换不改变已有 main/stream/report/manifest。"""
+    emitter = _sequence_emitter(tmp_path)
+    paths = emitter._paths
+    success_paths = tuple(Path(value) for value in (
+        paths.output, paths.stream, paths.report, paths.manifest,
+    ))
+    for index, path in enumerate(success_paths):
+        path.write_bytes(f"success-{index}".encode())
+    report = {
+        "run_attempt_id": "b" * 32, "run_id": None,
+        "artifacts_committed": False, "failed_slot": None, "attempts_used": 0,
+        "terminal_error_kind": "generation_plan_infeasible",
+        "llm_usage": {}, "rejected_attempts": {},
+    }
+
+    emitter.write_failed_report(report)
+
+    assert [path.read_bytes() for path in success_paths] == [
+        f"success-{index}".encode() for index in range(4)
+    ]
+    assert json.loads(Path(paths.failed_report).read_text()) == report
+    assert not Path(str(paths.failed_report) + ".part").exists()
+
+
+@pytest.mark.parametrize("mutation", ("digest", "run_id", "missing_report"))
+def test_sequence_invalid_product_identity_fails_before_any_part(
+        tmp_path, mutation):
+    """非法 digest/run identity 在打开任何 part 前 terminal。"""
+    emitter = _sequence_emitter(tmp_path)
+    report = _success_report()
+    if mutation == "missing_report":
+        report = {}
+    else:
+        report["generate"]["sequence"][mutation] = "invalid"
+        if mutation == "digest":
+            report["generate"]["sequence"]["delivery_digest"] = "invalid"
+        else:
+            report["generate"]["sequence"]["delivery_digest"] = "0" * 64
+    from labelkit.common.contracts.generation import GenerationProduct
+
+    product = GenerationProduct(({"main": 1},), ({"stream": 1},), report)
+    with pytest.raises(InternalError, match="generation_downstream_contract"):
+        emitter.commit(product)
+    assert not list((tmp_path / "out").glob("*.part"))

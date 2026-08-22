@@ -16,16 +16,22 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import re
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
+from urllib.parse import urlsplit
 
 import json_repair
 from jsonschema import Draft202012Validator
 
 from labelkit.common.contracts.types import Usage
-from labelkit.common.errors import ContextOverflowError, SchemaViolation
+from labelkit.common.errors import (
+    ContextOverflowError,
+    PostValidatorInvalidError,
+    SchemaViolation,
+)
 from labelkit.common.runtime.budget import feed_reactive_terminal
 
 if TYPE_CHECKING:
@@ -174,33 +180,12 @@ def _json_pointer(path: Any) -> str:
     )
 
 
-def _render_contains(error: Any) -> str:
-    """v1.14（裁决·渲染缺类可见）：渲染一条 ``contains`` 违规——点名缺失的帧类。
-
-    蓝图覆盖约束的 contains 子 Schema 形如
-    ``{"properties": {"frame_class": {"const": <名>}}, ...}``，故直接取那个 const 值
-    点名；不是该形状（用户 Schema 也可以用 contains）时回落 jsonschema 原始消息。
-    L0 关端点上的 L3 修复提示必须点名缺失帧类，否则修复指导性趋零。
-
-    @param error jsonschema 的一条 ValidationError（validator == "contains"）。
-    @return 渲染后的描述串。
-    """
-    props = (error.validator_value.get("properties")
-             if isinstance(error.validator_value, dict) else None)
-    field = props.get("frame_class") if isinstance(props, dict) else None
-    name = field.get("const") if isinstance(field, dict) else None
-    if name is None:
-        return error.message
-    return f"missing required frame_class {json.dumps(name, ensure_ascii=False)}"
-
-
 def _render_error(error: Any) -> str:
     """把一条违规渲染成 '<json-pointer>: <描述>'（面向修复提示词）。
 
-    枚举类违规按 spec 3.8.4 的「期望/实际」措辞自行渲染；v1.14 起 contains 违规点名
-    缺失的帧类（裁决·渲染缺类可见）；其它关键字直接携带 jsonschema 的原始消息。渲染
-    文本双重用途——既进 L3 修复提示词的违规清单，也进 StageError / rejects 的错误报告
-    面，故按「报错输出英文」规则统一为英文。
+    枚举类违规按 spec 3.8.4 的「期望/实际」措辞自行渲染；其它关键字直接携带
+    jsonschema 的原始消息。文本既进入 L3 修复提示词，也进入 StageError/rejects，
+    因此统一使用英文。
 
     @param error jsonschema 的一条 ValidationError。
     @return 渲染后的违规行。
@@ -210,8 +195,6 @@ def _render_error(error: Any) -> str:
         expected = json.dumps(list(error.validator_value), ensure_ascii=False)
         actual = json.dumps(error.instance, ensure_ascii=False)
         description = f"expected one of enum {expected}, got {actual}"
-    elif error.validator == "contains":
-        description = _render_contains(error)
     else:
         description = error.message
     return f"{pointer}: {description}"
@@ -224,6 +207,19 @@ def _summarize_error(error: Any) -> str:
     @return 脱敏后的违规摘要行。
     """
     return f"{_json_pointer(error.absolute_path)}: {error.validator}"
+
+
+def _thaw_json(value: Any) -> Any:
+    """把冻结 JSON 容器递归复制成可序列化的标准容器。
+
+    @param value MappingProxyType/tuple 也可能出现的 JSON 值
+    @return 仅含 dict/list 与 JSON 标量的新值
+    """
+    if isinstance(value, Mapping):
+        return {key: _thaw_json(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_thaw_json(item) for item in value]
+    return value
 
 
 # 连 L1 都产不出 JSON 对象时使用的渲染违规（根指针形态）。
@@ -244,6 +240,39 @@ def _build_repair_prompt(raw_output: str, violations: list[str]) -> str:
     """
     numbered = "\n".join(f"{i}. {v}" for i, v in enumerate(violations, 1))
     return f"[原始输出]\n{raw_output}\n\n[违规清单]\n{numbered}\n\n只输出修正后的 JSON。"
+
+
+def _build_post_repair_prompt(
+    original: PromptBundle,
+    raw_output: str,
+    violations: list[str],
+) -> PromptBundle:
+    """重放 prompt-safe 上下文并附加可执行后置验证修复回合。
+
+    @param original 首轮完整 prompt-safe 对话。
+    @param raw_output 上一候选原始输出。
+    @param violations 值受控的后置验证违规清单。
+    @return 原对话加 assistant 候选和 user 修复指令。
+    """
+    repair = _build_post_repair_instruction(violations)
+    messages = original.messages + (
+        Message(role="assistant", parts=(Part(kind="text", text=raw_output),)),
+        Message(role="user", parts=(Part(kind="text", text=repair),)),
+    )
+    return PromptBundle(messages=messages)
+
+
+def _build_post_repair_instruction(violations: list[str]) -> str:
+    """构造 post-validated 修复回合的新增 user 文本。"""
+    numbered = "\n".join(f"{index}. {item}" for index, item in enumerate(violations, 1))
+    return f"[违规清单]\n{numbered}\n\n只输出修正后的 JSON。"
+
+
+def _repair_context_fits(texts: Sequence[str], byte_limit: int | None) -> bool:
+    """判断本轮新增修复消息正文是否位于可选 UTF-8 byte 上限内。"""
+    if byte_limit is None:
+        return True
+    return sum(len(item.encode("utf-8")) for item in texts) <= byte_limit
 
 
 # ── resolved_at 桶归类（纯函数） ─────────────────────────────────────────────
@@ -476,76 +505,172 @@ def frame_classify_schema(names: Sequence[str], n: int) -> dict:
             "required": ["labels"], "additionalProperties": False}
 
 
-def plan_schema(names: Sequence[str], length: int, cover_all: bool = False) -> dict:
-    """v1.13 M6 时间流形态·蓝图调用的内部 Schema（裁决·蓝图实现内部 Schema）。
+_ACTOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "goal": {"type": "object"},
+        "identity": {"type": "object"},
+        "style": {"type": "object"},
+    },
+    "required": ["goal", "identity", "style"],
+    "additionalProperties": False,
+}
 
-    一条序列的 ``length`` 步计划：每步给出所属帧类（闭集，取自 ``names`` 帧类表）与
-    一句话内容要点 ``brief``（供帧实现调用逐位展开）。minItems = maxItems 钉死步数
-    （judgment_schema / frame_classify_schema 先例）；不用 uniqueItems——同一帧类在
-    一条序列里本就可重复出现（R1 同理，strict 网关硬拒该关键字）。
+def _scenario_state_resource(
+    state_schema: Mapping[str, object],
+) -> tuple[dict, str]:
+    """把用户状态 Schema 作为独立嵌入资源组合进 ScenarioSeed。
 
-    v1.14（裁决·蓝图双向硬约束）：``cover_all = True`` 时在 steps 数组对象上追加
-    ``allOf`` + 逐名一项 ``contains``（按传入名集序）——enum 给「⊆ 档内名集」、
-    contains 给「⊇」，合成构成恰等「步帧类集合 ≡ 档声明构成」。一个 Schema 对象只有
-    一个 contains 键位，故多类分 allOf 支（draft 2020-12 原生关键字，L2 直接可校验）。
-    缺省 False 的输出与 v1.13 逐字节一致。
+    没有 ``$id`` 的 Schema 在嵌入后会把本地 ``#`` 引用错误解析到 ScenarioSeed 根。
+    补入内容寻址资源标识可保留完整 Schema 及其本地引用作用域；已有绝对 ``$id``
+    原样保留。这里只复制组合对象，不修改 ResolvedConfig 中的用户 Schema。
 
-    @param names 帧类名闭集（档位表在场时 = 档内子集，构造器零感知）。
-    @param length 本条序列的步数（同时钉死数组长度）。
-    @param cover_all 是否注入「档内每类至少一次」的逐类 contains 覆盖约束。
-    @return draft 2020-12 Schema 对象。
+    @param state_schema 完整用户状态 Schema。
+    @return 独立资源副本及其绝对资源标识。
     """
-    steps: dict = {"type": "array",
-                   "items": {"type": "object",
-                             "properties": {"frame_class": {"type": "string",
-                                                            "enum": list(names)},
-                                            "brief": {"type": "string"}},
-                             "required": ["frame_class", "brief"],
-                             "additionalProperties": False},
-                   "minItems": length, "maxItems": length}
-    if cover_all:
-        steps["allOf"] = [{"contains": {"type": "object",
-                                        "properties": {"frame_class": {"const": name}},
-                                        "required": ["frame_class"]}}
-                          for name in names]
-    return {"type": "object", "properties": {"steps": steps},
-            "required": ["steps"], "additionalProperties": False}
+    embedded = _thaw_json(state_schema)
+    declared = embedded.get("$id")
+    if isinstance(declared, str) and urlsplit(declared).scheme:
+        return embedded, declared
+    canonical = json.dumps(
+        embedded, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    resource_id = f"urn:labelkit:state-schema:{digest}"
+    embedded["$id"] = resource_id
+    return embedded, resource_id
 
 
-def brief_schema(length: int) -> dict:
-    """v1.16 联合规划蓝图的 sampled brief Schema。
+def scenario_seed_schema(actor_names: Sequence[str] | None,
+                         state_schema: Mapping[str, object]) -> dict:
+    """构造完整 ScenarioSeed 内部 Schema。
 
-    @param length planner 已冻结的序列长度
-    @return 逐位只含 ``brief`` 的 draft 2020-12 Schema
+    @param actor_names declared actor 闭集；None 表示 instruction-only 动态闭集
+    @param state_schema 完整初始状态 Schema
+    @return 精确 ScenarioSeed Draft 2020-12 Schema
     """
-    if length < 1:
-        raise ValueError("brief schema length must be positive")
-    item = {"type": "object", "properties": {"brief": {"type": "string"}},
-            "required": ["brief"], "additionalProperties": False}
-    steps = {"type": "array", "items": item, "minItems": length, "maxItems": length}
-    return {"type": "object", "properties": {"steps": steps},
-            "required": ["steps"], "additionalProperties": False}
+    actors = _scenario_actor_schema(actor_names)
+    state_resource, _state_resource_id = _scenario_state_resource(state_schema)
+    return {
+        "type": "object",
+        "properties": {
+            "initial_state": state_resource,
+            "actors": actors,
+            "shared_facts": {
+                "type": "object",
+                "properties": {
+                    "public": {"type": "object"},
+                    "hidden": {"type": "object"},
+                },
+                "required": ["public", "hidden"],
+                "additionalProperties": False,
+            },
+            "style": {"type": "object"},
+            "time_context": {"type": "object"},
+        },
+        "required": ["initial_state", "actors", "shared_facts", "style", "time_context"],
+        "additionalProperties": False,
+    }
 
 
-def realize_schema(step_schemas: Sequence[dict]) -> dict:
-    """v1.13 M6 时间流形态·帧实现调用的内部 Schema（裁决·蓝图实现内部 Schema）。
+def _scenario_actor_schema(actor_names: Sequence[str] | None) -> dict:
+    """构造 declared 或 instruction-only actor 子 Schema。
 
-    逐位包装器：第 i 帧服从蓝图第 i 步帧类的**用户生成 Schema**（纯文本帧由调用方
-    传 ``{"type": "string"}``）。``prefixItems`` 是 draft 2020-12 原生关键字
-    （jsonschema ≥ 4.21 直接可校验，L2 无需翻译层），``"items": false`` 封尾禁止
-    超长数组，minItems = maxItems 再钉一次长度。用户生成 Schema 随 L0 原样透传，
-    不做关键字白名单 lint（output.schema 今日同款暴露面）。
-
-    @param step_schemas 逐位步骤 Schema 序列（纯文本帧由调用方传 ``{"type": "string"}``）。
-    @return draft 2020-12 Schema 对象。
+    @param actor_names actor 闭集；None 表示一至八个动态 actor
+    @return actor object Schema
     """
-    steps = list(step_schemas)
+    if actor_names is None:
+        return {"type": "object", "additionalProperties": _ACTOR_SCHEMA,
+                "propertyNames": {"type": "string", "minLength": 1},
+                "minProperties": 1, "maxProperties": 8}
     return {"type": "object",
-            "properties": {"frames": {"type": "array",
-                "prefixItems": steps,
-                "minItems": len(steps), "maxItems": len(steps),
-                "items": False}},
-            "required": ["frames"], "additionalProperties": False}
+            "properties": {name: _ACTOR_SCHEMA for name in actor_names},
+            "required": list(actor_names), "additionalProperties": False}
+
+
+def event_plan_schema(frame_names: Sequence[str], actor_names: Sequence[str]) -> dict:
+    """构造 EventPlan 内部 Schema；可执行约束留给后置验证。
+
+    @param frame_names 允许的帧类闭集
+    @param actor_names 允许的 actor 闭集
+    @return 精确 EventPlan Draft 2020-12 Schema
+    """
+    with_value = {
+        "type": "object",
+        "properties": {
+            "op": {"type": "string", "enum": ["test", "add", "replace"]},
+            "path": {"type": "string"},
+            "value": {},
+        },
+        "required": ["op", "path", "value"],
+        "additionalProperties": False,
+    }
+    remove = {
+        "type": "object",
+        "properties": {"op": {"type": "string", "const": "remove"},
+                       "path": {"type": "string"}},
+        "required": ["op", "path"], "additionalProperties": False,
+    }
+    return _event_plan_root(frame_names, actor_names, with_value, remove)
+
+
+def _event_plan_root(frame_names: Sequence[str], actor_names: Sequence[str],
+                     with_value: dict, remove: dict) -> dict:
+    """组装 EventPlan 顶层，保持公开构造函数短小。
+
+    @param frame_names 帧类闭集
+    @param actor_names actor 闭集
+    @param with_value 带 value 的 patch 操作 Schema
+    @param remove remove 操作 Schema
+    @return EventPlan 顶层 Schema
+    """
+    return {
+        "type": "object",
+        "properties": {
+            "frame_class": {"type": "string", "enum": list(frame_names)},
+            "actor": {"type": "string", "enum": list(actor_names)},
+            "intent": {"type": "string"},
+            "patch": {"type": "array", "items": {"oneOf": [with_value, remove]},
+                      "minItems": 2},
+        },
+        "required": ["frame_class", "actor", "intent", "patch"],
+        "additionalProperties": False,
+    }
+
+
+def semantic_evaluation_schema() -> dict:
+    """构造六项盲审判定内部 Schema。
+
+    @return 精确 SemanticEvaluation Draft 2020-12 Schema
+    """
+    codes = ["causal_inconsistency", "actor_knowledge_violation", "goal_inconsistency",
+             "temporal_implausibility", "cross_frame_inconsistency", "unrealistic"]
+    bools = ("causal_consistency", "actor_knowledge", "goal_consistency",
+             "temporal_plausibility", "cross_frame_consistency", "realism")
+    properties = {name: {"type": "boolean"} for name in bools}
+    properties["reason_codes"] = {"type": "array",
+                                  "items": {"type": "string", "enum": codes}}
+    return {"type": "object", "properties": properties,
+            "required": [*bools, "reason_codes"], "additionalProperties": False}
+
+
+def noise_semantic_evaluation_schema() -> dict:
+    """构造四项 noise 独立判定内部 Schema。
+
+    @return 精确 NoiseSemanticEvaluation Draft 2020-12 Schema
+    """
+    codes = [
+        "related_to_declared_task", "executable_task_present", "unrealistic",
+        "planned_noise_topic_mismatch",
+    ]
+    bools = (
+        "unrelated_to_declared_tasks", "no_executable_task", "realism",
+        "matches_planned_topic",
+    )
+    properties = {name: {"type": "boolean"} for name in bools}
+    properties["reason_codes"] = {"type": "array",
+                                  "items": {"type": "string", "enum": codes}}
+    return {"type": "object", "properties": properties,
+            "required": [*bools, "reason_codes"], "additionalProperties": False}
 
 
 # ── 引擎本体 ─────────────────────────────────────────────────────────────────
@@ -586,6 +711,7 @@ class CallScope:
     batch_no: int = 0                   # 批次号，仅用于 trace 事件与日志 extra
     record: Any = None                  # L2.5 回调第二入参（Record.raw），无则 None
     user_treatment: bool | None = None  # 显式待遇门；None ⇒ 按 schema is None 推断
+    repair_context_bytes: int | None = None  # 当前调用单轮新增 L3 正文 byte 上限
 
 
 _DEFAULT_SCOPE = CallScope()
@@ -600,6 +726,7 @@ class _CallContext:
     record_ids: tuple[str, ...]    # 本次调用覆盖的记录 id，仅用于 trace 事件
     batch_no: int                  # 批次号，仅用于 trace 事件与日志 extra
     record: Any                    # L2.5 回调的第二入参（Record.raw 原始输入映射），无则 None
+    repair_context_bytes: int | None = None  # 单轮新增 L3 正文 byte 上限
 
 
 @dataclass(frozen=True)
@@ -612,6 +739,102 @@ class _Pending:
     usage: Usage            # 截至目前累计的 token 用量
     model: str              # 首轮响应回报的模型名（修复轮不覆盖，随最终结果原样返回）
     attempts: int           # 截至目前发生的调用次数（首轮计 1）
+
+
+@dataclass(frozen=True)
+class _PostInspection:
+    """一次 L2 与 request-local 后置验证的归一结果。"""
+
+    rendered: list[str]             # 可进入 L3 的违规文本
+    summaries: list[str]            # trace 使用的脱敏摘要
+    execution: object | None        # 唯一成功执行证明
+    terminal_kind: str | None       # invalid/exception 终态分类
+
+
+@dataclass(frozen=True)
+class _PostPending:
+    """后置验证 L3 修复环的现场快照。"""
+
+    raw: str                        # 最近一轮原始输出
+    rendered: list[str]             # 最近一轮违规文本
+    summaries: list[str]            # 最近一轮脱敏摘要
+    usage: Usage                    # 累计 usage
+    model: str                      # 首轮模型名
+    attempts: int                   # 累计调用数
+
+
+@dataclass(frozen=True)
+class _PostRepairRequest:
+    """一轮 post-validated L3 调用的参数对象。"""
+
+    profile: str                    # 修复 profile
+    request: object                 # 后置验证调用请求
+    rendered: list[str]             # 仅违规文本
+    raw: str                        # 最近原始输出
+    context: _CallContext           # trace 范围
+
+
+_POST_PREFIX = "(post-validator) "
+
+
+def _inspect_post_candidate(obj: dict | None, schema: Mapping[str, object],
+                            validator: Callable[[Mapping[str, object]], object]) -> _PostInspection:
+    """对一个候选先跑 L2，再恰好一次执行后置验证器。
+
+    @param obj L1 后候选；None 表示不可解析
+    @param schema 完整内部 Schema
+    @param validator request-local 后置验证器
+    @return 可修复违规、成功证明或无内容终态分类
+    """
+    if obj is None:
+        return _PostInspection([_UNPARSEABLE_VIOLATION], [_UNPARSEABLE_SUMMARY], None, None)
+    errors = sorted(Draft202012Validator(schema).iter_errors(obj),
+                    key=lambda item: (_json_pointer(item.absolute_path), item.message))
+    if errors:
+        return _PostInspection([_render_error(item) for item in errors],
+                               [_summarize_error(item) for item in errors], None, None)
+    try:
+        result = validator(obj)
+    except PostValidatorInvalidError:
+        _logger.warning("Post-validator returned an invalid value", extra={"stage": "schema"})
+        return _PostInspection([], [], None, "post_validator_invalid")
+    except Exception:
+        _logger.warning("Post-validator raised an exception", extra={"stage": "schema"})
+        return _PostInspection([], [], None, "post_validator_exception")
+    return _normalize_post_result(result)
+
+
+def _normalize_post_result(result: object) -> _PostInspection:
+    """校验 PostValidationResult 的两种且仅两种合法形状。
+
+    @param result 后置验证器原始返回值
+    @return 成功证明、可修复违规或 invalid 终态
+    """
+    from labelkit.common.contracts.generation import EventExecution, PostValidationResult
+
+    if not isinstance(result, PostValidationResult):
+        return _PostInspection([], [], None, "post_validator_invalid")
+    violations = result.violations
+    valid_strings = isinstance(violations, tuple) and all(
+        isinstance(item, str) and bool(item.strip()) for item in violations)
+    if not valid_strings:
+        return _PostInspection([], [], None, "post_validator_invalid")
+    if not violations and isinstance(result.event_execution, EventExecution):
+        return _PostInspection([], [], result.event_execution, None)
+    if violations and result.event_execution is None:
+        rendered = [_POST_PREFIX + item for item in violations]
+        summaries = ["post-validator" for _ in violations]
+        return _PostInspection(rendered, summaries, None, None)
+    return _PostInspection([], [], None, "post_validator_invalid")
+
+
+def _raise_post_terminal(kind: str) -> None:
+    """以无异常文本、无候选内容的 SchemaViolation 终结当前候选。
+
+    @param kind post_validator_invalid 或 post_validator_exception
+    @raises SchemaViolation 始终抛出
+    """
+    raise SchemaViolation([kind], "")
 
 
 class SchemaEngine:
@@ -676,10 +899,8 @@ class SchemaEngine:
     def stats(self) -> dict:
         """resolved_at 计数器——只统计「用户待遇」调用（对应 report.schema_engine）。
 
-        v1.13（裁决·M8 显式待遇参数）：口径是「用户待遇族」而非「schema 参数为
-        None」——按序列类标注 Schema 显式传 schema 但同属记录级标注调用，照常记账
-        （§6.4 恒等式：resolved_at 加总 = 进入 M5 的记录级标注调用数）；帧级标注等
-        内部待遇调用仍不计。
+        口径是「用户待遇族」而非「schema 参数为 None」：按类标注显式传 schema
+        但仍属记录级标注调用，照常记账；帧级标注等内部待遇调用不计。
 
         @return 用户待遇调用的各类计数副本。
         """
@@ -709,7 +930,7 @@ class SchemaEngine:
 
     def _resolve(self, bucket: str, ctx: _CallContext, *,
                  violations: list[str], l1_lossy: bool = False) -> None:
-        """定案记账：计桶（仅「用户待遇」调用，v1.13）并为任何非 clean 定案发
+        """定案记账：仅为「用户待遇」调用计桶，并为任何非 clean 定案发
         schema.repair 追踪事件。
 
         @param bucket resolved_at 桶名。
@@ -776,10 +997,8 @@ class SchemaEngine:
         两者原样上抛给调用方（由算子归类，V27①）；「修复调用」抛出的
         ContextOverflowError 则判本轮失败并直接短路到耗尽（V25①）。
 
-        v1.13（裁决·M8 显式待遇参数）：``scope.user_treatment`` 显式声明本次调用
-        是否按「用户 Schema 待遇」处理——None = 按 ``schema is None`` 推断；True =
-        计 resolved_at 记账 + 启 L2.5（按序列类标注 Schema 即此形，正面修掉「显式
-        Schema = 放弃记账与回调」的弯折）；False = 内部待遇。
+        ``scope.user_treatment`` 显式声明是否按「用户 Schema 待遇」处理：None 按
+        ``schema is None`` 推断；True 计 resolved_at 并启用 L2.5；False 为内部待遇。
 
         @param profile 本次调用所用 LLM profile 名。
         @param prompt 提示词包。
@@ -792,10 +1011,12 @@ class SchemaEngine:
         """
         treated = ((schema is None) if scope.user_treatment is None
                    else scope.user_treatment)
+        active = _thaw_json(self._user_schema if schema is None else schema)
         ctx = _CallContext(
-            active=self._user_schema if schema is None else schema,
+            active=active,
             user_treated=treated, record_ids=scope.record_ids,
-            batch_no=scope.batch_no, record=scope.record)
+            batch_no=scope.batch_no, record=scope.record,
+            repair_context_bytes=scope.repair_context_bytes)
         # L0：Schema 恒交给客户端；仅当 profile 声明 supports_structured_output 时，
         # 客户端才施加厂商结构化输出机制。
         response = await self._llm.complete(profile, prompt, response_schema=ctx.active)
@@ -808,6 +1029,99 @@ class SchemaEngine:
             profile, ctx,
             _Pending(raw=raw, rendered=rendered, summaries=summaries,
                      usage=response.usage, model=response.model, attempts=1))
+
+    async def complete_post_validated(
+        self,
+        request: PostValidatedCallRequest,
+    ) -> ValidatedGenerationCall:
+        """对每个 L2 候选恰验证一次并返回匹配的执行证明。
+
+        @param request 含 request-local 后置验证器的完整调用请求
+        @return 已验证对象及该同一候选的执行证明
+        """
+        active = _thaw_json(request.schema)
+        ctx = _CallContext(active=active, user_treated=False,
+                           record_ids=request.scope.record_ids,
+                           batch_no=request.scope.batch_no, record=None,
+                           repair_context_bytes=request.scope.repair_context_bytes)
+        response = await self._llm.complete(
+            request.profile, request.prompt, response_schema=active)
+        obj, l1_fixed, raw = _extract_object(response)
+        inspected = _inspect_post_candidate(obj, active, request.post_validator)
+        if inspected.terminal_kind is not None:
+            _raise_post_terminal(inspected.terminal_kind)
+        if obj is not None and inspected.execution is not None:
+            from labelkit.common.contracts.generation import ValidatedGenerationCall
+
+            bucket = _bucket_for(l1_fixed, 0)
+            self._resolve(bucket, ctx, violations=[])
+            return ValidatedGenerationCall(obj, inspected.execution, bucket,
+                                           response.usage, 1, response.model)
+        pending = _PostPending(raw, inspected.rendered, inspected.summaries,
+                               response.usage, response.model, 1)
+        return await self._repair_post_validated(request, ctx, pending)
+
+    async def _repair_post_validated(
+        self,
+        request: PostValidatedCallRequest,
+        ctx: _CallContext,
+        pending: _PostPending,
+    ) -> ValidatedGenerationCall:
+        """在完整 Schema 与纯违规文本上执行最多两轮 L3。
+
+        @param request 原始 post-validated 请求
+        @param ctx 内部待遇调用上下文
+        @param pending 首轮未通过现场
+        @return 成功候选及同一次后置执行证明
+        @raises SchemaViolation 修复预算耗尽或 post-validator 终态
+        """
+        raw, rendered, summaries = pending.raw, pending.rendered, pending.summaries
+        usage, attempts = pending.usage, pending.attempts
+        repair_profile = self._cfg.repair_llm or request.profile
+        for repair_round in range(1, min(self._cfg.max_repair_attempts, 2) + 1):
+            repair = _PostRepairRequest(repair_profile, request, rendered, raw, ctx)
+            response = await self._post_repair_call(repair)
+            if response is None:
+                break
+            usage, attempts = usage + response.usage, attempts + 1
+            obj, _, raw = _extract_object(response)
+            schema = _thaw_json(request.schema)
+            inspected = _inspect_post_candidate(obj, schema, request.post_validator)
+            if inspected.terminal_kind is not None:
+                _raise_post_terminal(inspected.terminal_kind)
+            if obj is not None and inspected.execution is not None:
+                from labelkit.common.contracts.generation import ValidatedGenerationCall
+
+                bucket = f"l3_{repair_round}"
+                self._resolve(bucket, ctx, violations=summaries)
+                return ValidatedGenerationCall(obj, inspected.execution, bucket, usage,
+                                               attempts, pending.model)
+            rendered, summaries = inspected.rendered, inspected.summaries
+        raise SchemaViolation(rendered, raw)
+
+    async def _post_repair_call(self, repair: _PostRepairRequest):
+        """执行一轮 post-validated L3 调用并归一 overflow 短路。
+
+        @param repair 修复 profile、请求、违规、原始输出与 trace 范围
+        @return LLMResponse；overflow 时为 None
+        """
+        instruction = _build_post_repair_instruction(repair.rendered)
+        if not _repair_context_fits(
+            (repair.raw, instruction), repair.context.repair_context_bytes
+        ):
+            _logger.warning("L3 repair context exceeds the frozen byte limit",
+                            extra={"stage": "schema", "batch": repair.context.batch_no})
+            return None
+        prompt = _build_post_repair_prompt(
+            repair.request.prompt, repair.raw, repair.rendered)
+        try:
+            schema = _thaw_json(repair.request.schema)
+            return await self._llm.complete(repair.profile, prompt, response_schema=schema)
+        except ContextOverflowError as overflow:
+            _logger.warning("L3 repair call exceeded the context budget",
+                            extra={"stage": "schema", "batch": repair.context.batch_no})
+            feed_reactive_terminal(overflow, self._metrics)
+            return None
 
     async def _repair_until_valid(self, profile: str, ctx: _CallContext,
                                   pending: _Pending) -> tuple[dict, Usage, int, str]:
@@ -823,25 +1137,10 @@ class SchemaEngine:
         total_usage, attempts = pending.usage, pending.attempts
         repair_profile = self._cfg.repair_llm or profile
         for repair_round in range(1, self._cfg.max_repair_attempts + 1):
-            repair_prompt = PromptBundle(messages=(
-                Message(role="user",
-                        parts=(Part(kind="text", text=_build_repair_prompt(raw, rendered)),)),
-            ))
-            try:
-                response = await self._llm.complete(repair_profile, repair_prompt,
-                                                    response_schema=ctx.active)
-            except ContextOverflowError as overflow:
-                # v1.11（V25①，spec §3.3⑨）：修复调用超预算 ⇒ 判本轮失败并短路其余轮次
-                # （修复提示词恒定，后续轮必然同样失败）。下方耗尽路径仍按
-                # schema_violation / callback_violation 归因拒绝（绝不改记 context_overflow：
-                # 修复源文本从不截断，截断会破坏修复语义）。异常在此被吞掉即终结其生命，
-                # 故 A7「恰好一次」的 reactive-400 熔断喂入在这里结清（§7.8 矩阵；下方抛出的
-                # SchemaViolation 不会再抵达算子的溢出拒绝点）——预检与 finish 来源从不喂入，
-                # _breaker_fed 鸭子标志保证幂等。
-                _logger.warning("L3 repair call exceeded the context budget; failing this round "
-                                "and short-circuiting the remaining repair budget",
-                                extra={"stage": "schema", "batch": ctx.batch_no})
-                feed_reactive_terminal(overflow, self._metrics)
+            response = await self._generic_repair_call(
+                repair_profile, ctx, raw, rendered,
+            )
+            if response is None:
                 break
             total_usage = total_usage + response.usage
             attempts += 1
@@ -858,3 +1157,32 @@ class SchemaEngine:
             rendered, raw,
             callback_only=bool(rendered) and all(
                 v.startswith(self._CB_PREFIX) for v in rendered))
+
+    async def _generic_repair_call(self, profile, ctx, raw, rendered):
+        """执行一轮普通 L3 修复并把超预算归一为 None。"""
+        repair_text = _build_repair_prompt(raw, rendered)
+        if not _repair_context_fits((repair_text,), ctx.repair_context_bytes):
+            _logger.warning("L3 repair context exceeds the frozen byte limit",
+                            extra={"stage": "schema", "batch": ctx.batch_no})
+            return None
+        prompt = PromptBundle(messages=(
+            Message(role="user", parts=(Part(kind="text", text=repair_text),)),
+        ))
+        try:
+            return await self._llm.complete(profile, prompt, response_schema=ctx.active)
+        except ContextOverflowError as overflow:
+            # 修复提示词恒定，后续轮必然同败；被吞异常在这里恰好一次喂入熔断。
+            _logger.warning(
+                "L3 repair call exceeded the context budget; failing this round and "
+                "short-circuiting the remaining repair budget",
+                extra={"stage": "schema", "batch": ctx.batch_no},
+            )
+            feed_reactive_terminal(overflow, self._metrics)
+            return None
+
+
+# 公开签名的运行期注解绑定；载体模块同时把 SchemaEngine 注回自身命名空间。
+from labelkit.common.contracts.generation import (  # noqa: E402
+    PostValidatedCallRequest,
+    ValidatedGenerationCall,
+)

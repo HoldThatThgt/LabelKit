@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import sys
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import IO, TYPE_CHECKING, Callable, Mapping, Protocol
@@ -175,27 +176,50 @@ class ProgressListener(Protocol):
         """execute_run 装配完成后、asyncio.run 之前调用一次（U19）：cfg =
         ResolvedConfig；snapshot = LLMClient.snapshot（spec 3.9.2）；counters /
         fatal_streak = MetricsSink 只读闭包。渲染器以「惰性壳」形态传入（CLI 在
-        load 前无 cfg），本回调完成激活。"""
+        load 前无 cfg），本回调完成激活。
+
+        @param cfg 完整运行配置。
+        @param snapshot LLM profile 快照闭包。
+        @param counters 运行计数只读闭包。
+        @param fatal_streak 连续 fatal 次数闭包。
+        @return None。
+        """
         ...
 
     def on_estimate(self, est: Mapping) -> None:
         """M10 预扫后经 MetricsSink.run_estimate 转发的 estimate_run() 静态估算
-        （spec 3.10.3）；文本模态未开 console.estimate 时不发（U17）。"""
+        （spec 3.10.3）；文本模态未开 console.estimate 时不发（U17）。
+
+        @param est 静态调用量估算。
+        @return None。
+        """
         ...
 
     def on_event(self, ev: TraceEvent) -> None:
         """MetricsSink.event() 旁路转发；payload 已经 redact_payload(payload,
-        "none") 预脱敏（U22）。"""
+        "none") 预脱敏（U22）。
+
+        @param ev 已预脱敏事件。
+        @return None。
+        """
         ...
 
     def on_stage(self, stage: str, batch_no: int) -> None:
         """M10 stage 循环经 MetricsSink.stage_begin 转发（每 stage run() 之前
-        一次，U11）。"""
+        一次，U11）。
+
+        @param stage 当前阶段名。
+        @param batch_no 当前批次号。
+        @return None。
+        """
         ...
 
     def on_stop_requested(self) -> None:
         """SIGINT/SIGTERM 经 MetricsSink.stop_requested 转发（优雅中断横幅，
-        spec 3.10.3）。"""
+        spec 3.10.3）。
+
+        @return None。
+        """
         ...
 
 
@@ -407,6 +431,7 @@ class MetricsSink:
         self.event_log = event_log
         self.counters: dict[str, int] = {}
         self.stage_times: dict[str, float] = {}
+        self._captured_counts: dict[str, int] | None = None
         self._fatal_streak = 0
         self._circuit_broken = False
         self._listener: ProgressListener | None = listener
@@ -543,7 +568,46 @@ class MetricsSink:
         @param key 计数器键（report.json 的计数来源）
         @param n 增量，默认 1
         """
-        self.counters[key] = self.counters.get(key, 0) + n
+        captured = self._captured_counts
+        target = captured if captured is not None and not key.startswith("budget.") else self.counters
+        target[key] = target.get(key, 0) + n
+
+    @contextmanager
+    def capture_counts(self):
+        """暂存一个 sequence attempt 内产生的 dataset counters。
+
+        事件、LLM 用量、Schema 统计、熔断状态与 ``budget.*`` 运行事实继续实时写入；
+        其余经 :meth:`count` 写入的 dataset counters 被暂存，交付控制器在 group
+        commit 后显式合并。嵌套捕获会破坏归属边界，因此 fail closed。
+
+        @return 当前捕获区的可变计数表。
+        @raises RuntimeError 已存在活动捕获区。
+        """
+        if self._captured_counts is not None:
+            _logger.error("metrics count capture is already active")
+            raise RuntimeError("metrics count capture is already active")
+        captured: dict[str, int] = {}
+        self._captured_counts = captured
+        try:
+            yield captured
+        finally:
+            self._captured_counts = None
+
+    def merge_counts(self, counters: Mapping[str, int]) -> None:
+        """在 sequence group commit 后一次合并 attempt-local counters。
+
+        @param counters 已接受 attempt 的局部计数增量。
+        @return None。
+        @raises RuntimeError 捕获区仍活动，或增量不是非负整数。
+        """
+        if self._captured_counts is not None:
+            _logger.error("cannot merge metrics while count capture is active")
+            raise RuntimeError("cannot merge metrics while count capture is active")
+        for key, value in counters.items():
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                _logger.error("metrics counter delta must be a non-negative integer")
+                raise RuntimeError("metrics counter delta must be a non-negative integer")
+            self.counters[key] = self.counters.get(key, 0) + value
 
     def add_stage_time(self, stage: str, seconds: float) -> None:
         """累加某阶段的累计耗时。

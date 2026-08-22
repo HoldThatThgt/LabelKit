@@ -209,7 +209,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `frame.classify.fallback_class` | str | 必填† | † enabled 时必填且 ∈ 帧类表 name 集（2.3.1 帧粒度约束）：修复穷尽 / 窗口失败的兜底类（3.13.7 失败语义；LLM 亦可主动选择它）。 |
 | `[[frame.classify.classes]]` | array | 必填† | † enabled 时经「fallback_class ∈ 类表」传递性要求非空（无独立 ≥ 2 类数下限，与 `[[classify.classes]]` 有意不同，3.1.4）。每项：`name`（`[a-z0-9_]+`，表内唯一）、`description`（非空）、`examples`（字符串数组，可选——**解析合法但帧级批量判决模板不渲染**（§10.12 只渲染类表，与序列级 few-shot 有意不同），在场时 M1 显名 WARN `class examples are not rendered by the batched frame-verdict template (§10.12), so this key is ignored`，静态预算预检口径同步不计，3.1.4）。**帧类表与序列类表相互独立、允许重名、互不约束**（计数命名空间同分离：`frame_classify.*` vs `classify.*`，6.4）。 |
 | ~~`frame.classify.assignment`~~ | — | —（不提供） | v1.12 定向探针键：显式书写 → CONFIG_ERROR——帧分类恒为单一归属（帧多标签/帧级扇出为 v1.12 非目标，8.1）；多标签扇出请用序列级 `[classify].assignment`（机制 = v1.11 `use_vision` 原始节探针同款，3.1.4）。 |
-| `frame.annotate.enabled` | bool | false | v1.12 新增：帧级逐帧标注开关（M5 帧粒度，3.5.5）——序列级标注成功后对成员帧逐帧产出符合帧级 Schema 的标注，产物落 `_meta.stream.members[].annotation/status`（6.3）。默认关。process/flat 路径启用要求 `segment.enabled = true`；sequence 路径可脱离 segment 作为 attempt-local 下游。`frame.*` 任一启用 ⇒ `output.meta_mode != "none"`（帧产物仅经 `_meta.stream.members` 承载，sidecar 合法——2.3.1 帧粒度约束）。 |
+| `frame.annotate.enabled` | bool | false | 帧级逐帧标注开关（M5 帧粒度，3.5.5），产物落 `_meta.stream.members[].annotation/status`（6.3）。process/flat 路径启用要求 `segment.enabled = true`，并在序列级标注成功后执行；sequence 路径可脱离 segment 作为 attempt-local 下游，且 `annotate.enabled=false` 时直接执行 frame pass、序列标注零调用。sequence 的任一应标注帧失败都拒绝并重试整个 counterfactual set。`frame.*` 任一启用 ⇒ `output.meta_mode != "none"`（帧产物仅经 `_meta.stream.members` 承载，sidecar 合法——2.3.1 帧粒度约束）。 |
 | `frame.annotate.llm` | str | "default" | profile 引用；enabled 时计入密钥解析 / `--probe` / 存在性引用集；ui 模态 ∧ enabled 时**无条件入 vision 必需集**（镜像序列级 annotate——截图是标注主证据，3.1.4 帧粒度配置行）。 |
 | `frame.annotate.instruction` | str | 必填† | † enabled 时必填（非空，M1 校验）。全局帧标注指令；`[frame.class.<name>.annotate]` 可按帧类覆盖（见按类覆盖表 v1.12 注）。 |
 | `frame.annotate.examples` | array | [] | few-shot：[{input, output}]，output 须过**帧级 Schema**（M1 干跑校验，3.1.4；帧级无 L2.5 hook）；形态镜像 `annotate.examples`。 |
@@ -338,7 +338,7 @@ initial_state_catalog_path = "catalogs/ticket-booking.jsonl"
 |---|---|---|---|
 | `class.<name>.description` | str | 必填 | sequence class 的非空描述；name 匹配 `[a-z0-9_]+`。 |
 | `class.<name>.generate.instruction` | str | 必填† | † declared 非零 slot class 必填。 |
-| `class.<name>.generate.state_schema_path` | str | 必填† | † declared 必填；object JSON Schema，文件上限 65536 bytes。 |
+| `class.<name>.generate.state_schema_path` | str | 必填† | † declared 必填；object JSON Schema，文件上限 65536 bytes；LLM source 根级 `examples` 至少含一个通过完整 Schema 的 object。 |
 | `class.<name>.generate.initial_state_source` | str | 必填† | `llm` 或 `catalog`。 |
 | `class.<name>.generate.initial_state_catalog_path` | str | 条件必填 | catalog source 必填；每行是完整 `ScenarioSeed`，应用完整配置后按 slot 无放回分配。 |
 
@@ -358,7 +358,8 @@ schema_path = "schemas/frame-request.json"
 ~~~
 
 每个被 role、instruction-only 或 noise 引用的 frame class 都必须声明 description、非空 instruction，并用
-schema_path 或 schema_inline 恰选一个 object JSON Schema。sequence 不接受 string payload。
+schema_path 或 schema_inline 恰选一个 object JSON Schema。Schema 根级 `examples` 至少含一个通过完整 Schema 的
+object；M1 选择 canonical byte 最小 witness。sequence 不接受 string payload。
 
 #### pattern、role、binding 与 gap
 
@@ -489,8 +490,9 @@ instruction = "生成一次完整、自然、状态连续的订票交互。"
 state_schema_path = "schemas/state.json"
 ~~~
 
-name 唯一，sequence_class 有效，count 是精确序列数；len_range 两端位于 1..64。state Schema 可缺省为
-只要求 object 的固定 Schema。instruction-only 禁止 pattern、counterfactual set、role permission、outcome
+name 唯一，sequence_class 有效，count 是精确序列数；len_range 两端位于 1..8。显式 state Schema 根级
+`examples` 至少含一个通过完整 Schema 的 object；缺省为只要求 object 的固定 Schema，并以 `{}` 作 witness。
+instruction-only 禁止 pattern、counterfactual set、role permission、outcome
 Schema 与 expected violation；每 attempt 调 ScenarioSeedGenerator，不支持 catalog。
 
 #### timeline、calendar 与 noise
@@ -499,8 +501,8 @@ Schema 与 expected violation；每 attempt 调 ScenarioSeedGenerator，不支�
 [generate.timeline]
 timestamp_start = "2026-01-05T09:00:00+08:00"
 event_gap_s = [5, 60]
-primary_sessions = 7
-crossed_primary_sessions = 1
+primary_sessions = 8
+crossed_primary_sessions = 0
 session_max_events = 16
 session_max_span_s = 3600
 session_gap_s = 3600
@@ -515,6 +517,7 @@ intervals = [["08:00:00", "12:00:00"], ["13:00:00", "18:00:00"]]
 [generate.noise]
 frame_class = "noise"
 instruction = "生成与任何任务无关、没有可执行诉求的一条自然输入。"
+topics = ["夜空中的月相观察", "手工面包出炉时的香气"]
 ~~~
 
 | 字段 | 类型 | 约束 |
@@ -529,7 +532,7 @@ instruction = "生成与任何任务无关、没有可执行诉求的一条自�
 | `noise_events` | int | 精确 noise slot 数；大于零时 generate.noise 必填。 |
 | `duplicate_sequences` | int | 精确 whole-positive-sequence replay 数；source 无放回，source 不足启动失败。 |
 | calendar window | table | 固定 UTC offset、weekday 闭集、同日半开 intervals；名称唯一。 |
-| noise | table | frame class 有 object Schema，且不得被任何 role 使用；noise 无 owner、state patch 或任务真值。 |
+| noise | table | frame class 有 object Schema，且不得被任何 role 使用；topics 是与 noise_events 等长的非空唯一话题表；noise 无 owner、state patch 或任务真值。 |
 
 instruction-only 强制 crossed 为零、primary_sessions = N、duplicates 为零。每个 declared primary session 恰有
 一或两个不同 counterfactual set owner，同一 set 的 variants 永不共 session；每个 replay 独占尾部 session。
@@ -540,16 +543,24 @@ instruction-only 强制 crossed 为零、primary_sessions = N、duplicates 为�
 |---|---:|
 | pattern roles | 32 |
 | variants per set | 8 |
-| instruction-only events | 64 |
+| instruction-only events | 8 |
 | ScenarioSeed / state or outcome Schema / frame Schema | 65536 bytes |
 | event patch | 16384 canonical JSON bytes |
 | rendered payload | 65536 canonical JSON bytes |
-| instruction | 32768 UTF-8 bytes |
+| one runtime prompt value | 32768 UTF-8 bytes |
+| one L3 newly appended message-body set | 32768 UTF-8 bytes |
+| one generation prompt text | 32768 UTF-8 bytes |
 | `record_units` / `stream_rows` | 500000 |
 | `retained_content_bytes` | 536870912 |
 
 `record_units = primary_sequences + primary_events + noise_events + replay_events`；
 `stream_rows = primary_events + noise_events + replay_events`。计数先以 Python integer 检查，再进入 OR-Tools。
+generation prompt text 包括每项 class/frame/pattern description 与 class/frame/role/instruction-only/noise
+instruction。state/outcome/frame 的运行期产出 Schema 根级 `examples` 必须含有效 object；M1 按 canonical byte 长度、
+canonical bytes 选择唯一最小 witness，并要求其不超过对应 prompt-value/payload 上限。M1 以共享构造器形成六个完整
+PromptBundle，再加动态值与 L3 新增正文 byte 包络证明首轮/repair profile；运行期恰好上限可派发，多一 byte 零派发拒绝。
+六个 family 的 2D/5D/5D+P/6D+P/S+2D/Y、`ceil(bytes/3)`、structured Schema 与 repair replay
+精确公式以 3.1.4「console 与上下文预算」后的规范段为唯一实现口径。
 retained bytes 在每个 attempt 的 dedup commit 前按最终 main/stream canonical bytes 精确计费。M11 先从
 最终 item 与 pre-downstream projection 装配 `SequenceRows`，ReplayProjector 再只从 source
 `SequenceRows.primary_stream_rows` 构造全部计划 `ReplayRows`。prospective 值恰等于既有已接受

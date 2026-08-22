@@ -66,13 +66,39 @@ user:
 
 v1.11 起 `sequence_frames` 升格为**上限**：所引 profile 声明 `context_window`（第 6 章）后，实际关键帧数按预算剩余动态收缩——`k_eff = min(sequence_frames, max(2, ⌊图片份额 / 每图成本⌋))`，首末帧恒保留、中间照旧均匀降采样。份额定序是「图片先于文本让步」：文本摘要是裁决的兜底证据、token 效率也高于像素；k = 2 仍装不下再回头按「首末恒保留、丢中段」裁文本块，最后才按 `context_overflow` 记录级拒收。运行期另有两条自动换档：端点报上下文溢出时，该次标注**减帧保清重试**（k 减半、min 2，至多两次降级，仍溢出按 `context_overflow` 拒收）；verify 判 fail 且 `policy = "repair"` 时，修复重标注按**质量阶梯换档**——关键帧数减半、分辨率上探一档（`default_image_px` × 1.5/维，封顶 `max_image_px`，第 13 章）。与上一段警告的交互：那条警告盯的是 `max_image_px` 这个**天花板**而非日常工作点——就算 `default_image_px` 调得很低，修复升档仍可能探到天花板，所以躲 Anthropic 多图硬拒要压的始终是 `max_image_px`（≤ 2000）或帧数。
 
-### 帧级标注（v1.12）：序列行内的逐成员第二层
+### 帧级标注：序列行内的逐成员第二层
 
-流模式还有一层可选的帧粒度标注（`[frame.annotate]`，仅 `segment.enabled` 时可开——机制与真实产物在第 25 章 25.6）：序列级标注完成后，annotate 对 episode 的每个成员帧**再各做一次独立标注**，每成员一次调用，产物挂 `_meta.stream.members[].annotation` 随序列行交付。提示词模板与单记录标注同构——`[任务]` + 帧 Schema 全文嵌入 + 当前成员帧（text 模态 = 该行文本；ui 模态 = 截图 + 控件树摘要），变的只是「当前记录」换成单个成员帧。三件事与序列级标注不同：
+`[frame.annotate]` 复用 annotate 算子的成员 pass，每个成员一次调用，提示词仍是 `[任务]` + 帧 Schema
+全文 + 当前成员帧。它有两个明确入口：process 流模式要求 `segment.enabled=true`，并在 episode 的序列标注
+成功后运行；sequence generation 已有冻结成员和 inherited frame class，可脱离 segment，并可在
+`annotate.enabled=false` 时直接运行。frame-only sequence 不构造序列标注 prompt，序列标注调用精确为零。
 
-- **全局指令 vs 按帧类覆盖**：`frame.annotate.instruction` 是全局帧标注指令（enabled 时必填，few-shot 走 `frame.annotate.examples`）；开了帧分类（`[frame.classify]`）后可在 `[frame.class.<帧类名>.annotate]` 里按帧类覆盖 `instruction` / `examples`，或 `enabled = false` 整类跳过标注（第 24 章 24.8）——`examples/mix` 的两个工程各演示一套：UI 主工程给 form_screen 表单屏覆盖「抽表单字段与取值」的指令、给 transition 过渡屏整类跳过，文本姊妹工程给 task_request 覆盖、给 chitchat 跳过（第 25 章 25.6）；帧分类关闭时全员用全局指令。帧级**没有** self-consistency——在 `[frame.annotate]` 里显式写 `self_consistency` 是定向配置错误。
+- **全局指令 vs 按帧类覆盖**：`frame.annotate.instruction` 是全局指令，few-shot 走 `frame.annotate.examples`。process 流模式可按 frame classification 选择 `[frame.class.<名>.annotate]`；sequence 直接按生成计划中的 inherited frame class 选择同一冻结视图，即使 `frame.classify=false` 也不会丢失按类路由。帧级没有 self-consistency。
 - **独立的帧 Schema**：`frame.annotate.schema_path` / `schema_inline` **恰一**，与 `output.schema` 互相独立——「帧对象长什么样」与「序列行长什么样」是两份契约，各自过 draft 2020-12 元校验、各自的 examples 各自启动干跑。结构保障走同一结构引擎，但**不经代码回调校验层**（第 14 章 14.5）。
-- **失败去向不是 rejects**：成员标注修复穷尽 ⇒ 该成员在 members[] 里 `status="failed"`、`annotation=null`——**不写 rejects 行、不触发 `--strict`**，episode 照常发射；账记在 `report.stream.frame_annotate.failed`，逐成员审计走 trace 的 `annotate.frame` 事件（第 16 章）。与 11.6 的记录级失败语义对照着记：序列级标注失败死的是整条记录，帧级标注失败死的只是一个状态位。
+- **失败边界取决于运行形态**：process/flat 中，成员失败只把该成员写成 `status="failed"`、`annotation=null`，不进入 rejects；sequence 中，任一应标注成员失败会拒绝当前 attempt，由 M10 重试整个 counterfactual set。失败 attempt 不提交成员标注或 dataset counters，已发生的调用证据仍保留。
+
+只做 sequence 帧标注时，当前总阶段约束仍要求 pointwise quality 开启：
+
+```toml
+[quality]
+enabled = true
+mode = "pointwise"
+threshold = 0.0
+rubric = "default:trajectory"
+
+[annotate]
+enabled = false
+
+[frame.annotate]
+enabled = true
+llm = "default"
+instruction = "只根据当前成员帧提取请求编号、可见状态与简短摘要。"
+schema_path = "schemas/frame-annotation.json"
+```
+
+不需要添加 `[segment]`。可运行工程见 `examples/sequence-generation/project-frame-only.toml`；checker 同时验证
+main 的 sequence annotation 为 null、结构引擎的 sequence resolved-at 总数为零，以及 main/stream 两个视图中
+每个 frame annotation 都通过同一帧 Schema。
 
 ## 11.3 配置参考
 

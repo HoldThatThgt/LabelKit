@@ -199,9 +199,20 @@ M6 生成服务与 M3/M4/M5/M7/M11 协作者组装成串行 slot admission。M6 
 也不在内部打开正式输出文件。
 
 配置装载后，所有入口共用同一 `compile_generation_program(config)` 和
-`compile_scenario_plan(program, seed)`。planner 冻结 delivery slot、variant、role 或位置、逻辑时间、
+`compile_scenario_plan(program)`；`run.seed` 已是 program-bound `planner_seed`。planner 冻结 delivery slot、variant、role 或位置、逻辑时间、
 工件时间、session、crossing、noise 与 replay source。LLM 不能新增或删除事件、改变计划时间、改选 actor
 权限、决定 expected violation，或在交付失败后触发重规划。
+GenerationProgram 同时冻结生成上限、sequence ClassView、frame ClassView 与帧标注 Schema。每个 sequence
+ClassView 的 Schema 在编译时物化为类覆盖 Schema，否则物化为全局用户 Schema；两种 Schema 都与源配置隔离并进入
+program digest。编译后种子、run identity、提示预算、payload 上限、下游类路由和 M11 写前终检只读 program，
+不能再读取 ResolvedConfig 的同名源字段。四类 render/evaluate request 显式携带 `program.limits`，不得从
+`GenerationServices.config.sequence_generation.limits` 取值。
+
+`validate_plan_identity` 依次校验 program 自摘要、传入 plan 对自身全部语义字段的摘要，再从 program 重建唯一
+canonical plan 并要求完整 dataclass 相等；只协调重算 digest、改变 block 插入序或提供局部可行替代计划都失败。
+六个 family 的提示词都由 common 共享构造器形成。M1 在配置态完整 PromptBundle/Schema 上叠加固定动态值与 L3
+新增正文 byte 包络；运行期每个完整动态值和 repair 新增正文恰好 32768 UTF-8 bytes 可派发，多一 byte 零 provider
+派发拒绝。patch 仍以 16384、ScenarioSeed/payload 仍以各自 65536 byte 上限单独计；任何值都不裁剪。
 
 ### 3.6.6 declared 世界执行
 
@@ -209,21 +220,13 @@ M6 生成服务与 M3/M4/M5/M7/M11 协作者组装成串行 slot admission。M6 
 `ScenarioSeedGenerator`；catalog source 按 M1 已验证的 catalog 与当前 `DeliverySlot.catalog_row_index`
 机械取行，索引只由 `ScenarioPlan` 冻结，slot 重试不换行。两者使用同一固定外壳：
 `initial_state`、`actors`、`shared_facts.public`、`shared_facts.hidden`、`style` 和
-`time_context`。seed 不能包含 pattern、variant、role order、预期违规或最终 outcome。
+`time_context`。declared actor 闭集按 role 声明序取每个 `role.actor` 与全部 `role.observers` 的首次出现并集；
+ScenarioSeed prompt、封闭 Schema、配置期预算镜像与 SemanticEvaluator 最小 seed 必须共用该唯一投影。
+seed 不能包含 pattern、variant、role order、预期违规或最终 outcome。
 
 事件循环如下：
 
-~~~mermaid
-flowchart TD
-    Seed["ScenarioSeed"] --> Baseline["按 role 逐事件 plan / execute / render"]
-    Baseline --> BaselineEval["baseline 机械与语义判定"]
-    BaselineEval --> Branch["按 variant 声明序建立分支"]
-    Branch --> Prefix{"事件位于 protected prefix?"}
-    Prefix -- "是" --> Reuse["复用 EventDraft 语义字段并重派生分支 ID / 工件时间"]
-    Prefix -- "否" --> Replan["从 divergence 起逐事件重新 plan / execute / render"]
-    Reuse --> Eval["分支独立判定"]
-    Replan --> Eval
-~~~
+图 3-5 sequence declared 世界执行与反事实分支
 
 即使用户未声明 positive variant，baseline 也必须完整生成并通过全部生成侧判定；它只是不进入主输出与下游。
 positive 直接复用 baseline branch。
@@ -271,6 +274,10 @@ frame Schema 返回完整 object；系统在 M8 验证后深拷贝 candidate，�
 除根之外的父容器必须已存在；系统不改写任意 JSON Schema。payload 或完整上下文超限使
 whole-slot attempt 失败，不能裁剪真值。
 
+面向人的 payload 必须把内部状态翻译成自然业务语言；不得机械复述终态、在无重开事实时把终态写回处理中，
+也不得颠倒 actor 的消息收发关系。时间叙述必须以真正经历等待的动作、阶段或参与方作主语；把请求、消息或
+业务实体直接写成等待主体属于不自然表达，以等待过程本身作主语不属于该缺陷。
+
 ### 3.6.7 反事实因果耦合
 
 四种 variant 的唯一结构语义如下：
@@ -287,6 +294,10 @@ protected prefix 复用 `EventDraft` 的语义字段：payload、ActorView、int
 和 state hash 的 canonical bytes 都与 baseline 相同，`event_key` 也相同；只重新派生 world branch ID、event ID
 和工件时间。复用 patch 时仍在新分支 initial state 上重放并核对 before/after hash。PatternEvaluator 通过后，
 派生出的 protected-prefix `EventTruth.role` 也必须相同。
+
+baseline CP-SAT 同时加入每个 reordered 机械交换后的全部非目标 order 与 gap 约束；不可只产生目标 reordered 时，
+计划在任何内容调用前失败。positive 缺省时，hidden baseline 从 `timestamp_start` 独立求解全部 role calendar window，
+不能借用第一个可见反事实 branch 的起点。
 
 divergence 起的 causal suffix 可以重新规划内容，但必须保留同一 ScenarioSeed、实体、目标、style 与时间上下文。
 `CouplingEvaluator` 独立比较 protected prefix；任一受保护字段变化都产生
@@ -328,10 +339,12 @@ counterfactual set 或 positive replay source。
   才通过。其 request 不得包含 EventTrace、variant/target/expected/actual violation、pattern/state evaluation
   或任何 evaluator truth。declared 的 `pattern_description` 恰为 `SequencePattern.description`；
   instruction-only 恰为 `InstructionOnlySpec.instruction`，不得摘要或拼接。SemanticEvaluation 通过后才与既有
-  机械 verdict 组装最终 EventTrace。
+  机械 verdict 组装最终 EventTrace。判定器对终态重开、终态近义复述、actor 收发关系倒置与错误等待主体执行
+  反例优先审查；缺帧、错序或长等待本身不自动失败。
 - `CouplingEvaluator` 机械比较反事实 protected prefix。
 - `CrossViewReconciler` 在提交前验证 main sequence 与 primary stream owner 双向一一对应，以及 replay/noise
-  边界与全局时间顺序。
+  边界与全局时间顺序；它保留 replay 分组并从实际 canonical rows 独立复算每个分组和全量 retained-content，
+  不信任控制器或 row carrier 提供的计数。
 
 declared 的 `EventTruth.role` 只在 `PatternEvaluator` 产出 `actual_bindings` 后机械写入，不使用 planner
 witness；缺失、重复或额外 binding 都 fail closed，PatternEvaluator 通过前不得为 declared branch 构造
@@ -340,6 +353,15 @@ EventTrace 产生 pre-downstream `ProjectedSequence(main_record, primary_stream_
 replay 或最终 output bytes。NoiseProjector 单独从 `NoiseSlot` 产生 noise row；ReplayProjector 只在 M11
 完成最终 sequence 装配后从 source `SequenceRows.primary_stream_rows` 产生 replay。世界 state 与 patch
 默认不写训练输出，只在 `trace.content = "full"` 的独立 trace 通道出现。
+
+`EventProjector` 在构造 Record 前不信任 EventTrace 的 gate carrier：它重验 StateEvaluation 的 hash/三项布尔、
+SemanticEvaluation 的六项布尔与空 reason_codes。instruction-only 禁止携带 PatternEvaluation；declared 从
+program/variant 重建精确 role word，逐事件核对 RoleSpec 的 frame class/actor、event_id 唯一、
+`actual_bindings == {event_id: role}`，并要求 actual violation 与唯一期望违规恰等。任一伪造都是
+`generation_downstream_contract`，不能靠投影视图自洽通过。
+公开 `project_trace` 与 `project_replay` 同时携带 program 和完整 plan，先验证 canonical plan，再要求 slot/layout
+与该 plan 中唯一成员完整相等并复核事件、来源与身份。DeliveryController 只在交付边界验证一次，后续调用包内
+validated helper；内容重试不得重新运行 CP-SAT。
 
 所有 v1.18 generation ID 均对 canonical JSON array
 `["labelkit:v1.18", domain, components]` 做 UTF-8 SHA-256，取小写前 32 hex；`components` 本身必须是
@@ -350,24 +372,35 @@ member `Record.id = event_id`。replay 与 noise 使用各自 domain。缺失分
 
 ### 3.6.10 noise、replay 与内存边界
 
-全部 primary slot 接受后，noise slot 按 ordinal 串行执行。`NoiseRenderer` 只接收 noise instruction、frame
-Schema、sequence/frame class 的 name/description 闭集、冻结时间与 attempt identity；不接收 seed、trace 或
-primary payload。`NoiseSemanticEvaluator` 独立要求 unrelated-to-declared-tasks、no-executable-task 与 realism
-全为 true。noise 再经过 attempt-local SimilarityFilter；通过后才 commit 签名。noise 不进 quality、annotate、
+全部 primary slot 接受后，noise slot 按 ordinal 串行执行。planner 把与 noise_events 等长的非空唯一
+`generate.noise.topics` 按 ordinal 冻结到 NoiseSlot.topic。`NoiseRenderer` 只接收 noise instruction、
+frame Schema、sequence/frame class 的 name/description 闭集、NoiseSlot.topic、冻结时间与 attempt identity；
+不接收 seed、trace、primary payload 或既有 noise payload。renderer 必须把计划话题作为唯一话题，
+不得改换、混合或泛化；它在内部构造 attempt index + 2 个符合该话题的自然表达角度，
+再选择下标 attempt index 对应的角度。不同 attempt 必须使用明显不同措辞，不得输出候选表或
+内部标识；Schema examples 只描述形状，禁止复制或改写其内容。
+`NoiseSemanticEvaluator` 独立要求 unrelated-to-declared-tasks、no-executable-task、realism 与
+matches-planned-topic 全为 true；候选不忠实计划话题时使用 `planned_noise_topic_mismatch`。
+noise 再经过 attempt-local SimilarityFilter；
+通过后才 commit 签名。noise 不进 quality、annotate、
 verify 或 main dedup group。
 
 replay 是完整 positive sequence 的原样重发，不是单帧重复。planner 按 declaration order 与 scenario index
 冻结 source；每个 replay 独占尾部 session，使用新 replay sequence/event ID 与新 artifact timestamp，但 payload、
 frame class、actual role 和顺序逐位同源。source 不足在启动期失败，source delivery 失败时不能改选。
 
-下游接受后，M11 先以最终 `PipelineItem` 与 `ProjectedSequence` 零 I/O 装配 `SequenceRows`，
+下游接受后，M11 先通过
+`SequenceAssemblyRequest(program, schema_engine, item, projection, batch_no)` 零 I/O 装配 `SequenceRows`，
+并以 program-bound sequence/frame annotation Schema 终检实际待交付对象；不得回读 source ResolvedConfig。
+终检失败归 `sequence_projection_mismatch` 并重试整个 source slot，零 dedup、dataset、row 或 replay commit。
 然后 ReplayProjector 只从该最终 source 行派生全部已规划 `ReplayRows`。两者分别以同一
-`canonical_delivery_row` 计算自身行的 UTF-8 byte 数加一个 JSONL 换行 byte。dedup `group_commit`
-前的 prospective `retained_content_bytes` 等于既有已接受累计、当前 set 所有 `SequenceRows`
-与本次 `ReplayRows` 之和，上限为 536870912。超限归 `sequence_memory_budget` 并重试整个
-source slot，零 dedup 或 dataset commit。接受后 payload 在 main/stream/replay 间共享冻结引用，不深拷贝；
-立即释放 `ProjectedSequence`、`PipelineItem`、`AttemptTransaction`、state 和 LLM 中间对象，只保留最终
-main/stream rows、dedup features 与计数。
+`canonical_delivery_row` 计算自身行的 UTF-8 byte 数加一个 JSONL 换行 byte。dedup `group_commit` 前的
+prospective `retained_content_bytes` 等于既有已接受累计、当前 set 所有 `SequenceRows` 与本次按
+ReplayLayout 分组的 `ReplayRows` 之和，上限为 536870912。CrossView 再从 sequence main/primary、noise 与
+replay 实际 canonical rows 独立复算该总费用；超限归 `sequence_memory_budget` 并重试整个 source slot，零 dedup
+或 dataset commit。接受后 payload 在 main/stream/replay 间共享冻结引用，不深拷贝；立即释放
+`ProjectedSequence`、`PipelineItem`、`AttemptTransaction`、state 和 LLM 中间对象，只保留最终 main/stream
+rows、dedup features 与计数。
 
 `record_units = primary_sequences + primary_events + noise_events + replay_events` 与
 `stream_rows = primary_events + noise_events + replay_events` 各自不得超过 500000。单 block 最多 4096

@@ -231,11 +231,9 @@ async def test_auth_fatal_trips_breaker_and_queued_calls_fail_fast(tmp_path):
     from tests.common.observability.test_obslog import make_cfg as obslog_cfg
 
     prof = _profile(api_key_env="LABELKIT_BAD_KEY_TEST", max_concurrency=1)
-    os.environ["LABELKIT_BAD_KEY_TEST"] = "definitely-not-a-key"
-    prof = prof.__class__(**{**prof.__dict__, "api_key": "definitely-not-a-key"})
     sink = MetricsSink(obslog_cfg(tmp_path), "itest", EventLog(obslog_cfg(tmp_path).trace, "itest"))
     client = LLMClient({"default": prof}, {},
-                        _creds(default=os.environ[ZAI_KEY_ENV]), sink)
+                        _creds(default="definitely-not-a-key"), sink)
     prompt = PromptBundle(messages=(
         Message(role="user", parts=(Part(kind="text", text="hi", image=None),)),))
 

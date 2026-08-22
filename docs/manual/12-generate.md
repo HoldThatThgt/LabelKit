@@ -1,255 +1,156 @@
-# 第 12 章　生成算子 generate：从种子到新数据
+# 第 12 章　生成算子 generate：独立样本与完整序列
 
-> generate 是唯一会**增加**记录数的算子，也是唯一默认关闭的治理路径外算子。
-> 本章讲两种工作形态（扩充既有数据 / 从零合成）、多样性的三个来源，
-> 以及如何用报告里的桶统计判断"生成的货够不够新"。
+> `generate.form` 只有 `flat` 与 `sequence`。两者是不同的产品形态，不共享一套可空参数。
 
-## 12.1 直觉：仿制车间与它的纪律
+## 12.1 先选生成形式
 
-把 generate 想成流水线旁边的**仿制车间**：从过了质检的好货里抽几件当样品，让 LLM 照着「风格与题材」仿制新货。纪律有三条，都是为了防止仿品污染货架：
-
-1. **仿品不直接上架**——相似度过滤分两道：第一道**内置在 generate 算子里**、无条件执行（新样本与种子、与同批样本互查，复用 `[dedup]` 的 MinHash 参数——这正是 Self-Instruct 的相似度过滤，`survived_dedup` 统计的就是它的战果）；第二道是生成子批**回流**流水线从 dedup 起重新走一遍（与全部原始记录及先前生成的样本判重）→ 打分 → 标注 → 校验。仿得太像样品的，第一道就被扣下。
-2. **只仿一轮**——生成子批不会再触发生成（不递归），杜绝「仿品的仿品」的近亲繁殖。
-3. **件件有出处**——每条合成记录带 `generated_from`（种子记录 id 列表）和 `generator`（{"llm", "style"}）双溯源，主输出里 `generator ≠ null` 就是合成货的统一标识。
-
-**仅文本模态可用**（LLM 造不出配套截图），这是启动时的硬约束。v1.8 又加一条：generate 与流模式（`segment.enabled = true`，第 25 章）**互斥**——采集来的流要分段，合成的流不需要。这条互斥在 v1.13 依然字面成立：新增的时间流生成（`[generate.stream]`，第 27 章）走的是**直装**路线——序列在生成期就装配好了，直接进 dedup 之后的链，segment / stitch / extract 全程不参与。
-
-## 12.2 process 模式：给既有数据扩容
-
-在常规流水线上开 `generate.enabled = true`（要求 quality 也开着），每批的流程：
-
-1. **选种子**：批内 `active` 且聚合分 ≥ `seed_min_score` 的记录。`seed_min_score` 不填时自动取 `quality.threshold`；连 threshold 也没有就取批内中位数——**种子必须是好货**，这是仿制质量的根。
-2. **算调用数**：`⌈种子数 × num_per_record / num_per_call⌉`。默认 num_per_record=2（每种子期望产 2 条）、num_per_call=4（每次调用要 4 条）。
-3. **每次调用**：随机不放回抽 `seeds_per_call`（默认 3）条种子作为示例（v1.11 起这是**上限**：本次调用的目标 profile 声明了 `context_window` 时，按抽样序**从尾部丢弃**种子直到装下——确定性收缩、至少留 1 条；连 1 条都装不下按 `context_overflow` 处置），system = `generate.instruction`（+ 风格模板，见 12.4），要求输出 `{"samples": ["...", ...]}` 恰好 num_per_call 条，经结构引擎校验。
-4. **构造新记录**：每条样本文本包成 `{text_field: 样本}` 的记录（id 规则与 ingest 相同），回流。
-
-调用失败（修复耗尽/重试耗尽）只损失**那一次调用**的样本——种子不受影响，也不产生 failed 记录；该次调用计入报告桶统计（calls 计入、produced 为 0）。
-
-**按类种子池（v1.7）**：开启分类算子后，选种与预算按类独立——每类有自己的门槛链（全局 `seed_min_score` → 缺省取该类有效的 `quality.threshold` → 再缺省取该类种子池的聚合分中位数）与调用预算 `⌈该类种子数 × 该类有效 num_per_record / num_per_call⌉`；instruction / styles / num_per_record / temperature 均可在 `[class.X.generate]` 按类覆盖。生成样本**继承种子的类**（`_meta.classification.source = "inherited"`），回流时不再消耗分类调用；报告的桶统计（12.5）key 相应升为三段 `类×模型×风格`（仅启用分类时）。注意 `generate_only` 模式不支持按类配比——它走全局指令的扁平路径，产物由链上的 classify 正常分类。详见第 24 章。
-
-## 12.3 generate_only 模式：无中生有
-
-`run.mode = "generate_only"` 时没有输入数据（`run.input` 必须不设），generate 成为链路起点，产出按 `batch_size` 切批走 dedup → (quality) → (annotate) → (verify) → 输出。两种形态二选一：
-
-**① 种子池形态（Self-Instruct 式）**——你手写几条种子例句：
-
-```toml
-[run]
-mode = "generate_only"
-output = "./out/generated.jsonl"
-modality = "text"
-
-[generate]
-enabled = true
-instruction = """生成中文输入法用户可能向 AI 助手提出的一句话请求。要求贴近真实
-使用场景、类型多样（写作协助、翻译、问答、闲聊等），长度 10–60 字。"""
-seed_examples = [
-  "帮我写一条请假条，明天上午要去医院复查",
-  "把这句话翻译成英文：项目进度符合预期",
-  "解释一下什么是复利，举个例子",
-]
-num_per_record = 2      # 调用数 = ⌈3 × 2 / 4⌉ = 2 → 期望产出 8 条
+```mermaid
+flowchart LR
+    A[需要合成数据] --> B{输出单位}
+    B -->|独立样本| C[form = flat]
+    B -->|有角色、状态和时序的完整序列| D[form = sequence]
+    C --> E[种子池或纯指令]
+    D --> F[declared 或 instruction_only]
 ```
 
-种子池就是「样品间」：调用数按 `⌈len(seed_examples) × num_per_record / num_per_call⌉` 算，每次调用从池里抽**至多** `seeds_per_call` 条当示例（12.2 的预算尾丢收缩同样适用）。Self-Instruct 原文用 175 条人工种子自举出了整个数据集——种子的**多样性**直接决定产出的多样性，写种子时刻意覆盖你想要的类型光谱。
+`flat` 生成一条条相互独立的文本记录。`sequence` 生成完整事件序列，同时交付序列级 main rows 和可重放的
+event stream。不要用 sequence 模拟独立样本，也不要用 flat 拼接需要状态一致性的对话。
 
-**② 无种子条件化形态（Persona Hub / Cosmopedia 式）**——一条示例都不给，纯靠指令 × 风格驱动：
+两种形式都仅支持文本模态。`process` 模式中的 flat 生成以过质量门的记录为种子；`generate_only` 不读取输入。
 
-```toml
-[generate]
-enabled = true
-instruction = """……"""
-standalone_count = 500        # 目标产出条数（与 seed_examples 互斥）
-# 调用数 = ⌈500 / num_per_call⌉ = 125
-```
+## 12.2 flat：从种子或纯指令生成独立样本
 
-提示词不含示例段，多样性完全来自 instruction 的开放度和 styles 的分桶（12.4）。适合「我要的类型可以被描述清楚，但没有现成例句」的场景。
-
-`generate.stream` 的 v1.17 quota 是成功交付目标，不再是 旧 `sequences` 尝试数（v1.17 仅作 CONFIG_ERROR 负例）；finite schedule 是硬边界。`day`、`week`、`schedule` quota 可同时约束同一 occurrence，`crossed_sessions` 推导 session 数，内容失败只重试固定 slot。旧键 `sessions`、`ts_start`、`rules`、`windows`、旧 `[class.*.generate].sequences` 在 v1.17 定向报错，不提供兼容别名。
-
-`generate_only` 还有**第三形态**——时间流生成（v1.13），见下。
-
-### 时间流形态：产出的不是一条文本，是一条序列
-
-上面两种形态产出的都是**互不相干的独立文本**。要的样本单位若是「一段活动」——多轮请求按时间先后连成一条会话、几条会话交织成一条流——就换 `[generate.stream]`：
+有种子时，生成样本先经过内置相似度过滤，再从 dedup 起回流下游流水线；生成子批不会再次触发 generate。
+每条合成记录通过 `_meta.source.generated_from` 与 `_meta.source.generator` 保留来源。
 
 ```toml
 [run]
 mode = "generate_only"
 modality = "text"
 
-[stream]                      # 生成侧的铺设契约（复用摄取侧词汇，故工件可重放）
-order_by = "meta:ts"
-gap_s = 3600
-session_max_len = 12
-session_max_span_s = 3000
-
 [generate]
 enabled = true
-temperature = 0.9
-
-[generate.stream]
-enabled = true
-crossed_sessions = 1
-noise_ratio = 0.1
-max_attempts_per_slot = 3
-duplicates = 1
-frame_gap_s = [5, 60]
-
-[generate.stream.schedule]
-start = "2026-01-05T08:00:00+08:00"
-end = "2026-01-06T23:00:00+08:00"
-
-[[generate.stream.quotas]]
-name = "six_sequences"
-period = "schedule"
-counts = { ticket_booking = 3, smart_home = 3 }
-
-[[generate.stream.noise]]
-frame_class = "chatter"
-weight = 1
-
-[[generate.stream.frame_rules]]
-name = "request_chains_to_ack"
-template = "chain_response"
-source = "task_request"
-target = "acknowledgement"
-time_s = [1200, 2400]
-correlation = { source_field = "subject_id", target_field = "subject_id" }
-
-[[generate.stream.frame_windows]]
-name = "ticket_request_work_hours"
-frame_class = "task_request"
-of_day = [["08:00", "11:00"], ["14:00", "17:00"]]
-of_week = ["mon", "tue", "wed", "thu", "fri"]
-
-[class.ticket_booking.generate]
-instruction = "……"
-len_range = [4, 5]
+form = "flat"
+llms = ["default"]
+seed_examples = ["把会议改到周五下午。"]
+num_per_record = 4
+num_per_call = 4
 ```
 
-与本章前两种形态的分工，一句话各表：
+无种子时使用 `standalone_count` 和明确的 `instruction`：
 
-| | 平面生成（12.3 两形态） | 时间流形态（v1.13） |
+```toml
+[generate]
+enabled = true
+form = "flat"
+llms = ["default"]
+standalone_count = 100
+instruction = "生成自然、具体、彼此不同的日程安排请求。"
+```
+
+`styles`、多 profile mixture、temperature 和 `sample_validator` 都属于 flat。报告中的
+`generate.buckets` 用来观察各“类别 × profile × style”桶的调用、产出、验证拒绝与去重存活。
+
+## 12.3 sequence：生成受约束的事件序列
+
+sequence 形式要求：
+
+- `run.mode = "generate_only"`、`run.modality = "text"`；
+- `dedup.enabled = true` 且 `dedup.scope = "global"`；
+- `classify.enabled = false`、`frame.classify.enabled = false`；
+- `output.meta_mode = "inline"`、`output.rejects = "none"`；
+- `run.partial_delivery = false`，且不能使用 `--limit`；
+- semantic 与 evaluation 使用两个不同的 profile 名，两者都声明正数 `context_window`。
+
+```toml
+[generate]
+enabled = true
+form = "sequence"
+mode = "declared"
+semantic_llm = "default"
+evaluation_llm = "judge"
+max_slot_attempts = 4
+state_validator = "hooks.py:validate_state"
+```
+
+sequence 的详细配置和运行方法见第 27 章。这里先记住它与 flat 的边界：
+
+- flat 的 `seed_examples`、`standalone_count`、`num_per_record`、`seeds_per_call`、`num_per_call`
+  不得写进 sequence；
+- sequence 的 pattern、counterfactual set、timeline、noise 和 instruction-only slot 不得写进 flat；
+- 两边混写会在配置期失败，不会猜测用户意图。
+
+## 12.4 declared：一个世界，多条可比较分支
+
+declared 模式先声明 sequence class、frame class 和命名 pattern。pattern 的每个 role 指定 actor、frame class、
+读写/发布权限、状态指令、payload binding 与相邻时间间隔。
+
+一个 counterfactual set 共享同一 ScenarioSeed。baseline 先执行，再由确定性结构变换得到声明变体：
+
+| variant kind | 改变什么 | 唯一预期违规 |
 |---|---|---|
-| 一次调用产出 | `num_per_call` 条独立文本 | 默认路径是一条蓝图；启用规则/窗口时是固定帧类词对应的 brief。另一类调用实现这条序列的全部帧内容；delivery attempt 按 slot 计，不能把 brief/realize 两个调用误当成两次 slot attempt |
-| 配额 | `num_per_record` / `standalone_count` | 按 `[[generate.stream.quotas]]` 的 target × `len_range`（固定 slot 有界重试，精确交付） |
-| 结构 | 无 | 无规则/窗口时沿用机械交织；约束面在场时由联合 planner 在 LLM 前共同冻结 word、occurrence witness、session、crossing、timestamp 与 noise 槽 |
-| 产物 | 主输出 | 主输出（一行 = 一条序列）**+ 时间流工件**（一行 = 一帧，可当输入重放） |
-| 本章键的效力 | 全部生效 | `llms`/`mixture`/`weights`/`styles`/`temperature`/`sample_validator` 生效（作用面见第 27 章 27.4）；`num_per_call` 只管噪音批装箱；`seed_examples`/`standalone_count`/`num_per_record`/`seeds_per_call` **显式书写即配置错误** |
+| `positive` | 不改变 baseline | 空集 |
+| `missing` | 删除目标 role | `missing_role` |
+| `reordered` | 交换相邻 role | `reordered` |
+| `interval_exceeded` | 后移目标 gap 的后缀 | `gap_above_max` |
 
-其余照旧：序列级的相似度过滤（判重文本 = 成员文本按序拼接）照常内置执行、`survived_dedup` 照常记桶，合成序列照常走 dedup → classify（标签继承、零调用）→ quality → annotate → verify 全套治理，守恒恒等式仍是上面那条退化形（成员帧只活在工件里、不构造信封）。完整配置、两份产物的读法、工件重放与成本账见**第 27 章**。
+整组变体经过状态执行、payload 渲染、独立判定、下游处理、双视图校验和 retained-bytes 预算后才提交。
+其中任何一步拒绝都会回滚整组，并在同一个 delivery slot 上重试；不会只补某一条变体。
 
-`time_s` 不是在默认 `frame_gap_s` 上再取交集。只有被已选正规则 witness 覆盖的相邻 owner 边改由显式区间控制；它仍必须不超过 `stream.gap_s`，保证另一条 crossing 序列作废后，单独 replay 也不会把幸存序列切断。未覆盖相邻边继续用闭区间 `frame_gap_s`。窗口分支均须在同一自然日，序列和 session 本身可以跨日。
+## 12.5 instruction-only：自由规划，但仍要完整证明
 
-## 12.4 多样性的三个旋钮
-
-单一模型反复自生成会让产出分布收窄、长尾消失（model collapse，Nature 2024）。LabelKit 给了三个对抗手段：
-
-**① 温度**：`generate.temperature` 默认 0.9（覆盖 profile 的 0）——生成本来就要撒开。
-
-**② 多模型混合**：`llms = ["default", "judge", ...]`，每次调用按 `mixture` 选一个：
-
-- `"round_robin"`（默认）：按调用序轮转——严格均匀；
-- `"weighted"`：按 `weights`（正数数组，长度须等于 llms）加权随机抽。
-
-抽取由 `run.seed` 播种、按调用序号预先抽定，与并发调度顺序无关——同 seed 重跑，每次调用用哪个模型完全一致。
-
-**③ 风格模板**：`[[generate.styles]]` 子表，每次调用均匀抽一个，其 prompt 以 `[风格要求] …` 追加在 instruction 之后：
-
-```toml
-[[generate.styles]]
-name = "concise"
-prompt = "请求应当简短直接，一句话说清诉求。"
-
-[[generate.styles]]
-name = "detailed"
-prompt = "请求应包含具体的背景与约束条件（时间、对象、格式要求等）。"
-```
-
-这是最便宜也最可控的多样性来源：风格即分桶，桶按你的意图切。
-
-## 12.5 用桶统计验收多样性
-
-开生成后，报告多一个 `generate.buckets` 块——每个「模型×风格」组合一行账：
-
-```json
-"generate": {
-  "buckets": {
-    "default×concise":  {"calls": 5, "produced": 20, "survived_dedup": 19},
-    "default×detailed": {"calls": 5, "produced": 20, "survived_dedup": 11}
-  }
-}
-```
-
-读法：`survived_dedup / produced` 是**新颖率**。上例 detailed 桶只有 55% 的样本活过去重——这个桶在产重复货。（v1.13 时间流形态下 `produced` 数的是**序列**条数、`calls` 含蓝图与实现两类调用；那里另有一个 key 只有两段的**噪音桶**——噪音不属于任何序列类，也不参与序列级相似度过滤，其 `survived_dedup` 恒为 0，见第 27 章 27.4。）处置顺序：
-
-1. 改该 style 的 prompt，让它约束出更具体的差异化方向；
-2. 提高温度或增加模型（12.4）；
-3. 降低 `num_per_call`（一次要 8 条比要 4 条更容易在调用内部自我重复）；
-4. **不要**放松 dedup 阈值——那是掩耳盗铃。
-
-### 样本级代码校验：sample_validator
-
-想用**代码**给样本把关（长度窗口、语种检测、正则黑名单、敏感词……），注册一个回调：
+instruction-only 是独立模式，不是 declared 失败后的 fallback：
 
 ```toml
 [generate]
-sample_validator = "my_validators:check_sample"
+enabled = true
+form = "sequence"
+mode = "instruction_only"
+semantic_llm = "default"
+evaluation_llm = "judge"
+
+[[generate.instruction_only]]
+name = "open_booking"
+sequence_class = "ticket_booking"
+count = 1
+len_range = [3, 4]
+instruction = "生成一次完整、自然、状态连续的订票交互。"
+state_schema_path = "schemas/state.json"
 ```
 
-```python
-def check_sample(text: str) -> list[str]:
-    """返回违规描述列表，空 = 通过。"""
-    return [] if 10 <= len(text) <= 60 else ["长度须在 10–60 字之间"]
+模型在已声明 frame class 的闭集中选择每个事件的 frame class 与 actor。它没有 pattern、variant、
+expected violation 或 declared role 权限；每条 sequence 仍要通过状态后置验证、语义判定、下游处理和原子提交。
+
+## 12.6 世界状态与隐藏信息
+
+ScenarioSeed 包含 `initial_state`、actors、public/hidden shared facts、style 与 time context。declared 模式下，
+role 只能读取 `read_roots`、修改 `write_roots`，并通过 `publish_roots` 把事实发布给 observers。
+JSON Patch 只允许 `test`、`add`、`remove`、`replace`；状态和 payload 都必须通过完整 Schema。
+
+隐藏事实只供独立 evaluator 检查泄漏。它不会进入 EventPlanner、FrameRenderer、训练 payload、report、manifest
+或错误文本。用户 hook 接收不可变副本，不负责执行 patch，也不能成为第二份状态真值。
+
+## 12.7 精确交付与失败语义
+
+sequence dry-run 只打印同源计划和调用估算，不读取 API key value，也不创建或替换 main、stream、report、
+manifest 或 failed report。正式 run 的成功路径是：
+
+```text
+compile plan -> whole-slot attempts -> final downstream rows -> replay projection
+             -> main/stream/report fsync + rename -> manifest last
 ```
 
-语义是**过滤器**（与相似度过滤同性质）：违规样本直接剔除，不重试、不产生 failed 记录，计入桶统计的 `rejected_by_validator` 字段——某桶该值偏高，说明那个模型×风格组合在产不合规的货。回调在相似度过滤**之前**执行（先跑便宜的代码，再算 MinHash）；回调抛异常时该样本按违规剔除并在 stderr 告警一次，绝不拖垮运行。标注侧有个更强的孪生钩子 `output.validator`（violations 回喂修复环让模型改，见 14.5）。
+尝试耗尽或 commit 前的终局错误不会替换已有成功工件，并写独立的 `*.failed.report.json`。
+commit-I/O 失败可能留下固定路径混代，但旧 manifest 不变；消费者必须通过 manifest 中的 SHA-256 拒绝混代集合。
 
-另一个要监控的比例是主输出里的**合成占比**（`jq 'select(._meta.source.generator != null)' | wc -l` 除以总行数）。合成数据占比过高有 model collapse 风险——下游训练时建议控制真实:合成比例，靠 `generator` 字段随时可分拣。
+## 12.8 验收生成质量
 
-## 12.6 配置参考
+flat 先看 `generate.buckets` 的 produced、validator rejection 与 survived-dedup。sequence 则先看：
 
-```toml
-[generate]
-enabled = false               # 默认关
-llms = ["default"]            # profile 数组；每个都须存在于 [llm.*]
-mixture = "round_robin"       # "round_robin" | "weighted"
-weights = []                  # weighted 时必填，正数、长度=len(llms)
-instruction = """……"""        # enabled 时必填
-num_per_record = 2            # 每种子期望产出条数
-seeds_per_call = 3            # 每次调用抽几条种子当示例（v1.11：声明 context_window 后为上限，
-                              # 超预算按抽样序从尾部确定性丢弃，min 1）
-num_per_call = 4              # 每次调用要求产出几条
-seed_min_score = 0.5          # 种子门槛；缺省=quality.threshold，再缺省=批中位数
-temperature = 0.9             # 生成温度（覆盖 profile）
-sample_validator = ""         # 可选：样本级代码校验回调 "module:function"（见下）
-seed_examples = []            # generate_only 种子池形态专用（process 模式不得设置）
-standalone_count = 500        # generate_only 无种子形态专用（与 seed_examples 互斥）
-# 时间流形态的配额唯一写在 [[generate.stream.quotas]]；旧 sequences 键仅用于 CONFIG_ERROR 负例
-[[generate.stream.quotas]]
-name = "six_sequences"
-period = "schedule"
-counts = { ticket_booking = 3, smart_home = 3 }
-# len_range 在每个参与 sequence class 的 [class.<name>.generate] 中声明
+- `report.generate.sequence` 的 planned/delivered sets 与 sequences 是否完全相等；
+- `by_pattern` 每个 variant 是否 planned = delivered；
+- `rejected_attempts` 是否解释了额外尝试；
+- main、stream、report 是否与最后提交的 manifest 摘要一致；
+- replay 是否由最终 source rows 派生，并在 process ingest 时通过 ID 与 provenance 重算。
 
-# 仅平面生成形态的参数；时间流的 quota、schedule、frame_rules/frame_windows 与 sequence_rules 见上文
-
-```
-
-## 12.7 instruction 写作要点
-
-生成指令与标注指令的心法不同：标注要**收**（判据明确、边界清晰），生成要**放**（框定题材与体裁，把具体内容留给模型+风格+种子）：
-
-```toml
-# 太收：模型只会产出请假条的一百种变体
-instruction = "生成用户请AI写请假条的请求。"
-
-# 恰当：框定"是什么"（输入法一句话请求）+ 质量要求（贴近真实、长度），
-#       类型光谱交给种子池和 styles 去撑
-instruction = """生成中文输入法用户可能向 AI 助手提出的一句话请求。
-要求贴近真实使用场景、口语自然、诉求明确，长度 10–60 字。
-只借鉴示例的风格与题材范围，不得复述示例内容。"""
-```
-
-最后一句「不得复述示例内容」值得抄——它显著降低生成样本贴着种子抄的概率（抄了也会被 dedup 扣下，但那是白花钱的调用）。
+真实端点可能重试或触发 Schema repair，因此逻辑 family 调用数、provider 物理请求数与 token 用量要分开读。

@@ -109,6 +109,11 @@ _ESTIMATE_CALL_KEYS = ("generate_calls", "segment_calls", "stitch_calls",
                        "classify_calls", "frame_classify_calls",
                        "extract_calls", "quality_calls", "annotate_calls",
                        "frame_annotate_calls", "verify_calls")
+_SEQUENCE_CALL_KEYS = (
+    "scenario_seed_calls", "baseline_event_plan_calls", "variant_event_plan_calls",
+    "frame_render_calls", "semantic_evaluation_calls", "noise_render_calls",
+    "noise_evaluation_calls",
+)
 
 _BAR_CELLS = 24                    # 批进度条宽度（§3.2 样板）
 _NARROW_COLS = 60                  # < 60 列 → 单行退化（§3.1）
@@ -1372,6 +1377,9 @@ class ConsoleRenderer:
         t1.add_row("mode", cfg.run.mode)
         t1.add_row("estimated_records", str(est.get("records", 0)))
         t1.add_row("batches", str(est.get("batches", 0)))
+        sequence = est.get("sequence")
+        if isinstance(sequence, Mapping):
+            self._add_sequence_estimate_rows(t1, sequence)
 
         t2 = self._Table()
         t2.add_column("stage")
@@ -1387,7 +1395,39 @@ class ConsoleRenderer:
             "estimated LLM calls (excludes retries and repair calls)",
             style="bold"))
         self._console.print(t2)
+        if isinstance(sequence, Mapping):
+            self._console.print(self._Text("sequence generation calls", style="bold"))
+            self._console.print(self._sequence_calls_table(sequence))
         self._print_estimate_notes(cfg)
+
+    @staticmethod
+    def _add_sequence_estimate_rows(table, sequence: Mapping) -> None:
+        """把 sequence 精确算术加入 dry-run 主表。
+
+        @param table rich 估算主表。
+        @param sequence estimate.sequence 块。
+        @return None。
+        """
+        for key in (
+            "planned_sets", "planned_sequences", "primary_events", "noise_events",
+            "replay_sequences", "replay_events", "stream_rows",
+            "successful_attempt_lower_bound", "max_slot_attempts_upper_bound",
+        ):
+            table.add_row(key, str(sequence.get(key, 0)))
+
+    def _sequence_calls_table(self, sequence: Mapping) -> Any:
+        """构造七类 sequence generation 调用表。
+
+        @param sequence estimate.sequence 块。
+        @return rich Table。
+        """
+        table = self._Table()
+        table.add_column("family")
+        table.add_column("calls", justify="right")
+        calls = sequence.get("sequence_calls", {})
+        for key in _SEQUENCE_CALL_KEYS:
+            table.add_row(key, str(calls.get(key, 0)))
+        return table
 
     def _print_estimate_notes(self, cfg: "ResolvedConfig") -> None:
         """打印 dry-run 估算的两条下界注记与收尾行（与 plain 路径同文）。

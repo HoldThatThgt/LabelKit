@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "request": {
+      "type": "object",
+      "properties": {
+        "status": {"const": "new"},
+        "acknowledged": {"const": false}
+      },
+      "required": ["status", "acknowledged"]
+    },
+    "ticket": {
+      "type": "object",
+      "properties": {"status": {"const": "none"}},
+      "required": ["status"]
+    }
+  },
+  "required": ["request", "ticket"]
+}

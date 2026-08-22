@@ -1,0 +1,10 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "examples": [{"utterance": "今天天气不错。"}],
+  "properties": {
+    "utterance": {"type": "string", "minLength": 2, "maxLength": 80}
+  },
+  "required": ["utterance"],
+  "additionalProperties": false
+}

@@ -1,0 +1,249 @@
+schema_version = 1
+
+[run]
+output = "./out/sequence-labels.jsonl"
+modality = "text"
+mode = "generate_only"
+batch_size = 8
+seed = 20260822
+
+[dedup]
+enabled = true
+scope = "global"
+minhash_threshold = 0.85
+minhash_num_perm = 128
+ngram = 5
+
+[classify]
+enabled = false
+
+[frame.classify]
+enabled = false
+
+[quality]
+enabled = false
+
+[annotate]
+enabled = true
+llm = "default"
+instruction = """
+阅读完整订票序列，标注统一的业务意图、最终结果、请求编号、票号与一句简洁摘要。
+缺帧、错序或超时是训练目标，不要把它们修写成正常流程；只按序列实际发生的状态标注。
+"""
+
+[verify]
+enabled = false
+
+[generate]
+enabled = true
+form = "sequence"
+mode = "declared"
+semantic_llm = "default"
+evaluation_llm = "judge"
+max_slot_attempts = 8
+state_validator = "hooks.py:validate_state"
+
+[output]
+schema_path = "schemas/annotation.json"
+validator = "hooks.py:validate_output"
+meta_mode = "inline"
+rejects = "none"
+
+[class.ticket_booking]
+description = "一次铁路订票请求从提出、受理到出票或失败结果的完整交互"
+
+[class.ticket_booking.generate]
+instruction = """
+围绕 catalog 中同一个请求、路线、日期与乘客生成自然中文交互。每一步必须以当前 actor 当时可见的信息为准；
+若确认发生在受理之前，不得提前出票；若受理到确认的等待超过 SLA，必须过期且不得出票。
+若确认发生在受理之前，确认事件只说明尚未获得受理确认、因此本次未出票；随后 acknowledgement 是迟到的
+收件确认。该确认必须分成两个清楚分句：系统已收到用户请求；系统发出的补充确认不影响先前通知。不得把
+“补充确认”写成系统收到的对象，不得再次描述能否出票，不得重新进入处理中。
+面向用户的 utterance 必须使用自然业务语言，
+必须自然带上同一 request ID；不得照抄 state 枚举、SLA 等内部术语，也不得用两个同义短语机械复述同一个结果。
+"""
+state_schema_path = "schemas/state.json"
+initial_state_source = "catalog"
+initial_state_catalog_path = "catalogs/ticket-booking.jsonl"
+
+[class.ticket_booking.annotate]
+instruction = """
+标注这次订票交互的 intent、outcome、request_id、ticket_id 与 summary。
+outcome 只能是 ticketed、not_ticketed 或 expired；未出票时 ticket_id 使用空字符串。
+"""
+schema_path = "schemas/annotation.json"
+
+[frame.class.task_request]
+description = "请求者提出一条尚未受理的订票需求"
+
+[frame.class.task_request.generate]
+instruction = """
+写成请求者自然提出订票需求的一句话，包含已知路线或日期。不得声称系统已经受理或出票。
+"""
+schema_path = "schemas/frame-request.json"
+
+[frame.class.acknowledgement]
+description = "系统确认已接收请求，但尚未给出出票结果"
+
+[frame.class.acknowledgement.generate]
+instruction = """
+status 为 acknowledged 时，自然确认收到同一请求并说明正在处理；status 为 blocked 时，写成迟到的补充收件回执，
+用两个分句表达，并自然带上同一 request ID：“已收到您的 R-EXAMPLE 订票请求；此次补充确认不影响先前通知。”
+这只是主宾关系示例，不是固定句式。补充确认是系统正在发出的消息，
+不得写成系统收到的对象。不得再次描述能否出票，不得声称正在、继续或重新处理，
+不得输出 blocked、SLA 等内部术语。
+"""
+schema_path = "schemas/frame-acknowledgement.json"
+
+[frame.class.confirmation]
+description = "系统根据当前状态给出出票、未出票或超时结果"
+
+[frame.class.confirmation.generate]
+instruction = """
+写成系统对同一请求给出最终结果的一句话。必须忠实表达状态中的 ticket_id、status 与是否出票，
+不得在未受理或已超时时虚构成功。status 为 blocked 时，用自然语言只说明“尚未获得受理确认，因此本次未出票”；
+status 为 expired 时用“从受理到确认的等待已超过可用时间，因此本次请求失效，未能出票”这类自然表达；
+不得把请求本身写成等待主体。不得输出 blocked、late_acknowledged、SLA、阻塞等
+内部术语，不得把“无法出票”和“未出票”机械重复为两个结果；utterance 中“出票”最多出现一次。
+"""
+schema_path = "schemas/frame-confirmation.json"
+
+[frame.class.noise]
+description = "与订票任务无关且不包含可执行诉求的自然闲聊"
+
+[frame.class.noise.generate]
+instruction = "生成一句与任何订票或设备任务无关、没有可执行诉求的自然闲聊。"
+schema_path = "schemas/frame-noise.json"
+
+[generate.pattern.booking_success]
+sequence_class = "ticket_booking"
+description = "请求者提出订票需求，系统确认受理，并在允许时间内给出与当前状态一致的结果。"
+order = ["request", "acknowledge", "confirm"]
+max_span_s = 2400
+
+[[generate.pattern.booking_success.roles]]
+name = "request"
+frame_class = "task_request"
+actor = "requester"
+read_roots = ["/public", "/goal", "/request", "/actors/requester"]
+write_roots = ["/request/status"]
+publish_roots = ["/request/id", "/request/status", "/goal/origin", "/goal/destination", "/goal/travel_date"]
+observers = ["requester", "system"]
+state_instruction = """
+只先 test `/request/status` 为 `new`，再 replace `/request/status` 为 `pending`。
+不得修改任何其他 path，不得改变 request.id、goal、actor knowledge、audit 或 hidden_sentinel。
+"""
+pre_state_schema_path = "schemas/pre-request.json"
+payload_bindings = [
+  { payload_path = "/request_id", state_phase = "after", state_path = "/request/id" },
+  { payload_path = "/status", state_phase = "after", state_path = "/request/status" }
+]
+calendar_window = "service_hours"
+
+[[generate.pattern.booking_success.roles]]
+name = "acknowledge"
+frame_class = "acknowledgement"
+actor = "system"
+read_roots = ["/request", "/goal", "/actors/system"]
+write_roots = ["/request/acknowledged", "/request/status"]
+publish_roots = ["/request/id", "/request/status", "/request/acknowledged"]
+observers = ["requester", "system"]
+state_instruction = """
+只先 test 当前 `/request/status`。若值为 `pending`，replace `/request/acknowledged` 为 true 并把
+`/request/status` 改为 `acknowledged`；若值为 `blocked`，只 replace `/request/acknowledged` 为 true，
+保持 status 为 `blocked`，表示迟到回执不重开已经结束的出票结果。不得修改任何其他 path，不得补发票或改写
+actor knowledge、audit。
+"""
+pre_state_schema_path = "schemas/pre-acknowledgement.json"
+payload_bindings = [
+  { payload_path = "/request_id", state_phase = "after", state_path = "/request/id" },
+  { payload_path = "/status", state_phase = "after", state_path = "/request/status" }
+]
+
+[[generate.pattern.booking_success.roles]]
+name = "confirm"
+frame_class = "confirmation"
+actor = "system"
+read_roots = ["/request", "/ticket", "/goal", "/actors/system", "/sla"]
+write_roots = ["/request/status", "/ticket/id", "/ticket/status", "/sla/expired"]
+publish_roots = ["/request/id", "/request/status", "/ticket/id", "/ticket/status"]
+observers = ["requester", "system"]
+state_instruction = """
+只先 test 当前 `/request/acknowledged`。为 true 且 wait_since_previous_us 不超过
+`/sla/max_ack_to_confirm_us` 时，replace `/request/status` 为 `ticketed`、`/ticket/id` 为非空票号、
+`/ticket/status` 为 `issued`；为 false 时把 status 改为 `blocked`，ticket id 保持 null，ticket status 改为
+`not_issued`；等待超过 SLA 时把 status 改为 `expired`，ticket id 保持 null，ticket status 改为
+`not_issued`，并把 `/sla/expired` 改为 true。不得修改任何其他 path，包括 audit 与 hidden_sentinel。
+"""
+pre_state_schema_path = "schemas/pre-confirmation.json"
+payload_bindings = [
+  { payload_path = "/request_id", state_phase = "after", state_path = "/request/id" },
+  { payload_path = "/ticket_id", state_phase = "after", state_path = "/ticket/id" },
+  { payload_path = "/status", state_phase = "after", state_path = "/request/status" }
+]
+
+[[generate.pattern.booking_success.gaps]]
+name = "request_to_acknowledge"
+before = "request"
+after = "acknowledge"
+min_gap_s = 5
+max_gap_s = 120
+
+[[generate.pattern.booking_success.gaps]]
+name = "acknowledge_to_confirm"
+before = "acknowledge"
+after = "confirm"
+min_gap_s = 30
+max_gap_s = 1200
+
+[[generate.counterfactual_sets]]
+name = "booking_success_training"
+pattern = "booking_success"
+count = 2
+
+[[generate.counterfactual_sets.variants]]
+name = "positive"
+kind = "positive"
+outcome_schema_path = "schemas/outcome-positive.json"
+
+[[generate.counterfactual_sets.variants]]
+name = "missing_acknowledgement"
+kind = "missing"
+target_role = "acknowledge"
+outcome_schema_path = "schemas/outcome-missing.json"
+
+[[generate.counterfactual_sets.variants]]
+name = "confirmation_before_acknowledgement"
+kind = "reordered"
+target_before = "acknowledge"
+target_after = "confirm"
+outcome_schema_path = "schemas/outcome-reordered.json"
+
+[[generate.counterfactual_sets.variants]]
+name = "confirmation_timeout"
+kind = "interval_exceeded"
+target_gap = "acknowledge_to_confirm"
+min_excess_s = 1
+max_excess_s = 600
+outcome_schema_path = "schemas/outcome-timeout.json"
+
+[generate.timeline]
+timestamp_start = "2026-01-05T09:00:00+08:00"
+event_gap_s = [5, 60]
+primary_sessions = 8
+crossed_primary_sessions = 0
+session_max_events = 8
+session_max_span_s = 3600
+session_gap_s = 3600
+noise_events = 2
+duplicate_sequences = 1
+
+[generate.noise]
+frame_class = "noise"
+instruction = "生成与任何任务无关、没有可执行诉求的一句自然闲聊。"
+topics = ["夜空中的月相观察", "手工面包出炉时的香气"]
+
+[generate.calendar_window.service_hours]
+utc_offset = "+08:00"
+days = ["mon", "tue", "wed", "thu", "fri"]
+intervals = [["08:00:00", "12:00:00"], ["13:00:00", "18:00:00"]]

@@ -68,15 +68,6 @@ TEMPLATE_HEAD_TOKENS: dict[str, int] = {
     # 静态预算预检（V13③ 两新段）使用。
     "frame_classify": 81,   # classify._FRAME_SYSTEM_HEAD (§10.12)
     "frame_annotate": 35,   # annotate._FRAME_SYSTEM_STATIC (§10.13)
-    # v1.13 时间流生成两键（裁决·预算头两键）：蓝图调用与帧实现调用的系统侧静态
-    # 脚手架（计划器指令/结构句 + 段标签）；噪音批量实现复用既有 "generate" 键值。
-    # 值 = est_text(generate._PLAN_SYSTEM_STATIC / generate._REALIZE_SYSTEM_STATIC)
-    # （§10.14/§10.15 模板 verbatim 已冻结），由 V22 家族的跨层等式测试钉住；
-    # 类生成指令、帧类表与逐位契约的 Schema 文本是配置量，在 M1 静态预算预检
-    # （V13③ 两新段）各自计量。
-    "generate_plan": 189,      # §10.14 蓝图模板静态脚手架（wave 三校准定值）
-    "generate_realize": 95,    # §10.15 帧实现模板静态脚手架（wave 三校准定值）
-    "generate_brief": 126,     # §5.1 sampled brief 联合规划固定脚手架
 }
 
 # CJK 判定（V8）：Unicode 汉字基本区 + 各扩展区 + 全角标点——区间逐个枚举

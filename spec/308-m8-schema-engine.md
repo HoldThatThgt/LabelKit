@@ -42,12 +42,12 @@ state Schema 与 state validator，并把冻结 `EventExecution` 与合法对象
 ```
 @dataclass(frozen=True)
 class CallScope:
-    """一次调用的记账与追踪范围（2026-08-14 收参：原四个关键字入参的参数对象形，
-       字段名与语义逐项不变）。"""
+    """一次调用的记账、追踪与可选 L3 正文边界。"""
     record_ids: tuple[str, ...] = ()    # 本次调用覆盖的记录 id，仅用于 trace 事件
     batch_no: int = 0                   # 批次号，仅用于 trace 事件与日志 extra
     record: Mapping | None = None       # L2.5 回调第二入参（Record.raw），无则 None
     user_treatment: bool | None = None  # 显式待遇门；None ⇒ 按 schema is None 推断
+    repair_context_bytes: int | None = None  # 单轮新增 L3 消息正文集合 UTF-8 byte 上限
 
 class SchemaEngine:
     def __init__(self, user_schema: dict, llm: LLMClient, cfg: OutputConfig): ...
@@ -173,7 +173,13 @@ async def complete_post_validated(
   `ValidatedGenerationCall` 返回，正式事件提交不得再次执行 patch 或 hook。
 - 其他形状、非 string 违规、回调异常或错误返回类型分别归
   `post_validator_invalid` / `post_validator_exception`，直接拒绝当前 slot attempt，不进入 L3。
-- L3 prompt 只携带值受控的 violations；不能写入 `EventExecution`、state 或 hook 异常文本。
+- EventPlan 的 L3 prompt 重放 `PostValidatedCallRequest.prompt` 的原始 system/user 消息，把上一候选作为
+  assistant 消息，再追加只含值受控 violations 的 user 修复消息。它只能复用首轮已经可见的
+  ActorView/visible state，不能追加 `EventExecution`、隐藏 state、hook 异常或任何新事实。普通
+  `complete_validated` 继续使用 3.8.2 的单 user 修复形态。
+- `CallScope.repair_context_bytes` 为 null 时保持通用 M8 既有行为；v1.18 sequence 每个 family 显式传 32768。
+  普通 L3 对完整新 user 正文计费；EventPlan 对新增 assistant 原始输出与新增 user 修复正文之和计费。
+  恰好上限可派发，多一 UTF-8 byte 在 M8 内记录 warning 后短路，零 provider call、不截断原输出。
 
 只有 EventPlan 使用该入口；ScenarioSeed、FrameRenderer、SemanticEvaluator 与 noise 继续调用
 `complete_validated`。后置验证器只存在于当前 request，M8 不保存跨调用状态，并行请求不会串用 state/hook。

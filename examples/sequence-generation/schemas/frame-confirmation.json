@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$defs": {
+    "nullable_id": {"type": ["string", "null"]}
+  },
+  "type": "object",
+  "examples": [{"utterance": "车票已经出票。", "request_id": "R-EXAMPLE", "ticket_id": "T-EXAMPLE", "status": "ticketed"}],
+  "properties": {
+    "utterance": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240,
+      "pattern": "^(?!.*(?:blocked|late_acknowledged|SLA|阻塞))(?!(?:.|\\n)*(?:请求|消息|订单)[^，。；]{0,32}等待已超过)(?!(?:.*出票){2}).+$"
+    },
+    "request_id": {"type": "string", "minLength": 1},
+    "ticket_id": {"$ref": "#/$defs/nullable_id"},
+    "status": {"enum": ["ticketed", "blocked", "expired"]}
+  },
+  "required": ["utterance", "request_id", "ticket_id", "status"],
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "ticketed"}}, "required": ["status"]},
+      "then": {"properties": {"ticket_id": {"type": "string", "minLength": 1}}}
+    },
+    {
+      "if": {"properties": {"status": {"enum": ["blocked", "expired"]}}, "required": ["status"]},
+      "then": {"properties": {"ticket_id": {"type": "null"}}}
+    }
+  ],
+  "dependentSchemas": {
+    "ticket_id": {"required": ["status"]}
+  },
+  "unevaluatedProperties": false
+}

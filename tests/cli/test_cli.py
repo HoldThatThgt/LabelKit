@@ -86,12 +86,14 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/config/_classviews.py",   # M1 拆分（2026-08-14 规则整改：每文件 ≤2000 行）
     "labelkit/common/config/_collect.py",
     "labelkit/common/config/_constraints.py",
-    "labelkit/common/config/_generate_stream_constraints.py",  # v1.16 时间流约束簇
+    "labelkit/common/config/_generation_budget.py",  # v1.18 六家族预算证明
     "labelkit/common/config/_rubrics.py",
     "labelkit/common/config/_schemas.py",
     "labelkit/common/config/_sections.py",
+    "labelkit/common/config/generation.py",
     "labelkit/common/config/loader.py",
     "labelkit/common/config/model.py",
+    "labelkit/common/contracts/generation.py",
     "labelkit/common/contracts/stage.py",
     "labelkit/common/contracts/types.py",
     "labelkit/common/errors.py",
@@ -100,24 +102,24 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/observability/obslog.py",
     "labelkit/common/runtime/budget.py",           # v1.11 (CONTRACTS §7.17)
     "labelkit/common/runtime/credentials.py",      # v1.17 secret-free 凭据载体
+    "labelkit/common/runtime/generation_prompts.py",  # v1.18 六家族共享完整提示词
     "labelkit/common/runtime/llm_client.py",
     "labelkit/common/runtime/schema_engine.py",
-    "labelkit/common/runtime/scenario/__init__.py",    # v1.17 场景规划纯函数层
-    "labelkit/common/runtime/scenario/calendar.py",    # v1.17 fixed-offset 日历
-    "labelkit/common/runtime/scenario/diagnostics.py",  # v1.17 planner 异常与 message
-    "labelkit/common/runtime/scenario/model.py",       # v1.17 场景模型 (CONTRACTS §7.19.4)
-    "labelkit/common/runtime/scenario/noise.py",       # v1.17 确定性 noise 分配
-    "labelkit/common/runtime/scenario/planner.py",     # v1.17 compile_scenario
-    "labelkit/common/runtime/scenario/quota.py",       # v1.17 quota 算术与见证模型
-    "labelkit/common/runtime/scenario/rules.py",       # v1.17 规则纯求值器
-    "labelkit/common/runtime/scenario/sessions.py",    # v1.17 session/crossing/reserve builder
     "labelkit/operators/annotate.py",
     "labelkit/operators/classify.py",
     "labelkit/operators/dedup.py",
     "labelkit/operators/emitter.py",
     "labelkit/operators/extract.py",
     "labelkit/operators/generate.py",
-    "labelkit/operators/generate_stream.py",       # M6 时间流纯逻辑物理拆分
+    "labelkit/operators/generation/__init__.py",
+    "labelkit/operators/generation/evaluate.py",
+    "labelkit/operators/generation/flat.py",
+    "labelkit/operators/generation/planner.py",
+    "labelkit/operators/generation/program.py",
+    "labelkit/operators/generation/project.py",
+    "labelkit/operators/generation/render.py",
+    "labelkit/operators/generation/scenario.py",
+    "labelkit/operators/generation/state.py",
     "labelkit/operators/ingest.py",
     "labelkit/operators/quality.py",
     "labelkit/operators/segment.py",
@@ -125,6 +127,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/operators/verify.py",
     "labelkit/orchestration/__init__.py",
     "labelkit/orchestration/factory.py",
+    "labelkit/orchestration/generation_delivery.py",
     "labelkit/orchestration/orchestrator.py",
     "labelkit/orchestration/runtime.py",
 }
@@ -133,25 +136,19 @@ EXPECTED_TEST_PY = {
     "tests/cli/test_cli.py",
     "tests/cli/test_console.py",
     "tests/common/config/test_config.py",
-    "tests/common/config/test_loader_generate_stream.py",   # v1.13 (SPEC-stream-generation §3.1)
+    "tests/common/config/test_generation.py",
     "tests/common/config/test_paths_hooks.py",     # v1.17 (SPEC-scenario-planning §5.1/§4.9)
     "tests/common/contracts/test_stage.py",
+    "tests/common/contracts/test_generation_contracts.py",
     "tests/common/contracts/test_types.py",
     "tests/common/extensions/test_hooks.py",
     "tests/common/observability/test_console_format.py",
     "tests/common/observability/test_obslog.py",
     "tests/common/runtime/test_budget.py",         # v1.11 (CONTRACTS §7.17)
     "tests/common/runtime/test_credentials.py",    # v1.17 secret-free 凭据面
+    "tests/common/runtime/test_generation_prompts.py",
     "tests/common/runtime/test_llm_client.py",
     "tests/common/runtime/test_schema_engine.py",
-    "tests/common/runtime/scenario/test_calendar.py",    # v1.17 场景日历
-    "tests/common/runtime/scenario/test_diagnostics.py",  # v1.17 planner 诊断
-    "tests/common/runtime/scenario/test_model.py",       # v1.17 场景模型
-    "tests/common/runtime/scenario/test_noise.py",       # v1.17 noise 分配
-    "tests/common/runtime/scenario/test_planner.py",     # v1.17 compile_scenario 与 scale gate
-    "tests/common/runtime/scenario/test_quota.py",       # v1.17 quota 算术
-    "tests/common/runtime/scenario/test_rules.py",       # v1.17 规则求值器
-    "tests/common/runtime/scenario/test_sessions.py",    # v1.17 session 层 builder
     "tests/common/test_errors.py",
     "tests/conftest.py",
     "tests/hook_samples.py",
@@ -160,7 +157,8 @@ EXPECTED_TEST_PY = {
     "tests/integration/test_classify_llm.py",
     "tests/integration/test_frame_llm.py",         # v1.12 (SPEC-frame-annotation §3.9)
     "tests/integration/test_generate_llm.py",
-    "tests/integration/test_generate_stream_llm.py",  # v1.13 (SPEC-stream-generation §3.9)
+    "tests/integration/test_sequence_generation_llm.py",
+    "tests/integration/test_sequence_generation_structured_output_llm.py",
     "tests/integration/test_key_pool_llm.py",
     "tests/integration/test_llm_client_llm.py",
     "tests/integration/test_quality_llm.py",
@@ -174,13 +172,21 @@ EXPECTED_TEST_PY = {
     "tests/operators/test_emitter.py",
     "tests/operators/test_extract.py",
     "tests/operators/test_generate.py",
-    "tests/operators/test_generate_stream.py",   # v1.13 时间流形态（wave 三）
+    "tests/operators/generation/conftest.py",
+    "tests/operators/generation/test_evaluate.py",
+    "tests/operators/generation/test_planner.py",
+    "tests/operators/generation/test_program.py",
+    "tests/operators/generation/test_project.py",
+    "tests/operators/generation/test_render.py",
+    "tests/operators/generation/test_scenario.py",
+    "tests/operators/generation/test_state.py",
     "tests/operators/test_ingest.py",
     "tests/operators/test_quality.py",
     "tests/operators/test_segment.py",
     "tests/operators/test_stitch.py",
     "tests/operators/test_verify.py",
     "tests/orchestration/test_orchestrator.py",
+    "tests/orchestration/test_generation_delivery.py",
 }
 
 REMOVED_MODULES = (
@@ -274,8 +280,20 @@ def test_package_layout_dependency_direction():
                     "labelkit.operators.segment",
                 }
             elif own_module == "labelkit.operators.generate":
-                # M6 的物理拆分：generate_stream 是同一算子的纯逻辑承载文件。
-                allowed_operator_calls = {"labelkit.operators.generate_stream"}
+                # flat 与 sequence 都是 M6 的物理子模块。
+                allowed_operator_calls = {"labelkit.operators.generation.flat"}
+            elif own_module.startswith("labelkit.operators.generation."):
+                # generation/ 内部调用仍在同一 M6 边界。
+                allowed_operator_calls = {
+                    imported for imported in imports
+                    if imported.startswith("labelkit.operators.generation")
+                }
+            elif own_module == "labelkit.operators.ingest":
+                # M2 与 M6 projector 共用唯一 ID 派生公式。
+                allowed_operator_calls = {"labelkit.operators.generation.project"}
+            elif own_module == "labelkit.operators.emitter":
+                # M11 消费 M6 冻结的 canonical delivery bytes 口径。
+                allowed_operator_calls = {"labelkit.operators.generation.project"}
             else:
                 allowed_operator_calls = set()
             for imported in imports:

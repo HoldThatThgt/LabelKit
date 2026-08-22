@@ -63,6 +63,11 @@ from labelkit.common.contracts.types import (
     Usage,
     frame_digest,
 )
+from labelkit.common.errors import (
+    CircuitBreakerTripped,
+    ProviderFatalError,
+    ProviderRetryableError,
+)
 
 USER_SCHEMA = {
     "type": "object",
@@ -1966,3 +1971,159 @@ def test_sc_agreement_leaves_the_disagreement_counter_untouched():
 
     assert ann.sc == {"n": 3, "agreement_ratio": 2 / 3}   # 明显多数派
     assert "annotate.sc_disagreements" not in metrics.counters
+
+
+@_pytest.mark.parametrize("error", [
+    ProviderFatalError("fatal", "default", 401),
+    ProviderRetryableError("retryable", "default", 5),
+    CircuitBreakerTripped("breaker"),
+])
+def test_annotate_attempt_seam_propagates_terminal_errors_without_dataset_commit(
+        monkeypatch, error):
+    from contextlib import contextmanager
+    from labelkit.common.contracts.generation import (
+        AttemptTransaction,
+        DownstreamAttemptRequest,
+    )
+
+    class AttemptMetrics:
+        def __init__(self):
+            self.counters = {}
+            self.captured = None
+
+        @contextmanager
+        def capture_counts(self):
+            self.captured = {}
+            try:
+                yield self.captured
+            finally:
+                self.captured = None
+
+        def count(self, key, n=1):
+            target = self.captured if self.captured is not None else self.counters
+            target[key] = target.get(key, 0) + n
+
+    cfg = make_cfg()
+    metrics = AttemptMetrics()
+    item = PipelineItem(record=text_record())
+    transaction = AttemptTransaction((item,), {}, ())
+    context = _NS(cfg=cfg, llm=None, schema_engine=None, metrics=metrics,
+                  rng=None, batch_no=1)
+    request = DownstreamAttemptRequest(transaction, context)
+    stage = AnnotateStage(cfg)
+
+    async def fail(batch, run_context):
+        run_context.metrics.count("annotate.succeeded")
+        raise error
+
+    monkeypatch.setattr(stage, "run", fail)
+    with _pytest.raises(type(error)) as caught:
+        _asyncio.run(stage.run_attempt(request))
+    assert caught.value is error
+    assert metrics.counters == {}
+
+
+@_pytest.mark.parametrize("error", [
+    ProviderFatalError("fatal", "default", 401),
+    ProviderRetryableError("retryable", "default", 5),
+])
+def test_frame_annotate_attempt_seam_propagates_provider_errors_without_commit(error):
+    """真实 frame pass 在 attempt 模式下不做成员隔离，provider 终态原样穿透。"""
+    from contextlib import contextmanager
+    from labelkit.common.contracts.generation import (
+        AttemptTransaction,
+        DownstreamAttemptRequest,
+    )
+
+    class AttemptMetrics(_FrameMetrics):
+        def __init__(self):
+            super().__init__()
+            self.captured = None
+
+        @contextmanager
+        def capture_counts(self):
+            self.captured = {}
+            try:
+                yield self.captured
+            finally:
+                self.captured = None
+
+        def count(self, key, n=1):
+            target = self.captured if self.captured is not None else self.counters
+            target[key] = target.get(key, 0) + n
+
+    class FailingFrameEngine(_FrameEngine):
+        def __init__(self):
+            super().__init__()
+            self.started = 0
+
+        async def complete_validated(self, profile, prompt, schema=None, *, scope):
+            if schema is not None:
+                self.started += 1
+                raise error
+            return await super().complete_validated(
+                profile, prompt, schema=schema, scope=scope
+            )
+
+    cfg = make_frame_cfg()
+    metrics = AttemptMetrics()
+    item = PipelineItem(record=text_episode(3))
+    transaction = AttemptTransaction((item,), {}, ())
+    engine = FailingFrameEngine()
+    context = _NS(
+        cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
+        rng=None, batch_no=1,
+    )
+    request = DownstreamAttemptRequest(transaction, context)
+
+    with _pytest.raises(type(error)) as caught:
+        _asyncio.run(AnnotateStage(cfg).run_attempt(request))
+    assert caught.value is error
+    assert item.annotation is not None
+    assert engine.started == 3
+    assert metrics.counters == {}
+
+
+def test_frame_only_attempt_has_zero_sequence_calls_and_accepts_all_members():
+    """sequence frame-only 直接执行 frame pass，序列标注产物保持缺席。"""
+    from contextlib import contextmanager
+    from labelkit.common.contracts.generation import (
+        AttemptTransaction,
+        DownstreamAttemptRequest,
+    )
+
+    class AttemptMetrics(_FrameMetrics):
+        def __init__(self):
+            super().__init__()
+            self.captured = None
+
+        @contextmanager
+        def capture_counts(self):
+            self.captured = {}
+            try:
+                yield self.captured
+            finally:
+                self.captured = None
+
+        def count(self, key, n=1):
+            target = self.captured if self.captured is not None else self.counters
+            target[key] = target.get(key, 0) + n
+
+    cfg = make_frame_cfg()
+    cfg = replace(cfg, annotate=replace(cfg.annotate, enabled=False))
+    item = PipelineItem(record=text_episode(3))
+    transaction = AttemptTransaction((item,), {}, ())
+    engine, metrics = _FrameEngine(), AttemptMetrics()
+    context = _NS(
+        cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
+        rng=None, batch_no=1,
+    )
+    result = _asyncio.run(AnnotateStage(cfg).run_attempt(
+        DownstreamAttemptRequest(transaction, context)
+    ))
+    assert result.accepted and result.rejected_stage is None
+    assert item.annotation is None
+    assert len(engine.calls) == 3 and len(engine.frame_calls()) == 3
+    assert all(value is not None for value in item.member_annotations.values())
+    assert result.dataset_counters == {"frame_annotate.annotated": 3}
+    assert metrics.counters == {}

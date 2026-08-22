@@ -1,9 +1,4 @@
-"""Shared test config: loads .env for integration credentials, gates integration tests.
-
-Integration tests hit the real z.ai endpoint (no mock LLMs — project policy).
-They are marked @pytest.mark.integration and auto-skip when LABELKIT_ZAI_KEY
-is not available from the environment or the repo-root .env file.
-"""
+"""加载真实端点凭据，并按端点 marker 独立门控集成测试。"""
 
 import os
 from pathlib import Path
@@ -30,12 +25,27 @@ _load_dotenv()
 ZAI_BASE_URL = "https://api.z.ai/api/anthropic"
 ZAI_MODEL = "glm-5.2"
 ZAI_KEY_ENV = "LABELKIT_ZAI_KEY"
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/anthropic"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
+DEEPSEEK_KEY_ENV = "LABELKIT_DEEPSEEK_KEY"
 
 
 def pytest_collection_modifyitems(config, items):
-    if os.environ.get(ZAI_KEY_ENV):
-        return
-    skip = pytest.mark.skip(reason=f"{ZAI_KEY_ENV} not set — integration tests need the real endpoint")
+    """让 DeepSeek 与 z.ai 用例只依赖各自的真实凭据。
+
+    @param config pytest 配置对象；本函数不读取其内容。
+    @param items 已收集测试项。
+    """
+    del config
     for item in items:
-        if "integration" in item.keywords:
-            item.add_marker(skip)
+        if "integration" not in item.keywords:
+            continue
+        if "deepseek" in item.keywords and not os.environ.get(DEEPSEEK_KEY_ENV):
+            reason = f"{DEEPSEEK_KEY_ENV} not set; DeepSeek integration requires the real endpoint"
+            item.add_marker(pytest.mark.skip(reason=reason))
+        elif "zai" in item.keywords and not os.environ.get(ZAI_KEY_ENV):
+            reason = f"{ZAI_KEY_ENV} not set; z.ai integration requires the real endpoint"
+            item.add_marker(pytest.mark.skip(reason=reason))
+        elif not ({"deepseek", "zai"} & set(item.keywords)) and not os.environ.get(ZAI_KEY_ENV):
+            reason = f"{ZAI_KEY_ENV} not set; integration requires the real z.ai endpoint"
+            item.add_marker(pytest.mark.skip(reason=reason))

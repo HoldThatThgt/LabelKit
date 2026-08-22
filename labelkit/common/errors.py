@@ -9,6 +9,18 @@ class LabelKitError(Exception):
     """本工具全部异常的基类。"""
 
 
+class GenerationProjectionMismatch(Exception):
+    """表示当前 sequence attempt 的最终视图与冻结计划不一致。"""
+
+    def __init__(self, reason: str):
+        """构造不含用户内容的可恢复投影拒绝。
+
+        @param reason 固定的英文机械检查原因。
+        """
+        self.reason = reason
+        super().__init__(f"sequence projection mismatch: {reason}")
+
+
 class ConfigError(LabelKitError):
     """M1。聚合**全部**校验错误（绝不只报第一条）。CLI 退出码 2。"""
 
@@ -155,6 +167,22 @@ class InternalError(LabelKitError):
     kind='internal_error'；调用栈以 debug 级别写入 stderr 日志。"""
 
 
+class DeliveryError(LabelKitError):
+    """v1.18 sequence 精确交付尝试耗尽；CLI 退出码 1。"""
+
+    def __init__(self, kind: str, slot_key: str, attempts_used: int):
+        """构造不含状态、payload、prompt 或 provider 内容的交付错误。
+
+        @param kind 冻结交付错误分类
+        @param slot_key 耗尽的槽键
+        @param attempts_used 已使用尝试数
+        """
+        self.kind = kind
+        self.slot_key = slot_key
+        self.attempts_used = attempts_used
+        super().__init__(f"{kind}: slot={slot_key} attempts={attempts_used}")
+
+
 class CircuitBreakerTripped(LabelKitError):
     """MetricsSink.circuit_broken 置位后由 LLMClient 抛出；Orchestrator 将其转为
     致命的运行结束（退出码 4）。[FROZEN HERE]"""
@@ -162,7 +190,7 @@ class CircuitBreakerTripped(LabelKitError):
 
 # ── CLI 退出码（spec §2.4）─────────────────────────────────────────────────
 EXIT_OK = 0              # 运行完成（允许存在 rejects）
-EXIT_STRICT = 1          # 完成但违反 --strict（存在 rejects），或 report 写失败
+EXIT_STRICT = 1          # --strict、report 写失败或 sequence delivery exhaustion
 EXIT_CONFIG = 2          # ConfigError
 EXIT_INPUT = 3           # InputError（仅 process 模式；generate_only 永不返回 3）
 EXIT_FATAL = 4           # provider 鉴权失败 / 熔断 / 输出路径不可写
@@ -209,4 +237,20 @@ class ErrorKind(str, enum.Enum):
                                                              # 输出撞上 max_output_tokens →
                                                              # failed → rejects 独立桶；永不修复、
                                                              # 永不喂熔断器
+    GENERATION_CONFIG_INVALID = "generation_config_invalid"  # v1.18 M1 或编译器 → exit 2
+    GENERATION_PLAN_INFEASIBLE = "generation_plan_infeasible"# CP-SAT 不可行 → exit 2
+    GENERATION_PLAN_BUDGET = "generation_plan_budget"        # 未证明最优 → exit 4
+    GENERATION_PLAN_INTERNAL = "generation_plan_internal"    # 模型或不变量失效 → exit 4
+    GENERATION_DEDUP_TRANSACTION = "generation_dedup_transaction"  # 过期 token → exit 4
+    GENERATION_DOWNSTREAM_CONTRACT = "generation_downstream_contract"  # 协议违约
+    POST_VALIDATOR_INVALID = "post_validator_invalid"        # 当前槽 attempt 拒绝
+    POST_VALIDATOR_EXCEPTION = "post_validator_exception"    # 当前槽 attempt 拒绝
+    SEQUENCE_DELIVERY_EXHAUSTED = "sequence_delivery_exhausted"  # 交付尝试耗尽 → exit 1
+    SEQUENCE_PROJECTION_MISMATCH = "sequence_projection_mismatch"  # 当前槽 attempt 拒绝
+    GENERATION_COMMIT_IO = "generation_commit_io"            # 成功工件提交失败 → exit 4
+    GENERATION_FAILED_REPORT_IO = "generation_failed_report_io"  # 保留 primary error
     INTERNAL_ERROR = "internal_error"                        # 任何未预期异常
+
+
+class PostValidatorInvalidError(Exception):
+    """内部后置验证器在运行期返回了非法契约形状。"""

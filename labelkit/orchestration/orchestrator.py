@@ -43,23 +43,23 @@ from dataclasses import dataclass
 from datetime import datetime
 from itertools import islice
 from pathlib import Path
-from typing import TYPE_CHECKING, Mapping, Sequence
+from typing import TYPE_CHECKING, Mapping, NoReturn, Sequence
 
 from labelkit import TOOL_VERSION, __version__
-from labelkit.common.config.model import (
-    effective_frame_rules,
-    effective_frame_windows,
-    effective_tiers,
-)
 from labelkit.common.contracts.stage import RunContext, Stage
 from labelkit.common.contracts.types import PipelineItem, Record
-from labelkit.common.errors import CircuitBreakerTripped, InternalError
+from labelkit.common.errors import CircuitBreakerTripped, DeliveryError, InternalError
 from labelkit.common.runtime import budget
 # v1.17 Wave 2b：referenced_profiles 收集器已下沉 common 层（CONTRACTS §7.19.3）。
 from labelkit.common.runtime.credentials import referenced_profiles
+from labelkit.orchestration.generation_delivery import (
+    estimate_sequence,
+    estimate_sequence_products,
+)
 
 if TYPE_CHECKING:
-    from labelkit.common.config.model import LLMProfile, ResolvedConfig, TierSpec
+    from labelkit.common.config.model import LLMProfile, ResolvedConfig
+    from labelkit.common.contracts.generation import GenerationProgram, ScenarioPlan
     from labelkit.common.observability.obslog import MetricsSink
     from labelkit.common.runtime.llm_client import LLMClient
     from labelkit.common.runtime.schema_engine import SchemaEngine
@@ -91,6 +91,16 @@ _DEFECT_KINDS = ("label_mismatch", "off_task_members", "missing_head",
 
 _log = logging.getLogger("labelkit.orchestrator")
 
+
+def _generation_contract_error(message: str) -> NoReturn:
+    """记录并抛出 generation 编排契约错误。
+
+    @param message 固定英文错误文本。
+    @return 不返回。
+    """
+    _log.error(message, extra={"stage": "orchestrator", "batch": 0})
+    raise InternalError(message)
+
 # report.json 的 quality.aggregate_histogram 桶标签——冻结（§9.3）。
 _HIST_LABELS = tuple(f"{i / 10:.1f}-{(i + 1) / 10:.1f}" for i in range(10))
 
@@ -103,6 +113,16 @@ _ESTIMATE_CALL_ORDER = ("generate_calls", "segment_calls", "stitch_calls",
                         "classify_calls", "frame_classify_calls", "extract_calls",
                         "quality_calls", "annotate_calls", "frame_annotate_calls",
                         "verify_calls")
+
+_SEQUENCE_CALL_KEYS = (
+    "scenario_seed_calls",
+    "baseline_event_plan_calls",
+    "variant_event_plan_calls",
+    "frame_render_calls",
+    "semantic_evaluation_calls",
+    "noise_render_calls",
+    "noise_evaluation_calls",
+)
 
 # 时序流五键的零值底盘（非流分支恒取此值）。
 _STREAM_CALLS_ZERO = {"segment_calls": 0, "stitch_calls": 0, "extract_calls": 0,
@@ -195,20 +215,16 @@ class _CounterView:
 def _estimate_generate_only(cfg: "ResolvedConfig") -> tuple[int, int]:
     """generate_only 模式的生成量估算（3.6.2 量公式，静态、无需 scan）。
 
-    v1.17（SPEC-SP §10.2）：``generate_stream.enabled`` 时直读 M1 冻结的
-    ``cfg.scenario_plan``——records = len(slots)、generate_calls = 2 × len(slots) +
-    len(noise_slots)（每 sequence slot 一次 brief + 一次 realize，每 noise slot 一次
-    realize；duplicates 零 LLM）。不含 delivery retry、LLMClient 内 provider retry 与
-    Schema repair。
+    v1.18 sequence 形态由 :func:`estimate_sequence` 的真实 compiler/planner 结果负责；
+    本函数只为既有 scale 入口返回它的 generate_calls 与 primary sequence 数。
 
     @param cfg: 已解析配置
     @return: (生成调用数, 生成记录数)
     """
     g = cfg.generate
-    if cfg.generate_stream.enabled:
-        plan = cfg.scenario_plan
-        records = len(plan.slots)
-        return 2 * records + len(plan.noise_slots), records
+    if g.form == "sequence":
+        estimate = estimate_sequence(cfg)
+        return estimate["generate_calls"], estimate["records"]
     if g.seed_examples:
         calls = _ceil_div(len(g.seed_examples) * g.num_per_record, g.num_per_call)
     else:
@@ -317,14 +333,14 @@ def _estimate_classify_calls(cfg: "ResolvedConfig", scale: _EstimateScale) -> in
 
     v1.7 R11：process 模式 = ingested × max(1, self_consistency)（再流转子批继承分类、
     跳过 M13，不计入），generate_only = 生成记录数 × max(1, self_consistency)，流模式改
-    以 episodes ≈ sessions 为基数。v1.13：时间流形态的序列标签直接继承（inherited，
-    v1.7 R11 幂等哲学）——classify_calls 恒 0，classify.enabled 只作类表载体。
+    以 episodes ≈ sessions 为基数。sequence generation 的标签由计划继承，
+    classify_calls 恒 0，classify.enabled 只作类表载体。
 
     @param cfg: 已解析配置
     @param scale: 规模量
     @return: classify 调用数
     """
-    if not cfg.classify.enabled or cfg.generate_stream.enabled:
+    if not cfg.classify.enabled or cfg.generate.form == "sequence":
         return 0
     if cfg.run.mode == "generate_only":
         base = scale.generated
@@ -363,13 +379,15 @@ def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
 
     全部估算假定零丢弃（上界）且不含重试与修复调用；各分项的上/下界语义与版本沿革见
     ``_estimate_scale`` / ``_estimate_stream_calls`` / ``_estimate_classify_calls`` 的
-    说明（v1.8 S22 流模式、v1.11 V12 预算钳位、v1.12 帧粒度两键、v1.13 时间流精确复演）。
+    说明（普通流模式、预算钳位、帧粒度两键与 sequence generation 精确计划）。
 
     @param cfg: 已解析配置
     @param plan: M2 扫描结果；generate_only 传 None
     @return: 冻结键集的估算字典
     @raises AssertionError: process 模式未提供扫描结果
     """
+    if cfg.generate.form == "sequence":
+        return estimate_sequence(cfg)
     scale = _estimate_scale(cfg, plan)
     calls = dict(scale.stream_calls)
     calls["generate_calls"] = scale.generate_calls
@@ -384,42 +402,7 @@ def estimate_run(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> dict:
     for key in _ESTIMATE_CALL_ORDER:
         est[key] = calls[key]
     est["total_calls"] = sum(calls[key] for key in _ESTIMATE_CALL_ORDER)
-    if cfg.generate_stream.enabled and cfg.scenario_plan is not None:
-        est["scenario"] = _estimate_scenario(cfg)
     return est
-
-
-def _estimate_scenario(cfg: "ResolvedConfig") -> dict:
-    """v1.17（SPEC-SP §10.2）estimate 的 scenario 子块（冻结键序，直读计划）。
-
-    @param cfg: 已解析配置（``scenario_plan`` 已由 M1 冻结）
-    @return: 十键字典（models 的 families 值为 {variables, constraints} 映射）
-    """
-    from datetime import datetime, timedelta, timezone as tz
-
-    from labelkit.operators.generate_stream import _us_iso
-
-    plan = cfg.scenario_plan
-    schedule = cfg.generate_stream.schedule
-    models = {
-        name: {"entries": stats.variables + stats.constraints,
-               "families": {family: {"variables": row.variables,
-                                     "constraints": row.constraints}
-                            for family, row in stats.families.items()}}
-        for name, stats in plan.models.items()
-    }
-    return {
-        "target_sequences": len(plan.slots),
-        "task_frames": sum(len(layout.frames) for layout in plan.layouts),
-        "noise_frames": len(plan.noise_slots),
-        "sessions": len(plan.sessions),
-        "crossed_sessions": cfg.generate_stream.crossed_sessions,
-        "schedule_start": _us_iso(schedule.start_us, cfg),
-        "schedule_end": _us_iso(schedule.end_us, cfg),
-        "calendar_days_spanned": plan.objectives.calendar_days_spanned,
-        "plan_digest": plan.plan_digest,
-        "models": models,
-    }
 
 
 @dataclass(frozen=True)                            # [FROZEN in CONTRACTS.md §7.9]
@@ -502,6 +485,34 @@ class Orchestrator:
         self._timer_handles: list[asyncio.TimerHandle] = []
         self._t0 = 0.0
         self._estimate_cache: dict | None = None
+        self._init_sequence_state()
+
+    def _init_sequence_state(self) -> None:
+        """初始化只供 v1.18 sequence 分支使用的冻结计划引用。"""
+        self._sequence_program: "GenerationProgram | None" = None
+        self._scenario_plan: "ScenarioPlan | None" = None
+
+    def _bind_sequence_plan(
+        self,
+        program: "GenerationProgram",
+        plan: "ScenarioPlan",
+    ) -> None:
+        """绑定凭据物化前由运行期编译的唯一 sequence 计划。
+
+        @param program 唯一 GenerationProgram。
+        @param plan 唯一 ScenarioPlan。
+        @return None。
+        """
+        if self.cfg.generate.form != "sequence":
+            _generation_contract_error(
+                "generation_downstream_contract: sequence plan on flat run"
+            )
+        if self._sequence_program is not None or self._scenario_plan is not None:
+            _generation_contract_error(
+                "generation_downstream_contract: sequence plan already bound"
+            )
+        self._sequence_program = program
+        self._scenario_plan = plan
 
     # ── 对外入口 ───────────────────────────────────────────────────────────
 
@@ -518,6 +529,8 @@ class Orchestrator:
         self._install_signal_handlers()
         try:
             self._emit_run_start(plan, plan_estimated)
+            if self.cfg.generate.form == "sequence":
+                return await self._run_sequence()
             self.emitter.open()
             try:
                 if self.cfg.run.mode == "generate_only":
@@ -562,9 +575,8 @@ class Orchestrator:
 
         v1.10（U17/U19/U20）：live 估算只在**确有可用估算**时发——process 模式带估算的
         计划，或 generate_only（plan=None，3.6.2 量公式是静态的、无需 scan）。文本模态未
-        开 console.estimate 时什么都不发（渲染器于是只显示「批 i」不带分母）。v1.16
-        时间流估算会运行联合规划，因此未挂 listener 时跳过这次无人消费的规划；其余静态估算
-        仍保持既有调用路径。
+        开 console.estimate 时什么都不发（渲染器于是只显示「批 i」不带分母）。sequence
+        generation 复用 runtime 已绑定的 program/plan；其余静态估算保持既有调用路径。
 
         @param plan: 预扫描计划
         @param plan_estimated: 该计划是否带估算
@@ -575,11 +587,8 @@ class Orchestrator:
                                     "project_digest": self.cfg.project_digest,
                                     "trace_schema_version": 1})
         should_estimate = self.cfg.run.mode == "generate_only" or plan_estimated
-        stream_listener_ready = (
-            not self.cfg.generate_stream.enabled or self.metrics.has_listener
-        )
-        if should_estimate and stream_listener_ready:
-            self._estimate_cache = estimate_run(self.cfg, plan)
+        if should_estimate:
+            self._estimate_cache = self._estimate_for(plan)
             self.metrics.run_estimate(self._estimate_cache)
         # v1.11（V13①，spec 3.10.3 上下文预算行）：启动期预算 INFO 归 M10 启动段所有
         # （绝不归 loader：加载期 logging 尚未按 CLI 覆盖定级）。--dry-run 走不到这里
@@ -588,6 +597,150 @@ class Orchestrator:
         self._log_budget_startup()
 
     # ── 模式驱动 ───────────────────────────────────────────────────────────
+
+    async def _run_sequence(self) -> RunSummary:
+        """直接驱动 v1.18 whole-set 交付，不进入普通 Stage 批链。
+
+        @return 成功或本进程信号中断的运行摘要。
+        """
+        from labelkit.orchestration.generation_delivery import deliver_generation
+
+        request = self._sequence_request()
+        services = self._sequence_services()
+        task = asyncio.ensure_future(deliver_generation(request, services))
+        self._current_task = task
+        try:
+            product = await task
+        except asyncio.CancelledError:
+            if not self._stop:
+                raise
+            return self._sequence_interrupted_summary()
+        except BaseException as exc:
+            self._emit_sequence_terminal(1 if isinstance(exc, DeliveryError) else 4, {})
+            raise
+        finally:
+            self._current_task = None
+        return self._sequence_success_summary(product)
+
+    def _sequence_request(self):
+        """从唯一计划和自引用无关身份构造 DeliveryRequest。
+
+        @return 冻结 DeliveryRequest。
+        """
+        from labelkit.common.contracts.generation import DeliveryRequest
+        from labelkit.operators.generation.project import derive_generation_id
+
+        program, plan = self._require_sequence_plan()
+        paths = self.cfg.paths
+        if paths is None:
+            _generation_contract_error("generation_downstream_contract: missing sequence paths")
+        attempt_id = derive_generation_id(
+            "run_attempt_id", [program.digest, program.planner_seed]
+        )
+        run_id = derive_generation_id("run_id", [attempt_id, plan.digest])
+        if run_id != self.run_id:
+            _generation_contract_error(
+                "generation_downstream_contract: sequence run id mismatch"
+            )
+        return DeliveryRequest(
+            program=program,
+            plan=plan,
+            paths=paths,
+            run_attempt_id=attempt_id,
+            run_id=run_id,
+        )
+
+    def _sequence_services(self):
+        """从现有对象图选择 attempt 协作者并构造唯一服务根。
+
+        @return DeliveryServices。
+        """
+        from labelkit.common.contracts.generation import DeliveryServices, GenerationServices
+        from labelkit.operators.emitter import SequenceDeliveryEmitter
+
+        stages = {stage.name: stage for stage in self.stages}
+        dedup = stages.get("dedup")
+        if dedup is None or not hasattr(dedup, "index"):
+            _generation_contract_error(
+                "generation_downstream_contract: missing sequence dedup index"
+            )
+        if self.cfg.paths is None:
+            _generation_contract_error("generation_downstream_contract: missing sequence paths")
+        generation = GenerationServices(
+            config=self.cfg,
+            schema_engine=self.schema_engine,
+            llm=self.llm,
+            metrics=self.metrics,
+        )
+        return DeliveryServices(
+            generation=generation,
+            dedup=dedup.index,
+            quality=stages.get("quality"),
+            annotate=stages.get("annotate"),
+            verify=stages.get("verify"),
+            emitter=SequenceDeliveryEmitter(self.cfg.paths),
+        )
+
+    def _require_sequence_plan(self):
+        """读取运行期已经绑定的唯一 GenerationProgram 与 ScenarioPlan。
+
+        @return program 与 plan。
+        """
+        if self._sequence_program is None or self._scenario_plan is None:
+            _generation_contract_error(
+                "generation_downstream_contract: sequence plan is not bound"
+            )
+        return self._sequence_program, self._scenario_plan
+
+    def _sequence_success_summary(self, product) -> RunSummary:
+        """从已 manifest-last 提交的产品构造 CLI 摘要并结束观测。
+
+        @param product 已提交 GenerationProduct。
+        @return 成功运行摘要。
+        """
+        counts = dict(product.report["counts"])
+        wall_s = time.perf_counter() - self._t0
+        self._emit_sequence_terminal(0, counts)
+        return RunSummary(
+            counts=counts,
+            interrupted=False,
+            exit_code=0,
+            wall_s=wall_s,
+            output_lines=len(product.main_rows),
+            rejects_lines=0,
+        )
+
+    def _sequence_interrupted_summary(self) -> RunSummary:
+        """为本进程信号取消返回不含部分交付的 exit-4 摘要。
+
+        @return 中断运行摘要。
+        """
+        counts: dict[str, int] = {}
+        wall_s = time.perf_counter() - self._t0
+        self._emit_sequence_terminal(4, counts)
+        return RunSummary(
+            counts=counts,
+            interrupted=True,
+            exit_code=4,
+            wall_s=wall_s,
+            output_lines=0,
+            rejects_lines=0,
+        )
+
+    def _emit_sequence_terminal(self, exit_code: int, counts: Mapping) -> None:
+        """发出 sequence 运行终态并冲洗观测通道。
+
+        @param exit_code 最终退出码。
+        @param counts 已提交成功计数；失败时为空。
+        @return None。
+        """
+        self.metrics.event(
+            _EV_RUN_END,
+            stage="run",
+            batch_no=0,
+            payload={"counts": counts, "exit_code": exit_code},
+        )
+        self.metrics.flush()
 
     async def _run_process(self) -> None:
         """process 模式主驱动：按 batch_size 切批，生成子批插在父批之后。
@@ -687,7 +840,7 @@ class Orchestrator:
             await self._dispatch(frames[i:i + bs], chain)
 
     async def _run_generate_only(self) -> None:
-        """generate_only 模式驱动：一次性生成 → 切批走再流转链（不含 generate 工位）。
+        """flat generate_only：一次性生成 → 切批走再流转链（不含 generate 工位）。
 
         @raises InternalError: 阶段表里没有 generate 算子
         """
@@ -696,10 +849,6 @@ class Orchestrator:
             raise InternalError("generate_only mode requires a generate stage")
         # 预抽 PRNG 固定在 batch_no=0（spec 3.10.3）：Random(f"{seed}:0:generate")。
         ctx0 = self._make_ctx(0, "generate")
-        if self.cfg.generate_stream.enabled:
-            # v1.13 时间流形态（SPEC-stream-generation §3.2/§3.6）分支。
-            await self._run_generate_stream(gen, ctx0)
-            return
         product = await self._await_generate(gen.generate_all(ctx0))
         records: list[Record] = list(product) if product is not None else []
         if self.cfg.limit is not None:
@@ -716,40 +865,13 @@ class Orchestrator:
             await self._dispatch(batch, chain)
             del batch
 
-    async def _run_generate_stream(self, gen, ctx0: RunContext) -> None:
-        """v1.13 时间流形态驱动（SPEC-stream-generation §3.2/§3.6）：一次
-        ``generate_stream_all`` → 工件经 M11 工件通道落盘 → ``counts.generated`` = 进链
-        序列条数 → 直装信封按 batch_size 切批走再流转链（信封已带 session_id/
-        classification/member_classifications，绝不 ``PipelineItem(record=r)`` 裸构造
-        重建）。``--limit`` 已在 M6 计划期配额层前缀截断，此处兜底再截一次。
-
-        @param gen: generate 算子实例
-        @param ctx0: batch_no=0 的生成期上下文
-        """
-        product = await self._await_generate(gen.generate_stream_all(ctx0))
-        if product is None:
-            return                                 # 中断即无产物、无工件、无批次
-        # 工件先于任何批派发落盘（.part + flush；finalize 与主输出同批改名）。
-        self.emitter.write_stream_artifact(list(product.artifact_lines))
-        envelopes = list(product.envelopes)
-        if self.cfg.limit is not None:
-            envelopes = envelopes[: self.cfg.limit]
-        if envelopes:
-            self.metrics.count("counts.generated", len(envelopes))
-        chain = self._compose_chain(include_generate=False)
-        bs = self.cfg.run.batch_size
-        for i in range(0, len(envelopes), bs):
-            if self._stop:
-                break
-            await self._dispatch(envelopes[i:i + bs], chain)
-
     async def _await_generate(self, coro):
         """守护式执行生成协程——与 ``_guarded_batch`` 同形，故 SIGINT/SIGTERM 能停下它：
         ``_request_stop`` 的 30 s 计时器会取消 ``self._current_task``（spec 3.10.3 中断行；
         CONTRACTS §7.9「等当前批 ≤ 30 s 再取消」）。其墙钟像任何启用阶段一样计入
         report.timing.per_stage_s。
 
-        @param coro: 生成协程（``generate_all`` 或 ``generate_stream_all``）
+        @param coro: flat ``generate_all`` 协程
         @return: 协程产物；被我方中断取消时返回 None（生成期中断 ⇒ 无产物，finalize 照常
                  以 interrupted=true 收尾）
         @raises asyncio.CancelledError: 非我方 stop 触发的外部取消原样上抛
@@ -1087,9 +1209,6 @@ class Orchestrator:
                                 or bool(getattr(self.metrics, "circuit_broken", False)))
         if self._circuit_broken:
             exit_code = 4
-        elif self.cfg.generate_stream.enabled and self.metrics.counters.get(
-                "generate.stream.delivery.incomplete", 0):
-            exit_code = 1
         elif self.cfg.strict and self._rejects_lines > 0:
             exit_code = 1
         else:
@@ -1235,7 +1354,7 @@ class Orchestrator:
         run_block["paths"] = self._report_paths()
         artifact = getattr(self.emitter, "artifact_summary", None)
         if artifact:
-            # v1.13（裁决·观测面）：run 摘要族的工件条目（路径/sha256/行数，主输出
+            # run 摘要族的工件条目（路径/sha256/行数，主输出
             # 同款形态）——仅工件通道实际写入时在场（dry-run/形态关闭恒缺席）。
             run_block["artifact"] = dict(artifact)
         if self._circuit_broken:
@@ -1244,7 +1363,7 @@ class Orchestrator:
         return run_block
 
     def _report_paths(self) -> dict:
-        """输出九键绝对路径；旧 fixture 缺少 paths 时按已知字段归一化。"""
+        """输出当前 ResolvedPaths 的完整绝对路径键集。"""
         paths = getattr(self.cfg, "paths", None)
         if paths is not None:
             return {
@@ -1252,7 +1371,8 @@ class Orchestrator:
                 "input": paths.input, "output": paths.output,
                 "report": paths.report, "rejects": paths.rejects,
                 "sidecar": paths.sidecar, "trace": paths.trace,
-                "stream_artifact": paths.stream_artifact,
+                "stream": paths.stream, "manifest": paths.manifest,
+                "failed_report": paths.failed_report,
             }
         project = str(Path(self.cfg.project_path).resolve())
         output = str(Path(self.cfg.run.output).resolve())
@@ -1267,7 +1387,10 @@ class Orchestrator:
             "sidecar": stem + ".meta.jsonl" if self.cfg.output.meta_mode == "sidecar" else None,
             "trace": (str(Path(self.cfg.trace.path).resolve())
                       if self.cfg.trace.enabled and self.cfg.trace.path else None),
-            "stream_artifact": stem + ".stream.jsonl" if self.cfg.generate_stream.enabled else None,
+            "stream": stem + ".stream.jsonl" if self.cfg.generate.form == "sequence" else None,
+            "manifest": stem + ".manifest.json" if self.cfg.generate.form == "sequence" else None,
+            "failed_report": (stem + ".failed.report.json"
+                              if self.cfg.generate.form == "sequence" else None),
         }
 
     def _report_stream(self, c: _CounterView, counts: dict, ingest_report) -> dict:
@@ -1463,7 +1586,7 @@ class Orchestrator:
         return by_class
 
     def _report_generate(self, c: _CounterView) -> dict:
-        """组装 generate 节（按桶计数 + v1.13 时间流子块）。
+        """组装 flat bucket 或 sequence dry-run 精确计划块。
 
         rejected_by_validator 已并入白名单（bug 修复，spec v1.7 §6：M6 自 v1.5 起就在计数，
         报表解析却静默丢弃）；零初始化保住三个恒在字段，第四个仅在其计数器出现时（即配了
@@ -1472,6 +1595,9 @@ class Orchestrator:
         @param c: 计数器视图
         @return: generate 节字典
         """
+        if self.cfg.generate.form == "sequence":
+            estimate = self._estimate_cache or self._estimate()
+            return {"sequence": dict(estimate["sequence"])}
         buckets: dict[str, dict] = {}
         prefix = "generate.buckets."
         for key, value in c.values.items():
@@ -1483,179 +1609,7 @@ class Orchestrator:
                 continue
             buckets.setdefault(bucket, {"calls": 0, "produced": 0,
                                         "survived_dedup": 0})[field_name] = int(value)
-        block: dict = {"buckets": buckets}
-        if self.cfg.generate_stream.enabled:
-            block["stream"] = self._report_generate_stream(c)
-        return block
-
-    def _report_generate_stream(self, c: _CounterView) -> dict:
-        """v1.13（裁决·观测面）时间流子块——counts-only，形态开启才在场；键集与键序冻结；
-        sequences 按声明类零基（report.classify.classes 同款），计数面由 M6 供给
-        （generate.stream.* 前缀）。
-
-        v1.14（裁决·报表显式装配）：档位表非空时在 sequences 之后、frames 之前插入 tiers
-        子块（配额族相邻）——本节是显式键装配而非计数器前缀树，零额档与全作废档的在场由
-        装配保证，不依赖计数器首触序。
-
-        @param c: 计数器视图
-        @return: generate.stream 子块字典
-        """
-        plan = self.cfg.scenario_plan
-        block: dict = {
-            "sessions": len(plan.sessions),
-            "crossed_sessions": self.cfg.generate_stream.crossed_sessions,
-            "sequences": {
-                spec.name: {
-                    "planned": c(f"generate.stream.sequences.{spec.name}.planned"),
-                    "produced": c(f"generate.stream.sequences.{spec.name}.produced"),
-                }
-                for spec in self.cfg.classify.classes
-            },
-        }
-        if self.cfg.generate_stream.tiers:
-            block["tiers"] = self._report_stream_tiers(c)
-        self._append_stream_constraint_report(block, c)
-        block.update({
-            "frames": c("generate.stream.frames"),
-            "noise_frames": c("generate.stream.noise_frames"),
-            "duplicates": c("generate.stream.duplicates"),
-            "brief_calls": c("generate.stream.brief_calls"),
-            "realize_calls": c("generate.stream.realize_calls"),
-            "noise_calls": c("generate.stream.noise_calls"),
-        })
-        self._append_stream_plan_report(block, c)
-        return block
-
-    def _append_stream_plan_report(self, block: dict, c: _CounterView) -> None:
-        """追加 v1.17 planner、delivery 与 quota 报表面。"""
-        plan = self.cfg.scenario_plan
-        block["plan_digest"] = plan.plan_digest
-        block["planner"] = {
-            "models": {
-                name: {"entries": stats.variables + stats.constraints,
-                       "families": {family: {"variables": row.variables,
-                                             "constraints": row.constraints}
-                                    for family, row in stats.families.items()}}
-                for name, stats in plan.models.items()
-            },
-            "objectives": {
-                "preference_deviation": plan.objectives.preference_deviation,
-                "calendar_days_spanned": plan.objectives.calendar_days_spanned,
-                "timeline_end_us": plan.objectives.timeline_end_us,
-            },
-        }
-        target_sequences = len(plan.slots)
-        delivered_sequences = sum(
-            c(f"generate.stream.sequences.{spec.name}.produced")
-            for spec in self.cfg.classify.classes)
-        target_noise = len(plan.noise_slots)
-        delivered_noise = c("generate.stream.noise_frames")
-        target_duplicates = len(plan.duplicates)
-        delivered_duplicates = c("generate.stream.duplicates")
-        failure_keys = (
-            "brief", "realize", "noise", "context_overflow",
-            "sample_validator", "sample_validator_exception", "correlation",
-            "temporal", "sequence_validator", "sequence_validator_exception",
-            "similarity", "scenario_validator", "scenario_validator_exception")
-        failures = {key: c(f"generate.stream.delivery.failures.{key}")
-                    for key in failure_keys}
-        attempts = c("generate.stream.delivery.attempts")
-        complete = (c("generate.stream.delivery.incomplete") == 0
-                    and delivered_sequences == target_sequences
-                    and delivered_noise == target_noise
-                    and delivered_duplicates == target_duplicates)
-        block["delivery"] = {
-            "target_sequences": target_sequences,
-            "delivered_sequences": delivered_sequences,
-            "target_noise": target_noise,
-            "delivered_noise": delivered_noise,
-            "target_duplicates": target_duplicates,
-            "delivered_duplicates": delivered_duplicates,
-            "duplicate_shortfall": max(target_duplicates - delivered_duplicates, 0),
-            "attempts": attempts,
-            "complete": complete,
-            "interrupted": self._interrupted,
-            "exhausted_slots": c("generate.stream.delivery.exhausted"),
-            "failures": failures,
-        }
-        allocations = {quota.name: quota.allocation for quota in self.cfg.generate_stream.quotas}
-        block["quotas"] = [
-            {"name": row.name, "period": row.period, "bucket": row.bucket,
-             "class": row.sequence_class, "target": row.target,
-             "delivered": c(f"generate.stream.sequences.{row.sequence_class}.produced"),
-             "allocation": allocations.get(row.name),
-             "realized_ratio": (c(f"generate.stream.sequences.{row.sequence_class}.produced")
-                                 / row.target if row.target else 0.0),
-             "deviation": c(f"generate.stream.sequences.{row.sequence_class}.produced")
-                          - row.target}
-            for row in plan.quota_summary
-        ]
-
-    def _append_stream_constraint_report(self, block: dict, c: _CounterView) -> None:
-        """按实际配额前缀追加 v1.16 条件报表块。
-
-        @param block: 正在组装的 generate.stream 子块
-        @param c: 计数器视图
-        """
-        rules_active, windows_active = self._stream_constraint_faces()
-        if rules_active:
-            block["frame_rules"] = {
-                "sampled": c("generate.stream.frame_rules.sampled"),
-            }
-        v116_face_active = (
-            rules_active or windows_active
-            or bool(self.cfg.generate.sequence_validator)
-        )
-
-    def _stream_constraint_faces(self) -> tuple[bool, bool]:
-        """按冻结计划的参与类判断 frame_rules/frame_windows 报表条件面。"""
-        rules_active = False
-        windows_active = False
-        for slot in self.cfg.scenario_plan.slots:
-            view = self.cfg.class_views[slot.sequence_class]
-            rules_active |= bool(effective_frame_rules(
-                view.frame_rules, self.cfg.generate_stream.frame_rules))
-            windows_active |= bool(effective_frame_windows(
-                view.frame_windows, self.cfg.generate_stream.frame_windows))
-        return rules_active, windows_active
-
-    def _report_stream_tiers(self, c: _CounterView) -> dict:
-        """v1.14 档位配额子块：按声明档位表零基铺开 planned / produced（v1.15 双形）。
-
-        平面形（全部序列类都回落全局表）= v1.14 原形 ``{"<rank>": …}``，逐 rank 对**全部
-        声明类**的类段计数跨类求和 —— 与 v1.14 报表逐字节相等（彼时的平面计数本就是跨类
-        聚合值）。类嵌套形（任一按类表在场；裁决·嵌套报表全类铺开）=
-        ``{"<class>": {"<rank>": …}}``，外层全部声明类按声明序、内层该类**生效表** rank
-        升序。零配额类与全作废档一律呈现 0/0（显式装配，不依赖计数器首触序）。
-
-        @param c: 计数器视图
-        @return: 平面形或类嵌套形的 tiers 子块（十进制字符串键，键序 = 装配插入序）
-        """
-        cfg, views = self.cfg, self.cfg.class_views
-        names = [spec.name for spec in cfg.classify.classes]
-        if not any(view.tiers is not None for view in views.values()):
-            return self._tier_ranks(c, names, cfg.generate_stream.tiers)
-        return {name: self._tier_ranks(c, [name], effective_tiers(
-            views[name].tiers if name in views else None, cfg.generate_stream.tiers))
-            for name in names}
-
-    def _tier_ranks(self, c: _CounterView, names: list[str],
-                    table: "Sequence[TierSpec]") -> dict:
-        """把一张档位表铺成 ``{"<rank>": {planned, produced}}``，逐 rank 跨给定类段求和。
-
-        @param c: 计数器视图
-        @param names: 参与求和的序列类名（平面形 = 全部声明类；嵌套形 = 该类一个）
-        @param table: 该形态下的档位表（M1 解析期已按 tier_rank 升序定序）
-        @return: rank 升序的十进制字符串键字典
-        """
-        return {
-            str(spec.tier_rank): {
-                field: sum(c(f"generate.stream.tiers.{name}.{spec.tier_rank}.{field}")
-                           for name in names)
-                for field in ("planned", "produced")
-            }
-            for spec in table
-        }
+        return {"buckets": buckets}
 
     def _report_classify(self, c: _CounterView) -> dict:
         """v1.7 §9.3 classify 节：classes 直方图对**全部声明类**零基铺开（声明序）；计数器
@@ -1786,7 +1740,8 @@ class Orchestrator:
 
         wall_s = time.perf_counter() - self._t0
         report = self._build_report(exit_code=0, wall_s=wall_s)
-        self.emitter.finalize(report, deliver=False)   # 只写报告；不存在 .part
+        if cfg.generate.form != "sequence":
+            self.emitter.finalize(report, deliver=False)   # 普通形态只写 dry-run report
         self.metrics.event(_EV_RUN_END, stage="run", batch_no=0,
                            payload={"counts": report["counts"], "exit_code": 0})
         self.metrics.flush()
@@ -1813,10 +1768,43 @@ class Orchestrator:
               f"frame_annotate_calls={est['frame_annotate_calls']} "
               f"verify_calls={est['verify_calls']} total={est['total_calls']} "
               f"(excludes retries and repair calls)", file=sys.stderr)
+        if cfg.generate.form == "sequence":
+            self._print_sequence_estimate(est["sequence"])
         self._print_dry_notes()
-        side_channels = "report and trace only" if cfg.trace.enabled else "report only"
+        if cfg.generate.form == "sequence":
+            side_channels = "trace only" if cfg.trace.enabled else "no files"
+        else:
+            side_channels = "report and trace only" if cfg.trace.enabled else "report only"
         print(f"dry-run: no LLM calls made, no output written ({side_channels})",
               file=sys.stderr)
+
+    @staticmethod
+    def _print_sequence_estimate(sequence: Mapping) -> None:
+        """打印 sequence 精确计划算术与七类 generation 调用。
+
+        @param sequence estimate.sequence 冻结块。
+        @return None。
+        """
+        print(
+            "dry-run: sequence plan — "
+            f"planned_sets={sequence['planned_sets']} "
+            f"planned_sequences={sequence['planned_sequences']} "
+            f"primary_events={sequence['primary_events']} "
+            f"noise_events={sequence['noise_events']} "
+            f"replay_sequences={sequence['replay_sequences']} "
+            f"replay_events={sequence['replay_events']} "
+            f"stream_rows={sequence['stream_rows']}",
+            file=sys.stderr,
+        )
+        calls = sequence["sequence_calls"]
+        rendered = " ".join(f"{key}={calls[key]}" for key in _SEQUENCE_CALL_KEYS)
+        print(f"dry-run: sequence calls — {rendered}", file=sys.stderr)
+        print(
+            "dry-run: sequence attempt bounds — "
+            f"successful_attempt_lower_bound={sequence['successful_attempt_lower_bound']} "
+            f"max_slot_attempts_upper_bound={sequence['max_slot_attempts_upper_bound']}",
+            file=sys.stderr,
+        )
 
     def _print_dry_notes(self) -> None:
         """两条口径注记（措辞固定，与 rich 面板的注记文案严格一致）。
@@ -1864,6 +1852,17 @@ class Orchestrator:
         if self.cfg.run.mode != "generate_only":
             assert self.ingestor is not None, "process mode requires an Ingestor"
             plan = self.ingestor.scan()
+        return self._estimate_for(plan)
+
+    def _estimate_for(self, plan: "IngestPlan | None") -> dict:
+        """用已绑定 sequence 计划或普通 M2 计划生成估算。
+
+        @param plan 普通 process 的 M2 预扫描结果。
+        @return 估算字典。
+        """
+        if self.cfg.generate.form == "sequence":
+            program, scenario = self._require_sequence_plan()
+            return estimate_sequence_products(self.cfg, program, scenario)
         return estimate_run(self.cfg, plan)
 
     # ── 信号 ───────────────────────────────────────────────────────────────

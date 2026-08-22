@@ -2,9 +2,9 @@
 
 > `project.toml` 是工程级配置：一次标注任务的全部意图都写在这里。
 > 本章精讲 `[run]` `[input]` `[output]` `[trace]` 四节的每个参数；
-> 九个算子节（`[dedup]` `[classify]` `[quality]` `[generate]` `[annotate]` `[verify]`、v1.8 的 `[segment]` `[extract]` 与 v1.9 的 `[stitch]`）、
-> 配套的 `[stream]` 输入声明节、v1.12 的帧粒度双节（`[frame.classify]` `[frame.annotate]`）
-> 与 v1.13 的时间流生成节（`[generate.stream]`）在此给出速览，
+> 九个算子节（`[dedup]` `[classify]` `[quality]` `[generate]` `[annotate]` `[verify]`、
+> `[segment]` `[extract]` 与 `[stitch]`）、配套的 `[stream]` 输入声明、帧粒度双节
+> （`[frame.classify]` `[frame.annotate]`）与 sequence form 在此给出速览，
 > 深度解读见第 9–13、24、25、26、27 章。
 
 ## 7.1 文件骨架与最小可用配置
@@ -38,7 +38,7 @@ schema_inline = """
 | `input` | str | process 模式必填 | 输入路径（文件或目录，见第 5 章）。可被 CLI `--input` 覆盖。**`generate_only` 模式下必须不设**——设了（包括用 `--input` 传）直接配置错误 |
 | `output` | str | 必填 | 主输出 `.jsonl` 路径。可被 CLI `--output` 覆盖。其余产物都从它派生：`{stem}.rejects.jsonl`、`{stem}.report.json`、`{stem}.trace.jsonl` 都落在同目录 |
 | `modality` | str | 必填 | `"text"` 或 `"ui"`。决定输入解析方式、去重算法组合、提示词形态 |
-| `mode` | str | `"process"` | `"process"` = 加工既有数据；`"generate_only"` = 无输入纯生成，三形态——种子池 / 无种子（第 12 章）/ **时间流生成**（v1.13，`[generate.stream]`，第 27 章）。 |
+| `mode` | str | `"process"` | `"process"` 加工既有数据；`"generate_only"` 无输入生成。生成形式由 `generate.form` 的 `flat` / `sequence` 决定 |
 | `batch_size` | int | 256 | 批大小。**双重身份**：内存/落盘节奏的单位 + pairwise 质量打分的比较池大小（流模式下还是整会话装箱容量）。用 pairwise 时这是质量口径参数（第 10 章详述），不要只当性能参数调。**它从不影响单次 prompt 体积**——单次调用装多少内容由各算子的条数上限与上下文预算决定（v1.11，第 6 章 `context_window`），调大 batch_size 不会让单个请求变大 |
 | `seed` | int | 0 | 全局随机种子：配对采样、A/B 呈现顺序、生成时的模型/风格抽取全由它驱动。**换 seed = 换一套随机方案**；固定 seed + 固定输入 = 可复现的流程路径。调试 rubric 时保持 seed 不变，对照才有意义 |
 | `fatal_error_threshold` | int | 20 | 熔断阈值：**连续**多少次不可恢复的 API 错误后放弃整个运行（退出码 4）。认证类错误（401/403）不受此阈值约束、**首次出现即熔断**；重试耗尽也计入连续窗口；任何一次成功调用清零计数。调小（如 5）= 对坏端点更敏感、更快止损；调大 = 更能容忍偶发抽风 |
@@ -71,19 +71,28 @@ schema_inline = """
 | `[frame.classify]` | 关（v1.12，仅流模式） | `[[frame.classify.classes]]`（帧类表，启用必填）、`fallback_class`（兜底帧类，启用必填） | 第 24、25 章 |
 | `[extract]` | 关（v1.8） | `llm`（恒需视觉能力）、`instruction`（摘取补充说明）、`include_diff`（树变更摘要注入） | 第 25 章 |
 | `[quality]` | **开** | `mode`（pairwise/pointwise）、`threshold` 或 `selection="top_ratio"`（淘汰机制）、`rubric`（评价准则） | 第 10 章 |
-| `[generate]` | 关 | `instruction`（生成指令）、`num_per_record`（每种子产几条）、`llms`/`styles`（多样性来源） | 第 12 章 |
-| `[generate.stream]` | 关（v1.17，仅 `generate_only`） | finite schedule、day/week/schedule quota、`crossed_sessions`、named `frame_rules`/`frame_windows`、`noise`、`duration/resources`、exact delivery 与 duplicate | 第 27 章 |
+| `[generate]` | 关 | `form = "flat"` 生成独立样本；`form = "sequence"` 生成有世界状态、反事实与 replay 的完整序列 | 第 12、27 章 |
+| `[generate.pattern.*]` / `[[generate.counterfactual_sets]]` | 仅 declared sequence | 命名 role/gap、状态权限、四类变体与精确 count | 第 27 章 |
+| `[[generate.instruction_only]]` | 仅 instruction-only sequence | 直接声明 sequence class、count、len_range、instruction 与可选 state Schema | 第 27 章 |
 | `[annotate]` | **开** | `instruction`（标注指令，开了就必填）、`examples`（few-shot）、`self_consistency`（多次采样投票） | 第 11 章 |
-| `[frame.annotate]` | 关（v1.12，仅流模式） | `instruction`（帧标注指令，启用必填）、`schema_path`/`schema_inline`（独立帧 Schema，恰一）、`[frame.class.<名>.annotate]`（按帧类覆盖/跳过） | 第 11、25 章 |
+| `[frame.annotate]` | 关（process 流或 sequence） | `instruction`（帧标注指令，启用必填）、`schema_path`/`schema_inline`（独立帧 Schema，恰一）、`[frame.class.<名>.annotate]`（按帧类覆盖/跳过） | 第 11、25、27 章 |
 | `[verify]` | 关 | `llm`（评审 profile，建议独立模型）、`policy`（drop/repair）、`extra_criteria`（追加评审维度） | 第 13 章 |
 
 `[classify]` 是 v1.7 新增的分类算子节：按你声明的类别表对每条存活记录做 LLM 封闭集分类，类标签写进 `_meta.classification` 并驱动下游「按类条件化」。启用后另有一族按类覆盖节 **`[class.<name>.<section>]`**——对某个类别单独覆盖 quality / annotate / generate / verify（v1.8 起还有 extract 的 instruction）的白名单参数（按类 rubric、按类标注指令等），类未覆盖的键继承全局。完整键表、白名单与合并语义见第 24 章与 spec §5.2。
 
 v1.8/v1.9 新增的四节同属**流模式**一族：`[stream]` 声明输入的时间序与会话切分规则（排序依据、分区键、断开条件——它不是算子，随 `segment.enabled` 生效）；`[segment]` 是流模式的总开关，把候选会话经 LLM 边界精化切成语义完整的 episode 并剔除噪声帧；`[stitch]`（v1.9）把同一任务被穿插切开的 episode 碎片保守缝合成完整线索，并可救援过短被剔的收尾帧（要求 segment 开启）；`[extract]` 对 episode 的每对相邻帧推断结构化动作（仅 UI 模态，要求 segment 开启）。四节的逐键详解与完整示例见第 25、26 章。
 
-v1.17 的 `[generate.stream]` 是 generate_only 的第三形态：先用 finite fixed-offset schedule、具名 day/week/schedule quota、frame rule/window、跨 sequence rule、duration/resource 与 structured noise 编译唯一 `ScenarioPlan`，再按固定 slot 有界交付。旧 `sessions`、`ts_start`、`rules`、`windows` 与按类 `sequences` 均为定向 CONFIG_ERROR；四类 hook 统一使用 `path.py:function` 并相对 project root 解析。详细配置见第 27 章，全键表见附录 A.13。
+sequence form 在 `[generate]` 选择 `declared` 或 `instruction_only`。配置加载后先编译
+`GenerationProgram` 和 `ScenarioPlan`，再读取凭据和运行内容调用。declared 用命名 pattern 与
+counterfactual set；instruction-only 用独立 slot。timeline、calendar window、noise 与 replay 都属于这一个
+序列配置面。详细配置见第 27 章，全键表见附录 A.13。
 
-v1.12 的帧粒度双节也是流模式一族（都要求 `segment.enabled = true`），但它们不是新算子——`[frame.classify]` 让 classify 算子顺带对 episode 成员帧做批量闭集分类（帧类表与序列类表互相独立），`[frame.annotate]` 让 annotate 算子逐成员做帧级标注（独立的帧 Schema），配套的 `[frame.class.<帧类名>.annotate]` 按帧类覆盖指令或跳过整类。帧产物挂 `_meta.stream.members[]` 随序列行交付。逐键详解见第 25 章 25.6，全键表见附录 A.12。
+`[frame.classify]` 只消费 process 流模式的 episode，因此始终要求 `segment.enabled=true`。`[frame.annotate]`
+有两个入口：process/flat 仍要求 segment，并在序列标注成功后处理成员；sequence form 已由生成计划提供成员和
+inherited frame class，可脱离 segment，也可在 `annotate.enabled=false` 时直接运行。后一种组合必须开启
+pointwise quality，序列标注调用为零；任一应标注帧失败都会拒绝并重试整个 counterfactual set。帧产物同时进入
+main 的 `_meta.stream.members[]` 与对应 primary stream 行的 `_meta.annotation`。完整例子见
+`examples/sequence-generation/project-frame-only.toml`。
 
 开关组合的合法性约束见 4.5 节（M1 启动时强制检查）。
 
@@ -98,7 +107,9 @@ v1.12 的帧粒度双节也是流模式一族（都要求 `segment.enabled = tru
 
 **恰好提供其一**（都给或都不给 = 配置错误）。Schema 必须是合法的 JSON Schema **draft 2020-12**、顶层为 object、且**不得声明 `_meta` 属性**（那是 LabelKit 的保留键）。启动时会用元 Schema 预校验，写错立即退出码 2。Schema 怎么写才对 LLM 友好，第 14 章有专门的编写指南。
 
-开了分类算子时，这份 Schema 可以被**按类覆盖**：`[class.<类名>.annotate].schema_path` / `schema_inline`（至多其一，v1.13）——声明了就用类的、没声明的类回落到这里。「恰一」的规则不因按类覆盖而豁免：全部类都自带 Schema 时 `[output]` 这份只是回落占位。用法与真实对照见第 27 章 27.6。
+开了分类或 sequence class 路由时，这份 Schema 可以被**按类覆盖**：
+`[class.<类名>.annotate].schema_path` / `schema_inline`（至多其一）。声明了就用类的，未声明就回落全局。
+sequence 示例的按类 Schema 见第 27 章。
 
 选哪个？Schema 短（≤ 30 行）内嵌，随工程文件一目了然；Schema 长或多工程共用，外部文件。
 

@@ -10,12 +10,12 @@ format implicit, the decision is frozen here and tagged **[FROZEN HERE]** (all s
 also listed in §12). Any deviation requires editing this file first.
 
 The v1.18 source is commit `baaa4bf`; the frozen specification SHA-256 is
-`8d2221e8c17004641b1409b6ea4f7cab1c69522258c58fe3331b3d3aca5123b6`.
+`f307339edee752df75d8ec6f0b457bcd0cae8773c81c6ebbd05323fe8d5b9c0f`.
 
 Ground rules for every implementer:
 
 - Python ≥ 3.11. Deps: `httpx`, `jsonschema`, `datasketch`, `Pillow`, `imagehash`, `json_repair`,
-  `numpy`, `jsonpatch`, stdlib `tomllib`, and — v1.10 (U4, spec §2.6 whitelist revision) — `rich`, CLI-layer
+  `numpy`, `jsonpatch`, `jsonpointer`, stdlib `tomllib`, and — v1.10 (U4, spec §2.6 whitelist revision) — `rich`, CLI-layer
   only: lazily imported inside `labelkit/cli/console.py`, the sole touchpoint (operators/common
   never import it; M1 probes importability via `find_spec` without importing); v1.18 retains the
   narrow algorithm-library exception `ortools==9.15.6755`, imported only by
@@ -102,9 +102,11 @@ labelkit/
 │   │   ├── _rubrics.py                 # rubric resolution: inline table and packaged default:* selectors (package-private)
 │   │   ├── _classviews.py              # [class.*] / [frame.class.*] whitelist merge into class views (package-private)
 │   │   ├── _constraints.py             # cross-section constraint driver and parse products (package-private)
+│   │   ├── _generation_budget.py       # v1.18 sequence content limits and six-family budget proof
 │   │   └── generation.py                # v1.18 sequence-generation parsing and typed config carriers
 │   ├── runtime/
 │   │   ├── budget.py                   # v1.11 context-budget primitives + ImageCostCalibrator (§7.17)
+│   │   ├── generation_prompts.py       # v1.18 六个 sequence family 的共享精确构造器
 │   │   ├── llm_client.py               # M9 transport, retry/key pools, concurrency, usage
 │   │   ├── schema_engine.py            # M8 L0-L3 guarantee, repair, schema validation/stats
 │   │   └── credentials.py              # secret materialization for run / validate --probe
@@ -183,7 +185,8 @@ in `tests/common/runtime/test_llm_client.py`; stream-ingest coverage belongs in
 plain line formats — the golden-snapshot layer of the three-layer regression anchor, U24);
 v1.18 sequence-generation coverage mirrors its production owners: configuration in
 `tests/common/config/test_generation.py`; frozen carriers in
-`tests/common/contracts/test_generation.py`; pure compiler/planner/scenario/state/render/evaluate/
+`tests/common/contracts/test_generation_contracts.py`; shared prompt contracts in
+`tests/common/runtime/test_generation_prompts.py`; pure compiler/planner/scenario/state/render/evaluate/
 project behavior in `tests/operators/generation/`; transactional delivery in
 `tests/orchestration/test_generation_delivery.py`; and real endpoint coverage in
 `tests/integration/test_sequence_generation_llm.py` plus
@@ -194,6 +197,7 @@ project behavior in `tests/operators/generation/`; transactional delivery in
 real DeepSeek and z.ai routes prescribed by the repository guidance; no mock LLM transport is
 introduced. Existing seam coverage remains with `test_config.py`, `test_paths_hooks.py`,
 `test_types.py`, `test_hooks.py`, `test_budget.py`, `test_credentials.py`,
+`test_generation_prompts.py`,
 `test_schema_engine.py`, `test_dedup.py`, `test_quality.py`, `test_annotate.py`,
 `test_verify.py`, `test_emitter.py`, `test_ingest.py`, `test_orchestrator.py`, and the CLI tests.
 A separate compatibility-import test,
@@ -540,11 +544,11 @@ class PipelineItem:                        # the ONLY mutable envelope; lifetime
                                            # gate: `transitions is not None` → skip)
     member_classifications: dict[str, Classification] | None = None
                                            # v1.12 additive: written by the M13 classify frame
-                                           # pass on first-label sequence envelopes (§7.13);
-                                           # key = member record.id; None = frame classify off /
-                                           # not reached (idempotency gate); fan-out clones SHARE
-                                           # the dict BY REFERENCE (the record/dedup family,
-                                           # copied explicitly by classify._fan_out)
+                                           # pass or inherited from the v1.18 projector;
+                                           # key = member record.id; None = no member-class route /
+                                           # not reached (sequence generation always supplies it);
+                                           # fan-out clones SHARE the dict BY REFERENCE (the
+                                           # record/dedup family, copied by classify._fan_out)
     member_annotations: dict[str, Annotation] | None = None
                                            # v1.12 additive: written by the M5 annotate frame
                                            # pass (same execution gate); key = member record.id;
@@ -1285,6 +1289,7 @@ class NoiseSpec:
 
     frame_class: str
     instruction: str
+    topics: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -1293,13 +1298,15 @@ class GenerationLimits:
 
     pattern_roles: int = 32
     variants_per_counterfactual_set: int = 8
-    instruction_only_events: int = 64
+    instruction_only_events: int = 8
     scenario_seed_bytes: int = 65536
     state_or_outcome_schema_bytes: int = 65536
     frame_schema_bytes: int = 65536
     event_patch_bytes: int = 16384
     rendered_payload_bytes: int = 65536
-    instruction_bytes: int = 32768
+    prompt_value_bytes: int = 32768
+    repair_context_bytes: int = 32768
+    prompt_text_bytes: int = 32768
     record_units: int = 500000
     stream_rows: int = 500000
     retained_content_bytes: int = 536870912
@@ -1654,10 +1661,13 @@ class FrameClassifyConfig:                        # v1.12: M13 frame-level close
 
 @dataclass(frozen=True)
 class FrameAnnotateConfig:                        # v1.12: M5 frame-level per-member annotation
-                                                  # (default off; stream mode only). NO
+                                                  # (default off; process/flat requires stream;
+                                                  # sequence generation is the explicit exception).
+                                                  # NO
                                                   # self_consistency (explicit key = DIRECTED
                                                   # CONFIG_ERROR, rule 48)
-    enabled: bool = False                         # true ⇒ segment.enabled = true (rule 43)
+    enabled: bool = False                         # true ⇒ segment.enabled outside sequence form
+                                                  # (rule 43)
     llm: str = "default"                          # UNCONDITIONALLY in the vision set under
                                                   # ui ∧ enabled (screenshots are the primary
                                                   # annotation evidence — sequence-annotate mirror)
@@ -2100,9 +2110,12 @@ regardless of any switch — the rule-32/38 "checked regardless" family):
 
 Frame granularity (v1.12, SPEC-frame-annotation §3.1 — the seven-row constraint table; all
 checks apply only when the named switch is on unless stated):
-43. **帧粒度要求流模式** — `frame.classify.enabled ∨ frame.annotate.enabled` ⇒
-    `segment.enabled = true`; the error text points non-stream projects at
-    `classify + [class.<name>.annotate]`. Reference sets: `frame.classify.llm` /
+43. **帧粒度的 segment 边界** — `frame.classify.enabled` ⇒ `segment.enabled = true`；
+    `frame.annotate.enabled ∧ generate.form!="sequence"` ⇒ `segment.enabled = true`。
+    `generate.form="sequence"` 是 frame annotation 的显式例外：它允许
+    `frame.annotate.enabled=true ∧ segment.enabled=false`，但绝不放宽 frame classification。
+    process/flat 的错误文本把非流工程指向 `classify + [class.<name>.annotate]`。Reference sets:
+    `frame.classify.llm` /
     `frame.annotate.llm` each join the existence/key-resolution/probe sets
     (`labelkit.common.runtime.credentials.referenced_profiles()`) iff their own switch is
     on; the vision set takes ONLY `frame.annotate.llm` (ui ∧ enabled, unconditional — the
@@ -2152,12 +2165,14 @@ checks apply only when the named switch is on unless stated):
     marked seen so the unknown-key forward-compat warning never double-reports; the guidance
     points at the sequence-level `[classify].assignment` / `[annotate].self_consistency`).
 49. **frame 表停放警告** — no-op (non-blocking WARN): the `[frame]` table present ∧ neither
-    frame switch on ∧
-    `segment.enabled = false` ⇒ "[frame]" joins the v1.8 R8 parked-tables warning (one line
-    naming the ignored tables); with either frame switch on, rule 43's CONFIG_ERROR takes
-    over and the parked entry never appears. `generate.form="sequence"` also keeps `[frame]`
-    out of the parked list because its frame registry is live; `[segment]`, `[stitch]` and
-    `[extract]` continue to warn.
+    frame switch on ∧ `segment.enabled = false` ⇒ "[frame]" joins the v1.8 R8 parked-tables
+    warning (one line naming the ignored tables). Without segment, enabled frame classification
+    or process/flat frame annotation takes rule 43's CONFIG_ERROR path and never adds a parked
+    entry. Sequence frame annotation is the explicit valid exception: with
+    `generate.form="sequence" ∧ frame.annotate.enabled=true ∧ segment.enabled=false`, `[frame]`
+    is live and produces neither rule 43 error nor parked warning. Sequence generation also keeps
+    `[frame]` out of the parked list when both frame switches are off because its frame registry is
+    live; `[segment]`, `[stitch]` and `[extract]` continue to warn.
 
 Sequence generation (v1.18; every rule in this group is a clean breaking boundary):
 
@@ -2187,9 +2202,13 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
 
 53. **Profiles and full context** — `semantic_llm` and `evaluation_llm` are non-empty,
     distinct profile names; both profiles exist, resolve through rule 12 and explicitly
-    declare `context_window > 0`. Both are text profiles. M1 validates the complete minimum
-    prompt plus complete JSON Schema plus `max_output_tokens` plus the frozen margin for
-    every v1.18 family. Runtime prechecks use the complete actual prompt and Schema.
+    declare `context_window > 0`. Both are text profiles. M1 validates the complete configured
+    prompt scaffold plus complete JSON Schema and fixed dynamic-value byte envelopes, together
+    with `max_output_tokens` and the frozen margin, for every v1.18 family. This includes every
+    parsed VariantSpec outcome Schema; a raw TOML path string is not a substitute. The shared
+    builders in `common/runtime/generation_prompts.py` are the sole prompt construction source
+    for M1 and runtime. Runtime prechecks first enforce each complete dynamic value and then use
+    the complete actual prompt and Schema.
     ScenarioSeed, ActorView, EventDraft semantic history, patch, payload, full state and direct
     SemanticEvaluationRequest fields are never truncated or summarized to pass a budget.
     EventTrace is never a prompt carrier.
@@ -2212,8 +2231,11 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
     `[frame.class.<name>]`; each has a non-empty description and every referenced or noise
     class has non-empty `[frame.class.<name>.generate].instruction` plus exactly one of
     `schema_path|schema_inline`. Each Schema is valid Draft 2020-12, local-`$ref`
-    resolvable, object-rooted and within the fixed byte limit. String payloads and deleted
-    `time_fields` are rejected.
+    resolvable, object-rooted and within the fixed byte limit. Every runtime-generatable frame
+    Schema has a non-empty root `examples` array with at least one object passing that complete
+    Schema. M1 chooses the unique minimum valid object by canonical byte length then canonical
+    bytes and requires it to fit both the prompt-value and payload limits. String payloads and
+    deleted `time_fields` are rejected.
 
 57. **Pattern identity and total order** — declared mode requires one or more uniquely named
     `[generate.pattern.<name>]` entries. Each references a sequence class, has 1..32 unique
@@ -2256,7 +2278,7 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
     uniquely named `[[generate.instruction_only]]` rows and forbids patterns,
     counterfactual sets, role permissions, outcome Schemas and expected violations. Every
     row references a sequence class, has exact `count >= 1`, non-empty instruction,
-    `len_range` with `1 <= low <= high <= 64`, and an optional object-root state Schema
+    `len_range` with `1 <= low <= high <= 8`, and an optional object-root state Schema
     whose absent value compiles to the fixed object Schema. It never uses a catalog.
     Declared mode forbids instruction-only rows.
 
@@ -2276,7 +2298,9 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
 
 64. **Noise and replay** — `noise_events > 0` iff `[generate.noise]` is present; its frame
     class is not used by any role and has an object generation Schema. Noise instruction is
-    non-empty. `duplicate_sequences` non-replacement sources are positive primary
+    non-empty, and `topics` is a non-empty unique string array whose length equals
+    `noise_events`; topic at each ordinal is frozen into that `NoiseSlot`. `duplicate_sequences`
+    non-replacement sources are positive primary
     sequences chosen by declaration order then scenario index; insufficient sources fails
     at compile time. Each replay owns a tail session. Instruction-only requires zero
     duplicates. Noise, replay and their timestamps are exact planned slots, never best
@@ -2290,9 +2314,15 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
     `state_validator` is the v1.18 state-transition hook.
 
 66. **Static size and cardinality limits** — the fixed limits are pattern roles 32, variants
-    per set 8, instruction-only events 64, ScenarioSeed 65536 canonical UTF-8 bytes,
+    per set 8, instruction-only events 8, ScenarioSeed 65536 canonical UTF-8 bytes,
     state/outcome Schema 65536 bytes, frame Schema 65536 bytes, patch 16384 canonical bytes,
-    payload 65536 canonical bytes and instruction 32768 UTF-8 bytes. Derived
+    payload 65536 canonical bytes, one complete runtime prompt value 32768 UTF-8 bytes,
+    one L3 newly appended message-body set 32768 UTF-8 bytes, and one generation prompt text
+    32768 UTF-8 bytes. Generation prompt text means each class/frame/pattern description and
+    each class/frame/role/instruction-only/noise instruction independently. Non-default LLM
+    state Schemas and every outcome Schema also require a non-empty root `examples` array with
+    at least one valid object; the fixed default `{"type":"object"}` state Schema uses `{}`.
+    Derived
     `record_units = primary_sequences + primary_events + noise_events + replay_events` and
     `stream_rows = primary_events + noise_events + replay_events` each lie in
     `1..500000`; Python integers are range-checked before creating OR-Tools IntVars.
@@ -2319,14 +2349,16 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
     delivery/catalog cardinality shells and complete budgets, then freezes the canonical program
     digest before API key values are read or an LLM is called. ScenarioPlanner alone expands
     DeliverySlots, assigns `catalog_row_index`, allocates blocks and builds the CP-SAT plan.
+    `run.seed` is frozen into `GenerationProgram.planner_seed` before its digest is computed.
     Validate, dry-run and run call the same compiler and the same single
-    `compile_scenario_plan(program, seed)` entry. Only OPTIMAL decodes; INFEASIBLE is exit 2,
+    `compile_scenario_plan(program)` entry. Only OPTIMAL decodes; INFEASIBLE is exit 2,
     FEASIBLE/UNKNOWN/MODEL_INVALID follow the frozen plan-budget/internal exit-4 matrix. There is
     no greedy solver, incumbent use or runtime relaxation.
 
 70. **Sequence paths are conflict-free** — M1 freezes main, stream, report, manifest and
     failed-report paths plus null rejects/sidecar. Fixed paths and every same-directory
-    `.part` path are pairwise distinct, parents exist and are writable. Sequence delivery
+    `.part` path are pairwise distinct, parents exist and are writable; any target that already
+    exists must be a non-symlink writable regular file. Sequence delivery
     delays opening main/stream/report/manifest until all slots, projections and reconciliation
     pass. Failed-report is the only failure channel and is opened only when a run has begun.
 
@@ -2483,8 +2515,10 @@ Text parsing (3.2.5): non-object JSON line = bad line; `input.text_field` dotted
 used as-is; array/object hit serialized with canonical JSON; miss = bad line; empty lines skipped
 silently (not counted as bad).
 
-v1.18 replay envelope mapping is an additional fail-closed branch of text parsing, activated when
-the input rows match §9.5's `payload` + `_meta.event` envelope. Object `payload` becomes canonical
+v1.18 replay envelope mapping is an additional fail-closed branch of text parsing. Detection scans
+all non-empty lines; if any parseable row contains §9.5's `_meta.event` envelope, the entire input
+is strictly re-read as generation stream, so an earlier malformed or ordinary row cannot use
+`input.on_bad_line="skip"` to bypass provenance checks. Object `payload` becomes canonical
 Record.text and Record.raw remains the full row. M2 validates event/owner/replay IDs, primary
 group ordering and duplicate provenance from that file before yielding sessions. It recomputes
 each formula in §7.18 and rejects the entire input on malformed, duplicate, missing-source or
@@ -2797,11 +2831,11 @@ def build_frame_annotate_prompt(member: Record, cfg: ResolvedConfig,
     [FROZEN HERE]. schema_text = the canonical single-line dump of
     cfg.frame_schema (the user_schema_text form: ensure_ascii=False,
     separators=(", ", ": ")). label non-None → instruction/examples come from
-    cfg.frame_class_views[label] (the frame-class override view); None = the
-    global [frame.annotate] pair (the all-member form when frame.classify is
-    off). The budget packing enters through the private assembler's trailing
-    ``fit`` parameter (annotate_member), never here — the build_annotate_prompt
-    construction."""
+    cfg.frame_class_views[label] (the frame-class override view); None means the member
+    genuinely has no classification and selects the global [frame.annotate] pair. A disabled
+    classifier switch alone never clears an inherited v1.18 label. The budget packing enters
+    through the private assembler's trailing ``fit`` parameter (annotate_member), never here —
+    the build_annotate_prompt construction."""
 
 
 async def annotate_member(member: Record, ctx: RunContext,
@@ -2814,12 +2848,15 @@ async def annotate_member(member: Record, ctx: RunContext,
     existing verify→annotate leg). Routes complete_validated(prof, prompt,
     schema=cfg.frame_schema, scope=CallScope(...)) EXPLICITLY — internal-schema
     treatment: L0–L3 all present, NO L2.5 hook, NO resolved_at counting (the §9.3 identity
-    "resolved_at sum = records entering M5" stays unpolluted). FAILURE RETURNS
-    None, NEVER RAISES a record-level exception (member failure ≠ envelope
-    failure; CircuitBreakerTripped / KeyboardInterrupt / CancelledError are
-    run-level control flow and propagate): repair exhaustion / unrecoverable
-    errors count frame_annotate.failed + ONE data-free stderr WARN; success
-    counts frame_annotate.annotated. The frame prompt is the MINIMAL UNIT
+    "resolved_at sum = records entering M5" stays unpolluted). Failure behavior is execution-
+    surface specific. In ordinary process/flat member isolation, recoverable content, Schema and
+    provider errors count frame_annotate.failed, emit ONE data-free stderr WARN and return None;
+    the envelope may continue. In a sequence attempt, `SchemaViolation`, `ContextOverflowError`,
+    `OutputTruncatedError`, `ProviderRetryableError` and other recoverable content/provider errors
+    are re-raised to `run_attempt` rather than converted to None, so the controller rejects and
+    retries the whole set. `CircuitBreakerTripped`, `ProviderFatalError`, `KeyboardInterrupt` and
+    `CancelledError` remain run-level control flow and propagate on both surfaces. Success counts
+    frame_annotate.annotated. The frame prompt is the MINIMAL UNIT
     (single member, ≤ 1 image — no window to split, no keyframes to shrink),
     so there is NO degrade ladder: a post-trim overflow is precheck-shaped and
     never feeds the breaker (reactive-400 terminals feed exactly once, A7).
@@ -2884,25 +2921,38 @@ dropping it there would silently downgrade repair re-annotation to the uniform d
 (§7.6).
 
 v1.12 frame pass (SPEC-frame-annotation §3.3; the two frozen sequence-level signatures
-above are ZERO-CHANGE): after a sequence envelope's OWN annotation succeeds — and only
-then: a sequence-level failure never pays for frame annotation (链位与成本 ruling — the
-frame pass sits after the quality gate by construction) — the stage appends a per-member
-pass under the execution gate `frame_annotate.enabled ∧ status=="active" ∧
+above are ZERO-CHANGE): sequence and frame annotation have independent switches.
+`annotate.enabled=true` runs the envelope annotation first and appends the frame pass only after
+that succeeds; a sequence-level failure still never pays for frame annotation. The frame-only
+route is frozen as `annotate.enabled=false ⇒ direct frame pass`: it builds no sequence prompt,
+performs no sequence Schema call and leaves `item.annotation=None`. In v1.18 sequence form this
+route remains valid with `segment.enabled=false`. Both routes place the frame pass after the
+quality gate and apply the execution gate `frame_annotate.enabled ∧ status=="active" ∧
 record.kind=="sequence" ∧ first-label envelope (clone criterion `classification.label !=
 classification.labels[0]` — the first-label test shared with verify's member surgery, S8;
 no classification counts as first-label) ∧
 no `segment_degraded` duck mark (degraded = noise unfiltered — never pay for junk
 frames). Dict semantics (the SINGLE SOURCE OF TRUTH for the §9.1 members[] status
 three-value set): the pass initializes `item.member_annotations` to `{}` the moment it
-runs (distinct from the never-ran `None`); per member — the frame-class view
-(`frame_class_views[label]`, label from `member_classifications`; frame.classify off ⇒
-label None ⇒ global instruction) with `enabled=false` SKIPS the member and leaves NO key
-(+ `frame_annotate.skipped`); otherwise `annotate_member` occupies the key — Annotation
-on success, None on irreparable failure (failed 占键为 None，skipped 不占键). Existing
+runs (distinct from the never-ran `None`). Per member, label routing always reads
+`item.member_classifications[member.id]` when present; `frame.classify.enabled=false` does not
+imply `label=None`. The v1.18 projector writes an inherited frame classification for every
+generated member, so the attempt-local `frame_class_views[label]` is the corresponding
+`GenerationProgram.frame_classes[label]` view and supplies its class-effective instruction,
+few-shot examples and enabled flag. Only a genuinely absent member classification in ordinary
+process/flat input selects the global frame instruction. A selected view with `enabled=false`
+SKIPS the member and leaves NO key (+ `frame_annotate.skipped`); otherwise `annotate_member`
+occupies the key in ordinary process/flat — Annotation on success, None on an isolated member
+failure (failed 占键为 None，skipped 不占键). In a sequence attempt, a recoverable member error
+is propagated instead of occupying the key. Existing
 keys are never re-run (idempotent — the M7 backfill fills gaps only, §7.6) and the dict
 OBJECT is never replaced (fan-out clones share it by reference, §7.13). Concurrency:
-members gather under the profile semaphore; isolation is guaranteed by annotate_member's
-no-raise contract. One `annotate.frame` event per member incl. skipped ones (§8.1).
+`_frame_pass` submits pending members in declaration order through
+`asyncio.gather(return_exceptions=True)`, waits for every started member to settle, then scans the
+aligned results in the same member declaration order and raises the first exception. This prevents
+siblings from mutating attempt-local annotations or counters after `run_attempt` returns; the
+controller then performs whole-set retry. One `annotate.frame` event per member incl. skipped
+ones (§8.1).
 Counters owned here: `frame_annotate.annotated`/`skipped`/`failed` (§9.3; failed is also
 fed by the M11 pre-write backstop, §7.10).
 
@@ -3103,6 +3153,7 @@ class CallScope:
     batch_no: int = 0
     record: Mapping | None = None
     user_treatment: bool | None = None
+    repair_context_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -3176,9 +3227,36 @@ request's validator exactly once. Non-empty string violations with
 Empty violations plus a non-null EventExecution are the only success shape. Any other shape,
 non-string violation or non-`PostValidationResult` return is `post_validator_invalid`;
 callback exceptions are `post_validator_exception`. Those two terminal candidate errors do
-not enter L3 and never include exception text or user content. L3 receives violations only,
-never state, EventExecution or hook exceptions. The accepted EventExecution is returned and the
-caller must not execute the patch or state hook again.
+not enter L3 and never include exception text or user content. EventPlan L3 replays the original
+prompt-safe request messages, appends the previous candidate as an assistant message, then
+appends one user repair message containing only controlled violations. It never adds state beyond
+the ActorView/visible state already present in the original prompt, nor does it add EventExecution
+or hook exceptions. The accepted EventExecution is returned and the caller must not execute the
+patch or state hook again.
+
+The configured state validator follows that same closed classification: a runtime invalid
+`list[str]` return becomes `post_validator_invalid`, an exception becomes
+`post_validator_exception`, and a valid non-empty list enters L3 as controlled post-validator
+violations; exhaustion is reported as `state_transition`. There are no
+`state_validator_invalid`, `state_validator_exception` or `state_validator_violation` buckets.
+
+StateExecutor renders every pre-state/base-state/final-outcome Draft 2020-12 violation as
+`<kind>:<json-pointer>:<validator-keyword>`, sorted by safe instance pointer then keyword and
+deduplicated. The pointer is derived only from explicit `properties` names encountered while
+walking the error's `absolute_schema_path`; raw `absolute_path` is never serialized. Dynamic keys
+or indexes from `patternProperties`, `additionalProperties`, `propertyNames`, `items` or
+`prefixItems` are truncated to the deepest explicit-properties parent. The RFC 6901 root pointer
+is the empty string, for example
+`state_schema::required`. The only kinds are `pre_state_schema`, `state_schema` and
+`outcome_schema`. These controlled post-validator strings never include actual/expected values,
+the full state or a jsonschema message, and all violations—not only the first—enter the same
+bounded repair list. On a declared branch's final event, the hidden baseline selects the positive
+variant outcome Schema when that optional variant exists; without one it performs only the base
+state check. A delivery branch selects the `context.variant_name` outcome Schema. The final-event
+EventPlanRequest renders that complete Schema as an existing branch postcondition, but never the
+variant name, expected violation or target. Instruction-only and non-final events render `null`
+and skip this second outcome check. StateEvaluator still replays and verifies the outcome
+independently.
 
 Post-validators are request-local and are never stored on SchemaEngine. Scenario seed, frame
 render, semantic evaluation and noise use `complete_validated`; only event planning uses
@@ -3426,8 +3504,11 @@ images `{"type":"image_url","image_url":{"url":"data:<media>;base64,<b64>"}}`; s
 "schema":<schema>}}`. `anthropic` POST `{base_url}/v1/messages` with `x-api-key` +
 `anthropic-version: 2023-06-01` **[FROZEN HERE]**; images `{"type":"image","source":
 {"type":"base64","media_type":...,"data":...}}`; structured output = single tool with the schema
-as `input_schema` and `tool_choice={"type":"tool","name":"emit"}` **[FROZEN HERE: tool name
-"emit"]**, result surfaced in `LLMResponse.structured`. Retries: retryable = network error,
+as `input_schema`, `tool_choice={"type":"tool","name":"emit"}`, and description
+`Use this tool to return the final JSON object requested by the user. Populate every required field
+according to input_schema. Do not answer with prose or Markdown. Call the tool exactly once.`
+**[FROZEN HERE: tool name and description]**, result surfaced in `LLMResponse.structured`.
+Retries: retryable = network error,
 timeout, HTTP 408/409/429/5xx; wait for attempt i = `random.uniform(0, retry_base_delay_s * 2**i)`
 capped at 60 s (this jitter RNG is NOT seed-derived — timing only **[FROZEN HERE]**) — v1.6:
 this inter-attempt backoff applies to network errors/timeouts/408/409/5xx ONLY; ALL 429 waiting
@@ -3739,7 +3820,7 @@ v1.18 sequence-delivery orchestration:
 
 - **Separate driver.** `Orchestrator.run` branches on
   `cfg.generate.form == "sequence"` before the flat `_run_generate` path. It calls
-  `compile_generation_program(cfg)`, then `compile_scenario_plan(program, cfg.run.seed)`,
+  `compile_generation_program(cfg)`, then `compile_scenario_plan(program)`,
   derives `run_attempt_id` and self-reference-free `run_id`, materializes
   `RuntimeCredentials` only after compile succeeds, and invokes
   `deliver_generation(DeliveryRequest(...), DeliveryServices(...))`. The sequence branch
@@ -3762,8 +3843,10 @@ v1.18 sequence-delivery orchestration:
   separately added to `total_calls`. Existing top-level quality, annotate,
   frame-annotate and verify keys are attempt upper bounds. Dry-run additionally exposes exact
   planned sets, primary sequences/events, noise events, replay sequences and stream rows,
-  plus `successful_attempt_lower_bound` and the max-slot-attempt upper bound. Catalog seed
-  calls are zero; protected prefixes add no plan/render call.
+  plus `successful_attempt_lower_bound` and the max-slot-attempt upper bound. The lower bound is
+  one successful attempt for every planned delivery slot plus every noise slot and enabled
+  downstream call across the full run; the upper bound lets each delivery slot consume
+  `max_slot_attempts`. Catalog seed calls are zero; protected prefixes add no plan/render call.
 - **Report assembly.** The delivery controller supplies the frozen sequence report node and
   usage accumulated across every attempt. M10 does not infer counters from terminal
   PipelineItems and does not add old stream/quota/tier/brief/realize/shortfall keys.
@@ -3884,15 +3967,11 @@ class SequenceDeliveryEmitter:
 
     def assemble_sequence(
         self,
-        item: PipelineItem,
-        projection: ProjectedSequence,
-        batch_no: int,
+        request: SequenceAssemblyRequest,
     ) -> SequenceRows:
-        """从下游原地修改后的 item 装配最终内存行。
+        """从闭包请求装配最终内存行并执行 program-bound Schema 终检。
 
-        @param item 下游协作者处理后的唯一 PipelineItem。
-        @param projection 与该 item 对应的生成侧投影。
-        @param batch_no 交付批序号。
+        @param request 冻结 program、M8、最终 item、投影与交付批序号。
         @return 最终 main/primary stream rows 与 retained-content 费用。
         """
 
@@ -3927,15 +4006,24 @@ class SequenceDeliveryEmitter:
 
 Construction and attempts open no main, stream, report, manifest, rejects or sidecar channel.
 `assemble_sequence` and `prepare_product` are pure-memory, zero-I/O methods with the exact
-§7.18.2 signatures. After every slot, noise, replay projection, retained-content check and
-CrossView reconciliation succeeds, `prepare_product` computes the sole delivery digest and
-deep-freezes the final report/rows. `commit` rejects an absent or malformed report digest before
-opening a `.part`; it never recalculates that digest. It writes canonical main, stream and report
-bytes to same-directory `.part` files, flushes and fsyncs each, then performs `os.replace` in the
-fixed order main → stream → report. It then computes the exact artifact SHA-256 values,
-writes/fsyncs the manifest `.part`, and replaces manifest last. The returned manifest has
-`artifacts_committed=true`. The only emitter-added wall-clock field is
+§7.18.2 signatures. The request carries the only program-bound class/frame Schema views and M8
+instance; assembly never falls back to same-named source `ResolvedConfig` fields. Any final
+annotation Schema failure rejects the whole current set before retained-content accounting,
+replay projection, dedup commit or dataset commit. After every slot, noise, replay projection,
+retained-content check and CrossView reconciliation succeeds, `prepare_product` computes the sole
+delivery digest and deep-freezes the final report/rows. `commit` rejects an absent or malformed
+report digest before opening a `.part`; it never recalculates that digest. It writes main,
+stream and report with their frozen contract key order to same-directory `.part` files, flushes
+and fsyncs each, then
+performs `os.replace` in the fixed order main → stream → report. It then computes the exact
+artifact SHA-256 values, writes/fsyncs the manifest `.part`, and replaces manifest last. The
+returned manifest has `artifacts_committed=true`. The only emitter-added wall-clock field is
 `manifest.committed_at`; it is excluded from IDs and delivery digest.
+
+The user-visible serializer preserves insertion order and is deliberately separate from
+`canonical_delivery_row`, which keeps `sort_keys=true` solely for identity, retained-content and
+delivery-digest material. Reusing canonical serialization for output would violate the frozen
+stream, report and manifest key order.
 
 A pre-commit DeliveryError, provider fatal, circuit trip, SIGINT or cancellation calls no
 `commit`; old fixed artifacts remain untouched. A rename failure after the first rename may
@@ -4812,15 +4900,8 @@ TEMPLATE_HEAD_TOKENS: dict[str, int]                  # V22：per-stage 冻结�
                                                       #   _FRAME_SYSTEM_HEAD) / est_text(
                                                       #   annotate._FRAME_SYSTEM_STATIC)
                                                       #   （§10.12/§10.13 冻结模板头；
-                                                      #   M1 V13③ 两新段消费）；v1.18 序列
-                                                      #   family 六键依次为
-                                                      #   "generation_scenario_seed" = 238、
-                                                      #   "generation_event_plan" = 280、
-                                                      #   "generation_frame_render" = 220、
-                                                      #   "generation_semantic_evaluate" = 282、
-                                                      #   "generation_noise_render" = 135、
-                                                      #   "generation_noise_evaluate" = 140，
-                                                      #   等于 §10.14–§10.19 system 全文 est_text
+                                                      #   M1 V13③ 两新段消费）。v1.18 sequence
+                                                      #   不在此表增加整数 head，见下方共享构造器约束
 
 def margin(context_window: int) -> int
 def input_budget(profile: LLMProfile) -> int          # cw − max_output_tokens − margin；cw==0 → 0（预算关）
@@ -4912,9 +4993,26 @@ Binding notes (from dev spec §3.2, normative):
   `_static_prompt_est` for every config (`segment.context` enters the guard as
   `est_text(context) + 1` covering its joining newline); the cross-layer test asserts
   against the same worst-case composition.
-- v1.18 removes every former sequence-generation budget key and freezes only the six
-  `generation_*` keys and values listed above. M1 checks the entire minimum PromptBundle plus
-  the entire active Schema, not merely the head. Runtime uses the actual complete prompt and
+- v1.18 removes every former sequence-generation budget key and does not add six integer
+  `generation_*` head constants. The six families share their exact system text, complete user
+  scaffold and interpolation order through `common/runtime/generation_prompts.py`; M1 and the
+  operators call those same builders. `common/config/_generation_budget.py` owns the content-limit
+  checks and static proof; it is not a second prompt builder. M1 checks each actual configured
+  minimum PromptBundle with
+  `est_prompt`, including message overhead, and includes the entire active Schema only when the
+  call profile supports structured output. It then adds conservative token envelopes for complete
+  runtime dynamic values: declared EventPlan `2D`, instruction-only EventPlan `5D`, declared
+  FrameRenderer `5D+P`, instruction-only FrameRenderer `6D+P`, SemanticEvaluator `S+2D`, and
+  NoiseEvaluator `Y`; `D=32768`, `P=16384`, `S=65536`, `Y=65536` UTF-8 bytes and byte cost is
+  `ceil(bytes/3)`. ScenarioSeed and NoiseRenderer dynamic content is already configuration-bound
+  in the complete minimum bundle. Cases on one profile take a maximum, never a sum.
+  When `output.max_repair_attempts > 0`, the selected repair profile is checked separately: five
+  generic families use an empty one-user-message scaffold plus the complete `R=32768` newly
+  appended repair body, while EventPlan uses the complete original prompt/dynamic envelopes plus
+  the assistant/user pair, two message overheads and the same R shared across assistant raw and
+  repair user text. The repair Schema is counted only when the repair profile supports structured
+  output. Runtime accepts exactly D/P/S/Y/R and rejects one extra UTF-8 byte before provider
+  dispatch; it never truncates a value or repair source. Runtime also uses the actual prompt and
   Schema. ScenarioSeed, ActorView, EventDraft semantic history, state, patch, payload and direct
   semantic-review fields are indivisible; EventTrace is never a prompt carrier. No trimming,
   summarization or halving is a sequence-generation fallback.
@@ -4930,7 +5028,11 @@ Binding notes (from dev spec §3.2, normative):
 Physical ownership is fixed:
 
 - `common/config/generation.py` parses and validates the v1.18 sequence namespace.
+- `common/config/_generation_budget.py` owns root examples, fixed content limits and the shared
+  six-family context proof.
 - `common/contracts/generation.py` owns the new v1.18 generation carriers in this section.
+- `common/runtime/generation_prompts.py` owns all six exact sequence system/user builders shared
+  by M1 budget checks and generation operators.
 - Existing generic carriers keep their single canonical owners: RuntimeCredentials in
   `common/runtime/credentials.py`, ResolvedHook and ValidationHooks in
   `common/extensions/hooks.py`, and ResolvedPaths in `common/config/model.py`. Their mirrors
@@ -4974,8 +5076,10 @@ class GenerationProgram:
     semantic_profile: str
     evaluation_profile: str
     max_slot_attempts: int
+    planner_seed: int
     class_views: Mapping[str, ClassView]
     frame_classes: Mapping[str, FrameClassView]
+    frame_schema: Mapping[str, object] | None
     patterns: Mapping[str, SequencePattern]
     counterfactual_sets: tuple[CounterfactualSetSpec, ...]
     instruction_only: tuple[InstructionOnlySpec, ...]
@@ -5013,6 +5117,7 @@ class NoiseSlot:
     event_key: str
     ordinal: int
     frame_class: str
+    topic: str
     timestamp_us: int
     session_id: str
 
@@ -5177,6 +5282,7 @@ _NOISE_REASON_CODES = (
     "related_to_declared_task",
     "executable_task_present",
     "unrealistic",
+    "planned_noise_topic_mismatch",
 )
 
 
@@ -5185,10 +5291,12 @@ class NoiseSemanticEvaluation:
     unrelated_to_declared_tasks: bool
     no_executable_task: bool
     realism: bool
+    matches_planned_topic: bool
     reason_codes: tuple[Literal[
         "related_to_declared_task",
         "executable_task_present",
         "unrealistic",
+        "planned_noise_topic_mismatch",
     ], ...]
 
 
@@ -5213,6 +5321,8 @@ class GenerationParseContext:
     class_views: Mapping[str, ClassView]
     frame_classes: Mapping[str, FrameClassView]
     llm_profiles: Mapping[str, LLMProfile]
+    max_repair_attempts: int
+    repair_profile: str | None
     hook_loader: Callable[[str, Path], ResolvedHook]
     collector: _Collector
 
@@ -5238,6 +5348,8 @@ class EventPlanRequest:
     eligible_actors: tuple[str, ...]
     actor_view: ActorView | None
     visible_state: JsonObject | None
+    state_schema: Mapping[str, object] | None
+    outcome_schema: Mapping[str, object] | None
     history: tuple[EventDraft, ...] | None
     actor_profiles: Mapping[str, JsonObject] | None
     public_facts: JsonObject
@@ -5312,6 +5424,7 @@ class RenderEventRequest:
     role: RoleSpec | None
     public_facts: JsonObject
     attempt_index: int
+    limits: GenerationLimits
 
 
 @dataclass(frozen=True)
@@ -5344,6 +5457,7 @@ class SemanticEvaluationRequest:
     review_events: tuple[SemanticReviewEvent, ...]
     final_state: JsonObject
     attempt_index: int
+    limits: GenerationLimits
 
 
 @dataclass(frozen=True)
@@ -5355,20 +5469,24 @@ class NoiseRenderRequest:
     class_descriptions: Mapping[str, str]
     frame_descriptions: Mapping[str, str]
     attempt_index: int
+    limits: GenerationLimits
 
 
 @dataclass(frozen=True)
 class NoiseEvaluationRequest:
     evaluation_profile: str
     payload: JsonObject
+    planned_topic: str
     class_descriptions: Mapping[str, str]
     frame_descriptions: Mapping[str, str]
     attempt_index: int
+    limits: GenerationLimits
 
 
 @dataclass(frozen=True)
 class ProjectionRequest:
     program: GenerationProgram
+    plan: ScenarioPlan
     slot: DeliverySlot
     trace: EventTrace
 
@@ -5384,6 +5502,7 @@ class NoiseProjectionRequest:
 @dataclass(frozen=True)
 class ReplayProjectionRequest:
     program: GenerationProgram
+    plan: ScenarioPlan
     layout: ReplayLayout
     source: "SequenceRows"
 
@@ -5402,17 +5521,39 @@ class SequenceRows:
 
 
 @dataclass(frozen=True)
+class SequenceAssemblyRequest:
+    program: GenerationProgram
+    schema_engine: SchemaEngine
+    item: PipelineItem
+    projection: ProjectedSequence
+    batch_no: int
+
+
+@dataclass(frozen=True)
 class ReplayRows:
     rows: tuple[JsonObject, ...]
     retained_content_bytes: int
 
 
 @dataclass(frozen=True)
+class ProjectionWitness:
+    main_record_id: str
+    generation_digest: str
+    member_sources_digest: str
+    primary_base_digests: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class ReconcileRequest:
+    program: GenerationProgram
     plan: ScenarioPlan
+    run_id: str
+    projection_witnesses: tuple[ProjectionWitness, ...]
     sequences: tuple[SequenceRows, ...]
+    noise_payload_digests: tuple[str, ...]
     noise_rows: tuple[JsonObject, ...]
-    replay_rows: tuple[JsonObject, ...]
+    replays: tuple[ReplayRows, ...]
+    retained_content_bytes: int
 
 
 @dataclass(frozen=True)
@@ -5529,10 +5670,12 @@ and frozen parameters against a hand-written manifest rather than deriving expec
 production class.
 
 `EventExecutionContext.history` is exactly `tuple[EventDraft, ...]` and
-`EventPlanRequest.history` is exactly `tuple[EventDraft, ...] | None`, non-null only for
-instruction-only mode. EventDraft deliberately has no `role`; EventTruth is not a generation-time
-history carrier and cannot be constructed for a declared branch before independent pattern
-binding succeeds.
+`EventPlanRequest.state_schema` and `.outcome_schema` are exactly
+`Mapping[str, object] | None`; `.history` is exactly `tuple[EventDraft, ...] | None`.
+`state_schema` and `history` are non-null only for instruction-only mode. `outcome_schema` is
+non-null only for a declared final event with a mechanically selected branch postcondition.
+EventDraft deliberately has no `role`; EventTruth is not a generation-time history carrier and
+cannot be constructed for a declared branch before independent pattern binding succeeds.
 
 `PostValidationResult`, `PostValidatedCallRequest` and `ValidatedGenerationCall` are declared
 once in `common/contracts/generation.py` and imported by M8; their repetition in §7.7 documents
@@ -5545,10 +5688,21 @@ and never impersonate `PlannedEvent`. A replay resolves its source only through
 `source_slot_key` plus `source_variant_name`; that variant must be positive, and the number of
 `timestamps_us` must equal the source event count.
 
-`ReconcileRequest.sequences` preserves delivery-slot/variant declaration order;
-`noise_rows` preserves NoiseSlot order; `replay_rows` is the flattened concatenation of each
-ReplayRows.rows in ReplayLayout order. The request carries final row objects, not pre-downstream
-records or ReplayRows wrappers.
+`SequenceAssemblyRequest` closes one M11 call over the frozen `GenerationProgram`, the shared M8
+instance, the final attempt-local item, its corresponding projection and the fixed batch number.
+The emitter remains constructible from paths alone so planner failure can still write an
+independent failed report before runtime services exist.
+
+`ReconcileRequest.projection_witnesses` and `.sequences` preserve the same
+delivery-slot/variant declaration order and have equal length; the former contains compact
+full-SHA-256 source witnesses, while the latter contains final rows. `noise_payload_digests`
+contains the corresponding full-SHA-256 objects accepted by the noise semantic gate before
+projection, and it aligns exactly with `noise_rows` in NoiseSlot order. `replays` preserves one
+`ReplayRows` group per available `ReplayLayout`, in layout order; it is never flattened in the
+carrier. `retained_content_bytes` is the controller's prospective or final total across sequence
+main/primary rows, noise rows and replay rows. CrossView independently canonicalizes the actual
+rows and requires both every nested byte count and this total to match. `program` and `run_id` are
+mandatory independent ID inputs.
 
 ValidationHooks contains only output, sample and state. There is no sequence/scenario validator.
 RuntimeCredentials is the only secret-bearing carrier; its dataclass repr is disabled and both
@@ -5578,14 +5732,18 @@ def compile_generation_program(config: ResolvedConfig) -> GenerationProgram:
     """
 
 
-def compile_scenario_plan(
-    program: GenerationProgram,
-    seed: int,
-) -> ScenarioPlan:
+def generation_program_digest(program: GenerationProgram) -> str:
+    """计算排除 digest 自身且覆盖全部语义字段的程序摘要。
+
+    @param program 待校验或尚未写入 digest 的冻结程序。
+    @return 64 位小写十六进制摘要。
+    """
+
+
+def compile_scenario_plan(program: GenerationProgram) -> ScenarioPlan:
     """求解并返回唯一可接受的 OPTIMAL 确定性 CP-SAT 计划。
 
     @param program 冻结生成程序。
-    @param seed 运行随机种子。
     @return 完整冻结的场景计划。
     """
 
@@ -5634,6 +5792,14 @@ def build_event_plan_request(
     """
 
 
+def project_instruction_draft(draft: EventDraft) -> dict[str, object]:
+    """投影无递归 ActorView、工件 ID、timestamp 与 role 的 draft 语义。
+
+    @param draft 已完成的 EventDraft。
+    @return prompt 与 ActorView 共用的扁平语义 witness。
+    """
+
+
 async def plan_event(
     context: EventExecutionContext,
     attempt_index: int,
@@ -5647,6 +5813,34 @@ async def plan_event(
     @param variation_nonce 当前事件变化 nonce。
     @param services 生成服务根。
     @return 事件计划与同一候选的执行证明。
+    """
+
+
+async def generate_slot_traces(
+    program: GenerationProgram,
+    plan: ScenarioPlan,
+    slot: DeliverySlot,
+    attempt_index: int,
+    services: GenerationServices,
+) -> tuple[EventTrace, ...]:
+    """完整生成并判定一个交付槽的全部分支。
+
+    @param program 冻结生成程序。
+    @param plan 唯一冻结场景计划。
+    @param slot 当前交付槽。
+    @param attempt_index 零基交付尝试序号。
+    @param services 生成服务根。
+    @return 与槽内声明分支顺序精确一致的事件真值。
+    """
+
+
+def outcome_schema_for(
+    context: EventExecutionContext,
+) -> Mapping[str, object] | None:
+    """为 declared branch 的末事件选择唯一可选 outcome Schema。
+
+    @param context 唯一事件执行上下文。
+    @return 当前末事件的 outcome Schema；无需额外检查时为 None。
     """
 
 
@@ -5746,7 +5940,7 @@ async def evaluate_noise(
 
     @param request noise 语义判定请求。
     @param services 生成服务根。
-    @return 三项布尔判定与闭集 reason code。
+    @return 四项布尔判定与闭集 reason code。
     """
 
 
@@ -5774,10 +5968,55 @@ def project_replay(request: ReplayProjectionRequest) -> ReplayRows:
     """
 
 
+def projection_witness(projection: ProjectedSequence) -> ProjectionWitness:
+    """把 attempt-local projector 内容压缩为 CrossView 源证明。
+
+    @param projection 尚未释放的不可变 ProjectedSequence。
+    @return 不含 payload、Record 或 row 的 full-SHA-256 witness。
+    """
+
+
+def noise_payload_digest(payload: Mapping[str, object]) -> str:
+    """计算 post-gate noise payload 的 compact source witness。
+
+    @param payload 已通过完整 Schema 与独立语义 gate 的 noise object。
+    @return 不含源内容的完整 SHA-256。
+    """
+
+
+def scenario_plan_digest(plan: ScenarioPlan) -> str:
+    """计算排除 digest 自身的完整 ScenarioPlan 摘要。
+
+    @param plan 待校验或尚未写入 digest 的冻结计划。
+    @return 64 位小写十六进制摘要。
+    """
+
+
+def validate_planned_events(
+    program: GenerationProgram,
+    slot: DeliverySlot,
+    variant_name: str | None,
+    events: Sequence[PlannedEvent],
+) -> None:
+    """把一个 branch 的位置、role 与 event key 重新绑定到程序。"""
+
+
+def validate_plan_identity(program: GenerationProgram, plan: ScenarioPlan) -> None:
+    """完整复验 ScenarioPlan 的程序归属与内容摘要。"""
+
+
 def reconcile_views(request: ReconcileRequest) -> None:
     """对 primary 双射、replay provenance 或 timeline 不一致 fail closed。
 
-    @param request 全量交付视图对账请求。
+    @param request 最终全量交付视图对账请求。
+    @return None。
+    """
+
+
+def reconcile_prospective_views(request: ReconcileRequest) -> None:
+    """对当前连续交付前缀执行非最终 CrossView 对账。
+
+    @param request 尚未提交的 prospective 前缀。
     @return None。
     """
 
@@ -5836,15 +6075,11 @@ class SequenceDeliveryEmitter:
 
     def assemble_sequence(
         self,
-        item: PipelineItem,
-        projection: ProjectedSequence,
-        batch_no: int,
+        request: SequenceAssemblyRequest,
     ) -> SequenceRows:
-        """从下游原地修改后的 item 装配最终内存行。
+        """从闭包请求装配最终内存行并执行 program-bound Schema 终检。
 
-        @param item 下游协作者处理后的唯一 PipelineItem。
-        @param projection 与该 item 对应的生成侧投影。
-        @param batch_no 交付批序号。
+        @param request 冻结 program、M8、最终 item、投影与交付批序号。
         @return 最终 main/primary stream rows 与 retained-content 费用。
         """
 
@@ -5920,11 +6155,18 @@ never called by validate or dry-run.
 The compiler runs before credential materialization and LLM calls. It resolves every class,
 frame, pattern, role, gap, counterfactual set, instruction-only row, hook and catalog; validates
 the exact delivery cardinality, catalog cardinality, timeline identities and complete prompt
-budgets; and hashes one canonical GenerationProgram. The digest covers every semantic field,
+budgets; freezes `ResolvedConfig.run.seed` as `GenerationProgram.planner_seed`; and hashes one
+canonical GenerationProgram. The digest covers every semantic field including `planner_seed`,
 excludes itself and hook callables, and includes only each `ResolvedHook.reference`. The compiler
 performs no random draw, solver call, credential read, LLM call or downstream stage.
+For every sequence ClassView it materializes the effective annotation Schema: the class override
+when present, otherwise a frozen copy of the global user Schema. Generation limits, effective
+sequence ClassViews, frame ClassViews and the global frame-annotation Schema are frozen in that
+same program and covered by its digest. After compilation, slot attempts, IDs, random seeds, run
+identities, prompt budgets, downstream class routing and M11 Schema validation read only the
+program; same-named source fields in ResolvedConfig are not runtime truth.
 
-`compile_scenario_plan(program, seed)` is the only planner entry. Before solving, it freezes
+`compile_scenario_plan(program)` is the only planner entry. Before solving, it freezes
 DeliverySlots, `catalog_row_index` and block membership in declaration order; catalog allocation
 is a deterministic integer mapping and does not enter CP-SAT. The solver freezes declared
 baseline/variant presence, total order, closed integer gaps, max-span, calendar feasibility,
@@ -5933,12 +6175,35 @@ artifact timestamps, exact NoiseSlots and exact positive ReplayLayouts. `Planned
 only position, role, logical/artifact time and session; declared frame/actor come from RoleSpec,
 while instruction-only frame/actor are selected later by EventPlan. Session blocks contain at
 most 4096 primary events. The locked OR-Tools version runs with one worker, a deterministic seed
-derived from run seed/block identity, and `max_deterministic_time=10.0` per optimization layer.
+derived from `program.planner_seed`/block identity, and `max_deterministic_time=10.0` per
+optimization layer.
 Only OPTIMAL decodes. INFEASIBLE is `generation_plan_infeasible`; FEASIBLE/UNKNOWN are
 `generation_plan_budget`; MODEL_INVALID is `generation_plan_internal`. There is no incumbent,
-relaxation, greedy fallback or re-solve after content failure. Program/plan/seed equality implies
+relaxation, greedy fallback or re-solve after content failure. Program equality implies
 byte-identical program digest, DeliverySlots, ScenarioBlocks and plan digest across validate,
 dry-run and run.
+
+Every reordered mechanical role/time swap is constrained inside the baseline CP-SAT model so all
+non-target order and gap constraints still hold; an impossible isolated reordering is
+`generation_plan_infeasible` before content calls. When positive is absent, the hidden baseline
+independently takes its earliest calendar-feasible projection at or after `timestamp_start`; it
+never borrows the first visible counterfactual branch start.
+
+Canonical objectives are frozen: instruction length is minimized and therefore equals
+`len_range[0]`, with positions spaced by `event_gap_s[0]`; baseline role-time sum and the
+interval-exceeded suffix shift are minimized; crossing minimizes the one-based declaration-order
+boundary weight sum; a crossed pair minimizes its two absolute starts; non-crossed placement uses
+the earliest calendar intersection. A remaining tie is resolved only by the locked OR-Tools
+version, one worker and the program-bound solver seed. `validate_plan_identity` first checks the
+program digest, then checks that the supplied plan digest equals the digest of every semantic
+field in that supplied plan, rebuilds the canonical plan from the program, and requires full
+dataclass equality. Insertion-order changes inside a block, a coordinated rehash or a locally
+valid alternative plan are not accepted.
+
+Artifact time uses integer epoch microseconds throughout. Calendar expansion, fixed-offset
+ISO8601 projection and CrossView parsing never pass through floating-point timestamps. A plan or
+21-day calendar horizon outside Python datetime range fails as `generation_plan_infeasible`
+before any content call.
 
 Except for `delivery_digest`, every ID is exactly
 `sha256(canonical_json(["labelkit:v1.18", domain, components]).encode("utf-8"))`
@@ -5950,6 +6215,7 @@ string.
 |---|---|---|
 | declared scenario ID | `declared_scenario_id` | program digest, counterfactual-set name, scenario index |
 | declared world branch ID | `declared_world_branch_id` | scenario ID, variant name |
+| declared hidden baseline world branch ID | `declared_hidden_baseline_world_branch_id` | scenario ID |
 | instruction scenario ID | `instruction_scenario_id` | program digest, instruction-slot name, scenario index |
 | instruction world branch ID | `instruction_world_branch_id` | scenario ID, literal `instruction_only` |
 | declared event key | `declared_event_key` | scenario ID, baseline role name |
@@ -5978,27 +6244,49 @@ never main/stream or ID material, so there is no self-reference.
 
 Every event has one root, `EventExecutionContext`. It carries the program, plan, slot, variant,
 event index, ScenarioSeed, current state and `tuple[EventDraft, ...]` history.
-`build_event_plan_request` first proves the slot belongs to the plan, the block key exists and the
-event index is valid, then mechanically projects every EventPlanRequest field. A mismatch is
+The public `build_event_plan_request` and `plan_event` first validate the program digest and the
+supplied plan's self-digest, rebuild the complete canonical plan from that program, and then prove
+the slot, block key and event index.
+Only then may they mechanically project or dispatch an EventPlanRequest. A mismatch is
 `generation_downstream_contract`, exit 4, with zero LLM call and zero attempt consumption.
-Callers cannot separately construct or pass a second request.
+The already-validated slot loop calls only private validated helpers, so CP-SAT is not rerun for
+each event; those helpers are not a second public precondition or entry. Callers cannot separately
+construct or pass a second request.
 
 Declared EventPlanner input contains the semantic profile, fixed RoleSpec, eligible frame views
-and actor names, non-null ActorView and public facts; complete state, history and actor profiles
-are `None`. Instruction-only input contains the full instruction, frozen sequence length,
-complete visible state, complete ordered EventDraft history, ordered actor goal/identity/style
-profiles and ordered eligible frame views; ActorView and RoleSpec are `None` until EventPlan
-chooses its actor. No planner prompt contains variant, expected violation, target or evaluator
-output.
+and actor names, non-null ActorView and public facts; complete state, state Schema, history and
+actor profiles are `None`. Its final event alone carries the mechanically selected complete
+outcome Schema; a hidden baseline without an optional positive variant carries `None`.
+Instruction-only input contains the full instruction, frozen sequence length, complete visible
+state, the selected InstructionOnlySpec's complete state Schema, complete ordered EventDraft
+history, ordered actor goal/identity/style profiles and ordered eligible frame views; ActorView,
+RoleSpec and outcome Schema are `None` until EventPlan chooses its actor. Schemas are constraints,
+not a second state or new world fact. No planner prompt contains variant, expected violation,
+target or evaluator output.
 
 `plan_event(context, attempt_index, variation_nonce, services)` uses M8 executable
 post-validation. Each L2 candidate creates exactly one EventPlan and executes it against the same
 context. `test` paths are within declared read roots; mutations are `add|remove|replace` within
 write roots; at least one test precedes all mutations; instruction-only skips nonexistent root
 permissions. `jsonpatch` applies the complete patch with `in_place=false`. Pre-state Schema, base
-state Schema and state hook must pass before M8 returns one frozen EventExecution. `plan_event`
-returns that EventPlan and the same proof object; formal state commit must not rerun patch, Schema
-or hook. Publish roots must exist and are sent only to declared observers.
+state Schema, final declared outcome Schema and state hook must pass before M8 returns one frozen
+EventExecution. `plan_event` returns that EventPlan and the same proof object; formal state commit
+must not rerun patch, Schema or hook. Pre-state/base-state/final-outcome Schema errors use the
+exact value-free form `<kind>:<json-pointer>:<validator-keyword>`, with every error sorted and
+deduplicated. Only explicit `properties` names from `absolute_schema_path` enter the pointer;
+dynamic instance keys/indexes never do, and a root error has an empty pointer. Publish roots must
+exist and are sent only to declared observers.
+
+Before every StateExecutor or independent StateEvaluator Draft 2020-12 check, the frozen Schema is
+canonical-thawed to ordinary `dict`/`list` JSON containers. Passing `MappingProxyType` directly to
+jsonschema is forbidden because mapping-valued keywords such as `additionalProperties` can be
+silently treated differently from a plain JSON object.
+
+Before freezing a successful EventExecution, StateExecutor resolves every payload-binding
+`state_path` against its declared before/after snapshot. A missing leaf is the controlled
+`payload_binding` post-validator violation and enters the same bounded L3 repair; it must not be
+deferred until FrameRenderer or converted into an internal error. Once EventExecution succeeds,
+the renderer only re-reads those same immutable snapshots.
 
 FrameRenderer receives EventPlan, ActorView, public facts, publish snapshot, state hashes, full
 frame Schema and the ordered exact `payload_path -> authoritative value` bindings. It never
@@ -6009,6 +6297,10 @@ Schema rewriting, writable-schema deletion, root bindings, duplicate or ancestor
 binding paths, missing parents, silent overwrite failure and L3 repair of authoritative binding
 values are forbidden. Each successful plan/execute/render cycle constructs one EventDraft with no
 role field; this draft is the only event form admitted to subsequent generation-time history.
+RenderEventRequest, SemanticEvaluationRequest, NoiseRenderRequest and NoiseEvaluationRequest each
+carry `GenerationProgram.limits`. Those request limits are the sole runtime source for prompt,
+repair-context and payload bounds; `GenerationServices.config.sequence_generation.limits` is not
+consulted after program compilation.
 
 Even when positive is not delivered, the baseline completes Pattern, State and Semantic
 evaluation. Positive reuses it. Every counterfactual reuses the protected EventDraft semantic
@@ -6031,6 +6323,22 @@ StateEvaluation or a prior semantic verdict. Declared `pattern_description` is e
 SequencePattern.description; instruction-only uses InstructionOnlySpec.instruction. All six
 booleans must be true with closed, data-free reason codes before EventTrace is assembled.
 
+`project_trace` does not trust that assembled carrier merely because its fields are internally
+well typed. Before constructing any Record it rechecks that StateEvaluation has equal replay and
+final hashes plus all three booleans true, and SemanticEvaluation has all six booleans true with
+empty reason codes. Instruction-only must carry no PatternEvaluation. Declared mode independently
+derives the exact variant role word from the program, rechecks every EventTruth frame/actor against
+its RoleSpec, requires unique event IDs, requires
+`actual_bindings == {event_id: role}`, and requires `actual_violations` to exactly equal the
+variant's sole expected violation. Any forged gate carrier is `generation_downstream_contract`
+before projection, not a recoverable self-consistency repair.
+Public `project_trace` and `project_replay` requests carry both GenerationProgram and the complete
+ScenarioPlan. Each first calls `validate_plan_identity`, then requires its complete DeliverySlot or
+ReplayLayout dataclass to occur exactly once in the canonical plan and rechecks canonical event,
+layout and source relationships. Coordinated digest, event-ID or row changes cannot establish a
+new root. DeliveryController validates the plan once at the delivery boundary and then calls only
+package-private validated helpers; content retries do not rerun CP-SAT.
+
 Instruction-only freezes length and times before LLM calls; its planner chooses only eligible
 frame/actor/intent/patch values for fixed positions and may see complete current state/EventDraft
 history.
@@ -6047,7 +6355,7 @@ group_probe
 → pointwise quality
 → sequence and frame annotation
 → verify
-→ M11 assemble_sequence(final PipelineItem + ProjectedSequence)
+→ M11 assemble_sequence(SequenceAssemblyRequest)
 → replay preprojection
 → CrossViewReconciler
 → retained-content prospective check
@@ -6064,10 +6372,16 @@ and record digests unchanged, then commits all three index families in one no-aw
 section and invalidates the capability. Any validation failure is
 `generation_dedup_transaction`, exit 4, with zero partial insertion.
 
-`GenerationServices` is the sole config/SchemaEngine/LLMClient/MetricsSink root. DeliveryServices
-does not duplicate RunContext or credentials. DeliveryController derives each collaborator's
-RunContext so those four shared objects are identity-equal to GenerationServices and only rng and
-batch number are new. RuntimeCredentials exists only while the factory builds the LLMClient.
+`GenerationServices` is the sole source config/SchemaEngine/LLMClient/MetricsSink root.
+DeliveryServices does not duplicate RunContext or credentials. Dedup uses a context whose four
+shared objects are identity-equal to GenerationServices. For Quality, Annotate and Verify,
+DeliveryController derives an attempt-local cfg from the same source config but replaces
+`class_views`, `frame_class_views` and `frame_schema` with `GenerationProgram.class_views`,
+`GenerationProgram.frame_classes` and `GenerationProgram.frame_schema`; SchemaEngine, LLMClient
+and MetricsSink remain identity-equal, and only rng and batch number are otherwise new. Every
+normal, frame and verify-repair path reads that attempt-local cfg; the source config's same-named
+views and Schema are not consulted or mutated.
+RuntimeCredentials exists only while the factory builds the LLMClient.
 
 QualityStage, AnnotateStage and VerifyStage implement `run_attempt`; AnnotateStage handles frame
 annotation in the same attempt entry. Their attempt entry shares pure production cores with
@@ -6088,15 +6402,44 @@ exit 4. ProviderRetryableError from group_probe becomes the current attempt's
 OutputTruncatedError and ordinary quality/annotation/verification rejections return an
 unaccepted result and consume the attempt.
 
-`SequenceDeliveryEmitter.assemble_sequence` is pure memory and zero I/O. It assembles final
-SequenceRows from the downstream-mutated PipelineItem, so inherited classification, quality,
-sequence/frame annotation and verification are present in the exact bytes used by CrossView,
-retained-content accounting, delivery digest and final output. A replay-source positive is
-projected only after this assembly, from the final primary stream rows. Prospective retained
-content is the previously accepted total plus every current SequenceRows and ReplayRows byte
-count. If it would exceed 536870912 bytes, the entire source slot is rejected as
-`sequence_memory_budget` with zero dedup, dataset and replay commit. Source and replay rows enter
-the same in-memory critical section after group commit; no uncharged replay is constructed later.
+`SequenceDeliveryEmitter.assemble_sequence(SequenceAssemblyRequest)` is pure memory and zero I/O.
+It assembles final SequenceRows from the downstream-mutated PipelineItem, so inherited
+classification, quality, sequence/frame annotation and verification are present in the exact
+bytes used by CrossView, retained-content accounting, delivery digest and final output. Before it
+calculates bytes, it validates the final main user object against the selected program ClassView's
+materialized Schema and validates both the main-member and primary-row copies of every frame
+annotation against `GenerationProgram.frame_schema`. `FrameClassView.gen_schema` is only a payload
+generation Schema and is never an annotation fallback. A final annotation violation raises
+`sequence_projection_mismatch`, consumes the current whole-set attempt and leaves dedup, dataset,
+rows and replay state unchanged. A replay-source positive is projected only after this assembly,
+from the final primary stream rows. Prospective retained content is the previously accepted total
+plus every current SequenceRows and ReplayRows byte count. If it would exceed 536870912 bytes, the
+entire source slot is rejected as `sequence_memory_budget` with zero dedup, dataset and replay
+commit. Source and replay rows enter the same in-memory critical section after group commit; no
+uncharged replay is constructed later.
+
+CrossView never accepts final rows merely because their IDs are mutually self-consistent.
+`ReconcileRequest` carries the GenerationProgram, run ID, immutable ProjectionWitness values
+aligned with final SequenceRows, post-gate noise-payload digests aligned with final noise rows,
+ReplayRows grouped in ReplayLayout order, and the controller's prospective or final retained-byte
+total. It compares full-SHA-256 digests of every final primary payload/base
+event/generation tuple and every final noise payload with its source witness, while allowing only
+downstream classification and annotation additions on primary rows. It independently re-derives
+scenario, world-branch, primary event, sequence, noise event-key and noise event IDs from the
+program/run identity, planned coordinates and source payload. It also recomputes every
+SequenceRows count, every ReplayRows count and the complete retained total directly from the
+actual canonical rows; summing trusted carrier counters is insufficient. Declared
+role/frame/actor values must also match the RoleSpec. A synchronized payload-plus-ID rewrite,
+arbitrary valid-looking noise ID or forged byte total is therefore a reconcile rejection.
+
+`projection_witness(projection)` is called while the attempt-local ProjectedSequence still
+exists. ProjectionWitness contains only `main_record_id`, `generation_digest`,
+`member_sources_digest` and ordered `primary_base_digests`; no payload, Record or row survives in
+it. Each digest is full SHA-256 over canonical
+`["labelkit:v1.18", domain, value]`, with domains `projection_main_generation`,
+`projection_member_sources`, `projection_primary_base` and `noise_payload`. After slot commit,
+ProjectedSequence, PipelineItem and AttemptTransaction are released. The 500000-unit RSS gate
+includes all compact witnesses.
 
 #### 7.18.6 Delivery, replay and run terminal behavior
 
@@ -6107,9 +6450,10 @@ Each attempt seed is the full integer digest of canonical
 Retry restarts from ScenarioSeed; catalog retries keep the assigned row. Frozen pattern,
 variant, role, logical time, artifact time, session, noise slot and replay source never change.
 
-Noise runs only after all primary slots accept. It sees only noise instruction/schema, class/frame
-name-description registries, timestamp and attempt identity. It passes its object Schema, three-
-boolean independent semantic evaluation and an attempt-local SimilarityFilter preloaded with all
+Noise runs only after all primary slots accept. Each slot carries the unique topic declared at
+the same ordinal. It sees only noise instruction/schema, that topic, class/frame name-description
+registries, timestamp and attempt identity. It passes its object Schema, four-boolean independent
+semantic evaluation and an attempt-local SimilarityFilter preloaded with all
 primary member text plus accepted noise. It never runs quality, annotate, verify or main group
 dedup. Noise retained-byte overflow is `noise_memory_budget`.
 
@@ -6715,8 +7059,8 @@ all attempts remain in the generic run usage ledger. The frozen sequence report 
     "planned_sequences": 8,
     "delivered_sequences": 8,
     "primary_events": 22,
-    "primary_sessions": 7,
-    "crossed_primary_sessions": 1,
+    "primary_sessions": 8,
+    "crossed_primary_sessions": 0,
     "noise_events": 2,
     "replay_sequences": 1,
     "replay_events": 3,
@@ -6764,7 +7108,8 @@ all attempts remain in the generic run usage ledger. The frozen sequence report 
       "noise_memory_budget": 0,
       "noise_context_overflow": 0,
       "noise_output_truncated": 0,
-      "noise_provider_retryable_exhausted": 0
+      "noise_provider_retryable_exhausted": 0,
+      "noise_reconcile": 0
     }
   }
 }
@@ -6781,7 +7126,8 @@ The sequence estimate carries the same ordered seven-key `sequence_calls`, the e
 quality/annotate/frame-annotate/verify keys, exact planned sets/sequences/events/noise/replay/rows,
 `successful_attempt_lower_bound`, and the `max_slot_attempts` upper bound. Existing top-level
 estimate key order and total formula remain unchanged; the seven nested generation keys sum to
-`generate_calls` and are not double-counted.
+`generate_calls` and are not double-counted. Both bounds describe the complete planned run, not
+one delivery slot; neither includes L3 or provider retries.
 
 The failed report always contains `run_attempt_id`, nullable `run_id`,
 `artifacts_committed=false`, nullable `failed_slot`, integer `attempts_used`,
@@ -7217,6 +7563,26 @@ A `fail` verdict with an empty defects array is normalized code-side to one defa
 只输出修正后的 JSON。
 ```
 
+### 10.6.1 M8 EventPlan post-validator repair dialogue (v1.18, verbatim)
+
+`complete_post_validated` replays every message from the original
+`PostValidatedCallRequest.prompt` unchanged, then appends exactly two messages:
+
+```text
+assistant message:
+{raw LLM output, unmodified, in full}
+
+user message:
+[违规清单]
+{numbered controlled L2 or post-validator violations, 1-based, one per line}
+
+只输出修正后的 JSON。
+```
+
+The replay adds no state beyond the prompt-safe ActorView/visible state that the original call
+already contained. It never serializes EventExecution, hidden state, hook exceptions or new facts.
+The generic `complete_validated` repair dialogue remains the single-user-message form in §10.6.
+
 ### 10.7 Internal schemas (M8 module constants; exact JSON)
 
 ```python
@@ -7405,6 +7771,9 @@ _ACTOR_SCHEMA = {
 
 
 def scenario_seed_schema(actor_names, state_schema):
+    # 用户 Schema 被递归复制；没有绝对 $id 时，以 canonical SHA-256 派生
+    # urn:labelkit:state-schema:<digest> 作为 $id，保留嵌套本地引用作用域。
+    state_resource, _ = _scenario_state_resource(state_schema)
     if actor_names is None:
         actors = {
             "type": "object",
@@ -7422,7 +7791,7 @@ def scenario_seed_schema(actor_names, state_schema):
     return {
         "type": "object",
         "properties": {
-            "initial_state": dict(state_schema),
+            "initial_state": state_resource,
             "actors": actors,
             "shared_facts": {
                 "type": "object",
@@ -7880,7 +8249,7 @@ description={class_description}
 
 [输出契约]
 严格返回：
-{"initial_state":{},"actors":{},"shared_facts":{"public":{},"hidden":{}},"style":{},"time_context":{}}
+{"initial_state":{},"actors":{"<actor_name>":{"goal":{},"identity":{},"style":{}}},"shared_facts":{"public":{},"hidden":{}},"style":{},"time_context":{}}
 字段形状必须通过随请求提供的 JSON Schema。
 ```
 
@@ -7888,10 +8257,12 @@ description={class_description}
 mechanically projected from `ScenarioSeedRequest.program` plus `.slot`; callers do not supply a
 second prompt carrier. In declared mode `generation_instruction` is the selected
 `SequenceClassGenerationConfig.instruction`, `state_schema_json` is its state Schema and
-`actor_contract_json` is the exact ordered actor-name array; returned actors must equal it. In
-instruction-only mode the instruction and state Schema come from the selected
-`InstructionOnlySpec`, and `actor_contract_json` is
-`{"minimum_actor_count":1,"maximum_actor_count":8,"actor_name":"non-empty string"}`.
+`actor_contract_json` is
+`{"actor_names":[...],"actor_profile":{"each_value":"object","required":["goal","identity","style"]}}`;
+returned actor names must equal the ordered `actor_names`. In instruction-only mode the
+instruction and state Schema come from the selected `InstructionOnlySpec`, and
+`actor_contract_json` is
+`{"actor_name":"non-empty string","actor_profile":{"each_value":"object","required":["goal","identity","style"]},"maximum_actor_count":8,"minimum_actor_count":1}`.
 L0-off receives the textual output contract above; a structured profile also receives
 `scenario_seed_schema(...)` unchanged. The request's `random_seed` controls attempt randomness
 but is never rendered into prompt text or ID material.
@@ -7900,9 +8271,10 @@ but is never rendered into prompt text or ID material.
 
 Exactly two messages are sent through `EventPlanRequest.semantic_profile`. The request is built
 only by `build_event_plan_request(context, attempt_index, variation_nonce)`. Declared mode never
-renders complete state, hidden facts or another actor's goal; instruction-only renders complete
-current state, the complete semantic projection of EventDraft history and all actor profiles in
-explicitly labeled blocks.
+renders complete state, state Schema, hidden facts or another actor's goal; instruction-only
+renders complete current state, the selected InstructionOnlySpec's complete state Schema, the
+complete semantic projection of EventDraft history and all actor profiles in explicitly labeled
+blocks.
 
 **System message:**
 
@@ -7912,7 +8284,12 @@ explicitly labeled blocks.
 declared 模式只能读取 ActorView 和 public facts：test 操作必须位于 read_roots，
 add、remove、replace 操作必须位于 write_roots；至少一个 test，且全部 test 连续位于变更操作之前。
 patch 只允许 test、add、remove、replace，不允许 move 或 copy。
-instruction_only 模式可以读取明确提供的完整当前状态、历史和参与者档案，但 frame_class 和 actor 仍必须来自闭集。
+instruction_only 模式可以读取明确提供的完整当前状态、状态 Schema、历史和参与者档案，
+但 frame_class 和 actor 仍必须来自闭集。
+test 的 value 必须逐字取自当前可见状态；只修改完成本事件所需的最少叶子 path。
+必须保持未修改字段以及所有 object、array、string、number、boolean、null 的既有类型与容器形状。
+instruction_only 模式的 patch 后完整状态必须满足所提供的状态 Schema。
+若提供末事件 Outcome Schema，patch 后完整状态必须同时满足它。
 不要生成 payload，不要声称状态已经提交。只返回一个 JSON 对象，不要 Markdown、代码围栏、解释或额外字段。
 ```
 
@@ -7951,6 +8328,12 @@ wait_since_previous_us={wait_since_previous_us}
 [完整可见状态]
 {visible_state_json_or_null}
 
+[完整状态 Schema]
+{state_schema_json_or_null}
+
+[末事件 Outcome Schema]
+{outcome_schema_json_or_null}
+
 [既有事件历史]
 {history_json_or_null}
 
@@ -7979,12 +8362,13 @@ The line `role={role}` is exactly `request.planned_event.role`. It is distinct f
 instruction-only mode the former is the positional prompt/truth label while the latter remains
 null; StateTransitionInput.role also remains null because there is no declared RoleSpec.
 
-For instruction-only, `history_json_or_null` preserves EventDraft order and renders each draft's
-complete semantic projection with exactly `event_key`, `frame_class`, `actor`,
-`logical_time_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`,
-`publish_snapshot` and `payload`. It deliberately omits EventDraft `event_id` and
-`timestamp_us`; EventDraft has no role field. Prompt snapshot tests assert that no historical or
-current event ID, artifact timestamp, session ID or other projection coordinate is present.
+For instruction-only, the `EventPlanRequest.history` carrier preserves complete EventDraft objects
+in order. `history_json_or_null` and renderer `ActorView.observations` both use the same flat,
+non-recursive semantic witness with exactly `event_key`, `logical_time_us`, `frame_class`, `actor`,
+`intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot` and `payload`. It
+deliberately omits EventDraft `event_id`, `timestamp_us`, nested `actor_view` and role; EventDraft has
+no role field. Prompt snapshot tests assert that no historical or current event ID, artifact
+timestamp, session ID, recursive ActorView or other projection coordinate is present.
 
 `wait_since_previous_us` is not a second carrier field: declared mode reads the exact value from
 the non-null ActorView; instruction-only derives it from `planned_event.logical_time_us` minus
@@ -7992,15 +8376,20 @@ the last EventDraft's logical time, or zero for the first event. Although Planne
 `timestamp_us` and `session_id` for projection, neither value nor any other artifact coordinate is
 rendered into this prompt.
 
-Declared mode renders a non-null role contract and ActorView; `visible_state`, `history` and
-`actor_profiles` are literal `null`. Its eligible frame/actor arrays each contain only the
-role-fixed value, and `event_plan_schema` uses the same one-element enums. Instruction-only
-renders literal `null` for the RoleSpec and ActorView, uses `position_NNN` only for the prompt's
-`role` and later EventTruth label, and renders the complete `visible_state`, complete semantic
-projection of ordered EventDraft `history`, and ordered actor goal/identity/style profiles;
-its eligible arrays are the full closed sets. `generation_instruction` is respectively the
-declared class instruction or instruction-only slot instruction. Public facts never include
-`shared_facts.hidden`.
+Declared mode renders a non-null role contract and ActorView; `visible_state`, `state_schema`,
+`history` and `actor_profiles` are literal `null`. Its eligible frame/actor arrays each contain
+only the role-fixed value, and `event_plan_schema` uses the same one-element enums. A final
+declared event renders the complete mechanically selected `outcome_schema`; non-final events and
+a hidden baseline without a positive variant render `null`.
+Instruction-only renders literal `null` for the RoleSpec and ActorView, uses `position_NNN` only
+for the prompt's `role` and later EventTruth label, and renders the complete `visible_state`, the
+selected InstructionOnlySpec's complete `state_schema`, complete semantic projection of ordered
+EventDraft `history`, and ordered actor goal/identity/style profiles; its eligible frame array is
+exactly the non-noise frames with non-empty description, generation instruction and object-root
+generation Schema, while its actor array contains one to eight non-empty ScenarioSeed actor names;
+`outcome_schema` is literal `null`. `generation_instruction` is respectively the declared class instruction or
+instruction-only slot instruction. The state Schema is a constraint and never carries a second
+state value. Public facts never include `shared_facts.hidden`.
 
 No field named variant, target, expected violation, actual violation, PatternEvaluation,
 StateEvaluation or semantic verdict enters the request or prompt. L0-off uses the full textual
@@ -8022,6 +8411,14 @@ instance Schema; no path or keyword is removed, rewritten or translated.
 不得改变 frame_class、actor、role、intent、patch、状态哈希、逻辑时间或事件数量。
 不得生成或推断工件 timestamp、session 或其他投影坐标。
 不得猜测 hidden facts。机械绑定值必须出现在返回对象的指定 path，且等于给定值。
+payload 中面向人的自然语言必须把内部状态翻译成业务表达，
+不得照抄状态枚举、内部指标或实现术语，不得用两个同义短语机械复述一个结果。
+同一面向用户的句子不得重复同一业务终态关键词来再次声明结果。
+时间相关叙述必须用真正经历等待的动作、阶段或参与方作主语。“请求 R-1 等待已超过可用时间”把请求误作等待主体，属于错误搭配；“从受理到确认的等待已超过可用时间”以过程作主语，属于自然表达。
+当前可见状态已经是失败或结束状态时，除非 intent 与 ActorView
+明确给出重开事实，否则不得声称正在、继续或重新处理。
+后续消息需说明先前结果不变时，引用先前通知即可，不得再用新的近义短语复述该终态。
+每句话的动作发出者与接收对象必须符合 actor 身份；不得把当前 actor 正在发出的消息写成它收到的对象。
 只返回满足给定完整帧 Schema 的一个完整 JSON 对象，不要 Markdown、代码围栏、解释或额外字段。
 ```
 
@@ -8116,6 +8513,20 @@ patch、状态哈希、发布快照、逻辑等待、最终载荷和最终状态
 causal_consistency：因果与状态变化一致；actor_knowledge：每个 actor 只使用其当时可知的信息；
 goal_consistency：行为与 actor goal 一致；temporal_plausibility：等待与时间语义合理；
 cross_frame_consistency：跨帧实体、请求与结果一致；realism：整体像真实交互。
+作答前必须按时间顺序做反例优先审查，不得用未提供的隐藏理由替候选补故事：
+失败或结束结果之后又声称正在、继续或重新处理，
+而可见事件没有明确重开或迟到通知语义时，causal_consistency 与 realism 都必须为 false；
+面向人的文本照抄状态枚举、内部指标或实现术语，
+机械复述同一个结果，同一句重复终态关键词来再次声明结果，
+后续消息引用已有终态又用近义短语重述它，
+或跨场景呈现明显模板拼接时，realism 必须为 false。
+只有在语法主语直接是请求、消息或业务实体时，“请求 R-1 等待已超过可用时间”这类搭配才使 temporal_plausibility 与 realism 都为 false；
+“从受理到确认的等待已超过可用时间”以过程作主语，不属于该缺陷。
+消息的主语、宾语或收发关系与 actor 身份相反，例如发件者把自己正在发出的消息当成收到的对象时，
+goal_consistency 与 realism 必须为 false。
+缺步骤、顺序异常或长等待本身不自动失败；
+它仍必须形成可由可见状态解释、actor 不提前知情、表达自然的交互。
+只有审查证据足以支持时才返回 true。
 每一项只能返回 boolean。任一 false 必须加入对应闭集 reason code；全部 true 时 reason_codes 必须为空。
 reason_codes 不得包含用户数据、实体值或自由文本。只返回 JSON，不要 Markdown、代码围栏、解释或额外字段。
 ```
@@ -8174,6 +8585,10 @@ real `NoiseSlot`; it never accepts or constructs a PlannedEvent sentinel.
 ```text
 你是独立噪声事件渲染器。生成一条自然、真实，但与所有已声明任务无关且不包含可执行诉求的输入。
 不得复用任何主序列的实体、请求、票号、设备、目标、状态或措辞；不得生成任务的起点、进展或结果。
+计划噪声话题是当前 ordinal 的唯一话题；不得改换、混合或泛化为其他话题。
+生成前必须在内部列出 attempt_index + 2 个符合该话题的自然表达角度，再选择下标 attempt_index 对应的角度。
+不同 attempt 必须使用明显不同的措辞；不得输出候选表或复述内部标识。
+Schema 中的 examples 只描述形状，禁止复制或改写其内容。
 只能返回满足给定噪声帧 Schema 的一个 JSON 对象，不要 Markdown、代码围栏、解释或额外字段。
 ```
 
@@ -8194,6 +8609,9 @@ session_id={session_id}
 [已声明帧类别]
 {frame_descriptions_json}
 
+[计划噪声话题]
+{planned_topic}
+
 [噪声指令]
 {noise_instruction}
 
@@ -8207,7 +8625,8 @@ session_id={session_id}
 只返回一个通过噪声帧 Schema 的 JSON object。
 ```
 
-The attempt identity fields are projected exactly from `NoiseRenderRequest.noise_slot` and
+The attempt identity fields and planned topic are projected exactly from
+`NoiseRenderRequest.noise_slot` and
 `.attempt_index`; `noise_instruction` comes from `.noise_spec`, while frame instruction and the
 complete frame Schema come from `.frame_spec`. `class_descriptions_json` and
 `frame_descriptions_json` are the request mappings rendered as complete canonical JSON objects.
@@ -8222,8 +8641,10 @@ Exactly two messages are sent through `NoiseEvaluationRequest.evaluation_profile
 **System message:**
 
 ```text
-你是独立噪声语义判定器，不参与生成。判断候选是否与全部已声明任务无关、是否不含可执行任务、
-以及是否自然真实。三项只能返回 boolean；任一 false 必须加入对应闭集 reason code，
+你是独立噪声语义判定器，不参与生成。判断候选是否与全部已声明任务无关、是否不含可执行任务、以及是否自然真实。
+候选没有忠实表达计划噪声话题，或混入其他主题时，matches_planned_topic 必须为 false，
+reason_codes 必须包含 planned_noise_topic_mismatch。
+四项只能返回 boolean；任一 false 必须加入对应闭集 reason code，
 全部 true 时 reason_codes 必须为空。reason_codes 不得包含候选内容或自由文本。
 只返回 JSON，不要 Markdown、代码围栏、解释或额外字段。
 ```
@@ -8240,24 +8661,29 @@ attempt_index={attempt_index}
 [已声明帧类别]
 {frame_descriptions_json}
 
+[计划噪声话题]
+{planned_topic}
+
 [候选 payload]
 {payload_json}
 
 [输出契约]
 严格返回：
-{"unrelated_to_declared_tasks":true,"no_executable_task":true,"realism":true,"reason_codes":[]}
+{"unrelated_to_declared_tasks":true,"no_executable_task":true,"realism":true,"matches_planned_topic":true,"reason_codes":[]}
 reason_codes 只能取：
-["related_to_declared_task","executable_task_present","unrealistic"]
+["related_to_declared_task","executable_task_present","unrealistic","planned_noise_topic_mismatch"]
 ```
 
-The descriptions and candidate payload are the direct request fields rendered as complete
-canonical JSON. The prompt receives no NoiseSlot, PlannedEvent, ScenarioSeed, EventTrace, primary
-payload set, state or variant truth. All three booleans must be true. Structured output receives
+The descriptions, planned topic and candidate payload are the direct request fields; mappings and
+payload use complete canonical JSON. The prompt receives no NoiseSlot, PlannedEvent, ScenarioSeed,
+EventTrace, primary payload set, state or variant truth. All four booleans must be true. Structured output receives
 `noise_semantic_evaluation_schema()` unchanged; L0-off relies on the complete text contract.
 
 Across all six families, profile choice comes only from the request/program fields named above.
-All use the unchanged §10.6 L3 repair message after L1/L2 failure. Repair receives the same
-complete Schema and only normalized, data-minimized violations. Event-plan post-validation never
+ScenarioSeed, FrameRenderer, SemanticEvaluator, NoiseRenderer and NoiseEvaluator use the unchanged
+§10.6 single-user-message L3 repair after L1/L2 failure. EventPlanner uses the §10.6.1
+post-validated replay dialogue. Repair receives the same complete Schema and only normalized,
+data-minimized violations. Event-plan post-validation never
 injects state, EventExecution or hook exception text into repair. Frame binding application and
 its final full-Schema revalidation occur after M8 success and never enter L3.
 

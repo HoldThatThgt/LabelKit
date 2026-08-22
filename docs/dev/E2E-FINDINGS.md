@@ -1,942 +1,265 @@
-# E2E 测试发现的系统问题清单
+# E2E 测试发现与证据状态
 
-> 2026-07-03，撰写用户手册期间对 LabelKit 1.0.0 做的端到端测试所发现的问题。
-> 测试面：三个示例工程真实 LLM 全流程（text / ui / generate）、validate/--probe、--dry-run、
-> --limit/--strict、坏密钥、坏输入路径、坏配置等错误路径，以及 116 个审计智能体对
-> 手册与实现逐条核对时顺带发现的行为事实。按严重程度排序。
+> 本文件只记录可复核证据。已验证事实、权威验收目标、环境失败和待运行项分开书写。
+> 当前序列生成以 v1.18 规格与 `examples/sequence-generation` 为准。
 
-## 条目索引
+## 证据纪律
 
-| 条目 | 标题 | 严重级 | 状态 |
-|---|---|---|---|
-| 1 | `provider_retryable_exhausted` 未计入熔断窗口（spec §7.6 偏差） | P1 | ✅ 已修复（2026-07-03） |
-| 2 | 「无任何合法记录」未按 spec §2.4 触发退出码 3 | P1 | ✅ 已修复（2026-07-03） |
-| 3 | 认证失败 + 记录级隔离 ⇒ 静默全灭、exit 0 | P2 | ✅ 已修复（2026-07-03） |
-| 4 | trace 文件在启动瞬间被截断 | P2 | ✅ 已修复（2026-07-03） |
-| 5 | json-repair 会把「未转义内引号」修复成合法但被截断的内容 | P2 | ✅ 已缓解（2026-07-03） |
-| 6 | 温度 0 下 pointwise 打分跨运行明显漂移 | P2 | ⏸ 延期 |
-| 7 | `threshold` + `top_ratio` 同设时可能被静默忽略 | P3 | ✅ 已修复（2026-07-03） |
-| 8 | `verify.judges` 非空时仍强制要求 `verify.llm` 指向存在的 profile | P3 | ✅ 已修复（2026-07-03） |
-| 9 | pairwise 模式下 `report.quality.per_criterion_mean` 恒 ≈ 0.5 | P4 | ✅ 已修复（2026-07-03） |
-| 10 | 熔断时 `report.run.interrupted` 保持 `false` | P4 | ✅ 已修复（2026-07-03） |
-| 11 | report 的 generate.buckets 字段白名单漏 `rejected_by_validator`（spec §6.4 / CONTRACTS §9.3 偏差） | P1（规格偏差） | ✅ 已修复（2026-07-07） |
-| 12 | `_meta.run.rubric` 对 `default:trajectory` 回落为模态默认（§6.3 偏差） | P1（规格偏差） | ✅ 已修复（2026-07-14） |
-| 13 | v1.8 合入前对抗代码评审的七项发现（D1–D7） | 2 medium / 5 low | ✅ 全部修复（2026-07-14） |
-| 14 | glm-5.2 温度 0 下 segment 边界判决跨运行漂移（穿插流场景） | P2（同第 6 条根因） | ⏸ 数据侧缓解 |
-| 15 | z.ai 超窗形态实测：200 + `model_context_window_exceeded`，非 400 | 实测记录 | 已闭合（集成断言已钉） |
-| 16 | 实效窗实测：裸 glm-5.2 = 2^20 = 1,048,576（input+max_tokens 合并判定）；`[1m]` 后缀不存在 | 实测记录 | 已记录（集成测试常驻） |
-| 17 | 校准首批偏差实测：先验 1882 → 收敛 206/79 | 实测记录 | 已记录（钉入集成断言） |
-| 18 | `validate --probe` 被裁决·输出截断终局化误伤 | 真 bug（实现勘误） | ✅ 已修复（2026-07-23） |
-| 19 | classify 集成测试的「截断逼出 SchemaViolation」诡计随裁决·输出截断终局化失效 | 测试适配（非偏差） | ✅ 已适配（2026-07-23） |
-| 20 | 首例真跑 `output_truncated`：quality pointwise 写满 4096 | 实测记录（同第 6 条根因家族） | 已记录 |
-| 21 | 并发同名输出 stem 的碰撞形态 | P3 级锐边 | 已记录（roadmap 级建议） |
-| 22 | DeepSeek anthropic 路由响应默认携带 thinking 内容块 | 实测记录 | 📌 已记录（2026-08-12，M9 天然兼容） |
-| 23 | DeepSeek anthropic 路由不支持图像内容块 | 实测记录 | ✅ 已适配（2026-08-12） |
-| 24 | DeepSeek anthropic 路由对强制 tool_choice 返回 400 | 实测记录 | ✅ 已适配（2026-08-12） |
-| 25 | 无 L0 端点上 `prefixItems` 逐位契约靠提示词文本承载 | 实测记录 | ✅ 已适配（2026-08-13，模板内嵌结构契约） |
-| 26 | 温度 0.9 下帧实现偶发违约 ⇒ 整序列作废、交叉演示位退化 | 实测记录（同第 6 条根因家族） | ⏸ 数据侧缓解（按设计处置） |
-| 27 | 工件重放的判重档位实测：`near_text` 而非 `exact` | 实测记录 | 已记录（示例头注与手册按实测叙述） |
-| 28 | `resolved_at` 恒等式在 M8 显式待遇参数重构后的回归确认 | 实测记录 | ✅ 已确认（2026-08-13） |
-| 29 | `validate --probe` 的 rich 表格把 `profile[key]` 字面格当 markup 吞掉 | 真 bug（实现勘误） | ✅ 已修复（2026-08-14） |
-| 30 | 蓝图 `cover_all` 服从性实测：首轮全过，作废集中在帧实现 | 实测记录 | ✅ 已确认（2026-08-18） |
-| 31 | z.ai glm-5.2 接受 `allOf`/`contains` 作强制工具 input_schema | 实测记录 | ✅ 已确认（2026-08-18，L0 透传钉板） |
-| 32 | 工件重放判重档位的两分支现在都有实测：`exact` 与 `near_text` | 实测记录（第 27 条续） | 已记录（两分支并列叙述） |
-| 33 | v1.13 集成首例在真端点约 8 跑中偶发红一次 | 锐边记录（同第 6、26 条根因家族） | ⏸ 不改测试（处置理由见条目） |
-| 34 | v1.15 计数器键按类重冻结把 v1.14 集成第四例留成陈旧断言 | 测试适配（非偏差） | ✅ 已适配（2026-08-19） |
-| 35 | v1.15 验收当日 DeepSeek 端帧实现违约率抬头：6 跑中 5 跑各作废 1 条 | 实测记录（同第 26、33 条根因家族） | ⏸ 数据侧缓解（按设计处置） |
-| 36 | z.ai 账号周/月额度耗尽 ⇒ 两例 L0 透传钉板暂时无法执行 | 环境记录（非代码问题） | ✅ 已闭合（2026-08-20） |
-| 37 | v1.16 最小规则集 DeepSeek 单例通过 | 实测记录 | ✅ 已确认（1 passed，5.82s） |
-| 38 | v1.16 synth-stream 首跑：thinking 默认开启与 4096 输出预算导致全量作废 | 实测记录 | ⛔ failed-closed 诊断 |
-| 39 | v1.16 synth-stream 显式关闭 thinking 后的自由文本帧类型违约 | 实测记录 | ⛔ failed-closed 诊断 |
-| 40 | v1.16 synth-stream 规则生成成功验收 | 实测记录 | ✅ 已确认（2026-08-20） |
-| 41 | v1.16 synth-stream 正式 process replay 成功验收 | 实测记录 | ✅ 已确认（2026-08-20） |
-| 42 | 联合 planner 模型规模随序列数三次增长，12 条序列即触顶 | P1（规模硬伤） | ✅ v1.17 shipped（Wave 8 收口） |
-| 43 | 零交叉需求下仍构造全部交叉组合，占模型 67%–72% | P1（规模硬伤，第 42 条主因） | ✅ v1.17 shipped（Wave 8 收口） |
-| 44 | 容量拒绝被渲染成 INFEASIBLE，且不报实际规模 | P3（诊断误导） | ✅ v1.17 shipped（Wave 8 收口） |
-| 45 | 生成路径没有布局目标：9 条序列铺到 29 个自然日 | P2（布局不可预期） | ✅ v1.17 shipped（Wave 8 收口） |
-| 46 | 可行性入口与规划入口优化的不是同一目标 | P2（第 45 条同族） | ✅ v1.17 shipped（Wave 8 收口） |
-| 47 | 钩子模块不按 project TOML 目录解析 | P2（可移植性） | ✅ v1.17 shipped（Wave 8 收口） |
-| 48 | `session_max_len` 的 2× 下界忽略实际装箱计划 | P3（配置体验） | ✅ v1.17 shipped（Wave 8 收口） |
-| 49 | 派生约束逐层暴露，同一组关系要跑多轮才看全 | P3（配置体验） | ✅ v1.17 shipped（Wave 8 收口） |
-| 50 | 无 `--probe` 的 `validate` 仍要求密钥值存在 | P3（配置体验） | ✅ v1.17 shipped（Wave 8 收口） |
-| 51 | dry-run 估算只进 stderr，不进 report.json | P4（观测性） | ✅ v1.17 shipped（Wave 8 收口） |
-| 52 | 相对输出路径按启动目录解析且不回显绝对路径 | P3（配置体验） | ✅ v1.17 shipped（Wave 8 收口） |
-| 53 | `windows` 不能锁定唯一日期，horizon 无上界 | 能力缺口（须先改规格） | ✅ v1.17 shipped（Wave 8 收口） |
-| 54 | 噪音帧只能是纯文本，结构化负样本无入口 | 能力缺口（须先改规格） | ✅ v1.17 shipped（Wave 8 收口） |
-| 55 | 长周期行为配额无法声明 | 能力缺口（须先改规格） | ✅ v1.17 shipped（Wave 8 收口） |
-| 56 | 单日覆盖与多周比例的整数冲突无提示 | 能力缺口（须先改规格） | ✅ v1.17 shipped（Wave 8 收口） |
-| 57 | 跨序列类的先后、最小间隔与语义互斥 | 规格既有非目标 | ✅ v1.17 shipped（Wave 8 收口） |
-| 58 | App 使用区间严格包含屏幕 / 剪贴板证据 | 规格既有非目标 | ✅ v1.17 shipped（Wave 8 收口） |
-| 59 | 跨序列资源互斥（同设备音频焦点） | 规格既有非目标 | ✅ v1.17 shipped（Wave 8 收口） |
-| 60 | 失败序列不补足配额 | 规格既有非目标（报告面已够） | ✅ v1.17 shipped（Wave 8 收口） |
+- “已验证”必须带命令、输入边界或可检查的产物身份。
+- pytest 退出 0 不自动证明目标路径被执行；还要确认 marker 未跳过、真实 entrypoint 被调用、目标工件存在。
+- 真实 LLM 证据必须使用真实 endpoint，不替换 HTTP transport、LLM client 或服务端，不使用录制响应。
+- 429、5xx、额度耗尽属于环境失败；slot exhaustion 属于产品失败，不能重跑到绿后删除失败记录。
+- API key value 只在内存中使用，不写日志、trace、main、stream、report、manifest、failed report 或 assertion repr。
+- 尚未运行的证据必须保留 `[PENDING-EVIDENCE:<name>]`，不能用规格期望冒充结果。
 
-## P1 — 实现与规格的偏差
+## v1.18 闭包看板
 
-### 1. `provider_retryable_exhausted` 未计入熔断窗口（spec §7.6 偏差）—— ✅ 已修复（2026-07-03）
-
-**现象**：spec §7.6 规定重试耗尽（`provider_retryable_exhausted`）应「记录 failed，**计入熔断窗口**」。实现中 `llm_client.py` 的 `_post_with_retries()` 重试耗尽分支（约 :643-651）只发 trace 事件并抛 `ProviderRetryableError`，**从不调用** `_record_provider_result(fatal=True)`；全仓库也没有其他地方把该错误计入熔断。
-
-**后果**：端点持续性故障（所有请求 5xx/超时）时熔断永不触发——每条记录都要烧满 `max_retries` 次重试再失败，运行以最慢、最贵的方式爬完全程，最后 exit 0（除非 --strict）。熔断「对坏端点快速止损」的设计目标在这类故障下失效。
-
-**建议**：在重试耗尽分支补 `self._record_provider_result(fatal=True)`（与 401/403 分支对齐）。
-
-### 2. 「无任何合法记录」未按 spec §2.4 触发退出码 3 —— ✅ 已修复（2026-07-03）
-
-**现象（修复前）**：spec §2.4 将「无任何合法记录」列入退出码 3 的触发条件，errors.py 与 CONTRACTS.md §InputError 也有同样表述，但实现缺该检查：`text_field` 全员不命中（默认 `on_bad_line="skip"`）时运行照常收尾——实测 `scanned=2 ingested=0 bad_input=2 emitted=0`、退出码 0。
-
-**修复**：按 spec 实现于 M2（ingest 拥有输入级合法性校验）：`Ingestor.records()` 流耗尽时若 `ingested == 0` 抛 `InputError("no valid records: …(scanned/bad_input/missing_pair/index_conflict counts)")` → 退出码 3。覆盖全坏行、空文件、UI 全缺对/全冲突四种形态；只要有一条合法记录则行为不变。新增 4 个单测 + 更新 4 个原「空流不抛错」的单测（tests/test_ingest.py），CLI 级实测确认 exit=3；手册第 5/15/18/19 章已同步回改为新行为。
-
-## P2 — 符合规格但伤用户的锐边
-
-### 3. 认证失败 + 记录级隔离 ⇒ 静默全灭、exit 0 —— ✅ 已修复（2026-07-03：401/403 首错立即熔断 → exit 4；spec §3.9.3/§7.6 已同步）
-
-**现象**：坏 API 密钥（z.ai 返回 401 → `provider_fatal`）实测：14 条输入全流程跑完，`failed=13`（1 条先被 dedup 拦下）、主输出 0 行、**退出码 0**。原因：记录级隔离下每条记录在 quality 阶段首次调用失败即标 `failed`，后续阶段不再碰它——连续致命错误计数最多只能攒到「存活记录数」，14 条数据永远够不到默认阈值 20。
-
-**后果**：小批量/试跑场景下，密钥、权限、模型名错误表现为「运行成功但什么都没产出」，只有翻 rejects 或 counts 才能发现。
-
-**建议**：认证类致命错误（HTTP 401/403）不该按「连续 N 次」熔断——第一次出现就几乎不可能自愈，建议直接触发熔断或大幅降低此类错误的阈值。手册侧已用「先跑 `validate --probe`」缓解（第 2、15 章）。
-
-### 4. trace 文件在启动瞬间被截断 —— ✅ 已修复（2026-07-03：EventLog 惰性打开 + run.start 前先输入扫描；dry-run 的报告写 {stem}.dryrun.report.json、trace 写 {stem}.trace.dryrun.jsonl）
-
-**现象**：`EventLog` 启动即以 `"w"` 打开 trace 路径。实测一次 `--input ./no-such-dir`（未指定 --output）的运行在打印 `InputError` 退出前就把上一次成功运行的 trace 截断成了 2 行。`--dry-run` 同样截断 trace 并覆盖 report.json。（report.json 仅在 finalize 写出，死于启动校验的运行不会覆盖它；dry-run 会。）
-
-**后果**：一次手滑的失败命令就销毁了上一轮的调优底账（trace 是 rubric 迭代的核心原料）。虽有 WARN 提示「already exists — truncating」，但打印时已经截断了。
-
-**建议**：trace 打开推迟到 M1+输入扫描通过之后；dry-run 的 report/trace 写独立文件名（如 `{stem}.dryrun.report.json`）。
-
-### 5. json-repair 会把「未转义内引号」修复成合法但被截断的内容 —— ✅ 已缓解（2026-07-03：确定性修复层有损修复启发式——re 序列化长度损失 >20% 且 >40 字符时 stderr warn + trace schema.repair 事件带 l1_lossy 标记；根因在 LLM 输出侧，无法在修复层完全消除）
-
-**现象**：examples/ui 运行的 verify 环节，judge 输出的 critique 文本含中文引号内嵌英文引号（如 `页面标题"登录"…`），确定性修复层的 `json_repair` 把字符串在内引号处截断，产出**结构合法但语义残缺**的 JSON——trace 里实测两处：`"opinion": "页面标题"`、`"opinion": "screen_category 为 settings 语义正确；page_title 为"`。全程无任何告警，校验通过。
-
-**后果**：`policy="repair"` 时被截断的批评意见会回喂标注模型，修复质量打折；trace 审计材料失真。
-
-**建议**：内部 Schema 的自由文本字段（reason/opinion）可加 minLength 或对确定性修复层修复命中且文本骤短的情况发 warn；提示词侧可要求评审「意见文本中不要使用引号」。
-
-### 6. 温度 0 下 pointwise 打分跨运行明显漂移 —— ⏸ 延期（服务端非确定性非工具可消除；「n 次采样取中位数」属算法级新特性，须按 §1.6 流程与需求方对齐后立项；手册已在引用数字处加波动提示）
-
-**现象**：同配置、同 seed、同输入的相邻两次运行（examples/text，threshold=0.25）：`dropped_lowq` 在 5↔8 之间翻转（13 条中 3 条阈值附近记录逐次进出）；`facts_trivia` 均值 0.06↔0.22。temperature=0 不能消除 glm-5.2 服务端的非确定性，而 pointwise 单次打分对措辞极敏感。
-
-**后果**：阈值附近的门控结果不可复现；「可复现性」承诺只覆盖流程路径，不覆盖 LLM 判分本身（spec 已如此声明，但实际波动幅度值得知晓）。
-
-**建议**：产品侧可考虑给 pointwise 增加「n 次采样取均值/中位数」选项（对应 pairwise 已有的 both_orders 思路）；手册已在引用具体数字处加了波动提示。
-
-## P3 — 配置体验的坑
-
-### 7. `threshold` + `top_ratio` 同设时可能被静默忽略 —— ✅ 已修复（2026-07-03：selection=threshold 且设 top_ratio 时 M1 打 warning）
-
-互斥校验位于 `if quality.selection == "top_ratio":` 分支内（loader.py 约 :840-846）。用户设置了 `top_ratio` 但忘了把 `selection` 改成 `"top_ratio"` 时：装载成功、零警告，`top_ratio` 被静默忽略。建议：`selection="threshold"` 且 `top_ratio` 非空时打 warning。
-
-### 8. `verify.judges` 非空时仍强制要求 `verify.llm` 指向存在的 profile —— ✅ 已修复（2026-07-03：judges 非空豁免该校验；spec §5.2 脚注已同步）
-
-loader（约 :802-803）在 `verify.enabled` 时无条件校验 `verify.llm`（默认 `"judge"`）存在于 `[llm.*]`——即便配置了 judges 评审团、`verify.llm` 根本不会被使用（`referenced_profiles()` 里 judges 非空即替代它，probe 与密钥检查都跳过它）。用户必须定义一个用不到的 `[llm.judge]` 才能过校验。建议：judges 非空时豁免该校验（与 quality.judges 的语义对齐）。
-
-## P4 — 观测性小项
-
-### 9. pairwise 模式下 `report.quality.per_criterion_mean` 恒 ≈ 0.5 —— ✅ 已修复（2026-07-03：report 只增字段 per_criterion_tie_rate——每准则平局率，判定失败按平局计；spec §6.4 已同步）
-
-批内百分位的均值按构造恒为 0.5（examples/ui 实测四条准则全是 0.500）——该指标对 pairwise 无信息量，却和 pointwise 的有意义均值共用同一字段。建议：pairwise 下省略或改报 tie 率。
-
-### 10. 熔断时 `report.run.interrupted` 保持 `false` —— ✅ 已修复（2026-07-03：report.run 只增字段 circuit_broken；spec §6.4 已同步）
-
-`interrupted` 仅由 SIGINT/SIGTERM 置位；熔断只体现在 `exit_code: 4` + 主输出不交付。语义上容易误读（「中途死了却说没 interrupted」）。建议：report 增加显式的 `circuit_broken` 字段。
-
----
-
-### 测试留痕
-
-| 套件 | 数量 | 备注 |
+| 证据面 | 当前状态 | 已知事实 / 占位 |
 |---|---|---|
-| 示例工程真跑（text / ui / generate） | 3 个工程全部 exit 0，账目守恒 | text（14→8 emitted）、ui（6 scanned→4 emitted，跨子目录配对/孤儿树/精确重复三机关全部按预期处理）、generate（0 输入→8 emitted，桶统计正确） |
-| 错误路径与旗标 | 全部符合规格 | `validate --probe`、`--dry-run` 成本估算、`--limit`、`--strict`（exit 1）、退出码 2/3 错误路径 |
-| 离线测试套件 | 527 passed | — |
+| 变更前 offline baseline | 已验证 | 2157 tests |
+| 当前 offline suite | 已验证 | 2606 passed，47 deselected |
+| merged coverage | 已验证 | line 95.71%、branch 91.30%；1548/1548 可执行生产函数已进入 |
+| keyless compile / dry-run | 已验证 | 2 sets、8 primary sequences、22 primary events、2 noise events、3 replay events、27 stream rows |
+| 500000 record-unit planner probe | 已验证 | 16.889 秒，peak RSS 839221248 bytes |
+| retained-content 口径 | 已验证 | 536870912 bytes 是最终 main+stream canonical UTF-8 紧凑核算，不是物理分配 |
+| DeepSeek sequence integration | 已验证 | 5 passed in 119.26s，含真实双-noise 话题交付 |
+| DeepSeek teaching example | 已验证 | 2 sets、8 sequences、27 stream rows，checker PASS |
+| process replay | 已验证 | 27 scanned、9 episodes、2 noise、1 duplicate、8 emitted |
+| instruction-only live | 已验证 | 1 sequence、3 events，checker PASS |
+| frame-only live | 已验证 | 1 sequence、3 events，sequence annotation 为 null，checker PASS |
+| real failure injection | 已验证 | whole-set rollback 与 M8 L3 两条真实用例通过 |
+| z.ai structured output | 已验证 | 1 passed in 60.81s |
+| 完整真实端点 integration suite | 已验证 | 47 passed in 438.37s，无 skip |
+| 52-sequence blind review | 已验证 | 两名评审各 52/52；五类缺陷与系统性缺陷均为 0 |
 
----
+## 已验证的 keyless 计划
 
-## 附注：v1.6 密钥池与熔断交付下的既有修复语义（2026-07-03）
+命令：
 
-v1.6（多 API 密钥负载均衡 + 熔断交付，spec 3.9.3/3.10.3）触及本清单中第 1、3、10 条的实现位点，语义按如下方式保持并推广——「不回退」的精确含义：
-
-- **第 1 条（重试耗尽计入熔断窗口）**：重试耗尽仍 `record_provider_result(fatal=True)`；v1.6 新增的驻留超限（`run.max_park_s`）走同一路径，同样计入。轮换后的耗尽意味着调用在其触及的每把密钥上都失败过——计数含义只强不弱。
-- **第 3 条（认证类首错立即熔断）**：按密钥泛化——401/403 先禁用该密钥（`llm.key_disabled` WARN），池内尚有存活密钥时同一尝试立即换密钥重发（不耗重试、不喂熔断）；**最后一把存活密钥**被禁用时立即硬熔断。池大小 1 时逐位还原 v1.5 行为（首个 401 → exit 4）；其逆命题同时成立：一把被吊销的密钥不再杀死仍有健康密钥的运行。集成测试 `tests/integration/test_key_pool_llm.py` 以真实 401（故意无效的密钥值）覆盖两个方向。
-- **排队调用的熔断重新检查（评审工作流加固项）**：信号量后逐尝试 `_check_breaker` 保留；驻留期间每 ≤60s 分片同样重新检查。
-- **第 10 条（circuit_broken 字段）**：仍恒在；v1.6 熔断改为**交付**已完成批，report 另增 `partial_delivery`（仅熔断交付时出现）与 `counts.unprocessed`（差额，守恒恒等式左侧扩展项）——「熔断 = .part 不交付」的旧断言已随 spec 修订废止（tests/test_orchestrator.py 两处断言同步反转）。
-
-**测试留痕（v1.6）**
-
-| 套件 | 数量 | 备注 |
-|---|---|---|
-| 离线套件 | 596 passed | 新增 21 个密钥池纯逻辑测试 + 2 个熔断交付断言反转 |
-| 集成套件 | 21 passed | 新增 4 个：别名轮换、坏密钥吸收轮换、全池坏密钥硬熔断、逐密钥 probe_all |
-| examples/text 真实全流程 | exit 0 | 健康运行 report 结构与 v1.5 逐键一致（无新增字段） |
-
----
-
-## 追加条目：v1.7 可行性审查发现（2026-07-07）
-
-### 11. report 的 generate.buckets 字段白名单漏 `rejected_by_validator`（spec §6.4 / CONTRACTS §9.3 偏差）—— ✅ 已修复（2026-07-07，随 v1.7 实现顺带修复）
-
-**现象**：v1.5 引入的桶计数器 `generate.buckets.<key>.rejected_by_validator`（`generate.py` 在配置 `generate.sample_validator` 时零初始化、逐违规累加）从未到达 report.json——`orchestrator._build_report` 解析桶计数器时按字段名白名单过滤，白名单只含 `calls` / `produced` / `survived_dedup` 三项，第四个字段被静默丢弃，与 spec §6.4 / CONTRACTS §9.3 的承诺相矛盾。发现于 v1.7 分类算子的 fan-out 可行性审查（inline 核对承重事实时比对 orchestrator 白名单与 generate 计数点）。
-
-**后果**：配置了 `generate.sample_validator` 的运行里，回调的实际拦截量在报告中恒不可见——桶统计貌似完整实则少一列，validator 拦截率无法从 report.json 审计（trace 事件与 stderr 不受影响，但 report 是唯一的结构化台账）。
-
-**修复**：`orchestrator._build_report` 桶字段白名单补入 `rejected_by_validator`；零初始化语义保持——三个恒在字段不变，第四字段仅在计数器出现（即配置了 validator）时写入。回归测试 `tests/test_orchestrator.py::test_generate_bucket_whitelist_includes_rejected_by_validator`（先红后绿）覆盖「有 validator 桶带第四字段、无 validator 桶保持三字段形状」两个方向。
-
----
-
-## 追加条目：v1.8 E2E 发现（2026-07-14）
-
-### 12. `_meta.run.rubric` 对 `default:trajectory` 回落为模态默认（§6.3 偏差）—— ✅ 已修复（2026-07-14，v1.8 合入前）
-
-**现象**：emitter 的 `_rubric_selector` 白名单元组仍为 v1.7 的 `("default:text", "default:ui")`——工程显式配置 `quality.rubric = "default:trajectory"`（或流模式下留空经 loader 的裁决·流模式默认轨迹准则解析为 trajectory）时命中兜底分支，`_meta.run.rubric` 被写成 `default:{modality}`（examples/stream 实跑记为 `"default:ui"`，与实际打分准则不符）。发现于手册 25 章重同步（样例块与产物逐字核对时比对 `_meta.run` 块）。
-
-**后果**：仅溯源字段失真（打分本身用的是正确的 trajectory rubric——loader 解析与 M4 消费不受影响）；但 `_meta.run.rubric` 是行级审计的 rubric 依据，stream 工程的主输出全部行携带错误值。
-
-**修复**：`emitter._rubric_selector` 白名单补 `"default:trajectory"`，空串兜底分支镜像 loader 的 rubric 校验规则（CONTRACTS §6.3 rule 16）所载的裁决·流模式默认轨迹准则（`segment.enabled` ⇒ trajectory）。回归测试 `tests/test_emitter.py::test_rubric_selector_trajectory`（先红后绿）覆盖显式选择器与流模式空串解析两个方向。手册无受影响样例（25 章刻意未引 `_meta.run` 块）。
-
-### 13. v1.8 合入前对抗代码评审的七项发现（D1–D7）—— ✅ 全部修复（2026-07-14，v1.8 合入前）
-
-合入前的对抗评审（八攻击面 + 离线 probe 复现）确认流模式链路核心算法（滑窗缝合/成段/分段吸收例外/两阶段手术/守恒代数）无缺陷，但在观测面契约、会话身份与修复归因上查实 7 项（2 medium / 5 low），全部修复并补回归：
-
-| 序号 | 名称 | 级别 | 现象与修复 |
-|---|---|---|---|
-| D1 | 评审发现·乱序镜像外泄输入 | medium | `ingest.disorder` 逐事件 stderr 镜像违反「全运行仅一次」契约并外泄输入值：镜像行携带 reason 内的时间戳/游标值且每记录一条——时间戳字段系统性坏掉时 stderr 被输入派生值淹没。修复：事件改 trace-only（obslog 镜像表删行），M2 自身保留一条 data-free 的全运行单次 WARN；spec §7.2/CONTRACTS §8.1 同步。 |
-| D2 | 评审发现·会话身份哈希碰撞 | medium | 内容派生 `session_id` 碰撞致批内不同会话被 M14 静默合并：帧 id 是内容哈希且流模式下帧不判重，字节级相同的重复行被 max_len 切分即产出同 id 会话、同批装箱后被按 id 归组合并。修复：M2 闭会话时维护每运行重复序数，碰撞时折入哈希（首次出现保持原派生，正常流 id 稳定不变）；回归测试钉住同内容双会话 id 相异且跨运行确定。 |
-| D3 | 评审发现·限量耗尽误报截断 | low | `--limit` 恰耗尽于流末时误发「被截断」WARN：恰好耗尽与真截断不可区分（消歧需多拉取一条记录、扰动 scanned 台账）。裁决为语义澄清：cause="limit" 定义为「预算耗尽处闭合」、WARN 文案陈述预算耗尽而非断言截断；spec 3.2.8/CONTRACTS §7.1 钉死。 |
-| D4 | 评审发现·缺陷计数漏修复项 | low | `verify.defects.<kind>` 只计终局缺陷表：被成功修复的缺陷从报表消失，与 membership_repairs 的路由时计数口径自相矛盾（可出现「手术数 >0 而缺陷计数全 0」）。修复：改在每轮评审定案时计数（修复掉的缺陷仍入直方图）。 |
-| D5 | 评审发现·争帧误标采集缺口 | low | 同轮争帧误标 `suspected="capture_gap"`：位次序在后的 episode 查到的候选帧已被前序 episode 预定时跳过了三级判定的第二级——终局该帧确实被邻段回收，"采集缺口"属事实性错误标注。修复：claimed 帧按「邻段持有」判 mark-only。 |
-| D6 | 评审发现·克隆丢会话双标 | low | multi 扇出克隆丢 `session_split`/`segment_degraded` duck 标：同 episode 兄弟行的 `_meta.stream` 自相矛盾（会话属性非信封属性）。修复：`_fan_out` 复制两标（连同 v1.8 audit 补的 session_id 继承一并回归覆盖）。 |
-| D7 | 评审发现·换文件断会话未入册 | low | 文本 input_order 下「换文件即断会话」未入规范：行为正确（line_no 顺序语义不跨文件）但 spec/302 闭合条件枚举与 CONTRACTS §7.1 未登记、cause="key" 在 `stream.key=[]` 时无从解释。修复：两处文档登记（含 meta:* 下文件边界透明的对照句）。 |
-
-**测试留痕**
-
-| 套件 | 数量 | 备注 |
-|---|---|---|
-| 离线套件 | 1015 passed | 较评审前 +5：D2/D6 新回归 + D1/D3/D4/D5 断言修正（序号见上表） |
-| 集成套件 | 28 passed | 真实端点，评审前已跑 |
-
----
-
-## 追加条目：示例重组 E2E 发现（2026-07-17）
-
-### 14. glm-5.2 温度 0 下 segment 边界判决跨运行漂移（穿插流场景）—— ⏸ 数据侧缓解（context 语义边界句），同第 6 条根因
-
-**现象**：examples 按输入格式重组为三工程后，`examples/stream`（53 帧五会话，segment window=16 + stitch）连续五次真跑中两类边界判决出现跨运行翻转：① s1 会话（外卖 8 帧 + 打车 5 帧背靠背 + 桌面尾帧）在早期 context 措辞下偶发整会话 all-continues（14 帧并成 1 个 episode，噪声帧 5 未剔除）；② s4 会话的支付尾帧（409，与 404 的网购实体跨 4 帧呼应）在「背靠背串联」语义句加入后反而被判 `advances`（并进新闻段——该句的逆命题「切 App 且有实体延续 ⇒ 非新流程」被模型采信）。同 seed、temperature=0、同输入。
-
-**后果**：s1 翻转时 emitted 8↔9、s4 翻转时救援路径整条消失（rescued_short 1↔0、stitched 3↔4，错并的新闻线索被 verify 以 label_mismatch 拦截丢弃）——运行级账目守恒恒成立，但穿插流工程的逐场景验收数逐次运行可能不同。
-
-**处置**：根因与第 6 条同源（服务端非确定性 + 判决对措辞极敏感），工具侧无案。数据侧缓解落在 `[segment].context` 的三个语义边界句（现 examples/stream/project.toml）：「一笔任务已办完之后紧接着开始的另一笔是新流程」（治 s1 串联欠分割）、「advances 仅适用于当前这一笔进行中的任务；与几帧前被打断任务的实体呼应属切回收尾（context_switch）」（治 s4 尾帧误吸附）。加句后验证运行（run 5）五场景全部命中设计预期（2/2/3/2/0 线索、stitched=3、rescued_short=1、seams=4、错缝 0）；手册 25/26 章样例即取该次运行，并在 26.5 记录了这组措辞的调参因果。残余风险：漂移不能排除，逐场景数字仅作参考锚——两章均保留「照跑数字会有浮动、守恒恒成立」的提示。
-
----
-
-## 追加条目：v1.11 集成与验收工序实测（2026-07-23）
-
-> spec v1.11「上下文预算」集成与验收工序（SPEC-context-budget.md §3.9）对真端点
-> `https://api.z.ai/api/anthropic`（anthropic 协议，glm-5.2）的实测记录。
-> 新增集成测试文件 `tests/integration/test_budget_llm.py` 把第 15/16 条的采集
-> 钉成永久断言。
-
-### 15. z.ai 超窗形态实测：200 + `model_context_window_exceeded`，非 400
-
-本条闭合裁决·溢出裁帧保清重试与调查·端点溢出形态无官载（后者出自 PROPOSAL-context-budget §3 的调查登记）。
-
-**实测**：对未声明 `context_window` 的 profile 构造必超窗请求（估算 ≈ 1.9M token
-的 CJK+ASCII 重复文本，实际 1,333,338 GLM token），端点返回 **HTTP 200**，响应体
-逐字（省略 id/request 标识）：
-
-```json
-{"id":"msg_…","type":"message","role":"assistant","model":"glm-5.2",
- "content":[{"type":"text","text":""}],
- "stop_reason":"model_context_window_exceeded","stop_sequence":null,
- "usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0}}
+```bash
+cd examples/sequence-generation
+mkdir -p out
+uv run labelkit validate --config config.toml --project project.toml --console plain
+uv run labelkit run --config config.toml --project project.toml --dry-run --console plain
 ```
 
-即调查·超窗二百形态词值的双协议 200 形态——**裁决·溢出信号统一分相的 finish 终局化路径正好接住**（抛
-`ContextOverflowError(phase="reactive", origin="finish")`，交互本身 ok、不喂
-熔断，§7.8 矩阵实测吻合）；超窗拒绝**零计费**（usage 全 0）、数秒返回。
-**本端点不存在 400 形态的超窗**——裁决·溢出裁帧保清重试的 400 错误体嗅探在此无触发面，
-`_OVERFLOW_BODY_PATTERNS` **无需增补**（且事后验证：该 200 响应体若真以 400
-出现，现有 pattern `context_window_exceeded` 已能命中）。声明大而错的窗口
-（10M，precheck 放行）时同请求经 `complete()` 全链路抛 reactive，熔断连击
-恒 0——集成断言已钉（test_budget_llm.py）。裁决·反应终局计入熔断的 reactive-400 终局补喂在本
-端点不可达，维持离线钉板（tests/operators/test_annotate.py）。
+这条路径在凭据物化、EventLog/输出打开和 attempt 消耗之前编译同一份 GenerationProgram/ScenarioPlan。
+精确算术：
 
-### 16. 实效窗实测：裸 glm-5.2 = 2^20 = 1,048,576（input+max_tokens 合并判定）；`[1m]` 后缀不存在（裁决·实效窗口声明教义）
+| 对象 | 数量 |
+|---|---:|
+| counterfactual sets | 2 |
+| variants per set | 4 |
+| primary sequences | 8 |
+| primary events | 22 |
+| noise events | 2 |
+| replay sequences | 1 |
+| replay events | 3 |
+| stream rows | 27 |
 
-**实测**（阶梯 + 精确二分，全部 max_output_tokens=16）：估算 131,072（裁决·实效窗口声明教义的锚，
-集成测试常驻）与估算 400,000 两档接受；实际 1,010,670 / 1,033,338 /
-**1,048,554（+16 输出 = 1,048,570）接受**；**1,048,566（+16 = 1,048,582）**、
-1,066,662、1,333,338 拒绝——阈值 = **`input_tokens + max_tokens ≤ 1,048,576`**
-（接受/拒绝夹逼区间宽 12 token，2^20 为区间内唯一整值；input 单独 1,048,566
-< 2^20 仍被拒证明 max_tokens 计入合并判定），与调查·端点终止原因枚举语义一致。模型名 `glm-5.2[1m]` 被拒：HTTP 400
-`{"type":"error","error":{"type":"invalid_request_error","code":"1211",
-"message":"[1211][Unknown Model, please check the model code.][…]"}}`——
-调查·后缀选入百万窗口所记「1M 须 `[1m]` 后缀」在本端点**不成立**（裸名即 1M 窗）。
-**examples/config.toml 的 131072 声明维持不上调**：欠声明恒安全（裁决·实效窗口声明教义），实测
-窗大 8 倍只意味着更宽的富余；上调会改变 w_min/dry-run goldens，收益为零。
-附带测得估算器保守率：该 CJK+ASCII 混排上 `est_text ≈ 1.44×` 实际 GLM
-token（CJK 实测 ≈ 0.667 t/字，裁决·零依赖字符估算器预期方向）。
+每个 set 是 `3 + 2 + 3 + 3 = 11` 个 primary events，两个 set 共 22；再加 2 noise 与 3 replay，
+得到 27。sequence dry-run 不创建或替换 main、stream、success report、manifest 或 failed report。
 
-### 17. 校准首批偏差实测：先验 1882 → 收敛 206/79（裁决·在线校准批冻结快照）
+## 已验证的规模证据
 
-examples/stream UI 工程真跑 `report.budget.image_cost`：**default = 206、
-judge = 79**（先验 = anthropic patch 公式 @2048 最坏正方形 1568 × 1.2 =
-**1882**，首批高估 ≈ 9×——400×800 PIL 合成截图的实际计费远低于最坏先验；
-judge 值更低是 est_text 对文本重 prompt 的保守高估把图片残差压小，属 max
-滤波 + 0.85 折扣设计内）。examples/ui 工程 judge 样本数 < 8（CALIBRATION_MIN_SAMPLES）
-→ `image_cost.judge` 维持先验读数 1882（调查·样本不足不切换的门槛语义正确在报表可见）。
-集成测试以 64×64 PNG 双真调用钉住样本算式 `cost = ceil(max_sample/0.85)`
-与批冻结确定性（test_budget_llm.py::test_image_cost_calibration_converges…）。
+500000 record-unit planner probe 的记录值是 16.889 秒、peak RSS 839221248 bytes。`record_units` 与
+`stream_rows` 都有 500000 固定上限，超过时 compile 失败。
 
-### 18. `validate --probe` 被裁决·输出截断终局化误伤（集成与验收工序发现的真 bug）—— ✅ 已修复（2026-07-23）
+`retained_content_bytes = 536870912` 是另一条独立上限。它按最终 main 与 stream 每行 canonical JSONL 的
+UTF-8 字节计算，包括重复出现在两个视图中的 payload、annotation、generation truth、replay、元数据与换行。
+它不是提前分配 512 MiB，也不能用截断 payload/truth 规避。
 
-**现象**：probe 子客户端把 `max_output_tokens` 钳为 1，anthropic 协议下任何
-健康响应必然 `stop_reason="max_tokens"` → 裁决·输出截断终局化抛 `OutputTruncatedError`
-→ `_probe_one` 的兜底 except 记 `ok=False`——**健康密钥/端点的 probe 全红**
-（集成测试 test_key_pool_llm.py::test_probe_all… 首跑即红）。机制发现·探针同走咽喉的
-「probe 平凡通过」只考虑了 precheck，漏了 finish 终局化。
+## 已验证的真实端点矩阵
 
-**修复**：`_probe_one` 对 llm probe 捕获 `OutputTruncatedError` 记 ok——1 token
-probe 写满输出上限正是活性证明（鉴权通过、模型应答、usage 在场）；spec
-3.9.4 probe 语义不变，属实现勘误，无 spec 修订面。
+### DeepSeek 核心
 
-### 19. classify 集成测试的「截断逼出 SchemaViolation」诡计随裁决·输出截断终局化失效 —— ✅ 已适配（2026-07-23）
+目标命令：
 
-`test_classify_llm.py` 原以 `max_output_tokens=2` 逼真端点产出不可解析 JSON、
-穿确定性修复层至 LLM 修复环耗尽成 SchemaViolation 来钉 `on_error="fallback"`。裁决·输出截断终局化后同一
-响应（`stop_reason="max_tokens"`）不再进修复环——裁决·杂项审计钉板的错误分类分支下，分类器按
-`output_truncated` 记录级 reject 且**绕过 fallback 类**（spec 3.13.4 v1.11 行）。
-测试改钉新处置（failed + kind=output_truncated + fallback 未启用 +
-overflow_records 不误计）；fallback-on-SchemaViolation 路径由离线
-tests/operators/test_classify.py 继续覆盖。行为变化本身是 v1.11 已裁决项
-（裁决·输出截断终局化，不设开关），非偏差。
+```bash
+uv run --python 3.12 pytest tests/integration/test_sequence_generation_llm.py -q \
+  -m 'integration and deepseek'
+```
 
-### 20. 首例真跑 `output_truncated`：quality pointwise 写满 4096（同第 6 条根因家族）
+本轮通过以下断言：
 
-examples/stream UI 工程本轮真跑 failed=1：s1 首帧 episode 的 pointwise
-`noise_residue` 判分调用把 4096 输出上限写满（glm-5.2 长推理漂移），v1.11 按
-`(quality, output_truncated)` 记录级 reject（v1.10 会把截断 JSON 交给修复环
-「硬修」）。run 照常 exit 0、守恒成立——新 rejects reason 首次在示例真跑落地。
-逐次运行未必复现（同第 6 条服务端非确定性）；手册 25/26 章重采时若复现属预期。
+- 一个 catalog slot 真实交付四个声明 variants；
+- scenario ID 共享，world branch ID 各不相同；
+- protected prefix 耦合、patch 重放、state/outcome Schema 与 expected/actual violation 全成立；
+- hidden sentinel 不进入 planner/renderer request 或 payload；
+- report 的 set/sequence/variant planned = delivered；
+- 两个 profile 的 usage calls 与 prompt/completion tokens 都大于零；
+- 真实请求模型为 `deepseek-v4-flash`；
+- request body 精确携带 `{"thinking": {"type": "disabled"}}`，且不含 tools/tool-choice；
+- 两个显式 noise 话题分别到达 renderer 与独立 evaluator，最终四项语义判定均为真；
+- endpoint、parser、semantic correctness 和 stability 分别记录。
 
-### 21. 并发同名输出 stem 的碰撞形态（P3 级锐边，观察一次）
+结果为 5 passed in 119.26s，无 skip。五个用例共用真实 DeepSeek anthropic route 与生产 LLMClient；
+覆盖核心交付、显式双-noise 交付、whole-set 失败注入、EventPlan post-validator 的真实 M8 L3 修复以及
+请求体/secret 泄漏检查。
 
-集成与验收工序期间一次环境性重复启动（同一 `project-synth.toml` 两进程并发）实测出的
-碰撞形态：后启动进程以 `"w"` 打开同名 `.part` **截断了先启动进程已写的同
-inode**，先启动进程 rename 交付的「主输出」实为后进程内容；后进程 finalize
-时 `.part` 已被改名 → `FileNotFoundError` → exit 4。单进程语义下无锁属设计
-内（spec §2.6 无跨运行状态），但「第二进程毁掉第一进程的交付物」值得记录；
-建议（roadmap 级）：`.part` 以 `O_EXCL` 打开，并发同 stem 快速失败。清理重跑
-（单进程）exit 0 正常。
+### instruction-only
 
----
+真实 instruction-only 交付 1 条 sequence、3 个 primary events；frame/actor 落闭集、patch 可重放、semantic evaluation
+通过，truth 不含 declared pattern、variant 或 expected violation。default profile 为 9 calls、9884 input tokens、
+1548 output tokens；judge profile 为 1 call、2839 input tokens、51 output tokens；provider retries 均为 0，
+wall time 15.299 秒，checker PASS。
 
-### 测试留痕（v1.11 集成与验收工序）
+EventPlanRequest 必须显式携带完整 state Schema，让真实 post-validator/L3 能看到合法枚举；declared request 的
+该字段固定为 null，由冻结 program 解析权威 Schema。pre-state/base-state 的 L3 violations 只允许
+`<kind>:<json-pointer>:<validator-keyword>`，不得泄漏 actual/expected value。
 
-| 套件 | 数量 | 备注 |
+该路径的 delivery digest 为 `407b70e68dd0eb6d55c06eb83f1c2ab004e97da9c3a94a6fc573c366862f7d15`。
+
+### real failure injection
+
+测试只能装饰 production collaborator，不能替换网络组件：
+
+- 首个完整通过 generation、全部 evaluator 和下游的 attempt 在 group commit 前固定拒绝；
+- 后续完整 attempt 重跑真实 DeepSeek 并成功；先行自然 rejection 仍保留在报告；
+- 两次都观察到完整四 variant；
+- 被注入拒绝的完整 attempt 不进入正式 output、dedup index 或 dataset counters；
+- failed-attempt schema/usage/retry/trace 累积；
+- dataset/item/annotation/token/rows 回滚；
+- 最终 report 只合并成功 attempt 的 dataset counters。
+
+另一条注入在 EventPlan production state post-validator 边界触发真实 M8 L3，再由最后成功的冻结
+EventExecution 直接进入提交。declared 最后事件先由 M8/StateExecutor 以 outcome Schema 修复：
+hidden baseline 机械选择 positive outcome，交付 branch 选择当前 variant outcome；送入 L3 的错误仍只含
+value-free outcome-schema pointer/keyword。StateEvaluator 随后独立重放复验，不能共享同一份结论冒充独立证据。
+
+上述两条 failure injection 都在同一真实 DeepSeek 集成命令内通过。测试观察到被拒绝与最终成功 attempt 的完整
+variant 集、失败 attempt 隔离、usage/trace 累积、成功计数单次提交，以及 L3 返回的冻结 EventExecution 直接进入提交；
+没有替换 transport、LLM client 或服务端。
+
+### z.ai structured output
+
+目标命令：
+
+```bash
+uv run --python 3.12 pytest tests/integration/test_sequence_generation_structured_output_llm.py -q \
+  -m 'integration and zai'
+```
+
+ScenarioSeed、EventPlan、frame 与 SemanticEvaluation 必须都有非空 `LLMResponse.structured` 并通过完整 Schema。
+真实 anthropic body 必须恰有一个 frozen tool、强制 tool choice、完整 input Schema 与声明的 thinking 形状；
+真实 usage token 必须大于零。
+
+结果为 1 passed in 60.81s，无 skip；ScenarioSeed、EventPlan、frame 与 SemanticEvaluation 均取得非空 structured
+载荷并通过完整 Schema，真实 usage token 大于零。
+
+## 已验证的教学 example 与 replay
+
+完整命令：
+
+```bash
+cd examples/sequence-generation
+set -a
+source ../../.env
+set +a
+uv run labelkit validate --config config.toml --project project.toml --probe --console plain
+uv run labelkit run --config config.toml --project project.toml --console plain
+uv run python check_output.py
+uv run labelkit run --config config.toml --project project-replay.toml --console plain
+uv run python check_output.py --replay
+uv run labelkit run --config config.toml --project project-instruction-only.toml --console plain
+uv run python check_output.py --instruction-only
+uv run labelkit run --config config.toml --project project-frame-only.toml --console plain
+uv run python check_output.py --frame-only
+```
+
+主例 checker 必须从用户可见工件验证 exact counts、variant violations、main/stream 双向对账、hidden sentinel
+不泄漏、replay provenance、report/manifest digest。state、patch 与 ActorView 不写训练工件，所以 patch replay
+证据必须从集成测试的内存 EventTrace 取得，不能由 checker 假装读取不可见字段。
+
+replay 必须从最终 successful SequenceRows 派生，不从预投影 Record 或独立世界对象复制。M2 在单一 stream 文件内
+重算 primary event/owner sequence/replay sequence/replay event ID、ordinal 与 duplicate provenance；payload、
+timestamp、role、owner、world branch、source 或事件数任一篡改都 fail closed。
+
+主例在 2026-08-22 最终代码上交付 2 sets、8 sequences、22 primary events、2 noise events、1 条三事件 replay，
+共 27 行 stream；四个 variant 各 2 条，所有 rejected-attempt 桶为 0。default profile 为 38 calls、34470 input
+tokens、2511 output tokens；judge profile 为 10 calls、9541 input tokens、484 output tokens；provider retries 均为 0，
+wall time 44.989 秒。delivery digest 为
+`269089200ba4cbe62e41229d3921625341f902179f57cf2e0b95722aa23c8a76`，checker PASS。
+
+同一最终 stream 的 replay 扫描 27 行，组装 9 episodes、吸收 25 个 primary frames、剔除 2 条 noise，exact dedup
+命中 1 条 replay tail，最终 emitted 8；default profile 18 calls、1620 input tokens、954 output tokens、retries 0，
+wall time 5.217 秒，checker PASS。两条 noise 分别绑定“夜空中的月相观察”和“手工面包出炉时的香气”；
+回放 checker 仍精确剔除两条，没有放宽验收条件。
+
+frame-only 真实交付 1 条三帧 sequence；main 的 sequence annotation 为 null，三个 member 的 frame annotation 与
+primary stream 逐帧一致并通过完整 Schema。default profile 为 10 calls，judge 为 5 calls，provider retries 均为 0，
+wall time 14.374 秒，checker PASS。
+
+## 已验证的 52-sequence blind review
+
+最终发布工件是第八轮真实 DeepSeek declared 运行：13 个 counterfactual sets、52 条序列、143 个 primary events。
+main SHA-256 为 `d3247306770068be716aabf3c94c133a74a561b0ac87f4e0c5b8be185fdc250f`，stream SHA-256 为
+`2b50be3fe1da94045fb0a372534040a8971a376f618623bfcc6be72655ae11e1`，manifest SHA-256 为
+`87e2dd38df308bc19f25d45ea14c7364be2ab2b489c909f07a733ba64ab48851`，report SHA-256 为
+`e559b564758bb885d82e4b89dd5842049a1af74fa10218134d3ed41aa53dfb57`，独立重算的 delivery digest 为
+`d4582fafe9e975d1da5b6661b529178ad509d7869fd6ecab2d09edf43587b996`。四种 variant 各 13 条，52 个 owner
+与 143 行 stream 双向闭合，正式工件不含 hidden sentinel。16 次 sequence slot attempt 中有 3 次 semantic
+rejection；它们全部留在报告中，最终 13 个 set 精确交付。
+
+selection seed 为 20260822；盲样本只保留 review key、匿名 group key、timestamp、actor、frame class 与 payload，
+不含 variant、expected violation、sequence/scenario id、state、patch 或模型自评。Birch 与 Cedar 各自独立评审
+52 条，均为 52 pass / 0 fail；五个缺陷维度全部为零，也没有跨 scenario 的系统性缺陷。明显不真实比例为 0%，
+没有需要第三人裁决的分歧，因此本门通过。盲样本 SHA-256 为
+`8e2a4915615e372b954f151438d68d04559756f13e071e43ae80c77a49421b5e`，完整 value-free 账本见
+`docs/dev/evidence/v1.18-sequence-realism-review.jsonl`。
+
+该运行 default profile 为 270 calls、259595 input tokens、18736 output tokens；judge profile 为 61 calls、
+91328 input tokens、3141 output tokens；provider retries 均为 0，wall time 338.422 秒。
+
+为避免只记录最终绿色结果，前序现实性迭代保留如下：
+
+| 运行 | 观察 | 处置 |
 |---|---|---|
-| 集成套件（真端点） | 38 passed | 新增 test_budget_llm.py 6 例；test_verify_llm 的语义断言出现过一次第 6 条家族漂移红、复跑两次全绿 |
-| 合入前核对（2026-07-23，对抗评审 6 项修复后） | 离线套件 1417 passed（+18 例）；集成全套件复跑一次 36+2 | 两例第 6 条家族漂移红（test_l25_unsatisfiable_hook…、test_defect_verdict_schema_roundtrip），单测复跑即绿；后者同时暴露测试侧陈旧词表（本地 DEFECT_KIND_VOCAB 缺 v1.9 闭合词表第六枚 `wrong_stitch`，模型合法漂移到该枚即假红）——已补齐，该漂移面消除 |
-| 离线套件 | 1399 passed 不动 | probe 修复与测试登记后复跑确认 |
-| 五条示例命令 | 全部 exit 0 | text 14→15 emitted（generated 12）、text-synth 0→8、ui 6 scanned→4 emitted、stream UI 53 帧→8 emitted、stream-text 13→1 emitted |
-| stream UI 工程（vision 翻转后首次验收） | exit 0 | `segment: w_min=46 window=16 (budget)` 启动行（46 = vision 分支先验算值；文本分支应为 214，见 stream-text 报表 w_min=[8, 214]——两值互证 vision_resolved 生效）、`stream.windows = 5`、`report.budget` 节全键在场（见第 17 条）、守恒全展开式实测 8+0+0+0+1+0+8+45+4 = 53+0+0+13 = 66 ✓、`threads = episodes − stitched = 13 − 4 = 9` ✓、rejects 9 行（8 noise + 1 行，见第 20 条）下 exit 0（strict 语义不变） |
-
----
-
-## 追加条目：v1.12 DeepSeek 端点实测（2026-08-12）
-
-> v1.12「流模式帧级分类与标注」为 `examples/mix` 选型 DeepSeek anthropic 兼容
-> 路由（`https://api.deepseek.com/anthropic`，模型 `deepseek-v4-flash`，密钥
-> `.env` 的 `LABELKIT_DEEPSEEK_KEY`）时的端点行为实测，2026-08-12 两次真实
-> 探针 + mix 工程真跑确认。UI 帧路径不受影响——mix 主工程（UI 模态，2026-08-12
-> 需求方修订后）的视觉必需阶段经 `[llm.vision]` 走 z.ai glm-5.2，另有 z.ai
-> 集成测试（`tests/integration/test_frame_llm.py`）覆盖。
-
-### 22. DeepSeek anthropic 路由响应默认携带 thinking 内容块 —— 📌 已记录（M9 天然兼容，2026-08-12）
-
-**现象**：`https://api.deepseek.com/anthropic` + `deepseek-v4-flash` 的文本调用响应 `content` 数组默认携带 `type=="thinking"` 内容块（当时请求未显式携带关闭字段，默认开启），`type=="text"` 块随后。两次真实探针一致；温度 0 可用、usage 在场。
-
-**当日解析观测**：M9 anthropic 解析器只收集 `type=="text"` 块拼接文本（`llm_client.py` 的响应解析循环，约 :451-456），thinking 块天然跳过，JSON 干净落在 text 块、确定性修复层无感。但该兼容性是**解析器按块类型过滤**这一实现选择的副产品：若未来改为「拼接全部内容块」，thinking 文本会污染确定性修复层解析面——记录在案防回归。
-
-**处置**：`examples/mix/config.toml` 以该端点为默认 profile，文件头注记录本结论；无代码改动面。
-
-**v1.16 更新（见 §38–§40）**：profile 现在可显式设置 `thinking = "disabled"`。解析器继续按块类型跳过
-`thinking`、只收集 `text`，这是兼容已有响应形状的解析措施，不是关闭 thinking，也不是输出预算或截断问题的解决方案。
-
-### 23. 该路由不支持图像内容块 —— ✅ 已适配（examples/mix 双 profile 混合接入，2026-08-12 需求方修订后更新）
-
-**现象**：DeepSeek anthropic 兼容路由的官方字段支持表不含图像内容块（`type=="image"`），实测附图请求被拒。
-
-**后果**：该端点不能单独承载 UI 模态（截图是 UI 链路的主证据：vision 分类/标注/verify 评审/帧级标注均需附图）。
-
-**处置**（2026-08-12 需求方修订「示例必须用 UI 控件树数据或混合数据，不能纯文本」后更新）：`examples/mix` 主工程取 **UI 模态 + 双 profile 混合接入**——视觉必需四阶段（classify/annotate/frame.annotate/verify）经 `[llm.vision]` 走 z.ai glm-5.2，文本判决面（segment 滑窗判决、帧级批量分类、流模式 quality 打分）经 `[llm.default]` 走 DeepSeek，恰为 v1.12 vision 语义分列的教学形态；文本姊妹工程 `project-text.toml` 保留纯 DeepSeek 形态（`meta:ts` 排序 + gap 会话化 + 双粒度标注）。分工写进 `config.toml` 与两份 project 头注（SPEC-frame-annotation §3.8）。
-
-### 24. 该路由对强制 tool_choice 返回 400 —— ✅ 已适配（mix profile 声明 supports_structured_output=false，2026-08-12）
-
-**现象**：M9 anthropic 协议的结构化输出形态（名为 `emit` 的 tool + 强制 `tool_choice`，CONTRACTS §12）在该路由返回 HTTP 400——强制工具调用不受支持。
-
-**后果**：`supports_structured_output=true` 的 profile 声明在该端点不可用；若声明为 true，首个 LLM 调用即 400 快速失败。
-
-**处置**：`examples/mix/config.toml` 的 `[llm.default]`（DeepSeek profile）声明 `supports_structured_output = false`——该 profile 全部调用走**文本 + 确定性修复层解析**路径（结构化输出层缺位由确定性修复层至 LLM 修复环兜底，M8 四层保证语义不变），实测 JSON 干净落在 text 块、mix 主/姊妹两工程全流程 exit 0；`[llm.vision]` 的 z.ai profile 不受影响，照走结构化输出层。配置注释记录该 400 实测依据。
-
----
-
-## 追加条目：v1.13 时间流生成 E2E 实测（2026-08-13）
-
-> spec v1.13「时间流生成」（`SPEC-stream-generation.md`）的验收工序实测记录。E2E 面按需求方
-> 指定走 DeepSeek anthropic 路由（`https://api.deepseek.com/anthropic`，`deepseek-v4-flash`，
-> 密钥 `.env` 的 `LABELKIT_DEEPSEEK_KEY`），示例工程 `examples/synth-stream` 自含单 profile
-> `config.toml`；集成测试另设一例 z.ai glm-5.2 钉住 `prefixItems` 的 L0 透传。
-> 验收真跑：`counts.generated = emitted = 6`、`failed`/`dropped_*` 全 0、工件 29 行、exit 0。
-
-### 25. 无 L0 端点上 `prefixItems` 逐位契约靠提示词文本承载 —— ✅ 已适配（2026-08-13）
-
-**现象**：帧实现调用的内部 Schema 是 `realize_schema`——`{"frames": [...]}` 用 draft 2020-12 的 `prefixItems` 给第 i 帧套上第 i 个帧类的子模式、长度锁死为蓝图抽定的 L。但本特性的 E2E 端点声明 `supports_structured_output = false`（第 24 条：该路由对强制 tool_choice 硬拒 400），**L0 全关**：这份 Schema 根本不会到达供应商，模型看不到任何机器可读的结构约束。
-
-**后果**：逐位契约的服从性完全由**提示词文本**承担——两个新模板（蓝图 / 帧实现）内嵌的结构契约（`{"frames": [...]}` 形状句 + 逐位「第 i 帧（{frame_class}）须符合：{Schema 文本 | 自由文本一段}」）在无 L0 端点上是**硬要求而非兜底**。校验侧不受影响：jsonschema ≥ 4.21 原生支持 `prefixItems`，L2 照常逐位校验、违约照常进 L3 修复环。
-
-**处置与实测**：验收真跑 6/6 帧实现调用全部通过（`realize_calls = 6`、`realize_failures = 0`），用户 Schema 侧 `resolved_at = {l0_or_clean: 7, l1: 0, l3_1: 0, l3_2: 0, rejected: 0}`——一次修复都没花。集成测试 `tests/integration/test_generate_stream_llm.py` 双向钉板：DeepSeek 一侧钉「无 L0 走 L1–L3 路径」的蓝图 + 含结构化帧类的实现，z.ai glm-5.2 一侧钉 `prefixItems` 的 L0 供应商透传（站立假设：该关键字能被结构化输出层原样接受）。**残余锐边**：个别对结构化输出关键字挑剔的路由可能对含 `prefixItems` 的请求直接 400——处置是配置级的（该 profile 声明 `supports_structured_output = false`），**不新增调用级参数**；手册第 14 章 14.7 与第 27 章 27.5 已注明。
-
-### 26. 温度 0.9 下帧实现偶发违约 ⇒ 整序列作废、交叉演示位退化 —— ⏸ 数据侧缓解（同第 6、14 条根因家族）
-
-**现象**：`examples/synth-stream` 取 `generate.temperature = 0.9`（生成侧默认值）。验收前的一次早期真跑里，6 条计划序列有 **2 条在帧实现阶段作废**（`realize_failures = 2`：逐位契约违约或输出被截断），幸存 4 条；由于交叉会话数是派生量 `Σ幸存 − sessions`，`crossed_sessions` 随之**退化为 0**——工程刻意埋的交叉演示位当次不复现。随后的验收真跑则 6/6 全成、`crossed_sessions = 1`。
-
-**后果**：形态本身无缺陷——配额是**尝试配额**（裁决·量目标辖区：无输出条数保证、无补齐回路），作废序列不产 failed 记录、不进交织，守恒恒等式照常成立（`emitted + dropped_* + failed = generated`，generated 数的是**进链**序列数）。但示例的**逐场景演示位依赖足量幸存序列**：交叉、噪音落点、重发抽取都在交织期按幸存集掷签，作废会改变交织输入并使后续抽签整体位移——同 seed 双跑逐字节一致的前提是「蓝图与帧实现的 LLM 输出也一致」（spec §2.6 确定性声明链的 v1.13 句已如此表述）。
-
-**处置**：根因与第 6、14 条同源（服务端非确定性 + 判决/生成对措辞极敏感），工具侧无案。温度是两难旋钮，两端都有代价——低温使同类序列彼此近重、被序列级相似度过滤淘汰（`survived_dedup ≪ produced`），高温使帧实现违约（`produced < planned`）；无 L0 端点上后者的边界更窄（第 25 条）。数据侧缓解 = 保持 0.9 并把类 instruction 写出足够多的可变要素（不同城市/设备/时段），使低温不必要。验收口径写入手册第 27 章 27.9（温度两难表）与 27.10（排障表首行）：**先看 `produced/planned`，再看 `survived_dedup/produced`**；两处均声明逐次运行数字会浮动、守恒恒成立。
-
-### 27. 工件重放的判重档位实测：`near_text` 而非 `exact` —— 已记录（2026-08-13）
-
-**现象**：把验收真跑的时间流工件（`out/synth-labels.stream.jsonl`，29 行）拷成 process 模式输入、配同参 `[stream]`（`order_by = "meta:ts"`、`gap_s = 900`）+ `segment` 重放：**29 帧 → 6 会话（= sessions 5 + 重发尾会话 1）→ 6 episodes、`absorbed = 28`、`dropped_noise = 1`、`dropped_dup = 1`、exit 0**（加 `--strict` 预期退 1）。判重命中如设计预期，但**档位是 `near_text` 不是 `exact`**。
-
-**根因**：重发帧与原序列帧逐字节同源，但原会话里还混着一个噪音帧——重放时 segment 只判掉了两个噪音帧中的一个（`dropped_noise = 1`），另一个被**吸收**进 episode。于是原 episode 比重发 episode 多一个成员，序列判重配方（成员文本按序 `"\x1e"` 拼接）不再逐字节相同，命中落到近似层。噪音帧若被剔干净，两侧成员文本完全一致，档位就是 `exact`。
-
-**后果与处置**：判重命中本身稳定（演示位不会丢），但**档位随分段判决浮动**——文档不得把它写死。`examples/synth-stream/project.toml` 的文件头注与手册第 27 章 27.8 均按实测叙述（「剔除则 `exact`、被吸收则 `near_text`，实测为后者」）；spec §3.8 的验收记录同款措辞。另附一条对账事实：生成侧 `report.generate.stream.sessions = 5` **不含**重发的流尾会话，与重放侧的 6 会话差的就是它——两侧账目一致，不是偏差。
-
-### 28. `resolved_at` 恒等式在 M8 显式待遇参数重构后的回归确认 —— ✅ 已确认（2026-08-13）
-
-**背景**：v1.13 的按序列类标注 Schema 要求 M5 以**显式 schema** 调用 `complete_validated`，而 v1.12 及以前「显式 schema ⇒ 内部待遇」的推断会顺带丢掉两样东西：L2.5 代码回调校验层与 `resolved_at` 记账（该弯折即帧级标注的现状）。裁决·M8 显式待遇参数以 additive keyword `user_treatment: bool | None = None` 正面修掉它（`None` = 现行推断，15 个既有调用点零改动；按类标注调用传 `True`）。本条是该重构在真端点上的账目回归确认。
-
-**实测**：验收真跑 `schema_engine.resolved_at = {"l0_or_clean": 7, "l1": 0, "l3_1": 0, "l3_2": 0, "rejected": 0}`，加总 **7 = 6 条序列的标注调用 + 1 次 verify 修复路径的重标注**（主输出第 4 行的 `verification.rounds = 2` 佐证那一轮修复，其 `annotation.attempts = 1` 说明重标注本身一次到位）——与 §6.4 重述后的恒等式「`resolved_at` 加总 = 进入 M5 的**记录级**标注调用数（user_treatment 族）」逐项吻合。两个序列类各走自己的 `schema_inline`（产出行字段集互不相同）且**都计入**，证明显式 Schema 不再掉出记账；`llm_usage.default.calls = 52` 与 dry-run 估算 49 的差额三次全在估算从不包含的修复上：一轮 verify repair 的重标注 + 复审（第 4 行 `rounds = 2`），外加一次**内部** Schema 的修复环调用——用户 Schema 侧 `l1`/`l3_*` 全 0、`llm_usage.default.retries = 0`，两条同时成立即排除了「用户侧修复」与「重试」两种可能。帧级标注（内部待遇、不计 `resolved_at`）在本工程不可达（帧粒度与时间流形态互斥），该分支由 `examples/mix` 与离线套件继续覆盖。
-
-### 测试留痕（v1.13）
-
-| 套件 | 数量 | 备注 |
-|---|---|---|
-| 离线套件 | 1673 passed | 新增 `tests/common/config/test_loader_generate_stream.py` 与 `tests/operators/test_generate_stream.py`；既有必红项（budget 头常量十→十二、console 参数化七→八 golden、config 默认值、schema_engine stats 语义、`EXPECTED_TEST_PY`）全部同步 |
-
-## 追加条目：2026-08-14 规则整改测试补齐发现
-
-### 29. `validate --probe` 的 rich 表格把 `profile[key]` 字面格当 markup 吞掉 —— ✅ 已修复（2026-08-14）
-
-**现象**：`--probe` 在 rich × TTY 档渲染探测表时，表头 `profile[key]` 实际显示为 `profile`，池化 profile 的小写 `key_env` 标签同样整段消失。**根因**：`rich` 控制台 markup 把小写方括号片段解析为样式标签并从输出中移除（官方文档明言 "Rich will assume that `[bar]` is a tag and remove it from the output"），而 `_print_probe_table` 把表头与数据格作为裸字符串传入。这违反 spec §7.7（U13）「表格与 plain 行式数值逐项一致」——plain 行的标签形是 `profile[key_env]`，表格丢标签即信息丢失。**修复**：字面格一律以 `rich.text.Text` 直传、状态列改显式 `style=` 参数（裁决·探测表字面格以 Text 直传；业界依据：rich markup 官方文档的 `escape()`/`Text` 处置与 Textualize/rich Issue #120 作者建议）。发现途径：本轮测试补齐为 `_print_probe_table` 落零覆盖补用例时暴露。
-
-同批按「过时代码直接删除」纪律清掉三处死代码（HTTP-date 的 Python < 3.10 兼容分支、`_collect` 数值读取器零调用的 `required` 形参、校准器 `freeze_batch` 不可达空桶分支），并把 `tests/out.jsonl` / `tests/out.report.json` 判定为一次临时脚本残留后删除——复跑全量套件确认 `tests/` 目录零文件产出。裁决全文见 spec §1.6「代码规则整改（2026-08-14 对齐）」的测试补齐闭环条目。
-| 集成套件（真端点） | 3 passed | `tests/integration/test_generate_stream_llm.py`：DeepSeek 蓝图/实现（含结构化帧类）+ 按类标注 Schema 两例、z.ai glm-5.2 的 `prefixItems` L0 透传一例 |
-| `examples/synth-stream` 真跑 | exit 0 | `counts.generated = emitted = 6`、`failed`/`dropped_*` 全 0；`generate.stream = {sessions 5, crossed_sessions 1, 两类各 planned 3/produced 3, frames 23, noise_frames 2, duplicates 1, plan_calls 6, realize_calls 6, noise_calls 1, 三项 failures 0}`；`run.artifact.lines = 29`、`llm_usage.default.calls = 52`、`timing.wall_s = 96.97`；`_meta.run.rubric = "default:trajectory"`（S29 扩展生效）；`report.classify` 直方图全零（inherited，预期） |
-| 工件重放（process + segment） | exit 0 | 29 帧 → 6 会话 → 6 episodes、`absorbed 28`、`dropped_noise 1`、`dropped_dup 1`（`near_text`，见第 27 条） |
-| 既有示例 dry-run golden | 七个字节不动 | 新增第八个 `tests/cli/goldens/dryrun-synth-stream.txt`（`generate_calls=13`、`classify_calls=0`、`total=49`） |
-
----
-
-## 追加条目：v1.14 帧类构成档位与时间字段回填 E2E 实测（2026-08-18）
-
-> spec v1.14 两机制（`SPEC-generation-tiers.md`）的验收工序实测记录。E2E 面沿用 v1.13 端点纪律：
-> `examples/synth-stream` 就地扩展后走 DeepSeek anthropic 路由（`https://api.deepseek.com/anthropic`，
-> `deepseek-v4-flash`，密钥 `.env` 的 `LABELKIT_DEEPSEEK_KEY`），集成套件另设一例 z.ai glm-5.2 钉
-> `allOf`/`contains` 的 L0 透传。验收真跑：`counts.generated = emitted = 6`、`failed`/`dropped_*` 全 0、
-> `tiers = {"1": 4/4, "2": 2/2}`、工件 29 行、exit 0。
-
-### 30. 蓝图 `cover_all` 服从性实测：首轮全过，作废集中在帧实现 —— ✅ 已确认（2026-08-18）
-
-**背景**：档位的「构成恰等」由蓝图内部 Schema 双向承担——enum 限档内子集给「⊆」、`allOf` + 逐类 `contains` 给「⊇」。但 E2E 端点声明 `supports_structured_output = false`（第 24 条），**L0 全关**：这份 Schema 根本不会到达供应商，覆盖约束的服从性在首轮完全由**提示词文本**承担（§10.14 的 user 行冻结变体「……且 [帧类表] 中每个帧类都至少出现一次。」），校验侧则由 jsonschema 在 L2 逐条兑现（`contains` 是 draft 2020-12 原生关键字，4.26.0 实测直接可校验）。规格为此把服从率按「首轮通过率 / 修复后通过率」两列记录——L3 修复轮的提示包不带温度、生效温度回落 profile 默认（示例为 0.0），高温首轮违约由低温修复轮收敛是既有机制事实。
-
-**实测**：**全部真跑 `plan_failures = 0`**——`examples/synth-stream` 两次保留运行（`out/` 与 `out-run1/`）各 6 次蓝图调用、12/12 首轮即过，无一进修复环；集成套件的 DeepSeek 档位例同样零蓝图失败。逐行反查亦成立：主输出每行的 `_meta.stream.members[]` 帧类集合与其 `generator.tier_rank` 所声明的档构成**逐条恰等**（第 1 档 `{task_request, followup}` 四条、第 2 档全三类两条），工件行按 `truth.tier_rank` 分组对账同样恰等——构成语义可从数据直接反推，不必信任标签。
-
-**处置与残余**：两列服从率里首轮一列已足够（`temperature = 0.9` 下仍是 12/12），修复列本次无样本。作废依旧**集中在帧实现**（第 26 条同族锐边，kinds `schema_violation` / `output_truncated`）——保留运行 `out-run1/` 即该形态的真实样本：`plan_failures = 0` 而 `realize_failures = 2`，两类各作废一条 ⇒ `tiers = {"1": {planned 4, produced 3}, "2": {planned 2, produced 1}}`、`crossed_sessions` 退化为 0、工件 23 行。这正是**尝试配额语义**的教学样本：`planned` 是计划期配额、`produced` 是最终进链条数，缺口不补齐、守恒恒等式照常成立。M8 侧另有一条配套改动已随本版落地——`_render_error` 的 `contains` 分支点名缺失帧类（`steps: missing required frame_class "<名>"`），使 L0 关端点上万一发生的修复轮有可指导的违规描述，而非裸数组 repr。
-
-### 31. z.ai glm-5.2 接受 `allOf`/`contains` 作强制工具 input_schema —— ✅ 已确认（2026-08-18）
-
-**背景**：`cover_all` 产物随 `supports_structured_output` 上行，沿用 v1.13 裁决·用户生成 Schema 的 L0 待遇——不做关键字白名单 lint。站立假设需要一枚真端点钉板：某些对结构化输出关键字挑剔的路由可能对含 `allOf`/`contains` 的请求直接 400（`prefixItems` 的同款暴露面，第 25 条）。
-
-**实测**：集成测试 `tests/integration/test_generate_stream_llm.py` 新增的 z.ai 一例（`glm-5.2`，anthropic 路由，`supports_structured_output = true`）**HTTP 200 通过**——该路由把整份 Schema 作强制工具的 `input_schema` 原样收下，`allOf` + 逐类 `contains` 未被拒收，蓝图产物在 L2 直接过校验。集成套件本轮 6/6 全绿（DeepSeek 档位与时间字段两例 + z.ai `cover_all` L0 透传一例，加既有三例）。
-
-**处置与残余暴露面**：与第 25 条同款——**拒收形态是首个蓝图调用即 HTTP 400 快速失败**且计入熔断连击（连续 400 以退出码 4 收场，不是逐序列作废），处置是**配置级**的 `supports_structured_output = false`，**不新增调用级参数**。`openai_compatible` 的 strict 网关文档明载不支持 `allOf`/`contains`，处置同款；仓内两个真端点均为 anthropic 路由，故该面无钉板，属**已知未测暴露面**，写入手册第 14 章排障条目。
-
-### 32. 工件重放判重档位的两分支现在都有实测：`exact` 与 `near_text` —— 已记录（2026-08-18，第 27 条续）
-
-**现象**：把本轮验收工件（`out/synth-labels.stream.jsonl`，29 行）拷成 process 模式输入重放（`segment` hybrid + `dedup` + `annotate`，`quality` 关）：**29 帧 → 6 会话 → 6 episodes、`absorbed = 27`、`dropped_noise = 2`、`dropped_dup = 1`、`emitted = 5`、`failed = 0`、exit 0**。判重命中如设计预期，且**档位是 `exact`**——与第 27 条实测的 `near_text` 相反。
-
-**根因与结论**：档位随分段判决浮动，第 27 条已勘明机理（重发帧与源帧逐字节同源，但原会话里混着噪音帧：噪音被**剔除**则两侧成员文本完全一致走 `exact`，被**吸收**则原 episode 多一帧、序列判重配方不再逐字节相同而落近似层）。本次两枚噪音帧**都**被剔除（`dropped_noise = 2`），故走 `exact`。**至此两个分支都有实测样本**：`near_text`（v1.13，2026-08-13）与 `exact`（v1.14，2026-08-18）。文档一律按「取决于噪音帧是否被剔除，两分支皆可能」叙述，**不得把任一档位写死**——手册第 27 章与示例头注均已按此措辞。
-
-**同批对账事实两条**：① 生成侧全部成员 id 可从工件行**逐字节推导**（M2 的 `sha256(canonical_json(raw))[:16]` 作用于同一份行对象），4/5 幸存 episode 的 id 与生成侧序列 id **恰等**——差的那一条是交叉会话被分段判决合并/切分的浮动，属既有语义（分段是 LLM 判决，不承诺与生成侧的会话切分逐条同构）；② 时间字段回填不扰动上述任何一条——回填先于行对象与 id 计算，判重配方吃成员文本不吃 id，重发帧与源帧的文本字节同源不变。
-
-### 33. v1.13 集成首例在真端点约 8 跑中偶发红一次 —— ⏸ 不改测试（同第 6、26 条根因家族）
-
-**现象**：`tests/integration/test_generate_stream_llm.py` 的 v1.13 第一例（单序列 + 零作废断言）在本轮验收前后的约 8 次真端点执行中**偶发红一次**——帧实现调用 `schema_violation`，重跑即过。
-
-**根因**：与第 26 条同源——服务端非确定性 + 生成对措辞极敏感，`temperature = 0.9` 下帧实现偶发违约；该用例把「零作废」写进断言，一旦命中即红。
-
-**处置（不改测试）与理由**：① 该断言正是这条锐边的**探针**——放宽为「允许作废」会让真正的回归（例如缩减 Schema 派生出错导致的系统性违约）无声通过，探针价值高于偶发红的成本；② 作废语义本身无缺陷：配额是**尝试配额**，作废序列不产 failed 记录、不进交织、守恒恒等式照常成立（第 26 条已确立）；③ 温度是两难旋钮，两端都有代价（低温 ⇒ 同类序列近重被相似度过滤淘汰，高温 ⇒ 帧实现违约），工具侧无案；④ 集成套件本就是**手动执行**的真端点面（离线套件从不触网），偶发红重跑即可，不进 CI 门禁。记录于此以免后来者把它当作新缺陷重新调查。
-
-### 34. v1.15 计数器键按类重冻结把 v1.14 集成第四例留成陈旧断言 —— ✅ 已适配（2026-08-19）
-
-**现象**：v1.15 生产代码与离线套件全绿（2005 passed）之后首次执行集成套件，v1.14 的档位例（`test_generate_stream_tiers_real_deepseek_composition_and_counters`）红在第一条断言：`ctx.metrics.counters.get("generate.stream.tiers.1.planned")` 取回 `None`，实际落账的键是 `generate.stream.tiers.ticket_booking.1.planned`。
-
-**根因**：裁决·计数器键按类重冻结把 M6 的喂数键从 `generate.stream.tiers.<rank>.*` 改成恒带类段的 `generate.stream.tiers.<class>.<rank>.*`（平面形报表改由编排器跨类求和装配）。离线套件里读这族键的用例随 Wave 1a 一并改了，**集成套件不在离线跑范围内**（`-m 'not integration'`），于是这条陈旧断言活到了 Wave 2。
-
-**处置**：按新键形修正该例的三处断言（单序列类 ⇒ 类段恒为 `ticket_booking`），并在其 docstring 里点明「M6 恒喂类段键、平面形由编排器跨类求和、嵌套形由新增的第七例钉住」。**不是产品缺陷**——报表的平面形数值与 v1.14 逐字节相等这一点由 `test_generate_stream_report_tiers_flat_form_sums_across_classes` 等离线用例钉住，本条只是测试面的滞后。教训归档：**改动被计数器键族时，集成套件与离线套件要一起搜**（`rg 'generate\.stream\.tiers'` 覆盖 `tests/` 全域，而不只是 `-m 'not integration'` 跑得到的那部分）。
-
-### 35. v1.15 验收当日 DeepSeek 端帧实现违约率抬头：6 跑中 5 跑各作废 1 条 —— ⏸ 数据侧缓解（第 26、33 条根因家族）
-
-**现象**：`examples/synth-stream` 验收当日连跑 6 次，其中 5 次各有 1 条序列在帧实现阶段作废（`realize_failures = 1`，`plan_failures` 恒 0），第 6 次干净（6/6）。作废落点不固定：`ticket_booking` 序数 2 两次、`smart_home` 序数 1 两次、`smart_home` 序数 2 一次。开 `trace`（channels `schema` + `llm`、content `full`）取到违约形态是 `schema.repair {"resolved_at": "rejected", "violations": ["/frames/0: type"]}`——该位契约要结构化帧对象，模型给了一句纯文本；修复环耗尽 ⇒ 整条作废。
-
-**根因与非根因**：根因与第 26 条同源（无 L0 端点 + `temperature = 0.9` + 逐位类型契约）。**明确排除按类档位表**：① 作废在两个序列类、三个不同序数上都出现过，不是「购票类二档那张按类表」的专属；② 违约位是 `/frames/0`（首帧类型），与档位构成无关——`plan_failures` 恒 0 说明蓝图侧的 `enum` + `contains` 覆盖约束全程无违约（第 30 条结论继续成立）；③ 干净那一跑的逐行构成对账 6/6 全通过（构成恰等，按类表与全局表各自生效）。当日违约率高于 v1.14 验收日，属服务端非确定性的日间波动，工具侧无案。
-
-**处置**：验收取干净那一跑作为手册主样本，把带 1 条作废的一跑保留为 `out-run1/`——它恰好是 `produced < planned` 在**类嵌套** `tiers` 下的真实读法样本（`ticket_booking` 的 `"2": {"planned": 2, "produced": 1}` 一眼定位到「确认直达」那一档）。手册第 27 章 27.5/27.9/27.10 均已声明「逐次运行掉 0～1 条是常态」，不把 6/6 写成保证。
-
-**同日集成侧的同族观测**：验收末轮全套复跑时，v1.15 按类档位例与 v1.13 基础例各遇一次**两条计划序列同时作废**（同样是 `call=realize kind=schema_violation violations=1`），触发两例共用的「至少一条幸存」哨兵断言（第 26 条先例，配额取 2 即为此容忍设计）；原样复跑五个 DeepSeek 例即全绿。这说明当日波动的幅度足以偶发吃掉两条，**容忍设计的下限是「不为 0」而非「必有幸存」**——集成例遇红先原样复跑一次再判，别当代码回归。
-
-### 36. z.ai 账号周/月额度耗尽 ⇒ 两例 L0 透传钉板暂时无法执行 —— ✅ 已闭合（环境记录，2026-08-20 复跑双绿）
-
-**现象**：v1.15 集成套件执行时，两个 z.ai 例（`test_realize_schema_prefixitems_passthrough_zai_structured_output`、`test_plan_schema_cover_all_passthrough_zai_structured_output`）稳定红在 `ProviderRetryableError: retries exhausted (2): HTTP 429 … [1310][Weekly/Monthly Limit Exhausted. Your limit will reset at 2026-08-20 15:44:45]`。间隔重试两次，形态一致。
-
-**根因与处置**：**账号侧额度耗尽，不是代码问题**——两例是 v1.13/v1.14 的站立假设钉板（`prefixItems` 与 `allOf`/`contains` 随 L0 原样透传给供应商强制工具，第 31 条），v1.15 **零触碰**它们（既不改两个 Schema 构造器，也不改 L0 上行路径），SPEC-per-class-tiers §3.6 亦明记「z.ai `cover_all` L0 透传例保绿回归、无需新增」。工具侧的表现完全符合设计：429 走全抖动退避重试 → 预算耗尽 → `ProviderRetryableError`（`retry_after` 缺省时不做无界 park）。五个 DeepSeek 例（含 v1.15 新增的按类档位例）全绿，v1.15 的行为面因此有完整真端点覆盖。待额度重置后复跑这两例即可闭合。
-
-**闭合（2026-08-20）**：额度按期重置（15:44:45）后当日复跑两例，`2 passed in 17.40s`——`prefixItems` 与 `allOf`/`contains` 的 L0 原样透传钉板恢复在位，v1.15 集成面补齐为 **7/7**。与预判一致：纯账号额度问题，零代码改动、零重试外动作。
-
-### 测试留痕（v1.15）
-
-| 套件 | 数量 | 备注 |
-|---|---|---|
-| 离线套件 | 2007 passed | v1.14 基线 1980；开发期新增 25 例分布在 `test_loader_generate_stream.py`（rule 61 三子款正反例、白名单第七键、逐表身份连续性与跨类同构成、配额对吃生效表、并集化校验域、零额类结构校验不豁免、定位串带类名）、`test_generate_stream.py`（混合形态映射、`--limit` 逐类分块、蓝图取生效表档内子集、按类配分零 rng 钉板、同 seed 双跑字节一致、全缺省与 v1.14 等价）、`test_orchestrator.py`（平面形跨类求和、嵌套形双层键序、零配额类 0/0、混合触发谓词）、`test_config.py`（`ClassView.tiers` 默认 None、`effective_tiers` 三态）；检视闭环再 +2 例（rule 61 ②/③ 互斥只报空表错、形状错按未声明落库不叠报——同落 `test_loader_generate_stream.py`） |
-| 集成套件（真端点） | 7 passed | DeepSeek 五例全绿——v1.13 两例 + v1.14 两例 + **v1.15 新增按类档位一例**（混合形态：`ticket_booking` 自带单档表 `{task_request, confirmation}`、`smart_home` 回落全局两档表；断言逐行构成恰等吃**本行类**生效表、类段计数器落账、经生产装配器取到的嵌套 `tiers` 逐键对账含零额档 `0/0`、`generator.tier_rank` 与工件 `truth.tier_rank` 逐行一致）。v1.14 第四例的陈旧键断言按第 34 条修正；末轮复跑时两个 DeepSeek 例各遇一次全作废哨兵红、原样复跑即全绿（第 35 条同日观测）。两个 z.ai L0 透传例 2026-08-19 因账号额度耗尽被阻（第 36 条，非代码问题），2026-08-20 额度重置后复跑双绿闭合（`2 passed in 17.40s`）⇒ 集成面 **7/7** |
-| `examples/synth-stream` 真跑 | exit 0 | `counts.generated = emitted = 6`、`failed`/`dropped_*` 全 0；`generate.stream = {sessions 5, crossed_sessions 1, 两类各 planned 3/produced 3, tiers 类嵌套形 {ticket_booking: {"1": 1/1, "2": 2/2}, smart_home: {"1": 2/2, "2": 1/1}}, frames 23, noise_frames 2, duplicates 1, plan_calls 6, realize_calls 6, noise_calls 1, 三项 failures 0}`；`run.artifact.lines = 29`、`llm_usage.default.calls = 50`、`timing.wall_s = 70.311`；**逐行反推对账通过**——6 条序列的 `members[]` 帧类集合恰等于**本行序列类生效表**该 rank 的构成（购票二档两条均为 `{task_request, confirmation}`、智能家居二档一条为全三类，同 rank 两种构成），工件 29 行 `truth.tier_rank` 与 `generator.tier_rank` 逐行一致 |
-| 保留运行 `out-run1/` | exit 0 | `produced < planned` 在类嵌套 `tiers` 下的真实样本：1 条序列在帧实现作废（第 35 条）⇒ `ticket_booking {"1": 1/1, "2": 2/1}`、`smart_home {"1": 2/2, "2": 1/1}`、`crossed_sessions 0`、工件 25 行 |
-| 工件重放（process + segment） | exit 0 | 29 帧 → 6 会话 → 6 episodes、`absorbed 27`、`dropped_noise 2`、`dropped_dup 1`（本跑落 `exact`；**档位随分段判决浮动，两分支皆可能**，第 27、32 条）、`emitted 5`、`failed 0`、11 次调用 / 37.7 秒；23 个成员 id 与生成侧**逐个相同**，4/5 幸存 episode 的 id 与生成侧序列 id 恰等（对不上的那条是交叉会话整会话成段，其 id 恰等于生成侧的 `session_id`） |
-| dry-run golden | 八个**字节不动** | 按类档位零调用数变化 ⇒ `estimate_run` 零改动；示例扩展后 `dryrun-synth-stream.txt` 经 `cmp` 逐字节相等（`generate_calls=13`、`classify_calls=0`、`total=49`） |
-
-## 追加条目：v1.16 规则规划与 DeepSeek 诊断（2026-08-20）
-
-### 37. 最小规则集的真实 DeepSeek 集成单例通过 —— ✅ 已确认
-
-为隔离规则规划器、类型敏感关联和半开时间约束，先运行单个真实 DeepSeek 用例，不依赖
-完整示例的五类帧和下游质量/标注调用。用例声明固定两帧 request → acknowledgement，
-`time_s = [1200, 2400)`、工作日窗口和 `subject_id` typed equal，并核对 planner 计数、
-artifact 和验证结果。
-
-实测结果：`tests/integration/test_generate_stream_llm.py` 该单例 **`1 passed in 5.82s`**。
-这是 v1.16 规则路径的最小 live pass；它不等价于完整 `examples/synth-stream` 验收。
-
-### 38. 完整示例首跑未关闭 thinking 且输出预算为 4096 —— ⛔ failed-closed 诊断
-
-第一次运行完整 `examples/synth-stream` 时，请求没有显式关闭 thinking，示例 profile 的
-`max_output_tokens` 仍为 4096。进程退出码为 0，但六条 attempt 全部作废：四条在 brief
-阶段因 `output_truncated` 作废，两条在 realize 阶段因 `schema_violation` 作废。
-
-报告与用量证据为：`generated = 0`、`emitted = 0`、artifact 行数为 0；`plan_calls = 6`、
-`realize_calls = 2`、`noise_calls = 1`，物理 LLM 请求 13 次；input tokens 6095、output
-tokens 24617，`wall_s = 92.817`。这次运行只证明失败闭环和计数语义，不能作为功能验收。
-
-处置是修改示例 profile 为显式 `thinking = "disabled"`，并把结构结果预算调到 8192。
-增加预算本身不是关闭 thinking 的替代方案；后续运行必须同时保留两个设置。
-
-### 39. 显式关闭 thinking 后自由文本帧仍被输出成 object —— ⛔ failed-closed 诊断
-
-第二次完整示例运行已经显式携带 `thinking = "disabled"`，并使用 `max_output_tokens =
-8192`。输出截断不再是主故障，但六条 realize 全部因为自由文本帧被模型输出成 object 而
-作废。trace `limit = 1` 显示 Schema repair 已执行两轮，仍未把类型修正为字符串；最终
-仍是 0 条主输出、0 条 artifact。
-
-这次结果把问题边界收窄为 DeepSeek L0-off 路径上的逐位自由文本类型服从性，而不是
-thinking 预算耗尽。它仍是 failed-closed 诊断，不是「关闭 thinking 后全量 E2E 已通过」的
-证据。需要在不改变规则契约、不增加 fallback 或 deferred 实现的前提下完成后续修复与
-重新验证。
-
-### 测试留痕（v1.16 当前阶段）
-
-| 套件 | 结果 | 结论 |
-|---|---|---|
-| v1.16 最小真实 DeepSeek 集成单例 | `1 passed in 5.82s` | 规则 planner、typed correlation、半开 time_s 的最小 live pass |
-| `examples/synth-stream` 首跑 | exit 0，但 0 输出 | failed-closed：thinking 未显式关闭，4096 造成 4 次 truncation + 2 次 realize schema violation |
-| `examples/synth-stream` 显式 disabled + 8192 | exit 0，但 0 输出 | failed-closed：6 次 realize 自由文本位输出 object，repair 两轮仍未修复 |
-
-当前不能从这三项证据推出完整示例成功，也不能把进程 exit 0 当作业务产物验收通过。
-
-### 40. v1.16 synth-stream 规则生成最终真实验收通过 —— ✅ 已确认（2026-08-20）
-
-在显式 `thinking = "disabled"`、`max_output_tokens = 8192` 的当前配置下重新运行完整
-示例，进程 exit 0。主链报告为 `counts.generated = 6`、`emitted = 5`、
-`dropped_verify = 1`、`failed = 0`；计划配额为 6，其中
-`ticket_booking = {planned: 3, produced: 3}`、`smart_home = {planned: 3, produced: 3}`。
-
-按类档位报告为：`ticket_booking` 的 rank 1 为 `1/1`、rank 2 为 `2/2`；
-`smart_home` 的 rank 1 为 `2/2`、rank 2 为 `1/1`。时间流统计为
-`sessions = 5`、`crossed_sessions = 1`、`frames = 27`、`noise_frames = 3`、
-`duplicates = 1`、`calendar_days_spanned = 8`。
-
-规划与内容计数为：`plan_calls = 6`、`realize_calls = 6`、`noise_calls = 1`；
-规则计数为 `rules.sampled = 6`、`correlation_scrapped = 0`、
-`temporal_scrapped = 0`、`sequence_validator_scrapped = 0`。工件为 34 行，
-`sha256:927e469e16df3f007f057357a267b8f8228506a5dfb279dc83bdfa1f1da672bf`。
-
-LLM 用量为 `calls = 53`、`prompt_tokens = 12173`、`completion_tokens = 4487`、
-`retries = 0`，`timing.wall_s = 35.214`。这次结果保留了 planner 规划的真实 crossing，
-不是此前作废投影后 `crossed_sessions = 0` 的历史运行。
-
-### 41. v1.16 正式 process replay 最终真实验收通过 —— ✅ 已确认（2026-08-20）
-
-使用正式 `project-replay.toml` 重放上述 34 行工件，进程 exit 0。输入侧
-`scanned = ingested = 34`，分段结果为 `episodes = 6`、`absorbed = 31`、
-`dropped_noise = 3`；流尾 duplicate 命中为 `dropped_dup = 1`，主链为
-`emitted = 5`、`failed = 0`。
-
-重放观测为 `sessions = 6`、`mean_episode_len = 5.17`、`windows = 7`。LLM 用量为
-`calls = 12`、`prompt_tokens = 4542`、`completion_tokens = 721`、`retries = 0`，
-`timing.wall_s = 5.475`。这次结果验证了正式 process 配置可以消费最终生成工件，并在
-流尾重发 session 上命中 episode-level dedup。
-
-### 测试留痕（v1.16 最终验收）
-
-| 套件 | 数量 | 备注 |
-|---|---|---|
-| 离线套件 | 2128 passed，49 deselected | 最终离线门；规则规划、时间窗口、按类档位、生成与 replay 相关用例均在本轮通过 |
-| 集成套件（真端点） | 8 passed | 最终 DeepSeek 规则生成、既有时间流/档位/按类档位和 z.ai 结构化输出钉板均通过 |
-| `examples/synth-stream` 最终真跑 | exit 0 | 生成 6、emitted 5、`dropped_verify = 1`、failed 0；sessions 5、crossed_sessions 1、frames 27、noise 3、duplicates 1；工件 34 行，SHA-256 为 `927e469e16df3f007f057357a267b8f8228506a5dfb279dc83bdfa1f1da672bf` |
-| 工件重放（process + segment） | exit 0 | 34 帧 → 6 会话、6 episodes、`absorbed = 31`、`dropped_noise = 3`、`dropped_dup = 1`、`emitted = 5`、`failed = 0`；`mean_episode_len = 5.17`、`windows = 7`、12 次调用 / 5.475 秒 |
-| dry-run golden | 八个**字节不动** | 规则面不改变既有 golden 字节；live 用量以本次 report 为准 |
-
-## 追加条目：外部数据工程实跑反馈分诊（2026-08-21）
-
-> 来源：`Dataset-Person` 白领一日 / 半日合一工程（五份意图序列工程合并 → 真实 DeepSeek 生成 →
-> 同日转换导出）的实跑记录，共 29 条反馈。逐条对照本仓库 HEAD（v1.17 已提交；本段历史反馈记录已由 v1.17 场景规划与精确交付 supersede）核实后
-> 按「谁能解决」分档，**其中 18 条的解法在 LabelKit 内**，即下列第 42–60 条（第 42、43 条同源但
-> 可分别处置，第 44 条是第 42 条的连带诊断项，故 18 条反馈落成 19 个条目）。
->
-> 另 11 条不进本清单，理由如下：**2 条属提示词与钩子用法**——负样本理由补写输入中不存在的固定
-> 时长（一条娱乐负样本称「每个应用使用时长固定为 8 分钟」，而原始帧本身已有其他时长）、槽位值缺少
-> 可回指的成员帧证据（剪贴板只有优惠券和地址，标注器把优惠券文字写进 `actionInfo.items`）；两者
-> 的工具侧机制均已在位（`generate.sample_validator`、`generate.sequence_validator`、
-> `output.validator` 的 L2.5、verify 缺陷表），本轮只是没把这些语义写进提示词与钩子。**9 条属分支
-> 错配与自研脚本**——`time_profiles` / `ts_ms` / `end_ts_ms` 只存在于 v1.14 之后分家的另一条线
-> （`Downloads/LabelKit`，remote `HoldThatThgt/LabelKit`），本仓库用 `[[generate.stream.windows]]`
-> 与四词时间词表解决同一需求；`split.py` / `build_all_day_stream.py` / `export_stream_views.py`
-> 从不属于 LabelKit 交付面；`fit` 时长压缩、位置式窗口绑定、快照被建成 App 区间、导出访问器耦合
-> 精确类名均在自研转换器内；打卡 tier 漏列 POI 与公共时段帧属配置遗漏（档位构成本就是精确等值
-> 声明）；「固定 search strategy 未落地」一条**读错规格**——`SPEC-sequence-rules.md` 第 290 行写的
-> 就是「solver 固定 `num_search_workers = 1`，使用 CP-SAT 自动搜索」，`_configure_solver` 与之一致，
-> 该反馈已过时（其真正想指出的「无法保证选最早可行日期」是下列第 45 条）。
->
-> 下列条目**全部未修复，本轮零代码改动**；只记录现象、核实到的代码事实与修法方向。凡涉及新增
-> 配置面、改动报告键集或触碰 §1.6 既有裁决的，按仓库纪律须先改规格再动代码。
-
-### 42. 联合 planner 模型规模随序列数三次增长，12 条序列即触顶 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：167 条序列 / 180 个任务帧 / 167 个会话的工程执行纯本地 `validate`，约 51 秒后返回
-`sequence planner model exceeds the 250000 proto entry limit`。符合数据比例的显式负样本工程
-因此完全无法通过校验；半日工程（9 条序列）通过。
-
-**核实到的事实**：本机直接构造 `PlannerQuestion` 并读 `_proto_entries`（`len = 4`、
-`gap_s = 3600`、`session_max_len = 8`、无规则无窗口、`attempts == sessions`）：
-
-| 序列数 = 会话数 | 任务帧 | 现状 proto 条目 | 零交叉短路后 |
-|---:|---:|---:|---:|
-| 8 | 32 | 57,747 | 18,995 |
-| 9 | 36 | 82,605 | — |
-| 12 | 48 | 197,763 | — |
-| 13 | 52 | **252,047**（超限） | — |
-| 16 | 64 | 472,547 | 140,387 |
-| 24 | 96 | 1,608,435 | 462,483 |
-| 32 | 128 | 3,829,443 | 1,083,587 |
-| 48 | 192 | 12,982,947 | 3,616,035 |
-
-拐点硬落在 12 → 13 条之间——当前实现在「一序列一会话」形态下最多只能规划 **12 条序列**。
-规模主项是 `_new_session_vars`：`_session_members` 为**每个 session** 铺开**全部**
-`(attempt, position)` 三元组（`Σ帧数` 个），随后 `itertools.combinations(current, 2)` 施加
-session 内跨度约束、`for left in current: for right in previous` 施加跨 session 顺序约束——
-两处都是 O(sessions × 帧²)，合计 O(n³)。第 43 条是其中最大且可整段消除的一块。
-
-**v1.17 裁决**：改用 owner slot permutation：每个 session 恒有一个 primary slot，只有实际声明的
-`crossed_sessions` 才建立 secondary slot；owner 与 slot 用 `AddInverse` 排列，session 起止用
-`AddElement` 选择。不能把整条 attempt 放进 `AddNoOverlap`——那会禁止合法 crossed session 的
-帧级交错。最终方案与规模门见 `SPEC-scenario-planning.md` §7、§13。
-
-### 43. 零交叉需求下仍构造全部交叉组合，占模型 67%–72% —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：第 42 条规模的最大可压缩项，且是纯白建。
-
-**核实到的事实**：`_add_crossing_constraints` 对**每个 session × 每对 attempt**
-（`itertools.combinations(range(len(attempts)), 2)`）建 `pair_{s}_{l}_{r}` 布尔变量，再由
-`_alternation_patterns` 为每对建 `2 × L_left × L_right` 量级的 A-B-A / B-A-B 三点模式变量。
-但同一模型里 `_new_session_vars` 已钉住 `sum(doubles) == len(attempts) - sessions`：
-`len(attempts) == sessions` 时每个 session 恰含一个 owner，`pair` 恒不可满足，所有模式变量
-都不可能被用到。实测占比稳定在 67%–72%（第 42 条表格右列为 monkeypatch 掉该段后的对照）。
-
-**v1.17 裁决**：`crossed_sessions = 0` 时 crossing builder 不调用，约束族规模必须为零；有交叉时
-只对 secondary slot 实际映射到的 owner pair 建 A-B-A / B-A-B witness。不能按
-`_hint_session_assignments` 剪枝——hint 不是约束，日历窗口可以合法地反转 owner 顺序。
-
-### 44. 容量拒绝被渲染成 INFEASIBLE，且不报实际规模 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：上述超限的用户可见输出是两行——日志
-`sequence planner model exceeds the 250000 proto entry limit`，加 M1 聚合错误
-`[generate.stream]: sequence planner found no feasible full prefix (status = INFEASIBLE)`。
-用户读到的是「配置无解」，实际是「模型过大」，处置方向相反（前者会去放宽约束，后者该去减规模）。
-
-**核实到的事实**：`solve_question` 与 `select_feasible_plan` 超限都抛 `PlannerConfigError`；
-M1 的 `_check_full_potential` 只用 `_planner_error_is_unknown()` 把 UNKNOWN 分流出去，其余
-一律落 INFEASIBLE 分支。错误文本既不含实际条目数与上限，也不说明交叉组合 / 日历窗口析取 /
-帧类独热各占多少规模。
-
-**v1.17 裁决**：拆出 `PlannerCapacityError`、`PlannerInfeasibleError` 与 `PlannerBudgetError`。
-capacity 消息带 actual、limit、dominant family 与逐族 variables/constraints；只有真实硬约束无解才
-使用 INFEASIBLE，并通过 assumptions 返回足以导致无解的具名约束集合。
-
-### 45. 生成路径没有布局目标：9 条序列铺到 29 个自然日 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：半日工程（下午至晚间九条序列、`of_week = ["mon"]`）静态校验与真实生成都成功，但原始
-流从 `2026-01-05T14:30:00+08:00` 跨到 `2026-02-02T20:00:50+08:00`，报告
-`calendar_days_spanned = 29`，涉及五个周一。配置里的「半日」窗口不能直接得到半日工件，必须额外
-重排时间。
-
-**核实到的事实**：三处叠加。① `_minimize_timeline_end` 只在 `ctx.noise_presence` 为空时挂上，
-有噪音就让位给 `Maximize(sum(noise_presence))`。② 真正的规划入口 `select_feasible_plan` 在
-`_new_context` 之后立刻 `ctx.model.ClearObjective()`，换成
-`Minimize(sum(costs) * (len(noise) + 1) - noise)`——**timeline-end 目标在生成路径上从不生效**。
-③ `_horizon` 每个 session 加一个 `_WEEK_US`，`_add_session_boundaries` 允许
-`start <= 前一 session 结束 + gap + _WEEK_US - 1`。于是「铺散」是模型允许、且在目标函数上零代价
-的解，求解器没有任何理由选最早那一天。
-
-**v1.17 裁决**：`[generate.stream.schedule].start/end` 成为有限硬边界；目标分 preference deviation、
-calendar days spanned、timeline end 三层独立求 OPTIMAL，逐层冻结，不用大权重折叠。dry-run estimate
-与 live report 都回显日期范围、objective 与 plan digest。
-
-### 46. 可行性入口与规划入口优化的不是同一目标 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：对同一问题直接调用可行性求解入口可得到 2026-01-05 单日布局，而生成路径把布局分散到
-多周。用户无法根据校验成功推断实际输出的日期跨度。
-
-**核实到的事实**：`check_question` → `solve_question` 走 `_new_context`，无噪音时带
-`Minimize(timeline_end)`；`select_feasible_plan` 把该目标清掉。M1 的 `_check_local_potential`
-（逐类、逐档、逐长度的局部潜在可行矩阵）用前者，`_check_full_potential` 与 M6 `plan_stream`
-用后者——**M1 与 M6 彼此一致**（这点与原始记录的推测不同），但局部可行性矩阵与全局规划各自
-优化一件事，第 45 条的现象正由此被放大成「校验说可以、结果却不是那样」。
-
-**v1.17 裁决**：M1 只调用一次 `compile_scenario` 并把冻结 `ScenarioPlan` 放入 ResolvedConfig；
-validate、dry-run、estimate 与 M6 只读同一对象。删除生产路径的局部候选矩阵和 M6 二次规划入口。
-
-### 47. 钩子模块不按 project TOML 目录解析 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：`sequence_validator = "half_day_hooks:validate_sequence"`，钩子文件与 project TOML
-同目录，`labelkit validate` 仍报
-`[generate].sequence_validator: cannot import module 'half_day_hooks': No module named 'half_day_hooks'`。
-显式 `PYTHONPATH=<project 目录>` 后通过。工程无法仅凭 TOML 与同目录钩子运行。
-
-**核实到的事实**：`resolve_hook` 直接 `import_module`，不介入 `sys.path`。实测在
-`examples/synth-stream` 下执行 `uv run python -c "…"`，`sys.path` 为
-`[stdlib…, .venv/lib/python3.12/site-packages, /Users/atishoo/Project/LabelKit]`——**cwd 不在
-其中**。示例的 `examples.synth-stream.hooks:validate_sequence` 能解析，靠的是 editable 安装把
-仓库根放进了 path；也就是说**示例的可运行性依赖开发态安装形式**，用户把 project TOML 放到仓库
-外时必然失败。
-
-**v1.17 裁决**：四个 hook 统一改成 `path.py:function`，相对 project root；使用
-`importlib.util.spec_from_file_location` 与绝对路径 hash module name，不修改 `sys.path`。M1 解析一次
-并冻结 callable；新增的第四个 hook 是跨序列 `generate.scenario_validator`。
-
-### 48. `session_max_len` 的 2× 下界忽略实际装箱计划 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：即使 `sessions` 等于序列数、不需要双序列会话，仍报
-`[stream].session_max_len: the time-stream form requires >= 2 * max(len_range upper bound) …,
-got 3 < 6`。单序列会话配置也必须人为放大容量。
-
-**核实到的事实**：`_stream_form_weaving` 无条件检查 `2 * values.len_max >
-values.stream.session_max_len`，理由就写在错误串里（"a crossed session always packs two
-sequences"）。但 planner 侧 `_new_session_vars` 钉的是
-`sum(doubles) == len(attempts) - sessions`——`Σsequences == sessions` 时 doubles 恒 0，永不存在
-双序列会话；模型里真正的容量约束是 `task_count + noise_count <= session_max_len`。
-
-**v1.17 裁决**：删除用户 `sessions`，只声明 `crossed_sessions`；session 数由成功交付 slot 推导。
-静态检查只报告数学必要的单 owner / 最小可交叉 owner 容量，完整容量与 exact noise reserve 由实际
-slot 长度域在同一个 planner 中验证，不再使用无条件 `2 × len_max`。
-
-### 49. 派生约束逐层暴露，同一组关系要跑多轮才看全 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：`session_max_len = 3` 时只报 2× 下界；改成 6 后**下一轮**才报
-`[stream].session_max_span_s: worst-case session span (session_max_len - 1) * frame_gap_s
-upper bound = 300 s > 120 s`。用户须反复运行才能拿到同一组派生约束。
-
-**核实到的事实**：`_stream_form_weaving` 的跨度检查用**用户写的** `session_max_len` 计算
-`worst`，而不是用同一函数上面几行刚算出的派生下界 `2 * len_max`。M1「一次报全部错误」的纪律
-在这组派生量上失效——不是聚合器的问题，是被检查量取错了基准。
-
-**v1.17 裁决**：新增纯函数 `derive_stream_bounds`，一次返回 target/crossing/session、长度、容量、
-noise、frame gap、session gap、span、schedule bucket 与 duration/resource 的全部派生错误，不因前一条
-错误短路。
-
-### 50. 无 `--probe` 的 `validate` 仍要求密钥值存在 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：不带 `--probe` 执行 `labelkit validate` 仍因
-`[llm.default].api_key_env: environment variable "LABELKIT_DEEPSEEK_KEY" is not set or empty`
-退出；无密钥环境无法执行纯配置、JSON Schema 与约束校验（CI 静态门因此不可用）。该工程的规避
-方式是传一个命令级假值。
-
-**核实到的事实**：`_resolve_api_keys`（M1 规则 12）只为**被引用的** profile 解析密钥，但与
-`--probe` 无关——`load` 一律执行，缺值即 `col.error`。`--probe` 只控制是否真发探测请求。
-
-**v1.17 裁决**：静态 load 完全不读取 key value，也不发 missing-key WARN；删除 profile 上的 secret
-字段。只有 run 与 `validate --probe` 调 `resolve_credentials` 生成独立 `RuntimeCredentials`，并继续
-对缺失 key 聚合硬错。
-
-### 51. dry-run 估算只进 stderr，不进 report.json —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：控制台显示九条记录、54 帧、27 次基础模型调用的估算，报告中对应计数仍为零。自动化
-无法只读报告做成本与规模门控。
-
-**核实到的事实**：`_run_dry` 调 `self._estimate()` 拿到 `est`，只交给 `_print_dry_estimate` 或
-`metrics.run_estimate`；随后 `_build_report(exit_code=0, …)` 完全从计数器组装，而 dry-run 什么
-都没跑，所以计数全零。报告里没有任何估算字段。
-
-**v1.17 裁决**：dry-run 的 `report.estimate` 直接使用 `estimate_run` 返回对象；console 只格式化该
-对象。time-stream estimate 另含 schedule、plan digest、planner families 与 objective，自动化无需
-解析 stderr。
-
-### 52. 相对输出路径按启动目录解析且不回显绝对路径 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：从 `Project/LabelKit` 启动、`--project` 指向 `Dataset-Person` 下的 TOML 时，
-`[run].output` 的相对路径写进了 `Project/LabelKit/out`。工件位置取决于调用者 cwd，容易污染源码
-仓库或误读旧结果。
-
-**核实到的事实**：M1 的可写性检查用 `Path(eff_output).resolve()`（相对 cwd），M11 `Emitter`
-用 `Path(cfg.run.output)`（同样相对 cwd），`stream_artifact_path` 由输出路径派生因而同源。错误
-串只回显用户写的原始相对串，全程没有一处打印规范化绝对路径。五个 example 都靠 `cd` 到示例目录
-运行，把这个行为完全遮住了。
-
-**v1.17 裁决**：project TOML 内的 input/output、四类 Schema、trace 与 hook 路径统一相对 project
-root；CLI input/output 仍按 shell cwd。合并后只保留 `ResolvedPaths` 绝对路径，M2/M11/trace/console
-不得二次按 cwd 推导；report 与启动输出回显全部启用通道。
-
-### 53. `windows` 不能锁定唯一日期，horizon 无上界 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：`ts_start` 只提供下界，`of_week = ["mon"]` 在规划地平线内每周重复；没有 `ts_end` 或
-指定日期窗口。「生成一天」依赖求解器恰好选中第一个周一，而不是配置契约保证（第 45 条即其后果）。
-
-**核实到的事实**：`CalendarWindow` 只有 `frame_class` / `of_day` / `of_week` 三个字段
-（`common/runtime/temporal.py`），没有日期维度；`window_day_options` 从 `ts_start` 起按
-`days = max(8, (horizon - ts_start) // _DAY_US + 9)` 枚举合法日内窗，而 `_horizon` 每个 session
-加一周——session 越多，可选日期越多，`_add_calendar_constraints` 的析取分支也越多。
-
-**v1.17 裁决**：删除 `ts_start`，改为必填、同 fixed offset 的
-`[generate.stream.schedule].start/end` 半开区间，并支持 `exclude_dates`。删除每 session 一周的隐式
-horizon；frame window 只枚举 schedule 内合法日期。
-
-### 54. 噪音帧只能是纯文本，结构化负样本无入口 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：要求每行 `text` 是对象的下游导出契约无法消费内建噪音，只能把社交、娱乐、健身、弱证据
-快照全部建成显式序列类，进一步放大规划模型（第 42 条的规模正由此而来）。
-
-**核实到的事实**：`_noise_slot(payload: str, tiered: bool)` 的载荷是字符串，噪音批调用复用扁平
-生成模板；`assemble_stream` 把 `slot.payload` 直接写进行对象的 `text_field`，而结构化帧类走的是
-`realize_schema` 逐位路径，两者不通。提示词层面无法弥补——行里的值是字符串而不是对象。
-
-**v1.17 裁决**：`[[generate.stream.noise]]` 以 frame class + integer weight 声明，复用该 frame
-class 的 instruction、Schema 与 realization。noise 仍是 point occurrence；`truth.noise = true` 且
-`truth.frame_class` 写实际类名，sequence/tier 字段保持 null。
-
-### 55. 长周期行为配额无法声明 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：无法直接声明「每工作日八个意图、每周末一次买菜、跨周比例 60/25/15」，只能手工展开
-日期与序列类，配置体积与规划复杂度同步上升——167 条序列的工程正是这样来的。
-
-**核实到的事实**：`rules` 只约束同一序列内部的帧关系（15 个有限迹 DECLARE 模板），`windows`
-只约束帧的发生时段；配额只有 `[generate].sequences` 与按类覆盖，没有日历周期维度。
-
-**v1.17 裁决**：`[[generate.stream.quotas]]` 支持 day、ISO week、schedule bucket，支持 exact counts
-或 integer weights；schedule 提供有限展开边界，quota 编译后生成稳定成功交付 slot。
-
-### 56. 单日覆盖与多周比例的整数冲突无提示 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：标准工作日八个规律意图，若单日再加入一个不规律意图只能得到 8:1；九条有效意图也不能
-精确拆成 60% / 25% / 15%。单日样本不可能同时精确满足长期比例与全部覆盖要求，而工具不区分
-「单日覆盖目标」与「多周统计目标」，也不报最小可精确满足样本数。
-
-**核实到的事实**：档位配分用整数域最大余数法（`apportion_tiers`），零配额只有 WARN
-（"apportions 0 sequences to tier_rank = …"）；没有「要精确满足这组权重最少需要多少条」的反向报告。
-
-**v1.17 裁决**：weights 先按最大公约数归一，报告 `minimum_exact_cohort` 与上下邻近可精确 total；
-用户显式选择 `exact` 或纯整数 `largest_remainder`。QuotaCompiler 在有限 local date 上联合执行逐日
-counts 与长期 ratio；同一 occurrence 可同时满足多张约束，兼容时通过，冲突时 assumptions core
-同时点名自然名称 quota。
-
-### 57. 跨序列类的先后、最小间隔与语义互斥 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：原半日窗口先在 18:20 导航回家、后在 18:50 下班打卡；18:19 晚餐外卖后又在 19:20 买菜。
-每条序列内部连贯，合并后的白领行为主线不成立。
-
-**核实到的事实**：`SPEC-sequence-rules.md` 第 11 节明确：「规则只约束同一任务序列，不新增
-『一条业务序列必须发生在另一条之后』的用户配置；session crossing 是生成布局约束，不是跨业务
-序列 DECLARE。」跨意图顺序当前只能靠各类独立 `windows` 拼时间轴，没有统一的因果约束或语义冲突
-检查。
-
-**v1.17 裁决**：新增 period-scoped sequence rule：`precedence`、`response`、`succession` 与
-`not_co_existence`，gap 仍用半开秒区间。payload 语义互斥由增量
-`scenario_validator(accepted, candidate)` 失败关闭，违规只重试 candidate。
-
-### 58. App 使用区间严格包含屏幕 / 剪贴板证据 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：同日转换后咖啡 App 区间为 15:00:07.500–12.500，而瑞幸屏幕证据在
-15:00:02.500–03.000；五条有效序列的屏幕或剪贴板证据全部落在对应 App 区间之外——事件声称用户
-尚未使用 App 时已看到该 App 页面或复制了内容。
-
-**核实到的事实**：`SPEC-sequence-rules.md` 第 11 节：「帧仍是时间点事件，不引入 duration
-interval 与 Allen 区间代数。」`rules` 的 `time_s` 是两个时间**点**之间的半开差值约束，无法表达
-「A 的区间包含 B 的时刻」。仅调整 project TOML 无法建立包含关系。
-
-**v1.17 裁决**：frame class 可声明机械 `duration_s`，artifact timestamp 是 interval start；时间字段
-新增 `end_ts` / `duration_s`。同序列 frame rule 新增严格 `contains`，边界相等不通过，不再依赖
-artifact 写出后的修复脚本。
-
-### 59. 跨序列资源互斥（同设备音频焦点） —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：不同序列的媒体播放 duration 没有统一资源互斥检查，可能出现音乐与视频同时播放，违反
-手机音频焦点与真实用户行为。
-
-**核实到的事实**：既跨序列（第 57 条边界）又是区间语义（第 58 条边界），双重非目标。
-
-**v1.17 裁决**：duration frame 声明 `resources = ["audio_focus"]` 等自然名称；planner 把全场景同名
-resource interval 交给 CP-SAT `AddNoOverlap`。一个 frame 可占多个 resource，不同 resource 可重叠。
-
-### 60. 失败序列不补足配额 —— 🧭 v1.17 方案已冻结（待实现）
-
-**现象**：首次真实运行有两条序列因规划响应不满足 JSON Schema 而缺席，最终只输出七条序列 /
-41 帧，配置请求的九条没有重试补足。一次偶发格式错误就改变数量与比例，长周期统计更难稳定。
-
-**核实到的事实**：spec §8.3 O6 把「精确输出配额 + 补足循环」列为非目标。但**报告侧的「尝试 vs
-交付」其实已可对账**：`report.generate.stream` 有 `plan_failures` / `realize_failures` /
-`validator_scrapped`，`tiers` 子块逐档给 `planned` / `produced`（v1.15 起按类嵌套），零配额档与
-全作废档显式呈现 0/0。原始记录里「报告应明确区分尝试配额与交付配额」这半条已经满足。
-
-**v1.17 裁决**：quota 改成成功交付目标；每个 frozen slot 使用
-`max_attempts_per_slot` 有界重跑完整 brief + realization + validators，layout 不变。任一 slot 耗尽后
-继续处理其余 slot、交付 partial artifact、`delivery.complete = false`、exit 1；不无限循环、不跨运行续跑。
-
-### v1.17 统一设计留痕
-
-- 业界依据、替代方案与拒绝理由：[`PROPOSAL-scenario-planning.md`](PROPOSAL-scenario-planning.md)。
-- 字段、模型、失败语义、报告、文件归属与验收门：
-  [`SPEC-scenario-planning.md`](SPEC-scenario-planning.md)。
-- 当前状态只是**方案冻结**。生产代码、主规格、CONTRACTS、examples、手册与真实 E2E 尚未改动，
-  所以 E2E-42 至 E2E-60 均不得标记为已修复。
-
-### 分诊留痕（2026-08-21）
-
-| 核实对象 | 方法 | 结论 |
-|---|---|---|
-| planner 规模曲线 | 直接构造 `PlannerQuestion` 读 `_proto_entries`，取 8/9/12/13/16/24/32/48 八个点；另跑一遍 monkeypatch 掉零交叉短路的对照组 | 拐点硬落在 12 → 13 条（197,763 → 252,047）；交叉组合稳定占 67%–72%（第 42、43 条） |
-| 目标函数落点 | 读 `_minimize_timeline_end` / `select_feasible_plan` / `_add_session_boundaries` / `_horizon` | 生成路径无 end 目标；session 起点允许比前一个结束晚整周（第 45、46 条） |
-| 钩子解析路径 | `cd examples/synth-stream && uv run python -c "…sys.path…"` | cwd **不在** `sys.path`；仓库根在（editable 安装）⇒ 示例可运行性依赖开发态安装（第 47 条） |
-| 两条线的分家点 | 两个工作区 `git log` 对比 | 同源于 `070e341`（v1.14）；本仓库走 v1.15 / v1.16，`Downloads/LabelKit` 走 `time_profiles` + 全天合成脚本 ⇒「配置契约不一致」非加载器缺陷 |
-| 非目标条文 | `SPEC-sequence-rules.md` 第 11 节、spec §8.3 O6 | 第 57–60 条落在既有边界内，不是遗漏 |
-| 「固定 search strategy」一条 | `SPEC-sequence-rules.md` 第 290 行 vs `_configure_solver` | 规格写的就是自动搜索，实现与之一致 ⇒ 该反馈已过时，真问题是第 45 条 |
-| 报告面「尝试 vs 交付」 | 读 `_report_generate_stream` / `_report_stream_tiers` | `plan_failures` / `realize_failures` / `validator_scrapped` + 逐档 `planned` / `produced` 已在场（第 60 条） |
-
-分诊实测阶段**零代码改动、零测试改动、零 golden 变更**。后续只新增 v1.17 proposal/spec 并更新
-状态为“方案已冻结”；生产实现与验收仍全部待做。
+| 首轮 | 两名评审均为 27/52；13 个 reordered 场景出现终态后重新处理 | blocked 的迟到回执只确认收件，不重开状态 |
+| 第二轮 | 两名评审均为 49/52；3 个场景在迟到回执中重复终态 | renderer、Schema 与 evaluator 禁止近义复述终态 |
+| 第三轮 | 两名评审为 49/52、48/52；3 个场景把系统发出的补充确认写成系统收到的对象 | 明确 actor 收发关系并机械约束教学帧 |
+| 第四轮 | 50/52、52/52；第三人裁定两个 timeout 场景的等待主语生硬 | 约束时间叙述的自然主语关系 |
+| 第五轮 | 首个 slot 四次 semantic rejection 后 exhaustion | 诊断发现 evaluator 把自然的等待过程也误判为业务实体，收窄到精确语法关系 |
+| 第六轮 | 两名评审均为 51/52；唯一缺陷只在一个 scenario | 继续修正，不把阈值内瑕疵当作最终质量 |
+| 第七轮 | 两个独立 scenario 重复终态结论，构成系统性模板缺陷 | 收紧 confirmation Schema、renderer 与 evaluator |
+| 第八轮 | 两名评审均为 52/52，五类缺陷全零 | 通过发布门并固化 104 条逐评审记录 |
+
+## 成功提交与失败注入的验收口径
+
+- final `PipelineItem -> SequenceRows` 必须含 inherited classification、quality、sequence/frame annotation 与
+  verification；CrossView、retained bytes、delivery digest 与正式文件使用同一最终 bytes。
+- primary/noise/replay rows 按最终 artifact timestamp 全局稳定排序；main members 保持 owner 内顺序。
+- prospective retained bytes 在 dedup commit 前同时计 source 与它的全部 replay。
+- 成功按 main、stream、report 原子替换，manifest last。
+- exhaustion 或 pre-commit terminal 保留已有成功四件套，另写 failed report。
+- commit-I/O 可留下固定路径混代，但旧 manifest 保持；hash mismatch 必须让消费者拒绝。
+- failed report 的 usage 键与成功报告一样是 `llm_usage`；精确键集测试不得接受别名。
+- provider fatal/circuit breaker 零 attempt；retryable exhausted 恰消耗一次 attempt。
+
+## 历史非序列 findings 摘要
+
+下表保留仍有诊断价值的旧 findings；它们不是当前 sequence closure 的替代证据。
+
+| finding | 处置 |
+|---|---|
+| retryable exhausted 曾未进入 breaker window | 已修复 |
+| 全部输入非法曾错误 exit zero | 已修复为 input error |
+| 认证失败曾被记录级隔离吞成全灭 | 已修复为首错熔断 |
+| trace 曾在启动即截断 | 已修复为惰性打开 |
+| JSON repair 可能产生有损但合法内容 | 已加损失启发式与 trace 证据，仍需审慎 |
+| temperature zero 的服务端结果仍可漂移 | 服务端非确定性；保持为已知锐边 |
+| threshold 与 top-ratio 组合曾被静默忽略 | 已修复配置反馈 |
+| explicit judges 曾仍强制 default verify profile | 已修复 |
+| pairwise criterion mean 易被误读 | 已增加 tie-rate 观测 |
+| circuit-broken report 曾缺少显式标记 | 已修复 |
+| trajectory rubric metadata 曾回落错误 | 已修复 |
+| rich markup 曾吞掉 `profile[key]` | 已修复 |
+| context overflow 的成功响应形状与普通 HTTP 错误不同 | 已由真实 integration 固定解析边界 |
+| 并发同 stem 运行可能碰撞固定输出路径 | 仍是使用锐边；生产调度需保证路径唯一 |
+
+## 历史端点观察的使用边界
+
+2026-08-12 曾观察到 DeepSeek anthropic route 的三个行为：未显式禁用时返回 thinking block、不接受 image block、
+强制 tool choice 返回 HTTP 400。这些仍只是历史 route 观察。当前 v1.18 DeepSeek 集成已经重新验证 text-only、
+structured-output off、thinking disabled 的生产请求体和响应；z.ai 用例独立验证 structured-output on，不能用其中
+任一结果替代另一路径。

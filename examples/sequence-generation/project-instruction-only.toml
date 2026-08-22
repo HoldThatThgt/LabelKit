@@ -1,0 +1,103 @@
+schema_version = 1
+
+[run]
+output = "./out/instruction-only-labels.jsonl"
+modality = "text"
+mode = "generate_only"
+batch_size = 4
+seed = 20260823
+
+[dedup]
+enabled = true
+scope = "global"
+
+[classify]
+enabled = false
+
+[frame.classify]
+enabled = false
+
+[quality]
+enabled = false
+
+[annotate]
+enabled = true
+llm = "default"
+instruction = """
+阅读完整订票序列，标注统一的业务意图、最终结果、请求编号、票号与一句简洁摘要。
+"""
+
+[verify]
+enabled = false
+
+[generate]
+enabled = true
+form = "sequence"
+mode = "instruction_only"
+semantic_llm = "default"
+evaluation_llm = "judge"
+max_slot_attempts = 4
+state_validator = "hooks.py:validate_state"
+
+[output]
+schema_path = "schemas/annotation.json"
+validator = "hooks.py:validate_output"
+meta_mode = "inline"
+rejects = "none"
+
+[class.ticket_booking]
+description = "一次铁路订票请求从提出到最终结果的自然交互"
+
+[class.ticket_booking.annotate]
+instruction = """
+标注这次订票交互的 intent、outcome、request_id、ticket_id 与 summary。
+outcome 只能是 ticketed、not_ticketed 或 expired；未出票时 ticket_id 使用空字符串。
+"""
+schema_path = "schemas/annotation.json"
+
+[frame.class.task_request]
+description = "请求者提出一条订票需求"
+
+[frame.class.task_request.generate]
+instruction = "写成请求者自然提出订票需求的一句话，不得提前声称成功。"
+schema_path = "schemas/frame-request.json"
+
+[frame.class.acknowledgement]
+description = "系统确认已经接收请求"
+
+[frame.class.acknowledgement.generate]
+instruction = "写成系统自然确认已收到同一请求的一句话，不得提前声称出票。"
+schema_path = "schemas/frame-acknowledgement.json"
+
+[frame.class.confirmation]
+description = "系统给出与当前状态一致的最终结果"
+
+[frame.class.confirmation.generate]
+instruction = "写成系统对同一请求给出最终结果的一句话；不得虚构事实，“出票”最多出现一次。"
+schema_path = "schemas/frame-confirmation.json"
+
+[[generate.instruction_only]]
+name = "open_booking"
+sequence_class = "ticket_booking"
+count = 1
+len_range = [3, 4]
+instruction = """
+生成一次完整、自然、状态连续的中文订票交互。参与者先提出请求，系统再确认接收并给出结果；
+所有事件必须围绕同一个 request_id。patch 先 test 当前可见的精确叶子值，再只 replace 完成本事件所需的
+最少叶子 path；不得替换 actors、audit、goal、request、ticket、sla 等容器，不得改变任何字段类型。
+请求事件只把 request.status 从 new 改为 pending；受理事件只把 acknowledged 改为 true 并把 status 改为
+acknowledged；结果事件只把 request.status、ticket.id 与 ticket.status 改为一致终态。始终保持
+hidden_sentinel 不变。
+"""
+state_schema_path = "schemas/state.json"
+
+[generate.timeline]
+timestamp_start = "2026-01-05T09:00:00+08:00"
+event_gap_s = [15, 120]
+primary_sessions = 1
+crossed_primary_sessions = 0
+session_max_events = 8
+session_max_span_s = 1800
+session_gap_s = 3600
+noise_events = 0
+duplicate_sequences = 0

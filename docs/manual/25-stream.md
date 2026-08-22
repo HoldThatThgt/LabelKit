@@ -40,7 +40,9 @@ flowchart LR
 
 这套形态不是发明：从状态对反推动作是 OpenAI VPT 的逆动力学模型与 OS-Genesis 逆向任务合成的既有工序，滑窗 LLM 边界裁决是 2026 年 GUI 轨迹量产管线（Video2GUI 等）仍在用的形态之一，LabelKit 按自己的负边界（不训练本地模型）用运行时 LLM 充当这两个角色。**什么时候开**：输入是按时间排好的操作流（UI 模态的截图 + 树对，或带时间戳的文本事件流）、且你要的样本单位是「活动段」而非单条记录。开关是 `segment.enabled = true`，约束：仅 process 模式、必须开 annotate、与 generate 互斥；`extract` 再要求 UI 模态。默认全关——不开时行为与 v1.7 逐字节一致（输出只多一个恒为 null 的 `_meta.stream` 键）。
 
-**手上没有真实流呢？**时间流生成在 `generate_only` 下从零合成多会话流。两者是镜像关系：本章从帧流演绎序列，生成侧直接铺设序列，所以 segment / stitch / extract 不参与。v1.17 生成侧有 quota、规则或日历窗口时，结构不再由 LLM 蓝图与后置随机织造共同碰撞，而由 ScenarioPlan 在 LLM 前冻结；process stream 的 sessions/windows 语义仍由本章前面的 `[stream]` 与 segment 规则定义。工件仍是本章的合法输入；owner 相邻帧始终满足 `delta <= stream.gap_s`，因此 crossing 同伴作废后重放也不会把幸存 owner 切断。
+**手上没有真实流呢？** sequence form（第 27 章）可以从零生成 main 与逐事件 stream；它在内容调用前冻结
+ScenarioPlan，并在成功下游之后才从最终 source rows 派生 replay。生成侧不运行 segment/stitch/extract。
+之后可用 `project-replay.toml` 把 stream 作为本章的 process 输入；M2 会先验证全部 generation provenance。
 
 ## 25.2 快速上手：examples/stream 全流程
 
@@ -366,7 +368,10 @@ instruction = """
 enabled = false
 ```
 
-**组合约束**（全部启动期配置错误，第 4 章有合订）：帧粒度是流模式的第二层产物——`frame.classify` / `frame.annotate` 任一启用都要求 `segment.enabled = true`（非流工程想按类定制标注，用第 24 章的 `[class.<名>.annotate]`）；帧产物仅经 `_meta` 承载，`output.meta_mode` 不得为 `"none"`；`fallback_class` 必须 ∈ 帧类表；`[frame.class.<名>]` 在场要求帧分类开启、节名必须是帧类表成员，且白名单只有 annotate 一节的 instruction / examples / enabled 三键；帧级**没有**多标签也**没有**自洽采样——在 `[frame.classify]` 里写 `assignment` 或在 `[frame.annotate]` 里写 `self_consistency` 会得到定向配置错误（机制同 v1.11 移除 `segment.use_vision` 时的原始节探针）。v1.13 再加一条**互斥**：帧粒度两开关与时间流生成（`[generate.stream]`，第 27 章）不能同开——合成流的帧类是蓝图定下来的**真值**，再花钱判一遍没有意义，显式开启同样是定向配置错误。那边复用的只是帧类**表**（`[[frame.classify.classes]]` 保持 `enabled = false` 当真值词表用），帧内容契约写在另一族节 `[frame.class.<帧类名>.generate]` 里。
+**组合约束**（全部启动期检查，第 4 章有合订）：process stream 的帧粒度开关要求
+`segment.enabled = true` 且 `output.meta_mode != "none"`；frame class 必须来自分类闭集，帧级没有 multi 或
+self-consistency。sequence form 则要求两个分类开关都关闭，以 `[frame.class.<name>]` 注册 frame class，
+并在 `[frame.class.<name>.generate]` 声明 instruction 与 object Schema。两种形态共用概念，不共用判决路径。
 
 **members 块怎么读。**本次真跑主输出第 1 行（外卖下单的 episode，序列类 food_delivery，6 成员）的 `_meta.stream.members` 全文：
 

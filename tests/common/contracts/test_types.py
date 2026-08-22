@@ -18,10 +18,6 @@ from labelkit.common.contracts.types import (
     PipelineItem,
     Record,
     RecordRef,
-    ScenarioSequence,
-    ScenarioValidationInput,
-    SequenceValidationFrame,
-    SequenceValidationInput,
     Status,
     Transition,
     UINode,
@@ -250,55 +246,6 @@ class TestClassification:
                            detail={"reason": "既问且聊"})
         assert (c.label, c.labels, c.source, c.detail) == (
             "faq", ("faq", "chitchat"), "inherited", {"reason": "既问且聊"})
-
-
-class TestSequenceValidationInput:
-    def test_fields_and_nested_frame_are_frozen(self):
-        frame = SequenceValidationFrame(0, "request", {"subject": "x"})
-        value = SequenceValidationInput("booking", 1, (frame,))
-        assert value.sequence_class == "booking"
-        assert value.tier_rank == 1
-        assert value.frames == (frame,)
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            value.sequence_class = "other"  # type: ignore[misc]
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            frame.position = 1  # type: ignore[misc]
-
-    def test_empty_tier_and_frames_are_valid_contract_values(self):
-        value = SequenceValidationInput("chat", None, ())
-        assert value.tier_rank is None
-        assert value.frames == ()
-
-
-class TestScenarioValidationInput:
-    """v1.17（CONTRACTS §7.19.1 冻结块）：scenario validator 的两个输入类型。"""
-
-    def test_scenario_sequence_fields(self):
-        frame = SequenceValidationFrame(0, "request", {"subject": "x"})
-        seq = ScenarioSequence("d1:s1", "booking", "2026-01-01T00:00:00Z",
-                               "2026-01-01T00:01:00Z", (frame,))
-        assert seq.slot_key == "d1:s1"
-        assert seq.sequence_class == "booking"
-        assert seq.start == "2026-01-01T00:00:00Z"
-        assert seq.end == "2026-01-01T00:01:00Z"
-        assert seq.frames == (frame,)
-
-    def test_scenario_input_holds_accepted_tuple_and_candidate(self):
-        frame = SequenceValidationFrame(0, "request", {})
-        accepted = (ScenarioSequence("d1:s0", "booking", "t0", "t1", (frame,)),)
-        candidate = ScenarioSequence("d1:s1", "booking", "t2", "t3", (frame,))
-        value = ScenarioValidationInput(accepted=accepted, candidate=candidate)
-        assert value.accepted == accepted
-        assert value.candidate is candidate
-
-    def test_both_scenario_types_are_frozen(self):
-        frame = SequenceValidationFrame(0, "request", {})
-        seq = ScenarioSequence("k", "c", "t0", "t1", (frame,))
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            seq.slot_key = "other"  # type: ignore[misc]
-        value = ScenarioValidationInput((), seq)
-        with pytest.raises(dataclasses.FrozenInstanceError):
-            value.candidate = seq  # type: ignore[misc]
 
 
 class TestFrozen:

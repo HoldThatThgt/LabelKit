@@ -17,8 +17,8 @@ M1 冻结的 `ResolvedPaths`；组装 `_meta`、执行写前 Schema/双视图终
 | process stream 元数据 | segment/stitch/frame 开关决定既有 `_meta.stream`、members、fragment、defect 形态；成员标注写前逐项 `validate_only`。该面不承担 sequence 生成真值。 |
 | process / flat rejects | `none` / `refs` / `full` 三档保持既有语义；refs 只写引用与 value-free error，full 是用户显式的数据内容调试面。sequence 配置强制 none 且从不打开该通道。 |
 | process / flat report | `<output-stem>.report.json`；聚合运行参数摘要、计数、质量、去重、Schema、usage、预算与耗时，不含业务数据。 |
-| sequence 内存阶段 | M6 先产生只服务于 dedup/downstream 的 `ProjectedSequence`；M11 再以最终 `PipelineItem` 组装 `SequenceRows`，replay 只从 source 的最终 primary rows 派生。在全部 primary/noise/replay slot 与 CrossViewReconciler 通过前，不打开 main、stream、success report 或 manifest；失败 attempt 同样不打开正式数据通道。main/stream/replay 共享冻结 payload 引用。 |
-| sequence main | 只含 primary sequence，每个 Record 在写前按 inherited sequence class 选择有效用户 Schema；classify 关闭不影响 ClassView 路由。declared 与 instruction-only 的 generation truth 按第 6 章写入。 |
+| sequence 内存阶段 | M6 先产生只服务于 dedup/downstream 的 `ProjectedSequence`；M11 再以最终 `PipelineItem` 组装 `SequenceRows`，replay 只从 source 的最终 primary rows 派生。在全部 primary/noise/replay slot 与 CrossViewReconciler 通过前，不打开 main、stream、success report 或 manifest；失败 attempt 同样不打开正式数据通道。M11 Schema 终检失败回滚整个当前 set attempt。main/stream/replay 共享冻结 payload 引用。 |
+| sequence main | 只含 primary sequence，每个 Record 在写前按 inherited sequence class 选择 `GenerationProgram.class_views` 中已物化的生效用户 Schema；classify 关闭不影响 ClassView 路由。declared 与 instruction-only 的 generation truth 按第 6 章写入。 |
 | sequence stream | 顶层固定为 `payload` 与 `_meta`。primary row 与 main owner 双向一致；noise 无 owner/role/pattern/variant；replay 是 whole-positive-sequence 同源投影，使用新 ID 与时间但逐位 payload、frame class、actual role 和顺序同源。 |
 | sequence success report | `report.generate.sequence` 只含身份、精确计划/交付计数、调用族、按 pattern 计数、usage 与冻结 rejection buckets；不含 state、patch、payload、prompt 或已交付数据前缀。 |
 | sequence manifest | main、stream、report 都写同目录 `.part`，flush + fsync 后依次 `os.replace(main, stream, report)`；manifest 最后单独写、fsync、replace。manifest 是唯一成功提交真值，包含 schema_version、run_id、delivery_digest、artifacts_committed、三个 artifact 的绝对路径/sha256/rows 与 committed_at。 |
@@ -26,17 +26,35 @@ M1 冻结的 `ResolvedPaths`；组装 `_meta`、执行写前 Schema/双视图终
 | commit-I/O 失败 | main/stream/report 顺序 replace 可能留下新旧混合固定路径；旧 manifest 必须保持不变。消费者以 manifest 摘要核验并拒绝不匹配组合。failed-report 写失败不覆盖主异常；只有没有主异常时映射 exit 4。 |
 | stderr / console | 只打印进度、计数与 value-free 错误；rich/plain 仍共用 console_format。sequence 不打印 prompt、state、patch、payload、ActorView 或 key。 |
 
-`SequenceDeliveryEmitter.assemble_sequence(item, projection, batch_no)` 是纯内存、零 I/O 入口，
-复用普通 emitter 的用户对象、按类 Schema、scores、sequence/frame annotation 与 verification 装配规则，
-返回 `SequenceRows(main_row, primary_stream_rows, retained_content_bytes)`。`batch_no` 固定为从一开始的
-slot declaration ordinal，重试不变。`ProjectedSequence.main_record` 只是 dedup/downstream 输入，
-不得用它组装或计费最终 main row。
+`SequenceDeliveryEmitter` 构造器只绑定 `ResolvedPaths`，使 planner failure 在运行服务构造前仍可写独立 failed
+report。`SequenceDeliveryEmitter.assemble_sequence(request)` 是纯内存、零 I/O 入口；唯一参数
+`SequenceAssemblyRequest(program, schema_engine, item, projection, batch_no)` 闭包冻结 program、共享 M8、最终
+attempt-local item、对应投影与批号。入口复用普通 emitter 的用户对象、scores、sequence/frame annotation 与
+verification 装配规则，返回 `SequenceRows(main_row, primary_stream_rows, retained_content_bytes)`。`batch_no` 固定为
+从一开始的 slot declaration ordinal，重试不变。`ProjectedSequence.main_record` 只是 dedup/downstream 输入，不得
+用它组装或计费最终 main row。
+
+M11 必须在计费前终检实际待写对象。开启 sequence annotation 时，移除 main 顶层 `_meta` 后的用户对象以 inherited
+sequence class 选择的 `GenerationProgram.class_views[label].schema` 显式调用
+`SchemaEngine.validate_only(..., schema=...)`；该 Schema 已由 compiler 物化为类覆盖或全局用户 Schema。每个 frame
+成员还要用 `GenerationProgram.frame_classes` 判断是否应有标注，并把 main member 与 primary row 的两份最终标注都
+显式按 `GenerationProgram.frame_schema` 验证。`FrameClassView.gen_schema` 只约束生成 payload，不是帧标注 Schema。
+M11 不读取 source `ResolvedConfig` 的 class/frame views 或 Schema，不以 `schema=None` 触发 M8 默认 Schema，也没有
+未知类 fallback。缺失 program Schema 是 `generation_downstream_contract`；实际最终标注违规是
+`sequence_projection_mismatch`，只记录 record ID、检查面和违规数，不记录数据或违规正文。
+
+最终标注违规在 AnnotateStage 接受之后发生，因此归 report 的 `reconcile` rejection bucket，而不是 `annotate`。
+DeliveryController 拒绝并重试整个当前 counterfactual set attempt；所有 variant item、dedup token、dataset delta、
+SequenceRows 和 replay 一起回滚，已发生的 usage、retry、SchemaEngine 与 trace 运行事实仍累计。
 
 ReplayProjector 在 `assemble_sequence` 之后才从 source `SequenceRows.primary_stream_rows` 深拷贝并机械
 替换 replay 身份与工件时间，因而 payload、frame annotation 与其他下游元数据逐位保留。
 `SequenceRows.retained_content_bytes` 只计其 main row 与 primary rows；`ReplayRows.retained_content_bytes`
 只计 replay rows。两者共用 `canonical_delivery_row`，每行计 `len(canonical_row_bytes) + 1`，
-其中一 byte 是 JSONL 换行。
+其中一 byte 是 JSONL 换行。`ReconcileRequest.replays` 保留 ReplayLayout 顺序的 `ReplayRows` 分组，
+`ReconcileRequest.retained_content_bytes` 携带 prospective 或最终的 sequence main/primary、noise 与 replay 总费用。
+CrossView 必须直接从实际 canonical rows 独立复算每个 `SequenceRows`、每个 `ReplayRows` 与全量总费用；不能信任或
+只相加 carrier 已提供的 byte 字段。
 
 `SequenceDeliveryEmitter.prepare_product(main_rows, stream_rows, report)` 是 `delivery_digest` 的唯一属主。
 摘要使用完整 64-hex SHA-256：先写固定 ASCII header `labelkit:v1.18:delivery\n`，再按 main、
@@ -45,6 +63,9 @@ stream 视图顺序及各自行序写入 `len(canonical_row_bytes)` 的十进制
 `committed_at` 等发射期墙钟观测字段；annotation、generation truth、payload、事件时间与 replay
 证据都纳入。`prepare_product` 只计算一次，把摘要写入 report 深拷贝，并返回
 `GenerationProduct(main_rows, stream_rows, report)`。产品不另存 digest 或 manifest input。
+正式文件序列化与上述 canonical 材料严格分离：main/stream/report/manifest 按内存对象声明序写出，
+从而保留 stream 的 `payload` 后 `_meta`、sequence report 与 manifest 的冻结键序；不得为写文件复用
+`canonical_delivery_row` 的 `sort_keys = true`。
 所有 slot/noise/replay 交付完成与 report 计数在进入 `commit` 前已冻结；此后的失败只是
 commit-I/O run terminal，不消耗 attempt，不重试 slot，也不重新生成产品。
 
@@ -55,8 +76,8 @@ report/manifest，不写 main/stream，也不参与 Record ID。manifest 的 `co
 
 正式提交前，`CrossViewReconciler` 以最终 `SequenceRows`、noise rows 与 `ReplayRows` 做双向核对，
 再验证 canonical row 字节数与 prospective retained-content 计费一致。任何 projector/emitter 增删、
-改写或漏写字段都以 `sequence_projection_mismatch` 拒绝当前 attempt；不能用 planner witness
-修补实际输出。
+改写或漏写字段，包括伪造任何局部或总 retained-content 计数，都以 `sequence_projection_mismatch` 拒绝整个当前
+set attempt；不能用 planner witness 修补实际输出。
 
 **背书：**「主数据 + 拒绝通道 + 统计报告」三分法是 NeMo Curator / Dolma 管线产物的通行组织 [6][9]；原子改名交付为数据工程防半截文件的标准手法。
 

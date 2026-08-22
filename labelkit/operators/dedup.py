@@ -6,9 +6,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import secrets
 import unicodedata
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Literal, Sequence
+from typing import TYPE_CHECKING, Any, Literal, NoReturn, Sequence
 
 import imagehash
 import numpy as np
@@ -19,15 +20,17 @@ from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
     ErrorKind,
+    InternalError,
     ProviderFatalError,
     ProviderRetryableError,
 )
+from labelkit.common.contracts.generation import DedupGroupRequest, DedupProbeToken
+from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import DedupInfo, PipelineItem, Record, StageError
 from labelkit.common.runtime import budget
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import DedupConfig
-    from labelkit.common.contracts.stage import RunContext
 
 # 事件名（规范定义在 labelkit.obslog；这里用字面量以免本模块反向依赖 obslog ——
 # 测试会逐字断言这些字符串，CONTRACTS.md §7.11/§8.1）
@@ -38,6 +41,16 @@ _EV_ERROR = "error"
 _LOGGER = logging.getLogger("labelkit.dedup")
 # 日志记录附加字段：索引层不知道批次号，故 batch 留空（文本格式化器渲染为 "-"）
 _LOG_EXTRA: dict[str, Any] = {"stage": "dedup", "batch": None}
+
+
+def _dedup_contract_error(message: str) -> NoReturn:
+    """记录并抛出 sequence dedup 事务契约错误。
+
+    @param message 固定英文错误文本。
+    @return 不返回。
+    """
+    _LOGGER.error(message, extra=_LOG_EXTRA)
+    raise InternalError(message)
 
 
 # ── 纯函数辅助 ─────────────────────────────────────────────────────────────
@@ -164,6 +177,25 @@ class _ProbeDetail:
     verdict: DedupInfo | None = None                    # 最终判决（复合后回填）
 
 
+@dataclass(frozen=True)
+class _GroupFeatures:
+    """一次已提交 sequence set 的三族判重特征。"""
+
+    record_ids: tuple[str, ...]                         # 与特征同序的记录标识
+    record_digests: tuple[str, ...]                     # 记录与判重文本的绑定摘要
+    exact_features: tuple[str, ...]                     # 全文精确摘要
+    minhash_features: tuple[MinHash | None, ...]        # 近文本签名
+    embedding_features: tuple[tuple[float, ...], ...]   # 单位语义向量；关闭时为空
+
+
+@dataclass(frozen=True)
+class _PendingGroup:
+    """尚未提交且只能由一个 capability 消费的 sequence set。"""
+
+    records: tuple[Record, ...]                         # 冻结记录引用，提交前复算摘要
+    features: _GroupFeatures                            # probe 阶段预计算的完整特征
+
+
 # ── 索引 ───────────────────────────────────────────────────────────────────
 
 
@@ -201,6 +233,16 @@ class DedupIndex:
         self._vec_keys: list[str] = []                         # ④ 级：向量对应的簇键
         self._vec_buf: np.ndarray | None = None                # ④ 级：向量缓冲（倍增扩容）
         self._vec_count = 0                                    # ④ 级：已入缓冲的向量数
+        self._group_exact: dict[str, str] = {}                   # sequence 精确索引
+        self._group_lsh = MinHashLSH(                            # sequence MinHash 索引
+            threshold=self.cfg.minhash_threshold, num_perm=self.cfg.minhash_num_perm
+        )
+        self._group_minhashes: dict[str, MinHash] = {}           # LSH 候选复核签名
+        self._group_vec_ids: list[str] = []                      # sequence semantic 标识
+        self._group_vec_buf: np.ndarray | None = None            # sequence 单位向量索引
+        self._group_vec_count = 0                                # 已提交 semantic 向量数
+        self._pending_groups: dict[str, _PendingGroup] = {}     # 未消费能力表
+        self._group_generation = getattr(self, "_group_generation", -1) + 1
 
     @property
     def last_similarity(self) -> float | None:
@@ -415,6 +457,278 @@ class DedupIndex:
         self._vec_ids.append(rec_id)
         self._vec_keys.append(cluster_key)
         self._vec_count += 1
+
+    async def group_probe(
+        self,
+        request: "DedupGroupRequest",
+        context: "RunContext",
+    ) -> "DedupProbeToken":
+        """无突变地探测一整组 sequence records 并返回一次性能力。
+
+        @param request 当前 set 的记录、组内豁免对与可选 embedding profile。
+        @param context 与 GenerationServices 共享对象身份的运行上下文。
+        @return 可被 :meth:`group_commit` 消费一次的冻结 token。
+        @raises DedupGroupRejected 与已提交组或非豁免组内记录重复。
+        """
+        from labelkit.common.contracts.generation import DedupProbeToken
+
+        records = tuple(request.records)
+        texts = tuple(_dedup_text(record, self.cfg) for record in records)
+        exact = tuple(hashlib.sha256(text.encode("utf-8")).hexdigest() for text in texts)
+        minhash = tuple(_build_minhash(text, self.cfg.ngram, self.cfg.minhash_num_perm)
+                        for text in texts)
+        embeddings = await self._group_embeddings(texts, request.embedding_profile, context)
+        features = _GroupFeatures(
+            record_ids=tuple(record.id for record in records),
+            record_digests=self._group_record_digests(records),
+            exact_features=exact,
+            minhash_features=minhash,
+            embedding_features=embeddings,
+        )
+        self._reject_group_duplicate(features, request.exempt_pairs)
+        capability_id = secrets.token_hex(16)
+        self._pending_groups[capability_id] = _PendingGroup(records=records, features=features)
+        return DedupProbeToken(
+            capability_id=capability_id,
+            index_generation=self._group_generation,
+            record_digests=features.record_digests,
+            exact_features=features.exact_features,
+            minhash_features=tuple(
+                value.copy() if value is not None else None
+                for value in features.minhash_features
+            ),
+            embedding_features=features.embedding_features,
+        )
+
+    def group_commit(self, token: "DedupProbeToken") -> None:
+        """校验并原子消费一个 sequence group probe token。
+
+        @param token 当前 index generation 的未消费能力。
+        @return None。
+        @raises InternalError token 缺失、过期、被篡改或记录摘要改变。
+        """
+        pending = self._pending_groups.get(token.capability_id)
+        if pending is None:
+            _dedup_contract_error("generation_dedup_transaction: invalid capability")
+        features = pending.features
+        current = self._group_record_digests(pending.records)
+        if token.index_generation != self._group_generation or current != features.record_digests:
+            _dedup_contract_error("generation_dedup_transaction: stale capability")
+        scalars_match = (
+            token.record_digests == features.record_digests
+            and token.exact_features == features.exact_features
+            and token.embedding_features == features.embedding_features
+        )
+        if not scalars_match or not self._group_minhash_equal(
+            token.minhash_features, features.minhash_features
+        ):
+            _dedup_contract_error("generation_dedup_transaction: altered capability")
+        self._commit_group_features(features)
+        self._group_generation += 1
+        self._pending_groups.clear()
+
+    @staticmethod
+    def _group_minhash_equal(left, right) -> bool:
+        """按 hashvalues 比较 token 副本与私有特征。
+
+        @param left token 携带的对象表。
+        @param right pending 私有对象表。
+        @return 长度、类型与全部 hashvalues 都相同时为 True。
+        """
+        if len(left) != len(right):
+            return False
+        for lhs, rhs in zip(left, right, strict=True):
+            if lhs is None or rhs is None:
+                if lhs is not rhs:
+                    return False
+            elif not isinstance(lhs, MinHash) or not np.array_equal(
+                lhs.hashvalues, rhs.hashvalues
+            ):
+                return False
+        return True
+
+    def _commit_group_features(self, features: _GroupFeatures) -> None:
+        """在全部能力预检通过后同步写入三类正式索引。
+
+        @param features 只有 DedupIndex 持有的特征。
+        @return None。
+        """
+        self._validate_group_commit(features)
+        generation = self._group_generation
+        for index, record_id in enumerate(features.record_ids):
+            exact = features.exact_features[index]
+            self._group_exact.setdefault(exact, record_id)
+            signature = features.minhash_features[index]
+            key = f"g{generation}:{index}"
+            if signature is not None:
+                self._group_lsh.insert(key, signature)
+                self._group_minhashes[key] = signature
+            if features.embedding_features:
+                self._group_add_vector(record_id, features.embedding_features[index])
+
+    def _validate_group_commit(self, features: _GroupFeatures) -> None:
+        """在任何正式索引突变前验证整组形状与 semantic 维度。
+
+        @param features 只有 DedupIndex 持有的特征。
+        @return None。
+        @raises InternalError 特征表错位或向量维度不一致。
+        """
+        size = len(features.record_ids)
+        aligned = (
+            len(features.record_digests) == size
+            and len(features.exact_features) == size
+            and len(features.minhash_features) == size
+            and (not features.embedding_features or len(features.embedding_features) == size)
+        )
+        if not aligned:
+            _dedup_contract_error("generation_dedup_transaction: feature count mismatch")
+        if len(set(features.record_ids)) != size:
+            _dedup_contract_error("generation_dedup_transaction: duplicate record id")
+        vectors = features.embedding_features
+        if not vectors:
+            return
+        dimensions = {len(vector) for vector in vectors}
+        if len(dimensions) != 1 or 0 in dimensions:
+            _dedup_contract_error("generation_dedup_transaction: embedding dimension mismatch")
+        if any(not np.all(np.isfinite(vector)) for vector in vectors):
+            _dedup_contract_error("generation_dedup_transaction: invalid embedding value")
+        dimension = next(iter(dimensions))
+        if self._group_vec_buf is not None and self._group_vec_buf.shape[1] != dimension:
+            _dedup_contract_error("generation_dedup_transaction: embedding dimension mismatch")
+
+    def _group_add_vector(self, record_id: str, vector: tuple[float, ...]) -> None:
+        """向 sequence semantic 索引追加一个单位向量。
+
+        @param record_id 记录标识。
+        @param vector 已归一化向量。
+        @return None。
+        """
+        value = np.asarray(vector, dtype=np.float64)
+        if self._group_vec_buf is None:
+            self._group_vec_buf = np.empty((16, value.shape[0]), dtype=np.float64)
+        elif self._group_vec_count == self._group_vec_buf.shape[0]:
+            shape = (self._group_vec_buf.shape[0] * 2, self._group_vec_buf.shape[1])
+            grown = np.empty(shape, dtype=np.float64)
+            grown[:self._group_vec_count] = self._group_vec_buf[:self._group_vec_count]
+            self._group_vec_buf = grown
+        self._group_vec_buf[self._group_vec_count] = value
+        self._group_vec_ids.append(record_id)
+        self._group_vec_count += 1
+
+    def _group_record_digests(
+        self,
+        records: tuple[Record, ...],
+    ) -> tuple[str, ...]:
+        """绑定记录标识与精确内容特征，供 commit 前重验。
+
+        @param records 与特征同序的冻结记录。
+        @return 十六进制绑定摘要。
+        """
+        digests: list[str] = []
+        for record in records:
+            text = _dedup_text(record, self.cfg).encode("utf-8")
+            content = hashlib.sha256(text).hexdigest()
+            material = f"{record.id}\x00{content}".encode("utf-8")
+            digests.append(hashlib.sha256(material).hexdigest())
+        return tuple(digests)
+
+    async def _group_embeddings(
+        self, texts: tuple[str, ...], profile: str | None, context: "RunContext",
+    ) -> tuple[tuple[float, ...], ...]:
+        """为当前组计算 attempt-local 单位向量；关闭时不调用端点。
+
+        @param texts 完整判重文本。
+        @param profile embedding profile；None 表示关闭语义层。
+        @param context LLM 与观测服务根。
+        @return 与 records 同序的单位向量；关闭时为空 tuple。
+        """
+        if profile is None:
+            return ()
+        vectors = await context.llm.embed(profile, list(texts))
+        if len(vectors) != len(texts):
+            _dedup_contract_error("generation_dedup_transaction: embedding count mismatch")
+        return tuple(tuple(float(value) for value in _l2_normalize(vector))
+                     for vector in vectors)
+
+    def _reject_group_duplicate(
+        self, features: _GroupFeatures, exempt_pairs: frozenset[tuple[str, str]],
+    ) -> None:
+        """与已提交组及当前组非豁免配对比较，命中即拒绝整个 set。
+
+        @param features 当前 set 的完整特征。
+        @param exempt_pairs 允许相似的组内记录对。
+        @return None。
+        @raises DedupGroupRejected 任一不可豁免重复命中。
+        """
+        for index in range(len(features.record_ids)):
+            if self._group_hits_committed(features, index):
+                raise DedupGroupRejected("sequence group duplicates a committed set")
+        for left in range(len(features.record_ids)):
+            for right in range(left):
+                pair = (features.record_ids[right], features.record_ids[left])
+                reverse = (pair[1], pair[0])
+                if pair not in exempt_pairs and reverse not in exempt_pairs:
+                    if self._group_duplicate(features, left, features, right):
+                        raise DedupGroupRejected("sequence group contains a duplicate pair")
+
+    def _group_hits_committed(self, features: _GroupFeatures, index: int) -> bool:
+        """使用三类正式索引判定一条记录是否命中已提交集。
+
+        @param features 当前 attempt 特征。
+        @param index 当前记录下标。
+        @return exact、MinHash 或 semantic 任一命中时为 True。
+        """
+        if features.exact_features[index] in self._group_exact:
+            return True
+        signature = features.minhash_features[index]
+        if signature is not None:
+            for key in self._group_lsh.query(signature):
+                if signature.jaccard(self._group_minhashes[key]) >= self.cfg.minhash_threshold:
+                    return True
+        if not features.embedding_features or self._group_vec_count == 0:
+            return False
+        return self._group_semantic_hit(features.embedding_features[index])
+
+    def _group_semantic_hit(self, vector: tuple[float, ...]) -> bool:
+        """在已提交单位向量索引中检查阈值命中。
+
+        @param vector 当前记录的单位向量。
+        @return 最大余弦相似度达阈值时为 True。
+        """
+        assert self._group_vec_buf is not None
+        value = np.asarray(vector, dtype=np.float64)
+        committed = self._group_vec_buf[:self._group_vec_count]
+        if committed.shape[1] != value.shape[0]:
+            _dedup_contract_error("generation_dedup_transaction: embedding dimension mismatch")
+        similarities = committed @ value
+        return bool(np.max(similarities) >= self.cfg.semantic_threshold)
+
+    def _group_duplicate(
+        self, left: _GroupFeatures, left_index: int,
+        right: _GroupFeatures, right_index: int,
+    ) -> bool:
+        """按 exact、MinHash、semantic 顺序比较两个预计算记录槽。
+
+        @param left 左侧特征组。
+        @param left_index 左侧槽下标。
+        @param right 右侧特征组。
+        @param right_index 右侧槽下标。
+        @return 任一启用层命中则 True。
+        """
+        if left.exact_features[left_index] == right.exact_features[right_index]:
+            return True
+        lhs, rhs = left.minhash_features[left_index], right.minhash_features[right_index]
+        if lhs is not None and rhs is not None and lhs.jaccard(rhs) >= self.cfg.minhash_threshold:
+            return True
+        if not left.embedding_features or not right.embedding_features:
+            return False
+        cosine = float(np.dot(left.embedding_features[left_index],
+                              right.embedding_features[right_index]))
+        return cosine >= self.cfg.semantic_threshold
+
+
+class DedupGroupRejected(Exception):
+    """当前 sequence set 未通过正常 group dedup 准入。"""
 
 
 # ── 算子 ───────────────────────────────────────────────────────────────────

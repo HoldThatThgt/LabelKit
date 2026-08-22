@@ -1,0 +1,35 @@
+schema_version = 1
+
+[tool]
+log_level = "info"
+log_format = "text"
+
+[llm.default]
+provider = "anthropic"
+base_url = "https://api.deepseek.com/anthropic"
+model = "deepseek-v4-flash"
+api_key_env = "LABELKIT_DEEPSEEK_KEY"
+max_concurrency = 4
+timeout_s = 120
+max_retries = 5
+supports_structured_output = false
+supports_vision = false
+max_output_tokens = 8192
+thinking = "disabled"
+context_window = 131072
+temperature = 0.0
+
+[llm.judge]
+provider = "anthropic"
+base_url = "https://api.deepseek.com/anthropic"
+model = "deepseek-v4-flash"
+api_key_env = "LABELKIT_DEEPSEEK_KEY"
+max_concurrency = 4
+timeout_s = 120
+max_retries = 5
+supports_structured_output = false
+supports_vision = false
+max_output_tokens = 8192
+thinking = "disabled"
+context_window = 131072
+temperature = 0.0

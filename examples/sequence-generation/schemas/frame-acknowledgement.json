@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "examples": [{"utterance": "已收到 R-EXAMPLE 订票请求。", "request_id": "R-EXAMPLE", "status": "acknowledged"}],
+  "properties": {
+    "utterance": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 240,
+      "allOf": [
+        {"pattern": "^(?!.*(?:blocked|late_acknowledged|SLA|阻塞)).+$"},
+        {"pattern": "^.*R-[A-Za-z0-9-]+.*$"}
+      ]
+    },
+    "request_id": {"type": "string", "minLength": 1},
+    "status": {"enum": ["acknowledged", "blocked"]}
+  },
+  "required": ["utterance", "request_id", "status"],
+  "allOf": [
+    {
+      "if": {"properties": {"status": {"const": "blocked"}}, "required": ["status"]},
+      "then": {
+        "properties": {
+          "utterance": {
+            "allOf": [
+              {"pattern": "^(?!.*(?:正在|继续|重新).*处理).+$"},
+              {"pattern": "^(?!.*(?:未出票|没有出票|无法.{0,16}出票|未能.{0,16}出票)).+$"},
+              {"pattern": "^(?!.*回执).+$"},
+              {"pattern": "^(?!.*(?:收到|接收)[^。；！？]{0,32}补充(?:收件)?确认).+$"}
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

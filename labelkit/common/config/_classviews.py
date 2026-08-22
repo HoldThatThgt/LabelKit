@@ -7,20 +7,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from decimal import Decimal, InvalidOperation
-import math
-import re
+import json
+from pathlib import Path
 from typing import Any
 
 from jsonschema.validators import Draft202012Validator
 
 from labelkit.common.config._collect import (
     _GE0,
+    _KEY_RE,
     _UNIT_CLOSED,
     _UNIT_HALF_OPEN,
     _Collector,
     _fmt,
-    _int_pair,
     _Tbl,
 )
 from labelkit.common.config._rubrics import (
@@ -33,20 +32,17 @@ from labelkit.common.config._rubrics import (
 )
 from labelkit.common.config._schemas import (
     _DryRun,
+    _GenerationSchemaRequest,
     _dryrun_fewshot,
     _load_class_schema,
     _load_frame_gen,
+    _load_generation_schema,
 )
 from labelkit.common.config._sections import (
     _parse_examples,
-    _parse_frame_rules,
-    _parse_frame_windows,
-    _parse_sequence_rules,
     _parse_styles,
-    _parse_tiers,
-    _parse_time_fields,
-    _parse_duration_resources,
 )
+from labelkit.common.config.generation import SequenceClassGenerationConfig
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
@@ -58,7 +54,6 @@ from labelkit.common.config.model import (
     GenerateConfig,
     QualityConfig,
     Rubric,
-    TierSpec,
     VerifyConfig,
 )
 
@@ -67,16 +62,14 @@ from labelkit.common.config.model import (
 # quality.rubric = "inline" 的按类内联准则子表伙伴(R7)。v1.8 增 "extract"(仅
 # instruction, S2); segment 不在白名单内——它跑在 classify 之前, 类标签尚不存在
 # (链序因果)。
-# v1.13 增两族键: annotate 的 schema_path/schema_inline(裁决·按类标注 Schema,
-# 覆盖语义、缺省回落全局 output.schema)与 generate 的 sequences/len_range
-# (时间流形态的按类配额与序列长度区间载体)。
-# v1.15(裁决·表级原子覆盖)增 generate 第七键 tiers(按类档位表, 整表取代全局表;
-# 未声明即回落全局表)。
+# annotate 的 schema_path/schema_inline 使用覆盖语义，缺省回落全局 output.schema。
+# generate 的 instruction/styles/num_per_record/temperature 属于 flat 继承面，
+# state_schema_path/initial_state_source/initial_state_catalog_path 属于 v1.18 declared 世界面。
 _CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "quality": ("mode", "rounds", "rubric", "threshold", "selection", "top_ratio"),
     "annotate": ("instruction", "examples", "schema_path", "schema_inline"),
     "generate": ("instruction", "styles", "num_per_record", "temperature",
-                 "len_range", "tiers", "frame_rules", "frame_windows", "sequence_rules"),
+                 "state_schema_path", "initial_state_source", "initial_state_catalog_path"),
     "verify": ("extra_criteria",),
     "extract": ("instruction",),
 }
@@ -89,15 +82,11 @@ _SELECTION_GROUP = ("selection", "threshold", "top_ratio")
 # v1.12 [frame.class.<name>.<section>] 覆盖白名单(SPEC-frame-annotation §3.1): 帧类
 # 命名空间与 [class.*] 同为 M1 显名拥有(R25 家族)。annotate 节三键:
 # instruction / examples / enabled。
-# v1.13(裁决·帧类生成面)增 generate 节三键: instruction(时间流生成形态下每个帧类
-# 必填)+ schema_path/schema_inline(至多其一; 均缺 = 纯文本帧)——该节**仅时间流生成
-# 形态合法**, 非本形态出现是定向 CONFIG_ERROR(在约束簇上报)。
-# v1.14(裁决·绑定即剔除)增第四键 time_fields(时间语义字段绑定子表)——不入白名单的话
-# 该子表会被下面的白名单循环判成未知键 CONFIG_ERROR。
+# generate 节是 v1.18 sequence frame registry 的 instruction + Schema 恰一面；
+# 非 sequence 形态出现由约束簇定向报错。
 _FRAME_CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "annotate": ("instruction", "examples", "enabled"),
-    "generate": ("instruction", "schema_path", "schema_inline", "time_fields",
-                  "duration_s", "resources"),
+    "generate": ("instruction", "schema_path", "schema_inline"),
 }
 _FRAME_CLASS_SECTIONS = tuple(_FRAME_CLASS_SECTION_KEYS)
 
@@ -133,16 +122,10 @@ class _MergedClass:
     extract: ExtractConfig      # 合并后的摘取配置
     rubric_raw: dict | None     # [class.<name>.rubric] 原始表(R7 需要合并后的选择器)
     examples_provided: bool     # 该类是否自带 few-shot 示例(决定是否干跑)
-    schema_path: str | None     # v1.13 按类标注 Schema 的文件源
-    schema_inline: str | None   # v1.13 按类标注 Schema 的内联源
-    tiers: tuple[TierSpec, ...] | None = None
-                                # v1.15 按类档位表; None = 未声明(回落全局表)
-    frame_rules: tuple[Any, ...] | None = None
-                                # v1.17 按类 frame_rules; None = 继承全局, 空元组 = 清空
-    frame_windows: tuple[Any, ...] | None = None
-                                # v1.17 按类 frame_windows; 三态同 frame_rules
-    sequence_rules: tuple[Any, ...] | None = None
-                                # v1.17 按类 sequence_rules; 三态整表
+    schema_path: str | None     # 按类标注 Schema 的文件源
+    schema_inline: str | None   # 按类标注 Schema 的内联源
+    description: str            # v1.18 sequence class 描述
+    sequence_generation: SequenceClassGenerationConfig | None  # declared 世界配置
 
 
 @dataclass
@@ -179,6 +162,7 @@ class _FrameViewCtx:
     classify: FrameClassifyConfig      # [frame.classify] 节(承载帧类表)
     annotate: FrameAnnotateConfig      # [frame.annotate] 节(作为覆盖基线)
     class_raw: Any                     # [frame.class.<name>.*] 原始节
+    sequence: bool = False             # v1.18 sequence registry 是否生效
     validator: Any = None              # 帧级 Schema 校验器; None = 跳过干跑
     schema_key: str = ""               # 帧级 Schema 的源键名
     schema_alive: bool = True          # 帧级 Schema 的 $ref 解析兜底是否仍未触发
@@ -197,6 +181,11 @@ def _check_class_whitelist(col: _Collector, file: str, cname: str,
     @param sections 该类的原始覆盖节字典
     """
     for sect, sub in sections.items():
+        if sect == "description":
+            if not isinstance(sub, str) or not sub.strip():
+                col.error(f"{file}:[class.{cname}].description: expected non-empty string, "
+                          f"got {_fmt(sub)}")
+            continue
         if sect not in _CLASS_SECTIONS:
             col.error(f"{file}:[class.{cname}.{sect}]: section is not in the [class.*] "
                       f"override whitelist (available: {_avail(_CLASS_SECTIONS)})")
@@ -207,14 +196,13 @@ def _check_class_whitelist(col: _Collector, file: str, cname: str,
         if sect == "rubric":
             continue   # 结构由 _resolve_rubric 校验(与全局 [rubric] 同款)
         allowed = _CLASS_SECTION_KEYS[sect]
-        directed = {"sequences": "[[generate.stream.quotas]]",
-                    "rules": f"[[class.{cname}.generate.frame_rules]]",
-                    "windows": f"[[class.{cname}.generate.frame_windows]]"}
+        deleted = {"sequences", "len_range", "tiers", "frame_rules", "frame_windows",
+                   "sequence_rules", "rules", "windows"}
         for k in sub:
             if k not in allowed:
-                if sect == "generate" and k in directed:
+                if sect == "generate" and k in deleted:
                     col.error(f"{file}:[class.{cname}.generate].{k}: this key was "
-                              f"removed in v1.17 - use {directed[k]} instead (rule 62)")
+                              f"deleted (generation_config_invalid)")
                     continue
                 col.error(f"{file}:[class.{cname}.{sect}].{k}: [class.*.{sect}] cannot "
                           f"override this key (whitelist: {_avail(allowed)})")
@@ -250,7 +238,7 @@ def _merge_class_sections(col: _Collector, file: str, cname: str, sections: dict
     quality = _merge_class_quality(col, file, cname, _sect("quality"), bases.quality)
     annotate, examples_provided, schema_path, schema_inline = _merge_class_annotate(
         col, file, cname, _sect("annotate"), bases.annotate)
-    generate, tiers, frame_rules, frame_windows, sequence_rules = _merge_class_generate(
+    generate, sequence_generation = _merge_class_generate(
         col, file, cname, _sect("generate"), bases.generate)
     return _MergedClass(
         quality=quality, annotate=annotate, generate=generate,
@@ -259,16 +247,17 @@ def _merge_class_sections(col: _Collector, file: str, cname: str, sections: dict
         rubric_raw=(sections.get("rubric")
                     if isinstance(sections.get("rubric"), dict) else None),
         examples_provided=examples_provided,
-        schema_path=schema_path, schema_inline=schema_inline, tiers=tiers,
-        frame_rules=frame_rules, frame_windows=frame_windows,
-        sequence_rules=sequence_rules,
+        schema_path=schema_path, schema_inline=schema_inline,
+        description=(sections.get("description", "")
+                     if isinstance(sections.get("description", ""), str) else ""),
+        sequence_generation=sequence_generation,
     )
 
 
 def _merge_class_annotate(col: _Collector, file: str, cname: str, a_over: dict,
                           base: AnnotateConfig) -> tuple[AnnotateConfig, bool,
                                                          str | None, str | None]:
-    """``[class.<name>.annotate]`` 的合并, 外加 v1.13 按类标注 Schema 的两个源键取值。
+    """合并 ``[class.<name>.annotate]`` 并读取按类 Schema 的两个源键。
 
     Schema 的装载与元校验由视图物化侧的 ``_load_class_schema`` 统一执行(干跑要与全局
     hook 一起做), 此处只取值。
@@ -352,24 +341,126 @@ def _check_class_selection_group(col: _Collector, file: str, cname: str, q_over:
                  f'selection = "top_ratio"')
 
 
-def _merge_class_generate(col: _Collector, file: str, cname: str, g_over: dict,
-                          base: GenerateConfig,
-                          ) -> tuple[GenerateConfig, tuple[TierSpec, ...] | None,
-                                     tuple[Any, ...] | None,
-                                     tuple[Any, ...] | None,
-                                     tuple[Any, ...] | None]:
-    """``[class.<name>.generate]`` 的合并(按键溯源)。
+def _catalog_row_ok(row: object, state_schema: dict) -> bool:
+    """检查 catalog 行的固定 ScenarioSeed 外壳与初始状态。
 
-    v1.15(裁决·载体 ClassView 顶层字段): 第七键 ``tiers`` 与其余六键分道——它**不落**
-    ``GenerateConfig``(否则纯档位覆盖会被编排器误判为"估算失真型按类覆盖"), 而是随
-    返回值另交给视图物化侧挂在 ``ClassView.tiers`` 上。
+    @param row 待检查 JSON 值
+    @param state_schema 类状态 Schema
+    @return 是否满足固定外壳
+    """
+    if not isinstance(row, dict):
+        return False
+    if set(row) != {"initial_state", "actors", "shared_facts", "style", "time_context"}:
+        return False
+    actors = row.get("actors")
+    facts = row.get("shared_facts")
+    actor_ok = isinstance(actors, dict) and 1 <= len(actors) <= 8
+    actor_ok = actor_ok and all(
+        isinstance(value, dict) and set(value) == {"goal", "identity", "style"}
+        and all(isinstance(value[key], dict) for key in ("goal", "identity", "style"))
+        for value in actors.values()
+    )
+    fact_ok = isinstance(facts, dict) and set(facts) == {"public", "hidden"}
+    fact_ok = fact_ok and all(isinstance(facts[key], dict) for key in ("public", "hidden"))
+    shell_ok = actor_ok and fact_ok and isinstance(row.get("style"), dict)
+    shell_ok = shell_ok and isinstance(row.get("time_context"), dict)
+    return shell_ok and not tuple(Draft202012Validator(state_schema).iter_errors(row["initial_state"]))
+
+
+def _read_catalog(col: _Collector, file: str, cname: str, path: str,
+                  state_schema: dict) -> tuple[dict, ...]:
+    """读取并完整校验一份 class-level ScenarioSeed JSONL。
 
     @param col 错误聚合器
-    @param file 报错定位用的 project.toml 路径字符串
-    @param cname 序列类名
-    @param g_over 该类的 generate 覆盖表
-    @param base 全局生成基线
-    @return (合并后的生成配置, 按类档位表, 按类规则表, 按类窗口表)
+    @param file project.toml 定位字符串
+    @param cname sequence class 名
+    @param path catalog 绝对路径
+    @param state_schema 初始状态 Schema
+    @return 合法 catalog 行
+    """
+    rows: list[dict] = []
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        col.error(f"{file}:[class.{cname}.generate].initial_state_catalog_path: "
+                  f"cannot read catalog: {error}")
+        return ()
+    for index, line in enumerate(lines, 1):
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            col.error(f"{file}:[class.{cname}.generate].initial_state_catalog_path[{index}]: "
+                      f"invalid JSON: {error}")
+            continue
+        size = len(json.dumps(row, ensure_ascii=False, sort_keys=True,
+                              separators=(",", ":")).encode("utf-8"))
+        if size > 65536 or not _catalog_row_ok(row, state_schema):
+            col.error(f"{file}:[class.{cname}.generate].initial_state_catalog_path[{index}]: "
+                      "invalid ScenarioSeed catalog row")
+            continue
+        rows.append(row)
+    return tuple(rows)
+
+
+def _sequence_class_generation(col: _Collector, file: str, cname: str,
+                               raw: dict) -> SequenceClassGenerationConfig | None:
+    """解析一个 declared class 的世界生成面。
+
+    @param col 错误聚合器
+    @param file project.toml 定位字符串
+    @param cname sequence class 名
+    @param raw class generate 表
+    @return 冻结类生成配置；未声明时为 None
+    """
+    owned = {"state_schema_path", "initial_state_source", "initial_state_catalog_path"}
+    if not any(key in raw for key in owned):
+        return None
+    instruction = raw.get("instruction")
+    if not isinstance(instruction, str) or not instruction.strip():
+        col.error(f"{file}:[class.{cname}.generate].instruction: expected non-empty string")
+        instruction = ""
+    root = Path(file).resolve().parent
+    request = _GenerationSchemaRequest(
+        file=file, section=f"class.{cname}.generate.state",
+        path=raw.get("state_schema_path"), inline=None,
+        project_root=root, max_bytes=65536,
+    )
+    schema = _load_generation_schema(col, request)
+    if schema is None:
+        schema = {"type": "object"}
+    source = raw.get("initial_state_source")
+    if source not in ("llm", "catalog"):
+        col.error(f"{file}:[class.{cname}.generate].initial_state_source: "
+                  f"expected llm | catalog, got {_fmt(source)}")
+        source = "llm"
+    path_value = raw.get("initial_state_catalog_path")
+    catalog_path = None
+    catalog: tuple[dict, ...] = ()
+    if source == "catalog":
+        if not isinstance(path_value, str) or not path_value.strip():
+            col.error(f"{file}:[class.{cname}.generate].initial_state_catalog_path: "
+                      "required for catalog source")
+        else:
+            candidate = Path(path_value)
+            catalog_path = str(candidate if candidate.is_absolute() else root / candidate)
+            catalog = _read_catalog(col, file, cname, catalog_path, dict(schema))
+    elif path_value is not None:
+        col.error(f"{file}:[class.{cname}.generate].initial_state_catalog_path: "
+                  "forbidden for llm source")
+    return SequenceClassGenerationConfig(instruction, schema, source, catalog_path, catalog)
+
+
+def _merge_class_generate(col: _Collector, file: str, cname: str, g_over: dict,
+                          base: GenerateConfig,
+                          ) -> tuple[GenerateConfig, SequenceClassGenerationConfig | None]:
+    """合并 generic generate 覆盖并解析独立 sequence class 载体。
+
+    @param col 错误聚合器
+    @param file project.toml 定位字符串
+    @param cname sequence class 名
+    @param g_over class generate 表
+    @param base 通用 generate 基线
+    @return 通用合并配置与独立 sequence 载体
     """
     t = _Tbl(col, file, f"[class.{cname}.generate]", g_over)
     merged = replace(
@@ -379,30 +470,8 @@ def _merge_class_generate(col: _Collector, file: str, cname: str, g_over: dict,
                 if "styles" in g_over else base.styles),
         num_per_record=t.get_int("num_per_record", base.num_per_record, minimum=1),
         temperature=t.get_float("temperature", base.temperature, bound=_GE0),
-        len_range=_int_pair(t, "len_range", base.len_range),
     )
-    tiers = frame_rules = frame_windows = sequence_rules = None
-    if "tiers" in g_over:
-        raw = t.take("tiers")
-        parsed = _parse_tiers(col, file, raw, f"[[class.{cname}.generate.tiers]]")
-        # 形状错误(键值非数组)已在解析层报出且修复动作明确(改写成数组表), 按未声明
-        # 落库——不再叠报 rule 61 的空表/锚错(同一个键一条错误一个修复动作, 互斥推论)。
-        tiers = parsed if isinstance(raw, list) else None
-    if "frame_rules" in g_over:
-        frame_rules = _parse_frame_rules(
-            col, file, t.take("frame_rules"),
-            f"[[class.{cname}.generate.frame_rules]]")
-    if "frame_windows" in g_over:
-        frame_windows = _parse_frame_windows(
-            col, file, t.take("frame_windows"),
-            f"[[class.{cname}.generate.frame_windows]]")
-    if "sequence_rules" in g_over:
-        sequence_rules = _parse_sequence_rules(
-            col, file, t.take("sequence_rules"),
-            f"[[class.{cname}.generate.sequence_rules]]")
-    return merged, tiers, frame_rules, frame_windows, sequence_rules
-
-
+    return merged, _sequence_class_generation(col, file, cname, g_over)
 def _merge_class_verify(col: _Collector, file: str, cname: str, v_over: dict,
                         base: VerifyConfig) -> VerifyConfig:
     """``[class.<name>.verify]`` 的合并(白名单仅 extra_criteria)。
@@ -437,7 +506,7 @@ def _merge_class_extract(col: _Collector, file: str, cname: str, e_over: dict,
 
 
 def _inherit_class(bases: _ClassBases) -> _MergedClass:
-    """零覆盖的类: 全盘继承全局基线(v1.15: 档位表得 None ⇒ 回落全局表)。
+    """零覆盖的类全盘继承通用全局基线。
 
     @param bases 各节全局基线
     @return ``_MergedClass``
@@ -446,8 +515,8 @@ def _inherit_class(bases: _ClassBases) -> _MergedClass:
                         generate=bases.generate, verify=bases.verify,
                         extract=bases.extract, rubric_raw=None,
                         examples_provided=False, schema_path=None,
-                        schema_inline=None, tiers=None, frame_rules=None,
-                        frame_windows=None, sequence_rules=None)
+                        schema_inline=None, description="",
+                        sequence_generation=None)
 
 
 def _class_sections(col: _Collector, file: str, cname: str, class_raw: Any) -> dict | None:
@@ -522,8 +591,7 @@ def _dryrun_class_examples(col: _Collector, cname: str, merged: _MergedClass,
                            schema_c: dict | None, inputs: _ViewInputs) -> None:
     """few-shot 干跑: 过**类有效 Schema** + 全局 hook。
 
-    v1.13 修正——此前恒过全局 Schema, 类自带 Schema 时会误判。类自带 Schema 时, 继承
-    来的全局示例也要按类 Schema 复跑一遍(运行期就是按类 Schema 发出去的)。
+    类自带 Schema 时，继承的全局示例也按类 Schema 复跑一遍。
 
     @param col 错误聚合器
     @param cname 序列类名
@@ -567,8 +635,16 @@ def _build_class_views(col: _Collector, classify: ClassifyConfig, class_raw: Any
     global_key = "[[rubric.criteria]]" if inputs.rubric_is_inline else inputs.selector
     pointwise_checked: set[str] = (
         {global_key} if inputs.bases.quality.mode == "pointwise" else set())
-    for cspec in classify.classes:
-        cname = cspec.name
+    specs = {item.name: item for item in classify.classes}
+    names = list(specs)
+    if inputs.bases.generate.form == "sequence" and isinstance(class_raw, dict):
+        for raw_name in class_raw:
+            if not isinstance(raw_name, str) or not _KEY_RE.fullmatch(raw_name):
+                col.error(f"{inputs.file}:[class.{raw_name}]: expected name matching [a-z0-9_]+")
+                continue
+            if raw_name not in names:
+                names.append(raw_name)
+    for cname in names:
         sections = _class_sections(col, inputs.file, cname, class_raw)
         merged = (_merge_class_sections(col, inputs.file, cname, sections, inputs.bases)
                   if sections else _inherit_class(inputs.bases))
@@ -580,18 +656,18 @@ def _build_class_views(col: _Collector, classify: ClassifyConfig, class_raw: Any
             _check_pointwise_rubric(col, _RubricSite(file=inputs.file, selector=rkey,
                                                      modality=inputs.modality, scope=rscope),
                                     rubric_c, inline_c)
-        # v1.13(裁决·按类标注 Schema): 装载该类的标注 Schema(覆盖语义, 未声明 =
-        # None = 回落全局 output.schema)。
+        # 装载该类的标注 Schema；未声明时回落全局 output.schema。
         schema_c = _load_class_schema(col, inputs.file, cname, merged.schema_path,
                                       merged.schema_inline)
         _dryrun_class_examples(col, cname, merged, schema_c, inputs)
         views[cname] = ClassView(name=cname, quality=merged.quality, rubric=rubric_c,
                                  annotate=merged.annotate, generate=merged.generate,
                                  verify=merged.verify, extract=merged.extract,
-                                 schema=schema_c, tiers=merged.tiers,
-                                 frame_rules=merged.frame_rules,
-                                 frame_windows=merged.frame_windows,
-                                 sequence_rules=merged.sequence_rules)
+                                 schema=schema_c,
+                                 description=(merged.description
+                                              or specs.get(cname).description
+                                              if cname in specs else merged.description),
+                                 sequence_generation=merged.sequence_generation)
     return views
 
 
@@ -608,6 +684,11 @@ def _check_frame_class_whitelist(col: _Collector, file: str, cname: str,
     @param sections 该帧类的原始覆盖节字典
     """
     for sect, sub in sections.items():
+        if sect == "description":
+            if not isinstance(sub, str) or not sub.strip():
+                col.error(f"{file}:[frame.class.{cname}].description: "
+                          f"expected non-empty string, got {_fmt(sub)}")
+            continue
         if sect not in _FRAME_CLASS_SECTIONS:
             col.error(f"{file}:[frame.class.{cname}.{sect}]: section is not in the "
                       f"[frame.class.*] override whitelist "
@@ -619,6 +700,10 @@ def _check_frame_class_whitelist(col: _Collector, file: str, cname: str,
         allowed = _FRAME_CLASS_SECTION_KEYS[sect]
         for k in sub:
             if k not in allowed:
+                if sect == "generate" and k in {"time_fields", "duration_s", "resources"}:
+                    col.error(f"{file}:[frame.class.{cname}.generate].{k}: "
+                              "generation_config_invalid: deleted sequence key")
+                    continue
                 col.error(f"{file}:[frame.class.{cname}.{sect}].{k}: "
                           f"[frame.class.*.{sect}] cannot override this key "
                           f"(whitelist: {_avail(allowed)})")
@@ -626,13 +711,11 @@ def _check_frame_class_whitelist(col: _Collector, file: str, cname: str,
 
 def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
                        base: FrameAnnotateConfig) -> tuple[FrameClassView, bool]:
-    """v1.12: 把一个帧类的覆盖节合并到全局 ``[frame.annotate]``。
+    """把一个帧类的覆盖节合并到全局 ``[frame.annotate]``。
 
     (SPEC-frame-annotation §3.1「帧类覆盖」行; R25 家族。)按键溯源: 类提供的键覆盖
     全局值, 其余继承; ``enabled`` 缺省 true(= 该类照常标注; false = 跳过该类成员的帧
-    标注, 省成本面)。v1.13: 同时物化该帧类的生成面(``[frame.class.<name>.generate]``
-    四键白名单)——时间流生成形态的帧内容契约。v1.14: 生成面第四键 ``time_fields``
-    (时间语义字段绑定表)在此并入视图。
+    标注, 省成本面)。sequence 形态同时物化帧类的生成指令与完整 Schema。
 
     @param col 错误聚合器
     @param file 报错定位用的 project.toml 路径字符串
@@ -647,19 +730,16 @@ def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
     t = _Tbl(col, file, f"[frame.class.{cname}.annotate]", a_over)
     examples_provided = "examples" in a_over
     gen_instruction, gen_schema = _load_frame_gen(col, file, cname, sections)
-    duration_us, resources = _parse_duration_resources(
-        col, file, cname, sections.get("generate"))
     view = FrameClassView(
         instruction=t.get_str("instruction", base.instruction, nonempty=True),
         examples=(_parse_examples(col, file, t.take("examples"),
                                   section=f"frame.class.{cname}.annotate")
                   if examples_provided else base.examples),
         enabled=t.get_bool("enabled", True),
+        description=(sections.get("description", "")
+                     if isinstance(sections.get("description", ""), str) else ""),
         gen_instruction=gen_instruction,
         gen_schema=gen_schema,
-        time_fields=_parse_time_fields(col, file, cname, sections.get("generate")),
-        duration_us=duration_us,
-        resources=resources,
     )
     return view, examples_provided
 
@@ -672,30 +752,42 @@ def _build_frame_class_views(col: _Collector,
     @param ctx 帧类视图上下文(``schema_alive`` 就地更新)
     @return 帧类名 → ``FrameClassView``
     """
-    names = tuple(c.name for c in ctx.classify.classes)
+    names = [c.name for c in ctx.classify.classes]
+    if ctx.sequence and isinstance(ctx.class_raw, dict):
+        for raw_name in ctx.class_raw:
+            if not isinstance(raw_name, str) or not _KEY_RE.fullmatch(raw_name):
+                col.error(f"{ctx.file}:[frame.class.{raw_name}]: "
+                          "expected name matching [a-z0-9_]+")
+                continue
+            if raw_name not in names:
+                names.append(raw_name)
     if isinstance(ctx.class_raw, dict):
         for cname in ctx.class_raw:
-            if cname not in names:
+            if cname not in names and not ctx.sequence:
                 col.error(f"{ctx.file}:[frame.class.{cname}]: class name {_fmt(cname)} is "
                           f"not in [[frame.classify.classes]], available: {_avail(names)}")
     views: dict[str, FrameClassView] = {}
-    for cspec in ctx.classify.classes:
-        sections = (ctx.class_raw.get(cspec.name)
+    descriptions = {item.name: item.description for item in ctx.classify.classes}
+    for cname in names:
+        sections = (ctx.class_raw.get(cname)
                     if isinstance(ctx.class_raw, dict) else None)
         if sections is not None and not isinstance(sections, dict):
-            col.error(f"{ctx.file}:[frame.class.{cspec.name}]: expected table, "
+            col.error(f"{ctx.file}:[frame.class.{cname}]: expected table, "
                       f"got {_fmt(sections)}")
             sections = None
         if sections:
-            view, examples_provided = _merge_frame_class(col, ctx.file, cspec.name,
+            view, examples_provided = _merge_frame_class(col, ctx.file, cname,
                                                          sections, ctx.annotate)
         else:
             view = FrameClassView(instruction=ctx.annotate.instruction,
-                                  examples=ctx.annotate.examples, enabled=True)
+                                  examples=ctx.annotate.examples, enabled=True,
+                                  description=descriptions.get(cname, ""))
             examples_provided = False
         if examples_provided and view.examples:
-            _dryrun_frame_examples(col, cspec.name, view, ctx)
-        views[cspec.name] = view
+            _dryrun_frame_examples(col, cname, view, ctx)
+        if not view.description and cname in descriptions:
+            view = replace(view, description=descriptions[cname])
+        views[cname] = view
     return views
 
 

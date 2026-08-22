@@ -34,6 +34,7 @@ from typing import Any, Iterator, Literal, Mapping
 from labelkit.common.config.model import ResolvedConfig, StreamConfig
 from labelkit.common.errors import InputError
 from labelkit.common.contracts.types import ImageRef, Record, RecordRef, UINode, UITree
+from labelkit.operators.generation.project import derive_generation_id
 
 __all__ = ["IngestPlan", "IngestReport", "Ingestor", "Session"]
 
@@ -63,6 +64,31 @@ _VISIBLE_KEYS = ("visible", "visible_to_user")
 _BOUNDS_STR_RE = re.compile(
     r"^\s*\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]\s*\[\s*(-?\d+)\s*,\s*(-?\d+)\s*\]\s*$"
 )
+_GENERATION_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+_GENERATION_TIMESTAMP_RE = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}[+-]\d{2}:\d{2}$"
+)
+_PRIMARY_EVENT_FIELDS = frozenset({
+    "event_id", "event_key", "owner_sequence_id", "role", "frame_class",
+    "actor", "logical_time_us", "timestamp",
+})
+_REPLAY_EVENT_FIELDS = frozenset({
+    *_PRIMARY_EVENT_FIELDS, "replay_sequence_id", "replay_ordinal",
+    "duplicate_of_sequence_id", "duplicate_of_event_id",
+})
+_NOISE_EVENT_FIELDS = frozenset({*_PRIMARY_EVENT_FIELDS, "noise"})
+_PRIMARY_META_FIELDS = (
+    frozenset({"event", "generation", "classification"}),
+    frozenset({"event", "generation", "classification", "annotation"}),
+)
+_DECLARED_GENERATION_FIELDS = frozenset({
+    "validation_mode", "actor_knowledge_validation", "scenario_set", "scenario_index",
+    "scenario_id", "world_branch_id", "sequence_class", "pattern", "variant",
+})
+_INSTRUCTION_GENERATION_FIELDS = frozenset({
+    "validation_mode", "actor_knowledge_validation", "instruction_slot", "scenario_index",
+    "scenario_id", "world_branch_id", "sequence_class",
+})
 
 
 def _canonical_json(obj: Any) -> str:
@@ -81,6 +107,21 @@ def _text_record_id(raw: Mapping) -> str:
     @return 确定性记录 id
     """
     return hashlib.sha256(_canonical_json(raw).encode("utf-8")).hexdigest()[:16]
+
+
+def _generation_timestamp_us(value: object) -> int:
+    """严格解析生成工件的带 offset 六位微秒时间戳。
+
+    @param value `_meta.event.timestamp`。
+    @return UTC epoch 微秒。
+    @raises ValueError 格式不符合冻结工件时间。
+    """
+    if not isinstance(value, str) or _GENERATION_TIMESTAMP_RE.fullmatch(value) is None:
+        raise ValueError("invalid artifact timestamp")
+    parsed = datetime.fromisoformat(value).astimezone(timezone.utc)
+    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
+    delta = parsed - epoch
+    return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
 
 
 def _extract_text_field(obj: Mapping, dotted_path: str) -> str | None:
@@ -231,6 +272,17 @@ class _UIScan:
     pairs: tuple[tuple[int, str, str], ...]            # 命中配对，按 index 升序
     conflicts: tuple[tuple[int, tuple[str, ...]], ...]  # (index, 冲突文件组)，按 index 升序
     missing: tuple[tuple[int, str, str], ...]           # (index, 在场侧 "tree"|"image", 文件)
+
+
+@dataclass(frozen=True)
+class _GenerationInputRow:
+    """已解析但尚未信任身份的 generation stream 行。"""
+
+    raw: Mapping[str, object]                    # 完整 JSON object 行
+    source_file: str                             # 相对输入文件名
+    line_no: int                                 # 一基文件内行号
+    event: Mapping[str, object]                  # `_meta.event` 对象
+    timestamp_us: int                            # 严格解析后的 UTC epoch 微秒
 
 
 class _Assembler:
@@ -455,12 +507,20 @@ class Ingestor:
         @raises InputError 输入文件不可读
         """
         files = self._text_files(root)
+        generation_rows: tuple[_GenerationInputRow, ...] | None = None
+        if self._is_generation_stream(root, files):
+            try:
+                generation_rows = self._read_generation_rows(root, files, count_report=False)
+                self._validate_generation_rows(generation_rows)
+            except (KeyError, TypeError, ValueError) as exc:
+                self._generation_input_failure(str(exc))
         estimated = 0
         session_lens: tuple[int, ...] = ()
         if estimate and stream_mode:
             estimated, session_lens = self._fused_text_scan(root, files)
         elif estimate:
-            estimated = self._count_text_lines(root, files)
+            estimated = (len(generation_rows) if generation_rows is not None
+                         else self._count_text_lines(root, files))
         return IngestPlan(files=tuple(files), pairs=(), estimated_records=estimated,
                           session_lens=session_lens)
 
@@ -967,9 +1027,13 @@ class Ingestor:
         @return Record 迭代器
         @raises InputError 坏行命中 input.on_bad_line = "fail"
         """
+        files = self._text_files(root)
+        if self._is_generation_stream(root, files):
+            yield from self._generation_stream_records(root, files)
+            return
         on_bad = self._cfg.input.on_bad_line
         text_field = self._cfg.input.text_field
-        for rel in self._text_files(root):
+        for rel in files:
             path = root / rel if root.is_dir() else root
             # 二进制读 + 逐行严格解码：spec 6.1 规定 UTF-8 JSONL、3.2.1 规定原样保留
             # —— 非法字节必须成为坏行，绝不能被静默替换（errors="replace"）后当成
@@ -999,6 +1063,315 @@ class Ingestor:
                         ref=RecordRef(source_file=rel, line_no=line_no,
                                       pair_index=None, generated_from=()),
                     )
+
+    @staticmethod
+    def _is_generation_stream(root: Path, files: list[str]) -> bool:
+        """扫描全部非空行，发现任一 v1.18 envelope 即进入严格分支。
+
+        @param root 输入根。
+        @param files 字典序 JSONL 文件表。
+        @return 任一可解析行声明 `_meta.event` 时为 True。
+        """
+        for rel in files:
+            path = root / rel if root.is_dir() else root
+            with path.open("rb") as handle:
+                for line in handle:
+                    if not line.strip():
+                        continue
+                    try:
+                        raw = json.loads(line.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    meta = raw.get("_meta") if isinstance(raw, Mapping) else None
+                    if isinstance(meta, Mapping) and "event" in meta:
+                        return True
+        return False
+
+    def _generation_stream_records(
+        self,
+        root: Path,
+        files: list[str],
+    ) -> Iterator[Record]:
+        """先完整验证自包含 provenance，再产出 generation stream Records。
+
+        @param root 输入根。
+        @param files 字典序 JSONL 文件表。
+        @return 验证通过的 Record 迭代器。
+        """
+        try:
+            rows = self._read_generation_rows(root, files, count_report=True)
+            self._validate_generation_rows(rows)
+        except (KeyError, TypeError, ValueError) as exc:
+            self._generation_input_failure(str(exc))
+        for row in rows:
+            self._report.ingested += 1
+            yield Record(
+                id=str(row.event["event_id"]),
+                modality="text",
+                text=_canonical_json(row.raw["payload"]),
+                raw=row.raw,
+                ui_tree=None,
+                image=None,
+                ref=RecordRef(source_file=row.source_file, line_no=row.line_no,
+                              pair_index=None, generated_from=()),
+            )
+
+    def _read_generation_rows(
+        self,
+        root: Path,
+        files: list[str],
+        *,
+        count_report: bool,
+    ) -> tuple[_GenerationInputRow, ...]:
+        """严格读取整个 generation stream 工件。
+
+        @param root 输入根。
+        @param files 字典序 JSONL 文件表。
+        @param count_report 是否把完整验证读取计入 live ingest report。
+        @return 尚未信任身份的完整行表。
+        """
+        rows: list[_GenerationInputRow] = []
+        for rel in files:
+            path = root / rel if root.is_dir() else root
+            with path.open("rb") as handle:
+                for line_no, line in enumerate(handle, 1):
+                    if not line.strip():
+                        continue
+                    if count_report:
+                        self._report.scanned += 1
+                    raw = json.loads(line.decode("utf-8"))
+                    rows.append(self._parse_generation_row(raw, rel, line_no))
+        if not rows:
+            raise ValueError("generation stream is empty")
+        return tuple(rows)
+
+    @staticmethod
+    def _parse_generation_row(raw: object, source_file: str,
+                              line_no: int) -> _GenerationInputRow:
+        """解析一行固定 generation envelope，不接受 legacy fallback。"""
+        if not isinstance(raw, Mapping) or tuple(raw) != ("payload", "_meta"):
+            raise ValueError("generation stream row shape is invalid")
+        if not isinstance(raw["payload"], Mapping):
+            raise ValueError("generation stream payload is not an object")
+        meta = raw["_meta"]
+        event = meta.get("event") if isinstance(meta, Mapping) else None
+        if not isinstance(event, Mapping):
+            raise ValueError("generation stream event metadata is invalid")
+        timestamp_us = _generation_timestamp_us(event.get("timestamp"))
+        return _GenerationInputRow(raw, source_file, line_no, event, timestamp_us)
+
+    def _generation_input_failure(self, reason: str) -> None:
+        """记录 data-free 错误并拒绝整个 generation stream。
+
+        @param reason 固定结构错误原因。
+        @return 不返回。
+        """
+        self._report.bad_input += 1
+        _LOGGER.error("generation_input_invalid: %s", reason, extra=_LOG_EXTRA)
+        raise InputError(f"generation_input_invalid: {reason}")
+
+    @staticmethod
+    def _validate_generation_rows(rows: tuple[_GenerationInputRow, ...]) -> None:
+        """验证全局 ID 唯一性并按 primary/replay owner 闭包。"""
+        primary: dict[str, list[_GenerationInputRow]] = {}
+        replay: dict[str, list[_GenerationInputRow]] = {}
+        event_ids: set[str] = set()
+        for row in rows:
+            event_id = row.event.get("event_id")
+            if not isinstance(event_id, str) or _GENERATION_ID_RE.fullmatch(event_id) is None:
+                raise ValueError("generation event ID format is invalid")
+            if event_id in event_ids:
+                raise ValueError("generation event IDs are not globally unique")
+            event_ids.add(event_id)
+            Ingestor._classify_generation_row(row, primary, replay)
+        Ingestor._validate_primary_groups(primary)
+        for replay_id, group in replay.items():
+            Ingestor._validate_replay_group(replay_id, group, primary)
+
+    @staticmethod
+    def _classify_generation_row(row, primary, replay) -> None:
+        """把一行放入 primary/replay 组，或验证 noise 固定空身份。"""
+        event = row.event
+        owner = event.get("owner_sequence_id")
+        replay_id = event.get("replay_sequence_id")
+        if isinstance(owner, str):
+            Ingestor._validate_primary_row(row)
+            primary.setdefault(owner, []).append(row)
+            return
+        if replay_id is not None:
+            if not isinstance(replay_id, str) or _GENERATION_ID_RE.fullmatch(replay_id) is None:
+                raise ValueError("replay sequence ID format is invalid")
+            if owner is not None or event.get("noise") is not None:
+                raise ValueError("replay owner metadata is invalid")
+            Ingestor._validate_replay_shape(row)
+            replay.setdefault(replay_id, []).append(row)
+            return
+        Ingestor._validate_noise_row(row)
+
+    @staticmethod
+    def _validate_primary_row(row: _GenerationInputRow) -> None:
+        """独立重算一条 primary event ID 并验证生成分支身份。"""
+        event, meta = row.event, row.raw["_meta"]
+        if set(event) != _PRIMARY_EVENT_FIELDS or frozenset(meta) not in _PRIMARY_META_FIELDS:
+            raise ValueError("primary metadata fields are invalid")
+        generation = meta.get("generation")
+        Ingestor._validate_primary_generation(generation)
+        world = generation.get("world_branch_id") if isinstance(generation, Mapping) else None
+        event_key = event.get("event_key")
+        if not all(isinstance(value, str) and _GENERATION_ID_RE.fullmatch(value)
+                   for value in (event.get("owner_sequence_id"), world, event_key)):
+            raise ValueError("primary generation identity is invalid")
+        expected = derive_generation_id(
+            "primary_event_id", [world, event_key, row.timestamp_us, row.raw["payload"]]
+        )
+        if event.get("event_id") != expected:
+            raise ValueError("primary event ID does not match its source")
+        if event.get("noise") is not None or event.get("replay_sequence_id") is not None:
+            raise ValueError("primary event contains replay or noise identity")
+        logical = event.get("logical_time_us")
+        if (not all(isinstance(event.get(key), str) and bool(event.get(key))
+                    for key in ("role", "frame_class", "actor"))
+                or not isinstance(logical, int) or isinstance(logical, bool) or logical < 0):
+            raise ValueError("primary event semantics are invalid")
+        classification = {
+            "label": event.get("frame_class"),
+            "labels": [event.get("frame_class")],
+            "source": "inherited",
+        }
+        if meta.get("classification") != classification:
+            raise ValueError("primary classification differs from frame truth")
+
+    @staticmethod
+    def _validate_primary_generation(generation) -> None:
+        """封闭 declared 或 instruction-only primary generation truth。"""
+        if not isinstance(generation, Mapping):
+            raise ValueError("primary generation truth is invalid")
+        mode = generation.get("validation_mode")
+        expected = (_DECLARED_GENERATION_FIELDS if mode == "declared"
+                    else _INSTRUCTION_GENERATION_FIELDS if mode == "instruction_only" else None)
+        if expected is None or set(generation) != expected:
+            raise ValueError("primary generation fields are invalid")
+        knowledge = ("mechanical_and_semantic" if mode == "declared" else "semantic")
+        if generation.get("actor_knowledge_validation") != knowledge:
+            raise ValueError("primary generation validation mode is invalid")
+        ids = (generation.get("scenario_id"), generation.get("world_branch_id"))
+        index = generation.get("scenario_index")
+        if (not all(isinstance(value, str) and _GENERATION_ID_RE.fullmatch(value)
+                    for value in ids)
+                or not isinstance(index, int) or isinstance(index, bool) or index < 0
+                or not isinstance(generation.get("sequence_class"), str)
+                or not generation.get("sequence_class")):
+            raise ValueError("primary generation identity is invalid")
+        names = (("scenario_set", "pattern", "variant") if mode == "declared"
+                 else ("instruction_slot",))
+        if not all(isinstance(generation.get(key), str) and generation.get(key) for key in names):
+            raise ValueError("primary generation source is invalid")
+
+    @staticmethod
+    def _validate_noise_row(row: _GenerationInputRow) -> None:
+        """封闭 noise event、meta 与空身份。"""
+        event, meta = row.event, row.raw["_meta"]
+        if set(meta) != {"event", "generation"} or set(event) != _NOISE_EVENT_FIELDS:
+            raise ValueError("noise metadata fields are invalid")
+        event_key, frame = event.get("event_key"), event.get("frame_class")
+        if (not isinstance(event_key, str) or _GENERATION_ID_RE.fullmatch(event_key) is None
+                or not isinstance(frame, str) or not frame):
+            raise ValueError("noise identity is invalid")
+        if (event.get("owner_sequence_id") is not None or event.get("noise") is not True
+                or event.get("role") is not None or event.get("actor") is not None
+                or event.get("logical_time_us") is not None or meta.get("generation") is not None):
+            raise ValueError("noise metadata is invalid")
+
+    @staticmethod
+    def _validate_replay_shape(row: _GenerationInputRow) -> None:
+        """封闭 replay event 与允许的下游元数据字段集。"""
+        meta = row.raw["_meta"]
+        if set(row.event) != _REPLAY_EVENT_FIELDS or frozenset(meta) not in _PRIMARY_META_FIELDS:
+            raise ValueError("replay metadata fields are invalid")
+
+    @staticmethod
+    def _validate_primary_groups(primary: Mapping[str, list[_GenerationInputRow]]) -> None:
+        """按工件顺序重算每个 primary owner sequence ID。"""
+        for owner, group in primary.items():
+            truths = {
+                _canonical_json(row.raw["_meta"]["generation"])
+                for row in group
+            }
+            if len(truths) != 1:
+                raise ValueError("primary owner has multiple generation truths")
+            worlds = {row.raw["_meta"]["generation"]["world_branch_id"] for row in group}
+            if len(worlds) != 1:
+                raise ValueError("primary owner has multiple world branches")
+            event_ids = [row.event["event_id"] for row in group]
+            if derive_generation_id("sequence_id", [next(iter(worlds)), event_ids]) != owner:
+                raise ValueError("primary sequence ID does not match ordered events")
+
+    @staticmethod
+    def _validate_replay_group(replay_id: str, group, primary) -> None:
+        """重算 replay sequence/event IDs 并验证逐位 source provenance。"""
+        first = group[0].event
+        source_id, ordinal = first.get("duplicate_of_sequence_id"), first.get("replay_ordinal")
+        if (not isinstance(source_id, str) or source_id not in primary
+                or not isinstance(ordinal, int) or isinstance(ordinal, bool) or ordinal < 0):
+            raise ValueError("replay source identity is invalid")
+        if derive_generation_id("replay_sequence_id", [source_id, ordinal]) != replay_id:
+            raise ValueError("replay sequence ID does not match its source")
+        sources = primary[source_id]
+        if len(group) != len(sources):
+            raise ValueError("replay event count does not match its source")
+        for row, source in zip(group, sources, strict=True):
+            Ingestor._validate_replay_row(row, source, replay_id, source_id, ordinal)
+
+    @staticmethod
+    def _validate_replay_row(row, source, replay_id: str,
+                             source_id: str, ordinal: int) -> None:
+        """验证一条 replay 的位置引用、内容副本与新生 event ID。"""
+        event, source_event = row.event, source.event
+        if (event.get("replay_sequence_id") != replay_id
+                or event.get("replay_ordinal") != ordinal
+                or event.get("duplicate_of_sequence_id") != source_id
+                or event.get("duplicate_of_event_id") != source_event.get("event_id")):
+            raise ValueError("replay positional provenance is invalid")
+        expected = derive_generation_id(
+            "replay_event_id", [replay_id, source_event["event_id"], row.timestamp_us]
+        )
+        if event.get("event_id") != expected:
+            raise ValueError("replay event ID does not match its source")
+        Ingestor._validate_replay_copy(row, source)
+        Ingestor._validate_replay_generation(row, source, source_id)
+
+    @staticmethod
+    def _validate_replay_copy(row, source) -> None:
+        """验证 replay 除身份与工件时间外逐位复制 source final row。"""
+        fields = ("event_key", "role", "frame_class", "actor", "logical_time_us")
+        if any(row.event.get(key) != source.event.get(key) for key in fields):
+            raise ValueError("replay event content differs from its source")
+        row_meta, source_meta = row.raw["_meta"], source.raw["_meta"]
+        row_other = {key: value for key, value in row_meta.items()
+                     if key not in {"event", "generation"}}
+        source_other = {key: value for key, value in source_meta.items()
+                        if key not in {"event", "generation"}}
+        if row.raw["payload"] != source.raw["payload"] or row_other != source_other:
+            raise ValueError("replay final row differs from its source")
+
+    @staticmethod
+    def _validate_replay_generation(row, source, source_id: str) -> None:
+        """验证 replay generation truth 只引用 source，不伪造 primary truth。"""
+        source_truth = source.raw["_meta"].get("generation")
+        truth = row.raw["_meta"].get("generation")
+        if not isinstance(source_truth, Mapping) or not isinstance(truth, Mapping):
+            raise ValueError("replay generation provenance is invalid")
+        expected = {
+            "validation_mode": "replay",
+            "source_validation_mode": source_truth.get("validation_mode"),
+            "sequence_class": source_truth.get("sequence_class"),
+            "scenario_id": source_truth.get("scenario_id"),
+            "source_pattern": source_truth.get("pattern"),
+            "source_variant": source_truth.get("variant"),
+            "duplicate_of_sequence_id": source_id,
+        }
+        if dict(truth) != expected:
+            raise ValueError("replay generation provenance does not match its source")
 
     # ── UI 模态：扫描与配对（spec 3.2.4）────────────────────────────────────
 

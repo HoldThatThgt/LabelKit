@@ -1,0 +1,66 @@
+schema_version = 1
+
+[run]
+input = "./out/sequence-labels.stream.jsonl"
+output = "./out/replay-labels.jsonl"
+modality = "text"
+mode = "process"
+batch_size = 32
+seed = 20260822
+
+[input]
+text_field = "payload"
+on_bad_line = "fail"
+
+[stream]
+order_by = "meta:_meta.event.timestamp"
+on_disorder = "fail"
+gap_s = 3600
+session_max_len = 16
+session_max_span_s = 3600
+
+[segment]
+enabled = true
+strategy = "llm"
+llm = "default"
+window = 16
+digest_max_chars = 600
+noise_filter = true
+min_len = 2
+context = """
+输入是订票对话时间流。把围绕同一个 request_id 的请求、受理与结果归为一个 episode；
+同一会话中出现两个不同请求时在请求切换处切段。纯闲聊且没有可执行诉求的帧是 noise。
+"""
+on_error = "fail"
+
+[dedup]
+enabled = true
+scope = "global"
+minhash_threshold = 0.85
+minhash_num_perm = 128
+ngram = 5
+
+[classify]
+enabled = false
+
+[quality]
+enabled = false
+
+[annotate]
+enabled = true
+llm = "default"
+instruction = """
+阅读完整订票序列，标注统一的业务意图、最终结果、请求编号、票号与一句简洁摘要。
+"""
+
+[verify]
+enabled = false
+
+[generate]
+enabled = false
+
+[output]
+schema_path = "schemas/annotation.json"
+validator = "hooks.py:validate_output"
+meta_mode = "inline"
+rejects = "refs"

@@ -8,6 +8,7 @@ from labelkit.common.errors import (
     EXIT_STRICT,
     CircuitBreakerTripped,
     ConfigError,
+    DeliveryError,
     ErrorKind,
     InputError,
     InternalError,
@@ -23,6 +24,7 @@ def test_all_canonical_exceptions_share_labelkit_error_base():
         issubclass(error_type, LabelKitError)
         for error_type in (
             ConfigError,
+            DeliveryError,
             InputError,
             ProviderRetryableError,
             ProviderFatalError,
@@ -79,6 +81,13 @@ def test_plain_errors_keep_standard_exception_string_behavior():
     assert str(CircuitBreakerTripped("breaker open")) == "breaker open"
 
 
+def test_delivery_error_exposes_only_fixed_identity_fields():
+    exc = DeliveryError("post_validator_invalid", "set-a:000001", 3)
+    assert (exc.kind, exc.slot_key, exc.attempts_used) == (
+        "post_validator_invalid", "set-a:000001", 3)
+    assert str(exc) == "post_validator_invalid: slot=set-a:000001 attempts=3"
+
+
 def test_error_kind_values_are_the_frozen_wire_codes():
     assert {member.name: member.value for member in ErrorKind} == {
         "BAD_INPUT_LINE": "bad_input_line",
@@ -97,5 +106,17 @@ def test_error_kind_values_are_the_frozen_wire_codes():
         "PROVIDER_FATAL": "provider_fatal",
         "CONTEXT_OVERFLOW": "context_overflow",        # v1.11 (V16/V24)
         "OUTPUT_TRUNCATED": "output_truncated",        # v1.11 (V11)
+        "GENERATION_CONFIG_INVALID": "generation_config_invalid",
+        "GENERATION_PLAN_INFEASIBLE": "generation_plan_infeasible",
+        "GENERATION_PLAN_BUDGET": "generation_plan_budget",
+        "GENERATION_PLAN_INTERNAL": "generation_plan_internal",
+        "GENERATION_DEDUP_TRANSACTION": "generation_dedup_transaction",
+        "GENERATION_DOWNSTREAM_CONTRACT": "generation_downstream_contract",
+        "POST_VALIDATOR_INVALID": "post_validator_invalid",
+        "POST_VALIDATOR_EXCEPTION": "post_validator_exception",
+        "SEQUENCE_DELIVERY_EXHAUSTED": "sequence_delivery_exhausted",
+        "SEQUENCE_PROJECTION_MISMATCH": "sequence_projection_mismatch",
+        "GENERATION_COMMIT_IO": "generation_commit_io",
+        "GENERATION_FAILED_REPORT_IO": "generation_failed_report_io",
         "INTERNAL_ERROR": "internal_error",
     }

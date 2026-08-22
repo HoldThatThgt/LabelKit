@@ -2,15 +2,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Literal, Mapping, Sequence
+from typing import TYPE_CHECKING, Literal, Mapping
+
+from labelkit.common.config.generation import (
+    SequenceClassGenerationConfig,
+    SequenceGenerationConfig,
+)
 
 if TYPE_CHECKING:
-    # 仅类型检查期导入——运行期禁止：scenario 包的 __init__ → quota.py 会反向导入
-    # 本模块的 apportion_tiers，config.model 顶层 import scenario 即成环（探针实测）。
-    # spec 对象的运行期构造落在 _sections（解析层）与 _generate_stream_constraints
-    # （ScenarioConfig 装配层），两侧经「先 config.model 后 scenario」的导入序天然安全。
     from labelkit.common.extensions.hooks import ValidationHooks
-    from labelkit.common.runtime.scenario.model import ScenarioPlan
 
 
 # ── config.toml 侧 ─────────────────────────────────────────────────────────
@@ -174,9 +174,8 @@ class DedupConfig:
 class StreamConfig:
     """v1.8（spec 5.2 [stream]）：输入侧排序 + 会话切分声明，由 M2 消费。
 
-    segment.enabled=false 时声明本节 → 一条 no-op 警告。v1.13 起本节同时充当
-    时间流**生成侧的铺设契约**（order_by 命名工件时间戳键、gap_s 兜底会话间隔、
-    session_max_len 封顶交织）。
+    segment.enabled=false 时声明本节会产生一条 no-op 警告。sequence generation
+    不消费本节，其工件时间线只由 SequenceGenerationConfig.timeline 持有。
     """
 
     order_by: str = "input_order"                 # "input_order" | "meta:<字段>"（仅文本模态）
@@ -317,232 +316,13 @@ class GenerateStyle:
 
 
 @dataclass(frozen=True)
-class TierSpec:
-    """v1.14（裁决·档位即帧类构成）：``[[generate.stream.tiers]]`` 档位表的一项。
-
-    档位的定义**就是**该档序列的帧类构成集合——不携带质量指令、不控制帧内部语义
-    质量（那归各帧类的生成指令与温度）。
-    """
-
-    tier_rank: int                                # 档位序数（第几档的要求）：正整数、
-                                                  # 表内唯一、**每张生效表各自**连续
-                                                  # 覆盖 1..N（v1.15 裁决·rank 类内
-                                                  # 身份——按类表在场时 N 逐类可不同，
-                                                  # 跨类同 rank 无工具语义）；也是配分
-                                                  # 平票与类内序数分块的确定性排序
-                                                  # 依据。工具**不赋予**序数高低任何
-                                                  # 质量方向语义（方向归用户）
-    weight: int                                   # 配额权重：整数 >= 1；类配额按整数域
-                                                  # 最大余额法在各档间零抽签配分
-                                                  # （apportion_tiers）
-    frame_classes: tuple[str, ...]                # 档位构成：该档序列**恰用**这些帧类
-                                                  # （enum 给「⊆」、contains 给「⊇」）；
-                                                  # 非空、档内互异、名 ∈ 帧类表、各档
-                                                  # 构成集合两两互异（M1 校验）
-
-
-def apportion_tiers(sequences: int, tiers: Sequence[TierSpec]) -> tuple[int, ...]:
-    """v1.14（裁决·零抽签配分）：把一个序列类的配额按权重配到各档。
-
-    整数域最大余额法（算术冻结，**禁止任何浮点中间量**——平票判定要一路喂给类内序数
-    分块 → truth → 工件字节 → 成员 id，是冻结面，不能悬在浮点比较语义上）：
-    基额 = ``(sequences × weight) // Σweight``、余额键 =
-    ``(sequences × weight) mod Σweight``，按余额键降序、平票按 ``tier_rank`` 升序逐档
-    +1，直至 Σ逐档 = sequences。是 ``(sequences, tiers)`` 的纯函数、零 rng——冻结的抽签
-    消费顺序表原文不动。落点在 common 而非 operators：M1 的逐非零配额对约束与 M6 计划
-    期共用同一实现，而分层纪律不许 common 依赖 operators（M6 反向导入）。
-
-    @param sequences 该类的序列尝试配额（>= 0；0 = 该类不参与，逐档得 0）
-    @param tiers 该类的**生效**档位表（v1.15：按类表 ?? 全局表，取自
-                 ``effective_tiers``），调用方按 ``tier_rank`` 升序传入
-                 （``GenerateStreamConfig.tiers`` / ``ClassView.tiers`` 的存放序即
-                 此序），每档 ``weight >= 1``（M1 解析期强制）
-    @return 与入参同序（即 ``tier_rank`` 升序）的逐档配额元组；空档位表返回空元组
-    """
-    if not tiers:
-        return ()
-    total_weight = sum(spec.weight for spec in tiers)
-    scaled = [sequences * spec.weight for spec in tiers]
-    quotas = [value // total_weight for value in scaled]
-    remainders = [value % total_weight for value in scaled]
-    order = sorted(range(len(tiers)),
-                   key=lambda i: (-remainders[i], tiers[i].tier_rank))
-    for i in order[:sequences - sum(quotas)]:
-        quotas[i] += 1
-    return tuple(quotas)
-
-
-def effective_tiers(class_tiers: tuple[TierSpec, ...] | None,
-                    global_tiers: tuple[TierSpec, ...]) -> tuple[TierSpec, ...]:
-    """v1.15（裁决·表级原子覆盖 + 裁决·全局表为锚）：取一个序列类的生效档位表。
-
-    表级原子覆盖——类声明了就用类的**整张表**，未声明（None）回落全局表；不做行级
-    合并（行级合并会让 rank 身份跨表漂移）。全局表为锚 ⇒ 档位面开关恒 = 全局表非空，
-    每个参与类恒有生效表。落点在 common 而非 operators：M1 约束簇、M6 计划期与 M10
-    报表装配三方共用同一实现，而分层纪律不许 common 依赖 operators（M6/M10 反向导入，
-    ``apportion_tiers`` 同款）。
-
-    @param class_tiers 该类的 ``[[class.<name>.generate.tiers]]`` 解析产物；
-                       None = 未声明（回落）；空元组 = 显式空表（M1 拒收，此处原样返回）
-    @param global_tiers 全局 ``[[generate.stream.tiers]]`` 档位表
-    @return 该类的生效档位表（按 ``tier_rank`` 升序）
-    """
-    return global_tiers if class_tiers is None else class_tiers
-
-
-def effective_frame_rules(
-        class_rules: tuple[FrameRuleSpec, ...] | None,
-        global_rules: tuple[FrameRuleSpec, ...]) -> tuple[FrameRuleSpec, ...]:
-    """v1.17 按类 frame_rules 的三态整表查找（v1.16 rules 语义原样换名）。
-
-    @param class_rules 按类声明的整张表；``None`` 表示继承，空元组表示显式清空
-    @param global_rules 全局整张规则表
-    @return 该序列类的生效规则表
-    """
-    return global_rules if class_rules is None else class_rules
-
-
-def effective_frame_windows(
-        class_windows: tuple[FrameWindowSpec, ...] | None,
-        global_windows: tuple[FrameWindowSpec, ...]) -> tuple[FrameWindowSpec, ...]:
-    """v1.17 按类 frame_windows 的三态整表查找（v1.16 windows 语义原样换名）。
-
-    @param class_windows 按类声明的整张窗口表；``None`` 表示继承，空元组表示显式清空
-    @param global_windows 全局整张窗口表
-    @return 该序列类的生效窗口表
-    """
-    return global_windows if class_windows is None else class_windows
-
-
-def effective_sequence_rules(
-        class_rules: tuple[SequenceRuleSpec, ...] | None,
-        global_rules: tuple[SequenceRuleSpec, ...]) -> tuple[SequenceRuleSpec, ...]:
-    """v1.17 按类 sequence_rules 的三态整表查找。"""
-    return global_rules if class_rules is None else class_rules
-
-
-def render_constraint_text(rules: Sequence[FrameRuleSpec],
-                           windows: Sequence[FrameWindowSpec]) -> str:
-    """把生效 frame rule 与 frame window 渲染为内容模型可读的稳定约束文本。
-
-    v1.17 落点说明（裁决记录）：``render_constraint_text`` 是 M1 静态预算预检与
-    M6 brief/realize 提示词（CONTRACTS §10.17/§10.18）共用的纯函数；分层纪律不许
-    common 依赖 operators，故与 ``apportion_tiers`` 同款落 common/config/model.py
-    （M6/M10 反向导入）。spec 载体自 v1.17 起为 scenario.model 的 µs 域
-    ``FrameRuleSpec``/``FrameWindowSpec``，秒值与墙钟文本由本函数从 µs 换算渲染。
-
-    @param rules 生效的 frame rule 序列（声明序）
-    @param windows 生效的 frame window 序列（声明序）
-    @return 稳定约束文本；无规则和窗口时返回 ``"none"``
-    """
-
-    def _seconds(us: int) -> str:
-        """微秒 → 秒文本（整数值省小数位，保持 v1.16 观感）。"""
-        value = us / 1_000_000
-        return str(int(value)) if value == int(value) else f"{value:g}"
-
-    def _clock(us: int) -> str:
-        """日内微秒偏移 → HH:MM[:SS[.ffffff]] 墙钟文本。"""
-        total, micros = divmod(us, 1_000_000)
-        hour, rest = divmod(total, 3600)
-        minute, second = divmod(rest, 60)
-        text = f"{hour:02d}:{minute:02d}"
-        if second or micros:
-            text += f":{second:02d}"
-        if micros:
-            text += f".{micros:06d}".rstrip("0")
-        return text
-
-    lines: list[str] = []
-    for rule in rules:
-        fields = [f"template={rule.template}"]
-        if rule.name:
-            fields.insert(0, f"name={rule.name}")
-        fields.extend(f"{name}={value}" for name, value in (
-            ("frame_class", rule.frame_class), ("source", rule.source),
-            ("target", rule.target), ("count", rule.count),
-        ) if value is not None)
-        if rule.time_us is not None:
-            fields.append(f"time_s=[{_seconds(rule.time_us[0])}, "
-                          f"{_seconds(rule.time_us[1])}) 秒")
-        line = "规则：" + "；".join(fields)
-        if rule.correlation is not None:
-            corr = rule.correlation
-            if rule.template in {"not_co_existence", "not_succession"}:
-                line += (f"；correlation=equal，禁止 source.{corr.source_field} 与 "
-                         f"target.{corr.target_field} 的 JSON 类型及值相同；若该 "
-                         "occurrence 对同时满足其他结构与时间条件，则该对违规")
-            else:
-                line += (f"；correlation=equal，source.{corr.source_field} 与 "
-                         f"target.{corr.target_field} 的 JSON 类型及值必须相同")
-        lines.append(line)
-    for window in windows:
-        name = f"name={window.name}；" if window.name else ""
-        of_day = ", ".join(
-            f'[{_clock(start)}, {_clock(end)})' for start, end in window.of_day_us)
-        weekdays = (None, "mon", "tue", "wed", "thu", "fri", "sat", "sun")
-        of_week = ", ".join(weekdays[index] for index in window.of_week)
-        lines.append(f"窗口：{name}frame_class={window.frame_class}；"
-                     f"of_day={of_day}；of_week={of_week}")
-    return "\n".join(lines) if lines else "none"
-
-
-@dataclass(frozen=True)
-class GenerateStreamConfig:
-    """v1.17（SPEC-SP §4.2）：generate_only 的时间流形态。
-
-    LLM 只做逐槽位 brief 与帧实现（含 noise 槽位）两类内容调用；quota 求解、session
-    布局、时间戳、noise 槽位与 duplicate 平移全部由 ``compile_scenario`` 在 M1 冻结
-    （``ResolvedConfig.scenario_plan``）。默认关；全关 ⇒ 与 v1.12 字节等价。
-    v1.16 的 ``sessions``/``ts_start``/``noise_instruction``/``rules``/``windows`` 五键
-    已删除——显式书写是定向 CONFIG_ERROR（CONTRACTS §6.3 rule 62）。
-    """
-
-    enabled: bool = False                         # 形态总开关；true ⇒ generate_only ∧ text
-                                                  # ∧ generate.enabled ∧ classify.enabled
-                                                  # ∧ stream.order_by = "meta:<字段>"
-                                                  # ∧ output.meta_mode != "none"（M1 硬合取）
-    crossed_sessions: int = 0                     # 交叉 session 数；0 ≤ v ≤ floor(target/2)；
-                                                  # 总 session 恒推导为 target − v（primary =
-                                                  # N−D、单主 = N−2D、交叉 = D；duplicate 尾
-                                                  # session 不计入）
-    noise_ratio: float = 0.0                      # 噪音帧 / 任务帧 比例，[0,1)；目标 =
-                                                  # round(比例 × planned_task_frames)
-                                                  # （ROUND_HALF_EVEN），v1.17 起为精确交付目标
-    duplicates: int = 0                           # 原样重发的序列条数（0 = 无；≤ target）；
-                                                  # source 与时间布局在 planner 前冻结、
-                                                  # 零 LLM，恒落流尾新 session
-    frame_gap_s: tuple[float, float] = (5.0, 60.0)
-                                                  # 会话内帧起点间隔的闭区间（秒）；M1 按
-                                                  # Decimal(str(·)) 闭区间量化为
-                                                  # [ceil(lo×1e6), floor(hi×1e6)] µs
-    max_attempts_per_slot: int = 3                # 每个 sequence slot 与 noise slot 的独立
-                                                  # 交付预算（≥ 1）；仅 M6 delivery 消费，
-                                                  # 不进入 ScenarioConfig（rule 63）
-    tiers: tuple[TierSpec, ...] = ()              # v1.14 档位表（[[generate.stream.tiers]]），
-                                                  # 按 tier_rank 升序存放；空元组 = 档位面
-                                                  # 整体不在场
-    schedule: ScheduleSpec | None = None          # v1.17 有限半开 schedule（µs 域冻结产物）；
-                                                  # 形态开启时必填（rule 64）
-    quotas: tuple[QuotaSpec, ...] = ()            # v1.17 成功交付 quota 表（双形态互斥）；
-                                                  # 形态开启时 ≥ 1 张且 Σtarget ≥ 1（rule 65）
-    noise_classes: tuple[NoiseClassSpec, ...] = ()    # v1.17 结构化噪音表；
-                                                  # noise_ratio > 0 ⇔ 表非空（rule 69）
-    frame_rules: tuple[FrameRuleSpec, ...] = ()   # v1.17 全局同序列规则表（v1.16 rules 换名，
-                                                  # 每条带必填自然名称 name）
-    frame_windows: tuple[FrameWindowSpec, ...] = ()   # v1.17 全局帧类日历窗口表（v1.16
-                                                  # windows 换名，每条带必填 name）
-    sequence_rules: tuple[SequenceRuleSpec, ...] = ()  # v1.17 跨 sequence 规则表
-
-
-@dataclass(frozen=True)
 class GenerateConfig:
-    """[generate] 节：M6 数据生成（默认关；三种形态共用本节）。"""
+    """M6 通用与 flat 生成面；sequence 专用状态使用独立载体。"""
 
     enabled: bool = False                         # 生成总开关
+    form: Literal["flat", "sequence"] = "flat"  # 两种互斥生成形态
     llms: tuple[str, ...] = ("default",)          # 生成档案表（可多档混合）
-    instruction: str = ""                         # enabled 时必填（v1.13：时间流形态改由
-                                                  # 各帧类的 instruction 承载任务描述）
+    instruction: str = ""                         # flat 启用时必填
     mixture: Literal["round_robin", "weighted"] = "round_robin"     # 多档案混合方式
     weights: tuple[float, ...] = ()               # mixture="weighted" 时必填；len == len(llms)
     styles: tuple[GenerateStyle, ...] = ()        # 可选风格表（逐样本轮转）
@@ -552,23 +332,9 @@ class GenerateConfig:
     seed_min_score: float | None = None           # None = 自动（取 quality.threshold，
                                                   # 否则取批内中位数）
     temperature: float = 0.9                      # 生成温度（默认高于判决路径）
-    sample_validator: str | None = None           # v1.17 钩子引用 "<python-file>:
-                                                  # <attribute-path>"：fn(text) -> list[str]，
-                                                  # 样本级过滤（相似度过滤之前，spec 3.6.2）
-    sequence_validator: str | None = None          # v1.16 起的序列级钩子；v1.17 引用
-                                                  # 统一 "<python-file>:<attribute-path>"
-    scenario_validator: str | None = None          # v1.17 场景交付钩子（SPEC-SP §4.9）：
-                                                  # fn(ScenarioValidationInput) -> list[str]，
-                                                  # candidate 拒绝后同槽位重试
+    sample_validator: str | None = None           # flat 样本过滤 hook 引用
     seed_examples: tuple[str, ...] = ()           # 仅 generate_only 的种子池形态
-    standalone_count: int | None = None           # 仅 generate_only 的无种子形态；与
-                                                  # seed_examples 互斥；v1.17 起
-                                                  # ``sequences`` 键已删除（rule 62，
-                                                  # 配额改由 [[generate.stream.quotas]] 承载）
-    len_range: tuple[int, int] = (3, 6)           # 时间流形态：单序列步数的**抽取域**
-                                                  # （1 ≤ lo ≤ hi；类覆盖照常；length 在
-                                                  # slot 构建期由 scenario.preference 流
-                                                  # 冻结为 length_target）
+    standalone_count: int | None = None           # generate_only 无种子 flat 数量
 
 
 @dataclass(frozen=True)
@@ -663,43 +429,22 @@ class Rubric:
 class ClassView:
     """v1.7：一个类的生效配置——全局各节与其 [class.<name>.*] 覆盖的合并产物
     （逐键溯源；R6 选择组语义；R7 rubric 重解析）。由 M1 在装载期冻结；
-    classify 关闭时 ResolvedConfig.class_views == {}。"""
+    classify 关闭时通常为空；v1.18 sequence registry 仍会物化。"""
 
     name: str                                     # 类名（= class_views 的键）
     quality: QualityConfig                        # 选择组已合并（R6）；其中 rubric 字段存的是
                                                   # 该类的生效选择符
     rubric: Rubric                                # 重解析产物（R7）
     annotate: AnnotateConfig                      # 该类的生效标注配置
-    generate: GenerateConfig                      # 该类的生效生成配置（含 v1.13 序列配额）
+    generate: GenerateConfig                      # 该类的生效通用/flat 生成配置
     verify: VerifyConfig                          # 该类的生效评审配置
     extract: ExtractConfig                        # v1.8（S3）：只有 `instruction` 在白名单内；
                                                   # segment 没有按类视图（它跑在 classify 之前
                                                   # ——那时标签还不存在）
-    schema: Mapping | None = None                 # v1.13（裁决·按类标注 Schema）：该类的
-                                                  # 标注输出 Schema——[class.<name>.annotate]
-                                                  # 的 schema_path/schema_inline 解析产物
-                                                  # （至多其一）；None = 回落全局
-                                                  # output.schema（覆盖语义，rubric 按类
-                                                  # 重资产先例）
-    tiers: tuple[TierSpec, ...] | None = None     # v1.15（裁决·表级原子覆盖 + 裁决·载体
-                                                  # ClassView 顶层字段）：该类的档位表
-                                                  # （[[class.<name>.generate.tiers]]），按
-                                                  # tier_rank 升序存放。None = 未声明 ⇒ 回落
-                                                  # 全局 [[generate.stream.tiers]]（生效表查
-                                                  # 找恒经 effective_tiers）；空元组 = 显式
-                                                  # 空表 ⇒ M1 拒收。**不落** GenerateConfig：
-                                                  # 档位不改变任何调用数，dry-run 的按类覆盖
-                                                  # 注记不应因它触发（裁决·note 行不因档位
-                                                  # 触发）
-    frame_rules: tuple[FrameRuleSpec, ...] | None = None
-                                                  # v1.17：按类 frame_rules（v1.16 rules
-                                                  # 整表换名）；None = 继承全局，
-                                                  # 空元组 = 显式清空
-    frame_windows: tuple[FrameWindowSpec, ...] | None = None
-                                                  # v1.17：按类 frame_windows；三态同
-                                                  # frame_rules
-    sequence_rules: tuple[SequenceRuleSpec, ...] | None = None
-                                                  # v1.17：按类 sequence_rules；三态整表
+    schema: Mapping | None = None                 # 按类标注 Schema；None 回落全局
+    description: str = ""                         # v1.18 sequence class 描述
+    sequence_generation: SequenceClassGenerationConfig | None = None
+                                                  # declared 类的世界生成配置
 
 
 # ── 帧粒度（v1.12，spec §3.1 [frame.classify]/[frame.annotate]/[frame.class.*]）──
@@ -728,13 +473,13 @@ class FrameClassifyConfig:
 
 @dataclass(frozen=True)
 class FrameAnnotateConfig:
-    """v1.12：M5 帧级逐帧标注（默认关；仅流模式）。
+    """v1.12：M5 帧级逐帧标注（默认关；流模式或 sequence 生成）。
 
     没有 self_consistency（成本 ×n 且投票键须取自帧 Schema——显式书写是定向
     CONFIG_ERROR）。
     """
 
-    enabled: bool = False                         # true ⇒ segment.enabled = true（M1 约束）
+    enabled: bool = False                         # true ⇒ segment 或 generate.form=sequence
     llm: str = "default"                          # ui ∧ enabled 时无条件入 vision 必需集
                                                   # （截图是标注主证据，镜像序列级 annotate）
     instruction: str = ""                         # 全局帧标注指令；enabled 时必填
@@ -746,27 +491,20 @@ class FrameAnnotateConfig:
 
 @dataclass(frozen=True)
 class FrameClassView:
-    """v1.12：一个帧类的生效标注配置（v1.13 起兼载该帧类的生成面）。
+    """一个帧类的生效标注配置与 v1.18 对象生成契约。
 
     全局 [frame.annotate] 与 [frame.class.<name>.annotate] 白名单三键的合并产物
-    （键 = 帧类名）；M1 装载期冻结；frame.classify 关闭时 frame_class_views == {}。
+    （键 = 帧类名）；M1 装载期冻结。process/flat 由 frame.classify 类表物化，
+    sequence 由冻结 frame 注册表物化。
     """
 
     instruction: str                              # 生效帧标注指令（类覆盖 > 全局）
     examples: tuple[FewShotExample, ...]          # 生效 few-shot（类覆盖 > 全局）
     enabled: bool                                 # false ⇒ 该类成员跳过帧标注（省成本面；
                                                   # 成员在 members[] 呈现 status="skipped"）
-    gen_instruction: str | None = None            # v1.13（裁决·帧类生成面）：该帧类的内容
-                                                  # 生成指令（[frame.class.<name>.generate]
-                                                  # .instruction）；None = 未声明——时间流
-                                                  # 生成形态下每个帧类都必填（M1 校验）
-    gen_schema: Mapping | None = None             # v1.13：该帧类的生成 Schema 解析产物
-                                                  # （至多其一的 schema_path/schema_inline）；
-                                                  # None = 纯文本帧（帧内容直取文本）
-    time_fields: Mapping[str, str] | None = None  # v1.14（裁决·绑定即剔除）：时间语义字段
-                                                  # v1.17 duration/resource 规划域
-    duration_us: tuple[int, int] | None = None
-    resources: tuple[str, ...] = ()
+    description: str = ""                         # v1.18 帧注册表描述
+    gen_instruction: str | None = None            # 完整帧渲染指令
+    gen_schema: Mapping | None = None             # 对象根 payload Schema
 
 
 # ── CLI 覆盖项与总聚合 ──────────────────────────────────────────────────────
@@ -788,7 +526,9 @@ class ResolvedPaths:
     rejects: str | None                           # "<stem>.rejects.jsonl"；通道关闭为 None
     sidecar: str | None                           # "<stem>.meta.jsonl"；非 sidecar 形态为 None
     trace: str | None                             # 追踪文件（绝对）；通道关闭为 None
-    stream_artifact: str | None                   # "<stem>.stream.jsonl"；形态关闭为 None
+    stream: str | None                            # sequence stream JSONL；形态关闭为 None
+    manifest: str | None                          # manifest-last 成功标记
+    failed_report: str | None                     # 独立且无内容的失败报告
 
 
 @dataclass(frozen=True)
@@ -829,8 +569,8 @@ class ResolvedConfig:
     output: OutputConfig                          # [output] 节
     trace: TraceConfig                            # [trace] 节
     rubric: Rubric                                # 已解析（内置包数据或 inline）
-    class_views: Mapping[str, ClassView]          # v1.7：键 = 类名；非 classify.enabled 时为 {}
-                                                  # （R23：仍然不给默认值）
+    class_views: Mapping[str, ClassView]          # 键 = 类名；process/flat 随 classify 物化，
+                                                  # sequence 随冻结 sequence class 注册表物化
     user_schema: Mapping                          # 已解析的 dict，元 Schema 预校验通过
     limit: int | None                             # CLI --limit
     strict: bool                                  # CLI --strict
@@ -847,26 +587,15 @@ class ResolvedConfig:
     frame_annotate: FrameAnnotateConfig = FrameAnnotateConfig()
                                                   # v1.12：[frame.annotate] 节
     frame_class_views: Mapping[str, FrameClassView] = field(default_factory=dict)
-                                                  # v1.12：键 = 帧类名；仅 frame.classify.enabled
-                                                  # 时物化（零覆盖类也各得一份视图，class_views 同款）
+                                                  # 键 = 帧类名；process/flat 随 frame.classify
+                                                  # 物化，sequence 随冻结 frame 注册表物化
     frame_schema: Mapping | None = None           # v1.12：帧级输出 Schema 解析产物（user_schema
                                                   # 同胞：元校验 + few-shot 干跑）；frame.annotate
                                                   # 关闭时恒 None
-    generate_stream: GenerateStreamConfig = GenerateStreamConfig()
-                                                  # v1.13：时间流生成形态（默认关 = 字节等价
-                                                  # v1.12；沿用 v1.12 帧粒度四字段的
-                                                  # 「尾部追加带默认」惯例）
+    sequence_generation: SequenceGenerationConfig | None = None
+                                                  # form=sequence 时唯一专用配置载体
     paths: ResolvedPaths | None = None
                                                   # v1.17（SPEC-SP §5.1）：全部绝对路径的
-                                                  # 冻结 parse product。带默认值是**刻意
-                                                  # 设计**——全仓直接构造 ResolvedConfig 的
-                                                  # 测试 fixture 在迁移波保持绿；生产 loader
-                                                  # 恒显式填充
+                                                  # 冻结 parse product；生产 loader 恒显式填充
     validation_hooks: "ValidationHooks | None" = None
-                                                  # v1.17（SPEC-SP §4.9）：四个校验钩子的
-                                                  # 冻结载体（M1 解析一次；report/trace/
-                                                  # digest 只允许 reference）；同上默认 None
-    scenario_plan: "ScenarioPlan | None" = None
-                                                  # v1.17：ScenarioPlan 冻结编译产物；
-                                                  # scenario 包由后续 wave 落地，此处仅
-                                                  # TYPE_CHECKING 字符串注解，不得 import
+                                                  # output/sample/state 冻结 hook 集

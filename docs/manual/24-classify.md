@@ -181,8 +181,8 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
 | 节 | 可按类覆盖 | 锁定全局（及理由） |
 |---|---|---|
 | `[class.*.quality]` | `mode`、`rounds`、`rubric`（含 `[class.*.rubric]` 内联子表）、`threshold`、`selection`、`top_ratio` | `llm` / `judges` / `both_orders` / `criteria_per_call` / `on_unscored`——LLM 绑定属部署与成本面，类间差异优先用 rubric 表达 |
-| `[class.*.annotate]` | `instruction`、`examples`、**`schema_path` / `schema_inline`**（至多其一，v1.13） | `llm` / `self_consistency` / `sc_temperature` |
-| `[class.*.generate]` | `instruction`、`styles`、`num_per_record`、`temperature`；v1.13 时间流形态另加 **`[[generate.stream.quotas]]` / `len_range`**，v1.15 再加 **`tiers`**；v1.17 配额改由 `[[generate.stream.quotas]]` 承载（`[[class.<名>.generate.tiers]]` 按类档位表，整表取代全局 `[[generate.stream.tiers]]`）；该形态下 `num_per_record` / `seeds_per_call` 反过来禁设（第 27 章 27.4） | `llms` / `mixture` / `weights` / `seeds_per_call` / `num_per_call` / `sample_validator` |
+| `[class.*.annotate]` | `instruction`、`examples`、**`schema_path` / `schema_inline`**（至多其一） | `llm` / `self_consistency` / `sc_temperature` |
+| `[class.*.generate]` | flat 的 `instruction` / `styles` / `num_per_record` / `temperature`；declared sequence 的 `instruction` / state Schema / initial-state source 与 catalog path | profile mixture 与调用级部署参数仍由运行级 `[generate]` 管理 |
 | `[class.*.verify]` | `extra_criteria` | `llm` / `judges` / `policy` / `max_repair_rounds` |
 | —— | —— | `run.*` / `input.*` / `dedup.*` / `classify.*` / `trace.*` 与 `[output]` 的其余键 **从不按类**——输出通道的形态（`meta_mode`、`rejects`、修复预算、`validator`）是运行级契约 |
 
@@ -190,8 +190,10 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
 
 1. **选择组按组合并**：threshold 和 top_ratio 本是互斥对（第 10 章）。类里显式提供 `selection` / `threshold` / `top_ratio` 任何一个，合并视图就**整组换掉**全局侧的互斥对键——所以「全局 threshold + 某类 top_ratio」是合法组合，不会误报互斥；
 2. **rubric 按类重解析**：类可以换整把尺子（`rubric = "default:ui"` 或配 `[class.X.rubric]` 内联子表）；pointwise 的 6 级量表校验跑在「类有效 mode × 类有效 rubric」的组合上。`[class.X.rubric]` 子表在场但该类 selector 不是 `"inline"` 时，子表被忽略并打 warning（与全局同一惯例）；
-3. **输出 Schema 按类重解析**（v1.13）：`[class.X.annotate].schema_path` / `schema_inline` 至多其一，语义是**整份覆盖**（不做字段级合并）；每份类 Schema 各自过 draft 2020-12 元校验与 `_meta` 禁令，落盘前 emitter 按该行类的有效 Schema 再纯校验一次。这条与全局 Schema 待遇完全相同——代码回调校验层照常生效、`resolved_at` 照常记账（第 14 章 14.5 的三 Schema 对照表）；
-4. **类 examples 启动干跑**：`[class.X.annotate.examples]` 的 output 一样要过 Schema（与 validator）校验，错误信息会精确定位到 `[[class.<类名>.annotate.examples]][N]`。v1.13 起干跑用的是**该类的有效 Schema**（类声明了就用类的），修掉了旧版「类示例统一过全局 Schema」的错配。
+3. **输出 Schema 按类重解析**：`[class.X.annotate].schema_path` / `schema_inline` 至多其一，语义是
+   **整份覆盖**；每份类 Schema 各自过元校验与 `_meta` 禁令，emitter 按该行有效 Schema 再校验；
+4. **类 examples 启动干跑**：`[class.X.annotate.examples]` 的 output 用该类的有效 Schema 和 validator 校验，
+   错误精确定位到对应示例。
 
 ## 24.5 纯打标模式：一个覆盖都不配
 
@@ -242,7 +244,11 @@ multi 模式的机制要讲清楚（本节没有真实运行样例，`examples/t
 
 三个细节：其一，`classification` 只落 `label` / `labels` / `source` 三键——判决理由和自洽采样统计不落主输出，要看去 trace（`classify.decision` 事件）；其二，`scores.pool` 与 `classification.label` 恒相等，pool 是打分池的自述，pairwise 模式下「批内相对分」从此变成「**池内**相对分」（见 24.7）；其三，本工程的输出 Schema 是全局的——类只改工艺、不改产出结构：本次真跑回流的合成样本带着种子的类标签（`source="inherited"`）、按类指令标注，但 `intent` 字段仍由标注算子从全局枚举里独立选出。
 
-**「产出结构必须全局唯一」这条在 v1.13 松开了。**`[class.<类名>.annotate]` 的白名单增加了 `schema_path` / `schema_inline`（24.4 的表与合并细则 3）：声明了就用类的、没声明的类回落全局。这解的是一类真实困境——类与类要抽的**字段集本就不同**（购票要出发地/目的地/日期，设备控制要设备/动作/位置），逼它们共用一份 Schema 只有两条烂路：写成并集（每类填一半空字段）或退化成宽松对象（等于没有结构约束）。代价是下游契约变了：**同一份主输出里不同类的行字段集可以不同**，按 `_meta.classification.label` 分流后再解析——这与 multi 扇出改变行唯一键是同级的通知事项。真实对照（两份字段集互不相同的产物行）见第 27 章 27.6。**v1.15 又给这一节添了一个「整体覆盖」成员**：`[[class.<类名>.generate.tiers]]` 按类档位表——语义与按类 Schema 同款（声明了就整表取代全局表，未声明回落），差别只在回落源必须在场（全局档位表既是回落源、又是档位面的开关）。它同样改下游读法：`tier_rank` 从此是**类内**序数，跨类不可比（第 27 章 27.4）。至于**永远不按类**的那些：`run.*` / `input.*` / `dedup.*` / `classify.*` / `trace.*` 与 `[output]` 的其余键——它们是运行级契约（一次运行只有一个输出通道、一套去重口径、一份分类器），不是「加工工艺」。
+`[class.<类名>.annotate]` 可以整份覆盖 `schema_path` / `schema_inline`：声明了就用类的，未声明回落全局。
+这适合各类字段集天然不同的任务。代价是同一主输出里不同类的字段集可以不同，下游必须先按
+`_meta.classification.label` 分流再解析。sequence form 同样复用这套 ClassView，但 sequence/frame 标签来自
+冻结计划的 inherited classification，不运行 classify stage。运行级的 `run.*`、`input.*`、`dedup.*`、
+`classify.*`、`trace.*` 与 `[output]` 其余键从不按类。
 
 **拒绝通道**每行多一个 `label` 键（真实运行产物第 1、3 行，逐字）：
 
@@ -286,7 +292,9 @@ jq -r '._meta | "\(.label)\t\(.stage)/\(.reason)"' out/text-labels.rejects.jsonl
 
 ## 24.7 调优与排障
 
-**三种 `source`，先分清谁是谁。**`"llm"` = 分拣员正常判决（含主动选中兜底类——本次真跑那条笑声进 other 就是 `source="llm"`，所以 `fallback_count=0`）；`"fallback"` = 分类输出经结构修复耗尽仍非法、被**兜底机制**塞进 `fallback_class`；`"inherited"` = generate 按类生成的样本天生带标签、回流时幂等跳过分类（零额外调用；v1.17 时间流生成的序列同理——整条链上一次分类调用都不发，所以那种工程的 `report.classify` 逐类计数**恒全零**，是预期不是失灵，第 27 章）。诊断口径：`report.classify.fallback_count` 持续偏高，说明的不是「数据难分」而是「**分类调用的输出结构不稳**」或类别表口径盖不住数据——先查 trace 的 error 事件，再审 description。
+**三种 `source`，先分清谁是谁。**`"llm"` 是正常判决，`"fallback"` 是修复耗尽后进入兜底类，
+`"inherited"` 是生成期已知标签。flat 回流样本与 sequence 的 sequence/frame truth 都可使用 inherited；
+sequence form 直接禁用 classify stage，所以报告不会伪造一次分类判决。
 
 **`classification_invalid` 的两副面孔**（对应 `classify.on_error`）：
 
@@ -315,8 +323,11 @@ jq -r '._meta | "\(.label)\t\(.stage)/\(.reason)"' out/text-labels.rejects.jsonl
 
 最后一份检查清单，开 classify 前过一遍：类别表 ≥ 2 项且 name 全小写下划线；fallback_class 在表内、description 是排他形态；边界意图要么有自己的类、要么在 instruction 里写了裁决规则；trace.channels 加了 `"classify"`（调优期必开，判决理由全靠它）；multi 的话——下游知道行唯一键变成 (`_meta.id`, `label`) 了吗？
 
-## 24.8 帧类表与序列类表：两张互相独立的表（v1.12）
+## 24.8 sequence class 与 frame class 是不同维度
 
 流模式的帧粒度（第 25 章 25.6）引入了**第二张类别表**：`[[frame.classify.classes]]`。它与本章的 `[[classify.classes]]` 形态同构（`name` 匹配 `[a-z0-9_]+`、`description` 是 LLM 能看到的全部类语义、`examples` 可选；`frame.classify.fallback_class` 同样必填且必须在表内），但两张表**互相独立、允许重名、互不约束**——`examples/mix` 的文本姊妹工程 `project-text.toml` 就各有一个 `other`：序列类表的 other 收「不属于差旅/餐饮/写作的请求序列」，帧类表的 other 收「不属于发起任务/追问/寒暄的单条请求」，同名不同表、各管各的兜底，谁也不引用谁。「帧类给什么词表」跟着数据形态走：UI 主工程 `project.toml` 的帧类表是**屏幕类型**（list_screen / detail_screen / form_screen / confirm_screen / transition / other——序列类是任务类型 food_delivery / hotel_booking），文本姊妹的帧类表是**请求角色**（task_request / followup / chitchat / other）。判断一个标签属于哪张表看它挂在哪：序列类落 `_meta.classification.label`（一行一个），帧类落 `_meta.stream.members[].label`（一行 N 个、逐成员）。分类调用与计数也各走各的：帧分类是每 episode 一次批量判决、账记在 `report.stream.frame_classify`，与本章 `report.classify` 的序列级账互不掺和（帧分类还**永不**入视觉必需集——UI 主工程把它指向纯文本端点省钱，第 25 章 25.6 的双端点成本拆分）。
 
-按类覆盖面同样各有各的白名单：序列类是 24.4 那张四节大表；帧类**只有 annotate 一节、三个键**——`[frame.class.<帧类名>.annotate]` 的 `instruction` / `examples` / `enabled`（`enabled = false` 让该类成员整个跳过帧标注，members[] 呈现 `status="skipped"`——省成本面，第 25 章 25.6）。帧类没有按类 quality / generate / verify（帧粒度本无这些算子），也没有 multi 多标签（帧单一归属——在 `[frame.classify]` 里显式写 `assignment` 是定向配置错误）。`[frame.class.*]` 在场要求 `frame.classify.enabled = true` 且节名必须是帧类表成员；白名单外的键/节与 24.4 同一惯例——直接报配置错误，不静默。
+process stream 的 frame classification 使用自己的闭集和 `[frame.class.*.annotate]` 覆盖；sequence form 则以
+`[frame.class.<name>]` 注册 frame class，并在 `[frame.class.<name>.generate]` 声明生成 instruction 与 object
+Schema。sequence 运行时 `frame.classify.enabled = false`，EventPlan/Pattern truth 机械写 inherited label。
+两种形态不能混用分类调用来覆盖已冻结的 sequence frame truth。

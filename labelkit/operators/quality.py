@@ -33,6 +33,7 @@ import json
 import logging
 import math
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Literal, Mapping, Sequence
 
@@ -42,10 +43,13 @@ from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
     ErrorKind,
+    InternalError,
+    OutputTruncatedError,
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
 )
+from labelkit.common.contracts.generation import DownstreamAttemptRequest, DownstreamAttemptResult
 from labelkit.common.contracts.types import (
     PipelineItem,
     QualityScore,
@@ -64,6 +68,7 @@ from labelkit.common.runtime import budget
 from labelkit.common.runtime.llm_client import Message, Part, PromptBundle
 from labelkit.common.runtime.schema_engine import (
     CallScope,
+    _thaw_json,
     judgment_schema,
     pointwise_schema,
 )
@@ -72,6 +77,10 @@ from labelkit.common.runtime.schema_engine import (
 AGGREGATE_KEY = "__aggregate__"
 
 _logger = logging.getLogger("labelkit.quality")
+_ATTEMPT_MODE: ContextVar[bool] = ContextVar("quality_attempt_mode", default=False)
+_ATTEMPT_CONFIG: ContextVar[object | None] = ContextVar(
+    "quality_attempt_config", default=None
+)
 
 # 事件名（逐字对齐 CONTRACTS.md §7.11 / §8.1）。
 _EV_JUDGMENT = "quality.judgment"
@@ -792,7 +801,13 @@ class QualityStage:
 
     def __init__(self, cfg: "ResolvedConfig"):
         """@param cfg 已解析的不可变运行配置"""
-        self.cfg = cfg
+        self._cfg = cfg
+
+    @property
+    def cfg(self) -> "ResolvedConfig":
+        """@return 当前 attempt 的程序视图配置；普通批次返回构造期配置。"""
+        active = _ATTEMPT_CONFIG.get()
+        return self._cfg if active is None else active  # type: ignore[return-value]
 
     async def run(self, batch: list[PipelineItem], ctx: "RunContext") -> list[PipelineItem]:
         """对一批信封打分并门控（三阶段：预抽配对 → 合并判定 → 逐池后处理）。
@@ -812,6 +827,52 @@ class QualityStage:
         self._finish_pools(pools, ctx)
         return batch
 
+    async def run_attempt(
+        self,
+        request: DownstreamAttemptRequest,
+    ) -> DownstreamAttemptResult:
+        """执行一次 whole-set 质量 gate，延迟合并所有 dataset counters。
+
+        @param request 当前 AttemptTransaction 与共享运行上下文。
+        @return 接受状态、质量拒绝归因与 attempt-local counter delta。
+        """
+        items = list(request.transaction.items)
+        config_token = _ATTEMPT_CONFIG.set(request.run_context.cfg)
+        try:
+            token = _ATTEMPT_MODE.set(True)
+            try:
+                with request.run_context.metrics.capture_counts() as counters:
+                    try:
+                        await self.run(items, request.run_context)
+                    except SchemaViolation:
+                        return DownstreamAttemptResult(
+                            accepted=False, rejected_stage="quality",
+                            dataset_counters=dict(counters))
+            finally:
+                _ATTEMPT_MODE.reset(token)
+            self._assert_no_provider_fatal(items)
+            accepted = all(item.status == "active" for item in items)
+            return DownstreamAttemptResult(
+                accepted=accepted,
+                rejected_stage=None if accepted else "quality",
+                dataset_counters=dict(counters),
+            )
+        finally:
+            _ATTEMPT_CONFIG.reset(config_token)
+
+    @staticmethod
+    def _assert_no_provider_fatal(items: list[PipelineItem]) -> None:
+        """检测误用普通 Stage 隔离入口产生的 provider-fatal item error。
+
+        @param items 当前 attempt 的唯一信封真值。
+        @return None。
+        @raises RuntimeError 发现协议破坏。
+        """
+        if any(error.kind == ErrorKind.PROVIDER_FATAL.value
+               for item in items for error in item.errors):
+            _logger.error("generation_downstream_contract: isolated provider fatal")
+            raise InternalError("generation_downstream_contract: isolated provider fatal")
+
     # ── 分池与阶段编排（v1.7 spec 3.4.3、R13/R15） ──────────────────────────
 
     def _partition(self, items: list[PipelineItem],
@@ -827,6 +888,8 @@ class QualityStage:
         except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
             raise
         except Exception as exc:
+            if _ATTEMPT_MODE.get():
+                raise
             # 划分破损（例如标签不在 class_views 里——M1/M13 不变式被破坏）发生在任何池
             # 之前，因此沿用 v1.7 之前的批级兜底：失败的是这批记录，不是整个运行（契约④）。
             _logger.error("quality pool partition failed: exc=%s", type(exc).__name__,
@@ -852,6 +915,8 @@ class QualityStage:
             except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as exc:
+                if _ATTEMPT_MODE.get():
+                    raise
                 _logger.error("quality pairing pre-draw failed: pool=%s exc=%s",
                               pool.pool, type(exc).__name__,
                               extra={"stage": self.name, "batch": ctx.batch_no})
@@ -890,6 +955,8 @@ class QualityStage:
             except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as exc:
+                if _ATTEMPT_MODE.get():
+                    raise
                 _logger.error("quality call assembly failed: pool=%s exc=%s",
                               pool.pool, type(exc).__name__,
                               extra={"stage": self.name, "batch": ctx.batch_no})
@@ -918,6 +985,8 @@ class QualityStage:
             except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as exc:
+                if _ATTEMPT_MODE.get():
+                    raise
                 _logger.error("quality pool post-processing failed: pool=%s exc=%s",
                               pool.pool, type(exc).__name__,
                               extra={"stage": self.name, "batch": ctx.batch_no})
@@ -936,7 +1005,7 @@ class QualityStage:
         @param items 本批 active 信封
         @return 池列表
         """
-        if not self.cfg.classify.enabled:
+        if not any(item.classification is not None for item in items):
             return [_Pool(pool=None, items=list(items), q=self.cfg.quality,
                           criteria=self.cfg.rubric.criteria)]
         grouped: dict[str | None, list[PipelineItem]] = {}
@@ -990,6 +1059,8 @@ class QualityStage:
         except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
             raise
         except Exception as exc:
+            if _ATTEMPT_MODE.get():
+                raise
             _logger.error("quality judging call escaped its handlers: pool=%s exc=%s",
                           pool.pool, type(exc).__name__,
                           extra={"stage": self.name, "batch": ctx.batch_no})
@@ -1102,7 +1173,7 @@ class QualityStage:
             return None
         static = budget.est_text(system_text) + 2 * budget.MSG_OVERHEAD_TOKENS
         if prof.supports_structured_output:
-            static += budget.est_text(json.dumps(schema, ensure_ascii=False))
+            static += budget.est_text(json.dumps(_thaw_json(schema), ensure_ascii=False))
         n_images = sum(1 for r in records
                        if r.kind != "sequence" and r.modality == "ui"
                        and r.image is not None)
@@ -1482,6 +1553,10 @@ class QualityStage:
             return False
         if attempt.overflow_exc is not None:
             budget.feed_reactive_terminal(attempt.overflow_exc, ctx.metrics)
+        if _ATTEMPT_MODE.get():
+            raise ContextOverflowError(
+                "pairwise slot exceeds the record-side budget at the minimal unit",
+                phase="precheck")
         self._overflow_tie(ctx, involved,
                            "pairwise slot exceeds the record-side budget at the "
                            "minimal unit (2 records)")
@@ -1506,15 +1581,21 @@ class QualityStage:
             if attempt.degrade(ctx, exc):
                 return True
             budget.feed_reactive_terminal(exc, ctx.metrics)
+            if _ATTEMPT_MODE.get():
+                raise exc
             self._overflow_tie(
                 ctx, involved,
                 f"pairwise judgment overflow terminal ({type(exc).__name__}): {exc}")
             return False
         if isinstance(exc, SchemaViolation):
+            if _ATTEMPT_MODE.get():
+                raise exc
             self._record_judgment_failure(
                 ctx, involved,
                 f"pairwise judgment failed (SchemaViolation): {_violation_summary(exc)}")
             return False
+        if _ATTEMPT_MODE.get():
+            raise exc
         self._record_call_failure(ctx, involved, exc, "pairwise judgment call failed")
         return False
 
@@ -1643,6 +1724,10 @@ class QualityStage:
             return False
         if attempt.overflow_exc is not None:
             budget.feed_reactive_terminal(attempt.overflow_exc, ctx.metrics)
+        if _ATTEMPT_MODE.get():
+            raise ContextOverflowError(
+                "pointwise slot exceeds the record-side budget at the minimal unit",
+                phase="precheck")
         self._overflow_fail_record(
             ctx, item,
             f"pointwise slot for criterion {criterion.key} exceeds "
@@ -1669,12 +1754,16 @@ class QualityStage:
             if attempt.degrade(ctx, exc):
                 return True
             budget.feed_reactive_terminal(exc, ctx.metrics)
+            if _ATTEMPT_MODE.get():
+                raise exc
             self._overflow_fail_record(
                 ctx, item,
                 f"pointwise scoring overflow terminal for criterion "
                 f"{criterion.key} ({type(exc).__name__}): {exc}")
             return False
         if isinstance(exc, SchemaViolation):
+            if _ATTEMPT_MODE.get():
+                raise exc
             self._record_judgment_failure(
                 ctx, (item,),
                 f"pointwise scoring failed for criterion {criterion.key} "
@@ -1682,6 +1771,8 @@ class QualityStage:
             item.scores[criterion.key] = QualityScore(
                 criterion=criterion.key, score=None, mode="pointwise", detail={})
             return False
+        if _ATTEMPT_MODE.get():
+            raise exc
         self._record_call_failure(
             ctx, (item,), exc,
             f"pointwise scoring call failed for criterion {criterion.key}")

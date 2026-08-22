@@ -47,6 +47,7 @@ from labelkit.common.config.model import (
     VerifyConfig,
 )
 from labelkit.common.errors import (
+    CircuitBreakerTripped,
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
@@ -2661,3 +2662,53 @@ def test_verdict_form_budget_fit_trims_digest_block_only():
     _build_verdict_sequence_prompt(record, {"intent": "x"}, cfg, ("指令", ""),
                                    tight)
     assert tight.overflow is True
+
+
+@pytest.mark.parametrize("error", [
+    ProviderFatalError("fatal", "default", 401),
+    ProviderRetryableError("retryable", "default", 5),
+    CircuitBreakerTripped("breaker"),
+])
+def test_verify_attempt_seam_propagates_terminal_errors_without_dataset_commit(
+        monkeypatch, error):
+    from contextlib import contextmanager
+    from labelkit.common.contracts.generation import (
+        AttemptTransaction,
+        DownstreamAttemptRequest,
+    )
+
+    class AttemptMetrics:
+        def __init__(self):
+            self.counters = {}
+            self.captured = None
+
+        @contextmanager
+        def capture_counts(self):
+            self.captured = {}
+            try:
+                yield self.captured
+            finally:
+                self.captured = None
+
+        def count(self, key, n=1):
+            target = self.captured if self.captured is not None else self.counters
+            target[key] = target.get(key, 0) + n
+
+    cfg = trace_cfg()
+    metrics = AttemptMetrics()
+    item = PipelineItem(record=_record(), annotation=_annotation())
+    transaction = AttemptTransaction((item,), {}, ())
+    context = SimpleNamespace(cfg=cfg, llm=None, schema_engine=None, metrics=metrics,
+                              rng=None, batch_no=1)
+    request = DownstreamAttemptRequest(transaction, context)
+    stage = VerifyStage(cfg)
+
+    async def fail(batch, run_context):
+        run_context.metrics.count("verify.passed")
+        raise error
+
+    monkeypatch.setattr(stage, "run", fail)
+    with pytest.raises(type(error)) as caught:
+        asyncio.run(stage.run_attempt(request))
+    assert caught.value is error
+    assert metrics.counters == {}

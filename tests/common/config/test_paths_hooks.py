@@ -1,4 +1,4 @@
-"""v1.17 Wave 2a 路径与钩子面离线测试（SPEC-SP §5.1/§5.2/§4.9、§13.4）。
+"""路径与通用输出、flat sample 钩子面的离线测试。
 
 覆盖三 cwd 一致性、TOML 相对 vs CLI 相对 precedence、四类 schema_path + trace +
 input/output + 四 hook 的 project-root 解析、hook module name hash 防污染、
@@ -21,12 +21,6 @@ def validate_output(obj, record):
     return []
 
 def validate_sample(text):
-    return []
-
-def validate_sequence(value):
-    return []
-
-def validate_scenario(value):
     return []
 
 def explodes(text):
@@ -91,69 +85,6 @@ def _make_project(tmp_path: Path) -> Path:
         encoding="utf-8")
     return project
 
-
-def _make_stream_project(tmp_path: Path) -> Path:
-    """生成时间流形态工程（sequence_validator 键只在该形态合法）。"""
-    (tmp_path / "hooks.py").write_text(_HOOKS_PY, encoding="utf-8")
-    (tmp_path / "out").mkdir(exist_ok=True)
-    (tmp_path / "config.toml").write_text(_CONFIG, encoding="utf-8")
-    project = tmp_path / "project.toml"
-    project.write_text(
-        "schema_version = 1\n"
-        "\n"
-        "[run]\n"
-        'mode = "generate_only"\n'
-        'modality = "text"\n'
-        'output = "out/labels.jsonl"\n'
-        "\n"
-        "[annotate]\n"
-        'instruction = "标注意图"\n'
-        "\n"
-        "[output]\n"
-        f'schema_inline = """{_SCHEMA_JSON}"""\n'
-        'validator = "hooks.py:validate_output"\n'
-        "\n"
-        "[stream]\n"
-        'order_by = "meta:ts"\n'
-        "gap_s = 900\n"
-        "\n"
-        "[classify]\n"
-        "enabled = true\n"
-        "\n"
-        "[[classify.classes]]\n"
-        'name = "ticket_booking"\n'
-        'description = "高铁购票任务序列"\n'
-        "\n"
-        "[generate]\n"
-        "enabled = true\n"
-        'sample_validator = "hooks.py:validate_sample"\n'
-        'sequence_validator = "hooks.py:validate_sequence"\n'
-        'scenario_validator = "hooks.py:validate_scenario"\n'
-        "\n"
-        "[generate.stream]\n"
-        "enabled = true\n"
-        "\n"
-        "[generate.stream.schedule]\n"
-        'start = "2026-01-05T09:00:00+08:00"\n'
-        'end = "2026-01-05T18:00:00+08:00"\n'
-        "\n"
-        "[[generate.stream.quotas]]\n"
-        'name = "one_booking"\n'
-        'period = "schedule"\n'
-        "counts = { ticket_booking = 1 }\n"
-        "\n"
-        "[class.ticket_booking.generate]\n"
-        'instruction = "生成一段高铁购票的用户请求序列"\n'
-        "len_range = [2, 2]\n"
-        "\n"
-        "[[frame.classify.classes]]\n"
-        'name = "task_request"\n'
-        'description = "发起任务的首帧请求"\n'
-        "\n"
-        "[frame.class.task_request.generate]\n"
-        'instruction = "生成一条发起任务的用户话语"\n',
-        encoding="utf-8")
-    return project
 
 
 def _load(tmp_path: Path, cli: CliOverrides | None = None):
@@ -221,7 +152,7 @@ def test_run_paths_match_report_and_side_channels(project_dir):
     assert cfg.paths.rejects.endswith("labels.rejects.jsonl")   # rejects = "refs"
     assert cfg.paths.sidecar is None                            # meta_mode = "inline"
     assert cfg.paths.trace.endswith("custom.trace.jsonl")
-    assert cfg.paths.stream_artifact is None                    # 形态关闭
+    assert cfg.paths.stream is None                             # 形态关闭
     dry = _load(project_dir, CliOverrides(dry_run=True))
     assert dry.paths.report.endswith("labels.dryrun.report.json")
 
@@ -275,19 +206,6 @@ def test_all_path_faces_resolve_against_project_root(project_dir, tmp_path):
                               "required": ["topic"]}
 
 
-def test_four_hooks_resolve_via_project_root_and_freeze(tmp_path):
-    """四 hook 文件都按 project root 解析并冻结（sequence 键需时间流形态）。"""
-    project = _make_stream_project(tmp_path)
-    cfg = load(tmp_path / "config.toml", project, CliOverrides())
-    hooks = cfg.validation_hooks
-    assert hooks is not None
-    reference = str((tmp_path / "hooks.py").resolve())
-    assert hooks.output.reference == f"{reference}:validate_output"
-    assert hooks.sample.reference == f"{reference}:validate_sample"
-    assert hooks.sequence.reference == f"{reference}:validate_sequence"
-    assert hooks.scenario.reference == f"{reference}:validate_scenario"
-    assert hooks.output.target({}, None) == []
-    assert "target" not in repr(hooks.output)
 
 
 def test_sample_validator_gated_on_generate(project_dir):

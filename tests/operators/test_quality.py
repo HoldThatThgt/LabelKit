@@ -184,6 +184,54 @@ def make_ctx(cfg: ResolvedConfig, metrics: Recorder | None = None,
                       rng=random.Random(seed), batch_no=1)
 
 
+@pytest.mark.parametrize("error", [
+    ProviderFatalError("fatal", "default", 401),
+    ProviderRetryableError("retryable", "default", 5),
+    CircuitBreakerTripped("breaker"),
+])
+def test_quality_attempt_seam_propagates_terminal_errors_without_dataset_commit(
+        monkeypatch, error):
+    from contextlib import contextmanager
+    from labelkit.common.contracts.generation import (
+        AttemptTransaction,
+        DownstreamAttemptRequest,
+    )
+
+    class AttemptMetrics(Recorder):
+        def __init__(self):
+            super().__init__()
+            self.captured = None
+
+        @contextmanager
+        def capture_counts(self):
+            self.captured = {}
+            try:
+                yield self.captured
+            finally:
+                self.captured = None
+
+        def count(self, key, n=1):
+            target = self.captured if self.captured is not None else self.counters
+            target[key] = target.get(key, 0) + n
+
+    cfg = make_cfg(QualityConfig(enabled=True, mode="pointwise"))
+    metrics = AttemptMetrics()
+    item = PipelineItem(record=make_record("a" * 16))
+    transaction = AttemptTransaction((item,), {}, ())
+    request = DownstreamAttemptRequest(transaction, make_ctx(cfg, metrics))
+    stage = QualityStage(cfg)
+
+    async def fail(batch, context):
+        context.metrics.count("quality.kept")
+        raise error
+
+    monkeypatch.setattr(stage, "run", fail)
+    with pytest.raises(type(error)) as caught:
+        asyncio.run(stage.run_attempt(request))
+    assert caught.value is error
+    assert metrics.counters == {}
+
+
 # ── Bradley-Terry fit ─────────────────────────────────────────────────────────
 
 def test_bt_recovers_known_ordering():

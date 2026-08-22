@@ -17,8 +17,8 @@ labelkit run --config <config.toml> --project <project.toml>
 |---|---|
 | `--config` / `--project` | 两份配置的路径，**必填** |
 | `--input` / `--output` | 覆盖 `run.input` / `run.output`（CLI > project.toml）。注意 `generate_only` 模式下传 `--input` 同样是配置错误 |
-| `--limit N` | 只处理前 N 条（N ≥ 1；0 或负数在参数解析层就被拒绝）。**试跑神器**：小样本验证配置、rubric、Schema、成本，再放开跑全量。v1.17 时间流生成下单位是**序列**，截断发生在计划期的配额层（按类名字典序取前缀）——被砍掉的序列根本不生成、也不进交织，所以工件与主输出的覆盖面恒一致（第 27 章） |
-| `--dry-run` | 走完全部启动校验 + 输入扫描 + 成本估算，**不发一次 LLM 调用、不写主输出**。报告写 `{stem}.dryrun.report.json`；trace 写「trace 文件名在扩展名前插 .dryrun」（默认即 `{stem}.trace.dryrun.jsonl`），不覆盖上次真实运行的账本 |
+| `--limit N` | 普通运行只处理前 N 条（N ≥ 1）。sequence form 禁止 `--limit`，小运行应复制配置并减小 count，避免截断全局精确计划 |
+| `--dry-run` | 走完整启动校验与估算，不发 LLM。普通运行写独立 dry-run report/trace；sequence form 只打印计划和估算，五个固定正式路径全部不写 |
 | `--strict` | 有任何记录被拒绝（dropped_* / failed 非零）⇒ 退出码 1。给 CI/定时任务用：让「有货被扔」成为可编程的失败信号。v1.9 交互补注：缝合产生的 `stitched` 壳与救援命中的帧**不构成 rejects**——同一份输入开启 `[stitch]` 后 strict 结果可能从 1 变 0（短段被救援、不再落 rejects），属预期（第 26 章） |
 | `--log-level` | 覆盖 `tool.log_level`。`debug` 会打出每次 LLM 调用摘要（延迟/token/重试） |
 | `--console` | v1.10：进度显示三档，覆盖 config.toml 的 `console.mode`（第 6 章）。`rich` = 双区实时面板，`plain` = 现行行式输出（与 v1.9 等价），`auto`（默认）按终端环境自动选档；`tool.log_format = "jsonl"` 时强制 plain、显式 rich 也不可覆盖（启动 WARN 一次）。三档详解见 15.6 与 16.6；`validate` 也接受本参数（15.2） |
@@ -31,16 +31,17 @@ dry-run: estimated LLM calls — generate_calls=0 segment_calls=0 stitch_calls=0
 dry-run: no LLM calls made, no output written (report and trace only)
 ```
 
-v1.17 的时间流生成（第 27 章）在这一行里没有新键——蓝图、帧实现与噪音批量三类调用全部折进 `generate_calls`。`examples/synth-stream` 的真实输出（逐字节；本工程未开 trace，故末行是 `report only`）：
+sequence form 的 validate、dry-run 与 run 使用同一个 `compile_scenario_plan`。先做 keyless 验证：
 
-```
-dry-run: mode=generate_only estimated_records=6 batches=1
-dry-run: estimated LLM calls — generate_calls=13 segment_calls=0 stitch_calls=0 classify_calls=0 frame_classify_calls=0 extract_calls=0 quality_calls=24 annotate_calls=6 frame_annotate_calls=0 verify_calls=6 total=49 (excludes retries and repair calls)
-dry-run: note: estimated with global config / multi reports a lower bound at label multiplier 1
-dry-run: no LLM calls made, no output written (report only)
+```bash
+cd examples/sequence-generation
+uv run labelkit validate --config config.toml --project project.toml --console plain
+uv run labelkit run --config config.toml --project project.toml --dry-run --console plain
 ```
 
-对着配置验算：`generate_calls = 2 × 6 序列 + ⌈2 噪音帧 / num_per_call 4⌉ = 13`、`estimated_records = Σsequences = 6`、`quality_calls = 6 × 4 准则`、`classify_calls = 0`（标签生成期已知、继承，零判决调用）。**这不是上界口径**：估算分支复用生成算子的计划期纯函数（吃同一个 `seed` 与配置），序列长度、噪音帧数、会话装箱都按真实抽签复演一遍——与流模式那种「按会话数报下界」的估算不是一回事（真跑对账见第 27 章 27.9）。
+这两条路径不读取 API key value，也不打开 main、stream、report、manifest 或 failed report。当前已验证计划是
+2 sets、8 primary sequences、22 primary events、2 noise events、3 replay events，共 27 stream rows。
+逻辑 family 调用估算不含 provider retries 或 L3 repairs，后者只能由真实 report/trace 事后核账。
 
 注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），`segment_calls` / `extract_calls` 是 v1.8 新增字段（时序流，第 25 章），`stitch_calls` 是 v1.9 新增字段（线索缝合，第 26 章），`frame_classify_calls` / `frame_annotate_calls` 是 v1.12 新增字段（流模式帧粒度，第 25 章），未启用恒为 0；流模式下 quality/annotate/verify 的估算以「episode 数 ≈ 会话数」报**下界**、extract 按剔噪前帧数报**上界**（估算公式与真实对账见第 25 章）；帧粒度两键按预扫描帧总数报**粗上界**——帧分类实付每 episode 一次批量判决（且住 dedup 之后，重复 episode 零调用）、帧标注实付过质量门的成员数，实跑对账看 `report.stream` 的两个帧子块（第 8 章，成本账见第 25 章 25.6）；v1.11 起 `segment_calls` 的语义随预算而变——`segment.llm` 所指 profile 声明了 `context_window`（第 6 章）时，估算公式的窗宽取 `min(window, w_min)`（w_min = 预算保证每窗至少装下的帧数），实际装填每窗只多不少、窗数只少不多，故报的是**最坏装填上界**（实际窗数事后看 `report.stream.windows` 对账），且 w_min 小于 window 时 stream 注记行会追加一句 `; segment reports an upper bound at worst-case budget packing`；未声明预算或 w_min ≥ window 时公式与数值同 v1.10。`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。后两种情况 stderr 都会多打一行注记（`dry-run: note: estimated with global config / multi reports a lower bound at label multiplier 1`）。
 
@@ -51,7 +52,9 @@ labelkit validate --config <config.toml> --project <project.toml> [--probe]
                   [--console auto|rich|plain]
 ```
 
-执行 M1 全量校验（TOML 语法、字段类型、profile 引用、Schema 元校验、rubric 校验、few-shot 示例校验、环境变量存在性），**校验通过输出 `configuration valid`，退出码 0；不通过退出码 2**，且所有错误一次性列全：
+执行 M1 全量校验（TOML、字段类型、profile 引用、Schema、rubric 与示例），sequence form 还编译同一份
+`GenerationProgram` / `ScenarioPlan`。不带 `--probe` 时不物化凭据；校验通过输出
+`configuration valid`，失败以退出码 2 聚合列出全部配置错误：
 
 ```
 ConfigError: 2 config error(s) (all aggregated)

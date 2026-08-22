@@ -290,58 +290,6 @@ class _Tbl:
                 self.col.warn(f"{self.loc(k)}: unknown key, ignored (forward compatibility)")
 
 
-def _int_pair(t: _Tbl, key: str, default: tuple[int, int]) -> tuple[int, int]:
-    """v1.13: 读取 ``[lo, hi]`` 整数闭区间(len_range 形)。
-
-    要求长度恰 2、元素为整数、``1 <= lo <= hi``; 任一违反记录错误并返回默认值
-    (聚合式, 绝不提前抛)。
-
-    @param t 所属表读取器
-    @param key 键名
-    @param default 违规或缺键时的回落区间
-    @return 合法区间或 ``default``
-    """
-    v = t.take(key)
-    if v is _MISSING:
-        return default
-    expected = "integer range array of length 2 [lo, hi] (1 <= lo <= hi)"
-    if (not isinstance(v, list) or len(v) != 2
-            or any(isinstance(e, bool) or not isinstance(e, int) for e in v)):
-        t.err(key, expected, v)
-        return default
-    lo, hi = int(v[0]), int(v[1])
-    if lo < 1 or lo > hi:
-        t.err(key, expected, v)
-        return default
-    return lo, hi
-
-
-def _num_pair(t: _Tbl, key: str, default: tuple[float, float]) -> tuple[float, float]:
-    """v1.13: 读取 ``[lo, hi]`` 数值闭区间(frame_gap_s 形)。
-
-    要求长度恰 2、元素为数值、``0 < lo <= hi``；跨节上界由形态约束簇裁定：默认
-    v1.15 路径（含仅 sequence_validator、无实际非零 rules/windows 前缀）要求
-    ``hi < stream.gap_s``，仅实际非零 rules/windows 配额前缀的 v1.16 联合路径允许
-    ``hi == stream.gap_s``。
-
-    @param t 所属表读取器
-    @param key 键名
-    @param default 违规或缺键时的回落区间
-    @return 合法区间或 ``default``
-    """
-    v = t.take(key)
-    if v is _MISSING:
-        return default
-    expected = "number range array of length 2 [lo, hi] (0 < lo <= hi, seconds)"
-    if (not isinstance(v, list) or len(v) != 2
-            or any(isinstance(e, bool) or not isinstance(e, (int, float)) for e in v)):
-        t.err(key, expected, v)
-        return default
-    lo, hi = float(v[0]), float(v[1])
-    if lo <= 0 or lo > hi:
-        t.err(key, expected, v)
-        return default
-    return lo, hi
 
 
 def _section(col: _Collector, top: _Tbl, key: str) -> Any:

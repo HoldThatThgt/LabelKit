@@ -219,7 +219,15 @@ def test_anthropic_body_text_and_image_exact(png_image: ImageRef):
             ]},
         ],
         "system": "系统指令",
-        "tools": [{"name": "emit", "input_schema": SCHEMA}],
+        "tools": [{
+            "name": "emit",
+            "description": (
+                "Use this tool to return the final JSON object requested by the user. "
+                "Populate every required field according to input_schema. "
+                "Do not answer with prose or Markdown. Call the tool exactly once."
+            ),
+            "input_schema": SCHEMA,
+        }],
         "tool_choice": {"type": "tool", "name": "emit"},
     }
 
@@ -1306,6 +1314,19 @@ def test_probe_all_pool_yields_one_result_per_key_in_declaration_order(monkeypat
     assert single.key_env is None and seen[-1] == ("KEY_A", "ka")
 
 
+def test_probe_all_deduped_alias_keeps_first_declared_key_identity(monkeypatch):
+    """同值别名坍缩后仍是声明层池，唯一结果保留首个 key_env。"""
+    child = _ProbeChild()
+    monkeypatch.setattr(LLMClient, "_probe_client", lambda self, target: child)
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"))
+    client = LLMClient({"default": prof}, {}, _creds(llm={"default": ("ka",)}))
+
+    results = asyncio.run(client.probe_all("default"))
+
+    assert len(results) == 1
+    assert results[0].ok is True and results[0].key_env == "KEY_A"
+
+
 def test_probe_all_embedding_profile_follows_the_same_rule(monkeypatch):
     child = _ProbeChild()
     monkeypatch.setattr(LLMClient, "_probe_client", lambda self, target: child)
@@ -2139,7 +2160,15 @@ def test_complete_spec_assembles_url_body_parser_per_provider():
     prof = _llm_profile(provider="anthropic")
     spec = LLMClient({"default": prof}, {}, _creds())._complete_spec(prof, prompt, SCHEMA)
     assert spec.url == "https://llm-gw.example.com/v1/v1/messages"
-    assert spec.build_body()["tools"] == [{"name": "emit", "input_schema": SCHEMA}]
+    assert spec.build_body()["tools"] == [{
+        "name": "emit",
+        "description": (
+            "Use this tool to return the final JSON object requested by the user. "
+            "Populate every required field according to input_schema. "
+            "Do not answer with prose or Markdown. Call the tool exactly once."
+        ),
+        "input_schema": SCHEMA,
+    }]
     assert spec.parse({"content": [{"type": "text", "text": "y"}]})[0] == "y"
     assert spec.trace_extra == {} and spec.finalize_extra is None
 

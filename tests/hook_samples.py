@@ -1,8 +1,4 @@
-"""Sample validation hooks used by the hook tests (spec 3.8.2 L2.5 / 3.6.2).
-
-v1.17：本文件既被 ``<python-file>:<attribute-path>`` 文件形态装载，也被过渡期
-invoke 面按 ``tests.hook_samples`` 模块导入——签名与返回值语义保持稳定。
-"""
+"""Sample output and flat-generation validation hooks used by offline tests."""
 from __future__ import annotations
 
 
@@ -48,24 +44,3 @@ NOT_CALLABLE = 42
 
 def always_reject(obj, record):            # output.validator: unsatisfiable
     return ["该输出永远不合格（用于耗尽修复预算的测试）"]
-
-
-def sequence_ok(value):                    # generate.sequence_validator: pass
-    return []
-
-
-def sequence_reject(value):                # generate.sequence_validator: violation
-    return ["sequence rejected"]
-
-
-def sequence_mutates(value):               # generate.sequence_validator: mutate probe
-    value.frames[0].payload["nested"]["value"] = "changed"
-    return []
-
-
-def sequence_boom(value):                  # generate.sequence_validator: exception
-    raise RuntimeError("sequence hook exploded")
-
-
-def sequence_bad_return(value):            # generate.sequence_validator: bad return
-    return "not-a-list"

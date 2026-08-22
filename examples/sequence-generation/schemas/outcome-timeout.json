@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "examples": [{"request": {"status": "expired", "acknowledged": true}, "ticket": {"id": null, "status": "not_issued"}, "sla": {"expired": true}}],
+  "properties": {
+    "request": {
+      "type": "object",
+      "properties": {"status": {"const": "expired"}, "acknowledged": {"const": true}},
+      "required": ["status", "acknowledged"]
+    },
+    "ticket": {
+      "type": "object",
+      "properties": {"id": {"type": "null"}, "status": {"const": "not_issued"}},
+      "required": ["id", "status"]
+    },
+    "sla": {
+      "type": "object",
+      "properties": {"expired": {"const": true}},
+      "required": ["expired"]
+    }
+  },
+  "required": ["request", "ticket", "sla"]
+}

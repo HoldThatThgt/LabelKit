@@ -17,7 +17,9 @@ import pytest
 from PIL import Image
 
 from labelkit.common.config.model import DedupConfig
+from labelkit.common.contracts.generation import DedupGroupRequest
 from labelkit.operators.dedup import (
+    DedupGroupRejected,
     DedupIndex,
     DedupStage,
     _build_minhash,
@@ -30,6 +32,7 @@ from labelkit.operators.dedup import (
 )
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import ImageRef, PipelineItem, Record, RecordRef, UINode, UITree
+from labelkit.common.errors import InternalError, ProviderFatalError, ProviderRetryableError
 
 # ── fixtures / helpers ─────────────────────────────────────────────────────
 
@@ -884,3 +887,166 @@ def test_context_overflow_from_embed_classified_precisely():
     assert ctx.metrics.counters["budget.overflow_records"] == 1
     ev = [e for e in ctx.metrics.events if e[0] == "error"]
     assert ev and ev[0][4]["kind"] == "context_overflow"
+
+
+class _GroupEmbedder:
+    """返回测试指定向量表的 group embedding 协作者。"""
+
+    def __init__(self, vectors: list[list[float]]):
+        """保存下一次 embed 返回值。
+
+        @param vectors 与输入记录对齐的向量表。
+        """
+        self.vectors = vectors
+
+    async def embed(self, profile, texts):
+        """返回固定向量且不接触网络。
+
+        @param profile 未使用的 profile 名。
+        @param texts 输入文本表。
+        @return 固定向量表。
+        """
+        assert profile == "emb"
+        assert len(texts) == len(self.vectors)
+        return self.vectors
+
+
+@pytest.mark.parametrize("error", (
+    ProviderFatalError("fatal", "emb"),
+    ProviderRetryableError("retry", "emb", 0),
+))
+def test_group_probe_propagates_provider_terminal_without_pending_token(error):
+    """semantic group probe 不把 provider 终态降级为普通 duplicate。"""
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    index = DedupIndex(cfg, "text")
+    record = text_record("provider boundary", "9" * 16)
+    request = DedupGroupRequest((record,), frozenset(), "emb")
+    ctx = make_ctx()
+
+    class FailingEmbedder:
+        async def embed(self, profile, texts):
+            raise error
+
+    ctx.llm = FailingEmbedder()
+    with pytest.raises(type(error)) as caught:
+        asyncio.run(index.group_probe(request, ctx))
+    assert caught.value is error
+    assert index._pending_groups == {}
+    assert index._group_exact == {}
+    assert index._group_minhashes == {}
+    assert index._group_vec_count == 0
+
+
+def test_group_commit_rejects_mixed_vector_dimensions_before_any_index_write():
+    cfg = DedupConfig()
+    index = DedupIndex(cfg, "text")
+    records = (text_record("alpha unique", "a" * 16),
+               text_record("beta distinct", "b" * 16))
+    request = DedupGroupRequest(
+        records=records,
+        exempt_pairs=frozenset({(records[0].id, records[1].id)}),
+        embedding_profile="emb",
+    )
+    ctx = make_ctx()
+    ctx.llm = _GroupEmbedder([[1.0, 0.0], [1.0, 0.0, 0.0]])
+    token = asyncio.run(index.group_probe(request, ctx))
+
+    with pytest.raises(InternalError, match="embedding dimension mismatch"):
+        index.group_commit(token)
+
+    assert index._group_exact == {}
+    assert index._group_minhashes == {}
+    assert index._group_vec_buf is None
+    assert index._group_vec_ids == []
+    assert index._group_vec_count == 0
+    assert index._group_generation == token.index_generation
+
+
+def test_group_probe_token_minhash_is_independent_and_tampering_is_rejected():
+    """调用方修改 token 的 MinHash 不能同步改变 pending 私有真值。"""
+    cfg = DedupConfig()
+    index = DedupIndex(cfg, "text")
+    record = text_record("independent immutable feature", "c" * 16)
+    request = DedupGroupRequest((record,), frozenset(), None)
+    token = asyncio.run(index.group_probe(request, make_ctx()))
+    signature = token.minhash_features[0]
+    assert signature is not None
+    signature.hashvalues[:] = 0
+
+    with pytest.raises(InternalError, match="altered capability"):
+        index.group_commit(token)
+
+    assert index._group_exact == {}
+    assert index._group_minhashes == {}
+    assert index._group_vec_buf is None
+    assert index._group_generation == token.index_generation
+
+
+def test_group_commit_atomically_populates_all_indexes_and_future_probe_hits():
+    """commit 同步写 exact、LSH、向量索引，后续组通过正式索引命中。"""
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    index = DedupIndex(cfg, "text")
+    records = (
+        text_record("alpha committed feature", "d" * 16),
+        text_record("beta independent feature", "e" * 16),
+    )
+    request = DedupGroupRequest(
+        records, frozenset({(records[0].id, records[1].id)}), "emb"
+    )
+    ctx = make_ctx()
+    ctx.llm = _GroupEmbedder([[1.0, 0.0], [0.0, 1.0]])
+    token = asyncio.run(index.group_probe(request, ctx))
+    assert index._group_exact == {}
+    assert index._group_minhashes == {}
+    assert index._group_vec_count == 0
+
+    index.group_commit(token)
+
+    assert len(index._group_exact) == 2
+    assert len(index._group_minhashes) == 2
+    assert index._group_vec_ids == [records[0].id, records[1].id]
+    assert index._group_vec_count == 2
+    duplicate = text_record("alpha committed feature", "f" * 16)
+    duplicate_request = DedupGroupRequest((duplicate,), frozenset(), "emb")
+    ctx.llm = _GroupEmbedder([[1.0, 0.0]])
+    with pytest.raises(DedupGroupRejected):
+        asyncio.run(index.group_probe(duplicate_request, ctx))
+
+
+def test_group_semantic_index_rejects_distinct_text_with_matching_vector():
+    """正式向量索引参与未来 group probe，不依赖 exact 或 MinHash 全扫描。"""
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    index = DedupIndex(cfg, "text")
+    first = text_record("committed semantic anchor", "1" * 16)
+    ctx = make_ctx()
+    ctx.llm = _GroupEmbedder([[1.0, 0.0]])
+    token = asyncio.run(index.group_probe(
+        DedupGroupRequest((first,), frozenset(), "emb"), ctx
+    ))
+    index.group_commit(token)
+
+    candidate = text_record("lexically unrelated future candidate", "2" * 16)
+    ctx.llm = _GroupEmbedder([[0.99, 0.01]])
+    with pytest.raises(DedupGroupRejected):
+        asyncio.run(index.group_probe(
+            DedupGroupRequest((candidate,), frozenset(), "emb"), ctx
+        ))
+
+
+def test_group_probe_rejects_non_exempt_semantic_duplicate_inside_current_set():
+    """当前 set 的非豁免 pair 使用 attempt-local 特征比较，拒绝前零索引写入。"""
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    index = DedupIndex(cfg, "text")
+    records = (
+        text_record("first lexical surface", "3" * 16),
+        text_record("second unrelated surface", "4" * 16),
+    )
+    ctx = make_ctx()
+    ctx.llm = _GroupEmbedder([[1.0, 0.0], [1.0, 0.0]])
+    with pytest.raises(DedupGroupRejected):
+        asyncio.run(index.group_probe(
+            DedupGroupRequest(records, frozenset(), "emb"), ctx
+        ))
+    assert index._group_exact == {}
+    assert index._group_minhashes == {}
+    assert index._group_vec_count == 0

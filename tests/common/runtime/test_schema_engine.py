@@ -5,12 +5,27 @@ Pointer paths, byte-exact L3 repair-prompt rendering vs the spec 3.8.4 worked ex
 resolved_at bucket logic driven by synthetic layer outcomes, canonical user-schema
 text, and the §10.7 internal schema constants.
 """
+import asyncio
 import json
-from types import SimpleNamespace
+from dataclasses import replace
+from types import MappingProxyType, SimpleNamespace
 
+import pytest
 from jsonschema import Draft202012Validator
 
-from labelkit.common.config.model import OutputConfig
+from labelkit.common.config.model import LLMProfile, OutputConfig
+from labelkit.common.contracts.generation import (
+    EventExecution,
+    PostValidatedCallRequest,
+    PostValidationResult,
+)
+from labelkit.common.errors import SchemaViolation
+from labelkit.common.runtime.llm_client import (
+    Message,
+    Part,
+    PromptBundle,
+    _build_anthropic_body,
+)
 from labelkit.common.runtime.schema_engine import (
     VERDICT_SCHEMA,
     CallScope,
@@ -18,6 +33,7 @@ from labelkit.common.runtime.schema_engine import (
     _bucket_for,
     _CallContext,
     _build_repair_prompt,
+    _build_post_repair_instruction,
     _extract_object,
     _first_balanced_braces,
     _render_error,
@@ -26,10 +42,12 @@ from labelkit.common.runtime.schema_engine import (
     classification_schema,
     defect_verdict_schema,
     deterministic_repair,
+    event_plan_schema,
     judgment_schema,
-    plan_schema,
+    noise_semantic_evaluation_schema,
     pointwise_schema,
-    realize_schema,
+    scenario_seed_schema,
+    semantic_evaluation_schema,
     samples_schema,
     segment_window_schema,
     stitch_schema,
@@ -512,196 +530,143 @@ class TestInternalSchemas:
                                "reason": "r", "confidence": "low"})
                                                          # thread_ref key required
 
+    def test_scenario_seed_schema_declared_and_instruction_only(self):
+        state = {"type": "object", "properties": {"counter": {"type": "integer"}},
+                 "required": ["counter"], "additionalProperties": False}
+        declared = scenario_seed_schema(("requester", "system"), state)
+        dynamic = scenario_seed_schema(None, state)
+        Draft202012Validator.check_schema(declared)
+        Draft202012Validator.check_schema(dynamic)
+        actors = declared["properties"]["actors"]
+        assert tuple(actors["properties"]) == ("requester", "system")
+        assert actors["required"] == ["requester", "system"]
+        assert actors["additionalProperties"] is False
+        assert dynamic["properties"]["actors"]["minProperties"] == 1
+        assert dynamic["properties"]["actors"]["maxProperties"] == 8
+        assert dynamic["properties"]["actors"]["propertyNames"] == {
+            "type": "string", "minLength": 1,
+        }
+        dynamic_validator = Draft202012Validator(dynamic)
+        shell = {
+            "initial_state": {"counter": 0},
+            "actors": {"": {"goal": {}, "identity": {}, "style": {}}},
+            "shared_facts": {"public": {}, "hidden": {}},
+            "style": {}, "time_context": {},
+        }
+        assert not dynamic_validator.is_valid(shell)
+        state_resource = declared["properties"]["initial_state"]
+        resource_id = state_resource["$id"]
+        assert resource_id.startswith("urn:labelkit:state-schema:")
+        assert {key: value for key, value in state_resource.items() if key != "$id"} == state
 
-# ── v1.13: plan_schema / realize_schema (§10.7 / SPEC-stream-generation §3.3) ─
+    def test_scenario_seed_schema_preserves_embedded_resource_semantics(self):
+        state = {
+            "$defs": {"number": {"type": "integer"}},
+            "allOf": [{
+                "type": "object",
+                "properties": {
+                    "kind": {"const": "count"},
+                    "value": {"$ref": "#/$defs/number"},
+                    "enabled": {"type": "boolean"},
+                },
+                "required": ["kind", "value"],
+            }],
+            "if": {"properties": {"kind": {"const": "count"}}},
+            "then": {"dependentSchemas": {
+                "value": {"required": ["enabled"]},
+            }},
+            "unevaluatedProperties": False,
+        }
+        schema = scenario_seed_schema(("requester",), state)
+        validator = Draft202012Validator(schema)
+        seed = {
+            "initial_state": {"kind": "count", "value": 2, "enabled": True},
+            "actors": {"requester": {"goal": {}, "identity": {}, "style": {}}},
+            "shared_facts": {"public": {}, "hidden": {}},
+            "style": {}, "time_context": {},
+        }
+        assert validator.is_valid(seed)
+        assert not validator.is_valid({
+            **seed, "initial_state": {"kind": "count", "value": "2", "enabled": True}})
+        assert not validator.is_valid({
+            **seed, "initial_state": {"kind": "count", "value": 2}})
+        assert not validator.is_valid({
+            **seed,
+            "initial_state": {"kind": "count", "value": 2, "enabled": True, "extra": 1},
+        })
 
-FRAME_CLASSES = ["task_request", "followup", "confirmation"]
+    def test_scenario_seed_schema_reaches_anthropic_body_unchanged(self):
+        state = {
+            "$defs": {"value": {"type": "string"}},
+            "type": "object",
+            "properties": {"value": {"$ref": "#/$defs/value"}},
+            "required": ["value"],
+        }
+        schema = scenario_seed_schema(("requester",), state)
+        profile = LLMProfile(
+            name="semantic", provider="anthropic", base_url="https://example.invalid",
+            model="m", api_key_env="K", supports_structured_output=True,
+        )
+        prompt = PromptBundle(messages=(Message(
+            role="user", parts=(Part(kind="text", text="生成场景"),)),))
+        body = _build_anthropic_body(profile, prompt, schema)
+        assert body["tools"][0]["input_schema"] == schema
+        assert json.loads(json.dumps(body))["tools"][0]["input_schema"] == schema
 
-# 一个"结构化帧"的用户生成 Schema（帧类生成 Schema 的形状），与"纯文本帧"对照。
-UTTERANCE_SCHEMA = {
-    "type": "object",
-    "properties": {"utterance": {"type": "string"},
-                   "entities": {"type": "array", "items": {"type": "string"}}},
-    "required": ["utterance", "entities"],
-    "additionalProperties": False,
-}
-TEXT_FRAME_SCHEMA = {"type": "string"}
+    def test_scenario_seed_schema_reuses_absolute_state_resource_id(self):
+        state = {
+            "$id": "https://schemas.example.test/state",
+            "$defs": {"value": {"type": "integer"}},
+            "type": "object",
+            "properties": {"value": {"$ref": "#/$defs/value"}},
+            "required": ["value"],
+        }
+        schema = scenario_seed_schema(("requester",), state)
+        resource = schema["properties"]["initial_state"]
+        assert resource == state
+        seed = {
+            "initial_state": {"value": 1},
+            "actors": {"requester": {"goal": {}, "identity": {}, "style": {}}},
+            "shared_facts": {"public": {}, "hidden": {}},
+            "style": {}, "time_context": {},
+        }
+        assert Draft202012Validator(schema).is_valid(seed)
 
+    def test_event_plan_schema_pins_patch_and_closed_sets(self):
+        schema = event_plan_schema(("request", "confirm"), ("user", "system"))
+        Draft202012Validator.check_schema(schema)
+        validator = Draft202012Validator(schema)
+        valid = {
+            "frame_class": "request", "actor": "user", "intent": "ask",
+            "patch": [
+                {"op": "test", "path": "/status", "value": "new"},
+                {"op": "replace", "path": "/status", "value": "pending"},
+            ],
+        }
+        assert validator.is_valid(valid)
+        assert not validator.is_valid({**valid, "actor": "ghost"})
+        assert not validator.is_valid({**valid, "patch": valid["patch"][:1]})
+        assert not validator.is_valid({
+            **valid, "patch": [{"op": "remove", "path": "/x", "value": 1},
+                                valid["patch"][1]]})
 
-class TestPlanSchema:
-    def test_shape_pins_step_count_and_closed_frame_class_set(self):
-        s = plan_schema(FRAME_CLASSES, 3)
-        Draft202012Validator.check_schema(s)
-        assert s["required"] == ["steps"] and s["additionalProperties"] is False
-        arr = s["properties"]["steps"]
-        assert arr["minItems"] == 3 and arr["maxItems"] == 3
-        item = arr["items"]
-        assert item["required"] == ["frame_class", "brief"]
-        assert item["additionalProperties"] is False
-        assert item["properties"]["frame_class"] == {"type": "string",
-                                                     "enum": FRAME_CLASSES}
-        assert item["properties"]["brief"] == {"type": "string"}
-
-    def test_validation_positive_and_negative(self):
-        v = Draft202012Validator(plan_schema(FRAME_CLASSES, 2))
-        steps = [{"frame_class": "task_request", "brief": "发起购票"},
-                 {"frame_class": "followup", "brief": "补充日期"}]
-        assert v.is_valid({"steps": steps})
-        assert not v.is_valid({"steps": steps[:1]})              # minItems 钉长度
-        assert not v.is_valid({"steps": steps + steps[:1]})      # maxItems 钉长度
-        assert not v.is_valid({"steps": [{"frame_class": "ghost", "brief": "x"},
-                                         steps[1]]})             # 闭集之外
-        assert not v.is_valid({"steps": [{"frame_class": "followup"}, steps[1]]})
-        assert not v.is_valid({"steps": steps, "note": "多余键"})
-
-    def test_repeated_frame_class_is_schema_legal(self):
-        # 同一帧类在一条序列里本就可重复出现（R1 同理：不用 uniqueItems）
-        v = Draft202012Validator(plan_schema(FRAME_CLASSES, 2))
-        assert v.is_valid({"steps": [{"frame_class": "followup", "brief": "a"},
-                                     {"frame_class": "followup", "brief": "b"}]})
-
-    def test_keyword_set_stays_inside_the_frozen_vocabulary(self):
-        s = plan_schema(FRAME_CLASSES, 4)
-        assert _schema_keywords(s) <= ALLOWED_KEYWORDS
-        assert "uniqueItems" not in _all_dict_keys(s)
-
-    def test_enum_copies_input_sequence(self):
-        names = ["a", "b"]
-        s = plan_schema(names, 1)
-        names.append("c")
-        assert s["properties"]["steps"]["items"]["properties"]["frame_class"][
-            "enum"] == ["a", "b"]
-
-
-def _plan_step(name: str) -> dict:
-    """One blueprint step of the given frame class (the brief is content-free filler)."""
-    return {"frame_class": name, "brief": "要点"}
-
-
-class TestPlanSchemaCoverAll:
-    """v1.14（裁决·蓝图双向硬约束）：cover_all 的形状、语义与缺省字节等价。"""
-
-    def test_default_output_is_byte_identical_to_the_v1_13_shape(self):
-        # 缺省 False ⇒ 既有调用点与 golden 面零波及（双关字节等价的构造器一侧）
-        for length in (1, 4):
-            explicit = plan_schema(FRAME_CLASSES, length, cover_all=False)
-            assert json.dumps(plan_schema(FRAME_CLASSES, length)) == json.dumps(explicit)
-            assert "allOf" not in explicit["properties"]["steps"]
-
-    def test_cover_all_appends_one_contains_branch_per_name_in_order(self):
-        s = plan_schema(FRAME_CLASSES, 3, cover_all=True)
-        Draft202012Validator.check_schema(s)
-        steps = s["properties"]["steps"]
-        # allOf 追加在数组对象尾部，其余键与缺省形态逐字节一致
-        assert list(steps) == ["type", "items", "minItems", "maxItems", "allOf"]
-        assert steps["allOf"] == [
-            {"contains": {"type": "object",
-                          "properties": {"frame_class": {"const": name}},
-                          "required": ["frame_class"]}}
-            for name in FRAME_CLASSES]
-
-    def test_composition_is_exact_equality_of_the_frame_class_set(self):
-        # enum 给「⊆」、contains 给「⊇」，合成「步帧类集合 ≡ 传入名集」
-        v = Draft202012Validator(plan_schema(FRAME_CLASSES, 3, cover_all=True))
-        assert v.is_valid({"steps": [_plan_step(n) for n in FRAME_CLASSES]})
-        assert not v.is_valid({"steps": [_plan_step("task_request"),
-                                         _plan_step("followup"),
-                                         _plan_step("followup")]})  # 缺 confirmation
-        assert not v.is_valid({"steps": [_plan_step("task_request"),
-                                         _plan_step("followup"),
-                                         _plan_step("ghost")]})     # 档外类（enum）
-
-    def test_cover_all_on_a_tier_subset_only_covers_that_subset(self):
-        v = Draft202012Validator(plan_schema(["task_request", "followup"], 3,
-                                             cover_all=True))
-        assert v.is_valid({"steps": [_plan_step("task_request"),
-                                     _plan_step("followup"),
-                                     _plan_step("followup")]})
-        assert not v.is_valid({"steps": [_plan_step("task_request")] * 3})
-        assert not v.is_valid({"steps": [_plan_step("task_request"),
-                                         _plan_step("followup"),
-                                         _plan_step("confirmation")]})
-
-    def test_keyword_set_grows_by_exactly_the_three_frozen_words(self):
-        s = plan_schema(FRAME_CLASSES, 4, cover_all=True)
-        assert _schema_keywords(s) <= ALLOWED_KEYWORDS
-        assert _schema_keywords(s) - _schema_keywords(plan_schema(FRAME_CLASSES, 4)) == {
-            "allOf", "contains", "const"}
-        assert "uniqueItems" not in _all_dict_keys(s)
-
-    def test_render_error_names_the_missing_frame_class(self):
-        # 裁决·渲染缺类可见：L0 关端点上的 L3 修复提示必须点名缺失帧类
-        v = Draft202012Validator(plan_schema(FRAME_CLASSES, 3, cover_all=True))
-        obj = {"steps": [_plan_step("task_request"), _plan_step("followup"),
-                         _plan_step("followup")]}
-        rendered = sorted(_render_error(e) for e in v.iter_errors(obj))
-        assert rendered == ['/steps: missing required frame_class "confirmation"']
-
-    def test_render_error_reports_every_missing_frame_class(self):
-        v = Draft202012Validator(plan_schema(FRAME_CLASSES, 3, cover_all=True))
-        obj = {"steps": [_plan_step("task_request")] * 3}
-        rendered = sorted(_render_error(e) for e in v.iter_errors(obj))
-        assert rendered == ['/steps: missing required frame_class "confirmation"',
-                            '/steps: missing required frame_class "followup"']
-
-    def test_render_error_falls_back_for_a_foreign_contains_shape(self):
-        # 用户 Schema 也可以用 contains——不是覆盖约束形状时回落 jsonschema 原始消息
-        v = Draft202012Validator({"type": "object",
-                                  "properties": {"xs": {"type": "array",
-                                                        "contains": {"type": "integer"}}}})
-        rendered = [_render_error(e) for e in v.iter_errors({"xs": ["a"]})]
-        assert len(rendered) == 1
-        assert rendered[0].startswith("/xs: ")
-        assert "missing required frame_class" not in rendered[0]
-
-
-class TestRealizeSchema:
-    def test_shape_is_positional_prefix_items_closed_at_the_tail(self):
-        s = realize_schema([UTTERANCE_SCHEMA, TEXT_FRAME_SCHEMA])
-        Draft202012Validator.check_schema(s)
-        assert s["required"] == ["frames"] and s["additionalProperties"] is False
-        arr = s["properties"]["frames"]
-        assert arr["prefixItems"] == [UTTERANCE_SCHEMA, TEXT_FRAME_SCHEMA]
-        assert arr["minItems"] == 2 and arr["maxItems"] == 2
-        assert arr["items"] is False                    # 封尾：禁止超长数组
-
-    def test_prefix_items_validate_position_by_position(self):
-        # jsonschema ≥ 4.21 原生支持 draft 2020-12 prefixItems ⇒ L2 直接可校验
-        v = Draft202012Validator(realize_schema([UTTERANCE_SCHEMA,
-                                                 TEXT_FRAME_SCHEMA]))
-        good = {"frames": [{"utterance": "帮我订票", "entities": ["上海"]}, "好的"]}
-        assert v.is_valid(good)
-        # 位序颠倒 ⇒ 两位都不合规
-        assert not v.is_valid({"frames": ["好的",
-                                          {"utterance": "帮我订票",
-                                           "entities": ["上海"]}]})
-        # 第 1 帧缺必填键
-        assert not v.is_valid({"frames": [{"utterance": "帮我订票"}, "好的"]})
-        # 第 2 帧类型错（纯文本帧位收到对象）
-        assert not v.is_valid({"frames": [good["frames"][0], {"x": 1}]})
-        # 长度：少一帧 / 多一帧都不合规
-        assert not v.is_valid({"frames": good["frames"][:1]})
-        assert not v.is_valid({"frames": good["frames"] + ["多余"]})
-        assert not v.is_valid({"frames": good["frames"], "note": "多余键"})
-
-    def test_single_and_uniform_positions(self):
-        v = Draft202012Validator(realize_schema([TEXT_FRAME_SCHEMA] * 3))
-        assert v.is_valid({"frames": ["a", "b", "c"]})
-        assert not v.is_valid({"frames": ["a", "b"]})
-
-    def test_wrapper_skeleton_keywords_add_only_prefix_items(self):
-        s = realize_schema([TEXT_FRAME_SCHEMA])
-        skeleton = {"type", "properties", "required", "additionalProperties",
-                    "prefixItems", "minItems", "maxItems", "items"}
-        assert set(s) | set(s["properties"]["frames"]) <= skeleton
-        assert "uniqueItems" not in _all_dict_keys(s)
-
-    def test_step_schema_sequence_is_copied(self):
-        steps = [dict(TEXT_FRAME_SCHEMA)]
-        s = realize_schema(steps)
-        steps.append(dict(UTTERANCE_SCHEMA))
-        assert s["properties"]["frames"]["minItems"] == 1
-        assert len(s["properties"]["frames"]["prefixItems"]) == 1
+    def test_semantic_evaluation_schemas_are_closed(self):
+        semantic = semantic_evaluation_schema()
+        noise = noise_semantic_evaluation_schema()
+        Draft202012Validator.check_schema(semantic)
+        Draft202012Validator.check_schema(noise)
+        assert semantic["required"] == [
+            "causal_consistency", "actor_knowledge", "goal_consistency",
+            "temporal_plausibility", "cross_frame_consistency", "realism",
+            "reason_codes",
+        ]
+        assert noise["required"] == [
+            "unrelated_to_declared_tasks", "no_executable_task", "realism",
+            "matches_planned_topic",
+            "reason_codes",
+        ]
+        assert semantic["additionalProperties"] is False
+        assert noise["additionalProperties"] is False
 
 
 # ── v1.7: classification_schema (§10.7 / spec 3.13, R1) ─────────────────────
@@ -710,11 +675,9 @@ NAMES = ["faq", "chitchat", "other"]
 
 # The frozen keyword vocabulary of the internal schemas — classification_schema must
 # not grow it (R1: strict-mode gateways hard-reject e.g. uniqueItems, L0 passes
-# schemas through unconditionally). v1.14 grows it by exactly three words, all of them
-# draft 2020-12 natives carried by plan_schema(cover_all=True): allOf / contains / const.
+# schemas through unconditionally).
 ALLOWED_KEYWORDS = {"type", "properties", "required", "additionalProperties",
-                    "enum", "items", "minItems", "maxItems",
-                    "allOf", "contains", "const"}
+                    "enum", "items", "minItems", "maxItems"}
 
 
 def _schema_keywords(schema: dict) -> set[str]:
@@ -1004,6 +967,37 @@ def test_l3_repair_overflow_short_circuits_to_exhaustion():
     assert eng.stats["rejected"] == 1   # 2..3 short-circuited
 
 
+def test_generic_repair_context_byte_limit_accepts_exact_and_skips_overflow():
+    """generic L3 对完整新增 user 正文执行 R/R-1 边界且超限零修复派发。"""
+    schema = {
+        "type": "object",
+        "properties": {"ok": {"const": True}},
+        "required": ["ok"],
+        "additionalProperties": False,
+    }
+    raw = '{"bad":"value"}'
+    probe = SchemaEngine(schema, llm=None, cfg=OutputConfig())
+    rendered = probe._validate_full({"bad": "value"}, schema)[0]
+    size = len(_build_repair_prompt(raw, rendered).encode("utf-8"))
+
+    llm = _QueueLLM(raw, '{"ok":true}')
+    engine = SchemaEngine(schema, llm=llm, cfg=OutputConfig(max_repair_attempts=1))
+    result = asyncio.run(engine.complete_validated(
+        "default", object(), schema=schema,
+        scope=CallScope(repair_context_bytes=size),
+    ))
+    assert result[0] == {"ok": True} and llm.calls == 2
+
+    llm = _QueueLLM(raw, '{"ok":true}')
+    engine = SchemaEngine(schema, llm=llm, cfg=OutputConfig(max_repair_attempts=1))
+    with pytest.raises(SchemaViolation):
+        asyncio.run(engine.complete_validated(
+            "default", object(), schema=schema,
+            scope=CallScope(repair_context_bytes=size - 1),
+        ))
+    assert llm.calls == 1
+
+
 def test_initial_call_overflow_propagates_untouched():
     """v1.11: ContextOverflowError from the INITIAL complete() is NOT the
     engine's to classify — it propagates to the operator (V27①) with zero
@@ -1092,9 +1086,11 @@ class _QueueLLM:
     def __init__(self, *texts: str):
         self.texts = list(texts)
         self.calls = 0
+        self.prompts = []
 
     async def complete(self, profile, prompt, response_schema=None):
         self.calls += 1
+        self.prompts.append(prompt)
         return _StubResponse(self.texts[min(self.calls - 1, len(self.texts) - 1)])
 
 
@@ -1200,6 +1196,28 @@ def test_user_treatment_true_counts_the_bucket_on_an_explicit_schema():
     assert llm.schemas == [CLASS_SCHEMA]               # L0 透传的是显式 Schema
 
 
+def test_complete_validated_recursively_thaws_structured_schema():
+    """普通校验调用也必须把冻结 Schema 还原成 JSON 容器。"""
+    frozen = MappingProxyType({
+        "type": "object",
+        "properties": MappingProxyType({
+            "topic": MappingProxyType({"enum": ("qa", "chat")}),
+        }),
+        "required": ("topic",),
+        "additionalProperties": False,
+    })
+    llm = _FixedLLM('{"topic":"qa"}')
+    engine = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig())
+
+    result = _run_engine(engine, schema=frozen)
+
+    assert result[0] == {"topic": "qa"}
+    assert type(llm.schemas[0]) is dict
+    assert type(llm.schemas[0]["properties"]) is dict
+    assert type(llm.schemas[0]["properties"]["topic"]["enum"]) is list
+    assert json.loads(json.dumps(llm.schemas[0]))["required"] == ["topic"]
+
+
 def test_user_treatment_true_also_runs_the_l25_hook():
     import pytest
     from labelkit.common.errors import SchemaViolation
@@ -1232,3 +1250,213 @@ def test_plain_user_schema_call_is_byte_equivalent_to_v1_12():
     _obj, _usage, _attempts, _model = _run_engine(eng)
     assert eng.stats["l0_or_clean"] == 1
     assert llm.schemas == [SPEC_SCHEMA]
+
+
+# ── v1.18：request-local 可执行后置验证 ─────────────────────────────────────
+
+POST_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "plan": {
+            "type": "object",
+            "properties": {"n": {"type": "integer"}},
+            "required": ["n"],
+            "additionalProperties": False,
+        },
+    },
+    "required": ["plan"],
+    "additionalProperties": False,
+}
+
+
+def _execution(n: int) -> EventExecution:
+    """构造能用身份断言钉住的执行证明。"""
+    return EventExecution(
+        state_before={"n": n - 1},
+        state_after={"n": n},
+        state_before_hash=f"before-{n}",
+        state_after_hash=f"after-{n}",
+        publish_snapshot={"nested": {"n": n}},
+        normalized_patch=({"op": "replace", "path": "/n", "value": n},),
+    )
+
+
+def _post_request(llm, validator) -> tuple[SchemaEngine, PostValidatedCallRequest]:
+    """构造一条完整 post-validated 调用。"""
+    prompt = PromptBundle(messages=(Message(
+        role="user", parts=(Part(kind="text", text="生成事件"),)),))
+    request = PostValidatedCallRequest(
+        profile="semantic", prompt=prompt, schema=POST_SCHEMA,
+        scope=CallScope(record_ids=("record-1",), batch_no=2),
+        post_validator=validator,
+    )
+    engine = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig())
+    return engine, request
+
+
+def test_complete_post_validated_returns_same_execution_instance():
+    execution = _execution(1)
+    seen = []
+
+    def validate(candidate):
+        seen.append(candidate)
+        return PostValidationResult((), execution)
+
+    llm = _FixedLLM('{"plan":{"n":1}}')
+    engine, request = _post_request(llm, validate)
+    result = asyncio.run(engine.complete_post_validated(request))
+    assert result.object == {"plan": {"n": 1}}
+    assert result.event_execution is execution
+    assert result.resolved_at == "l0_or_clean"
+    assert result.attempts == 1 and llm.calls == 1
+    assert seen == [{"plan": {"n": 1}}]
+    assert engine.stats == ZERO_STATS
+
+
+def test_post_schema_recursively_thaws_for_anthropic_structured_body():
+    execution = _execution(1)
+    llm = _FixedLLM('{"plan":{"n":1}}')
+    engine, request = _post_request(
+        llm, lambda _candidate: PostValidationResult((), execution))
+    assert isinstance(request.schema, MappingProxyType)
+    assert isinstance(request.schema["properties"], MappingProxyType)
+    assert type(request.schema["properties"]["plan"]["required"]) is tuple
+    asyncio.run(engine.complete_post_validated(request))
+    sent = llm.schemas[0]
+    assert sent == POST_SCHEMA
+    assert type(sent) is dict
+    assert type(sent["properties"]) is dict
+    assert type(sent["properties"]["plan"]["required"]) is list
+    assert isinstance(request.schema["properties"], MappingProxyType)
+    assert type(request.schema["properties"]["plan"]["required"]) is tuple
+    profile = LLMProfile(
+        name="semantic", provider="anthropic", base_url="https://example.invalid",
+        model="m", api_key_env="K", supports_structured_output=True,
+    )
+    body = _build_anthropic_body(profile, request.prompt, sent)
+    assert body["tools"][0]["input_schema"] == POST_SCHEMA
+    assert json.loads(json.dumps(body))["tools"][0]["input_schema"] == POST_SCHEMA
+
+
+def test_post_validator_runs_once_per_l2_candidate_across_repairs():
+    calls = []
+    executions = {1: _execution(1), 2: _execution(2)}
+
+    def validate(candidate):
+        n = candidate["plan"]["n"]
+        calls.append(n)
+        if n == 1:
+            return PostValidationResult(("secret candidate detail",), None)
+        return PostValidationResult((), executions[n])
+
+    llm = _QueueLLM(
+        '{"plan":{"n":"invalid"}}',
+        '{"plan":{"n":1}}',
+        '{"plan":{"n":2}}',
+    )
+    metrics = _MetricsFeedSpy()
+    prompt = PromptBundle(messages=(Message(
+        role="user", parts=(Part(kind="text", text="生成事件"),)),))
+    request = PostValidatedCallRequest(
+        "semantic", prompt, POST_SCHEMA, CallScope(), validate)
+    engine = SchemaEngine(SPEC_SCHEMA, llm=llm,
+                          cfg=OutputConfig(max_repair_attempts=2), metrics=metrics)
+    result = asyncio.run(engine.complete_post_validated(request))
+    assert calls == [1, 2]
+    assert result.event_execution is executions[2]
+    assert result.resolved_at == "l3_2" and result.attempts == 3
+    assert metrics.payloads[0]["violations"] == ["post-validator"]
+    assert "secret candidate detail" not in json.dumps(metrics.payloads)
+    first_repair = llm.prompts[1].messages
+    assert first_repair[0] is prompt.messages[0]
+    assert first_repair[1].role == "assistant"
+    assert first_repair[1].parts[0].text == '{"plan":{"n":"invalid"}}'
+    assert first_repair[2].role == "user"
+    assert first_repair[2].parts[0].text.startswith("[违规清单]\n1. /plan/n:")
+    assert "[原始输出]" not in first_repair[2].parts[0].text
+    second_repair = llm.prompts[2].messages
+    assert second_repair[0] is prompt.messages[0]
+    assert second_repair[1].parts[0].text == '{"plan":{"n":1}}'
+    assert second_repair[2].parts[0].text == (
+        "[违规清单]\n1. (post-validator) secret candidate detail"
+        "\n\n只输出修正后的 JSON。"
+    )
+
+
+def test_post_repair_context_byte_limit_accepts_exact_and_skips_overflow():
+    """post L3 对 assistant+user 新增正文执行 R/R-1 边界。"""
+    raw = '{"plan":{"n":"invalid"}}'
+    rendered = sorted(
+        _render_error(error)
+        for error in Draft202012Validator(POST_SCHEMA).iter_errors(json.loads(raw))
+    )
+    instruction = _build_post_repair_instruction(rendered)
+    size = len(raw.encode("utf-8")) + len(instruction.encode("utf-8"))
+    execution = _execution(2)
+
+    def validate(candidate):
+        return PostValidationResult((), execution)
+
+    llm = _QueueLLM(raw, '{"plan":{"n":2}}')
+    engine, request = _post_request(llm, validate)
+    request = replace(
+        request,
+        scope=replace(request.scope, repair_context_bytes=size),
+    )
+    result = asyncio.run(engine.complete_post_validated(request))
+    assert result.object == {"plan": {"n": 2}} and llm.calls == 2
+
+    llm = _QueueLLM(raw, '{"plan":{"n":2}}')
+    engine, request = _post_request(llm, validate)
+    request = replace(
+        request,
+        scope=replace(request.scope, repair_context_bytes=size - 1),
+    )
+    with pytest.raises(SchemaViolation):
+        asyncio.run(engine.complete_post_validated(request))
+    assert llm.calls == 1
+
+
+@pytest.mark.parametrize("returned", [
+    object(),
+    PostValidationResult((), None),
+    PostValidationResult(("bad",), _execution(1)),
+    PostValidationResult("bad", None),
+    PostValidationResult((1,), None),
+    PostValidationResult((), object()),
+])
+def test_post_validator_rejects_every_non_contract_shape(returned):
+    llm = _FixedLLM('{"plan":{"n":1}}')
+    engine, request = _post_request(llm, lambda _candidate: returned)
+    with pytest.raises(SchemaViolation) as captured:
+        asyncio.run(engine.complete_post_validated(request))
+    assert captured.value.errors == ["post_validator_invalid"]
+    assert llm.calls == 1
+
+
+def test_post_validator_exception_is_terminal_and_data_free():
+    def raises(_candidate):
+        raise RuntimeError("secret candidate content")
+
+    llm = _FixedLLM('{"plan":{"n":1}}')
+    engine, request = _post_request(llm, raises)
+    with pytest.raises(SchemaViolation) as captured:
+        asyncio.run(engine.complete_post_validated(request))
+    assert captured.value.errors == ["post_validator_exception"]
+    assert "secret" not in str(captured.value)
+    assert llm.calls == 1
+
+
+def test_typed_post_validator_invalid_error_is_terminal_and_data_free():
+    from labelkit.common.errors import PostValidatorInvalidError
+
+    def invalid(_candidate):
+        raise PostValidatorInvalidError("secret invalid return")
+
+    llm = _FixedLLM('{"plan":{"n":1}}')
+    engine, request = _post_request(llm, invalid)
+    with pytest.raises(SchemaViolation) as captured:
+        asyncio.run(engine.complete_post_validated(request))
+    assert captured.value.errors == ["post_validator_invalid"]
+    assert "secret" not in str(captured.value)
+    assert llm.calls == 1

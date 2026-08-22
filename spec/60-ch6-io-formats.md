@@ -215,8 +215,8 @@ v1.18 sequence 形态不复用上述渐进式 counts 守恒来宣称部分成功
 
 sequence 形态不写旧 `report.generate.stream`。成功 report 的 `report.generate.sequence` 键序冻结如下；
 示例值同时冻结 `examples/sequence-generation` 的验收算术：2 sets、8 primary sequences、22 primary events、
-2 noise events、1 replay sequence 的 3 replay events，合计 27 stream rows；7 个 primary sessions 中
-1 个 crossed，另有 1 个 replay tail session。
+2 noise events、1 replay sequence 的 3 replay events，合计 27 stream rows；8 个 primary sessions
+彼此独立，另有 1 个 noise session 与 1 个 replay tail session。
 
 ```json
 {
@@ -231,8 +231,8 @@ sequence 形态不写旧 `report.generate.stream`。成功 report 的 `report.ge
   "planned_sequences": 8,
   "delivered_sequences": 8,
   "primary_events": 22,
-  "primary_sessions": 7,
-  "crossed_primary_sessions": 1,
+  "primary_sessions": 8,
+  "crossed_primary_sessions": 0,
   "noise_events": 2,
   "replay_sequences": 1,
   "replay_events": 3,
@@ -283,7 +283,8 @@ sequence 形态不写旧 `report.generate.stream`。成功 report 的 `report.ge
     "noise_memory_budget": 0,
     "noise_context_overflow": 0,
     "noise_output_truncated": 0,
-    "noise_provider_retryable_exhausted": 0
+    "noise_provider_retryable_exhausted": 0,
+    "noise_reconcile": 0
   }
 }
 ```
@@ -291,7 +292,7 @@ sequence 形态不写旧 `report.generate.stream`。成功 report 的 `report.ge
 成功时 `planned_sets = delivered_sets`、`planned_sequences = delivered_sequences`，且每个 variant
 的 planned 与 delivered 相等。`sequence_calls` 计逻辑 family 入口，包含失败 attempt；同一入口内的
 L3 repair 与 provider retry 继续只计既有 schema/usage 面。一次失败 attempt 只进入停止处的一个
-`rejected_attempts` 桶；noise slot 只使用 noise 前缀的七个桶。未列键不得动态追加；provider fatal、
+`rejected_attempts` 桶；noise slot 只使用 noise 前缀的八个桶。未列键不得动态追加；provider fatal、
 plan 与 commit-I/O 属 run terminal，只写 `terminal_error_kind`。
 
 failed report 使用相同 usage 与 `rejected_attempts` 口径，固定路径为
@@ -321,6 +322,8 @@ failed report 不属于成功 manifest，成功运行不删除历史 failed repo
 `canonical_delivery_row` 只移除发射期墙钟观测字段，包括 `_meta.run.started_at`、`finished_at`、
 `duration_ms` 与 manifest `committed_at`，再按 `sort_keys = true`、紧凑 separators、
 `ensure_ascii = false` 编码。摘要不写回 main/stream，也不参与任何 Record ID，因而不存在自引用。
+该 canonical 编码只用于身份、计费与摘要；正式 main/stream/report/manifest 使用保留声明序的紧凑 JSON
+序列化，不能因复用摘要编码而打乱本节冻结的键序。
 
 ## 6.5 v1.18 sequence stream 工件
 

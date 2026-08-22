@@ -121,7 +121,10 @@ capture/2026-07-01/
 
 这些键的完整语义与会话切分规则见第 25 章。
 
-**手上没有真实流？可以先合成一份。**v1.13 的时间流生成（`[generate.stream]`，第 27 章）从零造出一条带时间戳的多会话流，落成一份**时间流工件** `{输出名}.stream.jsonl`——它的行格式就是本节说的时间序输入格式（`{<ts 字段>: …, <text_field>: …, "truth": {…}}`），拷过来配上同样的 `[stream]` 声明（`order_by = "meta:<同一字段>"`、同一个 `gap_s`）就能原样重放，摄取侧会切出与生成侧完全一致的会话。多出来的 `truth` 字段是逐帧真值（会话序数、序列类、类内序数、帧类、是否噪音，重发帧另带 `duplicate_of`；生成侧声明了帧类构成档位时还有 `tier_rank`——v1.14，它是**类内**序数，须连着同行的 `sequence_class` 一起读，v1.15 起各序列类可以有各自的档位表），**不参与任何判定**——要拿它跟分段结果做对照，用 `output.passthrough_fields` 透传出来即可。
+**手上没有真实流？可以先生成一份。** sequence form（第 27 章）会写
+`{output_stem}.stream.jsonl`，每行顶层是 `payload` 与 `_meta`。重放工程把
+`input.text_field = "payload"`、`stream.order_by = "meta:_meta.event.timestamp"`，M2 会从同一文件重算
+primary/replay ID、owner 顺序与 duplicate provenance；任何篡改都会在 ingest 阶段 fail closed。
 
 ## 5.4 数据排布的实践建议
 

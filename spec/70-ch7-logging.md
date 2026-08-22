@@ -279,7 +279,7 @@ generate_only：批进度区退化为 `generate ▶ calls i/N · produced n`（c
 | DeepSeek | 禁止 mock transport、录制响应与本地 LLM server。Anthropic `deepseek-v4-flash` 以 `supports_structured_output = false` 真实交付一个 declared set 的四个 variant；断言 envelopes/variant 恰为四项、protected prefix 耦合、patch 可重放、actual violations 精确、hidden sentinel 不泄漏、1/1 set、4/4 sequences、各 profile usage 非零。production body 必须精确含 `"thinking": {"type": "disabled"}` 且不含 tools/tool_choice。instruction-only 另跑非空 slot，断言 main 恰一条，scenario seed/event plan/frame render/semantic evaluation/token usage 全部大于零，truth 不伪造 pattern、variant 或 expected violation。 |
 | failure injection | 在 production `CrossViewReconciler` 边界装饰一次性 rejection：attempt 0 完成生成、全部 evaluator、全部启用下游和原 reconciler 后，wrapper 才返回固定拒绝；attempt 1 完全委托原实现。两次 observed attempt index 恰为 `{0, 1}`，各含完整四 variant，最终 `sequence_slot_attempts = 2`、injected rejection = 1、1 set/4 sequences，attempt 0 零 output/dedup/dataset commit，usage calls ≥ `2 * estimate.successful_attempt_lower_bound`。另一真实用例只在 EventPlan production state 后置验证边界注入一次 violation，断言目标 `ValidatedGenerationCall.resolved_at` 匹配 `l3_[12]`，正式提交消费的 `EventExecution` 与最后一次成功后置验证返回的是同一冻结实例；不与另一场无注入 live run 比较。两者均保留真实网络、LLMClient、SchemaEngine 与下游事务。 |
 | structured output | z.ai Anthropic `glm-5.2` 真实覆盖 ScenarioSeed、EventPlan、frame 与 SemanticEvaluation 四类组合 Schema：单一强制 tool、`input_schema` 与当次 Schema 深等、`tool_choice` 强制该 tool、thinking 与 profile 声明的 body 形状精确相等、真实 `LLMResponse.structured` 非 null，prompt/completion token 均大于零。DeepSeek 与 z.ai marker 独立；缺某 endpoint key 只跳过对应 marker，不得把跳过当通过。 |
-| example / replay | `examples/sequence-generation` 主例固定 main 8、primary events 22、noise 2、replay 3、stream 27；主输出全行过 Schema，report/manifest 摘要一致。普通 process replay 固定 scanned 27、absorbed 25、dropped_noise 2、episodes 9、dropped_dup 1、emitted 8、failed 0，且重复必须由普通 M3 内容判重。 |
+| example / replay | `examples/sequence-generation` 主例固定 main 8、primary events 22、noise 2、replay 3、stream 27；主输出全行过 Schema，report/manifest 摘要一致。普通 process replay 固定 scanned 27、absorbed 25、dropped_noise 2、episodes 9、dropped_dup 1、emitted 8、failed 0，且重复必须由普通 M3 内容判重。instruction-only 固定一条三事件 sequence；frame-only 同样固定一条三事件 sequence，并要求 sequence annotation 为 null、逐帧 annotation 与 primary stream 一致且通过完整 Schema。 |
 | secret | 两个 endpoint 的 API key value 只作内存 sentinel；捕获的 stderr、trace、main、stream、report、manifest、failed report 与 pytest failure message 均做布尔泄漏检查。失败断言只输出固定英文消息，不把 sentinel 放入 assertion repr。 |
 | sequence 人工门 | 发布抽取 `min(50, delivered_sequences)`，少于 50 全量；开发主例 8 条全量双人盲审，最终发布至少 13 sets / 52 sequences。隐藏 variant truth，检查不可解释状态跃迁、actor 提前知情、模板拼接、等待语义与 set 前缀一致性；任一隐藏知识泄漏/不可能跃迁，或同一缺陷维度跨至少两个独立 scenario，均阻断；其余明显不真实比例 ≤ 10%，分歧由第三人裁决。`docs/dev/evidence/v1.18-sequence-realism-review.jsonl` 首行写 artifact digest、selection seed、样本数、评审人数与解盲时间；逐条写 sequence/scenario id、评审者假名、五维 verdict、value-free defect codes、总 verdict、adjudicator 与 adjudication verdict，不写完整 payload、用户数据或 secret。 |
 | 日志（v1.1 新增） | trace 每行可被 `json.loads` 解析且恰含 ts / run_id / batch_no / stage / ev / record_ids / payload 七字段；对 7.2 事件目录逐事件断言 payload 字段齐全；首行为 run.start 且携带 trace_schema_version=1；`trace.content="refs"` 时 trace 文件不含任何输入内容子串（与 rejects=refs 同法断言）；注入写失败（不可写路径 / mock OSError）断言运行不中断、warn 恰打印一次、`report.trace.dropped_events` 计数正确。 |
@@ -292,6 +292,9 @@ cd examples/sequence-generation
 mkdir -p out
 uv run labelkit validate --config config.toml --project project.toml --console plain
 uv run labelkit run --config config.toml --project project.toml --dry-run --console plain
+uv run labelkit validate --config config.toml --project project-frame-only.toml --console plain
+uv run labelkit run --config config.toml --project project-frame-only.toml --dry-run --console plain
+uv run python check_output.py --frame-only --static
 set -a
 source ../../.env
 set +a
@@ -302,6 +305,8 @@ uv run labelkit run --config config.toml --project project-replay.toml --console
 uv run python check_output.py --replay
 uv run labelkit run --config config.toml --project project-instruction-only.toml --console plain
 uv run python check_output.py --instruction-only
+uv run labelkit run --config config.toml --project project-frame-only.toml --console plain
+uv run python check_output.py --frame-only
 cd ../..
 uv run --python 3.12 pytest -q -m 'not integration'
 uv run --python 3.12 pytest tests/integration/test_sequence_generation_llm.py -q \
@@ -311,4 +316,5 @@ uv run --python 3.12 pytest tests/integration/test_sequence_generation_structure
 ```
 
 最终代码或配置变化后须重跑完整 offline、DeepSeek integration、structured output、主例、
-instruction-only 与 replay。429、5xx 或额度耗尽是环境失败；slot exhaustion 是产品失败，不得靠重跑抹去。
+instruction-only、frame-only 与 replay。429、5xx 或额度耗尽是环境失败；slot exhaustion 是产品失败，
+不得靠重跑抹去。

@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING
 
 from labelkit.common.config import load
 from labelkit.common.config.model import CliOverrides, ResolvedConfig
+from labelkit.common.errors import LabelKitError
 from labelkit.common.observability.obslog import EventLog, MetricsSink, setup_logging
 from labelkit.common.runtime.credentials import (
     RuntimeCredentials,
@@ -31,11 +32,26 @@ if TYPE_CHECKING:
     from labelkit.common.observability.obslog import ProgressListener
     from labelkit.common.runtime.llm_client import ProbeResult
     from labelkit.common.config.model import TraceConfig
+    from labelkit.common.contracts.generation import GenerationProgram, ScenarioPlan
     from labelkit.operators.ingest import Ingestor
 
 __all__ = ["execute_run", "probe_referenced_profiles", "validate_project"]
 
 _log = logging.getLogger("labelkit.runtime")
+
+
+class _SequencePlanFailure(Exception):
+    """保留已编译 program，使 live run 能写无内容 plan failed report。"""
+
+    def __init__(self, program: "GenerationProgram", cause: LabelKitError):
+        """保存 planner 失败边界。
+
+        @param program 已成功编译的程序。
+        @param cause planner 原始冻结异常。
+        """
+        super().__init__(type(cause).__name__)
+        self.program = program
+        self.cause = cause
 
 
 def _activate_listener(listener: "ProgressListener", cfg: ResolvedConfig,
@@ -133,6 +149,64 @@ def _build_ingestor(cfg: ResolvedConfig, metrics: MetricsSink) -> "Ingestor | No
     return ingestor
 
 
+def _compile_sequence_plan(
+    cfg: ResolvedConfig,
+) -> "tuple[GenerationProgram, ScenarioPlan] | None":
+    """在凭据、EventLog 与输出通道之前运行唯一 sequence compiler/planner。
+
+    @param cfg 已解析配置。
+    @return sequence 形态返回唯一 program/plan，flat 返回 None。
+    """
+    if cfg.generate.form != "sequence":
+        return None
+    from labelkit.operators.generation.planner import compile_scenario_plan
+    from labelkit.operators.generation.program import compile_generation_program
+
+    program = compile_generation_program(cfg)
+    try:
+        plan = compile_scenario_plan(program)
+    except LabelKitError as exc:
+        raise _SequencePlanFailure(program, exc) from exc
+    return program, plan
+
+
+def _sequence_plan_for_run(
+    cfg: ResolvedConfig,
+) -> "tuple[GenerationProgram, ScenarioPlan] | None":
+    """编译 live/dry-run 计划并仅在 live planner 失败时写诊断。
+
+    @param cfg 已通过 M1 的配置。
+    @return sequence program/plan；flat 返回 None。
+    """
+    try:
+        return _compile_sequence_plan(cfg)
+    except _SequencePlanFailure as failure:
+        if not cfg.dry_run:
+            from labelkit.orchestration.generation_delivery import _write_plan_failed_report
+
+            _write_plan_failed_report(cfg, failure.program, failure.cause)
+        raise failure.cause from failure
+
+
+def _runtime_run_id(
+    cfg: ResolvedConfig,
+    sequence_plan: "tuple[GenerationProgram, ScenarioPlan] | None",
+) -> str:
+    """为普通运行生成临时 ID，为 sequence 派生冻结 run ID。
+
+    @param cfg 已解析配置。
+    @param sequence_plan 可选的唯一 sequence program/plan。
+    @return 本次 EventLog、MetricsSink 与交付共用 run ID。
+    """
+    if sequence_plan is None:
+        return secrets.token_hex(6)
+    from labelkit.operators.generation.project import derive_generation_id
+
+    program, plan = sequence_plan
+    attempt_id = derive_generation_id("run_attempt_id", [program.digest, program.planner_seed])
+    return derive_generation_id("run_id", [attempt_id, plan.digest])
+
+
 def execute_run(
     config_path: str | Path,
     project_path: str | Path,
@@ -152,8 +226,9 @@ def execute_run(
     @return: 进程退出码
     """
     cfg = load(Path(config_path), Path(project_path), overrides)
+    sequence_plan = _sequence_plan_for_run(cfg)
     setup_logging(cfg)
-    run_id = secrets.token_hex(6)
+    run_id = _runtime_run_id(cfg, sequence_plan)
     run_started_at = datetime.now().astimezone()
 
     event_log = EventLog(_trace_config(cfg), run_id)
@@ -171,6 +246,8 @@ def execute_run(
         Emitter(cfg, schema_engine, run_id, run_started_at),
         services,
     )
+    if sequence_plan is not None:
+        orchestrator._bind_sequence_plan(*sequence_plan)
     if listener is not None:
         _activate_listener(listener, cfg, llm, metrics)
     try:
@@ -195,7 +272,12 @@ def validate_project(
     @param overrides: CLI 覆盖项
     @return: 已解析配置
     """
-    return load(Path(config_path), Path(project_path), overrides)
+    cfg = load(Path(config_path), Path(project_path), overrides)
+    try:
+        _compile_sequence_plan(cfg)
+    except _SequencePlanFailure as failure:
+        raise failure.cause from failure
+    return cfg
 
 
 def probe_referenced_profiles(cfg: ResolvedConfig) -> tuple["ProbeResult", ...]:

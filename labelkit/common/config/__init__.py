@@ -8,14 +8,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from labelkit.common.config.model import (
-    ResolvedConfig,
-    effective_frame_rules,
-    effective_frame_windows,
-)
+from labelkit.common.config.generation import parse_generation_config
+from labelkit.common.config.model import ResolvedConfig
 
-__all__ = ["load", "default_rubric", "ResolvedConfig", "effective_frame_rules",
-           "effective_frame_windows"]
+__all__ = ["load", "default_rubric", "ResolvedConfig", "parse_generation_config"]
 
 
 def __getattr__(name: str) -> Any:

@@ -1,26 +1,13 @@
 """Integration tests for M7 verify against the REAL glm-5.2 endpoint (no mock LLMs).
 
 One obviously-correct and one deliberately-wrong (record, annotation) pair are judged
-with policy="drop"; we assert a pass and a fail verdict respectively.
-
-The sibling service modules M8/M9 may not be implemented yet. When absent, this test
-registers *contract-shaped data types* (Part/Message/PromptBundle, VERDICT_SCHEMA —
-copied verbatim from CONTRACTS.md §7.8/§10.7) so `labelkit.operators.verify` can assemble prompts,
-and drives the LLM through a minimal in-test engine that makes REAL httpx calls to the
-z.ai anthropic endpoint (tool-forced structured output per §7.8) and validates the
-verdict with jsonschema. Nothing is faked: every judge verdict comes from glm-5.2.
+with policy="drop" through the production LLMClient and SchemaEngine.
 """
 from __future__ import annotations
 
 import asyncio
 import os
-import sys
-from dataclasses import dataclass
-from types import ModuleType
-from typing import Literal
 
-import httpx
-import jsonschema
 import pytest
 
 from labelkit.common.config.model import (
@@ -45,128 +32,16 @@ from labelkit.common.config.model import (
     TraceConfig,
     VerifyConfig,
 )
-from labelkit.common.errors import SchemaViolation
 from labelkit.common.contracts.types import Annotation, PipelineItem, Record, RecordRef, Usage
+from labelkit.common.contracts.stage import RunContext
+from labelkit.common.runtime.credentials import RuntimeCredentials
+from labelkit.common.runtime.llm_client import LLMClient
+from labelkit.common.runtime.schema_engine import SchemaEngine
+from labelkit.operators.verify import VerifyStage
 
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 
 pytestmark = pytest.mark.integration
-
-# ── contract-shaped prompt types (only registered if M9 has not landed yet) ──
-
-_VERDICT_SCHEMA = {  # CONTRACTS.md §10.7, verbatim
-    "type": "object",
-    "properties": {
-        "critiques": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "properties": {
-                    "aspect": {"type": "string"},
-                    "opinion": {"type": "string"},
-                },
-                "required": ["aspect", "opinion"],
-                "additionalProperties": False,
-            },
-        },
-        "verdict": {"type": "string", "enum": ["pass", "fail"]},
-    },
-    "required": ["critiques", "verdict"],
-    "additionalProperties": False,
-}
-
-
-def _ensure_contract_modules() -> None:
-    """Register CONTRACTS.md data shapes for modules other engineers have not landed."""
-    try:
-        import labelkit.common.runtime.llm_client  # noqa: F401
-    except ImportError:
-        mod = ModuleType("labelkit.common.runtime.llm_client")
-
-        @dataclass(frozen=True)
-        class Part:
-            kind: Literal["text", "image"]
-            text: str | None = None
-            image: object | None = None
-
-        @dataclass(frozen=True)
-        class Message:
-            role: Literal["system", "user", "assistant"]
-            parts: tuple
-
-        @dataclass(frozen=True)
-        class PromptBundle:
-            messages: tuple
-            temperature: float | None = None
-
-        mod.Part, mod.Message, mod.PromptBundle = Part, Message, PromptBundle
-        sys.modules["labelkit.common.runtime.llm_client"] = mod
-
-    try:
-        import labelkit.common.runtime.schema_engine  # noqa: F401
-    except ImportError:
-        mod = ModuleType("labelkit.common.runtime.schema_engine")
-        mod.VERDICT_SCHEMA = _VERDICT_SCHEMA
-        sys.modules["labelkit.common.runtime.schema_engine"] = mod
-
-
-_ensure_contract_modules()
-
-from labelkit.common.contracts.stage import RunContext  # noqa: E402
-from labelkit.operators.verify import VerifyStage  # noqa: E402
-
-
-# ── minimal REAL-endpoint engine (anthropic provider adaptation, §7.8) ──────
-
-class RealJudgeEngine:
-    """complete_validated() over real POST {base_url}/v1/messages with a tool-forced
-    structured output named "emit" (CONTRACTS.md §7.8), jsonschema-validated."""
-
-    def __init__(self, profiles: dict[str, LLMProfile]):
-        self.profiles = profiles
-
-    async def complete_validated(self, profile, prompt, schema=None, *, scope):
-        p = self.profiles[profile]
-        system = "\n".join(
-            part.text
-            for msg in prompt.messages if msg.role == "system"
-            for part in msg.parts if part.kind == "text"
-        )
-        messages = [
-            {"role": msg.role,
-             "content": [{"type": "text", "text": part.text}
-                         for part in msg.parts if part.kind == "text"]}
-            for msg in prompt.messages if msg.role != "system"
-        ]
-        body = {
-            "model": p.model,
-            "max_tokens": 700,
-            "temperature": 0.0,
-            "system": system,
-            "messages": messages,
-            "tools": [{"name": "emit", "description": "输出评审结果",
-                       "input_schema": schema}],
-            "tool_choice": {"type": "tool", "name": "emit"},
-        }
-        async with httpx.AsyncClient(timeout=p.timeout_s) as client:
-            resp = await client.post(
-                f"{p.base_url}/v1/messages",
-                headers={"x-api-key": p.api_key,
-                         "anthropic-version": "2023-06-01",
-                         "content-type": "application/json"},
-                json=body,
-            )
-            resp.raise_for_status()
-        data = resp.json()
-        obj = next(b["input"] for b in data["content"] if b["type"] == "tool_use")
-        errors = [
-            f"{'/' + '/'.join(str(x) for x in e.absolute_path)}: {e.message}"
-            for e in jsonschema.Draft202012Validator(schema).iter_errors(obj)
-        ]
-        if errors:
-            raise SchemaViolation(errors, str(obj))
-        usage = Usage(data["usage"]["input_tokens"], data["usage"]["output_tokens"])
-        return obj, usage, 1, data.get("model", p.model)
 
 
 class CollectingMetrics:
@@ -241,10 +116,22 @@ def _item(rec_id: str, text: str, output: dict) -> PipelineItem:
 def _run_verify(item: PipelineItem, trace: TraceConfig | None = None):
     cfg = _cfg(trace)
     metrics = CollectingMetrics()
-    ctx = RunContext(cfg=cfg, llm=None, schema_engine=RealJudgeEngine(cfg.llm_profiles),
+    credentials = RuntimeCredentials(
+        llm={"judge": (os.environ[ZAI_KEY_ENV],)}, embedding={}
+    )
+    client = LLMClient(cfg.llm_profiles, {}, credentials)
+    engine = SchemaEngine(cfg.user_schema, client, cfg.output)
+    ctx = RunContext(cfg=cfg, llm=client, schema_engine=engine,
                      metrics=metrics, rng=None, batch_no=1)
     stage = VerifyStage(cfg)
-    asyncio.run(stage.run([item], ctx))
+
+    async def run() -> None:
+        try:
+            await stage.run([item], ctx)
+        finally:
+            await client.aclose()
+
+    asyncio.run(run())
     return item, metrics
 
 

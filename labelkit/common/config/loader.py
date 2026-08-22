@@ -183,17 +183,23 @@ def _resolved_paths(ctx: _LoadCtx, products: _Products) -> ResolvedPaths:
     """
     p = ctx.p
     stem = str(Path(products.eff_output).with_suffix(""))
-    suffix = ".dryrun.report.json" if ctx.cli.dry_run else ".report.json"
+    sequence = p.generate.form == "sequence"
+    suffix = ".report.json" if sequence else (
+        ".dryrun.report.json" if ctx.cli.dry_run else ".report.json")
     return ResolvedPaths(
         project=str(Path(ctx.fp).resolve()),
         project_root=str(ctx.root),
         input=None if ctx.mode == "generate_only" else products.eff_input,
         output=products.eff_output,
         report=stem + suffix,
-        rejects=None if p.output.rejects == "none" else stem + ".rejects.jsonl",
-        sidecar=stem + ".meta.jsonl" if p.output.meta_mode == "sidecar" else None,
+        rejects=(None if sequence or p.output.rejects == "none"
+                 else stem + ".rejects.jsonl"),
+        sidecar=(stem + ".meta.jsonl"
+                 if not sequence and p.output.meta_mode == "sidecar" else None),
         trace=_trace_path(ctx, products) if p.trace.enabled else None,
-        stream_artifact=stem + ".stream.jsonl" if p.generate_stream.enabled else None,
+        stream=stem + ".stream.jsonl" if sequence else None,
+        manifest=stem + ".manifest.json" if sequence else None,
+        failed_report=stem + ".failed.report.json" if sequence else None,
     )
 
 
@@ -209,7 +215,8 @@ def _log_paths(paths: ResolvedPaths) -> None:
     """
     sides = [f"{name}={value}" for name, value in (
         ("rejects", paths.rejects), ("sidecar", paths.sidecar),
-        ("trace", paths.trace), ("stream_artifact", paths.stream_artifact)) if value]
+        ("trace", paths.trace), ("stream", paths.stream), ("manifest", paths.manifest),
+        ("failed_report", paths.failed_report)) if value]
     suffix = (" " + " ".join(sides)) if sides else ""
     print(f"run paths: output={paths.output} report={paths.report}{suffix}",
           file=sys.stderr)
@@ -218,14 +225,13 @@ def _log_paths(paths: ResolvedPaths) -> None:
 def _validation_hooks(products: _Products) -> ValidationHooks:
     """把 M1 解析期冻结的四个钩子载体装配成 ``ValidationHooks``。
 
-    @param products 产物累加器(其 ``hooks`` 键 = output/sample/sequence/scenario)
+    @param products 产物累加器(其 ``hooks`` 键 = output/sample/state)
     @return 冻结的 ``ValidationHooks``(未声明/未通过双检的键为 None)
     """
     return ValidationHooks(
         output=products.hooks.get("output"),
         sample=products.hooks.get("sample"),
-        sequence=products.hooks.get("sequence"),
-        scenario=products.hooks.get("scenario"),
+        state=products.hooks.get("state"),
     )
 
 
@@ -266,14 +272,13 @@ def _assemble(ctx: _LoadCtx, head: _ToolSide, products: _Products,
         frame_annotate=p.frame_annotate,
         frame_class_views=products.frame_class_views,
         frame_schema=products.frame_schema,
-        generate_stream=p.generate_stream,   # v1.13
+        sequence_generation=products.sequence_generation,
         limit=cli.limit, strict=cli.strict, dry_run=cli.dry_run,
         config_path=ctx.fc, project_path=ctx.fp,
         config_digest="sha256:" + hashlib.sha256(config_raw or b"").hexdigest(),
         project_digest="sha256:" + hashlib.sha256(project_raw or b"").hexdigest(),
         paths=paths,
         validation_hooks=_validation_hooks(products),
-        scenario_plan=products.scenario_plan,
     )
 
 

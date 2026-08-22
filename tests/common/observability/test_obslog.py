@@ -585,6 +585,71 @@ def test_metrics_sink_counters_and_stage_times(tmp_path):
     assert sink.stage_times == {"dedup": 0.75}
 
 
+def test_metrics_sink_capture_counts_defers_and_merges(tmp_path):
+    cfg = make_cfg(tmp_path)
+    sink = MetricsSink(cfg, "abc", EventLog(cfg.trace, "abc"))
+    sink.count("quality.kept", 2)
+
+    with sink.capture_counts() as captured:
+        sink.count("quality.kept", 3)
+        sink.count("annotate.sc_disagreements")
+        assert sink.counters == {"quality.kept": 2}
+
+    assert captured == {"quality.kept": 3, "annotate.sc_disagreements": 1}
+    assert sink.counters == {"quality.kept": 2}
+    sink.merge_counts(captured)
+    assert sink.counters == {"quality.kept": 5, "annotate.sc_disagreements": 1}
+
+
+def test_metrics_sink_capture_counts_rolls_back_on_exception(tmp_path):
+    cfg = make_cfg(tmp_path)
+    sink = MetricsSink(cfg, "abc", EventLog(cfg.trace, "abc"))
+
+    with pytest.raises(ValueError, match="attempt failed"):
+        with sink.capture_counts() as captured:
+            sink.count("quality.kept")
+            raise ValueError("attempt failed")
+
+    assert captured == {"quality.kept": 1}
+    assert sink.counters == {}
+    with sink.capture_counts() as next_capture:
+        sink.count("quality.kept", 2)
+    assert next_capture == {"quality.kept": 2}
+
+
+def test_metrics_sink_capture_keeps_budget_runtime_facts_on_attempt_rollback(tmp_path):
+    """attempt-local dataset counter 回滚不撤销 budget 运行事实。"""
+    cfg = make_cfg(tmp_path)
+    sink = MetricsSink(cfg, "abc", EventLog(cfg.trace, "abc"))
+
+    with pytest.raises(ValueError, match="rejected"):
+        with sink.capture_counts() as captured:
+            sink.count("quality.kept")
+            sink.count("budget.truncations.annotate")
+            sink.count("budget.overflow_records")
+            raise ValueError("rejected")
+
+    assert captured == {"quality.kept": 1}
+    assert sink.counters == {
+        "budget.truncations.annotate": 1,
+        "budget.overflow_records": 1,
+    }
+
+
+def test_metrics_sink_rejects_nested_capture_and_invalid_merge(tmp_path):
+    cfg = make_cfg(tmp_path)
+    sink = MetricsSink(cfg, "abc", EventLog(cfg.trace, "abc"))
+
+    with sink.capture_counts():
+        with pytest.raises(RuntimeError, match="already active"):
+            with sink.capture_counts():
+                pass
+        with pytest.raises(RuntimeError, match="while count capture"):
+            sink.merge_counts({"quality.kept": 1})
+    with pytest.raises(RuntimeError, match="non-negative integer"):
+        sink.merge_counts({"quality.kept": -1})
+
+
 def test_circuit_breaker_streak_and_reset(tmp_path):
     cfg = make_cfg(tmp_path)     # fatal_error_threshold = 3
     sink = MetricsSink(cfg, "abc", EventLog(cfg.trace, "abc"))

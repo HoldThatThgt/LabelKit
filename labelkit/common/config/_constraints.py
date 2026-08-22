@@ -4,8 +4,7 @@
 ``_Collector`` 里记账, 从不提前抛出; 少数函数会回传被"回填/冻结"过的配置对象
 (classify.max_labels 回填、segment/frame_classify 的 vision_resolved 冻结)。
 
-v1.13--v1.16 时间流生成约束位于 ``_generate_stream_constraints``，本模块只保留总驱动与
-其余配置组合约束。
+v1.18 sequence 配置由 ``config.generation`` 聚合解析，本模块负责接入通用 M1 流程。
 """
 from __future__ import annotations
 
@@ -28,7 +27,10 @@ from labelkit.common.config._classviews import (
     _build_frame_class_views,
 )
 from labelkit.common.config._collect import _Collector, _fmt
-from labelkit.common.config._generate_stream_constraints import check_generate_stream_form
+from labelkit.common.config.generation import (
+    SequenceGenerationConfig,
+    parse_generation_config,
+)
 from labelkit.common.config._rubrics import _RubricSite, _check_pointwise_rubric, _resolve_rubric
 from labelkit.common.config._schemas import (
     _DryRun,
@@ -45,16 +47,13 @@ from labelkit.common.config.model import (
     FrameClassView,
     LLMProfile,
     Rubric,
-    effective_frame_rules,
-    effective_frame_windows,
-    render_constraint_text,
 )
+from labelkit.common.contracts.generation import GenerationParseContext
 from labelkit.common.extensions.hooks import (
     ResolvedHook,
     check_hook_arity,
     load_hook,
     probe_hook,
-    scenario_probe_input,
 )
 from labelkit.common.runtime import budget
 
@@ -92,11 +91,9 @@ class _Products:
     eff_input: str | None = None                        # 生效输入路径(CLI > project, 绝对)
     eff_output: str | None = None                       # 生效输出路径(CLI > project, 绝对)
     hooks: dict[str, ResolvedHook] = field(default_factory=dict)
-                                                        # v1.17 已解析冻结的钩子载体
-                                                        # (键 = output/sample/sequence/scenario)
-    scenario_plan: Any = None
-                                                        # v1.17 compile_scenario 的冻结计划
-                                                        # (形态开启且静态门干净时装配)
+                                                        # 键 = output/sample/state
+    sequence_generation: SequenceGenerationConfig | None = None
+                                                        # v1.18 sequence-only 解析产物
 
 
 def _check_llm_ref(ctx: _LoadCtx, loc: str, name: str) -> None:
@@ -148,8 +145,9 @@ def _check_profile_refs(ctx: _LoadCtx) -> None:
         _check_llm_ref(ctx, f"{fp}:[extract].llm", p.extract.llm)   # v1.8 S30: 启用即引用
     _check_llm_ref(ctx, f"{fp}:[quality].llm", p.quality.llm)
     _check_llm_ref(ctx, f"{fp}:[annotate].llm", p.annotate.llm)
-    for i, name in enumerate(p.generate.llms, 1):
-        _check_llm_ref(ctx, f"{fp}:[generate].llms[{i}]", name)
+    if p.generate.form == "flat":
+        for i, name in enumerate(p.generate.llms, 1):
+            _check_llm_ref(ctx, f"{fp}:[generate].llms[{i}]", name)
     if p.verify.enabled and not p.verify.judges:
         # spec §5.2 脚注 †: 关闭时不要求默认 "judge" 存在; 非空评审团在运行期**取代**
         # verify.llm(3.7.2), 故其存在性也不作要求(E2E 发现 P3-8)——评审团成员在下面查
@@ -292,6 +290,43 @@ def _check_generate_weights(ctx: _LoadCtx) -> None:
             col.error(f"{fp}:[generate].weights[{i}]: expected positive number, got {_fmt(w)}")
 
 
+def _check_generation_form(ctx: _LoadCtx) -> None:
+    """校验 flat 与 sequence 的精确互斥键面和运行前提。
+
+    @param ctx 校验上下文
+    """
+    p, col, fp = ctx.p, ctx.col, ctx.fp
+    provided = p.gen_provided
+    if p.generate.form == "flat":
+        for key in ("mode", "semantic_llm", "evaluation_llm", "max_slot_attempts",
+                    "state_validator", "pattern", "counterfactual_sets", "instruction_only",
+                    "timeline", "calendar_window", "noise"):
+            if provided.get(key):
+                col.error(f"{fp}:[generate].{key}: generation_config_invalid: "
+                          "sequence key is forbidden in flat form")
+        return
+    for key in ("llms", "styles", "seed_examples", "standalone_count", "num_per_record",
+                "seeds_per_call", "num_per_call"):
+        if provided.get(key):
+            col.error(f"{fp}:[generate].{key}: generation_config_invalid: "
+                      "flat key is forbidden in sequence form")
+    requirements = (
+        (ctx.mode == "generate_only", "[run].mode", 'must be "generate_only"'),
+        (ctx.modality == "text", "[run].modality", 'must be "text"'),
+        (p.generate.enabled, "[generate].enabled", "must be true"),
+        (not p.classify.enabled, "[classify].enabled", "must be false"),
+        (not p.frame_classify.enabled, "[frame.classify].enabled", "must be false"),
+        (p.dedup.enabled, "[dedup].enabled", "must be true"),
+        (p.dedup.scope == "global", "[dedup].scope", 'must be "global"'),
+        (p.output.meta_mode == "inline", "[output].meta_mode", 'must be "inline"'),
+        (p.output.rejects == "none", "[output].rejects", 'must be "none"'),
+        (ctx.cli.limit is None, "cli:--limit", "must be absent"),
+    )
+    for valid, location, message in requirements:
+        if not valid:
+            col.error(f"{fp}:{location}: generation_config_invalid: sequence form {message}")
+
+
 def _check_run_mode(ctx: _LoadCtx) -> None:
     """规则 10/11(v1.4; = 阶段约束④): generate_only 与 process 两种模式的键面。
 
@@ -325,9 +360,8 @@ def _check_generate_only_mode(ctx: _LoadCtx) -> None:
     if not p.generate.enabled:
         col.error(f'{fp}:[generate].enabled: run.mode = "generate_only" requires '
                   f"generate.enabled = true")
-    # v1.17: 时间流形态自带 quota 面([[generate.stream.quotas]])——种子池与独立计数两族键
-    # 都不适用(显式书写由形态约束簇定向报错), 互斥校验仅平面形态执行。
-    if not p.generate_stream.enabled:
+    # sequence 形态由自己的精确声明持有交付数量；flat 才校验种子池与独立计数。
+    if p.generate.form == "flat":
         _check_flat_generate_only(ctx)
 
 
@@ -372,10 +406,7 @@ def _collect_referenced(ctx: _LoadCtx) -> set[str]:
         referenced.add(p.segment.llm)      # v1.8, S30 引用集要点②
     if p.stitch.enabled:
         referenced.add(p.stitch.llm)       # v1.9, T17 引用集要点
-    if p.classify.enabled and not p.generate_stream.enabled:
-        # v1.7, R24 引用集要点②; v1.13: 时间流形态的序列标签直接继承(inherited,
-        # classify 零判决调用)⇒ 援引 S30 先例豁免密钥引用集——存在性检查照旧
-        # (拼错 profile 名仍要在启动期揪出, 不需要活密钥)
+    if p.classify.enabled:
         referenced.add(p.classify.llm)
     if p.frame_classify.enabled:
         referenced.add(p.frame_classify.llm)   # v1.12 帧级分类引用集要点
@@ -387,8 +418,13 @@ def _collect_referenced(ctx: _LoadCtx) -> set[str]:
         referenced |= set(p.quality.judges) if judges_active else {p.quality.llm}
     if p.annotate.enabled:
         referenced.add(p.annotate.llm)
-    if p.generate.enabled:
+    if p.generate.enabled and p.generate.form == "flat":
         referenced |= set(p.generate.llms)
+    if p.generate.enabled and p.generate.form == "sequence":
+        raw = p.raw_project.get("generate")
+        if isinstance(raw, dict):
+            referenced |= {value for key in ("semantic_llm", "evaluation_llm")
+                           if isinstance((value := raw.get(key)), str) and value}
     if p.verify.enabled:
         referenced |= set(p.verify.judges) if p.verify.judges else {p.verify.llm}
     if p.output.repair_llm is not None:
@@ -440,10 +476,7 @@ def _resolve_and_probe_hook(ctx: _LoadCtx, loc: str, ref: str, arity: int,
 def _load_schema_and_hooks(ctx: _LoadCtx, products: _Products) -> None:
     """规则 13–15 与规则 17: 用户 Schema、few-shot 干跑与用户校验钩子。
 
-    v1.17(SPEC-SP §4.9): output.validator / generate.sample_validator /
-    generate.scenario_validator 三个钩子键在此解析为 ``ResolvedHook`` 冻结载体并做
-    位置参数数量检查 + synthetic 干跑; ``generate.sequence_validator`` 由时间流
-    形态约束簇解析(需要类表构造代表性 probe 输入)。
+    output.validator 与 flat generate.sample_validator 在此解析并做 synthetic 干跑。
 
     @param ctx 校验上下文
     @param products 产物累加器(填充 ``user_schema``/``dryrun``/``hooks``)
@@ -460,7 +493,7 @@ def _load_schema_and_hooks(ctx: _LoadCtx, products: _Products) -> None:
         dr.schema_alive, _ = _dryrun_fewshot(col, p.annotate.examples, _DryRun(
             file=fp, elem_label="annotate.examples", validator=dr.validator,
             schema_key=skey))
-    # 规则 17 + v1.17 rule 70 — 三个钩子键的统一 file-form 解析面
+    # 通用 output 与 flat sample hook 的 file-form 解析面。
     if p.output.validator is not None:
         hook = _resolve_and_probe_hook(ctx, f"{fp}:[output].validator",
                                        p.output.validator, 2, ({"topic": "probe"}, None))
@@ -468,18 +501,13 @@ def _load_schema_and_hooks(ctx: _LoadCtx, products: _Products) -> None:
             dr.hook = hook.target
             dr.hook_ref = hook.reference
             products.hooks["output"] = hook
-    if p.generate.enabled and p.generate.sample_validator is not None:
+    if (p.generate.enabled and p.generate.form == "flat"
+            and p.generate.sample_validator is not None):
         hook = _resolve_and_probe_hook(ctx, f"{fp}:[generate].sample_validator",
                                        p.generate.sample_validator, 1,
                                        ("m1-probe-sample",))
         if hook is not None:
             products.hooks["sample"] = hook
-    if p.generate.scenario_validator is not None:
-        hook = _resolve_and_probe_hook(ctx, f"{fp}:[generate].scenario_validator",
-                                       p.generate.scenario_validator, 1,
-                                       (scenario_probe_input(),))
-        if hook is not None:
-            products.hooks["scenario"] = hook
     if dr.hook is not None and schema_ok and p.annotate.examples:
         _, dr.hook_alive = _dryrun_fewshot(col, p.annotate.examples, _DryRun(
             file=fp, elem_label="annotate.examples", schema_key=skey,
@@ -491,8 +519,7 @@ def _resolve_global_rubric(ctx: _LoadCtx, products: _Products) -> None:
 
     v1.8 S29: 流模式下空选择器对**两种模态**都解析为轨迹准则(逐帧的 default:ui 准则
     对无图序列打分没有意义); 显式选择器恒胜出, 按类视图经回填的基线选择器继承。
-    v1.13(裁决·轨迹准则自动解析扩展): 空选择器条件扩为
-    ``segment.enabled ∨ generate_stream.enabled``——时间流形态打的也是序列/轨迹分。
+    v1.18 sequence 形态与 segment 流模式都默认使用轨迹准则。
 
     @param ctx 校验上下文
     @param products 产物累加器(填充 ``selector`` / ``rubric`` / ``rubric_is_inline``)
@@ -500,7 +527,7 @@ def _resolve_global_rubric(ctx: _LoadCtx, products: _Products) -> None:
     p = ctx.p
     if p.quality.rubric:
         selector = p.quality.rubric
-    elif p.segment.enabled or p.generate_stream.enabled:
+    elif p.segment.enabled or p.generate.form == "sequence":
         selector = "default:trajectory"
     else:
         selector = "default:ui" if ctx.modality == "ui" else "default:text"
@@ -512,23 +539,19 @@ def _resolve_global_rubric(ctx: _LoadCtx, products: _Products) -> None:
 
 
 def _check_classify_table(ctx: _LoadCtx) -> None:
-    """v1.7: ``classify.enabled = true`` 时的类表约束(类数、fallback、max_labels)。
-
-    v1.13(裁决·序列类约束按形态放宽): 时间流形态无判决路径(标签 inherited),
-    「≥ 2 类」与「fallback_class 必填」两条规则的保护对象不存在 ⇒ 放宽为 ≥ 1 类、
-    fallback 免填(写了仍须 ∈ 类表)。
+    """``classify.enabled = true`` 时校验类数、fallback 与 max_labels。
 
     @param ctx 校验上下文
     """
     col, fp, p = ctx.col, ctx.fp, ctx.p
     classify = p.classify
     class_names = tuple(c.name for c in classify.classes)
-    min_classes = 1 if p.generate_stream.enabled else 2
+    min_classes = 2
     if len(classify.classes) < min_classes:
         col.error(f"{fp}:[classify].classes: classify.enabled = true requires >= "
                   f"{min_classes} declared classes (the [[classify.classes]] array of "
                   f"tables), got {len(classify.classes)}")
-    if not classify.fallback_class and not p.generate_stream.enabled:
+    if not classify.fallback_class:
         col.error(f"{fp}:[classify].fallback_class: required when classify.enabled = true, "
                   f"expected a class name from [[classify.classes]]")
     elif classify.fallback_class and class_names \
@@ -577,12 +600,14 @@ def _check_classify_and_views(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
                   f"got {sc_c}")
     if p.classify_provided["max_labels"] and p.classify.assignment != "multi":
         col.error(f'{fp}:[classify].max_labels: can only be set when assignment = "multi"')
-    if not p.classify.enabled:
+    sequence = p.generate.form == "sequence"
+    if not p.classify.enabled and not sequence:
         _warn_parked_classify(ctx)
         return ctx
-    _check_classify_table(ctx)
+    if p.classify.enabled:
+        _check_classify_table(ctx)
     classify = p.classify
-    if classify.max_labels is None:
+    if p.classify.enabled and classify.max_labels is None:
         classify = replace(classify, max_labels=len(classify.classes))   # spec 5.2 回填
         ctx = replace(ctx, p=replace(p, classify=classify))
     inputs = _ViewInputs(
@@ -768,9 +793,7 @@ def _warn_segment_off(ctx: _LoadCtx) -> None:
     """
     col, fp, p = ctx.col, ctx.fp, ctx.p
     parked = []
-    if p.stream_provided["section"] and not p.generate_stream.enabled:
-        # v1.13(裁决·停放豁免精确化): 时间流形态复用摄取侧词汇——[stream] 是生成侧的
-        # 铺设契约(order_by 声明工件时间戳字段、gap_s 定会话间隔下界), 此时不是停放配置
+    if p.stream_provided["section"]:
         parked.append("[stream]")
     if p.segment_provided["non_switch_keys"]:
         parked.append("[segment]")
@@ -779,10 +802,8 @@ def _warn_segment_off(ctx: _LoadCtx) -> None:
     if p.extract_provided["non_switch_keys"] and not p.extract.enabled:
         parked.append("[extract]")
     if (p.frame_provided["section"] and not p.frame_classify.enabled
-            and not p.frame_annotate.enabled and not p.generate_stream.enabled):
-        # v1.12 no-op 约束: [frame.*] 节在场 ∧ 均未启用 ∧ segment off ⇒ 入 R8 停放清单
-        # (任一帧开关启用时由「帧粒度要求流模式」CONFIG_ERROR 接管, 不再重复告警)。
-        # v1.13: 时间流形态下帧类表与 [frame.class.*.generate] 是生效面, 不入停放清单
+            and not p.frame_annotate.enabled and p.generate.form != "sequence"):
+        # 两个帧开关均关闭时，flat 形态下的帧配置属于停放配置。
         parked.append("[frame]")
     if parked:
         col.warn(f"{fp}:[segment].enabled: segment.enabled = false, "
@@ -817,13 +838,13 @@ def _check_frame_switches(ctx: _LoadCtx) -> None:
     @param ctx 校验上下文
     """
     col, fp, p = ctx.col, ctx.fp, ctx.p
-    for fname, fon in (("frame.classify", p.frame_classify.enabled),
-                       ("frame.annotate", p.frame_annotate.enabled)):
-        if fon and not p.segment.enabled:
-            col.error(f"{fp}:[{fname}].enabled: {fname}.enabled = true requires "
-                      f"segment.enabled = true (frame granularity is stream-mode only) - "
-                      f"outside stream mode use classify + [class.<name>.annotate] "
-                      f"per-class annotation")
+    if p.frame_classify.enabled and not p.segment.enabled:
+        col.error(f"{fp}:[frame.classify].enabled: frame.classify.enabled = true requires "
+                  f"segment.enabled = true (frame classification needs segmented records)")
+    if (p.frame_annotate.enabled and not p.segment.enabled
+            and p.generate.form != "sequence"):
+        col.error(f"{fp}:[frame.annotate].enabled: frame.annotate.enabled = true requires "
+                  f"segment.enabled = true outside generate.form = \"sequence\"")
     # 约束·定向探针(v1.11 use_vision 原始节探针同款机制): 帧级无多标签、无自洽采样。
     if p.frame_provided["classify_assignment"]:
         col.error(f"{fp}:[frame.classify].assignment: frame classification does not provide "
@@ -888,7 +909,8 @@ def _load_frame_annotate_schema(ctx: _LoadCtx, products: _Products) -> _FrameVie
     fskey = ("schema_inline" if p.frame_annotate.schema_inline is not None
              else "schema_path")
     fctx = _FrameViewCtx(file=fp, classify=p.frame_classify, annotate=p.frame_annotate,
-                         class_raw=p.frame_class_raw, schema_key=fskey)
+                         class_raw=p.frame_class_raw,
+                         sequence=p.generate.form == "sequence", schema_key=fskey)
     if not p.frame_annotate.enabled:
         return fctx
     fschema, fs_ok = _load_frame_schema(col, fp, p.frame_annotate)
@@ -912,24 +934,23 @@ def _check_frame_namespace(ctx: _LoadCtx, products: _Products) -> None:
     """
     col, fp, p = ctx.col, ctx.fp, ctx.p
     fctx = _load_frame_annotate_schema(ctx, products)
-    frame_ns_live = p.frame_classify.enabled or p.generate_stream.enabled
+    frame_ns_live = p.frame_classify.enabled or p.generate.form == "sequence"
     raw = p.frame_class_raw
     if isinstance(raw, dict) and raw and not frame_ns_live:
         for cname in raw:
             col.error(f"{fp}:[frame.class.{cname}]: the presence of [frame.class.*] "
                       f"requires frame.classify.enabled = true or "
-                      f"generate.stream.enabled = true (frame-class overrides depend on "
-                      f"frame classification producing the labels; the time-stream "
-                      f"generation form declares frame content contracts through "
+                      f'generate.form = "sequence" (frame-class overrides depend on '
+                      f"frame classification producing the labels; sequence generation "
+                      f"declares frame content contracts through "
                       f"[frame.class.*.generate])")
-    if isinstance(raw, dict) and not p.generate_stream.enabled:
-        # v1.13(裁决·帧类生成面): generate 节仅时间流生成形态合法——反向定向
-        # CONFIG_ERROR(白名单接纳该节名, 故此处必须显名拦截, 否则会静默无效)
+    if isinstance(raw, dict) and p.generate.form != "sequence":
+        # generate 节仅 sequence 形态合法；白名单已接纳节名，故在此定向拦截。
         for cname, sections_g in raw.items():
             if isinstance(sections_g, dict) and "generate" in sections_g:
                 col.error(f"{fp}:[frame.class.{cname}.generate]: this section is only legal "
-                          f"in the time-stream generation form "
-                          f"([generate.stream].enabled = true) - write "
+                          f"in the sequence generation form "
+                          f'([generate].form = "sequence") - write '
                           f"[frame.class.{cname}.annotate] for frame annotation")
     if frame_ns_live:
         products.frame_class_views = _build_frame_class_views(col, fctx)
@@ -944,6 +965,48 @@ def _check_frame_family(ctx: _LoadCtx, products: _Products) -> None:
     _check_frame_switches(ctx)
     _check_frame_class_table(ctx)
     _check_frame_namespace(ctx, products)
+
+
+def _check_sequence_quality(ctx: _LoadCtx, products: _Products) -> None:
+    """校验 sequence 形态所有有效质量视图的固定 pointwise 门。
+
+    @param ctx 校验上下文
+    @param products 已物化按类视图的产物
+    """
+    if not ctx.p.quality.enabled:
+        return
+    for cname, view in products.class_views.items():
+        quality = view.quality
+        valid = (quality.mode == "pointwise" and quality.selection == "threshold"
+                 and quality.threshold is not None and quality.top_ratio is None)
+        if not valid:
+            ctx.col.error(f"{ctx.fp}:[class.{cname}.quality]: generation_config_invalid: "
+                          "sequence quality requires pointwise with an explicit fixed threshold")
+
+
+def _parse_sequence_generation(ctx: _LoadCtx, products: _Products) -> None:
+    """把 v1.18 sequence namespace 聚合成唯一冻结 parse product。
+
+    @param ctx 校验上下文
+    @param products 产物累加器
+    """
+    if ctx.p.generate.form != "sequence":
+        return
+    context = GenerationParseContext(
+        project_root=ctx.root,
+        class_views=products.class_views,
+        frame_classes=products.frame_class_views,
+        llm_profiles=ctx.llm_profiles,
+        max_repair_attempts=ctx.p.output.max_repair_attempts,
+        repair_profile=ctx.p.output.repair_llm,
+        hook_loader=load_hook,
+        collector=ctx.col,
+    )
+    parsed = parse_generation_config(ctx.p.raw_project, context)
+    products.sequence_generation = parsed
+    if parsed.state_validator is not None:
+        products.hooks["state"] = parsed.state_validator
+    _check_sequence_quality(ctx, products)
 
 
 # ── v1.11 — 上下文预算与 vision 推导(spec 3.1.4 上下文预算行) ────────────────
@@ -1129,9 +1192,8 @@ def _static_checks_scoring(ctx: _LoadCtx, views: tuple[ClassView, ...],
                            products: _Products) -> list[tuple[str, tuple, int]]:
     """V13③ 静态部件: quality 与 annotate 两段(逐池取最大)。
 
-    v1.13: annotate 的 schema 项现在是按类的(裁决·按类标注 Schema)——最大值跑在**整
-    池之和**(schema + instruction + few-shot)上; 未声明按类 Schema 时每个视图都解析到
-    全局那份, 取值与 v1.12 逐字节一致。
+    annotate 的最大值按完整 schema + instruction + few-shot 计算；未声明按类 Schema
+    时每个视图使用全局 Schema。
 
     @param ctx 校验上下文
     @param views 全部类视图
@@ -1163,164 +1225,22 @@ def _static_checks_scoring(ctx: _LoadCtx, views: tuple[ClassView, ...],
 
 def _static_checks_generate(ctx: _LoadCtx, products: _Products,
                             len_max: int) -> list[tuple[str, tuple, int]]:
-    """V13③ 静态部件: generate 段与 v1.13 的蓝图 / 帧实现两段(裁决·预算头两键)。
-
-    蓝图调用 = 冻结模板头 + 类有效 instruction + 全帧类表; 帧实现调用 = 冻结模板头 +
-    类有效 instruction + 最坏 L_max × max(帧类生成 Schema)(逐位契约把 Schema 文本重复
-    L 次)。噪音批量实现复用 generate 段。
+    """构造 flat generate 的通用静态预算检查。
 
     @param ctx 校验上下文
     @param products 产物累加器
-    @param len_max 各类 len_range 上界的最大值
-    @return (阶段名, profile 名元组, 静态估算)三元组列表
+    @param len_max 保留的通用签名参数
+    @return 阶段、profile 与静态 token 估算
     """
+    del len_max
     p = ctx.p
+    if not p.generate.enabled or p.generate.form != "flat":
+        return []
     views = tuple(products.class_views.values())
-    gen_instruction_est = max([budget.est_text(p.generate.instruction)]
-                              + [budget.est_text(v.generate.instruction) for v in views])
-    checks: list[tuple[str, tuple, int]] = []
-    if p.generate.enabled:
-        checks.append(("generate", tuple(p.generate.llms),
-                       budget.TEMPLATE_HEAD_TOKENS["generate"] + gen_instruction_est))
-    if not p.generate_stream.enabled:
-        return checks
-    # v1.17: 时间流形态恒走 brief+realize 两段（planner 已在 M1 冻结 word）；
-    # 参与类与最长长度取自冻结计划（scenario_plan），约束文本经换名后的
-    # render_constraint_text（config.model）渲染。
-    plan = products.scenario_plan
-    if plan is None or not plan.slots:
-        return checks
-    seen_classes: list[str] = []
-    joint_views = []
-    for slot in plan.slots:
-        name = slot.sequence_class
-        if name in products.class_views and name not in seen_classes:
-            seen_classes.append(name)
-            joint_views.append(products.class_views[name])
-    if not joint_views:
-        return checks
-    slot_len_max = max(slot.length_target for slot in plan.slots)
-    for name in p.generate.llms:
-        profile = ctx.llm_profiles.get(name)
-        if profile is None:
-            continue
-        brief_est, realize_est = _joint_prompt_estimates(
-            ctx, products, joint_views, slot_len_max, profile)
-        checks.append(("generate.stream.plan", (name,), brief_est))
-        checks.append(("generate.stream.realize", (name,), realize_est))
-    return checks
-
-
-def _joint_prompt_estimates(ctx: _LoadCtx, products: _Products,
-                            views: list[ClassView], len_max: int,
-                            profile: LLMProfile) -> tuple[int, int]:
-    """计算联合 brief 与不可拆 realize 的保守完整输入上界。"""
-    p = ctx.p
-    names = tuple(products.frame_class_views)
-    longest_frame = max(names, key=budget.est_text)
-    longest_class = max((view.name for view in views), key=budget.est_text)
-    instruction = max((view.generate.instruction for view in views),
-                      key=budget.est_text)
-    constraints = max((_joint_constraint_text(p, view) for view in views),
-                      key=budget.est_text)
-    positions = "\n".join(f"{index}: {longest_frame}"
-                           for index in range(1, len_max + 1))
-    brief_user = f"请为一条「{longest_class}」序列产出固定的 {len_max} 个 brief。"
-    brief = (budget.TEMPLATE_HEAD_TOKENS["generate_brief"]
-             + budget.est_text(instruction) + budget.est_text(constraints)
-             + budget.est_text(positions) + budget.est_text(brief_user)
-             + 2 * budget.MSG_OVERHEAD_TOKENS)
-    realize = _joint_realize_estimate(ctx, products, views, len_max, profile)
-    if profile.supports_structured_output:
-        brief += _brief_schema_estimate(len_max)
-    return brief, realize
-
-
-def _joint_constraint_text(project: _Project, view: ClassView) -> str:
-    """渲染一个序列类的生效规则与窗口预算文本。"""
-    rules = effective_frame_rules(view.frame_rules, project.generate_stream.frame_rules)
-    windows = effective_frame_windows(view.frame_windows,
-                                      project.generate_stream.frame_windows)
-    return render_constraint_text(rules, windows)
-
-
-def _joint_has_correlation(project: _Project, views: list[ClassView]) -> bool:
-    """判断实际联合规划前缀是否存在 correlation。"""
-    return any(rule.correlation is not None
-               for view in views
-               for rule in effective_frame_rules(view.frame_rules,
-                                                 project.generate_stream.frame_rules))
-
-
-def _joint_realize_estimate(ctx: _LoadCtx, products: _Products,
-                            views: list[ClassView], len_max: int,
-                            profile: LLMProfile) -> int:
-    """计算联合 realize 输入的保守上界。"""
-    p = ctx.p
-    longest_frame = max(products.frame_class_views, key=budget.est_text)
-    instruction = max((view.generate.instruction for view in views),
-                      key=budget.est_text)
-    constraints = max((_joint_constraint_text(p, view) for view in views),
-                      key=budget.est_text)
-    styles = [style.prompt for view in views for style in view.generate.styles]
-    style_est = max([0] + [budget.est_text(value) for value in styles])
-    contract, schema = _largest_frame_contract(products)
-    frame_line = f"第 {len_max} 帧（{longest_frame}）须符合：{contract}"
-    user_line = f"{len_max}. [{longest_frame}] "
-    result = (budget.TEMPLATE_HEAD_TOKENS["generate_realize"]
-              + budget.est_text(instruction) + style_est
-              + budget.est_text(constraints)
-              + len_max * (budget.est_text(frame_line) + budget.est_text(user_line))
-              + (profile.max_output_tokens if _joint_has_correlation(p, views) else 0)
-              + 2 * budget.MSG_OVERHEAD_TOKENS)
-    if profile.supports_structured_output:
-        result += _realize_schema_estimate(schema, len_max)
-    return result
-
-
-def _largest_frame_contract(products: _Products) -> tuple[str, dict]:
-    """取最坏逐帧内容契约与对应 Schema。"""
-    candidates: list[tuple[str, dict]] = []
-    for view in products.frame_class_views.values():
-        schema = _reduced_frame_schema(view)
-        shape = (json.dumps(schema, ensure_ascii=False, separators=(", ", ": "))
-                 if schema is not None else "自由文本一段")
-        contract = f"{view.gen_instruction or ''}\n内容契约：{shape}"
-        candidates.append((contract, schema or {"type": "string"}))
-    contract = max(candidates, key=lambda item: budget.est_text(item[0]))[0]
-    schema = max(candidates, key=lambda item: budget.est_text(
-        json.dumps(item[1], ensure_ascii=False)))[1]
-    return contract, schema
-
-
-def _reduced_frame_schema(view: FrameClassView) -> dict | None:
-    """按 v1.14 time_fields 规则派生 LLM 面向的生成 Schema。"""
-    if view.gen_schema is None:
-        return None
-    reduced = dict(view.gen_schema)
-    bound = set(view.time_fields or ())
-    if "properties" in reduced:
-        reduced["properties"] = {
-            name: value for name, value in reduced["properties"].items()
-            if name not in bound}
-    if "required" in reduced:
-        reduced["required"] = [name for name in reduced["required"] if name not in bound]
-    return reduced
-
-
-def _brief_schema_estimate(length: int) -> int:
-    """估算结构化输出 profile 上 sampled brief Schema 的上行成本。"""
-    from labelkit.common.runtime.schema_engine import brief_schema
-
-    return budget.est_text(json.dumps(brief_schema(length), ensure_ascii=False))
-
-
-def _realize_schema_estimate(schema: dict, length: int) -> int:
-    """估算结构化输出 profile 上最坏 realize Schema 的上行成本。"""
-    from labelkit.common.runtime.schema_engine import realize_schema
-
-    value = realize_schema([schema] * length)
-    return budget.est_text(json.dumps(value, ensure_ascii=False))
+    instruction = max([budget.est_text(p.generate.instruction)]
+                      + [budget.est_text(view.generate.instruction) for view in views])
+    estimate = budget.TEMPLATE_HEAD_TOKENS["generate"] + instruction
+    return [("generate", tuple(p.generate.llms), estimate)]
 
 
 def _static_checks_tail(ctx: _LoadCtx, products: _Products) -> list[tuple[str, tuple, int]]:
@@ -1455,8 +1375,7 @@ def _check_budget_and_vision(ctx: _LoadCtx, products: _Products, len_max: int) -
 def _check_required_instructions(ctx: _LoadCtx) -> None:
     """启用即必填的两条指令(spec §5.2 †)。
 
-    v1.13: 时间流形态把任务描述放在按类生成指令上(全局键退化为可选默认),
-    「参与类 instruction 非空」由形态约束簇按类裁定。
+    sequence 的任务描述由其专用配置承载；本函数只处理普通标注与 flat 生成。
 
     @param ctx 校验上下文
     """
@@ -1464,8 +1383,8 @@ def _check_required_instructions(ctx: _LoadCtx) -> None:
     if p.annotate.enabled and not p.annotate.instruction.strip():
         col.error(f"{fp}:[annotate].instruction: required when annotate.enabled = true, "
                   f"expected a non-empty string")
-    if (p.generate.enabled and not p.generate.instruction.strip()
-            and not p.generate_stream.enabled):
+    if (p.generate.enabled and p.generate.form == "flat"
+            and not p.generate.instruction.strip()):
         col.error(f"{fp}:[generate].instruction: required when generate.enabled = true, "
                   f"expected a non-empty string")
 
@@ -1522,6 +1441,45 @@ def _check_paths(ctx: _LoadCtx, products: _Products) -> None:
         if not (parent.is_dir() and os.access(parent, os.W_OK)):
             col.error(f"{fp}:[run].output: output parent directory does not exist or is "
                       f"not writable, got {_fmt(eff_output)}")
+    if eff_output is not None and p.generate.form == "sequence":
+        _check_sequence_paths(ctx, eff_output)
+
+
+def _check_sequence_paths(ctx: _LoadCtx, output: str) -> None:
+    """校验 sequence 固定路径及其同目录 part 路径互不冲突。
+
+    @param ctx 校验上下文
+    @param output 生效主输出绝对路径
+    """
+    stem = str(Path(output).with_suffix(""))
+    paths = [output, stem + ".stream.jsonl", stem + ".report.json",
+             stem + ".manifest.json", stem + ".failed.report.json"]
+    if ctx.p.trace.enabled:
+        paths.append(ctx.p.trace.path or stem + ".trace.jsonl")
+    parts = [value + ".part" for value in paths]
+    normalized = [str(Path(value).resolve()) for value in (*paths, *parts)]
+    if len(normalized) != len(set(normalized)):
+        ctx.col.error(f"{ctx.fp}:[run].output: sequence fixed paths and .part paths "
+                      "must be pairwise distinct")
+    for value in paths:
+        parent = Path(value).resolve().parent
+        if not (parent.is_dir() and os.access(parent, os.W_OK)):
+            ctx.col.error(f"{ctx.fp}:[run].output: sequence path parent is not writable: "
+                          f"{parent}")
+    for value in (*paths, *parts):
+        _check_sequence_target(ctx, value)
+
+
+def _check_sequence_target(ctx: _LoadCtx, value: str) -> None:
+    """要求既存 fixed/part 目标可由原子交付安全覆盖。"""
+    path = Path(value)
+    if not path.exists() and not path.is_symlink():
+        return
+    if path.is_symlink() or not path.is_file() or not os.access(path, os.W_OK):
+        ctx.col.error(
+            f"{ctx.fp}:[run].output: existing sequence target must be a writable "
+            f"regular file: {path.resolve()}"
+        )
 
 
 def _warn_self_enhancement(ctx: _LoadCtx) -> None:
@@ -1551,6 +1509,7 @@ def validate(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
     _check_vision_profiles(ctx)
     _check_dedup_semantic(ctx)
     _check_cross_field(ctx)
+    _check_generation_form(ctx)
     _check_run_mode(ctx)
     _collect_referenced_profiles(ctx, products)
     _load_schema_and_hooks(ctx, products)
@@ -1559,8 +1518,8 @@ def validate(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
     _check_stage_matrix(ctx)
     _check_stream_family(ctx, products)
     _check_frame_family(ctx, products)
-    _, len_max = check_generate_stream_form(ctx, products)
-    ctx = _check_budget_and_vision(ctx, products, len_max)
+    _parse_sequence_generation(ctx, products)
+    ctx = _check_budget_and_vision(ctx, products, 1)
     _check_required_instructions(ctx)
     _check_paths(ctx, products)
     _warn_self_enhancement(ctx)

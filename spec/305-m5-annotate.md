@@ -182,7 +182,12 @@ item.annotation = Annotation(
 
 ### 3.5.5 帧级逐帧标注（v1.12）
 
-流模式帧粒度的标注面（`frame.annotate.enabled`，默认关，5.2）：对序列信封的成员帧逐帧产出符合**帧级 Schema**（`cfg.frame_schema`，3.1.4 帧粒度配置行）的标注对象，产物写 `item.member_annotations`（键 = 成员 `record.id`，4.1），随序列行落盘 `_meta.stream.members[]`（3.11.2）。链位 = 序列级标注**成功之后**（同一 `_annotate_item` 内追加帧 pass）——质量门之后、被淘汰记录与序列级标注失败的信封**永不付帧标注费**（裁决·链位与成本）。序列级 `annotate_record` / `build_annotate_prompt` 冻结签名**零改动**。
+帧粒度标注面（`frame.annotate.enabled`，默认关，5.2）对序列信封的成员帧逐帧产出符合
+**帧级 Schema**（`cfg.frame_schema`，3.1.4 帧粒度配置行）的标注对象，产物写
+`item.member_annotations`（键 = 成员 `record.id`，4.1），随序列行落盘
+`_meta.stream.members[]`（3.11.2）。process/flat 流模式仍在序列级标注成功后追加 frame pass；
+v1.18 sequence attempt 在 `annotate.enabled=false` 时直接执行 frame pass，序列标注调用精确为零。
+序列级 `annotate_record` / `build_annotate_prompt` 的公开签名不变。
 
 **公开面（修复面族新成员，签名冻结）**：
 
@@ -194,8 +199,8 @@ async def annotate_member(member: Record, ctx: RunContext,
        （算子间导入白名单第四向，3.7.3）。label 非 None ⇒ 指令/few-shot 取
        cfg.frame_class_views[label]（帧类覆盖视图）；None ⇒ 全局 [frame.annotate]
        （frame.classify 关闭时的全员形态）。类视图 enabled=false 的跳过判定归调用方
-       （M5 帧 pass / M7 回收），本面不重复判定。失败返回 None，永不抛记录级异常
-       （CircuitBreakerTripped / KeyboardInterrupt / CancelledError 运行级控制流除外）。"""
+       （M5 帧 pass / M7 回收），本面不重复判定。普通流水线失败返回 None；sequence
+       attempt 内错误上抛给 run_attempt，拒绝当前 whole-set attempt。运行级控制流始终上抛。"""
 
 def build_frame_annotate_prompt(member: Record, cfg: ResolvedConfig, schema_text: str,
                                 label: str | None = None) -> PromptBundle:
@@ -204,10 +209,10 @@ def build_frame_annotate_prompt(member: Record, cfg: ResolvedConfig, schema_text
 
 要点（规格与理由）：
 
-- **执行门**：active ∧ `record.kind == "sequence"` ∧ 首标签信封（`classification.label == labels[0]`，无 classification 视为首标签——非首标签克隆不执行，裁决·扇出共享与首标签执行）∧ 非降格（`segment_degraded` duck 标在场即跳，裁决·降格会话跳过）∧ 序列级标注成功后。逐成员并发（gather），成员级隔离由 `annotate_member` 不抛保证。
+- **执行门**：active ∧ `record.kind == "sequence"` ∧ 首标签信封（`classification.label == labels[0]`，无 classification 视为首标签）∧ 非降格 ∧ `frame.annotate.enabled`。process/flat 入口来自序列标注成功后的 `_on_annotated`；sequence attempt 若 `annotate.enabled=true` 走同一路径，若为 false 则从 `_run_item` 直接进入 frame pass。后者不构造 sequence prompt、不调用 sequence Schema，并允许 `item.annotation is None`。
 - **模板段序（冻结）**：system = `[任务]` + 生效指令（类覆盖或全局，含 few-shot 各一条 user 消息、配置序）+ Schema 约束句 + **帧 Schema 文本嵌入**（`cfg.frame_schema` 的 canonical 单行 dump，镜像序列级 `build_annotate_prompt` 的 schema_text 嵌入手法）→ 成员内容 user 消息：text 模态 = `[成员帧] {行文本}`；ui 模态 = `[屏幕截图]` + image part + `[UI 控件树]` + 树摘要**三段形**（本模块单记录 ui 标注同款；树渲染绝对上限 `input.ui_tree_max_chars`，预算声明时动态帽收缩——树是唯一可裁块，生效指令 / few-shot / 帧 Schema 文本是静态语义资产只计不裁，3.1.4 V13③ 预检领地）。
 - **Schema 显式路由**（裁决·帧 Schema 显式路由）：`complete_validated(frame.annotate.llm, prompt, schema=cfg.frame_schema, ...)`——内部 Schema 待遇：L0–L3 四层全在、**无 L2.5、不计 `resolved_at`**（6.4 恒等式「resolved_at 加总 = 进入 M5 的记录数」不被帧调用污染，3.8.2）。
 - **幂等只补缺位**：帧 pass 一旦运行即把 `member_annotations` 初始化为 `{}`（区别于「未运行」的 None——emitter 在场规则的单一真相，4.1；multi 扇出场景下该容器由 M13 在扇出前预先钉住共享，裁决·扇出共享时序补丁，§1.6）；已有 dict **只补缺位、从不换对象**（扇出克隆按引用共享同一 dict 的前提）；仅当成员 id 不在 dict 时才调用（M7 回收补跑同款）；**同 id 成员只调用一次**（first-wins，裁决·同 id 成员 first-wins——防同键并发双付费与计数虚高，3.13.7 同口径）。
-- **跳过与失败语义**：帧类视图 `enabled=false` ⇒ 该成员 skipped、**不占键**、计 `frame_annotate.skipped`；修复穷尽/不可恢复 ⇒ 该成员**占键 None**（failed）、计 `frame_annotate.failed` + WARN 运行日志（只含成员 id / 错误 kind / 异常类型，绝不含数据内容或提示词），**`item.errors` 不写**（成员失败非信封失败——写入会污染 rejects 归因，v1.7 fallback 留痕同理）；episode 照常发射。成功 ⇒ 占键 Annotation、计 `frame_annotate.annotated`。单一真相 = dict 形态本身（占键 None = failed / 缺键 = skipped / dict 为 None = pass 未运行），emitter 三值判定见 3.11.2。
+- **跳过与失败语义**：帧类视图 `enabled=false` ⇒ 该成员 skipped、**不占键**、计 `frame_annotate.skipped`。process/flat 中，修复穷尽或不可恢复错误使该成员占键 None、计 `frame_annotate.failed`，episode 可继续发射。sequence attempt 中，任一应标注成员失败都使 `run_attempt.accepted=false`、`rejected_stage="annotate"`，M10 丢弃并重试整个 counterfactual set；失败 attempt 的成员标注与 dataset counters 不提交，已经发生的 Schema/usage/retry/trace 证据保留。并发 frame 调用必须全部收敛后再返回失败，禁止兄弟任务在 attempt 结束后继续修改状态。成功成员占键 Annotation。
 - **无降级梯（最小单元）**：帧 prompt 本身就是最小单元——单成员、至多单图，无窗可分、无关键帧可减；预算装填裁树后仍超限 ⇒ `ContextOverflowError(phase="precheck")`，按成员失败处置（注定失败的请求永不发出）、**永不喂熔断**；反应式终端镜像本模块 A7 纪律（仅 http_400 反应式恰一次喂）。图像成本恒取 profile 工作点（`default_image_px`——校准器按 profile 聚合的前提，帧调用不设独立尺寸）。
 - **事件载荷纪律**：`annotate.frame` 每成员一发（ids=(episode_id,)，3.12.4）；payload 仅 `member_id` / `status` / `attempts`——标注内容只经既有 `excerpt` 键按档位截断（excerpt/full 档 200 字，7.4），**不新增任何承载数据内容的 payload 键**（none 档预脱敏载荷直通 console 面板的红线）。

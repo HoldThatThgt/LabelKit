@@ -1,19 +1,12 @@
 """M8 integration tests — REAL endpoint (glm-5.2 via api.z.ai, anthropic protocol).
 
 No mock LLMs (project policy). SchemaEngine is exercised end-to-end through
-complete_validated against the live endpoint. Uses the real labelkit.common.runtime.llm_client once
-M9 lands; until then a minimal REAL-HTTP client implementing the exact contract
-surface M8 needs (async complete(profile, prompt, response_schema) -> LLMResponse-shaped
-object, Anthropic tool_choice structured output with tool name "emit") stands in, so
-the four-layer path is live either way.
+complete_validated and the production LLMClient against the live endpoint.
 """
 from __future__ import annotations
 
 import os
-import time
-from dataclasses import dataclass
 
-import httpx
 import pytest
 
 from labelkit.common.runtime.schema_engine import (
@@ -24,8 +17,10 @@ from labelkit.common.runtime.schema_engine import (
     SchemaEngine,
 )
 from labelkit.common.config.model import LLMProfile, OutputConfig
-from labelkit.common.contracts.types import Usage
+from labelkit.common.runtime.credentials import RuntimeCredentials
+from labelkit.common.runtime.llm_client import LLMClient
 
+from tests import hook_samples
 from tests.conftest import ZAI_BASE_URL, ZAI_KEY_ENV, ZAI_MODEL
 
 pytestmark = pytest.mark.integration
@@ -59,81 +54,13 @@ def make_profile(name: str, structured: bool) -> LLMProfile:
     )
 
 
-try:
-    from labelkit.common.runtime.llm_client import LLMClient as _RealLLMClient
-
-    def make_client(profiles: dict[str, LLMProfile]):
-        from labelkit.common.runtime.credentials import RuntimeCredentials
-        return _RealLLMClient(profiles, {}, RuntimeCredentials(
-            llm={n: (os.environ[ZAI_KEY_ENV],) for n in profiles}, embedding={}))
-except ImportError:
-    @dataclass(frozen=True)
-    class _Resp:
-        text: str
-        structured: dict | None
-        usage: Usage
-        model: str
-        latency_ms: int
-
-    class _MinimalRealAnthropicClient:
-        """Real HTTP calls to the real endpoint — contract subset of M9 LLMClient
-        (3.9.3: POST {base_url}/v1/messages, x-api-key + anthropic-version headers,
-        structured output = single tool "emit" forced via tool_choice)."""
-
-        def __init__(self, profiles: dict[str, LLMProfile]):
-            self._profiles = profiles
-
-        async def complete(self, profile: str, prompt, response_schema: dict | None = None):
-            p = self._profiles[profile]
-            system_chunks: list[str] = []
-            messages: list[dict] = []
-            for msg in prompt.messages:
-                text = "\n".join(part.text for part in msg.parts
-                                 if part.kind == "text" and part.text)
-                if msg.role == "system":
-                    system_chunks.append(text)
-                else:
-                    messages.append({"role": msg.role,
-                                     "content": [{"type": "text", "text": text}]})
-            body: dict = {
-                "model": p.model,
-                "max_tokens": p.max_output_tokens,
-                "temperature": prompt.temperature if prompt.temperature is not None
-                               else p.temperature,
-                "messages": messages,
-            }
-            if system_chunks:
-                body["system"] = "\n".join(system_chunks)
-            if response_schema is not None and p.supports_structured_output:
-                body["tools"] = [{"name": "emit",
-                                  "description": "Emit the structured result.",
-                                  "input_schema": response_schema}]
-                body["tool_choice"] = {"type": "tool", "name": "emit"}
-            headers = {"x-api-key": p.api_key,
-                       "anthropic-version": "2023-06-01",
-                       "content-type": "application/json"}
-            started = time.monotonic()
-            async with httpx.AsyncClient(timeout=p.timeout_s) as client:
-                resp = await client.post(f"{p.base_url}/v1/messages",
-                                         json=body, headers=headers)
-            resp.raise_for_status()
-            data = resp.json()
-            structured: dict | None = None
-            texts: list[str] = []
-            for block in data.get("content", []):
-                if block.get("type") == "tool_use" and structured is None:
-                    if isinstance(block.get("input"), dict):
-                        structured = block["input"]
-                elif block.get("type") == "text":
-                    texts.append(block.get("text", ""))
-            usage = Usage(data.get("usage", {}).get("input_tokens", 0),
-                          data.get("usage", {}).get("output_tokens", 0))
-            return _Resp(text="\n".join(texts), structured=structured, usage=usage,
-                         model=data.get("model", p.model),
-                         latency_ms=int((time.monotonic() - started) * 1000))
-
-    def make_client(profiles: dict[str, LLMProfile]):
-        return _MinimalRealAnthropicClient(profiles)
+def make_client(profiles: dict[str, LLMProfile]) -> LLMClient:
+    """用冻结运行凭据装配生产 LLMClient。"""
+    credentials = RuntimeCredentials(
+        llm={name: (os.environ[ZAI_KEY_ENV],) for name in profiles},
+        embedding={},
+    )
+    return LLMClient(profiles, {}, credentials)
 
 
 def user_message(text: str) -> Message:
@@ -200,8 +127,8 @@ async def test_l25_hook_violation_repaired_by_loop():
     it on the repair round — the hook is a coach, not just a gate."""
     prof = make_profile("default", structured=False)
     engine = SchemaEngine(USER_SCHEMA, make_client({"default": prof}),
-                          OutputConfig(max_repair_attempts=2,
-                                       validator="tests.hook_samples:topic_max6"))
+                          OutputConfig(max_repair_attempts=2),
+                          validator=hook_samples.topic_max6)
     prompt = PromptBundle(messages=(
         Message(role="system", parts=(Part(kind="text", text=(
             "你是意图标注员。输出必须是符合以下 JSON Schema 的单个 JSON 对象："
@@ -221,10 +148,10 @@ async def test_l25_hook_violation_repaired_by_loop():
 
 async def test_l25_unsatisfiable_hook_exhausts_as_callback_violation():
     from labelkit.common.errors import SchemaViolation
-    prof = make_profile("default", structured=False)
+    prof = make_profile("default", structured=True)
     engine = SchemaEngine(USER_SCHEMA, make_client({"default": prof}),
-                          OutputConfig(max_repair_attempts=1,
-                                       validator="tests.hook_samples:always_reject"))
+                          OutputConfig(max_repair_attempts=1),
+                          validator=hook_samples.always_reject)
     prompt = PromptBundle(messages=(
         Message(role="system", parts=(Part(kind="text", text=(
             "你是意图标注员。输出必须是符合以下 JSON Schema 的单个 JSON 对象："

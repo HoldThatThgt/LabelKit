@@ -1,0 +1,273 @@
+"""ResolvedConfig 到 GenerationProgram 的编译与规模边界测试。"""
+
+from __future__ import annotations
+
+import resource
+import sys
+from dataclasses import replace
+from types import MappingProxyType
+
+import pytest
+
+from labelkit.common.config.model import FewShotExample
+from labelkit.common.errors import ConfigError
+from labelkit.operators.generation.planner import compile_scenario_plan
+from labelkit.operators.generation.program import (
+    compile_generation_program,
+    generation_program_digest,
+)
+
+
+_RSS_LIMIT_BYTES = 4 * 1024**3
+
+
+def _peak_rss_bytes() -> int:
+    """把当前进程 peak RSS 统一为 byte。"""
+    value = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    return int(value if sys.platform == "darwin" else value * 1024)
+
+
+def _instruction_scale_config(config, *, count: int, length: int):
+    """构造只改变静态基数的 instruction-only 配置。"""
+    sequence = config.sequence_generation
+    source = replace(sequence.instruction_only[0], count=count, len_range=(length, length))
+    timeline = replace(
+        sequence.timeline,
+        primary_sessions=count,
+        session_max_events=max(sequence.timeline.session_max_events, length),
+    )
+    return replace(
+        config,
+        sequence_generation=replace(
+            sequence,
+            instruction_only=(source,),
+            timeline=timeline,
+        ),
+    )
+
+
+def _max_declared_config(config):
+    """构造 32 roles 与 8 variants 的最小合法声明程序。"""
+    sequence = config.sequence_generation
+    pattern = sequence.patterns[0]
+    role_names = tuple(f"role_{index:02d}" for index in range(32))
+    roles = tuple(
+        replace(pattern.roles[0], name=name, calendar_window=None)
+        for name in role_names
+    )
+    gaps = tuple(
+        replace(
+            pattern.gaps[0],
+            name=f"gap_{index:02d}",
+            before=role_names[index],
+            after=role_names[index + 1],
+            min_gap_us=1_000_000,
+            max_gap_us=1_000_000,
+        )
+        for index in range(31)
+    )
+    maximum = replace(
+        pattern,
+        roles=roles,
+        order=role_names,
+        gaps=gaps,
+        max_span_us=31_000_000,
+    )
+    source = sequence.counterfactual_sets[0]
+    positive = next(item for item in source.variants if item.kind == "positive")
+    missing = next(item for item in source.variants if item.kind == "missing")
+    variants = (positive, *(
+        replace(
+            missing,
+            name=f"missing_{name}",
+            target={"role": name},
+            expected_violation={"kind": "missing_role", "target": name},
+            divergence_role=name,
+        )
+        for name in role_names[1:8]
+    ))
+    timeline = replace(
+        sequence.timeline,
+        primary_sessions=8,
+        crossed_primary_sessions=0,
+        session_max_events=32,
+        noise_events=0,
+        duplicate_sequences=0,
+    )
+    updated = replace(
+        sequence,
+        patterns=(maximum,),
+        counterfactual_sets=(replace(source, count=1, variants=variants),),
+        timeline=timeline,
+        noise=None,
+    )
+    return replace(config, sequence_generation=updated)
+
+
+def test_program_digest_is_deterministic_and_covers_frozen_semantics(declared_config):
+    first = compile_generation_program(declared_config)
+    second = compile_generation_program(declared_config)
+    assert first == second
+    assert len(first.digest) == 64
+    assert first.calendar_windows
+    assert first.state_validator.reference.endswith("hooks.py:validate_state")
+
+
+def test_program_copies_and_deep_freezes_class_and_frame_views(declared_config):
+    class_schema = declared_config.class_views["ticket_booking"].schema
+    frame_schema = declared_config.frame_class_views["task_request"].gen_schema
+    example_output = {"nested": {"values": ["original"]}}
+    frame_views = dict(declared_config.frame_class_views)
+    frame_views["task_request"] = replace(
+        frame_views["task_request"],
+        examples=(FewShotExample("example", example_output),),
+    )
+    program = compile_generation_program(
+        replace(declared_config, frame_class_views=frame_views)
+    )
+    digest = program.digest
+
+    class_schema["source_mutation"] = True
+    frame_schema["source_mutation"] = True
+    example_output["nested"]["values"].append("source_mutation")
+
+    frozen_class = program.class_views["ticket_booking"].schema
+    frozen_frame = program.frame_classes["task_request"]
+    assert "source_mutation" not in frozen_class
+    assert "source_mutation" not in frozen_frame.gen_schema
+    assert frozen_frame.examples[0].output["nested"]["values"] == ("original",)
+    assert generation_program_digest(program) == digest
+    with pytest.raises(TypeError):
+        frozen_class["blocked"] = True
+    with pytest.raises(TypeError):
+        frozen_frame.gen_schema["blocked"] = True
+    with pytest.raises(TypeError):
+        frozen_frame.examples[0].output["nested"]["blocked"] = True
+
+
+def test_program_materializes_global_user_schema_and_freezes_frame_schema(declared_config):
+    """program 显式闭包全局用户 Schema 与最终帧标注 Schema。"""
+    user_schema = {
+        "type": "object",
+        "properties": {"result": {"type": "array", "items": {"type": "string"}}},
+    }
+    frame_schema = {
+        "type": "object",
+        "properties": {"frame": {"type": "object", "properties": {"ok": {}}}},
+    }
+    views = dict(declared_config.class_views)
+    views["ticket_booking"] = replace(views["ticket_booking"], schema=None)
+    config = replace(
+        declared_config,
+        class_views=views,
+        user_schema=user_schema,
+        frame_schema=frame_schema,
+    )
+    program = compile_generation_program(config)
+    original_digest = program.digest
+
+    user_schema["properties"]["result"]["items"]["type"] = "integer"
+    frame_schema["properties"]["frame"]["properties"]["changed"] = {}
+    assert program.class_views["ticket_booking"].schema["properties"]["result"][
+        "items"
+    ]["type"] == "string"
+    assert "changed" not in program.frame_schema["properties"]["frame"]["properties"]
+    assert generation_program_digest(program) == original_digest
+    with pytest.raises(TypeError):
+        program.frame_schema["blocked"] = True
+
+    changed = replace(
+        config,
+        user_schema={"type": "object", "properties": {"other": {}}},
+    )
+    assert compile_generation_program(changed).digest != original_digest
+
+
+def test_program_rejects_record_unit_limit_at_compile_boundary(declared_config):
+    sequence = replace(
+        declared_config.sequence_generation,
+        limits=replace(declared_config.sequence_generation.limits, record_units=1),
+    )
+    with pytest.raises(ConfigError, match="record_units"):
+        compile_generation_program(replace(declared_config, sequence_generation=sequence))
+
+
+def test_program_rejects_catalog_shorter_than_declared_slots(declared_config):
+    view = declared_config.class_views["ticket_booking"]
+    generation = replace(
+        view.sequence_generation,
+        initial_state_catalog=view.sequence_generation.initial_state_catalog[:1],
+    )
+    views = dict(declared_config.class_views)
+    views["ticket_booking"] = replace(view, sequence_generation=generation)
+    with pytest.raises(ConfigError, match="catalog has fewer rows"):
+        compile_generation_program(replace(declared_config, class_views=views))
+
+
+def test_program_accepts_500000_record_units_with_lightweight_carrier_oracle(instruction_config):
+    """日常门验证精确编译边界；release gate 另用真实 planner 隔离压测。"""
+    config = _instruction_scale_config(instruction_config, count=100_000, length=4)
+    program = compile_generation_program(config)
+    primary_sequences = sum(item.count for item in program.instruction_only)
+    primary_events = sum(item.count * item.len_range[0] for item in program.instruction_only)
+    assert primary_sequences + primary_events == 500_000
+
+    minimal_row = MappingProxyType({"payload": MappingProxyType({}), "_meta": MappingProxyType({})})
+    virtual_units = (minimal_row,) * 500_000
+    assert len(virtual_units) == 500_000
+    assert virtual_units[0] is virtual_units[-1] is minimal_row
+    assert _peak_rss_bytes() < _RSS_LIMIT_BYTES
+
+
+def test_program_uses_canonical_minimum_instruction_length_for_exact_scale(instruction_config):
+    """len_range 上界不得把 canonical 500000 units 误报为 600000。"""
+    config = _instruction_scale_config(instruction_config, count=100_000, length=4)
+    sequence = config.sequence_generation
+    source = replace(sequence.instruction_only[0], len_range=(4, 5))
+    config = replace(
+        config,
+        sequence_generation=replace(sequence, instruction_only=(source,)),
+    )
+    program = compile_generation_program(config)
+    assert sum(item.count * (1 + item.len_range[0])
+               for item in program.instruction_only) == 500_000
+
+
+def test_program_rejects_500001_record_units(instruction_config):
+    """compile 边界直接拒绝 500001 record units。"""
+    config = _instruction_scale_config(instruction_config, count=99_999, length=4)
+    sequence = config.sequence_generation
+    extra = replace(
+        sequence.instruction_only[0],
+        name="one_more",
+        count=1,
+        len_range=(5, 5),
+    )
+    config = replace(
+        config,
+        sequence_generation=replace(
+            sequence,
+            instruction_only=(*sequence.instruction_only, extra),
+            timeline=replace(sequence.timeline, primary_sessions=100_000),
+        ),
+    )
+    assert sum(item.count * (1 + item.len_range[1])
+               for item in config.sequence_generation.instruction_only) == 500_001
+    with pytest.raises(ConfigError, match="record_units"):
+        compile_generation_program(config)
+
+
+def test_maximum_declared_roles_and_variants_produce_complete_plan(declared_config):
+    """32 roles 与 8 variants 的合法边界完整进入冻结计划。"""
+    program = compile_generation_program(_max_declared_config(declared_config))
+    plan = compile_scenario_plan(program)
+    visible = [
+        events
+        for block in plan.blocks
+        for (_slot_key, variant), events in block.items()
+        if variant is not None
+    ]
+    assert len(program.patterns["booking_success"].roles) == 32
+    assert len(program.counterfactual_sets[0].variants) == 8
+    assert len(visible) == 8
+    assert sorted(map(len, visible)) == [31] * 7 + [32]

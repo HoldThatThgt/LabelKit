@@ -67,21 +67,35 @@ labelkit/common/config/
 | flat 生成 | `generate.form` 缺省 `flat`。flat 继续使用 `llms`、`styles`、`seed_examples`、`standalone_count`、`num_per_record`、`seeds_per_call` 与 `num_per_call`；种子池与无种子计数恰选一种。flat 显式书写 sequence 专用字段是 CONFIG_ERROR。 |
 | sequence 入口 | `generate.form = "sequence"` 要求 generate_only、text、`generate.enabled = true`、`run.partial_delivery = false`、`dedup.enabled = true`、`dedup.scope = "global"`、`output.meta_mode = "inline"`、`output.rejects = "none"`，并禁止 `--limit`。classify 与 frame.classify 必须关闭；frame.annotate 可作为 attempt-local 下游。M6 projector 为 sequence 与 frame 写 inherited Classification，`[frame.class.*]` 不要求 frame.classify 开启。sequence 显式书写任何 flat 字段是 CONFIG_ERROR。 |
 | sequence 模式与 profile | `generate.mode` 必须为 `declared` 或 `instruction_only`；`semantic_llm` 与 `evaluation_llm` 必填、名称不同、支持文本且均显式声明正 `context_window`；`max_slot_attempts` 在 1..20，缺省 3。 |
-| declared class 与 seed | 每个有交付 slot 的 sequence class 都声明非空 instruction、object state Schema；`initial_state_source` 只能是 `llm` 或 `catalog`。catalog 额外要求 JSONL 路径，按应用完整配置后的 slot 数无放回分配；行数不足或任一完整 `ScenarioSeed` 无效均在启动期失败。同一 class 的所有 pattern 必须声明同一 actor 集。 |
-| frame class | 每个 role、instruction-only 闭集或 noise 引用的 frame class 都必须有非空生成 instruction 和 object JSON Schema；sequence 不接受 string payload。 |
+| declared class 与 seed | 每个有交付 slot 的 sequence class 都声明非空 instruction、object state Schema；`initial_state_source` 只能是 `llm` 或 `catalog`。LLM source 的 state Schema 根级 `examples` 至少有一个通过完整 Schema 的 object；catalog 额外要求 JSONL 路径，按应用完整配置后的 slot 数无放回分配；行数不足或任一完整 `ScenarioSeed` 无效均在启动期失败。同一 class 的所有 pattern 必须声明同一 actor 集。 |
+| frame class | 每个 role、instruction-only 闭集或 noise 引用的 frame class 都必须有非空生成 instruction 和 object JSON Schema；Schema 根级 `examples` 至少有一个通过完整 Schema 的 object；sequence 不接受 string payload。 |
 | pattern | description 非空；role 名唯一且每个恰出现一次；`order` 恰好排列全部 role；`max_span_s > 0` 必填。每个相邻 role pair 恰有一条具名 gap，`max_gap_s` 必填；可加唯一、正向的非相邻 gap。秒值最多六位小数并无损转微秒，边界为闭区间。missing 目标 frame class 在 pattern 内唯一；reordered 目标相邻且 frame class 不同。 |
 | role 权限与 binding | roots 按 RFC 6901 token 前缀校验，同一列表内禁止祖先/后代冗余，三个列表之间可相交。patch 只允许 `test/add/remove/replace` 且至少以一个 `test` 开头；test 落 read roots，写操作落 write roots。publish roots 在事件后必须存在。binding 的 state path 同时被 read 与 publish roots 覆盖；payload path 禁止根路径、重复及任意祖先/后代冲突。LLM 始终面向完整 Draft 2020-12 frame Schema 生成完整 object，系统再按声明序以 RFC 6902 `add` 实例语义机械覆盖 binding，并用同一完整 Schema 复验；不改写 Schema。 |
-| counterfactual set | 每组至少一个 variant；name 与预期违规签名唯一；每个 variant 都有 outcome Schema。positive 可不声明但 baseline 永远存在。missing、reordered、interval_exceeded 只能产生对应唯一结构违规；编译器必须证明目标变换仍满足所有非目标 gap、`max_span_s` 与日历约束。 |
-| instruction-only | 每行 name 有效，count 为精确序列数，`len_range` 在 1..64。禁止 pattern、counterfactual set、role permission、outcome Schema 与 expected violation；只允许 LLM 从已声明 object frame class 闭集选类和 seed actor。缺省 state Schema 只要求 object；不支持 catalog。 |
+| counterfactual set | 每组至少一个 variant；name 与预期违规签名唯一；每个 variant 都有 outcome Schema，且根级 `examples` 至少有一个通过完整 Schema 的 object。positive 可不声明但 baseline 永远存在。missing、reordered、interval_exceeded 只能产生对应唯一结构违规；编译器必须证明目标变换仍满足所有非目标 gap、`max_span_s` 与日历约束。 |
+| instruction-only | 每行 name 有效，count 为精确序列数，`len_range` 在 1..8。禁止 pattern、counterfactual set、role permission、outcome Schema 与 expected violation；只允许 LLM 从已声明 object frame class 闭集选类和 seed actor。显式 state Schema 根级 `examples` 至少有一个通过完整 Schema 的 object；缺省 state Schema 只要求 object 并以 `{}` 作固定 witness；不支持 catalog。 |
 | timeline 与 calendar | `timestamp_start` 含显式 offset；`event_gap_s` 只作用于 instruction-only 相邻位置、noise 和 replay。primary 总数为 N、crossed 数为 D 时必须 `primary_sessions = N - D`；instruction-only 还要求 D = 0、`primary_sessions = N`、`duplicate_sequences = 0`。命名日历窗口使用固定 offset 和同日半开区间。 |
 | noise 与 replay | `noise_events > 0` 时 `generate.noise` 必填；noise frame class 不得被 role 使用，noise 无 owner、无 patch。replay 数量从已规划 positive primary sequence 按 declaration order 和 scenario index 无放回选源；正例不足在启动期失败；每个 replay 独占尾部 session。 |
-| 静态上限 | roles ≤ 32，variants/set ≤ 8，instruction-only events ≤ 64；seed、Schema、patch、payload、instruction 分别执行第 6 章固定字节上限。派生 `record_units` 与 `stream_rows` 均不超过 500000；`retained_content_bytes` 上限 536870912 在运行期 whole-attempt 预收费。 |
+| 静态上限 | roles ≤ 32，variants/set ≤ 8，instruction-only events ≤ 8；seed、Schema、patch、payload、单个完整运行期 prompt value、单轮新增 L3 正文集合、单项 generation prompt text 分别执行第 6 章固定字节上限。M1 以根 examples 选择最小有效 witness，并用共享 prompt 构造器加动态 byte 包络证明六个 family 的首轮与 repair profile；运行期同界零派发拒绝。派生 `record_units` 与 `stream_rows` 均不超过 500000；`retained_content_bytes` 上限 536870912 在运行期 whole-attempt 预收费。 |
 | quality | sequence 若启用 quality，只允许 pointwise、固定 threshold；pairwise、`top_ratio`、任何会让同一组成员互相影响的 selection 及任何生效的按类 quality override 均为 CONFIG_ERROR。 |
-| 路径 | project TOML 的相对路径统一相对 `project_root`；CLI input/output 相对调用 cwd 后再覆盖。sequence 一次冻结 main、stream、report、manifest 与 failed_report，rejects 与 sidecar 为 null；全部路径冲突、非同目录 `.part` 或不可写均在启动期失败。 |
+| 路径 | project TOML 的相对路径统一相对 `project_root`；CLI input/output 相对调用 cwd 后再覆盖。sequence 一次冻结 main、stream、report、manifest 与 failed_report，rejects 与 sidecar 为 null；全部路径冲突、非同目录 `.part` 或不可写均在启动期失败；任一既存 fixed/part 目标必须是非符号链接、可写普通文件。 |
 | hook | 所有 hook 使用 `<python-file>:<attribute-path>`，相对文件按 project root 解析；M1 用文件路径加载并冻结 callable，不改 `sys.path`。sequence 的 `state_validator` 签名是 `validate_state(StateTransitionInput) -> list[str]`，只接收不可变副本。 |
 | program 编译接缝 | M1 返回后，operators 层 `GenerationProgramCompiler` 在凭据物化前只读 `ResolvedConfig.sequence_generation` 与 M1 冻结的 ClassView，解析引用、Schema、Pointer、hook 和 catalog，冻结 expected violation、校验 delivery slot 精确数量与声明序、计算调用上界与 canonical digest；不构造 `DeliverySlot`、不抽样、不调用 LLM、不执行下游 stage。实际 slot 及 `catalog_row_index` 只由 `ScenarioPlan` 按 class、声明序与 scenario index 确定性冻结；LLM source 的索引为 null，slot 重试不换行。 |
-| planner 接缝 | 编排层让 validate、dry-run、run 共用 operators 层 `compile_scenario_plan(program, seed)`、block allocator 与 CP-SAT model builder。单 block 最多 4096 primary events；OR-Tools 单 worker，确定性 seed，每个优化层 `max_deterministic_time = 10.0`。只有 OPTIMAL 可解码；INFEASIBLE 为 exit 2，FEASIBLE/UNKNOWN 与 MODEL_INVALID 为 exit 4；不使用 incumbent 或替代 planner。 |
-| console 与上下文预算 | 既有 console 推导、静态模板预算和逐请求完整预算不变。sequence 的 seed、ActorView、patch、payload、完整轨迹证据与 blind semantic review 输入禁止裁剪或摘要；不适配完整上下文时配置失败或消耗当前 slot attempt。semantic request 本身不得携带 `EventTrace`、variant/target/expected/actual violation 或其他 evaluator truth。 |
+| planner 接缝 | 编排层让 validate、dry-run、run 共用 operators 层 `compile_scenario_plan(program)`、block allocator 与 CP-SAT model builder；`run.seed` 已冻结进 `GenerationProgram.planner_seed` 和 digest。单 block 最多 4096 primary events；OR-Tools 单 worker，确定性 seed，每个优化层 `max_deterministic_time = 10.0`。只有 OPTIMAL 可解码；INFEASIBLE 为 exit 2，FEASIBLE/UNKNOWN 与 MODEL_INVALID 为 exit 4；不使用 incumbent 或替代 planner。 |
+| console 与上下文预算 | 既有 console 推导不变。sequence 的六个 family 由 `generation_prompts.py` 同时供 M1 与运行期构造；`_generation_budget.py` 对配置态完整 PromptBundle、Schema、动态值 byte 包络与 repair 新增正文包络取 profile 最大值。seed、ActorView、patch、payload、完整 EventDraft history 与 blind semantic review 输入禁止裁剪或摘要；不适配完整上下文时配置失败或消耗当前 slot attempt。semantic request 本身不得携带 `EventTrace`、variant/target/expected/actual violation 或其他 evaluator truth。 |
+
+sequence 上下文证明的固定符号为 D=32768 runtime prompt value bytes、P=16384 patch bytes、
+S=65536 ScenarioSeed bytes、Y=65536 payload bytes、R=32768 单轮新增 L3 正文集合 bytes。动态费用按
+`ceil(bytes/3)` 折为 `est_text` 的保守 token 上界；declared EventPlan 加 2D，instruction-only EventPlan
+加 5D，declared FrameRenderer 加 5D+P，instruction-only FrameRenderer 加 6D+P，SemanticEvaluator
+加 S+2D，NoiseEvaluator 加 Y。ScenarioSeed 与 NoiseRenderer 的运行内容已由配置态完整最小 PromptBundle
+覆盖，不再加动态项。
+
+每个 case 先用与运行期相同的 builder 和 `est_prompt` 计完整消息脚手架；仅当该 profile
+`supports_structured_output = true` 时计完整 active Schema。同一 profile 的互斥 case 只取最大值，不求和。
+启用 repair 时，generic family 在 repair profile 上计空 user message 脚手架、按 capability 计 active Schema，
+再加 R；EventPlan 计完整首轮 prompt 与动态包络、按 repair profile capability 计 Schema，再加 R 与两个新增
+message overhead。首轮与 repair 包络同样按 profile 取最大值。运行期完整值/正文恰好固定上限可派发，多一
+UTF-8 byte 在 provider 前拒绝；禁止裁剪、摘要、拆值或替换 Schema。
 
 ### 3.1.5 错误处理
 

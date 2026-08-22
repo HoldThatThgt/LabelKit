@@ -1,24 +1,4 @@
-"""M7 verify 阶段——对（记录, 标注）对做 LLM-as-a-Judge 评审（spec 3.7）。
-
-按 CONTRACTS.md §7.6：每个带标注的 active 信封用 §10.5 模板对 ``VERDICT_SCHEMA``（§10.7）取判决；
-可选多 judge 面板（奇数、多数表决、意见并入 ``judge`` 字段）。policy ``drop`` 判 fail 即丢；
-``repair`` 把判 fail 的意见回灌 M5（``annotate_record`` + ``RepairContext``）重标注至多
-``verify.max_repair_rounds`` 轮，仍不过则 ``dropped_verify``。每轮每 judge 发一条 ``verify.verdict``
-trace 事件。
-
-v1.8 流式分支（S7/S8/S31）：``segment.enabled`` 下的序列信封分流进阶段层驱动器——§10.5 序列变体评审
-（缺陷词表 system + 六段 user 证据含 ``[边界余量]``；stitch 开启时 v1.9 T15 的 ``[片段结构]`` 插成
-七段；对 ``defect_verdict_schema()`` 校验），并在 ``policy = "repair"`` 下按轮做两阶段批级成员手术：
-并发评审 → 批位序同步缺陷路由（收缩 / 回收预定 / 仅标记）→ 并发回收复判（``judge_window`` 直调）→
-并发接缝重抽（``extract_transition`` 直调）→ 同步重建记录与步表 → v1.12 帧产物同步（收缩删键 +
-``classify_frames`` / ``annotate_member`` 回收补跑，SPEC-frame-annotation §3.4）→ 并发重标注 → 下一
-轮复评。非流式路径是回归锚：``run_verify_loop``、``VERDICT_SCHEMA`` 用法与经典模板逐字节不变。
-
-导入约定：所组合的服务与兄弟模块（llm_client、schema_engine、annotate，以及流式修复路径上获授权的
-直调面 ``segment.judge_window`` / ``extract.extract_transition`` / ``classify.classify_frames`` /
-``annotate.annotate_member``——CONTRACTS §1.1 算子间导入白名单第四向）一律在用到它们的函数内部懒
-加载，故 import 本模块不要求那些文件已存在；名字与用法与 CONTRACTS.md 一致。
-"""
+"""M7 verify：经典记录评审、流式序列修复与 sequence attempt gate。"""
 from __future__ import annotations
 
 import asyncio
@@ -27,16 +7,20 @@ import json
 import logging
 import math
 import re
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Awaitable, Callable, Literal, Mapping, Sequence
 
 from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
     ErrorKind,
+    InternalError,
+    OutputTruncatedError,
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
 )
+from labelkit.common.contracts.generation import DownstreamAttemptRequest, DownstreamAttemptResult
 from labelkit.common.contracts.types import (
     Annotation,
     PipelineItem,
@@ -47,6 +31,7 @@ from labelkit.common.contracts.types import (
     frame_digest,
 )
 from labelkit.common.runtime import budget
+from labelkit.common.runtime.schema_engine import _thaw_json
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import LLMProfile, ResolvedConfig
@@ -55,16 +40,15 @@ if TYPE_CHECKING:
     from labelkit.operators.annotate import AnnotatePromptOptions, RepairContext
 
 _log = logging.getLogger("labelkit.verify")
-
+_ATTEMPT_MODE: ContextVar[bool] = ContextVar("verify_attempt_mode", default=False)
+_ATTEMPT_CONFIG: ContextVar[object | None] = ContextVar("verify_attempt_config", default=None)
 EV_VERIFY_VERDICT = "verify.verdict"
 EV_ERROR = "error"
 
-# §10.5 评审提示词，固定中文文本（spec 3.7.2，逐字冻结）。
 _SYSTEM_HEAD = "你是标注质量审核员。给定任务指令、原始数据与标注结果，独立判断标注是否合格。"
 _SYSTEM_DIMS = "评审维度: ① 是否遵循任务指令 ② 与原始数据的事实一致性 ③ 字段语义是否正确填写"
 _SYSTEM_TAIL = "先逐维度给出简短意见，再给结论。"
 
-# §10.5 v1.8 序列变体，固定中文文本（CONTRACTS §10.5 处冻结）。
 _SEQ_SYSTEM_HEAD = ("你是标注质量审核员。给定任务指令、动作序列、边界余量与首末帧截图，独立判断该序列\n"
                     "（episode）的标注是否合格。")
 _SEQ_SYSTEM_DIMS = ("评审维度: ① 是否遵循任务指令 ② 与动作序列及首末帧证据的事实一致性 ③ 字段语义是否正确填写\n"
@@ -85,8 +69,6 @@ _SEQ_SYSTEM_STRUCTURE = (
     '              "position": <位置说明|null>, "detail": <一句话>}, ...],\n'
     ' "verdict": "pass"|"fail"}')
 
-# 序列证据的段标签 + §10.1 冻结步行格式。算子之间不互相依赖（spec §2.2）：M5/M4 各自
-# 持有同格式行模板的副本，这份是 M7 的副本。
 _LABEL_ACTION_SEQUENCE = "[动作序列]"
 _LABEL_FRAGMENT_STRUCTURE = "[片段结构]"   # v1.9（T15）：第七段
 _LABEL_BOUNDARY_MARGIN = "[边界余量]"
@@ -94,10 +76,6 @@ _LABEL_FIRST_FRAME = "[首帧截图]"
 _LABEL_LAST_FRAME = "[末帧截图]"
 _MEMBER_DIGEST_MAX_CHARS = 400   # 序列 excerpt 档摘要上限（镜像 M4 §7.3）
 
-# §10.16 v1.13 判决形序列变体（裁决·直装评审判决形，实现即冻结面）：经典路径遇
-# kind=="sequence"（segment 关闭——直装序列信封）时的评审模板——判决指令 system
-# 文本（非缺陷词表，defects 键被 VERDICT_SCHEMA 禁止）+ [任务指令]/[成员帧摘要]/
-# [标注结果] 三段 user 证据；无缺陷表/边界余量/片段结构。
 _VERDICT_SEQ_SYSTEM_HEAD = ("你是标注质量审核员。给定任务指令、成员帧摘要与标注结果，独立判断该序列"
                             "（episode）的标注是否合格。")
 _VERDICT_SEQ_SYSTEM_DIMS = ("评审维度: ① 是否遵循任务指令 ② 与成员帧摘要证据的事实一致性 "
@@ -108,42 +86,24 @@ _VERDICT_SEQ_SYSTEM_STRUCTURE = (
     ' "verdict": "pass"|"fail"}')
 _LABEL_MEMBER_DIGESTS = "[成员帧摘要]"
 
-# 缺陷种类闭集，按 schema/enum 序——S31 确定性去重排序键的第一分量。
-# v1.9（T15）：追加 wrong_stitch（六种）。
 DEFECT_KINDS = ("label_mismatch", "off_task_members", "missing_head",
                 "missing_tail", "missing_members", "wrong_stitch")
 _MISSING_KINDS = frozenset({"missing_head", "missing_tail", "missing_members"})
-# 接纳回收候选帧重入段内的 judge_window 关系值
-# （spec 3.7.3 流式修复路由 / §7.14 演绎映射：非边界值）。
 _RECLAIM_RELATIONS = frozenset({"continues", "advances"})
-# S7：判 fail 但 defects 为空数组时，代码侧规范化为一条默认 label_mismatch
-# （修复路由建立在缺陷表之上）。
 _DEFAULT_FAIL_DEFECT: Mapping = {
     "kind": "label_mismatch", "members": None, "position": None,
     "detail": "评审判 fail 但未指认缺陷，默认视同标签不符",
 }
-# 每侧段边界外 k = 2 帧进 [边界余量] 证据段
-# （spec 3.7.2——VAD hangover 惯例移植，零额外 LLM 调用）。
 _BOUNDARY_MARGIN_K = 2
-
-# M7 自持的流式计数器（CONTRACTS §9.3，S31 → report.stream.verify）。
 _COUNTER_MEMBERSHIP_REPAIRS = "verify.membership_repairs"
 _COUNTER_BOUNDARY_FLAGS = "verify.boundary_flags"
 _COUNTER_DEFECTS_PREFIX = "verify.defects."
 
 
-# ── v1.11 上下文预算装填（spec 3.7.2「上下文预算装填」行，V25②③）──────────────
-
 _TREE_MARKER_RE = re.compile(r"^…\(truncated (\d+) nodes\)$")
-
-
 @dataclasses.dataclass
 class _PromptFit:
-    """一次评审提示词的记录侧装填状态（spec 3.7.2 v1.11 行）：每轮只建一份提示词广播给整个面板，
-    故取面板最小输入预算（V25②）与面板内最大单图标定成本（保守广播）。唯一可裁槽位是
-    ``[动作序列]`` 步表块（序列，§3.3⑤）或控件树渲染（单记录，§3.3③）；``[标注结果]``、边界
-    余量、片段结构恒计不裁（V25③）。
-    """
+    """一次评审提示词的面板最小预算装填状态。"""
     input_budget: int       # 面板最小可用输入预算（token）
     image_cost: int         # 单图成本（面板内最大标定读数；text 模态为 0）
     truncations: int = 0    # 本次装填实际发生的裁剪次数（进 budget.truncations.verify）
@@ -152,15 +112,13 @@ class _PromptFit:
 
 @dataclasses.dataclass(frozen=True)
 class VerifyPromptOptions:
-    """``build_verify_prompt`` 的可选装配项（v1.7/v1.8/v1.9/v1.11/v1.13 增量的收拢面）；缺省实例
-    即 v1.7 之前的单记录经典调用形态：无类标签、无序列证据、无预算装填、非判决形。
-    """
+    """``build_verify_prompt`` 的可选装配项；缺省实例是经典单记录调用形态。"""
     label: str | None = None                            # 类标签；None = 取全局指令与准则（v1.7 R3）
     transitions: tuple[Transition, ...] | None = None   # 序列步表；None = 整段省略 [动作序列]（v1.8 S7）
     boundary_margin: str = ""                           # [边界余量] 段正文（驱动器预渲染，持批上下文）
     fragment_structure: str = ""                        # [片段结构] 段正文；空串 = 整段省略（v1.9 T15）
     fit: "_PromptFit | None" = None                     # 面板最小预算装填状态；None = 预算关（v1.11）
-    verdict_form: bool = False                          # 序列走 §10.16 判决形变体（v1.13 直装序列）
+    verdict_form: bool = False                          # 生成序列走 §10.16 判决形变体
 
 
 _DEFAULT_PROMPT_OPTIONS = VerifyPromptOptions()
@@ -289,7 +247,7 @@ def verify_sequence_system_text(extra_criteria: str) -> str:
 
 
 def verify_verdict_sequence_system_text(extra_criteria: str) -> str:
-    """判决形序列变体（§10.16，v1.13 裁决·直装评审判决形）的 system 段：三维评审 + 结论指令 +
+    """判决形生成序列变体（§10.16）的 system 段：三维评审 + 结论指令 +
     VERDICT_SCHEMA 结构句——无缺陷词表；extra_criteria 为空时整行省略（非流规则同款）。
     @param extra_criteria 类有效附加评审准则（[class.<name>.verify] 覆盖后取值）
     @return 换行拼接的 system 文本
@@ -562,12 +520,12 @@ def _build_verdict_sequence_prompt(record: Record, output: Mapping,
                                    cfg: "ResolvedConfig",
                                    texts: tuple[str, str],
                                    fit: "_PromptFit | None") -> "PromptBundle":
-    """判决形序列 prompt 装配（§10.16，v1.13 裁决·直装评审判决形）：user 段 = [任务指令] →
+    """判决形生成序列 prompt 装配（§10.16）：user 段 = [任务指令] →
     [成员帧摘要]（400 字/成员、ui_tree_max_chars 总量中段丢弃——镜像 M5 渲染）→ [标注结果]；无
-    缺陷表/边界余量/片段结构，无截图段（直装序列 text 模态）。``fit`` 非 None 时成员摘要块是唯一
+    缺陷表/边界余量/片段结构，无截图段（生成序列是 text 模态）。``fit`` 非 None 时成员摘要块是唯一
     可裁槽位（§3.3⑤ edges 裁剪），[标注结果]/指令恒计不裁（V25③）；不可裁地板超预算 ⇒
     fit.overflow（V10——调用方拒绝，请求从不发出）。
-    @param record kind == "sequence" 的直装序列记录
+    @param record kind == "sequence" 的生成序列记录
     @param output 待评审的标注对象
     @param cfg 已解析配置（ui_tree_max_chars 总量取值）
     @param texts (类有效任务指令, 类有效 extra_criteria)
@@ -744,8 +702,8 @@ def _build_single_record_prompt(record: Record, output: Mapping,
 def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
                         options: VerifyPromptOptions | None = None) -> "PromptBundle":
     """装配一对（记录, 标注结果）的 §10.5 judge 提示词，按记录形态与装配项选模板——三条互斥路线：
-    序列 ∧ ``options.verdict_form`` → §10.16 判决形变体（v1.13，调用方按「流式驱动器是否在场」选形：
-    经典路径遇直装序列传 True，驱动器从不传，故缺陷词表变体逐字节不变）；序列 → §10.5 v1.8 缺陷
+    序列 ∧ ``options.verdict_form`` → §10.16 生成判决形变体（whole-set delivery 路径传 True，
+    普通 segmentation 驱动器不传）；普通序列 → §10.5 v1.8 缺陷
     词表变体；单记录 → §10.5 经典变体（UI 按 §10.1/§10.2 携带截图与序列化控件树）。
     @param record 被评审记录
     @param output 待评审的标注对象
@@ -930,7 +888,13 @@ class VerifyStage:
         """构造阶段实例。
         @param cfg 已解析配置（判决策略、面板、帧粒度开关均从此读取）
         """
-        self.cfg = cfg
+        self._cfg = cfg
+
+    @property
+    def cfg(self) -> "ResolvedConfig":
+        """@return 当前 attempt 的程序视图配置；普通批次返回构造期配置。"""
+        active = _ATTEMPT_CONFIG.get()
+        return self._cfg if active is None else active  # type: ignore[return-value]
 
     async def run(self, batch: list[PipelineItem],
                   ctx: "RunContext") -> list[PipelineItem]:
@@ -955,6 +919,44 @@ class VerifyStage:
             return batch
         await asyncio.gather(*(self._verify_item(item, ctx) for item in eligible))
         return batch
+
+    async def run_attempt(
+        self,
+        request: DownstreamAttemptRequest,
+    ) -> DownstreamAttemptResult:
+        """执行 whole-set verify gate。@param request 当前事务与运行上下文。@return 接受状态、拒绝阶段和计数。"""
+        items = list(request.transaction.items)
+        config_token = _ATTEMPT_CONFIG.set(request.run_context.cfg)
+        try:
+            token = _ATTEMPT_MODE.set(True)
+            try:
+                with request.run_context.metrics.capture_counts() as counters:
+                    try:
+                        await self.run(items, request.run_context)
+                    except SchemaViolation:
+                        return DownstreamAttemptResult(
+                            accepted=False, rejected_stage="verify",
+                            dataset_counters=dict(counters))
+            finally:
+                _ATTEMPT_MODE.reset(token)
+            self._assert_no_provider_fatal(items)
+            accepted = all(item.status == "active" and item.verification is not None
+                           for item in items)
+            return DownstreamAttemptResult(
+                accepted=accepted,
+                rejected_stage=None if accepted else "verify",
+                dataset_counters=dict(counters),
+            )
+        finally:
+            _ATTEMPT_CONFIG.reset(config_token)
+
+    @staticmethod
+    def _assert_no_provider_fatal(items: list[PipelineItem]) -> None:
+        """把 attempt items 中误隔离的 provider fatal 升为下游协议破坏。"""
+        if any(error.kind == ErrorKind.PROVIDER_FATAL.value
+               for item in items for error in item.errors):
+            _log.error("generation_downstream_contract: isolated provider fatal")
+            raise InternalError("generation_downstream_contract: isolated provider fatal")
 
     # ── v1.11 预算接线（spec 3.7.2 v1.11 行）──────────────────────────────
 
@@ -983,7 +985,7 @@ class VerifyStage:
                 declared.append(prof)
         if not declared:
             return None
-        schema_est = budget.est_text(json.dumps(schema, ensure_ascii=False))
+        schema_est = budget.est_text(json.dumps(_thaw_json(schema), ensure_ascii=False))
         min_budget = min(
             budget.input_budget(p)
             - (schema_est if p.supports_structured_output else 0)
@@ -1030,6 +1032,8 @@ class VerifyStage:
         except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
             raise
         except Exception as exc:  # 单条失败不外逃（阶段契约④）
+            if _ATTEMPT_MODE.get():
+                raise
             kind = self._fail_item(item, exc, ctx)
             _log.error("verify review failed for one record: kind=%s", kind)
             return
@@ -1045,8 +1049,8 @@ class VerifyStage:
         self, record: Record, annotation: Annotation, round_no: int, ctx: "RunContext",
         label: str | None = None,
     ) -> tuple[str, list[dict], list[dict]]:
-        """经典路径的一轮评审：schema 恒 VERDICT_SCHEMA。v1.13（裁决·直装评审判决形）：遇序列
-        信封（segment 关闭的直装形态——驱动器在场时序列永不进本函数）走判决形模板，schema 不变。
+        """经典路径的一轮评审：schema 恒 VERDICT_SCHEMA。遇生成序列信封走判决形模板；
+        普通 segmentation 序列由其驱动器评审，不进入本函数。
         @param record 被评审记录
         @param annotation 本轮送审的标注
         @param round_no 轮次（1 基）
@@ -1096,6 +1100,8 @@ class VerifyStage:
         @raises BaseException 大三样原样上抛；单 judge 面板亦原样上抛，交 _classify_error 归类
         """
         if isinstance(exc, _BIG_THREE):
+            raise exc
+        if _ATTEMPT_MODE.get():
             raise exc
         if not multi:
             raise exc
@@ -1862,7 +1868,7 @@ class VerifyStage:
     def _rung_fits(self, trial: _LadderTrial, prof: "LLMProfile",
                    ctx: "RunContext") -> bool:
         """升档试装：按 (k 减半, 升档像素) 建一次提示词并估算，看是否仍在输入预算内。单图成本取
-        max(标定读数, 供应商先验 @ 升档像素 × PRIOR_INFLATION)。v1.13：试装的 Schema 文本与计价
+        max(标定读数, 供应商先验 @ 升档像素 × PRIOR_INFLATION)。试装的 Schema 文本与计价
         对象都取类有效 Schema——否则试装估算与真实重标注调用不同源。
         @param trial 试装参数
         @param prof annotate profile（预算与像素上限来源）

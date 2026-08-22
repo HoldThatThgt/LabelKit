@@ -356,51 +356,13 @@ def test_template_head_tokens_quality_and_generate_inline_literals():
     assert generate_sentence in system_text
 
 
-def test_template_head_tokens_covers_all_thirteen_stages():
-    # v1.12：闭集加 frame_classify / frame_annotate 两键（值已由下方跨层
-    # 等式测试与算子帧模板冻结常量逐字对齐）。
-    # v1.13（裁决·预算头两键）：再加 generate_plan / generate_realize——时间流生成的
-    # 蓝图与帧实现两类调用；噪音批量实现复用 "generate" 键值，故不另立键。两值已随
-    # wave 三的模板 verbatim 冻结校准（下方 V22 家族跨层等式钉住）。
+def test_template_head_tokens_covers_only_legacy_operator_heads():
+    # v1.18 六个生成家族改用 common 中的完整 PromptBundle 构造器，不再冻结整数头。
     assert set(TEMPLATE_HEAD_TOKENS) == {"segment", "classify", "quality",
                                          "annotate", "verify", "generate",
                                          "stitch", "extract",
-                                         "frame_classify", "frame_annotate",
-                                         "generate_plan", "generate_realize",
-                                         "generate_brief"}
+                                         "frame_classify", "frame_annotate"}
     assert all(v > 0 for v in TEMPLATE_HEAD_TOKENS.values())
-    # 两个生成键都比平面生成的结构句头大（蓝图/实现模板各自内嵌结构契约）
-    assert TEMPLATE_HEAD_TOKENS["generate_plan"] > TEMPLATE_HEAD_TOKENS["generate"]
-    assert TEMPLATE_HEAD_TOKENS["generate_realize"] > TEMPLATE_HEAD_TOKENS["generate"]
-    assert TEMPLATE_HEAD_TOKENS["generate_brief"] > TEMPLATE_HEAD_TOKENS["generate"]
-
-
-def test_template_head_tokens_generate_stream_match_operator_constants():
-    """v1.13 时间流生成两键的跨层等式（V22 家族，裁决·预算头两键）：预算冻结常量
-    == est_text(M6 蓝图/帧实现模板的系统侧完整静态脚手架常量，§10.14/§10.15)——
-    修订模板即翻红，常量随 CONTRACTS 修订跟进；类生成指令、帧类表与逐位契约
-    Schema 文本是配置量，在 M1 静态预算预检各自计量，不入头常量。"""
-    from labelkit.operators import generate, generate_stream
-
-    assert (TEMPLATE_HEAD_TOKENS["generate_plan"]
-            == est_text(generate._PLAN_SYSTEM_STATIC))
-    assert (TEMPLATE_HEAD_TOKENS["generate_realize"]
-            == est_text(generate._REALIZE_SYSTEM_STATIC))
-    assert (TEMPLATE_HEAD_TOKENS["generate_brief"]
-            == est_text(generate._BRIEF_SYSTEM_STATIC))
-    # 静态脚手架确内嵌于渲染事实（模板头常量活在装配路径上，§10.4 族证明形）
-    system_text, _user = generate_stream.render_plan_prompt_texts(
-        "指令", (SimpleNamespace(name="a", description="d"),), "类", 3)
-    for piece in (generate._PLAN_SYSTEM_HEAD, generate._PLAN_STRUCTURE):
-        assert piece in system_text
-    system_text, _user = generate.render_realize_prompt_texts(
-        "指令", "风格", [("a", "要点")], ["自由文本一段"])
-    for piece in (generate._REALIZE_LABEL_STYLE, generate._REALIZE_STRUCTURE):
-        assert piece in system_text
-    system_text, _user = generate.render_brief_prompt_texts(
-        "指令", ("a", "b"), "类", 2, "rule=init:a")
-    for piece in (generate._BRIEF_SYSTEM_HEAD, generate._BRIEF_STRUCTURE):
-        assert piece in system_text
 
 
 # ── classify_stage_error vocabulary (V27①) ──────────────────────────────────

@@ -19,7 +19,7 @@
 | annotate | N | × self_consistency 的 n |
 | annotate 帧粒度（v1.12） | Σ 过质量门 episode 的未跳过成员数 | 逐成员一次调用（帧粒度里贵的那半）；住 quality 门之后——被淘汰记录永不付帧标注费；`[frame.class.<名>.annotate].enabled = false` 按类再省；dry-run 的 `frame_annotate_calls` 同样按帧总数报粗上界 |
 | generate | ⌈种子数 × num_per_record / num_per_call⌉ | 产出还会回流产生新的 quality/annotate 调用 |
-| generate 时间流形态（v1.13） | **2 × Σsequences + ⌈噪音帧数 / num_per_call⌉** | 一序列一次蓝图 + 一次帧实现，噪音批量另算；装箱/交叉/噪音位置/时间戳零 LLM。下游 quality/annotate/verify 的记录基数 = 幸存序列数 |
+| generate sequence | `estimate_run` 按 ScenarioPlan 与启用 family 给出逻辑下界 | declared whole-set retry 会重跑整组；instruction-only 每个 slot 独立。provider retry 与 L3 repair 另算 |
 | verify | N 左右 | × 评审数；每轮 repair 追加 1 标注 + 1 复审 |
 | 结构修复（LLM 修复环） | 按需 | 健康工程接近 0；`resolved_at.l3_*` 高说明 Schema 有问题（第 14 章） |
 | 重试 | 按需 | 报告 `llm_usage.*.retries` 可见 |
@@ -30,7 +30,10 @@ stream 工程（v1.8）另有两条成本注记：`annotate.sequence_frames`（�
 
 帧粒度（v1.12，第 25 章 25.6）的成本模型自带四重保护，预算时按「上界很松、实付常小得多」来读：`--dry-run` 的 `frame_classify_calls` / `frame_annotate_calls` 都按**预扫描帧总数**报粗上界；实付层面——帧分类是**每 episode 一次批量判决**（一次调用判整窗成员，不是每帧一次），且住 **dedup 之后**（重复 episode 一分帧钱不付）；帧标注虽是逐成员一次调用（帧粒度里贵的那半），但住 **quality 质量门之后**（被淘汰记录永不付帧标注费），还能用 `[frame.class.<名>.annotate].enabled = false` 把低价值帧类整类跳过。`examples/mix` UI 主工程本次真跑的对照：上界 17/17，实付 2 次批量判决 + 9 次帧标注（1 个 transition 过渡屏成员按类跳过）——对账看 `report.stream.frame_classify` / `frame_annotate` 两个子块（第 8 章）。该工程还是「贵的调用挑贵的端点」的活例：双端点分账 `llm_usage.default`（DeepSeek，segment 滑窗/帧级批量分类/轨迹打分的文本判决面）与 `llm_usage.vision`（z.ai，序列分类/序列标注/帧标注/评审的视觉必需面）本次真跑各 15 次调用——帧级批量分类永不要求 vision，指向便宜的纯文本 profile 即省钱面（第 25 章 25.6 的双端点成本拆分）。
 
-时间流生成的 `--dry-run` 复演同一套计划期逻辑；v1.16 约束面在场时也会运行同一个联合 planner，因此长度、固定帧类词、可放入的噪音槽与调用计划和真跑同源。逻辑调用基数仍是一条 attempt 一次 brief + 一次 realize，另加噪音批次；provider retry、Schema repair 和既有非 correlation realization 降级会让物理请求更多，不能拿 dry-run 数字冒充账单上限。联合 planner 不产生 LLM 成本，但约束越多、长度域越宽，启动校验与 dry-run 的本机求解时间越高；超过固定 deterministic budget 会明确失败，不会在运行期降级。控成本仍优先减少 `sequences`，其次缩短 `len_range`，最后调整批量噪音目标。
+sequence 的 validate、dry-run 与 run 复用同一份 plan。dry-run 给逻辑 family 入口下界，不含 provider retry、
+Schema repair 或失败 attempt 的 whole-set 重跑。事后同时看 `report.generate.sequence.sequence_calls` 与
+`llm_usage`：前者是逻辑入口，后者是物理请求/token。控成本优先减少 counterfactual set 或 instruction-only
+count，其次减少 pattern roles/sequence length；不要通过放宽验证或只补单条 variant 降成本。
 
 **先验预算**：`--dry-run` 直接给出估算调用数（不含修复与重试）。**后验核账**：报告 `llm_usage` 分 profile 给出 calls / tokens / retries，配了单价还有 `est_cost_usd`。
 
@@ -65,8 +68,10 @@ stream 工程（v1.8）另有两条成本注记：`annotate.sequence_frames`（�
 | 批内信封对象 | 与 batch_size 成正比 | 通常不是问题 |
 | 语义去重向量索引（可选） | 条数 × 维度 × 8B（float64 存储；50 万 × 1024 维 ≈ 4 GB，缓冲倍增扩容瞬间峰值更高） | scope=global 时常驻，要计入预算 |
 | 图像字节 | **不常驻** | 接入算 id、去重算 pHash、构造请求时各读一次，用完即弃（第 5 章） |
+| sequence final rows | 受 `record_units` / `stream_rows` 500000 与 retained 536870912 bytes 双上限约束 | retained 是 main+stream canonical UTF-8 紧凑核算，不是 512 MiB 物理预分配 |
 
-超过 50 万条的正确姿势是**切分多次运行**（第 5 章），不是硬顶内存。
+普通输入超过 50 万条的正确姿势是切分多次运行。sequence plan 超过上限会在 compile 阶段直接失败，不能分批
+破坏精确时间线。已验证的 500000 record-unit planner probe 为 16.889 秒，peak RSS 839221248 bytes。
 
 ## 17.4 可靠性参数的配合
 
@@ -88,4 +93,4 @@ stream 工程（v1.8）另有两条成本注记：`annotate.sequence_frames`（�
 | 内存吃紧 | 条数 × 是否 global scope | 切分运行；scope=batch；语义去重改 batch 或关 |
 | 质量门口径不对 | aggregate_histogram | 第 10 章（threshold/top_ratio/模式选择） |
 | 错缝 / 漏缝（stream×stitch，v1.9） | report.stream.stitch；trace 的 stitch.judge（priors 命中腿 / merged） | 错缝：`bias` 保持 conservative、`votes` ↑（3/5，奇数）、`stale_gap_steps` 设阈让久挂线索降格；漏缝：补强 `stitch.context`、确认 `repass` 开着、查先验哪条腿没命中；穿插深的流：`max_open` ↑（第 26 章） |
-| 合成序列产出少于配额 | `produced/planned`、plan/realize failures、四个 validator 子计数与 `tiers` 缺口 | correlation 作废高先检查两侧生成 Schema、共同上下文与提示；temporal 作废本应为零，非零说明 planner 不变式缺陷；sequence hook 作废高则检查纯函数规则；相似度淘汰仍从 `survived_dedup` 定位 |
+| sequence 尝试增多或耗尽 | `rejected_attempts`、`sequence_slot_attempts`、`llm_usage` | 按最终失败边界修 state/frame/evaluator/downstream；不得只重跑到绿或放宽精确交付 |

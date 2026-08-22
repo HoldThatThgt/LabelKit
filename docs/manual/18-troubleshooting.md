@@ -30,7 +30,10 @@
 
 v1.12（流模式帧粒度，第 25 章 25.6）**零新增错误码**：帧级分类/标注的失败复用既有 kind（结构修复耗尽照旧是 `schema_violation` 等），且**不产生 rejects 行**——帧分类失败落兜底帧类（计 `report.stream.frame_classify.fallback` / `window_failures`），帧标注失败落 members[] 的 `status="failed"`（计 `frame_annotate.failed`），episode 信封照常发射。排查入口见 18.2 的「members 里大量 status="failed"」。
 
-时间流生成到 v1.17 仍**零新增错误码**，内容失败也不进 rejects：brief/realize 修复穷尽、逐帧 hook、correlation 或序列 hook 违规都按「该序列整条作废」处置，不产 failed 记录、不补生成。联合 planner 的 `INFEASIBLE` / deterministic-budget `UNKNOWN` 是启动配置错误；`MODEL_INVALID` 是实现缺陷，走退出码 4，不能伪装成用户配置不可满足。
+sequence generation 不打开 rejects。可恢复的 slot 失败进入 `report.generate.sequence.rejected_attempts`；
+耗尽以 `sequence_delivery_exhausted` 退出 1。计划不可行是 `generation_plan_infeasible`（退出 2）；
+计划预算/内部错误、事务契约、projection contract 与 commit-I/O 是退出 4。provider fatal/circuit trip 原样穿透，
+不消耗 slot attempt。
 
 ## 18.2 按症状排查
 
@@ -144,17 +147,32 @@ jq -e '.run.interrupted == false and .run.circuit_broken == false' out/report.js
 
 现象：主输出 episode 行的 `_meta.stream.members[]` 里 `status="failed"` 占比异常、对应 `annotation` 全是 null——而 rejects 里**找不到任何对应行**、`--strict` 也不红。后半是设计语义不是遗漏：成员失败不是信封失败，帧失败不入 rejects、不触发 `--strict`（第 25 章 25.6），账面就在 members[] 状态位与 report 的帧子块。按序排查：① **帧 Schema 复杂度**——帧标注输出越深越难修，第 14 章的编写指南对帧 Schema 同样成立（平铺、语义化枚举、`required` + `additionalProperties: false`），先把帧 Schema 改简单；② **上下文预算**——帧 prompt 是最小单元、无降级梯，所引 profile `context_window` 声明过狠时预检直接把成员判 failed（查 `report.budget.overflow_records` 与 trace error 事件里的 `context_overflow`）；③ **对账计数**——`report.stream.frame_annotate.failed`（emitter 写前帧校验兜底翻掉的也计入此数）；④ **逐成员定位**——trace 订阅 `"annotate"` 通道读 `annotate.frame` 事件（member_id / status / attempts，第 16 章），attempts 偏高说明修复环在反复失败，回到帧 Schema 与模型能力。
 
-### 「工件重放时会话对不上」（v1.13）
+### 「sequence stream 重放在 ingest 阶段被拒绝」
 
-现象：把时间流工件拷去重放，摄取侧会话数与生成报告对不上。先核对 `order_by`、`gap_s`、`key` 与 `gap_steps`。v1.17 还要注意：显式 `time_s` 可以让 owner 相邻帧超过 `frame_gap_s`，但绝不会超过同一份 `stream.gap_s`；摄取侧以 `delta > gap_s` 才切 session，等于阈值不会切。duplicate 恒另占流尾 session，生成报告的 primary `sessions` 不含它。
+先确认 `input.text_field = "payload"` 与
+`stream.order_by = "meta:_meta.event.timestamp"`。M2 会从单一 stream 文件重算 primary event ID、每个 owner
+的 ordered sequence ID、replay sequence/event ID、ordinal 与 duplicate provenance。手工改 payload、timestamp、
+role、owner、world branch、source ID 或行数都会 fail closed；不要通过关闭 disorder 检查绕过 provenance。
 
-### 「按类标注 Schema 没生效」（v1.13）
+### 「按类标注 Schema 没生效」
 
-现象：给某个类配了 `[class.<类名>.annotate].schema_inline`，产出行的字段集却还是全局那份。按序排查：① **节名逐字对**——`<类名>` 必须精确等于 `[[classify.classes]]` 里的 `name`，拼错的节名会在启动时报配置错误（白名单机制不静默，第 24 章 24.4）；② **看那一行的 label**——`_meta.classification.label` 才是取 Schema 的依据，行被判成了别的类自然用别的类的 Schema，multi 扇出时更要按 (`id`, `label`) 看；③ **确认没写成 `schema_path` 与 `schema_inline` 同时给**（至多其一，同时给是配置错误）；④ 类 few-shot 示例报错时注意定位串——v1.13 起类示例是用**该类的 Schema** 干跑的，错误里的 `[[class.<类名>.annotate.examples]][N]` 指的就是它。
+确认 `[class.<类名>.annotate]` 的类名与分类表或 sequence class 完全一致；再看该行
+`_meta.classification.label`。每类只能写 `schema_path` / `schema_inline` 之一，few-shot 会用该类有效 Schema
+干跑。sequence main row 还会在 emitter 前按最终 class view 再校验一次。
 
-### 「合成序列大批作废 / 交叉演示位没了」（v1.13）
+### 「sequence attempts 增多或最终耗尽」
 
-现象：时间流生成的 `produced` 少于 `planned`，或 `crossed_sessions` 掉到 0。先先看 `report.generate.stream.delivery` 的 target/delivered/complete，再按 `delivery.failures` 定位 brief、realize、noise、correlation、temporal、sequence_validator、similarity 或 scenario_validator 缺口；`planner.objectives` 记录规划目标，`quotas` 记录周期归因。`crossed_sessions` 按 survivor 固定时间轴上真实 A-B-A / B-A-B 交替计算，一条 owner 作废后会退化，但不会重新装箱。相似度淘汰仍看 `survived_dedup`，不要用放松 dedup 阈值掩盖内容同质化。
+成功报告必须满足 planned = delivered；不存在“少交一点也成功”。先看 `rejected_attempts` 的唯一非零边界，
+再结合 `sequence_slot_attempts`、`noise_slot_attempts`、`sequence_calls`、`llm_usage` 和 trace 区分：
+
+- state/frame/coupling/pattern/semantic：修指令、Schema、权限或声明，不要放宽独立 evaluator；
+- dedup/quality/annotate/verify：失败发生在真实下游，整组数据与 dedup token 已回滚；
+- reconcile：main/stream 的 role、owner、ID 或成员集合不一致；
+- memory budget：按最终 main+stream canonical UTF-8 核算，不能截断 truth 通过；
+- provider retryable exhausted：消耗一次 attempt；provider fatal 则直接 exit 4、零 retry。
+
+耗尽后检查独立 failed report；此前成功 main、stream、report、manifest 应保持不变。commit-I/O 失败则可能留下
+固定路径混代，必须以旧 manifest 的 hashes 检出并拒绝。
 
 ### 「运行频繁被 429 限流拖慢 / 中断」
 

@@ -82,7 +82,7 @@ def make_cfg(*, enabled=True, llm="default", max_open=4, bias="conservative",
         project="project.toml", project_root=".",
         input=None, output=output, report=stem + ".report.json",
         rejects=stem + ".rejects.jsonl", sidecar=None, trace=None,
-        stream_artifact=None)
+        stream=None, manifest=None, failed_report=None)
     return ResolvedConfig(
         tool=ToolConfig(),
         console=ConsoleConfig(),

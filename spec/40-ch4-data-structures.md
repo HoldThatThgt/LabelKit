@@ -262,13 +262,13 @@ JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是�
 | `InstructionOnlySpec` | `name`, `sequence_class`, `count`, `len_range`, `instruction`, `state_schema` |
 | `TimelineSpec` | `timestamp_start_us`, `utc_offset_minutes`, `event_gap_us`, `primary_sessions`, `crossed_primary_sessions`, `session_max_events`, `session_max_span_us`, `session_gap_us`, `noise_events`, `duplicate_sequences` |
 | `CalendarWindowSpec` | `name`, `utc_offset_minutes`, `days`, `intervals_us` |
-| `NoiseSpec` | `frame_class`, `instruction` |
-| `GenerationLimits` | `pattern_roles`, `variants_per_counterfactual_set`, `instruction_only_events`, `scenario_seed_bytes`, `state_or_outcome_schema_bytes`, `frame_schema_bytes`, `event_patch_bytes`, `rendered_payload_bytes`, `instruction_bytes`, `record_units`, `stream_rows`, `retained_content_bytes` |
+| `NoiseSpec` | `frame_class`, `instruction`, `topics` |
+| `GenerationLimits` | `pattern_roles`, `variants_per_counterfactual_set`, `instruction_only_events`, `scenario_seed_bytes`, `state_or_outcome_schema_bytes`, `frame_schema_bytes`, `event_patch_bytes`, `rendered_payload_bytes`, `prompt_value_bytes`, `repair_context_bytes`, `prompt_text_bytes`, `record_units`, `stream_rows`, `retained_content_bytes` |
 | `SequenceGenerationConfig` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `state_validator`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `calendar_windows`, `noise`, `limits` |
-| `GenerationProgram` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `class_views`, `frame_classes`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `calendar_windows`, `noise`, `limits`, `state_validator`, `digest` |
+| `GenerationProgram` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `planner_seed`, `class_views`, `frame_classes`, `frame_schema`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `calendar_windows`, `noise`, `limits`, `state_validator`, `digest` |
 | `DeliverySlot` | `slot_key`, `source_name`, `scenario_index`, `sequence_class`, `pattern_name`, `variant_names`, `catalog_row_index` |
 | `PlannedEvent` | `event_key`, `role`, `position`, `logical_time_us`, `timestamp_us`, `session_id` |
-| `NoiseSlot` | `event_key`, `ordinal`, `frame_class`, `timestamp_us`, `session_id` |
+| `NoiseSlot` | `event_key`, `ordinal`, `frame_class`, `topic`, `timestamp_us`, `session_id` |
 | `ReplayLayout` | `source_slot_key`, `source_variant_name`, `replay_ordinal`, `session_id`, `timestamps_us` |
 | `ScenarioPlan` | `blocks`, `delivery_slots`, `noise_slots`, `replay_layouts`, `primary_sessions`, `digest` |
 | `ScenarioSeed` | `initial_state`, `actors`, `shared_facts`, `style`, `time_context` |
@@ -282,29 +282,31 @@ JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是�
 | `PatternEvaluation` | `actual_bindings`, `actual_violations` |
 | `StateEvaluation` | `replay_hash`, `final_state_hash`, `bindings_valid`, `outcome_valid`, `protected_prefix_valid` |
 | `SemanticEvaluation` | `causal_consistency`, `actor_knowledge`, `goal_consistency`, `temporal_plausibility`, `cross_frame_consistency`, `realism`, `reason_codes` |
-| `NoiseSemanticEvaluation` | `unrelated_to_declared_tasks`, `no_executable_task`, `realism`, `reason_codes` |
+| `NoiseSemanticEvaluation` | `unrelated_to_declared_tasks`, `no_executable_task`, `realism`, `matches_planned_topic`, `reason_codes` |
 | `EventTrace` | `scenario_id`, `world_branch_id`, `sequence_class`, `pattern_name`, `variant_name`, `scenario_seed`, `events`, `final_state`, `pattern_evaluation`, `state_evaluation`, `semantic_evaluation` |
-| `GenerationParseContext` | `project_root`, `class_views`, `frame_classes`, `llm_profiles`, `hook_loader`, `collector` |
+| `GenerationParseContext` | `project_root`, `class_views`, `frame_classes`, `llm_profiles`, `max_repair_attempts`, `repair_profile`, `hook_loader`, `collector` |
 | `ScenarioSeedRequest` | `program`, `slot`, `attempt_index`, `random_seed` |
-| `EventPlanRequest` | `mode`, `semantic_profile`, `slot_key`, `planned_event`, `role`, `generation_instruction`, `sequence_length`, `eligible_frame_classes`, `eligible_actors`, `actor_view`, `visible_state`, `history`, `actor_profiles`, `public_facts`, `attempt_index`, `variation_nonce` |
+| `EventPlanRequest` | `mode`, `semantic_profile`, `slot_key`, `planned_event`, `role`, `generation_instruction`, `sequence_length`, `eligible_frame_classes`, `eligible_actors`, `actor_view`, `visible_state`, `state_schema`, `outcome_schema`, `history`, `actor_profiles`, `public_facts`, `attempt_index`, `variation_nonce` |
 | `EventExecutionContext` | `program`, `plan`, `slot`, `variant_name`, `event_index`, `scenario_seed`, `current_state`, `history` |
 | `StateTransitionInput` | `slot_key`, `variant`, `role`, `state_before`, `state_after`, `patch` |
 | `PostValidationResult` | `violations`, `event_execution` |
 | `PostValidatedCallRequest` | `profile`, `prompt`, `schema`, `scope`, `post_validator` |
 | `ValidatedGenerationCall` | `object`, `event_execution`, `resolved_at`, `usage`, `attempts`, `model` |
-| `RenderEventRequest` | `semantic_profile`, `slot_key`, `planned_event`, `event_plan`, `actor_view`, `publish_snapshot`, `state_before_hash`, `state_after_hash`, `binding_values`, `frame_spec`, `role`, `public_facts`, `attempt_index` |
+| `RenderEventRequest` | `semantic_profile`, `slot_key`, `planned_event`, `event_plan`, `actor_view`, `publish_snapshot`, `state_before_hash`, `state_after_hash`, `binding_values`, `frame_spec`, `role`, `public_facts`, `attempt_index`, `limits` |
 | `StateEvaluationRequest` | `program`, `slot`, `pattern`, `variant`, `scenario_seed`, `events`, `baseline_events`, `final_state` |
 | `CouplingEvaluationRequest` | `variant`, `baseline_events`, `events` |
-| `SemanticEvaluationRequest` | `evaluation_profile`, `mode`, `sequence_class`, `class_description`, `pattern_description`, `scenario_seed`, `review_events`, `final_state`, `attempt_index` |
-| `NoiseRenderRequest` | `semantic_profile`, `noise_slot`, `noise_spec`, `frame_spec`, `class_descriptions`, `frame_descriptions`, `attempt_index` |
-| `NoiseEvaluationRequest` | `evaluation_profile`, `payload`, `class_descriptions`, `frame_descriptions`, `attempt_index` |
-| `ProjectionRequest` | `program`, `slot`, `trace` |
+| `SemanticEvaluationRequest` | `evaluation_profile`, `mode`, `sequence_class`, `class_description`, `pattern_description`, `scenario_seed`, `review_events`, `final_state`, `attempt_index`, `limits` |
+| `NoiseRenderRequest` | `semantic_profile`, `noise_slot`, `noise_spec`, `frame_spec`, `class_descriptions`, `frame_descriptions`, `attempt_index`, `limits` |
+| `NoiseEvaluationRequest` | `evaluation_profile`, `payload`, `planned_topic`, `class_descriptions`, `frame_descriptions`, `attempt_index`, `limits` |
+| `ProjectionRequest` | `program`, `plan`, `slot`, `trace` |
 | `NoiseProjectionRequest` | `program`, `run_id`, `noise_slot`, `payload` |
-| `ReplayProjectionRequest` | `program`, `layout`, `source` |
+| `ReplayProjectionRequest` | `program`, `plan`, `layout`, `source` |
 | `ProjectedSequence` | `main_record`, `primary_stream_rows` |
 | `SequenceRows` | `main_row`, `primary_stream_rows`, `retained_content_bytes` |
+| `SequenceAssemblyRequest` | `program`, `schema_engine`, `item`, `projection`, `batch_no` |
 | `ReplayRows` | `rows`, `retained_content_bytes` |
-| `ReconcileRequest` | `plan`, `sequences`, `noise_rows`, `replay_rows` |
+| `ProjectionWitness` | `main_record_id`, `generation_digest`, `member_sources_digest`, `primary_base_digests` |
+| `ReconcileRequest` | `program`, `plan`, `run_id`, `projection_witnesses`, `sequences`, `noise_payload_digests`, `noise_rows`, `replays`, `retained_content_bytes` |
 | `GenerationServices` | `config`, `schema_engine`, `llm`, `metrics` |
 | `RuntimeCredentials` | `llm`, `embedding` |
 | `ResolvedHook` | `reference`, `target` |
@@ -356,7 +358,7 @@ def compile_generation_program(config: ResolvedConfig) -> GenerationProgram:
     """编译唯一生成程序。"""
 
 
-def compile_scenario_plan(program: GenerationProgram, seed: int) -> ScenarioPlan:
+def compile_scenario_plan(program: GenerationProgram) -> ScenarioPlan:
     """冻结确定性场景计划。"""
 
 
@@ -453,8 +455,37 @@ def project_replay(request: ReplayProjectionRequest) -> ReplayRows:
     """从最终 source SequenceRows 投影完整 replay 行。"""
 
 
+def projection_witness(projection: ProjectedSequence) -> ProjectionWitness:
+    """从尚存的投影视图计算完整 SHA-256 CrossView 源证明。"""
+
+
+def noise_payload_digest(payload: Mapping[str, object]) -> str:
+    """计算 noise semantic gate 后 payload 的完整源摘要。"""
+
+
+def scenario_plan_digest(plan: ScenarioPlan) -> str:
+    """计算排除 digest 自身的完整 ScenarioPlan 摘要。"""
+
+
+def validate_planned_events(
+    program: GenerationProgram,
+    slot: DeliverySlot,
+    variant_name: str | None,
+    events: Sequence[PlannedEvent],
+) -> None:
+    """把 branch 的位置、role 与 event key 重新绑定到程序。"""
+
+
+def validate_plan_identity(program: GenerationProgram, plan: ScenarioPlan) -> None:
+    """验证 program、plan 自摘要与 canonical planner 完整身份。"""
+
+
 def reconcile_views(request: ReconcileRequest) -> None:
     """提交前机械核对最终 main、primary、noise 与 replay 视图。"""
+
+
+def reconcile_prospective_views(request: ReconcileRequest) -> None:
+    """机械核对当前尚未提交的连续交付前缀。"""
 
 
 async def deliver_generation(
@@ -493,11 +524,9 @@ class SequenceDeliveryEmitter:
 
     def assemble_sequence(
         self,
-        item: PipelineItem,
-        projection: ProjectedSequence,
-        batch_no: int,
+        request: SequenceAssemblyRequest,
     ) -> SequenceRows:
-        """从最终 item 与基础投影组装零 I/O 的完整 sequence 行。"""
+        """从闭包请求组装零 I/O 的完整 sequence 行并执行最终 Schema 终检。"""
 
     def prepare_product(
         self,
@@ -545,11 +574,29 @@ pattern evaluation 之后从 `actual_bindings` 机械回填；instruction-only �
 replay 必须在此后只从 source `SequenceRows.primary_stream_rows` 派生，不得从 pre-downstream
 Record 或 `ProjectedSequence` 构造。
 
-`GenerationServices` 是唯一运行服务根；`DeliveryServices` 不复制 `RunContext`。为协作者派生的
-`RunContext.cfg/llm/schema_engine/metrics` 必须与 `GenerationServices` 对应对象身份相同，只新建 rng 与
-batch number。`AttemptTransaction.items` 是当次 attempt 内唯一可变 item 真值；
+`SequenceAssemblyRequest(program, schema_engine, item, projection, batch_no)` 是 M11 的唯一装配输入。
+`GenerationProgram.class_views` 已把每个类的覆盖 Schema 或全局用户 Schema 物化为生效 Schema，
+`GenerationProgram.frame_schema` 是唯一帧标注 Schema。M11 和下游协作者不得回读 source
+`ResolvedConfig` 的同名 class/frame views 或 Schema，也不得把 `FrameClassView.gen_schema` 当成标注 Schema。
+
+`ProjectionRequest` 与 `ReplayProjectionRequest` 都显式携带完整 `ScenarioPlan`。公开 projector 在构造任意行前
+先验证 program/plan canonical identity，再要求 slot/layout 与 plan 中唯一成员完整 dataclass 相等；控制器在交付边界
+验证一次后只用包内 validated helper，内容重试不重新运行 CP-SAT。四类 render/evaluate request 的 `limits` 都必须
+来自 `GenerationProgram.limits`，是编译后提示、repair 与 payload 上限的唯一运行真值。
+
+`GenerationServices` 是唯一 source config、LLM、SchemaEngine 与 metrics 根；`DeliveryServices` 不复制
+`RunContext`。dedup context 的 cfg 直接复用该 source config；Quality、Annotate 与 Verify 的 context.cfg 则从它
+派生，并用 `GenerationProgram.class_views/frame_classes/frame_schema` 替换同名 sequence/frame 视图与帧标注
+Schema，所有正常与 repair 路径只读该 attempt-local cfg。其余 `llm/schema_engine/metrics` 仍与
+`GenerationServices` 对应对象身份相同，只新建 rng 与 batch number。`AttemptTransaction.items` 是当次 attempt
+内唯一可变 item 真值；
 `DownstreamAttemptResult` 不复制 items 或 Schema stats。dataset counter delta 属 attempt-local；LLM usage、
 retry、latency、SchemaEngine resolved-at 与 trace 是全局运行事实，不随事务回滚。
+
+`ReconcileRequest.replays` 保留 ReplayLayout 顺序的 `ReplayRows` 分组，不能预先展平；
+`retained_content_bytes` 携带 prospective 或最终全量费用。CrossView 必须直接从实际 sequence main/primary、noise
+与 replay canonical rows 独立复算每个分组和总费用，不能信任或只相加 carrier 内已有计数。M11 终检或
+CrossView 失败都归 `sequence_projection_mismatch`，拒绝并回滚整个当前 set attempt。
 
 `SequenceDeliveryEmitter.prepare_product` 是 `delivery_digest` 的唯一属主：它只计算一次并写入
 report 的深拷贝。`GenerationProduct` 不复制 digest 或 manifest input；`commit` 只从深度冻结的

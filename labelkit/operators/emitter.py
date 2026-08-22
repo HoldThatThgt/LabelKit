@@ -12,7 +12,7 @@
 计数（v1.9 T21：被合并片段壳的内容活在其 thread 的重绑记录里——壳绝不能落到 rejects
 兜底路径）；其余一切非 active 状态 → rejects。
 
-v1.13（裁决·按类标注 Schema，spec §6.3）：写前终检按行取类有效 Schema——该行自身标签
+按类标注 Schema 的写前终检按行取类有效 Schema——该行自身标签
 声明了 ``[class.<name>.annotate]`` 覆盖时用覆盖，否则用全局 ``output.schema``。
 
 发射器绝不因单条坏记录崩溃：写前 ``validate_only`` 不通过（内部不变式破裂）就把该条
@@ -27,27 +27,46 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import Any, Mapping, NoReturn, Sequence
 
 from labelkit import TOOL_VERSION
-from labelkit.common.errors import ErrorKind, LabelKitError
+from labelkit.common.config.model import ResolvedConfig, ResolvedPaths
+from labelkit.common.contracts.generation import (
+    GenerationProduct,
+    SequenceAssemblyRequest,
+    SequenceRows,
+)
+from labelkit.common.errors import (
+    ErrorKind,
+    GenerationProjectionMismatch,
+    InternalError,
+    LabelKitError,
+)
 from labelkit.common.contracts.types import PipelineItem, Record, StageError
+from labelkit.common.runtime.schema_engine import SchemaEngine, _thaw_json
 # v1.10（U21）：plain 模式的进度/摘要行格式活在 common 层的纯函数模块里，与 CLI
 # 渲染器共用（operators → common 是许可的依赖方向；cli ↛ operators 依旧成立）。
 from labelkit.common.observability import console_format
 
-if TYPE_CHECKING:  # pragma: no cover —— 导入期服务模块可能尚未就位
-    from labelkit.common.config.model import ResolvedConfig
-    from labelkit.common.runtime.schema_engine import SchemaEngine
-
 _log = logging.getLogger("labelkit.emitter")
 
 
-@dataclass(frozen=True)                            # [FROZEN in CONTRACTS.md §7.10]
+def _generation_contract_error(message: str) -> NoReturn:
+    """记录并抛出 generation 发射契约错误。
+
+    @param message 固定英文错误文本。
+    @return 不返回。
+    """
+    _log.error(message, extra={"stage": "emitter", "batch": 0})
+    raise InternalError(message)
+
+
+@dataclass(frozen=True)                            # 已在 CONTRACTS.md §7.10 冻结
 class EmitResult:
     """单批发射结果（CONTRACTS.md §7.10 冻结形态）。"""
     emitted: int                                   # 本批写入主输出的行数
@@ -109,15 +128,9 @@ class Emitter:
         if cfg.output.rejects != "none" and paths.rejects is None:
             raise ValueError("paths.rejects is None but output.rejects is on")
         self._rejects_path = self._with_part_source(paths.rejects)
-        if cfg.generate_stream.enabled and paths.stream_artifact is None:
-            raise ValueError("paths.stream_artifact is None but generate "
-                             "stream form is enabled")
-        self._artifact_path = self._with_part_source(paths.stream_artifact)
-        self._artifact_part = self._with_part(self._artifact_path)
         self._main_fh = None
         self._sidecar_fh = None
         self._rejects_fh = None
-        self._artifact_fh = None
 
     @staticmethod
     def _with_part_source(raw: str | None) -> Path | None:
@@ -139,9 +152,6 @@ class Emitter:
 
     def _init_counters(self) -> None:
         """初始化批间累计计数、通道状态标志与装配期注入的鸭子面。"""
-        # v1.13：工件 run 摘要条目（路径/sha256/行数，主输出同款形态）——
-        # write_stream_artifact 写入时冻结，M10 组报告时鸭子面读取；未写恒 None。
-        self.artifact_summary: dict | None = None
         self._emitted_total = 0
         self._rejected_total = 0
         self._status_totals: dict[str, int] = {}
@@ -163,7 +173,7 @@ class Emitter:
         # 开启时必有解析产物）。
         self._frame_schema = (dict(cfg.frame_schema)
                               if cfg.frame_schema is not None else None)
-        # v1.13（裁决·按类标注 Schema）：按序列类的写前终检 Schema 表——键 = 类名，
+        # 按序列类的写前终检 Schema 表——键 = 类名，
         # 仅声明了覆盖的类入表（未声明的类缺席 ⇒ 终检走全局 output.schema 的既有
         # 路径）。M5 侧 annotate.class_annotate_schema 的最小镜像：算子间不新增
         # 依赖（spec §2.2），两侧取值语义必须保持一致。
@@ -329,47 +339,13 @@ class Emitter:
         if discarded and self.metrics is not None:
             self.metrics.count("frame_annotate.discarded", discarded)
 
-    def write_stream_artifact(self, lines: Sequence[str]) -> None:
-        """v1.13（裁决·时间流工件通道）：把交织序定稿的工件行写入
-        ``{output_stem}.stream.jsonl.part``（写入 + flush；finalize 与主输出同批
-        fsync + 原子改名；``_undeliverable`` 纪律共用）。dry-run 天然不触达
-        （``_run_dry`` 不驱动生成、不开 emitter 通道）。同时冻结 run 摘要条目
-        （路径/sha256/行数——sha256 按落盘字节计，config_digest 同款前缀形态）。"""
-        if self._artifact_part is None:
-            # M1 保证形态开启 ⇒ paths.stream_artifact 必非 None（构造期已核对）；
-            # 此处只是绝不把 None 拼成 cwd 下的 "None.part" 的硬闸。
-            raise LabelKitError("stream artifact channel not configured "
-                                "(ResolvedPaths.stream_artifact is None)")
-        try:
-            self._artifact_fh = open(self._artifact_part, "w", encoding="utf-8")
-        except OSError as exc:
-            self._undeliverable = True
-            raise LabelKitError(f"stream artifact channel unwritable: {exc}") from exc
-        digest = hashlib.sha256()
-        for line in lines:
-            data = line + "\n"
-            digest.update(data.encode("utf-8"))
-            self._channel_write(self._artifact_fh, data, "stream artifact")
-        try:
-            self._artifact_fh.flush()
-        except OSError as exc:
-            self._undeliverable = True
-            raise LabelKitError(f"stream artifact flush failed: {exc}") from exc
-        self.artifact_summary = {"path": str(self._artifact_path),
-                                 "sha256": "sha256:" + digest.hexdigest(),
-                                 "lines": len(lines)}
-        _log.info("stream artifact staged: %s (%d lines)",
-                  self._artifact_part, len(lines),
-                  extra={"stage": "emitter", "batch": 0})
-
     def finalize(self, report: Mapping, deliver: bool = True) -> None:
         """收尾：deliver=True 时 fsync + 原子改名；report.json 恒写。
 
         deliver=False 只出现在 dry-run（从未开过 ``.part``）；v1.6：熔断收尾传的
         是 deliver=True——已完成的批照常交付，由报告标记 run.partial_delivery
         （spec 3.10.3 熔断交付）。先前发生过通道写失败会强制 deliver=False：可能
-        损坏的 ``.part`` 绝不会被改名成最终名（spec 3.11.3 ④）。v1.13：时间流工件
-        通道（若已暂存）与主输出在同一次 finalize 里按同一规则交付。
+        损坏的 ``.part`` 绝不会被改名成最终名（spec 3.11.3 ④）。
 
         :param report: 待写出的 report 对象（counts-only）。
         :param deliver: 是否真正交付；False = 只关闭通道不改名。
@@ -388,7 +364,7 @@ class Emitter:
         self._print_summary(report)
 
     def _deliver_channels(self, deliver: bool) -> None:
-        """逐个交付已开通道（主输出 → 工件 → sidecar → rejects），末了统一收口。
+        """逐个交付已开通道（主输出 → sidecar → rejects），末了统一收口。
 
         :param deliver: True = fsync + 原子改名；False = 仅关闭。
         :raises LabelKitError: 任一通道交付失败（CLI 退出码 4）。
@@ -396,10 +372,6 @@ class Emitter:
         try:
             self._deliver(self._main_fh, self._output_part, self._output_path, deliver)
             self._main_fh = None
-            if self._artifact_fh is not None:
-                self._deliver(self._artifact_fh, self._artifact_part,
-                              self._artifact_path, deliver)
-                self._artifact_fh = None
             if self._sidecar_fh is not None:
                 self._deliver(self._sidecar_fh, self._sidecar_part, self._sidecar_path, deliver)
                 self._sidecar_fh = None
@@ -450,13 +422,13 @@ class Emitter:
         return _raw_payload(item.record)
 
     def _row_schema(self, item: PipelineItem) -> dict | None:
-        """写前终检的按行 Schema（v1.13 裁决·按类标注 Schema）。
+        """返回写前终检的按行 Schema。
 
         :param item: 待发射的信封；``item.classification.label`` 是该行的序列类
             标签（multi 扇出的每个兄弟信封各带自己的标签，故按行天然对齐）。
         :returns: 该类声明的标注 Schema 覆盖；None = 无覆盖（未分类、未知类或
             该类未声明）⇒ ``validate_only`` 走全局 ``output.schema`` 的既有缺省
-            路径，字节等价 v1.12。
+            路径。
         """
         cls = item.classification
         if cls is None:
@@ -551,10 +523,8 @@ class Emitter:
         if sel in ("default:text", "default:ui", "default:trajectory"):
             return sel
         # "" 本应已被 M1 解析掉；此处镜像 loader 的解析规则（v1.8 S29：流模式把空
-        # 选择子解析成轨迹准则，两种模态皆然；v1.13 裁决·轨迹准则自动解析扩展：
-        # 时间流生成形态同样在给序列打分——条件扩为 segment.enabled ∨
-        # generate_stream.enabled，与 loader 两侧对齐）。
-        if self._cfg.segment.enabled or self._cfg.generate_stream.enabled:
+        # 选择子解析成轨迹准则，两种模态皆然。
+        if self._cfg.segment.enabled:
             return "default:trajectory"
         return f"default:{self._cfg.run.modality}"
 
@@ -632,17 +602,12 @@ class Emitter:
         resumed 标志仅在 stitch 开启时在场——这是关闭态字节等价的条件。顶层
         order_span 保持信封跨度（§6.3 包络规则：多片段 thread 的跨度里可能夹着别
         的 thread 的帧——下游切片必须用 fragments[].order_span）。
-        v1.13（裁决·members 呈现真值门）：门扩为 segment.enabled ∨
-        generate_stream.enabled——直装行原样复用本块（order_span/member_sources
-        指向工件路径与行号；session_split=false / repaired=false / degraded=null
-        / steps=null 均由鸭子面缺省值落出；stitch 两键保持缺席）。
 
         :param item: 该行的信封。
         :returns: stream 块；非流模式或非序列记录时为 None。
         """
         rec = item.record
-        stream_on = self._cfg.segment.enabled or self._cfg.generate_stream.enabled
-        if not stream_on or rec.kind != "sequence":
+        if not self._cfg.segment.enabled or rec.kind != "sequence":
             return None
         members = rec.members
         block: dict = {"episode_id": rec.id}
@@ -655,13 +620,9 @@ class Emitter:
             "member_ids": [m.id for m in members],
             "member_sources": [_member_source(m) for m in members],
         })
-        if (self._cfg.frame_classify.enabled or self._cfg.frame_annotate.enabled
-                or self._cfg.generate_stream.enabled):
+        if self._cfg.frame_classify.enabled or self._cfg.frame_annotate.enabled:
             # v1.12（spec §3.6）：members 数组仅在任一帧开关开启时在场，位置冻结在
             # member_sources 之后、session_split 之前；全关时块形态与 v1.11 字节等价。
-            # v1.13（裁决·members 呈现真值门）：时间流生成形态同门在场——label 列
-            # 承载帧类真值（member_classifications，inherited），无 annotation/
-            # status 列（frame.annotate 与本形态 M1 互斥）。
             block["members"] = self._members_block(item)
         self._append_stream_tail(block, item)
         return block
@@ -690,10 +651,8 @@ class Emitter:
         """v1.12（spec §3.6）：members 条目——逐成员按 rec.members 序，字段序冻结为
         index, id[, label][, annotation, status]。label 键仅 frame.classify 开启时
         在场（dict 为 None 或缺键 ⇒ null，覆盖降格跳过）；annotation/status 两键仅
-        frame.annotate 开启时在场（三值判定见 _member_annotation）。v1.13：label
-        列门扩 ∨ generate_stream（帧类真值列，裁决·members 呈现真值门）。"""
-        classify_on = (self._cfg.frame_classify.enabled
-                       or self._cfg.generate_stream.enabled)
+        frame.annotate 开启时在场（三值判定见 _member_annotation）。"""
+        classify_on = self._cfg.frame_classify.enabled
         annotate_on = self._cfg.frame_annotate.enabled
         rows: list[dict] = []
         for index, member in enumerate(item.record.members):
@@ -859,8 +818,7 @@ class Emitter:
         :raises LabelKitError: flush 失败（缓冲可能已部分落盘，等同写失败）。
         """
         try:
-            for fh in (self._main_fh, self._sidecar_fh, self._rejects_fh,
-                       self._artifact_fh):
+            for fh in (self._main_fh, self._sidecar_fh, self._rejects_fh):
                 if fh is not None:
                     fh.flush()
         except OSError as exc:
@@ -889,8 +847,7 @@ class Emitter:
 
     def _close_all(self) -> None:
         """关闭全部已开通道并复位句柄（清理路径，绝不掩盖首要错误）。"""
-        for fh in (self._main_fh, self._sidecar_fh, self._rejects_fh,
-                   self._artifact_fh):
+        for fh in (self._main_fh, self._sidecar_fh, self._rejects_fh):
             if fh is not None:
                 try:
                     fh.close()
@@ -900,7 +857,6 @@ class Emitter:
                                  type(exc).__name__,
                                  extra={"stage": "emitter", "batch": "-"})
         self._main_fh = self._sidecar_fh = self._rejects_fh = None
-        self._artifact_fh = None
 
     # ── stderr 进度与摘要（展示面，不是日志——spec §7.7）─────────────────
 
@@ -945,6 +901,571 @@ class Emitter:
         sys.stderr.write(
             "\n".join(console_format.format_summary_lines(counts)) + "\n")
         sys.stderr.flush()
+
+
+class SequenceDeliveryEmitter:
+    """延迟打开 sequence 输出并按 manifest-last 协议提交完整产物。"""
+
+    def __init__(self, paths: "ResolvedPaths"):
+        """绑定 M1 已冻结的 sequence 输出路径。
+
+        @param paths 含 main、stream、report、manifest 与 failed-report 的绝对路径。
+        """
+        self._paths = paths
+
+    def assemble_sequence(
+        self,
+        request: "SequenceAssemblyRequest",
+    ) -> "SequenceRows":
+        """从闭包请求装配 main/primary 行并执行 program-bound 终检。
+
+        @param request program、M8、最终信封、投影与固定批号。
+        @return 最终 SequenceRows 与精确 retained-content 费用。
+        """
+        from labelkit.common.contracts.generation import SequenceRows
+        from labelkit.operators.generation.project import canonical_delivery_row
+
+        item, projection = request.item, request.projection
+        self._validate_projection(item, projection)
+        primary = self._assemble_primary_rows(item, projection.primary_stream_rows)
+        main = self._assemble_sequence_main(item, projection, request.batch_no)
+        self._validate_sequence_rows(request, main, primary)
+        retained = len(canonical_delivery_row(main)) + 1
+        retained += sum(len(canonical_delivery_row(row)) + 1 for row in primary)
+        return SequenceRows(
+            main_row=main,
+            primary_stream_rows=primary,
+            retained_content_bytes=retained,
+        )
+
+    def _validate_sequence_rows(self, request, main: dict, primary: tuple[dict, ...]) -> None:
+        """用程序冻结的最终 Schema 独立检查实际待交付对象。
+
+        @param request 当前 M11 闭包请求。
+        @param main 已装配的最终 main row。
+        @param primary 已装配的最终 primary rows。
+        @return None；任何违规均拒绝整个 attempt。
+        """
+        item = request.item
+        label = item.classification.label if item.classification is not None else None
+        view = request.program.class_views.get(label) if label is not None else None
+        if view is None:
+            self._schema_mismatch(item.record.id, "sequence_class", 1)
+        if not isinstance(view.schema, Mapping):
+            _generation_contract_error("generation_downstream_contract: missing class schema")
+        if view.annotate.enabled:
+            if item.annotation is None:
+                self._schema_mismatch(item.record.id, "sequence", 1)
+            user = {key: value for key, value in main.items() if key != "_meta"}
+            self._validate_schema(request, user, view.schema, item.record.id, "sequence")
+        elif item.annotation is not None:
+            self._schema_mismatch(item.record.id, "sequence", 1)
+        self._validate_frame_rows(request, main, primary)
+
+    def _validate_frame_rows(self, request, main: dict, primary: tuple[dict, ...]) -> None:
+        """逐成员检查 main 与 primary 两份最终帧标注。
+
+        @param request 当前 M11 闭包请求。
+        @param main 已装配的最终 main row。
+        @param primary 已装配的最终 primary rows。
+        @return None；未知帧类、缺失或非法标注均拒绝 attempt。
+        """
+        members = main["_meta"]["stream"]["members"]
+        for record, member, row in zip(
+            request.item.record.members, members, primary, strict=True
+        ):
+            cls = (request.item.member_classifications or {}).get(record.id)
+            view = request.program.frame_classes.get(cls.label) if cls is not None else None
+            if view is None:
+                self._schema_mismatch(request.item.record.id, "frame_class", 1)
+            outputs = (member.get("annotation"), row["_meta"].get("annotation"))
+            self._validate_frame_pair(request, outputs, view, request.item.record.id)
+
+    def _validate_frame_pair(self, request, outputs, view, record_id: str) -> None:
+        """检查一个成员在两份交付视图中的帧标注。
+
+        @param request 当前 M11 闭包请求。
+        @param outputs main member 与 primary 的标注对象。
+        @param view 当前帧类程序视图。
+        @param record_id 所属 sequence ID，仅用于脱敏日志。
+        @return None。
+        """
+        schema = request.program.frame_schema
+        if schema is None:
+            if any(output is not None for output in outputs):
+                _generation_contract_error(
+                    "generation_downstream_contract: missing frame annotation schema"
+                )
+            return
+        if view.enabled and any(output is None for output in outputs):
+            self._schema_mismatch(record_id, "frame", 1)
+        if not view.enabled and any(output is not None for output in outputs):
+            self._schema_mismatch(record_id, "frame", 1)
+        for output in outputs:
+            if output is not None:
+                self._validate_schema(request, output, schema, record_id, "frame")
+
+    @staticmethod
+    def _validate_schema(request, output, schema, record_id: str, surface: str) -> None:
+        """对一个实际输出对象运行显式 Schema 终检。
+
+        @param request 当前 M11 闭包请求。
+        @param output 待写出的用户对象。
+        @param schema program-bound 生效 Schema。
+        @param record_id 所属 sequence ID，仅用于脱敏日志。
+        @param surface sequence 或 frame 检查面。
+        @return None。
+        """
+        if not isinstance(output, Mapping):
+            SequenceDeliveryEmitter._schema_mismatch(record_id, surface, 1)
+        violations = request.schema_engine.validate_only(
+            _thaw_json(output), schema=_thaw_json(schema)
+        )
+        if violations:
+            SequenceDeliveryEmitter._schema_mismatch(
+                record_id, surface, len(violations)
+            )
+
+    @staticmethod
+    def _schema_mismatch(record_id: str, surface: str, count: int) -> NoReturn:
+        """记录脱敏终检摘要并抛可恢复投影拒绝。
+
+        @param record_id 所属 sequence ID。
+        @param surface sequence、frame 或 frame_class。
+        @param count 违规数量。
+        @return 不返回。
+        """
+        _log.warning(
+            "sequence schema pre-write failed: record=%s surface=%s violations=%d",
+            record_id,
+            surface,
+            count,
+            extra={"stage": "emitter", "batch": 0},
+        )
+        raise GenerationProjectionMismatch("final annotation schema is invalid")
+
+    def prepare_product(
+        self,
+        main_rows: Sequence[Mapping[str, object]],
+        stream_rows: Sequence[Mapping[str, object]],
+        report: Mapping[str, object],
+    ) -> "GenerationProduct":
+        """计算唯一 delivery digest 并冻结完整内存产物。
+
+        @param main_rows 最终 primary sequence rows。
+        @param stream_rows 最终 primary、noise、replay rows。
+        @param report 尚未填 delivery digest 的成功报告。
+        @return 含唯一摘要的 GenerationProduct。
+        """
+        from labelkit.common.contracts.generation import GenerationProduct
+
+        main = tuple(self._copy_json(row) for row in main_rows)
+        stream = tuple(self._copy_json(row) for row in stream_rows)
+        digest = self._delivery_digest((*main, *stream))
+        report_copy = self._copy_json(report)
+        sequence = report_copy.get("generate", {}).get("sequence")
+        if not isinstance(sequence, dict):
+            _generation_contract_error("generation_downstream_contract: missing sequence report")
+        if sequence.get("delivery_digest", object()) is not None:
+            _generation_contract_error(
+                "generation_downstream_contract: invalid digest placeholder"
+            )
+        if sequence.get("artifacts_committed") is not False:
+            _generation_contract_error(
+                "generation_downstream_contract: invalid commit placeholder"
+            )
+        sequence["delivery_digest"] = digest
+        sequence["artifacts_committed"] = True
+        return GenerationProduct(main_rows=main, stream_rows=stream, report=report_copy)
+
+    def commit(self, product: "GenerationProduct") -> Mapping[str, object]:
+        """写入 parts，依次替换三件工件，最后替换 manifest。
+
+        @param product 已冻结且 report 含合法唯一 delivery digest 的产物。
+        @return 已提交 manifest。
+        @raises LabelKitError 任一固定路径 I/O 失败或产物协议破坏。
+        """
+        digest, run_id = self._product_identity(product.report)
+        targets = self._success_targets()
+        main_bytes = self._jsonl_bytes(product.main_rows)
+        stream_bytes = self._jsonl_bytes(product.stream_rows)
+        report_bytes = self._json_bytes(product.report)
+        payloads = (main_bytes, stream_bytes, report_bytes)
+        try:
+            for target, data in zip(targets, payloads, strict=True):
+                self._write_part(target, data)
+            for target in targets:
+                os.replace(self._part(target), target)
+            identity = (run_id, digest)
+            row_counts = (len(product.main_rows), len(product.stream_rows))
+            manifest = self._manifest(identity, targets, payloads, row_counts)
+            manifest_path = self._required_path("manifest")
+            self._write_part(manifest_path, self._json_bytes(manifest))
+            os.replace(self._part(manifest_path), manifest_path)
+        except OSError as exc:
+            _log.error("generation_commit_io", extra={"stage": "emitter", "batch": 0})
+            raise LabelKitError("generation_commit_io") from exc
+        return manifest
+
+    def write_failed_report(self, report: Mapping[str, object]) -> None:
+        """原子替换独立 data-free failed report。
+
+        @param report 失败身份、计数、终态与 usage 对象。
+        @return None。
+        @raises LabelKitError failed report I/O 失败。
+        """
+        target = self._required_path("failed_report")
+        try:
+            self._write_part(target, self._json_bytes(report))
+            os.replace(self._part(target), target)
+        except OSError as exc:
+            _log.error("generation_failed_report_io",
+                       extra={"stage": "emitter", "batch": 0})
+            raise LabelKitError("generation_failed_report_io") from exc
+
+    @staticmethod
+    def _validate_projection(item: PipelineItem, projection) -> None:
+        """验证信封、主记录及 primary rows 的身份闭包。
+
+        @param item 下游最终信封。
+        @param projection 对应的生成投影。
+        @return None。
+        """
+        if item.status != "active" or item.record.id != projection.main_record.id:
+            _generation_contract_error("generation_downstream_contract: final item mismatch")
+        row_ids = tuple(row["_meta"]["event"]["event_id"]
+                        for row in projection.primary_stream_rows)
+        if row_ids != tuple(member.id for member in item.record.members):
+            _generation_contract_error("generation_downstream_contract: member row mismatch")
+
+    def _assemble_sequence_main(self, item: PipelineItem, projection, batch_no: int) -> dict:
+        """装配一条含全部下游产物的最终 main row。
+
+        @param item 下游最终信封。
+        @param projection 对应生成投影。
+        @param batch_no 固定交付序号。
+        @return 最终 main JSON object。
+        """
+        user = (dict(item.annotation.output) if item.annotation is not None
+                else dict(_raw_payload(item.record)))
+        truth = self._main_generation_truth(projection)
+        user["_meta"] = {
+            "id": item.record.id,
+            "source": self._sequence_source(item.record),
+            "stream": self._sequence_stream(item),
+            "scores": self._sequence_scores(item, batch_no),
+            "dedup": {"kind": item.dedup.kind} if item.dedup is not None else None,
+            "classification": self._classification(item),
+            "annotation": self._annotation(item),
+            "verification": self._verification(item),
+            "generation": truth,
+        }
+        return user
+
+    @staticmethod
+    def _main_generation_truth(projection) -> dict:
+        """读取 projector 保存在 main_record.raw 的完整 generation truth。
+
+        @param projection 当前 ProjectedSequence。
+        @return 深拷贝的完整主 truth。
+        """
+        raw = projection.main_record.raw
+        truth = raw.get("_meta", {}).get("generation") if isinstance(raw, Mapping) else None
+        if not isinstance(truth, Mapping):
+            _generation_contract_error(
+                "generation_downstream_contract: missing main generation truth"
+            )
+        return SequenceDeliveryEmitter._copy_json(truth)
+
+    @staticmethod
+    def _sequence_source(record: Record) -> dict:
+        """装配 generation main 的无输入来源块。
+
+        @param record sequence Record。
+        @return generic source metadata。
+        """
+        return {"file": record.ref.source_file, "pair_index": record.ref.pair_index,
+                "generated_from": list(record.ref.generated_from), "fields": {},
+                "generator": (dict(record.ref.generator)
+                              if record.ref.generator is not None else None)}
+
+    def _sequence_stream(self, item: PipelineItem) -> dict:
+        """装配 sequence main 的成员索引与 frame products。
+
+        @param item 下游最终信封。
+        @return stream 成员块。
+        """
+        return {
+            "episode_id": item.record.id,
+            "session_id": item.session_id,
+            "member_count": len(item.record.members),
+            "member_ids": [member.id for member in item.record.members],
+            "member_sources": [_member_source(member) for member in item.record.members],
+            "members": [self._sequence_member(item, index, member)
+                        for index, member in enumerate(item.record.members)],
+        }
+
+    @staticmethod
+    def _sequence_member(item: PipelineItem, index: int, member: Record) -> dict:
+        """装配一个 main stream.members 条目。
+
+        @param item 所属 sequence 信封。
+        @param index 成员序号。
+        @param member 当前成员。
+        @return frame classification/annotation 行。
+        """
+        cls = (item.member_classifications or {}).get(member.id)
+        annotations = item.member_annotations
+        row = {"index": index, "id": member.id,
+               "label": cls.label if cls is not None else None}
+        if annotations is not None:
+            annotation = annotations.get(member.id)
+            row["annotation"] = (dict(annotation.output) if annotation is not None else None)
+            row["status"] = ("skipped" if member.id not in annotations else
+                             "annotated" if annotation is not None else "failed")
+        return row
+
+    def _assemble_primary_rows(self, item: PipelineItem,
+                               rows: Sequence[Mapping[str, object]]) -> tuple[dict, ...]:
+        """把 frame products 注入最终 primary rows，供 replay 原样复制。
+
+        @param item 下游最终信封。
+        @param rows projector 的基础 primary rows。
+        @return 与成员同序的最终 row tuple。
+        """
+        output: list[dict] = []
+        for member, source in zip(item.record.members, rows, strict=True):
+            row = self._copy_json(source)
+            cls = (item.member_classifications or {}).get(member.id)
+            row["_meta"]["classification"] = self._classification_value(cls)
+            if item.member_annotations is not None:
+                annotation = item.member_annotations.get(member.id)
+                row["_meta"]["annotation"] = (
+                    dict(annotation.output) if annotation is not None else None)
+            output.append(row)
+        return tuple(output)
+
+    @staticmethod
+    def _classification(item: PipelineItem) -> dict | None:
+        """装配 sequence-level inherited classification。
+
+        @param item 当前信封。
+        @return generic classification block。
+        """
+        return SequenceDeliveryEmitter._classification_value(item.classification)
+
+    @staticmethod
+    def _classification_value(classification) -> dict | None:
+        """把 Classification 转为 generic output block。
+
+        @param classification 分类产物或 None。
+        @return JSON-compatible block。
+        """
+        if classification is None:
+            return None
+        return {"label": classification.label, "labels": list(classification.labels),
+                "source": classification.source}
+
+    @staticmethod
+    def _annotation(item: PipelineItem) -> dict | None:
+        """装配 sequence annotation 元数据。
+
+        @param item 当前信封。
+        @return generic annotation block。
+        """
+        annotation = item.annotation
+        if annotation is None:
+            return None
+        block = {"model": annotation.model, "attempts": annotation.attempts}
+        if annotation.sc is not None:
+            block["sc"] = dict(annotation.sc)
+        return block
+
+    @staticmethod
+    def _verification(item: PipelineItem) -> dict | None:
+        """装配 sequence verification 元数据。
+
+        @param item 当前信封。
+        @return generic verification block。
+        """
+        result = item.verification
+        return (None if result is None else
+                {"verdict": result.verdict, "rounds": result.rounds})
+
+    @staticmethod
+    def _sequence_scores(item: PipelineItem, batch_no: int) -> dict | None:
+        """装配 sequence quality scores 与 inherited class pool。
+
+        @param item 当前信封。
+        @param batch_no 固定交付序号。
+        @return generic scores block。
+        """
+        if not item.scores:
+            return None
+        scores = {key: value.score for key, value in item.scores.items()
+                  if key != "__aggregate__"}
+        aggregate = item.scores.get("__aggregate__")
+        scores["__aggregate__"] = aggregate.score if aggregate is not None else None
+        sample = aggregate or next(iter(item.scores.values()))
+        scores["mode"] = sample.mode
+        scores["batch_no"] = batch_no
+        if item.classification is not None:
+            scores["pool"] = item.classification.label
+        return scores
+
+    @staticmethod
+    def _delivery_digest(rows: Sequence[Mapping[str, object]]) -> str:
+        """按长度 framing 计算唯一 delivery SHA-256。
+
+        @param rows main 后接 stream 的最终有序行。
+        @return 64 位小写十六进制摘要。
+        """
+        from labelkit.operators.generation.project import canonical_delivery_row
+
+        digest = hashlib.sha256(b"labelkit:v1.18:delivery\n")
+        for row in rows:
+            payload = canonical_delivery_row(row)
+            digest.update(str(len(payload)).encode("ascii"))
+            digest.update(b":")
+            digest.update(payload)
+        return digest.hexdigest()
+
+    @staticmethod
+    def _jsonl_bytes(rows: Sequence[Mapping[str, object]]) -> bytes:
+        """按契约声明序把最终 rows 编为用户可见 JSONL。
+
+        @param rows 有序输出行。
+        @return 含每行末尾换行的 UTF-8 bytes。
+        """
+        return b"".join(
+            json.dumps(
+                SequenceDeliveryEmitter._copy_json(row),
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8") + b"\n"
+            for row in rows
+        )
+
+    @staticmethod
+    def _json_bytes(value: Mapping[str, object]) -> bytes:
+        """按契约声明序把 report 或 manifest 编为 JSON 文件。
+
+        @param value JSON object。
+        @return 单行 UTF-8 bytes，含末尾换行。
+        """
+        plain = SequenceDeliveryEmitter._copy_json(value)
+        return json.dumps(
+            plain, ensure_ascii=False, separators=(",", ":")
+        ).encode("utf-8") + b"\n"
+
+    def _product_identity(self, report: Mapping[str, object]) -> tuple[str, str]:
+        """在任何 I/O 前验证 success report 身份。
+
+        @param report GenerationProduct.report。
+        @return delivery digest 与 run ID。
+        """
+        sequence = report.get("generate", {}).get("sequence", {})
+        digest, run_id = sequence.get("delivery_digest"), sequence.get("run_id")
+        if not isinstance(digest, str) or re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+            _generation_contract_error(
+                "generation_downstream_contract: invalid delivery digest"
+            )
+        if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None:
+            _generation_contract_error("generation_downstream_contract: invalid run id")
+        return digest, run_id
+
+    def _success_targets(self) -> tuple[Path, Path, Path]:
+        """解析三个 manifest 前置成功路径。
+
+        @return main、stream、report 路径。
+        """
+        return (self._required_path("output"), self._required_path("stream"),
+                self._required_path("report"))
+
+    def _required_path(self, name: str) -> Path:
+        """读取一个 sequence 必需的冻结路径。
+
+        @param name ResolvedPaths 字段名。
+        @return 非空 Path。
+        """
+        raw = getattr(self._paths, name, None)
+        if not isinstance(raw, str) or not raw:
+            _generation_contract_error(
+                f"generation_downstream_contract: missing {name} path"
+            )
+        return Path(raw)
+
+    @staticmethod
+    def _copy_json(value):
+        """递归复制被 MappingProxyType 冻结的 JSON 树。
+
+        @param value JSON-compatible 值。
+        @return 可变 dict/list 树或标量。
+        """
+        if isinstance(value, Mapping):
+            return {key: SequenceDeliveryEmitter._copy_json(item)
+                    for key, item in value.items()}
+        if isinstance(value, (tuple, list)):
+            return [SequenceDeliveryEmitter._copy_json(item) for item in value]
+        return value
+
+    @staticmethod
+    def _part(target: Path) -> Path:
+        """派生同目录 part 路径。
+
+        @param target 固定正式路径。
+        @return 追加 .part 的路径。
+        """
+        return Path(str(target) + ".part")
+
+    @classmethod
+    def _write_part(cls, target: Path, data: bytes) -> None:
+        """覆盖、flush 并 fsync 一个同目录 part。
+
+        @param target 最终路径。
+        @param data 完整文件 bytes。
+        @return None。
+        """
+        with open(cls._part(target), "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+
+    def _manifest(self, identity, targets, payloads, row_counts) -> dict:
+        """从已替换工件构造 manifest-last 对象。
+
+        @param identity 32 位运行 ID 与 report 中的唯一 delivery digest。
+        @param targets main、stream、report 路径。
+        @param payloads 三件工件的精确 bytes。
+        @param row_counts main 与 stream 行数。
+        @return 固定键序 manifest。
+        """
+        run_id, digest = identity
+        main_path, stream_path, report_path = targets
+        main_bytes, stream_bytes, report_bytes = payloads
+        main_rows, stream_rows = row_counts
+        committed_at = datetime.now(timezone.utc).isoformat(timespec="microseconds")
+        return {
+            "schema_version": 1, "run_id": run_id, "delivery_digest": digest,
+            "artifacts_committed": True,
+            "main": self._artifact(main_path, main_bytes, main_rows),
+            "stream": self._artifact(stream_path, stream_bytes, stream_rows),
+            "report": {"path": str(report_path),
+                       "sha256": hashlib.sha256(report_bytes).hexdigest()},
+            "committed_at": committed_at.replace("+00:00", "Z"),
+        }
+
+    @staticmethod
+    def _artifact(path: Path, data: bytes, rows: int) -> dict:
+        """构造一个 manifest JSONL artifact block。
+
+        @param path 已提交固定路径。
+        @param data 对应完整文件 bytes。
+        @param rows JSONL 行数。
+        @return path、sha256、rows block。
+        """
+        return {"path": str(path), "sha256": hashlib.sha256(data).hexdigest(),
+                "rows": rows}
 
 
 def _step_row(transition, stitch_on: bool) -> dict:

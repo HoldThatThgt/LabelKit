@@ -54,7 +54,10 @@ emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed
   = scanned + generated [+ fanout] [+ episodes]
 ```
 
-（v1.13 的时间流生成（`[generate.stream]`，第 27 章）**不给这条等式添项**：合成流的成员帧只活在时间流工件里、不构造信封，一条序列 = 一个信封 = 一行，等式取 generate_only 的退化形 `emitted + dropped_* + failed = generated`——`absorbed` / `episodes` 是分段算子的记账项，本形态不出现。`bad_input` 是 ingest 阶段就不成记录的坏行/缺对，没有 id，不走拒绝通道，只计数。`fanout` 仅在 `classify.assignment = "multi"` 时出现于 `counts`——multi 扇出净增的信封数，右侧随之补平，第 24 章。`absorbed` / `dropped_noise` / `episodes` 是 v1.8 的 stream 三项，仅 `segment.enabled = true` 时出现：分段吸收的帧与剔除的噪声帧记在左侧，净增的 episode 信封数记在右侧补平，第 25 章。`stitched` 是 v1.9 缝合项，仅 `stitch.enabled = true` 时出现：被并进线索的 episode 壳作为终态记在左侧，与右侧的 `episodes` 一对一抵扣（线索数 = episodes − stitched），第 26 章。未启用的项恒为 0，等式退化回原形。另注意残差项 `unprocessed`：熔断中止时左侧另加它；流模式下**优雅中断（SIGINT/SIGTERM）也会**产生该项——会话缓冲让中断时可能有已扫描但未走完流水线的帧；非流模式的中断残差恒为 0、不出现此键。）
+序列生成把一条最终 sequence 作为一个流水线信封；成员事件只存在于 main 的成员视图和 stream 工件，
+不加入普通 process 守恒式。它另在 `report.generate.sequence` 中精确对账 sets、sequences、primary/noise/replay
+events 与 stream rows。分段产生的 `absorbed`、`dropped_noise`、`episodes`，以及缝合产生的 `stitched`，
+仍只属于 process stream 模式。熔断或流模式优雅中断时，普通守恒式还可能出现 `unprocessed`。
 
 ## 4.3 批（Batch）：流动与屏障
 
@@ -95,20 +98,21 @@ emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed
 | `stitch` 开 ⇒ `segment` 必须开（v1.9） | 缝合的对象是分段产出的 episode 碎片——没有分段就没有可缝的东西（仅流模式可用） |
 | `stitch.votes` 若大于 1 必须为奇数（v1.9） | 偶数票可能平票，严格多数决失去意义 |
 | `segment` 开 ⇒ `quality.llm` **免除** `supports_vision` 要求（v1.8 放宽项；v1.9 的 `stitch.llm` 同样恒不要求视觉） | 序列打分是纯文本（步骤序列 + 帧摘要，无图），UI 模态也不需要视觉能力；缝合判定同理（摘要卡证据，无图） |
-| `frame.classify` / `frame.annotate` 任一开 ⇒ `segment` 必须开（v1.12） | 帧粒度是流模式内的第二层产物——帧的载体是 episode 的成员集；非流工程想按类定制标注，用 `[class.<名>.annotate]`（第 24 章） |
+| `frame.classify` 开，或 process/flat 的 `frame.annotate` 开 ⇒ `segment` 必须开 | 普通帧粒度消费 segment 产生的 episode 成员；frame classify 没有 sequence 例外 |
+| sequence form 的 `frame.annotate` 可脱离 `segment` 与序列 `annotate` | 生成计划已经给出成员与 inherited frame class；只开帧标注时仍须开启 pointwise quality，以满足 quality/annotate 至少一项开启的总约束 |
 | 帧粒度任一开 ⇒ `output.meta_mode` 不得为 `"none"`（v1.12） | 帧产物仅经 `_meta.stream.members[]` 承载——丢弃元信息 = 丢弃全部帧产物 |
-| `[frame.class.*]` 在场 ⇒ `frame.classify` 必须开，且节名 ∈ 帧类表（v1.12；v1.13 放宽为 `frame.classify` 开 **∨** `generate.stream` 开——后者用 `[frame.class.<名>.generate]` 声明帧内容契约） | 按帧类覆盖以帧类判决为前提；`frame.classify.fallback_class` 同样必须 ∈ 帧类表 |
-| `generate.stream` 开 ⇒ `mode = "generate_only"` ∧ 模态 `text` ∧ `generate` 开 ∧ `classify` 开 ∧ `stream.order_by = "meta:<字段>"` ∧ `output.meta_mode ≠ "none"`（v1.13） | 时间流生成从零合成流：类表是配额与标签继承的载体、`order_by` 声明的字段名即工件的时间戳字段名（重放靠它）、帧类真值仅经 `_meta` 承载 |
-| `generate.stream` 开 ⇒ `frame.classify` / `frame.annotate` 必须关（v1.13） | 帧类真值在生成期已知（蓝图即真值），帧级判决与帧级标注在本形态下没有对象——显式开启是定向配置错误 |
-| `generate.stream` 开 ⇒ 序列类表放宽为 **≥1 类**、`fallback_class` **免填**（v1.13） | 标签继承（`inherited`）没有判决路径，「≥2 类才分得动」与兜底类这两条规则保护的对象不存在 |
-| `[[generate.stream.tiers]]` 在场 ⇒ `generate.stream` 必须开；**每张生效表**各自 `tier_rank` 连续覆盖 1..N、**表内**各档 `frame_classes` 两两互异、每个非零配额的 (类, 档) 组合须满足该类 `len_range` 下界 ≥ 该档构成大小（v1.14；v1.15 逐表化） | 档位即帧类构成，构成语义是**恰等**（档内每类至少出现一次）——步数装不下构成就必然产出缺类序列，故在启动时拦下；零配额组合豁免（不为永不尝试的组合抬高下界） |
-| `[[class.<名>.generate.tiers]]`（按类档位表，v1.15）在场 ⇒ 全局 `[[generate.stream.tiers]]` 必须在场；显式空表 `tiers = []` 拒收；仅时间流形态合法 | 类声明了就**整表取代**全局表，未声明回落全局表——全局表既是回落源、又是「档位面开没开」的唯一判据，缺了它按类表就没有锚；`tier_rank` 因此收窄为**类内身份**（跨类不可比、跨类同构成合法） |
-| `[frame.class.<名>.generate.time_fields]` 在场 ⇒ 该帧类必须声明 `schema_path` / `schema_inline`，绑定值 ∈ 闭集 `{ts, gap_prev_s, gap_next_s, elapsed_s}`，声明类型字面恰等（`ts` ⇒ string、其余 ⇒ number），且剔除后至少剩一个字段（v1.14） | 绑定字段从 LLM 面剔除、由时间轴机械回填——纯文本帧没有字段可绑，类型不符则回填值不满足用户 Schema，全绑定则这次调用没有任何内容要生成 |
-| `[[generate.stream.rules]]` / `[[generate.stream.windows]]`（v1.16）在场 ⇒ 只能用于时间流生成；规则引用和窗口帧类必须来自帧类真值表 | 任一非零配额类的生效表非空时，OR-Tools CP-SAT 在内容调用前联合冻结长度、帧类词、session、crossing、微秒时间戳与噪音槽；不是先生成再靠重试碰运气 |
-| `[[class.<名>.generate.rules]]` / `windows` 采用三态整表语义（v1.16） | 缺键继承全局表；显式空数组清空本类；非空数组整表取代全局表。两张表彼此独立，也不要求全局表充当锚 |
-| `generate.sequence_validator`（v1.16）只在时间流生成合法 | hook 每条序列调用一次，接收帧类与 payload 的深拷贝；它不激活联合 planner，异常或非空违规列表只作废该序列 |
+| `[frame.class.*]` 在场 ⇒ 用于已启用的帧分类，或用于 sequence form 的 frame 注册表 | 普通流模式按帧类覆盖标注；序列生成的 frame class 必须有 object payload Schema |
+| `generate.form = "sequence"` ⇒ `generate_only` + text + global dedup + inline metadata + no rejects | 序列以 whole-set 事务交付，不使用普通 rejects 或部分交付 |
+| sequence form ⇒ `classify` 与 `frame.classify` 关闭 | sequence/frame classification 由冻结计划机械写为 inherited，不发分类调用 |
+| sequence form ⇒ semantic/evaluation profile 名不同且都有 context window | 生成与盲审职责分离，完整 truth 不允许被裁剪通过 |
+| sequence form ⇒ 不允许 `--limit`、partial delivery、pairwise/top-ratio quality | 计划的精确数量、session、crossing、noise 与 replay 不能被运行参数截断 |
+| declared ⇒ pattern、role/gap、state Schema、counterfactual set 完整可编译 | 配置期先证明所有声明变体可满足非目标约束 |
+| instruction-only ⇒ 不得声明 pattern/variant/expected violation | 它是独立语义验证模式，不是 declared 的 fallback |
 
-`classify`（v1.7，默认关）与上表各开关**正交**：分类不改变组合合法性，任意合法组合都可以叠加分类——multi 扇出后的每个信封走同一套阶段组合（第 24 章）。v1.12 的帧粒度双开关（`frame.classify` / `frame.annotate`）不是新算子，而是 classify / annotate 两个算子在流模式下的第二层粒度；帧级没有多标签也没有自洽采样——在 `[frame.classify]` 里写 `assignment` 或在 `[frame.annotate]` 里写 `self_consistency` 是定向配置错误（第 25 章 25.6）。
+`classify` 与上表各 process/flat 开关正交：multi 扇出后的每个信封走同一阶段组合（第 24 章）。
+`frame.classify` 仍只属于 process 流模式；`frame.annotate` 复用 annotate 算子的成员 pass，在 sequence form
+中由 whole-set attempt 直接调用。sequence frame-only 不会先补一次序列标注；任一应标注帧失败会重试整组，
+不会交付部分成功的成员标注。帧级没有多标签或 self-consistency，在对应节显式书写仍是配置错误。
 
 几个常用组合的「菜谱」：
 
@@ -121,7 +125,7 @@ emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed
 | ✓ | — | 可选 | ✓ | 可选 | — | **纯生成**（`generate_only`）：无中生有 → 治理 →（标注）→ 输出 |
 | ✓ | ✓ | ✓ | — | ✓ | — | **按类分治**（v1.7）：先分类，再按类 rubric 打分、按类指令标注（第 24 章） |
 | ✓ | — | ✓ | — | ✓ | 可选 | **时序流分段标注**（v1.8）：另开 `[segment]`（UI 下可再开 `[extract]`），把连续采集的帧流切成 episode、摘出动作序列，再整段打分与标注（第 25 章） |
-| ✓ | ✓ | ✓ | ✓ | ✓ | 可选 | **时间流生成**（v1.13）：`generate_only` + `[generate.stream]`，从零合成一条带时间戳的多会话流——一条序列一行，另落一份可重放的时间流工件（第 27 章） |
+| ✓ | — | 可选 | ✓ | ✓ | 可选 | **序列生成**：`generate_only` + `generate.form = "sequence"`，交付 main、stream、report 与 manifest（第 27 章） |
 
 ## 4.6 两份配置文件：为什么是两份
 
@@ -150,7 +154,8 @@ project.toml:[quality].llm: referenced profile "gpt4" does not exist in config.t
 
 最后把「无状态 + 隐私」的承诺说满：
 
-- **落盘的只有这几样**：主输出、拒绝通道、`report.json`、（显式开启时的）trace 日志，外加 v1.13 时间流生成的**时间流工件**（`{输出名}.stream.jsonl`，与主输出同级的数据输出通道，仅该形态开启时产生，第 27 章）。没有临时文件、缓存、checkpoint——「无中间态落盘」的原则不变，工件是显式的产物而非中间态。
+- **落盘的只有显式输出通道**：普通运行是主输出、rejects、report 与可选 trace；序列生成另有 stream、
+  manifest 与 failed report。没有缓存或 checkpoint；同目录 `.part` 只是原子提交过程中的临时路径。
 - **报告永远不含数据内容**——只有计数、分布、耗时、token 统计。
 - **stderr 运行日志永远不含数据内容与提示词**。会含数据的只有两个你**显式选择**的地方：`output.rejects = "full"` 和 `trace.content` 的高档位（第 16 章有明确的风险提示）。
 - **API 密钥在任何通道都不落盘**。
