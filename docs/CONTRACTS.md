@@ -9,8 +9,8 @@ signatures, types, defaults, file formats, and prompt text*. Where the spec left
 format implicit, the decision is frozen here and tagged **[FROZEN HERE]** (all such decisions are
 also listed in §12). Any deviation requires editing this file first.
 
-The v1.18 source is commit `baaa4bf`; the frozen specification SHA-256 is
-`f307339edee752df75d8ec6f0b457bcd0cae8773c81c6ebbd05323fe8d5b9c0f`.
+The v1.18 source is commit `ce6b1f2`; the frozen specification SHA-256 is
+`f9cc60754cdcbdbe92eac37835e7f7db7a7cdd7ea7310a9a26bfe490e1685f97`.
 
 Ground rules for every implementer:
 
