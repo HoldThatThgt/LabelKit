@@ -268,6 +268,7 @@ async def test_each_sequence_failure_retries_whole_set_once(monkeypatch, failure
     assert controller.state.sequence_attempts == 2
     assert controller.state.attempts_used == 2
     assert controller.state.rejected[bucket] == 1
+    assert controller.state.retained_bytes == 0
     assert metrics.counters == {}
     assert dedup.commits == []
 
@@ -592,6 +593,7 @@ async def test_failed_attempt_keeps_runtime_facts_but_rolls_back_all_dataset_sta
     accepted = await controller._accept_sequence_slot(_slot(), 1)
     assert controller.state.sequences == []
     assert controller.state.sources == {}
+    assert controller.state.retained_bytes == 0
     assert dedup.commits == []
     assert metrics.counters == {"budget.truncations.annotate": 2}
     assert controller.generation.schema_engine.stats["l3_1"] == 2
@@ -609,6 +611,7 @@ async def test_failed_attempt_keeps_runtime_facts_but_rolls_back_all_dataset_sta
     }
     assert [row.main_row["attempt"] for row in controller.state.sequences] == [1]
     assert controller.state.sources == {("set/000000", None): accepted.rows[0]}
+    assert controller.state.retained_bytes == 1
 
 
 def test_retained_cap_accepts_exact_limit_and_rejects_one_utf8_byte(monkeypatch):
