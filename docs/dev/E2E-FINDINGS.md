@@ -16,7 +16,7 @@
 ## v1.20 时间完整性证据看板
 
 本节只记录 2026-08-27 当前实现 turn 已完成的离线门、Dataset-Person keyless 生产入口与本地 4B/GLM-5.2
-真实端点门。完整 offline suite 已计入；本轮 Uncle Bob mutation review 尚未计入通过。下面的历史 v1.18/v1.19
+真实端点门。完整 offline suite 与本轮 Uncle Bob mutation review 均已计入。下面的历史 v1.18/v1.19
 真实端点结果不能替代 v1.20 raw 时间证明。
 
 | 证据面 | 当前状态 | 已知事实 / 输入边界 |
@@ -35,8 +35,15 @@
 | production 时间叶门 | 已验证 | 单事件 navigation 检查 3 个业务时间 binding；双事件 navigation 检查 5 个 binding 与严格 containment，均由 GLM-5.2 接受 |
 | production navigation 提交 | 已验证 | 1/1 set、1 primary；default 3 calls、judge 1 call；3 个 payload binding 与 annotation binding、manifest 哈希及 delivery digest 独立通过 |
 | production 四类烟测 | 已验证失败边界 | navigation 等候选准备完成；`check_in` 被 GLM-5.2 连续拒绝 8 次后 slot exhaustion；无 success artifact，不能记为通过 |
-| Uncle Bob mutation review | 待运行 | `[PENDING-EVIDENCE:v1.20-uncle-bob]`；caller checkout 非 clean，按审查流程 fail-closed |
+| Uncle Bob mutation review | 已验证 | detached baseline `e90e7b1`；10 个独立语义变异全部 killed，survived、invalid、inconclusive 均为 0 |
 | 十二周真实 raw 生成 | 待运行 | `[PENDING-EVIDENCE:v1.20-12w-real-generation]` |
+
+本轮 Uncle Bob 在 detached worktree 中只临时修改生产源码，逐项运行预先声明的窄测试并立即反向恢复。十个变异覆盖
+Schema projection、generic finalizer 完整终验、strict containment、resource overlap、replay rebinding、annotation
+repair、M2 descriptor、exact dedup、precommit terminal 与 frozen nested annotation。还原后的同命令基线为 866 passed、
+1 deselected；唯一 deselected 用例是绑定绝对 checkout 路径的固定 program/plan digest 向量，它已在 caller checkout 的
+2928-test 完整离线套件中通过。审查结束时 detached HEAD 仍为 `e90e7b1`，`git diff --exit-code` 与包含 untracked 的完整
+status 均为空，worktree 已通过 `git worktree remove` 清理。
 
 production constructor 现在由 Schema annotation、frame `duration_s/resources/time_bindings`、pattern containment 与
 sequence annotation binding 描述唯一时间真值。Dataset-Person exporter 的产品边界是格式转换与只读校验；不得 align、

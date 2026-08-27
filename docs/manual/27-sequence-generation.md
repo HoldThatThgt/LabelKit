@@ -318,7 +318,8 @@ uv run python check_output.py --frame-only
 - plan audit 的 duplicate starts、`foreground_app` overlaps、containment violations 与 annotation resource missing
   都为零；
 - config、Schema/M2/M3、planner/program/contracts 与 Dataset-Person 离线门已分别取得
-  552、346、122、45+663 的通过证据；完整 offline suite 与本轮 Uncle Bob review 尚未在这里记为通过；
+  552、346、122、45+663 的通过证据；完整 offline suite 为 2928 passed、48 deselected；本轮 Uncle Bob review
+  独立杀死 10 个时间完整性语义变异，survived、invalid、inconclusive 均为零；
 - 十二周付费真实 raw 生成仍为 `[PENDING-EVIDENCE:v1.20-12w-real-generation]`。
 
 历史 v1.18/v1.19 真实端点证据包括：DeepSeek 主例 2 sets、8 sequences、27 stream rows 与 replay checker PASS；
