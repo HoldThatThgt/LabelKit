@@ -2,9 +2,9 @@
 
 **Status: FROZEN.** This document is the single interface contract for parallel implementation of
 M1–M17 + CLI by independent engineers. It is derived from the design spec v1.4 base through the
-v1.20 sequence temporal-integrity revision (`spec/*.md`,
+v1.21 sequence-interleaving revision (`spec/*.md`,
 `docs/dev/SPEC-sequence-generation-redesign.md`, `docs/dev/SPEC-execution-runtime.md` and
-`docs/dev/SPEC-sequence-temporal-integrity.md`). Those
+`docs/dev/SPEC-sequence-temporal-integrity.md`, `docs/dev/SPEC-sequence-interleaving.md`). Those
 documents remain the authority for *algorithms and behavior*; this document is the authority for
 *names, signatures, types, defaults, file formats, and prompt text*. Where a spec left a signature
 or format implicit, the decision is frozen here and tagged **[FROZEN HERE]** (all such decisions
@@ -13,7 +13,10 @@ are also listed in §12). Any deviation requires editing this file first.
 v1.20 is a clean-breaking generation boundary: earlier generation streams are rejected, and
 there is no alias, migration or fallback. The temporal-integrity spec governs business-time
 projection, interval planning, replay rebinding and precommit validation; implementation and
-this document must change together.
+this document must change together. v1.21 is a second clean-breaking planning/configuration
+boundary: users declare interleaving candidate sets, named patterns and integer weights, while
+the planner derives primary-session cardinality. Deleted session-count keys, obsolete terminology,
+compatibility parsing, migration and fallback do not survive.
 
 Ground rules for every implementer:
 
@@ -108,7 +111,8 @@ labelkit/
 │   │   ├── _classviews.py              # [class.*] / [frame.class.*] whitelist merge into class views (package-private)
 │   │   ├── _constraints.py             # cross-section constraint driver and parse products (package-private)
 │   │   ├── _generation_budget.py       # v1.18 sequence content limits and six-family budget proof
-│   │   └── generation.py                # v1.18 sequence-generation parsing and typed config carriers
+│   │   ├── _sequence_layout.py         # v1.21 timeline/interleaving parse and derived-count closure
+│   │   └── generation.py                # current sequence-generation public carriers and parser entry
 │   ├── inference/
 │   │   ├── budget.py                   # v1.11 context-budget primitives + ImageCostCalibrator (§7.17)
 │   │   ├── generation_prompts.py       # v1.18 六个 sequence family 的共享精确构造器
@@ -134,7 +138,7 @@ labelkit/
 │   │   ├── __init__.py
 │   │   ├── flat.py                     # v1.12 flat generation implementation
 │   │   ├── program.py                  # GenerationProgram compiler
-│   │   ├── planner.py                  # deterministic CP-SAT ScenarioPlan compiler
+│   │   ├── planner.py                  # deterministic weighted-interleaving CP-SAT ScenarioPlan compiler
 │   │   ├── scenario.py                 # ScenarioSeed and per-event scenario loop
 │   │   ├── state.py                    # JSON Patch execution and state evaluation
 │   │   ├── render.py                   # frame/noise rendering
@@ -197,7 +201,7 @@ in `tests/common/inference/test_llm_client.py`; stream-ingest coverage belongs i
 (renderer snapshots, keyboard, degradation) and
 `tests/common/observability/test_console_format.py` (byte-frozen golden snapshots of the
 plain line formats — the golden-snapshot layer of the three-layer regression anchor, U24);
-v1.18 sequence-generation coverage mirrors its production owners: configuration in
+v1.21 sequence-generation coverage mirrors its production owners: configuration in
 `tests/common/config/test_generation.py`; frozen carriers in
 `tests/common/contracts/test_generation_contracts.py`; shared prompt contracts in
 `tests/common/inference/test_generation_prompts.py`; pure compiler/planner/scenario/state/render/evaluate/
@@ -269,7 +273,7 @@ flowchart LR
         direction LR
         C0["generate_all()"] --> C1["dedup"] --> C2["classify"] --> C3["quality"] --> C4["annotate"] --> C5["verify"] --> C6["emit"]
     end
-    subgraph SEQUENCE["generate_only sequence mode (v1.18) — orchestration owns exact delivery; no ordinary Stage re-flow"]
+    subgraph SEQUENCE["generate_only sequence mode (v1.21) — orchestration owns exact delivery; no ordinary Stage re-flow"]
         direction LR
         D0["GenerationProgram"] --> D1["ScenarioPlan"] --> D2["scenario/state/render/evaluate"] --> D3["attempt-local dedup/quality/annotate/verify"] --> D4["CrossView"] --> D5["manifest-last commit"]
     end
@@ -712,7 +716,7 @@ class ContextOverflowError(LabelKitError):
     status='failed', kind='context_overflow' (§7.6) → rejects; run continues.
     phase='precheck' — the M9 pre-dispatch invariant check fired (V16, zero provider
     interaction), or a packing layer found even the minimal semantic unit unfittable
-    (V10 — recorded directly by the operator, no exception crossing);
+    (V10 — recorded directly by the operator, with no exception propagation across that boundary);
     phase='reactive' — a real provider interaction identified overflow: budget-gated
     400 body-sniff hit, or the 200-shaped `model_context_window_exceeded` termination
     (V20/V24). M9 itself NEVER feeds `record_provider_result(fatal=True)` for this
@@ -1263,7 +1267,26 @@ class CounterfactualSetSpec:
     name: str
     pattern: str
     count: int
+    interleaving_candidate_set: str | None
     variants: tuple[VariantSpec, ...]
+
+
+@dataclass(frozen=True)
+class InterleavingPatternSpec:
+    """一个命名 trigger/partner 候选关系与整数触发权重。"""
+
+    name: str
+    trigger_candidate_set: str
+    partner_candidate_set: str
+    trigger_weight: int
+
+
+@dataclass(frozen=True)
+class InterleavingSpec:
+    """一次运行的 standalone 权重与声明序交织 pattern。"""
+
+    no_interleaving_weight: int
+    patterns: tuple[InterleavingPatternSpec, ...]
 
 
 @dataclass(frozen=True)
@@ -1280,13 +1303,11 @@ class InstructionOnlySpec:
 
 @dataclass(frozen=True)
 class TimelineSpec:
-    """冻结整数时间线与精确交付基数。"""
+    """冻结整数时间线、session 容量与附加事件基数。"""
 
     timestamp_start_us: int
     utc_offset_minutes: int
     event_gap_us: tuple[int, int]
-    primary_sessions: int
-    crossed_primary_sessions: int
     session_max_events: int
     session_max_span_us: int
     session_gap_us: int
@@ -1335,7 +1356,7 @@ class GenerationLimits:
 
 @dataclass(frozen=True)
 class SequenceGenerationConfig:
-    """冻结的 v1.18 sequence-only 解析产物；flat generation 时不存在。"""
+    """冻结的 v1.21 sequence-only 解析产物；flat generation 时不存在。"""
 
     mode: Literal["declared", "instruction_only"]
     semantic_profile: str
@@ -1345,6 +1366,7 @@ class SequenceGenerationConfig:
     patterns: tuple[SequencePattern, ...]
     counterfactual_sets: tuple[CounterfactualSetSpec, ...]
     instruction_only: tuple[InstructionOnlySpec, ...]
+    interleaving: InterleavingSpec | None
     timeline: TimelineSpec
     calendar_windows: Mapping[str, CalendarWindowSpec]
     noise: NoiseSpec | None
@@ -1865,7 +1887,7 @@ merge every
 `frame_class_views` mapping (the frame-class-override rule, rule 44), and freeze
 `FrameClassifyConfig.vision_resolved` at
 load() end (the frame-granularity stream-mode rule, rule 43).
-v1.18: `parse_generation_config` aggregates the complete sequence namespace, builds the frozen
+v1.21: `parse_generation_config` aggregates the complete sequence namespace, builds the frozen
 sequence/frame registries and ClassViews, resolves Schemas/catalog/hooks relative to project root,
 and stores only `ResolvedConfig.sequence_generation`. The program compiler and exact planner run
 after ordinary config assembly but before credential values are materialized. Validate, dry-run
@@ -2220,7 +2242,7 @@ checks apply only when the named switch is on unless stated):
     `[frame]` out of the parked list when both frame switches are off because its frame registry is
     live; `[segment]`, `[stitch]` and `[extract]` continue to warn.
 
-Sequence generation (v1.18; every rule in this group is a clean breaking boundary):
+Sequence generation (current v1.21; every rule in this group is a clean breaking boundary):
 
 50. **Per-class annotation Schema remains generic** — `[class.<name>.annotate]` accepts at most
     one of `schema_path` and `schema_inline`; neither means the global output Schema.
@@ -2240,7 +2262,8 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
     key under flat or any explicit `llms`, `styles`, `seed_examples`,
     `standalone_count`, `num_per_record`, `seeds_per_call` or `num_per_call` under
     sequence is `generation_config_invalid`. Deleted keys such as `generate.stream`,
-    `quota`, `tiers`, `rules`, `windows` and `time_fields` are directed CONFIG_ERRORs,
+    `quota`, `tiers`, `rules`, `windows`, `time_fields`, timeline `primary_sessions` and
+    timeline `crossed_primary_sessions` are directed CONFIG_ERRORs,
     never unknown-key warnings. Deleted internal sequence Schema/helper names are not exported.
 
 52. **Sequence runtime conjunction** — `generate.form="sequence"` requires
@@ -2331,7 +2354,10 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
     whose frame class is unique in its pattern; `reordered` targets two adjacent roles
     with different frame classes; `interval_exceeded` targets a named gap and has closed
     `0 < min_excess_us <= max_excess_us`. The compiler freezes the exact target,
-    expected violation and causal divergence role.
+    expected violation and causal divergence role. Each row may declare one exact
+    `[a-z0-9_]+` `interleaving_candidate_set`; when present, that row has exactly one
+    positive variant and only the positive branches expanded from that declaration enter
+    the candidate set. Candidate labels do not support glob, regex, prefix, arrays or a DSL.
 
 61. **Instruction-only is exclusive** — `mode="instruction_only"` requires one or more
     uniquely named `[[generate.instruction_only]]` rows and forbids patterns,
@@ -2339,15 +2365,29 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
     row references a sequence class, has exact `count >= 1`, non-empty instruction,
     `len_range` with `1 <= low <= high <= 8`, and an optional object-root state Schema
     whose absent value compiles to the fixed object Schema. It never uses a catalog.
-    Declared mode forbids instruction-only rows.
+    Declared mode forbids instruction-only rows. Instruction-only forbids
+    `[generate.interleaving]` and every `interleaving_candidate_set`.
 
-62. **Timeline exactness** — `timestamp_start` includes a fixed UTC offset and is converted
+62. **Timeline and interleaving exactness** — `timestamp_start` includes a fixed UTC offset and is converted
     to integer microseconds; `event_gap_s=[min,max]` is closed and non-negative.
-    All cardinalities are integers. If N is the exact primary-sequence total and D is
-    `crossed_primary_sessions`, then `primary_sessions == N-D`. Each primary session owns
-    one or two different counterfactual sets, variants from the same set never share a
-    session, session capacity/span/gap and millisecond-aligned globally unique event starts must be feasible.
-    Instruction-only requires D=0 and `primary_sessions=N`.
+    `session_max_events`, `session_max_span_s` and `session_gap_s` remain required positive
+    timeline limits. User-declared `primary_sessions` and `crossed_primary_sessions` are deleted.
+    If N is the exact visible primary-branch total and D is the frozen InterleavingLayout count,
+    the planner derives `primary_sessions == N-D` and `interleaved_primary_sessions == D`.
+    Session capacity/span/gap and millisecond-aligned globally unique event starts must be feasible.
+
+    Interleaving is disabled only when `[generate.interleaving]` and every candidate label are
+    absent. Either side without the other is `generation_config_invalid`. Enabled interleaving
+    requires one or more declaration-ordered `[generate.interleaving.pattern.<name>]` tables;
+    names and candidate references use `[a-z0-9_]+`. Each pattern has distinct non-empty
+    `trigger_candidate_set` and `partner_candidate_set` references and a positive TOML int64
+    `trigger_weight`; the parent table has required non-negative TOML int64
+    `no_interleaving_weight`. Booleans, floats, out-of-range integers and opportunity weight
+    totals above `2^63-1` are rejected. No candidate set may serve both trigger and partner roles;
+    every declared candidate is referenced and every reference has members. Trigger and partner
+    sets may each be shared by multiple patterns; all such patterns consume one global
+    non-replacement pool per partner candidate set. Flat and instruction-only report fixed zero
+    interleaving statistics and use one session per primary sequence.
 
 63. **Calendar windows** — named windows have one fixed `utc_offset`, non-empty unique day
     names and non-empty, non-overlapping same-day half-open wall-clock intervals converted
@@ -5191,11 +5231,12 @@ Binding notes (from dev spec §3.2, normative):
   (schema_engine may not import operators); the M7 reclaim mark-only swallow point and
   the operators' overflow reject sites are the other feed points (§9.3 breaker matrix).
 
-### 7.18 v1.18 sequence kernel and delivery seam
+### 7.18 v1.21 sequence kernel and delivery seam
 
 Physical ownership is fixed:
 
-- `common/config/generation.py` parses and validates the v1.18 sequence namespace.
+- `common/config/generation.py` owns the public sequence config carriers and parser entry.
+- `common/config/_sequence_layout.py` owns v1.21 timeline/interleaving parsing and derived-count closure.
 - `common/config/_generation_budget.py` owns root examples, fixed content limits and the shared
   six-family context proof.
 - `common/contracts/generation.py` owns the new v1.18 generation carriers in this section.
@@ -5251,6 +5292,7 @@ class GenerationProgram:
     patterns: Mapping[str, SequencePattern]
     counterfactual_sets: tuple[CounterfactualSetSpec, ...]
     instruction_only: tuple[InstructionOnlySpec, ...]
+    interleaving: InterleavingSpec | None
     timeline: TimelineSpec
     calendar_windows: Mapping[str, CalendarWindowSpec]
     noise: NoiseSpec | None
@@ -5304,11 +5346,23 @@ class ReplayLayout:
 
 
 @dataclass(frozen=True)
+class InterleavingLayout:
+    pattern_name: str
+    trigger_slot_key: str
+    trigger_variant_name: str
+    partner_slot_key: str
+    partner_variant_name: str
+
+
+@dataclass(frozen=True)
 class ScenarioPlan:
     blocks: tuple[ScenarioBlock, ...]
     delivery_slots: tuple[DeliverySlot, ...]
     noise_slots: tuple[NoiseSlot, ...]
     replay_layouts: tuple[ReplayLayout, ...]
+    interleaving_layouts: tuple[InterleavingLayout, ...]
+    interleaving_opportunities: int
+    interleaving_pattern_opportunities: Mapping[str, int]
     primary_sessions: int
     digest: str
 
@@ -6478,8 +6532,9 @@ never called by validate or dry-run.
 #### 7.18.3 Program, plan and identity invariants
 
 The compiler runs before credential materialization and LLM calls. It resolves every class,
-frame, pattern, role, gap, counterfactual set, instruction-only row, hook and catalog; validates
-the exact delivery cardinality, catalog cardinality, timeline identities and complete prompt
+frame, pattern, role, gap, counterfactual set, interleaving candidate/pattern, instruction-only
+row, hook and catalog; validates the exact delivery cardinality, catalog cardinality,
+interleaving/configuration closure, timeline limits and complete prompt
 budgets; freezes `ResolvedConfig.run.seed` as `GenerationProgram.planner_seed`; and hashes one
 canonical GenerationProgram. The digest covers every semantic field including `planner_seed`,
 excludes itself and hook callables, and includes only each `ResolvedHook.reference`. The compiler
@@ -6496,8 +6551,9 @@ program; same-named source fields in ResolvedConfig are not runtime truth.
 DeliverySlots, `catalog_row_index` and block membership in declaration order; catalog allocation
 is a deterministic integer mapping and does not enter CP-SAT. The solver freezes declared
 baseline/variant presence, total order, closed integer gaps, max-span, calendar feasibility,
-instruction-only length and position times, primary sessions, crossing, globally unique artifact
-starts, resource non-overlap, strict containment, exact NoiseSlots and exact positive ReplayLayouts.
+instruction-only length and position times, interleaving layouts, derived primary sessions,
+globally unique artifact starts, resource non-overlap, strict containment, exact NoiseSlots and
+exact positive ReplayLayouts.
 `PlannedEvent` freezes position, role, logical/artifact time, duration, resources and session;
 declared frame/actor come from RoleSpec,
 while instruction-only frame/actor are selected later by EventPlan. Session blocks contain at
@@ -6510,6 +6566,55 @@ relaxation, greedy fallback or re-solve after content failure. Program equality 
 byte-identical program digest, DeliverySlots, ScenarioBlocks and plan digest across validate,
 dry-run and run.
 
+Interleaving first collects only the unique positive branch of each labeled counterfactual set,
+builds one declaration-ordered shared pool per partner candidate set and scans trigger branches in
+DeliverySlot order. A scan is an opportunity only while at least one applicable pattern has a
+non-empty pool. If its applicable declaration-ordered pattern weights are `w1..wk` and
+`no_interleaving_weight=w0`, then `P(none)=w0/(w0+sum(wi))` and
+`P(pattern_i)=wi/(w0+sum(wi))`; none occurs in the denominator exactly once and partner count,
+pair count and owner-word count do not duplicate weight. Exhausted patterns leave subsequent
+denominators. Each pattern's eligible-opportunity count advances whenever it is applicable with
+a non-empty pool, while the global opportunity count advances once per trigger scan.
+
+Pattern and partner draws use the complete 256-bit `generation_random` integer and rejection
+sampling. For range `T`, `M=2^256`, `limit=M-(M mod T)`, and the first independently derived
+`x < limit` yields `x mod T`; rejected draws advance only that draw's counter. Pattern tickets put
+none in `[0,w0)` and patterns in declaration-order contiguous ranges. Partner selection uses an
+independent domain over the current pool length and swap-deletes the selected index, giving an
+unbiased non-replacement index draw. Float thresholds, simple modulo and solver seed are not
+product randomness. Counters start at zero. Pattern draws use domain
+`interleaving_pattern_choice` and value `[program_digest, planner_seed, trigger_slot_key,
+trigger_variant_name, counter]`. Partner draws use domain `interleaving_partner_choice` and value
+`[program_digest, planner_seed, trigger_slot_key, trigger_variant_name, pattern_name,
+partner_candidate_set, counter]`. Matching builds no trigger-by-partner matrix and runs no CP-SAT
+for unselected partners.
+
+This probability contract follows QuickCheck's cumulative integer-weight `frequency` semantics
+(https://github.com/nick8325/quickcheck/blob/master/src/Test/QuickCheck/Gen.hs). Branch-order
+preservation follows CSP interleave (https://cocotec.io/fdr/manual/cspm/processes.html);
+precedence/resource layout follows OR-Tools Job Shop
+(https://developers.google.com/optimization/scheduling/job_shop). OR-Tools SatParameters
+(https://github.com/google/or-tools/blob/stable/ortools/sat/sat_parameters.proto) is cited to make
+explicit that solver seed is not a sampling distribution, while Temporal replay-safe randomness
+(https://github.com/temporalio/sdk-java/blob/main/temporal-sdk/src/main/java/io/temporal/workflow/Workflow.java)
+supports freezing draws before retry.
+
+Once selected, pattern and partner are immutable. The pair may use a partner before or after the
+trigger in declaration order; it creates one session at the earlier source position and skips the
+later source position during artifact placement without changing DeliverySlot commit order.
+CP-SAT may only translate each complete branch. It preserves internal logical deltas, gaps,
+duration, resources, calendar windows and order; enforces unique millisecond starts, shared-resource
+`AddNoOverlap`, session capacity/full-envelope span/gap and at least three maximal owner runs.
+Each A-B-A/B-A-B witness receives an integer from
+`generation_random("interleaving_witness_rank", [program_digest, planner_seed, pattern_name,
+trigger_slot_key, trigger_variant_name, partner_slot_key, partner_variant_name, witness_owner,
+witness_gap_index])`. `witness_owner` is `trigger|partner`, and the gap index is zero-based within
+that owner. Sorting by `(integer, owner_order, witness_gap_index)`, with trigger order zero and
+partner order one, assigns a unique zero-based rank even under a digest collision;
+canonical objectives minimize witness rank, earliest session event, trigger start, then partner
+start. An infeasible selected pair is `generation_plan_infeasible`; the planner never selects
+another partner/pattern, falls back to none/standalone or redraws during provider/slot retry.
+
 Every reordered mechanical role/time swap is constrained inside the baseline CP-SAT model so all
 non-target order and gap constraints still hold; an impossible isolated reordering is
 `generation_plan_infeasible` before content calls. When positive is absent, the hidden baseline
@@ -6518,9 +6623,9 @@ never borrows the first visible counterfactual branch start.
 
 Canonical objectives are frozen: instruction length is minimized and therefore equals
 `len_range[0]`, with positions spaced by `event_gap_s[0]`; baseline role-time sum and the
-interval-exceeded suffix shift are minimized; crossing minimizes the one-based declaration-order
-boundary weight sum; a crossed pair minimizes its two absolute starts; non-crossed placement uses
-the earliest calendar intersection. A remaining tie is resolved only by the locked OR-Tools
+interval-exceeded suffix shift are minimized; an interleaving pair uses the witness/start
+lexicographic objectives above; standalone placement uses the earliest calendar intersection.
+A remaining tie is resolved only by the locked OR-Tools
 version, one worker and the program-bound solver seed. `validate_plan_identity` first checks the
 program digest, then checks that the supplied plan digest equals the digest of every semantic
 field in that supplied plan, rebuilds the canonical plan from the program, and requires full
@@ -6533,11 +6638,21 @@ shift. Calendar expansion, fixed-offset ISO8601 projection and CrossView parsing
 21-day calendar horizon outside Python datetime range fails as `generation_plan_infeasible`
 before any content call.
 
+Program digest recursively covers candidate membership, named patterns and weights. Plan digest
+explicitly covers `interleaving_layouts`, global/per-pattern opportunity statistics, exact pair
+identity and every timestamp/session in blocks. `InterleavingLayout` does not duplicate session,
+timestamp or owner word; those remain uniquely derivable from plan blocks. DeliverySlot does not
+duplicate candidate membership; `source_name` resolves it from the frozen program.
+
 Except for `delivery_digest`, every ID is exactly
 `sha256(canonical_json(["labelkit:v1.20", domain, components]).encode("utf-8"))`
 lowercase hex truncated to 32 characters. Canonical JSON uses `sort_keys=True`, compact
 separators and `ensure_ascii=False`; components are a JSON array, never a caller-concatenated
 string.
+
+`labelkit:v1.20` is the artifact-encoding domain for generation IDs, the stream exact carrier and
+the delivery digest, not the product revision. v1.21 changes program/plan semantics but not these
+ID formulas or the stream envelope, so the encoding domain remains unchanged.
 
 | ID | domain | ordered components |
 |---|---|---|
@@ -7029,9 +7144,14 @@ DeliveryState. Provider response bytes and completion-time trace order remain no
 
 Scheduler tests use controlled coroutines for six hundred-task admission, reverse completion,
 resource isolation and cancellation; they do not claim endpoint capacity. The only local-endpoint
-exception is real Qwen3.5-4B-Q6_K through llama-server for the four-slot v1.19 E2E and same-shape
-before/after performance evidence. It supplements and never replaces the real DeepSeek sequence
-and z.ai structured-output release gates; mock transports and recorded responses remain forbidden.
+exception is real Qwen3.5-4B-Q6_K through llama-server. The current v1.21 gate has exactly two
+trigger slots and two partner slots, `no_interleaving_weight=0`, one weight-one named pattern,
+two opportunities, two interleaving layouts and two derived primary sessions; main remains four
+rows and stream remains sixteen rows. The former non-interleaving four-slot v1.19 run is historical
+runtime/performance evidence, not a valid v1.21 feature gate. Any new before/after performance claim
+must use the same current forced-pair shape on both revisions. The local gate supplements and never
+replaces the real DeepSeek sequence and z.ai structured-output release gates; mock transports and
+recorded responses remain forbidden.
 
 ## 8. Observability contract (M12 + ch.7)
 
@@ -7608,7 +7728,7 @@ records on re-flow), `classify.*` by M13 (v1.7), `quality.tie_*` by M4, `segment
 by M7 (v1.8), `stitch.*` by M16 (v1.9), `frame_classify.*` by M13 and `frame_annotate.*` by
 M5/M11 per the v1.12 split above.
 
-v1.19 sequence mode does not feed this generic process/flat conservation ledger. Its accepted
+v1.21 sequence mode does not feed this generic process/flat conservation ledger. Its accepted
 attempt counters are merged exactly once by the ordered commit coordinator; LLM usage and latency from
 all attempts remain in the generic run usage ledger. The frozen sequence report follows.
 
@@ -7621,13 +7741,16 @@ all attempts remain in the generic run usage ledger. The frozen sequence report 
     "delivery_digest": "<64 lowercase hex>",
     "artifacts_committed": true,
     "program_digest": "<64 lowercase hex>",
+    "plan_digest": "<64 lowercase hex>",
     "planned_sets": 2,
     "delivered_sets": 2,
     "planned_sequences": 8,
     "delivered_sequences": 8,
     "primary_events": 22,
+    "interleaving_opportunities": 0,
     "primary_sessions": 8,
-    "crossed_primary_sessions": 0,
+    "interleaved_primary_sessions": 0,
+    "by_interleaving_pattern": {},
     "noise_events": 2,
     "replay_sequences": 1,
     "replay_events": 3,
@@ -7689,7 +7812,16 @@ enters exactly its final boundary bucket. The closed rejected-attempt key set ca
 runtime. Provider fatal, planner and commit I/O are run terminals represented by
 `terminal_error_kind`, never a rejection bucket.
 
-The sequence estimate carries the same ordered seven-key `sequence_calls`, the existing top-level
+If N is the visible primary-branch count and D is the frozen `interleaving_layouts` count, the
+report has `interleaved_primary_sessions=D` and `primary_sessions=N-D`.
+`by_interleaving_pattern` is a declaration-ordered map containing every configured pattern,
+including zero selections; each value is exactly
+`{"eligible_opportunities": int, "selected_sessions": int}`. Disabled and instruction-only
+runs have zero `interleaving_opportunities`, zero `interleaved_primary_sessions` and an empty map.
+The report never exposes slot/pair identity, owner word, payload, prompt, state or API-key value.
+
+The sequence estimate carries `program_digest`, `plan_digest`, the same interleaving fields and
+the same ordered seven-key `sequence_calls`, the existing top-level
 quality/annotate/frame-annotate/verify keys, exact planned sets/sequences/events/noise/replay/rows,
 `successful_attempt_lower_bound`, and the `max_slot_attempts` upper bound. Existing top-level
 estimate key order and total formula remain unchanged; the seven nested generation keys sum to
@@ -7702,6 +7834,10 @@ The failed report always contains `run_attempt_id`, nullable `run_id`,
 contains the same top-level ordered nine-key `runtime` object as a success report and contains no
 delivered prefix, by-pattern delivery, state, payload, patch, prompt or exception text. Before a
 plan exists, `run_id` is null.
+An interleaving pair that was selected but has no legal absolute layout is the planner terminal
+`generation_plan_infeasible`, consumes no slot attempt, writes no success artifact and never
+redraws another partner/pattern or standalone result. Because no ScenarioPlan exists, its failed
+report keeps `run_id=null` and does not fabricate an empty plan digest.
 
 ### 9.4 Atomic delivery
 
@@ -7869,7 +8005,7 @@ A noise line has the same two top-level keys. Its event object has event_id/even
 has no scenario, world branch, owner, pattern, variant or state patch.
 
 Primary stream timestamps exactly equal ScenarioPlan projection timestamps and are globally
-unique across primary, noise and replay rows. Outer timestamp/gap/elapsed truth stays under
+unique across primary, noise and replay rows. Envelope timestamp/gap/elapsed truth stays under
 `_meta.event`; complete payload Schema business-time leaves are mechanically injected from the
 same start/end/duration. For every resource, positive intervals are globally non-overlapping.
 
@@ -9802,6 +9938,19 @@ Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code 
     CrossView checks, incremental CrossViewFrontier deltas and a no-await declaration-order commit.
     Package ownership is `labelkit/runtime`, `labelkit/common/inference`,
     `labelkit/orchestration/application.py`, `process_workflow.py` and `sequence_workflow.py`.
-    The real local Qwen3.5-4B-Q6_K gate supplements runtime E2E and performance evidence; it never
-    replaces the real DeepSeek or z.ai release gates.
+    The real local Qwen3.5-4B-Q6_K current gate uses the v1.21 forced-pair four-slot shape: two
+    trigger slots, two partner slots, standalone weight zero, one weight-one pattern, D=2,
+    `interleaving_opportunities=2`, `primary_sessions=2`, main=4 and stream=16. It supplements
+    runtime E2E and never replaces the real DeepSeek or z.ai release gates; the old v1.19
+    non-interleaving four-slot run is historical evidence only.
+36. **v1.21 序列交织冻结点** — declared counterfactual sets optionally carry one short
+    `interleaving_candidate_set`; `[generate.interleaving]` declares one non-negative standalone
+    weight and one or more named trigger/partner patterns with positive integer weights. Planner
+    performs exact rejection-sampled pattern and partner draws before content calls, consumes
+    partner pools globally without replacement, freezes only positive-branch InterleavingLayouts
+    and derives `primary_sessions=N-D`. A selected infeasible pair is terminal and never redraws,
+    falls back or joins the two DeliverySlot retry transactions. Program/plan digests and the
+    success report cover the frozen configuration, opportunities, selections and layout identity.
+    The product revision is v1.21, while `labelkit:v1.20` deliberately remains the independent
+    artifact-encoding domain for IDs, stream exact material and delivery digest.
 — End of contract. —

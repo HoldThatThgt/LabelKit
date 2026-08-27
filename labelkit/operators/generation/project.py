@@ -1,4 +1,4 @@
-"""v1.20 generation ID、双视图投影与提交前机械时间对账。"""
+"""v1.21 generation ID、双视图投影与提交前机械时间对账。"""
 from __future__ import annotations
 
 import dataclasses
@@ -43,6 +43,7 @@ from labelkit.common.errors import GenerationProjectionMismatch, InternalError
 
 
 _log = logging.getLogger("labelkit.generation.project")
+# v1.20 是保留的 artifact encoding、ID 与 delivery digest 域，不是产品 revision。
 _GENERATION_HEADER = "labelkit:v1.20"
 
 
@@ -58,9 +59,9 @@ def canonical_json(value: object) -> str:
 
 
 def generation_digest(domain: str, value: object) -> str:
-    """以 v1.20 域分离 canonical JSON 计算完整 SHA-256。
+    """以保留的 v1.20 artifact encoding 域分离 canonical JSON 计算 SHA-256。
 
-    @param domain 冻结 generation 域。
+    @param domain 冻结 ID、delivery 或内部 generation 子域。
     @param value 当前域的规范材料。
     @return 64 位小写十六进制摘要。
     """
@@ -125,6 +126,11 @@ def scenario_plan_digest(plan: ScenarioPlan) -> str:
         "delivery_slots": [dataclasses.asdict(item) for item in plan.delivery_slots],
         "noise_slots": [dataclasses.asdict(item) for item in plan.noise_slots],
         "replay_layouts": [dataclasses.asdict(item) for item in plan.replay_layouts],
+        "interleaving_layouts": [
+            dataclasses.asdict(item) for item in plan.interleaving_layouts
+        ],
+        "interleaving_opportunities": plan.interleaving_opportunities,
+        "interleaving_pattern_opportunities": plan.interleaving_pattern_opportunities,
         "primary_sessions": plan.primary_sessions,
     }
     return generation_digest("scenario_plan", material)

@@ -6,6 +6,10 @@
 > 破坏边界：v1.20 不读取 v1.18/v1.19 generation stream，不提供别名、migration 或 fallback
 > 权威关系：本文件覆盖 v1.18/v1.19 中与业务时间、payload 同源、replay 复制及 event 字段集冲突的条款
 
+> v1.21 导航：`SPEC-sequence-interleaving.md` 只覆盖用户 session 计数的删除、交织候选/权重/布局及派生统计。
+> 本文件的时间字段、毫秒量化、区间、resource、calendar、replay 与 `labelkit:v1.20` 工件编码域继续有效；
+> 若本文出现共享双 owner 布局语义，以 v1.21 交织规格为准。
+
 ## 1. 问题证据与完成标准
 
 LabelKit 现有 `_meta.event.timestamp` 由 ScenarioPlanner 确定性计算，但 payload、sequence annotation 和导出器仍可各自
@@ -227,7 +231,7 @@ envelope：`max(event.end) - min(event.start)`。calendar window 要求整个 `[
 不把十二周全部 event 放入一个巨型 CP-SAT 模型。绝对放置按声明序：
 
 - 普通 session 的 lower bound 从此前所有已放置正区间的最大 end 与 `session_gap_s` 计算；
-- crossed session 只联合求解两个 owner，并为共享 resource 加跨 owner `AddNoOverlap`；
+- 已选交织布局只联合求解两个 owner，并为共享 resource 加跨 owner `AddNoOverlap`；
 - session 内全局 event start 仍唯一；不同 resource 的区间可以重叠；
 - 每次绝对平移保持整个 branch 的内部 offset、毫秒 quantum 与 calendar envelope；
 - 等价可行解按最早 branch start、声明序 role start 的词典序稳定 tie-break；固定单 worker与 seed 不替代 tie-break；
@@ -340,11 +344,11 @@ resource 的 O(n log n) sort/sweep 检查全量，不复用 frontier 结论。�
 | 失败 | 处置 |
 |---|---|
 | Schema 声明、binding、resource、containment 或毫秒量化错误 | M1 聚合 `CONFIG_ERROR`，零凭据物化 |
-| branch、crossed session 或 replay 区间不可行 | `generation_plan_infeasible`，零 LLM 调用 |
+| branch、已选交织布局或 replay 区间不可行 | `generation_plan_infeasible`，零 LLM 调用 |
 | model Schema 候选或完整对象 L2.5 失败 | 既有可恢复生成/标注拒绝，可消费 attempt |
 | plan mechanical leaf value 不满足完整 leaf Schema | `generation_plan_infeasible`，零 LLM 调用 |
 | candidate finalizer/projector/full Schema contract 失败 | terminal `generation_downstream_contract`，不进入 L3 |
-| outer/payload/annotation/containment/resource/frontier 固定计划不一致 | terminal `generation_downstream_contract`，不重试 slot |
+| plan block/payload/annotation/containment/resource/frontier 固定计划不一致 | terminal `generation_downstream_contract`，不重试 slot |
 | final full reconcile 时间不一致 | terminal internal invariant，零正式输出提交 |
 
 固定计划不变量重试不会改变结果，因此不得归入 recoverable reconcile。错误日志为英文，只记录 slot/stage/reason 类型，
@@ -404,7 +408,7 @@ pattern containment。catalog、state Schema、outcome Schema、role roots 与 b
 - containment 余量 999 微秒失败、1000 微秒通过；两端共享 resource 在 M1 失败。
 - positive 与 missing-contained 通过；missing-container、破坏 containment 的 reordered/interval-exceeded 零 LLM 失败。
 - gap 保持 start-to-start；max span/session span/calendar 使用完整 interval envelope。
-- crossed owner 的毫秒对齐、resource no-overlap、calendar end 与 session gap 均有边界测试。
+- 交织 owner 的毫秒对齐、resource no-overlap、calendar end 与 session gap 均有边界测试。
 - replay 与 primary/resource overlap 被 Planner 选择 constant shift 或 keyless 判不可行；全部 member shift 相同，start delta、
   duration、resources 不变，point tail 至少推进一个 quantum，replay span 按 source interval envelope 计算。
 - 重复编译及 runtime capacity 1/600 得到相同 plan digest。

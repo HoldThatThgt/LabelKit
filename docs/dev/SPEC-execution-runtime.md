@@ -1001,7 +1001,7 @@ commit 性能记录候选到达率与 `commit_ms`。有序临界区只有在
 ```text
 /Users/atishoo/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q6_K.gguf
 sha256 fdedd781c9ce676ab66b018ca247ff78e8a33c98098a822c1e2d5075e7718f66
-llama-server binary version 9200
+历史 v1.19 证据使用 llama-server binary version 9200；每次发布门必须重新记录实际 build，不能沿用历史值
 ```
 
 启动命令：
@@ -1019,13 +1019,19 @@ LabelKit 使用两个不同 profile、各 `max_concurrency=2`，合计匹配四�
 `http://127.0.0.1:18081`，structured output/vision 关闭，thinking disabled，temperature 为零。旧基准命令的
 `-c 65536 -np 4` 只给每槽 16384，不能满足 v1.18 完整 sequence 提示词的启动期预算证明，不用于本验收。
 
-独立 fixture 至少含四个 delivery slots、primary、noise、replay 与真实下游。验收同时证明：
+v1.21 fixture 按 `SPEC-sequence-interleaving.md` 拆成两个 trigger slots 与两个 partner slots，
+`no_interleaving_weight=0`，由一个 named pattern 强制形成两个 interleaving layouts。它仍含四个 delivery slots、
+primary、noise、replay 与真实下游。验收同时证明：
 
 - 非 mock、非录制的 `/v1/messages` 请求成功；
 - runtime/profile active high-water 大于一；
 - `/metrics` 显示请求重叠；
 - planned 等于 delivered、usage 非零、manifest hash 与 checker 全通过；
+- `interleaving_opportunities=2`、`interleaved_primary_sessions=2`、`primary_sessions=2`；
+- 两个 primary session 都有两个 owner 和至少三个 owner runs，owner 内 logical/artifact delta 保持；
 - Schema/CrossView/人工抽样质量与 throughput 分开报告。
+
+本门只证明真实生成与下游能消费冻结的交织 plan；整数权重分布由离线 ticket/fixed-vector 测试证明。
 
 ### 21.3 前后性能证据
 

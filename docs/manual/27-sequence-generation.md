@@ -1,6 +1,9 @@
-# 第 27 章　序列生成：共享世界、反事实与可重放交付
+# 第 27 章　序列生成：共享世界、交织、反事实与可重放交付
 
 > 本章以 `examples/sequence-generation` 为唯一教学工程。它不依赖任何被删除的旧序列生成配置。
+
+v1.21 只在 v1.20 时间完整性之上增加 declared positive branch 的交织规划；generation stream envelope、ID 公式和
+delivery digest 仍使用 `labelkit:v1.20` 工件编码域。产品修订号与工件编码域不是同一件事。
 
 ## 27.1 你在生成什么
 
@@ -10,6 +13,7 @@ frame class、状态变更、payload 和时间；一组反事实变体共享 Sce
 ```mermaid
 flowchart LR
     A[GenerationProgram] --> B[ScenarioPlan]
+    X[短候选集标签 + 命名交织 pattern] --> B
     B --> C[delivery slot]
     C --> D[共享 ScenarioSeed]
     D --> E[baseline 逐事件执行]
@@ -23,7 +27,7 @@ flowchart LR
 ```
 
 配置、dry-run 与正式 run 都调用同一个 compiler/planner。计划在读取 API key value、打开输出和消耗 attempt 前冻结；
-同一个 seed 与配置得到同一个 program digest、slot、session、crossing、noise 与 replay 布局。
+同一个 seed 与配置得到同一个 program digest、plan digest、slot、交织机会、pair、session、noise 与 replay 布局。
 
 ## 27.2 教学工程的最小形状
 
@@ -48,8 +52,9 @@ flowchart LR
 - `confirmation_timeout`：把确认事件移到声明 gap 上限之外。
 
 已验证的 keyless 精确计划是：2 sets、8 primary sequences、22 primary events、2 noise events、
-3 replay events，因此 stream 共 `22 + 2 + 3 = 27` 行。八条 primary sequence 各自占一个 session；
-同一个 set 的不同 variant 永不共 session。这样 process replay 不需要从非连续交错片段猜线程身份。
+3 replay events，因此 stream 共 `22 + 2 + 3 = 27` 行。教学主例没有声明交织配置，故
+`interleaving_opportunities = 0`、`interleaved_primary_sessions = 0`、`primary_sessions = 8`、
+`by_interleaving_pattern = {}`；这些 session 数由 plan 派生，不是用户配置。启用交织不会改变上述数据量。
 
 ## 27.3 declared 配置骨架
 
@@ -88,6 +93,46 @@ name = "positive"
 kind = "positive"
 outcome_schema_path = "schemas/outcome-positive.json"
 ```
+
+交织相关字段单独组成一个闭包。教学主例刻意关闭交织；下面是独立的配置形状示例，不是 `project.toml` 的摘录，
+它需要与各自已有的 sequence pattern、class 和 Schema 声明一起使用：
+
+```toml
+[[generate.counterfactual_sets]]
+name = "food_order"
+pattern = "food_order"
+count = 1
+interleaving_candidate_set = "food_dinner"
+
+[[generate.counterfactual_sets.variants]]
+name = "completed"
+kind = "positive"
+outcome_schema_path = "schemas/food-order-completed.json"
+
+[[generate.counterfactual_sets]]
+name = "entertainment_habit"
+pattern = "entertainment_habit"
+count = 8
+interleaving_candidate_set = "entertainment"
+
+[[generate.counterfactual_sets.variants]]
+name = "completed"
+kind = "positive"
+outcome_schema_path = "schemas/entertainment-completed.json"
+
+[generate.interleaving]
+no_interleaving_weight = 9
+
+[generate.interleaving.pattern.food_with_entertainment]
+trigger_candidate_set = "food_dinner"
+partner_candidate_set = "entertainment"
+trigger_weight = 1
+```
+
+`food_dinner` 与 `entertainment` 是短业务标签，不是序列名称编码。标签和 pattern name 都只接受
+`[a-z0-9_]+` 并按完整字符串精确匹配；不支持 glob、regex、前缀、列表或 selector 表达式。交织开启时至少有一个
+命名 pattern；候选标签必须全部被引用，pattern 两侧都必须有成员。权重必须满足 TOML int64 边界，且一次机会的
+总权重不得超过 `2^63 - 1`。
 
 完整 role、gap、variant、timeline、calendar window 与 noise 配置直接阅读示例文件；删掉任何关键字段后运行
 `labelkit validate`，会在内容调用前得到聚合配置错误。
@@ -172,7 +217,8 @@ state_schema_path = "schemas/state.json"
 instruction-only 的 EventPlanRequest 显式携带完整 state Schema，使真实 post-validator/L3 能看到合法枚举；
 declared request 的同字段固定为 null，权威 Schema 从冻结 program 解析。输出 truth 只有
 `validation_mode = "instruction_only"`、slot、scenario、world branch 与 sequence class；不能伪装出 pattern、
-variant 或 expected violation。
+variant 或 expected violation。instruction-only 禁止 `interleaving_candidate_set` 和 `[generate.interleaving]`，
+report 中交织机会、交织 session 固定为零，pattern map 为空。
 
 ### 27.6.1 只做帧标注
 
@@ -203,10 +249,40 @@ schema_path = "schemas/frame-annotation.json"
 消费生成计划中的成员和 inherited frame class，不发 sequence annotation 调用。任一应标注帧失败会让整个 slot
 attempt 失败并重试；只有全部帧标注成功后，main 与 primary stream 才作为同一组提交。
 
-## 27.7 时间线、noise 与 replay
+## 27.7 交织、时间线、noise 与 replay
 
-`[generate.timeline]` 精确声明 timestamp start、默认 event gap、primary/crossed session、session 容量、noise 和
-replay 数量。declared role 的间隔只来自 pattern gaps；默认 `event_gap_s` 不会暗中收窄 timeout 变体。
+`[generate.timeline]` 只声明 timestamp start、默认 event gap、session 容量与间隔、noise 和 replay 数量。
+`primary_sessions` 与 `crossed_primary_sessions` 已删除；用户不再倒推并手填 session 数。declared role 的间隔只来自
+sequence pattern gaps；默认 `event_gap_s` 不会暗中收窄 timeout 变体。
+
+交织的心智模型只有三步：在 counterfactual set 上贴短候选集标签；用命名交织 pattern 连接 trigger 与 partner
+候选集；给 standalone 和每个 pattern 分配整数票。trigger positive branch 按 DeliverySlot 声明序接受抽取；partner
+从对应共享 pool 中无偏、不放回地抽取。partner 可以声明在 trigger 前面或后面。反事实 variant、hidden baseline、
+instruction-only、noise 与 replay 都不参与。同一候选集不能同时承担 trigger 和 partner；多个 pattern 可以共享
+同一 partner pool，但每条 partner branch 全局至多消费一次。若交织章节与候选集标签都不存在，能力关闭；只声明
+其中一侧会在配置期失败。
+
+`no_interleaving_weight = 9` 与唯一可用 pattern 的 `trigger_weight = 1` 表示当前 opportunity 中 standalone 占
+9 张票、pattern 占 1 张票，即条件概率为 9/10 与 1/10。它不是配额或“每十条必有一条”；有限样本会波动，pool
+耗尽后对应 pattern 会从后续机会的分母移除。none 只在分母出现一次，partner 数量和可实现 owner word 数量都不会
+复制权重；抽中 none 不消费 partner pool。所有对应 pool 都为空时不计 opportunity，trigger 直接保持 standalone。
+
+用户不配置 `A B B A B A A` 这样的 owner word。Planner 保持两条 branch 各自的 logical time、gap、duration、
+resource、calendar 和事件顺序，只选择两个整体绝对起点；最终 owner word 必须至少有三段连续 owner runs。
+`A B B A B A A` 是一种可实现结果，不是枚举值。候选资格不预搜索布局可行性；pattern 与 partner 一旦抽中便进入
+冻结 plan。若 calendar、resource、session 容量或交织约束无解，规划以 `generation_plan_infeasible`、exit 2 失败，
+不换 partner、pattern、standalone，也不在 provider/slot retry 时重抽。
+
+设可见 primary branch 数为 `N`，冻结交织布局数为 `D`：
+
+```text
+interleaved_primary_sessions = D
+primary_sessions = N - D
+```
+
+`report.generate.sequence` 还给出 `interleaving_opportunities` 和按 TOML 声明序排列的
+`by_interleaving_pattern`；每项包含 `eligible_opportunities` 与 `selected_sessions`，包括 selected 为零的 pattern。
+report 不输出 pair identity 或 owner word；从最终 stream 的 session 与 timestamp 机械推导真实 owner word。
 
 Planner 的固定 quantum 是 1 毫秒；起点、duration、gap、calendar 边界、variant excess、session gap 与求解结果都
 必须毫秒对齐。同一 resource 的所有正 duration event 使用半开区间互斥约束。pattern 的 `containments` 让 contained
@@ -241,7 +317,7 @@ CrossView 分三层保持线性工作量：每个 PreparedCandidate/PreparedNois
 source 与它的全部 rebound replay 进入同一个 `CrossViewDelta` 和同一次原子提交。全部 primary、replay、noise 内存提交
 后，full CrossViewReconciler 从最终 rows 独立重建全部事实，并在最终 timestamp 排序之后复查全局起点唯一、resource
 互斥、containment、descriptor、payload 与 annotation。固定计划错误是终态 downstream contract 失败，不作为 slot
-重试。main 内成员按 owner 顺序保留；最终 stream 按 timestamp 全局稳定排序，因此 crossed session 能呈现真实
+重试。main 内成员按 owner 顺序保留；最终 stream 按 timestamp 全局稳定排序，因此交织 session 能呈现真实
 A-B-A 或 B-A-B。
 
 Dataset-Person 导出器只做格式转换和只读 overlap/containment 验证；它不会 align、normalize、shift、synchronize 或
@@ -311,6 +387,9 @@ uv run python check_output.py --frame-only
 `thinking = "disabled"` 和正数 context window。不要把 key value 放进配置、命令参数、日志或断言文本。
 
 当前证据状态：
+
+v1.21 交织的实时证据只以 `docs/dev/E2E-FINDINGS.md` 的实际运行记录为准；下面保留的是 v1.20 时间完整性与
+v1.18/v1.19 历史端点证据，不能据此推断交织已通过真实模型门。
 
 - v1.20 Dataset-Person production constructor 的 keyless validate 已通过；dry-run 为 4380 sequences、
   16320 primary events、零 LLM 调用、零正式输出；

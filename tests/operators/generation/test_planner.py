@@ -11,10 +11,13 @@ from types import SimpleNamespace
 import pytest
 from ortools.sat.python import cp_model
 
+import labelkit.operators.generation.planner as planner_module
 from labelkit.common.config.generation import (
     CalendarWindowSpec,
     CounterfactualSetSpec,
     GapSpec,
+    InterleavingPatternSpec,
+    InterleavingSpec,
 )
 from labelkit.common.config._temporal import IntervalContainmentSpec
 from labelkit.common.config.model import TimeBindingSpec
@@ -22,6 +25,7 @@ from labelkit.common.errors import ConfigError, InternalError
 from labelkit.orchestration.sequence_workflow import _DeliveryController
 from labelkit.operators.generation.planner import (
     _add_containment_constraints,
+    _bounded_random,
     _plan_budget,
     _plan_internal,
     _require_program_quantum,
@@ -55,8 +59,6 @@ def _declared_case(program, pattern, variants, frames, duplicate: int = 0):
     )
     timeline = replace(
         program.timeline,
-        primary_sessions=len(variants),
-        crossed_primary_sessions=0,
         noise_events=0,
         duplicate_sequences=duplicate,
     )
@@ -95,6 +97,95 @@ def _resource_interval_case(program, first_gap_us: int):
     return _declared_case(program, pattern, (positive,), frames)
 
 
+def _interleaving_case(
+    program,
+    trigger_count: int = 1,
+    partner_count: int = 1,
+    none_weight: int = 0,
+    partner_first: bool = False,
+):
+    """构造一个 positive-only 且可强制交织的冻结 program。"""
+    source = program.counterfactual_sets[0]
+    positive = next(item for item in source.variants if item.kind == "positive")
+    trigger = replace(
+        source, name="trigger_source", count=trigger_count,
+        interleaving_candidate_set="trigger", variants=(positive,),
+    )
+    partner = replace(
+        source, name="partner_source", count=partner_count,
+        interleaving_candidate_set="partner", variants=(positive,),
+    )
+    interleaving = InterleavingSpec(none_weight, (
+        InterleavingPatternSpec("trigger_with_partner", "trigger", "partner", 1),
+    ))
+    sources = (partner, trigger) if partner_first else (trigger, partner)
+    timeline = replace(program.timeline, noise_events=0, duplicate_sequences=0)
+    return _rehash(replace(
+        program, counterfactual_sets=sources, interleaving=interleaving,
+        timeline=timeline, noise=None,
+    ))
+
+
+def _offset_pattern(program, name: str, prefix: str, offsets: tuple[int, ...]):
+    """从真实声明克隆一个固定 logical offset 的测试 pattern。"""
+    base = program.patterns["booking_success"]
+    roles = tuple(
+        replace(
+            base.roles[index % len(base.roles)],
+            name=f"{prefix}{index + 1}",
+            calendar_window=None,
+        )
+        for index in range(len(offsets))
+    )
+    order = tuple(item.name for item in roles)
+    gaps = tuple(
+        GapSpec(
+            f"{left}_to_{right}", left, right,
+            offsets[index + 1] - offsets[index],
+            offsets[index + 1] - offsets[index],
+        )
+        for index, (left, right) in enumerate(zip(order, order[1:]))
+    )
+    return replace(
+        base, name=name, roles=roles, order=order,
+        gaps=gaps, max_span_us=offsets[-1], containments=(),
+    )
+
+
+def _offset_interleaving_case(program, trigger_offsets, partner_offsets):
+    """构造两个独立固定 offset pattern 的强制交织用例。"""
+    trigger_pattern = _offset_pattern(program, "trigger_pattern", "a", trigger_offsets)
+    partner_pattern = _offset_pattern(program, "partner_pattern", "b", partner_offsets)
+    source = program.counterfactual_sets[0]
+    positive = next(item for item in source.variants if item.kind == "positive")
+    sources = (
+        replace(
+            source, name="trigger_source", pattern=trigger_pattern.name, count=1,
+            interleaving_candidate_set="trigger", variants=(positive,),
+        ),
+        replace(
+            source, name="partner_source", pattern=partner_pattern.name, count=1,
+            interleaving_candidate_set="partner", variants=(positive,),
+        ),
+    )
+    interleaving = InterleavingSpec(0, (
+        InterleavingPatternSpec("forced", "trigger", "partner", 1),
+    ))
+    timeline = replace(
+        program.timeline,
+        session_max_events=len(trigger_offsets) + len(partner_offsets),
+        session_max_span_us=max((*trigger_offsets, *partner_offsets, 0)) + 60_000_000,
+        noise_events=0,
+        duplicate_sequences=0,
+    )
+    return _rehash(replace(
+        program, patterns={trigger_pattern.name: trigger_pattern,
+                           partner_pattern.name: partner_pattern},
+        counterfactual_sets=sources, interleaving=interleaving,
+        timeline=timeline, calendar_windows={}, noise=None,
+    ))
+
+
 def _independent_violations(pattern, events):
     """不导入 production evaluator 地计算本教学模式的结构违规。"""
     positions = {event.role: index for index, event in enumerate(events)}
@@ -127,11 +218,114 @@ def _has_alternation(owners) -> bool:
                for left, middle, right in zip(owners, owners[1:], owners[2:]))
 
 
+def _prefer_first_trigger_gap(domain, material):
+    """固定选择 trigger 的第一个 alternation witness。"""
+    if domain != "interleaving_witness_rank":
+        return 0
+    owner, gap_index = material[-2:]
+    if (owner, gap_index) == ("trigger", 0):
+        return 0
+    return 10 + (0 if owner == "trigger" else 100) + gap_index
+
+
 def test_plan_is_deterministic(declared_program):
     plan_a = compile_scenario_plan(declared_program)
     plan_b = compile_scenario_plan(declared_program)
     assert plan_a == plan_b
     assert plan_a.digest == plan_b.digest
+
+
+def test_bounded_random_rejects_limit_and_advances_only_counter(monkeypatch):
+    upper = 10
+    maximum = 1 << 256
+    limit = maximum - maximum % upper
+    values = iter((limit, 17))
+    calls = []
+
+    def fake_random(domain, material):
+        calls.append((domain, material))
+        return next(values)
+
+    monkeypatch.setattr(planner_module, "generation_random", fake_random)
+
+    assert _bounded_random("interleaving_pattern_choice", ("program", 3), upper) == 7
+    assert calls == [
+        ("interleaving_pattern_choice", ["program", 3, 0]),
+        ("interleaving_pattern_choice", ["program", 3, 1]),
+    ]
+
+
+def test_partner_rejection_uses_exact_domain_material_and_counter(
+        declared_program, monkeypatch):
+    program = _interleaving_case(declared_program, partner_count=3)
+    maximum = 1 << 256
+    limit = maximum - maximum % 3
+    calls = []
+
+    def fake_random(domain, material):
+        if domain == "interleaving_partner_choice":
+            calls.append(list(material))
+            return limit if len(calls) == 1 else 0
+        return 0
+
+    monkeypatch.setattr(planner_module, "generation_random", fake_random)
+
+    plan = compile_scenario_plan(program)
+
+    assert len(plan.interleaving_layouts) == 1
+    assert calls == [
+        [program.digest, program.planner_seed, "trigger_source/000000", "positive",
+         "trigger_with_partner", "partner", 0],
+        [program.digest, program.planner_seed, "trigger_source/000000", "positive",
+         "trigger_with_partner", "partner", 1],
+    ]
+
+
+@pytest.mark.parametrize(
+    ("ticket", "selected"),
+    tuple((ticket, None if ticket < 9 else "trigger_with_partner") for ticket in range(10)),
+)
+def test_nine_to_one_pattern_ticket_boundaries(declared_program, monkeypatch, ticket, selected):
+    program = _interleaving_case(declared_program, none_weight=9)
+    trigger = SimpleNamespace(
+        slot=SimpleNamespace(slot_key="trigger_source/000000"),
+        variant_name="positive",
+    )
+    monkeypatch.setattr(planner_module, "generation_random", lambda _domain, _value: ticket)
+
+    pattern = planner_module._choose_interleaving_pattern(
+        program, trigger, program.interleaving.patterns,
+    )
+
+    assert (None if pattern is None else pattern.name) == selected
+
+
+def test_none_weight_occurs_once_before_multiple_pattern_ranges(declared_program, monkeypatch):
+    base = _interleaving_case(declared_program, none_weight=9)
+    patterns = (
+        InterleavingPatternSpec("first", "trigger", "partner", 1),
+        InterleavingPatternSpec("second", "trigger", "partner", 2),
+    )
+    program = _rehash(replace(base, interleaving=InterleavingSpec(9, patterns)))
+    trigger = SimpleNamespace(
+        slot=SimpleNamespace(slot_key="trigger_source/000000"),
+        variant_name="positive",
+    )
+    tickets = iter(range(12))
+    uppers = []
+
+    def bounded(_domain, _material, upper):
+        uppers.append(upper)
+        return next(tickets)
+
+    monkeypatch.setattr(planner_module, "_bounded_random", bounded)
+    observed = []
+    for _ticket in range(12):
+        choice = planner_module._choose_interleaving_pattern(program, trigger, patterns)
+        observed.append(None if choice is None else choice.name)
+
+    assert observed == [None] * 9 + ["first", "second", "second"]
+    assert uppers == [12] * 12
 
 
 def test_six_hundred_slot_plan_digest_is_runtime_capacity_independent(
@@ -146,8 +340,6 @@ def test_six_hundred_slot_plan_digest_is_runtime_capacity_independent(
     source = replace(source, count=600, variants=(positive,))
     timeline = replace(
         declared_program.timeline,
-        primary_sessions=600,
-        crossed_primary_sessions=0,
         session_gap_us=1000,
         noise_events=0,
         duplicate_sequences=0,
@@ -182,6 +374,41 @@ def test_six_hundred_slot_plan_digest_is_runtime_capacity_independent(
     assert digests[1] == digests[600]
 
 
+def test_six_hundred_positive_branches_compile_three_hundred_selected_pairs(
+        declared_program, monkeypatch):
+    pattern = declared_program.patterns["booking_success"]
+    pattern = replace(
+        pattern,
+        roles=tuple(replace(role, calendar_window=None) for role in pattern.roles),
+    )
+    base = _rehash(replace(
+        declared_program, patterns={pattern.name: pattern},
+    ))
+    program = _interleaving_case(base, trigger_count=300, partner_count=300)
+    timeline = replace(program.timeline, session_gap_us=1000)
+    program = _rehash(replace(program, timeline=timeline))
+    solve = planner_module._solve_interleaving_layout
+    calls = 0
+
+    def counted_solve(model, request):
+        nonlocal calls
+        calls += 1
+        return solve(model, request)
+
+    monkeypatch.setattr(planner_module, "_solve_interleaving_layout", counted_solve)
+
+    plan = compile_scenario_plan(program)
+
+    assert len(plan.delivery_slots) == 600
+    assert len(plan.interleaving_layouts) == 300
+    assert plan.interleaving_opportunities == 300
+    assert dict(plan.interleaving_pattern_opportunities) == {"trigger_with_partner": 300}
+    assert plan.primary_sessions == 300
+    assert calls == 1200
+    assert plan.digest == scenario_plan_digest(plan)
+    assert plan.digest == "59e11af8d22ecdf195409d6f2e242c11ba7a5d8f23e0315b4ae2013b41de8a89"
+
+
 def test_same_resource_half_open_adjacency_and_multi_resource_carrier(declared_program):
     program = _resource_interval_case(declared_program, 10_000_000)
 
@@ -203,7 +430,7 @@ def test_same_resource_strict_overlap_is_plan_infeasible(declared_program):
         compile_scenario_plan(program)
 
 
-def test_crossed_owners_use_millisecond_starts_and_shared_resource_no_overlap(
+def test_interleaved_owners_use_millisecond_starts_and_shared_resource_no_overlap(
         declared_program):
     program = _resource_interval_case(declared_program, 10_000_000)
     frames = dict(program.frame_classes)
@@ -213,13 +440,8 @@ def test_crossed_owners_use_millisecond_starts_and_shared_resource_no_overlap(
     frames["acknowledgement"] = replace(
         frames["acknowledgement"], duration_us=0, resources=(),
     )
-    source = replace(program.counterfactual_sets[0], count=2)
-    timeline = replace(
-        program.timeline, primary_sessions=1, crossed_primary_sessions=1,
-    )
-    program = _rehash(replace(
-        program, frame_classes=frames, counterfactual_sets=(source,), timeline=timeline,
-    ))
+    program = _rehash(replace(program, frame_classes=frames))
+    program = _interleaving_case(program)
 
     plan = compile_scenario_plan(program)
     request_events = [
@@ -235,8 +457,8 @@ def test_crossed_owners_use_millisecond_starts_and_shared_resource_no_overlap(
     assert intervals[0][1] <= intervals[1][0]
 
 
-def _crossed_calendar_case(program, duration_us: int):
-    """构造两个 owner 只可占用相邻毫秒起点的 crossed calendar。"""
+def _interleaved_calendar_case(program, duration_us: int):
+    """构造两个 owner 只可占用相邻毫秒起点的 calendar。"""
     base = program.patterns["booking_success"]
     roles = tuple(
         replace(role, calendar_window="tight" if role.name == "request" else None)
@@ -247,9 +469,6 @@ def _crossed_calendar_case(program, duration_us: int):
     frames["task_request"] = replace(
         frames["task_request"], duration_us=duration_us, resources=(),
     )
-    source = program.counterfactual_sets[0]
-    positive = next(item for item in source.variants if item.kind == "positive")
-    source = replace(source, count=2, variants=(positive,))
     start = int(datetime(2026, 8, 24, 9, tzinfo=timezone.utc).timestamp() * 1_000_000)
     window_start = 9 * 3_600_000_000
     window = CalendarWindowSpec(
@@ -259,8 +478,6 @@ def _crossed_calendar_case(program, duration_us: int):
         program.timeline,
         timestamp_start_us=start,
         utc_offset_minutes=0,
-        primary_sessions=1,
-        crossed_primary_sessions=1,
         session_max_events=6,
         noise_events=0,
         duplicate_sequences=0,
@@ -269,16 +486,15 @@ def _crossed_calendar_case(program, duration_us: int):
         program,
         patterns={pattern.name: pattern},
         frame_classes=frames,
-        counterfactual_sets=(source,),
         timeline=timeline,
         calendar_windows={"tight": window},
         noise=None,
     ))
-    return frozen, start + 11_000
+    return _interleaving_case(frozen), start + 11_000
 
 
-def test_crossed_calendar_end_uses_full_interval_boundary(declared_program):
-    program, window_end = _crossed_calendar_case(declared_program, 10_000)
+def test_interleaved_calendar_end_uses_full_interval_boundary(declared_program):
+    program, window_end = _interleaved_calendar_case(declared_program, 10_000)
 
     plan = compile_scenario_plan(program)
     requests = [events[0] for _slot, _variant, events in _visible_branches(plan)]
@@ -286,12 +502,12 @@ def test_crossed_calendar_end_uses_full_interval_boundary(declared_program):
     assert len({event.session_id for event in requests}) == 1
     assert max(event.timestamp_us + event.duration_us for event in requests) == window_end
 
-    impossible, _window_end = _crossed_calendar_case(declared_program, 12_000)
+    impossible, _window_end = _interleaved_calendar_case(declared_program, 12_000)
     with pytest.raises(ConfigError, match="generation_plan_infeasible"):
         compile_scenario_plan(impossible)
 
 
-def test_crossed_session_starts_at_full_previous_tail_plus_session_gap(declared_program):
+def test_interleaved_session_starts_at_full_previous_tail_plus_session_gap(declared_program):
     pattern = declared_program.patterns["booking_success"]
     pattern = replace(
         pattern,
@@ -303,26 +519,33 @@ def test_crossed_session_starts_at_full_previous_tail_plus_session_gap(declared_
     )
     source = declared_program.counterfactual_sets[0]
     positive = next(item for item in source.variants if item.kind == "positive")
-    missing = next(item for item in source.variants if item.kind == "missing")
     sources = (
         replace(source, name="first", count=1, variants=(positive,)),
-        replace(source, name="crossed_left", count=1, variants=(positive,)),
-        replace(source, name="crossed_right", count=1, variants=(missing,)),
+        replace(
+            source, name="trigger_source", count=1,
+            interleaving_candidate_set="trigger", variants=(positive,),
+        ),
+        replace(
+            source, name="partner_source", count=1,
+            interleaving_candidate_set="partner", variants=(positive,),
+        ),
     )
     timeline = replace(
         declared_program.timeline,
-        primary_sessions=2,
-        crossed_primary_sessions=1,
-        session_max_events=5,
+        session_max_events=6,
         session_gap_us=1_000_000,
         noise_events=0,
         duplicate_sequences=0,
     )
+    interleaving = InterleavingSpec(0, (
+        InterleavingPatternSpec("trigger_with_partner", "trigger", "partner", 1),
+    ))
     program = _rehash(replace(
         declared_program,
         patterns={pattern.name: pattern},
         frame_classes=frames,
         counterfactual_sets=sources,
+        interleaving=interleaving,
         timeline=timeline,
         noise=None,
     ))
@@ -335,13 +558,13 @@ def test_crossed_session_starts_at_full_previous_tail_plus_session_gap(declared_
         event.timestamp_us + max(event.duration_us, 1000)
         for event in branches["first"]
     )
-    crossed_start = min(
+    interleaved_start = min(
         events[0].timestamp_us
         for name, events in branches.items()
-        if name.startswith("crossed_")
+        if name in {"trigger_source", "partner_source"}
     )
 
-    assert crossed_start == first_tail + timeline.session_gap_us
+    assert interleaved_start == first_tail + timeline.session_gap_us
 
 
 def _containment_case(program, variants, gap_us: int = 1000):
@@ -661,22 +884,494 @@ def test_example_exact_layout_has_independent_primary_sessions(declared_program)
     assert plan.replay_layouts[0].shift_us % 1000 == 0
 
 
-def test_crossing_layout_has_true_owner_alternation(declared_program):
-    timeline = replace(
-        declared_program.timeline,
-        primary_sessions=7,
-        crossed_primary_sessions=1,
-    )
-    program = _rehash(replace(declared_program, timeline=timeline))
+def test_interleaving_layout_has_true_owner_alternation(declared_program):
+    program = _interleaving_case(declared_program)
+    plan = compile_scenario_plan(program)
     sessions = defaultdict(list)
-    for slot, variant, events in _visible_branches(compile_scenario_plan(program)):
+    for slot, variant, events in _visible_branches(plan):
         owner = (slot.slot_key, variant)
         for event in events:
             sessions[event.session_id].append((event.timestamp_us, owner))
-    crossed = [rows for rows in sessions.values() if len({owner for _, owner in rows}) == 2]
-    assert len(crossed) == 1
-    ordered_owners = [owner for _, owner in sorted(crossed[0])]
+    interleaved = [rows for rows in sessions.values() if len({owner for _, owner in rows}) == 2]
+    assert len(interleaved) == 1
+    ordered_owners = [owner for _, owner in sorted(interleaved[0])]
     assert _has_alternation(ordered_owners)
+    assert plan.interleaving_opportunities == 1
+    assert dict(plan.interleaving_pattern_opportunities) == {"trigger_with_partner": 1}
+    assert plan.primary_sessions == 1
+
+
+def test_interleaving_preserves_each_owner_logical_and_artifact_offsets(
+        declared_program):
+    second = 1_000_000
+    expected = {
+        "trigger_source": (0, 10 * second, 20 * second),
+        "partner_source": (0, 2 * second, 12 * second),
+    }
+    program = _offset_interleaving_case(
+        declared_program,
+        expected["trigger_source"],
+        expected["partner_source"],
+    )
+
+    for slot, _variant, events in _visible_branches(compile_scenario_plan(program)):
+        logical = tuple(
+            event.logical_time_us - events[0].logical_time_us for event in events
+        )
+        artifact = tuple(
+            event.timestamp_us - events[0].timestamp_us for event in events
+        )
+        assert logical == expected[slot.source_name]
+        assert artifact == expected[slot.source_name]
+
+
+def test_interleaving_enforces_cross_owner_resource_no_overlap(
+        declared_program, monkeypatch):
+    program = _offset_interleaving_case(
+        declared_program,
+        (0, 10_000_000, 20_000_000),
+        (0, 2_000_000, 12_000_000),
+    )
+    frames = {
+        name: replace(frame, duration_us=0, resources=())
+        for name, frame in program.frame_classes.items()
+    }
+    frames["task_request"] = replace(
+        frames["task_request"], duration_us=2_000_000, resources=("shared",),
+    )
+    program = _rehash(replace(program, frame_classes=frames))
+    monkeypatch.setattr(
+        planner_module, "generation_random", _prefer_first_trigger_gap,
+    )
+
+    branches = {
+        slot.source_name: events
+        for slot, _variant, events in _visible_branches(compile_scenario_plan(program))
+    }
+    trigger = branches["trigger_source"][0]
+    partner = branches["partner_source"][0]
+
+    assert partner.timestamp_us - trigger.timestamp_us == 2_000_000
+    assert trigger.timestamp_us + trigger.duration_us <= partner.timestamp_us
+
+
+def test_interleaving_enforces_cross_owner_start_uniqueness(
+        declared_program, monkeypatch):
+    program = _offset_interleaving_case(
+        declared_program,
+        (0, 10_000_000, 20_000_000),
+        (0, 9_999_000, 12_000_000),
+    )
+    frames = {
+        name: replace(frame, duration_us=0, resources=())
+        for name, frame in program.frame_classes.items()
+    }
+    program = _rehash(replace(program, frame_classes=frames))
+    monkeypatch.setattr(
+        planner_module, "generation_random", _prefer_first_trigger_gap,
+    )
+
+    branches = {
+        slot.source_name: events
+        for slot, _variant, events in _visible_branches(compile_scenario_plan(program))
+    }
+    timestamps = [
+        event.timestamp_us
+        for events in branches.values()
+        for event in events
+    ]
+
+    assert len(timestamps) == len(set(timestamps))
+    assert (
+        branches["partner_source"][0].timestamp_us
+        - branches["trigger_source"][0].timestamp_us
+    ) == 2_000
+
+
+def test_interleaving_combined_interval_envelope_obeys_session_cap(
+        declared_program, monkeypatch):
+    program = _offset_interleaving_case(
+        declared_program, (0, 10_000_000), (0, 10_000_000),
+    )
+    frames = {
+        name: replace(frame, duration_us=0, resources=())
+        for name, frame in program.frame_classes.items()
+    }
+    timeline = replace(
+        program.timeline,
+        session_max_events=4,
+        session_max_span_us=10_000_000,
+    )
+    program = _rehash(replace(
+        program, frame_classes=frames, timeline=timeline,
+    ))
+    monkeypatch.setattr(
+        planner_module, "generation_random", _prefer_first_trigger_gap,
+    )
+
+    with pytest.raises(ConfigError, match="generation_plan_infeasible"):
+        compile_scenario_plan(program)
+
+
+def test_interleaving_combined_event_count_obeys_session_cap(declared_program):
+    program = _offset_interleaving_case(
+        declared_program,
+        (0, 10_000_000),
+        (0, 2_000_000, 12_000_000),
+    )
+    frames = {
+        name: replace(frame, duration_us=0, resources=())
+        for name, frame in program.frame_classes.items()
+    }
+    timeline = replace(
+        program.timeline,
+        session_max_events=4,
+        session_max_span_us=60_000_000,
+    )
+    program = _rehash(replace(
+        program, frame_classes=frames, timeline=timeline,
+    ))
+
+    with pytest.raises(ConfigError, match="generation_plan_infeasible"):
+        compile_scenario_plan(program)
+
+
+@pytest.mark.parametrize("partner_first", (False, True))
+def test_partner_may_precede_or_follow_trigger(declared_program, partner_first):
+    program = _interleaving_case(declared_program, partner_first=partner_first)
+
+    plan = compile_scenario_plan(program)
+    layout = plan.interleaving_layouts[0]
+    branches = {
+        slot.source_name: events
+        for slot, _variant, events in _visible_branches(plan)
+    }
+
+    assert layout.trigger_slot_key == "trigger_source/000000"
+    assert layout.partner_slot_key == "partner_source/000000"
+    assert branches["trigger_source"][0].session_id == branches["partner_source"][0].session_id
+
+
+def test_nonadjacent_pair_is_placed_at_earlier_branch_position(declared_program):
+    source = declared_program.counterfactual_sets[0]
+    positive = next(item for item in source.variants if item.kind == "positive")
+    sources = (
+        replace(
+            source, name="trigger_source", count=1,
+            interleaving_candidate_set="trigger", variants=(positive,),
+        ),
+        replace(source, name="middle", count=1, variants=(positive,)),
+        replace(
+            source, name="partner_source", count=1,
+            interleaving_candidate_set="partner", variants=(positive,),
+        ),
+    )
+    interleaving = InterleavingSpec(0, (
+        InterleavingPatternSpec("forced", "trigger", "partner", 1),
+    ))
+    timeline = replace(
+        declared_program.timeline, noise_events=0, duplicate_sequences=0,
+    )
+    program = _rehash(replace(
+        declared_program, counterfactual_sets=sources,
+        interleaving=interleaving, timeline=timeline, noise=None,
+    ))
+
+    branches = {
+        slot.source_name: events
+        for slot, _variant, events in _visible_branches(compile_scenario_plan(program))
+    }
+
+    assert branches["trigger_source"][0].session_id == "primary_000000"
+    assert branches["partner_source"][0].session_id == "primary_000000"
+    assert branches["middle"][0].session_id == "primary_000001"
+
+
+def test_only_positive_variants_enter_interleaving_candidates(declared_program):
+    source = declared_program.counterfactual_sets[0]
+    sources = (
+        replace(
+            source, name="trigger_source", count=1,
+            interleaving_candidate_set="trigger",
+        ),
+        replace(
+            source, name="partner_source", count=1,
+            interleaving_candidate_set="partner",
+        ),
+    )
+    interleaving = InterleavingSpec(0, (
+        InterleavingPatternSpec("forced", "trigger", "partner", 1),
+    ))
+    timeline = replace(
+        declared_program.timeline, noise_events=0, duplicate_sequences=0,
+    )
+    program = _rehash(replace(
+        declared_program, counterfactual_sets=sources,
+        interleaving=interleaving, timeline=timeline, noise=None,
+    ))
+
+    plan = compile_scenario_plan(program)
+    layout = plan.interleaving_layouts[0]
+    sessions = defaultdict(set)
+    for slot, variant, events in _visible_branches(plan):
+        sessions[events[0].session_id].add((slot.source_name, variant))
+
+    assert layout.trigger_variant_name == "positive"
+    assert layout.partner_variant_name == "positive"
+    assert plan.primary_sessions == 7
+    assert sum(len(owners) == 2 for owners in sessions.values()) == 1
+    assert all(
+        variant == "positive"
+        for owners in sessions.values() if len(owners) == 2
+        for _source, variant in owners
+    )
+
+
+def test_none_does_not_consume_partner_pool(declared_program, monkeypatch):
+    program = _interleaving_case(
+        declared_program, trigger_count=2, partner_count=1, none_weight=1,
+    )
+
+    def fixed_random(domain, material):
+        if domain == "interleaving_pattern_choice":
+            return 0 if material[2].endswith("000000") else 1
+        return 0
+
+    monkeypatch.setattr(planner_module, "generation_random", fixed_random)
+
+    plan = compile_scenario_plan(program)
+
+    assert plan.interleaving_opportunities == 2
+    assert len(plan.interleaving_layouts) == 1
+    assert plan.interleaving_layouts[0].trigger_slot_key == "trigger_source/000001"
+    assert plan.interleaving_layouts[0].partner_slot_key == "partner_source/000000"
+
+
+def test_multiple_patterns_share_one_partner_pool_without_replacement(
+        declared_program, monkeypatch):
+    program = _interleaving_case(declared_program, trigger_count=2, partner_count=2)
+    patterns = (
+        InterleavingPatternSpec("first", "trigger", "partner", 1),
+        InterleavingPatternSpec("second", "trigger", "partner", 1),
+    )
+    program = _rehash(replace(program, interleaving=InterleavingSpec(0, patterns)))
+
+    def fixed_random(domain, material):
+        if domain == "interleaving_pattern_choice":
+            return 0 if material[2].endswith("000000") else 1
+        return 0
+
+    monkeypatch.setattr(planner_module, "generation_random", fixed_random)
+
+    plan = compile_scenario_plan(program)
+    layouts = plan.interleaving_layouts
+
+    assert [item.pattern_name for item in layouts] == ["first", "second"]
+    assert len({item.partner_slot_key for item in layouts}) == 2
+    assert dict(plan.interleaving_pattern_opportunities) == {"first": 2, "second": 2}
+
+
+def test_exhausted_partner_pool_removes_later_opportunities(declared_program):
+    program = _interleaving_case(
+        declared_program, trigger_count=3, partner_count=1,
+    )
+
+    plan = compile_scenario_plan(program)
+
+    assert len(plan.interleaving_layouts) == 1
+    assert plan.interleaving_opportunities == 1
+    assert dict(plan.interleaving_pattern_opportunities) == {"trigger_with_partner": 1}
+
+
+def test_only_selected_pair_runs_interleaving_solver(declared_program, monkeypatch):
+    program = _interleaving_case(
+        declared_program, trigger_count=50, partner_count=1,
+    )
+    solve = planner_module._solve_interleaving_layout
+    calls = 0
+
+    def counted_solve(model, request):
+        nonlocal calls
+        calls += 1
+        return solve(model, request)
+
+    monkeypatch.setattr(planner_module, "_solve_interleaving_layout", counted_solve)
+
+    plan = compile_scenario_plan(program)
+
+    assert len(plan.interleaving_layouts) == 1
+    assert calls == 4
+
+
+def test_replay_source_remains_positive_declaration_order(declared_program):
+    source = declared_program.counterfactual_sets[0]
+    positive = next(item for item in source.variants if item.kind == "positive")
+    sources = (
+        replace(
+            source, name="trigger_source", count=1,
+            interleaving_candidate_set="trigger", variants=(positive,),
+        ),
+        replace(source, name="middle", count=1, variants=(positive,)),
+        replace(
+            source, name="partner_source", count=1,
+            interleaving_candidate_set="partner", variants=(positive,),
+        ),
+    )
+    interleaving = InterleavingSpec(0, (
+        InterleavingPatternSpec("forced", "trigger", "partner", 1),
+    ))
+    timeline = replace(
+        declared_program.timeline,
+        noise_events=0,
+        duplicate_sequences=2,
+    )
+    program = _rehash(replace(
+        declared_program,
+        counterfactual_sets=sources,
+        interleaving=interleaving,
+        timeline=timeline,
+        noise=None,
+    ))
+
+    plan = compile_scenario_plan(program)
+
+    assert plan.interleaving_layouts[0].trigger_slot_key == "trigger_source/000000"
+    assert tuple(item.source_slot_key for item in plan.replay_layouts) == (
+        "trigger_source/000000", "middle/000000",
+    )
+
+
+def test_seed_ranked_layout_realizes_a_b_b_a_b_a_a(declared_program, monkeypatch):
+    second = 1_000_000
+    program = _offset_interleaving_case(
+        declared_program,
+        (0, 10 * second, 20 * second, 30 * second),
+        (0, 2 * second, 12 * second),
+    )
+
+    def ranked_random(domain, material):
+        if domain != "interleaving_witness_rank":
+            return 0
+        owner, gap_index = material[-2:]
+        if owner == "trigger" and gap_index == 0:
+            return 0
+        return 100 + (0 if owner == "trigger" else 10) + gap_index
+
+    monkeypatch.setattr(planner_module, "generation_random", ranked_random)
+
+    rows = []
+    for slot, _variant, events in _visible_branches(compile_scenario_plan(program)):
+        owner = "A" if slot.source_name == "trigger_source" else "B"
+        rows.extend((event.timestamp_us, owner) for event in events)
+
+    assert [owner for _timestamp, owner in sorted(rows)] == ["A", "B", "B", "A", "B", "A", "A"]
+
+
+def test_witness_hash_collision_uses_owner_and_gap_total_order(declared_program, monkeypatch):
+    second = 1_000_000
+    program = _offset_interleaving_case(
+        declared_program,
+        (0, 10 * second, 20 * second, 30 * second),
+        (0, 2 * second, 12 * second),
+    )
+    monkeypatch.setattr(planner_module, "generation_random", lambda _domain, _value: 0)
+
+    rows = []
+    for slot, _variant, events in _visible_branches(compile_scenario_plan(program)):
+        owner = "A" if slot.source_name == "trigger_source" else "B"
+        rows.extend((event.timestamp_us, owner) for event in events)
+
+    assert [owner for _timestamp, owner in sorted(rows)] == ["A", "B", "B", "A", "B", "A", "A"]
+
+
+def test_interleaving_plan_is_deterministic_and_digest_covers_pair_facts(declared_program):
+    program = _interleaving_case(declared_program)
+
+    plan_a = compile_scenario_plan(program)
+    plan_b = compile_scenario_plan(program)
+    tampered_opportunities = replace(
+        plan_a, interleaving_opportunities=plan_a.interleaving_opportunities + 1,
+    )
+    layout = plan_a.interleaving_layouts[0]
+    tampered_layout = replace(layout, partner_slot_key="forged/000000")
+    tampered_pair = replace(plan_a, interleaving_layouts=(tampered_layout,))
+
+    assert plan_a == plan_b
+    assert plan_a.digest == scenario_plan_digest(plan_a)
+    assert scenario_plan_digest(tampered_opportunities) != plan_a.digest
+    assert scenario_plan_digest(tampered_pair) != plan_a.digest
+
+
+def test_multiple_witness_fixture_changes_owner_word_across_frozen_seeds(declared_program):
+    second = 1_000_000
+    base = _offset_interleaving_case(
+        declared_program,
+        (0, 10 * second, 20 * second, 30 * second),
+        (0, 2 * second, 12 * second),
+    )
+    words = set()
+    for seed in range(8):
+        program = _rehash(replace(base, planner_seed=seed))
+        rows = []
+        for slot, _variant, events in _visible_branches(compile_scenario_plan(program)):
+            owner = "A" if slot.source_name == "trigger_source" else "B"
+            rows.extend((event.timestamp_us, owner) for event in events)
+        words.add(tuple(owner for _timestamp, owner in sorted(rows)))
+
+    assert len(words) > 1
+
+
+def test_single_event_can_be_wrapped_by_multi_event_partner(declared_program):
+    second = 1_000_000
+    program = _offset_interleaving_case(
+        declared_program, (0,), (0, 10 * second, 20 * second),
+    )
+
+    rows = []
+    for slot, _variant, events in _visible_branches(compile_scenario_plan(program)):
+        owner = "A" if slot.source_name == "trigger_source" else "B"
+        rows.extend((event.timestamp_us, owner) for event in events)
+    owners = [owner for _timestamp, owner in sorted(rows)]
+
+    assert _has_alternation(owners)
+    assert owners.count("A") == 1
+
+
+def test_two_single_event_branches_cannot_interleave(declared_program):
+    program = _offset_interleaving_case(declared_program, (0,), (0,))
+
+    with pytest.raises(ConfigError, match="cannot form a true owner interleave"):
+        compile_scenario_plan(program)
+
+
+@pytest.mark.parametrize("trigger_first", (False, True))
+def test_pure_serial_owner_words_are_rejected(declared_program, trigger_first):
+    second = 1_000_000
+    program = _offset_interleaving_case(
+        declared_program, (0, second), (0, second),
+    )
+    start = int(datetime(2026, 8, 24, 9, tzinfo=timezone.utc).timestamp() * 1_000_000)
+    hour = 3_600_000_000
+    windows = {
+        "early": CalendarWindowSpec("early", 0, ("mon",), ((9 * hour, 9 * hour + 1000),)),
+        "late": CalendarWindowSpec("late", 0, ("mon",), ((10 * hour, 10 * hour + 1000),)),
+    }
+    names = ("early", "late") if trigger_first else ("late", "early")
+    patterns = dict(program.patterns)
+    for pattern_name, window_name in zip(patterns, names):
+        pattern = patterns[pattern_name]
+        roles = (replace(pattern.roles[0], calendar_window=window_name), *pattern.roles[1:])
+        patterns[pattern_name] = replace(pattern, roles=roles)
+    timeline = replace(
+        program.timeline, timestamp_start_us=start, utc_offset_minutes=0,
+        session_max_span_us=2 * hour,
+    )
+    program = _rehash(replace(
+        program, patterns=patterns, timeline=timeline, calendar_windows=windows,
+    ))
+
+    with pytest.raises(ConfigError, match="selected interleaving pair has no feasible layout"):
+        compile_scenario_plan(program)
 
 
 def test_same_slot_variants_never_share_or_interleave_session(declared_program):
@@ -738,8 +1433,6 @@ def test_reordered_variant_with_impossible_non_target_gap_fails_planning(declare
     source = replace(source, count=1, variants=(reordered,))
     timeline = replace(
         declared_program.timeline,
-        primary_sessions=1,
-        crossed_primary_sessions=0,
         noise_events=0,
         duplicate_sequences=0,
     )
@@ -786,8 +1479,6 @@ def test_hidden_baseline_without_positive_has_independent_calendar_layout(declar
     source = replace(source, count=1, variants=(missing,))
     timeline = replace(
         declared_program.timeline,
-        primary_sessions=1,
-        crossed_primary_sessions=0,
         noise_events=0,
         duplicate_sequences=0,
     )
@@ -870,7 +1561,7 @@ def test_instruction_only_freezes_positions_without_declared_truth(instruction_p
     ]
 
 
-def test_infeasible_first_crossing_selection_tries_later_choice(declared_program):
+def test_selected_infeasible_partner_is_not_rematched(declared_program, monkeypatch):
     base = declared_program.patterns["booking_success"]
     windows = {
         "morning": CalendarWindowSpec(
@@ -889,37 +1580,54 @@ def test_infeasible_first_crossing_selection_tries_later_choice(declared_program
         return replace(base, name=name, roles=roles)
 
     patterns = {name: make_pattern(name, window) for name, window in (
-        ("morning_pattern", "morning"),
-        ("afternoon_left", "afternoon"),
-        ("afternoon_right", "afternoon"),
+        ("afternoon_trigger", "afternoon"),
+        ("morning_partner", "morning"),
+        ("afternoon_partner", "afternoon"),
     )}
     positive = declared_program.counterfactual_sets[0].variants[:1]
-    sources = tuple(CounterfactualSetSpec(f"source_{index}", name, 1, positive)
-                    for index, name in enumerate(patterns))
+    sources = (
+        CounterfactualSetSpec(
+            "trigger_source", "afternoon_trigger", 1, "trigger", positive,
+        ),
+        CounterfactualSetSpec(
+            "bad_partner", "morning_partner", 1, "partner", positive,
+        ),
+        CounterfactualSetSpec(
+            "good_partner", "afternoon_partner", 1, "partner", positive,
+        ),
+    )
     timeline = replace(
         declared_program.timeline,
-        primary_sessions=2,
-        crossed_primary_sessions=1,
         noise_events=0,
         duplicate_sequences=0,
     )
+    interleaving = InterleavingSpec(0, (
+        InterleavingPatternSpec("forced", "trigger", "partner", 1),
+    ))
     program = _rehash(replace(
         declared_program,
         planner_seed=17,
         patterns=patterns,
         counterfactual_sets=sources,
+        interleaving=interleaving,
         timeline=timeline,
         calendar_windows=windows,
+        noise=None,
     ))
-    plan = compile_scenario_plan(program)
-    sessions = defaultdict(set)
-    for slot, variant, events in _visible_branches(plan):
-        sessions[events[0].session_id].add((slot.slot_key, variant))
-    crossed = next(owners for owners in sessions.values() if len(owners) == 2)
-    assert {owner[0] for owner in crossed} == {"source_1/000000", "source_2/000000"}
+    calls = []
+
+    def fixed_random(domain, material):
+        calls.append((domain, tuple(material)))
+        return 0
+
+    monkeypatch.setattr("labelkit.operators.generation.planner.generation_random", fixed_random)
+    with pytest.raises(ConfigError, match="selected interleaving pair"):
+        compile_scenario_plan(program)
+    partner_calls = [item for item in calls if item[0] == "interleaving_partner_choice"]
+    assert len(partner_calls) == 1
 
 
-def test_zero_crossing_impossible_calendar_fails_without_retry_loop(declared_program):
+def test_standalone_impossible_calendar_fails_without_retry_loop(declared_program):
     base = declared_program.patterns["booking_success"]
     roles = tuple(replace(role, calendar_window="never" if index == 0 else None)
                   for index, role in enumerate(base.roles))
@@ -931,8 +1639,6 @@ def test_zero_crossing_impossible_calendar_fails_without_retry_loop(declared_pro
     )
     timeline = replace(
         declared_program.timeline,
-        primary_sessions=1,
-        crossed_primary_sessions=0,
         noise_events=0,
         duplicate_sequences=0,
     )
@@ -975,7 +1681,6 @@ def test_planner_maps_tampered_empty_missing_branch_to_internal_error(declared_p
     )
     timeline = replace(
         declared_program.timeline,
-        primary_sessions=1,
         noise_events=0,
         duplicate_sequences=0,
     )

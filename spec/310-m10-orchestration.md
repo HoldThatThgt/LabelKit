@@ -55,12 +55,12 @@ sequence namespace 由 run/phase/slot/attempt/stage 派生；`run_id` 与 `run_s
 | console 旁路（v1.10） | **stage 信号**：批链循环内每 stage `run()` 之前调 `metrics.stage_begin(stage.name, batch_no)`——进程内旁路仅转发 ProgressListener，不产生 TraceEvent、不入 7.2 目录（3.12.3/U11）；`_request_stop` 内加一行 `metrics.stop_requested()`（中断横幅通路）。**估算导出（U20）**：静态估算公式抽出为纯函数 `estimate_run(cfg, plan)`（`_estimate()` 改薄封装；dry-run 与渲染器批级分母共用）；live 路径在 P2-4 预扫后经 `metrics.run_estimate(...)` 发送——process 模式**复用该次 scan**（UI 模态翻 `estimate=True`，配对表零额外 I/O；文本模态仅 `console.estimate = true` 时做行数估算，U17），**禁二次 scan**；generate_only 走 3.6.2 静态公式无 scan。**dry-run 呈现（U13；v1.11/V12 修订）**：rich 档下估算四行 print 让位于渲染器表格（数值逐项一致）；plain 档行式输出为逐字节锚——`segment_calls`/`stitch_calls` 维持**无条件打印**，其中 `segment_calls` 行的含义自 v1.11 起改为**按 w_min 报预算最坏装填上界**（本表时序流行；预算未声明或 w_min ≥ window 时数值与 v1.10 逐字节不变——examples 声明保守实效窗下当时的五个黄金文件不动，V26；v1.12 起黄金文件为**七个**且因估算行插入两帧粒度键全部重采，见本表帧粒度行）。listener = None 时以上全部为 no-op（v1.9 行为逐字节一致）。 |
 | 上下文预算（v1.11，仅预算启用时） | **批边界校准冻结（V19）**：每批处理完成、下一批装填开始前调用 `self.llm.calibrator.freeze_batch()`——聚合本批图片成本样本的 max（对无序集取 max，序无关）压入批最大值窗口、刷新可读快照（第 N 批装填只读 < N 批的聚合值，确定性护栏——批序串行 ⇒ 同输入同配置可复现；校准器由 `LLMClient` 自持，公开面 `llm.calibrator`，3.9）。**启动期预算 INFO 行（V13①）**：M10 于运行起点打印预算参数（如 `segment: w_min=6 window=20 (budget)`——数据无关、仅计数与参数；归属 M10 启动段而非 loader——加载期 logging 尚未按 CLI 覆盖定级，7.1）。**报表汇总**：finalize 时组装 `report.budget = {profiles, w_min, truncations, overflow_records, image_cost, degrade_retries, escalations}`（counts-only 键义见 6.4；truncations 由各算子逐裁剪点计数、overflow_records 按 7.6 词表归集、image_cost/degrade_retries/escalations 为 V17 三层的校准终值与反应频度对账，V13②⑤）+ `report.stream.windows`（segment 实际窗数，M14 属主计数、随 stream 节落盘——供用户对账 V12 上界估算，V13④，6.4）。 |
 | 帧粒度（v1.12） | **组链或门（裁决·组链双门）**：factory（`build_stages`）以**或门** `classify.enabled ∨ frame_classify.enabled` 决定 ClassifyStage 进链（链序与槽位不变——仅帧级开启时 ClassifyStage 仍须进链执行帧 pass；组链的 classify 槽位判定与该或门同口径）；stage 内序列级判决单独受 `classify.enabled` 门控——仅帧级开启时序列记录不产生 Classification、`_meta.classification` 维持 null（3.13.7）。**estimate_run 两键**：`frame_classify_calls` / `frame_annotate_calls` = **粗上界 = 预扫描帧总数 Σ session_lens**（数据源与 `segment_calls` 完全同源，复用同一次预扫描；帧分类实际按窗批量、帧标注跳过噪声成员与跳过类，实际调用数均 ≤ 帧总数）；对应开关关闭 ⇒ 0（帧粒度要求流模式（3.1.4），非流分支恒 0）；`total_calls` 扩项；**键序冻结**——`frame_classify_calls` 紧跟 `classify_calls`、`frame_annotate_calls` 紧跟 `annotate_calls`（返回键表冻结注释同步，CONTRACTS §7.13）。**dry-run 估算行改写**：估算行（stderr 第 2 行）按冻结键序插入两键，**无条件打印**（非流工程恒 = 0，v1.9 `stitch_calls` 先例）——是**改第 2 行**而非加行：五个既有 dry-run golden 重采 + `examples/mix` 主/姊妹双工程的 `dryrun-mix.txt` / `dryrun-mix-text.txt` 两个新 golden，共**七个**（7.8 回归锚，`tests/cli/goldens/`）。 |
-| v1.20 sequence 精确交付 | `generate.form = "sequence"` 时，generate_only 分支在 M1 冻结 `SequenceGenerationConfig` 后调用唯一 `compile_generation_program` 与 `compile_scenario_plan`，再由 `SequenceWorkflow` 调用 `deliver_generation`；不进入 `GenerateStage` 或 `ProcessWorkflow._process_batch`。M10 负责候选缓冲、attempt transaction、声明序短提交、时间/区间 frontier、运行终态和 M11 commit，不实现 compiler/planner 算法。classify 与 frame.classify 判定 stage 静态关闭，projector 写 inherited Classification；frame.annotate 由 attempt-local 协作者执行。 |
+| v1.21 sequence 精确交付 | `generate.form = "sequence"` 时，generate_only 分支在 M1 冻结含 `InterleavingSpec` 的 `SequenceGenerationConfig` 后调用唯一 `compile_generation_program` 与 `compile_scenario_plan`，再由 `SequenceWorkflow` 调用 `deliver_generation`；不进入 `GenerateStage` 或 `ProcessWorkflow._process_batch`。program/plan 在凭据物化和任何 LLM 前冻结，其中包含交织 opportunity、pattern、partner、共享 session 布局与派生计数。M10 负责候选缓冲、attempt transaction、声明序短提交、时间/区间 frontier、运行终态和 M11 commit，不实现 compiler/planner 算法、不重抽交织事实。classify 与 frame.classify 判定 stage 静态关闭，projector 写 inherited Classification；frame.annotate 由 attempt-local 协作者执行。 |
 
 图 3-6 sequence slot attempt 与交付状态机。多个 slot 可以同时处于 attempt、生成、评估、下游或已准备状态；
 只有声明序 head 能进入最终重验证与 commit，recoverable rejection 在原 slot 启动下一 attempt。
 
-#### v1.20 sequence 候选缓冲
+#### v1.21 sequence 候选缓冲
 
 primary 与 noise 各有一个阶段。每个阶段的候选缓冲容量等于该阶段引用的不同 `ResourceKey` 容量之和，
 再钳制到剩余 slot 数。候选缓冲始终是从 `next_commit` 开始的连续声明序区间：
@@ -222,7 +222,7 @@ program、plan、paths、run attempt ID 与 run ID，不复制 config 或 materi
 | 最终 full CrossView 内部错误 | 否 | 否 | 4 | commit 前不替换 | `failed_slot=null`、`attempts_used=0` |
 | 配置、hook、catalog、路径错误 | 否 | 否 | 2 | 不替换 | 不写 |
 | 输出目录或 `.part` 运行期不可写 | 否 | 否 | 4 | 不替换 | 尝试同目录写；仍不可写时只记英文 stderr kind |
-| planner INFEASIBLE | 否 | 否 | 2 | 不替换 | 原子写 |
+| planner INFEASIBLE（含已选 pair 无可行布局） | 否 | 否 | 2 | 不替换 | 原子写 |
 | planner FEASIBLE/UNKNOWN budget 或 MODEL_INVALID | 否 | 否 | 4 | 不替换 | 原子写 |
 | commit-I/O 失败 | 否 | 否 | 4 | 可能已替换 main/stream/report 子集，旧 manifest 不变 | best-effort 原子写 |
 | failed-report I/O 失败 | 否 | 否 | 不改主退出码 | 不改 | stderr 记录英文 kind |
@@ -243,7 +243,8 @@ int.from_bytes(
 不得使用 Python `hash()` 或自行拼接字符串。重试可以改变 LLM seed 世界、intent、patch 与措辞；
 catalog 行不变。
 pattern、variant、role/position、全部计划时间、duration、resources、containment、session、noise source、
-replay source 与 replay shift 永不变化。普通内容/结构拒绝消耗 attempt；四类 run-terminal 异常必须原样穿透，
+replay source、replay shift、interleaving opportunity/pattern/partner/layout 与派生 session 计数永不变化。
+普通内容/结构拒绝消耗 attempt；四类 run-terminal 异常必须原样穿透，
 不消耗 attempt。
 任一 slot 耗尽立即停止接纳并抛 `DeliveryError(sequence_delivery_exhausted)`；不交付已接受前缀。
 
@@ -260,8 +261,15 @@ catalog seed 调用为零，protected prefix 复用 `EventDraft` 语义字段，
 block allocator 与 ScenarioPlan 计算一个成功 attempt 的逻辑下界和
 `max_slot_attempts` 上界，不含 M9 provider retry；不能另建近似 planner。
 
-report 的唯一块是 `report.generate.sequence`，包含 run/program/plan/delivery identity、planned/delivered set
-与 sequence、event/session/noise/replay 精确数量、调用族、按 pattern 交付计数和冻结 rejected_attempts 闭集。
+静态 estimate 与成功 report 的唯一序列块是 `generate.sequence`，包含 run/program/plan/delivery identity、planned/delivered set
+与 sequence、event/session/noise/replay 精确数量、调用族、按 sequence pattern 交付计数和冻结 rejected_attempts 闭集。
+在 `program_digest` 后立即输出 `plan_digest`，并输出 `interleaving_opportunities`、
+`primary_sessions`、`interleaved_primary_sessions` 与 `by_interleaving_pattern`。设可见 primary branch 为 N、
+冻结交织布局为 D，则 `primary_sessions=N-D`、`interleaved_primary_sessions=D`。named pattern map
+按 TOML 声明序保留，包含零 selected pattern，每项只含 `eligible_opportunities` 与
+`selected_sessions`。disabled 与 instruction-only 固定输出零 opportunity、零 interleaved session 与空 map。
+交织不改变 planned/delivered set、sequence、event、stream row、LLM call、noise 或 replay 计数。report 不输出
+slot identity、逐 pair owner word、payload、prompt、state 或 API key。
 任何 attempt 只记最终停止边界一个 rejection bucket。旧的流配额、档位、概要/逐位实现、幸存/shortfall 与
 partial delivery 统计均不出现。
 

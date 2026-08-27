@@ -491,9 +491,7 @@ def test_hidden_baseline_without_optional_positive_has_no_outcome_schema(declare
         source,
         variants=tuple(item for item in source.variants if item.kind != "positive"),
     )
-    timeline = replace(
-        declared_program.timeline, primary_sessions=6, duplicate_sequences=0,
-    )
+    timeline = replace(declared_program.timeline, duplicate_sequences=0)
     program = _rehash(replace(
         declared_program, counterfactual_sets=(without_positive,), timeline=timeline,
     ))

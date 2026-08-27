@@ -109,7 +109,7 @@ stream 每行顶层固定为 `payload` 与 `_meta`。primary event 的核心形�
 }
 ```
 
-同一 owner 的事件按声明顺序留在 main 的 members 中；整个 stream 按最终 timestamp 全局稳定排序，因此 crossing
+同一 owner 的事件按声明顺序留在 main 的 members 中；整个 stream 按最终 timestamp 全局稳定排序，因此交织 session
 可以呈现真实的 A-B-A 或 B-A-B。`_meta.event.timestamp` 是权威起点；descriptor 中声明的 payload 业务时间由
 框架按同一计划机械写入。模型不会生成这些时间叶子，M11 也只复验而不修复。
 
@@ -188,24 +188,33 @@ commit-I/O 失败可能已经替换了 main、stream、report 的子集，但旧
 | `replay_events` | `3` |
 | `stream_rows` | `27`，即 `22 + 2 + 3` |
 | `delivered_sets` / `delivered_sequences` | live 成功后分别严格等于 planned 值 |
-| session / crossing / replay-session fields | 与冻结 plan、stream provenance 和 manifest 对账 |
+| `program_digest` / `plan_digest` | 分别绑定编译后的配置语义与冻结 ScenarioPlan |
+| `interleaving_opportunities` | 主例为 `0`；一般语义是 trigger 扫描时至少有一个可用 partner pool 的抽取次数 |
+| `primary_sessions` | 主例为 `8`；一般满足 `N - D`，其中 `N` 是可见 primary branch 数、`D` 是冻结交织布局数 |
+| `interleaved_primary_sessions` | 主例为 `0`；一般等于 `D`，一条交织布局形成一个双 owner session |
+| `by_interleaving_pattern` | 主例为 `{}`；启用时按 TOML 声明序列出每个 pattern 的 eligible/selected 计数 |
 
 完整 block 还包含：
 
-- `run_attempt_id`、`run_id`、`delivery_digest`、`program_digest` 与 `artifacts_committed`；
+- `run_attempt_id`、`run_id`、`delivery_digest`、`program_digest`、`plan_digest` 与 `artifacts_committed`；
 - `sequence_slot_attempts` 与 `noise_slot_attempts`；
 - `sequence_calls`：scenario seed、baseline/variant event plan、frame render、semantic evaluation、noise render/evaluation；
 - `by_pattern`：每个 variant 的 planned/delivered；
 - 冻结闭集 `rejected_attempts`：每个失败 attempt 只进入最终停止边界对应的一个桶；
 - 顶层 `llm_usage`：按 profile 统计物理 calls、prompt/completion tokens 与 retries。
 
+`9:1` 权重表示每个仍有 partner 的机会里 standalone 与该 pattern 分别占 9 张票和 1 张票，不表示最终恰有
+10% 的 session 被交织。partner pool 耗尽后分母会改变。report 只记录机会与汇总计数，不输出 pair identity、
+owner word、payload、prompt、state 或 API key；需要核对真实 owner word 时，从最终 stream 的 session 与 timestamp
+机械推导。
+
 逻辑 family 调用次数会包含失败 attempt，但同一入口内部的 L3 repair 或 provider retry 不会重复计为新的 family call。
 它们分别进入 schema repair/trace 与 provider usage 账。
 
-最终 DeepSeek 教学主例中，default profile 为 38 calls、34470 prompt tokens、2511 completion tokens；judge profile
+历史 v1.18 DeepSeek 教学主例中，default profile 为 38 calls、34470 prompt tokens、2511 completion tokens；judge profile
 为 10 calls、9541 prompt tokens、484 completion tokens；两者 retries 都为 0。2 个 sets、8 条 sequence 与
 27 行 stream 的 planned/delivered 逐项相等，delivery digest 为
-`269089200ba4cbe62e41229d3921625341f902179f57cf2e0b95722aa23c8a76`。
+`269089200ba4cbe62e41229d3921625341f902179f57cf2e0b95722aa23c8a76`。这是历史端点证据，不是 v1.21 交织门。
 
 ## 8.7 failed report
 

@@ -1,7 +1,8 @@
 # LabelKit 用户手册
 
 > 这本手册按用户任务组织：先跑通普通流水线，再按需要进入流处理、平面生成或序列生成。
-> 当前序列生成契约以 v1.20 为准；业务时间由 Planner 与框架机械写入，旧 stream、配置没有 alias、migration 或 fallback。
+> 当前序列生成契约以 v1.21 为准；用户声明短 candidate set、命名 interleaving pattern 与整数权重，Planner
+> 在内容调用前冻结配对和保序交织。业务时间仍由 Planner 与框架机械写入，旧 stream、配置没有 alias、migration 或 fallback。
 
 ## 怎么读
 

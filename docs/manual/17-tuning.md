@@ -35,6 +35,10 @@ Schema repair 或失败 attempt 的 whole-set 重跑。事后同时看 `report.g
 `llm_usage`：前者是逻辑入口，后者是物理请求/token。控成本优先减少 counterfactual set 或 instruction-only
 count，其次减少 pattern roles/sequence length；不要通过放宽验证或只补单条 variant 降成本。
 
+交织本身不增加 sequence、event 或 LLM call 数，只改变 positive branch 的 session 与 timestamp。`9:1` 是每次
+opportunity 的整数票，不是需要靠扩大样本追平的配额；不要为了“凑到 10%”重跑。抽中的 pair 若布局不可行会在
+凭据物化前 fail closed，也不会用另一个 partner 偷偷替换，因此先用 validate/dry-run 检查 plan digest 和交织汇总。
+
 **先验预算**：`--dry-run` 直接给出估算调用数（不含修复与重试）。**后验核账**：报告 `llm_usage` 分 profile 给出 calls / tokens / retries，配了单价还有 `est_cost_usd`。
 
 省钱抓手按性价比排序：
@@ -79,9 +83,12 @@ v1.19 性能证据。
 | 图像字节 | **不常驻** | 接入算 id、去重算 pHash、构造请求时各读一次，用完即弃（第 5 章） |
 | sequence final rows | 受 `record_units` / `stream_rows` 500000 与 retained 536870912 bytes 双上限约束 | retained 是 main+stream canonical UTF-8 紧凑核算，不是 512 MiB 物理预分配 |
 | sequence candidate buffer | 数量不超过本阶段不同 ResourceKey 容量之和并钳制到剩余槽位 | `candidate_bytes_high_water` 只观测已完成候选 canonical bytes；六百候选不等于任意 Schema 下有 RSS 硬保证 |
+| sequence interleaving | partner pool 与 positive branch 线性增长 | 匹配不构造 trigger × partner matrix；只为实际选中的 pair 建布局约束 |
 
 普通输入超过 50 万条的正确姿势是切分多次运行。sequence plan 超过上限会在 compile 阶段直接失败，不能分批
 破坏精确时间线。已验证的 500000 record-unit planner probe 为 16.889 秒，peak RSS 839221248 bytes。
+v1.21 交织规模门另用 600 个 positive branch、300 个强制 pair 检查 wall time、peak RSS 与 plan digest；它验证
+Planner 的线性匹配边界，不代表外部端点能够并发处理 600 个请求。
 
 ## 17.4 可靠性参数的配合
 

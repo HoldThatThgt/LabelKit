@@ -4,7 +4,6 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, fields
-from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Mapping
@@ -149,7 +148,26 @@ class CounterfactualSetSpec(_ImmutableConfig):
     name: str                                     # 全局唯一 set 名
     pattern: str                                  # 引用的 pattern 名
     count: int                                    # 精确场景数量
+    interleaving_candidate_set: str | None        # 可选交织候选集标签
     variants: tuple[VariantSpec, ...]             # 声明序变体表
+
+
+@dataclass(frozen=True)
+class InterleavingPatternSpec(_ImmutableConfig):
+    """一个命名 trigger/partner 候选关系与整数触发权重。"""
+
+    name: str                                     # 全局唯一 pattern 名
+    trigger_candidate_set: str                    # 接受交织抽取的候选集
+    partner_candidate_set: str                    # 共享不放回池的候选集
+    trigger_weight: int                           # 选择本 pattern 的正整数权重
+
+
+@dataclass(frozen=True)
+class InterleavingSpec(_ImmutableConfig):
+    """一次运行的 standalone 权重与声明序交织 pattern。"""
+
+    no_interleaving_weight: int                   # 选择 standalone 的非负整数权重
+    patterns: tuple[InterleavingPatternSpec, ...] # TOML 声明序 pattern
 
 
 @dataclass(frozen=True)
@@ -166,13 +184,11 @@ class InstructionOnlySpec(_ImmutableConfig):
 
 @dataclass(frozen=True)
 class TimelineSpec(_ImmutableConfig):
-    """冻结整数时间线与精确交付基数。"""
+    """冻结整数时间线、session 容量与附加事件基数。"""
 
     timestamp_start_us: int                       # 带固定 offset 的起始 epoch 微秒
     utc_offset_minutes: int                       # 起始时间固定 UTC offset
     event_gap_us: tuple[int, int]                 # instruction/noise/replay 间隔闭区间
-    primary_sessions: int                         # primary session 精确数
-    crossed_primary_sessions: int                 # 双 owner session 精确数
     session_max_events: int                       # 单 session 事件容量
     session_max_span_us: int                      # 单 session 最大跨度微秒
     session_gap_us: int                           # session 起点间隔微秒
@@ -222,7 +238,7 @@ class GenerationLimits(_ImmutableConfig):
 
 @dataclass(frozen=True)
 class SequenceGenerationConfig(_ImmutableConfig):
-    """冻结的 v1.18 sequence-only 解析产物；flat generation 时不存在。"""
+    """冻结的 v1.21 sequence-only 解析产物；flat generation 时不存在。"""
 
     mode: Literal["declared", "instruction_only"]  # 唯一生成模式
     semantic_profile: str                         # 生成与渲染 profile
@@ -232,6 +248,7 @@ class SequenceGenerationConfig(_ImmutableConfig):
     patterns: tuple[SequencePattern, ...]         # declared pattern 表
     counterfactual_sets: tuple[CounterfactualSetSpec, ...]  # declared set 表
     instruction_only: tuple[InstructionOnlySpec, ...]  # instruction-only 表
+    interleaving: InterleavingSpec | None         # 可选交织配置
     timeline: TimelineSpec                        # 完整时间线声明
     calendar_windows: Mapping[str, CalendarWindowSpec]  # 窗口名到冻结窗口
     noise: NoiseSpec | None                       # 可选 noise 声明
@@ -865,10 +882,22 @@ def _parse_set(state: _ParseState, row: Mapping[str, object], index: int,
     @return 冻结 set 配置
     """
     location = f"[[generate.counterfactual_sets]][{index}]"
-    _check_keys(state, row, frozenset({"name", "pattern", "count", "variants"}), location)
+    _check_keys(
+        state,
+        row,
+        frozenset({"name", "pattern", "count", "interleaving_candidate_set", "variants"}),
+        location,
+    )
     name = _name(state, row.get("name"), f"{location}.name")
     pattern_name = _name(state, row.get("pattern"), f"{location}.pattern")
     count = _integer(state, row, "count", f"{location}.count", 1)
+    candidate = None
+    if "interleaving_candidate_set" in row:
+        candidate = _name(
+            state,
+            row.get("interleaving_candidate_set"),
+            f"{location}.interleaving_candidate_set",
+        )
     variants_raw = _rows(state, row, "variants", f"{location}.variants")
     variants = tuple(_parse_variant(state, item, f"{location}.variants[{item_index}]",
                                     patterns.get(pattern_name))
@@ -881,7 +910,7 @@ def _parse_set(state: _ParseState, row: Mapping[str, object], index: int,
     signatures = tuple(json.dumps(dict(item.expected_violation), sort_keys=True) for item in variants)
     if _duplicates(signatures):
         _error(state, f"{location}.variants", "expected violation signatures must be unique")
-    return CounterfactualSetSpec(name, pattern_name, count, variants)
+    return CounterfactualSetSpec(name, pattern_name, count, candidate, variants)
 
 
 def _parse_sets(state: _ParseState,
@@ -953,86 +982,6 @@ def _parse_instruction_only(state: _ParseState) -> tuple[InstructionOnlySpec, ..
     if _duplicates(names):
         _error(state, "[[generate.instruction_only]]", f"duplicate names: {_duplicates(names)!r}")
     return tuple(out)
-
-
-def _timestamp(state: _ParseState, value: object,
-               location: str) -> tuple[int, int]:
-    """解析带固定 offset 的 ISO-8601 时间。
-
-    @param state 当前解析状态
-    @param value 原始值
-    @param location 键定位
-    @return epoch 微秒与 offset 分钟
-    """
-    if not isinstance(value, str):
-        _error(state, location, f"expected ISO-8601 string with offset, got {_fmt(value)}")
-        return 0, 0
-    try:
-        parsed = datetime.fromisoformat(value)
-    except ValueError:
-        _error(state, location, f"expected ISO-8601 string with offset, got {_fmt(value)}")
-        return 0, 0
-    offset = parsed.utcoffset()
-    if parsed.tzinfo is None or offset is None:
-        _error(state, location, "timestamp must include a fixed UTC offset")
-        return 0, 0
-    epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    try:
-        delta = parsed.astimezone(timezone.utc) - epoch
-    except (OverflowError, ValueError):
-        _error(state, location, "timestamp is outside the supported UTC range")
-        return 0, 0
-    micros = delta.days * 86_400_000_000 + delta.seconds * 1_000_000 + delta.microseconds
-    return micros, int(offset.total_seconds() // 60)
-
-
-def _pair_us(state: _ParseState, value: object, location: str) -> tuple[int, int]:
-    """解析非负秒数闭区间。
-
-    @param state 当前解析状态
-    @param value 原始二元素数组
-    @param location 键定位
-    @return 整数微秒闭区间
-    """
-    if not isinstance(value, list) or len(value) != 2:
-        _error(state, location, f"expected two-number array, got {_fmt(value)}")
-        return 0, 0
-    low = _seconds_us(state, value[0], f"{location}[1]", False)
-    high = _seconds_us(state, value[1], f"{location}[2]", False)
-    if low > high:
-        _error(state, location, "range lower bound must be <= upper bound")
-    return low, high
-
-
-def _parse_timeline(state: _ParseState) -> TimelineSpec:
-    """解析完整 timeline 表。
-
-    @param state 当前解析状态
-    @return 冻结时间线载体
-    """
-    row = _table(state, state.generate, "timeline", "[generate.timeline]")
-    _check_keys(state, row, frozenset({
-        "timestamp_start", "event_gap_s", "primary_sessions", "crossed_primary_sessions",
-        "session_max_events", "session_max_span_s", "session_gap_s", "noise_events",
-        "duplicate_sequences",
-    }), "[generate.timeline]")
-    timestamp, offset = _timestamp(state, row.get("timestamp_start"),
-                                   "[generate.timeline].timestamp_start")
-    gap = _pair_us(state, row.get("event_gap_s"), "[generate.timeline].event_gap_s")
-    primary = _integer(state, row, "primary_sessions", "[generate.timeline].primary_sessions", 1)
-    crossed = _integer(state, row, "crossed_primary_sessions",
-                       "[generate.timeline].crossed_primary_sessions", 0)
-    max_events = _integer(state, row, "session_max_events",
-                          "[generate.timeline].session_max_events", 1)
-    max_span = _seconds_us(state, row.get("session_max_span_s"),
-                           "[generate.timeline].session_max_span_s", True)
-    session_gap = _seconds_us(state, row.get("session_gap_s"),
-                              "[generate.timeline].session_gap_s", True)
-    noise = _integer(state, row, "noise_events", "[generate.timeline].noise_events", 0)
-    duplicate = _integer(state, row, "duplicate_sequences",
-                         "[generate.timeline].duplicate_sequences", 0)
-    return TimelineSpec(timestamp, offset, gap, primary, crossed, max_events,
-                        max_span, session_gap, noise, duplicate)
 
 
 def _offset_minutes(state: _ParseState, value: object, location: str) -> int:
@@ -1378,73 +1327,6 @@ def _check_variant_targets(state: _ParseState, patterns: tuple[SequencePattern, 
                 if before is not None and after is not None and before.frame_class == after.frame_class:
                     _error(state, f"[[generate.counterfactual_sets]].{variant.name}",
                            "reordered target roles must have different frame classes")
-
-
-def _declared_counts(patterns: tuple[SequencePattern, ...],
-                     sets: tuple[CounterfactualSetSpec, ...], duplicates: int) -> tuple[int, int, int]:
-    """计算 declared primary sequence/event 与 replay event 数。
-
-    @param patterns pattern 表
-    @param sets counterfactual set 表
-    @param duplicates replay sequence 数
-    @return primary sequences、primary events、replay events
-    """
-    pattern_map = {item.name: item for item in patterns}
-    sequences = 0
-    events = 0
-    positive_lengths: list[int] = []
-    for group in sets:
-        pattern = pattern_map.get(group.pattern)
-        if pattern is None:
-            continue
-        sequences += group.count * len(group.variants)
-        for variant in group.variants:
-            length = len(pattern.roles) - (1 if variant.kind == "missing" else 0)
-            events += group.count * length
-            if variant.kind == "positive":
-                positive_lengths.extend([length] * group.count)
-    replay = sum(positive_lengths[:duplicates])
-    return sequences, events, replay
-
-
-def _check_timeline_counts(state: _ParseState, config: SequenceGenerationConfig) -> None:
-    """校验 timeline 精确基数、noise/replay 与静态容量上限。
-
-    @param state 当前解析状态
-    @param config 完整 sequence 配置
-    """
-    timeline = config.timeline
-    if config.mode == "declared":
-        sequences, events, replay = _declared_counts(
-            config.patterns, config.counterfactual_sets, timeline.duplicate_sequences)
-        positive = sum(group.count for group in config.counterfactual_sets
-                       if any(item.kind == "positive" for item in group.variants))
-        if timeline.duplicate_sequences > positive:
-            _error(state, "[generate.timeline].duplicate_sequences",
-                   "not enough positive primary sources for replay")
-    else:
-        sequences = sum(item.count for item in config.instruction_only)
-        events = sum(item.count * item.len_range[0] for item in config.instruction_only)
-        replay = 0
-        if timeline.crossed_primary_sessions != 0 or timeline.duplicate_sequences != 0:
-            _error(state, "[generate.timeline]",
-                   "instruction_only requires zero crossing and duplicate sequences")
-    if timeline.primary_sessions != sequences - timeline.crossed_primary_sessions:
-        _error(state, "[generate.timeline].primary_sessions",
-               "must equal primary sequence total minus crossed_primary_sessions")
-    if (timeline.noise_events > 0) != (config.noise is not None):
-        _error(state, "[generate.noise]", "noise table must be present iff noise_events > 0")
-    if config.noise is not None and len(config.noise.topics) != timeline.noise_events:
-        _error(
-            state, "[generate.noise].topics",
-            "topic count must equal generate.timeline.noise_events",
-        )
-    stream_rows = events + timeline.noise_events + replay
-    record_units = sequences + stream_rows
-    if not 1 <= stream_rows <= config.limits.stream_rows:
-        _error(state, "[generate]", "derived stream_rows must be in 1..500000")
-    if not 1 <= record_units <= config.limits.record_units:
-        _error(state, "[generate]", "derived record_units must be in 1..500000")
 
 
 def _check_gap_shell(state: _ParseState, patterns: tuple[SequencePattern, ...]) -> None:
@@ -1956,12 +1838,14 @@ def parse_generation_config(
     raw_project: Mapping[str, object],
     context: "GenerationParseContext",
 ) -> SequenceGenerationConfig:
-    """解析 v1.18 序列配置并聚合全部配置错误。
+    """解析 v1.21 序列配置并聚合全部配置错误。
 
     @param raw_project 原始项目配置
     @param context 配置解析所需的冻结上下文
     @return 完整校验后的序列生成配置
     """
+    from labelkit.common.config import _sequence_layout as layout
+
     raw_generate = raw_project.get("generate")
     generate = raw_generate if isinstance(raw_generate, Mapping) else {}
     state = _ParseState(raw_project, context, generate, GenerationLimits())
@@ -1983,7 +1867,8 @@ def parse_generation_config(
     windows = _parse_windows(state)
     config = SequenceGenerationConfig(
         mode_value, semantic, evaluation, attempts, _parse_state_hook(state), patterns,
-        sets, instructions, _parse_timeline(state), windows, _parse_noise(state), state.limits,
+        sets, instructions, layout.parse_interleaving(state), layout.parse_timeline(state),
+        windows, _parse_noise(state), state.limits,
     )
     _check_mode(state, mode_value, patterns, sets, instructions)
     _check_references(state, patterns, instructions, windows)
@@ -1992,7 +1877,7 @@ def parse_generation_config(
     _check_variant_targets(state, patterns, sets)
     check_sequence_temporal_contract(state, patterns, config)
     _check_gap_shell(state, patterns)
-    _check_timeline_counts(state, config)
+    layout.validate_sequence_layout(state, config)
     from labelkit.common.config._generation_budget import check_generation_content_limits
     check_generation_content_limits(state, config)
     _check_context_budget(state, config)

@@ -230,8 +230,6 @@ outcome_schema_path = "schemas/outcome-timeout.json"
 [generate.timeline]
 timestamp_start = "2026-01-05T09:00:00+08:00"
 event_gap_s = [5, 60]
-primary_sessions = 8
-crossed_primary_sessions = 0
 session_max_events = 8
 session_max_span_s = 3600
 session_gap_s = 3600

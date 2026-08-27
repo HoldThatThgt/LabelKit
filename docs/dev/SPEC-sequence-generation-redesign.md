@@ -1,11 +1,12 @@
-# LabelKit v1.20 序列生成真值与执行规格
+# LabelKit v1.21 序列生成真值与执行规格
 
 > 状态：实现规格，字段、术语、边界与完成门已冻结<br>
-> 日期：2026-08-26<br>
-> 实施基线：main 已合入 feat/v1.17-scenario-planning，基线提交 2138de2<br>
+> 日期：2026-08-27<br>
+> 实施基线：8fafbd1830e52c378b6f48a0d48aa8fd318545ab<br>
 > 替换范围：一次性删除 v1.13–v1.17 的全部序列生成专用面<br>
 > 破坏边界：旧配置、内部接口、随机数消费、提示词、报表、真值和时间流工件全部删除<br>
-> 设计来源：PROPOSAL-sequence-generation-redesign.md，经语义、代码亲和性、示例与 E2E 三路审查修订
+> 设计来源：PROPOSAL-sequence-generation-redesign.md 与 SPEC-sequence-interleaving.md，经语义、代码亲和性、
+> 示例与 E2E 三路审查修订
 
 ## 1. 交付结论
 
@@ -14,6 +15,9 @@ v1.18 把序列生成从 brief、realize、tier 和 weave 链路替换为一条�
 v1.19 把完整昂贵 attempt 改为有界跨槽并发准备，只在声明序无 `await` 临界区修改 dedup、CrossView frontier、
 retained-content 与 DeliveryState。v1.20 再把业务时间统一收归 ScenarioPlanner：模型只生成 model Schema 中的非时间字段，
 框架机械注入完整 Schema 声明的业务时间，并把 primary 与其 replay 放入同一个 checked delta 和原子提交。
+v1.21 删除用户声明的 session cardinality，改由短 interleaving candidate set、named interleaving pattern
+与整数 trigger weight 驱动计划期抽取；具体 pair、owner word、timestamp 与 session 仍由 ScenarioPlanner 在任何
+凭据或 LLM 调用前唯一冻结。
 
 ~~~mermaid
 flowchart LR
@@ -36,6 +40,7 @@ flowchart LR
 - JSON Patch 在副本上原子执行；每一步经过基础状态 Schema、可选前置 Schema 和可选 state validator。
 - PatternEvaluator 从最终事件重新绑定实际角色，不读取 planner 的角色 witness。
 - 任一变体在生成、判定、dedup、quality、annotate 或 verify 失败时，整个集合从场景种子开始重试。
+- 交织只作用于不同 candidate set 的 positive branch；两条 branch 仍有独立世界状态、attempt 与 ordered commit。
 - 尝试耗尽时不替换主输出、时间流、成功 report 或成功 manifest。
 - instruction-only 是独立模式，不声明结构证明，不是 declared 失败后的降级路径。
 
@@ -136,6 +141,13 @@ duration、resources、time binding descriptor 和顺序与 source 相同；payl
 | delivery slot | 一个 counterfactual set 与 scenario_index 的精确提交单位 |
 | primary sequence | 进入主输出、拥有独立 world_branch_id 的序列 |
 | replay sequence | 只进入时间流、保留 source 非时间内容与区间形状并按统一常量平移后机械重绑时间的重发 |
+| interleaving candidate set | counterfactual set 上的短标签；只收集该声明展开出的 positive branch |
+| interleaving pattern | 一个命名的 trigger candidate set、partner candidate set 与 trigger weight |
+| trigger branch | 按 DeliverySlot 声明序接受一次交织抽取的 positive branch |
+| partner pool | 一个 partner candidate set 尚未消费的全部 positive branch |
+| interleaving opportunity | 当前 trigger 至少有一个 partner pool 非空的 pattern 时发生的一次抽取 |
+| interleaving layout | 已冻结 pattern、trigger branch、partner branch 及其共享 session 时间布局 |
+| owner word | 把共享 session 按 timestamp 排序后得到的 branch owner 序列；仅由 plan blocks 派生 |
 
 不使用 tier、grade、blueprint、brief、realize、survivor、干扰序列或复杂事件处理等名称指代上述对象。
 
@@ -407,6 +419,8 @@ outcome_schema_path = "schemas/outcome-timeout.json"
 
 count 是 counterfactual set 数，不是尝试数。每个 set 至少一个 variant；variant name 和预期违规签名均须唯一。
 每个 variant 必须有 outcome_schema_path。positive 可以缺省，但 hidden baseline 始终存在。
+`interleaving_candidate_set` 是可选的 `[a-z0-9_]+` 短标签；声明后，该 set 展开的全部 slot 必须恰有一个
+positive variant，只有这些 positive branch 能进入对应候选集。标签精确匹配，不支持 glob、regex、前缀、列表或 DSL。
 
 | kind | 结构变换 | 唯一预期违规 |
 |---|---|---|
@@ -440,14 +454,47 @@ instruction-only 不允许 pattern、counterfactual_sets、role permission、out
 每个 attempt 固定调用 ScenarioSeedGenerator；它使用 instruction 与可选 state Schema 生成完整 ScenarioSeed，
 不支持 catalog source。EventPlanner 可读完整 current state，但 actor 必须来自该 seed 的 actors。
 
-### 5.8 timeline、calendar 与 noise
+### 5.8 interleaving
+
+~~~toml
+[[generate.counterfactual_sets]]
+name = "food_order"
+pattern = "food_order"
+count = 1
+interleaving_candidate_set = "food_dinner"
+
+[[generate.counterfactual_sets]]
+name = "entertainment_habit"
+pattern = "entertainment_habit"
+count = 8
+interleaving_candidate_set = "entertainment"
+
+[generate.interleaving]
+no_interleaving_weight = 9
+
+[generate.interleaving.pattern.food_with_entertainment]
+trigger_candidate_set = "food_dinner"
+partner_candidate_set = "entertainment"
+trigger_weight = 1
+~~~
+
+交织能力的唯一关闭形式是 `[generate.interleaving]` 与全部 `interleaving_candidate_set` 同时不存在。
+开启时至少声明一个 named pattern；pattern name、trigger/partner candidate set 都使用 `[a-z0-9_]+`，
+trigger 与 partner 必须不同。`no_interleaving_weight` 是非负 TOML int64，`trigger_weight` 是正 TOML int64；
+一个 opportunity 的总权重不得超过 `2^63-1`。一个 candidate set 不能同时承担 trigger 与 partner 角色，
+每个已声明 candidate set 必须被 pattern 引用，且每个引用必须有成员。一个 trigger 或 partner candidate set
+可被多个 pattern 引用；共享 partner pool 中的任一 positive branch 全局至多使用一次。
+
+交织只允许 declared sequence mode。flat 与 instruction-only 禁止交织章节和候选标签；instruction-only report
+固定输出零 opportunity、零 interleaved primary session 与空 pattern map。没有 `kind` 或用户提交的 owner
+word/selector 语法；v1.21 唯一语义是保持两条 branch 内部事实，并形成至少三个 maximal owner runs。
+
+### 5.9 timeline、calendar 与 noise
 
 ~~~toml
 [generate.timeline]
 timestamp_start = "2026-01-05T09:00:00+08:00"
 event_gap_s = [5, 60]
-primary_sessions = 8
-crossed_primary_sessions = 0
 session_max_events = 16
 session_max_span_s = 3600
 session_gap_s = 3600
@@ -469,16 +516,17 @@ role 可用 calendar_window = service_hours 引用命名窗口。窗口使用固
 event_gap_s 只约束 instruction-only 相邻位置和 noise 铺设间隔；declared role 间隔只由 pattern.gaps
 与 max_span 决定，不能用 event_gap_s 意外收窄超时变体。
 
-设 primary sequence 总数为 N，crossed_primary_sessions 为 D，则 primary_sessions 必须等于 N - D。
-每个 primary session 恰有一个或两个不同 counterfactual set 的 owner；同一个 set 的不同 variant 永不共 session。
-每个 replay sequence 独占一个尾部 session。
+`primary_sessions` 与 `crossed_primary_sessions` 已从用户配置删除；出现任一旧键都以
+`generation_config_invalid` 拒绝，不提供 alias、migration 或 fallback。设可见 primary branch 总数为 N、冻结
+interleaving layout 数为 D，则 planner 派生 `primary_sessions = N - D` 与
+`interleaved_primary_sessions = D`。每个 replay sequence 独占一个尾部 session。
 
 noise_events 大于零时 generate.noise 必填，frame_class 必须有 object 生成 Schema，且不得被任何 role 使用。
 topics 必须为与 noise_events 精确等长的非空唯一字符串表，第 ordinal 个话题唯一绑定第 ordinal 个 NoiseSlot。
 noise 是无 owner、无 state patch 的精确事件槽。duplicate_sequences 从已提交 positive primary sequence
 按 declaration order、scenario_index 选取，不放回；positive source 不足是启动期错误。
 instruction-only 要求 duplicate_sequences = 0；它没有 positive variant 真值。
-instruction-only 同时要求 crossed_primary_sessions = 0、primary_sessions = N；该模式不做 crossing。
+instruction-only 不做交织，全部 primary sequence 各自拥有独立 session。
 
 ## 6. 静态上限与上下文
 
@@ -574,12 +622,13 @@ candidate 形状的六百槽反向完成压测，记录 peak RSS、候选缓冲�
 
 GenerationProgramCompiler 在任何凭据物化和 LLM 请求之前完成：
 
-- 解析 sequence class、frame class、pattern、role、gap、counterfactual set 和 instruction-only 引用。
+- 解析 sequence class、frame class、pattern、role、gap、counterfactual set、interleaving candidate/pattern 和
+  instruction-only 引用。
 - 验证全部 JSON Schema、JSON Pointer、hook 签名、catalog 外壳与 catalog cardinality。
 - 为每个 variant 冻结唯一 expected_violation 和 causal divergence role。
 - 校验 delivery slot 的精确 cardinality 与声明序；实际 DeliverySlot 只由 ScenarioPlan 冻结，并在其中写入
   catalog_row_index（LLM source 为 null）。catalog 按 class、声明序、scenario_index 无放回分配，slot 重试不换行。
-- 校验 timeline 精确恒等式、crossing、noise、replay source 和 session 容量。
+- 校验 interleaving 两侧闭包、candidate 角色、唯一 positive、int64 权重总和、noise、replay source 和 session 容量。
 - 计算每种调用的完整最小上下文预算与调用上界。
 - 把 `ResolvedConfig.run.seed` 冻结为 `GenerationProgram.planner_seed`，再生成 canonical program digest，供
   validate、dry-run、run、ID 与 report 共用。digest 输入覆盖 `planner_seed` 和其余全部语义字段，排除
@@ -627,7 +676,8 @@ catalog 分配是确定性整数映射，
 - declared baseline 的 role presence、完整 order、logical_time_us、start-to-start gap 与完整 interval envelope max_span。
 - missing、reordered 和 interval_exceeded 的机械变换与非目标约束。
 - instruction-only slot 的固定 length、每个位置 logical_time_us 和 frame position。
-- 每个 primary sequence 的投影 timestamp、fixed duration/resources、session、crossing 与全局 event-start 唯一。
+- 每个 primary sequence 的投影 timestamp、fixed duration/resources、session 与全局 event-start 唯一。
+- interleaving layout 的 trigger/partner identity、共享 session、真正 owner 交织与全局 event-start 唯一。
 - role calendar window 的完整 `[start,end)` 包含、session event capacity、interval-envelope span 与 session gap。
 - 每个 positive-duration event 的 fixed-size interval；同 resource 通过 `AddNoOverlap`，适用 containment 使用线性约束。
 - exact point-noise slot、positive replay source、统一常量 `shift_us` 与 replay interval envelope。
@@ -651,10 +701,61 @@ solver 必须证明每个变体的所有非目标 gap、interval-envelope max_sp
 但相邻事件的实际 timestamp 差必须等于 logical timeline 的差。positive 缺省时，hidden baseline 仍须从
 timestamp_start 独立求得满足全部 role calendar window 的最早投影，不能借用第一个可见反事实分支的起点。
 
-### 8.4 block 与确定性
+### 8.4 interleaving 抽取、布局与失败闭包
 
-block allocator 先用整数算术按完整 primary session 分配全局 count；最后一个 block 接收余数。一个 crossed session
-的两个 owner 永远在同一 block，并为共享 resource 联合加入 `AddNoOverlap`。普通 session 的 lower bound 从此前已放置
+Planner 完成全部 DeliverySlot 与 logical branch 后，只收集带候选标签 set 的唯一 positive branch，并按
+candidate set 建立共享 partner pool。trigger positive branch 按 DeliverySlot 声明序扫描；反事实 variant、hidden
+baseline、instruction-only、noise 与 replay 均不进入候选。partner 可以位于 trigger 声明之前或之后。
+
+当前 trigger 至少有一个 named pattern 的 partner pool 非空时，记一次 `interleaving_opportunity`。设当前 applicable
+patterns 按 TOML 声明序为 `p1..pk`、trigger weights 为 `w1..wk`、`no_interleaving_weight=w0`，则总权重
+`W=w0+sum(wi)`，并冻结：
+
+~~~text
+P(no interleaving | current applicable patterns) = w0 / W
+P(select pi | current applicable patterns) = wi / W
+~~~
+
+none 在分母中只出现一次；partner 数、候选 pair 数和可实现 owner word 数都不复制权重。pool 耗尽的 pattern 从后续
+opportunity 分母移除；所有对应 pool 都为空时不计 opportunity。`by_interleaving_pattern.<name>.eligible_opportunities`
+在该 pattern 对当前 trigger 生效且 pool 非空时增加，因此一个 trigger 可增加多个 named pattern 的 eligible count，
+但全局 opportunity 只增加一次。
+
+每次抽取使用 `generation_random` 的完整 SHA-256 整数和拒绝采样。对正范围 `T`，令 `M=2^256`、
+`limit=M-(M mod T)`，按独立 domain 与 counter 接受首个小于 limit 的整数，再取 `x mod T`。不得使用 float threshold、
+简单取模或 solver seed。pattern ticket 由 none 的 `[0,w0)` 与各 pattern 按声明序的连续区间组成。partner 用独立
+domain 对当前 pool 长度无偏抽取，初始 pool 为 DeliverySlot 声明序，选中后 swap-delete；none 不消费 pool。
+counter 从零开始。pattern domain 固定为 `interleaving_pattern_choice`，value 固定为
+`[program_digest, planner_seed, trigger_slot_key, trigger_variant_name, counter]`；partner domain 固定为
+`interleaving_partner_choice`，value 固定为 `[program_digest, planner_seed, trigger_slot_key,
+trigger_variant_name, pattern_name, partner_candidate_set, counter]`。
+
+pattern 与 partner 一旦抽中，就不搜索其他 partner、不切换 pattern、不退回 none 或 standalone。Planner 不为未选
+partner 预跑 CP-SAT。选中 pair 只允许整体平移两条 branch，并保持 logical time、gap、duration、resource、calendar
+与 branch 内顺序；所有 start 毫秒对齐且全局唯一，同名 resource 使用 `AddNoOverlap`，共享 session 满足容量、完整
+interval envelope span 与前一 session gap。owner word 必须至少有三个 maximal runs，即存在 `A-B-A` 或 `B-A-B`。
+
+对两条 branch 的每个相邻事件 gap 构造 witness。witness rank 的随机材料固定为
+`generation_random("interleaving_witness_rank", [program_digest, planner_seed, pattern_name,
+trigger_slot_key, trigger_variant_name, partner_slot_key, partner_variant_name, witness_owner,
+witness_gap_index])`；`witness_owner` 为 `trigger|partner`，gap index 为 owner 内零基序号。按
+`(随机整数, owner_order, witness_gap_index)` 升序获得零基唯一 rank，owner order 固定 trigger=0、partner=1。
+CP-SAT 依次最小化 witness rank、session 最早
+event start、trigger branch start、partner branch start。选中 pair 在两个原声明位置中较早的位置创建 session，另一个
+位置随后跳过；这只改变工件时间，不改变 main 的 DeliverySlot/variant 交付顺序或 replay source 声明序选择。
+
+pair 无合法绝对布局时直接以 `generation_plan_infeasible`、exit 2 失败；FEASIBLE/UNKNOWN 与 MODEL_INVALID 仍分别
+映射 plan budget/internal。不存在换 partner、换 pattern、回退 standalone 或 retry 重抽。provider retry、recoverable
+slot attempt、并发完成序与 ordered commit 始终复用同一个 ScenarioPlan，不消费交织随机数。
+
+匹配不得构造 trigger × partner matrix；复杂度冻结为
+`O(positive branches + evaluated pattern incidences + selected pairs)` 时间、`O(positive branches)` pool 内存，
+单 pair 约束为 `O(m*n+m+n)`。现有每 pattern 32-role 上限使跨 owner start uniqueness 至多 1024 对。
+
+### 8.5 block 与确定性
+
+block allocator 先用整数算术按完整 primary session 分配全局 count；最后一个 block 接收余数。一个 interleaving
+layout 的两个 owner 永远在同一 block，并为共享 resource 联合加入 `AddNoOverlap`。standalone session 的 lower bound 从此前已放置
 正区间的最大 end 与 `session_gap_s` 计算。单 block 最多 4096 个 primary event；超出时从下一个完整 session 起新 block。
 
 ScenarioBlock 的键固定为 `(slot_key, variant_name)`：隐藏 baseline 与 instruction-only 唯一 branch 的
@@ -669,8 +770,8 @@ shift，点事件 tail cursor 也至少前进 1000 微秒。
 
 所有优化目标与 tie 行为都是 canonical plan 的组成部分：instruction-only 的 length 最小化，因此精确等于
 `len_range[0]`；位置时间从零开始并使用 `event_gap_s[0]`。declared baseline 固定首事件为零并最小化全部
-role 时间之和；interval_exceeded 最小化满足目标超时的 suffix shift；crossing 选择最小化所选边界的
-一基声明序权重和；crossed pair 最小化两个绝对起点之和；非 crossing branch 取日历交集的最早起点。
+role 时间之和；interval_exceeded 最小化满足目标超时的 suffix shift；interleaving pair 使用第 8.4 节的 seed-driven
+witness rank 与绝对起点词典序；standalone branch 取日历交集的最早起点。
 目标仍有并列时，以锁定 OR-Tools 版本、单 worker、program-bound solver seed 的 OPTIMAL assignment 为唯一
 tie-break；任何实现若改变目标、求解顺序、版本或 seed domain，都必须先修订本规格和 plan digest 测试。
 
@@ -696,14 +797,15 @@ CrossView 回读都使用 `epoch + timedelta(microseconds=...)` 和整数 timede
 任一计划时间或 21 天日历展开超出 Python datetime 可表达范围时，planner 在内容调用前以
 generation_plan_infeasible 拒绝。
 
-### 8.5 独立 oracle
+### 8.6 独立 oracle
 
 小词表与小长度测试必须用不导入 planner 实现的枚举 oracle，逐项比较：
 
 - slot 和 variant 数。
 - role presence 与 order。
 - 每条 gap、目标超时范围和 max_span。
-- session、crossing、resource interval、containment、noise、constant-shift replay 与全局 event start。
+- session、interleaving opportunity/pattern/pair/owner word、resource interval、containment、noise、
+  constant-shift replay 与全局 event start。
 
 不能用 planner decoded witness 作为期望值。
 
@@ -1071,6 +1173,10 @@ primary_base value 恰为 payload、event、generation 三字段 object；member
 sort_keys = true、separators = comma/colon、ensure_ascii = false；结果为 SHA-256 小写 hex 前 32 字符。
 domain 与 components 按下表逐字节冻结，components 是按顺序排列的 JSON array，禁止调用方自行连接字符串。
 
+`labelkit:v1.20` 是 generation ID、stream exact carrier 与 delivery digest 的工件编码域，不是产品 revision。
+v1.21 interleaving 只改变 program/plan 的语义输入与布局，不改变 ID 公式或 stream envelope，因此保留该编码域，
+避免制造无语义的 ID churn。
+
 | ID | domain | components |
 |---|---|---|
 | declared scenario_id | `declared_scenario_id` | program_digest、counterfactual set name、scenario_index |
@@ -1355,7 +1461,7 @@ main、stream、success report、manifest 或 failed report，只按同一 error
 | 最终 full CrossView 内部错误 | 否 | 否 | 4 | commit 前不替换 | `failed_slot=null`、`attempts_used=0` |
 | 启动期配置、hook、catalog 或路径验证错误 | 否 | 否 | 2 | 不替换 | 不写，运行尚未成立 |
 | 启动后权限/文件类型变化导致 `.part` 不可写 | 否 | 否 | 4 | 不替换 | 尝试同目录写；失败只记英文 stderr kind |
-| plan infeasible | 否 | 否 | 2 | 不替换 | 原子写 |
+| plan infeasible，包括已抽中 interleaving pair 无合法布局 | 否 | 否 | 2 | 不替换 | 原子写 |
 | plan budget 或 planner internal | 否 | 否 | 4 | 不替换 | 原子写 |
 | 任一固定正式路径的 commit-I/O 失败 | 否 | 否 | 4 | 可能已替换子集，旧 manifest 不变 | best-effort 原子写 |
 | failed report 写入失败 | 否 | 否 | 不改主退出码 | 不改主结果 | stderr 记录英文 kind |
@@ -1415,7 +1521,8 @@ estimate.successful_attempt_lower_bound 是全部计划 delivery slot 各成功�
 全运行逻辑调用下界；estimate.upper_bound 是该全运行中每个 delivery slot 最多消耗 max_slot_attempts 的保守上界。
 两者都不包含 LLMClient 内部 provider retry 或 L3，并使用实际 variant 集、保护前缀、noise 与 ClassView 计算，
 不用常量猜测。dry-run 同时显示 planned sets、planned primary sequences、primary events、noise events、
-replay sequences 和 stream rows。
+replay sequences、stream rows、program/plan digest、interleaving opportunities、派生 primary/interleaved
+primary sessions 与 declaration-ordered `by_interleaving_pattern`。
 全局 estimate_run 的旧十个调用键序与 total_calls 算式不变。sequence 形态中 generate_calls 等于
 上表前七个 generation LLM 细分键之和；这七键按表序作为 sequence_calls 子对象写 report/console，
 不再重复计入 total_calls。quality_calls、annotate_calls、frame_annotate_calls 和 verify_calls 使用旧顶层键，
@@ -1531,7 +1638,7 @@ noise event 固定 owner_sequence_id、role、scenario_id、world_branch_id 为 
 replay event 固定 owner_sequence_id = null，带 replay_sequence_id、replay_ordinal、duplicate_of_sequence_id 和
 duplicate_of_event_id；它不带新的 world_branch_id。M2 只用 replay_sequence_id 分组 replay，不从首次出现次序猜 ordinal。
 
-outer timestamp、gap 和 elapsed 保留在 `_meta.event`；完整 payload Schema 中标记的 business time field 由
+envelope timestamp、gap 和 elapsed 保留在 `_meta.event`；完整 payload Schema 中标记的 business time field 由
 `time_bindings` 从同一 Planner start/end/duration 机械注入，不读取模型或导出器时间。
 
 ### 14.3 manifest
@@ -1570,13 +1677,16 @@ report.generate.sequence 键序冻结：
   "delivery_digest": "4567...",
   "artifacts_committed": true,
   "program_digest": "...",
+  "plan_digest": "...",
   "planned_sets": 2,
   "delivered_sets": 2,
   "planned_sequences": 8,
   "delivered_sequences": 8,
   "primary_events": 22,
+  "interleaving_opportunities": 0,
   "primary_sessions": 8,
-  "crossed_primary_sessions": 0,
+  "interleaved_primary_sessions": 0,
+  "by_interleaving_pattern": {},
   "noise_events": 2,
   "replay_sequences": 1,
   "replay_events": 3,
@@ -1634,6 +1744,11 @@ report.generate.sequence 键序冻结：
 ~~~
 
 成功时 planned_sets = delivered_sets、planned_sequences = delivered_sequences，且每个 variant planned = delivered。
+设可见 primary branch 数为 N、`interleaving_layouts` 数为 D，report 必须满足
+`interleaved_primary_sessions = D` 与 `primary_sessions = N - D`。`by_interleaving_pattern` 按 TOML pattern
+声明序输出每个 `eligible_opportunities` 与 `selected_sessions`，包括 selected 为零的 pattern；交织关闭和
+instruction-only 固定输出零 opportunity、零 interleaved session 与空 map。report 不输出 slot identity、pair、
+owner word、payload、prompt、state 或 API key；exact pair identity 只存在于内存 ScenarioPlan。
 `by_pattern` 先按 counterfactual set 声明将每个 pattern/variant 的 planned 累加，再从实际最终
 SequenceRows 的 generation truth 对每条 sequence 恢复 delivered 且只计一次。多个 set 复用同一 pattern
 或 variant 时不得在 source 循环中重复扫描同一批已交付 rows；实际行出现未声明的 pattern/variant
@@ -1702,19 +1817,22 @@ DeliveryError 新增到 labelkit/common/errors.py，不继承 ConfigError。异�
 | GapSpec | `name`, `before`, `after`, `min_gap_us`, `max_gap_us` |
 | SequencePattern | `name`, `sequence_class`, `description`, `roles`, `order`, `gaps`, `max_span_us` |
 | VariantSpec | `name`, `kind`, `target`, `outcome_schema`, `expected_violation`, `divergence_role` |
-| CounterfactualSetSpec | `name`, `pattern`, `count`, `variants` |
+| CounterfactualSetSpec | `name`, `pattern`, `count`, `interleaving_candidate_set`, `variants` |
+| InterleavingPatternSpec | `name`, `trigger_candidate_set`, `partner_candidate_set`, `trigger_weight` |
+| InterleavingSpec | `no_interleaving_weight`, `patterns` |
 | InstructionOnlySpec | `name`, `sequence_class`, `count`, `len_range`, `instruction`, `state_schema` |
-| TimelineSpec | `timestamp_start_us`, `utc_offset_minutes`, `event_gap_us`, `primary_sessions`, `crossed_primary_sessions`, `session_max_events`, `session_max_span_us`, `session_gap_us`, `noise_events`, `duplicate_sequences` |
+| TimelineSpec | `timestamp_start_us`, `utc_offset_minutes`, `event_gap_us`, `session_max_events`, `session_max_span_us`, `session_gap_us`, `noise_events`, `duplicate_sequences` |
 | CalendarWindowSpec | `name`, `utc_offset_minutes`, `days`, `intervals_us` |
 | NoiseSpec | `frame_class`, `instruction`, `topics` |
 | GenerationLimits | `pattern_roles`, `variants_per_counterfactual_set`, `instruction_only_events`, `scenario_seed_bytes`, `state_or_outcome_schema_bytes`, `frame_schema_bytes`, `event_patch_bytes`, `rendered_payload_bytes`, `prompt_value_bytes`, `repair_context_bytes`, `prompt_text_bytes`, `record_units`, `stream_rows`, `retained_content_bytes` |
-| SequenceGenerationConfig | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `state_validator`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `calendar_windows`, `noise`, `limits` |
-| GenerationProgram | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `planner_seed`, `class_views`, `frame_classes`, `frame_schema`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `calendar_windows`, `noise`, `limits`, `state_validator`, `digest` |
+| SequenceGenerationConfig | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `state_validator`, `patterns`, `counterfactual_sets`, `instruction_only`, `interleaving`, `timeline`, `calendar_windows`, `noise`, `limits` |
+| GenerationProgram | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `planner_seed`, `class_views`, `frame_classes`, `frame_schema`, `patterns`, `counterfactual_sets`, `instruction_only`, `interleaving`, `timeline`, `calendar_windows`, `noise`, `limits`, `state_validator`, `digest` |
 | DeliverySlot | `slot_key`, `source_name`, `scenario_index`, `sequence_class`, `pattern_name`, `variant_names`, `catalog_row_index` |
 | PlannedEvent | `event_key`, `role`, `position`, `logical_time_us`, `timestamp_us`, `duration_us`, `resources`, `session_id` |
 | NoiseSlot | `event_key`, `ordinal`, `frame_class`, `topic`, `timestamp_us`, `duration_us`, `resources`, `session_id` |
 | ReplayLayout | `source_slot_key`, `source_variant_name`, `replay_ordinal`, `session_id`, `shift_us` |
-| ScenarioPlan | `blocks`, `delivery_slots`, `noise_slots`, `replay_layouts`, `primary_sessions`, `digest` |
+| InterleavingLayout | `pattern_name`, `trigger_slot_key`, `trigger_variant_name`, `partner_slot_key`, `partner_variant_name` |
+| ScenarioPlan | `blocks`, `delivery_slots`, `noise_slots`, `replay_layouts`, `interleaving_layouts`, `interleaving_opportunities`, `interleaving_pattern_opportunities`, `primary_sessions`, `digest` |
 | SequenceTemporalMember | `event_id`, `timestamp_us`, `duration_us`, `resources` |
 | SequenceTemporalContext | `members` |
 | ScenarioSeed | `initial_state`, `actors`, `shared_facts`, `style`, `time_context` |
@@ -2126,6 +2244,7 @@ complete_post_validated。ValidatedGenerationCall.resolved_at 的闭集固定为
 ~~~text
 labelkit/common/config/generation.py
 labelkit/common/config/_generation_budget.py
+labelkit/common/config/_sequence_layout.py
 labelkit/common/contracts/generation.py
 labelkit/common/inference/generation_prompts.py
 labelkit/operators/generation/__init__.py
@@ -2140,8 +2259,10 @@ labelkit/operators/generation/project.py
 labelkit/orchestration/sequence_workflow.py
 ~~~
 
-flat.py 接收原 generate.py 中 v1.12 独立样本实现。generate.py 只保留 flat generate 的薄 Stage 入口并调用
-generation.flat，不 import orchestration，也不保留旧 stream 分支。sequence 形态由 Application 创建的
+flat.py 接收原 generate.py 中 v1.12 独立样本实现。common/config/generation.py 只保留公共 carrier 与解析入口；
+其基线已有 1999 行，timeline、交织解析和派生计数闭包放入 `_sequence_layout.py`，不得继续膨胀聚合模块。
+operators/generate.py 只保留 flat generate 的薄 Stage 入口并调用 generation.flat，不 import orchestration，
+也不保留旧 stream 分支。sequence 形态由 Application 创建的
 SequenceWorkflow 调用 sequence_workflow.deliver_generation；依赖方向仍为
 cli → orchestration → operators → common。
 
@@ -2332,13 +2453,15 @@ catalog 有十三行完整 ScenarioSeed；主教学配置只按声明序消费�
 | replay events | 3 |
 | stream rows | 27 |
 | primary sessions | 8 |
-| crossed primary sessions | 0 |
+| interleaving opportunities | 0 |
+| interleaved primary sessions | 0 |
 | replay tail sessions | 1 |
 
 每个 set 的事件数为 3 + 2 + 3 + 3 = 11。replay 固定选择 declaration order 中首个 positive sequence，并以一个
 constant shift 重绑每个 payload 的 business time。
 同一个 counterfactual set 的 variant 不共 session；教学工程把八条 primary sequence 各放入独立 session，
-避免要求纯文本 process replay 从非连续交错片段重建线程。crossing 能力仍由 planner 与独立 oracle 测试覆盖。
+避免要求纯文本 process replay 从非连续交错片段重建线程。v1.21 interleaving 能力由独立 planner fixture、
+本地四槽真实门与独立 oracle 覆盖。
 
 state 至少包含 actors、goal、request、ticket、audit、sla 和 hidden_sentinel。hidden_sentinel 不在任何 role.read_roots、
 publish_roots、renderer input 或 payload 中。payload_binding 机械注入 request_id、ticket_id 与 status。
@@ -2415,7 +2538,14 @@ example checker 假装从不可见字段获得证明。
 - 不依赖 planner witness 的手工 ObservedEvent 分别注入同 frame 额外事件、低于下限的非目标 gap、
   以及完整 role word 上同时的 gap-above-max 与 max-span 超限，必须按 cardinality → order → gap
   → span 的依赖序输出精确违规。
-- CP-SAT 与独立枚举 oracle 对齐 role、gap、span、session、crossing、noise、replay 和 exact count。
+- CP-SAT 与独立枚举 oracle 对齐 role、gap、span、session、interleaving、noise、replay 和 exact count。
+- interleaving 配置覆盖 disabled、单边声明、未知或未引用 candidate、candidate 角色冲突、唯一 positive、
+  TOML int64 权重边界与旧 timeline 两键拒绝。
+- 权重用整数 ticket 穷举、注入随机整数和 fixed vector 证明；测试不得用统计容差代替数学契约。
+- partner pool 无偏索引、不放回且共享 pool 不重复消费；none 不消费 pool，partner 可在 trigger 前后。
+- owner word 可实现 `A B B A B A A`；串行 word 拒绝，选中不可行 pair 直接失败且不换 partner、pattern 或 none。
+- 保留 500000 record-unit 无交织 planner probe；新增 600 positive branch、300 强制 pair 的真实 planner/RSS
+  probe，记录 wall time、peak RSS 与 plan digest，并证明匹配阶段没有 trigger × partner matrix。
 - 同 seed 相同 plan；修改 attempt failure 不改变其他 slot 的 plan。
 - 同 set variant 不共 session、不交织。
 - `calendar_windows` 从真实 M1 配置进入 GenerationProgram，并由 validate、dry-run、run 的同一个
@@ -2643,6 +2773,23 @@ uv run --python 3.12 pytest tests/integration/test_sequence_generation_structure
 frame-only 和 replay 必须全部重跑。429、5xx 和额度耗尽记录为环境失败；slot exhaustion 是产品失败，
 禁止重跑到绿后忽略。
 
+### 23.5 本地 Qwen3.5-4B 真实门
+
+沿用 `SPEC-execution-runtime.md` 第 21.2 节冻结的真实模型、llama-server 命令、两个 profile 与四并发槽。
+四槽 fixture 拆成两个 trigger slots 与两个 partner slots，使用 `no_interleaving_weight = 0` 和一个
+`trigger_weight = 1` 的 named pattern，强制形成两个 interleaving layouts。必须机械断言：
+
+- main 为 4 rows、stream 为 16 rows，既有 LLM call 形状不变且 usage 非零；
+- `interleaving_opportunities = 2`、`interleaved_primary_sessions = 2`、`primary_sessions = 2`；
+- 每个 primary session 恰有两个 owner、六个 event、至少三个 owner runs，并恰含一个 trigger candidate
+  与一个 partner candidate；
+- owner 内 position、logical delta、artifact delta、duration 与 resource 全部保持；
+- server request high-water 恰为四，manifest、delivery digest、plan digest、checker 与 secret scan 全部通过。
+
+该门使用真实 Qwen3.5-4B-Q6_K 推理，不使用 mock、录制响应或静态替代；它只证明冻结的交织 plan 能被完整
+生成、判定、投影和交付链消费，不证明权重分布。证据记录实际 llama-server build、模型 SHA-256、命令、
+wall time、报告统计和 checker 结果，也不替代 DeepSeek 与 z.ai 发布门。
+
 ## 24. 独立真实感门
 
 发布验收抽取 min(50, delivered_sequences) 条；少于 50 时全量。两名独立评审隐藏 variant truth，分别判断：
@@ -2725,7 +2872,8 @@ AGENTS.md 与 CLAUDE.md 必须逐字节一致。
 ~~~mermaid
 flowchart LR
     S["本 SPEC + CONTRACTS + 主 spec"] --> C["config/contracts"]
-    C --> P["declared positive + planner"]
+    C --> X["interleaving config + deterministic matching/layout"]
+    X --> P["declared positive + planner"]
     P --> W["逐事件 state/render/evaluate"]
     W --> D["set delivery + downstream transaction"]
     D --> N["missing/reordered/timeout"]
@@ -2752,6 +2900,7 @@ flowchart LR
 | 反事实可比较性 | protected prefix + causal suffix | CouplingEvaluator |
 | 人看不假 | SemanticEvaluator + 独立真实感门 | 六维全 true + 盲审 |
 | 精确条数 | whole-set SequenceWorkflow | planned = delivered 或整个运行失败 |
+| 可选序列交织 | candidate set、named pattern、整数权重与冻结 pair/layout | ticket fixed vector、owner word、fail-closed 与 plan identity |
 | instruction 自主判定 | instruction-only 独立 truth | 无 pattern claim、语义级 knowledge |
 | 教学可复演 | sequence-generation example | 8 main、27 stream、replay dropped_dup = 1 |
 | 旧面归零 | 删除清单与未知键拒绝 | code search + config negatives |
@@ -2765,6 +2914,8 @@ flowchart LR
 - 所有新 production file 满足中文注释、英文日志/错误、行长、函数、参数、文件长度与 doxygen 规则。
 - spec 用例、函数、行和分支覆盖率达到仓库门。
 - DeepSeek 四变体、failure injection、instruction-only、主例和 replay 非空通过。
+- v1.21 interleaving 配置、精确整数抽样、共享 partner pool、seed-driven owner word、不可行 pair fail-closed、
+  500000 无交织基线与 600 branch/300 pair 规模门全部通过。
 - structured output 真实透传通过，或有明确外部 endpoint 环境失败证据而不伪称通过。
 - main、stream、report 与 manifest 摘要一致；commit 边界前的 failed run 不替换成功工件，
   commit-I/O 失败则按 §2.7 保留旧 manifest 并由摘要检出固定路径混代。
@@ -2776,10 +2927,17 @@ flowchart LR
 - RFC 6902 JSON Patch：https://datatracker.ietf.org/doc/html/rfc6902
 - python-json-patch 官方仓库：https://github.com/stefankoegl/python-json-patch
 - OR-Tools CP-SAT 官方文档：https://developers.google.com/optimization/cp/cp_solver
+- FDR CSP interleave：https://cocotec.io/fdr/manual/cspm/processes.html
+- QuickCheck Gen.frequency 与整数随机范围：https://github.com/nick8325/quickcheck/blob/master/src/Test/QuickCheck/Gen.hs
+- OR-Tools Job Shop：https://developers.google.com/optimization/scheduling/job_shop
+- OR-Tools SatParameters：https://github.com/google/or-tools/blob/stable/ortools/sat/sat_parameters.proto
+- Temporal replay-safe randomness：https://github.com/temporalio/sdk-java/blob/main/temporal-sdk/src/main/java/io/temporal/workflow/Workflow.java
 - Synthea 官方仓库：https://github.com/synthetichealth/synthea
 - WebArena 官方项目：https://webarena.dev/
 - tau-bench 论文：https://arxiv.org/abs/2406.12045
 - Generative Agents 论文：https://arxiv.org/abs/2304.03442
 
 本规格采用这些方案共同的成熟边界：有限约束交给 solver，世界状态必须可执行，状态变化使用标准 patch，
-最终结果程序化验收，语言模型负责场景和自然语言但不拥有结构真值。
+最终结果程序化验收，语言模型负责场景和自然语言但不拥有结构真值。v1.21 进一步采用 CSP interleave 的
+内部顺序保持、QuickCheck 的整数 alternative weight、OR-Tools 的 precedence/NoOverlap，以及 Temporal 的
+retry-safe 冻结随机性；solver seed 不承担产品概率语义。

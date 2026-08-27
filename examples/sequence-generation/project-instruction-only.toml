@@ -94,8 +94,6 @@ state_schema_path = "schemas/state.json"
 [generate.timeline]
 timestamp_start = "2026-01-05T09:00:00+08:00"
 event_gap_s = [15, 120]
-primary_sessions = 1
-crossed_primary_sessions = 0
 session_max_events = 8
 session_max_span_s = 1800
 session_gap_s = 3600

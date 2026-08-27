@@ -39,9 +39,13 @@ uv run labelkit validate --config config.toml --project project.toml --console p
 uv run labelkit run --config config.toml --project project.toml --dry-run --console plain
 ```
 
-这两条路径不读取 API key value，也不打开 main、stream、report、manifest 或 failed report。当前已验证计划是
-2 sets、8 primary sequences、22 primary events、2 noise events、3 replay events，共 27 stream rows。
-逻辑 family 调用估算不含 provider retries 或 L3 repairs，后者只能由真实 report/trace 事后核账。
+这两条路径不读取 API key value，也不打开 main、stream、report、manifest 或 failed report。教学主例的数据量算术是
+2 sets、8 primary sequences、22 primary events、2 noise events、3 replay events，共 27 stream rows；交织只改变
+timestamp 与 session，不改变这些数量。sequence 估算同时给出 `program_digest`、`plan_digest`、
+`interleaving_opportunities`、`primary_sessions`、`interleaved_primary_sessions` 和 `by_interleaving_pattern`，因此可以在
+任何付费调用前确认实际抽中的布局。逻辑 family 调用估算不含 provider retries 或 L3 repairs，后者只能由真实
+report/trace 事后核账。当前主例未启用交织，四个交织读数分别为 `0`、`8`、`0` 与 `{}`；这些值来自 plan，
+不是 timeline 中的用户计数。
 
 注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），`segment_calls` / `extract_calls` 是 v1.8 新增字段（时序流，第 25 章），`stitch_calls` 是 v1.9 新增字段（线索缝合，第 26 章），`frame_classify_calls` / `frame_annotate_calls` 是 v1.12 新增字段（流模式帧粒度，第 25 章），未启用恒为 0；流模式下 quality/annotate/verify 的估算以「episode 数 ≈ 会话数」报**下界**、extract 按剔噪前帧数报**上界**（估算公式与真实对账见第 25 章）；帧粒度两键按预扫描帧总数报**粗上界**——帧分类实付每 episode 一次批量判决（且住 dedup 之后，重复 episode 零调用）、帧标注实付过质量门的成员数，实跑对账看 `report.stream` 的两个帧子块（第 8 章，成本账见第 25 章 25.6）；v1.11 起 `segment_calls` 的语义随预算而变——`segment.llm` 所指 profile 声明了 `context_window`（第 6 章）时，估算公式的窗宽取 `min(window, w_min)`（w_min = 预算保证每窗至少装下的帧数），实际装填每窗只多不少、窗数只少不多，故报的是**最坏装填上界**（实际窗数事后看 `report.stream.windows` 对账），且 w_min 小于 window 时 stream 注记行会追加一句 `; segment reports an upper bound at worst-case budget packing`；未声明预算或 w_min ≥ window 时公式与数值同 v1.10。`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。后两种情况 stderr 都会多打一行注记（`dry-run: note: estimated with global config / multi reports a lower bound at label multiplier 1`）。
 
@@ -120,14 +124,16 @@ uv run labelkit rubric --show default:text > my-rubric.toml
 | 码 | 含义 | 典型触发 |
 |---|---|---|
 | **0** | 运行完成 | 注意：**可能仍有被拒绝的记录**（看 stderr 摘要与 report.counts）；generate_only 产出 0 条也是 0 |
-| **1** | 完成但违反 `--strict`，或报告写出失败 | 有 rejects 且开了 strict；主输出成功但 report.json 写不出 |
-| **2** | 配置错误 | TOML 语法错、字段非法、引用的 profile 不存在、Schema/rubric 非法、环境变量缺失、非法 CLI 参数组合 |
+| **1** | 交付未完成，或 ordinary run 完成但违反 `--strict` / report 写出失败 | sequence slot attempts 耗尽；有 rejects 且开了 strict；主输出成功但 report.json 写不出 |
+| **2** | 配置或确定性规划不可行 | TOML/Schema/profile/CLI 配置错误；已冻结的 sequence interleaving pair 无合法时间布局 |
 | **3** | 输入错误（仅 process 模式） | 输入路径不存在、目录下没有候选文件（无 `.jsonl` / 无 `uitree_*`+`image_*`）、**无任何合法记录**（读完输入 `ingested=0`，如 text_field 全员未命中）、UI index 冲突且策略为 fail、坏行/缺对且策略为 fail |
-| **4** | 致命运行错误 | 熔断触发（连续 `fatal_error_threshold` 次不可恢复 API 错误；v1.6 起熔断中止**交付**已完成批，见下方判读要点）、运行期输出写入失败、未预期异常、Ctrl-C 打在启动/收尾阶段（stderr 打印 `interrupted`；运行中的 Ctrl-C 则走优雅中断、正常交付并按 strict 规则返回 0/1） |
+| **4** | 致命运行错误 | sequence plan 未在预算内证明 OPTIMAL / model invalid；熔断；运行期输出写入失败；未预期异常；Ctrl-C 打在启动/收尾阶段 |
 
 判读要点：
 
 - **0 不等于「全部记录都成功」**——它只承诺流程走完、账目写清。生产脚本请用 `--strict` 或解析 report.counts；
+- sequence generation 不使用 rejects：`sequence_delivery_exhausted` 是 1；`generation_plan_infeasible` 是 2；
+  `generation_plan_budget` / `generation_plan_internal` 是 4。stderr 的 error kind 才是自动化的精确分流键；
 - 2 与 3 的分界：**还没碰数据**的错都是 2（包括「输出父目录不存在或不可写」——忘了 `mkdir -p out` 是退出码 2，不是 4）；**数据本身**的错才是 3；
 - 4 的几种触发里，只有**熔断**会走完收尾：报告照常写出（特征是 `run.exit_code: 4`；注意 `interrupted` 仍为 `false`——该字段只在 SIGINT/SIGTERM 中断时为 true），且 **v1.6 起已完成批次的主输出与 rejects 照常 fsync + 原子改名交付**（v1.5 及以前是「`.part` 残骸留在原地、不交付」——长跑末段配额死亡不再丢弃全部已完成产出）。此时 report.json 的 run 节带 `partial_delivery: true`（仅熔断交付时出现），counts 增列 `unprocessed` 补齐守恒恒等式（第 8 章）；运行期写盘失败与未预期异常则在收尾之前就抛出，连报告都不会写出；
 - （v1.6）**最终文件名出现不再等价「全部输入处理完毕」**：它仍然保证已交付的每一行完整且合法，但熔断中止与优雅中断如今都会交付。判定一次运行是否完整处理了全部输入，要看 report.run 的 `interrupted=false` **且** `circuit_broken=false`——退出码本身不够用：被 SIGINT 优雅中断的运行同样交付且按 strict 规则以 0/1 退出（第 8、18 章）。

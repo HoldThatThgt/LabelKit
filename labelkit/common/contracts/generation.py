@@ -1,4 +1,4 @@
-"""v1.20 序列生成内核的共享冻结载体。
+"""v1.21 序列生成内核的共享冻结载体。
 
 本模块只声明跨层数据，不实现业务算法。所有 Mapping 输入在构造时递归复制并以
 ``MappingProxyType`` 暴露；tuple 内的 JSON 容器同样递归冻结。
@@ -16,6 +16,7 @@ from labelkit.common.config.generation import (
     CalendarWindowSpec,
     CounterfactualSetSpec,
     GenerationLimits,
+    InterleavingSpec,
     InstructionOnlySpec,
     NoiseSpec,
     RoleSpec,
@@ -123,6 +124,7 @@ class GenerationProgram(_ImmutableCarrier):
     patterns: Mapping[str, SequencePattern]        # pattern 名映射
     counterfactual_sets: tuple[CounterfactualSetSpec, ...]  # declared set 表
     instruction_only: tuple[InstructionOnlySpec, ...]  # instruction-only 表
+    interleaving: InterleavingSpec | None              # 可选交织配置
     timeline: TimelineSpec                        # 精确时间线
     calendar_windows: Mapping[str, CalendarWindowSpec]  # 固定窗口表
     noise: NoiseSpec | None                       # 可选 noise 声明
@@ -191,6 +193,17 @@ class ReplayLayout(_ImmutableCarrier):
 
 
 @dataclass(frozen=True)
+class InterleavingLayout(_ImmutableCarrier):
+    """一个冻结的 trigger/partner positive branch 配对。"""
+
+    pattern_name: str                             # 命中的交织 pattern 名
+    trigger_slot_key: str                         # trigger 交付槽键
+    trigger_variant_name: str                     # trigger positive 变体名
+    partner_slot_key: str                         # partner 交付槽键
+    partner_variant_name: str                     # partner positive 变体名
+
+
+@dataclass(frozen=True)
 class ScenarioPlan(_ImmutableCarrier):
     """唯一 OPTIMAL 解码得到的完整冻结场景计划。"""
 
@@ -198,6 +211,9 @@ class ScenarioPlan(_ImmutableCarrier):
     delivery_slots: tuple[DeliverySlot, ...]      # 声明序交付槽
     noise_slots: tuple[NoiseSlot, ...]            # 精确 noise 槽
     replay_layouts: tuple[ReplayLayout, ...]      # 精确 replay 布局
+    interleaving_layouts: tuple[InterleavingLayout, ...]  # 冻结交织配对
+    interleaving_opportunities: int               # 全局交织抽取机会数
+    interleaving_pattern_opportunities: Mapping[str, int]  # pattern 可选机会数
     primary_sessions: int                         # primary session 数
     digest: str                                   # 规范化计划摘要
 

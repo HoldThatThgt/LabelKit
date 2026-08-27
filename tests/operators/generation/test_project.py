@@ -19,12 +19,14 @@ from types import MappingProxyType, SimpleNamespace
 import pytest
 
 from labelkit.common.config._temporal import IntervalContainmentSpec
+from labelkit.common.config.generation import InterleavingPatternSpec, InterleavingSpec
 from labelkit.common.config.model import TimeBindingSpec
 from labelkit.common.contracts.generation import (
     ActorView,
     DedupReservation,
     EventTrace,
     EventTruth,
+    InterleavingLayout,
     NoiseCandidateReconcileRequest,
     NoiseProjectionRequest,
     PatternEvaluation,
@@ -67,6 +69,7 @@ from labelkit.operators.generation.project import (
     reconcile_primary_candidate,
     reconcile_views,
     scenario_plan_digest,
+    validate_plan_identity,
 )
 _RETAINED_CAP = 536_870_912
 _RSS_LIMIT_BYTES = 4 * 1024**3
@@ -130,16 +133,150 @@ def test_actual_program_and_plan_digest_fixed_vectors(declared_program):
         "delivery_slots": [dataclasses.asdict(item) for item in plan.delivery_slots],
         "noise_slots": [dataclasses.asdict(item) for item in plan.noise_slots],
         "replay_layouts": [dataclasses.asdict(item) for item in plan.replay_layouts],
+        "interleaving_layouts": [
+            dataclasses.asdict(item) for item in plan.interleaving_layouts
+        ],
+        "interleaving_opportunities": plan.interleaving_opportunities,
+        "interleaving_pattern_opportunities": dict(
+            plan.interleaving_pattern_opportunities
+        ),
         "primary_sessions": plan.primary_sessions,
     }
     assert declared_program.digest == (
-        "2c635111bb113e1329d114118cd8e7959a09f3da01129af4eea714b983217c4c"
+        "6fc6ed81b120f839d94399366e3f065ed9be43da88be74e9f3e6794ac55adf3f"
     )
     assert declared_program.digest == _independent_domain_digest(
         "generation_program", program_value,
     )
-    assert plan.digest == "ab6143d154967b90c7524b8bed0e7371cf5120c7882813368acc0a054a544d90"
+    assert plan.digest == "472a517c2d000e0e216b9c07a8cadf4bf610d6e1caf654e4ff6e170393052f2e"
     assert plan.digest == _independent_domain_digest("scenario_plan", plan_value)
+
+
+def _interleaving_digest_plan(plan):
+    """为摘要篡改测试构造一个完整交织语义材料。"""
+    trigger, partner = plan.delivery_slots[:2]
+    layout = InterleavingLayout(
+        "trigger_with_partner",
+        trigger.slot_key,
+        "positive",
+        partner.slot_key,
+        "positive",
+    )
+    return replace(
+        plan,
+        interleaving_layouts=(layout,),
+        interleaving_opportunities=1,
+        interleaving_pattern_opportunities={"trigger_with_partner": 1},
+        primary_sessions=plan.primary_sessions - 1,
+        digest="",
+    )
+
+
+def _stable_digest_program(program):
+    """把 fixed-vector program 中的 checkout 路径替换为稳定语义值。"""
+    class_views = {
+        name: replace(
+            view,
+            sequence_generation=replace(
+                view.sequence_generation,
+                initial_state_catalog_path=(
+                    "/labelkit-test-fixture/catalogs/ticket-booking.jsonl"
+                ),
+            ),
+        )
+        for name, view in program.class_views.items()
+    }
+    state_validator = replace(
+        program.state_validator,
+        reference="/labelkit-test-fixture/hooks.py:validate_state",
+    )
+    stable = replace(
+        program,
+        class_views=MappingProxyType(class_views),
+        state_validator=state_validator,
+        digest="",
+    )
+    return replace(stable, digest=generation_program_digest(stable))
+
+
+def _tampered_block_plans(plan):
+    """返回 exact timestamp 与 session 的独立 block 变更。"""
+    blocks = [dict(block) for block in plan.blocks]
+    block = next(item for item in blocks if item)
+    key, events = next(iter(block.items()))
+    changed_time = replace(events[0], timestamp_us=events[0].timestamp_us + 1_000)
+    block[key] = (changed_time, *events[1:])
+    session_blocks = [dict(item) for item in plan.blocks]
+    session_block = next(item for item in session_blocks if item)
+    session_key, session_events = next(iter(session_block.items()))
+    changed_session = replace(session_events[0], session_id="forged-session")
+    session_block[session_key] = (changed_session, *session_events[1:])
+    return replace(plan, blocks=tuple(blocks)), replace(plan, blocks=tuple(session_blocks))
+
+
+def _tampered_interleaving_digest_plans(plan):
+    """返回覆盖全部交织摘要材料的独立变更。"""
+    layout = plan.interleaving_layouts[0]
+    return (
+        replace(plan, interleaving_opportunities=2),
+        replace(plan, interleaving_pattern_opportunities={"trigger_with_partner": 2}),
+        replace(plan, interleaving_pattern_opportunities={"forged_pattern": 1}),
+        replace(
+            plan,
+            interleaving_layouts=(replace(layout, pattern_name="forged-pattern"),),
+        ),
+        replace(
+            plan,
+            interleaving_layouts=(replace(layout, trigger_slot_key="forged-trigger"),),
+        ),
+        replace(
+            plan,
+            interleaving_layouts=(replace(layout, trigger_variant_name="forged-trigger"),),
+        ),
+        replace(
+            plan,
+            interleaving_layouts=(replace(layout, partner_slot_key="forged-partner"),),
+        ),
+        replace(
+            plan,
+            interleaving_layouts=(replace(layout, partner_variant_name="forged-partner"),),
+        ),
+        *_tampered_block_plans(plan),
+    )
+
+
+def test_plan_digest_covers_interleaving_opportunities_pair_and_blocks(declared_program):
+    """plan digest 显式覆盖机会统计、配对身份及 exact block 时间身份。"""
+    program = _stable_digest_program(declared_program)
+    base = _interleaving_digest_plan(compile_scenario_plan(program))
+    digest = scenario_plan_digest(base)
+    assert digest == (
+        "f7c3cc1e5c0f62d80cc0416295399d028be509c69bc6077676dac6de52252b34"
+    )
+    assert all(
+        scenario_plan_digest(item) != digest
+        for item in _tampered_interleaving_digest_plans(base)
+    )
+
+
+def test_plan_identity_rejects_coordinated_interleaving_tamper(declared_program):
+    """协调重算摘要仍不能把交织载体伪装成 canonical plan。"""
+    plan = compile_scenario_plan(declared_program)
+    synthetic = _interleaving_digest_plan(plan)
+    tampers = (
+        replace(plan, interleaving_opportunities=1, digest=""),
+        replace(
+            plan,
+            interleaving_pattern_opportunities={"trigger_with_partner": 1},
+            digest="",
+        ),
+        replace(plan, interleaving_layouts=synthetic.interleaving_layouts, digest=""),
+        *_tampered_block_plans(plan),
+    )
+    for item in tampers:
+        forged = replace(item, digest=scenario_plan_digest(item))
+        with pytest.raises(InternalError, match="canonical planner"):
+            validate_plan_identity(declared_program, forged)
 
 
 def test_far_future_timestamp_round_trips_without_float_drift(declared_program):
@@ -213,9 +350,9 @@ def _payload(role: str) -> dict:
     }
 
 
-def _trace(program, plan, variant_name: str = "positive"):
+def _trace(program, plan, variant_name: str = "positive", slot_index: int = 0):
     """从计划 witness 构造一个完整 declared EventTrace。"""
-    slot = plan.delivery_slots[0]
+    slot = plan.delivery_slots[slot_index]
     planned = _branch(plan, slot.slot_key, variant_name)
     pattern = program.patterns[slot.pattern_name]
     source = next(item for item in program.counterfactual_sets if item.name == slot.source_name)
@@ -260,6 +397,39 @@ def _trace(program, plan, variant_name: str = "positive"):
         seed, tuple(events), seed.initial_state, PatternEvaluation(bindings, violations),
         state, semantic,
     )
+
+
+def _paired_positive_program(program):
+    """构造两个 positive 候选且强制配对的冻结程序。"""
+    source = program.counterfactual_sets[0]
+    positive = next(item for item in source.variants if item.kind == "positive")
+    trigger = replace(
+        source,
+        name="projection_trigger",
+        count=1,
+        interleaving_candidate_set="projection_trigger",
+        variants=(positive,),
+    )
+    partner = replace(
+        source,
+        name="projection_partner",
+        count=1,
+        interleaving_candidate_set="projection_partner",
+        variants=(positive,),
+    )
+    pattern = InterleavingPatternSpec(
+        "projection_pair", "projection_trigger", "projection_partner", 1,
+    )
+    timeline = replace(program.timeline, noise_events=0, duplicate_sequences=0)
+    base = replace(
+        program,
+        counterfactual_sets=(trigger, partner),
+        interleaving=InterleavingSpec(0, (pattern,)),
+        timeline=timeline,
+        noise=None,
+        digest="",
+    )
+    return replace(base, digest=generation_program_digest(base))
 
 
 def _sequence_rows(projection, planned) -> SequenceRows:
@@ -328,8 +498,6 @@ def projected_set(declared_program):
     positive = next(variant for variant in source.variants if variant.kind == "positive")
     timeline = replace(
         declared_program.timeline,
-        primary_sessions=1,
-        crossed_primary_sessions=0,
         noise_events=2,
         duplicate_sequences=1,
     )
@@ -354,6 +522,51 @@ def projected_set(declared_program):
         program, plan, plan.replay_layouts[0], sequence,
     ))
     return program, plan, projection, sequence, noise, replay
+
+
+def test_projection_and_reconcile_accept_shared_interleaving_session(declared_program):
+    """两个 owner 的 positive branch 可投影并对账为同一个 primary session。"""
+    program = _paired_positive_program(declared_program)
+    plan = compile_scenario_plan(program)
+    assert len(plan.interleaving_layouts) == 1
+    assert plan.primary_sessions == 1
+    witnesses = []
+    sequences = []
+    session_ids = set()
+    for slot_index in range(2):
+        slot, trace = _trace(program, plan, slot_index=slot_index)
+        projection = project_trace(ProjectionRequest(program, plan, slot, trace))
+        planned = _branch(plan, slot.slot_key, "positive")
+        sequence = _sequence_rows(projection, planned)
+        session_ids.add(planned[0].session_id)
+        assert sequence.main_row["_meta"]["stream"]["session_id"] == planned[0].session_id
+        witness = projection_witness(projection)
+        reconcile_primary_candidate(PrimaryCandidateReconcileRequest(
+            program,
+            plan,
+            "a" * 32,
+            slot,
+            (witness,),
+            (sequence,),
+            (),
+            (),
+            sequence.retained_content_bytes,
+        ))
+        witnesses.append(witness)
+        sequences.append(sequence)
+    assert len(session_ids) == 1
+    retained = sum(item.retained_content_bytes for item in sequences)
+    reconcile_views(ReconcileRequest(
+        program,
+        plan,
+        "a" * 32,
+        tuple(witnesses),
+        tuple(sequences),
+        (),
+        (),
+        (),
+        retained,
+    ))
 
 
 def _thaw(value):
@@ -439,8 +652,6 @@ def _build_temporal_projected_set(declared_program):
     positive = next(item for item in source.variants if item.kind == "positive")
     timeline = replace(
         declared_program.timeline,
-        primary_sessions=1,
-        crossed_primary_sessions=0,
         noise_events=1,
         duplicate_sequences=1,
     )
@@ -608,8 +819,6 @@ def _single_final_request(program):
     positive = next(variant for variant in source.variants if variant.kind == "positive")
     timeline = replace(
         program.timeline,
-        primary_sessions=1,
-        crossed_primary_sessions=0,
         noise_events=1,
         duplicate_sequences=1,
     )
@@ -1565,7 +1774,9 @@ def _checker_report_fixture(checker):
     expected = {
         "mode": "declared", "planned_sets": 2, "delivered_sets": 2,
         "planned_sequences": 8, "delivered_sequences": 8, "primary_events": 22,
-        "primary_sessions": 8, "crossed_primary_sessions": 0, "noise_events": 2,
+        "interleaving_opportunities": 0, "primary_sessions": 8,
+        "interleaved_primary_sessions": 0, "by_interleaving_pattern": {},
+        "noise_events": 2,
         "replay_sequences": 1, "replay_events": 3, "replay_tail_sessions": 1,
         "stream_rows": 27,
     }
@@ -1586,6 +1797,7 @@ def _checker_report_fixture(checker):
         "delivery_digest": "c" * 64,
         "artifacts_committed": True,
         "program_digest": "d" * 64,
+        "plan_digest": "e" * 64,
         **{key: value for key, value in expected.items() if key != "mode"},
         "sequence_slot_attempts": 2,
         "noise_slot_attempts": 2,

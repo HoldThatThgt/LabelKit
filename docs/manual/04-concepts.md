@@ -56,7 +56,8 @@ emitted + dropped_dup + dropped_lowq + dropped_verify [+ dropped_noise] + failed
 
 序列生成把一条最终 sequence 作为一个流水线信封；成员事件只存在于 main 的成员视图和 stream 工件，
 不加入普通 process 守恒式。它另在 `report.generate.sequence` 中精确对账 sets、sequences、primary/noise/replay
-events 与 stream rows。分段产生的 `absorbed`、`dropped_noise`、`episodes`，以及缝合产生的 `stitched`，
+events、stream rows，以及由可见 primary branch 与交织布局派生的 session 数。分段产生的 `absorbed`、
+`dropped_noise`、`episodes`，以及缝合产生的 `stitched`，
 仍只属于 process stream 模式。熔断或流模式优雅中断时，普通守恒式还可能出现 `unprocessed`。
 
 ## 4.3 批（Batch）：流动与屏障
@@ -113,7 +114,7 @@ flat 回流子批）。sequence 不采用普通批：它有一个从当前声明
 | `generate.form = "sequence"` ⇒ `generate_only` + text + global dedup + inline metadata + no rejects | 序列以 whole-set 事务交付，不使用普通 rejects 或部分交付 |
 | sequence form ⇒ `classify` 与 `frame.classify` 关闭 | sequence/frame classification 由冻结计划机械写为 inherited，不发分类调用 |
 | sequence form ⇒ semantic/evaluation profile 名不同且都有 context window | 生成与盲审职责分离，完整 truth 不允许被裁剪通过 |
-| sequence form ⇒ 不允许 `--limit`、partial delivery、pairwise/top-ratio quality | 计划的精确数量、session、crossing、noise 与 replay 不能被运行参数截断 |
+| sequence form ⇒ 不允许 `--limit`、partial delivery、pairwise/top-ratio quality | 计划的精确数量、派生 session、交织机会、noise 与 replay 不能被运行参数截断 |
 | declared ⇒ pattern、role/gap、state Schema、counterfactual set 完整可编译 | 配置期先证明所有声明变体可满足非目标约束 |
 | instruction-only ⇒ 不得声明 pattern/variant/expected violation | 它是独立语义验证模式，不是 declared 的 fallback |
 

@@ -9,6 +9,7 @@ from types import MappingProxyType
 
 import pytest
 
+from labelkit.common.config.generation import InterleavingPatternSpec, InterleavingSpec
 from labelkit.common.config.model import FewShotExample, TimeBindingSpec
 from labelkit.common.errors import ConfigError
 from labelkit.operators.generation.planner import compile_scenario_plan
@@ -44,7 +45,6 @@ def _instruction_scale_config(config, *, count: int, length: int):
     source = replace(sequence.instruction_only[0], count=count, len_range=(length, length))
     timeline = replace(
         sequence.timeline,
-        primary_sessions=count,
         session_max_events=max(sequence.timeline.session_max_events, length),
     )
     return replace(
@@ -99,8 +99,6 @@ def _max_declared_config(config):
     ))
     timeline = replace(
         sequence.timeline,
-        primary_sessions=8,
-        crossed_primary_sessions=0,
         session_max_events=32,
         noise_events=0,
         duplicate_sequences=0,
@@ -122,6 +120,114 @@ def test_program_digest_is_deterministic_and_covers_frozen_semantics(declared_co
     assert len(first.digest) == 64
     assert first.calendar_windows
     assert first.state_validator.reference.endswith("hooks.py:validate_state")
+
+
+def test_program_compiler_rejects_non_sequence_form(declared_config):
+    """编译入口必须拒绝被协调篡改为 flat 的 ResolvedConfig。"""
+    config = replace(
+        declared_config,
+        generate=replace(declared_config.generate, form="flat"),
+    )
+    with pytest.raises(ConfigError, match="requires generate.form = sequence"):
+        compile_generation_program(config)
+
+
+def _interleaving_config(config):
+    """从教学配置构造两个候选集与一个合法交织 pattern。"""
+    sequence = config.sequence_generation
+    class_views = {
+        name: replace(
+            view,
+            sequence_generation=replace(
+                view.sequence_generation,
+                initial_state_catalog_path=(
+                    "/labelkit-test-fixture/catalogs/ticket-booking.jsonl"
+                ),
+            ),
+        )
+        for name, view in config.class_views.items()
+    }
+    state_validator = replace(
+        sequence.state_validator,
+        reference="/labelkit-test-fixture/hooks.py:validate_state",
+    )
+    source = sequence.counterfactual_sets[0]
+    trigger = replace(
+        source,
+        name="trigger_source",
+        count=1,
+        interleaving_candidate_set="trigger_candidates",
+    )
+    partner = replace(
+        source,
+        name="partner_source",
+        count=1,
+        interleaving_candidate_set="partner_candidates",
+    )
+    pattern = InterleavingPatternSpec(
+        "trigger_with_partner",
+        "trigger_candidates",
+        "partner_candidates",
+        3,
+    )
+    updated = replace(
+        sequence,
+        state_validator=state_validator,
+        counterfactual_sets=(trigger, partner),
+        interleaving=InterleavingSpec(2, (pattern,)),
+    )
+    return replace(
+        config,
+        class_views=MappingProxyType(class_views),
+        sequence_generation=updated,
+    )
+
+
+def test_program_digest_recursively_covers_interleaving_configuration(declared_config):
+    """候选归属、pattern 关系和两个权重均进入 program digest。"""
+    program = compile_generation_program(_interleaving_config(declared_config))
+    assert program.digest == (
+        "ee1c7ba6655081ea5771727682aa2297072235474f2a64bc21a79b3c846f3aec"
+    )
+    source = program.counterfactual_sets[0]
+    pattern = program.interleaving.patterns[0]
+    mutations = (
+        replace(
+            program,
+            counterfactual_sets=(
+                replace(source, interleaving_candidate_set="changed_candidates"),
+                *program.counterfactual_sets[1:],
+            ),
+        ),
+        replace(
+            program,
+            interleaving=replace(program.interleaving, no_interleaving_weight=5),
+        ),
+        replace(
+            program,
+            interleaving=replace(
+                program.interleaving,
+                patterns=(replace(pattern, trigger_candidate_set="changed_candidates"),),
+            ),
+        ),
+        replace(
+            program,
+            interleaving=replace(
+                program.interleaving,
+                patterns=(replace(pattern, partner_candidate_set="changed_candidates"),),
+            ),
+        ),
+        replace(
+            program,
+            interleaving=replace(
+                program.interleaving,
+                patterns=(replace(pattern, trigger_weight=4),),
+            ),
+        ),
+    )
+    expected = _interleaving_config(declared_config).sequence_generation.interleaving
+    assert program.interleaving == expected
+    assert all(generation_program_digest(item) != program.digest for item in mutations)
 
 
 def test_program_copies_and_deep_freezes_class_and_frame_views(declared_config):
@@ -285,6 +391,22 @@ def test_program_accepts_500000_record_units_with_lightweight_carrier_oracle(ins
     assert _peak_rss_bytes() < _RSS_LIMIT_BYTES
 
 
+def test_planner_accepts_500000_record_units_without_interleaving(instruction_config):
+    """真实 planner 冻结十万条四事件 sequence，并保持交织关闭。"""
+    config = _instruction_scale_config(instruction_config, count=100_000, length=4)
+    program = compile_generation_program(config)
+
+    plan = compile_scenario_plan(program)
+
+    assert plan.digest == "7b93a75e407382e24c4cd8dcfabf97cd9dfd30ff9c19ecbce166e2bfbd5d56ad"
+    assert len(plan.delivery_slots) == 100_000
+    assert sum(len(events) for block in plan.blocks for events in block.values()) == 400_000
+    assert plan.interleaving_opportunities == 0
+    assert plan.interleaving_layouts == ()
+    assert plan.primary_sessions == 100_000
+    assert _peak_rss_bytes() < _RSS_LIMIT_BYTES
+
+
 def test_program_uses_canonical_minimum_instruction_length_for_exact_scale(instruction_config):
     """len_range 上界不得把 canonical 500000 units 误报为 600000。"""
     config = _instruction_scale_config(instruction_config, count=100_000, length=4)
@@ -314,7 +436,6 @@ def test_program_rejects_500001_record_units(instruction_config):
         sequence_generation=replace(
             sequence,
             instruction_only=(*sequence.instruction_only, extra),
-            timeline=replace(sequence.timeline, primary_sessions=100_000),
         ),
     )
     assert sum(item.count * (1 + item.len_range[1])

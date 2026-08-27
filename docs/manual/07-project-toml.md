@@ -73,6 +73,7 @@ schema_inline = """
 | `[quality]` | **开** | `mode`（pairwise/pointwise）、`threshold` 或 `selection="top_ratio"`（淘汰机制）、`rubric`（评价准则） | 第 10 章 |
 | `[generate]` | 关 | `form = "flat"` 生成独立样本；`form = "sequence"` 生成有世界状态、反事实与 replay 的完整序列 | 第 12、27 章 |
 | `[generate.pattern.*]` / `[[generate.counterfactual_sets]]` | 仅 declared sequence | 命名 role/gap、状态权限、四类变体与精确 count | 第 27 章 |
+| `[generate.interleaving]` / `[generate.interleaving.pattern.*]` | 仅 declared sequence，可选 | standalone 权重、trigger 候选集、partner 候选集与 trigger 权重 | 第 27 章 |
 | `[[generate.instruction_only]]` | 仅 instruction-only sequence | 直接声明 sequence class、count、len_range、instruction 与可选 state Schema | 第 27 章 |
 | `[annotate]` | **开** | `instruction`（标注指令，开了就必填）、`examples`（few-shot）、`self_consistency`（多次采样投票） | 第 11 章 |
 | `[frame.annotate]` | 关（process 流或 sequence） | `instruction`（帧标注指令，启用必填）、`schema_path`/`schema_inline`（独立帧 Schema，恰一）、`[frame.class.<名>.annotate]`（按帧类覆盖/跳过） | 第 11、25、27 章 |
@@ -85,7 +86,11 @@ v1.8/v1.9 新增的四节同属**流模式**一族：`[stream]` 声明输入的�
 sequence form 在 `[generate]` 选择 `declared` 或 `instruction_only`。配置加载后先编译
 `GenerationProgram` 和 `ScenarioPlan`，再读取凭据和运行内容调用。declared 用命名 pattern 与
 counterfactual set；instruction-only 用独立 slot。timeline、calendar window、noise 与 replay 都属于这一个
-序列配置面。详细配置见第 27 章，全键表见附录 A.13。
+序列配置面。v1.21 的交织配置单独放在 `[generate.interleaving]`：counterfactual set 只贴
+`food_dinner` 这类短候选集标签，命名交织 pattern 再连接 trigger 与 partner 候选集。若 standalone 权重为 9、
+唯一可用 pattern 的 trigger 权重为 1，则当前机会中两者分别占 9 张票和 1 张票；这不是最终数据的固定比例。
+用户不再声明 primary session 数，Planner 从可见 branch 数与实际选中的交织布局数派生。详细配置见第 27 章，
+全键表见附录 A.13。
 
 v1.20 的业务时间配置属于 frame class 和 sequence class 本身。完整 payload/annotation Schema 用
 `x-labelkit-business-time = true` 标记每个时间叶子；M1 要求标记路径与 `time_bindings` 完全相等，并派生不含

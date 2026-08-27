@@ -1,6 +1,6 @@
 dry-run: mode=generate_only estimated_records=8 batches=2
 dry-run: estimated LLM calls — generate_calls=40 segment_calls=0 stitch_calls=0 classify_calls=0 frame_classify_calls=0 extract_calls=0 quality_calls=0 annotate_calls=8 frame_annotate_calls=0 verify_calls=0 total=48 (excludes retries and repair calls)
-dry-run: sequence plan — planned_sets=2 planned_sequences=8 primary_events=22 noise_events=2 replay_sequences=1 replay_events=3 stream_rows=27
+dry-run: sequence plan — planned_sets=2 planned_sequences=8 primary_events=22 interleaving_opportunities=0 primary_sessions=8 interleaved_primary_sessions=0 noise_events=2 replay_sequences=1 replay_events=3 stream_rows=27
 dry-run: sequence calls — scenario_seed_calls=0 baseline_event_plan_calls=6 variant_event_plan_calls=8 frame_render_calls=14 semantic_evaluation_calls=8 noise_render_calls=2 noise_evaluation_calls=2
 dry-run: sequence attempt bounds — successful_attempt_lower_bound=48 max_slot_attempts_upper_bound=384
 dry-run: no LLM calls made, no output written (no files)

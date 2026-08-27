@@ -151,7 +151,9 @@ jq -c 'select(.ev=="quality.judgment" and (.record_ids | index("6e60ce3c2d59f04d
 sequence 形态的核心账在 `report.generate.sequence`：
 
 - planned/delivered sets 与 sequences；
-- primary/noise/replay event 和 session 计数；
+- `program_digest` 与绑定完整交织决策、pair identity 和时间布局的 `plan_digest`；
+- primary/noise/replay event 计数，以及派生的 `primary_sessions` 与 `interleaved_primary_sessions`；
+- `interleaving_opportunities` 与 `by_interleaving_pattern` 的 eligible/selected 汇总；
 - `sequence_calls` 七个逻辑 family 入口；
 - `by_pattern` 的每个 variant planned/delivered；
 - 固定闭集 `rejected_attempts`；
@@ -159,6 +161,15 @@ sequence 形态的核心账在 `report.generate.sequence`：
 
 一次失败 attempt 只进入最终停止边界对应的一个 rejected bucket；内部 L3 repair 与 provider retry 不重复增加
 family call。provider fatal、plan 与 commit-I/O 是 terminal，写 `terminal_error_kind` 而不塞进 attempt bucket。
+
+交织权重是逐 opportunity 的整数票。配置 `no_interleaving_weight = 9`、唯一可用 pattern 的
+`trigger_weight = 1`，只表示当前机会的 standalone/交织概率为 9/10 与 1/10；有限样本比例可以偏离，partner pool
+耗尽后分母也会改变。report 不输出 slot identity、pair identity、owner word、payload、prompt、state 或 API key。
+真实 owner word 只能从最终 stream 的 session 与 timestamp 机械推导。
+
+教学主例未启用交织，因此报告固定为 `interleaving_opportunities = 0`、`primary_sessions = 8`、
+`interleaved_primary_sessions = 0`、`by_interleaving_pattern = {}`。instruction-only 同样输出零 opportunity、零
+交织 session 与空 pattern map；其 `primary_sessions` 仍由可见 sequence 数派生。
 
 成功与 failed report 都有同形状 `runtime` 块：`queue_high_water` / `running_high_water` 看调度接纳，
 `resource_wait_high_water` / `resource_wait_ms` 看 profile 许可，`http_pool_wait_ms` 看显式 HTTP origin admission，

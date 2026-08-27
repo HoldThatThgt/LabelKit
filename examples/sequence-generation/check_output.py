@@ -1,4 +1,4 @@
-"""验证 v1.20 序列生成教学工程的用户可见工件。"""
+"""验证 v1.21 序列生成教学工程的用户可见工件。"""
 
 from __future__ import annotations
 
@@ -19,13 +19,20 @@ OUT = ROOT / "out"
 HEX32 = frozenset("0123456789abcdef")
 SEQUENCE_REPORT_ORDER = (
     "mode", "run_attempt_id", "run_id", "delivery_digest", "artifacts_committed",
-    "program_digest", "planned_sets", "delivered_sets", "planned_sequences",
-    "delivered_sequences", "primary_events", "primary_sessions",
-    "crossed_primary_sessions", "noise_events", "replay_sequences", "replay_events",
+    "program_digest", "plan_digest", "planned_sets", "delivered_sets", "planned_sequences",
+    "delivered_sequences", "primary_events", "interleaving_opportunities", "primary_sessions",
+    "interleaved_primary_sessions", "by_interleaving_pattern", "noise_events",
+    "replay_sequences", "replay_events",
     "replay_tail_sessions", "stream_rows", "sequence_slot_attempts",
     "noise_slot_attempts", "sequence_calls", "by_pattern", "rejected_attempts",
 )
 SEQUENCE_REPORT_KEYS = frozenset(SEQUENCE_REPORT_ORDER)
+SEQUENCE_COUNT_KEYS = (
+    "planned_sets", "delivered_sets", "planned_sequences", "delivered_sequences",
+    "primary_events", "interleaving_opportunities", "primary_sessions",
+    "interleaved_primary_sessions", "noise_events", "replay_sequences", "replay_events",
+    "replay_tail_sessions", "stream_rows", "sequence_slot_attempts", "noise_slot_attempts",
+)
 SEQUENCE_CALL_ORDER = (
     "scenario_seed_calls", "baseline_event_plan_calls", "variant_event_plan_calls",
     "frame_render_calls", "semantic_evaluation_calls", "noise_render_calls",
@@ -222,11 +229,11 @@ def _assert_sequence_report(
     """校验 sequence report 的完整闭集、重试守恒与教学计划算术。"""
     assert tuple(sequence) == SEQUENCE_REPORT_ORDER, "Sequence report fields differ"
     assert _is_hex32(sequence["run_attempt_id"]) and _is_hex32(sequence["run_id"])
-    assert _is_hex64(sequence["program_digest"])
+    assert _is_hex64(sequence["program_digest"]) and _is_hex64(sequence["plan_digest"])
     assert _is_hex64(sequence["delivery_digest"])
     assert sequence["artifacts_committed"] is True
     assert type(max_slot_attempts) is int and max_slot_attempts > 0
-    for key in SEQUENCE_REPORT_ORDER[6:20]:
+    for key in SEQUENCE_COUNT_KEYS:
         assert type(sequence[key]) is int and sequence[key] >= 0, (
             f"Sequence report count is not an integer: {key}"
         )
@@ -244,6 +251,11 @@ def _assert_sequence_report(
     for variants in observed_patterns.values():
         for counts in variants.values():
             assert all(type(value) is int and value >= 0 for value in counts.values())
+    interleaving = sequence["by_interleaving_pattern"]
+    assert isinstance(interleaving, dict), "Interleaving pattern report is not an object"
+    for counts in interleaving.values():
+        assert tuple(counts) == ("eligible_opportunities", "selected_sessions")
+        assert all(type(value) is int and value >= 0 for value in counts.values())
     rejected = sequence["rejected_attempts"]
     assert tuple(rejected) == REJECTION_ORDER, "Rejection report fields differ"
     assert all(type(value) is int and value >= 0 for value in rejected.values())
@@ -805,7 +817,9 @@ def check_declared() -> None:
         {
             "mode": "declared", "planned_sets": 2, "delivered_sets": 2,
             "planned_sequences": 8, "delivered_sequences": 8, "primary_events": 22,
-            "primary_sessions": 8, "crossed_primary_sessions": 0, "noise_events": 2,
+            "interleaving_opportunities": 0, "primary_sessions": 8,
+            "interleaved_primary_sessions": 0, "by_interleaving_pattern": {},
+            "noise_events": 2,
             "replay_sequences": 1, "replay_events": 3, "replay_tail_sessions": 1,
             "stream_rows": 27,
         },
@@ -852,7 +866,9 @@ def check_instruction_only() -> None:
         {
             "mode": "instruction_only", "planned_sets": 1, "delivered_sets": 1,
             "planned_sequences": 1, "delivered_sequences": 1, "primary_events": 3,
-            "primary_sessions": 1, "crossed_primary_sessions": 0, "noise_events": 0,
+            "interleaving_opportunities": 0, "primary_sessions": 1,
+            "interleaved_primary_sessions": 0, "by_interleaving_pattern": {},
+            "noise_events": 0,
             "replay_sequences": 0, "replay_events": 0, "replay_tail_sessions": 0,
             "stream_rows": 3,
         },
@@ -955,7 +971,9 @@ def check_frame_only() -> None:
         {
             "mode": "instruction_only", "planned_sets": 1, "delivered_sets": 1,
             "planned_sequences": 1, "delivered_sequences": 1, "primary_events": 3,
-            "primary_sessions": 1, "crossed_primary_sessions": 0, "noise_events": 0,
+            "interleaving_opportunities": 0, "primary_sessions": 1,
+            "interleaved_primary_sessions": 0, "by_interleaving_pattern": {},
+            "noise_events": 0,
             "replay_sequences": 0, "replay_events": 0, "replay_tail_sessions": 0,
             "stream_rows": 3,
         },

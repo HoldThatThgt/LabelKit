@@ -39,8 +39,9 @@ def parse_generation_config(
     """解析并校验 sequence 生成配置。"""
 ~~~
 
-**模块内文件组织：**公开面仍由 `labelkit/common/config/` 导出；新增的 sequence 配置解析单独落
-`generation.py`，不把互斥形态塞进一个可空字段长表。
+**模块内文件组织：**公开面仍由 `labelkit/common/config/` 导出；sequence 主配置解析落
+`generation.py`，timeline 解析、派生 session 计数校验与交织解析落 `_sequence_layout.py`，不继续膨胀
+已接近文件上限的聚合模块，也不建立第二个配置层。
 
 ~~~text
 labelkit/common/config/
@@ -48,6 +49,7 @@ labelkit/common/config/
 ├── model.py
 ├── loader.py
 ├── generation.py
+├── _sequence_layout.py
 ├── _collect.py
 ├── _sections.py
 ├── _constraints.py
@@ -71,16 +73,17 @@ labelkit/common/config/
 | frame class | 每个 role、instruction-only 闭集或 noise 引用的 frame class 都必须有非空生成 instruction 和 object JSON Schema；完整 Schema 中 `x-labelkit-business-time = true` 的 path 集与 `time_bindings` path 集完全相等，M1 冻结剥离时间叶子的 model Schema；`duration_s` 精确量化为正整数毫秒，resource 名唯一且符合 `[a-z0-9_]+`，非空 resource 要求正 duration。sequence 不接受 string payload。 |
 | pattern | description 非空；role 名唯一且每个恰出现一次；`order` 恰好排列全部 role；`max_span_s > 0` 必填。每个相邻 role pair 恰有一条具名 gap，`max_gap_s` 必填；可加唯一、正向的非相邻 gap。秒值最多六位小数且必须毫秒对齐。containment 两端各出现一次、正 duration、不同且不共享 resource；missing-container 但保留 contained 失败。missing 目标 frame class 在 pattern 内唯一；reordered 目标相邻且 frame class 不同。 |
 | role 权限与 binding | roots 按 RFC 6901 token 前缀校验，同一列表内禁止祖先/后代冗余，三个列表之间可相交。patch 只允许 `test/add/remove/replace` 且至少以一个 `test` 开头；test 落 read roots，写操作落 write roots。publish roots 在事件后必须存在。state payload binding 的 path 与 frame time binding path 不得相等或互为前缀。模型只面向 model Schema；generic finalizer 先机械覆盖 state payload binding，再注入时间并执行完整 Schema。 |
-| counterfactual set | 每组至少一个 variant；name 与预期违规签名唯一；每个 variant 都有 outcome Schema，且根级 `examples` 至少有一个通过完整 Schema 的 object。positive 可不声明但 baseline 永远存在。missing、reordered、interval_exceeded 只能产生对应唯一结构违规；编译器必须证明目标变换仍满足所有非目标 gap、`max_span_s` 与日历约束。 |
-| instruction-only | 每行 name 有效，count 为精确序列数，`len_range` 在 1..8。禁止 pattern、counterfactual set、role permission、outcome Schema 与 expected violation；只允许 LLM 从已声明 object frame class 闭集选类和 seed actor。显式 state Schema 根级 `examples` 至少有一个通过完整 Schema 的 object；缺省 state Schema 只要求 object 并以 `{}` 作固定 witness；不支持 catalog。 |
-| timeline 与 calendar | `timestamp_start` 含显式 offset；Planner quantum 固定 1000 微秒，全部 start/duration/gap/boundary/shift 毫秒对齐。gap 是 start-to-start；max span、session span 与 calendar 使用完整 interval envelope。primary 总数为 N、crossed 数为 D 时必须 `primary_sessions = N - D`；instruction-only 还要求 D = 0、`primary_sessions = N`、`duplicate_sequences = 0`。 |
+| counterfactual set | 每组至少一个 variant；name 与预期违规签名唯一；每个 variant 都有 outcome Schema，且根级 `examples` 至少有一个通过完整 Schema 的 object。positive 可不声明但 baseline 永远存在。missing、reordered、interval_exceeded 只能产生对应唯一结构违规；编译器必须证明目标变换仍满足所有非目标 gap、`max_span_s` 与日历约束。`interleaving_candidate_set` 可选且必须匹配 `[a-z0-9_]+`；带标签的 set 必须有且仅有一个 positive variant，只有该可见 branch 进候选集。 |
+| 交织配置 | `[generate.interleaving]` 与全部 candidate set 标签必须同时在场或同时缺省；无隐式默认。candidate set 与 pattern name 精确匹配 `[a-z0-9_]+`，不支持 selector DSL、glob、regex、前缀、列表或表达式。`no_interleaving_weight` 是非负 TOML int64，`trigger_weight` 是正 TOML int64；bool/float/越界或任一 opportunity 总权重超过 `2^63-1` 均失败。trigger/partner 必须存在、非空且不同；同一 candidate set 不得同时承担两种角色；所有已声明 candidate set 必须被引用。一个 trigger set 可对应多个 pattern，一个 partner set 可被多个 pattern 共享同一不放回 pool。flat/instruction-only 禁止本章节和标签。 |
+| instruction-only | 每行 name 有效，count 为精确序列数，`len_range` 在 1..8。禁止 pattern、counterfactual set、role permission、outcome Schema、expected violation、交织章节与 candidate set 标签；只允许 LLM 从已声明 object frame class 闭集选类和 seed actor。显式 state Schema 根级 `examples` 至少有一个通过完整 Schema 的 object；缺省 state Schema 只要求 object 并以 `{}` 作固定 witness；不支持 catalog。 |
+| timeline 与 calendar | `timestamp_start` 含显式 offset；Planner quantum 固定 1000 微秒，全部 start/duration/gap/boundary/shift 毫秒对齐。gap 是 start-to-start；max span、session span 与 calendar 使用完整 interval envelope。旧 `[generate.timeline].primary_sessions` 与 `crossed_primary_sessions` 必须定向拒绝。可见 primary branch 为 N、冻结交织布局为 D 时，计划派生 `primary_sessions=N-D`、`interleaved_primary_sessions=D`；instruction-only 因为不交织而派生 `primary_sessions=N`，且 `duplicate_sequences=0`。 |
 | noise 与 replay | `noise_events > 0` 时 `generate.noise` 必填；noise frame class 必须是 point class，noise 无 owner、resource、patch。replay 从 positive primary 按声明序无放回选源；每个 replay 独占尾部 session并冻结一个正 constant `shift_us`，所有 source delta/duration/resources 保持。 |
 | 静态上限 | roles ≤ 32，variants/set ≤ 8，instruction-only events ≤ 8；seed、Schema、patch、payload、单个完整运行期 prompt value、单轮新增 L3 正文集合、单项 generation prompt text 分别执行第 6 章固定字节上限。M1 以根 examples 选择最小有效 witness，并用共享 prompt 构造器加动态 byte 包络证明六个 family 的首轮与 repair profile；运行期同界零派发拒绝。派生 `record_units` 与 `stream_rows` 均不超过 500000；`retained_content_bytes` 上限 536870912 在运行期 whole-attempt 预收费。 |
 | quality | sequence 若启用 quality，只允许 pointwise、固定 threshold；pairwise、`top_ratio`、任何会让同一组成员互相影响的 selection 及任何生效的按类 quality override 均为 CONFIG_ERROR。 |
 | 路径 | project TOML 的相对路径统一相对 `project_root`；CLI input/output 相对调用 cwd 后再覆盖。sequence 一次冻结 main、stream、report、manifest 与 failed_report，rejects 与 sidecar 为 null；全部路径冲突、非同目录 `.part` 或不可写均在启动期失败；任一既存 fixed/part 目标必须是非符号链接、可写普通文件。 |
 | hook | 所有 hook 使用 `<python-file>:<attribute-path>`，相对文件按 project root 解析；M1 用文件路径加载并冻结 callable，不改 `sys.path`。sequence 的 `state_validator` 签名是 `validate_state(StateTransitionInput) -> list[str]`，只接收不可变副本。 |
-| program 编译接缝 | M1 返回后，operators 层 `GenerationProgramCompiler` 在凭据物化前只读 `ResolvedConfig.sequence_generation` 与 M1 冻结的 ClassView，解析引用、Schema、Pointer、hook 和 catalog，冻结 expected violation、校验 delivery slot 精确数量与声明序、计算调用上界与 canonical digest；不构造 `DeliverySlot`、不抽样、不调用 LLM、不执行下游 stage。实际 slot 及 `catalog_row_index` 只由 `ScenarioPlan` 按 class、声明序与 scenario index 确定性冻结；LLM source 的索引为 null，slot 重试不换行。 |
-| planner 接缝 | 编排层让 validate、dry-run、run 共用 operators 层 `compile_scenario_plan(program)`、block allocator 与 CP-SAT model builder；`run.seed` 已冻结进 `GenerationProgram.planner_seed` 和 digest。单 block 最多 4096 primary events；OR-Tools 单 worker，确定性 seed，每个优化层 `max_deterministic_time = 10.0`。只有 OPTIMAL 可解码；INFEASIBLE 为 exit 2，FEASIBLE/UNKNOWN 与 MODEL_INVALID 为 exit 4；不使用 incumbent 或替代 planner。 |
+| program 编译接缝 | M1 返回后，operators 层 `GenerationProgramCompiler` 在凭据物化前只读 `ResolvedConfig.sequence_generation` 与 M1 冻结的 ClassView，解析引用、Schema、Pointer、hook 和 catalog，冻结 expected violation、candidate set 归属、named interleaving pattern 与权重，校验 delivery slot 精确数量与声明序、计算调用上界与递归覆盖交织配置的 canonical digest；不构造 `DeliverySlot`、不抽样、不调用 LLM、不执行下游 stage。实际 slot 及 `catalog_row_index` 只由 `ScenarioPlan` 按 class、声明序与 scenario index 确定性冻结；LLM source 的索引为 null，slot 重试不换行。 |
+| planner 接缝 | 编排层让 validate、dry-run、run 共用 operators 层 `compile_scenario_plan(program)`、block allocator 与 CP-SAT model builder；`run.seed` 已冻结进 `GenerationProgram.planner_seed` 和 digest。Planner 按 DeliverySlot 声明序扫描 trigger；至少一个对应共享 partner pool 非空才计 opportunity。none 只在分母出现一次，pattern ticket 不乘 partner 数；pattern 与 partner 使用独立 SHA-256 整数拒绝采样域，partner 按声明序 pool 无偏抽取后 swap-delete。选中 pair 才建 CP-SAT 布局，不为未选 partner 试跑；选中无可行布局为 `generation_plan_infeasible`、exit 2，不换 pair/pattern/none 或 standalone。单 block 最多 4096 primary events；OR-Tools 单 worker，确定性 seed，每个优化层 `max_deterministic_time = 10.0`。只有 OPTIMAL 可解码；FEASIBLE/UNKNOWN 为 `generation_plan_budget`、exit 4，MODEL_INVALID 为 `generation_plan_internal`、exit 4；不使用 incumbent 或替代 planner。 |
 | console 与上下文预算 | 既有 console 推导不变。sequence 的六个 family 由 `generation_prompts.py` 同时供 M1 与运行期构造；`_generation_budget.py` 对配置态完整 PromptBundle、Schema、动态值 byte 包络与 repair 新增正文包络取 profile 最大值。seed、ActorView、patch、payload、完整 EventDraft history 与 blind semantic review 输入禁止裁剪或摘要；不适配完整上下文时配置失败或消耗当前 slot attempt。semantic request 本身不得携带 `EventTrace`、variant/target/expected/actual violation 或其他 evaluator truth。 |
 
 **v1.20 Schema 投影。**业务时间标记只能位于显式 `properties` 下的 integer/string 标量叶子；标记在场时必须为

@@ -60,7 +60,6 @@ def _copy_project(
     text = project_path.read_text(encoding="utf-8")
     if one_set:
         text = text.replace("count = 2", "count = 1", 1)
-        text = text.replace("primary_sessions = 8", "primary_sessions = 4", 1)
         if not keep_noise:
             text = text.replace("noise_events = 2", "noise_events = 0", 1)
         text = text.replace("duplicate_sequences = 1", "duplicate_sequences = 0", 1)

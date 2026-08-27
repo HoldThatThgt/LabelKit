@@ -1,4 +1,4 @@
-"""ResolvedConfig 到 v1.20 GenerationProgram 的纯编译器。"""
+"""ResolvedConfig 到 v1.21 GenerationProgram 的纯编译器。"""
 from __future__ import annotations
 
 import dataclasses
@@ -47,6 +47,7 @@ def compile_generation_program(config: ResolvedConfig) -> GenerationProgram:
         patterns=patterns,
         counterfactual_sets=sequence.counterfactual_sets,
         instruction_only=sequence.instruction_only,
+        interleaving=sequence.interleaving,
         timeline=sequence.timeline,
         calendar_windows=dict(sequence.calendar_windows),
         noise=sequence.noise,
@@ -68,10 +69,6 @@ def _compiler_errors(config: "ResolvedConfig") -> list[str]:
     sequence = config.sequence_generation
     errors: list[str] = []
     primary_sequences = _primary_sequence_count(sequence)
-    if sequence.timeline.primary_sessions != (
-        primary_sequences - sequence.timeline.crossed_primary_sessions
-    ):
-        errors.append("generation timeline primary session identity is inconsistent")
     errors.extend(_catalog_errors(config, sequence))
     errors.extend(_scale_errors(sequence, primary_sequences))
     errors.extend(_replay_errors(sequence))

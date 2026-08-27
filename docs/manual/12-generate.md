@@ -77,7 +77,7 @@ sequence 的详细配置和运行方法见第 27 章。这里先记住它与 fla
 
 - flat 的 `seed_examples`、`standalone_count`、`num_per_record`、`seeds_per_call`、`num_per_call`
   不得写进 sequence；
-- sequence 的 pattern、counterfactual set、timeline、noise 和 instruction-only slot 不得写进 flat；
+- sequence 的 pattern、counterfactual set、interleaving、timeline、noise 和 instruction-only slot 不得写进 flat；
 - 两边混写会在配置期失败，不会猜测用户意图。
 
 ## 12.4 declared：一个世界，多条可比较分支
@@ -96,6 +96,33 @@ declared 模式先声明 sequence class、frame class 和命名 pattern。patter
 
 整组变体经过状态执行、payload 渲染、独立判定、下游处理、双视图校验和 retained-bytes 预算后才提交。
 其中任何一步拒绝都会回滚整组，并在同一个 delivery slot 上重试；不会只补某一条变体。
+
+### 交织候选集与命名 pattern
+
+交织配置不要求用户枚举 `A B B A B A A` 这样的事件排列。每个参与的 counterfactual set 只贴一个
+`interleaving_candidate_set` 短标签；`[generate.interleaving.pattern.<name>]` 再声明哪个候选集是 trigger、
+哪个是 partner，以及这个 pattern 占多少整数票。短标签按精确字符串匹配，不支持 glob、regex、前缀、列表或
+表达式，也不需要把 class、日期、tier 和 App 名编码进标签。
+
+```toml
+[generate.interleaving]
+no_interleaving_weight = 9
+
+[generate.interleaving.pattern.food_with_entertainment]
+trigger_candidate_set = "food_dinner"
+partner_candidate_set = "entertainment"
+trigger_weight = 1
+```
+
+当这个 pattern 是当前唯一可用 pattern 且 partner pool 非空时，standalone 占 9 张票，交织占 1 张票。
+权重不是配额，也不保证有限数据中恰有 10% 被交织；partner pool 耗尽后，后续机会的分母会改变。只有每个
+counterfactual set 的唯一 positive branch 能进入候选集，反事实 variant、hidden baseline、noise 与 replay 都不进入。
+trigger 与 partner 必须是不同候选集，同一候选集也不能在不同 pattern 中同时承担两种角色。
+
+Planner 一旦抽中 pattern 和 partner，就冻结两条 branch 的共享 session 布局。若该 pair 无法在 calendar、resource、
+session 容量和至少三段 owner runs 的约束下布局，规划直接以 `generation_plan_infeasible` 失败；不会换 partner、
+换 pattern、退回 standalone 或在 retry 中重抽。设可见 primary branch 数为 `N`、冻结交织布局数为 `D`，报告中的
+`primary_sessions = N - D`，`interleaved_primary_sessions = D`。
 
 ## 12.5 instruction-only：自由规划，但仍要完整证明
 
@@ -119,7 +146,8 @@ state_schema_path = "schemas/state.json"
 ```
 
 模型在已声明 frame class 的闭集中选择每个事件的 frame class 与 actor。它没有 pattern、variant、
-expected violation 或 declared role 权限；每条 sequence 仍要通过状态后置验证、语义判定、下游处理和原子提交。
+expected violation 或 declared role 权限，也禁止 `interleaving_candidate_set` 与 `[generate.interleaving]`；每条
+sequence 仍要通过状态后置验证、语义判定、下游处理和原子提交。
 
 ## 12.6 世界状态与隐藏信息
 

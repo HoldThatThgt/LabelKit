@@ -1,4 +1,4 @@
-"""v1.20 确定性点与区间 CP-SAT ScenarioPlan 编译器。"""
+"""v1.21 确定性点、区间与交织 ScenarioPlan 编译器。"""
 from __future__ import annotations
 
 import dataclasses
@@ -16,6 +16,7 @@ from labelkit.common.config.generation import is_generation_frame_eligible
 from labelkit.common.contracts.generation import (
     DeliverySlot,
     GenerationProgram,
+    InterleavingLayout,
     NoiseSlot,
     PlannedEvent,
     ReplayLayout,
@@ -25,6 +26,7 @@ from labelkit.common.errors import ConfigError, InternalError
 from labelkit.operators.generation.project import (
     derive_generation_id,
     generation_digest,
+    generation_random,
     scenario_plan_digest,
 )
 
@@ -57,22 +59,31 @@ class _PlacedBranch:
 
 
 @dataclass(frozen=True)
-class _CrossRequest:
-    """一个待真正交织的双 owner session。"""
+class _InterleavingPair:
+    """一个冻结的 trigger/partner 交织配对。"""
+
+    layout: InterleavingLayout  # 对外冻结配对身份。
+    trigger: _LogicalBranch  # trigger positive branch。
+    partner: _LogicalBranch  # partner positive branch。
+
+
+@dataclass(frozen=True)
+class _InterleavingSelection:
+    """一次精确抽取后的交织决策与机会统计。"""
+
+    pairs: tuple[_InterleavingPair, ...]  # 按 trigger scan 顺序的配对。
+    opportunities: int  # 全局抽取机会数。
+    pattern_opportunities: tuple[tuple[str, int], ...]  # pattern 声明序机会数。
+
+
+@dataclass(frozen=True)
+class _InterleavingRequest:
+    """一个只允许整体平移的双 branch 布局请求。"""
 
     program: GenerationProgram  # 冻结生成程序。
-    left: _LogicalBranch  # 声明序左 branch。
-    right: _LogicalBranch  # 声明序右 branch。
+    pair: _InterleavingPair  # 已冻结且不可重抽的配对。
     lower: int  # 该 session 全部事件的下界。
-    seed: int  # 交织 CP-SAT 随机种子。
-
-
-class _PrimaryLayoutInfeasible(Exception):
-    """当前 crossing 选择的任一绝对 primary 布局不可行。"""
-
-
-class _CrossingChoicesExhausted(Exception):
-    """全部满足精确 crossing 数量的选择都已被 no-good 排除。"""
+    seed: int  # 布局 CP-SAT 确定性种子。
 
 
 def compile_scenario_plan(program: GenerationProgram) -> ScenarioPlan:
@@ -89,19 +100,25 @@ def compile_scenario_plan(program: GenerationProgram) -> ScenarioPlan:
     seed = program.planner_seed
     slots = _delivery_slots(program)
     logical, baselines = _logical_branches(program, slots, seed)
-    placed = _select_primary_layout(program, logical, seed)
+    selection = _select_interleaving(program, logical)
+    placed = _place_primary(program, logical, selection)
     blocks = _allocate_blocks(program, placed, baselines)
     cursor = max((_events_tail(item.events) for item in placed),
                  default=program.timeline.timestamp_start_us)
     noise_slots, cursor = _noise_slots(program, cursor)
-    replay_layouts = _replay_layouts(program, placed, cursor)
+    replay_layouts = _replay_layouts(program, logical, placed, cursor)
     _validate_timestamp_range(program, placed, noise_slots, replay_layouts)
     base = ScenarioPlan(
         blocks=blocks,
         delivery_slots=slots,
         noise_slots=noise_slots,
         replay_layouts=replay_layouts,
-        primary_sessions=program.timeline.primary_sessions,
+        interleaving_layouts=tuple(pair.layout for pair in selection.pairs),
+        interleaving_opportunities=selection.opportunities,
+        interleaving_pattern_opportunities=MappingProxyType(
+            dict(selection.pattern_opportunities)
+        ),
+        primary_sessions=len(logical) - len(selection.pairs),
         digest="",
     )
     _preflight_temporal_values(program, base)
@@ -515,257 +532,299 @@ def _validate_logical_branch(program, pattern, branch) -> None:
            branch.variant_name or "baseline")
 
 
-def _select_primary_layout(program, branches, seed: int):
-    """用 no-good 闭包在全部 crossing 选择中求唯一可布局解。
-
-    @param program 冻结生成程序。
-    @param branches 声明序 primary branches。
-    @param seed 运行随机种子。
-    @return 已投影 primary branches。
-    """
-    forbidden: list[frozenset[int]] = []
-    while True:
-        paired = _solve_crossings(branches, program, seed, tuple(forbidden))
-        try:
-            return _place_primary(program, branches, paired, seed)
-        except _PrimaryLayoutInfeasible:
-            forbidden.append(paired)
-
-
-def _solve_crossings(branches, program, seed: int, forbidden) -> frozenset[int]:
-    """用 CP-SAT 选择不重叠的相邻 crossed-session 边界。
-
-    @param branches 按交付声明序排列的 primary branch。
-    @param program 冻结生成程序。
-    @param seed 运行随机种子。
-    @param forbidden 已证明绝对布局不可行的边界集。
-    @return 被选边界左端序号集合。
-    """
-    target = program.timeline.crossed_primary_sessions
-    if target == 0:
-        if forbidden:
-            _plan_infeasible("primary layout is infeasible")
-        return frozenset()
-    model = cp_model.CpModel()
-    choices = []
-    for index in range(len(branches) - 1):
-        different = branches[index].slot.slot_key != branches[index + 1].slot.slot_key
-        allowed = different and _relative_cross_possible(branches[index], branches[index + 1], program)
-        choice = model.new_bool_var(f"cross_{index}")
-        if not allowed:
-            model.add(choice == 0)
-        choices.append(choice)
-    for left, right in zip(choices, choices[1:]):
-        model.add(left + right <= 1)
-    for selection in forbidden:
-        model.add(sum(choices[index] for index in selection) <= target - 1)
-    model.add(sum(choices) == target)
-    model.minimize(sum((index + 1) * choice for index, choice in enumerate(choices)))
-    try:
-        solver = _solve_crossing_choice(model, _solver_seed(seed, "crossing"))
-    except _CrossingChoicesExhausted:
-        _plan_infeasible("no crossing selection has a feasible absolute primary layout")
-    return frozenset(index for index, choice in enumerate(choices) if solver.value(choice))
+def _select_interleaving(program, branches) -> _InterleavingSelection:
+    """按 trigger 声明序冻结权重抽取与共享 partner pool。"""
+    if program.interleaving is None:
+        return _InterleavingSelection((), 0, ())
+    patterns = program.interleaving.patterns
+    candidates = _positive_candidates(program, branches)
+    partner_names = {item.partner_candidate_set for item in patterns}
+    pools = {name: [] for name in partner_names}
+    for branch, candidate in candidates:
+        if candidate in pools:
+            pools[candidate].append(branch)
+    counts = {item.name: 0 for item in patterns}
+    pairs = []
+    opportunities = 0
+    for trigger, candidate in candidates:
+        applicable = tuple(
+            item for item in patterns
+            if item.trigger_candidate_set == candidate and pools[item.partner_candidate_set]
+        )
+        if not applicable:
+            continue
+        opportunities += 1
+        for item in applicable:
+            counts[item.name] += 1
+        pattern = _choose_interleaving_pattern(program, trigger, applicable)
+        if pattern is None:
+            continue
+        pool = pools[pattern.partner_candidate_set]
+        partner = _draw_partner(program, trigger, pattern, pool)
+        pairs.append(_interleaving_pair(pattern, trigger, partner))
+    ordered = tuple((item.name, counts[item.name]) for item in patterns)
+    return _InterleavingSelection(tuple(pairs), opportunities, ordered)
 
 
-def _solve_crossing_choice(model, seed: int):
-    """求解 crossing choice，并把 no-good 穷尽与预算失败分开。"""
-    solver = cp_model.CpSolver()
-    solver.parameters.num_search_workers = 1
-    solver.parameters.random_seed = seed
-    solver.parameters.max_deterministic_time = 10.0
-    status = solver.solve(model)
-    if status == cp_model.OPTIMAL:
-        return solver
-    if status == cp_model.INFEASIBLE:
-        raise _CrossingChoicesExhausted
-    if status in (cp_model.FEASIBLE, cp_model.UNKNOWN):
-        _plan_budget("CP-SAT model did not prove OPTIMAL: crossing")
-    _plan_internal("CP-SAT model is invalid: crossing")
-
-
-def _relative_cross_possible(left, right, program) -> bool:
-    """精确预判无日历平移下是否存在 A-B-A 或 B-A-B。
-
-    @param left 声明序左 branch。
-    @param right 声明序右 branch。
-    @param program 冻结生成程序。
-    @return 容量、跨度与交织同时可行时为 true。
-    """
-    timeline = program.timeline
-    if len(left.roles) + len(right.roles) > timeline.session_max_events:
-        return False
-    return all(
-        _branch_envelope_us(program, branch) <= timeline.session_max_span_us
-        for branch in (left, right)
+def _positive_candidates(program, branches):
+    """按 branch 声明序返回带标签的唯一 positive branch。"""
+    sources = {item.name: item for item in program.counterfactual_sets}
+    positive_names = {
+        item.name: next(
+            variant.name for variant in item.variants if variant.kind == "positive"
+        )
+        for item in program.counterfactual_sets
+        if item.interleaving_candidate_set is not None
+    }
+    return tuple(
+        (branch, sources[branch.slot.source_name].interleaving_candidate_set)
+        for branch in branches
+        if branch.slot.source_name in positive_names
+        and branch.variant_name == positive_names[branch.slot.source_name]
     )
 
 
-def _place_primary(program, branches, paired, seed: int) -> tuple[_PlacedBranch, ...]:
-    """按声明序投影 primary session 与全局工件时间。
+def _choose_interleaving_pattern(program, trigger, applicable):
+    """以精确整数 ticket 选择 none 或一个声明序 pattern。"""
+    none_weight = program.interleaving.no_interleaving_weight
+    total = none_weight + sum(item.trigger_weight for item in applicable)
+    material = (
+        program.digest, program.planner_seed,
+        trigger.slot.slot_key, trigger.variant_name,
+    )
+    ticket = _bounded_random("interleaving_pattern_choice", material, total)
+    if ticket < none_weight:
+        return None
+    ticket -= none_weight
+    for item in applicable:
+        if ticket < item.trigger_weight:
+            return item
+        ticket -= item.trigger_weight
+    _plan_internal("interleaving pattern ticket is outside its weight range")
 
-    @param program 冻结生成程序。
-    @param branches primary 逻辑 branches。
-    @param paired crossed 边界集合。
-    @param seed 运行随机种子。
-    @return 完整 primary branch 计划。
-    """
+
+def _draw_partner(program, trigger, pattern, pool):
+    """从共享 pool 无偏抽取并 swap-delete 一个 partner。"""
+    material = (
+        program.digest, program.planner_seed,
+        trigger.slot.slot_key, trigger.variant_name,
+        pattern.name, pattern.partner_candidate_set,
+    )
+    index = _bounded_random("interleaving_partner_choice", material, len(pool))
+    partner = pool[index]
+    pool[index] = pool[-1]
+    pool.pop()
+    return partner
+
+
+def _bounded_random(domain: str, material, upper: int) -> int:
+    """以拒绝采样把完整 SHA-256 整数无偏投影到正范围。"""
+    maximum = 1 << 256
+    limit = maximum - maximum % upper
+    counter = 0
+    while True:
+        value = generation_random(domain, [*material, counter])
+        if value < limit:
+            return value % upper
+        counter += 1
+
+
+def _interleaving_pair(pattern, trigger, partner) -> _InterleavingPair:
+    """冻结一个命名 pattern 的精确 branch identity。"""
+    layout = InterleavingLayout(
+        pattern_name=pattern.name,
+        trigger_slot_key=trigger.slot.slot_key,
+        trigger_variant_name=trigger.variant_name,
+        partner_slot_key=partner.slot.slot_key,
+        partner_variant_name=partner.variant_name,
+    )
+    return _InterleavingPair(layout, trigger, partner)
+
+
+def _branch_identity(branch) -> tuple[str, str | None]:
+    """返回一个 logical branch 的冻结身份。"""
+    return branch.slot.slot_key, branch.variant_name
+
+
+def _place_primary(program, branches, selection) -> tuple[_PlacedBranch, ...]:
+    """在较早 branch 位置投影 pair，其他 branch 保持声明序。"""
+    positions = {_branch_identity(branch): index for index, branch in enumerate(branches)}
+    by_branch = {
+        _branch_identity(branch): pair
+        for pair in selection.pairs for branch in (pair.trigger, pair.partner)
+    }
     placed: list[_PlacedBranch] = []
+    consumed: set[tuple[str, str | None]] = set()
     cursor: int | None = None
     session_index = 0
-    index = 0
-    while index < len(branches):
+    for branch in branches:
+        identity = _branch_identity(branch)
+        if identity in consumed:
+            continue
         lower = _branch_lower_bound(program, cursor, False)
-        if index in paired:
-            request = _CrossRequest(
-                program, branches[index], branches[index + 1], lower,
-                _solver_seed(seed, f"cross-layout:{index}"),
-            )
-            pair = _place_crossed_pair(request, session_index)
-            placed.extend(pair)
-            cursor = max(_events_tail(item.events) for item in pair)
-            index += 2
+        pair = by_branch.get(identity)
+        if pair is None:
+            current = _place_standalone(program, branch, lower, session_index)
         else:
-            branch = branches[index]
-            start = _earliest_calendar_start(program, branch, lower)
-            events = _planned_events(program, branch, start, session_index)
-            _check_session(program, branch.slot.slot_key, events, events[0].timestamp_us, len(events))
-            placed.append(_PlacedBranch(branch, events, session_index))
-            cursor = _events_tail(events)
-            index += 1
+            current = _place_selected_pair(program, pair, lower, session_index)
+            current = tuple(sorted(
+                current, key=lambda item: positions[_branch_identity(item.logical)]
+            ))
+            consumed.update((_branch_identity(pair.trigger), _branch_identity(pair.partner)))
+        placed.extend(current)
+        cursor = max(_events_tail(item.events) for item in current)
         session_index += 1
-    if session_index != program.timeline.primary_sessions:
-        _plan_infeasible("planned primary session count differs from timeline")
+    expected = len(branches) - len(selection.pairs)
+    if session_index != expected:
+        _plan_internal("derived primary session count is inconsistent")
     return tuple(placed)
 
 
-def _place_crossed_pair(request: _CrossRequest, session_index: int):
-    """求解并投影一个真正 owner 交织的 session。
+def _place_standalone(program, branch, lower: int, session_index: int):
+    """以最早日历可行起点投影一个独立 branch。"""
+    start = _earliest_calendar_start(program, branch, lower)
+    events = _planned_events(program, branch, start, session_index)
+    _check_session(program, branch.slot.slot_key, events, events[0].timestamp_us, len(events))
+    return (_PlacedBranch(branch, events, session_index),)
 
-    @param request 双 branch 与时间下界。
-    @param session_index primary session 序号。
-    @return 声明序的两个 placed branch。
-    """
-    program, left, right = request.program, request.left, request.right
-    left_start, right_start = _solve_crossed_starts(request)
-    left_events = _planned_events(program, left, left_start, session_index)
-    right_events = _planned_events(program, right, right_start, session_index)
-    events = tuple(sorted((*left_events, *right_events), key=lambda item: item.timestamp_us))
-    _check_session(program, left.slot.slot_key, events, events[0].timestamp_us, len(events))
+
+def _place_selected_pair(program, pair, lower: int, session_index: int):
+    """仅对已抽中 pair 求解一个真正 owner 交织 session。"""
+    identity = f"{pair.layout.pattern_name}:{pair.layout.trigger_slot_key}:{pair.layout.partner_slot_key}"
+    request = _InterleavingRequest(
+        program, pair, lower,
+        _solver_seed(program.planner_seed, f"interleaving-layout:{identity}"),
+    )
+    trigger_start, partner_start = _solve_interleaved_starts(request)
+    trigger_events = _planned_events(program, pair.trigger, trigger_start, session_index)
+    partner_events = _planned_events(program, pair.partner, partner_start, session_index)
+    events = tuple(sorted((*trigger_events, *partner_events), key=lambda item: item.timestamp_us))
+    _check_session(program, pair.trigger.slot.slot_key, events, events[0].timestamp_us, len(events))
     return (
-        _PlacedBranch(left, left_events, session_index),
-        _PlacedBranch(right, right_events, session_index),
+        _PlacedBranch(pair.trigger, trigger_events, session_index),
+        _PlacedBranch(pair.partner, partner_events, session_index),
     )
 
 
-def _solve_crossed_starts(request: _CrossRequest) -> tuple[int, int]:
-    """用 CP-SAT 联合冻结两个 branch 起点与 owner 交织。
-
-    @param request 双 branch 交织请求。
-    @return 左、右 branch 起点。
-    """
+def _solve_interleaved_starts(request: _InterleavingRequest) -> tuple[int, int]:
+    """用 CP-SAT 联合冻结 trigger/partner 起点与 witness。"""
+    program, pair = request.program, request.pair
     upper = request.lower + 21 * _DAY_US
-    left_intervals = _branch_start_intervals(
-        request.program, request.left, request.lower, upper
-    )
-    right_intervals = _branch_start_intervals(
-        request.program, request.right, request.lower, upper
-    )
-    if not left_intervals or not right_intervals:
-        raise _PrimaryLayoutInfeasible
+    trigger_intervals = _branch_start_intervals(program, pair.trigger, request.lower, upper)
+    partner_intervals = _branch_start_intervals(program, pair.partner, request.lower, upper)
+    if not trigger_intervals or not partner_intervals:
+        _plan_infeasible("selected interleaving pair has no calendar layout")
     model = cp_model.CpModel()
-    left = model.new_int_var_from_domain(
-        cp_model.Domain.from_intervals(_millisecond_intervals(left_intervals)), "left_start"
+    trigger = model.new_int_var_from_domain(
+        cp_model.Domain.from_intervals(_millisecond_intervals(trigger_intervals)), "trigger_start"
     )
-    right = model.new_int_var_from_domain(
-        cp_model.Domain.from_intervals(_millisecond_intervals(right_intervals)), "right_start"
+    partner = model.new_int_var_from_domain(
+        cp_model.Domain.from_intervals(_millisecond_intervals(partner_intervals)), "partner_start"
     )
-    if not _constrain_crossed_session(model, request, left, right):
-        raise _PrimaryLayoutInfeasible
+    witness_rank = _constrain_interleaved_session(model, request, trigger, partner)
+    if witness_rank is None:
+        _plan_infeasible("selected interleaving pair cannot form a true owner interleave")
     first = model.new_int_var(request.lower // _QUANTUM_US,
-                              upper // _QUANTUM_US, "first_branch_start")
-    model.add_min_equality(first, [left, right])
-    solver = _solve_cross_lexicographic(model, request, (first, left, right))
-    return solver.value(left) * _QUANTUM_US, solver.value(right) * _QUANTUM_US
+                              upper // _QUANTUM_US, "session_first")
+    model.add_min_equality(first, [trigger, partner])
+    objectives = (witness_rank, first, trigger, partner)
+    solver = _solve_interleaving_lexicographic(model, request, objectives)
+    return solver.value(trigger) * _QUANTUM_US, solver.value(partner) * _QUANTUM_US
 
 
-def _constrain_crossed_session(model, request, left_start, right_start) -> bool:
-    """加入时间唯一、session 容量与 owner 交织约束。
-
-    @param model 当前 CP-SAT 模型。
-    @param request 双 branch 交织请求。
-    @param left_start 左 branch 起点变量。
-    @param right_start 右 branch 起点变量。
-    @return 存在基本交织证明形状时为 true。
-    """
-    left_offsets = _logical_offsets(request.left)
-    right_offsets = _logical_offsets(request.right)
-    if len(left_offsets) + len(right_offsets) > request.program.timeline.session_max_events:
-        return False
-    for left in left_offsets:
-        for right in right_offsets:
+def _constrain_interleaved_session(model, request, trigger_start, partner_start):
+    """加入起点唯一、容量、资源、跨度与 witness 约束。"""
+    trigger_offsets = _logical_offsets(request.pair.trigger)
+    partner_offsets = _logical_offsets(request.pair.partner)
+    count = len(trigger_offsets) + len(partner_offsets)
+    if count > request.program.timeline.session_max_events:
+        return None
+    for trigger in trigger_offsets:
+        for partner in partner_offsets:
             model.add(
-                right_start + right // _QUANTUM_US
-                != left_start + left // _QUANTUM_US
+                partner_start + partner // _QUANTUM_US
+                != trigger_start + trigger // _QUANTUM_US
             )
-    _constrain_crossed_resources(model, request, left_start, right_start)
-    _constrain_session_span(model, request, left_start, right_start)
-    witnesses = _alternation_witnesses(model, left_offsets, right_offsets, left_start, right_start)
-    if not witnesses:
-        return False
-    model.add(sum(witnesses) >= 1)
-    return True
+    _constrain_interleaved_resources(model, request, trigger_start, partner_start)
+    _constrain_interleaved_span(model, request, trigger_start, partner_start)
+    return _add_alternation_witnesses(model, request, trigger_start, partner_start)
 
 
-def _constrain_session_span(model, request, left_start, right_start) -> None:
-    """限制双 owner session 的完整跨度。
-
-    @param model 当前 CP-SAT 模型。
-    @param request 双 branch 交织请求。
-    @param left_start 左 branch 起点。
-    @param right_start 右 branch 起点变量。
-    @return None。
-    """
+def _constrain_interleaved_span(model, request, trigger_start, partner_start) -> None:
+    """限制双 owner session 的完整 interval envelope。"""
     cap = request.program.timeline.session_max_span_us // _QUANTUM_US
     lower = request.lower // _QUANTUM_US
     horizon = lower + 21 * _DAY_US // _QUANTUM_US + cap
-    left_ends = _branch_end_expressions(request.program, request.left, left_start)
-    right_ends = _branch_end_expressions(request.program, request.right, right_start)
-    first = model.new_int_var(lower, horizon, "session_first")
-    last = model.new_int_var(lower, horizon + cap, "session_last")
-    model.add_min_equality(first, [left_start, right_start])
-    model.add_max_equality(last, [*left_ends, *right_ends])
+    trigger_ends = _branch_end_expressions(
+        request.program, request.pair.trigger, trigger_start
+    )
+    partner_ends = _branch_end_expressions(
+        request.program, request.pair.partner, partner_start
+    )
+    first = model.new_int_var(lower, horizon, "interleaving_first")
+    last = model.new_int_var(lower, horizon + cap, "interleaving_last")
+    model.add_min_equality(first, [trigger_start, partner_start])
+    model.add_max_equality(last, [*trigger_ends, *partner_ends])
     model.add(last - first <= cap)
 
 
-def _alternation_witnesses(model, left, right, left_start: int, right_start):
-    """构造 A-B-A 或 B-A-B 的可重化证明。
-
-    @param model 当前 CP-SAT 模型。
-    @param left 左 branch 逻辑 offset。
-    @param right 右 branch 逻辑 offset。
-    @param left_start 左 branch 起点。
-    @param right_start 右 branch 起点变量。
-    @return 可选交织证明变量。
-    """
-    witnesses = []
-    left = tuple(value // _QUANTUM_US for value in left)
-    right = tuple(value // _QUANTUM_US for value in right)
-    for index, (before, after) in enumerate(zip(left, left[1:])):
-        flag = model.new_bool_var(f"left_wraps_{index}")
-        model.add(right_start + right[0] >= left_start + before + 1).only_enforce_if(flag)
-        model.add(right_start + right[0] <= left_start + after - 1).only_enforce_if(flag)
-        witnesses.append(flag)
-    for index, (before, after) in enumerate(zip(right, right[1:])):
-        flag = model.new_bool_var(f"right_wraps_{index}")
-        model.add(right_start + before + 1 <= left_start + left[0]).only_enforce_if(flag)
-        model.add(left_start + left[0] + 1 <= right_start + after).only_enforce_if(flag)
-        witnesses.append(flag)
-    return witnesses
+def _add_alternation_witnesses(model, request, trigger_start, partner_start):
+    """构造并唯一选择 seed rank 最小的 A-B-A/B-A-B witness。"""
+    ranked = _ranked_witnesses(request)
+    if not ranked:
+        return None
+    rank = model.new_int_var(0, len(ranked) - 1, "witness_rank")
+    flags = []
+    for value, (owner, gap_index) in enumerate(ranked):
+        descriptor = (owner, gap_index, value)
+        flag = _witness_flag(model, request, (trigger_start, partner_start), descriptor)
+        model.add(rank == value).only_enforce_if(flag)
+        flags.append(flag)
+    model.add(sum(flags) == 1)
+    return rank
 
 
-def _solve_cross_layout(model, request: _CrossRequest):
-    """求解一层 crossing 绝对日历优化。"""
+def _ranked_witnesses(request):
+    """以冻结哈希、owner 序与 gap 序产生唯一 witness rank。"""
+    pair = request.pair
+    layout = pair.layout
+    prefix = [
+        request.program.digest, request.program.planner_seed, layout.pattern_name,
+        layout.trigger_slot_key, layout.trigger_variant_name,
+        layout.partner_slot_key, layout.partner_variant_name,
+    ]
+    ranked = []
+    owners = (("trigger", pair.trigger), ("partner", pair.partner))
+    for owner_order, (owner, branch) in enumerate(owners):
+        for gap_index in range(len(branch.roles) - 1):
+            value = generation_random(
+                "interleaving_witness_rank", [*prefix, owner, gap_index]
+            )
+            ranked.append((value, owner_order, gap_index, owner))
+    ranked.sort()
+    return tuple((owner, gap_index) for _value, _order, gap_index, owner in ranked)
+
+
+def _witness_flag(model, request, starts, descriptor):
+    """强制另一 owner 首事件严格位于一个 owner gap 中。"""
+    trigger_start, partner_start = starts
+    owner, gap_index, rank = descriptor
+    trigger = tuple(value // _QUANTUM_US for value in _logical_offsets(request.pair.trigger))
+    partner = tuple(value // _QUANTUM_US for value in _logical_offsets(request.pair.partner))
+    flag = model.new_bool_var(f"{owner}_wraps_{gap_index}_rank_{rank}")
+    if owner == "trigger":
+        before, after = trigger[gap_index:gap_index + 2]
+        model.add(partner_start + partner[0] >= trigger_start + before + 1).only_enforce_if(flag)
+        model.add(partner_start + partner[0] <= trigger_start + after - 1).only_enforce_if(flag)
+    else:
+        before, after = partner[gap_index:gap_index + 2]
+        model.add(trigger_start + trigger[0] >= partner_start + before + 1).only_enforce_if(flag)
+        model.add(trigger_start + trigger[0] <= partner_start + after - 1).only_enforce_if(flag)
+    return flag
+
+
+def _solve_interleaving_layout(model, request: _InterleavingRequest):
+    """求解一层 selected pair 绝对日历优化。"""
     solver = cp_model.CpSolver()
     solver.parameters.num_search_workers = 1
     solver.parameters.random_seed = request.seed
@@ -774,18 +833,18 @@ def _solve_cross_layout(model, request: _CrossRequest):
     if status == cp_model.OPTIMAL:
         return solver
     if status == cp_model.INFEASIBLE:
-        raise _PrimaryLayoutInfeasible
+        _plan_infeasible("selected interleaving pair has no feasible layout")
     if status in (cp_model.FEASIBLE, cp_model.UNKNOWN):
-        _plan_budget("crossed layout did not prove OPTIMAL")
-    _plan_internal("crossed layout model is invalid")
+        _plan_budget("interleaving layout did not prove OPTIMAL")
+    _plan_internal("interleaving layout model is invalid")
 
 
-def _solve_cross_lexicographic(model, request: _CrossRequest, objectives):
-    """依次冻结最早 branch 与声明序 owner 起点。"""
+def _solve_interleaving_lexicographic(model, request, objectives):
+    """依次冻结 witness rank、session 起点、trigger 与 partner 起点。"""
     solver = None
     for objective in objectives:
         model.minimize(objective)
-        solver = _solve_cross_layout(model, request)
+        solver = _solve_interleaving_layout(model, request)
         model.add(objective == solver.value(objective))
     return solver
 
@@ -814,12 +873,6 @@ def _branch_metadata(program, branch):
     )
 
 
-def _branch_envelope_us(program, branch) -> int:
-    """计算 branch 从最早 start 到最晚 end 的完整包络。"""
-    metadata = _branch_metadata(program, branch)
-    return max(offset + duration for _role, offset, duration, _resources in metadata)
-
-
 def _branch_end_expressions(program, branch, start):
     """构造毫秒绝对 branch 的全部 end 表达式。"""
     return tuple(
@@ -828,17 +881,20 @@ def _branch_end_expressions(program, branch, start):
     )
 
 
-def _constrain_crossed_resources(model, request, left_start, right_start) -> None:
-    """对 crossed owner 合并同名 resource 并加入 AddNoOverlap。"""
+def _constrain_interleaved_resources(model, request, trigger_start, partner_start) -> None:
+    """对交织 owner 合并同名 resource 并加入 AddNoOverlap。"""
     by_resource: dict[str, list] = {}
-    sides = ((request.left, left_start), (request.right, right_start))
-    for branch, start in sides:
+    owners = (
+        ("trigger", request.pair.trigger, trigger_start),
+        ("partner", request.pair.partner, partner_start),
+    )
+    for owner, branch, start in owners:
         for role, offset, duration, resources in _branch_metadata(request.program, branch):
             if duration <= 0:
                 continue
             interval = model.new_fixed_size_interval_var(
                 start + offset // _QUANTUM_US, duration // _QUANTUM_US,
-                f"crossed_{role}_interval",
+                f"interleaving_{owner}_{role}_interval",
             )
             for resource in resources:
                 by_resource.setdefault(resource, []).append(interval)
@@ -942,7 +998,7 @@ def _earliest_calendar_start(program, branch, lower: int) -> int:
         )
         intervals = _intersect_intervals(intervals, allowed)
     if not intervals:
-        raise _PrimaryLayoutInfeasible
+        _plan_infeasible("primary branch has no calendar layout")
     return intervals[0][0]
 
 
@@ -1159,11 +1215,11 @@ def _check_session(program, slot_key, events, start: int, count: int) -> None:
     @return None。
     """
     if count > program.timeline.session_max_events:
-        raise _PrimaryLayoutInfeasible
+        _plan_infeasible("primary session exceeds event capacity")
     last = max(event.timestamp_us + event.duration_us for event in events)
     first = min(event.timestamp_us for event in events)
     if last - first > program.timeline.session_max_span_us:
-        raise _PrimaryLayoutInfeasible
+        _plan_infeasible("primary session exceeds span capacity")
 
 
 def _allocate_blocks(program, placed, baselines):
@@ -1309,15 +1365,24 @@ def _next_noise_time(program, cursor, session_index, session_start, session_coun
     return timestamp, timestamp + _QUANTUM_US, session_index, session_start, session_count + 1
 
 
-def _replay_layouts(program, placed, cursor: int) -> tuple[ReplayLayout, ...]:
+def _replay_layouts(program, logical, placed, cursor: int) -> tuple[ReplayLayout, ...]:
     """从 declaration-order positive source 冻结完整 replay layouts。
 
     @param program 冻结生成程序。
+    @param logical 原始 declaration-order primary branches。
     @param placed 已放置 primary branches。
     @param cursor primary/noise 最后时间。
     @return replay layouts。
     """
-    positives = [item for item in placed if _is_positive(program, item.logical)]
+    placed_by_identity = {
+        _branch_identity(item.logical): item
+        for item in placed
+    }
+    positives = [
+        placed_by_identity[_branch_identity(branch)]
+        for branch in logical
+        if _is_positive(program, branch)
+    ]
     layouts = []
     for ordinal, source in enumerate(positives[:program.timeline.duplicate_sequences]):
         lower = cursor + max(program.timeline.session_gap_us, _QUANTUM_US)

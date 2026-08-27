@@ -33,7 +33,8 @@ v1.12（流模式帧粒度，第 25 章 25.6）**零新增错误码**：帧级�
 sequence generation 不打开 rejects。可恢复的 slot 失败进入 `report.generate.sequence.rejected_attempts`；
 耗尽以 `sequence_delivery_exhausted` 退出 1。计划不可行是 `generation_plan_infeasible`（退出 2）；
 计划预算/内部错误、事务契约、projection contract 与 commit-I/O 是退出 4。provider fatal/circuit trip 原样穿透，
-不消耗 slot attempt。
+不消耗 slot attempt。若原因是已选交织 pair 无合法布局，Planner 不会改选 partner、pattern、standalone，也不会在
+slot retry 中重抽；这是可复现的 fail-closed 配置/计划结果。
 
 ## 18.2 按症状排查
 
@@ -42,14 +43,18 @@ sequence generation 不打开 rejects。可恢复的 slot 失败进入 `report.g
 ```mermaid
 flowchart TD
     code{"退出码？"}
-    code -->|2| c2["配置错误：stderr 的 ConfigError 清单带 文件:节.键 定位（见「启动就退出，退出码 2」）"]
+    code -->|2| c2{"stderr error kind?"}
+    c2 -->|generation_plan_infeasible| p2["冻结 pair 无合法时间布局；不改选（见 sequence generation 段）"]
+    c2 -->|generation_config_invalid| cfg2["配置错误：按 ConfigError 的 文件:节.键 定位"]
     code -->|3| c3["输入错误：路径 / 候选文件 / 无任何合法记录（见「退出码 3」）"]
-    code -->|4| c4["熔断 / 运行期写盘失败 / Ctrl-C 打在启动或收尾阶段（见「退出码 4」）"]
-    code -->|1| c1["--strict 被违反（有 rejects）或报告写出失败（第 15 章退出码表）"]
+    code -->|4| c4["plan budget/internal / 熔断 / 写盘失败 / 启动收尾中断（见 stderr error kind）"]
+    code -->|1| c1{"sequence_delivery_exhausted?"}
+    c1 -->|是| s1["读取 failed report 的 failed_slot / attempts_used / terminal_error_kind"]
+    c1 -->|否| o1["ordinary --strict 被违反或 report 写出失败（第 15 章）"]
     code -->|0| c0{"主输出比预期少？"}
     c0 -->|否| done["流程走完；0 不等于全部记录成功，按需读 report.counts 对账（第 15 章）"]
     c0 -->|是| counts{"report.counts 哪类占大头？"}
-    c1 -->|有 rejects 时| counts
+    o1 -->|有 rejects 时| counts
     counts -->|failed| tf["读 rejects 的 _meta.reason：provider_* ⇒ 端点/密钥（第 2 章 probe）；schema_violation ⇒ 第 14 章"]
     counts -->|dropped_lowq| tq["质量线切多了或 rubric 口径不合 ⇒ 第 10 章"]
     counts -->|dropped_dup| td["模板化数据被近似判重大面积命中 ⇒ 第 9 章"]
@@ -68,6 +73,11 @@ config.toml:[llm.default].api_key_env: environment variable "LABELKIT_ZAI_KEY" i
 ```
 
 高频前六名：环境变量没加载（`set -a && source .env && set +a`）；引用的 profile 名拼错（错误里会列出可用名单）；Schema 不是合法 draft 2020-12 / 顶层不是 object / 声明了 `_meta`；`selection = "top_ratio"` 时仍设了 `threshold`（两种淘汰机制互斥，第 10 章）；UI 模态引用的 profile 没开 `supports_vision`；输出父目录不存在（忘了 `mkdir -p out`）。反向情形（`selection` 保持默认 `"threshold"` 时写了 `top_ratio`）不报错但会打一条 warning 提示「该键不会生效」——看到它就补上 `selection = "top_ratio"`。
+
+sequence 交织的高频配置错误也会在这里一次列全：仍写已删除的
+`[generate.timeline].primary_sessions` / `crossed_primary_sessions`；只声明候选集或只声明交织章节；候选集标签未被
+pattern 引用；同一候选集同时承担 trigger 与 partner；带标签的 counterfactual set 不恰好有一个 positive variant；
+以及权重为 bool/float、越过 int64 边界或当前机会总权重溢出。按错误定位改声明，不要加兼容键或 fallback。
 
 另注意**警告不是错误但更阴险**：「未知键，已忽略（前向兼容）」意味着你拼错了某个参数名、它压根没生效——看到这条警告立刻回头对拼写（对照附录 A）。
 
@@ -122,6 +132,12 @@ jq -e '.run.interrupted == false and .run.circuit_broken == false' out/report.js
 ### 「跑得比 dry-run 估的贵」
 
 估算不含重试与修复。查 `llm_usage.retries`（限流？）与 `schema_engine.resolved_at.l3_*`（LLM 修复环烧钱？）。
+
+### 「配置了 9:1，但实际交织比例不是 10%」
+
+这是预期语义。`9:1` 表示每个仍有 partner 的 opportunity 中 standalone 和该 pattern 分别占 9 张票与 1 张票，
+不是全局配额或“每十条必有一条”。有限样本会波动；partner pool 耗尽后，对应 pattern 会从后续机会的分母移除。
+先看 `interleaving_opportunities` 与 `by_interleaving_pattern`，不要为了追平比例重跑或修改 seed。
 
 ### 「开了分段，会话被切得粉碎 / episode 只有两三帧」（v1.8）
 

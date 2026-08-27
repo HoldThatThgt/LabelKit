@@ -3,7 +3,8 @@
 ### 3.6.1 职责与边界
 
 **做：**flat 形态组装既有生成提示词并产出独立文本 Record；sequence 形态由
-`labelkit/operators/generation/` 实现 ScenarioSeed、逐事件状态执行、反事实分支、独立判定与双视图投影。
+`labelkit/operators/generation/` 实现 ScenarioSeed、逐事件状态执行、反事实分支、候选集权重交织、
+独立判定与双视图投影。
 `GenerateStage` 只保留 flat 薄入口；M10 的 generate_only sequence 分支直接调用精确交付控制器。
 
 **不做：**仅文本模态；flat 单轮回流、不递归，仍由 M3 / M4 / M5 / M7 处理下游；sequence 不在 M6
@@ -21,7 +22,7 @@
 | 新记录构造 | 每条样本文本构造 Record：`raw = {input.text_field: sample}`，id 规则同 M2，`ref.generated_from = [种子id列表]`；generate_only 模式下 `generated_from = []`（种子非记录、无记录 id，种子本身在 project.toml 中可审计），`generator` 照常携带。 |
 | 回流 | 新记录组成「生成子批」交回 M10，从 M3 起走 去重 →打分 → 标注 →校验；去重索引含全部原始记录与先前生成样本，即 Self-Instruct 的相似度过滤 [18]（3.3.3 节）。子批不再触发生成（单轮回流，不递归）。generate_only 模式下生成子批即唯一数据来源：按 `run.batch_size` 切批走同一链路 M3→M4→M5→M7→M11（3.10.3），单遍不递归同样适用。 |
 | 按类种子池（v1.7） | classify 启用时（process 模式）：种子按 `classification.label` 分组为按类种子池，每类用该类有效 instruction / styles / num_per_record / temperature（`class_views[label].generate`）独立走「生成调用」行的量公式；llms / mixture / weights / seeds_per_call / num_per_call 恒为全局（5.2 按类覆盖白名单表）。**类段字典序拼接调用序**：参与类（有种子的类）按类名字典序占据连续的全局调用序号区间，每类预算 C_c = ⌈len(seeds_c) × num_per_record_c / num_per_call⌉；单遍 i = 0..C−1 预抽——llm 照旧按全局序号选定（round_robin 零 rng 消耗 / weighted 逐 i 一次 choices，「多模型混合」行机制不变），style 从该 i **所属类**的有效 styles 中均匀抽，种子抽样按全局序号升序逐调用执行；classify 关闭 ⇒ 单一匿名段 = 现行为。**种子门槛按类默认链**：每类取全局 `generate.seed_min_score` → 缺省取**该类有效** `quality.threshold` → 再缺省取**该类种子池**聚合分中位数；`select_seeds` 按 label 分组返回。规划产物 `CallPlan` 增 `class_name` 字段，`one_call` 按 plan.class_name 取类有效 instruction / temperature；`postprocess_samples` 返回 `list[tuple[Record, str \| None]]`，`run()` 构造 PipelineItem 时新样本**继承种子类**——带 `Classification(label, (label,), "inherited", {})`（零额外分类调用；回流子批经 M13 幂等跳过，3.13.4）。桶统计 key 在 classify 启用时扩展为 `<class>×<llm>×<style>`（6.4；关闭时格式不变）。generate_only 模式：`generate_all` 扁平路径不变——生成用**全局**指令（无输入无从按类），产物由链上 classify 正常分类后按类打分/标注；不支持 generate_only 按类生成配比（1.6 v1.7 对齐决策 ③，与 8.3 O6 一并立项）。 |
-| sequence 形态 | `generate.form = "sequence"` 时，GenerationProgram 与 ScenarioPlan 在任何内容调用前冻结。declared 先生成一个完整 baseline 世界，再从目标 divergence 开始生成机械变换后的反事实分支；instruction-only 的位置、长度、逻辑时间、工件时间与 session 也先冻结，LLM 只在闭集内选择逐位置语义。两种模式都经过状态执行、独立 evaluator、投影与 M10 attempt transaction。详见 3.6.5 起。 |
+| sequence 形态 | `generate.form = "sequence"` 时，GenerationProgram 与 ScenarioPlan 在任何内容调用前冻结。declared 先生成一个完整 baseline 世界，再从目标 divergence 开始生成机械变换后的反事实分支；可选交织在计划期按 trigger opportunity 从 none/named pattern 权重抽取，从共享 partner pool 无偏不放回选择并求两条 branch 的保序时间布局；instruction-only 的位置、长度、逻辑时间、工件时间与 standalone session 也先冻结，且禁止交织配置。两种模式都经过状态执行、独立 evaluator、投影与 M10 attempt transaction。详见 3.6.5 起。 |
 | 上下文预算装填（v1.11） | 本次调用的目标 profile 声明 `context_window` 时按上下文预算装填生成调用（未声明 = 预算关闭，行为与 v1.10 一致；预算/估算/校准机制见 3.9）：`seeds_per_call` 降级为**上限值**——按 rng 采样序**从尾部丢弃**种子直到装下（确定性；被丢种子不递补），min 1；连 1 条种子都装不下 → 该调用按 `context_overflow` 处置（V10，7.6）。`generate.llms` 多 profile mixture（round_robin / weighted）下按**本次调用的目标 profile** 的预算装填——(llm, style) 预抽序与轮转序不变（确定性），装填结果仍逐调用可复现。系统侧静态部件（instruction / styles / 生成输出 Schema）不动态裁剪，由 M1 静态预检把关（V13③，3.1.4）。 |
 
 ### 3.6.3 API
@@ -131,10 +132,11 @@ num_per_record = 2
 
 与上例（process 模式）的差异仅在入口与种子来源：无 M2 接入（IngestReport 全零、`report.counts.scanned = 0`），生成样本按 `run.batch_size` 切批走 M3→M4→M5→M7→M11；新 Record 的 `generated_from = []`、`generator` 照常携带（如 `{"llm": "default", "style": null}`）。6.4 计数不变量退化为 emitted + dropped_* + failed = generated，仍成立。
 
-#### sequence 形态教学配置（v1.18）
+#### sequence 形态独立交织配置示例（v1.21）
 
 sequence 形态显式选择 `form` 和唯一运行模式；它不读取 `[stream]` 摄取配置，也不启用 classify 或
-frame.classify 判定 stage；frame.annotate 可按配置作为 attempt-local 下游：
+frame.classify 判定 stage；frame.annotate 可按配置作为 attempt-local 下游。以下片段专门展示交织形状，
+不是 `examples/sequence-generation/project.toml` 摘录；正式主教学工程保持交织关闭：
 
 ~~~toml
 [run]
@@ -164,18 +166,47 @@ initial_state_catalog_path = "catalogs/ticket-booking.jsonl"
 [generate.timeline]
 timestamp_start = "2026-01-05T09:00:00+08:00"
 event_gap_s = [5, 60]
-primary_sessions = 3
-crossed_primary_sessions = 1
 session_max_events = 16
 session_max_span_s = 3600
 session_gap_s = 3600
 noise_events = 1
 duplicate_sequences = 1
+
+[[generate.counterfactual_sets]]
+name = "booking_trigger_training"
+pattern = "booking_success"
+count = 2
+interleaving_candidate_set = "booking_trigger"
+
+[[generate.counterfactual_sets.variants]]
+name = "positive"
+kind = "positive"
+outcome_schema_path = "schemas/outcome-positive.json"
+
+[[generate.counterfactual_sets]]
+name = "booking_partner_training"
+pattern = "booking_success"
+count = 2
+interleaving_candidate_set = "booking_partner"
+
+[[generate.counterfactual_sets.variants]]
+name = "positive"
+kind = "positive"
+outcome_schema_path = "schemas/outcome-positive.json"
+
+[generate.interleaving]
+no_interleaving_weight = 9
+
+[generate.interleaving.pattern.booking_with_partner]
+trigger_candidate_set = "booking_trigger"
+partner_candidate_set = "booking_partner"
+trigger_weight = 1
 ~~~
 
 每个 `[frame.class.<name>.generate]` 都提供非空 instruction 与 object JSON Schema。declared 的 pattern
 以具名 role、完整 order、必填 `max_span_s` 和具名 gap 声明唯一结构；交付数量只由
-`[[generate.counterfactual_sets]]` 的 count 与 variants 决定。完整字段见第 5 章。
+`[[generate.counterfactual_sets]]` 的 count 与 variants 决定。`interleaving_candidate_set` 是业务短标签，
+不是文件名或 selector 表达式；用户只声明 trigger/partner 集合和权重，不枚举 owner word。完整字段见第 5 章。
 
 ### 3.6.5 sequence 物理边界与入口
 
@@ -199,7 +230,7 @@ M3/M4/M5/M7/M11 协作者组装成有界候选准备和声明序短提交。M6 �
 
 配置装载后，所有入口共用同一 `compile_generation_program(config)` 和
 `compile_scenario_plan(program)`；`run.seed` 已是 program-bound `planner_seed`。planner 冻结 delivery slot、variant、role 或位置、逻辑时间、
-工件时间、session、crossing、noise 与 replay source。LLM 不能新增或删除事件、改变计划时间、改选 actor
+工件时间、session、interleaving opportunity/pattern/partner/layout、noise 与 replay source。LLM 不能新增或删除事件、改变计划时间、改选 actor
 权限、决定 expected violation，或在交付失败后触发重规划。
 GenerationProgram 同时冻结生成上限、sequence ClassView、frame ClassView 与帧标注 Schema。每个 sequence
 ClassView 的 Schema 在编译时物化为类覆盖 Schema，否则物化为全局用户 Schema；两种 Schema 都与源配置隔离并进入
@@ -212,6 +243,96 @@ canonical plan 并要求完整 dataclass 相等；只协调重算 digest、改�
 六个 family 的提示词都由 common 共享构造器形成。M1 在配置态完整 PromptBundle/Schema 上叠加固定动态值与 L3
 新增正文 byte 包络；运行期每个完整动态值和 repair 新增正文恰好 32768 UTF-8 bytes 可派发，多一 byte 零 provider
 派发拒绝。patch 仍以 16384、ScenarioSeed/payload 仍以各自 65536 byte 上限单独计；任何值都不裁剪。
+
+#### v1.21 交织计划
+
+Program compiler 递归冻结 candidate set 归属、named pattern 与权重并纳入 program digest，但不抽样。
+Planner 完成全部 DeliverySlot 与 logical branch 后，按 DeliverySlot 声明序扫描带 trigger candidate set 的
+唯一 positive branch。共享 partner pool 按 candidate set 分组，初始顺序为 DeliverySlot 声明序。
+hidden baseline、counterfactual variant、instruction-only、noise 与 replay 不参与。partner 可以在 trigger 声明之前
+或之后，声明相对位置不改变资格。
+
+当前 trigger 至少有一个对应 pattern 的 partner pool 非空时，全局
+`interleaving_opportunities` 加一。每个当前生效且 pool 非空的 pattern 的
+`eligible_opportunities` 各加一；一次 trigger scan 可使多个 pattern 计数增加，但全局机会只加一。
+若全部相关 pool 为空，则直接 standalone 且不计机会。资格只看 positive branch 和 pool 非空，
+不预搜索 calendar、resource 或 layout 可行性。
+
+对一次 opportunity，设 applicable pattern 按 TOML 声明序为 `p1..pk`，权重为 `w1..wk`，
+`no_interleaving_weight=w0`，总权重 `W=w0+Σwi`。none 占 `[0,w0)`，各 pattern 依声明序占连续
+ticket 区间。none 只进分母一次，partner 数、candidate pair 数与可实现 owner word 数都不复制权重。
+权重不表示配额或“每 N 条必交织一次”。
+
+两类抽取都使用 `generation_random` 的完整 SHA-256 整数和拒绝采样。对正整数范围 `T`：
+
+~~~text
+M = 2^256
+limit = M - (M mod T)
+x(counter) = generation_random(domain, value(counter))
+接受第一个 x < limit，结果为 x mod T
+~~~
+
+counter 从零开始。pattern 使用 domain `interleaving_pattern_choice` 与 value
+`[program_digest, planner_seed, trigger_slot_key, trigger_variant_name, counter]`；partner 使用 domain
+`interleaving_partner_choice` 与 value `[program_digest, planner_seed, trigger_slot_key,
+trigger_variant_name, pattern_name, partner_candidate_set, counter]`。拒绝时只递增当前抽取的 counter，
+不变更 opportunity、pool 或其他随机域；不使用 float threshold、solver seed 或简单取模。pattern 中选后，以当前共享
+pool 长度为 `T` 无偏选索引，再用 swap-delete 移除 partner；多 pattern 引用同一 partner set 时消费
+同一 pool，任一 partner branch 全局至多使用一次。这是每次索引无偏且不放回，不承诺最终全局
+匹配均匀。
+
+选中的 pattern 和 partner 立即冻结为 `InterleavingLayout`。Planner 只对该 pair 求两个整体绝对
+起点，并保留两条 branch 的 logical time、相邻 gap、duration、resource、calendar window 与内部顺序。
+所有 event start 必须毫秒对齐且全局唯一；同名 resource interval 使用 `AddNoOverlap`；共享 session
+满足 event count、完整 interval envelope span 与前一个已放置 session gap；owner word 至少有三个
+maximal runs，等价于存在 `A-B-A` 或 `B-A-B` witness。pair 在两个 branch 原声明位置中较早处建
+session，另一位置随后跳过；这不改变 main 的 DeliverySlot/variant 交付序或 replay source 声明序。
+
+对两条 branch 的每个相邻 event gap 构造 `A-B-A` / `B-A-B` witness。排序整数固定为
+`generation_random("interleaving_witness_rank", [program_digest, planner_seed, pattern_name,
+trigger_slot_key, trigger_variant_name, partner_slot_key, partner_variant_name, witness_owner,
+witness_gap_index])`。owner 是 `trigger|partner`，gap index 是 owner 内零基序号；按
+`(整数, owner_order, witness_gap_index)` 升序取得零基唯一 rank，owner order 固定 trigger=0、partner=1。
+CP-SAT 依次最小化 witness rank、
+session 最早 event start、trigger start 与 partner start。同 program/seed 的 plan 逐字节一致；多 witness
+fixture 在换 seed 后必须可观测到 pattern、partner 或 owner word 差异，但不对任一具体 owner word 承诺
+seed 多样性或均匀分布。`InterleavingLayout` 不复制 session、timestamp 或 owner word；这些只由 blocks 派生。
+
+选中 pair 无可行布局时，立即以 `generation_plan_infeasible`、exit 2 失败；不搜索其他 partner、
+不切换 pattern、不退回 none、不改为 standalone、不重抽。FEASIBLE/UNKNOWN 是
+`generation_plan_budget`、exit 4，MODEL_INVALID 是 `generation_plan_internal`、exit 4。provider retry、slot attempt retry、
+并发完成序与 ordered commit 都复用同一 plan，不消费交织随机数。
+
+匹配阶段不得构造 trigger×partner pair matrix，也不得为未选 partner 试跑 CP-SAT。时间复杂度为
+O(positive branches + evaluated pattern incidences + selected pairs)，pool 内存为 O(positive branches)，
+每个选中 pair 的新约束为 O(mn+m+n)。pattern role 上限为 32，因此跨 owner event-start uniqueness
+至多 1024 对。
+
+#### v1.21 交织验收
+
+| 特性面 | 必须机械断言的可观察行为 |
+|---|---|
+| 配置 | 章节缺省和正确启用均通过；旧 timeline 两键、单边配置、未知/空/未引用 candidate set、角色冲突与 int64 权重边界按契约拒绝。 |
+| 权重 | `9:1` ticket 边界精确；多 pattern 只有一个 none 区间；partner pool 大小不改变 pattern ticket；拒绝采样分支可注入固定整数验证。不使用统计容差代替整数区间证明。 |
+| partner | 索引抽样无偏、不放回，多 pattern 共享 pool 时不重复消费；partner 位于 trigger 前后都可选；none 不消费 pool。 |
+| branch 资格 | 只有声明的唯一 positive branch 可交织；hidden baseline、counterfactual variant、instruction-only、noise 与 replay 均不可。 |
+| owner word | 必须可实现 `A B B A B A A`；两种纯串行 word 必须拒绝；单事件 branch 与多事件 branch 可形成包裹，两个单事件 branch 因不可形成三个 run 而不可行。 |
+| 时间 | 两 owner 内 position、logical delta、artifact delta、duration、calendar、resource、start uniqueness、session span 与 capacity 全部保持。 |
+| fail-closed | 抽中不可行 partner 立即失败，不能换 partner、pattern、none 或 standalone。 |
+| determinism | 同 program/seed 的 plan 逐字节相同；多 witness fixture 换 seed 后至少存在 pattern、partner 或 owner word 差异，但不对任一具体 word 作均匀或必现承诺。 |
+| identity | opportunity、pattern opportunity map、pair identity、timestamp 或 session 的任一协调篡改均被 plan identity 拒绝。 |
+| report | disabled、selected-none、selected-pair 与 instruction-only 的 exact shape 分别断言；`primary_sessions=N-D`；不泄漏 pair、owner word 或数据内容。 |
+| retry | provider retry、slot attempt retry 与并发完成序都不改变 frozen pair/layout；某一 owner 耗尽不创建两 owner 共同 retry。 |
+| scale | 500000 record-unit 无交织基线与 600 positive branch/300 强制 pair 真实 probe 均通过，并证明匹配阶段无 pair matrix。 |
+
+本地 Qwen3.5-4B 真实门使用四槽 fixture：两个 trigger slots、两个 partner slots、
+`no_interleaving_weight=0` 且唯一 pattern 权重为一，强制两个 pair。必须使用真实
+`Qwen3.5-4B-Q6_K.gguf` 和四并发 llama-server，不得使用 mock、录制响应或静态替身。main 必须为
+四行、stream 必须为十六行，`interleaving_opportunities=2`、`interleaved_primary_sessions=2`、
+`primary_sessions=2`；每个 primary session 恰有两个 owner、六个 event 和至少三个 owner runs，且恰含
+一个 trigger candidate 与一个 partner candidate。owner 内时间/资源保持，server request high-water 恰为四，
+usage 非零，manifest、delivery/plan digest 与 secret scan 全部通过。该门只证明交织计划被完整生成、
+判定、投影与交付链消费，不证明权重分布。
 
 ### 3.6.6 declared 世界执行
 
@@ -318,8 +439,9 @@ instruction-only 的 `EventExecutionContext` 从 program/slot 解析出的 role 
 闭集、test 前缀、原子 JSON Patch、基础 state Schema 与可选 state validator。该模式没有 payload binding；
 actor 选定后再从完整历史构造只供 FrameRenderer 使用的 ActorView。
 
-instruction-only 的每个 slot 是独立单序列提交组，要求
-`crossed_primary_sessions = 0`、`primary_sessions = N`、`duplicate_sequences = 0`。它不生成
+instruction-only 的每个 slot 是独立单序列提交组。它禁止 `[generate.interleaving]` 与
+`interleaving_candidate_set`，派生 `primary_sessions=N`、`interleaved_primary_sessions=0`、
+`interleaving_opportunities=0`、空 `by_interleaving_pattern` 与 `duplicate_sequences=0`。它不生成
 counterfactual set 或 positive replay source。
 
 ### 3.6.9 独立判定与投影
@@ -365,7 +487,7 @@ program/variant 重建精确 role word，逐事件核对 RoleSpec 的 frame clas
 与该 plan 中唯一成员完整相等并复核事件、来源与身份。SequenceWorkflow 只在交付边界验证一次，后续调用包内
 validated helper；内容重试不得重新运行 CP-SAT。
 
-所有 v1.20 generation ID 均对 canonical JSON array
+所有 generation ID 继续使用 v1.20 工件编码域，即对 canonical JSON array
 `["labelkit:v1.20", domain, components]` 做 UTF-8 SHA-256，取小写前 32 hex；`components` 本身必须是
 JSON array，timestamp 是 integer 微秒，payload component 是已验证 JSON object，不得字符串拼接。
 declared 与 instruction-only 分别使用冻结 domain 与 component 序列；`Record.id = sequence_id`，
@@ -432,7 +554,7 @@ peak RSS 与候选字节高水位。由于用户 Schema 与 provider response �
 sequence 的 exact delivery、attempt 消耗、下游 transaction、正式文件提交与失败矩阵由 M10 和 M11 定义；
 M6 只返回完整候选、独立判定和投影结果，任何失败都不得产生半个 counterfactual set。
 
-### 3.6.11 v1.20 business time、区间与自描述工件
+### 3.6.11 v1.21 business time、交织区间与自描述工件
 
 FrameRenderer 与 NoiseRenderer 只把 `FrameClassView.model_gen_schema` 发送给 provider；prompt 可读取 planned
 start/end/duration，但 provider 输出不含 business time leaf。渲染调用通过 `complete_finalized`：model L2 后按

@@ -177,20 +177,38 @@ min_gap_s = 30
 max_gap_s = 1200
 
 [[generate.counterfactual_sets]]
-name = "runtime_four_slot"
+name = "runtime_trigger"
 pattern = "booking_success"
-count = 4
+count = 2
+interleaving_candidate_set = "runtime_trigger"
 
 [[generate.counterfactual_sets.variants]]
 name = "positive"
 kind = "positive"
 outcome_schema_path = "schemas/outcome-positive.json"
 
+[[generate.counterfactual_sets]]
+name = "runtime_partner"
+pattern = "booking_success"
+count = 2
+interleaving_candidate_set = "runtime_partner"
+
+[[generate.counterfactual_sets.variants]]
+name = "positive"
+kind = "positive"
+outcome_schema_path = "schemas/outcome-positive.json"
+
+[generate.interleaving]
+no_interleaving_weight = 0
+
+[generate.interleaving.pattern.runtime_pair]
+trigger_candidate_set = "runtime_trigger"
+partner_candidate_set = "runtime_partner"
+trigger_weight = 1
+
 [generate.timeline]
 timestamp_start = "2026-01-05T09:00:00+08:00"
 event_gap_s = [15, 120]
-primary_sessions = 4
-crossed_primary_sessions = 0
 session_max_events = 8
 session_max_span_s = 1800
 session_gap_s = 3600

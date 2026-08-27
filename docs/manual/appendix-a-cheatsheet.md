@@ -105,7 +105,7 @@ sequence 教学工程的 default/judge 都固定为 DeepSeek anthropic route、`
 | `generate.sample_validator` | 可选 hook | 生成样本语义过滤 |
 | `[[generate.styles]]` | 可选 | name + prompt 风格桶 |
 
-flat 不得出现 sequence 的 pattern、counterfactual、timeline、noise 或 instruction-only 字段。
+flat 不得出现 sequence 的 pattern、counterfactual、interleaving、timeline、noise 或 instruction-only 字段。
 
 ## A.5 output / trace
 
@@ -284,14 +284,17 @@ state_schema_path = "schemas/state.json"
 EventPlanRequest 显式携带完整 state Schema，让 post-validator/L3 能看到合法枚举；declared request 的该字段为 null，
 从冻结 program 解析权威 Schema。
 
-## A.13 timeline、calendar、noise 与 replay
+## A.13 interleaving、timeline、calendar、noise 与 replay
 
 | 键 | 约束 | 用途 |
 |---|---|---|
+| `generate.counterfactual_sets[].interleaving_candidate_set` | 可选；`[a-z0-9_]+` 短标签 | 把该 set 的唯一 positive branch 放入候选集 |
+| `generate.interleaving.no_interleaving_weight` | 非负 TOML int64 | 每次 opportunity 选择 standalone 的权重 |
+| `generate.interleaving.pattern.<name>.trigger_candidate_set` | 已声明候选集 | 按 DeliverySlot 声明序接受抽取 |
+| `generate.interleaving.pattern.<name>.partner_candidate_set` | 已声明且不同于 trigger | 共享、不放回的 partner pool |
+| `generate.interleaving.pattern.<name>.trigger_weight` | 正 TOML int64 | 选择该命名 pattern 的权重 |
 | `generate.timeline.timestamp_start` | 带 offset ISO 时间 | 确定性起点 |
 | `event_gap_s` | [lo, hi] | instruction-only / noise 默认间隔 |
-| `primary_sessions` | 精确 | primary session 数 |
-| `crossed_primary_sessions` | 精确 | 双 owner session 数 |
 | `session_max_events` | 正整数 | session 容量 |
 | `session_max_span_s` | 正数 | session 时间跨度 |
 | `session_gap_s` | 正数 | session 间隔 |
@@ -301,10 +304,19 @@ EventPlanRequest 显式携带完整 state Schema，让 post-validator/L3 能看�
 | `generate.noise.frame_class` | 独立 object frame class | noise payload |
 | `generate.noise.instruction` | noise 非零时必填 | noise 生成约束 |
 
-若 primary sequence 总数为 N、crossing 为 D，则 primary sessions 必须等于 N-D。同一个 counterfactual set 的
-variants 不共 session。instruction-only 要求 zero crossing、zero replay、primary sessions = sequence count。noise 与
-instruction-only 只能选择点 frame class。replay 的所有成员使用同一个正、毫秒对齐的 shift，保持 source 的 start delta、
-duration、resources 与非时间 payload，并按 replay 起点重新绑定业务时间。
+候选集标签精确匹配，不支持 glob、regex、前缀、列表或表达式。同一候选集不能同时承担 trigger 与 partner；带标签的
+counterfactual set 必须恰好有一个 positive variant。`no_interleaving_weight = 9`、当前唯一 pattern 的
+`trigger_weight = 1` 表示一次可用机会中 standalone 与该 pattern 分别占 9 张票和 1 张票，不是最终比例配额。
+交织章节与候选集标签必须同时存在或同时不存在；开启时至少有一个命名 pattern，全部标签都被引用且两侧非空。
+`no_interleaving_weight` 非负、`trigger_weight` 为正，单次机会总权重不得越过 TOML int64 上限。
+
+设可见 primary branch 数为 N、冻结交织布局数为 D，报告派生
+`primary_sessions = N - D`、`interleaved_primary_sessions = D`。抽中 pair 后若布局不可行，直接
+`generation_plan_infeasible`；不换 partner、pattern、standalone 或在 retry 中重抽。instruction-only 禁止交织配置，
+其交织机会与交织 session 为零、pattern map 为空。declared 未启用交织时也是零 opportunity、零 interleaved session
+和空 pattern map，`primary_sessions` 等于可见 primary branch 数。noise 与 instruction-only 只能选择点 frame class。
+replay 的所有成员使用同一个正、毫秒对齐的 shift，保持 source 的 start delta、duration、resources 与非时间 payload，
+并按 replay 起点重新绑定业务时间。
 
 ## A.14 固定上限
 

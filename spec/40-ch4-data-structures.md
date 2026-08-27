@@ -293,7 +293,7 @@ def tree_diff(a: UITree | None, b: UITree | None, quantize_px: int) -> Mapping
 
 **预算原语契约引（v1.11）**：上下文预算的估算与装填原语（`margin` / `input_budget` / `embed_budget` / `est_text` / `est_image_prior` / `est_prompt` / `fit_text` / `min_window` / `classify_stage_error` 与 `ImageCostCalibrator`）位于 `labelkit/common/inference/budget.py`，是模块级纯函数与类（**非执行运行时类型层**——签名与冻结常数以 CONTRACTS 的 budget 新节为准，机制见 3.9）；本章共享渲染层（`serialize` / `frame_digest` / `tree_diff`）签名零改动，装填器（贪心切窗等）属算子逻辑、落各算子模块。
 
-**v1.18 sequence 冻结类型：**下表类型全部为 frozen dataclass；Mapping 在构造时深拷贝为
+**v1.21 sequence 冻结类型：**下表类型全部为 frozen dataclass；Mapping 在构造时深拷贝为
 JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是接口契约，生产 typedef/dataclass
 每个字段都要有中文语义注释。
 
@@ -305,19 +305,22 @@ JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是�
 | `GapSpec` | `name`, `before`, `after`, `min_gap_us`, `max_gap_us` |
 | `SequencePattern` | `name`, `sequence_class`, `description`, `roles`, `order`, `gaps`, `max_span_us` |
 | `VariantSpec` | `name`, `kind`, `target`, `outcome_schema`, `expected_violation`, `divergence_role` |
-| `CounterfactualSetSpec` | `name`, `pattern`, `count`, `variants` |
+| `CounterfactualSetSpec` | `name`, `pattern`, `count`, `interleaving_candidate_set`, `variants` |
+| `InterleavingPatternSpec` | `name`, `trigger_candidate_set`, `partner_candidate_set`, `trigger_weight` |
+| `InterleavingSpec` | `no_interleaving_weight`, `patterns` |
 | `InstructionOnlySpec` | `name`, `sequence_class`, `count`, `len_range`, `instruction`, `state_schema` |
-| `TimelineSpec` | `timestamp_start_us`, `utc_offset_minutes`, `event_gap_us`, `primary_sessions`, `crossed_primary_sessions`, `session_max_events`, `session_max_span_us`, `session_gap_us`, `noise_events`, `duplicate_sequences` |
+| `TimelineSpec` | `timestamp_start_us`, `utc_offset_minutes`, `event_gap_us`, `session_max_events`, `session_max_span_us`, `session_gap_us`, `noise_events`, `duplicate_sequences` |
 | `CalendarWindowSpec` | `name`, `utc_offset_minutes`, `days`, `intervals_us` |
 | `NoiseSpec` | `frame_class`, `instruction`, `topics` |
 | `GenerationLimits` | `pattern_roles`, `variants_per_counterfactual_set`, `instruction_only_events`, `scenario_seed_bytes`, `state_or_outcome_schema_bytes`, `frame_schema_bytes`, `event_patch_bytes`, `rendered_payload_bytes`, `prompt_value_bytes`, `repair_context_bytes`, `prompt_text_bytes`, `record_units`, `stream_rows`, `retained_content_bytes` |
-| `SequenceGenerationConfig` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `state_validator`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `calendar_windows`, `noise`, `limits` |
-| `GenerationProgram` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `planner_seed`, `class_views`, `frame_classes`, `frame_schema`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `calendar_windows`, `noise`, `limits`, `state_validator`, `digest` |
+| `SequenceGenerationConfig` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `state_validator`, `patterns`, `counterfactual_sets`, `instruction_only`, `interleaving`, `timeline`, `calendar_windows`, `noise`, `limits` |
+| `GenerationProgram` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `planner_seed`, `class_views`, `frame_classes`, `frame_schema`, `patterns`, `counterfactual_sets`, `instruction_only`, `interleaving`, `timeline`, `calendar_windows`, `noise`, `limits`, `state_validator`, `digest` |
 | `DeliverySlot` | `slot_key`, `source_name`, `scenario_index`, `sequence_class`, `pattern_name`, `variant_names`, `catalog_row_index` |
 | `PlannedEvent` | `event_key`, `role`, `position`, `logical_time_us`, `timestamp_us`, `duration_us`, `resources`, `session_id` |
 | `NoiseSlot` | `event_key`, `ordinal`, `frame_class`, `topic`, `timestamp_us`, `duration_us`, `resources`, `session_id` |
 | `ReplayLayout` | `source_slot_key`, `source_variant_name`, `replay_ordinal`, `session_id`, `shift_us` |
-| `ScenarioPlan` | `blocks`, `delivery_slots`, `noise_slots`, `replay_layouts`, `primary_sessions`, `digest` |
+| `InterleavingLayout` | `pattern_name`, `trigger_slot_key`, `trigger_variant_name`, `partner_slot_key`, `partner_variant_name` |
+| `ScenarioPlan` | `blocks`, `delivery_slots`, `noise_slots`, `replay_layouts`, `interleaving_layouts`, `interleaving_opportunities`, `interleaving_pattern_opportunities`, `primary_sessions`, `digest` |
 | `SequenceTemporalMember` | `event_id`, `timestamp_us`, `duration_us`, `resources` |
 | `SequenceTemporalContext` | `members` |
 | `ScenarioSeed` | `initial_state`, `actors`, `shared_facts`, `style`, `time_context` |
@@ -382,6 +385,18 @@ JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是�
 `PlannedEvent` 只冻结位置与时间结构；declared 的 frame class/actor 从 role 解析，instruction-only
 的 frame class/actor 由当次 `EventPlan` 选择，两者都不在计划事件上伪造预置值。
 
+`DeliverySlot` 不复制 interleaving candidate set 标签；`source_name` 与 frozen program 中的
+`CounterfactualSetSpec` 是唯一归属真值。`InterleavingLayout` 只冻结 named pattern 与两个 branch identity，
+不复制 session ID、timestamp 或 owner word；这些事实由 `ScenarioPlan.blocks` 唯一持有。候选资格仅来自
+declared counterfactual set 的唯一 positive variant；hidden baseline、反事实 variant、instruction-only、noise
+与 replay 不得进入交织载体。
+
+`GenerationProgram.digest` 递归覆盖 candidate set 归属、named pattern 及全部权重。
+`ScenarioPlan.digest` 覆盖 `interleaving_opportunities`、按 TOML 声明序的 pattern opportunity map、
+exact pair identity、blocks 中的 exact timestamp/session 及其他既有计划字段。
+`validate_plan_identity` 必须重建并逐字段比较，不信任 carrier 自报。`labelkit:v1.20` 仍是 generation ID、
+stream exact carrier 与 delivery digest 的工件编码域；v1.21 不改变这些 ID 公式。
+
 `EventExecutionContext.history` 恰为 `tuple[EventDraft, ...]`；`EventPlanRequest.history` 恰为
 `tuple[EventDraft, ...] | None`，且只在 instruction-only 非 null。`EventDraft` 刻意没有 role，
 是逐事件生成期唯一 history carrier。declared branch 在独立 PatternEvaluator 完成一对一 binding 前
@@ -399,7 +414,7 @@ positive sequence 继承；source 只按 `slot_key` 与 `source_variant_name` �
 `SequenceValidationInput`、`ScenarioValidationInput`、`GenerateStreamConfig`、`ScenarioConfig`、
 `SequencePlan`、`StreamPlan`、`ExecuteEventRequest` 均不存在；不得保留同名 alias、wrapper 或转换层。
 
-**v1.18 sequence 冻结接口：**
+**v1.21 sequence 冻结接口：**
 
 ~~~python
 def parse_generation_config(

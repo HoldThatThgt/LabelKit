@@ -719,6 +719,8 @@ def test_dry_run_rich_renders_exact_sequence_arithmetic_and_call_families(
     }
     sequence = {
         "planned_sets": 2, "planned_sequences": 8, "primary_events": 22,
+        "interleaving_opportunities": 0, "primary_sessions": 8,
+        "interleaved_primary_sessions": 0, "by_interleaving_pattern": {},
         "noise_events": 2, "replay_sequences": 1, "replay_events": 3,
         "stream_rows": 27, "successful_attempt_lower_bound": 48,
         "max_slot_attempts_upper_bound": 384, "sequence_calls": families,
@@ -729,7 +731,7 @@ def test_dry_run_rich_renders_exact_sequence_arithmetic_and_call_families(
     renderer.on_event(_ev("run.end", payload={"counts": {}, "exit_code": 0}))
     text = buf.getvalue()
     for key, value in {**sequence, **families}.items():
-        if key != "sequence_calls":
+        if key not in {"sequence_calls", "by_interleaving_pattern"}:
             assert key in text and str(value) in text
     assert "sequence generation calls" in text
 

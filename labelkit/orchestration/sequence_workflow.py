@@ -1,4 +1,4 @@
-"""v1.20 sequence 有界并发准备与声明序精确交付控制器。"""
+"""v1.21 sequence 有界并发准备与声明序精确交付控制器。"""
 from __future__ import annotations
 
 import asyncio
@@ -407,8 +407,10 @@ def _sequence_estimate_block(program, plan, calls, sequence_calls) -> dict:
         "planned_sets": len(plan.delivery_slots),
         "planned_sequences": primary_sequences,
         "primary_events": primary_events,
+        "interleaving_opportunities": plan.interleaving_opportunities,
         "primary_sessions": plan.primary_sessions,
-        "crossed_primary_sessions": program.timeline.crossed_primary_sessions,
+        "interleaved_primary_sessions": len(plan.interleaving_layouts),
+        "by_interleaving_pattern": _interleaving_pattern_counts(program, plan),
         "noise_events": len(plan.noise_slots),
         "replay_sequences": len(plan.replay_layouts),
         "replay_events": replay_events,
@@ -416,6 +418,27 @@ def _sequence_estimate_block(program, plan, calls, sequence_calls) -> dict:
         "successful_attempt_lower_bound": lower,
         "max_slot_attempts_upper_bound": lower * program.max_slot_attempts,
         "sequence_calls": sequence_calls,
+    }
+
+
+def _interleaving_pattern_counts(program, plan) -> dict:
+    """按配置声明序派生交织机会与选择计数。
+
+    @param program 冻结生成程序。
+    @param plan 冻结场景计划。
+    @return report/estimate 共用的命名 pattern 统计。
+    """
+    if program.interleaving is None:
+        return {}
+    selected: dict[str, int] = {}
+    for layout in plan.interleaving_layouts:
+        selected[layout.pattern_name] = selected.get(layout.pattern_name, 0) + 1
+    return {
+        pattern.name: {
+            "eligible_opportunities": plan.interleaving_pattern_opportunities[pattern.name],
+            "selected_sessions": selected.get(pattern.name, 0),
+        }
+        for pattern in program.interleaving.patterns
     }
 
 
@@ -1286,7 +1309,7 @@ class _DeliveryController:
 
     def _sequence_report(self, stream_rows) -> dict:
         """按冻结键序组装 report.generate.sequence。"""
-        plan, timeline = self.request.plan, self.request.program.timeline
+        plan = self.request.plan
         primary_events = sum(len(row.primary_stream_rows) for row in self.state.sequences)
         return {
             "mode": self.request.program.mode,
@@ -1295,13 +1318,18 @@ class _DeliveryController:
             "delivery_digest": None,
             "artifacts_committed": False,
             "program_digest": self.request.program.digest,
+            "plan_digest": plan.digest,
             "planned_sets": len(plan.delivery_slots),
             "delivered_sets": len(plan.delivery_slots),
             "planned_sequences": self._planned_sequences(),
             "delivered_sequences": len(self.state.sequences),
             "primary_events": primary_events,
+            "interleaving_opportunities": plan.interleaving_opportunities,
             "primary_sessions": plan.primary_sessions,
-            "crossed_primary_sessions": timeline.crossed_primary_sessions,
+            "interleaved_primary_sessions": len(plan.interleaving_layouts),
+            "by_interleaving_pattern": _interleaving_pattern_counts(
+                self.request.program, plan,
+            ),
             "noise_events": len(self.state.noise_rows),
             "replay_sequences": len(plan.replay_layouts),
             "replay_events": sum(len(replay.rows) for replay in self.state.replays),

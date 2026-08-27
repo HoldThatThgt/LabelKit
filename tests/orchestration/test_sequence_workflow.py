@@ -1,4 +1,4 @@
-"""v1.20 sequence 候选窗口、声明序提交与终态账本测试。"""
+"""v1.21 sequence 候选窗口、交织计划、声明序提交与终态账本测试。"""
 from __future__ import annotations
 
 import asyncio
@@ -240,12 +240,15 @@ def _controller(
         semantic_profile="model", evaluation_profile="model", max_slot_attempts=attempts,
         class_views={"cls": _view()}, frame_classes={"frame": SimpleNamespace(enabled=True)},
         limits=SimpleNamespace(retained_content_bytes=10**9),
-        planner_seed=7, timeline=SimpleNamespace(crossed_primary_sessions=0, utc_offset_minutes=480),
-        counterfactual_sets=(), mode="instruction_only", digest="d" * 64, noise=None,
+        planner_seed=7, timeline=SimpleNamespace(utc_offset_minutes=480),
+        counterfactual_sets=(), interleaving=None, mode="instruction_only",
+        digest="d" * 64, noise=None,
     )
     plan = SimpleNamespace(
-        delivery_slots=tuple(_slot(index) for index in range(count)),
-        noise_slots=(), replay_layouts=(), blocks=(), primary_sessions=count, digest="p" * 64,
+        delivery_slots=tuple(_slot(index) for index in range(count)), noise_slots=(),
+        replay_layouts=(), interleaving_layouts=(), interleaving_opportunities=0,
+        interleaving_pattern_opportunities={}, blocks=(), primary_sessions=count,
+        digest="p" * 64,
     )
     paths = SimpleNamespace(
         project="project.toml", project_root="/tmp", input=None, output="out.jsonl",
@@ -284,6 +287,39 @@ async def _wait_until(predicate, turns: int = 5000) -> None:
     raise AssertionError("condition was not reached")
 
 
+def _local_interleaving_products():
+    """编译不物化凭据的本地四槽强制交织 program/plan。"""
+    cfg = load(
+        _EXAMPLE / "config-local-4b.toml",
+        _EXAMPLE / "project-runtime-four-slot.toml",
+        CliOverrides(),
+    )
+    from labelkit.operators.generation.planner import compile_scenario_plan
+    from labelkit.operators.generation.program import compile_generation_program
+
+    program = compile_generation_program(cfg)
+    return cfg, program, compile_scenario_plan(program)
+
+
+def _sequence_report_for_products(cfg, program, plan) -> dict:
+    """为离线 exact-shape 测试填入一轮完整成功交付账本。"""
+    controller, _metrics, _dedup = _controller(count=len(plan.delivery_slots))
+    controller.generation.config = cfg
+    controller.request.program = program
+    controller.request.plan = plan
+    for slot in plan.delivery_slots:
+        main = {"_meta": {"generation": {
+            "pattern": slot.pattern_name,
+            "variant": slot.variant_names[0],
+        }}}
+        controller.state.sequences.append(SequenceRows(main, ({}, {}, {}), 0))
+    controller.state.noise_rows.append({})
+    controller.state.replays.append(SimpleNamespace(rows=({}, {}, {})))
+    controller.state.sequence_attempts = 4
+    controller.state.noise_attempts = 1
+    return controller._sequence_report([{} for _ in range(16)])
+
+
 def test_estimate_uses_the_frozen_example_program_and_plan() -> None:
     """估算继续绑定生产 compiler/planner 的 8/27 教学计划。"""
     cfg = load(
@@ -299,6 +335,66 @@ def test_estimate_uses_the_frozen_example_program_and_plan() -> None:
     assert estimate["batches"] == 2
     assert estimate["sequence"]["stream_rows"] == 27
     assert estimate["sequence"]["successful_attempt_lower_bound"] == estimate["total_calls"]
+
+
+def test_selected_pair_estimate_and_success_report_have_exact_shape() -> None:
+    """强制 pair 的 estimate/report 共享冻结交织统计与键序。"""
+    cfg, program, plan = _local_interleaving_products()
+    estimate = estimate_sequence_products(cfg, program, plan)["sequence"]
+    report = _sequence_report_for_products(cfg, program, plan)
+    assert list(report) == [
+        "mode", "run_attempt_id", "run_id", "delivery_digest", "artifacts_committed",
+        "program_digest", "plan_digest", "planned_sets", "delivered_sets",
+        "planned_sequences", "delivered_sequences", "primary_events",
+        "interleaving_opportunities", "primary_sessions", "interleaved_primary_sessions",
+        "by_interleaving_pattern", "noise_events", "replay_sequences", "replay_events",
+        "replay_tail_sessions", "stream_rows", "sequence_slot_attempts",
+        "noise_slot_attempts", "sequence_calls", "by_pattern", "rejected_attempts",
+    ]
+    expected = {
+        "plan_digest": plan.digest,
+        "interleaving_opportunities": 2,
+        "primary_sessions": 2,
+        "interleaved_primary_sessions": 2,
+        "by_interleaving_pattern": {
+            "runtime_pair": {"eligible_opportunities": 2, "selected_sessions": 2},
+        },
+    }
+    assert {key: report[key] for key in expected} == expected
+    assert {key: estimate[key] for key in expected} == expected
+    assert report["primary_events"] == 12 and report["stream_rows"] == 16
+
+
+def test_selected_none_estimate_and_success_report_have_exact_shape(monkeypatch) -> None:
+    """启用配置但抽中 none 时保留机会并输出零 selected session。"""
+    cfg, program, _forced_plan = _local_interleaving_products()
+    from labelkit.operators.generation import planner
+    from labelkit.operators.generation.program import generation_program_digest
+
+    original_random = planner.generation_random
+    interleaving = replace(program.interleaving, no_interleaving_weight=1)
+    program = replace(program, interleaving=interleaving, digest="")
+    program = replace(program, digest=generation_program_digest(program))
+    monkeypatch.setattr(
+        planner,
+        "generation_random",
+        lambda domain, value: (
+            0 if domain == "interleaving_pattern_choice" else original_random(domain, value)
+        ),
+    )
+    plan = planner.compile_scenario_plan(program)
+    estimate = estimate_sequence_products(cfg, program, plan)["sequence"]
+    report = _sequence_report_for_products(cfg, program, plan)
+    expected = {
+        "interleaving_opportunities": 2,
+        "primary_sessions": 4,
+        "interleaved_primary_sessions": 0,
+        "by_interleaving_pattern": {
+            "runtime_pair": {"eligible_opportunities": 2, "selected_sessions": 0},
+        },
+    }
+    assert {key: report[key] for key in expected} == expected
+    assert {key: estimate[key] for key in expected} == expected
 
 
 def test_candidate_capacity_sums_distinct_enabled_resource_keys_only() -> None:
@@ -1140,6 +1236,68 @@ def test_success_and_failed_reports_use_frozen_runtime_key_order() -> None:
     assert list(failed["runtime"]) == list(_RUNTIME_KEYS)
 
 
+def test_instruction_only_success_report_has_exact_sequence_shape() -> None:
+    """instruction-only 成功路径输出冻结 sequence 闭集与零交织统计。"""
+    controller, _metrics, _dedup = _controller(count=1)
+    controller.state.sequences.append(SequenceRows(
+        {"_meta": {}}, ({"_meta": {"event": {"event_id": "event"}}},), 0,
+    ))
+    controller.state.sequence_attempts = 1
+
+    sequence = controller._success_report(({},))["generate"]["sequence"]
+
+    assert tuple(sequence) == (
+        "mode", "run_attempt_id", "run_id", "delivery_digest", "artifacts_committed",
+        "program_digest", "plan_digest", "planned_sets", "delivered_sets",
+        "planned_sequences", "delivered_sequences", "primary_events",
+        "interleaving_opportunities", "primary_sessions", "interleaved_primary_sessions",
+        "by_interleaving_pattern", "noise_events", "replay_sequences", "replay_events",
+        "replay_tail_sessions", "stream_rows", "sequence_slot_attempts",
+        "noise_slot_attempts", "sequence_calls", "by_pattern", "rejected_attempts",
+    )
+    assert tuple(sequence["sequence_calls"]) == (
+        "scenario_seed_calls", "baseline_event_plan_calls", "variant_event_plan_calls",
+        "frame_render_calls", "semantic_evaluation_calls", "noise_render_calls",
+        "noise_evaluation_calls",
+    )
+    assert tuple(sequence["rejected_attempts"]) == (
+        "scenario_schema", "event_schema", "post_validator_invalid",
+        "post_validator_exception", "state_transition", "frame_schema",
+        "coupling_evaluation", "pattern_evaluation", "state_evaluation",
+        "semantic_evaluation", "sequence_memory_budget", "context_overflow",
+        "output_truncated", "provider_retryable_exhausted", "dedup", "quality",
+        "annotate", "verify", "reconcile", "noise_schema", "noise_semantic",
+        "noise_similarity", "noise_memory_budget", "noise_context_overflow",
+        "noise_output_truncated", "noise_provider_retryable_exhausted", "noise_reconcile",
+    )
+    assert sequence | {
+        "run_attempt_id": "a" * 32,
+        "run_id": "b" * 32,
+        "program_digest": "d" * 64,
+        "plan_digest": "p" * 64,
+        "sequence_calls": {key: 0 for key in sequence["sequence_calls"]},
+        "rejected_attempts": {key: 0 for key in sequence["rejected_attempts"]},
+    } == sequence
+    assert {
+        key: sequence[key]
+        for key in (
+            "mode", "planned_sets", "delivered_sets", "planned_sequences",
+            "delivered_sequences", "primary_events", "interleaving_opportunities",
+            "primary_sessions", "interleaved_primary_sessions", "by_interleaving_pattern",
+            "noise_events", "replay_sequences", "replay_events", "replay_tail_sessions",
+            "stream_rows", "sequence_slot_attempts", "noise_slot_attempts", "by_pattern",
+        )
+    } == {
+        "mode": "instruction_only", "planned_sets": 1, "delivered_sets": 1,
+        "planned_sequences": 1, "delivered_sequences": 1, "primary_events": 1,
+        "interleaving_opportunities": 0, "primary_sessions": 1,
+        "interleaved_primary_sessions": 0, "by_interleaving_pattern": {},
+        "noise_events": 0, "replay_sequences": 0, "replay_events": 0,
+        "replay_tail_sessions": 0, "stream_rows": 1, "sequence_slot_attempts": 1,
+        "noise_slot_attempts": 0, "by_pattern": {},
+    }
+
+
 _SEQUENCE_RETRY_CASES = (
     (GenerationAttemptRejected("scenario_schema", "slot"), "scenario_schema"),
     (GenerationAttemptRejected("event_schema", "slot"), "event_schema"),
@@ -1292,6 +1450,72 @@ async def test_retry_reuses_exact_frozen_program_and_plan_objects() -> None:
     )
     await controller._deliver_slot_phases()
     assert observed == [expected, expected]
+
+
+async def test_interleaving_retry_and_reverse_completion_reuse_frozen_plan() -> None:
+    """启用交织后 recoverable retry 与逆序完成不替换 pair/layout/timestamp。"""
+    cfg, program, plan = _local_interleaving_products()
+    controller, _metrics, _dedup = _controller(count=4, capacity=4, attempts=2)
+    controller.generation.config = cfg
+    controller.request.program = program
+    controller.request.plan = plan
+    gates: dict[tuple[int, int], asyncio.Event] = {}
+    started: set[tuple[int, int]] = set()
+    completion: list[tuple[int, int]] = []
+    observed = []
+    commits: list[int] = []
+    expected = (
+        id(program), id(plan), _plan_witness(program, plan),
+        plan.interleaving_layouts, plan.interleaving_opportunities,
+    )
+    original_commit = controller._commit_primary_head
+
+    async def capture(_self, _phase, slot, ordinal, attempt_index):
+        if _phase == "noise":
+            return _AttemptOutcome(
+                attempt_index, _synthetic_candidate(ordinal), None, None,
+            )
+        key = (ordinal, attempt_index)
+        gate = gates.setdefault(key, asyncio.Event())
+        started.add(key)
+        observed.append((
+            id(controller.request.program), id(controller.request.plan),
+            _plan_witness(controller.request.program, controller.request.plan),
+            controller.request.plan.interleaving_layouts,
+            controller.request.plan.interleaving_opportunities,
+        ))
+        await gate.wait()
+        completion.append(key)
+        if key == (0, 0):
+            error = GenerationAttemptRejected("quality", slot.slot_key)
+            return _AttemptOutcome(attempt_index, None, None, error)
+        return _AttemptOutcome(attempt_index, _synthetic_candidate(ordinal), None, None)
+
+    def commit(_self, outcome):
+        if outcome.error is not None:
+            return original_commit(outcome)
+        commits.append(outcome.candidate.ordinal)
+        return None
+
+    controller._capture_attempt = MethodType(capture, controller)
+    controller._commit_primary_head = MethodType(commit, controller)
+    controller._commit_noise_head = MethodType(
+        lambda _self, _outcome: None,
+        controller,
+    )
+    run = asyncio.create_task(controller._deliver_slot_phases())
+    await _wait_until(lambda: {(index, 0) for index in range(4)} <= started)
+    for ordinal in reversed(range(4)):
+        gates[(ordinal, 0)].set()
+        await _wait_until(lambda value=ordinal: (value, 0) in completion)
+    await _wait_until(lambda: (0, 1) in started)
+    gates[(0, 1)].set()
+    await run
+    assert completion == [(3, 0), (2, 0), (1, 0), (0, 0), (0, 1)]
+    assert commits == [0, 1, 2, 3]
+    assert observed == [expected] * 5
+    assert controller.state.sequence_attempts == 5
+    assert controller.state.rejected["quality"] == 1
 
 
 @pytest.mark.parametrize("domain", ("primary", "noise"))
@@ -1603,8 +1827,10 @@ def test_teaching_example_arithmetic_and_call_families_are_exact() -> None:
         "planned_sets": 2,
         "planned_sequences": 8,
         "primary_events": 22,
+        "interleaving_opportunities": 0,
         "primary_sessions": 8,
-        "crossed_primary_sessions": 0,
+        "interleaved_primary_sessions": 0,
+        "by_interleaving_pattern": {},
         "noise_events": 2,
         "replay_sequences": 1,
         "replay_events": 3,

@@ -228,7 +228,7 @@
 
 - [114] Disjunctive Temporal Problems under Structural Restrictions. AAAI. https://ojs.aaai.org/index.php/AAAI/article/view/16489（日历析取导致的组合约束；v1.16 交由同一个 CP-SAT 模型联合求解）
 
-- [115] Google OR-Tools. CP-SAT Solver. https://developers.google.com/optimization/cp/cp_solver（v1.18 ScenarioPlanner 对 role/gap、时间、session、crossing、noise、replay 与 exact count 的有限整数约束，以及固定单 worker、确定性预算求解的基础）
+- [115] Google OR-Tools. CP-SAT Solver. https://developers.google.com/optimization/cp/cp_solver（v1.21 ScenarioPlanner 对 role/gap、时间、session、保序交织、noise、replay 与 exact count 的有限整数约束，以及固定单 worker、确定性预算求解的基础）
 
 - [116] Google OR-Tools. Python `AddAutomaton` API. https://or-tools.github.io/docs/pdoc/ortools/sat/python/cp_model（同一组位置变量上的有限自动机约束接口；不构造显式乘积 DFA）
 
@@ -263,3 +263,11 @@
 - [131] τ-bench: A Benchmark for Tool-Agent-User Interaction in Real-World Domains. https://arxiv.org/abs/2406.12045（2026-08-21 访问）（v1.18 以最终数据库状态与目标状态比较任务是否完成的 state-aware evaluator 先例）
 
 - [132] Park, J. S. et al. Generative Agents: Interactive Simulacra of Human Behavior. https://arxiv.org/abs/2304.03442（2026-08-21 访问）（v1.18 让 actor 的观察、计划与历史共同约束行为内容，避免局部 prompt 提前泄露世界事实）
+
+- [133] Cocotec. FDR CSPM Processes: interleave. https://cocotec.io/fdr/manual/cspm/processes.html（2026-08-27 访问）（CSP 保序 interleave 的成熟语义：各 operand 内部次序保持，全局允许合法 shuffle；v1.21 不让用户枚举 owner word）
+
+- [134] QuickCheck. `Test.QuickCheck.Gen` source: `frequency`. https://github.com/nick8325/quickcheck/blob/master/src/Test/QuickCheck/Gen.hs（2026-08-27 访问）（汇总整数权重后按累积连续区间选择 alternative；v1.21 的 none 只入分母一次且 partner 数不复制 pattern 权重）
+
+- [135] Google OR-Tools. `SatParameters` protocol. https://github.com/google/or-tools/blob/stable/ortools/sat/sat_parameters.proto（2026-08-27 访问）（CP-SAT 固定 worker、random seed 与 deterministic-time 预算的官方参数面；v1.21 仍只解码 OPTIMAL）
+
+- [136] Temporal Java SDK. `Workflow` replay-safe APIs. https://github.com/temporalio/sdk-java/blob/main/temporal-sdk/src/main/java/io/temporal/workflow/Workflow.java（2026-08-27 访问）（workflow replay-safe randomness 与普通随机源分离的工业实现；v1.21 先冻结交织计划，provider 与 slot retry 均不重抽）

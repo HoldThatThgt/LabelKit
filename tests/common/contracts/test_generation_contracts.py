@@ -1,4 +1,4 @@
-"""v1.18 generation carrier 与 common 接口的手写冻结清单测试。"""
+"""v1.21 generation carrier 与 common 接口的手写冻结清单测试。"""
 from __future__ import annotations
 
 import dataclasses
@@ -53,14 +53,19 @@ CONFIG_FIELDS = {
         "name", "kind", "target", "outcome_schema", "expected_violation",
         "divergence_role",
     ),
-    "CounterfactualSetSpec": ("name", "pattern", "count", "variants"),
+    "CounterfactualSetSpec": (
+        "name", "pattern", "count", "interleaving_candidate_set", "variants",
+    ),
+    "InterleavingPatternSpec": (
+        "name", "trigger_candidate_set", "partner_candidate_set", "trigger_weight",
+    ),
+    "InterleavingSpec": ("no_interleaving_weight", "patterns"),
     "InstructionOnlySpec": (
         "name", "sequence_class", "count", "len_range", "instruction", "state_schema",
     ),
     "TimelineSpec": (
-        "timestamp_start_us", "utc_offset_minutes", "event_gap_us", "primary_sessions",
-        "crossed_primary_sessions", "session_max_events", "session_max_span_us",
-        "session_gap_us", "noise_events", "duplicate_sequences",
+        "timestamp_start_us", "utc_offset_minutes", "event_gap_us", "session_max_events",
+        "session_max_span_us", "session_gap_us", "noise_events", "duplicate_sequences",
     ),
     "CalendarWindowSpec": ("name", "utc_offset_minutes", "days", "intervals_us"),
     "NoiseSpec": ("frame_class", "instruction", "topics"),
@@ -74,7 +79,7 @@ CONFIG_FIELDS = {
     "SequenceGenerationConfig": (
         "mode", "semantic_profile", "evaluation_profile", "max_slot_attempts",
         "state_validator", "patterns", "counterfactual_sets", "instruction_only",
-        "timeline", "calendar_windows", "noise", "limits",
+        "interleaving", "timeline", "calendar_windows", "noise", "limits",
     ),
 }
 
@@ -102,10 +107,13 @@ CONFIG_TYPES = {
         typing.Mapping[str, str], str | None,
     ),
     "CounterfactualSetSpec": (
-        str, str, int, tuple[config_generation.VariantSpec, ...]),
+        str, str, int, str | None, tuple[config_generation.VariantSpec, ...]),
+    "InterleavingPatternSpec": (str, str, str, int),
+    "InterleavingSpec": (
+        int, tuple[config_generation.InterleavingPatternSpec, ...]),
     "InstructionOnlySpec": (
         str, str, int, tuple[int, int], str, typing.Mapping[str, object]),
-    "TimelineSpec": (int, int, tuple[int, int], int, int, int, int, int, int, int),
+    "TimelineSpec": (int, int, tuple[int, int], int, int, int, int, int),
     "CalendarWindowSpec": (
         str, int,
         tuple[Literal["mon", "tue", "wed", "thu", "fri", "sat", "sun"], ...],
@@ -117,7 +125,8 @@ CONFIG_TYPES = {
         Literal["declared", "instruction_only"], str, str, int, ResolvedHook | None,
         tuple[config_generation.SequencePattern, ...],
         tuple[config_generation.CounterfactualSetSpec, ...],
-        tuple[config_generation.InstructionOnlySpec, ...], config_generation.TimelineSpec,
+        tuple[config_generation.InstructionOnlySpec, ...],
+        config_generation.InterleavingSpec | None, config_generation.TimelineSpec,
         typing.Mapping[str, config_generation.CalendarWindowSpec],
         config_generation.NoiseSpec | None, config_generation.GenerationLimits,
     ),
@@ -128,7 +137,8 @@ CONTRACT_FIELDS = {
     "GenerationProgram": (
         "mode", "semantic_profile", "evaluation_profile", "max_slot_attempts",
         "planner_seed", "class_views", "frame_classes", "frame_schema", "patterns",
-        "counterfactual_sets", "instruction_only", "timeline", "calendar_windows",
+        "counterfactual_sets", "instruction_only", "interleaving", "timeline",
+        "calendar_windows",
         "noise", "limits", "state_validator", "digest",
     ),
     "DeliverySlot": (
@@ -147,9 +157,14 @@ CONTRACT_FIELDS = {
         "source_slot_key", "source_variant_name", "replay_ordinal", "session_id",
         "shift_us",
     ),
+    "InterleavingLayout": (
+        "pattern_name", "trigger_slot_key", "trigger_variant_name", "partner_slot_key",
+        "partner_variant_name",
+    ),
     "ScenarioPlan": (
-        "blocks", "delivery_slots", "noise_slots", "replay_layouts", "primary_sessions",
-        "digest",
+        "blocks", "delivery_slots", "noise_slots", "replay_layouts",
+        "interleaving_layouts", "interleaving_opportunities",
+        "interleaving_pattern_opportunities", "primary_sessions", "digest",
     ),
     "SequenceTemporalMember": ("event_id", "timestamp_us", "duration_us", "resources"),
     "SequenceTemporalContext": ("members",),
@@ -400,7 +415,8 @@ CONTRACT_TYPES = {
         Mapping[str, ClassView], Mapping[str, FrameClassView], Mapping[str, object] | None,
         Mapping[str, config_generation.SequencePattern],
         tuple[config_generation.CounterfactualSetSpec, ...],
-        tuple[config_generation.InstructionOnlySpec, ...], config_generation.TimelineSpec,
+        tuple[config_generation.InstructionOnlySpec, ...],
+        config_generation.InterleavingSpec | None, config_generation.TimelineSpec,
         Mapping[str, config_generation.CalendarWindowSpec], config_generation.NoiseSpec | None,
         config_generation.GenerationLimits, ResolvedHook | None, str,
     ),
@@ -408,13 +424,15 @@ CONTRACT_TYPES = {
     "PlannedEvent": (str, str, int, int, int, int, tuple[str, ...], str),
     "NoiseSlot": (str, int, str, str, int, int, tuple[str, ...], str),
     "ReplayLayout": (str, str, int, str, int),
+    "InterleavingLayout": (str, str, str, str, str),
     "ScenarioPlan": (
         tuple[Mapping[
             tuple[str, str | None], tuple[contracts_generation.PlannedEvent, ...]
         ], ...],
         tuple[contracts_generation.DeliverySlot, ...],
         tuple[contracts_generation.NoiseSlot, ...],
-        tuple[contracts_generation.ReplayLayout, ...], int, str,
+        tuple[contracts_generation.ReplayLayout, ...],
+        tuple[contracts_generation.InterleavingLayout, ...], int, Mapping[str, int], int, str,
     ),
     "SequenceTemporalMember": (str, int, int, tuple[str, ...]),
     "SequenceTemporalContext": (
@@ -1097,7 +1115,7 @@ def test_contracts_frame_only_and_segment_exception_semantics_are_frozen():
     assert "`frame.classify.enabled ∨ frame.annotate.enabled`" not in rule_43
 
     rule_49 = _markdown_section(
-        path, "49. **frame 表停放警告**", "Sequence generation (v1.18",
+        path, "49. **frame 表停放警告**", "Sequence generation (current v1.21",
     )
     assert "process/flat frame annotation takes rule 43's CONFIG_ERROR path" in rule_49
     assert "Sequence frame annotation is the explicit valid exception" in rule_49
@@ -1109,7 +1127,7 @@ def test_sequence_report_rejection_fields_match_all_authoritative_sources():
     assert tuple(sequence_workflow._REJECTION_KEYS) == _REPORT_REJECTION_FIELDS
     sources = (
         (root / "docs/dev/SPEC-sequence-generation-redesign.md", "### 14.4 report"),
-        (root / "spec/60-ch6-io-formats.md", "### 6.4.1 v1.20 sequence success report"),
+        (root / "spec/60-ch6-io-formats.md", "### 6.4.1 v1.21 sequence success report"),
         (root / "docs/CONTRACTS.md", "The frozen sequence report follows."),
     )
     for path, marker in sources:
@@ -1150,3 +1168,23 @@ def test_mapping_carriers_recursively_copy_and_freeze_json():
     assert "new" not in execution.state_before["nested"]
     with pytest.raises(TypeError):
         execution.state_before["nested"]["blocked"] = True
+
+
+def test_scenario_plan_copies_and_freezes_interleaving_opportunity_map():
+    """plan 机会统计不得共享调用方可变 Mapping。"""
+    opportunities = {"trigger_with_partner": 1}
+    plan = contracts_generation.ScenarioPlan(
+        blocks=(),
+        delivery_slots=(),
+        noise_slots=(),
+        replay_layouts=(),
+        interleaving_layouts=(),
+        interleaving_opportunities=1,
+        interleaving_pattern_opportunities=opportunities,
+        primary_sessions=0,
+        digest="a" * 64,
+    )
+    opportunities["trigger_with_partner"] = 2
+    assert plan.interleaving_pattern_opportunities["trigger_with_partner"] == 1
+    with pytest.raises(TypeError):
+        plan.interleaving_pattern_opportunities["blocked"] = 1

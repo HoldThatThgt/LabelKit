@@ -89,6 +89,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/config/_generation_budget.py",  # v1.18 六家族预算证明
     "labelkit/common/config/_rubrics.py",
     "labelkit/common/config/_schemas.py",
+    "labelkit/common/config/_sequence_layout.py",  # v1.21 timeline 与交织配置闭包
     "labelkit/common/config/_sections.py",
     "labelkit/common/config/_temporal.py",
     "labelkit/common/config/generation.py",

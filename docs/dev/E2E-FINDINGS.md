@@ -1,8 +1,8 @@
 # E2E 测试发现与证据状态
 
 > 本文件只记录可复核证据。已验证事实、权威验收目标、环境失败和待运行项分开书写。
-> 当前序列生成以 v1.20 时间完整性规格、sequence redesign、v1.19 execution runtime 规格与
-> `examples/sequence-generation` 为准；v1.18/v1.19 结果仅作历史基线。
+> 当前序列生成以 v1.21 交织规格、v1.20 时间完整性规格、sequence redesign、v1.19 execution runtime 规格与
+> `examples/sequence-generation` 为准；较早 revision 的结果仅作历史基线。
 
 ## 证据纪律
 
@@ -12,6 +12,84 @@
 - 429、5xx、额度耗尽属于环境失败；slot exhaustion 属于产品失败，不能重跑到绿后删除失败记录。
 - API key value 只在内存中使用，不写日志、trace、main、stream、report、manifest、failed report 或 assertion repr。
 - 尚未运行的证据必须保留 `[PENDING-EVIDENCE:<name>]`，不能用规格期望冒充结果。
+
+## v1.21 序列交织证据看板
+
+本节记录 2026-08-28 当前 checkout 的权重选择、partner pool、真实交织布局、报告、规模与本地真实模型证据。
+DeepSeek 与 z.ai 的历史结果不冒充本轮回归；本轮未运行时分别保留
+`[PENDING-EVIDENCE:v1.21-deepseek]` 与 `[PENDING-EVIDENCE:v1.21-zai]`。
+
+| 证据面 | 当前状态 | 已知事实 / 输入边界 |
+|---|---|---|
+| interleaving 特性回归 | 已验证 | 最终定向门 855 passed，覆盖配置、carrier、program、plan、project、planner、workflow 与 CLI |
+| changed production coverage | 已验证 | 1514 passed、1 deselected；55/55 个修改函数进入；11 个修改文件最低 line 87.34%、最低 branch 81.38% |
+| 完整 offline suite | 已验证 | `3002 passed, 48 deselected in 575.62s`；shell wall 576.11 秒，peak RSS 991674368 bytes，0 swap |
+| 50 万 record-unit planner 门 | 已验证 | 100000 条四事件 sequence、400000 个事件；1 passed、12 deselected，21.81 秒；shell wall 22.38 秒，peak RSS 919453696 bytes，0 swap |
+| 六百分支规模门 | 已验证 | 600 positive branches、300 forced pairs；1 passed，65 deselected，446.83 秒；shell wall 447.46 秒，peak RSS 219054080 bytes，0 swap |
+| 主例 keyless 门 | 已验证 | 2 sets、8 sequences、22 primary events、0 opportunity、8 primary sessions、27 stream rows |
+| 四槽 keyless 门 | 已验证 | 4 sets、4 sequences、12 primary events、2 opportunities、2 interleaved sessions、16 stream rows |
+| 本地 Qwen3.5-4B 集成 checker | 已验证 | 修正最终 row 断言后 1 passed in 82.23 秒；server request high-water 精确为 4，两个 profile usage 均非零 |
+| 本地四槽持久化工件 | 已验证 | 4 main、16 stream、2 个双 owner 真交织 session；manifest-last 与 report 原子提交 |
+| Uncle Bob mutation review | 已验证 | 40 个有效语义变异全部 killed；2 个删除重复约束的等价变异为 invalid；survived 与 inconclusive 均为 0 |
+
+Uncle Bob review 在干净提交 `f5d828a` 的 detached worktree 上分组执行。配置闭包与 program/plan identity 为
+12 killed；权重、共享 partner pool、fail-closed 与声明序放置为 14 killed；逻辑 offset、资源、起点唯一性、
+真交织、容量、报告与冻结重试为 14 killed、2 equivalent invalid。两个 invalid 分别只删除 CP-SAT combined span
+约束和 combined event-count guard，但相同上限仍由 `_check_session` 的 post-check 拒绝，因此没有可观察语义变化。
+审查没有修改测试，每个生产变异都立即反向恢复并验证 detached 与 caller status 为空。
+
+50 万门真实调用 `compile_scenario_plan`，并冻结 program-bound plan digest
+`7b93a75e407382e24c4cd8dcfabf97cd9dfd30ff9c19ecbce166e2bfbd5d56ad`；它不是共享最小对象的 lightweight
+carrier oracle。交织规模门命令为：
+
+```bash
+/usr/bin/time -l uv run --python 3.12 pytest -q \
+  tests/operators/generation/test_planner.py \
+  -k 'six_hundred_positive_branches' -x
+```
+
+它实际构造 600 个 delivery slots、300 个布局与 300 个机会，并验证 1200 次 solver 调用、派生
+`primary_sessions=300` 和不构造 pair matrix；实际 plan digest 为
+`59e11af8d22ecdf195409d6f2e242c11ba7a5d8f23e0315b4ae2013b41de8a89`。完整 suite 再次包含同一规模用例，
+未通过 deselect 缩小组合门。
+
+本地真实模型为
+`/Users/atishoo/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q6_K.gguf`，SHA-256 为
+`fdedd781c9ce676ab66b018ca247ff78e8a33c98098a822c1e2d5075e7718f66`。服务为 llama-server 0.3.0，
+build 10621，commit `c1d0e7a00`。实际启动命令为：
+
+```bash
+/opt/homebrew/bin/llama-server \
+  -m /Users/atishoo/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q6_K.gguf \
+  -c 393216 -np 4 -b 2048 -ub 512 -t 6 -tb 6 \
+  -ngl all -fa on --fit off -rea off \
+  --host 127.0.0.1 --port 18081 --metrics --no-webui
+```
+
+真实集成命令及结果为：
+
+```bash
+LABELKIT_LOCAL_KEY=local-test-key uv run --python 3.12 pytest \
+  tests/integration/test_execution_runtime_local_llm.py -q \
+  -m 'integration and local_llm'
+```
+
+修正 checker 使其直接比较最终 row 的 duration/resources 后，结果为 1 passed in 82.23 秒，无 skip；shell wall
+82.54 秒，peak RSS 207421440 bytes，0 swap。checker 在独立临时工程中机械验证 main 4 行、stream 16 行、两个共享
+session 各含一个 `runtime_trigger` 与一个 `runtime_partner`、每个 session 六个事件且 owner runs 至少为三；同时验证
+最终 stream 的 owner 行序映射到连续 plan position、logical/artifact delta、最终 row duration/resource、
+plan/delivery digest、manifest 文件哈希与 secret scan。
+轮询真实 server metrics 得到 `llamacpp:requests_processing` high-water 精确为 4。
+
+随后使用同一服务运行公开四槽工程并持久化工件，shell wall 为 86.23 秒，peak RSS 182059008 bytes，0 swap。
+report 记录 `program_digest=ddfc456f66e48f8e25c1899ffa786041f3836dab5dfe6197a8e010f1db199af5`、
+`plan_digest=cc0d4342bd454b43bddee6689f41d7f4ce2d04f1bf75243950e4698f79d6e3ac` 与
+`delivery_digest=0a3b798a163859d3bc52a05edc4725bdfe9f6c1b61090d7bebfb501c37fada96`。default profile 为
+29 calls、24322 prompt tokens、1973 completion tokens；judge 为 5 calls、8539 prompt tokens、214 completion tokens；
+两者 provider retries 均为 0。manifest 中 main、stream、report SHA-256 分别为
+`d657f9c66ef5175f1421d65622d34038a00c579b1f482006dc1a6134c5f70829`、
+`2b9604561b2a834ce3e08f33aaf6334084ffca0a3ec4bd7d24ab3cef78647a4a` 与
+`f0624f1870bba8aea2502fed4366247fb4c7c4203fb1efbe16a323a371dc7a51`。
 
 ## v1.20 时间完整性证据看板
 

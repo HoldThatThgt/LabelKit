@@ -62,8 +62,8 @@ _FLAT_GENERATE_KEYS = (
 )
 _SEQUENCE_GENERATE_KEYS = (
     "mode", "semantic_llm", "evaluation_llm", "max_slot_attempts", "state_validator",
-    "pattern", "counterfactual_sets", "instruction_only", "timeline", "calendar_window",
-    "noise",
+    "pattern", "counterfactual_sets", "instruction_only", "interleaving", "timeline",
+    "calendar_window", "noise",
 )
 
 

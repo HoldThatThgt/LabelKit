@@ -16,7 +16,7 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 - 时区：aware 值换算为 UTC epoch；naive 值**按 UTC 解释**。内部序键 = float 秒。
 - 解析失败与乱序**同走 `stream.on_disorder`**（"skip" 默认：跳过并计 bad_input + `IngestReport.disorder`；"fail"：InputError，退出码 3；5.2）。
 - 流式单调性校验不做全量重排：单调性游标**按 `stream.key` 分区键各自维护**（S19，内存 = 键基数）——逐设备/逐来源拼接的输入不会被整体判乱序；键变即断会话，**输入须按分区键成组**（交错流为演进候选，8.4）。
-- **v1.20 sequence stream 工件**：工件行顶层固定为 `payload` 与 `_meta`（6.5）；重放工程固定 `input.text_field = "payload"`、`stream.order_by = "meta:_meta.event.timestamp"`。M2 允许 object payload，完整 envelope 留在 `Record.raw`，并从 event descriptor 自包含验证时间、区间、replay 与 exact carrier；冻结 id 与同源验证见 3.2.5。
+- **v1.21 sequence stream 工件**：工件行顶层固定为 `payload` 与 `_meta`（6.5）；重放工程固定 `input.text_field = "payload"`、`stream.order_by = "meta:_meta.event.timestamp"`。M2 允许 object payload，完整 envelope 留在 `Record.raw`，并从 event descriptor 自包含验证时间、区间、replay 与 exact carrier；冻结 id 与同源验证见 3.2.5。工件 ID、stream exact carrier 与 delivery digest 继续使用 `labelkit:v1.20` 编码域，不因产品修订号制造 ID churn。
 
 ## 6.2 输入：UI 模态
 
@@ -109,7 +109,7 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
 }
 ```
 
-**v1.20 sequence 主输出。**sequence 形态的 main 每行是一条 primary sequence，
+**v1.21 sequence 主输出。**sequence 形态的 main 每行是一条 primary sequence，
 `Record.id = sequence_id`，并在 `_meta.generation` 携带冻结的 sequence truth。declared 形态包含
 `validation_mode`、`actor_knowledge_validation`、scenario set/index/id、world branch、sequence class、
 pattern、variant、expected violation 与 actual violations；instruction-only 形态不得伪造 scenario set、
@@ -226,17 +226,17 @@ state、callable repr 或 API key。
 
 （左侧新增 `dropped_noise` 与 `absorbed`（v1.8）及 `stitched`（v1.9 壳终态；fanout（右侧）计信封存在、stitched（左侧）计壳终态，二者分别记账无双记——经审计数值验证）、右侧新增 `episodes`；未启用的项恒 0，退化为上式）。`counts.threads` 不入守恒式——它是恒等式 `threads = episodes − stitched` 的导出量（M10 post-emit tally 单点上报，3.10.3；`rescued_short` 帧的 dropped_noise → absorbed 翻转发生在 emit 前、账目在路由时已定格，不破坏两侧平衡）。且 **stream 模式下 `counts.unprocessed` 的出现条件扩为「熔断 ∨ interrupted」**（S18：SIGINT 中断叠加会话缓冲会产生未走完流水线的残差；此时左侧另加 `unprocessed`，残差公式右侧 `+ episodes`、左侧 `+ absorbed + dropped_noise`（v1.9 另 `+ stitched`）同步扩展，failed 兜底公式减项同步——三处同步见 3.10.3 线索缝合行）；非 stream 模式中断残差恒 0、不加键（回归锚不动）。`schema_engine.resolved_at` 仅统计用户 Schema 的标注调用，加总 = 进入 M5 的记录数（4141+87+30+3+9 = 4270 = ingested 4987 − dropped_dup 412 − dropped_lowq 305）；裁决/评审/生成等内部 Schema 解析不计入。v1.12：**守恒恒等式与全部计数不变量零改动**——帧产物挂信封字段、不改任何信封状态（成员帧保持 absorbed，4.3 零改动声明），`frame_classify.*` / `frame_annotate.*` 是独立命名空间的新增计数、不进 counts 与守恒式；**`resolved_at` 恒等式不受帧标注影响**——帧标注走 `complete_validated` 的**显式 schema 参数**（= 内部 Schema 待遇，3.8.2 路由声明），与裁决/评审/生成同列不入桶，「加总 = 进入 M5 的记录数」在帧粒度开启时依然逐数成立。
 
-v1.20 sequence 形态不复用上述渐进式 counts 守恒来宣称部分成功：整组 delivery 在正式 commit 前保持 attempt-local，slot 或 noise 耗尽即不替换 main、stream、成功 report 或 manifest。成功计数以 `report.generate.sequence` 的 planned/delivered 恒等式为准；main 只计 primary sequence，stream 另计 primary/noise/replay event。报告、manifest 与 failed report 都只含计数、摘要和路径，不含数据内容。
+v1.21 sequence 形态不复用上述渐进式 counts 守恒来宣称部分成功：整组 delivery 在正式 commit 前保持 attempt-local，slot 或 noise 耗尽即不替换 main、stream、成功 report 或 manifest。成功计数以 `report.generate.sequence` 的 planned/delivered 恒等式为准；main 只计 primary sequence，stream 另计 primary/noise/replay event。报告、manifest 与 failed report 都只含计数、摘要和路径，不含数据内容。
 
 **rejects 通道 v1.8 增量**（完整格式规范属 3.11.2，此处登记 IO 面变化）：rejects 行的 (stage, reason) 组合新增三种——`segment / noise`（LLM 判噪声帧）、`segment / below_min_len`（短段丢弃帧，独立于 noise，S11）、`verify / off_task_member`（修复收缩弃帧，S31）；`--strict` 交互注意：stream 工程下噪声帧属预期产物，会触发退出码 1。**rejects 通道 v1.9 增量**：(stage, reason) 组合再增一种——`stitch / stitch_invalid`（仅 `stitch.on_error = "fail"` 时出现，3.16.6）；stitched 壳与被救援帧永不入 rejects（第四路由 / 翻转回 absorbed，3.11.2）——`--strict` 补注：同输入开启 stitch 后（短段被救援不再落 rejects）strict 结果可能由 1 变 0，属预期（2.4）。`output.rejects = "full"` 档对序列 Record 的原始载荷输出 `{"kind": "sequence", "member_ids": [...], "member_sources": [...]}`（S25——单记录 `_raw_payload` 假设的序列分支；`raw_last_output` 的 reason 门维持 schema_violation 现状，既有缺口明文接受）。**rejects 通道 v1.11 增量**：reason 词表再增两值——`context_overflow`（上下文预算三形态：预检 / 最小单元不装 / 反应态降级耗尽，V10/V16/V24）与 `output_truncated`（响应以输出上限截断收尾的终局化，V11）；stage = 产生该错误的属主算子（任何 LLM 调用阶段皆可出现），语义、处置与熔断矩阵见 7.6；refs / full 档行形态不变（两 kind 均不携带 `raw_last_output`）。**rejects 通道 v1.12 零增量声明**：帧粒度对本通道**零改动**——(stage, reason) 组合不增、reason 词表不增、行键集闭集不动；**帧级失败的成员不产生 rejects 行**（帧分类失败落 `fallback_class`、帧标注失败落 members[] 条目 status="failed"，均为成员级留痕非信封失败，3.13.7/3.5.5/3.11.2），`--strict` 判定读信封状态计数，**不受帧失败影响**（裁决·成员失败不入 rejects）。
 
-**v1.20 sequence rejects 边界：**sequence 形态的六路径集合令 `rejects = sidecar = null`。失败 attempt 从未成为正式 Record，不写 rejects；它只进入 `report.generate.sequence.rejected_attempts` 的唯一终态桶。任一 slot 耗尽写独立 failed report 并以退出码 1 结束，不提交已接受前缀。普通 process、flat generate 与 process stream 的 rejects 规则保持本段既有语义。
+**v1.21 sequence rejects 边界：**sequence 形态的六路径集合令 `rejects = sidecar = null`。失败 attempt 从未成为正式 Record，不写 rejects；它只进入 `report.generate.sequence.rejected_attempts` 的唯一终态桶。任一 slot 耗尽写独立 failed report 并以退出码 1 结束，不提交已接受前缀。普通 process、flat generate 与 process stream 的 rejects 规则保持本段既有语义。
 
-### 6.4.1 v1.20 sequence success report
+### 6.4.1 v1.21 sequence success report
 
 sequence 形态不写旧 `report.generate.stream`。成功 report 的 `report.generate.sequence` 键序冻结如下；
 示例值同时冻结 `examples/sequence-generation` 的验收算术：2 sets、8 primary sequences、22 primary events、
-2 noise events、1 replay sequence 的 3 replay events，合计 27 stream rows；8 个 primary sessions
+2 noise events、1 replay sequence 的 3 replay events，合计 27 stream rows；本例未启用交织，8 个 primary sessions
 彼此独立，另有 1 个 noise session 与 1 个 replay tail session。下例只展开 `generate.sequence`；顶层
 `runtime` 仍按 6.4 的固定形状在场，不能嵌入本块。
 
@@ -248,13 +248,16 @@ sequence 形态不写旧 `report.generate.stream`。成功 report 的 `report.ge
   "delivery_digest": "4567...",
   "artifacts_committed": true,
   "program_digest": "...",
+  "plan_digest": "...",
   "planned_sets": 2,
   "delivered_sets": 2,
   "planned_sequences": 8,
   "delivered_sequences": 8,
   "primary_events": 22,
+  "interleaving_opportunities": 0,
   "primary_sessions": 8,
-  "crossed_primary_sessions": 0,
+  "interleaved_primary_sessions": 0,
+  "by_interleaving_pattern": {},
   "noise_events": 2,
   "replay_sequences": 1,
   "replay_events": 3,
@@ -317,12 +320,28 @@ L3 repair 与 provider retry 继续只计既有 schema/usage 面。一次失败 
 `rejected_attempts` 桶；noise slot 只使用 noise 前缀的八个桶。未列键不得动态追加；provider fatal、
 plan 与 commit-I/O 属 run terminal，只写 `terminal_error_kind`。
 
+设全部可见 primary branch 数为 N、冻结 `InterleavingLayout` 数为 D，则
+`interleaved_primary_sessions=D`、`primary_sessions=N-D`。`interleaving_opportunities` 只在当前
+trigger 至少有一个 applicable pattern 的共享 partner pool 非空时加一。`by_interleaving_pattern`
+按 TOML pattern 声明序输出，包含 `selected_sessions=0` 的 pattern；每项固定为
+`{"eligible_opportunities", "selected_sessions"}`。disabled 与 instruction-only 固定输出
+`interleaving_opportunities=0`、`interleaved_primary_sessions=0`、`by_interleaving_pattern={}`。
+交织不改变 planned/delivered set、sequence、event、stream row、LLM call、noise 或 replay 计数。
+
+`plan_digest` 紧跟 `program_digest`，必须为 64 位小写 hex；它覆盖 opportunity、pattern map、
+exact pair identity 与 exact timestamp/session。report 不输出 slot identity、逐 pair owner word、payload、prompt、state
+或 API key。exact pair identity 只留在内存 `ScenarioPlan`，owner word 只从 stream/plan blocks 机械派生。
+
 failed report 使用相同 usage 与 `rejected_attempts` 口径，固定路径为
 `{output_stem}.failed.report.json`。它始终包含 `run_attempt_id`，另含 nullable `run_id`、
 `artifacts_committed = false`、nullable `failed_slot`、`attempts_used` 与 `terminal_error_kind`；
 不含 by-pattern 已交付前缀，因为没有数据提交。plan 尚未产生时 `run_id = null`。coordinator 与全部
 叶任务 cleanup 完成后才冻结 failed report 及其顶层 `runtime`；因低槽耗尽而取消的高槽候选、reservation
 与 dataset counters 不得泄漏为已提交计数，但已经发生的 usage、retry、Schema、trace、等待与取消仍是运行事实。
+交织 pattern 与 partner 一旦抽中即冻结；无可行布局写
+`terminal_error_kind="generation_plan_infeasible"` 并以退出码 2 失败，不换 partner/pattern/none、
+不转 standalone 也不重抽。FEASIBLE/UNKNOWN 为 `generation_plan_budget`、exit 4；MODEL_INVALID 为
+`generation_plan_internal`、exit 4。规划失败不打开 main、stream、success report、manifest 或 rejects。
 
 ### 6.4.2 sequence 路径与成功提交
 
@@ -349,7 +368,7 @@ failed report 不属于成功 manifest，成功运行不删除历史 failed repo
 该 canonical 编码只用于身份、计费与摘要；正式 main/stream/report/manifest 使用保留声明序的紧凑 JSON
 序列化，不能因复用摘要编码而打乱本节冻结的键序。
 
-## 6.5 v1.20 sequence stream 工件
+## 6.5 v1.21 sequence stream 工件（`labelkit:v1.20` 编码域）
 
 sequence 生成的第二份数据产物固定为 `{output_stem}.stream.jsonl`。UTF-8 JSONL 一行一个
 event，顶层只允许 `payload` 与 `_meta`。primary member 至少具有以下结构：
@@ -382,7 +401,7 @@ event，顶层只允许 `payload` 与 `_meta`。primary member 至少具有以�
 
 primary row 同时携带与 main owner 一致的 `_meta.generation` sequence truth。declared role 来自
 PatternEvaluator 的 actual binding；instruction-only role 固定为 `position_000`、`position_001`
-等位置名，不伪装成业务 pattern role。outer timestamp、gap 与 elapsed 保留在 `_meta.event`；payload Schema 中
+等位置名，不伪装成业务 pattern role。工件 timestamp、gap 与 elapsed 保留在 `_meta.event`；payload Schema 中
 以 `x-labelkit-business-time = true` 标记的叶子由同一 Planner start/end/duration 机械注入。
 
 noise row 的 `owner_sequence_id`、role、scenario id 与 world branch id 均为 null，并显式

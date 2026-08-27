@@ -2,7 +2,7 @@
 
 ## 2.1 系统定位与总体规格
 
-LabelKit 是一个**单机、单进程、无状态**的 Python CLI 批处理工具。一次运行按 project.toml 声明的阶段组合执行流水线：`run.mode = "process"`（默认）读取并加工既有数据；`"generate_only"` 无输入，由 M6 从零生成。v1.18 的 `generate.form` 只有 `flat` 与 `sequence`：flat 保持独立样本生成，sequence 在任何 LLM 调用前把互斥的 declared 或 instruction-only 配置编译为冻结 `GenerationProgram` 与 `ScenarioPlan`，再逐 delivery slot 生成、独立判定、整组试算下游并精确提交。sequence 成功运行同时交付 primary main、可重放 stream、report 与最后写入的 manifest；唯一外部服务仍是配置中声明的 LLM API。
+LabelKit 是一个**单机、单进程、无状态**的 Python CLI 批处理工具。一次运行按 project.toml 声明的阶段组合执行流水线：`run.mode = "process"`（默认）读取并加工既有数据；`"generate_only"` 无输入，由 M6 从零生成。v1.21 的 `generate.form` 只有 `flat` 与 `sequence`：flat 保持独立样本生成，sequence 在任何 LLM 调用前把互斥的 declared 或 instruction-only 配置编译为冻结 `GenerationProgram` 与 `ScenarioPlan`。declared 可在独立交织章节中以短 candidate set 标签和整数权重配置保序交织，是否交织、named pattern、partner 与绝对时间在计划内一次冻结。sequence 成功运行同时交付 primary main、可重放 stream、report 与最后写入的 manifest；唯一外部服务仍是配置中声明的 LLM API。
 
 ### 2.1.1 功能规格总表
 
@@ -15,7 +15,7 @@ LabelKit 是一个**单机、单进程、无状态**的 Python CLI 批处理工�
 | 线索缝合 | 可选，默认关 | v1.9（`stitch.enabled = true`，要求 stream 模式）：M16 stitch 在会话内把同一目标导向任务被穿插切开的碎片（episode）保守缝合为**线索 thread**——单调选池 LLM 判定 × 机械先验合取（App 交集 / 实体重叠 / 返回同一页面析取三腿）+ 有界二遍复评修正贪心漏缝（3.16）；`below_min_len` 短段按连续 run 重组先进候选池救援；被并 episode 壳置 `stitched`（仅计数不落盘，3.11.2）、幸存信封 Record 重绑；多碎片线索机械标定接缝（`seam_indexes`），M15 对接缝序数零 LLM 生成占位步（`detail.kind = "thread_seam"`，3.15.4）。产出三级结构 thread ⊃ fragment ⊃ step（`_meta.stream.fragments` 溯源，6.3）；关闭时主输出 / rejects / report.json 与 v1.8 逐字节等价（3.16.4 退化锚）。 |
 | 质量打分 | 可选，默认开 | QuRating 双模式：pairwise（批内 k 轮随机配对 → LLM 判胜负 → BT 拟合 → 百分位归一化到 [0,1]）与 pointwise（0–5 加性 rubric 打分归一化）。Rubric 用户提供或用系统默认（文本/UI 各一套）。可按聚合分阈值过滤。v1.7：classify 启用时批内按类分池打分，rubric/门槛/选择机制均可按类覆盖（3.4.3 按类分池行）。 |
 | 自动标注 | 可选，默认开 | 按 project.toml 的任务指令 + few-shot 示例组装提示词；UI 模态附截图（base64）与序列化 UI 树；输出受用户 JSON Schema 约束，经结构引擎（M8）保证合法。v1.2 增可选 self-consistency：同一记录以 `annotate.sc_temperature` 独立采样 n 次（`annotate.self_consistency`，n≥3 奇数）后字段级多数投票，成本 ×n（3.5.2）。 |
-| 数据生成 | 可选，默认关 | 仅文本模态。`generate.form="flat"` 保持既有 Self-Instruct / seedless 独立样本生成、llms×styles 多样化与单遍下游回流。`form="sequence"` 使用 v1.18 生成真值与 v1.19 执行模型：declared 生成受控 counterfactual set，instruction-only 在 LLM 前冻结完整布局；多个 slot 可并发完成 generation、evaluation、dedup reservation 与完整下游，声明序 head 才做去重重验证、增量 CrossView、retained 累加和原子 commit（3.6、3.10、3.11、3.17）。 |
+| 数据生成 | 可选，默认关 | 仅文本模态。`generate.form="flat"` 保持既有 Self-Instruct / seedless 独立样本生成、llms×styles 多样化与单遍下游回流。`form="sequence"` 使用 v1.21 生成真值：declared 生成受控 counterfactual set，可把唯一 positive branch 加入交织候选集；Planner 按 opportunity 对 none/named pattern 加权抽取，再从共享 partner pool 无偏不放回选择，求两条 branch 的保序时间交织；instruction-only 在 LLM 前冻结完整 standalone 布局并禁止交织。多个 slot 可并发完成 generation、evaluation、dedup reservation 与完整下游，声明序 head 才做去重重验证、增量 CrossView、retained 累加和原子 commit（3.6、3.10、3.11、3.17）。 |
 | 二次校验 | 可选，默认关 | LLM-as-a-Judge 用独立 profile 评审 (记录, 标注) 是否合格，产出 verdict + 批评意见；失败策略可选丢弃或有界修复（批评意见回喂标注模型，最多 N 轮）。 |
 | 结构保证 | 必选 | 输出每行必然通过用户 JSON Schema 校验，四层防线：供应商原生结构化输出 → 确定性修复 → jsonschema 校验 → 有界 LLM 修复环；仍失败则该记录进 rejects 通道，绝不写入主输出。 |
 | 输出 | 必选 | 主输出 JSONL（用户结构 + 可配置 `_meta` 元信息）；`report.json` 运行报告（仅统计，无数据内容）；可选 rejects 通道。 |
@@ -35,12 +35,12 @@ LabelKit 是一个**单机、单进程、无状态**的 Python CLI 批处理工�
 
 | 模块 | 职责（做什么） | 边界（不做什么） | 依赖 |
 |---|---|---|---|
-| M1 config | 装载/聚合校验两个 TOML 与 CLI，冻结 `ResolvedConfig`、project-root 绝对路径、secret-free profile 引用、ClassView、`SequenceGenerationConfig` 与 sequence 输出路径。 | 不读输入数据或密钥值；不调用 LLM；不反向导入 operators；不保留旧 sequence 键、类型或转换层。 | common |
+| M1 config | 装载/聚合校验两个 TOML 与 CLI，冻结 `ResolvedConfig`、project-root 绝对路径、secret-free profile 引用、ClassView、含 `InterleavingSpec` 的 `SequenceGenerationConfig` 与 sequence 输出路径。 | 不读输入数据或密钥值；不调用 LLM；不反向导入 operators；不保留旧 sequence 键、类型或转换层。 | common |
 | M2 ingest | 解析输入路径 → 记录流；UI 文件对扫描与配对；构造 `Record`（含确定性 id）；输入级合法性校验。 | 不做去重/打分；不加载图像字节（懒加载引用）；不修改原始内容。 | M1 |
 | M3 dedup | 精确哈希 + MinHash-LSH + pHash 判重，v1.2 增可选第④级语义判重（经 M9 embed() 取句向量，默认关，3.3.3）；标记重复项并给出簇信息。 | 不调用对话 LLM；语义判重仅 dedup.semantic=true 时启用（默认零 embedding 依赖）；不物理删除（只标记状态）。 | M1（语义级开启时另需 M9） |
 | M4 quality | QuRating 双模式打分：配对采样、LLM 裁决、BT 拟合、归一化；按阈值标记低质。 | 不定义 rubric 内容（来自配置/默认包）；不做标注。 | M1, M8, M9 |
 | M5 annotate | 组装标注提示词（含多模态与 few-shot）；调用 LLM 获得符合用户 Schema 的标注；可选 self-consistency 字段级投票。帧粒度：process 序列在序列级标注成功后执行 frame pass；v1.18 sequence attempt 可在 `annotate.enabled=false` 时直接执行 frame pass，结果写 `item.member_annotations`（3.5.5）。 | 不校验结构（委托 M8）；不评审质量（M4/M7 职责）；不产出新记录（M6 职责）；frame-only 不补发序列标注调用。 | M1, M8, M9 |
-| M6 generate | flat：以种子或条件化提示生成独立 Record 并交 M10 回流。sequence：编译 program/plan，逐事件生成 ScenarioSeed、无 role EventDraft 与 Frame payload，执行状态、权限、pattern/state/semantic/noise 判定；actual binding 后构造 EventTruth，并只投影 pre-downstream primary 数据。 | 仅文本模态；flat 单轮不递归；sequence 不直接写盘、不投影 replay 或最终输出字节、不绕过冻结计划、不在失败后放宽规则或重排已冻结时间。 | M1, M8, M9, generation package |
+| M6 generate | flat：以种子或条件化提示生成独立 Record 并交 M10 回流。sequence：编译 program/plan，冻结交织候选、权重抽取、partner 与布局；逐事件生成 ScenarioSeed、无 role EventDraft 与 Frame payload，执行状态、权限、pattern/state/semantic/noise 判定；actual binding 后构造 EventTruth，并只投影 pre-downstream primary 数据。 | 仅文本模态；flat 单轮不递归；sequence 不直接写盘、不投影 replay 或最终输出字节、不为未选 partner 试跑求解、不绕过冻结计划、不在失败后换 partner/pattern 或降级 standalone。 | M1, M8, M9, generation package |
 | M7 verify | LLM-as-a-Judge 评审标注；失败按策略丢弃或驱动有界修复。 | 不直接改标注（修复仍由 M5 重新标注、M8 校验）。 | M1, M8, M9 |
 | M8 schema-engine | 用户与内部 JSON Schema 的四层保证；v1.18 新增 `complete_post_validated`，让 EventPlan 候选在每轮 L2/L3 后执行一次无副作用的状态权限/patch 后置判定并返回 `EventExecution`。 | 不保存跨调用 validator；不执行 planner；不认识已删除的 plan/brief/realize 专名。 | M1, M9 |
 | M9 llm-client | Profile 化的统一 LLM 访问：OpenAI 兼容/Anthropic provider、多模态消息、结构化输出、指数退避、ResourceManager profile/origin 许可、共享 HTTP 连接池、token/成本计量。 | 不理解业务语义；不拥有任务接纳或业务阶段顺序。 | M1, M17 |
@@ -78,7 +78,9 @@ LabelKit 是一个**单机、单进程、无状态**的 Python CLI 批处理工�
 - `generate.mode` 必须是 declared 或 instruction_only，两个配置形状互斥。declared 至少一个 pattern 与 counterfactual set，禁止 instruction_only 表；instruction_only 至少一行且禁止 pattern/counterfactual/role permission/outcome/expected violation。
 - flat 字段 `llms/styles/seed_examples/standalone_count/num_per_record/seeds_per_call/num_per_call/sample_validator` 在 sequence 明示即错误；sequence 字段在 flat 明示同样错误。旧 `generate.stream` 及其 quota/tier/rule/window/time-field/hook 键均按未知且禁止的删除面拒绝，不读取旧值或转换。
 - declared pattern 的 role/order/gap/max-span、JSON Pointer roots、payload binding、actor 集与 outcome Schema 必须全量静态闭合；每个 variant 的 expected violation 与 divergence role 唯一。instruction-only 的 count/len_range 与 frame/actor 闭集必须在上限内。
-- `primary_sessions = N - crossed_primary_sessions`；一个 primary session 只能有一个或两个不同 set owner，同 set variants 不共 session；instruction-only 强制零 crossing、零 duplicate 且 `primary_sessions=N`。每个 replay 独占流尾 session。
+- 旧 timeline `primary_sessions` 与 `crossed_primary_sessions` 已删除；声明即配置错误。对 N 条可见 primary branch 与 D 个冻结交织布局，`primary_sessions=N-D`、`interleaved_primary_sessions=D`。一个交织 session 恰有 trigger/partner 两个不同 candidate set owner，同 set variants 不共 session；instruction-only 禁止交织配置且零 duplicate，故 `primary_sessions=N`。每个 replay 独占流尾 session。
+- 交织章节与 candidate set 标签必须同时在场；候选集仅含 declared 唯一 positive branch。名称使用 `[a-z0-9_]+`，精确匹配，不支持 selector DSL。同一 candidate set 不得同时担任 trigger 与 partner；同一 partner set 可被多个 pattern 共享，全局不放回消费。
+- 权重只在当前 opportunity 的 none 与 applicable named pattern 间分配，none 只进分母一次，partner pool 大小不改变 pattern ticket。选中 pair 无合法布局即 `generation_plan_infeasible`、exit 2，不搜索替代配对、不重抽也不降级。
 - semantic/evaluation profile 名必须不同且都声明 `context_window>0`。ScenarioSeed、Schema、instruction、patch、payload、record_units、stream_rows 与 retained-content 按 5.2/2.6 固定上限校验；真值、状态、ActorView 或 evaluator 输入不得裁剪。
 - validate、dry-run、run 共享同一 GenerationProgram compiler、block allocator 与 planner model builder；规划失败按 `generation_plan_infeasible|budget|internal` 精确分流，禁止使用另一套近似检查或 fallback。
 
@@ -148,7 +150,7 @@ labelkit rubric   [--show default:text | default:ui | default:trajectory]   # �
 | 文件 | 性质 | 内容 |
 |---|---|---|
 | `config.toml` | 工具级静态配置。随部署环境变化，跨工程复用。 | LLM API profile 列表（provider、base_url、model、api_key_env / api_key_envs（v1.6 密钥池，3.9.3）、并发、超时、重试、能力声明）、全局日志级别；v1.10 增 `[console]` 进度显示面配置（部署环境属性：本机终端 vs CI，5.1）。见 5.1。 |
-| `project.toml` | 工程级单次配置。 | 输入/输出路径与模态、批大小与 seed、各阶段开关、Rubric、任务指令与 JSON Schema；v1.18 sequence 另声明 mode、class/frame contract、pattern/counterfactual 或 instruction-only、timeline/calendar/noise。完整字段见 5.2。 |
+| `project.toml` | 工程级单次配置。 | 输入/输出路径与模态、批大小与 seed、各阶段开关、Rubric、任务指令与 JSON Schema；v1.21 sequence 另声明 mode、class/frame contract、pattern/counterfactual 或 instruction-only、timeline/calendar/noise，declared 可另声明 counterfactual set 候选标签与独立 `[generate.interleaving]` 交织章节。完整字段见 5.2。 |
 
 参数优先级（高覆盖低）：**CLI 参数 > project.toml > config.toml 内的全局默认**。M1 在启动时完成三源合并并冻结为 `ResolvedConfig`，运行期只读。
 
@@ -161,9 +163,9 @@ labelkit rubric   [--show default:text | default:ui | default:trajectory]   # �
 | 数据不落盘 | 全部中间态仅在进程内；显式输出通道为主输出、rejects、report、可选 trace。v1.18 sequence 成功面另有 stream 与 manifest，失败面另有 counts-only failed report；正式数据通道直到全部交付通过才打开。所有 part 文件与正式文件位于同目录。 |
 | 隐私与网络 | 数据只发送至 config.toml 显式声明的 LLM API 端点；无遥测、无自动更新检查。API Key 只经环境变量进入内存，不写日志、不入报告。 |
 | 规模与内存 | 设计目标：单次运行 ≤ 50 万条记录（默认配置下全局 LSH 索引 + 信封对象约占 2–4 GB RSS）。图像字节懒加载：仅在构造该记录的 LLM 请求时读盘并编码，用后即弃，不常驻。超过规模建议按目录分次运行，或设 `dedup.scope="batch"` 降低索引内存。`dedup.semantic=true` 且 scope=global 时另需常驻向量索引，约增加 条数 × 向量维度 × 4 字节（50 万条 × 1024 维 ≈ 2 GB），须计入 RSS 预算。v1.8 注记：序列 Record 以 `members` 元组持成员 Record 的**引用**（frozen 对象共享、零拷贝），episode 化不改变批内存量级；懒加载不变（extract 峰值 2 图/请求、序列 annotate ≤ `sequence_frames` 图/请求）。 |
-| v1.18 规划与内容规模 | 每个 CP-SAT block 最多 4096 primary events；record_units 与 stream_rows 各 ≤ 500000。最终 main+stream canonical UTF-8 的 `retained_content_bytes ≤ 536870912`。M11 以最终 item 装配 `SequenceRows`，replay 在此后只从 source final primary rows 派生；两者必须在 source positive commit 前用同一 canonical helper 精确计费。500k 最小载荷与近 512 MiB 混合载荷的 peak RSS 都 ≤ 4 GiB。 |
+| v1.21 规划与内容规模 | 每个 CP-SAT block 最多 4096 primary events；record_units 与 stream_rows 各 ≤ 500000。最终 main+stream canonical UTF-8 的 `retained_content_bytes ≤ 536870912`。交织匹配不得构造 trigger×partner pair matrix，不得为未选 partner 试跑 CP-SAT；匹配时间为 O(positive branches + evaluated pattern incidences + selected pairs)，pool 内存为 O(positive branches)，选中 pair 约束为 O(mn+m+n)。保留 500000 record-unit 无交织探针，并增加 600 branch/300 pair 真实 planner/RSS 探针。M11 以最终 item 装配 `SequenceRows`，replay 在此后只从 source final primary rows 派生；两者必须在 source positive commit 前用同一 canonical helper 精确计费。500k 最小载荷与近 512 MiB 混合载荷的 peak RSS 都 ≤ 4 GiB。 |
 | 吞吐 | 瓶颈通常为 LLM API。M17 按 profile 的 `max_concurrency` 做全域接纳，ResourceManager 同时限制真实逻辑调用与 HTTP origin attempt；普通阶段屏障与输入序 reducer 保持业务确定性，sequence 只串行依赖已提交前缀的短 commit。 |
-| 幂等与可复现 | process/flat 保持既有 seed 条件化语义。sequence 的 program、plan、slot、事件位置、逻辑/投影时间、session、noise 与 replay source 由同版本+同配置+seed 确定；CP-SAT 固定单 worker/seed/deterministic-time 且只解码 OPTIMAL。每个 attempt 以 slot identity、attempt index、purpose 派生独立随机源；一个 slot 多一次重试不得改变其他 slot。LLM 服务端内容非确定性不在逐字节保证内。 |
+| 幂等与可复现 | process/flat 保持既有 seed 条件化语义。sequence 的 program、plan、slot、交织 opportunity/pattern/partner/layout、事件位置、逻辑/投影时间、session、noise 与 replay source 由同版本+同配置+seed 确定；权重与 partner 分别使用独立 `generation_random` SHA-256 整数拒绝采样域，CP-SAT 固定单 worker/seed/deterministic-time 且只解码 OPTIMAL。每个 attempt 以 slot identity、attempt index、purpose 派生独立随机源；provider/slot retry、并发完成序与 ordered commit 不得重抽交织事实。LLM 服务端内容非确定性不在逐字节保证内。 |
 | 容错 | 记录级隔离（1.3 节）；LLM 调用按 profile 配置重试（指数退避+全抖动）；v1.6 密钥池：profile 可声明多把 API Key（`api_key_envs`，5.1），429 按密钥冷却并即时轮换、认证失败按密钥禁用、全池冷却有界驻留（`run.max_park_s`，默认 3600s，超限按重试耗尽计），单密钥配置数据产出与熔断语义不变、429 等待路径有修订（3.9.3 重试行）；连续 `fatal_error_threshold`（默认 20）次不可恢复 provider 错误触发熔断（认证类 401/403 立即熔断、不计连续数，v1.5；v1.6 池化下 = 最后一把存活密钥被认证禁用时），以退出码 4 终止，写出已完成部分的报告并原子交付已完成批的主输出与 rejects（v1.6 熔断交付，3.10.3）。 |
 | 依赖面 | Python ≥ 3.11（tomllib 标准库）。第三方仅：`httpx`（异步 HTTP）、`jsonschema`（校验）、`datasketch`（MinHash-LSH）、`Pillow`+`imagehash`（pHash）、`json-repair`（确定性 JSON 修复）、`numpy`（BT 拟合）、`rich`（v1.10，7.7 console rich 档终端呈现；纯 Python，传递依赖 markdown-it-py + pygments 亦纯 Python；**懒 import**——仅 console 判定为 rich 档时于 CLI 层导入（M1 只以 find_spec 探测），导入失败自动降级 plain，operators/common 零触点；工业背书 pip vendored（`docs/dev/PROPOSAL-tui-console.md` [C-9]），对齐决策 1.6 U4）。无框架级依赖（rich 定性为终端呈现库；应用框架级的 textual 经调研否决——`docs/dev/SPEC-tui-console.md` §2 U4/U16）。 |
 | v1.18 依赖增量 | 保持精确锁定 `ortools==9.15.6755`，新增成熟库 `jsonpatch` 执行 RFC 6902 原子状态变换，并显式声明其生产代码直接使用的 `jsonpointer`；不提供自研 patch、pointer 或 planner fallback。 |

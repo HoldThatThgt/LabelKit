@@ -320,7 +320,7 @@ schema_inline = """
 """
 ```
 
-### 5.2.1 sequence 生成公共配置（v1.20）
+### 5.2.1 sequence 生成公共配置（v1.21）
 
 sequence 是 `generate.form = "sequence"` 的唯一入口；`generate.mode` 在 declared 与 instruction-only
 之间互斥。它要求 generate_only、text、global dedup、inline meta、rejects none、无 `--limit`，
@@ -476,11 +476,14 @@ contained = "acknowledge"
 
 #### counterfactual set
 
+以下是独立的交织配置形状示例，不是 `examples/sequence-generation/project.toml` 摘录；正式主教学工程保持交织关闭。
+
 ~~~toml
 [[generate.counterfactual_sets]]
-name = "booking_success_training"
+name = "interleaving_trigger_demo"
 pattern = "booking_success"
 count = 2
+interleaving_candidate_set = "booking_trigger"
 
 [[generate.counterfactual_sets.variants]]
 name = "positive"
@@ -507,12 +510,67 @@ target_gap = "acknowledge_to_confirm"
 min_excess_s = 1
 max_excess_s = 600
 outcome_schema_path = "schemas/outcome-timeout.json"
+
+[[generate.counterfactual_sets]]
+name = "interleaving_partner_demo"
+pattern = "booking_success"
+count = 2
+interleaving_candidate_set = "booking_partner"
+
+[[generate.counterfactual_sets.variants]]
+name = "positive"
+kind = "positive"
+outcome_schema_path = "schemas/outcome-positive.json"
 ~~~
 
 count 是精确 counterfactual set 数。每组至少一个 variant；variant name 与预期违规签名唯一，每个 variant
 都有 outcome Schema。positive 可缺省，但 baseline 始终生成和判定。missing、reordered、
 interval_exceeded 分别只允许 `target_role`、相邻 `target_before/target_after`、或 `target_gap` 加
 闭区间 excess。编译期必须证明目标变换与所有非目标 gap、max span、日历约束可同时满足。
+`interleaving_candidate_set` 是可选 `[a-z0-9_]+` 短标签，不要求把 class、日期、tier 或 App 名编入标签。
+标签使用精确相等；不支持 glob、regex、前缀、列表或表达式。带标签的 set 必须有且仅有一个
+`kind="positive"` variant；该 set 的全部 slot 只把这一条可见 positive branch 加入候选集。
+
+#### 交织配置
+
+~~~toml
+[generate.interleaving]
+no_interleaving_weight = 9
+
+[generate.interleaving.pattern.booking_with_partner]
+trigger_candidate_set = "booking_trigger"
+partner_candidate_set = "booking_partner"
+trigger_weight = 1
+~~~
+
+`[generate.interleaving]` 是独立章节。`no_interleaving_weight` 是一次 opportunity 选择 standalone 的
+必填非负 TOML int64。每个 `[generate.interleaving.pattern.<name>]` 声明一个唯一命名 pattern：
+`trigger_candidate_set` 与 `partner_candidate_set` 必填、已声明且不同，`trigger_weight` 是必填正
+TOML int64。pattern name 与 candidate set 标签均匹配 `[a-z0-9_]+`。至少声明一个 named pattern；
+没有 `kind` 字段，v1.21 只有“保持两条 branch 自身顺序、形成真正 owner 交织”一种语义。
+
+对一次 opportunity，当前 applicable pattern 按 TOML 声明序为 `p1..pk`，权重为 `w1..wk`，
+`no_interleaving_weight=w0`，`W=w0+Σwi`，则：
+
+~~~text
+P(no interleaving | current applicable patterns) = w0 / W
+P(select pi | current applicable patterns) = wi / W
+~~~
+
+none 只进分母一次。partner 数量、可实现 owner word 数量与 pattern 的候选 pair 数量均不复制权重。
+partner pool 耗尽后对应 pattern 从后续 opportunity 的分母移除；全部相关 pool 为空时，
+当前 trigger 直接 standalone 且不计 opportunity。权重不是频率配额，不承诺有限样本的实际比例。
+
+关闭能力的唯一形式是 `[generate.interleaving]` 与全部 `interleaving_candidate_set` 同时不存在；
+没有隐式默认 pattern、自动候选集或自动启用。交织只允许 declared sequence；flat 与 instruction-only
+声明交织章节或候选标签都是 `generation_config_invalid`。instruction-only 的 report 仍输出固定零值交织统计。
+
+M1 一次聚合并报告交织配置闭包错误：章节与标签只出现一侧；名称非法或引用不存在；
+带标签 set 不恰有一个 positive variant；trigger 与 partner 相同；同一 candidate set 同时担任 trigger
+与 partner；已声明 candidate set 未被任一 pattern 引用；pattern 的 trigger 或 partner 集合为空；
+权重为 bool、float、负数/非正数、超出 int64，或任一 opportunity 的总权重超出 `2^63-1`。
+一个 trigger candidate set 可被多个 pattern 引用；一个 partner candidate set 也可被多个 pattern 共享，
+这些 pattern 消费同一个不放回 pool，任一 partner branch 全局至多使用一次。
 
 #### instruction-only
 
@@ -529,7 +587,8 @@ state_schema_path = "schemas/state.json"
 name 唯一，sequence_class 有效，count 是精确序列数；len_range 两端位于 1..8。显式 state Schema 根级
 `examples` 至少含一个通过完整 Schema 的 object；缺省为只要求 object 的固定 Schema，并以 `{}` 作 witness。
 instruction-only 禁止 pattern、counterfactual set、role permission、outcome
-Schema 与 expected violation；每 attempt 调 ScenarioSeedGenerator，不支持 catalog。
+Schema、expected violation、`[generate.interleaving]` 与 `interleaving_candidate_set`；每 attempt 调
+ScenarioSeedGenerator，不支持 catalog。
 
 #### timeline、calendar 与 noise
 
@@ -537,8 +596,6 @@ Schema 与 expected violation；每 attempt 调 ScenarioSeedGenerator，不支�
 [generate.timeline]
 timestamp_start = "2026-01-05T09:00:00+08:00"
 event_gap_s = [5, 60]
-primary_sessions = 8
-crossed_primary_sessions = 0
 session_max_events = 16
 session_max_span_s = 3600
 session_gap_s = 3600
@@ -560,8 +617,6 @@ topics = ["夜空中的月相观察", "手工面包出炉时的香气"]
 |---|---|---|
 | `timestamp_start` | offset datetime | 必填；不取墙钟。 |
 | `event_gap_s` | closed seconds range | instruction-only 相邻位置与 noise 的铺设间隔；不约束 declared role gap。所有值必须毫秒对齐。 |
-| `primary_sessions` | int | primary 总数 N、crossed 数 D 时必须等于 N - D。 |
-| `crossed_primary_sessions` | int | 0..floor(N/2)；每个 crossing session 恰有两个不同 set owner。 |
 | `session_max_events` | int | 每个 primary session 的事件容量。 |
 | `session_max_span_s` | seconds | 必填正值；session 完整 interval envelope 的跨度上限。 |
 | `session_gap_s` | seconds | 相邻 session 的最小间隔。 |
@@ -570,8 +625,11 @@ topics = ["夜空中的月相观察", "手工面包出炉时的香气"]
 | calendar window | table | 固定 UTC offset、weekday 闭集、同日半开 intervals；名称唯一。 |
 | noise | table | frame class 有 object Schema、零 duration、空 resources，且不得被任何 role 使用；topics 是与 noise_events 等长的非空唯一话题表；noise 无 owner、state patch 或任务真值。 |
 
-instruction-only 强制 crossed 为零、primary_sessions = N、duplicates 为零。每个 declared primary session 恰有
-一或两个不同 counterfactual set owner，同一 set 的 variants 永不共 session；每个 replay 独占尾部 session。
+旧 `[generate.timeline].primary_sessions` 与 `crossed_primary_sessions` 两键已删除，出现即
+`generation_config_invalid`，不提供 alias、migration 或 fallback。设可见 primary branch 数为 N、冻结交织
+布局数为 D，则 `interleaved_primary_sessions=D`、`primary_sessions=N-D`。instruction-only 不交织且
+duplicates 为零，故 `primary_sessions=N`。每个 declared standalone session 恰有一个 owner；每个交织 session
+恰有 trigger 与 partner 两个 candidate set owner，同一 set 的 variants 永不共 session；每个 replay 独占尾部 session。
 
 #### 固定上限与精确求解
 
@@ -604,9 +662,24 @@ candidate 的实际 retained bytes；两者共用 `canonical_delivery_row`，每
 JSONL 换行 byte 计。超限拒绝当前 whole-slot attempt，不能裁剪 payload 或 truth，也不能提交 reservation、
 dataset counters 或 frontier delta。
 
-planner 按完整 session 分 block，单 block 最多 4096 primary events。OR-Tools 单 worker、确定性 seed、
-每层 `max_deterministic_time = 10.0`；只解码 OPTIMAL。INFEASIBLE 是配置失败，FEASIBLE/UNKNOWN 是
-planner deterministic-budget failure，MODEL_INVALID 是内部错误；无 incumbent、替代求解器或近似 dry-run。
+Planner 先冻结全部 DeliverySlot 和 logical branch，再按声明序扫描 trigger positive branch。只要
+至少一个对应 partner pool 非空就计一次 opportunity；可用资格不预搜索 calendar/resource/layout
+可行性。pattern 抽取用 `generation_random` 完整 SHA-256 整数和拒绝采样：none 占 `[0,w0)`，
+各 pattern 按 TOML 声明序占连续 ticket 区间。partner 使用独立随机域对当前 pool 长度做同样拒绝
+采样；pool 初始顺序为 DeliverySlot 声明序，中选后 swap-delete。不使用 float threshold、solver seed
+或简单取模。
+
+选中 pair 保留两条 branch 内部时间、duration、resource、calendar 与顺序，Planner 只求两个整体绝对
+起点，并强制全局 event start 唯一、resource `AddNoOverlap`、session 容量/跨度、session gap
+与至少三个 owner maximal runs。对 `A` 与 `B` 的相邻事件构造 `A-B-A` / `B-A-B` witness，
+以 3.6.4 冻结的 `interleaving_witness_rank` 完整材料和碰撞次级键给唯一 rank，再依次最小化 witness rank、
+session 最早 event start、trigger start 与 partner start。不接受用户 owner word 或将不可实现序列近似映射。
+
+Planner 按完整 session 分 block，单 block 最多 4096 primary events。OR-Tools 单 worker、确定性 seed、
+每层 `max_deterministic_time = 10.0`；只解码 OPTIMAL。选中 pattern/partner 后无可行布局是
+`generation_plan_infeasible`、exit 2，不搜索其他 partner、pattern、none 或 standalone、不重抽。
+FEASIBLE/UNKNOWN 是 `generation_plan_budget`、exit 4，MODEL_INVALID 是 `generation_plan_internal`、exit 4；
+无 incumbent、替代求解器或近似 dry-run。provider/slot retry 与并发完成序复用同一计划。
 
 ## 5.3 Rubric 结构（内联或默认包文件，同一 TOML 结构）
 

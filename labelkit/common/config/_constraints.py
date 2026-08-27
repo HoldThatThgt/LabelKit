@@ -4,7 +4,7 @@
 ``_Collector`` 里记账, 从不提前抛出; 少数函数会回传被"回填/冻结"过的配置对象
 (classify.max_labels 回填、segment/frame_classify 的 vision_resolved 冻结)。
 
-v1.18 sequence 配置由 ``config.generation`` 聚合解析，本模块负责接入通用 M1 流程。
+v1.21 sequence 配置由 ``config.generation`` 聚合解析，本模块负责接入通用 M1 流程。
 """
 from __future__ import annotations
 
@@ -323,7 +323,7 @@ def _check_generation_form(ctx: _LoadCtx) -> None:
     if p.generate.form == "flat":
         for key in ("mode", "semantic_llm", "evaluation_llm", "max_slot_attempts",
                     "state_validator", "pattern", "counterfactual_sets", "instruction_only",
-                    "timeline", "calendar_window", "noise"):
+                    "interleaving", "timeline", "calendar_window", "noise"):
             if provided.get(key):
                 col.error(f"{fp}:[generate].{key}: generation_config_invalid: "
                           "sequence key is forbidden in flat form")
@@ -1009,7 +1009,7 @@ def _check_sequence_quality(ctx: _LoadCtx, products: _Products) -> None:
 
 
 def _parse_sequence_generation(ctx: _LoadCtx, products: _Products) -> None:
-    """把 v1.18 sequence namespace 聚合成唯一冻结 parse product。
+    """把 v1.21 sequence namespace 聚合成唯一冻结 parse product。
 
     @param ctx 校验上下文
     @param products 产物累加器

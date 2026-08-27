@@ -1,4 +1,4 @@
-"""v1.18 sequence 配置的真实示例与聚合负例。"""
+"""v1.21 sequence 配置的真实示例与聚合负例。"""
 from __future__ import annotations
 
 import json
@@ -123,6 +123,8 @@ def test_declared_example_loads_through_public_loader():
         ("/status", "after", "/request/status"),
     )
     assert len(generation.counterfactual_sets) == 1
+    assert generation.counterfactual_sets[0].interleaving_candidate_set is None
+    assert generation.interleaving is None
     variants = generation.counterfactual_sets[0].variants
     assert tuple(item.name for item in variants) == (
         "positive", "missing_acknowledgement",
@@ -146,7 +148,6 @@ def test_declared_example_loads_through_public_loader():
     assert timeline.timestamp_start_us == 1_767_574_800_000_000
     assert timeline.utc_offset_minutes == 480
     assert timeline.event_gap_us == (5_000_000, 60_000_000)
-    assert (timeline.primary_sessions, timeline.crossed_primary_sessions) == (8, 0)
     assert (timeline.session_max_events, timeline.session_max_span_us) == (8, 3_600_000_000)
     assert (timeline.session_gap_us, timeline.noise_events, timeline.duplicate_sequences) == (
         3_600_000_000, 2, 1)
@@ -247,6 +248,7 @@ def test_instruction_only_example_loads_through_public_loader():
     generation = cfg.sequence_generation
     assert generation is not None and generation.mode == "instruction_only"
     assert generation.patterns == () and generation.counterfactual_sets == ()
+    assert generation.interleaving is None
     assert len(generation.instruction_only) == 1
     item = generation.instruction_only[0]
     assert (item.name, item.sequence_class, item.count, item.len_range) == (
@@ -257,8 +259,6 @@ def test_instruction_only_example_loads_through_public_loader():
     assert tuple(cfg.frame_class_views) == (
         "task_request", "acknowledgement", "confirmation")
     assert generation.calendar_windows == {} and generation.noise is None
-    assert generation.timeline.primary_sessions == 1
-    assert generation.timeline.crossed_primary_sessions == 0
     assert generation.timeline.duplicate_sequences == 0
 
 
@@ -511,8 +511,7 @@ state_schema_path = "schemas/state.json"
 
 '''
     text = text.replace("[generate.timeline]\n", second + "[generate.timeline]\n")
-    project.write_text(text.replace("primary_sessions = 1", "primary_sessions = 2"),
-                       encoding="utf-8")
+    project.write_text(text, encoding="utf-8")
     config = root / "config.toml"
     config.write_text(
         config.read_text(encoding="utf-8").replace(
@@ -674,11 +673,6 @@ def test_catalog_actors_must_match_pattern_actor_set(tmp_path):
 
 def test_catalog_must_cover_declared_slots_without_replacement(tmp_path):
     root = _mutated_project(tmp_path, "count = 2", "count = 14")
-    project = root / "project.toml"
-    text = project.read_text(encoding="utf-8").replace(
-        "primary_sessions = 8", "primary_sessions = 56", 1
-    )
-    project.write_text(text, encoding="utf-8")
     _has(_errors(root), "13 rows but 14 slots require rows")
 
 
@@ -808,16 +802,17 @@ def test_payload_binding_enforces_permission_and_phase(tmp_path, old, new):
     ) for error in errors)
 
 
-def test_instruction_only_rejects_declared_only_timeline_counts(tmp_path):
-    root = tmp_path / "sequence-generation"
-    shutil.copytree(EXAMPLE_ROOT, root)
-    project = root / "project-instruction-only.toml"
-    text = project.read_text(encoding="utf-8").replace(
-        "crossed_primary_sessions = 0", "crossed_primary_sessions = 1")
-    project.write_text(text, encoding="utf-8")
-    with pytest.raises(ConfigError) as captured:
-        load(root / "config.toml", project, CliOverrides())
-    _has(captured.value.errors, "instruction_only requires zero crossing")
+@pytest.mark.parametrize("key_value", (
+    "primary_sessions = 1",
+    "crossed_primary_sessions = 0",
+))
+def test_timeline_rejects_deleted_session_count_keys(tmp_path, key_value):
+    root = _mutated_project(
+        tmp_path,
+        "[generate.timeline]\n",
+        f"[generate.timeline]\n{key_value}\n",
+    )
+    _has(_errors(root), "generation_config_invalid: deleted timeline key")
 
 
 @pytest.mark.parametrize(("old", "new", "expected"), (
@@ -985,7 +980,6 @@ def test_missing_variant_cannot_remove_the_only_pattern_role(tmp_path):
     )
     timeline_start = text.index("[generate.timeline]", pattern_start)
     text = text[:pattern_start] + replacement + text[timeline_start:]
-    text = text.replace("primary_sessions = 8", "primary_sessions = 1", 1)
     text = text.replace("duplicate_sequences = 1", "duplicate_sequences = 0", 1)
     project.write_text(text, encoding="utf-8")
     _has(_errors(root), "missing variant must retain at least one role")
@@ -1064,10 +1058,13 @@ def test_sequence_quality_accepts_only_explicit_pointwise_threshold(tmp_path):
 @pytest.mark.parametrize(("old", "new", "expected"), (
     ('timestamp_start = "2026-01-05T09:00:00+08:00"',
      'timestamp_start = "2026-01-05T09:00:00"', "must include a fixed UTC offset"),
+    ('timestamp_start = "2026-01-05T09:00:00+08:00"',
+     'timestamp_start = 123', "expected ISO-8601 string with offset"),
+    ('timestamp_start = "2026-01-05T09:00:00+08:00"',
+     'timestamp_start = "not-a-date"', "expected ISO-8601 string with offset"),
     ("event_gap_s = [5, 60]", "event_gap_s = [61, 60]",
      "range lower bound must be <= upper bound"),
-    ("primary_sessions = 8", "primary_sessions = 7",
-     "must equal primary sequence total minus crossed_primary_sessions"),
+    ("event_gap_s = [5, 60]", "event_gap_s = [5]", "expected two-number array"),
     ("session_max_events = 8", "session_max_events = 0", "expected integer >= 1"),
     ("session_max_span_s = 3600", "session_max_span_s = 0", "expected seconds > 0"),
     ("session_gap_s = 3600", "session_gap_s = 0", "expected seconds > 0"),
@@ -1077,6 +1074,320 @@ def test_sequence_quality_accepts_only_explicit_pointwise_threshold(tmp_path):
 def test_timeline_constraints_are_fail_fast(tmp_path, old, new, expected):
     root = _mutated_project(tmp_path, old, new)
     _has(_errors(root), expected)
+
+
+def test_runtime_interleaving_loads_through_public_loader():
+    cfg = _load_example("project-runtime-four-slot.toml")
+    generation = cfg.sequence_generation
+    assert generation is not None
+    assert tuple(
+        (item.name, item.interleaving_candidate_set)
+        for item in generation.counterfactual_sets
+    ) == (
+        ("runtime_trigger", "runtime_trigger"),
+        ("runtime_partner", "runtime_partner"),
+    )
+    interleaving = generation.interleaving
+    assert interleaving is not None and interleaving.no_interleaving_weight == 0
+    assert tuple(
+        (
+            item.name,
+            item.trigger_candidate_set,
+            item.partner_candidate_set,
+            item.trigger_weight,
+        )
+        for item in interleaving.patterns
+    ) == (("runtime_pair", "runtime_trigger", "runtime_partner", 1),)
+    assert not hasattr(generation.timeline, "primary_sessions")
+    assert not hasattr(generation.timeline, "crossed_primary_sessions")
+
+
+def test_interleaving_requires_candidate_labels_and_section_together(tmp_path):
+    section = '''[generate.interleaving]
+no_interleaving_weight = 0
+
+[generate.interleaving.pattern.runtime_pair]
+trigger_candidate_set = "runtime_trigger"
+partner_candidate_set = "runtime_partner"
+trigger_weight = 1
+
+'''
+    root = _mutated_named_project(
+        tmp_path / "missing-section",
+        "project-runtime-four-slot.toml",
+        section,
+        "",
+    )
+    _has(
+        _named_errors(root, "project-runtime-four-slot.toml"),
+        "required when interleaving_candidate_set is declared",
+    )
+
+    root = _copied_example(tmp_path / "missing-labels")
+    project = root / "project-runtime-four-slot.toml"
+    text = project.read_text(encoding="utf-8").replace(
+        'interleaving_candidate_set = "runtime_trigger"\n', "", 1,
+    ).replace(
+        'interleaving_candidate_set = "runtime_partner"\n', "", 1,
+    )
+    project.write_text(text, encoding="utf-8")
+    _has(
+        _named_errors(root, "project-runtime-four-slot.toml"),
+        "required when generate.interleaving is declared",
+    )
+
+
+@pytest.mark.parametrize(("old", "new"), (
+    ('interleaving_candidate_set = "runtime_trigger"',
+     'interleaving_candidate_set = "runtime-trigger"'),
+    ('interleaving_candidate_set = "runtime_trigger"',
+     'interleaving_candidate_set = ["runtime_trigger"]'),
+    ('[generate.interleaving.pattern.runtime_pair]',
+     '[generate.interleaving.pattern.runtime-pair]'),
+))
+def test_interleaving_names_are_short_exact_identifiers(tmp_path, old, new):
+    root = _mutated_named_project(
+        tmp_path,
+        "project-runtime-four-slot.toml",
+        old,
+        new,
+    )
+    _has(_named_errors(root, "project-runtime-four-slot.toml"), "expected name matching")
+
+
+@pytest.mark.parametrize(("old", "new"), (
+    ('no_interleaving_weight = 0', 'no_interleaving_weight = -1'),
+    ('no_interleaving_weight = 0', 'no_interleaving_weight = false'),
+    ('no_interleaving_weight = 0', 'no_interleaving_weight = 0.5'),
+    ('no_interleaving_weight = 0', 'no_interleaving_weight = 9223372036854775808'),
+    ('trigger_weight = 1', 'trigger_weight = 0'),
+    ('trigger_weight = 1', 'trigger_weight = true'),
+    ('trigger_weight = 1', 'trigger_weight = 1.5'),
+    ('trigger_weight = 1', 'trigger_weight = 9223372036854775808'),
+))
+def test_interleaving_weights_require_exact_toml_int64(tmp_path, old, new):
+    root = _mutated_named_project(
+        tmp_path,
+        "project-runtime-four-slot.toml",
+        old,
+        new,
+    )
+    _has(_named_errors(root, "project-runtime-four-slot.toml"), "expected TOML int64")
+
+
+def test_interleaving_weight_int64_boundary_and_total(tmp_path):
+    maximum = 9_223_372_036_854_775_807
+    root = _mutated_named_project(
+        tmp_path / "exact",
+        "project-runtime-four-slot.toml",
+        "trigger_weight = 1",
+        f"trigger_weight = {maximum}",
+    )
+    cfg = load(root / "config.toml", root / "project-runtime-four-slot.toml", CliOverrides())
+    assert cfg.sequence_generation.interleaving.patterns[0].trigger_weight == maximum
+
+    root = _mutated_named_project(
+        tmp_path / "overflow",
+        "project-runtime-four-slot.toml",
+        "no_interleaving_weight = 0",
+        f"no_interleaving_weight = {maximum}",
+    )
+    _has(
+        _named_errors(root, "project-runtime-four-slot.toml"),
+        "opportunity weight total exceeds TOML int64",
+    )
+
+
+@pytest.mark.parametrize(("old", "replacement"), (
+    ('kind = "positive"', 'kind = "missing"\ntarget_role = "request"'),
+    (
+        'kind = "positive"\noutcome_schema_path = "schemas/outcome-positive.json"',
+        'kind = "positive"\noutcome_schema_path = "schemas/outcome-positive.json"\n\n'
+        '[[generate.counterfactual_sets.variants]]\nname = "positive_second"\n'
+        'kind = "positive"\noutcome_schema_path = "schemas/outcome-positive.json"',
+    ),
+))
+def test_interleaving_candidate_requires_unique_positive_branch(tmp_path, old, replacement):
+    root = _mutated_named_project(
+        tmp_path,
+        "project-runtime-four-slot.toml",
+        old,
+        replacement,
+    )
+    _has(
+        _named_errors(root, "project-runtime-four-slot.toml"),
+        "interleaving candidate set requires exactly one positive variant",
+    )
+
+
+def test_interleaving_references_must_resolve_and_cover_candidates(tmp_path):
+    root = _mutated_named_project(
+        tmp_path / "unknown",
+        "project-runtime-four-slot.toml",
+        'trigger_candidate_set = "runtime_trigger"',
+        'trigger_candidate_set = "ghost"',
+    )
+    _has(
+        _named_errors(root, "project-runtime-four-slot.toml"),
+        "unknown or empty interleaving candidate set",
+    )
+
+    root = _mutated_named_project(
+        tmp_path / "unreferenced",
+        "project-runtime-four-slot.toml",
+        'interleaving_candidate_set = "runtime_trigger"',
+        'interleaving_candidate_set = "orphan"',
+    )
+    _has(
+        _named_errors(root, "project-runtime-four-slot.toml"),
+        "declared candidate set is not referenced",
+    )
+
+
+def test_interleaving_candidate_roles_are_disjoint(tmp_path):
+    root = _mutated_named_project(
+        tmp_path / "same-pattern",
+        "project-runtime-four-slot.toml",
+        'partner_candidate_set = "runtime_partner"',
+        'partner_candidate_set = "runtime_trigger"',
+    )
+    _has(
+        _named_errors(root, "project-runtime-four-slot.toml"),
+        "trigger_candidate_set must differ from partner_candidate_set",
+    )
+
+    second = '''trigger_weight = 1
+
+[generate.interleaving.pattern.reverse_pair]
+trigger_candidate_set = "runtime_partner"
+partner_candidate_set = "runtime_trigger"
+trigger_weight = 1'''
+    root = _mutated_named_project(
+        tmp_path / "role-conflict",
+        "project-runtime-four-slot.toml",
+        "trigger_weight = 1",
+        second,
+    )
+    _has(
+        _named_errors(root, "project-runtime-four-slot.toml"),
+        "candidate sets cannot serve both trigger and partner roles",
+    )
+
+
+def test_interleaving_allows_patterns_to_share_candidate_pools(tmp_path):
+    second = '''trigger_weight = 1
+
+[generate.interleaving.pattern.runtime_pair_second]
+trigger_candidate_set = "runtime_trigger"
+partner_candidate_set = "runtime_partner"
+trigger_weight = 2'''
+    root = _mutated_named_project(
+        tmp_path,
+        "project-runtime-four-slot.toml",
+        "trigger_weight = 1",
+        second,
+    )
+    cfg = load(root / "config.toml", root / "project-runtime-four-slot.toml", CliOverrides())
+    assert tuple(item.name for item in cfg.sequence_generation.interleaving.patterns) == (
+        "runtime_pair",
+        "runtime_pair_second",
+    )
+
+
+@pytest.mark.parametrize(("old", "new", "expected"), (
+    ('[generate.interleaving]\n', '[generate.interleaving]\nkind = "owner_word"\n',
+     "unknown or deleted sequence key"),
+    ('trigger_weight = 1', 'trigger_weight = 1\nowner_word = "ABBA"',
+     "unknown or deleted sequence key"),
+))
+def test_interleaving_rejects_extra_configuration_layers(tmp_path, old, new, expected):
+    root = _mutated_named_project(
+        tmp_path,
+        "project-runtime-four-slot.toml",
+        old,
+        new,
+    )
+    _has(_named_errors(root, "project-runtime-four-slot.toml"), expected)
+
+
+def test_interleaving_requires_a_named_pattern(tmp_path):
+    block = '''[generate.interleaving.pattern.runtime_pair]
+trigger_candidate_set = "runtime_trigger"
+partner_candidate_set = "runtime_partner"
+trigger_weight = 1
+
+'''
+    root = _mutated_named_project(
+        tmp_path,
+        "project-runtime-four-slot.toml",
+        block,
+        "",
+    )
+    _has(
+        _named_errors(root, "project-runtime-four-slot.toml"),
+        "at least one named pattern is required",
+    )
+
+    root = _mutated_named_project(
+        tmp_path / "invalid-row",
+        "project-runtime-four-slot.toml",
+        block,
+        "pattern = { broken = 1 }\n\n",
+    )
+    _has(_named_errors(root, "project-runtime-four-slot.toml"), "expected table")
+
+
+def test_instruction_only_and_flat_forbid_interleaving(tmp_path):
+    section = '''[generate.interleaving]
+no_interleaving_weight = 0
+
+[generate.interleaving.pattern.illegal]
+trigger_candidate_set = "left"
+partner_candidate_set = "right"
+trigger_weight = 1
+
+'''
+    root = _mutated_named_project(
+        tmp_path / "instruction",
+        "project-instruction-only.toml",
+        "[generate.timeline]\n",
+        section + "[generate.timeline]\n",
+    )
+    _has(
+        _named_errors(root, "project-instruction-only.toml"),
+        "forbidden in instruction_only mode",
+    )
+
+    root = _mutated_named_project(
+        tmp_path / "flat",
+        "project-instruction-only.toml",
+        'form = "sequence"',
+        'form = "flat"',
+    )
+    project = root / "project-instruction-only.toml"
+    text = project.read_text(encoding="utf-8").replace(
+        "[generate.timeline]\n",
+        section + "[generate.timeline]\n",
+        1,
+    )
+    project.write_text(text, encoding="utf-8")
+    _has(
+        _named_errors(root, "project-instruction-only.toml"),
+        "[generate].interleaving: generation_config_invalid: sequence key is forbidden",
+    )
+
+
+def test_instruction_only_rejects_replay_count(tmp_path):
+    root = _mutated_named_project(
+        tmp_path,
+        "project-instruction-only.toml",
+        "duplicate_sequences = 0",
+        "duplicate_sequences = 1",
+    )
+    _has(
+        _named_errors(root, "project-instruction-only.toml"),
+        "instruction_only requires zero duplicate sequences",
+    )
 
 
 @pytest.mark.parametrize(("old", "new", "expected"), (
@@ -1303,8 +1614,7 @@ def test_record_unit_limit_accepts_exact_boundary_and_rejects_one_more(tmp_path)
     project = root / "project-instruction-only.toml"
     project.write_text(
         project.read_text(encoding="utf-8")
-        .replace("len_range = [3, 4]", "len_range = [1, 1]")
-        .replace("primary_sessions = 1", "primary_sessions = 250000"),
+        .replace("len_range = [3, 4]", "len_range = [1, 1]"),
         encoding="utf-8",
     )
     cfg = load(root / "config.toml", project, CliOverrides())
@@ -1312,8 +1622,7 @@ def test_record_unit_limit_accepts_exact_boundary_and_rejects_one_more(tmp_path)
 
     project.write_text(
         project.read_text(encoding="utf-8")
-        .replace("count = 250000", "count = 250001")
-        .replace("primary_sessions = 250000", "primary_sessions = 250001"),
+        .replace("count = 250000", "count = 250001"),
         encoding="utf-8",
     )
     _has(_named_errors(root, "project-instruction-only.toml"),
@@ -1328,8 +1637,7 @@ def test_record_unit_limit_uses_canonical_instruction_length(tmp_path):
     project = root / "project-instruction-only.toml"
     project.write_text(
         project.read_text(encoding="utf-8")
-        .replace("len_range = [3, 4]", "len_range = [4, 5]")
-        .replace("primary_sessions = 1", "primary_sessions = 100000"),
+        .replace("len_range = [3, 4]", "len_range = [4, 5]"),
         encoding="utf-8",
     )
     cfg = load(root / "config.toml", project, CliOverrides())
@@ -1344,8 +1652,7 @@ def test_stream_row_limit_rejects_derived_overflow(tmp_path):
     project = root / "project-instruction-only.toml"
     project.write_text(
         project.read_text(encoding="utf-8")
-        .replace("len_range = [3, 4]", "len_range = [8, 8]")
-        .replace("primary_sessions = 1", "primary_sessions = 62501"),
+        .replace("len_range = [3, 4]", "len_range = [8, 8]"),
         encoding="utf-8",
     )
     _has(_named_errors(root, "project-instruction-only.toml"),

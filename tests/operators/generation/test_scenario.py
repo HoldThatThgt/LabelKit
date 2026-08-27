@@ -853,7 +853,6 @@ outcome_schema_path = "schemas/outcome-positive.json"
 '''
     assert positive in text
     text = text.replace(positive, "", 1)
-    text = text.replace("primary_sessions = 8", "primary_sessions = 6", 1)
     text = text.replace("duplicate_sequences = 1", "duplicate_sequences = 0", 1)
     project.write_text(text, encoding="utf-8")
     monkeypatch.setenv("LABELKIT_DEEPSEEK_KEY", "offline-test-key")

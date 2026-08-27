@@ -1409,8 +1409,10 @@ class ConsoleRenderer:
         @return None。
         """
         for key in (
-            "planned_sets", "planned_sequences", "primary_events", "noise_events",
-            "replay_sequences", "replay_events", "stream_rows",
+            "planned_sets", "planned_sequences", "primary_events",
+            "interleaving_opportunities", "primary_sessions",
+            "interleaved_primary_sessions", "noise_events", "replay_sequences",
+            "replay_events", "stream_rows",
             "successful_attempt_lower_bound", "max_slot_attempts_upper_bound",
         ):
             table.add_row(key, str(sequence.get(key, 0)))
