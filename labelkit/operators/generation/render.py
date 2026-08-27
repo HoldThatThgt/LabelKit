@@ -1,4 +1,4 @@
-"""v1.20 帧 payload 与独立 noise 时间终验渲染器。"""
+"""v1.20 帧 payload state/time binding 与独立 noise 时间终验渲染器。"""
 from __future__ import annotations
 
 import json
@@ -6,7 +6,8 @@ import logging
 from dataclasses import dataclass
 from typing import Mapping
 
-from jsonpointer import JsonPointerException, resolve_pointer
+import jsonpatch
+from jsonpointer import JsonPointerException
 from jsonschema import Draft202012Validator
 
 from labelkit.common.config._temporal import (
@@ -52,9 +53,35 @@ class _TemporalFinalizer:
         if canonical_json(projected) != canonical_json(candidate):
             raise ValueError("model candidate contains a business time field")
         finalized = inject_temporal_values(candidate, dict(self.values))
-        if canonical_json(project_temporal_instance(finalized, self.paths)) != canonical_json(candidate):
+        projected_final = project_temporal_instance(finalized, self.paths)
+        if canonical_json(projected_final) != canonical_json(candidate):
             raise ValueError("temporal finalizer changed a non-time field")
         return finalized
+
+
+@dataclass(frozen=True)
+class _FrameFinalizer:
+    """按冻结声明串联 state payload binding 与时间注入。"""
+
+    state_values: tuple[tuple[str, object], ...]  # 声明序 payload path 与状态真值
+    temporal: _TemporalFinalizer                  # Planner 时间注入器
+
+    def __call__(self, candidate: Mapping[str, object]) -> Mapping[str, object]:
+        """机械覆盖 state binding，再注入业务时间。"""
+        value = _json_copy(candidate)
+        try:
+            for path, binding_value in self.state_values:
+                operation = [{"op": "add", "path": path, "value": _json_copy(binding_value)}]
+                value = jsonpatch.apply_patch(value, operation, in_place=False)
+        except (
+            jsonpatch.JsonPatchException,
+            JsonPointerException,
+            KeyError,
+            TypeError,
+            ValueError,
+        ):
+            raise ValueError("state payload binding failed") from None
+        return self.temporal(value)
 
 
 @dataclass(frozen=True)
@@ -72,7 +99,7 @@ async def render_event(
     request: RenderEventRequest,
     services: GenerationServices,
 ) -> Mapping[str, object]:
-    """让模型只生成非时间 payload，然后机械注入 Planner 时间。
+    """让模型生成 model-space payload，再机械写入 state binding 与 Planner 时间。
 
     @param request 帧渲染请求。
     @param services 生成服务根。
@@ -80,9 +107,10 @@ async def render_event(
     """
     full_schema, model_schema = _frame_schemas(request.frame_spec, request.slot_key)
     _validate_render_request(request)
-    finalizer, projector = _temporal_transforms(
+    temporal, projector = _temporal_transforms(
         request.frame_spec, request.planned_event, request.utc_offset_minutes,
     )
+    finalizer = _frame_finalizer(request, temporal)
     services.metrics.count("generate.sequence.calls.frame_render_calls")
     try:
         result = await services.schema_engine.complete_finalized(FinalizedCallRequest(
@@ -102,8 +130,6 @@ async def render_event(
     except CandidateFinalizerContractError:
         _contract_error("frame candidate finalizer contract failed")
     payload = result[0]
-    if not _state_bindings_match(payload, request):
-        _reject_frame(request.slot_key, "state payload binding differs from its planned value")
     limit = request.limits.rendered_payload_bytes
     if len(canonical_json(payload).encode("utf-8")) > limit:
         _reject_frame(request.slot_key, "rendered payload exceeds the frozen byte limit")
@@ -232,20 +258,15 @@ def _validate_render_request(request: RenderEventRequest) -> None:
         _contract_error("planned event interval differs from its frame class")
 
 
-def _state_bindings_match(payload: Mapping[str, object], request: RenderEventRequest) -> bool:
-    """验证模型已按状态真值填写非时间 payload binding。"""
+def _frame_finalizer(request: RenderEventRequest,
+                     temporal: _TemporalFinalizer) -> _FrameFinalizer:
+    """从冻结 RoleSpec 与 binding values 构造帧 finalizer。"""
     role = request.role
-    if role is None:
-        return True
-    for item in role.payload_bindings:
-        try:
-            actual = resolve_pointer(payload, item.payload_path)
-            expected = request.binding_values[item.payload_path]
-        except (JsonPointerException, KeyError, TypeError):
-            return False
-        if canonical_json(actual) != canonical_json(expected):
-            return False
-    return True
+    state_values = tuple(
+        (item.payload_path, request.binding_values[item.payload_path])
+        for item in (() if role is None else role.payload_bindings)
+    )
+    return _FrameFinalizer(state_values, temporal)
 
 
 def _validate_noise_request(request: NoiseRenderRequest) -> None:

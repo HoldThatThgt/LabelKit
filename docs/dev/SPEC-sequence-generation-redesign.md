@@ -875,7 +875,8 @@ state_after、EventExecution 和 state validator 都不进入 RenderEventRequest
 它不能增删事件、改变 frame_class、actor、patch、时间或 role。返回 model-space object 后：
 
 - 系统按 binding 的 before/after state snapshot 读取 state_path，并把精确的 payload_path/value 映射写入 prompt。
-- LLM 只按 model Schema 返回非时间 object；generic finalizer 按声明序在深拷贝上机械写入 business time path。
+- LLM 只按 model Schema 返回 object；generic finalizer 先按 RoleSpec 声明序机械覆盖 state payload binding，
+  再按 frame time binding 声明序写入 business time path。
 - 注入后用完整 frame Schema 验证；父路径缺失、错误父类型、非时间改写或复验失败都是终态 downstream contract。
 - canonical payload 超过上限或完整 prompt 不适配 context budget 时 attempt 失败，不裁剪真值。
 

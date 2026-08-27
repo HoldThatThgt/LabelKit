@@ -112,8 +112,8 @@ def _request(program, plan, role_name: str, values, frame=None, role=None):
     )
 
 
-def test_state_binding_mismatch_is_recoverable_without_overwrite(declared_config,
-                                                                  declared_program):
+def test_state_binding_mismatch_is_mechanically_overwritten(declared_config,
+                                                             declared_program):
     plan = compile_scenario_plan(declared_program)
     values = {"/request_id": "R-100", "/status": "pending"}
     request = _request(declared_program, plan, "request", values)
@@ -121,9 +121,8 @@ def test_state_binding_mismatch_is_recoverable_without_overwrite(declared_config
         declared_config,
         {"utterance": "请订票", "request_id": "WRONG", "status": "pending"},
     )
-    with pytest.raises(GenerationAttemptRejected) as caught:
-        asyncio.run(render_event(request, services))
-    assert caught.value.kind == "frame_schema"
+    payload = asyncio.run(render_event(request, services))
+    assert payload == {"utterance": "请订票", "request_id": "R-100", "status": "pending"}
     assert engine.calls == 1
     system = "".join(part.text or "" for part in engine.prompt.messages[0].parts)
     assert "不得照抄状态枚举、内部指标或实现术语" in system
@@ -230,7 +229,7 @@ def test_full_confirmation_combination_schema_runs_after_binding(declared_config
     assert payload["status"] == "ticketed" and payload["ticket_id"] == "T-100"
 
 
-def test_authoritative_binding_failing_complete_schema_rejects_without_second_call(
+def test_authoritative_binding_failing_complete_schema_is_terminal(
     declared_config, declared_program,
 ):
     plan = compile_scenario_plan(declared_program)
@@ -240,14 +239,13 @@ def test_authoritative_binding_failing_complete_schema_rejects_without_second_ca
         declared_config,
         {"utterance": "请订票", "request_id": "WRONG", "status": "pending"},
     )
-    with pytest.raises(GenerationAttemptRejected) as caught:
+    with pytest.raises(InternalError, match="frame candidate finalizer contract failed"):
         asyncio.run(render_event(request, services))
-    assert caught.value.kind == "frame_schema"
     assert engine.calls == 1
 
 
-def test_ancestor_binding_conflict_fails_mechanical_overwrite(declared_config,
-                                                               declared_program):
+def test_ancestor_binding_conflict_is_terminal_finalizer_error(declared_config,
+                                                                declared_program):
     plan = compile_scenario_plan(declared_program)
     original = declared_program.patterns["booking_success"].roles[0]
     role = replace(original, payload_bindings=(
@@ -278,9 +276,8 @@ def test_ancestor_binding_conflict_fails_mechanical_overwrite(declared_config,
     services, engine, _metrics = _services(
         declared_config, {"utterance": "请订票", "nested": {}},
     )
-    with pytest.raises(GenerationAttemptRejected) as caught:
+    with pytest.raises(InternalError, match="frame candidate finalizer contract failed"):
         asyncio.run(render_event(request, services))
-    assert caught.value.kind == "frame_schema"
     assert engine.calls == 1
 
 
