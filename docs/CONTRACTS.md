@@ -2,17 +2,18 @@
 
 **Status: FROZEN.** This document is the single interface contract for parallel implementation of
 M1–M17 + CLI by independent engineers. It is derived from the design spec v1.4 base through the
-v1.18 sequence-generation redesign and the v1.19 execution-runtime revision (`spec/*.md`,
-`docs/dev/SPEC-sequence-generation-redesign.md` and `docs/dev/SPEC-execution-runtime.md`). Those
+v1.20 sequence temporal-integrity revision (`spec/*.md`,
+`docs/dev/SPEC-sequence-generation-redesign.md`, `docs/dev/SPEC-execution-runtime.md` and
+`docs/dev/SPEC-sequence-temporal-integrity.md`). Those
 documents remain the authority for *algorithms and behavior*; this document is the authority for
 *names, signatures, types, defaults, file formats, and prompt text*. Where a spec left a signature
 or format implicit, the decision is frozen here and tagged **[FROZEN HERE]** (all such decisions
 are also listed in §12). Any deviation requires editing this file first.
 
-The v1.18 sequence baseline is commit `ce6b1f2`; its frozen specification SHA-256 is
-`f9cc60754cdcbdbe92eac37835e7f7db7a7cdd7ea7310a9a26bfe490e1685f97`. The v1.19 runtime contract
-is the current `docs/dev/SPEC-execution-runtime.md`; implementation and this document must change
-together.
+v1.20 is a clean-breaking generation boundary: earlier generation streams are rejected, and
+there is no alias, migration or fallback. The temporal-integrity spec governs business-time
+projection, interval planning, replay rebinding and precommit validation; implementation and
+this document must change together.
 
 Ground rules for every implementer:
 
@@ -418,6 +419,9 @@ class Record:
                                            # generated_from=(), generator=None) — full member
                                            # provenance travels in _meta.stream.member_sources
                                            # (§9.1), not in ref
+    exact_dedup_text: str | None = None     # v1.20 generation stream only: M2-verified payload
+                                           # after removing all declared business-time paths;
+                                           # ordinary ingest paths keep None
 ```
 
 **Record id rules (M2/M6/M14, normative):**
@@ -1455,6 +1459,20 @@ class ClassifyConfig:
     classes: tuple[ClassSpec, ...] = ()           # >= 2 entries iff enabled
 
 @dataclass(frozen=True)
+class TimeBindingSpec:
+    payload_path: str
+    source: Literal[
+        "event_start_milliseconds",
+        "event_end_milliseconds",
+        "event_duration_milliseconds",
+        "event_start_iso8601",
+        "event_end_iso8601",
+        "first_resource_start_milliseconds",
+    ]
+    resource: str | None = None
+
+
+@dataclass(frozen=True)
 class ClassView:                                  # one class's effective config;
                                                   # class_views = {} when classify is disabled,
                                                   # except the v1.18 sequence registry
@@ -1479,12 +1497,15 @@ class ClassView:                                  # one class's effective config
                                                   # ⇒ falls back to the global output.schema
                                                   # (override semantics, mirroring the per-class
                                                   # rubric heavy-asset precedent)
+    model_schema: Mapping | None = None           # v1.20 schema with business-time leaves removed
     description: str = ""                         # v1.18 sequence registry description; required
                                                   # and non-empty for every referenced sequence
                                                   # class under generate.form="sequence"
     sequence_generation: SequenceClassGenerationConfig | None = None
                                                   # v1.18 declared class generation surface;
                                                   # None for flat/process and instruction-only
+    business_time_paths: tuple[str, ...] = ()     # complete annotation-Schema instance paths
+    time_bindings: tuple[TimeBindingSpec, ...] = ()
 
 
 # ── stream (v1.8, spec §5.2 [stream] + [segment] + [extract]; v1.9 + [stitch]) ──
@@ -1716,6 +1737,11 @@ class FrameClassView:                             # one frame class's effective 
                                                   # every referenced or noise frame class
     gen_schema: Mapping | None = None             # v1.18 object payload Schema; sequence generation
                                                   # rejects absent and non-object schemas
+    model_gen_schema: Mapping | None = None       # v1.20 provider-facing projected Schema
+    business_time_paths: tuple[str, ...] = ()     # complete payload-Schema instance paths
+    time_bindings: tuple[TimeBindingSpec, ...] = ()
+    duration_us: int = 0                          # zero is a point event
+    resources: tuple[str, ...] = ()               # declaration-order exclusive resources
 
 
 # ── CLI overrides and the aggregate ────────────────────────────────────────
@@ -2200,7 +2226,13 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
     one of `schema_path` and `schema_inline`; neither means the global output Schema.
     It keeps the full Draft 2020-12, object-root, reserved-`_meta`, local-`$ref` and
     few-shot validation of rules 13–15. This generic process/flat capability is independent
-    of sequence generation.
+    of sequence generation. Declared sequence annotation may mark scalar leaf properties with
+    `x-labelkit-business-time=true`; the marked path set must exactly equal the class
+    `time_bindings` path set. M1 freezes that complete Schema and its business-time-free model
+    Schema. These bindings are illegal for ordinary process, instruction-only or disabled
+    annotation, and every binding uses `first_resource_start_milliseconds` plus a resource that
+    remains present in every delivered variant. M5 builds one frozen `SequenceTemporalContext`
+    from final members and applies the generic finalizer after every sample and repair.
 
 51. **Form separation is exact** — `generate.form` is exactly `flat|sequence` and defaults
     to `flat`. Flat retains the v1.12 keys and behavior. Sequence requires explicit
@@ -2253,9 +2285,15 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
     `schema_path|schema_inline`. Each Schema is valid Draft 2020-12, local-`$ref`
     resolvable, object-rooted and within the fixed byte limit. Every runtime-generatable frame
     Schema has a non-empty root `examples` array with at least one object passing that complete
-    Schema. M1 chooses the unique minimum valid object by canonical byte length then canonical
-    bytes and requires it to fit both the prompt-value and payload limits. String payloads and
-    deleted `time_fields` are rejected.
+    Schema. Every business-time scalar leaf is marked `x-labelkit-business-time=true`, and the
+    marked path set exactly equals `[frame.class.<name>.generate].time_bindings`. M1 freezes the
+    complete Schema plus a provider-facing model Schema with those leaves removed, including the
+    same projection in defaults, root examples and few-shot outputs. `duration_s` is absent for a
+    point event or a positive millisecond-aligned duration; declaration-order `resources` are
+    unique capacity-one names and require positive duration. End/duration bindings also require
+    positive duration. M1 chooses the unique minimum valid object by canonical byte length then
+    canonical bytes and requires it to fit both the prompt-value and payload limits. String
+    payloads and deleted `time_fields` are rejected.
 
 57. **Pattern identity and total order** — declared mode requires one or more uniquely named
     `[generate.pattern.<name>]` entries. Each references a sequence class, has 1..32 unique
@@ -2275,12 +2313,13 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
     contain redundant ancestor/descendant entries. Binding state phase is exactly
     `before|after`; its state path is covered by both role read and publish roots; its
     payload path cannot be the root, repeat another binding path, or have an ancestor/descendant
-    relationship with another binding path. M1 validates only pointer syntax, permissions and
-    those conflicts; it does not attempt to prove an instance path through arbitrary `$ref`,
-    `allOf`, `if/then`, `dependentSchemas` or `unevaluatedProperties`. FrameRenderer receives the
-    unchanged complete Schema and the exact ordered binding values. After L2, code applies each
-    binding to the instance with RFC 6902 `add` semantics and revalidates that same complete
-    Schema; this runtime result is the only payload-shape criterion. Observers are valid actors.
+    relationship with another binding path or any business-time path. M1 validates only pointer
+    syntax, permissions and those conflicts; it does not attempt to prove an instance path through
+    arbitrary `$ref`, `allOf`, `if/then`, `dependentSchemas` or `unevaluatedProperties`.
+    FrameRenderer sends only the model Schema to the provider. After model
+    L2, the generic candidate finalizer applies state payload bindings and ordered time bindings
+    on a deep copy, then validates the same complete Schema and optional L2.5 callback; this
+    finalized result is the only payload-shape criterion. Observers are valid actors.
     Optional pre-state Schemas receive the same validation and byte checks as the base state
     Schema.
 
@@ -2307,7 +2346,7 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
     All cardinalities are integers. If N is the exact primary-sequence total and D is
     `crossed_primary_sessions`, then `primary_sessions == N-D`. Each primary session owns
     one or two different counterfactual sets, variants from the same set never share a
-    session, session capacity/span/gap and globally increasing timestamps must be feasible.
+    session, session capacity/span/gap and millisecond-aligned globally unique event starts must be feasible.
     Instruction-only requires D=0 and `primary_sessions=N`.
 
 63. **Calendar windows** — named windows have one fixed `utc_offset`, non-empty unique day
@@ -2322,9 +2361,9 @@ Sequence generation (v1.18; every rule in this group is a clean breaking boundar
     `noise_events`; topic at each ordinal is frozen into that `NoiseSlot`. `duplicate_sequences`
     non-replacement sources are positive primary
     sequences chosen by declaration order then scenario index; insufficient sources fails
-    at compile time. Each replay owns a tail session. Instruction-only requires zero
-    duplicates. Noise, replay and their timestamps are exact planned slots, never best
-    effort.
+    at compile time. Each replay owns a tail session and freezes one positive millisecond-aligned
+    constant shift; member starts are derived from the source starts plus that shift. Instruction-only
+    requires zero duplicates. Noise slots and replay shifts are exact plan facts, never best effort.
 
 65. **Quality and downstream gates** — if quality is enabled in sequence form it is
     pointwise with an explicitly configured non-null fixed threshold; pairwise, top_ratio and any effective class override
@@ -2535,15 +2574,20 @@ Text parsing (3.2.5): non-object JSON line = bad line; `input.text_field` dotted
 used as-is; array/object hit serialized with canonical JSON; miss = bad line; empty lines skipped
 silently (not counted as bad).
 
-v1.18 replay envelope mapping is an additional fail-closed branch of text parsing. Detection scans
+v1.20 replay envelope mapping is an additional fail-closed branch of text parsing. Detection scans
 all non-empty lines; if any parseable row contains §9.5's `_meta.event` envelope, the entire input
 is strictly re-read as generation stream, so an earlier malformed or ordinary row cannot use
 `input.on_bad_line="skip"` to bypass provenance checks. Object `payload` becomes canonical
-Record.text and Record.raw remains the full row. M2 validates event/owner/replay IDs, primary
-group ordering and duplicate provenance from that file before yielding sessions. It recomputes
-each formula in §7.18 and rejects the entire input on malformed, duplicate, missing-source or
-positionally mismatched evidence. It never consults main output and never uses a legacy ID
-fallback. Ordinary JSONL without the v1.18 event envelope keeps the existing parsing behavior.
+Record.text and Record.raw remains the full row. M2 requires every event to carry `duration_us`,
+`resources` and `time_bindings`; it validates descriptor shape, millisecond quantum, payload
+business-time values, event/owner/replay IDs, global start uniqueness, resource half-open interval
+exclusion and one positive constant replay shift from that file before yielding sessions. Replay
+must preserve source duration/resources/descriptor and non-time payload while rebinding time paths
+to replay start/end/duration. A verified row receives `Record.exact_dedup_text` equal to canonical
+payload after deleting all descriptor time paths. M2 rejects malformed, duplicate, missing-source,
+binding, interval or positional evidence. It never consults main output and never uses a legacy ID
+fallback. Ordinary JSONL without the v1.20 event envelope keeps existing parsing behavior and
+leaves `exact_dedup_text=None`.
 
 v1.8 stream ordering & monotonicity (spec §6.1, S19/S20 — active only when `segment.enabled`):
 
@@ -2647,6 +2691,15 @@ adaptation points, all others unchanged):
 - Member frames never reach M3 individually (they are `absorbed`/`dropped_noise` before
   dedup in the chain, §7.9) — frame-level dedup semantics are intentionally void in stream
   mode.
+
+v1.20 generation-stream records use the stronger self-contained carrier set by M2. When a
+single has non-null `exact_dedup_text`, or every ordered member of a sequence has it, M3 runs
+only exact dedup and constructs neither MinHash nor embedding input. The key is
+`sha256(canonical_json(["labelkit:v1.20", "generation_stream_exact",
+ordered_exact_dedup_texts]))`; a single uses the same formula with a one-element array. M2 has
+already removed every declared business-time path, so a valid rebound replay remains an exact
+duplicate while any non-time payload difference cannot match. Ordinary records with null carrier
+retain the existing four-level behavior.
 
 ### 7.3 M4 — `labelkit/operators/quality.py`
 
@@ -3195,6 +3248,19 @@ CallPostValidator = Callable[[Mapping[str, object]], PostValidationResult]
 
 
 @dataclass(frozen=True)
+class FinalizedCallRequest:
+    """一次 model Schema 生成与完整 Schema 终验的冻结请求。"""
+
+    profile: str
+    prompt: PromptBundle
+    model_schema: Mapping[str, object]
+    final_schema: Mapping[str, object]
+    scope: CallScope
+    candidate_finalizer: Callable[[Mapping[str, object]], Mapping[str, object]]
+    repair_projector: Callable[[Mapping[str, object]], Mapping[str, object]]
+
+
+@dataclass(frozen=True)
 class PostValidatedCallRequest:
     """一次要求在 L2 后执行可执行后置验证的内部调用。"""
 
@@ -3246,6 +3312,16 @@ class SchemaEngine:
         @param request 含 request-local 后置验证器的完整调用请求。
         @return 已验证对象及该同一候选的执行证明。
         """
+
+    async def complete_finalized(
+        self,
+        request: FinalizedCallRequest,
+    ) -> tuple[dict, Usage, int, str]:
+        """执行 model L2、机械 finalizer、完整 L2 与可选 L2.5。
+
+        @param request 两份 Schema 与 request-local callable 的冻结请求。
+        @return 已验证完整对象、累计 usage、尝试次数与首轮模型名称。
+        """
 ```
 
 For every first response or L3 candidate that passes L2, `complete_post_validated` calls the
@@ -3291,6 +3367,16 @@ render, semantic evaluation and noise use `complete_validated`; only event plann
 internal generation Schemas. `ValidatedGenerationCall.resolved_at` records the successful
 candidate's exact internal path and never increments the global user-Schema
 `report.schema_engine.resolved_at` ledger.
+
+`complete_finalized` is a second generic seam and does not change either public method above.
+Every provider attempt sees only `model_schema`; after model L2 succeeds, the engine invokes
+`candidate_finalizer` exactly once on a deep copy, validates its object result against
+`final_schema`, then runs existing L2.5 when `scope.user_treatment` is true. L3 still consumes
+the configured `output.max_repair_attempts`; it projects every parsed candidate through the
+total, non-throwing `repair_projector` before canonicalizing `previous_output`, while an
+unparseable candidate uses `{}`. A callable exception, non-object return, non-time mutation or
+final-Schema failure is terminal `candidate_finalizer_contract` and never enters L3. The engine
+preserves cumulative usage, attempts, first-response model, resolved-at and trace semantics.
 
 The v1.18 internal builders are exact and their JSON is frozen in §10.7:
 
@@ -5191,6 +5277,8 @@ class PlannedEvent:
     position: int
     logical_time_us: int
     timestamp_us: int
+    duration_us: int
+    resources: tuple[str, ...]
     session_id: str
 
 
@@ -5201,6 +5289,8 @@ class NoiseSlot:
     frame_class: str
     topic: str
     timestamp_us: int
+    duration_us: int
+    resources: tuple[str, ...]
     session_id: str
 
 
@@ -5210,7 +5300,7 @@ class ReplayLayout:
     source_variant_name: str
     replay_ordinal: int
     session_id: str
-    timestamps_us: tuple[int, ...]
+    shift_us: int
 
 
 @dataclass(frozen=True)
@@ -5221,6 +5311,19 @@ class ScenarioPlan:
     replay_layouts: tuple[ReplayLayout, ...]
     primary_sessions: int
     digest: str
+
+
+@dataclass(frozen=True)
+class SequenceTemporalMember:
+    event_id: str
+    timestamp_us: int
+    duration_us: int
+    resources: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class SequenceTemporalContext:
+    members: tuple[SequenceTemporalMember, ...]
 
 
 @dataclass(frozen=True)
@@ -5268,6 +5371,7 @@ class EventDraft:
     actor: str
     logical_time_us: int
     timestamp_us: int
+    duration_us: int
     actor_view: ActorView
     intent: str
     patch: tuple[JsonObject, ...]
@@ -5286,6 +5390,7 @@ class EventTruth:
     actor: str
     logical_time_us: int
     timestamp_us: int
+    duration_us: int
     actor_view: ActorView
     intent: str
     patch: tuple[JsonObject, ...]
@@ -5300,6 +5405,7 @@ class ObservedEvent:
     event_id: str
     frame_class: str
     timestamp_us: int
+    duration_us: int
 
 
 @dataclass(frozen=True)
@@ -5307,6 +5413,7 @@ class SemanticReviewEvent:
     frame_class: str
     actor: str
     logical_time_us: int
+    duration_us: int
     wait_since_previous_us: int
     actor_view: ActorView
     intent: str
@@ -5506,6 +5613,7 @@ class RenderEventRequest:
     role: RoleSpec | None
     public_facts: JsonObject
     attempt_index: int
+    utc_offset_minutes: int
     limits: GenerationLimits
 
 
@@ -5526,6 +5634,7 @@ class CouplingEvaluationRequest:
     variant: VariantSpec
     baseline_events: tuple[EventTruth, ...]
     events: tuple[EventTruth, ...]
+    frame_classes: Mapping[str, FrameClassView]
 
 
 @dataclass(frozen=True)
@@ -5551,6 +5660,7 @@ class NoiseRenderRequest:
     class_descriptions: Mapping[str, str]
     frame_descriptions: Mapping[str, str]
     attempt_index: int
+    utc_offset_minutes: int
     limits: GenerationLimits
 
 
@@ -5784,12 +5894,22 @@ class PreparedNoiseCandidate:
 
 
 @dataclass(frozen=True)
+class ResourceInterval:
+    resource: str
+    start_us: int
+    end_us: int
+    event_id: str
+    source_key: str
+
+
+@dataclass(frozen=True)
 class CrossViewDelta:
     phase: Literal["primary", "noise"]
     ordinal: int
     event_ids: tuple[str, ...]
     timestamps_us: tuple[int, ...]
     source_keys: tuple[str, ...]
+    resource_intervals: tuple[ResourceInterval, ...]
 
 
 @dataclass(frozen=True)
@@ -5824,7 +5944,8 @@ are mirrored here only because generation crosses those existing interfaces. `Sc
 branches use their configured variant name. `NoiseSlot` and `ReplayLayout` never enter a block
 and never impersonate `PlannedEvent`. A replay resolves its source only through
 `source_slot_key` plus `source_variant_name`; that variant must be positive, and the number of
-`timestamps_us` must equal the source event count.
+members is inherited from the source while one positive millisecond-aligned `shift_us` applies to
+every source start.
 
 `SequenceAssemblyRequest` closes one M11 call over the frozen `GenerationProgram`, the shared M8
 instance, the final attempt-local item, its corresponding projection and the fixed batch number.
@@ -6320,7 +6441,7 @@ def derive_generation_id(
     domain: str,
     components: Sequence[object],
 ) -> str:
-    """从冻结 canonical framed material 派生一个 v1.18 32-hex ID。
+    """从冻结 canonical framed material 派生一个 v1.20 32-hex ID。
 
     @param domain ID 域标签。
     @param components 按声明顺序排列的 ID 组成值。
@@ -6363,8 +6484,9 @@ budgets; freezes `ResolvedConfig.run.seed` as `GenerationProgram.planner_seed`; 
 canonical GenerationProgram. The digest covers every semantic field including `planner_seed`,
 excludes itself and hook callables, and includes only each `ResolvedHook.reference`. The compiler
 performs no random draw, solver call, credential read, LLM call or downstream stage.
-For every sequence ClassView it materializes the effective annotation Schema: the class override
-when present, otherwise a frozen copy of the global user Schema. Generation limits, effective
+For every sequence ClassView it materializes the effective complete annotation Schema and its
+business-time-free model Schema; every frame ClassView likewise freezes its complete/model payload
+Schema, business-time paths, bindings, duration and resources. Generation limits, effective
 sequence ClassViews, frame ClassViews and the global frame-annotation Schema are frozen in that
 same program and covered by its digest. After compilation, slot attempts, IDs, random seeds, run
 identities, prompt budgets, downstream class routing and M11 Schema validation read only the
@@ -6374,9 +6496,10 @@ program; same-named source fields in ResolvedConfig are not runtime truth.
 DeliverySlots, `catalog_row_index` and block membership in declaration order; catalog allocation
 is a deterministic integer mapping and does not enter CP-SAT. The solver freezes declared
 baseline/variant presence, total order, closed integer gaps, max-span, calendar feasibility,
-instruction-only length and position times, primary sessions, crossing, globally increasing
-artifact timestamps, exact NoiseSlots and exact positive ReplayLayouts. `PlannedEvent` freezes
-only position, role, logical/artifact time and session; declared frame/actor come from RoleSpec,
+instruction-only length and position times, primary sessions, crossing, globally unique artifact
+starts, resource non-overlap, strict containment, exact NoiseSlots and exact positive ReplayLayouts.
+`PlannedEvent` freezes position, role, logical/artifact time, duration, resources and session;
+declared frame/actor come from RoleSpec,
 while instruction-only frame/actor are selected later by EventPlan. Session blocks contain at
 most 4096 primary events. The locked OR-Tools version runs with one worker, a deterministic seed
 derived from `program.planner_seed`/block identity, and `max_deterministic_time=10.0` per
@@ -6404,13 +6527,14 @@ field in that supplied plan, rebuilds the canonical plan from the program, and r
 dataclass equality. Insertion-order changes inside a block, a coordinated rehash or a locally
 valid alternative plan are not accepted.
 
-Artifact time uses integer epoch microseconds throughout. Calendar expansion, fixed-offset
-ISO8601 projection and CrossView parsing never pass through floating-point timestamps. A plan or
+Artifact time uses integer epoch microseconds throughout, with a fixed 1000-microsecond Planner
+quantum for starts, duration, gaps, calendar boundaries, variant excess, session gaps and replay
+shift. Calendar expansion, fixed-offset ISO8601 projection and CrossView parsing never pass through floating-point timestamps. A plan or
 21-day calendar horizon outside Python datetime range fails as `generation_plan_infeasible`
 before any content call.
 
 Except for `delivery_digest`, every ID is exactly
-`sha256(canonical_json(["labelkit:v1.18", domain, components]).encode("utf-8"))`
+`sha256(canonical_json(["labelkit:v1.20", domain, components]).encode("utf-8"))`
 lowercase hex truncated to 32 characters. Canonical JSON uses `sort_keys=True`, compact
 separators and `ensure_ascii=False`; components are a JSON array, never a caller-concatenated
 string.
@@ -6424,12 +6548,12 @@ string.
 | instruction world branch ID | `instruction_world_branch_id` | scenario ID, literal `instruction_only` |
 | declared event key | `declared_event_key` | scenario ID, baseline role name |
 | instruction event key | `instruction_event_key` | scenario ID, instruction-slot name, scenario index, position |
-| primary event ID | `primary_event_id` | world branch ID, event key, integer artifact timestamp, payload object |
+| primary event ID | `primary_event_id` | world branch ID, event key, start, duration, resources, time descriptor, final payload |
 | sequence ID | `sequence_id` | world branch ID, ordered event-ID array |
 | replay sequence ID | `replay_sequence_id` | source sequence ID, replay ordinal |
-| replay event ID | `replay_event_id` | replay sequence ID, source event ID, integer replay timestamp |
+| replay event ID | `replay_event_id` | replay sequence ID, source event ID, replay start, source duration, rebound payload |
 | noise event key | `noise_event_key` | program digest, literal `noise`, noise ordinal |
-| noise event ID | `noise_event_id` | run ID, noise event key, integer timestamp, payload object |
+| noise event ID | `noise_event_id` | run ID, noise event key, start, zero duration, empty resources, time descriptor, final payload |
 | run attempt ID | `run_attempt_id` | program digest, seed |
 | run ID | `run_id` | run attempt ID, ScenarioPlan digest |
 
@@ -6437,7 +6561,7 @@ string.
 `_meta.run.finished_at` and `_meta.run.duration_ms`, when present, then returns canonical row
 bytes. It removes no user, stage or generation field. `manifest.committed_at` is not a product
 row and never enters this helper. Retained content charges `len(row_bytes) + 1` per JSONL row. The delivery digest is a
-full 64-hex SHA-256: M11 first hashes ASCII `labelkit:v1.18:delivery\n`, then every ordered main
+full 64-hex SHA-256: M11 first hashes ASCII `labelkit:v1.20:delivery\n`, then every ordered main
 row followed by every ordered stream row as decimal byte length, a colon and the canonical row
 bytes. `SequenceDeliveryEmitter.prepare_product` is the only digest owner; it writes the digest
 into a deep-frozen report and returns GenerationProduct. `commit` reads that value to construct
@@ -6516,8 +6640,9 @@ once with no missing, duplicate or extra binding before each EventDraft is conve
 EventTruth; this binding is the sole source of declared `EventTruth.role`. Instruction-only skips
 PatternEvaluator and mechanically adds only its `position_NNN` truth role. EventTrace accepts
 only EventTruth and never EventDraft. Coupling evaluation then byte-compares the protected actor,
-view, intent, patch, payload, frame, derived role and logical-time fields, while excluding the
-re-derived branch ID and artifact timestamp. The normalized violation set must exactly equal the
+view, intent, patch, frame, derived role, logical-time fields and payload after deleting the frame
+class's declared business-time paths; those paths are rebound from the current branch
+start/duration. It excludes the re-derived branch ID and artifact timestamp. The normalized violation set must exactly equal the
 variant's frozen expected violation. StateEvaluator receives the DeliverySlot and baseline
 events, independently replays from initial state and validates bindings/outcome/prefix using
 `program.state_validator`.
@@ -6621,10 +6746,14 @@ classification, quality, sequence/frame annotation and verification are present 
 bytes used by CrossView, retained-content accounting, delivery digest and final output. Before it
 calculates bytes, it validates the final main user object against the selected program ClassView's
 materialized Schema and validates both the main-member and primary-row copies of every frame
-annotation against `GenerationProgram.frame_schema`. `FrameClassView.gen_schema` is only a payload
-generation Schema and is never an annotation fallback. A final annotation violation raises
+annotation against `GenerationProgram.frame_schema`. It also revalidates every payload and sequence
+annotation business-time value against the planned interval/resource facts; it never writes or
+repairs a time leaf. `FrameClassView.gen_schema` is only a payload generation Schema and is never an
+annotation fallback. An ordinary non-temporal final annotation violation raises
 `sequence_projection_mismatch`, consumes the current whole-set attempt and leaves dedup, dataset,
-rows and replay state unchanged. A replay-source positive is projected only after this assembly,
+rows and replay state unchanged. Any business-time, duration/resource or containment mismatch is
+terminal `generation_downstream_contract` and consumes no slot retry. A replay-source positive is
+projected only after this assembly,
 from the final primary stream rows. Candidate-local reconciliation requires every variant-aligned
 witness/SequenceRows and every ReplayLayout-aligned ReplayRows, recomputes the candidate's actual
 canonical bytes, and never reads the committed prefix. A missing/extra variant or replay, forged
@@ -6659,16 +6788,19 @@ constructed later or escapes retained accounting.
 
 CrossView never accepts final rows merely because their IDs are mutually self-consistent.
 PrimaryCandidateReconcileRequest and NoiseCandidateReconcileRequest prove each candidate's closed
-local truth. CrossViewFrontier then stores phase/next ordinal and committed event ID, timestamp and
-source sets. `check_primary` and `check_noise` inspect only the current head against those sets and
-return a frozen CrossViewDelta with no formal mutation; `commit(delta)` is no-await and
+local truth. CrossViewFrontier then stores phase/next ordinal and committed event ID, timestamp,
+source and resource-interval sets. `check_primary` and `check_noise` inspect only the current head
+against those sets and return a frozen CrossViewDelta containing the same facts with no formal
+mutation; `commit(delta)` is no-await and
 failure-free for that exact current delta. Each slot therefore does work proportional only to its
 own rows. Primary completion switches to noise without clearing global uniqueness sets.
 
 After all in-memory commits, final `ReconcileRequest` carries the GenerationProgram, run ID,
 immutable ProjectionWitness values aligned with final SequenceRows, post-gate noise-payload
 digests aligned with final noise rows, ReplayRows grouped in ReplayLayout order and final retained
-bytes. It compares full-SHA-256 digests of every final primary payload/base
+bytes. After the final timestamp sort it independently rechecks global start uniqueness, resource
+intervals, containment, descriptor/payload business time and sequence annotation time. It compares
+full-SHA-256 digests of every final primary payload/base
 event/generation tuple and every final noise payload with its source witness, while allowing only
 downstream classification and annotation additions on primary rows. It independently re-derives
 scenario, world-branch, primary event, sequence, noise event-key and noise event IDs from the
@@ -6687,7 +6819,7 @@ is no prospective-prefix reconciliation API.
 exists. ProjectionWitness contains only `main_record_id`, `generation_digest`,
 `member_sources_digest` and ordered `primary_base_digests`; no payload, Record or row survives in
 it. Each digest is full SHA-256 over canonical
-`["labelkit:v1.18", domain, value]`, with domains `projection_main_generation`,
+`["labelkit:v1.20", domain, value]`, with domains `projection_main_generation`,
 `projection_member_sources`, `projection_primary_base` and `noise_payload`. At the PreparedCandidate
 freeze boundary, ProjectedSequence, PipelineItem and AttemptTransaction are released. The
 500000-unit RSS gate
@@ -6704,15 +6836,17 @@ run terminates. A high ordinal that finishes early remains in its original windo
 does not admit a tail beyond the interval. Expensive complete attempts run concurrently across
 slots; variants within each slot retain declaration order and event state dependencies.
 Each attempt seed is the full integer digest of canonical
-`["labelkit:v1.18", "attempt_random", [seed, slot_identity, attempt_index, purpose]]`; Python
+`["labelkit:v1.20", "attempt_random", [seed, slot_identity, attempt_index, purpose]]`; Python
 `hash()` and caller-concatenated strings are forbidden.
 Retry restarts from ScenarioSeed; catalog retries keep the assigned row. Frozen pattern,
-variant, role, logical time, artifact time, session, noise slot and replay source never change.
+variant, role, logical time, artifact time, duration, resources, containment, noise slot and replay
+source/shift never change.
 
 Noise runs only after all primary slots commit. Noise generation and independent semantic
 evaluation prepare concurrently in a new continuous window. Each slot carries the unique topic at
-the same ordinal and sees only noise instruction/schema, that topic, class/frame name-description
-registries, timestamp and attempt identity. It passes its object Schema and four-boolean semantic
+the same ordinal and sees only noise instruction/model Schema, that topic, class/frame
+name-description registries, planned start/end/duration and attempt identity. The generic candidate
+finalizer injects any allowed start binding before it passes the complete object Schema and four-boolean semantic
 gate before `reconcile_noise_candidate` recursively freezes a PreparedNoiseCandidate containing
 slot/attempt identity, payload digest, final row, immutable similarity signature, the frozen
 dataset-counter delta, actual retained bytes and digest. It never runs quality, annotate, verify or
@@ -6723,7 +6857,8 @@ no-await path verifies candidate digest, obtains CrossViewFrontier.check_noise d
 retained bytes, prevalidates state, commits the similarity signature, and finally commits frontier,
 row and retained state. Similarity conflict or retained overflow rejects only that noise attempt;
 no ordinary rejection can occur after similarity commit. Replay has no coordinator or model call:
-it derives only from final source SequenceRows and travels with that source candidate.
+it derives only from final source SequenceRows, applies its one positive constant `shift_us`,
+rebinds payload time and travels with that source candidate in the same CrossView delta.
 
 Attempt exhaustion raises `DeliveryError(kind="sequence_delivery_exhausted", slot_key=...,
 attempts_used=...)` and exit 1. The exception contains no content. Before formal commit,
@@ -6748,14 +6883,15 @@ and replaces manifest last. A commit-I/O failure may leave mixed fixed paths but
 manifest unchanged, so consumers fail closed on artifact hashes. The separate failed report is
 best-effort atomic and never invalidates an already valid success manifest.
 
-M2 replay reads the v1.18 stream envelope with `input.text_field="payload"` and
+M2 replay reads the v1.20 stream envelope with `input.text_field="payload"` and
 `stream.order_by="meta:_meta.event.timestamp"`. Object payload becomes canonical Record.text
-while Record.raw retains the complete row. M2 recomputes primary event IDs, each owner's ordered
-sequence ID, replay sequence/event IDs and duplicate-of provenance using only that stream file;
-IDs must be well-formed and globally unique. It verifies every duplicate source exists and every
-replay position exactly matches source payload/frame/role/order. Any mismatch fails closed; it
-does not read main or use an old ID formula. Sequence dedup joins member text in order, so new
-replay IDs do not prevent exact duplicate detection.
+while Record.raw retains the complete row. M2 recomputes every descriptor binding, primary event
+ID, owner sequence ID, replay sequence/event ID, global start and resource interval using only
+that stream file. Replay must use one positive constant shift, preserve source
+duration/resources/descriptor/frame/role/order and non-time payload, and carry rebound payload
+time. Any mismatch fails closed; M2 does not read main or use an old ID formula. It writes
+time-stripped canonical payload to `Record.exact_dedup_text`; M3 then uses the v1.20 exact-only
+generation key and does not construct MinHash or embedding input.
 
 ### 7.19 M17 — `labelkit/runtime/`
 
@@ -7588,7 +7724,7 @@ rollback, directory transaction or prior-file preservation after commit I/O begi
 Before commit, slot exhaustion, provider fatal, circuit trip, SIGINT and cancellation replace no
 success path. The data-free failed report is a separate best-effort atomic diagnostic channel and
 never participates in a successful manifest.
-### 9.5 v1.18 main, stream, replay and manifest
+### 9.5 v1.20 main, stream, replay and manifest
 
 Main contains primary sequences only. With annotate enabled, its user object is the accepted
 sequence annotation under the class-effective Schema; with annotate disabled it follows §9.1's
@@ -7647,7 +7783,12 @@ Every primary stream line has exactly two top-level keys in this order, `payload
       "frame_class": "confirmation",
       "actor": "system",
       "logical_time_us": 960000000,
-      "timestamp": "2026-01-05T09:16:00.000000+08:00"
+      "timestamp": "2026-01-05T09:16:00.000000+08:00",
+      "duration_us": 120000000,
+      "resources": ["foreground_app"],
+      "time_bindings": [
+        {"payload_path": "/timestamp", "source": "event_start_milliseconds"}
+      ]
     },
     "generation": {
       "validation_mode": "declared",
@@ -7675,9 +7816,10 @@ only final `SequenceRows`: `main_row`, `primary_stream_rows`, `retained_content_
 CrossView, replay projection, memory accounting, delivery digest and files all consume these same
 rows; none may reconstruct output from `ProjectedSequence.main_record`.
 
-A replay deep-copies the final source `SequenceRows.primary_stream_rows`, preserving payload,
-frame annotation and every other downstream metadata field. It replaces only replay identity and
-artifact time. Its exact event and generation objects are:
+A replay is derived from final source `SequenceRows.primary_stream_rows`, preserving frame annotation,
+every other downstream metadata field and all non-time payload fields. It applies one
+`ReplayLayout.shift_us`, rebinds payload time from replay start/end/duration, and then derives replay
+identity. Its exact event and generation objects are:
 
 ```json
 {
@@ -7690,6 +7832,11 @@ artifact time. Its exact event and generation objects are:
     "actor": "system",
     "logical_time_us": 960000000,
     "timestamp": "2026-01-05T12:16:00.000000+08:00",
+    "duration_us": 120000000,
+    "resources": ["foreground_app"],
+    "time_bindings": [
+      {"payload_path": "/timestamp", "source": "event_start_milliseconds"}
+    ],
     "replay_sequence_id": "34563456345634563456345634563456",
     "replay_ordinal": 0,
     "duplicate_of_sequence_id": "23452345234523452345234523452345",
@@ -7707,29 +7854,31 @@ artifact time. Its exact event and generation objects are:
 }
 ```
 
-The shown objects replace `_meta.event` and `_meta.generation` inside the copied row; top-level
+The shown objects replace `_meta.event` and `_meta.generation` inside the derived row; top-level
 key order remains `payload`, `_meta`. `event_key`, role, frame_class, actor and logical time are
-copied byte-for-byte. `event_id`, timestamp and replay sequence identity are newly derived from
-ReplayLayout. `owner_sequence_id` is always null; only `replay_sequence_id` groups replay rows.
+copied byte-for-byte. duration/resources/descriptor also remain source-equal; payload time is
+rebound. `event_id`, timestamp and replay sequence identity are newly derived from ReplayLayout.
+`owner_sequence_id` is always null; only `replay_sequence_id` groups replay rows.
 No `replay=true`, new world_branch_id, primary `pattern`/`variant`, expected/actual violation or
 new scenario truth is emitted. `replay_sequence_id` never appears in main. Every replay owns one
 tail session.
 
 A noise line has the same two top-level keys. Its event object has event_id/event_key,
 `owner_sequence_id=null`, `role=null`, the configured frame_class, `actor=null`,
-`logical_time_us=null`, its timestamp and `noise=true`. Its generation value is null. Noise
+`logical_time_us=null`, its timestamp, `duration_us=0`, empty resources and `noise=true`. Its generation value is null. Noise
 has no scenario, world branch, owner, pattern, variant or state patch.
 
 Primary stream timestamps exactly equal ScenarioPlan projection timestamps and are globally
-strictly increasing across primary, noise and replay rows. Timestamp/gap/elapsed truth exists
-only under `_meta.event`; no deleted `time_fields` are injected into payload.
+unique across primary, noise and replay rows. Outer timestamp/gap/elapsed truth stays under
+`_meta.event`; complete payload Schema business-time leaves are mechanically injected from the
+same start/end/duration. For every resource, positive intervals are globally non-overlapping.
 
 Replay ingest is self-contained. With `input.text_field="payload"` an object payload becomes
-canonical Record.text and raw remains the full row. M2 validates 32-lowercase-hex IDs, global
-event-ID uniqueness, primary owner grouping, ordered source sequence ID, replay sequence/event
-ID formulas and every duplicate-of positional reference from this stream alone. Any missing,
-extra or mismatched source fails closed. It does not read main and does not fall back to a
-content-derived legacy ID.
+canonical Record.text and raw remains the full row. M2 validates descriptor shape and binding,
+32-lowercase-hex IDs, global event-ID/start uniqueness, resource intervals, primary owner grouping,
+ordered source sequence ID, constant replay shift, replay sequence/event ID formulas and every
+duplicate-of positional reference from this stream alone. Any missing, extra or mismatched source
+fails closed. It does not read main and does not fall back to a content-derived legacy ID.
 
 Successful manifest path is `output_stem.manifest.json`; key order and nested key order are:
 

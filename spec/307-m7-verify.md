@@ -176,9 +176,9 @@ VerificationResult(
 
 **对照分支：**若二次评审仍 fail，此时已达 `max_repair_rounds`（默认 1），按 drop 收尾——`status = "dropped_verify"`，批评意见摘要入 `_meta.verification` 与 rejects 通道（3.7.3）；rejects 行（`output.rejects = "refs"`）不含数据内容本体。
 
-### 3.7.5 v1.18 sequence attempt 评审
+### 3.7.5 v1.20 sequence attempt 评审
 
-process stream 的 episode 继续使用 3.7.2 缺陷表与成员手术。v1.18 生成 sequence 是 text 模态的完整
+process stream 的 episode 继续使用 3.7.2 缺陷表与成员手术。v1.20 生成 sequence 是 text 模态的完整
 主序列候选，使用既有 verdict Schema 的判决形模板；两者按调用入口区分，不以
 `segment.enabled` 猜测。
 
@@ -224,3 +224,10 @@ PipelineItem、共享 critiques 或 verification；attempt dataset counters 只�
 ContextOverflowError、OutputTruncatedError 与普通 verdict fail 返回 `accepted=false` 并消耗当前 attempt。
 若 attempt 路径出现新增的 provider-fatal `item.errors`，属于 `generation_downstream_contract`
 内部错误，不得当作可重试拒绝。
+
+sequence class 声明 annotation time binding 时，首次标注冻结的 `SequenceTemporalContext` 必须贯穿 judge wave、
+repair annotation wave 与复审。每轮 repair 仍只把上一版 model-space annotation 与 critiques 放入 prompt；
+`repair_projector` 删除 business time leaf，provider 与 L3 不读取机械值。M5 finalizer 在同一个 temporal context 上重新
+注入 `first_resource_start_milliseconds`，再跑完整 class Schema 与 L2.5。替换、遗漏 context，或让 verify 从 main
+metadata、member payload、wall clock 推断时间，都是 internal contract error。stream verify 的 reannotate leaf 同样调用
+该统一 finalizer；M7 不新增第二套时间修复代码。

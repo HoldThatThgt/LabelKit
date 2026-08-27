@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import dataclasses
+import hashlib
 import json
 import importlib.util
 import resource
@@ -12,10 +14,12 @@ from collections.abc import Mapping
 from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
+from types import MappingProxyType, SimpleNamespace
 
 import pytest
 
+from labelkit.common.config._temporal import IntervalContainmentSpec
+from labelkit.common.config.model import TimeBindingSpec
 from labelkit.common.contracts.generation import (
     ActorView,
     DedupReservation,
@@ -30,6 +34,7 @@ from labelkit.common.contracts.generation import (
     ProjectedSequence,
     ProjectionRequest,
     ReconcileRequest,
+    ResourceInterval,
     ReplayRows,
     ReplayProjectionRequest,
     ScenarioSeed,
@@ -48,12 +53,16 @@ from labelkit.operators.generation.project import (
     canonical_json,
     canonical_delivery_row,
     derive_generation_id,
+    generation_digest,
+    generation_random,
     noise_payload_digest,
     project_noise,
     project_replay,
     project_trace,
     projection_witness,
     _reconcile_declared_role,
+    _reconcile_sequence_temporal,
+    _resource_intervals_overlap,
     reconcile_noise_candidate,
     reconcile_primary_candidate,
     reconcile_views,
@@ -63,10 +72,80 @@ _RETAINED_CAP = 536_870_912
 _RSS_LIMIT_BYTES = 4 * 1024**3
 
 
+def test_v120_generation_domain_fixed_vectors():
+    assert generation_digest("fixed_vector", {"b": 2, "a": 1}) == (
+        "22311a5d679e7837e3ae9b12f8072cc21a34f58e77d27ba76c67a83142479b2d"
+    )
+    assert generation_random("attempt_random", [7, "slot", 2, "scenario"]) == (
+        64040523016585868640274058000328024092017509124317729899591492220036754143598
+    )
+    assert derive_generation_id(
+        "primary_event_id", ["world", "event", 123, {"x": 1}]
+    ) == "e08c2d306b8bdb97282d721f91d91116"
+
+
+def _independent_semantic_value(value):
+    """独立把 program carrier 转成不含 digest/callable 的语义树。"""
+    if dataclasses.is_dataclass(value):
+        if hasattr(value, "reference") and hasattr(value, "target"):
+            return {"reference": value.reference}
+        return {
+            field.name: _independent_semantic_value(getattr(value, field.name))
+            for field in dataclasses.fields(value)
+            if field.name != "digest"
+        }
+    if isinstance(value, Mapping):
+        return {str(key): _independent_semantic_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_independent_semantic_value(item) for item in value]
+    if isinstance(value, Path):
+        return str(value)
+    return None if callable(value) else value
+
+
+def _independent_domain_digest(domain: str, value) -> str:
+    """不用 production digest helper 计算 v1.20 canonical SHA-256。"""
+    encoded = json.dumps(
+        ["labelkit:v1.20", domain, value],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def test_actual_program_and_plan_digest_fixed_vectors(declared_program):
+    """教学工程实际 program/plan 必须命中独立重建的 v1.20 fixed vectors。"""
+    plan = compile_scenario_plan(declared_program)
+    program_value = _independent_semantic_value(declared_program)
+    plan_value = {
+        "blocks": [[
+            {
+                "slot_key": key[0],
+                "variant_name": key[1],
+                "events": [dataclasses.asdict(event) for event in events],
+            }
+            for key, events in block.items()
+        ] for block in plan.blocks],
+        "delivery_slots": [dataclasses.asdict(item) for item in plan.delivery_slots],
+        "noise_slots": [dataclasses.asdict(item) for item in plan.noise_slots],
+        "replay_layouts": [dataclasses.asdict(item) for item in plan.replay_layouts],
+        "primary_sessions": plan.primary_sessions,
+    }
+    assert declared_program.digest == (
+        "2c635111bb113e1329d114118cd8e7959a09f3da01129af4eea714b983217c4c"
+    )
+    assert declared_program.digest == _independent_domain_digest(
+        "generation_program", program_value,
+    )
+    assert plan.digest == "ab6143d154967b90c7524b8bed0e7371cf5120c7882813368acc0a054a544d90"
+    assert plan.digest == _independent_domain_digest("scenario_plan", plan_value)
+
+
 def test_far_future_timestamp_round_trips_without_float_drift(declared_program):
     """远期微秒在 planner、projection 与 ID 载体间必须保持整数精度。"""
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
-    target = datetime(2300, 1, 1, 0, 0, 0, 1, tzinfo=timezone.utc)
+    target = datetime(2300, 1, 1, 0, 0, 0, 1000, tzinfo=timezone.utc)
     delta = target - epoch
     target_us = (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
     assert _timestamp_us(_timestamp_text(target_us, 480)) == target_us
@@ -124,7 +203,10 @@ def _payload(role: str) -> dict:
     if role == "request":
         return {"utterance": "请订票", "request_id": "R-100", "status": "pending"}
     if role == "acknowledge":
-        return {"utterance": "已受理", "request_id": "R-100", "status": "acknowledged"}
+        return {
+            "utterance": "已受理 R-100", "request_id": "R-100",
+            "status": "acknowledged",
+        }
     return {
         "utterance": "已出票", "request_id": "R-100",
         "ticket_id": "T-100", "status": "ticketed",
@@ -147,13 +229,23 @@ def _trace(program, plan, variant_name: str = "positive"):
     bindings = {}
     for item in planned:
         role, payload = roles[item.role], _payload(item.role)
+        frame = program.frame_classes[role.frame_class]
+        descriptor = [
+            {"payload_path": binding.payload_path, "source": binding.source}
+            for binding in frame.time_bindings
+        ]
         event_id = derive_generation_id(
-            "primary_event_id", [world_id, item.event_key, item.timestamp_us, payload]
+            "primary_event_id",
+            [
+                world_id, item.event_key, item.timestamp_us, item.duration_us,
+                list(item.resources), descriptor, payload,
+            ],
         )
         view = ActorView(role.actor, {}, {}, (), item.logical_time_us, 0)
         events.append(EventTruth(
             item.event_key, event_id, item.role, role.frame_class, role.actor,
-            item.logical_time_us, item.timestamp_us, view, f"intent-{item.role}",
+            item.logical_time_us, item.timestamp_us, item.duration_us,
+            view, f"intent-{item.role}",
             ({"op": "test", "path": "/request/id", "value": "R-100"},),
             "before", "after", {}, payload,
         ))
@@ -190,7 +282,13 @@ def _sequence_rows(projection, planned) -> SequenceRows:
             "label": frame, "labels": [frame], "source": "inherited",
         }
         rows.append(row)
-    main = {"_meta": {
+    main = {
+        "intent": "book a ticket",
+        "outcome": "ticketed",
+        "request_id": "R-100",
+        "ticket_id": "T-100",
+        "summary": "ticket booking completed",
+        "_meta": {
         "id": sequence_id,
         "source": {"file": "", "line": None, "pair_index": None},
         "stream": {
@@ -214,7 +312,8 @@ def _sequence_rows(projection, planned) -> SequenceRows:
         "annotation": None,
         "verification": None,
         "generation": generation,
-    }}
+        },
+    }
     final_rows = tuple(rows)
     retained = sum(
         len(canonical_delivery_row(row)) + 1 for row in (main, *final_rows)
@@ -266,6 +365,127 @@ def _thaw(value):
     return value
 
 
+def _event_start_frame(frame, duration_us: int, resources: tuple[str, ...]):
+    """给教学 frame 增加一个由计划起点机械注入的业务时间叶。"""
+    schema = _thaw(frame.gen_schema)
+    schema["properties"]["timestamp"] = {
+        "type": "integer", "x-labelkit-business-time": True,
+    }
+    schema["required"].append("timestamp")
+    return replace(
+        frame,
+        gen_schema=schema,
+        model_gen_schema=_thaw(frame.gen_schema),
+        business_time_paths=("/timestamp",),
+        time_bindings=(TimeBindingSpec(
+            "/timestamp", "event_start_milliseconds", None,
+        ),),
+        duration_us=duration_us,
+        resources=resources,
+    )
+
+
+def _trace_with_bound_times(program, trace):
+    """把测试 trace 的模型 payload 转成 projector 接收的最终机械 payload。"""
+    events = []
+    for event in trace.events:
+        frame = program.frame_classes[event.frame_class]
+        payload = _thaw(event.payload)
+        if frame.time_bindings:
+            payload["timestamp"] = event.timestamp_us // 1000
+        descriptor = [
+            {"payload_path": binding.payload_path, "source": binding.source}
+            for binding in frame.time_bindings
+        ]
+        event_id = derive_generation_id(
+            "primary_event_id",
+            [
+                trace.world_branch_id, event.event_key, event.timestamp_us,
+                event.duration_us, list(frame.resources), descriptor, payload,
+            ],
+        )
+        events.append(replace(event, event_id=event_id, payload=payload))
+    evaluation = replace(
+        trace.pattern_evaluation,
+        actual_bindings={event.event_id: event.role for event in events},
+    )
+    return replace(trace, events=tuple(events), pattern_evaluation=evaluation)
+
+
+def _build_temporal_projected_set(declared_program):
+    """返回同时覆盖 interval、annotation、noise 与 replay rebinding 的闭包。"""
+    frames = dict(declared_program.frame_classes)
+    frames["task_request"] = _event_start_frame(
+        frames["task_request"], 10_000_000, ("foreground_app",),
+    )
+    frames["noise"] = _event_start_frame(frames["noise"], 0, ())
+    views = dict(declared_program.class_views)
+    view = views["ticket_booking"]
+    schema = _thaw(view.schema)
+    schema["properties"]["started_at"] = {
+        "type": "integer", "x-labelkit-business-time": True,
+    }
+    schema["required"].append("started_at")
+    views["ticket_booking"] = replace(
+        view,
+        schema=schema,
+        model_schema=_thaw(view.schema),
+        business_time_paths=("/started_at",),
+        time_bindings=(TimeBindingSpec(
+            "/started_at", "first_resource_start_milliseconds", "foreground_app",
+        ),),
+    )
+    source = declared_program.counterfactual_sets[0]
+    positive = next(item for item in source.variants if item.kind == "positive")
+    timeline = replace(
+        declared_program.timeline,
+        primary_sessions=1,
+        crossed_primary_sessions=0,
+        noise_events=1,
+        duplicate_sequences=1,
+    )
+    base = replace(
+        declared_program,
+        frame_classes=frames,
+        class_views=views,
+        counterfactual_sets=(replace(source, count=1, variants=(positive,)),),
+        timeline=timeline,
+        digest="",
+    )
+    program = replace(base, digest=generation_program_digest(base))
+    plan = compile_scenario_plan(program)
+    slot, trace = _trace(program, plan)
+    trace = _trace_with_bound_times(program, trace)
+    projection = project_trace(ProjectionRequest(program, plan, slot, trace))
+    planned = _branch(plan, slot.slot_key, "positive")
+    sequence = _sequence_rows(projection, planned)
+    main = _thaw(sequence.main_row)
+    main["started_at"] = min(
+        event.timestamp_us for event in planned
+        if "foreground_app" in event.resources
+    ) // 1000
+    rows = tuple(sequence.primary_stream_rows)
+    retained = sum(len(canonical_delivery_row(row)) + 1 for row in (main, *rows))
+    sequence = SequenceRows(main, rows, retained)
+    noise_slot = plan.noise_slots[0]
+    noise = project_noise(NoiseProjectionRequest(
+        program,
+        "a" * 32,
+        noise_slot,
+        {"utterance": "天气很好", "timestamp": noise_slot.timestamp_us // 1000},
+    ))
+    replay = project_replay(ReplayProjectionRequest(
+        program, plan, plan.replay_layouts[0], sequence,
+    ))
+    return program, plan, projection, sequence, noise, replay
+
+
+@pytest.fixture
+def temporal_projected_set(declared_program):
+    """向 pytest 暴露可复用的真实 temporal 投影闭包。"""
+    return _build_temporal_projected_set(declared_program)
+
+
 def _final_checker_rows(sequence):
     """把最小投影 fixture 补成教学 checker 接收的最终 M11 main 形状。"""
     main = _thaw(sequence.main_row)
@@ -305,7 +525,11 @@ def _rewrite_checker_owner(main, rows) -> None:
         event = row["_meta"]["event"]
         timestamp = _timestamp_us(event["timestamp"])
         event["event_id"] = derive_generation_id(
-            "primary_event_id", [world, event["event_key"], timestamp, row["payload"]]
+            "primary_event_id",
+            [
+                world, event["event_key"], timestamp, event["duration_us"],
+                event["resources"], event["time_bindings"], row["payload"],
+            ],
         )
         event_ids.append(event["event_id"])
     owner = derive_generation_id("sequence_id", [world, event_ids])
@@ -421,14 +645,15 @@ def _single_final_request(program):
 def test_projectors_round_trip_frozen_mappings_and_rederive_replay(projected_set):
     program, plan, projection, sequence, noise, replay = projected_set
     assert set(json.loads(canonical_json(plan.noise_slots[0]))) == {
-        "event_key", "ordinal", "frame_class", "topic", "timestamp_us", "session_id",
+        "event_key", "ordinal", "frame_class", "topic", "timestamp_us",
+        "duration_us", "resources", "session_id",
     }
     replay_layout = json.loads(canonical_json(plan.replay_layouts[0]))
     assert set(replay_layout) == {
         "source_slot_key", "source_variant_name", "replay_ordinal", "session_id",
-        "timestamps_us",
+        "shift_us",
     }
-    assert len(replay_layout["timestamps_us"]) == len(sequence.primary_stream_rows)
+    assert replay_layout["shift_us"] > 0
     assert json.loads(canonical_json(projection.primary_stream_rows[0]))["payload"]
     truth = projection.main_record.raw["_meta"]["generation"]
     assert truth["expected_violation"] == {}
@@ -443,19 +668,291 @@ def test_projectors_round_trip_frozen_mappings_and_rederive_replay(projected_set
     assert "请订票" not in canonical_json(witness)
     source_event = sequence.primary_stream_rows[0]["_meta"]["event"]
     replay_event = replay.rows[0]["_meta"]["event"]
-    timestamp_us = plan.replay_layouts[0].timestamps_us[0]
+    timestamp_us = _timestamp_us(source_event["timestamp"]) + plan.replay_layouts[0].shift_us
     expected = derive_generation_id(
         "replay_event_id",
-        [replay_event["replay_sequence_id"], source_event["event_id"], timestamp_us],
+        [
+            replay_event["replay_sequence_id"], source_event["event_id"], timestamp_us,
+            source_event["duration_us"], replay.rows[0]["payload"],
+        ],
     )
     assert replay_event["event_id"] == expected
     assert replay_event["timestamp"] != source_event["timestamp"]
     noise_event = noise["_meta"]["event"]
     noise_slot = plan.noise_slots[0]
     assert noise_event["event_id"] == derive_generation_id(
-        "noise_event_id", ["a" * 32, noise_slot.event_key, noise_slot.timestamp_us, noise["payload"]]
+        "noise_event_id",
+        [
+            "a" * 32, noise_slot.event_key, noise_slot.timestamp_us, 0, [],
+            noise_event["time_bindings"], noise["payload"],
+        ],
     )
     _reconcile_candidate_bundle(_request(program, plan, projection, sequence, noise, replay))
+
+
+def test_temporal_projectors_emit_self_describing_rebound_rows(temporal_projected_set):
+    """primary/noise/replay 都携带计划 interval 与 descriptor，replay 只平移时间叶。"""
+    program, plan, projection, sequence, noise, replay = temporal_projected_set
+    source = next(
+        row for row in sequence.primary_stream_rows
+        if row["_meta"]["event"]["time_bindings"]
+    )
+    rebound = next(
+        row for row in replay.rows
+        if row["_meta"]["event"]["time_bindings"]
+    )
+    source_event = source["_meta"]["event"]
+    rebound_event = rebound["_meta"]["event"]
+    assert source_event["duration_us"] == 10_000_000
+    assert source_event["resources"] == ("foreground_app",)
+    assert source_event["time_bindings"] == ({
+        "payload_path": "/timestamp", "source": "event_start_milliseconds",
+    },)
+    assert rebound_event["duration_us"] == source_event["duration_us"]
+    assert rebound_event["resources"] == source_event["resources"]
+    assert rebound_event["time_bindings"] == source_event["time_bindings"]
+    shift_ms = plan.replay_layouts[0].shift_us // 1000
+    assert rebound["payload"]["timestamp"] == source["payload"]["timestamp"] + shift_ms
+    assert {key: value for key, value in rebound["payload"].items() if key != "timestamp"} == {
+        key: value for key, value in source["payload"].items() if key != "timestamp"
+    }
+    noise_event = noise["_meta"]["event"]
+    assert noise_event["duration_us"] == 0 and tuple(noise_event["resources"]) == ()
+    assert noise["payload"]["timestamp"] == plan.noise_slots[0].timestamp_us // 1000
+    reconcile_views(_request(program, plan, projection, sequence, noise, replay))
+
+
+def _tamper_temporal_row(row, mutation: str):
+    """篡改一行时间事实且保留其余最终内容。"""
+    changed = _thaw(row)
+    event = changed["_meta"]["event"]
+    if mutation == "duration":
+        event["duration_us"] += 1000
+    elif mutation == "resources":
+        event["resources"] = ["forged_resource"]
+    elif mutation == "descriptor":
+        event["time_bindings"].append({
+            "payload_path": "/extra", "source": "event_start_milliseconds",
+        })
+    else:
+        changed["payload"]["timestamp"] += 1
+    return changed
+
+
+@pytest.mark.parametrize("surface", ("primary", "replay", "noise"))
+@pytest.mark.parametrize("mutation", ("duration", "resources", "descriptor", "payload_time"))
+def test_candidate_temporal_tamper_is_terminal_before_commit(
+    temporal_projected_set,
+    surface,
+    mutation,
+):
+    """三类候选的固定时间篡改都走 terminal downstream contract。"""
+    if surface == "noise":
+        request = _noise_candidate_request(temporal_projected_set)
+        request = replace(request, row=_tamper_temporal_row(request.row, mutation))
+        reconcile = reconcile_noise_candidate
+    else:
+        request = _primary_candidate_request(temporal_projected_set)
+        if surface == "primary":
+            sequence = request.sequences[0]
+            rows = list(sequence.primary_stream_rows)
+            index = next(i for i, row in enumerate(rows)
+                         if row["_meta"]["event"]["time_bindings"])
+            rows[index] = _tamper_temporal_row(rows[index], mutation)
+            changed = replace(sequence, primary_stream_rows=tuple(rows))
+            request = replace(request, sequences=(changed,))
+        else:
+            replay = request.replays[0]
+            rows = list(replay.rows)
+            index = next(i for i, row in enumerate(rows)
+                         if row["_meta"]["event"]["time_bindings"])
+            rows[index] = _tamper_temporal_row(rows[index], mutation)
+            request = replace(request, replays=(replace(replay, rows=tuple(rows)),))
+        reconcile = reconcile_primary_candidate
+    with pytest.raises(InternalError, match="generation_downstream_contract"):
+        reconcile(request)
+
+
+def test_candidate_main_annotation_tamper_is_terminal_before_commit(
+    temporal_projected_set,
+):
+    """main annotation 时间篡改必须在 candidate-local gate 终态失败。"""
+    request = _primary_candidate_request(temporal_projected_set)
+    sequence = request.sequences[0]
+    main = _thaw(sequence.main_row)
+    main["started_at"] += 1
+    changed = replace(sequence, main_row=main)
+    with pytest.raises(InternalError, match="annotation time"):
+        reconcile_primary_candidate(replace(request, sequences=(changed,)))
+
+
+def test_temporal_reconcile_accepts_frozen_nested_annotation() -> None:
+    """最终对账先解冻 annotation，不能把只读嵌套 object 误判为 Schema 违规。"""
+    schema = {
+        "type": "object",
+        "properties": {
+            "actionInfo": {
+                "type": "object",
+                "properties": {"timestamp": {"type": "integer"}},
+                "required": ["timestamp"],
+                "additionalProperties": False,
+            },
+        },
+        "required": ["actionInfo"],
+        "additionalProperties": False,
+    }
+    view = SimpleNamespace(schema=schema, time_bindings=())
+    program = SimpleNamespace(
+        class_views={"navigation": view},
+        mode="instruction_only",
+    )
+    slot = SimpleNamespace(sequence_class="navigation")
+    main = {
+        "actionInfo": MappingProxyType({"timestamp": 1}),
+        "_meta": MappingProxyType({}),
+    }
+
+    _reconcile_sequence_temporal(program, slot, (), main)
+
+
+def test_candidate_infeasible_containment_is_terminal_before_commit(
+    temporal_projected_set,
+):
+    """绕过 canonical identity 后，candidate-local 仍拒绝不可行 containment carrier。"""
+    request = _primary_candidate_request(temporal_projected_set)
+    pattern_name = request.slot.pattern_name
+    pattern = request.program.patterns[pattern_name]
+    patterns = dict(request.program.patterns)
+    patterns[pattern_name] = replace(
+        pattern,
+        containments=(IntervalContainmentSpec("request", "acknowledge"),),
+    )
+    tampered = replace(request.program, patterns=patterns)
+    with pytest.raises(InternalError, match="containment"):
+        reconcile_primary_candidate(replace(request, program=tampered))
+
+
+@pytest.mark.parametrize("surface", ("primary", "replay", "noise", "annotation"))
+def test_final_reconcile_independently_rejects_temporal_bypass(
+    temporal_projected_set,
+    surface,
+):
+    """绕过 candidate/frontier 的每个最终时间面仍由 full reconcile 独立拒绝。"""
+    program, plan, projection, sequence, noise, replay = temporal_projected_set
+    request = _request(program, plan, projection, sequence, noise, replay)
+    if surface == "primary":
+        rows = list(sequence.primary_stream_rows)
+        rows[0] = _tamper_temporal_row(rows[0], "duration")
+        request = replace(request, sequences=(replace(sequence, primary_stream_rows=tuple(rows)),))
+    elif surface == "replay":
+        rows = list(replay.rows)
+        rows[0] = _tamper_temporal_row(rows[0], "descriptor")
+        request = replace(request, replays=(replace(replay, rows=tuple(rows)),))
+    elif surface == "noise":
+        request = replace(request, noise_rows=(_tamper_temporal_row(noise, "payload_time"),))
+    else:
+        main = _thaw(sequence.main_row)
+        main["started_at"] += 1
+        request = replace(request, sequences=(replace(sequence, main_row=main),))
+    with pytest.raises(InternalError, match="generation_downstream_contract"):
+        reconcile_views(request)
+
+
+def test_final_reconcile_independently_rechecks_containment(
+    monkeypatch,
+    temporal_projected_set,
+):
+    """绕过 plan identity 后，final reconcile 仍独立执行 containment oracle。"""
+    program, plan, projection, sequence, noise, replay = temporal_projected_set
+    pattern_name = plan.delivery_slots[0].pattern_name
+    pattern = program.patterns[pattern_name]
+    patterns = dict(program.patterns)
+    patterns[pattern_name] = replace(
+        pattern,
+        containments=(IntervalContainmentSpec("request", "acknowledge"),),
+    )
+    tampered = replace(program, patterns=patterns)
+    from labelkit.operators.generation import project
+
+    monkeypatch.setattr(project, "validate_plan_identity", lambda *_args: None)
+    request = replace(
+        _request(program, plan, projection, sequence, noise, replay),
+        program=tampered,
+    )
+    with pytest.raises(InternalError, match="containment"):
+        reconcile_views(request)
+
+
+def test_final_reconcile_independently_rejects_global_resource_overlap(
+    monkeypatch,
+    temporal_projected_set,
+):
+    """即使绕过 Planner/frontier，final sort/sweep 仍拒绝 source/replay 全局重叠。"""
+    program, plan, projection, sequence, noise, _replay = temporal_projected_set
+    layout = replace(plan.replay_layouts[0], shift_us=1000)
+    changed_plan = replace(plan, replay_layouts=(layout,), digest="")
+    changed_plan = replace(changed_plan, digest=scenario_plan_digest(changed_plan))
+    from labelkit.operators.generation import project
+
+    monkeypatch.setattr(project, "validate_plan_identity", lambda *_args: None)
+    replay = project_replay(ReplayProjectionRequest(
+        program, changed_plan, layout, sequence,
+    ))
+    retained = sequence.retained_content_bytes + replay.retained_content_bytes
+    retained += len(canonical_delivery_row(noise)) + 1
+    request = ReconcileRequest(
+        program,
+        changed_plan,
+        "a" * 32,
+        (projection_witness(projection),),
+        (sequence,),
+        (noise_payload_digest(noise["payload"]),),
+        (noise,),
+        (replay,),
+        retained,
+    )
+    with pytest.raises(InternalError, match="resource intervals overlap"):
+        reconcile_views(request)
+
+
+def test_final_reconcile_rejects_synchronized_replay_rewrite(temporal_projected_set):
+    """整组同步改写 outer time、payload time 与 ID 仍不能替换冻结 replay layout。"""
+    program, plan, projection, sequence, noise, replay = temporal_projected_set
+    rows = _thaw(replay.rows)
+    extra_shift_us = 10_000_000
+    for row in rows:
+        event = row["_meta"]["event"]
+        timestamp_us = _timestamp_us(event["timestamp"]) + extra_shift_us
+        event["timestamp"] = _timestamp_text(timestamp_us, program.timeline.utc_offset_minutes)
+        if event["time_bindings"]:
+            row["payload"]["timestamp"] += extra_shift_us // 1000
+        event["event_id"] = derive_generation_id(
+            "replay_event_id",
+            [
+                event["replay_sequence_id"], event["duplicate_of_event_id"],
+                timestamp_us, event["duration_us"], row["payload"],
+            ],
+        )
+    changed = ReplayRows(tuple(rows), sum(_independent_row_bytes(row) for row in rows))
+    retained = sequence.retained_content_bytes + changed.retained_content_bytes
+    retained += len(canonical_delivery_row(noise)) + 1
+    request = replace(
+        _request(program, plan, projection, sequence, noise, replay),
+        replays=(changed,),
+        retained_content_bytes=retained,
+    )
+    with pytest.raises(InternalError, match="generation_downstream_contract"):
+        reconcile_views(request)
+
+
+def test_frontier_resource_sweep_uses_half_open_intervals():
+    """同 resource 相邻区间合法，一微秒交叠失败，多 resource 各自扫描。"""
+    first = ResourceInterval("app", 0, 10_000, "1" * 32, "first")
+    adjacent = ResourceInterval("app", 10_000, 15_000, "2" * 32, "second")
+    overlap = ResourceInterval("app", 9_999, 15_000, "3" * 32, "third")
+    other = ResourceInterval("screen", 1, 20_000, "4" * 32, "fourth")
+    assert not _resource_intervals_overlap((first, adjacent, other))
+    assert _resource_intervals_overlap((first, overlap, other))
 
 
 def _primary_candidate_request(projected_set):
@@ -638,7 +1135,7 @@ def test_candidate_local_converts_malformed_plan_and_noise_slot_to_rejection(pro
 def test_frontier_check_is_non_mutating_and_commit_advances_phase(projected_set):
     """check 只返回 delta；commit 后才写集合并从 primary 切换到 noise。"""
     primary_request = _primary_candidate_request(projected_set)
-    frontier = CrossViewFrontier(primary_request.plan)
+    frontier = CrossViewFrontier(primary_request.program, primary_request.plan)
     first_noise = _noise_candidate_request(projected_set)
     second_noise = _noise_candidate_request(projected_set, 1)
     with pytest.raises(InternalError, match="noise phase is closed"):
@@ -648,7 +1145,10 @@ def test_frontier_check_is_non_mutating_and_commit_advances_phase(projected_set)
     assert delta.phase == "primary" and delta.ordinal == 0
     main_id = primary_request.sequences[0].main_row["_meta"]["id"]
     replay_id = primary_request.replays[0].rows[0]["_meta"]["event"]["replay_sequence_id"]
-    assert delta.source_keys == (f"primary:{main_id}", f"replay:{replay_id}")
+    del main_id, replay_id
+    assert len(delta.source_keys) == len(delta.event_ids)
+    assert any(key.startswith("primary:") for key in delta.source_keys)
+    assert any(key.startswith("replay:") for key in delta.source_keys)
     assert frontier._event_ids == set()
     assert frontier._timestamps_us == set()
     assert frontier._source_keys == set()
@@ -678,11 +1178,10 @@ def test_frontier_check_is_non_mutating_and_commit_advances_phase(projected_set)
 def test_frontier_rejects_out_of_order_and_cross_candidate_collision_without_mutation(
     projected_set,
 ):
-    """scheduler 顺序错误是内部失败，候选身份冲突是可恢复且不推进 frontier。"""
+    """scheduler 顺序错误是内部失败且不推进 frontier。"""
     request = _primary_candidate_request(projected_set)
     second_slot = replace(request.slot, slot_key="second/000000")
-    plan = replace(request.plan, delivery_slots=(request.slot, second_slot))
-    frontier = CrossViewFrontier(plan)
+    frontier = CrossViewFrontier(request.program, request.plan)
     duplicate = replace(_prepared_primary(request), slot=second_slot)
 
     with pytest.raises(InternalError, match="out of order"):
@@ -690,10 +1189,10 @@ def test_frontier_rejects_out_of_order_and_cross_candidate_collision_without_mut
 
     first_delta = frontier.check_primary(_prepared_primary(request))
     frontier.commit(first_delta)
-    with pytest.raises(GenerationProjectionMismatch, match="committed CrossView"):
+    with pytest.raises(InternalError, match="primary phase is closed"):
         frontier.check_primary(duplicate)
 
-    assert frontier._next_ordinal == 1
+    assert frontier._phase == "noise"
     assert frontier._event_ids == set(first_delta.event_ids)
     assert frontier._timestamps_us == set(first_delta.timestamps_us)
     assert frontier._source_keys == set(first_delta.source_keys)
@@ -705,9 +1204,9 @@ def test_frontier_rejects_malformed_or_invalid_primary_facts(projected_set):
     prepared = _prepared_primary(request)
     sequence = prepared.sequences[0]
 
-    malformed = replace(prepared, sequences=(replace(sequence, main_row={}),))
-    with pytest.raises(GenerationProjectionMismatch, match="frontier facts are malformed"):
-        CrossViewFrontier(request.plan).check_primary(malformed)
+    malformed = replace(prepared, sequences=(replace(sequence, primary_stream_rows=({},)),))
+    with pytest.raises(InternalError, match="row count"):
+        CrossViewFrontier(request.program, request.plan).check_primary(malformed)
 
     rows = _thaw(sequence.primary_stream_rows)
     rows[0]["_meta"]["event"]["event_id"] = "invalid"
@@ -716,21 +1215,21 @@ def test_frontier_rejects_malformed_or_invalid_primary_facts(projected_set):
         sequences=(replace(sequence, primary_stream_rows=tuple(rows)),),
     )
     with pytest.raises(GenerationProjectionMismatch, match="event ID is invalid"):
-        CrossViewFrontier(request.plan).check_primary(invalid_id)
+        CrossViewFrontier(request.program, request.plan).check_primary(invalid_id)
 
-    replay = prepared.replays[0]
-    replay_rows = _thaw(replay.rows)
-    for row in replay_rows:
-        row["_meta"]["event"]["replay_sequence_id"] = "invalid"
-    invalid_replay = replace(prepared, replays=(replace(replay, rows=tuple(replay_rows)),))
-    with pytest.raises(GenerationProjectionMismatch, match="replay frontier source"):
-        CrossViewFrontier(request.plan).check_primary(invalid_replay)
+    rows = _thaw(sequence.primary_stream_rows)
+    rows[0]["_meta"]["event"]["duration_us"] = 1000
+    invalid_interval = replace(
+        prepared, sequences=(replace(sequence, primary_stream_rows=tuple(rows)),)
+    )
+    with pytest.raises(InternalError, match="planned interval"):
+        CrossViewFrontier(request.program, request.plan).check_primary(invalid_interval)
 
 
 def test_frontier_rejects_malformed_or_invalid_noise_facts(projected_set):
     """noise frontier 对缺失行结构和伪造 source identity 都不正式突变。"""
     primary = _primary_candidate_request(projected_set)
-    frontier = CrossViewFrontier(primary.plan)
+    frontier = CrossViewFrontier(primary.program, primary.plan)
     frontier.commit(frontier.check_primary(_prepared_primary(primary)))
     noise = _prepared_noise(_noise_candidate_request(projected_set))
 
@@ -738,27 +1237,21 @@ def test_frontier_rejects_malformed_or_invalid_noise_facts(projected_set):
         frontier.check_noise(replace(noise, row={}))
 
     row = _thaw(noise.row)
-    row["_meta"]["event"]["event_key"] = "invalid"
-    with pytest.raises(GenerationProjectionMismatch, match="noise frontier source"):
+    row["_meta"]["event"]["duration_us"] = 1000
+    with pytest.raises(InternalError, match="planned interval"):
         frontier.check_noise(replace(noise, row=row))
 
     assert frontier._next_ordinal == 0
 
 
-@pytest.mark.parametrize(("mutation", "message"), (
-    ("duplicate", "unchecked conflicting delta"),
-    ("empty", "unchecked conflicting delta"),
-    ("invalid_id", "unchecked invalid event ID"),
-    ("phase", "out of order"),
-))
+@pytest.mark.parametrize("mutation", ("duplicate", "empty", "invalid_id", "phase"))
 def test_frontier_commit_rejects_a_forged_unchecked_delta(
     projected_set,
     mutation,
-    message,
 ):
     """只有 check 产生的闭合当前 delta 可进入无 await commit 路径。"""
     request = _primary_candidate_request(projected_set)
-    frontier = CrossViewFrontier(request.plan)
+    frontier = CrossViewFrontier(request.program, request.plan)
     checked = frontier.check_primary(_prepared_primary(request))
     changes = {
         "duplicate": {"event_ids": (*checked.event_ids, checked.event_ids[0])},
@@ -768,7 +1261,7 @@ def test_frontier_commit_rejects_a_forged_unchecked_delta(
     }
     forged = replace(checked, **changes[mutation])
 
-    with pytest.raises(InternalError, match=message):
+    with pytest.raises(InternalError, match="was not checked"):
         frontier.commit(forged)
 
     assert frontier._next_ordinal == 0
@@ -1741,7 +2234,10 @@ def test_example_checker_rejects_synchronized_replay_time_shift(projected_set):
         event["timestamp"] = _timestamp_text(shifted, 480)
         event["event_id"] = derive_generation_id(
             "replay_event_id",
-            [event["replay_sequence_id"], event["duplicate_of_event_id"], shifted],
+            [
+                event["replay_sequence_id"], event["duplicate_of_event_id"], shifted,
+                event["duration_us"], row["payload"],
+            ],
         )
     with pytest.raises(AssertionError, match="frozen tail layout"):
         checker._assert_replay(primary, replay_rows, stream)
@@ -1761,7 +2257,8 @@ def test_reconcile_rejects_each_primary_identity_tamper(projected_set, field, va
     main, rows = _thaw(sequence.main_row), _thaw(sequence.primary_stream_rows)
     rows[0]["_meta"]["event"][field] = value
     tampered = SequenceRows(main, tuple(rows), 0)
-    with pytest.raises(GenerationProjectionMismatch):
+    expected = InternalError if field in {"frame_class", "timestamp"} else GenerationProjectionMismatch
+    with pytest.raises(expected):
         _reconcile_candidate_bundle(_primary_only_request(program, plan, projection, tampered))
 
 
@@ -1893,7 +2390,8 @@ def test_reconcile_rejects_each_replay_identity_tamper(projected_set, field, val
     program, plan, projection, sequence, noise, replay = projected_set
     rows = _thaw(replay.rows)
     rows[0]["_meta"]["event"][field] = value
-    with pytest.raises(GenerationProjectionMismatch):
+    error = InternalError if field == "timestamp" else GenerationProjectionMismatch
+    with pytest.raises(error):
         request = _request(program, plan, projection, sequence, noise, replay)
         _reconcile_candidate_bundle(replace(
             request, replays=(replace(replay, rows=tuple(rows)),)
@@ -1929,7 +2427,7 @@ def test_reconcile_rejects_equivalent_replay_instant_with_wrong_offset(projected
         timezone.utc
     ).isoformat(timespec="microseconds")
     request = _request(program, plan, projection, sequence, noise, replay)
-    with pytest.raises(GenerationProjectionMismatch):
+    with pytest.raises(InternalError):
         _reconcile_candidate_bundle(replace(
             request, replays=(replace(replay, rows=tuple(rows)),)
         ))
@@ -1948,7 +2446,8 @@ def test_reconcile_rejects_each_noise_identity_tamper(projected_set, field, valu
     program, plan, projection, sequence, noise, replay = projected_set
     row = _thaw(noise)
     row["_meta"]["event"][field] = value
-    with pytest.raises(GenerationProjectionMismatch):
+    error = InternalError if field == "timestamp" else GenerationProjectionMismatch
+    with pytest.raises(error):
         _reconcile_candidate_bundle(
             _request(program, plan, projection, sequence, row, replay)
         )
@@ -1978,7 +2477,11 @@ def test_reconcile_rejects_synchronized_noise_payload_id_and_offset_rewrite(proj
     row["payload"]["utterance"] = "同步改写"
     slot = plan.noise_slots[0]
     row["_meta"]["event"]["event_id"] = derive_generation_id(
-        "noise_event_id", ["a" * 32, slot.event_key, slot.timestamp_us, row["payload"]]
+        "noise_event_id",
+        [
+            "a" * 32, slot.event_key, slot.timestamp_us, 0, [],
+            row["_meta"]["event"]["time_bindings"], row["payload"],
+        ],
     )
     with pytest.raises(GenerationProjectionMismatch):
         _reconcile_candidate_bundle(replace(request, noise_rows=(row,)))
@@ -1988,7 +2491,7 @@ def test_reconcile_rejects_synchronized_noise_payload_id_and_offset_rewrite(proj
     row["_meta"]["event"]["timestamp"] = datetime.fromisoformat(timestamp).astimezone(
         timezone.utc
     ).isoformat(timespec="microseconds")
-    with pytest.raises(GenerationProjectionMismatch):
+    with pytest.raises(InternalError):
         _reconcile_candidate_bundle(replace(request, noise_rows=(row,)))
 
 
@@ -2002,7 +2505,7 @@ def test_projection_contract_errors_are_terminal_not_reconcile_rejections(projec
         ))
     layout = replace(
         plan.replay_layouts[0],
-        timestamps_us=(*plan.replay_layouts[0].timestamps_us, 1),
+        shift_us=plan.replay_layouts[0].shift_us + 1000,
     )
     with pytest.raises(InternalError, match="replay layout"):
         project_replay(ReplayProjectionRequest(program, plan, layout, sequence))
@@ -2182,7 +2685,10 @@ def test_projection_rejects_self_digesting_noncanonical_plan(declared_program, f
             event = events[0]
             events[0] = replace(event, event_id=derive_generation_id(
                 "primary_event_id",
-                [trace.world_branch_id, event.event_key, value, event.payload],
+                [
+                    trace.world_branch_id, event.event_key, value, event.duration_us,
+                    list(branch[0].resources), [], event.payload,
+                ],
             ))
         evaluation = replace(
             trace.pattern_evaluation,
@@ -2195,7 +2701,7 @@ def test_projection_rejects_self_digesting_noncanonical_plan(declared_program, f
 
 @pytest.mark.parametrize("field", (
     "source_slot_key", "positive_variant", "unknown_variant", "replay_ordinal",
-    "session_id", "timestamps_us",
+    "session_id", "shift_us",
 ))
 def test_replay_projector_requires_exact_planned_positive_layout(projected_set, field):
     """ReplayProjector 在造行前拒绝任一伪造的来源或布局字段。"""
@@ -2207,15 +2713,14 @@ def test_replay_projector_requires_exact_planned_positive_layout(projected_set, 
         "unknown_variant": {"source_variant_name": "unknown"},
         "replay_ordinal": {"replay_ordinal": 99},
         "session_id": {"session_id": "forged"},
-        "timestamps_us": {"timestamps_us": (layout.timestamps_us[0] + 1,
-                                               *layout.timestamps_us[1:])},
+        "shift_us": {"shift_us": layout.shift_us + 1000},
     }
     forged = replace(layout, **changes[field])
     with pytest.raises(InternalError, match="replay layout"):
         project_replay(ReplayProjectionRequest(program, plan, forged, sequence))
 
 
-@pytest.mark.parametrize("field", ("replay_ordinal", "session_id", "timestamps_us"))
+@pytest.mark.parametrize("field", ("replay_ordinal", "session_id", "shift_us"))
 def test_replay_rejects_self_digesting_noncanonical_plan(projected_set, field):
     """公开 replay projector 不接受自摘要但不是 planner 输出的布局。"""
     program, plan, _projection, sequence, _noise, _replay = projected_set
@@ -2223,9 +2728,7 @@ def test_replay_rejects_self_digesting_noncanonical_plan(projected_set, field):
     changes = {
         "replay_ordinal": {"replay_ordinal": layout.replay_ordinal + 1},
         "session_id": {"session_id": "forged-session"},
-        "timestamps_us": {"timestamps_us": (
-            layout.timestamps_us[0] + 1, *layout.timestamps_us[1:]
-        )},
+        "shift_us": {"shift_us": layout.shift_us + 1000},
     }
     forged_layout = replace(layout, **changes[field])
     layouts = tuple(

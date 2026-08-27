@@ -6,7 +6,10 @@ import io
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal, Mapping
+from typing import TYPE_CHECKING, Literal, Mapping
+
+if TYPE_CHECKING:
+    from labelkit.common.contracts.generation import SequenceTemporalContext
 
 Status = Literal[
     "active",          # 存活，继续向下流动
@@ -128,16 +131,20 @@ def _serialize_node_line(node: UINode, quantize_px: int) -> str:
     @param quantize_px 坐标量化粒度像素；0 = 不量化
     @return 该节点对应的一行文本（不含换行）
     """
-    l, t, r, b = node.bounds
+    left, top, right, bottom = node.bounds
     if quantize_px > 0:
-        l, t, r, b = (l // quantize_px, t // quantize_px,
-                      r // quantize_px, b // quantize_px)
+        left, top, right, bottom = (
+            left // quantize_px,
+            top // quantize_px,
+            right // quantize_px,
+            bottom // quantize_px,
+        )
     line = ("  " * node.depth) + node.role
     if node.text:
         line += f' "{node.text}"'
     if node.content_desc:
         line += f' desc="{node.content_desc}"'
-    line += f" [{l},{t},{r},{b}]"
+    line += f" [{left},{top},{right},{bottom}]"
     line += "".join(f" {k}={v}" for k, v in node.extra.items() if v)
     return line
 
@@ -188,6 +195,8 @@ class Record:
                                            # pair_index=首成员的 pair_index,
                                            # generated_from=(), generator=None)——完整成员
                                            # 谱系走 _meta.stream.member_sources
+    exact_dedup_text: str | None = None     # v1.20：M2 从 generation stream 内容证明得到的
+                                           # 非时间 payload canonical JSON；None 走普通四级判重
 
 
 @dataclass(frozen=True)
@@ -413,11 +422,15 @@ def _diff_index(tree: "UITree | None", quantize_px: int):
         if not node.visible:
             continue
         count += 1
-        l, t, r, bt = node.bounds
+        left, top, right, bottom = node.bounds
         if quantize_px > 0:
-            l, t, r, bt = (l // quantize_px, t // quantize_px,
-                           r // quantize_px, bt // quantize_px)
-        key = (node.role, (l, t, r, bt), node.depth)
+            left, top, right, bottom = (
+                left // quantize_px,
+                top // quantize_px,
+                right // quantize_px,
+                bottom // quantize_px,
+            )
+        key = (node.role, (left, top, right, bottom), node.depth)
         keyed.setdefault(key, Counter())[(node.text, node.content_desc)] += 1
         if app is None:
             for k in _DIGEST_APP_KEYS:
@@ -523,3 +536,6 @@ class PipelineItem:                        # **唯一**可变信封；生命周�
                                            # 键 = 成员 record.id；值 None = 该成员标注不可修复
                                            # （failed 占键为 None，skipped 不占键——单一真相 =
                                            # dict 形态本身）；克隆按引用共享（同上）
+    temporal_context: SequenceTemporalContext | None = None
+                                           # v1.20：sequence generation M5/M7 唯一冻结时间上下文；
+                                           # 普通 process 信封固定为 None

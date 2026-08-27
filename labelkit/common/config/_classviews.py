@@ -9,7 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from jsonschema.validators import Draft202012Validator
 
@@ -42,6 +42,16 @@ from labelkit.common.config._sections import (
     _parse_examples,
     _parse_styles,
 )
+from labelkit.common.config._temporal import (
+    TemporalSchemaProjection,
+    check_binding_schema,
+    compile_temporal_schema,
+    freeze_json,
+    parse_duration_us,
+    parse_resources,
+    parse_time_bindings,
+    project_temporal_instance,
+)
 from labelkit.common.config.generation import SequenceClassGenerationConfig
 from labelkit.common.config.model import (
     AnnotateConfig,
@@ -54,6 +64,7 @@ from labelkit.common.config.model import (
     GenerateConfig,
     QualityConfig,
     Rubric,
+    TimeBindingSpec,
     VerifyConfig,
 )
 
@@ -67,7 +78,8 @@ from labelkit.common.config.model import (
 # state_schema_path/initial_state_source/initial_state_catalog_path 属于 v1.18 declared 世界面。
 _CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "quality": ("mode", "rounds", "rubric", "threshold", "selection", "top_ratio"),
-    "annotate": ("instruction", "examples", "schema_path", "schema_inline"),
+    "annotate": ("instruction", "examples", "schema_path", "schema_inline",
+                 "time_bindings"),
     "generate": ("instruction", "styles", "num_per_record", "temperature",
                  "state_schema_path", "initial_state_source", "initial_state_catalog_path"),
     "verify": ("extra_criteria",),
@@ -86,7 +98,8 @@ _SELECTION_GROUP = ("selection", "threshold", "top_ratio")
 # 非 sequence 形态出现由约束簇定向报错。
 _FRAME_CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "annotate": ("instruction", "examples", "enabled"),
-    "generate": ("instruction", "schema_path", "schema_inline"),
+    "generate": ("instruction", "schema_path", "schema_inline", "time_bindings",
+                 "duration_s", "resources"),
 }
 _FRAME_CLASS_SECTIONS = tuple(_FRAME_CLASS_SECTION_KEYS)
 
@@ -152,6 +165,26 @@ class _ViewInputs:
     rubric_is_inline: bool   # 全局准则是否来自内联表
     bases: _ClassBases       # 各节全局基线
     dryrun: _GlobalDryRun    # 全局 Schema/回调干跑面(可变)
+
+
+@dataclass(frozen=True)
+class _ClassTemporalRequest:
+    """一个 class annotation 时间编译请求。"""
+
+    name: str                                      # sequence class 名
+    sections: dict | None                         # 当前类原始节
+    merged: _MergedClass                          # 时间投影前的合并视图
+    schema: Mapping[str, object] | None            # 类自有 full Schema；None 回落全局
+
+
+@dataclass(frozen=True)
+class _FrameTemporalRequest:
+    """一个 frame generate 时间编译请求。"""
+
+    file: str                                      # project.toml 定位字符串
+    name: str                                      # frame class 名
+    raw: dict                                      # generate TOML 原始表
+    schema: Mapping[str, object] | None             # 已装载 full generation Schema
 
 
 @dataclass
@@ -588,7 +621,7 @@ def _resolve_class_named_rubric(col: _Collector, cname: str, merged: _MergedClas
 
 
 def _dryrun_class_examples(col: _Collector, cname: str, merged: _MergedClass,
-                           schema_c: dict | None, inputs: _ViewInputs) -> None:
+                           compiled: TemporalSchemaProjection, inputs: _ViewInputs) -> None:
     """few-shot 干跑: 过**类有效 Schema** + 全局 hook。
 
     类自带 Schema 时，继承的全局示例也按类 Schema 复跑一遍。
@@ -596,29 +629,124 @@ def _dryrun_class_examples(col: _Collector, cname: str, merged: _MergedClass,
     @param col 错误聚合器
     @param cname 序列类名
     @param merged 该类的覆盖合并结果
-    @param schema_c 该类的标注 Schema; None = 回落全局
+    @param compiled 该类有效时间 Schema 投影
     @param inputs 全局取值捆包(``dryrun`` 的两个存活标志就地更新)
     """
     dr = inputs.dryrun
-    if not (merged.annotate.examples and (merged.examples_provided or schema_c is not None)):
+    examples = tuple(
+        replace(item, output=project_temporal_instance(item.output, ()))
+        for item in merged.annotate.examples
+    )
+    if not (examples
+            and (merged.examples_provided or compiled.model_schema is not None)):
         return
-    own = schema_c is not None
-    v_arg = (Draft202012Validator(schema_c) if own
-             else (dr.validator if dr.schema_alive else None))
+    own = merged.schema_path is not None or merged.schema_inline is not None
+    model_schema = compiled.model_schema
+    v_arg = Draft202012Validator(model_schema) if model_schema is not None else None
     key_c = (("schema_inline" if merged.schema_inline is not None else "schema_path")
              if own else dr.schema_key)
-    s_ok, h_ok = _dryrun_fewshot(col, merged.annotate.examples, _DryRun(
+    s_ok, h_ok = _dryrun_fewshot(col, examples, _DryRun(
         file=inputs.file, elem_label=f"class.{cname}.annotate.examples",
         validator=v_arg, schema_key=key_c,
         schema_section=f"class.{cname}.annotate" if own else "output",
         schema_noun="per-class annotation schema" if own else "user schema",
-        hook=dr.hook if (dr.hook_alive and dr.schema_ok) else None,
+        hook=(dr.hook if (dr.hook_alive and dr.schema_ok and not compiled.business_time_paths)
+              else None),
         hook_ref=dr.hook_ref))
     if not own:
         # 全局 Schema 的 $ref 解析死了才停后续类的干跑; 类自带 Schema 的失败只属于
         # 该类, 不牵连全局层。
         dr.schema_alive = dr.schema_alive and s_ok
     dr.hook_alive = dr.hook_alive and h_ok
+
+
+def _project_class_examples(merged: _MergedClass,
+                            paths: tuple[str, ...]) -> _MergedClass:
+    """把类 few-shot output 机械投影到 model space 并深冻结。
+
+    @param merged 当前类合并视图
+    @param paths 有效标注 Schema 业务时间 path
+    @return 替换了不可变 model-space examples 的合并视图
+    """
+    examples = tuple(
+        replace(item, output=freeze_json(project_temporal_instance(item.output, paths)))
+        for item in merged.annotate.examples
+    )
+    return replace(merged, annotate=replace(merged.annotate, examples=examples))
+
+
+def _compile_class_temporal(col: _Collector, inputs: _ViewInputs,
+                            request: _ClassTemporalRequest) -> tuple[
+                                _MergedClass,
+                                TemporalSchemaProjection,
+                                tuple[TimeBindingSpec, ...],
+                            ]:
+    """编译一个 sequence class 的有效 full/model Schema 与 binding。
+
+    @param col M1 错误聚合器
+    @param inputs 按类视图全局输入
+    @param request 当前 class 时间请求
+    @return 投影后合并视图、Schema 投影与 time binding
+    """
+    raw = request.sections.get("annotate", {}) if request.sections else {}
+    raw = raw if isinstance(raw, dict) else {}
+    location = f"[class.{request.name}.annotate]"
+    effective = request.schema
+    if effective is None and inputs.dryrun.validator is not None:
+        effective = inputs.dryrun.validator.schema
+    compiled = compile_temporal_schema(col, inputs.file, location, effective)
+    bindings = parse_time_bindings(
+        col, inputs.file, f"{location}.time_bindings", raw.get("time_bindings"), True,
+    )
+    check_binding_schema(col, inputs.file, location, compiled, bindings)
+    if bindings and inputs.bases.generate.form != "sequence":
+        col.error(f"{inputs.file}:{location}.time_bindings: only legal in sequence generation")
+    if bindings and not request.merged.annotate.enabled:
+        col.error(f"{inputs.file}:{location}.time_bindings: annotate must be enabled")
+    merged = _project_class_examples(request.merged, compiled.business_time_paths)
+    return merged, compiled, bindings
+
+
+def _class_view_names(col: _Collector, classify: ClassifyConfig, class_raw: Any,
+                      inputs: _ViewInputs) -> tuple[dict, list[str]]:
+    """按 classify 声明与 sequence registry 声明序组合 class 名。
+
+    @param col M1 错误聚合器
+    @param classify 已解析 classify 配置
+    @param class_raw 原始 class namespace
+    @param inputs 按类视图全局输入
+    @return classify spec 映射与声明序 class 名
+    """
+    specs = {item.name: item for item in classify.classes}
+    names = list(specs)
+    if inputs.bases.generate.form != "sequence" or not isinstance(class_raw, dict):
+        return specs, names
+    for raw_name in class_raw:
+        if not isinstance(raw_name, str) or not _KEY_RE.fullmatch(raw_name):
+            col.error(f"{inputs.file}:[class.{raw_name}]: expected name matching [a-z0-9_]+")
+        elif raw_name not in names:
+            names.append(raw_name)
+    return specs, names
+
+
+def _check_nonsequence_annotation_bindings(col: _Collector, file: str,
+                                           class_raw: Any, form: str) -> None:
+    """拒绝藏在普通工程未物化 class 下的 sequence annotation 时间 binding。
+
+    @param col 错误聚合器
+    @param file project.toml 路径
+    @param class_raw 原始 class namespace
+    @param form 当前 generation form
+    """
+    if form == "sequence" or not isinstance(class_raw, dict):
+        return
+    for name, sections in class_raw.items():
+        annotate = sections.get("annotate") if isinstance(sections, dict) else None
+        if isinstance(annotate, dict) and "time_bindings" in annotate:
+            col.error(
+                f"{file}:[class.{name}.annotate].time_bindings: "
+                "only legal in sequence generation"
+            )
 
 
 def _build_class_views(col: _Collector, classify: ClassifyConfig, class_raw: Any,
@@ -635,15 +763,7 @@ def _build_class_views(col: _Collector, classify: ClassifyConfig, class_raw: Any
     global_key = "[[rubric.criteria]]" if inputs.rubric_is_inline else inputs.selector
     pointwise_checked: set[str] = (
         {global_key} if inputs.bases.quality.mode == "pointwise" else set())
-    specs = {item.name: item for item in classify.classes}
-    names = list(specs)
-    if inputs.bases.generate.form == "sequence" and isinstance(class_raw, dict):
-        for raw_name in class_raw:
-            if not isinstance(raw_name, str) or not _KEY_RE.fullmatch(raw_name):
-                col.error(f"{inputs.file}:[class.{raw_name}]: expected name matching [a-z0-9_]+")
-                continue
-            if raw_name not in names:
-                names.append(raw_name)
+    specs, names = _class_view_names(col, classify, class_raw, inputs)
     for cname in names:
         sections = _class_sections(col, inputs.file, cname, class_raw)
         merged = (_merge_class_sections(col, inputs.file, cname, sections, inputs.bases)
@@ -659,15 +779,20 @@ def _build_class_views(col: _Collector, classify: ClassifyConfig, class_raw: Any
         # 装载该类的标注 Schema；未声明时回落全局 output.schema。
         schema_c = _load_class_schema(col, inputs.file, cname, merged.schema_path,
                                       merged.schema_inline)
-        _dryrun_class_examples(col, cname, merged, schema_c, inputs)
+        request = _ClassTemporalRequest(cname, sections, merged, schema_c)
+        merged, compiled, time_bindings = _compile_class_temporal(col, inputs, request)
+        _dryrun_class_examples(col, cname, merged, compiled, inputs)
         views[cname] = ClassView(name=cname, quality=merged.quality, rubric=rubric_c,
                                  annotate=merged.annotate, generate=merged.generate,
                                  verify=merged.verify, extract=merged.extract,
-                                 schema=schema_c,
+                                 schema=(freeze_json(schema_c) if schema_c is not None else None),
+                                 model_schema=compiled.model_schema,
                                  description=(merged.description
                                               or specs.get(cname).description
                                               if cname in specs else merged.description),
-                                 sequence_generation=merged.sequence_generation)
+                                 sequence_generation=merged.sequence_generation,
+                                 business_time_paths=compiled.business_time_paths,
+                                 time_bindings=time_bindings)
     return views
 
 
@@ -700,7 +825,7 @@ def _check_frame_class_whitelist(col: _Collector, file: str, cname: str,
         allowed = _FRAME_CLASS_SECTION_KEYS[sect]
         for k in sub:
             if k not in allowed:
-                if sect == "generate" and k in {"time_fields", "duration_s", "resources"}:
+                if sect == "generate" and k == "time_fields":
                     col.error(f"{file}:[frame.class.{cname}.generate].{k}: "
                               "generation_config_invalid: deleted sequence key")
                     continue
@@ -730,6 +855,10 @@ def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
     t = _Tbl(col, file, f"[frame.class.{cname}.annotate]", a_over)
     examples_provided = "examples" in a_over
     gen_instruction, gen_schema = _load_frame_gen(col, file, cname, sections)
+    generate_raw = sections.get("generate")
+    generate_raw = generate_raw if isinstance(generate_raw, dict) else {}
+    temporal = _FrameTemporalRequest(file, cname, generate_raw, gen_schema)
+    compiled, time_bindings, duration, resources = _compile_frame_temporal(col, temporal)
     view = FrameClassView(
         instruction=t.get_str("instruction", base.instruction, nonempty=True),
         examples=(_parse_examples(col, file, t.take("examples"),
@@ -739,9 +868,45 @@ def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
         description=(sections.get("description", "")
                      if isinstance(sections.get("description", ""), str) else ""),
         gen_instruction=gen_instruction,
-        gen_schema=gen_schema,
+        gen_schema=compiled.full_schema,
+        model_gen_schema=compiled.model_schema,
+        business_time_paths=compiled.business_time_paths,
+        time_bindings=time_bindings,
+        duration_us=duration,
+        resources=resources,
     )
     return view, examples_provided
+
+
+def _compile_frame_temporal(col: _Collector, request: _FrameTemporalRequest) -> tuple[
+        TemporalSchemaProjection, tuple[TimeBindingSpec, ...], int, tuple[str, ...]]:
+    """编译一个 frame class 的 Schema 投影、binding、duration 与 resource。
+
+    @param col M1 错误聚合器
+    @param request 当前 frame 时间编译请求
+    @return Schema 投影、binding、微秒时长与资源表
+    """
+    location = f"[frame.class.{request.name}.generate]"
+    compiled = compile_temporal_schema(col, request.file, location, request.schema)
+    bindings = parse_time_bindings(
+        col, request.file, f"{location}.time_bindings",
+        request.raw.get("time_bindings"), False,
+    )
+    check_binding_schema(col, request.file, location, compiled, bindings)
+    duration = parse_duration_us(
+        col, request.file, f"{location}.duration_s", request.raw.get("duration_s"),
+    )
+    resources = parse_resources(
+        col, request.file, f"{location}.resources", request.raw.get("resources"),
+    )
+    if resources and duration == 0:
+        col.error(f"{request.file}:{location}.resources: duration_s is required")
+    duration_sources = {
+        "event_end_milliseconds", "event_duration_milliseconds", "event_end_iso8601",
+    }
+    if duration == 0 and any(item.source in duration_sources for item in bindings):
+        col.error(f"{request.file}:{location}.time_bindings: duration_s is required")
+    return compiled, bindings, duration, resources
 
 
 def _build_frame_class_views(col: _Collector,

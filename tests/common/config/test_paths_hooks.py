@@ -203,7 +203,7 @@ def test_all_path_faces_resolve_against_project_root(project_dir, tmp_path):
     assert cfg2.class_views                     # classify.enabled ⇒ 按类视图物化
     booking = cfg2.class_views["booking"]
     assert booking.schema == {"type": "object", "properties": {"topic": {"type": "string"}},
-                              "required": ["topic"]}
+                              "required": ("topic",)}
 
 
 

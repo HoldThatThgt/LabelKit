@@ -38,7 +38,12 @@ from labelkit.common.config.model import (
 )
 from labelkit.common.errors import InputError
 from labelkit.common.contracts.types import ImageRef, Record, UITree
-from labelkit.operators.ingest import Ingestor, Session, _parse_order_key
+from labelkit.operators.ingest import (
+    Ingestor,
+    Session,
+    _generation_timestamp_us,
+    _parse_order_key,
+)
 from labelkit.operators.generation.project import derive_generation_id
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
@@ -140,11 +145,17 @@ def _artifact_timestamp(timestamp_us: int) -> str:
 def _generation_stream_rows() -> list[dict]:
     world_id = "1" * 32
     scenario_id = "2" * 32
-    payloads = ({"text": "request"}, {"text": "confirmation"})
     primary_times = (1_767_585_600_000_000, 1_767_585_660_000_000)
+    payloads = (
+        {"text": "request", "timestamp": primary_times[0] // 1000},
+        {"text": "confirmation", "timestamp": primary_times[1] // 1000},
+    )
     event_keys = ("3" * 32, "4" * 32)
+    bindings = [{"payload_path": "/timestamp", "source": "event_start_milliseconds"}]
     event_ids = [
-        derive_generation_id("primary_event_id", [world_id, key, timestamp, payload])
+        derive_generation_id(
+            "primary_event_id", [world_id, key, timestamp, 0, [], bindings, payload]
+        )
         for key, timestamp, payload in zip(event_keys, primary_times, payloads, strict=True)
     ]
     owner = derive_generation_id("sequence_id", [world_id, event_ids])
@@ -171,6 +182,9 @@ def _generation_stream_rows() -> list[dict]:
             "actor": ("user", "system")[index],
             "logical_time_us": index * 60_000_000,
             "timestamp": _artifact_timestamp(timestamp),
+            "duration_us": 0,
+            "resources": [],
+            "time_bindings": [dict(item) for item in bindings],
         }
         rows.append({"payload": payload, "_meta": {
             "event": event, "generation": dict(generation),
@@ -184,10 +198,13 @@ def _generation_stream_rows() -> list[dict]:
     for source, timestamp in zip(rows[:2], (1_767_589_200_000_000, 1_767_589_260_000_000),
                                  strict=True):
         source_event = source["_meta"]["event"]
+        payload = dict(source["payload"])
+        payload["timestamp"] = timestamp // 1000
         event_id = derive_generation_id(
-            "replay_event_id", [replay_id, source_event["event_id"], timestamp]
+            "replay_event_id", [replay_id, source_event["event_id"], timestamp, 0, payload]
         )
         event = dict(source_event)
+        event["time_bindings"] = [dict(item) for item in source_event["time_bindings"]]
         event.update({
             "event_id": event_id,
             "owner_sequence_id": None,
@@ -206,11 +223,27 @@ def _generation_stream_rows() -> list[dict]:
             "source_variant": "positive",
             "duplicate_of_sequence_id": owner,
         }
-        rows.append({"payload": dict(source["payload"]), "_meta": {
+        rows.append({"payload": payload, "_meta": {
             "event": event, "generation": replay_generation,
             "classification": dict(source["_meta"]["classification"]),
         }})
     return rows
+
+
+def _rederive_replay_event_id(row: dict) -> None:
+    """按已篡改的 replay payload/时间重算 ID，隔离 descriptor 复验。"""
+    event = row["_meta"]["event"]
+    timestamp_us = _generation_timestamp_us(event["timestamp"])
+    event["event_id"] = derive_generation_id(
+        "replay_event_id",
+        [
+            event["replay_sequence_id"],
+            event["duplicate_of_event_id"],
+            timestamp_us,
+            event["duration_us"],
+            row["payload"],
+        ],
+    )
 
 
 def test_generation_stream_envelope_recomputes_primary_and_replay_ids(tmp_path):
@@ -225,8 +258,10 @@ def test_generation_stream_envelope_recomputes_primary_and_replay_ids(tmp_path):
     assert [record.id for record in records] == [
         row["_meta"]["event"]["event_id"] for row in rows
     ]
-    assert records[0].text == '{"text":"request"}'
-    assert records[2].text == records[0].text
+    assert records[0].text == '{"text":"request","timestamp":1767585600000}'
+    assert records[2].text != records[0].text
+    assert records[0].exact_dedup_text == '{"text":"request"}'
+    assert records[2].exact_dedup_text == records[0].exact_dedup_text
     assert records[2].raw == rows[2]
     assert (ingestor.report.scanned, ingestor.report.ingested,
             ingestor.report.bad_input) == (4, 4, 0)
@@ -257,6 +292,17 @@ def test_generation_stream_envelope_recomputes_primary_and_replay_ids(tmp_path):
     "replay_event_missing",
     "replay_meta_extra",
     "synchronized_meta_extra",
+    "primary_payload_time",
+    "replay_payload_time",
+    "duration_quantum",
+    "point_resource",
+    "binding_source",
+    "binding_path",
+    "binding_duplicate",
+    "replay_binding_missing",
+    "replay_binding_extra",
+    "replay_descriptor_mismatch",
+    "replay_shift",
 ])
 def test_generation_stream_envelope_provenance_fails_closed(tmp_path, case):
     rows = _generation_stream_rows()
@@ -307,6 +353,52 @@ def test_generation_stream_envelope_provenance_fails_closed(tmp_path, case):
         replay["_meta"]["unexpected"] = True
     elif case == "synchronized_meta_extra":
         primary["_meta"]["unexpected"] = replay["_meta"]["unexpected"] = True
+    elif case == "primary_payload_time":
+        primary["payload"]["timestamp"] += 1
+    elif case == "replay_payload_time":
+        replay["payload"]["timestamp"] += 1
+    elif case == "duration_quantum":
+        primary["_meta"]["event"]["duration_us"] = 1
+    elif case == "point_resource":
+        primary["_meta"]["event"]["resources"] = ["foreground_app"]
+    elif case == "binding_source":
+        primary["_meta"]["event"]["time_bindings"][0]["source"] = "wall_clock"
+    elif case == "binding_path":
+        primary["_meta"]["event"]["time_bindings"][0]["payload_path"] = ""
+    elif case == "binding_duplicate":
+        primary["_meta"]["event"]["time_bindings"].append(
+            dict(primary["_meta"]["event"]["time_bindings"][0])
+        )
+    elif case == "replay_binding_missing":
+        replay["_meta"]["event"]["time_bindings"] = []
+        replay["payload"].pop("timestamp")
+        _rederive_replay_event_id(replay)
+    elif case == "replay_binding_extra":
+        replay["_meta"]["event"]["time_bindings"].append({
+            "payload_path": "/replayTimestamp",
+            "source": "event_start_milliseconds",
+        })
+        replay["payload"]["replayTimestamp"] = (
+            _generation_timestamp_us(replay["_meta"]["event"]["timestamp"]) // 1000
+        )
+        _rederive_replay_event_id(replay)
+    elif case == "replay_descriptor_mismatch":
+        replay["_meta"]["event"]["duration_us"] = 1000
+    elif case == "replay_shift":
+        changed = rows[3]
+        changed_event = changed["_meta"]["event"]
+        changed_us = _generation_timestamp_us(changed_event["timestamp"]) + 1000
+        changed_event["timestamp"] = _artifact_timestamp(changed_us)
+        changed["payload"]["timestamp"] = changed_us // 1000
+        changed_event["event_id"] = derive_generation_id(
+            "replay_event_id", [
+                changed_event["replay_sequence_id"],
+                changed_event["duplicate_of_event_id"],
+                changed_us,
+                changed_event["duration_us"],
+                changed["payload"],
+            ],
+        )
     else:
         replay["_meta"]["event"]["timestamp"] = "2026-01-05T00:00:00Z"
     cfg = make_cfg(tmp_path, text_field="payload")
@@ -333,6 +425,9 @@ def _generation_noise_row() -> dict:
             "actor": None,
             "logical_time_us": None,
             "timestamp": _artifact_timestamp(1_767_585_600_000_000),
+            "duration_us": 0,
+            "resources": [],
+            "time_bindings": [],
             "noise": True,
         },
         "generation": None,
@@ -436,7 +531,9 @@ def _crossing_primary_rows(world: str, offset: int) -> list[dict]:
                   1_767_585_600_000_000 + offset + 2_000_000)
     keys = (world * 32, chr(ord(world) + 1) * 32)
     ids = [
-        derive_generation_id("primary_event_id", [world * 32, key, stamp, payload])
+        derive_generation_id(
+            "primary_event_id", [world * 32, key, stamp, 0, [], [], payload]
+        )
         for key, stamp, payload in zip(keys, timestamps, payloads, strict=True)
     ]
     owner = derive_generation_id("sequence_id", [world * 32, ids])
@@ -461,6 +558,9 @@ def _crossing_primary_rows(world: str, offset: int) -> list[dict]:
             "actor": "user",
             "logical_time_us": index * 2_000_000,
             "timestamp": _artifact_timestamp(timestamp),
+            "duration_us": 0,
+            "resources": [],
+            "time_bindings": [],
         }
         output.append({"payload": payload, "_meta": {
             "event": event,
@@ -470,6 +570,64 @@ def _crossing_primary_rows(world: str, offset: int) -> list[dict]:
             },
         }})
     return output
+
+
+def _set_primary_intervals(rows: list[dict], duration_us: int, resource: str) -> None:
+    """给一组 primary 写入区间 descriptor 并重算 event/owner identity。"""
+    event_ids = []
+    for row in rows:
+        event = row["_meta"]["event"]
+        event["duration_us"] = duration_us
+        event["resources"] = [resource]
+        world = row["_meta"]["generation"]["world_branch_id"]
+        timestamp = _generation_timestamp_us(event["timestamp"])
+        event["event_id"] = derive_generation_id(
+            "primary_event_id", [
+                world,
+                event["event_key"],
+                timestamp,
+                duration_us,
+                [resource],
+                event["time_bindings"],
+                row["payload"],
+            ],
+        )
+        event_ids.append(event["event_id"])
+    world = rows[0]["_meta"]["generation"]["world_branch_id"]
+    owner = derive_generation_id("sequence_id", [world, event_ids])
+    for row in rows:
+        row["_meta"]["event"]["owner_sequence_id"] = owner
+
+
+def test_generation_resource_half_open_adjacency_is_valid(tmp_path):
+    rows = _crossing_primary_rows("a", 0)
+    _set_primary_intervals(rows, 2_000_000, "foreground_app")
+    cfg = make_cfg(tmp_path, text_field="payload")
+    write_jsonl(tmp_path / "in" / "generated.stream.jsonl", rows)
+
+    assert len(list(Ingestor(cfg).records())) == 2
+
+
+def test_generation_resource_overlap_fails_closed(tmp_path):
+    rows = _crossing_primary_rows("a", 0)
+    _set_primary_intervals(rows, 2_001_000, "foreground_app")
+    cfg = make_cfg(tmp_path, text_field="payload")
+    write_jsonl(tmp_path / "in" / "generated.stream.jsonl", rows)
+
+    with pytest.raises(InputError, match="generation_input_invalid"):
+        list(Ingestor(cfg).records())
+
+
+def test_generation_global_event_start_must_be_unique(tmp_path):
+    rows = _crossing_primary_rows("a", 0)
+    first = rows[0]["_meta"]["event"]["timestamp"]
+    rows[1]["_meta"]["event"]["timestamp"] = first
+    _set_primary_intervals(rows, 1_000, "foreground_app")
+    cfg = make_cfg(tmp_path, text_field="payload")
+    write_jsonl(tmp_path / "in" / "generated.stream.jsonl", rows)
+
+    with pytest.raises(InputError, match="generation_input_invalid"):
+        list(Ingestor(cfg).records())
 
 
 def test_generation_stream_crossing_preserves_each_owner_event_order(tmp_path):

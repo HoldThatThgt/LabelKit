@@ -1,7 +1,6 @@
-"""v1.18 ScenarioSeed、EventPlan 与完整 slot branch 生成。"""
+"""v1.20 ScenarioSeed、EventPlan 与完整 slot branch 生成。"""
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 from collections import OrderedDict
@@ -49,9 +48,14 @@ from labelkit.operators.generation.evaluate import (
 from labelkit.operators.generation.project import (
     canonical_json,
     derive_generation_id,
+    generation_random,
     validate_plan_identity,
 )
-from labelkit.operators.generation.render import render_event
+from labelkit.operators.generation.render import (
+    rebind_temporal_payload,
+    render_event,
+    time_binding_descriptor,
+)
 from labelkit.operators.generation.state import (
     binding_values,
     build_actor_view,
@@ -61,7 +65,6 @@ from labelkit.operators.generation.state import (
     project_instruction_draft,
     resolve_planned_events,
     resolve_role,
-    state_schema_for,
 )
 
 
@@ -378,22 +381,28 @@ async def _render_draft(
         context.program.semantic_profile, context.slot.slot_key, planned, event_plan,
         render.actor_view, execution.publish_snapshot, execution.state_before_hash,
         execution.state_after_hash, values, context.program.frame_classes[event_plan.frame_class],
-        role, _public_facts(context), render.attempt_index, context.program.limits,
+        role, _public_facts(context), render.attempt_index,
+        context.program.timeline.utc_offset_minutes, context.program.limits,
     )
     payload = await render_event(request, render.services)
+    frame = context.program.frame_classes[event_plan.frame_class]
     event_id = derive_generation_id(
-        "primary_event_id", [render.world_id, planned.event_key, planned.timestamp_us, payload]
+        "primary_event_id", [
+            render.world_id, planned.event_key, planned.timestamp_us, planned.duration_us,
+            planned.resources, time_binding_descriptor(frame), payload,
+        ],
     )
     return EventDraft(
         planned.event_key, event_id, event_plan.frame_class, event_plan.actor,
-        planned.logical_time_us, planned.timestamp_us, render.actor_view, event_plan.intent,
+        planned.logical_time_us, planned.timestamp_us, planned.duration_us,
+        render.actor_view, event_plan.intent,
         execution.normalized_patch, execution.state_before_hash, execution.state_after_hash,
         execution.publish_snapshot, payload,
     )
 
 
 def _reuse_draft(context, planned, baseline, world_id: str):
-    """重执行 protected patch，仅重派生 branch ID 与工件时间。"""
+    """重执行 protected patch，并把 payload 重绑到当前 branch 时间。"""
     event_plan = EventPlan(baseline.frame_class, baseline.actor, baseline.intent, baseline.patch)
     execution = execute_event(context, event_plan)
     if (
@@ -404,14 +413,22 @@ def _reuse_draft(context, planned, baseline, world_id: str):
         or planned.logical_time_us != baseline.logical_time_us
     ):
         raise GenerationAttemptRejected("coupling_evaluation", context.slot.slot_key)
+    frame = context.program.frame_classes[baseline.frame_class]
+    payload = rebind_temporal_payload(
+        baseline.payload, frame, planned, context.program.timeline.utc_offset_minutes,
+    )
     event_id = derive_generation_id(
-        "primary_event_id", [world_id, planned.event_key, planned.timestamp_us, baseline.payload]
+        "primary_event_id", [
+            world_id, planned.event_key, planned.timestamp_us, planned.duration_us,
+            planned.resources, time_binding_descriptor(frame), payload,
+        ],
     )
     draft = EventDraft(
         planned.event_key, event_id, baseline.frame_class, baseline.actor,
-        baseline.logical_time_us, planned.timestamp_us, baseline.actor_view, baseline.intent,
+        baseline.logical_time_us, planned.timestamp_us, planned.duration_us,
+        baseline.actor_view, baseline.intent,
         baseline.patch, baseline.state_before_hash, baseline.state_after_hash,
-        baseline.publish_snapshot, baseline.payload,
+        baseline.publish_snapshot, payload,
     )
     return draft, execution
 
@@ -435,7 +452,9 @@ async def _evaluate_trace(
     if not _state_passes(state_evaluation):
         raise GenerationAttemptRejected("state_evaluation", run.slot.slot_key)
     if variant is not None and not evaluate_coupling(
-        CouplingEvaluationRequest(variant, baseline_truths, truths)
+        CouplingEvaluationRequest(
+            variant, baseline_truths, truths, run.program.frame_classes,
+        )
     ):
         raise GenerationAttemptRejected("coupling_evaluation", run.slot.slot_key)
     semantic = await evaluate_semantics(
@@ -456,7 +475,9 @@ def _bind_truths(pattern, drafts):
         truths = tuple(_truth(draft, f"position_{index:03d}")
                        for index, draft in enumerate(drafts))
         return None, truths
-    observed = tuple(ObservedEvent(item.event_id, item.frame_class, item.timestamp_us) for item in drafts)
+    observed = tuple(ObservedEvent(
+        item.event_id, item.frame_class, item.timestamp_us, item.duration_us,
+    ) for item in drafts)
     evaluation = evaluate_pattern(pattern, observed)
     if set(evaluation.actual_bindings) != {item.event_id for item in drafts}:
         raise GenerationAttemptRejected("pattern_evaluation", pattern.name)
@@ -479,7 +500,8 @@ def _truth(draft: EventDraft, role: str) -> EventTruth:
     """仅在独立 binding 后为 draft 增加 role。"""
     return EventTruth(
         draft.event_key, draft.event_id, role, draft.frame_class, draft.actor,
-        draft.logical_time_us, draft.timestamp_us, draft.actor_view, draft.intent,
+        draft.logical_time_us, draft.timestamp_us, draft.duration_us,
+        draft.actor_view, draft.intent,
         draft.patch, draft.state_before_hash, draft.state_after_hash,
         draft.publish_snapshot, draft.payload,
     )
@@ -488,7 +510,7 @@ def _truth(draft: EventDraft, role: str) -> EventTruth:
 def _semantic_request(run: _SlotRun, drafts, final_state):
     """直接从 EventDraft 构造不含结构 verdict 的盲审请求。"""
     reviews = tuple(SemanticReviewEvent(
-        item.frame_class, item.actor, item.logical_time_us,
+        item.frame_class, item.actor, item.logical_time_us, item.duration_us,
         item.actor_view.wait_since_previous_us, item.actor_view, item.intent, item.patch,
         item.state_before_hash, item.state_after_hash, item.publish_snapshot, item.payload,
     ) for item in drafts)
@@ -756,10 +778,7 @@ def _world_branch_id(program, slot, variant_name) -> str:
 
 def _attempt_random(seed: int, slot_identity: str, attempt: int, purpose: str) -> int:
     """按冻结 domain framing 派生完整尝试随机整数。"""
-    material = canonical_json([
-        "labelkit:v1.18", "attempt_random", [seed, slot_identity, attempt, purpose],
-    ])
-    return int.from_bytes(hashlib.sha256(material.encode("utf-8")).digest(), "big")
+    return generation_random("attempt_random", [seed, slot_identity, attempt, purpose])
 
 
 def _variation_nonce(run: _SlotRun, branch, index: int) -> str:

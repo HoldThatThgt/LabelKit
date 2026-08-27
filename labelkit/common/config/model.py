@@ -426,6 +426,22 @@ class Rubric:
 
 
 @dataclass(frozen=True)
+class TimeBindingSpec:
+    """一个由 Planner 权威时间机械写入 JSON Pointer 的声明。"""
+
+    payload_path: str                             # 目标对象内 RFC 6901 path
+    source: Literal[
+        "event_start_milliseconds",
+        "event_end_milliseconds",
+        "event_duration_milliseconds",
+        "event_start_iso8601",
+        "event_end_iso8601",
+        "first_resource_start_milliseconds",
+    ]                                             # 权威时间取值方式
+    resource: str | None = None                   # annotation source 使用的资源名
+
+
+@dataclass(frozen=True)
 class ClassView:
     """v1.7：一个类的生效配置——全局各节与其 [class.<name>.*] 覆盖的合并产物
     （逐键溯源；R6 选择组语义；R7 rubric 重解析）。由 M1 在装载期冻结；
@@ -442,9 +458,12 @@ class ClassView:
                                                   # segment 没有按类视图（它跑在 classify 之前
                                                   # ——那时标签还不存在）
     schema: Mapping | None = None                 # 按类标注 Schema；None 回落全局
+    model_schema: Mapping | None = None           # 剥离业务时间叶子的有效标注 Schema
     description: str = ""                         # v1.18 sequence class 描述
     sequence_generation: SequenceClassGenerationConfig | None = None
                                                   # declared 类的世界生成配置
+    business_time_paths: tuple[str, ...] = ()     # 标注 Schema 中的业务时间 instance path
+    time_bindings: tuple[TimeBindingSpec, ...] = ()  # sequence annotation 机械时间声明
 
 
 # ── 帧粒度（v1.12，spec §3.1 [frame.classify]/[frame.annotate]/[frame.class.*]）──
@@ -505,6 +524,11 @@ class FrameClassView:
     description: str = ""                         # v1.18 帧注册表描述
     gen_instruction: str | None = None            # 完整帧渲染指令
     gen_schema: Mapping | None = None             # 对象根 payload Schema
+    model_gen_schema: Mapping | None = None       # 剥离业务时间叶子的模型 Schema
+    business_time_paths: tuple[str, ...] = ()     # payload Schema 中的业务时间 instance path
+    time_bindings: tuple[TimeBindingSpec, ...] = ()  # Planner 到 payload 的机械时间声明
+    duration_us: int = 0                          # 固定正区间时长；零表示点事件
+    resources: tuple[str, ...] = ()               # 区间占用的互斥资源
 
 
 # ── CLI 覆盖项与总聚合 ──────────────────────────────────────────────────────

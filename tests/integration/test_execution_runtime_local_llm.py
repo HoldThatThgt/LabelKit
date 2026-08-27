@@ -86,7 +86,7 @@ async def _run_with_metrics(config_path: Path, project_path: Path) -> tuple[int,
 
 def _delivery_digest(main: list[dict], stream: list[dict]) -> str:
     """按正式 framing 独立重算交付摘要。"""
-    digest = hashlib.sha256(b"labelkit:v1.18:delivery\n")
+    digest = hashlib.sha256(b"labelkit:v1.20:delivery\n")
     for row in (*main, *stream):
         payload = canonical_delivery_row(row)
         digest.update(str(len(payload)).encode("ascii"))

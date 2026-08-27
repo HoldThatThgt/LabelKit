@@ -5,22 +5,26 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from jsonschema import Draft202012Validator
 
 from labelkit.common.config.generation import PayloadBindingSpec
+from labelkit.common.config.model import TimeBindingSpec
 from labelkit.common.contracts.generation import (
     ActorView,
     EventPlan,
     GenerationServices,
+    NoiseRenderRequest,
     RenderEventRequest,
 )
-from labelkit.common.errors import ContextOverflowError, InternalError
+from labelkit.common.errors import ContextOverflowError, InternalError, SchemaViolation
+from labelkit.common.inference.schema_engine import CandidateFinalizerContractError
 from labelkit.operators.generation import GenerationAttemptRejected
 from labelkit.operators.generation.planner import compile_scenario_plan
 from labelkit.operators.generation.project import canonical_json
-from labelkit.operators.generation.render import render_event
+from labelkit.operators.generation.render import render_event, render_noise
 
 
 class _Metrics:
@@ -40,11 +44,26 @@ class _SchemaEngine:
         self.payload = payload
         self.calls = 0
         self.prompt = None
+        self.request = None
 
-    async def complete_validated(self, *_args, **_kwargs):
+    async def complete_finalized(self, request):
+        """按 model L2、finalizer、full L2 顺序执行离线伪引擎。"""
         self.calls += 1
-        self.prompt = _args[1]
-        return (self.payload,)
+        self.prompt = request.prompt
+        self.request = request
+        model_schema = json.loads(canonical_json(request.model_schema))
+        errors = tuple(Draft202012Validator(model_schema).iter_errors(self.payload))
+        if errors:
+            raise SchemaViolation([error.message for error in errors], "")
+        try:
+            value = request.candidate_finalizer(self.payload)
+        except Exception:
+            raise CandidateFinalizerContractError() from None
+        final_schema = json.loads(canonical_json(request.final_schema))
+        errors = tuple(Draft202012Validator(final_schema).iter_errors(value))
+        if errors:
+            raise CandidateFinalizerContractError()
+        return value, None, 1, "model"
 
     def validate_only(self, value, *, schema):
         return [error.message for error in Draft202012Validator(schema).iter_errors(value)]
@@ -88,12 +107,13 @@ def _request(program, plan, role_name: str, values, frame=None, role=None):
     frame_spec = frame or program.frame_classes[selected.frame_class]
     return RenderEventRequest(
         program.semantic_profile, slot.slot_key, planned, event_plan, actor_view,
-        {}, "before", "after", values, frame_spec, selected, {}, 0, program.limits,
+        {}, "before", "after", values, frame_spec, selected, {}, 0,
+        program.timeline.utc_offset_minutes, program.limits,
     )
 
 
-def test_binding_overwrites_conflicting_llm_values_and_revalidates(declared_config,
-                                                                    declared_program):
+def test_state_binding_mismatch_is_recoverable_without_overwrite(declared_config,
+                                                                  declared_program):
     plan = compile_scenario_plan(declared_program)
     values = {"/request_id": "R-100", "/status": "pending"}
     request = _request(declared_program, plan, "request", values)
@@ -101,8 +121,9 @@ def test_binding_overwrites_conflicting_llm_values_and_revalidates(declared_conf
         declared_config,
         {"utterance": "请订票", "request_id": "WRONG", "status": "pending"},
     )
-    payload = asyncio.run(render_event(request, services))
-    assert payload == {"utterance": "请订票", "request_id": "R-100", "status": "pending"}
+    with pytest.raises(GenerationAttemptRejected) as caught:
+        asyncio.run(render_event(request, services))
+    assert caught.value.kind == "frame_schema"
     assert engine.calls == 1
     system = "".join(part.text or "" for part in engine.prompt.messages[0].parts)
     assert "不得照抄状态枚举、内部指标或实现术语" in system
@@ -181,7 +202,11 @@ def test_binding_missing_parent_is_recoverable_frame_rejection(declared_config,
         },
         "required": ["utterance", "nested"],
     }
-    frame = replace(declared_program.frame_classes["task_request"], gen_schema=schema)
+    frame = replace(
+        declared_program.frame_classes["task_request"],
+        gen_schema=schema,
+        model_gen_schema=schema,
+    )
     request = _request(
         declared_program, plan, "request", {"/nested/request_id": "R-100"}, frame, role,
     )
@@ -197,8 +222,9 @@ def test_full_confirmation_combination_schema_runs_after_binding(declared_config
     values = {"/request_id": "R-100", "/ticket_id": "T-100", "/status": "ticketed"}
     request = _request(declared_program, plan, "confirm", values)
     services, _engine, _metrics = _services(declared_config, {
-        "utterance": "出票完成", "request_id": "R-100", "ticket_id": None,
-        "status": "blocked",
+        "utterance": "请求 R-100 已出票，票号为 T-100。",
+        "request_id": "R-100", "ticket_id": "T-100",
+        "status": "ticketed",
     })
     payload = asyncio.run(render_event(request, services))
     assert payload["status"] == "ticketed" and payload["ticket_id"] == "T-100"
@@ -236,7 +262,11 @@ def test_ancestor_binding_conflict_fails_mechanical_overwrite(declared_config,
         },
         "required": ["utterance", "nested"],
     }
-    frame = replace(declared_program.frame_classes["task_request"], gen_schema=schema)
+    frame = replace(
+        declared_program.frame_classes["task_request"],
+        gen_schema=schema,
+        model_gen_schema=schema,
+    )
     request = _request(
         declared_program,
         plan,
@@ -259,7 +289,7 @@ def test_rendered_payload_byte_limit_accepts_exact_boundary(declared_config,
     plan = compile_scenario_plan(declared_program)
     values = {"/request_id": "R-100", "/status": "pending"}
     request = _request(declared_program, plan, "request", values)
-    raw = {"utterance": "请订票", "request_id": "WRONG", "status": "pending"}
+    raw = {"utterance": "请订票", "request_id": "R-100", "status": "pending"}
     final = {"utterance": "请订票", "request_id": "R-100", "status": "pending"}
     size = len(canonical_json(final).encode("utf-8"))
     exact_limits = replace(request.limits, rendered_payload_bytes=size)
@@ -278,7 +308,7 @@ def test_render_uses_program_bound_request_limits_not_service_config(declared_co
     plan = compile_scenario_plan(declared_program)
     values = {"/request_id": "R-100", "/status": "pending"}
     request = _request(declared_program, plan, "request", values)
-    raw = {"utterance": "请订票", "request_id": "WRONG", "status": "pending"}
+    raw = {"utterance": "请订票", "request_id": "R-100", "status": "pending"}
     poisoned_limits = replace(request.limits, rendered_payload_bytes=1)
     poisoned_sequence = replace(
         declared_config.sequence_generation, limits=poisoned_limits
@@ -319,3 +349,164 @@ def test_missing_schema_and_binding_key_mismatch_are_zero_llm_internal_errors(
     with pytest.raises(InternalError, match="binding keys"):
         asyncio.run(render_event(mismatched, services))
     assert engine.calls == 0 and metrics.counters == {}
+
+
+_TIME_PROPERTIES = {
+    "startMs": {"type": "integer", "x-labelkit-business-time": True},
+    "endMs": {"type": "integer", "x-labelkit-business-time": True},
+    "durationMs": {"type": "integer", "x-labelkit-business-time": True},
+    "startIso": {"type": "string", "x-labelkit-business-time": True},
+    "endIso": {"type": "string", "x-labelkit-business-time": True},
+}
+
+
+def _temporal_frame_schema(*, point=False):
+    names = ("startMs", "startIso") if point else tuple(_TIME_PROPERTIES)
+    full = {
+        "type": "object",
+        "properties": {
+            "utterance": {"type": "string"},
+            "request_id": {"type": "string"},
+            "status": {"type": "string"},
+            "temporal": {
+                "type": "object",
+                "properties": {name: _TIME_PROPERTIES[name] for name in names},
+                "required": list(names),
+                "additionalProperties": False,
+            },
+        },
+        "required": ["utterance", "request_id", "status", "temporal"],
+        "additionalProperties": False,
+    }
+    model = json.loads(json.dumps(full))
+    model["properties"]["temporal"]["properties"] = {}
+    model["properties"]["temporal"]["required"] = []
+    return full, model
+
+
+def _temporal_frame(frame, *, point=False):
+    full, model = _temporal_frame_schema(point=point)
+    sources = (
+        ("/temporal/startMs", "event_start_milliseconds"),
+        ("/temporal/startIso", "event_start_iso8601"),
+    ) if point else (
+        ("/temporal/startMs", "event_start_milliseconds"),
+        ("/temporal/endMs", "event_end_milliseconds"),
+        ("/temporal/durationMs", "event_duration_milliseconds"),
+        ("/temporal/startIso", "event_start_iso8601"),
+        ("/temporal/endIso", "event_end_iso8601"),
+    )
+    return replace(
+        frame,
+        gen_schema=full,
+        model_gen_schema=model,
+        business_time_paths=tuple(path for path, _source in sources),
+        time_bindings=tuple(TimeBindingSpec(path, source) for path, source in sources),
+        duration_us=0 if point else 2_000_000,
+        resources=() if point else ("foreground_app",),
+    )
+
+
+def _temporal_payload():
+    return {
+        "utterance": "请订票",
+        "request_id": "R-100",
+        "status": "pending",
+        "temporal": {},
+    }
+
+
+def _expected_iso(epoch_us, offset_minutes):
+    instant = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=epoch_us)
+    fixed = timezone(timedelta(minutes=offset_minutes))
+    return instant.astimezone(fixed).isoformat(timespec="microseconds")
+
+
+@pytest.mark.parametrize("instruction_only", (False, True))
+def test_primary_and_instruction_only_time_bindings_are_mechanical(
+    declared_config, declared_program, instruction_only,
+):
+    plan = compile_scenario_plan(declared_program)
+    values = {"/request_id": "R-100", "/status": "pending"}
+    request = _request(declared_program, plan, "request", values)
+    frame = _temporal_frame(request.frame_spec)
+    event = replace(
+        request.planned_event,
+        duration_us=frame.duration_us,
+        resources=frame.resources,
+    )
+    request = replace(request, frame_spec=frame, planned_event=event)
+    if instruction_only:
+        request = replace(request, role=None, binding_values={})
+    services, engine, _metrics = _services(declared_config, _temporal_payload())
+
+    payload = asyncio.run(render_event(request, services))
+
+    start, end = event.timestamp_us, event.timestamp_us + event.duration_us
+    assert payload["temporal"] == {
+        "startMs": start // 1000,
+        "endMs": end // 1000,
+        "durationMs": event.duration_us // 1000,
+        "startIso": _expected_iso(start, request.utc_offset_minutes),
+        "endIso": _expected_iso(end, request.utc_offset_minutes),
+    }
+    assert engine.request.model_schema["properties"]["temporal"]["properties"] == {}
+    assert set(engine.request.final_schema["properties"]["temporal"]["properties"]) == set(_TIME_PROPERTIES)
+    assert engine.request.repair_projector(payload) == {
+        "utterance": "请订票",
+        "request_id": "R-100",
+        "status": "pending",
+        "temporal": {},
+    }
+
+
+def test_model_emitted_time_field_is_recoverable_schema_rejection(
+    declared_config, declared_program,
+):
+    plan = compile_scenario_plan(declared_program)
+    request = _request(
+        declared_program, plan, "request", {"/request_id": "R-100", "/status": "pending"},
+    )
+    frame = _temporal_frame(request.frame_spec)
+    request = replace(
+        request,
+        frame_spec=frame,
+        planned_event=replace(
+            request.planned_event, duration_us=frame.duration_us, resources=frame.resources,
+        ),
+    )
+    raw = _temporal_payload()
+    raw["temporal"] = {"startMs": 1}
+    services, engine, _metrics = _services(declared_config, raw)
+
+    with pytest.raises(GenerationAttemptRejected) as caught:
+        asyncio.run(render_event(request, services))
+    assert caught.value.kind == "frame_schema" and engine.calls == 1
+
+
+def test_noise_start_bindings_are_mechanical(declared_config, declared_program):
+    plan = compile_scenario_plan(declared_program)
+    slot = plan.noise_slots[0]
+    frame = _temporal_frame(declared_program.frame_classes[slot.frame_class], point=True)
+    descriptions = {name: view.description for name, view in declared_program.class_views.items()}
+    frames = {name: view.description for name, view in declared_program.frame_classes.items()}
+    request = NoiseRenderRequest(
+        declared_program.semantic_profile,
+        slot,
+        declared_program.noise,
+        frame,
+        descriptions,
+        frames,
+        0,
+        declared_program.timeline.utc_offset_minutes,
+        declared_program.limits,
+    )
+    services, engine, _metrics = _services(declared_config, _temporal_payload())
+
+    payload = asyncio.run(render_noise(request, services))
+
+    assert payload["temporal"] == {
+        "startMs": slot.timestamp_us // 1000,
+        "startIso": _expected_iso(slot.timestamp_us, request.utc_offset_minutes),
+    }
+    assert engine.request.model_schema["properties"]["temporal"]["properties"] == {}

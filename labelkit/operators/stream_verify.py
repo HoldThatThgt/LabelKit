@@ -1116,7 +1116,7 @@ class StreamVerifyDriver:
         """
         from labelkit.operators.annotate import (AnnotatePromptOptions,
                                                  build_annotate_prompt,
-                                                 class_effective_schema,
+                                                 class_effective_model_schema,
                                                  class_schema_text)
 
         item = trial.item
@@ -1125,11 +1125,12 @@ class StreamVerifyDriver:
             AnnotatePromptOptions(
                 repair=trial.repair, label=trial.label,
                 transitions=item.transitions, fragment_lens=trial.fragment_lens,
-                k_eff=trial.k_eff, image_px=trial.image_px))
+                k_eff=trial.k_eff, image_px=trial.image_px,
+                temporal_context=item.temporal_context))
         cost_up = max(ctx.llm.calibrator.cost(prof.name),
                       math.ceil(budget.est_image_prior(prof, trial.image_px)
                                 * budget.PRIOR_INFLATION))
-        schema_eff = (dict(class_effective_schema(ctx.cfg, trial.label))
+        schema_eff = (dict(class_effective_model_schema(ctx.cfg, trial.label))
                       if prof.supports_structured_output else None)
         est = budget.est_prompt(prompt, prof, schema_eff, image_cost=cost_up)
         return est <= budget.input_budget(prof)
@@ -1189,7 +1190,8 @@ class StreamVerifyDriver:
                          if fragments else None)
         opts = AnnotatePromptOptions(repair=repair, label=state.label,
                                      transitions=state.item.transitions,
-                                     fragment_lens=fragment_lens)
+                                     fragment_lens=fragment_lens,
+                                     temporal_context=state.item.temporal_context)
         return await annotate_record_leaf(
             state.item.record, ctx, self._repair_ladder(state.item, ctx, opts),
         )

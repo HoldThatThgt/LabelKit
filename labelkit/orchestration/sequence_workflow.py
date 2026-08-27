@@ -1,8 +1,7 @@
-"""v1.19 sequence 有界并发准备与声明序精确交付控制器。"""
+"""v1.20 sequence 有界并发准备与声明序精确交付控制器。"""
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import random
 import time
@@ -33,6 +32,8 @@ from labelkit.common.contracts.generation import (
     ReplayProjectionRequest,
     SequenceAssemblyRequest,
     SequenceRows,
+    SequenceTemporalContext,
+    SequenceTemporalMember,
 )
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import Classification, DedupInfo, PipelineItem
@@ -51,7 +52,12 @@ from labelkit.common.errors import (
 from labelkit.operators.dedup import DedupGroupRejected
 from labelkit.operators.generation import GenerationAttemptRejected
 from labelkit.operators.generation.flat import SimilarityFilter
-from labelkit.operators.generation.project import canonical_delivery_row, canonical_json
+from labelkit.operators.generation.project import (
+    canonical_delivery_row,
+    canonical_json,
+    generation_digest,
+    generation_random,
+)
 
 if TYPE_CHECKING:
     from labelkit.common.contracts.generation import (
@@ -389,7 +395,10 @@ def _sequence_estimate_block(program, plan, calls, sequence_calls) -> dict:
     primary_sequences = sum(len(slot.variant_names) if slot.variant_names else 1
                             for slot in plan.delivery_slots)
     primary_events = _sequence_primary_events(plan)
-    replay_events = sum(len(layout.timestamps_us) for layout in plan.replay_layouts)
+    replay_events = sum(
+        len(_plan_events(plan, layout.source_slot_key, layout.source_variant_name))
+        for layout in plan.replay_layouts
+    )
     lower = sum(calls.values())
     return {
         "mode": program.mode,
@@ -452,7 +461,7 @@ class _DeliveryController:
         from labelkit.operators.generation.project import CrossViewFrontier, validate_plan_identity
 
         validate_plan_identity(self.request.program, self.request.plan)
-        self._frontier = CrossViewFrontier(self.request.plan)
+        self._frontier = CrossViewFrontier(self.request.program, self.request.plan)
         try:
             await self._deliver_slot_phases()
             self._clear_failure_ledger()
@@ -1051,7 +1060,25 @@ class _DeliveryController:
             classification=classification,
             session_id=self._planned_session_id(slot, variant_name),
             member_classifications=member_classes,
+            temporal_context=self._temporal_context(slot, variant_name, projection),
         )
+
+    def _temporal_context(self, slot, variant_name, projection) -> SequenceTemporalContext:
+        """从计划与最终 projected event ID 构造冻结 annotation 时间上下文。"""
+        planned = _plan_events(self.request.plan, slot.slot_key, variant_name)
+        rows = projection.primary_stream_rows
+        if len(planned) != len(rows):
+            _delivery_contract_error("generation_downstream_contract: temporal member mismatch")
+        members = tuple(
+            SequenceTemporalMember(
+                row["_meta"]["event"]["event_id"],
+                event.timestamp_us,
+                event.duration_us,
+                event.resources,
+            )
+            for row, event in zip(rows, planned, strict=True)
+        )
+        return SequenceTemporalContext(members)
 
     def _planned_session_id(self, slot, variant_name: str | None) -> str:
         """从唯一冻结 plan branch 取得信封 session 身份。"""
@@ -1212,7 +1239,7 @@ class _DeliveryController:
         return NoiseRenderRequest(
             self.request.program.semantic_profile, slot, spec, frame,
             self._class_descriptions(), self._frame_descriptions(), attempt_index,
-            self.request.program.limits,
+            self.request.program.timeline.utc_offset_minutes, self.request.program.limits,
         )
 
     def _noise_evaluation_request(self, payload, slot, attempt_index) -> NoiseEvaluationRequest:
@@ -1241,11 +1268,8 @@ class _DeliveryController:
 
     def _attempt_seed(self, slot_identity: str, attempt_index: int, purpose: str) -> int:
         """按冻结 canonical 材料派生完整整数随机种子。"""
-        material = canonical_json([
-            "labelkit:v1.19", "attempt_random",
-            [self.request.program.planner_seed, slot_identity, attempt_index, purpose],
-        ])
-        return int.from_bytes(hashlib.sha256(material.encode("utf-8")).digest(), "big")
+        material = [self.request.program.planner_seed, slot_identity, attempt_index, purpose]
+        return generation_random("attempt_random", material)
 
     def _success_report(self, stream_rows) -> dict:
         """组装成功 report 与同形状 runtime block。"""
@@ -1604,8 +1628,7 @@ def _prepared_digest(domain: str, candidate) -> str:
         for item in fields(candidate)
         if item.name != "digest"
     }
-    encoded = canonical_json(["labelkit:v1.19", f"prepared_{domain}", material])
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+    return generation_digest(f"prepared_{domain}", material)
 
 
 def _canonical_value(value: object) -> object:

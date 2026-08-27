@@ -9,7 +9,7 @@ from types import MappingProxyType
 
 import pytest
 
-from labelkit.common.config.model import FewShotExample
+from labelkit.common.config.model import FewShotExample, TimeBindingSpec
 from labelkit.common.errors import ConfigError
 from labelkit.operators.generation.planner import compile_scenario_plan
 from labelkit.operators.generation.program import (
@@ -19,6 +19,17 @@ from labelkit.operators.generation.program import (
 
 
 _RSS_LIMIT_BYTES = 4 * 1024**3
+
+
+def _thaw(value):
+    """把配置层冻结 JSON 复制为测试可变树。"""
+    if isinstance(value, MappingProxyType):
+        return {key: _thaw(item) for key, item in value.items()}
+    if hasattr(value, "items"):
+        return {key: _thaw(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw(item) for item in value]
+    return value
 
 
 def _peak_rss_bytes() -> int:
@@ -114,16 +125,21 @@ def test_program_digest_is_deterministic_and_covers_frozen_semantics(declared_co
 
 
 def test_program_copies_and_deep_freezes_class_and_frame_views(declared_config):
-    class_schema = declared_config.class_views["ticket_booking"].schema
-    frame_schema = declared_config.frame_class_views["task_request"].gen_schema
+    class_schema = _thaw(declared_config.class_views["ticket_booking"].schema)
+    frame_schema = _thaw(declared_config.frame_class_views["task_request"].gen_schema)
     example_output = {"nested": {"values": ["original"]}}
+    class_views = dict(declared_config.class_views)
+    class_views["ticket_booking"] = replace(
+        class_views["ticket_booking"], schema=class_schema,
+    )
     frame_views = dict(declared_config.frame_class_views)
     frame_views["task_request"] = replace(
         frame_views["task_request"],
+        gen_schema=frame_schema,
         examples=(FewShotExample("example", example_output),),
     )
     program = compile_generation_program(
-        replace(declared_config, frame_class_views=frame_views)
+        replace(declared_config, class_views=class_views, frame_class_views=frame_views)
     )
     digest = program.digest
 
@@ -181,6 +197,56 @@ def test_program_materializes_global_user_schema_and_freezes_frame_schema(declar
         user_schema={"type": "object", "properties": {"other": {}}},
     )
     assert compile_generation_program(changed).digest != original_digest
+
+
+def test_program_freezes_temporal_frame_and_model_schema_carriers(declared_config):
+    full_schema = {
+        "type": "object",
+        "properties": {
+            "timestamp": {"type": "integer", "x-labelkit-business-time": True},
+            "text": {"type": "string"},
+        },
+        "required": ["timestamp", "text"],
+        "additionalProperties": False,
+    }
+    model_schema = {
+        "type": "object",
+        "properties": {"text": {"type": "string"}},
+        "required": ["text"],
+        "additionalProperties": False,
+    }
+    frames = dict(declared_config.frame_class_views)
+    frames["task_request"] = replace(
+        frames["task_request"],
+        gen_schema=full_schema,
+        model_gen_schema=model_schema,
+        business_time_paths=("/timestamp",),
+        time_bindings=(TimeBindingSpec(
+            "/timestamp", "event_start_milliseconds", None,
+        ),),
+        duration_us=10_000_000,
+        resources=("foreground_app",),
+    )
+
+    program = compile_generation_program(
+        replace(declared_config, frame_class_views=frames)
+    )
+    frozen = program.frame_classes["task_request"]
+    digest = program.digest
+
+    full_schema["properties"]["text"]["maxLength"] = 1
+    model_schema["properties"]["text"]["maxLength"] = 1
+    assert "maxLength" not in frozen.gen_schema["properties"]["text"]
+    assert "maxLength" not in frozen.model_gen_schema["properties"]["text"]
+    assert frozen.business_time_paths == ("/timestamp",)
+    assert frozen.duration_us == 10_000_000
+    assert frozen.resources == ("foreground_app",)
+    assert generation_program_digest(program) == digest
+
+    changed_frames = dict(program.frame_classes)
+    changed_frames["task_request"] = replace(frozen, duration_us=11_000_000)
+    changed = replace(program, frame_classes=changed_frames, digest="")
+    assert generation_program_digest(changed) != digest
 
 
 def test_program_rejects_record_unit_limit_at_compile_boundary(declared_config):

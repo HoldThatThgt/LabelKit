@@ -30,7 +30,7 @@
 | stream 模式 | `segment.enabled = true` 的运行形态（v1.8）：摄取按 `[stream]` 声明排序与会话化，链序为 segment → stitch → dedup → classify → extract → quality → annotate → verify（stitch 为 v1.9 增位，默认关）；默认关闭，关闭时数据产出与 v1.7 逐字段一致（`_meta.stream: null` 除外）（2.3.1、3.10.3）。 |
 | 线索（Thread） | v1.9 stream 模式的顶层工作单元：M16 把同一目标导向任务被穿插切开的碎片保守缝合所得（三级结构 thread ⊃ fragment ⊃ step），承载体仍是一条 `kind = "sequence"` 的序列记录（幸存信封 Record 重绑、id 不重算，`thread_id` = 幸存信封 record.id），作为一条普通记录走下游判重、分类、打分、标注与评审（3.16、4.1）。未被缝合的 episode 即单碎片线索；`stitch.enabled = false` 时线索与 episode 天然同值。 |
 | 碎片（Fragment） | 线索的成员分段（v1.9）：会话序上连续归属同一线索的成员帧区间——缝合前的一个 episode 或一个救援短段；以 `_meta.stream.fragments[]`{order_span, member_count, cause, source_episode} 溯源，cause ∈ "origin" \| "resumed" \| "rescued"（3.16、6.3）。 |
-| 序列生成（Sequence generation） | `generate.form = "sequence"` 的 v1.18 纯生成形态：M1 冻结 sequence 配置，M10 调用唯一 GenerationProgram compiler 与 ScenarioPlan planner，再以 delivery slot 为原子事务生成、判定并提交 primary sequence，同时交付可重放 stream 工件和成功 manifest（3.6、3.10、3.11）。 |
+| 序列生成（Sequence generation） | `generate.form = "sequence"` 的 v1.20 纯生成形态：M1 冻结 sequence 配置，M10 调用唯一 GenerationProgram compiler 与 ScenarioPlan planner，再以 delivery slot 为原子事务生成、判定并提交 primary sequence，同时交付可重放 stream 工件和成功 manifest（3.6、3.10、3.11）。 |
 | 序列模式（Sequence pattern） | declared 模式中一个 sequence class 的精确角色全集、完整顺序、相邻具名 gap 与必填最大跨度；每个 role 恰出现一次，不允许 subsequence 或 filler。 |
 | 角色（Role） | pattern 内唯一的业务职责；冻结 frame class、actor、read/write/publish roots、observers、状态指令、可选前置状态 Schema、payload binding 与日历窗。 |
 | 场景种子（ScenarioSeed） | 一个冻结逻辑世界快照：initial_state、actors、shared_facts.public/hidden、style 与 time_context；不随 stream 投影时间自动推进。 |
@@ -39,7 +39,7 @@
 | 事件真值（EventTruth） | 一个 world branch 内事件的角色绑定、actor、逻辑/投影时间、ActorView、意图、JSON Patch、前后状态哈希、发布快照和 payload。 |
 | 反事实集合（Counterfactual set） | 共享同一 ScenarioSeed 的完整 positive baseline 与声明 variant 集合。variant 闭集为 positive、missing、reordered、interval_exceeded；反例只从目标点起重规划 causal suffix，受保护前缀机械同一。 |
 | 交付槽（Delivery slot） | 一个 counterfactual set 与 scenario_index 的精确提交单位；多个槽可并发完成整组 generation/evaluation、dedup reservation、pointwise quality、annotate、verify 与 candidate-local CrossView，但只按声明序完成重验证、retained 累加和原子 commit。 |
-| 重放序列（Replay sequence） | 只进入 stream 工件的完整 primary positive sequence 重放；payload、frame class、actual role 与顺序同源，replay sequence/event ID 与 timestamp 新生。 |
+| 重放序列（Replay sequence） | 只进入 stream 工件的完整 primary positive sequence 重放；非时间 payload、frame class、actual role、duration、resources、time descriptor 与顺序同源，全部 member 使用同一个正时间平移量，payload 时间由框架按 replay start 重新绑定，replay sequence/event ID 新生。 |
 | 成功 manifest | sequence 运行的唯一成功提交真值：最后原子替换，包含 run_id、delivery_digest 以及 main/stream/report 的路径、SHA-256 和行数；摘要不匹配时消费者必须拒绝固定路径文件。 |
 | 接缝（Seam） | 多碎片线索中相邻两碎片的拼接处（v1.9）。判据：拼接对的会话序间隙含 ≥1 个归属其他线索的帧（间隙仅含噪声帧/本线索救援帧时不是接缝，该对照常摘取，3.16.4）；接缝步由 M15 零 LLM 机械占位（`action_type="app_switch"`、`detail.kind="thread_seam"`、步行内 `resumed=true`，3.15.4），位置经 `seam_indexes` duck 标承载（左成员下标坐标，4.1）。 |
 
@@ -152,7 +152,7 @@
 | 有序异步执行（v1.19） | ResourceKey 独立有界接纳；纯叶任务乱序完成、按输入序归并；sequence 使用连续候选缓冲和声明序短 commit（3.10、3.17） | Python TaskGroup 结构化并发、Apache Flink ordered async I/O 与 Ray pending-task backpressure |
 | Dedup reservation（v1.19） | counterfactual set 整组取得零正式突变的 reservation；轮到声明序 head 后对最新索引重验证，全部校验通过才在无 await 临界区消费并 commit（3.3、3.10） | 数据库式 reservation/validate/commit capability；运行事实不随 attempt 回滚 |
 | Manifest 提交协议（v1.18） | main、stream、report 各自写同目录 part、flush/fsync/replace，manifest 最后替换；commit-I/O 后消费者仅在 manifest 摘要全部匹配时接受（3.11） | 原子 rename 与内容摘要 manifest 是批数据发布的成熟提交协议；不虚构跨多文件原子 rename |
-| 双尺度硬门（v1.18） | record_units 与 stream_rows 各不超过 500000；最终 main+stream canonical UTF-8 retained_content_bytes 不超过 512 MiB。M11 先从最终 item 装配 source `SequenceRows`，replay 再只从其 primary rows 派生，两者均在 source positive commit 前精确计费（2.6、3.6、3.11） | 有界批处理必须同时约束对象数量和内容体积；共享冻结 payload 引用避免双视图与 replay 的无界深拷贝 |
+| 双尺度硬门（v1.20） | record_units 与 stream_rows 各不超过 500000；最终 main+stream canonical UTF-8 retained_content_bytes 不超过 512 MiB。M11 先从最终 item 装配 source `SequenceRows`，replay 从其 primary rows 派生独立 rebound payload；primary 与全部匹配 replay 在同一个 checked delta 和 source positive commit 前精确计费（2.6、3.6、3.11） | 有界批处理必须同时约束对象数量和内容体积；同一 checked delta 保证 source 与 replay 的时间重绑、计费和提交原子一致 |
 ## 1.6 已对齐的设计决策
 
 以下多方案设计点已与需求方沟通对齐（对齐日期见各行，早期各轮为 2026-07-02），本文档按对齐结论展开：

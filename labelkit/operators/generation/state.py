@@ -1,4 +1,4 @@
-"""v1.18 事件状态执行、ActorView 投影与机械 binding。"""
+"""v1.20 事件状态执行、ActorView 投影与机械 binding。"""
 from __future__ import annotations
 
 import hashlib

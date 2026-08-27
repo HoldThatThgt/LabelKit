@@ -50,7 +50,7 @@ def _check_schema_examples(state, config) -> None:
     for name, view in state.context.frame_classes.items():
         if name in required_frames:
             _schema_example(
-                state, view.gen_schema, f"[frame.class.{name}.generate]",
+                state, view.model_gen_schema, f"[frame.class.{name}.generate]",
                 min(limit, config.limits.rendered_payload_bytes),
             )
     for index, source in enumerate(config.instruction_only, 1):

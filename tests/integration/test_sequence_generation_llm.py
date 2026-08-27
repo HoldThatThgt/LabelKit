@@ -313,7 +313,7 @@ def _assert_main_stream_round_trip(main: list[dict], stream: list[dict]) -> None
 
 def _delivery_digest(main: list[dict], stream: list[dict]) -> str:
     """按冻结 framing 独立重算成功交付摘要。"""
-    digest = hashlib.sha256(b"labelkit:v1.18:delivery\n")
+    digest = hashlib.sha256(b"labelkit:v1.20:delivery\n")
     for row in (*main, *stream):
         payload = canonical_delivery_row(row)
         digest.update(str(len(payload)).encode("ascii"))

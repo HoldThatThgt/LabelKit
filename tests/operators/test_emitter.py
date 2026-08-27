@@ -20,11 +20,16 @@ from labelkit.common.config.model import (
     InputConfig, OutputConfig, QualityConfig,
     ResolvedConfig, ResolvedPaths, Rubric, RunConfig, SegmentConfig,
     StitchConfig, StreamConfig,
-    ToolConfig,
+    TimeBindingSpec, ToolConfig,
     TraceConfig, VerifyConfig,
 )
 from labelkit.operators.emitter import EmitResult, Emitter, SequenceDeliveryEmitter
-from labelkit.common.contracts.generation import ProjectedSequence, SequenceAssemblyRequest
+from labelkit.common.contracts.generation import (
+    ProjectedSequence,
+    SequenceAssemblyRequest,
+    SequenceTemporalContext,
+    SequenceTemporalMember,
+)
 from labelkit.common.errors import GenerationProjectionMismatch, InternalError, LabelKitError
 from labelkit.common.contracts.types import (
     Annotation, Classification, DedupInfo, ImageRef, PipelineItem, QualityScore,
@@ -1723,7 +1728,7 @@ def test_rubric_selector_off_form_keeps_modality_default(tmp_path):
     assert meta["run"]["rubric"] == "default:text"
 
 
-# ── v1.18 sequence manifest-last delivery ────────────────────────────────────────
+# ── v1.20 sequence manifest-last delivery ────────────────────────────────────────
 
 
 def _sequence_emitter(tmp_path: Path) -> SequenceDeliveryEmitter:
@@ -1901,6 +1906,43 @@ def test_sequence_assembly_rejects_invalid_sequence_annotation_as_projection(tmp
         emitter.assemble_sequence(request)
 
 
+def test_sequence_assembly_rechecks_final_annotation_time_before_part(tmp_path):
+    """M11 以冻结 context 复验 annotation 时间，错误值 terminal 且零 part。"""
+    emitter = _sequence_emitter(tmp_path)
+    projection, item, _truth = _sequence_projection_and_item()
+    request = _sequence_assembly_request(tmp_path, item, projection, 1)
+    view = request.program.class_views["ticket_booking"]
+    schema = dict(USER_SCHEMA)
+    schema["properties"] = {
+        **USER_SCHEMA["properties"], "started_at": {"type": "integer"},
+    }
+    schema["required"] = [*USER_SCHEMA["required"], "started_at"]
+    request.program.class_views["ticket_booking"] = _dc_replace(
+        view,
+        schema=schema,
+        time_bindings=(TimeBindingSpec(
+            "/started_at", "first_resource_start_milliseconds", "foreground_app",
+        ),),
+    )
+    first, second = item.record.members
+    item.temporal_context = SequenceTemporalContext((
+        SequenceTemporalMember(first.id, 1_000_000, 10_000, ("foreground_app",)),
+        SequenceTemporalMember(second.id, 2_000_000, 0, ()),
+    ))
+    output = dict(item.annotation.output)
+    output["started_at"] = 1000
+    item.annotation = _dc_replace(item.annotation, output=output)
+    emitter.assemble_sequence(request)
+    output["started_at"] = 1001
+    item.annotation = _dc_replace(item.annotation, output=output)
+    with pytest.raises(InternalError, match="generation_downstream_contract"):
+        emitter.assemble_sequence(request)
+    assert not any(Path(str(path) + ".part").exists() for path in (
+        emitter._paths.output, emitter._paths.stream, emitter._paths.report,
+        emitter._paths.manifest,
+    ))
+
+
 def test_sequence_assembly_rejects_invalid_frame_annotation_as_projection(tmp_path):
     """任一实际 frame annotation 违规时不得降格或返回局部 rows。"""
     emitter = _sequence_emitter(tmp_path)
@@ -2006,6 +2048,47 @@ def _success_report() -> dict:
         "delivery_digest": None,
         "artifacts_committed": False,
     }}}
+
+
+def _temporal_delivery_row() -> dict:
+    """返回 fixed-vector 使用的 rebound stream row。"""
+    return {
+        "payload": {"timestamp": 2000, "text": "rebound"},
+        "_meta": {"event": {
+            "event_id": "1" * 32,
+            "timestamp": "1970-01-01T08:00:02.000000+08:00",
+            "duration_us": 1_000_000,
+            "resources": ["foreground_app"],
+            "time_bindings": [{
+                "payload_path": "/timestamp", "source": "event_start_milliseconds",
+            }],
+        }},
+    }
+
+
+def test_delivery_digest_and_manifest_hash_cover_rebound_temporal_content(tmp_path):
+    """delivery fixed vector 与 manifest stream hash 均覆盖 rebound payload 和 metadata。"""
+    emitter = _sequence_emitter(tmp_path)
+    row = _temporal_delivery_row()
+    digest = emitter._delivery_digest((row,))
+    assert digest == "fb1bfa698fca0e73f74d429abbbffc847d502ae5cd55c0e8d39ea277684c7c40"
+    for path, value in (
+        (("payload", "timestamp"), 2001),
+        (("_meta", "event", "duration_us"), 2_000_000),
+        (("_meta", "event", "resources"), ["screen"]),
+        (("_meta", "event", "time_bindings"), []),
+    ):
+        changed = json.loads(json.dumps(row))
+        target = changed
+        for key in path[:-1]:
+            target = target[key]
+        target[path[-1]] = value
+        assert emitter._delivery_digest((changed,)) != digest
+    product = emitter.prepare_product((), (row,), _success_report())
+    manifest = emitter.commit(product)
+    stream_bytes = Path(emitter._paths.stream).read_bytes()
+    assert manifest["delivery_digest"] == digest
+    assert manifest["stream"]["sha256"] == hashlib.sha256(stream_bytes).hexdigest()
 
 
 def test_sequence_prepare_and_commit_use_one_digest_and_manifest_last(tmp_path, monkeypatch):

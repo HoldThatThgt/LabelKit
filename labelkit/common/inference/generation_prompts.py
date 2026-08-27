@@ -45,8 +45,9 @@ FRAME_RENDER_SYSTEM = """\
 与当前 actor 已知信息一致的 JSON object。
 只能表达给定 intent、ActorView、公开事实和 publish snapshot 中可见的内容。
 不得改变 frame_class、actor、role、intent、patch、状态哈希、逻辑时间或事件数量。
-不得生成或推断工件 timestamp、session 或其他投影坐标。
-不得猜测 hidden facts。机械绑定值必须出现在返回对象的指定 path，且等于给定值。
+计划起点、终点和时长只供内容语义对齐；不得在返回对象中生成或推断任何业务时间字段。
+不得生成 session 或其他投影坐标，不得猜测 hidden facts。
+状态绑定值是非时间业务真值，必须出现在返回对象的指定 path 且与给定值一致。
 payload 中面向人的自然语言必须把内部状态翻译成业务表达，
 不得照抄状态枚举、内部指标或实现术语，不得用两个同义短语机械复述一个结果。
 同一面向用户的句子不得重复同一业务终态关键词来再次声明结果。
@@ -58,7 +59,7 @@ payload 中面向人的自然语言必须把内部状态翻译成业务表达，
 后续消息需说明先前结果不变时，引用先前通知即可，不得再用新的近义短语复述该终态。
 每句话的动作发出者与接收对象必须符合 actor 身份；\
 不得把当前 actor 正在发出的消息写成它收到的对象。
-只返回满足给定完整帧 Schema 的一个完整 JSON 对象，不要 Markdown、\
+只返回满足给定 model Schema 的一个 JSON 对象，不要 Markdown、\
 代码围栏、解释或额外字段。"""
 
 SEMANTIC_EVALUATION_SYSTEM = """\
@@ -99,7 +100,8 @@ NOISE_RENDER_SYSTEM = (
     "再选择下标 attempt_index 对应的角度。\n"
     "不同 attempt 必须使用明显不同的措辞；不得输出候选表或复述内部标识。\n"
     "Schema 中的 examples 只描述形状，禁止复制或改写其内容。\n"
-    "只能返回满足给定噪声帧 Schema 的一个 JSON 对象，不要 Markdown、"
+    "计划起点、终点和时长只读；不得输出或推断任何业务时间字段。\n"
+    "只能返回满足给定 noise model Schema 的一个 JSON 对象，不要 Markdown、"
     "代码围栏、解释或额外字段。"
 )
 
@@ -162,13 +164,11 @@ def _event_plan_head(values: Mapping[str, object]) -> str:
     """构造 EventPlan user message 的身份与闭集前半段。"""
     return f"""[尝试身份]
 mode={values['mode']}
-slot_key={values['slot_key']}
-attempt_index={values['attempt_index']}
+slot_key={values['slot_key']}\nattempt_index={values['attempt_index']}
 variation_nonce={values['variation_nonce']}
 
 [冻结事件]
-event_key={values['event_key']}
-role={values['role']}
+event_key={values['event_key']}\nrole={values['role']}
 position={values['position']}
 sequence_length={values['sequence_length']}
 logical_time_us={values['logical_time_us']}
@@ -225,7 +225,6 @@ def _event_plan_tail(values: Mapping[str, object]) -> str:
 
 def frame_render_prompt(values: Mapping[str, object]) -> PromptBundle:
     """构造 FrameRenderer 的冻结两消息提示词。
-
     @param values 完整插值字段
     @return system/user PromptBundle
     """
@@ -236,11 +235,13 @@ attempt_index={values['attempt_index']}
 [冻结事件]
 event_key={values['event_key']}
 role={values['role']}
-position={values['position']}
-frame_class={values['frame_class']}
+position={values['position']}\nframe_class={values['frame_class']}
 actor={values['actor']}
 logical_time_us={values['logical_time_us']}
 wait_since_previous_us={values['wait_since_previous_us']}
+planned_start_us={values['planned_start_us']}
+planned_end_us={values['planned_end_us']}
+planned_duration_us={values['planned_duration_us']}
 intent={values['intent']}
 patch={_canonical_json(values['patch'])}
 
@@ -254,8 +255,7 @@ patch={_canonical_json(values['patch'])}
 {_canonical_json(values['publish_snapshot'])}
 
 [状态哈希]
-before={values['state_before_hash']}
-after={values['state_after_hash']}
+before={values['state_before_hash']}\nafter={values['state_after_hash']}
 
 [帧生成指令]
 {values['frame_instruction']}
@@ -263,15 +263,15 @@ after={values['state_after_hash']}
 [帧类别描述]
 {values['frame_description']}
 
-[机械绑定值]
+[非时间状态绑定值]
 {_canonical_json(values['binding_values'])}
 
-[完整帧 Schema]
+[不含业务时间字段的 model Schema]
 {_canonical_json(values['frame_schema'])}
 
 [输出契约]
-只返回一个通过完整帧 Schema 的完整 JSON object；\
-机械绑定 path 的值必须与上方给定值完全相同。"""
+只返回一个通过 model Schema 的 JSON object；\
+不得输出任何业务时间字段；非时间状态绑定 path 必须与上方值完全相同。"""
     return _prompt(FRAME_RENDER_SYSTEM, user)
 
 
@@ -329,7 +329,9 @@ event_key={values['event_key']}
 noise_ordinal={values['noise_ordinal']}
 attempt_index={values['attempt_index']}
 frame_class={values['frame_class']}
-timestamp_us={values['timestamp_us']}
+planned_start_us={values['planned_start_us']}
+planned_end_us={values['planned_end_us']}
+planned_duration_us={values['planned_duration_us']}
 session_id={values['session_id']}
 
 [已声明序列类别]
@@ -347,11 +349,11 @@ session_id={values['session_id']}
 [帧生成指令]
 {values['frame_instruction']}
 
-[噪声帧 Schema]
+[不含业务时间字段的 noise model Schema]
 {_canonical_json(values['frame_schema'])}
 
 [输出契约]
-只返回一个通过噪声帧 Schema 的 JSON object。"""
+只返回一个通过 noise model Schema 的 JSON object，不得输出业务时间字段。"""
     return _prompt(NOISE_RENDER_SYSTEM, user)
 
 

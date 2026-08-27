@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import secrets
 import unicodedata
@@ -93,6 +94,27 @@ def _dedup_text(rec: Record, cfg: "DedupConfig") -> str:
     return _normalize_text(rec.text or "")
 
 
+def _generation_exact_material(rec: Record) -> str | None:
+    """构造 generation stream Record 的 v1.20 exact-only canonical 材料。
+
+    @param rec M2 已写入 non-temporal payload carrier 的记录。
+    @return v1.20 域分离材料；普通或 mixed sequence 返回 None。
+    """
+    if rec.kind == "sequence":
+        values = tuple(member.exact_dedup_text for member in rec.members)
+        if not values or any(value is None for value in values):
+            return None
+    elif rec.exact_dedup_text is not None:
+        values = (rec.exact_dedup_text,)
+    else:
+        return None
+    return json.dumps(
+        ["labelkit:v1.20", "generation_stream_exact", values],
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 def _shingles(text: str, n: int) -> set[str]:
     """在（已折叠空白的）文本上做字符 n-gram 滑窗，取 shingle 集合。
 
@@ -170,6 +192,7 @@ class _ProbeDetail:
     digest: bytes                                       # 判重文本的 SHA-256 摘要
     own_key: str                                        # digest.hex()[:16]
     is_sequence: bool = False                           # v1.8：rec.kind == "sequence"（S10）
+    exact_only: bool = False                            # generation stream 仅运行 exact 层
     minhash: MinHash | None = None                      # ② 级 MinHash 签名
     tree_hit: tuple[str, str, float] | None = None      # (保留记录 id, 簇键, Jaccard 估计)
     phash: int | None = None                            # ③ 级 64 位 pHash
@@ -295,12 +318,15 @@ class DedupIndex:
         @param rec 待判重记录
         @return exact、MinHash、pHash 与静态身份特征
         """
-        text = _dedup_text(rec, self.cfg)
+        exact_material = _generation_exact_material(rec)
+        text = exact_material if exact_material is not None else _dedup_text(rec, self.cfg)
         digest = hashlib.sha256(text.encode("utf-8")).digest()
         detail = _ProbeDetail(dedup_text=text, digest=digest, own_key=digest.hex()[:16],
-                              is_sequence=rec.kind == "sequence")
-        detail.minhash = _build_minhash(text, self.cfg.ngram, self.cfg.minhash_num_perm)
-        if self.modality == "ui" and rec.image is not None:
+                              is_sequence=rec.kind == "sequence",
+                              exact_only=exact_material is not None)
+        if not detail.exact_only:
+            detail.minhash = _build_minhash(text, self.cfg.ngram, self.cfg.minhash_num_perm)
+        if not detail.exact_only and self.modality == "ui" and rec.image is not None:
             self._prepare_image(rec.image.path, detail)
         return detail
 
@@ -1076,6 +1102,8 @@ class DedupStage:
         @param detail 本记录的探测便签
         @return True 表示 ④ 级参与
         """
+        if detail.exact_only:
+            return False
         if self.index.modality == "text" or self.cfg.ui_dup_requires != "image":
             return True
         return detail.image_decode_failed or detail.is_sequence

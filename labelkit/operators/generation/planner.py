@@ -1,16 +1,18 @@
-"""v1.18 确定性 CP-SAT ScenarioPlan 编译器。"""
+"""v1.20 确定性点与区间 CP-SAT ScenarioPlan 编译器。"""
 from __future__ import annotations
 
 import dataclasses
-import hashlib
-import heapq
 import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from types import MappingProxyType
 
+from jsonpointer import JsonPointer
+from jsonschema import Draft202012Validator
 from ortools.sat.python import cp_model
 
+from labelkit.common.config._temporal import resolve_frame_time_values
+from labelkit.common.config.generation import is_generation_frame_eligible
 from labelkit.common.contracts.generation import (
     DeliverySlot,
     GenerationProgram,
@@ -21,13 +23,14 @@ from labelkit.common.contracts.generation import (
 )
 from labelkit.common.errors import ConfigError, InternalError
 from labelkit.operators.generation.project import (
-    canonical_json,
     derive_generation_id,
+    generation_digest,
     scenario_plan_digest,
 )
 
 
 _log = logging.getLogger("labelkit.generation.planner")
+_QUANTUM_US = 1000
 _DAY_US = 86_400_000_000
 _EPOCH_UTC = datetime(1970, 1, 1, tzinfo=timezone.utc)
 _WEEKDAY = {"mon": 0, "tue": 1, "wed": 2, "thu": 3,
@@ -82,13 +85,14 @@ def compile_scenario_plan(program: GenerationProgram) -> ScenarioPlan:
 
     if program.digest != generation_program_digest(program):
         _plan_internal("generation program digest is invalid")
+    _require_program_quantum(program)
     seed = program.planner_seed
     slots = _delivery_slots(program)
     logical, baselines = _logical_branches(program, slots, seed)
     placed = _select_primary_layout(program, logical, seed)
     blocks = _allocate_blocks(program, placed, baselines)
-    cursor = max((event.timestamp_us for item in placed for event in item.events),
-                 default=program.timeline.timestamp_start_us - 1)
+    cursor = max((_events_tail(item.events) for item in placed),
+                 default=program.timeline.timestamp_start_us)
     noise_slots, cursor = _noise_slots(program, cursor)
     replay_layouts = _replay_layouts(program, placed, cursor)
     _validate_timestamp_range(program, placed, noise_slots, replay_layouts)
@@ -100,6 +104,7 @@ def compile_scenario_plan(program: GenerationProgram) -> ScenarioPlan:
         primary_sessions=program.timeline.primary_sessions,
         digest="",
     )
+    _preflight_temporal_values(program, base)
     return dataclasses.replace(base, digest=scenario_plan_digest(base))
 
 
@@ -185,13 +190,15 @@ def _logical_branches(program, slots, seed: int):
         pattern = program.patterns[slot.pattern_name]
         source = _counterfactual_source(program, slot.source_name)
         times = _solve_pattern_times(
-            pattern, source.variants, _solver_seed(seed, f"baseline:{slot.slot_key}"),
+            program, pattern, source.variants,
+            _solver_seed(seed, f"baseline:{slot.slot_key}"),
         )
         baseline = _LogicalBranch(slot, None, pattern.order, times)
         baselines[slot.slot_key] = baseline
         for variant_index, variant in enumerate(source.variants):
+            variant_seed = _solver_seed(seed, f"variant:{slot.slot_key}:{variant_index}")
             branches.append(_variant_branch(
-                baseline, pattern, variant, seed, variant_index,
+                program, baseline, pattern, variant, variant_seed,
             ))
     return tuple(branches), baselines
 
@@ -217,36 +224,41 @@ def _instruction_branch(program, slot, seed: int, slot_index: int) -> _LogicalBr
     return _LogicalBranch(slot, None, roles, times)
 
 
-def _solve_pattern_times(pattern, variants, solver_seed: int) -> tuple[int, ...]:
+def _solve_pattern_times(program, pattern, variants, solver_seed: int) -> tuple[int, ...]:
     """求解 baseline role 时间与全部 gap/span 约束。
 
+    @param program 冻结生成程序。
     @param pattern 当前精确 pattern。
     @param variants 当前 set 的完整变体声明。
     @param solver_seed 确定性 solver seed。
     @return 与 pattern.order 对位的逻辑微秒。
     """
+    _require_pattern_quantum(pattern)
     model = cp_model.CpModel()
-    times = [model.new_int_var(0, pattern.max_span_us, f"time_{index}")
+    span_ms = pattern.max_span_us // _QUANTUM_US
+    times = [model.new_int_var(0, span_ms, f"time_{index}")
              for index in range(len(pattern.order))]
     model.add(times[0] == 0)
     role_indexes = {role: index for index, role in enumerate(pattern.order)}
     for left, right in zip(times, times[1:]):
-        model.add(left < right)
+        model.add(left + 1 <= right)
     for gap in pattern.gaps:
         delta = times[role_indexes[gap.after]] - times[role_indexes[gap.before]]
-        model.add(delta >= gap.min_gap_us)
-        model.add(delta <= gap.max_gap_us)
-    _add_reordered_constraints(model, pattern, times, variants)
-    model.add(times[-1] - times[0] <= pattern.max_span_us)
-    model.minimize(sum(times))
-    solver = _solve(model, solver_seed, pattern.name)
-    return tuple(solver.value(value) for value in times)
+        model.add(delta >= gap.min_gap_us // _QUANTUM_US)
+        model.add(delta <= gap.max_gap_us // _QUANTUM_US)
+    starts = {role: times[index] for role, index in role_indexes.items()}
+    _add_temporal_constraints(model, program, pattern, starts, pattern.order)
+    _add_reordered_constraints(model, program, pattern, times, variants)
+    _add_exceeded_feasibility(model, program, pattern, times, variants)
+    solver = _solve_lexicographic(model, solver_seed, pattern.name, tuple(times))
+    return tuple(solver.value(value) * _QUANTUM_US for value in times)
 
 
-def _add_reordered_constraints(model, pattern, times, variants) -> None:
+def _add_reordered_constraints(model, program, pattern, times, variants) -> None:
     """把每个错序分支的全部非目标结构约束并入 baseline 模型。
 
     @param model 当前 baseline CP-SAT 模型。
+    @param program 冻结生成程序。
     @param pattern 当前精确 pattern。
     @param times 与 pattern.order 对位的 baseline 时间变量。
     @param variants 当前 set 的完整变体声明。
@@ -260,23 +272,183 @@ def _add_reordered_constraints(model, pattern, times, variants) -> None:
         branch_times[before], branch_times[after] = branch_times[after], branch_times[before]
         for left, right in zip(pattern.order, pattern.order[1:]):
             if (left, right) != (before, after):
-                model.add(branch_times[left] < branch_times[right])
+                model.add(branch_times[left] + 1 <= branch_times[right])
         for gap in pattern.gaps:
             if (gap.before, gap.after) == (before, after):
                 continue
             delta = branch_times[gap.after] - branch_times[gap.before]
-            model.add(delta >= gap.min_gap_us)
-            model.add(delta <= gap.max_gap_us)
+            model.add(delta >= gap.min_gap_us // _QUANTUM_US)
+            model.add(delta <= gap.max_gap_us // _QUANTUM_US)
+        ordered = list(pattern.order)
+        before_index, after_index = ordered.index(before), ordered.index(after)
+        ordered[before_index], ordered[after_index] = ordered[after_index], ordered[before_index]
+        _add_temporal_constraints(model, program, pattern, branch_times, tuple(ordered))
 
 
-def _variant_branch(baseline, pattern, variant, seed: int, ordinal: int) -> _LogicalBranch:
+def _add_exceeded_feasibility(model, program, pattern, times, variants) -> None:
+    """把每个 interval-exceeded 分支的存在性并入 baseline 模型。"""
+    indexes = {role: index for index, role in enumerate(pattern.order)}
+    for variant in variants:
+        if variant.kind != "interval_exceeded":
+            continue
+        target = next(item for item in pattern.gaps if item.name == variant.target["gap"])
+        suffix = indexes[target.after]
+        low = (target.max_gap_us + int(variant.target["min_excess_us"])) // _QUANTUM_US
+        high = (target.max_gap_us + int(variant.target["max_excess_us"])) // _QUANTUM_US
+        shift = model.new_int_var(0, pattern.max_span_us // _QUANTUM_US,
+                                  f"exceeded_shift_{variant.name}")
+        starts = _shifted_starts(model, pattern, times, suffix, shift)
+        model.add(starts[target.after] - starts[target.before] >= low)
+        model.add(starts[target.after] - starts[target.before] <= high)
+        _add_non_target_gap_constraints(model, pattern, starts, target.name)
+        _add_temporal_constraints(model, program, pattern, starts, pattern.order)
+
+
+def _add_non_target_gap_constraints(model, pattern, starts, target_name: str) -> None:
+    """向 interval-exceeded 模型加入所有非目标 gap。"""
+    for gap in pattern.gaps:
+        if gap.name == target_name:
+            continue
+        delta = starts[gap.after] - starts[gap.before]
+        model.add(delta >= gap.min_gap_us // _QUANTUM_US)
+        model.add(delta <= gap.max_gap_us // _QUANTUM_US)
+
+
+def _shifted_starts(model, pattern, times, suffix_index: int, shift) -> dict:
+    """构造可直接作为 fixed interval 起点的后缀平移变量。
+
+    @param model 当前 CP-SAT 模型。
+    @param pattern 当前 pattern。
+    @param times baseline 起点变量。
+    @param suffix_index 后缀首 role 序号。
+    @param shift 后缀统一平移量。
+    @return role 到可用起点变量的映射。
+    """
+    upper = 2 * pattern.max_span_us // _QUANTUM_US
+    prefix = len(model.proto.variables)
+    starts = {}
+    for index, role in enumerate(pattern.order):
+        if index < suffix_index:
+            starts[role] = times[index]
+            continue
+        shifted = model.new_int_var(0, upper, f"shifted_{prefix}_{role}")
+        model.add(shifted == times[index] + shift)
+        starts[role] = shifted
+    return starts
+
+
+def _add_temporal_constraints(model, program, pattern, starts, roles) -> None:
+    """把区间包络、资源互斥与严格包含加入一个 branch 模型。"""
+    durations = _role_durations_ms(program, pattern)
+    resources = _role_resources(program, pattern)
+    present = tuple(role for role in roles if role in starts)
+    _add_interval_envelope(model, pattern, starts, durations, present)
+    by_resource: dict[str, list] = {}
+    for role in present:
+        duration = durations[role]
+        if duration <= 0:
+            continue
+        interval = model.new_fixed_size_interval_var(
+            starts[role], duration, f"{role}_interval")
+        for resource in resources[role]:
+            by_resource.setdefault(resource, []).append(interval)
+    for intervals in by_resource.values():
+        model.add_no_overlap(intervals)
+    _add_containment_constraints(model, pattern, starts, durations, frozenset(present))
+
+
+def _add_interval_envelope(model, pattern, starts, durations, roles) -> None:
+    """以完整 interval envelope 限制 pattern span。"""
+    cap = pattern.max_span_us // _QUANTUM_US
+    upper = cap + max(durations.values(), default=0)
+    first = model.new_int_var(0, upper, "interval_first")
+    last = model.new_int_var(0, upper, "interval_last")
+    model.add_min_equality(first, [starts[role] for role in roles])
+    model.add_max_equality(last, [starts[role] + durations[role] for role in roles])
+    model.add(last - first <= cap)
+
+
+def _add_containment_constraints(model, pattern, starts, durations, present) -> None:
+    """对仍同时在场的 role 加入一个 quantum 严格包含。"""
+    for item in pattern.containments:
+        if item.contained not in present:
+            continue
+        if item.container not in present:
+            model.add(0 == 1)
+            continue
+        if durations[item.container] <= 0 or durations[item.contained] <= 0:
+            model.add(0 == 1)
+            continue
+        model.add(starts[item.container] <= starts[item.contained])
+        model.add(
+            starts[item.contained] + durations[item.contained] + 1
+            <= starts[item.container] + durations[item.container]
+        )
+
+
+def _role_durations_ms(program, pattern) -> dict[str, int]:
+    """返回 pattern role 到固定毫秒时长的表。"""
+    return {
+        role.name: _duration_ms(program.frame_classes[role.frame_class].duration_us)
+        for role in pattern.roles
+    }
+
+
+def _role_resources(program, pattern) -> dict[str, tuple[str, ...]]:
+    """返回 pattern role 到声明序资源的表。"""
+    return {
+        role.name: program.frame_classes[role.frame_class].resources
+        for role in pattern.roles
+    }
+
+
+def _require_pattern_quantum(pattern) -> None:
+    """防止绕过 M1 的非毫秒 pattern 进入求解器。"""
+    values = [pattern.max_span_us]
+    values.extend(value for gap in pattern.gaps for value in (gap.min_gap_us, gap.max_gap_us))
+    if any(value % _QUANTUM_US for value in values):
+        _plan_infeasible("pattern timing must use the millisecond quantum")
+
+
+def _duration_ms(duration_us: int) -> int:
+    """校验并返回 Planner 毫秒 quantum 时长。"""
+    if duration_us < 0 or duration_us % _QUANTUM_US:
+        _plan_infeasible("frame duration must use the millisecond quantum")
+    return duration_us // _QUANTUM_US
+
+
+def _require_program_quantum(program) -> None:
+    """在建模前拒绝绕过 M1 的非毫秒全局时间。"""
+    timeline = program.timeline
+    values = [
+        timeline.timestamp_start_us, *timeline.event_gap_us,
+        timeline.session_max_span_us, timeline.session_gap_us,
+    ]
+    values.extend(
+        value for window in program.calendar_windows.values()
+        for interval in window.intervals_us for value in interval
+    )
+    values.extend(
+        int(variant.target[key])
+        for source in program.counterfactual_sets for variant in source.variants
+        if variant.kind == "interval_exceeded"
+        for key in ("min_excess_us", "max_excess_us")
+    )
+    if any(value % _QUANTUM_US for value in values):
+        _plan_infeasible("generation timeline must use the millisecond quantum")
+    for frame in program.frame_classes.values():
+        _duration_ms(frame.duration_us)
+
+
+def _variant_branch(program, baseline, pattern, variant,
+                    solver_seed: int) -> _LogicalBranch:
     """机械派生一个 positive/counterfactual branch。
 
+    @param program 冻结生成程序。
     @param baseline 当前 slot baseline。
     @param pattern 当前 pattern。
     @param variant 当前变体声明。
-    @param seed 运行随机种子。
-    @param ordinal 变体声明序号。
+    @param solver_seed 变体求解器随机种子。
     @return 派生逻辑 branch。
     """
     roles = list(baseline.roles)
@@ -293,15 +465,19 @@ def _variant_branch(baseline, pattern, variant, seed: int, ordinal: int) -> _Log
         roles[before], roles[after] = roles[after], roles[before]
     elif variant.kind == "interval_exceeded":
         times = _exceeded_times(
-            pattern, baseline.logical_times, variant,
-            _solver_seed(seed, f"variant:{baseline.slot.slot_key}:{ordinal}"),
+            program, pattern, baseline.logical_times, variant,
+            solver_seed,
         )
-    return _LogicalBranch(baseline.slot, variant.name, tuple(roles), tuple(times))
+    branch = _LogicalBranch(baseline.slot, variant.name, tuple(roles), tuple(times))
+    _validate_logical_branch(program, pattern, branch)
+    return branch
 
 
-def _exceeded_times(pattern, baseline_times, variant, solver_seed: int) -> list[int]:
+def _exceeded_times(program, pattern, baseline_times, variant,
+                    solver_seed: int) -> list[int]:
     """求解 interval-exceeded 的唯一 suffix 平移量。
 
+    @param program 冻结生成程序。
     @param pattern 当前 pattern。
     @param baseline_times baseline 逻辑时间。
     @param variant interval-exceeded 变体。
@@ -311,41 +487,32 @@ def _exceeded_times(pattern, baseline_times, variant, solver_seed: int) -> list[
     target = next(gap for gap in pattern.gaps if gap.name == variant.target["gap"])
     indexes = {role: index for index, role in enumerate(pattern.order)}
     after_index = indexes[target.after]
-    low = target.max_gap_us + int(variant.target["min_excess_us"])
-    high = target.max_gap_us + int(variant.target["max_excess_us"])
-    base_gap = baseline_times[after_index] - baseline_times[indexes[target.before]]
+    low = (target.max_gap_us + int(variant.target["min_excess_us"])) // _QUANTUM_US
+    high = (target.max_gap_us + int(variant.target["max_excess_us"])) // _QUANTUM_US
+    base_times = [value // _QUANTUM_US for value in baseline_times]
+    base_gap = base_times[after_index] - base_times[indexes[target.before]]
     model = cp_model.CpModel()
     shift = model.new_int_var(max(0, low - base_gap), high - base_gap, "suffix_shift")
-    for gap in pattern.gaps:
-        if gap.name == target.name:
-            continue
-        delta = _shifted_gap(pattern, baseline_times, gap, after_index, shift)
-        model.add(delta >= gap.min_gap_us)
-        model.add(delta <= gap.max_gap_us)
-    model.add(baseline_times[-1] + shift <= pattern.max_span_us)
+    starts = _shifted_starts(model, pattern, base_times, after_index, shift)
+    _add_non_target_gap_constraints(model, pattern, starts, target.name)
+    _add_temporal_constraints(model, program, pattern, starts, pattern.order)
     model.minimize(shift)
     solver = _solve(model, solver_seed, variant.name)
     amount = solver.value(shift)
-    return [value + amount if index >= after_index else value
+    return [value + amount * _QUANTUM_US if index >= after_index else value
             for index, value in enumerate(baseline_times)]
 
 
-def _shifted_gap(pattern, times, gap, suffix_index: int, shift):
-    """构造一个非目标 gap 的变体 CP 表达式。
-
-    @param pattern 当前 pattern。
-    @param times baseline 时间。
-    @param gap 当前非目标 gap。
-    @param suffix_index 后移后缀起点。
-    @param shift CP-SAT 后移量。
-    @return gap 微秒表达式。
-    """
-    indexes = {role: index for index, role in enumerate(pattern.order)}
-    before, after = indexes[gap.before], indexes[gap.after]
-    delta = times[after] - times[before]
-    if before < suffix_index <= after:
-        return delta + shift
-    return delta
+def _validate_logical_branch(program, pattern, branch) -> None:
+    """用固定 CP-SAT 模型验证派生 branch 的全部区间约束。"""
+    model = cp_model.CpModel()
+    starts = {
+        role: model.new_constant(value // _QUANTUM_US)
+        for role, value in zip(branch.roles, branch.logical_times)
+    }
+    _add_temporal_constraints(model, program, pattern, starts, branch.roles)
+    _solve(model, _solver_seed(program.planner_seed, f"fixed:{branch.slot.slot_key}"),
+           branch.variant_name or "baseline")
 
 
 def _select_primary_layout(program, branches, seed: int):
@@ -425,35 +592,13 @@ def _relative_cross_possible(left, right, program) -> bool:
     @param program 冻结生成程序。
     @return 容量、跨度与交织同时可行时为 true。
     """
-    left_offsets, right_offsets = _logical_offsets(left), _logical_offsets(right)
     timeline = program.timeline
-    if len(left_offsets) + len(right_offsets) > timeline.session_max_events:
+    if len(left.roles) + len(right.roles) > timeline.session_max_events:
         return False
-    cap = timeline.session_max_span_us
-    if left_offsets[-1] > cap or right_offsets[-1] > cap:
-        return False
-    return (_can_insert(left_offsets, right_offsets, cap)
-            or _can_insert(right_offsets, left_offsets, cap))
-
-
-def _can_insert(host, guest, cap: int) -> bool:
-    """判断 guest 首事件能否插入 host 的任一相邻空隙。
-
-    @param host 包围 guest 首事件的 owner offsets。
-    @param guest 待平移 owner offsets。
-    @param cap 完整 session 跨度上限。
-    @return 存在不碰撞整数平移时为 true。
-    """
-    forbidden = {left - right for left in host for right in guest}
-    for before, after in zip(host, host[1:]):
-        low, high = before + 1, min(after - 1, cap - guest[-1])
-        if low > high:
-            continue
-        if high - low + 1 > len(forbidden):
-            return True
-        if any(value not in forbidden for value in range(low, high + 1)):
-            return True
-    return False
+    return all(
+        _branch_envelope_us(program, branch) <= timeline.session_max_span_us
+        for branch in (left, right)
+    )
 
 
 def _place_primary(program, branches, paired, seed: int) -> tuple[_PlacedBranch, ...]:
@@ -466,7 +611,7 @@ def _place_primary(program, branches, paired, seed: int) -> tuple[_PlacedBranch,
     @return 完整 primary branch 计划。
     """
     placed: list[_PlacedBranch] = []
-    cursor = program.timeline.timestamp_start_us - 1
+    cursor: int | None = None
     session_index = 0
     index = 0
     while index < len(branches):
@@ -478,7 +623,7 @@ def _place_primary(program, branches, paired, seed: int) -> tuple[_PlacedBranch,
             )
             pair = _place_crossed_pair(request, session_index)
             placed.extend(pair)
-            cursor = max(event.timestamp_us for item in pair for event in item.events)
+            cursor = max(_events_tail(item.events) for item in pair)
             index += 2
         else:
             branch = branches[index]
@@ -486,7 +631,7 @@ def _place_primary(program, branches, paired, seed: int) -> tuple[_PlacedBranch,
             events = _planned_events(program, branch, start, session_index)
             _check_session(program, branch.slot.slot_key, events, events[0].timestamp_us, len(events))
             placed.append(_PlacedBranch(branch, events, session_index))
-            cursor = events[-1].timestamp_us
+            cursor = _events_tail(events)
             index += 1
         session_index += 1
     if session_index != program.timeline.primary_sessions:
@@ -530,16 +675,18 @@ def _solve_crossed_starts(request: _CrossRequest) -> tuple[int, int]:
         raise _PrimaryLayoutInfeasible
     model = cp_model.CpModel()
     left = model.new_int_var_from_domain(
-        cp_model.Domain.from_intervals(left_intervals), "left_start"
+        cp_model.Domain.from_intervals(_millisecond_intervals(left_intervals)), "left_start"
     )
     right = model.new_int_var_from_domain(
-        cp_model.Domain.from_intervals(right_intervals), "right_start"
+        cp_model.Domain.from_intervals(_millisecond_intervals(right_intervals)), "right_start"
     )
     if not _constrain_crossed_session(model, request, left, right):
         raise _PrimaryLayoutInfeasible
-    model.minimize(left + right)
-    solver = _solve_cross_layout(model, request)
-    return solver.value(left), solver.value(right)
+    first = model.new_int_var(request.lower // _QUANTUM_US,
+                              upper // _QUANTUM_US, "first_branch_start")
+    model.add_min_equality(first, [left, right])
+    solver = _solve_cross_lexicographic(model, request, (first, left, right))
+    return solver.value(left) * _QUANTUM_US, solver.value(right) * _QUANTUM_US
 
 
 def _constrain_crossed_session(model, request, left_start, right_start) -> bool:
@@ -557,7 +704,11 @@ def _constrain_crossed_session(model, request, left_start, right_start) -> bool:
         return False
     for left in left_offsets:
         for right in right_offsets:
-            model.add(right_start + right != left_start + left)
+            model.add(
+                right_start + right // _QUANTUM_US
+                != left_start + left // _QUANTUM_US
+            )
+    _constrain_crossed_resources(model, request, left_start, right_start)
     _constrain_session_span(model, request, left_start, right_start)
     witnesses = _alternation_witnesses(model, left_offsets, right_offsets, left_start, right_start)
     if not witnesses:
@@ -575,17 +726,15 @@ def _constrain_session_span(model, request, left_start, right_start) -> None:
     @param right_start 右 branch 起点变量。
     @return None。
     """
-    cap = request.program.timeline.session_max_span_us
-    lower = request.lower
-    horizon = lower + 21 * _DAY_US + cap
-    left_end = left_start + _logical_offsets(request.left)[-1]
+    cap = request.program.timeline.session_max_span_us // _QUANTUM_US
+    lower = request.lower // _QUANTUM_US
+    horizon = lower + 21 * _DAY_US // _QUANTUM_US + cap
+    left_ends = _branch_end_expressions(request.program, request.left, left_start)
+    right_ends = _branch_end_expressions(request.program, request.right, right_start)
     first = model.new_int_var(lower, horizon, "session_first")
     last = model.new_int_var(lower, horizon + cap, "session_last")
     model.add_min_equality(first, [left_start, right_start])
-    model.add_max_equality(last, [
-        left_end,
-        right_start + _logical_offsets(request.right)[-1],
-    ])
+    model.add_max_equality(last, [*left_ends, *right_ends])
     model.add(last - first <= cap)
 
 
@@ -600,26 +749,23 @@ def _alternation_witnesses(model, left, right, left_start: int, right_start):
     @return 可选交织证明变量。
     """
     witnesses = []
+    left = tuple(value // _QUANTUM_US for value in left)
+    right = tuple(value // _QUANTUM_US for value in right)
     for index, (before, after) in enumerate(zip(left, left[1:])):
         flag = model.new_bool_var(f"left_wraps_{index}")
-        model.add(right_start + right[0] > left_start + before).only_enforce_if(flag)
-        model.add(right_start + right[0] < left_start + after).only_enforce_if(flag)
+        model.add(right_start + right[0] >= left_start + before + 1).only_enforce_if(flag)
+        model.add(right_start + right[0] <= left_start + after - 1).only_enforce_if(flag)
         witnesses.append(flag)
     for index, (before, after) in enumerate(zip(right, right[1:])):
         flag = model.new_bool_var(f"right_wraps_{index}")
-        model.add(right_start + before < left_start + left[0]).only_enforce_if(flag)
-        model.add(left_start + left[0] < right_start + after).only_enforce_if(flag)
+        model.add(right_start + before + 1 <= left_start + left[0]).only_enforce_if(flag)
+        model.add(left_start + left[0] + 1 <= right_start + after).only_enforce_if(flag)
         witnesses.append(flag)
     return witnesses
 
 
 def _solve_cross_layout(model, request: _CrossRequest):
-    """求解一个 crossing 绝对日历布局，区分可替换选择与运行终态。
-
-    @param model 待求解 crossing CP-SAT 模型。
-    @param request 双 branch 交织请求。
-    @return 只有 OPTIMAL 时的 solver。
-    """
+    """求解一层 crossing 绝对日历优化。"""
     solver = cp_model.CpSolver()
     solver.parameters.num_search_workers = 1
     solver.parameters.random_seed = request.seed
@@ -634,6 +780,16 @@ def _solve_cross_layout(model, request: _CrossRequest):
     _plan_internal("crossed layout model is invalid")
 
 
+def _solve_cross_lexicographic(model, request: _CrossRequest, objectives):
+    """依次冻结最早 branch 与声明序 owner 起点。"""
+    solver = None
+    for objective in objectives:
+        model.minimize(objective)
+        solver = _solve_cross_layout(model, request)
+        model.add(objective == solver.value(objective))
+    return solver
+
+
 def _logical_offsets(branch) -> tuple[int, ...]:
     """返回 branch 相对首事件的逻辑时间。
 
@@ -644,19 +800,89 @@ def _logical_offsets(branch) -> tuple[int, ...]:
     return tuple(value - first for value in branch.logical_times)
 
 
-def _branch_lower_bound(program, cursor: int, shares: bool) -> int:
+def _branch_metadata(program, branch):
+    """返回 branch 声明序的 offset、duration 与 resources。"""
+    offsets = _logical_offsets(branch)
+    if program.mode == "instruction_only":
+        return tuple((role, offset, 0, ()) for role, offset in zip(branch.roles, offsets))
+    pattern = program.patterns[branch.slot.pattern_name]
+    roles = {item.name: item for item in pattern.roles}
+    return tuple(
+        (role, offset, program.frame_classes[roles[role].frame_class].duration_us,
+         program.frame_classes[roles[role].frame_class].resources)
+        for role, offset in zip(branch.roles, offsets)
+    )
+
+
+def _branch_envelope_us(program, branch) -> int:
+    """计算 branch 从最早 start 到最晚 end 的完整包络。"""
+    metadata = _branch_metadata(program, branch)
+    return max(offset + duration for _role, offset, duration, _resources in metadata)
+
+
+def _branch_end_expressions(program, branch, start):
+    """构造毫秒绝对 branch 的全部 end 表达式。"""
+    return tuple(
+        start + offset // _QUANTUM_US + duration // _QUANTUM_US
+        for _role, offset, duration, _resources in _branch_metadata(program, branch)
+    )
+
+
+def _constrain_crossed_resources(model, request, left_start, right_start) -> None:
+    """对 crossed owner 合并同名 resource 并加入 AddNoOverlap。"""
+    by_resource: dict[str, list] = {}
+    sides = ((request.left, left_start), (request.right, right_start))
+    for branch, start in sides:
+        for role, offset, duration, resources in _branch_metadata(request.program, branch):
+            if duration <= 0:
+                continue
+            interval = model.new_fixed_size_interval_var(
+                start + offset // _QUANTUM_US, duration // _QUANTUM_US,
+                f"crossed_{role}_interval",
+            )
+            for resource in resources:
+                by_resource.setdefault(resource, []).append(interval)
+    for intervals in by_resource.values():
+        model.add_no_overlap(intervals)
+
+
+def _millisecond_intervals(intervals) -> list[list[int]]:
+    """把已毫秒对齐的微秒闭区间转为 CP-SAT 毫秒域。"""
+    result = []
+    for start, end in intervals:
+        aligned_start = (start + _QUANTUM_US - 1) // _QUANTUM_US
+        aligned_end = end // _QUANTUM_US
+        if aligned_start <= aligned_end:
+            result.append([aligned_start, aligned_end])
+    return result
+
+
+def _branch_lower_bound(program, cursor: int | None, shares: bool) -> int:
     """计算下一个 branch 的最早工件起点。
 
     @param program 冻结生成程序。
-    @param cursor 前一 branch 最后事件时间。
+    @param cursor 前缀事件的最大区间尾。
     @param shares 是否与前一 branch 共 session。
     @return 严格递增的最早起点。
     """
-    if cursor < program.timeline.timestamp_start_us:
-        return program.timeline.timestamp_start_us
+    if cursor is None:
+        return _align_millisecond(program.timeline.timestamp_start_us)
     gap = (program.timeline.event_gap_us[0] if shares
            else program.timeline.session_gap_us)
-    return cursor + max(gap, 1)
+    return _align_millisecond(cursor + max(gap, _QUANTUM_US))
+
+
+def _align_millisecond(value: int) -> int:
+    """向上量化 epoch 微秒到 Planner 毫秒 quantum。"""
+    return ((value + _QUANTUM_US - 1) // _QUANTUM_US) * _QUANTUM_US
+
+
+def _events_tail(events) -> int:
+    """按区间 end 与点事件单 quantum 返回最大尾。"""
+    return max(
+        event.timestamp_us + max(event.duration_us, _QUANTUM_US)
+        for event in events
+    )
 
 
 def _planned_events(program, branch, start: int, session_index: int):
@@ -671,9 +897,11 @@ def _planned_events(program, branch, start: int, session_index: int):
     first = branch.logical_times[0]
     scenario_id = _scenario_id(program, branch.slot)
     events = []
-    for position, (role, logical_time) in enumerate(
-        zip(branch.roles, branch.logical_times)
+    metadata = _branch_metadata(program, branch)
+    for position, ((role, logical_time), temporal) in enumerate(
+        zip(zip(branch.roles, branch.logical_times), metadata)
     ):
+        _name, _offset, duration_us, resources = temporal
         event_key = _event_key(program, branch.slot, scenario_id, role, position)
         events.append(PlannedEvent(
             event_key=event_key,
@@ -681,6 +909,8 @@ def _planned_events(program, branch, start: int, session_index: int):
             position=position,
             logical_time_us=logical_time,
             timestamp_us=start + logical_time - first,
+            duration_us=duration_us,
+            resources=resources,
             session_id=f"primary_{session_index:06d}",
         ))
     return tuple(events)
@@ -695,19 +925,21 @@ def _earliest_calendar_start(program, branch, lower: int) -> int:
     @return 最早合法 epoch 微秒。
     """
     if program.mode == "instruction_only":
-        return lower
+        return _align_millisecond(lower)
     pattern = program.patterns[branch.slot.pattern_name]
     roles = {role.name: role for role in pattern.roles}
     constrained = [
-        (logical - branch.logical_times[0], roles[name].calendar_window)
-        for name, logical in zip(branch.roles, branch.logical_times)
+        (offset, duration, roles[name].calendar_window)
+        for name, offset, duration, _resources in _branch_metadata(program, branch)
         if roles[name].calendar_window is not None
     ]
     if not constrained:
-        return lower
-    intervals = [(lower, lower + 21 * _DAY_US)]
-    for offset, window_name in constrained:
-        allowed = _calendar_start_intervals(program.calendar_windows[window_name], offset, lower)
+        return _align_millisecond(lower)
+    intervals = [(_align_millisecond(lower), lower + 21 * _DAY_US)]
+    for offset, duration, window_name in constrained:
+        allowed = _calendar_start_intervals(
+            program.calendar_windows[window_name], offset, duration, lower,
+        )
         intervals = _intersect_intervals(intervals, allowed)
     if not intervals:
         raise _PrimaryLayoutInfeasible
@@ -725,24 +957,27 @@ def _branch_start_intervals(program, branch, lower: int, upper: int):
     """
     intervals = [(lower, upper)]
     if program.mode == "instruction_only":
-        return intervals
+        return [(_align_millisecond(lower), upper)]
     pattern = program.patterns[branch.slot.pattern_name]
     roles = {role.name: role for role in pattern.roles}
-    for name, logical in zip(branch.roles, branch.logical_times):
+    for name, offset, duration, _resources in _branch_metadata(program, branch):
         window_name = roles[name].calendar_window
         if window_name is None:
             continue
-        offset = logical - branch.logical_times[0]
-        allowed = _calendar_start_intervals(program.calendar_windows[window_name], offset, lower)
+        allowed = _calendar_start_intervals(
+            program.calendar_windows[window_name], offset, duration, lower,
+        )
         intervals = _intersect_intervals(intervals, allowed)
     return [(start, end) for start, end in intervals if start <= upper and end >= lower]
 
 
-def _calendar_start_intervals(window, logical_offset: int, lower: int):
+def _calendar_start_intervals(window, logical_offset: int, duration_us: int,
+                              lower: int):
     """展开 21 天内一个 role window 的可用 branch-start 区间。
 
     @param window 命名 calendar window。
     @param logical_offset role 相对 branch 起点偏移。
+    @param duration_us role 固定时长。
     @param lower branch start 下界。
     @return 闭区间整数微秒列表。
     """
@@ -753,6 +988,7 @@ def _calendar_start_intervals(window, logical_offset: int, lower: int):
         _plan_infeasible("calendar timestamp exceeds supported datetime range")
     day = datetime(local.year, local.month, local.day, tzinfo=zone)
     intervals = []
+    occupied = max(duration_us, _QUANTUM_US)
     for day_offset in range(22):
         try:
             current = day + timedelta(days=day_offset)
@@ -764,7 +1000,7 @@ def _calendar_start_intervals(window, logical_offset: int, lower: int):
         delta = current.astimezone(timezone.utc) - _EPOCH_UTC
         base = delta.days * _DAY_US + delta.seconds * 1_000_000 + delta.microseconds
         intervals.extend(
-            (base + start - logical_offset, base + end - logical_offset - 1)
+            (base + start - logical_offset, base + end - logical_offset - occupied)
             for start, end in window.intervals_us
         )
     return intervals
@@ -772,15 +1008,128 @@ def _calendar_start_intervals(window, logical_offset: int, lower: int):
 
 def _validate_timestamp_range(program, placed, noise_slots, replay_layouts) -> None:
     """在计划交付前验证全部工件时间可精确渲染为 ISO8601。"""
-    primary = (event.timestamp_us for branch in placed for event in branch.events)
-    replay = (value for layout in replay_layouts for value in layout.timestamps_us)
-    timestamps = tuple((*primary, *(item.timestamp_us for item in noise_slots), *replay))
+    timestamps = []
+    for branch in placed:
+        for event in branch.events:
+            timestamps.extend((event.timestamp_us, event.timestamp_us + event.duration_us))
+    timestamps.extend(item.timestamp_us for item in noise_slots)
+    sources = {
+        (item.logical.slot.slot_key, item.logical.variant_name): item
+        for item in placed
+    }
+    for layout in replay_layouts:
+        source = sources[(layout.source_slot_key, layout.source_variant_name)]
+        for event in source.events:
+            start = event.timestamp_us + layout.shift_us
+            timestamps.extend((start, start + event.duration_us))
     zone = timezone(timedelta(minutes=program.timeline.utc_offset_minutes))
     try:
         for value in timestamps:
             (_EPOCH_UTC + timedelta(microseconds=value)).astimezone(zone)
     except (OverflowError, ValueError):
         _plan_infeasible("planned timestamp exceeds supported datetime range")
+
+
+def _preflight_temporal_values(program, plan: ScenarioPlan) -> None:
+    """在任何 LLM 调用前验证全部机械时间叶值。"""
+    slots = {item.slot_key: item for item in plan.delivery_slots}
+    groups = {
+        key: events for block in plan.blocks for key, events in block.items()
+    }
+    for (slot_key, _variant), events in groups.items():
+        slot = slots[slot_key]
+        for event in events:
+            for frame_name in _event_frame_names(program, slot, event):
+                _preflight_frame_event(program, frame_name, event.timestamp_us,
+                                       event.duration_us, event.resources)
+    for noise in plan.noise_slots:
+        _preflight_frame_event(
+            program, noise.frame_class, noise.timestamp_us, noise.duration_us,
+            noise.resources,
+        )
+    _preflight_replays(program, plan, groups)
+    _preflight_annotations(program, plan, groups)
+
+
+def _event_frame_names(program, slot, event) -> tuple[str, ...]:
+    """返回计划事件在内容生成时可用的帧类闭集。"""
+    if program.mode == "declared":
+        pattern = program.patterns[slot.pattern_name]
+        role = next(item for item in pattern.roles if item.name == event.role)
+        return (role.frame_class,)
+    noise_name = None if program.noise is None else program.noise.frame_class
+    return tuple(
+        name for name, frame in program.frame_classes.items()
+        if name != noise_name and is_generation_frame_eligible(frame)
+    )
+
+
+def _preflight_frame_event(program, frame_name: str, timestamp_us: int,
+                           duration_us: int, resources) -> None:
+    """验证一个帧类在固定计划时间上的全部 binding 叶子。"""
+    frame = program.frame_classes[frame_name]
+    if frame.duration_us != duration_us or frame.resources != tuple(resources):
+        _plan_infeasible("planned event interval differs from frame declaration")
+    try:
+        values = resolve_frame_time_values(
+            frame.time_bindings, timestamp_us, duration_us,
+            program.timeline.utc_offset_minutes,
+        )
+    except ValueError:
+        _plan_infeasible("planned frame time binding cannot be resolved")
+    _validate_mechanical_leaf_values(frame.gen_schema, values)
+
+
+def _preflight_replays(program, plan, groups) -> None:
+    """在平移后的 replay 起点上重新验证 frame 时间叶子。"""
+    slots = {item.slot_key: item for item in plan.delivery_slots}
+    for layout in plan.replay_layouts:
+        key = (layout.source_slot_key, layout.source_variant_name)
+        source = groups[key]
+        slot = slots[layout.source_slot_key]
+        for event in source:
+            frame_name = _event_frame_names(program, slot, event)[0]
+            _preflight_frame_event(
+                program, frame_name, event.timestamp_us + layout.shift_us,
+                event.duration_us, event.resources,
+            )
+
+
+def _preflight_annotations(program, plan, groups) -> None:
+    """验证每个可交付 branch 的 annotation 资源起点叶值。"""
+    for slot in plan.delivery_slots:
+        view = program.class_views[slot.sequence_class]
+        if not view.time_bindings:
+            continue
+        for variant in slot.variant_names:
+            events = groups[(slot.slot_key, variant)]
+            values = {}
+            for binding in view.time_bindings:
+                starts = [event.timestamp_us for event in events
+                          if event.duration_us > 0 and binding.resource in event.resources]
+                if not starts:
+                    _plan_infeasible("annotation resource is absent from a deliverable branch")
+                values[binding.payload_path] = min(starts) // _QUANTUM_US
+            _validate_mechanical_leaf_values(view.schema, values)
+
+
+def _validate_mechanical_leaf_values(schema, values) -> None:
+    """用完整 Schema 中的原始叶子约束验证机械值。"""
+    if not values:
+        return
+    if schema is None:
+        _plan_infeasible("temporal binding requires a full Schema")
+    for path, value in values.items():
+        leaf = schema
+        for token in JsonPointer(path).parts:
+            properties = leaf.get("properties") if isinstance(leaf, dict) else None
+            if properties is None and hasattr(leaf, "get"):
+                properties = leaf.get("properties")
+            if not hasattr(properties, "get"):
+                _plan_infeasible("temporal binding leaf is absent from full Schema")
+            leaf = properties.get(token)
+        if not hasattr(leaf, "items") or tuple(Draft202012Validator(leaf).iter_errors(value)):
+            _plan_infeasible("planned mechanical value violates its full Schema leaf")
 
 
 def _intersect_intervals(left, right):
@@ -811,7 +1160,9 @@ def _check_session(program, slot_key, events, start: int, count: int) -> None:
     """
     if count > program.timeline.session_max_events:
         raise _PrimaryLayoutInfeasible
-    if events[-1].timestamp_us - start > program.timeline.session_max_span_us:
+    last = max(event.timestamp_us + event.duration_us for event in events)
+    first = min(event.timestamp_us for event in events)
+    if last - first > program.timeline.session_max_span_us:
         raise _PrimaryLayoutInfeasible
 
 
@@ -897,17 +1248,8 @@ def _baseline_events(program, baseline, anchor_events):
         program, baseline, program.timeline.timestamp_start_us,
     )
     session = anchor_events[0].session_id
-    scenario_id = _scenario_id(program, baseline.slot)
-    return tuple(PlannedEvent(
-        event_key=_event_key(program, baseline.slot, scenario_id, role, position),
-        role=role,
-        position=position,
-        logical_time_us=logical,
-        timestamp_us=start + logical - baseline.logical_times[0],
-        session_id=session,
-    ) for position, (role, logical) in enumerate(
-        zip(baseline.roles, baseline.logical_times)
-    ))
+    events = _planned_events(program, baseline, start, 0)
+    return tuple(dataclasses.replace(event, session_id=session) for event in events)
 
 
 def _noise_slots(program, cursor: int) -> tuple[tuple[NoiseSlot, ...], int]:
@@ -924,7 +1266,7 @@ def _noise_slots(program, cursor: int) -> tuple[tuple[NoiseSlot, ...], int]:
     session_start = None
     session_count = 0
     for ordinal in range(program.timeline.noise_events):
-        cursor, session_index, session_start, session_count = _next_noise_time(
+        timestamp, cursor, session_index, session_start, session_count = _next_noise_time(
             program, cursor, session_index, session_start, session_count
         )
         event_key = derive_generation_id(
@@ -935,7 +1277,9 @@ def _noise_slots(program, cursor: int) -> tuple[tuple[NoiseSlot, ...], int]:
             ordinal=ordinal,
             frame_class=program.noise.frame_class,
             topic=program.noise.topics[ordinal],
-            timestamp_us=cursor,
+            timestamp_us=timestamp,
+            duration_us=0,
+            resources=(),
             session_id=f"noise_{session_index:06d}",
         ))
     return tuple(slots), cursor
@@ -949,20 +1293,20 @@ def _next_noise_time(program, cursor, session_index, session_start, session_coun
     @param session_index 当前 noise session 序号。
     @param session_start 当前 session 首时间或 None。
     @param session_count 当前 session 事件数。
-    @return 更新后的四元组。
+    @return timestamp、新 tail、session 序号、起点与计数。
     """
-    gap = max(program.timeline.event_gap_us[0], 1)
-    timestamp = cursor + gap
+    gap = max(program.timeline.event_gap_us[0], _QUANTUM_US)
+    timestamp = cursor + max(gap - _QUANTUM_US, 0)
     if session_start is None:
-        timestamp = cursor + max(program.timeline.session_gap_us, 1)
+        timestamp = cursor + max(program.timeline.session_gap_us, _QUANTUM_US)
         session_start = timestamp
     exceeds = (session_count >= program.timeline.session_max_events
                or timestamp - session_start > program.timeline.session_max_span_us)
     if exceeds:
         session_index += 1
-        timestamp = cursor + max(program.timeline.session_gap_us, 1)
+        timestamp = cursor + max(program.timeline.session_gap_us, _QUANTUM_US)
         session_start, session_count = timestamp, 0
-    return timestamp, session_index, session_start, session_count + 1
+    return timestamp, timestamp + _QUANTUM_US, session_index, session_start, session_count + 1
 
 
 def _replay_layouts(program, placed, cursor: int) -> tuple[ReplayLayout, ...]:
@@ -976,23 +1320,31 @@ def _replay_layouts(program, placed, cursor: int) -> tuple[ReplayLayout, ...]:
     positives = [item for item in placed if _is_positive(program, item.logical)]
     layouts = []
     for ordinal, source in enumerate(positives[:program.timeline.duplicate_sequences]):
-        cursor += max(program.timeline.session_gap_us, 1)
-        first = source.events[0].logical_time_us
-        timestamps = tuple(
-            cursor + event.logical_time_us - first for event in source.events
+        lower = cursor + max(program.timeline.session_gap_us, _QUANTUM_US)
+        start = _earliest_calendar_start(program, source.logical, lower)
+        shift = start - source.events[0].timestamp_us
+        if shift <= 0 or shift % _QUANTUM_US:
+            _plan_infeasible("replay shift must be positive and millisecond aligned")
+        replay_events = tuple(
+            dataclasses.replace(
+                event,
+                timestamp_us=event.timestamp_us + shift,
+                session_id=f"replay_{ordinal:06d}",
+            )
+            for event in source.events
         )
-        if len(timestamps) > program.timeline.session_max_events:
-            _plan_infeasible("replay exceeds session event capacity")
-        if timestamps[-1] - timestamps[0] > program.timeline.session_max_span_us:
-            _plan_infeasible("replay exceeds session span")
+        _check_session(
+            program, source.logical.slot.slot_key, replay_events,
+            replay_events[0].timestamp_us, len(replay_events),
+        )
         layouts.append(ReplayLayout(
             source_slot_key=source.logical.slot.slot_key,
             source_variant_name=source.logical.variant_name,
             replay_ordinal=ordinal,
             session_id=f"replay_{ordinal:06d}",
-            timestamps_us=timestamps,
+            shift_us=shift,
         ))
-        cursor = timestamps[-1]
+        cursor = _events_tail(replay_events)
     return tuple(layouts)
 
 
@@ -1073,6 +1425,18 @@ def _solve(model: cp_model.CpModel, seed: int, identity: str) -> cp_model.CpSolv
     _plan_internal(f"CP-SAT model is invalid: {identity}")
 
 
+def _solve_lexicographic(model, seed: int, identity: str, objectives):
+    """按声明序逐项冻结确定性最优值。"""
+    solver = None
+    for objective in objectives:
+        model.minimize(objective)
+        solver = _solve(model, seed, identity)
+        model.add(objective == solver.value(objective))
+    if solver is None:
+        _plan_internal("lexicographic objective list is empty")
+    return solver
+
+
 def _solver_seed(seed: int, identity: str) -> int:
     """为一个 solver layer 派生稳定 31-bit seed。
 
@@ -1080,8 +1444,7 @@ def _solver_seed(seed: int, identity: str) -> int:
     @param identity layer 身份。
     @return OR-Tools 接受的非负整数 seed。
     """
-    material = canonical_json(["labelkit:v1.18", "planner_seed", [seed, identity]])
-    return int.from_bytes(hashlib.sha256(material.encode("utf-8")).digest()[:4], "big") & 0x7fffffff
+    return int(generation_digest("planner_seed", [seed, identity])[:8], 16) & 0x7fffffff
 
 
 def _plan_infeasible(message: str):

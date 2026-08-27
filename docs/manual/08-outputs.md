@@ -86,7 +86,8 @@ stream 每行顶层固定为 `payload` 与 `_meta`。primary event 的核心形�
 {
   "payload": {
     "request_id": "R-100",
-    "ticket_id": "T-100"
+    "ticket_id": "T-100",
+    "timestamp": 1767575760000
   },
   "_meta": {
     "event": {
@@ -97,14 +98,20 @@ stream 每行顶层固定为 `payload` 与 `_meta`。primary event 的核心形�
       "frame_class": "confirmation",
       "actor": "system",
       "logical_time_us": 960000000,
-      "timestamp": "2026-01-05T09:16:00.000000+08:00"
+      "timestamp": "2026-01-05T09:16:00.000000+08:00",
+      "duration_us": 120000000,
+      "resources": ["foreground_app"],
+      "time_bindings": [
+        {"payload_path": "/timestamp", "source": "event_start_milliseconds"}
+      ]
     }
   }
 }
 ```
 
 同一 owner 的事件按声明顺序留在 main 的 members 中；整个 stream 按最终 timestamp 全局稳定排序，因此 crossing
-可以呈现真实的 A-B-A 或 B-A-B。timestamp、gap 与 elapsed 只属于 `_meta.event`，不会写回用户 payload。
+可以呈现真实的 A-B-A 或 B-A-B。`_meta.event.timestamp` 是权威起点；descriptor 中声明的 payload 业务时间由
+框架按同一计划机械写入。模型不会生成这些时间叶子，M11 也只复验而不修复。
 
 特殊行：
 
@@ -122,8 +129,11 @@ text_field = "payload"
 order_by = "meta:_meta.event.timestamp"
 ```
 
-M2 从同一 stream 文件重算 primary event ID、每个 owner 的 ordered sequence ID、replay sequence/event ID 和
-duplicate provenance。它不依赖 main 文件；格式、唯一性、顺序、payload 或 provenance 任一失配都会 fail closed。
+M2 从同一 stream 文件重算 primary/noise/replay binding、event ID、每个 owner 的 ordered sequence ID、
+replay sequence/event ID 和 duplicate provenance。它用自描述的 `duration_us`、`resources` 与 `time_bindings`
+验证外层时间和 payload 时间；replay 必须保持 source 的非时间内容、duration/resources 与成员 start delta，并对全部
+成员使用同一个正 `shift_us` 重新绑定 payload。它不依赖 main 文件；descriptor、格式、唯一性、顺序、payload 或
+provenance 任一失配都会 fail closed。
 
 ## 8.5 manifest：消费者唯一信任的成功标记
 

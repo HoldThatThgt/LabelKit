@@ -227,3 +227,20 @@ def build_frame_annotate_prompt(member: Record, cfg: ResolvedConfig, schema_text
 - **跳过与失败语义**：帧类视图 `enabled=false` ⇒ 该成员 skipped、**不占键**、计 `frame_annotate.skipped`。process/flat 中，修复穷尽或不可恢复错误使该成员占键 None、计 `frame_annotate.failed`，episode 可继续发射。sequence attempt 中，任一应标注成员失败都使 `run_attempt.accepted=false`、`rejected_stage="annotate"`，M10 丢弃并重试整个 counterfactual set；失败 attempt 的成员标注与 dataset counters 不提交，已经发生的 Schema/usage/retry/trace 证据保留。TaskExecutor 必须等待全部 frame 叶任务及 cleanup 收敛，reducer 才能返回失败；叶任务不得在 attempt 结束后继续运行或修改状态。成功成员占键 Annotation。
 - **无降级梯（最小单元）**：帧 prompt 本身就是最小单元——单成员、至多单图，无窗可分、无关键帧可减；预算装填裁树后仍超限 ⇒ `ContextOverflowError(phase="precheck")`，按成员失败处置（注定失败的请求永不发出）、**永不喂熔断**；反应式终端镜像本模块 A7 纪律（仅 http_400 反应式恰一次喂）。图像成本恒取 profile 工作点（`default_image_px`——校准器按 profile 聚合的前提，帧调用不设独立尺寸）。
 - **事件载荷纪律**：`annotate.frame` 每成员一发（ids=(episode_id,)，3.12.4）；payload 仅 `member_id` / `status` / `attempts`——标注内容只经既有 `excerpt` 键按档位截断（excerpt/full 档 200 字，7.4），**不新增任何承载数据内容的 payload 键**（none 档预脱敏载荷直通 console 面板的红线）。
+
+### 3.5.6 v1.20 sequence annotation 时间
+
+declared sequence class 可以在完整 annotation Schema 的标量叶子上写
+`x-labelkit-business-time = true`，并以 `[class.<name>.annotate].time_bindings` 一一声明
+`source = "first_resource_start_milliseconds"` 与目标 resource。M5 在最终 members 上恰构造一次冻结
+`SequenceTemporalContext`；每个 member 只携带 event ID、Planner start、duration 与 resources，不携带 payload。
+机械值是目标 resource 最早正区间的 start 毫秒。
+
+首轮 sample、self-consistency vote、`annotate_record`、`annotate_record_leaf` 和 verify 返工都调用
+`complete_finalized(FinalizedCallRequest)`：provider 与 L3 只接收剥离时间叶子的 model Schema；finalizer 在副本上注入
+同一个 temporal context 的值后执行完整 Schema 与 L2.5。repair projector 从 previous output 删除仍可达的时间叶，
+错误 parent 类型时不创建或替换 parent。调用有 time binding 却缺失或替换 context 是 internal contract error；
+禁止从 `Record.raw`、generation provenance、payload 文本、wall clock 或导出器猜值。
+
+该 binding 只存在于 generate-only sequence declared mode；普通 process、instruction-only、ordinary annotation 或
+annotate disabled 配置已由 M1 拒绝。M11 只复验最终值，不新增或修复 annotation 时间。

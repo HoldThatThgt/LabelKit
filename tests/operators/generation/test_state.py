@@ -10,7 +10,6 @@ import pytest
 from labelkit.common.contracts.generation import (
     EventDraft,
     EventExecutionContext,
-    EventPlan,
     ScenarioSeed,
     StateEvaluationRequest,
 )
@@ -72,7 +71,7 @@ def _ack_context(program, plan):
     view = build_actor_view(first)
     draft = EventDraft(
         planned.event_key, "first-event", "task_request", "requester",
-        planned.logical_time_us, planned.timestamp_us, view, "submit request",
+        planned.logical_time_us, planned.timestamp_us, planned.duration_us, view, "submit request",
         execution.normalized_patch, execution.state_before_hash, execution.state_after_hash,
         execution.publish_snapshot, {"request_id": "R-100", "status": "pending"},
     )
@@ -99,7 +98,7 @@ def _confirm_context(program, plan):
     planned = resolve_planned_events(context)[1]
     draft = EventDraft(
         planned.event_key, "second-event", "acknowledgement", "system",
-        planned.logical_time_us, planned.timestamp_us, build_actor_view(context),
+        planned.logical_time_us, planned.timestamp_us, planned.duration_us, build_actor_view(context),
         "acknowledge request", execution.normalized_patch, execution.state_before_hash,
         execution.state_after_hash, execution.publish_snapshot,
         {"request_id": "R-100", "status": "acknowledged"},

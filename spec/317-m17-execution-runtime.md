@@ -89,7 +89,8 @@ PreparedNoiseCandidate(
     noise_slot, attempt_index, payload_digest, row, similarity_signature,
     dataset_counters, retained_content_bytes, digest,
 )
-CrossViewDelta(phase, ordinal, event_ids, timestamps_us, source_keys)
+ResourceInterval(resource, start_us, end_us, event_id, source_key)
+CrossViewDelta(phase, ordinal, event_ids, timestamps_us, source_keys, resource_intervals)
 ```
 
 ### 3.17.3 ExecutionRuntime
@@ -221,17 +222,23 @@ group_revalidate → candidate digest → CrossViewFrontier check
 → group_commit → frontier/dataset/rows/replay/retained commit
 ```
 
+v1.20 的 `CrossViewDelta` 还冻结当前 source primary 与全部 replay 的 `ResourceInterval`。frontier check 在 formal
+mutation 前验证 event start 全局唯一与同 resource 半开区间不重叠；source/replay 只有这一个 checked delta。
+replay 构造、time binding、constant shift、interval 或 retained 任一失败都在 `group_commit` 前回滚，不能先提交
+primary 再补 replay。`group_commit` 后的 frontier、dataset、rows、replay、retained state swaps 只消费同一 delta。
+
 reservation 后的 downstream recoverable outcome 保留 reservation 到 head；此时仍先 revalidate，若最新低 ordinal
 前缀产生 duplicate，则记录 dedup rejection，否则才记录已保存的 downstream failure 并 discard。group_commit 后
 不得再出现普通 recoverable 分支。
 
 noise 使用独立 `NoiseCandidateReconcileRequest` 与 `PreparedNoiseCandidate`。其 head 顺序为最新 primary/较低 noise
 上的 similarity probe、frozen digest、CrossViewFrontier、retained 与 delta 预验证、similarity commit、frontier/row/
-retained commit，全部无 `await`。Replay 不单独运行 coordinator，只从 source 的最终 SequenceRows 派生并随 source
-候选校验、计费和提交。
+retained commit，全部无 `await`。Replay 不单独运行 coordinator，只从 source 的最终 SequenceRows 按 Planner
+constant shift 重绑 business time，并随 source 候选校验、计费和提交。
 
 candidate-local reconcile 不读取已提交前缀；CrossViewFrontier 每次只检查当前候选并产生不可失败的增量提交状态。
-全部 primary/noise/replay 内存提交后，`reconcile_views()` 从最终 rows 独立完整重建一次。最终 full reconcile 失败是
+全部 primary/noise/replay 内存提交后，`reconcile_views()` 从 program、plan、main 与 stream 独立完整重建一次，
+并按每个 resource 的 sort/sweep 复验全局区间。最终 full reconcile 失败是
 InternalError、exit 4，不消费 attempt、不打开输出；不存在重建已提交前缀的第二接口。
 
 当前 head 耗尽时停止接纳，取消并等待所有更高 coordinator，discard 全部 reservation/candidate/capture。高槽未轮到

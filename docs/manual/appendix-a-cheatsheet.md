@@ -227,8 +227,21 @@ max_span_s = 2400
 | `pre_state_schema_path` | 可选 | patch 前完整 state 约束 |
 | `payload_bindings` | 可选有序表 | authoritative state → payload |
 
-每对相邻 role 必须恰有一个 named gap，声明 before/after、闭区间 min/max seconds。可以追加非相邻正向 gap。
-所有秒值最多六位小数并无损转微秒。
+frame class 的 temporal 键：
+
+| 键 | 约束 | 用途 |
+|---|---|---|
+| `duration_s` | 缺省为点事件；在场为正、精确到整数毫秒 | 固定 event interval |
+| `resources` | 声明序唯一，匹配 `[a-z0-9_]+` | 容量为一的互斥资源 |
+| `time_bindings` | 与完整 Schema 的业务时间路径集完全相等 | Planner 时间机械写入 payload |
+
+完整 Schema 的每个业务时间标量叶子必须声明 `x-labelkit-business-time = true`。frame binding source 是
+event start/end/duration 的 milliseconds 或 start/end 的 fixed-offset ISO 8601。模型只消费删除这些叶子的
+model Schema；generic candidate finalizer 注入后再执行完整 Schema。
+
+每对相邻 role 必须恰有一个 named gap，声明 before/after、闭区间 min/max seconds。可以追加非相邻正向 gap；
+`[[generate.pattern.<name>.containments]]` 用 `container` 与 `contained` 声明至少 1 毫秒余量的严格区间包含。
+所有时间配置与 Planner 结果都必须对齐 1 毫秒 quantum。
 
 ## A.11 counterfactual set
 
@@ -276,20 +289,22 @@ EventPlanRequest 显式携带完整 state Schema，让 post-validator/L3 能看�
 | 键 | 约束 | 用途 |
 |---|---|---|
 | `generate.timeline.timestamp_start` | 带 offset ISO 时间 | 确定性起点 |
-| `event_gap_s` | [lo, hi] | instruction-only / noise / replay 默认间隔 |
+| `event_gap_s` | [lo, hi] | instruction-only / noise 默认间隔 |
 | `primary_sessions` | 精确 | primary session 数 |
 | `crossed_primary_sessions` | 精确 | 双 owner session 数 |
 | `session_max_events` | 正整数 | session 容量 |
 | `session_max_span_s` | 正数 | session 时间跨度 |
 | `session_gap_s` | 正数 | session 间隔 |
 | `noise_events` | 非负 | 精确 noise slots |
-| `duplicate_sequences` | 非负 | 从 committed positive 选择 replay source |
+| `duplicate_sequences` | 非负 | 从 committed positive 选择 constant-shift replay source |
 | `generate.calendar_window.<name>` | fixed offset + days + half-open intervals | role 可引用的日历窗口 |
 | `generate.noise.frame_class` | 独立 object frame class | noise payload |
 | `generate.noise.instruction` | noise 非零时必填 | noise 生成约束 |
 
 若 primary sequence 总数为 N、crossing 为 D，则 primary sessions 必须等于 N-D。同一个 counterfactual set 的
-variants 不共 session。instruction-only 要求 zero crossing、zero replay、primary sessions = sequence count。
+variants 不共 session。instruction-only 要求 zero crossing、zero replay、primary sessions = sequence count。noise 与
+instruction-only 只能选择点 frame class。replay 的所有成员使用同一个正、毫秒对齐的 shift，保持 source 的 start delta、
+duration、resources 与非时间 payload，并按 replay 起点重新绑定业务时间。
 
 ## A.14 固定上限
 

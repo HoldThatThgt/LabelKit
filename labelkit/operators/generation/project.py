@@ -1,4 +1,4 @@
-"""v1.18 generation ID、双视图投影与提交前机械对账。"""
+"""v1.20 generation ID、双视图投影与提交前机械时间对账。"""
 from __future__ import annotations
 
 import dataclasses
@@ -10,6 +10,14 @@ from collections.abc import Mapping as MappingABC
 from datetime import datetime, timedelta, timezone
 from typing import Mapping, Sequence
 
+from jsonpointer import JsonPointer, JsonPointerException
+from jsonschema import Draft202012Validator
+
+from labelkit.common.config._temporal import (
+    inject_temporal_values,
+    project_temporal_instance,
+    resolve_frame_time_values,
+)
 from labelkit.common.config.generation import is_generation_frame_eligible
 from labelkit.common.contracts.generation import (
     CrossViewDelta,
@@ -25,6 +33,7 @@ from labelkit.common.contracts.generation import (
     ProjectedSequence,
     ProjectionRequest,
     ReconcileRequest,
+    ResourceInterval,
     ReplayProjectionRequest,
     ReplayRows,
     ScenarioPlan,
@@ -34,10 +43,11 @@ from labelkit.common.errors import GenerationProjectionMismatch, InternalError
 
 
 _log = logging.getLogger("labelkit.generation.project")
+_GENERATION_HEADER = "labelkit:v1.20"
 
 
 def canonical_json(value: object) -> str:
-    """返回 v1.18 使用的规范 JSON。
+    """返回 generation 使用的规范 JSON。
 
     @param value JSON-compatible 值。
     @return 键序稳定且无空白的 JSON。
@@ -45,6 +55,27 @@ def canonical_json(value: object) -> str:
     return json.dumps(
         _thaw_json(value), ensure_ascii=False, sort_keys=True, separators=(",", ":")
     )
+
+
+def generation_digest(domain: str, value: object) -> str:
+    """以 v1.20 域分离 canonical JSON 计算完整 SHA-256。
+
+    @param domain 冻结 generation 域。
+    @param value 当前域的规范材料。
+    @return 64 位小写十六进制摘要。
+    """
+    material = canonical_json([_GENERATION_HEADER, domain, value])
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def generation_random(domain: str, value: object) -> int:
+    """从 v1.20 generation digest 派生确定性完整整数。
+
+    @param domain 冻结随机域。
+    @param value 当前域的规范材料。
+    @return SHA-256 摘要对应的非负整数。
+    """
+    return int(generation_digest(domain, value), 16)
 
 
 def _thaw_json(value: object) -> object:
@@ -72,8 +103,7 @@ def derive_generation_id(domain: str, components: Sequence[object]) -> str:
     @param components 按规范顺序排列的组件。
     @return 32 位小写十六进制 ID。
     """
-    material = canonical_json(["labelkit:v1.18", domain, list(components)])
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
+    return generation_digest(domain, list(components))[:32]
 
 
 def scenario_plan_digest(plan: ScenarioPlan) -> str:
@@ -97,7 +127,7 @@ def scenario_plan_digest(plan: ScenarioPlan) -> str:
         "replay_layouts": [dataclasses.asdict(item) for item in plan.replay_layouts],
         "primary_sessions": plan.primary_sessions,
     }
-    return hashlib.sha256(canonical_json(material).encode("utf-8")).hexdigest()
+    return generation_digest("scenario_plan", material)
 
 
 def validate_planned_events(
@@ -191,8 +221,7 @@ def validate_plan_identity(program: GenerationProgram, plan: ScenarioPlan) -> No
 
 def _witness_digest(domain: str, value: object) -> str:
     """以冻结 domain 对 canonical source value 计算完整 SHA-256。"""
-    material = canonical_json(["labelkit:v1.18", domain, value])
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return generation_digest(domain, value)
 
 
 def noise_payload_digest(payload: Mapping[str, object]) -> str:
@@ -239,7 +268,7 @@ def _project_trace_from_validated_plan(request: ProjectionRequest) -> ProjectedS
         "sequence_id", [request.trace.world_branch_id, event_ids]
     )
     rows = tuple(
-        _primary_row(event, sequence_id, generation, request.program.timeline.utc_offset_minutes)
+        _primary_row(event, sequence_id, generation, request.program)
         for event in request.trace.events
     )
     members = tuple(_member_record(row) for row in rows)
@@ -287,6 +316,61 @@ def _primary_base(row) -> dict[str, object]:
     }
 
 
+def _time_descriptor(frame) -> list[dict[str, str]]:
+    """把帧类时间声明投影为 stream 自描述表。"""
+    return [
+        {"payload_path": binding.payload_path, "source": binding.source}
+        for binding in frame.time_bindings
+    ]
+
+
+def _frame_for_event(program, frame_class: object):
+    """读取一条 event 对应的生成帧类并拒绝未知名称。"""
+    frame = program.frame_classes.get(frame_class) if isinstance(frame_class, str) else None
+    if frame is None or not isinstance(frame.gen_schema, MappingABC):
+        _contract_error("event frame class has no complete generation Schema")
+    return frame
+
+
+def _validate_payload_time(program, frame, payload, timestamp_us: int, duration_us: int) -> None:
+    """独立复验 payload 机械时间、非时间闭包与完整 Schema。"""
+    if not isinstance(payload, MappingABC):
+        _temporal_contract_error("event payload is not an object")
+    try:
+        values = resolve_frame_time_values(
+            frame.time_bindings,
+            timestamp_us,
+            duration_us,
+            program.timeline.utc_offset_minutes,
+        )
+        projected = project_temporal_instance(payload, frame.business_time_paths)
+        rebound = inject_temporal_values(projected, values)
+    except ValueError:
+        _temporal_contract_error("event payload time binding cannot be reconstructed")
+    if canonical_json(rebound) != canonical_json(payload):
+        _temporal_contract_error("event payload time differs from the plan")
+    if any(Draft202012Validator(_thaw_json(frame.gen_schema)).iter_errors(_thaw_json(payload))):
+        _temporal_contract_error("event payload fails its complete frame Schema")
+
+
+def _rebound_payload(program, frame, payload, timestamp_us: int, duration_us: int) -> dict:
+    """删除 source 时间叶并按 replay 起点机械注入完整 payload。"""
+    try:
+        model_payload = project_temporal_instance(payload, frame.business_time_paths)
+        values = resolve_frame_time_values(
+            frame.time_bindings,
+            timestamp_us,
+            duration_us,
+            program.timeline.utc_offset_minutes,
+        )
+        rebound = inject_temporal_values(model_payload, values)
+    except ValueError:
+        _contract_error("replay payload time rebinding failed")
+    if any(Draft202012Validator(_thaw_json(frame.gen_schema)).iter_errors(rebound)):
+        _contract_error("replay payload fails its complete frame Schema")
+    return rebound
+
+
 def _validate_projection_request(request: ProjectionRequest) -> None:
     """校验 trace 与当前交付槽一致。
 
@@ -324,26 +408,41 @@ def _validate_trace_identity(request: ProjectionRequest) -> None:
     if trace.scenario_id != scenario_id or trace.world_branch_id != world_id:
         _contract_error("trace branch identity is not bound to the program")
     for event, witness in zip(trace.events, planned, strict=True):
+        frame = _frame_for_event(request.program, event.frame_class)
+        if request.program.mode == "instruction_only":
+            noise = request.program.noise
+            if (not is_generation_frame_eligible(frame)
+                    or (noise is not None and event.frame_class == noise.frame_class)):
+                _contract_error("instruction trace frame class is outside the registry")
+            if event.actor not in trace.scenario_seed.actors:
+                _contract_error("instruction trace actor is outside the scenario")
         planned_fields = (
             event.event_key == witness.event_key,
             event.role == witness.role,
             event.logical_time_us == witness.logical_time_us,
             event.timestamp_us == witness.timestamp_us,
+            event.duration_us == witness.duration_us,
+            frame.duration_us == witness.duration_us,
+            tuple(frame.resources) == tuple(witness.resources),
         )
+        descriptor = _time_descriptor(frame)
         expected_id = derive_generation_id(
             "primary_event_id",
-            [world_id, witness.event_key, witness.timestamp_us, event.payload],
+            [
+                world_id,
+                witness.event_key,
+                witness.timestamp_us,
+                witness.duration_us,
+                list(witness.resources),
+                descriptor,
+                event.payload,
+            ],
         )
         if not all(planned_fields) or event.event_id != expected_id:
             _contract_error("trace event identity differs from its planned branch")
-        if request.program.mode == "instruction_only":
-            frame = request.program.frame_classes.get(event.frame_class)
-            noise = request.program.noise
-            if (frame is None or not is_generation_frame_eligible(frame)
-                    or (noise is not None and event.frame_class == noise.frame_class)):
-                _contract_error("instruction trace frame class is outside the registry")
-            if event.actor not in trace.scenario_seed.actors:
-                _contract_error("instruction trace actor is outside the scenario")
+        _validate_payload_time(
+            request.program, frame, event.payload, witness.timestamp_us, witness.duration_us
+        )
 
 
 def _projection_branch(request: ProjectionRequest) -> tuple[PlannedEvent, ...]:
@@ -476,15 +575,16 @@ def _variant_for(request: ProjectionRequest):
     return variant
 
 
-def _primary_row(event, sequence_id: str, generation: Mapping[str, object], offset: int) -> dict:
+def _primary_row(event, sequence_id: str, generation: Mapping[str, object], program) -> dict:
     """构造一行 primary stream 数据。
 
     @param event 当前 EventTruth。
     @param sequence_id owner sequence ID。
     @param generation owner generation truth。
-    @param offset 固定 UTC offset 分钟。
+    @param program 冻结生成程序。
     @return 完整 primary row。
     """
+    frame = _frame_for_event(program, event.frame_class)
     event_meta = {
         "event_id": event.event_id,
         "event_key": event.event_key,
@@ -493,7 +593,10 @@ def _primary_row(event, sequence_id: str, generation: Mapping[str, object], offs
         "frame_class": event.frame_class,
         "actor": event.actor,
         "logical_time_us": event.logical_time_us,
-        "timestamp": _timestamp_text(event.timestamp_us, offset),
+        "timestamp": _timestamp_text(event.timestamp_us, program.timeline.utc_offset_minutes),
+        "duration_us": event.duration_us,
+        "resources": list(frame.resources),
+        "time_bindings": _time_descriptor(frame),
     }
     stream_generation = dict(generation)
     stream_generation.pop("expected_violation", None)
@@ -544,8 +647,20 @@ def project_noise(request: NoiseProjectionRequest) -> Mapping[str, object]:
     @return 完整 noise row。
     """
     slot = request.noise_slot
+    frame = _frame_for_event(request.program, slot.frame_class)
+    descriptor = _time_descriptor(frame)
+    _validate_payload_time(request.program, frame, request.payload, slot.timestamp_us, 0)
     event_id = derive_generation_id(
-        "noise_event_id", [request.run_id, slot.event_key, slot.timestamp_us, request.payload]
+        "noise_event_id",
+        [
+            request.run_id,
+            slot.event_key,
+            slot.timestamp_us,
+            0,
+            [],
+            descriptor,
+            request.payload,
+        ],
     )
     event = {
         "event_id": event_id,
@@ -558,6 +673,9 @@ def project_noise(request: NoiseProjectionRequest) -> Mapping[str, object]:
         "timestamp": _timestamp_text(
             slot.timestamp_us, request.program.timeline.utc_offset_minutes
         ),
+        "duration_us": 0,
+        "resources": [],
+        "time_bindings": descriptor,
         "noise": True,
     }
     return {"payload": request.payload, "_meta": {"event": event, "generation": None}}
@@ -577,8 +695,11 @@ def _project_replay_from_validated_plan(request: ReplayProjectionRequest) -> Rep
     """仅供已在运行边界验证过完整 plan 的控制器投影 replay。"""
     _validate_replay_request(request)
     source_rows = request.source.primary_stream_rows
-    if len(source_rows) != len(request.layout.timestamps_us) or not source_rows:
-        _contract_error("replay source row count does not match planned timestamps")
+    planned = _branch_events(
+        request.plan, request.layout.source_slot_key, request.layout.source_variant_name
+    )
+    if len(source_rows) != len(planned) or not source_rows:
+        _contract_error("replay source row count does not match the planned branch")
     source_id = _single_owner(source_rows)
     replay_id = derive_generation_id(
         "replay_sequence_id", [source_id, request.layout.replay_ordinal]
@@ -598,6 +719,8 @@ def _validate_replay_request(request: ReplayProjectionRequest) -> None:
     matches = [item for item in request.plan.replay_layouts if item == request.layout]
     if len(matches) != 1:
         _contract_error("replay layout is absent from the planned replay table")
+    if request.layout.shift_us <= 0 or request.layout.shift_us % 1000:
+        _contract_error("replay layout shift is not a positive millisecond value")
     slot = next(
         (item for item in request.plan.delivery_slots
          if item.slot_key == request.layout.source_slot_key),
@@ -658,13 +781,12 @@ def _replay_row(
     row = _thaw_json(source_row)
     source_event = source_row["_meta"]["event"]
     source_generation = source_row["_meta"]["generation"]
-    timestamp_us = request.layout.timestamps_us[index]
-    timestamp = (
-        timestamp_us,
-        _timestamp_text(timestamp_us, request.program.timeline.utc_offset_minutes),
-    )
+    payload, timestamp = _replay_temporal_projection(request, source_row, index)
     event = _replay_event(
-        source_event, source_id, replay_id, request.layout.replay_ordinal, timestamp
+        source_event,
+        (source_id, replay_id, request.layout.replay_ordinal),
+        timestamp,
+        payload,
     )
     generation = {
         "validation_mode": "replay",
@@ -675,30 +797,64 @@ def _replay_row(
         "source_variant": source_generation.get("variant"),
         "duplicate_of_sequence_id": source_id,
     }
+    row["payload"] = payload
     row["_meta"]["event"] = event
     row["_meta"]["generation"] = generation
     return row
 
 
+def _replay_temporal_projection(request, source_row, index: int) -> tuple[dict, tuple[int, str]]:
+    """复验 source 计划时间并机械构造 replay payload 与时间。
+
+    @param request 当前 replay 投影请求。
+    @param source_row 当前 source primary row。
+    @param index 当前 source member 位置。
+    @return rebound payload 与 replay 起点整数、文本。
+    """
+    source = source_row["_meta"]["event"]
+    source_start = _timestamp_us(source["timestamp"])
+    planned = _branch_events(
+        request.plan, request.layout.source_slot_key, request.layout.source_variant_name
+    )[index]
+    frame = _frame_for_event(request.program, source.get("frame_class"))
+    duration_us = source.get("duration_us")
+    if not isinstance(duration_us, int) or isinstance(duration_us, bool):
+        _contract_error("replay source duration is invalid")
+    valid = (
+        source_start == planned.timestamp_us,
+        duration_us == planned.duration_us,
+        tuple(source.get("resources", ())) == tuple(planned.resources),
+        canonical_json(source.get("time_bindings")) == canonical_json(_time_descriptor(frame)),
+    )
+    if not all(valid):
+        _contract_error("replay source temporal facts differ from the plan")
+    payload = source_row.get("payload")
+    _validate_payload_time(request.program, frame, payload, source_start, duration_us)
+    replay_start = source_start + request.layout.shift_us
+    rebound = _rebound_payload(request.program, frame, payload, replay_start, duration_us)
+    timestamp = _timestamp_text(replay_start, request.program.timeline.utc_offset_minutes)
+    return rebound, (replay_start, timestamp)
+
+
 def _replay_event(
     source,
-    source_id: str,
-    replay_id: str,
-    ordinal: int,
+    identity: tuple[str, str, int],
     timestamp: tuple[int, str],
+    payload: Mapping[str, object],
 ) -> dict:
     """构造 replay 的 event metadata。
 
     @param source source event metadata。
-    @param source_id source sequence ID。
-    @param replay_id replay sequence ID。
-    @param ordinal replay ordinal。
+    @param identity source sequence、replay sequence 与 replay ordinal。
     @param timestamp replay 工件时间的整数与 ISO 文本。
+    @param payload 已按 replay 起点重绑的最终 payload。
     @return replay event metadata。
     """
+    source_id, replay_id, ordinal = identity
     timestamp_us, timestamp_text = timestamp
+    duration_us = source["duration_us"]
     event_id = derive_generation_id("replay_event_id", [
-        replay_id, source["event_id"], timestamp_us,
+        replay_id, source["event_id"], timestamp_us, duration_us, payload,
     ])
     return {
         "event_id": event_id,
@@ -709,6 +865,9 @@ def _replay_event(
         "actor": source["actor"],
         "logical_time_us": source["logical_time_us"],
         "timestamp": timestamp_text,
+        "duration_us": duration_us,
+        "resources": list(source["resources"]),
+        "time_bindings": [dict(item) for item in source["time_bindings"]],
         "replay_sequence_id": replay_id,
         "replay_ordinal": ordinal,
         "duplicate_of_sequence_id": source_id,
@@ -751,6 +910,7 @@ def reconcile_primary_candidate(request: PrimaryCandidateReconcileRequest) -> No
         rows = [row for sequence in request.sequences for row in sequence.primary_stream_rows]
         rows.extend(replay_rows)
         _reconcile_timeline(rows)
+        _reconcile_resource_rows(rows)
         _reconcile_candidate_bytes(request, replay_rows)
     except GenerationProjectionMismatch:
         raise
@@ -804,6 +964,7 @@ def _reconcile_request(request: ReconcileRequest) -> None:
         rows.extend(request.noise_rows)
         rows.extend(replay_rows)
         _reconcile_timeline(rows)
+        _reconcile_resource_rows(rows)
         _reconcile_retained_bytes(request, replay_rows)
     except GenerationProjectionMismatch:
         raise
@@ -848,20 +1009,25 @@ def _reconcile_candidate_bytes(request, replay_rows) -> None:
 
 
 class CrossViewFrontier:
-    """按声明序维护已提交 CrossView 身份集合与当前 phase。"""
+    """按声明序维护已提交身份与 Planner 权威资源区间。"""
 
-    def __init__(self, plan: ScenarioPlan):
-        """构造空 frontier，并冻结当前计划的声明序边界。
+    def __init__(self, program: GenerationProgram, plan: ScenarioPlan):
+        """构造空 frontier，并验证当前运行的 canonical plan。
 
+        @param program 当前冻结生成程序。
         @param plan 当前运行唯一冻结计划。
         @return None。
         """
+        validate_plan_identity(program, plan)
+        self._program = program
         self._plan = plan
         self._phase = "primary" if plan.delivery_slots else "noise"
         self._next_ordinal = 0
         self._event_ids: set[str] = set()
         self._timestamps_us: set[int] = set()
         self._source_keys: set[str] = set()
+        self._resource_intervals: list[ResourceInterval] = []
+        self._checked_delta: CrossViewDelta | None = None
 
     def check_primary(self, candidate: PreparedCandidate) -> CrossViewDelta:
         """对当前 primary head 生成零正式突变的冻结 delta。
@@ -875,8 +1041,15 @@ class CrossViewFrontier:
         if candidate.slot != expected:
             _frontier_contract_error("crossview_frontier: primary ordinal is out of order")
         try:
-            delta = _primary_frontier_delta(candidate, self._next_ordinal)
+            facts = _planned_primary_facts(self._plan, expected)
+            rows = [
+                row for sequence in candidate.sequences
+                for row in sequence.primary_stream_rows
+            ]
+            rows.extend(row for replay in candidate.replays for row in replay.rows)
+            delta = _frontier_delta("primary", self._next_ordinal, rows, facts)
             self._check_delta_conflicts(delta)
+            self._checked_delta = delta
             return delta
         except GenerationProjectionMismatch:
             raise
@@ -895,8 +1068,13 @@ class CrossViewFrontier:
         if candidate.noise_slot != expected:
             _frontier_contract_error("crossview_frontier: noise ordinal is out of order")
         try:
-            delta = _noise_frontier_delta(candidate, self._next_ordinal)
+            fact = (
+                f"noise:{expected.event_key}", expected.timestamp_us,
+                expected.duration_us, expected.resources,
+            )
+            delta = _frontier_delta("noise", self._next_ordinal, [candidate.row], [fact])
             self._check_delta_conflicts(delta)
+            self._checked_delta = delta
             return delta
         except GenerationProjectionMismatch:
             raise
@@ -909,6 +1087,8 @@ class CrossViewFrontier:
         @param delta 当前 check_primary 或 check_noise 返回的冻结增量。
         @return None。
         """
+        if delta is not self._checked_delta:
+            _frontier_contract_error("crossview_frontier: delta was not checked by this frontier")
         if delta.phase != self._phase or delta.ordinal != self._next_ordinal:
             _frontier_contract_error("crossview_frontier: delta is out of order")
         if not _delta_is_well_formed(delta) or self._delta_conflicts(delta):
@@ -918,6 +1098,8 @@ class CrossViewFrontier:
         self._event_ids.update(delta.event_ids)
         self._timestamps_us.update(delta.timestamps_us)
         self._source_keys.update(delta.source_keys)
+        self._resource_intervals.extend(delta.resource_intervals)
+        self._checked_delta = None
         self._next_ordinal += 1
         if self._phase == "primary" and self._next_ordinal == len(self._plan.delivery_slots):
             self._phase = "noise"
@@ -925,36 +1107,74 @@ class CrossViewFrontier:
 
     def _check_delta_conflicts(self, delta: CrossViewDelta) -> None:
         """把候选内或相对已提交集合的冲突转为当前 attempt 拒绝。"""
-        if not _delta_is_well_formed(delta) or self._delta_conflicts(delta):
-            _projection_mismatch("candidate conflicts with the committed CrossView frontier")
+        if not _delta_is_well_formed(delta):
+            _projection_mismatch("candidate CrossView delta is malformed")
+        if self._delta_conflicts(delta):
+            _temporal_contract_error("candidate conflicts with the committed temporal frontier")
         if not all(_is_id(value) for value in delta.event_ids):
             _projection_mismatch("candidate frontier event ID is invalid")
 
     def _delta_conflicts(self, delta: CrossViewDelta) -> bool:
         """判断增量是否与三个正式身份集合相交。"""
-        return bool(
+        identity = bool(
             self._event_ids.intersection(delta.event_ids)
             or self._timestamps_us.intersection(delta.timestamps_us)
             or self._source_keys.intersection(delta.source_keys)
         )
+        return identity or _interval_sets_overlap(
+            tuple(self._resource_intervals), delta.resource_intervals
+        )
 
 
-def _primary_frontier_delta(candidate: PreparedCandidate, ordinal: int) -> CrossViewDelta:
-    """从已冻结 primary 候选提取 frontier 最小增量。"""
-    rows = [row for sequence in candidate.sequences for row in sequence.primary_stream_rows]
-    rows.extend(row for replay in candidate.replays for row in replay.rows)
-    event_ids, timestamps = _frontier_event_facts(rows)
-    source_keys = [
-        f"primary:{sequence.main_row['_meta']['id']}" for sequence in candidate.sequences
-    ]
-    for replay in candidate.replays:
-        replay_ids = {
-            row["_meta"]["event"]["replay_sequence_id"] for row in replay.rows
-        }
-        if len(replay_ids) != 1 or not _is_id(next(iter(replay_ids))):
-            _projection_mismatch("replay frontier source identity is invalid")
-        source_keys.append(f"replay:{next(iter(replay_ids))}")
-    return CrossViewDelta("primary", ordinal, event_ids, timestamps, tuple(source_keys))
+def _planned_primary_facts(plan, slot) -> tuple[tuple, ...]:
+    """按 candidate 行顺序展开 primary 与同源 replay 计划事实。"""
+    facts: list[tuple] = []
+    for variant in slot.variant_names or (None,):
+        for event in _branch_events(plan, slot.slot_key, variant):
+            key = f"primary:{slot.slot_key}:{variant}:{event.event_key}"
+            facts.append((key, event.timestamp_us, event.duration_us, event.resources))
+    layouts = [item for item in plan.replay_layouts if item.source_slot_key == slot.slot_key]
+    for layout in layouts:
+        events = _branch_events(plan, slot.slot_key, layout.source_variant_name)
+        for event in events:
+            key = f"replay:{layout.replay_ordinal}:{event.event_key}"
+            facts.append((
+                key, event.timestamp_us + layout.shift_us, event.duration_us, event.resources,
+            ))
+    return tuple(facts)
+
+
+def _frontier_delta(phase: str, ordinal: int, rows, facts) -> CrossViewDelta:
+    """用计划事实绑定实际 event ID 并构造排序资源区间。"""
+    if len(rows) != len(facts) or not rows:
+        _temporal_contract_error("candidate row count differs from planned temporal facts")
+    event_ids, timestamps, source_keys, intervals = [], [], [], []
+    for row, fact in zip(rows, facts, strict=True):
+        source_key, start_us, duration_us, resources = fact
+        event = row["_meta"]["event"]
+        actual_start = _timestamp_us(event["timestamp"])
+        actual_resources = tuple(event.get("resources", ()))
+        if (
+            actual_start != start_us
+            or event.get("duration_us") != duration_us
+            or actual_resources != tuple(resources)
+        ):
+            _temporal_contract_error("candidate interval differs from the planned interval")
+        event_id = event["event_id"]
+        event_ids.append(event_id)
+        timestamps.append(start_us)
+        source_keys.append(source_key)
+        if duration_us > 0:
+            intervals.extend(
+                ResourceInterval(resource, start_us, start_us + duration_us, event_id, source_key)
+                for resource in resources
+            )
+    ordered = tuple(sorted(intervals, key=_interval_sort_key))
+    if _resource_intervals_overlap(ordered):
+        _temporal_contract_error("candidate resource intervals overlap")
+    return CrossViewDelta(
+        phase, ordinal, tuple(event_ids), tuple(timestamps), tuple(source_keys), ordered
+    )
 
 
 def _delta_is_well_formed(delta: CrossViewDelta) -> bool:
@@ -962,31 +1182,42 @@ def _delta_is_well_formed(delta: CrossViewDelta) -> bool:
     return (
         bool(delta.event_ids and delta.timestamps_us and delta.source_keys)
         and len(delta.event_ids) == len(delta.timestamps_us)
+        and len(delta.event_ids) == len(delta.source_keys)
         and len(delta.event_ids) == len(set(delta.event_ids))
         and len(delta.timestamps_us) == len(set(delta.timestamps_us))
         and len(delta.source_keys) == len(set(delta.source_keys))
+        and delta.resource_intervals == tuple(sorted(
+            delta.resource_intervals, key=_interval_sort_key
+        ))
+        and not _resource_intervals_overlap(delta.resource_intervals)
     )
 
 
-def _noise_frontier_delta(
-    candidate: PreparedNoiseCandidate,
-    ordinal: int,
-) -> CrossViewDelta:
-    """从已冻结 noise 候选提取 frontier 最小增量。"""
-    event_ids, timestamps = _frontier_event_facts((candidate.row,))
-    event_key = candidate.row["_meta"]["event"]["event_key"]
-    if not _is_id(event_key):
-        _projection_mismatch("noise frontier source identity is invalid")
-    return CrossViewDelta(
-        "noise", ordinal, event_ids, timestamps, (f"noise:{event_key}",)
+def _interval_sort_key(interval: ResourceInterval) -> tuple:
+    """返回 resource interval 的规范排序键。"""
+    return (
+        interval.resource, interval.start_us, interval.end_us,
+        interval.event_id, interval.source_key,
     )
 
 
-def _frontier_event_facts(rows) -> tuple[tuple[str, ...], tuple[int, ...]]:
-    """提取一组 stream rows 的 event ID 与整数工件时间。"""
-    event_ids = tuple(row["_meta"]["event"]["event_id"] for row in rows)
-    timestamps = tuple(_timestamp_us(row["_meta"]["event"]["timestamp"]) for row in rows)
-    return event_ids, timestamps
+def _resource_intervals_overlap(intervals: Sequence[ResourceInterval]) -> bool:
+    """以每资源 sort/sweep 判断候选内部半开区间冲突。"""
+    previous: ResourceInterval | None = None
+    for current in sorted(intervals, key=_interval_sort_key):
+        if previous is not None and current.resource == previous.resource:
+            if current.start_us < previous.end_us:
+                return True
+            if current.end_us > previous.end_us:
+                previous = current
+        else:
+            previous = current
+    return False
+
+
+def _interval_sets_overlap(left, right) -> bool:
+    """判断 candidate 资源区间是否与已提交前缀相交。"""
+    return _resource_intervals_overlap((*left, *right))
 
 
 def _frontier_contract_error(message: str) -> None:
@@ -1066,9 +1297,6 @@ def _reconcile_sequence(program, witness, sequence, target) -> None:
     if main_id != witness.main_record_id or not _is_id(main_id):
         _projection_mismatch("primary main identity differs from projection")
     rows = tuple(sequence.primary_stream_rows)
-    retained = _canonical_rows_bytes((main, *rows))
-    if sequence.retained_content_bytes != retained:
-        _projection_mismatch("primary retained-content bytes are invalid")
     if len(rows) != len(planned) or len(rows) != len(witness.primary_base_digests) or not rows:
         _projection_mismatch("primary event count differs from plan")
     identity = _PrimaryIdentity(program, slot, variant, main_id, world_id, generation)
@@ -1080,6 +1308,10 @@ def _reconcile_sequence(program, witness, sequence, target) -> None:
     _reconcile_main_stream(
         meta.get("stream"), rows, event_ids, planned, witness
     )
+    _reconcile_sequence_temporal(program, slot, planned, main)
+    retained = _canonical_rows_bytes((main, *rows))
+    if sequence.retained_content_bytes != retained:
+        _projection_mismatch("primary retained-content bytes are invalid")
 
 
 def _projection_generation(projection) -> Mapping[str, object]:
@@ -1166,7 +1398,8 @@ def _reconcile_primary_row(row, source_digest, planned, identity, generation) ->
         _projection_mismatch("primary row shape is invalid")
     _require_keys(event, {
         "event_id", "event_key", "owner_sequence_id", "role", "frame_class",
-        "actor", "logical_time_us", "timestamp",
+        "actor", "logical_time_us", "timestamp", "duration_us", "resources",
+        "time_bindings",
     }, "primary event fields differ from contract")
     allowed = (
         {"event", "generation", "classification"},
@@ -1182,10 +1415,18 @@ def _reconcile_primary_row(row, source_digest, planned, identity, generation) ->
     }
     if any(event.get(key) != value for key, value in expected.items()):
         _projection_mismatch("primary row differs from planned event")
-    if _timestamp_us(event.get("timestamp")) != planned.timestamp_us:
-        _projection_mismatch("primary timestamp differs from plan")
+    frame = _reconcile_primary_temporal(identity.program, event, payload, planned)
     event_id = derive_generation_id(
-        "primary_event_id", [identity.world_id, planned.event_key, planned.timestamp_us, payload]
+        "primary_event_id",
+        [
+            identity.world_id,
+            planned.event_key,
+            planned.timestamp_us,
+            planned.duration_us,
+            list(planned.resources),
+            _time_descriptor(frame),
+            payload,
+        ],
     )
     if event.get("event_id") != event_id:
         _projection_mismatch("primary event ID is invalid")
@@ -1198,6 +1439,31 @@ def _reconcile_primary_row(row, source_digest, planned, identity, generation) ->
     if canonical_json(meta.get("generation")) != canonical_json(generation):
         _projection_mismatch("primary generation truth differs from main")
     return event_id
+
+
+def _reconcile_primary_temporal(program, event, payload, planned):
+    """复验 primary 外层区间、descriptor 与 payload 机械时间。
+
+    @param program 当前冻结生成程序。
+    @param event 当前 primary event metadata。
+    @param payload 当前最终 payload。
+    @param planned Planner 权威事件。
+    @return 当前事件的冻结 frame class view。
+    """
+    if _timestamp_us(event.get("timestamp")) != planned.timestamp_us:
+        _temporal_contract_error("primary timestamp differs from plan")
+    frame = _frame_for_event(program, event.get("frame_class"))
+    valid = (
+        event.get("duration_us") == planned.duration_us,
+        tuple(event.get("resources", ())) == tuple(planned.resources),
+        canonical_json(event.get("time_bindings")) == canonical_json(_time_descriptor(frame)),
+        tuple(frame.resources) == tuple(planned.resources),
+        frame.duration_us == planned.duration_us,
+    )
+    if not all(valid):
+        _temporal_contract_error("primary interval descriptor differs from plan")
+    _validate_payload_time(program, frame, payload, planned.timestamp_us, planned.duration_us)
+    return frame
 
 
 def _reconcile_source_row(row, source_digest: str) -> None:
@@ -1254,6 +1520,63 @@ def _reconcile_main_stream(stream, rows, event_ids, planned, witness) -> None:
         _projection_mismatch("main session differs from plan")
 
 
+def _reconcile_sequence_temporal(program, slot, planned, main) -> None:
+    """独立复验 main annotation Schema、机械时间与 containment。"""
+    view = program.class_views.get(slot.sequence_class)
+    if view is None:
+        _contract_error("sequence class view is absent during temporal reconcile")
+    user = _thaw_json({key: value for key, value in main.items() if key != "_meta"})
+    if isinstance(view.schema, MappingABC):
+        if any(Draft202012Validator(_thaw_json(view.schema)).iter_errors(user)):
+            _temporal_contract_error("main annotation fails its complete class Schema")
+    if view.time_bindings:
+        _reconcile_annotation_bindings(view, planned, user)
+    if program.mode == "declared":
+        pattern = program.patterns.get(slot.pattern_name)
+        if pattern is None:
+            _contract_error("declared pattern is absent during temporal reconcile")
+        _reconcile_containments(pattern, planned)
+
+
+def _reconcile_annotation_bindings(view, planned, user) -> None:
+    """要求 main annotation 时间等于目标资源的最早计划起点。"""
+    for binding in view.time_bindings:
+        starts = [
+            event.timestamp_us for event in planned
+            if event.duration_us > 0 and binding.resource in event.resources
+        ]
+        if binding.source != "first_resource_start_milliseconds" or not starts:
+            _temporal_contract_error("annotation time binding has no planned resource interval")
+        expected = min(starts) // 1000
+        try:
+            actual = JsonPointer(binding.payload_path).resolve(user)
+        except (JsonPointerException, TypeError):
+            _temporal_contract_error("annotation time binding path is missing")
+        if actual != expected or isinstance(actual, bool):
+            _temporal_contract_error("annotation time differs from planned resource start")
+
+
+def _reconcile_containments(pattern, planned) -> None:
+    """从计划 member 独立复验当前 branch 的严格区间包含。"""
+    events = {event.role: event for event in planned}
+    for relation in pattern.containments:
+        container = events.get(relation.container)
+        contained = events.get(relation.contained)
+        if contained is None:
+            continue
+        if container is None:
+            _temporal_contract_error("contained interval has no container")
+        margin = container.timestamp_us + container.duration_us
+        valid = (
+            container.duration_us > 0
+            and contained.duration_us > 0
+            and container.timestamp_us <= contained.timestamp_us
+            and contained.timestamp_us + contained.duration_us + 1000 <= margin
+        )
+        if not valid:
+            _temporal_contract_error("planned interval containment is invalid")
+
+
 def _member_source(member: Record) -> dict[str, object]:
     """从 projector member ref 重建唯一输出来源块。"""
     source: dict[str, object] = {"file": member.ref.source_file}
@@ -1305,7 +1628,8 @@ def _reconcile_noise_row(row, source_digest: str, slot, identity) -> None:
         _projection_mismatch("noise row shape is invalid")
     _require_keys(event, {
         "event_id", "event_key", "owner_sequence_id", "role", "frame_class",
-        "actor", "logical_time_us", "timestamp", "noise",
+        "actor", "logical_time_us", "timestamp", "duration_us", "resources",
+        "time_bindings", "noise",
     }, "noise event fields differ from contract")
     _require_keys(meta, {"event", "generation"}, "noise metadata fields differ from contract")
     expected = {
@@ -1321,12 +1645,21 @@ def _reconcile_noise_row(row, source_digest: str, slot, identity) -> None:
         _projection_mismatch("noise row differs from planned slot")
     expected_timestamp = _timestamp_text(slot.timestamp_us, program.timeline.utc_offset_minutes)
     if event.get("timestamp") != expected_timestamp:
-        _projection_mismatch("noise timestamp differs from plan")
-    event_key = derive_generation_id(
-        "noise_event_key", [program.digest, "noise", slot.ordinal]
-    )
+        _temporal_contract_error("noise timestamp differs from plan")
+    frame = _frame_for_event(program, slot.frame_class)
+    descriptor = _time_descriptor(frame)
+    if (
+        event.get("duration_us") != 0
+        or tuple(event.get("resources", ())) != ()
+        or canonical_json(event.get("time_bindings")) != canonical_json(descriptor)
+        or frame.duration_us != 0
+        or frame.resources
+    ):
+        _temporal_contract_error("noise interval descriptor differs from plan")
+    _validate_payload_time(program, frame, payload, slot.timestamp_us, 0)
+    event_key = derive_generation_id("noise_event_key", [program.digest, "noise", slot.ordinal])
     event_id = derive_generation_id(
-        "noise_event_id", [run_id, event_key, slot.timestamp_us, payload]
+        "noise_event_id", [run_id, event_key, slot.timestamp_us, 0, [], descriptor, payload]
     )
     if noise_payload_digest(payload) != source_digest:
         _projection_mismatch("noise payload differs from accepted source")
@@ -1345,11 +1678,11 @@ def _reconcile_replay(sources, replays, layouts, program) -> None:
     for replay, layout in zip(replays, expected, strict=True):
         source = sources[(layout.source_slot_key, layout.source_variant_name)]
         rows = tuple(replay.rows)
+        _reconcile_replay_group(
+            rows, source, layout, program
+        )
         if replay.retained_content_bytes != _canonical_rows_bytes(rows):
             _projection_mismatch("replay retained-content bytes are invalid")
-        _reconcile_replay_group(
-            rows, source, layout, program.timeline.utc_offset_minutes
-        )
 
 
 def _reconcile_retained_bytes(request, replay_rows) -> None:
@@ -1378,7 +1711,7 @@ def _canonical_rows_bytes(rows) -> int:
     return sum(len(canonical_delivery_row(row)) + 1 for row in rows)
 
 
-def _reconcile_replay_group(rows, source, layout, utc_offset_minutes: int) -> None:
+def _reconcile_replay_group(rows, source, layout, program) -> None:
     """校验一个 replay group 的组身份与逐位 source 关系。"""
     source_id = source.main_row["_meta"]["id"]
     replay_id = derive_generation_id(
@@ -1388,25 +1721,20 @@ def _reconcile_replay_group(rows, source, layout, utc_offset_minutes: int) -> No
         zip(rows, source.primary_stream_rows, strict=True)
     ):
         _reconcile_replay_row(
-            row, source_row, layout, (index, source_id, replay_id), utc_offset_minutes
+            row, source_row, layout, (index, source_id, replay_id), program
         )
 
 
-def _reconcile_replay_row(row, source, layout, identity, utc_offset_minutes: int) -> None:
-    """校验一行 replay 的新时间、新 ID 与 source 语义。"""
-    index, source_id, replay_id = identity
-    _require_row_fields(row, "replay row fields differ from contract")
-    meta, source_meta = row.get("_meta"), source.get("_meta")
-    event = meta.get("event") if isinstance(meta, MappingABC) else None
-    source_event = source_meta.get("event") if isinstance(source_meta, MappingABC) else None
-    if not isinstance(event, MappingABC) or not isinstance(source_event, MappingABC):
-        _projection_mismatch("replay row shape is invalid")
-    _require_keys(event, {
-        "event_id", "event_key", "owner_sequence_id", "role", "frame_class",
-        "actor", "logical_time_us", "timestamp", "replay_sequence_id",
-        "replay_ordinal", "duplicate_of_sequence_id", "duplicate_of_event_id",
-    }, "replay event fields differ from contract")
-    timestamp_us = layout.timestamps_us[index]
+def _reconcile_replay_provenance(event, source_event, layout, source_id, replay_id) -> None:
+    """复验 replay provenance 与 source primary 逐字段同源。
+
+    @param event 当前 replay event metadata。
+    @param source_event 对应 source event metadata。
+    @param layout Planner 权威 replay layout。
+    @param source_id source sequence ID。
+    @param replay_id replay sequence ID。
+    @return None。
+    """
     expected = {
         "event_key": source_event.get("event_key"),
         "owner_sequence_id": None,
@@ -1421,19 +1749,64 @@ def _reconcile_replay_row(row, source, layout, identity, utc_offset_minutes: int
     }
     if any(event.get(key) != value for key, value in expected.items()):
         _projection_mismatch("replay provenance differs from source")
-    event_id = derive_generation_id(
-        "replay_event_id", [replay_id, source_event.get("event_id"), timestamp_us]
+
+
+def _reconcile_replay_row(row, source, layout, identity, program) -> None:
+    """校验一行 replay 的新时间、新 ID 与 source 语义。"""
+    index, source_id, replay_id = identity
+    _require_row_fields(row, "replay row fields differ from contract")
+    meta, source_meta = row.get("_meta"), source.get("_meta")
+    event = meta.get("event") if isinstance(meta, MappingABC) else None
+    source_event = source_meta.get("event") if isinstance(source_meta, MappingABC) else None
+    if not isinstance(event, MappingABC) or not isinstance(source_event, MappingABC):
+        _projection_mismatch("replay row shape is invalid")
+    _require_keys(event, {
+        "event_id", "event_key", "owner_sequence_id", "role", "frame_class",
+        "actor", "logical_time_us", "timestamp", "duration_us", "resources",
+        "time_bindings", "replay_sequence_id", "replay_ordinal",
+        "duplicate_of_sequence_id", "duplicate_of_event_id",
+    }, "replay event fields differ from contract")
+    del index
+    source_timestamp_us = _timestamp_us(source_event.get("timestamp"))
+    timestamp_us = source_timestamp_us + layout.shift_us
+    _reconcile_replay_provenance(event, source_event, layout, source_id, replay_id)
+    if (
+        layout.shift_us <= 0
+        or layout.shift_us % 1000
+        or event.get("duration_us") != source_event.get("duration_us")
+        or tuple(event.get("resources", ())) != tuple(source_event.get("resources", ()))
+        or canonical_json(event.get("time_bindings")) != canonical_json(
+            source_event.get("time_bindings")
+        )
+    ):
+        _temporal_contract_error("replay interval descriptor differs from source")
+    duration_us = source_event.get("duration_us")
+    if not isinstance(duration_us, int) or isinstance(duration_us, bool):
+        _temporal_contract_error("replay source duration is invalid")
+    frame = _frame_for_event(program, source_event.get("frame_class"))
+    _reconcile_replay_content(row, source, source_id, frame)
+    rebound = _rebound_payload(
+        program, frame, source.get("payload"), timestamp_us, duration_us
     )
-    timestamp = _timestamp_text(timestamp_us, utc_offset_minutes)
-    if event.get("event_id") != event_id or event.get("timestamp") != timestamp:
+    if canonical_json(row.get("payload")) != canonical_json(rebound):
+        _temporal_contract_error("replay payload time is not rebound from source")
+    event_id = derive_generation_id(
+        "replay_event_id",
+        [replay_id, source_event.get("event_id"), timestamp_us, duration_us, rebound],
+    )
+    timestamp = _timestamp_text(timestamp_us, program.timeline.utc_offset_minutes)
+    if event.get("event_id") != event_id:
         _projection_mismatch("replay artifact identity is invalid")
-    _reconcile_replay_content(row, source, source_id)
+    if event.get("timestamp") != timestamp:
+        _temporal_contract_error("replay timestamp text differs from the planned offset")
 
 
-def _reconcile_replay_content(row, source, source_id: str) -> None:
+def _reconcile_replay_content(row, source, source_id: str, frame) -> None:
     """校验 replay payload、下游 frame 产物与 generation 同源。"""
-    if canonical_json(row.get("payload")) != canonical_json(source.get("payload")):
-        _projection_mismatch("replay payload differs from source")
+    source_model = project_temporal_instance(source.get("payload"), frame.business_time_paths)
+    replay_model = project_temporal_instance(row.get("payload"), frame.business_time_paths)
+    if canonical_json(replay_model) != canonical_json(source_model):
+        _projection_mismatch("replay non-time payload differs from source")
     row_extra = {key: value for key, value in row["_meta"].items()
                  if key not in {"event", "generation"}}
     source_extra = {key: value for key, value in source["_meta"].items()
@@ -1459,9 +1832,46 @@ def _reconcile_timeline(rows: Sequence[Mapping[str, object]]) -> None:
     timestamps = [_timestamp_us(row["_meta"]["event"]["timestamp"]) for row in rows]
     event_ids = [row["_meta"]["event"]["event_id"] for row in rows]
     if len(timestamps) != len(set(timestamps)):
-        _projection_mismatch("artifact timestamps are not globally unique")
+        _temporal_contract_error("artifact timestamps are not globally unique")
     if len(event_ids) != len(set(event_ids)) or not all(_is_id(value) for value in event_ids):
         _projection_mismatch("event IDs are not globally unique")
+
+
+def _reconcile_resource_rows(rows: Sequence[Mapping[str, object]]) -> None:
+    """从最终 row 独立重建全局资源区间并执行 sort/sweep。"""
+    intervals: list[ResourceInterval] = []
+    for row in rows:
+        event = row["_meta"]["event"]
+        start_us = _timestamp_us(event.get("timestamp"))
+        duration_us = event.get("duration_us")
+        resources = event.get("resources")
+        if (
+            not isinstance(duration_us, int)
+            or isinstance(duration_us, bool)
+            or duration_us < 0
+            or duration_us % 1000
+            or not isinstance(resources, (tuple, list))
+            or len(resources) != len(set(resources))
+            or (duration_us == 0 and resources)
+        ):
+            _temporal_contract_error("final resource descriptor is invalid")
+        source_key = _final_source_key(event)
+        intervals.extend(
+            ResourceInterval(resource, start_us, start_us + duration_us, event["event_id"], source_key)
+            for resource in resources
+        )
+    if _resource_intervals_overlap(tuple(intervals)):
+        _temporal_contract_error("final resource intervals overlap")
+
+
+def _final_source_key(event) -> str:
+    """从 final event metadata 构造仅供独立 sweep 的稳定 source key。"""
+    if event.get("noise") is True:
+        return f"noise:{event.get('event_key')}"
+    replay = event.get("replay_sequence_id")
+    if replay is not None:
+        return f"replay:{replay}:{event.get('event_key')}"
+    return f"primary:{event.get('owner_sequence_id')}:{event.get('event_key')}"
 
 
 def _timestamp_us(value: object) -> int:
@@ -1524,3 +1934,12 @@ def _contract_error(message: str):
     """
     _log.error("generation_downstream_contract: %s", message)
     raise InternalError(f"generation_downstream_contract: {message}")
+
+
+def _temporal_contract_error(message: str):
+    """把固定计划时间不一致作为不消费 slot retry 的终态错误。
+
+    @param message 不含 payload 与实际时间值的英文原因。
+    @return 不返回。
+    """
+    _contract_error(message)

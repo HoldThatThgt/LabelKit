@@ -4,13 +4,18 @@
 > 目标版本：v1.19<br>
 > 变更性质：破坏性架构修订；不保留旧模块、旧接口、别名、兼容层、migration 或 fallback<br>
 > 适用范围：普通标记流水线、flat 生成回流、sequence 精确交付、真实模型调用与 embedding 调用<br>
-> 上游真值：`docs/CONTRACTS.md`、`docs/dev/SPEC-sequence-generation-redesign.md` 与 `spec/*.md`
+> 上游真值：`docs/CONTRACTS.md`、`docs/dev/SPEC-sequence-generation-redesign.md`、
+> `docs/dev/SPEC-sequence-temporal-integrity.md` 与 `spec/*.md`
 
 ## 1. 结论
 
 LabelKit 新增一级 `labelkit/runtime/`，作为普通标记与 sequence 生成共同使用的进程内执行运行时。
 它只负责资源感知的有界任务接纳、结构化并发、取消、结果顺序和运行观测；业务阶段、重试、去重、
 CrossView、retained-content 与工件提交仍由工作流和 operator 拥有。
+
+v1.20 的时间完整性保持这条所有权边界：generic candidate finalizer、`SequenceTemporalContext`、区间规划和
+replay rebound 属于 inference/operator/workflow，不进入执行运行时配置面。运行时只承载冻结候选；ordered commit
+消费的 `CrossViewDelta` 新增 resource intervals，并把 source 与其全部 rebound replay 作为同一个原子 delta。
 
 选定模型不是通用有向无环任务图，也不是线程池：
 
@@ -134,7 +139,7 @@ commit 等待、peak RSS 与 wall，避免把 prompt cache 或调用形状变化
 | 候选缓冲 | 从当前提交槽开始的连续 sequence 槽位集合，含 preparing、prepared 与 recoverable outcome |
 | 候选缓冲容量 | 候选缓冲可同时占用的槽位数，由本阶段不同资源容量之和与剩余槽位数共同钳制 |
 | 提交协调器 | 唯一按声明 ordinal 修改 dedup 与 DeliveryState 的协调协程 |
-| CrossViewFrontier | 已提交 event ID、timestamp、source 与下一 phase/ordinal 的增量校验状态 |
+| CrossViewFrontier | 已提交 event ID、timestamp、source、resource intervals 与下一 phase/ordinal 的增量校验状态 |
 
 不使用 worker pool、thread pool、executor pool 等词替代资源通道或执行运行时。
 
@@ -503,8 +508,9 @@ SimilarityFilter.probe(latest primary + lower noise)
 SimilarityFilter 正式突变后不得再有普通 rejection。相似度冲突只拒绝当前 noise attempt；高槽提前计算的 signature
 不能直接 commit。
 
-Replay 不调用 LLM，不进入独立 coordinator。它只从对应 source slot 的最终成功 SequenceRows 派生，并随该 source
-候选做本地校验和声明序提交。
+Replay 不调用 LLM，不进入独立 coordinator。它只从对应 source slot 的最终成功 SequenceRows 派生；Planner 冻结一个
+毫秒对齐的正 `shift_us`，所有成员保持 start delta、duration、resources、role 顺序与非时间 payload，业务时间按 replay
+start 重新绑定。source 与全部 rebound replay 一起做本地校验并进入同一个声明序提交。
 
 ## 11. Dedup reservation
 
@@ -546,10 +552,12 @@ stateDiagram-v2
 source 的完整 ReplayLayouts、实际 ReplayRows 与候选 retained bytes。它只验证当前候选，不从计划首槽开始 zip，
 也不读取 DeliveryState 前缀。
 
-它执行现有 CrossView 的本地事实：payload/base event/generation witness、ID 派生、owner、role、frame、actor、
-member copy、replay source、候选内 timestamp/event ID 唯一和候选 canonical bytes。SequenceRows 数量与 variant 顺序
-必须和 slot 完全相等；ReplayRows 必须和该 source 的全部 ReplayLayouts 一一相等，不得遗漏或增加；retained bytes
-必须覆盖 main、全部 primary 与全部 replay。
+它执行 CrossView 的本地事实：payload/base event/generation witness、ID 派生、owner、role、frame、actor、duration、
+resources、time-binding descriptor、业务时间机械值、containment、replay source 与 constant shift、候选内
+timestamp/event ID 唯一、resource interval 互斥和候选 canonical bytes。比较 source/replay payload 时先删除 descriptor
+列出的时间路径，要求其余内容与下游 metadata 相同，再用 rebound payload 重算 replay event ID。SequenceRows 数量与
+variant 顺序必须和 slot 完全相等；ReplayRows 必须和该 source 的全部 ReplayLayouts 一一相等，不得遗漏或增加；
+retained bytes 必须覆盖 main、全部 primary 与全部 rebound replay。
 
 candidate-local 通过后创建唯一深冻结 PreparedCandidate，闭包 slot/attempt identity、严格 variant 顺序的 witnesses
 与 SequenceRows、按 layout 顺序的全部 ReplayRows、reservation、已验证 counter delta、实际 retained bytes 与
@@ -560,16 +568,19 @@ Noise 使用独立 NoiseCandidateReconcileRequest 与深冻结 PreparedNoiseCand
 
 ### 12.2 增量 frontier
 
-CrossViewFrontier 保存 `(primary|noise, next ordinal)`、已提交 event IDs、timestamps 与 source keys。primary 完成后
-才切换到 noise phase，ID、timestamp 与 source 集合不清空。提交时检查当前 candidate rows 与 frontier 不冲突，
+CrossViewFrontier 保存 `(primary|noise, next ordinal)`、已提交 event IDs、timestamps、source keys 与按 resource 排序的
+intervals。primary 完成后才切换到 noise phase，这些集合不清空。提交时检查当前 candidate rows 与 frontier 不冲突，
 `check_primary()` / `check_noise()` 只生成尚未正式应用的冻结 CrossViewDelta；全部其他可恢复检查通过后，
 `commit(delta)` 无失败消费。每槽工作量只与当前候选行数有关，不再重扫完整前缀。primary candidate
-的 replay 与 source 一起进入同一 frontier delta；noise candidate 同样参与全局 ID 与 timestamp 唯一性。
+的 rebound replay 与 source 一起进入同一 frontier delta 和同一次原子 commit；noise candidate 同样参与全局 ID 与
+timestamp 唯一性。固定计划的 payload time、annotation、containment、resource 或 frontier interval 不一致是终态
+`generation_downstream_contract`，不得作为 recoverable slot rejection。
 
 ### 12.3 最终独立对账
 
-全部 primary、noise 与 replay 内存提交后，现有 full `reconcile_views()` 仍从最终 rows 独立重建全部事实并执行一次。
-incremental frontier 与 full reconcile 必须通过属性式反例证明等价。最终 full reconcile 失败属于内部不变式破坏，
+全部 primary、noise 与 replay 内存提交后，full `reconcile_views()` 从最终 rows 独立重建全部事实；stream 完成最终
+timestamp 排序后再复查全局起点唯一、resource interval 互斥、containment、descriptor、payload 业务时间与 main
+annotation。incremental frontier 与 full reconcile 必须通过属性式反例证明等价。最终 full reconcile 失败属于内部不变式破坏，
 使用既有运行级 InternalError、exit 4，不消费 attempt，failed report 使用 `failed_slot=null`、`attempts_used=0`，
 不能打开输出或替换旧 manifest，也不得重新包装为 GenerationAttemptRejected。任何 candidate-specific mismatch 必须
 已在 local/frontier 阶段成为当前 attempt 的 reconcile rejection。
@@ -946,9 +957,9 @@ dataset 与工件事件按归并/提交时序。
 | 拒绝优先级 | 同一候选 dedup 与 CrossView 同时失败时先记 dedup |
 | CrossView 无索引污染 | revalidate 后 CrossView 拒绝，正式 dedup 仍为空 |
 | 增量线性 | 一百/三百/六百槽不出现前缀重扫的二次调用数 |
-| incremental/full 等价 | ID、timestamp、replay、retained 随机破坏判定一致 |
-| candidate 闭包 | 遗漏 variant、遗漏 replay 与篡改 frozen digest 都在当前 attempt 拒绝 |
-| noise 本地真值 | 伪造 payload digest、topic/ordinal、ID 或 bytes 都在当前 noise attempt 拒绝 |
+| incremental/full 等价 | ID、timestamp、resource interval、containment、replay、retained 随机破坏判定一致 |
+| candidate 闭包 | 遗漏 variant/replay、descriptor 或 rebound payload 篡改都在提交前拒绝 |
+| noise 本地真值 | 伪造 descriptor、payload digest、topic/ordinal、ID 或 bytes 都在当前 noise attempt 拒绝 |
 | final invariant | 故意漏写 frontier delta 只产生 exit 4 内部失败，不消费 attempt 或打开输出 |
 | ContextVar capture | 六百 attempt counters 隔离，只有提交者合并 |
 | capacity 确定性 | capacity 一与六百的 deterministic provider 产物 digest 相同 |

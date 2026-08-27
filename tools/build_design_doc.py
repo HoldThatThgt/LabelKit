@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """docs/design/ 设计文档构建脚本（stdlib-only，确定性）。
 
-把 spec/*.md（v1.19 现行设计规格，实现级、与代码同步）汇编为单文件自包含
+把 spec/*.md（v1.20 现行设计规格，实现级、与代码同步）汇编为单文件自包含
 HTML 设计说明书 docs/design/labelkit-design-v1.html：
 
   封面（版本/修订历史取自 spec/00-frontmatter.md）→ 目录（h1/h2 自动生成）
@@ -273,9 +273,10 @@ def build_cover(meta_rows: list[list[str]], rev_rows: list[list[str]]) -> str:
     kv = "".join(f"<tr><td>{inline(k)}</td><td>{inline(v)}</td></tr>"
                  for k, v in meta_rows)
     rev_head, rev_body = rev_rows[0], rev_rows[1:]
+    rev_styles = (' style="width:12%"', ' style="width:20%"', "")
     rev = ("<tr>" + "".join(
-        f'<th{" style=\"width:12%\"" if j == 0 else (" style=\"width:20%\"" if j == 1 else "")}>'
-        f"{inline(c)}</th>" for j, c in enumerate(rev_head)) + "</tr>")
+        f"<th{rev_styles[j]}>{inline(c)}</th>" for j, c in enumerate(rev_head)
+    ) + "</tr>")
     rev += "".join("<tr>" + "".join(f"<td>{inline(c)}</td>" for c in r) + "</tr>"
                    for r in rev_body)
     return f"""

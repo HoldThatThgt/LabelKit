@@ -20,6 +20,7 @@ import hashlib
 import logging
 import re
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 from urllib.parse import urlsplit
 
@@ -28,6 +29,7 @@ from jsonschema import Draft202012Validator
 
 from labelkit.common.contracts.types import Usage
 from labelkit.common.errors import (
+    LabelKitError,
     ContextOverflowError,
     PostValidatorInvalidError,
     SchemaViolation,
@@ -219,6 +221,19 @@ def _thaw_json(value: Any) -> Any:
         return {key: _thaw_json(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
         return [_thaw_json(item) for item in value]
+    return value
+
+
+def _freeze_json(value: Any) -> Any:
+    """递归复制并冻结 JSON 容器。
+
+    @param value 待冻结的 JSON 值。
+    @return 只含 MappingProxyType、tuple 与 JSON 标量的新值。
+    """
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_json(item) for key, item in value.items()})
+    if isinstance(value, (tuple, list)):
+        return tuple(_freeze_json(item) for item in value)
     return value
 
 
@@ -717,6 +732,34 @@ class CallScope:
 _DEFAULT_SCOPE = CallScope()
 
 
+class CandidateFinalizerContractError(LabelKitError):
+    """candidate finalizer 载体或机械注入产物违反冻结协议。"""
+
+    kind = "candidate_finalizer_contract"
+
+    def __init__(self) -> None:
+        """构造不携带候选内容的终态协议错误。"""
+        super().__init__(self.kind)
+
+
+@dataclass(frozen=True)
+class FinalizedCallRequest:
+    """一次 model Schema 生成与完整 Schema 终验的冻结请求。"""
+
+    profile: str                                  # 首轮调用 profile
+    prompt: PromptBundle                          # 完整提示包
+    model_schema: Mapping[str, object]             # 仅供 provider 与 model L2 使用
+    final_schema: Mapping[str, object]             # finalizer 产物的完整 L2 Schema
+    scope: CallScope                              # 记账、trace 与 L2.5 范围
+    candidate_finalizer: Callable[[Mapping[str, object]], Mapping[str, object]]
+    repair_projector: Callable[[Mapping[str, object]], Mapping[str, object]]
+
+    def __post_init__(self) -> None:
+        """隔离并递归冻结两份 Schema。"""
+        object.__setattr__(self, "model_schema", _freeze_json(self.model_schema))
+        object.__setattr__(self, "final_schema", _freeze_json(self.final_schema))
+
+
 @dataclass(frozen=True)
 class _CallContext:
     """一次 ``complete_validated`` 调用贯穿 L0→L3 的不变上下文（记账与追踪所需）。"""
@@ -739,6 +782,28 @@ class _Pending:
     usage: Usage            # 截至目前累计的 token 用量
     model: str              # 首轮响应回报的模型名（修复轮不覆盖，随最终结果原样返回）
     attempts: int           # 截至目前发生的调用次数（首轮计 1）
+
+
+@dataclass(frozen=True)
+class _FinalizedInspection:
+    """一个 model-space 候选的终验结果。"""
+
+    object: dict | None      # 通过 full L2/L2.5 的唯一完整对象
+    rendered: list[str]      # 仅 model L2 或 L2.5 可修复违规
+    summaries: list[str]     # trace 脱敏摘要
+
+
+@dataclass(frozen=True)
+class _FinalizedPending:
+    """generic finalizer L3 修复环的冻结现场。"""
+
+    raw: str                 # 最近 provider 原始输出，仅供耗尽证据
+    previous_output: str     # repair projector 派生的 canonical model-space 文本
+    rendered: list[str]      # 最近可修复违规
+    summaries: list[str]     # 最近 trace 脱敏摘要
+    usage: Usage             # 截至当前的累计 token 用量
+    model: str               # 首轮实际模型名
+    attempts: int            # 截至当前的 provider 调用数
 
 
 @dataclass(frozen=True)
@@ -835,6 +900,96 @@ def _raise_post_terminal(kind: str) -> None:
     @raises SchemaViolation 始终抛出
     """
     raise SchemaViolation([kind], "")
+
+
+def _raise_finalizer_contract(reason: str) -> None:
+    """记录不含数据的固定原因并终止 candidate finalizer 调用。
+
+    @param reason 引擎内部的固定英文原因码。
+    @raises CandidateFinalizerContractError 始终抛出。
+    """
+    _logger.error(
+        "Candidate finalizer contract failed",
+        extra={"stage": "schema", "reason": reason},
+    )
+    raise CandidateFinalizerContractError() from None
+
+
+def _mapping_transform(
+    transform: Callable[[Mapping[str, object]], Mapping[str, object]],
+    candidate: Mapping[str, object],
+    kind: str,
+) -> dict:
+    """在深拷贝候选上执行一次 mapping 变换并归一输出。
+
+    @param transform finalizer 或 repair projector。
+    @param candidate 引擎保留的原始 model-space 候选。
+    @param kind 固定的变换名，仅用于脱敏日志。
+    @return 只含标准 JSON 容器的新 dict。
+    @raises CandidateFinalizerContractError callable 异常或返回非 object 时抛出。
+    """
+    failed = False
+    try:
+        result = transform(_thaw_json(candidate))
+    except Exception:
+        failed = True
+        result = None
+    if failed:
+        _raise_finalizer_contract(f"{kind}_exception")
+    if not isinstance(result, Mapping):
+        _raise_finalizer_contract(f"{kind}_return")
+    failed = False
+    try:
+        thawed = _thaw_json(result)
+    except Exception:
+        failed = True
+        thawed = None
+    if failed:
+        _raise_finalizer_contract(f"{kind}_return")
+    return thawed
+
+
+def _repair_previous_output(
+    candidate: dict | None,
+    projector: Callable[[Mapping[str, object]], Mapping[str, object]],
+) -> str:
+    """产生 L3 只能看到的 canonical model-space previous output。
+
+    @param candidate L1 归一后的 model-space 候选；不可解析时为 None。
+    @param projector 请求冻结的 repair projector。
+    @return canonical JSON object 文本；不可解析时固定为 ``{}``。
+    @raises CandidateFinalizerContractError projector 违约或结果不可 JSON 序列化。
+    """
+    if candidate is None:
+        return "{}"
+    projected = _mapping_transform(projector, candidate, "repair_projector")
+    failed = False
+    try:
+        rendered = json.dumps(
+            projected, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except Exception:
+        failed = True
+        rendered = ""
+    if failed:
+        _raise_finalizer_contract("repair_projector_json")
+    return rendered
+
+
+def _finalized_context(request: FinalizedCallRequest) -> _CallContext:
+    """从公开请求构造 model Schema 调用上下文。
+
+    @param request generic finalizer 公开请求。
+    @return 仅在显式 user_treatment=True 时启用 L2.5 的内部上下文。
+    """
+    scope = request.scope
+    return _CallContext(
+        active=_thaw_json(request.model_schema),
+        user_treated=scope.user_treatment is True,
+        record_ids=scope.record_ids,
+        batch_no=scope.batch_no,
+        record=scope.record,
+        repair_context_bytes=scope.repair_context_bytes,
+    )
 
 
 class SchemaEngine:
@@ -1029,6 +1184,109 @@ class SchemaEngine:
             profile, ctx,
             _Pending(raw=raw, rendered=rendered, summaries=summaries,
                      usage=response.usage, model=response.model, attempts=1))
+
+    def _inspect_finalized_candidate(
+        self,
+        candidate: dict | None,
+        request: FinalizedCallRequest,
+        ctx: _CallContext,
+    ) -> _FinalizedInspection:
+        """按 model L2、finalizer、full L2、L2.5 的固定顺序检查候选。
+
+        @param candidate L1 归一的 model-space 对象。
+        @param request 冻结的 generic finalizer 请求。
+        @param ctx model Schema 与 L2.5 调用上下文。
+        @return 成功完整对象或可修复违规。
+        @raises CandidateFinalizerContractError finalizer 或 full Schema 终验违约。
+        """
+        if candidate is None:
+            return _FinalizedInspection(
+                None, [_UNPARSEABLE_VIOLATION], [_UNPARSEABLE_SUMMARY])
+        rendered, summaries = self._validate_full(candidate, ctx.active)
+        if rendered:
+            return _FinalizedInspection(None, rendered, summaries)
+        finalized = _mapping_transform(
+            request.candidate_finalizer, candidate, "candidate_finalizer")
+        try:
+            rendered, _summaries = self._validate_full(
+                finalized, _thaw_json(request.final_schema))
+        except Exception:
+            _raise_finalizer_contract("final_schema_validation")
+        if rendered:
+            _raise_finalizer_contract("final_schema_violation")
+        if ctx.user_treated and self._validator is not None:
+            violations = self._callback_violations(_thaw_json(finalized), ctx.record)
+            if violations:
+                return _FinalizedInspection(None, violations, list(violations))
+        return _FinalizedInspection(finalized, [], [])
+
+    async def complete_finalized(
+        self,
+        request: FinalizedCallRequest,
+    ) -> tuple[dict, Usage, int, str]:
+        """provider 只生成 model Schema 对象，机械完成后再执行完整终验。
+
+        @param request model/full Schema、两个 callable 与调用范围。
+        @return (完整对象, 累计用量, provider 调用数, 首轮模型名)。
+        @raises SchemaViolation model L2 或 L2.5 在 L3 预算内未修复。
+        @raises CandidateFinalizerContractError callable 或 full Schema 违约。
+        """
+        ctx = _finalized_context(request)
+        response = await self._llm.complete(
+            request.profile, request.prompt, response_schema=ctx.active)
+        candidate, l1_fixed, raw = _extract_object(response)
+        inspected = self._inspect_finalized_candidate(candidate, request, ctx)
+        if inspected.object is not None:
+            self._settle_clean(candidate, raw, l1_fixed, ctx)
+            return inspected.object, response.usage, 1, response.model
+        previous_output = ""
+        if self._cfg.max_repair_attempts > 0:
+            previous_output = _repair_previous_output(
+                candidate, request.repair_projector)
+        pending = _FinalizedPending(
+            raw, previous_output, inspected.rendered, inspected.summaries,
+            response.usage, response.model, 1)
+        return await self._repair_finalized(request, ctx, pending)
+
+    async def _repair_finalized(
+        self,
+        request: FinalizedCallRequest,
+        ctx: _CallContext,
+        pending: _FinalizedPending,
+    ) -> tuple[dict, Usage, int, str]:
+        """model Schema 与 L2.5 违规的有界 L3 修复环。
+
+        @param request 原始 generic finalizer 请求。
+        @param ctx model Schema 调用上下文。
+        @param pending 首轮未通过的冻结现场。
+        @return 完整对象与保持既有语义的调用证据。
+        @raises SchemaViolation 修复预算耗尽。
+        @raises CandidateFinalizerContractError projector、finalizer 或 full Schema 违约。
+        """
+        raw, previous = pending.raw, pending.previous_output
+        rendered, summaries = pending.rendered, pending.summaries
+        usage, attempts = pending.usage, pending.attempts
+        repair_profile = self._cfg.repair_llm or request.profile
+        for repair_round in range(1, self._cfg.max_repair_attempts + 1):
+            response = await self._generic_repair_call(
+                repair_profile, ctx, previous, rendered)
+            if response is None:
+                break
+            usage, attempts = usage + response.usage, attempts + 1
+            candidate, _, raw = _extract_object(response)
+            inspected = self._inspect_finalized_candidate(candidate, request, ctx)
+            if inspected.object is not None:
+                bucket = _bucket_for(False, repair_round)
+                self._resolve(bucket, ctx, violations=summaries)
+                return inspected.object, usage, attempts, pending.model
+            if repair_round < self._cfg.max_repair_attempts:
+                previous = _repair_previous_output(candidate, request.repair_projector)
+            rendered, summaries = inspected.rendered, inspected.summaries
+        self._resolve("rejected", ctx, violations=summaries)
+        raise SchemaViolation(
+            rendered, raw,
+            callback_only=bool(rendered) and all(
+                item.startswith(self._CB_PREFIX) for item in rendered))
 
     async def complete_post_validated(
         self,

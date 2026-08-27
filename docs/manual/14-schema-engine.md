@@ -55,6 +55,26 @@ v1.11 补两条边界规则：
 - **截断响应不进这套循环**——输出写满 `max_output_tokens` 的响应（`finish_reason=length` / `stop_reason=max_tokens`）被终局化为 `output_truncated` 记录级拒收，从确定性修复层到 LLM 修复环都不再碰它（14.3）；
 - **修复调用自己也受上下文预算约束**——所引 profile 声明了 `context_window`（第 6 章）时，某轮修复请求本身超预算则该轮记失败并**短路至预算耗尽**（修复提示词恒定，余轮必然同败；`[原始输出]` 修复原文永不截断——截断即破坏修复语义），拒收归因维持 `schema_violation` / `callback_violation` 不变。
 
+### 业务时间的 model Schema 与完整 Schema
+
+v1.20 对以 `x-labelkit-business-time = true` 标记的业务时间叶子使用两份职责明确的 Schema。完整 Schema 始终是
+工程权威；M1 从中机械派生不含时间叶子的 model Schema，provider 首轮与每轮 L3 只看到 model Schema。解析候选先过
+model Schema L2，generic candidate finalizer 再把 Planner 或冻结 `SequenceTemporalContext` 中的机械值注入深拷贝，
+最后执行完整 Schema L2 与用户回调 L2.5。
+
+```mermaid
+flowchart LR
+    F[完整 Schema] --> P[M1 投影 model Schema]
+    P --> L[provider 与 L3]
+    L --> M[model Schema L2]
+    M --> I[generic candidate finalizer 注入]
+    I --> V[完整 Schema L2 与 L2.5]
+```
+
+这一通用入口由 `FinalizedCallRequest` 描述，并通过 `complete_finalized` 执行。L3 的 `previous_output` 会先投影回
+model space，不携带机械时间。候选自行提供时间叶子是 model Schema 违规；finalizer 抛异常、改写非时间字段、返回
+非 object 或产物未通过完整 Schema，则是终态 candidate-finalizer contract 错误，不会把固定计划错误伪装成模型重试。
+
 ## 14.2 一次真实的抢救过程
 
 上面那段三重问题的输出，引擎是这么救的：
@@ -195,8 +215,9 @@ repair、token 与 trace 仍完整记账。
 - 裁决输出偶尔非法不会炸：修不好按平局计（`judgment_invalid`，对 Bradley-Terry 中性），计入 `report.quality.judgment_failures`；
 - 内部修复调用同样计入 token 计量与 `llm.call` trace 事件——账一分不少；
 - 分类结果的内部 Schema 用 enum 封闭集锁死类名；multi 重复标签在 Schema 通过后确定性归一化。
-- sequence 的每个 frame class 必须是完整 object Schema。系统按 payload binding 覆盖权威 state value 后，
-  用同一完整 Schema 复验，不能通过改写 Schema 或把 authoritative value 送进 L3 来掩盖冲突。
+- sequence 的每个 frame class 必须是完整 object Schema。系统先按 payload binding 覆盖权威 state value，再由
+  generic candidate finalizer 注入业务时间并复验完整 Schema；model Schema 与 L3 都不携带机械时间，不能通过改写
+  Schema 或把 authoritative value 送进 L3 来掩盖冲突。
 - instruction-only 的 `EventPlanRequest` 显式携带并呈现完整 `state_schema`，让真实 L3 repair 能看到合法枚举；
   declared request 的该字段固定为 null，权威 Schema 从冻结 program/context 解析。
 - pre-state 与 base-state 进入 L3 的违规文本固定为

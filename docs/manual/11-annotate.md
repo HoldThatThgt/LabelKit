@@ -77,6 +77,15 @@ v1.11 起 `sequence_frames` 升格为**上限**：所引 profile 声明 `context
 - **独立的帧 Schema**：`frame.annotate.schema_path` / `schema_inline` **恰一**，与 `output.schema` 互相独立——「帧对象长什么样」与「序列行长什么样」是两份契约，各自过 draft 2020-12 元校验、各自的 examples 各自启动干跑。结构保障走同一结构引擎，但**不经代码回调校验层**（第 14 章 14.5）。
 - **失败边界取决于运行形态**：process/flat 中，成员失败只把该成员写成 `status="failed"`、`annotation=null`，不进入 rejects；sequence 中，任一应标注成员失败会拒绝当前 attempt，由 M10 重试整个 counterfactual set。失败 attempt 不提交成员标注或 dataset counters，已发生的调用证据仍保留。
 
+### sequence annotation 的业务时间
+
+declared sequence 可以在完整 class annotation Schema 中用 `x-labelkit-business-time = true` 标记时间叶子，并在
+`[class.<name>.annotate].time_bindings` 把它绑定到 `first_resource_start_milliseconds`。M5 从最终成员构造冻结的
+`SequenceTemporalContext`；机械值是目标 resource 最早正区间的起点。模型看到的 model Schema 不含这些叶子，
+generic candidate finalizer 在每个 sample、self-consistency vote、leaf repair 和 verify repair 后注入同一机械值，
+再执行完整 Schema 与业务回调。存在 binding 却没有 temporal context 是内部契约错误，不会从 raw、provenance 或
+wall clock 补猜。
+
 只做 sequence 帧标注时，当前总阶段约束仍要求 pointwise quality 开启：
 
 ```toml

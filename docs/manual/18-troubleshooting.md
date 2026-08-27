@@ -150,9 +150,12 @@ jq -e '.run.interrupted == false and .run.circuit_broken == false' out/report.js
 ### 「sequence stream 重放在 ingest 阶段被拒绝」
 
 先确认 `input.text_field = "payload"` 与
-`stream.order_by = "meta:_meta.event.timestamp"`。M2 会从单一 stream 文件重算 primary event ID、每个 owner
-的 ordered sequence ID、replay sequence/event ID、ordinal 与 duplicate provenance。手工改 payload、timestamp、
-role、owner、world branch、source ID 或行数都会 fail closed；不要通过关闭 disorder 检查绕过 provenance。
+`stream.order_by = "meta:_meta.event.timestamp"`。M2 会从单一 stream 文件中的自描述 event descriptor 重算
+primary/noise/replay time binding、event ID、每个 owner 的 ordered sequence ID、replay sequence/event ID、ordinal 与
+duplicate provenance。重点检查 `duration_us`、`resources`、`time_bindings` 是否完整，payload 的每个时间叶子是否等于
+descriptor 的机械值，以及 replay 是否对全部成员使用同一个正 shift、保持 source 的非时间内容与 start delta。
+手工改 payload、timestamp、descriptor、role、owner、world branch、source ID 或行数都会 fail closed；不要通过关闭
+disorder 检查绕过 provenance。
 
 ### 「按类标注 Schema 没生效」
 

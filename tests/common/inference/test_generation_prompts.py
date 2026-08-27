@@ -13,7 +13,9 @@ def test_noise_prompt_requires_identity_driven_variation():
         "noise_ordinal": 1,
         "attempt_index": 2,
         "frame_class": "noise",
-        "timestamp_us": 10,
+        "planned_start_us": 10,
+        "planned_end_us": 10,
+        "planned_duration_us": 0,
         "session_id": "session-noise",
         "class_descriptions": {"ticket": "订票"},
         "frame_descriptions": {"noise": "闲聊"},
@@ -33,13 +35,16 @@ def test_noise_prompt_requires_identity_driven_variation():
 生成前必须在内部列出 attempt_index + 2 个符合该话题的自然表达角度，再选择下标 attempt_index 对应的角度。
 不同 attempt 必须使用明显不同的措辞；不得输出候选表或复述内部标识。
 Schema 中的 examples 只描述形状，禁止复制或改写其内容。
-只能返回满足给定噪声帧 Schema 的一个 JSON 对象，不要 Markdown、代码围栏、解释或额外字段。"""
+计划起点、终点和时长只读；不得输出或推断任何业务时间字段。
+只能返回满足给定 noise model Schema 的一个 JSON 对象，不要 Markdown、代码围栏、解释或额外字段。"""
     assert user == """[尝试身份]
 event_key=noise-event
 noise_ordinal=1
 attempt_index=2
 frame_class=noise
-timestamp_us=10
+planned_start_us=10
+planned_end_us=10
+planned_duration_us=0
 session_id=session-noise
 
 [已声明序列类别]
@@ -57,11 +62,11 @@ session_id=session-noise
 [帧生成指令]
 生成 utterance
 
-[噪声帧 Schema]
+[不含业务时间字段的 noise model Schema]
 {"type":"object"}
 
 [输出契约]
-只返回一个通过噪声帧 Schema 的 JSON object。"""
+只返回一个通过 noise model Schema 的 JSON object，不得输出业务时间字段。"""
 
 
 def test_noise_evaluation_prompt_freezes_planned_topic_gate():

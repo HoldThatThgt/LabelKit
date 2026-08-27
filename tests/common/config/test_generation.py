@@ -1256,7 +1256,7 @@ def test_generation_schema_file_byte_limit_is_closed(tmp_path):
     schema.write_text(base + " " * (65536 - len(base)), encoding="utf-8")
     cfg = load(root / "config.toml", root / "project.toml", CliOverrides())
     assert cfg.frame_class_views["noise"].gen_schema == {
-        "type": "object", "examples": [{}],
+        "type": "object", "examples": ({},),
     }
 
     root = tmp_path / "over" / "sequence-generation"
@@ -1271,8 +1271,10 @@ def _catalog_with_canonical_size(root: Path, size: int) -> None:
     path = root / "catalogs" / "ticket-booking.jsonl"
     rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
     rows[0]["style"] = {"padding": ""}
-    compact = lambda value: json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    def compact(value):
+        return json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        )
     current = len(compact(rows[0]).encode("utf-8"))
     assert current <= size
     rows[0]["style"]["padding"] = "a" * (size - current)

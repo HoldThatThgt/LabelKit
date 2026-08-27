@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import os
 from dataclasses import dataclass, field, replace
-from typing import Any
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -26,6 +25,7 @@ from labelkit.common.config._classviews import (
     _avail,
     _build_class_views,
     _build_frame_class_views,
+    _check_nonsequence_annotation_bindings,
 )
 from labelkit.common.config._collect import _Collector, _fmt
 from labelkit.common.config.generation import (
@@ -624,6 +624,7 @@ def _check_classify_and_views(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
     if p.classify_provided["max_labels"] and p.classify.assignment != "multi":
         col.error(f'{fp}:[classify].max_labels: can only be set when assignment = "multi"')
     sequence = p.generate.form == "sequence"
+    _check_nonsequence_annotation_bindings(col, fp, p.class_raw, p.generate.form)
     if not p.classify.enabled and not sequence:
         _warn_parked_classify(ctx)
         return ctx

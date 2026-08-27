@@ -875,6 +875,58 @@ def test_semantic_embed_input_untouched_when_window_undeclared():
     assert "budget.truncations.dedup" not in ctx.metrics.counters
 
 
+def test_generation_stream_sequence_uses_v120_exact_identity_only():
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    llm = _EmbedRecorder()
+    ctx = _semantic_ctx(0, llm)
+    source_members = [
+        replace(text_record('{"timestamp":1,"action":"open"}', "source-1"),
+                exact_dedup_text='{"action":"open"}'),
+        replace(text_record('{"timestamp":2,"screen":"home"}', "source-2"),
+                exact_dedup_text='{"screen":"home"}'),
+    ]
+    replay_members = [
+        replace(text_record('{"timestamp":101,"action":"open"}', "replay-1"),
+                exact_dedup_text='{"action":"open"}'),
+        replace(text_record('{"timestamp":102,"screen":"home"}', "replay-2"),
+                exact_dedup_text='{"screen":"home"}'),
+    ]
+    items = [
+        PipelineItem(record=seq_record("source", source_members)),
+        PipelineItem(record=seq_record("replay", replay_members)),
+    ]
+
+    run_stage(DedupStage(cfg, DedupIndex(cfg, "text")), items, ctx)
+
+    expected = "80b086fc9dae13b8"
+    assert items[1].status == "dropped_dup"
+    assert items[1].dedup.kind == "exact"
+    assert items[1].dedup.cluster_key == expected
+    assert llm.texts == []
+    assert ctx.tasks.requests == []
+
+
+def test_generation_stream_non_temporal_difference_skips_near_layers():
+    cfg = DedupConfig(semantic=True, semantic_embedding="emb")
+    llm = _EmbedRecorder()
+    ctx = _semantic_ctx(0, llm)
+    prefix = "same long payload content " * 20
+    records = [
+        replace(text_record(prefix + "A timestamp=1", "a"),
+                exact_dedup_text='{"action":"A"}'),
+        replace(text_record(prefix + "B timestamp=2", "b"),
+                exact_dedup_text='{"action":"B"}'),
+    ]
+    items = [PipelineItem(record=record) for record in records]
+
+    run_stage(DedupStage(cfg, DedupIndex(cfg, "text")), items, ctx)
+
+    assert [item.status for item in items] == ["active", "active"]
+    assert [item.dedup.kind for item in items] == ["unique", "unique"]
+    assert llm.texts == []
+    assert ctx.tasks.requests == []
+
+
 def test_embedding_failure_skip_path_unchanged_under_budget():
     # V15: the existing embedding_failures skip path stays the fallback — a
     # provider failure after truncation still resolves the record on ①–③.

@@ -39,7 +39,9 @@ def _branch(plan, slot_key: str, variant: str):
 def _observed(pattern, events):
     """只以 frame 与实际 timestamp 构造盲结构输入。"""
     frames = {role.name: role.frame_class for role in pattern.roles}
-    return tuple(ObservedEvent(f"event-{index}", frames[event.role], event.timestamp_us)
+    return tuple(ObservedEvent(
+        f"event-{index}", frames[event.role], event.timestamp_us, event.duration_us,
+    )
                  for index, event in enumerate(events))
 
 
@@ -66,7 +68,7 @@ def _observed_word(pattern, timestamps):
     """按 pattern role word 构造不依赖 planner 的观察序列。"""
     roles = {role.name: role for role in pattern.roles}
     return tuple(
-        ObservedEvent(f"manual-{index}", roles[role].frame_class, timestamp)
+        ObservedEvent(f"manual-{index}", roles[role].frame_class, timestamp, 0)
         for index, (role, timestamp) in enumerate(zip(pattern.order, timestamps))
     )
 
@@ -76,7 +78,7 @@ def test_pattern_evaluator_detects_extra_role_without_planner(declared_program):
     pattern = declared_program.patterns["booking_success"]
     events = list(_observed_word(pattern, (0, 5_000_000, 35_000_000)))
     request_frame = next(role.frame_class for role in pattern.roles if role.name == "request")
-    events.append(ObservedEvent("manual-extra", request_frame, 36_000_000))
+    events.append(ObservedEvent("manual-extra", request_frame, 36_000_000, 0))
     result = evaluate_pattern(pattern, tuple(events))
     assert tuple(map(dict, result.actual_violations)) == (
         {"kind": "extra_role", "target": request_frame},
@@ -104,12 +106,30 @@ def test_pattern_evaluator_detects_gap_and_span_in_dependency_order(declared_pro
     )
 
 
+def test_pattern_span_uses_complete_interval_envelope(declared_program):
+    """role start 仍在上限内时，末事件 end 越界也必须命中 max span。"""
+    pattern = declared_program.patterns["booking_success"]
+    events = list(_observed_word(pattern, (0, 5_000_000, 35_000_000)))
+    events[-1] = replace(events[-1], duration_us=pattern.max_span_us - 35_000_000 + 1)
+
+    result = evaluate_pattern(pattern, tuple(events))
+
+    assert tuple(map(dict, result.actual_violations)) == (
+        {"kind": "max_span_exceeded", "target": pattern.name},
+    )
+
+
 def _truth(role: str, index: int, payload=None) -> EventTruth:
     """构造 coupling 只读字段完整的 EventTruth。"""
     view = ActorView("actor", {}, {}, (), index, index)
+    frame = {
+        "request": "task_request",
+        "acknowledge": "acknowledgement",
+        "confirm": "confirmation",
+    }[role]
     return EventTruth(
-        f"key-{role}", f"id-{index}", role, f"frame-{role}", "actor",
-        index, 100 + index, view, f"intent-{role}",
+        f"key-{role}", f"id-{index}", role, frame, "actor",
+        index, 1000 + index * 1000, 0, view, f"intent-{role}",
         ({"op": "test", "path": "/x", "value": index},),
         f"before-{index}", f"after-{index}", {"/x": index},
         payload or {"value": index},
@@ -142,7 +162,9 @@ def test_coupling_ignores_branch_ids_but_protects_every_prefix_field(
     ))
     branch = tuple(replace(event, event_id=f"branch-{index}", timestamp_us=900 + index)
                    for index, event in enumerate(baseline))
-    assert evaluate_coupling(CouplingEvaluationRequest(variant, baseline, branch))
+    assert evaluate_coupling(CouplingEvaluationRequest(
+        variant, baseline, branch, declared_program.frame_classes,
+    ))
     changes = {
         "event_key": "changed-key",
         "role": "changed-role",
@@ -158,7 +180,36 @@ def test_coupling_ignores_branch_ids_but_protects_every_prefix_field(
         "payload": {"value": "changed"},
     }
     tampered = (replace(branch[0], **{field: changes[field]}), *branch[1:])
-    assert not evaluate_coupling(CouplingEvaluationRequest(variant, baseline, tampered))
+    assert not evaluate_coupling(CouplingEvaluationRequest(
+        variant, baseline, tampered, declared_program.frame_classes,
+    ))
+
+
+def test_coupling_ignores_declared_time_paths_but_protects_non_time_bytes(declared_program):
+    """protected prefix 可重绑时间叶，但同一 payload 的非时间字节仍不可变化。"""
+    variant = next(item for item in declared_program.counterfactual_sets[0].variants
+                   if item.name == "confirmation_before_acknowledgement")
+    baseline = tuple(_truth(role, index) for index, role in enumerate(
+        ("request", "acknowledge", "confirm")
+    ))
+    baseline = (
+        replace(baseline[0], payload={"value": 0, "timing": {"start": 1000}}),
+        *baseline[1:],
+    )
+    branch = tuple(replace(event, event_id=f"branch-{index}", timestamp_us=900 + index)
+                   for index, event in enumerate(baseline))
+    branch = (
+        replace(branch[0], payload={"value": 0, "timing": {"start": 9000}}),
+        *branch[1:],
+    )
+    frames = dict(declared_program.frame_classes)
+    frames["task_request"] = replace(
+        frames["task_request"], business_time_paths=("/timing/start",),
+    )
+
+    assert evaluate_coupling(CouplingEvaluationRequest(variant, baseline, branch, frames))
+    changed = (replace(branch[0], payload={"value": 1, "timing": {"start": 9000}}), *branch[1:])
+    assert not evaluate_coupling(CouplingEvaluationRequest(variant, baseline, changed, frames))
 
 
 class _Metrics:

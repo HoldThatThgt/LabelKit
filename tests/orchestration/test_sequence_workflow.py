@@ -1,12 +1,13 @@
-"""v1.19 sequence 候选窗口、声明序提交与终态账本测试。"""
+"""v1.20 sequence 候选窗口、声明序提交与终态账本测试。"""
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
 import time
+from collections.abc import Mapping as MappingABC
 from contextlib import contextmanager
-from dataclasses import replace
+from dataclasses import fields, is_dataclass, replace
 from pathlib import Path
 from types import MethodType, SimpleNamespace
 
@@ -179,10 +180,15 @@ class _Emitter:
 
     def __init__(self):
         self.failed: list[dict] = []
+        self.committed: list[object] = []
 
     def write_failed_report(self, report) -> None:
         """保存无内容 failed report。"""
         self.failed.append(dict(report))
+
+    def commit(self, product) -> None:
+        """记录测试中不应发生的 manifest-last 提交。"""
+        self.committed.append(product)
 
 
 def _view(*, enabled: bool = False, profile: str = "unused"):
@@ -234,7 +240,7 @@ def _controller(
         semantic_profile="model", evaluation_profile="model", max_slot_attempts=attempts,
         class_views={"cls": _view()}, frame_classes={"frame": SimpleNamespace(enabled=True)},
         limits=SimpleNamespace(retained_content_bytes=10**9),
-        planner_seed=7, timeline=SimpleNamespace(crossed_primary_sessions=0),
+        planner_seed=7, timeline=SimpleNamespace(crossed_primary_sessions=0, utc_offset_minutes=480),
         counterfactual_sets=(), mode="instruction_only", digest="d" * 64, noise=None,
     )
     plan = SimpleNamespace(
@@ -791,6 +797,66 @@ def _prepared_primary(
     return replace(candidate, digest=_prepared_digest("primary", candidate))
 
 
+def _independent_prepared_value(value):
+    """不用 workflow helper 把 prepared carrier 转成 canonical 树。"""
+    if is_dataclass(value):
+        return {
+            field.name: _independent_prepared_value(getattr(value, field.name))
+            for field in fields(value)
+        }
+    if isinstance(value, MappingABC):
+        return {str(key): _independent_prepared_value(item) for key, item in value.items()}
+    if isinstance(value, (tuple, list)):
+        return [_independent_prepared_value(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        items = [_independent_prepared_value(item) for item in value]
+        return sorted(items, key=lambda item: json.dumps(item, sort_keys=True))
+    return value
+
+
+def _independent_prepared_digest(domain: str, candidate) -> str:
+    """独立执行 v1.20 prepared domain、排除自身与 canonical SHA-256。"""
+    material = {
+        field.name: _independent_prepared_value(getattr(candidate, field.name))
+        for field in fields(candidate)
+        if field.name != "digest"
+    }
+    payload = json.dumps(
+        ["labelkit:v1.20", f"prepared_{domain}", material],
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def test_actual_prepared_primary_and_noise_domain_fixed_vectors() -> None:
+    """实际 carrier 必须命中互不混域的独立 prepared fixed vectors。"""
+    reservation = DedupReservation(
+        "fixed-capability", 0, ("record-a", "record-b"), ("cluster-a",),
+    )
+    row = SequenceRows({"_meta": {"id": "main-set/000000"}}, (), 0)
+    primary = PreparedCandidate(
+        _slot(0), 1, (), (row,), (), reservation, {"generated": 1}, 0, "",
+    )
+    noise = PreparedNoiseCandidate(
+        NoiseSlot("event-key", 0, "frame", "topic", 1000, 0, (), "noise-session"),
+        1, "p" * 64, {"payload": {"text": "fixed"}}, (1, 2, 3),
+        {"generated": 1}, 37, "",
+    )
+    assert _prepared_digest("primary", primary) == (
+        "01d5b7329a511dd1ae2542b603c9ada16871cd8976f7e126f0aa7b5a82147018"
+    )
+    assert _prepared_digest("primary", primary) == _independent_prepared_digest(
+        "primary", primary,
+    )
+    assert _prepared_digest("noise", noise) == (
+        "ba1228faa47a11daa8475f74d3cc80bece93e6111adc1f8a7420bda7844fecf2"
+    )
+    assert _prepared_digest("noise", noise) == _independent_prepared_digest("noise", noise)
+    assert _prepared_digest("primary", primary) != _prepared_digest("noise", noise)
+
+
 async def test_coordinator_discards_reservation_if_buffer_transfer_fails() -> None:
     """候选插入缓冲失败时 reservation 仍由 coordinator finally 路径消费。"""
     dedup = _Dedup()
@@ -984,7 +1050,8 @@ def test_noise_similarity_commit_path_is_linear(monkeypatch, total: int) -> None
     candidates = []
     for ordinal in range(total):
         slot = NoiseSlot(
-            f"event-{ordinal}", ordinal, "frame", f"topic-{ordinal}", ordinal, f"session-{ordinal}"
+            f"event-{ordinal}", ordinal, "frame", f"topic-{ordinal}", ordinal * 1000, 0, (),
+            f"session-{ordinal}",
         )
         unique = hashlib.sha256(f"noise-{ordinal}".encode()).hexdigest()
         row = {"payload": {"text": unique}}
@@ -1043,7 +1110,7 @@ async def test_deliver_runs_final_crossview_before_manifest_commit(monkeypatch) 
 
     from labelkit.operators.generation import project
     monkeypatch.setattr(project, "validate_plan_identity", lambda *_args: None)
-    monkeypatch.setattr(project, "CrossViewFrontier", lambda _plan: object())
+    monkeypatch.setattr(project, "CrossViewFrontier", lambda _program, _plan: object())
     controller._deliver_slot_phases = MethodType(phases, controller)
     controller._final_reconcile = MethodType(lambda _self: order.append("crossview"), controller)
     controller._ordered_stream_rows = MethodType(lambda _self: [], controller)
@@ -1141,7 +1208,7 @@ async def test_every_noise_recoverable_boundary_retries_without_early_commit(
 ) -> None:
     """旧 noise retry 矩阵完整迁移且只有第二次成功推进。"""
     controller, _metrics, _dedup = _controller(count=0, capacity=1, attempts=2)
-    slot = NoiseSlot("event", 0, "frame", "topic", 1, "session")
+    slot = NoiseSlot("event", 0, "frame", "topic", 1000, 0, (), "session")
     controller.request.plan.noise_slots = (slot,)
     attempts: list[int] = []
     original = controller._commit_noise_head
@@ -1252,12 +1319,159 @@ def test_candidate_reconcile_maps_only_typed_projection_mismatch(
             )
             controller._reconcile_primary_candidate(closure)
         else:
-            slot = NoiseSlot("event", 0, "frame", "topic", 1, "session")
+            slot = NoiseSlot("event", 0, "frame", "topic", 1000, 0, (), "session")
             controller._reconcile_noise_candidate(slot, "digest", {"payload": {}}, 0)
     if mapped:
         assert caught.value.kind == "reconcile"
     else:
         assert caught.value is error
+
+
+def _real_temporal_bundle():
+    """从真实教学 program 构造带 business-time/resource/replay 的闭包。"""
+    cfg = load(_EXAMPLE / "config.toml", _EXAMPLE / "project.toml", CliOverrides())
+    from labelkit.operators.generation.program import compile_generation_program
+    from tests.operators.generation.test_project import _build_temporal_projected_set
+
+    return _build_temporal_projected_set(compile_generation_program(cfg))
+
+
+def _assert_precommit_state_is_empty(controller, metrics, dedup, discarded) -> None:
+    """统一证明 terminal temporal attempt 没有任何正式提交。"""
+    assert dedup.states == {}
+    assert dedup.commits == []
+    assert dedup.discards == discarded
+    assert metrics.merged == [] and metrics.counters == {}
+    assert controller.state.sequences == []
+    assert controller.state.noise_rows == [] and controller.state.replays == []
+    assert controller.state.sources == {} and controller.state.retained_bytes == 0
+    assert controller.state.sequence_attempts == controller.state.noise_attempts == 0
+    assert controller.services.emitter.committed == []
+    assert controller.services.emitter.failed == []
+
+
+@pytest.mark.parametrize(
+    "surface",
+    ("primary", "replay", "annotation", "containment", "replay_construction"),
+)
+async def test_controller_primary_precommit_temporal_tamper_is_terminal_and_atomic(
+    surface: str,
+) -> None:
+    """实际 primary/replay 篡改经 controller capture 后 terminal 且 reservation 全回滚。"""
+    program, plan, projection, sequence, _noise, replay = _real_temporal_bundle()
+    from labelkit.common.config._temporal import IntervalContainmentSpec
+    from labelkit.operators.generation.project import projection_witness
+    from tests.operators.generation.test_project import _tamper_temporal_row, _thaw
+
+    if surface == "primary":
+        rows = list(sequence.primary_stream_rows)
+        index = next(i for i, row in enumerate(rows)
+                     if row["_meta"]["event"]["time_bindings"])
+        rows[index] = _tamper_temporal_row(rows[index], "payload_time")
+        sequence = replace(sequence, primary_stream_rows=tuple(rows))
+    elif surface == "replay":
+        rows = list(replay.rows)
+        index = next(i for i, row in enumerate(rows)
+                     if row["_meta"]["event"]["time_bindings"])
+        rows[index] = _tamper_temporal_row(rows[index], "descriptor")
+        replay = replace(replay, rows=tuple(rows))
+    elif surface == "annotation":
+        main = _thaw(sequence.main_row)
+        main["started_at"] += 1
+        sequence = replace(sequence, main_row=main)
+    elif surface == "containment":
+        pattern_name = plan.delivery_slots[0].pattern_name
+        pattern = program.patterns[pattern_name]
+        patterns = dict(program.patterns)
+        patterns[pattern_name] = replace(
+            pattern,
+            containments=(IntervalContainmentSpec("request", "acknowledge"),),
+        )
+        program = replace(program, patterns=patterns)
+    else:
+        rows = list(sequence.primary_stream_rows)
+        rows[0] = _tamper_temporal_row(rows[0], "duration")
+        sequence = replace(sequence, primary_stream_rows=tuple(rows))
+    dedup = _Dedup()
+    controller, metrics, _ = _controller(count=1, dedup=dedup)
+    controller.request.program = program
+    controller.request.plan = plan
+    controller.request.run_id = "a" * 32
+    controller._candidate_capacity = lambda _phase, _total: 1
+    slot = plan.delivery_slots[0]
+    reservation = _reservation(f"temporal-{surface}")
+    closure = SimpleNamespace(
+        slot=slot,
+        witnesses=(projection_witness(projection),),
+        rows=(sequence,),
+        replays=(replay,),
+        retained=sequence.retained_content_bytes + replay.retained_content_bytes,
+    )
+
+    async def reserve(_transaction, _context):
+        dedup.add(reservation)
+        return reservation
+
+    async def downstream(_transaction, _slot_value, _attempt_index, _batch_no):
+        return {"generated": 1}
+
+    def assemble(build):
+        assert build.reservation is reservation
+        if surface == "replay_construction":
+            controller._project_replays(build.slot, closure.rows)
+        else:
+            controller._reconcile_primary_candidate(closure)
+        raise AssertionError("temporal reconcile unexpectedly accepted")
+
+    async def generate(_slot_value: object, _attempt_index: int) -> tuple[()]:
+        return ()
+
+    controller._generate_traces = generate
+    controller._project_traces = lambda *_args: (projection,)
+    controller._projection_witnesses = lambda _items: closure.witnesses
+    controller._transaction = lambda *_args: SimpleNamespace()
+    controller._dedup_reserve = reserve
+    controller._run_downstream = downstream
+    controller._assemble_primary_candidate = assemble
+    async with asyncio.TaskGroup() as task_group:
+        terminal = await controller._run_phase("primary", (slot,), task_group)
+    assert isinstance(terminal, InternalError)
+    expected_reason = {
+        "annotation": "annotation time",
+        "containment": "containment",
+        "replay_construction": "replay source temporal facts",
+    }.get(surface)
+    if expected_reason is not None:
+        assert expected_reason in str(terminal)
+    assert controller._recoverable_kind(terminal, "primary") is None
+    assert controller._terminal_kind(terminal) == "generation_downstream_contract"
+    _assert_precommit_state_is_empty(
+        controller, metrics, dedup, [f"temporal-{surface}"],
+    )
+
+
+async def test_controller_noise_precommit_temporal_tamper_is_terminal_and_atomic() -> None:
+    """实际 noise payload-time 篡改经 controller capture 后 terminal 且零正式提交。"""
+    program, plan, _projection, _sequence, noise, _replay = _real_temporal_bundle()
+    controller, metrics, dedup = _controller(count=0)
+    controller.request.program = program
+    controller.request.plan = plan
+    controller.request.run_id = "a" * 32
+    controller._candidate_capacity = lambda _phase, _total: 1
+    slot = plan.noise_slots[0]
+    payload = dict(noise["payload"])
+    payload["timestamp"] += 1
+
+    async def render(_slot_value, _attempt_index):
+        return payload
+
+    controller._render_and_evaluate_noise = render
+    async with asyncio.TaskGroup() as task_group:
+        terminal = await controller._run_phase("noise", (slot,), task_group)
+    assert isinstance(terminal, InternalError)
+    assert controller._recoverable_kind(terminal, "noise") is None
+    assert controller._terminal_kind(terminal) == "generation_downstream_contract"
+    _assert_precommit_state_is_empty(controller, metrics, dedup, [])
 
 
 @pytest.mark.parametrize(("retained", "limit", "expected"), ((10, 10, None), (11, 10, "sequence_memory_budget")))
@@ -1301,7 +1515,7 @@ def test_noise_reconcile_rejection_precedes_simultaneous_retained_overflow() -> 
     controller.request.program.limits.retained_content_bytes = 0
     controller._noise_similarity = controller._initial_similarity_filter()
     controller._frontier.error = GenerationProjectionMismatch("noise collision")
-    slot = NoiseSlot("event", 0, "frame", "topic", 1, "session")
+    slot = NoiseSlot("event", 0, "frame", "topic", 1000, 0, (), "session")
     row = {"payload": {"text": "novel noise"}}
     signature = controller._noise_signature(canonical_json(row["payload"]))
     candidate = PreparedNoiseCandidate(slot, 1, "payload-digest", row, signature, {}, 1, "")
@@ -1334,12 +1548,42 @@ def test_planned_session_id_comes_from_unique_plan_branch() -> None:
     """信封 session 身份只取唯一冻结 branch，重复或缺失 fail closed。"""
     controller, _metrics, _dedup = _controller(count=1)
     slot = controller.request.plan.delivery_slots[0]
-    event = PlannedEvent("event", "position_000", 0, 0, 10, "planned-session")
+    event = PlannedEvent("event", "position_000", 0, 0, 1000, 0, (), "planned-session")
     controller.request.plan.blocks = ({(slot.slot_key, None): (event,)},)
     assert controller._planned_session_id(slot, None) == "planned-session"
     controller.request.plan.blocks = ()
     with pytest.raises(InternalError, match="invalid planned session"):
         controller._planned_session_id(slot, None)
+
+
+def test_attempt_item_carries_the_frozen_temporal_context() -> None:
+    """attempt 信封从唯一计划分支冻结 member 时间与资源。"""
+    controller, _metrics, _dedup = _controller(count=1)
+    slot = controller.request.plan.delivery_slots[0]
+    event = PlannedEvent(
+        "event", "position_000", 0, 0, 1000, 2000,
+        ("foreground_app",), "planned-session",
+    )
+    controller.request.plan.blocks = ({(slot.slot_key, None): (event,)},)
+    row = {
+        "_meta": {
+            "event": {"event_id": "event-id", "frame_class": "frame"},
+        },
+    }
+    projection = SimpleNamespace(
+        main_record=SimpleNamespace(members=(SimpleNamespace(id="event-id"),)),
+        primary_stream_rows=(row,),
+    )
+
+    item = controller._item(slot, None, projection)
+
+    assert item.session_id == "planned-session"
+    assert item.classification.label == "cls"
+    assert item.member_classifications["event-id"].label == "frame"
+    member = item.temporal_context.members[0]
+    assert member.event_id == "event-id"
+    assert (member.timestamp_us, member.duration_us) == (1000, 2000)
+    assert member.resources == ("foreground_app",)
 
 
 def test_teaching_example_arithmetic_and_call_families_are_exact() -> None:
@@ -1437,7 +1681,7 @@ async def test_exhaustion_consumes_exact_bound_without_commit() -> None:
 async def test_noise_exhaustion_consumes_exact_bound_without_commit() -> None:
     """noise head 恰消费上限且不提交 similarity、row 或 retained state。"""
     controller, _metrics, _dedup = _controller(count=0, capacity=1, attempts=3)
-    slot = NoiseSlot("event", 0, "frame", "topic", 1, "session")
+    slot = NoiseSlot("event", 0, "frame", "topic", 1000, 0, (), "session")
     controller.request.plan.noise_slots = (slot,)
 
     async def capture(_self, _phase, _slot_value, _ordinal, attempt_index):
@@ -1488,7 +1732,7 @@ def test_delivery_invariant_errors_fail_closed_before_mutation() -> None:
         controller._transaction(slot, ())
     controller.request.program.noise = None
     with pytest.raises(InternalError):
-        controller._noise_render_request(NoiseSlot("event", 0, "missing", "topic", 1, "s"), 0)
+        controller._noise_render_request(NoiseSlot("event", 0, "missing", "topic", 1000, 0, (), "s"), 0)
     with pytest.raises(InternalError):
         controller._reject("not-a-bucket")
     with pytest.raises(InternalError):
@@ -1522,7 +1766,7 @@ def test_noise_filter_uses_resolved_dedup_parameters() -> None:
 def test_noise_requests_share_exact_planned_topic_and_profiles() -> None:
     """noise render/evaluation 请求共享计划 topic 且 profile 分离。"""
     controller, _metrics, _dedup = _controller(count=0)
-    slot = NoiseSlot("event", 0, "frame", "planned-topic", 1, "session")
+    slot = NoiseSlot("event", 0, "frame", "planned-topic", 1000, 0, (), "session")
     controller.request.program.semantic_profile = "semantic"
     controller.request.program.evaluation_profile = "evaluation"
     controller.request.program.noise = SimpleNamespace(instruction="noise", topics=("planned-topic",))
@@ -1532,6 +1776,7 @@ def test_noise_requests_share_exact_planned_topic_and_profiles() -> None:
     render = controller._noise_render_request(slot, 2)
     evaluation = controller._noise_evaluation_request({"text": "noise"}, slot, 2)
     assert render.semantic_profile == "semantic"
+    assert render.utc_offset_minutes == 480
     assert render.noise_slot.topic == "planned-topic"
     assert evaluation.evaluation_profile == "evaluation"
     assert evaluation.planned_topic == "planned-topic"
@@ -1545,7 +1790,7 @@ def test_rejected_noise_similarity_does_not_mutate_state_or_filter() -> None:
         {}, ({"payload": payload},), 0
     ))
     controller._noise_similarity = controller._initial_similarity_filter()
-    slot = NoiseSlot("event", 0, "frame", "topic", 1, "session")
+    slot = NoiseSlot("event", 0, "frame", "topic", 1000, 0, (), "session")
     signature = controller._noise_signature(canonical_json(payload))
     candidate = PreparedNoiseCandidate(slot, 1, "digest", {"payload": payload}, signature, {}, 1, "")
     candidate = replace(candidate, digest=_prepared_digest("noise", candidate))

@@ -326,7 +326,7 @@ counterfactual set 或 positive replay source。
 
 生成调用不能自报通过。每个 declared branch 依次通过以下相互独立的判定：
 
-- `PatternEvaluator` 只接收最终的 `ObservedEvent(event_id, frame_class, timestamp_us)`，自行执行 role
+- `PatternEvaluator` 只接收最终的 `ObservedEvent(event_id, frame_class, timestamp_us, duration_us)`，自行执行 role
   一对一绑定并输出 `actual_bindings` 与 `actual_violations`。它不接收 planner role witness、expected
   binding 或 variant 变换；实际违规必须与唯一 expected violation 恰等。
 - `StateEvaluator` 只从 `StateEvaluationRequest.program` 取 Schema 与 state validator，从 seed initial state
@@ -343,7 +343,7 @@ counterfactual set 或 positive replay source。
 - `CouplingEvaluator` 机械比较反事实 protected prefix。
 - primary candidate-local validator 只验证当前 DeliverySlot、严格 variant 顺序的 `SequenceRows`、全部已规划
   `ReplayLayout` 与对应 `ReplayRows`；它不读取已提交前缀。`CrossViewFrontier.check_primary` 与
-  `check_noise` 在声明序短提交中增量验证当前 candidate 与已提交 event ID、timestamp、source 和
+  `check_noise` 在声明序短提交中增量验证当前 candidate 与已提交 event ID、timestamp、source、resource interval 和
   phase/ordinal，返回冻结 `CrossViewDelta`；`commit(delta)` 无普通失败分支。全部 primary、noise 与 replay
   内存提交后，`reconcile_views` 再从最终 rows 独立重建全部事实一次。三层均从实际 canonical rows 复算
   retained-content，不信任控制器或 row carrier 提供的计数。
@@ -365,8 +365,8 @@ program/variant 重建精确 role word，逐事件核对 RoleSpec 的 frame clas
 与该 plan 中唯一成员完整相等并复核事件、来源与身份。SequenceWorkflow 只在交付边界验证一次，后续调用包内
 validated helper；内容重试不得重新运行 CP-SAT。
 
-所有 v1.18 generation ID 均对 canonical JSON array
-`["labelkit:v1.18", domain, components]` 做 UTF-8 SHA-256，取小写前 32 hex；`components` 本身必须是
+所有 v1.20 generation ID 均对 canonical JSON array
+`["labelkit:v1.20", domain, components]` 做 UTF-8 SHA-256，取小写前 32 hex；`components` 本身必须是
 JSON array，timestamp 是 integer 微秒，payload component 是已验证 JSON object，不得字符串拼接。
 declared 与 instruction-only 分别使用冻结 domain 与 component 序列；`Record.id = sequence_id`，
 member `Record.id = event_id`。replay 与 noise 使用各自 domain。缺失分支没有目标 role 的 `event_key`。
@@ -392,15 +392,18 @@ canonical bytes。成为 head 后，提交协调器先对最新全部 primary �
 再执行 frontier 与 retained-content 检查；signature commit 后不得再有普通可恢复失败。noise 不进 quality、
 annotate、verify 或 main dedup group。
 
-replay 是完整 positive sequence 的原样重发，不是单帧重复。planner 按 declaration order 与 scenario index
-冻结 source；每个 replay 独占尾部 session，使用新 replay sequence/event ID 与新 artifact timestamp，但 payload、
-frame class、actual role 和顺序逐位同源。source 不足在启动期失败，source delivery 失败时不能改选。Replay
-不调用 LLM，也不进入独立 coordinator；它与 source primary candidate 一起校验和提交。
+replay 是完整 positive sequence 的 constant-shift 重发，不是单帧重复。planner 按 declaration order 与 scenario
+index 冻结 source；每个 replay 独占尾部 session并持有一个正、毫秒对齐的 `shift_us`。全部 member 的 start delta、
+duration、resources、descriptor、frame class、actual role、顺序与非时间 payload 逐位同源；payload business time
+按 replay start/end/duration 机械重绑，并以 rebound payload 派生 replay event ID。source 不足在启动期失败，source
+delivery 失败时不能改选。Replay 不调用 LLM，也不进入独立 coordinator；它与 source primary candidate 一起校验和提交。
 
 下游接受后，M11 通过
 `SequenceAssemblyRequest(program, schema_engine, item, projection, batch_no)` 零 I/O 装配 `SequenceRows`，
 并以 program-bound sequence/frame annotation Schema 终检实际待交付对象；不得回读 source ResolvedConfig。
-终检失败归 `sequence_projection_mismatch` 并重试整个 source slot，零 dedup、dataset、row 或 replay commit。
+普通非时间终检失败归 `sequence_projection_mismatch` 并重试整个 source slot，零 dedup、dataset、row 或 replay commit；
+payload/annotation business time、duration/resources 或 containment 的固定计划不一致归 terminal
+`generation_downstream_contract`，不消费 slot retry。
 ReplayProjector 只从该最终 source 行派生全部已规划 `ReplayRows`。两者分别以同一
 `canonical_delivery_row` 计算自身行的 UTF-8 byte 数加一个 JSONL 换行 byte。
 
@@ -412,7 +415,7 @@ rows 独立复算 bytes，不读取已提交前缀。通过后，`PreparedCandid
 
 该 candidate 成为 head 时，retained-content 检查比较“已提交实际 bytes + 当前 candidate 实际 bytes”，上限为
 536870912。恰好上限接受，多一 UTF-8 byte 归 `sequence_memory_budget` 并重试整个 source slot，零 dedup 或
-dataset commit。成功后 replay 与 source 一起提交，payload 在 main/stream/replay 间共享冻结引用。
+dataset commit。成功后 replay 与 source 一起提交；primary 视图共享冻结 payload，replay 保存重绑后的独立 payload。
 `CrossViewFrontier.check_primary/check_noise` 只增量检查当前 candidate 与已提交前缀，返回冻结
 `CrossViewDelta`，`commit(delta)` 无普通失败分支；全部 rows 内存提交后，`reconcile_views` 从最终
 sequence main/primary、noise 与 replay 实际 canonical rows 独立执行一次完整对账。
@@ -428,3 +431,21 @@ peak RSS 与候选字节高水位。由于用户 Schema 与 provider response �
 
 sequence 的 exact delivery、attempt 消耗、下游 transaction、正式文件提交与失败矩阵由 M10 和 M11 定义；
 M6 只返回完整候选、独立判定和投影结果，任何失败都不得产生半个 counterfactual set。
+
+### 3.6.11 v1.20 business time、区间与自描述工件
+
+FrameRenderer 与 NoiseRenderer 只把 `FrameClassView.model_gen_schema` 发送给 provider；prompt 可读取 planned
+start/end/duration，但 provider 输出不含 business time leaf。渲染调用通过 `complete_finalized`：model L2 后按
+`TimeBindingSpec` 声明序机械注入，完整 frame Schema 通过后才构造 EventDraft/EventTruth。mechanical leaf 在 Planner
+完成后、首个 LLM 前独立按 leaf Schema preflight；不满足是 `generation_plan_infeasible`。finalizer/projector 异常、
+非 object、非时间 mutation 或 full Schema 失败是 terminal `generation_downstream_contract`，不进入 L3。
+
+protected prefix 重新使用 current branch 的 start/duration 注入时间；CouplingEvaluator 按 frame class 删除全部 time paths
+后比较 payload canonical bytes，其他 protected 字段不变。每个 primary、noise 与 replay `_meta.event` 固定自带
+`duration_us`、`resources` 和规范声明序 `time_bindings`。noise 固定 point class；instruction-only 也只允许 point frame
+class。ID、retained bytes、delivery digest 和 CrossView 都消费注入或 rebound 后的最终 payload。
+
+M2 从 descriptor 证明内容后写 `Record.exact_dedup_text`。generation single/sequence 的 exact key 固定为
+`sha256(canonical_json(["labelkit:v1.20", "generation_stream_exact",
+ordered_exact_dedup_texts]))`；有该 carrier 的记录只运行 exact 层，禁止构造 MinHash 或 embedding。合法 replay 因
+非时间内容相同命中 exact duplicate；任何非时间 payload 差异不得命中。

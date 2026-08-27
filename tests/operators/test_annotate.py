@@ -16,6 +16,7 @@ from pathlib import Path
 from types import SimpleNamespace, SimpleNamespace as _NS
 
 import pytest as _pytest
+from jsonschema import Draft202012Validator
 
 from labelkit.common.contracts.execution import TaskGroupRequest
 
@@ -33,6 +34,7 @@ from labelkit.operators.annotate import (
     build_annotate_prompt,
     build_frame_annotate_prompt,
     class_annotate_schema,
+    class_effective_model_schema,
     class_effective_schema,
     class_schema_text,
 )
@@ -59,9 +61,11 @@ from labelkit.common.config.model import (
     StitchConfig,
     StreamConfig,
     ToolConfig,
+    TimeBindingSpec,
     TraceConfig,
     VerifyConfig,
 )
+from labelkit.common.contracts.generation import SequenceTemporalContext, SequenceTemporalMember
 from labelkit.common.contracts.types import (
     Annotation,
     Classification,
@@ -82,8 +86,10 @@ from labelkit.common.errors import (
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
+    InternalError,
 )
 from labelkit.common.inference import budget as budget_mod
+from labelkit.common.inference.schema_engine import CandidateFinalizerContractError
 
 USER_SCHEMA = {
     "type": "object",
@@ -1841,6 +1847,231 @@ def test_self_consistency_vote_uses_class_effective_schema():
                                         AnnotatePromptOptions(label="qa")))
     assert ann2.output == {"task": "A", "kind": "book"}       # 无分歧，取样本 #1
     assert ann2.sc == {"n": 3, "agreement_ratio": 1.0}
+
+
+TEMPORAL_CLASS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "task": {"type": "string"},
+        "approved": {"type": "boolean"},
+        "timing": {
+            "type": "object",
+            "properties": {
+                "startTime": {
+                    "type": "integer",
+                    "x-labelkit-business-time": True,
+                },
+            },
+            "required": ["startTime"],
+            "additionalProperties": False,
+        },
+    },
+    "required": ["task", "approved", "timing"],
+    "additionalProperties": False,
+}
+
+TEMPORAL_MODEL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "task": {"type": "string"},
+        "approved": {"type": "boolean"},
+        "timing": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": False,
+        },
+    },
+    "required": ["task", "approved", "timing"],
+    "additionalProperties": False,
+}
+
+
+def temporal_schema_cfg(**kw) -> ResolvedConfig:
+    """构造只允许框架写入 sequence annotation 时间的类视图。"""
+    base = schema_cfg(**kw)
+    views = dict(base.class_views)
+    views["writing"] = replace(
+        views["writing"],
+        schema=TEMPORAL_CLASS_SCHEMA,
+        model_schema=TEMPORAL_MODEL_SCHEMA,
+        business_time_paths=("/timing/startTime",),
+        time_bindings=(TimeBindingSpec(
+            "/timing/startTime", "first_resource_start_milliseconds", "foreground_app",
+        ),),
+    )
+    return replace(base, class_views=views)
+
+
+def temporal_context(record: Record) -> SequenceTemporalContext:
+    """冻结含点事件与两个目标 resource 正区间的 member 时间事实。"""
+    return SequenceTemporalContext((
+        SequenceTemporalMember(record.members[0].id, 1_000_000, 0, ()),
+        SequenceTemporalMember(
+            record.members[1].id, 5_000_000, 2_000_000, ("foreground_app",),
+        ),
+        SequenceTemporalMember(
+            record.members[2].id, 3_000_000, 1_000_000, ("foreground_app",),
+        ),
+    ))
+
+
+class _TemporalAnnotationEngine:
+    """离线执行 model Schema、finalizer 与完整 Schema 的测试引擎。"""
+
+    user_schema_text = SCHEMA_TEXT
+
+    def __init__(self, candidates, *, terminal=False):
+        self.candidates = list(candidates)
+        self.terminal = terminal
+        self.calls = []
+        self.finalizer_calls = 0
+
+    async def complete_finalized(self, request):
+        self.calls.append(request)
+        if self.terminal:
+            raise CandidateFinalizerContractError()
+        candidate = self.candidates.pop(0)
+        errors = tuple(Draft202012Validator(request.model_schema).iter_errors(candidate))
+        if errors:
+            raise SchemaViolation([error.message for error in errors], "")
+        try:
+            value = request.candidate_finalizer(candidate)
+            self.finalizer_calls += 1
+        except Exception:
+            raise CandidateFinalizerContractError() from None
+        if tuple(Draft202012Validator(request.final_schema).iter_errors(value)):
+            raise CandidateFinalizerContractError()
+        return dict(value), Usage(1, 1), 1, "m"
+
+    async def complete_validated(self, *args, **kwargs):
+        raise AssertionError("temporal annotation bypassed complete_finalized")
+
+
+def _temporal_candidate(task="book", approved=True):
+    return {"task": task, "approved": approved, "timing": {}}
+
+
+def _temporal_ctx(cfg, engine):
+    return _test_ctx(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(), batch_no=1)
+
+
+def test_public_annotation_uses_model_schema_and_mechanical_resource_start():
+    cfg, record = temporal_schema_cfg(), text_episode(3)
+    context = temporal_context(record)
+    engine = _TemporalAnnotationEngine([_temporal_candidate()])
+    opts = AnnotatePromptOptions(label="writing", temporal_context=context)
+
+    annotation = _asyncio.run(annotate_record(record, _temporal_ctx(cfg, engine), opts))
+
+    assert annotation.output == {"task": "book", "approved": True,
+                                 "timing": {"startTime": 3000}}
+    (call,) = engine.calls
+    model_timing = call.model_schema["properties"]["timing"]
+    full_timing = call.final_schema["properties"]["timing"]
+    assert "startTime" not in model_timing["properties"]
+    assert "startTime" in full_timing["properties"]
+    assert call.scope.user_treatment is True
+    assert call.candidate_finalizer.context is context
+    assert call.repair_projector(annotation.output) == _temporal_candidate()
+    prompt_text = "\n".join(
+        part.text or "" for message in call.prompt.messages for part in message.parts
+    )
+    assert "startTime" not in prompt_text
+    assert class_effective_model_schema(cfg, "writing") == TEMPORAL_MODEL_SCHEMA
+
+
+def test_annotation_stage_threads_pipeline_temporal_context():
+    cfg, record = temporal_schema_cfg(), text_episode(3)
+    context = temporal_context(record)
+    engine = _TemporalAnnotationEngine([_temporal_candidate()])
+    item = PipelineItem(
+        record=record,
+        classification=_classification("writing"),
+        temporal_context=context,
+    )
+
+    _asyncio.run(AnnotateStage(cfg)._annotate_item(item, _temporal_ctx(cfg, engine)))
+
+    assert item.annotation.output["timing"] == {"startTime": 3000}
+    assert engine.calls[0].candidate_finalizer.context is context
+
+
+@_pytest.mark.parametrize("mode", ("missing", "replaced"))
+def test_temporal_annotation_rejects_missing_or_replaced_context_before_provider(mode):
+    cfg, record = temporal_schema_cfg(), text_episode(3)
+    context = temporal_context(record)
+    if mode == "missing":
+        context = None
+    else:
+        context = replace(context, members=(
+            replace(context.members[0], event_id="different"), *context.members[1:],
+        ))
+    engine = _TemporalAnnotationEngine([_temporal_candidate()])
+    opts = AnnotatePromptOptions(label="writing", temporal_context=context)
+
+    with _pytest.raises(InternalError, match="generation_downstream_contract"):
+        _asyncio.run(annotate_record(record, _temporal_ctx(cfg, engine), opts))
+    assert engine.calls == []
+
+
+def test_temporal_annotation_missing_required_parent_is_recoverable_schema_violation():
+    cfg, record = temporal_schema_cfg(), text_episode(3)
+    engine = _TemporalAnnotationEngine([{"task": "book", "approved": True}])
+    opts = AnnotatePromptOptions(label="writing", temporal_context=temporal_context(record))
+
+    with _pytest.raises(SchemaViolation):
+        _asyncio.run(annotate_record(record, _temporal_ctx(cfg, engine), opts))
+    assert len(engine.calls) == 1 and engine.finalizer_calls == 0
+
+
+def test_self_consistency_and_vote_reuse_one_temporal_context():
+    cfg, record = temporal_schema_cfg(self_consistency=3), text_episode(3)
+    context = temporal_context(record)
+    engine = _TemporalAnnotationEngine([
+        _temporal_candidate("a", True),
+        _temporal_candidate("b", False),
+        _temporal_candidate("c", False),
+    ])
+    opts = AnnotatePromptOptions(label="writing", temporal_context=context)
+
+    annotation = _asyncio.run(annotate_record(record, _temporal_ctx(cfg, engine), opts))
+
+    assert annotation.output == {"task": "b", "approved": False,
+                                 "timing": {"startTime": 3000}}
+    assert annotation.sc == {"n": 3, "agreement_ratio": 2 / 3}
+    assert engine.finalizer_calls == 3
+    assert all(call.candidate_finalizer.context is context for call in engine.calls)
+
+
+def test_leaf_repair_projects_previous_time_and_uses_same_finalizer():
+    cfg, record = temporal_schema_cfg(), text_episode(3)
+    context = temporal_context(record)
+    engine = _TemporalAnnotationEngine([_temporal_candidate("fixed", False)])
+    repair = RepairContext(
+        previous_output={"task": "old", "approved": True, "timing": {"startTime": 999}},
+        critiques_text="task: fix",
+    )
+    opts = AnnotatePromptOptions(repair=repair, label="writing", temporal_context=context)
+
+    annotation = _asyncio.run(annotate_record_leaf(record, _temporal_ctx(cfg, engine), opts))
+
+    assert annotation.output["timing"] == {"startTime": 3000}
+    (call,) = engine.calls
+    assert call.candidate_finalizer.context is context
+    prompt_text = "\n".join(
+        part.text or "" for message in call.prompt.messages for part in message.parts
+    )
+    assert "startTime" not in prompt_text
+
+
+def test_temporal_candidate_finalizer_contract_failure_is_terminal():
+    cfg, record = temporal_schema_cfg(), text_episode(3)
+    engine = _TemporalAnnotationEngine([_temporal_candidate()], terminal=True)
+    opts = AnnotatePromptOptions(label="writing", temporal_context=temporal_context(record))
+
+    with _pytest.raises(InternalError, match="candidate finalizer contract failed"):
+        _asyncio.run(annotate_record(record, _temporal_ctx(cfg, engine), opts))
 
 
 def _structured_profile(context_window: int, name: str = "default"):

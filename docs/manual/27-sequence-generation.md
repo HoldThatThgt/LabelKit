@@ -36,7 +36,9 @@ flowchart LR
 | `confirm` | system | `confirmation` | 根据状态给出最终结果 |
 
 相邻 role 都有闭区间 gap，整个 pattern 有 `max_span_s`。每个 role 还声明 RFC 6901 读写/发布 roots、
-状态指令、可选 pre-state Schema 和从权威状态机械覆盖 payload 的 bindings。
+状态指令、可选 pre-state Schema 和从权威状态机械覆盖 payload 的 bindings。v1.20 的 frame class 还声明固定
+`duration_s`、容量为一的 `resources` 与机械 `time_bindings`；完整 Schema 用
+`x-labelkit-business-time = true` 标出每个业务时间叶子。
 
 主例有两个 counterfactual sets，每个 set 共享一行 catalog ScenarioSeed，并产生四个变体：
 
@@ -90,6 +92,10 @@ outcome_schema_path = "schemas/outcome-positive.json"
 完整 role、gap、variant、timeline、calendar window 与 noise 配置直接阅读示例文件；删掉任何关键字段后运行
 `labelkit validate`，会在内容调用前得到聚合配置错误。
 
+frame business time path 必须与 `time_bindings[*].payload_path` 完全相等。M1 从完整 Schema 派生不含这些叶子的
+model Schema；模型首轮和每轮 L3 只生成非时间字段，generic candidate finalizer 才按 planned start/end/duration
+注入并复验完整 Schema。sequence annotation 使用同一标记机制，当前 source 为目标 resource 的最早正区间起点。
+
 每个会让 LLM 产出 object 的 state、outcome 与 frame Schema 都在根级给出非空 `examples`。这不是 few-shot：
 M1 会用完整 Schema 验证它们，再选择 canonical UTF-8 最小的有效 object 作为“该 Schema 至少可实现”的预算 witness。
 显式 Schema 没有有效根 example，或最小 example 超过固定 prompt/payload 上限，都会在读取 API key 前失败。
@@ -123,7 +129,8 @@ value-free outcome-schema pointer/keyword，不含实际或期望状态值。修
 ## 27.5 反事实为何可比较
 
 baseline 先逐事件生成 EventDraft。只有 baseline 全部成功后，系统才执行结构变换并复用 protected prefix。
-CouplingEvaluator 会拒绝本应复用位置上的 ActorView、intent、patch 或 payload 字节变化。
+CouplingEvaluator 会拒绝本应复用位置上的 ActorView、intent、patch 或非时间 payload 字节变化；protected prefix 的
+业务时间仍按当前 branch 的绝对起点与时长重新绑定。
 
 PatternEvaluator 机械验证 role、顺序和 gap；StateEvaluator 验证最终 outcome 与状态；SemanticEvaluator 在看不到
 variant、target、expected/actual violation 的条件下独立判断自然性、因果一致性、actor knowledge 和隐藏信息泄漏。
@@ -201,12 +208,21 @@ attempt 失败并重试；只有全部帧标注成功后，main 与 primary stre
 `[generate.timeline]` 精确声明 timestamp start、默认 event gap、primary/crossed session、session 容量、noise 和
 replay 数量。declared role 的间隔只来自 pattern gaps；默认 `event_gap_s` 不会暗中收窄 timeout 变体。
 
+Planner 的固定 quantum 是 1 毫秒；起点、duration、gap、calendar 边界、variant excess、session gap 与求解结果都
+必须毫秒对齐。同一 resource 的所有正 duration event 使用半开区间互斥约束。pattern 的 `containments` 让 contained
+role 严格落在 container 区间中，并在 contained 终点与 container 终点之间保留至少 1 毫秒余量；仍存在的关系在
+reordered 与 interval-exceeded branch 中同样必须成立。
+
 noise 是没有 owner、没有 state patch 的精确事件槽。`[generate.noise].topics` 必须按 ordinal 显式声明互不重复的
 话题，数量与 `timeline.noise_events` 精确相等；planner 把每一项冻结进对应 `NoiseSlot.topic`。renderer 只能围绕
 该话题生成，独立 semantic evaluation 分别证明它与声明任务无关、没有可执行诉求、表达自然且忠实计划话题。
-MinHash 仍在四项语义门之后拦截文字近重，但不负责猜测两个语义话题是否相同。
-replay 只从已经通过全部下游处理的最终 positive `SequenceRows` 派生；timestamp、event ID、replay sequence ID、
-ordinal 和 duplicate provenance 全部重新确定性计算。它不会复制预投影记录或另存第二份世界真值。
+MinHash 仍在四项语义门之后拦截文字近重，但不负责猜测两个语义话题是否相同。noise 固定为点事件：
+`duration_us = 0`、空 resources，只能使用允许 start binding 的点 frame class。
+
+replay 只从已经通过全部下游处理的最终 positive `SequenceRows` 派生。Planner 为整条 source 选择同一个正、毫秒对齐
+的 `shift_us`；所有成员保持 source 的 start delta、duration、resources、role 顺序与非时间 payload，业务时间按 replay
+起点重新绑定。timestamp、event ID、replay sequence ID、ordinal 和 duplicate provenance 全部重新确定性计算。
+它不会复制 source 时间 payload、预投影记录或另存第二份世界真值。
 
 ## 27.8 两个输出视图与 provenance
 
@@ -215,15 +231,21 @@ main 每行是一条最终 sequence，包含已启用的 classification、qualit
 expected violation 与 actual violations。
 
 stream 每行固定为 `{"payload": ..., "_meta": ...}`。primary event truth 包含 event/event-key、owner sequence、role、
-frame class、actor、logical time 与 timestamp。noise 的 owner 为空；replay 另带 replay sequence ID、ordinal、
-source sequence/event ID。process replay 的 M2 ingest 会从同一 stream 文件重算并验证全部 ID 与 provenance，
-不把 main 文件当隐式旁输入。
+frame class、actor、logical time、timestamp、duration、resources 与 time-binding descriptor。noise 的 owner 为空；
+replay 另带 replay sequence ID、ordinal、source sequence/event ID。process replay 的 M2 ingest 会从同一 stream 文件
+重算 binding、ID 与 provenance，验证 replay 的 constant shift 和 rebound payload，不把 main 文件或原工程配置当隐式旁输入。
+M2 为已验证成员写入删除时间叶子的 exact dedup carrier；M3 对这类 single/sequence 只运行 exact 层。
 
 CrossView 分三层保持线性工作量：每个 PreparedCandidate/PreparedNoiseCandidate 进入缓冲前做 candidate-local 校验；
-声明序 head 用 CrossViewFrontier 检查全局 ID、timestamp、source 与 phase/ordinal 并生成 delta；全部 primary、replay、
-noise 内存提交后，再由 full CrossViewReconciler 从最终 rows 独立重建一次全部事实。前两层负责把候选错误变成当前
-attempt 可重试 rejection，最终层失败是运行级内部不变式破坏。main 内成员按 owner 顺序保留；最终 stream 按
-timestamp 全局稳定排序，因此 crossed session 能呈现真实 A-B-A 或 B-A-B。
+声明序 head 用 CrossViewFrontier 检查全局 ID、timestamp、source、resource intervals 与 phase/ordinal 并生成 delta；
+source 与它的全部 rebound replay 进入同一个 `CrossViewDelta` 和同一次原子提交。全部 primary、replay、noise 内存提交
+后，full CrossViewReconciler 从最终 rows 独立重建全部事实，并在最终 timestamp 排序之后复查全局起点唯一、resource
+互斥、containment、descriptor、payload 与 annotation。固定计划错误是终态 downstream contract 失败，不作为 slot
+重试。main 内成员按 owner 顺序保留；最终 stream 按 timestamp 全局稳定排序，因此 crossed session 能呈现真实
+A-B-A 或 B-A-B。
+
+Dataset-Person 导出器只做格式转换和只读 overlap/containment 验证；它不会 align、normalize、shift、synchronize 或
+重写任何业务时间。raw 工件必须在 LabelKit manifest-last 提交前已经满足这些不变量，消费者无需二次修复。
 
 ## 27.9 retained bytes 与原子提交
 
@@ -290,29 +312,35 @@ uv run python check_output.py --frame-only
 
 当前证据状态：
 
-- keyless validate/dry-run 与 2/8/22+2+3=27 算术已验证；
-- DeepSeek 主例：2 sets、8 sequences、27 stream rows，checker PASS；
-- replay：27 scanned、9 episodes、2 noise、1 exact duplicate、8 emitted，checker PASS；
-- instruction-only：1 sequence、3 events，checker PASS；
-- DeepSeek 核心、双-noise 与两条 failure injection：5 passed in 119.26s；
-- z.ai structured output：1 passed in 60.81s。
+- v1.20 Dataset-Person production constructor 的 keyless validate 已通过；dry-run 为 4380 sequences、
+  16320 primary events、零 LLM 调用、零正式输出；
+- 重复 compile 的 program digest 同为 `0e0a49...8f94b7`，plan digest 同为 `0c957e...bcca08`；
+- plan audit 的 duplicate starts、`foreground_app` overlaps、containment violations 与 annotation resource missing
+  都为零；
+- config、Schema/M2/M3、planner/program/contracts 与 Dataset-Person 离线门已分别取得
+  552、346、122、45+663 的通过证据；完整 offline suite 与本轮 Uncle Bob review 尚未在这里记为通过；
+- 十二周付费真实 raw 生成仍为 `[PENDING-EVIDENCE:v1.20-12w-real-generation]`。
 
-## 27.11 独立真实感门
+历史 v1.18/v1.19 真实端点证据包括：DeepSeek 主例 2 sets、8 sequences、27 stream rows 与 replay checker PASS；
+instruction-only 1 sequence、3 events；DeepSeek 核心、双-noise 与两条 failure injection 5 passed in 119.26s；
+z.ai structured output 1 passed in 60.81s。这些结果不能替代 v1.20 的 model/full Schema、rebound replay 或 raw 时间门。
+
+## 27.11 历史独立真实感门
 
 最终发布门使用 13 个 counterfactual sets 的 52 条真实 DeepSeek declared 序列。selection seed 20260822 打乱
 序列与变体身份；两名评审只看 timestamp、actor、frame class 与 payload，不看内部真值、文件顺序、state、patch、
 expected violation 或模型自评。
 
 两名评审各自得到 52 pass / 0 fail；不可能跃迁、提前知情、模板或不自然表达、时间错配和目标点前不一致
-全部为零，也没有跨 scenario 的系统性缺陷。因此真实感门通过。发布工件 main SHA-256 为
+全部为零，也没有跨 scenario 的系统性缺陷。因此该 v1.18 真实感门通过。发布工件 main SHA-256 为
 `d3247306770068be716aabf3c94c133a74a561b0ac87f4e0c5b8be185fdc250f`，逐评审账本在
 `docs/dev/evidence/v1.18-sequence-realism-review.jsonl`；账本不保存完整 payload 或 secret。
 
-## 27.12 已验证的发布证据
+## 27.12 历史发布证据
 
 - v1.18 变更前离线基线：2157 tests。
 - v1.18 pre-revision 离线套件：2610 passed、47 deselected。
-- v1.19 当前离线套件：2772 passed、48 deselected。
+- v1.19 离线套件：2774 passed、48 deselected。
 - v1.18 合并覆盖率基线：line 95.71%、branch 91.30%；1548/1548 个可执行生产函数已进入。
 - v1.19 完整真实端点 integration suite：47 passed、1 skipped in 370.53s；skip 只因该 shell 未设置本地模型专用 key，
   同一 checkout 的本地 Qwen3.5-4B 四槽门已独立连续通过三次。

@@ -320,7 +320,7 @@ schema_inline = """
 """
 ```
 
-### 5.2.1 sequence 生成公共配置（v1.18）
+### 5.2.1 sequence 生成公共配置（v1.20）
 
 sequence 是 `generate.form = "sequence"` 的唯一入口；`generate.mode` 在 declared 与 instruction-only
 之间互斥。它要求 generate_only、text、global dedup、inline meta、rejects none、无 `--limit`，
@@ -361,11 +361,36 @@ description = "用户发起任务请求"
 [frame.class.task_request.generate]
 instruction = "请求者提出尚未完成的同一请求。"
 schema_path = "schemas/frame-request.json"
+duration_s = 120
+resources = ["foreground_app"]
+time_bindings = [
+  { payload_path = "/timestamp", source = "event_start_milliseconds" },
+  { payload_path = "/endTime", source = "event_end_milliseconds" },
+]
 ~~~
 
 每个被 role、instruction-only 或 noise 引用的 frame class 都必须声明 description、非空 instruction，并用
 schema_path 或 schema_inline 恰选一个 object JSON Schema。Schema 根级 `examples` 至少含一个通过完整 Schema 的
 object；M1 选择 canonical byte 最小 witness。sequence 不接受 string payload。
+
+完整 Schema 的业务时间叶必须写 `x-labelkit-business-time = true`，且 path 集与 `time_bindings` path 集完全相等。
+frame source 只允许 start/end/duration milliseconds 或 start/end fixed-offset ISO8601。M1 同时冻结完整 Schema 与剥离
+时间叶子的 model Schema；provider 与 L3 只消费 model Schema。`duration_s` 缺省为点事件，在场时必须是正整数毫秒；
+resource 名匹配 `[a-z0-9_]+`、声明序唯一且要求正 duration。
+
+declared sequence annotation 以同样标记声明 class Schema 时间叶，并在 `[class.<name>.annotate]` 声明：
+
+~~~toml
+[class.ticket_booking.annotate]
+time_bindings = [
+  { payload_path = "/actionInfo/timestamp",
+    source = "first_resource_start_milliseconds",
+    resource = "foreground_app" },
+]
+~~~
+
+该配置只允许 generate-only sequence declared mode；annotation 时间来自最终 members 中目标 resource 最早正区间 start。
+annotate disabled、ordinary process、ordinary annotation 或 instruction-only 声明均为 CONFIG_ERROR。
 
 #### pattern、role、binding 与 gap
 
@@ -430,6 +455,10 @@ before = "acknowledge"
 after = "confirm"
 min_gap_s = 30
 max_gap_s = 1200
+
+[[generate.pattern.booking_success.containments]]
+container = "request"
+contained = "acknowledge"
 ~~~
 
 | 面 | 约束 |
@@ -440,8 +469,9 @@ max_gap_s = 1200
 | roots | RFC 6901 token 前缀；同一列表内禁止祖先/后代冗余，read/write/publish 列表之间可相交。 |
 | patch | 只允许 test/add/remove/replace，至少一个 test 且 test 连续位于写操作前；test 落 read roots，写操作落 write roots。 |
 | publish | publish roots 在事件后存在；observers 必须来自 seed actors。 |
-| binding | state_path 同时被当前 role 的 read 与 publish roots 覆盖；payload_path 禁止根路径、重复及任意祖先/后代冲突。binding 的精确 path/value 进入 renderer prompt；LLM 按完整 Draft 2020-12 frame Schema 返回完整 object，系统在深拷贝上按声明序以 RFC 6902 `add` 实例语义机械覆盖，再以同一完整 Schema 复验；不改写 Schema。 |
+| binding | state_path 同时被当前 role 的 read 与 publish roots 覆盖；state payload path 与 time binding path 不得相等或互为前缀。provider 按 model Schema 返回非时间 object；框架注入时间后以完整 Schema 复验。 |
 | calendar | role 可选引用一个命名 `calendar_window`。 |
+| containment | container/contained 各出现一次、正 duration、不同且不共享 resource；仍同时存在时满足 `container.start <= contained.start` 且 `contained.end + 1000us <= container.end`。 |
 | counterexample eligibility | missing 目标 frame class 在 pattern 内唯一；reordered 的目标 role 相邻且 frame class 不同。 |
 
 #### counterfactual set
@@ -529,16 +559,16 @@ topics = ["夜空中的月相观察", "手工面包出炉时的香气"]
 | 字段 | 类型 | 约束 |
 |---|---|---|
 | `timestamp_start` | offset datetime | 必填；不取墙钟。 |
-| `event_gap_s` | closed seconds range | instruction-only 相邻位置、noise 与 replay 的铺设间隔；不约束 declared role gap。 |
+| `event_gap_s` | closed seconds range | instruction-only 相邻位置与 noise 的铺设间隔；不约束 declared role gap。所有值必须毫秒对齐。 |
 | `primary_sessions` | int | primary 总数 N、crossed 数 D 时必须等于 N - D。 |
 | `crossed_primary_sessions` | int | 0..floor(N/2)；每个 crossing session 恰有两个不同 set owner。 |
 | `session_max_events` | int | 每个 primary session 的事件容量。 |
-| `session_max_span_s` | seconds | 必填正值；session 的闭区间跨度上限。 |
+| `session_max_span_s` | seconds | 必填正值；session 完整 interval envelope 的跨度上限。 |
 | `session_gap_s` | seconds | 相邻 session 的最小间隔。 |
 | `noise_events` | int | 精确 noise slot 数；大于零时 generate.noise 必填。 |
-| `duplicate_sequences` | int | 精确 whole-positive-sequence replay 数；source 无放回，source 不足启动失败。 |
+| `duplicate_sequences` | int | 精确 whole-positive-sequence replay 数；source 无放回，source 不足启动失败；每条 replay 冻结一个正 constant shift。 |
 | calendar window | table | 固定 UTC offset、weekday 闭集、同日半开 intervals；名称唯一。 |
-| noise | table | frame class 有 object Schema，且不得被任何 role 使用；topics 是与 noise_events 等长的非空唯一话题表；noise 无 owner、state patch 或任务真值。 |
+| noise | table | frame class 有 object Schema、零 duration、空 resources，且不得被任何 role 使用；topics 是与 noise_events 等长的非空唯一话题表；noise 无 owner、state patch 或任务真值。 |
 
 instruction-only 强制 crossed 为零、primary_sessions = N、duplicates 为零。每个 declared primary session 恰有
 一或两个不同 counterfactual set owner，同一 set 的 variants 永不共 session；每个 replay 独占尾部 session。

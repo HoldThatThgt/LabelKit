@@ -1,8 +1,7 @@
-"""ResolvedConfig 到 v1.18 GenerationProgram 的纯编译器。"""
+"""ResolvedConfig 到 v1.20 GenerationProgram 的纯编译器。"""
 from __future__ import annotations
 
 import dataclasses
-import hashlib
 import logging
 from collections.abc import Mapping
 from pathlib import Path
@@ -10,7 +9,7 @@ from pathlib import Path
 from labelkit.common.config.model import ResolvedConfig
 from labelkit.common.contracts.generation import GenerationProgram
 from labelkit.common.errors import ConfigError
-from labelkit.operators.generation.project import canonical_json
+from labelkit.operators.generation.project import generation_digest
 
 
 _log = logging.getLogger("labelkit.generation.program")
@@ -194,8 +193,7 @@ def generation_program_digest(program: GenerationProgram) -> str:
     @param program 待校验或尚未写入 digest 的冻结程序。
     @return 64 位小写十六进制摘要。
     """
-    material = canonical_json(_semantic_value(program))
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()
+    return generation_digest("generation_program", _semantic_value(program))
 
 
 def _semantic_value(value):

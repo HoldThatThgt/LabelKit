@@ -1,4 +1,4 @@
-"""验证 v1.18 序列生成教学工程的用户可见工件。"""
+"""验证 v1.20 序列生成教学工程的用户可见工件。"""
 
 from __future__ import annotations
 
@@ -151,8 +151,8 @@ def _canonical_json(value: object) -> str:
 
 
 def _derive_id(domain: str, components: list[object]) -> str:
-    """按公开 v1.18 公式独立派生 32 位 generation ID。"""
-    material = _canonical_json(["labelkit:v1.18", domain, components])
+    """按公开 v1.20 公式独立派生 32 位 generation ID。"""
+    material = _canonical_json(["labelkit:v1.20", domain, components])
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:32]
 
 
@@ -180,7 +180,7 @@ def _delivery_digest(main: list[dict[str, Any]], stream: list[dict[str, Any]]) -
     @param stream 最终时间流视图行。
     @return 64 位 SHA-256 十六进制摘要。
     """
-    digest = hashlib.sha256(b"labelkit:v1.18:delivery\n")
+    digest = hashlib.sha256(b"labelkit:v1.20:delivery\n")
     for row in (*main, *stream):
         body = _canonical_row(row)
         digest.update(str(len(body)).encode("ascii"))
@@ -510,7 +510,8 @@ def _assert_primary_meta(primary: dict[str, Any]) -> None:
     event = meta["event"]
     assert set(event) == {
         "event_id", "event_key", "owner_sequence_id", "role", "frame_class",
-        "actor", "logical_time_us", "timestamp",
+        "actor", "logical_time_us", "timestamp", "duration_us", "resources",
+        "time_bindings",
     }, "Primary event fields differ from the contract"
     classification = meta["classification"]
     assert classification == {
@@ -522,6 +523,63 @@ def _assert_primary_meta(primary: dict[str, Any]) -> None:
         role = event["role"]
         assert event["frame_class"] == ROLE_FRAMES[role], "Declared frame differs from role"
         assert event["actor"] == ROLE_ACTORS[role], "Declared actor differs from role"
+    _assert_time_payload(primary)
+
+
+def _pointer_parts(path: str) -> tuple[str, ...]:
+    """解析 checker 使用的非根 RFC 6901 object path。"""
+    assert path.startswith("/") and path != "/", "Time binding path is invalid"
+    return tuple(token.replace("~1", "/").replace("~0", "~") for token in path[1:].split("/"))
+
+
+def _pointer_value(payload: dict[str, Any], path: str) -> Any:
+    """读取一个只穿过 object parent 的业务时间叶子。"""
+    value: Any = payload
+    for token in _pointer_parts(path):
+        assert isinstance(value, dict) and token in value, "Time binding path is missing"
+        value = value[token]
+    return value
+
+
+def _time_value(source: str, start_us: int, duration_us: int, timestamp: str) -> Any:
+    """独立计算 stream descriptor 声明的业务时间值。"""
+    if source == "event_start_milliseconds":
+        return start_us // 1000
+    if source == "event_end_milliseconds":
+        return (start_us + duration_us) // 1000
+    if source == "event_duration_milliseconds":
+        return duration_us // 1000
+    zone = datetime.fromisoformat(timestamp).tzinfo
+    epoch_us = start_us + (duration_us if source == "event_end_iso8601" else 0)
+    instant = datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(microseconds=epoch_us)
+    assert source in {"event_start_iso8601", "event_end_iso8601"}
+    return instant.astimezone(zone).isoformat(timespec="microseconds")
+
+
+def _assert_time_payload(row: dict[str, Any]) -> None:
+    """从自描述 event 独立复算 payload 的全部业务时间叶子。"""
+    event, payload = row["_meta"]["event"], row["payload"]
+    duration, resources = event["duration_us"], event["resources"]
+    assert isinstance(duration, int) and not isinstance(duration, bool) and duration >= 0
+    assert duration % 1000 == 0 and len(resources) == len(set(resources))
+    assert duration > 0 or resources == [], "Point event cannot occupy a resource"
+    start = _assert_example_timestamp(event["timestamp"])
+    for binding in event["time_bindings"]:
+        assert set(binding) == {"payload_path", "source"}, "Time descriptor fields differ"
+        expected = _time_value(binding["source"], start, duration, event["timestamp"])
+        assert _pointer_value(payload, binding["payload_path"]) == expected
+
+
+def _without_time(payload: dict[str, Any], descriptor: list[dict[str, str]]) -> dict[str, Any]:
+    """在副本中删除 descriptor 声明的业务时间叶子。"""
+    value = json.loads(json.dumps(payload, ensure_ascii=False))
+    for binding in descriptor:
+        parts = _pointer_parts(binding["payload_path"])
+        parent = value
+        for token in parts[:-1]:
+            parent = parent[token]
+        parent.pop(parts[-1])
+    return value
 
 
 def _assert_member_views(stream: dict[str, Any], rows: list[dict[str, Any]]) -> None:
@@ -571,6 +629,7 @@ def _assert_primary_owner(row: dict[str, Any], rows: list[dict[str, Any]],
         assert event["event_key"] == _event_key(truth, event, index)
         expected = _derive_id("primary_event_id", [
             world, event["event_key"], _assert_example_timestamp(event["timestamp"]),
+            event["duration_us"], event["resources"], event["time_bindings"],
             primary["payload"],
         ])
         assert event["event_id"] == expected and event["owner_sequence_id"] == meta["id"]
@@ -630,6 +689,7 @@ def _assert_replay(primary: list[dict[str, Any]], replay: list[dict[str, Any]],
     assert stream[-len(replay):] == replay, "Replay must be the explicit stream tail"
     expected_start = _timestamp_us(stream[-len(replay) - 1]["_meta"]["event"]["timestamp"])
     expected_start += 3_600_000_000
+    shifts: set[int] = set()
     for row in replay:
         assert tuple(row) == ("payload", "_meta"), "Replay row fields differ"
         event = row["_meta"]["event"]
@@ -641,8 +701,9 @@ def _assert_replay(primary: list[dict[str, Any]], replay: list[dict[str, Any]],
         )
         assert set(event) == {
             "event_id", "event_key", "owner_sequence_id", "role", "frame_class",
-            "actor", "logical_time_us", "timestamp", "replay_sequence_id",
-            "replay_ordinal", "duplicate_of_sequence_id", "duplicate_of_event_id",
+            "actor", "logical_time_us", "timestamp", "duration_us", "resources",
+            "time_bindings", "replay_sequence_id", "replay_ordinal",
+            "duplicate_of_sequence_id", "duplicate_of_event_id",
         }, "Replay event fields differ from the contract"
         assert source_event["owner_sequence_id"] == source_owner
         expected_sequence = _derive_id(
@@ -650,9 +711,19 @@ def _assert_replay(primary: list[dict[str, Any]], replay: list[dict[str, Any]],
         )
         expected_event = _derive_id("replay_event_id", [
             expected_sequence, source_event["event_id"],
-            _assert_example_timestamp(event["timestamp"]),
+            _assert_example_timestamp(event["timestamp"]), event["duration_us"],
+            row["payload"],
         ])
-        assert row["payload"] == source["payload"], "Replay payload differs from source"
+        assert event["duration_us"] == source_event["duration_us"]
+        assert event["resources"] == source_event["resources"]
+        assert event["time_bindings"] == source_event["time_bindings"]
+        assert _without_time(row["payload"], event["time_bindings"]) == _without_time(
+            source["payload"], source_event["time_bindings"]
+        ), "Replay non-time payload differs from source"
+        _assert_time_payload(row)
+        shift = _timestamp_us(event["timestamp"]) - _timestamp_us(source_event["timestamp"])
+        assert shift > 0 and shift % 1000 == 0, "Replay shift must be positive milliseconds"
+        shifts.add(shift)
         replay_extra = {key: value for key, value in row["_meta"].items()
                         if key not in {"event", "generation"}}
         source_extra = {key: value for key, value in source["_meta"].items()
@@ -681,11 +752,9 @@ def _assert_replay(primary: list[dict[str, Any]], replay: list[dict[str, Any]],
         assert generation["scenario_id"] == source_truth["scenario_id"]
     duplicate_ids = tuple(row["_meta"]["event"]["duplicate_of_event_id"] for row in replay)
     assert duplicate_ids == tuple(row["_meta"]["event"]["event_id"] for row in source_rows)
-    replay_times = tuple(_timestamp_us(row["_meta"]["event"]["timestamp"]) for row in replay)
-    logical = tuple(row["_meta"]["event"]["logical_time_us"] for row in source_rows)
-    assert replay_times == tuple(expected_start + value - logical[0] for value in logical), (
-        "Replay timestamps differ from the frozen tail layout"
-    )
+    assert len(shifts) == 1, "Replay members must share one constant shift"
+    actual_start = _timestamp_us(replay[0]["_meta"]["event"]["timestamp"])
+    assert actual_start == expected_start, "Replay timestamps differ from the frozen tail layout"
 
 
 def _assert_noise(rows: list[dict[str, Any]], program_digest: str, run_id: str) -> None:
@@ -698,16 +767,20 @@ def _assert_noise(rows: list[dict[str, Any]], program_digest: str, run_id: str) 
         event = meta["event"]
         assert set(event) == {
             "event_id", "event_key", "owner_sequence_id", "role", "frame_class",
-            "actor", "logical_time_us", "timestamp", "noise",
+            "actor", "logical_time_us", "timestamp", "duration_us", "resources",
+            "time_bindings", "noise",
         }, "Noise event fields differ"
         event_key = _derive_id("noise_event_key", [program_digest, "noise", ordinal])
         event_id = _derive_id("noise_event_id", [
-            run_id, event_key, _assert_example_timestamp(event["timestamp"]), row["payload"],
+            run_id, event_key, _assert_example_timestamp(event["timestamp"]),
+            event["duration_us"], event["resources"], event["time_bindings"], row["payload"],
         ])
         assert event["event_key"] == event_key and event["event_id"] == event_id
         assert event["owner_sequence_id"] is None and event["noise"] is True
         assert event["frame_class"] == "noise" and event["role"] is None
         assert event["actor"] is None and event["logical_time_us"] is None
+        assert event["duration_us"] == 0 and event["resources"] == []
+        _assert_time_payload(row)
         assert meta["generation"] is None
 
 

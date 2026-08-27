@@ -1,7 +1,8 @@
 # E2E 测试发现与证据状态
 
 > 本文件只记录可复核证据。已验证事实、权威验收目标、环境失败和待运行项分开书写。
-> 当前序列生成以 v1.18 行为规格、v1.19 execution runtime 规格与 `examples/sequence-generation` 为准。
+> 当前序列生成以 v1.20 时间完整性规格、sequence redesign、v1.19 execution runtime 规格与
+> `examples/sequence-generation` 为准；v1.18/v1.19 结果仅作历史基线。
 
 ## 证据纪律
 
@@ -12,7 +13,61 @@
 - API key value 只在内存中使用，不写日志、trace、main、stream、report、manifest、failed report 或 assertion repr。
 - 尚未运行的证据必须保留 `[PENDING-EVIDENCE:<name>]`，不能用规格期望冒充结果。
 
-## v1.18 闭包看板
+## v1.20 时间完整性证据看板
+
+本节只记录 2026-08-27 当前实现 turn 已完成的离线门、Dataset-Person keyless 生产入口与本地 4B/GLM-5.2
+真实端点门。完整 offline suite 已计入；本轮 Uncle Bob mutation review 尚未计入通过。下面的历史 v1.18/v1.19
+真实端点结果不能替代 v1.20 raw 时间证明。
+
+| 证据面 | 当前状态 | 已知事实 / 输入边界 |
+|---|---|---|
+| 完整 offline suite | 已验证 | 修复真实端点发现的冻结嵌套 annotation 误判后，`2928 passed, 48 deselected in 43.83s` |
+| config 与 frozen shapes | 已验证 | 当前 `tests/common/config` 相关全组 552 passed，含 few-shot JSON array 回归 |
+| Schema finalizer、M2、M3 | 已验证 | model/full Schema、generic finalizer、自描述 ingest 与 exact-only dedup 相关组 346 passed |
+| planner、program、contracts | 已验证 | planner 35 passed；1 ms quantum、interval/resource/containment 与 replay rebound 均有直接测试 |
+| Dataset-Person 离线门 | 已验证 | 当前两组门分别 46 passed 与 663 subtests；不把外部付费生成算入 |
+| production keyless validate | 已验证 | production constructor 验证通过，未物化 LLM key value |
+| production dry-run | 已验证 | 4380 sequences、16320 primary events；LLM calls 为 0，正式输出为 0 |
+| 重复 compile | 已验证 | 两次 program digest 均为 `0e0a49...8f94b7`，plan digest 均为 `0c957e...bcca08` |
+| plan temporal audit | 已验证 | duplicate starts 0；`foreground_app` overlaps 0；containment violations 0；annotation resource missing 0 |
+| 本地 4B / GLM-5.2 probe | 已验证 | Qwen3.5-4B-Q6_K 162 ms；真实 `glm-5.2` 2678 ms；两个 profile 均由 production probe 到达 |
+| 教学工程真实四槽 | 已验证 | 4/4 sets、12 primary、1 noise、3 replay；34 calls、0 rejection；running high-water 4，原子提交并独立审核通过 |
+| production 时间叶门 | 已验证 | 单事件 navigation 检查 3 个业务时间 binding；双事件 navigation 检查 5 个 binding 与严格 containment，均由 GLM-5.2 接受 |
+| production navigation 提交 | 已验证 | 1/1 set、1 primary；default 3 calls、judge 1 call；3 个 payload binding 与 annotation binding、manifest 哈希及 delivery digest 独立通过 |
+| production 四类烟测 | 已验证失败边界 | navigation 等候选准备完成；`check_in` 被 GLM-5.2 连续拒绝 8 次后 slot exhaustion；无 success artifact，不能记为通过 |
+| Uncle Bob mutation review | 待运行 | `[PENDING-EVIDENCE:v1.20-uncle-bob]`；caller checkout 非 clean，按审查流程 fail-closed |
+| 十二周真实 raw 生成 | 待运行 | `[PENDING-EVIDENCE:v1.20-12w-real-generation]` |
+
+production constructor 现在由 Schema annotation、frame `duration_s/resources/time_bindings`、pattern containment 与
+sequence annotation binding 描述唯一时间真值。Dataset-Person exporter 的产品边界是格式转换与只读校验；不得 align、
+normalize、shift、synchronize 或重写 raw 业务时间。keyless validate/dry-run 与计划审核只证明编译、排程和零调用边界，
+不证明付费模型返回、最终 raw 工件或十二周 manifest-last 提交。
+
+本轮本地 renderer 使用
+`/Users/atishoo/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q6_K.gguf`，SHA-256 为
+`fdedd781c9ce676ab66b018ca247ff78e8a33c98098a822c1e2d5075e7718f66`；服务为 llama-server v9200，
+关键参数为 `-c 393216 -np 4 -b 2048 -ub 512 -t 6 -tb 6 -ngl all -fa on --fit off -rea off`。semantic
+evaluation profile 固定为真实 z.ai `glm-5.2`，没有替换 transport、LLM client、服务端或响应。
+
+四槽教学工程报告记录 main 4 行、stream 16 行、delivery digest
+`fad30744ddb5e6507e99e14fb80a06aeb068e8b279b9b187e4083a3fde3b3ae0`。default profile 为 29 calls、
+32000 prompt tokens、1997 completion tokens；judge 为 5 calls、11262 prompt tokens、300 completion tokens；两者
+provider retry 均为 0。独立审核重算 manifest 文件哈希与 delivery digest，并验证 16 个时间点全局有序且唯一、三种
+primary/noise/replay descriptor 闭包、failed report 缺失与密钥不落盘。
+
+首次 production 烟测在最终对账暴露真实缺陷：M11 已递归解冻 annotation 并通过完整 Schema，CrossView 最终对账却
+直接把深冻结 `mappingproxy` 交给 `jsonschema`，导致合法嵌套 object 被误判为 type 违规。受控诊断证明原对象有一条
+`/actionInfo: type` 违规，递归解冻后为零；修复为对最终用户对象同样递归解冻，并新增专门回归。修复后 navigation
+单槽以真实模型原子提交，delivery digest 为
+`053a3faadea448a0b17993d038a7c1b9dbf0db2fc727ee68dd7c888ea579b0f1`；独立审核验证 main/stream/report 哈希、
+delivery framing、outer/payload/annotation 时间一致、时间唯一、failed report 缺失与密钥不落盘。
+
+同一修复后的四类 production 烟测不能报绿：`check_in` 槽的八个候选全部被 GLM-5.2 的 semantic evaluation 拒绝，
+failed report 精确记录 `sequence_delivery_exhausted`、8 个 `semantic_evaluation` rejection、default 93 calls、judge
+11 calls，且 `artifacts_committed=false`；main、stream、success report、manifest 均不存在。该证据证明时间提交缺陷已
+越过，但不证明 Qwen3.5-4B 能稳定满足全部白领工程语义，也不替代十二周真实 raw 生成。
+
+## 历史 v1.18 闭包看板
 
 | 证据面 | 当前状态 | 已知事实 / 占位 |
 |---|---|---|
@@ -32,7 +87,7 @@
 | 完整真实端点 integration suite | 已验证 | 47 passed in 438.37s，无 skip |
 | 52-sequence blind review | 已验证 | 两名评审各 52/52；五类缺陷与系统性缺陷均为 0 |
 
-## v1.19 execution runtime 闭包看板
+## 历史 v1.19 execution runtime 闭包看板
 
 | 证据面 | 当前状态 | 已知事实 |
 |---|---|---|
@@ -235,9 +290,10 @@ uv run python check_output.py --frame-only
 不泄漏、replay provenance、report/manifest digest。state、patch 与 ActorView 不写训练工件，所以 patch replay
 证据必须从集成测试的内存 EventTrace 取得，不能由 checker 假装读取不可见字段。
 
-replay 必须从最终 successful SequenceRows 派生，不从预投影 Record 或独立世界对象复制。M2 在单一 stream 文件内
-重算 primary event/owner sequence/replay sequence/replay event ID、ordinal 与 duplicate provenance；payload、
-timestamp、role、owner、world branch、source 或事件数任一篡改都 fail closed。
+这组 v1.18 证据只证明当时 replay 从最终 successful SequenceRows 派生，不从预投影 Record 或独立世界对象复制。
+v1.20 已删除旧 payload-copy 判定：M2 改为从单一 stream 的 event descriptor 重算业务时间，验证 duration/resources、
+constant shift、非时间 payload 与下游 metadata，并用 rebound payload 重算 replay event ID。当前行为只由上方 v1.20
+门和新的 raw 生成证据证明。
 
 主例在 2026-08-22 最终代码上交付 2 sets、8 sequences、22 primary events、2 noise events、1 条三事件 replay，
 共 27 行 stream；四个 variant 各 2 条，所有 rejected-attempt 桶为 0。default profile 为 38 calls、34470 input
@@ -293,6 +349,8 @@ selection seed 为 20260822；盲样本只保留 review key、匿名 group key�
 - final `PipelineItem -> SequenceRows` 必须含 inherited classification、quality、sequence/frame annotation 与
   verification；CrossView、retained bytes、delivery digest 与正式文件使用同一最终 bytes。
 - primary/noise/replay rows 按最终 artifact timestamp 全局稳定排序；main members 保持 owner 内顺序。
+- payload/annotation 业务时间、duration/resources、descriptor、containment 与全局 resource intervals 在提交前复验；
+  source 与全部 rebound replay 进入同一个 `CrossViewDelta` 和同一次原子提交。
 - prospective retained bytes 在 dedup commit 前同时计 source 与它的全部 replay。
 - 成功按 main、stream、report 原子替换，manifest last。
 - exhaustion 或 pre-commit terminal 保留已有成功四件套，另写 failed report。

@@ -1,4 +1,4 @@
-"""v1.18 generation 纯逻辑测试共享夹具。"""
+"""v1.20 generation 纯逻辑测试共享夹具。"""
 
 from __future__ import annotations
 

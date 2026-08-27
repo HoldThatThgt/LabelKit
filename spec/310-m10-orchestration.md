@@ -55,12 +55,12 @@ sequence namespace 由 run/phase/slot/attempt/stage 派生；`run_id` 与 `run_s
 | console 旁路（v1.10） | **stage 信号**：批链循环内每 stage `run()` 之前调 `metrics.stage_begin(stage.name, batch_no)`——进程内旁路仅转发 ProgressListener，不产生 TraceEvent、不入 7.2 目录（3.12.3/U11）；`_request_stop` 内加一行 `metrics.stop_requested()`（中断横幅通路）。**估算导出（U20）**：静态估算公式抽出为纯函数 `estimate_run(cfg, plan)`（`_estimate()` 改薄封装；dry-run 与渲染器批级分母共用）；live 路径在 P2-4 预扫后经 `metrics.run_estimate(...)` 发送——process 模式**复用该次 scan**（UI 模态翻 `estimate=True`，配对表零额外 I/O；文本模态仅 `console.estimate = true` 时做行数估算，U17），**禁二次 scan**；generate_only 走 3.6.2 静态公式无 scan。**dry-run 呈现（U13；v1.11/V12 修订）**：rich 档下估算四行 print 让位于渲染器表格（数值逐项一致）；plain 档行式输出为逐字节锚——`segment_calls`/`stitch_calls` 维持**无条件打印**，其中 `segment_calls` 行的含义自 v1.11 起改为**按 w_min 报预算最坏装填上界**（本表时序流行；预算未声明或 w_min ≥ window 时数值与 v1.10 逐字节不变——examples 声明保守实效窗下当时的五个黄金文件不动，V26；v1.12 起黄金文件为**七个**且因估算行插入两帧粒度键全部重采，见本表帧粒度行）。listener = None 时以上全部为 no-op（v1.9 行为逐字节一致）。 |
 | 上下文预算（v1.11，仅预算启用时） | **批边界校准冻结（V19）**：每批处理完成、下一批装填开始前调用 `self.llm.calibrator.freeze_batch()`——聚合本批图片成本样本的 max（对无序集取 max，序无关）压入批最大值窗口、刷新可读快照（第 N 批装填只读 < N 批的聚合值，确定性护栏——批序串行 ⇒ 同输入同配置可复现；校准器由 `LLMClient` 自持，公开面 `llm.calibrator`，3.9）。**启动期预算 INFO 行（V13①）**：M10 于运行起点打印预算参数（如 `segment: w_min=6 window=20 (budget)`——数据无关、仅计数与参数；归属 M10 启动段而非 loader——加载期 logging 尚未按 CLI 覆盖定级，7.1）。**报表汇总**：finalize 时组装 `report.budget = {profiles, w_min, truncations, overflow_records, image_cost, degrade_retries, escalations}`（counts-only 键义见 6.4；truncations 由各算子逐裁剪点计数、overflow_records 按 7.6 词表归集、image_cost/degrade_retries/escalations 为 V17 三层的校准终值与反应频度对账，V13②⑤）+ `report.stream.windows`（segment 实际窗数，M14 属主计数、随 stream 节落盘——供用户对账 V12 上界估算，V13④，6.4）。 |
 | 帧粒度（v1.12） | **组链或门（裁决·组链双门）**：factory（`build_stages`）以**或门** `classify.enabled ∨ frame_classify.enabled` 决定 ClassifyStage 进链（链序与槽位不变——仅帧级开启时 ClassifyStage 仍须进链执行帧 pass；组链的 classify 槽位判定与该或门同口径）；stage 内序列级判决单独受 `classify.enabled` 门控——仅帧级开启时序列记录不产生 Classification、`_meta.classification` 维持 null（3.13.7）。**estimate_run 两键**：`frame_classify_calls` / `frame_annotate_calls` = **粗上界 = 预扫描帧总数 Σ session_lens**（数据源与 `segment_calls` 完全同源，复用同一次预扫描；帧分类实际按窗批量、帧标注跳过噪声成员与跳过类，实际调用数均 ≤ 帧总数）；对应开关关闭 ⇒ 0（帧粒度要求流模式（3.1.4），非流分支恒 0）；`total_calls` 扩项；**键序冻结**——`frame_classify_calls` 紧跟 `classify_calls`、`frame_annotate_calls` 紧跟 `annotate_calls`（返回键表冻结注释同步，CONTRACTS §7.13）。**dry-run 估算行改写**：估算行（stderr 第 2 行）按冻结键序插入两键，**无条件打印**（非流工程恒 = 0，v1.9 `stitch_calls` 先例）——是**改第 2 行**而非加行：五个既有 dry-run golden 重采 + `examples/mix` 主/姊妹双工程的 `dryrun-mix.txt` / `dryrun-mix-text.txt` 两个新 golden，共**七个**（7.8 回归锚，`tests/cli/goldens/`）。 |
-| v1.19 sequence 精确交付 | `generate.form = "sequence"` 时，generate_only 分支在 M1 冻结 `SequenceGenerationConfig` 后调用唯一 `compile_generation_program` 与 `compile_scenario_plan`，再由 `SequenceWorkflow` 调用 `deliver_generation`；不进入 `GenerateStage` 或 `ProcessWorkflow._process_batch`。M10 负责候选缓冲、attempt transaction、声明序短提交、运行终态和 M11 commit，不实现 compiler/planner 算法。classify 与 frame.classify 判定 stage 静态关闭，projector 写 inherited Classification；frame.annotate 由 attempt-local 协作者执行。 |
+| v1.20 sequence 精确交付 | `generate.form = "sequence"` 时，generate_only 分支在 M1 冻结 `SequenceGenerationConfig` 后调用唯一 `compile_generation_program` 与 `compile_scenario_plan`，再由 `SequenceWorkflow` 调用 `deliver_generation`；不进入 `GenerateStage` 或 `ProcessWorkflow._process_batch`。M10 负责候选缓冲、attempt transaction、声明序短提交、时间/区间 frontier、运行终态和 M11 commit，不实现 compiler/planner 算法。classify 与 frame.classify 判定 stage 静态关闭，projector 写 inherited Classification；frame.annotate 由 attempt-local 协作者执行。 |
 
 图 3-6 sequence slot attempt 与交付状态机。多个 slot 可以同时处于 attempt、生成、评估、下游或已准备状态；
 只有声明序 head 能进入最终重验证与 commit，recoverable rejection 在原 slot 启动下一 attempt。
 
-#### v1.19 sequence 候选缓冲
+#### v1.20 sequence 候选缓冲
 
 primary 与 noise 各有一个阶段。每个阶段的候选缓冲容量等于该阶段引用的不同 `ResourceKey` 容量之和，
 再钳制到剩余 slot 数。候选缓冲始终是从 `next_commit` 开始的连续声明序区间：
@@ -109,7 +109,8 @@ transaction 一起丢弃。LLM usage、latency、provider retry、成本、Schem
 `PrimaryCandidateReconcileRequest` 只携带当前 `DeliverySlot`、variant-aligned witnesses、严格 variant 顺序的
 `SequenceRows`、计划中该 source 的全部 `ReplayLayout`、按 layout 顺序的 `ReplayRows` 和候选实际 retained
 bytes；它不读取 `DeliveryState` 前缀。local validator 验证 payload/base event/generation witness、ID、owner、
-role、frame、actor、member copy、replay source、候选内唯一性和 canonical bytes，并要求 variant 与 replay
+role、frame、actor、payload time、duration/resources/descriptor、rebound replay、constant shift、候选内 event-start
+唯一、resource interval 互斥和 canonical bytes，并要求 variant 与 replay
 闭包不多不少。
 
 local validator 通过后创建唯一深度冻结 `PreparedCandidate`。carrier 闭包 slot/attempt identity、witnesses、
@@ -121,7 +122,7 @@ candidate-local 扫描。
 #### 声明序短提交
 
 唯一提交协调器只消费当前 `next_commit`。`CrossViewFrontier` 保存当前 phase 的 next ordinal，以及全部已提交
-primary、replay 与 noise 的 event ID、timestamp 和 source key；primary 切换到 noise phase 时集合不清空。
+primary、replay 与 noise 的 event ID、timestamp、source key 和资源区间；primary 切换到 noise phase 时集合不清空。
 primary head 的完整顺序为：
 
 ~~~text
@@ -136,7 +137,8 @@ DedupIndex.group_revalidate
 ~~~
 
 整个临界区无 `await`。`CrossViewFrontier.check_primary` 只检查当前候选与已提交前缀，并返回冻结且尚未应用的
-`CrossViewDelta`；`commit(delta)` 无普通失败分支。工作量只与当前候选行数有关。dedup 重验证先于 CrossView 和
+`CrossViewDelta`；delta 同时冻结 event IDs、timestamps、source keys 和排序后的 `ResourceInterval`。`commit(delta)`
+无普通失败分支。工作量只与当前候选行数有关。dedup 重验证先于 CrossView 和
 retained-content，因此冲突优先级与原
 声明序 first-writer 一致。`group_commit` 后的状态交换不得再有普通可恢复失败分支。commit-time dedup、
 CrossView 或 retained-content rejection 只让当前 head 原位重建下一 attempt；已准备的更高候选继续保留，
@@ -178,9 +180,12 @@ SimilarityFilter.probe(latest primary + lower noise)
 
 SimilarityFilter 正式突变后不得再有普通 rejection。高 ordinal 提前计算的 signature 不能直接 commit；相似度冲突
 只拒绝当前 noise attempt。Replay 不调用 LLM，也不进入独立 coordinator；它只从 source slot 最终成功的
-`SequenceRows.primary_stream_rows` 派生，并随 source 候选执行 local 校验和声明序提交。
+`SequenceRows.primary_stream_rows` 派生，按 ReplayLayout constant shift 机械重绑 payload 时间，并随 source 候选执行
+local 校验和声明序提交。primary 与它的全部 replay 只产生一个 checked `CrossViewDelta`；replay 构造、Schema、binding、
+frontier 或 retained 任一失败都发生在 `group_commit` 前，source primary 与 replay 计数/rows/bytes 全部回滚。
 
-全部 primary、noise 与 replay 内存提交后，`reconcile_views` 从最终 rows 独立重建全部事实并执行一次。任一
+全部 primary、noise 与 replay 内存提交后，`reconcile_views` 从 program、plan、main 与 stream 独立重建全部事实，
+按 resource sort/sweep 复验全局 interval，并执行一次。任一
 candidate-specific mismatch 必须已在 local 或 frontier 阶段成为当前 attempt 的 `reconcile` rejection；最终 full
 reconcile 失败是运行级内部错误，exit 4，不消费 attempt，不打开输出，也不包装成 `GenerationAttemptRejected`。
 
@@ -228,7 +233,7 @@ program、plan、paths、run attempt ID 与 run ID，不复制 config 或 materi
 int.from_bytes(
     sha256(
         canonical_json(
-            ["labelkit:v1.18", "attempt_random", [seed, slot_identity, attempt_index, purpose]]
+            ["labelkit:v1.20", "attempt_random", [seed, slot_identity, attempt_index, purpose]]
         ).encode("utf-8")
     ).digest(),
     "big",
@@ -237,8 +242,9 @@ int.from_bytes(
 
 不得使用 Python `hash()` 或自行拼接字符串。重试可以改变 LLM seed 世界、intent、patch 与措辞；
 catalog 行不变。
-pattern、variant、role/position、全部计划时间、session、noise
-与 replay source 永不变化。普通内容/结构拒绝消耗 attempt；四类 run-terminal 异常必须原样穿透，不消耗 attempt。
+pattern、variant、role/position、全部计划时间、duration、resources、containment、session、noise source、
+replay source 与 replay shift 永不变化。普通内容/结构拒绝消耗 attempt；四类 run-terminal 异常必须原样穿透，
+不消耗 attempt。
 任一 slot 耗尽立即停止接纳并抛 `DeliveryError(sequence_delivery_exhausted)`；不交付已接受前缀。
 
 sequence 不使用 process/flat 的 partial-delivery 或优雅中断提交；`run.partial_delivery` 的有效策略恒为 false。

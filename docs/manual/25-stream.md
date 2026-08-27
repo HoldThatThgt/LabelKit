@@ -42,7 +42,8 @@ flowchart LR
 
 **手上没有真实流呢？** sequence form（第 27 章）可以从零生成 main 与逐事件 stream；它在内容调用前冻结
 ScenarioPlan，并在成功下游之后才从最终 source rows 派生 replay。生成侧不运行 segment/stitch/extract。
-之后可用 `project-replay.toml` 把 stream 作为本章的 process 输入；M2 会先验证全部 generation provenance。
+之后可用 `project-replay.toml` 把 stream 作为本章的 process 输入；M2 会先从每行自描述 descriptor 复验业务时间、
+duration/resources、constant-shift replay、ID 与全部 generation provenance，再提供 exact-only dedup carrier。
 
 ## 25.2 快速上手：examples/stream 全流程
 

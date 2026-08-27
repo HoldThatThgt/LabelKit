@@ -10,6 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import jsonpatch
 from jsonschema import Draft202012Validator
 
 from labelkit.cli.parser import CliOverrides
@@ -97,11 +98,45 @@ class _OfflineSchemaEngine:
     async def complete_validated(self, _profile, prompt, *, schema, scope):
         del scope
         self.validated_calls.append((_profile, prompt, schema))
+        return (self._value_for_schema(schema),)
+
+    async def complete_finalized(self, request):
+        """用 model Schema 生成，再执行生产 finalizer 的离线替身。"""
+        self.validated_calls.append((request.profile, request.prompt, request.model_schema))
+        candidate = self._value_for_schema(request.model_schema)
+        candidate = self._apply_state_bindings(candidate, request.prompt)
+        value = request.candidate_finalizer(candidate)
+        schema = json.loads(canonical_json(request.final_schema))
+        errors = tuple(Draft202012Validator(schema).iter_errors(value))
+        if errors:
+            raise AssertionError(
+                "offline finalized candidate failed full schema: "
+                + "; ".join(error.message for error in errors)
+            )
+        return value, None, 1, "offline"
+
+    @staticmethod
+    def _apply_state_bindings(candidate, prompt):
+        """让离线候选遵循 prompt 显式给出的非时间状态绑定。"""
+        user = _user_text(SimpleNamespace(prompt=prompt))
+        marker = "[非时间状态绑定值]\n"
+        if marker not in user:
+            return candidate
+        bindings = json.loads(user.split(marker, 1)[1].splitlines()[0])
+        value = candidate
+        for binding in bindings:
+            value = jsonpatch.apply_patch(value, [{
+                "op": "add", "path": binding["payload_path"], "value": binding["value"],
+            }], in_place=False)
+        return value
+
+    def _value_for_schema(self, schema):
+        """按请求 Schema 形状生成一个离线候选。"""
         properties = schema.get("properties", {})
         if "initial_state" in properties:
-            return (self.seed,)
+            return self.seed
         if "causal_consistency" in properties:
-            return ({
+            return {
                 "causal_consistency": True,
                 "actor_knowledge": True,
                 "goal_consistency": True,
@@ -109,15 +144,15 @@ class _OfflineSchemaEngine:
                 "cross_frame_consistency": True,
                 "realism": True,
                 "reason_codes": [],
-            },)
+            }
         if "unrelated_to_declared_tasks" in properties:
-            return ({
+            return {
                 "unrelated_to_declared_tasks": True,
                 "no_executable_task": True,
                 "realism": True,
                 "matches_planned_topic": True,
                 "reason_codes": [],
-            },)
+            }
         if "utterance" in properties and "request_id" in properties:
             status = properties["status"]
             if status.get("const") == "pending":
@@ -133,10 +168,10 @@ class _OfflineSchemaEngine:
                     "utterance": "未能出票", "request_id": "R-100",
                     "ticket_id": None, "status": "blocked",
                 }
-            return (value,)
+            return value
         if "utterance" in properties:
-            return ({"utterance": "今天的云很好看"},)
-        raise AssertionError("unexpected complete_validated schema")
+            return {"utterance": "今天的云很好看"}
+        raise AssertionError("unexpected schema")
 
     async def complete_post_validated(self, request):
         self.plan_requests.append(request)
@@ -291,7 +326,8 @@ def _draft(event):
     """从已绑定 EventTruth 移除 role，返回生成期 EventDraft。"""
     return EventDraft(
         event.event_key, event.event_id, event.frame_class, event.actor,
-        event.logical_time_us, event.timestamp_us, event.actor_view, event.intent,
+        event.logical_time_us, event.timestamp_us, event.duration_us,
+        event.actor_view, event.intent,
         event.patch, event.state_before_hash, event.state_after_hash,
         event.publish_snapshot, event.payload,
     )
@@ -745,15 +781,15 @@ def test_primary_coordinate_tamper_is_zero_llm(
     )
 
 
-@pytest.mark.parametrize("field", ("timestamp_us", "source"))
+@pytest.mark.parametrize("field", ("shift_us", "source"))
 def test_replay_coordinate_or_source_tamper_is_zero_llm(
     declared_config, declared_program, field,
 ):
     """replay 时间或声明序 source 漂移必须在零调用边界终止。"""
     plan = compile_scenario_plan(declared_program)
     layout = plan.replay_layouts[0]
-    if field == "timestamp_us":
-        layout = replace(layout, timestamps_us=tuple(value + 1 for value in layout.timestamps_us))
+    if field == "shift_us":
+        layout = replace(layout, shift_us=layout.shift_us + 1)
     else:
         layout = replace(layout, source_slot_key=plan.delivery_slots[1].slot_key)
     tampered = replace(plan, replay_layouts=(layout, *plan.replay_layouts[1:]))
@@ -1169,7 +1205,8 @@ def test_noise_render_and_blind_evaluation_use_two_counted_families(declared_con
     frames = {name: view.description for name, view in declared_program.frame_classes.items()}
     render_request = NoiseRenderRequest(
         declared_program.semantic_profile, slot, declared_program.noise, frame,
-        descriptions, frames, 0, declared_program.limits,
+        descriptions, frames, 0, declared_program.timeline.utc_offset_minutes,
+        declared_program.limits,
     )
     payload = asyncio.run(render_noise(render_request, services))
     evaluation_request = NoiseEvaluationRequest(

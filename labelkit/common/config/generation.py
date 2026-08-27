@@ -1,8 +1,4 @@
-"""v1.18 序列生成配置载体与聚合解析器。
-
-本模块只拥有 sequence 形态的配置语义。flat 生成仍由 ``config.model.GenerateConfig``
-承载；二者没有兼容键、迁移或运行期回落。
-"""
+"""sequence 形态的冻结配置载体与聚合解析器；不承担 flat 生成语义。"""
 from __future__ import annotations
 
 import json
@@ -10,12 +6,16 @@ import re
 from dataclasses import dataclass, fields
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
-from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Literal, Mapping
 from jsonpointer import JsonPointer, JsonPointerException
-from labelkit.common.config._collect import _Collector, _fmt
+from labelkit.common.config._collect import _fmt
 from labelkit.common.config._schemas import _GenerationSchemaRequest, _load_generation_schema
+from labelkit.common.config._temporal import (
+    IntervalContainmentSpec,
+    check_sequence_temporal_contract,
+    parse_containment_spec,
+)
 from labelkit.common.extensions.hooks import (
     ResolvedHook,
     check_hook_arity,
@@ -126,6 +126,7 @@ class SequencePattern(_ImmutableConfig):
     order: tuple[str, ...]                        # 全量唯一 role 排列
     gaps: tuple[GapSpec, ...]                     # 正向 gap 集
     max_span_us: int                              # 最大闭区间跨度微秒
+    containments: tuple[IntervalContainmentSpec, ...]  # role 区间包含关系
 
 
 @dataclass(frozen=True)
@@ -369,7 +370,7 @@ def _integer(state: _ParseState, row: Mapping[str, object], key: str,
 
 def _seconds_us(state: _ParseState, value: object, location: str,
                 positive: bool) -> int:
-    """无损把最多六位小数的秒数转换为整数微秒。
+    """无损把秒数量化为整数毫秒的微秒值。
 
     @param state 当前解析状态
     @param value TOML 数值
@@ -385,11 +386,11 @@ def _seconds_us(state: _ParseState, value: object, location: str,
     except InvalidOperation:
         _error(state, location, f"expected finite decimal seconds, got {_fmt(value)}")
         return 0
-    scaled = decimal * 1_000_000
+    scaled = decimal * 1000
     if not decimal.is_finite() or scaled != scaled.to_integral_value():
-        _error(state, location, "expected at most six decimal places")
+        _error(state, location, "expected seconds at millisecond precision")
         return 0
-    result = int(scaled)
+    result = int(scaled) * 1000
     if result < 0 or (positive and result == 0):
         condition = "> 0" if positive else ">= 0"
         _error(state, location, f"expected seconds {condition}, got {_fmt(value)}")
@@ -643,6 +644,7 @@ def _parse_pattern(state: _ParseState, name: str,
     base = f"[generate.pattern.{name}]"
     _check_keys(state, row, frozenset({
         "sequence_class", "description", "roles", "order", "gaps", "max_span_s",
+        "containments",
     }), base)
     sequence_class = _name(state, row.get("sequence_class"), f"{base}.sequence_class")
     description = _string(state, row, "description", f"{base}.description")
@@ -653,8 +655,14 @@ def _parse_pattern(state: _ParseState, name: str,
     gaps_raw = _rows(state, row, "gaps", f"{base}.gaps")
     gaps = tuple(_parse_gap(state, item, f"{base}.gaps[{index}]")
                  for index, item in enumerate(gaps_raw, 1))
+    containments_raw = _rows(state, row, "containments", f"{base}.containments")
+    containments = tuple(
+        parse_containment_spec(state, item, f"{base}.containments[{index}]")
+        for index, item in enumerate(containments_raw, 1)
+    )
     span = _seconds_us(state, row.get("max_span_s"), f"{base}.max_span_s", True)
-    pattern = SequencePattern(name, sequence_class, description, roles, order, gaps, span)
+    pattern = SequencePattern(name, sequence_class, description, roles, order, gaps, span,
+                              containments)
     _check_pattern(state, pattern, base)
     return pattern
 
@@ -703,6 +711,14 @@ def _check_pattern(state: _ParseState, pattern: SequencePattern, location: str) 
     adjacent = set(zip(pattern.order, pattern.order[1:]))
     if not adjacent.issubset(set(pairs)):
         _error(state, f"{location}.gaps", "every adjacent role pair requires exactly one gap")
+    containment_pairs = tuple(
+        f"{item.container}\0{item.contained}" for item in pattern.containments
+    )
+    if _duplicates(containment_pairs):
+        _error(state, f"{location}.containments", "duplicate containment pair")
+    for item in pattern.containments:
+        if item.container not in positions or item.contained not in positions:
+            _error(state, f"{location}.containments", "containment roles must exist in order")
 
 
 def _parse_patterns(state: _ParseState) -> tuple[SequencePattern, ...]:
@@ -1343,7 +1359,7 @@ def _check_variant_targets(state: _ParseState, patterns: tuple[SequencePattern, 
     for group in sets:
         pattern = pattern_map.get(group.pattern)
         if pattern is None:
-            _error(state, f"[[generate.counterfactual_sets]].pattern", "unknown pattern")
+            _error(state, "[[generate.counterfactual_sets]].pattern", "unknown pattern")
             continue
         roles = {role.name: role for role in pattern.roles}
         for variant in group.variants:
@@ -1757,13 +1773,14 @@ def _frame_case(config, source, event, frame_entry, role) -> _BudgetCase:
         "slot_key": f"{source}/000000", "attempt_index": config.max_slot_attempts - 1,
         "event_key": "0" * 32, "role": role_name, "position": position,
         "frame_class": frame_name, "actor": actor, "logical_time_us": position,
-        "wait_since_previous_us": 0, "intent": "a", "patch": _minimum_patch(),
+        "wait_since_previous_us": 0, "planned_start_us": 0, "intent": "a",
+        "planned_end_us": frame.duration_us, "planned_duration_us": frame.duration_us, "patch": _minimum_patch(),
         "actor_view": _minimum_actor_view(actor, position, observations),
         "public_facts": {},
         "publish_snapshot": {}, "state_before_hash": "0" * 64,
         "state_after_hash": "0" * 64, "frame_instruction": frame.gen_instruction,
         "frame_description": frame.description, "binding_values": bindings,
-        "frame_schema": frame.gen_schema,
+        "frame_schema": frame.model_gen_schema,
     }
     dynamic = [
         config.limits.prompt_value_bytes,
@@ -1776,7 +1793,7 @@ def _frame_case(config, source, event, frame_entry, role) -> _BudgetCase:
     if role is None:
         dynamic.append(config.limits.prompt_value_bytes)
     return _BudgetCase(
-        config.semantic_profile, frame_render_prompt(fields), frame.gen_schema, False,
+        config.semantic_profile, frame_render_prompt(fields), frame.model_gen_schema, False,
         tuple(dynamic),
     )
 
@@ -1891,7 +1908,7 @@ def _noise_budget_cases(state, config) -> list[_BudgetCase]:
             "planned_topic": topic, "payload": {},
         })
         cases.extend((
-            _BudgetCase(config.semantic_profile, render, frame.gen_schema, False),
+            _BudgetCase(config.semantic_profile, render, frame.model_gen_schema, False),
             _BudgetCase(
                 config.evaluation_profile, evaluate,
                 noise_semantic_evaluation_schema(), False,
@@ -1904,15 +1921,16 @@ def _noise_budget_cases(state, config) -> list[_BudgetCase]:
 def _noise_render_fields(config, frame, registries, topic: str) -> dict[str, object]:
     """构造 NoiseRenderer 完整最小字段。"""
     classes, frames = registries
+    start = config.timeline.timestamp_start_us
     return {
         "event_key": "0" * 32, "noise_ordinal": 0,
         "attempt_index": config.max_slot_attempts - 1,
-        "frame_class": config.noise.frame_class,
-        "timestamp_us": config.timeline.timestamp_start_us, "session_id": "noise_000000",
+        "frame_class": config.noise.frame_class, "session_id": "noise_000000",
+        "planned_start_us": start, "planned_end_us": start, "planned_duration_us": 0,
         "class_descriptions": classes, "frame_descriptions": frames,
         "planned_topic": topic,
         "noise_instruction": config.noise.instruction,
-        "frame_instruction": frame.gen_instruction, "frame_schema": frame.gen_schema,
+        "frame_instruction": frame.gen_instruction, "frame_schema": frame.model_gen_schema,
     }
 
 
@@ -1972,6 +1990,7 @@ def parse_generation_config(
     _check_class_registry(state, patterns, sets)
     _check_frame_registry(state, patterns, config)
     _check_variant_targets(state, patterns, sets)
+    check_sequence_temporal_contract(state, patterns, config)
     _check_gap_shell(state, patterns)
     _check_timeline_counts(state, config)
     from labelkit.common.config._generation_budget import check_generation_content_limits

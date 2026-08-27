@@ -34,6 +34,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, NoReturn, Sequence
 
+from jsonpointer import JsonPointer, JsonPointerException
+
 from labelkit import TOOL_VERSION
 from labelkit.common.config.model import ResolvedConfig, ResolvedPaths
 from labelkit.common.contracts.generation import (
@@ -181,7 +183,7 @@ class Emitter:
                                for name, view in cfg.class_views.items()
                                if view.schema is not None}
 
-    # ── 通道生命周期 ──────────────────────────────────────────────────────
+    # ── 通道生命周期 ──
 
     def open(self) -> None:
         """创建/截断输出通道。
@@ -409,7 +411,7 @@ class Emitter:
             _log.info("wrote %s", self._report_path,
                       extra={"stage": "emitter", "batch": "-"})
 
-    # ── 主输出通道 ────────────────────────────────────────────────────────
+    # ── 主输出通道 ──
 
     def _user_object(self, item: PipelineItem) -> Mapping:
         """取该行落盘的用户对象。
@@ -722,7 +724,7 @@ class Emitter:
             block["defects"] = list(ver.defects)
         return block
 
-    # ── rejects 通道 ──────────────────────────────────────────────────────
+    # ── rejects 通道 ──
 
     def _divert_internal(self, item: PipelineItem, batch_no: int, errors: list[str],
                          log_message: str) -> None:
@@ -810,7 +812,7 @@ class Emitter:
             return first.stage, first.kind
         return "emitter", ErrorKind.INTERNAL_ERROR.value
 
-    # ── 通道管路 ──────────────────────────────────────────────────────────
+    # ── 通道管路 ──
 
     def _flush(self) -> None:
         """把全部已开通道的缓冲刷到磁盘。
@@ -858,7 +860,7 @@ class Emitter:
                                  extra={"stage": "emitter", "batch": "-"})
         self._main_fh = self._sidecar_fh = self._rejects_fh = None
 
-    # ── stderr 进度与摘要（展示面，不是日志——spec §7.7）─────────────────
+    # ── stderr 进度与摘要（展示面，不是日志；spec §7.7）──
 
     def _progress(self, batch_no: int) -> None:
         """TTY 批级进度（spec §7.7）：当前批号 + 逐状态累计计数。
@@ -958,9 +960,45 @@ class SequenceDeliveryEmitter:
                 self._schema_mismatch(item.record.id, "sequence", 1)
             user = {key: value for key, value in main.items() if key != "_meta"}
             self._validate_schema(request, user, view.schema, item.record.id, "sequence")
+            self._validate_annotation_time(view, user, item.temporal_context)
         elif item.annotation is not None:
             self._schema_mismatch(item.record.id, "sequence", 1)
         self._validate_frame_rows(request, main, primary)
+
+    @staticmethod
+    def _validate_annotation_time(view, user, context) -> None:
+        """在 M11 写前复验 sequence annotation 的机械时间。
+
+        @param view 当前 sequence class 冻结视图。
+        @param user 最终 main 用户字段。
+        @param context M5/M7 共享的冻结时间上下文。
+        @return None；固定时间不一致时抛终态契约错误。
+        """
+        if not view.time_bindings:
+            return
+        if context is None:
+            _generation_contract_error(
+                "generation_downstream_contract: annotation temporal context is missing"
+            )
+        for binding in view.time_bindings:
+            starts = [
+                member.timestamp_us for member in context.members
+                if member.duration_us > 0 and binding.resource in member.resources
+            ]
+            if not starts:
+                _generation_contract_error(
+                    "generation_downstream_contract: annotation resource interval is missing"
+                )
+            try:
+                actual = JsonPointer(binding.payload_path).resolve(user)
+            except (JsonPointerException, TypeError):
+                _generation_contract_error(
+                    "generation_downstream_contract: annotation time path is missing"
+                )
+            if actual != min(starts) // 1000 or isinstance(actual, bool):
+                _generation_contract_error(
+                    "generation_downstream_contract: annotation time differs from context"
+                )
 
     def _validate_frame_rows(self, request, main: dict, primary: tuple[dict, ...]) -> None:
         """逐成员检查 main 与 primary 两份最终帧标注。
@@ -1322,7 +1360,7 @@ class SequenceDeliveryEmitter:
         """
         from labelkit.operators.generation.project import canonical_delivery_row
 
-        digest = hashlib.sha256(b"labelkit:v1.18:delivery\n")
+        digest = hashlib.sha256(b"labelkit:v1.20:delivery\n")
         for row in rows:
             payload = canonical_delivery_row(row)
             digest.update(str(len(payload)).encode("ascii"))

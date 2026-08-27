@@ -7,7 +7,7 @@ text, and the §10.7 internal schema constants.
 """
 import asyncio
 import json
-from dataclasses import replace
+from dataclasses import fields, replace
 from types import MappingProxyType, SimpleNamespace
 
 import pytest
@@ -27,6 +27,8 @@ from labelkit.common.inference.llm_client import (
     _build_anthropic_body,
 )
 from labelkit.common.inference.schema_engine import (
+    CandidateFinalizerContractError,
+    FinalizedCallRequest,
     VERDICT_SCHEMA,
     CallScope,
     SchemaEngine,
@@ -1087,10 +1089,12 @@ class _QueueLLM:
         self.texts = list(texts)
         self.calls = 0
         self.prompts = []
+        self.schemas = []
 
     async def complete(self, profile, prompt, response_schema=None):
         self.calls += 1
         self.prompts.append(prompt)
+        self.schemas.append(response_schema)
         return _StubResponse(self.texts[min(self.calls - 1, len(self.texts) - 1)])
 
 
@@ -1460,3 +1464,382 @@ def test_typed_post_validator_invalid_error_is_terminal_and_data_free():
     assert captured.value.errors == ["post_validator_invalid"]
     assert "secret" not in str(captured.value)
     assert llm.calls == 1
+
+
+# ── v1.20：generic candidate finalizer ─────────────────────────────────────────
+
+FINALIZED_MODEL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "payload": {
+            "type": "object",
+            "properties": {"label": {"type": "string"}},
+            "required": ["label"],
+            "additionalProperties": False,
+        },
+    },
+    "required": ["payload"],
+    "additionalProperties": False,
+}
+
+FINALIZED_FULL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "payload": {
+            "type": "object",
+            "properties": {
+                "label": {"type": "string"},
+                "timestamp": {"type": "integer"},
+            },
+            "required": ["label", "timestamp"],
+            "additionalProperties": False,
+        },
+    },
+    "required": ["payload"],
+    "additionalProperties": False,
+}
+
+
+def _finalized_prompt() -> PromptBundle:
+    """Build a stable prompt for finalized-call tests."""
+    return PromptBundle(messages=(Message(
+        role="user", parts=(Part(kind="text", text="Generate payload"),)),))
+
+
+def _bind_timestamp(candidate):
+    """Bind one deterministic framework-owned field on the supplied copy."""
+    candidate["payload"]["timestamp"] = 123
+    return candidate
+
+
+def _identity_projector(candidate):
+    """Return the model-space candidate unchanged."""
+    return candidate
+
+
+def _finalized_request(finalizer=_bind_timestamp, projector=_identity_projector,
+                       *, scope=CallScope()) -> FinalizedCallRequest:
+    """Build one complete finalized request."""
+    return FinalizedCallRequest(
+        profile="semantic",
+        prompt=_finalized_prompt(),
+        model_schema=FINALIZED_MODEL_SCHEMA,
+        final_schema=FINALIZED_FULL_SCHEMA,
+        scope=scope,
+        candidate_finalizer=finalizer,
+        repair_projector=projector,
+    )
+
+
+class _FinalizedModelQueueLLM:
+    """Return distinct first/repair models while recording profiles and schemas."""
+
+    def __init__(self):
+        self.calls = 0
+        self.profiles = []
+        self.schemas = []
+
+    async def complete(self, profile, _prompt, response_schema=None):
+        self.profiles.append(profile)
+        self.schemas.append(response_schema)
+        texts = ('{"payload":{"label":1}}', '{"payload":{"label":"ok"}}')
+        models = ("first-model", "repair-model")
+        response = _StubResponse(texts[self.calls])
+        response.model = models[self.calls]
+        self.calls += 1
+        return response
+
+
+def test_finalized_request_has_exact_frozen_public_fields():
+    request = _finalized_request()
+    assert [item.name for item in fields(FinalizedCallRequest)] == [
+        "profile", "prompt", "model_schema", "final_schema", "scope",
+        "candidate_finalizer", "repair_projector",
+    ]
+    assert isinstance(request.model_schema, MappingProxyType)
+    assert isinstance(request.model_schema["properties"], MappingProxyType)
+    assert type(request.model_schema["required"]) is tuple
+    with pytest.raises(TypeError):
+        request.model_schema["type"] = "array"
+
+
+def test_complete_finalized_orders_model_finalize_full_and_l25_once():
+    order = []
+
+    def finalize(candidate):
+        order.append("finalizer")
+        assert candidate == {"payload": {"label": "ok"}}
+        return _bind_timestamp(candidate)
+
+    def validate(candidate, record):
+        order.append("l2.5")
+        assert candidate == {"payload": {"label": "ok", "timestamp": 123}}
+        assert record == {"source": "record"}
+        return []
+
+    llm = _FixedLLM('{"payload":{"label":"ok"}}')
+    engine = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(), validator=validate)
+    request = _finalized_request(
+        finalize, scope=CallScope(record={"source": "record"}, user_treatment=True))
+
+    result = asyncio.run(engine.complete_finalized(request))
+
+    assert result == ({"payload": {"label": "ok", "timestamp": 123}}, Usage(5, 2),
+                      1, "glm-5.2")
+    assert order == ["finalizer", "l2.5"]
+    assert llm.schemas == [FINALIZED_MODEL_SCHEMA]
+    assert engine.stats["l0_or_clean"] == 1
+
+
+def test_complete_finalized_default_scope_is_internal_and_skips_l25():
+    def must_not_run(_candidate, _record):
+        raise AssertionError("L2.5 must require explicit user treatment")
+
+    llm = _FixedLLM('{"payload":{"label":"ok"}}')
+    engine = SchemaEngine(
+        SPEC_SCHEMA, llm=llm, cfg=OutputConfig(), validator=must_not_run)
+
+    result = asyncio.run(engine.complete_finalized(_finalized_request()))
+
+    assert result[0] == {"payload": {"label": "ok", "timestamp": 123}}
+    assert engine.stats == ZERO_STATS
+
+
+def test_complete_finalized_repair_projects_candidate_and_preserves_accounting():
+    projected = []
+
+    def projector(candidate):
+        candidate["payload"].pop("timestamp", None)
+        projected.append(candidate)
+        return candidate
+
+    llm = _QueueLLM(
+        '{"payload":{"label":"first","timestamp":999}}',
+        '{"payload":{"label":"second"}}',
+    )
+    metrics = _MetricsFeedSpy()
+    engine = SchemaEngine(
+        SPEC_SCHEMA, llm=llm, cfg=OutputConfig(max_repair_attempts=1), metrics=metrics)
+    request = _finalized_request(
+        projector=projector, scope=CallScope(user_treatment=True))
+
+    obj, usage, attempts, model = asyncio.run(engine.complete_finalized(request))
+
+    assert obj == {"payload": {"label": "second", "timestamp": 123}}
+    assert projected == [{"payload": {"label": "first"}}]
+    assert usage == Usage(10, 4) and attempts == 2 and model == "glm-5.2"
+    assert llm.schemas == [FINALIZED_MODEL_SCHEMA, FINALIZED_MODEL_SCHEMA]
+    repair_text = llm.prompts[1].messages[0].parts[0].text
+    assert repair_text.startswith('[原始输出]\n{"payload":{"label":"first"}}')
+    assert "999" not in repair_text
+    assert engine.stats["l3_1"] == 1
+    assert metrics.payloads[0]["resolved_at"] == "l3_1"
+    assert metrics.payloads[0]["violations"] == ["/payload: additionalProperties"]
+
+
+def test_complete_finalized_repairs_l25_on_model_space_candidate():
+    finalizer_inputs = []
+    projector_inputs = []
+    validations = []
+
+    def finalizer(candidate):
+        finalizer_inputs.append(candidate)
+        return _bind_timestamp(candidate)
+
+    def projector(candidate):
+        projector_inputs.append(candidate)
+        return candidate
+
+    def validate(candidate, _record):
+        validations.append(candidate)
+        return ["retry"] if candidate["payload"]["label"] == "first" else []
+
+    llm = _QueueLLM(
+        '{"payload":{"label":"first"}}',
+        '{"payload":{"label":"second"}}',
+    )
+    engine = SchemaEngine(
+        SPEC_SCHEMA, llm=llm, cfg=OutputConfig(max_repair_attempts=1),
+        validator=validate)
+    request = _finalized_request(
+        finalizer, projector, scope=CallScope(user_treatment=True))
+
+    result = asyncio.run(engine.complete_finalized(request))
+
+    assert result[0] == {"payload": {"label": "second", "timestamp": 123}}
+    assert finalizer_inputs == [
+        {"payload": {"label": "first", "timestamp": 123}},
+        {"payload": {"label": "second", "timestamp": 123}},
+    ]
+    assert projector_inputs == [{"payload": {"label": "first"}}]
+    assert validations == finalizer_inputs
+    assert result[2] == 2
+
+
+def test_complete_finalized_uses_configured_repair_budget_without_two_round_cap():
+    llm = _QueueLLM(
+        '{"payload":{"label":1}}',
+        '{"payload":{"label":2}}',
+        '{"payload":{"label":3}}',
+        '{"payload":{"label":4}}',
+    )
+    engine = SchemaEngine(
+        SPEC_SCHEMA, llm=llm, cfg=OutputConfig(max_repair_attempts=3))
+
+    with pytest.raises(SchemaViolation) as captured:
+        asyncio.run(engine.complete_finalized(_finalized_request()))
+
+    assert llm.calls == 4
+    assert captured.value.raw_last_output == '{"payload":{"label":4}}'
+    assert all(schema == FINALIZED_MODEL_SCHEMA for schema in llm.schemas)
+
+
+def test_complete_finalized_keeps_first_model_and_uses_repair_profile():
+    llm = _FinalizedModelQueueLLM()
+    engine = SchemaEngine(
+        SPEC_SCHEMA, llm=llm,
+        cfg=OutputConfig(repair_llm="repair", max_repair_attempts=1))
+
+    obj, usage, attempts, model = asyncio.run(
+        engine.complete_finalized(_finalized_request()))
+
+    assert obj["payload"]["timestamp"] == 123
+    assert usage == Usage(10, 4) and attempts == 2
+    assert model == "first-model"
+    assert llm.profiles == ["semantic", "repair"]
+    assert llm.schemas == [FINALIZED_MODEL_SCHEMA, FINALIZED_MODEL_SCHEMA]
+
+
+def test_complete_finalized_unparseable_candidate_uses_empty_previous_output():
+    projector_calls = []
+
+    def projector(candidate):
+        projector_calls.append(candidate)
+        return candidate
+
+    llm = _QueueLLM("not-json", '{"payload":{"label":"ok"}}')
+    engine = SchemaEngine(
+        SPEC_SCHEMA, llm=llm, cfg=OutputConfig(max_repair_attempts=1))
+
+    result = asyncio.run(engine.complete_finalized(
+        _finalized_request(projector=projector)))
+
+    assert result[0]["payload"]["timestamp"] == 123
+    assert projector_calls == []
+    repair_text = llm.prompts[1].messages[0].parts[0].text
+    assert repair_text.startswith("[原始输出]\n{}\n\n[违规清单]")
+
+
+@pytest.mark.parametrize("finalizer", [
+    lambda _candidate: object(),
+    lambda _candidate: (_ for _ in ()).throw(RuntimeError("secret value")),
+    lambda _candidate: {"payload": {"label": "ok", "timestamp": "bad"}},
+    lambda _candidate: (_ for _ in ()).throw(
+        CandidateFinalizerContractError()),
+])
+def test_complete_finalized_finalizer_contract_failures_are_terminal(finalizer):
+    llm = _QueueLLM(
+        '{"payload":{"label":"ok"}}',
+        '{"payload":{"label":"would-be-repair"}}',
+    )
+    engine = SchemaEngine(
+        SPEC_SCHEMA, llm=llm, cfg=OutputConfig(max_repair_attempts=3))
+
+    with pytest.raises(CandidateFinalizerContractError) as captured:
+        asyncio.run(engine.complete_finalized(_finalized_request(finalizer)))
+
+    assert str(captured.value) == "candidate_finalizer_contract"
+    assert "secret" not in str(captured.value)
+    assert llm.calls == 1
+    assert engine.stats == ZERO_STATS
+
+
+def test_complete_finalized_reported_non_time_mutation_is_terminal():
+    def detects_non_time_mutation(_candidate):
+        raise CandidateFinalizerContractError()
+
+    llm = _QueueLLM(
+        '{"payload":{"label":"ok"}}',
+        '{"payload":{"label":"would-be-repair"}}',
+    )
+    engine = SchemaEngine(
+        SPEC_SCHEMA, llm=llm, cfg=OutputConfig(max_repair_attempts=3))
+
+    with pytest.raises(CandidateFinalizerContractError):
+        asyncio.run(engine.complete_finalized(
+            _finalized_request(detects_non_time_mutation)))
+
+    assert llm.calls == 1
+
+
+@pytest.mark.parametrize("projector", [
+    lambda _candidate: object(),
+    lambda _candidate: (_ for _ in ()).throw(RuntimeError("secret value")),
+    lambda _candidate: (_ for _ in ()).throw(
+        CandidateFinalizerContractError()),
+])
+def test_complete_finalized_projector_contract_failures_are_terminal(projector):
+    llm = _QueueLLM(
+        '{"payload":{"label":1}}',
+        '{"payload":{"label":"would-be-repair"}}',
+    )
+    engine = SchemaEngine(
+        SPEC_SCHEMA, llm=llm, cfg=OutputConfig(max_repair_attempts=3))
+
+    with pytest.raises(CandidateFinalizerContractError) as captured:
+        asyncio.run(engine.complete_finalized(
+            _finalized_request(projector=projector)))
+
+    assert str(captured.value) == "candidate_finalizer_contract"
+    assert "secret" not in str(captured.value)
+    assert llm.calls == 1
+    assert engine.stats == ZERO_STATS
+
+
+def test_complete_finalized_model_l2_failure_never_calls_finalizer_or_l25():
+    calls = []
+
+    def finalizer(candidate):
+        calls.append(("finalizer", candidate))
+        return candidate
+
+    def validate(candidate, _record):
+        calls.append(("l2.5", candidate))
+        return []
+
+    llm = _FixedLLM('{"payload":{"label":1}}')
+    engine = SchemaEngine(
+        SPEC_SCHEMA, llm=llm, cfg=OutputConfig(max_repair_attempts=0),
+        validator=validate)
+
+    with pytest.raises(SchemaViolation):
+        asyncio.run(engine.complete_finalized(_finalized_request(
+            finalizer, scope=CallScope(user_treatment=True))))
+
+    assert calls == []
+
+
+def test_complete_finalized_full_l2_failure_never_calls_l25_or_l3():
+    l25_calls = []
+
+    def invalid_full(candidate):
+        candidate["payload"]["timestamp"] = "wrong"
+        return candidate
+
+    def validate(candidate, _record):
+        l25_calls.append(candidate)
+        return []
+
+    llm = _QueueLLM(
+        '{"payload":{"label":"ok"}}',
+        '{"payload":{"label":"would-be-repair"}}',
+    )
+    engine = SchemaEngine(
+        SPEC_SCHEMA, llm=llm, cfg=OutputConfig(max_repair_attempts=3),
+        validator=validate)
+
+    with pytest.raises(CandidateFinalizerContractError):
+        asyncio.run(engine.complete_finalized(_finalized_request(
+            invalid_full, scope=CallScope(user_treatment=True))))
+
+    assert l25_calls == [] and llm.calls == 1

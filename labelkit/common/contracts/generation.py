@@ -1,4 +1,4 @@
-"""v1.18 序列生成内核的共享冻结载体。
+"""v1.20 序列生成内核的共享冻结载体。
 
 本模块只声明跨层数据，不实现业务算法。所有 Mapping 输入在构造时递归复制并以
 ``MappingProxyType`` 暴露；tuple 内的 JSON 容器同样递归冻结。
@@ -153,13 +153,15 @@ class DeliverySlot(_ImmutableCarrier):
 
 @dataclass(frozen=True)
 class PlannedEvent(_ImmutableCarrier):
-    """计划器冻结的事件位置、role 与双时间坐标。"""
+    """计划器冻结的事件位置、时间与互斥资源。"""
 
     event_key: str                                # 跨分支稳定事件键
     role: str                                     # declared role 或 position_NNN
     position: int                                 # 分支内零基位置
     logical_time_us: int                          # 世界语义时间
     timestamp_us: int                             # 工件全局时间
+    duration_us: int                              # 固定非负时长；零表示点事件
+    resources: tuple[str, ...]                    # 声明序互斥资源
     session_id: str                               # 工件 session 标识
 
 
@@ -172,6 +174,8 @@ class NoiseSlot(_ImmutableCarrier):
     frame_class: str                              # noise 专用帧类
     topic: str                                    # 显式声明的唯一噪声话题
     timestamp_us: int                             # 工件全局时间
+    duration_us: int                              # 固定为零的点事件时长
+    resources: tuple[str, ...]                    # 固定为空的资源表
     session_id: str                               # 独立 session 标识
 
 
@@ -183,7 +187,7 @@ class ReplayLayout(_ImmutableCarrier):
     source_variant_name: str                      # replay 来源 positive 变体
     replay_ordinal: int                           # 全局 replay 序号
     session_id: str                               # replay 独立 session
-    timestamps_us: tuple[int, ...]                # 与 source 事件数等长的新时间
+    shift_us: int                                 # source 全部 member 共享的正平移量
 
 
 @dataclass(frozen=True)
@@ -196,6 +200,23 @@ class ScenarioPlan(_ImmutableCarrier):
     replay_layouts: tuple[ReplayLayout, ...]      # 精确 replay 布局
     primary_sessions: int                         # primary session 数
     digest: str                                   # 规范化计划摘要
+
+
+@dataclass(frozen=True)
+class SequenceTemporalMember(_ImmutableCarrier):
+    """序列标注可见的单个最终 member 时间事实。"""
+
+    event_id: str                                 # 最终 member 事件 ID
+    timestamp_us: int                             # Planner 权威起点
+    duration_us: int                              # Planner 权威时长
+    resources: tuple[str, ...]                    # 帧类声明序资源
+
+
+@dataclass(frozen=True)
+class SequenceTemporalContext(_ImmutableCarrier):
+    """一个最终 sequence 不含 payload 的冻结时间上下文。"""
+
+    members: tuple[SequenceTemporalMember, ...]   # 最终 member 顺序时间事实
 
 
 @dataclass(frozen=True)
@@ -253,6 +274,7 @@ class EventDraft(_ImmutableCarrier):
     actor: str                                    # 实际 actor
     logical_time_us: int                          # 世界时间
     timestamp_us: int                             # 工件时间
+    duration_us: int                              # 计划器冻结的事件时长
     actor_view: ActorView                         # 事件前 actor 知识
     intent: str                                   # 事件意图
     patch: tuple[JsonObject, ...]                 # 已执行 patch
@@ -273,6 +295,7 @@ class EventTruth(_ImmutableCarrier):
     actor: str                                    # 实际 actor
     logical_time_us: int                          # 世界时间
     timestamp_us: int                             # 工件时间
+    duration_us: int                              # 计划器冻结的事件时长
     actor_view: ActorView                         # 事件前 actor 知识
     intent: str                                   # 事件意图
     patch: tuple[JsonObject, ...]                 # 已执行 patch
@@ -289,6 +312,7 @@ class ObservedEvent(_ImmutableCarrier):
     event_id: str                                 # 事件 ID
     frame_class: str                              # 实际帧类
     timestamp_us: int                             # 实际工件顺序坐标
+    duration_us: int                              # 实际工件区间时长
 
 
 @dataclass(frozen=True)
@@ -298,6 +322,7 @@ class SemanticReviewEvent(_ImmutableCarrier):
     frame_class: str                              # 实际帧类
     actor: str                                    # 实际 actor
     logical_time_us: int                          # 世界时间
+    duration_us: int                              # 计划器冻结的事件时长
     wait_since_previous_us: int                   # 相对等待时间
     actor_view: ActorView                         # actor 知识视图
     intent: str                                   # 事件意图
@@ -507,6 +532,7 @@ class RenderEventRequest(_ImmutableCarrier):
     role: RoleSpec | None                         # declared binding 声明
     public_facts: JsonObject                      # 共享 public facts
     attempt_index: int                            # 当前尝试序号
+    utc_offset_minutes: int                       # timeline 固定 UTC offset 分钟
     limits: GenerationLimits                      # 程序摘要绑定的唯一生成上限
 
 
@@ -531,6 +557,7 @@ class CouplingEvaluationRequest(_ImmutableCarrier):
     variant: VariantSpec                          # 当前反事实声明
     baseline_events: tuple[EventTruth, ...]       # baseline 真值
     events: tuple[EventTruth, ...]                # 当前分支真值
+    frame_classes: Mapping[str, FrameClassView]   # 去除帧类时间 path 的冻结声明
 
 
 @dataclass(frozen=True)
@@ -560,6 +587,7 @@ class NoiseRenderRequest(_ImmutableCarrier):
     class_descriptions: Mapping[str, str]         # sequence class 描述表
     frame_descriptions: Mapping[str, str]         # frame class 描述表
     attempt_index: int                            # 当前尝试序号
+    utc_offset_minutes: int                       # timeline 固定 UTC offset 分钟
     limits: GenerationLimits                      # 程序摘要绑定的唯一生成上限
 
 
@@ -910,6 +938,17 @@ class PreparedNoiseCandidate(_ImmutableCarrier):
 
 
 @dataclass(frozen=True)
+class ResourceInterval(_ImmutableCarrier):
+    """提交前索引的一个容量一资源半开区间。"""
+
+    resource: str                                 # 互斥资源名
+    start_us: int                                 # 包含的区间起点
+    end_us: int                                   # 不包含的区间终点
+    event_id: str                                 # 占用区间的最终事件 ID
+    source_key: str                               # primary/noise/replay 来源身份
+
+
+@dataclass(frozen=True)
 class CrossViewDelta(_ImmutableCarrier):
     """CrossViewFrontier 检查后尚未应用的当前候选增量。"""
 
@@ -918,6 +957,7 @@ class CrossViewDelta(_ImmutableCarrier):
     event_ids: tuple[str, ...]                     # 当前候选新增 event ID
     timestamps_us: tuple[int, ...]                 # 当前候选新增工件时间
     source_keys: tuple[str, ...]                   # 当前候选新增 source 身份
+    resource_intervals: tuple[ResourceInterval, ...]  # 按资源、起点排序的区间
 
 
 @dataclass(frozen=True)

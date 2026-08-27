@@ -124,7 +124,11 @@ capture/2026-07-01/
 **手上没有真实流？可以先生成一份。** sequence form（第 27 章）会写
 `{output_stem}.stream.jsonl`，每行顶层是 `payload` 与 `_meta`。重放工程把
 `input.text_field = "payload"`、`stream.order_by = "meta:_meta.event.timestamp"`，M2 会从同一文件重算
-primary/replay ID、owner 顺序与 duplicate provenance；任何篡改都会在 ingest 阶段 fail closed。
+primary/noise/replay ID、owner 顺序与 duplicate provenance，并用每行自带的 `duration_us`、`resources` 和
+`time_bindings` 复验业务时间。replay 必须是 source 的同一常量平移：非时间 payload 与下游 metadata 保持不变，
+时间字段按 replay 起点重新绑定。M2 验证通过后才提供去除时间叶子的 exact dedup carrier；M3 对这类记录只运行
+exact 层，不再用 MinHash 或 embedding 猜重复。任何 descriptor、payload、时间、顺序或 provenance 篡改都会在
+ingest 阶段 fail closed。
 
 ## 5.4 数据排布的实践建议
 

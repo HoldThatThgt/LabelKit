@@ -314,18 +314,20 @@ JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是�
 | `SequenceGenerationConfig` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `state_validator`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `calendar_windows`, `noise`, `limits` |
 | `GenerationProgram` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `planner_seed`, `class_views`, `frame_classes`, `frame_schema`, `patterns`, `counterfactual_sets`, `instruction_only`, `timeline`, `calendar_windows`, `noise`, `limits`, `state_validator`, `digest` |
 | `DeliverySlot` | `slot_key`, `source_name`, `scenario_index`, `sequence_class`, `pattern_name`, `variant_names`, `catalog_row_index` |
-| `PlannedEvent` | `event_key`, `role`, `position`, `logical_time_us`, `timestamp_us`, `session_id` |
-| `NoiseSlot` | `event_key`, `ordinal`, `frame_class`, `topic`, `timestamp_us`, `session_id` |
-| `ReplayLayout` | `source_slot_key`, `source_variant_name`, `replay_ordinal`, `session_id`, `timestamps_us` |
+| `PlannedEvent` | `event_key`, `role`, `position`, `logical_time_us`, `timestamp_us`, `duration_us`, `resources`, `session_id` |
+| `NoiseSlot` | `event_key`, `ordinal`, `frame_class`, `topic`, `timestamp_us`, `duration_us`, `resources`, `session_id` |
+| `ReplayLayout` | `source_slot_key`, `source_variant_name`, `replay_ordinal`, `session_id`, `shift_us` |
 | `ScenarioPlan` | `blocks`, `delivery_slots`, `noise_slots`, `replay_layouts`, `primary_sessions`, `digest` |
+| `SequenceTemporalMember` | `event_id`, `timestamp_us`, `duration_us`, `resources` |
+| `SequenceTemporalContext` | `members` |
 | `ScenarioSeed` | `initial_state`, `actors`, `shared_facts`, `style`, `time_context` |
 | `ActorView` | `actor`, `goal`, `read_state`, `observations`, `logical_time_us`, `wait_since_previous_us` |
 | `EventPlan` | `frame_class`, `actor`, `intent`, `patch` |
 | `EventExecution` | `state_before`, `state_after`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `normalized_patch` |
-| `EventDraft` | `event_key`, `event_id`, `frame_class`, `actor`, `logical_time_us`, `timestamp_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
-| `EventTruth` | `event_key`, `event_id`, `role`, `frame_class`, `actor`, `logical_time_us`, `timestamp_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
-| `ObservedEvent` | `event_id`, `frame_class`, `timestamp_us` |
-| `SemanticReviewEvent` | `frame_class`, `actor`, `logical_time_us`, `wait_since_previous_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
+| `EventDraft` | `event_key`, `event_id`, `frame_class`, `actor`, `logical_time_us`, `timestamp_us`, `duration_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
+| `EventTruth` | `event_key`, `event_id`, `role`, `frame_class`, `actor`, `logical_time_us`, `timestamp_us`, `duration_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
+| `ObservedEvent` | `event_id`, `frame_class`, `timestamp_us`, `duration_us` |
+| `SemanticReviewEvent` | `frame_class`, `actor`, `logical_time_us`, `duration_us`, `wait_since_previous_us`, `actor_view`, `intent`, `patch`, `state_before_hash`, `state_after_hash`, `publish_snapshot`, `payload` |
 | `PatternEvaluation` | `actual_bindings`, `actual_violations` |
 | `StateEvaluation` | `replay_hash`, `final_state_hash`, `bindings_valid`, `outcome_valid`, `protected_prefix_valid` |
 | `SemanticEvaluation` | `causal_consistency`, `actor_knowledge`, `goal_consistency`, `temporal_plausibility`, `cross_frame_consistency`, `realism`, `reason_codes` |
@@ -339,11 +341,11 @@ JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是�
 | `PostValidationResult` | `violations`, `event_execution` |
 | `PostValidatedCallRequest` | `profile`, `prompt`, `schema`, `scope`, `post_validator` |
 | `ValidatedGenerationCall` | `object`, `event_execution`, `resolved_at`, `usage`, `attempts`, `model` |
-| `RenderEventRequest` | `semantic_profile`, `slot_key`, `planned_event`, `event_plan`, `actor_view`, `publish_snapshot`, `state_before_hash`, `state_after_hash`, `binding_values`, `frame_spec`, `role`, `public_facts`, `attempt_index`, `limits` |
+| `RenderEventRequest` | `semantic_profile`, `slot_key`, `planned_event`, `event_plan`, `actor_view`, `publish_snapshot`, `state_before_hash`, `state_after_hash`, `binding_values`, `frame_spec`, `role`, `public_facts`, `attempt_index`, `utc_offset_minutes`, `limits` |
 | `StateEvaluationRequest` | `program`, `slot`, `pattern`, `variant`, `scenario_seed`, `events`, `baseline_events`, `final_state` |
-| `CouplingEvaluationRequest` | `variant`, `baseline_events`, `events` |
+| `CouplingEvaluationRequest` | `variant`, `baseline_events`, `events`, `frame_classes` |
 | `SemanticEvaluationRequest` | `evaluation_profile`, `mode`, `sequence_class`, `class_description`, `pattern_description`, `scenario_seed`, `review_events`, `final_state`, `attempt_index`, `limits` |
-| `NoiseRenderRequest` | `semantic_profile`, `noise_slot`, `noise_spec`, `frame_spec`, `class_descriptions`, `frame_descriptions`, `attempt_index`, `limits` |
+| `NoiseRenderRequest` | `semantic_profile`, `noise_slot`, `noise_spec`, `frame_spec`, `class_descriptions`, `frame_descriptions`, `attempt_index`, `utc_offset_minutes`, `limits` |
 | `NoiseEvaluationRequest` | `evaluation_profile`, `payload`, `planned_topic`, `class_descriptions`, `frame_descriptions`, `attempt_index`, `limits` |
 | `ProjectionRequest` | `program`, `plan`, `slot`, `trace` |
 | `NoiseProjectionRequest` | `program`, `run_id`, `noise_slot`, `payload` |
@@ -358,6 +360,8 @@ JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是�
 | `PreparedCandidate` | `slot`, `attempt_index`, `projection_witnesses`, `sequences`, `replays`, `reservation`, `dataset_counters`, `retained_content_bytes`, `digest` |
 | `PreparedNoiseCandidate` | `noise_slot`, `attempt_index`, `payload_digest`, `row`, `similarity_signature`, `dataset_counters`, `retained_content_bytes`, `digest` |
 | `ReconcileRequest` | `program`, `plan`, `run_id`, `projection_witnesses`, `sequences`, `noise_payload_digests`, `noise_rows`, `replays`, `retained_content_bytes` |
+| `ResourceInterval` | `resource`, `start_us`, `end_us`, `event_id`, `source_key` |
+| `CrossViewDelta` | `phase`, `ordinal`, `event_ids`, `timestamps_us`, `source_keys`, `resource_intervals` |
 | `GenerationServices` | `config`, `schema_engine`, `llm`, `metrics`, `tasks` |
 | `RuntimeCredentials` | `llm`, `embedding` |
 | `ResolvedHook` | `reference`, `target` |
@@ -384,9 +388,9 @@ JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是�
 不得构造 `EventTruth`；只有完整 `actual_bindings` 覆盖全部 event_id 后，才为每个 draft 增加唯一 role。
 
 `NoiseSlot` 只描述独立 noise 事件；`ReplayLayout` 只描述一次完整 replay 的 source、variant、
-ordinal、session 与逐事件 timestamp，两者均不进入 `ScenarioBlock`。`ReplayLayout.timestamps_us`
-的长度必须等于 source positive sequence 的事件数；source 只按 `slot_key` 与
-`source_variant_name` 解析，不得按 payload、位置或临时 list index 猜测。
+ordinal、session 与一个正、毫秒对齐的 `shift_us`，两者均不进入 `ScenarioBlock`。replay member 数量从 source
+positive sequence 继承；source 只按 `slot_key` 与 `source_variant_name` 解析，不得按 payload、位置或临时 list index
+猜测。
 
 `ResolvedPaths` 对 sequence 冻结 main、stream、report、manifest、failed_report，rejects 与 sidecar 为 null。
 `RuntimeCredentials` 只服务于 factory 构造 LLMClient，随后不进入 delivery request；其与
@@ -660,7 +664,7 @@ ReplayLayouts、实际 ReplayRows 与候选 retained bytes；它不得读取 Del
 workflow 才递归深冻结 `PreparedCandidate` 或 `PreparedNoiseCandidate` 并把 reservation/capture 所有权转移到
 连续候选缓冲；随后立即释放 AttemptTransaction、PipelineItem 与投影中间对象。
 
-`CrossViewFrontier` 保存 phase、下一 ordinal、已提交 event ID、timestamp 与 source key。当前 head 的提交协调器
+`CrossViewFrontier` 保存 phase、下一 ordinal、已提交 event ID、timestamp、source key 与资源区间。当前 head 的提交协调器
 只根据 prepared carrier 生成不可失败 delta，并在同一无 `await` 临界区随 dedup、retained、counter 与
 DeliveryState 一起应用。全部 primary/noise/replay 内存提交后，`ReconcileRequest` 只代表最终 full reconcile；
 其 `replays` 保留 ReplayLayout 顺序分组，`retained_content_bytes` 只携带最终全量费用，不再表达中间前缀。

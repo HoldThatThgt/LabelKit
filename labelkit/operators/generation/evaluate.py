@@ -1,16 +1,17 @@
-"""v1.18 pattern、state、coupling 与独立语义 oracle。"""
+"""v1.20 pattern、state、coupling 与独立语义 oracle。"""
 from __future__ import annotations
 
 import hashlib
 import json
 import logging
 from collections import defaultdict
-from typing import Mapping, Sequence
+from typing import Sequence
 
 import jsonpatch
 from jsonpointer import JsonPointerException, resolve_pointer
 from jsonschema import Draft202012Validator
 
+from labelkit.common.config._temporal import project_temporal_instance
 from labelkit.common.config.generation import SequencePattern
 from labelkit.common.contracts.generation import (
     CouplingEvaluationRequest,
@@ -39,7 +40,6 @@ from labelkit.common.inference.schema_engine import (
 )
 from labelkit.operators.generation import GenerationAttemptRejected
 from labelkit.operators.generation.project import canonical_json
-from labelkit.operators.generation.state import binding_values
 
 
 _log = logging.getLogger("labelkit.generation.evaluate")
@@ -86,7 +86,9 @@ def evaluate_state(request: StateEvaluationRequest) -> StateEvaluation:
     replay_hash = _state_hash(state)
     replay_valid = replay_valid and canonical_json(state) == canonical_json(request.final_state)
     outcome_valid = replay_valid and _outcome_valid(request, state)
-    protected = _protected_prefix_valid(request.variant, request.baseline_events, request.events)
+    protected = _protected_prefix_valid(
+        request.variant, request.baseline_events, request.events, request.program.frame_classes,
+    )
     return StateEvaluation(replay_hash, final_hash, bindings_valid, outcome_valid, protected)
 
 
@@ -96,7 +98,9 @@ def evaluate_coupling(request: CouplingEvaluationRequest) -> bool:
     @param request 基线与变体耦合判定请求。
     @return 全部受保护字段一致时为 true。
     """
-    return _protected_prefix_valid(request.variant, request.baseline_events, request.events)
+    return _protected_prefix_valid(
+        request.variant, request.baseline_events, request.events, request.frame_classes,
+    )
 
 
 async def evaluate_semantics(
@@ -206,11 +210,13 @@ def _gap_violations(pattern, role_events, prior):
 
 
 def _span_violations(pattern, role_events):
-    """在全部 role 可绑定时检查 max span。"""
+    """在全部 role 可绑定时检查完整区间 envelope。"""
     if any(role not in role_events for role in pattern.order):
         return []
-    times = [role_events[role].timestamp_us for role in pattern.order]
-    if max(times) - min(times) <= pattern.max_span_us:
+    starts = [role_events[role].timestamp_us for role in pattern.order]
+    ends = [role_events[role].timestamp_us + role_events[role].duration_us
+            for role in pattern.order]
+    if max(ends) - min(starts) <= pattern.max_span_us:
         return []
     return [{"kind": "max_span_exceeded", "target": pattern.name}]
 
@@ -327,7 +333,7 @@ def _state_schema(request):
     return config.state_schema
 
 
-def _protected_prefix_valid(variant, baseline, events) -> bool:
+def _protected_prefix_valid(variant, baseline, events, frame_classes) -> bool:
     """比较 divergence role 之前的全部受保护语义字段。"""
     if variant is None or variant.divergence_role is None:
         count = min(len(baseline), len(events))
@@ -336,25 +342,33 @@ def _protected_prefix_valid(variant, baseline, events) -> bool:
                       if event.role == variant.divergence_role), 0)
     if len(events) < count or len(baseline) < count:
         return False
-    return all(_protected_bytes(left) == _protected_bytes(right)
-               for left, right in zip(baseline[:count], events[:count]))
+    for left, right in zip(baseline[:count], events[:count]):
+        left_bytes = _protected_bytes(left, frame_classes)
+        right_bytes = _protected_bytes(right, frame_classes)
+        if left_bytes is None or right_bytes is None or left_bytes != right_bytes:
+            return False
+    return True
 
 
-def _protected_bytes(event) -> str:
-    """投影 protected prefix 要求字节相同的字段。"""
+def _protected_bytes(event, frame_classes) -> str | None:
+    """投影 protected prefix 的非时间字节真值。"""
+    frame = frame_classes.get(event.frame_class)
+    if frame is None:
+        return None
     return canonical_json({
         "event_key": event.event_key,
         "role": event.role,
         "frame_class": event.frame_class,
         "actor": event.actor,
         "logical_time_us": event.logical_time_us,
+        "duration_us": event.duration_us,
         "actor_view": event.actor_view,
         "intent": event.intent,
         "patch": event.patch,
         "state_before_hash": event.state_before_hash,
         "state_after_hash": event.state_after_hash,
         "publish_snapshot": event.publish_snapshot,
-        "payload": event.payload,
+        "payload": project_temporal_instance(event.payload, frame.business_time_paths),
     })
 
 

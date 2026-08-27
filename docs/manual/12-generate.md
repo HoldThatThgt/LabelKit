@@ -130,6 +130,18 @@ JSON Patch 只允许 `test`、`add`、`remove`、`replace`；状态和 payload �
 隐藏事实只供独立 evaluator 检查泄漏。它不会进入 EventPlanner、FrameRenderer、训练 payload、report、manifest
 或错误文本。用户 hook 接收不可变副本，不负责执行 patch，也不能成为第二份状态真值。
 
+### 业务时间、区间与 resource
+
+完整 frame Schema 用 `x-labelkit-business-time = true` 标记业务时间叶子；frame class 的 `time_bindings` 把每条路径
+绑定到 event start、end 或 duration。M1 机械派生删除这些叶子的 model Schema，模型只生成非时间字段；每轮候选通过
+model Schema 后，generic candidate finalizer 按 Planner 事实注入并执行完整 Schema。`duration_s` 声明事件区间，
+`resources` 声明容量为一的互斥资源。Planner 固定使用 1 毫秒 quantum，对同一 resource 执行半开区间不重叠约束；
+pattern containment 保证 contained 区间在 container 中至少保留 1 毫秒严格余量。
+
+noise 与 instruction-only 只能选择点 frame class。replay 不复制 source 的时间 payload，而是为整条 source 选择同一个
+正、毫秒对齐的 `shift_us`；成员 start delta、duration、resources、role 顺序与非时间 payload 保持不变，业务时间按
+replay 起点重新绑定。event ID、dedup、retained bytes 与 delivery digest 都消费重新绑定后的最终内容。
+
 ## 12.7 精确交付与失败语义
 
 sequence dry-run 只打印同源计划和调用估算，不读取 API key value，也不创建或替换 main、stream、report、
@@ -151,6 +163,7 @@ flat 先看 `generate.buckets` 的 produced、validator rejection 与 survived-d
 - `by_pattern` 每个 variant 是否 planned = delivered；
 - `rejected_attempts` 是否解释了额外尝试；
 - main、stream、report 是否与最后提交的 manifest 摘要一致；
-- replay 是否由最终 source rows 派生，并在 process ingest 时通过 ID 与 provenance 重算。
+- replay 是否由最终 source rows 派生，并在 process ingest 时通过 descriptor、constant shift、业务时间、ID 与
+  provenance 重算。
 
 真实端点可能重试或触发 Schema repair，因此逻辑 family 调用数、provider 物理请求数与 token 用量要分开读。

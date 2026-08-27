@@ -47,7 +47,7 @@ CONFIG_FIELDS = {
     "GapSpec": ("name", "before", "after", "min_gap_us", "max_gap_us"),
     "SequencePattern": (
         "name", "sequence_class", "description", "roles", "order", "gaps",
-        "max_span_us",
+        "max_span_us", "containments",
     ),
     "VariantSpec": (
         "name", "kind", "target", "outcome_schema", "expected_violation",
@@ -94,6 +94,7 @@ CONFIG_TYPES = {
     "SequencePattern": (
         str, str, str, tuple[config_generation.RoleSpec, ...], tuple[str, ...],
         tuple[config_generation.GapSpec, ...], int,
+        tuple[config_generation.IntervalContainmentSpec, ...],
     ),
     "VariantSpec": (
         str, Literal["positive", "missing", "reordered", "interval_exceeded"],
@@ -135,19 +136,23 @@ CONTRACT_FIELDS = {
         "variant_names", "catalog_row_index",
     ),
     "PlannedEvent": (
-        "event_key", "role", "position", "logical_time_us", "timestamp_us", "session_id",
+        "event_key", "role", "position", "logical_time_us", "timestamp_us", "duration_us",
+        "resources", "session_id",
     ),
     "NoiseSlot": (
-        "event_key", "ordinal", "frame_class", "topic", "timestamp_us", "session_id",
+        "event_key", "ordinal", "frame_class", "topic", "timestamp_us", "duration_us",
+        "resources", "session_id",
     ),
     "ReplayLayout": (
         "source_slot_key", "source_variant_name", "replay_ordinal", "session_id",
-        "timestamps_us",
+        "shift_us",
     ),
     "ScenarioPlan": (
         "blocks", "delivery_slots", "noise_slots", "replay_layouts", "primary_sessions",
         "digest",
     ),
+    "SequenceTemporalMember": ("event_id", "timestamp_us", "duration_us", "resources"),
+    "SequenceTemporalContext": ("members",),
     "ScenarioSeed": ("initial_state", "actors", "shared_facts", "style", "time_context"),
     "ActorView": (
         "actor", "goal", "read_state", "observations", "logical_time_us",
@@ -160,17 +165,18 @@ CONTRACT_FIELDS = {
     ),
     "EventDraft": (
         "event_key", "event_id", "frame_class", "actor", "logical_time_us",
-        "timestamp_us", "actor_view", "intent", "patch", "state_before_hash",
+        "timestamp_us", "duration_us", "actor_view", "intent", "patch", "state_before_hash",
         "state_after_hash", "publish_snapshot", "payload",
     ),
     "EventTruth": (
         "event_key", "event_id", "role", "frame_class", "actor", "logical_time_us",
-        "timestamp_us", "actor_view", "intent", "patch", "state_before_hash",
+        "timestamp_us", "duration_us", "actor_view", "intent", "patch", "state_before_hash",
         "state_after_hash", "publish_snapshot", "payload",
     ),
-    "ObservedEvent": ("event_id", "frame_class", "timestamp_us"),
+    "ObservedEvent": ("event_id", "frame_class", "timestamp_us", "duration_us"),
     "SemanticReviewEvent": (
-        "frame_class", "actor", "logical_time_us", "wait_since_previous_us", "actor_view",
+        "frame_class", "actor", "logical_time_us", "duration_us", "wait_since_previous_us",
+        "actor_view",
         "intent", "patch", "state_before_hash", "state_after_hash", "publish_snapshot",
         "payload",
     ),
@@ -218,13 +224,16 @@ CONTRACT_FIELDS = {
     "RenderEventRequest": (
         "semantic_profile", "slot_key", "planned_event", "event_plan", "actor_view",
         "publish_snapshot", "state_before_hash", "state_after_hash", "binding_values",
-        "frame_spec", "role", "public_facts", "attempt_index", "limits",
+        "frame_spec", "role", "public_facts", "attempt_index", "utc_offset_minutes",
+        "limits",
     ),
     "StateEvaluationRequest": (
         "program", "slot", "pattern", "variant", "scenario_seed", "events",
         "baseline_events", "final_state",
     ),
-    "CouplingEvaluationRequest": ("variant", "baseline_events", "events"),
+    "CouplingEvaluationRequest": (
+        "variant", "baseline_events", "events", "frame_classes",
+    ),
     "SemanticEvaluationRequest": (
         "evaluation_profile", "mode", "sequence_class", "class_description",
         "pattern_description", "scenario_seed", "review_events", "final_state",
@@ -232,7 +241,7 @@ CONTRACT_FIELDS = {
     ),
     "NoiseRenderRequest": (
         "semantic_profile", "noise_slot", "noise_spec", "frame_spec", "class_descriptions",
-        "frame_descriptions", "attempt_index", "limits",
+        "frame_descriptions", "attempt_index", "utc_offset_minutes", "limits",
     ),
     "NoiseEvaluationRequest": (
         "evaluation_profile", "payload", "planned_topic", "class_descriptions",
@@ -281,7 +290,11 @@ CONTRACT_FIELDS = {
         "noise_slot", "attempt_index", "payload_digest", "row",
         "similarity_signature", "dataset_counters", "retained_content_bytes", "digest",
     ),
-    "CrossViewDelta": ("phase", "ordinal", "event_ids", "timestamps_us", "source_keys"),
+    "ResourceInterval": ("resource", "start_us", "end_us", "event_id", "source_key"),
+    "CrossViewDelta": (
+        "phase", "ordinal", "event_ids", "timestamps_us", "source_keys",
+        "resource_intervals",
+    ),
     "GenerationProduct": ("main_rows", "stream_rows", "report"),
 }
 
@@ -392,9 +405,9 @@ CONTRACT_TYPES = {
         config_generation.GenerationLimits, ResolvedHook | None, str,
     ),
     "DeliverySlot": (str, str, int, str, str | None, tuple[str, ...], int | None),
-    "PlannedEvent": (str, str, int, int, int, str),
-    "NoiseSlot": (str, int, str, str, int, str),
-    "ReplayLayout": (str, str, int, str, tuple[int, ...]),
+    "PlannedEvent": (str, str, int, int, int, int, tuple[str, ...], str),
+    "NoiseSlot": (str, int, str, str, int, int, tuple[str, ...], str),
+    "ReplayLayout": (str, str, int, str, int),
     "ScenarioPlan": (
         tuple[Mapping[
             tuple[str, str | None], tuple[contracts_generation.PlannedEvent, ...]
@@ -403,6 +416,9 @@ CONTRACT_TYPES = {
         tuple[contracts_generation.NoiseSlot, ...],
         tuple[contracts_generation.ReplayLayout, ...], int, str,
     ),
+    "SequenceTemporalMember": (str, int, int, tuple[str, ...]),
+    "SequenceTemporalContext": (
+        tuple[contracts_generation.SequenceTemporalMember, ...],),
     "ScenarioSeed": (
         _JSON_OBJECT, Mapping[str, Mapping[str, object]], _JSON_OBJECT,
         _JSON_OBJECT, _JSON_OBJECT,
@@ -415,16 +431,16 @@ CONTRACT_TYPES = {
         tuple[_JSON_OBJECT, ...],
     ),
     "EventDraft": (
-        str, str, str, str, int, int, contracts_generation.ActorView, str,
+        str, str, str, str, int, int, int, contracts_generation.ActorView, str,
         tuple[_JSON_OBJECT, ...], str, str, _JSON_OBJECT, _JSON_OBJECT,
     ),
     "EventTruth": (
-        str, str, str, str, str, int, int, contracts_generation.ActorView, str,
+        str, str, str, str, str, int, int, int, contracts_generation.ActorView, str,
         tuple[_JSON_OBJECT, ...], str, str, _JSON_OBJECT, _JSON_OBJECT,
     ),
-    "ObservedEvent": (str, str, int),
+    "ObservedEvent": (str, str, int, int),
     "SemanticReviewEvent": (
-        str, str, int, int, contracts_generation.ActorView, str,
+        str, str, int, int, int, contracts_generation.ActorView, str,
         tuple[_JSON_OBJECT, ...], str, str, _JSON_OBJECT, _JSON_OBJECT,
     ),
     "PatternEvaluation": (Mapping[str, str], tuple[_VIOLATION, ...]),
@@ -476,7 +492,7 @@ CONTRACT_TYPES = {
         str, str, contracts_generation.PlannedEvent, contracts_generation.EventPlan,
         contracts_generation.ActorView, _JSON_OBJECT, str, str, _JSON_OBJECT,
         FrameClassView, config_generation.RoleSpec | None, _JSON_OBJECT, int,
-        config_generation.GenerationLimits,
+        int, config_generation.GenerationLimits,
     ),
     "StateEvaluationRequest": (
         contracts_generation.GenerationProgram, contracts_generation.DeliverySlot,
@@ -486,7 +502,7 @@ CONTRACT_TYPES = {
     ),
     "CouplingEvaluationRequest": (
         config_generation.VariantSpec, tuple[contracts_generation.EventTruth, ...],
-        tuple[contracts_generation.EventTruth, ...],
+        tuple[contracts_generation.EventTruth, ...], Mapping[str, FrameClassView],
     ),
     "SemanticEvaluationRequest": (
         str, Literal["declared", "instruction_only"], str, str, str,
@@ -496,7 +512,8 @@ CONTRACT_TYPES = {
     ),
     "NoiseRenderRequest": (
         str, contracts_generation.NoiseSlot, config_generation.NoiseSpec, FrameClassView,
-        Mapping[str, str], Mapping[str, str], int, config_generation.GenerationLimits,
+        Mapping[str, str], Mapping[str, str], int, int,
+        config_generation.GenerationLimits,
     ),
     "NoiseEvaluationRequest": (
         str, _JSON_OBJECT, str, Mapping[str, str], Mapping[str, str], int,
@@ -573,8 +590,10 @@ CONTRACT_TYPES = {
         contracts_generation.NoiseSlot, int, str, _JSON_OBJECT, tuple[int, ...],
         Mapping[str, int], int, str,
     ),
+    "ResourceInterval": (str, int, int, str, str),
     "CrossViewDelta": (
         Literal["primary", "noise"], int, tuple[str, ...], tuple[int, ...], tuple[str, ...],
+        tuple[contracts_generation.ResourceInterval, ...],
     ),
     "GenerationProduct": (
         tuple[_JSON_OBJECT, ...], tuple[_JSON_OBJECT, ...], _JSON_OBJECT),
@@ -910,7 +929,9 @@ def test_prepared_candidate_carriers_recursively_freeze_rows_and_counters():
     noise_row = {"payload": {"text": "noise"}, "_meta": {"event": {"noise": True}}}
     noise_counters = {"generated": 1}
     noise = contracts_generation.PreparedNoiseCandidate(
-        contracts_generation.NoiseSlot("e" * 32, 0, "noise", "weather", 1, "noise_0"),
+        contracts_generation.NoiseSlot(
+            "e" * 32, 0, "noise", "weather", 1000, 0, (), "noise_0",
+        ),
         1,
         "f" * 64,
         noise_row,
@@ -1088,7 +1109,7 @@ def test_sequence_report_rejection_fields_match_all_authoritative_sources():
     assert tuple(sequence_workflow._REJECTION_KEYS) == _REPORT_REJECTION_FIELDS
     sources = (
         (root / "docs/dev/SPEC-sequence-generation-redesign.md", "### 14.4 report"),
-        (root / "spec/60-ch6-io-formats.md", "### 6.4.1 v1.18 sequence success report"),
+        (root / "spec/60-ch6-io-formats.md", "### 6.4.1 v1.20 sequence success report"),
         (root / "docs/CONTRACTS.md", "The frozen sequence report follows."),
     )
     for path, marker in sources:

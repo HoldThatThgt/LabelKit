@@ -80,6 +80,10 @@ repair 的完整轨迹示例（真实流程走查）：
 
 **修复换档（v1.11）**：标注 profile 声明了 `context_window`（第 6 章）的多图序列工程里，repair 的返工重标不只是带着意见重来——它按**质量阶梯换档**：关键帧数减半（min 2，首末帧恒保留）、分辨率上探一档（`default_image_px` × 1.5/维，封顶 `max_image_px`），预算约束经校准估算重新核算后照常成立。直觉：被评审出问题的多图标注，更常见的毛病是「看不清」而不是「看得少」——帧少一点、每帧清楚一点。触发条件就是 fail ∧ `policy = "repair"`，仅此一项、无需配置；换档**单向有界**——只发生在修复路径，每记录至多 `max_repair_rounds` 次（默认 1）。
 
+declared sequence 的 annotation 若声明业务时间 binding，每轮 repair 继续显式携带首次标注使用的同一个冻结
+`SequenceTemporalContext`。模型只修非时间字段；generic candidate finalizer 在重标结果上重新注入目标 resource 的
+最早起点，再执行完整 Schema 与业务回调。verify repair 不会复制上一版时间、读取 raw payload 或自行计算另一份时间。
+
 ## 13.4 多评审团
 
 `verify.judges = ["judge_a", "judge_b", "judge_c"]`（奇数个）时启用评审团：

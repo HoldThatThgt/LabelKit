@@ -31,7 +31,14 @@ from itertools import islice
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterator, Literal, Mapping
 
-from labelkit.common.config.model import ResolvedConfig, StreamConfig
+from jsonpointer import JsonPointer, JsonPointerException
+
+from labelkit.common.config._temporal import (
+    paths_overlap,
+    project_temporal_instance,
+    resolve_frame_time_values,
+)
+from labelkit.common.config.model import ResolvedConfig, StreamConfig, TimeBindingSpec
 from labelkit.common.errors import InputError
 from labelkit.common.contracts.types import ImageRef, Record, RecordRef, UINode, UITree
 from labelkit.operators.generation.project import derive_generation_id
@@ -70,7 +77,7 @@ _GENERATION_TIMESTAMP_RE = re.compile(
 )
 _PRIMARY_EVENT_FIELDS = frozenset({
     "event_id", "event_key", "owner_sequence_id", "role", "frame_class",
-    "actor", "logical_time_us", "timestamp",
+    "actor", "logical_time_us", "timestamp", "duration_us", "resources", "time_bindings",
 })
 _REPLAY_EVENT_FIELDS = frozenset({
     *_PRIMARY_EVENT_FIELDS, "replay_sequence_id", "replay_ordinal",
@@ -89,6 +96,14 @@ _INSTRUCTION_GENERATION_FIELDS = frozenset({
     "validation_mode", "actor_knowledge_validation", "instruction_slot", "scenario_index",
     "scenario_id", "world_branch_id", "sequence_class",
 })
+_FRAME_TIME_SOURCES = frozenset({
+    "event_start_milliseconds",
+    "event_end_milliseconds",
+    "event_duration_milliseconds",
+    "event_start_iso8601",
+    "event_end_iso8601",
+})
+_RESOURCE_RE = re.compile(r"^[a-z0-9_]+$")
 
 
 def _canonical_json(obj: Any) -> str:
@@ -122,6 +137,81 @@ def _generation_timestamp_us(value: object) -> int:
     epoch = datetime(1970, 1, 1, tzinfo=timezone.utc)
     delta = parsed - epoch
     return (delta.days * 86_400 + delta.seconds) * 1_000_000 + delta.microseconds
+
+
+def _generation_offset_minutes(value: object) -> int:
+    """从已通过工件格式检查的时间文本提取整分钟 offset。
+
+    @param value `_meta.event.timestamp`。
+    @return UTC offset 分钟。
+    @raises ValueError offset 不存在或不是整分钟。
+    """
+    parsed = datetime.fromisoformat(str(value))
+    offset = parsed.utcoffset()
+    seconds = None if offset is None else offset.total_seconds()
+    if seconds is None or seconds % 60:
+        raise ValueError("artifact timestamp offset must use whole minutes")
+    return int(seconds // 60)
+
+
+def _artifact_time_bindings(value: object) -> tuple[TimeBindingSpec, ...]:
+    """解析自描述 stream 中声明序封闭的 frame time bindings。"""
+    if not isinstance(value, list):
+        raise ValueError("generation time bindings must be an array")
+    bindings: list[TimeBindingSpec] = []
+    for item in value:
+        if not isinstance(item, Mapping) or set(item) != {"payload_path", "source"}:
+            raise ValueError("generation time binding shape is invalid")
+        path, source = item.get("payload_path"), item.get("source")
+        _validate_artifact_time_path(path, bindings)
+        if source not in _FRAME_TIME_SOURCES:
+            raise ValueError("generation time binding source is invalid")
+        bindings.append(TimeBindingSpec(str(path), source))
+    return tuple(bindings)
+
+
+def _validate_artifact_time_path(path: object, bindings: list[TimeBindingSpec]) -> None:
+    """拒绝非法、重复或互为前缀的 artifact binding path。"""
+    try:
+        parts = tuple(JsonPointer(path).parts) if isinstance(path, str) else ()
+    except JsonPointerException as error:
+        raise ValueError("generation time binding path is invalid") from error
+    if not parts or "-" in parts:
+        raise ValueError("generation time binding path is invalid")
+    if any(paths_overlap(str(path), item.payload_path) for item in bindings):
+        raise ValueError("generation time binding paths conflict")
+
+
+def _artifact_resources(value: object, duration_us: object) -> tuple[str, ...]:
+    """解析 generation event 的声明序容量一资源。"""
+    valid_duration = (isinstance(duration_us, int) and not isinstance(duration_us, bool)
+                      and duration_us >= 0 and duration_us % 1000 == 0)
+    if not valid_duration:
+        raise ValueError("generation event duration is invalid")
+    if not isinstance(value, list):
+        raise ValueError("generation event resources are invalid")
+    if not all(isinstance(item, str) and _RESOURCE_RE.fullmatch(item) for item in value):
+        raise ValueError("generation event resources are invalid")
+    if len(set(value)) != len(value):
+        raise ValueError("generation event resources are invalid")
+    if value and duration_us == 0:
+        raise ValueError("generation event resources require positive duration")
+    return tuple(value)
+
+
+def _validate_artifact_payload_time(row: "_GenerationInputRow") -> None:
+    """复算一行 descriptor 的全部机械值并逐路径比较 payload。"""
+    offset = _generation_offset_minutes(row.event.get("timestamp"))
+    values = resolve_frame_time_values(
+        row.time_bindings, row.timestamp_us, row.duration_us, offset)
+    payload = row.raw["payload"]
+    for path, expected in values.items():
+        try:
+            actual = JsonPointer(path).resolve(payload)
+        except JsonPointerException as error:
+            raise ValueError("generation payload time path is missing") from error
+        if type(actual) is not type(expected) or actual != expected:
+            raise ValueError("generation payload time value is invalid")
 
 
 def _extract_text_field(obj: Mapping, dotted_path: str) -> str | None:
@@ -283,6 +373,10 @@ class _GenerationInputRow:
     line_no: int                                 # 一基文件内行号
     event: Mapping[str, object]                  # `_meta.event` 对象
     timestamp_us: int                            # 严格解析后的 UTC epoch 微秒
+    duration_us: int                             # descriptor 固定非负毫秒量化时长
+    resources: tuple[str, ...]                   # descriptor 声明序容量一资源
+    time_bindings: tuple[TimeBindingSpec, ...]   # descriptor 声明序 frame binding
+    exact_dedup_text: str                        # 删除已验证 time paths 的 payload canonical JSON
 
 
 class _Assembler:
@@ -1114,6 +1208,7 @@ class Ingestor:
                 image=None,
                 ref=RecordRef(source_file=row.source_file, line_no=row.line_no,
                               pair_index=None, generated_from=()),
+                exact_dedup_text=row.exact_dedup_text,
             )
 
     def _read_generation_rows(
@@ -1158,7 +1253,17 @@ class Ingestor:
         if not isinstance(event, Mapping):
             raise ValueError("generation stream event metadata is invalid")
         timestamp_us = _generation_timestamp_us(event.get("timestamp"))
-        return _GenerationInputRow(raw, source_file, line_no, event, timestamp_us)
+        duration_us = event.get("duration_us")
+        resources = _artifact_resources(event.get("resources"), duration_us)
+        bindings = _artifact_time_bindings(event.get("time_bindings"))
+        paths = tuple(item.payload_path for item in bindings)
+        exact = _canonical_json(project_temporal_instance(raw["payload"], paths))
+        row = _GenerationInputRow(
+            raw, source_file, line_no, event, timestamp_us,
+            int(duration_us), resources, bindings, exact,
+        )
+        _validate_artifact_payload_time(row)
+        return row
 
     def _generation_input_failure(self, reason: str) -> None:
         """记录 data-free 错误并拒绝整个 generation stream。
@@ -1172,7 +1277,7 @@ class Ingestor:
 
     @staticmethod
     def _validate_generation_rows(rows: tuple[_GenerationInputRow, ...]) -> None:
-        """验证全局 ID 唯一性并按 primary/replay owner 闭包。"""
+        """验证全局 ID/起点/资源与 primary/replay owner 闭包。"""
         primary: dict[str, list[_GenerationInputRow]] = {}
         replay: dict[str, list[_GenerationInputRow]] = {}
         event_ids: set[str] = set()
@@ -1184,6 +1289,7 @@ class Ingestor:
                 raise ValueError("generation event IDs are not globally unique")
             event_ids.add(event_id)
             Ingestor._classify_generation_row(row, primary, replay)
+        Ingestor._validate_generation_timeline(rows)
         Ingestor._validate_primary_groups(primary)
         for replay_id, group in replay.items():
             Ingestor._validate_replay_group(replay_id, group, primary)
@@ -1222,7 +1328,15 @@ class Ingestor:
                    for value in (event.get("owner_sequence_id"), world, event_key)):
             raise ValueError("primary generation identity is invalid")
         expected = derive_generation_id(
-            "primary_event_id", [world, event_key, row.timestamp_us, row.raw["payload"]]
+            "primary_event_id", [
+                world,
+                event_key,
+                row.timestamp_us,
+                row.duration_us,
+                list(row.resources),
+                row.event["time_bindings"],
+                row.raw["payload"],
+            ]
         )
         if event.get("event_id") != expected:
             raise ValueError("primary event ID does not match its source")
@@ -1281,6 +1395,8 @@ class Ingestor:
                 or event.get("role") is not None or event.get("actor") is not None
                 or event.get("logical_time_us") is not None or meta.get("generation") is not None):
             raise ValueError("noise metadata is invalid")
+        if row.duration_us != 0 or row.resources:
+            raise ValueError("noise temporal descriptor is invalid")
 
     @staticmethod
     def _validate_replay_shape(row: _GenerationInputRow) -> None:
@@ -1319,6 +1435,10 @@ class Ingestor:
         sources = primary[source_id]
         if len(group) != len(sources):
             raise ValueError("replay event count does not match its source")
+        shifts = {row.timestamp_us - source.timestamp_us
+                  for row, source in zip(group, sources, strict=True)}
+        if len(shifts) != 1 or next(iter(shifts)) <= 0 or next(iter(shifts)) % 1000:
+            raise ValueError("replay events do not use one positive constant shift")
         for row, source in zip(group, sources, strict=True):
             Ingestor._validate_replay_row(row, source, replay_id, source_id, ordinal)
 
@@ -1333,7 +1453,13 @@ class Ingestor:
                 or event.get("duplicate_of_event_id") != source_event.get("event_id")):
             raise ValueError("replay positional provenance is invalid")
         expected = derive_generation_id(
-            "replay_event_id", [replay_id, source_event["event_id"], row.timestamp_us]
+            "replay_event_id", [
+                replay_id,
+                source_event["event_id"],
+                row.timestamp_us,
+                source.duration_us,
+                row.raw["payload"],
+            ]
         )
         if event.get("event_id") != expected:
             raise ValueError("replay event ID does not match its source")
@@ -1342,8 +1468,11 @@ class Ingestor:
 
     @staticmethod
     def _validate_replay_copy(row, source) -> None:
-        """验证 replay 除身份与工件时间外逐位复制 source final row。"""
-        fields = ("event_key", "role", "frame_class", "actor", "logical_time_us")
+        """验证 replay 只重绑机械时间，其他 source 内容逐位相同。"""
+        fields = (
+            "event_key", "role", "frame_class", "actor", "logical_time_us",
+            "duration_us", "resources", "time_bindings",
+        )
         if any(row.event.get(key) != source.event.get(key) for key in fields):
             raise ValueError("replay event content differs from its source")
         row_meta, source_meta = row.raw["_meta"], source.raw["_meta"]
@@ -1351,8 +1480,26 @@ class Ingestor:
                      if key not in {"event", "generation"}}
         source_other = {key: value for key, value in source_meta.items()
                         if key not in {"event", "generation"}}
-        if row.raw["payload"] != source.raw["payload"] or row_other != source_other:
+        if row.exact_dedup_text != source.exact_dedup_text or row_other != source_other:
             raise ValueError("replay final row differs from its source")
+
+    @staticmethod
+    def _validate_generation_timeline(rows: tuple[_GenerationInputRow, ...]) -> None:
+        """校验全局起点唯一与每个 exclusive resource 的半开区间互斥。"""
+        starts: set[int] = set()
+        intervals: dict[str, list[tuple[int, int]]] = {}
+        for row in rows:
+            if row.timestamp_us in starts:
+                raise ValueError("generation event timestamps are not globally unique")
+            starts.add(row.timestamp_us)
+            for resource in row.resources:
+                intervals.setdefault(resource, []).append(
+                    (row.timestamp_us, row.timestamp_us + row.duration_us))
+        for values in intervals.values():
+            ordered = sorted(values)
+            if any(current[0] < previous[1]
+                   for previous, current in zip(ordered, ordered[1:], strict=False)):
+                raise ValueError("generation resource intervals overlap")
 
     @staticmethod
     def _validate_replay_generation(row, source, source_id: str) -> None:

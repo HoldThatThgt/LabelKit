@@ -54,6 +54,7 @@ from labelkit.common.errors import (
     ProviderRetryableError,
     SchemaViolation,
 )
+from labelkit.common.contracts.generation import SequenceTemporalContext
 from labelkit.common.inference import budget as budget_mod
 from labelkit.common.inference.schema_engine import VERDICT_SCHEMA, defect_verdict_schema
 from labelkit.common.contracts.types import (
@@ -950,7 +951,8 @@ def _stub_annotate(monkeypatch, output=None):
         calls.append(SimpleNamespace(record=record, repair=opts.repair,
                                      label=opts.label,
                                      transitions=opts.transitions,
-                                     fragment_lens=opts.fragment_lens))
+                                     fragment_lens=opts.fragment_lens,
+                                     temporal_context=opts.temporal_context))
         return _annotation(output or {"task_label": "修正"})
 
     monkeypatch.setattr("labelkit.operators.annotate.annotate_record_leaf", fake)
@@ -2839,11 +2841,13 @@ def test_classic_path_sequence_repair_policy_reannotates(monkeypatch):
     """修复 = 既有 policy 重标注（annotate_record 修复面穿透）：首轮 fail →
     重标注 → 次轮 pass ⇒ active + 修复后标注落信封。"""
     cfg = _verdict_cfg(policy="repair", max_repair_rounds=1, with_views=True)
+    temporal_context = SequenceTemporalContext(())
     item = PipelineItem(record=_assembled_sequence(), status="active",
                         annotation=_annotation({"intent": "错标"}),
                         classification=Classification(
                             label="faq", labels=("faq",), source="inherited",
-                            detail={}))
+                            detail={}),
+                        temporal_context=temporal_context)
     engine = _VerdictEngine({"e" * 16: [_verdict_obj("fail"),
                                         _verdict_obj("pass")]})
     calls = _stub_annotate(monkeypatch, output={"intent": "修正"})
@@ -2860,6 +2864,7 @@ def test_classic_path_sequence_repair_policy_reannotates(monkeypatch):
     (call,) = calls
     assert call.label == "faq"                     # 修复穿按类取值面
     assert call.record.kind == "sequence"
+    assert call.temporal_context is temporal_context
 
 
 def test_stream_driver_path_unperturbed_by_verdict_form():
@@ -3052,7 +3057,7 @@ def test_stream_strict_waves_use_pure_leaves_and_fresh_frame_results(monkeypatch
     _stub_extract(monkeypatch)
     _stub_classify_frames(monkeypatch, label="task_request")
     member_calls = _stub_annotate_member(monkeypatch)
-    _stub_annotate(monkeypatch, output={"task_label": "修正"})
+    annotate_calls = _stub_annotate(monkeypatch, output={"task_label": "修正"})
 
     async def forbidden(*args, **kwargs):
         raise AssertionError("verify called a grouped operator surface from a leaf")
@@ -3067,6 +3072,8 @@ def test_stream_strict_waves_use_pure_leaves_and_fresh_frame_results(monkeypatch
     noise = _env(reclaimed, status="dropped_noise")
     noise.noise_attribution = ("segment", "noise")
     episode = _episode([first, second], transitions=(_transition(0),))
+    temporal_context = SequenceTemporalContext(())
+    episode.temporal_context = temporal_context
     episode.member_classifications = {
         first.id: _member_cls(),
         second.id: _member_cls(),
@@ -3108,6 +3115,8 @@ def test_stream_strict_waves_use_pure_leaves_and_fresh_frame_results(monkeypatch
     assert episode.member_classifications["f2"].label == "task_request"
     assert member_calls == [("f2", "task_request")]
     assert episode.member_annotations["f2"].output == {"intent": "帧", "entities": []}
+    assert len(annotate_calls) == 1
+    assert annotate_calls[0].temporal_context is temporal_context
     assert episode.verification.verdict == "pass"
 
 

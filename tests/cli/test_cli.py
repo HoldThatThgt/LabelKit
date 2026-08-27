@@ -90,6 +90,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/config/_rubrics.py",
     "labelkit/common/config/_schemas.py",
     "labelkit/common/config/_sections.py",
+    "labelkit/common/config/_temporal.py",
     "labelkit/common/config/generation.py",
     "labelkit/common/config/loader.py",
     "labelkit/common/config/model.py",
@@ -144,6 +145,8 @@ EXPECTED_TEST_PY = {
     "tests/common/config/test_config.py",
     "tests/common/config/test_generation.py",
     "tests/common/config/test_paths_hooks.py",     # v1.17 (SPEC-scenario-planning §5.1/§4.9)
+    "tests/common/config/test_temporal.py",
+    "tests/common/config/test_temporal_config.py",
     "tests/common/contracts/test_execution.py",
     "tests/common/contracts/test_stage.py",
     "tests/common/contracts/test_generation_contracts.py",

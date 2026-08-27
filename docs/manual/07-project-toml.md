@@ -87,6 +87,12 @@ sequence form 在 `[generate]` 选择 `declared` 或 `instruction_only`。配置
 counterfactual set；instruction-only 用独立 slot。timeline、calendar window、noise 与 replay 都属于这一个
 序列配置面。详细配置见第 27 章，全键表见附录 A.13。
 
+v1.20 的业务时间配置属于 frame class 和 sequence class 本身。完整 payload/annotation Schema 用
+`x-labelkit-business-time = true` 标记每个时间叶子；M1 要求标记路径与 `time_bindings` 完全相等，并派生不含
+这些叶子的 model Schema。`[frame.class.<name>.generate]` 还可声明毫秒量化的 `duration_s` 与容量为一的
+`resources`；`[[generate.pattern.<name>.containments]]` 声明严格包含关系。模型只生成非时间字段，Planner 与
+generic candidate finalizer 机械写入起点、终点和时长。配置形状和完整示例见第 27 章。
+
 `[frame.classify]` 只消费 process 流模式的 episode，因此始终要求 `segment.enabled=true`。`[frame.annotate]`
 有两个入口：process/flat 仍要求 segment，并在序列标注成功后处理成员；sequence form 已由生成计划提供成员和
 inherited frame class，可脱离 segment，也可在 `annotate.enabled=false` 时直接运行。后一种组合必须开启
@@ -110,6 +116,10 @@ main 的 `_meta.stream.members[]` 与对应 primary stream 行的 `_meta.annotat
 开了分类或 sequence class 路由时，这份 Schema 可以被**按类覆盖**：
 `[class.<类名>.annotate].schema_path` / `schema_inline`（至多其一）。声明了就用类的，未声明就回落全局。
 sequence 示例的按类 Schema 见第 27 章。
+
+sequence annotation 的业务时间同样在完整 class Schema 标记，并在 `[class.<类名>.annotate].time_bindings`
+声明；当前 source 只有 `first_resource_start_milliseconds`。值来自最终成员中目标 resource 的最早正区间，
+不从 prompt、raw payload 或 wall clock 推断。
 
 选哪个？Schema 短（≤ 30 行）内嵌，随工程文件一目了然；Schema 长或多工程共用，外部文件。
 

@@ -1294,6 +1294,10 @@ class VerifyStage:
             if _ATTEMPT_MODE.get():
                 raise
             return exc
+        except InternalError as exc:
+            if _ATTEMPT_MODE.get():
+                raise
+            return exc
         except Exception as exc:
             return exc
 
@@ -1432,7 +1436,11 @@ class VerifyStage:
         )
         return await annotate_record_leaf(
             state.item.record, ctx,
-            AnnotatePromptOptions(repair=repair, label=state.label),
+            AnnotatePromptOptions(
+                repair=repair,
+                label=state.label,
+                temporal_context=state.item.temporal_context,
+            ),
         )
 
     # ── classic 与 stream 共享的失败归并 ─────────────────────────────
