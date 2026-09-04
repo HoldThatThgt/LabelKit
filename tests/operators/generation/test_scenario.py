@@ -1082,6 +1082,47 @@ def test_declared_counterfactual_suffixes_overlap_after_baseline(
     assert tuple(trace.variant_name for trace in traces) == plan.delivery_slots[0].variant_names
 
 
+def test_declared_branch_events_wait_for_prior_state_and_history(
+    declared_config, declared_program, monkeypatch,
+):
+    """同一 branch 的下一事件必须等待前一事件提交 state 与 history。"""
+    plan = compile_scenario_plan(declared_program)
+    services, _engine, _metrics = _services(declared_config)
+    original_plan = scenario_module._plan_validated_event
+    original_render = scenario_module._render_draft
+    target = "confirmation_before_acknowledgement"
+    plan_indices: list[int] = []
+    first_rendered = False
+    first_state_after: str | None = None
+
+    async def guarded_plan(context, attempt_index, nonce, call_services):
+        if context.variant_name == target:
+            plan_indices.append(context.event_index)
+            if context.event_index == 1:
+                await asyncio.sleep(0)
+            elif context.event_index == 2:
+                assert first_rendered
+                assert len(context.history) == 2
+                assert canonical_json(context.current_state) == first_state_after
+        return await original_plan(context, attempt_index, nonce, call_services)
+
+    async def guarded_render(context, planned, event_plan, execution, render):
+        nonlocal first_rendered, first_state_after
+        draft = await original_render(context, planned, event_plan, execution, render)
+        if context.variant_name == target and context.event_index == 1:
+            first_state_after = canonical_json(execution.state_after)
+            first_rendered = True
+        return draft
+
+    monkeypatch.setattr(scenario_module, "_plan_validated_event", guarded_plan)
+    monkeypatch.setattr(scenario_module, "_render_draft", guarded_render)
+    asyncio.run(generate_slot_traces(
+        declared_program, plan, plan.delivery_slots[0], 0, services,
+    ))
+
+    assert plan_indices == [1, 2]
+
+
 def test_declared_baseline_acceptance_precedes_all_suffix_work(
     declared_config, declared_program, monkeypatch,
 ):
@@ -1213,14 +1254,16 @@ def test_declared_suffix_fatal_cancels_and_settles_siblings(
         finally:
             cleaned += 1
 
-    monkeypatch.setattr(scenario_module, "_generate_variant", fail_one)
-    with pytest.raises(RuntimeError) as caught:
-        asyncio.run(generate_slot_traces(
-            declared_program, plan, plan.delivery_slots[0], 0, services,
-        ))
+    async def run_and_assert_cleanup():
+        with pytest.raises(RuntimeError) as caught:
+            await generate_slot_traces(
+                declared_program, plan, plan.delivery_slots[0], 0, services,
+            )
+        assert caught.value is fatal
+        assert started == 3 and cleaned == 3
 
-    assert caught.value is fatal
-    assert started == 3 and cleaned == 3
+    monkeypatch.setattr(scenario_module, "_generate_variant", fail_one)
+    asyncio.run(run_and_assert_cleanup())
 
 
 def test_declared_suffix_recoverable_uses_variant_declaration_order(

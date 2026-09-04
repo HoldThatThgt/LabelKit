@@ -70,6 +70,6 @@ git diff --check
 ```
 
 离线基线为 2157 tests；v1.18 历史门为 2610 passed、47 deselected。当前 v1.21 加并发修复的离线套件为
-3025 passed、48 deselected；本轮 19/19 个修改函数进入，四个修改文件最低 line 90.58%、最低 branch 81.00%。
+3026 passed、48 deselected；本轮 19/19 个修改函数进入，四个修改文件最低 line 90.58%、最低 branch 81.00%。
 真实 LLM 测试不使用 mock server、
 mock transport、录制响应或本地替身。实现必须先服从 spec 与 `docs/CONTRACTS.md`，再由测试证明闭包。
