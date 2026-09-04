@@ -22,6 +22,7 @@
 | `llm.*.context_window` | int | 0 | v1.11 新增（V6/V26，3.9.5）：模型上下文窗口（token）。`0` = 未声明：该 profile 上下文预算关闭（行为与 v1.10 一致），被启用阶段引用时 M1 WARN 一次（3.1.4）。> 0 时须满足 `context_window > max_output_tokens + margin`，否则 CONFIG_ERROR（预算非正）；`margin = max(256, ceil(0.10 × context_window))`。**声明部署实效窗口，勿照抄文档（V26/[C-59]，`docs/dev/PROPOSAL-context-budget.md`）**：同名模型随部署差数倍（Together 版 glm-5.2 为 256K、vLLM 由 `--max-model-len` 决定），且文档说法可能与端点实况相悖（z.ai anthropic 路由实测：裸 `glm-5.2` 实效窗即 `input+max_tokens ≤ 2^20`，官方博客的 `[1m]` 后缀反被拒——E2E-FINDINGS #16）——窗口只能按部署实测或保守欠声明；**欠声明恒安全**（只多裁不溢出）。 |
 | `llm.*.temperature` | float | 0.0 | profile 级默认；生成阶段建议在 project.toml 用 generate.temperature 调高。 |
 | `llm.*.thinking` | str | 缺省 | v1.16：可选 `"enabled"` \| `"disabled"`；显式值在 OpenAI 兼容与 Anthropic 两种请求的顶层写为 `{"thinking": {"type": <value>}}`，缺省不写该字段以保持既有请求体形态。 |
+| `llm.*.extra_body` | table | `{}` | 仅 `openai_compatible` profile 可用：把 vLLM/OpenAI-compatible 扩展参数逐项合并到 `/chat/completions` 请求 JSON 顶层，配置节名 `extra_body` 本身不发送。值必须是 JSON-compatible TOML tree；`model`、`messages`、`max_tokens`、`temperature`、`response_format`、`thinking`、`stream` 与 `extra_body` 是 LabelKit 保留键，禁止覆盖。Anthropic profile、非 table、非 JSON 值或保留键冲突均为 CONFIG_ERROR。缺省为空时请求体与既有形态完全相同；该表作用于普通调用、repair、sequence、重试与 `validate --probe` 共用的每一次 chat-completions 请求，不作用于 `[embedding.*]`。 |
 | `llm.*.max_image_px` | int | 2048 | 图像长边上限，超出等比缩小（3.9.3）。v1.11 语义升格（V18/V27③，3.9.5）：**升级天花板 + provider 像素制硬限制域**——V21 判审升级路径的分辨率上探以本键封顶；像素是运载意图与 provider 硬限制（带宽/载荷；Anthropic 的 8000px 与 >20 图 ∧ >2000px 硬拒本身是像素制）的控制面。[C-62] 记载：gpt-5.6 级 openai 后端默认 `detail` 等效 `original`（服务端不再隐式钳制图片 token），本键与 `default_image_px` 因此成为该类后端**唯一的客户端成本闸**。 |
 | `llm.*.default_image_px` | int | 0 | v1.11 新增（V18，3.9.5）：图片采样**默认工作点**（长边 px）。`0` = 沿用 `max_image_px`（v1.10 行为逐字节不变）。> 0 时须 ≤ `max_image_px`（CONFIG_ERROR，3.1.4）；V21 升级路径可上探至 `max_image_px`。 |
 | `llm.*.price_per_mtok_in / _out` | float | 可选 | 每百万 token 单价；配置后报告输出成本估算。 |
@@ -80,6 +81,11 @@ context_window = 131072             # v1.11 上下文预算（0/缺省 = 关；�
 # default_image_px = 1092           # v1.11 图片采样工作点（0/缺省 = 沿用 max_image_px；须 ≤ max_image_px）
 price_per_mtok_in = 0.6
 price_per_mtok_out = 1.8
+
+[llm.default.extra_body]            # 可选：逐项平铺进 /chat/completions 请求 JSON 顶层
+top_k = 50
+min_p = 0.05
+chat_template_kwargs = { enable_thinking = false }
 
 [llm.judge]                         # 独立评审模型（避免自增强偏差, 3.7.2）
 provider = "anthropic"

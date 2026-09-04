@@ -80,6 +80,19 @@ event loop，并补同 branch state/history 串行 oracle；重审后该变异�
 最终合计为 31 killed、0 survived、0 invalid、0 inconclusive，implementation missing 与 implementation diverged
 均为 0。审查未修改测试或文档；probe、scenario、stitch worktree 最终均回到各自 baseline commit 且 status 为空。
 
+## 2026-09-04 vLLM extra_body 证据
+
+`[llm.<name>.extra_body]` 仅为 OpenAI-compatible chat-completions profile 提供 JSON 顶层扩展字段。配置装载必须拒绝
+Anthropic、非 JSON 值与 LabelKit 保留键冲突；缺省空表必须维持既有请求体，显式扩展必须在普通调用与 probe 共用的
+请求构造器中平铺，不能发送 `extra_body` 包裹字段。
+
+| 证据面 | 当前状态 | 已知事实 / 输入边界 |
+|---|---|---|
+| 配置与请求体离线回归 | 已验证 | 配置与 LLM client 定向套件 550 passed；完整 offline suite 3043 passed、48 deselected，用时 558.70 秒 |
+| changed production coverage | 已验证 | 5/5 个修改函数进入；3 个修改文件最低 line 92.61%、最低 branch 91.74% |
+| Uncle Bob mutation review | 阻断 | `[PENDING-EVIDENCE:vllm-extra-body-bob-review]`；技能要求调用方工作树来自 clean commit，当前功能尚未获提交授权，未自动 commit/stash |
+| 真实 vLLM endpoint | 待运行 | `[PENDING-EVIDENCE:vllm-extra-body-real-endpoint]`；未用纯函数请求体断言冒充服务端接收证据 |
+
 ## v1.21 序列交织证据看板
 
 本节记录 2026-08-28 当前 checkout 的权重选择、partner pool、真实交织布局、报告、规模与本地真实模型证据。

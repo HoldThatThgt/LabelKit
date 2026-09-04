@@ -583,7 +583,8 @@ def _build_openai_body(profile: LLMProfile, prompt: PromptBundle,
                        response_schema: dict | None) -> dict:
     """装配 POST {base_url}/chat/completions 的请求体。图像编码为 image_url 的 data URI；
     结构化输出 = response_format json_schema strict（spec 3.9.3 / 3.9.4 ①）。图像字节在
-    **此处**（请求装配时）惰性加载，且只存在于返回的请求体内。
+    **此处**（请求装配时）惰性加载，且只存在于返回的请求体内。profile.extra_body 的
+    JSON entries 直接平铺进顶层；M1 已拒绝保留键冲突。
 
     @param profile 目标剖面
     @param prompt 消息束
@@ -607,12 +608,13 @@ def _build_openai_body(profile: LLMProfile, prompt: PromptBundle,
                     content.append({"type": "image_url",
                                     "image_url": {"url": f"data:{media_type};base64,{b64}"}})
         messages.append({"role": msg.role, "content": content})
-    body: dict = {
+    body: dict = dict(profile.extra_body)
+    body.update({
         "model": profile.model,
         "temperature": _resolve_temperature(profile, prompt),
         "max_tokens": profile.max_output_tokens,
         "messages": messages,
-    }
+    })
     if response_schema is not None and profile.supports_structured_output:
         body["response_format"] = {
             "type": "json_schema",

@@ -310,6 +310,24 @@ def test_openai_schema_ignored_without_structured_support():
     assert "response_format" not in body
 
 
+def test_openai_extra_body_is_flattened_into_request_top_level():
+    prof = _llm_profile(extra_body={
+        "top_k": 50,
+        "min_p": 0.05,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }, thinking="disabled")
+    prompt = PromptBundle(messages=(
+        Message(role="user", parts=(Part(kind="text", text="hi"),)),))
+    body = _build_openai_body(prof, prompt, response_schema=SCHEMA)
+    assert body["top_k"] == 50
+    assert body["min_p"] == 0.05
+    assert body["chat_template_kwargs"] == {"enable_thinking": False}
+    assert body["thinking"] == {"type": "disabled"}
+    assert body["response_format"]["json_schema"]["schema"] == SCHEMA
+    assert json.loads(json.dumps(body))["chat_template_kwargs"] == {"enable_thinking": False}
+    assert "extra_body" not in body
+
+
 @pytest.mark.parametrize("thinking", ["enabled", "disabled"])
 def test_openai_thinking_is_explicit_top_level_field(thinking):
     prof = _llm_profile(thinking=thinking)
@@ -1495,7 +1513,7 @@ def test_probe_same_named_profiles_uses_exact_resource_kind(monkeypatch):
 
 
 def test_probe_client_narrows_profile_to_one_key_and_shares_pool():
-    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"))
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"), extra_body={"top_k": 50})
     client = _client({"default": prof}, {"embed": _embedding_profile()},
                        _creds())
     child = client._probe_client(_ProbeTarget(
@@ -1505,6 +1523,7 @@ def test_probe_client_narrows_profile_to_one_key_and_shares_pool():
     assert narrowed.api_key_envs == ("KEY_B",)      # v1.17: 只收窄 env 名
     assert narrowed.api_key_env == "KEY_B"
     assert narrowed.max_output_tokens == 1          # 1 token 活体调用
+    assert narrowed.extra_body == {"top_k": 50}    # 探针保留同一扩展请求体
     assert child._embedding_profiles == {}
     assert child._http_client is client._http()     # 共享连接池
     assert child._resources is client._resources    # 共享资源限制器

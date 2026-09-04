@@ -160,6 +160,7 @@ def test_happy_path_defaults(env):
     assert cfg.llm_profiles["default"].max_concurrency == 8
     assert cfg.llm_profiles["default"].provider == "openai_compatible"
     assert cfg.llm_profiles["default"].thinking is None
+    assert cfg.llm_profiles["default"].extra_body == {}
     # resolution duties
     assert cfg.quality.rubric == "default:text"        # auto by modality
     assert cfg.rubric.name == "default-text-v1"
@@ -198,6 +199,105 @@ def test_llm_thinking_rejects_unknown_value(env):
     )
     errors = env.errors(config_text=config)
     has(errors, '[llm.default].thinking: expected "enabled" | "disabled", got "automatic"')
+
+
+def test_llm_extra_body_accepts_and_deep_freezes_json_table(env):
+    config = BASE_CONFIG.replace(
+        'supports_structured_output = true\n',
+        'supports_structured_output = true\n'
+        'extra_body = { top_k = 50, min_p = 0.05, stop_token_ids = [1, 2], '
+        'chat_template_kwargs = { enable_thinking = false } }\n',
+        1,
+    )
+    profile = env.load(config_text=config).llm_profiles["default"]
+    assert profile.extra_body == {
+        "top_k": 50,
+        "min_p": 0.05,
+        "stop_token_ids": (1, 2),
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    with pytest.raises(TypeError, match="frozen JSON mapping"):
+        profile.extra_body["top_k"] = 40
+    with pytest.raises(TypeError, match="frozen JSON mapping"):
+        profile.extra_body["chat_template_kwargs"]["enable_thinking"] = True
+
+
+def test_llm_extra_body_accepts_nested_toml_table(env):
+    config = BASE_CONFIG.replace(
+        "\n[llm.judge]",
+        "\n[llm.default.extra_body]\n"
+        "top_k = 40\n"
+        "chat_template_kwargs = { enable_thinking = false }\n\n"
+        "[llm.judge]",
+        1,
+    )
+    assert env.load(config_text=config).llm_profiles["default"].extra_body == {
+        "top_k": 40,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+
+
+@pytest.mark.parametrize("body", ["{}", "{ top_k = 50 }"])
+def test_llm_extra_body_rejects_anthropic_profile(env, body):
+    config = BASE_CONFIG.replace(
+        "[llm.judge]\n",
+        f"[llm.judge]\nextra_body = {body}\n",
+        1,
+    )
+    errors = env.errors(config_text=config)
+    has(errors, '[llm.judge].extra_body: supported only for provider "openai_compatible"')
+
+
+def test_llm_extra_body_rejects_non_table(env):
+    config = BASE_CONFIG.replace(
+        'supports_structured_output = true\n',
+        'supports_structured_output = true\nextra_body = 3\n',
+        1,
+    )
+    errors = env.errors(config_text=config)
+    has(errors, "[llm.default].extra_body: expected table, got 3")
+
+
+@pytest.mark.parametrize(
+    ("declaration", "location"),
+    [
+        ("deadline = 2026-09-04T12:00:00Z", "deadline"),
+        ("penalties = [0.1, 2026-09-04T12:00:00Z]", "penalties[2]"),
+        ("top_p = nan", "top_p"),
+    ],
+)
+def test_llm_extra_body_rejects_non_json_value(env, declaration, location):
+    config = BASE_CONFIG.replace(
+        'supports_structured_output = true\n',
+        'supports_structured_output = true\n'
+        f'extra_body = {{ {declaration} }}\n',
+        1,
+    )
+    errors = env.errors(config_text=config)
+    has(errors, f"[llm.default].extra_body.{location}: expected JSON-compatible value")
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "model",
+        "messages",
+        "max_tokens",
+        "temperature",
+        "response_format",
+        "thinking",
+        "stream",
+        "extra_body",
+    ],
+)
+def test_llm_extra_body_rejects_reserved_request_key(env, key):
+    config = BASE_CONFIG.replace(
+        'supports_structured_output = true\n',
+        f'supports_structured_output = true\nextra_body = {{ {key} = "override" }}\n',
+        1,
+    )
+    errors = env.errors(config_text=config)
+    has(errors, f"[llm.default].extra_body.{key}: reserved request key cannot be overridden")
 
 
 def test_digests_are_sha256_of_raw_bytes(env):

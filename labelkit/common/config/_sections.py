@@ -7,6 +7,7 @@ spec 3.1.4 的表行次序对齐。
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+import math
 from pathlib import Path
 import re
 from typing import Any, Literal
@@ -65,6 +66,16 @@ _SEQUENCE_GENERATE_KEYS = (
     "pattern", "counterfactual_sets", "instruction_only", "interleaving", "timeline",
     "calendar_window", "noise",
 )
+_OPENAI_EXTRA_BODY_RESERVED_KEYS = frozenset({
+    "model",
+    "messages",
+    "max_tokens",
+    "temperature",
+    "response_format",
+    "thinking",
+    "stream",
+    "extra_body",
+})
 
 
 @dataclass(frozen=True)
@@ -253,10 +264,11 @@ def _parse_llm_profile(col: _Collector, file: str, name: str, data: dict) -> LLM
     """
     t = _Tbl(col, file, f"[llm.{name}]", data)
     key_envs = _parse_key_envs(col, t, data)
+    provider = t.get_str("provider", "openai_compatible", required=True,
+                         enum=("openai_compatible", "anthropic"))
     prof = LLMProfile(
         name=name,
-        provider=t.get_str("provider", "openai_compatible", required=True,
-                           enum=("openai_compatible", "anthropic")),
+        provider=provider,
         base_url=t.get_str("base_url", "", required=True, nonempty=True) or "",
         model=t.get_str("model", "", required=True, nonempty=True) or "",
         api_key_env=key_envs[0] if key_envs else "",
@@ -271,6 +283,7 @@ def _parse_llm_profile(col: _Collector, file: str, name: str, data: dict) -> LLM
         context_window=t.get_int("context_window", 0, minimum=0),
         temperature=t.get_float("temperature", 0.0, bound=_GE0),
         thinking=t.get_str("thinking", None, enum=("enabled", "disabled")),
+        extra_body=_parse_llm_extra_body(col, t, provider),
         max_image_px=t.get_int("max_image_px", 2048, minimum=1),
         default_image_px=t.get_int("default_image_px", 0, minimum=0),
         price_per_mtok_in=t.get_float("price_per_mtok_in", None, bound=_GE0),
@@ -279,6 +292,57 @@ def _parse_llm_profile(col: _Collector, file: str, name: str, data: dict) -> LLM
     t.finish()
     _check_llm_budget_keys(col, file, prof)
     return prof
+
+
+def _validate_extra_body_value(col: _Collector, location: str, value: object) -> bool:
+    """递归校验一棵 ``extra_body`` TOML tree 是否可直接编码为 JSON。
+
+    @param col 错误聚合器
+    @param location 当前值的配置定位
+    @param value 待校验值
+    @return 全树可编码时为 true
+    """
+    if value is None or isinstance(value, (str, bool, int)):
+        return True
+    if isinstance(value, float):
+        if math.isfinite(value):
+            return True
+    elif isinstance(value, dict):
+        valid = True
+        for key, item in value.items():
+            valid = _validate_extra_body_value(col, f"{location}.{key}", item) and valid
+        return valid
+    elif isinstance(value, list):
+        valid = True
+        for index, item in enumerate(value, 1):
+            valid = _validate_extra_body_value(col, f"{location}[{index}]", item) and valid
+        return valid
+    col.error(f"{location}: expected JSON-compatible value, got {_fmt(value)}")
+    return False
+
+
+def _parse_llm_extra_body(col: _Collector, t: _Tbl, provider: str) -> dict[str, object]:
+    """解析并校验 OpenAI-compatible profile 的扩展请求字段。
+
+    @param col 错误聚合器
+    @param t 当前 LLM profile 的表读取器
+    @param provider 已解析的协议族
+    @return 合法扩展表；缺省或非法时为空表
+    """
+    raw = t.take("extra_body")
+    if raw is _MISSING:
+        return {}
+    supported = provider == "openai_compatible"
+    if not supported:
+        col.error(f'{t.loc("extra_body")}: supported only for provider "openai_compatible"')
+    if not isinstance(raw, dict):
+        t.err("extra_body", "table", raw)
+        return {}
+    valid = _validate_extra_body_value(col, t.loc("extra_body"), raw)
+    conflicts = sorted(_OPENAI_EXTRA_BODY_RESERVED_KEYS.intersection(raw))
+    for key in conflicts:
+        col.error(f"{t.loc('extra_body')}.{key}: reserved request key cannot be overridden")
+    return raw if supported and valid and not conflicts else {}
 
 
 def _check_llm_budget_keys(col: _Collector, file: str, prof: LLMProfile) -> None:

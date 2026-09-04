@@ -8,6 +8,7 @@ from labelkit.common.config.generation import (
     SequenceClassGenerationConfig,
     SequenceGenerationConfig,
 )
+from labelkit.common.config._temporal import freeze_json
 
 if TYPE_CHECKING:
     from labelkit.common.extensions.hooks import ValidationHooks
@@ -79,6 +80,9 @@ class LLMProfile:
     thinking: Literal["enabled", "disabled"] | None = None
                                                   # v1.16：两种 provider 的顶层 thinking 开关；
                                                   # None = 不写请求字段，保持既有请求体形态
+    extra_body: Mapping[str, object] = field(default_factory=dict)
+                                                  # OpenAI-compatible/vLLM 扩展请求字段；
+                                                  # M1 校验后递归冻结，发送时平铺到 JSON 顶层
     max_image_px: int = 2048                      # 图片长边像素**上限**（V21 升档天花板）
     default_image_px: int = 0                     # v1.11（V18）：图片采样默认**工作点**
                                                   # （长边像素）。0 = 取 max_image_px
@@ -95,6 +99,13 @@ class LLMProfile:
                                                   # profile 只保存环境变量**名**——
                                                   # 密钥值由 run/probe 期的
                                                   # RuntimeCredentials 物化，绝不入配置
+
+    def __post_init__(self) -> None:
+        """递归冻结 ``extra_body`` 的 JSON 容器。
+
+        @return None
+        """
+        object.__setattr__(self, "extra_body", freeze_json(self.extra_body))
 
 
 @dataclass(frozen=True)

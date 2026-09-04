@@ -1057,6 +1057,12 @@ class LLMProfile:
                                                   # None omits the request field; explicit values
                                                   # become top-level {"thinking": {"type": ...}}
                                                   # on both provider request formats.
+    extra_body: Mapping[str, object] = field(default_factory=dict)
+                                                  # OpenAI-compatible/vLLM extensions, deep-frozen
+                                                  # at construction and merged directly into the
+                                                  # chat-completions JSON top level. M1 rejects
+                                                  # Anthropic use, non-JSON values and reserved-key
+                                                  # collisions; empty preserves the old body.
     max_image_px: int = 2048
     default_image_px: int = 0                     # v1.11 (V18): default image sampling WORKING
                                                   # POINT (long edge px). 0 = use max_image_px
@@ -3671,7 +3677,12 @@ class LLMClient:
 Provider adaptation (normative, 3.9.3): `openai_compatible` POST `{base_url}/chat/completions`;
 images `{"type":"image_url","image_url":{"url":"data:<media>;base64,<b64>"}}`; structured output
 `response_format={"type":"json_schema","json_schema":{"name":"user_schema","strict":true,
-"schema":<schema>}}`. `anthropic` POST `{base_url}/v1/messages` with `x-api-key` +
+"schema":<schema>}}`. For an `openai_compatible` profile, each `extra_body` entry is merged directly
+into that JSON top level on every body build, including retries and `validate --probe`; no nested
+`extra_body` field is sent. M1 accepts only a JSON-compatible table and rejects Anthropic use plus
+collisions with `model`, `messages`, `max_tokens`, `temperature`, `response_format`, `thinking`,
+`stream` or `extra_body`; the empty default preserves the prior request shape. `anthropic` POST
+`{base_url}/v1/messages` with `x-api-key` +
 `anthropic-version: 2023-06-01` **[FROZEN HERE]**; images `{"type":"image","source":
 {"type":"base64","media_type":...,"data":...}}`; structured output = single tool with the schema
 as `input_schema`, `tool_choice={"type":"tool","name":"emit"}`, and description

@@ -160,6 +160,37 @@ stateDiagram-v2
 | `supports_structured_output` | false | 声明该模型支持原生结构化输出。填 `true` 时，结构引擎启用结构化输出层：OpenAI 兼容口传 `response_format={"type":"json_schema",...}`，Anthropic 口用强制工具调用把 Schema 作为工具入参。**模型实际不支持却填 true** ⇒ 请求可能直接报 400。填 false 完全没问题——只是结构保证全部落到代码修复层（第 14 章），多花一点修复调用 |
 | `supports_vision` | false | 声明该模型能看图。**UI 模态下被引用的 profile 必须为 true**——这是启动时的硬校验（填 false 会退出码 2），因为跑到一半才发现模型看不了图，钱已经烧了。v1.8/v1.9 流模式（第 25、26 章）下这条校验有三处例外：`extract.llm` 所引 profile **恒**要求 true（每次摘取都看前后两帧截图）；`quality.llm` 反而**免除**要求（序列打分是纯文本，UI 模态也不看图）；`stitch.llm`（v1.9）同样**恒不**要求（缝合判定的证据是摘要卡，纯文本无图）。`segment.llm` v1.11 起**不在视觉必需集内**：分段窗口是否附图由所引 profile 的本键**自动推导**（所引 profile 支持视觉就自动附图，选 profile 即选能力；要纯文本裁决就把 `segment.llm` 指向纯文本 profile，第 25 章）。v1.12 帧粒度（第 25 章 25.6）再添两条：`frame.annotate.llm` 所引 profile 在 UI 模态且 `frame.annotate` 启用时**恒**要求 true（逐成员标注要看帧截图）；`frame.classify.llm` **永不**加入视觉必需集（判决仅凭成员摘要行，纯文本无图——可指向纯文本 profile 省成本） |
 
+### vLLM 扩展请求参数
+
+vLLM 在 OpenAI-compatible Chat API 之外还提供 `top_k`、`min_p`、`structured_outputs`、
+`chat_template_kwargs` 等扩展参数。把这些参数放进 profile 的 `extra_body` 表，LabelKit 会把表内字段直接平铺到
+`/chat/completions` 的 JSON 顶层：
+
+```toml
+[llm.local]
+provider = "openai_compatible"
+base_url = "http://127.0.0.1:8000/v1"
+model = "Qwen/Qwen3.5-4B"
+api_key_env = "LABELKIT_LOCAL_KEY"
+
+[llm.local.extra_body]
+top_k = 50
+min_p = 0.05
+chat_template_kwargs = { enable_thinking = false }
+```
+
+最终请求里会出现顶层 `"top_k": 50`、`"min_p": 0.05` 与 `"chat_template_kwargs": {...}`，不会出现
+`"extra_body": {...}` 包裹层。也可以把小配置写成内联表：
+
+```toml
+extra_body = { top_k = 50, min_p = 0.05 }
+```
+
+这张表仅对 `provider = "openai_compatible"` 的 LLM profile 生效，并覆盖该 profile 的普通调用、repair、sequence、
+重试与 `validate --probe`。它不适用于 Anthropic 或 embedding profile。值必须能直接表示成 JSON；TOML 日期时间等
+非 JSON 值会在启动时被拒绝。`model`、`messages`、`max_tokens`、`temperature`、`response_format`、`thinking`、
+`stream` 与 `extra_body` 由 LabelKit 管理，不能在表内覆盖；需要调整已有一等参数时，直接改 profile 对应字段。
+
 ### 生成参数
 
 | 键 | 默认 | 说明 |
