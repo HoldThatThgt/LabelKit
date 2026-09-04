@@ -1355,6 +1355,104 @@ def test_probe_all_pool_keys_overlap_but_results_keep_declaration_order(monkeypa
     assert [result.key_env for result in results] == ["KEY_A", "KEY_B", "KEY_C"]
 
 
+def test_probe_all_constructor_failures_become_ordered_results(monkeypatch):
+    """子客户端构造失败也必须落入 ProbeResult，而不是泄漏 ExceptionGroup。"""
+    for env_name, key in (("KEY_A", "ka"), ("KEY_B", "kb")):
+        monkeypatch.setenv(env_name, key)
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B"))
+    client = _client(
+        {"default": prof}, {}, _creds(llm={"default": ("ka", "kb")})
+    )
+
+    def fail_constructor(_target):
+        raise RuntimeError(f"construct-{_target.env}")
+
+    monkeypatch.setattr(client, "_probe_client", fail_constructor)
+    results = asyncio.run(client.probe_all(("llm", "default")))
+
+    assert [result.key_env for result in results] == ["KEY_A", "KEY_B"]
+    assert [result.error for result in results] == ["construct-KEY_A", "construct-KEY_B"]
+    assert all(result.ok is False for result in results)
+
+
+@pytest.mark.parametrize("mode", ["raise", "self_cancel"])
+def test_probe_all_child_cancellation_cleans_siblings(monkeypatch, mode):
+    """直接抛取消与 task 自取消都必须清理同池 siblings。"""
+    for env_name, key in (("KEY_A", "ka"), ("KEY_B", "kb"), ("KEY_C", "kc")):
+        monkeypatch.setenv(env_name, key)
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B", "KEY_C"))
+    client = _client(
+        {"default": prof}, {}, _creds(llm={"default": ("ka", "kb", "kc")})
+    )
+    all_started = asyncio.Event()
+    never = asyncio.Event()
+    cancelled = asyncio.CancelledError("key cancelled")
+    started = cleaned = 0
+
+    async def probe_one(target):
+        nonlocal started, cleaned
+        started += 1
+        if started == 3:
+            all_started.set()
+        try:
+            await asyncio.wait_for(all_started.wait(), timeout=1)
+            if target.env == "KEY_A":
+                if mode == "raise":
+                    raise cancelled
+                asyncio.current_task().cancel()
+                await asyncio.sleep(0)
+            await never.wait()
+        finally:
+            cleaned += 1
+
+    monkeypatch.setattr(client, "_probe_one", probe_one)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        asyncio.run(asyncio.wait_for(
+            client.probe_all(("llm", "default")),
+            timeout=2,
+        ))
+
+    if mode == "raise":
+        assert caught.value is cancelled
+    assert started == 3 and cleaned == 3
+
+
+def test_probe_all_external_cancellation_cleans_children(monkeypatch):
+    """父探针取消应沿结构化取消路径清理全部密钥任务。"""
+    for env_name, key in (("KEY_A", "ka"), ("KEY_B", "kb"), ("KEY_C", "kc")):
+        monkeypatch.setenv(env_name, key)
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B", "KEY_C"))
+    client = _client(
+        {"default": prof}, {}, _creds(llm={"default": ("ka", "kb", "kc")})
+    )
+    all_started = asyncio.Event()
+    never = asyncio.Event()
+    started = cleaned = 0
+
+    async def probe_one(_target):
+        nonlocal started, cleaned
+        started += 1
+        if started == 3:
+            all_started.set()
+        try:
+            await never.wait()
+        finally:
+            cleaned += 1
+
+    async def cancel_parent():
+        task = asyncio.create_task(client.probe_all(("llm", "default")))
+        await asyncio.wait_for(all_started.wait(), timeout=1)
+        task.cancel("probe parent cancelled")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert caught.value.args == ("probe parent cancelled",)
+
+    monkeypatch.setattr(client, "_probe_one", probe_one)
+    asyncio.run(cancel_parent())
+
+    assert started == 3 and cleaned == 3
+
+
 def test_probe_all_deduped_alias_keeps_first_declared_key_identity(monkeypatch):
     """同值别名坍缩后仍是声明层池，唯一结果保留首个 key_env。"""
     child = _ProbeChild()

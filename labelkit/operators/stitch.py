@@ -340,14 +340,15 @@ def build_stitch_prompt(thread_cards: Sequence[str], candidate_card: str,
 
 # ── 票数聚合（T18/M-4，纯逻辑）─────────────────────────────────────────────
 
-def aggregate_votes(samples: Sequence[Mapping]) -> Mapping | None:
+def aggregate_votes(samples: Sequence[Mapping], total_votes: int) -> Mapping | None:
     """在完整的 (verdict, thread_ref) 判决键上取严格多数（M-4）。
 
-    某个键的计数严格超过 n/2 即获胜，并整体返回该多数簇的**首个**样本
+    某个键的计数严格超过原始 n/2 即获胜，并整体返回该多数簇的**首个**样本
     （task_name/reason 随之带出）。任何不足严格多数的分裂——包括 verdict 占多数但
     thread_ref 分裂——一律返回 None（调用方回退到保守结果：episode → new，rescue → 漏缝）。
 
     @param samples 同一提示词的多次采样结果
+    @param total_votes 原始采样总数，包含因结构违规而弃权的样本
     @return 获胜样本；无严格多数或样本为空时为 None
     """
     if not samples:
@@ -359,7 +360,7 @@ def aggregate_votes(samples: Sequence[Mapping]) -> Mapping | None:
         counts[key] = counts.get(key, 0) + 1
         first.setdefault(key, sample)
     best_key, best_n = max(counts.items(), key=lambda kv: kv[1])
-    if best_n * 2 > len(samples):
+    if best_n * 2 > total_votes:
         return first[best_key]
     return None
 
@@ -371,6 +372,13 @@ class _StitchFailure:
     """一个应由候选 reducer 处置的普通叶失败。"""
 
     error: Exception  # 原记录级异常。
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _StitchAbstention:
+    """一个因 SchemaViolation 弃权的投票叶结果。"""
+
+    error: SchemaViolation  # 原始结构违规。
 
 
 async def judge_stitch(thread_cards: Sequence[str], candidate_card: str,
@@ -423,8 +431,8 @@ def _reduce_stitch_samples(results: Sequence[object]) -> Mapping | None:
     samples: list[Mapping] = []
     last_violation: SchemaViolation | None = None
     for res in results:
-        if isinstance(res, SchemaViolation):
-            last_violation = res                   # 该样本弃权
+        if isinstance(res, _StitchAbstention):
+            last_violation = res.error             # 该样本弃权
         elif isinstance(res, _StitchFailure):
             raise res.error
         elif isinstance(res, BaseException):
@@ -435,18 +443,18 @@ def _reduce_stitch_samples(results: Sequence[object]) -> Mapping | None:
     if not samples:
         raise last_violation if last_violation is not None else SchemaViolation(
             ["stitch votes: all samples failed"], "")
-    return aggregate_votes(samples)
+    return aggregate_votes(samples, len(results))
 
 
 async def _sample_stitch(ctx: "RunContext", prompt: PromptBundle, schema: Mapping,
-                         scope: CallScope) -> tuple | _StitchFailure:
+                         scope: CallScope) -> tuple | _StitchAbstention | _StitchFailure:
     """执行一个不修改业务状态的投票叶任务。
 
     @param ctx 运行上下文
     @param prompt 冻结提示词
     @param schema stitch 输出 Schema
     @param scope 调用归属
-    @return 校验成功的完整调用结果，或待归并的普通异常
+    @return 校验成功的完整调用结果、弃权结果或待归并的普通异常
     """
     try:
         return await ctx.schema_engine.complete_validated(
@@ -454,6 +462,8 @@ async def _sample_stitch(ctx: "RunContext", prompt: PromptBundle, schema: Mappin
         )
     except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
         raise
+    except SchemaViolation as exc:
+        return _StitchAbstention(exc)
     except Exception as exc:
         return _StitchFailure(exc)
 

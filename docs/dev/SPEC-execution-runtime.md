@@ -296,9 +296,10 @@ Context 的 admitted leaf，不新增固定 worker 或 dispatcher。
 ### 7.3 协调协程作用域
 
 SequenceWorkflow 在 execution domain 内拥有根 coordinator TaskGroup。sequence 每个在途槽位由一个协调协程
-推进；declared baseline 完成后，generation operator 可创建只覆盖 sibling counterfactual suffix 的 branch-local
-TaskGroup。协调协程不计入叶任务接纳，也不直接取得 LLM/embedding 许可；每次真实调用仍逐次取得准确的
-ResourceManager 许可。任意逃逸
+推进；declared baseline 完成并通过 expected-violation 验收后，generation operator 可创建只覆盖 sibling
+counterfactual suffix 的 branch-local TaskGroup。该组直接收到 CancelledError 或 suffix task 自取消时，必须先取消并
+回收 siblings，再恢复原始 CancelledError。协调协程不计入叶任务接纳，也不直接取得 LLM/embedding 许可；每次真实
+调用仍逐次取得准确的 ResourceManager 许可。任意逃逸
 fatal 先由 coordinator wrapper 记录稳定身份，再触发 TaskGroup 取消所有 sibling coordinators；所有 cleanup 完成后
 按 `(phase declaration order, slot ordinal, attempt index, leaf declaration key)` 选择最小原始异常。
 
@@ -325,6 +326,7 @@ fatal 先由 coordinator wrapper 记录稳定身份，再触发 TaskGroup 取消
 | 叶任务逃逸 CircuitBreakerTripped | 取消当前任务组、等待 cleanup、原样交回工作流属主 |
 | 外部取消 | 停止接纳、取消所有已创建任务、等待 cleanup、重抛 CancelledError |
 | coordinator fatal | 取消所有 sibling coordinators 与其叶任务 |
+| branch/probe child 主动取消 | 转为内部结构化终止，取消并回收 siblings 后恢复原始 CancelledError |
 | coordinator recoverable attempt failure | 作为普通结果交给声明序提交协调器 |
 
 ## 8. ResourceManager 与 transport
@@ -445,8 +447,9 @@ flowchart TB
 ```
 
 - 同一 branch 的事件按 state_after 依赖串行；不同 slot 并发。
-- declared baseline 完成后，不同 counterfactual suffix 由 branch coordinator 结构化并发；完整 branch 不冒充某个
-  profile 的单一叶任务。结果与可恢复失败按 variant 声明序归并；fatal/control 等待 sibling cleanup 后原样传播。
+- declared baseline 完成并通过 expected-violation 验收后，不同 counterfactual suffix 由 branch coordinator
+  结构化并发；完整 branch 不冒充某个 profile 的单一叶任务。结果与可恢复失败按 variant 声明序归并；suffix
+  直接取消、自取消、fatal 与 control 都先等待 sibling cleanup，再恢复原始异常。
 - quality → annotate → verify 的业务屏障不删除；前一 gate 拒绝后不支付后续 gate。
 - 不同 attempt 使用不同 PipelineItem；同一 attempt 内共享 item 的叶调用必须返回纯 outcome 后归并。
 - 高 ordinal 的 recoverable failure 提前完成后只保留结果，不自行重试或写报告。
@@ -693,7 +696,9 @@ dataset 与工件事件按归并/提交时序。
   `RunServices.tasks` 身份构造唯一惰性 ExecutionRuntime，但不进入 execution domain、不创建 leaf，也不构造
   HTTP client。
 - `validate --probe` 构造 ResourceManager 与 LLMClient，以精确 ResourceKey 区分同名 LLM 与
-  embedding profile，通过相同资源许可与 origin pool 执行，并在 finally 关闭。
+  embedding profile。全部被引用 profile 与各 profile 的池内密钥分别结构化并发，通过相同资源许可与 origin pool
+  执行，并按 `(LLM, embedding, profile, key)` 声明序归并。子客户端构造与普通 provider 失败成为 ProbeResult；
+  key/profile 直接取消或 task 自取消时先回收 siblings，再恢复原始 CancelledError；finally 关闭根客户端。
 - live run 在 ResolvedConfig、GenerationProgram 与 ScenarioPlan 冻结后构造 runtime。
 - Application 是唯一 composition root，并在所有成功、错误与 cancellation 路径关闭 LLMClient。
 - CLI 参数、退出码、partial delivery 与信号边界保持既有契约。
@@ -926,13 +931,14 @@ dataset 与工件事件按归并/提交时序。
 | origin 聚合 | LLM/embedding/repair/probe 同 origin 聚合，不同 origin 独立 |
 | repair 切 profile | A=600 叶任务进入 B=1 repair 时 B active≤1，且 B lane 可独立接纳 |
 | 生命周期关闭 | run/probe 成功、失败、取消及主异常+close failure 都保持优先级并恰好关闭一次 |
+| probe 两层并发 | 三个 profile 与三把 pool key 分别同时在途、结果声明序；构造失败成为结果；直接取消、自取消与外部取消均回收 siblings 并恢复 CancelledError |
 
 ### 20.2 普通标记
 
 | 阶段 | 必须证明 |
 |---|---|
 | segment | 窗口反序完成仍按 session/span 归并 |
-| stitch | 同会话前一候选决定后一 prompt/pool；不同会话当前候选的 vote samples 在同一 wave 并发且按输入序归并 |
+| stitch | 同会话前一候选决定后一 prompt/pool；不同会话 pass-1/repass 当前候选真重叠；一个 wave 的全部 votes 只提交一个 TaskGroupRequest；judge 事件按会话声明序；SchemaViolation 单票弃权但原始 n 分母不变、全弃权抛最后声明违规 |
 | dedup | participating embedding 真实并发；exact twins、semantic twins、低槽 failure 反序仍 input-order first-writer |
 | classify | samples 与 frame windows 分阶段；fanout 按 item×label 声明序 |
 | extract | transition 反序完成仍按 member ordinal，episode all-or-none |
@@ -951,7 +957,7 @@ dataset 与工件事件按归并/提交时序。
 |---|---|
 | 全 attempt 跨槽并发 | quality/annotate/verify 的不同槽调用真实重叠 |
 | 同槽状态串行 | event N+1 不得早于 N 的 state_after |
-| 同槽 suffix 并发 | baseline 后至少三个 counterfactual suffix 同时在途，结果与 recoverable failure 按 variant 声明序归并 |
+| 同槽 suffix 并发 | baseline 验收失败时 suffix 调用数为零；通过后至少三个 suffix 同时在途，结果与 recoverable failure 按 variant 声明序；直接取消、自取消与外部取消均先清理 siblings |
 | 声明序 commit | 六百槽反向完成仍严格零至五百九十九 |
 | 高槽失败延迟记账 | 高槽先拒绝、低槽耗尽时报告不含高槽 rejection |
 | reservation 失败优先级 | 高槽 quality failure、低槽后提交同内容时，高槽轮到后先记 dedup |
@@ -982,7 +988,9 @@ dataset 与工件事件按归并/提交时序。
   HTTP pool 退回默认、repair 错计首轮 lane、ordinary semantic dedup 重新串行化、dedup 按完成序 commit、unused
   speculative outcome 污染索引、dedup 不重验证、CrossView 前缀重扫、quality 按完成序写 error、verify leaf 写共享
   claim、ordinary ProviderFatal 升级为 runtime fatal、frame annotate OR gate 回退、generated child 再进 generate、
-  RunServices/task identity 断裂与 sequence 越序 commit。
+  probe 构造失败逃逸与 key/profile 主动取消漏清理、baseline 验收移到 suffix 之后、suffix 主动取消漏清理、stitch
+  SchemaViolation 不弃权或弃权后缩小原始分母、pass-1/repass 跨会话重新串行化、vote wave 拆组、session 逆序归并、RunServices/task
+  identity 断裂与 sequence 越序 commit。
 
 ## 21. 性能与真实模型验收
 

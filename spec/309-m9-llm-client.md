@@ -50,7 +50,9 @@ class LLMClient:
            ResourceKey 和 ProbeResult.kind 保证同名 llm/embedding profile 仍是两个独立探测目标。
            validate --probe 还会结构化并发全部被引用 profile；输出仍按 (LLM, embedding, profile,
            key) 声明序归并。全部真实调用继续受 profile 与 HTTP origin 许可约束。成本 = 各被引用
-           profile 池大小之和 次探测调用。"""
+           profile 池大小之和 次探测调用。普通子客户端构造或 provider 失败成为对应 ProbeResult；
+           密钥探针直接抛 CancelledError 或 task 自取消时，先取消并回收 sibling，再恢复原始
+           CancelledError；外部取消沿同一 cleanup 边界传播。"""
     async def aclose(self) -> None
         """仅根客户端拥有关闭权；幂等关闭共享 AsyncClient，实际关闭恰好一次。"""
     @property

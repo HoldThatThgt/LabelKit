@@ -3620,7 +3620,8 @@ class LLMClient:
 
     async def probe(self, resource_key: ResourceKey) -> ProbeResult:
         """validate --probe: minimal 1-token live call (llm profiles) or 1-text embed
-        (embedding profiles). Never raises; failures land in ProbeResult.error.
+        (embedding profiles). Ordinary construction/provider failures never raise and land in
+        ProbeResult.error; cancellation and language control exceptions retain their semantics.
         Pooled profiles: probes the first key. ResourceKey keeps same-named llm and
         embedding profiles distinct."""
 
@@ -3631,7 +3632,11 @@ class LLMClient:
         identity when both profile tables declare the same name. Used by `validate --probe` (§7.12);
         referenced profiles are also probed concurrently, while output remains in
         (llm, embedding, profile, key) declaration order. Resource and origin permits remain
-        authoritative. Cost = pool size probes per referenced profile. Never raises."""
+        authoritative. Cost = pool size probes per referenced profile. Ordinary failures become
+        ProbeResult rows, including child-client construction failures. A key probe that raises
+        CancelledError directly or cancels itself cancels and settles sibling key probes before
+        restoring the original CancelledError; external cancellation follows the same cleanup
+        boundary."""
 
     async def aclose(self) -> None:
         """幂等关闭根实例拥有的共享 AsyncClient；probe child 没有关闭权。
@@ -4466,7 +4471,10 @@ parsed overrides through, so `--console` reaches M1 and the jsonl × explicit-ri
 referenced profile (v1.6 — one line per key for pooled profiles; single-key output format
 unchanged). Referenced profiles and each profile's pool keys run concurrently under the same
 ResourceManager profile/origin limits; results are flattened in (llm, embedding, profile, key)
-declaration order. v1.10 (U13/U27): under `mode_resolved == "rich"` the probe result table is
+declaration order. Ordinary key construction/call failures become failed ProbeResult rows. A key
+or profile probe that raises CancelledError directly or cancels its own task cancels and settles
+its siblings before the original CancelledError leaves the probe boundary; external cancellation
+does the same. v1.10 (U13/U27): under `mode_resolved == "rich"` the probe result table is
 rendered as a table ONLY when stdout is a TTY — script consumers keep the current line
 format (stdout channel duty unchanged). Any probe failure does not change the exit code
 unless config itself is invalid
@@ -4941,8 +4949,10 @@ def build_stitch_prompt(thread_cards: Sequence[str], candidate_card: str,
 
 
 async def judge_stitch(thread_cards: Sequence[str], candidate_card: str, ctx: RunContext,
-                       record_ids: tuple[str, ...] = ()) -> Mapping | None:
+                       record_ids: tuple[str, ...],
+                       call_ordinal: tuple[int, int, int]) -> Mapping | None:
     """One candidate judgment through complete_validated(schema=stitch_schema(), §10.7).
+    call_ordinal freezes (session, pass, candidate); vote ordinal completes TaskSpec identity.
     votes == 1 (default): a single call. votes > 1 (T18): n concurrent samples of the SAME
     prompt, aggregated by aggregate_votes below; a SchemaViolation sample abstains while
     provider/internal errors escalate (the classify sc discipline); zero surviving samples
@@ -4950,12 +4960,13 @@ async def judge_stitch(thread_cards: Sequence[str], candidate_card: str, ctx: Ru
     winning judgment object, or None when votes split short of a strict majority."""
 
 
-def aggregate_votes(samples: Sequence[Mapping]) -> Mapping | None:
-    """T18/M-4 pure aggregation: strict majority (> n/2) over the COMPLETE
+def aggregate_votes(samples: Sequence[Mapping], total_votes: int) -> Mapping | None:
+    """T18/M-4 pure aggregation: strict majority (> original n/2) over the COMPLETE
     (verdict, thread_ref) judgment key; the FIRST sample of the winning cluster is returned
-    whole (task_name/reason travel with it). Any split short of a strict majority —
-    including a verdict majority whose thread_ref splits — returns None (the caller falls
-    back to the conservative outcome: episode → new, rescue → miss)."""
+    whole (task_name/reason travel with it). total_votes is the original sample count and
+    includes SchemaViolation abstentions. Any split short of a strict majority — including
+    a verdict majority whose thread_ref splits — returns None (the caller falls back to the
+    conservative outcome: episode → new, rescue → miss)."""
 
 
 def prior_hits(thread_members: Sequence[Record], fragment_tails: Sequence[Record],
@@ -6947,8 +6958,13 @@ includes all compact witnesses.
 
 #### 7.18.6 Delivery, replay and run terminal behavior
 
-SequenceWorkflow owns one coordinator TaskGroup inside the execution domain. The candidate window
-is the continuous declaration-order interval beginning at `next_commit`; its capacity is the sum
+SequenceWorkflow owns one root coordinator TaskGroup inside the execution domain. After a declared
+slot's baseline has completed and passed its expected-violation check, the generation operator may
+own one branch-local TaskGroup covering only that slot's independent counterfactual suffixes. The
+branch group never starts before baseline acceptance; direct child cancellation and task
+self-cancellation both cancel and settle sibling suffixes before restoring the original
+CancelledError. The candidate window is the continuous declaration-order interval beginning at
+`next_commit`; its capacity is the sum
 of distinct ResourceKey capacities referenced by the current phase, capped by remaining slots.
 One window permit is acquired before a coordinator is created and held across attempt preparation,
 PreparedCandidate/recoverable outcome, ordered wait and retry until that ordinal commits or the
@@ -7126,8 +7142,11 @@ after admission is InternalError, never retryable. Zero-origin static paths crea
 cancelled waiter contributes once and never consumes a permit.
 
 No `[runtime]`, workers, queue-size, thread-count or HTTP-pool setting exists. No production
-dependency is added. All production gathers are removed from operators; pure leaves use
-TaskExecutor and reducers mutate shared business state in frozen ordinal order.
+dependency is added. Ordinary pure-leaf concurrency uses TaskExecutor and reducers mutate shared
+business state in frozen ordinal order. The only operator-owned TaskGroup exception is the
+generation branch coordinator above: a complete suffix can span multiple sequential calls and
+profiles, so it is not a TaskSpec leaf; each real call still acquires its exact ResourceManager
+permit.
 
 #### 7.19.3 Lifecycle, determinism and evidence
 
@@ -7136,7 +7155,10 @@ single inert ExecutionRuntime required by the exact RunServices TaskExecutor ide
 execution domain, creates leaves or constructs AsyncClient.
 `validate --probe` creates ResourceManager and the root LLMClient, passes an exact ResourceKey for
 every referenced profile, uses the same profile/origin permits and closes in `finally`. Same-named
-LLM and embedding profiles are independent probe targets and their results retain `kind`. A live run
+LLM and embedding profiles are independent probe targets and their results retain `kind`.
+Referenced profiles and pool keys each use a bounded-lifetime TaskGroup: ordinary failures remain
+results, while direct/self cancellation settles siblings and restores the original cancellation.
+A live run
 constructs runtime only after config/program/plan
 freeze. Application is the only close owner. Root close is idempotent and physically once; normal
 close failure is InternalError, while a primary exception/cancellation remains primary after
@@ -9415,8 +9437,10 @@ its final full-Schema revalidation occur after M8 success and never enter L3.
    `probe`, `ProcessWorkflow.run`, `ExecutionRuntime.run` and `TaskExecutor.run_group` are
    asynchronous. Ordinary processing has one active batch and strict stage barriers. A stage
    synchronously plans immutable TaskSpec leaves, dispatches them through the shared TaskExecutor,
-   then reduces results in declaration order. Production operators submit concurrency only through
-   TaskExecutor.
+   then reduces results in declaration order. Production operators submit pure-leaf concurrency
+   through TaskExecutor. The sole exception is the declared-generation branch-local TaskGroup from
+   §7.18.6; it coordinates whole multi-call suffixes and never replaces per-call ResourceManager
+   admission.
 2. **Stages never remove items** — status flips only; `generate` returns a new list instead
    (the v1.7 multi-label fan-out exception: classify multi may tail-append; the v1.8
    segment-absorption exception: segment may tail-append sequence

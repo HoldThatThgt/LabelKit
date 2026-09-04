@@ -348,6 +348,85 @@ def test_probe_referenced_profiles_overlap_but_flatten_in_declaration_order(monk
     assert state.clients[0].close_calls == 1
 
 
+@pytest.mark.parametrize("mode", ["raise", "self_cancel"])
+def test_probe_referenced_profiles_child_cancellation_cleans_siblings(monkeypatch, mode):
+    """profile 子任务主动取消时，其他 profile 必须先完成 cleanup。"""
+    application, state, cfg = _install_graph(monkeypatch)
+    all_started = asyncio.Event()
+    never = asyncio.Event()
+    cancelled = asyncio.CancelledError("profile cancelled")
+    started = cleaned = 0
+
+    async def probe_all(self, resource_key):
+        nonlocal started, cleaned
+        self.probe_calls.append(resource_key)
+        started += 1
+        if started == 3:
+            all_started.set()
+        try:
+            await asyncio.wait_for(all_started.wait(), timeout=1)
+            if resource_key == ("llm", "a"):
+                if mode == "raise":
+                    raise cancelled
+                asyncio.current_task().cancel()
+                await asyncio.sleep(0)
+            await never.wait()
+        finally:
+            cleaned += 1
+
+    monkeypatch.setattr(application.LLMClient, "probe_all", probe_all)
+    real_run = asyncio.run
+    monkeypatch.setattr(
+        application.asyncio,
+        "run",
+        lambda coro: real_run(asyncio.wait_for(coro, timeout=2)),
+    )
+    with pytest.raises(asyncio.CancelledError) as caught:
+        application.probe_referenced_profiles(cfg)
+
+    if mode == "raise":
+        assert caught.value is cancelled
+    assert started == 3 and cleaned == 3
+    assert state.clients[0].close_calls == 1
+
+
+def test_probe_referenced_profiles_external_cancellation_cleans_and_closes(monkeypatch):
+    """父工作流取消必须清理全部 profile，并关闭根客户端恰一次。"""
+    application, state, _cfg = _install_graph(monkeypatch)
+    all_started = asyncio.Event()
+    never = asyncio.Event()
+    started = cleaned = 0
+
+    async def probe_all(self, resource_key):
+        nonlocal started, cleaned
+        self.probe_calls.append(resource_key)
+        started += 1
+        if started == 3:
+            all_started.set()
+        try:
+            await never.wait()
+        finally:
+            cleaned += 1
+
+    async def cancel_parent(client):
+        resource_keys = (("llm", "a"), ("llm", "b"), ("embedding", "e"))
+        task = asyncio.create_task(application._run_and_close(
+            client, lambda: application._probe_profiles(client, resource_keys), None,
+        ))
+        await asyncio.wait_for(all_started.wait(), timeout=1)
+        task.cancel("profile parent cancelled")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert caught.value.args == ("profile parent cancelled",)
+
+    monkeypatch.setattr(application.LLMClient, "probe_all", probe_all)
+    client = application.LLMClient()
+    asyncio.run(cancel_parent(client))
+
+    assert started == 3 and cleaned == 3
+    assert state.clients[0].close_calls == 1
+
+
 def test_probe_distinguishes_same_named_llm_and_embedding_profiles(monkeypatch):
     application, state, cfg = _install_graph(monkeypatch)
     cfg.embedding_profiles["a"] = _profile("a", "https://embed.example/v1", 3)

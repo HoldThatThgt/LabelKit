@@ -4,7 +4,7 @@ LabelKit 采集数据自动标注工具 — 产品设计说明书 v1.21
 
 | 文档版本 | v1.21 |
 |---|---|
-| 日期 | 2026-08-27 |
+| 日期 | 2026-09-04 |
 | 状态 | 实现规格 |
 | 目标读者 | 开发工程师、算法工程师、测试工程师 |
 | 文档定位 | 实现级设计规格 —— 开发者依据本文档即可完成实现，无需自行补全任何设计决策 |
@@ -28,3 +28,4 @@ LabelKit 采集数据自动标注工具 — 产品设计说明书 v1.21
 | v1.19 | 2026-08-23 | 新增普通标记与 sequence 共用的进程内 ExecutionRuntime：按 ResourceKey 全域有界接纳、TaskGroup 结构化取消、纯叶任务与声明序归并；`common/runtime` 物理改名为 `common/inference`，composition root、普通工作流与 sequence 工作流采用唯一新路径。普通 semantic dedup 投机并发 embedding 后按输入序重验证；sequence 以连续候选缓冲跨槽并发完整 attempt，使用 DedupReservation、candidate-local CrossView、增量 frontier 与一次最终 full reconcile，只有短声明序 commit 无 await。ResourceManager 同时冻结 profile 与 HTTP origin 容量，删除 HTTPX 隐式百连接上限；报告新增 runtime 等待与高水位。无旧模块、shim、migration、fallback 或第二执行分支。权威来源为 `docs/dev/SPEC-execution-runtime.md`、`docs/dev/SPEC-sequence-generation-redesign.md` 与 `docs/CONTRACTS.md`。 |
 | v1.20 | 2026-08-26 | 序列时间完整性破坏性升级：完整 Schema 以 `x-labelkit-business-time` 声明业务时间，M1 派生 model Schema 并要求 time binding 等集；Planner 统一冻结事件起点、时长、互斥资源、严格 containment 与 constant-shift replay；render/annotation 通过 generic finalizer 机械注入时间，M2 复验自描述 descriptor，M3 对去时载体只做 exact 判重；primary 与 replay 在同一 checked delta 原子提交，final reconcile 独立复验全局时间事实。Dataset-Person production constructor 全量迁移并删除 exporter 时间修复。无兼容、migration 或 fallback。权威来源为 `docs/dev/SPEC-sequence-temporal-integrity.md`。 |
 | v1.21 | 2026-08-27 | 序列交织配置破坏性升级：counterfactual set 使用短 candidate set 标签，命名 interleaving pattern 声明 trigger/partner 与整数权重；Planner 按 opportunity 抽取 none 或 pattern，从共享 partner pool 无偏不放回抽取并冻结两条 branch 的保序时间交织。用户不枚举 owner word；retry 不重抽；选中 pair 无可行布局即 fail-closed。旧 timeline `primary_sessions` / `crossed_primary_sessions` 与旧双序列会话契约已删除，session 计数由计划派生。无兼容、migration 或 fallback。唯一增量来源为 `docs/dev/SPEC-sequence-interleaving.md`。 |
+| v1.21 | 2026-09-04 | 并发行为修订：被引用 profile 与池内密钥分别结构化并发；stitch 不同会话的 pass-1/repass 当前候选组成单一 TaskExecutor wave；declared baseline 验收后 sibling counterfactual suffix 使用 branch-local TaskGroup。三条路径均按声明序归并，主动取消先回收 siblings 后恢复原始 CancelledError；probe 普通构造失败成为 ProbeResult，stitch SchemaViolation 单票弃权且不缩小原始多数分母。无配置、输出或兼容层变化。增量来源为 `docs/dev/SPEC-execution-runtime.md`、`docs/dev/SPEC-sequence-generation-redesign.md` 与 `docs/CONTRACTS.md`。 |

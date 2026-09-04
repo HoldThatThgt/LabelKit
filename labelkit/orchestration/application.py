@@ -11,7 +11,7 @@ import secrets
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Awaitable, Callable, TypeVar, cast
+from typing import TYPE_CHECKING, Awaitable, Callable, Sequence, TypeVar, cast
 
 import httpx
 
@@ -57,6 +57,98 @@ class _SequencePlanFailure(Exception):
         super().__init__(type(cause).__name__)
         self.program = program
         self.cause = cause
+
+
+class _ProfileProbeCancellation(Exception):
+    """把 profile 探针主动取消转换为可清理 siblings 的内部信号。"""
+
+    def __init__(self, ordinal: int, error: asyncio.CancelledError):
+        """保存声明序与原始取消对象。
+
+        @param ordinal profile 声明序号
+        @param error 原始取消对象
+        """
+        self.ordinal = ordinal
+        self.error = error
+        super().__init__("profile probe cancelled")
+
+
+def _flatten_profile_probe_group(group: BaseExceptionGroup) -> list[BaseException]:
+    """递归展开 profile 探针 TaskGroup 异常树。
+
+    @param group 待展开的异常组
+    @return 按异常树声明序排列的叶异常
+    """
+    leaves: list[BaseException] = []
+    for error in group.exceptions:
+        if isinstance(error, BaseExceptionGroup):
+            leaves.extend(_flatten_profile_probe_group(error))
+        else:
+            leaves.append(error)
+    return leaves
+
+
+def _unwrap_profile_probe_group(group: BaseExceptionGroup) -> BaseException:
+    """按 profile 声明序还原探针 TaskGroup 的原始取消。
+
+    @param group TaskGroup 抛出的异常组
+    @return 应向调用方还原的原始异常
+    """
+    leaves = _flatten_profile_probe_group(group)
+    cancellations = [leaf for leaf in leaves if isinstance(leaf, _ProfileProbeCancellation)]
+    if cancellations:
+        return min(cancellations, key=lambda failure: failure.ordinal).error
+    ordinary = [leaf for leaf in leaves if not isinstance(leaf, asyncio.CancelledError)]
+    if ordinary:
+        _log.error("profile probe task group raised an untracked exception")
+        return ordinary[0]
+    return asyncio.CancelledError()
+
+
+async def _probe_profile(client: LLMClient, resource_key: tuple[str, str],
+                         ordinal: int) -> "list[ProbeResult] | Exception":
+    """运行一个 profile 探针并保留普通异常身份。
+
+    @param client 根 LLM 客户端
+    @param resource_key profile 资源键
+    @param ordinal profile 声明序号
+    @return 探针结果列表或普通异常
+    """
+    try:
+        operation_task = asyncio.create_task(client.probe_all(resource_key))
+        return await operation_task
+    except asyncio.CancelledError as exc:
+        task = asyncio.current_task()
+        if task is None or task.cancelling() == 0:
+            raise _ProfileProbeCancellation(ordinal, exc) from None
+        raise
+    except Exception as exc:  # noqa: BLE001 —— 归并后按 profile 声明序还原
+        _log.error("profile probe failed: kind=%s profile=%s", *resource_key)
+        return exc
+
+
+async def _probe_profiles(client: LLMClient, resource_keys: Sequence[tuple[str, str]]) \
+        -> tuple["ProbeResult", ...]:
+    """并发探测全部 profile，并按声明序扁平化结果。
+
+    @param client 根 LLM 客户端
+    @param resource_keys 待探测的 profile 资源键
+    @return 按 profile 声明序扁平化的探测结果
+    """
+    tasks: list[asyncio.Task[list[ProbeResult] | Exception]] = []
+    try:
+        async with asyncio.TaskGroup() as group:
+            for ordinal, resource_key in enumerate(resource_keys):
+                tasks.append(group.create_task(_probe_profile(client, resource_key, ordinal)))
+    except BaseExceptionGroup as group:
+        raise _unwrap_profile_probe_group(group) from None
+    results: list[ProbeResult] = []
+    for task in tasks:
+        outcome = task.result()
+        if isinstance(outcome, Exception):
+            raise outcome
+        results.extend(outcome)
+    return tuple(results)
 
 
 def _activate_listener(listener: "ProgressListener", cfg: ResolvedConfig,
@@ -424,39 +516,17 @@ def probe_referenced_profiles(cfg: ResolvedConfig) -> tuple["ProbeResult", ...]:
     @param cfg 已解析配置
     @return 按 (LLM, embedding) 顺序排布的探测结果元组
     @raises ConfigError 任一被引用密钥缺失（聚合全部缺失项）
+    @raises CancelledError 任一 profile 探针主动取消或调用方取消
     """
     llm_names, emb_names = referenced_profiles(cfg)
     resources = _build_resources(cfg, None)
     client = LLMClient(cfg.llm_profiles, cfg.embedding_profiles,
                        resolve_credentials(cfg), resources, None)
 
-    async def _probe_all() -> tuple[ProbeResult, ...]:
-        """并发探测全部被引用 profile，按声明序归并结果。
-
-        @return 探测结果 tuple
-        """
-        resource_keys = tuple(
-            [("llm", name) for name in llm_names]
-            + [("embedding", name) for name in emb_names]
-        )
-
-        async def _capture(resource_key):
-            """保留测试替身或内部缺陷的原异常身份。"""
-            try:
-                return await client.probe_all(resource_key)
-            except Exception as exc:  # noqa: BLE001 —— 归并后按 profile 声明序还原
-                return exc
-
-        tasks = []
-        async with asyncio.TaskGroup() as group:
-            for resource_key in resource_keys:
-                tasks.append(group.create_task(_capture(resource_key)))
-        results: list[ProbeResult] = []
-        for task in tasks:
-            outcome = task.result()
-            if isinstance(outcome, Exception):
-                raise outcome
-            results.extend(outcome)
-        return tuple(results)
-
-    return asyncio.run(_run_and_close(client, _probe_all, None))
+    resource_keys = tuple(
+        [("llm", name) for name in llm_names]
+        + [("embedding", name) for name in emb_names]
+    )
+    return asyncio.run(_run_and_close(
+        client, lambda: _probe_profiles(client, resource_keys), None,
+    ))

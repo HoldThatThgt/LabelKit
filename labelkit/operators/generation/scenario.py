@@ -123,6 +123,20 @@ class _VariantFatal(Exception):
         super().__init__("counterfactual variant failed")
 
 
+class _VariantCancellation(Exception):
+    """把 suffix 主动取消转换为可触发 sibling cleanup 的内部信号。"""
+
+    def __init__(self, ordinal: int, error: asyncio.CancelledError):
+        """保存声明序与原始取消对象。
+
+        @param ordinal variant 声明序号
+        @param error 原始取消对象
+        """
+        self.ordinal = ordinal
+        self.error = error
+        super().__init__("counterfactual variant cancelled")
+
+
 async def generate_scenario_seed(
     request: ScenarioSeedRequest,
     services: GenerationServices,
@@ -371,9 +385,15 @@ async def _generate_variant_outcome(run: _SlotRun, baseline, variant,
                                     ordinal: int) -> _VariantOutcome:
     """生成一条 suffix，把可恢复失败冻结为普通结果。"""
     try:
-        trace = await _generate_variant(run, baseline, variant)
+        operation_task = asyncio.create_task(_generate_variant(run, baseline, variant))
+        trace = await operation_task
         _require_expected(trace, variant.expected_violation)
         return _VariantOutcome(ordinal, trace, None)
+    except asyncio.CancelledError as exc:
+        task = asyncio.current_task()
+        if task is None or task.cancelling() == 0:
+            raise _VariantCancellation(ordinal, exc) from None
+        raise
     except (GenerationAttemptRejected, ProviderRetryableError,
             ContextOverflowError, OutputTruncatedError) as exc:
         return _VariantOutcome(ordinal, None, exc)
@@ -384,6 +404,9 @@ async def _generate_variant_outcome(run: _SlotRun, baseline, variant,
 def _unwrap_variant_group(group: BaseExceptionGroup) -> BaseException:
     """从 TaskGroup 异常树中按 variant 声明序还原原异常。"""
     leaves = _flatten_variant_group(group)
+    cancellations = [leaf for leaf in leaves if isinstance(leaf, _VariantCancellation)]
+    if cancellations:
+        return min(cancellations, key=lambda failure: failure.ordinal).error
     failures = [leaf for leaf in leaves if isinstance(leaf, _VariantFatal)]
     if failures:
         return min(failures, key=lambda failure: failure.ordinal).error

@@ -407,6 +407,52 @@ class _ProbeTarget:
     key_env: str | None                            # 回填进 ProbeResult.key_env；单键探测为 None
 
 
+class _ProbeCancellation(Exception):
+    """把探针叶任务主动取消转换为可触发 sibling cleanup 的内部信号。"""
+
+    def __init__(self, ordinal: int, error: asyncio.CancelledError):
+        """保存声明序与原始取消对象。
+
+        @param ordinal 密钥声明序号
+        @param error 原始取消对象
+        """
+        self.ordinal = ordinal
+        self.error = error
+        super().__init__("probe target cancelled")
+
+
+def _flatten_probe_group(group: BaseExceptionGroup) -> list[BaseException]:
+    """递归展开探针 TaskGroup 异常树。
+
+    @param group 待展开的异常组
+    @return 按异常树声明序排列的叶异常
+    """
+    leaves: list[BaseException] = []
+    for error in group.exceptions:
+        if isinstance(error, BaseExceptionGroup):
+            leaves.extend(_flatten_probe_group(error))
+        else:
+            leaves.append(error)
+    return leaves
+
+
+def _unwrap_probe_group(group: BaseExceptionGroup) -> BaseException:
+    """按密钥声明序还原探针 TaskGroup 的原始取消。
+
+    @param group TaskGroup 抛出的异常组
+    @return 应向调用方还原的原始异常
+    """
+    leaves = _flatten_probe_group(group)
+    cancellations = [leaf for leaf in leaves if isinstance(leaf, _ProbeCancellation)]
+    if cancellations:
+        return min(cancellations, key=lambda failure: failure.ordinal).error
+    ordinary = [leaf for leaf in leaves if not isinstance(leaf, asyncio.CancelledError)]
+    if ordinary:
+        _logger.error("probe task group raised an untracked exception")
+        return ordinary[0]
+    return asyncio.CancelledError()
+
+
 @dataclass
 class _RetryContext:
     """重试引擎在单次逻辑调用内的可变状态（生命周期 = 一次 ``_post_with_retries``）。"""
@@ -977,21 +1023,25 @@ class LLMClient:
 
     async def probe(self, resource_key: ResourceKey) -> ProbeResult:
         """validate --probe：对 llm 剖面做一次最小的 1 token 活体调用，对 embedding
-        剖面做一次单文本嵌入。永不抛出，失败落在 .error 里。池化剖面只探**第一把**密钥
-        （v1.6）——其余由 probe_all 覆盖。资源类型使同名 llm 与 embedding 剖面互不混淆。
+        剖面做一次单文本嵌入。普通失败不抛出，落在 .error 里；取消与语言控制异常保持
+        原语义。池化剖面只探**第一把**密钥（v1.6）——其余由 probe_all 覆盖。资源类型使
+        同名 llm 与 embedding 剖面互不混淆。
 
         @param resource_key 资源类型与剖面名
         @return 单条探测结果
+        @raises CancelledError 探针或调用方取消
         """
         return (await self._probe_keys(resource_key, first_only=True))[0]
 
     async def probe_all(self, resource_key: ResourceKey) -> list[ProbeResult]:
         """v1.6：按声明顺序对池内每把密钥各探一次，llm 与 embedding 剖面同规——池化
         （>1 键）剖面的结果带 key_env。单键剖面退化为 [await probe(resource_key)] 且
-        key_env=None。供 ``validate --probe`` 使用。永不抛出。
+        key_env=None。供 ``validate --probe`` 使用。普通失败成为 ProbeResult；取消先清理
+        siblings，再恢复原始 CancelledError。
 
         @param resource_key 资源类型与剖面名
         @return 每把密钥一条探测结果
+        @raises CancelledError 任一密钥探针主动取消或调用方取消
         """
         return await self._probe_keys(resource_key, first_only=False)
 
@@ -1117,6 +1167,7 @@ class LLMClient:
         @param resource_key 资源类型与剖面名
         @param first_only True = 只探第一把密钥（probe），False = 全池（probe_all）
         @return 每把密钥一条结果；未知剖面回单条 ok=False 结果
+        @raises CancelledError 任一密钥探针主动取消或调用方取消
         """
         kind, profile = resource_key
         is_llm = kind == "llm"
@@ -1147,26 +1198,47 @@ class LLMClient:
             for env, key in members
         )
         tasks: list[asyncio.Task[ProbeResult]] = []
-        async with asyncio.TaskGroup() as group:
-            for target in targets:
-                tasks.append(group.create_task(self._probe_one(target)))
+        try:
+            async with asyncio.TaskGroup() as group:
+                for ordinal, target in enumerate(targets):
+                    tasks.append(group.create_task(self._run_probe_target(target, ordinal)))
+        except BaseExceptionGroup as group:
+            raise _unwrap_probe_group(group) from None
         return [task.result() for task in tasks]
+
+    async def _run_probe_target(self, target: _ProbeTarget, ordinal: int) -> ProbeResult:
+        """运行探针叶任务，并把主动取消转换为结构化失败。
+
+        @param target 探测目标
+        @param ordinal 密钥声明序号
+        @return 单把密钥的探测结果
+        """
+        try:
+            operation_task = asyncio.create_task(self._probe_one(target))
+            return await operation_task
+        except asyncio.CancelledError as exc:
+            task = asyncio.current_task()
+            if task is None or task.cancelling() == 0:
+                raise _ProbeCancellation(ordinal, exc) from None
+            raise
 
     async def _probe_one(self, target: _ProbeTarget) -> ProbeResult:
         """探测单把密钥。
 
         @param target 探测目标（剖面、密钥、待回填的 key_env）
-        @return 成功或失败的 ProbeResult；本方法永不抛出
+        @return 成功或失败的 ProbeResult；普通失败不抛出
         """
         start = time.monotonic()
-        client = self._probe_client(target)
+        client: LLMClient | None = None
         try:
+            client = self._probe_client(target)
             model, latency_ms = await self._probe_call(client, target, start)
-        except Exception as exc:  # noqa: BLE001 —— 探针永不抛出
+        except Exception as exc:  # noqa: BLE001 —— 探针普通失败不抛出
             # 失败原因随 ProbeResult.error 结构化返回给 validate --probe，这里只留
             # 排障用的低噪声痕迹（不改 stderr 的默认可见输出）。
             _logger.debug("probe failed for profile %s: %s", target.profile, exc)
-            self._merge_usage(client._usage)
+            if client is not None:
+                self._merge_usage(client._usage)
             kind = "llm" if target.is_llm else "embedding"
             return ProbeResult(kind=kind, profile=target.profile, ok=False, model=target.prof.model,
                                latency_ms=int((time.monotonic() - start) * 1000),

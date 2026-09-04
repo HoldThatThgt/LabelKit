@@ -93,7 +93,8 @@ uv run labelkit run --config config.toml --project project.toml
 
 ## 2.4 验证连通性：先探测，再开跑
 
-装好之后，强烈建议先用 `validate --probe` 做一次连通性探测——它会对每个被引用的 profile 发一次 1-token 的试调用：
+装好之后，强烈建议先用 `validate --probe` 做一次连通性探测——它会并发探测全部被引用的 profile；单密钥 profile
+发一次 1-token 试调用，`api_key_envs` 密钥池则对池内每把密钥各调用一次，最终仍按 profile 与密钥声明序输出：
 
 ```bash
 uv run labelkit validate --config config.toml --project project.toml --probe

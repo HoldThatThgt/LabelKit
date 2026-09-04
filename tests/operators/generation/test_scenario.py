@@ -1082,6 +1082,113 @@ def test_declared_counterfactual_suffixes_overlap_after_baseline(
     assert tuple(trace.variant_name for trace in traces) == plan.delivery_slots[0].variant_names
 
 
+def test_declared_baseline_acceptance_precedes_all_suffix_work(
+    declared_config, declared_program, monkeypatch,
+):
+    """baseline 未通过验收时不得启动任何 counterfactual suffix。"""
+    plan = compile_scenario_plan(declared_program)
+    services, _engine, _metrics = _services(declared_config)
+    failure = GenerationAttemptRejected("baseline", "invalid")
+    suffix_calls = 0
+
+    def reject_baseline(_trace, expected):
+        if expected == {}:
+            raise failure
+
+    async def observe_suffix(_run, baseline, _variant):
+        nonlocal suffix_calls
+        suffix_calls += 1
+        return baseline
+
+    monkeypatch.setattr(scenario_module, "_require_expected", reject_baseline)
+    monkeypatch.setattr(scenario_module, "_generate_variant", observe_suffix)
+    with pytest.raises(GenerationAttemptRejected) as caught:
+        asyncio.run(generate_slot_traces(
+            declared_program, plan, plan.delivery_slots[0], 0, services,
+        ))
+
+    assert caught.value.kind == "baseline"
+    assert suffix_calls == 0
+
+
+@pytest.mark.parametrize("mode", ["raise", "self_cancel"])
+def test_declared_suffix_child_cancellation_cleans_siblings(
+    declared_config, declared_program, monkeypatch, mode,
+):
+    """suffix 直接抛取消或自取消时必须先清理全部 siblings。"""
+    plan = compile_scenario_plan(declared_program)
+    services, _engine, _metrics = _services(declared_config)
+    all_started = asyncio.Event()
+    never = asyncio.Event()
+    cancelled = asyncio.CancelledError("suffix cancelled")
+    started = cleaned = 0
+
+    async def cancel_one(_run, _baseline, variant):
+        nonlocal started, cleaned
+        started += 1
+        if started == 3:
+            all_started.set()
+        try:
+            await asyncio.wait_for(all_started.wait(), timeout=1)
+            if variant.name == "missing_acknowledgement":
+                if mode == "raise":
+                    raise cancelled
+                asyncio.current_task().cancel()
+                await asyncio.sleep(0)
+            await never.wait()
+        finally:
+            cleaned += 1
+
+    monkeypatch.setattr(scenario_module, "_generate_variant", cancel_one)
+    with pytest.raises(asyncio.CancelledError) as caught:
+        asyncio.run(asyncio.wait_for(
+            generate_slot_traces(
+                declared_program, plan, plan.delivery_slots[0], 0, services,
+            ),
+            timeout=2,
+        ))
+
+    if mode == "raise":
+        assert caught.value is cancelled
+    assert started == 3 and cleaned == 3
+
+
+def test_declared_suffix_external_cancellation_cleans_children(
+    declared_config, declared_program, monkeypatch,
+):
+    """父 branch 取消必须清理全部 suffix 任务。"""
+    plan = compile_scenario_plan(declared_program)
+    services, _engine, _metrics = _services(declared_config)
+    all_started = asyncio.Event()
+    never = asyncio.Event()
+    started = cleaned = 0
+
+    async def wait_forever(_run, _baseline, _variant):
+        nonlocal started, cleaned
+        started += 1
+        if started == 3:
+            all_started.set()
+        try:
+            await never.wait()
+        finally:
+            cleaned += 1
+
+    async def cancel_parent():
+        task = asyncio.create_task(generate_slot_traces(
+            declared_program, plan, plan.delivery_slots[0], 0, services,
+        ))
+        await asyncio.wait_for(all_started.wait(), timeout=1)
+        task.cancel("suffix parent cancelled")
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert caught.value.args == ("suffix parent cancelled",)
+
+    monkeypatch.setattr(scenario_module, "_generate_variant", wait_forever)
+    asyncio.run(cancel_parent())
+
+    assert started == 3 and cleaned == 3
+
+
 def test_declared_suffix_fatal_cancels_and_settles_siblings(
     declared_config, declared_program, monkeypatch,
 ):

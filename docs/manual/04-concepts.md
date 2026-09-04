@@ -70,8 +70,8 @@ events、stream rows，以及由可见 primary branch 与交织布局派生的 s
 - **profile 之间独立接纳**——低容量 profile 排队不会占住另一个 profile 的接纳名额。
 
 stitch 是一个有状态算子的具体例子：同一会话的候选必须逐个推进，但不同会话的当前候选会组成一轮 wave；结果仍按
-会话声明序归并。sequence 的 declared slot 则先串行完成 baseline，再并发彼此独立的 counterfactual suffix，最后按
-variant 声明序归并。两者都不会把依赖上一状态的同键步骤错误地并发化。
+会话声明序归并。sequence 的 declared slot 则先串行完成并验收 baseline，再并发彼此独立的 counterfactual suffix，
+最后按 variant 声明序归并。两者都不会把依赖上一状态的同键步骤错误地并发化。
 
 普通 semantic dedup 是一个明确的投机点：静态 participating 的记录先并发取得 embedding，再按输入序从 exact 层
 到 semantic 层重验证。后来被 hash 或较低 ordinal 淘汰的 embedding 不改数据，但已经发生的 usage/retry/breaker

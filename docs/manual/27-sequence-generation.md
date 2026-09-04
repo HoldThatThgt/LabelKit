@@ -334,8 +334,9 @@ instruction-only 单序列最多 8 个事件。单个完整运行期 prompt valu
 系统不会通过截断 ScenarioSeed、ActorView、EventDraft history、patch、payload 或 repair 原输出来“挤进窗口”。
 
 sequence 使用从当前 `next_commit` 开始的连续候选缓冲。generation、evaluation、dedup reservation、quality、annotate、
-verify、最终行装配、replay 与 candidate-local CrossView 可跨槽并发；每个 declared slot 先完成 baseline，再让彼此
-独立的 counterfactual suffix 结构化并发，按 variant 声明序归并。同一 branch 内事件仍按 `state_after` 串行。
+verify、最终行装配、replay 与 candidate-local CrossView 可跨槽并发；每个 declared slot 先完成并验收 baseline，再让
+彼此独立的 counterfactual suffix 结构化并发，按 variant 声明序归并。同一 branch 内事件仍按 `state_after` 串行；
+任一 suffix 主动取消时，会先清理同组 siblings，再把原始取消传出。
 running、prepared 和 recoverable outcome 都占用
 同一个槽位，只有 head 成功 commit 才滑入一个新 tail。head 在无 await 临界区按
 `dedup revalidate → frontier → retained prospective check → commit` 执行。若 source 本身未超限、加入它的 replay 后

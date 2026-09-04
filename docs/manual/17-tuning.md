@@ -56,7 +56,7 @@ opportunity 的整数票，不是需要靠扩大样本追平的配额；不要�
 批耗时 ≈ Σ各算子耗时；算子耗时 ≈ ⌈该算子调用数 / 有效并发⌉ × 单次调用延迟
 ```
 
-sequence 的昂贵链路可跨候选槽并发；同一 declared slot 的 baseline 完成后，counterfactual suffix 也可重叠，
+sequence 的昂贵链路可跨候选槽并发；同一 declared slot 的 baseline 完成并验收后，counterfactual suffix 也可重叠，
 但每条 branch 内事件仍是状态依赖串行链。stitch 则按“同会话串行、不同会话当前候选 wave 并发”执行。墙钟近似由
 这些关键路径、profile/origin 等待和声明序 commit 队头等待共同决定，不能再用“所有调用时间相加”估算。普通侧旧
 实跑里 quality 是调用量大头的结论仍可作定位参考，但不是当前性能证据。

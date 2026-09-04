@@ -90,10 +90,12 @@ generation / evaluation
 → PreparedCandidate
 ~~~
 
-同一 branch 的事件按 `state_after` 依赖串行；declared baseline 完成后，不同 counterfactual suffix 由 branch
-coordinator 结构化并发，真实调用仍逐次取得各自 ResourceManager 许可，不把跨多次调用、可能跨 profile 的完整
-branch 冒充单个 profile 叶任务。结果仍按 variant 声明序归并；可恢复失败也按该顺序选择，fatal/control 取消并等待
-sibling cleanup 后原样传播。quality → annotate → verify 的业务屏障不变；前一 gate 拒绝后不支付后一 gate。
+同一 branch 的事件按 `state_after` 依赖串行；declared baseline 完成并通过 expected-violation 验收后，不同
+counterfactual suffix 由 branch coordinator 结构化并发，真实调用仍逐次取得各自 ResourceManager 许可，不把跨
+多次调用、可能跨 profile 的完整 branch 冒充单个 profile 叶任务。结果仍按 variant 声明序归并；可恢复失败也按该
+顺序选择。suffix 直接抛 CancelledError 或 task 自取消时，必须先取消并回收 sibling，再恢复原始 CancelledError；
+fatal/control 同样等待 sibling cleanup 后原样传播。quality → annotate → verify 的业务屏障不变；前一 gate 拒绝后
+不支付后一 gate。
 不同 attempt 使用不同 `PipelineItem`。叶调用只返回冻结 outcome，operator 按
 slot ordinal、attempt index、stage declaration order 与叶任务 ordinal 归并后才修改 attempt-local item。
 

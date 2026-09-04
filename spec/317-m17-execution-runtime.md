@@ -186,7 +186,8 @@ LLMClient 根实例持有共享 AsyncClient；probe child 共享它与 ResourceM
 
 普通工作流保持一个活动批和固定阶段屏障：同步计划 → TaskGroup 纯叶调用 → 输入序 reduce/commit。leaf 不得修改
 PipelineItem、quality pool、claim table、DedupIndex 或 emitter。RNG 只在同步计划阶段按输入序消费，leaf 不共享
-RNG。所有生产并发只经 TaskExecutor，不保留第二执行分支。
+RNG。普通 operator 的纯叶并发只经 TaskExecutor，不保留第二执行分支；完整多调用 generation suffix 的唯一协调
+例外由 3.17.6 定义。
 
 普通 ProviderFatalError 继续由 operator 转为既有记录级 outcome；CircuitBreaker 只结构化取消当前任务组并交回
 工作流属主，CancelledError 终止 execution domain。
@@ -196,9 +197,11 @@ breaker、latency 与 embedding failure 证据保留。
 
 ### 3.17.6 Sequence 候选窗口与有序提交
 
-SequenceWorkflow 在 execution domain 内拥有根 coordinator TaskGroup；每个 declared slot 的 baseline 完成后，
-generation operator 可创建仅覆盖 sibling counterfactual suffix 的 branch-local TaskGroup。branch coordinator 不占
-某个 profile 的 TaskExecutor admission；其每次真实调用仍逐次取得准确的 ResourceManager 许可。候选窗口始终是从
+SequenceWorkflow 在 execution domain 内拥有根 coordinator TaskGroup；每个 declared slot 的 baseline 完成并通过
+expected-violation 验收后，generation operator 可创建仅覆盖 sibling counterfactual suffix 的 branch-local
+TaskGroup。branch coordinator 不占某个 profile 的 TaskExecutor admission；其每次真实调用仍逐次取得准确的
+ResourceManager 许可。suffix 直接抛 CancelledError 或 task 自取消时，先取消并回收 siblings，再恢复原始
+CancelledError。候选窗口始终是从
 `next_commit` 起的连续声明序区间，容量是当前 phase 引用的不同 ResourceKey 容量之和并钳制到剩余 slot。permit 在创建 coordinator 前
 取得，跨 attempt、preparing、PreparedCandidate/PreparedNoiseCandidate、recoverable outcome、等待提交和 retry
 保留，只在该 ordinal commit 或终止 cleanup 后释放。高 ordinal 提前结束仍占原位置，不向窗口外补 tail。

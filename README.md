@@ -54,7 +54,9 @@ uv run labelkit run --config config.toml --project project.toml --dry-run --cons
 ## 文档
 
 - [用户手册](docs/manual/README.md)：从安装、配置和普通流水线，到 sequence generation 与 replay。
-- [v1.18 序列生成规格](docs/dev/SPEC-sequence-generation-redesign.md)：当前序列生成的权威设计。
+- [v1.21 序列交织规格](docs/dev/SPEC-sequence-interleaving.md)：当前交织配置、计划与验收真值。
+- [执行运行时规格](docs/dev/SPEC-execution-runtime.md)：有界接纳、结构化并发与声明序归并契约。
+- [序列生成规格](docs/dev/SPEC-sequence-generation-redesign.md)：序列生成内核与原子交付设计。
 - [跨模块契约](docs/CONTRACTS.md)：冻结的数据结构、接口、事件和提示词边界。
 - [实现规格](spec/)：模块职责、数据结构、配置、输出、日志与验收要求。
 - [E2E 发现](docs/dev/E2E-FINDINGS.md)：已验证事实、环境失败和待补证据的分离记录。
@@ -67,6 +69,7 @@ uv run --python 3.12 pytest tests/integration -q -m integration
 git diff --check
 ```
 
-离线基线为 2157 tests；当前 v1.18 离线套件已验证为 2606 passed、47 deselected。合并覆盖率为 line 95.71%、
-branch 91.30%，1548/1548 个可执行生产函数已进入。真实 LLM 测试不使用 mock server、
+离线基线为 2157 tests；v1.18 历史门为 2610 passed、47 deselected。当前 v1.21 加并发修复的离线套件为
+3025 passed、48 deselected；本轮 19/19 个修改函数进入，四个修改文件最低 line 90.58%、最低 branch 81.00%。
+真实 LLM 测试不使用 mock server、
 mock transport、录制响应或本地替身。实现必须先服从 spec 与 `docs/CONTRACTS.md`，再由测试证明闭包。

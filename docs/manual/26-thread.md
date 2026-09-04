@@ -315,6 +315,6 @@ dry-run: no LLM calls made, no output written (report and trace only)
 
 标注指令里写明「`step_range` 为 [起始步序号, 结束步序号] 闭区间、按 `steps[].index` 计」即可——结构引擎照常保证它合法，接缝步的序号也在同一坐标系里。
 
-**`votes` 是什么？该开吗？**判定稳定化采样：默认 `1`（单调用，不启用）；设为 ≥3 的**奇数**（偶数直接配置错误）时，同一判定采样 n 次，对 (verdict, thread_ref) 完整判定取**严格多数**——凑不齐严格多数（含 verdict 一致但 thread_ref 分裂）一律回落保守结局（episode 候选判 new、救援候选按未命中）。它的定位是「口头置信度门槛的正规替代」：治**漂移**（同一判定跨运行摇摆），不治**偏差**（系统性过连接）——所以它跟机械先验合取不可互替、只能叠加。成本直白：判定调用 ×n（n=3 时 stitch 全口径占比仍 <8%，同前缀采样吃 prompt 缓存）。开的时机：同 seed 重跑时 `stitch.judge` 的判定翻转可测，再开——本例 fixture 实体证据充足，votes=1 就五缝五中（4 次 episode 并入 + 1 次救援命中，全部双腿先验）。
+**`votes` 是什么？该开吗？**判定稳定化采样：默认 `1`（单调用，不启用）；设为 ≥3 的**奇数**（偶数直接配置错误）时，同一判定采样 n 次，对 (verdict, thread_ref) 完整判定取**严格多数**——凑不齐严格多数（含 verdict 一致但 thread_ref 分裂）一律回落保守结局（episode 候选判 new、救援候选按未命中）。单个 SchemaViolation 样本只弃权，不会缩小原始 n 票分母；全部样本违规时，候选按既有 `on_error` 策略处置。它的定位是「口头置信度门槛的正规替代」：治**漂移**（同一判定跨运行摇摆），不治**偏差**（系统性过连接）——所以它跟机械先验合取不可互替、只能叠加。成本直白：判定调用 ×n（n=3 时 stitch 全口径占比仍 <8%，同前缀采样吃 prompt 缓存）。开的时机：同 seed 重跑时 `stitch.judge` 的判定翻转可测，再开——本例 fixture 实体证据充足，votes=1 就五缝五中（4 次 episode 并入 + 1 次救援命中，全部双腿先验）。
 
 最后一份检查清单，开 stitch 前过一遍：`segment.enabled = true` 且分段口径按穿插流调过（26.5 的穿插流声明）；`trace.channels` 加了 `"stitch"`；verify 开着的话 `extra_criteria` 写了构造约定（26.5 的构造事实说明）；留了纯噪声负样本会话当门禁；下游知道一行 = 一条线索、切片用 `fragments[].order_span` 而不是顶层包络、接缝步认 `resumed` 标志了吗？

@@ -20,13 +20,13 @@ counterfactual suffix、stitch 不同会话的当前候选 wave，以及 `valida
 
 | 证据面 | 当前状态 | 已知事实 / 输入边界 |
 |---|---|---|
-| 定向回归 | 已验证 | 390 passed；覆盖 scenario、stitch、LLM probe、Application probe 与 CLI 呈现 |
-| 同时在途屏障 | 已验证 | 6 passed；三个 suffix、两个 stitch session、三个 profile、三把 pool key 均须同时到达同步屏障 |
-| 顺序与失败语义 | 已验证 | variant/session/profile/key 仍按声明序归并；suffix fatal 等待 sibling cleanup；stitch ProviderFatal 保持候选级隔离 |
-| changed production coverage | 已验证 | 26/26 个修改函数进入；4 个修改文件最低 line 92.73%、最低 branch 80.21% |
-| 完整 offline suite | 已验证 | `3008 passed, 48 deselected in 573.19s`；未缩小门面 |
+| 定向回归 | 已验证 | 337 passed；覆盖 scenario、stitch、LLM probe 与 Application probe；新增 17 个对抗用例全部通过 |
+| 同时在途屏障 | 已验证 | suffix 三任务、stitch 两会话 pass-1/repass、三个 profile 与三把 pool key 均须同时到达同步屏障；串行降级不能靠 on_error 掩盖 |
+| 顺序与失败语义 | 已验证 | baseline 未验收时 suffix 零调用；variant/session/profile/key 按声明序归并；主动/外部取消等待 sibling cleanup 并恢复原始 CancelledError；stitch SchemaViolation 单票弃权且严格多数仍以原始 n 为分母 |
+| changed production coverage | 已验证 | 19/19 个修改函数进入；4 个修改文件最低 line 90.58%、最低 branch 81.00% |
+| 完整 offline suite | 已验证 | `3025 passed, 48 deselected in 698.09s`；同一次运行生成 branch coverage，未缩小门面 |
 | keyless 真实入口 | 已验证 | sequence 主例 `validate` 通过；`dry-run` 为 2 sets、8 sequences、22 primary events、27 stream rows，零 LLM 调用且零输出写入 |
-| Uncle Bob mutation review | 环境阻塞 | `[PENDING-EVIDENCE:concurrency-uncle-bob]`；caller checkout 含用户未跟踪文件与本轮未提交变更，强制 clean-checkout preflight 禁止启动 mutation phase |
+| Uncle Bob mutation review | 待复核 | `[PENDING-EVIDENCE:concurrency-uncle-bob]`；按规则在提交并确认 caller checkout 干净后重新运行，并记录每个变异的身份、预期杀手测试与结果 |
 | 真实 endpoint 吞吐 | 待运行 | `[PENDING-EVIDENCE:concurrency-real-throughput]`；未复用历史四槽数据声称本轮加速 |
 
 ## v1.21 序列交织证据看板

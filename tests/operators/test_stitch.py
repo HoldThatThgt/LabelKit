@@ -940,15 +940,15 @@ def test_aggregate_votes_strict_majority_on_complete_pair():
     win = obj("resume", ref=1, task="首个", reason="r1")
     win2 = obj("resume", ref=1, task="次个", reason="r2")
     lose = obj("new")
-    picked = aggregate_votes([win, lose, win2])
+    picked = aggregate_votes([win, lose, win2], 3)
     assert picked is win                               # majority cluster's FIRST sample
     # verdict majority but thread_ref split → NO strict majority → None
     assert aggregate_votes([obj("resume", ref=1), obj("resume", ref=2),
-                            obj("new")]) is None
+                            obj("new")], 3) is None
     # three-way split → None; exact half is NOT strict
     assert aggregate_votes([obj("resume", ref=1), obj("new"),
-                            obj("resume", ref=2)]) is None
-    assert aggregate_votes([obj("new")]) is not None   # n=1 trivially wins
+                            obj("resume", ref=2)], 3) is None
+    assert aggregate_votes([obj("new")], 1) is not None   # n=1 trivially wins
 
 
 def test_votes_reverse_completion_keeps_declaration_order_winner():
@@ -970,6 +970,55 @@ def test_votes_reverse_completion_keeps_declaration_order_winner():
         (1, 1, 0, 0, 0, 1),
         (1, 1, 0, 0, 0, 2),
     ]
+
+
+def test_votes_schema_violation_abstains_when_valid_majority_survives():
+    """一个结构违规样本弃权，两个合法同票样本仍应形成多数。"""
+    violation = SchemaViolation(["/verdict"], "{}")
+    first_valid = obj("new", task="首个合法样本")
+    second_valid = obj("new", task="第二个合法样本")
+    engine = QueueEngine([violation, first_valid, second_valid])
+    ctx = make_ctx(make_cfg(votes=3), engine)
+
+    outcome = asyncio.run(judge_stitch(
+        ["thread"], "candidate", ctx, (), (0, 0, 0),
+    ))
+
+    assert outcome is first_valid
+
+
+def test_votes_schema_violation_abstention_keeps_original_denominator():
+    """两个结构违规样本弃权后，单个合法样本不构成原始三票多数。"""
+    violations = [
+        SchemaViolation(["/first"], "{}"),
+        SchemaViolation(["/second"], "{}"),
+    ]
+    engine = QueueEngine([*violations, obj("new", task="唯一合法样本")])
+    ctx = make_ctx(make_cfg(votes=3), engine)
+
+    outcome = asyncio.run(judge_stitch(
+        ["thread"], "candidate", ctx, (), (0, 0, 0),
+    ))
+
+    assert outcome is None
+
+
+def test_votes_all_schema_violations_raise_last_declared_violation():
+    """没有合法样本时按 vote 声明序抛出最后一次结构违规。"""
+    violations = [
+        SchemaViolation(["/first"], "{}"),
+        SchemaViolation(["/second"], "{}"),
+        SchemaViolation(["/third"], "{}"),
+    ]
+    engine = QueueEngine(violations)
+    ctx = make_ctx(make_cfg(votes=3), engine)
+
+    with pytest.raises(SchemaViolation) as caught:
+        asyncio.run(judge_stitch(
+            ["thread"], "candidate", ctx, (), (0, 0, 0),
+        ))
+
+    assert caught.value is violations[-1]
 
 
 def test_votes_three_samples_strict_majority_drives_merge():
@@ -1093,6 +1142,114 @@ def test_multi_session_batches_processed_independently_in_order():
     assert engine.calls[0][3] == ("a0",) and engine.calls[1][3] == ("b0",)
     thread_events = [e for e in ctx.metrics.events if e[0] == "stitch.thread"]
     assert [e[3]["session_id"] for e in thread_events] == ["sa", "sb"]
+
+
+def test_multi_session_pass_one_overlaps_without_failure_fallback():
+    """不同会话的 pass-1 当前候选必须真重叠，不能靠失败降级掩盖串行。"""
+    class BarrierEngine:
+        def __init__(self):
+            self.started = 0
+            self.active = 0
+            self.high_water = 0
+            self.all_started = asyncio.Event()
+
+        async def complete_validated(self, _profile, _prompt, schema=None, *, scope):
+            del schema
+            self.started += 1
+            self.active += 1
+            self.high_water = max(self.high_water, self.active)
+            if self.started == 2:
+                self.all_started.set()
+            try:
+                await asyncio.wait_for(self.all_started.wait(), timeout=1)
+                task = "A任务" if scope.record_ids == ("a0",) else "B任务"
+                return obj("new", task=task), None, 1, "offline"
+            finally:
+                self.active -= 1
+
+    fa = [envelope(ui_frame("a0", 0, app="com.a"), "sa")]
+    fb = [envelope(ui_frame("b0", 0, app="com.b"), "sb")]
+    ep_a, ep_b = episode_of(fa, "sa"), episode_of(fb, "sb")
+    engine = BarrierEngine()
+
+    _out, ctx = run_stage(
+        make_cfg(repass=False), [*fa, *fb, ep_a, ep_b], engine,
+    )
+
+    assert engine.started == 2 and engine.high_water == 2
+    assert ctx.metrics.counters.get("stitch.failures", 0) == 0
+
+
+def test_multi_session_vote_wave_uses_one_ordered_task_group_request():
+    """同一 wave 的全部会话和 votes 必须一次提交，并按会话声明序归并。"""
+    fa = [envelope(ui_frame("a0", 0, app="com.a"), "sa")]
+    fb = [envelope(ui_frame("b0", 0, app="com.b"), "sb")]
+    ep_a, ep_b = episode_of(fa, "sa"), episode_of(fb, "sb")
+    engine = QueueEngine([
+        obj("new", task="A任务"), obj("new", task="A任务"), obj("new", task="A任务"),
+        obj("new", task="B任务"), obj("new", task="B任务"), obj("new", task="B任务"),
+    ])
+
+    _out, ctx = run_stage(
+        make_cfg(votes=3, repass=False), [*fa, *fb, ep_a, ep_b], engine,
+    )
+
+    (request,) = ctx.tasks.requests
+    assert [spec.declaration_key for spec in request.tasks] == [
+        (1, 1, 0, 0, 0, 0),
+        (1, 1, 0, 0, 0, 1),
+        (1, 1, 0, 0, 0, 2),
+        (1, 1, 1, 0, 0, 0),
+        (1, 1, 1, 0, 0, 1),
+        (1, 1, 1, 0, 0, 2),
+    ]
+    judge_events = [event for event in ctx.metrics.events if event[0] == "stitch.judge"]
+    assert [event[2] for event in judge_events] == [("a0",), ("b0",)]
+
+
+def test_multi_session_repass_candidates_overlap():
+    """pass-1 完成后，不同会话的当前 repass 候选仍必须形成并发 wave。"""
+    class RepassBarrierEngine:
+        def __init__(self):
+            self.active = 0
+            self.high_water = 0
+            self.targets_started = 0
+            self.all_started = asyncio.Event()
+
+        async def complete_validated(self, _profile, prompt, schema=None, *, scope):
+            del schema
+            target = (
+                scope.record_ids in {("a0",), ("b0",)}
+                and pool_card_count(prompt) > 0
+            )
+            if target:
+                self.targets_started += 1
+                self.active += 1
+                self.high_water = max(self.high_water, self.active)
+                if self.targets_started == 2:
+                    self.all_started.set()
+                try:
+                    await asyncio.wait_for(self.all_started.wait(), timeout=1)
+                finally:
+                    self.active -= 1
+            return obj("new", task="独立任务"), None, 1, "offline"
+
+    fa0 = [envelope(ui_frame("a0", 0, app="com.a"), "sa")]
+    fa1 = [envelope(ui_frame("a1", 1, app="com.a"), "sa")]
+    fb0 = [envelope(ui_frame("b0", 0, app="com.b"), "sb")]
+    fb1 = [envelope(ui_frame("b1", 1, app="com.b"), "sb")]
+    episodes = [
+        episode_of(fa0, "sa"), episode_of(fa1, "sa"),
+        episode_of(fb0, "sb"), episode_of(fb1, "sb"),
+    ]
+    engine = RepassBarrierEngine()
+
+    _out, ctx = run_stage(
+        make_cfg(), [*fa0, *fa1, *fb0, *fb1, *episodes], engine,
+    )
+
+    assert engine.targets_started == 2 and engine.high_water == 2
+    assert ctx.metrics.counters.get("stitch.failures", 0) == 0
 
 
 def test_multi_session_current_candidates_overlap_and_isolate_provider_failure():

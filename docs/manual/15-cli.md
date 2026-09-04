@@ -66,7 +66,8 @@ project.toml:[run].output: missing required key, expected string (may be supplie
 project.toml:[quality].llm: referenced profile "gpt4" does not exist in config.toml [llm.*], available: default, judge
 ```
 
-`--probe` 追加连通性探测：对每个**被实际引用**的 profile 发一次 1-token 试调用（没被任何启用算子引用的 profile 不探测、也不要求密钥存在）：
+`--probe` 追加连通性探测：并发探测每个**被实际引用**的 profile；单密钥 profile 发一次 1-token 试调用，
+密钥池则对每把密钥各调用一次（没被任何启用算子引用的 profile 不探测、也不要求密钥存在）：
 
 ```
 configuration valid
