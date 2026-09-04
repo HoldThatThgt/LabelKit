@@ -90,13 +90,15 @@ Anthropic、非 JSON 值与 LabelKit 保留键冲突；缺省空表必须维持�
 |---|---|---|
 | 配置与请求体离线回归 | 已验证 | 配置与 LLM client 定向套件 551 passed；完整 offline suite 3044 passed、48 deselected，用时 653.83 秒 |
 | changed production coverage | 已验证 | 5/5 个修改函数进入；3 个修改文件最低 line 92.61%、最低 branch 91.74% |
-| Uncle Bob mutation review | 待复审 | 首轮在 `14c1580` 的 detached worktree 审查：21 killed、2 survived、0 invalid、0 inconclusive；两处 oracle 已补，保留 `[PENDING-EVIDENCE:vllm-extra-body-bob-review]` 直至新 clean commit 复审 |
+| Uncle Bob mutation review | 已验证 | 修复提交 `c414c9a` 的 detached worktree 复审：23 killed、0 survived、0 invalid、0 inconclusive；implementation missing 与 implementation diverged 均为 0 |
 | 真实 vLLM endpoint | 待运行 | `[PENDING-EVIDENCE:vllm-extra-body-real-endpoint]`；未用纯函数请求体断言冒充服务端接收证据 |
 
 首轮 survived 分别允许 `_complete_spec` 在调用共享 builder 前清空 `extra_body`，以及允许第二次和后续 retry
 删除 `top_k`。前者现在由带非空扩展字段的 `_complete_spec(...).build_body()` 断言承保；后者连续进入 attempt 0 与
 attempt 1 的 `_dispatch_attempt` body handoff，并在 origin admission 前以资源边界哨兵停止，零网络且不伪造 HTTP
-server/transport。上述修复已通过 2 条窄回归、551 条定向回归与完整 offline suite，复审结果不得预写。
+server/transport。上述修复已通过 2 条窄回归、551 条定向回归与完整 offline suite。复审重新执行全部 23 个
+语义变异；原 M22 与 M23 分别由 `_complete_spec` 精确断言和第二次 attempt handoff 断言 killed，其余 21 个
+变异保持 killed，最终无 survived、invalid 或 inconclusive。审查前后 detached worktree 与调用方工作树均为 clean。
 
 ## v1.21 序列交织证据看板
 
