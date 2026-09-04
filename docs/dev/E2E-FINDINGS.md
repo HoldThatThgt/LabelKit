@@ -88,10 +88,15 @@ Anthropic、非 JSON 值与 LabelKit 保留键冲突；缺省空表必须维持�
 
 | 证据面 | 当前状态 | 已知事实 / 输入边界 |
 |---|---|---|
-| 配置与请求体离线回归 | 已验证 | 配置与 LLM client 定向套件 550 passed；完整 offline suite 3043 passed、48 deselected，用时 558.70 秒 |
+| 配置与请求体离线回归 | 已验证 | 配置与 LLM client 定向套件 551 passed；完整 offline suite 3044 passed、48 deselected，用时 653.83 秒 |
 | changed production coverage | 已验证 | 5/5 个修改函数进入；3 个修改文件最低 line 92.61%、最低 branch 91.74% |
-| Uncle Bob mutation review | 阻断 | `[PENDING-EVIDENCE:vllm-extra-body-bob-review]`；技能要求调用方工作树来自 clean commit，当前功能尚未获提交授权，未自动 commit/stash |
+| Uncle Bob mutation review | 待复审 | 首轮在 `14c1580` 的 detached worktree 审查：21 killed、2 survived、0 invalid、0 inconclusive；两处 oracle 已补，保留 `[PENDING-EVIDENCE:vllm-extra-body-bob-review]` 直至新 clean commit 复审 |
 | 真实 vLLM endpoint | 待运行 | `[PENDING-EVIDENCE:vllm-extra-body-real-endpoint]`；未用纯函数请求体断言冒充服务端接收证据 |
+
+首轮 survived 分别允许 `_complete_spec` 在调用共享 builder 前清空 `extra_body`，以及允许第二次和后续 retry
+删除 `top_k`。前者现在由带非空扩展字段的 `_complete_spec(...).build_body()` 断言承保；后者连续进入 attempt 0 与
+attempt 1 的 `_dispatch_attempt` body handoff，并在 origin admission 前以资源边界哨兵停止，零网络且不伪造 HTTP
+server/transport。上述修复已通过 2 条窄回归、551 条定向回归与完整 offline suite，复审结果不得预写。
 
 ## v1.21 序列交织证据看板
 

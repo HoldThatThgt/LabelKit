@@ -6,8 +6,9 @@
 ``ProfileUsage`` / ``_RetryContext`` / ``_KeyState`` / ``KeyUsage`` /
 ``_AttemptFailure``）后直调单个步骤函数，断言状态转移与返回值。真正需要一次 HTTP
 往返的两个函数（``_dispatch_attempt`` / ``_post_with_retries``）改由真端点集成套件
-承保。全程不睡真实墙钟：``_Clock`` 把模块内的 ``time.monotonic`` 与
-``asyncio.sleep`` 换成虚拟时钟。"""
+承保；离线套件只允许在 origin admission 前以资源边界哨兵检查每次 attempt 的 body
+handoff，不伪造 HTTP server 或 transport。全程不睡真实墙钟：``_Clock`` 把模块内的
+``time.monotonic`` 与 ``asyncio.sleep`` 换成虚拟时钟。"""
 from __future__ import annotations
 
 import asyncio
@@ -2346,11 +2347,14 @@ def test_complete_spec_assembles_url_body_parser_per_provider():
     prompt = PromptBundle(messages=(
         Message(role="user", parts=(Part(kind="text", text="hi"),)),))
 
-    prof = _llm_profile(base_url="https://llm-gw.example.com/v1/")
+    prof = _llm_profile(base_url="https://llm-gw.example.com/v1/",
+                        extra_body={"top_k": 50})
     spec = _client({"default": prof}, {}, _creds())._complete_spec(prof, prompt, SCHEMA)
     assert spec.kind == "llm" and spec.operation is None
     assert spec.url == "https://llm-gw.example.com/v1/chat/completions"
-    assert spec.build_body()["response_format"]["json_schema"]["schema"] == SCHEMA
+    body = spec.build_body()
+    assert body["top_k"] == 50
+    assert body["response_format"]["json_schema"]["schema"] == SCHEMA
     assert spec.parse({"model": "m", "choices": [
         {"message": {"content": "x"}, "finish_reason": "stop"}]}) == (
         "x", None, Usage(0, 0), "m", "stop")
@@ -2369,6 +2373,42 @@ def test_complete_spec_assembles_url_body_parser_per_provider():
     }]
     assert spec.parse({"content": [{"type": "text", "text": "y"}]})[0] == "y"
     assert spec.trace_extra == {} and spec.finalize_extra is None
+
+
+def test_retry_attempt_rebuilds_and_preserves_extra_body_before_http():
+    """每次 attempt 均重建并原样交接扩展字段；资源边界哨兵确保测试零网络。"""
+    prof = _llm_profile(extra_body={"top_k": 50})
+    built_bodies: list[dict] = []
+
+    def build_body() -> dict:
+        body = {"model": prof.model, **dict(prof.extra_body)}
+        built_bodies.append(body)
+        return body
+
+    spec = _CallSpec(
+        kind="llm", prof=prof, url="https://llm-gw.example.com/v1/chat/completions",
+        build_body=build_body, parse=lambda data: _parse_openai_response(data, prof.model))
+    client, ctx = _engine(prof, spec=spec)
+    ks, ku = _key(ctx)
+    stop = RuntimeError("stop before HTTP")
+
+    def stop_before_http(_resource_key):
+        raise stop
+
+    client._resources = SimpleNamespace(origin_for=stop_before_http)
+    for attempt in (0, 1):
+        ctx.attempt = attempt
+        with pytest.raises(RuntimeError) as caught:
+            asyncio.run(client._dispatch_attempt(ctx, ks, ku))
+        assert caught.value is stop
+
+    assert built_bodies == [
+        {"model": "test-model", "top_k": 50},
+        {"model": "test-model", "top_k": 50},
+    ]
+    assert built_bodies[0] is not built_bodies[1]
+    assert ks.in_flight == 0
+    assert client._http_client is None
 
 
 def test_complete_spec_renders_both_message_faces_at_the_full_tier():
