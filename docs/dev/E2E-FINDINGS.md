@@ -26,8 +26,59 @@ counterfactual suffix、stitch 不同会话的当前候选 wave，以及 `valida
 | changed production coverage | 已验证 | 19/19 个修改函数进入；4 个修改文件最低 line 90.58%、最低 branch 81.00% |
 | 完整 offline suite | 已验证 | `3026 passed, 48 deselected in 728.03s`；同一次运行生成 branch coverage，未缩小门面 |
 | keyless 真实入口 | 已验证 | sequence 主例 `validate` 通过；`dry-run` 为 2 sets、8 sequences、22 primary events、27 stream rows，零 LLM 调用且零输出写入 |
-| Uncle Bob mutation review | 待复核 | `[PENDING-EVIDENCE:concurrency-uncle-bob]`；按规则在提交并确认 caller checkout 干净后重新运行，并记录每个变异的身份、预期杀手测试与结果 |
+| Uncle Bob mutation review | 已验证 | probe/stitch 在 `a79edfe`、sequence 在测试加固提交 `42ad20d` 的 detached worktree 审查；31 个有效语义变异全部 killed，survived、invalid、inconclusive 均为 0 |
 | 真实 endpoint 吞吐 | 待运行 | `[PENDING-EVIDENCE:concurrency-real-throughput]`；未复用历史四槽数据声称本轮加速 |
+
+### 并发修复 Uncle Bob 台账
+
+三个分片分别先跑干净 baseline：probe 两文件 `219 passed`、scenario `62 passed`、stitch `57 passed`。每个
+mutation 只修改生产源码，运行预先声明的窄测试后立即用反向 patch 恢复，并以 `git diff --exit-code` 与
+porcelain status 空证明零残留。首轮 scenario 的 `fatal-cleanup-before-propagation` survived：旧测试在
+`asyncio.run()` 退出后才断言，事件循环 teardown 会替错误实现清理遗留任务。`42ad20d` 把断言移入同一运行中
+event loop，并补同 branch state/history 串行 oracle；重审后该变异与新增 branch 并发变异均 killed。
+
+| probe 变异身份 | 预声明杀手测试 | 结果 |
+|---|---|---|
+| `pool-key-serial` | pool key overlap barrier | killed：首任务内部 timeout |
+| `pool-key-reverse-settlement` | pool key declaration-order result | killed：结果变为 C/B/A |
+| `probe-constructor-escape` | constructor failures become ordered results | killed：泄漏 constructor RuntimeError |
+| `pool-key-active-cancel-bypass` | direct/self child cancellation cleanup | killed：两个分支均由测试内 timeout 失败 |
+| `pool-key-external-cancel-misclassify` | external cancellation identity | killed：取消参数丢失 |
+| `profile-serial` | referenced-profile overlap barrier | killed：首 profile 内部 timeout |
+| `profile-reverse-settlement` | referenced-profile declaration order | killed：embedding 结果错误居首 |
+| `profile-active-cancel-bypass` | direct/self profile cancellation cleanup | killed：两个分支均由测试内 timeout 失败 |
+| `profile-external-cancel-misclassify` | external profile cancellation identity | killed：取消参数丢失 |
+| `profile-failure-swallow` | primary probe failure priority | killed：主异常被吞、close failure 错误升级 |
+| `probe-cancel-skip-close` | external cancellation closes root once | killed：close 次数为 0 |
+
+| sequence 变异身份 | 预声明杀手测试 | 结果 |
+|---|---|---|
+| `suffix-serial` | suffix overlap barrier | killed：首 suffix 内部 timeout |
+| `baseline-validation-late` | baseline rejection starts zero suffix calls | killed：观察到 3 次 suffix 调用 |
+| `variant-results-reversed` | exact high-level variant order | killed：首结果不再是 positive |
+| `recoverable-select-last` | recoverable declaration priority | killed：选择末位 state_transition |
+| `fatal-exception-group-leak` | fatal original-exception identity | killed：泄漏 ExceptionGroup |
+| `suffix-active-cancel-bypass` | direct/self suffix cancellation cleanup | killed：两个分支均由测试内 timeout 失败 |
+| `suffix-external-cancel-misclassify` | external suffix cancellation identity | killed：取消参数丢失 |
+| `fatal-cleanup-before-propagation` | same-loop fatal cleanup assertion | killed：异常传播时 cleaned 仅为 1/3 |
+| `branch-events-parallel` | prior state/history visibility | killed：第二事件早于首事件 render 进入 |
+
+| stitch 变异身份 | 预声明杀手测试 | 结果 |
+|---|---|---|
+| `pass-one-sessions-serial` | pass-one multi-session overlap | killed：high-water 降为 1 |
+| `sessions-reverse-settlement` | wave judge event order | killed：事件顺序变为 b/a |
+| `wave-split-requests` | one ordered TaskGroupRequest per wave | killed：出现多个 request |
+| `repass-sessions-serial` | repass multi-session overlap | killed：high-water 降为 1 |
+| `provider-failure-escalation` | runtime fatal boundary and cross-session isolation | killed：ProviderFatalError 逃逸为 runtime fatal |
+| `schema-violation-as-failure` | one abstention plus valid majority | killed：首张违规票直接抛出 |
+| `abstention-shrinks-denominator` | two abstentions plus one valid vote | killed：单张合法票错误胜出 |
+| `all-violations-select-first` | all violations raise last declaration | killed：错误抛出第一张违规票 |
+| `vote-completion-order` | reverse-completion first-sample identity | killed：返回声明序末位样本 |
+| `leaf-nested-submit-after-success` | wave owns one request | killed：出现额外嵌套 request |
+| `leaf-nested-submit-before-normalization` | runtime rejects nested leaf submission | killed：触发 nested-task-group InternalError |
+
+最终合计为 31 killed、0 survived、0 invalid、0 inconclusive，implementation missing 与 implementation diverged
+均为 0。审查未修改测试或文档；probe、scenario、stitch worktree 最终均回到各自 baseline commit 且 status 为空。
 
 ## v1.21 序列交织证据看板
 
