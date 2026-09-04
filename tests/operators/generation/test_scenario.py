@@ -1051,6 +1051,95 @@ def test_declared_high_level_api_delivers_four_exact_variants(declared_config,
         assert "catalog-secret-a" not in user
 
 
+def test_declared_counterfactual_suffixes_overlap_after_baseline(
+    declared_config, declared_program, monkeypatch,
+):
+    """三条 sibling suffix 必须同时到达屏障，串行实现会超时。"""
+    plan = compile_scenario_plan(declared_program)
+    services, _engine, _metrics = _services(declared_config)
+    original = scenario_module._generate_variant
+    all_started = asyncio.Event()
+    active = high_water = 0
+
+    async def guarded(run, baseline, variant):
+        nonlocal active, high_water
+        active += 1
+        high_water = max(high_water, active)
+        if active == 3:
+            all_started.set()
+        try:
+            await asyncio.wait_for(all_started.wait(), timeout=1)
+            return await original(run, baseline, variant)
+        finally:
+            active -= 1
+
+    monkeypatch.setattr(scenario_module, "_generate_variant", guarded)
+    traces = asyncio.run(generate_slot_traces(
+        declared_program, plan, plan.delivery_slots[0], 0, services,
+    ))
+
+    assert high_water == 3
+    assert tuple(trace.variant_name for trace in traces) == plan.delivery_slots[0].variant_names
+
+
+def test_declared_suffix_fatal_cancels_and_settles_siblings(
+    declared_config, declared_program, monkeypatch,
+):
+    """fatal 必须等全部 sibling cleanup 后以原异常身份离开。"""
+    plan = compile_scenario_plan(declared_program)
+    services, _engine, _metrics = _services(declared_config)
+    all_started = asyncio.Event()
+    never = asyncio.Event()
+    started = cleaned = 0
+    fatal = RuntimeError("suffix fatal")
+
+    async def fail_one(_run, _baseline, variant):
+        nonlocal started, cleaned
+        started += 1
+        if started == 3:
+            all_started.set()
+        try:
+            await asyncio.wait_for(all_started.wait(), timeout=1)
+            if variant.name == "missing_acknowledgement":
+                raise fatal
+            await never.wait()
+        finally:
+            cleaned += 1
+
+    monkeypatch.setattr(scenario_module, "_generate_variant", fail_one)
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(generate_slot_traces(
+            declared_program, plan, plan.delivery_slots[0], 0, services,
+        ))
+
+    assert caught.value is fatal
+    assert started == 3 and cleaned == 3
+
+
+def test_declared_suffix_recoverable_uses_variant_declaration_order(
+    declared_config, declared_program, monkeypatch,
+):
+    """多个可恢复失败同时完成时选择最早声明的 variant。"""
+    plan = compile_scenario_plan(declared_program)
+    services, _engine, _metrics = _services(declared_config)
+    kinds = {
+        "missing_acknowledgement": "event_schema",
+        "confirmation_before_acknowledgement": "event_semantic",
+        "confirmation_timeout": "state_transition",
+    }
+
+    async def reject(_run, _baseline, variant):
+        raise GenerationAttemptRejected(kinds[variant.name], "ignored")
+
+    monkeypatch.setattr(scenario_module, "_generate_variant", reject)
+    with pytest.raises(GenerationAttemptRejected) as caught:
+        asyncio.run(generate_slot_traces(
+            declared_program, plan, plan.delivery_slots[0], 0, services,
+        ))
+
+    assert caught.value.kind == "event_schema"
+
+
 def test_state_oracle_exposes_replay_binding_outcome_and_prefix_failures_independently(
     declared_config, declared_program,
 ):

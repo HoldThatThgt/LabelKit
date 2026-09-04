@@ -13,6 +13,22 @@
 - API key value 只在内存中使用，不写日志、trace、main、stream、report、manifest、failed report 或 assertion repr。
 - 尚未运行的证据必须保留 `[PENDING-EVIDENCE:<name>]`，不能用规格期望冒充结果。
 
+## 2026-09-04 并发缺口修复证据
+
+本轮只增加三处已有依赖边允许的并发，不改变普通批屏障或同一状态链：declared baseline 后的 sibling
+counterfactual suffix、stitch 不同会话的当前候选 wave，以及 `validate --probe` 的 profile/密钥探测。
+
+| 证据面 | 当前状态 | 已知事实 / 输入边界 |
+|---|---|---|
+| 定向回归 | 已验证 | 390 passed；覆盖 scenario、stitch、LLM probe、Application probe 与 CLI 呈现 |
+| 同时在途屏障 | 已验证 | 6 passed；三个 suffix、两个 stitch session、三个 profile、三把 pool key 均须同时到达同步屏障 |
+| 顺序与失败语义 | 已验证 | variant/session/profile/key 仍按声明序归并；suffix fatal 等待 sibling cleanup；stitch ProviderFatal 保持候选级隔离 |
+| changed production coverage | 已验证 | 26/26 个修改函数进入；4 个修改文件最低 line 92.73%、最低 branch 80.21% |
+| 完整 offline suite | 已验证 | `3008 passed, 48 deselected in 573.19s`；未缩小门面 |
+| keyless 真实入口 | 已验证 | sequence 主例 `validate` 通过；`dry-run` 为 2 sets、8 sequences、22 primary events、27 stream rows，零 LLM 调用且零输出写入 |
+| Uncle Bob mutation review | 环境阻塞 | `[PENDING-EVIDENCE:concurrency-uncle-bob]`；caller checkout 含用户未跟踪文件与本轮未提交变更，强制 clean-checkout preflight 禁止启动 mutation phase |
+| 真实 endpoint 吞吐 | 待运行 | `[PENDING-EVIDENCE:concurrency-real-throughput]`；未复用历史四槽数据声称本轮加速 |
+
 ## v1.21 序列交织证据看板
 
 本节记录 2026-08-28 当前 checkout 的权重选择、partner pool、真实交织布局、报告、规模与本地真实模型证据。

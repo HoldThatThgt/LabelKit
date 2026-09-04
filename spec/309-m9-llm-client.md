@@ -44,10 +44,13 @@ class LLMClient:
 
     async def probe(self, resource_key: ResourceKey) -> ProbeResult   # validate --probe：按资源类型探测首密钥
     async def probe_all(self, resource_key: ResourceKey) -> list[ProbeResult]
-        """v1.6：逐密钥探测——按声明序每密钥一个 ProbeResult（增 key_env 字段：所用密钥的环境变量名，
-           单密钥 profile 为 None）；单密钥 profile 退化为 [await probe(resource_key)]。
+        """v1.6：逐密钥探测——池内密钥结构化并发，按声明序每密钥一个 ProbeResult（增 key_env 字段：
+           所用密钥的环境变量名，单密钥 profile 为 None）；单密钥 profile 退化为
+           [await probe(resource_key)]。
            ResourceKey 和 ProbeResult.kind 保证同名 llm/embedding profile 仍是两个独立探测目标。
-           validate --probe 使用本方法（2.4），成本 = 各被引用 profile 池大小之和 次探测调用。"""
+           validate --probe 还会结构化并发全部被引用 profile；输出仍按 (LLM, embedding, profile,
+           key) 声明序归并。全部真实调用继续受 profile 与 HTTP origin 许可约束。成本 = 各被引用
+           profile 池大小之和 次探测调用。"""
     async def aclose(self) -> None
         """仅根客户端拥有关闭权；幂等关闭共享 AsyncClient，实际关闭恰好一次。"""
     @property

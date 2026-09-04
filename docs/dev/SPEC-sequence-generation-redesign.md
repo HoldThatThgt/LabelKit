@@ -1262,7 +1262,9 @@ slot 数；它始终是连续声明序区间：
 替换占位。高 ordinal 提前完成或失败都继续占位，不得因为叶任务已结束而接纳窗口外 tail。
 
 每个 slot coordinator 同一时刻只运行一个 attempt。同一 branch 的事件按 state_after 依赖串行；declared baseline
-完成后，不同 counterfactual suffix 可以并发，结果按 variant 声明序归并。quality → annotate → verify 的阶段屏障
+完成后，不同 counterfactual suffix 由 branch coordinator 结构化并发，真实调用仍逐次取得准确的 ResourceManager
+许可，不把跨多次调用、可能跨 profile 的完整 branch 冒充单个 profile 叶任务。结果与可恢复失败按 variant 声明序
+归并；fatal/control 取消并等待 sibling cleanup 后原样传播。quality → annotate → verify 的阶段屏障
 不变，前一 gate 拒绝后不支付后一 gate。不同 attempt 使用不同 PipelineItem；同一 attempt 的叶调用只返回冻结
 outcome，再按 slot、attempt、stage 与叶 ordinal 归并。
 

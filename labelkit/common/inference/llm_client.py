@@ -1112,7 +1112,7 @@ class LLMClient:
     # -- 探针 -----------------------------------------------------------------
 
     async def _probe_keys(self, resource_key: ResourceKey, *, first_only: bool) -> list[ProbeResult]:
-        """按声明顺序逐把密钥探测。
+        """并发探测池内密钥，按声明顺序返回结果。
 
         @param resource_key 资源类型与剖面名
         @param first_only True = 只探第一把密钥（probe），False = 全池（probe_all）
@@ -1139,10 +1139,18 @@ class LLMClient:
         pooled = len(_declared_env_names(prof)) > 1 and not first_only
         if first_only:
             members = members[:1]
-        return [await self._probe_one(_ProbeTarget(
-                    profile=profile, prof=prof, is_llm=is_llm, env=env, key=key,
-                    key_env=env if pooled else None))
-                for env, key in members]
+        targets = tuple(
+            _ProbeTarget(
+                profile=profile, prof=prof, is_llm=is_llm, env=env, key=key,
+                key_env=env if pooled else None,
+            )
+            for env, key in members
+        )
+        tasks: list[asyncio.Task[ProbeResult]] = []
+        async with asyncio.TaskGroup() as group:
+            for target in targets:
+                tasks.append(group.create_task(self._probe_one(target)))
+        return [task.result() for task in tasks]
 
     async def _probe_one(self, target: _ProbeTarget) -> ProbeResult:
         """探测单把密钥。

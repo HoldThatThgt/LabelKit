@@ -327,6 +327,27 @@ def test_probe_uses_resources_and_closes_in_the_same_event_loop(monkeypatch):
     assert all(loop is state.close_loops[0] for loop in state.workflow_loops)
 
 
+def test_probe_referenced_profiles_overlap_but_flatten_in_declaration_order(monkeypatch):
+    application, state, cfg = _install_graph(monkeypatch)
+    all_started = asyncio.Event()
+    started: list[tuple[str, str]] = []
+
+    async def probe_all(self, resource_key):
+        self.probe_calls.append(resource_key)
+        started.append(resource_key)
+        if len(started) == 3:
+            all_started.set()
+        await asyncio.wait_for(all_started.wait(), timeout=1)
+        return [f"probe:{resource_key[0]}:{resource_key[1]}"]
+
+    monkeypatch.setattr(application.LLMClient, "probe_all", probe_all)
+    result = application.probe_referenced_profiles(cfg)
+
+    assert started == [("llm", "a"), ("llm", "b"), ("embedding", "e")]
+    assert result == ("probe:llm:a", "probe:llm:b", "probe:embedding:e")
+    assert state.clients[0].close_calls == 1
+
+
 def test_probe_distinguishes_same_named_llm_and_embedding_profiles(monkeypatch):
     application, state, cfg = _install_graph(monkeypatch)
     cfg.embedding_profiles["a"] = _profile("a", "https://embed.example/v1", 3)

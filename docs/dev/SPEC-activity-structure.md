@@ -245,8 +245,9 @@ flowchart TD
 M7 fail 先例，缝合改绑例外授权面不含 absorbed/dropped_noise→failed 帧迁移；
 救援候选不适用 fail 路径，判定失败一律按未命中处理，**审计发现·救援永不开线索**）。
 **二遍判定失败**：无论 on_error 取值一律降格为 keep 等价（已开线索无从 fail），
-计数器与 error 事件照发（实现定稿）。**会话串行**：池是串行决策过程，会话内候选
-顺序处理（确定性事件序、零 RNG）；并发仅存在于 votes>1 的采样 gather 内。
+计数器与 error 事件照发（实现定稿）。**会话内串行、会话间 wave 并发**：池是会话局部的串行决策过程，
+同一会话的候选顺序处理；不同会话的当前候选按会话声明序组成一轮 TaskExecutor wave，输入序归并后再推进下一轮。
+每轮事件按会话声明序确定，零 RNG；votes>1 的样本也并入同一个 wave。
 
 判定 Schema（M8 内部 Schema，`schema_engine.stitch_schema()`）：
 

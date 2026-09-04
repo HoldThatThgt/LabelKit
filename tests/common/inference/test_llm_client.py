@@ -1327,6 +1327,34 @@ def test_probe_all_pool_yields_one_result_per_key_in_declaration_order(monkeypat
     assert single.key_env is None and seen[-1] == ("KEY_A", "ka")
 
 
+def test_probe_all_pool_keys_overlap_but_results_keep_declaration_order(monkeypatch):
+    """三把密钥必须同时到达屏障，返回顺序仍按环境变量声明。"""
+    for env_name, key in (("KEY_A", "ka"), ("KEY_B", "kb"), ("KEY_C", "kc")):
+        monkeypatch.setenv(env_name, key)
+    prof = _llm_profile(api_key_envs=("KEY_A", "KEY_B", "KEY_C"))
+    client = _client(
+        {"default": prof}, {}, _creds(llm={"default": ("ka", "kb", "kc")})
+    )
+    all_started = asyncio.Event()
+    started: list[str] = []
+
+    async def probe_one(target):
+        started.append(target.env)
+        if len(started) == 3:
+            all_started.set()
+        await asyncio.wait_for(all_started.wait(), timeout=1)
+        return ProbeResult(
+            kind="llm", profile=target.profile, ok=True, model=target.prof.model,
+            latency_ms=0, key_env=target.key_env,
+        )
+
+    monkeypatch.setattr(client, "_probe_one", probe_one)
+    results = asyncio.run(client.probe_all(("llm", "default")))
+
+    assert started == ["KEY_A", "KEY_B", "KEY_C"]
+    assert [result.key_env for result in results] == ["KEY_A", "KEY_B", "KEY_C"]
+
+
 def test_probe_all_deduped_alias_keeps_first_declared_key_identity(monkeypatch):
     """同值别名坍缩后仍是声明层池，唯一结果保留首个 key_env。"""
     child = _ProbeChild()

@@ -1,6 +1,7 @@
 """v1.20 ScenarioSeed、EventPlan 与完整 slot branch 生成。"""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from collections import OrderedDict
@@ -31,7 +32,13 @@ from labelkit.common.contracts.generation import (
     StateEvaluationRequest,
 )
 from labelkit.common.config.generation import declared_actor_names, is_generation_frame_eligible
-from labelkit.common.errors import InternalError, SchemaViolation
+from labelkit.common.errors import (
+    ContextOverflowError,
+    InternalError,
+    OutputTruncatedError,
+    ProviderRetryableError,
+    SchemaViolation,
+)
 from labelkit.common.inference.generation_prompts import (
     enforce_prompt_value_limit,
     event_plan_prompt,
@@ -69,6 +76,8 @@ from labelkit.operators.generation.state import (
 
 
 _log = logging.getLogger("labelkit.generation.scenario")
+
+
 @dataclass(frozen=True)
 class _SlotRun:
     """一次 slot attempt 的内部生成根。"""
@@ -89,6 +98,29 @@ class _DraftRender:
     world_id: str  # 当前 branch 世界 ID。
     attempt_index: int  # 零基尝试序号。
     services: GenerationServices  # 生成服务根。
+
+
+@dataclass(frozen=True)
+class _VariantOutcome:
+    """一条 counterfactual suffix 的声明序结果。"""
+
+    ordinal: int  # variant 在 set 内的声明序号。
+    trace: EventTrace | None  # 成功生成的 branch trace。
+    error: Exception | None  # 可恢复失败；成功时为空。
+
+
+class _VariantFatal(Exception):
+    """在 TaskGroup 内绑定 fatal 的 variant 声明序。"""
+
+    def __init__(self, ordinal: int, error: Exception):
+        """保存原异常，供结构化清理后稳定还原。
+
+        @param ordinal variant 声明序号。
+        @param error 原 fatal/control/internal 异常。
+        """
+        self.ordinal = ordinal
+        self.error = error
+        super().__init__("counterfactual variant failed")
 
 
 async def generate_scenario_seed(
@@ -295,7 +327,7 @@ async def _run_slot(program, plan, slot, attempt_index: int, services):
 
 
 async def _generate_declared(run: _SlotRun):
-    """生成 hidden baseline 并按声明序派生全部变体。"""
+    """生成 hidden baseline，并发派生独立 suffix 后按声明序归并。"""
     source = next(
         item for item in run.program.counterfactual_sets
         if item.name == run.slot.source_name
@@ -304,15 +336,73 @@ async def _generate_declared(run: _SlotRun):
     baseline_name = None if positive is None else positive.name
     baseline = await _generate_fresh_branch(run, baseline_name, True)
     _require_expected(baseline, {})
-    traces = []
-    for variant in source.variants:
-        if variant.kind == "positive":
-            trace = baseline
-        else:
-            trace = await _generate_variant(run, baseline, variant)
-        _require_expected(trace, variant.expected_violation)
+    return await _generate_variant_set(run, baseline, source)
+
+
+async def _generate_variant_set(run: _SlotRun, baseline, source):
+    """结构化运行 sibling suffix，并按 variant 声明序选择结果。"""
+    tasks: dict[int, asyncio.Task[_VariantOutcome]] = {}
+    try:
+        async with asyncio.TaskGroup() as group:
+            for ordinal, variant in enumerate(source.variants):
+                if variant.kind != "positive":
+                    tasks[ordinal] = group.create_task(
+                        _generate_variant_outcome(run, baseline, variant, ordinal)
+                    )
+    except BaseExceptionGroup as group:
+        raise _unwrap_variant_group(group) from None
+    outcomes = {ordinal: task.result() for ordinal, task in tasks.items()}
+    traces: list[EventTrace] = []
+    for ordinal, variant in enumerate(source.variants):
+        outcome = outcomes.get(ordinal)
+        if outcome is not None and outcome.error is not None:
+            raise outcome.error
+        trace = baseline if outcome is None else outcome.trace
+        if trace is None:
+            _log.error("counterfactual variant completed without a trace")
+            raise InternalError("counterfactual variant completed without a trace")
+        if outcome is None:
+            _require_expected(trace, variant.expected_violation)
         traces.append(trace)
     return tuple(traces)
+
+
+async def _generate_variant_outcome(run: _SlotRun, baseline, variant,
+                                    ordinal: int) -> _VariantOutcome:
+    """生成一条 suffix，把可恢复失败冻结为普通结果。"""
+    try:
+        trace = await _generate_variant(run, baseline, variant)
+        _require_expected(trace, variant.expected_violation)
+        return _VariantOutcome(ordinal, trace, None)
+    except (GenerationAttemptRejected, ProviderRetryableError,
+            ContextOverflowError, OutputTruncatedError) as exc:
+        return _VariantOutcome(ordinal, None, exc)
+    except Exception as exc:
+        raise _VariantFatal(ordinal, exc) from exc
+
+
+def _unwrap_variant_group(group: BaseExceptionGroup) -> BaseException:
+    """从 TaskGroup 异常树中按 variant 声明序还原原异常。"""
+    leaves = _flatten_variant_group(group)
+    failures = [leaf for leaf in leaves if isinstance(leaf, _VariantFatal)]
+    if failures:
+        return min(failures, key=lambda failure: failure.ordinal).error
+    ordinary = [leaf for leaf in leaves if not isinstance(leaf, asyncio.CancelledError)]
+    if ordinary:
+        _log.error("counterfactual variant group raised an untracked exception")
+        return ordinary[0]
+    return asyncio.CancelledError()
+
+
+def _flatten_variant_group(group: BaseExceptionGroup) -> list[BaseException]:
+    """递归展开 branch-local TaskGroup 异常树。"""
+    leaves: list[BaseException] = []
+    for error in group.exceptions:
+        if isinstance(error, BaseExceptionGroup):
+            leaves.extend(_flatten_variant_group(error))
+        else:
+            leaves.append(error)
+    return leaves
 
 
 async def _generate_instruction(run: _SlotRun):

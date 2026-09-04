@@ -366,6 +366,13 @@ def aggregate_votes(samples: Sequence[Mapping]) -> Mapping | None:
 
 # ── 一次判决（votes 感知）──────────────────────────────────────────────────
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class _StitchFailure:
+    """一个应由候选 reducer 处置的普通叶失败。"""
+
+    error: Exception  # 原记录级异常。
+
+
 async def judge_stitch(thread_cards: Sequence[str], candidate_card: str,
                        ctx: "RunContext",
                        record_ids: tuple[str, ...],
@@ -384,28 +391,42 @@ async def judge_stitch(thread_cards: Sequence[str], candidate_card: str,
     @return 获胜的判决对象；票数分裂不足严格多数时为 None
     @raises SchemaViolation votes > 1 且全部样本都违规时重抛最后一次违规
     """
-    cfg = ctx.cfg
-    prompt = build_stitch_prompt(thread_cards, candidate_card, cfg)
+    specs = _stitch_task_specs(
+        thread_cards, candidate_card, ctx, record_ids, call_ordinal
+    )
+    results = await ctx.tasks.run_group(TaskGroupRequest(specs))
+    return _reduce_stitch_samples(results)
+
+
+def _stitch_task_specs(thread_cards: Sequence[str], candidate_card: str,
+                       ctx: "RunContext", record_ids: tuple[str, ...],
+                       call_ordinal: tuple[int, int, int]) -> tuple[TaskSpec, ...]:
+    """冻结一次候选判定的全部 vote 叶任务。"""
+    prompt = build_stitch_prompt(thread_cards, candidate_card, ctx.cfg)
     schema = stitch_schema()
-    n = cfg.stitch.votes
     scope = CallScope(record_ids=record_ids, batch_no=ctx.batch_no)
     ordinal_text = ":".join(str(value) for value in call_ordinal)
-    specs = tuple(
+    return tuple(
         TaskSpec(
             task_id=f"{ctx.task_namespace}:stitch:{ordinal_text}:vote:{vote}",
             declaration_key=(ctx.batch_no, 1, *call_ordinal, vote),
             stage="stitch",
-            resource_key=("llm", cfg.stitch.llm),
+            resource_key=("llm", ctx.cfg.stitch.llm),
             operation=lambda: _sample_stitch(ctx, prompt, schema, scope),
         )
-        for vote in range(n)
+        for vote in range(ctx.cfg.stitch.votes)
     )
-    results = await ctx.tasks.run_group(TaskGroupRequest(specs))
+
+
+def _reduce_stitch_samples(results: Sequence[object]) -> Mapping | None:
+    """按 vote 声明序归并一组冻结叶结果。"""
     samples: list[Mapping] = []
     last_violation: SchemaViolation | None = None
     for res in results:
         if isinstance(res, SchemaViolation):
             last_violation = res                   # 该样本弃权
+        elif isinstance(res, _StitchFailure):
+            raise res.error
         elif isinstance(res, BaseException):
             raise res                              # provider / 内部错误照常上抛
         else:
@@ -418,7 +439,7 @@ async def judge_stitch(thread_cards: Sequence[str], candidate_card: str,
 
 
 async def _sample_stitch(ctx: "RunContext", prompt: PromptBundle, schema: Mapping,
-                         scope: CallScope) -> tuple | Exception:
+                         scope: CallScope) -> tuple | _StitchFailure:
     """执行一个不修改业务状态的投票叶任务。
 
     @param ctx 运行上下文
@@ -434,7 +455,7 @@ async def _sample_stitch(ctx: "RunContext", prompt: PromptBundle, schema: Mappin
     except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
         raise
     except Exception as exc:
-        return exc
+        return _StitchFailure(exc)
 
 
 # ── 会话内状态 ──────────────────────────────────────────────────────────────
@@ -533,6 +554,30 @@ class _SessionState:
     position_of: Mapping[str, int]         # 帧 id → 会话序位置（首次出现为准）
     threads: list[_Thread]                 # 线索创建序列表，含被淘汰出池者
     pool: list[_Thread]                    # 开放线索池（单调选择池），容量 stitch.max_open
+
+
+@dataclasses.dataclass(slots=True)
+class _SessionWork:
+    """一个会话在跨会话 wave 中的推进游标。"""
+
+    state: _SessionState                  # 会话局部业务状态。
+    frames: list[PipelineItem]            # 会话全部帧信封。
+    candidates: list[_Candidate]          # pass-1 候选声明序。
+    next_candidate: int = 0               # 下一 pass-1 候选下标。
+    clock: int = 0                        # 已归并判决数。
+    repass_candidates: tuple[_Thread, ...] = ()  # pass-2 冻结候选。
+    next_repass: int = 0                  # 下一 pass-2 候选下标。
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _JudgmentPlan:
+    """一轮 wave 内一个会话的纯判定计划。"""
+
+    work: _SessionWork                    # 所属会话推进状态。
+    candidate: _Candidate                 # 当前候选快照。
+    pool_view: tuple[_Thread, ...]         # 当前提示词展示池。
+    specs: tuple[TaskSpec, ...]            # 当前候选全部 vote 叶任务。
+    repass_thread: _Thread | None          # pass-2 候选线索；pass-1 为空。
 
 
 def select_eviction(pool: Sequence[_Thread], candidate_pos: int,
@@ -646,13 +691,12 @@ class StitchStage:
 
     async def run(self, batch: list[PipelineItem],
                   ctx: "RunContext") -> list[PipelineItem]:
-        """逐会话缝合本批次的分段产物。
+        """以跨会话候选 wave 缝合本批次的分段产物。
 
         选择与幂等：会话严格按批内位置序（= 会话序）处理；episode 候选是尚未缝过的活跃
         sequence 信封（thread_id 在开线索时打戳，因此重入零调用）。零 episode 候选的会话整个
-        跳过——救援候选独自面对空池永远无法合并（B-2）。会话之间**串行**：池是一个串行决策
-        过程、线索状态是会话局部的——事件与判决顺序因此确定，零 rng（按 §3.5 成本模型，
-        每会话的调用数很少）。
+        跳过——救援候选独自面对空池永远无法合并（B-2）。同一会话严格逐候选推进；不同会话
+        的当前候选组成 TaskExecutor wave，按会话声明序归并后才进入下一轮。
 
         @param batch 本批次信封列表（原地改状态，绝不删除元素）
         @param ctx 运行上下文
@@ -674,24 +718,31 @@ class StitchStage:
                     and item.thread_id is None):
                 episodes_by_sid[item.session_id].append(item)
 
-        for session_ordinal, sid in enumerate(order):
-            if not episodes_by_sid[sid]:
-                continue
-            await self._run_session((session_ordinal, sid), frames_by_sid[sid],
-                                    episodes_by_sid[sid], ctx)
+        works = [
+            self._session_work((session_ordinal, sid), frames_by_sid[sid],
+                               episodes_by_sid[sid], ctx)
+            for session_ordinal, sid in enumerate(order)
+            if episodes_by_sid[sid]
+        ]
+        await self._run_pass_one(works)
+        if self.cfg.stitch.repass:
+            self._prepare_repass(works)
+            await self._run_repass(works)
+        for work in works:
+            self._finalize_session(work.state, work.frames)
         return batch                            # 同一个列表对象（②c）
 
-    # ── 单会话驱动 ───────────────────────────────────────────────────────────
+    # ── 跨会话 wave 驱动 ────────────────────────────────────────────────────
 
-    async def _run_session(self, session_key: tuple[int, str], frames: list[PipelineItem],
-                           episodes: list[PipelineItem],
-                           ctx: "RunContext") -> None:
-        """跑完一个会话：候选流 → 单调池判决 → 可选二次重判 → 收尾标记。
+    def _session_work(self, session_key: tuple[int, str], frames: list[PipelineItem],
+                      episodes: list[PipelineItem], ctx: "RunContext") -> _SessionWork:
+        """构造一个会话的局部状态和候选游标。
 
         @param session_key （本批声明序号, 会话 id）
         @param frames 该会话的全部帧信封，按会话序
         @param episodes 该会话尚未缝过的活跃 episode 信封
         @param ctx 运行上下文
+        @return 可参与跨会话 wave 的会话工作项
         """
         session_ordinal, sid = session_key
         position_of: dict[str, int] = {}
@@ -700,18 +751,61 @@ class StitchStage:
         session = _SessionState(sid=sid, ordinal=session_ordinal, ctx=ctx,
                                 position_of=position_of,
                                 threads=[], pool=[])
-
         candidates = self._assemble_candidates(frames, episodes, position_of)
-        clock = 0
-        for cand in candidates:
-            if cand.kind == "rescue" and not session.pool:
+        return _SessionWork(session, frames, candidates)
+
+    async def _run_pass_one(self, works: Sequence[_SessionWork]) -> None:
+        """逐 wave 运行每个会话的当前 pass-1 候选。"""
+        while True:
+            plans = tuple(
+                plan for work in works
+                if (plan := self._next_candidate_plan(work)) is not None
+            )
+            if not plans:
+                return
+            groups = await self._run_judgment_wave(plans)
+            for plan, results in zip(plans, groups, strict=True):
+                self._settle_judgment(plan, results)
+
+    def _next_candidate_plan(self, work: _SessionWork) -> _JudgmentPlan | None:
+        """取当前会话下一个需要真实判定的 pass-1 候选。"""
+        while work.next_candidate < len(work.candidates):
+            cand = work.candidates[work.next_candidate]
+            work.next_candidate += 1
+            if cand.kind == "rescue" and not work.state.pool:
                 continue                        # B-2：零调用，保持 dropped_noise
-            clock = await self._judge_candidate(session, cand, clock)
+            pool_view = tuple(sorted(
+                work.state.pool, key=lambda thread: thread.last_active, reverse=True
+            ))
+            return self._judgment_plan(work, cand, pool_view, None)
+        return None
 
-        if self.cfg.stitch.repass:
-            clock = await self._repass(session, clock)
+    def _judgment_plan(self, work: _SessionWork, cand: _Candidate,
+                       pool_view: tuple[_Thread, ...],
+                       repass_thread: _Thread | None) -> _JudgmentPlan:
+        """冻结一个候选的提示词与 vote 任务。"""
+        cards = self._pool_cards(pool_view, cand.members[0])
+        cand_card = render_candidate_card(
+            cand.kind, cand.members, (cand.first_pos, cand.last_pos), self.cfg
+        )
+        pass_ordinal = int(repass_thread is not None)
+        specs = _stitch_task_specs(
+            cards, cand_card, work.state.ctx, (cand.members[0].id,),
+            (work.state.ordinal, pass_ordinal, work.clock),
+        )
+        return _JudgmentPlan(work, cand, pool_view, specs, repass_thread)
 
-        self._finalize_session(session, frames)
+    async def _run_judgment_wave(
+        self, plans: Sequence[_JudgmentPlan],
+    ) -> tuple[tuple[object, ...], ...]:
+        """把不同会话的当前候选扁平化为一个 TaskExecutor wave。"""
+        specs = tuple(spec for plan in plans for spec in plan.specs)
+        results = await plans[0].work.state.ctx.tasks.run_group(TaskGroupRequest(specs))
+        width = self.cfg.stitch.votes
+        return tuple(
+            tuple(results[offset:offset + width])
+            for offset in range(0, len(results), width)
+        )
 
     def _assemble_candidates(self, frames: list[PipelineItem],
                              episodes: list[PipelineItem],
@@ -773,43 +867,52 @@ class StitchStage:
                     candidate_head, self.cfg)
                 for i, t in enumerate(pool_view, start=1)]
 
-    async def _judge_candidate(self, session: _SessionState, cand: _Candidate,
-                               clock: int) -> int:
-        """对一个 pass-1 候选跑一次判决并落状态。
-
-        判决失败走 on_error 处置（合同 ④ 记录级隔离：只有「大三样」向上逃逸）。
-
-        @param session 本会话状态
-        @param cand 当前候选
-        @param clock 会话内判决时钟
-        @return 递增后的判决时钟
-        """
-        pool_view = sorted(session.pool, key=lambda t: t.last_active,
-                           reverse=True)
-        cards = self._pool_cards(pool_view, cand.members[0])
-        cand_card = render_candidate_card(cand.kind, cand.members,
-                                          (cand.first_pos, cand.last_pos),
-                                          self.cfg)
+    def _settle_judgment(self, plan: _JudgmentPlan,
+                         results: Sequence[object]) -> None:
+        """按 wave 输入序归并一个候选结果并推进会话状态。"""
+        work = plan.work
         try:
-            outcome = await judge_stitch(cards, cand_card, session.ctx,
-                                         (cand.members[0].id,),
-                                         (session.ordinal, 0, clock))
+            outcome = _reduce_stitch_samples(results)
         except (CircuitBreakerTripped, KeyboardInterrupt,
                 asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001 — 记录级隔离绝对优先
-            _logger.error("stitch judgment failed: session=%s candidate=%s "
-                          "exc=%s", session.sid, cand.kind,
-                          type(exc).__name__,
-                          extra={"stage": self.name,
-                                 "batch": session.ctx.batch_no})
-            self._dispose_failure(session, cand, exc, clock)
-            return clock + 1
-        session.ctx.metrics.count(_COUNTER_JUDGMENTS)
-        decision = self._resolve_merge(outcome, pool_view, cand)
-        self._apply_decision(session, cand, outcome, decision, clock)
-        self._emit_judge(session, cand, outcome, decision, repass=False)
-        return clock + 1
+            self._settle_judgment_failure(plan, exc)
+            work.clock += 1
+            return
+        counter = (_COUNTER_REPASS_JUDGMENTS if plan.repass_thread is not None
+                   else _COUNTER_JUDGMENTS)
+        work.state.ctx.metrics.count(counter)
+        decision = self._resolve_merge(outcome, plan.pool_view, plan.candidate)
+        if plan.repass_thread is None:
+            self._apply_decision(
+                work.state, plan.candidate, outcome, decision, work.clock
+            )
+        elif decision.target is not None:
+            self._merge_pass2(
+                work.state, decision.target, plan.repass_thread, outcome, work.clock
+            )
+        self._emit_judge(
+            work.state, plan.candidate, outcome, decision,
+            repass=plan.repass_thread is not None,
+        )
+        work.clock += 1
+
+    def _settle_judgment_failure(self, plan: _JudgmentPlan,
+                                 exc: Exception) -> None:
+        """把一个普通判定失败隔离到所属候选。"""
+        session = plan.work.state
+        repass = plan.repass_thread is not None
+        label = "repass judgment" if repass else "judgment"
+        _logger.error(
+            "stitch %s failed: session=%s candidate=%s exc=%s",
+            label, session.sid, plan.candidate.kind, type(exc).__name__,
+            extra={"stage": self.name, "batch": session.ctx.batch_no},
+        )
+        if repass:
+            self._dispose_repass_failure(session, plan.candidate, exc)
+        else:
+            self._dispose_failure(session, plan.candidate, exc, plan.work.clock)
 
     # ── 合并闸门（T8 判决 × T9 先验）─────────────────────────────────────────
 
@@ -1006,80 +1109,66 @@ class StitchStage:
 
     # ── 二次重判（T19/M-2）───────────────────────────────────────────────────
 
-    async def _repass(self, session: _SessionState, clock: int) -> int:
-        """有界的二次重判。
+    @staticmethod
+    def _prepare_repass(works: Sequence[_SessionWork]) -> None:
+        """冻结每个会话在 pass-1 结束时的单碎片候选。"""
+        for work in works:
+            snapshot = [
+                thread for thread in work.state.threads
+                if thread.alive and len(thread.fragments) == 1
+            ]
+            snapshot.sort(key=lambda thread: thread.fragments[0].first_pos)
+            work.repass_candidates = tuple(snapshot)
 
-        候选 = pass 1 **结束时**仍只有一个碎片的线索（按其碎片的会话序）；目标集 = 该会话
-        其余所有存活线索。目标集是一个**活视图**——一次合并立即更新跨度与卡片；被并走的
-        候选就此消费。
+    async def _run_repass(self, works: Sequence[_SessionWork]) -> None:
+        """逐 wave 运行每个会话的当前 pass-2 候选。"""
+        while True:
+            plans = tuple(
+                plan for work in works
+                if (plan := self._next_repass_plan(work)) is not None
+            )
+            if not plans:
+                return
+            groups = await self._run_judgment_wave(plans)
+            for plan, results in zip(plans, groups, strict=True):
+                self._settle_judgment(plan, results)
 
-        @param session 本会话状态
-        @param clock 会话内判决时钟
-        @return 递增后的判决时钟
-        """
-        snapshot = [t for t in session.threads
-                    if t.alive and len(t.fragments) == 1]
-        snapshot.sort(key=lambda t: t.fragments[0].first_pos)
-        for cand_thread in snapshot:
+    def _next_repass_plan(self, work: _SessionWork) -> _JudgmentPlan | None:
+        """取当前会话下一个仍可判定的 pass-2 候选。"""
+        while work.next_repass < len(work.repass_candidates):
+            cand_thread = work.repass_candidates[work.next_repass]
+            work.next_repass += 1
             if not cand_thread.alive:
-                continue                        # 已在 pass 2 早些时候被并走
-            others = [t for t in session.threads
-                      if t.alive and t is not cand_thread]
-            if not others:
-                continue                        # 零调用
-            clock = await self._repass_one(session, cand_thread, others, clock)
-        return clock
+                continue
+            pool_view = self._repass_pool(work.state, cand_thread)
+            if not pool_view:
+                continue
+            cand = _Candidate(
+                "episode", cand_thread.members, cand_thread.head_pos,
+                cand_thread.tail_pos, envelope=cand_thread.envelope,
+            )
+            return self._judgment_plan(work, cand, pool_view, cand_thread)
+        return None
 
-    async def _repass_one(self, session: _SessionState, cand_thread: _Thread,
-                          others: list[_Thread], clock: int) -> int:
-        """对一条单碎片线索跑一次 pass-2 判决。
-
-        目标集超过 max_open 时按跨度距离截断，再按最近活跃降序展示。合并方向**反转**：候选信封变成空壳，目标线索
-        存活并把碎片按会话序重排。
-
-        @param session 本会话状态
-        @param cand_thread 作为候选的单碎片线索
-        @param others 该会话其余存活线索（非空）
-        @param clock 会话内判决时钟
-        @return 递增后的判决时钟
-        """
-        st = self.cfg.stitch
-        if len(others) > st.max_open:
-            others = sorted(
-                others,
-                key=lambda t: (span_distance(cand_thread.head_pos,
-                                             cand_thread.tail_pos,
-                                             t.head_pos, t.tail_pos),
-                               t.head_pos))[:st.max_open]
-        pool_view = sorted(others, key=lambda t: t.last_active, reverse=True)
-        cards = self._pool_cards(pool_view, cand_thread.members[0])
-        cand = _Candidate("episode", cand_thread.members,
-                          cand_thread.head_pos, cand_thread.tail_pos,
-                          envelope=cand_thread.envelope)
-        cand_card = render_candidate_card("episode", cand.members,
-                                          (cand.first_pos, cand.last_pos),
-                                          self.cfg)
-        try:
-            outcome = await judge_stitch(cards, cand_card, session.ctx,
-                                         (cand.members[0].id,),
-                                         (session.ordinal, 1, clock))
-        except (CircuitBreakerTripped, KeyboardInterrupt,
-                asyncio.CancelledError):
-            raise
-        except Exception as exc:  # noqa: BLE001 — 记录级隔离
-            _logger.error("stitch repass judgment failed: session=%s exc=%s",
-                          session.sid, type(exc).__name__,
-                          extra={"stage": self.name,
-                                 "batch": session.ctx.batch_no})
-            self._dispose_repass_failure(session, cand, exc)
-            return clock + 1
-        session.ctx.metrics.count(_COUNTER_REPASS_JUDGMENTS)
-        decision = self._resolve_merge(outcome, pool_view, cand)
-        if decision.target is not None:
-            self._merge_pass2(session, decision.target, cand_thread, outcome,
-                              clock)
-        self._emit_judge(session, cand, outcome, decision, repass=True)
-        return clock + 1
+    def _repass_pool(self, session: _SessionState,
+                     cand_thread: _Thread) -> tuple[_Thread, ...]:
+        """按跨度截断并排序一条 pass-2 候选的活目标池。"""
+        others = [
+            thread for thread in session.threads
+            if thread.alive and thread is not cand_thread
+        ]
+        if len(others) > self.cfg.stitch.max_open:
+            others.sort(key=lambda thread: (
+                span_distance(
+                    cand_thread.head_pos, cand_thread.tail_pos,
+                    thread.head_pos, thread.tail_pos,
+                ),
+                thread.head_pos,
+            ))
+            others = others[:self.cfg.stitch.max_open]
+        return tuple(sorted(
+            others, key=lambda thread: thread.last_active, reverse=True
+        ))
 
     def _dispose_repass_failure(self, session: _SessionState, cand: _Candidate,
                                 exc: Exception) -> None:

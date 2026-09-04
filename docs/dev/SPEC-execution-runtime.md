@@ -295,8 +295,10 @@ Context 的 admitted leaf，不新增固定 worker 或 dispatcher。
 
 ### 7.3 协调协程作用域
 
-SequenceWorkflow 在 execution domain 内拥有一个唯一 coordinator TaskGroup。sequence 每个在途槽位由一个协调协程
-推进，它可以分阶段调用 TaskExecutor。协调协程不计入叶任务接纳，也不直接取得 LLM/embedding 许可。任意逃逸
+SequenceWorkflow 在 execution domain 内拥有根 coordinator TaskGroup。sequence 每个在途槽位由一个协调协程
+推进；declared baseline 完成后，generation operator 可创建只覆盖 sibling counterfactual suffix 的 branch-local
+TaskGroup。协调协程不计入叶任务接纳，也不直接取得 LLM/embedding 许可；每次真实调用仍逐次取得准确的
+ResourceManager 许可。任意逃逸
 fatal 先由 coordinator wrapper 记录稳定身份，再触发 TaskGroup 取消所有 sibling coordinators；所有 cleanup 完成后
 按 `(phase declaration order, slot ordinal, attempt index, leaf declaration key)` 选择最小原始异常。
 
@@ -395,7 +397,7 @@ flowchart LR
 |---|---|---|
 | ingest | 无 | next-fit、硬切、批号与输入消费 |
 | segment | 每个判定窗口 | session/member 状态与 episode 追加 |
-| stitch | 当前候选的 vote samples | session、candidate、pool、repass 状态机 |
+| stitch | 不同 session 的当前候选及其 vote samples 组成同一 wave | 同一 session 的 candidate、pool、repass 状态机 |
 | dedup | semantic 开启时每个静态 eligible active item 的 embedding | 全层级按输入序 probe/commit，保持 first-writer-wins |
 | classify | sequence samples；归并后 frame windows | classification 写入与 fanout |
 | extract | 每个 transition | episode/member ordinal 回填 |
@@ -443,7 +445,8 @@ flowchart TB
 ```
 
 - 同一 branch 的事件按 state_after 依赖串行；不同 slot 并发。
-- declared baseline 完成后，不同 counterfactual suffix 可以并发，结果仍按 variant 声明序归并。
+- declared baseline 完成后，不同 counterfactual suffix 由 branch coordinator 结构化并发；完整 branch 不冒充某个
+  profile 的单一叶任务。结果与可恢复失败按 variant 声明序归并；fatal/control 等待 sibling cleanup 后原样传播。
 - quality → annotate → verify 的业务屏障不删除；前一 gate 拒绝后不支付后续 gate。
 - 不同 attempt 使用不同 PipelineItem；同一 attempt 内共享 item 的叶调用必须返回纯 outcome 后归并。
 - 高 ordinal 的 recoverable failure 提前完成后只保留结果，不自行重试或写报告。
@@ -929,7 +932,7 @@ dataset 与工件事件按归并/提交时序。
 | 阶段 | 必须证明 |
 |---|---|
 | segment | 窗口反序完成仍按 session/span 归并 |
-| stitch | 只有 vote samples 并发；前一候选决定后一 prompt/pool |
+| stitch | 同会话前一候选决定后一 prompt/pool；不同会话当前候选的 vote samples 在同一 wave 并发且按输入序归并 |
 | dedup | participating embedding 真实并发；exact twins、semantic twins、低槽 failure 反序仍 input-order first-writer |
 | classify | samples 与 frame windows 分阶段；fanout 按 item×label 声明序 |
 | extract | transition 反序完成仍按 member ordinal，episode all-or-none |
@@ -948,6 +951,7 @@ dataset 与工件事件按归并/提交时序。
 |---|---|
 | 全 attempt 跨槽并发 | quality/annotate/verify 的不同槽调用真实重叠 |
 | 同槽状态串行 | event N+1 不得早于 N 的 state_after |
+| 同槽 suffix 并发 | baseline 后至少三个 counterfactual suffix 同时在途，结果与 recoverable failure 按 variant 声明序归并 |
 | 声明序 commit | 六百槽反向完成仍严格零至五百九十九 |
 | 高槽失败延迟记账 | 高槽先拒绝、低槽耗尽时报告不含高槽 rejection |
 | reservation 失败优先级 | 高槽 quality failure、低槽后提交同内容时，高槽轮到后先记 dedup |

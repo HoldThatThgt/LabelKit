@@ -196,8 +196,10 @@ breaker、latency 与 embedding failure 证据保留。
 
 ### 3.17.6 Sequence 候选窗口与有序提交
 
-SequenceWorkflow 在 execution domain 内拥有唯一 coordinator TaskGroup。候选窗口始终是从 `next_commit` 起的连续
-声明序区间，容量是当前 phase 引用的不同 ResourceKey 容量之和并钳制到剩余 slot。permit 在创建 coordinator 前
+SequenceWorkflow 在 execution domain 内拥有根 coordinator TaskGroup；每个 declared slot 的 baseline 完成后，
+generation operator 可创建仅覆盖 sibling counterfactual suffix 的 branch-local TaskGroup。branch coordinator 不占
+某个 profile 的 TaskExecutor admission；其每次真实调用仍逐次取得准确的 ResourceManager 许可。候选窗口始终是从
+`next_commit` 起的连续声明序区间，容量是当前 phase 引用的不同 ResourceKey 容量之和并钳制到剩余 slot。permit 在创建 coordinator 前
 取得，跨 attempt、preparing、PreparedCandidate/PreparedNoiseCandidate、recoverable outcome、等待提交和 retry
 保留，只在该 ordinal commit 或终止 cleanup 后释放。高 ordinal 提前结束仍占原位置，不向窗口外补 tail。
 

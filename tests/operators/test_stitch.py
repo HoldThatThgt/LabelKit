@@ -1095,6 +1095,40 @@ def test_multi_session_batches_processed_independently_in_order():
     assert [e[3]["session_id"] for e in thread_events] == ["sa", "sb"]
 
 
+def test_multi_session_current_candidates_overlap_and_isolate_provider_failure():
+    """不同会话同一 wave 真并发，普通 provider failure 仍只影响所属候选。"""
+    class BarrierEngine:
+        def __init__(self):
+            self.started = 0
+            self.all_started = asyncio.Event()
+
+        async def complete_validated(self, _profile, _prompt, schema=None, *, scope):
+            del schema
+            self.started += 1
+            if self.started == 2:
+                self.all_started.set()
+            await asyncio.wait_for(self.all_started.wait(), timeout=1)
+            if scope.record_ids == ("a0",):
+                raise ProviderFatalError("bad request", profile="default")
+            return obj("new", task="B任务"), None, 1, "offline"
+
+    fa = [envelope(ui_frame("a0", 0, app="com.a"), "sa")]
+    fb = [envelope(ui_frame("b0", 0, app="com.b"), "sb")]
+    ep_a, ep_b = episode_of(fa, "sa"), episode_of(fb, "sb")
+    engine = BarrierEngine()
+
+    out, ctx = run_stage(
+        make_cfg(repass=False), [*fa, *fb, ep_a, ep_b], engine
+    )
+
+    assert out[-2:] == [ep_a, ep_b]
+    assert engine.started == 2
+    assert ep_a.status == ep_b.status == "active"
+    assert ctx.metrics.counters["stitch.failures"] == 1
+    thread_events = [event for event in ctx.metrics.events if event[0] == "stitch.thread"]
+    assert [event[3]["session_id"] for event in thread_events] == ["sa", "sb"]
+
+
 # ── v1.11 (V27①/spec 3.16.4 上下文预算 row): precise budget kinds ────────────
 
 def test_context_overflow_fail_records_precise_kind():

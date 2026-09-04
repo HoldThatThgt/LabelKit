@@ -3625,11 +3625,13 @@ class LLMClient:
         embedding profiles distinct."""
 
     async def probe_all(self, resource_key: ResourceKey) -> list[ProbeResult]:
-        """v1.6: one probe per pool key, declaration order, for llm AND embedding profiles
-        (each result carries key_env). Single-key profiles → 1-element list equal to
+        """v1.6: pool keys are probed concurrently, with one declaration-order result per key,
+        for llm AND embedding profiles (each result carries key_env). Single-key profiles → 1-element list equal to
         [await probe(resource_key)] with key_env=None. ProbeResult.kind preserves the resource
         identity when both profile tables declare the same name. Used by `validate --probe` (§7.12);
-        cost = pool size probes per referenced profile. Never raises."""
+        referenced profiles are also probed concurrently, while output remains in
+        (llm, embedding, profile, key) declaration order. Resource and origin permits remain
+        authoritative. Cost = pool size probes per referenced profile. Never raises."""
 
     async def aclose(self) -> None:
         """幂等关闭根实例拥有的共享 AsyncClient；probe child 没有关闭权。
@@ -4462,7 +4464,9 @@ parsed overrides through, so `--console` reaches M1 and the jsonl × explicit-ri
 `--probe`, it calls `probe_referenced_profiles`, which uses
 `labelkit.common.inference.credentials.referenced_profiles` and `LLMClient.probe_all` on every
 referenced profile (v1.6 — one line per key for pooled profiles; single-key output format
-unchanged); v1.10 (U13/U27): under `mode_resolved == "rich"` the probe result table is
+unchanged). Referenced profiles and each profile's pool keys run concurrently under the same
+ResourceManager profile/origin limits; results are flattened in (llm, embedding, profile, key)
+declaration order. v1.10 (U13/U27): under `mode_resolved == "rich"` the probe result table is
 rendered as a table ONLY when stdout is a TTY — script consumers keep the current line
 format (stdout channel duty unchanged). Any probe failure does not change the exit code
 unless config itself is invalid
@@ -4996,10 +5000,11 @@ private.)
 
 Normative behavior (spec 3.16):
 
-- **Selection & idempotency.** Sessions are processed strictly one at a time in batch position
-  order (= session order) — each decision observes the preceding pool state, giving a
-  deterministic event/judgment order with zero rng (concurrency exists only inside a
-  votes > 1 sample gather). Episode candidates = active sequence envelopes with
+- **Selection & idempotency.** Each session observes its preceding pool state and therefore
+  advances candidates strictly in session order. Current candidates from different sessions
+  form one TaskExecutor wave in batch-position order; results are reduced in that input order
+  before the next wave, giving a deterministic event/judgment order with zero rng. `votes > 1`
+  samples join the same wave. Episode candidates = active sequence envelopes with
   `thread_id is None` (`thread_id` is stamped at thread opening, so re-entry costs zero
   calls); sessions with zero episode candidates are skipped whole — rescue candidates alone
   can never merge into an empty pool (B-2).

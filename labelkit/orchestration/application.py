@@ -431,15 +431,32 @@ def probe_referenced_profiles(cfg: ResolvedConfig) -> tuple["ProbeResult", ...]:
                        resolve_credentials(cfg), resources, None)
 
     async def _probe_all() -> tuple[ProbeResult, ...]:
-        """依次探测全部被引用 profile。
+        """并发探测全部被引用 profile，按声明序归并结果。
 
         @return 探测结果 tuple
         """
+        resource_keys = tuple(
+            [("llm", name) for name in llm_names]
+            + [("embedding", name) for name in emb_names]
+        )
+
+        async def _capture(resource_key):
+            """保留测试替身或内部缺陷的原异常身份。"""
+            try:
+                return await client.probe_all(resource_key)
+            except Exception as exc:  # noqa: BLE001 —— 归并后按 profile 声明序还原
+                return exc
+
+        tasks = []
+        async with asyncio.TaskGroup() as group:
+            for resource_key in resource_keys:
+                tasks.append(group.create_task(_capture(resource_key)))
         results: list[ProbeResult] = []
-        for name in llm_names:
-            results.extend(await client.probe_all(("llm", name)))
-        for name in emb_names:
-            results.extend(await client.probe_all(("embedding", name)))
+        for task in tasks:
+            outcome = task.result()
+            if isinstance(outcome, Exception):
+                raise outcome
+            results.extend(outcome)
         return tuple(results)
 
     return asyncio.run(_run_and_close(client, _probe_all, None))
