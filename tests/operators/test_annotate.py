@@ -93,7 +93,11 @@ from labelkit.common.errors import (
 )
 from labelkit.common.extensions.hooks import ResolvedHook
 from labelkit.common.inference import budget as budget_mod
-from labelkit.common.inference.schema_engine import CandidateFinalizerContractError, _thaw_json
+from labelkit.common.inference.schema_engine import (
+    CandidateFinalizerContractError,
+    SchemaEngine,
+    _thaw_json,
+)
 
 USER_SCHEMA = {
     "type": "object",
@@ -1445,6 +1449,39 @@ def test_annotate_member_routes_explicit_frame_schema():
     assert metrics.counters == {"frame_annotate.annotated": 1}
 
 
+def test_frame_without_postprocessor_skips_user_validator_and_resolved_at():
+    """无工程函数的帧调用仍保持内部 Schema 待遇。"""
+    class FixedCompletion:
+        def __init__(self):
+            self.schemas = []
+
+        async def complete(self, _profile, _prompt, response_schema=None):
+            self.schemas.append(response_schema)
+            return _NS(
+                text="", structured={"intent": "book_train", "entities": ["上海"]},
+                usage=Usage(1, 1), model="m", latency_ms=1,
+            )
+
+    validator_calls = []
+
+    def validator(obj, record):
+        validator_calls.append((obj, record))
+        return []
+
+    cfg = make_frame_cfg()
+    completion = FixedCompletion()
+    engine = SchemaEngine(cfg.user_schema, completion, cfg.output, validator=validator)
+    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=_FrameMetrics(), batch_no=1)
+
+    annotation = _asyncio.run(annotate_member_leaf(text_member(0), ctx))
+
+    assert annotation.output == {"intent": "book_train", "entities": ["上海"]}
+    assert completion.schemas == [FRAME_SCHEMA]
+    assert (validator_calls, engine.stats) == ([], {
+        "l0_or_clean": 0, "l1": 0, "l3_1": 0, "l3_2": 0, "rejected": 0,
+    })
+
+
 def test_annotate_member_failure_swallows_counts_and_returns_none():
     cfg = make_frame_cfg()
     member = text_member(0)
@@ -2480,6 +2517,61 @@ def test_frame_global_and_class_postprocessors_use_real_member_raw():
     assert first.raw == {"text": "步骤文本0"}
     assert second.raw == {"text": "步骤文本1"}
     assert all(call.scope.user_treatment is None for call in engine.calls)
+
+
+def test_frame_prompt_response_schema_and_budget_use_model_frame_schema():
+    frame_full = {
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string"},
+            "source": {
+                "type": "string", "description": "大" * 10000,
+                "x-labelkit-postprocessor": True,
+            },
+        },
+        "required": ["intent", "source"],
+        "additionalProperties": False,
+    }
+    frame_model = {
+        "type": "object",
+        "properties": {"intent": {"type": "string"}},
+        "required": ["intent"],
+        "additionalProperties": False,
+    }
+
+    def complete(obj, record):
+        obj["source"] = record["text"]
+        return obj
+
+    base = make_frame_cfg()
+    profile = _structured_profile(3000)
+    cfg = replace(
+        base,
+        frame_annotate=replace(
+            base.frame_annotate,
+            resolved_postprocessor=_resolved_postprocessor(complete, "frame_budget"),
+        ),
+        frame_schema=frame_full,
+        model_frame_schema=frame_model,
+        llm_profiles={"default": profile},
+    )
+    engine = _PostprocessorEngine([{"intent": "book_train"}])
+
+    annotation = _asyncio.run(annotate_member_leaf(
+        text_member(0), budget_ctx(cfg, engine, image_cost=0),
+    ))
+
+    assert annotation.output == {"intent": "book_train", "source": "步骤文本0"}
+    (call,) = engine.calls
+    prompt_text = "\n".join(
+        part.text or "" for message in call.prompt.messages for part in message.parts
+    )
+    assert '"source"' not in prompt_text
+    assert _thaw_json(call.model_schema) == frame_model
+    assert _thaw_json(call.final_schema) == frame_full
+    assert budget_mod.est_text(json.dumps(frame_full, ensure_ascii=False)) > (
+        budget_mod.input_budget(profile)
+    )
 
 
 def test_postprocessor_error_isolates_one_record_and_keeps_sibling():

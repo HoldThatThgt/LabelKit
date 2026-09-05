@@ -139,6 +139,24 @@ def test_record_class_can_own_schema_and_hook_without_global_postprocessor(env):
     assert cfg.class_views["writing"].model_schema == cfg.model_user_schema
 
 
+def test_record_class_full_schema_is_deeply_frozen(env):
+    schema = _schema()
+    schema["properties"]["value"]["enum"] = ["hi"]
+    body = CLASSIFY_BODY + "\n[class.qa.annotate]\n" + _annotation()
+    body += "schema_inline = '''\n" + json.dumps(schema) + "\n'''\n"
+    cfg = env.load(project_text=env.project(body=body))
+    full = cfg.class_views["qa"].schema
+    assert full["properties"]["value"]["enum"] == ("hi",)
+    with pytest.raises(TypeError):
+        full["properties"]["value"]["type"] = "integer"
+    with pytest.raises(AttributeError):
+        full["properties"]["value"]["enum"].append("changed")
+    with pytest.raises(AttributeError):
+        full["required"].append("changed")
+    assert full["required"] == ("value", "length")
+    assert full["properties"]["length"][MARKER] is True
+
+
 def test_frame_global_and_class_overrides_freeze_shared_projection(env):
     body = SEG_ON + FRAME_CLASSIFY_ONLY + _frame()
     body += '\n[frame.class.task_request.annotate]\npostprocessor = "hooks.py:other"\n'
@@ -176,6 +194,35 @@ def test_fewshot_expected_output_must_include_required_code_fields(env, location
         body += "\n[frame.class.task_request.annotate]\n" + missing
     errors = env.errors(project_text=env.project(body=body, annotate_body=annotate, schema=json.dumps(_schema())))
     assert any("length" in error and "required" in error for error in errors), errors
+
+
+@pytest.mark.parametrize("location", ["global", "class", "frame", "frame_class"])
+def test_fewshot_code_owned_values_must_satisfy_final_constraints(env, location):
+    invalid = 'examples = [{ input = "hi", output = { value = "hi", length = -1 } }]\n'
+    body = ""
+    annotate = _annotation(examples=False)
+    if location == "global":
+        annotate += invalid
+    elif location == "class":
+        body = CLASSIFY_BODY + "\n[class.qa.annotate]\n" + invalid
+    elif location == "frame":
+        body = SEG_ON + _frame(examples=False) + invalid
+    else:
+        body = SEG_ON + FRAME_CLASSIFY_ONLY + _frame(examples=False)
+        body += "\n[frame.class.task_request.annotate]\n" + invalid
+    project = env.project(body=body, annotate_body=annotate, schema=json.dumps(_schema()))
+    errors = env.errors(project_text=project)
+    sections = {
+        "global": "annotate.examples",
+        "class": "class.qa.annotate.examples",
+        "frame": "frame.annotate.examples",
+        "frame_class": "frame.class.task_request.annotate.examples",
+    }
+    assert any(
+        f"[[{sections[location]}]][1].output" in error
+        and "less than the minimum of 0" in error
+        for error in errors
+    ), errors
 
 
 @pytest.mark.parametrize("location", ["global", "class", "frame", "frame_class"])
@@ -306,6 +353,60 @@ def test_model_budget_omits_code_owned_schema_content(env):
     assert "length" not in cfg.model_user_schema["properties"]
 
 
+def test_class_static_budget_uses_its_projected_model_schema(env):
+    class_schema = _schema()
+    class_schema["properties"]["length"]["description"] = "派生" * 10000
+
+    def project(schema):
+        body = CLASSIFY_BODY + "\n[class.qa.annotate]\n" + _annotation(examples=False)
+        body += "schema_inline = '''\n" + json.dumps(schema) + "\n'''\n"
+        return env.project(
+            schema=json.dumps(_schema()),
+            annotate_body=_annotation(examples=False),
+            body=body,
+        )
+
+    cfg = env.load(config_text=_cw_config(5500), project_text=project(class_schema))
+    view = cfg.class_views["qa"]
+    assert len(view.schema["properties"]["length"]["description"]) == 20000
+    assert "length" not in view.model_schema["properties"]
+    assert "description" not in cfg.user_schema["properties"]["length"]
+
+    unmarked = json.loads(json.dumps(class_schema))
+    del unmarked["properties"]["length"][MARKER]
+    errors = env.errors(config_text=_cw_config(5500), project_text=project(unmarked))
+    assert any(
+        "[annotate]: static system-side prompt parts estimated" in error
+        for error in errors
+    ), errors
+
+
+def test_frame_static_budget_uses_its_projected_model_schema(env):
+    frame_schema = _schema()
+    frame_schema["properties"]["length"]["description"] = "派生" * 10000
+
+    def project(schema):
+        frame = _frame(examples=False).replace(json.dumps(_schema()), json.dumps(schema))
+        return env.project(
+            schema=json.dumps(_schema()),
+            annotate_body=_annotation(examples=False),
+            body=SEG_ON + frame,
+        )
+
+    cfg = env.load(config_text=_cw_config(12000), project_text=project(frame_schema))
+    assert len(cfg.frame_schema["properties"]["length"]["description"]) == 20000
+    assert "length" not in cfg.model_frame_schema["properties"]
+    assert "description" not in cfg.user_schema["properties"]["length"]
+
+    unmarked = json.loads(json.dumps(frame_schema))
+    del unmarked["properties"]["length"][MARKER]
+    errors = env.errors(config_text=_cw_config(12000), project_text=project(unmarked))
+    assert any(
+        "[frame.annotate]: static system-side prompt parts estimated" in error
+        for error in errors
+    ), errors
+
+
 @pytest.mark.parametrize("location", ["global", "class", "frame", "frame_class"])
 def test_model_budget_omits_large_code_owned_fewshot_in_every_namespace(env, location):
     schema = _schema()
@@ -385,6 +486,7 @@ def test_unknown_class_reference_is_loaded_once_without_executing_business_hook(
 
 def _temporal_with_code(tmp_path):
     root, project = _complete_temporal_project(tmp_path)
+    (root / "out").mkdir(exist_ok=True)
     hook_file = root / "hooks.py"
     hook_file.write_text(hook_file.read_text(encoding="utf-8") + HOOK_SOURCE, encoding="utf-8")
     target = root / "schemas" / "annotation.json"

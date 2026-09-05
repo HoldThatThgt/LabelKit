@@ -18,6 +18,11 @@ from labelkit.operators.generation.program import (
     compile_generation_program,
     generation_program_digest,
 )
+from tests.operators.generation.test_project import (
+    _independent_domain_digest,
+    _independent_semantic_value,
+    _stable_digest_program,
+)
 
 
 _RSS_LIMIT_BYTES = 4 * 1024**3
@@ -445,11 +450,14 @@ def test_program_accepts_500000_record_units_with_lightweight_carrier_oracle(ins
 def test_planner_accepts_500000_record_units_without_interleaving(instruction_config):
     """真实 planner 冻结十万条四事件 sequence，并保持交织关闭。"""
     config = _instruction_scale_config(instruction_config, count=100_000, length=4)
-    program = compile_generation_program(config)
+    program = _stable_digest_program(compile_generation_program(config))
+    assert program.digest == _independent_domain_digest(
+        "generation_program", _independent_semantic_value(program),
+    )
 
     plan = compile_scenario_plan(program)
 
-    assert plan.digest == "20bf9ab1ba812ab4272e306f2f61f4801e2a13a69cf447b39afc62c04c3b3f8c"
+    assert plan.digest == "2e244046b99f680ad527ef6ad4e36fcf70d5a2fb181ac1fcdeee8546b3efb9f6"
     assert len(plan.delivery_slots) == 100_000
     assert sum(len(events) for block in plan.blocks for events in block.values()) == 400_000
     assert plan.interleaving_opportunities == 0

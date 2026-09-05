@@ -27,8 +27,8 @@
 | SchemaEngine 隔离 | 已验证 | inference 套件 397 passed；新增 5 个定稿顺序、L3 调用次数、validator 深复制和程序错误身份用例 |
 | 工程示例离线门 | 已验证 | 12 passed；含多实体、分隔符、缺失上下文、歧义、伪造位置/长度的拒绝，以及两个工程的冻结计划 |
 | 真实本地 4B | 已验证 | `1 passed in 27.51s`；实际调用生产 `execute_run`，两次普通标注和一次带帧、replay 的 sequence 交付全部通过独立检查器 |
-| 完整离线与覆盖门 | 已验证 | 补齐独立复核断言后的最终门为 `3224 passed, 49 deselected in 670.75s`；79/79 修改函数进入；17 个修改生产文件最低行覆盖 88.65%、最低分支覆盖 77.50% |
-| Uncle Bob mutation review | 待运行 | 用户已授权本地提交及隔离语义变异；以本轮干净提交执行，完成后记录独立台账 |
+| 完整离线与覆盖门 | 已验证 | 隔离测试修复后的完整门为 `3239 passed, 49 deselected, 2 warnings in 702.15s`；79/79 修改函数进入；17 个修改生产文件最低行覆盖 90.05%、最低分支覆盖 77.50% |
+| Uncle Bob mutation review | 复审准备中 | 首轮为 172 killed、18 survived、1 invalid、1 inconclusive，另有一个因基线失败未计分的回放 probe；对应测试已补强，最终结论须等待干净提交上的复审 |
 | 外部端点发布门 | 本轮未运行 | `[PENDING-EVIDENCE:postprocessing-deepseek]`、`[PENDING-EVIDENCE:postprocessing-zai]`；用户指定的本轮特性真实验收为本地 4B |
 
 ### 本地模型身份与可复现命令
@@ -91,9 +91,63 @@ sequence 的模型负责摘要及帧的请求身份、状态，工程函数计�
 最终真实日志为 `local-4b-e2e-final.log`，最终工件位于
 `live-test-final/test_real_local_postprocessing0/examples/annotation-postprocessing/out/`。
 完整离线命令为 `uv run --python 3.12 pytest -q -m 'not integration' --cov=labelkit --cov-branch`，
-补齐独立复核断言后的最终日志为 `acceptance-offline.log`，覆盖 JSON 为 `coverage-acceptance.json`，
+此前补齐独立复核断言的日志为 `acceptance-offline.log`，覆盖 JSON 为 `coverage-acceptance.json`，
 逐修改函数及文件证据为 `acceptance-production-coverage.json`。比较 `9f88620` 与本轮 AST 得到 79 个新增或
 修改函数；全部进入。此前已通过的 3211 用例完整运行及其覆盖日志也保留，没有覆盖失败或旧门证据。
+
+### 首轮语义变异与测试补强
+
+用户已授权本地提交、隔离 worktree 中的临时生产语义变异及必要修复提交，不推送。首轮审查基线为
+`2b62fae49f54290bc068fc1e9f289c71a21f9e64`，三个审查分区的 worktree 均已恢复零 diff 并移除，
+caller 的 HEAD 和完整 status 保持不变。
+
+| 审查范围 | Killed | Survived | Invalid | Inconclusive | 其他未计分证据 |
+|---|---:|---:|---:|---:|---|
+| 配置、投影与工程函数 | 109 | 12 | 1 | 1 | 无 |
+| 结构引擎、标注与 verify | 38 | 3 | 0 | 0 | 无 |
+| 序列冻结、交付与工程示例 | 25 | 3 | 0 | 0 | 回放 retained bytes 的原预声明宽基线失败 |
+
+Survived 表示预声明局部 oracle 没有检测该变异，不能据此推断完整测试库也无法检测。首次缓存隔离不足的
+试跑已撤销计分；所有上述正式结果均使用逐次独立的 `PYTHONPYCACHEPREFIX`，并验证生产导入来自隔离
+worktree。模块导入次数没有规范依据，对应变异列为 invalid，不计入有效变异。
+
+凭据测试曾在 pytest 格式化失败时继续拦截全局环境读取，造成 inconclusive；修复为只在实际配置加载的
+作用域内拦截。原 sequence 宽基线依赖 checkout 绝对路径的摘要金值，保留 `1 failed, 377 passed`，
+不通过 deselect 缩小分母；现复用既有稳定路径 fixture，原宽基线已达到 `379 passed`。
+
+| 补强范围 | 新增的可观察断言 |
+|---|---|
+| 返回、冻结与调用隔离 | 返回完整字典替换候选；引用与 callable、类完整 Schema 不可变；缺失 raw 保持 None；sys.path 不变；每个候选恰调用一次 |
+| 模型投影与静态预算 | 普通 required 保留；递归数组和 object default 投影；完整 few-shot 值约束；类与帧使用各自模型 Schema 计价 |
+| 标注与 verify | 帧提示词、response Schema 和预算一致；无 hook 帧仍不运行记录 validator 或累计 resolved_at；verify 评审不重复调用 hook |
+| 交付与资源计数 | manifest report hash 独立复算；非空 main/stream 摘要及 main 等长变化敏感性；冻结完整帧 Schema 绑定；真实候选装配计入非空 replay 并在超限时回滚 |
+
+首轮完整报告与逐条 patch、命令、因果日志保留于以下本地目录：
+
+- `/tmp/labelkit-bob-config-20260905.1T2vSl/`
+- `/tmp/labelkit-annotation-postprocessing-bob.cp6mRB-results/`；报告为
+  `/tmp/labelkit-annotation-postprocessing-bob.cp6mRB-report.md`。
+- `/tmp/labelkit-bob-postprocess-delivery.wgi3bm/`
+
+测试补强工作区和完整回归证据为 `/tmp/labelkit-postprocessor-hardening.jZBxxM/`。本次补强没有修改生产代码
+或实际工程示例函数，真实本地 4B 证据仍对应相同的实现语义。最终复审完成前不声称全部有效变异已 killed。
+
+补强后的首次隔离完整门保留 `4 failed, 3234 passed, 49 deselected in 670.77s`，日志为上述目录的
+`full-offline.log`。其中两个大规模规划金值仍依赖 checkout 绝对路径，两个示例测试依赖未跟踪的 out 目录。
+示例测试现明确通过 CLI 覆盖把输出指向 tmp_path，窄门为 `12 passed in 1.83s`。规模测试复用并扩展既有
+固定路径 fixture；两个不同绝对根的 declared 和 instruction-only program 在处理后具有相同的独立语义
+摘要。固定向量与双根检查为 `2 passed in 0.91s`，实际两个规模用例为 `2 passed in 474.17s`，保留固定摘要、
+记录规模、solver 调用数和资源约束；600 分支的最终 plan 另以独立材料及 domain SHA-256 复算。
+相关证据为 `path-normalization-input-evidence.log`、`path-stable-scale-final.log` 和
+`generation-import-proof.log`。新完整门在这些修复后重新执行，旧失败日志保留。
+
+隔离测试修复后的最终完整门为 `3239 passed, 49 deselected, 2 warnings in 702.15s`。
+日志为 `full-offline-green.log`，分支覆盖为 `coverage-hardening-green.json`，逐文件与修改函数证据为
+`final-production-coverage.json`；均位于 `/tmp/labelkit-postprocessor-hardening.jZBxxM/`。
+使用 caller 的 Python 3.12 环境、显式 hardening `PYTHONPATH` 和本次专属的 `PYTHONPYCACHEPREFIX`，
+执行 `python -m pytest -q -m 'not integration' --cov=labelkit --cov-branch`，没有缩小完整离线门。
+79/79 修改生产函数进入，17 个修改生产文件最低行覆盖为 90.05%、最低分支覆盖为 77.50%。
+同一批补强测试通过 Ruff 0.16.6 的 E4/E7/E9/F 检查，目标版本为 Python 3.12。
 
 ## 2026-09-04 并发缺口修复证据
 

@@ -44,6 +44,7 @@ from labelkit.operators.generation.project import canonical_delivery_row, canoni
 from labelkit.orchestration.sequence_workflow import (
     _AttemptOutcome,
     _DeliveryController,
+    _PrimaryBuild,
     _prepared_digest,
     deliver_generation,
     estimate_sequence,
@@ -432,7 +433,12 @@ def test_candidate_capacity_sums_distinct_enabled_resource_keys_only() -> None:
 async def test_downstream_barriers_bind_only_frozen_program_views() -> None:
     """workflow 按 quality→annotate→verify 屏障传递 program-bound 类与帧视图。"""
     cfg = load(_EXAMPLE / "config.toml", _EXAMPLE / "project.toml", CliOverrides())
-    cfg = replace(cfg, model_frame_schema={"type": "object", "properties": {"value": {"type": "string"}}})
+    frame_schema = {
+        "type": "object",
+        "properties": {"value": {"type": "string"}, "derived": {"type": "integer"}},
+    }
+    model_frame_schema = {"type": "object", "properties": {"value": {"type": "string"}}}
+    cfg = replace(cfg, frame_schema=frame_schema, model_frame_schema=model_frame_schema)
     from labelkit.common.extensions.hooks import ResolvedHook
     from labelkit.operators.generation.planner import compile_scenario_plan
     from labelkit.operators.generation.program import compile_generation_program
@@ -449,7 +455,8 @@ async def test_downstream_barriers_bind_only_frozen_program_views() -> None:
     plan = compile_scenario_plan(program)
     controller, metrics, _dedup = _controller(count=1)
     controller.generation.config = replace(
-        cfg, model_frame_schema={"type": "integer"}, class_views={}, frame_class_views={},
+        cfg, frame_schema={"type": "integer"}, model_frame_schema={"type": "integer"},
+        class_views={}, frame_class_views={},
     )
     controller.request.program = program
     controller.request.plan = plan
@@ -463,6 +470,7 @@ async def test_downstream_barriers_bind_only_frozen_program_views() -> None:
             assert request.run_context.cfg.class_views is program.class_views
             assert request.run_context.cfg.frame_class_views is program.frame_classes
             assert request.run_context.cfg.frame_schema is program.frame_schema
+            assert request.run_context.cfg.frame_schema["type"] == "object"
             assert request.run_context.cfg.model_frame_schema is program.model_frame_schema
             assert request.run_context.cfg.model_frame_schema["type"] == "object"
             frozen_cfg = request.run_context.cfg
@@ -1614,6 +1622,60 @@ def _real_temporal_bundle():
     from tests.operators.generation.test_project import _build_temporal_projected_set
 
     return _build_temporal_projected_set(compile_generation_program(cfg))
+
+
+def test_primary_candidate_and_capacity_include_projected_replay_bytes() -> None:
+    """真实 candidate 装配与容量门都计入非空 replay canonical bytes。"""
+    program, plan, projection, sequence, _noise, expected_replay = _real_temporal_bundle()
+    controller, metrics, dedup = _controller(count=1)
+    controller.request.program = program
+    controller.request.plan = plan
+    controller.request.run_id = "a" * 32
+    slot = plan.delivery_slots[0]
+
+    class _FinalEmitter(_Emitter):
+        """把既有最终 sequence rows 送入真实 replay 装配入口。"""
+
+        def assemble_sequence(self, request):
+            assert request.projection == projection
+            return sequence
+
+    controller.services.emitter = _FinalEmitter()
+    transaction = controller._transaction(slot, (projection,))
+    reservation = _reservation("replay-retained")
+    build = _PrimaryBuild(
+        slot, 1, 0, transaction, (projection,),
+        controller._projection_witnesses((projection,)), reservation, {"annotated": 1},
+    )
+    candidate = controller._assemble_primary_candidate(build)
+
+    sequence_bytes = sum(
+        len(canonical_delivery_row(row)) + 1
+        for row in (sequence.main_row, *sequence.primary_stream_rows)
+    )
+    replay_bytes = sum(
+        len(canonical_delivery_row(row)) + 1 for row in expected_replay.rows
+    )
+    assert replay_bytes > 0
+    assert candidate.replays == (expected_replay,)
+    assert candidate.retained_content_bytes == sequence_bytes + replay_bytes
+    assert candidate.sequences[0].retained_content_bytes == sequence_bytes
+    assert candidate.replays[0].retained_content_bytes == replay_bytes
+
+    controller.request.program = replace(
+        program,
+        limits=replace(program.limits, retained_content_bytes=sequence_bytes + replay_bytes - 1),
+    )
+    dedup.add(reservation)
+    result = controller._commit_primary_head(
+        _AttemptOutcome(0, candidate, reservation, None),
+    )
+    assert result == "sequence_memory_budget"
+    assert dedup.discards == ["replay-retained"]
+    assert metrics.merged == []
+    assert controller.state.sequences == []
+    assert controller.state.replays == []
+    assert controller.state.retained_bytes == 0
 
 
 def _assert_precommit_state_is_empty(controller, metrics, dedup, discarded) -> None:

@@ -88,12 +88,12 @@ def test_plate_hook_rejects_missing_or_unmatched_context(hooks, candidate, recor
         hooks.complete_plate_annotation(candidate, record)
 
 
-def test_runtime_boundary_redacts_plate_hook_failure():
+def test_runtime_boundary_redacts_plate_hook_failure(tmp_path):
     """真实装载的工程异常在调用边界转成固定脱敏错误。"""
     cfg = load(
         _EXAMPLE / "config-local-4b.toml",
         _EXAMPLE / "project.toml",
-        CliOverrides(console="plain"),
+        CliOverrides(output=str(tmp_path / "plate-labels.jsonl"), console="plain"),
     )
     candidate = {"entities": [{"value": "粤B12345"}]}
     record = {"text": "这里只有京A12345。", "private": {"value": "secret"}}
@@ -145,9 +145,9 @@ def test_sequence_hooks_use_the_declared_record_boundaries(hooks):
     assert located["request_id_length"] == len(duplicate["payload"]["request_id"])
 
 
-def test_projects_freeze_model_projection_and_single_sequence_plan():
+def test_projects_freeze_model_projection_and_single_sequence_plan(tmp_path):
     """M1 与 M2 冻结代码字段投影及一条三事件正例和 replay。"""
-    overrides = CliOverrides(console="plain")
+    overrides = CliOverrides(output=str(tmp_path / "labels.jsonl"), console="plain")
     ordinary = load(_EXAMPLE / "config-local-4b.toml", _EXAMPLE / "project.toml", overrides)
     sequence = load(
         _EXAMPLE / "config-local-4b.toml", _EXAMPLE / "project-sequence.toml", overrides,

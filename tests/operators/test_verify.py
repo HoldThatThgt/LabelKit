@@ -2868,7 +2868,11 @@ def test_verify_judge_receives_complete_annotation_with_code_owned_field():
         "additionalProperties": False,
     }
 
+    postprocessor_calls = []
+
     def complete(obj, record):
+        postprocessor_calls.append((dict(obj), record))
+        obj["summary_length"] += 1
         return obj
 
     base = _verdict_cfg()
@@ -2903,6 +2907,7 @@ def test_verify_judge_receives_complete_annotation_with_code_owned_field():
     assert "summary_length" not in model_schema["properties"]
     assert schema is VERDICT_SCHEMA
     assert item.verification.verdict == "pass"
+    assert postprocessor_calls == []
 
 
 _VERDICT_HEAD = "你是标注质量审核员。给定任务指令、成员帧摘要与标注结果"

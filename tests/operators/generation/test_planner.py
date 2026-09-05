@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from collections import defaultdict
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -33,11 +34,42 @@ from labelkit.operators.generation.planner import (
 )
 from labelkit.operators.generation.program import generation_program_digest
 from labelkit.operators.generation.project import scenario_plan_digest
+from tests.operators.generation.test_project import (
+    _independent_domain_digest,
+    _independent_semantic_value,
+    _stable_digest_program,
+)
 
 
 def _rehash(program):
     """为测试内协调修改后的程序重建权威摘要。"""
     return replace(program, digest=generation_program_digest(program))
+
+
+def _independent_plan_value(plan) -> dict:
+    """不用 production digest helper 构造完整计划语义材料。"""
+    blocks = [[
+        {
+            "slot_key": key[0],
+            "variant_name": key[1],
+            "events": [dataclasses.asdict(event) for event in events],
+        }
+        for key, events in block.items()
+    ] for block in plan.blocks]
+    return {
+        "blocks": blocks,
+        "delivery_slots": [dataclasses.asdict(item) for item in plan.delivery_slots],
+        "noise_slots": [dataclasses.asdict(item) for item in plan.noise_slots],
+        "replay_layouts": [dataclasses.asdict(item) for item in plan.replay_layouts],
+        "interleaving_layouts": [
+            dataclasses.asdict(item) for item in plan.interleaving_layouts
+        ],
+        "interleaving_opportunities": plan.interleaving_opportunities,
+        "interleaving_pattern_opportunities": dict(
+            plan.interleaving_pattern_opportunities
+        ),
+        "primary_sessions": plan.primary_sessions,
+    }
 
 
 def _visible_branches(plan):
@@ -376,6 +408,7 @@ def test_six_hundred_slot_plan_digest_is_runtime_capacity_independent(
 
 def test_six_hundred_positive_branches_compile_three_hundred_selected_pairs(
         declared_program, monkeypatch):
+    declared_program = _stable_digest_program(declared_program)
     pattern = declared_program.patterns["booking_success"]
     pattern = replace(
         pattern,
@@ -405,8 +438,14 @@ def test_six_hundred_positive_branches_compile_three_hundred_selected_pairs(
     assert dict(plan.interleaving_pattern_opportunities) == {"trigger_with_partner": 300}
     assert plan.primary_sessions == 300
     assert calls == 1200
+    assert program.digest == _independent_domain_digest(
+        "generation_program", _independent_semantic_value(program),
+    )
     assert plan.digest == scenario_plan_digest(plan)
-    assert plan.digest == "9aa71e9b13f28ec48f57b25169d5df69bfa5110318be92206670ae6f7d6e02ce"
+    assert plan.digest == _independent_domain_digest(
+        "scenario_plan", _independent_plan_value(plan),
+    )
+    assert plan.digest == "e35e28724cd004930b79a404bbc61a733e799fb88789289542b2d6bb02d2fb93"
 
 
 def test_same_resource_half_open_adjacency_and_multi_resource_carrier(declared_program):

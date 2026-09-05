@@ -119,6 +119,7 @@ def _independent_domain_digest(domain: str, value) -> str:
 
 def test_actual_program_and_plan_digest_fixed_vectors(declared_program):
     """教学工程实际 program/plan 必须命中独立重建的 v1.20 fixed vectors。"""
+    declared_program = _stable_digest_program(declared_program)
     plan = compile_scenario_plan(declared_program)
     program_value = _independent_semantic_value(declared_program)
     plan_value = {
@@ -143,12 +144,12 @@ def test_actual_program_and_plan_digest_fixed_vectors(declared_program):
         "primary_sessions": plan.primary_sessions,
     }
     assert declared_program.digest == (
-        "54ee52908d65269ced0f31605601ef4d88cca285304a360e96352b274da16880"
+        "61c40c866a8d2b70625d0c0dba52a00f428711c3b13b97aea01e9cc78686baa4"
     )
     assert declared_program.digest == _independent_domain_digest(
         "generation_program", program_value,
     )
-    assert plan.digest == "a4c9ac4b2a5714804978b35ba4d8638000b50cc74794f42e7ad4b56e3e70daf3"
+    assert plan.digest == "1c20498e62fe05e2ed0130457e43aec900d940002e0e6a1b95591f35abad80cf"
     assert plan.digest == _independent_domain_digest("scenario_plan", plan_value)
 
 
@@ -174,18 +175,17 @@ def _interleaving_digest_plan(plan):
 
 def _stable_digest_program(program):
     """把 fixed-vector program 中的 checkout 路径替换为稳定语义值。"""
-    class_views = {
-        name: replace(
-            view,
-            sequence_generation=replace(
-                view.sequence_generation,
+    class_views = {}
+    for name, view in program.class_views.items():
+        generation = view.sequence_generation
+        if generation is not None:
+            generation = replace(
+                generation,
                 initial_state_catalog_path=(
                     "/labelkit-test-fixture/catalogs/ticket-booking.jsonl"
                 ),
-            ),
-        )
-        for name, view in program.class_views.items()
-    }
+            )
+        class_views[name] = replace(view, sequence_generation=generation)
     state_validator = replace(
         program.state_validator,
         reference="/labelkit-test-fixture/hooks.py:validate_state",
@@ -197,6 +197,41 @@ def _stable_digest_program(program):
         digest="",
     )
     return replace(stable, digest=generation_program_digest(stable))
+
+
+def test_stable_digest_program_is_checkout_independent(
+    declared_program, instruction_program,
+) -> None:
+    """同一真实 program 的两个绝对根归一化为同一独立语义摘要。"""
+    def reroot(program, root: str):
+        views = {}
+        for name, view in program.class_views.items():
+            generation = view.sequence_generation
+            if generation is not None:
+                generation = replace(
+                    generation,
+                    initial_state_catalog_path=f"{root}/catalogs/ticket-booking.jsonl",
+                )
+            views[name] = replace(view, sequence_generation=generation)
+        validator = replace(
+            program.state_validator, reference=f"{root}/hooks.py:validate_state",
+        )
+        changed = replace(
+            program, class_views=MappingProxyType(views),
+            state_validator=validator, digest="",
+        )
+        return replace(changed, digest=generation_program_digest(changed))
+
+    for program in (declared_program, instruction_program):
+        first = reroot(program, "/checkout/a")
+        second = reroot(program, "/different/checkout/b")
+        assert first.digest != second.digest
+        stable_first = _stable_digest_program(first)
+        stable_second = _stable_digest_program(second)
+        assert stable_first.digest == stable_second.digest
+        assert stable_first.digest == _independent_domain_digest(
+            "generation_program", _independent_semantic_value(stable_first),
+        )
 
 
 def _tampered_block_plans(plan):

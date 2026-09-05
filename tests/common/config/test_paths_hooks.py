@@ -114,8 +114,9 @@ def test_keyless_static_load_succeeds_and_reads_no_env_values(project_dir, monke
         calls.append(args[0] if args else "?")
         raise AssertionError(f"os.environ.get forbidden in static load: {args}")
 
-    monkeypatch.setattr(os.environ, "get", _forbidden)
-    cfg = _load(project_dir)
+    with monkeypatch.context() as guarded:
+        guarded.setattr(os.environ, "get", _forbidden)
+        cfg = _load(project_dir)
     assert calls == []
     assert cfg.llm_profiles["default"].api_key_envs == (_KEY_ENV,)
     assert not hasattr(cfg.llm_profiles["default"], "api_key")   # 值字段已删除

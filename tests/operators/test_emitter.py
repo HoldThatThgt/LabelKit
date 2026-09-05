@@ -2066,12 +2066,25 @@ def _temporal_delivery_row() -> dict:
     }
 
 
+def _independent_delivery_digest(rows: tuple[dict, ...]) -> str:
+    """不用 emitter helper 独立执行 canonical JSON 与长度 framing。"""
+    framed = bytearray(b"labelkit:v1.20:delivery\n")
+    for row in rows:
+        payload = json.dumps(
+            row, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        framed.extend(str(len(payload)).encode("ascii"))
+        framed.extend(b":")
+        framed.extend(payload)
+    return hashlib.sha256(framed).hexdigest()
+
+
 def test_delivery_digest_and_manifest_hash_cover_rebound_temporal_content(tmp_path):
-    """delivery fixed vector 与 manifest stream hash 均覆盖 rebound payload 和 metadata。"""
+    """delivery 独立 framing 同时覆盖非空 main、stream 与等长代码字段变化。"""
     emitter = _sequence_emitter(tmp_path)
     row = _temporal_delivery_row()
-    digest = emitter._delivery_digest((row,))
-    assert digest == "fb1bfa698fca0e73f74d429abbbffc847d502ae5cd55c0e8d39ea277684c7c40"
+    stream_digest = emitter._delivery_digest((row,))
+    assert stream_digest == "fb1bfa698fca0e73f74d429abbbffc847d502ae5cd55c0e8d39ea277684c7c40"
     for path, value in (
         (("payload", "timestamp"), 2001),
         (("_meta", "event", "duration_us"), 2_000_000),
@@ -2083,11 +2096,22 @@ def test_delivery_digest_and_manifest_hash_cover_rebound_temporal_content(tmp_pa
         for key in path[:-1]:
             target = target[key]
         target[path[-1]] = value
-        assert emitter._delivery_digest((changed,)) != digest
-    product = emitter.prepare_product((), (row,), _success_report())
+        assert emitter._delivery_digest((changed,)) != stream_digest
+
+    main = {"derived_code": "code-a", "_meta": {"record_id": "2" * 32}}
+    expected = _independent_delivery_digest((main, row))
+    product = emitter.prepare_product((main,), (row,), _success_report())
+    assert product.report["generate"]["sequence"]["delivery_digest"] == expected
+    changed_main = json.loads(json.dumps(main))
+    changed_main["derived_code"] = "code-b"
+    changed = emitter.prepare_product((changed_main,), (row,), _success_report())
+    changed_digest = changed.report["generate"]["sequence"]["delivery_digest"]
+    assert changed_digest == _independent_delivery_digest((changed_main, row))
+    assert changed_digest != expected
+
     manifest = emitter.commit(product)
     stream_bytes = Path(emitter._paths.stream).read_bytes()
-    assert manifest["delivery_digest"] == digest
+    assert manifest["delivery_digest"] == expected
     assert manifest["stream"]["sha256"] == hashlib.sha256(stream_bytes).hexdigest()
 
 
@@ -2162,6 +2186,9 @@ def test_sequence_prepare_and_commit_use_one_digest_and_manifest_last(tmp_path, 
     assert manifest_doc["delivery_digest"] == digest
     assert manifest["main"]["sha256"] == hashlib.sha256(
         Path(paths.output).read_bytes()
+    ).hexdigest()
+    assert manifest["report"]["sha256"] == hashlib.sha256(
+        Path(paths.report).read_bytes()
     ).hexdigest()
 
 

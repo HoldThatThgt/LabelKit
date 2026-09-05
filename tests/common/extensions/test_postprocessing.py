@@ -1,5 +1,7 @@
 """工程后处理公共边界的纯逻辑契约测试；不调用 LLM。"""
 from copy import deepcopy
+from dataclasses import FrozenInstanceError
+import sys
 from types import MappingProxyType
 
 import pytest
@@ -39,6 +41,10 @@ def test_items_projection_removes_required_code_fields_and_rejects_provider_valu
     assert projected == {"text": "hello", "entities": [{"value": "hello"}]}
     assert Draft202012Validator(model).is_valid(projected)
     assert not Draft202012Validator(model).is_valid(full)
+    assert model["required"] == ["entities", "text"]
+    assert model["properties"]["entities"]["items"]["required"] == ["value"]
+    for missing in ({}, {"entities": []}, {"text": "hello"}, {"text": "hello", "entities": [{}]}):
+        assert not Draft202012Validator(model).is_valid(missing)
     assert Draft202012Validator(schema).is_valid(full)
     assert not Draft202012Validator(schema).is_valid(projected)
     assert schema == source
@@ -62,6 +68,12 @@ def test_nested_arrays_optional_nullable_parents_and_empty_objects():
     model = project_postprocessor_schema(schema)
     value = {"groups": [[None, {"computed": 1}, {"value": "x", "computed": 2}]], "empty": {"computed": 1}}
     assert project_postprocessor_instance(value, schema) == {"groups": [[None, {}, {"value": "x"}]], "empty": {}}
+    projected = {"groups": [[None, {}, {"value": "x"}]], "empty": {}}
+    assert Draft202012Validator(model).is_valid(projected)
+    assert not Draft202012Validator(model).is_valid(value)
+    inner = model["properties"]["groups"]["items"]["items"]
+    assert inner["properties"] == {"value": {"type": "string"}}
+    assert inner["required"] == []
     assert model["properties"]["groups"]["minItems"] == 0
     assert model["properties"]["groups"]["maxItems"] == 10
     assert not Draft202012Validator(model).is_valid({"groups": [[]] * 11})
@@ -80,6 +92,8 @@ def test_default_examples_projection_and_same_named_data_are_preserved():
     schema["properties"]["entities"]["examples"] = [value["entities"]]
     model = project_postprocessor_schema(schema)
     assert model["default"]["metadata"] == {MARKER: "business data"}
+    assert model["default"]["entities"] == [{"value": "x"}]
+    assert Draft202012Validator(model).is_valid(model["default"])
     assert model["examples"][0]["entities"] == [{"value": "x"}]
     assert model["properties"]["entities"]["default"] == [{"value": "x"}]
     assert model["properties"]["entities"]["examples"] == [[{"value": "x"}]]
@@ -228,9 +242,11 @@ def test_boolean_schema_siblings_and_regular_key_named_marker():
 
 def test_invoke_copies_nested_inputs_and_result_without_changing_ordinary_fields_policy():
     retained = {}
+    calls = []
     obj = {"value": "  hi ", "nested": {"values": [1]}}
     record = {"text": "source", "nested": [1]}
     def hook(candidate, raw):
+        calls.append((candidate, raw))
         candidate["value"] = candidate["value"].strip()
         candidate["nested"]["values"].append(2)
         raw["nested"].append(3)
@@ -238,10 +254,35 @@ def test_invoke_copies_nested_inputs_and_result_without_changing_ordinary_fields
         retained["raw"] = raw
         return candidate
     result = invoke_postprocessor(ResolvedHook("hooks.py:normalise", hook), freeze_json(obj), freeze_json(record))
+    assert len(calls) == 1
     assert result == {"value": "hi", "nested": {"values": [1, 2]}}
     retained["candidate"]["nested"]["values"].append(9)
     assert result["nested"]["values"] == [1, 2]
     assert obj["nested"]["values"] == record["nested"] == [1]
+
+
+def test_returned_object_completely_replaces_candidate_without_implicit_merge():
+    candidate = {"value": "original", "optional": "remove", "nested": {"items": [1]}}
+    returned = {"value": "normalized", "nested": {"items": [2]}}
+    def complete(obj, record):
+        obj["temporary"] = "also removed"
+        return returned
+    result = invoke_postprocessor(ResolvedHook("hooks.py:complete", complete), candidate, None)
+    assert result == {"value": "normalized", "nested": {"items": [2]}}
+    returned["nested"]["items"].append(3)
+    assert result["nested"]["items"] == [2]
+    assert candidate == {"value": "original", "optional": "remove", "nested": {"items": [1]}}
+
+
+@pytest.mark.parametrize("raw", [None, {}])
+def test_missing_raw_remains_distinct_from_an_empty_raw_object(raw):
+    seen = []
+    def complete(obj, record):
+        seen.append(record)
+        return {"has_raw": record is not None}
+    result = invoke_postprocessor(ResolvedHook("hooks.py:complete", complete), {}, raw)
+    assert seen == [raw]
+    assert result == {"has_raw": raw is not None}
 
 
 @pytest.mark.parametrize("returned", [
@@ -288,7 +329,9 @@ def _load(tmp_path, source, attribute="process"):
 
 
 def test_resolver_checks_without_calling_function_and_supports_file_forms(tmp_path, monkeypatch):
+    original_path = list(sys.path)
     hook = _load(tmp_path, "def process(obj, record=None):\n    raise AssertionError('must not run')\n")
+    assert sys.path == original_path
     assert hook.reference.endswith("/hooks.py:process")
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
@@ -296,6 +339,18 @@ def test_resolver_checks_without_calling_function_and_supports_file_forms(tmp_pa
     same = resolve_postprocessor(hook.reference, elsewhere)
     assert same.reference == hook.reference
     _load(tmp_path, "class Gate:\n    @staticmethod\n    def process(obj, record, /):\n        return obj\n", "Gate.process")
+    assert sys.path == original_path
+
+
+def test_resolved_postprocessor_reference_and_callable_are_immutable(tmp_path):
+    hook = _load(tmp_path, "def process(obj, record): return {'value': 'original'}")
+    original_reference, original_target = hook.reference, hook.target
+    with pytest.raises(FrozenInstanceError):
+        hook.reference = "elsewhere.py:changed"
+    with pytest.raises(FrozenInstanceError):
+        hook.target = lambda obj, record: {"value": "changed"}
+    assert hook.reference == original_reference and hook.target is original_target
+    assert invoke_postprocessor(hook, {}, None) == {"value": "original"}
 
 
 def test_two_projects_with_same_hook_filename_keep_distinct_frozen_callables(tmp_path):
