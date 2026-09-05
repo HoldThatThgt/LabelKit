@@ -28,7 +28,7 @@
 | 工程示例离线门 | 已验证 | 12 passed；含多实体、分隔符、缺失上下文、歧义、伪造位置/长度的拒绝，以及两个工程的冻结计划 |
 | 真实本地 4B | 已验证 | `1 passed in 27.51s`；实际调用生产 `execute_run`，两次普通标注和一次带帧、replay 的 sequence 交付全部通过独立检查器 |
 | 完整离线与覆盖门 | 已验证 | 隔离测试修复后的完整门为 `3239 passed, 49 deselected, 2 warnings in 702.15s`；79/79 修改函数进入；17 个修改生产文件最低行覆盖 90.05%、最低分支覆盖 77.50% |
-| Uncle Bob mutation review | 复审准备中 | 首轮为 172 killed、18 survived、1 invalid、1 inconclusive，另有一个因基线失败未计分的回放 probe；对应测试已补强，最终结论须等待干净提交上的复审 |
+| Uncle Bob mutation review | 已验证 | 干净提交 `0a3ccfe` 上的 191 个不同源码变异经 192 次预声明执行全部 killed；无 survived、invalid、inconclusive 或 blocked；首轮及环境准备失败记录完整保留 |
 | 外部端点发布门 | 本轮未运行 | `[PENDING-EVIDENCE:postprocessing-deepseek]`、`[PENDING-EVIDENCE:postprocessing-zai]`；用户指定的本轮特性真实验收为本地 4B |
 
 ### 本地模型身份与可复现命令
@@ -130,7 +130,7 @@ worktree。模块导入次数没有规范依据，对应变异列为 invalid，�
 - `/tmp/labelkit-bob-postprocess-delivery.wgi3bm/`
 
 测试补强工作区和完整回归证据为 `/tmp/labelkit-postprocessor-hardening.jZBxxM/`。本次补强没有修改生产代码
-或实际工程示例函数，真实本地 4B 证据仍对应相同的实现语义。最终复审完成前不声称全部有效变异已 killed。
+或实际工程示例函数，真实本地 4B 证据仍对应相同的实现语义。最终复审结论记录如下。
 
 补强后的首次隔离完整门保留 `4 failed, 3234 passed, 49 deselected in 670.77s`，日志为上述目录的
 `full-offline.log`。其中两个大规模规划金值仍依赖 checkout 绝对路径，两个示例测试依赖未跟踪的 out 目录。
@@ -148,6 +148,47 @@ worktree。模块导入次数没有规范依据，对应变异列为 invalid，�
 执行 `python -m pytest -q -m 'not integration' --cov=labelkit --cov-branch`，没有缩小完整离线门。
 79/79 修改生产函数进入，17 个修改生产文件最低行覆盖为 90.05%、最低分支覆盖为 77.50%。
 同一批补强测试通过 Ruff 0.16.6 的 E4/E7/E9/F 检查，目标版本为 Python 3.12。
+
+### 最终语义变异复审
+
+复审使用干净提交 `0a3ccfe86359f8eb210983c11162fa0feeb6716d`。配置、运行期和交付各自在独立 detached
+worktree 中执行，生产导入路径指向对应 worktree；每次运行使用独立 `PYTHONPYCACHEPREFIX`。
+每次变异只临时修改生产源码，运行原预声明 oracle 后立即恢复，并检查 HEAD、staged/unstaged diff
+和完整 status；没有修改测试、删减命令、录制模型响应或保留源码变异。
+
+| 审查范围 | 不同源码变异 | 执行次数 | 因果复核结果 | 绿色基线 |
+|---|---:|---:|---|---|
+| 配置、投影与工程函数 | 121 | 122 | 全部 killed | 176 passed in 2.01s，零 skip |
+| 结构引擎、标注与 verify | 41 | 41 | 全部 killed | 预检 361 passed in 1.36s；恢复后 361 passed in 0.77s |
+| 序列冻结、交付与工程示例 | 29 | 29 | 全部 killed | PROGRAM 4、WORKFLOW 15、EMITTER 88、EXAMPLE 12；原完整 workflow + project 为 380 passed in 31.33s |
+
+合计 191 个不同生产源码变异、192 次预声明执行；无 survived、invalid、inconclusive 或 blocked。
+配置分区的原凭据双测试与单测试使用相同源码补丁，保留两组 oracle 分别重跑，不能把它们算成两个不同变异。
+首轮结果按执行分类统计，18 处局部测试缺口均已闭合；首轮 invalid 仍独立保留历史。
+该结果证明预声明语义变异能被相应测试检测，不声明所有可能程序错误都已枚举。
+
+交付分区的两次环境准备失败均为零变异：首次导入证明发现 caller cwd 抢先解析包；另一次旧 sequence
+示例缺少文档要求的空 out 目录，使 PROGRAM fixture 失败。两次均保留日志并清理工作区，未计入变异结果；
+修正 scratch runner 后从同一干净提交重新执行全部五组基线。原完整命令为：
+
+```bash
+python -m pytest -p no:cacheprovider -q \
+  tests/orchestration/test_sequence_workflow.py tests/operators/generation/test_project.py
+```
+
+该命令没有 `-k`、deselect 或 skip；其 380 用例绿色基线建立后，才用同一完整命令复核 replay retained
+变异。report 最终文件 hash、非空 main/stream 独立摘要、冻结完整帧 Schema 和真实 replay 容量门均给出
+明确因果失败。运行期原帧预算、无 hook 帧待遇及 verify 重复调用三处缺口同样全部闭合。
+
+| 完整报告 | 逐项与恢复证据 |
+|---|---|
+| [配置与钩子报告](/tmp/labelkit-bob-config-20260905.1T2vSl/round-two/bob-report.md) | 同目录 `execution.vM1kut/classified-ledger.json`、`execution-integrity.json`、`restoration.json` |
+| [运行期报告](/tmp/labelkit-postprocessor-bob-round2-run.52jVoY/report.md) | 同目录 `results/` 的 patch、日志、JUnit、result 与 restore；`cleanup-proof.log` |
+| [交付报告](/tmp/labelkit-bob-postprocess-delivery-rerun.VKhimw/bob-report.md) | 同目录 `classified-results.tsv`、`results.tsv`、`restoration.log` 与原始逐项日志 |
+
+所有正式及环境准备审查 worktree 均已不使用 force 地移除，路径和 Git 注册不存在。最后的 caller 证明
+保持上述提交及 `codex/annotation-postprocessing` 分支，staged/unstaged diff 与完整 status 为空。
+复审后只整理本规格、文件清单与验收文档；生产代码和测试保持通过完整回归及审查的同一内容。全部提交仅在本地，未推送。
 
 ## 2026-09-04 并发缺口修复证据
 

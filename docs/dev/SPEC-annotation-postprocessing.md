@@ -1,6 +1,6 @@
 # LabelKit 标注后处理钩子特性规格
 
-> 状态：最终开发规格；实现与验收必须覆盖本文全部要求
+> 状态：已实现；完整离线、本地真实 4B 与 Uncle Bob 验收通过
 > 日期：2026-09-05
 > 实施基线：`9f88620`
 > 范围：普通记录、序列记录和成员帧的标注结果；包含所有标注重试、verify 修复与序列交付路径
@@ -266,6 +266,76 @@ Schema 投影发现不支持的带标记结构时抛固定定位的 ValueError�
 
 文件清单按最终实际改动更新；若发现额外必要入口，先修订本文再修改实现，不用清单遗漏作为跳过依据。
 
+### 6.3 实际修改文件
+
+对比实施基线 `9f88620`，本轮共有 62 个受 Git 管理的改动文件。
+本地指导文件 `AGENTS.md` 与 `CLAUDE.md` 另按字节一致同步。
+
+| 变更 | 文件 |
+|---|---|
+| 修改 | [docs/CONTRACTS.md](../../docs/CONTRACTS.md) |
+| 修改 | [docs/design/labelkit-design-v1.html](../../docs/design/labelkit-design-v1.html) |
+| 修改 | [docs/design/labelkit-design-v1.pdf](../../docs/design/labelkit-design-v1.pdf) |
+| 修改 | [docs/dev/E2E-FINDINGS.md](../../docs/dev/E2E-FINDINGS.md) |
+| 新增 | [docs/dev/SPEC-annotation-postprocessing.md](../../docs/dev/SPEC-annotation-postprocessing.md) |
+| 修改 | [docs/dev/SPEC-sequence-generation-redesign.md](../../docs/dev/SPEC-sequence-generation-redesign.md) |
+| 修改 | [docs/manual/07-project-toml.md](../../docs/manual/07-project-toml.md) |
+| 修改 | [docs/manual/11-annotate.md](../../docs/manual/11-annotate.md) |
+| 修改 | [docs/manual/13-verify.md](../../docs/manual/13-verify.md) |
+| 修改 | [docs/manual/14-schema-engine.md](../../docs/manual/14-schema-engine.md) |
+| 新增 | [examples/annotation-postprocessing/README.md](../../examples/annotation-postprocessing/README.md) |
+| 新增 | [examples/annotation-postprocessing/check_output.py](../../examples/annotation-postprocessing/check_output.py) |
+| 新增 | [examples/annotation-postprocessing/config-local-4b.toml](../../examples/annotation-postprocessing/config-local-4b.toml) |
+| 新增 | [examples/annotation-postprocessing/data/plates.jsonl](../../examples/annotation-postprocessing/data/plates.jsonl) |
+| 新增 | [examples/annotation-postprocessing/hooks.py](../../examples/annotation-postprocessing/hooks.py) |
+| 新增 | [examples/annotation-postprocessing/oracles/plates.json](../../examples/annotation-postprocessing/oracles/plates.json) |
+| 新增 | [examples/annotation-postprocessing/project-sequence.toml](../../examples/annotation-postprocessing/project-sequence.toml) |
+| 新增 | [examples/annotation-postprocessing/project.toml](../../examples/annotation-postprocessing/project.toml) |
+| 新增 | [examples/annotation-postprocessing/schemas/frame-annotation.json](../../examples/annotation-postprocessing/schemas/frame-annotation.json) |
+| 新增 | [examples/annotation-postprocessing/schemas/plate-annotation.json](../../examples/annotation-postprocessing/schemas/plate-annotation.json) |
+| 新增 | [examples/annotation-postprocessing/schemas/sequence-annotation.json](../../examples/annotation-postprocessing/schemas/sequence-annotation.json) |
+| 修改 | [labelkit/common/config/_classviews.py](../../labelkit/common/config/_classviews.py) |
+| 修改 | [labelkit/common/config/_constraints.py](../../labelkit/common/config/_constraints.py) |
+| 新增 | [labelkit/common/config/_postprocessing.py](../../labelkit/common/config/_postprocessing.py) |
+| 修改 | [labelkit/common/config/_schemas.py](../../labelkit/common/config/_schemas.py) |
+| 修改 | [labelkit/common/config/_sections.py](../../labelkit/common/config/_sections.py) |
+| 修改 | [labelkit/common/config/loader.py](../../labelkit/common/config/loader.py) |
+| 修改 | [labelkit/common/config/model.py](../../labelkit/common/config/model.py) |
+| 修改 | [labelkit/common/contracts/generation.py](../../labelkit/common/contracts/generation.py) |
+| 修改 | [labelkit/common/errors.py](../../labelkit/common/errors.py) |
+| 修改 | [labelkit/common/extensions/hooks.py](../../labelkit/common/extensions/hooks.py) |
+| 新增 | [labelkit/common/extensions/postprocessing.py](../../labelkit/common/extensions/postprocessing.py) |
+| 修改 | [labelkit/common/inference/schema_engine.py](../../labelkit/common/inference/schema_engine.py) |
+| 修改 | [labelkit/operators/annotate.py](../../labelkit/operators/annotate.py) |
+| 新增 | [labelkit/operators/annotation_finalization.py](../../labelkit/operators/annotation_finalization.py) |
+| 修改 | [labelkit/operators/generation/program.py](../../labelkit/operators/generation/program.py) |
+| 修改 | [labelkit/operators/stream_verify.py](../../labelkit/operators/stream_verify.py) |
+| 修改 | [labelkit/orchestration/sequence_workflow.py](../../labelkit/orchestration/sequence_workflow.py) |
+| 修改 | [spec/00-frontmatter.md](../../spec/00-frontmatter.md) |
+| 修改 | [spec/301-m1-config.md](../../spec/301-m1-config.md) |
+| 修改 | [spec/305-m5-annotate.md](../../spec/305-m5-annotate.md) |
+| 修改 | [spec/307-m7-verify.md](../../spec/307-m7-verify.md) |
+| 修改 | [spec/308-m8-schema-engine.md](../../spec/308-m8-schema-engine.md) |
+| 修改 | [spec/40-ch4-data-structures.md](../../spec/40-ch4-data-structures.md) |
+| 修改 | [spec/50-ch5-config-spec.md](../../spec/50-ch5-config-spec.md) |
+| 修改 | [tests/cli/test_cli.py](../../tests/cli/test_cli.py) |
+| 修改 | [tests/common/config/test_config.py](../../tests/common/config/test_config.py) |
+| 修改 | [tests/common/config/test_paths_hooks.py](../../tests/common/config/test_paths_hooks.py) |
+| 新增 | [tests/common/config/test_postprocessing_config.py](../../tests/common/config/test_postprocessing_config.py) |
+| 修改 | [tests/common/contracts/test_generation_contracts.py](../../tests/common/contracts/test_generation_contracts.py) |
+| 新增 | [tests/common/extensions/test_postprocessing.py](../../tests/common/extensions/test_postprocessing.py) |
+| 新增 | [tests/common/inference/test_postprocessing_schema_engine.py](../../tests/common/inference/test_postprocessing_schema_engine.py) |
+| 新增 | [tests/integration/test_postprocessing_local_llm.py](../../tests/integration/test_postprocessing_local_llm.py) |
+| 修改 | [tests/operators/generation/test_planner.py](../../tests/operators/generation/test_planner.py) |
+| 修改 | [tests/operators/generation/test_program.py](../../tests/operators/generation/test_program.py) |
+| 修改 | [tests/operators/generation/test_project.py](../../tests/operators/generation/test_project.py) |
+| 修改 | [tests/operators/test_annotate.py](../../tests/operators/test_annotate.py) |
+| 修改 | [tests/operators/test_emitter.py](../../tests/operators/test_emitter.py) |
+| 新增 | [tests/operators/test_postprocessing_examples.py](../../tests/operators/test_postprocessing_examples.py) |
+| 修改 | [tests/operators/test_verify.py](../../tests/operators/test_verify.py) |
+| 修改 | [tests/orchestration/test_sequence_workflow.py](../../tests/orchestration/test_sequence_workflow.py) |
+| 新增 | [tools/design_figures/fig-3-7.svg](../../tools/design_figures/fig-3-7.svg) |
+
 ## 7. 验收矩阵
 
 每个自然语言命名的验收项都必须映射到测试函数及当前结果。不能仅以测试文件存在代替行为证明。
@@ -329,8 +399,8 @@ CLAUDE.md 字节一致，执行 `git diff --check`。没有通过的门不得标
 
 下表链接到实际测试函数；参数化反例属于相同测试函数。首轮语义变异断言与隔离 worktree 测试前提
 修复完成后，最终完整离线门为 `3239 passed, 49 deselected, 2 warnings in 702.15s`。
-用户已授权本地提交和隔离语义变异。Uncle Bob 首轮检测出 18 处局部 oracle 缺口，另有 invalid、
-inconclusive 和未计分的失败基线记录；对应测试已补强，最终结论须等待干净提交上的复审。
+用户已授权本地提交和隔离语义变异。首轮 18 处局部 oracle 缺口均已补强，复审的 191 个不同源码变异
+经 192 次预声明执行全部 killed；无 survived、invalid、inconclusive 或 blocked。首轮失败和无效结果保留。
 本地真实门为 1 passed，模型身份、逐运行 usage、调用数、时间及失败修复证据见
 [E2E 记录](E2E-FINDINGS.md#2026-09-05-标注后处理钩子证据)。
 
@@ -395,4 +465,26 @@ Doxygen 注释。`git diff --check` 与 AGENTS/CLAUDE 字节一致检查通过�
 
 设计 HTML/PDF 已重建；检查了配置、候选定稿图、verify、SchemaEngine、数据载体及配置表所在页面。
 修复了受影响页面原有的围栏和字面换行显示问题，最终 PDF 为 190 页。
-Uncle Bob 首轮结果、方法纠正和测试补强记录见 E2E 文档；本节尚不声称复审门已完成。
+Uncle Bob 首轮结果、方法纠正、测试补强与最终复审记录见 E2E 文档。
+
+
+### 9.2 最终语义变异审查
+
+复审基线为干净提交 `0a3ccfe86359f8eb210983c11162fa0feeb6716d`。三路使用各自的 detached worktree，
+先证明实际生产导入位置和绿色预声明基线，再逐项变异并立即恢复。每次执行使用独立 Python 缓存；
+不修改测试或缩小失败基线，所有失败均经因果复核。
+
+| 审查范围 | 不同源码变异 | 预声明执行 | 绿色基线与结果 |
+|---|---:|---:|---|
+| 配置、投影与工程函数 | 121 | 122 | 基线 176 passed；全部 killed |
+| 结构引擎、标注与 verify | 41 | 41 | 前后基线均 361 passed；全部 killed |
+| 序列冻结、交付与工程示例 | 29 | 29 | 配置/工作流/交付/示例基线分别为 4/15/88/12 passed；原完整 workflow + project 为 380 passed；全部 killed |
+
+凭据变异保留两组原预声明 oracle，故执行次数比不同源码补丁数多一次。首轮没有规范依据的模块导入次数
+变异保留为历史 invalid，不计入本轮。交付分区两次环境准备失败均在零变异时停止；修正执行 cwd 与
+补齐文档要求的旧 sequence 示例空 out 目录后，从同一干净提交重跑全部基线和变异。
+
+所有审查 worktree 已无 force 清理，路径和注册均消失；caller 的 HEAD、staged/unstaged diff 与完整
+status 均保持不变。首轮 survivor、凭据 inconclusive 及先前未计分的 replay retained 用例全部闭合。
+最终特性没有延期实现项。逐条命令、变异、测试因果和恢复证据链接见
+[E2E 审查记录](E2E-FINDINGS.md#最终语义变异复审)。
