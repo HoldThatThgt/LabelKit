@@ -1346,7 +1346,9 @@ quality、annotate、verify 的 class 路由以 PipelineItem.classification 中�
 
 每个协作者接收 AttemptTransaction，它持有临时 PipelineItem、status counters、ProjectedSequence 和不可变 ClassView。
 SequenceWorkflow 由源 ResolvedConfig 派生 attempt-local cfg，但必须用 `GenerationProgram.class_views`、
-`GenerationProgram.frame_classes` 与 `GenerationProgram.frame_schema` 替换其中同名视图与 Schema。
+`GenerationProgram.frame_classes`、`GenerationProgram.frame_schema` 与 `GenerationProgram.model_frame_schema`
+替换其中同名视图与 Schema。标注后处理函数随类视图冻结，模型帧 Schema 与完整帧 Schema 分开冻结；
+源配置后续变化不能改变 attempt 行为。完整后处理契约见 `SPEC-annotation-postprocessing.md`。
 Quality、Annotate 与 Verify 的正常、frame 与 repair 路径都只读
 该 attempt-local cfg；源 ResolvedConfig 中同名 class/frame 视图即使不同也不得影响当次结果或被修改。
 不得把 attempt-local item 加入 ProcessWorkflow 的普通批次或直接调用 Emitter.emit。接受时一次合并这些纯内存结果；
@@ -1830,7 +1832,7 @@ DeliveryError 新增到 labelkit/common/errors.py，不继承 ConfigError。异�
 | NoiseSpec | `frame_class`, `instruction`, `topics` |
 | GenerationLimits | `pattern_roles`, `variants_per_counterfactual_set`, `instruction_only_events`, `scenario_seed_bytes`, `state_or_outcome_schema_bytes`, `frame_schema_bytes`, `event_patch_bytes`, `rendered_payload_bytes`, `prompt_value_bytes`, `repair_context_bytes`, `prompt_text_bytes`, `record_units`, `stream_rows`, `retained_content_bytes` |
 | SequenceGenerationConfig | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `state_validator`, `patterns`, `counterfactual_sets`, `instruction_only`, `interleaving`, `timeline`, `calendar_windows`, `noise`, `limits` |
-| GenerationProgram | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `planner_seed`, `class_views`, `frame_classes`, `frame_schema`, `patterns`, `counterfactual_sets`, `instruction_only`, `interleaving`, `timeline`, `calendar_windows`, `noise`, `limits`, `state_validator`, `digest` |
+| GenerationProgram | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `planner_seed`, `class_views`, `frame_classes`, `frame_schema`, `model_frame_schema`, `patterns`, `counterfactual_sets`, `instruction_only`, `interleaving`, `timeline`, `calendar_windows`, `noise`, `limits`, `state_validator`, `digest` |
 | DeliverySlot | `slot_key`, `source_name`, `scenario_index`, `sequence_class`, `pattern_name`, `variant_names`, `catalog_row_index` |
 | PlannedEvent | `event_key`, `role`, `position`, `logical_time_us`, `timestamp_us`, `duration_us`, `resources`, `session_id` |
 | NoiseSlot | `event_key`, `ordinal`, `frame_class`, `topic`, `timestamp_us`, `duration_us`, `resources`, `session_id` |

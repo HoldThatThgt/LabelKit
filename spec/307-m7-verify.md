@@ -7,6 +7,13 @@
 
 ### 3.7.2 评审调用
 
+配置标注后处理时，verify 始终评审已经过后处理、框架时间注入和完整 Schema 的最终 annotation。
+repair 将 previous_output 投影为模型字段后交给 M5；新候选再次后处理并完整校验。
+episode repair 与 frame backfill 使用相同入口，不绕过按类函数或真实成员 raw。
+这两个分支在 sequence attempt 中必须原样传播 `PostprocessorError` 及既有内部定稿错误，
+不能吞为可恢复成员失败；普通 process 仍保持记录/成员隔离。完整契约及验收矩阵见
+`docs/dev/SPEC-annotation-postprocessing.md`。
+
 ```
 system: 你是标注质量审核员。给定任务指令、原始数据与标注结果，独立判断标注是否合格。
         评审维度: ① 是否遵循任务指令 ② 与原始数据的事实一致性 ③ 字段语义是否正确填写

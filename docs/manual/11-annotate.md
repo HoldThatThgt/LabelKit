@@ -74,7 +74,7 @@ v1.11 起 `sequence_frames` 升格为**上限**：所引 profile 声明 `context
 `annotate.enabled=false` 时直接运行。frame-only sequence 不构造序列标注 prompt，序列标注调用精确为零。
 
 - **全局指令 vs 按帧类覆盖**：`frame.annotate.instruction` 是全局指令，few-shot 走 `frame.annotate.examples`。process 流模式可按 frame classification 选择 `[frame.class.<名>.annotate]`；sequence 直接按生成计划中的 inherited frame class 选择同一冻结视图，即使 `frame.classify=false` 也不会丢失按类路由。帧级没有 self-consistency。
-- **独立的帧 Schema**：`frame.annotate.schema_path` / `schema_inline` **恰一**，与 `output.schema` 互相独立——「帧对象长什么样」与「序列行长什么样」是两份契约，各自过 draft 2020-12 元校验、各自的 examples 各自启动干跑。结构保障走同一结构引擎，但**不经代码回调校验层**（第 14 章 14.5）。
+- **独立的帧 Schema**：`frame.annotate.schema_path` / `schema_inline` **恰一**，与 `output.schema` 互相独立。两份 Schema 各自进行元校验和完整示例检查。帧可以配置自己的 postprocessor，但不调用记录级 `output.validator`（第 14 章）。
 - **失败边界取决于运行形态**：process/flat 中，成员失败只把该成员写成 `status="failed"`、`annotation=null`，不进入 rejects；sequence 中，任一应标注成员失败会拒绝当前 attempt，由 M10 重试整个 counterfactual set。失败 attempt 不提交成员标注或 dataset counters，已发生的调用证据仍保留。
 
 ### sequence annotation 的业务时间
@@ -129,6 +129,7 @@ sc_temperature = 0.7          # self-consistency 各次采样的温度
 | `llm` | `"default"` | UI 模态下该 profile 必须 `supports_vision = true`（启动校验） |
 | `instruction` | 必填 | 见 11.4 的写作指南 |
 | `examples` | `[]` | 每项 `{input, output}`；`output` 必须过用户 Schema（启动校验，错在启动时就报）。UI 模态下示例只有文本 input，不支持带图示例 |
+| `postprocessor` | 不设 | 工程根相对 `hooks.py:complete_annotation`，在模型候选通过结构检查后运行，见本章后处理说明 |
 | `self_consistency` | 0 | 见 11.5 |
 | `sc_temperature` | 0.7 | 仅 self_consistency ≥ 3 时生效——多样性靠温度，投票靠多数 |
 
@@ -189,3 +190,48 @@ instruction = """
 2. **抽 20 条人工比对**——错误集中在某个枚举边界？加判据/加示例（11.4）；错误随机散布？考虑换更强的模型或开 self-consistency；
 3. **UI 模态看图**——图片工作点是不是缩太狠导致小字不可读（v1.11 起日常发送尺寸由 `default_image_px` 决定，0 = 沿用 `max_image_px`，第 6 章）；树是不是被 `ui_tree_max_chars` 或预算份额截断了关键节点（trace 的序列化文本里找 `…(truncated`；声明预算的运行另可读 `report.budget.truncations` 的逐算子裁剪计数）；
 4. **开 verify 兜底**——标注质量的最后一道闸是独立评审（第 13 章），它能把「指令遵循错误」拦在主输出之外。
+
+## 11.8 用工程代码完成确定性字段
+
+模型适合判断实体是什么；实体在原文中的位置、金额格式或派生计数可以交给工程函数。
+在工程根目录保存 `hooks.py`，声明同步函数并返回完整标注对象：
+
+```toml
+[annotate]
+postprocessor = "hooks.py:complete_annotation"
+```
+
+```python
+def complete_annotation(obj: dict, record: dict | None) -> dict:
+    """规范化实体并计算数量，返回完整标注。"""
+    for entity in obj["entities"]:
+        entity["value"] = entity["value"].strip()
+    obj["entity_count"] = len(obj["entities"])
+    return obj
+```
+
+函数可以规范化已有字段。对于模型不应生成的字段，在完整 Schema 对应 property 上声明
+`"x-labelkit-postprocessor": true`。例如 entity_count 仍可声明为 required integer，但模型收到的
+Schema 中没有它，由函数补齐后才检查完整输出。标记字段的直属对象必须设置 additionalProperties=false；
+支持实体数组与可选或 nullable 父对象。复杂组合约束的限制见
+[特性规格](../dev/SPEC-annotation-postprocessing.md)。
+
+```mermaid
+flowchart LR
+    MODEL[模型生成语义字段] --> CODE[代码规范化与计算]
+    CODE --> SCHEMA[完整 Schema 校验]
+    SCHEMA --> RULE[自定义业务校验]
+    RULE --> VERIFY[verify 评审]
+```
+
+普通记录和帧收到真实原始行副本；序列整体收到 None。候选、原始行和返回结果相互隔离，函数不能改变
+原始数据、序列身份或框架时间。函数需保持确定性、无外部副作用；每个合格模型候选运行一次，修复后的
+新候选重新运行。函数异常、非法 JSON 或不满足最终 Schema 属于程序错误，不交给模型修程序。
+
+按记录类覆盖使用 `[class.<名>.annotate].postprocessor`；帧使用 `[frame.annotate].postprocessor`，
+按帧类覆盖使用 `[frame.class.<名>.annotate].postprocessor`。未覆盖的类继承全局函数。
+启动检查函数签名但不会执行后处理业务代码；few-shot 必须写出合法的完整期望结果，框架检查后再删除
+代码字段发给模型。verify 总是看到完整结果，self-consistency 选择已处理并验证过的原候选。
+
+可运行的车牌实体位置与序列派生字段工程见
+[annotation-postprocessing 示例](../../examples/annotation-postprocessing/README.md)。

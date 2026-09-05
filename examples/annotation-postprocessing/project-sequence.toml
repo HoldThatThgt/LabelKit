@@ -1,0 +1,230 @@
+schema_version = 1
+
+[run]
+output = "./out/sequence-labels.jsonl"
+modality = "text"
+mode = "generate_only"
+batch_size = 1
+seed = 20260905
+
+[dedup]
+enabled = true
+scope = "global"
+
+[classify]
+enabled = false
+
+[frame.classify]
+enabled = false
+
+[quality]
+enabled = false
+
+[annotate]
+enabled = true
+llm = "default"
+postprocessor = "hooks.py:complete_sequence_annotation"
+instruction = """
+阅读完整订票序列，标注业务意图、最终结果、请求编号、票号与一句简洁摘要。
+只按实际发生的三个事件标注，不要输出由工程代码计算的字段。
+"""
+
+[frame.annotate]
+enabled = true
+llm = "default"
+postprocessor = "hooks.py:complete_frame_annotation"
+schema_path = "schemas/frame-annotation.json"
+instruction = """
+只根据当前成员帧标注 request_id、observed_status 与 summary。
+request_id 和 observed_status 必须忠实复制当前 payload；summary 用一句自然中文概括当前事件。
+不要推断其他帧，不要输出由工程代码计算的三个长度字段。
+"""
+
+[[frame.annotate.examples]]
+input = "R-EXAMPLE 请求已受理。"
+
+[frame.annotate.examples.output]
+request_id = "R-EXAMPLE"
+observed_status = "acknowledged"
+summary = "请求者提交了订票需求。"
+summary_length = 11
+utterance_length = 16
+request_id_length = 9
+
+[verify]
+enabled = false
+
+[generate]
+enabled = true
+form = "sequence"
+mode = "declared"
+semantic_llm = "default"
+evaluation_llm = "judge"
+max_slot_attempts = 8
+state_validator = "../sequence-generation/hooks.py:validate_state"
+
+[output]
+schema_path = "schemas/sequence-annotation.json"
+meta_mode = "inline"
+rejects = "none"
+
+[class.ticket_booking]
+description = "一次铁路订票请求从提出、受理到成功出票的完整交互"
+
+[class.ticket_booking.generate]
+instruction = """
+围绕 catalog 中同一个请求、路线、日期与乘客生成三句自然中文交互。
+每个 payload 都必须忠实保留同一个 request_id，最终确认 payload 还必须忠实保留 ticket_id。
+每一步只表达当前状态，不得输出内部状态术语，不得修改未授权状态。
+"""
+state_schema_path = "../sequence-generation/schemas/state.json"
+initial_state_source = "catalog"
+initial_state_catalog_path = "../sequence-generation/catalogs/ticket-booking.jsonl"
+
+[class.ticket_booking.annotate]
+instruction = """
+标注这次订票交互的 intent、outcome、request_id、ticket_id 与 summary。
+本工程只有成功正例，intent 使用 book_train_ticket，outcome 使用 ticketed；其余语义来自真实生成序列。
+"""
+schema_path = "schemas/sequence-annotation.json"
+
+[[class.ticket_booking.annotate.examples]]
+input = "订票请求 R-EXAMPLE 已完成出票，票号为 T-EXAMPLE。"
+
+[class.ticket_booking.annotate.examples.output]
+intent = "book_train_ticket"
+outcome = "ticketed"
+request_id = "R-EXAMPLE"
+ticket_id = "T-EXAMPLE"
+summary = "订票请求已成功出票。"
+summary_length = 10
+
+[frame.class.task_request]
+description = "请求者提出一条尚未受理的订票需求"
+
+[frame.class.task_request.generate]
+instruction = """
+写成请求者自然提出订票需求的一句话，payload 必须保留同一个 request_id，
+utterance 自然表达路线或日期，不得声称系统已经受理或出票。
+"""
+schema_path = "../sequence-generation/schemas/frame-request.json"
+
+[frame.class.acknowledgement]
+description = "系统确认已经接收请求，但尚未给出出票结果"
+
+[frame.class.acknowledgement.generate]
+instruction = """
+写成系统自然确认已经收到请求的一句话，payload 必须保留同一个 request_id，
+utterance 不得提前声称出票。
+"""
+schema_path = "../sequence-generation/schemas/frame-acknowledgement.json"
+
+[frame.class.confirmation]
+description = "系统根据当前状态给出成功出票结果"
+
+[frame.class.confirmation.generate]
+instruction = """
+写成系统对同一请求给出最终结果的一句话，payload 必须保留 request_id 与 ticket_id，
+utterance 忠实表达成功出票，“出票”一词最多出现一次。
+"""
+schema_path = "../sequence-generation/schemas/frame-confirmation.json"
+
+[generate.pattern.booking_success]
+sequence_class = "ticket_booking"
+description = "请求者提出需求，系统确认受理并在允许时间内成功出票。"
+order = ["request", "acknowledge", "confirm"]
+max_span_s = 2400
+
+[[generate.pattern.booking_success.roles]]
+name = "request"
+frame_class = "task_request"
+actor = "requester"
+read_roots = ["/public", "/goal", "/request", "/actors/requester"]
+write_roots = ["/request/status"]
+publish_roots = ["/request/id", "/request/status", "/goal/origin", "/goal/destination", "/goal/travel_date"]
+observers = ["requester", "system"]
+state_instruction = """
+只先 test `/request/status` 为 `new`，再 replace `/request/status` 为 `pending`。
+不得修改任何其他 path。
+"""
+pre_state_schema_path = "../sequence-generation/schemas/pre-request.json"
+payload_bindings = [
+  { payload_path = "/request_id", state_phase = "after", state_path = "/request/id" },
+  { payload_path = "/status", state_phase = "after", state_path = "/request/status" }
+]
+calendar_window = "service_hours"
+
+[[generate.pattern.booking_success.roles]]
+name = "acknowledge"
+frame_class = "acknowledgement"
+actor = "system"
+read_roots = ["/request", "/goal", "/actors/system"]
+write_roots = ["/request/acknowledged", "/request/status"]
+publish_roots = ["/request/id", "/request/status", "/request/acknowledged"]
+observers = ["requester", "system"]
+state_instruction = """
+只先 test 当前 `/request/status` 为 `pending`，再 replace `/request/acknowledged` 为 true，
+并把 `/request/status` 改为 `acknowledged`。不得修改任何其他 path。
+"""
+pre_state_schema_path = "../sequence-generation/schemas/pre-acknowledgement.json"
+payload_bindings = [
+  { payload_path = "/request_id", state_phase = "after", state_path = "/request/id" },
+  { payload_path = "/status", state_phase = "after", state_path = "/request/status" }
+]
+
+[[generate.pattern.booking_success.roles]]
+name = "confirm"
+frame_class = "confirmation"
+actor = "system"
+read_roots = ["/request", "/ticket", "/goal", "/actors/system", "/sla"]
+write_roots = ["/request/status", "/ticket/id", "/ticket/status", "/sla/expired"]
+publish_roots = ["/request/id", "/request/status", "/ticket/id", "/ticket/status"]
+observers = ["requester", "system"]
+state_instruction = """
+只先 test 当前 `/request/acknowledged` 为 true，再 replace `/request/status` 为 `ticketed`、
+`/ticket/id` 为非空票号、`/ticket/status` 为 `issued`。不得修改任何其他 path。
+"""
+pre_state_schema_path = "../sequence-generation/schemas/pre-confirmation.json"
+payload_bindings = [
+  { payload_path = "/request_id", state_phase = "after", state_path = "/request/id" },
+  { payload_path = "/ticket_id", state_phase = "after", state_path = "/ticket/id" },
+  { payload_path = "/status", state_phase = "after", state_path = "/request/status" }
+]
+
+[[generate.pattern.booking_success.gaps]]
+name = "request_to_acknowledge"
+before = "request"
+after = "acknowledge"
+min_gap_s = 5
+max_gap_s = 120
+
+[[generate.pattern.booking_success.gaps]]
+name = "acknowledge_to_confirm"
+before = "acknowledge"
+after = "confirm"
+min_gap_s = 30
+max_gap_s = 1200
+
+[[generate.counterfactual_sets]]
+name = "postprocessing_positive"
+pattern = "booking_success"
+count = 1
+
+[[generate.counterfactual_sets.variants]]
+name = "positive"
+kind = "positive"
+outcome_schema_path = "../sequence-generation/schemas/outcome-positive.json"
+
+[generate.timeline]
+timestamp_start = "2026-01-05T09:00:00+08:00"
+event_gap_s = [15, 120]
+session_max_events = 3
+session_max_span_s = 1800
+session_gap_s = 3600
+noise_events = 0
+duplicate_sequences = 1
+
+[generate.calendar_window.service_hours]
+utc_offset = "+08:00"
+days = ["mon", "tue", "wed", "thu", "fri"]
+intervals = [["08:00:00", "12:00:00"], ["13:00:00", "18:00:00"]]

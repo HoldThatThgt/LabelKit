@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "request_id": {"type": "string", "minLength": 1},
+    "observed_status": {"enum": ["pending", "acknowledged", "ticketed"]},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 160},
+    "summary_length": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 160,
+      "x-labelkit-postprocessor": true
+    },
+    "utterance_length": {
+      "description": "record.payload.utterance 的 Unicode code point 长度",
+      "type": "integer",
+      "minimum": 1,
+      "x-labelkit-postprocessor": true
+    },
+    "request_id_length": {
+      "description": "已核对 record.payload.request_id 后的 Unicode code point 长度",
+      "type": "integer",
+      "minimum": 1,
+      "x-labelkit-postprocessor": true
+    }
+  },
+  "required": [
+    "request_id",
+    "observed_status",
+    "summary",
+    "summary_length",
+    "utterance_length",
+    "request_id_length"
+  ],
+  "additionalProperties": false
+}

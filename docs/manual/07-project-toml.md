@@ -75,8 +75,8 @@ schema_inline = """
 | `[generate.pattern.*]` / `[[generate.counterfactual_sets]]` | 仅 declared sequence | 命名 role/gap、状态权限、四类变体与精确 count | 第 27 章 |
 | `[generate.interleaving]` / `[generate.interleaving.pattern.*]` | 仅 declared sequence，可选 | standalone 权重、trigger 候选集、partner 候选集与 trigger 权重 | 第 27 章 |
 | `[[generate.instruction_only]]` | 仅 instruction-only sequence | 直接声明 sequence class、count、len_range、instruction 与可选 state Schema | 第 27 章 |
-| `[annotate]` | **开** | `instruction`（标注指令，开了就必填）、`examples`（few-shot）、`self_consistency`（多次采样投票） | 第 11 章 |
-| `[frame.annotate]` | 关（process 流或 sequence） | `instruction`（帧标注指令，启用必填）、`schema_path`/`schema_inline`（独立帧 Schema，恰一）、`[frame.class.<名>.annotate]`（按帧类覆盖/跳过） | 第 11、25、27 章 |
+| `[annotate]` | **开** | `instruction`（标注指令）、`examples`（few-shot）、`postprocessor`（工程后处理）、`self_consistency`（多次采样投票） | 第 11 章 |
+| `[frame.annotate]` | 关（process 流或 sequence） | `instruction`、`schema_path`/`schema_inline`（独立帧 Schema，恰一）、`postprocessor`；`[frame.class.<名>.annotate]` 可覆盖指令、示例、后处理或跳过该类 | 第 11、25、27 章 |
 | `[verify]` | 关 | `llm`（评审 profile，建议独立模型）、`policy`（drop/repair）、`extra_criteria`（追加评审维度） | 第 13 章 |
 
 `[classify]` 是 v1.7 新增的分类算子节：按你声明的类别表对每条存活记录做 LLM 封闭集分类，类标签写进 `_meta.classification` 并驱动下游「按类条件化」。启用后另有一族按类覆盖节 **`[class.<name>.<section>]`**——对某个类别单独覆盖 quality / annotate / generate / verify（v1.8 起还有 extract 的 instruction）的白名单参数（按类 rubric、按类标注指令等），类未覆盖的键继承全局。完整键表、白名单与合并语义见第 24 章与 spec §5.2。
@@ -134,7 +134,7 @@ sequence annotation 的业务时间同样在完整 class Schema 标记，并在 
 |---|---|---|
 | `max_repair_attempts` | 2 | 结构引擎 LLM 修复环的最大轮数。修复 2 轮仍不合法 ⇒ 该记录 `failed` 进拒绝通道。调大能救回更多顽固记录，但每轮都是一次真金白银的调用；更值得做的是把 Schema 改简单（第 14 章） |
 | `repair_llm` | 同调用方 | 修复调用用哪个 profile。默认跟原调用同一 profile；可以指一个便宜的小模型专门干修 JSON 的活 |
-| `validator` | 不设 | **代码回调校验层**：`"module:function"`，对已过 Schema 的标注对象做业务级硬校验（跨字段/词表/业务规则），违规意见回喂修复环。签名与写法见 14.5；启动时校验可导入、可调用并对 few-shot 示例干跑 |
+| `validator` | 不设 | `<python-file>:<attribute-path>`，文件相对工程根目录加载，对已过完整 Schema 的标注副本做业务校验，违规意见回喂修复环。需要计算字段时使用 annotate.postprocessor。 |
 
 ### 元信息与透传
 

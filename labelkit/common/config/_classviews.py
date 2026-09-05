@@ -22,6 +22,12 @@ from labelkit.common.config._collect import (
     _fmt,
     _Tbl,
 )
+from labelkit.common.config._postprocessing import (
+    compile_postprocessor_model,
+    project_postprocessor_examples,
+    require_postprocessor,
+    resolve_config_postprocessor,
+)
 from labelkit.common.config._rubrics import (
     _RUBRIC_SELECTORS,
     _RubricSite,
@@ -79,7 +85,7 @@ from labelkit.common.config.model import (
 _CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
     "quality": ("mode", "rounds", "rubric", "threshold", "selection", "top_ratio"),
     "annotate": ("instruction", "examples", "schema_path", "schema_inline",
-                 "time_bindings"),
+                 "time_bindings", "postprocessor"),
     "generate": ("instruction", "styles", "num_per_record", "temperature",
                  "state_schema_path", "initial_state_source", "initial_state_catalog_path"),
     "verify": ("extra_criteria",),
@@ -97,7 +103,7 @@ _SELECTION_GROUP = ("selection", "threshold", "top_ratio")
 # generate 节是 v1.18 sequence frame registry 的 instruction + Schema 恰一面；
 # 非 sequence 形态出现由约束簇定向报错。
 _FRAME_CLASS_SECTION_KEYS: dict[str, tuple[str, ...]] = {
-    "annotate": ("instruction", "examples", "enabled"),
+    "annotate": ("instruction", "examples", "enabled", "postprocessor"),
     "generate": ("instruction", "schema_path", "schema_inline", "time_bindings",
                  "duration_s", "resources"),
 }
@@ -304,8 +310,13 @@ def _merge_class_annotate(col: _Collector, file: str, cname: str, a_over: dict,
     """
     t = _Tbl(col, file, f"[class.{cname}.annotate]", a_over)
     examples_provided = "examples" in a_over
+    reference = t.get_str("postprocessor", base.postprocessor, nonempty=True)
+    hook = (resolve_config_postprocessor(col, file, f"[class.{cname}.annotate]",
+                                        reference, Path(file).resolve().parent)
+            if "postprocessor" in a_over else base.resolved_postprocessor)
     annotate = replace(
         base,
+        postprocessor=reference, resolved_postprocessor=hook,
         instruction=t.get_str("instruction", base.instruction, nonempty=True),
         examples=(_parse_examples(col, file, t.take("examples"),
                                   section=f"class.{cname}.annotate")
@@ -675,6 +686,29 @@ def _project_class_examples(merged: _MergedClass,
     return replace(merged, annotate=replace(merged.annotate, examples=examples))
 
 
+def _finalize_class_postprocessor(col: _Collector, file: str, cname: str,
+                                  merged: _MergedClass, compiled: TemporalSchemaProjection) -> tuple:
+    """完整示例检查之后，组合时间与代码字段投影。
+
+    @param col 错误聚合器
+    @param file 工程文件位置
+    @param cname 类名
+    @param merged 带有效函数与去时间示例的合并配置
+    @param compiled 既有时间 Schema 投影
+    @return 投影后的配置与完整/模型 Schema 载体
+    """
+    location = f"[class.{cname}.annotate]"
+    # 在去时间前检查归属冲突，不能让已有时间投影抹去冲突证据。
+    full_model = compile_postprocessor_model(col, file, location, compiled.full_schema)
+    model = (compile_postprocessor_model(col, file, location, compiled.model_schema)
+             if compiled.business_time_paths else full_model)
+    if merged.annotate.enabled:
+        require_postprocessor(col, file, location, compiled.full_schema, merged.annotate.resolved_postprocessor)
+    examples = project_postprocessor_examples(merged.annotate.examples, compiled.model_schema)
+    return (replace(merged, annotate=replace(merged.annotate, examples=examples)),
+            replace(compiled, model_schema=model))
+
+
 def _compile_class_temporal(col: _Collector, inputs: _ViewInputs,
                             request: _ClassTemporalRequest) -> tuple[
                                 _MergedClass,
@@ -782,6 +816,7 @@ def _build_class_views(col: _Collector, classify: ClassifyConfig, class_raw: Any
         request = _ClassTemporalRequest(cname, sections, merged, schema_c)
         merged, compiled, time_bindings = _compile_class_temporal(col, inputs, request)
         _dryrun_class_examples(col, cname, merged, compiled, inputs)
+        merged, compiled = _finalize_class_postprocessor(col, inputs.file, cname, merged, compiled)
         views[cname] = ClassView(name=cname, quality=merged.quality, rubric=rubric_c,
                                  annotate=merged.annotate, generate=merged.generate,
                                  verify=merged.verify, extract=merged.extract,
@@ -834,6 +869,25 @@ def _check_frame_class_whitelist(col: _Collector, file: str, cname: str,
                           f"(whitelist: {_avail(allowed)})")
 
 
+def _frame_postprocessor(col: _Collector, file: str, cname: str,
+                         raw: dict, base: FrameAnnotateConfig):
+    """按帧类覆盖解析函数；继承时复用已冻结的全局函数。
+
+    @param col 错误聚合器
+    @param file 工程文件位置
+    @param cname 帧类名
+    @param raw 帧类标注覆盖节
+    @param base 全局帧标注配置
+    @return 生效的冻结函数
+    """
+    if "postprocessor" not in raw:
+        return base.resolved_postprocessor
+    table = _Tbl(col, file, f"[frame.class.{cname}.annotate]", raw)
+    reference = table.get_str("postprocessor", None, nonempty=True)
+    return resolve_config_postprocessor(col, file, f"[frame.class.{cname}.annotate]",
+                                        reference, Path(file).resolve().parent)
+
+
 def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
                        base: FrameAnnotateConfig) -> tuple[FrameClassView, bool]:
     """把一个帧类的覆盖节合并到全局 ``[frame.annotate]``。
@@ -874,6 +928,7 @@ def _merge_frame_class(col: _Collector, file: str, cname: str, sections: dict,
         time_bindings=time_bindings,
         duration_us=duration,
         resources=resources,
+        resolved_postprocessor=_frame_postprocessor(col, file, cname, a_over, base),
     )
     return view, examples_provided
 
@@ -946,13 +1001,18 @@ def _build_frame_class_views(col: _Collector,
         else:
             view = FrameClassView(instruction=ctx.annotate.instruction,
                                   examples=ctx.annotate.examples, enabled=True,
-                                  description=descriptions.get(cname, ""))
+                                  description=descriptions.get(cname, ""),
+                                  resolved_postprocessor=ctx.annotate.resolved_postprocessor)
             examples_provided = False
         if examples_provided and view.examples:
             _dryrun_frame_examples(col, cname, view, ctx)
+        schema = ctx.validator.schema if ctx.validator is not None else None
+        if ctx.annotate.enabled and view.enabled:
+            require_postprocessor(col, ctx.file, f"[frame.class.{cname}.annotate]",
+                                  schema, view.resolved_postprocessor)
         if not view.description and cname in descriptions:
             view = replace(view, description=descriptions[cname])
-        views[cname] = view
+        views[cname] = replace(view, examples=project_postprocessor_examples(view.examples, schema))
     return views
 
 

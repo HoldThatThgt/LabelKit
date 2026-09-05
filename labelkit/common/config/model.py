@@ -11,7 +11,7 @@ from labelkit.common.config.generation import (
 from labelkit.common.config._temporal import freeze_json
 
 if TYPE_CHECKING:
-    from labelkit.common.extensions.hooks import ValidationHooks
+    from labelkit.common.extensions.hooks import ResolvedHook, ValidationHooks
 
 
 # ── config.toml 侧 ─────────────────────────────────────────────────────────
@@ -370,6 +370,8 @@ class AnnotateConfig:
                                                   # （首帧/末帧恒保留，中间均匀降采样）；
                                                   # M1：2 <= v <= 100（CONFIG_ERROR），
                                                   # > 20 且 max_image_px > 2000 → WARN（S28）
+    postprocessor: str | None = None              # 工程后处理函数的文件与属性引用
+    resolved_postprocessor: ResolvedHook | None = None  # M1 冻结的生效函数；不是配置键
 
 
 @dataclass(frozen=True)
@@ -469,7 +471,7 @@ class ClassView:
                                                   # segment 没有按类视图（它跑在 classify 之前
                                                   # ——那时标签还不存在）
     schema: Mapping | None = None                 # 按类标注 Schema；None 回落全局
-    model_schema: Mapping | None = None           # 剥离业务时间叶子的有效标注 Schema
+    model_schema: Mapping | None = None           # 排除框架时间与代码负责字段的有效标注 Schema
     description: str = ""                         # v1.18 sequence class 描述
     sequence_generation: SequenceClassGenerationConfig | None = None
                                                   # declared 类的世界生成配置
@@ -517,6 +519,8 @@ class FrameAnnotateConfig:
     schema_path: str | None = None                # 帧级输出 JSON Schema：enabled 时
     schema_inline: str | None = None              # schema_path/schema_inline 恰一
                                                   # （镜像 output.schema 全套分支）
+    postprocessor: str | None = None              # 帧标注后处理函数的文件与属性引用
+    resolved_postprocessor: ResolvedHook | None = None  # M1 冻结的生效函数；不是配置键
 
 
 @dataclass(frozen=True)
@@ -540,6 +544,7 @@ class FrameClassView:
     time_bindings: tuple[TimeBindingSpec, ...] = ()  # Planner 到 payload 的机械时间声明
     duration_us: int = 0                          # 固定正区间时长；零表示点事件
     resources: tuple[str, ...] = ()               # 区间占用的互斥资源
+    resolved_postprocessor: ResolvedHook | None = None  # 类覆盖后的帧标注后处理函数
 
 
 # ── CLI 覆盖项与总聚合 ──────────────────────────────────────────────────────
@@ -634,3 +639,5 @@ class ResolvedConfig:
                                                   # 冻结 parse product；生产 loader 恒显式填充
     validation_hooks: "ValidationHooks | None" = None
                                                   # output/sample/state 冻结 hook 集
+    model_user_schema: Mapping = field(default_factory=dict)  # 排除代码负责字段的冻结模型 Schema
+    model_frame_schema: Mapping | None = None     # 帧模型 Schema；帧标注关闭时为 None

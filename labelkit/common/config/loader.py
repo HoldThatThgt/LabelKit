@@ -28,6 +28,7 @@ from pathlib import Path
 from labelkit.common.config._collect import _Collector, _flush_warnings
 from labelkit.common.config._constraints import _LoadCtx, _Products, validate
 from labelkit.common.config._rubrics import default_rubric
+from labelkit.common.config._temporal import freeze_json
 from labelkit.common.config._sections import (
     _TRACE_CHANNELS,        # 追踪通道枚举: 实现落在 _sections, 公开导入面留在本模块
     _auto_console_mode,     # v1.10 auto 决策链: 同上, 公开导入面留在本模块
@@ -267,11 +268,13 @@ def _assemble(ctx: _LoadCtx, head: _ToolSide, products: _Products,
         trace=replace(p.trace, path=_trace_path(ctx, products)),
         rubric=products.rubric,
         class_views=products.class_views,
-        user_schema=products.user_schema,
+        user_schema=freeze_json(products.user_schema),
+        model_user_schema=products.model_user_schema,
         frame_classify=p.frame_classify,   # v1.12; vision_resolved 已冻结
         frame_annotate=p.frame_annotate,
         frame_class_views=products.frame_class_views,
-        frame_schema=products.frame_schema,
+        frame_schema=freeze_json(products.frame_schema),
+        model_frame_schema=products.model_frame_schema,
         sequence_generation=products.sequence_generation,
         limit=cli.limit, strict=cli.strict, dry_run=cli.dry_run,
         config_path=ctx.fc, project_path=ctx.fp,

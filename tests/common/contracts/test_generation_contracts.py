@@ -136,7 +136,7 @@ CONFIG_TYPES = {
 CONTRACT_FIELDS = {
     "GenerationProgram": (
         "mode", "semantic_profile", "evaluation_profile", "max_slot_attempts",
-        "planner_seed", "class_views", "frame_classes", "frame_schema", "patterns",
+        "planner_seed", "class_views", "frame_classes", "frame_schema", "model_frame_schema", "patterns",
         "counterfactual_sets", "instruction_only", "interleaving", "timeline",
         "calendar_windows",
         "noise", "limits", "state_validator", "digest",
@@ -413,6 +413,7 @@ CONTRACT_TYPES = {
     "GenerationProgram": (
         Literal["declared", "instruction_only"], str, str, int, int,
         Mapping[str, ClassView], Mapping[str, FrameClassView], Mapping[str, object] | None,
+        Mapping[str, object] | None,
         Mapping[str, config_generation.SequencePattern],
         tuple[config_generation.CounterfactualSetSpec, ...],
         tuple[config_generation.InstructionOnlySpec, ...],

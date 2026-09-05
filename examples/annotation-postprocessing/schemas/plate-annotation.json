@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "entities": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "value": {"type": "string", "minLength": 7, "maxLength": 8},
+          "start": {"type": "integer", "minimum": 0, "x-labelkit-postprocessor": true},
+          "end": {"type": "integer", "minimum": 1, "x-labelkit-postprocessor": true}
+        },
+        "required": ["value", "start", "end"],
+        "additionalProperties": false
+      },
+      "maxItems": 8
+    },
+    "entity_count": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 8,
+      "x-labelkit-postprocessor": true
+    }
+  },
+  "required": ["entities", "entity_count"],
+  "additionalProperties": false
+}

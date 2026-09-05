@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Awaitable, Callable, Mapping
 
 from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
+from labelkit.common.errors import InternalError
 from labelkit.common.inference import budget
 from labelkit.common.contracts.types import (
     Annotation,
@@ -19,6 +20,7 @@ from labelkit.common.contracts.types import (
 )
 from labelkit.operators.verify import (
     _BIG_THREE,
+    _ATTEMPT_MODE,
     _COUNTER_BOUNDARY_FLAGS,
     _COUNTER_DEFECTS_PREFIX,
     _COUNTER_MEMBERSHIP_REPAIRS,
@@ -106,6 +108,16 @@ async def _capture_leaf(operation: Callable[[], Awaitable[object]]) -> object:
     except Exception as exc:
         _log.error("stream verify leaf failed: kind=%s", type(exc).__name__)
         return exc
+
+
+def _propagate_attempt_internal(outcome: object) -> None:
+    """让 sequence attempt 中的程序错误越过普通记录隔离边界。
+
+    @param outcome 叶任务结果或被捕获的异常。
+    @raises InternalError attempt 模式中的内部错误原样抛出。
+    """
+    if _ATTEMPT_MODE.get() and isinstance(outcome, InternalError):
+        raise outcome
 
 
 async def _claim_call(claim: _ReclaimClaim, ctx: "RunContext") -> _ClaimOutcome:
@@ -507,6 +519,7 @@ class StreamVerifyDriver:
         outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
         for state, outcome in zip(jobs, outcomes):
             if isinstance(outcome, BaseException):
+                _propagate_attempt_internal(outcome)
                 self._stage._fail_item(state.item, outcome, ctx)
                 continue
             state.item.annotation = outcome
@@ -1066,6 +1079,7 @@ class StreamVerifyDriver:
         outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
         for (state, member, _label), outcome in zip(jobs, outcomes):
             if isinstance(outcome, BaseException):
+                _propagate_attempt_internal(outcome)
                 _record_member_failure(member, ctx, outcome)
                 state.item.member_annotations[member.id] = None
                 continue
@@ -1114,10 +1128,11 @@ class StreamVerifyDriver:
         @param ctx 运行上下文（标定器与按类 Schema 查询）
         @return True = 升档站得住；False = 只保留 k 减半
         """
-        from labelkit.operators.annotate import (AnnotatePromptOptions,
-                                                 build_annotate_prompt,
-                                                 class_effective_model_schema,
-                                                 class_schema_text)
+        from labelkit.operators.annotate import AnnotatePromptOptions, build_annotate_prompt
+        from labelkit.operators.annotation_finalization import (
+            class_effective_model_schema,
+            class_schema_text,
+        )
 
         item = trial.item
         prompt = build_annotate_prompt(

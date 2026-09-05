@@ -44,6 +44,7 @@ def compile_generation_program(config: ResolvedConfig) -> GenerationProgram:
         class_views=class_views,
         frame_classes=dict(config.frame_class_views),
         frame_schema=config.frame_schema,
+        model_frame_schema=config.model_frame_schema,
         patterns=patterns,
         counterfactual_sets=sequence.counterfactual_sets,
         instruction_only=sequence.instruction_only,

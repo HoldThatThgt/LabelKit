@@ -143,12 +143,12 @@ def test_actual_program_and_plan_digest_fixed_vectors(declared_program):
         "primary_sessions": plan.primary_sessions,
     }
     assert declared_program.digest == (
-        "6fc6ed81b120f839d94399366e3f065ed9be43da88be74e9f3e6794ac55adf3f"
+        "54ee52908d65269ced0f31605601ef4d88cca285304a360e96352b274da16880"
     )
     assert declared_program.digest == _independent_domain_digest(
         "generation_program", program_value,
     )
-    assert plan.digest == "472a517c2d000e0e216b9c07a8cadf4bf610d6e1caf654e4ff6e170393052f2e"
+    assert plan.digest == "a4c9ac4b2a5714804978b35ba4d8638000b50cc74794f42e7ad4b56e3e70daf3"
     assert plan.digest == _independent_domain_digest("scenario_plan", plan_value)
 
 
@@ -251,7 +251,7 @@ def test_plan_digest_covers_interleaving_opportunities_pair_and_blocks(declared_
     base = _interleaving_digest_plan(compile_scenario_plan(program))
     digest = scenario_plan_digest(base)
     assert digest == (
-        "f7c3cc1e5c0f62d80cc0416295399d028be509c69bc6077676dac6de52252b34"
+        "c130f66209c5ff2165527673385ee53931d26299ce9574b773e80e39a03a5eae"
     )
     assert all(
         scenario_plan_digest(item) != digest

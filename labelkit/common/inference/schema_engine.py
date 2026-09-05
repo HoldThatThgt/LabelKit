@@ -31,6 +31,7 @@ from labelkit.common.contracts.types import Usage
 from labelkit.common.errors import (
     LabelKitError,
     ContextOverflowError,
+    PostprocessorError,
     PostValidatorInvalidError,
     SchemaViolation,
 )
@@ -926,11 +927,14 @@ def _mapping_transform(
     @param candidate 引擎保留的原始 model-space 候选。
     @param kind 固定的变换名，仅用于脱敏日志。
     @return 只含标准 JSON 容器的新 dict。
-    @raises CandidateFinalizerContractError callable 异常或返回非 object 时抛出。
+    @raises PostprocessorError 后处理函数运行违约时原样传播。
+    @raises CandidateFinalizerContractError 其他 callable 异常或返回非 object 时抛出。
     """
     failed = False
     try:
         result = transform(_thaw_json(candidate))
+    except PostprocessorError:
+        raise
     except Exception:
         failed = True
         result = None
@@ -958,6 +962,7 @@ def _repair_previous_output(
     @param candidate L1 归一后的 model-space 候选；不可解析时为 None。
     @param projector 请求冻结的 repair projector。
     @return canonical JSON object 文本；不可解析时固定为 ``{}``。
+    @raises PostprocessorError projector 传播的后处理运行违约。
     @raises CandidateFinalizerContractError projector 违约或结果不可 JSON 序列化。
     """
     if candidate is None:
@@ -1038,7 +1043,7 @@ class SchemaEngine:
         @return 带前缀的违规列表；空列表 = 回调放行。
         """
         from labelkit.common.extensions.hooks import normalize_violations
-        raw = self._validator(dict(obj), record)          # 防御性拷贝
+        raw = self._validator(_thaw_json(obj), _thaw_json(record))
         return [self._CB_PREFIX + v
                 for v in normalize_violations(raw, self._validator_ref)]
 
@@ -1197,6 +1202,7 @@ class SchemaEngine:
         @param request 冻结的 generic finalizer 请求。
         @param ctx model Schema 与 L2.5 调用上下文。
         @return 成功完整对象或可修复违规。
+        @raises PostprocessorError 后处理函数运行违约。
         @raises CandidateFinalizerContractError finalizer 或 full Schema 终验违约。
         """
         if candidate is None:
@@ -1229,6 +1235,7 @@ class SchemaEngine:
         @param request model/full Schema、两个 callable 与调用范围。
         @return (完整对象, 累计用量, provider 调用数, 首轮模型名)。
         @raises SchemaViolation model L2 或 L2.5 在 L3 预算内未修复。
+        @raises PostprocessorError 任一合格候选的后处理函数运行违约。
         @raises CandidateFinalizerContractError callable 或 full Schema 违约。
         """
         ctx = _finalized_context(request)
@@ -1261,6 +1268,7 @@ class SchemaEngine:
         @param pending 首轮未通过的冻结现场。
         @return 完整对象与保持既有语义的调用证据。
         @raises SchemaViolation 修复预算耗尽。
+        @raises PostprocessorError 修复候选的后处理函数运行违约。
         @raises CandidateFinalizerContractError projector、finalizer 或 full Schema 违约。
         """
         raw, previous = pending.raw, pending.previous_output

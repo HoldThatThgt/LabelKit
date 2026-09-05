@@ -1,0 +1,52 @@
+schema_version = 1
+
+[run]
+input = "./data/plates.jsonl"
+output = "./out/plate-labels.jsonl"
+modality = "text"
+batch_size = 2
+seed = 20260905
+
+[input]
+text_field = "text"
+
+[dedup]
+enabled = false
+
+[classify]
+enabled = false
+
+[quality]
+enabled = false
+
+[generate]
+enabled = false
+
+[annotate]
+enabled = true
+llm = "default"
+postprocessor = "hooks.py:complete_plate_annotation"
+instruction = """
+识别原文中的中国机动车号牌实体。只输出 entities；每个元素只含 value。
+按原文出现顺序保留每次出现，value 写对应号牌本体，可保留原文里的中间点或连字符。
+不要推断原文没有出现的号牌；没有号牌时输出空数组。
+"""
+
+[[annotate.examples]]
+input = "测试车辆粤B·12345已到场。"
+
+[annotate.examples.output]
+entities = [{value = "粤B12345", start = 4, end = 12}]
+entity_count = 1
+
+[verify]
+enabled = false
+
+[trace]
+enabled = false
+
+[output]
+schema_path = "schemas/plate-annotation.json"
+meta_mode = "inline"
+rejects = "refs"
+passthrough_fields = ["case_id"]

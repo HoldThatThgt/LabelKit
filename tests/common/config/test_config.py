@@ -16,6 +16,7 @@ import pytest
 
 from labelkit.common.config import ResolvedConfig, default_rubric, load
 from labelkit.common.config import loader as loader_mod
+from labelkit.common.config._temporal import freeze_json
 from labelkit.common.config.model import (
     CliOverrides,
     ConsoleConfig,
@@ -354,7 +355,7 @@ def test_schema_path_variant(env):
     schema_file.write_text(SCHEMA, encoding="utf-8")
     body = f'[output]\nschema_path = "{schema_file}"'
     cfg = env.load(project_text=env.project(include_output=False, body=body))
-    assert cfg.user_schema == json.loads(SCHEMA)
+    assert cfg.user_schema == freeze_json(json.loads(SCHEMA))
     assert cfg.output.schema_path == str(schema_file)
 
 
@@ -3087,7 +3088,7 @@ enabled = false
     assert cfg.frame_annotate.instruction == "标注帧意图"
     assert cfg.frame_annotate.examples[0].output == {
         "intent": "book_train", "entities": ["上海", "明天"]}   # 干跑通过
-    assert cfg.frame_schema == json.loads(FRAME_SCHEMA)
+    assert cfg.frame_schema == freeze_json(json.loads(FRAME_SCHEMA))
     # 每个已声明帧类各得一份视图（零覆盖类含在内，class_views 同款）
     assert set(cfg.frame_class_views) == {"task_request", "chitchat", "other"}
     t = cfg.frame_class_views["task_request"]
@@ -3139,7 +3140,7 @@ instruction = "任务请求帧标注指令。"
     has(errors, "[frame.class.task_request.quality]: section is not in the [frame.class.*] "
                 "override whitelist (available: annotate, generate)")
     has(errors, "[frame.class.task_request.annotate].llm: [frame.class.*.annotate] cannot "
-                "override this key (whitelist: instruction, examples, enabled)")
+                "override this key (whitelist: instruction, examples, enabled, postprocessor)")
     # 白名单内键不误伤
     assert not any(".instruction" in e for e in errors)
 
@@ -3200,7 +3201,7 @@ def test_frame_schema_path_variant_and_unreadable(env):
     prefix = SEG_ON + '\n[frame.annotate]\nenabled = true\ninstruction = "标"\n'
     cfg = env.load(project_text=env.project(
         body=prefix + f'schema_path = "{schema_file}"\n'))
-    assert cfg.frame_schema == json.loads(FRAME_SCHEMA)
+    assert cfg.frame_schema == freeze_json(json.loads(FRAME_SCHEMA))
     assert cfg.frame_annotate.schema_path == str(schema_file)
     errors = env.errors(project_text=env.project(
         body=prefix + 'schema_path = "ghost/frame.json"\n'))

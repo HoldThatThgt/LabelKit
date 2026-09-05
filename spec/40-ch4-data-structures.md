@@ -2,6 +2,14 @@
 
 本章是全部模块共享的类型契约。除 `PipelineItem` 的状态字段外全部为不可变（frozen dataclass）；模块间只通过这些类型与第 3 章列出的类签名交互。
 
+标注后处理增加以下冻结字段：`AnnotateConfig` 与 `FrameAnnotateConfig` 的 postprocessor 引用及
+resolved_postprocessor 函数；`FrameClassView.resolved_postprocessor`；`ResolvedConfig.model_user_schema`
+与 model_frame_schema；`GenerationProgram.model_frame_schema`。ClassView.model_schema 同时排除
+业务时间和代码负责字段。ResolvedHook.target 为 `Callable[..., object]`，调用处分别检查返回契约；
+ValidationHooks 仍只包含 output/sample/state 校验。sequence program 深冻结模型帧 Schema 和各类函数，
+attempt 配置只绑定这些冻结值。新增载体字段与引用进入现有 canonical digest，不包含 callable 对象或
+钩子文件内容。公共投影和调用接口见 `docs/dev/SPEC-annotation-postprocessing.md`。
+
 ## 4.1 记录与信封
 
 ```
@@ -314,7 +322,7 @@ JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是�
 | `NoiseSpec` | `frame_class`, `instruction`, `topics` |
 | `GenerationLimits` | `pattern_roles`, `variants_per_counterfactual_set`, `instruction_only_events`, `scenario_seed_bytes`, `state_or_outcome_schema_bytes`, `frame_schema_bytes`, `event_patch_bytes`, `rendered_payload_bytes`, `prompt_value_bytes`, `repair_context_bytes`, `prompt_text_bytes`, `record_units`, `stream_rows`, `retained_content_bytes` |
 | `SequenceGenerationConfig` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `state_validator`, `patterns`, `counterfactual_sets`, `instruction_only`, `interleaving`, `timeline`, `calendar_windows`, `noise`, `limits` |
-| `GenerationProgram` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `planner_seed`, `class_views`, `frame_classes`, `frame_schema`, `patterns`, `counterfactual_sets`, `instruction_only`, `interleaving`, `timeline`, `calendar_windows`, `noise`, `limits`, `state_validator`, `digest` |
+| `GenerationProgram` | `mode`, `semantic_profile`, `evaluation_profile`, `max_slot_attempts`, `planner_seed`, `class_views`, `frame_classes`, `frame_schema`, `model_frame_schema`, `patterns`, `counterfactual_sets`, `instruction_only`, `interleaving`, `timeline`, `calendar_windows`, `noise`, `limits`, `state_validator`, `digest` |
 | `DeliverySlot` | `slot_key`, `source_name`, `scenario_index`, `sequence_class`, `pattern_name`, `variant_names`, `catalog_row_index` |
 | `PlannedEvent` | `event_key`, `role`, `position`, `logical_time_us`, `timestamp_us`, `duration_us`, `resources`, `session_id` |
 | `NoiseSlot` | `event_key`, `ordinal`, `frame_class`, `topic`, `timestamp_us`, `duration_us`, `resources`, `session_id` |

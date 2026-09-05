@@ -167,6 +167,17 @@ class InternalError(LabelKitError):
     kind='internal_error'；调用栈以 debug 级别写入 stderr 日志。"""
 
 
+class PostprocessorError(InternalError):
+    """工程后处理函数违反同步 JSON 返回契约的脱敏内部错误。"""
+
+    def __init__(self) -> None:
+        """构造不包含业务数据或原始函数异常的固定错误。
+
+        @return 无。
+        """
+        super().__init__("postprocessor_error")
+
+
 class DeliveryError(LabelKitError):
     """v1.18 sequence 精确交付尝试耗尽；CLI 退出码 1。"""
 

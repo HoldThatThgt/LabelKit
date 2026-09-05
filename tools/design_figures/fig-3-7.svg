@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 230" font-family="PingFang SC, sans-serif">
+  <defs>
+    <marker id="postprocess-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#526477"/>
+    </marker>
+  </defs>
+  <g text-anchor="middle" font-size="17">
+    <rect x="10" y="40" width="175" height="88" rx="8" fill="#edf3fa" stroke="#526477"/>
+    <text x="97" y="75" font-weight="600">模型 Schema 通过</text>
+    <text x="97" y="101" font-size="13">模型只生成语义字段</text>
+    <rect x="225" y="40" width="175" height="88" rx="8" fill="#edf8f2" stroke="#39825e"/>
+    <text x="312" y="75" font-weight="600">同步工程函数</text>
+    <text x="312" y="101" font-size="13">规范化与计算代码字段</text>
+    <rect x="440" y="40" width="175" height="88" rx="8" fill="#f5f2fc" stroke="#8069a3"/>
+    <text x="527" y="75" font-weight="600">框架时间注入</text>
+    <text x="527" y="101" font-size="13">冻结计划提供机械时间</text>
+    <rect x="655" y="40" width="175" height="88" rx="8" fill="#fff7e8" stroke="#a87b2d"/>
+    <text x="742" y="75" font-weight="600">完整 Schema 通过</text>
+    <text x="742" y="101" font-size="13">最终输出的结构约束</text>
+    <rect x="870" y="40" width="200" height="88" rx="8" fill="#edf3fa" stroke="#526477"/>
+    <text x="970" y="75" font-weight="600">记录级自定义校验</text>
+    <text x="970" y="101" font-size="13">通过后交给 verify 与交付</text>
+    <text x="540" y="177" font-size="15" fill="#405165">每个合格候选恰好执行一次工程函数；候选、原始行与返回值深拷贝隔离</text>
+    <text x="540" y="204" font-size="14" fill="#405165">帧使用自己的函数与完整 Schema，不调用记录级自定义校验</text>
+  </g>
+  <g stroke="#526477" stroke-width="2" marker-end="url(#postprocess-arrow)">
+    <path d="M185 84 H222"/>
+    <path d="M400 84 H437"/>
+    <path d="M615 84 H652"/>
+    <path d="M830 84 H867"/>
+  </g>
+</svg>

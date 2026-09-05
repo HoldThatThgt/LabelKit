@@ -7,6 +7,24 @@
 
 ### 3.5.2 标注提示词组装（确定性模板）
 
+**标注后处理。**工程函数可规范化模型已经生成的字段，也可计算 Schema 中标记
+`x-labelkit-postprocessor: true` 的代码负责字段。该标记定义生成职责，不限制函数只能写标记字段。
+完整契约见 `docs/dev/SPEC-annotation-postprocessing.md`。
+
+图 3-7 标注候选的工程后处理与完整校验
+
+M5 用 `FinalizedCallRequest` 接入既有结构引擎。函数对每个模型 L2 合格候选恰好调用一次；
+模型 L2 不合格候选不调用。普通记录与帧传真实 raw 副本，序列记录传 None；候选与返回值也深拷贝隔离。
+函数必须返回完整标准 JSON 字典，异常和非法返回为固定脱敏 `PostprocessorError`，不进入模型修复。
+最终 Schema 不合格或工程函数自行产生框架时间沿定稿内部错误传播；普通批只失败当前记录，
+sequence 为终态错误、退出 4，不消费 slot attempt。
+
+每次 self-consistency 采样、内部 L3、verify 重标注、episode repair 和 frame backfill 均经过同一边界。
+self-consistency 按模型 Schema 的字段投票并选择已经完整验证的某个原候选，不拼接对象、不再次执行函数。
+帧标注使用独立模型/完整帧 Schema 与有效帧类函数，继续无记录级 output validator 和 resolved-at 记账。
+模型 prompt、response Schema、few-shot、修复 previous_output 和对应预算均不包含代码字段与框架时间字段。
+sequence attempt 只能读取 GenerationProgram 冻结的类视图与 model_frame_schema。
+
 ```
 system:
   {annotate.instruction}                        # project.toml，必填
@@ -42,18 +60,19 @@ UI 树序列化格式（`UITree.serialize()`，4.3 节）：深度缩进的每�
 **按类标注 Schema。**`label` 同时选定标注 Schema：类有效 Schema =
 `class_views[label].schema ?? cfg.user_schema`。process 的 LLM/fallback 标签与 v1.18 sequence projector 写入的
 inherited 标签走同一单点取值函数；不能以 `cfg.classify.enabled = false` 为由跳过 `ClassView`。类未声明覆盖、
-label 缺失或类表外未知类回落全局。每个 Schema 消费点都读该函数，保证计价 Schema 与调用 Schema 相同：
+label 缺失或类表外未知类使用全局。完整 Schema 供最终验证与写出，模型 Schema 排除业务时间与代码字段；
+每个消费点使用其对应 Schema，保证计价 Schema 与模型实际调用相同：
 
 | 消费点 | 按类有效取值 |
 |---|---|
-| 本节模板的 `{user_schema_json}` | 类有效 Schema 的 canonical 单行 dump（无覆盖时直取 M8 的 `user_schema_text` 属性，字节等价） |
-| 标注调用（首次 / 修复重标注两处） | 有覆盖 ⇒ 显式 `schema=类有效Schema` **且** `scope.user_treatment=True`（3.8.2 待遇参数：L2.5 与 `resolved_at` 记账双保留）；无覆盖 ⇒ `schema=None` 的既有推断路径 |
-| self-consistency 字段级投票 | 可投票字段取自类有效 Schema（按类 Schema 的字段集可与全局不同） |
-| v1.11 预算装填的 schema 计价项 | 按类有效 Schema 计价 |
-| M7 修复路径的重标注与 V21 试装 | 传同一 `label` 自然穿透（无修复侧改动，3.7.3） |
+| 本节模板的 `{user_schema_json}` | 类有效模型 Schema 的 canonical 单行 dump；没有投影及类覆盖时沿用 M8.user_schema_text |
+| 标注调用（首次 / 修复重标注） | 有后处理或时间绑定时使用完整/模型 Schema 的 finalized 接口，scope.user_treatment=True；其余沿用原显式 Schema 与全局推断路径 |
+| self-consistency 字段级投票 | 可投票字段取自类有效模型 Schema；返回已经完整验证的原候选 |
+| v1.11 预算装填的 schema 计价项 | 按类有效模型 Schema 及投影示例计价 |
+| M7 修复路径的重标注与 V21 试装 | 使用同一 label、模型 Schema 和移除代码/时间字段的 previous_output |
 | M11 写前终检 | 按**该行**类标签取有效 Schema（3.11.2；multi 扇出的兄弟信封各带自己的标签，按行天然对齐） |
 
-未配置任何按类 Schema 时全部调用形与 v1.12 逐字节一致。
+未配置按类 Schema、后处理或时间绑定时，保持既有调用形和模型调用数量。
 
 **标注鲁棒性：self-consistency（可选，v1.2）。**`annotate.self_consistency = n`（默认 0 = 关；启用须 n ≥ 3 且为奇数，5.2）时，M5 对每条记录按本节模板独立采样 n 次（temperature 统一取 `annotate.sc_temperature`，默认 0.7——采样多样性的来源），每次输出都各自经 M8 走完整结构保证后才参与投票。**字段级投票**：enum / boolean / integer 字段逐字段取 n 个样本中的众数；自由文本 / 数组字段不逐字投票，取「与众数字段组合一致的样本」中第一个的对应字段值。其余类型字段（number、嵌套 object 等）与自由文本/数组同法处理（不逐字段投票，随众数字段组合整体取值）。全体分歧（众数组合不存在或无样本与其完全一致）时整体采用第一个样本，并计入 `report.annotate.sc_disagreements`。某次采样经 M8 修复仍失败（SchemaViolation）⇒ 该样本弃权、由其余合法样本投票（agreement_ratio 分母仍为 n）；n 次全部失败才置 `status="failed"`。`_meta.annotation.attempts` 记 n 次采样 attempts 之和。`_meta.annotation` 增 `sc = {n, agreement_ratio}`（agreement_ratio = 与最终众数字段组合完全一致的样本数 / n；6.3 只增字段）；trace `annotate.done` 事件 payload 增同构 `sc` 字段（7.2「只增不改」契约内扩展）。该机制对分类型 Schema 收益最大——如统一示例的 `intent` / `difficulty` 枚举字段：多路径采样 + 多数投票显著优于单次贪心解码（Self-Consistency，Wang et al., ICLR 2023 [33]，GSM9K +17.9%）。成本：标注调用与 token ×n。
 

@@ -13,6 +13,88 @@
 - API key value 只在内存中使用，不写日志、trace、main、stream、report、manifest、failed report 或 assertion repr。
 - 尚未运行的证据必须保留 `[PENDING-EVIDENCE:<name>]`，不能用规格期望冒充结果。
 
+## 2026-09-05 标注后处理钩子证据
+
+权威规格为 `docs/dev/SPEC-annotation-postprocessing.md`。普通记录、序列记录及成员帧共用
+模型 Schema → 工程后处理 → 框架时间 → 完整 Schema 的候选定稿边界。代码负责字段不进入模型生成输入，
+最终交付保留这些字段；记录级 validator 与 verify 检查处理后的完整结果。
+
+| 证据面 | 当前状态 | 已知事实 / 输入边界 |
+|---|---|---|
+| 改动前完整离线基线 | 已验证 | `3044 passed, 48 deselected in 623.44s`；基线 commit `9f88620` |
+| 配置、投影与函数边界 | 已验证 | 761 passed；43/43 修改函数进入，覆盖未知类引用聚合、非法 Schema 聚合和全局完整 Schema 深冻结 |
+| 标注与 stream verify | 已验证 | 230 passed；27/27 修改函数进入，覆盖真实 raw、副本隔离、自洽选择、时间顺序及修复错误传播 |
+| SchemaEngine 隔离 | 已验证 | inference 套件 397 passed；新增 5 个定稿顺序、L3 调用次数、validator 深复制和程序错误身份用例 |
+| 工程示例离线门 | 已验证 | 12 passed；含多实体、分隔符、缺失上下文、歧义、伪造位置/长度的拒绝，以及两个工程的冻结计划 |
+| 真实本地 4B | 已验证 | `1 passed in 27.51s`；实际调用生产 `execute_run`，两次普通标注和一次带帧、replay 的 sequence 交付全部通过独立检查器 |
+| 完整离线与覆盖门 | 已验证 | 补齐独立复核断言后的最终门为 `3224 passed, 49 deselected in 670.75s`；79/79 修改函数进入；17 个修改生产文件最低行覆盖 88.65%、最低分支覆盖 77.50% |
+| Uncle Bob mutation review | 待运行 | 用户已授权本地提交及隔离语义变异；以本轮干净提交执行，完成后记录独立台账 |
+| 外部端点发布门 | 本轮未运行 | `[PENDING-EVIDENCE:postprocessing-deepseek]`、`[PENDING-EVIDENCE:postprocessing-zai]`；用户指定的本轮特性真实验收为本地 4B |
+
+### 本地模型身份与可复现命令
+
+本轮实测模型为 `/Users/atishoo/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q6_K.gguf`，SHA-256 为
+`fdedd781c9ce676ab66b018ca247ff78e8a33c98098a822c1e2d5075e7718f66`。实际服务版本为 llama-server
+0.3.0，build 10621，commit `c1d0e7a00`。独立端口 18081 的服务启动命令为：
+
+```bash
+/opt/homebrew/bin/llama-server \
+  -m /Users/atishoo/models/Qwen3.5-4B-GGUF/Qwen3.5-4B-Q6_K.gguf \
+  -c 393216 -np 4 -b 2048 -ub 512 -t 6 -tb 6 \
+  -ngl all -fa on --fit off -rea off \
+  --host 127.0.0.1 --port 18081 --metrics --no-webui
+```
+
+两个工程使用 `examples/annotation-postprocessing/config-local-4b.toml`，实际 profile 为 context window 98304、
+max concurrency 2、max output tokens 2048、thinking disabled。先运行两个工程的 `validate` 和 `dry-run`，
+普通工程计划 2 次调用；sequence 工程为 1 primary sequence、3 primary events、3 replay events、0 noise，
+预计 11 次调用。随后以非秘密的本地测试凭据设置 `LABELKIT_LOCAL_KEY`，执行：
+
+```bash
+uv run --python 3.12 pytest tests/integration/test_postprocessing_local_llm.py \
+  -q -s -m 'integration and local_llm' \
+  --basetemp /tmp/labelkit-postprocessor-20260905-RMOspE/live-test-final
+```
+
+| 实际运行 | 产物与独立检查 | LLM usage | wall time |
+|---|---|---|---|
+| 普通标注首轮 | 2 rows；多实体及分隔符实体的规范值、原文切片、Unicode 位置和数量均正确 | default：2 calls、8 prompt tokens、46 completion tokens | 2.268 秒 |
+| 普通标注再次运行 | 同一输入与独立实体 oracle；确定性字段关系再次正确 | default：2 calls、8 prompt tokens、46 completion tokens | 0.970 秒 |
+| sequence 交付 | 1 main、6 stream；main/member/primary/replay 的完整标注一致，所有 manifest 文件 hash 与 delivery digest 检查通过 | default：10 calls、6740 prompt tokens、534 completion tokens；judge：1 call、2055 prompt tokens、45 completion tokens；全部零 retry | 22.154 秒 |
+
+普通标注中模型负责抽取车牌值，工程函数规范化大小写与分隔符并计算 `start`、`end`、`entity_count`。
+独立 oracle 检查 `粤B12345`、`京A12345` 的原文区间分别为 `[6,14)`、`[15,22)`，`沪C88888` 为 `[6,14)`。
+sequence 的模型负责摘要及帧的请求身份、状态，工程函数计算 `summary_length`、`request_id_length` 和
+`utterance_length`；检查器从最终业务字段与真实成员 payload 重新计算。函数不读取独立 oracle 文件。
+
+最终 sequence delivery digest 为
+`19cc31b578c2bb542910cbb2f6e3e554d7d3d4956fb869d7a62399e7034778eb`。
+真实请求旁路观察只保存“模型 Schema/提示词是否含代码字段”的布尔值，观察到 ordinary 4、sequence 1、frame 3
+个标注请求；未替换 transport、LLM client 或服务端。全部模型调用共 15 次。以上时间只证明本轮可运行，
+不作为吞吐或加速结论。验证结束已关闭本轮启动的 18081 服务，用户原有 8080 服务未停止或替换。
+
+### 失败证据与修复边界
+
+首个真实 sequence 门因示例函数要求 utterance 内一定出现请求编号而失败：真实模型在两个成员的自然语言中
+未重复该编号，但 payload 与帧标注中的请求身份、状态一致。失败正确传播为 `PostprocessorError`、退出码 4、
+零 slot attempt，并写入 `generation_downstream_contract` failed report；未把程序错误回喂模型。
+示例已改为从实际语义结果与 raw 计算有业务含义的长度，普通记录仍验证真实实体位置；最终完整真实门重新通过。
+脱敏诊断原件为
+`/private/tmp/labelkit-postprocessing-diag-2on1qjxa/examples/annotation-postprocessing/diagnostic.jsonl`，
+同目录 failed report 保留零 attempt 与终态错误分类；诊断只记录字段存在性、相等性和位置匹配数量。
+
+独立配置复核保留了 8 个失败用例的原始日志：未知类引用不能漏检、非法完整 Schema 不能逃逸错误聚合、
+全局完整 Schema 必须深冻结。修复后三组回归全部通过。此前完整离线门的类型载体/摘要金值及示例迭代失败
+也保留，不能使用该红色基线作为变异测试的分母。
+
+本轮原始日志、最终真实产物及覆盖数据保存于 `/tmp/labelkit-postprocessor-20260905-RMOspE/`；
+最终真实日志为 `local-4b-e2e-final.log`，最终工件位于
+`live-test-final/test_real_local_postprocessing0/examples/annotation-postprocessing/out/`。
+完整离线命令为 `uv run --python 3.12 pytest -q -m 'not integration' --cov=labelkit --cov-branch`，
+补齐独立复核断言后的最终日志为 `acceptance-offline.log`，覆盖 JSON 为 `coverage-acceptance.json`，
+逐修改函数及文件证据为 `acceptance-production-coverage.json`。比较 `9f88620` 与本轮 AST 得到 79 个新增或
+修改函数；全部进入。此前已通过的 3211 用例完整运行及其覆盖日志也保留，没有覆盖失败或旧门证据。
+
 ## 2026-09-04 并发缺口修复证据
 
 本轮只增加三处已有依赖边允许的并发，不改变普通批屏障或同一状态链：declared baseline 后的 sibling

@@ -53,10 +53,17 @@ from labelkit.common.errors import (
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
+    InternalError,
+    PostprocessorError,
 )
+from labelkit.common.extensions.hooks import ResolvedHook
 from labelkit.common.contracts.generation import SequenceTemporalContext
 from labelkit.common.inference import budget as budget_mod
-from labelkit.common.inference.schema_engine import VERDICT_SCHEMA, defect_verdict_schema
+from labelkit.common.inference.schema_engine import (
+    CandidateFinalizerContractError,
+    VERDICT_SCHEMA,
+    defect_verdict_schema,
+)
 from labelkit.common.contracts.types import (
     Annotation,
     Classification,
@@ -349,6 +356,7 @@ def trace_cfg(*, enabled=True, content="refs") -> ResolvedConfig:
         rubric=Rubric(name="default:text", criteria=()),
         class_views={},
         user_schema=USER_SCHEMA,
+        model_user_schema=USER_SCHEMA,
         limit=None,
         strict=False,
         dry_run=False,
@@ -547,6 +555,7 @@ def test_multi_judge_schema_violation_preserves_majority():
         rubric=Rubric(name="default:text", criteria=()),
         class_views={},
         user_schema=USER_SCHEMA,
+        model_user_schema=USER_SCHEMA,
         limit=None, strict=False, dry_run=False,
         config_path="config.toml", project_path="project.toml",
         config_digest="sha256:0", project_digest="sha256:0",
@@ -610,6 +619,7 @@ def test_single_judge_schema_violation_becomes_record_outcome():
         rubric=Rubric(name="default:text", criteria=()),
         class_views={},
         user_schema=USER_SCHEMA,
+        model_user_schema=USER_SCHEMA,
         limit=None, strict=False, dry_run=False,
         config_path="config.toml", project_path="project.toml",
         config_digest="sha256:0", project_digest="sha256:0",
@@ -657,11 +667,11 @@ def _classified_cfg(*, policy="drop", max_repair_rounds=1) -> ResolvedConfig:
             annotate=replace(base.annotate, instruction=CLASS_INSTRUCTION),
             generate=base.generate,
             verify=replace(gverify, extra_criteria=CLASS_EXTRA),
-            extract=ExtractConfig()),
+            extract=ExtractConfig(), model_schema=base.model_user_schema),
         "qa": ClassView(
             name="qa", quality=base.quality, rubric=base.rubric,
             annotate=base.annotate, generate=base.generate, verify=gverify,
-            extract=ExtractConfig()),
+            extract=ExtractConfig(), model_schema=base.model_user_schema),
     }
     classify = ClassifyConfig(
         enabled=True, fallback_class="qa",
@@ -1833,7 +1843,8 @@ def _stream_classified_cfg() -> ResolvedConfig:
     base = _stream_cfg()
     views = {name: ClassView(name=name, quality=base.quality, rubric=base.rubric,
                              annotate=base.annotate, generate=base.generate,
-                             verify=base.verify, extract=base.extract)
+                             verify=base.verify, extract=base.extract,
+                             model_schema=base.model_user_schema)
              for name in ("a", "b")}
     classify = ClassifyConfig(
         enabled=True, assignment="multi", max_labels=2, fallback_class="a",
@@ -2312,7 +2323,8 @@ def _frame_stream_cfg(base=None, *, classify_on=True, annotate_on=True,
     return replace(base, frame_classify=frame_classify,
                    frame_annotate=frame_annotate,
                    frame_class_views=_frame_views() if classify_on else {},
-                   frame_schema={"type": "object"} if annotate_on else None)
+                   frame_schema={"type": "object"} if annotate_on else None,
+                   model_frame_schema={"type": "object"} if annotate_on else None)
 
 
 def _member_cls(label="task_request") -> Classification:
@@ -2627,7 +2639,8 @@ def _class_schema_cfg(*, structured: bool, annotate_cw: int) -> ResolvedConfig:
     views = {
         name: ClassView(name=name, quality=base.quality, rubric=base.rubric,
                         annotate=base.annotate, generate=base.generate,
-                        verify=base.verify, extract=base.extract, schema=schema)
+                        verify=base.verify, extract=base.extract, schema=schema,
+                        model_schema=schema or base.model_user_schema)
         for name, schema in (("big", CLASS_SCHEMA_BIG), ("plain", None))
     }
     classify = ClassifyConfig(
@@ -2710,7 +2723,7 @@ def _verdict_cfg(*, policy="drop", max_repair_rounds=1,
             generate=cfg.generate,
             verify=VerifyConfig(enabled=True, llm="judge",
                                 extra_criteria="④ 序列连贯性"),
-            extract=cfg.extract)
+            extract=cfg.extract, model_schema=cfg.model_user_schema)
         cfg = replace(cfg, classify=ClassifyConfig(
             enabled=True,
             classes=(ClassSpec(name="faq", description="d"),)),
@@ -2832,6 +2845,64 @@ def test_classic_path_sequence_pairs_verdict_form_with_verdict_schema():
     assert passing.verification.defects == ()
     assert failing.status == "dropped_verify"
     assert failing.verification.defects == ()
+
+
+def test_verify_judge_receives_complete_annotation_with_code_owned_field():
+    """判决提示必须携带最终完整对象，包括只由后处理函数补齐的字段。"""
+    full_schema = {
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string"},
+            "summary_length": {
+                "type": "integer",
+                "x-labelkit-postprocessor": True,
+            },
+        },
+        "required": ["intent", "summary_length"],
+        "additionalProperties": False,
+    }
+    model_schema = {
+        "type": "object",
+        "properties": {"intent": {"type": "string"}},
+        "required": ["intent"],
+        "additionalProperties": False,
+    }
+
+    def complete(obj, record):
+        return obj
+
+    base = _verdict_cfg()
+    cfg = replace(
+        base,
+        annotate=replace(
+            base.annotate,
+            resolved_postprocessor=ResolvedHook("/project/hooks.py:complete", complete),
+        ),
+        user_schema=full_schema,
+        model_user_schema=model_schema,
+    )
+    output = {"intent": "问答", "summary_length": 2}
+    item = PipelineItem(
+        record=_assembled_sequence(), status="active", annotation=_annotation(output),
+    )
+    engine = _VerdictEngine({"e" * 16: [_verdict_obj("pass")]})
+    ctx = _task_context(
+        cfg=cfg, llm=None, schema_engine=engine, metrics=_CapturingMetrics(),
+        rng=None, batch_no=1,
+    )
+
+    asyncio.run(VerifyStage(cfg).run([item], ctx))
+
+    ((_, prompt, schema, _),) = engine.calls
+    annotation_parts = [
+        part.text for part in prompt.messages[1].parts
+        if (part.text or "").startswith("[标注结果] ")
+    ]
+    assert len(annotation_parts) == 1
+    assert json.loads(annotation_parts[0].removeprefix("[标注结果] ")) == output
+    assert "summary_length" not in model_schema["properties"]
+    assert schema is VERDICT_SCHEMA
+    assert item.verification.verdict == "pass"
 
 
 _VERDICT_HEAD = "你是标注质量审核员。给定任务指令、成员帧摘要与标注结果"
@@ -3231,6 +3302,123 @@ def test_sequence_attempt_retryable_error_is_recoverable_outcome():
     assert result.dataset_counters == {}
     assert item.status == "failed"
     assert item.errors[0].kind == "provider_retryable_exhausted"
+    assert metrics.counters == {}
+
+
+class _FinalizedFailureStreamEngine(SeqJudgeEngine):
+    """Judge normally, then fail the annotation finalized boundary."""
+
+    user_schema_text = json.dumps(USER_SCHEMA, ensure_ascii=False,
+                                  separators=(", ", ": "))
+
+    def __init__(self, scripts, error):
+        super().__init__(scripts)
+        self.error = error
+        self.finalized_calls = []
+
+    async def complete_finalized(self, request):
+        self.finalized_calls.append(request)
+        raise self.error
+
+
+def _enable_record_postprocessor(cfg):
+    def complete(obj, record):
+        return obj
+
+    hook = ResolvedHook("/project/hooks.py:complete", complete)
+    return replace(
+        cfg, annotate=replace(cfg.annotate, resolved_postprocessor=hook),
+    )
+
+
+def _stream_attempt(cfg, items, engine):
+    from labelkit.common.contracts.generation import (
+        AttemptTransaction,
+        DownstreamAttemptRequest,
+    )
+
+    metrics = _AttemptMetrics()
+    transaction = AttemptTransaction(tuple(items), {}, ())
+    ctx = _task_context(
+        cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
+        rng=None, batch_no=1, tasks=_SerialTaskRunner(),
+    )
+    return VerifyStage(cfg), DownstreamAttemptRequest(transaction, ctx), metrics
+
+
+def test_stream_episode_repair_postprocessor_error_is_attempt_fatal():
+    cfg = _enable_record_postprocessor(_stream_cfg(extract_enabled=False))
+    episode = _episode([_frame("f0"), _frame("f1")])
+    error = PostprocessorError()
+    engine = _FinalizedFailureStreamEngine({
+        episode.record.id: [_seq_obj("fail", defects=[_defect("label_mismatch")])],
+    }, error)
+    stage, request, metrics = _stream_attempt(cfg, [episode], engine)
+
+    with pytest.raises(PostprocessorError) as caught:
+        asyncio.run(stage.run_attempt(request))
+
+    assert caught.value is error
+    assert len(engine.finalized_calls) == 1
+    assert metrics.counters == {}
+
+
+def test_stream_episode_repair_final_schema_error_is_attempt_fatal():
+    cfg = _enable_record_postprocessor(_stream_cfg(extract_enabled=False))
+    episode = _episode([_frame("f0"), _frame("f1")])
+    engine = _FinalizedFailureStreamEngine({
+        episode.record.id: [_seq_obj("fail", defects=[_defect("label_mismatch")])],
+    }, CandidateFinalizerContractError())
+    stage, request, metrics = _stream_attempt(cfg, [episode], engine)
+
+    with pytest.raises(InternalError, match="candidate finalizer contract failed"):
+        asyncio.run(stage.run_attempt(request))
+
+    assert len(engine.finalized_calls) == 1
+    assert metrics.counters == {}
+
+
+def test_stream_frame_backfill_final_schema_error_is_attempt_fatal(monkeypatch):
+    hook = ResolvedHook("/project/hooks.py:complete_frame", lambda obj, record: obj)
+    base = _frame_stream_cfg(extract_enabled=False)
+    views = {
+        name: replace(view, resolved_postprocessor=hook)
+        for name, view in base.frame_class_views.items()
+    }
+    cfg = replace(
+        base,
+        frame_annotate=replace(
+            base.frame_annotate, resolved_postprocessor=hook,
+        ),
+        frame_class_views=views,
+    )
+    _stub_judge_window(monkeypatch, relation="continues")
+    _stub_classify_frames(monkeypatch, label="task_request")
+    first, second, reclaimed = (
+        _ui_frame("f0"), _ui_frame("f1"), _ui_frame("f2"),
+    )
+    noise = _env(reclaimed, status="dropped_noise")
+    noise.noise_attribution = ("segment", "noise")
+    episode = _episode([first, second])
+    episode.member_classifications = {
+        first.id: _member_cls(), second.id: _member_cls(),
+    }
+    episode.member_annotations = {
+        first.id: _annotation({"intent": "帧"}),
+        second.id: _annotation({"intent": "帧"}),
+    }
+    engine = _FinalizedFailureStreamEngine({
+        episode.record.id: [_seq_obj("fail", defects=[_defect("missing_tail")])],
+    }, CandidateFinalizerContractError())
+    stage, request, metrics = _stream_attempt(
+        cfg, [_env(first), _env(second), noise, episode], engine,
+    )
+
+    with pytest.raises(InternalError, match="frame annotation candidate finalizer"):
+        asyncio.run(stage.run_attempt(request))
+
+    assert len(engine.finalized_calls) == 1
+    assert engine.finalized_calls[0].scope.record_ids == (reclaimed.id,)
     assert metrics.counters == {}
 
 

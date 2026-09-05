@@ -1139,6 +1139,7 @@ class _DeliveryController:
             class_views=transaction.class_views,
             frame_class_views=self.request.program.frame_classes,
             frame_schema=self.request.program.frame_schema,
+            model_frame_schema=self.request.program.model_frame_schema,
         )
         collaborators = (
             ("quality", self.services.quality),

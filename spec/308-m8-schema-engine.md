@@ -14,6 +14,15 @@ state Schema 与 state validator，并把冻结 `EventExecution` 与合法对象
 
 ### 3.8.2 四层保证与修复环
 
+标注后处理复用 `complete_finalized`：先用模型 Schema 校验，再对独立候选运行一次 finalizer，
+用完整 Schema 校验后才进入既有用户 validator。`PostprocessorError` 继承 `InternalError`，
+必须原样向上传播；不能改为 Schema 违规、消耗 L3 预算或泄漏工程异常正文。
+其他定稿契约错误仍为 `candidate_finalizer_contract`。用户 validator 在首轮和每轮修复中
+都接收候选与 raw 的递归深拷贝；其参数变异不改变最终候选。L3 通过 repair_projector 删除
+代码负责字段及框架时间字段后构造 previous_output，使用相同模型 Schema 产生新候选。
+帧标注虽使用后处理，仍是内部 Schema 待遇，无 output validator、无记录级 resolved-at。
+完整语义见 `docs/dev/SPEC-annotation-postprocessing.md`。
+
 图 3-3 结构引擎四层保证。任何写入主输出的对象必然经过 L2 通过分支。
 
 | 层 | 精确行为 |
@@ -38,7 +47,7 @@ Schema validation、repair、usage、retry、breaker、resource/origin wait 与 
 **帧级两类调用的路由声明（v1.12）**：帧粒度引入的两类 LLM 调用都走本引擎既有能力，`complete_validated` 与 `validate_only` 的显式 schema 参数路径**零改动**——
 
 - **帧分类**（M13 批量判决，3.13.7）：传入模块级构造器 `frame_classify_schema(names, n)` 产出的**内部 Schema**，待遇与裁决/评分/评审等内部 Schema 完全同族——L0–L3 全在、不经过 L2.5、不计入 `report.schema_engine.resolved_at`。
-- **帧标注**（M5 逐帧标注，3.5.5）：传入**用户声明的帧级 Schema** `cfg.frame_schema`（显式 schema 参数，裁决·帧 Schema 显式路由）——虽为用户 Schema 的同胞（M1 元校验 + few-shot 干跑，3.1.4），但按**内部 Schema 待遇**路由：L0–L3 四层全在、**无 L2.5**（`output.validator` 仅约束序列级用户 Schema 调用；帧级回调列 8.4 演进候选）、**不计 `resolved_at`**——保住 6.4 恒等式「resolved_at 加总 = 进入 M5 的记录数」不被帧调用污染。
+- **帧标注**（M5 逐帧标注）：配置后处理时使用 finalized 接口，模型接收 cfg.model_frame_schema，工程函数处理后按 cfg.frame_schema 终验；无后处理时沿用显式帧 Schema 调用。帧保持内部 Schema 待遇，L0–L3 全在，无记录级 output.validator、不计记录级 resolved-at。
 - **写前兜底**（M11，3.11.2）：emitter 对每个非 null 帧标注对象跑 `validate_only(obj, schema=cfg.frame_schema)`——通过 ⇒ status="annotated"，不通过 ⇒ 翻 "failed" + annotation 置 null + 计数，非法帧对象**永不落盘**（主输出 `validate_only` 终检的帧级镜像）。
 
 **显式 Schema 待遇：**`CallScope.user_treatment` 把用户待遇与显式 schema 参数解耦；按类标注 Schema 虽显式传入，仍执行 L2.5 与 `resolved_at` 记账：
@@ -70,7 +79,9 @@ class SchemaEngine:
                                  scope: CallScope = CallScope()) -> dict:
         """schema=None 时用用户 Schema；内部 Schema（裁决/评分/评审/生成/分类（v1.7）/
            分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9）/帧级判决（v1.12）/
-           sequence 的 seed/event-plan/frame-render/semantic/noise Schema）由调用方传入。\n           scope.user_treatment：None = 按 schema is None 推断；\n           True = 用户待遇（计 resolved_at + 启 L2.5）——按序列类标注 Schema 即此形；
+           sequence 的 seed/event-plan/frame-render/semantic/noise Schema）由调用方传入。
+           scope.user_treatment：None = 按 schema is None 推断；
+           True = 用户待遇（计 resolved_at + 启 L2.5）——按序列类标注 Schema 即此形；
            False = 内部待遇。成功返回已通过 L2 的 dict；失败抛 SchemaViolation。"""
     def validate_only(self, obj: dict, schema: dict | None = None) -> list[str]:
         """M1 校验 few-shot 示例输出、M11 写出前终检用；v1.12：M11 帧标注写前

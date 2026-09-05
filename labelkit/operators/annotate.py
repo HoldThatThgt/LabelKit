@@ -42,7 +42,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Mapping, Sequence
 
-from labelkit.common.config._temporal import inject_temporal_values, project_temporal_instance
 from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
@@ -71,6 +70,20 @@ from labelkit.common.inference import budget
 from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 from labelkit.common.inference.schema_engine import (
     CallScope, CandidateFinalizerContractError, FinalizedCallRequest, _thaw_json,
+)
+from labelkit.operators.annotation_finalization import (
+    annotation_contract_error,
+    annotation_record_context,
+    annotation_transforms,
+    class_annotate_schema,
+    class_effective_model_schema,
+    class_effective_schema,
+    class_schema_text,
+    frame_annotation_transforms,
+    frame_postprocessor,
+    project_annotation_instance,
+    record_postprocessor,
+    verify_temporal_annotation,
 )
 
 if TYPE_CHECKING:
@@ -240,170 +253,6 @@ def _dumps(obj: object) -> str:
     return json.dumps(_thaw_json(obj), ensure_ascii=False)
 
 
-# ── 按序列类标注 Schema ───────────────────────────────────────────────────
-#
-# 三个取值函数是本特性在 M5 侧的单点真相：调用 Schema、提示词 Schema 文本、
-# 预算计价与自洽投票全部经此取值，保证「计价的 Schema 就是调用的 Schema」。
-# M7 verify 的 V21 试装经懒加载复用同一组函数；M11 emitter 不得跨算子导入，
-# 按 spec §2.2 在其内部做最小镜像（语义须与 class_annotate_schema 一致）。
-
-
-@dataclass(frozen=True)
-class _AnnotationFinalizer:
-    """一次 sequence annotation 的冻结时间注入器。"""
-
-    paths: tuple[str, ...]                       # 完整 Schema 中的时间路径
-    values: tuple[tuple[str, object], ...]        # 路径到最早 resource start
-    context: SequenceTemporalContext              # 本次调用显式复用的唯一冻结上下文
-
-    def __call__(self, candidate: Mapping[str, object]) -> Mapping[str, object]:
-        """注入 annotation 时间且拒绝任何非时间改写。"""
-        projected = project_temporal_instance(candidate, self.paths)
-        if _canonical_mapping(projected) != _canonical_mapping(candidate):
-            raise ValueError("annotation candidate contains a business time field")
-        finalized = inject_temporal_values(candidate, dict(self.values))
-        if _canonical_mapping(project_temporal_instance(finalized, self.paths)) \
-                != _canonical_mapping(candidate):
-            raise ValueError("annotation finalizer changed a non-time field")
-        return finalized
-
-
-@dataclass(frozen=True)
-class _AnnotationProjector:
-    """annotation L3 只读可达时间叶子的 total 投影器。"""
-
-    paths: tuple[str, ...]                       # 需删除的业务时间路径
-
-    def __call__(self, candidate: Mapping[str, object]) -> Mapping[str, object]:
-        """@return 不创建或替换 parent 的 model-space 副本。"""
-        return project_temporal_instance(candidate, self.paths)
-
-
-def _canonical_mapping(value: Mapping[str, object]) -> str:
-    """把 mapping 转为稳定字节等价文本。"""
-    return json.dumps(_thaw_json(value), ensure_ascii=False, sort_keys=True,
-                      separators=(",", ":"))
-
-
-def _class_view(cfg: "ResolvedConfig", label: str | None):
-    """读取标签的冻结类视图；非法标签不猜测。"""
-    return None if label is None else cfg.class_views.get(label)
-
-def class_annotate_schema(cfg: "ResolvedConfig",
-                          label: str | None) -> Mapping | None:
-    """取该记录所属序列类的标注 Schema 覆盖。
-
-    @param cfg 已解析配置
-    @param label 记录分类标签
-    @return 类 Schema；无标签、未知类或无覆盖时为 None
-    """
-    if label is None:
-        return None
-    view = cfg.class_views.get(label)
-    return None if view is None else view.schema
-
-
-def class_effective_schema(cfg: "ResolvedConfig", label: str | None) -> Mapping:
-    """类有效标注 Schema = 按类覆盖 ?? 全局 ``output.schema``。
-
-    @param cfg 已解析配置
-    @param label 记录分类标签
-    @return 自洽投票与预算计价共用的有效 Schema
-    """
-    override = class_annotate_schema(cfg, label)
-    return cfg.user_schema if override is None else override
-
-
-def class_effective_model_schema(cfg: "ResolvedConfig", label: str | None) -> Mapping:
-    """取一条标注调用的 provider-facing model Schema。
-
-    @param cfg 已解析配置
-    @param label 序列类标签
-    @return 投影后或既有的有效 Schema
-    """
-    view = _class_view(cfg, label)
-    if view is None or not view.time_bindings:
-        return class_effective_schema(cfg, label)
-    if view.model_schema is None:
-        _annotation_contract_error("annotation model schema is missing")
-    return view.model_schema
-
-
-def class_schema_text(ctx: "RunContext", label: str | None) -> str:
-    """提示词内嵌的类有效 Schema 文本（canonical 单行 dump）。
-
-    @param ctx 运行上下文
-    @param label 记录分类标签
-    @return provider-facing Schema 文本
-    """
-    view = _class_view(ctx.cfg, label)
-    if view is not None and view.time_bindings:
-        return json.dumps(_thaw_json(class_effective_model_schema(ctx.cfg, label)),
-                          ensure_ascii=False, separators=(", ", ": "))
-    override = class_annotate_schema(ctx.cfg, label)
-    if override is None:
-        return ctx.schema_engine.user_schema_text
-    return json.dumps(_thaw_json(override), ensure_ascii=False, separators=(", ", ": "))
-
-
-def _annotation_time_values(record: Record, cfg: "ResolvedConfig", opts: AnnotatePromptOptions):
-    """从同一冻结 temporal context 解析 annotation 机械值。"""
-    view = _class_view(cfg, opts.label)
-    if view is None or not view.time_bindings:
-        return {}
-    context = opts.temporal_context
-    if not isinstance(context, SequenceTemporalContext) or record.kind != "sequence":
-        _annotation_contract_error("annotation temporal context is missing")
-    if tuple(member.event_id for member in context.members) != tuple(member.id for member in record.members):
-        _annotation_contract_error("annotation temporal context differs from sequence members")
-    values: dict[str, object] = {}
-    for binding in view.time_bindings:
-        values[binding.payload_path] = _first_resource_start(context, binding)
-    if tuple(values) != view.business_time_paths:
-        _annotation_contract_error("annotation binding order differs from its Schema paths")
-    return context, values
-
-
-def _first_resource_start(context: SequenceTemporalContext, binding) -> int:
-    """读取一个 resource 的最早正区间毫秒起点。"""
-    if binding.source != "first_resource_start_milliseconds" or not binding.resource:
-        _annotation_contract_error("annotation time binding source is invalid")
-    starts = []
-    for member in context.members:
-        valid = (isinstance(member.timestamp_us, int) and not isinstance(member.timestamp_us, bool)
-                 and isinstance(member.duration_us, int) and not isinstance(member.duration_us, bool)
-                 and member.timestamp_us % 1000 == 0 and member.duration_us >= 0
-                 and member.duration_us % 1000 == 0)
-        if not valid:
-            _annotation_contract_error("annotation temporal context contains an invalid interval")
-        if binding.resource in member.resources:
-            if member.duration_us == 0:
-                _annotation_contract_error("annotation resource interval is not positive")
-            starts.append(member.timestamp_us)
-    if not starts:
-        _annotation_contract_error("annotation temporal context lacks its resource interval")
-    return min(starts) // 1000
-
-
-def _annotation_transforms(record: Record, cfg: "ResolvedConfig", opts: AnnotatePromptOptions
-                           ) -> tuple[_AnnotationFinalizer, _AnnotationProjector]:
-    """为一条序列标注构造同 context 的冻结变换对。"""
-    view = _class_view(cfg, opts.label)
-    paths = () if view is None else view.business_time_paths
-    context, values = _annotation_time_values(record, cfg, opts)
-    return _AnnotationFinalizer(paths, tuple(values.items()), context), _AnnotationProjector(paths)
-
-
-def _project_repair_options(cfg: "ResolvedConfig", opts: AnnotatePromptOptions) -> AnnotatePromptOptions:
-    """从 M7 外层 repair prompt 的 previous_output 删除机械时间。"""
-    if opts.repair is None:
-        return opts
-    view = _class_view(cfg, opts.label)
-    paths = () if view is None else view.business_time_paths
-    previous = project_temporal_instance(opts.repair.previous_output, paths)
-    return replace(opts, repair=replace(opts.repair, previous_output=previous))
-
-
 async def _complete_annotation(ctx: "RunContext", record: Record, prompt: PromptBundle, opts: AnnotatePromptOptions,
                                ) -> tuple[dict, Usage, int, str]:
     """把一次记录级标注调用路由进 M8。
@@ -416,10 +265,13 @@ async def _complete_annotation(ctx: "RunContext", record: Record, prompt: Prompt
     """
     profile = ctx.cfg.annotate.llm
     scope = CallScope(record_ids=(record.id,), batch_no=ctx.batch_no,
-                      record=record.raw)
-    view = _class_view(ctx.cfg, opts.label)
-    if view is not None and view.time_bindings:
-        finalizer, projector = _annotation_transforms(record, ctx.cfg, opts)
+                      record=annotation_record_context(record))
+    postprocessor = record_postprocessor(ctx.cfg, opts.label)
+    view = ctx.cfg.class_views.get(opts.label) if opts.label is not None else None
+    if postprocessor is not None or (view is not None and view.time_bindings):
+        finalizer, projector = annotation_transforms(
+            record, ctx.cfg, opts.label, opts.temporal_context,
+        )
         try:
             return await ctx.schema_engine.complete_finalized(FinalizedCallRequest(
                 profile=profile,
@@ -431,7 +283,7 @@ async def _complete_annotation(ctx: "RunContext", record: Record, prompt: Prompt
                 repair_projector=projector,
             ))
         except CandidateFinalizerContractError:
-            _annotation_contract_error("annotation candidate finalizer contract failed")
+            annotation_contract_error("annotation candidate finalizer contract failed")
     schema = class_annotate_schema(ctx.cfg, opts.label)
     if schema is None:
         return await ctx.schema_engine.complete_validated(profile, prompt,
@@ -439,14 +291,6 @@ async def _complete_annotation(ctx: "RunContext", record: Record, prompt: Prompt
     return await ctx.schema_engine.complete_validated(
         profile, prompt, schema=dict(schema),
         scope=replace(scope, user_treatment=True))
-
-
-def _annotation_contract_error(reason: str):
-    """以 generation downstream 终态结束时间标注契约破坏。"""
-    _logger.error("generation_downstream_contract: %s", reason)
-    raise InternalError(f"generation_downstream_contract: {reason}")
-
-
 # ── v1.11 上下文预算装填（spec 3.5.2 上下文预算装填与修复升级换档）───────────
 
 _TREE_MARKER_RE = re.compile(r"^…\(truncated (\d+) nodes\)$")
@@ -596,7 +440,9 @@ def _assemble_prompt(record: Record, cfg: "ResolvedConfig", schema_text: str,
         等价路径（预算关，或本次装配本就塞得下）
     @return 装配好的 PromptBundle
     """
-    opts = _project_repair_options(cfg, opts)
+    if opts.repair is not None:
+        previous = project_annotation_instance(opts.repair.previous_output, cfg, opts.label)
+        opts = replace(opts, repair=replace(opts.repair, previous_output=previous))
     acfg = cfg.class_views[opts.label].annotate if opts.label is not None else cfg.annotate
     messages = _prelude_messages(acfg, schema_text)
     if record.kind == "sequence":              # v1.8 序列变体（判定先于模态）
@@ -1182,8 +1028,7 @@ async def annotate_record(record: Record, ctx: "RunContext",
                           ) -> Annotation:
     """跑完一条记录的完整标注路径（含自洽投票）。
 
-    @param record 待标注记录（序列记录 raw = None，故 L2.5 回调收到 record=None——
-        已知限制）
+    @param record 待标注记录；序列记录不向后处理函数或 L2.5 暴露内部 raw
     @param ctx 为本次公开调用派生唯一 task_namespace 的运行上下文
     @param opts 装配变体参数（``AnnotatePromptOptions``）：``repair`` 非 None 时
         **跳过**自洽（修复重标注恒为 profile 默认温度下的单次调用）；``label``
@@ -1251,42 +1096,28 @@ def _annotation_from_samples(outcomes: Sequence[_SampleOutcome], record: Record,
         if outcome.value is None:
             raise InternalError("annotation sample completed without a value")
         obj, usage, attempts, model = outcome.value
-        _verify_temporal_annotation(obj, record, ctx.cfg, opts)
+        verify_temporal_annotation(
+            obj, record, ctx.cfg, opts.label, opts.temporal_context,
+        )
         return Annotation(output=obj, model=model, attempts=attempts, usage=usage)
     valid, last_violation = _split_sc_results(outcomes)
     if not valid:
         raise last_violation if last_violation is not None else SchemaViolation(
             ["self-consistency: all samples failed"], "")
 
-    # 可投票字段取自类有效 Schema（按类 Schema 的字段集可与全局不同）。
+    # 可投票字段取自模型 Schema，代码负责字段不参与候选选择。
     chosen, matches, disagreed = _majority_vote(
-        [obj for obj, _, _, _ in valid], class_effective_schema(ctx.cfg, opts.label))
+        [obj for obj, _, _, _ in valid], class_effective_model_schema(ctx.cfg, opts.label))
     if disagreed:
         ctx.metrics.count("annotate.sc_disagreements")
     n = len(outcomes)
-    _verify_temporal_annotation(chosen, record, ctx.cfg, opts)
+    verify_temporal_annotation(
+        chosen, record, ctx.cfg, opts.label, opts.temporal_context,
+    )
     return Annotation(output=chosen, model=valid[0][3],
                       attempts=sum(attempts for _, _, attempts, _ in valid),
                       usage=sum((usage for _, usage, _, _ in valid), Usage()),
                       sc={"n": n, "agreement_ratio": matches / n})
-
-
-def _verify_temporal_annotation(output: Mapping[str, object], record: Record,
-                                cfg: "ResolvedConfig", opts: AnnotatePromptOptions) -> None:
-    """确认 sample 或 vote 定稿仍等于同 context 的机械注入结果。"""
-    view = _class_view(cfg, opts.label)
-    if view is None or not view.time_bindings:
-        return
-    finalizer, _projector = _annotation_transforms(record, cfg, opts)
-    model = project_temporal_instance(output, view.business_time_paths)
-    try:
-        expected = finalizer(model)
-    except ValueError:
-        _annotation_contract_error("annotation vote temporal finalization failed")
-    if _canonical_mapping(expected) != _canonical_mapping(output):
-        _annotation_contract_error("annotation vote replaced its temporal context")
-
-
 # ── v1.12 帧级逐帧标注（SPEC-frame-annotation §3.3；公开直调面 = 修复面族新成员）──
 #
 # 段序冻结（§10.13）：system（[任务] + 生效指令 + Schema 约束句 + 帧 Schema 文本——
@@ -1463,16 +1294,38 @@ async def annotate_member_leaf(member: Record, ctx: "RunContext",
     @return 成功 Annotation；异常原样上抛
     """
     cfg = ctx.cfg
-    schema = _thaw_json(cfg.frame_schema)
-    schema_text = json.dumps(schema, ensure_ascii=False, separators=(", ", ": "))
+    final_schema = _thaw_json(cfg.frame_schema)
+    model_schema = _thaw_json(cfg.model_frame_schema)
+    schema_text = json.dumps(model_schema, ensure_ascii=False, separators=(", ", ": "))
     prof = cfg.llm_profiles.get(cfg.frame_annotate.llm)
     if prof is None or prof.context_window <= 0:
         prompt = build_frame_annotate_prompt(member, cfg, schema_text, label=label)
     else:
         prompt = _pack_frame_prompt(member, ctx, prof, schema_text, label)
-    obj, usage, attempts, model = await ctx.schema_engine.complete_validated(
-        cfg.frame_annotate.llm, prompt, schema=schema,
-        scope=CallScope(record_ids=(member.id,), batch_no=ctx.batch_no))
+    scope = CallScope(
+        record_ids=(member.id,), batch_no=ctx.batch_no,
+        record=annotation_record_context(member),
+    )
+    postprocessor = frame_postprocessor(cfg, label)
+    if postprocessor is None:
+        result = await ctx.schema_engine.complete_validated(
+            cfg.frame_annotate.llm, prompt, schema=model_schema, scope=scope,
+        )
+    else:
+        finalizer, projector = frame_annotation_transforms(member, cfg, label)
+        try:
+            result = await ctx.schema_engine.complete_finalized(FinalizedCallRequest(
+                profile=cfg.frame_annotate.llm,
+                prompt=prompt,
+                model_schema=model_schema,
+                final_schema=final_schema,
+                scope=scope,
+                candidate_finalizer=finalizer,
+                repair_projector=projector,
+            ))
+        except CandidateFinalizerContractError:
+            annotation_contract_error("frame annotation candidate finalizer contract failed")
+    obj, usage, attempts, model = result
     return Annotation(output=obj, model=model, attempts=attempts, usage=usage)
 
 

@@ -28,6 +28,13 @@ from labelkit.common.config._classviews import (
     _check_nonsequence_annotation_bindings,
 )
 from labelkit.common.config._collect import _Collector, _fmt
+from labelkit.common.config._postprocessing import (
+    check_parked_postprocessor_references,
+    compile_postprocessor_model,
+    project_postprocessor_examples,
+    require_postprocessor,
+    resolve_config_postprocessor,
+)
 from labelkit.common.config.generation import (
     SequenceGenerationConfig,
     parse_generation_config,
@@ -88,6 +95,8 @@ class _Products:
     rubric_is_inline: bool = False                      # 全局准则是否来自内联表
     class_views: dict[str, ClassView] = field(default_factory=dict)          # 序列类视图
     frame_schema: dict | None = None                    # 帧级输出 Schema
+    model_user_schema: object = None                    # 全局冻结模型 Schema
+    model_frame_schema: object = None                   # 帧级冻结模型 Schema
     frame_class_views: dict[str, FrameClassView] = field(default_factory=dict)  # 帧类视图
     eff_input: str | None = None                        # 生效输入路径(CLI > project, 绝对)
     eff_output: str | None = None                       # 生效输出路径(CLI > project, 绝对)
@@ -512,6 +521,9 @@ def _load_schema_and_hooks(ctx: _LoadCtx, products: _Products) -> None:
     dr.schema_key = skey
     dr.schema_ok = schema_ok
     products.user_schema = user_schema
+    products.model_user_schema = compile_postprocessor_model(col, fp, "[output]", user_schema if schema_ok else None)
+    if p.annotate.enabled and not (p.classify.enabled or p.generate.form == "sequence"):
+        require_postprocessor(col, fp, "[annotate]", user_schema, p.annotate.resolved_postprocessor)
     if dr.validator is not None and p.annotate.examples:
         dr.schema_alive, _ = _dryrun_fewshot(col, p.annotate.examples, _DryRun(
             file=fp, elem_label="annotate.examples", validator=dr.validator,
@@ -626,6 +638,7 @@ def _check_classify_and_views(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
     sequence = p.generate.form == "sequence"
     _check_nonsequence_annotation_bindings(col, fp, p.class_raw, p.generate.form)
     if not p.classify.enabled and not sequence:
+        check_parked_postprocessor_references(col, fp, p.class_raw, "class")
         _warn_parked_classify(ctx)
         return ctx
     if p.classify.enabled:
@@ -642,6 +655,7 @@ def _check_classify_and_views(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
                           verify=p.verify, extract=p.extract),
         dryrun=products.dryrun)
     products.class_views = _build_class_views(col, classify, p.class_raw, inputs)
+    check_parked_postprocessor_references(col, fp, p.class_raw, "class", products.class_views)
     return ctx
 
 
@@ -940,7 +954,10 @@ def _load_frame_annotate_schema(ctx: _LoadCtx, products: _Products) -> _FrameVie
     fschema, fs_ok = _load_frame_schema(col, fp, p.frame_annotate)
     if fs_ok:
         products.frame_schema = fschema
+        products.model_frame_schema = compile_postprocessor_model(col, fp, "[frame.annotate]", fschema)
         fctx.validator = Draft202012Validator(fschema)
+        if not (p.frame_classify.enabled or p.generate.form == "sequence"):
+            require_postprocessor(col, fp, "[frame.annotate]", fschema, p.frame_annotate.resolved_postprocessor)
     if fctx.validator is not None and p.frame_annotate.examples:
         fctx.schema_alive, _ = _dryrun_fewshot(col, p.frame_annotate.examples, _DryRun(
             file=fp, elem_label="frame.annotate.examples", validator=fctx.validator,
@@ -978,6 +995,9 @@ def _check_frame_namespace(ctx: _LoadCtx, products: _Products) -> None:
                           f"[frame.class.{cname}.annotate] for frame annotation")
     if frame_ns_live:
         products.frame_class_views = _build_frame_class_views(col, fctx)
+        check_parked_postprocessor_references(col, fp, raw, "frame.class", products.frame_class_views)
+    else:
+        check_parked_postprocessor_references(col, fp, raw, "frame.class")
 
 
 def _check_frame_family(ctx: _LoadCtx, products: _Products) -> None:
@@ -1174,9 +1194,9 @@ def _class_schema_est(view: ClassView, schema_text: str) -> int:
     @param schema_text 全局用户 Schema 的 JSON 文本
     @return token 估算值
     """
-    if view.schema is None:
+    if view.model_schema is None:
         return budget.est_text(schema_text)
-    return budget.est_text(json.dumps(view.schema, ensure_ascii=False))
+    return budget.est_text(json.dumps(view.model_schema, ensure_ascii=False))
 
 
 def _static_checks_prefix(ctx: _LoadCtx,
@@ -1216,7 +1236,7 @@ def _static_checks_scoring(ctx: _LoadCtx, views: tuple[ClassView, ...],
                            products: _Products) -> list[tuple[str, tuple, int]]:
     """V13③ 静态部件: quality 与 annotate 两段(逐池取最大)。
 
-    annotate 的最大值按完整 schema + instruction + few-shot 计算；未声明按类 Schema
+    annotate 的最大值按模型 Schema + instruction + 模型 few-shot 计算；未声明按类 Schema
     时每个视图使用全局 Schema。
 
     @param ctx 校验上下文
@@ -1225,8 +1245,8 @@ def _static_checks_scoring(ctx: _LoadCtx, views: tuple[ClassView, ...],
     @return (阶段名, profile 名元组, 静态估算)三元组列表
     """
     p = ctx.p
-    schema_text = (json.dumps(products.user_schema, ensure_ascii=False)
-                   if products.user_schema else "")
+    schema_text = (json.dumps(products.model_user_schema, ensure_ascii=False)
+                   if products.model_user_schema else "")
     checks: list[tuple[str, tuple, int]] = []
     if p.quality.enabled:
         judges_active = bool(p.quality.judges) and p.quality.mode == "pairwise"
@@ -1295,8 +1315,8 @@ def _static_checks_tail(ctx: _LoadCtx, products: _Products) -> list[tuple[str, t
                        budget.TEMPLATE_HEAD_TOKENS["frame_classify"]
                        + budget.est_text(frame_table_text)))
     if p.frame_annotate.enabled:
-        frame_schema_text = (json.dumps(products.frame_schema, ensure_ascii=False)
-                             if products.frame_schema else "")
+        frame_schema_text = (json.dumps(products.model_frame_schema, ensure_ascii=False)
+                             if products.model_frame_schema else "")
         checks.append(("frame.annotate", (p.frame_annotate.llm,),
                        budget.TEMPLATE_HEAD_TOKENS["frame_annotate"]
                        + budget.est_text(frame_schema_text)
@@ -1521,6 +1541,34 @@ def _warn_self_enhancement(ctx: _LoadCtx) -> None:
                      f"model {_fmt(a_prof.model)}, which risks self-enhancement bias (3.7.2)")
 
 
+def _resolve_annotation_postprocessors(ctx: _LoadCtx) -> _LoadCtx:
+    """解析两个全局函数；关闭阶段也检查显式引用。
+
+    @param ctx M1 校验上下文
+    @return 带冻结全局函数的新上下文
+    """
+    updates = {}
+    for name, location in (("annotate", "[annotate]"), ("frame_annotate", "[frame.annotate]")):
+        config = getattr(ctx.p, name)
+        hook = resolve_config_postprocessor(ctx.col, ctx.fp, location, config.postprocessor, ctx.root)
+        updates[name] = replace(config, resolved_postprocessor=hook)
+    return replace(ctx, p=replace(ctx.p, **updates))
+
+
+def _project_global_postprocessor_examples(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
+    """类视图完成最终示例检查后，再投影全局示例。
+
+    @param ctx M1 校验上下文
+    @param products 完整 Schema 产物
+    @return 示例已投影并冻结的新上下文
+    """
+    annotate = replace(ctx.p.annotate, examples=project_postprocessor_examples(
+        ctx.p.annotate.examples, products.user_schema))
+    frame = replace(ctx.p.frame_annotate, examples=project_postprocessor_examples(
+        ctx.p.frame_annotate.examples, products.frame_schema))
+    return replace(ctx, p=replace(ctx.p, annotate=annotate, frame_annotate=frame))
+
+
 def validate(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
     """按 spec 3.1.4 的表行次序跑完全部约束簇(次序即报错聚合次序)。
 
@@ -1537,12 +1585,14 @@ def validate(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
     _check_generation_form(ctx)
     _check_run_mode(ctx)
     _collect_referenced_profiles(ctx, products)
+    ctx = _resolve_annotation_postprocessors(ctx)
     _load_schema_and_hooks(ctx, products)
     _resolve_global_rubric(ctx, products)
     ctx = _check_classify_and_views(ctx, products)
     _check_stage_matrix(ctx)
     _check_stream_family(ctx, products)
     _check_frame_family(ctx, products)
+    ctx = _project_global_postprocessor_examples(ctx, products)
     _parse_sequence_generation(ctx, products)
     ctx = _check_budget_and_vision(ctx, products, 1)
     _check_required_instructions(ctx)

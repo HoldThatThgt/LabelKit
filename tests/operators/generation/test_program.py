@@ -12,6 +12,7 @@ import pytest
 from labelkit.common.config.generation import InterleavingPatternSpec, InterleavingSpec
 from labelkit.common.config.model import FewShotExample, TimeBindingSpec
 from labelkit.common.errors import ConfigError
+from labelkit.common.extensions.hooks import ResolvedHook
 from labelkit.operators.generation.planner import compile_scenario_plan
 from labelkit.operators.generation.program import (
     compile_generation_program,
@@ -122,6 +123,44 @@ def test_program_digest_is_deterministic_and_covers_frozen_semantics(declared_co
     assert first.state_validator.reference.endswith("hooks.py:validate_state")
 
 
+@pytest.mark.parametrize("surface", ["record", "frame"])
+def test_program_digest_includes_postprocessor_reference_but_not_callable(declared_config, surface):
+    """记录与帧的有效引用各自进入程序摘要，目标函数既不执行也不序列化。"""
+    def original_target(_obj, _record):
+        raise AssertionError("program compilation must not execute a postprocessor")
+
+    def replacement_target(_obj, _record):
+        raise AssertionError("replacement callable must not enter program serialization")
+
+    def compile_with(reference, target):
+        hook = ResolvedHook(reference, target)
+        if surface == "record":
+            views = dict(declared_config.class_views)
+            view = views["ticket_booking"]
+            views["ticket_booking"] = replace(
+                view, annotate=replace(view.annotate, resolved_postprocessor=hook),
+            )
+            config = replace(declared_config, class_views=views)
+        else:
+            views = dict(declared_config.frame_class_views)
+            views["task_request"] = replace(views["task_request"], resolved_postprocessor=hook)
+            config = replace(declared_config, frame_class_views=views)
+        return compile_generation_program(config)
+
+    reference = f"/labelkit-test-fixture/hooks.py:{surface}_postprocess"
+    original = compile_with(reference, original_target)
+    changed_reference = compile_with(f"{reference}_other", original_target)
+    changed_callable = compile_with(reference, replacement_target)
+    assert original.digest != changed_reference.digest
+    assert original.digest == changed_callable.digest
+    frozen_hook = (
+        changed_callable.class_views["ticket_booking"].annotate.resolved_postprocessor
+        if surface == "record" else changed_callable.frame_classes["task_request"].resolved_postprocessor
+    )
+    assert frozen_hook.reference == reference
+    assert frozen_hook.target is replacement_target
+
+
 def test_program_compiler_rejects_non_sequence_form(declared_config):
     """编译入口必须拒绝被协调篡改为 flat 的 ResolvedConfig。"""
     config = replace(
@@ -187,7 +226,7 @@ def test_program_digest_recursively_covers_interleaving_configuration(declared_c
     """候选归属、pattern 关系和两个权重均进入 program digest。"""
     program = compile_generation_program(_interleaving_config(declared_config))
     assert program.digest == (
-        "ee1c7ba6655081ea5771727682aa2297072235474f2a64bc21a79b3c846f3aec"
+        "8bd9a073c523d8371c7d2c620104efcef9b5542d1f13268358ef0da779c908e9"
     )
     source = program.counterfactual_sets[0]
     pattern = program.interleaving.patterns[0]
@@ -277,6 +316,10 @@ def test_program_materializes_global_user_schema_and_freezes_frame_schema(declar
         "type": "object",
         "properties": {"frame": {"type": "object", "properties": {"ok": {}}}},
     }
+    model_frame_schema = {
+        "type": "object",
+        "properties": {"frame": {"type": "string"}},
+    }
     views = dict(declared_config.class_views)
     views["ticket_booking"] = replace(views["ticket_booking"], schema=None)
     config = replace(
@@ -284,19 +327,27 @@ def test_program_materializes_global_user_schema_and_freezes_frame_schema(declar
         class_views=views,
         user_schema=user_schema,
         frame_schema=frame_schema,
+        model_frame_schema=model_frame_schema,
     )
     program = compile_generation_program(config)
     original_digest = program.digest
 
     user_schema["properties"]["result"]["items"]["type"] = "integer"
     frame_schema["properties"]["frame"]["properties"]["changed"] = {}
+    model_frame_schema["properties"]["frame"]["type"] = "integer"
     assert program.class_views["ticket_booking"].schema["properties"]["result"][
         "items"
     ]["type"] == "string"
     assert "changed" not in program.frame_schema["properties"]["frame"]["properties"]
+    assert program.model_frame_schema["properties"]["frame"]["type"] == "string"
     assert generation_program_digest(program) == original_digest
     with pytest.raises(TypeError):
         program.frame_schema["blocked"] = True
+    with pytest.raises(TypeError):
+        program.model_frame_schema["blocked"] = True
+    assert generation_program_digest(replace(
+        program, model_frame_schema={"type": "object"},
+    )) != original_digest
 
     changed = replace(
         config,
@@ -398,7 +449,7 @@ def test_planner_accepts_500000_record_units_without_interleaving(instruction_co
 
     plan = compile_scenario_plan(program)
 
-    assert plan.digest == "7b93a75e407382e24c4cd8dcfabf97cd9dfd30ff9c19ecbce166e2bfbd5d56ad"
+    assert plan.digest == "20bf9ab1ba812ab4272e306f2f61f4801e2a13a69cf447b39afc62c04c3b3f8c"
     assert len(plan.delivery_slots) == 100_000
     assert sum(len(events) for block in plan.blocks for events in block.values()) == 400_000
     assert plan.interleaving_opportunities == 0

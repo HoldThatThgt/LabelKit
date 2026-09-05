@@ -406,7 +406,7 @@ def test_six_hundred_positive_branches_compile_three_hundred_selected_pairs(
     assert plan.primary_sessions == 300
     assert calls == 1200
     assert plan.digest == scenario_plan_digest(plan)
-    assert plan.digest == "59e11af8d22ecdf195409d6f2e242c11ba7a5d8f23e0315b4ae2013b41de8a89"
+    assert plan.digest == "9aa71e9b13f28ec48f57b25169d5df69bfa5110318be92206670ae6f7d6e02ce"
 
 
 def test_same_resource_half_open_adjacency_and_multi_resource_carrier(declared_program):

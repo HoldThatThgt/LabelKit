@@ -11,6 +11,22 @@ project-root hook；冻结路径、按类视图与控制台/视觉推导结果�
 
 ### 3.1.2 输入 / 输出
 
+标注后处理的配置契约由 `docs/dev/SPEC-annotation-postprocessing.md` 定义。M1 同时解析
+`annotate.postprocessor`、`class.*.annotate.postprocessor`、`frame.annotate.postprocessor` 和
+`frame.class.*.annotate.postprocessor`。引用必须是非空文件路径与属性路径；继承与覆盖后重新冻结 callable。
+加载仅检查可调用性及同步双位置参数签名，不执行 synthetic 候选或 few-shot 后处理，不读取凭据。
+
+M1 保留完整 Schema，并递归投影 `x-labelkit-postprocessor: true` 的显式 property：删除该 property、
+对应 required 成员及 default/examples 数据中的对应值，保留对象父节点与数组结构。支持显式 properties、
+同构 items 及可选或 nullable 祖先；开放直属对象、受影响的组合/引用/依赖约束、uniqueItems 数组、
+非法标记位置和与业务时间的父子重叠必须聚合报错。无标记区域保持原 Schema 语义。
+时间 Schema 先按既有规则投影，再投影代码字段；结果必须重新通过元 Schema 检查。
+
+few-shot 先按有效完整 Schema 检查代码字段，再投影成模型示例；时间字段继续使用既有去时间示例规则。
+output validator 的候选和 raw 参数必须递归深拷贝，其参数变异不影响原始示例。预算与运行 prompt 使用
+同一模型 Schema 和投影示例。`resolved_postprocessor`、`model_user_schema`、`model_frame_schema`
+只能由框架产生，工程显式配置这些内部字段属于 CONFIG_ERROR。
+
 | 方向 | 内容 |
 |---|---|
 | 输入 | config.toml 路径、project.toml 路径、CLI 覆盖项，以及不含 secret value 的进程与终端能力信息。 |
@@ -23,7 +39,7 @@ project-root hook；冻结路径、按类视图与控制台/视觉推导结果�
 
 ### 3.1.3 API
 
-~~~python
+```python
 def load(config_path: Path, project_path: Path, cli_overrides: CliOverrides) -> ResolvedConfig:
     """装载三源配置、聚合校验并冻结全部解析产物。"""
 
@@ -37,13 +53,13 @@ def parse_generation_config(
     context: GenerationParseContext,
 ) -> SequenceGenerationConfig:
     """解析并校验 sequence 生成配置。"""
-~~~
+```
 
 **模块内文件组织：**公开面仍由 `labelkit/common/config/` 导出；sequence 主配置解析落
 `generation.py`，timeline 解析、派生 session 计数校验与交织解析落 `_sequence_layout.py`，不继续膨胀
 已接近文件上限的聚合模块，也不建立第二个配置层。
 
-~~~text
+```text
 labelkit/common/config/
 ├── __init__.py
 ├── model.py
@@ -53,10 +69,11 @@ labelkit/common/config/
 ├── _collect.py
 ├── _sections.py
 ├── _constraints.py
+├── _postprocessing.py
 ├── _schemas.py
 ├── _rubrics.py
 └── _classviews.py
-~~~
+```
 
 ### 3.1.4 校验规则（启动时全量执行）
 

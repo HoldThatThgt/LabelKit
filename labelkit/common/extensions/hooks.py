@@ -38,10 +38,10 @@ _OLD_FORM_HINT = ('hook references use the "<python-file>:<attribute-path>" form
 
 @dataclass(frozen=True)
 class ResolvedHook:
-    """一个已按工程根目录解析并通过 synthetic probe 的校验器。"""
+    """一个已按工程根目录解析的函数；各调用面独立检查函数契约。"""
 
     reference: str                               # 绝对文件路径与属性路径
-    target: Callable[..., list[str]] = field(    # 已解析且不参与显示或相等的 callable
+    target: Callable[..., object] = field(       # 已解析且不参与显示或相等的 callable
         repr=False, compare=False)
 
 

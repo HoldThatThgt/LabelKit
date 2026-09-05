@@ -19,7 +19,7 @@ from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
 from labelkit.common.config._collect import _Collector, _fmt, _Tbl
-from labelkit.common.extensions.hooks import normalize_violations
+from labelkit.common.extensions.hooks import _thaw_json, normalize_violations
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import FewShotExample, FrameAnnotateConfig, OutputConfig
@@ -458,7 +458,7 @@ def _dryrun_hook(col: _Collector, examples: tuple[FewShotExample, ...],
         return True
     for i, ex in enumerate(examples, 1):
         try:
-            violations = normalize_violations(target.hook(dict(ex.output), None),
+            violations = normalize_violations(target.hook(_thaw_json(ex.output), None),
                                               target.hook_ref)
         except Exception as e:   # 回调自身有 bug——按配置错误上报, 而非退出码 4
             col.error(f"{target.file}:[output].validator: the callback raised while "

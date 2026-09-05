@@ -61,6 +61,7 @@ from labelkit.common.errors import (
     InputError,
     InternalError,
     LabelKitError,
+    PostprocessorError,
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
@@ -87,6 +88,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/config/_collect.py",
     "labelkit/common/config/_constraints.py",
     "labelkit/common/config/_generation_budget.py",  # v1.18 六家族预算证明
+    "labelkit/common/config/_postprocessing.py",
     "labelkit/common/config/_rubrics.py",
     "labelkit/common/config/_schemas.py",
     "labelkit/common/config/_sequence_layout.py",  # v1.21 timeline 与交织配置闭包
@@ -101,6 +103,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/contracts/types.py",
     "labelkit/common/errors.py",
     "labelkit/common/extensions/hooks.py",
+    "labelkit/common/extensions/postprocessing.py",
     "labelkit/common/observability/console_format.py",
     "labelkit/common/observability/obslog.py",
     "labelkit/common/inference/budget.py",           # v1.11 (CONTRACTS §7.17)
@@ -109,6 +112,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/inference/llm_client.py",
     "labelkit/common/inference/schema_engine.py",
     "labelkit/operators/annotate.py",
+    "labelkit/operators/annotation_finalization.py",
     "labelkit/operators/classify.py",
     "labelkit/operators/dedup.py",
     "labelkit/operators/emitter.py",
@@ -146,6 +150,7 @@ EXPECTED_TEST_PY = {
     "tests/common/config/test_config.py",
     "tests/common/config/test_generation.py",
     "tests/common/config/test_paths_hooks.py",     # v1.17 (SPEC-scenario-planning §5.1/§4.9)
+    "tests/common/config/test_postprocessing_config.py",
     "tests/common/config/test_temporal.py",
     "tests/common/config/test_temporal_config.py",
     "tests/common/contracts/test_execution.py",
@@ -153,6 +158,7 @@ EXPECTED_TEST_PY = {
     "tests/common/contracts/test_generation_contracts.py",
     "tests/common/contracts/test_types.py",
     "tests/common/extensions/test_hooks.py",
+    "tests/common/extensions/test_postprocessing.py",
     "tests/common/observability/test_console_format.py",
     "tests/common/observability/test_obslog.py",
     "tests/common/inference/test_budget.py",         # v1.11 (CONTRACTS §7.17)
@@ -160,6 +166,7 @@ EXPECTED_TEST_PY = {
     "tests/common/inference/test_generation_prompts.py",
     "tests/common/inference/test_llm_client.py",
     "tests/common/inference/test_schema_engine.py",
+    "tests/common/inference/test_postprocessing_schema_engine.py",
     "tests/common/test_errors.py",
     "tests/conftest.py",
     "tests/hook_samples.py",
@@ -168,6 +175,7 @@ EXPECTED_TEST_PY = {
     "tests/integration/test_budget_llm.py",
     "tests/integration/test_classify_llm.py",
     "tests/integration/test_execution_runtime_local_llm.py",
+    "tests/integration/test_postprocessing_local_llm.py",
     "tests/integration/test_frame_llm.py",         # v1.12 (SPEC-frame-annotation §3.9)
     "tests/integration/test_generate_llm.py",
     "tests/integration/test_sequence_generation_llm.py",
@@ -180,6 +188,7 @@ EXPECTED_TEST_PY = {
     "tests/integration/test_stream_llm.py",
     "tests/integration/test_verify_llm.py",
     "tests/operators/test_annotate.py",
+    "tests/operators/test_postprocessing_examples.py",
     "tests/operators/test_classify.py",
     "tests/operators/test_dedup.py",
     "tests/operators/test_emitter.py",
@@ -315,6 +324,7 @@ def test_package_layout_dependency_direction():
             elif own_module == "labelkit.operators.stream_verify":
                 allowed_operator_calls = {
                     "labelkit.operators.annotate",
+                    "labelkit.operators.annotation_finalization",
                     "labelkit.operators.classify",
                     "labelkit.operators.extract",
                     "labelkit.operators.segment",
@@ -322,6 +332,9 @@ def test_package_layout_dependency_direction():
                 }
             elif own_module == "labelkit.operators.quality":
                 allowed_operator_calls = {"labelkit.operators.quality_calls"}
+            elif own_module == "labelkit.operators.annotate":
+                # 同一 M5 内部拆分的候选定稿与模型投影。
+                allowed_operator_calls = {"labelkit.operators.annotation_finalization"}
             elif own_module == "labelkit.operators.generate":
                 # flat 与 sequence 都是 M6 的物理子模块。
                 allowed_operator_calls = {"labelkit.operators.generation.flat"}
@@ -362,6 +375,7 @@ def test_package_layout_dependency_direction():
         (ProviderRetryableError("timeout", profile="default", retries=5), EXIT_FATAL),
         (SchemaViolation(["/x: bad"], raw_last_output="{}"), EXIT_FATAL),
         (InternalError("invariant broken"), EXIT_FATAL),
+        (PostprocessorError(), EXIT_FATAL),
         (RuntimeError("unexpected"), EXIT_FATAL),
     ],
 )

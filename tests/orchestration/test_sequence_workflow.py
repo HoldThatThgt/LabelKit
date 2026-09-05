@@ -33,12 +33,14 @@ from labelkit.common.errors import (
     InternalError,
     LabelKitError,
     OutputTruncatedError,
+    PostprocessorError,
     ProviderFatalError,
     ProviderRetryableError,
 )
+from labelkit.common.inference.llm_client import ProfileUsage
 from labelkit.operators.dedup import DedupGroupRejected
 from labelkit.operators.generation import GenerationAttemptRejected
-from labelkit.operators.generation.project import canonical_json
+from labelkit.operators.generation.project import canonical_delivery_row, canonical_json
 from labelkit.orchestration.sequence_workflow import (
     _AttemptOutcome,
     _DeliveryController,
@@ -430,13 +432,25 @@ def test_candidate_capacity_sums_distinct_enabled_resource_keys_only() -> None:
 async def test_downstream_barriers_bind_only_frozen_program_views() -> None:
     """workflow 按 quality→annotate→verify 屏障传递 program-bound 类与帧视图。"""
     cfg = load(_EXAMPLE / "config.toml", _EXAMPLE / "project.toml", CliOverrides())
+    cfg = replace(cfg, model_frame_schema={"type": "object", "properties": {"value": {"type": "string"}}})
+    from labelkit.common.extensions.hooks import ResolvedHook
     from labelkit.operators.generation.planner import compile_scenario_plan
     from labelkit.operators.generation.program import compile_generation_program
 
+    hook = ResolvedHook("hooks.py:complete", lambda obj, record: {"frozen": True})
+    views = dict(cfg.class_views)
+    views["ticket_booking"] = replace(views["ticket_booking"], annotate=replace(
+        views["ticket_booking"].annotate, postprocessor=hook.reference, resolved_postprocessor=hook,
+    ))
+    frame_views = dict(cfg.frame_class_views)
+    frame_views["task_request"] = replace(frame_views["task_request"], resolved_postprocessor=hook)
+    cfg = replace(cfg, class_views=views, frame_class_views=frame_views)
     program = compile_generation_program(cfg)
     plan = compile_scenario_plan(program)
     controller, metrics, _dedup = _controller(count=1)
-    controller.generation.config = cfg
+    controller.generation.config = replace(
+        cfg, model_frame_schema={"type": "integer"}, class_views={}, frame_class_views={},
+    )
     controller.request.program = program
     controller.request.plan = plan
     order: list[str] = []
@@ -449,6 +463,11 @@ async def test_downstream_barriers_bind_only_frozen_program_views() -> None:
             assert request.run_context.cfg.class_views is program.class_views
             assert request.run_context.cfg.frame_class_views is program.frame_classes
             assert request.run_context.cfg.frame_schema is program.frame_schema
+            assert request.run_context.cfg.model_frame_schema is program.model_frame_schema
+            assert request.run_context.cfg.model_frame_schema["type"] == "object"
+            frozen_cfg = request.run_context.cfg
+            assert frozen_cfg.class_views["ticket_booking"].annotate.resolved_postprocessor.target is hook.target
+            assert frozen_cfg.frame_class_views["task_request"].resolved_postprocessor.target is hook.target
             assert order == ["quality", "annotate", "verify"][:len(order)]
             order.append(self.name)
             return SimpleNamespace(
@@ -953,6 +972,42 @@ def test_actual_prepared_primary_and_noise_domain_fixed_vectors() -> None:
     assert _prepared_digest("primary", primary) != _prepared_digest("noise", noise)
 
 
+@pytest.mark.parametrize("surface", ["record", "frame_member", "frame_primary"])
+def test_prepared_digest_changes_with_final_postprocessor_fields(surface) -> None:
+    """等长代码字段变化必须改变真实 prepared 摘要，JSON 键序变化必须保持摘要。"""
+    main = {
+        "derived_code": "code-a",
+        "_meta": {"stream": {"members": [{
+            "index": 0, "id": "event-a", "annotation": {"derived_code": "code-a"},
+        }]}},
+    }
+    primary = {"payload": {"text": "event"}, "_meta": {"annotation": {"derived_code": "code-a"}}}
+
+    def prepare(main_row, primary_row):
+        retained = sum(len(canonical_delivery_row(row)) + 1 for row in (main_row, primary_row))
+        rows = SequenceRows(main_row, (primary_row,), retained)
+        candidate = PreparedCandidate(
+            _slot(0), 1, (), (rows,), (), _reservation("final-annotation"), {"annotated": 1}, retained, "",
+        )
+        return replace(candidate, digest=_prepared_digest("primary", candidate))
+
+    original = prepare(main, primary)
+    changed_main, changed_primary = json.loads(json.dumps([main, primary]))
+    if surface == "record":
+        changed_main["derived_code"] = "code-b"
+    elif surface == "frame_member":
+        changed_main["_meta"]["stream"]["members"][0]["annotation"]["derived_code"] = "code-b"
+    else:
+        changed_primary["_meta"]["annotation"]["derived_code"] = "code-b"
+    changed = prepare(changed_main, changed_primary)
+    assert original.retained_content_bytes == changed.retained_content_bytes
+    assert original.sequences[0].retained_content_bytes == changed.sequences[0].retained_content_bytes
+    assert replace(original, sequences=changed.sequences, digest="") == replace(changed, digest="")
+    assert original.digest != changed.digest
+    reordered = prepare(dict(reversed(list(main.items()))), dict(reversed(list(primary.items()))))
+    assert original.digest == reordered.digest
+
+
 async def test_coordinator_discards_reservation_if_buffer_transfer_fails() -> None:
     """候选插入缓冲失败时 reservation 仍由 coordinator finally 路径消费。"""
     dedup = _Dedup()
@@ -1395,6 +1450,7 @@ async def test_every_noise_recoverable_boundary_retries_without_early_commit(
         ProviderFatalError("fatal", "model", 401),
         CircuitBreakerTripped("breaker"),
         InternalError("internal"),
+        PostprocessorError(),
     ),
 )
 async def test_terminal_primary_failure_never_consumes_or_retries(failure) -> None:
@@ -2066,10 +2122,14 @@ async def test_commit_failure_clears_last_slot_and_preserves_old_manifest(monkey
     assert failed["terminal_error_kind"] == "generation_commit_io"
 
 
-async def test_public_exhaustion_preserves_success_artifacts_and_writes_only_failure(
-    monkeypatch, tmp_path,
+@pytest.mark.parametrize("failure,attempts_used", [
+    (DeliveryError("sequence_delivery_exhausted", "set/000000", 2), 2),
+    (PostprocessorError(), 0),
+])
+async def test_public_terminal_failure_preserves_success_artifacts_and_writes_only_failure(
+    monkeypatch, tmp_path, failure, attempts_used,
 ) -> None:
-    """deliver_generation 耗尽后只原子替换独立 failed report。"""
+    """耗尽或后处理内部错误只原子替换独立 failed report，保留成功工件。"""
     from labelkit.operators.emitter import SequenceDeliveryEmitter
 
     controller, _metrics, _dedup = _controller(count=1, attempts=2)
@@ -2085,17 +2145,18 @@ async def test_public_exhaustion_preserves_success_artifacts_and_writes_only_fai
     for index, path in enumerate(success_paths):
         path.write_text(f"old-{index}", encoding="utf-8")
     controller.services.emitter = SequenceDeliveryEmitter(paths)
-    failure = DeliveryError("sequence_delivery_exhausted", "set/000000", 2)
-
     async def exhaust(self):
+        self.generation.llm.usage_by_profile["model"] = ProfileUsage(
+            calls=2, prompt_tokens=17, completion_tokens=9, retries=1, est_cost_usd=0.25,
+        )
         self.state.failed_slot = "set/000000"
-        self.state.attempts_used = 2
-        self.state.sequence_attempts = 2
-        self.state.rejected["quality"] = 2
+        self.state.attempts_used = attempts_used
+        self.state.sequence_attempts = attempts_used
+        self.state.rejected["quality"] = attempts_used
         raise failure
 
     monkeypatch.setattr(_DeliveryController, "deliver", exhaust)
-    with pytest.raises(DeliveryError) as caught:
+    with pytest.raises(type(failure)) as caught:
         await deliver_generation(controller.request, controller.services)
     assert caught.value is failure
     assert [path.read_text(encoding="utf-8") for path in success_paths] == [
@@ -2103,8 +2164,11 @@ async def test_public_exhaustion_preserves_success_artifacts_and_writes_only_fai
     ]
     failed = json.loads(Path(paths.failed_report).read_text(encoding="utf-8"))
     assert failed["failed_slot"] == "set/000000"
-    assert failed["attempts_used"] == 2
-    assert failed["rejected_attempts"]["quality"] == 2
+    assert failed["attempts_used"] == attempts_used
+    assert failed["rejected_attempts"]["quality"] == attempts_used
+    assert failed["llm_usage"] == {
+        "model": {"calls": 2, "prompt_tokens": 17, "completion_tokens": 9, "retries": 1, "est_cost_usd": 0.25},
+    }
     assert failed["runtime"] == {key: 0 for key in _RUNTIME_KEYS}
 
 

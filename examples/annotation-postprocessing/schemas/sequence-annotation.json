@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "properties": {
+    "intent": {"type": "string", "minLength": 1},
+    "outcome": {"enum": ["ticketed", "not_ticketed", "expired"]},
+    "request_id": {"type": "string", "minLength": 1},
+    "ticket_id": {"type": "string"},
+    "summary": {"type": "string", "minLength": 1, "maxLength": 240},
+    "summary_length": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 240,
+      "x-labelkit-postprocessor": true
+    }
+  },
+  "required": ["intent", "outcome", "request_id", "ticket_id", "summary", "summary_length"],
+  "additionalProperties": false
+}

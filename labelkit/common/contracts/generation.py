@@ -121,6 +121,7 @@ class GenerationProgram(_ImmutableCarrier):
     class_views: Mapping[str, ClassView]           # sequence class 冻结视图
     frame_classes: Mapping[str, FrameClassView]    # frame class 冻结视图
     frame_schema: Mapping[str, object] | None      # 最终帧标注 Schema
+    model_frame_schema: Mapping[str, object] | None  # 排除代码负责字段的模型帧标注 Schema
     patterns: Mapping[str, SequencePattern]        # pattern 名映射
     counterfactual_sets: tuple[CounterfactualSetSpec, ...]  # declared set 表
     instruction_only: tuple[InstructionOnlySpec, ...]  # instruction-only 表
@@ -137,6 +138,7 @@ class GenerationProgram(_ImmutableCarrier):
         object.__setattr__(self, "class_views", _freeze_config_tree(self.class_views))
         object.__setattr__(self, "frame_classes", _freeze_config_tree(self.frame_classes))
         object.__setattr__(self, "frame_schema", _freeze_config_tree(self.frame_schema))
+        object.__setattr__(self, "model_frame_schema", _freeze_config_tree(self.model_frame_schema))
         super().__post_init__()
 
 

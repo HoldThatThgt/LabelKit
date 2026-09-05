@@ -26,6 +26,7 @@ from labelkit.common.config._collect import (
     _Tbl,
 )
 from labelkit.common.config._rubrics import _RUBRIC_SELECTORS
+from labelkit.common.config._postprocessing import reject_internal_postprocessing_fields
 from labelkit.common.config.model import (
     AnnotateConfig,
     ClassifyConfig,
@@ -900,6 +901,7 @@ def _parse_annotate(col: _Collector, file: str, section: Any) -> AnnotateConfig:
         self_consistency=t.get_int("self_consistency", 0, minimum=0),
         sc_temperature=t.get_float("sc_temperature", 0.7, bound=_GE0),
         sequence_frames=t.get_int("sequence_frames", 20, minimum=1),   # [2,100] 在约束簇
+        postprocessor=t.get_str("postprocessor", None, nonempty=True),
     )
     t.finish()
     return cfg
@@ -1026,6 +1028,7 @@ def _parse_frame_annotate(col: _Collector, file: str, section: Any) -> FrameAnno
         examples=_parse_examples(col, file, t.take("examples"), section="frame.annotate"),
         schema_path=t.get_str("schema_path", None, nonempty=True),
         schema_inline=t.get_str("schema_inline", None, nonempty=True),
+        postprocessor=t.get_str("postprocessor", None, nonempty=True),
     )
     # v1.12 定向探针(同上): 帧级无自洽采样——self_consistency 显式书写是定向
     # CONFIG_ERROR。
@@ -1240,6 +1243,7 @@ def _parse_project_file(col: _Collector, file: str, data: dict,
     @return ``_Project``
     """
     top = _Tbl(col, file, "", data)
+    reject_internal_postprocessing_fields(col, file, data)
     _check_schema_version(col, top)
     parts: dict[str, Any] = dict(run=_parse_run(col, file, top),
                                  input=_parse_input(col, file, top))

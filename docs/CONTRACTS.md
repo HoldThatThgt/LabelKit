@@ -110,6 +110,7 @@ labelkit/
 │   │   ├── _rubrics.py                 # rubric resolution: inline table and packaged default:* selectors (package-private)
 │   │   ├── _classviews.py              # [class.*] / [frame.class.*] whitelist merge into class views (package-private)
 │   │   ├── _constraints.py             # cross-section constraint driver and parse products (package-private)
+│   │   ├── _postprocessing.py          # 标注后处理配置、完整示例与模型投影
 │   │   ├── _generation_budget.py       # v1.18 sequence content limits and six-family budget proof
 │   │   ├── _sequence_layout.py         # v1.21 timeline/interleaving parse and derived-count closure
 │   │   └── generation.py                # current sequence-generation public carriers and parser entry
@@ -123,7 +124,8 @@ labelkit/
 │   │   ├── obslog.py                   # M12 logs, trace, events, metrics, breaker state
 │   │   └── console_format.py           # v1.10 plain progress/summary line formats (U21) — pure functions, the single source shared by the M11 emitter and the CLI renderer; byte-frozen (re-frozen 2026-08-14 onto the English strings)
 │   └── extensions/
-│       └── hooks.py                    # user validator resolution/execution/normalization
+│       ├── hooks.py                    # user validator resolution/execution/normalization
+│       └── postprocessing.py           # 同步后处理装载、严格 JSON 调用及 Schema/实例投影
 ├── operators/
 │   ├── ingest.py                       # M2
 │   ├── segment.py                      # M14
@@ -133,6 +135,7 @@ labelkit/
 │   ├── extract.py                      # M15
 │   ├── quality.py                      # M4
 │   ├── quality_calls.py                # M4 pure call plans and outcomes
+│   ├── annotation_finalization.py      # M5 标注定稿、Schema 选择与模型实例投影
 │   ├── generate.py                     # M6
 │   ├── generation/
 │   │   ├── __init__.py
@@ -1391,6 +1394,8 @@ class AnnotateConfig:
     llm: str = "default"
     instruction: str = ""                         # required iff enabled
     examples: tuple[FewShotExample, ...] = ()
+    postprocessor: str | None = None              # 工程根相对的同步后处理函数引用
+    resolved_postprocessor: ResolvedHook | None = None  # M1 冻结的生效函数，禁止 TOML 显式配置
     self_consistency: int = 0                     # 0 = off; else odd, >= 3
     sc_temperature: float = 0.7
     sequence_frames: int = 20                     # v1.8: max keyframes per sequence-annotation
@@ -1429,7 +1434,7 @@ class OutputConfig:
     meta_mode: Literal["inline", "sidecar", "none"] = "inline"
     passthrough_fields: tuple[str, ...] = ()
     rejects: Literal["none", "refs", "full"] = "refs"
-    validator: str | None = None                  # v1.5 plan-A hook: "module:function",
+    validator: str | None = None                  # "<python-file>:<attribute-path>",
                                                   # fn(obj, record|None) -> list[str];
                                                   # engine L2.5, user schema only (spec 3.8.2)
 
@@ -1525,7 +1530,7 @@ class ClassView:                                  # one class's effective config
                                                   # ⇒ falls back to the global output.schema
                                                   # (override semantics, mirroring the per-class
                                                   # rubric heavy-asset precedent)
-    model_schema: Mapping | None = None           # v1.20 schema with business-time leaves removed
+    model_schema: Mapping | None = None           # 排除框架业务时间及代码负责字段的模型 Schema
     description: str = ""                         # v1.18 sequence registry description; required
                                                   # and non-empty for every referenced sequence
                                                   # class under generate.form="sequence"
@@ -1741,6 +1746,8 @@ class FrameAnnotateConfig:                        # v1.12: M5 frame-level per-me
                                                   # required iff enabled (rule 45)
     examples: tuple[FewShotExample, ...] = ()     # optional few-shot; M1 dry-runs them against
                                                   # the FRAME schema (rule 45)
+    postprocessor: str | None = None              # 工程根相对的同步帧标注后处理引用
+    resolved_postprocessor: ResolvedHook | None = None  # M1 冻结，禁止 TOML 显式配置
     schema_path: str | None = None                # frame-level output JSON Schema: exactly one of
     schema_inline: str | None = None              # schema_path/schema_inline iff enabled
                                                   # (mirror of the output.schema branch set,
@@ -1751,7 +1758,7 @@ class FrameAnnotateConfig:                        # v1.12: M5 frame-level per-me
 class FrameClassView:                             # one frame class's effective annotate/generate
                                                   # config — global [frame.annotate] merged with
                                                   # the [frame.class.<name>.annotate] whitelist
-                                                  # trio (keyed by frame class name); frozen by M1;
+                                                  # fields (keyed by frame class name); frozen by M1;
                                                   # frame_class_views == {} unless frame.classify
                                                   # or v1.18 sequence generation is enabled
     instruction: str                              # effective instruction (class override > global)
@@ -1759,6 +1766,7 @@ class FrameClassView:                             # one frame class's effective 
     enabled: bool                                 # false ⇒ members of this class skip frame
                                                   # annotation (cost-saving face; rendered
                                                   # status="skipped" in members[])
+    resolved_postprocessor: ResolvedHook | None = None  # 帧类覆盖或继承的冻结函数
     description: str = ""                         # v1.18 frame registry description; required and
                                                   # non-empty when sequence generation references it
     gen_instruction: str | None = None            # v1.18 frame-render instruction; required for
@@ -1850,6 +1858,8 @@ class ResolvedConfig:
                                                   # loader-owned resolved output/sample/state hooks;
                                                   # sequence uses only the state member in addition
                                                   # to generic output/sample behavior
+    model_user_schema: Mapping = field(default_factory=dict)  # M1 派生的全局标注模型 Schema
+    model_frame_schema: Mapping | None = None      # M1 派生并冻结的帧标注模型 Schema
 ```
 
 The v1.18 public export set of `labelkit.common.config` is exact: `load`, `default_rubric`,
@@ -1857,6 +1867,10 @@ The v1.18 public export set of `labelkit.common.config` is exact: `load`, `defau
 `labelkit.common.config.generation`; the two loader functions retain the existing lazy re-export so
 importing the model does not execute loader assembly. No deleted sequence-generation type or helper
 is re-exported.
+
+`annotation_finalization.py` 是 M5 的内部实现拆分。annotate 使用其中的候选定稿与 Schema/实例投影；
+stream_verify 的重标注修复可直接复用其投影 helper。这仍属于既有 verify→annotate 修复面，
+不增加新算子依赖或新流水线阶段，不从 annotate 保留旧 helper 别名。
 
 `schema_version` (a required top-level int key in BOTH files, spec §5.1/§5.2 row 1) is validated
 by the file-structure-and-version-key rule (§6.3 rule 1) and deliberately **not** mirrored into
@@ -2201,7 +2215,7 @@ checks apply only when the named switch is on unless stated):
     `frame.classify.enabled = true` **∨ `generate.form="sequence"`** (a
     CONFIG_ERROR — deliberately NOT the parked-config warning family, R8); `<name>` must be a
     declared frame class; the per-class section whitelist is TWO sections (v1.13) —
-    `annotate` with keys `instruction` / `examples` / `enabled`, and `generate` with keys
+    `annotate` with keys `instruction` / `examples` / `enabled` / `postprocessor`, and `generate` with keys
     `instruction` / `schema_path` / `schema_inline` — anything else is a CONFIG_ERROR (the
     [frame.class.*] namespace is M1-owned, R25 family). The `generate` section is legal ONLY
     under the sequence form: present while `generate.form!="sequence"` ⇒ a REVERSE
@@ -3420,9 +3434,22 @@ Every provider attempt sees only `model_schema`; after model L2 succeeds, the en
 `final_schema`, then runs existing L2.5 when `scope.user_treatment` is true. L3 still consumes
 the configured `output.max_repair_attempts`; it projects every parsed candidate through the
 total, non-throwing `repair_projector` before canonicalizing `previous_output`, while an
-unparseable candidate uses `{}`. A callable exception, non-object return, non-time mutation or
-final-Schema failure is terminal `candidate_finalizer_contract` and never enters L3. The engine
+unparseable candidate uses `{}`. An annotation postprocessor failure propagates the fixed,
+redacted `PostprocessorError` (an `InternalError`) unchanged. Other finalizer exceptions,
+non-object returns or final-Schema failures are terminal `candidate_finalizer_contract` and never enter L3. The engine
 preserves cumulative usage, attempts, first-response model, resolved-at and trace semantics.
+
+标注后处理的完整权威语义见 `docs/dev/SPEC-annotation-postprocessing.md`。M5 按
+模型 L2 → 工程后处理 → 既有业务时间注入 → 完整 L2 → 记录级 output validator 的顺序定稿。
+帧标注执行自己的后处理和完整 Schema，继续不调用 output validator、不增加记录级 resolved-at。
+verify 评审完整结果；记录修复、episode repair、frame backfill 与 L3 的每个新候选均经过同一边界。
+自洽采样按模型 Schema 选择已经完整验证的原候选；不拼接新对象，也不再次执行后处理。
+
+后处理接收候选和原始记录的深拷贝，普通记录与帧使用真实 `Record.raw`，序列记录使用 `None`。
+函数同步接受两个位置参数并返回完整标准 JSON 字典；返回后再次深拷贝。模型 Schema 通过前零调用，
+每个合格候选恰一次调用。用户 validator 在运行和启动 few-shot 校验时也接收候选及 raw 的深拷贝，
+其参数变异不得写回正式候选。程序错误不能进入 L3；sequence 内部错误原样终态传播、退出 4，
+不消耗 slot attempt，并保留已有成功交付工件。普通批处理仍只失败当前记录。
 
 The v1.18 internal builders are exact and their JSON is frozen in §10.7:
 
@@ -5316,6 +5343,7 @@ class GenerationProgram:
     class_views: Mapping[str, ClassView]
     frame_classes: Mapping[str, FrameClassView]
     frame_schema: Mapping[str, object] | None
+    model_frame_schema: Mapping[str, object] | None
     patterns: Mapping[str, SequencePattern]
     counterfactual_sets: tuple[CounterfactualSetSpec, ...]
     instruction_only: tuple[InstructionOnlySpec, ...]
@@ -5870,7 +5898,7 @@ class RuntimeCredentials:
 @dataclass(frozen=True)
 class ResolvedHook:
     reference: str
-    target: Callable[..., list[str]] = field(repr=False, compare=False)
+    target: Callable[..., object] = field(repr=False, compare=False)
 
 
 @dataclass(frozen=True)

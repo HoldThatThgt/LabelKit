@@ -33,6 +33,8 @@ from labelkit.operators.annotate import (
     annotate_record_leaf,
     build_annotate_prompt,
     build_frame_annotate_prompt,
+)
+from labelkit.operators.annotation_finalization import (
     class_annotate_schema,
     class_effective_model_schema,
     class_effective_schema,
@@ -87,9 +89,11 @@ from labelkit.common.errors import (
     ProviderRetryableError,
     SchemaViolation,
     InternalError,
+    PostprocessorError,
 )
+from labelkit.common.extensions.hooks import ResolvedHook
 from labelkit.common.inference import budget as budget_mod
-from labelkit.common.inference.schema_engine import CandidateFinalizerContractError
+from labelkit.common.inference.schema_engine import CandidateFinalizerContractError, _thaw_json
 
 USER_SCHEMA = {
     "type": "object",
@@ -163,6 +167,7 @@ def make_cfg(*, modality="text", instruction="你是意图标注员。", example
         rubric=Rubric(name="default:text", criteria=()),
         class_views={},
         user_schema=user_schema,
+        model_user_schema=user_schema,
         limit=None,
         strict=False,
         dry_run=False,
@@ -531,10 +536,12 @@ def make_classified_cfg(**kw) -> ResolvedConfig:
     views = {
         "writing": ClassView(name="writing", quality=base.quality, rubric=base.rubric,
                              annotate=class_annotate, generate=base.generate,
-                             verify=base.verify, extract=ExtractConfig()),
+                             verify=base.verify, extract=ExtractConfig(),
+                             model_schema=base.model_user_schema),
         "qa": ClassView(name="qa", quality=base.quality, rubric=base.rubric,
                         annotate=base.annotate, generate=base.generate,
-                        verify=base.verify, extract=ExtractConfig()),
+                        verify=base.verify, extract=ExtractConfig(),
+                        model_schema=base.model_user_schema),
     }
     classify = ClassifyConfig(
         enabled=True, fallback_class="qa", max_labels=None,
@@ -1286,7 +1293,8 @@ def make_frame_cfg(*, frame_examples=(), views=None, classified=False,
             examples=tuple(frame_examples),
             schema_inline=json.dumps(FRAME_SCHEMA)),
         frame_class_views=views or {},
-        frame_schema=FRAME_SCHEMA)
+        frame_schema=FRAME_SCHEMA,
+        model_frame_schema=FRAME_SCHEMA)
 
 
 def frame_views(*, skip_chitchat=True):
@@ -1738,7 +1746,9 @@ def schema_cfg(**kw) -> ResolvedConfig:
     覆盖（schema=None）——两类共同构成「按类 vs 回落全局」的对照面。"""
     base = make_classified_cfg(**kw)
     views = dict(base.class_views)
-    views["writing"] = replace(views["writing"], schema=CLASS_SCHEMA)
+    views["writing"] = replace(
+        views["writing"], schema=CLASS_SCHEMA, model_schema=CLASS_SCHEMA,
+    )
     return replace(base, class_views=views)
 
 
@@ -1972,7 +1982,7 @@ def test_public_annotation_uses_model_schema_and_mechanical_resource_start():
     assert "startTime" not in model_timing["properties"]
     assert "startTime" in full_timing["properties"]
     assert call.scope.user_treatment is True
-    assert call.candidate_finalizer.context is context
+    assert call.candidate_finalizer.temporal_context is context
     assert call.repair_projector(annotation.output) == _temporal_candidate()
     prompt_text = "\n".join(
         part.text or "" for message in call.prompt.messages for part in message.parts
@@ -1994,7 +2004,7 @@ def test_annotation_stage_threads_pipeline_temporal_context():
     _asyncio.run(AnnotateStage(cfg)._annotate_item(item, _temporal_ctx(cfg, engine)))
 
     assert item.annotation.output["timing"] == {"startTime": 3000}
-    assert engine.calls[0].candidate_finalizer.context is context
+    assert engine.calls[0].candidate_finalizer.temporal_context is context
 
 
 @_pytest.mark.parametrize("mode", ("missing", "replaced"))
@@ -2041,7 +2051,7 @@ def test_self_consistency_and_vote_reuse_one_temporal_context():
                                  "timing": {"startTime": 3000}}
     assert annotation.sc == {"n": 3, "agreement_ratio": 2 / 3}
     assert engine.finalizer_calls == 3
-    assert all(call.candidate_finalizer.context is context for call in engine.calls)
+    assert all(call.candidate_finalizer.temporal_context is context for call in engine.calls)
 
 
 def test_leaf_repair_projects_previous_time_and_uses_same_finalizer():
@@ -2058,7 +2068,7 @@ def test_leaf_repair_projects_previous_time_and_uses_same_finalizer():
 
     assert annotation.output["timing"] == {"startTime": 3000}
     (call,) = engine.calls
-    assert call.candidate_finalizer.context is context
+    assert call.candidate_finalizer.temporal_context is context
     prompt_text = "\n".join(
         part.text or "" for message in call.prompt.messages for part in message.parts
     )
@@ -2090,7 +2100,9 @@ def test_pack_prompt_schema_est_prices_class_effective_schema():
            "required": ["task"]}
     base = make_classified_cfg()
     views = dict(base.class_views)
-    views["writing"] = replace(views["writing"], schema=big)
+    views["writing"] = replace(
+        views["writing"], schema=big, model_schema=big,
+    )
     cfg = _dc_replace(base, class_views=views,
                       llm_profiles={"default": _structured_profile(30000)})
     engine = _SchemaRoutingEngine()
@@ -2105,6 +2117,395 @@ def test_pack_prompt_schema_est_prices_class_effective_schema():
                                      AnnotatePromptOptions(label="writing")))
     assert excinfo.value.phase == "precheck"
     assert len(engine.calls) == 1                # 溢出发生在派发前
+
+
+# ── deterministic annotation postprocessing ────────────────────────────────
+
+POSTPROCESSOR_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "label": {"type": "string", "enum": ["a", "b"]},
+        "text": {"type": "string"},
+        "derived": {
+            "type": "boolean",
+            "x-labelkit-postprocessor": True,
+        },
+    },
+    "required": ["label", "text", "derived"],
+    "additionalProperties": False,
+}
+
+POSTPROCESSOR_MODEL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "label": {"type": "string", "enum": ["a", "b"]},
+        "text": {"type": "string"},
+    },
+    "required": ["label", "text"],
+    "additionalProperties": False,
+}
+
+
+def _resolved_postprocessor(target, name="complete") -> ResolvedHook:
+    return ResolvedHook(f"/project/hooks.py:{name}", target)
+
+
+def _postprocessor_cfg(hook, *, self_consistency=0, class_hook=None,
+                       full_schema=POSTPROCESSOR_SCHEMA) -> ResolvedConfig:
+    base = make_cfg(user_schema=full_schema, self_consistency=self_consistency)
+    global_annotate = replace(base.annotate, resolved_postprocessor=hook)
+    views = {}
+    if class_hook is not None:
+        class_annotate = replace(global_annotate, resolved_postprocessor=class_hook)
+        views["writing"] = ClassView(
+            name="writing", quality=base.quality, rubric=base.rubric,
+            annotate=class_annotate, generate=base.generate, verify=base.verify,
+            extract=base.extract, schema=full_schema,
+            model_schema=POSTPROCESSOR_MODEL_SCHEMA,
+        )
+    return replace(
+        base, annotate=global_annotate, class_views=views,
+        model_user_schema=POSTPROCESSOR_MODEL_SCHEMA,
+    )
+
+
+class _PostprocessorEngine:
+    """Execute the operator's finalized request without an LLM transport."""
+
+    user_schema_text = SCHEMA_TEXT
+
+    def __init__(self, candidates):
+        self.candidates = list(candidates)
+        self.calls = []
+
+    async def complete_finalized(self, request):
+        self.calls.append(request)
+        candidate = self.candidates.pop(0)
+        model_errors = tuple(
+            Draft202012Validator(request.model_schema).iter_errors(candidate)
+        )
+        if model_errors:
+            raise SchemaViolation([error.message for error in model_errors], "")
+        try:
+            output = request.candidate_finalizer(candidate)
+        except PostprocessorError:
+            raise
+        except Exception:
+            raise CandidateFinalizerContractError() from None
+        if tuple(Draft202012Validator(request.final_schema).iter_errors(output)):
+            raise CandidateFinalizerContractError()
+        return dict(output), Usage(1, 1), 1, "m"
+
+    async def complete_validated(self, *args, **kwargs):
+        raise AssertionError("postprocessed annotation bypassed complete_finalized")
+
+
+def _postprocessor_ctx(cfg, engine):
+    return _test_ctx(
+        cfg=cfg, schema_engine=engine, metrics=_FrameMetrics(), batch_no=1,
+    )
+
+
+def test_global_record_postprocessor_normalizes_and_isolates_raw_and_result():
+    retained = []
+
+    def complete(obj, record):
+        retained.append((obj, record))
+        obj["text"] = obj["text"].strip()
+        obj["derived"] = record["nested"]["value"] == 1
+        record["nested"]["value"] = 9
+        return obj
+
+    hook = _resolved_postprocessor(complete)
+    cfg = _postprocessor_cfg(hook)
+    raw = {"instruction": "source", "nested": {"value": 1}}
+    record = replace(text_record(), raw=raw)
+    candidate = {"label": "a", "text": "  normalized  "}
+    engine = _PostprocessorEngine([candidate])
+
+    annotation = _asyncio.run(annotate_record(record, _postprocessor_ctx(cfg, engine)))
+
+    assert annotation.output == {"label": "a", "text": "normalized", "derived": True}
+    assert raw == {"instruction": "source", "nested": {"value": 1}}
+    assert candidate == {"label": "a", "text": "  normalized  "}
+    retained[0][0]["text"] = "late mutation"
+    retained[0][1]["nested"]["value"] = 10
+    assert annotation.output["text"] == "normalized"
+    assert raw["nested"]["value"] == 1
+    (call,) = engine.calls
+    assert _thaw_json(call.model_schema) == POSTPROCESSOR_MODEL_SCHEMA
+    assert _thaw_json(call.final_schema) == POSTPROCESSOR_SCHEMA
+    assert call.scope.user_treatment is True
+
+
+def test_record_class_postprocessor_replaces_global_callable():
+    calls = []
+
+    def forbidden(obj, record):
+        raise AssertionError("global postprocessor ran for class override")
+
+    def class_complete(obj, record):
+        calls.append(record["instruction"])
+        obj["text"] = "class:" + obj["text"].strip()
+        obj["derived"] = True
+        return obj
+
+    cfg = _postprocessor_cfg(
+        _resolved_postprocessor(forbidden, "global_complete"),
+        class_hook=_resolved_postprocessor(class_complete, "class_complete"),
+    )
+    engine = _PostprocessorEngine([{"label": "b", "text": " value "}])
+
+    annotation = _asyncio.run(annotate_record(
+        text_record("class source"), _postprocessor_ctx(cfg, engine),
+        AnnotatePromptOptions(label="writing"),
+    ))
+
+    assert annotation.output == {"label": "b", "text": "class:value", "derived": True}
+    assert calls == ["class source"]
+
+
+def test_sequence_postprocessor_gets_none_before_mechanical_time_injection():
+    full_schema = {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string"},
+            "derived": {
+                "type": "string", "x-labelkit-postprocessor": True,
+            },
+            "timing": TEMPORAL_CLASS_SCHEMA["properties"]["timing"],
+        },
+        "required": ["task", "derived", "timing"],
+        "additionalProperties": False,
+    }
+    model_schema = {
+        "type": "object",
+        "properties": {
+            "task": {"type": "string"},
+            "timing": TEMPORAL_MODEL_SCHEMA["properties"]["timing"],
+        },
+        "required": ["task", "timing"],
+        "additionalProperties": False,
+    }
+    seen = []
+
+    def complete(obj, record):
+        seen.append((record, dict(obj["timing"])))
+        obj["task"] = obj["task"].strip()
+        obj["derived"] = "code"
+        return obj
+
+    base = temporal_schema_cfg()
+    views = dict(base.class_views)
+    views["writing"] = replace(
+        views["writing"], schema=full_schema, model_schema=model_schema,
+        annotate=replace(
+            views["writing"].annotate,
+            resolved_postprocessor=_resolved_postprocessor(complete),
+        ),
+    )
+    cfg = replace(base, class_views=views)
+    sequence = replace(text_episode(3), raw={"internal": {"truth": "secret"}})
+    context = temporal_context(sequence)
+    engine = _PostprocessorEngine([{"task": " book ", "timing": {}}])
+
+    annotation = _asyncio.run(annotate_record(
+        sequence, _postprocessor_ctx(cfg, engine),
+        AnnotatePromptOptions(label="writing", temporal_context=context),
+    ))
+
+    assert seen == [(None, {})]
+    assert annotation.output == {
+        "task": "book", "derived": "code", "timing": {"startTime": 3000},
+    }
+    assert sequence.raw == {"internal": {"truth": "secret"}}
+
+
+def test_postprocessor_cannot_write_framework_time():
+    calls = []
+
+    def complete(obj, record):
+        calls.append(record)
+        obj["timing"]["startTime"] = 999
+        return obj
+
+    base = temporal_schema_cfg()
+    views = dict(base.class_views)
+    views["writing"] = replace(
+        views["writing"],
+        annotate=replace(
+            views["writing"].annotate,
+            resolved_postprocessor=_resolved_postprocessor(complete),
+        ),
+    )
+    cfg = replace(base, class_views=views)
+    sequence = text_episode(3)
+    engine = _PostprocessorEngine([_temporal_candidate()])
+
+    with _pytest.raises(InternalError, match="candidate finalizer contract failed"):
+        _asyncio.run(annotate_record(
+            sequence, _postprocessor_ctx(cfg, engine),
+            AnnotatePromptOptions(
+                label="writing", temporal_context=temporal_context(sequence),
+            ),
+        ))
+
+    assert calls == [None]
+
+
+def test_self_consistency_votes_model_fields_and_does_not_rerun_postprocessor():
+    calls = []
+
+    def complete(obj, record):
+        calls.append(obj["text"])
+        obj["derived"] = obj["text"] != "two"
+        return obj
+
+    cfg = _postprocessor_cfg(
+        _resolved_postprocessor(complete), self_consistency=3,
+    )
+    engine = _PostprocessorEngine([
+        {"label": "a", "text": "one"},
+        {"label": "b", "text": "two"},
+        {"label": "b", "text": "three"},
+    ])
+
+    annotation = _asyncio.run(annotate_record(
+        text_record(), _postprocessor_ctx(cfg, engine),
+    ))
+
+    assert annotation.output == {"label": "b", "text": "two", "derived": False}
+    assert annotation.sc == {"n": 3, "agreement_ratio": 2 / 3}
+    assert calls == ["one", "two", "three"]
+
+
+def test_verify_repair_projection_and_budget_use_the_same_model_schema():
+    full_schema = json.loads(json.dumps(POSTPROCESSOR_SCHEMA))
+    full_schema["properties"]["derived"]["description"] = "大" * 10000
+
+    def complete(obj, record):
+        obj["derived"] = True
+        return obj
+
+    cfg = _postprocessor_cfg(
+        _resolved_postprocessor(complete), full_schema=full_schema,
+    )
+    profile = _structured_profile(3000)
+    cfg = replace(cfg, llm_profiles={"default": profile})
+    engine = _PostprocessorEngine([{"label": "b", "text": "fixed"}])
+    ctx = budget_ctx(cfg, engine, image_cost=0)
+    repair = RepairContext(
+        previous_output={"label": "a", "text": "old", "derived": False},
+        critiques_text="label: fix",
+    )
+
+    annotation = _asyncio.run(annotate_record_leaf(
+        text_record(), ctx, AnnotatePromptOptions(repair=repair),
+    ))
+
+    assert annotation.output == {"label": "b", "text": "fixed", "derived": True}
+    (call,) = engine.calls
+    assert call.repair_projector(repair.previous_output) == {"label": "a", "text": "old"}
+    prompt_text = "\n".join(
+        part.text or "" for message in call.prompt.messages for part in message.parts
+    )
+    assert '"derived"' not in prompt_text
+    assert _thaw_json(call.model_schema) == POSTPROCESSOR_MODEL_SCHEMA
+    assert budget_mod.est_text(json.dumps(full_schema, ensure_ascii=False)) > (
+        budget_mod.input_budget(profile)
+    )
+
+
+def test_frame_global_and_class_postprocessors_use_real_member_raw():
+    frame_full = {
+        "type": "object",
+        "properties": {
+            "intent": {"type": "string"},
+            "source": {
+                "type": "string", "x-labelkit-postprocessor": True,
+            },
+        },
+        "required": ["intent", "source"],
+        "additionalProperties": False,
+    }
+    frame_model = {
+        "type": "object",
+        "properties": {"intent": {"type": "string"}},
+        "required": ["intent"],
+        "additionalProperties": False,
+    }
+    calls = []
+
+    def global_complete(obj, record):
+        calls.append(("global", record["text"]))
+        obj["intent"] = obj["intent"].strip()
+        obj["source"] = record["text"]
+        record["text"] = "mutated"
+        return obj
+
+    def class_complete(obj, record):
+        calls.append(("class", record["text"]))
+        obj["intent"] = "class:" + obj["intent"].strip()
+        obj["source"] = record["text"]
+        return obj
+
+    base = make_frame_cfg()
+    frame_annotate = replace(
+        base.frame_annotate,
+        resolved_postprocessor=_resolved_postprocessor(global_complete, "frame_global"),
+    )
+    views = {
+        "task_request": FrameClassView(
+            instruction=FRAME_INSTRUCTION, examples=(), enabled=True,
+            resolved_postprocessor=_resolved_postprocessor(class_complete, "frame_class"),
+        ),
+    }
+    cfg = replace(
+        base, frame_annotate=frame_annotate, frame_class_views=views,
+        frame_schema=frame_full, model_frame_schema=frame_model,
+    )
+    first = text_member(0)
+    second = text_member(1)
+    engine = _PostprocessorEngine([
+        {"intent": " global "}, {"intent": " class "},
+    ])
+    ctx = _postprocessor_ctx(cfg, engine)
+
+    global_annotation = _asyncio.run(annotate_member_leaf(first, ctx))
+    class_annotation = _asyncio.run(annotate_member_leaf(second, ctx, "task_request"))
+
+    assert global_annotation.output == {"intent": "global", "source": "步骤文本0"}
+    assert class_annotation.output == {"intent": "class:class", "source": "步骤文本1"}
+    assert calls == [("global", "步骤文本0"), ("class", "步骤文本1")]
+    assert first.raw == {"text": "步骤文本0"}
+    assert second.raw == {"text": "步骤文本1"}
+    assert all(call.scope.user_treatment is None for call in engine.calls)
+
+
+def test_postprocessor_error_isolates_one_record_and_keeps_sibling():
+    def complete(obj, record):
+        if record["instruction"] == "fail":
+            raise RuntimeError("sensitive detail")
+        obj["derived"] = True
+        return obj
+
+    cfg = _postprocessor_cfg(_resolved_postprocessor(complete))
+    engine = _PostprocessorEngine([
+        {"label": "a", "text": "first"},
+        {"label": "b", "text": "second"},
+    ])
+    ctx = _postprocessor_ctx(cfg, engine)
+    failed = PipelineItem(record=text_record("fail"))
+    passing = PipelineItem(record=replace(text_record("pass"), id="2" * 16))
+
+    batch = _asyncio.run(AnnotateStage(cfg).run([failed, passing], ctx))
+
+    assert batch[0].status == "failed"
+    assert batch[0].errors[0].kind == "internal_error"
+    assert batch[0].errors[0].message == "PostprocessorError: postprocessor_error"
+    assert batch[0].annotation is None
+    assert batch[1].status == "active"
+    assert batch[1].annotation.output == {"label": "b", "text": "second", "derived": True}
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -2338,6 +2739,94 @@ def test_frame_annotate_attempt_seam_propagates_provider_errors_without_commit(e
         assert caught.value is error
     assert item.annotation is not None
     assert engine.started == 3
+    assert metrics.counters == {}
+
+
+@_pytest.mark.parametrize("surface", ["record", "frame"])
+def test_sequence_attempt_postprocessor_error_escapes_real_annotation_boundaries(surface):
+    """真实 record/frame finalized 路径必须让程序错误逃逸，且不得提交计数。"""
+    from contextlib import contextmanager
+    from labelkit.common.contracts.generation import (
+        AttemptTransaction,
+        DownstreamAttemptRequest,
+    )
+
+    class AttemptMetrics(_FrameMetrics):
+        def __init__(self):
+            super().__init__()
+            self.captured = None
+
+        @contextmanager
+        def capture_counts(self):
+            self.captured = {}
+            try:
+                yield self.captured
+            finally:
+                self.captured = None
+
+        def count(self, key, n=1):
+            target = self.captured if self.captured is not None else self.counters
+            target[key] = target.get(key, 0) + n
+
+    class CapturingPostprocessorEngine(_PostprocessorEngine):
+        async def complete_finalized(self, request):
+            try:
+                return await super().complete_finalized(request)
+            except PostprocessorError as exc:
+                self.postprocessor_error = exc
+                raise
+
+    def fail_postprocessing(obj, record):
+        raise RuntimeError("sensitive postprocessor detail")
+
+    hook = _resolved_postprocessor(fail_postprocessing, f"{surface}_failure")
+    if surface == "record":
+        cfg = _postprocessor_cfg(hook)
+        candidate = {"label": "a", "text": "value"}
+    else:
+        frame_full = {
+            "type": "object",
+            "properties": {
+                "intent": {"type": "string"},
+                "source": {"type": "string", "x-labelkit-postprocessor": True},
+            },
+            "required": ["intent", "source"],
+            "additionalProperties": False,
+        }
+        frame_model = {
+            "type": "object",
+            "properties": {"intent": {"type": "string"}},
+            "required": ["intent"],
+            "additionalProperties": False,
+        }
+        base = make_frame_cfg()
+        cfg = replace(
+            base,
+            annotate=replace(base.annotate, enabled=False),
+            frame_annotate=replace(base.frame_annotate, resolved_postprocessor=hook),
+            frame_schema=frame_full,
+            model_frame_schema=frame_model,
+        )
+        candidate = {"intent": "book_train"}
+
+    metrics = AttemptMetrics()
+    item = PipelineItem(record=text_episode(1))
+    transaction = AttemptTransaction((item,), {}, ())
+    engine = CapturingPostprocessorEngine([candidate])
+    context = _test_ctx(
+        cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
+        rng=None, batch_no=1,
+    )
+    request = DownstreamAttemptRequest(transaction, context)
+
+    with _pytest.raises(PostprocessorError) as caught:
+        _asyncio.run(AnnotateStage(cfg).run_attempt(request))
+
+    assert caught.value is engine.postprocessor_error
+    assert str(caught.value) == "postprocessor_error"
+    assert len(engine.calls) == 1
+    assert item.annotation is None
+    assert not item.member_annotations
     assert metrics.counters == {}
 
 

@@ -213,6 +213,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `annotate.enabled` | bool | true | — |
 | `annotate.llm / instruction` | str | default / 必填† | † enabled 时必填。 |
 | `annotate.examples` | array | [] | few-shot：[{input, output}]，output 须过用户 Schema（M1 校验）。 |
+| `annotate.postprocessor` | str | 无 | 工程根相对 `<python-file>:<attribute-path>`；同步两个位置参数 `fn(obj, record)` 返回完整标准 JSON dict。按类可覆盖。模型 L2 后执行，完整 Schema 与 validator 检查其结果。 |
 | `annotate.self_consistency` | int | 0 | 0 = 关（单次标注，v1.1 行为）；启用须 ≥3 且为奇数（M1 校验）：每条记录独立采样 n 次后字段级投票（3.5.2 note 框）。成本：标注调用与 token ×n。 |
 | `annotate.sc_temperature` | float | 0.7 | self-consistency 各次采样的 temperature（采样多样性来源 [33]），覆盖 profile 默认；仅 `self_consistency ≥ 3` 时生效。 |
 | `annotate.sequence_frames` | int | 20 | v1.8 新增：序列（episode）标注单请求最大关键帧数，∈ **[2, 100]**（越界 CONFIG_ERROR，M1 校验）。成员数 n > k 时确定性均匀降采样 `idx_i = ⌊i·(n−1)/(k−1)⌋, i=0..k−1`（首末帧恒含、严格递增、纯整数零 rng；n ≤ k 取全量，3.5.2 序列行）。**`sequence_frames > 20` 且所引 profile `max_image_px > 2000` ⇒ M1 WARN**（S28：Anthropic 对 >20 图请求单图 >2000px 为 400 硬拒非缩放，现默认 max_image_px=2048 恰撞拒——指引改 ≤ 2000 或降帧；20 图阈值按请求内全部 image block 计）。非 stream 模式显式设置 ⇒ no-op warning（3.1.4）。v1.11（V9，3.9.5）：升格为**上限**——所引 profile 声明 `context_window` 后关键帧数按预算剩余动态收缩 `k_eff = min(sequence_frames, max(2, ⌊剩余 / 每图成本⌋))`（首末帧恒保留、中间均匀下采样，既有降采样语义不变）；未声明预算时即固定上限（现行为）。 |
@@ -224,6 +225,7 @@ dims = 1024                         # 可选：返回向量维度校验
 | `frame.annotate.enabled` | bool | false | 帧级逐帧标注开关（M5 帧粒度，3.5.5），产物落 `_meta.stream.members[].annotation/status`（6.3）。process/flat 路径启用要求 `segment.enabled = true`，并在序列级标注成功后执行；sequence 路径可脱离 segment 作为 attempt-local 下游，且 `annotate.enabled=false` 时直接执行 frame pass、序列标注零调用。sequence 的任一应标注帧失败都拒绝并重试整个 counterfactual set。`frame.*` 任一启用 ⇒ `output.meta_mode != "none"`（帧产物仅经 `_meta.stream.members` 承载，sidecar 合法——2.3.1 帧粒度约束）。 |
 | `frame.annotate.llm` | str | "default" | profile 引用；enabled 时计入密钥解析 / `--probe` / 存在性引用集；ui 模态 ∧ enabled 时**无条件入 vision 必需集**（镜像序列级 annotate——截图是标注主证据，3.1.4 帧粒度配置行）。 |
 | `frame.annotate.instruction` | str | 必填† | † enabled 时必填（非空，M1 校验）。全局帧标注指令；`[frame.class.<name>.annotate]` 可按帧类覆盖（见按类覆盖表 v1.12 注）。 |
+| `frame.annotate.postprocessor` | str | 无 | 同记录级函数契约，按帧类可覆盖，接收真实成员 raw 的副本；不调用记录级 output.validator。 |
 | `frame.annotate.examples` | array | [] | few-shot：[{input, output}]，output 须过**帧级 Schema**（M1 干跑校验，3.1.4；帧级无 L2.5 hook）；形态镜像 `annotate.examples`。 |
 | `frame.annotate.schema_path` | str | 二选一 | 外部 .json 的帧级输出 Schema；与 `schema_inline` 恰一（2.3.1 帧粒度约束；解析产物 `ResolvedConfig.frame_schema`，`user_schema` 同胞——draft 2020-12 元校验，镜像 `output.schema` 全套分支）。 |
 | `frame.annotate.schema_inline` | str | 二选一 | TOML 多行字符串内嵌的帧级 Schema JSON 文本（同上）。 |
@@ -253,11 +255,11 @@ description 的 `[class.<name>]` 直接声明 sequence class，classify 必须�
 | 节 | 可覆盖键 | 不可覆盖（保持全局）及理由 |
 |---|---|---|
 | `[class.*.quality]` | mode, rounds, rubric（含 `[class.*.rubric]` 内联子表，结构同 5.3）, threshold, selection, top_ratio | llm / judges / both_orders / criteria_per_call / on_unscored——LLM 绑定属部署与成本面，类差异先用 rubric 表达（1.6 v1.7 对齐决策 ④） |
-| `[class.*.annotate]` | instruction、examples、schema_path / schema_inline（至多其一） | 类声明 Schema 时整份覆盖，否则回落全局 output Schema；按类 few-shot 走有效 Schema 与 output validator。 |
+| `[class.*.annotate]` | instruction、examples、postprocessor、schema_path / schema_inline（至多其一） | 类声明 Schema 时整份覆盖，否则使用全局 output Schema；未覆盖 postprocessor 时继承全局函数。按类 few-shot 走有效 Schema 与 output validator。 |
 | `[class.*.generate]` | flat：instruction、styles、num_per_record、temperature；sequence declared：instruction、state_schema_path、initial_state_source、initial_state_catalog_path | flat 与 sequence 字段按 `generate.form` 互斥。sequence 的 llm source 禁止 catalog_path；catalog source 要求完整 ScenarioSeed JSONL。 |
 | `[class.*.verify]` | extra_criteria | llm / judges / policy / max_repair_rounds |
 | `[class.*.extract]` | instruction（v1.8 增） | llm / include_diff / on_error——LLM 绑定与失败策略属部署与成本面（与 quality 行同理） |
-| `[frame.class.*.annotate]`（v1.12） | instruction, examples, enabled（enabled = false ⇒ 该帧类成员跳过帧标注——省成本面，members[] 呈现 status="skipped"，3.11.2） | llm / schema——LLM 绑定属部署与成本面；帧级标注 Schema 按粒度唯一（8.4 M13 行）。v1.18 sequence 另声明下行 `generate` 节；两节之外的节名 ⇒ CONFIG_ERROR（3.1.4 帧粒度配置行） |
+| `[frame.class.*.annotate]`（v1.12） | instruction、examples、postprocessor、enabled（false 时该帧类成员跳过帧标注，members[] 呈现 status="skipped"） | llm / schema——LLM 绑定属部署与成本面；帧级标注 Schema 按粒度唯一。sequence 另声明下行 generate 节；两节之外的节名为 CONFIG_ERROR。 |
 | `[frame.class.*.generate]` | instruction、schema_path / schema_inline | sequence 引用到的每个 frame class 必须有非空 instruction，并恰选一个 object JSON Schema；不支持 string payload。flat/process 不读取本节。 |
 | —— | —— | run、input、stream、dedup、segment、stitch、classify、trace 均不可按类；output 中只有标注 Schema 可按 sequence class 覆盖，其余输出面保持全局唯一。 |
 

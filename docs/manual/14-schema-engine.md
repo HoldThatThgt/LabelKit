@@ -144,15 +144,15 @@ JSON Schema 说不清的约束——跨字段关系（`bounds` 必须 l<r、t<b�
 
 ```toml
 [output]
-validator = "my_validators:check_annotation"   # "module:function"，importlib 加载
+validator = "my_validators.py:check_annotation"   # 相对工程根目录加载文件
 ```
 
 ```python
-# my_validators.py —— 放在 PYTHONPATH 可达的位置
+# my_validators.py —— 放在工程根目录
 def check_annotation(obj: dict, record: dict | None) -> list[str]:
     """返回违规描述列表，空列表 = 通过。
-    obj    = 已通过 Schema 校验的标注对象（防御性副本，改了不影响流水线）；
-    record = 该记录的原始行对象（文本/生成记录），UI 记录为 None。"""
+    obj    = 已通过完整 Schema 校验的标注对象的递归深拷贝；
+    record = 原始行的递归深拷贝，缺失时为 None。"""
     problems = []
     if obj["difficulty"] == "hard" and len(obj["topic"]) < 4:
         problems.append("hard 难度的 topic 不应如此空泛，请给出具体主题")
@@ -170,7 +170,12 @@ def check_annotation(obj: dict, record: dict | None) -> list[str]:
 - **启动即体检**：M1 校验引用格式、可导入、可调用，并把每条 few-shot 示例的 output 干跑一遍——示例过不了你自己的回调，是配置错误（退出码 2），不会浪费一次调用；
 - **回调抛异常不吞**：该记录按 `internal_error` 失败，运行继续（记录级隔离）；
 - 回调以运行者同权限执行任意代码——信任边界与你亲手写的配置文件一致；建议保持纯函数（幂等、无 IO 副作用），它会被每条记录、每轮修复调用；
-- 回调模块须位于**可导入路径**——LabelKit 不会隐式把工程目录塞进 `sys.path`。最省事的做法：把 `my_validators.py` 放在工程目录并在运行前 `export PYTHONPATH=.`（或做成已安装的包）。
+- 引用形式为 `<python-file>:<attribute-path>`，文件相对工程根目录解析，也接受绝对路径。无需设置 PYTHONPATH。
+- 运行和启动示例检查都传递归深拷贝；修改嵌套字段或原始行不会改变正式结果。需要变换字段时使用 annotate.postprocessor。
+
+后处理发生在模型 Schema 通过之后、完整 Schema 和本节业务校验之前。代码字段不会发送给模型，
+后处理补齐后必须通过完整 Schema；业务违规仍可进入模型修复，但后处理函数异常和非法返回会直接失败。
+后处理完整用法见[标注章节](11-annotate.md#118-用工程代码完成确定性字段)。
 
 生成侧有一个孪生钩子 `generate.sample_validator`（签名 `fn(text) -> list[str]`），语义是**过滤器**而非 LLM 修复环：违规样本直接剔除、计入桶统计，详见第 12 章。
 
