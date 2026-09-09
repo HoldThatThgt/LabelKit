@@ -5,27 +5,28 @@
 
 ## 当前阶段
 
-功能已经实现；全部特性组合测试、完整离线回归与真实本地4B门禁通过。
-用户授权本地提交与隔离变异后，Uncle Bob 已在干净提交 `9a3330a` 完成首轮。
-首轮发现测试断言缺口，当前进行测试加固；须在新的干净提交完整复审，结果见
-[Bob报告](BOB-sequence-context-capacity.md)。功能与回归通过不能替代该门禁。
+全部规格功能已经实现，未延期任何实现项。特性组合测试、完整离线回归、覆盖率、文档、真实本地4B
+和Uncle Bob门禁全部通过。首轮变异发现的测试断言缺口已加固；干净提交 `a050661` 上完整复审293个
+有效变体全部killed，零survived、invalid和inconclusive，详见[Bob报告](BOB-sequence-context-capacity.md)。
 
 | 核对项 | 实际证据 |
 |---|---|
-| checkout / HEAD | `/Users/atishoo/Project/LabelKit`；`codex/annotation-postprocessing`；实施基线 `56a0ea1`，功能提交 `9a3330a` |
+| checkout / HEAD | `/Users/atishoo/Project/LabelKit`；`codex/annotation-postprocessing`；实施基线 `56a0ea1`，功能提交 `9a3330a`，测试加固与最终验收基线 `a050661` |
 | 修改前基线 | 3239 passed、49 deselected、699.72秒；开始工作区干净 |
 | 规格和研究 | 官方Spark、Flink、ksqlDB、LlamaIndex与端点资料已核对；spec先审查再实现 |
 | 首轮完整离线 | 3432 passed、5 failed、56 deselected、644.81秒；失败全为生成摘要固定向量 |
-| 最终完整离线 | 3467 passed、56 deselected、653.00秒；shell墙钟653.52秒，测试进程RSS高水位944439296字节；包括更新金值后的大型规划与全部新增组合 |
+| 功能阶段完整离线 | 3467 passed、56 deselected、653.00秒；shell墙钟653.52秒，测试进程RSS高水位944439296字节；包括更新金值后的大型规划与全部新增组合 |
+| 最终完整离线 | 干净提交 `a050661` 的独立未变异worktree：3543 passed、56 deselected、2个依赖弃用警告、688.72秒；shell墙钟691.32秒，命令RSS高水位1018331136字节 |
 | 固定向量核对 | 旧HEAD真实loader/compiler与当前版独立规范化diff仅删除旧sequence_frames；生成核心源文件未改；六金值更新，三个小摘要回归通过 |
-| 生产覆盖率 | 最终完整门300/300改动可执行函数实际进入；32文件全部达标，最低行89.61%、分支78.05%；没有把Protocol声明当函数进入；独立核对源码与最终覆盖哈希 |
+| 生产覆盖率 | 最终完整门300/300改动可执行函数实际进入；32文件全部达标，最低行89.88%、分支78.46%；没有把Protocol声明当函数进入；独立核对源码与最终覆盖哈希 |
 | 最后组合回归 | 159 passed，含25个跨模块组合、后处理大产物三参数和CLI实际布局；各owner另跑357 / 447项窄回归 |
 | 配置静态门 | 六本地项目全部keyless validate及dry-run通过，共12条真实CLI命令 |
 | 真实4B矩阵 | 七测试节点先6 passed、1 failed、115.97秒；static按原规格纠正并加强断言后真实复跑1 passed、14.21秒 |
 | 独立产物检查 | 八个execute_run（文本batch_size 2/3/64与其余五项目）均通过独立业务、位置守恒及边界检查 |
 | 输出与请求 | 文本classify/annotate/verify完整；UI25图/树完整，中间像素事实正确；stitch真实合并；active/reactive容量恢复与最小失败明确结束 |
 | 文档版式 | HTML与186页PDF重建；两张新增流程图及受影响页面已渲染视检，无内容遮挡或裁切；预览及文件哈希归档 |
-| 当前未完成门 | Uncle Bob首轮完成并发现测试断言缺口；测试加固后的完整复审尚未结算 |
+| 测试加固集成 | 17个相关测试文件1183 passed、5.31秒；本轮只加强测试与证据文档，生产和本地4B测试源码未变 |
+| Uncle Bob | 公共69、下游66、上游82、控制器76个有效变体全部killed；四棵审查树及独立完整回归树已恢复、移除，调用方审查期间保持干净 |
 
 ## 真实模型与资源证据
 
@@ -62,6 +63,8 @@
 | `changed-production-coverage-first-run.json` | 首轮覆盖审计原件，最终审计未覆盖历史记录 |
 | `source-constraints.json` | 改动生产文件、行、函数与参数约束，AGENTS/CLAUDE一致性 |
 | `bob-preflight-status.txt` | Bob调用方工作区非空的原始证据，不是变异执行记录 |
+| `bob-first-review/` | 干净提交 `9a3330a` 的首轮及补充轮原始报告、变异差异、日志、台账、恢复和测试加固记录；历史失败未覆盖 |
+| `bob-final-review/` | 干净提交 `a050661` 的四组完整复审；全部293个有效变体的预声明oracle、因果失败和恢复证据；`full/`为从未施加变异的完整离线、覆盖原件与独立逐函数审计 |
 | `generation-digest-canonical-diff.json` | 旧版与当前规范化材料、独立hash及仅旧字段删除的精确差异 |
 | `labelkit-capacity-example-static-validation.log` | 六项目validate/dry-run真实CLI结果 |
 | `design-preview/` | 设计PDF受影响页及联系图，用于版式检查 |
@@ -91,6 +94,13 @@
 补齐完整用户包络、完整L3修复、repair profile能力、dedup同步计划多错、克隆归属/共享帧产物和交错片段
 重排。最后static仅测试误要求末段sealed；加强边界及精确计数断言后再经真实模型复验。
 原始失败日志保留，不能以最终绿色结果覆盖失败经过。
+
+Uncle Bob最初因未提交工作区阻塞；用户授权本地提交和隔离变异后，首轮299个不同源码变体的最终独立
+裁决为251 killed、39 survived、7 invalid、2 inconclusive。加固测试后，原292个有效变体连同新增的
+规范UTF-8身份变体在 `a050661` 全部重跑并killed；7个无效候选保留排除理由，不计入有效检出数。
+最终生产源码清单SHA-256仍为 `8ac26b912f06f29c35d5be7a19ec0eb95ea46e87c085f2e69760da45d2f1794c`，
+与本地4B实跑时一致；最终覆盖JSON SHA-256为
+`8aebbbb0233f920763a040952b3d64c81a203f233bf74a1d5f15a557d3c24460`。
 
 本地4B补充本次特性验收，不替代DeepSeek/z.ai正式发布门；本轮未执行该发布门，明确记录
 `[PENDING-EVIDENCE:sequence-context-capacity-release-endpoints]`。所有本特性开发验收项必须闭合，不能据此延期。
