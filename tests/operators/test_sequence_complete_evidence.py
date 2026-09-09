@@ -10,7 +10,7 @@ from types import SimpleNamespace
 import pytest
 
 from labelkit.common.config.model import (
-    ClassifyConfig, ClassSpec, ClassView, Criterion, ExtractConfig, FrameAnnotateConfig, FrameClassView,
+    ClassifyConfig, ClassSpec, ClassView, Criterion, ExtractConfig, FewShotExample, FrameAnnotateConfig, FrameClassView,
     FrameClassifyConfig, LLMProfile, QualityConfig, Rubric, SegmentConfig,
 )
 from labelkit.common.contracts.sequence_capacity import (
@@ -18,7 +18,9 @@ from labelkit.common.contracts.sequence_capacity import (
 )
 from labelkit.common.contracts.stage import RunContext
 from labelkit.common.contracts.types import Classification, PipelineItem, SequenceBounds, SequenceCapacity, Usage
-from labelkit.common.errors import ContextOverflowError, ProviderFatalError, SessionCapacityError
+from labelkit.common.errors import (
+    ContextOverflowError, OutputTruncatedError, PostprocessorError, ProviderFatalError, SessionCapacityError,
+)
 from labelkit.common.inference.sequence_evidence import record_evidence
 from labelkit.operators.annotate import AnnotatePromptOptions, AnnotateStage, build_annotate_prompt
 from labelkit.operators.classify import ClassifyStage
@@ -323,6 +325,8 @@ def test_complete_fixed_envelope_overflow_does_not_split_or_call_model(path):
     from labelkit.common.inference.llm_client import PromptBundle
     from labelkit.operators.annotate_capacity import sequence_request as annotate_request
     from labelkit.operators.classify_capacity import frame_request, sequence_request as classify_request
+    from labelkit.operators.classify import build_classify_prompt, build_frame_classify_prompt
+    from labelkit.operators.quality import _Comparison, _build_pairwise_prompt, _build_pointwise_prompt
     from labelkit.operators.quality_capacity import _preview_requests
     from labelkit.orchestration.session_capacity import SessionPartition
     from test_annotate import SEQ_TRANSITIONS
@@ -331,26 +335,39 @@ def test_complete_fixed_envelope_overflow_does_not_split_or_call_model(path):
     classes = (ClassSpec("main", "目标", examples=("固定类别示例",)), ClassSpec("other", "其他"))
     item = item_with_members([text_member(0), text_member(1)])
     item.transitions = SEQ_TRANSITIONS
+    empty = replace(item.record, members=())
     if path == "classify":
         cfg = replace(cfg, classify=ClassifyConfig(enabled=True, max_labels=1, fallback_class="other", classes=classes))
         stage = ClassifyStage(cfg)
         request = classify_request(item.record, cfg)
+        expected_fixed = build_classify_prompt(empty, cfg, False)
+        assert "固定类别示例" in content(expected_fixed)
+        assert [message.role for message in expected_fixed.messages] == ["system", "user", "user"]
     elif path == "frame_classify":
         cfg = replace(cfg, frame_classify=FrameClassifyConfig(enabled=True, fallback_class="other", classes=classes))
         stage = ClassifyStage(cfg)
         request = frame_request(item.record.members, cfg)
+        expected_fixed = build_frame_classify_prompt((), cfg, ())
+        assert [message.role for message in expected_fixed.messages] == ["system", "user"]
     elif path == "annotate":
         stage = AnnotateStage(cfg)
         request = annotate_request(item.record, context(cfg, Engine(), stage.name), SCHEMA_TEXT,
                                    AnnotatePromptOptions(transitions=item.transitions))
+        expected_fixed = build_annotate_prompt(empty, cfg, SCHEMA_TEXT, AnnotatePromptOptions(transitions=()))
     else:
         cfg = replace(cfg, quality=replace(cfg.quality, mode="pairwise" if path == "quality_pair" else "pointwise"))
         stage = QualityStage(cfg)
         request = next(_preview_requests(stage, item, cfg))
+        expected_fixed = (_build_pairwise_prompt(_Comparison(empty, empty, (), ()), cfg.rubric.criteria, False, None)
+                          if path == "quality_pair" else
+                          _build_pointwise_prompt(empty, cfg.rubric.criteria[0], None, ()))
+    assert request.fixed_prompt == expected_fixed
+    assert expected_fixed.messages[-1].role == "user"
+    assert any(part.text and part.text.strip() for part in expected_fixed.messages[-1].parts)
     profile = cfg.llm_profiles["default"]
     schema = request.schema if profile.supports_structured_output else None
-    fixed_cost = budget.est_prompt(request.fixed_prompt, profile, schema, image_cost=0)
-    system_cost = budget.est_prompt(PromptBundle(messages=request.fixed_prompt.messages[:-1]), profile, schema,
+    fixed_cost = budget.est_prompt(expected_fixed, profile, schema, image_cost=0)
+    system_cost = budget.est_prompt(PromptBundle(messages=expected_fixed.messages[:-1]), profile, schema,
                                     image_cost=0)
     window = next(value for value in range(321, 10000)
                   if budget.input_budget(replace(profile, context_window=value)) == fixed_cost - 1)
@@ -380,12 +397,19 @@ def test_annotation_fixed_baseline_preserves_steps_label_examples_and_repair():
     from test_annotate import RepairContext, SEQ_TRANSITIONS
 
     cfg = configuration()
+    examples = tuple(FewShotExample(f"完整固定示例{index}",
+        {"intent": "read", "topic": "sequence", "difficulty": "easy"}) for index in range(2))
+    cfg = replace(cfg, annotate=replace(cfg.annotate, examples=examples))
     item = item_with_members([text_member(0), text_member(1)])
     repair = RepairContext({"intent": "read"}, "修复必须保留完整固定后缀")
     request = sequence_request(item.record, context(cfg, Engine(), "annotate"), SCHEMA_TEXT,
                                AnnotatePromptOptions(transitions=SEQ_TRANSITIONS, repair=repair))
     fixed = content(request.fixed_prompt)
     assert "[动作序列]" in fixed and "[序列成员]" in fixed and "修复必须保留完整固定后缀" in fixed
+    assert [message.role for message in request.fixed_prompt.messages] == ["system", "user", "user", "user"]
+    for index, example in enumerate(examples, start=1):
+        assert example.input in request.fixed_prompt.messages[index].parts[0].text
+        assert json.dumps(example.output, ensure_ascii=False) in request.fixed_prompt.messages[index].parts[0].text
     assert len(request.fixed_prompt.messages) == len(request.prompt.messages)
     assert all(member.text not in fixed for member in item.record.members)
     assert images(request.fixed_prompt) == []
@@ -769,3 +793,272 @@ def test_all_process_sequence_calls_request_complete_evidence_schema_repairs(sta
     ctx = context(cfg, Engine(), stage_type.name)
     asyncio.run(stage_type(cfg).run([item], ctx))
     assert ctx.schema_engine.calls and all(call[3].complete_evidence for call in ctx.schema_engine.calls)
+
+
+def exact_request_config(cfg, prompt, schema, *, below=0, profile_name="default"):
+    """从完整实际请求独立计量边界，不读取容量预览产物。"""
+    from labelkit.common.inference import budget
+
+    profile = cfg.llm_profiles[profile_name]
+    response_schema = schema if profile.supports_structured_output else None
+    cost = budget.est_prompt(prompt, profile, response_schema, image_cost=37)
+    wanted = cost - below
+    window = next(value for value in range(321, 100000)
+                  if budget.input_budget(replace(profile, context_window=value)) == wanted)
+    configured = replace(profile, context_window=window)
+    return replace(cfg, llm_profiles={**cfg.llm_profiles, profile_name: configured}), cost
+
+
+@pytest.mark.parametrize("modality", ["text", "ui"])
+@pytest.mark.parametrize("members_count", [1, 3, 7])
+def test_frame_classify_preview_schema_and_prompt_equal_actual_complete_episode(modality, members_count):
+    from labelkit.common.inference.schema_engine import frame_classify_schema
+    from labelkit.operators.classify_capacity import frame_request
+
+    classes = (ClassSpec("main", "目标"), ClassSpec("other", "其他"))
+    cfg = replace(configuration(modality), frame_classify=FrameClassifyConfig(
+        enabled=True, fallback_class="other", classes=classes))
+    member = ui_member(0) if modality == "ui" else replace(text_member(0), text="完整重复成员" * 300)
+    item = item_with_members([member] * members_count, start=11)
+    expected_schema = frame_classify_schema(["main", "other"], members_count)
+    request = frame_request(item.record.members, cfg)
+    engine = Engine()
+    asyncio.run(ClassifyStage(cfg).run([item], context(cfg, engine, "classify")))
+    assert len(engine.calls) == 1
+    _profile, actual_prompt, actual_schema, _scope = engine.calls[0]
+    assert request.schema == actual_schema == expected_schema
+    assert actual_schema["properties"]["labels"]["minItems"] == members_count
+    assert actual_schema["properties"]["labels"]["maxItems"] == members_count
+    assert request.prompt == actual_prompt
+    assert content(actual_prompt).count(record_evidence(member)) == members_count
+    assert images(actual_prompt) == ([member.image] * members_count if modality == "ui" else [])
+    assert set(item.member_classifications) == set(range(11, 11 + members_count))
+
+
+@pytest.mark.parametrize("path", ["extract", "verify_extract", "frame_annotate"])
+@pytest.mark.parametrize("structured", [False, True])
+@pytest.mark.parametrize("below", [0, 1], ids=["exact_fit", "one_token_over"])
+def test_actual_minimum_request_budget_preserves_unit_positions_and_zero_dispatch(path, structured, below):
+    from labelkit.common.inference.schema_engine import action_schema
+    from labelkit.operators.annotate import build_frame_annotate_prompt
+    from labelkit.operators.extract import build_extract_prompt
+
+    cfg = configuration("ui")
+    profile = replace(cfg.llm_profiles["default"], supports_structured_output=structured)
+    cfg = replace(cfg, llm_profiles={"default": profile}, extract=ExtractConfig(enabled=True))
+    label = "target_frame" if path == "frame_annotate" else None
+    if label is not None:
+        cfg = replace(cfg, annotate=replace(cfg.annotate, enabled=False),
+                      frame_annotate=FrameAnnotateConfig(enabled=True),
+                      frame_class_views={label: FrameClassView("完整帧指令", (FewShotExample("示例", {
+                          "intent": "read", "topic": "sequence", "difficulty": "easy"}),), True)})
+    member = ui_member(0)
+    item = item_with_members([member] * (1 if label is not None else 2), start=17)
+    if label is not None:
+        item.member_classifications = {17: Classification(label, (label,), "llm", {})}
+        schema = dict(cfg.model_frame_schema)
+        prompt = build_frame_annotate_prompt(member, cfg, json.dumps(schema, ensure_ascii=False), label)
+        stage = AnnotateStage(cfg)
+    else:
+        schema = action_schema()
+        prompt = build_extract_prompt(member, member, cfg, None)
+        stage = ExtractStage(cfg)
+    cfg, _cost = exact_request_config(cfg, prompt, schema, below=below)
+    stage = type(stage)(cfg)
+    engine = Engine()
+    owner = "verify" if path == "verify_extract" else stage.name
+    ctx = context(cfg, engine, owner)
+    operation = (extract_transition_for_item(item, 0, ctx) if path == "verify_extract" else stage.run([item], ctx))
+    if below:
+        with pytest.raises(SessionCapacityError) as caught:
+            asyncio.run(operation)
+        assert len(caught.value.failures) == 1
+        failure = caught.value.failures[0]
+        assert failure.stage == owner and failure.unit == ("frame" if label else "transition")
+        assert failure.targets == (replace(capacity_target(item), label=label),)
+        assert failure.error.phase == "precheck" and failure.error.profile == "default"
+        assert engine.calls == [] and item.status == "active" and item.errors == []
+        assert item.transitions is None and item.member_annotations is None
+        assert ctx.metrics.counters == {} and ctx.metrics.events == []
+    else:
+        asyncio.run(operation)
+        assert len(engine.calls) == 1 and engine.calls[0][1] == prompt
+        assert engine.calls[0][2] == schema and item.status == "active" and not item.errors
+        assert images(engine.calls[0][1]) == [member.image] * len(item.record.members)
+        if label is not None:
+            assert item.member_annotations[17] is not None
+
+
+@pytest.mark.parametrize("mode", ["pointwise", "pairwise"])
+def test_quality_actual_and_preview_requests_keep_every_complete_step(mode):
+    from labelkit.operators.quality_capacity import _preview_requests
+    from test_annotate import SEQ_TRANSITIONS
+
+    cfg = replace(configuration("ui"), quality=QualityConfig(mode=mode, rounds=1))
+    items = [item_with_members([ui_member(index) for index in range(start, start + 4)],
+                              start=start, record_id=f"sequence-{start}") for start in (0, 4)]
+    for item in items:
+        item.transitions = tuple(replace(SEQ_TRANSITIONS[0], index=index,
+            action={**SEQ_TRANSITIONS[0].action, "description": f"{item.record.id}-step-{index}" + "决定性动作" * 300})
+            for index in range(3))
+    engine = Engine()
+    ctx = context(cfg, engine, "quality")
+    stage = QualityStage(cfg)
+    preview = tuple(_preview_requests(stage, items[0], cfg))
+    assert stage.preview_capacity(items[0], ctx) is None and len(preview) == 1
+    for transition in items[0].transitions:
+        assert content(preview[0].prompt).count(transition.action["description"]) == (2 if mode == "pairwise" else 1)
+    asyncio.run(stage.run(items, ctx))
+    assert len(engine.calls) == (1 if mode == "pairwise" else 2)
+    for call_index, call in enumerate(engine.calls):
+        involved = items if mode == "pairwise" else [items[call_index]]
+        for item in involved:
+            for transition in item.transitions:
+                assert transition.action["description"] in content(call[1])
+            for member in item.record.members:
+                assert record_evidence(member) in content(call[1])
+        assert len(images(call[1])) == sum(len(item.record.members) for item in involved)
+    assert all(item.status == "active" and item.scores for item in items)
+
+
+@pytest.mark.parametrize("mode", ["pointwise", "pairwise"])
+def test_quality_preview_checks_later_reachable_class_with_actual_pool_configuration(mode):
+    cfg = configuration(context_window=2000)
+    huge = "后续类别完整准则" * 1000
+    rubric = Rubric("large", (Criterion("complete", huge, huge, pointwise_levels=(huge,) * 6),))
+    views = {
+        "small": ClassView("small", cfg.quality, cfg.rubric, cfg.annotate, cfg.generate, cfg.verify, cfg.extract),
+        "large": ClassView("large", QualityConfig(mode=mode, rounds=1), rubric,
+                           cfg.annotate, cfg.generate, cfg.verify, cfg.extract),
+    }
+    cfg = replace(cfg, classify=replace(cfg.classify, enabled=True), class_views=views)
+    items = [item_with_members([text_member(index)], start=index, record_id=f"sequence-{index}") for index in (0, 1)]
+    engine = Engine()
+    ctx = context(cfg, engine, "quality")
+    stage = QualityStage(cfg)
+    failure = stage.preview_capacity(items[0], ctx)
+    assert failure is not None and failure.unit == "fixed"
+    assert failure.targets[0].label == "large" and failure.error.profile == "default"
+    assert engine.calls == [] and ctx.metrics.counters == {}
+    items[0].classification = Classification("small", ("small",), "llm", {})
+    assert stage.preview_capacity(items[0], ctx) is None
+    for item in items:
+        item.classification = Classification("large", ("large",), "llm", {})
+    with pytest.raises(SessionCapacityError) as caught:
+        asyncio.run(stage.run(items, ctx))
+    assert all(error.unit == "fixed" for error in caught.value.failures)
+    assert all(target.label == "large" for error in caught.value.failures for target in error.targets)
+    assert engine.calls == [] and all(not item.scores and not item.errors for item in items)
+
+
+@pytest.mark.parametrize("below", [0, 1], ids=["exact_fit", "one_token_over"])
+def test_quality_pair_preview_budgets_both_complete_sides_against_actual_request(below):
+    from labelkit.common.inference import budget
+    from labelkit.operators.quality import _Comparison, _build_pairwise_prompt
+
+    cfg = replace(configuration(), quality=QualityConfig(mode="pairwise", rounds=1))
+    members = [replace(text_member(index), text=f"成员{index}" + "完整比较依据" * 300) for index in (0, 1)]
+    items = [item_with_members(members, start=start, record_id=f"sequence-{start}") for start in (0, 2)]
+    initial = Engine()
+    asyncio.run(QualityStage(cfg).run(items, context(cfg, initial, "quality")))
+    assert len(initial.calls) == 1
+    _profile, full_prompt, schema, _scope = initial.calls[0]
+    assert all(content(full_prompt).count(member.text) == 2 for member in members)
+    cfg, full_cost = exact_request_config(cfg, full_prompt, schema, below=below)
+    profile = cfg.llm_profiles["default"]
+    one_side = _build_pairwise_prompt(_Comparison(items[0].record, replace(items[0].record, members=())),
+                                      cfg.rubric.criteria, False, None)
+    one_cost = budget.est_prompt(one_side, profile, schema if profile.supports_structured_output else None, image_cost=37)
+    assert one_cost < budget.input_budget(profile) == full_cost - below
+    items = [item_with_members(members, start=start, record_id=f"sequence-{start}") for start in (0, 2)]
+    engine = Engine()
+    ctx = context(cfg, engine, "quality")
+    stage = QualityStage(cfg)
+    preview = stage.preview_capacity(items[0], ctx)
+    if below:
+        assert preview is not None and preview.unit == "sequence" and preview.error.phase == "precheck"
+        with pytest.raises(SessionCapacityError) as caught:
+            asyncio.run(stage.run(items, ctx))
+        assert len(caught.value.failures) == 1 and caught.value.failures[0].unit == "pairwise"
+        assert {target.record_id for target in caught.value.failures[0].targets} == {item.record.id for item in items}
+        assert engine.calls == [] and all(not item.scores and not item.errors for item in items)
+    else:
+        assert preview is None
+        asyncio.run(stage.run(items, ctx))
+        assert len(engine.calls) == 1 and engine.calls[0][1] == full_prompt
+        assert all(item.status == "active" and item.scores for item in items)
+
+
+def test_quality_preview_checks_every_judge_and_preserves_actual_failing_profile():
+    cfg = configuration()
+    narrow = replace(cfg.llm_profiles["default"], name="narrow", context_window=1000)
+    cfg = replace(cfg, quality=QualityConfig(mode="pairwise", rounds=1, judges=("default", "narrow")),
+                  llm_profiles={**cfg.llm_profiles, "narrow": narrow})
+    items = [item_with_members([replace(text_member(index), text="完整比较内容" * 500)],
+                              start=index, record_id=f"sequence-{index}") for index in (0, 1)]
+    engine = Engine()
+    ctx = context(cfg, engine, "quality")
+    stage = QualityStage(cfg)
+    failure = stage.preview_capacity(items[0], ctx)
+    assert failure is not None and failure.error.profile == "narrow" and failure.unit == "sequence"
+    assert engine.calls == [] and ctx.metrics.counters == {}
+    with pytest.raises(SessionCapacityError) as caught:
+        asyncio.run(stage.run(items, ctx))
+    assert len(caught.value.failures) == 1
+    failure = caught.value.failures[0]
+    assert failure.error.profile == "narrow" and failure.error.phase == "precheck" and failure.unit == "pairwise"
+    assert len(failure.targets) == 2 and [call[0] for call in engine.calls] == ["default"]
+    assert all(not item.scores and not item.errors for item in items)
+
+
+def test_process_annotation_ignores_dynamic_image_working_point_and_keeps_full_repair_evidence():
+    from test_annotate import RepairContext
+
+    cfg = configuration("ui")
+    members = tuple(ui_member(index) for index in range(3))
+    opts = AnnotatePromptOptions(image_px=128, repair=RepairContext({"intent": "read"}, "完整修复意见"))
+    prompt = build_annotate_prompt(make_episode(members), cfg, SCHEMA_TEXT, opts)
+    assert opts.image_px == 128 and prompt.image_px is None
+    assert images(prompt) == [member.image for member in members]
+    assert all(record_evidence(member) in content(prompt) for member in members)
+    assert "完整修复意见" in content(prompt)
+
+
+@pytest.mark.parametrize("path", ["classify", "quality", "annotate", "extract_fallback", "extract_fail"])
+@pytest.mark.parametrize("error_name", ["output_truncated", "program", "postprocessor", "provider_fatal"])
+def test_process_noncapacity_errors_keep_their_original_stage_route(path, error_name):
+    cfg = configuration("ui")
+    cfg = replace(cfg, classify=ClassifyConfig(enabled=True, max_labels=1, fallback_class="other",
+                  classes=(ClassSpec("main", "目标"), ClassSpec("other", "其他"))),
+                  extract=ExtractConfig(enabled=True, on_error="fail" if path == "extract_fail" else "fallback"))
+    error = {
+        "output_truncated": lambda: OutputTruncatedError("output limit", profile="default", finish="length"),
+        "program": lambda: RuntimeError("program failed"),
+        "postprocessor": PostprocessorError,
+        "provider_fatal": lambda: ProviderFatalError("provider fatal", "default", 401),
+    }[error_name]()
+    stage_type = {"classify": ClassifyStage, "quality": QualityStage, "annotate": AnnotateStage,
+                  "extract_fallback": ExtractStage, "extract_fail": ExtractStage}[path]
+    item = item_with_members([ui_member(0), ui_member(1)], start=23)
+    before = item.capacity
+    engine = Engine(error)
+    ctx = context(cfg, engine, stage_type.name)
+    if error_name == "provider_fatal":
+        with pytest.raises(ProviderFatalError) as caught:
+            asyncio.run(stage_type(cfg).run([item], ctx))
+        assert caught.value is error and item.status == "active" and not item.errors
+    else:
+        asyncio.run(stage_type(cfg).run([item], ctx))
+        if path == "extract_fallback" and error_name == "output_truncated":
+            assert item.status == "active" and item.errors == []
+            assert len(item.transitions) == 1 and item.transitions[0].detail["kind"] == "extraction_invalid"
+            assert ctx.metrics.counters["extract.fallback_steps"] == 1
+        else:
+            assert item.status == "failed"
+            assert [entry.kind for entry in item.errors] == ["output_truncated" if error_name == "output_truncated"
+                                                           else "internal_error"]
+            assert item.annotation is None and item.transitions is None
+    assert len(engine.calls) == 1 and item.capacity is before and item.member_positions == (23, 24)
+    assert not any(key.startswith("capacity.") for key in ctx.metrics.counters)
+    assert ctx.metrics.counters.get("budget.overflow_records", 0) == 0
+    assert not any(event == "sequence.capacity" for event, _payload in ctx.metrics.events)

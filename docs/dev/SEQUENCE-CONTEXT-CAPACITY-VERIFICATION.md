@@ -6,13 +6,13 @@
 ## 当前阶段
 
 功能已经实现；全部特性组合测试、完整离线回归与真实本地4B门禁通过。
-最终完成仍要求 Uncle Bob 变异审查。其[前置检查已阻塞](BOB-sequence-context-capacity.md)：本次改动尚未
-提交，技能要求调用方工作区干净，仓库又禁止未经明确请求 commit。需要本地提交与隔离变异授权后继续；
-不能把下表的功能与回归通过视为全部交付门禁完成。
+用户授权本地提交与隔离变异后，Uncle Bob 已在干净提交 `9a3330a` 完成首轮。
+首轮发现测试断言缺口，当前进行测试加固；须在新的干净提交完整复审，结果见
+[Bob报告](BOB-sequence-context-capacity.md)。功能与回归通过不能替代该门禁。
 
 | 核对项 | 实际证据 |
 |---|---|
-| checkout / HEAD | `/Users/atishoo/Project/LabelKit`；`codex/annotation-postprocessing`；实施基线 `56a0ea1`，尚未提交 |
+| checkout / HEAD | `/Users/atishoo/Project/LabelKit`；`codex/annotation-postprocessing`；实施基线 `56a0ea1`，功能提交 `9a3330a` |
 | 修改前基线 | 3239 passed、49 deselected、699.72秒；开始工作区干净 |
 | 规格和研究 | 官方Spark、Flink、ksqlDB、LlamaIndex与端点资料已核对；spec先审查再实现 |
 | 首轮完整离线 | 3432 passed、5 failed、56 deselected、644.81秒；失败全为生成摘要固定向量 |
@@ -25,7 +25,7 @@
 | 独立产物检查 | 八个execute_run（文本batch_size 2/3/64与其余五项目）均通过独立业务、位置守恒及边界检查 |
 | 输出与请求 | 文本classify/annotate/verify完整；UI25图/树完整，中间像素事实正确；stitch真实合并；active/reactive容量恢复与最小失败明确结束 |
 | 文档版式 | HTML与186页PDF重建；两张新增流程图及受影响页面已渲染视检，无内容遮挡或裁切；预览及文件哈希归档 |
-| 当前未完成门 | Uncle Bob隔离变异审查；前置检查BLOCKED，未创建审查worktree或执行变异，不声明通过 |
+| 当前未完成门 | Uncle Bob首轮完成并发现测试断言缺口；测试加固后的完整复审尚未结算 |
 
 ## 真实模型与资源证据
 
@@ -57,7 +57,7 @@
 | `labelkit-capacity-local-final.log` | 七节点原始完整日志，保留static断言失败 |
 | `labelkit-capacity-local-static-final.log` | 修正并加强static断言后的真实复跑日志 |
 | `labelkit-capacity-offline-final.log`、`labelkit-capacity-coverage.json` | 首完整离线失败与覆盖原件，不作为Bob绿色基线 |
-| `labelkit-capacity-offline-verified.log`、`labelkit-capacity-coverage-final.json` | 最终完整离线绿色结果及对应覆盖原件；Bob仍须在干净提交的隔离worktree建立自己的基线 |
+| `labelkit-capacity-offline-verified.log`、`labelkit-capacity-coverage-final.json` | 功能阶段完整离线绿色结果及对应覆盖原件；独立Bob基线与复审另行结算 |
 | `changed-production-coverage.json` | 基线/源哈希、每个改动函数真实函数体行、每文件门槛及缺失行/分支 |
 | `changed-production-coverage-first-run.json` | 首轮覆盖审计原件，最终审计未覆盖历史记录 |
 | `source-constraints.json` | 改动生产文件、行、函数与参数约束，AGENTS/CLAUDE一致性 |

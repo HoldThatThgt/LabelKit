@@ -304,11 +304,12 @@ async def test_real_workflow_freezes_calibration_only_after_session_recomputatio
     llm = SimpleNamespace(calibrator=calibrator)
     metrics = FakeMetrics()
     engine = SchemaEngine(MODEL_SCHEMA, llm=None, cfg=cfg.output)
-    previews, reads, random_values, completed, groups = [], [], [], [], []
+    previews, reads, random_values, completed, groups, task_ids = [], [], [], [], [], []
 
     class CompletionExecutor:
         async def run_group(self, request):
             groups.append(tuple(task.declaration_key[-1] for task in request.tasks))
+            task_ids.extend(task.task_id for task in request.tasks)
             order = list(range(len(request.tasks)))
             if reverse_completion:
                 order.reverse()
@@ -382,6 +383,7 @@ async def test_real_workflow_freezes_calibration_only_after_session_recomputatio
     assert summary.counts["absorbed"] == 6
     assert all(len(group) <= batch_size for group in groups)
     assert len(groups) == (24 if batch_size == 1 else 9)
+    assert len(task_ids) == len(set(task_ids)) == 24
     first_wave = [index for sid, attempt, index in completed if sid == "first" and attempt == 1]
     assert first_wave == ([2, 1, 0, 5, 4, 3, 7, 6] if reverse_completion and batch_size == 3 else list(range(8)))
 

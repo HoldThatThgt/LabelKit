@@ -1521,6 +1521,65 @@ def test_capacity_repass_failure_seals_earliest_candidate_even_when_target_is_la
     assert len(engine.calls) == 3
 
 
+@pytest.mark.parametrize("entry", ["pass_one", "rescue", "repass"])
+def test_failed_capacity_preview_preserves_formal_records_ownership_and_products(entry):
+    from copy import deepcopy
+    from labelkit.common.contracts.types import Annotation, Classification
+    from test_segment import MemberCapacity
+
+    frames = [envelope(ui_frame(f"f{i}", i)) for i in range(4)]
+    episodes = [episode_of(frames[:2])]
+    if entry == "rescue":
+        short_run(frames[2:])
+    else:
+        episodes.append(episode_of(frames[2:]))
+    for episode in episodes:
+        episode.annotation = Annotation({"task": episode.record.id}, "stored", 1, Usage(7, 3))
+        episode.classification = Classification("task", ("task",), "llm", {"reason": "stored"})
+        episode.transitions = (Transition(0, {"description": "stored"}, "stored", 1, {}),)
+        episode.member_annotations = {position: episode.annotation for position in episode.member_positions}
+        episode.member_classifications = {position: episode.classification for position in episode.member_positions}
+    records = [episode.record for episode in episodes]
+    positions = [episode.member_positions for episode in episodes]
+    product_names = ("annotation", "classification", "transitions", "member_annotations",
+                     "member_classifications", "scores", "errors", "dedup", "verification")
+    products = [{name: getattr(episode, name) for name in product_names} for episode in episodes]
+    product_values = deepcopy(products)
+    frame_states = [dict(vars(frame)) for frame in frames]
+    outcomes = [obj(), obj(), obj("resume", 1)] if entry == "repass" else [obj(), obj("resume", 1)]
+    cfg = make_cfg(bias="llm", repass=entry == "repass")
+    engine = QueueEngine(outcomes)
+    ctx = make_ctx(cfg, engine)
+    ctx.capacity_checker = MemberCapacity(2)
+    batch = [*frames, *episodes]
+
+    assert asyncio.run(StitchStage(cfg).run(batch, ctx)) is batch
+
+    assert len(batch) == len(frames) + len(episodes)
+    for episode, original_record, original_positions, refs, values in zip(
+            episodes, records, positions, products, product_values, strict=True):
+        assert episode.record is original_record
+        assert episode.record.members is original_record.members
+        assert tuple(id(member) for member in episode.record.members) == tuple(
+            id(frames[position].record) for position in original_positions)
+        assert episode.member_positions == original_positions
+        assert episode.status == "active"
+        assert episode.thread_id == original_record.id
+        assert [fragment["member_positions"] for fragment in episode.stitch_fragments] == [list(original_positions)]
+        assert [fragment["source_episode"] for fragment in episode.stitch_fragments] == [original_record.id]
+        for name in product_names:
+            assert getattr(episode, name) is refs[name]
+            assert getattr(episode, name) == values[name]
+    assert [vars(frame) for frame in frames] == frame_states
+    assert episodes[0].capacity.sealed
+    assert all(not episode.capacity.sealed for episode in episodes[1:])
+    expected_counts = {"stitch.judgments": 2, "capacity.sealed": 1}
+    if entry == "repass":
+        expected_counts["stitch.repass_judgments"] = 1
+    assert ctx.metrics.counters == expected_counts
+    assert len(engine.calls) == len(outcomes)
+
+
 def test_capacity_repass_interleaved_members_seal_without_false_linear_cut():
     episodes, _, ctx, engine = capacity_run([(0, 8), (4, 6)], [obj(), obj(), obj("resume", 1)], 2)
     older, later = episodes

@@ -54,6 +54,17 @@ def test_child_identity_cannot_self_reference_a_stitched_single_member_founder()
     assert child != capacity_sequence_id("another_root", (0,), ("same",))
 
 
+def test_sequence_identity_matches_frozen_canonical_domain_vectors():
+    # 固定向量由规范中的规范化 JSON 独立求 SHA-256，不复用生产身份辅助函数。
+    # ["process_sequence","session",[0],["same"]]
+    assert process_sequence_id("session", (0,), ("same",)) == "37f801eeb038c37c"
+    # ["process_sequence_capacity","frozen-root",[3,7],["same","same"]]
+    assert capacity_sequence_id("frozen-root", (3, 7), ("same", "same")) == "199c3c87fe05cc95"
+    # 非 ASCII 身份按原始 UTF-8 编码，不能先变成 JSON 转义序列。
+    assert process_sequence_id("会话", (0,), ("重复",)) == "603c8d69bf956353"
+    assert capacity_sequence_id("根", (3, 7), ("重复", "重复")) == "1537a23486cfd8a8"
+
+
 @pytest.mark.parametrize("positions,ids", [((), ()), ((0,), ()), ((1, 0), ("a", "b")),
                                              ((0, 0), ("a", "b")), ((-1,), ("a",)), ((True,), ("a",))])
 def test_invalid_occurrence_partition_cannot_produce_sequence_identity(positions, ids):

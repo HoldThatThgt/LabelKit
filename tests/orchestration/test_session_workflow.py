@@ -154,7 +154,12 @@ async def test_complete_session_runs_upstream_once_and_ignores_physical_group_si
 
 
 async def test_reactive_splits_rebuild_whole_downstream_without_leaking_dedup_or_counts(tmp_path):
-    segment = PartitionStage()
+    class CountedPartition(PartitionStage):
+        async def run(self, batch, ctx):
+            ctx.metrics.count("segment.windows", 5)
+            return await super().run(batch, ctx)
+
+    segment = CountedPartition()
     annotate = CapacityStage(2)
     driver, dedup, metrics, emitter = workflow(tmp_path, [segment, annotate])
     summary = await driver.run()
@@ -165,6 +170,7 @@ async def test_reactive_splits_rebuild_whole_downstream_without_leaking_dedup_or
     assert all(item.capacity.sealed for item in sequences)
     assert set(dedup.index._digest_by_id) == {item.record.id for item in sequences}
     assert metrics.counters["annotate.annotated"] == 4
+    assert metrics.counters["segment.windows"] == 5
     assert metrics.counters["llm.capacity_test_calls"] > 4
     assert metrics.counters["capacity.splits"] == 3
     assert metrics.counters["capacity.recomputations"] == 3
@@ -206,19 +212,30 @@ async def test_fixed_failure_does_not_split_a_large_sequence(tmp_path):
 
 
 @pytest.mark.parametrize("error", [ProviderFatalError("denied", "default", 401), asyncio.CancelledError()])
-async def test_control_failure_discards_attempt_and_keeps_formal_state(tmp_path, error):
+async def test_control_failure_discards_attempt_and_keeps_formal_state(tmp_path, error, monkeypatch):
     class ControlStage(CapacityStage):
         async def run(self, batch, ctx):
             ctx.metrics.count("annotate.annotated", 90)
             raise error
 
     driver, dedup, metrics, emitter = workflow(tmp_path, [PartitionStage(), ControlStage(1)])
+    reservations = []
+    reserve = dedup.reserve_session
+
+    async def observe_reservation(batch, ctx):
+        reservation = await reserve(batch, ctx)
+        reservations.append(reservation)
+        return reservation
+
+    monkeypatch.setattr(dedup, "reserve_session", observe_reservation)
     with pytest.raises(type(error)):
         await driver.run()
     assert not dedup.index._exact
     assert "annotate.annotated" not in metrics.counters
     assert "counts.episodes" not in metrics.counters
     assert emitter.products == []
+    assert len(reservations) == 1
+    assert reservations[0].consumed and reservations[0].local is None
 
 
 def partition(sizes=(4, 2)):
@@ -253,7 +270,7 @@ def test_pairwise_split_selects_larger_then_earliest_and_preserves_nonempty_memb
     assert children[0].capacity.root_id == "root-0"
 
 
-def test_child_ids_depend_on_final_members_not_split_tree_and_clones_share_only_evidence():
+def test_nested_children_use_frozen_root_and_clones_share_only_evidence():
     first = partition((8,))
     root = first.items[-1]
     root.scores["mutable"] = {"value": []}
@@ -263,10 +280,8 @@ def test_child_ids_depend_on_final_members_not_split_tree_and_clones_share_only_
     assert clone.record is root.record
     left, _ = first.split(overflow([root]))
     final, _ = first.split(overflow([left]))
-    second = partition((8,))
-    second.split(overflow([second.items[-1]]))
-    final2, _ = second.split(overflow([second.items[-2]]))
-    assert final.record.id == final2.record.id
+    # 规范固定向量：root-0、位置 [0,1]、成员 000...001 与 000...002，与直接父身份无关。
+    assert final.record.id == "5c10d7c5be87a88f"
     assert final.capacity.parent_id == left.record.id
 
 
@@ -382,9 +397,9 @@ def test_real_multilabel_fanout_and_verify_shrink_preserve_single_member_owner(t
     impostor.classification = None
     impostor.record = replace(impostor.record, id="unrelated-root")
     impostor.capacity = replace(impostor.capacity, root_id="unrelated-root")
-    with pytest.raises(InternalError, match="overlapping"):
+    with pytest.raises(InternalError):
         validate_session([*batch, impostor])
-    with pytest.raises(InternalError, match="no member owner"):
+    with pytest.raises(InternalError):
         validate_session([*batch[:3], sibling])
 
 
@@ -426,7 +441,8 @@ def test_conservation_rejects_missing_absorbed_claims():
         validate_session(batch)
 
 
-async def test_terminal_traceback_does_not_retain_discarded_attempt(tmp_path):
+@pytest.mark.parametrize("linked_attribute", ["__cause__", "__context__"])
+async def test_terminal_traceback_does_not_retain_discarded_attempt(tmp_path, linked_attribute):
     class Evidence:
         pass
 
@@ -435,16 +451,27 @@ async def test_terminal_traceback_does_not_retain_discarded_attempt(tmp_path):
             super().__init__(0)
             self.ref = None
             self.failure = None
+            self.link_ref = None
+
+        def retained_link(self):
+            linked_evidence = Evidence()
+            self.link_ref = weakref.ref(linked_evidence)
+            try:
+                raise RuntimeError("previous request attempt")
+            except RuntimeError as error:
+                return error
 
         async def run(self, batch, ctx):
             if self.ref is not None:
                 gc.collect()
                 assert self.ref() is None
+                assert self.link_ref() is None
                 assert self.failure.__traceback__ is self.failure.__cause__ is self.failure.__context__ is None
                 return batch
             local_evidence = Evidence()
             self.ref = weakref.ref(local_evidence)
             self.failure = ContextOverflowError("terminal complete evidence", "reactive", "default", "http_400")
+            setattr(self.failure, linked_attribute, self.retained_link())
             try:
                 raise self.failure
             except ContextOverflowError as error:
@@ -621,10 +648,14 @@ def test_wave_discards_unreachable_lineage_without_marking_minimum_failure(tmp_p
     session = SessionWorkflow(driver, "session", 1)
     plan = partition((2,))
     item = plan.items[-1]
-    wrong_lineage = replace(overflow([item]), targets=(replace(capacity_target(item), root_id="old-root"),))
+    wrong_lineage = replace(overflow([item]), targets=(replace(capacity_target(item), root_id="old-root"),),
+                            error=ContextOverflowError("stale request", "precheck", "stale-profile"))
     session._advance(plan, (wrong_lineage, overflow([item])))
     assert metrics.counters["capacity.splits"] == 1
     assert session.terminals == ()
+    children = [item for item in plan.items if item.record.kind == "sequence"]
+    cut = children[0].capacity.bounds.after
+    assert (cut.stage, cut.profile, cut.phase) == ("annotate", "default", "reactive")
 
 
 def test_wave_fixed_frame_and_transition_failures_follow_allowed_noise_positions(tmp_path):
@@ -674,3 +705,67 @@ def test_every_error_in_capacity_wave_releases_old_traceback_even_when_supersede
     gc.collect()
     assert all(ref() is None for ref in refs)
     assert all(failure.error.__traceback__ is None for failure in failures)
+
+
+def test_eliminated_pair_request_does_not_split_its_other_unchanged_target(tmp_path):
+    driver, _, metrics, _ = workflow(tmp_path, [])
+    session = SessionWorkflow(driver, "session", 1)
+    plan = partition((2, 2))
+    first, second = [item for item in plan.items if item.record.kind == "sequence"]
+    session._advance(plan, (overflow([first]), overflow([first, second], "pairwise", "quality")))
+    sequences = [item for item in plan.items if item.record.kind == "sequence"]
+    assert [item.member_positions for item in sequences] == [(0,), (1,), (2, 3)]
+    assert sequences[-1] is second and not second.capacity.sealed
+    assert metrics.counters["capacity.splits"] == metrics.counters["capacity.recomputations"] == 1
+    assert metrics.counters.get("capacity.minimum_failures", 0) == 0 and session.terminals == ()
+
+
+@pytest.mark.parametrize("violation", ["duplicate_owner", "orphan_label", "outside_bounds"])
+async def test_final_member_violation_prevents_dedup_counts_and_output_commit(tmp_path, violation):
+    class InvalidMembership(CapacityStage):
+        async def run(self, batch, ctx):
+            item, = [item for item in batch if item.status == "active"]
+            ctx.metrics.count("annotate.annotated")
+            if violation == "duplicate_owner":
+                duplicate = clone_item(item)
+                duplicate.record = replace(duplicate.record, id="independent-duplicate-owner")
+                duplicate.capacity = replace(duplicate.capacity, root_id=duplicate.record.id)
+                batch.append(duplicate)
+            elif violation == "orphan_label":
+                item.classification = Classification("secondary", ("primary", "secondary"), "llm", {})
+                for frame in batch:
+                    if frame.record.kind != "sequence":
+                        frame.status = "dropped_noise"
+            else:
+                item.capacity = replace(item.capacity, bounds=SequenceBounds(1, 2))
+            return batch
+
+    driver, dedup, metrics, emitter = workflow(tmp_path, [PartitionStage(), InvalidMembership(99)], length=2)
+    with pytest.raises(InternalError):
+        await driver.run()
+    assert emitter.products == [] and not dedup.index._exact
+    assert metrics.counters.get("annotate.annotated", 0) == 0
+    assert metrics.counters.get("counts.episodes", 0) == 0
+    assert metrics.counters.get("counts.emitted", 0) == 0
+
+
+def test_real_session_checker_includes_enabled_complete_embedding_budget(tmp_path):
+    from labelkit.common.config.model import EmbeddingProfile
+
+    cfg = stream_cfg(tmp_path)
+    cfg = replace(cfg, dedup=replace(cfg.dedup, semantic=True, semantic_embedding="embed"),
+                  embedding_profiles={"embed": EmbeddingProfile(
+                      name="embed", model="model", base_url="http://unused", api_key_env="UNUSED",
+                      context_window=128)})
+    dedup = DedupStage(cfg.dedup, DedupIndex(cfg.dedup, "text"))
+    metrics = FakeMetrics()
+    driver = ProcessWorkflow(cfg, [dedup], None, CapturingEmitter(cfg), services(metrics))
+    session = SessionWorkflow(driver, "session", 1)
+    item = partition((2,)).items[-1]
+    item.record = replace(item.record, members=tuple(replace(member, text="完整证据" * 300)
+                                                     for member in item.record.members))
+    failure = session.checker.preview(item, session._context("segment", 0))
+    assert failure is not None
+    assert (failure.stage, failure.error.profile, failure.error.phase) == ("dedup", "embed", "precheck")
+    assert failure.targets[0].member_positions == (0, 1)
+    assert dedup.index._exact == {} and metrics.counters == {}

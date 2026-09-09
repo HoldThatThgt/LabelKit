@@ -3348,6 +3348,159 @@ def test_claim_and_rebuild_recheck_allowed_bounds_before_committing():
     assert episode.member_positions == (0, 1) and frame.status == "dropped_noise"
 
 
+@pytest.mark.parametrize("side", ["lower", "upper"])
+def test_reclaim_commit_rejects_claim_when_capacity_bounds_narrow_after_planning(side, caplog):
+    frames = [_env(_frame(f"f{i}", pair_index=i), status="dropped_noise") for i in range(4)]
+    for frame in frames:
+        frame.noise_attribution = ("segment", "noise")
+    frames[1].status = frames[2].status = "absorbed"
+    episode = _episode([frames[1].record, frames[2].record], transitions=(_transition(0),))
+    episode.member_positions = (1, 2)
+    episode.capacity = SequenceCapacity(SequenceBounds(0, 4), root_id="root")
+    state = _EpisodeReview(episode, 0)
+    driver = StreamVerifyDriver(VerifyStage(_stream_cfg()))
+    position = 0 if side == "lower" else 3
+    claim = driver._make_claim(state, frames[position], position)
+    assert claim.position == position and claim.envelope is frames[position]
+    assert claim.window_positions == ((0, 1) if side == "lower" else (2, 3))
+    cut = CapacityCut(0, 1, "annotate", "default", "precheck") if side == "lower" else (
+        CapacityCut(2, 3, "annotate", "default", "precheck"))
+    bounds = SequenceBounds(1, 4, before=cut) if side == "lower" else SequenceBounds(0, 3, after=cut)
+    episode.capacity = replace(episode.capacity, bounds=bounds, sealed=True)
+    original_frame_states = [dict(vars(frame)) for frame in frames]
+    original_episode = dict(vars(episode))
+    original_members, original_positions = list(state.working_members), list(state.working_positions)
+
+    with pytest.raises(InternalError, match="claim commit violates capacity bounds"):
+        driver._apply_reclaim(state, claim)
+
+    assert [vars(frame) for frame in frames] == original_frame_states
+    assert vars(episode) == original_episode
+    assert episode.record is original_episode["record"]
+    assert episode.annotation is original_episode["annotation"]
+    assert state.working_members == original_members and state.working_positions == original_positions
+    assert not state.surgical
+    assert driver._repair_snapshots == {} and driver._repair_counts == {}
+    assert "stream verify claim commit violates capacity bounds" in caplog.text
+
+
+@pytest.mark.parametrize("surgery, expected_positions, expected_pair", [
+    ("shrink", (2, 4), ("f2", "f4", 0, None)),
+    ("reclaim_head", (1, 2, 3, 4), ("f1", "f2", 0, None)),
+    ("reclaim_tail", (2, 3, 4, 5), ("f4", "f5", 2, None)),
+])
+def test_successful_member_surgery_preserves_capacity_bounds_cuts_and_emitted_metadata(
+        monkeypatch, tmp_path, surgery, expected_positions, expected_pair):
+    from labelkit.operators.verify_capacity import allows_position
+    from tests.operators.test_emitter import USER_SCHEMA as EMIT_SCHEMA
+    from tests.operators.test_emitter import make_cfg as emitter_cfg, read_jsonl, run_emitter
+
+    cfg = replace(_stream_cfg(), user_schema=EMIT_SCHEMA)
+    claims = _stub_judge_window(monkeypatch)
+    extracts = _stub_extract(monkeypatch)
+    output = {"intent": "request", "topic": "capacity", "difficulty": "easy"}
+    annotations = _stub_annotate(monkeypatch, output)
+    frames = [_env(_frame(f"f{i}", pair_index=i), status="dropped_noise") for i in range(7)]
+    for frame in frames:
+        frame.noise_attribution = ("segment", "noise")
+    for position in (2, 3, 4):
+        frames[position].status = "absorbed"
+    episode = _episode([frames[i].record for i in (2, 3, 4)], annotation=_annotation(output),
+                       transitions=(_transition(0), _transition(1)))
+    before = CapacityCut(0, 1, "annotate", "default", "precheck")
+    after = CapacityCut(5, 6, "quality", "judge", "reactive")
+    original_capacity = SequenceCapacity(SequenceBounds(1, 6, before, after), True, "root", "parent")
+    episode.capacity = original_capacity
+    original_record = episode.record
+    defect = (_defect("off_task_members", members=[3]) if surgery == "shrink" else
+              _defect("missing_head" if surgery == "reclaim_head" else "missing_tail"))
+    engine = SeqJudgeEngine({episode.record.id: [_seq_obj("fail", defects=[defect]), _seq_obj("pass")]})
+
+    metrics = _run_verify(cfg, [*frames, episode], engine)
+
+    assert episode.status == "active" and episode.stream_repaired
+    assert episode.record is not original_record and episode.record.id == original_record.id
+    assert episode.member_positions == expected_positions
+    assert episode.record.members == tuple(frames[i].record for i in expected_positions)
+    assert episode.capacity == original_capacity
+    assert episode.capacity.bounds.lower == 1 and episode.capacity.bounds.upper == 6
+    assert episode.capacity.bounds.before == before and episode.capacity.bounds.after == after
+    assert not allows_position(episode, 0) and not allows_position(episode, 6)
+    assert extracts == [expected_pair]
+    assert len(annotations) == 1 and annotations[0].record is episode.record
+    assert annotations[0].transitions == episode.transitions
+    assert (episode.verification.verdict, episode.verification.rounds) == ("pass", 2)
+    assert metrics.counters["verify.membership_repairs"] == 1
+    assert claims == ([] if surgery == "shrink" else [["f1", "f2"]] if surgery == "reclaim_head" else [["f4", "f5"]])
+    assert [frame.status for frame in frames] == [
+        "absorbed" if i in expected_positions else "dropped_noise" for i in range(7)]
+    assert frames[0].noise_attribution == frames[6].noise_attribution == ("segment", "noise")
+    delivery_cfg = emitter_cfg(tmp_path, modality="ui", segment=cfg.segment)
+    _, result = run_emitter(delivery_cfg, [episode])
+    assert result.emitted == 1 and result.rejected == 0
+    stream = read_jsonl(Path(delivery_cfg.paths.output))[0]["_meta"]["stream"]
+    assert stream["member_positions"] == list(expected_positions) and stream["repaired"] is True
+    assert stream["capacity"] == {
+        "sealed": True, "allowed_positions": [1, 6],
+        "before": {"left_position": 0, "right_position": 1, "stage": "annotate",
+                   "profile": "default", "phase": "precheck"},
+        "after": {"left_position": 5, "right_position": 6, "stage": "quality",
+                  "profile": "judge", "phase": "reactive"},
+        "root_id": "root", "parent_id": "parent",
+    }
+
+
+def test_stitch_final_task_name_survives_real_verify_reclaim_and_seam_rebuild(monkeypatch):
+    from labelkit.operators.extract import _seam_placeholder
+    from tests.operators.test_stitch import (
+        QueueEngine, StitchStage, envelope, episode_of, make_cfg as stitch_cfg,
+        make_ctx as stitch_ctx, obj, ui_frame,
+    )
+
+    frames = [envelope(ui_frame(f"f{i}", i)) for i in range(9)]
+    for frame in frames:
+        frame.status = "dropped_noise"
+        frame.noise_attribution = ("segment", "noise")
+    first = episode_of([frames[0], frames[4]])
+    second = episode_of([frames[2], frames[6]])
+    continuation = episode_of([frames[7], frames[8]])
+    batch = [*frames, first, second, continuation]
+    cfg = stitch_cfg(bias="llm", repass=False, rescue_short=False)
+    stitch_engine = QueueEngine([obj(task="task-A"), obj(task="task-B"), obj("resume", 1, task="task-B-final")])
+
+    asyncio.run(StitchStage(cfg).run(batch, stitch_ctx(cfg, stitch_engine)))
+
+    assert continuation.status == "stitched" and second.member_positions == (2, 6, 7, 8)
+    assert first.stitch_task_name == "task-A" and second.stitch_task_name == "task-B-final"
+    assert first.seam_interrupted_by == (("task-B-final",),)
+    for episode in (first, second):
+        seams = dict(zip(episode.seam_indexes, episode.seam_interrupted_by, strict=True))
+        episode.transitions = tuple(_seam_placeholder(i, seams[i]) if i in seams else _transition(i)
+                                    for i in range(len(episode.record.members) - 1))
+        episode.annotation = _annotation()
+    claims = _stub_judge_window(monkeypatch)
+    extracts = _stub_extract(monkeypatch)
+    annotations = _stub_annotate(monkeypatch)
+    verify_cfg = replace(_stream_cfg(), stitch=StitchConfig(enabled=True))
+    judge = SeqJudgeEngine({
+        first.record.id: [_seq_obj("fail", defects=[_defect("missing_members", members=[1])]), _seq_obj("pass")],
+        second.record.id: [_seq_obj("pass")],
+    })
+
+    _run_verify(verify_cfg, batch, judge)
+
+    assert first.member_positions == (0, 1, 4) and second.member_positions == (2, 6, 7, 8)
+    assert first.seam_indexes == (1,) and first.seam_interrupted_by == (("task-B-final",),)
+    assert first.transitions[1].detail["interrupted_by"] == ["task-B-final"]
+    assert second.seam_indexes == (0,) and second.seam_interrupted_by == (("task-A",),)
+    assert first.stitch_task_name == "task-A" and second.stitch_task_name == "task-B-final"
+    assert claims == [["f0", "f1", "f4"]] and extracts == [("f0", "f1", 0, None)]
+    assert [call.record.id for call in annotations] == [first.record.id]
+    assert annotations[0].transitions[1].detail["interrupted_by"] == ["task-B-final"]
+    assert first.verification.verdict == second.verification.verdict == "pass"
+    assert first.verification.rounds == 2 and second.verification.rounds == 1
+
+
 def test_fragment_projection_assigns_reclaim_to_previous_original_fragment():
     from labelkit.operators.verify_capacity import project_fragments
     records = [_frame("same", pair_index=index) for index in range(6)]

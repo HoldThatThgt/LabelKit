@@ -1,6 +1,6 @@
 # LabelKit 跨批次序列缝合与上下文容量规格
 
-> 状态：功能、完整离线、覆盖率、文档和本地 4B 门禁已验证；Uncle Bob 前置检查因未提交工作区阻塞
+> 状态：功能、完整离线、覆盖率、文档和本地 4B 门禁已验证；Uncle Bob 首轮完成，测试加固后等待完整复审
 > 日期：2026-09-09
 > 实施基线：`56a0ea1`
 > 范围：`run.mode = "process"` 且 `segment.enabled = true` 的文本与 UI 序列处理
@@ -369,7 +369,7 @@ MetricsSink 用独立 ContextVar 标记当前会话和尝试，流模式所有�
 | 本地真实 4B 容量 | 主动预算分区和真实端点 token 超限各有一次可验证恢复；最小失败明确结束 | local_llm 真实调用证据 | 已验证 |
 | 本地真实 4B UI | 全图/树进入实际请求且有依赖中间帧的明确答案；不以文本测试代替视觉门禁 | local_llm UI 集成 | 已验证 |
 | 特性与生产覆盖率 | 规范特性全覆盖；300/300改动函数进入，32文件最低行89.61%、分支78.05% | 最终完整离线及独立覆盖报告 | 已验证 |
-| Uncle Bob 变异审查 | 独立绿色基线与有效语义 mutant 零 survived | [Bob报告](BOB-sequence-context-capacity.md)；调用方工作区未提交，前置检查停止 | BLOCKED：需本地提交授权 |
+| Uncle Bob 变异审查 | 独立绿色基线与有效语义 mutant 零 survived | [Bob报告](BOB-sequence-context-capacity.md)；干净提交首轮完成，发现断言缺口 | 测试加固后完整复审 |
 | 文档与产物 | validate、dry-run、run 同配置可用；手册、报告、HTML/PDF 与实际行为一致 | 示例检查器及文档检查 | 已验证 |
 
 本地门禁使用真实 Qwen3.5-4B-Q6_K 与真实 llama-server。正常文本、UI、主动分区、真实超限恢复分别记录

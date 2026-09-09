@@ -40,6 +40,7 @@ from labelkit.common.inference.budget import (
     pack_windows,
 )
 from labelkit.common.inference.llm_client import Message, Part, PromptBundle
+from labelkit.common.inference.sequence_evidence import CapacityRequest, preview_failure, request_overflow, request_unit
 
 
 def _llm(**over) -> LLMProfile:
@@ -165,6 +166,43 @@ def test_est_prompt_sums_text_images_overhead_and_schema():
     assert est_prompt(bundle, _llm(), schema, image_cost=100) == expected
     # schema=None (not sent) drops exactly the schema term
     assert est_prompt(bundle, _llm(), None, image_cost=100) == expected - schema_est
+
+
+@pytest.mark.parametrize("structured", [False, True])
+def test_complete_request_preview_counts_only_schema_actually_sent_to_provider(structured):
+    profile = _llm(context_window=512, max_output_tokens=64, supports_structured_output=structured)
+    ctx = SimpleNamespace(cfg=SimpleNamespace(llm_profiles={profile.name: profile}))
+    prompt = PromptBundle(messages=(Message(role="user", parts=(Part(kind="text", text="abc"),)),))
+    schema = {"type": "object", "description": "x" * 600}
+    request = CapacityRequest(profile.name, prompt, schema)
+    # 512 - 64 - 256 = 192；正文加消息仅 5，600 个 ASCII Schema 字符本身已超过 192。
+    assert request_overflow(CapacityRequest(profile.name, prompt), ctx) is None
+    overflow = request_overflow(request, ctx)
+    if structured:
+        assert isinstance(overflow, ContextOverflowError)
+        assert (overflow.phase, overflow.profile) == ("precheck", "default")
+    else:
+        assert overflow is None
+
+
+@pytest.mark.parametrize("unit,expected", [
+    ("sequence", "fixed"), ("pairwise", "fixed"), ("frame", "frame"), ("transition", "transition"),
+])
+def test_fixed_overhead_preserves_frame_and_transition_failure_ownership(unit, expected):
+    from labelkit.common.contracts.sequence_capacity import CapacityTarget, SessionAttemptScope
+
+    profile = _llm(context_window=512, max_output_tokens=64)
+    ctx = SimpleNamespace(cfg=SimpleNamespace(llm_profiles={profile.name: profile}),
+                          session_attempt=SessionAttemptScope("session", 1, 1, "annotate"))
+    fixed = PromptBundle(messages=(Message(role="system", parts=(Part(kind="text", text="x" * 600),)),))
+    prompt = PromptBundle(messages=(*fixed.messages, Message(role="user", parts=(Part(kind="text", text="abc"),))))
+    request = CapacityRequest(profile.name, prompt, fixed_prompt=fixed)
+    target = CapacityTarget("root", "child", "alpha", (3, 7))
+    assert request_unit(request, ctx, unit) == expected
+    failure = preview_failure(ctx, (target,), unit, request)
+    assert failure is not None
+    assert (failure.stage, failure.targets, failure.unit) == ("annotate", (target,), expected)
+    assert (failure.error.phase, failure.error.profile) == ("precheck", "default")
 
 
 # ── fit_text: both modes (V9/V15) ───────────────────────────────────────────

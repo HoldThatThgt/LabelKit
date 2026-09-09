@@ -297,6 +297,24 @@ def test_global_scope_dedups_across_batches():
     assert b2[0].dedup.kept_id == "a"
 
 
+@pytest.mark.parametrize("admission_order", [("OnorJg", "kxmHEV"), ("kxmHEV", "OnorJg")])
+def test_real_near_text_equal_scores_keep_the_earliest_admitted_record(admission_order):
+    cfg = DedupConfig(ngram=1, minhash_threshold=0.3)
+    index = DedupIndex(cfg, "text")
+    admitted = [text_record(text, f"admitted-{position}") for position, text in enumerate(admission_order)]
+    first = index.probe_and_add(admitted[0])
+    second = index.probe_and_add(admitted[1])
+    assert first.kind == second.kind == "unique"
+    query = text_record("OnorJgkxmHEV", "query")
+    features = index.prepare(query)
+    assert set(index._lsh.query(features.minhash)) == {record.id for record in admitted}
+    assert [features.minhash.jaccard(index.prepare(record).minhash) for record in admitted] == [0.5, 0.5]
+    info = index.probe_and_add(query)
+    assert info.kind == "near_text" and info.kept_id == admitted[0].id
+    assert info.cluster_key == first.cluster_key and index.last_similarity == 0.5
+    assert tuple(index._digest_by_id) == tuple(record.id for record in admitted)
+
+
 def test_batch_scope_resets_index_between_batches():
     cfg = DedupConfig(scope="batch")
     stage = DedupStage(cfg, DedupIndex(cfg, "text"))
