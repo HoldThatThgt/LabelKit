@@ -118,7 +118,7 @@ def _independent_domain_digest(domain: str, value) -> str:
 
 
 def test_actual_program_and_plan_digest_fixed_vectors(declared_program):
-    """教学工程实际 program/plan 必须命中独立重建的 v1.20 fixed vectors。"""
+    """教学工程摘要命中删除旧裁帧字段后的独立规范化金值。"""
     declared_program = _stable_digest_program(declared_program)
     plan = compile_scenario_plan(declared_program)
     program_value = _independent_semantic_value(declared_program)
@@ -144,12 +144,12 @@ def test_actual_program_and_plan_digest_fixed_vectors(declared_program):
         "primary_sessions": plan.primary_sessions,
     }
     assert declared_program.digest == (
-        "61c40c866a8d2b70625d0c0dba52a00f428711c3b13b97aea01e9cc78686baa4"
+        "bab1caed765026d097ba3388e34b47d3c575583362881329161f0f3dd6239ce0"
     )
     assert declared_program.digest == _independent_domain_digest(
         "generation_program", program_value,
     )
-    assert plan.digest == "1c20498e62fe05e2ed0130457e43aec900d940002e0e6a1b95591f35abad80cf"
+    assert plan.digest == "abd914c07cea289652b22c9d1f09c915cbce8789216273c8fcf527a23c7fc371"
     assert plan.digest == _independent_domain_digest("scenario_plan", plan_value)
 
 
@@ -286,7 +286,7 @@ def test_plan_digest_covers_interleaving_opportunities_pair_and_blocks(declared_
     base = _interleaving_digest_plan(compile_scenario_plan(program))
     digest = scenario_plan_digest(base)
     assert digest == (
-        "c130f66209c5ff2165527673385ee53931d26299ce9574b773e80e39a03a5eae"
+        "b57d75260c5537e4e5cc2aea7f196ff08e35f29acd73a0c51e9efde29034981a"
     )
     assert all(
         scenario_plan_digest(item) != digest

@@ -1,0 +1,46 @@
+schema_version = 1
+[run]
+input = "data/ui"
+output = "out/ui.jsonl"
+modality = "ui"
+batch_size = 2
+seed = 42
+[input]
+ui_tree_max_chars = 30
+[stream]
+order_by = "input_order"
+
+session_max_len = 64
+[segment]
+enabled = true
+strategy = "rules"
+window = 32
+min_len = 2
+on_error = "fail"
+noise_filter = false
+context = "仓库配货和聊天是独立任务；切换应用、再回仓库都要建立新片段。仓库同一请求的修改和确认属于同一任务；色卡连续检查也是单一任务。"
+[stitch]
+enabled = false
+
+[dedup]
+enabled = false
+[quality]
+enabled = false
+[annotate]
+enabled = true
+instruction = "依次检查全部截图，每张中央都有色卡。只有一帧颜色不同，marker_color填这张异色色卡的英文颜色名；frame_count填本序列实际截图总数。不可根据控件树猜颜色。"
+[verify]
+enabled = true
+llm = "default"
+policy = "repair"
+max_repair_rounds = 1
+extra_criteria = "容量切分的人工边界不是任务内容；摘要只需覆盖当前完整成员中的事实。测试色卡画面和界面树是不同的完整证据。"
+[trace]
+enabled = true
+channels = ["segment", "stitch", "annotate", "verify", "schema"]
+content = "refs"
+[output]
+meta_mode = "inline"
+rejects = "full"
+max_repair_attempts = 1
+schema_path = "schemas/ui.json"

@@ -13,6 +13,60 @@
 - API key value 只在内存中使用，不写日志、trace、main、stream、report、manifest、failed report 或 assertion repr。
 - 尚未运行的证据必须保留 `[PENDING-EVIDENCE:<name>]`，不能用规格期望冒充结果。
 
+## 2026-09-09 完整会话与上下文容量证据
+
+权威规格为 `docs/dev/SPEC-sequence-context-capacity.md`，逐项状态见
+`docs/dev/SEQUENCE-CONTEXT-CAPACITY-VERIFICATION.md`。输入仍是固定文件组，不新增实时接入或跨进程恢复。
+研究引用、文件修改清单与独立上游、公共层、控制器审查记录均位于该规格及 `docs/dev/research/`。
+
+本地验证使用已有 8082 单槽服务，真实 Qwen3.5-4B-Q6_K，实际窗口 32768、视觉开启、thinking 关闭。
+模型 SHA-256 为 `fdedd781c9ce676ab66b018ca247ff78e8a33c98098a822c1e2d5075e7718f66`，
+llama-server build 为 b10621-c1d0e7a00。本轮未启动、停止或修改该共享服务。
+生产入口为 execute_run，观察器原样转发真实序列化和 HTTP 请求；无模拟服务器、transport 替换响应或录制回放。
+
+| 实际用例 | 输入文件字节 | 正式结果 | 成功调用及 prompt/completion tokens | 运行墙钟秒 |
+|---|---:|---|---|---:|
+| 文本 batch_size 2 / 3 / 64 | 各666 | 各6次出现、1序列；重复ID保留，两处修改与中间改色答案相同；classify/annotate/verify均含完整正文 | 各4 calls；1932 / 475 | 8.214 / 8.029 / 8.053 |
+| 完整UI | 94130 | 25棵树、25图完整进入 annotate/verify；仅中间像素可见的绿色卡片正确，输出25帧 | 2 calls；7739 / 277 | 4.940 |
+| 交错任务缝合 | 84293 | 8帧→3片段→1次合并→2输出；配货成员为[0,1,2,5,6,7]，业务答案正确 | 9 calls；8727 / 1214 | 26.059 |
+| 主动分区 | 47700 | 6帧→3序列、2切点、2封闭前段，末段开放；0重算、0失败 | 6 calls；17619 / 791 | 13.844 |
+| 真实超限重算 | 72300 | 服务真实400拒绝超过32768窗口的请求；1切点、1次重算、2完整子段，0失败，不重播相同失败请求 | 4 calls；73224 / 451 | 36.043 |
+| 最小单位失败 | 68480 | 前会话1输出保留；后一完整单帧真实超限，恰1最小失败、有限结束 | 2 calls；663 / 232 | 4.519 |
+
+端点错误形状另经真实 tokenize 和 HTTP400 独立确认：`exceed_context_size_error`，不是任意400归类。
+六项目全部经过不含本地凭据的 validate 与 dry-run（12次静态命令）。本地七个测试节点先运行得到
+6 passed、1 failed、115.97秒；唯一失败为 static 测试错误要求末段也 sealed。按既有规格加强边界断言后
+真实重跑该节点：1 passed、14.21秒。不能把这两次命令表述为单次7 passed。
+
+完整矩阵进程 RSS 高水位为140689408字节，静态复跑为134692864字节；这是测试进程实测，
+不含已有模型服务，不是每会话物理内存上限，也不是加速声明。表中输入字节来自实际输入文件清单，
+不含未使用夹具、输出和配置；JSONL字节也不等于模型token。
+可检查的输入、输出、报告、请求结构、哈希、用量、原始失败日志与 `summary.json` 归档于
+`examples/sequence-context-capacity/out/verification-20260909/`。
+完整离线覆盖率、文档版式及 Uncle Bob 的最终状态由验收记录单独维护。
+
+首轮完整离线门为3432 passed、5 failed、56 deselected、644.81秒；五个失败均为生成摘要金值。
+独立从HEAD归档运行旧版loader/compiler，对四份program逐字段比较，差异仅为删除
+`class_views.ticket_booking.annotate.sequence_frames=20`。生成核心四个文件与HEAD字节一致；
+两个小计划仅30个event_key变化。六个金值据此更新，三个小规模摘要回归已通过；随后大型计划与完整离线
+套件统一重验通过：3467 passed、56 deselected、653.00秒，shell墙钟653.52秒，测试进程RSS高水位
+944439296字节。独立材料为归档中的 `generation-digest-canonical-diff.json`。
+首轮覆盖率单独达标：300/300改动可执行函数进入；32文件最低行89.61%、分支78.05%，无缺口。
+这不等于首轮全套通过，也不构成可运行变异审查的绿色基线。
+
+最终完整门的覆盖率经独立重算仍为300/300函数进入、32文件全部达标，最低行89.61%、分支78.05%。
+生产源码与首轮覆盖材料字节一致。设计HTML与186页PDF已重建并完成受影响图示、配置与输出页视检。
+Uncle Bob前置检查因本次工作区尚未提交而BLOCKED，尚未创建审查worktree、建立其独立基线或执行变异；
+详见 `docs/dev/BOB-sequence-context-capacity.md`，不能将离线绿色替代该审查。
+
+早期失败保留：文本夹具时间戳不同导致重复ID断言错误；stitch夹具图像证据与任务判据不够明确导致
+verify拒收，后将相同业务事实绘入截图并明确审核范围，未提供答案或要求pass；初次容量门暴露verify邻居
+跨切点与固定判决轮只传播首错，修复后主动与真实超限恢复通过。后续独立审查补齐克隆归属、片段重排、
+共享帧产物、完整L3修复及dedup同步预检全部失败事实收集。失败记录不能作为有效变异审查基线。
+
+本地证据补充本特性验收；DeepSeek/z.ai 正式发布门本轮尚未执行：
+`[PENDING-EVIDENCE:sequence-context-capacity-release-endpoints]`。
+
 ## 2026-09-05 标注后处理钩子证据
 
 权威规格为 `docs/dev/SPEC-annotation-postprocessing.md`。普通记录、序列记录及成员帧共用

@@ -231,7 +231,7 @@ def test_program_digest_recursively_covers_interleaving_configuration(declared_c
     """候选归属、pattern 关系和两个权重均进入 program digest。"""
     program = compile_generation_program(_interleaving_config(declared_config))
     assert program.digest == (
-        "8bd9a073c523d8371c7d2c620104efcef9b5542d1f13268358ef0da779c908e9"
+        "c89d03520ca31b197476b4953293562dcc8873c31d0c1a105c5920d731b509b7"
     )
     source = program.counterfactual_sets[0]
     pattern = program.interleaving.patterns[0]
@@ -457,7 +457,7 @@ def test_planner_accepts_500000_record_units_without_interleaving(instruction_co
 
     plan = compile_scenario_plan(program)
 
-    assert plan.digest == "2e244046b99f680ad527ef6ad4e36fcf70d5a2fb181ac1fcdeee8546b3efb9f6"
+    assert plan.digest == "fc7eec245ca20856a445a6bde84900bf408995cc085ea3b9abcba9c9c2c02ecc"
     assert len(plan.delivery_slots) == 100_000
     assert sum(len(events) for block in plan.blocks for events in block.values()) == 400_000
     assert plan.interleaving_opportunities == 0

@@ -275,7 +275,7 @@ def _build_post_repair_prompt(
         Message(role="assistant", parts=(Part(kind="text", text=raw_output),)),
         Message(role="user", parts=(Part(kind="text", text=repair),)),
     )
-    return PromptBundle(messages=messages)
+    return PromptBundle(messages=messages, image_px=original.image_px)
 
 
 def _build_post_repair_instruction(violations: list[str]) -> str:
@@ -465,7 +465,7 @@ def defect_verdict_schema() -> dict:
                 "defects": {"type": "array", "items": {"type": "object",
                     "properties": {"kind": {"type": "string", "enum": kinds},
                                    "members": {"type": ["array", "null"],
-                                               "items": {"type": "string"}},
+                                               "items": {"type": "integer", "minimum": 0}},
                                    "position": {"type": ["string", "null"]},
                                    "detail": {"type": "string"}},
                     "required": ["kind", "members", "position", "detail"],
@@ -728,6 +728,7 @@ class CallScope:
     record: Any = None                  # L2.5 回调第二入参（Record.raw），无则 None
     user_treatment: bool | None = None  # 显式待遇门；None ⇒ 按 schema is None 推断
     repair_context_bytes: int | None = None  # 当前调用单轮新增 L3 正文 byte 上限
+    complete_evidence: bool = False     # 修复保留原完整证据；容量错误交还所属算子
 
 
 _DEFAULT_SCOPE = CallScope()
@@ -771,6 +772,7 @@ class _CallContext:
     batch_no: int                  # 批次号，仅用于 trace 事件与日志 extra
     record: Any                    # L2.5 回调的第二入参（Record.raw 原始输入映射），无则 None
     repair_context_bytes: int | None = None  # 单轮新增 L3 正文 byte 上限
+    original_prompt: PromptBundle | None = None  # 完整证据调用修复时原样重放的首轮提示词
 
 
 @dataclass(frozen=True)
@@ -994,6 +996,7 @@ def _finalized_context(request: FinalizedCallRequest) -> _CallContext:
         batch_no=scope.batch_no,
         record=scope.record,
         repair_context_bytes=scope.repair_context_bytes,
+        original_prompt=request.prompt if scope.complete_evidence else None,
     )
 
 
@@ -1155,7 +1158,7 @@ class SchemaEngine:
 
         v1.11：首轮 complete() 可能抛 ContextOverflowError / OutputTruncatedError，
         两者原样上抛给调用方（由算子归类，V27①）；「修复调用」抛出的
-        ContextOverflowError 则判本轮失败并直接短路到耗尽（V25①）。
+        ContextOverflowError 在普通路径判修复耗尽；complete_evidence 调用保留原证据并原样上抛容量错误。
 
         ``scope.user_treatment`` 显式声明是否按「用户 Schema 待遇」处理：None 按
         ``schema is None`` 推断；True 计 resolved_at 并启用 L2.5；False 为内部待遇。
@@ -1176,7 +1179,8 @@ class SchemaEngine:
             active=active,
             user_treated=treated, record_ids=scope.record_ids,
             batch_no=scope.batch_no, record=scope.record,
-            repair_context_bytes=scope.repair_context_bytes)
+            repair_context_bytes=scope.repair_context_bytes,
+            original_prompt=prompt if scope.complete_evidence else None)
         # L0：Schema 恒交给客户端；仅当 profile 声明 supports_structured_output 时，
         # 客户端才施加厂商结构化输出机制。
         response = await self._llm.complete(profile, prompt, response_schema=ctx.active)
@@ -1425,7 +1429,14 @@ class SchemaEngine:
                 v.startswith(self._CB_PREFIX) for v in rendered))
 
     async def _generic_repair_call(self, profile, ctx, raw, rendered):
-        """执行一轮普通 L3 修复并把超预算归一为 None。"""
+        """执行 L3 修复；完整证据调用保留首轮上下文并上抛实际容量错误。
+
+        @param profile 本轮修复模型档案。
+        @param ctx 冻结 Schema、记账及原始证据。
+        @param raw 最近一次模型空间候选。
+        @param rendered 本轮完整违规清单。
+        @return 实际响应，或普通路径的修复容量耗尽。
+        """
         repair_text = _build_repair_prompt(raw, rendered)
         if not _repair_context_fits((repair_text,), ctx.repair_context_bytes):
             _logger.warning("L3 repair context exceeds the frozen byte limit",
@@ -1434,9 +1445,14 @@ class SchemaEngine:
         prompt = PromptBundle(messages=(
             Message(role="user", parts=(Part(kind="text", text=repair_text),)),
         ))
+        if ctx.original_prompt is not None:
+            prompt = _build_post_repair_prompt(ctx.original_prompt, raw, rendered)
         try:
             return await self._llm.complete(profile, prompt, response_schema=ctx.active)
         except ContextOverflowError as overflow:
+            if ctx.original_prompt is not None:
+                _logger.error("complete-evidence L3 repair exceeded the context budget: profile=%s", profile)
+                raise
             # 修复提示词恒定，后续轮必然同败；被吞异常在这里恰好一次喂入熔断。
             _logger.warning(
                 "L3 repair call exceeded the context budget; failing this round and "

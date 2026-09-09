@@ -46,6 +46,7 @@ class ExtractStage(Stage):
     name = "extract"
     def __init__(self, cfg: ResolvedConfig): ...
     async def run(self, batch, ctx) -> list[PipelineItem]: ...   # 返回传入的同一列表（不增不减）
+    def preview_capacity(self, item, ctx) -> SessionCapacityFailure | None: ...
 
 def build_extract_prompt(prev: Record, curr: Record, cfg: ResolvedConfig,
                          label: str | None) -> PromptBundle
@@ -53,11 +54,11 @@ def build_extract_prompt(prev: Record, curr: Record, cfg: ResolvedConfig,
                                        # class_views[label].extract 有效值（3.1.4 按类覆盖合并行）
 async def extract_transition(prev: Record, curr: Record, index: int,
                              ctx: RunContext, label: str | None = None) -> Transition
-                                       # 一转移一调用：经 complete_validated(schema=action_schema())；
-                                       # 修复耗尽按 on_error 兜底/抛出。M7 成员手术后的接缝重摘取
-                                       # 直调本函数（1–2 次/手术；重建的 Transition 带
-                                       # detail.reseamed=true 溯源，index 重编号后不变量
-                                       # len(transitions) = len(members) − 1 恒真，3.7）
+                                       # 一转移一调用；会话内原始容量错误交给 owning stage
+async def extract_transition_for_item(item: PipelineItem, index: int,
+                                      ctx: RunContext) -> Transition
+                                       # 从实际 working item 取完整相邻成员与真实位置。
+                                       # M7 成员手术使用本面，owner 保持 verify。
 ```
 
 产物类型 `Transition`（完整定义见 4.2）：`index`（重建后位次，恒 = 在 transitions 元组中的下标）、`action`（过 Schema 的动作对象）、`model`、`attempts`（1 + L3 修复次数）、`detail`（干净摘取 `{}`；fallback `{kind: "extraction_invalid", message}`；手术重摘取 `{reseamed: true}`）。
@@ -106,7 +107,8 @@ user（单条消息多 Part——「text 标签 + image」组装惯例同 3.5.2/
   image part: s_{i+1}.image
   text part:  [树变更摘要] {tree_diff(s_i.ui_tree, s_{i+1}.ui_tree) 的文字化}
                                                  ← include_diff = true 时；false 整段省略
-              [前后帧树摘要] {frame_digest(s_i)} → {frame_digest(s_{i+1})}
+              [前一帧完整控件树] {record_evidence(s_i)}
+              [后一帧完整控件树] {record_evidence(s_{i+1})}
 ```
 
 锚定句（「前一帧是动作发生前最后一个稳定状态……归并为一个语义动作」）移植自 OpenCUA 的 State-Action Matching 与 Action Reduction 约定 [43]（3.15.7）。`[树变更摘要]` = `tree_diff`（第 4 章 helper，M14 同源）输出的确定性文字化——增/删/文本变化节点数、变化比例、App/标题是否变更；零额外 LLM 调用。
@@ -129,12 +131,17 @@ user（单条消息多 Part——「text 标签 + image」组装惯例同 3.5.2/
 | 设计点 | 定义 |
 |---|---|
 | 调用与校验 | 每对相邻成员帧 1 次调用（`extract_calls = Σ(len(members) − 1)`），经 `complete_validated(schema=action_schema())`（3.8.3）。temperature 恒 0。 |
-| 并发 | planner 按 (episode 批内位置, 对位次) 冻结全部非 seam 转移 `TaskSpec`；TaskExecutor 经 `extract.llm` 资源通道有界执行并按请求输入序返回。叶任务只返回冻结 Transition outcome，不写 `item.transitions`、status、errors、events 或 counters；reducer 把机械 seam/fallback 与模型 outcome 按同一 ordinal 拼成完整 tuple 后一次回写。普通 ProviderFatal 转为既有 fallback/fail outcome，不取消 sibling；逃逸 internal/control 异常才取消 execution domain。**无 rng 消耗**（种子豁免面不变，2.6），结果与完成顺序无关。 |
-| 幂等 | `transitions is not None` 的信封跳过——任何重入零额外调用。M7 修复路径不重跑本 stage：接缝重摘取经 `extract_transition` 函数直调（3.15.3、3.7）。 |
+| 并发 | planner 按完整会话的 episode/相邻对位次冻结非 seam TaskSpec，ctx.run_group 只按 batch_size 分批派发；叶任务不写状态。归并器先扫描容量失败，再按位次组合机械 seam、普通 fallback 与真实结果，完整 tuple 一次回写。会话内 ProviderFatal 和运行级控制流原样上抛；无 RNG 消耗。 |
+| 幂等 | `transitions is not None` 的信封跳过——任何重入零额外调用。M7 修复路径不重跑本 stage：接缝重摘取经 `extract_transition_for_item` 函数直调（3.15.3、3.7）。 |
 | multi 扇出（**按 label 各摘**，S9） | classify `assignment="multi"` 扇出的兄弟信封克隆时 `transitions` 恒 None（classify 在前、extract 在后，3.13.4 multi 扇出行）——每个兄弟按**各自 label** 的有效 `extract.instruction` 独立摘取（per-label 白名单承诺兑现；transitions 每信封自持，接受 ×k 调用成本）。episode 命中多类应属罕见——M14 边界判据即「单一目标导向活动」（3.14.4）。dry-run 估算按乘数 1 报下界 + stderr 注明（3.13 R28 口径，2.4）。 |
 | fallback 语义 | 单转移 M8 修复耗尽且 `on_error="fallback"`（默认）：该步写入代码侧构造的兜底 Transition——`action = {"action_type": "other", "target": null, "value": null, "description": ""}` + `detail = {kind: "extraction_invalid", message}` 留痕；episode 存活、后续转移照常摘取；**不写 `item.errors`**（rejects 归因取 `item.errors[0]`，写入会在该记录后续阶段失败时污染归因——3.13.4 失败与兜底行同则）。留痕使兜底步与 LLM 确证的 other 对下游可区分（detail.kind 在场与否）。 |
 | 接缝占位（v1.9，T10 四键钉死） | `seam_indexes` 所列序数（3.15.2 占位段）写入代码侧构造的占位 Transition，**零 LLM**：`action = {"action_type": "app_switch", "target": null, "value": null, "description": "线索接缝：被<打断者>打断后恢复"}`（<打断者> = interrupted_by 各任务名顿号连接）+ `detail = {kind: "thread_seam", interrupted_by: [...]}`（按接缝判据恒非空，3.16.4）；steps 步行 `resumed = true` 落接缝步自身（emitter 由 detail.kind 推导，6.3）。**语义备注**：占位 `action_type="app_switch"` 对同 App 内穿插（返回同页型）语义不贴——占位类型**不承诺语义**，下游以 `detail.kind` 判别（与 extraction_invalid 留痕同法）。**计数器口径**：seam 占位**不计入** `report.stream.extract.transitions` 与 `extract.by_type.*`（非摘取产物——零 LLM 的 app_switch 会灌污 by_type 分布；接缝唯一计量点 = `report.stream.stitch.seams`，6.4）；**相邻救援不占位**：会话位置紧邻的救援拼接对是真实转移，照常送 LLM 摘取并正常计数（3.16.4 救援行）。 |
-| 上下文预算（v1.11） | 摘取 profile 声明 `context_window` 时（未声明 = 预算关闭，行为与 v1.10 一致；机制见 3.9）：恒定 2 帧 + 2 图的单转移调用**无可收缩项**（图不可减帧、diff / 摘要段结构有界）——不做装填裁剪，由 M9 咽喉终检兜底（V16）；溢出（终检命中或反应态，本调用点无降级面）→ 该步走既有 `on_error="fallback"` 机械回退语义**不变**（`action_type="other"` 兜底步留痕，3.15.6；`"fail"` 时错误分类按 7.6 词表精确记 `context_overflow`）。接缝占位步零 LLM、不受预算影响（本表接缝占位行）。 |
+| 完整证据与容量 | 两个完整成员、两图、完整可见树、可选树 diff、指令及 action Schema 全部计量，不做帧内裁剪或改变图片工作点。Stage.preview_capacity 对全部可达类别检查实际模板；未知接缝时保守检查所有相邻对。归并器在任何 fallback/failed 写入前扫描原始 ContextOverflowError，并携真实两位置、label、profile 交给 owning stage，unit 恒为 transition。无法再分的相邻对登记最小终态，下次调用前投影；不为该最小对反复切整序列，不把双图错误误归 fixed，不吞成一次普通成功动作。接缝机械占位继续零 LLM。 |
+
+完整波次结束后，先按 episode/相邻对声明序收齐全部容量错误，以非空 `SessionCapacityError.failures`
+统一交给 owning stage，再合并任何机械占位、fallback 或业务结果。预览与实际 planner 共用有效 seam 规则，
+已有接缝占位不会产生不存在的容量请求。处理流设置 `CallScope.complete_evidence=true`，M8 结构修复仍发送
+完整两帧及原指令；修复阶段发生的原始容量错误同样上抛。
 
 ### 3.15.5 配置项
 
@@ -149,6 +156,8 @@ user（单条消息多 Part——「text 标签 + image」组装惯例同 3.5.2/
 | `on_error` | `"fallback"`\|`"fail"` / `"fallback"` | 单转移修复耗尽处置（3.15.6）。 |
 
 ### 3.15.6 错误处理
+
+容量错误先按会话协议归并并终止重复请求；下面两形态只处理非容量结构失败，或已由控制器确认的最小终态投影。
 
 错误码 `extraction_invalid`（7.6，v1.8 增行）两形态：
 

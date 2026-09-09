@@ -33,7 +33,11 @@ user (当前记录):
 
 UI 模态的「当前记录」Part 组装与 3.5.2 相同（`[屏幕截图]` 为 `kind="image"` 的 Part，`[UI 控件树]` 为 `kind="text"` 的 Part，3.9.2），所引 profile 须 `supports_vision = true`（M1 校验，3.1.4）。类别示例 `examples` 仅输入侧——分类的输出格式由内部 Schema 钉死，无「示例输出」段。`reason` 的请求条件见 3.13.4 调用与校验行。
 
-**序列记录分支（v1.8）。**stream 模式下 episode（`record.kind = "sequence"`，3.14）作为普通记录被分类（对序列形态零崩溃），仅「当前记录」user 消息改走序列变体——system 与类别示例消息不变，段标签与截断标记行逐字冻结于 CONTRACTS §10.8 序列变体：text part `[待分类数据·序列]` = 成员逐帧 `frame_digest`（4.3）按成员序每帧一行拼接的 episode 摘要，**总量封顶 `input.ui_tree_max_chars`**——**首尾成员恒保留**、中段按**整条**截断、被截断时以标记行 `…(truncated N members)` 收尾；UI 模态另附**首帧截图**（text part `[首帧截图]` + 首成员的 image part，M9 调用时编码，3.9.2）——classify 保持在 vision 引用集，所引 profile 仍须 `supports_vision = true`（3.1.4 vision 逐阶段表）；文本模态序列仅摘要段。
+**处理序列的完整证据。**`run.mode="process"` 且 `segment.enabled=true` 时，分类作用于会话终结后的完整序列。
+当前记录消息按成员顺序包含每个成员的完整 `record.text`，或完整 `UITree.serialize(max_chars=None)` 与每张截图。
+共同渲染器是 `record_evidence` / `sequence_parts`；`input.ui_tree_max_chars` 只约束普通单记录 UI，不裁处理序列。
+图片保留 profile 的固定工作点，在真正序列化请求时惰性编码；预览不加载字节。系统指令、类别表、few-shot 和模型 Schema
+全部计入实际预算。完整输入不承诺模型一定正确理解，语义质量由真实答案门禁及评审另验。
 
 分类输出经 M8 内部 Schema 校验（`schema_engine.classification_schema`，3.8.1 内部 Schema 清单）。关键字集 ⊆ 既有内部 Schema 关键字集，**不写 `uniqueItems`**——该关键字会被 OpenAI strict 模式与部分约束解码网关硬拒（L0 无条件透传 Schema），重复标签改由本模块在 M8 验证后确定性归一化（3.13.4 归一化行）：
 
@@ -65,22 +69,21 @@ def classification_schema(class_names: list[str], assignment: str,
 | 归一化（M8 之后，确定性，顺序固定） | ① 标签映射到类别表声明序并**去重**；② 兜底类与具体类同现 ⇒ 剔除兜底类（纯兜底保留——「其余」与具体类命中矛盾）。归一化只收窄已验证集合（词表合法性由内部 Schema enum 保证，3.13.3）。 |
 | sc 投票 | `classify.self_consistency = n`（0 关；≥3 奇数，M1 校验）：n 次独立采样（某次采样 SchemaViolation ⇒ 该样本弃权，分母仍为 n）。single：多数票，无过半 ⇒ 归兜底类；multi：逐标签保留出现于 > n/2 个采样集合者，全落选 ⇒ 归兜底类。`Classification.detail.sc = {"n", "agreement_ratio"}`（single = 胜出类票占比；multi = 保留标签中最低票占比）。本投票不复用 3.5.2 的字段级投票——其「全体分歧回退首样本」语义不适用于分类（无过半应归兜底而非取首样本）。 |
 | 失败与兜底 | M8 修复耗尽：`classify.on_error = "fallback"`（默认）⇒ 归兜底类 `classify.fallback_class`，`source="fallback"`，留痕写 `Classification.detail`（含 kind 与消息）——**不写 `item.errors`**（记录存活；rejects 归因取 `item.errors[0]`，写入会在该记录后续阶段失败时污染归因，3.11.2）+ error 事件（kind = `classification_invalid`，7.6）+ 计数器 `classify.fallback`；`on_error = "fail"` ⇒ `status="failed"`、StageError 入 `item.errors` ⇒ rejects。 |
-| multi 扇出 | 归一化后 k ≥ 2：原信封取首标签（声明序），其余 k−1 标签各克隆一个兄弟 `PipelineItem` **原地追加到传入批列表尾部**——克隆共享 `record` 与 `dedup`（引用共享，零内容复制；保证兄弟行 `_meta.dedup` 一致）并继承 `session_id`（v1.8——兄弟序列信封对 M7 边界余量/邻域查询保持可寻址，3.7.3）以及 `thread_id` 与 `seam_indexes`（v1.9，stitch 启用时在场——复制清单增两项：thread_id 为真字段进克隆构造、seam_indexes 为 duck 标进复制循环；兄弟线索信封对 M15 接缝占位与 M7 `[片段结构]` 证据保持可用，3.16/3.15.4/3.7.2），`classification` 换 label（`labels` 同为全集），`status="active"`，scores / annotation / verification / errors 为全新默认容器。追加序 =（原元素批内位置 → 标签声明序），逐字节可复现。返回值 = 传入的同一列表对象（4.3 契约 ②a）。此后每个信封与普通单标签记录完全同构——进各自类池打分、按各自类参数标注/评审、独立淘汰、独立产出一行（行唯一键 = (`_meta.id`, label)，6.3），下游算子对扇出零感知；扇出净增数由 M10 计入 `counts.fanout`（3.10.3、6.4）。 |
+| multi 扇出 | 原信封取首标签，其余标签按声明序追加兄弟信封。兄弟共享当前尝试的 record、dedup、member_classifications 与 member_annotations；复制 session_id、session_position、member_positions、capacity、thread_id、segment_degraded、seam_indexes、seam_interrupted_by、stitch_fragments、stitch_task_name。scores、annotation、verification、errors 为全新容器，transitions 保持 None 供各 label 独立摘取。会话重算从冻结上游重建，禁止把上次尝试的帧产品复用到新尝试。扇出后独立类路由与淘汰，净增仍由 M10 计量。 |
 | multi × episode（v1.8，S9） | stream 模式下 multi 扇出照常作用于序列信封，两点增量语义：① 克隆兄弟的 `transitions` **恒为 None**——extract 链序在 classify **之后**（3.10.3），每个兄弟按**各自 label** 的有效 `[class.<label>.extract]` instruction 独立摘取（per-label 白名单承诺兑现；transitions 每信封自持，×k 摘取成本接受——episode 命中多类应属罕见：M14 边界判据即「单一目标导向活动」，3.14.4；dry-run 沿本表 multi 惯例按乘数 1 报下界，3.10.3）。② **共享语义边界声明**：本表「multi 扇出」行的「克隆共享 `record` 引用」不变量仅维持到 M7 成员手术为止——被修复兄弟的 `record` 分叉（以新成员集重建，3.7.3 stream 修复路由），同 `_meta.id` 的兄弟输出行自此 `member_ids` **可不同**，以 `_meta.stream.repaired` 消歧（6.3）；membership 类手术仅原信封（首标签）可执行、克隆兄弟降为只标记（S8，3.7.3）。 |
 | 幂等与 sequence 边界 | `classification is not None` 的项跳过，覆盖 flat 回流样本的 inherited 分类与任何重入。v1.18 sequence 要求 `classify.enabled = false`，ClassifyStage 不进链；sequence class 直接由 `[class.<name>]` 声明，EventProjector 在主序列与成员事件上写 `source="inherited"` 的实际类真值。因此 sequence 的分类调用恒为零，但 M4/M5/M7/M11 必须继续读取 inherited Classification 选择 ClassView。 |
 | 事件与计数 | 每记录一条 `classify.decision` trace 事件（classify 通道 / trace-only，payload：`label`、`labels`（multi 携带全集）、`source`、`reason`†、`sc`†；条件与字段定义见 7.2）；计数器（M13 属主）：`classify.classes.<name>`（逐标签计）、`classify.fallback`、`classify.failures`、`classify.multi_label_records`；`counts.fanout` 由 M10 计量（counts.* 所有权属 M10，3.10.3）。report `classify` 节见 6.4。 |
-| 上下文预算装填（v1.11） | 分类 profile 声明 `context_window` 时按上下文预算装填分类调用（未声明 = 预算关闭，行为与 v1.10 一致；预算/估算/校准机制见 3.9）：「当前记录」的单记录 UI 树渲染动态封顶——`UITree.serialize(max_chars=…)` 实参从固定 `input.ui_tree_max_chars` 改为 `min(ui_tree_max_chars, 预算折算字符)`（渲染后按 est 复核，超则按行丢尾、保留既有 `…(truncated N nodes)` 标记；`ui_tree_max_chars` 保留为绝对上限，V9；序列分支的摘要段封顶为同族语义）。**类别示例是系统侧静态部件（V13③）**：`[类别示例·{name}]` 段与类表、`classify.instruction` 一律**不动态裁剪**（用户语义资产）——由 M1 静态预检把关（est ≥ input_budget → CONFIG_ERROR、> 50% → WARN，3.1.4）。连最小单元（单记录）都装不下 → 该记录记 `context_overflow` 入 rejects（V10，7.6）。逐裁剪点计入 `report.budget.truncations`（6.4）。 |
+| 上下文预算 | 普通单记录保留既有 UI 树动态预算帽和截断计量；处理序列一律不裁正文、树或图片。`preview_capacity(item,ctx)` 用真实模板与模型 Schema 检查完整请求；实际 precheck/reactive `ContextOverflowError` 必须在 SC 弃权、fallback 或 failed 前，以原 error 和精确 `CapacityTarget` 交给会话控制器。完整序列可按成员边界拆分；仅指令/类别示例/Schema 已超限则是 `fixed` 最小失败。已知同 stage/profile/view/positions 终态在发请求前投影，不能重复调用。普通 HTTP 413 等非 token 错误不触发拆分。 |
 
-**v1.19 planner / leaf / reducer。**planner 按批内 item 序冻结 sequence sample 任务，只消费同步计划阶段的
-RNG。叶任务返回冻结分类 sample outcome，不得写 classification、member map、errors、events 或 counters。
-sequence reducer 按 item/sample ordinal 完成投票、归一化和 fallback，再写原信封分类。
+**执行顺序。**先按完整会话中的 item/sample 顺序冻结分类计划，再通过 `ctx.run_group` 按 `run.batch_size`
+分组执行固定任务清单。批大小不切开语义会话。叶任务只返回结果；完整波次结束后，归并器按 item/sample 声明序
+同时收齐同步计划异常和所有叶容量错误，以非空 `SessionCapacityError.failures` 一次交给控制器，再投票、归一化和普通失败。
+帧分类在序列分类归并后、multi 扇出前完成；帧产物按输入出现位置归并。空计划不提交空任务组。
+会话内 ProviderFatal 与运行级控制流原样上抛；ordinary 单记录继续使用既有错误隔离。
 
-sequence 分类 reducer 完成后、multi fanout 之前，stage 才从稳定分类结果与成员摘要冻结 frame window 任务；
-frame 叶任务返回窗口 outcome，frame reducer 按 episode/window/member ordinal 写入同一个
-`member_classifications` dict。随后 multi reducer 才按原 item 位置与标签声明序向批尾追加兄弟信封。这个屏障保证
-克隆只共享已定案的帧产物，不会重复付费。无 sequence 分类调用或无 frame window 时对应任务组为空；
-ProviderFatal 在普通路径转为现有 fallback/fail outcome，不取消 sibling，逃逸 internal/control 异常才取消
-execution domain。
+固定开销通过同一 builder 的空成员输入计算，保留系统任务、类别表、few-shot、模型 Schema、当前 user 消息及恒有段落标签。
+这些内容已超限时直接归 `fixed`，不增加任何 sequence 切点。处理流设置 `CallScope.complete_evidence=true`，
+M8 结构修复保留原证据并追加坏输出和违规指令；修复请求的原始容量错误仍交给本阶段。
 
 ### 3.13.5 API 与配置
 
@@ -89,6 +92,7 @@ class ClassifyStage(Stage):
     name = "classify"
     def __init__(self, cfg: ResolvedConfig): ...
     async def run(self, batch, ctx) -> list[PipelineItem]: ...   # 返回传入的同一列表（multi 可尾部追加）
+    def preview_capacity(self, item, ctx) -> SessionCapacityFailure | None: ...
 
 def build_classify_prompt(record: Record, cfg: ResolvedConfig,
                           with_reason: bool) -> PromptBundle       # 3.13.3 模板的确定性组装
@@ -154,38 +158,31 @@ item.classification = Classification(label="qa", labels=("qa",), source="llm", d
 
 两个信封各自进 writing / qa 类池打分、按各自类有效 instruction 标注，各产出一行（行唯一键 (`_meta.id`, label)，6.3）；本批 `counts.fanout` 增 1（3.10.3）。**fallback 分支**：若某记录的分类输出经 M8 修复耗尽仍非法，默认 `on_error="fallback"` 下归兜底类——`Classification(label="other", labels=("other",), source="fallback", detail={"kind": "classification_invalid", "message": "…"})`，记录保持 active、不写 `item.errors`（3.13.4 失败与兜底行）。
 
-### 3.13.7 帧级批量判决（v1.12）
+### 3.13.7 帧级分类
 
-流模式帧粒度的分类面（`frame.classify.enabled`，默认关，5.2）：对序列信封的成员帧按**帧类表**（`[[frame.classify.classes]]`，与序列类表相互独立、允许重名、互不约束）做一次批量闭集判决，产物写 `item.member_classifications`（键 = 成员 `record.id`，4.1）。链位住 M13 的成本结构（裁决·链位与成本）：dedup 之后——重复 episode 不付费；quality 之前的少量批量调用可接受（帧标注贵在逐帧，故住质量门之后的 M5，3.5.5）。
+`frame.classify.enabled` 开启时，M13 在序列级归并后、multi 扇出前执行帧 pass。只处理 active、sequence、
+首标签或无分类信封；已有 member map 幂等跳过，segment_degraded 保持原跳过计量。Stage 组链门仍是
+`classify.enabled or frame_classify.enabled`；仅帧级开启不产生序列 Classification。
 
-**公开面（算子间导入白名单第四向，签名冻结）**：
-
-```
-async def classify_frames(members: Sequence[Record], ctx: RunContext) -> dict[str, Classification]:
-    """对给定成员 Record 序列做帧级闭集批量判决，返回 {member.id: Classification}
-       （label = 帧类名，labels = (label,) 恒单元素，source ∈ {"llm", "fallback"}）。
-       M7 verify 的成员回收补跑直接调用（单成员回收即单元素调用）——v1.8
-       segment.judge_window 同款契约地位的 sanctioned import exception（CONTRACTS §1.1）。
-       本函数永不抛出记录级异常（运行级控制流大三样除外）。"""
-
+```python
+async def classify_frames(members: Sequence[Record], ctx: RunContext,
+                          target: CapacityTarget | None = None) -> dict[int | str, Classification]: ...
 def build_frame_classify_prompt(members: Sequence[Record], cfg: ResolvedConfig,
-                                digests: Sequence[str]) -> PromptBundle:
-    """帧级批量判决模板的确定性装配（verbatim 捕于 CONTRACTS §10.12）。"""
+                                digests: Sequence[str]) -> PromptBundle: ...
 ```
 
-要点（规格与理由）：
-
-- **执行门**（stage 内帧 pass，序列级判决写完之后、multi 扇出之前）：active ∧ `record.kind == "sequence"` ∧ 首标签信封（`classification.label == labels[0]`；classification 为 None 视同非克隆——克隆恒携 classification）∧ 幂等门 `item.member_classifications is None` ∧ 非降格（`segment_degraded` duck 标在场 ⇒ 计 `frame_classify.skipped_degraded` 并跳过，裁决·降格会话跳过）。
-- **组链双门**（裁决·组链双门）：factory 以或门 `classify.enabled ∨ frame_classify.enabled` 决定 ClassifyStage 进链（槽位不变，3.10.3）；stage 内序列级判决单独受 `classify.enabled` 门控——仅帧级开启时序列记录不产生 Classification（`_meta.classification` 维持 null）、帧 pass 照常。
-- **调用形态**：一 episode 一调用；预算声明时按 `budget.pack_windows`（v1.12 自 `segment._pack_windows` 下沉的同一纯函数，裁决·装箱器下沉）对成员摘要行成本贪心分窗——**零重叠调用形**：pack_windows 跨度链自带的 1 帧重叠（M14 缝帧语义）不适用于帧分类，自第二窗起丢弃与前窗重叠的首帧（前窗持有缝帧判决），所得跨度两两不交且完整覆盖；帧分类无窗口上限键 ⇒ 预算是唯一切分力；**预算关 ⇒ 单窗全成员**。
-- **提示词**（确定性模板，house 风格，verbatim 冻结 CONTRACTS §10.12）：system = `[任务]` 逐帧闭集分类指令（{N} 代入窗内成员数）+ 帧类表行 `- name: description`（声明序）+ 结构句 + 输出契约；user = `[会话成员帧]` 1-based 摘要行（`frame_digest`，每行上限 `segment.digest_max_chars`，会话级预计算复用——装配器自身永不计算摘要）；`FrameClassifyConfig.vision_resolved` 时每成员追加 `[成员 i 截图]` 标签 + image part（工作点 = profile `default_image_px`，不另设尺寸——校准器按 profile 聚合的前提）。
-- **内部 Schema**：`schema_engine.frame_classify_schema(names, n)` = `{"labels": {"type": "array", "items": {"enum": [...]}, "minItems": n, "maxItems": n}}` + `additionalProperties: false`（`segment_window_schema` 同款先例，3.8.1）；**对齐后校验**在代码侧（first-wins 家族）：labels 数组按位置对齐窗内成员序，**超长截断**（保留前 n 项）、**缺项 ⇒ 该帧 `fallback_class`**（source="fallback"）；**同 id 成员 first-wins**（裁决·同 id 成员 first-wins，§1.6）——成员 id 为内容哈希，episode 内同 id 帧落表首位次胜出、不重复计数，各位次 members[] 行渲染同一产物。
-- **失败语义**（v1.7 fallback 哲学下推）：单窗修复穷尽或调用不可恢复 ⇒ 该窗**全部成员**落 `fallback_class`，计 `frame_classify.fallback += N`、`frame_classify.window_failures += 1`；**永不**使 episode 信封 failed、不写 `item.errors`。窗口跨度零重叠 ⇒ 各窗写入互不覆盖，折叠结果与调度顺序无关。
-- **溢出纪律**：precheck（含强制最小窗仍不可装填）= 最小单元失败，**永不喂熔断**；反应式溢出 ⇒ 窗口**对半重切 ≤ 2 级**（segment V20 同款镜像；帧分类窗口零重叠，切分不保缝帧；每次对半计 `budget.degrade_retries`），级数耗尽/单帧窗不可再切 ⇒ 按窗失败兜底；reactive-400 终局在窗失败吞点经共享 `budget.feed_reactive_terminal` 补喂熔断**恰一次**（A7 纪律，7.6 熔断矩阵）。
-- **扇出共享**（裁决·扇出共享与首标签执行）：`_fan_out` 克隆构造清单显式加入 `member_classifications` / `member_annotations` 两字段——与 `record`/`dedup` 同族**按引用共享**（帧产物描述成员帧本身而非信封路由，克隆行渲染同一 dict）；帧 pass 在扇出**之前**执行，克隆自身永不重跑。
-- **产物**：`item.member_classifications = {member_id: Classification(label=帧类名, labels=(label,), source="llm"|"fallback")}`（恒单标签——帧级无 assignment，3.1.4 定向探针）。
-- **与 v1.18 sequence 互斥**：`generate.form = "sequence"` 要求 `frame.classify.enabled = false`，
-  ClassifyStage 整体不进链。PatternEvaluator 的 actual role binding 与实际 EventTruth.frame_class 是 projector
-  写 inherited `member_classifications` 的唯一来源；planner role witness 不能代写实际标签。process stream 的
-  帧分类路径维持本节算法。
-- **事件与计数**：`classify.frame` 每 episode 一发（ids=(episode_id,)，payload = members/windows/fallback 三计数，不携带任何数据内容，3.12.4）；计数器 `frame_classify.calls` / `fallback` / `window_failures` / `skipped_degraded`（report 子块见 6.4）。
+- 处理会话必须传实际 `CapacityTarget`，其 member_positions 与 members 一一对应；verify 回收用 expanded working item
+  的真实位置和 owning stage=verify。缺失目标是接口错误，不能悄悄退回内容 ID。
+- 当前完整 episode 只构造一次帧分类请求，携带所有成员全文、完整可见树和全部截图；不按 segment.window 或 batch_size
+  分窗。内部 `labels` 数组长度等于 episode 成员数，类名依帧类表闭集验证。多个 episode 的任务先冻结，再按 batch_size
+  分组；归并顺序不依赖完成顺序，完整波次的全部容量失败先统一上抛。
+- `member_classifications` 在 process 中用全会话整数出现位置作键。同 ID 的不同出现位置分别对齐、分别产出，
+  不执行 first-wins。generation 的 inherited 帧产品仍使用唯一字符串事件 ID。
+- 多成员请求的容量单位为 `sequence`；同源空成员包络及实际 Schema 已超限时归 `fixed`。控制器只对 sequence 请求
+  按完整成员边界分区。单成员请求（包括 verify 回收）恒为 `frame`，控制器登记 stage/profile/view/position
+  最小终态；下次在发请求前直接投影原 fallback 帧产品，不重复发送。非容量结构修复耗尽继续产生 fallback 分类，
+  不写 episode.errors。
+- `classify.frame` 与 calls/fallback/window_failures/skipped_degraded 计量保留；dataset 计数只提交最终会话尝试。
+  原始调用、Schema、usage 与 trace 事实跨重算保留。multi 兄弟共享当前尝试同一个帧字典。
+- `generate.form="sequence"` 要求 sequence/frame classify 关闭；EventProjector 仍从真实 EventTruth 写 inherited
+  分类，不能拿 planner witness 代替实际标签。

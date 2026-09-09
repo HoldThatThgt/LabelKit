@@ -86,6 +86,7 @@ _OVERFLOW_BODY_PATTERNS = (
     '"code":"1261"',
     '"code": "1261"',
     "context_window_exceeded",
+    "exceed_context_size_error",
 )
 
 

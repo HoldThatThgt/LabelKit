@@ -16,15 +16,8 @@ v1.7 按类分池（spec 3.4.3 按类分池、CONTRACTS.md §7.3）：classify �
 池的 LLM 判定调用冻结进一个 TaskGroupRequest（跨池有界并发）。池间失败隔离（R15）。classify 关闭 =
 唯一匿名池，与 v1.7 之前逐字节一致（扁平计数键，payload 无 "pool" 字段）。
 
-v1.8 序列打分（spec 3.4.3 sequence 行、CONTRACTS §7.3 / §10.2 / §10.3）：episode 信封
-（record.kind == "sequence"）即使在 UI 模态下也渲染为纯文本（rule-34 视觉豁免的唯一一处，
-S30）——[步骤序列]（item.transitions 逐步骤行；兜底步骤带（摘取兜底）后缀，与 LLM 确认的
-"other" 区分开，S16）+ [成员帧摘要]（逐成员 frame_digest，有界）。transitions 经私有提示词
-装配函数的尾部参数下传（非冻结面）；单条记录路径取默认 None，与 v1.7 逐字节一致。
-
-v1.11 上下文预算装填（spec 3.4.3 v1.11 行、§3.3③④⑤）：每次 (比较, 评委) 调用各按该评委
-profile 的预算装填（V25② 与 verify 的 min-over-panel 相对）；反应式溢出按 V20 至多降档
-重试一次，最小语义单元仍装不下则按 V10 处置。
+处理会话的完整序列路径见 quality_capacity：全部文字、树、图片和动作进入每个实际评估请求，
+容量失败在归并屏障上抛；普通记录与生成路径维持各自的预算策略。
 """
 from __future__ import annotations
 
@@ -50,6 +43,7 @@ from labelkit.common.errors import (
     SchemaViolation,
 )
 from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
+from labelkit.common.contracts.sequence_capacity import raise_session_capacities
 from labelkit.common.contracts.generation import DownstreamAttemptRequest, DownstreamAttemptResult
 from labelkit.common.contracts.types import (
     PipelineItem,
@@ -70,6 +64,7 @@ from labelkit.operators.quality_calls import (
     QualityFitRequest,
     QualityJudgment,
 )
+from labelkit.operators.quality_capacity import complete_parts, preview_capacity, run_complete_call, wave_failures
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import Criterion, LLMProfile, QualityConfig, ResolvedConfig
@@ -452,7 +447,7 @@ def _violation_summary(exc: SchemaViolation) -> str:
 # ── v1.8 序列渲染（spec 3.4.3 sequence 行、CONTRACTS §10.2/§10.3） ────────────
 # 算子模块之间互不依赖（spec §2.2）：annotate 自带同格式的步骤行模板，这里是 M4 的副本。
 
-_MEMBER_DIGEST_MAX_CHARS = 400   # 逐成员 frame_digest 上限（segment.digest_max_chars 默认值）
+_MEMBER_DIGEST_MAX_CHARS = 400   # 生成文本序列和脱敏摘要的既有上限
 _FALLBACK_STEP_SUFFIX = "（摘取兜底）"
 
 
@@ -558,24 +553,14 @@ class _Comparison:
 def _record_parts(record: Record, label: str, ui_tree_max_chars: int,
                   transitions: tuple[Transition, ...] | None = None,
                   fit: _CallFit | None = None) -> list[Part]:
-    """渲染一条记录在提示词里占的内容槽位。
+    """渲染当前记录的实际内容槽位。
 
-    text 模态：一条 '[label] text' 文本；UI 模态：§10.2 的三段（截图头行 + 图片 + 控件树）。
-    v1.8 序列记录（record.kind == "sequence"，先于模态判断）渲染成「一条纯文本」——
-    `[{label}·操作序列]` 头行，随后是 §10.2/§10.3 的 [步骤序列]（transitions 为 None 时整段
-    省略）+ [成员帧摘要]——即便在 UI 模态下也不带图片部件（rule-34 视觉豁免，S30）。
-
-    v1.11（fit 非 None，spec 3.4.3 v1.11 行）：本槽位按 fit.side_share 装填——UI 控件树走
-    §3.3③ 动态封顶，[步骤序列] 走 §3.3⑤ 边缘裁剪；记录正文与成员摘要块（已按字符封顶）
-    不属于可裁剪类，下限仍超份额时置 fit.overflow（V10）。fit=None 即 v1.10 逐字节路径。
-
-    @param record 待渲染的记录
-    @param label 槽位标签（如 "记录 A" / "记录内容"）
-    @param ui_tree_max_chars 控件树 / 成员摘要块的字符上限（input.ui_tree_max_chars）
-    @param transitions 序列记录的步骤序列；None 表示不渲染 [步骤序列]
-    @param fit 装填状态；None = 预算关闭
-    @return 该槽位的消息部件列表
-    """
+    @param record 普通记录或序列
+    @param label 当前比较侧标签
+    @param ui_tree_max_chars 普通树字符上限；空值明确选择处理序列完整证据
+    @param transitions 已有完整动作
+    @param fit 普通记录或生成路径的装填状态
+    @return 当前记录的证据部件"""
     if record.kind == "sequence":
         return _sequence_parts(record, label, ui_tree_max_chars, transitions, fit)
     if record.modality == "text":
@@ -598,6 +583,8 @@ def _sequence_parts(record: Record, label: str, ui_tree_max_chars: int,
     @param fit 装填状态；None = 预算关闭
     @return 只含一条文本部件的列表
     """
+    if ui_tree_max_chars is None:
+        return complete_parts(record, label, transitions)
     lines = [f"[{label}·操作序列]"]
     if transitions is not None:
         lines.append("[步骤序列]")
@@ -805,6 +792,10 @@ class QualityStage:
         active = _ATTEMPT_CONFIG.get()
         return self._cfg if active is None else active  # type: ignore[return-value]
 
+    def preview_capacity(self, item: PipelineItem, ctx: "RunContext"):
+        """@param item 候选完整序列。@param ctx 冻结会话上下文。@return 首个完整请求容量失败。"""
+        return preview_capacity(self, item, ctx)
+
     async def run(self, batch: list[PipelineItem], ctx: "RunContext") -> list[PipelineItem]:
         """对一批信封打分并门控（三阶段：预抽配对 → 合并判定 → 逐池后处理）。
 
@@ -924,7 +915,7 @@ class QualityStage:
         @param pools 池列表
         @param ctx 运行上下文
         """
-        plans = self._collect_calls(pools, ctx)
+        plans, errors = self._collect_calls(pools, ctx)
         specs = tuple(
             TaskSpec(
                 task_id=f"{ctx.task_namespace}:quality:{plan.ordinal}",
@@ -935,19 +926,23 @@ class QualityStage:
             )
             for plan in plans
         )
-        outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
+        outcomes = await ctx.run_group(TaskGroupRequest(specs))
+        raise_session_capacities(ctx, wave_failures(self, pools, (plans, errors), outcomes, ctx))
+        for index, error in errors.items():
+            self._fail_pool(pools[index], ctx, error)
         for plan, outcome in zip(plans, outcomes, strict=True):
             self._reduce_call(pools, plan, outcome, ctx)
 
     def _collect_calls(self, pools: list["_Pool"],
-                       ctx: "RunContext") -> list[QualityCall]:
+                       ctx: "RunContext") -> tuple[list[QualityCall], dict[int, Exception]]:
         """按池与调用声明序冻结全部纯叶计划。
 
         @param pools 池列表
         @param ctx 运行上下文
-        @return 按池、比较或记录、评委、呈现序与准则展开的调用计划
+        @return 按声明序展开的调用计划与同步计划异常。
         """
         plans: list[QualityCall] = []
+        errors: dict[int, Exception] = {}
         for pool_ordinal, pool in enumerate(pools):
             if pool.dead:
                 continue
@@ -965,10 +960,10 @@ class QualityStage:
                 _logger.error("quality call assembly failed: pool=%s exc=%s",
                               pool.pool, type(exc).__name__,
                               extra={"stage": self.name, "batch": ctx.batch_no})
-                self._fail_pool(pool, ctx, exc)
+                errors[pool_ordinal] = exc
                 continue
             plans.extend(calls)
-        return plans
+        return plans, errors
 
     async def _run_call(self, plan: QualityCall,
                         ctx: "RunContext") -> QualityCallOutcome:
@@ -986,6 +981,8 @@ class QualityStage:
             raise
         except Exception as exc:
             if _ATTEMPT_MODE.get():
+                raise
+            if ctx.session_attempt is not None and isinstance(exc, ProviderFatalError):
                 raise
             _logger.error("quality judging leaf failed: ordinal=%d exc=%s",
                           plan.ordinal, type(exc).__name__,
@@ -1539,6 +1536,8 @@ class QualityStage:
         @param ctx 运行上下文
         @return 成功裁决或普通失败
         """
+        if ctx.session_attempt is not None:
+            return await run_complete_call(self, call, ctx)
         keys = [criterion.key for criterion in call.criteria]
         schema = judgment_schema(keys, call.with_reason)
         fit = self._call_fit(ctx, QualityFitRequest(
@@ -1584,7 +1583,8 @@ class QualityStage:
         )
         return _build_pairwise_prompt(
             pair, call.criteria, call.with_reason,
-            self.cfg.input.ui_tree_max_chars, fit,
+            None if self.cfg.run.mode == "process" and self.cfg.segment.enabled else self.cfg.input.ui_tree_max_chars,
+            fit,
         )
 
     @staticmethod
@@ -1754,6 +1754,8 @@ class QualityStage:
         @param ctx 运行上下文
         @return 成功打分或普通失败
         """
+        if ctx.session_attempt is not None:
+            return await run_complete_call(self, call, ctx)
         schema = pointwise_schema(call.criterion.key)
         fit = self._call_fit(ctx, QualityFitRequest(
             profile=call.profile,

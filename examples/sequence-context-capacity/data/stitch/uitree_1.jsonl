@@ -1,0 +1,2 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "visible": true, "bounds": [0, 0, 256, 256], "package": "com.example.warehouse"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "RIVER-42 配货单详情：西仓，红色零件3箱。", "visible": true, "bounds": [0, 74, 256, 256], "package": "com.example.warehouse"}

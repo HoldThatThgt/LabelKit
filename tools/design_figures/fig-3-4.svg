@@ -5,9 +5,9 @@
     </marker>
   </defs>
   <g font-size="12" text-anchor="middle">
-    <!-- lifelines -->
+    <!-- 普通记录路径；流序列按完整会话执行，见跨批次容量规格。 -->
     <rect x="40"  y="20" width="120" height="34" rx="4" fill="#eef3fa" stroke="#2456a6"/><text x="100" y="42">CLI / main</text>
-    <rect x="230" y="20" width="120" height="34" rx="4" fill="#eef8f0" stroke="#2e8b57"/><text x="290" y="42">M10 编排器</text>
+    <rect x="230" y="20" width="120" height="34" rx="4" fill="#eef8f0" stroke="#2e8b57"/><text x="290" y="42">M10 普通记录编排</text>
     <rect x="430" y="20" width="120" height="34" rx="4" fill="#fdf7ee" stroke="#c9861a"/><text x="490" y="42" font-size="11">阶段链（3.10.3 链序）</text>
     <rect x="630" y="20" width="120" height="34" rx="4" fill="#fdf7ee" stroke="#c9861a"/><text x="690" y="42">M11 输出器</text>
     <rect x="830" y="20" width="130" height="34" rx="4" fill="#f6f1fb" stroke="#7a4fb5"/><text x="895" y="42">进程内存</text>

@@ -1,0 +1,28 @@
+{
+  "type": "object",
+  "properties": {
+    "task": {
+      "type": "string"
+    },
+    "request_id": {
+      "type": "string"
+    },
+    "destination": {
+      "type": "string"
+    },
+    "color": {
+      "type": "string"
+    },
+    "quantity": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "task",
+    "request_id",
+    "destination",
+    "color",
+    "quantity"
+  ],
+  "additionalProperties": false
+}

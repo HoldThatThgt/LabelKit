@@ -6,12 +6,8 @@
 # 覆盖指令、transition 跳过）→ verify(评审 + 修复)。帧产物随序列行落盘
 # _meta.stream.members[]。
 #
-# 双端点分工（v1.12 vision 语义分列的教学形态，config.toml 在本目录）：
-# DeepSeek [llm.default] = 文本判决面——segment 滑窗摘要判决（vision_resolved=
-# false 成本控制面）、帧级批量分类（digest-only，frame.classify 永不入 vision
-# 必需集）、stream 模式 quality 纯文本打分（S30 放宽）；z.ai glm-5.2
-# [llm.vision] = 视觉必需面——classify/annotate/frame.annotate/verify 四阶段在
-# UI 模态强制 supports_vision。
+# 当前 UI 主工程所有成员证据阶段使用 [llm.vision]，保留完整树与图片。
+# [llm.default] 留给纯文本姊妹工程；旧运行的双端点成本数字是历史证据。
 #
 # extract/stitch 显式不启用：上手示例聚焦双粒度，动作摘取与线索缝合见
 # examples/stream；generate 与 segment 互斥（2.3.1），不可用。纯文本时间序流的
@@ -44,7 +40,7 @@ schema_version = 1
 input = "./data"
 output = "./out/mix-labels.jsonl"
 modality = "ui"
-batch_size = 32                   # 17 帧 3 会话整会话装箱进一批
+batch_size = 32                   # 每个计算组最多 32 个叶任务，完整会话独立提交
 seed = 42
 
 [stream]
@@ -53,7 +49,7 @@ key = ["source_dir"]              # 分区键：每个会话子目录一个会�
 
 [segment]
 enabled = true                    # stream 模式总开关
-llm = "default"                   # DeepSeek 摘要判决：vision_resolved=false 成本控制面
+llm = "vision"                    # 完整成员树与图片证据
 strategy = "llm"                  # 滑窗 LLM 边界精化 + 逐帧噪声标记
 window = 8                        # ≥ 最长会话（6 帧）：每会话恰一窗
 min_len = 2
@@ -66,7 +62,7 @@ enabled = false                   # 显式不启用：线索缝合的完整演�
 enabled = true                    # 判重单元 = episode：成员配方按序拼接（spec 3.3.3）
 
 [classify]
-enabled = true                    # 序列级分类：episode 摘要 + 首帧截图入提示词
+enabled = true                    # 序列分类使用全部成员的完整树与图片
 llm = "vision"                    # UI 模态 classify 入 vision 必需集——走 z.ai
 assignment = "single"
 fallback_class = "other"
@@ -86,7 +82,7 @@ description = "不属于以上任何一类的任务"
 # ── 帧粒度（v1.12）：成员帧闭集分类——帧类表与序列类表相互独立 ──
 [frame.classify]
 enabled = true
-llm = "default"                   # digest-only 帧级批量判决：永不入 vision 必需集
+llm = "vision"                    # 完整成员树与图片证据
 fallback_class = "other"          # 修复穷尽/窗口失败的兜底，须 ∈ 帧类表
 
 [[frame.classify.classes]]
@@ -119,14 +115,14 @@ enabled = false                   # 显式不启用：逐帧对动作摘取的�
 [quality]
 enabled = true
 mode = "pointwise"
-llm = "default"                   # stream 模式质量打分纯文本（S30）——走 DeepSeek
+llm = "vision"                    # 完整序列证据，包括全部成员图片
 rubric = "default:trajectory"     # 轨迹四准则；无 threshold——只打分不筛
 
 [annotate]
 enabled = true
 llm = "vision"                    # UI 模态 annotate 入 vision 必需集——走 z.ai
 instruction = """
-你是移动端操作序列标注员。根据成员帧摘要与关键帧截图，
+你是移动端操作序列标注员。根据全部成员帧的完整 UI 树与截图，
 标注该操作序列的任务标签（用户在做什么）、所属应用与一句话摘要。
 """
 
@@ -170,7 +166,7 @@ enabled = true
 llm = "vision"                    # UI 模态 verify 入 vision 必需集——走 z.ai
 policy = "repair"
 max_repair_rounds = 1
-extra_criteria = "补充审核约定：审核证据仅含首末帧截图与成员帧摘要行，标注摘要允许概括中间成员帧的可见内容，除非与所给证据直接矛盾，不因此判 label_mismatch；成员中偶发的支付处理中等同 App 过渡屏是采集使然，不构成 off_task_members 的证据"
+extra_criteria = "补充审核约定：审核证据包含全部成员帧的完整 UI 树与截图，标注摘要允许概括成员帧的可见内容，除非与证据矛盾，不因概括措辞判 label_mismatch；成员中偶发的支付处理中等同 App 过渡屏是采集使然，不构成 off_task_members 的证据"
 
 [trace]
 enabled = true

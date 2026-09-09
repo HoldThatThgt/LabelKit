@@ -12,7 +12,6 @@ import json
 import os
 from dataclasses import dataclass, field, replace
 from pathlib import Path
-from types import SimpleNamespace
 
 from datasketch import MinHashLSH
 from jsonschema.validators import Draft202012Validator
@@ -167,8 +166,7 @@ def _check_profile_refs(ctx: _LoadCtx) -> None:
         # 与下面的 verify 同理: 阶段关闭时默认引用("default")不必存在(v1.7, R24 ①)
         _check_llm_ref(ctx, f"{fp}:[classify].llm", p.classify.llm)
     if p.frame_classify.enabled:
-        # v1.12: enabled 即入存在性引用集; 永不入下方 vision 必需集(vision 语义分列
-        # 裁决——vision_resolved 自适应推导, segment V3 同款)
+        # 帧分类读取完整成员证据，UI 模态同时加入视觉校验。
         _check_llm_ref(ctx, f"{fp}:[frame.classify].llm", p.frame_classify.llm)
     if p.frame_annotate.enabled:
         # v1.12: enabled 即入存在性引用集(vision 登记见下方 ui 分支)
@@ -203,48 +201,62 @@ def _check_judge_panels(ctx: _LoadCtx) -> None:
                           f"non-empty, got {len(judges)}")
 
 
-def _vision_users(ctx: _LoadCtx) -> dict[str, set[str]]:
+def _quality_profiles(ctx: _LoadCtx, views: tuple[ClassView, ...]) -> tuple[str, ...]:
+    """汇总实际评分模式使用的剖面，包含按类覆盖后的模式。
+
+    @param ctx 校验上下文。
+    @param views 已解析的可达类视图。
+    @return 首次出现顺序的剖面名。
+    """
+    configs = tuple(view.quality for view in views) if ctx.p.classify.enabled and views else (ctx.p.quality,)
+    return tuple(dict.fromkeys(name for cfg in configs
+                               for name in (cfg.judges if cfg.mode == "pairwise" and cfg.judges else (cfg.llm,))))
+
+
+def _vision_users(ctx: _LoadCtx, views: tuple[ClassView, ...]) -> dict[str, set[str]]:
     """收集 UI 模态下必须具备 vision 能力的 profile → 引用它的阶段名集合。
 
-    v1.11 (V3): segment 对 vision 是**自适应**的(vision_resolved 解析产物), 永不入本
-    集合——原先受 use_vision 把守的分支已失去可失败性。
+    普通流所有实际读取 UI 成员的阶段都保留全图，必须具有视觉能力。
 
     @param ctx 校验上下文
+    @param views 已解析的可达类视图。
     @return profile 名 → 阶段名集合
     """
     p = ctx.p
     users: dict[str, set[str]] = {}
+    if p.segment.enabled and p.segment.strategy in ("llm", "hybrid"):
+        users.setdefault(p.segment.llm, set()).add("segment")
+    if p.frame_classify.enabled:
+        users.setdefault(p.frame_classify.llm, set()).add("frame.classify")
     if p.classify.enabled:
         users.setdefault(p.classify.llm, set()).add("classify")
     if p.extract.enabled:
         users.setdefault(p.extract.llm, set()).add("extract")   # v1.8 S30: 恒读相邻截图
-    if p.quality.enabled and not p.segment.enabled:
-        # v1.8 S30 放宽: 流模式的质量打分把序列当纯文本评(转移 + 帧摘要, 不附图)
-        refs = (p.quality.judges if p.quality.judges and p.quality.mode == "pairwise"
-                else (p.quality.llm,))
-        for name in refs:
+    if p.quality.enabled:
+        for name in _quality_profiles(ctx, views):
             users.setdefault(name, set()).add("quality")
     if p.annotate.enabled:
         users.setdefault(p.annotate.llm, set()).add("annotate")
     if p.frame_annotate.enabled:
-        # v1.12(vision 语义分列): frame.annotate.llm 在 ui ∧ enabled 时无条件入 vision
-        # 必需集(截图是帧标注主证据, 镜像序列级 annotate); frame.classify.llm 永不入
-        # 此集——附图与否由 vision_resolved 解析产物自适应决定。
+        # 帧标注读取完整图像，与其他 UI 成员请求使用相同视觉约束。
         users.setdefault(p.frame_annotate.llm, set()).add("frame.annotate")
     if p.verify.enabled:
         for name in (p.verify.judges or (p.verify.llm,)):
             users.setdefault(name, set()).add("verify")
+    if p.segment.enabled and users and p.output.max_repair_attempts > 0 and p.output.repair_llm:
+        users.setdefault(p.output.repair_llm, set()).add("output.repair")
     return users
 
 
-def _check_vision_profiles(ctx: _LoadCtx) -> None:
+def _check_vision_profiles(ctx: _LoadCtx, products: _Products) -> None:
     """UI 模态下, 被视觉必需阶段引用的 profile 须 ``supports_vision = true``。
 
     @param ctx 校验上下文
+    @param products 已解析的类视图。
     """
     if ctx.modality != "ui":
         return
-    for name, stages in _vision_users(ctx).items():
+    for name, stages in _vision_users(ctx, tuple(products.class_views.values())).items():
         prof = ctx.llm_profiles.get(name)
         if prof is not None and not prof.supports_vision:
             ctx.col.error(f"{ctx.fc}:[llm.{name}].supports_vision: a profile referenced by "
@@ -422,17 +434,17 @@ def _check_flat_generate_only(ctx: _LoadCtx) -> None:
     # standalone_count >= 1 已在解析期强制
 
 
-def _collect_referenced(ctx: _LoadCtx) -> set[str]:
+def _collect_referenced(ctx: _LoadCtx, views: tuple[ClassView, ...]) -> set[str]:
     """规则 12: 汇总"被启用阶段真正会拨号"的 profile 集合。
 
     评审团只在 PAIRWISE 模式取代 quality.llm(spec 3.4.4: 逐条打分恒用 quality.llm;
     另见 cli.referenced_profiles)——引用集必须与运行期一致。
 
     @param ctx 校验上下文
+    @param views 已解析的可达类视图。
     @return profile 名集合
     """
     p = ctx.p
-    judges_active = bool(p.quality.judges) and p.quality.mode == "pairwise"
     referenced: set[str] = set()
     if p.segment.enabled and p.segment.strategy in ("llm", "hybrid"):
         referenced.add(p.segment.llm)      # v1.8, S30 引用集要点②
@@ -447,7 +459,7 @@ def _collect_referenced(ctx: _LoadCtx) -> set[str]:
     if p.extract.enabled:
         referenced.add(p.extract.llm)      # v1.8, S30 引用集要点②
     if p.quality.enabled:
-        referenced |= set(p.quality.judges) if judges_active else {p.quality.llm}
+        referenced.update(_quality_profiles(ctx, views))
     if p.annotate.enabled:
         referenced.add(p.annotate.llm)
     if p.generate.enabled and p.generate.form == "flat":
@@ -459,7 +471,7 @@ def _collect_referenced(ctx: _LoadCtx) -> set[str]:
                            if isinstance((value := raw.get(key)), str) and value}
     if p.verify.enabled:
         referenced |= set(p.verify.judges) if p.verify.judges else {p.verify.llm}
-    if p.output.repair_llm is not None:
+    if p.output.repair_llm is not None and (not p.segment.enabled or p.output.max_repair_attempts > 0):
         referenced.add(p.output.repair_llm)
     return referenced
 
@@ -474,7 +486,7 @@ def _collect_referenced_profiles(ctx: _LoadCtx, products: _Products) -> None:
     @param ctx 校验上下文
     @param products 产物累加器(填充 ``referenced``)
     """
-    products.referenced = _collect_referenced(ctx)
+    products.referenced = _collect_referenced(ctx, tuple(products.class_views.values()))
 
 
 def _resolve_and_probe_hook(ctx: _LoadCtx, loc: str, ref: str, arity: int,
@@ -763,9 +775,6 @@ def _check_stream_keys(ctx: _LoadCtx) -> None:
     if p.segment.window < 2:
         col.error(f"{fp}:[segment].window: expected an integer >= 2 (a sliding window must "
                   f"contain at least one adjacent frame pair), got {p.segment.window}")
-    if not 2 <= p.annotate.sequence_frames <= 100:
-        col.error(f"{fp}:[annotate].sequence_frames: expected an integer in [2, 100], "
-                  f"got {p.annotate.sequence_frames}")
 
 
 def _warn_segment_on(ctx: _LoadCtx, selector: str) -> None:
@@ -775,29 +784,13 @@ def _warn_segment_on(ctx: _LoadCtx, selector: str) -> None:
     @param selector 全局生效的准则选择器
     """
     col, fp, p = ctx.col, ctx.fp, ctx.p
-    if p.annotate.sequence_frames > 20:
-        prof_a = ctx.llm_profiles.get(p.annotate.llm)
-        if prof_a is not None and prof_a.max_image_px > 2000:
-            # S28: Anthropic 对 >20 图请求硬拒任一边 >2000px 的图(400, 非自动缩放)
-            col.warn(f"{fp}:[annotate].sequence_frames: sequence_frames = "
-                     f"{p.annotate.sequence_frames} > 20 and the profile referenced by "
-                     f"annotate [llm.{p.annotate.llm}] has max_image_px = "
-                     f"{prof_a.max_image_px} > 2000 - Anthropic hard-rejects >20-image "
-                     f"requests carrying any image with an edge > 2000px (400, not "
-                     f"auto-downscaled); set max_image_px <= 2000 or lower "
-                     f"sequence_frames back to <= 20")
-    if p.stream.session_max_len > p.run["batch_size"]:
-        col.warn(f"{fp}:[stream].session_max_len: session_max_len = "
-                 f"{p.stream.session_max_len} > run.batch_size = {p.run['batch_size']}; "
-                 f"over-long sessions will be hard-cut by M10 and marked "
-                 f"session_split (S21)")
     _warn_segment_strategy(ctx)
     # S29 组合提示: 仅当**生效准则**就是轨迹准则时才提示(含空选择器的流模式解析)——
     # 显式选了 default:text/ui/inline 的用户是按自己的准则打分, 不该被告知在打轨迹分。
     if p.quality.enabled and not p.extract.enabled and selector == "default:trajectory":
         col.warn(f"{fp}:[quality].enabled: segment.enabled = true and "
                  f"extract.enabled = false, so trajectory scoring (default:trajectory) "
-                 f"evaluates \"frame-to-frame change\" from frame digests instead of a "
+                 f"evaluates \"frame-to-frame change\" from complete member evidence instead of a "
                  f"structured action sequence - enable [extract] to score by action sequence")
 
 
@@ -818,7 +811,7 @@ def _warn_segment_strategy(ctx: _LoadCtx) -> None:
                  f'switch strategy to "llm" or "hybrid" to stitch at task granularity')
     if p.stitch_provided["non_switch_keys"] and not p.stitch.enabled:
         # v1.9 T17: 停放清单告警在 segment-off 分支——本组合(stitch 关、segment 开且带
-        # 载荷)自成一条告警(sequence_frames 先例)
+        # 载荷)自成一条告警。
         col.warn(f"{fp}:[stitch].enabled: stitch.enabled = false, the remaining [stitch] "
                  f"keys will have no effect and are ignored (keeping the config with the "
                  f"switch off is legal)")
@@ -847,10 +840,6 @@ def _warn_segment_off(ctx: _LoadCtx) -> None:
         col.warn(f"{fp}:[segment].enabled: segment.enabled = false, "
                  f"{_avail(tuple(parked))} will have no effect and is ignored (keeping the "
                  f"config with the switch off is legal)")
-    if p.sequence_frames_provided:
-        col.warn(f"{fp}:[annotate].sequence_frames: segment.enabled = false; "
-                 f"sequence_frames only applies to sequence annotation (stream mode), so "
-                 f"it has no effect")
 
 
 def _check_stream_family(ctx: _LoadCtx, products: _Products) -> None:
@@ -1062,10 +1051,8 @@ def _check_removed_use_vision(ctx: _LoadCtx) -> None:
     @param ctx 校验上下文
     """
     if ctx.p.segment_provided["use_vision"]:
-        ctx.col.error(f"{ctx.fp}:[segment].use_vision: segment.use_vision was removed in "
-                      f"v1.11: whether a window carries images is derived automatically "
-                      f"from supports_vision of the profile named by segment.llm; point "
-                      f"segment.llm at a text-only profile for text-only judgments (V2)")
+        ctx.col.error(f"{ctx.fp}:[segment].use_vision: removed; UI segment requests require "
+                      f"all member images and a vision-capable profile")
 
 
 def _freeze_vision(ctx: _LoadCtx) -> _LoadCtx:
@@ -1109,7 +1096,7 @@ def _warn_segment_image_limit(ctx: _LoadCtx) -> None:
 
 
 def _warn_undeclared_windows(ctx: _LoadCtx, products: _Products) -> None:
-    """V6: 被启用阶段引用却未声明上下文窗口的 profile 各出一条 WARN(非阻断, 带声明建议)。
+    """检查实际启用档案的窗口；普通流必须声明正容量。
 
     @param ctx 校验上下文
     @param products 产物累加器(读取引用集)
@@ -1117,51 +1104,27 @@ def _warn_undeclared_windows(ctx: _LoadCtx, products: _Products) -> None:
     for name in sorted(products.referenced):
         prof_r = ctx.llm_profiles.get(name)
         if prof_r is not None and prof_r.context_window == 0:
+            if ctx.p.segment.enabled:
+                ctx.col.error(f"{ctx.fc}:[llm.{name}].context_window: process sequences require a positive "
+                              "deployment context window for every enabled model profile")
+                continue
             ctx.col.warn(f"{ctx.fc}:[llm.{name}].context_window: referenced by an enabled "
                          f"stage but not declared (0 = context budget off for this profile) "
                          f"- declare the deployment-effective window (e.g. context_window = "
                          f"131072; under-declaring is always safe, it only trims more and "
                          f"never overflows, V6/V26)")
     dedup = ctx.p.dedup
-    if dedup.semantic and dedup.semantic_embedding in ctx.embedding_profiles:
+    if dedup.enabled and dedup.semantic and dedup.semantic_embedding in ctx.embedding_profiles:
         prof_e = ctx.embedding_profiles[dedup.semantic_embedding]
         if prof_e.context_window == 0:
+            if ctx.p.segment.enabled:
+                ctx.col.error(f"{ctx.fc}:[embedding.{prof_e.name}].context_window: process sequences require "
+                              "a positive deployment context window for semantic deduplication")
+                return
             ctx.col.warn(f"{ctx.fc}:[embedding.{prof_e.name}].context_window: referenced by "
                          f"an enabled stage but not declared (0 = embedding budget off for "
                          f"this profile) - declare the deployment-effective window "
                          f"(under-declaring is always safe, V6/V15)")
-
-
-def _check_min_window(ctx: _LoadCtx) -> None:
-    """V9 静态护栏: 声明预算下, segment 的最坏保证装填量须容得下地板帧数。
-
-    verify repair 下地板为 3(固定的三帧成员复裁窗, F14: policy="drop" 不建复裁窗,
-    地板保持 2)。
-
-    @param ctx 校验上下文
-    """
-    p = ctx.p
-    prof_seg = ctx.llm_profiles.get(p.segment.llm)
-    if not (p.segment.enabled and p.segment.strategy in ("llm", "hybrid")
-            and prof_seg is not None and prof_seg.context_window > 0):
-        return
-    w_min = budget.min_window(
-        SimpleNamespace(segment=p.segment, llm_profiles=ctx.llm_profiles))
-    floor = 3 if (p.verify.enabled and p.verify.policy == "repair"
-                  and p.segment.enabled) else 2
-    if w_min < floor:
-        ctx.col.error(f"{ctx.fp}:[segment].window: worst-case guaranteed packing size "
-                      f"w_min = {w_min} < floor = {floor} (profile [llm.{p.segment.llm}], "
-                      f"context_window = {prof_seg.context_window}) - any frame must "
-                      f"statically fit into a {floor}-frame window (the verify repair "
-                      f"re-judgment window is always 3 frames); raise context_window, lower "
-                      f"segment.digest_max_chars or switch profile (V9)")
-    elif w_min == floor:
-        ctx.col.warn(f"{ctx.fp}:[segment].window: worst-case guaranteed packing size "
-                     f"w_min = {w_min} == floor - degenerate shape: every frame is a seam "
-                     f"and every frame is judged twice, so the window count explodes (a "
-                     f"full 200-frame session takes up to 199 windows, roughly 18x the call "
-                     f"volume of the default 20-frame shape, V9)")
 
 
 def _rubric_est(rub: Rubric, mode: str) -> int:
@@ -1249,8 +1212,7 @@ def _static_checks_scoring(ctx: _LoadCtx, views: tuple[ClassView, ...],
                    if products.model_user_schema else "")
     checks: list[tuple[str, tuple, int]] = []
     if p.quality.enabled:
-        judges_active = bool(p.quality.judges) and p.quality.mode == "pairwise"
-        q_profiles = p.quality.judges if judges_active else (p.quality.llm,)
+        q_profiles = _quality_profiles(ctx, views)
         checks.append(("quality", tuple(q_profiles),
                        budget.TEMPLATE_HEAD_TOKENS["quality"]
                        + max([_rubric_est(products.rubric, p.quality.mode)]
@@ -1407,7 +1369,6 @@ def _check_budget_and_vision(ctx: _LoadCtx, products: _Products, len_max: int) -
     ctx = _freeze_vision(ctx)
     _warn_segment_image_limit(ctx)
     _warn_undeclared_windows(ctx, products)
-    _check_min_window(ctx)
     _check_static_budget(ctx, products, len_max)
     _warn_stitch_card_pool(ctx)
     return ctx
@@ -1579,16 +1540,16 @@ def validate(ctx: _LoadCtx, products: _Products) -> _LoadCtx:
     _check_cli_overrides(ctx)
     _check_minhash_threshold(ctx)
     _check_profile_refs(ctx)
-    _check_vision_profiles(ctx)
     _check_dedup_semantic(ctx)
     _check_cross_field(ctx)
     _check_generation_form(ctx)
     _check_run_mode(ctx)
-    _collect_referenced_profiles(ctx, products)
     ctx = _resolve_annotation_postprocessors(ctx)
     _load_schema_and_hooks(ctx, products)
     _resolve_global_rubric(ctx, products)
     ctx = _check_classify_and_views(ctx, products)
+    _check_vision_profiles(ctx, products)
+    _collect_referenced_profiles(ctx, products)
     _check_stage_matrix(ctx)
     _check_stream_family(ctx, products)
     _check_frame_family(ctx, products)

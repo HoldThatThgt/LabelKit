@@ -24,6 +24,7 @@ from labelkit.common.errors import (
     InternalError,
     ProviderFatalError,
     ProviderRetryableError,
+    SessionCapacityError,
 )
 from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
 from labelkit.common.contracts.generation import DedupGroupRequest, DedupReservation
@@ -266,6 +267,7 @@ class DedupIndex:
 
         @return 无
         """
+        self._ordinary_generation = getattr(self, "_ordinary_generation", -1) + 1
         self._exact: dict[bytes, str] = {}              # 精确键摘要 → 保留记录 id
         self._digest_by_id: dict[str, bytes] = {}       # 记录 id → 精确键摘要
         self._lsh = MinHashLSH(
@@ -460,6 +462,7 @@ class DedupIndex:
         @param detail 本记录的探测便签
         @return 无
         """
+        self._ordinary_generation += 1
         self._exact[detail.digest] = rec_id
         self._digest_by_id[rec_id] = detail.digest
         if detail.minhash is not None:
@@ -479,6 +482,7 @@ class DedupIndex:
         @param rec_id 记录 id
         @return 无
         """
+        self._ordinary_generation += 1
         digest = self._digest_by_id.pop(rec_id, None)
         if digest is not None and self._exact.get(digest) == rec_id:
             del self._exact[digest]
@@ -519,6 +523,7 @@ class DedupIndex:
         @param vec 单位向量
         @return 无
         """
+        self._ordinary_generation += 1
         v = np.asarray(vec, dtype=np.float64)
         if self._vec_buf is None:
             self._vec_buf = np.empty((16, v.shape[0]), dtype=np.float64)
@@ -841,6 +846,26 @@ class DedupStage:
         self.index = index
         self._counted_clusters: set[str] = set()   # 运行级去重后的重复簇集合
 
+    async def reserve_session(self, batch: list[PipelineItem], ctx: "RunContext"):
+        """暂存当前会话的普通去重判决。@param batch 本次信封。@param ctx 会话上下文。@return 未提交增量。"""
+        from labelkit.operators.dedup_session import reserve_session
+
+        return await reserve_session(self, batch, ctx)
+
+    def commit_session(self, reservation) -> None:
+        """提交最终会话去重增量。@param reservation 当前阶段拥有的增量。"""
+        reservation.commit(self)
+
+    def discard_session(self, reservation) -> None:
+        """释放未提交会话去重增量。@param reservation 当前阶段拥有的增量。"""
+        reservation.discard(self)
+
+    def preview_capacity(self, item: PipelineItem, ctx: "RunContext"):
+        """预览完整序列的 embedding 容量。@param item 候选。@param ctx 上下文。@return 容量失败或空。"""
+        from labelkit.operators.dedup_session import preview_capacity
+
+        return preview_capacity(self, item, ctx)
+
     async def run(self, batch: list[PipelineItem], ctx: "RunContext") -> list[PipelineItem]:
         """投机取得静态 semantic 结果，再按输入序完成全层判重提交。
 
@@ -849,9 +874,27 @@ class DedupStage:
         @return 原列表（就地改状态，元素永不移除）
         @raises CircuitBreakerTripped 熔断器已跳闸（批级传播）
         """
-        if self.cfg.scope == "batch":
+        if self.cfg.scope == "batch" and ctx.session_attempt is None:
             self.index.reset()
+        prepared, errors = self._prepare_records(batch, ctx)
+        self._settle_preparation_errors(errors, ctx)
+        outcomes = await self._run_embeddings(prepared, ctx)
+        self._record_embedding_failures(outcomes, ctx)
+        for value in prepared:
+            try:
+                self._reduce_one(value, outcomes.get(value.ordinal), ctx)
+            except (CircuitBreakerTripped, SessionCapacityError, KeyboardInterrupt, asyncio.CancelledError):
+                raise
+            except Exception as exc:
+                _LOGGER.debug("record-level dedup failure: %s", type(exc).__name__,
+                              extra={"stage": self.name, "batch": ctx.batch_no})
+                self._fail_item(value.item, exc, ctx)
+        return batch
+
+    def _prepare_records(self, batch, ctx):
+        """冻结整轮去重输入与同步错误。@param batch 输入信封。@param ctx 运行上下文。@return 计划与错误。"""
         prepared: list[_PreparedRecord] = []
+        errors = []
         for item in batch:
             if item.status != "active":
                 continue
@@ -861,24 +904,18 @@ class DedupStage:
                 if self.cfg.semantic and self._semantic_participates(detail):
                     embed_input = self._embed_input(detail, ctx)
                 prepared.append(_PreparedRecord(len(prepared), item, detail, embed_input))
-            except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
+            except (CircuitBreakerTripped, SessionCapacityError, KeyboardInterrupt, asyncio.CancelledError):
                 raise
             except Exception as exc:  # 单条失败绝不逃逸到批级
-                _LOGGER.debug("record-level dedup failure: %s", type(exc).__name__,
+                _LOGGER.error("record-level dedup preparation failure: %s", type(exc).__name__,
                               extra={"stage": self.name, "batch": ctx.batch_no})
-                self._fail_item(item, exc, ctx)
-        outcomes = await self._run_embeddings(prepared, ctx)
-        self._record_embedding_failures(outcomes, ctx)
-        for value in prepared:
-            try:
-                self._reduce_one(value, outcomes.get(value.ordinal), ctx)
-            except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
-                raise
-            except Exception as exc:
-                _LOGGER.debug("record-level dedup failure: %s", type(exc).__name__,
-                              extra={"stage": self.name, "batch": ctx.batch_no})
-                self._fail_item(value.item, exc, ctx)
-        return batch
+                errors.append((item, exc))
+        return prepared, errors
+
+    def _settle_preparation_errors(self, errors, ctx):
+        """派发向量请求前结算全部同步错误。@param errors 声明序错误。@param ctx 运行上下文。"""
+        for item, error in errors:
+            self._fail_item(item, error, ctx)
 
     async def _run_embeddings(
         self, prepared: list[_PreparedRecord], ctx: "RunContext"
@@ -899,7 +936,7 @@ class DedupStage:
         ) for value in active)
         if not tasks:
             return {}
-        results = await ctx.tasks.run_group(TaskGroupRequest(tasks=tasks))
+        results = await ctx.run_group(TaskGroupRequest(tasks=tasks))
         return {value.ordinal: result for value, result in zip(active, results, strict=True)}
 
     async def _embed_one(
@@ -1072,8 +1109,12 @@ class DedupStage:
             payload=payload,
         )
         ctx.metrics.count(f"dedup.{info.kind}")
-        if info.cluster_key not in self._counted_clusters:
-            self._counted_clusters.add(info.cluster_key)
+        self._count_cluster(info.cluster_key, ctx)
+
+    def _count_cluster(self, cluster_key: str, ctx: "RunContext") -> None:
+        """记录首次出现的重复簇。@param cluster_key 簇键。@param ctx 观测上下文。"""
+        if cluster_key not in self._counted_clusters:
+            self._counted_clusters.add(cluster_key)
             ctx.metrics.count("dedup.clusters")
 
     @staticmethod
@@ -1144,5 +1185,11 @@ class DedupStage:
         cap = budget.embed_budget(prof)
         if budget.est_text(text) <= cap:
             return text
+        if ctx.session_attempt is not None:
+            _LOGGER.error("complete sequence embedding input exceeds context capacity", extra=_LOG_EXTRA)
+            raise ContextOverflowError(
+                "complete sequence embedding input exceeds context capacity",
+                phase="precheck", profile=self.cfg.semantic_embedding,
+            )
         ctx.metrics.count("budget.truncations.dedup")
         return budget.fit_text(text, cap, keep="head")

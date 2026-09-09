@@ -7,6 +7,8 @@ payload shape. Pure logic only — no LLM: the schema engine is replaced by the
 in-process complete_validated stubs (test_classify 惯例)."""
 from __future__ import annotations
 
+from labelkit.common.contracts.stage import RunContext
+
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
@@ -24,6 +26,7 @@ from labelkit.common.config.model import (
     ExtractConfig,
     GenerateConfig,
     InputConfig,
+    LLMProfile,
     OutputConfig,
     QualityConfig,
     ResolvedConfig,
@@ -77,7 +80,8 @@ def make_cfg(*, include_diff=True, instruction="", on_error="fallback",
     return ResolvedConfig(
         tool=ToolConfig(),
         console=ConsoleConfig(),
-        llm_profiles={},
+        llm_profiles={"default": LLMProfile("default", "openai_compatible", "http://unused.invalid/v1",
+                                            "unit", "UNUSED", context_window=32768, supports_vision=True)},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="ui", input="in"),
         input=InputConfig(),
@@ -242,8 +246,12 @@ class TaskRunner:
         return tuple(results)
 
 
+def _llm():
+    return SimpleNamespace(calibrator=SimpleNamespace(cost=lambda profile: 37))
+
+
 def make_ctx(cfg, engine):
-    return SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
+    return RunContext(cfg=cfg, llm=_llm(), schema_engine=engine,
                            metrics=RecordingMetrics(), tasks=TaskRunner(),
                            task_namespace="run:batch:1:stage:extract",
                            rng=None, batch_no=1)
@@ -282,7 +290,7 @@ def test_user_message_five_parts_two_images_diff_and_digest_tail():
     # the diff line uses the same fixed form as M14's §10.9 rendering
     assert msg.parts[4].text == (
         "[树变更摘要] 新增 0 节点，移除 0 节点，文本变化 1 处，变更比例 50%，标题变化\n"
-        f"[前后帧树摘要] {frame_digest(f0, 400)} → {frame_digest(f1, 400)}"
+        f"[前一帧完整控件树]\n{f0.ui_tree.serialize()}\n[后一帧完整控件树]\n{f1.ui_tree.serialize()}"
     )
 
 
@@ -294,7 +302,7 @@ def test_include_diff_false_omits_diff_line_keeps_digest_tail():
     # the closing text part is always present)
     assert [p.kind for p in msg.parts] == ["text", "image", "text", "image", "text"]
     assert msg.parts[4].text == (
-        f"[前后帧树摘要] {frame_digest(f0, 400)} → {frame_digest(f1, 400)}")
+        f"[前一帧完整控件树]\n{f0.ui_tree.serialize()}\n[后一帧完整控件树]\n{f1.ui_tree.serialize()}")
     assert "[树变更摘要]" not in msg.parts[4].text
 
 
@@ -732,7 +740,7 @@ def test_reactive_400_fallback_feeds_breaker_once():
     f0, f1 = frame("f0" * 8, "首页"), frame("f1" * 8, "搜索结果页")
     item = PipelineItem(record=episode([f0, f1]), status="active")
     exc = ContextOverflowError("sniff", phase="reactive")   # origin defaults http_400
-    ctx = SimpleNamespace(cfg=cfg, llm=None,
+    ctx = RunContext(cfg=cfg, llm=_llm(),
                           schema_engine=PairEngine({(f0.id, f1.id): exc}),
                           metrics=FeedMetrics(), tasks=TaskRunner(),
                           task_namespace="run:batch:1:stage:extract",
@@ -744,7 +752,7 @@ def test_reactive_400_fallback_feeds_breaker_once():
     exc200 = ContextOverflowError("finish", phase="reactive")
     exc200.origin = "finish"
     item2 = PipelineItem(record=episode([f0, f1]), status="active")
-    ctx2 = SimpleNamespace(cfg=cfg, llm=None,
+    ctx2 = RunContext(cfg=cfg, llm=_llm(),
                            schema_engine=PairEngine({(f0.id, f1.id): exc200}),
                            metrics=FeedMetrics(), tasks=TaskRunner(),
                            task_namespace="run:batch:1:stage:extract",

@@ -1,0 +1,2 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "visible": true, "bounds": [0, 0, 256, 256], "package": "com.example.warehouse"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "AUDIT-25 inventory card inspection step 6. Full visible evidence tail KEEP-TREE-6.", "visible": true, "bounds": [0, 0, 256, 70], "package": "com.example.warehouse"}

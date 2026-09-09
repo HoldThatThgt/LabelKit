@@ -69,7 +69,7 @@ def test_execution_protocols_expose_only_the_frozen_methods():
     }.issubset(vars(execution.ResourceLimiter))
 
 
-def test_run_context_has_eight_required_fields_in_contract_order():
+def test_run_context_has_eight_required_fields_and_explicit_optional_session_scope():
     stage = importlib.import_module("labelkit.common.contracts.stage")
 
     assert [field.name for field in fields(stage.RunContext)] == [
@@ -81,11 +81,15 @@ def test_run_context_has_eight_required_fields_in_contract_order():
         "metrics",
         "tasks",
         "task_namespace",
+        "session_attempt",
+        "capacity_checker",
     ]
     assert all(
         parameter.default is inspect.Parameter.empty
-        for parameter in inspect.signature(stage.RunContext).parameters.values()
+        for parameter in list(inspect.signature(stage.RunContext).parameters.values())[:8]
     )
+    assert all(parameter.default is None
+               for parameter in list(inspect.signature(stage.RunContext).parameters.values())[8:])
 
 
 def test_run_services_and_generation_services_require_the_same_task_identity():

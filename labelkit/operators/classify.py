@@ -30,9 +30,11 @@ from labelkit.common.contracts.types import (
     PipelineItem,
     Record,
     StageError,
-    frame_digest,
 )
 from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
+from labelkit.common.contracts.sequence_capacity import (
+    CapacityTarget, SessionCapacityFailure, capacity_target, raise_session_capacities, raise_session_capacity,
+)
 
 from labelkit.common.inference import budget
 from labelkit.common.inference.llm_client import Message, Part, PromptBundle
@@ -40,6 +42,9 @@ from labelkit.common.inference.schema_engine import (
     CallScope,
     classification_schema,
     frame_classify_schema,
+)
+from labelkit.common.inference.sequence_evidence import (
+    CapacityRequest, preview_failure, record_evidence, request_overflow, sequence_parts, terminal_error,
 )
 
 if TYPE_CHECKING:
@@ -71,10 +76,8 @@ _LABEL_EXAMPLE_TMPL = "[类别示例·{name}] {example}"
 _LABEL_RECORD = "[待分类数据]"
 _LABEL_SCREENSHOT = "[屏幕截图]"
 _LABEL_UI_TREE = "[UI 控件树]"
-# v1.8 序列变体标签 + 截断标记（CONTRACTS §10.8 [FROZEN HERE]）。
+# 完整序列变体标签（CONTRACTS §10.8）。
 _LABEL_RECORD_SEQ = "[待分类数据·序列]"
-_LABEL_FIRST_FRAME = "[首帧截图]"
-_SEQ_TRUNCATION_MARKER = "…(truncated {n} members)"
 
 # ── v1.12 帧级批量判决（SPEC-frame-annotation §3.2，实现后 verbatim 捕进 CONTRACTS §10.12）──
 # 事件与计数器：命名空间 frame_classify.* 与序列级 classify.* 严格分离（计数命名空间裁决）。
@@ -93,11 +96,11 @@ _MAX_FRAME_DEGRADE_LEVELS = 2
 # 常量形，1–2 字符代入量由 margin 吸收，V7）。
 _FRAME_SYSTEM_HEAD = (
     "[任务]\n"
-    "你是数据流的逐帧分类员。下面给出同一会话中按时间顺序排列的 {N} 帧成员摘要，"
+    "你是数据流的逐帧分类员。下面给出同一会话中按时间顺序排列的 {N} 帧完整成员证据，"
     "对每一帧独立判断它属于以下类别中的哪一类，只能从以下封闭类别表中取恰一值。类别表："
 )
 _FRAME_STRUCTURE = ('{"labels": [<第 1 帧类名>, <第 2 帧类名>, ...]}'
-                    "（恰 {N} 项，按帧序与成员摘要行对齐）")
+                    "（恰 {N} 项，按帧序与成员证据对齐）")
 _LABEL_FRAME_MEMBERS = "[会话成员帧]"
 _LABEL_MEMBER_SCREENSHOT = "[成员 {i} 截图]"
 _FRAME_MEMBER_LINE = "{m}. {digest}"
@@ -132,6 +135,7 @@ class _FrameEpisodePlan:
     digests: tuple[str, ...]
     spans: tuple[tuple[int, int], ...]
     budget_on: bool
+    target: CapacityTarget | None = None  # 处理流显式成员出现位置与视图归属
 
 
 @dataclass
@@ -221,36 +225,6 @@ def _fit_tree_text(rendered: str, budget_tokens: int) -> tuple[str, bool]:
     return candidate(lo), True
 
 
-def _fit_digest_body(body: str, budget_tokens: int) -> tuple[str, bool]:
-    """§3.3③ 序列摘要正文的同族上限。
-
-    已按字符数封顶的 _sequence_digest_block 输出以 est_text 复核；超出份额时丢弃
-    **中间**成员行（首末恒保留），并以冻结标记 "…(truncated N members)" 收尾——
-    即该块自有的 §10.8 截断约定（标记置于最后一条成员行之后），N 累加到既有标记
-    的计数上。
-
-    @param body 摘要正文（每成员一行）
-    @param budget_tokens 本槽位可用的 token 份额
-    @return (修剪后的正文, 是否发生修剪)
-    """
-    if budget.est_text(body) <= budget_tokens:
-        return body, False
-    lines = body.split("\n")
-    base = 0
-    m = re.match(r"^…\(truncated (\d+) members\)$", lines[-1])
-    if m is not None:
-        base = int(m.group(1))
-        lines = lines[:-1]
-    n = len(lines)
-    if n > 2:
-        for keep_middle in range(n - 3, -1, -1):
-            marker = _SEQ_TRUNCATION_MARKER.format(n=base + n - 2 - keep_middle)
-            cand = "\n".join(lines[: 1 + keep_middle] + [lines[-1], marker])
-            if budget.est_text(cand) <= budget_tokens:
-                return cand, True
-    return _SEQ_TRUNCATION_MARKER.format(n=base + n), True
-
-
 def _feed_reactive_terminal(exc: BaseException, metrics) -> None:
     """A7/§7.8 熔断矩阵：只有 reactive-400（响应体嗅探）溢出终局喂致命连续计数。
 
@@ -294,65 +268,14 @@ def _prompt_fit(record: Record, cfg: "ResolvedConfig", ctx: "RunContext",
     return _PromptFit(input_budget=b, image_cost=cost)
 
 
-def _sequence_digest_block(record: Record, cfg: "ResolvedConfig") -> str:
-    """§10.8 序列变体的 episode 摘要正文（spec 3.13.3 序列行）。
-
-    按成员序每成员一行——"{m}. {frame_digest(member, segment.digest_max_chars)}"，
-    序号 1-based——**总长**以 input.ui_tree_max_chars 封顶。超出上限时整行丢弃
-    **中间**行（首末成员恒保留，幸存序号自然暴露缺口），并以冻结标记行
-    "…(truncated N members)" 收尾，N = 被省略的成员行数（UITree.serialize 截断约定）。
-
-    @param record 序列记录（episode / thread）
-    @param cfg 本次运行的解析配置
-    @return 摘要正文文本
-    """
-    max_chars = cfg.input.ui_tree_max_chars
-    lines = [f"{m}. {frame_digest(member, cfg.segment.digest_max_chars)}"
-             for m, member in enumerate(record.members, start=1)]
-    full = "\n".join(lines)
-    if len(full) <= max_chars:
-        return full
-
-    n = len(lines)
-    # prefix_len[k] = len("\n".join(lines[:k]))——serialize 的前缀和手法。
-    prefix_len = [0] * (n + 1)
-    for i, line in enumerate(lines):
-        prefix_len[i + 1] = prefix_len[i] + (1 if i else 0) + len(line)
-    last_len = len(lines[-1])
-    # 保留首行、尽可能长的中间行前缀、以及末行；既然已超上限，至少要丢一条中间行，
-    # 故保留的中间行数取值域为 [0, n-3]，标记恒收尾。
-    for keep_middle in range(n - 3, -1, -1):
-        marker = _SEQ_TRUNCATION_MARKER.format(n=n - 2 - keep_middle)
-        total = (prefix_len[1 + keep_middle] + 1 + last_len + 1 + len(marker))
-        if total <= max_chars:
-            return "\n".join(lines[: 1 + keep_middle] + [lines[-1], marker])
-    # 退化上限（连首 + 末 + 标记都塞不下，或 n <= 2）：serialize 的最后一档——
-    # 单条标记代表全部成员。
-    return _SEQ_TRUNCATION_MARKER.format(n=n)
-
-
 def build_classify_prompt(record: Record, cfg: "ResolvedConfig",
                           with_reason: bool) -> PromptBundle:
-    """CONTRACTS §10.8 模板的确定性装配（公开面冻结）。
+    """装配类别表、指令、示例和当前记录的完整分类请求。
 
-    system（单/多标签变体头、按 [[classify.classes]] 声明序的类别表、可选的
-    classify.instruction 行、带或不带 reason 片段的结构句），随后每条已配置类别
-    示例一条 user 消息（类别声明序，再数组序），最后是当前记录的 user 消息——
-    文本部件，或 §10.1 同形的三部件「截图 + 控件树」形（R27）。
-
-    v1.8 序列记录（record.kind == "sequence"，spec 3.13.3 序列行）：system 与
-    few-shot 消息不变；当前记录消息改为 §10.8 序列变体——[待分类数据·序列] 的
-    episode 摘要块，外加（仅 UI 模态——classify 恒在视觉引用集内）[首帧截图]
-    标签与首成员截图部件。
-
-    v1.11：冻结签名保持不动——预算路径经私有装配器的尾参 ``fit`` 进入
-    （classify_record），绝不经由此处。
-
-    @param record 待判决记录（单条或序列）
-    @param cfg 本次运行的解析配置
-    @param with_reason 是否索取一句话理由（R29）
-    @return 装配好的提示词包
-    """
+    @param record 普通记录或完整序列
+    @param cfg 已解析配置
+    @param with_reason 是否索取理由
+    @return 序列包含所有成员正文、可见树和图片的提示词"""
     return _assemble_classify(record, cfg, with_reason)
 
 
@@ -414,40 +337,6 @@ def _record_slot_budget(fit: _PromptFit, messages: Sequence[Message],
     return fit.input_budget - static_est
 
 
-def _sequence_record_parts(record: Record, cfg: "ResolvedConfig",
-                           slot_budget: int | None,
-                           fit: _PromptFit | None) -> tuple[Part, ...]:
-    """v1.8 序列变体（§10.8）的当前记录部件。
-
-    摘要文本部件在先；UI 模态追加 [首帧截图] 标签与**首成员**图像（由 M9 在调用
-    期编码）。文本模态的序列只携摘要部件。
-
-    @param record 序列记录
-    @param cfg 本次运行的解析配置
-    @param slot_budget 当前记录槽位份额；预算关时为 None
-    @param fit 本次调用的装填状态；预算关时为 None
-    @return 当前记录 user 消息的部件元组
-    """
-    digest_block = _sequence_digest_block(record, cfg)
-    if slot_budget is not None and fit is not None:
-        head_est = budget.est_text(f"{_LABEL_RECORD_SEQ}\n")
-        if record.modality == "ui":
-            head_est += budget.est_text(_LABEL_FIRST_FRAME)
-        digest_block, trimmed = _fit_digest_body(
-            digest_block, max(0, slot_budget - head_est))
-        if trimmed:
-            fit.truncations += 1
-    parts: tuple[Part, ...] = (
-        Part(kind="text", text=f"{_LABEL_RECORD_SEQ}\n{digest_block}"),
-    )
-    if record.modality == "ui":
-        parts += (
-            Part(kind="text", text=_LABEL_FIRST_FRAME),
-            Part(kind="image", image=record.members[0].image),
-        )
-    return parts
-
-
 def _ui_record_parts(record: Record, cfg: "ResolvedConfig",
                      slot_budget: int | None,
                      fit: _PromptFit | None) -> tuple[Part, ...]:
@@ -497,7 +386,7 @@ def _assemble_classify(record: Record, cfg: "ResolvedConfig", with_reason: bool,
 
     parts: tuple[Part, ...]
     if record.kind == "sequence":
-        parts = _sequence_record_parts(record, cfg, slot_budget, fit)
+        parts = sequence_parts(record, _LABEL_RECORD_SEQ)
     elif record.modality == "text":
         parts = (Part(kind="text", text=f"{_LABEL_RECORD} {record.text}"),)
     else:
@@ -560,6 +449,13 @@ def _classify_prompt(record: Record, ctx: "RunContext", schema: dict,
     @raises ContextOverflowError 连单条记录都装不下（phase="precheck"，V10）
     """
     cfg = ctx.cfg
+    if record.kind == "sequence" and cfg.run.mode == "process" and cfg.segment.enabled:
+        prompt = _assemble_classify(record, cfg, with_reason)
+        error = request_overflow(CapacityRequest(cfg.classify.llm, prompt, schema), ctx)
+        if error is not None:
+            _logger.warning("complete classification prompt exceeds context capacity")
+            raise error
+        return prompt
     fit = _prompt_fit(record, cfg, ctx, schema)
     prompt = _assemble_classify(record, cfg, with_reason, fit=fit)
     if fit is not None:
@@ -606,7 +502,8 @@ async def _call_classify_sample(plan: _ClassifyPlan,
     """
     obj, _usage, _attempts, _model = await ctx.schema_engine.complete_validated(
         ctx.cfg.classify.llm, plan.prompt, plan.schema,
-        scope=CallScope(record_ids=(plan.record.id,), batch_no=ctx.batch_no))
+        scope=CallScope(record_ids=(plan.record.id,), batch_no=ctx.batch_no,
+                        complete_evidence=ctx.session_attempt is not None))
     return obj
 
 
@@ -623,6 +520,8 @@ async def _run_classify_sample(plan: _ClassifyPlan,
     except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
         raise
     except Exception as exc:  # noqa: BLE001 — 普通记录级异常交给 reducer
+        if ctx.session_attempt is not None and isinstance(exc, ProviderFatalError):
+            raise
         _logger.debug("classification sample failed: item=%d exc=%s",
                       plan.item_ordinal, type(exc).__name__,
                       extra={"stage": "classify", "batch": ctx.batch_no})
@@ -744,24 +643,12 @@ async def classify_record(record: Record, ctx: "RunContext") -> Classification:
 
 def build_frame_classify_prompt(members: Sequence[Record], cfg: "ResolvedConfig",
                                 digests: Sequence[str]) -> PromptBundle:
-    """§10.12 帧级批量判决模板的确定性装配（公开面冻结）。
+    """确定性装配逐帧闭集分类请求。
 
-    system：_FRAME_SYSTEM_HEAD（{N} 代入窗内成员数）+ 帧类表行 "- name: description"
-    （[[frame.classify.classes]] 声明序）+ 结构句 + _FRAME_STRUCTURE 输出契约。
-    user：单条消息——[会话成员帧] 文本部件承载 1-based 摘要行（``digests`` 与
-    ``members`` 对齐，调用方按 segment.digest_max_chars 预计算，segment V9 同款——
-    装配器自身永不计算摘要）；frame_classify.vision_resolved 时每成员追加
-    "[成员 i 截图]" 文本标签 + image part（工作点 = profile 图像工作点，M9 编码期
-    生效——镜像 segment 窗口判决的视觉形态）。
-
-    v1.11 形态延续：冻结签名不动——预算路径经私有装配器 _assemble_frame_classify
-    的尾参 ``fit`` 进入（build_classify_prompt 的「公开面冻结 + 私有 fit 尾参」同款）。
-
-    @param members 窗内成员帧记录（按帧序）
-    @param cfg 本次运行的解析配置
-    @param digests 与 ``members`` 对齐的成员摘要（调用方预计算）
-    @return 装配好的提示词包
-    """
+    @param members 本次请求的全部成员
+    @param cfg 已解析配置
+    @param digests 非处理会话的既有成员文本；处理会话直接渲染完整证据
+    @return 完整提示词与按位标签输出约束"""
     return _assemble_frame_classify(members, cfg, digests)
 
 
@@ -788,10 +675,12 @@ def _assemble_frame_classify(members: Sequence[Record], cfg: "ResolvedConfig",
     messages: list[Message] = [
         Message(role="system", parts=(Part(kind="text", text="\n".join(lines)),))]
 
+    if cfg.run.mode == "process" and cfg.segment.enabled:
+        digests = tuple(record_evidence(member) for member in members)
     body = "\n".join(_FRAME_MEMBER_LINE.format(m=m, digest=digest)
                      for m, digest in enumerate(digests, start=1))
     parts: list[Part] = [Part(kind="text", text=f"{_LABEL_FRAME_MEMBERS}\n{body}")]
-    if fc.vision_resolved:
+    if fc.vision_resolved or (cfg.run.mode == "process" and cfg.segment.enabled):
         for m, member in enumerate(members, start=1):
             if member.image is None:               # 防御：无图成员只留摘要行
                 continue
@@ -827,7 +716,7 @@ def _frame_prompt_fit(cfg: "ResolvedConfig", ctx: "RunContext",
     if prof.supports_structured_output:
         b -= budget.est_text(json.dumps(schema, ensure_ascii=False))
     cost = (ctx.llm.calibrator.cost(prof.name)
-            if cfg.frame_classify.vision_resolved else 0)
+            if cfg.frame_classify.vision_resolved or (cfg.run.mode == "process" and cfg.segment.enabled) else 0)
     return _PromptFit(input_budget=b, image_cost=cost)
 
 
@@ -917,7 +806,8 @@ async def _judge_frame_window(window_members: Sequence[Record],
             "minimal window", phase="precheck", profile=fc.llm)
     obj, _usage, _attempts, _model = await ctx.schema_engine.complete_validated(
         fc.llm, prompt, schema,
-        scope=CallScope(record_ids=ids, batch_no=ctx.batch_no))
+        scope=CallScope(record_ids=ids, batch_no=ctx.batch_no,
+                        complete_evidence=ctx.session_attempt is not None))
     raw: list[str | None] = list(obj["labels"])[:n]
     return raw + [None] * (n - len(raw))
 
@@ -1037,23 +927,21 @@ def _assemble_frame_results(members: Sequence[Record], fc, aligned: dict,
     return result, fallback
 
 
-async def classify_frames(members: Sequence[Record],
-                          ctx: "RunContext") -> dict[str, Classification]:
-    """对给定成员 Record 序列做帧级闭集批量判决，返回 {member.id: Classification}
-    （source ∈ {"llm", "fallback"}）。
+async def classify_frames(members: Sequence[Record], ctx: "RunContext",
+                          target: CapacityTarget | None = None) -> dict[int | str, Classification]:
+    """对完整成员序列做一次闭集判决，处理会话按全会话出现位置返回结果。
 
-    预算声明时按 budget.pack_windows 的零重叠调用形分窗（预算关 ⇒ 单窗全成员）；
-    单窗修复穷尽/不可恢复 ⇒ 该窗全部成员落 frame_classify.fallback_class（v1.7
-    fallback 哲学下推），本函数永不抛出记录级异常（大三样除外）。PUBLIC
-    DIRECT-CALL SURFACE：M7 verify 的成员回收补跑直接调用本函数（单成员回收即
-    单元素调用），CONTRACTS §1.1 算子间导入白名单第四向——judge_window（§7.14）
-    同款契约地位的 sanctioned import exception。
+    处理会话的多个成员共享同一个完整请求和对齐 labels 数组；容量失败收齐后交给
+    会话控制器。verify 单成员回收是不可再拆的 frame 请求，直接复用相同入口。
+    非处理会话保留原预算分窗路径，普通结构修复耗尽产生 fallback 成员判决。
 
     @param members 待判决的成员帧记录序列（按帧序）
     @param ctx 本次（批次, 阶段）运行上下文
-    @return 成员判决表 {member.id: Classification}
+    @param target 处理会话的实际 owning stage 目标和成员位置
+    @return 处理会话使用整数位置键，其他路径使用成员 ID 键
+    @raises SessionCapacityError 完整请求的全部新容量失败
     """
-    plan = _plan_frame_episode(members, ctx, members[0].id, 0)
+    plan = _plan_frame_episode(members, ctx, members[0].id, 0, target)
     outcomes = []
     for span in plan.spans:
         outcomes.append(await _run_frame_plan(plan, span, ctx))
@@ -1062,7 +950,8 @@ async def classify_frames(members: Sequence[Record],
 
 
 def _plan_frame_episode(members: Sequence[Record], ctx: "RunContext",
-                        episode_id: str, item_ordinal: int) -> _FrameEpisodePlan:
+                        episode_id: str, item_ordinal: int,
+                        target: CapacityTarget | None = None) -> _FrameEpisodePlan:
     """同步冻结一条 episode 的摘要、预算态与原始窗口。
 
     @param members episode 成员序列
@@ -1072,8 +961,14 @@ def _plan_frame_episode(members: Sequence[Record], ctx: "RunContext",
     @return 帧窗口计划
     """
     frozen_members = tuple(members)
-    digests = tuple(frame_digest(member, ctx.cfg.segment.digest_max_chars)
-                    for member in frozen_members)
+    if ctx.session_attempt is not None:
+        if target is None or len(target.member_positions) != len(members):
+            _logger.error("stream frame classification requires explicit member positions")
+            raise ValueError("stream frame classification requires explicit member positions")
+        digests = tuple(record_evidence(member) for member in frozen_members)
+        return _FrameEpisodePlan(item_ordinal, episode_id, frozen_members, digests,
+                                 ((0, len(members)),), True, target)
+    digests = tuple(record_evidence(member) for member in frozen_members)
     prof = ctx.cfg.llm_profiles.get(ctx.cfg.frame_classify.llm)
     budget_on = prof is not None and prof.context_window > 0
     spans = (_frame_windows(frozen_members, digests, ctx.cfg, ctx) if budget_on
@@ -1099,20 +994,28 @@ async def _run_frame_plan(plan: _FrameEpisodePlan, span: tuple[int, int],
         @param current 当前局部窗口跨度
         @return 与局部窗口成员序对齐的标签表
         """
-        stats.calls += 1
         start, end = current
+        if plan.target is not None:
+            target = replace(plan.target, member_positions=plan.target.member_positions[start:end])
+            unit = "sequence" if len(target.member_positions) > 1 else "frame"
+            known = terminal_error(ctx, target, unit, ctx.cfg.frame_classify.llm)
+            if known is not None:
+                raise known
+        stats.calls += 1
         return await _judge_frame_window(plan.members[start:end],
                                          plan.digests[start:end], ctx,
                                          (plan.episode_id,))
 
     try:
-        if plan.budget_on:
+        if plan.budget_on and plan.target is None:
             leaves = await _judge_frames_degrading(judge, span, stats)
         else:
             leaves = [(span, await judge(span))]
     except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
         raise
     except Exception as exc:  # noqa: BLE001 — 普通窗口失败由 reducer 兜底
+        if ctx.session_attempt is not None and isinstance(exc, ProviderFatalError):
+            raise
         _logger.warning("frame classification window failed: span=%d-%d exc=%s",
                         span[0], span[1], type(exc).__name__,
                         extra={"stage": "classify", "batch": ctx.batch_no})
@@ -1130,6 +1033,9 @@ def _reduce_frame_plan(plan: _FrameEpisodePlan,
     @param ctx 本次运行上下文
     @return (成员判决表, 实际调用数, fallback 帧数)
     """
+    from labelkit.operators.classify_capacity import frame_plan_failures
+
+    raise_session_capacities(ctx, frame_plan_failures(plan, outcomes, ctx))
     calls = sum(outcome.calls for outcome in outcomes)
     degrade_retries = sum(outcome.degrade_retries for outcome in outcomes)
     if calls:
@@ -1142,6 +1048,18 @@ def _reduce_frame_plan(plan: _FrameEpisodePlan,
     result, fallback = _assemble_frame_results(
         plan.members, ctx.cfg.frame_classify, aligned, detail,
     )
+    if plan.target is not None:
+        result = {}
+        fallback = 0
+        for index, position in enumerate(plan.target.member_positions):
+            label = aligned.get(index)
+            if label is None:
+                fallback += 1
+            result[position] = Classification(
+                label=label or ctx.cfg.frame_classify.fallback_class,
+                labels=(label or ctx.cfg.frame_classify.fallback_class,),
+                source="llm" if label is not None else "fallback", detail=detail.get(index, {}),
+            )
     if fallback:
         ctx.metrics.count(_COUNTER_FRAME_FALLBACK, fallback)
     return result, calls, fallback
@@ -1164,6 +1082,29 @@ class ClassifyStage:
         @param cfg 本次运行的不可变解析配置（M1 产物）
         """
         self.cfg = cfg
+
+    def preview_capacity(self, item: PipelineItem, ctx: "RunContext") -> SessionCapacityFailure | None:
+        """预览完整序列分类和逐帧分类请求，不调用模型或变更计数。
+
+        @param item 候选完整序列
+        @param ctx 冻结会话上下文
+        @return 首个实际请求容量失败
+        """
+        from labelkit.operators.classify_capacity import frame_request, sequence_request
+
+        cfg = self.cfg
+        target = capacity_target(item)
+        if cfg.classify.enabled:
+            request = sequence_request(item.record, cfg)
+            failure = preview_failure(ctx, (target,), "sequence", request)
+            if failure is not None:
+                return failure
+        if cfg.frame_classify.enabled:
+            members = item.record.members
+            request = frame_request(members, cfg)
+            unit = "sequence" if len(members) > 1 else "frame"
+            return preview_failure(ctx, (capacity_target(item),), unit, request)
+        return None
 
     async def run(self, batch: list[PipelineItem],
                   ctx: "RunContext") -> list[PipelineItem]:
@@ -1233,7 +1174,7 @@ class ClassifyStage:
                     resource_key=("llm", self.cfg.classify.llm),
                     operation=lambda plan=plan: _run_classify_sample(plan, ctx),
                 ))
-        return await ctx.tasks.run_group(TaskGroupRequest(tuple(specs)))
+        return await ctx.run_group(TaskGroupRequest(tuple(specs)))
 
     def _reduce_sequence_wave(
             self, todo: list[PipelineItem],
@@ -1247,6 +1188,9 @@ class ClassifyStage:
         @param ctx 本次运行上下文
         @return 无
         """
+        from labelkit.operators.classify_capacity import sequence_failures
+
+        raise_session_capacities(ctx, sequence_failures(self, todo, plans, outcomes, ctx))
         offset = 0
         for item, plan in zip(todo, plans):
             if isinstance(plan, BaseException):
@@ -1314,7 +1258,8 @@ class ClassifyStage:
             return []
         return [
             (item, _plan_frame_episode(item.record.members, ctx,
-                                       item.record.id, item_ordinal))
+                                       item.record.id, item_ordinal,
+                                       capacity_target(item) if ctx.session_attempt is not None else None))
             for item_ordinal, item in self._frame_gate(batch, ctx)
         ]
 
@@ -1340,7 +1285,7 @@ class ClassifyStage:
                     operation=(lambda plan=plan, span=span:
                                _run_frame_plan(plan, span, ctx)),
                 ))
-        return await ctx.tasks.run_group(TaskGroupRequest(tuple(specs)))
+        return await ctx.run_group(TaskGroupRequest(tuple(specs)))
 
     def _reduce_frame_wave(
             self, plans: Sequence[tuple[PipelineItem, _FrameEpisodePlan]],
@@ -1352,6 +1297,9 @@ class ClassifyStage:
         @param ctx 本次运行上下文
         @return 无
         """
+        from labelkit.operators.classify_capacity import frame_wave_failures
+
+        raise_session_capacities(ctx, frame_wave_failures(plans, outcomes, ctx))
         offset = 0
         for item, plan in plans:
             selected = outcomes[offset:offset + len(plan.spans)]
@@ -1407,6 +1355,9 @@ class ClassifyStage:
         @param exc 判决路径抛出的异常
         @return 兜底判决产物；已置 failed 时为 None（调用方直接收手）
         """
+        self._raise_capacity(item, ctx, exc)
+        if ctx.session_attempt is not None and isinstance(exc, ProviderFatalError):
+            raise exc
         if isinstance(exc, SchemaViolation):
             if self.cfg.classify.on_error == "fail":
                 item.raw_last_output = exc.raw_last_output  # type: ignore[attr-defined]
@@ -1431,6 +1382,14 @@ class ClassifyStage:
             self._fail(item, ctx, kind, f"{type(exc).__name__}: {exc}",
                        retryable=False)
         return None
+
+    def _raise_capacity(self, item: PipelineItem, ctx: "RunContext", error: BaseException) -> None:
+        """@param item 实际序列。@param ctx 当前尝试。@param error 原始异常。@raises SessionCapacityError 容量失败。"""
+        unit = "sequence"
+        if ctx.session_attempt is not None and isinstance(error, ContextOverflowError):
+            failure = self.preview_capacity(item, ctx)
+            unit = "fixed" if failure is not None and failure.unit == "fixed" else unit
+        raise_session_capacity(ctx, (capacity_target(item),), error, unit)
 
     def _fallback(self, item: PipelineItem, ctx: "RunContext",
                   message: str) -> Classification:
@@ -1533,16 +1492,15 @@ class ClassifyStage:
                     dedup=item.dedup,
                     session_id=item.session_id,
                     thread_id=item.thread_id,
+                    session_position=item.session_position,
+                    member_positions=item.member_positions,
+                    capacity=item.capacity,
                     member_classifications=item.member_classifications,
                     member_annotations=item.member_annotations,
                 )
-                # v1.8（D6）：session_split / segment_degraded 描述的是 **episode**
-                # 的会话与切分，不是信封——兄弟行不得与原信封的 _meta.stream 矛盾。
-                # v1.9（T14）：M16 的标位一并入列——seam_indexes 驱动兄弟自己的
-                # extract pass，seam_interrupted_by 供其占位文本，stitch_fragments
-                # 供其 _meta.stream.fragments 与 annotate 配额。
-                for mark in ("session_split", "segment_degraded", "seam_indexes",
-                             "seam_interrupted_by", "stitch_fragments"):
+                # 切分、缝合证据和最终任务名属于序列；兄弟信封保持相同边界身份。
+                for mark in ("segment_degraded", "seam_indexes",
+                             "seam_interrupted_by", "stitch_fragments", "stitch_task_name"):
                     value = getattr(item, mark, None)
                     if value is not None:
                         setattr(clone, mark, value)

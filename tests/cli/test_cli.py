@@ -99,6 +99,7 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/config/model.py",
     "labelkit/common/contracts/execution.py",
     "labelkit/common/contracts/generation.py",
+    "labelkit/common/contracts/sequence_capacity.py",
     "labelkit/common/contracts/stage.py",
     "labelkit/common/contracts/types.py",
     "labelkit/common/errors.py",
@@ -111,10 +112,14 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/common/inference/generation_prompts.py",  # v1.18 六家族共享完整提示词
     "labelkit/common/inference/llm_client.py",
     "labelkit/common/inference/schema_engine.py",
+    "labelkit/common/inference/sequence_evidence.py",
     "labelkit/operators/annotate.py",
+    "labelkit/operators/annotate_capacity.py",
     "labelkit/operators/annotation_finalization.py",
     "labelkit/operators/classify.py",
+    "labelkit/operators/classify_capacity.py",
     "labelkit/operators/dedup.py",
+    "labelkit/operators/dedup_session.py",
     "labelkit/operators/emitter.py",
     "labelkit/operators/extract.py",
     "labelkit/operators/generate.py",
@@ -129,11 +134,14 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/operators/generation/state.py",
     "labelkit/operators/ingest.py",
     "labelkit/operators/quality.py",
+    "labelkit/operators/quality_capacity.py",
     "labelkit/operators/quality_calls.py",
     "labelkit/operators/segment.py",
+    "labelkit/operators/segment_capacity.py",
     "labelkit/operators/stitch.py",
     "labelkit/operators/stream_verify.py",
     "labelkit/operators/verify.py",
+    "labelkit/operators/verify_capacity.py",
     "labelkit/runtime/__init__.py",
     "labelkit/runtime/resources.py",
     "labelkit/runtime/scheduler.py",
@@ -141,10 +149,19 @@ EXPECTED_PRODUCTION_PY = {
     "labelkit/orchestration/application.py",
     "labelkit/orchestration/factory.py",
     "labelkit/orchestration/process_workflow.py",
+    "labelkit/orchestration/session_capacity.py",
+    "labelkit/orchestration/session_workflow.py",
     "labelkit/orchestration/sequence_workflow.py",
 }
 
 EXPECTED_TEST_PY = {
+    "tests/common/contracts/test_sequence_capacity.py",
+    "tests/integration/test_sequence_context_capacity_local_llm.py",
+    "tests/operators/test_dedup_session.py",
+    "tests/operators/test_emitter_capacity.py",
+    "tests/operators/test_sequence_complete_evidence.py",
+    "tests/operators/test_sequence_capacity_combinations.py",
+    "tests/orchestration/test_session_workflow.py",
     "tests/cli/test_cli.py",
     "tests/cli/test_console.py",
     "tests/common/config/test_config.py",
@@ -352,6 +369,20 @@ def test_package_layout_dependency_direction():
                 allowed_operator_calls = {"labelkit.operators.generation.project"}
             else:
                 allowed_operator_calls = set()
+            families = (
+                {"annotate", "annotate_capacity", "annotation_finalization"},
+                {"classify", "classify_capacity"}, {"dedup", "dedup_session"},
+                {"quality", "quality_capacity", "quality_calls"}, {"segment", "segment_capacity"},
+                {"verify", "stream_verify", "verify_capacity"},
+            )
+            for family in families:
+                if own_module.rsplit(".", 1)[-1] in family:
+                    allowed_operator_calls.update(f"labelkit.operators.{member}" for member in family)
+            if own_module == "labelkit.operators.stream_verify":
+                allowed_operator_calls.update({"labelkit.operators.classify_capacity",
+                                               "labelkit.operators.annotate_capacity"})
+            if own_module == "labelkit.operators.verify_capacity":
+                allowed_operator_calls.add("labelkit.operators.stitch")
             for imported in imports:
                 if (imported.startswith("labelkit.operators.")
                         and imported != own_module

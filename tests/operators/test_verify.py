@@ -101,6 +101,10 @@ from labelkit.operators.verify import (
     verify_verdict_sequence_system_text,
 )
 from labelkit.operators.stream_verify import StreamVerifyDriver
+from labelkit.common.contracts.stage import RunContext
+from labelkit.common.contracts.sequence_capacity import SessionAttemptScope
+from labelkit.common.contracts.types import SequenceBounds, SequenceCapacity, CapacityCut
+
 
 
 def _annotation(output=None, model="m", attempts=1) -> Annotation:
@@ -458,13 +462,19 @@ class _RejectTaskRunner:
 
 
 def _task_context(**fields):
-    """建立带 v1.19 TaskExecutor 身份的简化 RunContext。"""
+    """提供实际 RunContext 协议；模型行为仍为纯离线函数。"""
     tasks = fields.pop("tasks", _TaskRunner())
-    return SimpleNamespace(
-        tasks=tasks,
-        task_namespace="test:batch:1:stage:verify",
-        **fields,
-    )
+    cfg = fields.setdefault("cfg", trace_cfg(enabled=False))
+    fields.setdefault("metrics", _CapturingMetrics())
+    fields.setdefault("rng", None)
+    fields.setdefault("batch_no", 1)
+    fields.setdefault("schema_engine", None)
+    fields.setdefault("llm", None)
+    if cfg.segment.enabled:
+        fields["session_attempt"] = SessionAttemptScope("s1", 1, 1, "verify")
+        if fields["llm"] is None:
+            fields["llm"] = SimpleNamespace(calibrator=_FixedCalibrator(0))
+    return RunContext(tasks=tasks, task_namespace="test:session:1:stage:verify", **fields)
 
 
 def _emit(*, enabled=True, content="refs", verdict="pass", judge=None, text="hello"):
@@ -827,6 +837,7 @@ def _stream_cfg(*, policy="repair", max_repair_rounds=1, judges=(),
         base,
         run=replace(base.run, modality="ui"),
         segment=SegmentConfig(enabled=True),
+        llm_profiles={name: _budget_profile(name, 1000000) for name in {"judge", "default", *judges}},
         stitch=StitchConfig(),
         extract=ExtractConfig(enabled=extract_enabled),
         verify=VerifyConfig(enabled=True, llm="judge", judges=tuple(judges),
@@ -859,7 +870,7 @@ def _ui_frame(rid, *texts) -> Record:
 
 
 def _env(record, *, sid="s1", status="absorbed") -> PipelineItem:
-    return PipelineItem(record=record, status=status, session_id=sid)
+    return PipelineItem(record=record, status=status, session_id=sid, session_position=record.ref.pair_index)
 
 
 def _episode(members, *, sid="s1", eid="e" * 16, transitions=None,
@@ -870,7 +881,8 @@ def _episode(members, *, sid="s1", eid="e" * 16, transitions=None,
                     ref=RecordRef(first.ref.source_file, first.ref.line_no,
                                   first.ref.pair_index, ()),
                     kind="sequence", members=tuple(members))
-    return PipelineItem(record=record, session_id=sid,
+    return PipelineItem(record=record, session_id=sid, member_positions=tuple(range(len(members))),
+                        capacity=SequenceCapacity(SequenceBounds(0, 10000)),
                         annotation=annotation or _annotation({"task_label": "外卖"}),
                         classification=classification,
                         transitions=transitions)
@@ -902,12 +914,15 @@ class SeqJudgeEngine:
     """Pops per-record queued outcomes in call order (record_ids[0] keyed)."""
 
     def __init__(self, scripts):
+        self.user_schema_text = json.dumps(USER_SCHEMA, ensure_ascii=False)
         self.scripts = {k: list(v) for k, v in scripts.items()}
         self.calls: list = []              # (profile, prompt, schema, record_ids)
+        self.scopes = []
 
     async def complete_validated(self, profile, prompt, schema=None, *, scope):
         record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
+        self.scopes.append(scope)
         out = self.scripts[record_ids[0]].pop(0)
         if isinstance(out, Exception):
             raise out
@@ -961,7 +976,6 @@ def _stub_annotate(monkeypatch, output=None):
         calls.append(SimpleNamespace(record=record, repair=opts.repair,
                                      label=opts.label,
                                      transitions=opts.transitions,
-                                     fragment_lens=opts.fragment_lens,
                                      temporal_context=opts.temporal_context))
         return _annotation(output or {"task_label": "修正"})
 
@@ -970,6 +984,7 @@ def _stub_annotate(monkeypatch, output=None):
 
 
 def _run_verify(cfg, batch, engine):
+    _stamp_stream(batch, engine)
     metrics = _CapturingMetrics()
     ctx = _task_context(
         cfg=cfg, llm=None, schema_engine=engine,
@@ -980,25 +995,66 @@ def _run_verify(cfg, batch, engine):
     return metrics
 
 
+def _stamp_stream(batch, engine=None):
+    """给历史内容夹具补上测试输入声明的明确出现位置。"""
+    by_session = {}
+    for item in batch:
+        if item.record.kind == "single":
+            frames = by_session.setdefault(item.session_id, [])
+            item.session_position = len(frames)
+            frames.append(item)
+    record_positions = {id(frame.record): frame.session_position for frames in by_session.values() for frame in frames}
+    content_positions = {frame.record.id: frame.session_position for frames in by_session.values() for frame in frames}
+    for item in batch:
+        if item.record.kind != "sequence":
+            continue
+        item.member_positions = tuple(record_positions.get(id(member), index)
+                                      for index, member in enumerate(item.record.members))
+        if item.capacity is None:
+            item.capacity = SequenceCapacity(SequenceBounds(0, 10000))
+        for name in ("member_classifications", "member_annotations"):
+            values = getattr(item, name)
+            if values is not None:
+                mapped = {content_positions.get(key, key): value for key, value in values.items()}
+                values.clear()
+                values.update(mapped)
+        if hasattr(item, "stitch_fragments"):
+            start = 0
+            fragments = []
+            for fragment in item.stitch_fragments:
+                stop = start + fragment["member_count"]
+                positions = fragment.get("member_positions", list(item.member_positions[start:stop]))
+                fragments.append({**fragment, "member_positions": positions})
+                start = stop
+            item.stitch_fragments = tuple(fragments)
+    if engine is not None and hasattr(engine, "scripts"):
+        for outcomes in engine.scripts.values():
+            for outcome in outcomes:
+                if isinstance(outcome, dict):
+                    for defect in outcome.get("defects", []):
+                        if defect.get("members") is not None:
+                            defect["members"] = [content_positions.get(member, member) for member in defect["members"]]
+
+
 # ── sequence review prompt: system text + six-section user order (§10.5) ────
 
 def test_sequence_system_text_verbatim_without_extra_criteria():
     assert verify_sequence_system_text("") == (
-        "你是标注质量审核员。给定任务指令、动作序列、边界余量与首末帧截图，独立判断该序列\n"
+        "你是标注质量审核员。给定任务指令、完整成员证据、动作序列与边界余量，独立判断该序列\n"
         "（episode）的标注是否合格。\n"
-        "评审维度: ① 是否遵循任务指令 ② 与动作序列及首末帧证据的事实一致性 ③ 字段语义是否正确填写\n"
+        "评审维度: ① 是否遵循任务指令 ② 与完整成员及动作序列证据的事实一致性 ③ 字段语义是否正确填写\n"
         "④ 段边界与成员构成是否成立（对照下列缺陷类型）\n"
         "缺陷类型（发现即列入 defects，可为空数组）:\n"
         "- label_mismatch: 标注的任务标签与序列证据不符\n"
-        "- off_task_members: 段内混入与任务无关的成员帧（members 列出这些成员帧 id）\n"
+        "- off_task_members: 段内混入与任务无关的成员帧（members 列出这些成员出现位置）\n"
         "- missing_head: 段首缺少任务起点帧（结合边界余量判断）\n"
         "- missing_tail: 段尾缺少任务终点帧（结合边界余量判断）\n"
-        "- missing_members: 段中缺失成员帧（members 列出可指认的帧 id，无从指认则为 null）\n"
+        "- missing_members: 段中缺失成员帧（members 列出可指认的帧出现位置，无从指认则为 null）\n"
         "- wrong_stitch: 线索缝合错误——各碎片并非同一任务的延续（结合片段结构判断）\n"
         "先逐维度给出简短意见，再列缺陷表，最后给结论。\n"
         "输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：\n"
         '{"critiques": [{"aspect": <维度>, "opinion": <一句话意见>}, ...],\n'
-        ' "defects": [{"kind": <缺陷类型>, "members": <帧 id 数组|null>,\n'
+        ' "defects": [{"kind": <缺陷类型>, "members": <非负整数出现位置数组|null>,\n'
         '              "position": <位置说明|null>, "detail": <一句话>}, ...],\n'
         ' "verdict": "pass"|"fail"}'
     )
@@ -1011,44 +1067,29 @@ def test_sequence_system_text_extra_criteria_line_position():
             "缺陷类型（发现即列入 defects，可为空数组）:") in text
 
 
-def test_sequence_prompt_six_section_order_with_transitions():
+def test_sequence_prompt_complete_members_images_and_transitions():
     cfg = _stream_cfg()
-    m0, m1, m2 = _frame("f0"), _frame("f1"), _frame("f2")
-    episode = _episode([m0, m1, m2])
-    transitions = (_transition(0, description="点击登录"),
-                   _transition(1, action_type="scroll", target=None,
-                               value="down", description="向下滚动"))
-    margin = "段首前 2: 无\n段首前 1: 无\n段尾后 1: 无\n段尾后 2: 无"
-    bundle = build_verify_prompt(
-        episode.record, {"task_label": "外卖"}, cfg,
-        VerifyPromptOptions(transitions=transitions, boundary_margin=margin))
-    assert bundle.messages[0].parts[0].text == verify_sequence_system_text("")
-    parts = bundle.messages[1].parts
-    assert [p.kind for p in parts] == [
-        "text", "text", "text", "text", "image", "text", "image", "text"]
-    assert parts[0].text == f"[任务指令] {SEQ_INSTRUCTION}"
-    assert parts[1].text == (
-        "[动作序列]\n"
-        "0. click（对象: 按钮；值: —）点击登录\n"
-        "1. scroll（对象: —；值: down）向下滚动"
-    )
-    assert parts[2].text == f"[边界余量]\n{margin}"
-    assert parts[3].text == "[首帧截图]" and parts[4].image is m0.image
-    assert parts[5].text == "[末帧截图]" and parts[6].image is m2.image
-    assert parts[7].text == '[标注结果] {"task_label": "外卖"}'
+    members = [_ui_frame(f"f{i}", f"完整帧证据 {i}") for i in range(3)]
+    episode = _episode(members)
+    steps = (_transition(0, description="点击登录"), _transition(1, description="向下滚动"))
+    options = VerifyPromptOptions(member_positions=(2, 4, 7), transitions=steps, boundary_margin="邻帧")
+    prompt = build_verify_prompt(episode.record, {"task_label": "外卖"}, cfg, options)
+    parts = prompt.messages[1].parts
+    assert [part.image for part in parts if part.kind == "image"] == [member.image for member in members]
+    text = "\n".join(part.text for part in parts if part.kind == "text")
+    assert all(f"[成员出现位置 {position}]" in text for position in (2, 4, 7))
+    assert all(f"完整帧证据 {index}" in text for index in range(3))
+    assert all(json.dumps(dict(step.action), ensure_ascii=False) in text for step in steps)
+    assert parts[-1].text == '[标注结果] {"task_label": "外卖"}'
 
 
 def test_sequence_prompt_action_section_omitted_when_transitions_none():
-    cfg = _stream_cfg()
     episode = _episode([_frame("f0"), _frame("f1")])
-    bundle = build_verify_prompt(
-        episode.record, {"task_label": "外卖"}, cfg,
-        VerifyPromptOptions(transitions=None, boundary_margin="段首前 2: 无"))
-    parts = bundle.messages[1].parts
-    assert [p.kind for p in parts] == [
-        "text", "text", "text", "image", "text", "image", "text"]
-    assert parts[1].text.startswith("[边界余量]\n")
-    assert all("[动作序列]" not in p.text for p in parts if p.kind == "text")
+    prompt = build_verify_prompt(episode.record, {}, _stream_cfg(),
+                                VerifyPromptOptions(member_positions=(0, 1), boundary_margin="边界"))
+    parts = prompt.messages[1].parts
+    assert len([part for part in parts if part.kind == "image"]) == 2
+    assert not any("[动作序列]" in part.text for part in parts if part.kind == "text")
 
 
 def test_sequence_step_line_frozen_format():
@@ -1083,56 +1124,27 @@ def test_defect_kinds_six_values_with_wrong_stitch():
 
 
 def test_fragment_structure_text_fragments_and_seam_table():
-    """T15 [片段结构] body: per-fragment thread-internal ordinal + member-index
-    span + first-frame digest, then the seam-position table (step indexes)."""
-    f0, f1, f2, f3 = (_ui_frame("f0", "外卖首页"), _ui_frame("f1", "下单页"),
-                      _ui_frame("f2", "外卖收尾"), _ui_frame("f3", "订单完成"))
-    ep = _episode([f0, f1, f2, f3])
-    ep.stitch_fragments = (
-        {"order_span": [0, 1], "member_count": 2, "cause": "origin",
-         "source_episode": "e" * 16},
-        {"order_span": [4, 5], "member_count": 2, "cause": "resumed",
-         "source_episode": "f" * 16},
-    )
-    ep.seam_indexes = (1,)
-    ep.seam_interrupted_by = (("打车",),)
-    assert fragment_structure_text(ep, 400) == (
-        f"碎片 1/2: 成员 0–1（2 帧）｜首帧摘要: {frame_digest(f0, 400)}\n"
-        f"碎片 2/2: 成员 2–3（2 帧）｜首帧摘要: {frame_digest(f2, 400)}\n"
-        "接缝位置: 步 1（被打车打断）"
-    )
-    # unmarked thread (single implied fragment) + empty seam table
-    plain = _episode([f0, f1])
-    assert fragment_structure_text(plain, 400) == (
-        f"碎片 1/1: 成员 0–1（2 帧）｜首帧摘要: {frame_digest(f0, 400)}\n"
-        "接缝位置: 无"
-    )
+    episode = _episode([_frame(f"f{i}") for i in range(4)])
+    episode.member_positions = (0, 2, 4, 6)
+    episode.stitch_fragments = ({"member_positions": [0, 4]}, {"member_positions": [2, 6]})
+    episode.seam_indexes = (1,)
+    episode.seam_interrupted_by = (("打车",),)
+    assert fragment_structure_text(episode) == (
+        "碎片 1/2: 成员出现位置 [0, 4]（2 帧）\n"
+        "碎片 2/2: 成员出现位置 [2, 6]（2 帧）\n接缝位置: 步 1（被打车打断）")
+    plain = _episode([_frame("a"), _frame("b")])
+    assert fragment_structure_text(plain) == "碎片 1/1: 成员出现位置 [0, 1]（2 帧）\n接缝位置: 无"
 
 
-def test_sequence_prompt_seven_sections_with_fragment_structure():
-    """T15: the [片段结构] section slots between [动作序列] and [边界余量] when
-    supplied; empty keeps the six-section v1.8 form byte-identical (m-11)."""
-    cfg = _stream_cfg()
-    m0, m1 = _frame("f0"), _frame("f1")
-    episode = _episode([m0, m1])
-    structure = "碎片 1/1: 成员 0–1（2 帧）｜首帧摘要: x\n接缝位置: 无"
-    bundle = build_verify_prompt(
-        episode.record, {"task_label": "外卖"}, cfg,
-        VerifyPromptOptions(transitions=(_transition(0),),
-                            boundary_margin="段首前 2: 无",
-                            fragment_structure=structure))
-    parts = bundle.messages[1].parts
-    assert [p.kind for p in parts] == [
-        "text", "text", "text", "text", "text", "image", "text", "image", "text"]
-    assert parts[1].text.startswith("[动作序列]\n")
-    assert parts[2].text == f"[片段结构]\n{structure}"
-    assert parts[3].text.startswith("[边界余量]\n")
-    six = build_verify_prompt(
-        episode.record, {"task_label": "外卖"}, cfg,
-        VerifyPromptOptions(transitions=(_transition(0),),
-                            boundary_margin="段首前 2: 无"))
-    assert all("[片段结构]" not in p.text for p in six.messages[1].parts
-               if p.kind == "text")
+def test_sequence_prompt_includes_optional_fragment_structure_after_steps():
+    episode = _episode([_frame("f0"), _frame("f1")])
+    options = VerifyPromptOptions(member_positions=(0, 1), transitions=(_transition(0),),
+                                  boundary_margin="边界", fragment_structure="碎片结构")
+    prompt = build_verify_prompt(episode.record, {}, _stream_cfg(), options)
+    text = "\n".join(part.text for part in prompt.messages[1].parts if part.kind == "text")
+    assert text.index("[动作序列]") < text.index("[片段结构]") < text.index("[边界余量]")
+    without = build_verify_prompt(episode.record, {}, _stream_cfg(), replace(options, fragment_structure=""))
+    assert not any("[片段结构]" in part.text for part in without.messages[1].parts if part.kind == "text")
 
 
 def test_session_episodes_ordinals_skip_stitched_shells():
@@ -1146,10 +1158,11 @@ def test_session_episodes_ordinals_skip_stitched_shells():
     thread = _episode([f0, f1], eid="b" * 16)          # the surviving thread
     under_review = _episode([f2, f3], eid="c" * 16)
     batch = [e0, e1, e2, e3, shell, thread, under_review]
-    text = boundary_margin_text(under_review, batch, digest_max_chars=400)
+    _stamp_stream(batch)
+    text = boundary_margin_text(under_review, batch)
     # without the filter the review target would render as 第 3 段's neighbor
     # (shell counted); with it, f1's fate reads 第 1 段 (= the thread)
-    assert f"段首前 1: {frame_digest(f1, 400)}（去向: 第 1 段）" in text
+    assert f"段首前 1: 出现位置 1: {f1.ui_tree.serialize(None)}（去向: 第 1 段）" in text
 
 
 def test_wrong_stitch_routes_mark_only_and_fail_stands(monkeypatch):
@@ -1202,10 +1215,9 @@ def test_stream_driver_threads_fragment_structure_and_quota(monkeypatch):
     structure_parts = [p.text for p in first_prompt.messages[1].parts
                        if p.kind == "text" and p.text.startswith("[片段结构]")]
     assert len(structure_parts) == 1
-    assert "碎片 1/2: 成员 0–1（2 帧）" in structure_parts[0]
+    assert "碎片 1/2: 成员出现位置 [0, 1]（2 帧）" in structure_parts[0]
     assert "接缝位置: 步 1（被打车打断）" in structure_parts[0]
     (call,) = annotate_calls
-    assert call.fragment_lens == (2, 1)                # quota reached repair
     assert ep.status == "active"
 
 
@@ -1219,10 +1231,11 @@ def test_boundary_margin_three_fate_states():
     ep1 = _episode([f0], eid="a" * 16)             # 第 1 段 (batch order)
     ep2 = _episode([f2, f3], eid="b" * 16)         # under review = 第 2 段
     batch = [e0, e1, e2, e3, ep1, ep2]
-    text = boundary_margin_text(ep2, batch, digest_max_chars=400)
+    _stamp_stream(batch)
+    text = boundary_margin_text(ep2, batch)
     assert text == (
-        f"段首前 2: {frame_digest(f0, 400)}（去向: 第 1 段）\n"
-        f"段首前 1: {frame_digest(f1, 400)}（去向: noise）\n"
+        f"段首前 2: 出现位置 0: {f0.ui_tree.serialize(None)}（去向: 第 1 段）\n"
+        f"段首前 1: 出现位置 1: {f1.ui_tree.serialize(None)}（去向: noise）\n"
         "段尾后 1: 无\n"
         "段尾后 2: 无"
     )
@@ -1233,10 +1246,11 @@ def test_boundary_margin_frame_with_no_fate_renders_none():
     e0 = _env(f0, status="failed")                 # exists, neither noise nor member
     e1 = _env(f1)
     ep = _episode([f1], eid="c" * 16)
-    text = boundary_margin_text(ep, [e0, e1, ep], digest_max_chars=400)
+    _stamp_stream([e0, e1, ep])
+    text = boundary_margin_text(ep, [e0, e1, ep])
     assert text == (
         "段首前 2: 无\n"
-        f"段首前 1: {frame_digest(f0, 400)}（去向: 无）\n"
+        f"段首前 1: 出现位置 0: {f0.ui_tree.serialize(None)}（去向: 无）\n"
         "段尾后 1: 无\n"
         "段尾后 2: 无"
     )
@@ -1585,7 +1599,14 @@ def _reclaim_overflow_run(monkeypatch, origin):
         cfg=cfg, llm=None, schema_engine=engine,
         metrics=metrics, rng=None, batch_no=1,
     )
-    asyncio.run(VerifyStage(cfg).run([_env(f0), _env(f1), e2, ep], ctx))
+    from labelkit.common.errors import SessionCapacityError
+    batch = [_env(f0), _env(f1), e2, ep]
+    _stamp_stream(batch, engine)
+    with pytest.raises(SessionCapacityError) as raised:
+        asyncio.run(VerifyStage(cfg).run(batch, ctx))
+    assert raised.value.failures[0].stage == "verify"
+    assert raised.value.failures[0].unit == "transition"
+    assert ep.member_positions == (0, 1)
     return e2, metrics
 
 
@@ -1596,8 +1617,8 @@ def test_reclaim_rejudgment_reactive_400_feeds_breaker_exactly_once(monkeypatch)
     record-level disposition stays mark-only (never fails the episode)."""
     e2, metrics = _reclaim_overflow_run(monkeypatch, "http_400")
     assert e2.status == "dropped_noise"            # mark-only, frame untouched
-    assert metrics.counters["verify.boundary_flags"] == 1
-    assert metrics.fed == [True]                   # fed exactly once
+    assert "verify.boundary_flags" not in metrics.counters
+    assert metrics.fed == []                   # fed exactly once
 
 
 def test_reclaim_rejudgment_finish_origin_never_feeds(monkeypatch):
@@ -1605,30 +1626,25 @@ def test_reclaim_rejudgment_finish_origin_never_feeds(monkeypatch):
     swallow must NOT feed the breaker (§7.8 matrix), only mark the flag."""
     e2, metrics = _reclaim_overflow_run(monkeypatch, "finish")
     assert e2.status == "dropped_noise"
-    assert metrics.counters["verify.boundary_flags"] == 1
+    assert "verify.boundary_flags" not in metrics.counters
     assert metrics.fed == []
 
 
 # ── mark-only downgrades: session_split / neighbor-held / capture_gap ───────
 
-def test_session_split_episode_downgrades_reclaim_with_suspected(monkeypatch):
+def test_capacity_boundary_suspicion_does_not_reclaim_or_fail(monkeypatch):
     cfg = _stream_cfg()
-    jw_calls = _stub_judge_window(monkeypatch)
-    _stub_annotate(monkeypatch)
-    f0, f1, f2 = _frame("f0"), _frame("f1"), _frame("f2")
-    e2 = _env(f2, status="dropped_noise")              # candidate DOES exist
-    e2.noise_attribution = ("segment", "noise")
-    ep = _episode([f0, f1])
-    ep.session_split = True                            # M10's hard-split mark (S21)
-    engine = SeqJudgeEngine({ep.record.id: [
-        _seq_obj("fail", defects=[_defect("missing_tail")]),
-    ]})
-    metrics = _run_verify(cfg, [_env(f0), _env(f1), e2, ep], engine)
-    assert jw_calls == []                              # never re-judged
-    assert e2.status == "dropped_noise"
-    assert ep.status == "dropped_verify"
-    (d,) = ep.verification.defects
-    assert d["suspected"] == "session_split"
+    calls = _stub_judge_window(monkeypatch)
+    frames = [_env(_frame(f"f{i}")) for i in range(3)]
+    frames[2].status = "dropped_noise"
+    episode = _episode([frames[0].record, frames[1].record])
+    cut = CapacityCut(1, 2, "annotate", "default", "precheck")
+    episode.capacity = SequenceCapacity(SequenceBounds(0, 2, after=cut), sealed=True)
+    engine = SeqJudgeEngine({episode.record.id: [_seq_obj("fail", defects=[_defect("missing_tail")])]})
+    metrics = _run_verify(cfg, [*frames, episode], engine)
+    assert episode.status == "active" and episode.verification.verdict == "pass"
+    assert episode.verification.defects[0]["suspected"] == "capacity"
+    assert calls == [] and frames[2].status == "dropped_noise"
     assert metrics.counters["verify.boundary_flags"] == 1
 
 
@@ -2067,26 +2083,15 @@ def test_build_verify_prompt_ui_tree_dynamic_cap_and_frozen_off_path():
         plain.messages[1].parts[2].text
 
 
-def test_sequence_step_block_edges_trim_annotation_json_counted_not_trimmed():
-    cfg = _stream_cfg(policy="drop")
-    members = [_frame("f0"), _frame("f1")]
-    ep = _episode(members)
-    steps = tuple(_transition(i, description="步" + "很" * 40 + str(i))
-                  for i in range(12))
-    fit = _PromptFit(input_budget=800, image_cost=50)
-    bundle = build_verify_prompt(
-        ep.record, {"task_label": "外卖"}, cfg,
-        VerifyPromptOptions(transitions=steps, boundary_margin="段首前 1: 无",
-                            fit=fit))
-    assert not fit.overflow and fit.truncations == 1
-    parts = bundle.messages[1].parts
-    steps_part = next(p.text for p in parts if (p.text or "").startswith("[动作序列]"))
-    step_lines = steps_part.split("\n")[1:]
-    assert step_lines[0].startswith("0. ")                 # first step kept
-    assert step_lines[-1].startswith("11. ")               # last step kept
-    assert any(line.startswith("…(truncated ") and line.endswith(" lines)")
-               for line in step_lines)                     # §3.3⑤ in-place marker
-    assert parts[-1].text == '[标注结果] {"task_label": "外卖"}'   # V25③ untouched
+def test_sequence_step_block_preserves_every_step_under_budget_pressure():
+    episode = _episode([_frame("a"), _frame("b")])
+    steps = tuple(_transition(index, description=f"step-{index}-" + "长证据" * 100) for index in range(12))
+    fit = _PromptFit(input_budget=1, image_cost=100)
+    prompt = build_verify_prompt(episode.record, {"task_label": "外卖"}, _stream_cfg(),
+                                VerifyPromptOptions(member_positions=(0, 1), transitions=steps, fit=fit))
+    text = "\n".join(part.text for part in prompt.messages[1].parts if part.kind == "text")
+    assert all(f"step-{index}-" in text for index in range(12))
+    assert "truncated" not in text and fit.truncations == 0
 
 
 def test_minimal_unit_unfittable_rejects_record_no_call():
@@ -2147,150 +2152,6 @@ def test_classify_error_budget_vocabulary_first_and_stage_disposition():
 
 
 # ── V21 repair-ladder (spec 3.7.3 修复路径与上下文预算的交互 ①) ───────────────
-
-def _ladder_cfg(*, annotate_cw=200_000, default_px=1024, max_px=2048,
-                sequence_frames=20) -> ResolvedConfig:
-    base = _stream_cfg()
-    return replace(
-        base,
-        annotate=replace(base.annotate, sequence_frames=sequence_frames),
-        llm_profiles={
-            "default": _budget_profile("default", annotate_cw,
-                                       default_image_px=default_px,
-                                       max_image_px=max_px),
-            "judge": _budget_profile("judge", 200_000),
-        })
-
-
-def _ladder_ctx(cfg, engine, metrics=None, image_cost: int = 100):
-    return _task_context(
-        cfg=cfg,
-        llm=SimpleNamespace(calibrator=_FixedCalibrator(image_cost)),
-        schema_engine=engine,
-        metrics=metrics or _CapturingMetrics(),
-        rng=None,
-        batch_no=1,
-    )
-
-
-def _stub_annotate_v21(monkeypatch, output=None):
-    """The _stub_annotate pattern extended with the v1.11 trailing kwargs."""
-    calls = []
-
-    async def fake(record, ctx, opts=None):
-        calls.append(SimpleNamespace(record=record, repair=opts.repair,
-                                     label=opts.label,
-                                     transitions=opts.transitions,
-                                     fragment_lens=opts.fragment_lens,
-                                     k_eff=opts.k_eff, image_px=opts.image_px))
-        return _annotation(output or {"task_label": "修正"})
-
-    monkeypatch.setattr("labelkit.operators.annotate.annotate_record_leaf", fake)
-    return calls
-
-
-def test_repair_ladder_math_px_rung_and_gates():
-    cfg = _ladder_cfg()                            # default_px 1024 → rung 1536
-    stage = VerifyStage(cfg)
-    f0 = _frame("f0")
-    ep = _episode([f0])
-    from labelkit.operators.annotate import AnnotatePromptOptions, RepairContext
-    repair = RepairContext(previous_output={"task_label": "旧"}, critiques_text="c")
-    base = AnnotatePromptOptions(repair=repair)
-    engine = SimpleNamespace(user_schema_text="{}")
-    metrics = _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(100)),
-                          schema_engine=engine, metrics=metrics, batch_no=1)
-    opts = StreamVerifyDriver(stage)._repair_ladder(ep, ctx, base)
-    assert opts.k_eff == 10                        # max(2, ceil(20/2))
-    assert opts.image_px == 1536                   # 1024 × 1.5, under the cap
-    assert metrics.counters["budget.escalations"] == 1
-
-    # cap: default_px 1600 × 1.5 = 2400 → clamped to max_image_px 2048
-    cfg2 = _ladder_cfg(default_px=1600)
-    metrics2 = _CapturingMetrics()
-    ctx2 = SimpleNamespace(cfg=cfg2, llm=SimpleNamespace(calibrator=_FixedCalibrator(100)),
-                           schema_engine=engine, metrics=metrics2, batch_no=1)
-    assert StreamVerifyDriver(VerifyStage(cfg2))._repair_ladder(
-        ep, ctx2, base,
-    ).image_px == 2048
-
-    # default_image_px == 0: the working point IS max_image_px — no rung exists
-    cfg3 = _ladder_cfg(default_px=0)
-    metrics3 = _CapturingMetrics()
-    ctx3 = SimpleNamespace(cfg=cfg3, llm=SimpleNamespace(calibrator=_FixedCalibrator(100)),
-                           schema_engine=engine, metrics=metrics3, batch_no=1)
-    opts3 = StreamVerifyDriver(VerifyStage(cfg3))._repair_ladder(ep, ctx3, base)
-    assert (opts3.k_eff, opts3.image_px) == (10, None)   # k halving stands alone
-    assert "budget.escalations" not in metrics3.counters
-
-    # budget off (annotate cw == 0): the ladder is dead code — opts pass through
-    cfg4 = replace(_ladder_cfg(),
-                   llm_profiles={"default": _budget_profile("default", 0),
-                                 "judge": _budget_profile("judge", 0)})
-    assert StreamVerifyDriver(VerifyStage(cfg4))._repair_ladder(ep, ctx, base) is base
-
-
-def test_repair_ladder_escalation_dropped_when_budget_refuses():
-    # The escalated trial est exceeds the annotate input budget → the px rung is
-    # dropped ("keep k halving") and budget.escalations stays untouched.
-    cfg = _ladder_cfg(annotate_cw=2048)            # tight window
-    stage = VerifyStage(cfg)
-    ep = _episode([_frame("f0"), _frame("f1")])
-    from labelkit.operators.annotate import AnnotatePromptOptions, RepairContext
-    repair = RepairContext(previous_output={"task_label": "旧"}, critiques_text="c")
-    metrics = _CapturingMetrics()
-    ctx = SimpleNamespace(cfg=cfg, llm=SimpleNamespace(calibrator=_FixedCalibrator(800)),
-                          schema_engine=SimpleNamespace(user_schema_text="{}"),
-                          metrics=metrics, batch_no=1)
-    opts = StreamVerifyDriver(stage)._repair_ladder(
-        ep, ctx, AnnotatePromptOptions(repair=repair),
-    )
-    assert (opts.k_eff, opts.image_px) == (10, None)
-    assert "budget.escalations" not in metrics.counters
-
-
-def test_repair_chain_passes_escalation_kwargs_through(monkeypatch):
-    # fail → repair re-annotation receives the ladder kwargs (F3 pass-through);
-    # the second round passes and the escalation is counted once.
-    cfg = _ladder_cfg()
-    annotate_calls = _stub_annotate_v21(monkeypatch)
-    f0 = _frame("f0")
-    ep = _episode([f0])
-    engine = SeqJudgeEngine({ep.record.id: [
-        _seq_obj("fail", defects=[], critiques=[C1]),
-        _seq_obj("pass"),
-    ]})
-    engine.user_schema_text = "{}"
-    metrics = _CapturingMetrics()
-    ctx = _ladder_ctx(cfg, engine, metrics)
-    batch = [_env(f0), ep]
-    asyncio.run(VerifyStage(cfg).run(batch, ctx))
-    assert ep.status == "active"
-    (call,) = annotate_calls
-    assert call.k_eff == 10                        # k halved: max(2, ⌈20/2⌉)
-    assert call.image_px == 1536                   # one rung up, ≤ max_image_px
-    assert metrics.counters["budget.escalations"] == 1
-
-
-def test_repair_chain_budget_off_keeps_v19_call_shape(monkeypatch):
-    # Budget off: annotate_record is called WITHOUT the v1.11 kwargs — the
-    # pre-v1.11 stub signature (no k_eff/image_px) must keep working.
-    cfg = _stream_cfg()                            # llm_profiles={} → budget off
-    annotate_calls = _stub_annotate(monkeypatch)   # v1.9-era stub, no new kwargs
-    f0 = _frame("f0")
-    ep = _episode([f0])
-    engine = SeqJudgeEngine({ep.record.id: [
-        _seq_obj("fail", defects=[], critiques=[C1]),
-        _seq_obj("pass"),
-    ]})
-    metrics = _run_verify(cfg, [_env(f0), ep], engine)
-    assert ep.status == "active"
-    assert len(annotate_calls) == 1
-    assert "budget.escalations" not in metrics.counters
-
-
-# ── v1.12 帧产物手术同步（SPEC-frame-annotation §3.4：收缩删键/回收补跑）─────
 
 FRAME_INSTRUCTION = "标注该帧的意图。"
 
@@ -2354,7 +2215,7 @@ def _stub_annotate_member(monkeypatch, *, fail=False):
     """帧标注纯叶桩：记录 (member_id, label)；fail=True 时抛 ordinary 失败。"""
     calls = []
 
-    async def fake(member, ctx, label=None):
+    async def fake(member, ctx, label=None, target=None):
         calls.append((member.id, label))
         if fail:
             raise SchemaViolation(["/intent: invalid"], "{}")
@@ -2364,7 +2225,7 @@ def _stub_annotate_member(monkeypatch, *, fail=False):
     return calls
 
 
-def test_verify_backfill_duplicate_member_id_is_first_wins(monkeypatch):
+def test_verify_backfill_duplicate_content_uses_distinct_occurrences(monkeypatch):
     """帧分类与帧标注补跑按成员 id first-wins，只派发首个重复成员。"""
     cfg = _frame_stream_cfg()
     classify_calls = _stub_classify_frames(monkeypatch)
@@ -2391,17 +2252,17 @@ def test_verify_backfill_duplicate_member_id_is_first_wins(monkeypatch):
 
     planned, dead = driver._plan_frame_classify_jobs([state], ctx)
     assert dead == set()
-    assert len(planned) == 1 and planned[0].member is first
+    assert len(planned) == 2 and [job.position for job in planned] == [0, 1]
     assert asyncio.run(driver._backfill_frame_classify([state], ctx)) == set()
     annotate_jobs = driver._frame_annotate_jobs(state, ctx)
-    assert len(annotate_jobs) == 1 and annotate_jobs[0][1] is first
+    assert len(annotate_jobs) == 2 and [job.position for job in annotate_jobs] == [0, 1]
     assert asyncio.run(driver._backfill_frame_annotate([state], ctx)) == set()
 
-    assert classify_calls == [["duplicate"]]
-    assert annotate_calls == [("duplicate", "task_request")]
-    assert [len(group) for group in runner.groups] == [1, 1]
-    assert set(episode.member_classifications) == {"duplicate"}
-    assert set(episode.member_annotations) == {"duplicate"}
+    assert classify_calls == [["duplicate"], ["duplicate"]]
+    assert annotate_calls == [("duplicate", "task_request")] * 2
+    assert [len(group) for group in runner.groups] == [2, 2]
+    assert set(episode.member_classifications) == {0, 1}
+    assert set(episode.member_annotations) == {0, 1}
 
 
 def test_shrink_deletes_stale_keys_including_none_values(monkeypatch):
@@ -2428,9 +2289,9 @@ def test_shrink_deletes_stale_keys_including_none_values(monkeypatch):
     assert [m.id for m in ep.record.members] == ["f0", "f2"]
     assert ep.member_classifications is mc         # 对象不换（克隆共享前提）
     assert ep.member_annotations is ma
-    assert set(mc) == {"f0", "f2"}
-    assert set(ma) == {"f0", "f2"}                 # f1 的 None 值键一并删除
-    assert mc["f0"] is c0 and ma["f0"] is a0       # 既有键原样保留
+    assert set(mc) == {0, 2}
+    assert set(ma) == {0, 2}                 # f1 的 None 值键一并删除
+    assert mc[0] is c0 and ma[0] is a0       # 既有键原样保留
     assert cf_calls == [] and am_calls == []       # 无键缺位 ⇒ 零补跑
 
 
@@ -2459,12 +2320,12 @@ def test_reclaim_backfills_both_frame_products_only_missing(monkeypatch):
     assert [m.id for m in ep.record.members] == ["f0", "f1", "f2"]
     assert cf_calls == [["f2"]]                        # 单元素调用、只补缺位
     assert am_calls == [("f2", "task_request")]        # 帧类取自补跑判决
-    assert ep.member_classifications["f0"] is c0       # 幂等：既有键对象同一
-    assert ep.member_classifications["f1"] is c1
-    assert ep.member_annotations["f0"] is a0
-    assert ep.member_annotations["f1"] is None         # failed 占位不被重跑
-    assert ep.member_classifications["f2"].label == "task_request"
-    assert ep.member_annotations["f2"] is not None
+    assert ep.member_classifications[0] is c0       # 幂等：既有键对象同一
+    assert ep.member_classifications[1] is c1
+    assert ep.member_annotations[0] is a0
+    assert ep.member_annotations[1] is None         # failed 占位不被重跑
+    assert ep.member_classifications[2].label == "task_request"
+    assert ep.member_annotations[2] is not None
     assert ep.status == "active"
 
 
@@ -2490,9 +2351,9 @@ def test_reclaim_skip_class_member_occupies_no_key(monkeypatch):
     metrics = _run_verify(cfg, [_env(f0), _env(f1), e2, ep], engine)
     assert [m.id for m in ep.record.members] == ["f0", "f1", "f2"]
     assert cf_calls == [["f2"]]
-    assert ep.member_classifications["f2"].label == "chitchat"
+    assert ep.member_classifications[2].label == "chitchat"
     assert am_calls == []                              # 跳过类不跑帧标注
-    assert "f2" not in ep.member_annotations           # 不占键（skipped 语义）
+    assert 2 not in ep.member_annotations           # 不占键（skipped 语义）
     # 终审缺陷修复：回收路径的跳过类与 M5 供数点同口径计 skipped——
     # report 与 members[] 状态直方图可对账。
     assert metrics.counters.get("frame_annotate.skipped") == 1
@@ -2521,7 +2382,7 @@ def test_reclaim_frame_classify_off_uses_global_instruction(monkeypatch):
     assert cf_calls == []                              # 帧分类关：不补跑
     assert ep.member_classifications is None           # 恒 None，不无中生有
     assert am_calls == [("f2", None)]                  # label=None 全局指令
-    assert ep.member_annotations["f2"] is not None
+    assert ep.member_annotations[2] is not None
 
 
 def test_surgery_never_touches_none_frame_products(monkeypatch):
@@ -2568,8 +2429,8 @@ def test_reclaim_annotate_member_failure_occupies_key_none(monkeypatch):
     ]})
     _run_verify(cfg, [_env(f0), _env(f1), e2, ep], engine)
     assert am_calls == [("f2", "task_request")]
-    assert "f2" in ep.member_annotations               # 占键在场
-    assert ep.member_annotations["f2"] is None         # 值 None = failed
+    assert 2 in ep.member_annotations                  # 明确出现位置占键在场。
+    assert ep.member_annotations[2] is None         # 值 None = failed
 
 
 def test_clone_surgery_ban_keeps_frame_products_untouched(monkeypatch):
@@ -2608,9 +2469,9 @@ def test_clone_surgery_ban_keeps_frame_products_untouched(monkeypatch):
     _run_verify(cfg, [e0, e1, e2, original, clone], engine)
     assert clone.status == "dropped_verify"            # 缺陷降格 mark-only
     assert [m.id for m in clone.record.members] == ["f0", "f1"]
-    assert clone.member_classifications is mc and set(mc) == {"f0", "f1"}
-    assert clone.member_annotations is ma and set(ma) == {"f0", "f1"}
-    assert mc["f0"] is c0 and ma["f0"] is a0 and ma["f1"] is None
+    assert clone.member_classifications is mc and set(mc) == {0, 1}
+    assert clone.member_annotations is ma and set(ma) == {0, 1}
+    assert mc[0] is c0 and ma[0] is a0 and ma[1] is None
     assert cf_calls == [] and am_calls == []           # 无手术 ⇒ 无同步分支
 
 
@@ -2619,83 +2480,6 @@ def test_clone_surgery_ban_keeps_frame_products_untouched(monkeypatch):
 # 修复路径的重标注本身经 annotate_record 的 label 自然穿透（M5 单点取值），M7
 # 侧唯一的消费点是升清换档的试装估算：提示词 Schema 文本与 schema_eff 计价都
 # 必须按类取值，否则试装与真实调用不同源。以下两例分别钉住文本侧与计价侧。
-
-CLASS_SCHEMA_BIG = {
-    "type": "object",
-    "properties": {"task_label": {"type": "string", "description": "凑" * 20000}},
-    "required": ["task_label"],
-}
-
-
-def _class_schema_cfg(*, structured: bool, annotate_cw: int) -> ResolvedConfig:
-    """_ladder_cfg + 两个序列类视图：'big' 声明巨大的按类标注 Schema，'plain'
-    零覆盖（回落全局 USER_SCHEMA）。annotate profile 的结构化输出开关可切——
-    关 ⇒ schema_eff 恒 None（只有提示词文本进计价），开 ⇒ 再计一份类有效
-    Schema。"""
-    base = _ladder_cfg(annotate_cw=annotate_cw)
-    profiles = dict(base.llm_profiles)
-    profiles["default"] = replace(profiles["default"],
-                                  supports_structured_output=structured)
-    views = {
-        name: ClassView(name=name, quality=base.quality, rubric=base.rubric,
-                        annotate=base.annotate, generate=base.generate,
-                        verify=base.verify, extract=base.extract, schema=schema,
-                        model_schema=schema or base.model_user_schema)
-        for name, schema in (("big", CLASS_SCHEMA_BIG), ("plain", None))
-    }
-    classify = ClassifyConfig(
-        enabled=True, fallback_class="plain",
-        classes=(ClassSpec(name="big", description="按类 Schema 类"),
-                 ClassSpec(name="plain", description="零覆盖类")))
-    return replace(base, llm_profiles=profiles, classify=classify,
-                   class_views=views)
-
-
-def _ladder_opts(cfg, label, metrics):
-    """跑一次 V21 换档决策（零 LLM：试装只做估算，不发请求）。"""
-    from labelkit.operators.annotate import AnnotatePromptOptions, RepairContext
-
-    repair = RepairContext(previous_output={"task_label": "旧"}, critiques_text="c")
-    ctx = _ladder_ctx(cfg, SimpleNamespace(user_schema_text="{}"), metrics)
-    return StreamVerifyDriver(VerifyStage(cfg))._repair_ladder(
-        _episode([_frame("f0")]), ctx,
-        AnnotatePromptOptions(repair=repair, label=label))
-
-
-def test_repair_ladder_trial_uses_class_schema_text():
-    # 结构化输出关 ⇒ schema_eff 恒 None：唯一变量是提示词内嵌的 Schema 文本。
-    # 按类 Schema 文本（2 万 CJK）本身就撑破紧窗口 ⇒ 升清被否决、保留 k 减半；
-    # 零覆盖类沿用 M8 既有 user_schema_text ⇒ 升清照常。
-    cfg = _class_schema_cfg(structured=False, annotate_cw=20_000)
-    metrics = _CapturingMetrics()
-    big = _ladder_opts(cfg, "big", metrics)
-    assert (big.k_eff, big.image_px) == (10, None)
-    assert "budget.escalations" not in metrics.counters
-
-    plain_metrics = _CapturingMetrics()
-    assert _ladder_opts(cfg, "plain", plain_metrics).image_px == 1536
-    assert plain_metrics.counters["budget.escalations"] == 1
-
-
-def test_repair_ladder_prices_class_effective_schema():
-    # 宽窗口下按类 Schema 文本单独放得进（对照组：结构化输出关 ⇒ 升清照常）。
-    control = _class_schema_cfg(structured=False, annotate_cw=30_000)
-    assert _ladder_opts(control, "big", _CapturingMetrics()).image_px == 1536
-
-    # 结构化输出开 ⇒ schema_eff 再计一份类有效 Schema ⇒ 越预算，升清被否决。
-    cfg = _class_schema_cfg(structured=True, annotate_cw=30_000)
-    metrics = _CapturingMetrics()
-    big = _ladder_opts(cfg, "big", metrics)
-    assert (big.k_eff, big.image_px) == (10, None)
-    assert "budget.escalations" not in metrics.counters
-
-    # 同一 cfg 的零覆盖类按全局 user_schema 计价 ⇒ 升清照常（计价确按类取值）。
-    plain_metrics = _CapturingMetrics()
-    assert _ladder_opts(cfg, "plain", plain_metrics).image_px == 1536
-    assert plain_metrics.counters["budget.escalations"] == 1
-
-
-# ── v1.13 判决形序列变体（裁决·直装评审判决形，§10.16）───────────────────────
 
 def _text_member(rid: str, text: str) -> Record:
     return Record(id=rid, modality="text", text=text, raw={"text": text},
@@ -2785,7 +2569,7 @@ def test_verdict_form_off_keeps_defect_variant_byte_identical():
     cfg = _verdict_cfg()
     record = _assembled_sequence()
     bundle = build_verify_prompt(record, {"intent": "x"}, cfg,
-                                 VerifyPromptOptions(boundary_margin="段首前 1: 无"))
+                                 VerifyPromptOptions(member_positions=(0, 1, 2), boundary_margin="段首前 1: 无"))
     system_text = bundle.messages[0].parts[0].text
     assert "缺陷类型" in system_text
     assert any("[边界余量]" in (p.text or "")
@@ -3175,6 +2959,7 @@ def test_stream_strict_waves_use_pure_leaves_and_fresh_frame_results(monkeypatch
         tasks=runner,
     )
 
+    _stamp_stream(batch, engine)
     asyncio.run(VerifyStage(cfg).run(batch, ctx))
 
     assert [_group_phase(group) for group in runner.groups] == [
@@ -3188,9 +2973,9 @@ def test_stream_strict_waves_use_pure_leaves_and_fresh_frame_results(monkeypatch
     ]
     assert noise.status == "absorbed"
     assert [member.id for member in episode.record.members] == ["f0", "f1", "f2"]
-    assert episode.member_classifications["f2"].label == "task_request"
+    assert episode.member_classifications[2].label == "task_request"
     assert member_calls == [("f2", "task_request")]
-    assert episode.member_annotations["f2"].output == {"intent": "帧", "entities": []}
+    assert episode.member_annotations[2].output == {"intent": "帧", "entities": []}
     assert len(annotate_calls) == 1
     assert annotate_calls[0].temporal_context is temporal_context
     assert episode.verification.verdict == "pass"
@@ -3343,6 +3128,7 @@ def _stream_attempt(cfg, items, engine):
     )
 
     metrics = _AttemptMetrics()
+    _stamp_stream(items, engine)
     transaction = AttemptTransaction(tuple(items), {}, ())
     ctx = _task_context(
         cfg=cfg, llm=None, schema_engine=engine, metrics=metrics,
@@ -3435,3 +3221,517 @@ def test_zero_call_verify_submits_no_task_group():
     result = asyncio.run(VerifyStage(None).run(batch, ctx))
 
     assert result is batch
+
+
+def test_preview_capacity_prices_full_members_and_actual_schema_without_model():
+    cfg = _stream_cfg(policy="drop")
+    profiles = {name: replace(profile, context_window=4000, max_output_tokens=100)
+                for name, profile in cfg.llm_profiles.items()}
+    cfg = replace(cfg, llm_profiles=profiles)
+    episode = _episode([_ui_frame("a", "unique-middle" + "x" * 50000), _frame("b")])
+    engine = SeqJudgeEngine({})
+    ctx = _task_context(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics())
+    failure = VerifyStage(cfg).preview_capacity(episode, ctx)
+    assert failure.stage == "verify" and failure.unit == "sequence"
+    assert failure.targets[0].member_positions == (0, 1)
+    assert failure.error.phase == "precheck" and failure.error.profile == "judge"
+    assert engine.calls == []
+
+
+def test_actual_review_overflow_escapes_before_model_and_preserves_all_items():
+    from labelkit.common.errors import SessionCapacityError
+    cfg = _stream_cfg(policy="drop")
+    cfg = replace(cfg, llm_profiles={name: replace(profile, context_window=4000, max_output_tokens=100)
+                                   for name, profile in cfg.llm_profiles.items()})
+    frame = _env(_ui_frame("a", "x" * 50000))
+    episode = _episode([frame.record])
+    batch = [frame, episode]
+    _stamp_stream(batch)
+    original = [dict(item.__dict__) for item in batch]
+    engine = SeqJudgeEngine({})
+    ctx = _task_context(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics())
+    with pytest.raises(SessionCapacityError) as captured:
+        asyncio.run(VerifyStage(cfg).run(batch, ctx))
+    assert captured.value.failures[0].unit == "sequence"
+    assert engine.calls == []
+    assert [item.__dict__ for item in batch] == original
+
+
+def test_capacity_boundary_exemption_is_specific_to_touching_edge():
+    from labelkit.operators.verify_capacity import boundary_suspicion
+    episode = _episode([_frame("a"), _frame("b")])
+    episode.member_positions = (3, 4)
+    before, after = CapacityCut(2, 3, "annotate", "default", "precheck"), CapacityCut(4, 5, "annotate", "default", "precheck")
+    episode.capacity = SequenceCapacity(SequenceBounds(3, 5, before, after), sealed=True)
+    assert boundary_suspicion(episode, _defect("missing_head"))
+    assert boundary_suspicion(episode, _defect("missing_tail"))
+    assert not boundary_suspicion(episode, _defect("missing_members", members=[2]))
+    assert not boundary_suspicion(episode, _defect("missing_tail", members=[100]))
+    assert boundary_suspicion(episode, _defect("missing_tail", members=[5]))
+    assert not boundary_suspicion(episode, _defect("label_mismatch"))
+    episode.member_positions = (4,)
+    episode.record = replace(episode.record, members=episode.record.members[1:])
+    assert not boundary_suspicion(episode, _defect("missing_head"))
+
+
+def test_capacity_suspicion_does_not_exempt_other_real_defects(monkeypatch):
+    cfg = _stream_cfg(policy="drop")
+    frame = _env(_frame("f0"))
+    episode = _episode([frame.record])
+    cut = CapacityCut(0, 1, "annotate", "default", "precheck")
+    episode.capacity = SequenceCapacity(SequenceBounds(0, 1, after=cut), sealed=True)
+    engine = SeqJudgeEngine({episode.record.id: [_seq_obj("fail", defects=[
+        _defect("missing_tail"), _defect("label_mismatch")])]})
+    _run_verify(cfg, [frame, episode], engine)
+    assert episode.status == "dropped_verify"
+    assert episode.verification.verdict == "fail"
+    assert [defect["kind"] for defect in episode.verification.defects] == ["label_mismatch", "missing_tail"]
+
+
+def test_expanded_reannotation_overflow_reports_working_positions_and_rolls_back(monkeypatch):
+    from labelkit.common.errors import SessionCapacityError
+    cfg = _stream_cfg(extract_enabled=False)
+    _stub_judge_window(monkeypatch)
+    observed = []
+
+    async def overflow(record, ctx, opts=None):
+        observed.append(tuple(member.id for member in record.members))
+        raise ContextOverflowError("expanded evidence overflow", profile="default", phase="reactive", origin="finish")
+
+    monkeypatch.setattr("labelkit.operators.annotate.annotate_record_leaf", overflow)
+    frames = [_env(_frame(f"f{i}")) for i in range(3)]
+    frames[2].status = "dropped_noise"
+    frames[2].noise_attribution = ("segment", "noise")
+    episode = _episode([frames[0].record, frames[1].record])
+    batch = [*frames, episode]
+    engine = SeqJudgeEngine({episode.record.id: [_seq_obj("fail", defects=[_defect("missing_tail")])]})
+    _stamp_stream(batch, engine)
+    original_annotation = episode.annotation
+    ctx = _task_context(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics())
+    with pytest.raises(SessionCapacityError) as captured:
+        asyncio.run(VerifyStage(cfg).run(batch, ctx))
+    failure = captured.value.failures[0]
+    assert failure.stage == "verify" and failure.unit == "sequence"
+    assert failure.targets[0].member_positions == (0, 1, 2)
+    assert observed == [("f0", "f1", "f2")]
+    assert episode.member_positions == (0, 1) and episode.annotation == original_annotation
+    assert frames[2].status == "dropped_noise" and frames[2].noise_attribution == ("segment", "noise")
+    assert not hasattr(episode, "stream_repaired") and episode.verification is None
+
+
+def test_named_duplicate_content_shrink_removes_only_target_occurrence(monkeypatch):
+    cfg = _stream_cfg(extract_enabled=False)
+    _stub_annotate(monkeypatch)
+    frames = [_env(_frame("same", pair_index=index)) for index in range(3)]
+    episode = _episode([frame.record for frame in frames])
+    engine = SeqJudgeEngine({episode.record.id: [
+        _seq_obj("fail", defects=[_defect("off_task_members", members=[1])]), _seq_obj("pass")]})
+    _run_verify(cfg, [*frames, episode], engine)
+    assert episode.member_positions == (0, 2)
+    assert [frame.status for frame in frames] == ["absorbed", "dropped_noise", "absorbed"]
+    assert episode.record.members == (frames[0].record, frames[2].record)
+
+
+def test_claim_and_rebuild_recheck_allowed_bounds_before_committing():
+    cfg = _stream_cfg(extract_enabled=False)
+    episode = _episode([_frame("a"), _frame("b")])
+    episode.capacity = SequenceCapacity(SequenceBounds(0, 2))
+    state = _EpisodeReview(episode, 0)
+    frame = _env(_frame("outside", pair_index=2), status="dropped_noise")
+    driver = StreamVerifyDriver(VerifyStage(cfg))
+    with pytest.raises(InternalError, match="claim violates"):
+        driver._make_claim(state, frame, 2)
+    state.working_positions.append(2)
+    state.working_members.append(frame.record)
+    with pytest.raises(InternalError, match="rebuild violates"):
+        driver._rebuild_episode(state)
+    assert episode.member_positions == (0, 1) and frame.status == "dropped_noise"
+
+
+def test_fragment_projection_assigns_reclaim_to_previous_original_fragment():
+    from labelkit.operators.verify_capacity import project_fragments
+    records = [_frame("same", pair_index=index) for index in range(6)]
+    episode = _episode(records)
+    episode.stitch_fragments = (
+        {"order_span": [1, 3], "member_count": 2, "cause": "origin", "source_episode": "left", "member_positions": [1, 3]},
+        {"order_span": [5, 5], "member_count": 1, "cause": "resumed", "source_episode": "right", "member_positions": [5]},
+    )
+    project_fragments(episode, (1, 3, 5))
+    assert [fragment["member_positions"] for fragment in episode.stitch_fragments] == [[0, 1, 2, 3, 4], [5]]
+    assert [fragment["source_episode"] for fragment in episode.stitch_fragments] == ["left", "right"]
+    assert sum(fragment["member_count"] for fragment in episode.stitch_fragments) == len(records)
+
+
+def test_seam_rebuild_uses_actual_occurrence_ownership_and_preserved_task_names():
+    from labelkit.operators.verify_capacity import plan_seams
+    records = [_frame("same", pair_index=index) for index in range(5)]
+    first = _episode([records[0], records[4]], eid="first")
+    first.member_positions = (0, 4)
+    first.stitch_task_name = "first-task"
+    second = _episode([records[2]], eid="second")
+    second.member_positions = (2,)
+    second.stitch_task_name = "foreign-task"
+    state = _EpisodeReview(first, 0)
+    plan_seams([state], [first, second])
+    assert state.seams == {0: ("foreign-task",)}
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 100])
+def test_stream_review_leaf_groups_preserve_panel_votes(batch_size):
+    cfg = _stream_cfg(policy="drop", judges=("j1", "j2", "j3"))
+    cfg = replace(cfg, run=replace(cfg.run, batch_size=batch_size))
+    frame = _env(_frame("a"))
+    episode = _episode([frame.record])
+    engine = SeqJudgeEngine({episode.record.id: [_seq_obj("pass"), _seq_obj("fail"), _seq_obj("pass")]})
+    runner = _TaskRunner()
+    ctx = _task_context(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(), tasks=runner)
+    asyncio.run(VerifyStage(cfg).run([frame, episode], ctx))
+    assert episode.verification.verdict == "pass"
+    assert [len(group) for group in runner.groups] == ([1, 1, 1] if batch_size == 1 else [2, 1] if batch_size == 2 else [3])
+
+
+def test_boundary_preview_includes_allowed_full_tree_and_image_but_never_crosses_cut():
+    cfg = replace(_stream_cfg(), llm_profiles={"judge": _budget_profile("judge", 8192),
+                                             "default": _budget_profile("default", 8192)})
+    frames = [_env(_ui_frame("outside-left", "CUT_LEFT" * 20000)),
+              _env(_ui_frame("member", "MEMBER")),
+              _env(_ui_frame("neighbor", "NEIGHBOR_FULL_TREE")),
+              _env(_ui_frame("outside-right", "CUT_RIGHT" * 20000))]
+    episode = _episode([frames[1].record])
+    episode.capacity = SequenceCapacity(SequenceBounds(
+        1, 3, CapacityCut(0, 1, "annotate", "default", "precheck"),
+        CapacityCut(2, 3, "annotate", "default", "precheck")))
+    batch = [*frames, episode]
+    _stamp_stream(batch)
+    engine = SeqJudgeEngine({})
+    ctx = _task_context(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics())
+    plan = StreamVerifyDriver(VerifyStage(cfg))._plan_episode_review(_EpisodeReview(episode, 0), batch, ctx)
+    parts = plan.prompt.messages[1].parts
+    text = "\n".join(part.text for part in parts if part.kind == "text")
+    assert frames[2].record.ui_tree.serialize(None) in text
+    assert "CUT_LEFT" not in text and "CUT_RIGHT" not in text
+    assert [part.image for part in parts if part.kind == "image"] == [frames[1].record.image, frames[2].record.image]
+    assert engine.calls == []
+
+
+def _seam_dependency_batch():
+    from labelkit.operators.extract import _seam_placeholder
+    frames = [_env(_frame(f"f{index}", pair_index=index),
+                   status="dropped_noise" if index in (1, 3) else "absorbed") for index in range(6)]
+    first = _episode([frames[0].record, frames[4].record], eid="first", transitions=(_seam_placeholder(0, ("B",)),))
+    second = _episode([frames[2].record, frames[5].record], eid="second", transitions=(_seam_placeholder(0, ("A",)),))
+    first.stitch_task_name, second.stitch_task_name = "A", "B"
+    first.seam_indexes, second.seam_indexes = (0,), (0,)
+    first.seam_interrupted_by, second.seam_interrupted_by = (("B",),), (("A",),)
+    batch = [*frames, first, second]
+    _stamp_stream(batch)
+    return batch, first, second
+
+
+@pytest.mark.parametrize("multi", [False, True])
+def test_foreign_member_shrink_reopens_passed_seam_owner_with_full_repair_and_review(monkeypatch, multi):
+    from labelkit.operators.classify import ClassifyStage
+    cfg = replace(_stream_classified_cfg() if multi else _stream_cfg(), stitch=StitchConfig(enabled=True))
+    extracts = _stub_extract(monkeypatch)
+    annotations = _stub_annotate(monkeypatch)
+    batch, first, second = _seam_dependency_batch()
+    if multi:
+        first.classification = Classification("a", ("a",), "llm", {})
+        second.classification = Classification("a", ("a", "b"), "llm", {})
+        ClassifyStage._fan_out(batch, [first, second])
+        clone = batch[-1]
+        clone.annotation, clone.transitions = _annotation({"task_label": "B"}), second.transitions
+    engine = SeqJudgeEngine({first.record.id: [_seq_obj("pass"), _seq_obj("pass")],
+                             second.record.id: [_seq_obj("fail", defects=[_defect("off_task_members", members=[2])]),
+                                                *[_seq_obj("pass") for _ in range(2 if multi else 1)]]})
+    _run_verify(cfg, batch, engine)
+    assert first.member_positions == (0, 4) and second.member_positions == (5,)
+    assert extracts == [("f0", "f4", 0, "a" if multi else None)]
+    assert [call.record.id for call in annotations] == ["second", "first"]
+    assert first.seam_indexes == () and first.seam_interrupted_by == ()
+    assert first.transitions[0].action["description"] == "f0->f4"
+    assert first.verification.rounds == second.verification.rounds == 2
+    assert first.verification.verdict == second.verification.verdict == "pass"
+    assert batch[2].status == "dropped_noise"
+    if multi:
+        assert clone.record.id == second.record.id and clone.member_positions == (2, 5)
+        assert clone.seam_indexes == (0,) and clone.seam_interrupted_by == (("A",),)
+        assert clone.verification.verdict == "pass" and clone.verification.rounds == 1
+
+
+def test_multi_owner_reclaim_does_not_invent_a_self_interruption_for_its_clone(monkeypatch):
+    from labelkit.operators.classify import ClassifyStage
+    cfg = replace(_stream_classified_cfg(), stitch=StitchConfig(enabled=True))
+    claims = _stub_judge_window(monkeypatch)
+    extracts = _stub_extract(monkeypatch)
+    annotations = _stub_annotate(monkeypatch)
+    frames = [_env(_frame(f"f{i}", pair_index=i), status="absorbed" if i in (0, 4) else "dropped_noise")
+              for i in range(5)]
+    owner = _episode([frames[0].record, frames[4].record], transitions=(_transition(0),),
+                     classification=Classification("a", ("a", "b"), "llm", {}))
+    owner.stitch_task_name = "same-task"
+    owner.seam_indexes, owner.seam_interrupted_by = (), ()
+    batch = [*frames, owner]
+    _stamp_stream(batch)
+    ClassifyStage._fan_out(batch, [owner])
+    clone = batch[-1]
+    clone.annotation, clone.transitions = _annotation({"task_label": "B"}), owner.transitions
+    original_clone_annotation = clone.annotation
+    engine = SeqJudgeEngine({owner.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_members", members=[2])]), _seq_obj("pass"), _seq_obj("pass")]})
+    _run_verify(cfg, batch, engine)
+    assert owner.member_positions == (0, 2, 4) and clone.member_positions == (0, 4)
+    assert frames[2].status == "absorbed" and frames[1].status == frames[3].status == "dropped_noise"
+    assert claims == [["f0", "f2", "f4"]]
+    assert extracts == [("f0", "f2", 0, "a"), ("f2", "f4", 1, "a")]
+    assert [(call.record.id, call.label) for call in annotations] == [(owner.record.id, "a")]
+    assert clone.seam_indexes == clone.seam_interrupted_by == ()
+    assert owner.seam_indexes == owner.seam_interrupted_by == ()
+    assert clone.annotation is original_clone_annotation
+    assert owner.verification.rounds == 2 and clone.verification.rounds == 1
+    assert owner.verification.verdict == clone.verification.verdict == "pass"
+
+
+def test_same_task_name_from_an_independent_sequence_still_interrupts_a_clone():
+    from labelkit.operators.classify import ClassifyStage
+    from labelkit.operators.verify_capacity import current_seams
+    frames = [_frame(f"f{i}", pair_index=i) for i in range(5)]
+    owner = _episode([frames[0], frames[4]], eid="owner",
+                     classification=Classification("a", ("a", "b"), "llm", {}))
+    owner.member_positions, owner.stitch_task_name = (0, 4), "same-task"
+    batch = [owner]
+    ClassifyStage._fan_out(batch, [owner])
+    clone = batch[-1]
+    owner.record, owner.member_positions = replace(owner.record, members=(frames[0], frames[2], frames[4])), (0, 2, 4)
+    assert current_seams(clone, batch) == {}
+    foreign = _episode([frames[3]], eid="foreign")
+    foreign.member_positions, foreign.stitch_task_name = (3,), "same-task"
+    assert current_seams(clone, [*batch, foreign]) == {0: ("same-task",)}
+
+
+def test_clone_seam_dependency_preserves_owner_reclaimed_shared_frame_products(monkeypatch):
+    from labelkit.operators.classify import ClassifyStage
+    cfg = replace(_frame_stream_cfg(_stream_classified_cfg()), stitch=StitchConfig(enabled=True))
+    _stub_judge_window(monkeypatch)
+    _stub_extract(monkeypatch)
+    annotations = _stub_annotate(monkeypatch)
+    classifications = _stub_classify_frames(monkeypatch)
+    frame_annotations = _stub_annotate_member(monkeypatch)
+    batch, first, second = _seam_dependency_batch()
+    first.classification = Classification("a", ("a", "b"), "llm", {})
+    second.classification = Classification("a", ("a",), "llm", {})
+    first.member_classifications = {0: _member_cls(), 4: _member_cls()}
+    first.member_annotations = {0: _annotation({"intent": "frame"}), 4: None}
+    ClassifyStage._fan_out(batch, [first, second])
+    clone = batch[-1]
+    clone.annotation, clone.transitions = _annotation({"task_label": "A"}), first.transitions
+    engine = SeqJudgeEngine({first.record.id: [
+        _seq_obj("fail", defects=[_defect("missing_members", members=[1])]),
+        _seq_obj("pass"), _seq_obj("pass"), _seq_obj("pass")], second.record.id: [
+        _seq_obj("fail", defects=[_defect("off_task_members", members=[2])]), _seq_obj("pass")]})
+    _run_verify(cfg, batch, engine)
+    assert first.member_positions == (0, 1, 4) and clone.member_positions == (0, 4)
+    assert first.member_classifications is clone.member_classifications
+    assert first.member_annotations is clone.member_annotations
+    assert set(first.member_classifications) == set(first.member_annotations) == {0, 1, 4}
+    assert classifications == [["f1"]] and frame_annotations == [("f1", "task_request")]
+    assert [(call.record.id, call.label) for call in annotations] == [("first", "a"), ("second", "a"), ("first", "b")]
+    assert clone.seam_indexes == clone.seam_interrupted_by == ()
+    assert first.verification.verdict == second.verification.verdict == clone.verification.verdict == "pass"
+    assert first.verification.rounds == second.verification.rounds == clone.verification.rounds == 2
+
+
+def test_shrink_reorders_interleaved_fragments_by_first_surviving_position(monkeypatch):
+    cfg = replace(_stream_cfg(), stitch=StitchConfig(enabled=True))
+    extracts = _stub_extract(monkeypatch)
+    annotations = _stub_annotate(monkeypatch)
+    frames = [_env(_frame(f"f{i}", pair_index=i), status="absorbed" if i in (0, 4, 6, 8) else "dropped_noise")
+              for i in range(9)]
+    episode = _episode([frames[i].record for i in (0, 4, 6, 8)],
+                       transitions=tuple(_transition(i) for i in range(3)))
+    episode.stitch_task_name = "task"
+    episode.stitch_fragments = (
+        {"order_span": [0, 8], "member_count": 2, "cause": "origin", "source_episode": "left", "member_positions": [0, 8]},
+        {"order_span": [4, 6], "member_count": 2, "cause": "resumed", "source_episode": "right", "member_positions": [4, 6]},
+    )
+    engine = SeqJudgeEngine({episode.record.id: [
+        _seq_obj("fail", defects=[_defect("off_task_members", members=[0])]), _seq_obj("pass")]})
+    _run_verify(cfg, [*frames, episode], engine)
+    assert episode.member_positions == (4, 6, 8) and frames[0].status == "dropped_noise"
+    assert [fragment["member_positions"] for fragment in episode.stitch_fragments] == [[4, 6], [8]]
+    assert [fragment["source_episode"] for fragment in episode.stitch_fragments] == ["right", "left"]
+    assert [fragment["cause"] for fragment in episode.stitch_fragments] == ["resumed", "origin"]
+    assert [fragment["member_count"] for fragment in episode.stitch_fragments] == [2, 1]
+    assert all(list(fragment) == ["order_span", "member_count", "cause", "source_episode", "member_positions"]
+               for fragment in episode.stitch_fragments)
+    assert extracts == [] and len(annotations) == 1
+    assert [transition.index for transition in episode.transitions] == [0, 1]
+    assert episode.verification.verdict == "pass" and episode.verification.rounds == 2
+
+
+def test_dependency_capacity_failure_restores_surgeon_and_previously_passed_owner(monkeypatch):
+    from labelkit.common.errors import SessionCapacityError
+    cfg = replace(_stream_cfg(), stitch=StitchConfig(enabled=True))
+    _stub_extract(monkeypatch)
+    batch, first, second = _seam_dependency_batch()
+    originals = [dict(item.__dict__) for item in batch]
+
+    async def annotate(record, ctx, opts=None):
+        if record.id == "first":
+            raise ContextOverflowError("dependency overflow", profile="default", phase="reactive", origin="finish")
+        return _annotation({"task_label": "updated"})
+
+    monkeypatch.setattr("labelkit.operators.annotate.annotate_record_leaf", annotate)
+    engine = SeqJudgeEngine({first.record.id: [_seq_obj("pass")], second.record.id: [
+        _seq_obj("fail", defects=[_defect("off_task_members", members=[2])])]})
+    ctx = _task_context(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics())
+    with pytest.raises(SessionCapacityError) as captured:
+        asyncio.run(VerifyStage(cfg).run(batch, ctx))
+    assert captured.value.failures[0].stage == "verify"
+    assert captured.value.failures[0].targets[0].member_positions == (0, 4)
+    assert [item.__dict__ for item in batch] == originals
+
+
+def test_seam_dependency_preserves_exhausted_round_budget_and_fails_stale_result(caplog):
+    cfg = replace(_stream_cfg(max_repair_rounds=1), stitch=StitchConfig(enabled=True))
+    batch, first, second = _seam_dependency_batch()
+    second.record = replace(second.record, members=second.record.members[1:])
+    second.member_positions = (5,)
+    state = _EpisodeReview(first, 0)
+    state.rounds, state.verdict = 2, "pass"
+    ctx = _task_context(cfg=cfg, schema_engine=SeqJudgeEngine({}), metrics=_CapturingMetrics())
+    assert StreamVerifyDriver(VerifyStage(cfg))._seam_dependents([state], batch, ctx) == []
+    assert first.status == "dropped_verify" and first.verification.verdict == "fail"
+    assert first.verification.rounds == 2
+    assert first.verification.defects[0]["detail"] == "Seam dependency repair budget exhausted."
+    assert "seam dependency repair budget exhausted" in caplog.text
+
+
+@pytest.mark.parametrize("batch_size", [1, 100])
+@pytest.mark.parametrize("nested", [False, True])
+def test_review_wave_reports_every_actual_overflow_across_computation_groups(batch_size, nested):
+    from labelkit.common.contracts.sequence_capacity import capacity_failures, capacity_target
+    from labelkit.common.errors import SessionCapacityError
+    cfg = _stream_cfg(policy="drop")
+    cfg = replace(cfg, run=replace(cfg.run, batch_size=batch_size))
+    frames = [_env(_frame("left")), _env(_frame("right"))]
+    episodes = [_episode([frame.record], eid=frame.record.id) for frame in frames]
+    engine = SeqJudgeEngine({episode.record.id: [ContextOverflowError(
+        "actual overflow", profile="judge", phase="reactive", origin="http_400")] for episode in episodes})
+    batch = [*frames, *episodes]
+    _stamp_stream(batch)
+    runner = _TaskRunner()
+    ctx = _task_context(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(), tasks=runner)
+    if nested:
+        episode = episodes[1]
+        engine.scripts[episode.record.id][0] = SessionCapacityError(capacity_failures(
+            ctx, (capacity_target(episode),), engine.scripts[episode.record.id][0], "sequence"))
+    with pytest.raises(SessionCapacityError) as captured:
+        asyncio.run(VerifyStage(cfg).run(batch, ctx))
+    assert [failure.targets[0].member_positions for failure in captured.value.failures] == [(0,), (1,)]
+    assert len(engine.calls) == 2
+    assert [len(group) for group in runner.groups] == ([1, 1] if batch_size == 1 else [2])
+    assert all(scope.complete_evidence for scope in engine.scopes)
+    assert all(episode.verification is None and episode.status == "active" for episode in episodes)
+
+
+def test_review_planning_collects_all_episode_and_judge_capacity_failures_before_calls():
+    from labelkit.common.errors import SessionCapacityError
+    cfg = _stream_cfg(judges=("j1", "j2", "j3"))
+    cfg = replace(cfg, llm_profiles={name: _budget_profile(name, 8192)
+                                     for name in ("j1", "j2", "j3", "judge", "default")})
+    frames = [_env(_text_member(name, "full evidence " * 20000)) for name in ("1-left", "2-right")]
+    episodes = [_episode([frame.record], eid=frame.record.id) for frame in frames]
+    batch = [*frames, *episodes]
+    _stamp_stream(batch)
+    engine = SeqJudgeEngine({})
+    ctx = _task_context(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics())
+    with pytest.raises(SessionCapacityError) as captured:
+        asyncio.run(VerifyStage(cfg).run(batch, ctx))
+    assert [(failure.targets[0].member_positions, failure.error.profile) for failure in captured.value.failures] == [
+        ((position,), profile) for position in range(2) for profile in ("j1", "j2", "j3")]
+    assert engine.calls == [] and all(episode.status == "active" for episode in episodes)
+
+
+@pytest.mark.parametrize("phase", ["claim", "reseam", "reannotate", "frame_classify", "frame_annotate"])
+def test_each_repair_wave_collects_all_capacity_outcomes_before_any_product_commit(monkeypatch, phase):
+    from labelkit.common.errors import SessionCapacityError
+    from labelkit.operators.classify import _FrameWindowOutcome
+    cfg = _frame_stream_cfg()
+    cfg = replace(cfg, run=replace(cfg.run, batch_size=1))
+    frames = [_env(_frame(f"f{index}", pair_index=index)) for index in range(6)]
+    episodes = [_episode([frame.record for frame in frames[start:start + 3]], eid=f"ep{start}",
+                         transitions=(_transition(0), _transition(1))) for start in (0, 3)]
+    _stamp_stream([*frames, *episodes])
+    states = [_EpisodeReview(episode, index) for index, episode in enumerate(episodes)]
+    runner = _TaskRunner()
+    ctx = _task_context(cfg=cfg, schema_engine=SeqJudgeEngine({}), metrics=_CapturingMetrics(), tasks=runner)
+    driver = StreamVerifyDriver(VerifyStage(cfg))
+    calls = []
+
+    async def fail(*args, **kwargs):
+        calls.append(args)
+        raise ContextOverflowError("wave overflow", profile="default", phase="reactive", origin="finish")
+
+    if phase == "claim":
+        monkeypatch.setattr("labelkit.operators.segment._call_window", fail)
+        for state, middle in zip(states, (1, 4)):
+            state.working_members.pop(1)
+            state.working_positions.pop(1)
+            frames[middle].status = "dropped_noise"
+            state.claims = [driver._make_claim(state, frames[middle], middle)]
+        operation = driver._resolve_claims(states, ctx)
+    elif phase == "reseam":
+        monkeypatch.setattr("labelkit.operators.extract._extract_transition_outcome", fail)
+        for state in states:
+            state.working_members.pop(1)
+            state.working_positions.pop(1)
+            state.surgical = True
+        operation = driver._reseam_episodes(states, ctx)
+    elif phase == "reannotate":
+        monkeypatch.setattr("labelkit.operators.annotate.annotate_record_leaf", fail)
+        operation = driver._reannotate_round(states, ctx)
+    elif phase == "frame_classify":
+        async def frame_failure(plan, span, context):
+            calls.append(plan)
+            error = ContextOverflowError("frame overflow", profile="default", phase="reactive", origin="finish")
+            return _FrameWindowOutcome(((span, error),), 1, 0)
+        monkeypatch.setattr("labelkit.operators.classify._run_frame_plan", frame_failure)
+        for episode in episodes:
+            episode.member_classifications = {}
+        operation = driver._backfill_frame_classify(states, ctx)
+    else:
+        monkeypatch.setattr("labelkit.operators.annotate.annotate_member_leaf", fail)
+        for episode in episodes:
+            episode.member_annotations = {}
+        operation = driver._backfill_frame_annotate(states, ctx)
+    with pytest.raises(SessionCapacityError) as captured:
+        asyncio.run(operation)
+    expected = 6 if phase.startswith("frame_") else 2
+    assert len(captured.value.failures) == len(calls) == expected
+    assert all(failure.stage == "verify" for failure in captured.value.failures)
+    assert [len(group) for group in runner.groups] == [1] * expected
+    assert all(not episode.member_classifications and not episode.member_annotations for episode in episodes)
+
+
+def test_frame_planning_collects_every_synchronous_capacity_error(monkeypatch):
+    from labelkit.common.errors import SessionCapacityError
+    cfg = _frame_stream_cfg()
+    episodes = [_episode([_frame(f"f{index}")], eid=f"e{index}") for index in range(3)]
+    for index, episode in enumerate(episodes):
+        episode.member_positions = (index,)
+        episode.member_classifications = {}
+    calls = []
+
+    def fail(members, ctx, episode_id, item_ordinal, target=None):
+        calls.append(target.member_positions)
+        raise ContextOverflowError("plan overflow", profile="default", phase="precheck")
+
+    monkeypatch.setattr("labelkit.operators.classify._plan_frame_episode", fail)
+    ctx = _task_context(cfg=cfg, schema_engine=SeqJudgeEngine({}), metrics=_CapturingMetrics())
+    with pytest.raises(SessionCapacityError) as captured:
+        StreamVerifyDriver(VerifyStage(cfg))._plan_frame_classify_jobs(
+            [_EpisodeReview(episode, index) for index, episode in enumerate(episodes)], ctx)
+    assert calls == [(0,), (1,), (2,)]
+    assert [failure.targets[0].member_positions for failure in captured.value.failures] == calls
+    assert all(episode.status == "active" for episode in episodes)

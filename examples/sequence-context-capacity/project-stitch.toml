@@ -1,0 +1,47 @@
+schema_version = 1
+[run]
+input = "data/stitch"
+output = "out/stitch.jsonl"
+modality = "ui"
+batch_size = 2
+seed = 42
+[input]
+ui_tree_max_chars = 30
+[stream]
+order_by = "input_order"
+
+session_max_len = 64
+[segment]
+enabled = true
+strategy = "hybrid"
+window = 32
+min_len = 2
+on_error = "fail"
+noise_filter = true
+context = "仓库配货和聊天是独立任务；切换应用、再回仓库都要建立新片段。仓库同一请求的修改和确认属于同一任务；色卡连续检查也是单一任务。"
+[stitch]
+enabled = true
+llm = "default"
+repass = true
+[dedup]
+enabled = false
+[quality]
+enabled = false
+[annotate]
+enabled = true
+instruction = "完整阅读此任务成员。仓库任务task填dispatch，提取最终request_id、destination、color、quantity。聊天任务task填chat，其余三个字符串填空串，quantity填0。"
+[verify]
+enabled = true
+llm = "default"
+policy = "repair"
+max_repair_rounds = 1
+extra_criteria = "只依据给出的实际成员审查，不假设未观察到的未来状态。仓库最后一个成员已明确发货完成，因此其确认状态就是最终状态。聊天任务按标注指令使用task=chat、三个空字符串和quantity=0，这是有效目标格式。仓库任务中途被聊天打断又回到同一请求时，可以形成多个碎片；只因时间不连续不能判wrong_stitch，须指出请求或任务身份不同的具体证据。"
+[trace]
+enabled = true
+channels = ["segment", "stitch", "annotate", "verify", "schema"]
+content = "refs"
+[output]
+meta_mode = "inline"
+rejects = "full"
+max_repair_attempts = 1
+schema_path = "schemas/stitch.json"

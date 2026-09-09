@@ -199,7 +199,7 @@ class StreamConfig:
                                                   # 过切分补救不回来
     gap_steps: int = 0                            # 序号间隔切分（任何排序键都可）；0 = 关；
                                                   # gap_s 与 gap_steps 可并用——任一触发即切
-    session_max_len: int = 200                    # 会话长度硬上限（帧）；> run.batch_size → M1 WARN
+    session_max_len: int = 200                    # 会话长度硬上限（帧），与计算分组大小无关
     session_max_span_s: int = 0                   # 会话跨度硬上限（仅 meta:*）；0 = 关
 
 
@@ -210,14 +210,9 @@ class SegmentConfig:
     enabled: bool = False                         # 关 = v1.7 行为（除 _meta.stream 恒 null）
     strategy: Literal["rules", "llm", "hybrid"] = "hybrid"   # 边界判定策略
     llm: str = "default"                          # 仅当 strategy ∈ {llm, hybrid} 时入引用集
-                                                  # （S30）；v1.11（V3）：永不入 vision 集——
-                                                  # vision 由下方 vision_resolved **自适应**派生
-    window: int = 20                              # v1.11（V9）：单次窗口调用的帧数**上限**；
-                                                  # M1：>= 2。声明了预算 → 按每帧成本贪心装箱
-                                                  # 到此上限（M1 保证 w_min >= 下限，§7.17
-                                                  # min_window）；预算关 → 固定窗口，与 v1.10
-                                                  # 逐字节一致
-    digest_max_chars: int = 400                   # 单帧摘要字符上限
+                                                  # UI 模态要求完整图像与视觉能力
+    window: int = 20                              # 完整边界判决的帧数上限，至少 2
+                                                  # 逐帧完整证据估算装窗；最小相邻对仍需终检
     noise_filter: bool = True                     # 仅 llm/hybrid；rules + true → no-op 警告
     min_len: int = 2                              # 仅作用于经 LLM 精修的片段（S11）
     context: str = ""                             # 可选领域上下文——**不是**边界定义
@@ -366,10 +361,6 @@ class AnnotateConfig:
     examples: tuple[FewShotExample, ...] = ()     # 可选 few-shot（M1 干跑校验）
     self_consistency: int = 0                     # 0 = 关；否则为奇数且 >= 3
     sc_temperature: float = 0.7                   # 仅自洽采样时生效
-    sequence_frames: int = 20                     # v1.8：序列标注的关键帧上限
-                                                  # （首帧/末帧恒保留，中间均匀降采样）；
-                                                  # M1：2 <= v <= 100（CONFIG_ERROR），
-                                                  # > 20 且 max_image_px > 2000 → WARN（S28）
     postprocessor: str | None = None              # 工程后处理函数的文件与属性引用
     resolved_postprocessor: ResolvedHook | None = None  # M1 冻结的生效函数；不是配置键
 

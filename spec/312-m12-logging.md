@@ -104,3 +104,5 @@ failed report 当作成功 manifest 的否定信号。
 见 5.1 `tool.log_format` 与 5.2 `[trace]` 节、`quality.judgment_reasons`。
 
 **背书：**对每次 LLM 调用与判定做结构化追踪（trace）并以其驱动评测迭代，是 LLM 工程的工业标准形态：LangSmith（LangChain）[28] 与 W&B Weave [29] 均以「逐步 trace LLM 调用 + 数据集评测」为核心能力。`llm.call` 等事件的字段命名对齐 OpenTelemetry GenAI 语义约定 [27]——该约定截至 2026-07 处于 Development（实验性、非 stable）状态，本工具仅做命名对齐、不依赖其 SDK 实现（7.3）。
+
+完整会话增设 session_attempt(session_id, attempt) ContextVar 范围，自动注入每个 trace payload，异步叶任务继承且退出必恢复。capture_counts 捕获当前上游或下游尝试的数据计数；流模式 budget.overflow_records 随最终尝试提交，capacity.* 和 dedup.embedding_failures 以及已有请求成本保持实时。observe_session_frames 更新 capacity.retained_frames_high_water，不把帧数当作字节或物理内存上限。

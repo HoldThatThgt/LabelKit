@@ -9,15 +9,15 @@
 
 | 来源 | 次数 | 说明 |
 |---|---|---|
-| segment（v1.8） | Σ ceil((L−1)/(w_eff−1))，L = 各会话帧数；w_eff = min(window, w_min) | 滑窗重叠 1 帧故步长 = 窗宽−1。未声明预算时 w_eff = window（与 v1.10 同式同值）；所引 profile 声明 `context_window` 后 window 只是**上限**、按预算贪心装填，公式按最坏保证装填量 w_min 报**上界**（实际每窗只多装、窗数只更少，事后看 `report.stream.windows` 对账）；`strategy="rules"` 与单帧会话为 0；window ≥ 会话长且预算装得下时整段一次调用 |
+| segment | 按每会话的相邻两帧单位估算初始请求；rules 与单帧会话为零 | 完整证据按真实请求预算装填，window 是上限；真实请求、修复和重算次数以 trace/usage 为准，不能从固定摘要长度推导保证 |
 | stitch（v1.9） | 一遍每 episode 候选 1 次 + 二遍每单碎片线索 1 次，全量 × `votes` | 判定纯文本无图、单次便宜；救援候选仅池非空时判定、池空零调用，无其他线索的复评同样零调用。**votes 成本注**：`votes = n`（奇数）把每次判定放大为 n 次采样——n=3 时 stitch 全口径占比仍 <8%，但只该在漂移可测时才开（第 26 章） |
 | classify（v1.7） | N × max(1, sc) | sc = `classify.self_consistency`；生成样本继承种子类，回流不重分类 |
-| classify 帧粒度（v1.12） | 存活 episode 数（每 episode 一次**批量**判决；预算装填下长会话才拆多窗，按窗计） | 住 dedup 之后——重复 episode 零帧调用；一次调用判整窗成员，**不是**每帧一次；dry-run 的 `frame_classify_calls` 按预扫描帧总数报粗上界 |
+| classify 帧粒度（v1.12） | 存活 episode 数（每 episode 一次**批量**判决；预算装填下长会话才拆多窗，按窗计） | 住 dedup 之后——重复 episode 零帧调用；一次调用判整窗成员，**不是**每帧一次；dry-run 的 `frame_classify_calls` 按预扫描帧数给初始名义估算，不含重算 |
 | extract（v1.8） | Σ (L−1)，L = 各 episode 成员数 | 每对相邻帧一次调用、每次带 2 张图——**stream 工程的调用大头几乎总是它**（帧数远多于 episode 数） |
 | quality pairwise | N × k / 2（默认 k=4 ⇒ 2N） | × 评审数 × 双顺序(2) ×（single 模式再 ×C） |
 | quality pointwise | N × C | 与 C 成正比是它比 pairwise 贵的原因（C=4 时 4N vs 2N） |
 | annotate | N | × self_consistency 的 n |
-| annotate 帧粒度（v1.12） | Σ 过质量门 episode 的未跳过成员数 | 逐成员一次调用（帧粒度里贵的那半）；住 quality 门之后——被淘汰记录永不付帧标注费；`[frame.class.<名>.annotate].enabled = false` 按类再省；dry-run 的 `frame_annotate_calls` 同样按帧总数报粗上界 |
+| annotate 帧粒度（v1.12） | Σ 过质量门 episode 的未跳过成员数 | 逐成员一次调用（帧粒度里贵的那半）；住 quality 门之后——被淘汰记录永不付帧标注费；`[frame.class.<名>.annotate].enabled = false` 按类再省；dry-run 的 `frame_annotate_calls` 按帧数给初始名义估算，不含重算 |
 | generate | ⌈种子数 × num_per_record / num_per_call⌉ | 产出还会回流产生新的 quality/annotate 调用 |
 | generate sequence | `estimate_run` 按 ScenarioPlan 与启用 family 给出逻辑下界 | declared whole-set retry 会重跑整组；instruction-only 每个 slot 独立。provider retry 与 L3 repair 另算 |
 | verify | N 左右 | × 评审数；每轮 repair 追加 1 标注 + 1 复审 |
@@ -26,9 +26,9 @@
 
 分类算子开 `assignment = "multi"` 时另记一笔扇出账：一条记录命中几类就变成几个信封，下游 quality / annotate / verify 的 N 实际乘上平均标签数——multi 工程做预算时按这个乘数打提前量（`--dry-run` 的估算按乘数 1 报下界）。
 
-stream 工程（v1.8）另有两条成本注记：`annotate.sequence_frames`（默认 20）决定每个 episode 的标注请求**至多**携带几张关键帧图（v1.11 起它是上限：声明 `context_window` 后实际帧数 k_eff 按预算剩余收缩，首末帧恒保留，第 11 章）——序列标注的 token 开销与实际帧数近似线性，降帧最省钱但会丢视觉证据；`extract.include_diff` 默认开（向摘取提示词注入结构化树变更摘要，工程实践正面），怀疑它对你的数据没有增益时可关掉跑一次 A/B（对比 `report.stream.extract.by_type` 分布与 verify 缺陷率），确认后再定去留。
+普通流始终发送当前序列所需的全部成员证据；不提供按预算抽关键帧或截摘要的省钱路径。序列越长，请求成本越高；可按业务语义调整会话边界，或为真实请求配置合适的部署上下文。容量切分会重算未提交会话，下游实际调用可能增加。extract.include_diff 仍可按业务效果验证。
 
-帧粒度（v1.12，第 25 章 25.6）的成本模型自带四重保护，预算时按「上界很松、实付常小得多」来读：`--dry-run` 的 `frame_classify_calls` / `frame_annotate_calls` 都按**预扫描帧总数**报粗上界；实付层面——帧分类是**每 episode 一次批量判决**（一次调用判整窗成员，不是每帧一次），且住 **dedup 之后**（重复 episode 一分帧钱不付）；帧标注虽是逐成员一次调用（帧粒度里贵的那半），但住 **quality 质量门之后**（被淘汰记录永不付帧标注费），还能用 `[frame.class.<名>.annotate].enabled = false` 把低价值帧类整类跳过。`examples/mix` UI 主工程本次真跑的对照：上界 17/17，实付 2 次批量判决 + 9 次帧标注（1 个 transition 过渡屏成员按类跳过）——对账看 `report.stream.frame_classify` / `frame_annotate` 两个子块（第 8 章）。该工程还是「贵的调用挑贵的端点」的活例：双端点分账 `llm_usage.default`（DeepSeek，segment 滑窗/帧级批量分类/轨迹打分的文本判决面）与 `llm_usage.vision`（z.ai，序列分类/序列标注/帧标注/评审的视觉必需面）本次真跑各 15 次调用——帧级批量分类永不要求 vision，指向便宜的纯文本 profile 即省钱面（第 25 章 25.6 的双端点成本拆分）。
+帧分类在 dedup 之后运行，帧标注在 quality 门之后运行，并可按帧类关闭。dry-run 按预扫描帧总数给出初始名义调用量，不包含容量重算或修复；不能当作最终费用上界。UI 帧分类和标注都保留完整树与图片，必须使用视觉 profile。第 25 章保留的 mix 两端点各 15 次调用属于摘要实现的历史结果，当前配置与新验证见 [会话容量示例](../../examples/sequence-context-capacity/README.md)。
 
 sequence 的 validate、dry-run 与 run 复用同一份 plan。dry-run 给逻辑 family 入口下界，不含 provider retry、
 Schema repair 或失败 attempt 的 whole-set 重跑。事后同时看 `report.generate.sequence.sequence_calls` 与
@@ -46,7 +46,7 @@ opportunity 的整数票，不是需要靠扩大样本追平的配额；不要�
 1. **把 rubric 和 instruction 在 `--limit` 小样本上调到位再跑全量**——返工全量一次的钱够你小样本迭代五十轮；
 2. **quality 模式选对**：C ≥ 3 时 pairwise（2N）比 pointwise（CN）便宜且是默认推荐；只有一两条准则、又要跨批绝对分数时 pointwise 才占优；
 3. **能不开的鲁棒性选项别急着开**：judges ×3、both_orders ×2、self-consistency ×n、verify ×1.5——全开是 10 倍级别的成本放大，按第 10/11/13 章的决策线逐个论证再开；
-4. **调小 `max_output_tokens` 依然不是省钱手段，但坑在 v1.11 换了形态**——输出写满上限的截断响应不再触发修复环，而是按 `output_truncated` **记录级拒收**（终局，不修复，第 14 章）：省下的不是修复调用，丢掉的是整条记录。它反而多了一个新权衡面：声明了 `context_window`（第 6 章）时，`max_output_tokens` 整段从窗口里预留出去、直接挤占输入预算——输出上限越大，单次调用能装的输入越少（裁剪更狠、装填更碎、调用可能更多）。按你 Schema 的真实输出规模取宽裕但不奢侈的值。
+4. **调小 `max_output_tokens` 依然不是省钱手段，但坑在 v1.11 换了形态**——输出写满上限的截断响应不再触发修复环，而是按 `output_truncated` **记录级拒收**（终局，不修复，第 14 章）：省下的不是修复调用，丢掉的是整条记录。它反而多了一个新权衡面：声明了 `context_window`（第 6 章）时，`max_output_tokens` 整段从窗口里预留出去、直接挤占输入预算——输出上限越大，单次调用能装的输入越少（普通流的容量分区可能变多，并增加重算）。按你 Schema 的真实输出规模取宽裕但不奢侈的值。
 
 ## 17.2 时间账：为什么慢、怎么快
 
@@ -57,7 +57,7 @@ opportunity 的整数票，不是需要靠扩大样本追平的配额；不要�
 ```
 
 sequence 的昂贵链路可跨候选槽并发；同一 declared slot 的 baseline 完成并验收后，counterfactual suffix 也可重叠，
-但每条 branch 内事件仍是状态依赖串行链。stitch 则按“同会话串行、不同会话当前候选 wave 并发”执行。墙钟近似由
+但每条 branch 内事件仍是状态依赖串行链。普通流按会话顺序处理；stitch 的下一候选依赖上一候选归并，同一判决的独立投票可有界并发。墙钟近似由
 这些关键路径、profile/origin 等待和声明序 commit 队头等待共同决定，不能再用“所有调用时间相加”估算。普通侧旧
 实跑里 quality 是调用量大头的结论仍可作定位参考，但不是当前性能证据。
 
@@ -66,7 +66,7 @@ sequence 的昂贵链路可跨候选槽并发；同一 declared slot 的 baselin
 1. **`max_concurrency`**（config.toml，按 profile）：以端点公开额度和同形状实测为准，不使用固定百分比经验值。多个
    算子引用同一 profile 时共享额度；不同 profile 有独立任务通道，但指向同一 origin 时仍由共享 HTTP origin 容量
    观测。看 `resource_wait_ms`、`http_pool_wait_ms`、provider latency 与 retries 决定调高还是调低；
-2. **`batch_size`**：批越大，屏障摊销越好、并发越吃得满。但 pairwise 用户注意——批大小首先是**质量口径参数**（第 10 章），别纯为吞吐调它。pointwise 无此顾虑，可以放心加大；
+2. **`batch_size`**：普通记录同时影响批与 pairwise 池；普通流只影响叶任务计算组。流模式内存受完整会话大小、完整证据和下游暂存共同影响，调小计算组不能把会话缓冲限制到同样大小。
 3. **网络位置**：延迟高的跨境端点，单次调用 5–8 秒很常见；同机房网关能砍一个量级。
 
 并发能力不是吞吐承诺。v1.19 的本地单 GPU 四槽 fixture 确实把 server request high-water 从 1 提到 4，但三次 wall
@@ -79,7 +79,7 @@ sequence 的昂贵链路可跨候选槽并发；同一 declared slot 的 baselin
 | 占用者 | 量级 | 备注 |
 |---|---|---|
 | 全局去重索引（LSH + 精确键 + pHash） | 50 万条 ≈ 2–4 GB | `dedup.scope="batch"` 可砍掉大头（代价：跨批漏检） |
-| 批内信封对象 | 与 batch_size 成正比 | 通常不是问题 |
+| 当前信封与证据 | 普通记录与 batch_size 相关；普通流与完整会话及容量分区相关 | session_max_len 仍限制语义会话长度；图片保持惰性引用 |
 | 语义去重向量索引（可选） | 条数 × 维度 × 8B（float64 存储；50 万 × 1024 维 ≈ 4 GB，缓冲倍增扩容瞬间峰值更高） | scope=global 时常驻，要计入预算 |
 | 图像字节 | **不常驻** | 接入算 id、去重算 pHash、构造请求时各读一次，用完即弃（第 5 章） |
 | sequence final rows | 受 `record_units` / `stream_rows` 500000 与 retained 536870912 bytes 双上限约束 | retained 是 main+stream canonical UTF-8 紧凑核算，不是 512 MiB 物理预分配 |

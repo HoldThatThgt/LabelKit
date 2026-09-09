@@ -31,7 +31,7 @@ state Schema 与 state validator，并把冻结 `EventExecution` 与合法对象
 | L1 | 顺序执行：① 剥离 Markdown 代码围栏；② 取首个花括号平衡子串；③ `json_repair.loads()`（工业库，处理截断/单引号/尾逗号/裸换行 [8]）。全部失败 ⇒ 直接进 L3。L1 为纯函数，无副作用、可单测穷举。 |
 | L2 | `Draft202012Validator.iter_errors()` 收集全部违规，每条含 JSON Pointer 路径、期望与实际。通过后进入可选用户回调或调用级后置验证；未通过进入 L3。enum 等错误统一渲染为英文、值受 trace/content 规则保护。 |
 | L2.5（v1.5，可选） | `output.validator` 配置时、且仅对用户 Schema 调用：L2 通过后执行用户回调 `fn(obj, record)`。返回非空违规列表 ⇒ 违规以 `(validator) <消息>` 形式并入违规清单、与 Schema 违规同路进入 L3 修复环（回调意见回喂模型自我修正——回调既是门卫也是修复环的教练）；返回空 ⇒ 通过。L3 每轮修复输出重走 L1→L2→L2.5。预算耗尽且剩余违规**全部**来自回调 ⇒ `SchemaViolation(callback_only=True)`，记录 kind = `callback_violation`（7.6），否则仍为 `schema_violation`。回调抛异常不吞：向上传播、按记录级 `internal_error` 收敛（3.5.3）。内部 Schema（裁决/评分/评审/生成/分类（v1.7）/分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9））不经过 L2.5。 |
-| L3 | 修复提示词 = 单条 user 消息，按 `[原始输出]` / `[违规清单]` 分节标签组织，末尾指令「只输出修正后的 JSON」（逐字实例见 3.8.4）。使用 `output.repair_llm`（默认同调用方 profile）。每次修复输出重走 L1→L2。尝试次数耗尽 ⇒ 抛 `SchemaViolation(errors, raw_last_output)`。修复调用计入 token 计量，命中层级分布计入报告（`report.schema_engine.resolved_at = {l0_or_clean, l1, l3_1, l3_2, rejected}`）。**上下文预算交互（v1.11，V25①）**：修复调用经 M9 终检（3.9）抛出 `ContextOverflowError(phase="precheck")` 时**捕获并记该轮修复失败**——修复 prompt 恒定 ⇒ 余轮必然同败，**短路至预算耗尽**；reject 归因维持既有 `schema_violation` / `callback_violation`（**不新增 reject 值、不计 `report.budget.overflow_records`**，7.6 注）；`[原始输出]` 修复原文**永不截断**——截断即破坏修复语义；该吞点即异常终局——reactive-400 形态在此经共享 `budget.feed_reactive_terminal` 补喂熔断**恰一次**（7.6 熔断矩阵；`_breaker_fed` duck 标防重喂，precheck/200 形态永不喂，v1.11 审计修订）。 |
+| L3 | 普通记录修复使用单条 user 消息，保留完整原始输出、违规清单和修正指令。process stream 设置 CallScope.complete_evidence=true，保留首轮全部消息、文本、树、图片及固定尺寸，再追加上一版模型空间输出与违规；finalized 调用先经 repair_projector 移除代码和框架负责字段。修复使用 output.repair_llm（缺省同调用方），重走 L1–L2，次数耗尽抛 SchemaViolation，实际调用均计 usage。process stream 的 ContextOverflowError 保留原 profile/phase/origin 上抛所属会话阶段，不转 SchemaViolation，不由 M8 提前喂熔断。普通记录修复超限保留既有短路 SchemaViolation 及 reactive-400 终态恰一次补喂语义。生成保留其独立完整修复合同。 |
 
 **v1.19 资源与并发边界。**operator 的 `TaskSpec.resource_key` 只标识首轮业务调用的接纳通道。L3 若切换到
 `output.repair_llm`，SchemaEngine 在同一叶任务内继续调用 LLMClient；LLMClient 必须通过共享
@@ -71,6 +71,7 @@ class CallScope:
     record: Mapping | None = None       # L2.5 回调第二入参（Record.raw），无则 None
     user_treatment: bool | None = None  # 显式待遇门；None ⇒ 按 schema is None 推断
     repair_context_bytes: int | None = None  # 单轮新增 L3 消息正文集合 UTF-8 byte 上限
+    complete_evidence: bool = False     # process stream 修复保留原完整请求并上抛容量错误
 
 class SchemaEngine:
     def __init__(self, user_schema: dict, llm: LLMClient, cfg: OutputConfig): ...

@@ -3,13 +3,19 @@ from __future__ import annotations
 
 import dataclasses
 import logging
-import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Awaitable, Callable, Mapping
 
 from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
-from labelkit.common.errors import InternalError
-from labelkit.common.inference import budget
+from labelkit.common.errors import ContextOverflowError, InternalError, SessionCapacityError
+from labelkit.common.contracts.sequence_capacity import (
+    capacity_failures, capacity_target, member_key, raise_session_capacities,
+)
+from labelkit.common.inference.sequence_evidence import terminal_error
+from labelkit.operators.verify_capacity import (
+    allows_position, boundary_suspicion, check_review, check_reviews, current_seams, review_request,
+    plan_seams, project_fragments, restore_items, snapshot_items, working_failures, working_item,
+)
 from labelkit.common.contracts.types import (
     Annotation,
     PipelineItem,
@@ -26,7 +32,6 @@ from labelkit.operators.verify import (
     _COUNTER_MEMBERSHIP_REPAIRS,
     _DEFAULT_FAIL_DEFECT,
     _EpisodeReview,
-    _LadderTrial,
     _MISSING_KINDS,
     _RECLAIM_RELATIONS,
     _ReclaimClaim,
@@ -35,11 +40,10 @@ from labelkit.operators.verify import (
     VerifyPromptOptions,
     _critique_entries,
     _feed_reactive_terminal,
-    _next_image_rung,
     _qualifies_for_reclaim,
     _session_frame_envelopes,
     boundary_margin_text,
-    build_verify_prompt,
+    boundary_frames,
     fragment_structure_text,
     majority_verdict,
     normalize_defects,
@@ -48,9 +52,7 @@ from labelkit.operators.verify import (
 
 if TYPE_CHECKING:
     from labelkit.common.inference.llm_client import PromptBundle
-    from labelkit.common.config.model import LLMProfile
     from labelkit.common.contracts.stage import RunContext
-    from labelkit.operators.annotate import AnnotatePromptOptions
     from labelkit.operators.verify import VerifyStage
 
 
@@ -81,8 +83,19 @@ class _FrameClassifyJob:
 
     state: _EpisodeReview  # 所属 episode 台账
     member: Record         # 待补分类的成员
+    position: int          # 当前成员的明确出现位置。
     ordinal: int           # 本波次声明序
     plan: object           # classify 冻结窗口计划
+
+
+@dataclass(frozen=True)
+class _FrameAnnotateJob:
+    """一个出现位置的帧标注补跑任务。"""
+
+    state: _EpisodeReview  # 所属工作序列。
+    member: Record         # 完整成员证据。
+    position: int          # 会话内出现位置。
+    label: str | None      # 当前帧分类视图。
 
 
 @dataclass(frozen=True)
@@ -120,15 +133,20 @@ def _propagate_attempt_internal(outcome: object) -> None:
         raise outcome
 
 
-async def _claim_call(claim: _ReclaimClaim, ctx: "RunContext") -> _ClaimOutcome:
+async def _claim_call(state: _EpisodeReview, claim: _ReclaimClaim, ctx: "RunContext") -> _ClaimOutcome:
     """执行不发事件的成员回收窗口复判。
 
     @param claim 回收预定
+    @param state 当前完整工作序列台账。
     @param ctx 运行上下文
     @return 候选关系与待归并的窗口裁决
     """
     from labelkit.operators.segment import _call_window
 
+    target = capacity_target(working_item(state), claim.window_positions)
+    known = terminal_error(ctx, target, "transition", ctx.cfg.segment.llm)
+    if known is not None:
+        raise known
     boundary = await _call_window(
         claim.window, ctx, span=(0, len(claim.window)),
     )
@@ -234,8 +252,20 @@ class StreamVerifyDriver:
         @param episodes 本批待评审的序列信封（批位序）
         @param ctx 运行上下文
         """
-        pending = [_EpisodeReview(item, ordinal)
-                   for ordinal, item in enumerate(episodes)]
+        snapshots = snapshot_items(batch)
+        try:
+            await self._run_rounds(batch, episodes, ctx)
+        except SessionCapacityError:
+            restore_items(batch, snapshots)
+            self._repair_snapshots.clear()
+            self._repair_counts.clear()
+            raise
+
+    async def _run_rounds(self, batch: list[PipelineItem],
+                          episodes: list[PipelineItem], ctx: "RunContext") -> None:
+        """执行完整会话评审轮。@param batch 会话帧。@param episodes 序列。@param ctx 当前上下文。"""
+        states = [_EpisodeReview(item, ordinal) for ordinal, item in enumerate(episodes)]
+        pending = states
         while pending:
             reviewed = await self._review_round(pending, batch, ctx)        # (a)
             self._repair_snapshots.clear()
@@ -248,23 +278,67 @@ class StreamVerifyDriver:
                     repairing.append(state)
                 else:
                     finalize.append(state)   # 无可修复项——fail 结论维持
-            dead = await self._reseam_episodes(repairing, ctx)              # (d)
-            for state in repairing:                                         # (e)
-                if id(state) in dead or not state.surgical:
-                    continue
-                try:
-                    self._rebuild_episode(state)
-                except Exception as exc:
-                    self._rollback_repair(state)
-                    _log.error("stream verify rebuild failed: kind=%s", type(exc).__name__)
-                    raise
-                self._commit_repair(state, ctx)
-            dead |= await self._sync_frame_products(repairing, dead, ctx)   # (e2)
-            next_pending = await self._reannotate_round(                    # (f)
-                [state for state in repairing if id(state) not in dead], ctx)
+            next_pending = await self._repair_wave(repairing, batch, ctx)
             for state in finalize:
                 self._finalize_episode(state, ctx)
-            pending = next_pending                                          # (g)
+            dependents = self._seam_dependents(states, batch, ctx)
+            refreshed = await self._repair_wave(dependents, batch, ctx)
+            pending_ids = {id(state) for state in next_pending + refreshed}
+            pending = [state for state in states if id(state) in pending_ids and state.item.status == "active"]
+
+    async def _repair_wave(self, repairing: list[_EpisodeReview], batch: list[PipelineItem],
+                           ctx: "RunContext") -> list[_EpisodeReview]:
+        """复用同一修复波次处理成员手术与接缝依赖，不改变已消耗评审轮数。
+
+        @param repairing 当前修复台账。
+        @param batch 完整会话信封。
+        @param ctx 当前会话上下文。
+        @return 已成功重标注并等待复评的台账。
+        """
+        plan_seams(repairing, batch)
+        dead = await self._reseam_episodes(repairing, ctx)
+        for state in repairing:
+            if id(state) in dead or not state.surgical:
+                continue
+            try:
+                self._rebuild_episode(state)
+            except Exception as exc:
+                self._rollback_repair(state)
+                _log.error("stream verify rebuild failed: kind=%s", type(exc).__name__)
+                raise
+            self._commit_repair(state, ctx)
+        dead |= await self._sync_frame_products(repairing, dead, ctx)
+        return await self._reannotate_round([state for state in repairing if id(state) not in dead], ctx)
+
+    def _seam_dependents(self, states: list[_EpisodeReview], batch: list[PipelineItem],
+                         ctx: "RunContext") -> list[_EpisodeReview]:
+        """成员手术已成功或回滚后，以最终归属找出失效的评审结果。
+
+        @param states 全会话既有评审台账。
+        @param batch 当前已提交成员状态。
+        @param ctx 当前上下文。
+        @return 仍有修复预算的接缝依赖台账。
+        """
+        dirty = []
+        for state in states:
+            item = state.item
+            if item.status != "active" or not hasattr(item, "stitch_task_name"):
+                continue
+            previous = dict(zip(getattr(item, "seam_indexes", ()), getattr(item, "seam_interrupted_by", ())))
+            if previous == current_seams(item, batch):
+                continue
+            if state.rounds > self._stage.cfg.verify.max_repair_rounds:
+                _log.error("stream verify seam dependency repair budget exhausted")
+                state.verdict = "fail"
+                state.defects = [{**_DEFAULT_FAIL_DEFECT, "detail": "Seam dependency repair budget exhausted."}]
+                self._finalize_episode(state, ctx)
+                continue
+            state.begin_round()
+            state.surgical = True
+            state.needs_reannotate = True
+            state.fail_critiques = [{"aspect": "sequence evidence", "opinion": "Rebuild the changed seam evidence."}]
+            dirty.append(state)
+        return dirty
 
     async def _review_round(self, pending: list[_EpisodeReview],
                             batch: list[PipelineItem],
@@ -280,7 +354,7 @@ class StreamVerifyDriver:
         if not plans:
             return []
         specs = self._review_specs(plans, ctx)
-        outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
+        outcomes = await ctx.run_group(TaskGroupRequest(specs))
         return self._reduce_review_wave(plans, outcomes, ctx)
 
     def _plan_review_wave(
@@ -294,13 +368,18 @@ class StreamVerifyDriver:
         @return 可执行的 episode 计划
         """
         plans: list[_StreamReviewPlan] = []
+        errors = []
         for state in pending:
             try:
                 plans.append(self._plan_episode_review(state, batch, ctx))
             except _BIG_THREE:
                 raise
             except Exception as exc:
-                self._stage._fail_item(state.item, exc, ctx)
+                errors.append((state, exc))
+        failures = tuple(failure for state, error in errors for failure in working_failures(state, error, ctx))
+        raise_session_capacities(ctx, failures)
+        for state, error in errors:
+            self._stage._fail_item(state.item, error, ctx)
         return plans
 
     def _plan_episode_review(
@@ -315,26 +394,17 @@ class StreamVerifyDriver:
         """
         from labelkit.common.inference.schema_engine import defect_verdict_schema
 
-        margin = boundary_margin_text(
-            state.item, batch, self._stage.cfg.segment.digest_max_chars,
-        )
-        structure = (
-            fragment_structure_text(
-                state.item, self._stage.cfg.stitch.digest_max_chars,
-            )
-            if self._stage.cfg.stitch.enabled else ""
-        )
-        schema = defect_verdict_schema()
-        fit = self._stage._panel_fit(ctx, state.item.record, schema)
-        prompt = build_verify_prompt(
-            state.item.record, state.item.annotation.output, ctx.cfg,
-            VerifyPromptOptions(
-                label=state.label, transitions=state.item.transitions,
-                boundary_margin=margin, fragment_structure=structure, fit=fit,
-            ),
-        )
-        self._stage._settle_fit(fit, ctx)
+        margin = boundary_margin_text(state.item, batch)
+        structure = fragment_structure_text(state.item) if self._stage.cfg.stitch.enabled else ""
+        options = VerifyPromptOptions(label=state.label, transitions=state.item.transitions,
+                                      boundary_margin=margin, fragment_structure=structure,
+                                      member_positions=state.item.member_positions,
+                                      boundary_records=tuple((frame.session_position, frame.record) for frame in
+                                                             boundary_frames(state.item, batch)))
         judges, _multi = self._stage._judge_panel()
+        requests = [review_request(self._stage, state.item, ctx, options, judge) for judge in judges]
+        check_reviews(state.item, requests, ctx)
+        prompt, schema = requests[0].prompt, requests[0].schema
         return _StreamReviewPlan(state, prompt, schema, tuple(judges))
 
     def _review_specs(
@@ -380,6 +450,7 @@ class StreamVerifyDriver:
                 scope=CallScope(
                     record_ids=(plan.state.item.record.id,),
                     batch_no=ctx.batch_no,
+                    complete_evidence=ctx.session_attempt is not None,
                 ),
             )
 
@@ -395,6 +466,13 @@ class StreamVerifyDriver:
         @param ctx 运行上下文
         @return 评审成功台账
         """
+        offset = 0
+        failures = []
+        for plan in plans:
+            for outcome in outcomes[offset:offset + len(plan.judges)]:
+                failures.extend(working_failures(plan.state, outcome, ctx))
+            offset += len(plan.judges)
+        raise_session_capacities(ctx, failures)
         reviewed: list[_EpisodeReview] = []
         offset = 0
         for plan in plans:
@@ -444,6 +522,7 @@ class StreamVerifyDriver:
         claimed: set[int] = set()      # 本轮已预定的噪声信封 id()
         for state in reviewed:
             state.begin_round()
+            self._normalize_capacity_defects(state, ctx)
             if state.verdict == "pass":
                 finalize.append(state)
                 continue
@@ -455,11 +534,24 @@ class StreamVerifyDriver:
             routed.append(state)
         return finalize, routed
 
+    @staticmethod
+    def _normalize_capacity_defects(state: _EpisodeReview, ctx: "RunContext") -> None:
+        """准确命中人工边界的疑点保留审计，但不独立造成失败。
+
+        @param state 当前评审台账。
+        @param ctx 当前上下文。
+        """
+        for index, defect in enumerate(state.defects):
+            if boundary_suspicion(state.item, defect):
+                state.defects[index] = {**defect, "suspected": "capacity"}
+                ctx.metrics.count(_COUNTER_BOUNDARY_FLAGS)
+        if state.defects and all(defect.get("suspected") == "capacity" for defect in state.defects):
+            state.verdict = "pass"
+
     async def _resolve_claims(self, routed: list[_EpisodeReview],
                               ctx: "RunContext") -> None:
-        """(c) 经 segment.judge_window 并发复判回收候选，并按预定序同步落地。复判失败降级为仅
-        标记（记录级隔离）；这一吞是该异常的终态——回收窗口没有降级面（V24），故 reactive-400
-        溢出的 A7「恰好一次」熔断喂食在此结清（duck 标记幂等；precheck 与 finish 判据永不喂）。
+        """经 segment 完整窗口并发复判回收候选，先传播容量信号，再按声明序提交。
+        普通复判失败仅保留疑点；容量失败由会话控制器重算，本阶段回滚全部认领。
         @param routed 已路由待修复的台账
         @param ctx 运行上下文
         @raises BaseException 大三样原样上抛
@@ -475,12 +567,15 @@ class StreamVerifyDriver:
                                  state.ordinal, claim_ordinal),
                 stage=self._stage.name,
                 resource_key=("llm", self._stage.cfg.segment.llm),
-                operation=lambda claim=claim: _capture_leaf(
-                    lambda: _claim_call(claim, ctx)),
+                operation=lambda state=state, claim=claim: _capture_leaf(
+                    lambda: _claim_call(state, claim, ctx)),
             )
             for claim_ordinal, (state, claim) in enumerate(claims)
         )
-        outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
+        outcomes = await ctx.run_group(TaskGroupRequest(specs))
+        failures = tuple(failure for (state, claim), outcome in zip(claims, outcomes)
+                         for failure in working_failures(state, outcome, ctx, "transition", claim.window_positions))
+        raise_session_capacities(ctx, failures)
         for (state, claim), outcome in zip(claims, outcomes):
             if isinstance(outcome, BaseException):
                 _feed_reactive_terminal(outcome, ctx.metrics)
@@ -516,7 +611,10 @@ class StreamVerifyDriver:
             )
             for state in jobs
         )
-        outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
+        outcomes = await ctx.run_group(TaskGroupRequest(specs))
+        failures = tuple(failure for state, outcome in zip(jobs, outcomes)
+                         for failure in working_failures(state, outcome, ctx))
+        raise_session_capacities(ctx, failures)
         for state, outcome in zip(jobs, outcomes):
             if isinstance(outcome, BaseException):
                 _propagate_attempt_internal(outcome)
@@ -581,18 +679,13 @@ class StreamVerifyDriver:
         """
         item = state.item
         frames = _session_frame_envelopes(batch, item.session_id)
-        positions: dict[str, int] = {}
-        for i, frame in enumerate(frames):
-            positions.setdefault(frame.record.id, i)
-        state.session_positions = positions
         # S8：多标签扇出的克隆兄弟（classification.label 不是命中集首项）永不执行成员手术
         # ——共享的成员帧属于原信封。
         classification = item.classification
         scope = _RoutingScope(
             frames=frames, claimed=claimed,
             clone=bool(classification is not None and classification.labels
-                       and classification.label != classification.labels[0]),
-            split=bool(getattr(item, "session_split", False)))
+                       and classification.label != classification.labels[0]))
         for idx in range(len(state.defects)):
             self._route_one_defect(state, idx, scope, ctx)
 
@@ -606,6 +699,8 @@ class StreamVerifyDriver:
         """
         defect = state.defects[idx]
         kind = defect["kind"]
+        if defect.get("suspected") == "capacity":
+            return
         if kind == "label_mismatch":
             state.needs_reannotate = True
             return
@@ -622,11 +717,6 @@ class StreamVerifyDriver:
             self._shrink_off_task(state, defect, scope)
             return
         # missing_head / missing_tail / missing_members——三级回收判定（噪声池 → 邻段 → 无处可寻）。
-        if scope.split:
-            # 会话在 batch_size 处被硬切（S21）：缺失帧可能落在别的批——回收降级为仅标记。
-            state.defects[idx] = {**defect, "suspected": "session_split"}
-            ctx.metrics.count(_COUNTER_BOUNDARY_FLAGS)
-            return
         found = self._find_reclaim_candidate(kind, defect, state, scope)
         if isinstance(found, _ReclaimClaim):
             scope.claimed.add(id(found.envelope))
@@ -647,13 +737,15 @@ class StreamVerifyDriver:
         @param scope 批级路由作用域
         """
         named = set(defect.get("members") or ())
-        shrink_ids = {m.id for m in state.working_members if m.id in named}
+        shrink_ids = set(state.working_positions) & named
         if not shrink_ids or len(shrink_ids) == len(state.working_members):
             return
-        state.working_members = [m for m in state.working_members
-                                 if m.id not in shrink_ids]
+        kept = [(position, member) for position, member in zip(state.working_positions, state.working_members)
+                if position not in shrink_ids]
+        state.working_positions = [position for position, _ in kept]
+        state.working_members = [member for _, member in kept]
         for frame in scope.frames:
-            if frame.status == "absorbed" and frame.record.id in shrink_ids:
+            if frame.status == "absorbed" and frame.session_position in shrink_ids:
                 self._remember_envelope(state, frame)
                 frame.status = "dropped_noise"
                 frame.noise_attribution = ("verify", "off_task_member")  # type: ignore[attr-defined]
@@ -672,9 +764,7 @@ class StreamVerifyDriver:
         @param scope 批级路由作用域
         @return 回收预定 / "neighbor"（帧被别的 episode 持有）/ None（无候选）
         """
-        positions = state.session_positions
-        member_positions = sorted(positions[m.id] for m in state.working_members
-                                  if m.id in positions)
+        member_positions = state.working_positions
         if not member_positions:
             return None
         head, tail = member_positions[0], member_positions[-1]
@@ -693,7 +783,7 @@ class StreamVerifyDriver:
         @return 回收预定 / "neighbor" / None
         """
         frames = scope.frames
-        if not 0 <= position < len(frames):
+        if not allows_position(state.item, position) or not 0 <= position < len(frames):
             return None
         frame = frames[position]
         if _qualifies_for_reclaim(frame, scope.claimed):
@@ -718,12 +808,14 @@ class StreamVerifyDriver:
         named = set(defect.get("members") or ())
         contended = False
         for pos in range(head + 1, tail):
+            if not allows_position(state.item, pos):
+                continue
             frame = scope.frames[pos]
             if not _qualifies_for_reclaim(frame, scope.claimed):
                 if id(frame) in scope.claimed:
                     contended = True       # 本轮被更早的 episode 预定走了
                 continue
-            if named and frame.record.id not in named:
+            if named and frame.session_position not in named:
                 continue
             return self._make_claim(state, frame, pos)
         return "neighbor" if contended else None
@@ -737,38 +829,32 @@ class StreamVerifyDriver:
         @param position 候选帧的会话内批位序
         @return 回收预定
         """
-        positions = state.session_positions
-        prev_member = next_member = None
-        for member in state.working_members:
-            member_pos = positions.get(member.id)
-            if member_pos is None:
-                continue
-            if member_pos < position:
-                prev_member = member                 # 位序在下方的最后一个胜出
-            elif member_pos > position and next_member is None:
-                next_member = member
-        window: list[Record] = []
-        if prev_member is not None:
-            window.append(prev_member)
-        candidate_index = len(window)
-        window.append(frame.record)
-        if next_member is not None:
-            window.append(next_member)
-        return _ReclaimClaim(frame, position, window, candidate_index)
+        if not allows_position(state.item, position):
+            _log.error("stream verify claim violates capacity bounds")
+            raise InternalError("stream verify claim violates capacity bounds")
+        entries = list(zip(state.working_positions, state.working_members, strict=True))
+        previous = next((entry for entry in reversed(entries) if entry[0] < position), None)
+        following = next((entry for entry in entries if entry[0] > position), None)
+        selected = ([previous] if previous is not None else []) + [(position, frame.record)]
+        candidate_index = len(selected) - 1
+        if following is not None:
+            selected.append(following)
+        return _ReclaimClaim(frame, position, [member for _, member in selected], candidate_index,
+                             tuple(pos for pos, _ in selected))
 
     def _apply_reclaim(self, state: _EpisodeReview, claim: _ReclaimClaim) -> None:
         """回收通过：噪声信封翻回 absorbed（②b M7 豁免——绝不翻回 active），记录按批位序插回。
         @param state episode 台账
         @param claim 回收预定
         """
+        if not allows_position(state.item, claim.position):
+            _log.error("stream verify claim commit violates capacity bounds")
+            raise InternalError("stream verify claim commit violates capacity bounds")
         self._remember_envelope(state, claim.envelope)
         claim.envelope.status = "absorbed"
-        positions = state.session_positions
-        insert_at = 0
-        for i, member in enumerate(state.working_members):
-            if positions.get(member.id, -1) < claim.position:
-                insert_at = i + 1
+        insert_at = sum(position < claim.position for position in state.working_positions)
         state.working_members.insert(insert_at, claim.envelope.record)
+        state.working_positions.insert(insert_at, claim.position)
         state.surgical = True
         self._record_repair(state)
 
@@ -830,12 +916,12 @@ class StreamVerifyDriver:
         @param state episode 台账
         @return [(重建后的步序号, 左成员, 右成员)]
         """
-        old_adjacent = {(a.id, b.id)
-                        for a, b in zip(state.orig_members, state.orig_members[1:])}
-        return [(j, a, b)
-                for j, (a, b) in enumerate(zip(state.working_members,
-                                               state.working_members[1:]))
-                if (a.id, b.id) not in old_adjacent]
+        old_adjacent = set(zip(state.orig_positions, state.orig_positions[1:]))
+        old_seams = {tuple(state.orig_positions[index:index + 2])
+                     for index in getattr(state.item, "seam_indexes", ())}
+        return [(index, state.working_members[index], state.working_members[index + 1])
+                for index, pair in enumerate(zip(state.working_positions, state.working_positions[1:]))
+                if (pair not in old_adjacent or pair in old_seams) and index not in state.seams]
 
     async def _reseam_episodes(self, repairing: list[_EpisodeReview],
                                ctx: "RunContext") -> set[int]:
@@ -845,14 +931,9 @@ class StreamVerifyDriver:
         @return 因重抽出错而阵亡的台账 id() 集合（记录级隔离）
         @raises BaseException 大三样原样上抛
         """
-        jobs: list[tuple[_EpisodeReview, int, Record, Record]] = []
-        for state in repairing:
-            if not state.surgical:
-                continue
-            if not (self._stage.cfg.extract.enabled and state.item.transitions is not None):
-                continue
-            for j, a, b in self._affected_pairs(state):
-                jobs.append((state, j, a, b))
+        jobs = [(state, j, a, b) for state in repairing
+                if state.surgical and self._stage.cfg.extract.enabled and state.item.transitions is not None
+                for j, a, b in self._affected_pairs(state)]
         dead: set[int] = set()
         if not jobs:
             return dead
@@ -870,12 +951,16 @@ class StreamVerifyDriver:
             for job_ordinal, (state, j, a, b) in enumerate(jobs)
         )
         try:
-            outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
+            outcomes = await ctx.run_group(TaskGroupRequest(specs))
         except _BIG_THREE as exc:
             for state in repairing:
                 self._rollback_repair(state)
             _log.error("stream verify reseam wave aborted: kind=%s", type(exc).__name__)
             raise
+        failures = tuple(failure for (state, j, _a, _b), outcome in zip(jobs, outcomes)
+                         for failure in working_failures(state, outcome, ctx, "transition",
+                                                          state.working_positions[j:j + 2]))
+        raise_session_capacities(ctx, failures)
         for (state, j, _a, _b), outcome in zip(jobs, outcomes):
             if isinstance(outcome, BaseException):
                 if id(state) not in dead:
@@ -893,44 +978,55 @@ class StreamVerifyDriver:
         @param state episode 台账
         """
         item = state.item
+        if any(not allows_position(item, position) for position in state.working_positions):
+            _log.error("stream verify rebuild violates capacity bounds")
+            raise InternalError("stream verify rebuild violates capacity bounds")
         new_members = tuple(state.working_members)
         new_record = dataclasses.replace(item.record, members=new_members)
         new_transitions = item.transitions
         if item.transitions is not None:
             old_by_pair = {
-                (a.id, b.id): t
-                for (a, b), t in zip(zip(state.orig_members, state.orig_members[1:]),
-                                     item.transitions)
+                pair: transition
+                for pair, transition in zip(zip(state.orig_positions, state.orig_positions[1:]),
+                                            item.transitions)
             }
             rebuilt: list[Transition] = []
             for j, (a, b) in enumerate(zip(new_members, new_members[1:])):
-                if j in state.reseams:
+                if j in state.seams:
+                    from labelkit.operators.extract import _seam_placeholder
+                    rebuilt.append(_seam_placeholder(j, state.seams[j]))
+                elif j in state.reseams:
                     fresh = state.reseams[j]
                     rebuilt.append(dataclasses.replace(
                         fresh, index=j,
                         detail={**dict(fresh.detail), "reseamed": True}))
                 else:
-                    rebuilt.append(dataclasses.replace(old_by_pair[(a.id, b.id)],
+                    rebuilt.append(dataclasses.replace(old_by_pair[tuple(state.working_positions[j:j + 2])],
                                                        index=j))
             new_transitions = tuple(rebuilt)
         item.record = new_record
+        item.member_positions = tuple(state.working_positions)
         item.transitions = new_transitions
+        project_fragments(item, state.orig_positions)
+        item.seam_indexes = tuple(state.seams)
+        item.seam_interrupted_by = tuple(state.seams.values())
         item.stream_repaired = True  # type: ignore[attr-defined]  # → _meta.stream.repaired
 
     # ── (e2) v1.12 帧产物同步（SPEC-frame-annotation §3.4 手术同步）──────────
 
     async def _sync_frame_products(self, repairing: list[_EpisodeReview],
                                    dead: set[int], ctx: "RunContext") -> set[int]:
-        """帧产物同步：先收缩删键（同步、批位序），再回收补跑（帧分类先行、帧标注后随）。克隆信封被
-        既有 S8 判据挡在手术之外（_route_defects 对克隆永不置 surgical），故帧产物同步天然只发生在
-        首标签信封上，无克隆分支——克隆按引用共享同一 dict，随之生效。
+        """帧产物同步：先收缩删键，再回收补跑，且只由拥有成员的首标签写共享产物。
+        克隆可因接缝依赖重建步骤，但不能按自己的旧成员视图删除或补跑原信封的帧产物。
         @param repairing 本轮待修复的台账
         @param dead 先前阶段已阵亡的台账 id()
         @param ctx 运行上下文
         @return 本阶段新阵亡的台账 id() 集合
         """
         synced = [state for state in repairing
-                  if id(state) not in dead and state.surgical]
+                  if id(state) not in dead and state.surgical
+                  and (state.item.classification is None
+                       or state.item.classification.label == state.item.classification.labels[0])]
         for state in synced:
             self._shrink_frame_products(state.item)
         newly_dead = await self._backfill_frame_classify(synced, ctx)
@@ -940,13 +1036,13 @@ class StreamVerifyDriver:
 
     @staticmethod
     def _shrink_frame_products(item: PipelineItem) -> None:
-        """收缩同步：成员手术后不再属于 record.members 的成员 id 从两个帧产物 dict 中删键（含值为
+        """收缩同步：成员手术后不再属于当前序列的出现位置从两个帧产物 dict 中删键（含值为
         None 的 failed 占位键，不留无主条目）。仅当对应 dict 非 None 时操作（dict None = 帧 pass
         未运行：降格会话/帧粒度关闭/非首标签，语义必须保持）；dict 对象本身从不更换——扇出克隆
         按引用共享同一 dict 的前提。
         @param item 手术后的序列信封
         """
-        kept = {member.id for member in item.record.members}
+        kept = set(item.member_positions)
         for products in (item.member_classifications, item.member_annotations):
             if products is None:
                 continue
@@ -978,7 +1074,7 @@ class StreamVerifyDriver:
             )
             for job in jobs
         )
-        outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
+        outcomes = await ctx.run_group(TaskGroupRequest(specs))
         self._reduce_frame_classify(jobs, outcomes, dead, ctx)
         return dead
 
@@ -995,6 +1091,7 @@ class StreamVerifyDriver:
 
         jobs: list[_FrameClassifyJob] = []
         dead: set[int] = set()
+        errors = []
         ordinal = 0
         if not self._stage.cfg.frame_classify.enabled:
             return jobs, dead
@@ -1002,22 +1099,27 @@ class StreamVerifyDriver:
             classifications = state.item.member_classifications
             if classifications is None:
                 continue
-            seen: set[str] = set()
-            try:
-                for member in state.item.record.members:
-                    if member.id in classifications or member.id in seen:
-                        continue
-                    seen.add(member.id)
-                    plan = _plan_frame_episode((member,), ctx, member.id, ordinal)
-                    jobs.append(_FrameClassifyJob(state, member, ordinal, plan))
-                    ordinal += 1
-            except _BIG_THREE:
-                raise
-            except Exception as exc:
-                jobs = [job for job in jobs if job.state is not state]
-                dead.add(id(state))
-                self._stage._fail_item(state.item, exc, ctx)
-        return jobs, dead
+            for index, member in enumerate(state.item.record.members):
+                position = member_key(state.item, index)
+                if position in classifications:
+                    continue
+                target = capacity_target(state.item, (position,))
+                try:
+                    plan = _plan_frame_episode((member,), ctx, member.id, ordinal, target)
+                except _BIG_THREE:
+                    raise
+                except Exception as exc:
+                    errors.append((state, target, exc))
+                    continue
+                jobs.append(_FrameClassifyJob(state, member, position, ordinal, plan))
+                ordinal += 1
+        failures = tuple(failure for _state, target, error in errors
+                         for failure in capacity_failures(ctx, (target,), error, "frame"))
+        raise_session_capacities(ctx, failures)
+        for state, _target, error in errors:
+            dead.add(id(state))
+            self._stage._fail_item(state.item, error, ctx)
+        return [job for job in jobs if id(job.state) not in dead], dead
 
     def _reduce_frame_classify(
             self, jobs: list[_FrameClassifyJob], outcomes: tuple[object, ...],
@@ -1029,6 +1131,15 @@ class StreamVerifyDriver:
         @param dead 已阵亡台账 id 集合
         @param ctx 运行上下文
         """
+        from labelkit.operators.classify_capacity import frame_plan_failures
+
+        failures = []
+        for job, outcome in zip(jobs, outcomes):
+            if isinstance(outcome, BaseException):
+                failures.extend(capacity_failures(ctx, (job.plan.target,), outcome, "frame"))
+            else:
+                failures.extend(frame_plan_failures(job.plan, outcome, ctx))
+        raise_session_capacities(ctx, failures)
         for job, outcome in zip(jobs, outcomes):
             state = job.state
             if id(state) in dead:
@@ -1039,153 +1150,77 @@ class StreamVerifyDriver:
                     self._stage._fail_item(state.item, outcome, ctx)
                 continue
             result = _commit_frame_classify(job.plan, outcome, ctx)
-            state.item.member_classifications[job.member.id] = result[job.member.id]
+            state.item.member_classifications[job.position] = result[job.position]
 
     async def _backfill_frame_annotate(self, states: list[_EpisodeReview],
                                        ctx: "RunContext") -> set[int]:
-        """回收补跑·帧标注：缺键成员按最新帧类调用纯单成员标注叶。
+        """按明确成员位置补跑帧标注，再按声明序提交产物。
 
-        帧分类 reducer 先落键；普通失败在本 reducer 占键 None。
-        @param states 已完成帧分类补跑的台账
-        @param ctx 运行上下文
-        @return 本步新阵亡的台账 id() 集合
-        @raises BaseException 大三样原样上抛
+        @param states 已完成帧分类的工作台账。
+        @param ctx 当前会话上下文。
+        @return 普通帧失败沿原 None 产物语义，不额外失败整个序列。
         """
-        jobs: list[tuple[_EpisodeReview, Record, str | None]] = []
-        if self._stage.cfg.frame_annotate.enabled:
-            for state in states:
-                jobs.extend(self._frame_annotate_jobs(state, ctx))
-        dead: set[int] = set()
-        if not jobs:
-            return dead
-        from labelkit.operators.annotate import (
-            _record_member_failure,
-            annotate_member_leaf,
-        )
+        from labelkit.operators.annotate import _record_member_failure
 
-        specs = tuple(
-            TaskSpec(
-                task_id=(f"{ctx.task_namespace}:verify:stream:frame-annotate:"
-                         f"{state.rounds}:{state.ordinal}:{job_ordinal}"),
-                declaration_key=(ctx.batch_no, 8, state.rounds, 4,
-                                 state.ordinal, job_ordinal),
-                stage=self._stage.name,
-                resource_key=("llm", self._stage.cfg.frame_annotate.llm),
-                operation=lambda member=member, label=label: _capture_leaf(
-                    lambda: annotate_member_leaf(member, ctx, label)),
-            )
-            for job_ordinal, (state, member, label) in enumerate(jobs)
-        )
-        outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
-        for (state, member, _label), outcome in zip(jobs, outcomes):
+        jobs = [job for state in states for job in self._frame_annotate_jobs(state, ctx)]
+        specs = tuple(TaskSpec(
+            task_id=f"{ctx.task_namespace}:verify:stream:frame-annotate:{job.state.rounds}:{ordinal}",
+            declaration_key=(ctx.batch_no, 8, job.state.rounds, 4, job.state.ordinal, ordinal),
+            stage=self._stage.name, resource_key=("llm", self._stage.cfg.frame_annotate.llm),
+            operation=lambda job=job: _capture_leaf(lambda: self._frame_annotation_leaf(job, ctx)),
+        ) for ordinal, job in enumerate(jobs))
+        outcomes = await ctx.run_group(TaskGroupRequest(specs))
+        failures = []
+        for job, outcome in zip(jobs, outcomes, strict=True):
+            target = dataclasses.replace(capacity_target(job.state.item, (job.position,)), label=job.label)
+            failures.extend(capacity_failures(ctx, (target,), outcome, "frame"))
+        raise_session_capacities(ctx, failures)
+        for job, outcome in zip(jobs, outcomes, strict=True):
             if isinstance(outcome, BaseException):
                 _propagate_attempt_internal(outcome)
-                _record_member_failure(member, ctx, outcome)
-                state.item.member_annotations[member.id] = None
-                continue
-            state.item.member_annotations[member.id] = outcome
-        return dead
+                _record_member_failure(job.member, ctx, outcome)
+                job.state.item.member_annotations[job.position] = None
+            else:
+                job.state.item.member_annotations[job.position] = outcome
+        return set()
 
-    def _frame_annotate_jobs(
-        self, state: _EpisodeReview, ctx: "RunContext",
-    ) -> list[tuple[_EpisodeReview, Record, str | None]]:
-        """单 episode 的帧标注补跑工单：缺键成员 × 帧类视图门。label 与视图判定镜像 M5 帧 pass 的成
-        员槽位规则（annotate._frame_member），含跳过类的 frame_annotate.skipped 计数（与 M5 供数点
-        同口径，report 与 members[] 状态直方图可对账）；视图 enabled=false ⇒ 跳过类不占键（emitter
-        按缺键推导 skipped），frame.classify 关 ⇒ label=None 走全局指令。
-        @param state episode 台账
-        @param ctx 运行上下文（跳过计数）
-        @return [(台账, 成员记录, 帧类标签)]
+    @staticmethod
+    async def _frame_annotation_leaf(job: _FrameAnnotateJob, ctx: "RunContext") -> Annotation:
+        """传递完整工作序列和帧类视图。@param job 单帧工单。@param ctx 上下文。@return 标注产物。"""
+        from labelkit.operators.annotate import annotate_member_leaf
+
+        target = dataclasses.replace(capacity_target(job.state.item, (job.position,)), label=job.label)
+        return await annotate_member_leaf(job.member, ctx, job.label, target)
+
+    def _frame_annotate_jobs(self, state: _EpisodeReview, ctx: "RunContext") -> list[_FrameAnnotateJob]:
+        """按明确成员键选择尚未标注且类别启用的帧。
+
+        @param state 当前工作序列。
+        @param ctx 帧分类视图和计数来源。
+        @return 按出现位置排列的补标工单。
         """
         item = state.item
-        if item.member_annotations is None:
+        if not self._stage.cfg.frame_annotate.enabled or item.member_annotations is None:
             return []
-        jobs: list[tuple[_EpisodeReview, Record, str | None]] = []
-        seen: set[str] = set()
-        for member in item.record.members:
-            if member.id in item.member_annotations or member.id in seen:
+        jobs = []
+        for index, member in enumerate(item.record.members):
+            position = member_key(item, index)
+            if position in item.member_annotations:
                 continue
-            seen.add(member.id)
-            cls = (item.member_classifications or {}).get(member.id)
-            label = cls.label if cls is not None else None
-            view = (self._stage.cfg.frame_class_views.get(label)
-                    if label is not None else None)
+            classification = (item.member_classifications or {}).get(position)
+            label = classification.label if classification is not None else None
+            view = self._stage.cfg.frame_class_views.get(label) if label is not None else None
             if view is not None and not view.enabled:
                 ctx.metrics.count("frame_annotate.skipped")
-                continue                     # 跳过类不占键（skipped 语义）
-            jobs.append((state, member, label))
+                continue
+            jobs.append(_FrameAnnotateJob(state, member, position, label))
         return jobs
 
     # ── (f) 重标注 + 终审 ─────────────────────────────────────────────────
 
-    def _rung_fits(self, trial: _LadderTrial, prof: "LLMProfile",
-                   ctx: "RunContext") -> bool:
-        """升档试装：按 (k 减半, 升档像素) 建一次提示词并估算，看是否仍在输入预算内。单图成本取
-        max(标定读数, 供应商先验 @ 升档像素 × PRIOR_INFLATION)。试装的 Schema 文本与计价
-        对象都取类有效 Schema——否则试装估算与真实重标注调用不同源。
-        @param trial 试装参数
-        @param prof annotate profile（预算与像素上限来源）
-        @param ctx 运行上下文（标定器与按类 Schema 查询）
-        @return True = 升档站得住；False = 只保留 k 减半
-        """
-        from labelkit.operators.annotate import AnnotatePromptOptions, build_annotate_prompt
-        from labelkit.operators.annotation_finalization import (
-            class_effective_model_schema,
-            class_schema_text,
-        )
-
-        item = trial.item
-        prompt = build_annotate_prompt(
-            item.record, ctx.cfg, class_schema_text(ctx, trial.label),
-            AnnotatePromptOptions(
-                repair=trial.repair, label=trial.label,
-                transitions=item.transitions, fragment_lens=trial.fragment_lens,
-                k_eff=trial.k_eff, image_px=trial.image_px,
-                temporal_context=item.temporal_context))
-        cost_up = max(ctx.llm.calibrator.cost(prof.name),
-                      math.ceil(budget.est_image_prior(prof, trial.image_px)
-                                * budget.PRIOR_INFLATION))
-        schema_eff = (dict(class_effective_model_schema(ctx.cfg, trial.label))
-                      if prof.supports_structured_output else None)
-        est = budget.est_prompt(prompt, prof, schema_eff, image_cost=cost_up)
-        return est <= budget.input_budget(prof)
-
-    def _repair_ladder(self, item: PipelineItem, ctx: "RunContext",
-                       opts: "AnnotatePromptOptions") -> "AnnotatePromptOptions":
-        """V21 修复梯：为判 fail ∧ policy="repair" 的重标注算出换档取值（spec 3.7.3「修复路径与
-        上下文预算的交互 ①」的唯一触发面，此处正是那条路径）。以 annotate profile 预算为门（cw ==
-        0 保持 v1.10 调用形逐字节不变），只有 UI 序列带关键帧面。梯级：k → max(2,
-        ⌈sequence_frames/2⌉)（F3）；px → 工作点上一级（见 _next_image_rung），经
-        _rung_fits 复核，越预算则丢掉 px 档只保留 k 减半。budget.escalations 每次真正升档记一次；
-        单发——由既有 max_repair_rounds 循环限界。
-        @param item 待重标注的序列信封
-        @param ctx 运行上下文
-        @param opts 本次重标注的基准装配变体参数（修复上下文 / 类标签 / 碎片配额）
-        @return 换档后的装配变体参数（预算关或非 UI 序列时原样返回 opts）
-        """
-        record = item.record
-        acfg = self._stage.cfg.annotate
-        prof = self._stage.cfg.llm_profiles.get(acfg.llm)
-        if (prof is None or prof.context_window <= 0
-                or record.kind != "sequence" or record.modality != "ui"):
-            return opts
-        k_half = max(2, math.ceil(acfg.sequence_frames / 2))
-        px_up = _next_image_rung(prof)
-        if px_up is not None and not self._rung_fits(
-                _LadderTrial(item=item, repair=opts.repair, label=opts.label,
-                             fragment_lens=opts.fragment_lens, k_eff=k_half,
-                             image_px=px_up), prof, ctx):
-            px_up = None
-        if px_up is not None:
-            ctx.metrics.count("budget.escalations")
-        return dataclasses.replace(opts, k_eff=k_half, image_px=px_up)
-
     async def _reannotate_episode(self, state: _EpisodeReview,
                                   ctx: "RunContext") -> Annotation:
-        """重标注一个手术过/判 label_mismatch 的 episode。v1.9（T14 穿参义务）：每碎片关键帧配额
-        从 M16 duck 标记穿到两个 annotate 调用点——此处丢掉它会把修复重标注悄悄降级成均匀降采样。
-        v1.11（V21/F3）：换档取值只在修复梯活着（预算开 + UI 序列）时改写基准变体参数，预算关
-        时原样透传，调用形保持逐字节不变。
+        """以全部工作成员、图片、动作与当前批评重标注，实际请求完整检查容量。
         @param state episode 台账
         @param ctx 运行上下文
         @return 重标注结果
@@ -1200,16 +1235,15 @@ class StreamVerifyDriver:
             previous_output=state.item.annotation.output,
             critiques_text=render_critiques_text(state.fail_critiques),
         )
-        fragments = getattr(state.item, "stitch_fragments", None)
-        fragment_lens = (tuple(int(f["member_count"]) for f in fragments)
-                         if fragments else None)
         opts = AnnotatePromptOptions(repair=repair, label=state.label,
                                      transitions=state.item.transitions,
-                                     fragment_lens=fragment_lens,
                                      temporal_context=state.item.temporal_context)
-        return await annotate_record_leaf(
-            state.item.record, ctx, self._repair_ladder(state.item, ctx, opts),
-        )
+        from labelkit.operators.annotate import class_schema_text
+        from labelkit.operators.annotate_capacity import sequence_request
+
+        request = sequence_request(state.item.record, ctx, class_schema_text(ctx, state.label), opts)
+        check_review(state.item, request, ctx)
+        return await annotate_record_leaf(state.item.record, ctx, opts)
 
     def _finalize_episode(self, state: _EpisodeReview, ctx: "RunContext") -> None:
         """终审落地：写 VerificationResult，判 fail 即 dropped_verify。verify.defects.<kind> 在

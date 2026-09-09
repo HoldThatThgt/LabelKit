@@ -547,15 +547,14 @@ async def test_pairwise_batch_of_one_fixed_half():
     assert item.scores[AGGREGATE_KEY].detail == {}
 
 
-async def test_pairwise_single_item_submits_an_empty_task_group():
+async def test_pairwise_single_item_submits_no_leaf_tasks():
     cfg = make_cfg(QualityConfig(mode="pairwise"))
     tasks = TaskRunner()
     batch = [PipelineItem(record=make_record("solo"))]
 
     await QualityStage(cfg).run(batch, make_ctx(cfg, tasks=tasks))
 
-    request, = tasks.requests
-    assert request.tasks == ()
+    assert tasks.requests == []
 
 
 async def test_empty_active_batch_does_not_submit_a_task_group():

@@ -1167,6 +1167,7 @@ def test_raise_for_finish_disposition_is_a_closed_map():
 
 # [C-75] five empirical overflow-body families (V20 seeds, frozen set).
 _OVERFLOW_BODIES = [
+    '{"error":{"type":"exceed_context_size_error","n_prompt_tokens":32769,"n_ctx":32768}}',
     # OpenAI/Azure: code + message family
     '{"error": {"message": "This model\'s maximum context length is 128000 '
     'tokens. However, your messages resulted in 130531 tokens.", '
@@ -1210,6 +1211,7 @@ def test_sniff_gate_requires_budget_and_status_400():
     assert _sniff_overflow_400(131072, 400, body) is True
     assert _sniff_overflow_400(0, 400, body) is False        # budget off
     assert _sniff_overflow_400(131072, 404, body) is False   # wrong status
+    assert _sniff_overflow_400(131072, 413, body) is False
     assert _sniff_overflow_400(131072, 400, '{"error": "nope"}') is False
 
 

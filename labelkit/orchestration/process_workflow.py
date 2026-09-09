@@ -3,8 +3,7 @@
 纯编排/调度——零业务逻辑、不直接发 LLM 调用、不写文件（输出通道属主是 M11）。职责：
 
 - 把 M2 记录流（generate_only 模式下是 M6 generate_all 的产物）按 ``run.batch_size``
-  切批；流模式（v1.8，``segment.enabled``）改消费 M2 会话流视图，按 next-fit **整会话**
-  装箱——仅一只开口箱、超长会话硬切（S21）——并在帧信封上盖章 ``session_id``（S4）；
+  切批；流模式消费 M2 完整会话，按出现位置冻结上游并在会话提交前处理容量重算；
 - 按配置开关（2.3.1 矩阵）以规范链序 segment → stitch → dedup → classify → extract →
   quality → generate → annotate → verify 组链（v1.9 单一超集元组；segment/stitch/extract
   默认关，关闭时逐字节退化为 v1.7 链）；
@@ -146,44 +145,6 @@ def _ceil_div(a: int, b: int) -> int:
     return -(-a // b) if b > 0 else 0
 
 
-def _pack_next_fit(session_lens: Sequence[int],
-                   batch_size: int) -> tuple[list[int], list[int]]:
-    """会话长度序列的 next-fit 装箱空跑——与 ``_run_process_stream`` 逐条同构，
-    故 dry-run 批数是**精确值**（S21/S22）。超长会话硬切成 ``batch_size`` 片，每片
-    自成一批。
-
-    @param session_lens: 按到达序的会话帧数序列
-    @param batch_size: 批容量（帧）
-    @return: (每批帧数, 每批会话片数)
-    """
-    frames: list[int] = []
-    pieces: list[int] = []
-    open_frames = open_pieces = 0
-    for length in session_lens:
-        if length > batch_size:
-            if open_frames:
-                frames.append(open_frames)
-                pieces.append(open_pieces)
-                open_frames = open_pieces = 0
-            full, rest = divmod(length, batch_size)
-            frames.extend([batch_size] * full)
-            pieces.extend([1] * full)
-            if rest:
-                frames.append(rest)
-                pieces.append(1)
-            continue
-        if open_frames and open_frames + length > batch_size:
-            frames.append(open_frames)
-            pieces.append(open_pieces)
-            open_frames = open_pieces = 0
-        open_frames += length
-        open_pieces += 1
-    if open_frames:
-        frames.append(open_frames)
-        pieces.append(open_pieces)
-    return frames, pieces
-
-
 @dataclass(frozen=True)
 class _EstimateScale:
     """静态估算的规模量——``estimate_run`` 的中间产物，仅本模块内部使用。"""
@@ -256,16 +217,9 @@ def _estimate_stream_calls(cfg: "ResolvedConfig",
                            session_lens: Sequence[int]) -> dict:
     """时序流五键（segment/stitch/extract/帧分类/帧标注）的调用数估算。
 
-    ``segment_calls = Σ ceil((L−1)/(w−1))``（L ≥ 2 的会话求和；L = 1 或
-    ``strategy="rules"`` 计 0），其中 v1.11 V12 起 ``w = min(segment.window,
-    budget.min_window(cfg))``——最坏保证装填量（**上界**语义：实际每窗装填 ≥ w_min 帧，
-    故实际窗数 ≤ 估算）。min_window 按设计**不自带上限**（M1 的 V9 护栏要用原始预算导出
-    值），故在**本调用点**钳到窗宽上限；预算未声明 ⇒ min_window 返回 window ⇒ 数值与
-    v1.10 逐字节一致（V26 的 examples 声明的实效窗足够大，w_min > window，八个 dry-run
-    golden 不动）。``stitch_calls``（v1.9 T16 估算，沿用 S22 的 episodes ≈ sessions 下界
-    基数）= 每 episode 候选一次判断 × votes 采样 × repass 开启时翻倍。``extract_calls =
-    Σ(L−1)``（上界）。v1.12 帧粒度两键 = 预扫描帧总数 Σ session_lens 的粗上界（与
-    segment_calls 完全同源；帧分类实际按窗批量、帧标注跳过噪声成员，均 ≤ 帧总数）。
+    分段按必要两帧单位估计初始窗口数；完整证据没有摘要字符上界，
+    该值不保证真实端点可装，也不包含失败重试和容量重算。
+    缝合及下游按每会话一条序列估算；帧分类与帧标注按原始帧总数估算。
 
     @param cfg: 已解析配置
     @param session_lens: 预扫描得到的会话帧数序列
@@ -292,8 +246,8 @@ def _estimate_scale(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> _Estima
     """算出估算的规模量：记录数、批数、评审池、下游基数、生成量与时序流调用数。
 
     v1.8 流模式（segment × generate_only 被 M1 禁止，故这里的 plan 恒为 process 模式的
-    扫描结果）：会话表 → **精确**批数（next-fit 空跑），episodes ≈ sessions 作为下游记录
-    基数（**下界**，stderr 另有注记），pairwise 每批池大小 = 该批装入的会话片数。
+    扫描结果）：批数等于完整会话数；episodes ≈ sessions 是未知分段前的下游基数，
+    pairwise 每个会话的初始估算池为一条序列，真实切分与重算调用不能静态精确预测。
 
     @param cfg: 已解析配置
     @param plan: M2 扫描结果；generate_only 传 None
@@ -319,8 +273,8 @@ def _estimate_scale(cfg: "ResolvedConfig", plan: "IngestPlan | None") -> _Estima
     stream_calls = dict(_STREAM_CALLS_ZERO)
     if cfg.segment.enabled and cfg.run.mode == "process":
         session_lens = tuple(getattr(plan, "session_lens", ()) or ())
-        frame_sizes, pools = _pack_next_fit(session_lens, bs)
-        n_batches, downstream_base = len(frame_sizes), len(session_lens)
+        pools = [1] * len(session_lens)
+        n_batches = downstream_base = len(session_lens)
         stream_calls = _estimate_stream_calls(cfg, session_lens)
     return _EstimateScale(total_records=total_records, ingested=n_ingested,
                           generated=gen_records, generate_calls=gen_calls,
@@ -476,7 +430,6 @@ class ProcessWorkflow:
         self._rejects_lines = 0
         self._batch_no = 0
         self._pending: deque[list[PipelineItem]] = deque()  # 生成再流转队列
-        self._split_warned = False                 # 会话硬切 WARN 每轮仅一次
 
         # 控制流。
         self._stop = False
@@ -754,8 +707,7 @@ class ProcessWorkflow:
         if getattr(self.ingestor, "metrics", None) is None:
             self.ingestor.metrics = self.metrics   # trace 接线（CONTRACTS §7.1）
         if self.cfg.segment.enabled:
-            # v1.8 流模式：改走 M2 会话流视图的整会话 next-fit 装箱（generate 与 segment
-            # 按 M1 互斥，故再流转队列在这条路径上永不填充）。
+            # 普通流以完整会话为暂存与提交边界；计算组大小由 RunContext 限制。
             await self._run_process_stream()
             return
         stream = iter(self.ingestor.records())
@@ -780,67 +732,34 @@ class ProcessWorkflow:
             del batch                              # 批级内存生命周期：落盘后不留引用
 
     async def _run_process_stream(self) -> None:
-        """v1.8 流模式装箱（S21/S4，CONTRACTS §7.9）：消费 ``ingestor.sessions()``
-        （``--limit`` 的 islice 住在 M2 内部、夹在解析流与组装器之间——S17），按 next-fit
-        整会话装箱：恰一只开口箱，装不下的会话封掉当前批、另开一箱。批容量 =
-        run.batch_size **帧**。超过 batch_size 的会话**硬切**成 batch_size 片，每片自成
-        一批。M10 在构造信封时盖章 ``PipelineItem.session_id``（S4）；会话流耗尽后，残留的
-        开口箱原样发出。收到 SIGINT/SIGTERM 后不再派发**新**批——缓冲中的帧滞留为中断残差
-        （S18）。
+        """顺序处理完整语义会话，计算分组不封闭序列。
 
         @raises AssertionError: 未提供摄取器
         """
         assert self.ingestor is not None, "process mode requires an Ingestor"
-        chain = self._compose_chain(include_generate=True)
-        bs = self.cfg.run.batch_size
-        open_batch: list[PipelineItem] = []
-
+        from labelkit.orchestration.session_workflow import SessionWorkflow
         for sess in self.ingestor.sessions():
             if self._stop:
                 break
-            frames = [PipelineItem(record=r, session_id=sess.session_id)
-                      for r in sess.records]
-            if len(frames) > bs:
-                self._mark_split_session(frames)
-                if open_batch:
-                    await self._dispatch(open_batch, chain)
-                    open_batch = []
-                await self._dispatch_split_session(frames, chain)
-                continue
-            if open_batch and len(open_batch) + len(frames) > bs:
-                # 唯一的待装箱溢出会话——新增的跨批存活项（§11 ⑤），装箱即释放。
-                await self._dispatch(open_batch, chain)
-                open_batch = []
-            open_batch.extend(frames)
-        if open_batch and not self._stop:
-            await self._dispatch(open_batch, chain)  # 残留开口箱原样发出
+            self._batch_no += 1
+            frames = [PipelineItem(record=record, session_id=sess.session_id, session_position=position)
+                      for position, record in enumerate(sess.records)]
+            driver = SessionWorkflow(self, sess.session_id, self._batch_no)
+            await self._guarded_session(driver, frames)
+            del driver, frames, sess
 
-    def _mark_split_session(self, frames: list[PipelineItem]) -> None:
-        """给被硬切会话的每一帧打 duck-typed ``session_split`` 标（S21），并每轮 WARN
-        一次（M7 缺帧判定的降级依据，落到 ``_meta.stream.session_split``）。
-
-        @param frames: 该会话的全部帧信封
-        """
-        if not self._split_warned:
-            self._split_warned = True
-            _log.warning("session exceeds batch_size and was hard-split "
-                         "(warned once per run)",
-                         extra={"stage": "run", "batch": self._batch_no})
-        for item in frames:
-            item.session_split = True
-
-    async def _dispatch_split_session(self, frames: list[PipelineItem],
-                                      chain: Sequence[Stage]) -> None:
-        """硬切派发（S21）：按 batch_size 切片，每片自成一批、按序派发。
-
-        @param frames: 该会话的全部帧信封
-        @param chain: 本批的阶段链
-        """
-        bs = self.cfg.run.batch_size
-        for i in range(0, len(frames), bs):
-            if self._stop:
-                break
-            await self._dispatch(frames[i:i + bs], chain)
+    async def _guarded_session(self, driver, frames) -> None:
+        """在完整会话边界处理取消和图片校准冻结。@param driver 会话协调器。@param frames 完整输入。"""
+        task = asyncio.ensure_future(driver.run(frames))
+        self._current_task = task
+        try:
+            await task
+        except asyncio.CancelledError:
+            if not self._stop:
+                raise
+        finally:
+            self._current_task = None
+            self._freeze_calibrator()
 
     async def _run_generate_only(self) -> None:
         """flat generate_only：一次性生成 → 切批走再流转链（不含 generate 工位）。
@@ -1121,11 +1040,9 @@ class ProcessWorkflow:
         return declared
 
     def _log_budget_startup(self) -> None:
-        """v1.11（V13①，spec 3.10.3 上下文预算行）：打一行数据无关的 INFO 罗列已声明的
-        预算参数——``budget: <name>=<cw>/<input_budget> ...``——并在 segment 启用且其
-        profile 有预算时补一行 ``segment: w_min=<w_min> window=<cap> (budget)``（w_min 取
-        budget.min_window 的原始值，即 V9 护栏/INFO 的打印值）。只有计数与参数，绝无数据
-        内容（§2.6）；无任何被引用 profile 声明窗宽时静默。
+        """打印引用模型的预算与分段必要帧数，不承诺完整证据的安全装填量。
+
+        @return 无；日志只含计数和静态参数。
         """
         declared = self._budget_profiles()
         if not declared:
@@ -1137,7 +1054,7 @@ class ProcessWorkflow:
         seg_prof = (cfg.llm_profiles.get(cfg.segment.llm)
                     if cfg.segment.enabled else None)
         if seg_prof is not None and seg_prof.context_window > 0:
-            _log.info("segment: w_min=%d window=%d (budget)",
+            _log.info("segment: minimum_frames=%d window=%d (budget)",
                       budget.min_window(cfg), cfg.segment.window,
                       extra={"stage": "run", "batch": 0})
 
@@ -1429,6 +1346,8 @@ class ProcessWorkflow:
             "below_min_len": c("segment.below_min_len"),
             "digest_poor_frames": c("segment.digest_poor_frames"),
             "segment_failures": c("segment.failures"),
+            "capacity": {key: c(f"capacity.{key}") for key in (
+                "sealed", "splits", "recomputations", "minimum_failures", "retained_frames_high_water")},
         }
         block.update(self._report_stream_operators(c))
         return block
@@ -1646,7 +1565,7 @@ class ProcessWorkflow:
         """v1.11 report.budget（V13②④⑤；键名冻结于 §9.3）：**整节**仅在 ≥ 1 个本轮被引用
         的 profile 声明了窗宽时才出现——全未声明时 report.json 与 v1.10 逐字节一致。只记数
         与统计，绝无数据内容（§2.6）。M10 在组报表时自 ResolvedConfig、budget.min_window
-        与 llm.calibrator 组装 profiles/w_min/image_cost，其余键直出算子属主的计数器。
+        与 llm.calibrator 组装 profiles/minimum_frames/image_cost，其余键直出算子属主的计数器。
 
         image_cost = 各 profile 的校准**终值**（V19；上面 finalize 的冻结已把末批折进去）。
         最小忠实形态：只列校准器真正采过样的 profile（≥ 1 个冻结图片样本——低于最小样本数时
@@ -1664,10 +1583,8 @@ class ProcessWorkflow:
                          for name, cw, ib in budget_profiles},
         }
         if self.cfg.segment.enabled:
-            # 冻结子键 "segment.window" 下的 [cap, w_min]——w_min 是 budget.min_window 的
-            # **原始**值（按设计不带上限：钳位发生在估算自己的调用点，V12/V26）。
-            block["w_min"] = {"segment.window": [self.cfg.segment.window,
-                                                 budget.min_window(self.cfg)]}
+            # 必要的完整相邻帧单位；不声称任意输入都能装入窗口。
+            block["minimum_frames"] = 2
         trunc_prefix = "budget.truncations."
         block["truncations"] = {key[len(trunc_prefix):]: int(value)
                                 for key, value in sorted(c.values.items())
@@ -1822,14 +1739,9 @@ class ProcessWorkflow:
         )
 
     def _print_dry_notes(self) -> None:
-        """两条口径注记（措辞固定，与 rich 面板的注记文案严格一致）。
+        """说明静态估算不含未知标签、容量拆分和实际重试。
 
-        v1.7 R28：按类覆盖会让静态估算不精确，multi 扇出又把下游调用数乘上一个（不可知的）
-        标签数——两者都用固定措辞标注。v1.8 S22（R28 式）：下游估算按 episodes ≈ sessions，
-        而 LLM 边界精化只会**增加**段数，故这些数字是下界。v1.11（V12，spec 3.10.3 时序流
-        行）：预算装填低于窗宽上限（w_min < window）时，该注记**追加一句**把 segment_calls
-        标为最坏装填上界；w_min ≥ window（V26 的 examples）或预算关闭时注记逐字节不变
-        （dry-run 黄金锚）。
+        @return 无；与 rich 面板使用相同口径。
         """
         cfg = self.cfg
         if cfg.classify.enabled and (cfg.classify.assignment == "multi"
@@ -1839,9 +1751,10 @@ class ProcessWorkflow:
         if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
             note = ("dry-run: note: stream estimate: downstream reports a lower bound "
                     "at episodes≈sessions (LLM refinement only adds segments)")
-            if budget.min_window(cfg) < cfg.segment.window:
-                note += "; segment reports an upper bound at worst-case budget packing"
             print(note, file=sys.stderr)
+        if cfg.segment.enabled:
+            print("dry-run: note: capacity repartition and retries may change actual sequence and call counts",
+                  file=sys.stderr)
 
     def _class_overrides_exist(self) -> bool:
         """是否至少存在一处偏离全局节的 [class.*] 覆盖（class_views 对**每个声明类**都持有

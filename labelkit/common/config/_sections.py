@@ -112,7 +112,6 @@ class _Project:
     segment_provided: dict[str, bool]    # [segment] 的在场/显式书写探针(含 use_vision)
     stitch_provided: dict[str, bool]     # [stitch] 的在场探针
     extract_provided: dict[str, bool]    # [extract] 的在场探针
-    sequence_frames_provided: bool       # [annotate].sequence_frames 是否显式书写
     quality: QualityConfig               # [quality] 质量打分
     generate: GenerateConfig             # [generate] 生成扩增
     gen_provided: dict[str, Any]         # [generate] 互斥形态与删除键探针
@@ -724,7 +723,6 @@ def _parse_segment(col: _Collector, file: str, section: Any) -> SegmentConfig:
         strategy=t.get_str("strategy", "hybrid", enum=("rules", "llm", "hybrid")),
         llm=t.get_str("llm", "default", nonempty=True),
         window=t.get_int("window", 20, minimum=1),   # >= 2 在约束簇里查(§3.6)
-        digest_max_chars=t.get_int("digest_max_chars", 400, minimum=1),
         noise_filter=t.get_bool("noise_filter", True),
         min_len=t.get_int("min_len", 2, minimum=1),
         context=t.get_str("context", "") or "",
@@ -734,6 +732,9 @@ def _parse_segment(col: _Collector, file: str, section: Any) -> SegmentConfig:
     # 由约束簇经原始节探针上报, 而非未知键前向兼容 WARN(此处标记 seen 抑制该 WARN,
     # 保证定向报错是唯一上报)。
     t.seen.add("use_vision")
+    if "digest_max_chars" in t.data:
+        t.take("digest_max_chars")
+        col.error(f"{file}:[segment].digest_max_chars: removed; segment requests use complete member evidence")
     t.finish()
     return cfg
 
@@ -900,9 +901,11 @@ def _parse_annotate(col: _Collector, file: str, section: Any) -> AnnotateConfig:
         examples=_parse_examples(col, file, t.take("examples")),
         self_consistency=t.get_int("self_consistency", 0, minimum=0),
         sc_temperature=t.get_float("sc_temperature", 0.7, bound=_GE0),
-        sequence_frames=t.get_int("sequence_frames", 20, minimum=1),   # [2,100] 在约束簇
         postprocessor=t.get_str("postprocessor", None, nonempty=True),
     )
+    if "sequence_frames" in t.data:
+        t.take("sequence_frames")
+        col.error(f"{file}:[annotate].sequence_frames: removed; sequence requests include every member image")
     t.finish()
     return cfg
 
@@ -1163,8 +1166,6 @@ def _parse_labeling_family(col: _Collector, file: str, top: _Tbl) -> dict[str, A
         quality=quality, generate=generate, gen_provided=gen_provided,
         top_ratio_provided=top_ratio_provided,
         annotate=annotate,
-        sequence_frames_provided=(isinstance(annotate_section, dict)
-                                  and "sequence_frames" in annotate_section),
     )
 
 

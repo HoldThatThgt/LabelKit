@@ -9,10 +9,8 @@ frames 1-8 with the frame-5 social interruption screen; task B 打车 frames 9-1
    noise-semantics assertion (SPEC-stream-segmentation.md §3.3 criteria template).
 2. M15 extract_transition — one adjacent-pair call, action_type within the frozen
    11-value vocabulary (S15), non-empty description, Transition.index carried.
-3. M5 sequence annotation — a 25-member episode downsampled to sequence_frames=20
-   keyframes: EXACTLY 20 image blocks in one request, right at the Anthropic
-   >20-images/request hard-reject threshold (S28) — the endpoint-behavior pin of
-   acceptance item ④ (SPEC §6).
+3. M5 sequence annotation — all 20 original member images in one request.
+   The separate local context-capacity gate verifies a complete 25-member episode.
 4. M7 stream review round — defect_verdict_schema() roundtrip on a deliberately
    mismatched (episode, annotation) pair: forced-tool structured output with
    ["array","null"]/["string","null"] nullable unions accepted by the real
@@ -92,7 +90,7 @@ USER_SCHEMA = {
 # examples/stream/project.toml-style domain context + its sequence-annotation task.
 SEGMENT_CONTEXT = ("手机屏幕操作录屏流；通知面板、弹窗等与前后操作无关的短暂插入屏"
                    "属于干扰帧")
-ANNOTATE_INSTRUCTION = ("你是移动端操作序列标注员。根据动作序列与关键帧，\n"
+ANNOTATE_INSTRUCTION = ("你是移动端操作序列标注员。根据完整动作序列和所有成员帧，\n"
                         "标注该操作序列的任务标签（用户在做什么）、所属应用与一句话摘要。")
 
 # Frozen closed-set vocabularies, mirrored literally from the spec (§3.3 / S15 / S7)
@@ -124,7 +122,7 @@ def _profile(name: str, max_output_tokens: int) -> LLMProfile:
     )
 
 
-def make_cfg(sequence_frames: int = 20) -> ResolvedConfig:
+def make_cfg() -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
         console=ConsoleConfig(),
@@ -149,8 +147,7 @@ def make_cfg(sequence_frames: int = 20) -> ResolvedConfig:
         quality=QualityConfig(),
         generate=GenerateConfig(),
         annotate=AnnotateConfig(enabled=True, llm="default",
-                                instruction=ANNOTATE_INSTRUCTION,
-                                sequence_frames=sequence_frames),
+                                instruction=ANNOTATE_INSTRUCTION),
         verify=VerifyConfig(enabled=True, llm="judge", policy="repair",
                             max_repair_rounds=1),
         output=OutputConfig(schema_inline=json.dumps(USER_SCHEMA, ensure_ascii=False)),
@@ -293,27 +290,26 @@ async def test_extract_transition_action_in_vocabulary():
     assert transition.model and transition.attempts >= 1
 
 
-# ── 3. M5 sequence annotation: 25 members → 20 keyframes (Anthropic image cap) ──
+# ── M5：二十个成员的每张图片都进入实际请求 ──
 
-async def test_sequence_annotate_downsampling_25_frames():
-    cfg = make_cfg(sequence_frames=20)
+async def test_sequence_annotate_complete_20_frames():
+    cfg = make_cfg()
     ctx = make_ctx(cfg)
-    # 25 members cycling the task-A frames (noise frame 5 excluded); member ids
+    # 20 members cycling the task-A frames (noise frame 5 excluded); member ids
     # de-duplicated via dataclasses.replace with an ordinal suffix (id is not
     # recomputed — the id rule binds at M2, S24).
     base = [stream_frame(n) for n in (1, 2, 3, 4, 6, 7, 8)]
     members = tuple(
         replace(base[i % len(base)], id=f"{base[i % len(base)].id[:12]}{i:04x}")
-        for i in range(25))
-    assert len({m.id for m in members}) == 25
+        for i in range(20))
+    assert len({m.id for m in members}) == 20
     episode = make_episode(members)
 
-    # Endpoint-behavior pin (S28 / acceptance ④): the S28 downsample formula keeps
-    # EXACTLY 20 keyframes for n=25, k=20 — 20 image blocks in ONE request, right
-    # at the Anthropic >20-images hard-reject threshold.
+    # 完整成员数等于实际图数；不裁剪任何成员。
     prompt = build_annotate_prompt(episode, cfg, ctx.schema_engine.user_schema_text)
     image_parts = [p for m in prompt.messages for p in m.parts if p.kind == "image"]
     assert len(image_parts) == 20
+    assert [part.image for part in image_parts] == [member.image for member in members]
 
     annotation = await annotate_record(episode, ctx)   # ONE real 20-image call
 

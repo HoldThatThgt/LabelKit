@@ -1,0 +1,46 @@
+schema_version = 1
+[run]
+input = "data/minimum.jsonl"
+output = "out/minimum.jsonl"
+modality = "text"
+batch_size = 2
+seed = 42
+[input]
+ui_tree_max_chars = 30
+[stream]
+order_by = "meta:ts"
+gap_s = 900
+session_max_len = 64
+[segment]
+enabled = true
+strategy = "rules"
+window = 32
+min_len = 2
+on_error = "fail"
+noise_filter = false
+context = "仓库配货和聊天是独立任务；切换应用、再回仓库都要建立新片段。仓库同一请求的修改和确认属于同一任务；色卡连续检查也是单一任务。"
+[stitch]
+enabled = false
+
+[dedup]
+enabled = false
+[quality]
+enabled = false
+[annotate]
+enabled = true
+instruction = "提取完整成员中反复确认的请求编号到request_id。"
+[verify]
+enabled = true
+llm = "default"
+policy = "repair"
+max_repair_rounds = 1
+extra_criteria = "容量切分的人工边界不是任务内容；摘要只需覆盖当前完整成员中的事实。测试色卡画面和界面树是不同的完整证据。"
+[trace]
+enabled = true
+channels = ["segment", "stitch", "annotate", "verify", "schema"]
+content = "refs"
+[output]
+meta_mode = "inline"
+rejects = "full"
+max_repair_attempts = 1
+schema_path = "schemas/minimum.json"

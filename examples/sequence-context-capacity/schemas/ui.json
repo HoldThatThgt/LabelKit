@@ -1,0 +1,16 @@
+{
+  "type": "object",
+  "properties": {
+    "marker_color": {
+      "type": "string"
+    },
+    "frame_count": {
+      "type": "integer"
+    }
+  },
+  "required": [
+    "marker_color",
+    "frame_count"
+  ],
+  "additionalProperties": false
+}

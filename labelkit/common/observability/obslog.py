@@ -455,6 +455,9 @@ class MetricsSink:
         self._captured_counts: ContextVar[dict[str, int] | None] = ContextVar(
             f"labelkit_metrics_capture_{run_id}", default=None,
         )
+        self._session_attempt: ContextVar[tuple[str, int] | None] = ContextVar(
+            f"labelkit_metrics_session_{run_id}", default=None,
+        )
         self._runtime_high_water = {key: 0 for key in _RUNTIME_HIGH_WATER_KEYS}
         self._runtime_totals = {key: 0 for key in _RUNTIME_TOTAL_KEYS}
         self._fatal_streak = 0
@@ -539,7 +542,10 @@ class MetricsSink:
         @param record_ids 相关记录 id（0/1/2 个）
         @param payload 事件自有字段；None 视作 {}
         """
-        payload = payload or {}
+        payload = dict(payload or {})
+        session_attempt = self._session_attempt.get()
+        if session_attempt is not None:
+            payload["session_id"], payload["session_attempt"] = session_attempt
         trace_ev = TraceEvent(
             ts=datetime.now().astimezone().isoformat(timespec="milliseconds"),
             run_id=self.run_id,
@@ -595,14 +601,51 @@ class MetricsSink:
         """
         captured = self._captured_counts.get()
         realtime = key.startswith(_REALTIME_COUNTER_PREFIXES)
+        if self._session_attempt.get() is not None:
+            if key == "budget.overflow_records":
+                realtime = False
+            elif key == "dedup.embedding_failures" or key.startswith("capacity."):
+                realtime = True
         target = captured if captured is not None and not realtime else self.counters
         target[key] = target.get(key, 0) + n
+
+    @contextmanager
+    def session_attempt(self, session_id: str, attempt: int):
+        """为当前会话及其全部叶任务绑定可脱敏的尝试身份。
+
+        @param session_id 完整会话的结构身份，不含输入内容。
+        @param attempt 上游为零，下游从一开始的尝试序号。
+        @return 当前作用域，退出或取消时恢复外层身份。
+        @raises ValueError 会话身份为空或尝试序号不合法。
+        """
+        if not session_id or not _non_negative_int(attempt):
+            _logger.error("session metrics scope requires an identity and non-negative attempt")
+            raise ValueError("session metrics scope requires an identity and non-negative attempt")
+        token = self._session_attempt.set((session_id, attempt))
+        try:
+            yield
+        finally:
+            self._session_attempt.reset(token)
+
+    def observe_session_frames(self, frames: int) -> None:
+        """记录实际保留的会话帧数高水位，不将它声称为字节或 RSS。
+
+        @param frames 当前保留会话的原始出现位置数。
+        @return None。
+        @raises ValueError 帧数不是非负整数。
+        """
+        if not _non_negative_int(frames):
+            _logger.error("retained session frames must be a non-negative integer")
+            raise ValueError("retained session frames must be a non-negative integer")
+        key = "capacity.retained_frames_high_water"
+        self.counters[key] = max(self.counters.get(key, 0), frames)
 
     @contextmanager
     def capture_counts(self):
         """暂存一个 sequence attempt 内产生的 dataset counters。
 
-        事件、LLM 用量、Schema 统计、熔断状态与 ``budget.*`` 运行事实继续实时写入；
+        事件、LLM 用量、Schema 统计、熔断状态与预算运行事实继续实时写入；普通流会话中的
+        ``budget.overflow_records`` 是最终失败记录计数，随当前捕获区提交或丢弃。
         其余经 :meth:`count` 写入的 dataset counters 被暂存，交付控制器在 group
         commit 后显式合并。嵌套捕获会破坏归属边界，因此 fail closed。
 

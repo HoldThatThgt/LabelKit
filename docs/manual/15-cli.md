@@ -47,7 +47,7 @@ timestamp 与 session，不改变这些数量。sequence 估算同时给出 `pro
 report/trace 事后核账。当前主例未启用交织，四个交织读数分别为 `0`、`8`、`0` 与 `{}`；这些值来自 plan，
 不是 timeline 中的用户计数。
 
-注意 `(excludes retries and repair calls)`——真实用量会比估算略高（结构修复、重试、verify 的 repair 轮都不在估算里）。配了 `price_per_mtok_*` 时可结合历史运行的 token 均值折算金额。`classify_calls` 是 v1.7 新增字段（分类算子，第 24 章），`segment_calls` / `extract_calls` 是 v1.8 新增字段（时序流，第 25 章），`stitch_calls` 是 v1.9 新增字段（线索缝合，第 26 章），`frame_classify_calls` / `frame_annotate_calls` 是 v1.12 新增字段（流模式帧粒度，第 25 章），未启用恒为 0；流模式下 quality/annotate/verify 的估算以「episode 数 ≈ 会话数」报**下界**、extract 按剔噪前帧数报**上界**（估算公式与真实对账见第 25 章）；帧粒度两键按预扫描帧总数报**粗上界**——帧分类实付每 episode 一次批量判决（且住 dedup 之后，重复 episode 零调用）、帧标注实付过质量门的成员数，实跑对账看 `report.stream` 的两个帧子块（第 8 章，成本账见第 25 章 25.6）；v1.11 起 `segment_calls` 的语义随预算而变——`segment.llm` 所指 profile 声明了 `context_window`（第 6 章）时，估算公式的窗宽取 `min(window, w_min)`（w_min = 预算保证每窗至少装下的帧数），实际装填每窗只多不少、窗数只少不多，故报的是**最坏装填上界**（实际窗数事后看 `report.stream.windows` 对账），且 w_min 小于 window 时 stream 注记行会追加一句 `; segment reports an upper bound at worst-case budget packing`；未声明预算或 w_min ≥ window 时公式与数值同 v1.10。`classify.assignment = "multi"` 时，quality/annotate/verify 的估算按每记录标签乘数 1 计——报的是**下界**（扇出后的实际调用数只多不少）；配了 `[class.*]` 按类覆盖时则一律按全局配置估算。后两种情况 stderr 都会多打一行注记（`dry-run: note: estimated with global config / multi reports a lower bound at label multiplier 1`）。
+静态估算不包含重试、结构修复和容量重算。普通流的 batches 精确等于扫描得到的完整会话数；下游先以每会话一条序列估算，实际语义分段、容量切分、类扇出及过滤都会改变调用数。segment 以必要两帧单位估计初始请求，不能证明任意成员都可装入请求。真实用量读 report.llm_usage，跨尝试原因读带 session_id/session_attempt 的 trace。
 
 ## 15.2 `labelkit validate`：只体检不跑车
 

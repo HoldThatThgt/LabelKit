@@ -36,14 +36,16 @@ user:   [任务指令] {annotate.instruction}
 | kind | 语义 |
 |---|---|
 | `label_mismatch` | 标注的任务标签与序列证据不符。 |
-| `off_task_members` | 段内混入与任务无关的成员帧（`members` 列出这些成员帧 id）。 |
+| `off_task_members` | 段内混入与任务无关的成员帧（`members` 列出这些成员帧的非负整数出现位置）。 |
 | `missing_head` / `missing_tail` | 段首缺少任务起点帧 / 段尾缺少任务终点帧（结合边界余量判断）。 |
-| `missing_members` | 段中缺失成员帧（`members` 列出可指认的帧 id，无从指认则为 null）。 |
+| `missing_members` | 段中缺失成员帧（`members` 列出可指认的非负整数出现位置，无从指认则为 null）。 |
 | `wrong_stitch` | v1.9：线索的某处缝合是错误的——某碎片与线索其余部分不属同一目标导向任务（结合 `[片段结构]` 判断；`position` 指向可疑碎片的线索内序数）。仅 stitch 启用时可判（3.16）。 |
 
-评审证据为单条 user 消息**七段序**（v1.8 为六段，v1.9 插入 `[片段结构]`；system 含六类缺陷说明（v1.9 起）；全文逐字冻结于 CONTRACTS §10.5 序列变体）：`[任务指令]`（classify 启用时取类有效值，同本节按类取值段）→ `[动作序列]`（`item.transitions` 按 3.5.2 步骤行格式渲染，接缝占位步带 thread_seam 后缀（3.4.3 序列行同款）；transitions 为 None 时整段省略）→ `[片段结构]`（v1.9，**仅 stitch 启用时在场**——关闭时整段省略、退回六段形态即 v1.8 回归锚：每碎片一行「线索内序数 / 帧跨度 / 首帧摘要」+ 接缝位置表（`seam_indexes` 的文字化）；无此节 `wrong_stitch` 不可判，3.16）→ `[边界余量]`（段边界外前后 **k = 2** 帧的 `frame_digest`（4.3）及其去向标注：noise / 相邻段序数 / 无——防切头切尾的证据段，零额外 LLM 调用，语音端点检测 hangover 惯例的移植 [54]；多碎片线索的边界 = 线索两端，维持**首碎片头 / 尾碎片尾**邻帧（接缝不是边界，v1.9）；「相邻段序数」的会话内清单**过滤 `status="stitched"` 壳**（实现 `_session_episodes`，壳非产出单元、不得占用「第 n 段」序数，v1.9））→ `[首帧截图]` → `[末帧截图]`（judge profile 须 supports_vision，3.1.4 vision 逐阶段表）→ `[标注结果]`。产物增量：`VerificationResult` 增 additive 字段 `defects`（4.2，非 stream 恒 `()`）；`_meta.verification` 在 stream 模式下携带恒在 `defects` 键（无缺陷 = []，6.3）；缺陷摘要随 `verify.verdict` 事件 payload（受 trace.content 分级，7.4，S31）。`verdict = "fail"` 而 defects 为空数组 ⇒ 代码侧归一化为一条默认 `label_mismatch` 缺陷（S7——修复路由建立在缺陷表之上，fail 必有路由依据）。
+评审证据依次包含 `[任务指令]`、全部成员的出现位置与完整文本或 UI 树、全部成员图片、已有完整 `[动作序列]`、启用 stitch 时的 `[片段结构]`、`[边界余量]` 和完整 `[标注结果]`。每个成员的正文由 `record_evidence` 渲染，UI 树使用 `serialize(None)`；图片使用惰性 ImageRef 引用，预检不加载字节。动作保留每一步完整 action JSON，不能以摘要、首尾帧或关键帧代替真实证据。碎片按显式 `member_positions` 列举成员，并展示接缝；边界余量只引用允许范围内段外前后各两帧的完整文字、原图片和真实出现位置，标明 noise、相邻有效 episode 或无归属，过滤 stitched 壳。人工容量边界另外标明对应出现位置；切点外帧的正文和图片均不加入请求。
 
-**上下文预算装填（v1.11）。**评审 profile 声明 `context_window` 时按上下文预算装填评审调用（未声明 = 预算关闭，行为与 v1.10 一致；预算/估算/校准机制见 3.9）：记录侧可裁份额 = 单记录 UI 树渲染动态封顶（`min(input.ui_tree_max_chars, 预算折算字符)`，marker 与绝对上限语义同 3.13.4）与序列 `[动作序列]` 步骤行块的「首末步恒保留、丢中段整行 + 原位标记」裁剪（V9）。**多评审团共用单 prompt**（本节多评审团行与 stream 序列评审均为一次构建广播全团）⇒ 记录侧份额按评审团**最小 `input_budget`** 装填（V25②；对照：quality pairwise 逐 (对, 评审) 各自构建、按本评审预算装填，3.4.3）。**不可裁剪动态块（V25③）**：`[标注结果]` 的标注 JSON 为 per-record 语义资产——**计入 est、永不裁剪**；全部可裁份额耗尽仍超 → 该记录记 `context_overflow` 入 rejects（V10，7.6）。逐裁剪点计入 `report.budget.truncations`（6.4）。
+`VerificationResult.defects` 在 process sequence 中恒在，无缺陷为空；缺陷摘要随 `verify.verdict` 事件输出并受 trace.content 分级。`verdict="fail"` 且 defects 为空时归一化为默认 `label_mismatch`，保证失败有明确路由依据。`defects.members` 只接受会话内非负整数出现位置；内容 ID 不能定位成员，因为相同内容可以重复出现。
+
+**上下文预算。**普通单记录继续使用既有 UI 树预算装填，生成序列的 verdict 路径遵循本章独立生成契约。process sequence 不裁剪成员、图片、步骤或标注：一次构建完整 prompt，按每个 judge 的实际模板、Schema、图片成本和 profile 独立预检，所有 judge 均可容纳才提交整轮。`VerifyStage.preview_capacity` 对当前已知成员、已有动作与 annotation 执行相同检查，未知派生产物不伪造。实际请求前和响应终检的 `context_overflow` 统一交给会话控制器，不能降为普通评审失败或预算裁剪。
 
 ### 3.7.3 失败策略与修复环
 
@@ -53,24 +55,15 @@ user:   [任务指令] {annotate.instruction}
 | `verify.policy = "repair"` | fail ⇒ 将批评意见追加进标注提示词（`[上一版标注] ... [审核意见] ... 请修正后重新输出`），M5 重标注、M8 重校验、M7 重评审；最多 `verify.max_repair_rounds`（默认 1）轮，仍 fail 按 drop 处理。评审轮数记入 `_meta.verification.rounds`（含首评，一次通过 =1；修复后复评 =2），各轮意见按序累积于 `VerificationResult.critiques`（4.2），实例见 3.7.4。 |
 
 **stream 修复路由：严格波次（v1.19）。**`policy = "repair"` 下序列信封按缺陷表路由标签重标、成员收缩
-与成员回收。实现位于 `labelkit/operators/stream_verify.py`；`verify.py` 保留 classic judge/repair 核心。每轮
+与成员回收。实现位于 `labelkit/operators/stream_verify.py`；`verify.py` 保留 classic judge/repair 核心。每轮冻结整会话各波次的全部叶任务，再由 `ctx.run_group` 按 `batch_size` 分组执行；全部分组收齐后只执行一次 reducer。
 严格执行下列屏障，禁止把存在数据依赖的相邻波次合并为一个任务组：
 
-```mermaid
-flowchart LR
-    REVIEW[review leaves] --> ROUTE[route reduce]
-    ROUTE --> CLAIM[claim leaves / reduce]
-    CLAIM --> RESEAM[reseam leaves / rebuild]
-    RESEAM --> FC[frame-classify leaves / reduce]
-    FC --> FA[frame-annotate leaves / reduce]
-    FA --> RA[reannotate leaves / reduce]
-    RA --> NEXT[next round]
-```
+图 3-8 普通流评审的严格修复波次。每一波完整收齐并按声明序归并后，才能进入下一波；需修复的序列最终进入下一轮评审。
 
 | 波次 | 叶任务 | 冻结 ordinal reducer |
 |---|---|---|
 | review | 每个 episode × judge 独立返回 verdict/critiques/defects | 按批位置、judge ordinal 合成评审团结果与确定性 defects 并集 |
-| route | 无 | 按批位置应用 `off_task_members` 收缩；为 missing 缺陷冻结 noise-pool claim 请求；相邻 episode 已持有的帧只标记 boundary flag，不跨段夺帧；无候选时标 `capture_gap`，硬切会话标 `session_split` |
+| route | 无 | 按出现位置执行 off_task_members 收缩；先按容量允许范围筛选 noise-pool 候选，再冻结 claim；邻段已持有帧仅标记，禁止夺帧；无候选标 capture_gap；恰好指向实际人工边界的头尾疑点标 suspected=capacity |
 | claim | 每个冻结 claim 通过 `segment.judge_window` 复裁，只返回 relation outcome | 按 episode、defect、candidate ordinal 更新唯一 claim table；只有 `{continues, advances}` 的首个声明序 claim 可执行 `dropped_noise → absorbed`，其余只标记 |
 | reseam | 每个手术触点通过 `extract.extract_transition` 返回重摘 outcome | 按触点 ordinal 重建 Record 与 transitions；序列 id 不重算，`Transition.index` 恒等元组下标且 `len(transitions) = len(members) − 1` |
 | frame-classify | 仅为回收后缺位成员执行单成员 `classify_frames` | 按成员 ordinal 补写既有 member classification map |
@@ -86,20 +79,32 @@ internal/control 异常结构化取消当前 execution domain。
 同步两个帧产物 dict（`member_classifications` / `member_annotations`，4.1）——手术改了成员集，帧产物必须随
 成员集走，否则 members[] 落盘时出现无主条目或缺帧：
 
-- **收缩删键**：不再属于 `record.members` 的成员 id 从两 dict 删键，**含值为 None 的 failed 占位键**（不留无主条目）；仅当对应 dict 非 None 时操作；dict 对象本身**从不更换**（扇出克隆按引用共享同一 dict 的前提，4.3 补注）。
+- **收缩删键**：从两个帧产物 dict 删除不再属于当前 `member_positions` 的键，包含值为 None 的失败占位。仅触碰非 None dict，保留 dict 对象，扇出共享引用不会产生无主条目。
 - **回收补跑**（幂等只补缺位）：新入 `record.members` 且键缺位的成员依次经过独立的 frame-classify
   TaskGroup 与 reducer、frame-annotate TaskGroup 与 reducer。`frame.classify.enabled` 且 dict 非 None 时，
   单成员窗口失败落 `fallback_class`；`frame.annotate.enabled` 且 dict 非 None 时，标注必须读取前一 reducer
   的新鲜帧类。帧类视图 `enabled=false` 的成员跳过且不占键；frame classify 关闭时 label=None 走全局指令；
   不可修复的帧标注占键 None。
 - **dict None 全程不触碰**：dict 为 None = 帧 pass 未运行（降格会话 / 帧粒度关闭 / 非首标签），收缩与补跑均不触碰——降格语义保持、永不无中生有。
-- **克隆无同步分支**：克隆信封永不手术（既有 S8——multi 扇出克隆的 membership 类手术只标记，仅原信封可执行），故帧产物同步不需要克隆分支；懒加载直调面由三个扩为**四个**（`classify.classify_frames` 为算子间导入白名单第四向；`annotate_member` 并入既有 annotate 修复面族——CONTRACTS §1.1）。
+- **克隆不写共享帧产物**：multi 扇出克隆的 membership 类手术只标记，仅首标签原信封可执行。克隆可因接缝依赖重建自己的步骤、重标注和复评；这一路径必须跳过共享帧产物同步，不能按克隆的旧成员删除原信封新回收帧的产物，也不能重复补跑。懒加载直调面包含 `classify.classify_frames` 与 `annotate_member`（CONTRACTS §1.1）。
 
 **wrong_stitch 路由（v1.9，独立分支）**：**只标记、不拆线**——自动拆线手术是 v1.9 非目标（8.1），本缺陷不进上述三类手术路由，尤其**不得落入 missing_\* 的噪声池回收扫描**（错缝的修复方向是移除碎片而非补帧，回收扫描会反向加重错缝）；repair 轮内不为其执行任何成员手术（重标注亦不能修复错缝），持续 fail 按 drop 收尾（`dropped_verify`——错缝线索 fail-closed 不入主输出）；计数入 `verify.defects.wrong_stitch`（6.4）。成员手术的回收扫描语义不变（异线索 absorbed 帧按既有 D5 邻域判定已是 neighbor mark-only，缝合不改变其结论）。
 
 修复轮数计入 `verify.max_repair_rounds`（含首评，与本节非 stream 语义一致）。状态改写授权：手术在 `absorbed` 与 `dropped_noise` 间**双向**改写成员信封状态——4.3 契约 ②b 的 M7 修复路径豁免（契约①的唯一反向豁免），**禁止翻回 `active`**（帧与其 episode 不得双写主输出）。其余裁决：multi 扇出克隆兄弟的 membership 类手术**只标记**——仅原信封（首标签）可执行（S8，3.13.4 multi × episode 行）；多评审团下 defects = 投 fail 的 judge 的**并集**，按 (kind 枚举序, position, members) 确定性去重排序，同成员的互斥手术取先序（S31）；修复后**不重打分**——沿用修复前质量分 + `_meta.stream.repaired = true` 标记（6.3；multi 下亦用于消歧同 id 兄弟行）。观测面（M7 属主，`report.stream.verify` 子块，6.4）：`verify.membership_repairs`（执行的手术数）、`verify.boundary_flags`（只标记的边界判定数）、`verify.defects.<kind>`（逐缺陷类型计数）。
 
-**修复路径与上下文预算的交互（v1.11）。**① **升级触发（V21）**：`verdict = "fail"` ∧ `policy = "repair"` 是修复重标注质量阶梯换档（关键帧减半 + 分辨率上探 ≤ `max_image_px`，3.5.2 v1.11 段）的**唯一**触发面——升级只发生在修复路径、每记录 ≤ `verify.max_repair_rounds` 次，阶梯参数经 `AnnotatePromptOptions` 的 `k_eff` / `image_px` 两字段传入（实现为 `dataclasses.replace(opts, …)`，F3）。② **回收复裁的静态保证（V9/F14）**：成员回收的固定 [前成员, 候选, 后成员] 三帧复裁窗（直调 `segment.judge_window`）由 M1 预算护栏静态覆盖——`w_min` 护栏下限 `floor = 3` **仅当** `verify.enabled ∧ verify.policy = "repair" ∧ segment.enabled`（`policy = "drop"` 不构造复裁窗、不做三帧静态要求），`w_min < floor` → CONFIG_ERROR（3.1.4、3.9），由此在**先验计价**下保证修复路径运行期复裁不 `context_overflow`（v1.11 审计修订：校准值超先验的个案降为复裁失败的既有 mark-only 处置——记录级，永不 run 级；reactive-400 形态在该吞点补喂熔断恰一次，7.6 熔断矩阵）。③ 缺陷词表与预算无交互：`wrong_stitch` 的无条件闭合词表语义不变（3.7.2 四处同步闭集，stitch off 亦在场）。
+**修复路径与上下文预算。**回收复裁窗由完整相邻成员与候选组成，运行前检查真实窗口，不能依赖静态三帧保证。重标注使用全部工作成员、全部图片、全部现有步骤和真实审核意见，不降采样、不尝试图像阶梯、不缩小分辨率。评审、复裁、重摘、帧补分类、帧补标注和重标注的容量失败均归属 verify，携带扩展后的工作目标及实际请求位置上抛。整个 verify 阶段恢复开始时的成员、帧状态、共享帧产物、annotation 和 claims；会话控制器只重算未提交状态，已记录的最小终态由目标 stage/profile/label/positions 消费，禁止重复发送同一失败请求。
+
+候选生成和 claim 提交前都校验半开容量范围，重绑成员前再检查所有工作位置；任何一次越界均不得提交。仅在当前实际段首对应 before 切点、或段尾对应 after 切点时，missing_head/missing_tail 可标 `suspected="capacity"`；具名成员必须恰好是切点另一侧位置。此类疑点不回收、不独立 fail，其余真实缺陷仍照常裁决。
+
+手术后按出现位置投影碎片。保留成员保持原碎片归属；回收成员归入其前邻原成员的碎片，段首无前邻时归入后邻原成员的碎片。删除空碎片后按各碎片首个剩余出现位置重新排序，保留 cause、source_episode 和固定键序。多碎片夹缝以此规则消除归属歧义，不能从成员计数或内容 ID 猜测。接缝根据真实出现位置缺口重建，中断名读取同会话各线索内部保存的 `stitch_task_name`，不新增用户输出字段。成员归属只取未分类序列或分类命中集首标签；其余标签视图只消费成员。与当前视图具有同一 record.id 的线索不能形成自身中断，独立线索即使任务名相同仍是真实中断。
+
+**接缝依赖闭合。**本轮成员手术成功或回滚之后，按最终成员归属扫描全部已评审台账。若其他序列的接缝或中断名改变，复用同一重摘、重绑、重标注波次，再复评该序列，不能只修改元数据。已有 max_repair_rounds 预算不重置；无剩余预算时明确 dropped_verify，不能交付消费旧步骤的 annotation。例如 A=[0,4]、B=[2,5]，B 移除位置 2 后 A 必须重新摘取 0→4、重标注并复评。依赖修复容量失败时，整阶段快照同时恢复 A、B、原帧和所有认领。
+
+**整波容量归集。**每个评审团的同步预检、跨序列同步计划，以及 review、claim、reseam、frame-classify、frame-annotate、reannotate 各波均先收齐全部物理计算分组，再按叶任务声明序归集全部容量问题。嵌套 SessionCapacityError.failures 保留顺序扁平传递；任何业务结果归并之前统一上抛非空失败元组，会话控制器一次重算消费全部已知失败，禁止同一已失败请求在下一尝试原样重发。
+
+最小失败证据保留实际请求位置。frame 的终态门按出现位置精确隔离；transition 中不可拆的必要相邻对使当前序列视图无法完成，因此其终态在相同 stage、profile、lineage、record.id 和 label 上阻断该视图的所有相邻对请求。其他子序列、分类视图、阶段或 profile 不受此门影响；不能把失败证据里的原相邻对改写成整序列成员。
+
+**Schema 修复证据。**process session 的 CallScope.complete_evidence 为 true。L3 修复保留原完整成员、图片、任务与 Schema，再附上一版模型字段和违规清单；容量错误原样交回 verify，不能改写为 SchemaViolation。上游容量预览只检查当前已知证据，实际邻帧、annotation 或修复意见出现后再执行完整请求检查。
 
 **背书：**LLM-as-a-Judge 的可靠性、偏差类型（位置/冗长/自增强）与缓解手段出自 Zheng et al.（NeurIPS 2023）[20]；「批评意见回喂原模型迭代修正」是 Self-Refine（NeurIPS 2023）的 FEEDBACK→REFINE 循环 [21]，有界轮数与其停机设定一致；批评-修订两阶段结构同 Constitutional AI [22]。GUI-360 以同构的「LLM 质量过滤」环节筛选 GUI 轨迹数据 [14]。
 

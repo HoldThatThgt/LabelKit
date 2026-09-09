@@ -2,21 +2,21 @@
 
 ### 3.16.1 职责与边界
 
-**做：**（v1.9 新增算子）对批内候选会话执行线索缝合：以「单调选池 LLM 判定 × 机械先验合取」把同一目标导向任务被穿插切开的碎片（episode）保守缝合为**线索（thread）**，有界二遍复评修正顺序贪心的漏缝（3.16.4）；被并 episode 信封壳置 `status="stitched"`、幸存信封 Record 重绑（4.3 契约 ②c）；`below_min_len` 短段按连续 run 重组为救援候选先进候选池，命中时成员帧 `dropped_noise → absorbed` 翻转（②c③）；对多碎片线索机械标定接缝（`seam_indexes` duck 标，零 LLM——接缝转移由 M15 按 T10 四键占位，3.15.4）。产出三级结构 **thread ⊃ fragment ⊃ step**（对齐 Ego4D Goal-Step goal⊃step⊃substep [69] 与 AndroidControl goal⊃instruction⊃action [45]）；帧永远单一归属——交叉用「平面分段 + 线索身份」表达（Goal-Step `is_continued` 同型 [69]；PIRA 把任务子轨迹形式化为**非连续帧子集** [64]），不引入帧多重归属。链序位于 segment 之后、dedup 之前（3.10.3）——缝合改变成员集，必须先于判重（线索判重面 = 重绑后成员配方，3.3.3）与摘取（接缝序数占位，3.15）。`stitch.enabled = false`（默认）时本算子不入链，**主输出、rejects、report.json 与 v1.8 逐字节等价**（退化锚，3.16.4 退化锚行；例外恰两处——dry-run stderr 的 `stitch_calls=0` 行与 stream×verify 缺陷词表的 `wrong_stitch: 0` 行，见退化锚行）。
-**不做：**不重分段（episode 边界属 M14 上游；本算子只合并、不切分）；不推断接缝动作内容（接缝是已知中断，零 LLM 机械占位属 M15 消费面，3.15.4）；不判重（M3）；不打任务标签（`task_name` 是摘要卡滚动线索名——工具内部结构，进 trace 与判定证据，用户 Schema 产出物属 M5）；不跨会话、不跨批缝合（hard-split 边界不可缝，3.16.4 作用域行）；不推断画面业务上的真并发、不赋予帧多重归属（单前台屏无真并发 [65]，2.1.2 / 8.1）。
+**做：**（v1.9 新增算子）对完整会话内候选执行线索缝合：以「单调选池 LLM 判定 × 机械先验合取」把同一目标导向任务被穿插切开的碎片（episode）保守缝合为**线索（thread）**，有界二遍复评修正顺序贪心的漏缝（3.16.4）；被并 episode 信封壳置 `status="stitched"`、幸存信封 Record 重绑（4.3 契约 ②c）；`below_min_len` 短段按连续 run 重组为救援候选先进候选池，命中时成员帧 `dropped_noise → absorbed` 翻转（②c③）；对多碎片线索机械标定接缝（`seam_indexes` duck 标，零 LLM——接缝转移由 M15 按 T10 四键占位，3.15.4）。产出三级结构 **thread ⊃ fragment ⊃ step**（对齐 Ego4D Goal-Step goal⊃step⊃substep [69] 与 AndroidControl goal⊃instruction⊃action [45]）；帧永远单一归属——交叉用「平面分段 + 线索身份」表达（Goal-Step `is_continued` 同型 [69]；PIRA 把任务子轨迹形式化为**非连续帧子集** [64]），不引入帧多重归属。链序位于 segment 之后、dedup 之前（3.10.3）——缝合改变成员集，必须先于判重（线索判重面 = 重绑后成员配方，3.3.3）与摘取（接缝序数占位，3.15）。`stitch.enabled = false`（默认）时本算子不入链，不产生线索专属字段；出现位置与容量边界仍遵循共同 process sequence 契约。
+**不做：**不重分段（episode 边界属 M14 上游；本算子只合并、不切分）；不推断接缝动作内容（接缝是已知中断，零 LLM 机械占位属 M15 消费面，3.15.4）；不判重（M3）；不打任务标签（`task_name` 是摘要卡滚动线索名——工具内部结构，进 trace 与判定证据，用户 Schema 产出物属 M5）；不跨会话；计算分组不构成缝合边界（3.16.4 作用域行）；不推断画面业务上的真并发、不赋予帧多重归属（单前台屏无真并发 [65]，2.1.2 / 8.1）。
 
 **v1.20 sequence generation 边界：**sequence `generate_only` 不进入 M16。工件 replay 仅在 process 工程显式开启 `stitch` 时按本节普通会话内规则运行；replay/owner 元数据既不授权跨会话缝合，也不替代 LLM 判定与机械先验。M2 复验自描述时间并为每个 member 写入去除全部 time path 后的 `exact_dedup_text`；M3 只运行 generation exact 层，不读取 provenance，也不进入 MinHash、图像或 embedding 判重。
 
 | 模块 | 职责 | 边界 | 依赖 |
 |---|---|---|---|
-| M16 stitch | 把会话内碎片保守缝合为线索：单调选池 LLM 判定 × 机械先验合取 + 有界二遍复评；被并 episode 壳置 stitched、幸存信封 Record 重绑、below_min_len 短段救援翻转（②c）；机械标定 `seam_indexes` | 不重分段（M14）；不摘取动作（M15）；不判重（M3）；不跨会话/跨批；不做帧多重归属 | M1, M8, M9 |
+| M16 stitch | 把会话内碎片保守缝合为线索：单调选池 LLM 判定 × 机械先验合取 + 有界二遍复评；被并 episode 壳置 stitched、幸存信封 Record 重绑、below_min_len 短段救援翻转（②c）；机械标定 `seam_indexes` | 不重分段（M14）；不摘取动作（M15）；不判重（M3）；不跨会话；不做帧多重归属 | M1, M8, M9 |
 
 ### 3.16.2 输入 / 输出
 
 | 方向 | 内容 |
 |---|---|
-| 输入 | 按会话独立执行（`session_id` 分组，批内位置序即会话序——M10 整会话装箱保证，3.10.3）。候选流 = 会话内 `status="active"` 且 `record.kind="sequence"` 的 episode 信封 + （`stitch.rescue_short = true` 时）`noise_attribution == ("segment", "below_min_len")` 的帧信封按**连续 run 重组**的救援候选（3.16.4 救援行；`reason="noise"` 的噪声帧不入候选池），按会话序合流；`[stitch]` 参数（5.2）；LLM profile（`stitch.llm`，纯文本判定——摘要卡无图）。 |
-| 输出 | 命中并入的候选：幸存信封 Record 重绑（成员按序键升序拼接；`record.id` **不重算**——M7 手术先例，3.7.3）、被并 episode 信封 `status → "stitched"`（壳终态，M11 第四路由仅计数，3.11.2）；救援命中：成员帧 `dropped_noise → absorbed` 翻转 + 计 `rescued_short`（单位 = 帧）；每个幸存线索信封盖章 `PipelineItem.thread_id = record.id`（单碎片线索亦然，4.1）并挂 `seam_indexes` duck 标（无接缝 = 空元组；坐标语义见 3.16.4 接缝行）与碎片跨度表 duck 标（供 M11 组装 `_meta.stream.fragments` 与 M5 按碎片配额，6.3/3.5.2）；返回值 = 传入的同一列表对象（4.3 契约 ②c）。`on_error="fail"` 且判定修复耗尽时**仅 episode 候选信封**置 `status="failed"`（3.16.6）。 |
+| 输入 | 按会话独立执行（`session_id` 分组，显式 session_position 即会话出现位置——M10 完整会话驱动保证，3.10.3）。候选流 = 会话内 `status="active"` 且 `record.kind="sequence"` 的 episode 信封 + （`stitch.rescue_short = true` 时）`noise_attribution == ("segment", "below_min_len")` 的帧信封按**连续 run 重组**的救援候选（3.16.4 救援行；`reason="noise"` 的噪声帧不入候选池），按会话序合流；`[stitch]` 参数（5.2）；LLM profile（`stitch.llm`，纯文本判定——摘要卡无图）。 |
+| 输出 | 命中并入的候选：幸存信封 Record 重绑（成员按序键升序拼接；`record.id` **不重算**——M7 手术先例，3.7.3）、被并 episode 信封 `status → "stitched"`（壳终态，M11 第四路由仅计数，3.11.2）；救援命中：成员帧 `dropped_noise → absorbed` 翻转 + 计 `rescued_short`（单位 = 帧）；每个幸存线索信封盖章 `PipelineItem.thread_id = record.id`（单碎片线索亦然，4.1）并挂 `seam_indexes` duck 标（无接缝 = 空元组；坐标语义见 3.16.4 接缝行）与碎片跨度表 duck 标（供 M11 组装 `_meta.stream.fragments` 与后续按明确出现位置投影，6.3/3.5.2）；返回值 = 传入的同一列表对象（4.3 契约 ②c）。`on_error="fail"` 且判定修复耗尽时**仅 episode 候选信封**置 `status="failed"`（3.16.6）。 |
 
 信封变化示例（规范验收场景 V2「单交叉」：任务 A 被任务 B 打断——会话 `sess-0012` 内 segment 已产出 3 个 episode；②c 状态写入 = 只改既有元素状态 + 幸存信封 Record 重绑，无删除/重排/替换）：
 
@@ -83,7 +83,7 @@ async def judge_stitch(thread_cards: Sequence[str], candidate_card: str,
                                        #   stitch.judge 事件（3.16.6）
 ```
 
-**摘要卡（digest card）**：判定证据的确定性结构化载体，全部字段自 episode 成员的 `frame_digest` / `tree_diff`（4.3 共享 helper）与信封簿记可达——链序上 extract 后置，缝合运行时批内**无任何 Transition**，证据面全部为帧摘要级（resumption 判定单元「挂起目标尾动作 × 候选恢复首动作」[65] 相应降格为**线索尾帧摘要 × 候选首帧摘要对**的帧级承载）。线索卡逐行：`[线索 {i}] 任务名: {task_name}`（i = 呈现序 1 起编号；未命名渲染「（未命名）」）→ `App 集合:`（成员 App 集排序顿号连接，空集渲染「（未知）」）→ `序号跨度: [first, last]｜帧数 n｜碎片数 F` → `首帧摘要:` → `尾帧摘要:` → `接续对（线索尾帧 → 候选首帧）变更:`（该线索尾帧与候选首帧的 `tree_diff` 确定性文字化——增/删/文本变化节点数、变更比例、应用切换/标题变化，E5 判定对的变更证据行）；候选卡逐行：`[候选碎片] 类型: 分段产出|短段救援` → `App 集合:` → `序号跨度: [first, last]｜帧数 n` → `首帧摘要:` → `末帧摘要:`。卡内嵌入的每个帧摘要沿用 segment `digest_max_chars` 同名键语义截断（`stitch.digest_max_chars`，5.2）；卡的结构化字段有界由构造保证。App / activity / title 提取循环与 diff 文字化由本模块自带副本（先例 `extract` 的 `_diff_text` 副本——算子互不依赖，共享渲染仅 `frame_digest` / `tree_diff` 两枚下沉第 4 章，其余模块内自持）；**数据依赖声明**：activity 依赖采集侧 dump 将其写入 UI 树 `extra`（该字段常缺席，4.1 注），缺失时先验腿③静默失效——析取降格可接受（3.16.4 先验行）。
+**摘要卡（digest card）**：判定证据的确定性结构化载体，全部字段自 episode 成员的 `frame_digest` / `tree_diff`（4.3 共享 helper）与信封簿记可达——链序上 extract 后置，缝合运行时会话内**无任何 Transition**，证据面全部为帧摘要级（resumption 判定单元「挂起目标尾动作 × 候选恢复首动作」[65] 相应降格为**线索尾帧摘要 × 候选首帧摘要对**的帧级承载）。线索卡逐行：`[线索 {i}] 任务名: {task_name}`（i = 呈现序 1 起编号；未命名渲染「（未命名）」）→ `App 集合:`（成员 App 集排序顿号连接，空集渲染「（未知）」）→ `序号跨度: [first, last]｜帧数 n｜碎片数 F` → `首帧摘要:` → `尾帧摘要:` → `接续对（线索尾帧 → 候选首帧）变更:`（该线索尾帧与候选首帧的 `tree_diff` 确定性文字化——增/删/文本变化节点数、变更比例、应用切换/标题变化，E5 判定对的变更证据行）；候选卡逐行：`[候选碎片] 类型: 分段产出|短段救援` → `App 集合:` → `序号跨度: [first, last]｜帧数 n` → `首帧摘要:` → `末帧摘要:`。卡内嵌入的每个帧摘要仅按 `stitch.digest_max_chars` 截断（5.2）；segment 使用完整证据，无此配置键；卡的结构化字段有界由构造保证。App / activity / title 提取循环与 diff 文字化由本模块自带副本（先例 `extract` 的 `_diff_text` 副本——算子互不依赖，共享渲染仅 `frame_digest` / `tree_diff` 两枚下沉第 4 章，其余模块内自持）；**数据依赖声明**：activity 依赖采集侧 dump 将其写入 UI 树 `extra`（该字段常缺席，4.1 注），缺失时先验腿③静默失效——析取降格可接受（3.16.4 先验行）。
 
 判定内部 Schema（`schema_engine.stitch_schema()`，3.8.1 内部 Schema 清单：不计入 `report.schema_engine.resolved_at`、不经过 L2.5）。规则同族：关键字集 ⊆ 既有内部 Schema 关键字集、无 `uniqueItems`、可空以类型联合表达、**全键 required**（OpenAI strict 兼容，3.8.1）；`thread_ref` = 池内线索卡的 **1 起呈现序编号**（Schema 不设界——Schema 看不到池大小，域校验由代码侧执行）；`reason` **恒请求**（判定量级小——每会话 ≈ episode 数次调用，零额外 token 原则的成本面不适用；votes 聚合亦需按多数簇取 task_name / reason，3.16.4 votes 行）；`confidence` 仅作 trace 观测、**不进判定门槛**（口头置信度饱和且系统性过高 [79]，去 confidence 腿见 3.16.4 先验行）：
 
@@ -147,10 +147,34 @@ user（单条消息多 text Part：线索卡在前——按最近活跃降序、
 | 救援短段（`rescue_short=true`，默认） | 判别载体 = 帧信封的 `noise_attribution == ("segment", "below_min_len")` duck 标（M14 剔噪时盖章，3.14.4）；`reason="noise"` 的噪声帧**不入候选池**。**连续 run 重组**：会话序上连续的 below_min_len 帧（中间无任何其他帧）重组为**一个**救援候选，与 segment 原切分不再一一对应（相邻两短段合为一候选；混合任务 run 因先验难命中而维持 dropped——保守面兜底）。机理：用户在切换前密集执行收尾动作（段落完成率基线 0.78/min → 切换前 10.9–12.8/min [81]），任务收尾帧天然易成短段、聚集在切换点旁。命中 → 并入 + 帧翻转（②c③）、`rescued_short` **累加翻转帧数**（单位 = 帧，非救援事件数）；未命中 → 维持 `dropped_noise` 原 reason 落 rejects。`below_min_len` 计数器为发生计数（帧口径），救援**不回退**（3.14.4 ③）。**相邻救援不盖接缝**：会话位置紧邻的拼接对是真实转移，照常送 M15 摘取（接缝判据行）。 |
 | votes 多数决（`votes=1` 默认不启用） | votes = n（≥3 奇数）时同判定 n 次采样，`aggregate_votes(samples, total_votes)` 以**聚合键 = (verdict, thread_ref) 完整判定的严格多数**（> 原始 n/2）归并；`total_votes` 恒为原始采样数 n，SchemaViolation 样本仅从 `samples` 弃权而不缩小分母，零合法样本时抛最后声明票的违规；任何不足严格多数的分裂（含 verdict 多数但 thread_ref 分裂）一律回落保守结局——episode 候选 = `new`、救援候选 = 未命中；`task_name` / `reason` 取多数簇内首个采样。定位：votes 是**口头置信度门槛的正规替代**（采样一致性是可靠的不确定性信号 [33]，口头置信度被证不可靠 [79]）；边界：自一致高 ≠ 对——votes **治方差（漂移）不治偏差（过连接）**，与机械先验合取不可互替 [89]。**路线选型**（业界两路线对照）：采「单模型多次」（self-consistency [33]）而非「多模型评审团」（PoLL [32]）——过连接是**跨家族共享偏差**（PIRA 消融 GPT 系与 Gemini 系同向 trigger-happy [64]），异构裁判会把共享偏差投成多数、且评审团有效独立票仅 ≈2 [86][89]；部署纪律为单端点单模型。若第二模型家族进场，`stitch.judges` 可镜像既有 `verify.judges` 模式作纯配置扩展（8.3 O8）。成本 = 判定调用 ×n（同模型同前缀吃 prompt 缓存）。 |
 | 重绑与身份链 | 幸存信封 Record 重绑：`members` = 两方成员按序键升序拼接的新元组，`record.id` **不重算**（M7 手术先例，3.14.4 拼装行）；`episode_id` = 幸存信封 record.id = `thread_id`（stitch on 时语义为线索 id；off 时二者天然同值——概念性陈述，off 时 `_meta.stream.thread_id` 键不在场）；碎片原 episode_id 记录于 `_meta.stream.fragments[].source_episode`（cause ∈ `"origin"`\|`"resumed"`\|`"rescued"`，6.3）。**steps 编号**：线索的 `steps[].index` 全线索连续 0..n−2——重绑先于 M15，`Transition.index` 恒等元组下标、`len(transitions) = len(members) − 1` 不变量与 emitter 渲染三处约束的唯一解（3.15、4.2）。 |
-| 作用域 | 不跨 session、不跨 batch；hard-split 边界不可缝（`session_split` 标照旧 + WARN 提示调大 batch_size，3.10.3）；segment `on_error="keep"` 的整会话降格 episode **照常入池**（合法 episode，3.14.6）。 |
+| 作用域 | 只在完整 session 内缝合，可跨计算分组；batch_size 仅限制本轮提交的叶任务数，不结束线索或重建池；segment `on_error="keep"` 的整会话降格 episode **照常入池**（合法 episode，3.14.6）。 |
 | 幂等 | 已盖章 `thread_id` 的信封跳过（重入零额外调用）；M7 修复路径不重跑本 stage（wrong_stitch 缺陷 mark-only，不拆线，3.7.3）。 |
-| 退化锚 | 单碎片会话 / 全 new 判定 → 产出 = v1.8 形态（thread = 单碎片、fragments 长度 1、零接缝）；`stitch.enabled = false` → **主输出、rejects、report.json 逐字节等价 v1.8**——依赖条件在场规则：counts.stitched/threads、`report.stream.stitch` 子块、batch.end 新字段、`_meta.stream` 新键（thread_id / fragments / resumed）**仅启用时在场**（6.3/6.4）。**例外恰两处（均无条件设计）**：① dry-run stderr 的 `stitch_calls=0` 行（3.10.3，v1.8 segment_calls 先例）；② stream×verify 报告的缺陷词表行 `verify.defects.wrong_stitch: 0` 与序列评审 system 词表行——缺陷词表是 3.7.2 四处同步的**单一闭集**，不随本开关条件化（真机复验：stitch off 重跑 examples/stream，counts / rejects 全等，仅该一行新增）。 |
-| 上下文预算（v1.11） | 判定 profile 声明 `context_window` 时（未声明 = 预算关闭，行为与 v1.10 一致；机制见 3.9）：缝合判定 prompt 的卡池结构**静态有界**（≤ max_open + 1 张卡 × digest 项，3.16.3 构造保证）⇒ 不做运行期动态裁剪，改由 **M1 静态最坏预检**把关——最坏 est > `input_budget` → **WARN**（**不自动缩 `max_open`**——改语义须用户动手：调大 context_window / 缩 `digest_max_chars` / 缩 `max_open`，3.1.4）。运行时兜底 = M9 咽喉终检（V16）+ 既有 `on_error="keep"` 保守结局（3.16.6：episode 候选开新线索存活、救援候选维持 dropped_noise），无专属降级重试面。 |
+| 关闭缝合 | 单碎片会话或全 new 判定保留单碎片结构、零接缝。stitch=false 不运行本阶段，thread_id/fragments/resumed 和 stitch 计数按既有开关规则省略；共同的 member_positions 与 capacity 契约在两种配置中一致。verify 缺陷词表恒为同一闭集。 |
+| 语义卡片预算 | process sequence 所用 profile 必须声明正 context_window。卡池最多 max_open+1 张卡，卡内摘要有界；静态最坏请求超过 input_budget 时告警，不自动改变 max_open 或卡摘要。运行时仍检查实际请求，不动态裁剪卡池；普通卡片判决失败按 keep/fail 保守处置。完整成员的合并预览另行检查所有已知下游请求，卡片可装不代表序列可装。 |
+
+**完整序列容量闸门**：语义卡片仅用于候选判断。每次 pass1、救援、pass2 命中后，构造无副作用的
+完整 members/member_positions 合并预览，检查当前已知完整下游请求。可装才一次提交 Record、碎片、
+成员状态与计数；不可装时按下表处理。
+
+| 入口 | 容量不足 |
+|---|---|
+| pass1 | 封闭旧目标，候选保留并按原规则开自己的线索 |
+| 短段救援 | 封闭旧目标，救援帧保持 dropped_noise，不创建业务 episode |
+| pass2 | 双方保留全部成员，按最早出现位置封闭较早线索 |
+
+候选检索、预览和提交都拒绝双方任一 sealed；初次分区得到的 sealed episode 直接建立自己的封闭线索，
+零 stitch 判决、不入 pool。普通 max_open 淘汰仍可按原规则复评。所有成员必须位于双方允许范围交集，
+成功合并继承交集，不扩大范围。会话结束才统一复评未 sealed 线索并结算 seam 与中断归属。
+
+只有真实成员分区或严格旧尾位置小于新首位置才建立线性切点。已有 `[0,8]` 与 `[4,6]` 成员合并失败，
+只封闭前者并保留原允许范围，不伪造位置 4 的切点。容量事件统一用 sequence.capacity，记录双方位置。
+出现位置独立于内容 record.id；每个 fragments 元素追加 member_positions，固定键序为 order_span、
+member_count、cause、source_episode、member_positions。后续分区按显式位置投影，禁止凭计数猜交错归属。
+最终判定的任务名保存在内部 `stitch_task_name`，随扇出与容量子段复制，不增加外部输出字段。
+verify 成员手术后据真实出现位置重建接缝，从此载体读取被穿插线索的中断名。回收成员归入其前邻
+原成员所属碎片，段首无前邻时归入后邻原成员所属碎片；保留成员不变更原碎片归属。
+
+process session 的 Schema 调用使用 `CallScope.complete_evidence=true`：L3 修复保留原始完整请求与模型字段错误反馈，容量异常原样交还所属阶段。
 
 ### 3.16.5 配置项
 
@@ -165,7 +189,7 @@ user（单条消息多 text Part：线索卡在前——按最近活跃降序、
 | `rescue_short` | bool / `true` | below_min_len 短段按连续 run 重组先进候选池（3.16.4 救援行）；false = 短段维持 dropped_noise（v1.8 行为）。 |
 | `repass` | bool / `true` | 有界二遍复评（3.16.4 ②）；false = 纯一遍贪心。 |
 | `stale_gap_steps` | int / `0` | 时间衰减阈值（会话序号差；0 = 不启用）。**双职**：① 先验降格（超限须两腿命中，3.16.4 保守偏置行）；② 池满逐出优先腿（3.16.4 ①）。与 `stream.gap_steps` 语义区分——后者是会话切分规则（M2），本键是会话内线索挂起跨度。 |
-| `digest_max_chars` | int / `400` | 卡内嵌入的每个帧摘要截断上限（沿用 segment 同名键语义，3.16.3）。 |
+| `digest_max_chars` | int / `400` | 卡内嵌入的每个帧摘要截断上限（仅用于 stitch 语义卡片，不证明完整序列可装）。 |
 | `context` | str / `""` | 可选域上下文（何为「同一任务」的领域提示），注入模板可选行；**不是判据定义**——保守偏置内置于固定模板，零配置可用。 |
 | `votes` | int / `1` | 判定稳定化采样数：1 = 不启用（单调用）；> 1 须为奇数（偶数 = CONFIG_ERROR，3.1.4），n 次采样对 (verdict, thread_ref) 严格多数决（3.16.4 votes 行）。成本 ×n。 |
 | `on_error` | `"keep"`\|`"fail"` / `"keep"` | 单判定修复耗尽处置（3.16.6）；fail 仅施于 episode 候选信封。 |
@@ -186,7 +210,7 @@ user（单条消息多 text Part：线索卡在前——按最近活跃降序、
 | 事件名 | 通道 / stderr 级别 | 触发点 | payload 字段 |
 |---|---|---|---|
 | `stitch.judge` | stitch / —（trace-only，无 stderr 镜像） | 每候选判定定案后（votes 聚合之后；一遍与二遍均发）；`record_ids` = [候选碎片首成员 id]。 | `session_id`、`candidate`（"episode"\|"rescue"）、`repass`（bool，false = 一遍 / true = 二遍）、`verdict`（votes 分裂回落时记保守结局 "new"）、`thread_ref`、`confidence`（仅观测，3.16.3）、`priors`（机械先验命中腿列表，⊆ {app_overlap, entity_overlap, same_page}）、`merged`（bool，是否实际并入——LLM 判 resume 而先验未过时 verdict 与 merged 可分离）；条件字段：`votes_split`（= true，仅 votes 严格多数不成立回落时携带）、`task_name`††、`reason`††（votes 分裂时二者不携带）、`target_thread_id`（仅 merged 时携带 = 目标线索 id）。 |
-| `stitch.thread` | stitch / —（trace-only） | 会话缝合定案后每线索一条；`record_ids` = [幸存信封 record.id]。 | `session_id`、`thread_id`、`task_name`††、`fragments`[]{`order_span`, `member_count`, `cause`, `source_episode`}（碎片跨度表）、`seam_indexes`。 |
+| `stitch.thread` | stitch / —（trace-only） | 会话缝合定案后每线索一条；`record_ids` = [幸存信封 record.id]。 | `session_id`、`thread_id`、`task_name`††、`fragments`[]{`order_span`, `member_count`, `cause`, `source_episode`, `member_positions`}（碎片跨度表）、`seam_indexes`。 |
 
 †† `task_name` / `reason` 为 LLM 自由文本——入 `_FREE_TEXT_KEYS` 脱敏集（7.4，v1.9 增 `task_name`）：`none` 档剥除、`refs` 档起携带；其余 payload 字段均为结构字段，全档保留。
 

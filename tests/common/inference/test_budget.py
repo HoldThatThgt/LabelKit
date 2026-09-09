@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from labelkit.common.config.model import (
     EmbeddingProfile,
     LLMProfile,
@@ -200,91 +202,17 @@ def test_fit_text_edges_degenerate_floor_is_the_marker():
     assert fit_text(s, 5, keep="edges") == "…(truncated 3 lines)"
 
 
-# ── min_window matrix (V9/V12/V26) ──────────────────────────────────────────
+# ── 完整证据窗口的最小语义单位 ─────────────────────────────────────────────
 
-def _cfg(prof: LLMProfile, *, window=20, digest_max_chars=400,
-         vision_resolved=False, context="") -> SimpleNamespace:
-    # min_window reads only cfg.segment + cfg.llm_profiles (duck-typed —
-    # M1 calls it before ResolvedConfig assembly).
-    return SimpleNamespace(
-        segment=SegmentConfig(enabled=True, llm=prof.name, window=window,
-                              digest_max_chars=digest_max_chars,
-                              context=context, vision_resolved=vision_resolved),
-        llm_profiles={prof.name: prof})
-
-
-def test_min_window_undeclared_budget_keeps_window():
-    assert min_window(_cfg(_llm(), window=20)) == 20
-    assert min_window(_cfg(_llm(), window=7)) == 7
-    # missing profile → same degradation (existence errors are M1's job)
-    cfg = _cfg(_llm(), window=20)
-    cfg.llm_profiles = {}
-    assert min_window(cfg) == 20
-
-
-def test_min_window_large_window_exceeds_cap():
-    # per-frame worst = 400 (all-CJK digest) + 128 (diff) = 528;
-    # static = 484 (V22 full segment scaffolding) + 0 (context) + 8 (envelopes)
-    prof = _llm(context_window=131072)
-    assert min_window(_cfg(prof)) == (113868 - 492) // 528  # 214, ≥ window
-    assert min_window(_cfg(prof)) >= 20
-
-
-def test_min_window_small_window_yields_guard_values():
-    prof = _llm(context_window=3200, max_output_tokens=1024)  # ib = 1856
-    assert min_window(_cfg(prof)) == 2
-    prof = _llm(context_window=3712, max_output_tokens=1024)  # ib = 2316
-    assert min_window(_cfg(prof)) == 3
-
-
-def test_min_window_vision_adds_the_inflated_image_prior():
-    prof = _llm(provider="anthropic", context_window=131072)
-    text_only = min_window(_cfg(prof))
-    vision = min_window(_cfg(prof, vision_resolved=True))
-    # per-frame gains ceil(1568 × 1.2) = 1882 → 528 + 1882 = 2410
-    assert vision == (113868 - 492) // 2410                # 47
-    assert vision < text_only
-
-
-def test_min_window_vision_uses_the_working_point_px():
-    prof = _llm(provider="anthropic", context_window=131072,
-                default_image_px=1092)
-    # prior @1092 = 1521 → ×1.2 → 1826 → per-frame 2354
-    assert min_window(_cfg(prof, vision_resolved=True)) == (113868 - 492) // 2354
-
-
-def test_min_window_context_eats_static_budget():
-    prof = _llm(context_window=3200, max_output_tokens=1024)
-    ctx = "外" * 600                # +600 static tokens (+1 joining newline)
-    assert min_window(_cfg(prof, context=ctx)) == (1856 - 492 - 601) // 528
-
-
-def test_min_window_static_term_covers_runtime_static_est():
-    """V9 guard alignment (finding-1 fix): min_window's static term must be
-    ≥ the operator's runtime _static_prompt_est for EVERY config — otherwise
-    the packer sees a smaller per-window budget than the guard promised and
-    the 2-frame guarantee silently breaks. Sweep context shapes × with_reason
-    (trace channel toggles the worst structure variant)."""
-    from types import SimpleNamespace as NS
-
-    from labelkit.operators.segment import _static_prompt_est
-
-    prof = _llm(context_window=131072)
-    contexts = ("", "短", "外" * 600, "mixed 上下文 hint\n第二行", "a" * 599,
-                "x")
-    for context in contexts:
-        for with_reason in (False, True):
-            seg = SegmentConfig(enabled=True, llm=prof.name, window=20,
-                                digest_max_chars=400, context=context)
-            trace = NS(enabled=with_reason,
-                       channels=("segment",) if with_reason else ())
-            cfg = NS(segment=seg, llm_profiles={prof.name: prof}, trace=trace,
-                     dedup=NS(bounds_quantize_px=8))
-            guard_static = (TEMPLATE_HEAD_TOKENS["segment"]
-                            + (est_text(context) + 1 if context else 0)
-                            + 2 * MSG_OVERHEAD_TOKENS)
-            assert guard_static >= _static_prompt_est(cfg), (
-                context, with_reason)
+@pytest.mark.parametrize("window", [2, 7, 20, 100])
+@pytest.mark.parametrize("context_window", [0, 3200, 131072])
+@pytest.mark.parametrize("vision", [False, True])
+def test_min_window_is_required_adjacent_pair_not_a_summary_capacity_guarantee(window, context_window, vision):
+    profile = _llm(context_window=context_window)
+    cfg = SimpleNamespace(segment=SegmentConfig(enabled=True, llm=profile.name, window=window,
+                                                context="完整上下文" * 400, vision_resolved=vision),
+                          llm_profiles={profile.name: profile})
+    assert min_window(cfg) == 2
 
 
 # ── TEMPLATE_HEAD_TOKENS cross-layer equality (V22) ─────────────────────────

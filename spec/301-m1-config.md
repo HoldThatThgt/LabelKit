@@ -239,3 +239,5 @@ $ echo $?
 ```
 
 三条错误分属 3.1.4 校验表的「Profile 引用」「用户 Schema」「Rubric」三类，按该表行序输出。`labelkit validate --config config.toml --project project.toml` 会产生完全相同的错误清单与退出码 2（2.4），适合在提交长任务前做零成本的纯本地检查。
+
+普通 process 流配置还必须满足完整证据容量契约：所有实际调用的 LLM 与 semantic embedding profile 声明正 context_window；所有读取 UI 成员的阶段要求视觉。quality 按类覆盖 mode 后的实际剖面同时进入静态校验和运行凭据集合。segment.digest_max_chars、annotate.sequence_frames 已删除并显式报错；session_max_len 与 batch_size 无硬切联动。静态配置无法证明任意完整文本的两帧装填保证，实际请求负责完整预检和确定错误后的有限重算。

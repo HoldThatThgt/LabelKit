@@ -2,14 +2,14 @@
 
 ### 3.4.1 职责与边界
 
-**做：**按 rubric 对批内存活记录打质量分：pairwise 模式执行「k 轮随机配对 → LLM 裁决 → Bradley-Terry 拟合 → 批内百分位归一化」；pointwise 模式执行 0–5 加性打分归一化。计算加权聚合分，按阈值标记 `dropped_lowq`。 
+**做：**按 rubric 对比较池内存活记录打质量分：pairwise 模式执行「k 轮随机配对 → LLM 裁决 → Bradley-Terry 拟合 → 池内百分位归一化」；pointwise 模式执行 0–5 加性打分归一化。计算加权聚合分，按阈值标记 `dropped_lowq`。
 **不做：**不定义 rubric 内容；不决定被过滤记录的物理去向；不做标注语义正确性评审（那是 M7）。
 
 ### 3.4.2 输入 / 输出
 
 | 方向 | 内容 |
 |---|---|
-| 输入 | 批内 `status="active"` 的 PipelineItem；Rubric；LLM profile。 |
+| 输入 | 当前比较域内 `status="active"` 的 PipelineItem；Rubric；LLM profile。ordinary 比较域是批，process stream 比较域是完整会话。 |
 | 输出 | 每条记录 `item.scores: dict[str, QualityScore]`（每 criterion 一项 + `"__aggregate__"`）；低于阈值者 `status="dropped_lowq"`。 |
 
 ### 3.4.3 算法：pairwise + Bradley-Terry（主模式）
@@ -20,30 +20,38 @@
 
 | 设计点 | 定义 |
 |---|---|
-| 比较池 | = 当前批（`run.batch_size`）。QuRating 原文在语料分片内采样成对比较 [1]；批即本工具的采样域。批间分数不可直接比较（百分位为批内相对量），报告中按批记录分布。需要跨批可比时使用 pointwise 模式（绝对刻度）。 |
+| 比较池 | ordinary 单记录维持当前批；process stream 使用完整会话结束后的存活序列，classify 开启时再按 label 分池。run.batch_size 只分组派发冻结叶任务，不改变成员、配对、BT、top_ratio 或百分位。分数是对应池内相对量；需要不同会话/批次可比时使用 pointwise 绝对刻度。 |
 | 配对方案 | k 轮独立随机完美匹配（洗牌后相邻配对）。每记录恰好参与 k 次比较；k 轮随机匹配的并图为随机 k-正则图，k≥3 即高概率连通，默认 k=4 兼顾成本与 BT 可辨识性；孤立分量由正则化伪计数兜底。 |
 | 裁决提示词 | 系统提示 = rubric 全部 criteria 的 pairwise_prompt 拼接；用户消息 = 记录 A、B 内容（UI 模态为两组「截图+序列化树」，需 profile 支持多图）；要求输出 JSON：`{"judgments": [{"criterion": key, "winner": "A"\|"B"\|"tie", "reason": str}]}`（`reason` 仅当 `quality.judgment_reasons` 生效时要求——一句话裁决理由，写入 trace 日志供 rubric 优化使用，见 7.5），经 M8 内部 Schema 校验。单次调用裁决全部 criteria（QuRating 为每 criterion 独立询问 [1]；合并询问是成本优化，`quality.criteria_per_call = "all"`（默认）\| `"single"` 可切回原文行为）。 |
 | 位置偏差 | 每次比较 A/B 呈现顺序由 PRNG 随机；k 轮聚合平均化残余偏差（Zheng et al. 位置偏差缓解 [20]）。 |
 | BT 拟合 | 每 criterion 独立：极大似然 MM 迭代 θᵢ ← Wᵢ / Σ_j nᵢⱼ/(θᵢ+θⱼ)（Hunter 2004 [10]），每轮后归一化 Πθ=1；收敛条件 max\|Δlogθ\| < 1e-6 或 200 轮。正则化：每记录附加 λ=0.1 次对虚拟对手（θ=1）的半胜半负，保证全胜/全负与孤立分量下 θ 有限且唯一。 |
-| 归一化与聚合 | 每 criterion 独立：将批内全部 log θ 升序排名（并列取平均秩 rank），`score = (rank − 1)/(N − 1)`；N=1 时 score=0.5。得分域 [0,1]，批内最低 0、最高 1。聚合分 `__aggregate__` = Σ wᵢ·scoreᵢ / Σ wᵢ（wᵢ 为 rubric 权重；score 为 null 的 criterion 不计入分子分母）。 |
-| 选择机制 | `quality.selection = "threshold"`（默认，现行为：聚合分 < `quality.threshold` ⇒ `status="dropped_lowq"`；threshold 缺省则只打分不筛）\| `"top_ratio"`（批内按聚合分降序保留 ceil(`top_ratio` × 批内存活数) 条，其余 `dropped_lowq`；`quality.top_ratio` ∈ (0,1] 必填，与 threshold 互斥，M1 校验）。排序与并列规则：按聚合分降序，聚合分相同时按记录 id 字典序升序作确定性平局裁决（同输入同 seed 可复现）；名额基数「批内存活数」= 批内 score 非 null 的存活记录数（score=null 的 on_unscored 保留记录不计入基数、也不占名额）。top_ratio 在 pairwise 与 pointwise 下均定义良好——两种模式的质量门输入同为批内聚合分排序，是流式场景做定量筛选的推荐姿势；需要「恰好全局 N 条」时须两阶段方案，见 8.3 O6。按 `on_unscored="keep"` 保留的未打分记录（score=null）不占名额、直接保留。 |
+| 归一化与聚合 | 每 criterion 独立：将池内全部 log θ 升序排名（并列取平均秩 rank），`score = (rank − 1)/(N − 1)`；N=1 时 score=0.5。得分域 [0,1]，池内最低 0、最高 1。聚合分 `__aggregate__` = Σ wᵢ·scoreᵢ / Σ wᵢ（wᵢ 为 rubric 权重；score 为 null 的 criterion 不计入分子分母）。 |
+| 选择机制 | `quality.selection = "threshold"`（默认，现行为：聚合分 < `quality.threshold` ⇒ `status="dropped_lowq"`；threshold 缺省则只打分不筛）\| `"top_ratio"`（池内按聚合分降序保留 ceil(`top_ratio` × 池内存活数) 条，其余 `dropped_lowq`；`quality.top_ratio` ∈ (0,1] 必填，与 threshold 互斥，M1 校验）。排序与并列规则：按聚合分降序，聚合分相同时按记录 id 字典序升序作确定性平局裁决（同输入同 seed 可复现）；名额基数「池内存活数」= 池内 score 非 null 的存活记录数（score=null 的 on_unscored 保留记录不计入基数、也不占名额）。top_ratio 在 pairwise 与 pointwise 下均定义良好——两种模式的质量门输入同为池内聚合分排序，是有限会话场景做定量筛选的推荐姿势；需要「恰好全局 N 条」时须两阶段方案，见 8.3 O6。按 `on_unscored="keep"` 保留的未打分记录（score=null）不占名额、直接保留。 |
 | 裁决失败 | 单次比较经 M8 修复仍非法 ⇒ 该比较按 tie 计（对 BT 中性），计入 `report.quality.judgment_failures`；某记录全部比较失败 ⇒ 该记录 score 置 null 并按 `quality.on_unscored = "keep"`（默认）\| `"drop"` 处理。 |
 | 多评审团（可选） | `quality.judges` 配置奇数个 LLM profile（默认 `[]` = 单评审，用 `quality.llm`）。每次比较由各 judge 以同一呈现顺序独立裁决；per-criterion 取多数票——A/B/tie 三类计票，某类得票过半 ⇒ 取该类，无类别过半 ⇒ tie；BT 拟合取多数结果。trace 中每 judge 各写一条 `quality.judgment` 事件（payload 增加 `judge` 字段 = profile 名；7.2 契约只增不改）。成本 = 单评审 × \|judges\|。背书：PoLL [32]——异构小模型评审团在三种评审设置、六个数据集上优于单一大评审，且显著降低模型内偏差。 |
 | 双顺序裁决（可选） | `quality.both_orders = true`（默认 false）时，同一对记录以正反两种呈现顺序各裁决一次（多评审团下每 judge 各判两次）；per-criterion 两次结果一致（换序后仍指向同一记录）⇒ 记该 winner，不一致 ⇒ tie。合成次序固定：先 per-judge 做双顺序一致性合成，再跨 judge 取多数票。相对「位置偏差」行的随机化缓解，本机制将位置偏差系统性消除（Zheng et al. 的位置一致性判定 [20]）。trace：正反两序各为一次独立裁决，每 judge 各写两条 `quality.judgment` 事件（以 `order` 字段区分两序）。成本 ×2。 |
-| 按类分池（v1.7） | classify 启用时，批内 active 项按 `classification.label` 分池，池 = 类内存活记录；classify 关闭 ⇒ 单一匿名池 = 现行为（零变化回归锚）。**两阶段执行**：先同步按类名字典序逐池预抽配对计划（消费 `ctx.rng`，消费序确定），再把全部 pool/comparison/judge/order 叶调用按声明序冻结为一个 `TaskGroupRequest`；TaskExecutor 按 profile 资源通道有界执行，返回顺序仍是计划顺序。每池取 `class_views[label]` 的类有效 (QualityConfig, Rubric)：mode / rounds / rubric / threshold / selection / top_ratio 池内生效；judges / both_orders / criteria_per_call / llm / on_unscored 恒为全局（5.2 按类覆盖白名单表）。池级失败 outcome 隔离——某池普通业务失败不波及其余池。N=1 池沿用单条规则（不发裁决调用、score 固定 0.5，本表「归一化与聚合」行）；top_ratio 名额基数 = **池内** scored 存活数。pairwise 分数语义相应收窄为「批内类内相对」，`_meta.scores` 增 `pool` 字段（= 类名，仅 classify 启用时出现）自述比较池（6.3）。计数器与统计升维：classify 启用时 tie 计数器键为 `quality.tie_outcomes.<pool>.<crit>`（`tie_comparisons` 同），report 顶层 `quality.mode/rounds` 保留（= 全局继承基值）、增 `quality.by_class` 每池视图（每池携带有效 mode/rounds，6.4），`per_criterion_tie_rate` 输出条件改为「存在 pairwise 池」；`quality.bt_fit` / `quality.gate` / `quality.judgment` 事件 payload 增 `pool` 字段（7.2 只增）；关闭时计数器键式与报表形状不变。 |
-| 序列打分（v1.8） | stream 模式下序列信封（`record.kind = "sequence"`，3.14）的**记录内容段**改走序列变体，两小节按序（逐字冻结于 CONTRACTS §10.2/§10.3——pairwise 下嵌入 `[记录 X]` 内容槽、pointwise 下替换 `{record content}`，标签不变）：`[步骤序列]`（`item.transitions` 按 3.5.2 步骤行格式逐行文本渲染，transitions 为 None 时整段省略；**fallback 步分列**——`Transition.detail.kind == "extraction_invalid"` 的兜底步行尾加「（摘取兜底）」后缀，与 LLM 确证的 other 可区分，防兜底噪声污染连贯性锚点，S16；**接缝步分列（v1.9）**——`Transition.detail.kind == "thread_seam"` 的占位步行尾加专用后缀「（线索接缝：被 {interrupted_by} 打断）」，与 extraction_invalid 后缀并列——防 trajectory rubric 的 noise_residue / coherence 判据把接缝当噪声残留或无法解释的跳变扣分，3.15.4/3.16.4）+ `[成员帧摘要]`（逐成员 `frame_digest`（4.3）按成员序每帧一行，总量有界）。**无图**——UI 模态亦纯文本打分（vision 逐阶段表的放宽项：`quality.llm` 不因 stream 要求 supports_vision，S30，3.1.4/5.2；v1.9 起 `stitch.llm` 同为纯文本恒不要求，3.16.3）。transitions 与预渲染文本经 `_judge_once` / `_pointwise_once` 的新增私有形参下穿（私有签名，非冻结面）；trace `excerpt` 档对序列的摘录 = 成员摘要渲染的前 200 字符（`_excerpt_payload` 序列分支，7.4）。**rubric**：stream 下 `quality.rubric` 空串解析为 `default:trajectory`（S29，3.1.4）——内置轨迹四准则（completion / coherence / purposefulness / noise_residue），全文与背书拆分注记见附录 A.3（completion/coherence 源自 OS-Genesis TRM [41]，1–5 五级改制为 0–5 六级；purposefulness 自 Coherence "toward the goal" 拆分；noise_residue 源自 RPA 日志分割噪声处理 [50]）；rubric 由既有机制消费、零改动。`extract.enabled = false` 时步骤段缺席、**退化为帧摘要打分**——rubric 措辞模态中立、「步骤」读作「帧间变化」（M1 对该组合发 warning 指引，3.1.4）。**门控**：stream 下 `quality.threshold` 缺省 = 只打分不筛（现语义，对 stream 尤其合理——TRM 消融与 E2E 台账 #6 佐证，1.6）。**信度注记**：长 episode（> 20 步）下整体式 LLM 判分信度随长度衰减（GUIDE 长度退化数据 [57]）——建议 pairwise（批内相对比较）或对绝对分降信任、按 episode 长度分层审计。**打分单元（v1.9）**：stitch 启用时打分单元升维 episode → **线索**（thread，缝合后的幸存序列信封——被并壳被 active 过滤天然排除，3.16）；序列变体机制原样，仅步骤序列与成员摘要作用于重绑后的成员集，缝合并入使打分调用数随行数下降（3.16.4 调用与校验行）。 |
-| 上下文预算装填（v1.11） | 裁决 profile 声明 `context_window` 时按上下文预算装填单次裁决调用（未声明 = 预算关闭，行为与 v1.10 一致；预算/估算/校准机制见 3.9）。**pairwise**：记录侧预算 = `input_budget − est(系统提示 + 准则文本)`，按**每评审各自构建**（逐 (对, 评审) 装填、取本评审 profile 的预算——与 verify 的「评审团最小预算」形态不同，V25②），两记录各半；每侧 UI 树渲染动态封顶 `min(input.ui_tree_max_chars, 预算折算字符)`（渲染后按 est 复核，超则按行丢尾、保留既有 `…(truncated N nodes)` 标记；`ui_tree_max_chars` 保留为绝对上限）；附图（UI 对 2 张）按校准单价计 est ×2 后再分。**序列变体**：`[步骤序列]` 步骤行块获得预算份额，超出按「首末步恒保留、丢中段整行 + 原位标记」裁剪（与成员摘要块既有截断语义同族，V9）。**pointwise** 单记录同族（树渲染动态封顶 + 步骤行同款裁剪）。**溢出反应（V20）**：识别到 provider 上下文溢出 → 收紧文本份额**重试一次**（有界降级）。**最小单元终局分粒度**（V10 的 M4 适配）：pointwise 单记录装不下 → 该记录记 `StageError(kind="context_overflow")`、`status="failed"` 入 rejects（7.6）；**pairwise 2 记录装不下 → 按本表「裁决失败」行的裁决级粒度折算 tie**（对局记 `context_overflow` 错误与事件、双方记录保持 active 可入其他对局）——记录级隔离（2.6）要求超大一侧不得殃及配对另一侧；全部对局皆溢出的记录落入既有 `on_unscored` 处置族。逐裁剪点计入 `report.budget.truncations`（6.4）。 |
+| 按类分池（v1.7） | classify 启用时，比较域内 active 项按 `classification.label` 分池，池 = 类内存活记录；classify 关闭 ⇒ 单一匿名池 = 现行为（零变化回归锚）。**两阶段执行**：先同步按类名字典序逐池预抽配对计划（消费 `ctx.rng`，消费序确定），再把全部 pool/comparison/judge/order 叶调用按声明序冻结为一个 `TaskGroupRequest`；TaskExecutor 按 profile 资源通道有界执行，返回顺序仍是计划顺序。每池取 `class_views[label]` 的类有效 (QualityConfig, Rubric)：mode / rounds / rubric / threshold / selection / top_ratio 池内生效；judges / both_orders / criteria_per_call / llm / on_unscored 恒为全局（5.2 按类覆盖白名单表）。池级失败 outcome 隔离——某池普通业务失败不波及其余池。N=1 池沿用单条规则（不发裁决调用、score 固定 0.5，本表「归一化与聚合」行）；top_ratio 名额基数 = **池内** scored 存活数。pairwise 分数语义相应收窄为「比较域内类内相对」，`_meta.scores` 增 `pool` 字段（= 类名，仅 classify 启用时出现）自述比较池（6.3）。计数器与统计升维：classify 启用时 tie 计数器键为 `quality.tie_outcomes.<pool>.<crit>`（`tie_comparisons` 同），report 顶层 `quality.mode/rounds` 保留（= 全局继承基值）、增 `quality.by_class` 每池视图（每池携带有效 mode/rounds，6.4），`per_criterion_tie_rate` 输出条件改为「存在 pairwise 池」；`quality.bt_fit` / `quality.gate` / `quality.judgment` 事件 payload 增 `pool` 字段（7.2 只增）；关闭时计数器键式与报表形状不变。 |
+| 处理序列打分 | 内容段包含全部 `[步骤序列]` 和全部成员的完整正文/可见树/所有图片，使用同一 record_evidence/sequence_parts。步骤保持实际顺序和 extraction_invalid、thread_seam 后缀；transitions=None 时只省略整个步骤段。UI 的全部实际 judging profile 均须支持 vision；不再存在 stream 纯文本质量特例。extract 关闭仍按完整帧证据评分。缝合后使用幸存序列的完整成员，壳不进池。默认 trajectory rubric、缺省阈值只打分、语义信度局限保留；full evidence 不保证模型对任意长序列都正确打分。 |
+| 上下文预算 | ordinary 单记录保留 UI 树预算帽、既有一次文本收紧及局部失败规则；合法 generate-only 文本序列保留既有生成链预算。process stream 的 pointwise 和 pairwise 真实请求均包含完整两侧证据、全部步骤、准则与模型 Schema，不裁内容/图片、不降级重试。preview_capacity 检查全部可达类、评委和 criteria_per_call 组合，不消费 RNG。实际原始 ContextOverflowError 在 tie、投票、score 或 failed 写入前交给会话控制器；pointwise 携一个精确目标，pairwise 同时携实际双方目标，按成员边界推进。纯静态指令/Schema 超限归 fixed；已不可分的两侧登记终态并在发请求前投影，不能折算中性 tie 来伪造成功。 |
 
-**v1.19 执行形态。**同步 planner 是唯一 RNG 消费点，先冻结 pool、配对、pointwise criterion、judge、
+**执行形态。**ordinary 按批、process stream 按完整会话冻结计划；ctx.run_group 根据 batch_size 分组派发，不能重新抽签。同步 planner 是唯一 RNG 消费点，先冻结 pool、配对、pointwise criterion、judge、
 正反顺序与 task ordinal；叶任务只返回冻结 `QualityCallOutcome`，不得写 PipelineItem、quality pool、score、
-gate、errors、events 或 dataset counters。reducer 按计划 ordinal 合成双顺序与评审团结果，再按 pool 执行
+gate、errors、events 或 dataset counters。完整波次结束后，reducer 先按 pool/call 声明序收齐同步计划错误和所有
+叶容量错误，以非空 `SessionCapacityError.failures` 一次交给会话控制器，再按计划 ordinal 合成双顺序与评审团结果，并按 pool 执行
 BT/pointwise 聚合、质量门和所有共享写入；叶任务完成顺序及 profile capacity 不得改变结果。不同 judge profile
 使用各自 `ResourceKey`，空池、N=1 与无需 LLM 的路径提交零任务。
 
-sequence 只允许 pointwise：每个 variant × criterion 可以在当前 slot coordinator 内并发，结果按
-variant/criterion ordinal 归并进 AttemptTransaction。普通调用的 ProviderFatal 按既有比较/记录失败 outcome
-收敛，不取消 sibling；sequence ProviderFatal 原样逃逸并取消 execution domain。两侧的 CircuitBreaker 与
+generate-only sequence 只允许 pointwise：每个 variant × criterion 可以在当前 slot coordinator 内并发，结果按
+variant/criterion ordinal 归并进 AttemptTransaction。ordinary 单记录的 ProviderFatal 按既有比较/记录失败 outcome
+收敛；process 会话与 generation sequence 的 ProviderFatal 原样逃逸并取消 execution domain。CircuitBreaker 与
 CancelledError 都保持结构化取消。
+
+`QualityStage.preview_capacity(item, ctx) -> SessionCapacityFailure | None` 与实际请求构造同源；
+未知配对对象以候选完整序列的两侧请求预估，真实配对终检仍是最后约束。阶段归属从 session_attempt.stage 读取。
+池和 RNG、scores、dataset counters 均只属于当前尝试；完整会话重算时清理并从冻结上游重新产生。
+固定开销以同一 builder 的空成员、空步骤构造（pairwise 两侧都置空），保留当前 user 包络和全部恒有段落标签。
+固定包络本身超限归 fixed，不能通过不断切分序列尝试补救。处理流设置 `CallScope.complete_evidence=true`，
+M8 结构修复保留完整原证据，修复请求的原始容量错误同样上抛。
 
 ### 3.4.4 算法：pointwise 加性打分（低成本模式）
 

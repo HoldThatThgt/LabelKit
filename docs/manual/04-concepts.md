@@ -62,15 +62,15 @@ events、stream rows，以及由可见 primary branch 与交织布局派生的 s
 
 ## 4.3 批（Batch）：流动与屏障
 
-记录不是一条条流过流水线，而是**成批**流动（`run.batch_size`，默认 256）。v1.19 的 execution runtime 不改变
-业务屏障，只统一每个屏障内的任务接纳与结果归并：
+普通记录按 `run.batch_size` 成批处理；普通流以一个完整输入会话为业务边界，`batch_size` 只限制每次提交的叶任务数。会话内分段和缝合状态跨计算组保留，全部组完成后才统一归并：
+
 
 - **同一算子内，纯叶任务有界并发**——任务可乱序完成，但共享 item/index 只按输入序归并；
 - **算子之间，批内串行（屏障）**——一批必须整体走完去重，才整体进入打分。
 - **profile 之间独立接纳**——低容量 profile 排队不会占住另一个 profile 的接纳名额。
 
-stitch 是一个有状态算子的具体例子：同一会话的候选必须逐个推进，但不同会话的当前候选会组成一轮 wave；结果仍按
-会话声明序归并。sequence 的 declared slot 则先串行完成并验收 baseline，再并发彼此独立的 counterfactual suffix，
+stitch 在同一完整会话内逐候选推进；计算组结束不清空线索池，会话收尾才执行最终复评。sequence generation 的声明组提交边界仍按其独立契约执行。
+sequence generation 的 declared slot 先串行完成并验收 baseline，再并发彼此独立的 counterfactual suffix，
 最后按 variant 声明序归并。两者都不会把依赖上一状态的同键步骤错误地并发化。
 
 普通 semantic dedup 是一个明确的投机点：静态 participating 的记录先并发取得 embedding，再按输入序从 exact 层
@@ -79,11 +79,11 @@ stitch 是一个有状态算子的具体例子：同一会话的候选必须逐�
 
 为什么要屏障？因为 pairwise 质量打分需要「同一批的记录互相比较」（第 10 章），批不齐没法比。这带来一个你必须记住的推论：
 
-> **批 = pairwise 打分的比较池。** `batch_size` 不只是内存/吞吐参数，它直接决定质量分的统计口径。pairwise 分数是「批内相对排名」，批间不可直接比较。
+> 普通记录的 pairwise 比较池是批；普通流的比较池是完整会话内的存活序列，启用分类后再按类分池。流模式调大 `batch_size` 不扩大比较池，也不改变序列封闭条件。
 
-批走完最后一个算子就**立即落盘并释放内存**。普通路径任意时刻仍只有一个批的中间态（外加全局去重索引与
-flat 回流子批）。sequence 不采用普通批：它有一个从当前声明序 head 开始的连续候选缓冲，完整 attempt 可跨槽并发，
-但 dedup 重验证、CrossView frontier、retained 累加和内存 commit 只在短的无 await 临界区按声明序执行。
+普通记录完成批后落盘；普通流在完整会话最终尝试提交后落盘并释放当前会话状态。
+sequence generation 按声明组提交：dedup 重验证、CrossView frontier、retained 累加和内存 commit
+只在短的无 await 临界区按声明序执行。
 
 ## 4.4 运行（Run）：一次进程的生命周期
 
@@ -110,7 +110,7 @@ flat 回流子批）。sequence 不采用普通批：它有一个从当前声明
 | `extract` 开 ⇒ `segment` 必须开且模态必须是 `ui`（v1.8） | 动作摘取的对象是屏幕帧序列——没有分段就没有 episode，文本序列 v1 不适用 |
 | `stitch` 开 ⇒ `segment` 必须开（v1.9） | 缝合的对象是分段产出的 episode 碎片——没有分段就没有可缝的东西（仅流模式可用） |
 | `stitch.votes` 若大于 1 必须为奇数（v1.9） | 偶数票可能平票，严格多数决失去意义 |
-| `segment` 开 ⇒ `quality.llm` **免除** `supports_vision` 要求（v1.8 放宽项；v1.9 的 `stitch.llm` 同样恒不要求视觉） | 序列打分是纯文本（步骤序列 + 帧摘要，无图），UI 模态也不需要视觉能力；缝合判定同理（摘要卡证据，无图） |
+| UI 普通流的成员证据阶段 ⇒ 对应 profile 支持视觉且声明正上下文窗口 | 分段、分类、摘取、打分、标注和评审使用完整 UI 树与所有相关图片；stitch 的语义摘要卡判决仍不要求视觉，合并前另做完整下游容量预检 |
 | `frame.classify` 开，或 process/flat 的 `frame.annotate` 开 ⇒ `segment` 必须开 | 普通帧粒度消费 segment 产生的 episode 成员；frame classify 没有 sequence 例外 |
 | sequence form 的 `frame.annotate` 可脱离 `segment` 与序列 `annotate` | 生成计划已经给出成员与 inherited frame class；只开帧标注时仍须开启 pointwise quality，以满足 quality/annotate 至少一项开启的总约束 |
 | 帧粒度任一开 ⇒ `output.meta_mode` 不得为 `"none"`（v1.12） | 帧产物仅经 `_meta.stream.members[]` 承载——丢弃元信息 = 丢弃全部帧产物 |

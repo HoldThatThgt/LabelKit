@@ -51,7 +51,7 @@ sequence 教学工程的 default/judge 都固定为 DeepSeek anthropic route、`
 | `run.output` | 必填 | 主输出 JSONL |
 | `run.modality` | text / ui | 输入模态 |
 | `run.mode` | process | process / generate-only |
-| `run.batch_size` | 256 | 批大小与 pairwise 比较池 |
+| `run.batch_size` | 256 | 普通记录为批/比较池大小；普通流为计算组叶任务上限 |
 | `run.seed` | 0 | 所有本地确定性随机源 |
 | `run.fatal_error_threshold` | 20 | 连续 provider fatal 熔断阈值 |
 | `run.max_park_s` | 60 | 密钥池全部冷却时的驻留上限 |

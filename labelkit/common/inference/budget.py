@@ -1,7 +1,7 @@
 """v1.11 上下文预算原语（spec 3.9.5，CONTRACTS.md §7.17）。
 
 本模块提供：余量/预算算术、零依赖的文本与图像 token 估算器、确定性文本裁剪、
-静态最小窗口保证（w_min）、V27① 阶段错误归类助手，以及 ``ImageCostCalibrator``
+相邻关系最小窗口、阶段错误归类助手，以及 ``ImageCostCalibrator``
 （V19 在线单图成本校准）。全部是纯函数 + 一个纯内存类；零第三方依赖；零持久化。
 
 分层约束：llm_client 在运行期导入本模块，因此本模块运行期绝不可反向导入
@@ -43,30 +43,29 @@ CALIBRATION_WINDOW_BATCHES = 8  # 批最大值窗口深度（F8：窗口单位=�
 PRIOR_INFLATION = 1.2         # 首批先验保守放大（V17）
 
 # V22（跨层依赖豁免）：common 不得导入算子，因此各阶段冻结提示词模板头以
-# 「冻结整型常量」的形式落在这里，供 M1 静态预检（V13③）与 V9 保证使用。
+# 「冻结整型常量」的形式落在这里，供 M1 静态预检使用。
 # 每个取值 = est_text(该阶段算子模板中最大的那条冻结 system/模板头常量)
 # （CONTRACTS §10 冻结文本）；tests/common/inference/test_budget.py 以跨层等式
 # 断言 est_text(算子常量) == 本字典取值——修订 §10 模板会让该测试变红，常量
 # 随 CONTRACTS 修订同步。
 # 例外——"segment" 覆盖的是提示词的「完整最坏情况静态脚手架」而非仅模板头：
 # est_text("\n".join(_SYSTEM_HEAD, _STRUCTURE_SENTENCE, _STRUCTURE_REASON))
-# ——with_reason 结构变体即最坏情况。min_window 的静态项锚定 V9 运行期装填
-# 保证，故它对任意配置都必须 ≥ segment._static_prompt_est；只取模板头会漏算
-# 结构句，让装箱器看到的单窗预算小于保证承诺的量。
+# ——with_reason 结构变体即最坏情况。完整动态成员无法从静态常量推导装填保证；
+# 每次实际请求仍按同源提示词和 Schema 终检。
 TEMPLATE_HEAD_TOKENS: dict[str, int] = {
     "segment": 484,   # §10.9 完整静态脚手架（模板头 + 结构句，
                       # with_reason 变体——见上方例外说明）
     "classify": 48,   # classify._SYSTEM_HEAD_MULTI（§10.8）
     "quality": 39,    # §10.2 成对判决/结构句（内联字面量）
     "annotate": 32,   # annotate._SCHEMA_SENTENCE（§10.1）
-    "verify": 192,    # verify._SEQ_SYSTEM_DEFECT_TYPES（§10.5 stream 变体）
+    "verify": 197,    # verify._SEQ_SYSTEM_DEFECT_TYPES（完整成员出现位置变体）
     "generate": 29,   # §10.4 结构句（内联字面量）
     "stitch": 325,    # stitch._SYSTEM_HEAD（§10.11）
     "extract": 286,   # extract._SYSTEM_HEAD（§10.10）
     # v1.12 帧级两键：值 = est_text(算子帧模板头常数)，由跨层等式测试钉住
     # （test_budget 与 classify/annotate 的冻结常量逐字对齐）；同时供 M1
     # 静态预算预检（V13③ 两新段）使用。
-    "frame_classify": 81,   # classify._FRAME_SYSTEM_HEAD (§10.12)
+    "frame_classify": 83,   # classify._FRAME_SYSTEM_HEAD (§10.12)
     "frame_annotate": 35,   # annotate._FRAME_SYSTEM_STATIC (§10.13)
 }
 
@@ -297,12 +296,9 @@ def pack_windows(costs: list[int], budget: int, cap: int) -> list[tuple[int, int
 
     窗口取半开区间 [start, end)：首窗自 0 起，其后每窗自前窗 end − 1 起——1 帧重叠
     与「接缝归后窗所有」的约定保持不变（M14 的 rel[] 覆写序依赖之）；预算与帧数上
-    限同时满足时帧并入当前窗，超出即封窗。每窗至少 2 帧——V10 语义下界：M1 的
-    w_min ≥ floor 保证在「先验」图像定价下任意两个最坏帧都装得下（spec 3.1.4），
-    但装箱器按校准器定价，而校准器在样本数越过 CALIBRATION_MIN_SAMPLES 之后合法地
-    可能超出 先验 × PRIOR_INFLATION（刻意不设夹紧）。因此预算本会让窗口不足 2 帧时，
-    无视成本强制装到 2 帧：若其真实估算确实超预算，交由 M9 发送前终检按记录级处理
-    ——绝不升级为运行级失败，且强制推进保证循环收敛。本函数是 (costs, budget, cap)
+    限同时满足时帧并入当前窗，超出即封窗。每窗至少 2 帧用于保留相邻关系，不表示
+    任意完整帧必定装得下。最小窗实际预检或端点仍超限时，调用方按明确容量终态处理，
+    不能裁剪证据或把该窗口当作成功。强制推进保证遍历收敛。本函数是 (costs, budget, cap)
     的纯函数 ⇒ 重跑结果确定。
 
     零重叠调用形（v1.12，M13 帧级批量判决专用）：帧分类窗口是不重叠切分——重叠
@@ -332,46 +328,18 @@ def pack_windows(costs: list[int], budget: int, cap: int) -> list[tuple[int, int
     return spans
 
 
-# ── 静态最小窗口保证（V9/V12） ──────────────────────────────────────────────
+# ── 相邻关系的最小窗口 ──────────────────────────────────────────────────────
 
 def min_window(cfg: "ResolvedConfig") -> int:
-    """计算最坏情况下仍能保证装填的窗口大小 w_min，供 M1 的 V9 保证与 V12 估算上界共用。
+    """返回完整证据分段的最小相邻关系窗口，不声称未知帧必定可装。
 
-    预算未声明（segment profile 缺失或 context_window == 0）⇒ 原样返回
-    cfg.segment.window。已声明 ⇒ ⌊(input_budget − est_static_system) /
-    per_frame_max⌋（不小于 0），且全部按「先验」定价：
+    全文和完整树没有静态字符上界，旧摘要帽无法再推导保证装填量。
+    调用数估计使用必要的完整相邻对；实际可装窗口由成员证据决定。
 
-    - per_frame_max = est_text(digest_max_chars 长的最坏全中文摘要) +
-      DIFF_MAX_TOKENS +（仅 vision_resolved 时）工作像素下的 图像先验 ×
-      PRIOR_INFLATION；
-    - est_static_system = V22 冻结的 segment 脚手架常量（系统头 + 最坏结构句，见
-      TEMPLATE_HEAD_TOKENS 的例外说明）+ segment.context（额外 +1 计其拼接换行，
-      使分别取整之和 ≥ 运行期拼接后的估算）+ 两条消息信封——三者之和对任意配置都
-      ≥ segment._static_prompt_est，这正是 V9 保证赖以成立的对齐关系。
-
-    保证本身是「先验」口径：校准后的图像成本高于 先验 × PRIOR_INFLATION 是合法的
-    （刻意不夹紧），此时经装箱器的强制 2 帧窗 + M9 终检按记录级降级——绝不升级为
-    运行级失败（spec 3.1.4 的诚实表述）。
-
-    注意：返回值不按 window 封顶——w_min 可能超过该上限（保证方需要预算推导出的原
-    值；估算侧消费者按 V12/V26 自行夹紧）。鸭子类型：只读 cfg.segment 与
-    cfg.llm_profiles（M1 在 ResolvedConfig 组装之前即调用本函数）。
-
-    @param cfg 已解析（或组装中）的配置对象，需提供 segment 与 llm_profiles。
-    @return 最坏情况保证窗口大小 w_min（帧数）。
+    @param cfg 已验证的运行配置，分段窗口至少包含两个成员。
+    @return 最小相邻关系窗口的帧数。
     """
-    seg = cfg.segment
-    prof = cfg.llm_profiles.get(seg.llm)
-    if prof is None or prof.context_window <= 0:
-        return seg.window
-    est_static = (TEMPLATE_HEAD_TOKENS["segment"]
-                  + (est_text(seg.context) + 1 if seg.context else 0)
-                  + 2 * MSG_OVERHEAD_TOKENS)
-    per_frame = est_text("\u597d" * seg.digest_max_chars) + DIFF_MAX_TOKENS
-    if seg.vision_resolved:
-        px = prof.default_image_px or prof.max_image_px
-        per_frame += math.ceil(est_image_prior(prof, px) * PRIOR_INFLATION)
-    return max(0, (input_budget(prof) - est_static) // per_frame)
+    return min(2, cfg.segment.window)
 
 
 # ── V27① 共享的阶段错误归类器 ───────────────────────────────────────────────

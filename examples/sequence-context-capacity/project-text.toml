@@ -1,0 +1,62 @@
+schema_version = 1
+
+[run]
+input = "data/events.jsonl"
+output = "out/text.jsonl"
+modality = "text"
+batch_size = 2
+seed = 42
+
+[stream]
+order_by = "meta:ts"
+gap_s = 900
+session_max_len = 64
+
+[segment]
+enabled = true
+strategy = "hybrid"
+window = 32
+min_len = 2
+on_error = "fail"
+context = "所有消息都是同一笔仓库配货请求的推进；重复确认仍然是任务成员，不是噪声。"
+
+[dedup]
+enabled = false
+
+[classify]
+enabled = true
+assignment = "single"
+fallback_class = "other"
+
+[[classify.classes]]
+name = "dispatch"
+description = "同一笔仓库配货请求的创建、修改、确认和发货"
+
+[[classify.classes]]
+name = "other"
+description = "与仓库配货无关的任务"
+
+[quality]
+enabled = false
+
+[annotate]
+enabled = true
+instruction = "阅读所有成员，按最后生效的修改提取配货单。request_id为请求编号；destination取最终目的仓；color取中间消息指定的最终颜色；quantity取最终数量。只有成员明确提供的事实才可填入。"
+
+[verify]
+enabled = true
+llm = "default"
+policy = "repair"
+max_repair_rounds = 1
+extra_criteria = "重复确认是有效成员；首尾同一请求，中间的改色消息是最终颜色事实。"
+
+[trace]
+enabled = true
+channels = ["segment", "classify", "annotate", "verify", "schema"]
+content = "refs"
+
+[output]
+meta_mode = "inline"
+rejects = "full"
+max_repair_attempts = 1
+schema_path = "schemas/dispatch.json"

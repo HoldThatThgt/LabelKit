@@ -92,6 +92,13 @@ main、stream、dedup index 或 dataset counters；下一次 attempt 从共享�
 
 ## 运行真实主例与回放
 
+普通 process 回放现在以完整输入 session 为提交边界；`batch_size` 只控制叶任务计算组。
+分段摘要字符配置已删除，实际上下文不足会沿完整成员边界拆分，并重算未提交会话下游。
+以下保留的回放数量与质量数字是此前记录的运行证据；当前回放只完成配置校验，新的真实运行待补。
+容量示例见 [会话容量示例](../sequence-context-capacity/README.md)。
+
+[PENDING-EVIDENCE:sequence-replay-context-capacity]
+
 把 `LABELKIT_DEEPSEEK_KEY` 放在仓库根目录 git-ignored 的 `.env`，只加载到当前 shell：
 
 ```bash

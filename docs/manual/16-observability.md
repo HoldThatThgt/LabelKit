@@ -133,16 +133,21 @@ jq -c 'select(.ev=="quality.judgment" and (.record_ids | index("6e60ce3c2d59f04d
 {"ts":"2026-07-03T01:19:03+08:00","level":"info","stage":"run","batch":1,"msg":"batch.end active=8 ..."}
 ```
 
-### 启动期预算 INFO 行（v1.11）
+### 启动期预算与会话容量观测
 
-本次运行引用的 profile 里只要有一个声明了 `context_window`（第 6 章），`run.start` 之后就多一行**预算参数 INFO**：逐 profile 给出「声明窗/输入预算」；stream 工程（segment 启用且所引 profile 声明了窗）再多一行 segment 的静态最坏装填量。真实两行（examples/stream 工程）：
+启动日志列出每个被引用 profile 的声明上下文和输入预算。普通流另列必要帧对与配置窗上限，形态示意：
 
+```text
+segment: minimum_frames=2 window=16 (budget)
 ```
-2026-07-23T04:46:24+08:00 INFO  run     batch=0 budget: default=131072/113868 judge=131072/115916
-2026-07-23T04:46:24+08:00 INFO  run     batch=0 segment: w_min=46 window=16 (budget)
-```
 
-读法：`113868` = 声明窗 131072 扣掉输出预留（该 profile 的 `max_output_tokens`）与 10% 安全边距后**真正拿来装输入**的预算（judge profile 输出预留小，可用输入反而更多）；`w_min=46` 是按最坏单帧成本（满长摘要 + diff 常数 + 每图先验）算出的单窗保底装填量——它 ≥ 窗上限 `window=16` 时装填顶格、行为与定长窗一致，它 < window 时实际窗会变小变多（对账细则见第 25 章成本账）。两行都是数据无关的参数与计数。**报告侧的对应读数是 `report.budget`**（profiles / w_min / truncations / overflow_records / image_cost / degrade_retries / escalations——第 8 章逐键解读），预算相关的记录级失败则以 `context_overflow` / `output_truncated` 两个新错误码落 rejects（第 18 章）。
+minimum_frames 不是“保证能装下的帧数”；任意完整帧仍可能超限。报告的 budget.minimum_frames 同为 2，
+不再输出旧 w_min。report.stream.capacity 包含 sealed、splits、recomputations、minimum_failures 和
+retained_frames_high_water；最后一项是保留帧数，不能当作字节或 RSS。
+
+会话内所有 trace 事件携带 session_id 与 session_attempt；上游尝试为 0，下游从 1 递增。
+sequence.capacity 的 action 为 split、seal、minimum_failure 或 recompute。失败尝试的调用、重试、
+错误和容量控制事件保留，最终 dataset 计数只合并最后一次尝试。budget.overflow_records 只计最终失败视图。
 
 想要完整的调用审计（每次请求的 token、延迟、重试、状态），订阅 trace 的 `llm` 通道即可——`llm.call` 事件字段命名对齐 OpenTelemetry GenAI 语义约定（`gen_ai.usage.input_tokens` 等），现成的 OTel 生态分析工具可以直接吃。
 

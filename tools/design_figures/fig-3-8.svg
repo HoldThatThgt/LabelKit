@@ -1,0 +1,67 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 475"
+     font-family="PingFang SC, Microsoft YaHei, sans-serif" role="img" aria-labelledby="verify-wave-title">
+  <title id="verify-wave-title">普通流评审的严格修复波次与下一轮评审</title>
+  <desc>评审、同步缺陷路由、回收复判、动作重抽与重建、补跑帧分类、补跑帧标注、
+    重新标注序列依次执行；各波次归并完成后才能进入下一波，最后进入下一轮评审。</desc>
+  <defs>
+    <marker id="verify-wave-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#526477"/>
+    </marker>
+  </defs>
+  <g fill="none" stroke="#526477" stroke-width="2" marker-end="url(#verify-wave-arrow)">
+    <path d="M 240 113 H 297"/>
+    <path d="M 500 113 H 557"/>
+    <path d="M 760 113 H 817"/>
+    <path d="M 920 165 V 257"/>
+    <path d="M 820 313 H 763"/>
+    <path d="M 560 313 H 503"/>
+    <path d="M 300 313 H 243"/>
+    <path d="M 40 313 H 15 V 113 H 37"/>
+  </g>
+  <g text-anchor="middle" fill="#26384b">
+    <text x="540" y="29" font-size="17" font-weight="600">需要修复的序列按依赖顺序推进</text>
+    <g fill="#edf3fa" stroke="#526477">
+      <rect x="40" y="60" width="200" height="105" rx="9"/>
+      <rect x="560" y="60" width="200" height="105" rx="9"/>
+      <rect x="820" y="60" width="200" height="105" rx="9"/>
+      <rect x="820" y="260" width="200" height="105" rx="9"/>
+      <rect x="560" y="260" width="200" height="105" rx="9"/>
+      <rect x="300" y="260" width="200" height="105" rx="9"/>
+    </g>
+    <rect x="300" y="60" width="200" height="105" rx="9" fill="#fff7e8" stroke="#a87b2d"/>
+    <rect x="40" y="260" width="200" height="105" rx="9" fill="#edf8f2" stroke="#39825e"/>
+    <g font-size="20" font-weight="600">
+      <text x="140" y="92">评审</text>
+      <text x="400" y="92">缺陷路由</text>
+      <text x="660" y="92">回收复判</text>
+      <text x="920" y="92">动作重抽与重建</text>
+      <text x="920" y="292">补跑帧分类</text>
+      <text x="660" y="292">补跑帧标注</text>
+      <text x="400" y="292">重新标注序列</text>
+      <text x="140" y="292">进入下一轮</text>
+    </g>
+    <g font-size="14" fill="#526477">
+      <text x="140" y="119">review · 序列 × 评委</text>
+      <text x="140" y="144">归并评审结论与缺陷</text>
+      <text x="400" y="119">route · 同步归并</text>
+      <text x="400" y="144">收缩成员 / 冻结回收候选</text>
+      <text x="660" y="119">claim · 叶任务与归并</text>
+      <text x="660" y="144">按声明序认领噪声帧</text>
+      <text x="920" y="119">reseam · 叶任务与归并</text>
+      <text x="920" y="144">重绑成员 / 更新相邻动作</text>
+      <text x="920" y="319">frame-classify</text>
+      <text x="920" y="344">归并最新成员分类</text>
+      <text x="660" y="319">frame-annotate</text>
+      <text x="660" y="344">按最新帧类补写产物</text>
+      <text x="400" y="319">reannotate</text>
+      <text x="400" y="344">归并完整序列标注</text>
+      <text x="140" y="319">重新执行 review</text>
+      <text x="140" y="344">保留已消耗的修复轮数</text>
+      <text x="800" y="215">重建后补齐帧产物</text>
+    </g>
+    <rect x="40" y="395" width="980" height="38" rx="7" fill="#f1f5f9"/>
+    <text x="530" y="420" font-size="16">每一波：完整冻结 → 按 batch_size 分组 → 收齐全部结果 → 按声明序归并</text>
+    <text x="540" y="459" font-size="14" fill="#526477">无需修复的结论直接终审；新容量错误收齐整轮后交会话驱动，不进入下一修复波次。</text>
+  </g>
+</svg>

@@ -25,7 +25,6 @@ from labelkit.operators.segment import (
     _judge_span_degrading,
     _reason_requested,
     _static_prompt_est,
-    _window_spans,
     build_segment_prompt,
     judge_window,
     render_tree_diff,
@@ -62,6 +61,9 @@ from labelkit.common.errors import (
 )
 from labelkit.common.inference import budget as budget_mod
 from labelkit.common.inference.schema_engine import segment_window_schema
+from labelkit.common.contracts.stage import RunContext
+from labelkit.common.contracts.sequence_capacity import process_sequence_id, SessionAttemptScope
+from labelkit.common.inference.sequence_evidence import record_evidence
 from labelkit.common.contracts.types import (
     ImageRef,
     PipelineItem,
@@ -74,20 +76,20 @@ from labelkit.common.contracts.types import (
 )
 
 
-def make_cfg(*, strategy="hybrid", window=20, digest_max_chars=400,
+def make_cfg(*, strategy="hybrid", window=20,
              noise_filter=True, min_len=2, vision_resolved=False, context="",
              on_error="keep", trace=None, llm_profiles=None) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
         console=ConsoleConfig(),
-        llm_profiles=llm_profiles or {},
+        llm_profiles=llm_profiles if llm_profiles is not None else {"default": llm_profile(context_window=1000000)},
         embedding_profiles={},
         run=RunConfig(output="out.jsonl", modality="ui", input="in"),
         input=InputConfig(),
         stream=StreamConfig(),
         dedup=DedupConfig(),
         segment=SegmentConfig(enabled=True, strategy=strategy, llm="default",
-                              window=window, digest_max_chars=digest_max_chars,
+                              window=window,
                               noise_filter=noise_filter, min_len=min_len,
                               context=context, on_error=on_error,
                               vision_resolved=vision_resolved),
@@ -148,7 +150,7 @@ def bare_frame(rid, pair_index) -> Record:
 
 
 def envelope(record, sid="sess-0001") -> PipelineItem:
-    return PipelineItem(record=record, session_id=sid)
+    return PipelineItem(record=record, session_id=sid, session_position=record.ref.pair_index)
 
 
 def window_obj(*relations, reasons=None) -> dict:
@@ -163,7 +165,7 @@ def window_obj(*relations, reasons=None) -> dict:
 
 def digests_of(frames, max_chars=400) -> list[str]:
     """The session-level digest vector callers now precompute (V9)."""
-    return [frame_digest(frame, max_chars) for frame in frames]
+    return [record_evidence(frame) for frame in frames]
 
 
 # ── in-process complete_validated stubs (no LLM, test_classify 惯例) ─────────
@@ -174,10 +176,12 @@ class QueueEngine:
     def __init__(self, outcomes):
         self.outcomes = list(outcomes)
         self.calls: list = []              # (profile, prompt, schema, record_ids)
+        self.scopes = []
 
     async def complete_validated(self, profile, prompt, schema=None, *, scope):
         record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
+        self.scopes.append(scope)
         out = self.outcomes.pop(0)
         if isinstance(out, Exception):
             raise out
@@ -288,10 +292,11 @@ class StubCalibrator:
 
 
 def make_ctx(cfg, engine, llm=None):
-    return SimpleNamespace(cfg=cfg, llm=llm, schema_engine=engine,
+    return RunContext(cfg=cfg, llm=llm or SimpleNamespace(calibrator=StubCalibrator(0)), schema_engine=engine,
                            metrics=RecordingMetrics(), tasks=TaskRunner(),
                            task_namespace="run:batch:1:stage:segment",
-                           rng=None, batch_no=1)
+                           session_attempt=SessionAttemptScope("s1", 1, 0, "segment"),
+                           rng=None, batch_no=1, capacity_checker=SimpleNamespace(preview=lambda item, ctx: None))
 
 
 def run_stage(cfg, batch, engine, stage=None, llm=None):
@@ -370,10 +375,11 @@ def test_user_parts_frame_labels_and_diff_lines():
     bundle = build_segment_prompt(frames, [None, diff], make_cfg(), False,
                                   digests_of(frames))
     parts = bundle.messages[1].parts
-    assert [p.kind for p in parts] == ["text", "text"]
-    assert parts[0].text == f"[帧 0] {frame_digest(frames[0], 400)}"
+    assert [p.kind for p in parts] == ["image", "text", "image", "text"]
+    parts = [part for part in parts if part.kind == "text"]
+    assert parts[0].text == f"[帧 0] {record_evidence(frames[0])}"
     assert parts[1].text == (
-        f"[帧 1] {frame_digest(frames[1], 400)}\n"
+        f"[帧 1] {record_evidence(frames[1])}\n"
         "[帧 1 变更] 新增 2 节点，移除 1 节点，文本变化 3 处，变更比例 25%，应用切换")
 
 
@@ -384,6 +390,7 @@ def test_builder_consumes_supplied_digests_verbatim():
     bundle = build_segment_prompt(frames, [None, None], make_cfg(), False,
                                   ["摘要甲", "摘要乙"])
     parts = bundle.messages[1].parts
+    parts = [part for part in parts if part.kind == "text"]
     assert parts[0].text == "[帧 0] 摘要甲"
     assert parts[1].text == "[帧 1] 摘要乙"
 
@@ -402,7 +409,7 @@ def test_vision_resolved_two_state_parts_shape():
     frames = [ui_frame("f0", 3), ui_frame("f1", 4)]
     plain = build_segment_prompt(frames, [None, None], make_cfg(), False,
                                  digests_of(frames))
-    assert [p.kind for p in plain.messages[1].parts] == ["text", "text"]
+    assert [p.kind for p in plain.messages[1].parts] == ["image", "text", "image", "text"]
     vision = build_segment_prompt(frames, [None, None],
                                   make_cfg(vision_resolved=True), False,
                                   digests_of(frames))
@@ -461,6 +468,7 @@ def test_judge_window_precomputes_adjacent_diffs_into_prompt():
     ctx = make_ctx(make_cfg(), engine)
     asyncio.run(judge_window(frames, ctx))
     parts = engine.calls[0][1].messages[1].parts
+    parts = [part for part in parts if part.kind == "text"]
     assert "[帧 1 变更] " not in parts[0].text          # 窗首帧无此行
     # one TextView added between the frames → deterministic diff line
     assert parts[1].text.endswith(
@@ -489,34 +497,27 @@ def test_public_judge_window_self_computes_digests(monkeypatch):
     # digest vector — _judge_window computes its own table (CONTRACTS §7.14).
     calls = []
 
-    def counting(record, max_chars):
-        calls.append((record.id, max_chars))
-        return frame_digest(record, max_chars)
+    def counting(record):
+        calls.append(record.id)
+        return record_evidence(record)
 
-    monkeypatch.setattr("labelkit.operators.segment.frame_digest", counting)
+    monkeypatch.setattr("labelkit.operators.segment.record_evidence", counting)
     frames = [ui_frame("f0", 3), ui_frame("f1", 4)]
     engine = QueueEngine([window_obj("continues", "continues")])
     asyncio.run(judge_window(frames, make_ctx(make_cfg(), engine)))
-    assert calls == [("f0", 400), ("f1", 400)]
+    assert calls == ["f0", "f1"]
     parts = engine.calls[0][1].messages[1].parts
-    assert parts[0].text == f"[帧 0] {frame_digest(frames[0], 400)}"
+    assert [part.text for part in parts if part.kind == "text"][0] == f"[帧 0] {record_evidence(frames[0])}"
 
 
-# ── window cut: fixed fallback (budget off) + greedy packer (V9) ─────────────
+# ── 完整证据装箱：帧数上限与一帧重叠 ──────────────────────────────────
 
-def test_window_spans_fixed_fallback_stride_is_window_minus_one():
-    # The budget-undeclared cut — byte-identical to v1.10 (regression anchor).
-    assert _window_spans(5, 20) == [(0, 5)]
-    assert _window_spans(3, 2) == [(0, 2), (1, 3)]
-    assert _window_spans(21, 20) == [(0, 20), (19, 21)]
-    assert _window_spans(39, 20) == [(0, 20), (19, 39)]
-
-
-def test_pack_windows_cap_ceiling_degrades_to_fixed_windows():
-    # Unconstrained budget → the frame-count cap alone cuts: the packer's
-    # spans coincide with the fixed v1.10 shape for the same (n, window).
-    for n, cap in ((5, 20), (3, 2), (21, 20), (39, 20)):
-        assert _pack_windows([1] * n, 10 ** 9, cap) == _window_spans(n, cap)
+@pytest.mark.parametrize("n,cap,expected", [
+    (5, 20, [(0, 5)]), (3, 2, [(0, 2), (1, 3)]),
+    (21, 20, [(0, 20), (19, 21)]), (39, 20, [(0, 20), (19, 39)]),
+])
+def test_pack_windows_respects_frame_cap_with_full_budget(n, cap, expected):
+    assert _pack_windows([1] * n, 10 ** 9, cap) == expected
 
 
 def test_pack_windows_overflow_closes_window_with_one_frame_overlap():
@@ -705,10 +706,7 @@ def test_episode_assembly_spec_worked_example():
     assert episode.session_id == "sess-0003"
     assert episode.transitions is None
     record = episode.record
-    assert record.id == "7655568d2c485c43"              # sha256("\n".join(ids))[:16]
-    assert record.id == hashlib.sha256(
-        "\n".join([SPEC_IDS[0], SPEC_IDS[1], SPEC_IDS[3],
-                   SPEC_IDS[4]]).encode("utf-8")).hexdigest()[:16]
+    assert record.id == process_sequence_id("sess-0003", (3, 4, 6, 7), tuple(SPEC_IDS[i] for i in (0, 1, 3, 4)))
     assert record.kind == "sequence"
     assert record.modality == "ui"
     assert record.text is None and record.raw is None
@@ -733,24 +731,13 @@ def test_episode_assembly_spec_worked_example():
     assert payload["model"] == "glm-5.2" and "reason" not in payload
 
 
-def test_session_split_mark_propagates_to_episode():
-    cfg = make_cfg()
-    frames = [ui_frame("f0", 0), ui_frame("f1", 1)]
-    batch = [envelope(r, sid="sess-0009") for r in frames]
-    batch[1].session_split = True                       # M10's hard-split mark (S21)
-    engine = MapEngine({"f0": window_obj("continues", "continues")})
-    out, _ = run_stage(cfg, batch, engine)
-    (episode,) = batch[2:]
-    assert episode.session_split is True
-    # unmarked sessions carry no duck attribute at all
-    batch2 = [envelope(ui_frame("g0", 0), sid="s2"),
-              envelope(ui_frame("g1", 1), sid="s2")]
-    out2, _ = run_stage(cfg, batch2, MapEngine({"g0": window_obj("continues",
-                                                                 "continues")}))
-    assert not hasattr(batch2[2], "session_split")
+def test_episode_keeps_positions_and_allowed_bounds():
+    frames = [envelope(ui_frame("f0", 0)), envelope(ui_frame("f1", 1))]
+    out, _ = run_stage(make_cfg(), frames, MapEngine({"f0": window_obj("continues", "continues")}))
+    assert out[-1].member_positions == (0, 1)
+    assert (out[-1].capacity.bounds.lower, out[-1].capacity.bounds.upper) == (0, 2)
+    assert not out[-1].capacity.sealed
 
-
-# ── strategy routing: rules and lone-frame sessions cost zero LLM ────────────
 
 def test_rules_strategy_zero_llm_and_min_len_not_applied():
     cfg = make_cfg(strategy="rules", min_len=5)
@@ -882,24 +869,14 @@ def test_multiple_failed_windows_counted_in_degraded_evidence():
 
 # ── V27① error classification: overflow / truncated window failures ─────────
 
-def test_reactive_overflow_without_budget_classifies_context_overflow():
-    # Budget off (no declared window): the 200-shaped oracle (origin="finish")
-    # takes the plain failure path — no degrade, no breaker feed — and the
-    # kind routes through budget.classify_stage_error (V27①).
-    cfg = make_cfg(on_error="keep")
-    frames = [ui_frame("f0", 0), ui_frame("f1", 1)]
-    batch = [envelope(r) for r in frames]
-    overflow = ContextOverflowError("prompt too long", phase="reactive",
-                                    profile="default", origin="finish")
-    out, ctx = run_stage(cfg, batch, MapEngine({"f0": overflow}))
-    (episode,) = batch[2:]
-    assert episode.segment_degraded == {"kind": "context_overflow",
-                                        "windows_failed": 1}
-    assert ctx.metrics.counters == {"segment.failures": 1,
-                                    "segment.windows": 1}
-    assert ctx.metrics.provider_results == []           # never fed budget-off
-    (err_event,) = [e for e in ctx.metrics.events if e[0] == "error"]
-    assert err_event[3]["kind"] == "context_overflow"
+def test_minimal_reactive_window_never_uses_keep():
+    batch = [envelope(ui_frame("f0", 0)), envelope(ui_frame("f1", 1))]
+    error = ContextOverflowError("over", phase="reactive", profile="default", origin="finish")
+    _, ctx = run_stage(make_cfg(on_error="keep"), batch, MapEngine({"f0": error}))
+    assert len(batch) == 2
+    assert all(item.status == "failed" and item.errors[0].kind == "context_overflow" for item in batch)
+    assert ctx.metrics.counters["capacity.minimum_failures"] == 1
+    assert ctx.metrics.provider_results == []
 
 
 def test_output_truncated_window_classifies_without_degrade():
@@ -1001,10 +978,9 @@ def test_degrade_level_bound_terminal_feeds_breaker_once_for_http_400():
     ctx = degrade_ctx()
     with pytest.raises(ContextOverflowError):
         run_degrading(judge, (0, 16), ctx)
-    # level 0 (0,16) → level 1 (0,9) → level 2 (0,5): the level bound makes it
-    # terminal — the tree stops at the first terminal leaf (sequential halves)
-    assert calls == [(0, 16), (0, 9), (0, 5)]
-    assert ctx.metrics.counters == {"budget.degrade_retries": 2}
+    # 完整证据持续收缩到最小相邻对，终态只向断路器记一次失败。
+    assert calls == [(0, 16), (0, 9), (0, 5), (0, 3), (0, 2)]
+    assert ctx.metrics.counters == {"budget.degrade_retries": 4}
     assert ctx.metrics.provider_results == [(True, False)]   # exactly once (A7)
 
 
@@ -1031,7 +1007,7 @@ def test_degrade_terminal_finish_origin_never_feeds_breaker():
     assert ctx.metrics.provider_results == []
 
 
-def test_degrade_precheck_phase_never_degrades_or_feeds():
+def test_degrade_precheck_phase_splits_without_feeding_breaker():
     calls = []
 
     async def judge(span):
@@ -1041,8 +1017,8 @@ def test_degrade_precheck_phase_never_degrades_or_feeds():
     ctx = degrade_ctx()
     with pytest.raises(ContextOverflowError):
         run_degrading(judge, (0, 8), ctx)
-    assert calls == [(0, 8)]                            # no split attempted
-    assert ctx.metrics.counters == {}
+    assert calls == [(0, 8), (0, 5), (0, 3), (0, 2)]
+    assert ctx.metrics.counters == {"budget.degrade_retries": 3}
     assert ctx.metrics.provider_results == []
 
 
@@ -1074,30 +1050,16 @@ def test_stage_degrade_retry_merges_sub_window_verdicts():
 
 
 def test_stage_degrade_exhaustion_disposes_context_overflow_and_feeds_once():
-    cfg = make_cfg(on_error="keep",
-                   llm_profiles={"default": llm_profile(context_window=131072)})
-    frames = [ui_frame(f"f{i}", i) for i in range(3)]   # one packed window (0,3)
-    batch = [envelope(r) for r in frames]
-    overflow = ContextOverflowError("over", phase="reactive",
-                                    origin="http_400", profile="default")
-    engine = SpanEngine({("f0", 3): overflow,           # original window
-                         ("f0", 2): overflow})          # first half (0,2): minimal
-    out, ctx = run_stage(cfg, batch, engine)
-    # first half's terminal stops the tree — the second half is never judged
+    batch = [envelope(ui_frame(f"f{i}", i)) for i in range(3)]
+    error = ContextOverflowError("over", phase="reactive", origin="http_400", profile="default")
+    engine = SpanEngine({("f0", 3): error, ("f0", 2): error})
+    _, ctx = run_stage(make_cfg(on_error="keep"), batch, engine)
     assert engine.calls == [("f0", 3), ("f0", 2)]
-    (episode,) = batch[3:]
-    assert episode.segment_degraded == {"kind": "context_overflow",
-                                        "windows_failed": 1}
-    assert all(item.errors == [] for item in batch[:3])  # keep: never item.errors
-    assert ctx.metrics.counters == {"segment.failures": 1,
-                                    "segment.windows": 2,
-                                    "budget.degrade_retries": 1}
-    assert ctx.metrics.provider_results == [(True, False)]  # exactly once (A7)
-    (err_event,) = [e for e in ctx.metrics.events if e[0] == "error"]
-    assert err_event[3]["kind"] == "context_overflow"
+    assert len(batch) == 3 and all(item.status == "failed" for item in batch)
+    assert all(item.errors[0].kind == "context_overflow" for item in batch)
+    assert ctx.metrics.counters["budget.overflow_records"] == 3
+    assert ctx.metrics.provider_results == [(True, False)]
 
-
-# ── budget-on packing through the stage (V9) ─────────────────────────────────
 
 def packed_spans(cfg, frames, image_cost=0):
     """The spans the stage is expected to dispatch — computed with the same
@@ -1105,7 +1067,7 @@ def packed_spans(cfg, frames, image_cost=0):
     arithmetic is pinned by the direct _pack_windows tests above)."""
     prof = cfg.llm_profiles["default"]
     costs = [budget_mod.est_text(d) + budget_mod.DIFF_MAX_TOKENS + image_cost
-             for d in digests_of(frames, cfg.segment.digest_max_chars)]
+             for d in digests_of(frames)]
     return _pack_windows(costs, budget_mod.input_budget(prof)
                          - _static_prompt_est(cfg), cfg.segment.window)
 
@@ -1170,35 +1132,20 @@ def test_budget_on_vision_image_cost_prices_frames_and_reads_calibrator_once():
     batch = [envelope(r) for r in frames]
     out, ctx = run_stage(vision_cfg, batch, engine,
                          llm=SimpleNamespace(calibrator=calibrator))
-    assert calibrator.calls == ["default"]              # ONE read per session
+    assert calibrator.calls == ["default"] * (len(expected) + 1)              # ONE read per session
     assert boundary_windows(ctx) == expected
     # vision prompts carry one image part per frame
     parts = engine.calls[0][1].messages[1].parts
     assert [p.kind for p in parts][:2] == ["image", "text"]
 
 
-def test_budget_off_profile_with_zero_window_keeps_fixed_cut():
-    # context_window == 0 on the referenced profile = budget off: the fixed
-    # v1.10 cut, even though the profile table is populated.
-    cfg = make_cfg(window=2, min_len=1,
-                   llm_profiles={"default": llm_profile(context_window=0)})
-    frames = [ui_frame("f0", 0), ui_frame("f1", 1), ui_frame("f2", 2)]
-    batch = [envelope(r) for r in frames]
-    engine = MapEngine({"f0": window_obj("continues", "continues"),
-                        "f1": window_obj("continues", "continues")})
-    out, ctx = run_stage(cfg, batch, engine)
-    assert boundary_windows(ctx) == [(0, 2), (1, 3)]    # stride = window − 1
-    assert ctx.metrics.counters["segment.windows"] == 2
+def test_missing_positive_context_window_is_a_contract_error():
+    from labelkit.common.errors import InternalError
+    cfg = make_cfg(llm_profiles={"default": llm_profile(context_window=0)})
+    batch = [envelope(ui_frame("f0", 0)), envelope(ui_frame("f1", 1))]
+    with pytest.raises(InternalError, match="positive profile context"):
+        run_stage(cfg, batch, ExplodingEngine())
 
-
-# ── calibrated-above-prior forced-min-2 packing (finding-1 repro) ─────────────
-# The reviewer's scenario: an M1-passing config (w_min == 2 under PRIOR image
-# pricing) meets a calibrator whose post-min-samples readout legally exceeds
-# prior × 1.2 (V19, no clamp) — per-frame cost then exceeds the pack budget and
-# the pre-fix packer closed windows at 1 frame (AssertionError at runtime;
-# under python -O a non-advancing infinite loop). Now: forced 2-frame windows,
-# and a true overflow surfaces record-level via the M9 precheck terminal
-# through the per-window failure path — never an exception escaping run().
 
 def calibrated_above_prior_setup():
     prof = llm_profile(context_window=7168, max_output_tokens=1024)
@@ -1225,18 +1172,14 @@ def calibrated_above_prior_setup():
     return cfg, calibrator, frames
 
 
-def test_calibrated_above_prior_forces_two_frame_windows_and_completes():
+def test_calibrated_minimum_pair_fails_before_model():
     cfg, calibrator, frames = calibrated_above_prior_setup()
-    engine = MapEngine({"f0": window_obj("continues", "continues"),
-                        "f1": window_obj("continues", "continues"),
-                        "f2": window_obj("continues", "continues")})
-    batch = [envelope(r) for r in frames]
-    out, ctx = run_stage(cfg, batch, engine,
-                         llm=SimpleNamespace(calibrator=calibrator))
-    assert boundary_windows(ctx) == [(0, 2), (1, 3), (2, 4)]
-    assert all(e - s == 2 for s, e in boundary_windows(ctx))
-    assert status_tally(batch[:4]) == {"absorbed": 4}   # normal assembly
-    assert ctx.metrics.provider_results == []           # nothing fed the breaker
+    batch = [envelope(record) for record in frames]
+    _, ctx = run_stage(cfg, batch, ExplodingEngine(), llm=SimpleNamespace(calibrator=calibrator))
+    assert status_tally(batch) == {"failed": 4}
+    assert all(item.errors[0].kind == "context_overflow" for item in batch)
+    assert ctx.metrics.counters["capacity.minimum_failures"] == 1
+    assert ctx.metrics.provider_results == []
 
 
 def test_calibrated_above_prior_true_overflow_fails_record_level_never_raises():
@@ -1263,25 +1206,15 @@ def test_calibrated_above_prior_true_overflow_fails_record_level_never_raises():
     assert ctx.metrics.provider_results == []           # precheck never feeds
 
 
-def test_calibrated_above_prior_keep_disposition_degrades_whole_session():
-    # on_error="keep" (default): the same overflow terminal degrades the
-    # session to ONE whole episode with the S26 evidence triple — kind
-    # context_overflow — and no reject, so overflow_records stays untouched.
+def test_calibrated_overflow_cannot_keep_episode():
     cfg, calibrator, frames = calibrated_above_prior_setup()
-    engine = QueueEngine([ContextOverflowError(
-        "over budget", phase="precheck", profile="default")
-        for _ in range(3)])
-    batch = [envelope(r) for r in frames]
-    out, ctx = run_stage(cfg, batch, engine,
-                         llm=SimpleNamespace(calibrator=calibrator))
-    assert status_tally(batch[:4]) == {"absorbed": 4}
-    (episode,) = batch[4:]
-    assert episode.segment_degraded["kind"] == "context_overflow"
-    assert "budget.overflow_records" not in ctx.metrics.counters
+    batch = [envelope(record) for record in frames]
+    _, ctx = run_stage(cfg, batch, ExplodingEngine(), llm=SimpleNamespace(calibrator=calibrator))
+    assert status_tally(batch) == {"failed": 4}
+    assert all(item.errors[0].kind == "context_overflow" for item in batch)
+    assert ctx.metrics.counters["capacity.minimum_failures"] == 1
     assert ctx.metrics.provider_results == []
 
-
-# ── V9 session-level digest precompute ───────────────────────────────────────
 
 def test_digests_computed_once_per_frame_per_session(monkeypatch):
     # v1.10 digested per window inclusion (the seam frame twice); v1.11
@@ -1291,24 +1224,24 @@ def test_digests_computed_once_per_frame_per_session(monkeypatch):
     # independent by design.)
     calls = []
 
-    def counting(record, max_chars):
-        calls.append((record.id, max_chars))
-        return frame_digest(record, max_chars)
+    def counting(record):
+        calls.append(record.id)
+        return record_evidence(record)
 
-    monkeypatch.setattr("labelkit.operators.segment.frame_digest", counting)
+    monkeypatch.setattr("labelkit.operators.segment.record_evidence", counting)
     cfg = make_cfg(window=2, min_len=1)                 # 3 frames → 2 windows (seam)
     frames = [ui_frame("f0", 0), ui_frame("f1", 1), ui_frame("f2", 2)]
     batch = [envelope(r) for r in frames]
     engine = MapEngine({"f0": window_obj("continues", "continues"),
                         "f1": window_obj("continues", "continues")})
     out, ctx = run_stage(cfg, batch, engine)
-    assert sorted(calls) == [("f0", 400), ("f1", 400), ("f2", 400)]
+    assert sorted(calls) == ["f0", "f1", "f2"]
     # the seam frame's digest still reached both windows' prompts
     first_parts = engine.calls[0][1].messages[1].parts
     second_parts = engine.calls[1][1].messages[1].parts
-    seam_digest = frame_digest(frames[1], 400)
-    assert first_parts[1].text.startswith(f"[帧 1] {seam_digest}")
-    assert second_parts[0].text.startswith(f"[帧 0] {seam_digest}")
+    seam_digest = record_evidence(frames[1])
+    assert [p.text for p in first_parts if p.kind == "text"][1].startswith(f"[帧 1] {seam_digest}")
+    assert [p.text for p in second_parts if p.kind == "text"][0].startswith(f"[帧 0] {seam_digest}")
 
 
 # ── ②b contract ──────────────────────────────────────────────────────────────
@@ -1413,3 +1346,116 @@ def test_sessions_processed_in_batch_position_order():
     assert [r.id for r in episode.record.members] == ["b0", "b1"]
     # conservation across the whole batch
     assert status_tally(batch) == {"dropped_noise": 2, "absorbed": 2, "active": 1}
+
+
+class MemberCapacity:
+    """纯成员装箱规则，不模拟模型响应或网络服务。"""
+
+    def __init__(self, max_members, impossible=()):
+        self.max_members = max_members
+        self.impossible = frozenset(impossible)
+        self.previews = []
+
+    def preview(self, item, ctx):
+        from labelkit.common.contracts.sequence_capacity import SessionCapacityFailure, capacity_target
+        self.previews.append(item.member_positions)
+        if len(item.record.members) <= self.max_members and not self.impossible.intersection(item.member_positions):
+            return None
+        return SessionCapacityFailure("annotate", (capacity_target(item),), "sequence",
+                                      ContextOverflowError("complete evidence does not fit", profile="default",
+                                                           phase="precheck"))
+
+
+def test_capacity_partition_happens_after_min_len_and_keeps_short_tail():
+    cfg = make_cfg(min_len=3)
+    frames = [envelope(ui_frame(f"f{i}", i)) for i in range(5)]
+    batch = list(frames)
+    ctx = make_ctx(cfg, QueueEngine([window_obj(*(["continues"] * 5))]))
+    ctx.capacity_checker = MemberCapacity(2)
+    asyncio.run(SegmentStage(cfg).run(batch, ctx))
+    episodes = batch[5:]
+    assert [item.member_positions for item in episodes] == [(0, 1), (2, 3), (4,)]
+    assert [item.status for item in episodes] == ["active"] * 3
+    assert [item.status for item in frames] == ["absorbed"] * 5
+    assert [item.capacity.sealed for item in episodes] == [True, True, False]
+    assert [(item.capacity.bounds.lower, item.capacity.bounds.upper) for item in episodes] == [(0, 2), (2, 4), (4, 5)]
+    assert episodes[0].capacity.bounds.after == episodes[1].capacity.bounds.before
+    assert episodes[1].capacity.bounds.after == episodes[2].capacity.bounds.before
+    assert ctx.metrics.counters["capacity.splits"] == 2
+    assert "segment.below_min_len" not in ctx.metrics.counters
+
+
+def test_semantically_short_segment_never_enters_capacity_partition():
+    cfg = make_cfg(min_len=3)
+    batch = [envelope(ui_frame(f"f{i}", i)) for i in range(2)]
+    ctx = make_ctx(cfg, QueueEngine([window_obj("continues", "continues")]))
+    checker = ctx.capacity_checker = MemberCapacity(1)
+    asyncio.run(SegmentStage(cfg).run(batch, ctx))
+    assert len(batch) == 2 and checker.previews == []
+    assert [item.noise_attribution for item in batch] == [("segment", "below_min_len")] * 2
+
+
+def test_capacity_single_frame_failure_keeps_failed_episode_and_frame_ownership(caplog):
+    cfg = make_cfg(strategy="rules")
+    frames = [envelope(ui_frame("same", i)) for i in range(3)]
+    batch = list(frames)
+    ctx = make_ctx(cfg, ExplodingEngine())
+    ctx.capacity_checker = MemberCapacity(2, impossible=(1,))
+    asyncio.run(SegmentStage(cfg).run(batch, ctx))
+    episodes = batch[3:]
+    assert [item.member_positions for item in episodes] == [(0,), (1,), (2,)]
+    assert len({item.record.id for item in episodes}) == 3
+    assert [item.status for item in episodes] == ["active", "failed", "active"]
+    assert [item.status for item in frames] == ["absorbed"] * 3
+    assert episodes[1].errors[0].kind == "context_overflow"
+    assert episodes[1].errors[0].stage == "annotate"
+    assert ctx.metrics.counters["capacity.minimum_failures"] == 1
+    assert "minimal sequence capacity failed" in caplog.text
+    failures = [event[3] for event in ctx.metrics.events if event[0] == "sequence.capacity"
+                and event[3]["action"] == "minimum_failure"]
+    assert failures[0]["member_positions"] == [1]
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 100])
+def test_segment_computation_groups_preserve_window_overlap_and_episode(batch_size):
+    import dataclasses
+    cfg = make_cfg(window=2)
+    cfg = dataclasses.replace(cfg, run=dataclasses.replace(cfg.run, batch_size=batch_size))
+    batch = [envelope(ui_frame(f"f{i}", i)) for i in range(5)]
+    engine = MapEngine({f"f{i}": window_obj("continues", "continues") for i in range(4)})
+    ctx = make_ctx(cfg, engine)
+    from test_stitch import TaskRunner as RecordingTaskRunner
+    ctx.tasks = RecordingTaskRunner()
+    asyncio.run(SegmentStage(cfg).run(batch, ctx))
+    assert batch[-1].member_positions == (0, 1, 2, 3, 4)
+    assert len(batch) == 6
+    assert [len(request.tasks) for request in ctx.tasks.requests] == (
+        [1, 1, 1, 1] if batch_size == 1 else [2, 2] if batch_size == 2 else [4])
+    assert [call[3] for call in engine.calls] == [(f"f{i}",) for i in range(4)]
+
+
+def test_segment_request_keeps_late_visible_evidence_and_each_image():
+    frames = [ui_frame("a", 0, texts=("x" * 500, "unique-tail-evidence")), ui_frame("b", 1)]
+    engine = QueueEngine([window_obj("continues", "continues")])
+    asyncio.run(judge_window(frames, make_ctx(make_cfg(vision_resolved=False), engine)))
+    assert engine.scopes[0].complete_evidence is True
+    parts = engine.calls[0][1].messages[1].parts
+    assert "unique-tail-evidence" in "\n".join(part.text for part in parts if part.kind == "text")
+    assert [part.image for part in parts if part.kind == "image"] == [frame.image for frame in frames]
+
+
+@pytest.mark.parametrize("unit", ["fixed", "frame", "transition", "pairwise", "stitch_pool"])
+def test_indivisible_preview_keeps_full_semantic_episode_for_owning_stage(unit):
+    import dataclasses
+    cfg = make_cfg(strategy="rules")
+    frames = [envelope(ui_frame(f"f{i}", i)) for i in range(3)]
+    batch = list(frames)
+    ctx = make_ctx(cfg, ExplodingEngine())
+    capacity = MemberCapacity(0)
+    ctx.capacity_checker = SimpleNamespace(
+        preview=lambda item, current: dataclasses.replace(capacity.preview(item, current), unit=unit))
+    asyncio.run(SegmentStage(cfg).run(batch, ctx))
+    assert len(batch) == 4
+    assert batch[-1].member_positions == (0, 1, 2) and batch[-1].status == "active"
+    assert all(frame.status == "absorbed" for frame in frames)
+    assert not any(key.startswith("capacity.") for key in ctx.metrics.counters)

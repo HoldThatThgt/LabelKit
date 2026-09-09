@@ -1,12 +1,5 @@
-# Tool-level static config（spec §5.1）——双 profile 双端点分工（v1.12 vision
-# 语义分列的教学形态）：
-#   [llm.default] = DeepSeek（deepseek-v4-flash，文本判决面）——UI 主工程的
-#     segment 滑窗摘要判决、帧级批量分类（digest-only，frame.classify 永不入
-#     vision 必需集）、stream 模式 quality 纯文本打分（S30 放宽），以及文本
-#     姊妹工程 project-text.toml 的全部阶段；
-#   [llm.vision] = z.ai glm-5.2（视觉必需面）——UI 模态下 classify/annotate/
-#     frame.annotate/verify 四阶段强制 supports_vision，取值哲学镜像
-#     ../config.toml。
+# Tool-level static config：UI 主工程使用 vision 处理所有完整成员证据。
+# default 用于 project-text.toml 纯文本姊妹工程；旧摘要阶段分工不再适用。
 # 本示例独立成套、不复用 ../config.toml，偏离共享惯例的理由：双粒度上手示例
 # 单目录即完整可跑（独立上手），且 DeepSeek 端点与其余示例共用的 z.ai
 # glm-5.2 端点隔离、互不牵连。

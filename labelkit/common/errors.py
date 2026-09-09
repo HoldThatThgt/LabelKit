@@ -2,11 +2,30 @@
 from __future__ import annotations
 
 import enum
-from typing import Literal
+import logging
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from labelkit.common.contracts.sequence_capacity import SessionCapacityFailure
 
 
 class LabelKitError(Exception):
     """本工具全部异常的基类。"""
+
+
+class SessionCapacityError(LabelKitError):
+    """在普通会话提交前传递可定位的容量控制信号。"""
+
+    def __init__(self, failures: tuple[SessionCapacityFailure, ...]):
+        """保留整轮声明序容量事实，不将失败尝试变成已交付记录失败。
+
+        @param failures 已明确阶段、请求单位和成员归属的非空容量事实元组。
+        """
+        if not failures:
+            logging.getLogger(__name__).error("session capacity control requires at least one failure")
+            raise ValueError("session capacity control requires at least one failure")
+        self.failures = failures
+        super().__init__(f"session context capacity exceeded: stage={failures[0].stage} failures={len(failures)}")
 
 
 class GenerationProjectionMismatch(Exception):

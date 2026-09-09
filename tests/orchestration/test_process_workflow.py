@@ -15,6 +15,7 @@ import json
 import logging
 import random
 from dataclasses import replace
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -192,13 +193,20 @@ class FakeMetrics:
             "candidate_bytes_high_water": 0, "cancelled_tasks": 0,
             "resource_wait_ms": 0, "http_pool_wait_ms": 0, "commit_ms": 0,
         }
+        self._captured_counts = ContextVar("workflow_test_capture", default=None)
+        self._session_attempt = ContextVar("workflow_test_session", default=None)
+
+    capture_counts = MetricsSink.capture_counts
+    merge_counts = MetricsSink.merge_counts
+    session_attempt = MetricsSink.session_attempt
+    observe_session_frames = MetricsSink.observe_session_frames
 
     def event(self, ev, *, stage, batch_no, record_ids=(), payload=None):
         self.events.append((ev, stage, batch_no, tuple(record_ids), dict(payload or {})))
         self.event_log.events_written += 1
 
     def count(self, key, n=1):
-        self.counters[key] = self.counters.get(key, 0) + n
+        MetricsSink.count(self, key, n)
 
     def add_stage_time(self, stage, seconds):
         self.stage_times[stage] = self.stage_times.get(stage, 0.0) + seconds
@@ -556,7 +564,8 @@ class StubSegmentStage:
                              image=None, ref=members[0].record.ref,
                              kind="sequence",
                              members=tuple(m.record for m in members))
-            batch.append(PipelineItem(record=episode, session_id=sid))
+            batch.append(PipelineItem(record=episode, session_id=sid,
+                                      member_positions=tuple(member.session_position for member in members)))
         return batch
 
 
@@ -588,9 +597,26 @@ class StubStitchStage:
                 head.record = replace(
                     head.record,
                     members=head.record.members + item.record.members)
+                head.member_positions += item.member_positions
                 item.status = "stitched"
             elif item.thread_id is None:
                 item.thread_id = item.record.id
+        return batch
+
+
+class StubSplitSegmentStage(StubSegmentStage):
+    """Produce two semantic episodes inside one session for stitching lifecycle tests."""
+
+    async def run(self, batch, ctx):
+        await super().run(batch, ctx)
+        parent = batch[-1]
+        if len(parent.record.members) < 4:
+            return batch
+        members, positions = parent.record.members, parent.member_positions
+        parent.record = replace(parent.record, members=members[:2])
+        parent.member_positions = positions[:2]
+        batch.append(PipelineItem(record=replace(parent.record, id="shell", members=members[2:]),
+                                  session_id=parent.session_id, member_positions=positions[2:]))
         return batch
 
 
@@ -677,9 +703,33 @@ def build(cfg, stages, records=None, *, ingestor=None, llm=None, schema_engine=N
     emitter = FakeEmitter(cfg)
     if ingestor is None and cfg.run.mode == "process":
         ingestor = FakeIngestor(records or [])
+    if cfg.segment.enabled:
+        stages = [SessionStageProbe(stage) if stage.name == "dedup" else stage for stage in stages]
     orch = ProcessWorkflow(cfg, stages, ingestor, emitter,
                         services(metrics, llm, schema_engine))
     return orch, metrics, emitter, ingestor
+
+
+class SessionStageProbe:
+    """Adapt pure scheduling probes to the explicit session reservation protocol; no inference."""
+
+    name = "dedup"
+
+    def __init__(self, stage):
+        self.stage = stage
+
+    async def reserve_session(self, batch, ctx):
+        await self.stage.run(batch, ctx)
+        return object()
+
+    def commit_session(self, reservation):
+        pass
+
+    def discard_session(self, reservation):
+        pass
+
+    def preview_capacity(self, item, ctx):
+        return None
 
 
 def counts_invariant(counts):
@@ -1855,13 +1905,13 @@ async def test_stream_next_fit_packing_whole_sessions(tmp_path):
     orch, metrics, emitter, _ = build(cfg, [stage], ingestor=ingestor)
     summary = await orch.run()
 
-    assert [len(ids) for _, ids in stage.calls] == [8, 4]
+    assert [len(ids) for _, ids in stage.calls] == [5, 3, 4]
     # whole sessions, arrival order: batch 1 = s1 then s2 frames, batch 2 = s3
-    assert stage.calls[0][1] == tuple(f"{i:016x}" for i in (1, 2, 3, 4, 5,
-                                                            11, 12, 13))
-    assert stage.calls[1][1] == tuple(f"{i:016x}" for i in (21, 22, 23, 24))
+    assert stage.calls[0][1] == tuple(f"{i:016x}" for i in (1, 2, 3, 4, 5))
+    assert stage.calls[1][1] == tuple(f"{i:016x}" for i in (11, 12, 13))
+    assert stage.calls[2][1] == tuple(f"{i:016x}" for i in (21, 22, 23, 24))
     starts = [e for e in metrics.events if e[0] == "batch.start"]
-    assert [e[4]["size"] for e in starts] == [8, 4]
+    assert [e[4]["size"] for e in starts] == [5, 3, 4]
     assert summary.exit_code == 0
     assert stream_counts_invariant(emitter.report["counts"])
 
@@ -1891,11 +1941,11 @@ async def test_stream_oversized_session_hard_split_and_marks(tmp_path, caplog):
         orch, _, emitter, _ = build(cfg, [probe], ingestor=ingestor)
         summary = await orch.run()
 
-    assert [len(b) for b in probe.batches] == [8, 2, 8, 1]
+    assert [len(b) for b in probe.batches] == [10, 9]
     for b in probe.batches:
-        assert all(split is True for _, split in b)
-    assert probe.batches[0][0][0] == "s1" and probe.batches[3][0][0] == "s2"
-    assert sum("hard-split" in r.message for r in caplog.records) == 1
+        assert all(split is False for _, split in b)
+    assert probe.batches[0][0][0] == "s1" and probe.batches[1][0][0] == "s2"
+    assert sum("hard-split" in r.message for r in caplog.records) == 0
     assert summary.output_lines == 19
     assert stream_counts_invariant(emitter.report["counts"])
 
@@ -1930,7 +1980,7 @@ async def test_stream_session_id_stamped_on_frame_envelopes(tmp_path):
     orch, _, _, _ = build(cfg, [stub], ingestor=ingestor)
     await orch.run()
     # captured at segment ENTRY: the three frame envelopes, stamped in order
-    assert stub.calls == [(1, ("s1", "s1", "s2"))]
+    assert stub.calls == [(1, ("s1", "s1")), (2, ("s2",))]
 
 
 async def test_stream_episodes_metered_as_segment_len_delta(tmp_path):
@@ -2030,7 +2080,7 @@ async def test_stream_report_block_shape_and_counts_gating(tmp_path):
     assert set(stream) == {"sessions", "episodes", "mean_episode_len",
                            "absorbed", "dropped_noise", "below_min_len",
                            "digest_poor_frames", "segment_failures",
-                           "extract", "verify"}
+                           "capacity", "extract", "verify"}
     assert stream["sessions"] == 2
     assert stream["episodes"] == 2
     assert stream["mean_episode_len"] == 2.5       # absorbed/episodes, round 2
@@ -2071,7 +2121,7 @@ async def test_stream_report_block_base_form_and_disabled_gating(tmp_path):
     stream = emitter.report["stream"]
     assert set(stream) == {"sessions", "episodes", "mean_episode_len",
                            "absorbed", "dropped_noise", "below_min_len",
-                           "digest_poor_frames", "segment_failures"}
+                           "digest_poor_frames", "segment_failures", "capacity"}
     assert stream["mean_episode_len"] == 2.0
     # v1.12 门控（帧关方向）：基础八键形态即字节等价证明——两子块不在场。
     assert "frame_classify" not in stream and "frame_annotate" not in stream
@@ -2144,11 +2194,11 @@ async def test_stream_breaker_residual_includes_episodes_and_absorbed(tmp_path):
     assert summary.exit_code == 4
     assert emitter.report["run"]["partial_delivery"] is True
     counts = emitter.report["counts"]
-    assert counts["episodes"] == 2                 # metered in BOTH batches
+    assert counts["episodes"] == 1                 # committed session only
     assert counts["absorbed"] == 3                 # batch 1 only (batch 2 no emit)
     assert counts["failed"] == 1                   # batch 1's failed episode
     assert "unprocessed" in counts
-    assert counts["unprocessed"] == 3              # s2's 2 frames + its episode
+    assert counts["unprocessed"] == 2              # only original frames
     lhs = (counts["emitted"] + counts["dropped_dup"] + counts["dropped_lowq"]
            + counts["dropped_verify"] + counts["dropped_noise"]
            + counts["failed"] + counts["bad_input"] + counts["absorbed"]
@@ -2188,7 +2238,7 @@ async def test_stream_interrupted_run_gains_unprocessed(tmp_path):
     counts = emitter.report["counts"]
     assert counts["emitted"] == 2                  # batch 1 only
     # s2 (buffered in the open bin) + s3 (pulled, never packed) stranded
-    assert counts["unprocessed"] == 4
+    assert counts["unprocessed"] == 2
     assert stream_counts_invariant(counts)
 
 
@@ -2237,11 +2287,11 @@ async def test_dry_run_stream_estimate_formulas_and_note(tmp_path, capsys):
     err = capsys.readouterr().err
     assert "estimated_records=26" in err
     # next-fit simulation: 21 hard-splits to [8][8][5], then [5] → 4 batches
-    assert "batches=4" in err
-    assert "segment_calls=3" in err                # ceil(20/19) + ceil(4/19)
+    assert "batches=2" in err
+    assert "segment_calls=24" in err               # necessary two-frame windows
     assert "extract_calls=24" in err               # 20 + 4 (upper bound)
     assert "annotate_calls=2" in err               # episodes ≈ sessions
-    assert "total=29" in err
+    assert "total=50" in err
     assert ("stream estimate: downstream reports a lower bound at "
             "episodes≈sessions (LLM refinement only adds segments)") in err
 
@@ -2382,12 +2432,12 @@ async def test_stitched_tally_threads_derivation_and_report_block(tmp_path):
     batch.end gains stitched/threads; report.stream gains the stitch block
     positioned before extract's."""
     cfg = stitch_stream_cfg(tmp_path, batch_size=8)
-    ingestor = FakeSessionIngestor([sess("s1", 1, 2), sess("s2", 11, 2)])
+    ingestor = FakeSessionIngestor([sess("s1", 1, 4)])
     # StubSegmentStage appends one episode per session; the s2 episode merges
     # into the s1 episode (batch-first survivor).
-    shell_id = "ep:s2:1"[:16]
+    shell_id = "shell"
     orch, metrics, emitter, _ = build(
-        cfg, [StubSegmentStage(), StubStitchStage(merges=(shell_id,))],
+        cfg, [StubSplitSegmentStage(), StubStitchStage(merges=(shell_id,))],
         ingestor=ingestor)
     summary = await orch.run()
 
@@ -2413,7 +2463,7 @@ async def test_stitched_tally_threads_derivation_and_report_block(tmp_path):
     # v1.11 (V13④/spec §6.4): the budget-gated windows key is absent on this
     # undeclared run — stitch follows segment_failures directly.
     assert "windows" not in stream
-    assert keys.index("stitch") == keys.index("segment_failures") + 1
+    assert keys.index("stitch") == keys.index("capacity") + 1
 
 
 async def test_stitch_counters_surface_in_report_block(tmp_path):
@@ -2458,11 +2508,10 @@ async def test_stream_breaker_residual_subtracts_stitched(tmp_path):
     (s3) trips the breaker before emit and strands whole."""
     cfg = stitch_stream_cfg(tmp_path, batch_size=4, fatal_threshold=2,
                             annotate=True)
-    ingestor = FakeSessionIngestor([sess("s1", 1, 2), sess("s2", 11, 2),
-                                    sess("s3", 21, 2)])
-    shell_id = "ep:s2:1"[:16]
+    ingestor = FakeSessionIngestor([sess("s1", 1, 4), sess("s2", 21, 2)])
+    shell_id = "shell"
     orch, _, emitter, _ = build(
-        cfg, [StubSegmentStage(), StubStitchStage(merges=(shell_id,)),
+        cfg, [StubSplitSegmentStage(), StubStitchStage(merges=(shell_id,)),
               BreakerStage()],
         ingestor=ingestor)
     summary = await orch.run()
@@ -2472,7 +2521,7 @@ async def test_stream_breaker_residual_subtracts_stitched(tmp_path):
     assert counts["stitched"] == 1                 # batch 1's shell, tallied
     assert counts["failed"] == 1                   # batch 1's thread (breaker-fed)
     assert "unprocessed" in counts
-    assert counts["unprocessed"] == 3              # s3's 2 frames + its episode
+    assert counts["unprocessed"] == 2              # canceled session contributes only original frames
     lhs = (counts["emitted"] + counts["dropped_dup"] + counts["dropped_lowq"]
            + counts["dropped_verify"] + counts["dropped_noise"]
            + counts["failed"] + counts["bad_input"] + counts["absorbed"]
@@ -2664,11 +2713,11 @@ def test_estimate_run_stream_next_fit_exactness(tmp_path):
     est = estimate_run(cfg, SimpleNamespace(estimated_records=26,
                                             session_lens=(21, 5)))
     assert est["records"] == 26
-    assert est["batches"] == 4                     # 21 hard-splits [8][8][5], then [5]
-    assert est["segment_calls"] == 3               # ceil(20/19) + ceil(4/19)
+    assert est["batches"] == 2                     # complete semantic sessions
+    assert est["segment_calls"] == 24              # necessary two-frame windows
     assert est["extract_calls"] == 24              # 20 + 4 (upper bound)
     assert est["annotate_calls"] == 2              # episodes ≈ sessions
-    assert est["total_calls"] == 29
+    assert est["total_calls"] == 50
 
 
 def test_estimate_run_stitch_votes_and_repass_formula(tmp_path):
@@ -2829,7 +2878,7 @@ async def test_live_run_ui_stream_estimate_reuses_session_lens(tmp_path):
     assert ingestor.scan_estimates == [True]
     assert len(metrics.run_estimates) == 1
     est = metrics.run_estimates[0]
-    assert est["records"] == 5 and est["batches"] == 1
+    assert est["records"] == 5 and est["batches"] == 2
 
 
 # — dry-run rich yield (U13) ——————————————————————————————————————————————————
@@ -3180,17 +3229,17 @@ def test_estimate_run_segment_calls_budget_two_state(tmp_path):
                                             window=20),
                       extract=ExtractConfig(enabled=True))
     off = estimate_run(base, plan)                 # anchor (asserted above)
-    assert off["segment_calls"] == 3
+    assert off["segment_calls"] == 24
 
     small = replace(base, llm_profiles={"default": budget_profile(5600)})
-    assert budget.min_window(small) == 6           # (4016 − 492) // 528
+    assert budget.min_window(small) == 2
     est = estimate_run(small, plan)
-    assert est["segment_calls"] == 5               # ceil(20/5) + ceil(4/5)
+    assert est["segment_calls"] == 24
     assert est["extract_calls"] == off["extract_calls"] == 24
-    assert est["total_calls"] == off["total_calls"] + 2
+    assert est["total_calls"] == off["total_calls"]
 
     large = replace(base, llm_profiles={"default": budget_profile(131072)})
-    assert budget.min_window(large) == 220 > 20    # uncapped by design
+    assert budget.min_window(large) == 2
     assert estimate_run(large, plan) == off        # clamp at the call site
 
 
@@ -3206,12 +3255,9 @@ def test_estimate_run_rules_strategy_ignores_budget(tmp_path):
     assert est["segment_calls"] == 0
 
 
-async def test_dry_run_stream_budget_small_window_upper_bound_and_note(
+async def test_dry_run_stream_small_budget_nominal_estimate_and_note(
         tmp_path, capsys):
-    """V12 dry-run face: w_min < window → the segment_calls line reports the
-    upper-bound value and the stream note gains the ONE appended sentence
-    "segment reports an upper bound at worst-case budget packing" (same line,
-    after the v1.8 wording)."""
+    """Complete evidence reports nominal counts and never a worst-case capacity guarantee."""
     cfg = budget_stream_cfg(tmp_path, 5600, batch_size=8, dry_run=True,
                             annotate=True, extract=ExtractConfig(enabled=True))
     ingestor = FakeSessionIngestor(session_lens=(21, 5))
@@ -3220,21 +3266,18 @@ async def test_dry_run_stream_budget_small_window_upper_bound_and_note(
 
     assert summary.exit_code == 0
     err = capsys.readouterr().err
-    assert "segment_calls=5" in err                # w_min=6: ceil(20/5)+ceil(4/5)
+    assert "segment_calls=24" in err
     assert "extract_calls=24" in err               # non-segment keys unchanged
-    assert "total=31" in err
+    assert "total=50" in err
     assert ("dry-run: note: stream estimate: downstream reports a lower bound "
-            "at episodes≈sessions (LLM refinement only adds segments)"
-            "; segment reports an upper bound at worst-case budget packing") in err
+            "at episodes≈sessions (LLM refinement only adds segments)") in err
+    assert "worst-case" not in err
+    assert "capacity repartition and retries may change actual sequence and call counts" in err
 
 
-async def test_dry_run_stream_budget_large_window_byte_identical(
+async def test_dry_run_stream_large_budget_does_not_claim_guaranteed_packing(
         tmp_path, capsys):
-    """V26 anchor: w_min > window → estimate values AND the stream note stay
-    byte-identical to the budget-off run (no appended sentence) — the
-    mechanism that keeps the seven dry-run goldens (v1.12: five re-sampled +
-    dryrun-mix.txt / dryrun-mix-text.txt) frozen under the examples' 131072
-    declaration."""
+    """A large declared window does not bound arbitrary complete evidence or retries."""
     cfg = budget_stream_cfg(tmp_path, 131072, batch_size=8, dry_run=True,
                             annotate=True, extract=ExtractConfig(enabled=True))
     ingestor = FakeSessionIngestor(session_lens=(21, 5))
@@ -3242,11 +3285,11 @@ async def test_dry_run_stream_budget_large_window_byte_identical(
     await orch.run()
 
     err = capsys.readouterr().err
-    assert "segment_calls=3" in err                # ceil(20/19) + ceil(4/19)
-    assert "total=29" in err
+    assert "segment_calls=24" in err
+    assert "total=50" in err
     assert ("dry-run: note: stream estimate: downstream reports a lower bound "
-            "at episodes≈sessions (LLM refinement only adds segments)\n") in err
-    assert "worst-case budget packing" not in err
+            "at episodes≈sessions (LLM refinement only adds segments)") in err
+    assert "worst-case" not in err
 
 
 # — V19: batch-boundary calibrator freezes ————————————————————————————————————
@@ -3322,11 +3365,11 @@ async def test_report_budget_node_shape_per_contracts(tmp_path):
     await orch.run()
 
     b = emitter.report["budget"]
-    assert list(b) == ["profiles", "w_min", "truncations", "overflow_records",
+    assert list(b) == ["profiles", "minimum_frames", "truncations", "overflow_records",
                        "image_cost", "degrade_retries", "escalations"]
     assert b["profiles"] == {"default": {"context_window": 5600,
                                          "input_budget": 4016}}
-    assert b["w_min"] == {"segment.window": [20, 6]}
+    assert b["minimum_frames"] == 2 and "w_min" not in b
     assert b["truncations"] == {"annotate": 3}
     assert b["overflow_records"] == 2
     assert b["image_cost"] == {"default": 1882}    # cost() readout, ≥1 sample
@@ -3350,7 +3393,7 @@ async def test_report_budget_w_min_raw_and_absent_without_segment(tmp_path):
     orch, _, emitter, _ = build(cfg, [StubSegmentStage()], ingestor=ingestor,
                                 llm=SimpleNamespace(calibrator=cal))
     await orch.run()
-    assert emitter.report["budget"]["w_min"] == {"segment.window": [20, 220]}
+    assert emitter.report["budget"]["minimum_frames"] == 2
     assert emitter.report["budget"]["image_cost"] == {}   # zero samples
 
     cfg2 = make_cfg(tmp_path, batch_size=4, annotate=True)
@@ -3359,7 +3402,7 @@ async def test_report_budget_w_min_raw_and_absent_without_segment(tmp_path):
                                   llm=SimpleNamespace(calibrator=StubCalibrator()))
     await orch2.run()
     b2 = emitter2.report["budget"]
-    assert "w_min" not in b2
+    assert "minimum_frames" not in b2 and "w_min" not in b2
     assert list(b2) == ["profiles", "truncations", "overflow_records",
                         "image_cost", "degrade_retries", "escalations"]
 
@@ -3432,7 +3475,7 @@ async def test_startup_budget_info_lines_and_gating(tmp_path, caplog):
         await orch.run()
     msgs = [r.getMessage() for r in caplog.records]
     assert "budget: default=5600/4016" in msgs
-    assert "segment: w_min=6 window=20 (budget)" in msgs
+    assert "segment: minimum_frames=2 window=20 (budget)" in msgs
 
     # non-stream budget run: profile line only, no segment line
     caplog.clear()

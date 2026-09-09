@@ -8,7 +8,7 @@ from dataclasses import fields
 from labelkit.common.contracts.stage import RunContext, Stage
 
 
-def test_run_context_has_exactly_eight_required_fields_in_contract_order():
+def test_run_context_required_services_and_optional_session_scope():
     assert [field.name for field in fields(RunContext)] == [
         "cfg",
         "llm",
@@ -18,11 +18,15 @@ def test_run_context_has_exactly_eight_required_fields_in_contract_order():
         "metrics",
         "tasks",
         "task_namespace",
+        "session_attempt",
+        "capacity_checker",
     ]
     assert all(
         parameter.default is inspect.Parameter.empty
-        for parameter in inspect.signature(RunContext).parameters.values()
+        for parameter in list(inspect.signature(RunContext).parameters.values())[:8]
     )
+    assert inspect.signature(RunContext).parameters["session_attempt"].default is None
+    assert inspect.signature(RunContext).parameters["capacity_checker"].default is None
 
 
 def test_run_context_preserves_supplied_runtime_objects():

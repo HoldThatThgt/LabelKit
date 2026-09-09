@@ -49,7 +49,8 @@ from labelkit.common.errors import (
     InternalError,
     LabelKitError,
 )
-from labelkit.common.contracts.types import PipelineItem, Record, StageError
+from labelkit.common.contracts.sequence_capacity import member_key
+from labelkit.common.contracts.types import CapacityCut, PipelineItem, Record, StageError
 from labelkit.common.inference.schema_engine import SchemaEngine, _thaw_json
 # v1.10（U21）：plain 模式的进度/摘要行格式活在 common 层的纯函数模块里，与 CLI
 # 渲染器共用（operators → common 是许可的依赖方向；cli ↛ operators 依旧成立）。
@@ -598,12 +599,12 @@ class Emitter:
         """装配 v1.8 的 `_meta.stream` 值（§9.1 / spec §6.3）。
 
         segment 关闭时恒 null。流模式下每一行主输出都是一条 episode（序列记录）
-        ——这里遇到非序列记录属防御性分支，同样给 null。session_split /
-        stream_repaired / segment_degraded 以鸭子面信封标记传递，由 M10/M7/M14
+        ——这里遇到非序列记录同样给 null。capacity 持有人工边界；
+        stream_repaired / segment_degraded 由 M7/M14
         写入（S21/S26，§7.6）。v1.9（T16/m-11）：thread_id / fragments 与逐步的
         resumed 标志仅在 stitch 开启时在场——这是关闭态字节等价的条件。顶层
         order_span 保持信封跨度（§6.3 包络规则：多片段 thread 的跨度里可能夹着别
-        的 thread 的帧——下游切片必须用 fragments[].order_span）。
+        的 thread 的帧——精确归属必须用 fragments[].member_positions）。
 
         :param item: 该行的信封。
         :returns: stream 块；非流模式或非序列记录时为 None。
@@ -620,17 +621,18 @@ class Emitter:
             "order_span": [_order_key_repr(members[0]), _order_key_repr(members[-1])],
             "member_count": len(members),
             "member_ids": [m.id for m in members],
+            "member_positions": list(item.member_positions),
             "member_sources": [_member_source(m) for m in members],
         })
         if self._cfg.frame_classify.enabled or self._cfg.frame_annotate.enabled:
             # v1.12（spec §3.6）：members 数组仅在任一帧开关开启时在场，位置冻结在
-            # member_sources 之后、session_split 之前；全关时块形态与 v1.11 字节等价。
+            # member_sources 之后、capacity 之前。
             block["members"] = self._members_block(item)
         self._append_stream_tail(block, item)
         return block
 
     def _append_stream_tail(self, block: dict, item: PipelineItem) -> None:
-        """就地补齐 `_meta.stream` 的尾部键（键序冻结：session_split / repaired /
+        """就地补齐 `_meta.stream` 的尾部键（键序冻结：capacity / repaired /
         degraded[/ fragments] / steps）。
 
         :param block: 待补齐的 stream 块（就地修改）。
@@ -638,7 +640,7 @@ class Emitter:
         """
         stitch_on = self._cfg.stitch.enabled
         block.update({
-            "session_split": bool(getattr(item, "session_split", False)),
+            "capacity": self._capacity_block(item),
             "repaired": bool(getattr(item, "stream_repaired", False)),
             "degraded": getattr(item, "segment_degraded", None),
         })
@@ -648,6 +650,34 @@ class Emitter:
                                   if fragments is not None else None)
         block["steps"] = (None if item.transitions is None
                           else [_step_row(t, stitch_on) for t in item.transitions])
+
+    def _capacity_block(self, item: PipelineItem) -> dict | None:
+        """装配容量封闭与半开位置边界；自然序列输出 null。
+
+        @param item 当前序列信封。
+        @return 只含结构定位的容量元数据。
+        """
+        capacity = item.capacity
+        if capacity is None:
+            return None
+        bounds = capacity.bounds
+        if not capacity.sealed and bounds.before is None and bounds.after is None:
+            return None
+        return {"sealed": capacity.sealed, "allowed_positions": [bounds.lower, bounds.upper],
+                "before": self._capacity_cut(bounds.before), "after": self._capacity_cut(bounds.after),
+                "root_id": capacity.root_id, "parent_id": capacity.parent_id}
+
+    @staticmethod
+    def _capacity_cut(cut: CapacityCut | None) -> dict | None:
+        """把人工切口转换为有序输出字段。
+
+        @param cut 切口；自然边界为空。
+        @return 容量发生位置、阶段、剖面与检测阶段。
+        """
+        if cut is None:
+            return None
+        return {"left_position": cut.left_position, "right_position": cut.right_position,
+                "stage": cut.stage, "profile": cut.profile, "phase": cut.phase}
 
     def _members_block(self, item: PipelineItem) -> list[dict]:
         """v1.12（spec §3.6）：members 条目——逐成员按 rec.members 序，字段序冻结为
@@ -659,17 +689,18 @@ class Emitter:
         rows: list[dict] = []
         for index, member in enumerate(item.record.members):
             row: dict = {"index": index, "id": member.id}
+            key = member_key(item, index)
             if classify_on:
-                cls = (item.member_classifications or {}).get(member.id)
+                cls = (item.member_classifications or {}).get(key)
                 row["label"] = cls.label if cls is not None else None
             if annotate_on:
                 row["annotation"], row["status"] = self._member_annotation(
-                    item, member.id)
+                    item, key)
             rows.append(row)
         return rows
 
     def _member_annotation(self, item: PipelineItem,
-                           member_id: str) -> tuple[dict | None, str]:
+                           member_id: int | str) -> tuple[dict | None, str]:
         """v1.12（spec §3.6）：status 闭集三值判定 + 写前校验兜底。dict 为 None 或
         缺键 ⇒ (null, "skipped")；值 None ⇒ (null, "failed")；对象 ⇒ 写前
         validate_only(obj, schema=帧 Schema)——通过 ⇒ (对象, "annotated")，不通过 ⇒

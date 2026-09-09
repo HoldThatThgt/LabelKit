@@ -6,7 +6,7 @@
 
 | 输出面 | 形态与开关 | 内容 | 消费方 |
 |---|---|---|---|
-| ① 运行日志 | stderr，恒开。级别 debug/info/warn/error（`tool.log_level` / `--log-level`）；行格式 `tool.log_format = "text"`（默认）\| `"jsonl"`（7.3）。 | 仅运维事件：生命周期、警告、错误、LLM 调用摘要（debug 级）；v1.11 增启动期上下文预算参数 INFO 行（如 `segment: w_min=6 window=20 (budget)`——数据无关、仅计数与参数，M10 启动段属主，V13①，3.10.3）。绝不含数据内容与提示词。 | 人工排障；日志采集系统。 |
+| ① 运行日志 | stderr，恒开。级别 debug/info/warn/error（`tool.log_level` / `--log-level`）；行格式 `tool.log_format = "text"`（默认）\| `"jsonl"`（7.3）。 | 仅运维事件：生命周期、警告、错误、LLM 调用摘要（debug 级）；v1.11 增启动期上下文预算参数 INFO 行（如 `segment: minimum_frames=2 window=20 (budget)`——数据无关、仅计数与参数，M10 启动段属主，V13①，3.10.3）。绝不含数据内容与提示词。 | 人工排障；日志采集系统。 |
 | ② trace 追踪日志 | JSONL 文件，默认 `{output_stem}.trace.jsonl`（`trace.path`）；默认关（`trace.enabled = false`）。文件在**首个事件写出时**才打开/截断（v1.5）：死于配置或输入校验的运行不会碰上一次的 trace；dry-run 写 `{name}.dryrun{suffix}` 独立文件。 | 结构化事件流，一行一事件（7.2）；按 `trace.channels` 过滤通道，按 `trace.content` 控制内容量（7.4）。 | rubric 优化（7.5）；标注质量分析与审计；后续 `labelkit analyze`（8.3 O5）。 |
 | ③ 进度显示（v1.10 起称 console） | 三态 `console.mode = auto \| rich \| plain`（5.1 / CLI `--console`），恒开。rich = 双区内联实时面板；plain = v1.9 行为逐字节保留（`heartbeat_s=0` 默认下）；auto 按 TTY 等判定链选档（7.7）。 | 批进度、流水线段棋盘、各状态计数、LLM 用量/密钥池/熔断、瞬时成本累计（7.7 区块表）。 | 交互终端前的人。不属于日志（7.7）。 |
 
@@ -329,3 +329,5 @@ uv run --python 3.12 pytest tests/integration/test_sequence_generation_structure
 最终代码或配置变化后须重跑完整 offline、DeepSeek integration、structured output、主例、
 instruction-only、frame-only 与 replay。429、5xx 或额度耗尽是环境失败；slot exhaustion 是产品失败，
 不得靠重跑抹去。
+
+完整会话 trace 的所有阶段、Schema 和 LLM payload 通过 ContextVar 附带 session_id/session_attempt（上游为 0，下游从 1 起）。sequence.capacity 仅记录 split/seal/minimum_failure/recompute 及结构位置、阶段、剖面和检测阶段。capacity.* 与 dedup.embedding_failures 是取消和重算仍保留的观测事实，budget.overflow_records 在流模式属于最终记录计数。正文、图片、树与用户标注不进入容量事件或报告。

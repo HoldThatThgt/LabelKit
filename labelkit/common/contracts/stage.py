@@ -3,7 +3,9 @@ from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, TypeVar
+
+from labelkit.common.contracts.execution import TaskGroupRequest
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import ResolvedConfig
@@ -12,14 +14,17 @@ if TYPE_CHECKING:
     from labelkit.common.inference.schema_engine import SchemaEngine
     from labelkit.common.observability.obslog import MetricsSink
     from labelkit.common.contracts.types import PipelineItem
+    from labelkit.common.contracts.sequence_capacity import SessionAttemptScope, SequenceCapacityChecker
+
+T = TypeVar("T")
 
 
 @dataclass
 class RunContext:
     """交给每次 stage.run() 调用的上下文。
 
-    由 ProcessWorkflow 构造，**每（批次, 阶段）调用一个**——因为 rng 与 task_namespace
-    都按批次与阶段派生。TaskExecutor 身份在同一 execution domain 的所有上下文中保持一致；
+    普通记录每个批次与阶段构造一个；普通流按会话、尝试与阶段构造，计算分组不改变语义状态。
+    TaskExecutor 身份在同一 execution domain 的所有上下文中保持一致；
     run_id / run_started_at 继续经 MetricsSink / Emitter / RunServices 传递。
     """
     cfg: ResolvedConfig           # 本次运行的不可变解析配置（M1 产物）
@@ -30,6 +35,27 @@ class RunContext:
     metrics: MetricsSink          # M12 计数器与 trace 事件汇；阶段一切埋点经此发出
     tasks: TaskExecutor           # Application 所有的唯一 execution-domain TaskExecutor
     task_namespace: str           # run、批次与阶段派生的不含数据任务身份前缀
+    session_attempt: SessionAttemptScope | None = None
+                                  # 普通流会话和尝试归属；普通记录和生成路径为空
+    capacity_checker: SequenceCapacityChecker | None = None
+                                  # 编排组合的完整已知请求预览，不新增资源执行器
+
+    async def run_group(self, request: TaskGroupRequest[T]) -> tuple[T, ...]:
+        """将固定判决轮按计算上限派发并保持完整声明序。
+
+        @param request 当前判决轮已经冻结的全部叶任务。
+        @return 全部计算分组的输入序结果，归并只在调用方一次执行。
+        """
+        if not request.tasks:
+            return ()
+        if self.session_attempt is None:
+            return await self.tasks.run_group(request)
+        results: list[T] = []
+        size = self.cfg.run.batch_size
+        for start in range(0, len(request.tasks), size):
+            group = TaskGroupRequest(request.tasks[start:start + size])
+            results.extend(await self.tasks.run_group(group))
+        return tuple(results)
 
 
 class Stage(Protocol):
@@ -63,9 +89,11 @@ class Stage(Protocol):
            幸存。不追加、不删除、不重排、不替换任何元素对象；返回值仍须是传入的同一
            列表对象；
            ③ generate 例外——返回新增子批（原批元素不修改）；④ 单条失败不得抛出到批层面，
-           必须落入 item.errors 并置 status='failed'。
+           必须落入 item.errors 并置 status='failed'。普通流会话容量控制是明确例外：
+           尚未提交的 ContextOverflowError 以 SessionCapacityError 交给会话编排重算，
+           不提前写正式失败计数；已确立的最小终态仍按对应阶段执行门投影。
 
-        @param batch 本批信封列表（唯一可变载体，生命周期 = 一个批次）
+        @param batch 本批或当前完整会话尝试的信封列表
         @param ctx 本次（批次, 阶段）调用的运行上下文
         @return 传入的同一列表对象（调用方依赖列表身份）
         """

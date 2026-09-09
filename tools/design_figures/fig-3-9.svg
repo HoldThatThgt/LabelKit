@@ -1,0 +1,80 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 680"
+     font-family="PingFang SC, Microsoft YaHei, sans-serif" role="img" aria-labelledby="session-capacity-title">
+  <title id="session-capacity-title">完整输入会话的容量重算与正式提交</title>
+  <desc>完整会话只分段和缝合一次，冻结成员分配。每个下游尝试创建新信封和去重增量。
+    新容量错误可沿完整成员边界拆分并更新分区，或登记所属阶段的最小请求失败；
+    重建下游直至无新容量错误，再校验守恒、提交去重和计数、写出结果。</desc>
+  <defs>
+    <marker id="session-capacity-arrow" viewBox="0 0 10 10" refX="9" refY="5"
+            markerWidth="7" markerHeight="7" orient="auto">
+      <path d="M 0 0 L 10 5 L 0 10 z" fill="#526477"/>
+    </marker>
+  </defs>
+  <g fill="none" stroke="#526477" stroke-width="2" marker-end="url(#session-capacity-arrow)">
+    <path d="M 330 88 H 407"/>
+    <path d="M 670 88 H 747"/>
+    <path d="M 880 135 V 187"/>
+    <path d="M 750 237 H 683"/>
+    <path d="M 515 285 V 327"/>
+    <path d="M 400 385 H 318"/>
+    <path d="M 630 385 H 747"/>
+    <path d="M 515 440 V 502"/>
+    <path d="M 880 340 V 288"/>
+    <path d="M 660 552 H 1040 V 20 H 880 V 37"/>
+  </g>
+  <g text-anchor="middle" fill="#26384b">
+    <g fill="#edf3fa" stroke="#526477">
+      <rect x="70" y="40" width="260" height="95" rx="9"/>
+      <rect x="410" y="40" width="260" height="95" rx="9"/>
+      <rect x="750" y="40" width="260" height="95" rx="9"/>
+      <rect x="750" y="190" width="260" height="95" rx="9"/>
+      <rect x="350" y="190" width="330" height="95" rx="9"/>
+    </g>
+    <polygon points="515,330 630,385 515,440 400,385" fill="#fff7e8" stroke="#a87b2d"/>
+    <rect x="40" y="335" width="275" height="110" rx="9" fill="#edf8f2" stroke="#39825e"/>
+    <rect x="750" y="340" width="260" height="95" rx="9" fill="#fff1f2" stroke="#b04a4a"/>
+    <rect x="370" y="505" width="290" height="95" rx="9" fill="#fff7e8" stroke="#a87b2d"/>
+    <g font-size="20" font-weight="600">
+      <text x="200" y="72">完整输入会话</text>
+      <text x="540" y="72">分段与缝合一次</text>
+      <text x="880" y="72">冻结成员分配</text>
+      <text x="880" y="222">创建新的下游尝试</text>
+      <text x="515" y="222">运行完整会话下游</text>
+      <text x="177" y="369">正式提交</text>
+      <text x="880" y="372">登记最小请求失败</text>
+      <text x="515" y="537">拆分并封闭序列</text>
+    </g>
+    <g font-size="14" fill="#526477">
+      <text x="200" y="99">固定输入文件 / 已有会话边界</text>
+      <text x="200" y="121">batch_size 只限制计算分组</text>
+      <text x="540" y="99">会话结束后完成最终复评</text>
+      <text x="540" y="121">容量封闭的序列不再合并</text>
+      <text x="880" y="99">明确出现位置 / 序列分区</text>
+      <text x="880" y="121">上游不随容量重算</text>
+      <text x="880" y="249">新信封 / 会话去重增量</text>
+      <text x="880" y="273">共享不可变原始证据</text>
+      <text x="515" y="249">去重 · 分类 · 抽取 · 会话质量池</text>
+      <text x="515" y="273">标注 · 验证；保留全部完整证据</text>
+      <text x="177" y="398">校验守恒 · 提交去重与计数</text>
+      <text x="177" y="425">按既有输出规则写出</text>
+      <text x="880" y="399">固定 / 帧 / 相邻对 / 单成员</text>
+      <text x="880" y="423">保留原错误及所属阶段</text>
+      <text x="515" y="564">在完整成员中点形成非空子段</text>
+      <text x="515" y="588">保留后段；禁止后续再缝合</text>
+    </g>
+    <g font-size="16" font-weight="600">
+      <text x="515" y="379">本轮下游结果</text>
+      <text x="515" y="402">是否有新容量错误</text>
+    </g>
+    <g font-size="13" fill="#526477">
+      <text x="357" y="369">无新容量错误</text>
+      <text x="690" y="369">最小请求不可缩</text>
+      <text x="550" y="480">可缩短</text>
+      <text x="961" y="307">下一尝试按阶段终态化</text>
+      <text x="961" y="325">已知失败不重发</text>
+      <text x="850" y="538">新增切点后更新分区</text>
+    </g>
+    <rect x="40" y="629" width="970" height="36" rx="7" fill="#f1f5f9"/>
+    <text x="525" y="653" font-size="15">仅最终尝试提交业务状态；usage、错误、重试和 trace 保留全部真实尝试。</text>
+  </g>
+</svg>

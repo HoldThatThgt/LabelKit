@@ -30,7 +30,7 @@ schema_version = 1
 input = "./data"
 output = "./out/stream-labels.jsonl"
 modality = "ui"
-batch_size = 64                   # 53 帧 5 会话整会话装箱进一批
+batch_size = 64                   # 每个计算组最多 64 个叶任务，完整会话独立提交
 seed = 42
 
 [stream]
@@ -56,7 +56,7 @@ repass = true                     # 有界二遍复评修正一遍贪心漏缝
 enabled = true                    # 判重单元 = 线索（重绑后成员配方拼接，spec 3.3.3）
 
 [classify]
-enabled = true                    # 序列记录照常分类：episode 摘要 + 首帧截图入提示词
+enabled = true                    # 序列分类使用全部成员的完整树与图片
 llm = "default"
 assignment = "single"
 fallback_class = "other"
@@ -112,7 +112,7 @@ enabled = true
 llm = "judge"
 policy = "repair"                 # 缺陷表路由：成员手术 + 重摘取 + 重标注
 max_repair_rounds = 1
-extra_criteria = "补充审核约定：动作序列恒为 成员帧数−1 步（每相邻帧对摘取一步，线索接缝为机械占位步），步数比成员帧数少一是构造使然，不构成 missing_members / missing_tail 的证据；标注摘要允许概括中间成员帧的可见内容（审核证据仅含首末帧截图），除非与所给证据直接矛盾，不因此判 label_mismatch"
+extra_criteria = "补充审核约定：动作序列恒为 成员帧数−1 步（每相邻帧对摘取一步，线索接缝为机械占位步），步数比成员帧数少一是构造使然，不构成 missing_members / missing_tail 的证据；标注摘要允许概括成员帧的完整树与图片证据，除非与证据矛盾，不因概括措辞判 label_mismatch"
 
 [trace]
 enabled = true

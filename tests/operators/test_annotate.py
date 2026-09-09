@@ -8,6 +8,8 @@ through the single/self-consistency/repair paths and the stage layer, and the
 single-record default-kwarg regression anchor."""
 from __future__ import annotations
 
+from labelkit.common.contracts.stage import RunContext
+
 import asyncio
 import asyncio as _asyncio
 import json
@@ -23,7 +25,6 @@ from labelkit.common.contracts.execution import TaskGroupRequest
 from labelkit.operators.annotate import (
     AnnotateStage,
     RepairContext,
-    _keyframe_indexes,
     _majority_vote,
     _member_digest_lines,
     _voted_keys,
@@ -139,13 +140,14 @@ class _InlineTasks:
 def _test_ctx(**values):
     values.setdefault("tasks", _InlineTasks())
     values.setdefault("task_namespace", "test:run:batch:1:stage:annotate")
-    return SimpleNamespace(**values)
+    values.setdefault("llm", None)
+    values.setdefault("rng", None)
+    return RunContext(**values)
 
 
 def make_cfg(*, modality="text", instruction="你是意图标注员。", examples=(),
              self_consistency=0, ui_tree_max_chars=30000,
-             user_schema=USER_SCHEMA, trace=None,
-             sequence_frames=20) -> ResolvedConfig:
+             user_schema=USER_SCHEMA, trace=None) -> ResolvedConfig:
     return ResolvedConfig(
         tool=ToolConfig(),
         console=ConsoleConfig(),
@@ -163,8 +165,7 @@ def make_cfg(*, modality="text", instruction="你是意图标注员。", example
         generate=GenerateConfig(),
         annotate=AnnotateConfig(enabled=True, llm="default", instruction=instruction,
                                 examples=tuple(examples),
-                                self_consistency=self_consistency,
-                                sequence_frames=sequence_frames),
+                                self_consistency=self_consistency),
         verify=VerifyConfig(),
         output=OutputConfig(schema_inline=json.dumps(user_schema)),
         trace=trace or TraceConfig(),
@@ -728,183 +729,9 @@ def digest_section(record: Record) -> str:
 
 # ── S28 keyframe downsample formula ──────────────────────────────────────────
 
-def test_keyframe_downsample_formula_n25_k20():
-    assert _keyframe_indexes(25, 20) == [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13,
-                                         15, 16, 17, 18, 20, 21, 22, 24]
-
-
-def test_keyframe_downsample_keeps_all_when_n_le_k():
-    assert _keyframe_indexes(3, 20) == [0, 1, 2]
-    assert _keyframe_indexes(20, 20) == list(range(20))
-    assert _keyframe_indexes(1, 2) == [0]
-
-
-def test_keyframe_downsample_endpoints_monotonic_no_rng():
-    for n, k in ((100, 20), (21, 20), (50, 3), (2, 2), (101, 7), (1000, 100)):
-        idx = _keyframe_indexes(n, k)
-        assert idx[0] == 0                       # first ALWAYS kept
-        assert idx[-1] == n - 1                  # last ALWAYS kept
-        assert idx == sorted(set(idx))           # strictly increasing, no duplicates
-        assert len(idx) == min(n, k)
-
-
 # ── v1.9 (T14): per-fragment keyframe quota ─────────────────────────────────
 
-def test_keyframe_quota_every_fragment_keeps_at_least_one():
-    """The minor-8 counterexample: a small fragment that the uniform formula
-    drains whole must keep ≥ 1 keyframe under the quota path."""
-    # fragments 20 + 2 + 3 = 25 members, k = 4: uniform picks [0, 8, 16, 24]
-    # — nothing from the 2-member middle fragment
-    uniform = _keyframe_indexes(25, 4)
-    assert not any(20 <= i < 22 for i in uniform)
-    quota = _keyframe_indexes(25, 4, (20, 2, 3))
-    assert len(quota) == 4
-    assert any(20 <= i < 22 for i in quota)      # middle fragment survives
-    assert quota[0] == 0 and quota[-1] == 24     # global first/last invariant
-    assert quota == sorted(set(quota))
-
-
-def test_keyframe_quota_largest_remainder_distribution():
-    # n=10, k=5, fragments (6, 2, 2): surplus 2 over weights (5, 1, 1) →
-    # base [1, 0, 0] + leftover 1 by largest remainder (3/7 vs 2/7) → frag 1
-    idx = _keyframe_indexes(10, 5, (6, 2, 2))
-    assert len(idx) == 5
-    assert idx[0] == 0 and idx[-1] == 9
-    per_fragment = [sum(1 for i in idx if lo <= i < hi)
-                    for lo, hi in ((0, 6), (6, 8), (8, 10))]
-    assert per_fragment == [3, 1, 1]             # every fragment ≥ 1
-    # quota-1 middle fragment keeps its FIRST member; last fragment keeps LAST
-    assert 6 in idx and 9 in idx
-
-
-def test_keyframe_quota_degrades_to_uniform_when_infeasible_or_absent():
-    uniform = _keyframe_indexes(25, 4)
-    assert _keyframe_indexes(25, 4, None) == uniform
-    assert _keyframe_indexes(25, 4, (25,)) == uniform          # single fragment
-    assert _keyframe_indexes(25, 4, (10, 10)) == uniform       # sum mismatch
-    assert _keyframe_indexes(25, 4, (5,) * 5) == uniform       # k < m infeasible
-    # n <= k keeps everything regardless of fragments
-    assert _keyframe_indexes(4, 20, (2, 2)) == [0, 1, 2, 3]
-
-
-def test_keyframe_quota_invariants_across_shapes():
-    for n, k, lens in ((25, 20, (20, 2, 3)), (30, 5, (1, 1, 27, 1)),
-                       (12, 6, (4, 4, 4)), (9, 3, (3, 3, 3)),
-                       (40, 7, (35, 2, 3))):
-        idx = _keyframe_indexes(n, k, lens)
-        assert len(idx) == k
-        assert idx[0] == 0 and idx[-1] == n - 1
-        assert idx == sorted(set(idx))
-        bounds, start = [], 0
-        for length in lens:
-            bounds.append((start, start + length))
-            start += length
-        assert all(any(lo <= i < hi for i in idx) for lo, hi in bounds)
-
-
 # ── sequence template: ①②③ order + text-final invariant (S6) ────────────────
-
-def test_sequence_template_three_sections_in_order():
-    cfg = make_cfg(modality="ui")
-    ep = ui_episode(3)
-    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
-                                   AnnotatePromptOptions(transitions=SEQ_TRANSITIONS))
-    parts = bundle.messages[-1].parts
-
-    assert [p.kind for p in parts] == [
-        "text", "text", "image", "text", "image", "text", "image", "text"]
-    assert parts[0].text == ACTION_SECTION                     # ①
-    assert "摘取兜底" not in parts[0].text
-    assert parts[1].text == "[关键帧 1/3·成员 1]"               # ② labels: 1-based i/k, m
-    assert parts[3].text == "[关键帧 2/3·成员 2]"
-    assert parts[5].text == "[关键帧 3/3·成员 3]"
-    assert parts[2].image is ep.members[0].image
-    assert parts[4].image is ep.members[1].image
-    assert parts[6].image is ep.members[2].image
-    assert parts[-1].kind == "text"                            # ③ ALWAYS-text final part
-    assert parts[-1].text == digest_section(ep)
-
-
-def test_sequence_template_transitions_none_omits_action_section():
-    cfg = make_cfg(modality="ui")
-    ep = ui_episode(2)
-    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT)       # transitions omitted
-    parts = bundle.messages[-1].parts
-    assert [p.kind for p in parts] == ["text", "image", "text", "image", "text"]
-    assert "[动作序列]" not in "".join(p.text or "" for p in parts)
-    assert parts[0].text == "[关键帧 1/2·成员 1]"
-    assert parts[-1].kind == "text"                            # still closes with ③
-    assert parts[-1].text == digest_section(ep)
-
-
-def test_sequence_template_downsamples_25_members_to_20_keyframes():
-    cfg = make_cfg(modality="ui")                              # sequence_frames default 20
-    ep = ui_episode(25)
-    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
-                                   AnnotatePromptOptions(transitions=SEQ_TRANSITIONS))
-    parts = bundle.messages[-1].parts
-
-    images = [p for p in parts if p.kind == "image"]
-    assert len(images) == 20
-    kept = [0, 1, 2, 3, 5, 6, 7, 8, 10, 11, 12, 13, 15, 16, 17, 18, 20, 21, 22, 24]
-    assert [p.image for p in images] == [ep.members[m].image for m in kept]
-    labels = [p.text for p in parts[1:-1] if p.kind == "text"]
-    assert labels == [f"[关键帧 {i}/20·成员 {m + 1}]"
-                      for i, m in enumerate(kept, start=1)]
-    assert parts[-1].kind == "text"
-    # ③ still digests EVERY member, not just the kept keyframes
-    assert parts[-1].text == digest_section(ep)
-
-
-def test_sequence_template_fragment_lens_selects_quota_keyframes():
-    """v1.9 (T14, third additive trailing kwarg): fragment_lens switches the ②
-    keyframe selection to per-fragment quotas; None keeps the v1.8 uniform
-    downsample byte-identical."""
-    cfg = make_cfg(modality="ui", sequence_frames=4)
-    ep = ui_episode(25)
-    quota = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
-                                  AnnotatePromptOptions(
-                                      transitions=SEQ_TRANSITIONS,
-                                      fragment_lens=(20, 2, 3)))
-    kept = _keyframe_indexes(25, 4, (20, 2, 3))
-    images = [p for p in quota.messages[-1].parts if p.kind == "image"]
-    assert [p.image for p in images] == [ep.members[m].image for m in kept]
-    assert any(20 <= m < 22 for m in kept)                 # small fragment kept
-    plain = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
-                                  AnnotatePromptOptions(transitions=SEQ_TRANSITIONS))
-    uniform = _keyframe_indexes(25, 4)
-    images_plain = [p for p in plain.messages[-1].parts if p.kind == "image"]
-    assert [p.image for p in images_plain] == [ep.members[m].image
-                                               for m in uniform]
-
-
-def test_stage_threads_fragment_lens_from_stitch_duck_mark():
-    """v1.9 (T14 穿参义务, M5 main call site): the stage derives fragment_lens
-    from the stitch_fragments duck mark and threads it into the prompt — the
-    quota keyframe set reaches the request."""
-    import asyncio
-    from labelkit.common.contracts.types import PipelineItem
-
-    cfg = make_cfg(modality="ui", sequence_frames=4)
-    ep = ui_episode(25)
-    item = PipelineItem(record=ep)
-    item.stitch_fragments = (
-        {"order_span": [0, 19], "member_count": 20, "cause": "origin",
-         "source_episode": ep.id},
-        {"order_span": [25, 26], "member_count": 2, "cause": "resumed",
-         "source_episode": "f" * 16},
-        {"order_span": [30, 32], "member_count": 3, "cause": "rescued",
-         "source_episode": None},
-    )
-    engine, metrics = _CapturingEngine(), _CapturingMetrics()
-    ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=metrics, batch_no=1)
-    asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
-    assert item.annotation is not None
-    prompt = engine.prompts[0]
-    images = [p for p in prompt.messages[-1].parts if p.kind == "image"]
-    kept = _keyframe_indexes(25, 4, (20, 2, 3))
-    assert [p.image for p in images] == [ep.members[m].image for m in kept]
-
 
 def test_text_sequence_degrades_to_steps_plus_digest():
     cfg = make_cfg()
@@ -937,24 +764,6 @@ def test_member_digest_lines_bounded_first_last_kept():
 
 
 # ── repair suffix on the sequence branch (S6: never swallows the last image) ─
-
-def test_sequence_repair_suffix_lands_on_digest_part_keeps_images():
-    cfg = make_cfg(modality="ui")
-    ep = ui_episode(3)
-    repair = RepairContext(previous_output={"a": 1}, critiques_text="x: y")
-    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
-                                   AnnotatePromptOptions(
-                                       repair=repair,
-                                       transitions=SEQ_TRANSITIONS))
-    parts = bundle.messages[-1].parts
-    # every keyframe image survives; the suffix concatenates onto the ③ text part
-    assert [p.kind for p in parts] == [
-        "text", "text", "image", "text", "image", "text", "image", "text"]
-    assert parts[-2].kind == "image"
-    assert parts[-1].text == (digest_section(ep)
-                              + '\n[上一版标注] {"a": 1}\n[审核意见] x: y\n请修正后重新输出')
-    assert "None" not in parts[-1].text
-
 
 # ── transitions kwarg threading (S5) ─────────────────────────────────────────
 
@@ -1101,20 +910,6 @@ def _images(prompt) -> list:
     return [p.image for p in prompt.messages[-1].parts if p.kind == "image"]
 
 
-def test_build_prompt_k_eff_caps_below_config_first_last_kept():
-    cfg = make_cfg(modality="ui", sequence_frames=20)
-    ep = ui_episode(25)
-    bundle = build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
-                                   AnnotatePromptOptions(k_eff=6))
-    kept = _keyframe_indexes(25, 6)
-    assert [p for p in _images(bundle)] == [ep.members[m].image for m in kept]
-    assert kept[0] == 0 and kept[-1] == 24         # first/last invariant
-    # min with the config value: k_eff above the config cap is inert
-    assert build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
-                                 AnnotatePromptOptions(k_eff=99)) == (
-        build_annotate_prompt(ep, cfg, SCHEMA_TEXT))
-
-
 def test_build_prompt_image_px_rides_bundle():
     cfg = make_cfg(modality="ui")
     ep = ui_episode(3)
@@ -1132,50 +927,7 @@ def test_build_prompt_none_none_byte_identical():
         AnnotatePromptOptions(transitions=SEQ_TRANSITIONS)) == \
         build_annotate_prompt(ep, cfg, SCHEMA_TEXT,
                               AnnotatePromptOptions(transitions=SEQ_TRANSITIONS,
-                                                    k_eff=None, image_px=None))
-
-
-def test_budget_k_eff_layer_images_eat_remainder():
-    # §3.3⑥③: images eat what the counted static+text side leaves —
-    # k_eff = min(cap, max(2, ⌊remaining/cost⌋)), first/last always kept.
-    cfg = budget_cfg(4096, modality="ui", sequence_frames=20)
-    ep = ui_episode(25)
-    engine = _PromptEngine()
-    ctx = budget_ctx(cfg, engine, image_cost=300)
-    ann = _asyncio.run(annotate_record(ep, ctx))
-    assert ann is not None
-    (prompt,) = engine.prompts
-    images = _images(prompt)
-    assert 2 <= len(images) < 20                   # shrunk below the config cap
-    assert images[0] is ep.members[0].image        # first member kept
-    assert images[-1] is ep.members[24].image      # last member kept
-    prof = cfg.llm_profiles["default"]
-    est = budget_mod.est_prompt(prompt, prof, None, image_cost=300)
-    assert est <= budget_mod.input_budget(prof)    # throat invariant honoured
-
-    # determinism: identical re-run → identical prompt and k
-    engine2 = _PromptEngine()
-    _asyncio.run(annotate_record(ui_episode(25), budget_ctx(cfg, engine2,
-                                                            image_cost=300)))
-    assert engine2.prompts[0] == prompt
-
-
-def test_budget_k_floor_then_text_blocks_trim():
-    # §3.3⑥④: at the k=2 floor the text blocks trim (edges) — digests are the
-    # last to yield; the assembled prompt then fits.
-    cfg = budget_cfg(2000, modality="ui", sequence_frames=20)
-    ep = ui_episode(25)
-    engine = _PromptEngine()
-    ctx = budget_ctx(cfg, engine, image_cost=500)
-    _asyncio.run(annotate_record(ep, ctx))
-    (prompt,) = engine.prompts
-    assert len(_images(prompt)) == 2               # keyframe floor
-    digest_part = prompt.messages[-1].parts[-1].text
-    assert "…(truncated " in digest_part           # §3.3⑤ edges marker in place
-    assert ctx.metrics.counters["budget.truncations.annotate"] >= 1
-    prof = cfg.llm_profiles["default"]
-    assert budget_mod.est_prompt(prompt, prof, None, image_cost=500) <= \
-        budget_mod.input_budget(prof)
+                                                    image_px=None))
 
 
 def test_budget_minimal_unit_unfittable_fails_record():
@@ -1188,38 +940,6 @@ def test_budget_minimal_unit_unfittable_fails_record():
     ctx = budget_ctx(cfg, engine)
     _asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
     assert engine.prompts == []                    # doomed request never sent
-    assert item.status == "failed"
-    assert item.errors[0].kind == "context_overflow"
-    assert ctx.metrics.counters["budget.overflow_records"] == 1
-
-
-def test_v20_reactive_degrade_halves_keyframes():
-    cfg = budget_cfg(8192, modality="ui", sequence_frames=8)
-    ep = ui_episode(25)
-    engine = _PromptEngine(n_overflows=1)
-    ctx = budget_ctx(cfg, engine, image_cost=100)
-    _asyncio.run(annotate_record(ep, ctx))
-    assert len(engine.prompts) == 2
-    k1 = len(_images(engine.prompts[0]))
-    k2 = len(_images(engine.prompts[1]))
-    assert k1 == 8                                 # roomy budget: config cap
-    assert k2 == max(2, -(-k1 // 2))               # V20: k → max(2, ⌈k/2⌉)
-    assert ctx.metrics.counters["budget.degrade_retries"] == 1
-    assert ctx.metrics.fed == []                   # successful degrade: no feed
-
-
-def test_v20_degrades_bounded_then_terminal_feeds_once():
-    cfg = budget_cfg(8192, modality="ui", sequence_frames=8)
-    ep = ui_episode(25)
-    engine = _PromptEngine(n_overflows=99)         # never recovers
-    ctx = budget_ctx(cfg, engine, image_cost=100)
-    from labelkit.common.contracts.types import PipelineItem
-    item = PipelineItem(record=ep)
-    _asyncio.run(AnnotateStage(cfg)._annotate_item(item, ctx))
-    assert len(engine.prompts) == 3                # initial + 2 bounded degrades
-    assert [len(_images(p)) for p in engine.prompts] == [8, 4, 2]
-    assert ctx.metrics.counters["budget.degrade_retries"] == 2
-    assert ctx.metrics.fed == [True]               # A7: reactive-400 fed ONCE
     assert item.status == "failed"
     assert item.errors[0].kind == "context_overflow"
     assert ctx.metrics.counters["budget.overflow_records"] == 1

@@ -49,11 +49,10 @@ UI 树序列化格式（`UITree.serialize()`，4.3 节）：深度缩进的每�
 | `temperature` | 采样温度；None = profile 默认（M5 内部设定，调用方置值忽略） | v1.1 |
 | `label` | classification 标签；有 inherited 标签时同样选定按类标注 Schema | v1.7 |
 | `transitions` | `[动作序列]` 步骤源；None = 整段省略 | v1.8 |
-| `fragment_lens` | 逐碎片成员数（按碎片配额降采样）；None = 全局均匀降采样 | v1.9 |
-| `k_eff` | 生效关键帧上限（V20 折半 / V21 修复梯） | v1.11 |
-| `image_px` | 升档后的图像采样边长 | v1.11 |
+| `image_px` | 普通单记录图像工作点；process stream 忽略此参数并保持冻结 profile 表示 | v1.11 |
+| `temporal_context` | generate-only sequence 的冻结业务时间上下文 | v1.20 |
 
-缺省实例即引入这些取值之前的全局无变体装配（逐字节等价）；换档一律以 `dataclasses.replace(opts, …)` 产出新对象。字段名与语义与逐次引入时完全一致——变的只是承载形式，v1.7–v1.11 的「追加式末位 kwarg」叙事就此退场。
+默认实例使用全局首次标注；修复、类路由和时间上下文以 `dataclasses.replace(opts, …)` 构造明确的新值。
 
 **按类取值（v1.7）。**classify 启用且记录带类标签时，本节模板的 `{annotate.instruction}` 与 few-shot `examples` 取该类有效配置（`class_views[label].annotate`，3.1.4 按类覆盖合并行）——模板结构不变，仅取值来源变化。取值载体为 `opts.label`（None = 全局配置）；stage 层传 `item.classification.label if item.classification else None`。trace `annotate.done` 事件 payload 增 `label` 字段（仅 classify 启用时携带，7.2 只增不改）。
 
@@ -69,68 +68,62 @@ label 缺失或类表外未知类使用全局。完整 Schema 供最终验证与
 | 标注调用（首次 / 修复重标注） | 有后处理或时间绑定时使用完整/模型 Schema 的 finalized 接口，scope.user_treatment=True；其余沿用原显式 Schema 与全局推断路径 |
 | self-consistency 字段级投票 | 可投票字段取自类有效模型 Schema；返回已经完整验证的原候选 |
 | v1.11 预算装填的 schema 计价项 | 按类有效模型 Schema 及投影示例计价 |
-| M7 修复路径的重标注与 V21 试装 | 使用同一 label、模型 Schema 和移除代码/时间字段的 previous_output |
+| M7 修复路径的重标注与实际预算 | 使用同一 label、模型 Schema 和移除代码/时间字段的 previous_output |
 | M11 写前终检 | 按**该行**类标签取有效 Schema（3.11.2；multi 扇出的兄弟信封各带自己的标签，按行天然对齐） |
 
 未配置按类 Schema、后处理或时间绑定时，保持既有调用形和模型调用数量。
 
 **标注鲁棒性：self-consistency（可选，v1.2）。**`annotate.self_consistency = n`（默认 0 = 关；启用须 n ≥ 3 且为奇数，5.2）时，M5 对每条记录按本节模板独立采样 n 次（temperature 统一取 `annotate.sc_temperature`，默认 0.7——采样多样性的来源），每次输出都各自经 M8 走完整结构保证后才参与投票。**字段级投票**：enum / boolean / integer 字段逐字段取 n 个样本中的众数；自由文本 / 数组字段不逐字投票，取「与众数字段组合一致的样本」中第一个的对应字段值。其余类型字段（number、嵌套 object 等）与自由文本/数组同法处理（不逐字段投票，随众数字段组合整体取值）。全体分歧（众数组合不存在或无样本与其完全一致）时整体采用第一个样本，并计入 `report.annotate.sc_disagreements`。某次采样经 M8 修复仍失败（SchemaViolation）⇒ 该样本弃权、由其余合法样本投票（agreement_ratio 分母仍为 n）；n 次全部失败才置 `status="failed"`。`_meta.annotation.attempts` 记 n 次采样 attempts 之和。`_meta.annotation` 增 `sc = {n, agreement_ratio}`（agreement_ratio = 与最终众数字段组合完全一致的样本数 / n；6.3 只增字段）；trace `annotate.done` 事件 payload 增同构 `sc` 字段（7.2「只增不改」契约内扩展）。该机制对分类型 Schema 收益最大——如统一示例的 `intent` / `difficulty` 枚举字段：多路径采样 + 多数投票显著优于单次贪心解码（Self-Consistency，Wang et al., ICLR 2023 [33]，GSM9K +17.9%）。成本：标注调用与 token ×n。
 
-**序列标注模板（v1.8，S5/S6/S28）。**stream 模式下序列信封（`record.kind = "sequence"`，3.14）的「当前记录」user 消息改走序列变体——system 与 few-shot 消息不变，**段序与步骤行格式逐字冻结**（CONTRACTS §10.1 序列变体），单条 user 消息内 Part 恰按此序：
+**处理序列的完整标注。**`run.mode="process"` 且 `segment.enabled=true` 时，序列请求固定包含：
 
-```
-① text part:  [动作序列]                    ← item.transitions 为 None 时整段省略
-              {index}. {action_type}（对象: {target|—}；值: {value|—}）{description}
-                                             ← 每 Transition 一行，index 升序；
-                                               target/value 为 null 时渲染为字符「—」
-② 每保留关键帧（关键帧序数 i/k，成员序数 m——标签显式携带成员序数）:
-   text part:  [关键帧 {i}/{k}·成员 {m}]
-   image part: member.image                  （M9 调用时编码，3.9.2）
-③ text part:  [成员帧摘要]                  ← 恒在收尾段
-              {全体成员逐帧 frame_digest（4.3），每成员一行、按成员序，总量有界}
+```text
+system: 生效 instruction + 代码负责投影后的模型 Schema
+few-shot: 保持配置完整声明序
+user:
+  [动作序列] 全部已有 Transition 按 index 顺序渲染；None 时省略整个动作段
+  [序列成员]
+  逐成员完整正文；UI 成员逐个包含原工作点截图及完整可见 UITree.serialize(max_chars=None)
+  最后始终是 text Part；repair 后缀附在末尾
 ```
 
-**模板不变量（S6）：user 消息末 Part 恒为 ③ 恒在的 text 段**——M7 修复后缀（3.7.3）拼接在末 Part 的 text 之上，若消息以图收尾会静默产出 "None\n…" 并丢失末帧图；恒在收尾摘要段以零修复代码改动保证该不变量（repair 拼接路径不动）。
+`record_evidence` 与 `sequence_parts` 是所有实际成员内容的共同渲染面。全部步骤、图片、成员、指令、few-shot、
+模型 Schema、上一版标注及审核意见均进入实际预算；`input.ui_tree_max_chars` 不裁处理序列。
+图片仅在序列化实际调用时惰性编码，整次会话维持 profile 固定图片工作点和冻结图像成本。
+`AnnotatePromptOptions` 只含 repair、temperature、label、transitions、image_px、temporal_context；
+image_px 只用于普通记录的合法路径，处理序列不因修复轮而抽图或换档。不存在 sequence_frames、k_eff 或 fragment_lens 接口。
 
-**关键帧降采样（S28）：**成员数 n > `annotate.sequence_frames` = k 时确定性均匀降采样 `idx_i = ⌊i·(n−1)/(k−1)⌋, i = 0..k−1`——首末帧恒含、严格递增无重复、纯整数零 rng（种子豁免面不变，2.6）；n ≤ k 取全量。k ∈ [2, 100] 与 `> 20 ∧ max_image_px > 2000` 联动警告由 M1 校验（3.1.4、5.2）。
+**容量归属。**`AnnotateStage.preview_capacity(item,ctx)` 对全部可达类别和启用帧类，用真实 builder 检查完整模型请求；
+不发送模型、不执行后处理、不修改信封或指标。实际 precheck/reactive 原始 ContextOverflowError 在 SC 弃权、
+failed 或成员 None 投影之前交给当前 owning stage。完整序列可按完整成员边界拆分；仅固定指令/few-shot/Schema
+已超限则登记 fixed 最小终态。verify 的成员手术和 repair 后缀都以 expanded working item 为实际 target，owner 保持 verify；
+已知同 stage/profile/view/positions 最小终态在再次调用前投影，不重发相同请求。原错误的 phase/profile/origin 不变。
 
-**按碎片配额降采样（v1.9）：**stitch 启用且信封为多碎片线索（F ≥ 2 个碎片，3.16）时，上式升级为**按碎片配额**——全局均匀采样会把小碎片整段抽空（恢复段可能仅 2–3 帧，恰是缝合语义的关键证据），每碎片须至少保底 1 帧（T14）。确定性公式（纯整数零 rng；n_f = 碎片 f 的成员数，Σn_f = n > k ≥ F）：
+**ordinary 与 generation 的合法路径。**普通单记录仍使用 input.ui_tree_max_chars 和原 UI 树预算帽，指令、Schema、
+few-shot 与 repair 动态块只计不裁。generate-only sequence 仅支持文本，保留其既有有界步骤/成员文本预算和时间绑定；
+生成流程的 whole-set 原子尝试规则不变，不引入已删除的 UI 抽图路径。transitions 总是由 stage 传入当前值；
+verify 手术后重标注使用重建值。sequence 的 Record.raw 为 None，普通 record validator 的既有输入约定不变。
 
-```
-配额:   q_f = 1 + base_f + tip_f                      # 每碎片保底 1 帧，Σ q_f = k
-        base_f = ⌊(n_f − 1) · (k − F) / (n − F)⌋      # 剩余 k − F 个名额按 (n_f − 1) 加权
-                                                      #   （保底帧已计入，按剩余成员数分摊）
-        tip_f  ∈ {0, 1}: 余名额 (k−F) − Σ base_f 个，按余数 (n_f−1)·(k−F) mod (n−F)
-                 降序逐碎片 +1（平局取碎片序小者）——最大余数法
-碎片内: 以 q_f 对碎片成员局部套均匀公式（q_f ≥ 2 时碎片首末帧恒含；q_f = 1 取碎片首帧，
-        唯一例外：末碎片 q_F = 1 时取其末帧），选中下标映射回线索成员元组
-不变量: 全局首帧（经首碎片）与末帧（经末碎片）恒含；跨碎片严格递增无重复
-退化:   碎片划分缺席 / 单碎片 / 与成员数不一致、或 k < F（保底不可行）⇒ 静默回退
-        全局均匀公式（单碎片线索由此逐字节退化为 v1.8 行为——零变化回归锚）
-```
+**执行形态。**planner 对 ordinary 批或 process 完整会话按 item/sample 顺序冻结全部任务；ctx.run_group
+按 batch_size 分组执行，叶结果不得修改信封。完整波次结束后，归并器按 item/sample 声明序收齐同步计划异常与所有
+叶容量错误，以非空 `SessionCapacityError.failures` 一次交给控制器，再投票并写 annotation、status、errors 与计数。
+固定开销用同一 builder 的空成员、空 transitions（原存在时）计算，保留 user 包络、恒有段落标签、few-shot 与修复后缀。
+固定包络本身超限直接归 fixed，不增加 sequence 切点。处理流的记录和帧调用均设置 `CallScope.complete_evidence=true`，
+M8 结构修复保留完整原证据，并让原始容量错误上抛给本阶段。
+sequence reducer 完成后，帧 pass 对当前成员出现位置冻结叶任务；仅在当前尝试字典补缺位。处理会话同内容 ID 的
+不同位置分别调用并产出，不能按内容 first-wins。generation 帧产品维持唯一事件 ID 键。
+`annotate.enabled=false, frame.annotate.enabled=true` 时序列任务组为空，帧 pass 仍执行。
 
-**穿参义务（v1.9）：**碎片划分在信封 duck 标上而 `build_annotate_prompt` / `annotate_record` 只收 Record——载体是 `opts.fragment_lens`（= 线索各碎片的成员数，按碎片序；None = 全局均匀降采样）。stage 层自信封碎片跨度表取各碎片 member_count 传入；**M7 修复重标注调用同步穿参**（3.7.3——两处调用点一并穿参，否则修复重标丢配额、退回全局均匀采样）。
-
-**transitions 取值（S5）：**载体是 `opts.transitions`（CONTRACTS §7.4）。stage 层传 `item.transitions`；M7 修复路径在成员手术后传**重建值**（3.7.3）。self-consistency 与 L2.5 路径不动——序列记录的 L2.5 回调收到 `record = None`（`Record.raw` 对序列恒 None，4.1；文档声明的既有局限，富载荷形参列演进候选）。
-
-**上下文预算装填与修复升级换档（v1.11）。**标注 profile 声明 `context_window` 时按上下文预算装填单次标注调用（未声明 = 预算关闭，行为与 v1.10 一致；预算/估算/校准机制见 3.9）。**份额定序**（确定性，V9）：① 系统侧静态部件（instruction / 用户 Schema / few-shot）**不裁剪**——用户语义资产，由 M1 静态预检把关（3.1.4，V13③）；② 文本块（步骤行 + 成员摘要块；单记录 UI 树渲染同 3.13.4 的动态封顶语义）按其既有绝对上限渲染并计 est；③ 图片吃剩余：`k_eff = min(sequence_frames, max(2, ⌊剩余 / est_image⌋))`——**首末帧恒保留**、中间均匀下采样（本节降采样公式与按碎片配额语义不变，仅 k 收缩；图片单价读校准器，3.9）；④ k = 2 仍超预算 → 回头按「首末恒保留、丢中段」裁文本块直至装下；⑤ 仍不下 → 该记录记 `context_overflow` 入 rejects（V10，7.6）。**图片先于文本让步**：文本摘要是裁决兜底证据、token 效率高于像素。**溢出反应（V20）**：识别到 provider 上下文溢出 → 关键帧减半重试（k 减半，min 2；有界 ≤ 2 次降级），耗尽仍溢出按 V10 处置。**修复轮升级换档（V21）**：`verify.policy = "repair"` 的修复重标注按质量阶梯换档——关键帧数减半（k → max(2, ⌈k/2⌉)，首末恒保）+ 分辨率上探一档（`default_image_px` × 1.5ⁿ/维，≤ `max_image_px`），预算约束经校准估算复核后不变；阶梯参数经 `opts.k_eff` / `opts.image_px` 两字段传入（M7 以 `dataclasses.replace` 换档，F3）；单向有界——升级仅发生于修复路径、每记录 ≤ `verify.max_repair_rounds` 次（触发条件见 3.7.3）。**不可裁剪动态块（V25③）**：修复轮追加的 `[上一版标注] / [审核意见]` 尾注为语义资产——**计入 est、永不裁剪**；全部可裁份额耗尽仍超 → V10。逐裁剪点计入 `report.budget.truncations`（6.4）。
-
-**v1.19 执行形态。**普通 stage 先按批内 item ordinal 同步冻结 sequence sample 计划；TaskExecutor 返回
-冻结 sample outcome 后，reducer 才按 item/sample ordinal 投票并写 annotation、status、errors、events 与
-counters。帧 pass 必须等 sequence reducer 完成，再对稳定成员集合按首次出现的 member id 冻结叶任务；叶任务只
-返回成员 outcome，reducer 按 member ordinal 原位补写既有 member map。同 id 成员只计划一次，不能靠并发完成序
-争抢 first-wins。`annotate.enabled=false, frame.annotate.enabled=true` 时 sequence 任务组为空，帧 pass 仍执行。
-
-sequence attempt 复用同一 planner/leaf/reducer，但全部写入 AttemptTransaction 与 attempt-local Metrics capture；
-sequence samples 归并成功后才能启动 frame members。普通 ProviderFatal 转为既有记录/member 失败 outcome，不取消
-sibling；sequence ProviderFatal 原样逃逸。任何叶任务都不得写 PipelineItem、member map、events 或 counters，
-也不得嵌套调用 `run_group()`。
+生成 sequence attempt 的 dataset 写入受 AttemptTransaction 约束；处理流受会话尝试约束。两者失败尝试的
+Schema、usage、retry、trace 保留，帧/序列产品和 dataset 计数不泄漏到重算。会话和生成尝试内 ProviderFatal
+原样上抛；普通单记录维持局部错误隔离。叶任务不得嵌套 run_group。
 
 ### 3.5.3 API 与错误处理
 
 ```
 class AnnotateStage(Stage):
     name = "annotate"
+    def preview_capacity(self, item, ctx) -> SessionCapacityFailure | None: ...
     async def run(self, batch, ctx) -> list[PipelineItem]:
         """对每条 active 记录: prompt = build_prompt(rec); item.annotation = await ctx.schema_engine
            .complete_validated(profile, prompt, user_schema)  # M8 全责保证结构
@@ -210,42 +203,33 @@ item.annotation = Annotation(
  "description": "手机号+验证码登录页"}
 ```
 
-### 3.5.5 帧级逐帧标注（v1.12）
+### 3.5.5 帧级逐帧标注
 
-帧粒度标注面（`frame.annotate.enabled`，默认关，5.2）对序列信封的成员帧逐帧产出符合
-**帧级 Schema**（`cfg.frame_schema`，3.1.4 帧粒度配置行）的标注对象，产物写
-`item.member_annotations`（键 = 成员 `record.id`，4.1），随序列行落盘
-`_meta.stream.members[]`（3.11.2）。process/flat 流模式仍在序列级标注成功后追加 frame pass；
-v1.18 sequence attempt 在 `annotate.enabled=false` 时直接执行 frame pass，序列标注调用精确为零。
-序列级 `annotate_record` / `build_annotate_prompt` 的公开签名不变。
+`frame.annotate.enabled` 对完整成员逐帧产出符合有效帧 Schema 的 Annotation。process 的 member_annotations
+以全会话整数出现位置作键；generation 以唯一字符串事件 ID 作键。结果按实际 members 顺序写入 `_meta.stream.members`。
 
-**公开面（修复面族新成员，签名冻结）**：
-
-```
-async def annotate_member(member: Record, ctx: RunContext,
-                          label: str | None = None) -> Annotation | None:
-    """对单个成员 Record 做一次帧级标注。M7 verify 回收成员补跑经懒加载直调本面，
-       与 annotate_record / segment.judge_window / extract.extract_transition 同列
-       （算子间导入白名单第四向，3.7.3）。label 非 None ⇒ 指令/few-shot 取
-       cfg.frame_class_views[label]（帧类覆盖视图）；None ⇒ 全局 [frame.annotate]
-       （frame.classify 关闭时的全员形态）。类视图 enabled=false 的跳过判定归调用方
-       （M5 帧 pass / M7 回收），本面不重复判定。普通流水线失败返回 None；sequence
-       attempt 内错误上抛给 run_attempt，拒绝当前 whole-set attempt。运行级控制流始终上抛。"""
-
+```python
+async def annotate_member(member: Record, ctx: RunContext, label: str | None = None,
+                          target: CapacityTarget | None = None) -> Annotation | None: ...
+async def annotate_member_leaf(member: Record, ctx: RunContext, label: str | None = None,
+                               target: CapacityTarget | None = None) -> Annotation: ...
 def build_frame_annotate_prompt(member: Record, cfg: ResolvedConfig, schema_text: str,
-                                label: str | None = None) -> PromptBundle:
-    """帧级标注提示词的确定性装配（verbatim 捕于 CONTRACTS §10.13）。"""
+                                label: str | None = None) -> PromptBundle: ...
 ```
 
-要点（规格与理由）：
-
-- **执行门**：active ∧ `record.kind == "sequence"` ∧ 首标签信封（`classification.label == labels[0]`，无 classification 视为首标签）∧ 非降格 ∧ `frame.annotate.enabled`。process/flat 入口来自序列标注成功后的 `_on_annotated`；sequence attempt 若 `annotate.enabled=true` 走同一路径，若为 false 则从 `_run_item` 直接进入 frame pass。后者不构造 sequence prompt、不调用 sequence Schema，并允许 `item.annotation is None`。
-- **模板段序（冻结）**：system = `[任务]` + 生效指令（类覆盖或全局，含 few-shot 各一条 user 消息、配置序）+ Schema 约束句 + **帧 Schema 文本嵌入**（`cfg.frame_schema` 的 canonical 单行 dump，镜像序列级 `build_annotate_prompt` 的 schema_text 嵌入手法）→ 成员内容 user 消息：text 模态 = `[成员帧] {行文本}`；ui 模态 = `[屏幕截图]` + image part + `[UI 控件树]` + 树摘要**三段形**（本模块单记录 ui 标注同款；树渲染绝对上限 `input.ui_tree_max_chars`，预算声明时动态帽收缩——树是唯一可裁块，生效指令 / few-shot / 帧 Schema 文本是静态语义资产只计不裁，3.1.4 V13③ 预检领地）。
-- **Schema 显式路由**（裁决·帧 Schema 显式路由）：`complete_validated(frame.annotate.llm, prompt, schema=cfg.frame_schema, ...)`——内部 Schema 待遇：L0–L3 四层全在、**无 L2.5、不计 `resolved_at`**（6.4 恒等式「resolved_at 加总 = 进入 M5 的记录数」不被帧调用污染，3.8.2）。
-- **幂等只补缺位**：帧 pass 一旦运行即把 `member_annotations` 初始化为 `{}`（区别于「未运行」的 None——emitter 在场规则的单一真相，4.1；multi 扇出场景下该容器由 M13 在扇出前预先钉住共享，裁决·扇出共享时序补丁，§1.6）；已有 dict **只补缺位、从不换对象**（扇出克隆按引用共享同一 dict 的前提）；仅当成员 id 不在 dict 时才调用（M7 回收补跑同款）；**同 id 成员只调用一次**（first-wins，裁决·同 id 成员 first-wins——防同键并发双付费与计数虚高，3.13.7 同口径）。
-- **跳过与失败语义**：帧类视图 `enabled=false` ⇒ 该成员 skipped、**不占键**、计 `frame_annotate.skipped`。process/flat 中，修复穷尽或不可恢复错误使该成员占键 None、计 `frame_annotate.failed`，episode 可继续发射。sequence attempt 中，任一应标注成员失败都使 `run_attempt.accepted=false`、`rejected_stage="annotate"`，M10 丢弃并重试整个 counterfactual set；失败 attempt 的成员标注与 dataset counters 不提交，已经发生的 Schema/usage/retry/trace 证据保留。TaskExecutor 必须等待全部 frame 叶任务及 cleanup 收敛，reducer 才能返回失败；叶任务不得在 attempt 结束后继续运行或修改状态。成功成员占键 Annotation。
-- **无降级梯（最小单元）**：帧 prompt 本身就是最小单元——单成员、至多单图，无窗可分、无关键帧可减；预算装填裁树后仍超限 ⇒ `ContextOverflowError(phase="precheck")`，按成员失败处置（注定失败的请求永不发出）、**永不喂熔断**；反应式终端镜像本模块 A7 纪律（仅 http_400 反应式恰一次喂）。图像成本恒取 profile 工作点（`default_image_px`——校准器按 profile 聚合的前提，帧调用不设独立尺寸）。
-- **事件载荷纪律**：`annotate.frame` 每成员一发（ids=(episode_id,)，3.12.4）；payload 仅 `member_id` / `status` / `attempts`——标注内容只经既有 `excerpt` 键按档位截断（excerpt/full 档 200 字，7.4），**不新增任何承载数据内容的 payload 键**（none 档预脱敏载荷直通 console 面板的红线）。
+- 处理会话的单帧调用必须显式传实际 target，包含真实出现位置和帧 label；verify 回收传 expanded working item
+  投影的位置，owner 仍是 verify。缺失 target 是接口错误，不能按 record.id 猜位置。
+- 帧 pass 仅处理 active、sequence、首标签或无分类、非降格信封。处理流从序列标注成功后进入；生成 sequence
+  在 annotate.enabled=false 时可直接进入，不构造序列 prompt。已存在的当前尝试字典只补缺位，不换对象。
+- process 单帧正文/完整可见树/该图全量进入模型请求，不受 ui_tree_max_chars 帽；图片固定工作点不变。
+  SchemaEngine 接收投影后的 model frame Schema；后处理再补代码字段并完整复验。帧调用不走普通 record validator，
+  不计 record resolved_at，保持后处理规范的明确边界。
+- enabled=false 的帧类跳过，不占键；普通非容量失败占键 None 并计 frame_annotate.failed，episode 可继续。
+  生成 sequence 任一应标注帧失败拒绝整个 counterfactual set。成功帧占键 Annotation。
+- 容量异常先发 frame 信号。单成员没有合法再拆边界：控制器登记 owning stage/profile/label/position 终态，
+  下次调用前返回原帧失败产品，不裁树、不丢图、不重新喂模型；fixed 帧 Schema 仍是 frame 单位，不升级为整序列错误。
+- multi 兄弟共享当前尝试帧字典，处理流中同内容 ID 的不同出现位置不共享一个键。重算从冻结上游重新生成帧产品。
+  annotate.frame 继续按成员产生结构化事件；usage/Schema/trace 事实累计，dataset 计数只随最终会话提交。
 
 ### 3.5.6 v1.20 sequence annotation 时间
 

@@ -10,6 +10,105 @@ documents remain the authority for *algorithms and behavior*; this document is t
 or format implicit, the decision is frozen here and tagged **[FROZEN HERE]** (all such decisions
 are also listed in §12). Any deviation requires editing this file first.
 
+## Process sequence context capacity contract — 2026-09-09
+
+`docs/dev/SPEC-sequence-context-capacity.md` is the authoritative process-stream revision.
+For `run.mode="process"` with `segment.enabled=true`, this section replaces batch-lifetime,
+hard-split, sequence sampling, content-ID member addressing and immediate downstream commit clauses below.
+Ordinary records and sequence generation retain their own execution and identity contracts.
+Superseded process-stream wording is removed as part of the same implementation/documentation change.
+
+The complete input Session is the semantic unit. `run.batch_size` limits leaf tasks in each
+TaskExecutor group; each dependent wave is planned before grouping and reduced after all groups finish.
+RunContext.run_group(request) uses the existing executor without adding resource permits.
+Stream batch_no is the session ordinal; calibration freezes only after that session settles.
+
+Shared types are declared in common/contracts/types.py:
+
+```python
+@dataclass(frozen=True)
+class CapacityCut:
+    left_position: int
+    right_position: int
+    stage: str
+    profile: str | None
+    phase: Literal["precheck", "reactive"]
+
+@dataclass(frozen=True)
+class SequenceBounds:
+    lower: int
+    upper: int
+    before: CapacityCut | None = None
+    after: CapacityCut | None = None
+
+@dataclass(frozen=True)
+class SequenceCapacity:
+    bounds: SequenceBounds
+    sealed: bool = False
+    root_id: str | None = None
+    parent_id: str | None = None
+```
+
+PipelineItem adds session_position: int | None, member_positions: tuple[int, ...], and
+capacity: SequenceCapacity | None. Process-stream member products are keyed by integer session
+position; generation member products remain keyed by their existing unique string IDs. Common
+member_key(item, index) selects the declared carrier, never guesses an occurrence from content IDs.
+defect_verdict_schema().defects[].members uses integer session positions for process-stream review.
+
+common/contracts/sequence_capacity.py declares CapacityTarget(root_id, record_id, label, member_positions),
+SessionCapacityFailure(stage, targets, unit, error), and
+SessionAttemptScope(session_id, ordinal, attempt, stage, terminal_failures).
+unit is one of sequence, pairwise, frame, transition, fixed, stitch_pool. error retains the original
+ContextOverflowError, including profile, phase and origin. stage is the owning orchestration stage;
+verify subcalls remain owned by verify. SessionCapacityError(failures) carries a nonempty tuple in
+complete-wave declaration order. capacity_failures(ctx, targets, error, unit) purely converts raw or
+nested capacity errors; raise_session_capacities(ctx, failures) filters previously established terminal
+requests and raises the remaining full collection before any wave business reduction. A downstream
+restart consumes all applicable failures once; obsolete sequence/pairwise requests are discarded when
+an earlier cut eliminated them, while minimum-unit failures retain their occurrence/bounds identity.
+RunContext carries session_attempt and capacity_checker; ordinary and generation contexts leave both null.
+SequenceCapacityChecker.preview(item, ctx) is a synchronous, side-effect-free budget preview returning
+a SessionCapacityFailure or null. Operators publish preview_capacity(item, ctx) for actual known requests;
+orchestration composes them. RunContext.run_group(request) divides a frozen wave only when session_attempt
+is present and preserves declaration order; semantic reduction follows all physical groups.
+
+Common process_sequence_id(session_id, positions, member_ids) computes the first 16 hex digits of
+SHA-256 over canonical JSON `["process_sequence", session_id, positions, member_ids]`.
+capacity_sequence_id(root_id, positions, member_ids) uses
+`["process_sequence_capacity", root_id, positions, member_ids]`.
+Canonical JSON is UTF-8, ensure_ascii=False, separators=(",", ":"). Stitch survivor IDs stay fixed.
+Capacity children retain the frozen upstream root_id and their direct parent_id.
+
+All stream LLM and embedding profiles declare positive context_window; image-consuming profiles
+declare vision support. Complete text, uncapped visible normalized trees and every required image
+enter actual requests. Artificial boundaries replace evidence truncation. Sealed sequences cannot
+be merge candidates or targets; allowed member intervals intersect on merges and never widen.
+
+Segment/stitch settle once for the complete session. Each downstream attempt owns fresh mutable
+envelopes, frame products, noise claims, quality pools and a local ordinary-dedup increment.
+Only the final attempt commits ordinary dedup and dataset counts, then invokes existing emission.
+Usage, Schema attempts, request failures, trace and elapsed costs remain real-time observations.
+MetricsSink session/attempt ContextVar adds session_id and session_attempt to stream trace payloads.
+Existing emitter pre-write rejection and I/O semantics remain; formal commit never returns to capacity retry.
+
+Output removes session_split and adds member_positions plus capacity. The capacity object is null
+without an artificial boundary or capacity seal; otherwise its ordered fields are sealed, allowed_positions, before,
+after, root_id, parent_id. Cut objects use the CapacityCut field order. Per-session quality replaces
+batch-dependent pools. Final episodes include the final capacity-partition net increase; stitched
+counts only real upstream shells; threads = episodes - stitched; fanout remains separate.
+Public stitch_fragments entries have ordered fields order_span, member_count, cause, source_episode,
+member_positions. Exact occurrence membership governs fragment projection through capacity splits and review surgery.
+Projection removes empty fragments and sorts remaining fragments by their first occurrence position.
+Seam ownership uses only unclassified or first-label envelopes and excludes other label views of the same record ID.
+Distinct sequences sharing a task name remain independent owners. Seam-dependent clones rebuild their actions,
+annotations and reviews but never mutate shared member products using their older membership.
+report.stream.capacity has splits, sealed, minimum_failures, recomputations, retained_frames_high_water.
+Internal capacity.* and dedup.embedding_failures remain observed costs through retries and cancellation;
+stream budget.overflow_records belongs to the final attempt dataset counts.
+
+The specification acceptance matrix is mandatory for this revision, including complete offline
+regression, real local Qwen3.5-4B text/UI/reactive-overflow evidence and isolated semantic mutation review.
+
 v1.20 is a clean-breaking generation boundary: earlier generation streams are rejected, and
 there is no alias, migration or fallback. The temporal-integrity spec governs business-time
 projection, interval planning, replay rebinding and precommit validation; implementation and
@@ -42,7 +141,8 @@ Ground rules for every implementer:
   contracts, errors, config, observability and the sibling `labelkit.common.inference.budget`;
   `labelkit.common.inference.schema_engine` imports the inference LLM client plus common
   errors/observability. `labelkit.common.contracts.stage` imports inference/config/observability and
-  execution protocol types under `typing.TYPE_CHECKING` only. Common never imports runtime,
+  execution protocol annotations under `typing.TYPE_CHECKING`; TaskGroupRequest is a common runtime import
+  for fixed-wave physical grouping. Common never imports runtime,
   operators or orchestration. Runtime imports common only. `labelkit.operators.generation` imports
   only common and its own
   sibling generation modules; it never imports orchestration. Operator modules
@@ -436,8 +536,8 @@ class Record:
   `canonical_json(x) = json.dumps(x, sort_keys=True, ensure_ascii=False, separators=(",", ":"))`.
 - UI modality: `sha256(uitree_file_bytes + image_file_bytes).hexdigest()[:16]`.
 - generated records (M6): `raw = {input.text_field: sample_text}`, then the text rule.
-- sequence records (M14, v1.8): `sha256("\n".join(member_ids).encode("utf-8")).hexdigest()[:16]`
-  over the member ids in order-key ascending order, fixed at episode formation — M7 member
+- process sequence records: `process_sequence_id(session_id, member_positions, member_ids)`
+  over the session, occurrence positions and member ids in order-key ascending order, fixed at episode formation — M7 member
   surgery never recomputes it (spec 3.14.4, the sequence-assembly record-build step), and
   neither does M16's thread rebinding (the record-rebind write of the stitch-rebind exception,
   §5; v1.9): the surviving envelope keeps its id, which doubles as `thread_id` and
@@ -541,7 +641,7 @@ class StageError:
 
 
 @dataclass
-class PipelineItem:                        # the ONLY mutable envelope; lifetime = one batch
+class PipelineItem:                        # mutable envelope; ordinary batch or one complete-session attempt
     record: Record
     status: Status = "active"
     classification: Classification | None = None   # v1.7: written by M13 classify (or inherited)
@@ -568,16 +668,19 @@ class PipelineItem:                        # the ONLY mutable envelope; lifetime
                                            # v1.8 additive: written by M15 extract (§7.15);
                                            # None = extract disabled / not reached (idempotency
                                            # gate: `transitions is not None` → skip)
-    member_classifications: dict[str, Classification] | None = None
+    session_position: int | None = None
+    member_positions: tuple[int, ...] = ()
+    capacity: SequenceCapacity | None = None
+    member_classifications: dict[int | str, Classification] | None = None
                                            # v1.12 additive: written by the M13 classify frame
                                            # pass or inherited from the v1.18 projector;
-                                           # key = member record.id; None = no member-class route /
+                                           # key = stream session_position or generation member ID; None = no member-class route /
                                            # not reached (sequence generation always supplies it);
                                            # fan-out clones SHARE the dict BY REFERENCE (the
                                            # record/dedup family, copied by classify._fan_out)
-    member_annotations: dict[str, Annotation] | None = None
+    member_annotations: dict[int | str, Annotation | None] | None = None
                                            # v1.12 additive: written by the M5 annotate frame
-                                           # pass (same execution gate); key = member record.id;
+                                           # pass (same execution gate); key = stream position or generation member ID;
                                            # value None = that member's frame annotation FAILED
                                            # irreparably (failed 占键为 None, skipped 不占键 —
                                            # the dict shape is the single source of truth for
@@ -608,10 +711,10 @@ def frame_digest(record: Record, max_chars: int) -> str:
     per run; v1.11 (V4): the WARN guidance reads "attach frame screenshots by
     pointing segment.llm at a supports_vision=true profile" (the segment.use_vision
     key it formerly pointed at was removed in v1.11; the wording is the 2026-08-14
-    English re-freeze of the same guidance). v1.11 (V9): M14 calls this ONCE per frame at
-    SESSION level, BEFORE window packing — the digest vector feeds both the
-    packer's per-frame costs and the §10.9 prompts (the pre-v1.11 per-window
-    recomputation is gone; the poverty-guard path stays independent)."""
+    English re-freeze of the same guidance). Process-stream M14 uses full record_evidence
+    for both window budgets and prompts. This bounded digest remains available for
+    stitch candidate cards and separately scoped ordinary/generation uses; it must not
+    replace complete sequence evidence."""
     ...
 
 
@@ -643,7 +746,7 @@ Notes binding on all implementers:
 - v1.9 additive deltas (spec §4.1, same appended-with-defaults construction):
   `PipelineItem.thread_id` and the `Status` value `stitched`. The three thread duck marks
   stamped by M16 on surviving thread envelopes are deliberately NOT dataclass fields
-  (duck-typed envelope attributes, the `session_split`/`noise_attribution` family):
+  (duck-typed envelope attributes, the noise_attribution family):
   ① `seam_indexes: tuple[int, ...]` — each element is the seam pair's LEFT-member index in
   the rebound member tuple, the SAME coordinate as `Transition.index`/`_meta.stream.steps[].index`,
   range `[0, len(members) − 2]`; it has NO conversion relationship with `order_span`'s
@@ -909,6 +1012,13 @@ class RunContext:
     metrics: MetricsSink
     tasks: TaskExecutor
     task_namespace: str
+    session_attempt: SessionAttemptScope | None = None
+    capacity_checker: SequenceCapacityChecker | None = None
+
+    async def run_group(self, request: TaskGroupRequest[T]) -> tuple[T, ...]:
+        """派发已冻结整轮任务；流会话按 batch_size 分组，所有结果仍按完整声明序返回。
+        普通记录和生成路径直接提交唯一执行域，不按 segment 配置猜测会话上下文。"""
+        ...
 
 
 class Stage(Protocol):
@@ -1094,9 +1204,9 @@ class EmbeddingProfile:
     max_retries: int = 5
     retry_base_delay_s: float = 1.0               # same backoff mechanism as llm.* [FROZEN HERE]
     context_window: int = 0                       # v1.11 (V15): 0 = undeclared = embed budget off;
-                                                  # > 0 → embed input truncated to
-                                                  # budget = context_window − margin (no output
-                                                  # reservation; §7.17 embed_budget)
+                                                  # > 0 → budget = context_window − margin;
+                                                  # ordinary records may trim; process sequences remain complete
+                                                  # and use session capacity control (§7.17 embed_budget)
     dims: int | None = None                       # if set, embed() validates returned dims
     api_key_envs: tuple[str, ...] = ()            # v1.6 key pool — same normalization as
                                                   # LLMProfile.api_key_envs; secret values are
@@ -1398,21 +1508,6 @@ class AnnotateConfig:
     resolved_postprocessor: ResolvedHook | None = None  # M1 冻结的生效函数，禁止 TOML 显式配置
     self_consistency: int = 0                     # 0 = off; else odd, >= 3
     sc_temperature: float = 0.7
-    sequence_frames: int = 20                     # v1.8: max keyframes per sequence-annotation
-                                                  # request, ∈ [2, 100] (M1; outside → CONFIG_
-                                                  # ERROR). n members > k → deterministic
-                                                  # downsample, zero rng, first/last always kept,
-                                                  # strictly increasing; n <= k takes all (S28).
-                                                  # Non-stitched sequences: uniform
-                                                  # idx_i = ⌊i·(n−1)/(k−1)⌋, i=0..k−1; stitched
-                                                  # threads (v1.9, T14): per-fragment quotas —
-                                                  # every fragment keeps ≥ 1 keyframe, surplus
-                                                  # k−m split largest-remainder by (Lᵢ−1), local
-                                                  # uniform inside fragments (§7.4 formula).
-                                                  # > 20 while the annotate profile's
-                                                  # max_image_px > 2000 → M1 WARN (§6.3);
-                                                  # explicitly set while non-stream → no-op
-                                                  # warning
 
 
 @dataclass(frozen=True)
@@ -1573,7 +1668,7 @@ class StreamConfig:                               # input-side ordering + sessio
     gap_steps: int = 0                            # break when adjacent ordinal delta > gap_steps;
                                                   # 0 = off; combinable with gap_s (either fires)
     session_max_len: int = 200                    # hard cap (frames), break at limit;
-                                                  # > run.batch_size → M1 static WARN (S21)
+                                                  # independent of run.batch_size
     session_max_span_s: int = 0                   # hard time-span cap (seconds; 0 = off); may be
                                                   # SET only under order_by="meta:*" (M1)
 
@@ -1594,20 +1689,17 @@ class SegmentConfig:                              # M14 (§7.14) — the stream-
                                                   # "hybrid" names the rules+LLM composition)
     llm: str = "default"                          # joins the existence/key/probe reference sets
                                                   # ONLY when strategy ∈ {llm, hybrid} (S30, §6.3
-                                                  # rule 33); v1.11 (V3): never the vision set —
-                                                  # vision is ADAPTIVE via vision_resolved below
+                                                  # rule 33); UI requests require vision
     window: int = 20                              # v1.11 (V9) semantics revision: UPPER CAP on
                                                   # frames per window call; M1: >= 2. Budget
                                                   # declared (segment profile context_window > 0):
                                                   # windows are GREEDY-PACKED by per-frame cost up
                                                   # to this cap, PRESERVING the 1-frame overlap
                                                   # and the seam-frame-owned-by-the-LATER-window
-                                                  # semantics (§7.14; M1 guards w_min ≥ floor,
-                                                  # §7.17 min_window); budget off: fixed windows,
-                                                  # step = window − 1, byte-identical to v1.10
+                                                  # semantics (§7.14); minimum necessary pair = 2,
+                                                  # not a guaranteed fitting size
                                                   # (window >= session length degrades to one
                                                   # whole-session call, S32)
-    digest_max_chars: int = 400                   # frame_digest truncation cap (§3)
     noise_filter: bool = True                     # llm/hybrid only; rules + explicit true →
                                                   # no-op warning (§6.3)
     min_len: int = 2                              # segment length floor; applies ONLY to LLM-
@@ -1714,10 +1806,8 @@ class FrameClassifyConfig:                        # v1.12: M13 frame-level close
                                                   # max_labels (帧单一归属地基; explicit keys are
                                                   # DIRECTED CONFIG_ERRORs, rule 48)
     enabled: bool = False                         # true ⇒ segment.enabled = true (rule 43)
-    llm: str = "default"                          # joins the reference sets iff enabled; NEVER
-                                                  # the vision set (vision 语义分列 — adaptive via
-                                                  # vision_resolved below; cost-control face =
-                                                  # point it at a text-only profile)
+    llm: str = "default"                          # joins the reference sets iff enabled;
+                                                  # UI requests require vision
     fallback_class: str = ""                      # required iff enabled; must be in the frame
                                                   # class table (rule 47 — 修复穷尽/窗口失败兜底)
     classes: tuple[ClassSpec, ...] = ()           # frame class table, isomorphic with
@@ -1941,13 +2031,13 @@ Profile × reference-set × vision navigation table (non-normative consolidation
 
 | Stage profile key | existence / key-resolution (rule 12) / `validate --probe` sets | vision set (rules 4/34) |
 |---|---|---|
-| `quality.llm`, `quality.judges[*]` | always when referenced (rule 2) | UI modality: required (rule 4) — EXCEPT under `segment.enabled`: sequence scoring is pure text, the single rule-34 relaxation |
+| `quality.llm`, `quality.judges[*]` | always when referenced (rule 2) | UI modality: required, including complete stream sequence evidence |
 | `annotate.llm`, `verify.llm` (only when verify enabled), `verify.judges[*]`, `generate.llms[*]`, `output.repair_llm` (when set) | always when referenced (rule 2) | UI modality: required (rule 4); under stream, annotate/verify stay required per the rule-34 table |
-| `classify.llm` | iff `classify.enabled` (rule 23) | UI modality: required (rule 23); stream mode required — first-frame screenshot (rule 34) |
-| `segment.llm` | iff `segment.enabled ∧ strategy ∈ {llm, hybrid}` (rule 33) | NEVER a requirement — vision-ADAPTIVE via the parse product `segment.vision_resolved` (rules 33/34, V1/V3) |
+| `classify.llm` | iff `classify.enabled` (rule 23) | UI modality: required; stream requests include every member image |
+| `segment.llm` | iff `segment.enabled ∧ strategy ∈ {llm, hybrid}` (rule 33) | UI modality: required for complete window evidence |
 | `extract.llm` | iff `extract.enabled` — then always all four sets (rule 33) | ALWAYS required (every request carries 2 images, rules 33/34) |
 | `stitch.llm` | iff `stitch.enabled`, no strategy condition (rule 40) | NEVER — pure-text judgment (T16, rule 40) |
-| `frame.classify.llm` | iff `frame.classify.enabled` (rule 43) | NEVER — vision-adaptive via the parse product `FrameClassifyConfig.vision_resolved` (rule 43) |
+| `frame.classify.llm` | iff `frame.classify.enabled` (rule 43) | UI requests require vision |
 | `frame.annotate.llm` | iff `frame.annotate.enabled` (rule 43) | UNCONDITIONAL under ui ∧ enabled — the sequence-annotate mirror (rule 43) |
 | `generate.semantic_llm`, `generate.evaluation_llm` | iff `generate.form="sequence"`; both exist, resolve credentials and declare `context_window > 0`; names differ | NEVER — all v1.18 generation prompts are text plus JSON |
 
@@ -1967,9 +2057,8 @@ Profile references:
 3. **judges 奇数** — `quality.judges` / `verify.judges`: when non-empty, length must be odd.
 4. **UI 模态 vision 要求** — UI modality: every profile used by quality/annotate/verify must
    have `supports_vision = true`.
-   v1.8: under `segment.enabled = true` this rule is superseded by the per-stage vision table
-   of rule 34 (quality is exempted there; classify/extract join per their own rows;
-   v1.11 — segment's row is vision-ADAPTIVE, never a requirement, V1/V3).
+   Under segment.enabled, every image-consuming stage profile must have vision support,
+   including segment, frame classification and quality; stitch semantic cards remain text-only.
 5. **语义去重要求 embedding** — `dedup.semantic = true` ⇒ `dedup.semantic_embedding` set,
    exists in `[embedding.*]`, and that
    profile passes rule 12's declaration check (exactly one of
@@ -2110,31 +2199,13 @@ apply only when the named switch is on unless stated):
     `order_by = "meta:*"` is TEXT-MODALITY-ONLY; explicitly setting `stream.gap_s` or
     `stream.session_max_span_s` requires `order_by = "meta:*"`; every `stream.key` element
     is `"meta:<field>"` (text modality only) or `"source_dir"` (either modality).
-32. **窗口与关键帧数值界** — `segment.window >= 2`; `2 <= annotate.sequence_frames <= 100`
-    (outside the range → CONFIG_ERROR).
-33. **segment 引用集条件** — Reference sets (S30 — the "three sets" of rule 23 are FOUR for
-    v1.8 profiles:
-    key resolution (rule 12) / vision (rule 4/34) / `validate --probe`
-    (`labelkit.common.inference.credentials.referenced_profiles()`) / existence): `segment.llm`
-    joins the existence/key-resolution/probe sets ONLY when
-    `segment.enabled` AND `segment.strategy ∈ {llm, hybrid}` (the rules strategy makes zero
-    LLM calls — no key may be demanded; these three sets and their gate are UNCHANGED in
-    v1.11), and — v1.11 (V1/V3) — NEVER joins the vision set: segment left the
-    "requires vision" validation set and is vision-ADAPTIVE instead (whether window calls
-    attach images is the M1-derived parse product `segment.vision_resolved`, §6.1 — the
-    vision proposition has no failure mode left to validate, and the rule-4/34
-    error-message `stages` set can therefore no longer contain "segment");
-    `extract.llm`, when `extract.enabled`, ALWAYS joins all
-    four sets and ALWAYS the vision set (every extract request carries 2 images).
-34. **vision 逐阶段表** — Stream-mode per-stage vision table (S30; UI modality,
-    `segment.enabled = true`):
-    classify ✓ (first-frame screenshot, §10.8), annotate ✓ (multi-image, §10.1),
-    verify ✓ (first/last-frame screenshots, §10.5), extract ✓ (always), segment —
-    ADAPTIVE, never required (v1.11, V1/V3: per-frame screenshots ride the window calls
-    iff `segment.vision_resolved` — capability follows the chosen profile's
-    `supports_vision`; a pure-text segment verdict is expressed by pointing `segment.llm`
-    at a text-only profile), **quality ✗** — sequence scoring is pure text (§10.2/§10.3 sequence
-    variants); `quality.llm` is the single vision relaxation of rule 4.
+32. **完整证据窗口** — segment.window >= 2. Removed segment.digest_max_chars and
+    annotate.sequence_frames are explicit configuration errors. Stream profiles require positive context_window.
+33. **实际引用集合** — segment.llm enters reference sets only for enabled llm/hybrid strategies.
+    All actual quality modes after class overrides enter both validation and credential collection.
+34. **视觉证据** — In UI process streams, segment, classify, frame.classify, extract, quality,
+    annotate, frame.annotate and verify require vision whenever enabled and consuming member images.
+    Stitch semantic cards remain text-only. No image-consuming stage silently drops image evidence.
 35. **按类 extract 白名单** — `[class.<name>.extract]` whitelist: `instruction` ONLY (extends
     rule 25's table; any
     other key → CONFIG_ERROR). `[class.<name>.segment]` does NOT exist as a section:
@@ -2206,11 +2277,8 @@ checks apply only when the named switch is on unless stated):
     `frame.classify.llm` /
     `frame.annotate.llm` each join the existence/key-resolution/probe sets
     (`labelkit.common.inference.credentials.referenced_profiles()`) iff their own switch is
-    on; the vision set takes ONLY `frame.annotate.llm` (ui ∧ enabled, unconditional — the
-    sequence-annotate mirror) and NEVER `frame.classify.llm` — frame classify is
-    vision-ADAPTIVE via the parse product `FrameClassifyConfig.vision_resolved` =
-    (modality=="ui") ∧ enabled ∧ profile.supports_vision, frozen by M1 at load() end
-    (segment V1 sibling, no strategy term).
+    on. Both require vision in UI modality because their complete actual requests carry images.
+    M1 freezes the resolved capability after validating the profile.
 44. **帧类覆盖要求帧分类或序列生成** — any `[frame.class.<name>]` table present ⇒
     `frame.classify.enabled = true` **∨ `generate.form="sequence"`** (a
     CONFIG_ERROR — deliberately NOT the parked-config warning family, R8); `<name>` must be a
@@ -2495,21 +2563,15 @@ non-blocking): any of `[stream]`/`[segment]`/`[extract]` present while `segment.
 false` → ONE warning naming the ignored tables (v1.9: `[stitch]` joins that parked list when
 it carries payload beyond its own `enabled` switch while `stitch.enabled = false`);
 `segment.strategy = "rules"` with explicit
-`noise_filter = true` → no-op warning; `annotate.sequence_frames` explicitly set while
-`segment.enabled = false` → no-op warning; effective trajectory rubric while
-`extract.enabled = false` → warning (the rubric is modality-neutral and does not presuppose
-steps — "步骤" degrades to "帧间变化", S29); `stream.session_max_len > run.batch_size` →
-static WARN (S21: such sessions will be hard-split by M10 + `session_split` mark);
-`annotate.sequence_frames > 20` while the annotate profile's `max_image_px > 2000` → WARN
-(S28: Anthropic hard-rejects >20-image requests containing any image over 2000 px — HTTP
-400, not a resize; the default max_image_px=2048 hits it. Guide: set `max_image_px <= 2000`
-or lower `sequence_frames`; the 20-image threshold counts ALL image blocks in the request).
+`noise_filter = true` → no-op warning. The effective trajectory rubric without extract warns
+that it scores frame-to-frame changes from complete member evidence rather than extracted actions.
+Physical computation group size never hard-splits a session or triggers a session-size warning.
 v1.9 additions (T17, same family): ① `stitch.enabled = true` with `segment.strategy =
 "rules"` → advisory WARN (rules segmentation has no LLM refinement, so the stitch pool
 receives coarse whole-session cuts — legal but usually unintended; switch strategy to
 `"llm"`/`"hybrid"` to stitch at task granularity); ② `[stitch]` carrying payload beyond its
 own `enabled` switch while `stitch.enabled = false` AND `segment.enabled = true` → its OWN
-no-op warning (the `sequence_frames` precedent — the v1.8 parked-tables warning lives in the
+no-op warning (the parked-tables warning lives in the
 segment-OFF branch and cannot fire here; under segment off the table joins that parked list
 instead, see above).
 v1.10 addition (spec 3.1.4 console row — independent of the parked-tables family, R8):
@@ -2834,8 +2896,8 @@ v1.8 sequence scoring (`record.kind == "sequence"`; spec 3.4.3 sequence row):
   `detail.interrupted_by` joined with `、`, frozen in §10.2: without it the trajectory
   rubric's noise_residue/coherence criteria would score the mechanical seam as noise residue
   or an unexplained jump) +
-  `[成员帧摘要]` (bounded per-member `frame_digest`), **NO images** — sequence scoring is
-  pure text even in UI modality (the rule-34 vision relaxation, §6.3). transitions and the
+  `[完整成员证据]` with every member's full text or normalized UI tree and every UI image.
+  Complete prompt assets share the same capacity check as the actual request. Transitions and the
   pre-rendered text reach the judging calls via NEW PRIVATE parameters of
   `_judge_once`/`_pointwise_once` (private signatures — not part of the frozen surface);
   the `excerpt` tier payload for sequences = first 200 chars of the member-digest rendering.
@@ -2853,249 +2915,118 @@ v1.8 sequence scoring (`record.kind == "sequence"`; spec 3.4.3 sequence row):
 ### 7.4 M5 — `labelkit/operators/annotate.py`
 
 ```python
-@dataclass(frozen=True)                            # [FROZEN HERE]
+@dataclass(frozen=True)
 class RepairContext:
-    previous_output: Mapping                       # last annotation object
-    critiques_text: str                            # rendered lines "aspect: opinion"
-                                                   # (multi-judge: "judge_name/aspect: opinion")
+    previous_output: Mapping
+    critiques_text: str
 
-
-@dataclass(frozen=True)                            # [FROZEN HERE — 2026-08-14]
+@dataclass(frozen=True)
 class AnnotatePromptOptions:
-    """Every assembly variant of one annotation call, in ONE parameter object.
-
-    The 2026-08-14 code-rule remediation (≤ 5 parameters per function) collapsed the
-    v1.7/v1.8/v1.9/v1.11 additive trailing kwargs of the two public faces below into this
-    frozen dataclass. FIELD NAMES AND SEMANTICS ARE UNCHANGED — only the carrier changed;
-    the "additive trailing kwarg" narrative is retired, and callers step a variant with
-    `dataclasses.replace(opts, ...)` (the V20 halving and the V21 repair ladder both do).
-    The default instance reproduces the pre-v1.7 global no-variant assembly byte for byte.
-    """
-    repair: RepairContext | None = None            # §10.5 repair context; None = first annotation
-    temperature: float | None = None               # sampling temperature; None = profile default
-    label: str | None = None                       # v1.7 (R2) class label; v1.13 also selects the class schema
-    transitions: tuple[Transition, ...] | None = None   # v1.8 (S5) [动作序列] steps; None = section omitted
-    fragment_lens: tuple[int, ...] | None = None   # v1.9 (T14) per-fragment member counts; None = uniform downsample
-    k_eff: int | None = None                       # v1.11 (V20/V21) externally narrowed keyframe cap
-    image_px: int | None = None                    # v1.11 (V23①) escalated image sampling edge
-
+    repair: RepairContext | None = None
+    temperature: float | None = None
+    label: str | None = None
+    transitions: tuple[Transition, ...] | None = None
+    image_px: int | None = None
+    temporal_context: SequenceTemporalContext | None = None
 
 def build_annotate_prompt(record: Record, cfg: ResolvedConfig, schema_text: str,
-                          opts: AnnotatePromptOptions = AnnotatePromptOptions(),
-                          ) -> PromptBundle:
-    """Deterministic template assembly per §10.1. schema_text = the CLASS-EFFECTIVE schema
-    text (v1.13: `class_schema_text(ctx, label)` — SchemaEngine.user_schema_text unless the
-    record's class overrides output.schema).
-    [FROZEN HERE] `opts.repair` != None appends the repair suffix (§10.5).
-    `opts.label` (v1.7, R2): non-None → instruction/examples come from
-    cfg.class_views[label].annotate; None = global config.
-    `opts.transitions` (v1.8, S5): non-None → the §10.1 sequence variant renders the
-    [动作序列] section from it; None = section omitted.
-    `opts.fragment_lens` (v1.9, T14): non-None → the ② keyframe downsample runs the
-    per-fragment quotas below; None = the uniform downsample.
-    `opts.k_eff` (v1.11, V20/V21) → EFFECTIVE KEYFRAME CAP: the ② downsample runs with
-    k = min(annotate.sequence_frames, k_eff) (carrier of the V20 frame-halving retry and
-    the V21 repair-ladder k → max(2, ⌈k/2⌉); per-fragment quotas degrade per the existing
-    T14 rule when the quota becomes infeasible).
-    `opts.image_px` (v1.11, V23①) → ESCALATED RESOLUTION, carried into PromptBundle.image_px
-    (the builder computes effective px = image_px or profile.default_image_px or
-    profile.max_image_px, clamped to min(·, max_image_px)).
-    Budget packing itself enters through the PRIVATE assembler's `fit` parameter (inside
-    annotate_record), never here."""
-
-
+                          opts: AnnotatePromptOptions = AnnotatePromptOptions()) -> PromptBundle: ...
 async def annotate_record(record: Record, ctx: RunContext,
-                          opts: AnnotatePromptOptions = AnnotatePromptOptions(),
-                          ) -> Annotation:
-    """One record's full annotation path incl. self-consistency (skipped when
-    `opts.repair` != None: repair re-annotation is always a single call at profile-default
-    temperature [FROZEN HERE]).
-    Raises SchemaViolation / ProviderRetryableError / ProviderFatalError / ContextOverflowError.
-    This is the hook M7 uses for verify.policy='repair'. [FROZEN HERE] Every `opts` field is
-    threaded through to build_annotate_prompt on EVERY path (single call, each
-    self-consistency sample, repair re-annotation), with the same semantics as above:
-    `label` = global config when None; `transitions` = the stage layer's item.transitions,
-    and the M7 repair path threads the REBUILT value through after member surgery;
-    `fragment_lens` = M16's stitch_fragments quotas; `k_eff`/`image_px` = the M7 V21 ladder
-    step on verify-fail re-annotation (keyframe cap halved to max(2, ⌈k/2⌉), one resolution
-    rung up at 1.5×/dim ≤ max_image_px, budget re-checked against the calibrated estimate),
-    while M5's own V20 overflow degrade sets `k_eff` internally. `opts.temperature` is
-    OVERRIDDEN by M5 (single call = profile default, self-consistency samples =
-    sc_temperature) — a caller-set value is ignored.
-    v1.13 (裁决·按类标注 Schema): `label` ALSO selects the annotation SCHEMA. Prompt text,
-    the M8 call, the self-consistency vote and the V9 packing estimate all read
-    `class_effective_schema` / `class_schema_text`, and a class-schema call routes
-    `complete_validated(schema=<class schema>, scope=CallScope(..., user_treatment=True))` —
-    record-level annotation stays in the user-treatment family, so L2.5 and the resolved_at
-    accounting are preserved (§7.7). M7's repair re-annotation inherits this by passing the
-    same label — no repair-side change. With no per-class schema configured every call shape
-    is byte-identical to v1.12]"""
+                          opts: AnnotatePromptOptions = AnnotatePromptOptions()) -> Annotation: ...
+async def annotate_record_leaf(record: Record, ctx: RunContext,
+                               opts: AnnotatePromptOptions = AnnotatePromptOptions()) -> Annotation: ...
+def class_annotate_schema(cfg: ResolvedConfig, label: str | None) -> Mapping | None: ...
+def class_effective_schema(cfg: ResolvedConfig, label: str | None) -> Mapping: ...
+def class_effective_model_schema(cfg: ResolvedConfig, label: str | None) -> Mapping: ...
+def class_schema_text(ctx: RunContext, label: str | None) -> str: ...
+def build_frame_annotate_prompt(member: Record, cfg: ResolvedConfig, schema_text: str,
+                                label: str | None = None) -> PromptBundle: ...
+async def annotate_member(member: Record, ctx: RunContext, label: str | None = None,
+                          target: CapacityTarget | None = None) -> Annotation | None:
+    """Annotate one member under its owning execution contract.
 
-
-# ── per-sequence-class annotation Schema (generic ClassView surface) ───────
-# The SINGLE lookup point for the class-effective annotation schema. Every schema
-# consumer inside M5 reads through these three functions so the PRICED schema is
-# always the CALLED one; M7's V21 trial packing lazy-imports the same pair (an
-# existing sanctioned import edge); M11 may NOT import them (operator isolation,
-# spec §2.2) and keeps a minimal in-module mirror whose semantics must match.
-
-def class_annotate_schema(cfg: ResolvedConfig, label: str | None) -> Mapping | None:
-    """The per-class annotation schema OVERRIDE, or None [FROZEN HERE].
-    label None / unknown class / class without an override → None, which every
-    caller reads as "stay on the global output.schema path" (byte-equivalent to
-    v1.12)."""
-
-
-def class_effective_schema(cfg: ResolvedConfig, label: str | None) -> Mapping:
-    """`class_annotate_schema(...) ?? cfg.user_schema` — the schema the record is
-    actually constrained by (self-consistency voting and budget pricing share
-    it) [FROZEN HERE]."""
-
-
-def class_schema_text(ctx: RunContext, label: str | None) -> str:
-    """The schema text embedded in the prompt [FROZEN HERE]. No override → the
-    existing `ctx.schema_engine.user_schema_text` property verbatim; with an
-    override → computed per call in the SAME shape (json.dumps with
-    ensure_ascii=False, separators=(", ", ": ")) — the frame-side precedent."""
-
-
-# ── v1.12 frame-level per-member annotation (SPEC-frame-annotation §3.3) ────
-
-def build_frame_annotate_prompt(member: Record, cfg: ResolvedConfig,
-                                schema_text: str,
-                                label: str | None = None) -> PromptBundle:
-    """Deterministic assembly of the §10.13 frame-annotation template (v1.12)
-    [FROZEN HERE]. schema_text = the canonical single-line dump of
-    cfg.frame_schema (the user_schema_text form: ensure_ascii=False,
-    separators=(", ", ": ")). label non-None → instruction/examples come from
-    cfg.frame_class_views[label] (the frame-class override view); None means the member
-    genuinely has no classification and selects the global [frame.annotate] pair. A disabled
-    classifier switch alone never clears an inherited v1.18 label. The budget packing enters
-    through the private assembler's trailing ``fit`` parameter (annotate_member), never here —
-    the build_annotate_prompt construction."""
-
-
-async def annotate_member(member: Record, ctx: RunContext,
-                          label: str | None = None) -> Annotation | None:
-    """One member Record's frame-level annotation (v1.12) [FROZEN HERE] —
-    PUBLIC DIRECT-CALL SURFACE and the repair-face family's new member: M7's
-    member-reclaim backfill lazy-loads and calls it directly (§7.6; same
-    contract standing as the annotate_record repair hook — the §1.1 fourth
-    sanctioned import direction rides classify_frames, THIS surface rides the
-    existing verify→annotate leg). Routes complete_validated(prof, prompt,
-    schema=cfg.frame_schema, scope=CallScope(...)) EXPLICITLY — internal-schema
-    treatment: L0–L3 all present, NO L2.5 hook, NO resolved_at counting (the §9.3 identity
-    "resolved_at sum = records entering M5" stays unpolluted). Failure behavior is execution-
-    surface specific. In ordinary process/flat member isolation, content, Schema and ordinary
-    provider failures including ProviderFatalError count frame_annotate.failed, emit ONE data-free
-    stderr WARN and return None;
-    the envelope may continue. In a sequence attempt, `SchemaViolation`, `ContextOverflowError`,
-    `OutputTruncatedError`, `ProviderRetryableError` and other recoverable content/provider errors
-    are re-raised to `run_attempt` rather than converted to None, so the controller rejects and
-    retries the whole set; `ProviderFatalError` is re-raised as a terminal sequence error without
-    consuming an attempt. `CircuitBreakerTripped`, `KeyboardInterrupt` and `CancelledError` remain
-    run-level control flow and propagate on both surfaces. Success counts
-    frame_annotate.annotated. The frame prompt is the MINIMAL UNIT
-    (single member, ≤ 1 image — no window to split, no keyframes to shrink),
-    so there is NO degrade ladder: a post-trim overflow is precheck-shaped and
-    never feeds the breaker (reactive-400 terminals feed exactly once, A7).
-    The view.enabled=false skip determination belongs to the CALLERS (M5 frame
-    pass / M7 backfill) — this surface never re-checks it."""
-
+    In ordinary process/flat member isolation, content, Schema and ordinary
+    provider failures including ProviderFatalError return None; the envelope may continue.
+    In sequence generation, `SchemaViolation`, `ContextOverflowError`, `OutputTruncatedError`
+    and `ProviderRetryableError` are re-raised to `run_attempt` rather than converted to None;
+    the coordinator retries the whole set. `ProviderFatalError` is re-raised as a terminal sequence error.
+    In process streams, new capacity failures return session control before reduction;
+    established minimum frame failures retain member isolation. Fatal provider errors propagate.
+    Cancellation, circuit-breaker and program/finalizer errors always propagate.
+    """
+async def annotate_member_leaf(member: Record, ctx: RunContext, label: str | None = None,
+                               target: CapacityTarget | None = None) -> Annotation: ...
 
 class AnnotateStage(Stage):
     name = "annotate"
     def __init__(self, cfg: ResolvedConfig): ...
     async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]: ...
+    def preview_capacity(self, item: PipelineItem, ctx: RunContext) -> SessionCapacityFailure | None: ...
 ```
 
-Normative behavior: per active item, `item.annotation = await annotate_record(...)`; on
-`SchemaViolation` → `status="failed"`, kind `schema_violation`; provider exhausted → `failed`,
-kind `provider_retryable_exhausted`; UI image decode error → `failed`, kind `image_decode_error`.
-Self-consistency (`self_consistency = n ≥ 3`): n independent samples at `sc_temperature`, each
-through the full M8 guarantee; field-level vote: enum/boolean/integer properties → per-field mode;
-all other fields (string free text, arrays, numbers, nested objects) taken wholesale from the
-first sample matching the modal voted-field combination; no such sample / no modal combination →
-take sample #1 entirely and count `report.annotate.sc_disagreements`; a failed sample abstains
-(denominator stays n); all n fail → `failed`. `Annotation.attempts` = sum of attempts over the
-SUCCESSFUL samples (a failed sample aborts via SchemaViolation, which carries no attempts/usage
-through `complete_validated` — its attempts are unrecoverable by design); `Annotation.usage`
-likewise sums successful samples only; `Annotation.sc = {"n": n, "agreement_ratio": matches/n}`. Trace: `annotate.done` with
-payload `{attempts[, sc]}`. Concurrency: the stage plans record/sample TaskSpec leaves in
-declaration order, submits them through `ctx.tasks` and reduces aligned frozen outcomes in that
-same order. ResourceManager, not LLMClient-private state, bounds each logical provider call.
+`label` selects class-effective instruction, examples, final Schema and model Schema; null selects
+those global values. `class_annotate_schema` returns the declared override or null. The final Schema
+includes time/code-owned fields; the model Schema excludes them. `class_schema_text` renders the model
+Schema in the same form used by actual calls. The complete annotation-postprocessing contract remains
+`docs/dev/SPEC-annotation-postprocessing.md`: model validation, synchronous postprocessor, framework time
+injection and final Schema validation precede the record validator; frame annotation bypasses that record
+validator and resolved-at counting. Program/finalizer errors remain terminal and never enter LLM repair.
 
-v1.7 label semantics (R2): `label = None` ⇒ globally configured instruction/examples (exactly
-the pre-v1.7 behavior); `label` non-None ⇒ both are read from `class_views[label].annotate`.
-The stage layer passes `item.classification.label if item.classification else None`. The
-`annotate.done` payload gains `label` (classify enabled only, §8.1).
+The stage modifies active envelopes in declaration order and returns the same list. Schema exhaustion,
+ordinary exhausted provider errors and image decode errors use their existing StageError kinds. Fatal
+provider and circuit-breaker control flow propagate from stream attempts. Request leaves execute through
+the single TaskExecutor; a fixed wave is planned before physical grouping and reduced after all groups.
 
-v1.8 sequence annotation (S5/S6/S28; `record.kind == "sequence"` only): the user message
-follows the §10.1 sequence variant — `[动作序列]` text (omitted entirely when
-`transitions is None`) → per kept keyframe `[关键帧 {i}/{k}·成员 {m}]` text + image →
-ALWAYS-CLOSING `[成员帧摘要]` text. **Template invariant: the final part of the user message
-is ALWAYS text** — the M8 repair loop concatenates onto `parts[-1].text`, an image-final
-message would silently produce "None\n…" and drop the last image (S6); the closing digest
-section exists to guarantee this with zero repair-code changes. Keyframe selection: n members
-> `annotate.sequence_frames` = k → deterministic uniform downsample
-`idx_i = ⌊i·(n−1)/(k−1)⌋, i = 0..k−1` (first/last always kept, strictly increasing, zero
-rng; n ≤ k takes all members). Self-consistency and the L2.5 hook paths are UNCHANGED (the
-L2.5 callback receives `record=None` for sequence records — documented limitation; a richer
-payload is a roadmap candidate).
+Self-consistency creates the declared odd sample count at sc_temperature. Enum/boolean/integer fields
+vote by mode; remaining fields come together from the first sample matching the modal combination,
+or from the first complete sample when no such match exists. Failed ordinary samples abstain while the
+denominator remains the declared sample count. All ordinary samples failing fails the record. Attempts
+and per-annotation usage sum successful samples, while global request/Schema costs retain every actual
+attempt. Annotation.sc records n and agreement_ratio. A capacity error in any required stream sample
+returns session control rather than being hidden by a successful sibling sample.
 
-v1.9 per-fragment keyframe quota (T14; stitched threads only — `fragment_lens` non-None):
-uniform sampling would drain a small fragment whole (minor-8), so with m fragments of
-lengths L₁..Lₘ (member-tuple order — fragments are contiguous session-order blocks;
-Σ Lᵢ = n > k ≥ m) the downsample upgrades to quotas: every fragment gets a BASE quota of 1;
-the surplus k − m is distributed by largest remainder weighted by (Lᵢ − 1) — base share
-`⌊(Lᵢ−1)·(k−m) / (n−m)⌋`, leftover units granted in descending-remainder order with ties
-broken toward the LOWER fragment index; inside each fragment the uniform downsample formula
-(S28) runs
-LOCALLY over its quota (a quota-1 fragment keeps its FIRST member, except the LAST fragment
-keeps its LAST member — preserving the global first/last invariant). DEGRADE to the v1.8
-uniform formula when `fragment_lens` is absent, single-fragment, inconsistent
-(Σ Lᵢ ≠ n), or k < m (the ≥ 1-per-fragment guarantee is infeasible). Threading duty
-(穿参义务): the stage layer derives `fragment_lens` from the `stitch_fragments` duck mark's
-`member_count` column; the M7 repair re-annotation call site threads it IDENTICALLY —
-dropping it there would silently downgrade repair re-annotation to the uniform downsample
-(§7.6).
+Repair carries the entire previous output and critiques. It uses one annotation call at the profile
+sampling temperature, with the same class selection, full rebuilt transitions and temporal context.
+Process-stream requests include every member's full text or complete visible normalized tree and every
+member image at the fixed deployment image size. All existing transition lines and repair suffixes remain
+complete. The last user part is always text for the Schema-engine repair append contract. There is no
+sequence_frames, fragment_lens, k_eff, image sampling or evidence truncation branch. image_px remains a
+legal ordinary single-record repair option; it does not change a process-stream image representation.
+Text sequence generation retains its separately frozen prompt and postprocessing path.
 
-v1.12 frame pass (SPEC-frame-annotation §3.3; the two frozen sequence-level signatures
-above are ZERO-CHANGE): sequence and frame annotation have independent switches.
-`annotate.enabled=true` runs the envelope annotation first and appends the frame pass only after
-that succeeds; a sequence-level failure still never pays for frame annotation. The frame-only
-route is frozen as `annotate.enabled=false ⇒ direct frame pass`: it builds no sequence prompt,
-performs no sequence Schema call and leaves `item.annotation=None`. In v1.18 sequence form this
-route remains valid with `segment.enabled=false`. Both routes place the frame pass after the
-quality gate and apply the execution gate `frame_annotate.enabled ∧ status=="active" ∧
-record.kind=="sequence" ∧ first-label envelope (clone criterion `classification.label !=
-classification.labels[0]` — the first-label test shared with verify's member surgery, S8;
-no classification counts as first-label) ∧
-no `segment_degraded` duck mark (degraded = noise unfiltered — never pay for junk
-frames). Dict semantics (the SINGLE SOURCE OF TRUTH for the §9.1 members[] status
-three-value set): the pass initializes `item.member_annotations` to `{}` the moment it
-runs (distinct from the never-ran `None`). Per member, label routing always reads
-`item.member_classifications[member.id]` when present; `frame.classify.enabled=false` does not
-imply `label=None`. The v1.18 projector writes an inherited frame classification for every
-generated member, so the attempt-local `frame_class_views[label]` is the corresponding
-`GenerationProgram.frame_classes[label]` view and supplies its class-effective instruction,
-few-shot examples and enabled flag. Only a genuinely absent member classification in ordinary
-process/flat input selects the global frame instruction. A selected view with `enabled=false`
-SKIPS the member and leaves NO key (+ `frame_annotate.skipped`); otherwise `annotate_member`
-occupies the key in ordinary process/flat — Annotation on success, None on an isolated member
-failure (failed 占键为 None，skipped 不占键). In a sequence attempt, a recoverable member error
-is propagated instead of occupying the key. Existing
-keys are never re-run (idempotent — the M7 backfill fills gaps only, §7.6) and the dict
-OBJECT is never replaced (fan-out clones share it by reference, §7.13). Concurrency:
-`_frame_pass` submits pure pending-member TaskSpec leaves in declaration order through
-`ctx.tasks`; recoverable member failures are typed frozen outcomes, while an escaping fatal or
-control exception triggers structured sibling cancellation. The aligned results reduce in member
-declaration order only after every child has settled. This prevents siblings from mutating
-attempt-local annotations or counters after `run_attempt` returns; SequenceWorkflow then performs
-whole-set retry. One `annotate.frame` event per member incl. skipped
-ones (§8.1).
-Counters owned here: `frame_annotate.annotated`/`skipped`/`failed` (§9.3; failed is also
-fed by the M11 pre-write backstop, §7.10).
+Synchronous preview_capacity builds actual known requests for every reachable sequence class and frame
+class. It preserves schemas, templates and fixed assets, reads no image bytes and invokes no model. Unknown
+future annotation/transition/postprocessor contents are checked again when actual requests exist. Fixed
+asset overflow changes sequence/pairwise units to fixed; frame and transition keep their existing minimum
+unit so a frame annotation failure cannot accidentally fail an entire sequence.
+
+v1.12 frame pass (SPEC-frame-annotation §3.3; extended by the current process-session capacity contract):
+
+The frame pass runs after successful sequence annotation, or directly on the separately legal generation
+frame-only route. It runs only for active sequence envelopes and the first-label owner, skips degraded
+sequence noise, initializes the shared member_annotations dict once and fills missing occurrence keys.
+Process streams use integer member positions; generation uses its existing unique member IDs.
+Per-member labels come from member_classifications even when classification is disabled because generation
+can supply inherited labels. Class views with enabled=false skip the member without inserting a key.
+Successful annotation inserts Annotation; an isolated terminal process-frame failure inserts null;
+missing keys remain skipped. Fanout siblings share the same current-attempt product dictionaries.
+
+For the separately legal generation frame-only route, `annotate.enabled=false ⇒ direct frame pass`.
+`frame.classify.enabled=false` does not imply `label=None`: sequence generation
+writes an inherited frame classification for every generated member and resolves its effective view from
+`GenerationProgram.frame_classes[label]`. A disabled classifier switch alone never clears an inherited v1.18 label.
+Only a genuinely absent member classification in ordinary process/flat input selects the global frame instruction.
+The stage submits pure pending-member TaskSpec leaves in declaration order;
+recoverable member failures are typed frozen outcomes, and aligned results reduce in member declaration order.
+Generation failure selection retains whole-set retry; process-stream capacity control first collects the full wave.
+
+Process-stream direct member calls require an explicit CapacityTarget; record IDs cannot infer duplicate
+occurrences. A new ContextOverflowError returns SessionCapacityError owned by the current orchestration
+stage, including verify subcalls. A previously established minimum frame failure is consumed without
+repeating the request and follows existing member-failure accounting. Generation recoverable failures
+instead reject the complete declared set, preserving its independent atomic-attempt contract. Cancellation
+and run-level failures always propagate. Frame annotations are internally Schema-validated and never
+increment record resolved-at buckets. Trace events and final frame counters retain their existing names.
 
 ### 7.5 M6 flat generation — `labelkit/operators/generate.py` + `generation/flat.py`
 
@@ -3163,13 +3094,15 @@ class VerifyPromptOptions:
     transitions: tuple[Transition, ...] | None = None   # sequence step table; None omits [动作序列] (v1.8 S7)
     boundary_margin: str = ""                           # [边界余量] body, pre-rendered by the driver
     fragment_structure: str = ""                        # [片段结构] body; "" omits the section (v1.9 T15)
-    fit: _PromptFit | None = None                       # panel-minimum budget packing state; None = budget off (v1.11)
+    fit: _PromptFit | None = None                       # ordinary record budget state only
+    member_positions: tuple[int, ...] = ()              # process sequence occurrence positions
+    boundary_records: tuple[tuple[int, Record], ...] = ()  # allowed complete neighbors with occurrence positions
 ```
 
 The default instance is the pre-v1.7 single-record classic call. The builder is NOT part of the
 frozen public surface, but the option object's field names and semantics are frozen here so the
 stage driver and the docs agree; `_repair_ladder` steps a variant with
-`dataclasses.replace(opts, k_eff=…, image_px=…)` on the ANNOTATE option object (§7.4), never by
+`dataclasses.replace(opts, image_px=…)` on ordinary single-record ANNOTATE options (§7.4), never by
 positional re-assembly.
 
 v1.7 label threading (R3): `options.label` selects the class-effective values for both the
@@ -3193,25 +3126,15 @@ byte-unchanged; sequence envelopes are driven by a stage-layer bypass driver:
   vocabulary is SIX values (v1.9, T15): the five v1.8 kinds + `wrong_stitch` appended last —
   `DEFECT_KINDS` in `labelkit/operators/verify.py`, mirrored by `_DEFECT_KINDS` in the
   orchestrator report assembly and the §10.7 schema enum (four-way sync).
-- **Evidence** (§10.5 sequence variant): `[任务指令]` + `[动作序列]` + (v1.9, stitch on only)
-  `[片段结构]` + `[边界余量]` (the
-  frame_digest of the k=2 frames beyond each segment boundary plus each frame's fate:
-  noise / adjacent-episode ordinal / none) + `[首帧截图]` + `[末帧截图]` + `[标注结果]` —
-  six sections in v1.8 form, SEVEN under stitch (T15: without the fragment-structure section
-  `wrong_stitch` is unjudgeable). `[片段结构]` is pre-rendered by the stage driver via the
-  public helper `fragment_structure_text(item, cfg.stitch.digest_max_chars)` ONLY when
-  `stitch.enabled` (m-11 — stitch off keeps the six-section v1.8 form byte-identical): one
-  line per fragment (thread-internal ordinal / member-index span in the rebound-tuple
-  coordinate / member count / first-frame digest) plus the seam-position table rendered from
-  `seam_indexes`/`seam_interrupted_by` (`步 {idx}（被{X}打断）`, or `接缝位置: 无`); marks
-  absent/inconsistent degrade to a single implied fragment. The section body rides
-  `VerifyPromptOptions.fragment_structure` (the `boundary_margin` construction) — an empty
-  string omits the section.
-  `[动作序列]` step lines follow the §10.1 format; review evidence carries NO `（摘取兜底）`
-  suffix (that S16 marker is M4's), but v1.9 thread-seam placeholder steps DO carry the
-  `（线索接缝：被{X}打断）` suffix (T14/T15 — a deliberate revision of the no-suffix rule:
-  without it the reviewer reads the mechanical placeholder as an unexplained jump and calls
-  spurious defects).
+- **Evidence** uses the complete §10.5 assembly: class-effective task instruction,
+  all member text or normalized trees and images, complete actions, occurrence-based fragment
+  structure, allowed neighboring frames with their images, artificial boundaries and the
+  current full annotation. fragment_structure_text(item) has no digest limit. Known upstream
+  preview cannot predict future annotations or neighbors; actual review construction checks
+  all now-known assets. Capacity cuts forbid reintroducing outside evidence as boundary margin.
+  A membership change also rebuilds any other reviewed sequence whose seam attribution changes,
+  then reannotates and re-reviews it without resetting its consumed repair rounds. Exhaustion
+  fails explicitly; rollback restores dependent products.
 - **Stitched-shell filtering (v1.9, T15 major-5).** The session-episode ordinal helper
   `_session_episodes` (feeding the `[边界余量]` "第 n 段" fates and the neighbor-episode
   determination) EXCLUDES `status == "stitched"` shells — a shell's stale member set would
@@ -3233,14 +3156,13 @@ byte-unchanged; sequence envelopes are driven by a stage-layer bypass driver:
   ADJACENT episode: mark only, no cross-episode theft → nowhere to be found: the defect
   entry gains a code-side SIBLING key `suspected = "capture_gap"` (`detail` is
   string-typed in the schema, so the annotation cannot nest under it; frames of a
-  batch_size-split session get `"session_split"` instead); ③ concurrent seam re-extraction via direct
+  matching artificial capacity boundaries get `"capacity"` and never trigger reclaim or fail alone); ③ concurrent seam re-extraction via direct
   `extract.extract_transition` calls (§7.15; 1–2 per surgery, `detail.reseamed = true`);
   ④ synchronous record rebuild (`dataclasses.replace(record, members=...)`; the record
   **id is NOT recomputed**) and transitions rebuild (renumbered so
   `len(transitions) == len(members) − 1` holds); ⑤ concurrent re-annotation via
   `annotate_record(record, ctx, AnnotatePromptOptions(transitions=<rebuilt>,
-  fragment_lens=<from the stitch_fragments duck mark — the v1.9 per-fragment-quota
-  threading duty (T14), §7.4>, …))`; → next-round
+  …))`; → next-round
   re-review. Repair
   rounds count against `max_repair_rounds` INCLUDING the first review.
 - **Frame-product sync (v1.12; SPEC-frame-annotation §3.4).** Slotted BETWEEN the surgery
@@ -3279,10 +3201,18 @@ provider/circuit/cancellation exceptions pass through unchanged and no attempt r
 to main or rejects. The old direct-assembly verdict prompt and its selection flag do not exist.
 ### 7.7 M8 — `labelkit/common/inference/schema_engine.py`
 
-The existing flat/process L0 → L1 → L2 → optional L2.5 → bounded L3 contract and
+The L0 → L1 → L2 → optional L2.5 → bounded L3 order and
 `complete_validated` return tuple remain unchanged. Deterministic repair, ordinary user output
 validator routing, user-treatment statistics and every pre-v1.18 internal Schema builder remain
 unchanged.
+
+Every process-stream call sets `CallScope.complete_evidence = true`. L3 retains the original
+messages, complete text/trees, all images and image size, then appends the previous model-space
+output and violations. `complete_finalized` projects the previous output back to model-owned fields.
+An actual repair `ContextOverflowError` preserves its original profile, phase and origin and propagates
+to the owning session stage without being converted to SchemaViolation or fed to the breaker by M8.
+Ordinary record calls with `complete_evidence = false` retain the existing compact L3 repair prompt;
+generation retains its separate post-validation and finalization repair contract.
 
 ```python
 @dataclass(frozen=True)
@@ -3294,6 +3224,7 @@ class CallScope:
     record: Mapping | None = None
     user_treatment: bool | None = None
     repair_context_bytes: int | None = None
+    complete_evidence: bool = False
 
 
 @dataclass(frozen=True)
@@ -3596,7 +3527,7 @@ class LLMClient:
                                                    # missing → no sample + ONE WARN per profile);
                                                    # operators read ctx.llm.calibrator.cost(
                                                    # profile) for packing; M10 calls
-                                                   # freeze_batch() at batch boundaries
+                                                   # freeze_batch() at ordinary batch or complete stream-session boundaries
 
     def __init__(self, llm_profiles: Mapping[str, LLMProfile],
                  embedding_profiles: Mapping[str, EmbeddingProfile],
@@ -3921,15 +3852,11 @@ v1.7 classify orchestration (spec 3.10.3 分类与扇出 row):
 
 v1.8 stream orchestration (spec 3.10.3 stream rows; active only when `segment.enabled`):
 
-- **Whole-session batching — next-fit (S21).** M10 consumes `ingestor.sessions()` (§7.1)
-  instead of `records()` and packs WHOLE sessions into batches by next-fit (sequential
-  packing, exactly ONE open bin): sessions ship in arrival order, a session that no longer
-  fits closes the current batch and opens the next. Batch capacity = `run.batch_size`
-  FRAMES. A single session longer than `batch_size` is HARD-SPLIT by M10 + ONE stderr WARN
-  + a `session_split` duck mark on the split session's frame envelopes (M7's
-  missing-frame downgrade evidence and `_meta.stream.session_split`, §9.1). The one pending
-  overflow session is the ONLY new cross-batch survivor (released as soon as it is packed —
-  it joins the closed cross-batch-survivor list of §11's no-data-persistence convention).
+- **Complete-session processing.** M10 consumes ingestor.sessions() and processes each complete
+  session in order. batch_no is the session ordinal; run.batch_size limits task leaves per physical
+  group in a frozen wave. Segment/stitch settle once. Each downstream attempt owns fresh envelopes,
+  frame products, noise claims, quality pools and ordinary-dedup reservations. Only the final attempt
+  commits dedup and dataset counts, then emits; no session_split carrier, warning or hard-cut path exists.
 - **session_id stamping (S4).** M10 stamps `PipelineItem.session_id` on frame envelopes at
   envelope construction (bookkeeping, not business logic); M14 stamps the episode envelopes
   it appends.
@@ -3955,18 +3882,11 @@ v1.8 stream orchestration (spec 3.10.3 stream rows; active only when `segment.en
   v1.9 T7 — among the terminal counts).
   Non-stream interrupted runs keep a zero residual and NO `unprocessed` key (regression
   anchor).
-- **Dry-run (S22/S23; v1.11 V12 revision).** `_estimate` gains, unconditionally printed
-  (classify precedent; 0 when disabled): `segment_calls = Σ ceil((L−1)/(w_eff−1))` with
-  `w_eff = min(segment.window, budget.min_window(cfg))` over sessions of length
-  L ≥ 2 (L = 1 or `strategy="rules"` counts 0) — an UPPER bound under a declared budget
-  (actual packing fits ≥ w_min frames per window); budget undeclared ⇒ w_eff == window and
-  the formula is the v1.8 original, values byte-identical — and `extract_calls = Σ (L−1)`
-  reported as an
-  UPPER bound; quality/annotate/verify estimates use episodes ≈ sessions as a LOWER bound +
-  a stderr note (which gains the appended sentence 「segment 按预算最坏装填报上界」 iff
-  w_eff < window, V12); the batch count is computed EXACTLY by dry-run next-fit packing of
-  the session sizes; text-modality line counting and the session dry-run fuse into a single
-  read pass (S23, §7.1).
+- **Dry-run.** Session count is the stream batch count. Segment's initial-window upper estimate is
+  sum(max(L-1, 0)) for LLM/hybrid sessions, reflecting the required complete adjacent pair; rules uses
+  zero calls. Capacity retry costs depend on actual evidence and provider errors and are not a static
+  success guarantee. Extract's upper estimate is sum(max(L-1, 0)); downstream episode estimates use
+  sessions as a lower bound and preserve class/fanout uncertainty. The pre-scan stays one read pass.
 
 v1.9 stitch orchestration (spec 3.10.3 v1.9 rows; active only when `stitch.enabled`):
 
@@ -4009,7 +3929,7 @@ MetricsSink carries no listener — byte-identical to v1.9):
   `metrics.run_estimate(...)` off the input rehearsal pre-scan (introduced by the
   E2E-FINDINGS item-4 fix) — process mode REUSES that single
   scan: UI modality flips it to `scan(estimate=True)` (the pairing table makes the totals
-  free, zero extra I/O; stream batch count = exact next-fit simulation); text modality runs
+  free, zero extra I/O; stream batch count = complete-session count); text modality runs
   the line-count estimate ONLY when `console.estimate = true` (one extra input pass the user
   explicitly buys — otherwise no `on_estimate` is emitted and the panel shows `批 i` with no
   denominator). NEVER scan twice. generate_only uses the 3.6.2 static call-count formula, no
@@ -4018,15 +3938,14 @@ MetricsSink carries no listener — byte-identical to v1.9):
   lines yield to the renderer's table (values identical item by item); the plain-mode line
   output is the byte-for-byte regression anchor (the dry-run golden layer of the
   three-layer regression anchor, U24) — including the v1.8/v1.9
-  unconditionally printed `segment_calls`/`stitch_calls` lines (v1.11: `segment_calls`
-  becomes the w_min upper bound (V12) under a declared budget — budget undeclared keeps the
-  v1.9 meaning and bytes; `stitch_calls` unchanged).
+  unconditionally printed `segment_calls`/`stitch_calls` lines. Stream estimates use the
+  necessary adjacent pair, minimum_frames=2. They do not bound reactive retries or repair calls.
 
 v1.12 frame-granularity estimate (SPEC-frame-annotation 裁决·估算上界与 golden 家族):
 
 - **Two new `estimate_run` keys.** `frame_classify_calls` / `frame_annotate_calls` —
   COARSE UPPER BOUNDS = the pre-scan frame total `Σ session_lens`, the SAME data source
-  as `segment_calls` (the actual frame classify batches members per window and the
+  as `segment_calls` (the actual stream frame classifier uses one complete episode per request and the
   actual frame annotate skips noise-dropped members, so both real counts are ≤ the frame
   total); the owning switch off ⇒ 0, and the non-stream branch is ALWAYS 0 (frame
   granularity requires stream mode, §6.3 rule 43). KEY ORDER FROZEN in the returned
@@ -4576,7 +4495,7 @@ def build_frame_classify_prompt(members: Sequence[Record], cfg: ResolvedConfig,
                                 digests: Sequence[str]) -> PromptBundle:
     """Deterministic assembly of the §10.12 frame-verdict template (v1.12)
     [FROZEN HERE]. ``digests`` is ALIGNED with ``members`` — the per-member
-    frame_digest strings at segment.digest_max_chars, precomputed ONCE per
+    complete record_evidence strings, precomputed ONCE per
     episode by the caller (the segment V9 construction: the builder never
     computes digests itself). frame_classify.vision_resolved appends a
     "[成员 {i} 截图]" text label + image part per member (working point = the
@@ -4585,20 +4504,14 @@ def build_frame_classify_prompt(members: Sequence[Record], cfg: ResolvedConfig,
     (the build_classify_prompt construction), never here."""
 
 
-async def classify_frames(members: Sequence[Record],
-                          ctx: RunContext) -> dict[str, Classification]:
-    """Frame-level closed-set batch verdict over the given member Records —
-    returns {member record.id: Classification} with source ∈ {"llm",
-    "fallback"} (v1.12) [FROZEN HERE]. PUBLIC DIRECT-CALL SURFACE: M7's
-    member-reclaim backfill calls it directly (single-element calls) — the
-    FOURTH sanctioned operator-to-operator import (§1.1 ground rules; the
-    judge_window/extract_transition contract standing). Budget declared ⇒
-    members are windowed via budget.pack_windows in the ZERO-OVERLAP
-    invocation form (§7.17); budget off ⇒ one window = all members. A
-    window's repair exhaustion / unrecoverable error lands EVERY member of
-    that window on frame_classify.fallback_class INSIDE this surface — it
-    never raises a record-level exception (the run-level big three
-    propagate)."""
+async def classify_frames(members: Sequence[Record], ctx: RunContext,
+                          target: CapacityTarget | None = None) -> dict[int | str, Classification]:
+    """帧级闭集判决；process stream 必须显式给出对齐的出现位置 target。
+    返回键为 session_position；generation 路径使用其既有唯一成员 ID。
+    process stream 每帧为最小请求单位，完整证据参与实际预算；ContextOverflowError
+    上抛会话容量控制，终态投影沿既有帧分类失败语义且不重发相同请求。
+    普通非会话调用保留其合法分窗执行路径。M7 回收补跑复用此公开接口。"""
+
 ```
 
 Normative behavior:
@@ -4635,12 +4548,12 @@ Normative behavior:
   `classification`
   swaps `label` (`labels` = the same full set); `status="active"`;
   scores/annotation/verification/errors are fresh default containers. The duck-mark copy
-  loop (D6 — v1.8 copies `session_split`/`segment_degraded`, which describe the EPISODE's
+  loop (D6 — v1.8 copies `segment_degraded`, which describe the EPISODE's
   session and segmentation, so sibling rows never contradict the original's `_meta.stream`)
   grows in v1.9 (T14) by the three M16 marks `seam_indexes` / `seam_interrupted_by` /
   `stitch_fragments`: seam_indexes drives the sibling's own extract pass (§7.15),
   seam_interrupted_by its seam-placeholder text, stitch_fragments its
-  `_meta.stream.fragments` and annotate keyframe quota (§7.4). Append order =
+  `_meta.stream.fragments`; stitch_task_name retains the final name for position-based seam rebuilding. Append order =
   (original element's batch position → label declaration order), byte-reproducible. Return
   value = the same list object passed in.
 - **Idempotency.** Items with `classification is not None` are skipped (covers generated
@@ -4652,10 +4565,8 @@ Normative behavior:
   is counted by M10 (len-delta metering, R9/§7.9) — M13 never increments `counts.*`.
 - **v1.8 sequence branch** (`record.kind == "sequence"`; spec 3.13.3 sequence row —
   zero-crash guarantee for episodes): the current-record user message follows the §10.8
-  sequence variant — `[待分类数据·序列]` episode digest (per-member `frame_digest` in member
-  order, TOTAL capped at `input.ui_tree_max_chars` with first/last members always kept and
-  whole middle entries truncated + an `…(truncated N members)` marker) + the FIRST member's
-  screenshot (UI modality; classify stays in the rule-34 vision set).
+  sequence variant — `[待分类数据·序列]` followed by all members in occurrence order,
+  full text or normalized UI trees and every member image. No member or text truncation.
 - **v1.8 multi × episode semantics (S9).** Fan-out clones always carry
   `transitions = None` (extract runs AFTER classify in the chain — each sibling extracts
   independently under its own label's effective `[class.<label>.extract]` instruction;
@@ -4691,11 +4602,11 @@ Normative behavior:
     pushed down; NEVER episode-failed,
     no `item.errors`, no error event) + `frame_classify.window_failures` +
     `frame_classify.fallback` per member. Overflow: a precheck minimal-unit overflow
-    never feeds the breaker; a reactive overflow splits the window in half and retries
-    ≤ 2 (the V20 segment mirror, `budget.degrade_retries` counted; zero-overlap
-    halving), exhaustion falls back per the window-failure rule; the reactive-400
-    terminal feeds the breaker exactly once at the swallow point (A7).
-  - **Product & observability.** `item.member_classifications = {member_id:
+    never feeds the breaker. Actual minimal frame overflow is delegated to the session
+    coordinator and permanently scoped to its occurrence, stage, profile and class view;
+    terminal projection uses the existing frame classification failure route without resending.
+    Reactive terminal failure feeds the breaker exactly once at the swallow point.
+  - **Product & observability.** `item.member_classifications = {session_position:
     Classification(label, (label,), source, detail)}`. One `classify.frame` event per
     episode (`record_ids=(episode_id,)`, payload = `members`/`windows`/`fallback`
     counts only — §8.1). Counters owned by M13:
@@ -4709,9 +4620,9 @@ Normative behavior:
 (New module, spec 3.14 / `spec/314-m14-segment.md`. Numbered AFTER §7.13 so every frozen
 §7.x anchor stays valid; chain position is the HEAD of the chain — before dedup, §7.9/§2.)
 
-Responsibilities: refine the batch's candidate sessions into episodes — regroup active
-frame envelopes (`kind == "single"`) by `session_id` (batch position order = session order,
-guaranteed by M10's whole-session packing, §7.9); optional LLM sliding-window boundary
+Responsibilities: refine one complete candidate session into episodes — active frame
+envelopes (`kind == "single"`) retain session order independently of computation groups
+managed by M10 (§7.9); optional LLM sliding-window boundary
 verdicts + per-frame noise marking (§10.9); flip members to `absorbed` / noise frames to
 `dropped_noise`, assemble sequence Records (member order-key ascending) and tail-append
 episode envelopes per the segment-absorption exception (§5). Boundaries: no
@@ -4731,16 +4642,12 @@ class SegmentStage(Stage):
 def build_segment_prompt(frames: Sequence[Record], diffs: Sequence[Mapping | None],
                          cfg: ResolvedConfig, with_reason: bool,
                          digests: Sequence[str]) -> PromptBundle:
-    """Deterministic assembly of the §10.9 template — TEMPLATE BYTES UNCHANGED; frame
-    digests and adjacent-frame diffs are pre-assembled code-side (frame_digest/tree_diff,
-    §3). `digests` is the v1.11 (V9) signature revision: the per-frame digest strings
-    ALIGNED with `frames`, precomputed ONCE per session BEFORE window packing (the packer
-    prices frames off the same vector — seam frames are no longer digested twice; the
-    poverty-guard path stays independent, §7.14); the builder no longer computes digests
-    itself. The image-part conditionality keys on `cfg.segment.vision_resolved` (V1 —
-    was `use_vision`, removed v1.11). NOTE: `judge_window`'s PUBLIC signature below does
-    NOT change — it computes its own ≤3-frame digest table internally and passes it
-    through, so M7's re-judgment surface is untouched (V9)."""
+    """Deterministically assemble full aligned member evidence and adjacent tree differences.
+    The parameter named digests contains complete record_evidence strings, computed once
+    per session and used by both budgets and prompts. It does not contain bounded frame_digest.
+    UI requests include every member image using the configured fixed deployment size.
+    judge_window retains its public signature and renders the same complete evidence for
+    its explicit frame tuple, including verify reclaim calls."""
 
 
 async def judge_window(frames: Sequence[Record], ctx: RunContext) -> list[str]:
@@ -4756,25 +4663,18 @@ async def judge_window(frames: Sequence[Record], ctx: RunContext) -> list[str]:
 
 Normative behavior (spec 3.14.4):
 
-- **Strategy** (`segment.strategy`): `"rules"` — candidate sessions become episodes as-is,
-  zero LLM (noise_filter/min_len ineffective); `"llm"`/`"hybrid"` (default hybrid) —
-  sliding-window refinement, identical behavior inside M14 (rule-layer sessionization is
-  always on in M2; "hybrid" names the composition). v1.11 (V9) window semantics:
-  `segment.window` (≥ 2) is the per-window UPPER CAP, no longer a fixed length. Budget
-  declared (the segment profile's `context_window > 0`): windows are GREEDY-PACKED per
-  session — digests precomputed once per session (§3), then windows cut by the packing
-  condition `est_static_system + Σ c_i ≤ input_budget ∧ window-frame count ≤ window`
-  (`c_i = est_text(digest_i) + DIFF_MAX_TOKENS + image cost when vision_resolved`;
-  overflow closes the window; the packer `_pack_windows(costs, budget, cap)` is M14-OWNED
-  operator logic — budget.py supplies only the estimation/budget primitives, §7.17). The
-  1-frame overlap is PRESERVED: each subsequent window starts at the previous window's
-  last frame, and the seam frame's WHOLE verdict still belongs to the LATER window —
-  unconditional overwrite during stitching. Budget off (`context_window == 0`): fixed
-  windows, step = window − 1, byte-identical to v1.10. `len(session) == 1` degrades to
-  rules (zero LLM).
-- **Calls & stitching.** One call per window; all windows across all sessions become one frozen
-  TaskGroupRequest and run through `ctx.tasks`. Stitching is a synchronous reduce after all
-  verdicts arrive, positioned by session/window declaration key — schedule-independent; zero rng.
+- **Strategy** (`segment.strategy`): rules uses the complete candidate session with zero
+  boundary LLM calls. llm/hybrid plans complete-frame windows of at most segment.window,
+  with a one-frame overlap. Window relation ownership remains with the later window.
+  Each candidate request is checked with the actual prompt, Schema, full member text/trees
+  and all images. Capacity shrinks complete windows; the minimum necessary adjacent pair
+  has two frames. If that pair cannot fit, every original session frame fails and no
+  episode is created, regardless of segment.on_error. A one-frame session uses rules.
+- **Calls and reduction.** A fixed wave is planned in session/window declaration order,
+  dispatched through RunContext.run_group, and reduced only after all its computation
+  groups finish. No grouping boundary finalizes a semantic sequence.
+
+
 - **Deductive mapping (code-side lookup — the LLM never answers the boundary question):**
   `continues`/`advances` → non-boundary; `returns_to_entry`/`context_switch` → boundary
   (THAT frame is the first frame of a new segment); `interruption` → noise. The session's
@@ -4935,7 +4835,7 @@ stitch-rebind exception
 multi-fragment threads with `seam_indexes`/`seam_interrupted_by`/`stitch_fragments`
 (§3 duck marks) and emit one `stitch.thread` event each. Boundaries: never crosses a
 session or a batch (T12 — hard-split sessions stay unstitchable across the split; the
-`session_split` mark is M10's); appends/deletes/reorders NO envelopes (the stitch-rebind
+capacity and occurrence positions are common carriers); appends/deletes/reorders NO envelopes (the stitch-rebind
 exception is status +
 rebind + rescue-flip only); no task labels beyond the internal rolling `task_name` card
 state (M13 owns classification); segment-degraded (`on_error="keep"`) episodes join the
@@ -5156,7 +5056,7 @@ TEMPLATE_HEAD_TOKENS: dict[str, int]                  # V22：per-stage 冻结�
                                                       #   离线测试跨层断言与算子常数一致；
                                                       #   segment 例外 = §10.9 全部最坏静态骨架
                                                       #   （头+结构句+with_reason 行拼接，V22 修订））
-                                                      #   v1.12 增 "frame_classify" = 81 /
+                                                      #   当前 "frame_classify" = 83 /
                                                       #   "frame_annotate" = 35 两键——跨层等式
                                                       #   测试钉住 = est_text(classify.
                                                       #   _FRAME_SYSTEM_HEAD) / est_text(
@@ -5189,8 +5089,7 @@ def pack_windows(costs: list[int], budget: int,
                                                       #   接缝归后窗 + 强制 ≥2 帧语义下限；M14 窗口
                                                       #   切分与 M13 帧级批量判决共用（帧级为零重叠
                                                       #   调用形——调用方对返回跨度去重叠）
-def min_window(cfg: ResolvedConfig) -> int            # 最坏保证装填量 w_min（V9 护栏 + V12 estimate 上界
-                                                      # 共用；未声明窗口 → cfg.segment.window 原值；基于先验）
+def min_window(cfg: ResolvedConfig) -> int            # 必需相邻两帧；不保证任意完整内容可以装入窗口
 def classify_stage_error(exc: BaseException) -> str | None
                                                       # V27①共享 helper：ContextOverflowError →
                                                       #   "context_overflow"；OutputTruncatedError →
@@ -5207,9 +5106,9 @@ class ImageCostCalibrator:                            # V19：每 profile 每图
     def observe(self, profile: str, prompt_tokens: int,
                 text_est: int, n_images: int) -> None # M9 每响应喂样本（含图调用才计；usage 缺失 → 不记样本，
                                                       #   WARN 一次/profile，先验长期生效——[C-64] 兜底）
-    def freeze_batch(self) -> None                    # M10 批边界冻结：聚合本批样本 max（序无关）压入
+    def freeze_batch(self) -> None                    # 普通批或完整流会话结束冻结：聚合周期样本 max 压入
                                                       #   deque(maxlen=CALIBRATION_WINDOW_BATCHES)，
-                                                      #   刷新可读快照（第 N 批装填只读 <N 批聚合值）
+                                                      #   同会话所有重算固定读取会话开始前快照
     def cost(self, profile: str) -> int               # 装填读数 = max(批最大值窗口) ÷ 0.85 取整；
                                                       #   累计样本 < 8 → 先验 × 1.2
 ```
@@ -5220,18 +5119,17 @@ Binding notes (from dev spec §3.2, normative):
   v1.12（装箱器下沉裁决）, a PUBLIC face of budget.py — sunk VERBATIM from the former
   segment-private `_pack_windows`, byte-equivalent behavior (the pre-existing packing
   tests hold it): M14 imports it for the greedy budget-packed window cut (V9; 1-frame
-  overlap, seam owned by
-  the later window, forced ≥2-frame semantic minimum), and M13's v1.12 frame-classify
-  batching reuses it in the zero-overlap invocation form (the caller strips the
-  overlapping head frame of every later span — the span-chaining convention itself stays
-  frozen). Apart from the packer, budget.py still supplies ONLY the estimation/budget
+  overlap, seam owned by the later window, forced ≥2-frame semantic minimum).
+  Process-stream M13 classifies a complete episode in one request; the zero-overlap
+  packer form remains only for separately legal non-session direct calls.
+  Apart from the packer, budget.py still supplies ONLY the estimation/budget
   primitives + the calibrator.
 - `est_text` is monotone over prefixes ⇒ `fit_text` bisects on line boundaries —
   deterministic, O(n log n) upper bound. CJK determination = the Unicode block CJK
   Unified Ideographs and its extensions + fullwidth punctuation (the implementation
   enumerates the ranges; tests pin exact samples).
 - `ImageCostCalibrator` determinism guard (V19/F8): the calibration snapshot is FROZEN
-  PER BATCH — batch N's packing reads only the < N batches' aggregate (only one batch is active,
+  PER SEMANTIC UNIT — ordinary batches and complete process sessions read only the < N batches' aggregate (only one batch is active,
   so the same input + same config reproduces byte-identically); samples arrive in
   asyncio completion order, so `freeze_batch()` aggregates the batch max over the
   UNORDERED sample set (order-free) into the `deque(maxlen=8)` batch-max window;
@@ -7395,10 +7293,11 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
                                    // fragments[].order_span, never this key
       "member_count": <int>,
       "member_ids": ["<member record id>", ...],
+      "member_positions": [<session position>, ...],
       "member_sources": [{"file": ..., "pair_index"|"line_no": ...}, ...],
       // v1.12 — the members array is present ONLY when frame.classify.enabled ∨
       // frame.annotate.enabled, frozen in this position: AFTER
-      // member_sources, BEFORE session_split (SPEC-frame-annotation §3.6). One entry per member in
+      // member_sources, BEFORE capacity (SPEC-frame-annotation §3.6). One entry per member in
       // rec.members order, index 0-based; ENTRY FIELD ORDER FROZEN:
       // index, id[, label][, annotation, status] —
       //   "label"      present iff frame.classify.enabled: the frame class, or null
@@ -7414,9 +7313,10 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
       "members": [{"index": 0, "id": "<member record id>", "label": "<frame class>"|null,
                    "annotation": {<frame-schema object>}|null,
                    "status": "annotated"|"skipped"|"failed"}, ...],
-      "session_split": false,      // the owning session was hard-split at batch_size
-                                   // (S21; M7's missing-frame downgrade evidence)
-      "repaired": false,           // verify defect repair rewrote the member set
+      "capacity": null | {"sealed": <bool>, "allowed_positions": [<lower>, <upper>],
+                          "before": <CapacityCut|null>, "after": <CapacityCut|null>,
+                          "root_id": "<upstream root>", "parent_id": "<direct parent>"|null},
+      "repaired": false,           // verify repaired membership or dependent seams, then reannotated/reviewed
                                    // (§7.6; disambiguates same-id sibling rows under
                                    // multi fan-out, §7.13)
       "degraded": null | {"kind": "segmentation_invalid", "windows_failed": <int>},
@@ -7426,7 +7326,8 @@ check is skipped (§7.10); `_meta` attaches per `meta_mode` as usual with `annot
       "fragments": null | [{"order_span": [<first key>, <last key>],
                             "member_count": <int>,
                             "cause": "origin"|"resumed"|"rescued",
-                            "source_episode": "<original episode id>"|null}, ...],
+                            "source_episode": "<original episode id>"|null,
+                            "member_positions": [<session position>, ...]}, ...],
                                    // session-ordered fragment table rendered from the
                                    // stitch_fragments duck mark (§3/§7.16); rescue
                                    // fragments carry source_episode = null
@@ -7634,15 +7535,15 @@ accepted gap since v1.7, spec §7 已知锐边). `rejects="none"`: no file.
   // report.json byte-identical to v1.10 — the context-budget byte-equivalence declaration);
   // counts/stats ONLY, never data content (§2.6); key names [FROZEN HERE] (V13②/④/⑤):
   // "budget": {"profiles": {"<profile>": {"context_window": 0, "input_budget": 0}},
-  //            "w_min": {"segment.window": [<cap>, <w_min>]},
+  //            "minimum_frames": 2,  // process-stream required adjacent pair, not a packing guarantee
   //            "truncations": {"<stage>": 0, ...},
   //            "overflow_records": 0,
   //            "image_cost": {"<profile>": 0},
   //            "degrade_retries": 0,
   //            "escalations": 0}
   //   — profiles = the budget-declared profiles with their derived input_budget (V13②);
-  //     w_min pairs [cap, w_min] under the frozen sub-key "segment.window" (V9/V12,
-  //     budget.min_window as the single fact source); truncations = per-stage §3.3
+  //     minimum_frames is present only for process stream and equals 2;
+  //     truncations = per-stage content trims in ordinary paths, never stream evidence;
   //     content-trim counts; overflow_records = context_overflow rejects, all phases
   //     (L3-repair-internal overflows excluded, V25①); image_cost = each profile's
   //     calibration END value (V19 — reconciles against usage); degrade_retries = V20
@@ -7749,7 +7650,7 @@ list — quality/classify/verify/
 annotate/dedup/generate, the last for the generate seed tail-drop entry of that list);
 `budget.degrade_retries`
 (owner = the operator performing the bounded overflow degrade (V20)
-— segment window re-split / annotate frame-halving / quality text-tightening);
+— segment complete-window re-split and separately legal ordinary-record budget retries);
 `budget.escalations` (owner M7 — the trigger of the verify-repair escalation ladder, V21);
 `budget.overflow_records` (owner = the stage recording the `context_overflow` reject,
 all phases); `segment.windows` (owner M14 — the counter itself is emitted
@@ -7758,7 +7659,7 @@ surface `report.stream.windows` is BUDGET-GATED per spec §6.4: present only whe
 segment stage's profile declares `context_window > 0`, keeping the all-undeclared
 report byte-identical to v1.10 — unlike the unconditional
 `below_min_len`/`digest_poor_frames` report fields).
-`report.budget.profiles` / `w_min` / `image_cost` are NOT MetricsSink counters — M10
+`report.budget.profiles` / `minimum_frames` / `image_cost` are NOT MetricsSink counters — M10
 assembles them at report time from ResolvedConfig, `budget.min_window(cfg)` and
 `llm.calibrator` (the profiles and image-cost branches of the budget-observability
 ruling V13).
@@ -8138,28 +8039,26 @@ user (current record):
                   {record.ui_tree.serialize(max_chars=input.ui_tree_max_chars)}
 ```
 
-v1.8 sequence variant (`record.kind == "sequence"`, S5/S6 — segment ORDER and the step-line
-format are frozen verbatim; system message unchanged):
+Process-stream sequence variant (`run.mode == "process"` and `segment.enabled`):
 
 ```
-user (current record, sequence form — one user message, parts in this exact order):
-  ① text part:  [动作序列]                    ← section omitted ENTIRELY when
-                                                item.transitions is None
-                {index}. {action_type}（对象: {target|—}；值: {value|—}）{description}
-                                              ← one line per Transition, index ascending;
-                                                null target/value render as the char "—"
-  ② per kept keyframe (keyframe ordinal i of k, member ordinal m; selection per §7.4):
-     text part:  [关键帧 {i}/{k}·成员 {m}]
-     image part: member.image                 (encoded by M9 at call time)
-  ③ text part:  [成员帧摘要]                  ← ALWAYS-PRESENT closing section
-                {frame_digest of EVERY member, one per line, member order, total bounded}
+user (current record, one message):
+  text part: [动作序列]                     ← absent when transitions is None
+             {all transition lines in index order; no step clipping}
+  text part: [序列成员]
+  per member i, in occurrence order:
+    text part: [成员 {i} 截图]              ← only when that member has an image
+    image part: member.image
+    text part: [成员 {i}]
+               {full text or UITree.serialize(max_chars=None)}
 ```
 
-**Template invariant (S6): the final part is ALWAYS the closing `[成员帧摘要]` text
-section** — the M7 repair
-suffix (§10.5) concatenates onto `parts[-1].text`; an image-final message would silently
-render "None\n…" and drop the last frame. The `[动作序列]` line format
-`{index}. {action_type}（对象: {target|—}；值: {value|—}）{description}` is **[FROZEN HERE]**.
+The final part is text. Repair appends its complete critique to that part and preserves
+all original evidence. Fixed deployment image sizing remains; capacity never removes
+members, samples images or truncates text. The transition line remains
+`{index}. {action_type}（对象: {target|—}；值: {value|—}）{description}`.
+Generation sequence rendering retains its separate existing text-only member-digest path.
+
 
 ### 10.2 M4 pairwise judging prompt (spec 3.4.3 / the third worked example in spec 3.4.6)
 
@@ -8184,36 +8083,25 @@ text `[记录 A 屏幕截图]`, the image part, text `[记录 A UI 控件树]\n{
 input.ui_tree_max_chars)}` (same for B) **[FROZEN HERE labels]**. Record content for text
 modality = `record.text`.
 
-v1.8 sequence records (spec 3.4.3 sequence row — applies to the record-content section of
-BOTH this template and §10.3): a `kind == "sequence"` record renders as TEXT ONLY (no image
-parts even in UI modality — the §6.3 rule-34 quality relaxation), two subsections in order
-**[FROZEN HERE]**:
+Process-stream sequence records in pairwise and pointwise prompts use complete evidence:
 
 ```
-[步骤序列]                                    ← omitted entirely when transitions is None
-{index}. {action_type}（对象: {target|—}；值: {value|—}）{description}（摘取兜底）
-                                              ← same line format as §10.1; the trailing
-                                                「（摘取兜底）」 suffix appears ONLY on
-                                                fallback steps (Transition.detail.kind ==
-                                                "extraction_invalid", S16) so fallback
-                                                steps stay distinguishable from
-                                                LLM-confirmed "other"
-{index}. {action_type}（对象: {target|—}；值: {value|—}）{description}（线索接缝：被{X}打断）
-                                              ← v1.9 (T14): the PARALLEL trailing suffix
-                                                appears ONLY on thread-seam placeholder
-                                                steps (Transition.detail.kind ==
-                                                "thread_seam"); X = detail.interrupted_by
-                                                joined with 「、」 — without it the
-                                                trajectory rubric's noise_residue/coherence
-                                                criteria would read the mechanical seam as
-                                                noise residue / an unexplained jump
-[成员帧摘要]
-{frame_digest of every member, one per line, member order, total bounded}
+text part: [记录 X·操作序列]
+text part: [步骤序列]                       ← absent when transitions is None
+           {all step lines, including extraction_invalid and thread_seam attribution}
+text part: [序列成员]
+per member i:
+  text part: [成员 {i} 截图]                ← when an image exists
+  image part: member.image
+  text part: [成员 {i}]
+             {full text or full normalized UI tree}
 ```
 
-In pairwise judging the two subsections sit inside the `[记录 X]` content slot (labels
-unchanged); in §10.3 pointwise they replace `{record content}`. The `excerpt` trace tier for
-sequences carries the first 200 chars of the member-digest rendering (§7.3).
+Pairwise preserves both sides and their images. Fixed rubric, all criterion instructions
+and actual Schema enter the same request budget. Trace excerpts remain an observation
+channel and never replace model evidence. Ordinary and generation rendering retain their
+separate legitimate behavior.
+
 
 ### 10.3 M4 pointwise prompt (spec 3.4.4 / the seventh worked example in spec 3.4.6) — one call per record per criterion
 
@@ -8278,60 +8166,48 @@ annotation prompt when re-annotating (`RepairContext`):
 请修正后重新输出
 ```
 
-v1.8 stream variant (sequence envelopes only, spec 3.7 stream branch — structure per SPEC
-§3.5: the defect explanation in system — five kinds in v1.8, SIX in v1.9 (`wrong_stitch`
-appended, T15) — and the six-section user order, SEVEN under stitch (v1.9: `[片段结构]`
-slots between the action sequence and the boundary margin); wording
-**[FROZEN HERE]**; validated against `defect_verdict_schema()` §10.7, NOT `VERDICT_SCHEMA`):
+Process-stream verify uses the complete member evidence and occurrence-position schema.
 
 ```
 system:
-  你是标注质量审核员。给定任务指令、动作序列、边界余量与首末帧截图，独立判断该序列
+  你是标注质量审核员。给定任务指令、完整成员证据、动作序列与边界余量，独立判断该序列
   （episode）的标注是否合格。
-  评审维度: ① 是否遵循任务指令 ② 与动作序列及首末帧证据的事实一致性 ③ 字段语义是否正确填写
+  评审维度: ① 是否遵循任务指令 ② 与完整成员及动作序列证据的事实一致性 ③ 字段语义是否正确填写
   ④ 段边界与成员构成是否成立（对照下列缺陷类型）
-  {verify.extra_criteria}                   ← line omitted when empty
+  {class-effective verify.extra_criteria, omitted when empty}
   缺陷类型（发现即列入 defects，可为空数组）:
   - label_mismatch: 标注的任务标签与序列证据不符
-  - off_task_members: 段内混入与任务无关的成员帧（members 列出这些成员帧 id）
+  - off_task_members: 段内混入与任务无关的成员帧（members 列出这些成员出现位置）
   - missing_head: 段首缺少任务起点帧（结合边界余量判断）
   - missing_tail: 段尾缺少任务终点帧（结合边界余量判断）
-  - missing_members: 段中缺失成员帧（members 列出可指认的帧 id，无从指认则为 null）
+  - missing_members: 段中缺失成员帧（members 列出可指认的帧出现位置，无从指认则为 null）
   - wrong_stitch: 线索缝合错误——各碎片并非同一任务的延续（结合片段结构判断）
-                                            ← v1.9 (T15): sixth bullet, appended last;
-                                              present in ALL stream reviews (the schema enum
-                                              carries six kinds unconditionally)
   先逐维度给出简短意见，再列缺陷表，最后给结论。
   输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
   {"critiques": [{"aspect": <维度>, "opinion": <一句话意见>}, ...],
-   "defects": [{"kind": <缺陷类型>, "members": <帧 id 数组|null>,
+   "defects": [{"kind": <缺陷类型>, "members": <非负整数出现位置数组|null>,
                 "position": <位置说明|null>, "detail": <一句话>}, ...],
    "verdict": "pass"|"fail"}
-user (one message, six sections — SEVEN when stitch is on (v1.9) — IN THIS ORDER):
-  text part:  [任务指令] {annotate.instruction — class-effective value under classify}
-  text part:  [动作序列] {item.transitions rendered per the §10.1 line format;
-                          section omitted when transitions is None; v1.9: thread-seam
-                          placeholder steps carry the 「（线索接缝：被{X}打断）」 suffix
-                          (T14/T15 — §7.6; the 「（摘取兜底）」 suffix stays M4-only)}
-  text part:  [片段结构] {v1.9 (T15) — SECTION PRESENT ONLY when stitch.enabled (m-11;
-                          stitch off keeps the six-section v1.8 form byte-identical):
-                          one line per fragment —
-                          碎片 {k}/{m}: 成员 {start}–{end}（{count} 帧）｜首帧摘要: {digest}
-                          (member-index span in the rebound-tuple coordinate; digest cap =
-                          stitch.digest_max_chars) — then the seam-position table:
-                          接缝位置: 步 {idx}（被{X}打断）；… or 接缝位置: 无}
-  text part:  [边界余量] {frame_digest of the k=2 frames beyond EACH segment boundary,
-                          each annotated with its fate: noise / 相邻段序数 / 无}
-  text part:  [首帧截图]
-  image part: first member's image
-  text part:  [末帧截图]
-  image part: last member's image
-  text part:  [标注结果] {json.dumps(annotation.output, ensure_ascii=False)}
+user (one message):
+  text part: [任务指令] {class-effective annotate.instruction}
+  per member:
+    text part: [成员出现位置 {session_position}]
+               {full text or full normalized UI tree}
+    image part: member.image                   ← when image exists
+  text part: [动作序列]                        ← absent when transitions is None
+             {step.index}. {json.dumps(dict(step.action), ensure_ascii=False)}
+  text part: [片段结构] {fragment_structure}    ← absent when no fragment structure
+  text part: [边界余量] {complete allowed neighboring frame evidence and artificial cuts}
+  image parts: every referenced allowed neighboring UI frame image, in occurrence order
+  text part: [标注结果] {json.dumps(annotation.output, ensure_ascii=False)}
 ```
 
-A `fail` verdict with an empty defects array is normalized code-side to one default
-`label_mismatch` entry (S7, §7.6). The non-stream template above is byte-unchanged
-(regression anchor).
+Fragment structure carries exact member occurrence positions, counts and interruption
+names. Boundary evidence excludes positions outside the capacity bounds. Prompt preview
+and actual request use this same complete assembly, including all referenced images.
+A fail verdict with no defects becomes label_mismatch. Defects caused exactly by an
+artificial capacity boundary remain audited suspicions and do not alone fail the view.
+All other defect semantics and the ordinary non-stream template remain in force.
 
 ### 10.6 M8 L3 repair prompt (spec 3.8.2 / 3.8.4, verbatim) — single user message
 
@@ -8490,7 +8366,7 @@ def defect_verdict_schema() -> dict:
                     "items": {"type": "object",
                               "properties": {"kind": {"type": "string", "enum": kinds},
                                              "members": {"type": ["array", "null"],
-                                                         "items": {"type": "string"}},
+                                                         "items": {"type": "integer", "minimum": 0}},
                                              "position": {"type": ["string", "null"]},
                                              "detail": {"type": "string"}},
                               "required": ["kind", "members", "position", "detail"],
@@ -8722,23 +8598,21 @@ image part (encoded by M9 at call time), text `[UI 控件树]\n{serialize(...)}`
 single-record assembly shape as §10.1 (R27). Deterministic string concatenation throughout;
 class table and per-class examples follow `[[classify.classes]]` declaration order.
 
-v1.8 sequence variant (`record.kind == "sequence"`, spec 3.13.3 sequence row — system and
-few-shot messages unchanged; the current-record user message becomes):
+Process-stream classification sequence variant:
 
 ```
-user (current record, sequence form):
-  text part:  [待分类数据·序列]
-              {frame_digest of the members, one per line, member order — TOTAL capped at
-               input.ui_tree_max_chars: first/last members always kept, middle entries
-               truncated WHOLE, capped output ends with the marker line
-               "…(truncated N members)"}
-  (UI modality only — classify stays in the §6.3 rule-34 vision set:)
-  text part:  [首帧截图]
-  image part: first member's image             (encoded by M9 at call time)
+user (current record):
+  text part: [待分类数据·序列]
+  per member i, in occurrence order:
+    text part: [成员 {i} 截图]              ← when an image exists
+    image part: member.image
+    text part: [成员 {i}]
+               {full text or full normalized UI tree}
 ```
 
-Section label `[待分类数据·序列]`, the `[首帧截图]` label and the truncation-marker line
-are **[FROZEN HERE]**. Text-modality sequences carry the digest part only.
+System instructions, examples and classification Schema stay complete. No first/last
+selection, middle-member marker or total text cap applies to this branch.
+
 
 ### 10.9 M14 segment window-verdict prompt (spec 3.14.4, verbatim)
 
@@ -8761,7 +8635,7 @@ system:
   输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
   {"frames": [{"index": <窗内帧序号>, "relation": <词表值>[, "reason": <一句话理由>]}, ...]}（恰 {N} 项）
 user（窗内逐帧，一帧一段）:
-  [帧 {i}] {frame_digest(frame_i, segment.digest_max_chars)}
+  [帧 {i}] {record_evidence(frame_i)}
   [帧 {i} 变更] {tree_diff(frame_{i-1}, frame_i) 的文字化摘要}      ← i ≥ 1；窗首帧无此行
   （seg.vision_resolved = true 时：每帧摘要 text Part 前附该帧 kind="image" 的 Part，3.9.2
     ——v1.11/V1：判据为 M1 派生的 parse product，取代 v1.11 已移除的 segment.use_vision 键；
@@ -8805,7 +8679,10 @@ user（单条消息多 Part——「text 标签 + image」组装惯例同 3.5.2/
   image part: s_{i+1}.image
   text part:  [树变更摘要] {tree_diff(s_i.ui_tree, s_{i+1}.ui_tree) 的文字化}
                                                  ← include_diff = true 时；false 整段省略
-              [前后帧树摘要] {frame_digest(s_i)} → {frame_digest(s_{i+1})}
+              [前一帧完整控件树]
+              {record_evidence(s_i)}
+              [后一帧完整控件树]
+              {record_evidence(s_{i+1})}
 ```
 
 Field semantics (verbatim-frozen table; vocabulary legality is enforced by the schema enum,
@@ -8872,7 +8749,7 @@ structure):
   bootstrap). The system message is the head + optional `stitch.context` line + the
   structure sentence + the three-line structure shape, joined by newlines.
 - Card assembly is deterministic string concatenation; each frame digest inside a card is
-  truncated to `stitch.digest_max_chars` (the segment key-name semantics, m-9). The thread
+  truncated to `stitch.digest_max_chars` for semantic selection cards only. The thread
   card's fifth line is `尾帧摘要`, the candidate card's is `末帧摘要` (distinct labels,
   frozen); the candidate card carries NO fragment count and NO 接续对 line.
 - The `接续对` line textualizes `tree_diff(thread tail frame, candidate head frame)` in the
@@ -8898,15 +8775,15 @@ structure):
 ```
 system:
   [任务]
-  你是数据流的逐帧分类员。下面给出同一会话中按时间顺序排列的 {N} 帧成员摘要，对每一帧独立判断它属于以下类别中的哪一类，只能从以下封闭类别表中取恰一值。类别表：
+  你是数据流的逐帧分类员。下面给出同一会话中按时间顺序排列的 {N} 帧完整成员证据，对每一帧独立判断它属于以下类别中的哪一类，只能从以下封闭类别表中取恰一值。类别表：
   - {name}: {description}                       ← 按 [[frame.classify.classes]] 声明序逐类一行
   输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：
-  {"labels": [<第 1 帧类名>, <第 2 帧类名>, ...]}（恰 {N} 项，按帧序与成员摘要行对齐）
-user（单条消息；一窗一调用）:
+  {"labels": [<第 1 帧类名>, <第 2 帧类名>, ...]}（恰 {N} 项，按帧序与完整成员证据行对齐）
+user（单条消息；process stream 每 episode 一调用）:
   text part:  [会话成员帧]
               {m}. {digest}
-              （↑ 1-based 成员摘要行，一成员一行——digests 与 members 对齐，按
-                frame_digest @ segment.digest_max_chars 每 episode 预计算一次，
+              （↑ 1-based 完整成员行，一成员一行——digests 与 members 对齐，按
+                完整 record_evidence 每 episode 预计算一次，
                 装配器永不自行计算摘要，§7.13）
   （frame_classify.vision_resolved = true 时，每成员追加两部件：）
   text part:  [成员 {i} 截图]
@@ -8932,10 +8809,12 @@ alignment parenthesis), `_LABEL_FRAME_MEMBERS`, `_LABEL_MEMBER_SCREENSHOT`,
 - `{N}` is substituted via `str.replace` at assembly time with the window's member count;
   budget estimation prices the UN-substituted constant form — the 1–2-char substitution
   delta is absorbed by the margin (the segment §10.9 precedent, V7).
-  `TEMPLATE_HEAD_TOKENS["frame_classify"] = 81 = est_text(_FRAME_SYSTEM_HEAD)` is pinned
+  `TEMPLATE_HEAD_TOKENS["frame_classify"] = 83 = est_text(_FRAME_SYSTEM_HEAD)` is pinned
   by the cross-layer equality test (`tests/common/inference/test_budget.py`, §7.17).
-- One call per WINDOW (`budget.pack_windows` zero-overlap invocation form under a
-  declared budget; budget off ⇒ one window = all members, §7.13/§7.17). Response
+- Process stream classifies every complete episode in one request and returns an aligned labels array.
+  More than one member is a sequence capacity unit; one member or a reclaimed frame is a frame unit.
+  Fixed-template overflow on a multi-member request is a fixed unit. Computation groups and segment.window
+  do not partition a downstream frame-classification request. Other legal direct calls retain budget-packed windows. Response
   validated against `frame_classify_schema(names, n)` — exact JSON in §7.13; positional
   alignment/first-wins/missing ⇒ fallback are code-side, never the LLM's problem.
 
@@ -9497,24 +9376,28 @@ its final full-Schema revalidation occur after M8 success and never enter L3.
    key selection is deterministic least-in-flight and never changes what data is produced, v1.6).
 5. **No data persistence**: no temp files beyond the declared output channels (`.part` files are
    part of output delivery); no caches, checkpoints, or cross-run state; the closed list of
-   cross-batch survivors is: DedupIndex, MetricsSink counters, M9 usage — all content-free —
-   plus, v1.8 stream mode only, M2's unclosed-session buffer (≤ `session_max_len` Record
-   metadata entries, images still lazy) and M10's single pending overflow session (next-fit's
-   open bin, §7.9) — both process-memory only, released as soon as they are packed/consumed;
-   neither is a new disk surface (spec §2.6).
+   state surviving physical groups is DedupIndex, MetricsSink and M9 usage/calibration, plus
+   the current complete session: immutable upstream snapshot, one mutable attempt and its local
+   dedup increment. Images remain lazy. A session releases its temporary state on completion or
+   cancellation; no cache/checkpoint/cross-run state is added. Raw text has no separate byte hard cap,
+   so retained-frame high-water is not a physical RAM guarantee.
 6. **Atomic delivery**: main output/sidecar via `.part` + fsync + rename (§9.4).
 7. **Privacy**: data goes only to configured endpoints; API keys only via env → memory
    (`repr=False` fields), never in logs, traces, reports, or exceptions; stderr never carries
    data content or prompts; trace content is tiered per §8.3; reports contain counts only.
 8. **LLM output is untrusted**: every LLM-produced object (annotations, judgments, verdicts,
    samples, repairs) passes M8 L2 validation before use; M11 re-validates before writing.
-9. **Memory**: image bytes loaded per request and released; batch intermediates dropped after
+9. **Memory**: image bytes loaded per request and released; ordinary batch or process-session intermediates dropped after
    emit; ≤500k records design target.
 10. **Log-write failures never interrupt the run** (warn once, close channel, count drops).
 
 ---
 
-## 12. Registry of decisions frozen by this document
+## 12. Historical decision registry
+
+The entries below preserve release history only. They are not current implementation requirements;
+current normative APIs and behavior are specified above. Superseded sampling and batch-lifetime
+requirements do not authorize compatibility code.
 
 Spec-silent or spec-ambiguous points, resolved here (do not re-litigate in code review):
 

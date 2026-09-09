@@ -1,5 +1,6 @@
-dry-run: mode=process estimated_records=53 batches=1
-dry-run: estimated LLM calls — generate_calls=0 segment_calls=5 stitch_calls=10 classify_calls=5 frame_classify_calls=0 extract_calls=48 quality_calls=20 annotate_calls=5 frame_annotate_calls=0 verify_calls=5 total=98 (excludes retries and repair calls)
+dry-run: mode=process estimated_records=53 batches=5
+dry-run: estimated LLM calls — generate_calls=0 segment_calls=48 stitch_calls=10 classify_calls=5 frame_classify_calls=0 extract_calls=48 quality_calls=20 annotate_calls=5 frame_annotate_calls=0 verify_calls=5 total=141 (excludes retries and repair calls)
 dry-run: note: estimated with global config / multi reports a lower bound at label multiplier 1
 dry-run: note: stream estimate: downstream reports a lower bound at episodes≈sessions (LLM refinement only adds segments)
+dry-run: note: capacity repartition and retries may change actual sequence and call counts
 dry-run: no LLM calls made, no output written (report and trace only)

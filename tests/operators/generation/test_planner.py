@@ -445,7 +445,7 @@ def test_six_hundred_positive_branches_compile_three_hundred_selected_pairs(
     assert plan.digest == _independent_domain_digest(
         "scenario_plan", _independent_plan_value(plan),
     )
-    assert plan.digest == "e35e28724cd004930b79a404bbc61a733e799fb88789289542b2d6bb02d2fb93"
+    assert plan.digest == "24fb973dfe2054c0f8c573afe7bc48ec188b4944cabfd7e573ee4240c393416d"
 
 
 def test_same_resource_half_open_adjacency_and_multi_resource_carrier(declared_program):

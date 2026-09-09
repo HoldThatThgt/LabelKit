@@ -1,0 +1,1 @@
+{"type":"object","properties":{"request_id":{"type":"string"},"destination":{"type":"string"},"color":{"type":"string"},"quantity":{"type":"integer"}},"required":["request_id","destination","color","quantity"],"additionalProperties":false}

@@ -506,8 +506,58 @@ class Transition:                          # v1.8：一次 M15 extract 对相邻
                                            # 干净抽取时为 {}
 
 
+@dataclass(frozen=True)
+class CapacityCut:
+    """记录完整成员之间的人工容量切点。
+
+    @param left_position 切点左侧最后一个原始成员位置。
+    @param right_position 切点右侧第一个原始成员位置。
+    @param stage 产生切点的编排阶段。
+    @param profile 触发容量边界的模型档案。
+    @param phase 预检或真实端点溢出。
+    """
+
+    left_position: int                     # 左侧成员在完整会话中的出现位置
+    right_position: int                    # 右侧成员在完整会话中的出现位置
+    stage: str                             # 产生边界的阶段名
+    profile: str | None                    # 模型档案名，不包含凭据
+    phase: Literal["precheck", "reactive"] # 容量错误的真实归因
+
+
+@dataclass(frozen=True)
+class SequenceBounds:
+    """限定一条序列允许认领的会话位置半开区间。
+
+    @param lower 可认领位置的包含下界。
+    @param upper 可认领位置的不包含上界。
+    @param before 下界对应的人工切点。
+    @param after 上界对应的人工切点。
+    """
+
+    lower: int                             # 包含下界
+    upper: int                             # 不包含上界
+    before: CapacityCut | None = None      # 左侧容量边界，无人工边界时为空
+    after: CapacityCut | None = None       # 右侧容量边界，无人工边界时为空
+
+
+@dataclass(frozen=True)
+class SequenceCapacity:
+    """保存普通序列的容量封闭、认领范围与拆分谱系。
+
+    @param bounds 只会收紧的允许成员范围。
+    @param sealed 是否已禁止继续缝合。
+    @param root_id 下游重算前冻结的上游序列身份。
+    @param parent_id 本次容量子序列的直接父身份。
+    """
+
+    bounds: SequenceBounds                 # 容量切点约束的成员认领区间
+    sealed: bool = False                   # 禁止作为任意合并的候选和目标
+    root_id: str | None = None             # 冻结的上游根序列身份
+    parent_id: str | None = None           # 直接被拆分的父序列身份
+
+
 @dataclass
-class PipelineItem:                        # **唯一**可变信封；生命周期 = 一个批次
+class PipelineItem:                        # 唯一可变信封；普通流处理生命周期为一次会话尝试
     """流水线信封：包裹一条冻结的 Record，累积各阶段产物与状态。"""
 
     record: Record                         # 被包裹的记录（单帧或序列）
@@ -527,15 +577,19 @@ class PipelineItem:                        # **唯一**可变信封；生命周�
                                            # seam_indexes / seam_interrupted_by / stitch_fragments
                                            # 随行（T20，由 classify._fan_out 复制）
     transitions: tuple[Transition, ...] | None = None   # v1.8：M15 extract 写入
-    member_classifications: dict[str, Classification] | None = None
+    member_classifications: dict[int | str, Classification] | None = None
                                            # v1.12：M13 帧级批量判决写入（首标签序列信封）；
-                                           # 键 = 成员 record.id；扇出克隆按引用共享同一 dict
+                                           # 普通流键为成员出现位置，生成键为 record.id；扇出共享同一 dict
                                            # （record/dedup 同族，classify._fan_out 显式复制）
-    member_annotations: dict[str, Annotation] | None = None
+    member_annotations: dict[int | str, Annotation | None] | None = None
                                            # v1.12：M5 帧级逐帧标注写入（同一执行门）；
-                                           # 键 = 成员 record.id；值 None = 该成员标注不可修复
+                                           # 键与 member_classifications 相同；值 None = 该成员标注不可修复
                                            # （failed 占键为 None，skipped 不占键——单一真相 =
                                            # dict 形态本身）；克隆按引用共享（同上）
     temporal_context: SequenceTemporalContext | None = None
                                            # v1.20：sequence generation M5/M7 唯一冻结时间上下文；
                                            # 普通 process 信封固定为 None
+    session_position: int | None = None    # 普通流输入帧在完整会话中的零起始出现位置
+    member_positions: tuple[int, ...] = () # 普通流序列的有序成员出现位置，与 members 一一对应
+    capacity: SequenceCapacity | None = None
+                                           # 普通流序列的容量与谱系；普通单记录和生成路径为空

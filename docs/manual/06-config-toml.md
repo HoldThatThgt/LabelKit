@@ -158,7 +158,7 @@ stateDiagram-v2
 | 键 | 默认 | 填错的后果 |
 |---|---|---|
 | `supports_structured_output` | false | 声明该模型支持原生结构化输出。填 `true` 时，结构引擎启用结构化输出层：OpenAI 兼容口传 `response_format={"type":"json_schema",...}`，Anthropic 口用强制工具调用把 Schema 作为工具入参。**模型实际不支持却填 true** ⇒ 请求可能直接报 400。填 false 完全没问题——只是结构保证全部落到代码修复层（第 14 章），多花一点修复调用 |
-| `supports_vision` | false | 声明该模型能看图。**UI 模态下被引用的 profile 必须为 true**——这是启动时的硬校验（填 false 会退出码 2），因为跑到一半才发现模型看不了图，钱已经烧了。v1.8/v1.9 流模式（第 25、26 章）下这条校验有三处例外：`extract.llm` 所引 profile **恒**要求 true（每次摘取都看前后两帧截图）；`quality.llm` 反而**免除**要求（序列打分是纯文本，UI 模态也不看图）；`stitch.llm`（v1.9）同样**恒不**要求（缝合判定的证据是摘要卡，纯文本无图）。`segment.llm` v1.11 起**不在视觉必需集内**：分段窗口是否附图由所引 profile 的本键**自动推导**（所引 profile 支持视觉就自动附图，选 profile 即选能力；要纯文本裁决就把 `segment.llm` 指向纯文本 profile，第 25 章）。v1.12 帧粒度（第 25 章 25.6）再添两条：`frame.annotate.llm` 所引 profile 在 UI 模态且 `frame.annotate` 启用时**恒**要求 true（逐成员标注要看帧截图）；`frame.classify.llm` **永不**加入视觉必需集（判决仅凭成员摘要行，纯文本无图——可指向纯文本 profile 省成本） |
+| `supports_vision` | false | UI 普通流中，实际接收截图的 segment、classify、frame.classify、extract、quality、annotate、frame.annotate、verify 及相关修复 profile 必须支持视觉。每个成员的完整图片证据都会进入对应请求。stitch 仍使用纯文本语义卡片，不要求视觉，但合并候选必须另过完整序列容量预检。 |
 
 ### vLLM 扩展请求参数
 
@@ -201,12 +201,12 @@ extra_body = { top_k = 50, min_p = 0.05 }
 
 ### 上下文预算与图片工作点（v1.11）
 
-v1.11 给每个 profile 增加一套**可选**的上下文预算机制：声明模型的上下文窗口后，工具对每一次 LLM 调用保证「输入估算 + `max_output_tokens` + 安全边距 ≤ 窗口」——各算子按预算动态装填（条数类参数从固定值降级为**上限**），装不下的记录在调用发出前就按 `context_overflow` 记录级拒收，而不是把超大记录打到端点上换一个 400 去攒熔断（第 18 章）。全部不声明时，工具行为与 v1.10 一致。
+上下文预算按实际完整请求估算，预留输出和安全边距。普通流要求所有实际使用的 LLM 与语义 embedding profile 声明正值 `context_window`。预检只覆盖当时已知的完整证据，不能承诺尚未生成的标注、修复意见或实际 provider 一定可装。真实上下文溢出在会话提交前沿完整成员边界缩短序列，保留后段并重算；不会为了预算截断成员证据。普通单记录保留其既有可选预算机制。
 
 | 键 | 默认 | 含义 |
 |---|---|---|
-| `context_window` | 0 | 模型上下文窗口（token）。**0 = 未声明 = 该 profile 预算关闭**（被启用算子引用时启动打一条 WARN 提示可声明）。> 0 即开启预算，且须满足 `context_window > max_output_tokens + margin`，否则预算为非正数、直接配置错误（退出码 2）；`margin = max(256, ⌈0.10 × context_window⌉)`，承担估算残差与消息封装开销。**声明部署实效窗口，别照抄厂商表**：同名模型在不同部署实效窗口差数倍（Together 256K；vLLM 由 `--max-model-len` 决定；z.ai anthropic 路由的裸 glm-5.2 实测实效窗是 2²⁰ = 1,048,576，且按 `input + max_tokens` 合并判定——窗口只能实测，文档与命名约定都不可靠）。不确定时**欠声明恒安全**：声明小了只会多裁剪，绝不会溢出 |
-| `default_image_px` | 0 | 图片采样**默认工作点**（长边 px）。**0 = 沿用 `max_image_px`**（v1.10 行为逐字节不变）；> 0 时须 ≤ `max_image_px`，违反即配置错误（退出码 2）。日常调用按工作点缩放编码；verify 判 fail 走 repair 修复重标时按质量阶梯逐档上探（× 1.5/维），封顶 `max_image_px`（第 13 章） |
+| `context_window` | 0 | 模型部署的实际上下文窗口。普通流实际使用的 profile 必须为正值，且大于输出预留与 `margin = max(256, ceil(0.10 × context_window))`。普通单记录的 0 表示预算关闭。应填部署实效值；较小声明可能增加容量切分，估算仍可能与 provider 不一致，实际超限由会话协调器处理。 |
+| `default_image_px` | 0 | 默认图片工作点；0 使用 max_image_px，正值不超过 max_image_px。普通流保留固定部署表达口径，容量压力不会触发动态降清、抽图或文本裁剪。 |
 
 ### 计价（可选但强烈建议配）
 
@@ -225,7 +225,7 @@ v1.11 给每个 profile 增加一套**可选**的上下文预算机制：声明�
 | `api_key_envs` | 无 | v1.6 密钥池，与 `api_key_env` 恰提供其一；轮换/冷却/禁用/驻留机制与 LLM profile 完全一致（见 6.3「密钥池」），每个列出的环境变量都须存在且非空 |
 | `max_concurrency` / `timeout_s` / `max_retries` / `retry_base_delay_s` | 8 / 60 / 5 / 1.0 | 与 LLM profile 同一套重试/限流机制 |
 | `dims` | 不设 | 设了就逐次校验返回向量的维度，不匹配立即判致命错误——防「模型换了没人知道」的静默事故 |
-| `context_window` | 0 | v1.11：同 LLM profile 的声明制（**0 = 未声明 = 该 embedding profile 预算关闭**）。> 0 时预算 = `context_window − margin`——embedding 没有输出、无输出预留；送去嵌入的文本超预算按**确定性头部保留**截断（第 9 章）。声明实效窗口与欠声明恒安全的指引同 6.3 |
+| `context_window` | 0 | embedding 输入预算为窗口减安全边距。普通流的语义去重必须声明正值并发送完整规范化成员文本/UI 树；超限交会话容量协调器。普通单记录保留既有头部截断语义。 |
 
 ## 6.5 多 profile 的典型格局
 
@@ -270,8 +270,8 @@ warning: project.toml:[verify].llm: verify.llm and annotate.llm use the same mod
       segment.llm v1.11 起不入 vision 校验——附图随所引档能力自动推导）
 生成：max_output_tokens=4096（v1.11：截断响应终局化为记录级拒收；声明窗口后还挤占输入预算）,
       temperature=0.0, max_image_px=2048（升级天花板）, default_image_px=0（0=沿用 max_image_px）
-预算：context_window=0（v1.11；0=未声明=预算关；margin=max(256, ⌈10%×窗口⌉)，预算非正=配置错误；
-      声明部署实效窗口、欠声明恒安全；embedding 档同名键预算=窗口−margin）
+预算：普通流使用的 context_window 必须为正值；普通单记录的 0 表示预算关闭；
+      声明部署实效窗口；embedding 预算=窗口−margin；真实超限保留完整证据并缩短序列）
 计价：price_per_mtok_in/_out（可选，配了才有成本估算）
 日志：tool.log_level=info, tool.log_format=text（jsonl 强制 console plain 档）
 面板：console.mode=auto（auto|rich|plain）, refresh_hz=5（1–10）, heartbeat_s=0（0=关，≥0）,

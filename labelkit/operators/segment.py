@@ -1,32 +1,13 @@
-"""M14 分段阶段（spec 3.14、CONTRACTS.md §7.14）——v1.8 流式模式算子。
+"""M14 完整会话分段与容量分区。
 
-把本批次的候选会话精化为 episode：按 PipelineItem.session_id 重新聚合活跃帧信封
-（record.kind == "single"；批内位置序即会话序，由 M10 的整会话装箱保证），跑可选的
-LLM 滑窗边界裁决（确定性 §10.9 提示词、经 schema_engine.segment_window_schema 取得
-M8 内部 Schema 保证、代码侧首次命中缝合），随后确定性成段：噪音帧 → ``dropped_noise``
-（鸭子类型 reason "noise"）、边界切分、min_len 校验（只作用于 LLM 精化过的段，S11——
-reason "below_min_len"）、成员 → ``absorbed``，每段尾追加一个 sequence 信封到**同一个**
-批次列表（Stage 合同 ②b）。链位置：链首，dedup 之前。失败策略 segment.on_error：
-"keep" 把整个会话降级为一个 episode 并留下 S26 证据三件套（鸭子类型
-``segment_degraded`` → _meta.stream.degraded + error 事件 + segment.failures 计数器，
-绝不写 item.errors）；"fail" 让该会话全体成员失败。``judge_window`` 是 M7 成员回收
-重判的**公开直调面**（获批的算子间导入例外）。
-
-v1.11（上下文预算，SPEC-context-budget V4/V9/V13④/V20/V24/V27①）：帧摘要在装窗
-**之前**按会话预计算一次，装箱定价与每个窗口提示词共用同一向量；segment profile 声明了
-``context_window > 0`` 时，窗口切分从固定跨度切换为贪心预算装箱器
-``budget.pack_windows``（v1.12 装箱器下沉：原 M14 私有 ``_pack_windows`` 原样迁入 budget
-模块公开面，行为字节等价）——window 退化为纯上限，1 帧重叠与「接缝帧归后一窗」语义保留；
-未声明预算则字节等价保持 v1.10 的固定切分。窗口调用抛出反应式 ``ContextOverflowError``
-时对半重切重试（有界，≤ 2 层——400 嗅探终态恰好喂一次熔断器，A7）；窗口失败先经
-``budget.classify_stage_error`` 归类，再回落 segmentation_invalid；每个实际派发的窗口
-计一次 ``segment.windows``（→ report.stream.windows）。
+全会话规划完整帧证据窗口，计算分组只限制同时提交的叶任务数量。窗口保持一帧重叠，
+重叠裁决归后一窗；预检和实际溢出逐步收缩至最小相邻对。最小相邻对仍溢出时整会话失败。
+语义噪声和短段判定完成后，再按完整成员预览下游容量，保留容量短尾及永久边界。
 """
 from __future__ import annotations
 
 import asyncio
 import dataclasses
-import hashlib
 import logging
 from typing import TYPE_CHECKING, Mapping, Sequence
 
@@ -40,17 +21,18 @@ from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
 from labelkit.common.contracts.types import (
     PipelineItem,
     Record,
-    RecordRef,
+    SequenceBounds,
     StageError,
     digest_is_poor,
-    frame_digest,
     tree_diff,
 )
 
 from labelkit.common.inference import budget as budget_mod
 from labelkit.common.inference.budget import pack_windows
 from labelkit.common.inference.llm_client import Message, Part, PromptBundle
+from labelkit.common.inference.sequence_evidence import CapacityRequest, record_evidence, request_overflow
 from labelkit.common.inference.schema_engine import CallScope, segment_window_schema
+from labelkit.operators.segment_capacity import capacity_episodes
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import ResolvedConfig
@@ -71,10 +53,6 @@ _COUNTER_BELOW_MIN_LEN = "segment.below_min_len"
 _COUNTER_DIGEST_POOR = "segment.digest_poor_frames"
 _COUNTER_WINDOWS = "segment.windows"
 _COUNTER_DEGRADE_RETRIES = "budget.degrade_retries"
-
-# V20 降级上界：每个原始窗口最多 2 层降级（对半之后再对半一次）——乘性递减、有界
-# （AIMD 家族，spec 3.14.4 溢出降级重试）。
-_MAX_DEGRADE_LEVELS = 2
 
 # 演绎映射（spec 3.14.4，代码侧查表——边界问题从不交给 LLM 回答）：
 # continues/advances → 非边界；returns_to_entry/context_switch → 边界（该帧起新段）；
@@ -153,18 +131,15 @@ def build_segment_prompt(frames: Sequence[Record], diffs: Sequence[Mapping | Non
     system：冻结的三步演绎判据（替入窗内帧数）+ 可选的 segment.context 行（为空则省略）
     + 带或不带 reason 片段的结构行。user：**一条**消息，每帧一个文本 part——
     "[帧 {i}] {digest}"，从第二帧起且调用方给了 diff 时再追加 "[帧 {i} 变更]" 行；
-    segment.vision_resolved（v1.11 V1 解析产物）为真时，每帧摘要 part 之前先放该帧图片
-    part（§10.1/§10.10 单消息多 part 形态）。
+    每个有图片的帧在完整证据文本之前附上对应的惰性图片引用。
 
-    ``digests``（v1.11 V9 冻结签名修订，CONTRACTS §7.14）：与 ``frames`` 对齐的逐帧摘要串，
-    在装窗**之前**按会话预计算一次——装箱器与提示词共用同一向量，接缝帧不再被摘要两次；
-    本组装器自身绝不计算摘要。
+    digests 是装窗前按会话预计算的完整证据向量；构造器原样消费，不再摘要或截断。
 
     @param frames 窗内帧记录，按会话序
     @param diffs 与 frames 对齐的相邻帧变更映射；窗首帧为 None
     @param cfg 已解析的不可变配置
     @param with_reason 结构行是否带 reason 片段
-    @param digests 与 frames 对齐的逐帧摘要串
+    @param digests 与 frames 对齐的完整逐帧证据
     @return 可直接交给 M9 的提示词包
     """
     seg = cfg.segment
@@ -180,7 +155,7 @@ def build_segment_prompt(frames: Sequence[Record], diffs: Sequence[Mapping | Non
 
     parts: list[Part] = []
     for i, frame in enumerate(frames):
-        if seg.vision_resolved and frame.image is not None:
+        if frame.image is not None:
             parts.append(Part(kind="image", image=frame.image))
         text = _FRAME_LABEL_TMPL.format(i=i, digest=digests[i])
         diff = diffs[i] if i < len(diffs) else None
@@ -295,20 +270,23 @@ async def _call_window(frames: Sequence[Record], ctx: "RunContext", *,
     @param frames 窗内帧记录，按会话序
     @param ctx 运行上下文
     @param span 窗口跨度 [start, end)，进事件载荷
-    @param digests 与 frames 对齐的摘要切片；None 表示本函数自行计算
+    @param digests 与 frames 对齐的完整证据切片；None 表示本函数自行计算
     @return 不修改业务对象或发业务事件的冻结窗口裁决
     """
     cfg = ctx.cfg
     with_reason = _reason_requested(cfg)
     if digests is None:
-        digests = [frame_digest(frame, cfg.segment.digest_max_chars)
-                   for frame in frames]
+        digests = [record_evidence(frame) for frame in frames]
     diffs = _adjacent_diffs(frames, cfg.dedup.bounds_quantize_px)
     prompt = build_segment_prompt(frames, diffs, cfg, with_reason, digests)
     schema = segment_window_schema(len(frames), with_reason)
+    overflow = request_overflow(CapacityRequest(cfg.segment.llm, prompt, schema), ctx)
+    if overflow is not None:
+        raise overflow
     obj, _usage, _attempts, model = await ctx.schema_engine.complete_validated(
         cfg.segment.llm, prompt, schema,
-        scope=CallScope(record_ids=(frames[0].id,), batch_no=ctx.batch_no))
+        scope=CallScope(record_ids=(frames[0].id,), batch_no=ctx.batch_no,
+                        complete_evidence=ctx.session_attempt is not None))
 
     table, verdicts = _align_relations(obj["frames"], len(frames))
     reasons: tuple[str, ...] = ()
@@ -346,78 +324,30 @@ def _emit_boundary(ctx: "RunContext", outcome: _WindowVerdict,
                       record_ids=(), payload=payload)
 
 
-def _window_spans(n: int, window: int) -> list[tuple[int, int]]:
-    """会话 n 帧上的固定滑窗跨度（spec 3.14.4 伪代码）。
-
-    window = [start, end)，步长 = window − 1（1 帧重叠——缝合时接缝帧的整条裁决归后一窗）。
-    v1.11：这是**预算未声明**的切分（segment profile 缺失或 context_window == 0）——原样
-    保留，使降级路径按构造与 v1.10 字节一致（V9 回归锚）；声明了预算的会话走
-    budget.pack_windows（v1.12 下沉后的同一纯函数）。
-
-    @param n 会话帧数
-    @param window 窗口帧数上限
-    @return 升序排列的窗口跨度列表
-    """
-    spans: list[tuple[int, int]] = []
-    start = 0
-    while start < n:
-        end = min(start + window, n)
-        spans.append((start, end))
-        if end == n:
-            break
-        start += window - 1
-    return spans
-
-
-# v1.12（装箱器下沉裁决）：贪心预算装箱器 _pack_windows 原样迁至
-# budget.pack_windows（公开面，行为字节等价，M13 帧级批量判决复用），本模块经
-# 顶部 import 以既有调用形继续使用——归属句见 CONTRACTS §7.17。
-
-
 async def _judge_span_degrading(judge, span: tuple[int, int],
-                                ctx: "RunContext", *,
-                                level: int = 0) -> list[tuple[tuple[int, int], _WindowVerdict]]:
-    """V20 窗口分半降级重试（spec 3.14.4 溢出降级重试；SPEC-context-budget V20/V24/A7）。
+                                ctx: "RunContext") -> list[tuple[tuple[int, int], _WindowVerdict]]:
+    """以完整证据递归收缩窗口，最小相邻对失败即终止。
 
-    ``judge`` = 异步可调用 callable(span) -> 该跨度的逐帧关系（依赖注入——正是这道缝
-    让本纯逻辑可离线测试）。返回叶子结果 [(子跨度, 关系列表), ...]，按跨度升序，可直接
-    做与调度无关的 rel[] 覆写（后一子窗依旧拥有它的接缝帧）。
+    预检和实际溢出都按一帧重叠拆分，后一子窗拥有重叠帧。两个子窗顺序执行，
+    每次严格缩短跨度，因此无需人工层数上限；实际 HTTP 400 终态仅记一次断路器失败。
 
-    抛出反应式 ContextOverflowError 的窗口调用被对半重切：[s, m+1) 与 [m, e)，m = 中点
-    ——1 帧重叠与「接缝帧归后一窗」语义在拆分后依旧成立，且不丢帧。乘性递减、有界：每个
-    原始窗口最多 _MAX_DEGRADE_LEVELS（2）层降级；每次对半计一次 budget.degrade_retries。
-    两半**顺序**执行——熔断记账确定（第一个终态即停止整棵树；降级流量只在反应式路径上
-    出现且罕见，为并发牺牲确定性不划算）。
-
-    终态（不再拆分）：非反应式 phase（precheck = 装箱层 bug，防御式捕获，永不可降级）、
-    最小 2 帧窗口（< 3 帧无法拆成两个 ≥ 2 帧的半窗）、或触及层数上界。按 SPEC §3.5 的
-    熔断矩阵，**只有** 400 嗅探形态的反应式终态（origin="http_400"）喂熔断器——恰好一次，
-    就在这里的叶子上（A7：M9 抛出时刻意没喂）；200 形态的 origin="finish" 神谕搭乘的是一次
-    成功 HTTP 交互，其 ok 已清空连续计数，而 precheck 根本没有 provider 交互。异常随后
-    重新抛出，落到该会话的 on_error 处置（父层递归绝不重复结算——只有直接的 judge() 调用
-    位于 try 之内）。
-
-    @param judge 异步可调用：接受跨度、返回该跨度的逐帧关系
-    @param span 本层的窗口跨度 [start, end)
-    @param ctx 运行上下文
-    @param level 当前降级层数（递归内部使用）
-    @return 叶子结果 [(子跨度, 关系列表), ...]，按跨度升序
-    @raises ContextOverflowError 终态不可再降级时原样重新抛出
+    @param judge 接受跨度并返回该跨度完整裁决的异步调用。
+    @param span 当前半开窗口跨度。
+    @param ctx 本会话上下文。
+    @return 按跨度排列的成功叶窗口及其裁决。
+    @raises ContextOverflowError 最小完整相邻对仍不可装入时原样抛出。
     """
     start, end = span
     try:
         return [(span, await judge(span))]
     except ContextOverflowError as exc:
-        if exc.phase != "reactive" or end - start < 3 or level >= _MAX_DEGRADE_LEVELS:
-            if exc.phase == "reactive" and exc.origin == "http_400":
-                ctx.metrics.record_provider_result(fatal=True)
+        if end - start < 3:
+            budget_mod.feed_reactive_terminal(exc, ctx.metrics)
             raise
         ctx.metrics.count(_COUNTER_DEGRADE_RETRIES)
         mid = (start + end) // 2
-        results = await _judge_span_degrading(judge, (start, mid + 1), ctx,
-                                              level=level + 1)
-        results.extend(await _judge_span_degrading(judge, (mid, end), ctx,
-                                                   level=level + 1))
+        results = await _judge_span_degrading(judge, (start, mid + 1), ctx)
+        results.extend(await _judge_span_degrading(judge, (mid, end), ctx))
         return results
 
 
@@ -428,10 +358,9 @@ class _WindowJob:
     """一次原始窗口派发所需的全部输入（会话级向量 + 窗口跨度）。"""
 
     records: list[Record]      # 会话级 Record 向量；子窗按跨度切片，不重新摘要
-    digests: list[str]         # 与 records 对齐的会话级摘要向量（V9 预计算）
+    digests: list[str]         # 与 records 对齐的会话级完整证据向量（V9 预计算）
     sid: str                   # 会话 id，进 segment.boundary 事件载荷
     span: tuple[int, int]      # 原始窗口跨度 [start, end)
-    degrade: bool              # 是否启用 V20 分半降级重试（= 该 profile 声明了预算）
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -442,7 +371,6 @@ class _SessionPass:
     ctx: "RunContext"          # 运行上下文（配置 / 指标 / Schema 引擎）
     sid: str                   # 会话 id
     items: list[PipelineItem]  # 该会话按会话序排列的活跃帧信封
-    split: bool                # 会话是否带 M10 硬切分标记（S21）
 
 
 # ── 阶段 ─────────────────────────────────────────────────────────────────────
@@ -516,23 +444,20 @@ class SegmentStage:
         """
         seg = self.cfg.segment
         prof = self.cfg.llm_profiles.get(seg.llm)
-        budget_on = refine and prof is not None and prof.context_window > 0
-        pack_budget = (budget_mod.input_budget(prof) - _static_prompt_est(self.cfg)
-                       if budget_on else 0)
+        if refine and (prof is None or prof.context_window <= 0):
+            _logger.error("segment requires a positive profile context window")
+            raise InternalError("segment requires a positive profile context window")
+        pack_budget = budget_mod.input_budget(prof) - _static_prompt_est(self.cfg) if refine else 0
         jobs_meta: list[tuple[str, tuple[int, int]]] = []
         jobs: list[_WindowJob] = []
         for sid, items in sessions.items():
             if not refine or len(items) == 1:      # 规则 / 单帧会话：零 LLM
                 continue
             self._guard_digest_poverty(items, ctx)
-            # V9 会话级摘要预计算——每帧每会话恰算一次，且在装窗之前；装箱定价与每个窗口
-            # 提示词（含 V20 子窗）共用本向量，接缝帧不再被摘要两次。上面的贫瘠护栏是一条
-            # 独立计算路径（digest_is_poor 自带硬编码上限），按设计不受影响。
+            # 完整证据按会话预计算一次，窗口定价与实际请求共用同一向量。
             records = [item.record for item in items]
-            digests = [frame_digest(record, seg.digest_max_chars)
-                       for record in records]
-            spans = (self._pack_spans(digests, ctx, pack_budget) if budget_on
-                     else _window_spans(len(items), seg.window))
+            digests = [record_evidence(record) for record in records]
+            spans = self._pack_spans(digests, ctx, pack_budget)
             for span in spans:
                 jobs_meta.append((sid, span))
                 jobs.append(_WindowJob(
@@ -540,7 +465,6 @@ class SegmentStage:
                     digests=digests,
                     sid=sid,
                     span=span,
-                    degrade=budget_on,
                 ))
         return jobs_meta, jobs
 
@@ -567,14 +491,13 @@ class SegmentStage:
         逐图成本每会话只读一次校准器——快照是批次冻结的（V19），因此批内任何位置读到的
         值都相同、确定。
 
-        @param digests 会话级摘要向量
+        @param digests 会话级完整证据向量
         @param ctx 运行上下文
         @param pack_budget 扣除静态提示词后的可用 token 预算
         @return 升序排列的窗口跨度列表
         """
         seg = self.cfg.segment
-        image_cost = (ctx.llm.calibrator.cost(seg.llm)
-                      if seg.vision_resolved else 0)
+        image_cost = ctx.llm.calibrator.cost(seg.llm) if self.cfg.run.modality == "ui" else 0
         costs = [budget_mod.est_text(digest) + budget_mod.DIFF_MAX_TOKENS
                  + image_cost for digest in digests]
         return pack_windows(costs, pack_budget, seg.window)
@@ -604,7 +527,7 @@ class SegmentStage:
             )
             for ordinal, job in enumerate(jobs)
         )
-        results = await ctx.tasks.run_group(TaskGroupRequest(specs))
+        results = await ctx.run_group(TaskGroupRequest(specs))
         for (sid, span), result in zip(jobs_meta, results):
             bucket = outcomes.setdefault(sid, [])
             if isinstance(result, BaseException):
@@ -626,14 +549,12 @@ class SegmentStage:
         @param refine 策略是否要求 LLM 精化
         """
         for sid, items in sessions.items():
-            split = any(getattr(item, "session_split", False) for item in items)
+            session = _SessionPass(batch=batch, ctx=ctx, sid=sid, items=items)
             if not refine or len(items) == 1:
                 # 规则 / 单帧降级：会话原样成为一个 episode；noise_filter / min_len
                 # 不适用（S11）。
-                self._emit_episode(batch, sid, items, split=split)
+                self._emit_episode(session, items)
                 continue
-            session = _SessionPass(batch=batch, ctx=ctx, sid=sid, items=items,
-                                   split=split)
             session_outcomes = outcomes[sid]
             for _, result in session_outcomes:
                 if isinstance(result, _WindowVerdict):
@@ -656,10 +577,8 @@ class SegmentStage:
         """派发一个原始窗口，并做窗口级错误捕获。
 
         只有「大三样」向上逃逸（合同 ④——其余一律转成会话级 on_error 处置，S26）。
-        ``job.records`` / ``job.digests`` 是**会话级**向量，子跨度只做切片，因此 V20 拆分
-        重派时不会重新摘要。``job.degrade`` = 预算已开（V20 的分半重试是预算模式下的反应；
-        预算关闭时的溢出信号——那个无条件的 200 形态神谕——走下面的普通失败路径，由
-        _dispose_failed 归类）。每个实际派发的窗口（含拆分子窗）计一次 segment.windows（V13④）。
+        会话级完整证据向量在子窗口之间共享；实际请求始终携带完整帧及图片。
+        每个尝试的窗口计入 segment.windows，所有溢出持续收缩到最小相邻对。
 
         @param job 本次原始窗口的派发参数
         @param ctx 运行上下文
@@ -676,9 +595,7 @@ class SegmentStage:
                                       span=sub, digests=job.digests[sub[0]:sub[1]])
 
         try:
-            if job.degrade:
-                return await _judge_span_degrading(judge, job.span, ctx)
-            return [(job.span, await judge(job.span))]
+            return await _judge_span_degrading(judge, job.span, ctx)
         except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
             raise
         except Exception as exc:  # noqa: BLE001 — 记录级隔离绝对优先
@@ -705,12 +622,12 @@ class SegmentStage:
         @param failures 本会话所有失败窗口的异常，按跨度序
         """
         ctx = session.ctx
-        first = failures[0]
+        first = next((failure for failure in failures if isinstance(failure, ContextOverflowError)), failures[0])
         kind = (budget_mod.classify_stage_error(first)
                 or ErrorKind.SEGMENTATION_INVALID.value)
         windows_failed = len(failures)
         message = str(first)
-        if self.cfg.segment.on_error == "fail":
+        if self.cfg.segment.on_error == "fail" or isinstance(first, ContextOverflowError):
             error = StageError(stage=self.name, kind=kind, message=message,
                                retryable=False)
             for item in session.items:
@@ -718,9 +635,17 @@ class SegmentStage:
                 item.status = "failed"
                 if kind == ErrorKind.CONTEXT_OVERFLOW.value:
                     ctx.metrics.count("budget.overflow_records")  # V13②：每个拒收各计一次
+            if isinstance(first, ContextOverflowError):
+                _logger.error("minimal segment window exceeds context: session=%s", session.sid)
+                ctx.metrics.count("capacity.minimum_failures")
+                ctx.metrics.event(
+                    "sequence.capacity", stage=self.name, batch_no=ctx.batch_no,
+                    payload={"action": "minimum_failure", "stage": self.name,
+                             "profile": first.profile, "phase": first.phase,
+                             "member_positions": [item.session_position for item in session.items]},
+                )
         else:                                      # "keep"
-            self._emit_episode(session.batch, session.sid, session.items,
-                               split=session.split,
+            self._emit_episode(session, session.items,
                                degraded={"kind": kind,
                                          "windows_failed": windows_failed})
         ctx.metrics.count(_COUNTER_FAILURES)
@@ -766,42 +691,29 @@ class SegmentStage:
                     item.noise_attribution = ("segment", "below_min_len")  # type: ignore[attr-defined]
                     session.ctx.metrics.count(_COUNTER_BELOW_MIN_LEN)
                 continue
-            self._emit_episode(session.batch, session.sid, members,
-                               split=session.split)
+            self._emit_episode(session, members)
 
     @staticmethod
-    def _emit_episode(batch: list[PipelineItem], sid: str,
-                      members: list[PipelineItem], *, split: bool,
+    def _emit_episode(session: _SessionPass, members: list[PipelineItem],
                       degraded: Mapping | None = None) -> None:
         """吸收成员信封并尾追加一个 sequence 信封（合同 ②b）。
 
-        id = sha256("\\n".join(成员 id))[:16]，成形时即固定；text/raw/ui_tree/image 全为
-        None；ref 继承首个成员（S24）；打上 session_id；session_split / segment_degraded
-        以鸭子类型属性随行，供 M11 的 _meta.stream 使用。
+        先按完整下游证据预算分区，再由会话身份、成员位置和内容身份生成各序列 ID。
+        全部完整成员只归属一个序列；容量分区不再次应用语义最短长度。
 
-        @param batch 本批次信封列表（尾追加于此）
-        @param sid 会话 id
-        @param members 本段成员帧信封，按会话序
-        @param split 会话是否带 M10 硬切分标记
+        @param session 当前完整会话与输出列表。
+        @param members 本段成员帧信封，按出现位置排列。
         @param degraded 降级证据（kind / windows_failed）；None 表示未降级
         """
-        records = tuple(item.record for item in members)
-        joined = "\n".join(record.id for record in records)
-        first = records[0]
-        episode_record = Record(
-            id=hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16],
-            modality=first.modality,
-            text=None, raw=None, ui_tree=None, image=None,
-            ref=RecordRef(source_file=first.ref.source_file,
-                          line_no=first.ref.line_no,
-                          pair_index=first.ref.pair_index,
-                          generated_from=(), generator=None),
-            kind="sequence", members=records)
+        positions = tuple(item.session_position for item in session.items)
+        if any(position is None for position in positions):
+            _logger.error("segment requires explicit session occurrence positions")
+            raise InternalError("segment requires explicit session occurrence positions")
+        bounds = SequenceBounds(0, max(positions) + 1)
+        episodes = capacity_episodes(session.sid, members, bounds, session.ctx)
         for item in members:
             item.status = "absorbed"
-        episode = PipelineItem(record=episode_record, session_id=sid)
-        if split:
-            episode.session_split = True  # type: ignore[attr-defined]
-        if degraded is not None:
-            episode.segment_degraded = dict(degraded)  # type: ignore[attr-defined]
-        batch.append(episode)
+        for episode in episodes:
+            if degraded is not None:
+                episode.segment_degraded = dict(degraded)  # type: ignore[attr-defined]
+            session.batch.append(episode)

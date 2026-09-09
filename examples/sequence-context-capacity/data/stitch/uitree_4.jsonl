@@ -1,0 +1,2 @@
+{"id": "0", "parent": null, "class": "FrameLayout", "text": "", "visible": true, "bounds": [0, 0, 256, 256], "package": "com.example.messages"}
+{"id": "1", "parent": "0", "class": "TextView", "text": "与同事聊天：今晚去公园散步，时间为19点。", "visible": true, "bounds": [0, 74, 256, 256], "package": "com.example.messages"}

@@ -79,16 +79,14 @@ def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
     if cfg.classify.enabled:
         llm_names.append(cfg.classify.llm)
     if cfg.frame_classify.enabled:
-        # v1.12：帧级分类判决 profile——enabled 即入探测集（链位居序列级 classify 之后；
-        # 永不入 vision 必需集，vision 语义分列裁决）
+        # 帧级分类启用即入探测集，UI 视觉能力已在 M1 检查。
         llm_names.append(cfg.frame_classify.llm)
     if cfg.extract.enabled:
         llm_names.append(cfg.extract.llm)
     if cfg.quality.enabled:
-        if cfg.quality.mode == "pointwise" or not cfg.quality.judges:
-            llm_names.append(cfg.quality.llm)
-        else:
-            llm_names.extend(cfg.quality.judges)
+        views = tuple(view.quality for view in cfg.class_views.values()) if cfg.classify.enabled else (cfg.quality,)
+        for quality in views:
+            llm_names.extend(quality.judges if quality.mode == "pairwise" and quality.judges else (quality.llm,))
     if cfg.annotate.enabled:
         llm_names.append(cfg.annotate.llm)
     if cfg.frame_annotate.enabled:
@@ -101,7 +99,7 @@ def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
             llm_names.extend(cfg.verify.judges)
         else:
             llm_names.append(cfg.verify.llm)
-    if cfg.output.repair_llm:
+    if cfg.output.repair_llm and (not cfg.segment.enabled or cfg.output.max_repair_attempts > 0):
         llm_names.append(cfg.output.repair_llm)
 
     emb_names: list[str] = []

@@ -61,50 +61,51 @@ UTF-8 编码 JSONL；每行一个 JSON object；行分隔符 `\n`；空行跳过
                "generated_from": [], "fields": {},           // passthrough_fields 落点
                "generator": null},   // v1.2 只增：flat 生成记录为 {"llm", "style"}（3.6.2），否则 null
     "stream": null,                  // v1.8 恒在键（位置：source 之后、scores 之前——链序镜像）；
-                                     // = null 当 segment 未启用；process stream 启用时（3.14/3.10.3）：
-                                     // {"episode_id", "session_id", "order_span": [first, last], "member_count",
-                                     //  "member_ids": [...], "member_sources": [{file, pair_index|line_no}, ...],
-                                     //  "members": [{index, id[, label][, annotation, status]}, ...],
-                                     //                            // v1.12（任一帧开关启用时在场；冻结位 = member_sources 后、
-                                     //                            //   session_split 前）：逐成员按序一条目，字段序冻结；
-                                     //                            //   label 仅 frame.classify 启用时在场（降格跳过 = null）；
-                                     //                            //   annotation/status 仅 frame.annotate 启用时在场，status
-                                     //                            //   闭集 "annotated"|"skipped"|"failed"（三值判定与写前
-                                     //                            //   校验兜底见 3.11.2；真实示例见 3.11.3）；帧粒度全关时
-                                     //                            //   本键不在场——本块与 v1.11 逐字节等价（退化锚）；
-                                     //                            //   手术后原/克隆行 members 分叉由 repaired 位消歧（4.3）
-                                     //  "session_split": false,   // 所属会话曾被 batch_size 硬切（S21，M7 缺帧判定降级依据）
-                                     //  "repaired": false,        // verify 缺陷修复改写过成员集（3.7 stream 分支；
-                                     //                            //   multi 扇出下消歧同 id 兄弟行的成员分叉，3.13）
-                                     //  "degraded": null | {kind, windows_failed},   // segment.on_error="keep" 留痕（S26；segment 专属——
-                                     //                            //   stitch keep 路径留痕为事件+计数器两件，无 _meta 腿，3.16.6）
-                                     //  "steps": null | [{index, action_type, target, value, description}, ...]}
-                                     //                            // extract 关闭时恒 null；启用 = transitions 逐步摘要（3.15）；
-                                     //                            //   v1.9（仅 stitch 启用）：步行内另含 "resumed": true——仅接缝
-                                     //                            //   占位步携带（emitter 由 Transition.detail.kind=="thread_seam"
-                                     //                            //   推导，3.15.4；非接缝步不携带该键）
-                                     // v1.9 增两键（仅 stitch.enabled=true 时在场——off 时本块与 v1.8
-                                     //   逐字节等价，3.16.4 退化锚）：
-                                     //  "thread_id": "9c31f5a2d84e07b6",   // = 幸存信封 record.id = episode_id（T22，3.16.4）
-                                     //  "fragments": [{"order_span": [first, last], "member_count", "cause",
-                                     //                 "source_episode"}, ...]
-                                     //                            // 每碎片一项、按会话序；cause ∈ "origin"|"resumed"|"rescued"；
-                                     //                            //   source_episode = 碎片缝合前的 episode_id（救援碎片 = null）。
-                                     //                            // 包络规范句：多碎片线索的顶层 order_span 为包络（区间内含
-                                     //                            //   异线索帧）——下游切片必须用 fragments[].order_span，
-                                     //                            //   不得按顶层跨度切片（3.16.4）
+    // = null 当 segment 未启用；process stream 启用时（3.14/3.10.3）：
+    // {"episode_id", "session_id", "order_span": [first, last], "member_count",
+    //  "member_ids": [...], "member_positions": [...],
+    //  "member_sources": [{file, pair_index|line_no}, ...],
+    //  "members": [{index, id[, label][, annotation, status]}, ...],
+    //                            // v1.12（任一帧开关启用时在场；冻结位 = member_sources 后、
+    //                            //   capacity 前）：逐成员按序一条目，字段序冻结；
+    //                            //   label 仅 frame.classify 启用时在场（降格跳过 = null）；
+    //                            //   annotation/status 仅 frame.annotate 启用时在场，status
+    //                            //   闭集 "annotated"|"skipped"|"failed"（三值判定与写前
+    //                            //   校验兜底见 3.11.2；真实示例见 3.11.3）；帧粒度全关时
+    //                            //   本键不在场；位置和容量字段仍保留；
+    //                            //   手术后原/克隆行 members 分叉由 repaired 位消歧（4.3）
+    //  "capacity": null,   // 无人工容量切点或封闭时为 null
+    //  "repaired": false,        // verify 成员或依赖接缝修复、重标注与复评（3.7；
+    //                            //   multi 扇出下消歧同 id 兄弟行的成员分叉，3.13）
+    //  "degraded": null | {kind, windows_failed},   // segment.on_error="keep" 留痕（S26；segment 专属——
+    //                            //   stitch keep 路径留痕为事件+计数器两件，无 _meta 腿，3.16.6）
+    //  "steps": null | [{index, action_type, target, value, description}, ...]}
+    //                            // extract 关闭时恒 null；启用 = transitions 逐步摘要（3.15）；
+    //                            //   v1.9（仅 stitch 启用）：步行内另含 "resumed": true——仅接缝
+    //                            //   占位步携带（emitter 由 Transition.detail.kind=="thread_seam"
+    //                            //   推导，3.15.4；非接缝步不携带该键）
+    // v1.9 增两键（仅 stitch.enabled=true 时在场——off 时本块与 v1.8
+    //   逐字节等价，3.16.4 退化锚）：
+    //  "thread_id": "9c31f5a2d84e07b6",   // = 幸存信封 record.id = episode_id（T22，3.16.4）
+    //  "fragments": [{"order_span": [first, last], "member_count", "cause",
+    //                 "source_episode", "member_positions": [...]}, ...]
+    //                            // 每碎片一项、按会话序；cause ∈ "origin"|"resumed"|"rescued"；
+    //                            //   source_episode = 碎片缝合前的 episode_id（救援碎片 = null）。
+    //                            // 包络规范句：多碎片线索的顶层 order_span 为包络（区间内含
+    //                            //   异线索帧）——精确归属必须用 fragments[].member_positions，
+    //                            //   不得按顶层跨度切片（3.16.4）
     "scores": {"screenshot_readability": 0.81, "tree_screen_consistency": 0.66,
                "state_completeness": 0.74, "interaction_richness": 0.52,
                "__aggregate__": 0.68, "mode": "pairwise_bt", "batch_no": 3},
-                                       // scores v1.7 只增：classify 启用时另含 "pool"（= 类名，比较池自述，3.4.3 按类分池行）
+      // scores v1.7 只增：classify 启用时另含 "pool"（= 类名，比较池自述，3.4.3 按类分池行）
     "dedup": {"kind": "unique"},
     "classification": null,            // v1.7 恒在键：classify 启用时为 {"label", "labels", "source"}（labels = 命中全集，single 恒单元素；3.13）；
-                                       // 未启用 = null。multi 模式下行唯一键 = (_meta.id, classification.label)——同 id 可有多行（3.13.4 扇出行）
+      // 未启用 = null。multi 模式下行唯一键 = (_meta.id, classification.label)——同 id 可有多行（3.13.4 扇出行）
     "annotation": {"model": "qwen2.5-vl-72b-instruct", "attempts": 1},   // v1.2 只增：self-consistency 启用时另含 "sc": {"n", "agreement_ratio"}（3.5.2）
     "verification": {"verdict": "pass", "rounds": 1}          // verify 未启用则为 null
-                                       // verification v1.8 只增：stream 模式下另含 "defects"（该键恒在，
-                                       //   无缺陷 = []；缺陷项 {kind, members, position, detail}，S7，3.7 stream 分支）；
-                                       //   非 stream 行不携带该键
+      // verification v1.8 只增：stream 模式下另含 "defects"（该键恒在，
+      //   无缺陷 = []；缺陷项 {kind, members, position, detail}，S7，3.7 stream 分支）；
+      //   非 stream 行不携带该键
   }
 }
 ```
@@ -142,7 +143,7 @@ main 不含 noise 或 replay 行，且不再输出旧 `tier_rank`、`time_fields
   //   "stream": {"sessions", "episodes", "mean_episode_len", "absorbed", "dropped_noise",
   //              "below_min_len", "digest_poor_frames", "segment_failures",
   //    [预算启用，v1.11] "windows",   // segment 实际窗数（M14 属主，V13④）——供对账 dry-run/估算的
-  //                                   //   w_min 上界（V12；预算未声明时不在场）
+  //                                   //   相邻双帧参考估算；不覆盖重算和修复调用
   //    [stitch 启用，v1.9] "stitch": {"stitched", "rescued_short", "seams", "judgments",
   //              "repass_judgments", "failures"},
   //    [frame.classify 启用，v1.12] "frame_classify": {"calls", "fallback", "window_failures",
@@ -159,8 +160,8 @@ main 不含 noise 或 replay 行，且不再输出旧 `tier_rank`、`time_fields
   //      v1.9 注：接缝占位步不计入 extract.transitions 与 by_type——非摘取产物，3.15.4）；
   //      verify 子块见 3.7 stream 分支（S31；defects 计数键 v1.9 起含 wrong_stitch，3.7.2）；
   //      v1.12 两子块**条件在场**（对应开关开启才出现——off 时 stream 节与 v1.11 逐字节等价，
-  //      退化锚；两处精确集合断言测试同步）：frame_classify 键义见 3.13.7（calls = 实际派发窗数、
-  //      fallback = 兜底帧数、window_failures = 失败窗数、skipped_degraded = 降格跳过 episode 数）；
+  //      退化锚；两处精确集合断言测试同步）：frame_classify 键义见 3.13.7（calls = 完整 episode 请求数、
+  //      fallback = 兜底帧数、window_failures = 失败请求数、skipped_degraded = 降格跳过 episode 数）；
   //      frame_annotate 键义见 3.5.5 / 3.11.2（annotated / skipped / failed 按成员计，
   //      discarded = 终态非 active 信封携带的已产出未交付帧标注条目数——沉没成本记账）
   "dedup": {"exact": 118, "near_text": 201, "near_image": 46, "near_both": 47,
@@ -177,7 +178,7 @@ main 不含 noise 或 replay 行，且不再输出旧 `tier_rank`、`time_fields
                      "l3_2": 3, "rejected": 9}},
   // v1.11 可选节（上下文预算启用时出现——任一被启用阶段引用的 profile 声明 context_window）：
   //   "budget": {"profiles": {<profile>: {"context_window", "input_budget"}},   // 声明与预算终值
-  //              "w_min": {"segment.window": [cap, w_min]},                     // 静态最坏装填量（V9/V12）
+  //              "minimum_frames": 2,                                        // 仅 process stream 的必要相邻帧数
   //              "truncations": {<stage>: n},                                   // 各算子逐裁剪点计数
   //              "overflow_records": n,                                         // context_overflow 记录数（7.6）
   //              "image_cost": {<profile>: n},                                  // 每图成本校准终值（V19）
@@ -466,3 +467,5 @@ emitted 8、failed 0；这证明完整 replay sequence 被 M3 删除，而不是
 final `SequenceRows` 与由最终 source rows 投影的全部 `ReplayRows`；更高 ordinal 的已准备候选不计入当前
 retained gate。上限固定 536870912（512 MiB）；恰等于上限时允许提交，超一个 UTF-8 byte 时整个 slot
 拒绝，且在 `group_commit` 前保持 dedup、dataset 与 replay 零提交。
+
+普通 process 流在 member_ids 后输出 member_positions，与 member_sources 一一对应。capacity 为 null 或键序固定的 sealed、allowed_positions、before、after、root_id、parent_id 对象；before/after 按 left_position、right_position、stage、profile、phase 输出。fragments 每项在 source_episode 后增加 member_positions，精确表达交错归属。帧级分类和标注通过出现位置查找，重复 ID 的帧不会合并。report.stream.capacity 输出 splits、sealed、minimum_failures、recomputations、retained_frames_high_water。正式提交后的写前失败及 I/O 错误保持既有发射语义，不返回容量重算。

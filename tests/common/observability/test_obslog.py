@@ -2,6 +2,7 @@
 write-failure resilience). No LLM involved."""
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -634,6 +635,80 @@ def test_metrics_sink_capture_keeps_budget_runtime_facts_on_attempt_rollback(tmp
         "budget.truncations.annotate": 1,
         "budget.overflow_records": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_session_attempt_trace_scope_reaches_leaf_and_restores_after_failure(tmp_path):
+    path = tmp_path / "session.trace.jsonl"
+    cfg = make_cfg(tmp_path, trace=TraceConfig(enabled=True, path=str(path),
+                                               channels=("annotate",), content="none"))
+    log = EventLog(cfg.trace, "abc")
+    sink = MetricsSink(cfg, "abc", log)
+
+    async def leaf():
+        await asyncio.sleep(0)
+        sink.event("annotate.done", stage="annotate", batch_no=1,
+                   payload={"reason": "private explanation", "session_attempt": 999})
+
+    with pytest.raises(ValueError, match="discard"):
+        with sink.session_attempt("session-a", 1):
+            await asyncio.create_task(leaf())
+            raise ValueError("discard")
+    with sink.session_attempt("session-a", 2):
+        await asyncio.create_task(leaf())
+    sink.event("annotate.done", stage="annotate", batch_no=2)
+    sink.flush()
+    log.close()
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert [row["payload"].get("session_attempt") for row in rows] == [1, 2, None]
+    assert [row["payload"].get("session_id") for row in rows] == ["session-a", "session-a", None]
+    assert all("reason" not in row["payload"] for row in rows)
+
+
+def test_session_final_overflow_count_commits_once_while_request_costs_survive(tmp_path):
+    cfg = make_cfg(tmp_path)
+    sink = MetricsSink(cfg, "abc", EventLog(cfg.trace, "abc"))
+    for attempt in (1, 2):
+        with sink.session_attempt("session-a", attempt):
+            with sink.capture_counts() as captured:
+                sink.count("budget.overflow_records")
+                sink.count("budget.degrade_retries")
+                sink.count("counts.failed")
+        assert "budget.overflow_records" not in sink.counters
+    sink.merge_counts(captured)
+    assert sink.counters == {"budget.degrade_retries": 2, "budget.overflow_records": 1, "counts.failed": 1}
+    sink.count("budget.overflow_records")
+    assert sink.counters["budget.overflow_records"] == 2
+
+
+def test_cancelled_session_retains_capacity_and_embedding_failures_only(tmp_path):
+    cfg = make_cfg(tmp_path)
+    sink = MetricsSink(cfg, "abc", EventLog(cfg.trace, "abc"))
+    with pytest.raises(RuntimeError, match="cancelled"):
+        with sink.session_attempt("session", 0), sink.capture_counts() as captured:
+            sink.count("capacity.sealed")
+            sink.count("capacity.splits", 2)
+            sink.count("dedup.embedding_failures")
+            sink.count("counts.episodes")
+            sink.count("budget.overflow_records")
+            raise RuntimeError("cancelled")
+    assert captured == {"counts.episodes": 1, "budget.overflow_records": 1}
+    assert sink.counters == {"capacity.sealed": 1, "capacity.splits": 2, "dedup.embedding_failures": 1}
+
+
+def test_session_retained_frames_high_water_and_scope_validation(tmp_path):
+    cfg = make_cfg(tmp_path)
+    sink = MetricsSink(cfg, "abc", EventLog(cfg.trace, "abc"))
+    for frames in (2, 9, 3):
+        sink.observe_session_frames(frames)
+    assert sink.counters["capacity.retained_frames_high_water"] == 9
+    for bad in (-1, True):
+        with pytest.raises(ValueError, match="non-negative"):
+            sink.observe_session_frames(bad)
+    for session, attempt in (("", 0), ("session-a", -1), ("session-a", True)):
+        with pytest.raises(ValueError, match="non-negative"):
+            with sink.session_attempt(session, attempt):
+                pass
 
 
 def test_metrics_sink_rejects_nested_capture_and_invalid_merge(tmp_path):

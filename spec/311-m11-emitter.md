@@ -142,7 +142,7 @@ v1.12 members 块示例（摘自 `examples/mix` UI 主工程真跑主输出 `out
      "order_span": [1, 6], "member_count": 6,
      "member_ids": ["7cfb0c25f855b2d7", "164b7480ab098de5", ...],
      "member_sources": [{"file": "s1-food-order/uitree_1.jsonl", "pair_index": 1}, ...],
-     "members": [                                     // ← member_sources 后、session_split 前（冻结位）
+     "members": [                                     // ← member_sources 后、capacity 前（冻结位）
        {"index": 0, "id": "7cfb0c25f855b2d7", "label": "list_screen",
         "annotation": {"screen_role": "美食外卖首页",
                        "key_widgets": ["搜索美食", "搜索", "推荐餐厅", "金牌黄焖鸡 4.9 分", ...]},
@@ -165,7 +165,7 @@ v1.12 members 块示例（摘自 `examples/mix` UI 主工程真跑主输出 `out
         "annotation": {"screen_role": "支付成功结果页",
                        "key_widgets": ["支付成功", "订单号 FD20260812001", ...]},
         "status": "annotated"}],
-     "session_split": false, "repaired": false, "degraded": null, "steps": null}}}
+     "capacity": null, "repaired": false, "degraded": null, "steps": null}}}
 ```
 
 #### ② rejects = "refs"（默认）的一行
@@ -207,3 +207,5 @@ v1.7：classify 启用的工程中该 `_meta` 另含 `"label"` 键（3.11.2 reje
 #### ④ 原子改名交付时间线
 
 运行全程只向 `out/ime-intent-0630.jsonl.part` 追加（每批 flush）；finalize 时 fsync 后一次 rename 为 `out/ime-intent-0630.jsonl`。因此目录中任一时刻要么只有 `.part`（运行中，或未走到 finalize 的硬崩溃 / 输出路径不可写），要么只有最终文件——目标文件名出现即保证**已交付的每一行完整且合法**，永远不会读到半截行。v1.6 起熔断中止同样交付（3.10.3 熔断交付），「目标文件出现」因此不再等价「全部输入处理完毕」：消费方判定运行完整性须看 report.run：`interrupted=false` **且** `circuit_broken=false`（退出码 0/1 不足——被 SIGINT 优雅中断的运行同样交付且以 0 退出，3.10.3 中断行）；熔断交付的主输出是「已完成批的完整前缀」，缺口可由 counts.unprocessed 核对（6.4 不变量扩展）。
+
+普通 process 流在 member_ids 后输出 member_positions，与 member_sources 一一对应。capacity 为 null 或键序固定的 sealed、allowed_positions、before、after、root_id、parent_id 对象；before/after 按 left_position、right_position、stage、profile、phase 输出。fragments 每项在 source_episode 后增加 member_positions，精确表达交错归属。帧级分类和标注通过出现位置查找，重复 ID 的帧不会合并。report.stream.capacity 输出 splits、sealed、minimum_failures、recomputations、retained_frames_high_water。正式提交后的写前失败及 I/O 错误保持既有发射语义，不返回容量重算。

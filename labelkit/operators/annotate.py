@@ -1,36 +1,7 @@
-"""M5 标注算子（spec 3.5，CONTRACTS.md §7.4）。
+"""M5 标注：模型 Schema 校验、确定性后处理、机械时间注入和完整 Schema 校验。
 
-确定性提示词装配（任务指令 + few-shot + 记录内容；ui 模态追加截图与序列化控件树）、
-把结构保证委派给 M8（``SchemaEngine.complete_validated``）、可选的自洽采样与字段级
-多数投票（spec 3.5.2），以及 M7 verify 使用的公开修复面。
-
-v1.8 序列标注（S5/S6/S28，CONTRACTS §10.1 序列变体）：episode 信封
-（``record.kind == "sequence"``）把「当前记录」用户消息换成 ① [动作序列] 步骤行
-（transitions 为 None 时整段省略）→ ② 每个保留关键帧的
-``[关键帧 {i}/{k}·成员 {m}]`` 文本 + 图像（确定性均匀降采样到
-annotate.sequence_frames；text 模态序列跳过 ②）→ ③ **恒在**的收尾 [成员帧摘要]
-文本段。模板不变式（S6）：最后一段恒为 ③ 文本段——修复后缀直接拼到
-``parts[-1].text``，修复侧代码零改动。transitions 是 ``AnnotatePromptOptions`` 上
-继 v1.7 label 之后的取值；None 让 v1.8 之前的每个调用点字节等价。v1.9（T14）再加
-fragment_lens——线索（thread）的逐片段关键帧配额（每个片段至少保留一个关键帧）；
-None 保持 v1.8 的均匀降采样。
-
-v1.12 帧级逐帧标注（SPEC-frame-annotation §3.3）：process 序列在自身标注成功后追加
-逐成员帧 pass；v1.18 sequence attempt 在序列标注关闭时直接执行同一 pass，序列标注调用
-精确为零。公开直调面 ``annotate_member`` 填充 ``item.member_annotations``——修复面族的
-新成员（M7 verify 的成员回收补跑懒加载直调它）。帧调用把 ``cfg.frame_schema`` 显式路由
-进 ``complete_validated(schema=...)``：内部 Schema 待遇——无 L2.5、不计 resolved_at。
-
-按序列类标注 Schema：
-某个类可经 ``[class.<name>.annotate].schema_path/schema_inline`` 覆盖全局
-``output.schema``。``class_annotate_schema`` 是**单点**取值函数（label →
-``cfg.class_views[label].schema``；label 缺失、类表外的未知类或无覆盖的类一律回落
-全局 Schema），本模块每个 Schema 消费点都经它取值——两处标注调用、提示词 Schema
-文本、自洽投票与预算装填计价——保证「计价的 Schema 就是调用的 Schema」。按类
-Schema 的调用显式路由 ``schema=<类 Schema>`` 且 ``CallScope(user_treatment=True)``
-（裁决·M8 显式待遇参数）：记录级标注恒属用户待遇族，L2.5 与 resolved_at 记账保留。
-未配置任何按类 Schema 时，统一使用全局 Schema。
-"""
+处理会话保留完整成员文本、可见树、所有图片和全部动作，容量错误交由会话重算。
+普通记录和序列生成保留各自合法的提示词、后处理、采样与失败语义。"""
 from __future__ import annotations
 
 import asyncio
@@ -43,16 +14,13 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Mapping, Sequence
 
 from labelkit.common.errors import (
-    CircuitBreakerTripped,
-    ContextOverflowError,
-    ErrorKind,
-    InternalError,
-    OutputTruncatedError,
-    ProviderFatalError,
-    ProviderRetryableError,
-    SchemaViolation,
+    CircuitBreakerTripped, ContextOverflowError, ErrorKind, InternalError,
+    OutputTruncatedError, ProviderFatalError, ProviderRetryableError, SchemaViolation, SessionCapacityError,
 )
 from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
+from labelkit.common.contracts.sequence_capacity import (
+    CapacityTarget, capacity_target, member_key, raise_session_capacities, raise_session_capacity,
+)
 from labelkit.common.contracts.generation import (
     DownstreamAttemptRequest, DownstreamAttemptResult, SequenceTemporalContext,
 )
@@ -70,6 +38,12 @@ from labelkit.common.inference import budget
 from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 from labelkit.common.inference.schema_engine import (
     CallScope, CandidateFinalizerContractError, FinalizedCallRequest, _thaw_json,
+)
+from labelkit.common.inference.sequence_evidence import (
+    CapacityRequest, record_evidence, request_overflow, terminal_error,
+)
+from labelkit.operators.annotate_capacity import (
+    complete_parts, frame_wave_failures, preview_capacity, sequence_request, sequence_wave_failures,
 )
 from labelkit.operators.annotation_finalization import (
     annotation_contract_error,
@@ -130,7 +104,7 @@ _FRAME_SYSTEM_STATIC = f"{_FRAME_LABEL_TASK}\n{_SCHEMA_SENTENCE}"
 
 # 算子模块之间互不依赖（spec §2.2）：M4 quality 自持一份同格式的步骤行模板（外加
 # （摘取兜底）兜底后缀）；此处是 M5 自己的副本。
-_MEMBER_DIGEST_MAX_CHARS = 400   # 单成员 frame_digest 上限（segment.digest_max_chars 默认值）
+_MEMBER_DIGEST_MAX_CHARS = 400   # 生成文本序列的既有摘要上限
 
 
 def _step_line(transition: Transition) -> str:
@@ -148,50 +122,6 @@ def _step_line(transition: Transition) -> str:
             f"（对象: {'—' if target is None else target}；"
             f"值: {'—' if value is None else value}）"
             f"{action.get('description')}")
-
-
-def _keyframe_indexes(n: int, k: int,
-                      fragment_lens: Sequence[int] | None = None) -> list[int]:
-    """S28 确定性降采样：在 n 个成员上按上限 k 选出关键帧下标。
-
-    @param n 成员总数
-    @param k 关键帧上限（annotate.sequence_frames 或其外部收窄值）
-    @param fragment_lens v1.9（T14）线索的逐片段成员数（成员元组序；片段是会话序的
-        连续块）；None = v1.8 均匀降采样
-    @return 严格递增的成员下标列表；n <= k 时保留全部成员
-
-    n > k 时 ``idx_i = i*(n-1)//(k-1)``（i = 0..k-1）——纯整数运算、零随机、首末帧恒
-    保留、无重复。给出 fragment_lens 时升级为逐片段配额，保证**每个**片段至少保留
-    一个关键帧（均匀采样会把小片段整段抽干，minor-8）：m 个片段各得 1 个，再按
-    (Lᵢ − 1) 加权用最大余数法分配 k − m 的余量（同余数取小下标）；片段内部跑同一个
-    S28 均匀公式（配额为 1 时保留该片段的**首**成员——末片段保留其**末**成员，故
-    全局首末不变式成立）。fragment_lens 缺失/单片段/与 n 不自洽，或 k < m（至少一帧
-    不可行）时，退化回 v1.8 均匀路径。
-    """
-    if n <= k:
-        return list(range(n))
-    if (not fragment_lens or len(fragment_lens) <= 1
-            or sum(fragment_lens) != n or len(fragment_lens) > k):
-        return [i * (n - 1) // (k - 1) for i in range(k)]
-    m = len(fragment_lens)
-    extra_total = k - m
-    weight_total = n - m                       # Σ (Lᵢ − 1) ≥ 1，因为 n > k ≥ m
-    base = [(length - 1) * extra_total // weight_total for length in fragment_lens]
-    remainders = [(length - 1) * extra_total % weight_total
-                  for length in fragment_lens]
-    leftover = extra_total - sum(base)
-    granted = set(sorted(range(m), key=lambda i: (-remainders[i], i))[:leftover])
-    out: list[int] = []
-    start = 0
-    for i, length in enumerate(fragment_lens):
-        quota = 1 + base[i] + (1 if i in granted else 0)
-        if quota == 1:
-            picks = [length - 1] if i == m - 1 else [0]
-        else:
-            picks = [j * (length - 1) // (quota - 1) for j in range(quota)]
-        out.extend(start + p for p in picks)
-        start += length
-    return out
 
 
 def _member_digest_lines(members: tuple[Record, ...], max_total_chars: int) -> list[str]:
@@ -239,8 +169,6 @@ class AnnotatePromptOptions:
     temperature: float | None = None               # 采样温度；None = profile 默认
     label: str | None = None                       # 分类标签，同时选择按类 Schema
     transitions: tuple[Transition, ...] | None = None   # v1.8 [动作序列] 步骤；None = 整段省略
-    fragment_lens: tuple[int, ...] | None = None   # v1.9（T14）逐片段成员数；None = 均匀降采样
-    k_eff: int | None = None                       # v1.11（V20/V21）关键帧上限的外部收窄值
     image_px: int | None = None                    # v1.11（V23①）升档后的图像采样边长
     temporal_context: SequenceTemporalContext | None = None  # v1.20 同一最终 sequence 冻结时间上下文
 
@@ -265,7 +193,7 @@ async def _complete_annotation(ctx: "RunContext", record: Record, prompt: Prompt
     """
     profile = ctx.cfg.annotate.llm
     scope = CallScope(record_ids=(record.id,), batch_no=ctx.batch_no,
-                      record=annotation_record_context(record))
+                      record=annotation_record_context(record), complete_evidence=ctx.session_attempt is not None)
     postprocessor = record_postprocessor(ctx.cfg, opts.label)
     view = ctx.cfg.class_views.get(opts.label) if opts.label is not None else None
     if postprocessor is not None or (view is not None and view.time_bindings):
@@ -318,7 +246,7 @@ class _PackScale:
     schema_est: int     # Schema 文本计量（结构化输出关闭时为 0）
     text_est: int       # 本次装配的文本侧计量
     image_cost: int     # 单图成本（无图时 0）
-    k_fin: int          # ③ 定档后的关键帧数（无图时 0）
+    image_count: int     # 实际完整图片数；普通记录至多一张，生成文本序列为零
 
 
 def _feed_reactive_terminal(exc: BaseException, metrics) -> None:
@@ -395,34 +323,19 @@ def _fit_block(body: str, share: int | None) -> tuple[str, int]:
 #
 # 段序固定：system（任务指令 + Schema 约束句 + Schema 文本）→ 每条 few-shot 一条
 # user 消息（配置序）→ 当前记录 user 消息（text 一段，或 ui 的截图 + 控件树三段）。
-# 序列记录（record.kind == "sequence"，判定先于模态）走 S6 段序 ① [动作序列] →
-# ② 保留关键帧（text 标签 + 图像；S28 降采样到 annotate.sequence_frames；text 模态
-# 跳过）→ ③ **恒在**的收尾 [成员帧摘要] 文本段，故 parts[-1] 恒为文本段，§10.5
-# 修复后缀直接拼到其 text 上，修复侧代码零改动（S6 模板不变式）。
+# 处理序列先渲染全部动作，再按成员序渲染完整正文、树和每张图片。
+# 最后部件恒为文本，修复后缀附在该文本上；生成文本序列保持独立预算路径。
 
 def build_annotate_prompt(record: Record, cfg: "ResolvedConfig", schema_text: str,
                           opts: AnnotatePromptOptions = _DEFAULT_PROMPT_OPTIONS,
                           ) -> PromptBundle:
-    """按 CONTRACTS.md §10.1（+ §10.5 修复后缀）确定性装配标注提示词。
+    """确定性装配标注请求；处理序列不裁剪完整证据。
 
-    @param record 待标注记录（单记录或 v1.8 序列 episode）
+    @param record 当前记录或完整序列
     @param cfg 已解析配置
-    @param schema_text 类有效 Schema 文本（``class_schema_text`` 取值：无按类覆盖时
-        即 M8 的 ``SchemaEngine.user_schema_text`` 属性）
-    @param opts 装配变体参数（``AnnotatePromptOptions``）：``repair`` §10.5 修复上
-        下文；``temperature`` 采样温度；``label`` v1.7（R2）分类标签，非 None ⇒
-        指令/few-shot 取 ``cfg.class_views[label].annotate``；``transitions``
-        v1.8（S5）[动作序列] 步骤源，None = 整段省略；``fragment_lens`` v1.9（T14）
-        逐片段关键帧配额（每片段至少保留一帧），None = 均匀降采样；``k_eff``
-        v1.11（V20/V21）**生效关键帧上限**，② 的降采样按 k =
-        min(annotate.sequence_frames, k_eff) 跑；``image_px`` v1.11（V23①）升档
-        分辨率，随 ``PromptBundle.image_px`` 下传（M9 构建器算生效 px = image_px
-        or profile.default_image_px or profile.max_image_px，再截到
-        min(·, max_image_px)）。缺省对象即 v1.7 之前的全局无变体装配
-    @return 装配好的 PromptBundle
-
-    预算装填本身走私有装配器的尾参 ``fit``（在 annotate_record 内），绝不在此。
-    """
+    @param schema_text 实际模型 Schema 文本
+    @param opts 标签、动作、修复上下文、温度和普通记录图片工作点
+    @return 最终提示词包，处理序列的图片使用固定配置表示"""
     return _assemble_prompt(record, cfg, schema_text, opts)
 
 
@@ -452,8 +365,8 @@ def _assemble_prompt(record: Record, cfg: "ResolvedConfig", schema_text: str,
     if opts.repair is not None:
         parts = _with_repair_suffix(parts, opts.repair)
     messages.append(Message(role="user", parts=parts))
-    return PromptBundle(messages=tuple(messages), temperature=opts.temperature,
-                        image_px=opts.image_px)
+    image_px = None if cfg.run.mode == "process" and cfg.segment.enabled else opts.image_px
+    return PromptBundle(messages=tuple(messages), temperature=opts.temperature, image_px=image_px)
 
 
 def _prelude_messages(acfg: "AnnotateConfig", schema_text: str) -> list[Message]:
@@ -475,19 +388,6 @@ def _prelude_messages(acfg: "AnnotateConfig", schema_text: str) -> list[Message]
     return messages
 
 
-def _effective_k_cap(cfg: "ResolvedConfig", k_eff: int | None) -> int:
-    """算出本次装配的生效关键帧上限。
-
-    @param cfg 已解析配置（annotate.sequence_frames 是配置侧上限）
-    @param k_eff 外部收窄值；None = 直接用配置值
-    @return min(配置上限, max(2, k_eff))——外部帽与配置值取小（§7.4），并落在 V10 的
-        最小单元 2 上：每个受认可的载体（V20 折半、V21 梯、§3.3⑥③ 装填）本就以 2
-        触底，且 k=1 没有降采样形态
-    """
-    cap = cfg.annotate.sequence_frames
-    return cap if k_eff is None else min(cap, max(2, k_eff))
-
-
 def _sequence_parts(record: Record, cfg: "ResolvedConfig", opts: AnnotatePromptOptions,
                     fit: _PackState | None) -> tuple[Part, ...]:
     """装配 v1.8 序列变体的 ①②③ 段（S6 段序；末段恒为 ③ 文本段）。
@@ -498,6 +398,8 @@ def _sequence_parts(record: Record, cfg: "ResolvedConfig", opts: AnnotatePromptO
     @param fit ④ 裁剪指令；None = 不裁
     @return 当前记录 user 消息的 parts 元组
     """
+    if cfg.run.mode == "process" and cfg.segment.enabled:
+        return complete_parts(record, opts)
     parts: list[Part] = []
     if opts.transitions is not None:           # ① transitions 为 None 时整段省略
         steps = "\n".join(_step_line(t) for t in opts.transitions)
@@ -505,15 +407,6 @@ def _sequence_parts(record: Record, cfg: "ResolvedConfig", opts: AnnotatePromptO
             steps, trims = _fit_block(steps, fit.step_budget)
             fit.truncations += trims
         parts.append(Part(kind="text", text=f"{_LABEL_ACTION_SEQUENCE}\n{steps}"))
-    if record.modality == "ui":                # ② text 模态序列退化为 ① + ③
-        kept = _keyframe_indexes(len(record.members),
-                                 _effective_k_cap(cfg, opts.k_eff),
-                                 opts.fragment_lens)
-        k = len(kept)
-        for i, m_idx in enumerate(kept, start=1):
-            member = record.members[m_idx]
-            parts.append(Part(kind="text", text=f"[关键帧 {i}/{k}·成员 {m_idx + 1}]"))
-            parts.append(Part(kind="image", image=member.image))
     digests = "\n".join(
         _member_digest_lines(record.members, cfg.input.ui_tree_max_chars))
     if fit is not None:
@@ -566,13 +459,8 @@ def _with_repair_suffix(parts: tuple[Part, ...],
 
 # ── v1.11 装填驱动（spec 3.5.2 v1.11 段，确定性份额定序）─────────────────────
 #
-# ① 静态系统侧（指令 / 用户 Schema / few-shot）只**计量**、永不裁（V13③ M1 预检
-#    领地）；② 文本块（步骤行 + 成员摘要；单记录控件树）按各自绝对上限渲染并计量；
-# ③ 图像吃余量——k_eff = min(cap, max(2, ⌊余量/单图成本⌋))，首末关键帧恒保留、中间
-#    均匀降采样（只收缩 k；T14 逐片段配额按其既定规则退化）；④ k = 2 仍超 ⇒ 文本块
-#    边缘裁剪（成员摘要是兜底裁决证据，**最后**才让步）；⑤ 仍超 ⇒ V10
-#    ContextOverflowError(phase="precheck")——记录由 stage 层落 rejects，注定失败的
-#    请求永不发出。
+# 本节只装填普通单记录与生成文本序列；处理流在预算入口直接使用完整请求。
+# 指令、模型 Schema、few-shot 与修复上下文只计量不裁；合法文本槽位不足则明确溢出。
 
 def _image_unit_cost(prof: "LLMProfile", ctx: "RunContext",
                      image_px: int | None) -> int:
@@ -625,21 +513,16 @@ def _pack_prompt(record: Record, ctx: "RunContext", prof: "LLMProfile",
                   if prof.supports_structured_output else 0)
     bundle = _assemble_prompt(record, cfg, schema_text, opts)   # ①② 按请求上限全量计量
     text_est, n_images = _prompt_text_est(bundle, schema_est)
-    image_cost = k_fin = 0
+    image_cost = 0
     if n_images == 0:
         if text_est <= b:
             return bundle, 0
     else:
         image_cost = _image_unit_cost(prof, ctx, opts.image_px)
-        k_fin = min(n_images, max(2, (b - text_est) // image_cost))   # ③ 图像吃余量
-        if k_fin < n_images:
-            bundle = _assemble_prompt(record, cfg, schema_text,
-                                      replace(opts, k_eff=k_fin))
-            text_est, n_images = _prompt_text_est(bundle, schema_est)
         if text_est + n_images * image_cost <= b:
             return bundle, n_images
     scale = _PackScale(profile=prof.name, limit=b, schema_est=schema_est,
-                       text_est=text_est, image_cost=image_cost, k_fin=k_fin)
+                       text_est=text_est, image_cost=image_cost, image_count=n_images)
     return _trim_pack(record, ctx, schema_text, opts, scale)
 
 
@@ -666,7 +549,7 @@ def _trim_state(record: Record, cfg: "ResolvedConfig", opts: AnnotatePromptOptio
         # ⑤ 族裁剪真正切走的块**体**。
         fixed = (scale.text_est - budget.est_text(steps_body)
                  - budget.est_text(digest_body))
-        avail = scale.limit - fixed - scale.k_fin * scale.image_cost
+        avail = scale.limit - fixed - scale.image_count * scale.image_cost
         digest_share = min(budget.est_text(digest_body), max(0, avail))
         step_share = max(0, avail - digest_share)
         return _PackState(
@@ -678,7 +561,7 @@ def _trim_state(record: Record, cfg: "ResolvedConfig", opts: AnnotatePromptOptio
                      if record.ui_tree else "")
         fixed = scale.text_est - budget.est_text(tree_body)
         return _PackState(tree_budget=(scale.limit - fixed
-                                       - scale.k_fin * scale.image_cost))
+                                       - scale.image_count * scale.image_cost))
     raise ContextOverflowError(
         "annotation prompt exceeds the input budget at the minimal unit "
         "(single text record — no trimmable block)", phase="precheck",
@@ -688,7 +571,7 @@ def _trim_state(record: Record, cfg: "ResolvedConfig", opts: AnnotatePromptOptio
 def _trim_pack(record: Record, ctx: "RunContext", schema_text: str,
                opts: AnnotatePromptOptions,
                scale: _PackScale) -> tuple[PromptBundle, int]:
-    """④⑤：在关键帧触底后裁文本块，仍超限即 V10。
+    """裁普通记录或生成文本序列的合法文本槽位，仍超限则终止。
 
     @param record 待标注记录
     @param ctx 运行上下文（裁剪计数入口）
@@ -696,14 +579,10 @@ def _trim_pack(record: Record, ctx: "RunContext", schema_text: str,
     @param opts 装配变体参数
     @param scale 本次装配的度量口径快照
     @return (装填后的 PromptBundle, 图像数)
-    @raises ContextOverflowError 全部可裁份额耗尽后，不可裁触底（静态侧 + V25③
-        后缀 + 2 个关键帧）仍超预算 → V10
+    @raises ContextOverflowError 全部合法文本份额耗尽，固定部件仍超预算。
     """
     fit = _trim_state(record, ctx.cfg, opts, scale)
-    is_ui_sequence = record.kind == "sequence" and record.modality == "ui"
-    k_arg = scale.k_fin if is_ui_sequence else opts.k_eff
-    bundle = _assemble_prompt(record, ctx.cfg, schema_text,
-                              replace(opts, k_eff=k_arg), fit=fit)
+    bundle = _assemble_prompt(record, ctx.cfg, schema_text, opts, fit=fit)
     if fit.truncations:
         ctx.metrics.count("budget.truncations.annotate", fit.truncations)
     text_est, n_images = _prompt_text_est(bundle, scale.schema_est)
@@ -717,67 +596,47 @@ def _trim_pack(record: Record, ctx: "RunContext", schema_text: str,
 
 async def _budgeted_call(record: Record, ctx: "RunContext", schema_text: str,
                          opts: AnnotatePromptOptions) -> tuple[dict, Usage, int, str]:
-    """经 M8 四层保证发出一次标注调用。
+    """发出一次同源标注请求；处理序列保留完整证据。
 
-    @param record 待标注记录
+    @param record 当前记录或完整序列
     @param ctx 运行上下文
-    @param schema_text 类有效 Schema 文本
-    @param opts 装配变体参数
-    @return complete_validated 的四元组（对象、用量、尝试数、模型）
-    @raises SchemaViolation L3 修复穷尽
-    @raises ContextOverflowError 装填 V10 或反应式溢出终态
-
-    预算未声明（cw == 0）⇒ 走 v1.11 之前的装配/调用路径，字节等价（200 形态的溢出
-    仍可能浮现，直接上抛且不喂熔断）；已声明 ⇒ 交给 _degrading_call。两个调用点
-    都经 _complete_annotation，携带按类 Schema 覆盖。
-    """
+    @param schema_text 实际模型 Schema 文本
+    @param opts 当前标注参数
+    @return 通过模型及最终 Schema 校验的结果
+    @raises ContextOverflowError 完整请求容量不足，保持原始异常"""
     cfg = ctx.cfg
+    if record.kind == "sequence" and cfg.run.mode == "process" and cfg.segment.enabled:
+        request = sequence_request(record, ctx, schema_text, opts)
+        error = request_overflow(request, ctx)
+        if error is not None:
+            _logger.warning("complete annotation prompt exceeds context capacity")
+            raise error
+        return await _complete_annotation(ctx, record, request.prompt, opts)
     prof = cfg.llm_profiles.get(cfg.annotate.llm)
     if prof is not None and prof.context_window > 0:
-        return await _degrading_call(record, ctx, schema_text, opts, prof)
+        return await _packed_call(record, ctx, schema_text, opts, prof)
     prompt = _assemble_prompt(record, cfg, schema_text, opts)
     return await _complete_annotation(ctx, record, prompt, opts)
 
 
-async def _degrading_call(record: Record, ctx: "RunContext", schema_text: str,
-                          opts: AnnotatePromptOptions,
-                          prof: "LLMProfile") -> tuple[dict, Usage, int, str]:
-    """预算已声明时的装填调用 + V20 有界降级重试。
+async def _packed_call(record: Record, ctx: "RunContext", schema_text: str,
+                       opts: AnnotatePromptOptions,
+                       prof: "LLMProfile") -> tuple[dict, Usage, int, str]:
+    """普通单记录与生成文本使用既有装填，处理序列由完整证据路径负责。
 
     @param record 待标注记录
     @param ctx 运行上下文
     @param schema_text 类有效 Schema 文本
-    @param opts 装配变体参数
-    @param prof 归属 [llm.*] profile
-    @return complete_validated 的四元组
-    @raises ContextOverflowError 装填 V10，或降级次数耗尽后的反应式终态
-
-    关键帧折半（k → max(2, ⌈k/2⌉)），至多 2 次降级并计 budget.degrade_retries；
-    终态遵循 §3.5 熔断矩阵——反应式 400 恰喂一次熔断。
+    @param opts 装配参数
+    @param prof 请求模型配置
+    @return 通过模型及后处理验证的结果
     """
-    shape = opts
-    degrades = 0
-    pending: ContextOverflowError | None = None
-    while True:
-        try:
-            prompt, k_used = _pack_prompt(record, ctx, prof, schema_text, shape)
-        except ContextOverflowError:
-            # 装箱器抛的 V10：驱动本次降级的那个反应式溢出（若有）在此结算终态
-            # （A7）；precheck 抛出本身永不喂。
-            if pending is not None:
-                _feed_reactive_terminal(pending, ctx.metrics)
-            raise
-        try:
-            return await _complete_annotation(ctx, record, prompt, shape)
-        except ContextOverflowError as exc:
-            if k_used > 2 and degrades < 2:
-                degrades += 1
-                pending = exc
-                ctx.metrics.count("budget.degrade_retries")
-                shape = replace(shape, k_eff=max(2, math.ceil(k_used / 2)))  # V20 折半
-                continue
-            _feed_reactive_terminal(exc, ctx.metrics)
-            raise
+    prompt, _images = _pack_prompt(record, ctx, prof, schema_text, opts)
+    try:
+        return await _complete_annotation(ctx, record, prompt, opts)
+    except ContextOverflowError as exc:
+        _feed_reactive_terminal(exc, ctx.metrics)
+        raise
 
 
 # ── 自洽采样的字段级多数投票（spec 3.5.2）───────────────────────────────────
@@ -970,7 +829,7 @@ async def _run_sample(plan: _SamplePlan, ctx: "RunContext",
     except SchemaViolation as exc:
         return _SampleOutcome(value=None, error=exc)
     except ProviderFatalError as exc:
-        if _ATTEMPT_MODE.get() or not isolate:
+        if _ATTEMPT_MODE.get() or not isolate or ctx.session_attempt is not None:
             raise
         return _SampleOutcome(value=None, error=exc)
     except Exception as exc:  # 纯叶只回传冻结失败
@@ -1001,7 +860,7 @@ async def _execute_samples(plans: Sequence[_SamplePlan], ctx: "RunContext",
         )
         for ordinal, plan in enumerate(plans)
     )
-    return await ctx.tasks.run_group(TaskGroupRequest(specs))
+    return await ctx.run_group(TaskGroupRequest(specs))
 
 
 async def annotate_record_leaf(record: Record, ctx: "RunContext",
@@ -1026,31 +885,13 @@ async def annotate_record_leaf(record: Record, ctx: "RunContext",
 async def annotate_record(record: Record, ctx: "RunContext",
                           opts: AnnotatePromptOptions = _DEFAULT_PROMPT_OPTIONS,
                           ) -> Annotation:
-    """跑完一条记录的完整标注路径（含自洽投票）。
+    """执行记录或序列的完整标注与自洽投票。
 
-    @param record 待标注记录；序列记录不向后处理函数或 L2.5 暴露内部 raw
-    @param ctx 为本次公开调用派生唯一 task_namespace 的运行上下文
-    @param opts 装配变体参数（``AnnotatePromptOptions``）：``repair`` 非 None 时
-        **跳过**自洽（修复重标注恒为 profile 默认温度下的单次调用）；``label``
-        选择按类指令/few-shot 与标注
-        Schema——提示词文本、M8 调用、自洽投票与预算计价四处同源取值，按类 Schema
-        调用保留用户待遇（L2.5 + resolved_at），而 llm / self_consistency /
-        sc_temperature 仍取全局（白名单）；``transitions`` v1.8（S5）步骤源，M7 穿
-        的是成员手术后的**重建**值；``fragment_lens`` v1.9（T14）逐片段关键帧配额，
-        来自 M16 的 stitch_fragments 标位；``k_eff`` v1.11（V21 梯 / F3）关键帧上限
-        收窄值，M5 自身的 V20 降级在 _degrading_call 内部单独传；``image_px``
-        v1.11（V23①）升档后的图像采样边长。``temperature`` 由 M5 内部设定（单次
-        调用取 profile 默认，自洽样本取 sc_temperature），调用方置值一律忽略
-    @return 该记录的 Annotation
-    @raises SchemaViolation L3 修复穷尽（含 L2.5 回调违规）
-    @raises ProviderRetryableError 重试耗尽
-    @raises ProviderFatalError 不可重试的 provider 错误
-    @raises ContextOverflowError 装填 V10 或反应式溢出终态
-
-    每个变体取值在**所有**路径（单次调用、每个自洽样本、修复重标注）上一致穿参；
-    缺省对象即与引入这些取值之前的调用形字节等价。M7 的修复重标注传同一个 label，
-    故按类 Schema 无需修复侧改动。
-    """
+    @param record 当前记录；序列不向后处理暴露内部 raw
+    @param ctx 拥有唯一任务命名空间的运行上下文
+    @param opts 标签、动作、修复内容、普通图片工作点和冻结时间上下文
+    @return 通过所有校验的标注结果
+    @raises Exception 模型、后处理或容量错误保持原有明确归属"""
     plans = _sample_plans(record, ctx, opts)
     outcomes = await _execute_samples(plans, ctx, isolate=False)
     return _annotation_from_samples(outcomes, record, ctx, opts)
@@ -1178,8 +1019,10 @@ def _assemble_frame_prompt(member: Record, cfg: "ResolvedConfig",
             Part(kind="text", text=f"{_FRAME_LABEL_MEMBER} {member.text}"),
         )
     else:  # ui 成员：三段形（镜像本文件单记录 ui 标注）
-        tree_text = member.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars)
-        if fit is not None and fit.tree_budget is not None:
+        complete = cfg.run.mode == "process" and cfg.segment.enabled
+        tree_text = (record_evidence(member) if complete else
+                     member.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars))
+        if not complete and fit is not None and fit.tree_budget is not None:
             tree_text, trimmed = _fit_tree_text(tree_text, max(0, fit.tree_budget))
             if trimmed:
                 fit.truncations += 1
@@ -1284,27 +1127,54 @@ class _MemberOutcome:
     error: Exception | None                # 待声明序归并的失败
 
 
-async def annotate_member_leaf(member: Record, ctx: "RunContext",
-                               label: str | None = None) -> Annotation:
+def _frame_call_prompt(member: Record, ctx: "RunContext", label: str | None) -> PromptBundle:
+    """装配实际帧请求，处理流不裁树、不改图片工作点。
+
+    @param member 完整成员记录
+    @param ctx 运行上下文
+    @param label 实际帧类视图
+    @return 已完成发送前预算检查的提示词
+    """
+    cfg = ctx.cfg
+    schema = _thaw_json(cfg.model_frame_schema)
+    schema_text = json.dumps(schema, ensure_ascii=False, separators=(", ", ": "))
+    profile = cfg.llm_profiles.get(cfg.frame_annotate.llm)
+    if cfg.run.mode == "process" and cfg.segment.enabled:
+        prompt = build_frame_annotate_prompt(member, cfg, schema_text, label=label)
+        error = request_overflow(CapacityRequest(cfg.frame_annotate.llm, prompt, schema), ctx)
+        if error is not None:
+            _logger.warning("complete frame annotation prompt exceeds context capacity")
+            raise error
+        return prompt
+    if profile is not None and profile.context_window > 0:
+        return _pack_frame_prompt(member, ctx, profile, schema_text, label)
+    return build_frame_annotate_prompt(member, cfg, schema_text, label=label)
+
+
+async def annotate_member_leaf(member: Record, ctx: "RunContext", label: str | None = None,
+                               target: CapacityTarget | None = None) -> Annotation:
     """verify TaskSpec 可直接调用的无调度单成员纯叶面。
 
     @param member 待标注成员帧
     @param ctx verify 波次派生的运行上下文
     @param label 成员类标签；None 使用全局帧指令
+    @param target 处理流显式帧出现位置与帧类视图
     @return 成功 Annotation；异常原样上抛
     """
     cfg = ctx.cfg
+    if ctx.session_attempt is not None:
+        if target is None:
+            _logger.error("stream frame annotation requires an explicit capacity target")
+            raise InternalError("stream frame annotation requires an explicit capacity target")
+        known = terminal_error(ctx, target, "frame", cfg.frame_annotate.llm)
+        if known is not None:
+            raise known
     final_schema = _thaw_json(cfg.frame_schema)
     model_schema = _thaw_json(cfg.model_frame_schema)
-    schema_text = json.dumps(model_schema, ensure_ascii=False, separators=(", ", ": "))
-    prof = cfg.llm_profiles.get(cfg.frame_annotate.llm)
-    if prof is None or prof.context_window <= 0:
-        prompt = build_frame_annotate_prompt(member, cfg, schema_text, label=label)
-    else:
-        prompt = _pack_frame_prompt(member, ctx, prof, schema_text, label)
+    prompt = _frame_call_prompt(member, ctx, label)
     scope = CallScope(
         record_ids=(member.id,), batch_no=ctx.batch_no,
-        record=annotation_record_context(member),
+        record=annotation_record_context(member), complete_evidence=ctx.session_attempt is not None,
     )
     postprocessor = frame_postprocessor(cfg, label)
     if postprocessor is None:
@@ -1329,8 +1199,8 @@ async def annotate_member_leaf(member: Record, ctx: "RunContext",
     return Annotation(output=obj, model=model, attempts=attempts, usage=usage)
 
 
-async def _run_member(member: Record, ctx: "RunContext",
-                      label: str | None) -> _MemberOutcome:
+async def _run_member(member: Record, ctx: "RunContext", label: str | None,
+                      target: CapacityTarget | None = None) -> _MemberOutcome:
     """执行纯成员叶，把可隔离失败收敛为普通结果。
 
     @param member 待标注成员帧
@@ -1339,11 +1209,11 @@ async def _run_member(member: Record, ctx: "RunContext",
     @return 成功值或普通失败
     """
     try:
-        return _MemberOutcome(await annotate_member_leaf(member, ctx, label), None)
+        return _MemberOutcome(await annotate_member_leaf(member, ctx, label, target), None)
     except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
         raise
     except ProviderFatalError as exc:
-        if _ATTEMPT_MODE.get():
+        if _ATTEMPT_MODE.get() or ctx.session_attempt is not None:
             raise
         return _MemberOutcome(None, exc)
     except Exception as exc:  # 纯叶只回传冻结失败
@@ -1351,7 +1221,8 @@ async def _run_member(member: Record, ctx: "RunContext",
 
 
 async def _execute_members(members: Sequence[tuple[Record, str | None]],
-                           ctx: "RunContext", start: int) -> tuple[_MemberOutcome, ...]:
+                           ctx: "RunContext", start: int,
+                           targets: Sequence[CapacityTarget | None] | None = None) -> tuple[_MemberOutcome, ...]:
     """通过共享 TaskExecutor 执行一个成员标注波次。
 
     @param members 成员记录与类标签对
@@ -1368,11 +1239,12 @@ async def _execute_members(members: Sequence[tuple[Record, str | None]],
             declaration_key=(ctx.batch_no, 7, start + ordinal),
             stage="annotate",
             resource_key=("llm", profile),
-            operation=lambda member=member, label=label: _run_member(member, ctx, label),
+            operation=lambda member=member, label=label, ordinal=ordinal:
+                _run_member(member, ctx, label, targets[ordinal] if targets is not None else None),
         )
         for ordinal, (member, label) in enumerate(members)
     )
-    return await ctx.tasks.run_group(TaskGroupRequest(specs))
+    return await ctx.run_group(TaskGroupRequest(specs))
 
 
 def _record_member_failure(member: Record, ctx: "RunContext", exc: Exception) -> None:
@@ -1391,8 +1263,8 @@ def _record_member_failure(member: Record, ctx: "RunContext", exc: Exception) ->
                     extra={"stage": "annotate", "batch": ctx.batch_no})
 
 
-async def annotate_member(member: Record, ctx: "RunContext",
-                          label: str | None = None) -> Annotation | None:
+async def annotate_member(member: Record, ctx: "RunContext", label: str | None = None,
+                          target: CapacityTarget | None = None) -> Annotation | None:
     """v1.12 帧级逐帧标注的公开直调面（SPEC-frame-annotation §3.3/§3.4，签名冻结）。
 
     @param member 单个成员帧记录
@@ -1407,8 +1279,13 @@ async def annotate_member(member: Record, ctx: "RunContext",
     @raises CircuitBreakerTripped 运行级控制流在所有模式照常上抛（KeyboardInterrupt /
         CancelledError 同理）
     """
-    (outcome,) = await _execute_members(((member, label),), ctx, 0)
+    if ctx.session_attempt is not None and target is None:
+        _logger.error("stream frame annotation requires an explicit capacity target")
+        raise InternalError("stream frame annotation requires an explicit capacity target")
+    (outcome,) = await _execute_members(((member, label),), ctx, 0, (target,))
     if outcome.error is not None:
+        if target is not None:
+            raise_session_capacity(ctx, (target,), outcome.error, "frame")
         if _ATTEMPT_MODE.get():
             raise outcome.error
         _record_member_failure(member, ctx, outcome.error)
@@ -1435,6 +1312,7 @@ class _RecordSpan:
     options: AnnotatePromptOptions        # 本信封的装配参数
     start: int                            # sample 结果起始位置
     count: int                            # sample 结果数
+    error: Exception | None = None        # 未产生模型任务的同步容量计划异常
 
 
 @dataclass(frozen=True, slots=True)
@@ -1453,6 +1331,7 @@ class _FramePlan:
     label: str | None                     # 成员类标签
     skipped: bool                         # 类视图是否禁用
     call_index: int | None                # 成员叶结果位置
+    member_index: int = 0                 # 当前序列中的成员索引，对应显式出现位置
 
 
 class AnnotateStage:
@@ -1473,6 +1352,10 @@ class AnnotateStage:
         """@return 当前 attempt 的程序视图配置；普通批次返回构造期配置。"""
         active = _ATTEMPT_CONFIG.get()
         return self._cfg if active is None else active  # type: ignore[return-value]
+
+    def preview_capacity(self, item: PipelineItem, ctx: "RunContext"):
+        """@param item 候选完整序列。@param ctx 冻结会话上下文。@return 首个实际请求容量失败。"""
+        return preview_capacity(self, item, ctx)
 
     async def run(self, batch: list[PipelineItem], ctx: "RunContext") -> list[PipelineItem]:
         """先并发全批 sequence samples，归并后再并发 frame members。
@@ -1555,10 +1438,11 @@ class AnnotateStage:
         if not self.cfg.frame_annotate.enabled or item.record.kind != "sequence":
             return True
         annotations = item.member_annotations or {}
-        for member in item.record.members:
-            cls = (item.member_classifications or {}).get(member.id)
+        for index, member in enumerate(item.record.members):
+            key = member_key(item, index)
+            cls = (item.member_classifications or {}).get(key)
             view = self.cfg.frame_class_views.get(cls.label) if cls is not None else None
-            if (view is None or view.enabled) and annotations.get(member.id) is None:
+            if (view is None or view.enabled) and annotations.get(key) is None:
                 return False
         return True
 
@@ -1576,14 +1460,16 @@ class AnnotateStage:
             return spans, samples
         for item in items:
             label = item.classification.label if item.classification else None
-            fragments = getattr(item, "stitch_fragments", None)
-            fragment_lens = (tuple(int(f["member_count"]) for f in fragments)
-                             if fragments else None)
             options = AnnotatePromptOptions(
-                label=label, transitions=item.transitions, fragment_lens=fragment_lens,
+                label=label, transitions=item.transitions,
                 temporal_context=item.temporal_context,
             )
-            planned = _sample_plans(item.record, ctx, options)
+            try:
+                planned = _sample_plans(item.record, ctx, options)
+            except (ContextOverflowError, SessionCapacityError) as exc:
+                _logger.error("annotation sample planning exceeded context capacity")
+                spans.append(_RecordSpan(item, options, len(samples), 0, exc))
+                continue
             spans.append(_RecordSpan(item, options, len(samples), len(planned)))
             samples.extend(planned)
         return spans, samples
@@ -1598,9 +1484,12 @@ class AnnotateStage:
         """
         spans, samples = self._sequence_plans(items, ctx)
         outcomes = await _execute_samples(samples, ctx, isolate=True)
+        raise_session_capacities(ctx, sequence_wave_failures(spans, outcomes, ctx))
         for span in spans:
             result_slice = outcomes[span.start:span.start + span.count]
             try:
+                if span.error is not None:
+                    raise span.error
                 annotation = _annotation_from_samples(
                     result_slice, span.item.record, ctx, span.options,
                 )
@@ -1646,7 +1535,7 @@ class AnnotateStage:
             return kind.value, str(exc), False
         if isinstance(exc, (ContextOverflowError, OutputTruncatedError)):
             # v1.11（V27①）：预算词表先行路由——精确 kind，记录级 failed → rejects。
-            # 终态喂熔断已在 _degrading_call 内发生（A7——duck 标位幂等）。
+            # 终态喂熔断已在 _packed_call 内发生（A7——duck 标位幂等）。
             return budget.classify_stage_error(exc), str(exc), False
         if isinstance(exc, ProviderRetryableError):
             return ErrorKind.PROVIDER_RETRYABLE_EXHAUSTED.value, str(exc), True
@@ -1698,16 +1587,17 @@ class AnnotateStage:
             if not self._frame_gate(item):
                 continue
             occupied = item.member_annotations or {}
-            seen: set[str] = set()
-            for member in item.record.members:
-                if member.id in occupied or member.id in seen:
+            seen: set[int | str] = set()
+            for index, member in enumerate(item.record.members):
+                key = member_key(item, index)
+                if key in occupied or key in seen:
                     continue
-                seen.add(member.id)
-                label = self._member_label(item, member)
+                seen.add(key)
+                label = self._member_label(item, index)
                 view = self.cfg.frame_class_views.get(label) if label is not None else None
                 skipped = view is not None and not view.enabled
                 call_index = None if skipped else len(calls)
-                plans.append(_FramePlan(item, member, label, skipped, call_index))
+                plans.append(_FramePlan(item, member, label, skipped, call_index, index))
                 if not skipped:
                     calls.append((member, label))
         return plans, calls
@@ -1727,14 +1617,14 @@ class AnnotateStage:
         return getattr(item, "segment_degraded", None) is None
 
     @staticmethod
-    def _member_label(item: PipelineItem, member: Record) -> str | None:
+    def _member_label(item: PipelineItem, index: int) -> str | None:
         """读取一个成员的新鲜帧类标签。
 
         @param item 所属序列信封
         @param member 成员帧
         @return 成员类标签；未分类时为 None
         """
-        classification = (item.member_classifications or {}).get(member.id)
+        classification = (item.member_classifications or {}).get(member_key(item, index))
         return classification.label if classification is not None else None
 
     async def _frame_wave(self, items: Sequence[PipelineItem], ctx: "RunContext",
@@ -1746,10 +1636,19 @@ class AnnotateStage:
         @param start 本波次起始 ordinal
         """
         plans, calls = self._frame_plans(items)
-        outcomes = await _execute_members(calls, ctx, start)
+        targets = [self._frame_target(plan) if ctx.session_attempt is not None else None
+                   for plan in plans if not plan.skipped]
+        outcomes = await _execute_members(calls, ctx, start, targets)
+        raise_session_capacities(ctx, frame_wave_failures(self, plans, outcomes, ctx))
         for plan in plans:
             outcome = None if plan.skipped else outcomes[plan.call_index]
             self._settle_frame(plan, outcome, ctx)
+
+    @staticmethod
+    def _frame_target(plan: _FramePlan) -> CapacityTarget:
+        """@param plan 实际成员请求。@return 以帧类别与出现位置定位的容量目标。"""
+        positions = plan.item.member_positions[plan.member_index:plan.member_index + 1]
+        return replace(capacity_target(plan.item, positions), label=plan.label)
 
     def _settle_frame(self, plan: _FramePlan, outcome: _MemberOutcome | None,
                       ctx: "RunContext") -> None:
@@ -1771,7 +1670,7 @@ class AnnotateStage:
             if outcome is None:
                 raise InternalError("frame annotation result is missing")
             annotation = self._settle_member_outcome(plan, outcome, ctx)
-            annotations[member.id] = annotation
+            annotations[member_key(plan.item, plan.member_index)] = annotation
             payload = {"member_id": member.id,
                        "status": "annotated" if annotation is not None else "failed",
                        "attempts": annotation.attempts if annotation is not None else 0}

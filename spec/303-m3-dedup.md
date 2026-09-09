@@ -58,7 +58,39 @@ reservation；只有深度冻结候选成功放入候选缓冲后，所有权才
 
 **线索记录（v1.9）。**stitch 启用时抵达本模块的判重单元升维为**线索**（thread——M16 缝合后的幸存序列信封，链序 stitch 在 dedup 之前，3.10.3/3.16）：`dedup_text` 配方**机制原样**（上列 S10 序列分支零改动）——成员逐条按其单记录配方产出后按成员序以 `"\x1e"` 拼接，作用对象自然是**重绑后**的成员元组，线索级重复 =「同样的完整操作流程（含恢复段）」；被并 episode 壳（`status = "stitched"`）被既有 `status == "active"` 处理面过滤**天然排除**、不参检不入索引（absorbed 成员帧同理）——**本模块代码零改动**（T13，审计核查点 6）。
 
-**嵌入输入预算截断（v1.11，V15）。**`dedup.semantic = true` 且所引 `[embedding.<name>]` profile 声明 `context_window` 时（0 = 未声明 = 预算关闭，行为与 v1.10 一致），第④级的 embed 输入（`dedup_text` 产物，含序列/线索拼接文本）在发起 embedding 调用前按 `embed_budget = context_window − margin`（无输出预留，3.9）截断——**确定性头部保留**（`keep = "head"` 行边界截断：嵌入语义主体在文本前部），修复该调用点完全无截断的既有缺口；截断计入 `report.budget.truncations`（6.4）。既有 `embedding_failures` 跳过路径（3.3.4）**保留为兜底**——截断之外的 embedding 失败仍按①—③判定、不增新失败通道。
+**普通记录嵌入输入预算截断（不适用于普通流会话）。**`dedup.semantic = true` 且所引 `[embedding.<name>]` profile 声明 `context_window` 时（0 = 未声明 = 预算关闭，行为与 v1.10 一致），第④级的 embed 输入（`dedup_text` 产物，含序列/线索拼接文本）在发起 embedding 调用前按 `embed_budget = context_window − margin`（无输出预留，3.9）截断——**确定性头部保留**（`keep = "head"` 行边界截断：嵌入语义主体在文本前部），修复该调用点完全无截断的既有缺口；截断计入 `report.budget.truncations`（6.4）。既有 `embedding_failures` 跳过路径（3.3.4）**保留为兜底**——截断之外的 embedding 失败仍按①—③判定、不增新失败通道。
+
+### 普通流会话去重暂存
+
+普通流在上游成员分配冻结后调用 `DedupStage.reserve_session(batch, ctx)`，返回
+`SessionDedupReservation`。它持有空的当前尝试普通索引增量和只读正式前缀，不复制正式索引，
+不复用生成 counterfactual set 的组级豁免或 whole-set rejection 规则。
+
+查询顺序仍为 exact → MinHash/pHash → semantic。每层同时查询正式前缀和当前增量，选择最高相似度；
+同分时正式前缀优先，段内仍按插入顺序。正式 `_last_probe`、`last_similarity` 与 `_counted_clusters`
+在预备尝试中不变；新增重复簇只记本尝试，已正式记录的簇只查询。scope=batch 表示当前完整会话，
+不查询旧会话，并且只在最终提交时替换旧索引。
+
+`commit_session(reservation)` 同步提交该最终尝试在 dedup 阶段接纳的所有 CPU 与语义特征、重复簇及
+最后探测状态。后续质量、分类、标注或验证过滤不撤回接纳身份，内容保持去重阶段的原有含义。
+`discard_session(reservation)` 只释放当前增量，不修改正式状态。每个 reservation 只能消费一次，
+拥有者不匹配、正式索引变化或重复提交/丢弃均为 InternalError。
+
+语义嵌入参与的普通流序列必须保留完整规范化成员文本/UI 树，不再 fit_text 或头部截断。
+`preview_capacity(item, ctx)` 对完整输入做纯预算检查，正值 embedding context_window 由配置层保证。
+真实或预检 ContextOverflowError 保留原异常并作为 dedup 拥有的 sequence 容量信号交会话协调器；
+ProviderFatalError、熔断和取消保持控制流，不能变为跳过语义级的成功接纳。
+同步 prepare 与完整 embedding 输入预检先扫描全轮，按输入声明序收齐全部错误；发现容量错误时，
+一次上抛全部同步容量信号，不派发任何可装成员的向量请求，也不提前写入普通错误产品或去重结果。
+若不存在容量或致命错误，普通准备错误继续采用原有单记录失败语义，不阻止其余成员接纳。
+所有静态声明的 embedding 任务先完成，在任何向量判决归并前收集全部 ContextOverflowError，以
+`SessionCapacityError.failures` 按输入声明序一次上抛。任一 ProviderFatalError 保持运行控制优先级。
+不能只处理首个超限而在重算后重发同轮已知失败请求；失败尝试不提交任何特征。
+已发生的调用用量、重试和 embedding failure 仍是真实运行事实。
+
+验证要求：只读正式前缀与当前增量的 exact/near/semantic 最大值和同分顺序；重复簇不泄漏；
+commit/discard、scope=batch、过期 reservation；下游过滤后仍提交去重接纳身份；完整输入预览零截断；
+真实容量控制异常与 provider fatal 不被跳过；当前会话失败和取消后正式索引及最终 dataset 计数不变。
 
 ### 3.3.4 API 与配置
 
@@ -67,6 +99,10 @@ class DedupStage(Stage):
     name = "dedup"
     def __init__(self, cfg: DedupConfig, index: DedupIndex): ...
     async def run(self, batch: list[PipelineItem], ctx: RunContext) -> list[PipelineItem]: ...
+    async def reserve_session(self, batch: list[PipelineItem], ctx: RunContext) -> SessionDedupReservation: ...
+    def commit_session(self, reservation: SessionDedupReservation) -> None: ...
+    def discard_session(self, reservation: SessionDedupReservation) -> None: ...
+    def preview_capacity(self, item: PipelineItem, ctx: RunContext) -> SessionCapacityFailure | None: ...
 
 class DedupIndex:
     """运行内存索引：exact、MinHash、pHash 与可选 semantic 特征。"""

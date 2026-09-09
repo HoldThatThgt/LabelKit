@@ -17,6 +17,7 @@ from labelkit.common.errors import (
     ProviderFatalError,
     ProviderRetryableError,
     SchemaViolation,
+    SessionCapacityError,
 )
 from labelkit.common.contracts.generation import DownstreamAttemptRequest, DownstreamAttemptResult
 from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
@@ -31,6 +32,7 @@ from labelkit.common.contracts.types import (
 )
 from labelkit.common.inference import budget
 from labelkit.common.inference.schema_engine import _thaw_json
+from labelkit.common.inference.sequence_evidence import record_evidence
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import LLMProfile, ResolvedConfig
@@ -53,35 +55,33 @@ _SYSTEM_DIMS = (
 _SYSTEM_TAIL = "先逐维度给出简短意见，再给结论。"
 
 _SEQ_SYSTEM_HEAD = (
-    "你是标注质量审核员。给定任务指令、动作序列、边界余量与首末帧截图，独立判断该序列\n"
+    "你是标注质量审核员。给定任务指令、完整成员证据、动作序列与边界余量，独立判断该序列\n"
     "（episode）的标注是否合格。"
 )
 _SEQ_SYSTEM_DIMS = (
-    "评审维度: ① 是否遵循任务指令 ② 与动作序列及首末帧证据的事实一致性 "
+    "评审维度: ① 是否遵循任务指令 ② 与完整成员及动作序列证据的事实一致性 "
     "③ 字段语义是否正确填写\n"
     "④ 段边界与成员构成是否成立（对照下列缺陷类型）"
 )
 _SEQ_SYSTEM_DEFECT_TYPES = (
     "缺陷类型（发现即列入 defects，可为空数组）:\n"
     "- label_mismatch: 标注的任务标签与序列证据不符\n"
-    "- off_task_members: 段内混入与任务无关的成员帧（members 列出这些成员帧 id）\n"
+    "- off_task_members: 段内混入与任务无关的成员帧（members 列出这些成员出现位置）\n"
     "- missing_head: 段首缺少任务起点帧（结合边界余量判断）\n"
     "- missing_tail: 段尾缺少任务终点帧（结合边界余量判断）\n"
-    "- missing_members: 段中缺失成员帧（members 列出可指认的帧 id，无从指认则为 null）\n"
+    "- missing_members: 段中缺失成员帧（members 列出可指认的帧出现位置，无从指认则为 null）\n"
     "- wrong_stitch: 线索缝合错误——各碎片并非同一任务的延续（结合片段结构判断）")
 _SEQ_SYSTEM_TAIL = "先逐维度给出简短意见，再列缺陷表，最后给结论。"
 _SEQ_SYSTEM_STRUCTURE = (
     "输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：\n"
     '{"critiques": [{"aspect": <维度>, "opinion": <一句话意见>}, ...],\n'
-    ' "defects": [{"kind": <缺陷类型>, "members": <帧 id 数组|null>,\n'
+    ' "defects": [{"kind": <缺陷类型>, "members": <非负整数出现位置数组|null>,\n'
     '              "position": <位置说明|null>, "detail": <一句话>}, ...],\n'
     ' "verdict": "pass"|"fail"}')
 
 _LABEL_ACTION_SEQUENCE = "[动作序列]"
-_LABEL_FRAGMENT_STRUCTURE = "[片段结构]"   # v1.9（T15）：第七段
+_LABEL_FRAGMENT_STRUCTURE = "[片段结构]"
 _LABEL_BOUNDARY_MARGIN = "[边界余量]"
-_LABEL_FIRST_FRAME = "[首帧截图]"
-_LABEL_LAST_FRAME = "[末帧截图]"
 _MEMBER_DIGEST_MAX_CHARS = 400   # 序列 excerpt 档摘要上限（镜像 M4 §7.3）
 
 _VERDICT_SEQ_SYSTEM_HEAD = (
@@ -104,7 +104,6 @@ _DEFAULT_FAIL_DEFECT: Mapping = {
     "kind": "label_mismatch", "members": None, "position": None,
     "detail": "评审判 fail 但未指认缺陷，默认视同标签不符",
 }
-_BOUNDARY_MARGIN_K = 2
 _COUNTER_MEMBERSHIP_REPAIRS = "verify.membership_repairs"
 _COUNTER_BOUNDARY_FLAGS = "verify.boundary_flags"
 _COUNTER_DEFECTS_PREFIX = "verify.defects."
@@ -128,6 +127,8 @@ class VerifyPromptOptions:
     boundary_margin: str = ""              # [边界余量] 段正文（驱动器预渲染）
     fragment_structure: str = ""                        # [片段结构] 段正文；空串 = 整段省略（v1.9 T15）
     fit: "_PromptFit | None" = None                     # 面板最小预算装填状态；None = 预算关（v1.11）
+    member_positions: tuple[int, ...] = ()              # 普通流每个成员的明确输入出现位置。
+    boundary_records: tuple[tuple[int, Record], ...] = ()  # 允许范围内实际引用的邻帧位置与完整证据。
     verdict_form: bool = False                          # 生成序列走 §10.16 判决形变体
 
 
@@ -152,18 +153,6 @@ class _RoutingScope:
     frames: list[PipelineItem]  # 本会话的帧信封（批位序 = 会话序）
     claimed: set[int]           # 本轮已被预定的噪声信封 id()（跨 episode 共享）
     clone: bool                 # 多标签扇出克隆信封——禁止成员手术（S8）
-    split: bool                 # 会话在 batch_size 处被硬切（S21）——回收降级为仅标记
-
-
-@dataclasses.dataclass(frozen=True)
-class _LadderTrial:
-    """V21 修复梯的一次升档试装参数（zero 调用，只做估算）。"""
-    item: PipelineItem                     # 待重标注的序列信封（取 record 与 transitions）
-    repair: "RepairContext"                # M5 修复上下文（试装提示词需嵌入）
-    label: str | None                      # 类标签（按类取指令与 Schema）
-    fragment_lens: tuple[int, ...] | None  # 每碎片成员数（关键帧配额，T14 穿参义务）
-    k_eff: int                             # 试装用关键帧配额（k 减半后的值）
-    image_px: int                          # 试装用图像采样上限（升档后的像素）
 
 
 def _feed_reactive_terminal(exc: BaseException, metrics) -> None:
@@ -386,92 +375,87 @@ def _seam_position_line(item: PipelineItem) -> str:
     return "接缝位置: " + "；".join(entries)
 
 
-def fragment_structure_text(item: PipelineItem, digest_max_chars: int) -> str:
-    """构造 [片段结构] 段正文。
+def fragment_structure_text(item: PipelineItem) -> str:
+    """按明确出现位置列出碎片，不凭计数猜测交错成员。
 
-    每碎片一行，末行给出接缝位置；未缝合或不匹配时降级为单个隐含碎片。
-    @param item 线索/episode 信封
-    @param digest_max_chars 首帧摘要字符上限
-    @return 多行段正文
+    @param item 当前线索信封。
+    @return 完整碎片成员位置和接缝结构。
     """
-    members = item.record.members
-    fragments = list(getattr(item, "stitch_fragments", ()) or ())
-    counts = [int(f.get("member_count", 0)) for f in fragments]
-    if not fragments or sum(counts) != len(members):
-        counts = [len(members)]                      # 单个隐含碎片
-    lines: list[str] = []
-    start = 0
-    total = len(counts)
-    for k, count in enumerate(counts, 1):
-        end = start + count - 1
-        digest = (frame_digest(members[start], digest_max_chars)
-                  if start < len(members) else "")
-        lines.append(f"碎片 {k}/{total}: 成员 {start}–{end}（{count} 帧）"
-                     f"｜首帧摘要: {digest}")
-        start += count
-    lines.append(_seam_position_line(item))
-    return "\n".join(lines)
+    fragments = getattr(item, "stitch_fragments", ())
+    positions = [tuple(fragment["member_positions"]) for fragment in fragments]
+    if not fragments:
+        positions = [item.member_positions]
+    lines = [f"碎片 {index}/{len(positions)}: 成员出现位置 {list(values)}（{len(values)} 帧）"
+             for index, values in enumerate(positions, 1)]
+    return "\n".join([*lines, _seam_position_line(item)])
 
 
-def _episode_membership(batch: Sequence[PipelineItem],
-                        session_id: str | None) -> dict[str, int]:
-    """帧 id → 所属 episode 的会话内序号（1 基，批序）。
-    @param batch 本批信封列表
-    @param session_id 会话 id
-    @return 归属表；首次出现者胜出
+def _episode_membership(batch: Sequence[PipelineItem], session_id: str | None) -> dict[int, int]:
+    """按出现位置构造会话成员归属。
+
+    @param batch 完整会话信封。
+    @param session_id 原始会话身份。
+    @return 出现位置到首次所属序列声明序的映射。
     """
-    membership: dict[str, int] = {}
+    membership: dict[int, int] = {}
     for ordinal, episode in enumerate(_session_episodes(batch, session_id), 1):
-        for member in episode.record.members:
-            membership.setdefault(member.id, ordinal)
+        for position in episode.member_positions:
+            membership.setdefault(position, ordinal)
     return membership
 
 
-def _frame_fate(frame: PipelineItem, membership: Mapping[str, int]) -> str:
-    """一帧在 [边界余量] 里的去向文本。
-    @param frame 帧信封
-    @param membership 帧 id → episode 序号
-    @return "noise" / "第 n 段" / "无"
+def _frame_fate(frame: PipelineItem, membership: Mapping[int, int]) -> str:
+    """渲染一个明确出现位置的当前去向。
+
+    @param frame 完整会话帧信封。
+    @param membership 出现位置到序列声明序的映射。
+    @return 噪声、序列或无归属说明。
     """
     if frame.status == "dropped_noise":
         return "noise"
-    ordinal = membership.get(frame.record.id)
+    ordinal = membership.get(frame.session_position)
     return f"第 {ordinal} 段" if ordinal is not None else "无"
 
 
-def boundary_margin_text(item: PipelineItem, batch: Sequence[PipelineItem],
-                         digest_max_chars: int) -> str:
-    """[边界余量] 段正文（spec 3.7.2）：每侧段边界外 k = 2 帧的摘要与去向，取同 session_id 的批位序
-    邻域（段首成员之前 / 段尾成员之后），越界位置渲染成裸「无」行；行序按时间（段首前 2、段首前
-    1、段尾后 1、段尾后 2）。纯代码读批状态——零 LLM 调用、零随机。
-    @param item 被评审的序列信封
-    @param batch 本批信封列表（邻域来源）
-    @param digest_max_chars 帧摘要字符上限
-    @return 四行段正文
-    """
-    frames = _session_frame_envelopes(batch, item.session_id)
-    position_of: dict[str, int] = {}
-    for i, frame in enumerate(frames):
-        position_of.setdefault(frame.record.id, i)
-    members = item.record.members
-    head = position_of.get(members[0].id) if members else None
-    tail = position_of.get(members[-1].id) if members else None
-    membership = _episode_membership(batch, item.session_id)
+def boundary_margin_text(item: PipelineItem, batch: Sequence[PipelineItem]) -> str:
+    """列出同会话边界邻帧的完整文本证据与人工容量边界。
 
-    lines: list[str] = []
-    for label, base, offsets in (("段首前", head, (-_BOUNDARY_MARGIN_K, -1)),
-                                 ("段尾后", tail, (1, _BOUNDARY_MARGIN_K))):
+    @param item 当前工作序列。
+    @param batch 完整会话信封。
+    @return 四侧邻域及明确人工边界说明。
+    """
+    frames = {frame.session_position: frame for frame in boundary_frames(item, batch)}
+    membership = _episode_membership(batch, item.session_id)
+    lines = []
+    for label, base, offsets in (("段首前", item.member_positions[0], (-2, -1)),
+                                 ("段尾后", item.member_positions[-1], (1, 2))):
         for offset in offsets:
-            distance = abs(offset)
-            pos = None if base is None else base + offset
-            if pos is None or not 0 <= pos < len(frames):
-                lines.append(f"{label} {distance}: 无")
-            else:
-                frame = frames[pos]
-                digest = frame_digest(frame.record, digest_max_chars)
-                lines.append(f"{label} {distance}: {digest}"
-                             f"（去向: {_frame_fate(frame, membership)}）")
+            position = base + offset
+            frame = frames.get(position)
+            evidence = (f"出现位置 {position}: {record_evidence(frame.record)}"
+                        f"（去向: {_frame_fate(frame, membership)}）" if frame is not None else "无")
+            lines.append(f"{label} {abs(offset)}: {evidence}")
+    if item.capacity is not None:
+        bounds = item.capacity.bounds
+        for label, cut in (("段首", bounds.before), ("段尾", bounds.after)):
+            if cut is not None:
+                lines.append(f"{label}人工容量边界: 出现位置 {cut.left_position} → {cut.right_position}")
     return "\n".join(lines)
+
+
+def boundary_frames(item: PipelineItem, batch: Sequence[PipelineItem]) -> tuple[PipelineItem, ...]:
+    """选择允许范围内被边界余量引用的完整帧，禁止跨人工切点引用。
+
+    @param item 当前工作序列。
+    @param batch 完整会话信封。
+    @return 按出现位置排列的可引用边界邻帧。
+    """
+    from labelkit.operators.verify_capacity import allows_position
+
+    head, tail = item.member_positions[0], item.member_positions[-1]
+    positions = {head - 2, head - 1, tail + 1, tail + 2}
+    return tuple(frame for frame in _session_frame_envelopes(batch, item.session_id)
+                 if frame.session_position in positions and allows_position(item, frame.session_position))
 
 
 def majority_verdict(verdicts: Sequence[str]) -> Literal["pass", "fail"]:
@@ -565,80 +549,43 @@ def _build_verdict_sequence_prompt(record: Record, output: Mapping,
         Message(role="user", parts=parts)))
 
 
-def _fit_sequence_parts(parts: list, system_text: str, steps_at: int,
-                        n_images: int, fit: _PromptFit) -> None:
-    """§10.5 序列变体的预算装填：唯一可裁槽位是 [动作序列] 步表块（§3.3⑤ edges 裁剪），其余文本
-    段与图像成本恒计不裁（V25③）；装填后总量仍越预算则置 fit.overflow（V10）。
-    @param parts user 消息的 Part 列表（就地替换步表段）
-    @param system_text system 段文本（计入固定量）
-    @param steps_at 步表段在 parts 中的下标；-1 = 该段整段省略
-    @param n_images 图像段数量（UI 序列为 2，text 为 0）
-    @param fit 面板最小预算装填状态
-    """
-    from labelkit.common.inference.llm_client import Part
-
-    fixed = (budget.est_text(system_text)
-             + sum(budget.est_text(p.text or "") for i, p in enumerate(parts)
-                   if p.kind == "text" and i != steps_at)
-             + 2 * budget.MSG_OVERHEAD_TOKENS + n_images * fit.image_cost)
-    if steps_at >= 0:
-        slot = (fit.input_budget - fixed
-                - budget.est_text(f"{_LABEL_ACTION_SEQUENCE}\n"))
-        steps = parts[steps_at].text.split("\n", 1)[1]
-        if budget.est_text(steps) > slot:
-            steps = budget.fit_text(steps, max(0, slot), keep="edges")
-            fit.truncations += 1
-            parts[steps_at] = Part(kind="text",
-                                   text=f"{_LABEL_ACTION_SEQUENCE}\n{steps}")
-    total = (budget.est_text(system_text)
-             + sum(budget.est_text(p.text or "") for p in parts if p.kind == "text")
-             + 2 * budget.MSG_OVERHEAD_TOKENS + n_images * fit.image_cost)
-    fit.overflow = total > fit.input_budget
-
-
 def _build_defect_sequence_prompt(record: Record, output: Mapping,
                                   cfg: "ResolvedConfig", texts: tuple[str, str],
                                   options: VerifyPromptOptions) -> "PromptBundle":
-    """§10.5 v1.8 缺陷词表序列变体（流式驱动器调用面）。段序：[任务指令] → [动作序列]（transitions
-    为 None 时整段省略）→ v1.9 [片段结构]（T15：驱动器按 M16 duck 标记预渲染，空串时整段省略——
-    stitch 关则六段形态逐字节不变）→ [边界余量]（驱动器预渲染，它持有批上下文）→ [首帧截图] + 图
-    → [末帧截图] + 图 → [标注结果]；text 模态序列降级为无截图段（M5 S6 先例）。
-    @param record kind == "sequence" 的记录
-    @param output 待评审的标注对象
-    @param cfg 已解析配置
-    @param texts (类有效任务指令, 类有效 extra_criteria)
-    @param options 装配项（步表 / 边界余量 / 片段结构 / 预算装填）
-    @return 两条消息的提示词包
+    """按明确出现位置构造完整成员、全部图片、动作与边界证据。
+
+    @param record 当前工作序列。
+    @param output 完整当前标注。
+    @param cfg 已解析配置。
+    @param texts 类有效指令和附加评审准则。
+    @param options 完整成员位置及已存在派生产物。
+    @return 不执行预算裁剪的完整请求。
     """
     from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 
+    if len(options.member_positions) != len(record.members):
+        _log.error("stream verification requires explicit member occurrence positions")
+        raise InternalError("stream verification requires explicit member occurrence positions")
     instruction, extra_criteria = texts
-    system_text = verify_sequence_system_text(extra_criteria)
-    parts: list[Part] = [Part(kind="text", text=f"[任务指令] {instruction}")]
-    steps_at = -1
-    if options.transitions is not None:      # transitions 为 None 即整段省略
-        steps = "\n".join(sequence_step_line(t) for t in options.transitions)
-        steps_at = len(parts)
+    parts = [Part(kind="text", text=f"[任务指令] {instruction}")]
+    for position, member in zip(options.member_positions, record.members, strict=True):
+        parts.append(Part(kind="text", text=f"[成员出现位置 {position}]\n{record_evidence(member)}"))
+        if member.image is not None:
+            parts.append(Part(kind="image", image=member.image))
+    if options.transitions is not None:
+        steps = "\n".join(f"{step.index}. {json.dumps(dict(step.action), ensure_ascii=False)}"
+                          for step in options.transitions)
         parts.append(Part(kind="text", text=f"{_LABEL_ACTION_SEQUENCE}\n{steps}"))
-    if options.fragment_structure:           # v1.9 第七段（仅 stitch 开启，T15）
-        parts.append(Part(
-            kind="text",
-            text=f"{_LABEL_FRAGMENT_STRUCTURE}\n{options.fragment_structure}"))
-    parts.append(Part(kind="text",
-                      text=f"{_LABEL_BOUNDARY_MARGIN}\n{options.boundary_margin}"))
-    n_images = 0
-    if record.modality == "ui":
-        parts.append(Part(kind="text", text=_LABEL_FIRST_FRAME))
-        parts.append(Part(kind="image", image=record.members[0].image))
-        parts.append(Part(kind="text", text=_LABEL_LAST_FRAME))
-        parts.append(Part(kind="image", image=record.members[-1].image))
-        n_images = 2
-    parts.append(Part(kind="text",
-                      text=f"[标注结果] {json.dumps(output, ensure_ascii=False)}"))
-    if options.fit is not None:
-        _fit_sequence_parts(parts, system_text, steps_at, n_images, options.fit)
+    if options.fragment_structure:
+        parts.append(Part(kind="text", text=f"{_LABEL_FRAGMENT_STRUCTURE}\n{options.fragment_structure}"))
+    parts.append(Part(kind="text", text=f"{_LABEL_BOUNDARY_MARGIN}\n{options.boundary_margin}"))
+    for position, member in options.boundary_records:
+        if member.image is not None:
+            parts.append(Part(kind="text", text=f"[边界邻帧出现位置 {position}]"))
+            parts.append(Part(kind="image", image=member.image))
+    parts.append(Part(kind="text", text=f"[标注结果] {json.dumps(output, ensure_ascii=False)}"))
     return PromptBundle(messages=(
-        Message(role="system", parts=(Part(kind="text", text=system_text),)),
+        Message(role="system", parts=(Part(kind="text", text=verify_sequence_system_text(extra_criteria)),)),
         Message(role="user", parts=tuple(parts))))
 
 
@@ -808,10 +755,10 @@ class _EpisodeReview:
     __slots__ = ("item", "ordinal", "label", "rounds", "critiques", "verdict", "fail_critiques",
                  "defects",
                  # 轮内手术字段（begin_round 重置）：手术前成员元组（重建时比对相邻对）、
-                 # 成员工作副本、帧 id → 会话内批位序、需重标注标志（label_mismatch）、
+                 # 成员与出现位置工作副本、需重标注标志（label_mismatch）、
                  # 本轮发生过成员手术标志、本轮预定的回收候选、重建步下标 → 重抽 Transition。
-                 "orig_members", "working_members", "session_positions",
-                 "needs_reannotate", "surgical", "claims", "reseams")
+                 "orig_members", "working_members", "orig_positions", "working_positions",
+                 "needs_reannotate", "surgical", "claims", "reseams", "seams")
 
     def __init__(self, item: PipelineItem, ordinal: int):
         """建立一个 episode 的评审台账。
@@ -832,11 +779,13 @@ class _EpisodeReview:
         """重置轮内手术字段（成员工作副本、回收预定、接缝重抽结果）。"""
         self.orig_members: tuple[Record, ...] = self.item.record.members
         self.working_members: list[Record] = list(self.item.record.members)
-        self.session_positions: dict[str, int] = {}
+        self.orig_positions = self.item.member_positions
+        self.working_positions = list(self.item.member_positions)
         self.needs_reannotate = False
         self.surgical = False
         self.claims: list["_ReclaimClaim"] = []
         self.reseams: dict[int, Transition] = {}
+        self.seams: dict[int, tuple[str, ...]] = {}
 
 
 class _ReclaimClaim:
@@ -845,19 +794,22 @@ class _ReclaimClaim:
     __slots__ = ("envelope",         # 候选噪声帧信封
                  "position",         # 候选帧的会话内批位序
                  "window",           # [前成员, 候选, 后成员] 复判窗口
+                 "window_positions",  # 与完整复判窗口一一对应的出现位置。
                  "candidate_index")  # 候选帧在窗口中的下标
 
     def __init__(self, envelope: PipelineItem, position: int,
-                 window: list[Record], candidate_index: int):
+                 window: list[Record], candidate_index: int, window_positions: tuple[int, ...]):
         """建立一条回收预定。
         @param envelope 候选噪声帧信封
         @param position 候选帧的会话内批位序
         @param window [前成员, 候选, 后成员] 复判窗口（边缘候选无前/后成员）
         @param candidate_index 候选帧在窗口中的下标
+        @param window_positions 复判窗口中的明确成员出现位置。
         """
         self.envelope = envelope
         self.position = position
         self.window = window
+        self.window_positions = window_positions
         self.candidate_index = candidate_index
 
 
@@ -872,18 +824,6 @@ def _qualifies_for_reclaim(frame: PipelineItem, claimed: set[int]) -> bool:
         return False
     attribution = getattr(frame, "noise_attribution", None)
     return not (attribution and attribution[0] == "verify")
-
-
-def _next_image_rung(prof: "LLMProfile") -> int | None:
-    """V21 分辨率升档一级：default_image_px × 1.5（取整）并夹在 max_image_px 内；
-    default_image_px == 0 表示工作点已经就是 max_image_px——无档可升。
-    @param prof annotate profile
-    @return 升档后的像素上限；无档可升为 None
-    """
-    if prof.default_image_px <= 0:
-        return None
-    candidate = min(int(round(prof.default_image_px * 1.5)), prof.max_image_px)
-    return candidate if candidate > prof.default_image_px else None
 
 
 _BIG_THREE = (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError)
@@ -928,7 +868,8 @@ async def _judge_leaf(plan: _ClassicJudgePlan, judge: str,
     try:
         return await ctx.schema_engine.complete_validated(
             judge, plan.prompt, schema=plan.schema,
-            scope=CallScope(record_ids=(record.id,), batch_no=ctx.batch_no),
+            scope=CallScope(record_ids=(record.id,), batch_no=ctx.batch_no,
+                            complete_evidence=ctx.session_attempt is not None),
         )
     except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
         raise
@@ -956,6 +897,12 @@ class VerifyStage:
         """@return 当前 attempt 的程序视图配置；普通批次返回构造期配置。"""
         active = _ATTEMPT_CONFIG.get()
         return self._cfg if active is None else active  # type: ignore[return-value]
+
+    def preview_capacity(self, item: PipelineItem, ctx: "RunContext"):
+        """预览当前完整已知评审请求。@param item 工作序列。@param ctx 会话上下文。@return 首个容量失败。"""
+        from labelkit.operators.verify_capacity import preview_capacity
+
+        return preview_capacity(self, item, ctx)
 
     async def run(self, batch: list[PipelineItem],
                   ctx: "RunContext") -> list[PipelineItem]:
@@ -1106,7 +1053,7 @@ class VerifyStage:
         if not plans:
             return []
         specs = self._classic_judge_specs(plans, ctx)
-        outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
+        outcomes = await ctx.run_group(TaskGroupRequest(specs))
         return self._reduce_classic_reviews(plans, outcomes, ctx)
 
     def _plan_classic_review(
@@ -1251,7 +1198,7 @@ class VerifyStage:
         if not repairs:
             return []
         specs = tuple(self._classic_repair_spec(state, ctx) for state in repairs)
-        outcomes = await ctx.tasks.run_group(TaskGroupRequest(specs))
+        outcomes = await ctx.run_group(TaskGroupRequest(specs))
         pending: list[_ClassicReview] = []
         for state, outcome in zip(repairs, outcomes, strict=True):
             if isinstance(outcome, BaseException):
@@ -1454,6 +1401,8 @@ class VerifyStage:
         @param ctx 运行上下文
         @return 归类得到的 StageError.kind（调用方据此写错误日志）
         """
+        if isinstance(exc, SessionCapacityError):
+            raise exc
         kind, retryable = _classify_error(exc, item.record.modality)
         _log.error("verify record failed: kind=%s", kind)
         if isinstance(exc, SchemaViolation):

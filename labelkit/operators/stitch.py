@@ -1,6 +1,6 @@
 """M16 缝合阶段（spec 3.16、CONTRACTS.md §7.16）——v1.9 线索缝合。
 
-保守地把同会话的碎片重新缝回线索：逐会话（批内位置序即会话序，M10 整会话装箱）把分段
+保守地把同会话的碎片重新缝回线索：逐完整会话（明确成员出现位置）把分段
 产物——活跃的 episode 信封，加上由 ``below_min_len`` 丢帧的连续段重新成形出的救援候选
 （T11）——按会话序走一条**单调**选择池。每个候选一次 LLM 判决（§10.11 提示词：开放线索
 摘要卡按最近活跃降序 + 候选摘要卡，经 ``schema_engine.stitch_schema()`` 校验），由 T9 保守
@@ -37,11 +37,15 @@ from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
     ErrorKind,
+    InternalError,
     SchemaViolation,
 )
 from labelkit.common.contracts.types import (
     PipelineItem,
     Record,
+    CapacityCut,
+    SequenceBounds,
+    SequenceCapacity,
     StageError,
     frame_digest,
     tree_diff,
@@ -402,7 +406,7 @@ async def judge_stitch(thread_cards: Sequence[str], candidate_card: str,
     specs = _stitch_task_specs(
         thread_cards, candidate_card, ctx, record_ids, call_ordinal
     )
-    results = await ctx.tasks.run_group(TaskGroupRequest(specs))
+    results = await ctx.run_group(TaskGroupRequest(specs))
     return _reduce_stitch_samples(results)
 
 
@@ -412,7 +416,8 @@ def _stitch_task_specs(thread_cards: Sequence[str], candidate_card: str,
     """冻结一次候选判定的全部 vote 叶任务。"""
     prompt = build_stitch_prompt(thread_cards, candidate_card, ctx.cfg)
     schema = stitch_schema()
-    scope = CallScope(record_ids=record_ids, batch_no=ctx.batch_no)
+    scope = CallScope(record_ids=record_ids, batch_no=ctx.batch_no,
+                       complete_evidence=ctx.session_attempt is not None)
     ordinal_text = ":".join(str(value) for value in call_ordinal)
     return tuple(
         TaskSpec(
@@ -474,20 +479,20 @@ class _Fragment:
     """一个线索碎片：自有成员在会话序上的一个连续块。"""
 
     __slots__ = ("first_pos", "last_pos", "member_count", "cause",
-                 "source_episode", "first", "last")
+                 "source_episode", "first", "last", "positions")
 
-    def __init__(self, members: Sequence[Record], first_pos: int, last_pos: int,
+    def __init__(self, members: Sequence[Record], positions: tuple[int, ...],
                  cause: str, source_episode: str | None):
         """构造一个碎片。
 
         @param members 本碎片的成员帧，按会话序
-        @param first_pos 首帧的会话序位置
-        @param last_pos 尾帧的会话序位置
+        @param positions 每个成员的明确输入出现位置，严格递增。
         @param cause 成因，∈ {"origin", "resumed", "rescued"}
         @param source_episode 原 episode id；救援碎片没有 episode 形态，传 None
         """
-        self.first_pos = first_pos
-        self.last_pos = last_pos
+        self.first_pos = positions[0]
+        self.last_pos = positions[-1]
+        self.positions = positions
         self.member_count = len(members)
         self.cause = cause                      # "origin" | "resumed" | "rescued"
         self.source_episode = source_episode    # 原 episode id；救援 → None
@@ -542,6 +547,7 @@ class _Candidate:
     members: tuple[Record, ...]            # 候选的成员帧记录，按会话序
     first_pos: int                         # 候选首帧的会话序位置
     last_pos: int                          # 候选尾帧的会话序位置
+    positions: tuple[int, ...]             # 各成员的明确输入出现位置。
     envelope: PipelineItem | None = None   # 仅 episode 候选有信封；rescue 恒为 None
     frames: tuple[PipelineItem, ...] = ()  # 仅 rescue 候选有帧信封；episode 恒为空
 
@@ -561,7 +567,7 @@ class _SessionState:
     sid: str                               # 会话 id
     ordinal: int                           # 本批会话声明序号
     ctx: "RunContext"                      # 运行上下文（配置 / 指标 / Schema 引擎）
-    position_of: Mapping[str, int]         # 帧 id → 会话序位置（首次出现为准）
+    bounds: SequenceBounds                # 完整会话允许的成员出现位置范围。
     threads: list[_Thread]                 # 线索创建序列表，含被淘汰出池者
     pool: list[_Thread]                    # 开放线索池（单调选择池），容量 stitch.max_open
 
@@ -628,39 +634,29 @@ def span_distance(a_head: int, a_tail: int, b_head: int, b_tail: int) -> int:
     return 0
 
 
-def compute_seams(members: Sequence[Record], position_of: Mapping[str, int],
-                  owner_task: Mapping[str, str],
-                  own_ids: frozenset[str],
-                  frame_ids_by_pos: Sequence[str],
-) -> tuple[tuple[int, ...], tuple[tuple[str, ...], ...]]:
+def compute_seams(positions: Sequence[int], owner_task: Mapping[int, str]
+                  ) -> tuple[tuple[int, ...], tuple[tuple[str, ...], ...]]:
     """接缝判定（T20/M-1）。
 
     相邻成员对 ⟨i, i+1⟩ 是接缝，当且仅当两成员之间的会话序间隙里至少有 1 帧被**别的**线索
     吸收。纯噪音间隙（以及无主帧构成的间隙）**不是**接缝——那些对由 extract 正常判决，与
     v1.8 的剔噪约定一致。
 
-    @param members 线索重绑后的成员帧元组，按会话序
-    @param position_of 帧 id → 会话序位置
-    @param owner_task 帧 id → 吸收它的线索任务名
-    @param own_ids 本线索自有成员的 id 集合
-    @param frame_ids_by_pos 会话序位置 → 帧 id
+    @param positions 线索全部成员出现位置，按会话序。
+    @param owner_task 会话出现位置到吸收线索任务名的映射。
     @return （接缝下标元组，各接缝的打断者任务名元组）——接缝下标是重绑成员元组里**左**成员
             的下标（m-8：与 Transition.index 同坐标，范围 [0, len(members)−2]），打断者按
             间隙顺序去重列出（M-1：接缝的打断者列表永不为空）
     """
     seams: list[int] = []
     interrupted: list[tuple[str, ...]] = []
-    for i in range(len(members) - 1):
-        left = position_of.get(members[i].id)
-        right = position_of.get(members[i + 1].id)
-        if left is None or right is None:
-            continue
+    owned = frozenset(positions)
+    for i, (left, right) in enumerate(zip(positions, positions[1:])):
         names: list[str] = []
         for pos in range(left + 1, right):
-            frame_id = frame_ids_by_pos[pos]
-            if frame_id in own_ids:
+            if pos in owned:
                 continue
-            task = owner_task.get(frame_id)
+            task = owner_task.get(pos)
             if task is not None and task not in names:
                 names.append(task)
         if names:
@@ -701,7 +697,7 @@ class StitchStage:
 
     async def run(self, batch: list[PipelineItem],
                   ctx: "RunContext") -> list[PipelineItem]:
-        """以跨会话候选 wave 缝合本批次的分段产物。
+        """以固定候选轮缝合完整会话的分段产物。
 
         选择与幂等：会话严格按批内位置序（= 会话序）处理；episode 候选是尚未缝过的活跃
         sequence 信封（thread_id 在开线索时打戳，因此重入零调用）。零 episode 候选的会话整个
@@ -755,13 +751,14 @@ class StitchStage:
         @return 可参与跨会话 wave 的会话工作项
         """
         session_ordinal, sid = session_key
-        position_of: dict[str, int] = {}
-        for i, frame in enumerate(frames):
-            position_of.setdefault(frame.record.id, i)
+        positions = tuple(frame.session_position for frame in frames)
+        if not positions or any(position is None for position in positions):
+            _logger.error("stitch requires explicit session occurrence positions")
+            raise InternalError("stitch requires explicit session occurrence positions")
         session = _SessionState(sid=sid, ordinal=session_ordinal, ctx=ctx,
-                                position_of=position_of,
+                                bounds=SequenceBounds(0, max(positions) + 1),
                                 threads=[], pool=[])
-        candidates = self._assemble_candidates(frames, episodes, position_of)
+        candidates = self._assemble_candidates(frames, episodes)
         return _SessionWork(session, frames, candidates)
 
     async def _run_pass_one(self, works: Sequence[_SessionWork]) -> None:
@@ -782,11 +779,18 @@ class StitchStage:
         while work.next_candidate < len(work.candidates):
             cand = work.candidates[work.next_candidate]
             work.next_candidate += 1
+            if cand.envelope is not None and self._sealed(cand.envelope):
+                self._open_thread(work.state, cand, "", work.clock)
+                continue
             if cand.kind == "rescue" and not work.state.pool:
                 continue                        # B-2：零调用，保持 dropped_noise
             pool_view = tuple(sorted(
-                work.state.pool, key=lambda thread: thread.last_active, reverse=True
+                (thread for thread in work.state.pool
+                 if self._merge_bounds(work.state, thread, cand) is not None),
+                key=lambda thread: thread.last_active, reverse=True
             ))
+            if cand.kind == "rescue" and not pool_view:
+                continue
             return self._judgment_plan(work, cand, pool_view, None)
         return None
 
@@ -810,7 +814,7 @@ class StitchStage:
     ) -> tuple[tuple[object, ...], ...]:
         """把不同会话的当前候选扁平化为一个 TaskExecutor wave。"""
         specs = tuple(spec for plan in plans for spec in plan.specs)
-        results = await plans[0].work.state.ctx.tasks.run_group(TaskGroupRequest(specs))
+        results = await plans[0].work.state.ctx.run_group(TaskGroupRequest(specs))
         width = self.cfg.stitch.votes
         return tuple(
             tuple(results[offset:offset + width])
@@ -818,8 +822,7 @@ class StitchStage:
         )
 
     def _assemble_candidates(self, frames: list[PipelineItem],
-                             episodes: list[PipelineItem],
-                             position_of: Mapping[str, int]) -> list[_Candidate]:
+                             episodes: list[PipelineItem]) -> list[_Candidate]:
         """按会话序组装候选流（T11）。
 
         每个 episode 信封一个候选；stitch.rescue_short 打开时，再为每一段
@@ -829,17 +832,16 @@ class StitchStage:
 
         @param frames 该会话的全部帧信封，按会话序
         @param episodes 该会话尚未缝过的活跃 episode 信封
-        @param position_of 帧 id → 会话序位置
         @return 按首帧位置升序排列的候选列表
         """
         candidates: list[_Candidate] = []
         for episode in episodes:
             members = episode.record.members
-            positions = [position_of[m.id] for m in members
-                         if m.id in position_of]
-            first = min(positions) if positions else 0
-            last = max(positions) if positions else 0
-            candidates.append(_Candidate("episode", tuple(members), first, last,
+            positions = episode.member_positions
+            if len(positions) != len(members) or not positions or episode.capacity is None:
+                _logger.error("stitch episode is missing occurrence or capacity metadata")
+                raise InternalError("stitch episode is missing occurrence or capacity metadata")
+            candidates.append(_Candidate("episode", tuple(members), positions[0], positions[-1], positions,
                                          envelope=episode))
         if self.cfg.stitch.rescue_short:
             run: list[PipelineItem] = []
@@ -856,7 +858,8 @@ class StitchStage:
                     members = tuple(f.record for f in run)
                     candidates.append(_Candidate(
                         "rescue", members,
-                        position_of[members[0].id], position_of[members[-1].id],
+                        run[0].session_position, run[-1].session_position,
+                        tuple(frame.session_position for frame in run),
                         frames=tuple(run)))
                     run = []
         candidates.sort(key=lambda c: c.first_pos)
@@ -894,6 +897,7 @@ class StitchStage:
                    else _COUNTER_JUDGMENTS)
         work.state.ctx.metrics.count(counter)
         decision = self._resolve_merge(outcome, plan.pool_view, plan.candidate)
+        decision = self._guard_capacity(plan, decision)
         if plan.repass_thread is None:
             self._apply_decision(
                 work.state, plan.candidate, outcome, decision, work.clock
@@ -961,6 +965,122 @@ class StitchStage:
 
     # ── 状态迁移（合同 ②c）──────────────────────────────────────────────────
 
+    @staticmethod
+    def _sealed(item: PipelineItem) -> bool:
+        """读取明确的不可再合并状态。
+
+        @param item 线索或候选信封。
+        @return 是否已被容量永久封闭。
+        """
+        return item.capacity is not None and item.capacity.sealed
+
+    def _merge_bounds(self, session: _SessionState, target: _Thread,
+                      cand: _Candidate) -> SequenceBounds | None:
+        """检查双方封闭状态和全部成员是否位于允许区间交集。
+
+        @param session 当前完整会话。
+        @param target 拟接纳成员的线索。
+        @param cand 拟加入的候选。
+        @return 可合并的交集；不满足边界时为空。
+        """
+        if self._sealed(target.envelope) or (cand.envelope is not None and self._sealed(cand.envelope)):
+            return None
+        left = target.envelope.capacity.bounds
+        right = cand.envelope.capacity.bounds if cand.envelope is not None else session.bounds
+        lower, upper = max(left.lower, right.lower), min(left.upper, right.upper)
+        positions = (*target.envelope.member_positions, *cand.positions)
+        if any(position < lower or position >= upper for position in positions):
+            return None
+        if len(set(positions)) != len(positions):
+            _logger.error("stitch attempted duplicate member occurrence ownership")
+            raise InternalError("stitch attempted duplicate member occurrence ownership")
+        before = left.before if left.lower >= right.lower else right.before
+        after = left.after if left.upper <= right.upper else right.after
+        return SequenceBounds(lower, upper, before, after)
+
+    def _merge_preview(self, session: _SessionState, target: _Thread,
+                       cand: _Candidate) -> PipelineItem | None:
+        """构造不修改任何正式信封的完整成员合并视图。
+
+        @param session 当前会话。
+        @param target 合并目标。
+        @param cand 合并候选。
+        @return 完整预览信封；封闭或范围不允许时为空。
+        """
+        bounds = self._merge_bounds(session, target, cand)
+        if bounds is None:
+            return None
+        entries = sorted((*zip(target.envelope.member_positions, target.members),
+                          *zip(cand.positions, cand.members)), key=lambda entry: entry[0])
+        return dataclasses.replace(
+            target.envelope,
+            record=dataclasses.replace(target.envelope.record, members=tuple(record for _, record in entries)),
+            member_positions=tuple(position for position, _ in entries),
+            capacity=dataclasses.replace(target.envelope.capacity, bounds=bounds),
+        )
+
+    def _guard_capacity(self, plan: _JudgmentPlan, decision: _MergeDecision) -> _MergeDecision:
+        """所有合并、救援及复评共享的无副作用预算闸门。
+
+        @param plan 已收齐真实判决的候选计划。
+        @param decision 判决与机械先验给出的目标。
+        @return 经容量约束确认的合并决策。
+        """
+        target = decision.target
+        if target is None:
+            return decision
+        session = plan.work.state
+        preview = self._merge_preview(session, target, plan.candidate)
+        if preview is None:
+            return _MergeDecision(None, decision.priors)
+        checker = session.ctx.capacity_checker
+        if checker is None:
+            _logger.error("stitch requires a sequence capacity checker")
+            raise InternalError("stitch requires a sequence capacity checker")
+        failure = checker.preview(preview, session.ctx)
+        if failure is None:
+            return decision
+        older = target
+        newer = plan.candidate
+        if plan.repass_thread is not None and plan.repass_thread.head_pos < target.head_pos:
+            older = plan.repass_thread
+            newer = _Candidate("episode", target.members, target.head_pos, target.tail_pos,
+                               target.envelope.member_positions, target.envelope)
+        self._seal_capacity(session, older, newer, failure)
+        return _MergeDecision(None, decision.priors)
+
+    def _seal_capacity(self, session: _SessionState, thread: _Thread,
+                       following: _Candidate, failure) -> None:
+        """预算不足时永久封闭旧线索，保留其全部正式成员。
+
+        @param session 当前会话。
+        @param thread 应封闭的较早线索。
+        @param following 未并入的后续候选。
+        @param failure 真实预览返回的容量失败。
+        """
+        capacity = thread.envelope.capacity
+        bounds = capacity.bounds
+        if thread.tail_pos < following.first_pos:
+            cut = CapacityCut(thread.tail_pos, following.first_pos, failure.stage,
+                              failure.error.profile, failure.error.phase)
+            bounds = dataclasses.replace(bounds, upper=min(bounds.upper, cut.right_position), after=cut)
+            if following.envelope is not None:
+                other = following.envelope.capacity
+                other_bounds = dataclasses.replace(other.bounds,
+                                                   lower=max(other.bounds.lower, cut.right_position), before=cut)
+                following.envelope.capacity = dataclasses.replace(other, bounds=other_bounds)
+        thread.envelope.capacity = dataclasses.replace(capacity, bounds=bounds, sealed=True)
+        if thread in session.pool:
+            session.pool.remove(thread)
+        session.ctx.metrics.count("capacity.sealed")
+        session.ctx.metrics.event(
+            "sequence.capacity", stage="stitch", batch_no=session.ctx.batch_no,
+            record_ids=(thread.envelope.record.id,),
+            payload={"action": "seal", "stage": failure.stage, "profile": failure.error.profile,
+                     "phase": failure.error.phase, "member_positions": list(thread.envelope.member_positions),
+                     "following_positions": list(following.positions)},
+        )
+
     def _apply_decision(self, session: _SessionState, cand: _Candidate,
                         outcome: Mapping | None, decision: _MergeDecision,
                         clock: int) -> None:
@@ -993,18 +1113,21 @@ class StitchStage:
         @param task_name 新线索的任务名；判决失败的 keep 路径传空串
         @param clock 会话内判决时钟
         """
-        if len(session.pool) >= self.cfg.stitch.max_open:
+        assert cand.envelope is not None
+        sealed = self._sealed(cand.envelope)
+        if not sealed and len(session.pool) >= self.cfg.stitch.max_open:
             evicted = select_eviction(session.pool, cand.first_pos,
                                       self.cfg.stitch.stale_gap_steps)
             session.pool.remove(evicted)
         envelope = cand.envelope
         assert envelope is not None
         envelope.thread_id = envelope.record.id     # T22 身份链
-        fragment = _Fragment(cand.members, cand.first_pos, cand.last_pos,
+        fragment = _Fragment(cand.members, cand.positions,
                              cause="origin", source_episode=envelope.record.id)
         thread = _Thread(envelope, fragment, task_name, clock)
         session.threads.append(thread)
-        session.pool.append(thread)
+        if not sealed:
+            session.pool.append(thread)
 
     def _merge_pass1(self, session: _SessionState, target: _Thread,
                      cand: _Candidate, outcome: Mapping, clock: int) -> None:
@@ -1017,10 +1140,10 @@ class StitchStage:
         @param clock 会话内判决时钟
         """
         assert cand.envelope is not None
-        self._rebind(target, cand.members, session.position_of)
+        self._rebind(session, target, cand)
         cand.envelope.status = "stitched"
         target.fragments.append(_Fragment(
-            cand.members, cand.first_pos, cand.last_pos,
+            cand.members, cand.positions,
             cause="resumed", source_episode=cand.envelope.record.id))
         self._touch(target, outcome, clock)
 
@@ -1036,31 +1159,30 @@ class StitchStage:
         @param outcome 判决对象
         @param clock 会话内判决时钟
         """
-        self._rebind(target, cand.members, session.position_of)
+        self._rebind(session, target, cand)
         for frame in cand.frames:
             frame.status = "absorbed"
             frame.rescued_by = target.envelope.record.id  # type: ignore[attr-defined]
         session.ctx.metrics.count(_COUNTER_RESCUED_SHORT, len(cand.frames))
         target.fragments.append(_Fragment(
-            cand.members, cand.first_pos, cand.last_pos,
+            cand.members, cand.positions,
             cause="rescued", source_episode=None))
         self._touch(target, outcome, clock)
 
-    @staticmethod
-    def _rebind(target: _Thread, new_members: Sequence[Record],
-                position_of: Mapping[str, int]) -> None:
+    def _rebind(self, session: _SessionState, target: _Thread, cand: _Candidate) -> None:
         """Record 重绑（②c②）：成员并集按会话序升序；record.id **绝不**重算
         （T6/T22——沿用 M7 手术先例）。
 
         @param target 存活线索
         @param new_members 并入的成员帧
-        @param position_of 帧 id → 会话序位置
         """
-        merged = sorted(
-            (*target.members, *new_members),
-            key=lambda record: position_of.get(record.id, 0))
-        target.envelope.record = dataclasses.replace(
-            target.envelope.record, members=tuple(merged))
+        preview = self._merge_preview(session, target, cand)
+        if preview is None:
+            _logger.error("stitch commit violates sealed or occurrence bounds")
+            raise InternalError("stitch commit violates sealed or occurrence bounds")
+        target.envelope.record = preview.record
+        target.envelope.member_positions = preview.member_positions
+        target.envelope.capacity = preview.capacity
 
     @staticmethod
     def _touch(target: _Thread, outcome: Mapping, clock: int) -> None:
@@ -1125,7 +1247,7 @@ class StitchStage:
         for work in works:
             snapshot = [
                 thread for thread in work.state.threads
-                if thread.alive and len(thread.fragments) == 1
+                if thread.alive and len(thread.fragments) == 1 and not StitchStage._sealed(thread.envelope)
             ]
             snapshot.sort(key=lambda thread: thread.fragments[0].first_pos)
             work.repass_candidates = tuple(snapshot)
@@ -1148,14 +1270,14 @@ class StitchStage:
         while work.next_repass < len(work.repass_candidates):
             cand_thread = work.repass_candidates[work.next_repass]
             work.next_repass += 1
-            if not cand_thread.alive:
+            if not cand_thread.alive or self._sealed(cand_thread.envelope):
                 continue
             pool_view = self._repass_pool(work.state, cand_thread)
             if not pool_view:
                 continue
             cand = _Candidate(
                 "episode", cand_thread.members, cand_thread.head_pos,
-                cand_thread.tail_pos, envelope=cand_thread.envelope,
+                cand_thread.tail_pos, cand_thread.envelope.member_positions, envelope=cand_thread.envelope,
             )
             return self._judgment_plan(work, cand, pool_view, cand_thread)
         return None
@@ -1166,6 +1288,9 @@ class StitchStage:
         others = [
             thread for thread in session.threads
             if thread.alive and thread is not cand_thread
+            and self._merge_bounds(session, thread, _Candidate(
+                "episode", cand_thread.members, cand_thread.head_pos, cand_thread.tail_pos,
+                cand_thread.envelope.member_positions, cand_thread.envelope)) is not None
         ]
         if len(others) > self.cfg.stitch.max_open:
             others.sort(key=lambda thread: (
@@ -1216,7 +1341,9 @@ class StitchStage:
         @param outcome 命中的判决对象
         @param clock 会话内判决时钟
         """
-        self._rebind(target, cand_thread.members, session.position_of)
+        cand = _Candidate("episode", cand_thread.members, cand_thread.head_pos,
+                          cand_thread.tail_pos, cand_thread.envelope.member_positions, cand_thread.envelope)
+        self._rebind(session, target, cand)
         cand_thread.envelope.status = "stitched"
         cand_thread.alive = False
         for fragment in cand_thread.fragments:
@@ -1240,26 +1367,24 @@ class StitchStage:
         @param frames 该会话的全部帧信封，按会话序
         """
         alive = [t for t in session.threads if t.alive]
-        owner_task: dict[str, str] = {}
+        owner_task: dict[int, str] = {}
         for thread in alive:
-            for member in thread.members:
-                owner_task.setdefault(member.id, thread.task_name)
-        frame_ids_by_pos = [frame.record.id for frame in frames]
+            for position in thread.envelope.member_positions:
+                owner_task[position] = thread.task_name
 
         for thread in alive:
             thread.fragments.sort(key=lambda fragment: fragment.first_pos)
             envelope = thread.envelope
+            envelope.stitch_task_name = thread.task_name  # type: ignore[attr-defined]
             envelope.stitch_fragments = tuple(  # type: ignore[attr-defined]
                 {"order_span": [_order_key_repr(fragment.first),
                                 _order_key_repr(fragment.last)],
                  "member_count": fragment.member_count,
                  "cause": fragment.cause,
-                 "source_episode": fragment.source_episode}
+                 "source_episode": fragment.source_episode,
+                 "member_positions": list(fragment.positions)}
                 for fragment in thread.fragments)
-            own_ids = frozenset(member.id for member in thread.members)
-            seams, interrupted = compute_seams(
-                thread.members, session.position_of, owner_task, own_ids,
-                frame_ids_by_pos)
+            seams, interrupted = compute_seams(thread.envelope.member_positions, owner_task)
             envelope.seam_indexes = seams  # type: ignore[attr-defined]
             envelope.seam_interrupted_by = interrupted  # type: ignore[attr-defined]
             if seams:

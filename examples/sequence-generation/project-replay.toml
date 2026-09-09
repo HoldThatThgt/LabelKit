@@ -24,7 +24,6 @@ enabled = true
 strategy = "llm"
 llm = "default"
 window = 16
-digest_max_chars = 600
 noise_filter = true
 min_len = 2
 context = """

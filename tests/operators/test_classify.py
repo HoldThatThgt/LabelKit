@@ -6,6 +6,9 @@ Pure logic only — no LLM: the schema engine is replaced by the in-process
 complete_validated stubs (test_annotate 惯例)."""
 from __future__ import annotations
 
+from labelkit.common.contracts.stage import RunContext
+from labelkit.common.inference.sequence_evidence import record_evidence
+
 import asyncio
 from types import SimpleNamespace
 
@@ -244,7 +247,7 @@ class ReverseTaskRunner(TaskRunner):
 
 def make_ctx(cfg, engine, tasks=None):
     tasks = tasks or TaskRunner()
-    return SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
+    return RunContext(cfg=cfg, llm=None, schema_engine=engine,
                            metrics=RecordingMetrics(), tasks=tasks,
                            task_namespace="run:batch:1:stage:classify",
                            rng=None, batch_no=1)
@@ -364,51 +367,34 @@ def seq_record(members, rid="a3f1c2d4e5b60718") -> Record:
                   kind="sequence", members=tuple(members))
 
 
-def test_sequence_prompt_ui_digest_lines_and_first_frame_screenshot():
-    cfg = make_cfg(modality="ui")
-    members = [seq_member_ui(1), seq_member_ui(2), seq_member_ui(3)]
-    rec = seq_record(members)
-    bundle = build_classify_prompt(rec, cfg, with_reason=False)
-    # system and few-shot messages keep the single-record shape (spec 3.13.3)
+def test_sequence_prompt_ui_keeps_all_visible_trees_and_images():
+    cfg = make_cfg(modality="ui", ui_tree_max_chars=10)
+    members = [seq_member_ui(i) for i in range(25)]
+    bundle = build_classify_prompt(seq_record(members), cfg, with_reason=False)
     assert [m.role for m in bundle.messages] == ["system", "user", "user"]
     assert bundle.messages[1].parts[0].text.startswith("[类别示例·writing] ")
-    msg = bundle.messages[-1]
-    assert [p.kind for p in msg.parts] == ["text", "text", "image"]
-    expected_lines = [f"{m}. {frame_digest(member, cfg.segment.digest_max_chars)}"
-                      for m, member in enumerate(members, start=1)]
-    assert msg.parts[0].text == "[待分类数据·序列]\n" + "\n".join(expected_lines)
-    assert "truncated" not in msg.parts[0].text            # under the cap: no marker
-    assert msg.parts[1].text == "[首帧截图]"
-    assert msg.parts[2].image is members[0].image          # FIRST member's screenshot
+    parts = bundle.messages[-1].parts
+    body = "\n".join(part.text or "" for part in parts)
+    assert [part.image for part in parts if part.kind == "image"] == [member.image for member in members]
+    assert all(record_evidence(member) in body for member in members)
+    assert "truncated" not in body
 
 
-def test_sequence_prompt_text_modality_digest_only():
-    cfg = make_cfg()                                       # text modality
-    members = [text_record("打开外卖应用", rid="s1"), text_record("搜索奶茶", rid="s2")]
-    rec = seq_record(members)
-    bundle = build_classify_prompt(rec, cfg, with_reason=False)
-    msg = bundle.messages[-1]
-    assert [p.kind for p in msg.parts] == ["text"]         # digest part only, no image
-    assert msg.parts[0].text == "[待分类数据·序列]\n1. 打开外卖应用\n2. 搜索奶茶"
+def test_sequence_prompt_text_keeps_every_complete_member_without_images():
+    members = [text_record("打开应用" + "内容" * 400 + "结束", rid="s1"), text_record("搜索奶茶", rid="s2")]
+    bundle = build_classify_prompt(seq_record(members), make_cfg(), with_reason=False)
+    parts = bundle.messages[-1].parts
+    assert all(part.kind == "text" for part in parts)
+    assert all(member.text in "\n".join(part.text for part in parts) for member in members)
 
 
-def test_sequence_prompt_truncation_keeps_first_and_last_members():
-    cfg = make_cfg(ui_tree_max_chars=1000)
-    texts = [f"m{i}" + "步" * (400 - len(f"m{i}")) for i in range(1, 6)]
-    members = [text_record(t, rid=f"s{i}") for i, t in enumerate(texts, start=1)]
-    rec = seq_record(members)
-    bundle = build_classify_prompt(rec, cfg, with_reason=False)
-    part = bundle.messages[-1].parts[0].text
-    assert part.startswith("[待分类数据·序列]\n")
-    body = part.removeprefix("[待分类数据·序列]\n")
-    lines = body.splitlines()
-    # First/last member lines always kept, whole middle lines dropped, the frozen
-    # marker closes the block, and the body respects the ui_tree_max_chars cap.
-    assert lines[0] == f"1. {texts[0]}"
-    assert lines[-2] == f"5. {texts[4]}"
-    assert lines[-1] == "…(truncated 3 members)"
-    assert len(lines) == 3                                 # no middle member survived
-    assert len(body) <= 1000
+def test_sequence_prompt_ignores_tree_character_cap_for_complete_members():
+    texts = [f"member{i}" + "步" * 800 for i in range(5)]
+    members = [text_record(text, rid=f"s{i}") for i, text in enumerate(texts)]
+    bundle = build_classify_prompt(seq_record(members), make_cfg(ui_tree_max_chars=1000), with_reason=False)
+    body = "\n".join(part.text or "" for part in bundle.messages[-1].parts)
+    assert all(text in body for text in texts)
+    assert len(body) > 1000 and "truncated" not in body
 
 
 def test_stage_classifies_sequence_record_without_crash():
@@ -629,12 +615,11 @@ def test_stage_multi_fan_out_clones_inherit_episode_marks():
     cfg = make_cfg(assignment="multi", classes=CLASSES4, max_labels=4)
     rec = text_record()
     item = PipelineItem(record=rec, session_id="sess-0042")
-    item.session_split = True
     item.segment_degraded = {"kind": "segmentation_invalid", "windows_failed": 1}
     batch = [item]
     run_stage(cfg, batch, MapEngine({rec.id: {"classes": ["code", "qa"]}}))
     (clone,) = batch[1:]
-    assert clone.session_split is True
+    assert not hasattr(clone, "session_split")
     assert clone.segment_degraded == {"kind": "segmentation_invalid",
                                       "windows_failed": 1}
     # unmarked originals stay unmarked on the clone (getattr default path)
@@ -881,22 +866,16 @@ def test_budget_off_prompt_byte_identical():
     assert not any(k.startswith("budget.") for k in ctx.metrics.counters)
 
 
-def test_budget_sequence_digest_body_trims_same_family():
-    cfg = budget_cfg(1000)                             # text modality, no images
-    members = [text_record("步骤" + "字" * 120, rid=f"s{i}") for i in range(1, 9)]
-    rec = seq_record(members)
-    item = PipelineItem(record=rec)
-    engine = MapEngine({rec.id: {"class": "qa"}})
+def test_budget_complete_sequence_fails_without_truncating_or_sending():
+    cfg = budget_cfg(1000)
+    members = [text_record("步骤" + "字" * 120, rid=f"s{i}") for i in range(8)]
+    item = PipelineItem(record=seq_record(members))
+    engine = MapEngine({item.record.id: {"class": "qa"}})
     ctx = budget_ctx(cfg, engine)
     asyncio.run(ClassifyStage(cfg).run([item], ctx))
-    assert item.status == "active"
-    (call,) = engine.calls
-    body = call[1].messages[-1].parts[0].text.removeprefix("[待分类数据·序列]\n")
-    lines = body.split("\n")
-    assert lines[0].startswith("1. ")                  # first member kept
-    assert lines[-2].startswith("8. ")                 # last member kept
-    assert lines[-1].startswith("…(truncated ") and lines[-1].endswith(" members)")
-    assert ctx.metrics.counters["budget.truncations.classify"] == 1
+    assert item.status == "failed" and item.errors[0].kind == "context_overflow"
+    assert engine.calls == []
+    assert ctx.metrics.counters.get("budget.truncations.classify", 0) == 0
 
 
 def test_budget_minimal_unit_unfittable_fails_record_no_call():
@@ -1033,19 +1012,19 @@ def frame_members(n: int, text="步骤") -> list[Record]:
 def test_frame_prompt_verbatim_text():
     cfg = frame_cfg()
     members = [text_record("打开外卖应用", rid="fm1"), text_record("搜索奶茶", rid="fm2")]
-    digests = [frame_digest(m, cfg.segment.digest_max_chars) for m in members]
+    digests = [record_evidence(m) for m in members]
     bundle = build_frame_classify_prompt(members, cfg, digests)
     assert [m.role for m in bundle.messages] == ["system", "user"]
     assert bundle.messages[0].parts[0].text == (
         "[任务]\n"
-        "你是数据流的逐帧分类员。下面给出同一会话中按时间顺序排列的 2 帧成员摘要，"
+        "你是数据流的逐帧分类员。下面给出同一会话中按时间顺序排列的 2 帧完整成员证据，"
         "对每一帧独立判断它属于以下类别中的哪一类，只能从以下封闭类别表中取恰一值。类别表：\n"
         "- task_request: 发起一项新任务的请求\n"
         "- followup: 对进行中任务的补充或跟进\n"
         "- chitchat: 与任务无关的闲聊\n"
         "- other: 其余\n"
         "输出必须是符合以下结构的单个 JSON 对象，不输出任何其他内容：\n"
-        '{"labels": [<第 1 帧类名>, <第 2 帧类名>, ...]}（恰 2 项，按帧序与成员摘要行对齐）'
+        '{"labels": [<第 1 帧类名>, <第 2 帧类名>, ...]}（恰 2 项，按帧序与成员证据对齐）'
     )
     (part,) = bundle.messages[1].parts
     assert part.text == "[会话成员帧]\n1. 打开外卖应用\n2. 搜索奶茶"
@@ -1055,7 +1034,7 @@ def test_frame_prompt_verbatim_text():
 def test_frame_prompt_vision_appends_member_screenshot_parts():
     cfg = frame_cfg(modality="ui", vision_resolved=True)
     members = [seq_member_ui(1), seq_member_ui(2)]
-    digests = [frame_digest(m, cfg.segment.digest_max_chars) for m in members]
+    digests = [record_evidence(m) for m in members]
     bundle = build_frame_classify_prompt(members, cfg, digests)
     msg = bundle.messages[-1]
     assert [p.kind for p in msg.parts] == ["text", "text", "image", "text", "image"]
@@ -1410,9 +1389,8 @@ def test_stage_frame_only_dual_gate_skips_sequence_classification():
     assert len(engine.frame_calls) == 1
     assert engine.calls == engine.frame_calls          # 序列级零调用
     assert ctx.metrics.counters["frame_classify.calls"] == 1
-    assert len(ctx.tasks.groups) == 2
-    assert ctx.tasks.groups[0].tasks == ()
-    (frame_task,) = ctx.tasks.groups[1].tasks
+    assert len(ctx.tasks.groups) == 1
+    (frame_task,) = ctx.tasks.groups[0].tasks
     assert frame_task.task_id.endswith(":classify:frame:0:0")
     assert frame_task.resource_key == ("llm", "default")
 
@@ -1428,8 +1406,7 @@ def test_stage_frame_pass_disabled_by_switch():
     assert engine.frame_calls == []
     assert not any(key.startswith("frame_classify.")
                    for key in ctx.metrics.counters)
-    assert len(ctx.tasks.groups) == 2
-    assert ctx.tasks.groups[1].tasks == ()
+    assert len(ctx.tasks.groups) == 1
 
 
 # ── _fan_out：两 dict 按引用共享（扇出共享裁决） ─────────────────────────────

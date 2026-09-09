@@ -40,6 +40,11 @@ sequence `--dry-run` 只在 console 输出计划与估算，不创建、截断�
 - `_meta.stream`：process stream 的 session/episode/member 结构；
 - `_meta.run`：配置摘要与运行观测。
 
+普通流的 `member_positions` 记录完整会话中的出现位置，重复内容 ID 不会折叠成员。
+`capacity` 描述人工容量边界、sealed 状态和 root/parent 谱系；只有最终会话尝试进入主输出。
+`report.stream.capacity` 给出封闭、拆分、重算、最小失败与保留帧数高水位，失败尝试的用量和 trace 仍保留。
+这条普通流提交路径没有新增 manifest，也不提供跨进程状态恢复。
+
 用户 Schema 不得声明 `_meta`；它由 emitter 统一装配。要剥离元信息：
 
 ```bash

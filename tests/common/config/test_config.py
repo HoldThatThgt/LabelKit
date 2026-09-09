@@ -49,6 +49,7 @@ model = "main-model"
 api_key_env = "LK_TEST_KEY_DEFAULT"
 supports_structured_output = true
 supports_vision = true
+context_window = 131072
 
 [llm.judge]
 provider = "anthropic"
@@ -56,6 +57,7 @@ base_url = "https://example.com"
 model = "judge-model"
 api_key_env = "LK_TEST_KEY_JUDGE"
 supports_vision = true
+context_window = 131072
 
 [embedding.emb]
 base_url = "https://example.com/v1"
@@ -607,6 +609,7 @@ base_url = "https://example.com"
 model = "judge-model"
 api_key_env = "LK_TEST_KEY_JUDGE"
 supports_vision = true
+context_window = 131072
 """, "\n")
     cfg = env.load(config_text=solo)
     assert "judge" not in cfg.llm_profiles
@@ -707,8 +710,7 @@ def test_declared_embedding_window_does_not_warn(env, capsys):
 
 def test_annotate_disabled_leaves_the_stage_out_of_the_reference_set(env):
     # 引用集只收启用阶段：annotate 关掉后 [llm.default] 只因 quality 在册。
-    config = BASE_CONFIG.replace('model = "main-model"',
-                                 'model = "main-model"\ncontext_window = 131072', 1)
+    config = BASE_CONFIG
     cfg = env.load(config_text=config,
                    project_text=env.project(annotate_body="enabled = false",
                                             body='[quality]\nllm = "judge"\n'
@@ -1956,7 +1958,7 @@ def test_stream_sections_default_when_absent(env):
     assert cfg.segment.strategy == "hybrid"
     assert cfg.segment.llm == "default"
     assert cfg.segment.window == 20
-    assert cfg.segment.digest_max_chars == 400
+    assert not hasattr(cfg.segment, "digest_max_chars")
     assert cfg.segment.noise_filter is True
     assert cfg.segment.min_len == 2
     assert cfg.segment.vision_resolved is False    # v1.11 parse product (V1):
@@ -1967,7 +1969,7 @@ def test_stream_sections_default_when_absent(env):
     assert cfg.extract.instruction == ""
     assert cfg.extract.include_diff is True
     assert cfg.extract.on_error == "fallback"
-    assert cfg.annotate.sequence_frames == 20
+    assert not hasattr(cfg.annotate, "sequence_frames")
 
 
 def test_stream_and_segment_sections_parse_explicit_values(env):
@@ -1986,7 +1988,6 @@ enabled = true
 strategy = "llm"
 llm = "judge"
 window = 8
-digest_max_chars = 200
 noise_filter = false
 min_len = 3
 context = "外卖 App 采集流"
@@ -2003,7 +2004,6 @@ on_error = "fail"
     assert cfg.segment.strategy == "llm"
     assert cfg.segment.llm == "judge"
     assert cfg.segment.window == 8
-    assert cfg.segment.digest_max_chars == 200
     assert cfg.segment.noise_filter is False
     assert cfg.segment.min_len == 3
     assert cfg.segment.context == "外卖 App 采集流"
@@ -2154,44 +2154,22 @@ def test_segment_window_minimum(env):
     assert cfg.segment.window == 2
 
 
-@pytest.mark.parametrize("value", [1, 101])
-def test_sequence_frames_range_rejected(env, value):
+@pytest.mark.parametrize("value", [1, 2, 20, 25, 100, 101])
+def test_sequence_frames_removed_for_all_former_values(env, value):
     errors = env.errors(project_text=env.project(
         annotate_body=f'instruction = "标注"\nsequence_frames = {value}'))
-    has(errors, f"[annotate].sequence_frames: expected an integer in [2, 100], got {value}")
+    has(errors, "[annotate].sequence_frames: removed; sequence requests include every member image")
 
 
-@pytest.mark.parametrize("value", [2, 100])
-def test_sequence_frames_accepts_bounds(env, value):
-    cfg = env.load(project_text=env.project(
-        annotate_body=f'instruction = "标注"\nsequence_frames = {value}',
-        body=SEG_ON))
-    assert cfg.annotate.sequence_frames == value
+def test_segment_digest_limit_is_removed_including_former_default(env):
+    errors = env.errors(project_text=env.project(body=SEG_ON + "digest_max_chars = 400"))
+    has(errors, "[segment].digest_max_chars: removed; segment requests use complete member evidence")
 
 
-def test_sequence_frames_image_px_warning(env, capsys):
-    # default max_image_px = 2048 > 2000 — the S28 hazard fires past 20 frames
-    cfg = env.load(project_text=env.project(
-        annotate_body='instruction = "标注"\nsequence_frames = 25', body=SEG_ON))
-    assert cfg.annotate.sequence_frames == 25
-    err = capsys.readouterr().err
-    assert "warning:" in err
-    assert "[annotate].sequence_frames" in err and "max_image_px" in err
-
-
-def test_sequence_frames_image_px_no_warning_at_2000(env, capsys):
-    config = BASE_CONFIG.replace(
-        "supports_structured_output = true",
-        "supports_structured_output = true\nmax_image_px = 2000")
-    env.load(config_text=config, project_text=env.project(
-        annotate_body='instruction = "标注"\nsequence_frames = 25', body=SEG_ON))
-    assert "max_image_px" not in capsys.readouterr().err
-
-
-def test_session_max_len_exceeds_batch_warns(env, capsys):
+def test_session_max_len_exceeding_computation_group_does_not_hard_split(env, capsys):
     env.load(project_text=env.project(run_extra="batch_size = 100", body=SEG_ON))
     err = capsys.readouterr().err
-    assert "[stream].session_max_len" in err and "hard-cut" in err
+    assert "hard-cut" not in err and "session_split" not in err
 
 
 def test_session_max_len_within_batch_no_warning(env, capsys):
@@ -2231,24 +2209,22 @@ def test_hybrid_strategy_no_noise_filter_warning(env, capsys):
     assert "[segment].noise_filter" not in capsys.readouterr().err
 
 
-def test_sequence_frames_noop_without_stream_warns(env, capsys):
-    cfg = env.load(project_text=env.project(
+def test_removed_sequence_frames_is_rejected_without_stream(env):
+    errors = env.errors(project_text=env.project(
         annotate_body='instruction = "标注"\nsequence_frames = 10'))
-    assert cfg.annotate.sequence_frames == 10
-    err = capsys.readouterr().err
-    assert "[annotate].sequence_frames" in err and "no effect" in err
+    has(errors, "[annotate].sequence_frames: removed")
 
 
 def test_stream_quality_without_extract_hints_frame_digest_scoring(env, capsys):
     env.load(project_text=env.project(body=SEG_ON))
-    assert "frame digests" in capsys.readouterr().err
+    assert "complete member evidence" in capsys.readouterr().err
 
 
 def test_stream_quality_with_extract_no_hint(env, capsys):
     body = SEG_ON + "\n[extract]\nenabled = true"
     project = env.project(input_path=env.input_dir, modality="ui", body=body)
     env.load(project_text=project)
-    assert "frame digests" not in capsys.readouterr().err
+    assert "complete member evidence" not in capsys.readouterr().err
 
 
 def test_stream_explicit_non_trajectory_rubric_no_hint(env, capsys):
@@ -2257,7 +2233,7 @@ def test_stream_explicit_non_trajectory_rubric_no_hint(env, capsys):
     # be told it is doing trajectory scoring.
     body = SEG_ON + '\n[quality]\nrubric = "default:text"'
     env.load(project_text=env.project(body=body))
-    assert "frame digests" not in capsys.readouterr().err
+    assert "complete member evidence" not in capsys.readouterr().err
 
 
 # ── v1.8 rubric: default:trajectory + stream empty-selector resolution ─────
@@ -2353,6 +2329,7 @@ provider = "openai_compatible"
 base_url = "https://example.com/v1"
 model = "blind-model"
 api_key_env = "LK_TEST_KEY_DEFAULT"
+context_window = 131072
 """
 
 
@@ -2364,28 +2341,51 @@ def test_extract_llm_always_needs_vision(env):
     has(errors, "[llm.novision].supports_vision: a profile referenced by the extract stage(s) in UI modality")
 
 
-def test_segment_llm_never_needs_vision_and_vision_resolved_derives(env):
-    # v1.11 (V1/V3): segment is ADAPTIVE about vision — it never joins the
-    # vision-required set; the parse product derives from profile capability.
+def test_segment_llm_requires_vision_for_complete_ui_evidence(env):
     body = SEG_ON + 'llm = "novision"'
     project = env.project(input_path=env.input_dir, modality="ui", body=body)
-    cfg = env.load(config_text=BASE_CONFIG + NOVISION_PROFILE, project_text=project)
-    assert cfg.segment.llm == "novision"
-    assert cfg.segment.vision_resolved is False    # capability off → pure text
-    # capable profile under UI modality → the same config flips to multi-image
+    errors = env.errors(config_text=BASE_CONFIG + NOVISION_PROFILE, project_text=project)
+    has(errors, "[llm.novision].supports_vision: a profile referenced by the segment stage(s) in UI modality")
     body = SEG_ON + 'llm = "judge"'
     project = env.project(input_path=env.input_dir, modality="ui", body=body)
     cfg = env.load(project_text=project)
     assert cfg.segment.vision_resolved is True
 
 
-def test_stream_quality_vision_relaxed(env):
-    # S30: stream-mode quality scores sequences as pure text — a vision-less
-    # quality profile is legal exactly when segment.enabled
+def test_stream_quality_requires_vision_for_complete_ui_evidence(env):
     body = SEG_ON + 'strategy = "rules"\n\n[quality]\nllm = "novision"'
     project = env.project(input_path=env.input_dir, modality="ui", body=body)
-    cfg = env.load(config_text=BASE_CONFIG + NOVISION_PROFILE, project_text=project)
-    assert cfg.quality.llm == "novision"
+    errors = env.errors(config_text=BASE_CONFIG + NOVISION_PROFILE, project_text=project)
+    has(errors, "[llm.novision].supports_vision: a profile referenced by the quality stage(s) in UI modality")
+
+
+@pytest.mark.parametrize("stream,attempts,vision,accepted", [
+    (True, 1, False, False), (True, 1, True, True), (True, 0, False, True), (False, 1, False, True),
+])
+def test_complete_evidence_repair_profile_requires_vision_only_when_reachable(env, stream, attempts, vision, accepted):
+    body = SEG_ON + 'strategy = "rules"' if stream else ""
+    project = env.project(input_path=env.input_dir, modality="ui", body=body)
+    project = project.replace("[output]\n", '[output]\nrepair_llm = "novision"\n'
+                              f'max_repair_attempts = {attempts}\n')
+    profile = NOVISION_PROFILE + f"supports_vision = {str(vision).lower()}\n"
+    if accepted:
+        assert env.load(config_text=BASE_CONFIG + profile, project_text=project).output.repair_llm == "novision"
+    else:
+        errors = env.errors(config_text=BASE_CONFIG + profile, project_text=project)
+        has(errors, "[llm.novision].supports_vision: a profile referenced by the output.repair stage(s) in UI modality")
+
+
+def test_disabled_stream_schema_repair_adds_no_capacity_or_credential_requirement(env):
+    from labelkit.common.inference.credentials import referenced_profiles
+
+    project = env.project(input_path=env.input_dir, modality="ui", body=SEG_ON + 'strategy = "rules"')
+    project = project.replace("[output]\n", '[output]\nrepair_llm = "novision"\nmax_repair_attempts = 0\n')
+    profile = NOVISION_PROFILE.replace("context_window = 131072", "context_window = 0")
+    cfg = env.load(config_text=BASE_CONFIG + profile, project_text=project)
+    assert "novision" not in referenced_profiles(cfg)[0]
+    enabled = project.replace("max_repair_attempts = 0", "max_repair_attempts = 1")
+    errors = env.errors(config_text=BASE_CONFIG + profile, project_text=enabled)
+    has(errors, "[llm.novision].context_window: process sequences require a positive")
 
 
 def test_nonstream_quality_vision_still_required(env):
@@ -2776,12 +2776,13 @@ def _cw_config(cw, *, max_out=None, extra="") -> str:
         add = f"max_output_tokens = {max_out}\n" + add
     if extra:
         add += "\n" + extra
-    return BASE_CONFIG.replace("supports_structured_output = true",
+    declared = BASE_CONFIG.replace("context_window = 131072\n", "", 1)
+    return declared.replace("supports_structured_output = true",
                                "supports_structured_output = true\n" + add, 1)
 
 
 def test_context_window_parses_and_zero_is_the_default(env):
-    cfg = env.load()
+    cfg = env.load(config_text=BASE_CONFIG.replace("context_window = 131072\n", ""))
     assert cfg.llm_profiles["default"].context_window == 0    # undeclared = off
     assert cfg.embedding_profiles["emb"].context_window == 0
     cfg = env.load(config_text=_cw_config(131072))
@@ -2829,9 +2830,8 @@ def test_removed_use_vision_key_is_directed_error(env, capsys):
     for literal in ("false", "true"):
         errors = env.errors(project_text=env.project(
             body=SEG_ON + f"use_vision = {literal}"))
-        has(errors, "[segment].use_vision: segment.use_vision was removed in v1.11")
-        has(errors, "derived automatically from supports_vision")
-        has(errors, "point segment.llm at a text-only profile")
+        has(errors, "[segment].use_vision: removed")
+        has(errors, "all member images and a vision-capable profile")
     # never double-reported through the unknown-key forward-compat WARN
     assert "use_vision: unknown key" not in capsys.readouterr().err
 
@@ -2841,7 +2841,7 @@ def test_removed_use_vision_key_is_directed_error(env, capsys):
     ("ui", "llm", "judge", True),
     ("ui", "rules", "judge", False),        # rules strategy makes zero LLM calls
     ("text", "hybrid", "judge", False),     # text modality never attaches frames
-    ("ui", "hybrid", "novision", False),    # capability off → pure text
+    ("text", "hybrid", "novision", False),
 ])
 def test_vision_resolved_derivation_matrix(env, modality, strategy, profile,
                                            expected):
@@ -2876,7 +2876,7 @@ def test_segment_vision_window_image_px_warning(env, capsys):
 
 
 def test_undeclared_context_window_reference_warns_once(env, capsys):
-    env.load()                                              # default referenced
+    env.load(config_text=BASE_CONFIG.replace("context_window = 131072\n", ""))
     err = capsys.readouterr().err
     assert "[llm.default].context_window: referenced by an enabled stage but not declared" in err
     assert err.count("[llm.default].context_window") == 1   # once per profile
@@ -2913,41 +2913,61 @@ def test_static_system_precheck_silent_with_room(env, capsys):
     assert "static system-side prompt parts estimated" not in capsys.readouterr().err
 
 
-def test_min_window_guard_warns_at_floor_two(env, capsys):
-    # V9: cw 3200 / max_out 1024 → input budget 1856; per-frame worst 528,
-    # segment static 492 (V22 full scaffolding) → w_min = 2 == floor
-    # (verify off → floor 2).
+def test_full_evidence_has_no_false_guaranteed_window_warning(env, capsys):
     cfg = env.load(config_text=_cw_config(3200, max_out=1024),
                    project_text=env.project(body=SEG_ON))
     assert isinstance(cfg, ResolvedConfig)
     err = capsys.readouterr().err
-    assert "[segment].window: worst-case guaranteed packing size w_min = 2" in err
-    assert "every frame is a seam" in err
+    assert "worst-case guaranteed packing size" not in err
 
 
-def test_min_window_guard_errors_below_repair_floor(env):
-    # F14: verify.policy = "repair" lifts the floor to 3 (the fixed 3-frame
-    # member-reclaim re-judgment window) → w_min 2 < 3 is a CONFIG_ERROR.
+def test_full_evidence_window_is_checked_against_actual_requests_with_repair(env):
     body = SEG_ON + '\n[verify]\nenabled = true\npolicy = "repair"\nllm = "judge"'
-    errors = env.errors(config_text=_cw_config(3200, max_out=1024),
-                        project_text=env.project(body=body))
-    has(errors, "[segment].window: worst-case guaranteed packing size w_min = 2 < floor = 3")
+    cfg = env.load(config_text=_cw_config(3200, max_out=1024), project_text=env.project(body=body))
+    assert cfg.verify.policy == "repair"
 
 
-def test_min_window_guard_drop_policy_keeps_floor_two(env, capsys):
-    # F14 counter-leg: policy = "drop" builds no reclaim window — floor stays 2
+def test_full_evidence_window_has_no_summary_based_floor_with_drop(env, capsys):
     body = SEG_ON + '\n[verify]\nenabled = true\npolicy = "drop"\nllm = "judge"'
     cfg = env.load(config_text=_cw_config(3200, max_out=1024),
                    project_text=env.project(body=body))
     assert isinstance(cfg, ResolvedConfig)
-    assert "w_min = 2" in capsys.readouterr().err           # the WARN leg instead
-
-
-def test_min_window_guard_silent_without_budget_or_with_room(env, capsys):
-    env.load(project_text=env.project(body=SEG_ON))          # budget off
     assert "worst-case guaranteed packing size" not in capsys.readouterr().err
-    env.load(config_text=_cw_config(131072),                 # w_min 214 ≫ floor
-             project_text=env.project(body=SEG_ON))
+
+
+@pytest.mark.parametrize("override", ["pointwise", "pairwise"])
+def test_stream_class_quality_modes_validate_every_actual_profile(env, override):
+    from labelkit.common.inference.credentials import referenced_profiles
+
+    global_mode = "pairwise" if override == "pointwise" else "pointwise"
+    body = (SEG_ON + 'strategy = "rules"\n\n' + CLASSIFY_BODY
+            + f'\n[quality]\nmode = "{global_mode}"\nllm = "default"\njudges = ["judge"]\n'
+            + f'\n[class.qa.quality]\nmode = "{override}"\n')
+    project = env.project(body=body)
+    cfg = env.load(project_text=project)
+    assert set(referenced_profiles(cfg)[0]) == {"default", "judge"}
+    undeclared_judge = BASE_CONFIG.replace('context_window = 131072', 'context_window = 0')
+    errors = env.errors(config_text=undeclared_judge, project_text=project)
+    has(errors, "[llm.judge].context_window")
+    has(errors, "[llm.default].context_window")
+
+
+def test_stream_semantic_embedding_requires_capacity_only_when_enabled(env):
+    body = SEG_ON + 'strategy = "rules"\n\n[dedup]\nsemantic = true\nsemantic_embedding = "emb"\n'
+    errors = env.errors(project_text=env.project(body=body))
+    has(errors, "[embedding.emb].context_window")
+    config = BASE_CONFIG.replace('model = "bge"', 'model = "bge"\ncontext_window = 8192')
+    cfg = env.load(config_text=config, project_text=env.project(body=body))
+    assert cfg.embedding_profiles["emb"].context_window == 8192
+    cfg = env.load(project_text=env.project(body=body + 'enabled = false\n'))
+    assert cfg.dedup.enabled is False
+
+
+def test_stream_rejects_undeclared_capacity_but_accepts_explicit_capacity(env, capsys):
+    errors = env.errors(config_text=_cw_config(0), project_text=env.project(body=SEG_ON))
+    has(errors, "context_window")
+    has(errors, "positive")
+    env.load(config_text=_cw_config(131072), project_text=env.project(body=SEG_ON))
     assert "worst-case guaranteed packing size" not in capsys.readouterr().err
 
 
@@ -2966,13 +2986,13 @@ def test_stitch_card_pool_worst_case_warns(env, capsys):
     assert "max_open is never auto-shrunk" in err
 
 
-def test_stitch_card_pool_within_budget_or_undeclared_stays_silent(env, capsys):
+def test_stitch_card_pool_within_declared_budget_stays_silent(env, capsys):
     # smaller digest cap fits: 325 + 5 × 2 × 100 = 1325 ≤ 2316 → silent
     body = STITCH_ON + "digest_max_chars = 100\n"
     env.load(config_text=_cw_config(3712, max_out=1024),
              project_text=env.project(body=body))
     assert "stitch card-pool" not in capsys.readouterr().err
-    # undeclared stitch profile → the check never runs (budget off)
+    # 较大的已声明容量同样不触发卡池告警。
     env.load(project_text=env.project(body=STITCH_ON))
     assert "stitch card-pool" not in capsys.readouterr().err
 
@@ -2990,15 +3010,13 @@ def test_static_precheck_error_takes_max_over_class_annotate_views(env):
 
 def test_static_precheck_error_takes_max_over_class_verify_views(env):
     # Same mechanism on verify's per-class extra_criteria (its profile is
-    # [llm.judge] — declared here via string splice): 192 (head) +
-    # max(0, 300) + 4 (annotate instruction rides verify prompts) = 496 ≥ 281.
-    config = _cw_config(4864).replace(
-        'api_key_env = "LK_TEST_KEY_JUDGE"',
-        'api_key_env = "LK_TEST_KEY_JUDGE"\ncontext_window = 4864', 1)
+    # [llm.judge] — declared here via string splice): 197 (head) +
+    # max(0, 300) + 4 (annotate instruction rides verify prompts) = 501 ≥ 281.
+    config = _cw_config(4864).replace('context_window = 131072', 'context_window = 4864')
     body = (CLASSIFY_BODY + '\n[verify]\nenabled = true\nllm = "judge"\n'
             + f'\n[class.qa.verify]\nextra_criteria = "{"标" * 300}"\n')
     errors = env.errors(config_text=config, project_text=env.project(body=body))
-    has(errors, "[verify]: static system-side prompt parts estimated at 496 tokens >= the input budget of 281 tokens")
+    has(errors, "[verify]: static system-side prompt parts estimated at 501 tokens >= the input budget of 281 tokens")
 
 
 def test_static_precheck_class_views_within_budget_stay_silent(env, capsys):
@@ -3365,16 +3383,13 @@ def test_frame_annotate_llm_needs_vision_on_ui(env):
     has(errors, "[llm.novision].supports_vision: a profile referenced by the frame.annotate stage(s) in UI modality")
 
 
-def test_frame_classify_llm_never_needs_vision_and_vision_resolved_derives(env):
-    # vision 语义分列：frame.classify.llm 永不入 vision 必需集——附图与否由
-    # vision_resolved 解析产物自适应（ui ∧ enabled ∧ supports_vision）
+def test_frame_classify_requires_vision_for_complete_ui_evidence(env):
     body = (SEG_ON + 'strategy = "rules"\n\n'
             + FRAME_CLASSIFY_ONLY.replace("enabled = true",
                                           'enabled = true\nllm = "novision"'))
     project = env.project(input_path=env.input_dir, modality="ui", body=body)
-    cfg = env.load(config_text=BASE_CONFIG + NOVISION_PROFILE, project_text=project)
-    assert cfg.frame_classify.llm == "novision"
-    assert cfg.frame_classify.vision_resolved is False   # capability off → 纯文本判决
+    errors = env.errors(config_text=BASE_CONFIG + NOVISION_PROFILE, project_text=project)
+    has(errors, "[llm.novision].supports_vision: a profile referenced by the frame.classify stage(s) in UI modality")
     body = (SEG_ON + 'strategy = "rules"\n\n'
             + FRAME_CLASSIFY_ONLY.replace("enabled = true",
                                           'enabled = true\nllm = "judge"'))

@@ -66,7 +66,7 @@ class Record:
                                       #   "sequence" = M14 拼装的 episode 序列记录（3.14）
     members: tuple["Record", ...] = ()# v1.8 只增：sequence 时为成员帧按序键升序；single 恒 ()
                                       # 序列 Record 字段约定（S24）：text/raw/ui_tree/image = None；
-                                      #   modality = 成员模态；id = sha256("\n".join(member_ids))[:16]
+                                      #   modality = 成员模态；id = process_sequence_id(session_id, member_positions, member_ids)
                                       #   （拼装时定格，成员手术不重算；v1.9：M16 缝合重绑同样不重算
                                       #   ——episode_id = 幸存信封 record.id = thread_id，碎片原
                                       #   episode_id 落 _meta.stream.fragments[].source_episode，
@@ -87,7 +87,7 @@ class Classification:                 # v1.7：M13 分类结果（3.13）
     detail: Mapping                       # reason / sc 统计 / fallback 留痕（kind, message）
 
 @dataclass
-class PipelineItem:                   # 唯一可变信封；生命周期 = 一个批
+class PipelineItem:                   # 唯一可变信封；生命周期 = 普通记录批或完整会话的一次尝试
     record: Record
     status: Status = "active"
     classification: Classification | None = None   # v1.7：未启用 classify 恒为 None
@@ -98,7 +98,7 @@ class PipelineItem:                   # 唯一可变信封；生命周期 = 一�
     errors: list[StageError] = field(default_factory=list)
     transitions: tuple[Transition, ...] | None = None   # v1.8 只增：M15 写入（3.15）；
                                       #   None = 未启用 extract / 未到站（幂等门：is not None 跳过）
-    session_id: str | None = None     # v1.8 只增：会话边界的批内载体（S4）——M10 装箱时对帧信封
+    session_id: str | None = None     # v1.8 只增：完整会话边界载体（S4）——M10 开始会话时对帧信封
                                       #   盖章、M14 对追加的 episode 信封盖章（簿记非业务逻辑）；
                                       #   M7 修复邻域查询 = session_id 过滤 + 批列表位置序
     thread_id: str | None = None      # v1.9 只增：线索身份（3.16）——M16 对幸存线索信封盖章
@@ -109,17 +109,20 @@ class PipelineItem:                   # 唯一可变信封；生命周期 = 一�
                                       #   中的下标，与 Transition.index / steps[].index 同坐标、
                                       #   值域 [0, len(members)−2]，与 _meta.stream.order_span 的
                                       #   会话序键空间无换算关系（3.16.4；_fan_out 同复制）
-    member_classifications: dict[str, Classification] | None = None
+    session_position: int | None = None
+    member_positions: tuple[int, ...] = ()
+    capacity: SequenceCapacity | None = None
+    member_classifications: dict[int | str, Classification] | None = None
                                       # v1.12 只增：M13 帧级批量判决写入（首标签序列信封，3.13.7）；
-                                      #   键 = 成员 record.id、值恒单标签（labels = (label,)，
+                                      #   键 = process 流成员出现位置；生成序列为成员 record.id、值恒单标签（labels = (label,)，
                                       #   source ∈ {"llm","fallback","inherited"}；sequence projector
                                       #   按实际事件 frame class 直装 inherited 值，classify 调用为零；
                                       #   None = 帧 pass 未运行
                                       #   （帧分类关闭 / 降格会话 / 非首标签克隆）——幂等门 is None；
                                       #   扇出克隆按引用共享同一 dict（record/dedup 同族，3.13.7）
-    member_annotations: dict[str, Annotation] | None = None
+    member_annotations: dict[int | str, Annotation | None] | None = None
                                       # v1.12 只增：M5 帧级逐帧标注写入（同一执行门，3.5.5）；
-                                      #   键 = 成员 record.id；值语义 = 单一真相（emitter 三值判定
+                                      #   键 = process 流成员出现位置；生成序列为成员 record.id；值语义 = 单一真相（emitter 三值判定
                                       #   直读 dict 形态，3.11.2）：占键 Annotation = annotated、
                                       #   占键 None = failed（成员标注不可修复）、缺键 = skipped
                                       #   （跳过类）、dict 本身 None = 帧 pass 未运行；克隆按引用
@@ -706,3 +709,7 @@ report 的深拷贝。`GenerationProduct` 不复制 digest 或 manifest input；
 
 复杂接口使用冻结 request dataclass，函数不超过五个参数；全部接口声明须有 doxygen style 中文 docstring。
 generation 包不导出旧函数名或参数转换 wrapper。
+
+## 完整会话容量载体
+
+CapacityCut、SequenceBounds、SequenceCapacity 与 CapacityTarget 的字段、半开位置范围、确定性 ID 域及作用域错误信号，冻结于 docs/CONTRACTS.md 的 Process sequence context capacity contract。RunContext 增加 session_attempt 与 capacity_checker；run_group 仅在会话 scope 存在时拆分计算组。成员归属、片段投影与 defects.members 一律使用从零起始的输入出现位置；重复内容 ID 不去除出现位置。生成侧保留独立唯一 ID。

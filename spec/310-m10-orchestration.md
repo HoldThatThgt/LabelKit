@@ -43,17 +43,17 @@ sequence namespace 由 run/phase/slot/attempt/stage 派生；`run_id` 与 `run_s
 
 | 规格 | 定义 |
 |---|---|
-| 跨批存活状态 | 仅三项：① DedupIndex（scope=global 时）；② MetricsSink 计数器；③ M9 用量累计。均不含数据内容本体（哈希/签名/计数），运行结束随进程销毁。v1.8（stream 模式）封闭清单增两项：④ M2 未闭合会话缓冲（≤ `session_max_len` 条 Record 元数据，图像仍懒加载，3.2.8）；⑤ M10 待装箱溢出会话（next-fit 唯一开口箱，见下方时序流行）——两者均属进程内存、随装箱/消费即释放，不构成新的落盘面（2.6 注记）。 |
+| 跨计算组存活状态 | 普通记录保留正式去重索引、观测计数和用量。普通流另外保留当前完整会话原始帧、冻结的上游序列分区、单调容量切点与最小失败、本次下游尝试信封和去重增量。全部只在进程内存；前一会话提交或取消后释放，重启不恢复。M2 的 session_max_len 仍是语义会话边界。 |
 | 尾批 | 最后一批不足 batch_size 照常处理；批内仅 1 条时 M4 不发裁决调用，各 criterion score 固定 0.5（3.4.3 归一化行）。 |
 | 熔断 | MetricsSink 维护连续致命计数（ProviderFatalError 与重试耗尽 provider_retryable_exhausted 均计入，7.6），达 `run.fatal_error_threshold`（默认 20），或 401/403 认证类首错**立即**（v1.5，3.9.3；v1.6 密钥池下「认证首错」= 该 profile 最后一把存活密钥被认证禁用——池内尚有存活密钥时单密钥认证失败仅禁用该密钥、不计入熔断）⇒ 取消在飞任务、finalize。**熔断交付（v1.6，1.6 对齐决策 ②）**：已完成批的主输出与 rejects 照常 fsync + 原子改名交付（v1.5 及以前为「.part 不交付」——长跑末段配额死亡不再丢弃全部已完成产出），报告写 run.circuit_broken=true 与 run.partial_delivery=true、counts 增列 unprocessed（6.4），退出码 4 不变。「运行完整处理了全部输入」的判定信号由此从「目标文件名出现」改为「report.run.interrupted=false 且 circuit_broken=false」——退出码 0/1 不足以判定：被 SIGINT 优雅中断的运行同样交付且以 0 退出（本表中断行）（3.11.2 主输出行、3.11.3 ④、6.4）。 |
 | 中断（SIGINT/SIGTERM） | 停止取新批 → 等待当前批完成或 30s 超时取消 → finalize（报告标记 `interrupted=true`）。已 flush 的输出行有效。 |
 | --limit N | M2 流截断在前 N 条记录，其余全流程不变（试跑）；generate_only 模式下作用于生成样本流的前 N 条：仅执行预抽序前 ⌈N / generate.num_per_call⌉ 次生成调用（(llm, style) 预抽不受影响），产出再截断到 N 条——本表下行「执行全部生成调用」带 --limit 时按此截断。 |
 | 纯生成模式（v1.4） | `run.mode="generate_only"` 时跳过 M2（IngestReport 全零）：启动后先按 3.6.2 的量公式执行全部生成调用（并发受相应 ResourceKey 的 admission capacity 限制，(llm, style) 组合按调用序号预抽保证可复现——生成先于切批、尚无批号，预抽 PRNG 固定取 Random(f"{run.seed}:0:generate")，即 3.10.3 派生式中 batch_no 恒取 0），产出构造为 Record 后按 `run.batch_size` 切批，逐批走 M3→M4→M5→M7→M11，批生命周期与内存释放同 process 模式；不触发二次生成（单遍）。规模建议同 2.6（≤ 50 万条）。 |
 | 分类与扇出（v1.7） | 规范链序 `_CHAIN_ORDER = ("dedup", "classify", "quality", "generate", "annotate", "verify")`（v1.8 起扩展为含 segment/extract、v1.9 起含 stitch 的九名单一超集元组，见下方时序流行——三者关闭时逐字节退化回本六名形）；`_compose_chain` 的 enabled 表增 classify——主链、生成回流链、generate_only 链均含（回流子批带 `source="inherited"` 继承分类，经 M13 幂等跳过，零额外调用，3.13.4）。multi 扇出只改变批内信封基数、不改链结构（4.3 契约 ②a）：`counts.fanout` = classify 阶段执行前后 `len(batch)` 的差值，由 M10 在批链循环处计量（counts.* 所有权属 M10，与从 generate 返回值计 generated 同构）；`batch.end` 事件 payload 增 `fanout` 字段（7.2 只增；`batch.start.size` 语义 = 批入口信封数，即扇出前基数）；熔断交付的 unprocessed 残差公式右侧同步 `+ fanout`（6.4 不变量扩展）。`--dry-run` 估算（`_estimate`）增 `classify_calls`：process 模式 = ingested × max(1, self_consistency)，generate_only 模式 = 生成记录数 × max(1, self_consistency)（回流子批继承分类、不计入）；存在 `[class.*]` 覆盖或 `assignment="multi"` 时，quality/annotate/verify 估算按全局继承配置、multi 按标签乘数 1 报下界，并在 stderr 注明口径——注记逐字为 `dry-run: note: estimated with global config / multi reports a lower bound at label multiplier 1`（1.6 v1.7 对齐决策 ⑦）。 |
-| 时序流与整会话装箱（v1.8，仅 `segment.enabled = true`） | **链序**：`_CHAIN_ORDER = ("segment", "stitch", "dedup", "classify", "extract", "quality", "generate", "annotate", "verify")`——**九名单一超集元组**（stitch 为 v1.9 增位，`_compose_chain` 的 enabled 映射同步增 `"stitch": cfg.stitch.enabled`）；segment/stitch/extract 默认关，三者关闭时有效链逐字节退化为 v1.7 六名链序（generate 与 stream 互斥（2.3.1），故 generate 顺位与三新工位永不同链）。**装箱（S21）**：M10 改消费 `ingestor.sessions()` 会话流视图（3.2.8）而非 `records()`，按 **next-fit（顺序装箱，仅一只开口箱）**整会话装箱——会话按到达序装入，装不下即封批开新箱；批容量 = `run.batch_size` **帧**。单会话 > batch_size ⇒ M10 **硬切** + WARN 一次 + 对切分会话的帧信封打 duck-typed `session_split` 标（M7 缺帧判定的降级依据与 `_meta.stream.session_split`，3.7.3/6.3）；M1 对 `stream.session_max_len > run.batch_size` 发静态 warning（3.1.4）。待装箱溢出会话是唯一新增跨批存活项（本表跨批存活行 ⑤，装箱即释放）。**session_id 盖章（S4）**：M10 构造帧信封时盖章 `PipelineItem.session_id`（簿记非业务逻辑，4.1；M14 对其追加的 episode 信封盖章）。**计量与记账**：`counts.episodes` = segment 阶段执行前后 `len(batch)` 差值（fanout 同构计量，M10 属主——M14 不碰 `counts.*`）；post-emit 状态 tally 增 absorbed / dropped_noise；failed 兜底公式扩展为 `failed = max(len(batch) − emitted − dropped_dup − dropped_lowq − dropped_verify − absorbed − dropped_noise, 0)`（不扩展则 absorbed 成员被误计 failed）。`batch.end` 事件 payload 增 `episodes` / `absorbed` / `dropped_noise` 三可选键（仅 segment 启用时携带，fanout 的 R20 形制，7.2 只增）；stderr 进度/摘要行**不增键**（fanout 先例——报表与 batch.end 可见）。**守恒与中断（S18）**：守恒式全展开形见 6.4（左侧新增 dropped_noise 与 absorbed、右侧新增 episodes）；stream 模式下 `counts.unprocessed` 的出现条件扩为「熔断 **∨** interrupted」——SIGINT 叠加会话缓冲会产生未走完流水线的在飞残差，残差公式两侧同步扩展（右侧 `+ episodes`、左侧 `+ absorbed + dropped_noise`）；非 stream 中断残差恒 0、不加键（回归锚不动）。**dry-run 估算（S22/S23；v1.11/V12 修订）**：`_estimate` 增 `segment_calls = Σ ceil((L−1)/(w_min−1))`（对长度 L ≥ 2 的会话求和；L = 1 或 `strategy="rules"` 计 0；**window 实参自 v1.11 起替换为 `budget.min_window(cfg)` 导出的最坏保证装填量 w_min**——**上界语义**：实际每窗装填 ≥ w_min 帧 ⇒ 实际窗数 ≤ 估算，与 M1 预算护栏共用单一事实源；预算未声明时 w_min = window，公式与数值与 v1.8 同构不变）与 `extract_calls = Σ(L−1)`（报**上界**）；quality/annotate/verify 估算以 episodes ≈ sessions 报**下界** + stderr 注明口径（R28 式；注记逐字为 `dry-run: note: stream estimate: downstream reports a lower bound at episodes≈sessions (LLM refinement only adds segments)`），stream stderr 注行在 **w_min < window** 时增补一句 `; segment reports an upper bound at worst-case budget packing`（v1.11/V12）；批数由会话尺寸空跑 next-fit 装箱**精确**得出（文本模态行数统计与会话空跑单遍融合，3.2.8）；两新键**无条件打印** `segment_calls=… extract_calls=…`（classify 先例：默认关闭恒 0）。 |
+| 普通流会话边界 | 消费 ingestor.sessions()，每个完整 Session 按声明序单独处理；batch_no 等于会话序号。帧同时携带 session_id 与从零起始的 session_position。run.batch_size 只限制 RunContext.run_group 的叶任务数量，固定判决轮全部计算组完成后归并；不按帧数硬切，不存在 session_split 标记或警告。segment → stitch 只执行一次；下游会话尝试按 dedup → classify → extract → quality → annotate → verify 执行，quality 比较池是本会话同类序列。会话结束后才统一 verify 与 emit，共享噪声和后邻帧保留到提交。详细契约见下方会话容量小节。 |
 | 线索缝合（v1.9，仅 `stitch.enabled = true`） | **计量（T7）**：`counts.stitched` 由 post-emit 状态 tally 归集（壳终态；仅计被并 episode 信封壳——救援短段无信封形态、不产生壳，3.16.6）；`counts.threads` 在 post-emit tally 处以恒等式 **`threads = episodes − stitched`** 导出（单点上报，不设第二落点——救援只并入不开新线索、壳一对一抵扣、降格段照常入池、fanout 后置无交互，恒等经审计验算；counts.* 属主仍归 M10，M16 不碰）。**公式三处同步（T7）**：failed 兜底公式终态减项同步增 `− stitched`（`failed = max(len(batch) − emitted − dropped_dup − dropped_lowq − dropped_verify − absorbed − dropped_noise − stitched, 0)`——不扩展则壳被误计 failed）；熔断/中断的 unprocessed 残差公式减项同步增 `− stitched`；守恒全式左侧增 `stitched` 项（6.4）。**batch.end**：payload 增 `stitched` / `threads` 两可选键（仅 stitch 启用时携带，episodes 的 R20 形制，7.2 只增）；stderr 进度/摘要行**不增键**（固定键集，stitched 经报表与 batch.end 可见——有意为之；v1.10 U18：固定键集约束收窄为 plain 面专属，rich 面板状态账展示 stitched/threads，7.7）。**report**：`stream` 节增 `stitch` 子块 `{stitched, rescued_short, seams, judgments, repass_judgments, failures}`（M16 属主，6.4）。**dry-run 估算（T16）**：`_estimate` 增 `stitch_calls = len(session_lens) × votes × (2 若 repass 否则 1)`（episodes ≈ sessions 下界基数，沿用既有 stderr 下界注；救援候选调用不计入估算——池非空才发生的 +ε 项）；该行**无条件打印** `stitch_calls=…`（off 时恒 0，segment_calls 先例）。 |
-| console 旁路（v1.10） | **stage 信号**：批链循环内每 stage `run()` 之前调 `metrics.stage_begin(stage.name, batch_no)`——进程内旁路仅转发 ProgressListener，不产生 TraceEvent、不入 7.2 目录（3.12.3/U11）；`_request_stop` 内加一行 `metrics.stop_requested()`（中断横幅通路）。**估算导出（U20）**：静态估算公式抽出为纯函数 `estimate_run(cfg, plan)`（`_estimate()` 改薄封装；dry-run 与渲染器批级分母共用）；live 路径在 P2-4 预扫后经 `metrics.run_estimate(...)` 发送——process 模式**复用该次 scan**（UI 模态翻 `estimate=True`，配对表零额外 I/O；文本模态仅 `console.estimate = true` 时做行数估算，U17），**禁二次 scan**；generate_only 走 3.6.2 静态公式无 scan。**dry-run 呈现（U13；v1.11/V12 修订）**：rich 档下估算四行 print 让位于渲染器表格（数值逐项一致）；plain 档行式输出为逐字节锚——`segment_calls`/`stitch_calls` 维持**无条件打印**，其中 `segment_calls` 行的含义自 v1.11 起改为**按 w_min 报预算最坏装填上界**（本表时序流行；预算未声明或 w_min ≥ window 时数值与 v1.10 逐字节不变——examples 声明保守实效窗下当时的五个黄金文件不动，V26；v1.12 起黄金文件为**七个**且因估算行插入两帧粒度键全部重采，见本表帧粒度行）。listener = None 时以上全部为 no-op（v1.9 行为逐字节一致）。 |
-| 上下文预算（v1.11，仅预算启用时） | **批边界校准冻结（V19）**：每批处理完成、下一批装填开始前调用 `self.llm.calibrator.freeze_batch()`——聚合本批图片成本样本的 max（对无序集取 max，序无关）压入批最大值窗口、刷新可读快照（第 N 批装填只读 < N 批的聚合值，确定性护栏——批序串行 ⇒ 同输入同配置可复现；校准器由 `LLMClient` 自持，公开面 `llm.calibrator`，3.9）。**启动期预算 INFO 行（V13①）**：M10 于运行起点打印预算参数（如 `segment: w_min=6 window=20 (budget)`——数据无关、仅计数与参数；归属 M10 启动段而非 loader——加载期 logging 尚未按 CLI 覆盖定级，7.1）。**报表汇总**：finalize 时组装 `report.budget = {profiles, w_min, truncations, overflow_records, image_cost, degrade_retries, escalations}`（counts-only 键义见 6.4；truncations 由各算子逐裁剪点计数、overflow_records 按 7.6 词表归集、image_cost/degrade_retries/escalations 为 V17 三层的校准终值与反应频度对账，V13②⑤）+ `report.stream.windows`（segment 实际窗数，M14 属主计数、随 stream 节落盘——供用户对账 V12 上界估算，V13④，6.4）。 |
+| console 旁路 | 每阶段执行前发送 stage_begin；停止请求发送 stop_requested。estimate_run 由 dry-run 与进度总量共用，process 复用一次 scan，禁止重复预扫。普通流下游以 episodes≈sessions 给出名义估算，segment 按必要两帧单元估计初始调用；完整证据大小、后处理、容量拆分和重算未静态确定，不能将估算称为完整运行的最坏调用上界。plain 与 rich 使用相同数值与注记，segment_calls/stitch_calls 关闭时仍显示零。 |
+| 上下文预算 | 普通流在完整会话完成或取消后、下一会话开始前冻结 calibrator；同会话所有下游尝试只读此前会话的校准快照，不因容量重算刷新快照。普通记录仍按批冻结，finalize 再完成最终快照。启动日志为 budget: <profile>=<context_window>/<input_budget>，启用 segment 时另报 segment: minimum_frames=2 window=<configured> (budget)；必要两帧数不构成任意完整输入的装填保证。report.budget 保留 profiles、truncations、overflow_records、image_cost、degrade_retries、escalations，并仅在 segment 启用时含 minimum_frames=2；删除 w_min。report.stream.windows 记录实际窗口数，capacity 记录实际容量转换，真实费用以 usage/trace 为准。 |
 | 帧粒度（v1.12） | **组链或门（裁决·组链双门）**：factory（`build_stages`）以**或门** `classify.enabled ∨ frame_classify.enabled` 决定 ClassifyStage 进链（链序与槽位不变——仅帧级开启时 ClassifyStage 仍须进链执行帧 pass；组链的 classify 槽位判定与该或门同口径）；stage 内序列级判决单独受 `classify.enabled` 门控——仅帧级开启时序列记录不产生 Classification、`_meta.classification` 维持 null（3.13.7）。**estimate_run 两键**：`frame_classify_calls` / `frame_annotate_calls` = **粗上界 = 预扫描帧总数 Σ session_lens**（数据源与 `segment_calls` 完全同源，复用同一次预扫描；帧分类实际按窗批量、帧标注跳过噪声成员与跳过类，实际调用数均 ≤ 帧总数）；对应开关关闭 ⇒ 0（帧粒度要求流模式（3.1.4），非流分支恒 0）；`total_calls` 扩项；**键序冻结**——`frame_classify_calls` 紧跟 `classify_calls`、`frame_annotate_calls` 紧跟 `annotate_calls`（返回键表冻结注释同步，CONTRACTS §7.13）。**dry-run 估算行改写**：估算行（stderr 第 2 行）按冻结键序插入两键，**无条件打印**（非流工程恒 = 0，v1.9 `stitch_calls` 先例）——是**改第 2 行**而非加行：五个既有 dry-run golden 重采 + `examples/mix` 主/姊妹双工程的 `dryrun-mix.txt` / `dryrun-mix-text.txt` 两个新 golden，共**七个**（7.8 回归锚，`tests/cli/goldens/`）。 |
 | v1.21 sequence 精确交付 | `generate.form = "sequence"` 时，generate_only 分支在 M1 冻结含 `InterleavingSpec` 的 `SequenceGenerationConfig` 后调用唯一 `compile_generation_program` 与 `compile_scenario_plan`，再由 `SequenceWorkflow` 调用 `deliver_generation`；不进入 `GenerateStage` 或 `ProcessWorkflow._process_batch`。program/plan 在凭据物化和任何 LLM 前冻结，其中包含交织 opportunity、pattern、partner、共享 session 布局与派生计数。M10 负责候选缓冲、attempt transaction、声明序短提交、时间/区间 frontier、运行终态和 M11 commit，不实现 compiler/planner 算法、不重抽交织事实。classify 与 frame.classify 判定 stage 静态关闭，projector 写 inherited Classification；frame.annotate 由 attempt-local 协作者执行。 |
 
@@ -288,6 +288,55 @@ ActorView、prompt 和 API key 只能按 trace 内容策略处理。
 
 
 **背书：**「编排器只做组合调度、算子无相互依赖」是 Data-Juicer 配方执行器 [4] 与 distilabel Pipeline 运行时 [5] 的共同架构；批式流转 + 增量写出与 Dolma toolkit 的并行分片处理模型一致 [6]。
+
+### 普通流会话容量与提交
+
+图 3-9 完整输入会话的容量重算与正式提交。上游成员分配只冻结一次；容量拆分或最小失败登记后重建下游，最终尝试才提交去重、计数和输出。
+
+`SessionWorkflow` 负责一个会话生命周期；`SessionPartition` 只保存分段与缝合之后的成员分配。
+每次尝试从新信封开始，完整原始 `Record` 与图片惰性引用共享，可变状态不共享。容量重算不重发
+segment/stitch，也不改变原先噪声判断和初始序列最短长度判决。
+
+`SessionCapacityChecker.preview` 按下游规范链调用各阶段纯 `preview_capacity`，使用对应拥有者的
+`SessionAttemptScope.stage`。预览不改信封、正式索引、计数或图片加载状态。完整请求不可装入时由上游
+按请求单位处理；fixed/frame/transition/pairwise 的最终失败归属仍由对应下游执行门处理。
+
+普通 sequence 容量错误按当前冻结序列成员中点拆成两个非空子序列；pairwise 选择成员更多的可拆目标，
+同长选择出现位置更早者。frame、transition、fixed 和 stitch_pool 不盲目拆父序列。verify 回收的临时
+工作成员不作为新基线：撤销本次尝试后拆原冻结成员；原基线仅一帧则登记该视图终态。
+每个已完成判决轮以 `SessionCapacityError.failures` 交回完整声明序失败集合，不能因首错丢掉其他已发生
+超限。协调器一次消费全部仍可达请求：可建立多个切点或最小失败，但 recomputations 只增加一次。
+同轮相同请求的重复样本不重复登记；先前切分已替换的 sequence/pairwise 请求失效，不因旧 ID 不存在
+误登记最小终态，也不把父请求的失败未经判断套到子请求。整个失败集合未增加切点或最小失败是内部契约错误。
+
+子序列身份由 root_id、最终有序出现位置与完整成员身份派生，保留直接 parent_id；认领范围用半开区间
+SequenceBounds，切点缩小左右区间。子序列全部 sealed，后续不再进入缝合。碎片按 member_positions
+取交集，保留 source_episode/cause，重算 member_count/order_span；接缝依原相邻位置重新编号。
+同一根的另一分类视图引发切分时，已知 frame/transition 最小失败按子范围保留完整请求位置；verify
+本轮回收的 noise 即使不在冻结成员中，只要仍在允许范围也继续受终态约束。transition 跨新切点时失效。
+固定请求失败投影到所有子视图；sequence/pairwise 原请求被替换后失效。
+
+去重使用 reserve_session/commit_session/discard_session；保留最终尝试在去重阶段接纳的全部身份，
+之后的质量或验证过滤不回溯改写去重。失败尝试不改正式索引、重复簇、质量池统计、成员认领和输出。
+上游 dataset 计数暂存一次，下游每次尝试单独 capture_counts；最终会话只 merge 最终两份计数。
+usage、错误、重试、trace、阶段耗时和容量控制事实保持真实累计。全部尝试的随机种子按会话序号和阶段
+派生，任务身份另含 attempt；图片校准只在完整会话收尾时冻结。
+
+冻结后接管上游信封并清空调用方原列表，只保留上游快照和一份下游尝试。跨尝试保存原容量异常时清除
+traceback/cause/context 对旧调用栈的引用，保留原错误对象及其错误事实；会话完成后释放全部信封。
+
+正式提交前检查所有视图的完整成员位置、原始帧对应关系与容量认领范围。absorbed 守恒仅按多标签的
+首标签成员所有者计算；克隆必须有对应所有者，两个独立成员所有者不得交叠认领。之后无 await 地提交
+去重增量与 dataset 计数，再调用既有 emitter，以 post-emit 状态计 emitted/failed/rejects。
+提交开始后不再容量重算，I/O 失败继续原有部分交付语义，不新增文件事务。
+最终 episodes = 上游初始 episode 数 + 最终容量分区净增数；stitched 只数上游壳，threads = episodes − stitched，
+fanout 单独计数。取消的未提交尝试只留下原始输入出现位置残差，不增加虚构 episode 或 fanout。
+
+report.stream.capacity 固定为 `{sealed, splits, recomputations, minimum_failures, retained_frames_high_water}`。
+高水位是保留帧数，不是字节或 RSS。trace 的 sequence.capacity 事件使用 split/seal/minimum_failure/recompute，
+每条包含 targets 的 root_id/record_id/label/member_positions，split/seal 另含实际 cut；
+session_id/session_attempt 由 MetricsSink 的 ContextVar 标注。dry-run 的 batches 精确等于扫描会话数；
+成员长度和后处理输出未知，模型请求与容量重算只提供估算，不能宣称实际调用精确值。
 
 ### 3.10.4 运行走查示例
 

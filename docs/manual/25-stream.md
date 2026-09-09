@@ -1,5 +1,7 @@
 # 第 25 章　流模式 stream：会话化、语义分段与动作摘取
 
+> 本章保留的运行数字、日志和 JSON 节选是容量改造前的历史证据，不代表当前配置的新运行结果。当前容量、全证据与跨计算组示例见 [会话容量示例](../../examples/sequence-context-capacity/README.md)。历史 JSON 中的 session_split 不再是当前输出字段。
+
 > 流模式是 v1.8 新增的一组能力：把**按时间顺序采集的屏幕状态流**（录屏抽帧 + UI 树）
 > 先切成一段段「用户在做一件事」的 episode，再逐帧对推断出中间发生的动作，
 > 最后以**序列**为单位完成打分、标注与评审。
@@ -10,6 +12,30 @@
 > 帧粒度小节 25.6 的样例另取自双粒度工程 `examples/mix` 的真实运行
 > （UI 控件树主工程，DeepSeek + z.ai 双端点分工）。
 
+## 会话、计算分组和容量边界
+
+输入仍是一组确定的 JSONL 文件或 UI 文件路径；这不是等待数据逐步到达的在线服务。一个已确定的会话
+在同次进程运行中跨计算组保留分段、缝合和共享帧状态。进程重启不会恢复状态。
+`run.batch_size` 只限制每组叶任务数量，序列可以包含更多帧；key、gap、session_max_len、时间跨度、
+EOF 和 limit 仍决定语义会话边界，不允许跨语义会话缝合。
+
+```mermaid
+flowchart LR
+    input[固定文件中的完整会话] --> upstream[跨计算组分段与缝合]
+    upstream --> frozen[冻结序列分配]
+    frozen --> downstream[会话内分类、去重、质量与标注验证]
+    downstream --> overflow{上下文超限}
+    overflow -->|可缩短| split[完整成员切分并封闭]
+    split --> downstream
+    overflow -->|最小请求| failed[所属阶段终态失败]
+    overflow -->|完成| commit[提交会话与输出]
+```
+
+封闭后的序列禁止在 pass1、rescue 和 repass 再次并入或被并入。容量切点限定验证可以回收的帧范围；
+共享噪声和后邻帧一直保留到会话统一验证。去重身份、质量统计、结果计数和输出只提交最终尝试，
+实际用量、错误、重试和 trace 保留所有尝试。`report.stream.capacity` 给出封闭、拆分、重算、
+最小失败数及保留帧数高水位；它不是 RSS 或字节预算。
+
 ## 25.1 为什么要分段：时间轴上没有「一条记录」
 
 前面所有章节都默认一件事：输入里的**每一行/每一对就是一条独立记录**，标注单位与采集单位天然重合。但屏幕操作流不是这样采的——录屏抽帧得到的是「首页、搜索页、结果页、详情页、弹窗、购物车……」一长串状态截面，**单帧什么都说明不了**：训练侧要的样本是「用户搜索并下单了一次外卖」这样的完整任务段，而任务的边界、中间混入的通知弹窗、乃至「两帧之间用户到底做了什么」，在原始数据里根本没有字段承载。拿 v1.7 的流水线硬跑这种数据，得到的是逐帧的碎片标注：帧级去重在连续 UI 帧上大面积误伤，质量分打在单帧上毫无意义。（v1.12 起流模式内也有帧粒度产物——但那是 opt-in 的**第二层**产物：以段为单元跑完整条链之后，帧级分类与标注挂在 episode 行内随序列一起交付（25.6），与这里说的「把帧当独立记录逐帧硬跑」是两回事。）
@@ -19,7 +45,7 @@
 1. **会话化**（`[stream]`，M2 规则层）：按声明的顺序与断开规则，把帧流粗切成候选会话——纯代码、零 LLM；
 2. **语义分段**（`[segment]`，M14 算子）：LLM 滑窗逐帧裁决「这一帧相对进行中的活动是什么角色」，代码按固定规则从关系**演绎**出边界与噪声帧，每段拼装成一个 episode（序列记录）；
 3. **动作摘取**（`[extract]`，M15 算子）：对 episode 内每对相邻帧，LLM 推断「两帧之间发生的单个语义动作」，写成结构化步骤序列；
-4. **下游序列适配**：去重、打分、标注、评审全部改以 episode 为单位——轨迹 rubric 打结构分、标注看动作序列 + 关键帧、评审带缺陷表并能对成员集做「手术」。
+4. **下游序列适配**：去重、打分、标注、评审全部改以 episode 为单位——轨迹 rubric 打结构分、标注看动作序列与完整成员证据、评审带缺陷表并能对成员集做「手术」。
 
 四层接进既有链序，就是流模式的完整加工链（本图作本章与第 26 章共用的地图；缝合默认关，机制在第 26 章）：
 
@@ -64,7 +90,7 @@ min_len = 2                       # 仅作用于 LLM 精化切出的段
 context = "…"                     # 域上下文声明（本工程为穿插流写了长版，全文与解读见第 26 章）
 ```
 
-`[stream]` 声明「帧流怎么排、会话在哪断」：本例用分区键 `source_dir` 让**每个子目录成为一个会话**。`[segment]` 是流模式总开关；`window` 自 v1.11 起是**上限**——所引 profile 声明了 `context_window` 时（本仓库示例配置就声明了 131072），窗口按预算**贪心装填**、装满或到上限即封窗，未声明预算时保持定长窗（步长 = window−1；两种形态都重叠 1 帧、接缝帧判决归后窗）。本工程 16 ≥ 最长会话且预算装得下整段（启动 INFO 报最坏也能装 46 帧，25.5），滑窗退化为**每会话恰一窗**。v1.11 的另一处变化：窗口**是否附图没有独立开关**——`segment.llm` 指向的 default profile `supports_vision = true`，UI 模态下窗口自动逐帧附截图（选 profile 即选能力，25.5/25.7）。`context` 只是可选域上下文——**边界判据内置于固定模板，零配置可用**，这行不是必需品。
+`[stream]` 声明输入顺序与语义会话边界；本例 source_dir 按目录分会话。segment.window 是单次边界判断的帧数上限，实际窗口按每个成员完整证据和已声明上下文贪心装填。窗口重叠与接缝归属保留；完整两帧仍不可装时明确失败。UI 窗口需要支持视觉的 profile，不能通过关图或摘要替代降低预算。context 仍是可选业务背景。
 
 **第二节：摘取与序列打分。**
 
@@ -88,7 +114,7 @@ rubric = "default:trajectory"     # 轨迹四准则；无 threshold——只打�
 enabled = true
 llm = "default"
 instruction = """
-你是移动端操作序列标注员。根据动作序列与关键帧，
+你是移动端操作序列标注员。根据动作序列与完整成员帧，
 标注该操作序列的任务标签（用户在做什么）、所属应用与一句话摘要。
 被打断后恢复的任务请标注其完整任务（接缝步表示任务曾被打断）。
 """
@@ -110,7 +136,7 @@ rejects = "full"                  # 噪声帧 rejects 行携带完整载荷（�
 # schema_inline = …               # task_label / app / summary 三字段的输出 Schema，略
 ```
 
-（工程还开着 `[classify]`——episode 序列照常分类：摘要 + 首帧截图入提示词、shopping 类挂了按类标注指令，机制见第 24 章；`[stitch]` 见第 26 章。）trace 通道枚举 v1.8 从 8 值扩到 10 值（v1.9 再加 `"stitch"` 成 11 值）：`"segment"` 与 `"extract"` 都**不在默认订阅集**里，想审计边界判决必须显式加（与第 24 章的 `"classify"` 同款约定）。跑起来：
+工程还开着 `[classify]`：episode 使用全部成员的完整证据分类，shopping 类挂了按类标注指令，机制见第 24 章；`[stitch]` 见第 26 章。`"segment"` 与 `"extract"` 都不在默认 trace 订阅集里，审计边界判决时须显式添加。跑起来：
 
 ```bash
 cd examples/stream && mkdir -p out
@@ -118,7 +144,7 @@ set -a && source ../../.env && set +a
 uv run labelkit run --config ../config.toml --project project.toml
 ```
 
-启动段先看到两行 v1.11 的预算 INFO（第 16 章），stream 工程多出的第二行是 segment 的最坏装填量（省略时间戳）：
+以下两行是旧运行的预算日志。当前启动行使用 minimum_frames=2，仅表示必要帧对；旧 w_min 不能用于当前完整证据的容量推断：
 
 ```
 INFO  run     batch=0 budget: default=131072/113868 judge=131072/115916
@@ -168,9 +194,9 @@ other                            无法归类（语义写进 description）
 **第四层：下游算子的序列适配。**episode 是 `kind="sequence"` 的记录（成员帧转入 `absorbed` 状态、不再独立产出——这是 Stage 契约新增的受控例外「分段吸收例外」，spec §4.3；第 4 章），下游全部换序列口径。v1.9 起 segment 与下游之间还有一个可选的缝合算子（`[stitch]`，第 26 章），把同会话内被穿插切开的 episode 碎片并成线索（Stage 契约的缝合改绑例外，spec §4.3），开启后下面各算子看到的单元相应从 episode 升级为线索：
 
 - **dedup**（第 9 章）：序列的判重文本 = 成员配方按序拼接，episode 级重复 = 「同样的操作流程」；pHash 层自动跳过（序列记录无自己的图）。真实展品在 `project-text.toml` 的真跑里：晚间会话对合同翻译三连的逐字重发，episode 判重配方与中午那段逐字一致——`stage="dedup", reason="exact"` 落拒绝通道（`rejects="full"` 档的载荷是成员清单 `{"kind": "sequence", "member_ids": […], "member_sources": […]}`）；
-- **quality**（第 10 章）：证据 = `[步骤序列]`（extract 产物的文字渲染，fallback 步与确证 other 分列）+ `[成员帧摘要]`，**全程无图**——trajectory rubric 的四条准则（完成度/连贯性/目的性/噪声残留）全是结构性判据，不需要逐帧看图（25.7 有展开）。extract 关了也能打：「步骤」退化读作「帧间变化」（M1 会给 warning 提示这个组合）；
-- **annotate**（第 11 章）：序列模板 = `[动作序列]` 逐步行渲染 + 关键帧图 + `[成员帧摘要]` 收尾。关键帧数以 `annotate.sequence_frames`（默认 20）为**上限**：v1.11 的预算装填先给足文本块，图片吃剩余份额——实发帧数 `k_eff = min(sequence_frames, 预算余量 ÷ 每图成本)`，首末帧恒保留、中间均匀降采样（预算宽裕时 k_eff 就等于上限，本工程即如此）；
-- **verify**（第 13 章）：评审输出在意见/结论之外多一张**缺陷表**（六值：`label_mismatch` 标签不符 / `off_task_members` 混入无关帧 / `missing_head` / `missing_tail` 切头切尾 / `missing_members` 段中缺帧 / `wrong_stitch` 缝合错误——v1.9 增，词表闭集恒在场、仅开缝合时可判），证据段含 `[边界余量]`——段边界外前后各 2 帧的摘要及去向，专防切头切尾。`policy = "repair"` 时按缺陷路由**成员手术**：收缩（把无关帧逐出段，reason=`off_task_member`）与回收（把批内同会话的噪声帧复裁后接回），手术后接缝重摘取、transitions 重编号、重标注复审，全程两阶段批级结构保证并发下确定性；修复过的行带 `_meta.stream.repaired = true`，不重打分。
+- **quality**（第 10 章）：动作步骤与所有成员的完整文本、可见 UI 树和图片共同构成证据。UI profile 必须支持视觉；比较池为完整会话内同类序列，容量重算会重建整池。
+- **annotate**（第 11 章）：动作步骤与每个成员的完整文本、可见 UI 树和截图一起标注。上下文不足触发容量切分及未提交会话重算，不能抽图、裁摘要或遗漏成员。
+- **verify**（第 13 章）：完整成员、输出和必要边界证据共同评审，缺陷成员使用出现位置定位。同会话噪声与后邻帧保留到验证；认领不可跨人工容量边界。成功成员手术遵循既有验证流程，容量失败则撤销临时工作成员并从冻结基线重算整个未提交会话。
 
 ## 25.4 输出怎么读
 
@@ -202,7 +228,7 @@ other                            无法归类（语义写进 description）
                           {"file": "s1-serial-noise/uitree_6.jsonl", "pair_index": 6},   ← 5 缺席：噪声帧
                           {"file": "s1-serial-noise/uitree_7.jsonl", "pair_index": 7},
                           {"file": "s1-serial-noise/uitree_8.jsonl", "pair_index": 8}],
-      "session_split": false,                ← 所属会话曾被 batch_size 硬切过吗（25.7）
+      "session_split": false,                ← 历史字段；当前删除，人工边界由 capacity 表达
       "repaired": false,                     ← verify 手术改写过成员集吗
       "degraded": null,                      ← segment 失败降级留痕（on_error="keep" 时）
       "fragments": [{"order_span": [1, 4], "member_count": 4, "cause": "origin",
@@ -236,7 +262,7 @@ other                            无法归类（语义写进 description）
 }
 ```
 
-逐键读 `_meta.stream`：`member_sources` 是完整成员溯源（每帧来自哪个文件哪个 index——`source` 键只继承首成员），拿它能把 episode 还原回原始帧；`order_span` 与 `member_count` 对不上（跨度 8、成员 7）就说明段内有帧被剔了。v1.12 起这里还可能多一个 `members` 键（`member_sources` 之后、`session_split` 之前）：帧粒度任一开关开启时在场，逐成员给出帧类标签、帧级标注与状态位——本工程没开帧粒度所以缺席，读法与真实样例在 25.6。`thread_id`、`fragments` 与步行内的 `resumed` 是 v1.9 增键，**仅本工程开着 `[stitch]` 才在场**（读法在第 26 章；关掉缝合，这三处消失，主输出与 v1.8 逐字节等价）。留意这行的 `steps` 里**没有**接缝占位步（六步全是真实转移、`resumed` 全 false）：两个碎片的间隙里只有噪声帧 5，按判据不构成接缝——这条辨析在第 26 章展开。顶层三个字段仍是你的 Schema 产物——**输出结构照旧由全局 Schema 管**，stream 改变的只是「一行代表什么」。另两处细节：`verification` 在流模式恒带 `defects` 键（无缺陷 = 空数组）；判分噪声这次落在了别的行上——s4 的新闻浏览线索被打了 `noise_residue` 0.0、`completion` 0.4（聚合 0.55），对一条干净的三帧浏览流来说是个可疑判决，但因为没设 threshold，它只是个随行落盘的分数。**stream 工程默认只打分不筛**的价值就在这：判分的噪声不会变成数据的损失，后筛时你还有机会用 trace 复核。
+逐键读 `_meta.stream`：`member_sources` 是完整成员溯源（每帧来自哪个文件哪个 index——`source` 键只继承首成员），拿它能把 episode 还原回原始帧；`order_span` 与 `member_count` 对不上（跨度 8、成员 7）就说明段内有帧被剔了。v1.12 起这里还可能多一个 `members` 键（`member_sources` 之后、`capacity` 之前）：帧粒度任一开关开启时在场，逐成员给出帧类标签、帧级标注与状态位——本工程没开帧粒度所以缺席，读法与真实样例在 25.6。`thread_id`、`fragments` 与步行内的 `resumed` 是 v1.9 增键，**仅本工程开着 `[stitch]` 才在场**（读法在第 26 章；关掉缝合，这三处消失，主输出与 v1.8 逐字节等价）。留意这行的 `steps` 里**没有**接缝占位步（六步全是真实转移、`resumed` 全 false）：两个碎片的间隙里只有噪声帧 5，按判据不构成接缝——这条辨析在第 26 章展开。顶层三个字段仍是你的 Schema 产物——**输出结构照旧由全局 Schema 管**，stream 改变的只是「一行代表什么」。另两处细节：`verification` 在流模式恒带 `defects` 键（无缺陷 = 空数组）；判分噪声这次落在了别的行上——s4 的新闻浏览线索被打了 `noise_residue` 0.0、`completion` 0.4（聚合 0.55），对一条干净的三帧浏览流来说是个可疑判决，但因为没设 threshold，它只是个随行落盘的分数。**stream 工程默认只打分不筛**的价值就在这：判分的噪声不会变成数据的损失，后筛时你还有机会用 trace 复核。
 
 **拒绝通道**是噪声帧的去向（`rejects = "full"` 档；s1 的两行 `_meta` 逐字如下，`record` 载荷——该帧的树文本与图路径——以 `{…}` 略去）：
 
@@ -288,7 +314,7 @@ emitted + dropped_dup + dropped_lowq + dropped_verify + dropped_noise + failed +
 
 ## 25.5 调优与审计闭环
 
-**三个旋钮，按影响面排序。**其一，`gap_s` / `gap_steps`（会话粒度）：gap 偏大 = 欠分割，还有 LLM 精化兜着；gap 偏小 = 过分割，**段一旦切碎就再也拼不回来**（LLM 只在会话内精化，v1.9 的缝合算子同样只在会话内缝——跨会话永远无解，第 26 章）——这就是 `gap_s` 默认给到 300 秒偏大值的结构性理由，宁欠勿过。其二，`segment.window`（单窗帧数上限）：窗内上下文越足判得越稳，业界证据甚至偏向「整段单调用」形态——会话普遍不长时直接把 window 调到 ≥ 会话长度，滑窗天然退化为整段单调用；v1.11 给这句话补了一个**预算前提**：所引 profile 声明 `context_window` 后窗口按预算贪心装填（每窗帧数 ≤ window、装不下就封窗开新窗，溢出还有对半改切的降级重试兜底），「window ≥ 会话长即单窗」只在**整段也装得进输入预算**时成立。看启动 INFO 行心里就有数：本工程 `segment: w_min=46 window=16 (budget)`——最坏也能装 46 帧、远超 16 的上限，装填顶格、行为与定长窗一致（`window=16` 就是这么定的）；反过来 w_min < window 时实际窗会比上限小、窗数变多，事后拿 `report.stream.windows` 对账。窗小步多则调用省不了几个、接缝还多。其三，`segment.context`（域上下文）：告诉审核员「这是什么流」（本工程的长版 context 枚举了低电量弹窗、通知面板等噪声原型，还声明了任务互斥与切回语义——逐要点解读在第 26 章），它不定义边界，但能收敛噪声与切换判定的口径。
+**会话边界与请求容量分别配置。**gap/key/session_max_len 决定语义会话，跨这种边界不能恢复任务。segment.window 只限制单次边界判断的最多帧数，实际按完整证据预算装填；计算组大小不改变语义窗口和下游池。context 提供域知识。启动 minimum_frames=2 仅是必要的两帧单位，不再从有界摘要推断任意长帧的安全装填数量。
 
 **边界审计：抽读 `segment.boundary`。**每窗一条事件，`relations` 是逐帧判决、`reason` 是逐帧理由（订阅 segment 通道 + `content="refs"` 起携带）。抽读法：挑判决密度高的窗，把 relations 与你的人工预期逐帧对——本次真跑的 s1 窗（真实 trace 行，格式化展示；`…` 处省略 `run_id`/`batch_no`/`member_ids` 与其余帧的同构内容）：
 
@@ -311,11 +337,11 @@ index 4（帧 5）的 `interruption`、index 8（帧 9）的 `context_switch` �
 
 **extract 的可靠性预算：按 70–80%/步做计划。**LLM zero-shot 动作推断的实测可靠性就在这个区间（Watch & Learn 70.5%、Sharingan 70–80% 且按动作类型不均衡）——每步 20–30% 的错误率会沿 episode 级联，**不要把单步 steps 当真值消费**。工具承诺的是缓解链而非单步正确性：`include_diff` 的树 diff 证据（默认开，可关做 A/B——对照读数就是 `extract.by_type` 分布与 verify 缺陷率）、verify 缺陷路由兜底（步骤↔标签不符会被打 `label_mismatch`）、quality 结构分软门（连贯性/噪声残留压分可疑段）。日常盯两个计数：`by_type.other` 占比异常升高或某类型塌缩 = 系统性劣化信号；`fallback_steps` 持续非零 = 摘取输出结构不稳，先查 trace 的 error 事件。
 
-**帧摘要贫瘠与 vision 补偿。**纯文本裁决的第一瓶颈是帧摘要保真度——摘要没抓到的实体，LLM 看不见。摘要贫瘠（可见文本节点为零或摘要长度趋零：画布类屏幕、ghost nodes）会计入 `report.stream.digest_poor_frames` 并打一次 WARN，WARN 文案（`poor frame digest (zero visible text nodes): text-only boundary verdicts lack evidence; attach frame screenshots by pointing segment.llm at a supports_vision=true profile`）给出的补偿动作是 v1.11 的新口径：**为 `segment.llm` 配置 `supports_vision = true` 的 profile**——窗口是否附图由所引 profile 的能力自动推导（选 profile 即选能力），原 `segment.use_vision` 键已随 v1.11 移除，配置里显式写出会直接报配置错误并附迁移指引。本工程的 default profile 支持视觉，多图窗口默认就开着（每帧一图、成本相应上去；想省钱就指向纯文本 profile）；本次真跑贫瘠计数为 0——fixture 的树信息充足，附图属于锦上添花。
+**完整 UI 证据。**空可见树仍保留截图作为证据；UI 普通流的 segment 与所有实际接收成员图片的阶段都必须使用视觉 profile。不能通过选纯文本 profile 把图片从证据中移除，segment.digest_max_chars 已删除。
 
 **长 episode 的信度注记。**episode 超过 ~20 步后，LLM 对整段的判分信度会衰减（业界同证据）。两个缓解：质量侧改 pairwise（相对比较对长序列比绝对刻度稳）；或对超长段的分数降信任、把裁量交给人工抽检。
 
-**成本账**（形制同第 17 章 §17.1；设会话长 L、窗上限 w、最坏装填量 w_min——启动 INFO 行里那个数）：
+**历史运行成本账**：下表保留旧实现的估算与实跑数字；当前不再提供摘要保证的 w_min，实际请求与重算读新运行 trace。
 
 | 来源 | 次数 | 本次真跑 |
 |---|---|---|
@@ -329,14 +355,18 @@ index 4（帧 5）的 `interruption`、index 8（帧 9）的 `context_switch` �
 
 ## 25.6 帧级分类与标注（v1.12）
 
-**双粒度动机。**到这里为止，stream 的产物粒度是「一行 = 一段活动」：分类、打分、标注全在回答「这一段是什么」。但下游经常还要第二层**原子粒度**——段内每个成员帧各自扮演什么角色（发起任务、追问修改、寒暄插入），各自承载哪些结构化要素（意图、实体、参数）。v1.12 把这层需求做成流模式内 **opt-in 的帧粒度**：`[frame.classify]` 让 classify 处理每个 episode 时顺带对成员帧做**一次批量闭集判决**，`[frame.annotate]` 让 annotate 在序列级标注之后**逐成员**按帧类做结构化标注——一份配置、一次流水线，序列级意图与帧级原子标注同时拿到；帧产物挂在 episode 行内的 `_meta.stream.members[]` 随序列交付，成员帧状态机、链序与守恒恒等式零改动（帧粒度全关时行为与 v1.11 一致，唯 dry-run 估算行无条件多两个估算键，第 15 章）。仓库自带的 `examples/mix` 就是双粒度同开的上手工程，主工程 `project.toml` 是 UI 控件树时间序流：截图 + 控件树 17 帧对、三个会话子目录（s1 外卖下单、s2 订酒店、s3 = s1 的逐字节复刻——episode 级判重埋点），fixture 由 `tools/gen_fixtures.py` 用 PIL 确定性生成。它的 `config.toml` 独立成套且是**双端点**：`[llm.default]`（DeepSeek）承担文本判决面——segment 滑窗判决、帧级批量分类、轨迹打分；`[llm.vision]`（z.ai glm-5.2）承担视觉必需面——序列分类/序列标注/帧级标注/评审四阶段在 UI 模态强制 `supports_vision`（25.7 的逐阶段 vision 分列，在这里落成了「按阶段挑端点」的教学形态）。运行 `cd examples/mix && mkdir -p out && uv run labelkit run --config config.toml --project project.toml`（注意 config 在本目录，非 `../config.toml`）；同目录另有文本姊妹工程 `project-text.toml`——单端点纯 DeepSeek 的最低成本形态与文本帧路径演示，输出 `mix-text-labels.jsonl`（本节后文有其真跑节选）。以下配置与产物均摘自主工程的真实运行。
+**双粒度动机。**序列级分类、打分和标注回答「这一段是什么」；帧粒度回答各成员在其中的角色与结构化要素。`[frame.classify]` 对成员帧做批量闭集判决，`[frame.annotate]` 在序列级标注之后按帧类逐成员标注。帧产物挂在 episode 行的 `_meta.stream.members[]` 中，出现位置区分相同内容的多次出现。每次调用都保留该请求所需的完整成员证据。
+
+仓库的 `examples/mix` 同时开启两种粒度。UI 主工程包含 17 帧、三个会话子目录，第三个会话是第一个的逐字节复刻。当前配置把 UI 分段、帧分类、质量、序列分类、序列标注、帧标注与评审都交给 `vision`；stitch 的摘要卡判断可使用文本 profile。文本姊妹工程 `project-text.toml` 使用 `default`，输出 `mix-text-labels.jsonl`。
+
+运行 `cd examples/mix && mkdir -p out && uv run labelkit run --config config.toml --project project.toml`，注意使用本目录的 config。下方配置反映当前完整证据要求；后续产物和调用数字是已记录历史结果，不代表当前实现的运行成本。
 
 **配置三节**（摘自 `examples/mix/project.toml`，UI 主工程——帧类表是**屏幕类型**词表）：
 
 ```toml
 [frame.classify]                  # 帧级闭集分类（默认关；仅流模式）
 enabled = true
-llm = "default"                   # digest-only 帧级批量判决：永不入 vision 必需集——走 DeepSeek
+llm = "vision"                    # 完整成员树与图片证据
 fallback_class = "other"          # 修复穷尽/窗口失败的兜底，须 ∈ 帧类表
 
 [[frame.classify.classes]]        # 帧类表：与 [[classify.classes]] 同构，但两张表互相独立（第 24 章）
@@ -424,7 +454,7 @@ self-consistency。sequence form 则要求两个分类开关都关闭，以 `[fr
 
 **成本账两句。**帧分类住 dedup **之后**、每 episode 一次批量调用：本次真跑 3 个 episode 判重掉 1 个后只付 2 次（`frame_classify.calls=2`——s3 复刻会话一分帧分类钱都没付）；帧标注住 quality 质量门**之后**、逐成员一次调用：被淘汰的记录永不付帧标注费，按类跳过再省（本次真跑 `annotated=9`、`skipped=1`——那个 skipped 就是外卖 episode 的 transition 过渡屏；dry-run 估算行报的上界是预扫描帧总数——本工程 `frame_classify_calls=17` / `frame_annotate_calls=17`，实付 2 + 9，第 15、17 章）。审计走 trace 的 `classify.frame` / `annotate.frame` 两事件（第 16 章）；verify 手术改写成员集时帧产物随行增删（第 13 章）。
 
-**双端点成本拆分。**报告的 `llm_usage` 按 profile 分账，本次真跑恰好对半：`default`（DeepSeek）15 次调用——文本判决面（segment 3 窗滑窗判决 + 帧级批量分类 2 + 两条存活 episode 的轨迹四准则打分 8 + 打分输出的 2 次 LLM 修复环调用）；`vision`（z.ai glm-5.2）15 次调用——视觉必需面（序列分类 2 + 序列标注 2 + 逐成员帧标注 9 + 评审 2）。哪个阶段该走哪个端点、为什么这么分，`examples/mix/config.toml` 的文件头注写着完整分工表——想把帧标注也省下来的读法只有换姊妹工程（帧标注在 UI 模态无条件入视觉必需集，25.7）；帧级批量分类反过来**永不**要求 vision（digest-only 判决），把 `frame.classify.llm` 指向纯文本 profile 就是它的省钱面。
+**历史双端点成本账。**本节先前记录的 default/vision 各 15 次调用来自摘要与部分纯文本阶段的历史实现。当前 UI 配置已把所有成员证据阶段指向 vision；文本姊妹工程继续使用 default。不能把这份历史调用账当作当前成本，新运行应以对应 report 和 trace 核对。
 
 ## 25.7 常见问题
 
@@ -432,10 +462,10 @@ self-consistency。sequence form 则要求两个分类开关都关闭，以 `[fr
 
 **孤帧会话去哪了？**不会静默消失。`len(session) == 1` 的会话走 rules 退化：原样成一个单帧 episode（零 LLM 调用），**不经 min_len**——min_len 只砍「LLM 精化切出的短段」。所以帧 14 那条 `below_min_len` 的完整因果是：它在 14 帧大会话里被判 `returns_to_entry`（回到桌面开启新流程）、开了一个只有自己的新段，段长 1 < 2 才被丢（本工程开着缝合，它随后还进了救援候选池、被判 `new` 维持原判——救援候选永不开新线索，第 26 章）——假如它自成一个会话（比如配了 `gap_steps` 且序号断开），反而会原样活成 episode。
 
-**为什么 quality 不看图？**三重原因：trajectory rubric 的四条准则全是**结构性**判据（推进到终态了吗、步步承接吗、朝单一目标吗、混了无关步骤吗），动作序列 + 帧摘要足以裁决；序列打分若逐帧附图，一个 20 帧 episode × 4 准则就是 80 张图的开销；且多图请求有硬上限（见下条）。这是 vision 能力要求的显式放宽——stream（UI 模态）各阶段里 extract 恒要求 vision，annotate/verify/classify 启用时同样要看图；segment **不入视觉必需集**（v1.11）：窗口是否附图由 `segment.llm` 所指 profile 的 `supports_vision` 自动推导——支持就逐帧附图（本工程即多图窗口），不支持就纯文本摘要，原 `use_vision` 独立开关已移除；v1.12 的帧粒度双开关同款分列——`frame.annotate.llm` 在 UI 模态**恒**要求 vision（单帧截图是帧标注的主证据），`frame.classify.llm` **恒不**入视觉必需集（digest-only 批量判决，指向纯文本 profile 即省钱面）——`examples/mix` 主工程按这条分界把两个开关分别指向 z.ai 与 DeepSeek 两个端点（25.6）；quality 与 v1.9 的 stitch 判定则**恒**是纯文本（后者的证据是摘要卡，第 26 章）。
+**UI 普通流哪些阶段需要视觉？**凡实际使用成员证据的 segment、序列及帧分类、extract、quality、序列及帧标注、verify 和相关修复都保留图片证据并要求视觉 profile。stitch 的候选检索仍使用纯文本语义卡片，但卡片可装不等于合并序列可装；合并前还要预览完整下游请求。
 
-**多图上限与「帧数 × 像素」的联动是怎么回事？**Anthropic 端点对「单请求 >20 张图且任一图 >2000px」直接 400 硬拒（不是自动缩放）。两处会撞上它的配置都有 M1 启动 WARN：序列标注一请求带 ≤ `sequence_frames` 张关键帧图（默认 20，恰在界内），调到 >20 且所引 profile 的 `max_image_px > 2000` 即 WARN；v1.11 起 segment 的多图窗口有同款姊妹校验——`segment.window > 20` 且窗口附图（vision_resolved）且 `max_image_px > 2000` 同样 WARN（本工程 window=16，界内）。出路都一样：像素上限降到 2000，或把帧数/窗上限降回来；v1.11 还把「日常像素工作点」独立成键 `default_image_px`（`max_image_px` 升格为升级天花板与 provider 硬限域，第 6 章）——多图请求按工作点编码，预算与硬限都好算。降采样本身是纯整数公式（首末帧恒保留、均匀取样、零随机），成员数 ≤ sequence_frames 时全量带图。openai_compatible 一侧工具**不设独立上限**：官方口径宽松得多（1500 图/请求、512MB 载荷），但真实约束面在网关——Azure 文档写 10 图、GPT-4o 实测 20 图硬顶，vLLM/SGLang 的多模态上限随部署配置变化——静态校验必然虚警或漏警，建议对自己的端点用 `labelkit validate --probe` 加小样本试跑（`--limit`）实测确认。
+**多图请求如何控制容量？**每个相关请求保留全部所需截图，并遵守已配置的固定图片表达和实际 endpoint 限制。声明正值部署上下文，使用完整请求预检；真实长度超限沿成员边界拆分。非长度类 provider 拒绝、单最小成员或固定开销超限按原错误归属失败，不自动抽帧或降清。
 
-**什么是 hard-split（会话硬切）？**单个会话装不进一个批（会话长 > `run.batch_size`）时，M10 按批容量硬切会话并 WARN 一次，切出的帧带 `session_split` 标记（落 `_meta.stream.session_split`）——它是 verify 判「缺帧」时的降级依据（缺的帧可能在隔壁批，不是采集断档）。M1 在 `stream.session_max_len > run.batch_size` 时会提前警告这个组合。正确姿势：让 `batch_size ≥ session_max_len`，从源头避免硬切。
+**计算组结束会不会切断会话？**不会。batch_size 不再按帧数硬切会话，也没有 session_split 标记。语义会话结束或序列容量封闭才形成边界；容量封闭禁止继续缝合，并且验证不得跨边界回收帧。
 
-最后一份检查清单，开 stream 前过一遍：输入按时间序排好且（配了分区键时）按键成组；`batch_size ≥ session_max_len`；trace.channels 加了 `"segment"`（边界审计全靠它，调优期必开）；quality 不设 threshold、留给后筛；CI 的 `--strict` 策略想好了噪声帧怎么算；下游知道一行 = 一个 episode、成员溯源在 `_meta.stream.member_sources` 了吗？
+运行前确认输入顺序与分区规则、所有实际使用 profile 的正值上下文、UI 视觉能力，以及质量池按完整会话解释。输出的一行是一条最终序列，成员位置和来源分别在 member_positions 与 member_sources；状态只保留在当前进程内。

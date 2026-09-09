@@ -32,9 +32,9 @@ from labelkit.common.contracts.generation import (
 )
 from labelkit.common.errors import GenerationProjectionMismatch, InternalError, LabelKitError
 from labelkit.common.contracts.types import (
-    Annotation, Classification, DedupInfo, ImageRef, PipelineItem, QualityScore,
+    Annotation, CapacityCut, Classification, DedupInfo, ImageRef, PipelineItem, QualityScore,
     Record, RecordRef, StageError, Transition, UINode, UITree, Usage,
-    VerificationResult,
+    VerificationResult, SequenceBounds, SequenceCapacity,
 )
 
 USER_SCHEMA = {
@@ -493,18 +493,19 @@ def test_meta_stream_episode_full_structure_text(tmp_path):
     stream = meta["stream"]
     # v1.12 锚：帧粒度全关 ⇒ 无 members 键，键序与 v1.11 字节等价
     assert list(stream) == ["episode_id", "session_id", "order_span",
-                            "member_count", "member_ids", "member_sources",
-                            "session_split", "repaired", "degraded", "steps"]
+                            "member_count", "member_ids", "member_positions", "member_sources",
+                            "capacity", "repaired", "degraded", "steps"]
     assert stream == {
         "episode_id": "e" * 16,
         "session_id": "ime-log/0",
         "order_span": ["ime-2026-06.jsonl:3", "ime-2026-06.jsonl:8"],
         "member_count": 3,
         "member_ids": ["1" * 16, "2" * 16, "3" * 16],
+        "member_positions": [],
         "member_sources": [{"file": "ime-2026-06.jsonl", "line_no": 3},
                            {"file": "ime-2026-06.jsonl", "line_no": 5},
                            {"file": "ime-2026-06.jsonl", "line_no": 8}],
-        "session_split": False,
+        "capacity": None,
         "repaired": False,
         "degraded": None,
         "steps": None,
@@ -522,7 +523,8 @@ def test_meta_stream_ui_order_span_marks_and_steps(tmp_path):
                make_ui_record("2" * 16, pair_index=5, source_file="b/uitree_5.jsonl")]
     item = make_item(record=make_seq_record(members, rec_id="f" * 16))
     item.session_id = "capture/0"
-    item.session_split = True
+    item.capacity = SequenceCapacity(SequenceBounds(0, 2), sealed=True, root_id=item.record.id)
+    item.member_positions = (0, 1)
     item.stream_repaired = True
     item.segment_degraded = {"kind": "segmentation_invalid", "windows_failed": 1}
     item.transitions = (
@@ -541,7 +543,9 @@ def test_meta_stream_ui_order_span_marks_and_steps(tmp_path):
                                         {"file": "b/uitree_5.jsonl", "pair_index": 5}]
     for entry in stream["member_sources"]:          # exactly one of the two keys
         assert set(entry) & {"line_no", "pair_index"} == {"pair_index"}
-    assert stream["session_split"] is True
+    assert "session_split" not in stream
+    assert stream["capacity"] == {"sealed": True, "allowed_positions": [0, 2], "before": None,
+                                  "after": None, "root_id": item.record.id, "parent_id": None}
     assert stream["repaired"] is True
     assert stream["degraded"] == {"kind": "segmentation_invalid", "windows_failed": 1}
     assert stream["steps"] == [{"index": 0, "action_type": "click", "target": "登录",
@@ -608,8 +612,8 @@ def test_meta_stream_stitch_keys_present_only_when_enabled(tmp_path):
     stream = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"]
     # v1.12 锚：帧粒度全关 ⇒ 无 members 键（v1.9 stitch 键序不变）
     assert list(stream) == ["episode_id", "thread_id", "session_id",
-                            "order_span", "member_count", "member_ids",
-                            "member_sources", "session_split", "repaired",
+                            "order_span", "member_count", "member_ids", "member_positions",
+                            "member_sources", "capacity", "repaired",
                             "degraded", "fragments", "steps"]
     assert stream["thread_id"] == "e" * 16             # == episode_id (T22)
     assert stream["fragments"] == [dict(f) for f in item.stitch_fragments]
@@ -627,8 +631,8 @@ def test_meta_stream_stitch_keys_present_only_when_enabled(tmp_path):
     run_emitter(cfg_off, [item_off])
     stream_off = read_jsonl(out2)[0]["_meta"]["stream"]
     assert list(stream_off) == ["episode_id", "session_id", "order_span",
-                                "member_count", "member_ids", "member_sources",
-                                "session_split", "repaired", "degraded", "steps"]
+                                "member_count", "member_ids", "member_positions", "member_sources",
+                                "capacity", "repaired", "degraded", "steps"]
     assert all("resumed" not in row for row in stream_off["steps"])
 
 
@@ -661,9 +665,9 @@ def test_meta_stream_members_block_shape_and_frozen_position(tmp_path):
 
     stream = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"]
     assert list(stream) == ["episode_id", "session_id", "order_span",
-                            "member_count", "member_ids", "member_sources",
+                            "member_count", "member_ids", "member_positions", "member_sources",
                             "members",
-                            "session_split", "repaired", "degraded", "steps"]
+                            "capacity", "repaired", "degraded", "steps"]
     assert stream["members"] == [
         {"index": 0, "id": "1" * 16, "label": "task_request",
          "annotation": {"intent": "book_train", "entities": ["上海"]},
@@ -727,9 +731,9 @@ def test_members_position_frozen_with_stitch_keys(tmp_path):
     run_emitter(cfg, [item])
     stream = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"]
     assert list(stream) == ["episode_id", "thread_id", "session_id",
-                            "order_span", "member_count", "member_ids",
+                            "order_span", "member_count", "member_ids", "member_positions",
                             "member_sources", "members",
-                            "session_split", "repaired", "degraded",
+                            "capacity", "repaired", "degraded",
                             "fragments", "steps"]
 
 
@@ -843,8 +847,8 @@ def test_frame_all_off_stream_block_byte_equivalent_and_no_counting(tmp_path):
     stream = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"]
     assert "members" not in stream
     assert list(stream) == ["episode_id", "session_id", "order_span",
-                            "member_count", "member_ids", "member_sources",
-                            "session_split", "repaired", "degraded", "steps"]
+                            "member_count", "member_ids", "member_positions", "member_sources",
+                            "capacity", "repaired", "degraded", "steps"]
     assert metrics.counters == {}              # active 行永不计 discarded
 
 

@@ -61,11 +61,15 @@ from labelkit.common.errors import (
     SchemaViolation,
 )
 from labelkit.common.inference.schema_engine import stitch_schema
+from labelkit.common.contracts.stage import RunContext
+from labelkit.common.contracts.sequence_capacity import process_sequence_id, SessionAttemptScope
 from labelkit.common.contracts.types import (
     ImageRef,
     PipelineItem,
     Record,
     RecordRef,
+    SequenceBounds,
+    SequenceCapacity,
     Transition,
     UINode,
     UITree,
@@ -140,23 +144,24 @@ def ui_frame(rid: str, pair_index: int, *, app="com.food", activity=None,
 
 
 def envelope(record: Record, sid="s1", status="active") -> PipelineItem:
-    return PipelineItem(record=record, status=status, session_id=sid)
+    return PipelineItem(record=record, status=status, session_id=sid, session_position=record.ref.pair_index)
 
 
 def episode_of(frame_items: list[PipelineItem], sid="s1") -> PipelineItem:
     """Segment-shaped episode envelope: members = the frames' records (S24 id
     rule), member envelopes absorbed — the M14 _emit_episode mirror."""
     records = tuple(it.record for it in frame_items)
-    joined = "\n".join(r.id for r in records)
+    positions = tuple(item.session_position for item in frame_items)
     first = records[0]
-    rec = Record(id=hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16],
+    rec = Record(id=process_sequence_id(sid, positions, tuple(record.id for record in records)),
                  modality="ui", text=None, raw=None, ui_tree=None, image=None,
                  ref=RecordRef(first.ref.source_file, None,
                                first.ref.pair_index, ()),
                  kind="sequence", members=records)
     for it in frame_items:
         it.status = "absorbed"
-    return PipelineItem(record=rec, session_id=sid)
+    return PipelineItem(record=rec, session_id=sid, member_positions=positions,
+                        capacity=SequenceCapacity(SequenceBounds(0, 10000)))
 
 
 def short_run(frame_items: list[PipelineItem]) -> None:
@@ -181,10 +186,12 @@ class QueueEngine:
     def __init__(self, outcomes):
         self.outcomes = list(outcomes)
         self.calls: list = []              # (profile, prompt, schema, record_ids)
+        self.scopes = []
 
     async def complete_validated(self, profile, prompt, schema=None, *, scope):
         record_ids = scope.record_ids
         self.calls.append((profile, prompt, schema, record_ids))
+        self.scopes.append(scope)
         out = self.outcomes.pop(0)
         if isinstance(out, Exception):
             raise out
@@ -261,10 +268,11 @@ class RecordingMetrics:
 
 
 def make_ctx(cfg, engine):
-    return SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
+    return RunContext(cfg=cfg, llm=None, schema_engine=engine,
                            metrics=RecordingMetrics(), tasks=TaskRunner(),
                            task_namespace="run:batch:1:stage:stitch",
-                           rng=None, batch_no=1)
+                           session_attempt=SessionAttemptScope("s1", 1, 0, "stitch"),
+                           rng=None, batch_no=1, capacity_checker=SimpleNamespace(preview=lambda item, ctx: None))
 
 
 def run_stage(cfg, batch, engine):
@@ -1038,6 +1046,7 @@ def test_votes_three_samples_strict_majority_drives_merge():
     assert len(engine.calls) == 6                      # 2 judgments × 3 samples
     assert ep_c.status == "stitched"
     assert ctx.metrics.counters["stitch.judgments"] == 2
+    assert len(engine.scopes) == 6 and all(scope.complete_evidence for scope in engine.scopes)
 
 
 def test_votes_split_falls_back_conservatively():
@@ -1073,10 +1082,8 @@ def test_stage_untouched_when_disabled_and_factory_gating():
                                                   "quality", "annotate"]
 
 
-def test_off_meta_stream_is_byte_shape_identical_to_v18(tmp_path):
-    """m-11 anchor: with stitch disabled the _meta.stream key set (and step
-    rows) is EXACTLY the v1.8 shape — no thread_id/fragments/resumed anywhere;
-    enabling stitch adds exactly those three."""
+def test_stitch_off_retains_common_stream_capacity_shape(tmp_path):
+    """缝合开关只决定线索字段；公共容量和出现位置字段恒在。"""
     from labelkit.operators.emitter import Emitter
 
     def emitter_for(cfg):
@@ -1094,14 +1101,14 @@ def test_off_meta_stream_is_byte_shape_identical_to_v18(tmp_path):
     stream_off = emitter_for(off_cfg)._stream_block(ep)
     assert set(stream_off) == {"episode_id", "session_id", "order_span",
                                "member_count", "member_ids", "member_sources",
-                               "session_split", "repaired", "degraded", "steps"}
+                               "member_positions", "capacity", "repaired", "degraded", "steps"}
     assert all("resumed" not in row for row in stream_off["steps"])
 
     on_cfg = make_cfg(output=str(tmp_path / "o2.jsonl"))
     ep.thread_id = ep.record.id
     ep.stitch_fragments = ({"order_span": [0, 1], "member_count": 2,
                             "cause": "origin",
-                            "source_episode": ep.record.id},)
+                            "source_episode": ep.record.id, "member_positions": [0, 1]},)
     stream_on = emitter_for(on_cfg)._stream_block(ep)
     assert set(stream_on) == set(stream_off) | {"thread_id", "fragments"}
     assert stream_on["thread_id"] == ep.record.id
@@ -1349,10 +1356,10 @@ def test_reactive_400_terminal_feeds_breaker_once_keep_path():
     ep = episode_of(frames, sid)
     engine = QueueEngine([ContextOverflowError("sniff", phase="reactive")])
     cfg = make_cfg(on_error="keep", repass=False)
-    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
+    ctx = RunContext(cfg=cfg, llm=None, schema_engine=engine,
                           metrics=FeedMetrics(), tasks=TaskRunner(),
                           task_namespace="run:batch:1:stage:stitch",
-                          rng=None, batch_no=1)
+                          rng=None, batch_no=1, capacity_checker=SimpleNamespace(preview=lambda item, ctx: None))
     asyncio.run(StitchStage(cfg).run([*frames, ep], ctx))
     assert ctx.metrics.fed == [True]                   # A7: exactly once
 
@@ -1386,10 +1393,10 @@ def _repass_failure_run(exc, *, cfg=None):
         # pass 2（候选按碎片会话序 A1 → B → A2）：A1 的判决失败，其余判 new
         exc, obj("new", task="打车"), obj("new", task="点外卖收尾"),
     ])
-    ctx = SimpleNamespace(cfg=cfg, llm=None, schema_engine=engine,
+    ctx = RunContext(cfg=cfg, llm=None, schema_engine=engine,
                           metrics=_FeedMetrics(), tasks=TaskRunner(),
                           task_namespace="run:batch:1:stage:stitch",
-                          rng=None, batch_no=1)
+                          rng=None, batch_no=1, capacity_checker=SimpleNamespace(preview=lambda item, ctx: None))
     out = asyncio.run(StitchStage(cfg).run(batch, ctx))
     assert out is batch                                # 契约②c：同一列表对象
     return a1, b, a2, engine, ctx
@@ -1459,3 +1466,147 @@ def test_repass_failure_under_on_error_fail_still_keeps_the_candidate():
         SchemaViolation(["/verdict"], "{}"), cfg=make_cfg(on_error="fail"))
     assert a1.status == "active" and a1.errors == []
     assert ctx.metrics.counters["stitch.failures"] == 1
+
+
+def capacity_run(groups, outcomes, max_members, *, repass=True, rescue=()):
+    """完整会话语义夹具；容量由纯成员装箱规则决定。"""
+    from test_segment import MemberCapacity
+    size = 1 + max(position for group in [*groups, rescue] for position in group)
+    frames = [envelope(ui_frame(f"f{i}", i)) for i in range(size)]
+    for frame in frames:
+        frame.status = "dropped_noise"
+        frame.noise_attribution = ("segment", "noise")
+    episodes = [episode_of([frames[position] for position in group]) for group in groups]
+    short_run([frames[position] for position in rescue])
+    cfg = make_cfg(bias="llm", repass=repass)
+    engine = QueueEngine(outcomes)
+    ctx = make_ctx(cfg, engine)
+    ctx.capacity_checker = MemberCapacity(max_members)
+    batch = [*frames, *episodes]
+    asyncio.run(StitchStage(cfg).run(batch, ctx))
+    return episodes, frames, ctx, engine
+
+
+def test_capacity_pass_one_failure_seals_target_and_preserves_candidate():
+    episodes, frames, ctx, engine = capacity_run([(0, 1), (2, 3)], [obj(), obj("resume", 1)], 2)
+    left, right = episodes
+    assert [item.member_positions for item in episodes] == [(0, 1), (2, 3)]
+    assert [item.status for item in episodes] == ["active", "active"]
+    assert left.capacity.sealed and not right.capacity.sealed
+    assert left.capacity.bounds.upper == right.capacity.bounds.lower == 2
+    assert left.capacity.bounds.after == right.capacity.bounds.before
+    assert [frame.status for frame in frames] == ["absorbed"] * 4
+    assert ctx.metrics.counters["capacity.sealed"] == 1
+    assert len(engine.calls) == 2
+
+
+def test_capacity_rescue_failure_seals_target_and_keeps_dropped_short_frames():
+    episodes, frames, ctx, engine = capacity_run([(0, 1)], [obj(), obj("resume", 1)], 2, rescue=(2,))
+    assert len(episodes) == 1 and episodes[0].member_positions == (0, 1)
+    assert episodes[0].capacity.sealed and episodes[0].capacity.bounds.upper == 2
+    assert frames[2].status == "dropped_noise"
+    assert frames[2].noise_attribution == ("segment", "below_min_len")
+    assert "stitch.rescued_short" not in ctx.metrics.counters
+    assert len(engine.calls) == 2
+
+
+def test_capacity_repass_failure_seals_earliest_candidate_even_when_target_is_later():
+    episodes, frames, ctx, engine = capacity_run(
+        [(0, 1), (2, 3)], [obj(), obj(), obj("resume", 1)], 2)
+    assert [item.status for item in episodes] == ["active", "active"]
+    assert [item.capacity.sealed for item in episodes] == [True, False]
+    assert episodes[0].capacity.bounds.after == episodes[1].capacity.bounds.before
+    assert [frame.status for frame in frames] == ["absorbed"] * 4
+    assert ctx.metrics.counters["stitch.repass_judgments"] == 1
+    assert len(engine.calls) == 3
+
+
+def test_capacity_repass_interleaved_members_seal_without_false_linear_cut():
+    episodes, _, ctx, engine = capacity_run([(0, 8), (4, 6)], [obj(), obj(), obj("resume", 1)], 2)
+    older, later = episodes
+    assert older.member_positions == (0, 8) and later.member_positions == (4, 6)
+    assert older.capacity.sealed and not later.capacity.sealed
+    assert older.capacity.bounds == later.capacity.bounds == SequenceBounds(0, 10000)
+    event = next(event[3] for event in ctx.metrics.events if event[0] == "sequence.capacity")
+    assert event["member_positions"] == [0, 8] and event["following_positions"] == [4, 6]
+    assert len(engine.calls) == 3
+
+
+def test_initial_sealed_episode_never_enters_judgment_or_repass_pool():
+    import dataclasses
+    frames = [envelope(ui_frame(f"f{i}", i)) for i in range(4)]
+    left, right = episode_of(frames[:2]), episode_of(frames[2:])
+    left.capacity = dataclasses.replace(left.capacity, sealed=True)
+    cfg = make_cfg(bias="llm")
+    engine = QueueEngine([obj()])
+    _, ctx = run_stage(cfg, [*frames, left, right], engine)
+    assert len(engine.calls) == 1 and pool_card_count(engine.calls[0][1]) == 0
+    assert left.thread_id == left.record.id
+    assert left.status == right.status == "active"
+    assert "stitch.repass_judgments" not in ctx.metrics.counters
+
+
+@pytest.mark.parametrize("sealed_side", ["target", "candidate"])
+def test_both_sealed_sides_block_preview_and_commit(sealed_side):
+    import dataclasses
+    from labelkit.common.errors import InternalError
+    frames = [envelope(ui_frame(f"f{i}", i)) for i in range(4)]
+    left, right = episode_of(frames[:2]), episode_of(frames[2:])
+    cfg = make_cfg(repass=False)
+    stage = StitchStage(cfg)
+    work = stage._session_work((0, "s1"), frames, [left, right], make_ctx(cfg, ExplodingEngine()))
+    stage._open_thread(work.state, work.candidates[0], "task", 0)
+    item = left if sealed_side == "target" else right
+    item.capacity = dataclasses.replace(item.capacity, sealed=True)
+    assert stage._merge_preview(work.state, work.state.threads[0], work.candidates[1]) is None
+    with pytest.raises(InternalError, match="sealed or occurrence bounds"):
+        stage._rebind(work.state, work.state.threads[0], work.candidates[1])
+    assert left.member_positions == (0, 1) and right.member_positions == (2, 3)
+
+
+def test_capacity_bounds_filter_incompatible_targets_before_judgment():
+    frames = [envelope(ui_frame(f"f{i}", i)) for i in range(4)]
+    left, right = episode_of(frames[:2]), episode_of(frames[2:])
+    left.capacity = SequenceCapacity(SequenceBounds(0, 2))
+    right.capacity = SequenceCapacity(SequenceBounds(2, 4))
+    engine = QueueEngine([obj(), obj()])
+    run_stage(make_cfg(bias="llm"), [*frames, left, right], engine)
+    assert [pool_card_count(call[1]) for call in engine.calls] == [0, 0]
+    assert left.member_positions == (0, 1) and right.member_positions == (2, 3)
+
+
+def test_successful_merge_inherits_intersection_without_mutating_content_identity():
+    frames = [envelope(ui_frame(f"f{i}", i)) for i in range(8)]
+    left, right = episode_of([frames[1], frames[3]]), episode_of(frames[4:6])
+    left.capacity = SequenceCapacity(SequenceBounds(0, 8))
+    right.capacity = SequenceCapacity(SequenceBounds(1, 7))
+    original_id = left.record.id
+    run_stage(make_cfg(bias="llm", repass=False), [*frames, left, right], QueueEngine([obj(), obj("resume", 1)]))
+    assert left.member_positions == (1, 3, 4, 5)
+    assert left.capacity.bounds == SequenceBounds(1, 7)
+    assert left.record.id == original_id and right.status == "stitched"
+
+
+def test_repeated_content_keeps_distinct_occurrences_and_projectable_interleaved_fragments():
+    frames = [envelope(ui_frame("same-content-id", i)) for i in range(4)]
+    left, right = episode_of([frames[0], frames[2]]), episode_of([frames[1], frames[3]])
+    run_stage(make_cfg(bias="llm", repass=False), [*frames, left, right], QueueEngine([obj(), obj("resume", 1)]))
+    assert left.member_positions == (0, 1, 2, 3) and len(left.record.members) == 4
+    assert [fragment["member_positions"] for fragment in left.stitch_fragments] == [[0, 2], [1, 3]]
+    assert list(left.stitch_fragments[0]) == ["order_span", "member_count", "cause", "source_episode", "member_positions"]
+    assert left.seam_indexes == ()
+
+
+@pytest.mark.parametrize("batch_size", [1, 2, 100])
+def test_vote_groups_limit_leaf_tasks_without_changing_stitch_decision(batch_size):
+    import dataclasses
+    cfg = make_cfg(votes=3, bias="llm", repass=False)
+    cfg = dataclasses.replace(cfg, run=dataclasses.replace(cfg.run, batch_size=batch_size))
+    frames = [envelope(ui_frame(f"f{i}", i)) for i in range(4)]
+    left, right = episode_of(frames[:2]), episode_of(frames[2:])
+    engine = QueueEngine([obj()] * 3 + [obj("resume", 1)] * 3)
+    _, ctx = run_stage(cfg, [*frames, left, right], engine)
+    assert left.member_positions == (0, 1, 2, 3) and right.status == "stitched"
+    assert [len(request.tasks) for request in ctx.tasks.requests] == (
+        [1] * 6 if batch_size == 1 else [2, 1, 2, 1] if batch_size == 2 else [3, 3])
+    assert ctx.metrics.counters["stitch.judgments"] == 2

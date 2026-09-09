@@ -13,7 +13,7 @@
 | 术语 | 定义 |
 |---|---|
 | 记录（Record） | 流水线处理的最小数据单元。文本模态下为输入 JSONL 的一行；UI 模态下为一个「UI 树文件 + 截图文件」对。 |
-| 批（Batch） | 一次流水线调度处理的记录集合，大小由 `run.batch_size` 决定；也是 QuRating 成对比较的采样池。 |
+| 批（Batch） | 普通记录按 run.batch_size 组成流水线批及 QuRating 池；process stream 以完整会话作为语义和比较范围，batch_size 只限制固定判决轮计算组中的叶任务数。 |
 | 运行（Run） | 一次 `labelkit run` 进程的完整生命周期，处理一个输入路径的全部记录。 |
 | Rubric | 质量评价准则集：若干条 criterion（准则），每条含 key、权重、描述、成对比较提示词与单点打分等级说明。 |
 | QuRating | Wettig et al., ICML 2024 提出的数据质量评估算法：LLM 成对比较 + Bradley-Terry 模型拟合标量质量分 [1]。 |
@@ -25,7 +25,7 @@
 | UI 树 | 设备屏幕的控件层级结构（accessibility tree / view hierarchy）导出文件，JSONL 格式，每行一个控件节点。 |
 | 纯生成模式 | `run.mode = "generate_only"`（v1.4）：无输入数据，M6 从配置种子池（`generate.seed_examples`）或无种子条件化提示从零产出样本，再走常规治理 / 标注管线（3.6.2、3.10.3）。默认模式为 `"process"`（加工既有数据）。 |
 | Episode（序列记录 / 情节） | stream 模式的复合记录（v1.8）：M14 把同一目标导向活动的成员帧按序键收拢为一条 `kind = "sequence"` 的序列 Record（成员经 `members` 元组引用共享持有），作为一条普通记录走下游分类、打分、标注与评审（3.14、4.1）。 |
-| 会话（Session） | 摄取层按 `[stream]` 规则（时间间隙 gap / 分区键 key / 长度与时长上限）从有序记录流切出的候选窗口——流处理标准的 session window 原语的对应物 [55]；是 M14 语义精化的输入单元，切批改整会话装箱保证会话不跨批（3.2.8、3.10.3）。 |
+| 会话（Session） | 摄取按时间间隔、分区键、长度与时长上限从固定输入文件组产生的有限记录序列。它是 process stream 的语义、状态寿命和提交单元，可以跨任意多个计算组。 |
 | 转移（Transition） | 序列内相邻两帧 ⟨s_i, s_{i+1}⟩ 之间发生的单个语义动作：M15 经 LLM 推断为结构化对象 {action_type, target, value, description} 写入 `item.transitions`，转移数 = 成员数 − 1（3.15、4.1）。 |
 | stream 模式 | `segment.enabled = true` 的运行形态（v1.8）：摄取按 `[stream]` 声明排序与会话化，链序为 segment → stitch → dedup → classify → extract → quality → annotate → verify（stitch 为 v1.9 增位，默认关）；默认关闭，关闭时数据产出与 v1.7 逐字段一致（`_meta.stream: null` 除外）（2.3.1、3.10.3）。 |
 | 线索（Thread） | v1.9 stream 模式的顶层工作单元：M16 把同一目标导向任务被穿插切开的碎片保守缝合所得（三级结构 thread ⊃ fragment ⊃ step），承载体仍是一条 `kind = "sequence"` 的序列记录（幸存信封 Record 重绑、id 不重算，`thread_id` = 幸存信封 record.id），作为一条普通记录走下游判重、分类、打分、标注与评审（3.16、4.1）。未被缝合的 episode 即单碎片线索；`stitch.enabled = false` 时线索与 episode 天然同值。 |
@@ -129,7 +129,7 @@
 | 定位与描述分立（v1.8） | segment（时序定位/分段）与 annotate（描述/打标）拆成两个工序 | Vid2Seq, CVPR 2023 [52]——取用：dense video captioning 的「先 temporal localization 再 captioning」两段式先例 |
 | 宁滥勿缺 + 后段精化（v1.8） | 批内不删元素、噪声帧只改状态；verify 复裁可回收（软排除而非硬删，②b） | BSN, ECCV 2018；Soft-NMS, ICCV 2017 [53]——取用：时序候选「宁滥勿缺 + 后段精化/软排除」范式对应「只改状态不删元素 + 成员回收」的谱系定位 |
 | 边界余量证据（v1.8） | verify 评审证据含段边界外前后 k=2 帧的摘要及其去向（`[边界余量]` 段，3.7.2） | 语音端点检测 hangover 惯例（ITU-T G.729 Annex B VAD / WebRTC VAD）[54]——取用：防切头切尾的工业标准手法移植为评审证据段，零额外 LLM 调用 |
-| 多图请求上限（v1.8） | `annotate.sequence_frames ∈ [2,100]`、默认 20；>20 联动 `max_image_px > 2000` 警告（3.1.4） | Anthropic Vision API 文档 [56]——取用：100 图/请求、>20 图单图任一边 >2000px 为 400 硬拒（非缩放）、32MB/请求；OpenAI 1500 图/512MB 故不设独立上限 |
+| 完整序列的多图请求 | process stream 保留全部成员图像及完整树，不设抽帧开关；使用 profile 固定部署尺寸、完整上下文预算和端点错误分类 | provider 请求图片数量、单图尺寸和请求字节限制仍是各自独立约束；非上下文错误不能误判为容量分区信号。 |
 | 整段单调用对照形态（v1.8） | v1 保留 hybrid 滑窗——window ≥ 会话长时天然退化为整段单调用，长会话建议调大 window | GUIDE [57]——取用：GUI 域验证最充分的 LLM 分段形态是纯文本动作序列整段一次调用（99.4% 段可用率、50–80 步无衰减）；其整体式 judge 随轨迹变长退化的数据（>20 步降信任）入手册调优指引 |
 | extract 可靠性预算（v1.8） | 风险面明写每步 zero-shot 错误率 20–30% 的级联；缓解 = 树 diff 证据 + verify 缺陷路由 + quality 结构分 + `extract.by_type` 分布可观测 | Watch & Learn, CVPR 2026 [58]——取用：zero-shot MLLM 动作标注 **70.5%** vs 专训 IDM 91.7% 的直接对照钉死可靠性预算；「噪声标注主动伤害下游」佐证 fail-closed 质量门 |
 | diff 注入可消融（v1.8） | `extract.include_diff` 开关（默认开，可关做 A/B 对比） | Sharingan [59]——取用：像素 diff 显式注入实测负结果、按动作类型精度极不均衡（click 0.94 / drag 0.40）——结构化树 diff ≠ 像素 diff 且工程实践正面，但**方向未定** ⇒ 做成开关而非硬编码正收益 |
@@ -149,7 +149,7 @@
 | 线索命名后置（v1.9） | `task_name` 由池空判定自举、滚动更新（工具内部结构，进 trace 与判定证据；用户任务标签仍由 annotate 产出） | OS-Genesis [41] / NNetNav [70]——取用：自然流 → 事后反推任务标注范式；「可命名性」剪枝判据 |
 | 问题域现状与护栏（v1.9） | interleaved 解缠无域内基线：护栏 = 保守合取 + 二遍复评 + 负样本协议 + 真机门禁（错缝 FPS = 0 验收线） | Robotic Process Mining [67]——取用：UI 日志 interleaved 解缠 = open challenge、全局法依赖「例程重复」前提（2025 复核不变 [85]）；学术解缠系列与三家产品均无穿插解缠 + 通信类 App 天然噪声名单 [68]；跨 App 单目标轨迹形态 [46] |
 | 上下文预算：窗口声明与预算公式（v1.11） | `[llm.<name>]` / `[embedding.<name>]` 用户声明 `context_window`（0 = 未声明 = 该 profile 预算关闭）；`input_budget = context_window − max_output_tokens − margin`，`margin = max(256, ceil(0.10 × context_window))`（3.9） | LlamaIndex PromptHelper [91]——取用：`context_window − prompt − num_output` 预算式与 repack 装填；Claude Code auto-compact [92]——取用：`contextWindow − min(maxOut, 20k) − 13k` 的「预留输出 + 固定 buffer」结构（各来源触发百分比不一、结构一致）；OpenAI Codex CLI [93]——取用：`model_context_window` 用户声明 + 钳制 + 输出预留 + 比例边距的完整同构 |
-| 条数上限 + 预算动态装填（v1.11） | 条数型参数（`segment.window` / `annotate.sequence_frames` / `generate.seeds_per_call`）降级为**上限值**，按逐项实际 est 贪心装填；调用次数以静态最坏值 w_min 报上界（3.9、3.14、V9/V12） | Qwen-VL 官方评测口径 [94]——取用：帧数上限 × 总 token 预算双约束、`max_pixels = 预算 // 帧数`（帧数是上限、预算守恒）；NeMo Curator Nemotron-CC DocumentJoiner [95]——取用：按 `max_segment_tokens` 的 token 装填（"maximize input utilization"）是数据管线同类算子 |
+| 完整证据与预算装填 | segment.window 限制上游相邻边界判决窗口，下游一次请求包含完整 episode；初始容量贪心分区、后续真实超限永久切点和有限会话重算。generate.seeds_per_call 保留独立生成协议 | 借鉴成熟请求预算装填，完整请求扣除输出预算及估算余量；完整证据不能通过抽帧或截字降低容量。 |
 | 图片成本测量-反应式三层（v1.11） | 先验装填（provider 公式仅作首批先验）→ 溢出裁帧保清重试 → `usage.prompt_tokens` 在线校准（窗口化 max 滤波 + 0.85 安全系数、批冻结快照）（3.9、V17–V20） | ABR / 拥塞控制 measure-don't-model 范式 [96]——取用：BBA 纯缓冲选档（稳态不需容量估计、启动期必须要）与 BBR windowed-max 测量式建模取代丢包反应——校准器滤波蓝本；Cline [97]——取用：生产级上下文管理刻意反应式（"accurate token counting varies by model/tokenizer"）+ 企业网关 `usage: null` 实证（缺样本兜底的依据） |
 | 判审触发裁帧升清重试（v1.11） | `verify` fail ∧ policy="repair" 的修复重标注换档：关键帧减半 + 分辨率上探一档（≤ `max_image_px`），单向有界（3.5.2、3.7.3、V21） | 置信度触发递归变焦谱系 [98]——取用：Zoom Eye 置信分驱动图像树递归变焦（训练无关）、V*/SEAL 置信度低于阈值即递归切 patch 搜索（7B+搜索 75.4% vs GPT-4V 55.0%）、UI-Zoomer 置信门控变焦（GUI grounding +4.2–13.4%）——「低置信 → 定向升清重试」的学术与 GUI 域背书 |
 | 精确模式与反事实耦合（v1.18） | 命名 pattern 直接声明完整 role/order/gap/max-span；每个 set 先生成完整 positive baseline，missing/reordered/interval-exceeded 只变换一个目标约束并从 divergence role 起重规划 causal suffix，protected prefix 逐字段机械相同（3.6） | LTLf/DECLARE 有限迹语义 [110][111] 为有限序列约束提供依据；反事实数据的同源干预纪律由结构因果模型的干预/保持非目标机制原则支持 |
@@ -201,14 +201,14 @@
 - S18 stream 模式 `counts.unprocessed` 出现条件扩为「熔断 ∨ 中断」；守恒式两侧同步扩展（6.4）。
 - S19 单调性游标按分区键各自维护（groupby 语义、键变即断、输入须按键成组）；UI 模态增分区键来源 `"source_dir"`（3.2.8）。
 - S20 时间戳解析规格：数值 <1e11 判秒、[1e11, 1e14) 判毫秒、界外解析失败；字符串先试数值再试 `fromisoformat`；失败与乱序同走 `stream.on_disorder`（6.1）。
-- S21 整会话装箱用 next-fit（顺序装箱、仅一只开口箱）；单会话超 batch_size 硬切 + WARN + `session_split` 标（3.10.3）。
+- 完整会话是 process stream 语义、质量比较及提交单元；batch_size 只限制固定判决轮的计算组叶任务数，不按帧数切会话。
 - S22 dry-run 估算公式修正：`segment_calls = Σ ceil((L−1)/(window−1))`；`extract_calls = Σ(L−1)` 报上界；quality/annotate/verify 以 episodes ≈ sessions 报下界（3.10.3）。
 - S23 文本模态 dry-run 单遍融合：一次读同时产出行数与会话空跑结果（3.2.8）。
 - S24 序列 Record 的 ref 继承首成员 line_no（文本）/ pair_index（UI）；完整成员溯源由 `_meta.stream.member_sources` 承担（4.1）。
 - S25 rejects full 档序列载荷 = `{"kind":"sequence","member_ids":[...],"member_sources":[...]}`（3.11.2）。
 - S26 `segment.on_error = "keep"` 留痕三件套（`_meta.stream.degraded` + error 事件 + 计数器），不写 `item.errors`（防归因污染，3.14）。
 - S27 trace 脱敏：新 `_DATA_KEYS = {"target","value"}` none/refs 档剥除；`"description"` 入自由文本键集（7.4）。
-- S28 `2 ≤ annotate.sequence_frames ≤ 100`；>20 且引用 profile `max_image_px > 2000` ⇒ WARN（Anthropic many-image 硬拒 [56]）；降采样纯整数公式、首末帧恒含（3.5.2）。
+- process stream 标注和复审保留全部成员文本、树、图像与动作；初始分区封闭已被后段接替的前段，容量边界禁止重新缝合或跨界回收。
 - S29 stream 模式下 `quality.rubric == ""` 解析为 `"default:trajectory"`（两模态一致；显式选择器恒优先；rubric 文本模态中立，附录 A.3）。
 - S30 profile 引用集四处：`segment.llm` 仅 `strategy ∈ {llm, hybrid}` 时计入；`extract.llm` 恒入且恒入 vision_users；stream 模式下 quality 的 supports_vision 强制校验放宽（序列打分纯文本，3.1.4）。
 - S31 verify 收缩弃帧 rejects 行 stage = "verify"、reason = "off_task_member"；计数器 `membership_repairs` / `boundary_flags` / `defects.<kind>` 入 report.stream.verify；transitions 手术后重编号 + `reseamed` 溯源标（3.7.3、6.4）。

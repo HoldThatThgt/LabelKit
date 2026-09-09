@@ -469,7 +469,7 @@ class TestInternalSchemas:
 
     def test_defect_verdict_schema_shape(self):
         # v1.8 M7 stream variant (S7): all three top keys required; defect
-        # members is a nullable STRING array; critiques byte-identical to
+        # members 使用可空的会话位置整数数组；critiques 保留原形态。
         # VERDICT_SCHEMA's (the feed-back/merge chain consumes them unchanged).
         # v1.9 (T15): six kinds — wrong_stitch appended.
         s = defect_verdict_schema()
@@ -484,7 +484,7 @@ class TestInternalSchemas:
             "label_mismatch", "off_task_members", "missing_head",
             "missing_tail", "missing_members", "wrong_stitch"]
         assert defect["properties"]["members"] == {"type": ["array", "null"],
-                                                   "items": {"type": "string"}}
+                                                   "items": {"type": "integer", "minimum": 0}}
         assert defect["properties"]["position"]["type"] == ["string", "null"]
         assert s["properties"]["verdict"]["enum"] == ["pass", "fail"]
         assert "uniqueItems" not in _all_dict_keys(s)
@@ -495,11 +495,14 @@ class TestInternalSchemas:
                            "verdict": "fail"})
         assert v.is_valid({"critiques": [], "defects": [], "verdict": "pass"})
         assert not v.is_valid({"critiques": [], "verdict": "pass"})  # defects required
-        assert not v.is_valid({"critiques": [],
+        assert v.is_valid({"critiques": [],
                                "defects": [{"kind": "off_task_members",
                                             "members": [123], "position": None,
                                             "detail": "d"}],
-                               "verdict": "fail"})       # members items are strings
+                               "verdict": "fail"})
+        for invalid in ("123", -1, True):
+            assert not v.is_valid({"critiques": [], "defects": [{"kind": "off_task_members",
+                "members": [invalid], "position": None, "detail": "d"}], "verdict": "fail"})
 
     def test_stitch_schema_shape(self):
         # v1.9 M16 (spec 3.16 / §10.7): all five keys required; thread_ref is a
@@ -967,6 +970,67 @@ def test_l3_repair_overflow_short_circuits_to_exhaustion():
     assert any("/intent" in v for v in ei.value.errors)   # original violations kept
     assert llm.calls == 2               # first call + ONE repair try — rounds
     assert eng.stats["rejected"] == 1   # 2..3 short-circuited
+
+
+@pytest.mark.parametrize("finalized", (False, True))
+def test_complete_evidence_l3_preserves_original_messages_and_propagates_capacity(finalized):
+    from labelkit.common.errors import ContextOverflowError
+
+    image = object()
+    original = PromptBundle(messages=(
+        Message(role="system", parts=(Part(kind="text", text="Keep every member fact"),)),
+        Message(role="user", parts=(Part(kind="text", text="middle decisive fact"),
+                                    Part(kind="image", image=image))),
+    ), image_px=512)
+    overflow = ContextOverflowError("repair overflows", "reactive", "repair-profile", "http_400")
+
+    class Calls:
+        def __init__(self):
+            self.requests = []
+
+        async def complete(self, profile, prompt, response_schema=None):
+            self.requests.append((profile, prompt, response_schema))
+            if len(self.requests) == 1:
+                return _StubResponse('{"intent":"invalid"}')
+            raise overflow
+
+    llm = Calls()
+    metrics = _MetricsFeedSpy()
+    engine = SchemaEngine(SPEC_SCHEMA, llm=llm,
+                          cfg=OutputConfig(max_repair_attempts=3, repair_llm="repair-profile"), metrics=metrics)
+    scope = CallScope(complete_evidence=True)
+    if finalized:
+        request = replace(_finalized_request(scope=scope), prompt=original)
+        operation = engine.complete_finalized(request)
+    else:
+        operation = engine.complete_validated("default", original, scope=scope)
+    with pytest.raises(ContextOverflowError) as caught:
+        asyncio.run(operation)
+    assert caught.value is overflow and not getattr(overflow, "_breaker_fed", False)
+    assert metrics.fed == []
+    assert len(llm.requests) == 2
+    profile, repair, schema = llm.requests[1]
+    assert profile == "repair-profile" and schema == llm.requests[0][2]
+    assert repair.messages[:-2] == original.messages and repair.image_px == 512
+    assert repair.messages[-2].role == "assistant" and repair.messages[-1].role == "user"
+    assert "[违规清单]" in repair.messages[-1].parts[0].text
+    assert engine.stats["rejected"] == 0
+
+
+def test_complete_evidence_finalized_repair_keeps_only_model_space_previous_output():
+    llm = _QueueLLM('{"payload":{"label":"first","timestamp":999}}',
+                    '{"payload":{"label":"second"}}')
+    engine = SchemaEngine(SPEC_SCHEMA, llm=llm, cfg=OutputConfig(max_repair_attempts=1))
+    request = _finalized_request(
+        projector=lambda candidate: {"payload": {"label": candidate["payload"]["label"]}},
+        scope=CallScope(complete_evidence=True),
+    )
+    result = asyncio.run(engine.complete_finalized(request))
+    assert result[0] == {"payload": {"label": "second", "timestamp": 123}}
+    assert llm.prompts[1].messages[:-2] == request.prompt.messages
+    previous = llm.prompts[1].messages[-2].parts[0].text
+    assert json.loads(previous) == {"payload": {"label": "first"}}
+    assert "999" not in previous
 
 
 def test_generic_repair_context_byte_limit_accepts_exact_and_skips_overflow():

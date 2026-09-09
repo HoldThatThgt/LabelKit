@@ -22,10 +22,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Mapping
 
 from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
+from labelkit.common.contracts.sequence_capacity import (
+    SessionCapacityFailure, capacity_failures, capacity_target, raise_session_capacities, raise_session_capacity,
+)
 from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
@@ -47,6 +50,9 @@ from labelkit.common.inference import budget
 
 from labelkit.common.inference.llm_client import Message, Part, PromptBundle
 from labelkit.common.inference.schema_engine import CallScope, action_schema
+from labelkit.common.inference.sequence_evidence import (
+    CapacityRequest, preview_failure, record_evidence, request_overflow, terminal_error,
+)
 
 if TYPE_CHECKING:
     from labelkit.common.config.model import ResolvedConfig
@@ -174,8 +180,12 @@ def build_extract_prompt(prev: Record, curr: Record, cfg: "ResolvedConfig",
     if cfg.extract.include_diff:
         diff = tree_diff(prev.ui_tree, curr.ui_tree, cfg.dedup.bounds_quantize_px)
         tail_lines.append(f"{_LABEL_DIFF} {_diff_text(diff)}")
-    tail_lines.append(f"{_LABEL_DIGESTS} {frame_digest(prev, _DIGEST_MAX_CHARS)}"
-                      f" → {frame_digest(curr, _DIGEST_MAX_CHARS)}")
+    if cfg.run.mode == "process" and cfg.segment.enabled:
+        tail_lines.extend((f"[前一帧完整控件树]\n{record_evidence(prev)}",
+                           f"[后一帧完整控件树]\n{record_evidence(curr)}"))
+    else:
+        tail_lines.append(f"{_LABEL_DIGESTS} {frame_digest(prev, _DIGEST_MAX_CHARS)}"
+                          f" → {frame_digest(curr, _DIGEST_MAX_CHARS)}")
     user = Message(role="user", parts=(
         Part(kind="text", text=_LABEL_PREV),
         Part(kind="image", image=prev.image),
@@ -281,6 +291,27 @@ async def extract_transition(prev: Record, curr: Record, index: int,
     return outcome.transition
 
 
+async def extract_transition_for_item(item: PipelineItem, index: int, ctx: "RunContext") -> Transition:
+    """为验证重摘显式传入当前成员归属，重复内容不共享出现位置。
+
+    @param item 当前工作序列视图
+    @param index 相邻成员对的起始索引
+    @param ctx 所有者阶段运行上下文
+    @return 通过校验的完整动作
+    @raises SessionCapacityError 相邻完整成员对超出容量
+    """
+    target = capacity_target(item, item.member_positions[index:index + 2])
+    known = terminal_error(ctx, target, "transition", ctx.cfg.extract.llm)
+    try:
+        if known is not None:
+            raise known
+        return await extract_transition(item.record.members[index], item.record.members[index + 1],
+                                        index, ctx, target.label)
+    except ContextOverflowError as exc:
+        raise_session_capacity(ctx, (target,), exc, "transition")
+        raise
+
+
 async def _extract_transition_outcome(prev: Record, curr: Record, index: int,
                                       ctx: "RunContext", label: str | None) -> _ExtractOutcome:
     """执行一次摘取调用并返回不带业务突变的冻结结果。
@@ -296,9 +327,14 @@ async def _extract_transition_outcome(prev: Record, curr: Record, index: int,
     prompt = build_extract_prompt(prev, curr, cfg, label)
     ids = (prev.id, curr.id)
     try:
+        if cfg.run.mode == "process" and cfg.segment.enabled:
+            error = request_overflow(CapacityRequest(cfg.extract.llm, prompt, action_schema()), ctx)
+            if error is not None:
+                raise error
         obj, _usage, attempts, model = await ctx.schema_engine.complete_validated(
             cfg.extract.llm, prompt, action_schema(),
-            scope=CallScope(record_ids=ids, batch_no=ctx.batch_no))
+            scope=CallScope(record_ids=ids, batch_no=ctx.batch_no,
+                            complete_evidence=ctx.session_attempt is not None))
     except SchemaViolation as e:
         if cfg.extract.on_error == "fail":
             raise
@@ -306,6 +342,8 @@ async def _extract_transition_outcome(prev: Record, curr: Record, index: int,
         return _fallback_transition(index, ids, str(e),
                                     1 + cfg.output.max_repair_attempts, ctx.batch_no)
     except (ContextOverflowError, OutputTruncatedError) as e:
+        if ctx.session_attempt is not None and isinstance(e, ContextOverflowError):
+            raise
         # v1.11（spec 3.15.4「上下文预算」行）：恒定的 2 帧 / 2 图调用无物可缩——
         # 无装填、无降级面，由 M9 咽喉 / finish 处置兜底（V16）；溢出与截断原样
         # 搭乘**既有**的机械兜底语义（detail.kind 驱动下游的（摘取兜底）后缀与
@@ -348,6 +386,16 @@ def _commit_extract_outcome(outcome: _ExtractOutcome, ctx: "RunContext") -> None
     )
 
 
+def _effective_seams(item: PipelineItem) -> frozenset[int]:
+    """读取实际摘取与预览共同跳过的有效机械接缝。
+
+    @param item 当前完整序列信封。
+    @return 相邻对合法索引范围内的 seam 集合。
+    """
+    pairs = len(item.record.members) - 1
+    return frozenset(index for index in getattr(item, "seam_indexes", ()) or () if 0 <= index < pairs)
+
+
 def _plan_episode_pairs(todo: list[PipelineItem]) -> tuple[
         list[tuple[PipelineItem, int, frozenset[int]]], list[_PairJob]]:
     """为每个待摘取 episode 排布相邻对，并冻结扁平任务表。
@@ -366,8 +414,7 @@ def _plan_episode_pairs(todo: list[PipelineItem]) -> tuple[
         members = item.record.members
         label = item.classification.label if item.classification else None
         pairs = max(0, len(members) - 1)
-        seams = frozenset(i for i in getattr(item, "seam_indexes", ()) or ()
-                          if 0 <= i < pairs)
+        seams = _effective_seams(item)
         spans.append((item, pairs, seams))
         for i in range(pairs):
             if i in seams:
@@ -402,6 +449,26 @@ def _finalize_transitions(row: list, pairs: int, seams: frozenset[int],
     return tuple(transitions)
 
 
+def _pair_wave_failures(spans, outcomes, ctx: "RunContext") -> tuple[SessionCapacityFailure, ...]:
+    """在任何步骤结果归并前收齐整个执行波次的容量事实。
+
+    @param spans 完整会话的信封、相邻对数量及机械接缝计划。
+    @param outcomes 已完整等待的扁平相邻对结果。
+    @param ctx 当前 owning stage 上下文。
+    @return 按信封和相邻对声明序排列的失败元组。
+    """
+    failures = []
+    offset = 0
+    for item, pairs, seams in spans:
+        for index in range(pairs):
+            if index in seams:
+                continue
+            target = capacity_target(item, item.member_positions[index:index + 2])
+            failures.extend(capacity_failures(ctx, (target,), outcomes[offset], "transition"))
+            offset += 1
+    return tuple(failures)
+
+
 class ExtractStage:
     """M15 extract 阶段的 Stage 实现（spec 3.15.2）。
 
@@ -416,6 +483,31 @@ class ExtractStage:
         @param cfg 本次运行的不可变解析配置（M1 产物）
         """
         self.cfg = cfg
+
+    def preview_capacity(self, item: PipelineItem, ctx: "RunContext") -> SessionCapacityFailure | None:
+        """检查每个完整相邻成员对及全部可达类别指令，不执行模型或写入状态。
+
+        @param item 候选完整序列
+        @param ctx 冻结会话上下文
+        @return 首个相邻对容量失败
+        """
+        if not self.cfg.extract.enabled or item.record.modality != "ui":
+            return None
+        labels = ((item.classification.label,) if item.classification else
+                  tuple(self.cfg.class_views) if self.cfg.classify.enabled else (None,))
+        members = item.record.members
+        seams = _effective_seams(item)
+        for label in labels:
+            for index, (prev, curr) in enumerate(zip(members, members[1:])):
+                if index in seams:
+                    continue
+                prompt = build_extract_prompt(prev, curr, self.cfg, label)
+                request = CapacityRequest(self.cfg.extract.llm, prompt, action_schema())
+                target = replace(capacity_target(item, item.member_positions[index:index + 2]), label=label)
+                failure = preview_failure(ctx, (target,), "transition", request)
+                if failure is not None:
+                    return failure
+        return None
 
     async def run(self, batch: list[PipelineItem],
                   ctx: "RunContext") -> list[PipelineItem]:
@@ -437,6 +529,7 @@ class ExtractStage:
 
         spans, jobs = _plan_episode_pairs(todo)
         results = await self._run_jobs(jobs, ctx)
+        raise_session_capacities(ctx, _pair_wave_failures(spans, results, ctx))
 
         # 按批内位置序同步收尾：任一步骤异常外溢的 episode 整体失败（它其余步骤的
         # 结果一并丢弃——步骤元组是全有或全无的不变式）；否则 len(transitions) ==
@@ -478,7 +571,7 @@ class ExtractStage:
             )
             for ordinal, job in enumerate(jobs)
         )
-        return await ctx.tasks.run_group(TaskGroupRequest(specs))
+        return await ctx.run_group(TaskGroupRequest(specs))
 
     @staticmethod
     async def _run_job(job: _PairJob, ctx: "RunContext") -> object:
@@ -495,6 +588,8 @@ class ExtractStage:
         except (CircuitBreakerTripped, KeyboardInterrupt, asyncio.CancelledError):
             raise
         except Exception as exc:  # 记录级隔离，归并屏障负责 item 写入
+            if ctx.session_attempt is not None and isinstance(exc, ProviderFatalError):
+                raise
             _logger.error("extract transition failed: index=%d exc=%s", job.index,
                           type(exc).__name__, extra={"stage": _STAGE_NAME,
                                                     "batch": ctx.batch_no})

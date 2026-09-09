@@ -979,7 +979,7 @@ def test_generation_limit_defaults_are_exact():
 
 def test_call_scope_manifest_is_exact():
     assert tuple(field.name for field in dataclasses.fields(CallScope)) == (
-        "record_ids", "batch_no", "record", "user_treatment", "repair_context_bytes",
+        "record_ids", "batch_no", "record", "user_treatment", "repair_context_bytes", "complete_evidence",
     )
     assert get_type_hints(CallScope) == {
         "record_ids": tuple[str, ...],
@@ -987,8 +987,9 @@ def test_call_scope_manifest_is_exact():
         "record": typing.Any,
         "user_treatment": bool | None,
         "repair_context_bytes": int | None,
+        "complete_evidence": bool,
     }
-    assert CallScope() == CallScope((), 0, None, None, None)
+    assert CallScope() == CallScope((), 0, None, None, None, False)
 
 
 @pytest.mark.parametrize(
@@ -1068,7 +1069,7 @@ def test_contracts_frame_only_and_segment_exception_semantics_are_frozen():
     assert "no-raise contract" not in normalized
 
     annotate_member = _markdown_section(
-        path, "async def annotate_member", "class AnnotateStage(Stage):",
+        path, "async def annotate_member(", "class AnnotateStage(Stage):",
     )
     required_member_failure = (
         "In ordinary process/flat member isolation",
