@@ -336,7 +336,8 @@ class StreamVerifyDriver:
             state.begin_round()
             state.surgical = True
             state.needs_reannotate = True
-            state.fail_critiques = [{"aspect": "sequence evidence", "opinion": "Rebuild the changed seam evidence."}]
+            state.fail_critiques.append(
+                {"aspect": "sequence evidence", "opinion": "Rebuild the changed seam evidence."})
             dirty.append(state)
         return dirty
 
@@ -502,7 +503,7 @@ class StreamVerifyDriver:
         state.rounds += 1
         state.critiques.extend(merged)
         state.verdict = verdict
-        state.fail_critiques = failed
+        state.fail_critiques.extend(failed)
         state.defects = defects
         for defect in defects:
             ctx.metrics.count(f"{_COUNTER_DEFECTS_PREFIX}{defect['kind']}")

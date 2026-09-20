@@ -75,6 +75,12 @@ label 缺失或类表外未知类使用全局。完整 Schema 供最终验证与
 
 **标注鲁棒性：self-consistency（可选，v1.2）。**`annotate.self_consistency = n`（默认 0 = 关；启用须 n ≥ 3 且为奇数，5.2）时，M5 对每条记录按本节模板独立采样 n 次（temperature 统一取 `annotate.sc_temperature`，默认 0.7——采样多样性的来源），每次输出都各自经 M8 走完整结构保证后才参与投票。**字段级投票**：enum / boolean / integer 字段逐字段取 n 个样本中的众数；自由文本 / 数组字段不逐字投票，取「与众数字段组合一致的样本」中第一个的对应字段值。其余类型字段（number、嵌套 object 等）与自由文本/数组同法处理（不逐字段投票，随众数字段组合整体取值）。全体分歧（众数组合不存在或无样本与其完全一致）时整体采用第一个样本，并计入 `report.annotate.sc_disagreements`。某次采样经 M8 修复仍失败（SchemaViolation）⇒ 该样本弃权、由其余合法样本投票（agreement_ratio 分母仍为 n）；n 次全部失败才置 `status="failed"`。`_meta.annotation.attempts` 记 n 次采样 attempts 之和。`_meta.annotation` 增 `sc = {n, agreement_ratio}`（agreement_ratio = 与最终众数字段组合完全一致的样本数 / n；6.3 只增字段）；trace `annotate.done` 事件 payload 增同构 `sc` 字段（7.2「只增不改」契约内扩展）。该机制对分类型 Schema 收益最大——如统一示例的 `intent` / `difficulty` 枚举字段：多路径采样 + 多数投票显著优于单次贪心解码（Self-Consistency，Wang et al., ICLR 2023 [33]，GSM9K +17.9%）。成本：标注调用与 token ×n。
 
+**process 记录的 Schema 修复上下文。**首次标注及 verify 重标注的 L3 修复均保留首轮实际请求的
+任务、Schema、few-shot、文本和图片，再附当前模型候选与违规。普通记录设置
+`CallScope.retain_repair_prompt=true`；该字段只控制提示词保留，不改变普通记录的容量失败归因。
+处理流仍通过 `complete_evidence=true` 同时保留完整证据并把容量错误交还会话阶段。
+UI 记录启用标注且允许 L3 修复时，生效 repair profile 必须支持 vision；缺省复用标注 profile。
+
 **处理序列的完整标注。**`run.mode="process"` 且 `segment.enabled=true` 时，序列请求固定包含：
 
 ```text

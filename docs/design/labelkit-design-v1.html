@@ -1114,6 +1114,11 @@ label 缺失或类表外未知类使用全局。完整 Schema 供最终验证与
 <table><tr><th>消费点</th><th>按类有效取值</th></tr><tr><td>本节模板的 <code>{user_schema_json}</code></td><td>类有效模型 Schema 的 canonical 单行 dump；没有投影及类覆盖时沿用 M8.user_schema_text</td></tr><tr><td>标注调用（首次 / 修复重标注）</td><td>有后处理或时间绑定时使用完整/模型 Schema 的 finalized 接口，scope.user_treatment=True；其余沿用原显式 Schema 与全局推断路径</td></tr><tr><td>self-consistency 字段级投票</td><td>可投票字段取自类有效模型 Schema；返回已经完整验证的原候选</td></tr><tr><td>v1.11 预算装填的 schema 计价项</td><td>按类有效模型 Schema 及投影示例计价</td></tr><tr><td>M7 修复路径的重标注与实际预算</td><td>使用同一 label、模型 Schema 和移除代码/时间字段的 previous_output</td></tr><tr><td>M11 写前终检</td><td>按<b>该行</b>类标签取有效 Schema（3.11.2；multi 扇出的兄弟信封各带自己的标签，按行天然对齐）</td></tr></table>
 <p>未配置按类 Schema、后处理或时间绑定时，保持既有调用形和模型调用数量。</p>
 <p><b>标注鲁棒性：self-consistency（可选，v1.2）。</b><code>annotate.self_consistency = n</code>（默认 0 = 关；启用须 n ≥ 3 且为奇数，5.2）时，M5 对每条记录按本节模板独立采样 n 次（temperature 统一取 <code>annotate.sc_temperature</code>，默认 0.7——采样多样性的来源），每次输出都各自经 M8 走完整结构保证后才参与投票。<b>字段级投票</b>：enum / boolean / integer 字段逐字段取 n 个样本中的众数；自由文本 / 数组字段不逐字投票，取「与众数字段组合一致的样本」中第一个的对应字段值。其余类型字段（number、嵌套 object 等）与自由文本/数组同法处理（不逐字段投票，随众数字段组合整体取值）。全体分歧（众数组合不存在或无样本与其完全一致）时整体采用第一个样本，并计入 <code>report.annotate.sc_disagreements</code>。某次采样经 M8 修复仍失败（SchemaViolation）⇒ 该样本弃权、由其余合法样本投票（agreement_ratio 分母仍为 n）；n 次全部失败才置 <code>status="failed"</code>。<code>_meta.annotation.attempts</code> 记 n 次采样 attempts 之和。<code>_meta.annotation</code> 增 <code>sc = {n, agreement_ratio}</code>（agreement_ratio = 与最终众数字段组合完全一致的样本数 / n；6.3 只增字段）；trace <code>annotate.done</code> 事件 payload 增同构 <code>sc</code> 字段（7.2「只增不改」契约内扩展）。该机制对分类型 Schema 收益最大——如统一示例的 <code>intent</code> / <code>difficulty</code> 枚举字段：多路径采样 + 多数投票显著优于单次贪心解码（Self-Consistency，Wang et al., ICLR 2023 [33]，GSM9K +17.9%）。成本：标注调用与 token ×n。</p>
+<p><b>process 记录的 Schema 修复上下文。</b>首次标注及 verify 重标注的 L3 修复均保留首轮实际请求的
+任务、Schema、few-shot、文本和图片，再附当前模型候选与违规。普通记录设置
+<code>CallScope.retain_repair_prompt=true</code>；该字段只控制提示词保留，不改变普通记录的容量失败归因。
+处理流仍通过 <code>complete_evidence=true</code> 同时保留完整证据并把容量错误交还会话阶段。
+UI 记录启用标注且允许 L3 修复时，生效 repair profile 必须支持 vision；缺省复用标注 profile。</p>
 <p><b>处理序列的完整标注。</b><code>run.mode="process"</code> 且 <code>segment.enabled=true</code> 时，序列请求固定包含：</p>
 <pre><code>system: 生效 instruction + 代码负责投影后的模型 Schema
 few-shot: 保持配置完整声明序
@@ -1737,7 +1742,11 @@ user:   [任务指令] {annotate.instruction}
 <p><code>VerificationResult.defects</code> 在 process sequence 中恒在，无缺陷为空；缺陷摘要随 <code>verify.verdict</code> 事件输出并受 trace.content 分级。<code>verdict="fail"</code> 且 defects 为空时归一化为默认 <code>label_mismatch</code>，保证失败有明确路由依据。<code>defects.members</code> 只接受会话内非负整数出现位置；内容 ID 不能定位成员，因为相同内容可以重复出现。</p>
 <p><b>上下文预算。</b>普通单记录继续使用既有 UI 树预算装填，生成序列的 verdict 路径遵循本章独立生成契约。process sequence 不裁剪成员、图片、步骤或标注：一次构建完整 prompt，按每个 judge 的实际模板、Schema、图片成本和 profile 独立预检，所有 judge 均可容纳才提交整轮。<code>VerifyStage.preview_capacity</code> 对当前已知成员、已有动作与 annotation 执行相同检查，未知派生产物不伪造。实际请求前和响应终检的 <code>context_overflow</code> 统一交给会话控制器，不能降为普通评审失败或预算裁剪。</p>
 <h3>3.7.3 失败策略与修复环</h3>
-<table><tr><th>策略</th><th>行为</th></tr><tr><td><code>verify.policy = "drop"</code>（默认）</td><td>fail ⇒ <code>status="dropped_verify"</code>，批评意见摘要入 <code>_meta.verification</code> 与 rejects 通道。</td></tr><tr><td><code>verify.policy = "repair"</code></td><td>fail ⇒ 将批评意见追加进标注提示词（<code>[上一版标注] ... [审核意见] ... 请修正后重新输出</code>），M5 重标注、M8 重校验、M7 重评审；最多 <code>verify.max_repair_rounds</code>（默认 1）轮，仍 fail 按 drop 处理。评审轮数记入 <code>_meta.verification.rounds</code>（含首评，一次通过 =1；修复后复评 =2），各轮意见按序累积于 <code>VerificationResult.critiques</code>（4.2），实例见 3.7.4。</td></tr></table>
+<p>普通记录和处理流序列每次返工携带当前候选和此前所有轮次中投 fail 的评委意见，按轮次、评委顺序累计。
+投 pass 的意见仍写入完整评审结果，不进入返工要求。修复模型依据原始数据重新核验历史批评，
+保留已正确内容；复审评委只接收原始数据和当前候选，不接收历史批评。
+成员手术不清空历史批评；接缝刷新产生的批评追加到历史中。每次返工依据当前成员与接缝证据重新核验。</p>
+<table><tr><th>策略</th><th>行为</th></tr><tr><td><code>verify.policy = "drop"</code>（默认）</td><td>fail ⇒ <code>status="dropped_verify"</code>，批评意见摘要入 <code>_meta.verification</code> 与 rejects 通道。</td></tr><tr><td><code>verify.policy = "repair"</code></td><td>fail ⇒ 将批评意见追加进标注提示词（<code>[上一版标注] ... [审核意见] ... 请依据原始数据和上一版标注核验全部历史批评，保留已正确内容，只修正仍成立的问题。只输出修正后的 JSON。</code>），M5 重标注、M8 重校验、M7 重评审；最多 <code>verify.max_repair_rounds</code>（默认 1）轮，仍 fail 按 drop 处理。评审轮数记入 <code>_meta.verification.rounds</code>（含首评，一次通过 =1；修复后复评 =2），各轮意见按序累积于 <code>VerificationResult.critiques</code>（4.2），实例见 3.7.4。</td></tr></table>
 <p><b>stream 修复路由：严格波次（v1.19）。</b><code>policy = "repair"</code> 下序列信封按缺陷表路由标签重标、成员收缩
 与成员回收。实现位于 <code>labelkit/operators/stream_verify.py</code>；<code>verify.py</code> 保留 classic judge/repair 核心。每轮冻结整会话各波次的全部叶任务，再由 <code>ctx.run_group</code> 按 <code>batch_size</code> 分组执行；全部分组收齐后只执行一次 reducer。
 严格执行下列屏障，禁止把存在数据依赖的相邻波次合并为一个任务组：</p>
@@ -1850,7 +1859,7 @@ user:   [任务指令] 你是输入法中文指令的意图标注员。判断每
 <p><code>verdict = "fail"</code> 且 <code>policy = "repair"</code>、已用修复轮数 0 &lt; <code>max_repair_rounds</code> = 1，触发修复。按 3.7.3 格式将下述片段追加进 3.5.2 组装的标注提示词末尾（system / few-shot / 当前记录各段与首次标注调用逐字相同）：</p>
 <pre><code>[上一版标注] {"intent": "writing_assist", "topic": "请假条写作", "difficulty": "easy"}
 [审核意见] 字段语义: difficulty 标为 easy，但该指令涉及正式文书格式与措辞得体性，应为 medium
-请修正后重新输出</code></pre>
+请依据原始数据和上一版标注核验全部历史批评，保留已正确内容，只修正仍成立的问题。只输出修正后的 JSON。</code></pre>
 <p>M5（<code>[llm.default]</code>，qwen2.5-vl-72b-instruct）重新输出，经 M8 通过用户 Schema（L0 直出即合法，<code>attempts = 1</code>）：</p>
 <pre><code>{"intent": "writing_assist", "topic": "请假条写作", "difficulty": "medium"}</code></pre>
 <h4>③ 二次评审（第 2 轮）</h4>
@@ -1879,24 +1888,26 @@ user:   [任务指令] 你是输入法中文指令的意图标注员。判断每
 <p>process stream 的 episode 继续使用 3.7.2 缺陷表与成员手术。v1.20 生成 sequence 是 text 模态的完整
 主序列候选，使用既有 verdict Schema 的判决形模板；两者按调用入口区分，不以
 <code>segment.enabled</code> 猜测。</p>
-<p>~~~python
-@dataclasses.dataclass(frozen=True)
+<pre><code>@dataclasses.dataclass(frozen=True)
 class VerifyPromptOptions:
-"""一次评审提示词的全部可选装配项。"""</p>
-<p>label: str | None = None
-transitions: tuple | None = None
-boundary_margin: str = ""
-fragment_structure: str = ""
-fit: "_PromptFit | None" = None
-verdict_form: bool = False</p>
-<p>class VerifyStage(Stage):
-"""标注评审阶段。"""</p>
-<p>async def run_attempt(
-self,
-request: DownstreamAttemptRequest,
-) -&gt; DownstreamAttemptResult:
-"""在 sequence attempt 内评审完整候选，不提交全局状态。"""
-~~~</p>
+    """一次评审提示词的全部可选装配项。"""
+
+    label: str | None = None
+    transitions: tuple | None = None
+    boundary_margin: str = ""
+    fragment_structure: str = ""
+    fit: "_PromptFit | None" = None
+    verdict_form: bool = False
+
+
+class VerifyStage(Stage):
+    """标注评审阶段。"""
+
+    async def run_attempt(
+        self,
+        request: DownstreamAttemptRequest,
+    ) -&gt; DownstreamAttemptResult:
+        """在 sequence attempt 内评审完整候选，不提交全局状态。"""</code></pre>
 <p>生成 sequence 的判决形 system 检查任务指令遵循、成员 payload 证据一致性与标注字段语义；user 段固定为
 任务指令、按 event order 的完整成员摘要、标注结果。它不生成 process episode 的 boundary/fragment defect 表。
 摘要可以按既有非真值装填规则裁剪，但 annotation、generation truth 与 evaluator 结果不能裁剪后继续判 pass。</p>
@@ -1996,7 +2007,7 @@ state Schema 与 state validator，并把冻结 <code>EventExecution</code> 与�
   <text x="560" y="108" font-size="11" fill="#7a4fb5">修复输出重走 L1→L2（→L2.5）</text>
   <text x="905" y="180" font-size="11" fill="#b04a4a">次数耗尽</text>
 </svg><figcaption>图 3-3 结构引擎四层保证。任何写入主输出的对象必然经过 L2 通过分支。</figcaption></figure>
-<table><tr><th>层</th><th>精确行为</th></tr><tr><td>L0</td><td>profile <code>supports_structured_output=true</code> 时：OpenAI 兼容 provider 传 <code>response_format={"type":"json_schema", "json_schema":{...strict:true}}</code>；Anthropic provider 以单工具 <code>tool_choice</code> 强制工具调用、Schema 作为工具入参。L0 只是「使 L1/L3 少触发」的优化，不豁免 L2——供应商实现存在覆盖缺口（JSONSchemaBench 实测各引擎均有不支持的 Schema 特性 [24]），校验永远执行。</td></tr><tr><td>L1</td><td>顺序执行：① 剥离 Markdown 代码围栏；② 取首个花括号平衡子串；③ <code>json_repair.loads()</code>（工业库，处理截断/单引号/尾逗号/裸换行 [8]）。全部失败 ⇒ 直接进 L3。L1 为纯函数，无副作用、可单测穷举。</td></tr><tr><td>L2</td><td><code>Draft202012Validator.iter_errors()</code> 收集全部违规，每条含 JSON Pointer 路径、期望与实际。通过后进入可选用户回调或调用级后置验证；未通过进入 L3。enum 等错误统一渲染为英文、值受 trace/content 规则保护。</td></tr><tr><td>L2.5（v1.5，可选）</td><td><code>output.validator</code> 配置时、且仅对用户 Schema 调用：L2 通过后执行用户回调 <code>fn(obj, record)</code>。返回非空违规列表 ⇒ 违规以 <code>(validator) &lt;消息&gt;</code> 形式并入违规清单、与 Schema 违规同路进入 L3 修复环（回调意见回喂模型自我修正——回调既是门卫也是修复环的教练）；返回空 ⇒ 通过。L3 每轮修复输出重走 L1→L2→L2.5。预算耗尽且剩余违规<b>全部</b>来自回调 ⇒ <code>SchemaViolation(callback_only=True)</code>，记录 kind = <code>callback_violation</code>（7.6），否则仍为 <code>schema_violation</code>。回调抛异常不吞：向上传播、按记录级 <code>internal_error</code> 收敛（3.5.3）。内部 Schema（裁决/评分/评审/生成/分类（v1.7）/分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9））不经过 L2.5。</td></tr><tr><td>L3</td><td>普通记录修复使用单条 user 消息，保留完整原始输出、违规清单和修正指令。process stream 设置 CallScope.complete_evidence=true，保留首轮全部消息、文本、树、图片及固定尺寸，再追加上一版模型空间输出与违规；finalized 调用先经 repair_projector 移除代码和框架负责字段。修复使用 output.repair_llm（缺省同调用方），重走 L1–L2，次数耗尽抛 SchemaViolation，实际调用均计 usage。process stream 的 ContextOverflowError 保留原 profile/phase/origin 上抛所属会话阶段，不转 SchemaViolation，不由 M8 提前喂熔断。普通记录修复超限保留既有短路 SchemaViolation 及 reactive-400 终态恰一次补喂语义。生成保留其独立完整修复合同。</td></tr></table>
+<table><tr><th>层</th><th>精确行为</th></tr><tr><td>L0</td><td>profile <code>supports_structured_output=true</code> 时：OpenAI 兼容 provider 传 <code>response_format={"type":"json_schema", "json_schema":{...strict:true}}</code>；Anthropic provider 以单工具 <code>tool_choice</code> 强制工具调用、Schema 作为工具入参。L0 只是「使 L1/L3 少触发」的优化，不豁免 L2——供应商实现存在覆盖缺口（JSONSchemaBench 实测各引擎均有不支持的 Schema 特性 [24]），校验永远执行。</td></tr><tr><td>L1</td><td>顺序执行：① 剥离 Markdown 代码围栏；② 取首个花括号平衡子串；③ <code>json_repair.loads()</code>（工业库，处理截断/单引号/尾逗号/裸换行 [8]）。全部失败 ⇒ 直接进 L3。L1 为纯函数，无副作用、可单测穷举。</td></tr><tr><td>L2</td><td><code>Draft202012Validator.iter_errors()</code> 收集全部违规，每条含 JSON Pointer 路径、期望与实际。通过后进入可选用户回调或调用级后置验证；未通过进入 L3。enum 等错误统一渲染为英文、值受 trace/content 规则保护。</td></tr><tr><td>L2.5（v1.5，可选）</td><td><code>output.validator</code> 配置时、且仅对用户 Schema 调用：L2 通过后执行用户回调 <code>fn(obj, record)</code>。返回非空违规列表 ⇒ 违规以 <code>(validator) &lt;消息&gt;</code> 形式并入违规清单、与 Schema 违规同路进入 L3 修复环（回调意见回喂模型自我修正——回调既是门卫也是修复环的教练）；返回空 ⇒ 通过。L3 每轮修复输出重走 L1→L2→L2.5。预算耗尽且剩余违规<b>全部</b>来自回调 ⇒ <code>SchemaViolation(callback_only=True)</code>，记录 kind = <code>callback_violation</code>（7.6），否则仍为 <code>schema_violation</code>。回调抛异常不吞：向上传播、按记录级 <code>internal_error</code> 收敛（3.5.3）。内部 Schema（裁决/评分/评审/生成/分类（v1.7）/分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9））不经过 L2.5。</td></tr><tr><td>L3</td><td>普通记录的内部调用默认使用单条 user 修复消息。process 记录标注设置 CallScope.retain_repair_prompt=true，保留首轮实际提示词，但容量失败仍按普通路径短路为 SchemaViolation。process stream 设置 CallScope.complete_evidence=true，保留首轮全部消息、文本、树、图片及固定尺寸，再追加上一版模型空间输出与违规；finalized 调用先经 repair_projector 移除代码和框架负责字段。修复使用 output.repair_llm（缺省同调用方），重走 L1–L2，次数耗尽抛 SchemaViolation，实际调用均计 usage。process stream 的 ContextOverflowError 保留原 profile/phase/origin 上抛所属会话阶段，不转 SchemaViolation，不由 M8 提前喂熔断。普通记录修复超限保留既有短路 SchemaViolation 及 reactive-400 终态恰一次补喂语义。生成保留其独立完整修复合同。</td></tr></table>
 <p><b>v1.19 资源与并发边界。</b>operator 的 <code>TaskSpec.resource_key</code> 只标识首轮业务调用的接纳通道。L3 若切换到
 <code>output.repair_llm</code>，SchemaEngine 在同一叶任务内继续调用 LLMClient；LLMClient 必须通过共享
 ResourceManager 取得 repair profile 的实际逻辑调用许可与对应 origin 许可。repair 不创建嵌套
@@ -2021,6 +2032,7 @@ class CallScope:
     user_treatment: bool | None = None  # 显式待遇门；None ⇒ 按 schema is None 推断
     repair_context_bytes: int | None = None  # 单轮新增 L3 消息正文集合 UTF-8 byte 上限
     complete_evidence: bool = False     # process stream 修复保留原完整请求并上抛容量错误
+    retain_repair_prompt: bool = False  # 普通记录标注仅保留首轮实际请求，容量错误仍按普通路径处理
 
 class SchemaEngine:
     def __init__(self, user_schema: dict, llm: LLMClient, cfg: OutputConfig): ...
@@ -2038,6 +2050,8 @@ class SchemaEngine:
            校验经显式 schema=cfg.frame_schema 走同一入口（3.8.2 路由声明）。"""</code></pre>
 <p><b>设计考量：</b>“Let Me Speak Freely?”（arXiv:2408.02442）报告了严格格式约束可能损失推理质量 [25]。缓解按各内部 Schema 的实际字段序落地：评审输出的 <code>critiques</code> 置于 <code>verdict</code> <b>之前</b>（3.7.2「先意见后结论」）、pointwise 打分的 <code>reason</code> 置于 <code>score</code> <b>之前</b>（3.4.4「先给两句理由再给整数分」），让模型先推理后作答。例外是成对裁决：字段序为 <code>criterion → winner → reason</code>，<code>reason</code> 在结论<b>之后</b>且仅当 <code>quality.judgment_reasons</code> 生效时才要求（3.4.3）——它的用途是落入 trace 供 rubric 优化（7.5），不承担「先推理后作答」的缓解职责（生成输出 <code>{"samples": [...]}</code> 则不含自由文本字段）。用户 Schema 若需同类缓解，可自行加 reasoning 字段并在下游忽略。
 <b>背书：</b>「Schema 约束生成 + 机器校验 + 修复重试」为工业标准三件套：OpenAI Structured Outputs [7]、约束解码框架 Outlines [23]、JSONSchemaBench 对 6 家引擎的评测 [24]、instructor 的 validation-retry 循环与 json-repair 库 [8]。四层纵深（供应商能力不被信任、校验不可豁免）是对 [24] 所示覆盖缺口的直接工程回应。</p>
+<p><code>maxItems</code> 违规渲染为 <code>&lt;json-pointer&gt;: expected at most N items, received M</code>。
+违规文本只含数量，不重复完整数组；原始候选仍完整保留在修复提示词中。根 JSON Pointer 为空字符串。</p>
 <h3>3.8.4 输入 / 输出示例</h3>
 <p>以贯穿示例的文本模态工程为例：输入行 <code>{"instruction": "帮我写一条请假条，明天上午要去医院", "source": "ime-log", "ts": "2026-06-30T10:12:00Z"}</code>（<code>input.text_field = "instruction"</code>，记录 id = <code>1cda030abc565f17</code>）。M5 组装标注提示词后调用 <code>complete_validated(profile="default", prompt, user_schema)</code>。用户 Schema（<code>output.schema_inline</code>）：</p>
 <pre><code>{
@@ -2069,89 +2083,57 @@ class SchemaEngine:
 (jsonschema 原始消息: 'writing' is not one of ['writing_assist', 'qa',
  'translation', 'chitchat', 'other'])</code></pre>
 <p>违规清单非空 ⇒ 进入 L3。</p>
-<p><b>⑤ L3 修复调用（第 1 次，预算 <code>output.max_repair_attempts = 2</code>）：</b>本工程未配置 <code>output.repair_llm</code> ⇒ 使用调用方 profile <code>default</code>。修复提示词按 3.8.2 逐字组装 = 原始输出全文 + 违规清单 + 「只输出修正后的 JSON」，作为单条 user 消息发出：</p>
-<pre><code>[原始输出]
-```json
-{
-  "intent": "writing",
-  "topic": "请假条写作",
-  "difficulty": "easy",
-}</code></pre>
-<p>[违规清单]</p>
-<ol><li>/intent: expected one of enum ["writing_assist", "qa", "translation",
-"chitchat", "other"], got "writing"</li></ol>
-<p>只输出修正后的 JSON。</p>
-<pre><code>
-修复响应：
-</code></pre>
-<p>{"intent": "writing_assist", "topic": "请假条写作", "difficulty": "easy"}</p>
-<pre><code>
-**⑥ 重走 L1→L2：**L1 无围栏可剥、直接解析成功；L2 `iter_errors()` 返回空清单 ⇒ 通过。`complete_validated()` 返回该对象，M5 写入 `item.annotation`：`Annotation.attempts = 2`（= 1 + 1 次 L3 修复，4.2 定义），首次调用与修复调用的 token 均计入 `Annotation.usage` 与 profile 计量（3.9.3）；本次解决计入 `report.schema_engine.resolved_at` 的 `l3_1` 桶（首次 L3 修复即通过），主输出 `_meta.annotation.attempts = 2`。
+<p><b>⑤ L3 修复调用（第 1 次，预算 <code>output.max_repair_attempts = 2</code>）：</b>本工程未配置 <code>output.repair_llm</code> ⇒ 使用调用方 profile <code>default</code>。process 记录标注保留首轮 system、few-shot 和原始数据消息，再追加以下 assistant 候选及 user 修复指令：</p>
+<pre><code>assistant: &lt;上方首次模型输出全文&gt;
+user:
+  [违规清单]
+  1. /intent: expected one of enum ["writing_assist", "qa", "translation",
+     "chitchat", "other"], got "writing"
 
-| 层 | 输入 | 动作 | 输出 |
-|---|---|---|---|
-| L0 | `supports_structured_output = false` | 不注入原生结构化输出参数 | 提示词原样发出，保证责任交给 L1–L3 |
-| L1 | 带围栏 + 尾逗号的原始文本 | 剥围栏 → 平衡花括号子串 → `json_repair.loads()` | 可解析对象（`intent` 仍为 `"writing"`） |
-| L2（第 1 次） | L1 产物 | `iter_errors()` 全量收集违规 | 1 条违规（`/intent` 枚举）⇒ 转 L3 |
-| L3（第 1 次） | 原始输出全文 + 违规清单 | 经 `output.repair_llm`（默认同调用方）发起修复调用 | 修正后的 JSON 文本 |
-| L1→L2（重走） | 修复输出 | 同 L1 / L2 | 通过 ⇒ 返回对象；`attempts = 2`；`resolved_at.l3_1` 计 1 |
-
-若第 2 次 L3 修复后仍未通过 L2，则预算耗尽，抛 `SchemaViolation(errors, raw_last_output)`：该记录 `status = "failed"`、错误码 `schema_violation`（7.6）入 rejects 通道，并计入 `resolved_at.rejected`。
-
-### 3.8.5 v1.18 调用级后置验证
-
-既有 `complete_validated` 返回类型不变。需要执行状态转移的 EventPlan 使用独立内部入口：
-
-~~~python
-CallPostValidator = Callable[[Mapping[str, object]], PostValidationResult]
+  只输出修正后的 JSON。</code></pre>
+<p>修复响应：</p>
+<pre><code>{"intent": "writing_assist", "topic": "请假条写作", "difficulty": "easy"}</code></pre>
+<p><b>⑥ 重走 L1→L2：</b>L1 无围栏可剥、直接解析成功；L2 <code>iter_errors()</code> 返回空清单 ⇒ 通过。<code>complete_validated()</code> 返回该对象，M5 写入 <code>item.annotation</code>：<code>Annotation.attempts = 2</code>（= 1 + 1 次 L3 修复，4.2 定义），首次调用与修复调用的 token 均计入 <code>Annotation.usage</code> 与 profile 计量（3.9.3）；本次解决计入 <code>report.schema_engine.resolved_at</code> 的 <code>l3_1</code> 桶（首次 L3 修复即通过），主输出 <code>_meta.annotation.attempts = 2</code>。</p>
+<table><tr><th>层</th><th>输入</th><th>动作</th><th>输出</th></tr><tr><td>L0</td><td><code>supports_structured_output = false</code></td><td>不注入原生结构化输出参数</td><td>提示词原样发出，保证责任交给 L1–L3</td></tr><tr><td>L1</td><td>带围栏 + 尾逗号的原始文本</td><td>剥围栏 → 平衡花括号子串 → <code>json_repair.loads()</code></td><td>可解析对象（<code>intent</code> 仍为 <code>"writing"</code>）</td></tr><tr><td>L2（第 1 次）</td><td>L1 产物</td><td><code>iter_errors()</code> 全量收集违规</td><td>1 条违规（<code>/intent</code> 枚举）⇒ 转 L3</td></tr><tr><td>L3（第 1 次）</td><td>首轮完整请求 + 原始输出全文 + 违规清单</td><td>经 <code>output.repair_llm</code>（默认同调用方）发起修复调用</td><td>修正后的 JSON 文本</td></tr><tr><td>L1→L2（重走）</td><td>修复输出</td><td>同 L1 / L2</td><td>通过 ⇒ 返回对象；<code>attempts = 2</code>；<code>resolved_at.l3_1</code> 计 1</td></tr></table>
+<p>若第 2 次 L3 修复后仍未通过 L2，则预算耗尽，抛 <code>SchemaViolation(errors, raw_last_output)</code>：该记录 <code>status = "failed"</code>、错误码 <code>schema_violation</code>（7.6）入 rejects 通道，并计入 <code>resolved_at.rejected</code>。</p>
+<h3>3.8.5 v1.18 调用级后置验证</h3>
+<p>既有 <code>complete_validated</code> 返回类型不变。需要执行状态转移的 EventPlan 使用独立内部入口：</p>
+<pre><code>CallPostValidator = Callable[[Mapping[str, object]], PostValidationResult]
 
 
 async def complete_post_validated(
     request: PostValidatedCallRequest,
 ) -&gt; ValidatedGenerationCall:
-    """对每个结构合法候选执行恰一次调用级后置验证。"""
-~~~
-
-`PostValidatedCallRequest` 冻结 profile、prompt、Schema、`CallScope` 与后置验证器。每个首轮或 L3
-候选通过 L2 后恰调用一次：
-
-- 非空 `violations` 且 `event_execution is None` 是可修复结果，以
-  `(post-validator)` 前缀进入同一 L3 违规清单。
-- 空 `violations` 且携带 `EventExecution` 是唯一成功形态；结果随
-  `ValidatedGenerationCall` 返回，正式事件提交不得再次执行 patch 或 hook。
-- 其他形状、非 string 违规、回调异常或错误返回类型分别归
-  `post_validator_invalid` / `post_validator_exception`，直接拒绝当前 slot attempt，不进入 L3。
-- EventPlan 的 L3 prompt 重放 `PostValidatedCallRequest.prompt` 的原始 system/user 消息，把上一候选作为
-  assistant 消息，再追加只含值受控 violations 的 user 修复消息。它只能复用首轮已经可见的
-  ActorView/visible state，不能追加 `EventExecution`、隐藏 state、hook 异常或任何新事实。普通
-  `complete_validated` 继续使用 3.8.2 的单 user 修复形态。
-- `CallScope.repair_context_bytes` 为 null 时保持通用 M8 既有行为；v1.18 sequence 每个 family 显式传 32768。
-  普通 L3 对完整新 user 正文计费；EventPlan 对新增 assistant 原始输出与新增 user 修复正文之和计费。
-  恰好上限可派发，多一 UTF-8 byte 在 M8 内记录 warning 后短路，零 provider call、不截断原输出。
-
-只有 EventPlan 使用该入口；ScenarioSeed、FrameRenderer、SemanticEvaluator 与 noise 继续调用
-`complete_validated`。后置验证器只存在于当前 request，M8 不保存跨调用状态，并行请求不会串用 state/hook。
-`ValidatedGenerationCall` 按字段顺序携带 `object`、`event_execution`、`resolved_at`、`usage`、
-`attempts`、`model`；`resolved_at` 闭集只有 `l0_or_clean`、`l1`、`l3_1`、`l3_2`，用于标识当次
-成功对象的解析路径，不写入只属于用户 Schema annotate 的全局 `resolved_at` 计数。
-
-state validator 必须确定、无副作用，签名为
-`validate_state(StateTransitionInput) -&gt; list[str]`。M1 用同一深拷贝输入连续调用两次并比较归一化违规字节。
-普通非空 string list 进入 L3；异常与非法返回分别终结 attempt。sequence 与 scenario 级旧 hook 不存在。
-
-### 3.8.6 v1.18 sequence Schema 所有权
-
-固定 family 为 `generation.scenario_seed`、`generation.event_plan`、
-`generation.frame_render`、`generation.semantic_evaluate`、`generation.noise_render` 与
-`generation.noise_evaluate`。模板与输出 Schema 冻结在 CONTRACTS，各 generation 模块只定义一次。
-M8 只消费调用方传入的标准 JSON Schema，不提供蓝图、概要、批量逐位实现或字段回填构造器。
-
-ScenarioSeed、ActorView、patch、payload、完整轨迹证据与 semantic evaluator 输入不能裁剪或以摘要替代。
-semantic evaluator 只接收盲化 `SemanticEvaluationRequest`，不得因完整性要求改传 `EventTrace`、
+    """对每个结构合法候选执行恰一次调用级后置验证。"""</code></pre>
+<p><code>PostValidatedCallRequest</code> 冻结 profile、prompt、Schema、<code>CallScope</code> 与后置验证器。每个首轮或 L3
+候选通过 L2 后恰调用一次：</p>
+<ul><li>非空 <code>violations</code> 且 <code>event_execution is None</code> 是可修复结果，以
+<code>(post-validator)</code> 前缀进入同一 L3 违规清单。</li><li>空 <code>violations</code> 且携带 <code>EventExecution</code> 是唯一成功形态；结果随
+<code>ValidatedGenerationCall</code> 返回，正式事件提交不得再次执行 patch 或 hook。</li><li>其他形状、非 string 违规、回调异常或错误返回类型分别归
+<code>post_validator_invalid</code> / <code>post_validator_exception</code>，直接拒绝当前 slot attempt，不进入 L3。</li><li>EventPlan 的 L3 prompt 重放 <code>PostValidatedCallRequest.prompt</code> 的原始 system/user 消息，把上一候选作为
+assistant 消息，再追加只含值受控 violations 的 user 修复消息。它只能复用首轮已经可见的
+ActorView/visible state，不能追加 <code>EventExecution</code>、隐藏 state、hook 异常或任何新事实。普通
+<code>complete_validated</code> 继续使用 3.8.2 的单 user 修复形态。</li><li><code>CallScope.repair_context_bytes</code> 为 null 时保持通用 M8 既有行为；v1.18 sequence 每个 family 显式传 32768。
+普通 L3 对完整新 user 正文计费；EventPlan 对新增 assistant 原始输出与新增 user 修复正文之和计费。
+恰好上限可派发，多一 UTF-8 byte 在 M8 内记录 warning 后短路，零 provider call、不截断原输出。</li></ul>
+<p>只有 EventPlan 使用该入口；ScenarioSeed、FrameRenderer、SemanticEvaluator 与 noise 继续调用
+<code>complete_validated</code>。后置验证器只存在于当前 request，M8 不保存跨调用状态，并行请求不会串用 state/hook。
+<code>ValidatedGenerationCall</code> 按字段顺序携带 <code>object</code>、<code>event_execution</code>、<code>resolved_at</code>、<code>usage</code>、
+<code>attempts</code>、<code>model</code>；<code>resolved_at</code> 闭集只有 <code>l0_or_clean</code>、<code>l1</code>、<code>l3_1</code>、<code>l3_2</code>，用于标识当次
+成功对象的解析路径，不写入只属于用户 Schema annotate 的全局 <code>resolved_at</code> 计数。</p>
+<p>state validator 必须确定、无副作用，签名为
+<code>validate_state(StateTransitionInput) -&gt; list[str]</code>。M1 用同一深拷贝输入连续调用两次并比较归一化违规字节。
+普通非空 string list 进入 L3；异常与非法返回分别终结 attempt。sequence 与 scenario 级旧 hook 不存在。</p>
+<h3>3.8.6 v1.18 sequence Schema 所有权</h3>
+<p>固定 family 为 <code>generation.scenario_seed</code>、<code>generation.event_plan</code>、
+<code>generation.frame_render</code>、<code>generation.semantic_evaluate</code>、<code>generation.noise_render</code> 与
+<code>generation.noise_evaluate</code>。模板与输出 Schema 冻结在 CONTRACTS，各 generation 模块只定义一次。
+M8 只消费调用方传入的标准 JSON Schema，不提供蓝图、概要、批量逐位实现或字段回填构造器。</p>
+<p>ScenarioSeed、ActorView、patch、payload、完整轨迹证据与 semantic evaluator 输入不能裁剪或以摘要替代。
+semantic evaluator 只接收盲化 <code>SemanticEvaluationRequest</code>，不得因完整性要求改传 <code>EventTrace</code>、
 variant/target/expected/actual violation、pattern/state evaluation 或其他 evaluator truth。
 precheck overflow 不发请求；内容相关 overflow、truncation 或 repair 耗尽按当前 sequence/noise attempt
-错误矩阵返回。provider fatal、circuit trip、KeyboardInterrupt 与 CancelledError 不在 M8 降级为记录错误。
-</code></pre>
+错误矩阵返回。provider fatal、circuit trip、KeyboardInterrupt 与 CancelledError 不在 M8 降级为记录错误。</p>
 <h2 id="m9">3.9 M9 LLM 客户端 <code>labelkit/common/inference/llm_client.py</code></h2>
 <h3>3.9.1 职责与边界</h3>
 <div class="boundary"><b>做：</b>按 profile 提供统一异步调用接口：消息构造（文本/多图多模态）、provider 适配（OpenAI 兼容 / Anthropic 原生）、结构化输出参数透传、超时/重试/限流、token 与成本计量、<code>--probe</code> 连通性探测。
@@ -2244,6 +2226,10 @@ class ProfileSnapshot:                            # v1.10
 <table><tr><th>机制</th><th>定义</th></tr><tr><td>Provider 适配</td><td><code>openai_compatible</code>：POST <code>{base_url}/chat/completions</code>，图像为 <code>image_url: data:image/png;base64,...</code>；<code>anthropic</code>：POST <code>{base_url}/v1/messages</code>，图像为 <code>source.type="base64"</code>。任一 LLM profile 显式设置 <code>thinking = "enabled" | "disabled"</code> 时，按对应协议在请求顶层追加 <code>{"thinking": {"type": &lt;value&gt;}}</code>；缺省不追加。仅 <code>openai_compatible</code> profile 可声明 <code>extra_body</code>：每次构造 chat-completions 请求时把其 JSON-compatible entries 直接合并到请求 JSON 顶层，绝不发送名为 <code>extra_body</code> 的包裹字段；M1 已拒绝保留键冲突，空表不改变既有请求体。普通调用、repair、sequence、重试与 <code>validate --probe</code> 复用同一构造器，因此语义一致。两种 provider 的结构化输出映射见 3.8.2 L0。v1.2 embedding：<code>embed()</code> 仅支持 <code>openai_compatible</code>：POST <code>{base_url}/embeddings</code>，请求体含 <code>model</code> 与 <code>input</code>（texts 数组），响应取 <code>data[*].embedding</code>（顺序与输入对齐）；<code>[embedding.*]</code> profile 的 provider 无 "anthropic" 取值，且不消费 LLM <code>extra_body</code>（5.1）。</td></tr><tr><td>重试</td><td>可重试错误 = 网络错误、超时、HTTP 408/409/429/5xx。第 i 次等待 = <code>random(0, retry_base_delay_s × 2^i)</code>（全抖动指数退避，工业标准），封顶 60s，最多 <code>max_retries</code> 次——<b>v1.6 起该退避公式仅适用于网络错误/超时/408/409/5xx；一切 429 等待（含与不含 <code>Retry-After</code>）一律落于密钥冷却</b>而非调用内休眠，时长以密钥池行为唯一规范（含 <code>Retry-After</code> 遵从其全时长；缺失按密钥计数指数冷却、封顶 300s）。池内有其他可用密钥时下一次尝试立即轮换、零等待；池大小 1 时驻留至冷却结束——含 <code>Retry-After</code> 时净等待与 v1.5 相同但受 <code>run.max_park_s</code>（默认 3600s）约束，超长 <code>Retry-After</code>（如小时级配额信号）在单密钥配置下不再无界等待，而按重试耗尽让该记录失败（v1.6 行为修订）。不可重试错误（401/403/400/404）直接抛 <code>ProviderFatalError</code>；其中<b>认证类（401/403）在抛出的同时立即打开熔断器</b>——凭据/权限故障不会自愈，按连续计数只是烧钱（v1.5）；v1.6 密钥池下认证失败先按密钥禁用，仅当禁用的是最后一把存活密钥时才立即熔断（密钥池行）。重试耗尽（<code>provider_retryable_exhausted</code>，v1.6 含驻留超限）同样计入熔断窗口（7.6）。v1.11 修订（V16/V20/V24，3.9.5）：<b>所用 profile 预算开启（<code>context_window &gt; 0</code>）时</b>，400 响应先于 ProviderFatalError 分类在<b>完整响应体</b>上匹配超窗 pattern 集（3.9.5 pattern 行）——命中抛 <code>ContextOverflowError(phase="reactive")</code>，M9 <b>不喂</b>熔断连击（降级重试与终局补喂归属主算子，熔断交互矩阵见 3.9.5）；未命中或预算关闭走本行 fatal 老路（零回归）。另两类记录级终局同不入本行分类：complete() 分派前终检抛 <code>ContextOverflowError(phase="precheck")</code>（零 provider 交互，V16）、成功响应按终止原因归一终局化（<code>OutputTruncatedError</code>；200 形态 <code>model_context_window_exceeded</code> 同抛 <code>ContextOverflowError(phase="reactive")</code>——V11，3.9.5）——上述异常均<b>不喂 <code>_record_provider_result(fatal=True)</code>、不烧常规重试</b>。</td></tr><tr><td>逻辑调用许可</td><td>M9 不再持有私有 semaphore。每次 <code>complete()</code> / <code>embed()</code> / repair / probe 都以完整 <code>ResourceKey</code> 从共享 <code>ResourceLimiter.resource_limit()</code> 取得许可。许可覆盖整个逻辑调用：provider attempt、密钥轮换、普通 retry backoff、429 cooldown 与 parking，直到成功或终止。池化 profile 的 <code>max_concurrency</code> 仍是全部密钥的总上限；同名 LLM 与 embedding profile 使用不同资源键。资源许可等待计入 <code>runtime.resource_wait_ms</code>，不进入 provider latency。</td></tr><tr><td>HTTP origin 池</td><td>所有真实 HTTP attempt 在 dispatch 前先根据 ResourceKey 取得冻结 origin，再进入 <code>origin_limit()</code>。共享 <code>AsyncClient</code> 延迟创建，<code>max_connections</code> 与 <code>max_keepalive_connections</code> 都等于本轮引用 origin 容量之和；相同 origin 的 LLM、embedding、repair 与 probe profile 聚合容量，不同 origin 独立。<code>runtime.http_pool_wait_ms</code> 只计显式 origin admission 等待，provider latency 从取得 origin 许可后开始。取得许可后仍出现 <code>httpx.PoolTimeout</code> 是内部容量契约错误，必须先于宽泛 timeout 分支 fail closed，不能 provider retry。零 origin 的静态路径不创建 client。</td></tr><tr><td>密钥池（v1.6）</td><td>profile 以 <code>api_key_envs = [...]</code>（5.1，与 <code>api_key_env</code> 恰提供其一）声明多把密钥，同 base_url、同 model 构成<b>同构池</b>；单密钥配置 = 池大小 1：数据产出、重试记账与熔断/退出语义与 v1.5 一致，429 等待路径为 v1.6 行为修订（见重试行：<code>Retry-After</code> 等待受 <code>run.max_park_s</code> 约束；无 <code>Retry-After</code> 冷却封顶 300s 且按密钥跨调用计数；驻留发 WARN 与事件）。<b>选择</b>：每次请求尝试发出前选「在途请求数最少」的可用密钥（并列取声明序靠前者；确定性算法、无 RNG——密钥选择只影响时序不影响数据内容，与重试抖动同属 seed 豁免，2.6 可复现性不受影响），请求头按所选密钥逐次构造。<b>每密钥 429 冷却</b>：含 <code>Retry-After</code> 时冷却其全时长；缺失时按 <code>random(0, retry_base_delay_s × 2^c)</code> 全抖动冷却、封顶 300s（c = 该密钥连续 429 计数，跨逻辑调用累计，<b>该密钥自身</b>任一成功清零）——无 <code>Retry-After</code> 的持续限流由此以每密钥 ≤ 每 5 分钟一次的探测频率自愈。冷却不改重试记账：该次尝试照常消耗一次重试预算，但下次尝试立即换可用密钥重发（<code>llm.key_cooldown</code> 事件，7.2）。<b>认证禁用</b>：密钥 401/403 ⇒ 本运行内永久禁用（stderr WARN 一次 + <code>llm.key_disabled</code> 事件，携环境变量名）；池内尚有存活密钥 ⇒ 同一尝试立即换密钥重发，不消耗重试预算、不计入熔断（认证失败是密钥级确定性故障，每密钥至多发生一次，轮换次数以池大小为界）；禁用的是<b>最后一把</b>存活密钥 ⇒ 等价 v1.5 认证首错：立即熔断、退出码 4（3.10.3）。配额以 403 形态出现的 provider 同按认证禁用处理，不做错误体嗅探（1.6 对齐决策 ④）。<b>驻留</b>：全部存活密钥均在冷却 ⇒ 调用驻留至最早冷却结束（<code>llm.pool_parked</code> 事件 + stderr WARN；≤60s 分片休眠，每片重查熔断器——v1.5 排队调用熔断复查语义保持）；驻留不消耗重试预算，单次逻辑调用累计驻留（跨多段驻留求和，不含资源许可排队等待）&gt; <code>run.max_park_s</code>（5.2，默认 3600，0 = 不驻留）⇒ 按重试耗尽抛 <code>ProviderRetryableError</code>（记录 failed、计入熔断窗口，1.6 对齐决策 ③）；最早冷却结束时刻已可证超出剩余驻留预算时立即按同路径失败，不空耗墙钟。驻留发生在<b>已获取的 ResourceManager 逻辑调用许可内并持有该许可</b>——全池冷却时吞吐本为零，释放许可只会放入更多注定驻留的调用。降级阶梯：<b>轮换（零等待）→ 驻留（有界）→ 记录失败累积 → 熔断退出 4</b>。400/404 等请求形错误与密钥无关：不轮换，行为同 v1.5。<code>embed()</code> 与 <code>[embedding.*]</code> profile 适用同一机制。</td></tr><tr><td>图像编码</td><td>调用时读盘 → 若长边 &gt; <b>生效像素档</b>按比例缩小再编码（Pillow）→ base64 → 请求发出后即释放字节（懒加载契约，2.6 节）。v1.11 生效档链（V18/V21/V23①，3.9.5）：<code>生效 px = bundle.image_px or profile.default_image_px or profile.max_image_px</code>，再钳 <code>min(·, profile.max_image_px)</code>——<code>default_image_px</code> 为采样默认工作点（0/缺省 = 沿用 max_image_px，行为与 v1.10 逐字节一致，5.1）、<code>bundle.image_px</code> 为 V21 判审升级档载体、<code>max_image_px</code> 恒为升级天花板。</td></tr><tr><td>计量</td><td>从响应 usage 字段累计 prompt/completion token；<code>profile.price_per_mtok_in/out</code>（可选配置）存在时折算成本入报告。</td></tr><tr><td>校准采样（v1.11）</td><td>每个<b>含图</b>成功响应向图片成本校准器（V19，3.9.5）喂一个样本：<code>(usage.prompt_tokens − est_text(本请求文本)) / 本请求图数</code>；响应无可用 usage（企业网关有 <code>usage: null</code>，[C-64]）⇒ 不记样本、WARN 一次/profile（"image-cost calibration inactive"）——校准器停留先验 ×1.2。</td></tr><tr><td>快照（v1.10）</td><td><code>snapshot()</code>（3.9.2）为 console 面板的只读拉取面（7.7，每 tick 一次）：<code>in_flight</code> = Σ 密钥在途（在线 HTTP 请求数口径）、密钥三态（ok / cooldown 携剩余秒 / disabled）、用量镜像 usage、<b>p50 延迟 = 每 (kind, profile) 有界样本窗 <code>deque(maxlen=256)</code> 的中位数</b>（成功逻辑调用口径，<code>_post_with_retries</code> 成功返回前喂入——v1.10 唯一新增采集点）；窗口与中位数<b>不入 report.json</b>（报告零新键，7.7）、不入任何事件。</td></tr></table>
 <div class="backing"><b>背书：</b>统一多 provider 异步客户端、外部资源许可、显式 HTTPX Limits 与指数退避分别对应成熟客户端的
 资源接纳、连接池和失败恢复边界；全抖动退避为 AWS 架构规范确立的工业标准。</div>
+<p><code>timeout_s</code> 同时约束每次 HTTP attempt 的总墙钟时间与 HTTPX 的网络无进展时间。
+总截止从取得 origin 许可后开始，到响应体接收完成为止，不包含资源排队、退避或密钥冷却。
+总截止沿既有可重试故障路径处理；外部取消保持 <code>CancelledError</code>，<code>PoolTimeout</code> 仍为内部容量错误。
+非对象 JSON 已由现有 provider parser 归为可重试的畸形响应，不新增重复的形状检查。</p>
 <h3>3.9.4 输入 / 输出示例</h3>
 <p>以统一 UI 示例贯穿：5.1 的 <code>[llm.default]</code> profile + 5.2 的 project.toml，记录为文件对 <code>capture/2026-07-01/b/uitree_2.jsonl</code> + <code>c/image_2.png</code>（<code>pair_index=2</code>，即 6.3 中 id 为 <code>9f2c31ab52e08d17</code> 的登录页记录）。M5 按 3.5.2 模板组装 <code>PromptBundle</code>，M8 因 <code>supports_structured_output=true</code> 启用 L0，M9 适配为如下 <code>openai_compatible</code> 请求。</p>
 <h4>① 标注请求报文（openai_compatible）与响应要点</h4>

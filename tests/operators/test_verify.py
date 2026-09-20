@@ -218,6 +218,7 @@ def _scripted_repair(new_annotations):
 
 C1 = {"aspect": "字段语义", "opinion": "difficulty 应为 medium"}
 C2 = {"aspect": "字段语义", "opinion": "修正正确"}
+C3 = {"aspect": "事实一致性", "opinion": "topic 仍缺少来源"}
 
 
 def test_pass_on_first_round():
@@ -276,15 +277,34 @@ def test_drop_policy_fails_immediately_without_repair():
 
 def test_two_repair_rounds_then_pass():
     anns = [_annotation({"v": i}) for i in range(3)]
-    judge = _scripted_judge([("fail", [C1]), ("fail", [C1]), ("pass", [C2])])
+    judge = _scripted_judge([("fail", [C1]), ("fail", [C3]), ("pass", [C2])])
     repair = _scripted_repair(anns[1:])
     verdict, rounds, critiques, final = asyncio.run(
         run_verify_loop(anns[0], judge, repair, policy="repair", max_repair_rounds=2)
     )
     assert (verdict, rounds) == ("pass", 3)
-    assert critiques == [C1, C1, C2]
+    assert critiques == [C1, C3, C2]
     assert final is anns[2]
-    assert len(repair.calls) == 2
+    assert repair.calls == [(anns[0], [C1]), (anns[1], [C1, C3])]
+
+
+def test_repair_history_excludes_pass_votes_and_is_snapshot_isolated():
+    """审核报告保留全部意见，返工只累计 fail 意见且不暴露历史列表本体。"""
+    anns = [_annotation({"v": i}) for i in range(3)]
+    script = iter([("fail", [C1, C2], [C1]), ("fail", [C3, C2], [C3]), ("pass", [], [])])
+    captured = []
+
+    async def judge(annotation, round_no):
+        return next(script)
+
+    async def repair(annotation, critiques):
+        captured.append(list(critiques))
+        critiques.append({"aspect": "injected", "opinion": "must not persist"})
+        return anns[len(captured)]
+
+    result = asyncio.run(run_verify_loop(anns[0], judge, repair, "repair", 2))
+    assert captured == [[C1], [C1, C3]]
+    assert result == ("pass", 3, [C1, C2, C3, C2], anns[2])
 
 
 def test_zero_repair_rounds_behaves_like_drop():
@@ -824,6 +844,50 @@ def test_classic_waves_thread_label_through_judges_and_repair(monkeypatch):
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+@pytest.mark.parametrize("judges", [(), ("fail_a", "pass_b", "fail_c")])
+def test_classic_repair_accumulates_failed_judges_and_keeps_review_independent(monkeypatch, judges):
+    """实际波次驱动携带历史批评与最新候选，独立复审不受历史意见污染。"""
+    cfg = _classified_cfg(policy="repair", max_repair_rounds=2)
+    cfg = replace(cfg, verify=replace(cfg.verify, judges=judges))
+    panel = judges or (cfg.verify.llm,)
+    rounds = dict.fromkeys(panel, 0)
+    annotations = [_annotation({"intent": f"candidate-{index}"}) for index in range(3)]
+    item = PipelineItem(record=_record(text="original-evidence"), annotation=annotations[0])
+    prompts, repairs = [], []
+
+    async def complete(judge, prompt, *, schema, scope):
+        round_no = rounds[judge]
+        rounds[judge] += 1
+        prompts.append(prompt)
+        fail = judge != "pass_b" and round_no < 2
+        critique = {"aspect": "check", "opinion": f"{judge}-round-{round_no}"}
+        return {"verdict": "fail" if fail else "pass", "critiques": [critique]}, Usage(1, 1), 1, "m"
+
+    async def repair(record, ctx, opts=None):
+        assert record is item.record
+        repairs.append(opts.repair)
+        return annotations[len(repairs)]
+
+    monkeypatch.setattr("labelkit.operators.annotate.annotate_record_leaf", repair)
+    ctx = _task_context(cfg=cfg, schema_engine=SimpleNamespace(complete_validated=complete),
+                        metrics=_CapturingMetrics(), batch_no=1)
+    asyncio.run(VerifyStage(cfg).run([item], ctx))
+
+    expected = []
+    for round_no, entry in enumerate(repairs):
+        expected.extend(f"{judge + '/' if judges else ''}check: {judge}-round-{round_no}"
+                        for judge in panel if judge != "pass_b")
+        assert entry.critiques_text == "\n".join(expected)
+        assert entry.previous_output is annotations[round_no].output
+    assert len(repairs) == 2 and item.annotation is annotations[2]
+    assert (item.verification.verdict, item.verification.rounds) == ("pass", 3)
+    assert len(item.verification.critiques) == len(panel) * 3
+    for index, prompt in enumerate(prompts):
+        text = "\n".join(part.text or "" for message in prompt.messages for part in message.parts)
+        assert "original-evidence" in text and "-round-" not in text
+        assert f"candidate-{index // len(panel)}" in text
+
+
 # v1.8 stream branch — sequence review (S7) + two-phase member surgery (S8/S31)
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -1300,6 +1364,44 @@ def test_multi_judge_defects_union_over_fail_voters_only():
     assert "verify.defects.missing_head" not in metrics.counters
 
 
+def test_stream_panel_repair_uses_only_fail_voter_critiques(monkeypatch):
+    cfg = _stream_cfg(judges=("fail_a", "pass_b", "fail_c"))
+    annotate_calls = _stub_annotate(monkeypatch)
+    frame = _frame("f0")
+    episode = _episode([frame])
+    first_round = (
+        {"aspect": "accuracy", "opinion": "FAIL_A_HISTORY"},
+        {"aspect": "clarity", "opinion": "PASS_B_HISTORY"},
+        {"aspect": "coverage", "opinion": "FAIL_C_HISTORY"},
+    )
+    engine = SeqJudgeEngine({episode.record.id: [
+        _seq_obj("fail", critiques=[first_round[0]], defects=[_defect("label_mismatch")]),
+        _seq_obj("pass", critiques=[first_round[1]]),
+        _seq_obj("fail", critiques=[first_round[2]], defects=[_defect("label_mismatch")]),
+        _seq_obj("pass", critiques=[]),
+        _seq_obj("pass", critiques=[]),
+        _seq_obj("pass", critiques=[]),
+    ]})
+
+    _run_verify(cfg, [_env(frame), episode], engine)
+
+    (repair_call,) = annotate_calls
+    assert repair_call.repair.critiques_text == (
+        "fail_a/accuracy: FAIL_A_HISTORY\nfail_c/coverage: FAIL_C_HISTORY"
+    )
+    assert episode.verification.critiques == tuple(
+        {**critique, "judge": judge}
+        for critique, judge in zip(first_round, ("fail_a", "pass_b", "fail_c"), strict=True)
+    )
+    assert (episode.verification.verdict, episode.verification.rounds) == ("pass", 2)
+    review_prompts = (
+        "\n".join(part.text or "" for message in call[1].messages for part in message.parts)
+        for call in engine.calls[3:]
+    )
+    assert all(not any(critique["opinion"] in prompt for critique in first_round)
+               for prompt in review_prompts)
+
+
 def test_fail_with_empty_defects_normalized_to_default_label_mismatch_drop():
     cfg = _stream_cfg(policy="drop")
     f0 = _frame("f0")
@@ -1327,6 +1429,48 @@ def test_fail_with_empty_defects_routes_repair_reannotation(monkeypatch):
     assert call.repair.critiques_text == "字段语义: difficulty 应为 medium"
     assert not hasattr(ep, "stream_repaired")          # no member surgery happened
     assert "verify.membership_repairs" not in metrics.counters
+
+
+def test_stream_repair_accumulates_fail_critiques_across_rounds(monkeypatch):
+    cfg = _stream_cfg(max_repair_rounds=2)
+    annotate_calls = _stub_annotate(monkeypatch)
+    frame = _frame("f0")
+    episode = _episode([frame])
+    engine = SeqJudgeEngine({episode.record.id: [
+        _seq_obj("fail", critiques=[C1], defects=[_defect("label_mismatch")]),
+        _seq_obj("fail", critiques=[C3], defects=[_defect("label_mismatch")]),
+        _seq_obj("pass", critiques=[C2]),
+    ]})
+
+    _run_verify(cfg, [_env(frame), episode], engine)
+
+    assert [call.repair.critiques_text for call in annotate_calls] == [
+        render_critiques_text([C1]), render_critiques_text([C1, C3]),
+    ]
+    assert episode.verification.critiques == (C1, C3, C2)
+    assert (episode.verification.verdict, episode.verification.rounds) == ("pass", 3)
+
+
+def test_stream_member_surgery_preserves_fail_critique_history(monkeypatch):
+    cfg = _stream_cfg(max_repair_rounds=2, extract_enabled=False)
+    annotate_calls = _stub_annotate(monkeypatch)
+    frames = [_frame("f0"), _frame("f1")]
+    episode = _episode(frames)
+    engine = SeqJudgeEngine({episode.record.id: [
+        _seq_obj("fail", critiques=[C1],
+                 defects=[_defect("off_task_members", members=["f1"])]),
+        _seq_obj("fail", critiques=[C3], defects=[_defect("label_mismatch")]),
+        _seq_obj("pass", critiques=[C2]),
+    ]})
+    envelopes = [_env(frame) for frame in frames]
+
+    _run_verify(cfg, [*envelopes, episode], engine)
+
+    assert [member.id for member in episode.record.members] == ["f0"]
+    assert [call.repair.critiques_text for call in annotate_calls] == [
+        render_critiques_text([C1]), render_critiques_text([C1, C3]),
+    ]
+    assert (episode.verification.verdict, episode.verification.rounds) == ("pass", 3)
 
 
 # ── sequence review plumbing: schema + verdict events with defects ──────────
@@ -3758,6 +3902,25 @@ def test_seam_dependency_preserves_exhausted_round_budget_and_fails_stale_result
     assert first.verification.rounds == 2
     assert first.verification.defects[0]["detail"] == "Seam dependency repair budget exhausted."
     assert "seam dependency repair budget exhausted" in caplog.text
+
+
+def test_seam_dependency_appends_refresh_to_fail_critique_history():
+    cfg = replace(_stream_cfg(max_repair_rounds=2), stitch=StitchConfig(enabled=True))
+    batch, first, second = _seam_dependency_batch()
+    second.record = replace(second.record, members=second.record.members[1:])
+    second.member_positions = (5,)
+    state = _EpisodeReview(first, 0)
+    state.rounds, state.verdict = 1, "pass"
+    state.fail_critiques = [C1]
+    ctx = _task_context(cfg=cfg, schema_engine=SeqJudgeEngine({}), metrics=_CapturingMetrics())
+
+    dirty = StreamVerifyDriver(VerifyStage(cfg))._seam_dependents([state], batch, ctx)
+
+    assert dirty == [state]
+    assert state.fail_critiques == [
+        C1,
+        {"aspect": "sequence evidence", "opinion": "Rebuild the changed seam evidence."},
+    ]
 
 
 @pytest.mark.parametrize("batch_size", [1, 100])

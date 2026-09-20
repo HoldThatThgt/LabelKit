@@ -147,7 +147,7 @@ stateDiagram-v2
 | 键 | 默认 | 这个数字在控制什么 |
 |---|---|---|
 | `max_concurrency` | 8 | 该 profile 对应 ResourceKey 的**接纳容量**：同一时刻最多几个完整逻辑调用持有许可。所有经此 profile 的调用（打分、标注、修复、评审）共享这个额度。调大 = 更快 + 更容易撞限流；调小 = 稳但慢。按真实调用形状逐级压测，直到吞吐不再增加、429 上升、延迟拐点或内存边界出现；不使用固定百分比经验值 |
-| `timeout_s` | 120 | 单次请求超时（秒）。超时算**可重试**错误。长输出任务（大 Schema、长标注）适当调大 |
+| `timeout_s` | 120 | 单次 HTTP 请求的总耗时及网络无进展超时（秒），从取得连接准入许可后计时，不包含排队和重试等待。超时算**可重试**错误。长输出任务（大 Schema、长标注）适当调大 |
 | `max_retries` | 5 | 可重试错误（网络错、超时、HTTP 408/409/429/5xx）的最大重试次数。重试之间用「全抖动指数退避」：第 i 次等待 = `random(0, retry_base_delay_s × 2^i)`，封顶 60 秒；429 响应带 `Retry-After` 头时优先遵从（v1.6 起一切 429 等待统一经密钥冷却路径实现且受 `run.max_park_s` 约束，见上节「密钥池」；退避公式适用于其余可重试错误）。**不可重试**错误（401/403/400/404）不重试，直接判致命 |
 | `retry_base_delay_s` | 1.0 | 上式中的退避基数。网关脾气差（频繁 429）时调大到 2–4 |
 
@@ -158,7 +158,7 @@ stateDiagram-v2
 | 键 | 默认 | 填错的后果 |
 |---|---|---|
 | `supports_structured_output` | false | 声明该模型支持原生结构化输出。填 `true` 时，结构引擎启用结构化输出层：OpenAI 兼容口传 `response_format={"type":"json_schema",...}`，Anthropic 口用强制工具调用把 Schema 作为工具入参。**模型实际不支持却填 true** ⇒ 请求可能直接报 400。填 false 完全没问题——只是结构保证全部落到代码修复层（第 14 章），多花一点修复调用 |
-| `supports_vision` | false | UI 普通流中，实际接收截图的 segment、classify、frame.classify、extract、quality、annotate、frame.annotate、verify 及相关修复 profile 必须支持视觉。每个成员的完整图片证据都会进入对应请求。stitch 仍使用纯文本语义卡片，不要求视觉，但合并候选必须另过完整序列容量预检。 |
+| `supports_vision` | false | UI 普通记录启用标注和 L3 修复时，显式修复 profile 也必须支持视觉。UI 普通流中，实际接收截图的 segment、classify、frame.classify、extract、quality、annotate、frame.annotate、verify 及相关修复 profile 必须支持视觉。每个成员的完整图片证据都会进入对应请求。stitch 仍使用纯文本语义卡片，不要求视觉，但合并候选必须另过完整序列容量预检。 |
 
 ### vLLM 扩展请求参数
 

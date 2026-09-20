@@ -2360,9 +2360,9 @@ def test_stream_quality_requires_vision_for_complete_ui_evidence(env):
 
 
 @pytest.mark.parametrize("stream,attempts,vision,accepted", [
-    (True, 1, False, False), (True, 1, True, True), (True, 0, False, True), (False, 1, False, True),
+    (True, 1, False, False), (True, 1, True, True), (True, 0, False, True), (False, 1, False, False),
 ])
-def test_complete_evidence_repair_profile_requires_vision_only_when_reachable(env, stream, attempts, vision, accepted):
+def test_annotation_repair_profile_requires_vision_only_when_reachable(env, stream, attempts, vision, accepted):
     body = SEG_ON + 'strategy = "rules"' if stream else ""
     project = env.project(input_path=env.input_dir, modality="ui", body=body)
     project = project.replace("[output]\n", '[output]\nrepair_llm = "novision"\n'
@@ -2373,6 +2373,13 @@ def test_complete_evidence_repair_profile_requires_vision_only_when_reachable(en
     else:
         errors = env.errors(config_text=BASE_CONFIG + profile, project_text=project)
         has(errors, "[llm.novision].supports_vision: a profile referenced by the output.repair stage(s) in UI modality")
+
+
+def test_nonannotation_repair_profile_need_not_support_vision(env):
+    project = env.project(input_path=env.input_dir, modality="ui", annotate_body="enabled = false")
+    project = project.replace("[output]\n", '[output]\nrepair_llm = "novision"\n')
+    cfg = env.load(config_text=BASE_CONFIG + NOVISION_PROFILE, project_text=project)
+    assert cfg.annotate.enabled is False and cfg.output.repair_llm == "novision"
 
 
 def test_disabled_stream_schema_repair_adds_no_capacity_or_credential_requirement(env):

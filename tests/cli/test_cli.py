@@ -189,6 +189,7 @@ EXPECTED_TEST_PY = {
     "tests/hook_samples.py",
     "tests/llm_client_helpers.py",
     "tests/integration/test_annotate_llm.py",
+    "tests/integration/test_annotation_repair_context_llm.py",
     "tests/integration/test_budget_llm.py",
     "tests/integration/test_classify_llm.py",
     "tests/integration/test_execution_runtime_local_llm.py",

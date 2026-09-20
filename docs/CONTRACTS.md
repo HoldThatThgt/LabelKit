@@ -3075,7 +3075,7 @@ validated against `VERDICT_SCHEMA` (§10.7). Multi-judge: independent identical 
 by majority, all critiques merged with `"judge"` field added, one `verify.verdict` trace event
 per judge per round. Policy drop: fail → `status="dropped_verify"`. Policy repair: on fail and
 rounds used < `max_repair_rounds`: build `RepairContext(previous_output=item.annotation.output,
-critiques_text=<critiques of the judges that voted fail, one per line, "aspect: opinion",
+critiques_text=<all prior rounds of critiques from judges that voted fail, in round/panel order, "aspect: opinion",
 multi-judge prefixed with judge name>)`, call
 `annotate_record(record, ctx, AnnotatePromptOptions(repair=repair))`; new
 annotation replaces `item.annotation`; re-verify; still fail at budget → drop as above.
@@ -3114,11 +3114,12 @@ label=…))` (§7.4). The stage passes `item.classification.label if item.classi
 
 v1.8 stream branch (sequence envelopes only; spec 3.7 stream branch, S7/S8/S31). The
 non-stream path is a REGRESSION ANCHOR — `run_verify_loop` and `VERDICT_SCHEMA` are
-byte-unchanged; sequence envelopes are driven by a stage-layer bypass driver:
+retained; the classic repair loop now accumulates fail-voter critiques across rounds. Sequence envelopes use a stage-layer bypass driver:
 
 - **Schema & verdict.** Reviews validate against `defect_verdict_schema()` (§10.7) — three
   top-level keys `{critiques, defects, verdict}`, ALL required (S7). `critiques` flow through
-  the existing merge/feed-back chain unchanged; `defects` land in
+  the merge/feed-back chain; repair accumulates fail-voter critiques across rounds, including after
+  member surgery. Seam-refresh critiques append to that history. `defects` land in
   `VerificationResult.defects` and `_meta.verification.defects` (§9.1). A `fail` verdict with
   an EMPTY defects array is normalized code-side to one default `label_mismatch` entry (S7).
   Multi-judge: defects = the UNION over judges that voted fail, deterministically
@@ -3211,8 +3212,12 @@ messages, complete text/trees, all images and image size, then appends the previ
 output and violations. `complete_finalized` projects the previous output back to model-owned fields.
 An actual repair `ContextOverflowError` preserves its original profile, phase and origin and propagates
 to the owning session stage without being converted to SchemaViolation or fed to the breaker by M8.
-Ordinary record calls with `complete_evidence = false` retain the existing compact L3 repair prompt;
-generation retains its separate post-validation and finalization repair contract.
+Process-mode record annotation sets `CallScope.retain_repair_prompt = true`, preserving its original
+assembled prompt in L3 without changing ordinary repair overflow into a session-capacity error.
+Only `complete_evidence = true` propagates repair overflow; ordinary calls still short-circuit as
+SchemaViolation and account reactive terminal errors once. A UI annotation repair profile must support
+vision when L3 is enabled, including an explicit `output.repair_llm`. Other ordinary internal calls keep
+the compact repair prompt; generation retains its separate repair contract.
 
 ```python
 @dataclass(frozen=True)
@@ -3225,6 +3230,7 @@ class CallScope:
     user_treatment: bool | None = None
     repair_context_bytes: int | None = None
     complete_evidence: bool = False
+    retain_repair_prompt: bool = False
 
 
 @dataclass(frozen=True)
@@ -3715,6 +3721,10 @@ AsyncClient is lazy and uses `httpx.Limits(max_connections=N, max_keepalive_conn
 HTTP attempt acquires `origin_limit(origin_for(resource_key))` before dispatch. The explicit wait
 feeds `runtime.http_pool_wait_ms`; provider latency begins after the permit. An `httpx.PoolTimeout`
 after origin admission is an InternalError and is classified before generic timeout handling.
+The profile's `timeout_s` also bounds the total wall-clock duration of each HTTP attempt, from
+origin admission until its response body is received. Each retry gets its own deadline; resource
+waits, backoff and key cooling do not consume it. Deadline expiry follows ordinary retry accounting,
+while external cancellation remains CancelledError.
 
 The root LLMClient owns `aclose()`; probe children share its ResourceManager and connection pool
 without close ownership. Close is idempotent and physically occurs once. On normal completion a
@@ -8163,7 +8173,7 @@ annotation prompt when re-annotating (`RepairContext`):
 [上一版标注] {json.dumps(previous_output, ensure_ascii=False)}
 [审核意见] {critiques_text}                 ← one per line: "aspect: opinion";
                                               multi-judge: "judge_name/aspect: opinion" [FROZEN HERE]
-请修正后重新输出
+请依据原始数据和上一版标注核验全部历史批评，保留已正确内容，只修正仍成立的问题。只输出修正后的 JSON。
 ```
 
 Process-stream verify uses the complete member evidence and occurrence-position schema.
@@ -8209,6 +8219,9 @@ A fail verdict with no defects becomes label_mismatch. Defects caused exactly by
 artificial capacity boundary remain audited suspicions and do not alone fail the view.
 All other defect semantics and the ordinary non-stream template remain in force.
 
+For `maxItems`, violations render only the allowed and actual item counts, without repeating
+array values; the complete candidate remains in the repair message. The root JSON Pointer is empty.
+
 ### 10.6 M8 L3 repair prompt (spec 3.8.2 / 3.8.4, verbatim) — single user message
 
 ```
@@ -8221,6 +8234,10 @@ All other defect semantics and the ordinary non-stream template remain in force.
 
 只输出修正后的 JSON。
 ```
+
+Process record annotations preserve the first assembled prompt when `retain_repair_prompt=true`,
+then append the previous model-space output and violations. Unlike process-stream `complete_evidence`,
+this does not propagate repair overflow out of M8; ordinary SchemaViolation accounting remains unchanged.
 
 ### 10.6.1 M8 EventPlan post-validator repair dialogue (v1.18, verbatim)
 

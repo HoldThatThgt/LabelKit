@@ -243,7 +243,9 @@ def _vision_users(ctx: _LoadCtx, views: tuple[ClassView, ...]) -> dict[str, set[
     if p.verify.enabled:
         for name in (p.verify.judges or (p.verify.llm,)):
             users.setdefault(name, set()).add("verify")
-    if p.segment.enabled and users and p.output.max_repair_attempts > 0 and p.output.repair_llm:
+    repair_replays_images = ((p.segment.enabled and bool(users))
+                             or (ctx.mode == "process" and p.annotate.enabled))
+    if repair_replays_images and p.output.max_repair_attempts > 0 and p.output.repair_llm:
         users.setdefault(p.output.repair_llm, set()).add("output.repair")
     return users
 

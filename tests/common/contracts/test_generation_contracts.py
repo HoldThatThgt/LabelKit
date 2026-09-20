@@ -980,6 +980,7 @@ def test_generation_limit_defaults_are_exact():
 def test_call_scope_manifest_is_exact():
     assert tuple(field.name for field in dataclasses.fields(CallScope)) == (
         "record_ids", "batch_no", "record", "user_treatment", "repair_context_bytes", "complete_evidence",
+        "retain_repair_prompt",
     )
     assert get_type_hints(CallScope) == {
         "record_ids": tuple[str, ...],
@@ -988,8 +989,9 @@ def test_call_scope_manifest_is_exact():
         "user_treatment": bool | None,
         "repair_context_bytes": int | None,
         "complete_evidence": bool,
+        "retain_repair_prompt": bool,
     }
-    assert CallScope() == CallScope((), 0, None, None, None, False)
+    assert CallScope() == CallScope((), 0, None, None, None, False, False)
 
 
 @pytest.mark.parametrize(

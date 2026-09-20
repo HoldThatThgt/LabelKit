@@ -6,9 +6,9 @@
 ``ProfileUsage`` / ``_RetryContext`` / ``_KeyState`` / ``KeyUsage`` /
 ``_AttemptFailure``）后直调单个步骤函数，断言状态转移与返回值。真正需要一次 HTTP
 往返的两个函数（``_dispatch_attempt`` / ``_post_with_retries``）改由真端点集成套件
-承保；离线套件只允许在 origin admission 前以资源边界哨兵检查每次 attempt 的 body
-handoff，不伪造 HTTP server 或 transport。全程不睡真实墙钟：``_Clock`` 把模块内的
-``time.monotonic`` 与 ``asyncio.sleep`` 换成虚拟时钟。"""
+承保；离线总截止测试使用真实 HTTPX 的 request hook 在发包前阻塞或抛错，验证真实
+asyncio 截止与取消，不伪造 HTTP server、transport 或响应。退避和驻留测试使用
+``_Clock`` 替换模块内的 ``time.monotonic`` 与 ``asyncio.sleep``。"""
 from __future__ import annotations
 
 import asyncio
@@ -33,6 +33,7 @@ from labelkit.common.config.model import EmbeddingProfile, LLMProfile, TraceConf
 from labelkit.common.errors import (
     CircuitBreakerTripped,
     ContextOverflowError,
+    InternalError,
     OutputTruncatedError,
     ProviderFatalError,
     ProviderRetryableError,
@@ -1876,6 +1877,161 @@ def _failure(**over) -> _AttemptFailure:
                     body_text="upstream", retry_after=None, retryable=True)
     defaults.update(over)
     return _AttemptFailure(**defaults)
+
+
+async def test_total_attempt_deadline_cancels_before_transport():
+    """真实 HTTPX 请求钩子阻塞发包，真实总截止必须取消且沿原重试路径终局化。"""
+    prof = _llm_profile(timeout_s=0.05, max_retries=0)
+    recorder = _EngineRecorder()
+    client, ctx = _engine(prof, metrics=recorder)
+    ks, ku = _key(ctx)
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def hold_before_send(request):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    client._http_client = httpx.AsyncClient(event_hooks={"request": [hold_before_send]})
+    try:
+        async with asyncio.timeout(1):
+            failure = await client._dispatch_attempt(ctx, ks, ku)
+    finally:
+        await client.aclose()
+
+    assert started.is_set() and cancelled.is_set()
+    assert failure.retryable is True
+    assert "total HTTP attempt deadline" in failure.message
+    assert ctx.latency_ms >= 40
+    assert ks.in_flight == 0
+    with pytest.raises(ProviderRetryableError, match="total HTTP attempt deadline") as caught:
+        client._guard_retry_budget(ctx, ks, failure)
+    assert caught.value.retries == 0
+    assert recorder.payload(1)["status"] == "retryable_exhausted"
+
+
+async def test_external_cancellation_preserves_control_flow_and_origin_permit():
+    """外部取消原样上抛，不误算 provider 超时，且归还实际 origin 许可。"""
+    client, ctx = _engine(_llm_profile(max_concurrency=1), metrics=_EngineRecorder())
+    ks, ku = _key(ctx)
+    started = asyncio.Event()
+
+    async def hold_before_send(request):
+        started.set()
+        await asyncio.Event().wait()
+
+    client._http_client = httpx.AsyncClient(event_hooks={"request": [hold_before_send]})
+    task = asyncio.create_task(client._dispatch_attempt(ctx, ks, ku))
+    try:
+        await asyncio.wait_for(started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        origin = client._resources.origin_for(("llm", "default"))
+        async with asyncio.timeout(1), client._resources.origin_limit(origin):
+            assert ks.in_flight == 0
+        assert ctx.acc.calls == 0
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await client.aclose()
+
+
+async def test_attempt_deadline_excludes_origin_queue():
+    """真实 origin 排队超过 timeout_s 后，HTTP attempt 仍能开始并获得自己的截止。"""
+    client, ctx = _engine(_llm_profile(timeout_s=0.05, max_concurrency=1))
+    ks, ku = _key(ctx)
+    started = asyncio.Event()
+
+    async def hold_before_send(request):
+        started.set()
+        await asyncio.Event().wait()
+
+    client._http_client = httpx.AsyncClient(event_hooks={"request": [hold_before_send]})
+    origin = client._resources.origin_for(("llm", "default"))
+    try:
+        async with asyncio.timeout(1):
+            async with client._resources.origin_limit(origin):
+                task = asyncio.create_task(client._dispatch_attempt(ctx, ks, ku))
+                await asyncio.sleep(0.075)
+                assert not task.done() and not started.is_set()
+            failure = await task
+        assert started.is_set() and "total HTTP attempt deadline" in failure.message
+        assert ks.in_flight == 0
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await client.aclose()
+
+
+async def test_pool_timeout_remains_internal_after_explicit_admission():
+    """连接池契约故障不得被新增总截止的通用异常分支吞成 provider 重试。"""
+    client, ctx = _engine()
+    ks, ku = _key(ctx)
+
+    async def reject_before_send(request):
+        raise httpx.PoolTimeout("pool admission invariant")
+
+    client._http_client = httpx.AsyncClient(event_hooks={"request": [reject_before_send]})
+    try:
+        with pytest.raises(InternalError, match="HTTP pool exhausted"):
+            await client._dispatch_attempt(ctx, ks, ku)
+        assert ks.in_flight == 0 and ctx.acc.calls == 0
+    finally:
+        await client.aclose()
+
+
+async def test_deadline_retries_receive_a_fresh_attempt_budget():
+    """每次重试独立取得总截止，沿既有预算终局化且不发送网络请求。"""
+    prof = _llm_profile(timeout_s=0.05, max_retries=1, retry_base_delay_s=0)
+    client, _ctx = _engine(prof)
+    attempts = []
+    elapsed = []
+
+    async def hold_before_send(request):
+        attempts.append(request.url.path)
+        started = asyncio.get_running_loop().time()
+        try:
+            await asyncio.sleep(prof.timeout_s * 1.5)
+        except asyncio.CancelledError:
+            elapsed.append(asyncio.get_running_loop().time() - started)
+            raise
+        pytest.fail("HTTP attempt exceeded its configured deadline")
+
+    client._http_client = httpx.AsyncClient(event_hooks={"request": [hold_before_send]})
+    prompt = PromptBundle(messages=(Message(role="user", parts=(Part(kind="text", text="ping"),)),))
+    try:
+        async with asyncio.timeout(1):
+            with pytest.raises(ProviderRetryableError, match="total HTTP attempt deadline") as caught:
+                await client.complete("default", prompt)
+        assert caught.value.retries == 1
+        assert len(attempts) == 2
+        assert len(elapsed) == 2 and all(value >= prof.timeout_s * 0.8 for value in elapsed)
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize("payload", [[], None, "private-response", 3, True])
+@pytest.mark.parametrize("provider", ["openai_compatible", "anthropic"])
+def test_non_object_provider_json_is_already_retryable(payload, provider, caplog):
+    """实际 provider parser 已拒绝非对象 JSON；错误只描述类型，不携带内容。"""
+    prof = _llm_profile(provider=provider, max_retries=0)
+    recorder = _EngineRecorder()
+    client, ctx = _engine(prof, metrics=recorder)
+    ctx.spec = client._complete_spec(prof, PromptBundle(messages=()), None)
+    ks, ku = _key(ctx)
+    response = httpx.Response(200, content=json.dumps(payload))
+    with caplog.at_level(logging.WARNING, logger="labelkit.llm"):
+        failure = client._settle_2xx(ctx, ks, ku, response)
+    assert failure.retryable is True and failure.status_code is None
+    assert "malformed provider response" in failure.message
+    assert "private-response" not in failure.message + caplog.text
+    with pytest.raises(ProviderRetryableError):
+        client._guard_retry_budget(ctx, ks, failure)
+    assert recorder.payload(1)["status"] == "retryable_exhausted"
 
 
 # ── _RetryContext: the two accessors ───────────────────────────────────────

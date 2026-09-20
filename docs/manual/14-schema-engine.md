@@ -50,9 +50,11 @@ flowchart TD
     gate -->|耗尽| rejected["记录 failed 进拒绝通道：错误码 schema_violation，若剩余违规全部来自回调则为 callback_violation"]
 ```
 
-v1.11 补两条边界规则：
+修复边界规则：
 
 - **截断响应不进这套循环**——输出写满 `max_output_tokens` 的响应（`finish_reason=length` / `stop_reason=max_tokens`）被终局化为 `output_truncated` 记录级拒收，从确定性修复层到 LLM 修复环都不再碰它（14.3）；
+- **处理已有记录时保留修复依据**——记录标注的 Schema 修复保留首轮实际请求，包括任务、Schema、few-shot、文本和图片。普通记录修复超预算仍按 Schema 校验失败收尾；处理流继续交由会话容量机制处理。UI 的生效修复模型必须支持图片。
+- **数组超长直接报告数量**——`maxItems` 错误写明最多允许和实际收到的项目数，避免在违规说明中再次粘贴整个数组。
 - **修复调用自己也受上下文预算约束**——所引 profile 声明了 `context_window`（第 6 章）时，某轮修复请求本身超预算则该轮记失败并**短路至预算耗尽**（修复提示词恒定，余轮必然同败；`[原始输出]` 修复原文永不截断——截断即破坏修复语义），拒收归因维持 `schema_violation` / `callback_violation` 不变。
 
 ### 业务时间的 model Schema 与完整 Schema

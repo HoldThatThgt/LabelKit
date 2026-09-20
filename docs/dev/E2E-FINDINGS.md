@@ -13,6 +13,47 @@
 - API key value 只在内存中使用，不写日志、trace、main、stream、report、manifest、failed report 或 assertion repr。
 - 尚未运行的证据必须保留 `[PENDING-EVIDENCE:<name>]`，不能用规格期望冒充结果。
 
+## 2026-09-20 通用推理与返工修复证据
+
+原主线 `5a359ca` 与 WorldMock 私有依赖候选 `e8f168f` 的逐项问题确认、候选评估及最小实现说明见
+`docs/dev/REVIEW-common-inference-repair.md`。没有直接合入候选提交；非对象 JSON 已正确归为可重试错误，
+因此只增加回归、不添加重复分支。普通记录保留原始修复请求属于明确的契约修订；提示词保留与容量错误
+传播分别处理。累计审核意见覆盖普通、stream、成员手术和接缝刷新，并且只回灌投 fail 的评委意见。
+
+| 证据面 | 结果与边界 |
+|---|---|
+| 原实现复现 | 总 deadline、数组长度报错重复内容、普通记录丢失修复依据、历史 fail 意见覆盖均有红转绿证据；两种 provider 的十种非对象响应在旧实现已通过 |
+| 相关回归 | 变异审查补强 deadline 与 stream 混合投票断言后，最终六文件 1048 passed in 5.37s；仅测试变化，生产代码未变 |
+| 完整离线 | 3573 passed、57 deselected、671.33 秒；57 项是命令明确排除的真实集成测试 |
+| 生产覆盖 | 12/12 修改或文档变化函数进入，6 文件最低行覆盖 89.88%、最低分支覆盖 78.46%；补强测试后生产源码哈希不变 |
+| 真实 z.ai 客户端 | 6 passed in 28.98s，没有跳过；确认生产 HTTP 客户端仍可实际调用端点 |
+| 真实 z.ai 标注修复 | 1 passed in 11.49s；真实 AnnotateStage、SchemaEngine、LLMClient，通过真实校验回调触发 L3，实际 HTTP 请求保留首轮 system 和消息前缀，两个真实调用、非零 usage、l3_1=1 |
+| 真实序列套件 | 5 passed、1 failed、270.99 秒；失败节点为跨视图单次拒绝后的整组重试，用尽 8 次槽位尝试；没有把该命令记为全部通过 |
+| 无凭据示例 | validate、dry-run 通过；2 sets、8 primary sequences、22 primary events、2 noise、3 replay，共 27 stream rows |
+| 设计产物 | 186 页 PDF 与 HTML 重建；第 51、65、69、70、71、72、73、77 页视检通过 |
+| Uncle Bob | 最终干净快照 8838b618 的 1048 项独立基线通过；23 killed、0 survived、0 invalid、0 inconclusive；每项恢复干净，审查工作树已移除 |
+
+真实序列失败中，7 次尝试被 `semantic_evaluation` 拒绝，另一次成功经过语义生成、标注和生产 reconcile，
+随后被测试自身预期的单次拒绝注入消费。没有总 deadline 或 transport 失败，项目为 text/generate_only，
+verify 关闭；generation、orchestration、runtime 和 common/contracts 未变。本次 prompt 保留及视觉
+校验不作用于该路径，语义审核 Schema 也没有 maxItems。现有证据没有指向本次修复，但仍是一次真实产品失败。
+原临时 trace/failed report 被 pytest 清理，保留了完整失败日志，不能从该日志继续区分 Schema 失败与语义否决。
+旧主线同一节点的干净对照为 1 passed in 46.40s；新快照对应复验仍为 1 failed in 85.46s，
+八次全部为 semantic_evaluation。新复验的固定 trace 确认 144 次真实请求全部 status=ok、retries=0，
+最大单次 latency 1691ms，schema.repair=0；没有 L1/L3 或最终 SchemaViolation，拒绝发生于未修改的
+`_semantic_consistent`。下游 annotate/reconcile、容量、截断及 provider 拒绝计数均为零。
+旧主线也没有 Schema 修复，80 次真实请求均成功，经历 2 次语义拒绝及 1 次测试预期 reconcile 注入后交付。
+当前证据指向既有生成/审核的语义稳定性；refs 不保存响应，不能进一步断言具体语义判据。
+这不是一次全绿发布验收，原失败及复验失败均保留，没有继续重跑到绿。
+变异审查曾发现重试预算扩大与 stream pass 意见混入返工两个测试缺口；补强后完整 23 个变体重新执行并
+全部 killed，三轮台账见 `docs/dev/BOB-common-inference-repair.md`。补强仅涉及测试，生产代码未变化。
+
+验证过程中的失败保持独立：新增 live 测试最初两次因测试配置未填入有效 model Schema 而被 enum 拒绝，
+修正配置并启用端点真实结构化输出后通过，没有放宽生产 Schema。旧主线对照首次在请求前因忽略目录 out
+不存在而失败，按示例要求建立目录后才实际调用模型。早期离线门的包布局白名单遗漏与主动中断求解器的结果
+另存，没有用于最终通过或覆盖率结论。原始日志、固定对照产物、覆盖 JSON 和设计视检记录位于
+`out/verification-common-fixes-20260920/`。
+
 ## 2026-09-09 完整会话与上下文容量证据
 
 权威规格为 `docs/dev/SPEC-sequence-context-capacity.md`，逐项状态见

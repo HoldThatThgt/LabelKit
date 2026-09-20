@@ -31,7 +31,7 @@ state Schema 与 state validator，并把冻结 `EventExecution` 与合法对象
 | L1 | 顺序执行：① 剥离 Markdown 代码围栏；② 取首个花括号平衡子串；③ `json_repair.loads()`（工业库，处理截断/单引号/尾逗号/裸换行 [8]）。全部失败 ⇒ 直接进 L3。L1 为纯函数，无副作用、可单测穷举。 |
 | L2 | `Draft202012Validator.iter_errors()` 收集全部违规，每条含 JSON Pointer 路径、期望与实际。通过后进入可选用户回调或调用级后置验证；未通过进入 L3。enum 等错误统一渲染为英文、值受 trace/content 规则保护。 |
 | L2.5（v1.5，可选） | `output.validator` 配置时、且仅对用户 Schema 调用：L2 通过后执行用户回调 `fn(obj, record)`。返回非空违规列表 ⇒ 违规以 `(validator) <消息>` 形式并入违规清单、与 Schema 违规同路进入 L3 修复环（回调意见回喂模型自我修正——回调既是门卫也是修复环的教练）；返回空 ⇒ 通过。L3 每轮修复输出重走 L1→L2→L2.5。预算耗尽且剩余违规**全部**来自回调 ⇒ `SchemaViolation(callback_only=True)`，记录 kind = `callback_violation`（7.6），否则仍为 `schema_violation`。回调抛异常不吞：向上传播、按记录级 `internal_error` 收敛（3.5.3）。内部 Schema（裁决/评分/评审/生成/分类（v1.7）/分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9））不经过 L2.5。 |
-| L3 | 普通记录修复使用单条 user 消息，保留完整原始输出、违规清单和修正指令。process stream 设置 CallScope.complete_evidence=true，保留首轮全部消息、文本、树、图片及固定尺寸，再追加上一版模型空间输出与违规；finalized 调用先经 repair_projector 移除代码和框架负责字段。修复使用 output.repair_llm（缺省同调用方），重走 L1–L2，次数耗尽抛 SchemaViolation，实际调用均计 usage。process stream 的 ContextOverflowError 保留原 profile/phase/origin 上抛所属会话阶段，不转 SchemaViolation，不由 M8 提前喂熔断。普通记录修复超限保留既有短路 SchemaViolation 及 reactive-400 终态恰一次补喂语义。生成保留其独立完整修复合同。 |
+| L3 | 普通记录的内部调用默认使用单条 user 修复消息。process 记录标注设置 CallScope.retain_repair_prompt=true，保留首轮实际提示词，但容量失败仍按普通路径短路为 SchemaViolation。process stream 设置 CallScope.complete_evidence=true，保留首轮全部消息、文本、树、图片及固定尺寸，再追加上一版模型空间输出与违规；finalized 调用先经 repair_projector 移除代码和框架负责字段。修复使用 output.repair_llm（缺省同调用方），重走 L1–L2，次数耗尽抛 SchemaViolation，实际调用均计 usage。process stream 的 ContextOverflowError 保留原 profile/phase/origin 上抛所属会话阶段，不转 SchemaViolation，不由 M8 提前喂熔断。普通记录修复超限保留既有短路 SchemaViolation 及 reactive-400 终态恰一次补喂语义。生成保留其独立完整修复合同。 |
 
 **v1.19 资源与并发边界。**operator 的 `TaskSpec.resource_key` 只标识首轮业务调用的接纳通道。L3 若切换到
 `output.repair_llm`，SchemaEngine 在同一叶任务内继续调用 LLMClient；LLMClient 必须通过共享
@@ -72,6 +72,7 @@ class CallScope:
     user_treatment: bool | None = None  # 显式待遇门；None ⇒ 按 schema is None 推断
     repair_context_bytes: int | None = None  # 单轮新增 L3 消息正文集合 UTF-8 byte 上限
     complete_evidence: bool = False     # process stream 修复保留原完整请求并上抛容量错误
+    retain_repair_prompt: bool = False  # 普通记录标注仅保留首轮实际请求，容量错误仍按普通路径处理
 
 class SchemaEngine:
     def __init__(self, user_schema: dict, llm: LLMClient, cfg: OutputConfig): ...
@@ -91,6 +92,9 @@ class SchemaEngine:
 
 **设计考量：**“Let Me Speak Freely?”（arXiv:2408.02442）报告了严格格式约束可能损失推理质量 [25]。缓解按各内部 Schema 的实际字段序落地：评审输出的 `critiques` 置于 `verdict` **之前**（3.7.2「先意见后结论」）、pointwise 打分的 `reason` 置于 `score` **之前**（3.4.4「先给两句理由再给整数分」），让模型先推理后作答。例外是成对裁决：字段序为 `criterion → winner → reason`，`reason` 在结论**之后**且仅当 `quality.judgment_reasons` 生效时才要求（3.4.3）——它的用途是落入 trace 供 rubric 优化（7.5），不承担「先推理后作答」的缓解职责（生成输出 `{"samples": [...]}` 则不含自由文本字段）。用户 Schema 若需同类缓解，可自行加 reasoning 字段并在下游忽略。
 **背书：**「Schema 约束生成 + 机器校验 + 修复重试」为工业标准三件套：OpenAI Structured Outputs [7]、约束解码框架 Outlines [23]、JSONSchemaBench 对 6 家引擎的评测 [24]、instructor 的 validation-retry 循环与 json-repair 库 [8]。四层纵深（供应商能力不被信任、校验不可豁免）是对 [24] 所示覆盖缺口的直接工程回应。
+
+`maxItems` 违规渲染为 `<json-pointer>: expected at most N items, received M`。
+违规文本只含数量，不重复完整数组；原始候选仍完整保留在修复提示词中。根 JSON Pointer 为空字符串。
 
 ### 3.8.4 输入 / 输出示例
 
@@ -139,23 +143,16 @@ JSON Pointer: /intent
 
 违规清单非空 ⇒ 进入 L3。
 
-**⑤ L3 修复调用（第 1 次，预算 `output.max_repair_attempts = 2`）：**本工程未配置 `output.repair_llm` ⇒ 使用调用方 profile `default`。修复提示词按 3.8.2 逐字组装 = 原始输出全文 + 违规清单 + 「只输出修正后的 JSON」，作为单条 user 消息发出：
+**⑤ L3 修复调用（第 1 次，预算 `output.max_repair_attempts = 2`）：**本工程未配置 `output.repair_llm` ⇒ 使用调用方 profile `default`。process 记录标注保留首轮 system、few-shot 和原始数据消息，再追加以下 assistant 候选及 user 修复指令：
 
 ```
-[原始输出]
-```json
-{
-  "intent": "writing",
-  "topic": "请假条写作",
-  "difficulty": "easy",
-}
-```
+assistant: <上方首次模型输出全文>
+user:
+  [违规清单]
+  1. /intent: expected one of enum ["writing_assist", "qa", "translation",
+     "chitchat", "other"], got "writing"
 
-[违规清单]
-1. /intent: expected one of enum ["writing_assist", "qa", "translation",
-   "chitchat", "other"], got "writing"
-
-只输出修正后的 JSON。
+  只输出修正后的 JSON。
 ```
 
 修复响应：
@@ -171,7 +168,7 @@ JSON Pointer: /intent
 | L0 | `supports_structured_output = false` | 不注入原生结构化输出参数 | 提示词原样发出，保证责任交给 L1–L3 |
 | L1 | 带围栏 + 尾逗号的原始文本 | 剥围栏 → 平衡花括号子串 → `json_repair.loads()` | 可解析对象（`intent` 仍为 `"writing"`） |
 | L2（第 1 次） | L1 产物 | `iter_errors()` 全量收集违规 | 1 条违规（`/intent` 枚举）⇒ 转 L3 |
-| L3（第 1 次） | 原始输出全文 + 违规清单 | 经 `output.repair_llm`（默认同调用方）发起修复调用 | 修正后的 JSON 文本 |
+| L3（第 1 次） | 首轮完整请求 + 原始输出全文 + 违规清单 | 经 `output.repair_llm`（默认同调用方）发起修复调用 | 修正后的 JSON 文本 |
 | L1→L2（重走） | 修复输出 | 同 L1 / L2 | 通过 ⇒ 返回对象；`attempts = 2`；`resolved_at.l3_1` 计 1 |
 
 若第 2 次 L3 修复后仍未通过 L2，则预算耗尽，抛 `SchemaViolation(errors, raw_last_output)`：该记录 `status = "failed"`、错误码 `schema_violation`（7.6）入 rejects 通道，并计入 `resolved_at.rejected`。
@@ -180,7 +177,7 @@ JSON Pointer: /intent
 
 既有 `complete_validated` 返回类型不变。需要执行状态转移的 EventPlan 使用独立内部入口：
 
-~~~python
+```python
 CallPostValidator = Callable[[Mapping[str, object]], PostValidationResult]
 
 
@@ -188,7 +185,7 @@ async def complete_post_validated(
     request: PostValidatedCallRequest,
 ) -> ValidatedGenerationCall:
     """对每个结构合法候选执行恰一次调用级后置验证。"""
-~~~
+```
 
 `PostValidatedCallRequest` 冻结 profile、prompt、Schema、`CallScope` 与后置验证器。每个首轮或 L3
 候选通过 L2 后恰调用一次：

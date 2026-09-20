@@ -293,6 +293,26 @@ SPEC_REPAIR_PROMPT = (
 
 
 class TestRepairPrompt:
+    def test_max_items_keeps_candidate_once_and_reports_counts(self):
+        values = ["private-claim", "another-claim", "last-claim"]
+        schema = {"type": "object", "properties": {
+            "claims": {"type": "array", "maxItems": 2}}}
+        raw = json.dumps({"claims": values})
+
+        violations = make_engine(schema).validate_only(json.loads(raw))
+        prompt = _build_repair_prompt(raw, violations)
+
+        assert violations == ["/claims: expected at most 2 items, received 3"]
+        assert prompt.count("private-claim") == 1
+
+    @pytest.mark.parametrize("limit, values", [(0, ["only-claim"]), (2, [1, 2, 3])])
+    def test_max_items_root_and_valid_boundary(self, limit, values):
+        schema = {"type": "array", "maxItems": limit}
+        engine = make_engine(schema)
+        assert engine.validate_only(values) == [
+            f": expected at most {limit} items, received {len(values)}"]
+        assert engine.validate_only(values[:limit]) == []
+
     def test_spec_worked_example_byte_exact(self):
         # L1 on the spec's raw output: fence stripped, trailing comma repaired,
         # enum violation survives untouched into L2.
@@ -1015,6 +1035,52 @@ def test_complete_evidence_l3_preserves_original_messages_and_propagates_capacit
     assert repair.messages[-2].role == "assistant" and repair.messages[-1].role == "user"
     assert "[违规清单]" in repair.messages[-1].parts[0].text
     assert engine.stats["rejected"] == 0
+
+
+@pytest.mark.parametrize("finalized", (False, True))
+@pytest.mark.parametrize("origin, expected_feeds", [("http_400", [True]), ("finish", [])])
+def test_retained_repair_prompt_preserves_evidence_without_propagating_capacity(
+        finalized, origin, expected_feeds):
+    from labelkit.common.errors import ContextOverflowError
+
+    image = object()
+    original = PromptBundle(messages=(
+        Message(role="system", parts=(Part(kind="text", text="Keep every member fact"),)),
+        Message(role="user", parts=(Part(kind="text", text="middle decisive fact"),
+                                    Part(kind="image", image=image))),
+    ), image_px=512)
+    overflow = ContextOverflowError("repair overflows", "reactive", "repair-profile", origin)
+
+    class Calls:
+        def __init__(self):
+            self.requests = []
+
+        async def complete(self, profile, prompt, response_schema=None):
+            self.requests.append((profile, prompt, response_schema))
+            if len(self.requests) == 1:
+                return _StubResponse('{"intent":"invalid"}')
+            raise overflow
+
+    llm = Calls()
+    metrics = _MetricsFeedSpy()
+    engine = SchemaEngine(SPEC_SCHEMA, llm=llm,
+                          cfg=OutputConfig(max_repair_attempts=3, repair_llm="repair-profile"), metrics=metrics)
+    scope = CallScope(user_treatment=True, retain_repair_prompt=True)
+    if finalized:
+        request = replace(_finalized_request(scope=scope), prompt=original)
+        operation = engine.complete_finalized(request)
+    else:
+        operation = engine.complete_validated("default", original, scope=scope)
+    with pytest.raises(SchemaViolation):
+        asyncio.run(operation)
+    assert metrics.fed == expected_feeds
+    assert len(llm.requests) == 2
+    profile, repair, schema = llm.requests[1]
+    assert profile == "repair-profile" and schema == llm.requests[0][2]
+    assert repair.messages[:-2] == original.messages and repair.image_px == 512
+    assert repair.messages[-2].role == "assistant" and repair.messages[-1].role == "user"
+    assert "[违规清单]" in repair.messages[-1].parts[0].text
+    assert engine.stats["rejected"] == 1
 
 
 def test_complete_evidence_finalized_repair_keeps_only_model_space_previous_output():

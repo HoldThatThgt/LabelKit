@@ -691,23 +691,25 @@ async def run_verify_loop(
     """驱动评审/修复循环（spec 3.7.3）。
     @param annotation 起始标注
     @param judge_round ``judge_round(annotation, round_no)`` → (结论, 合并意见, 判 fail 意见)
-    @param reannotate ``reannotate(annotation, fail_critiques)`` → 修复后的标注（M5 钩子）
+    @param reannotate ``reannotate(annotation, fail_critiques)`` → 修复后的标注；意见累计自各轮投 fail 的评委
     @param policy 判 fail 后的处置策略
     @param max_repair_rounds 最多重标注轮数
     @return (结论, 已评审轮数（首评计 1）, 累计意见, 最终标注)
     """
     critiques_all: list[dict] = []
+    failed_all: list[dict] = []
     rounds = 0
     while True:
         rounds += 1
         verdict, merged, fail_critiques = await judge_round(annotation, rounds)
         critiques_all.extend(merged)
+        failed_all.extend(fail_critiques)
         if verdict == "pass":
             return "pass", rounds, critiques_all, annotation
         repairs_done = rounds - 1
         if policy != "repair" or repairs_done >= max_repair_rounds:
             return "fail", rounds, critiques_all, annotation
-        annotation = await reannotate(annotation, fail_critiques)
+        annotation = await reannotate(annotation, list(failed_all))
 
 
 def _classify_error(exc: Exception, modality: str) -> tuple[str, bool]:
@@ -750,8 +752,8 @@ def _excerpt_source(record: Record) -> str:
 class _EpisodeReview:
     """流式驱动器的单 episode 台账（一个序列信封一份，跨驱动器轮次存活）。"""
 
-    # 跨轮字段：被评审信封、类标签（首标签）、已评轮数、累计意见、本轮面板结论、本轮判
-    # fail 的意见（回灌 M5）、本轮规范化缺陷表。
+    # 跨轮字段：被评审信封、类标签（首标签）、已评轮数、累计意见、本轮面板结论、累计判
+    # fail 的评委意见及接缝刷新批评（回灌 M5）、本轮规范化缺陷表。
     __slots__ = ("item", "ordinal", "label", "rounds", "critiques", "verdict", "fail_critiques",
                  "defects",
                  # 轮内手术字段（begin_round 重置）：手术前成员元组（重建时比对相邻对）、
@@ -1161,7 +1163,7 @@ class VerifyStage:
         state.rounds += 1
         state.verdict = verdict
         state.critiques.extend(critiques)
-        state.fail_critiques = failed
+        state.fail_critiques.extend(failed)
 
     def _reduce_classic_round(
             self, reviewed: list[_ClassicReview],
@@ -1366,7 +1368,7 @@ class VerifyStage:
 
     async def _reannotate_leaf(
             self, state: _ClassicReview, ctx: "RunContext") -> Annotation:
-        """把判 fail 的意见回灌 M5 标注器重标注一次。
+        """把此前各轮投 fail 的评委意见回灌 M5 标注器重标注一次。
         @param state 当前记录的跨轮台账
         @param ctx 运行上下文
         @return 重标注结果

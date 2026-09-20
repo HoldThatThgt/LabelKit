@@ -49,10 +49,16 @@ user:   [任务指令] {annotate.instruction}
 
 ### 3.7.3 失败策略与修复环
 
+普通记录和处理流序列每次返工携带当前候选和此前所有轮次中投 fail 的评委意见，按轮次、评委顺序累计。
+投 pass 的意见仍写入完整评审结果，不进入返工要求。修复模型依据原始数据重新核验历史批评，
+保留已正确内容；复审评委只接收原始数据和当前候选，不接收历史批评。
+成员手术不清空历史批评；接缝刷新产生的批评追加到历史中。每次返工依据当前成员与接缝证据重新核验。
+
+
 | 策略 | 行为 |
 |---|---|
 | `verify.policy = "drop"`（默认） | fail ⇒ `status="dropped_verify"`，批评意见摘要入 `_meta.verification` 与 rejects 通道。 |
-| `verify.policy = "repair"` | fail ⇒ 将批评意见追加进标注提示词（`[上一版标注] ... [审核意见] ... 请修正后重新输出`），M5 重标注、M8 重校验、M7 重评审；最多 `verify.max_repair_rounds`（默认 1）轮，仍 fail 按 drop 处理。评审轮数记入 `_meta.verification.rounds`（含首评，一次通过 =1；修复后复评 =2），各轮意见按序累积于 `VerificationResult.critiques`（4.2），实例见 3.7.4。 |
+| `verify.policy = "repair"` | fail ⇒ 将批评意见追加进标注提示词（`[上一版标注] ... [审核意见] ... 请依据原始数据和上一版标注核验全部历史批评，保留已正确内容，只修正仍成立的问题。只输出修正后的 JSON。`），M5 重标注、M8 重校验、M7 重评审；最多 `verify.max_repair_rounds`（默认 1）轮，仍 fail 按 drop 处理。评审轮数记入 `_meta.verification.rounds`（含首评，一次通过 =1；修复后复评 =2），各轮意见按序累积于 `VerificationResult.critiques`（4.2），实例见 3.7.4。 |
 
 **stream 修复路由：严格波次（v1.19）。**`policy = "repair"` 下序列信封按缺陷表路由标签重标、成员收缩
 与成员回收。实现位于 `labelkit/operators/stream_verify.py`；`verify.py` 保留 classic judge/repair 核心。每轮冻结整会话各波次的全部叶任务，再由 `ctx.run_group` 按 `batch_size` 分组执行；全部分组收齐后只执行一次 reducer。
@@ -141,7 +147,7 @@ judge 响应（经 M8 按评审内部 Schema 校验合法）：
 ```
 [上一版标注] {"intent": "writing_assist", "topic": "请假条写作", "difficulty": "easy"}
 [审核意见] 字段语义: difficulty 标为 easy，但该指令涉及正式文书格式与措辞得体性，应为 medium
-请修正后重新输出
+请依据原始数据和上一版标注核验全部历史批评，保留已正确内容，只修正仍成立的问题。只输出修正后的 JSON。
 ```
 
 M5（`[llm.default]`，qwen2.5-vl-72b-instruct）重新输出，经 M8 通过用户 Schema（L0 直出即合法，`attempts = 1`）：
@@ -194,7 +200,7 @@ process stream 的 episode 继续使用 3.7.2 缺陷表与成员手术。v1.20 �
 主序列候选，使用既有 verdict Schema 的判决形模板；两者按调用入口区分，不以
 `segment.enabled` 猜测。
 
-~~~python
+```python
 @dataclasses.dataclass(frozen=True)
 class VerifyPromptOptions:
     """一次评审提示词的全部可选装配项。"""
@@ -215,7 +221,7 @@ class VerifyStage(Stage):
         request: DownstreamAttemptRequest,
     ) -> DownstreamAttemptResult:
         """在 sequence attempt 内评审完整候选，不提交全局状态。"""
-~~~
+```
 
 生成 sequence 的判决形 system 检查任务指令遵循、成员 payload 证据一致性与标注字段语义；user 段固定为
 任务指令、按 event order 的完整成员摘要、标注结果。它不生成 process episode 的 boundary/fragment defect 表。

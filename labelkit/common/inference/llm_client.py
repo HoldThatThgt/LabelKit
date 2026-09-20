@@ -1649,19 +1649,21 @@ class LLMClient:
             async with self._resources.origin_limit(origin):
                 start = time.monotonic()
                 try:
-                    resp = await self._http().post(
-                        ctx.spec.url, json=body, headers=headers,
-                        timeout=httpx.Timeout(ctx.prof.timeout_s))
+                    async with asyncio.timeout(ctx.prof.timeout_s):
+                        resp = await self._http().post(
+                            ctx.spec.url, json=body, headers=headers,
+                            timeout=httpx.Timeout(ctx.prof.timeout_s))
                 except httpx.PoolTimeout as exc:
                     _logger.error("HTTP pool exhausted after explicit origin admission")
                     raise InternalError(
                         "HTTP pool exhausted after explicit origin admission"
                     ) from exc
-        except (httpx.TimeoutException, httpx.TransportError) as exc:
+        except (TimeoutError, httpx.TimeoutException, httpx.TransportError) as exc:
             ctx.latency_ms = int((time.monotonic() - start) * 1000)
             _logger.warning("provider transport failure on profile %s: %s",
                             ctx.prof.name, type(exc).__name__)
-            return _AttemptFailure(message=f"{type(exc).__name__}: {exc}")
+            detail = "total HTTP attempt deadline exceeded" if isinstance(exc, TimeoutError) else str(exc)
+            return _AttemptFailure(message=f"{type(exc).__name__}: {detail}")
         else:
             ctx.latency_ms = int((time.monotonic() - start) * 1000)
             if 200 <= resp.status_code < 300:

@@ -47,9 +47,11 @@ extra_criteria = "④ topic 是否为名词短语而非整句复述 ⑤ 涉及�
 | 策略 | 行为 | 适用 |
 |---|---|---|
 | `policy = "drop"`（默认） | fail ⇒ 记录置 `dropped_verify`，进拒绝通道（`stage="verify"`、`reason="verify_fail"`，`errors` 为空——判负不是错误）；批评意见全文只落在 trace 的 `verify.verdict` 事件（见 13.7） | 数据管够、要纯度：错了就扔，不给返工机会 |
-| `policy = "repair"` | fail ⇒ 批评意见追加进标注提示词（`[上一版标注] … [审核意见] … 请修正后重新输出`）→ 重标 → 重校 → **复审**；最多 `max_repair_rounds`（默认 1）轮，仍 fail 按 drop 收尾 | 数据金贵（UI 采集、稀缺场景）：先给一次改错机会 |
+| `policy = "repair"` | fail ⇒ 批评意见追加进标注提示词（`[上一版标注] … [审核意见] … 请依据原始数据和上一版标注核验全部历史批评，保留已正确内容，只修正仍成立的问题。只输出修正后的 JSON。`）→ 重标 → 重校 → **复审**；最多 `max_repair_rounds`（默认 1）轮，仍 fail 按 drop 收尾 | 数据金贵（UI 采集、稀缺场景）：先给一次改错机会 |
 
 repair 回路的三方往返如图——verify 只出意见、annotate 只动笔、结构引擎只把关结构，轮数由 `max_repair_rounds` 封顶：
+每次返工同时携带当前候选和此前各轮投 fail 的评委意见，避免修正新问题时丢失旧要求。
+投 pass 的意见保留在完整评审结果中；独立复审只看原始数据和当前候选。
 
 ```mermaid
 sequenceDiagram

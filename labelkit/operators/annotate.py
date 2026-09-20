@@ -85,7 +85,10 @@ _LABEL_SCREENSHOT = "[屏幕截图]"
 _LABEL_UI_TREE = "[UI 控件树]"
 _LABEL_PREV_OUTPUT = "[上一版标注]"
 _LABEL_CRITIQUES = "[审核意见]"
-_REPAIR_TAIL = "请修正后重新输出"
+_REPAIR_TAIL = (
+    "请依据原始数据和上一版标注核验全部历史批评，保留已正确内容，只修正仍成立的问题。"
+    "只输出修正后的 JSON。"
+)
 
 # v1.8 序列变体片段（CONTRACTS §10.1 序列变体，S5/S6）。
 _LABEL_ACTION_SEQUENCE = "[动作序列]"
@@ -193,7 +196,8 @@ async def _complete_annotation(ctx: "RunContext", record: Record, prompt: Prompt
     """
     profile = ctx.cfg.annotate.llm
     scope = CallScope(record_ids=(record.id,), batch_no=ctx.batch_no,
-                      record=annotation_record_context(record), complete_evidence=ctx.session_attempt is not None)
+                      record=annotation_record_context(record), complete_evidence=ctx.session_attempt is not None,
+                      retain_repair_prompt=ctx.cfg.run.mode == "process")
     postprocessor = record_postprocessor(ctx.cfg, opts.label)
     view = ctx.cfg.class_views.get(opts.label) if opts.label is not None else None
     if postprocessor is not None or (view is not None and view.time_bindings):

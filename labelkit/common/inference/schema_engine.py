@@ -186,7 +186,7 @@ def _json_pointer(path: Any) -> str:
 def _render_error(error: Any) -> str:
     """把一条违规渲染成 '<json-pointer>: <描述>'（面向修复提示词）。
 
-    枚举类违规按 spec 3.8.4 的「期望/实际」措辞自行渲染；其它关键字直接携带
+    枚举与数组长度上限违规按 spec 3.8.4 的固定措辞自行渲染；其它关键字直接携带
     jsonschema 的原始消息。文本既进入 L3 修复提示词，也进入 StageError/rejects，
     因此统一使用英文。
 
@@ -198,6 +198,8 @@ def _render_error(error: Any) -> str:
         expected = json.dumps(list(error.validator_value), ensure_ascii=False)
         actual = json.dumps(error.instance, ensure_ascii=False)
         description = f"expected one of enum {expected}, got {actual}"
+    elif error.validator == "maxItems":
+        description = f"expected at most {error.validator_value} items, received {len(error.instance)}"
     else:
         description = error.message
     return f"{pointer}: {description}"
@@ -729,6 +731,7 @@ class CallScope:
     user_treatment: bool | None = None  # 显式待遇门；None ⇒ 按 schema is None 推断
     repair_context_bytes: int | None = None  # 当前调用单轮新增 L3 正文 byte 上限
     complete_evidence: bool = False     # 修复保留原完整证据；容量错误交还所属算子
+    retain_repair_prompt: bool = False  # 修复保留首轮提示词；容量错误仍按普通路径处理
 
 
 _DEFAULT_SCOPE = CallScope()
@@ -772,7 +775,8 @@ class _CallContext:
     batch_no: int                  # 批次号，仅用于 trace 事件与日志 extra
     record: Any                    # L2.5 回调的第二入参（Record.raw 原始输入映射），无则 None
     repair_context_bytes: int | None = None  # 单轮新增 L3 正文 byte 上限
-    original_prompt: PromptBundle | None = None  # 完整证据调用修复时原样重放的首轮提示词
+    complete_evidence: bool = False  # 修复容量错误是否交还所属算子
+    original_prompt: PromptBundle | None = None  # 修复时原样重放的首轮提示词
 
 
 @dataclass(frozen=True)
@@ -996,7 +1000,8 @@ def _finalized_context(request: FinalizedCallRequest) -> _CallContext:
         batch_no=scope.batch_no,
         record=scope.record,
         repair_context_bytes=scope.repair_context_bytes,
-        original_prompt=request.prompt if scope.complete_evidence else None,
+        complete_evidence=scope.complete_evidence,
+        original_prompt=(request.prompt if scope.complete_evidence or scope.retain_repair_prompt else None),
     )
 
 
@@ -1180,7 +1185,8 @@ class SchemaEngine:
             user_treated=treated, record_ids=scope.record_ids,
             batch_no=scope.batch_no, record=scope.record,
             repair_context_bytes=scope.repair_context_bytes,
-            original_prompt=prompt if scope.complete_evidence else None)
+            complete_evidence=scope.complete_evidence,
+            original_prompt=(prompt if scope.complete_evidence or scope.retain_repair_prompt else None))
         # L0：Schema 恒交给客户端；仅当 profile 声明 supports_structured_output 时，
         # 客户端才施加厂商结构化输出机制。
         response = await self._llm.complete(profile, prompt, response_schema=ctx.active)
@@ -1429,7 +1435,7 @@ class SchemaEngine:
                 v.startswith(self._CB_PREFIX) for v in rendered))
 
     async def _generic_repair_call(self, profile, ctx, raw, rendered):
-        """执行 L3 修复；完整证据调用保留首轮上下文并上抛实际容量错误。
+        """执行 L3 修复；按调用范围保留首轮上下文并归类实际容量错误。
 
         @param profile 本轮修复模型档案。
         @param ctx 冻结 Schema、记账及原始证据。
@@ -1450,7 +1456,7 @@ class SchemaEngine:
         try:
             return await self._llm.complete(profile, prompt, response_schema=ctx.active)
         except ContextOverflowError as overflow:
-            if ctx.original_prompt is not None:
+            if ctx.complete_evidence:
                 _logger.error("complete-evidence L3 repair exceeded the context budget: profile=%s", profile)
                 raise
             # 修复提示词恒定，后续轮必然同败；被吞异常在这里恰好一次喂入熔断。

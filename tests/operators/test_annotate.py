@@ -307,7 +307,7 @@ def test_repair_suffix_appended_to_final_text_part():
         "[待标注数据] 帮我写一条请假条，明天上午要去医院\n"
         '[上一版标注] {"intent": "qa", "topic": "错", "difficulty": "easy"}\n'
         "[审核意见] 事实一致性: 主题字段与原始数据不符\n"
-        "请修正后重新输出"
+        "请依据原始数据和上一版标注核验全部历史批评，保留已正确内容，只修正仍成立的问题。只输出修正后的 JSON。"
     )
 
 
@@ -319,7 +319,7 @@ def test_repair_suffix_ui_modality_lands_on_tree_part():
     parts = bundle.messages[-1].parts
     assert [p.kind for p in parts] == ["text", "image", "text"]
     assert parts[2].text.startswith("[UI 控件树]\n")
-    assert parts[2].text.endswith('[上一版标注] {"a": 1}\n[审核意见] x: y\n请修正后重新输出')
+    assert parts[2].text.endswith('[上一版标注] {"a": 1}\n[审核意见] x: y\n请依据原始数据和上一版标注核验全部历史批评，保留已正确内容，只修正仍成立的问题。只输出修正后的 JSON。')
 
 
 # ── annotate.done excerpt payload — trace.content tier gating (§7.4) ────────
@@ -802,7 +802,7 @@ def test_annotate_record_threads_transitions_through_repair_path():
     assert parts[0].text == ACTION_SECTION
     assert parts[-1].kind == "text"
     assert parts[-1].text.endswith(
-        '[上一版标注] {"intent": "qa"}\n[审核意见] a: b\n请修正后重新输出')
+        '[上一版标注] {"intent": "qa"}\n[审核意见] a: b\n请依据原始数据和上一版标注核验全部历史批评，保留已正确内容，只修正仍成立的问题。只输出修正后的 JSON。')
     assert prompt.temperature is None                  # profile-default temperature
 
 
@@ -1522,7 +1522,9 @@ class _SchemaRoutingEngine:
     async def complete_validated(self, profile, prompt, schema=None, *, scope):
         self.calls.append(_NS(profile=profile, prompt=prompt, schema=schema,
                               user_treatment=scope.user_treatment,
-                              record=scope.record))
+                              record=scope.record,
+                              complete_evidence=scope.complete_evidence,
+                              retain_repair_prompt=scope.retain_repair_prompt))
         output = (self._outputs.pop(0) if self._outputs
                   else {"task": "订票", "kind": "book"})
         return output, Usage(1, 1), 1, "m"
@@ -1552,8 +1554,10 @@ def test_class_schema_text_computed_per_class():
     assert class_schema_text(ctx, None) is SCHEMA_TEXT
 
 
-def test_class_schema_call_routes_explicit_schema_with_user_treatment():
+@_pytest.mark.parametrize("mode", ["process", "generate_only"])
+def test_class_schema_call_routes_explicit_schema_with_user_treatment(mode):
     cfg = schema_cfg()
+    cfg = replace(cfg, run=replace(cfg.run, mode=mode))
     engine = _SchemaRoutingEngine()
     ctx = _test_ctx(cfg=cfg, schema_engine=engine, metrics=_CapturingMetrics(),
                     batch_no=1)
@@ -1568,6 +1572,8 @@ def test_class_schema_call_routes_explicit_schema_with_user_treatment():
     assert call.schema is not cfg.class_views["writing"].schema   # 防御性拷贝
     assert call.user_treatment is True          # L2.5 与 resolved_at 记账保留
     assert call.record == record.raw            # L2.5 回调仍拿到原始映射
+    assert call.retain_repair_prompt is (mode == "process")
+    assert call.complete_evidence is False
     # 提示词 system 段内嵌按类现算的 Schema 文本，而非全局文本
     system_text = call.prompt.messages[0].parts[0].text
     assert system_text.endswith(CLASS_SCHEMA_TEXT)
@@ -1588,6 +1594,8 @@ def test_class_without_schema_keeps_v112_call_shape():
     for call in engine.calls:
         # 既有推断路径：schema 与 user_treatment 都不传（v1.12 调用形字节等价）
         assert (call.schema, call.user_treatment) == (None, None)
+        assert call.retain_repair_prompt is True
+        assert call.complete_evidence is False
         assert call.prompt.messages[0].parts[0].text.endswith(SCHEMA_TEXT)
 
 

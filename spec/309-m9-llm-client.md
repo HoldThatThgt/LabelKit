@@ -110,6 +110,11 @@ class ProfileSnapshot:                            # v1.10
 **背书：**统一多 provider 异步客户端、外部资源许可、显式 HTTPX Limits 与指数退避分别对应成熟客户端的
 资源接纳、连接池和失败恢复边界；全抖动退避为 AWS 架构规范确立的工业标准。
 
+`timeout_s` 同时约束每次 HTTP attempt 的总墙钟时间与 HTTPX 的网络无进展时间。
+总截止从取得 origin 许可后开始，到响应体接收完成为止，不包含资源排队、退避或密钥冷却。
+总截止沿既有可重试故障路径处理；外部取消保持 `CancelledError`，`PoolTimeout` 仍为内部容量错误。
+非对象 JSON 已由现有 provider parser 归为可重试的畸形响应，不新增重复的形状检查。
+
 ### 3.9.4 输入 / 输出示例
 
 以统一 UI 示例贯穿：5.1 的 `[llm.default]` profile + 5.2 的 project.toml，记录为文件对 `capture/2026-07-01/b/uitree_2.jsonl` + `c/image_2.png`（`pair_index=2`，即 6.3 中 id 为 `9f2c31ab52e08d17` 的登录页记录）。M5 按 3.5.2 模板组装 `PromptBundle`，M8 因 `supports_structured_output=true` 启用 L0，M9 适配为如下 `openai_compatible` 请求。
