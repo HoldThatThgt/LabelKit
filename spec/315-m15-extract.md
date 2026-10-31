@@ -2,10 +2,10 @@
 
 ### 3.15.1 职责与边界
 
-**做：**（v1.8 新增算子）对批内每个 `status="active"` 的序列信封（episode），逐对相邻成员帧 ⟨s_i, s_{i+1}⟩ 经 LLM 产出结构化动作（内部 Schema，3.15.3），写入 `item.transitions`；**转移数 = 成员数 − 1**（动作发生在相邻帧之间 [45]）。链序位于 classify 之后、quality 之前（3.10.3）——类标签先就位使 `[class.<name>.extract]` 按类 instruction 生效（3.15.4 multi 行）；轨迹 rubric 与序列标注在下游消费步骤序列。仅 UI 模态序列（M1 强制 `extract.enabled` 要求 `segment.enabled` ∧ `run.modality="ui"`，2.3.1；文本序列的「转移」语义弱，v1 不适用，列演进候选 8.4）。
+**做：**（v1.8 新增算子）对批内每个 `status="active"` 的序列信封（episode），逐对相邻成员帧 ⟨s_i, s_{i+1}⟩ 经 LLM 产出结构化动作（内部 Schema，3.15.3），写入 `item.transitions`；**转移数 = 成员数 − 1**（动作发生在相邻帧之间 [45]）。链序位于 classify 之后、quality 之前（3.10.3）——类标签先就位使 `[class.<name>.extract]` 按类 instruction 生效（3.15.4 multi 行）；轨迹 rubric 与序列标注在下游消费步骤序列。仅 UI 模态序列（M1 强制 `extract.enabled` 要求 `segment.sequence_resolved` ∧ `run.modality="ui"`，2.3.1；文本序列的「转移」语义弱，v1 不适用，列演进候选 8.4）。
 **不做：**不重分段（边界属 M14 上游；成员集是给定输入）；不产出用户 Schema 字段（步骤序列是工具内部结构——进 `_meta.stream.steps` 并注入下游提示词；用户 Schema 产出物属 M5）；不淘汰记录（修复耗尽的默认路径是兜底留痕而非丢弃，3.15.6）；不打分、不评审。
 
-**v1.18 sequence generation 边界：**sequence 生成与其文本 replay 都不调用 M15；本算子仍只接受 `segment.enabled` 且 UI 模态的普通 process episode。生成工件中的 `_meta.event` 时间与 provenance 不产生 Transition，也不改变本节 UI-only 约束。
+**v1.18 sequence generation 边界：**sequence 生成与其文本 replay 都不调用 M15；本算子仍只接受 `segment.sequence_resolved` 且 UI 模态的普通 process episode。生成工件中的 `_meta.event` 时间与 provenance 不产生 Transition，也不改变本节 UI-only 约束。
 
 | 模块 | 职责 | 边界 | 依赖 |
 |---|---|---|---|
@@ -149,7 +149,7 @@ user（单条消息多 Part——「text 标签 + image」组装惯例同 3.5.2/
 
 | 键 | 类型 / 默认 | 说明与约束 |
 |---|---|---|
-| `enabled` | bool / `false` | 启用要求 `segment.enabled` ∧ `run.modality="ui"`（2.3.1）；`[extract]` 在场而 `segment.enabled=false` ⇒ M1 no-op warning（3.1.4）。 |
+| `enabled` | bool / `false` | 启用要求 `segment.sequence_resolved` ∧ `run.modality="ui"`（2.3.1）；`segment.mode = "image"` 时开启是定向 CONFIG_ERROR（rule 76）；`[extract]` 在场而 `segment.enabled=false`（仅指开关关闭）⇒ M1 no-op warning（3.1.4）。 |
 | `llm` | str / `"default"` | LLM profile 引用；**恒**计入密钥解析 / vision / probe / 存在性四处引用集且恒入 vision_users（S30）——每请求 2 图，无纯文本档。 |
 | `instruction` | str / `""` | 可选域提示，注入模板可选行；`[class.<name>.extract]` 按类覆盖白名单的**唯一**键（5.2 白名单表；per-label 生效见 3.15.4 multi 行）。 |
 | `include_diff` | bool / `true` | `[树变更摘要]` 注入开关（S14）；关闭可做 A/B 对照（手册调用账章给指引）。 |

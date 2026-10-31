@@ -6,6 +6,8 @@
 
 > **2026-08-14 整改修订注记**：全库代码规则整改（spec §1.6 同日条目 / CONTRACTS §12 第 34 条）对本文的**决策与规格零改动**——本文保留为历史裁决记录。仅两处口径随代码更新：① 生产代码的注释与 docstring 为中文，日志/报错/CLI 输出为英文（LLM 提示词模板与 spec 冻结的输出数据仍为中文原样）；② 若本文引用了 `build_annotate_prompt` / `annotate_record` / `build_verify_prompt` / `complete_validated` / `render_thread_card` / `Orchestrator` 的「末位可选形参」调用形，这些取值现已收拢为参数对象 `AnnotatePromptOptions` / `VerifyPromptOptions` / `CallScope` / `ThreadCard` / `RunServices`（字段名与语义逐项不变）。
 
+> **2026-10-31 修订注记（v1.22）**：`segment.mode` 拆分后，本文的流模式前置条件读 `segment.sequence_resolved`（`segment.enabled ∧ segment.mode == "sequence"`），行为零改动。`segment.mode = "image"` 下开启 `frame.classify` 或 `frame.annotate` 是定向 `CONFIG_ERROR`，见 `SPEC-image-region-segmentation.md` §6.3 rule 76c、76d。
+
 ---
 
 ## 1. 结论与形态
@@ -87,13 +89,13 @@ M1 组合约束（全部 CONFIG_ERROR，写进 §2.3.1 与 §3.1.4）：
 
 | 约束 | 内容 |
 |---|---|
-| 帧粒度要求流模式 | `frame.classify.enabled ∨ frame.annotate.enabled` ⇒ `segment.enabled = true`；报错文案指引「非流模式请用 classify + [class.<name>.annotate]」 |
+| 帧粒度要求流模式 | `frame.classify.enabled ∨ frame.annotate.enabled` ⇒ `segment.sequence_resolved = true`；报错文案指引「非流模式请用 classify + [class.<name>.annotate]」 |
 | 帧类覆盖要求帧分类 | `[frame.class.*]` 在场 ⇒ `frame.classify.enabled = true`；节名 ⊆ 帧类表；白名单外键/节 ⇒ CONFIG_ERROR |
 | 帧 Schema 恰一 | `frame.annotate.enabled` ⇒ `schema_path`/`schema_inline` 恰一 + draft 2020-12 元校验 + examples 干跑（镜像 output.schema 全套分支） |
 | meta_mode 护栏 | `frame.*` 任一启用 ⇒ `output.meta_mode != "none"` |
 | fallback 合法 | `frame.classify.fallback_class` ∈ 帧类表 name 集 |
 | 定向探针 | `[frame.classify].assignment`、`[frame.annotate].self_consistency` 显式书写 ⇒ 定向 CONFIG_ERROR（原始节探针，v1.11 `use_vision` 同款机制与文案风格） |
-| no-op 提示 | `[frame.*]` 节在场 ∧ 均未启用 ∧ `segment.enabled = false` ⇒ 裁决·关开关留配置仅警告家族 WARN（节被忽略）；`[[frame.classify.classes]].examples` 在场 ⇒ 显名 WARN「帧级批量判决模板不渲染类别示例」（实现期补充裁决——批量判决形态无 few-shot 段，与序列级有意不同；静态预算预检表口径同步不计 examples） |
+| no-op 提示 | `[frame.*]` 节在场 ∧ 均未启用 ∧ `segment.enabled = false`（此处仅指开关本身）⇒ 裁决·关开关留配置仅警告家族 WARN（节被忽略）；`[[frame.classify.classes]].examples` 在场 ⇒ 显名 WARN「帧级批量判决模板不渲染类别示例」（实现期补充裁决——批量判决形态无 few-shot 段，与序列级有意不同；静态预算预检表口径同步不计 examples） |
 
 解析产物：`FrameClassifyConfig`（含 `vision_resolved`）、`FrameAnnotateConfig`、`frame_class_views: Mapping[str, FrameClassView]`（仅 annotate 一节：instruction/examples/enabled）、`ResolvedConfig.frame_schema: Mapping | None`。`referenced_profiles` 登记两个新 llm 键；视觉必需集**只**登记 `frame.annotate.llm`（ui ∧ enabled）。启动期静态预算预检表（裁决·预算观测最小增量的静态预检表分支，`loader.py`）新增 `frame_classify` / `frame_annotate` 两段（头常量 + instruction/类表/Schema 静态部件）。
 

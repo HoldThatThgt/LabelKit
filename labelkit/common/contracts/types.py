@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal, Mapping
 
 if TYPE_CHECKING:
     from labelkit.common.contracts.generation import SequenceTemporalContext
+    from labelkit.common.contracts.regions import RegionSet
 
 Status = Literal[
     "active",          # 存活，继续向下流动
@@ -37,6 +38,21 @@ class RecordRef:
                                            # 非生成记录：None
 
 
+def scaled_size(width: int, height: int, max_px: int) -> tuple[int, int]:
+    """按长边上限计算逐轴缩放尺寸；ImageRef.load_base64 与叠图渲染共用。
+
+    @param width 原图宽。
+    @param height 原图高。
+    @param max_px 长边上限。
+    @return 长边不超限时原样返回；否则 (max(1, round(width * s)), max(1, round(height * s)))，s = max_px / 长边。
+    """
+    long_edge = max(width, height)
+    if long_edge <= max_px:
+        return width, height
+    scale = max_px / long_edge
+    return max(1, round(width * scale)), max(1, round(height * scale))
+
+
 @dataclass(frozen=True)
 class ImageRef:
     """截图文件的惰性引用——字节永不常驻内存（spec §2.6）。"""
@@ -46,28 +62,34 @@ class ImageRef:
     size_bytes: int                        # 磁盘文件字节数（M2 用于 max_image_mb 判定）
 
     def load_base64(self, max_px: int) -> tuple[str, str]:
-        """调用时才从磁盘装载；长边超过 max_px 则按比例缩放（Pillow）后再编码。
+        """调用时才从磁盘装载；长边超过 max_px 则按比例缩放（Pillow）后再编码，否则解码校验后发送文件原字节。
 
         @param max_px 长边像素上限
         @return (media_type, b64)，media_type 为 "image/png" | "image/jpeg"
+        @raises OSError 文件不可读或 Pillow 解码失败（DecompressionBombError 与解码时的其他异常都转成它），由 image_decode_error 归类
         """
         from PIL import Image  # 局部导入：保持模块导入轻量；Pillow 是硬依赖
 
         media_type = "image/png" if self.format == "png" else "image/jpeg"
-        with Image.open(self.path) as im:
-            width, height = im.size
-            long_edge = max(width, height)
-            if long_edge > max_px:
-                scale = max_px / long_edge
-                new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
-                resized = im.resize(new_size, Image.Resampling.LANCZOS)
-                if self.format == "jpeg" and resized.mode not in ("RGB", "L"):
-                    resized = resized.convert("RGB")
-                buf = io.BytesIO()
-                resized.save(buf, format="PNG" if self.format == "png" else "JPEG")
-                data = buf.getvalue()
-            else:
-                data = self.path.read_bytes()
+        try:
+            with Image.open(self.path) as im:
+                width, height = im.size
+                if max(width, height) > max_px:
+                    resized = im.resize(scaled_size(width, height, max_px), Image.Resampling.LANCZOS)
+                    if self.format == "jpeg" and resized.mode not in ("RGB", "L"):
+                        resized = resized.convert("RGB")
+                    buf = io.BytesIO()
+                    resized.save(buf, format="PNG" if self.format == "png" else "JPEG")
+                    data = buf.getvalue()
+                else:
+                    im.load()  # 只读文件头发现不了像素截断；解码结果不用，发送的仍是文件原字节
+                    data = self.path.read_bytes()
+        except Image.DecompressionBombError as exc:
+            raise OSError("image exceeds the pixel limit") from exc
+        except OSError:
+            raise
+        except Exception as exc:  # 损坏的 PNG 在解码时还会抛 SyntaxError、ValueError，都是这张图的问题
+            raise OSError(f"image unreadable: {type(exc).__name__}") from exc
         return media_type, base64.b64encode(data).decode("ascii")
 
 
@@ -197,6 +219,13 @@ class Record:
                                            # 谱系走 _meta.stream.member_sources
     exact_dedup_text: str | None = None     # v1.20：M2 从 generation stream 内容证明得到的
                                            # 非时间 payload canonical JSON；None 走普通四级判重
+    companion: bytes | None = None         # v1.22 图片模式：伴随文件原始字节，不解码、不解释；
+                                           # 未注册钩子或无伴随文件时为 None
+    companion_path: str | None = None      # v1.22 图片模式：伴随文件路径字符串，与
+                                           # str(record.image.path) 同形；无伴随文件时为 None
+    image_sha256: str | None = None        # v1.22 图片模式：图片 sha256 完整小写十六进制（M2 写入）
+    companion_sha256: str | None = None    # v1.22 图片模式：伴随文件 sha256 完整小写十六进制；
+                                           # 无伴随文件时为 None
 
 
 @dataclass(frozen=True)
@@ -593,3 +622,5 @@ class PipelineItem:                        # 唯一可变信封；普通流处�
     member_positions: tuple[int, ...] = () # 普通流序列的有序成员出现位置，与 members 一一对应
     capacity: SequenceCapacity | None = None
                                            # 普通流序列的容量与谱系；普通单记录和生成路径为空
+    regions: RegionSet | None = None       # v1.22 图片模式候选：None = 未运行图片分割或分割失败；
+                                           # RegionSet(regions=()) = 合法空候选，二者不混用

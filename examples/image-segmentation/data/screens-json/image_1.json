@@ -1,0 +1,36 @@
+{
+  "root": {
+    "role": "window",
+    "name": "",
+    "rect": {
+      "x": 0,
+      "y": 0,
+      "width": 540,
+      "height": 960
+    },
+    "children": [
+      {
+        "role": "button",
+        "name": "Sign in",
+        "rect": {
+          "x": 60,
+          "y": 300,
+          "width": 420,
+          "height": 80
+        },
+        "children": []
+      },
+      {
+        "role": "button",
+        "name": "Register",
+        "rect": {
+          "x": 60,
+          "y": 420,
+          "width": 420,
+          "height": 80
+        },
+        "children": []
+      }
+    ]
+  }
+}

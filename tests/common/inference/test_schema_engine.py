@@ -14,8 +14,8 @@ import pytest
 from jsonschema import Draft202012Validator
 
 from labelkit.common.config.model import LLMProfile, OutputConfig
-from labelkit.common.contracts.generation import (
-    EventExecution,
+from labelkit.common.contracts.generation import EventExecution
+from labelkit.common.contracts.post_validation import (
     PostValidatedCallRequest,
     PostValidationResult,
 )
@@ -1440,7 +1440,7 @@ def test_complete_post_validated_returns_same_execution_instance():
     engine, request = _post_request(llm, validate)
     result = asyncio.run(engine.complete_post_validated(request))
     assert result.object == {"plan": {"n": 1}}
-    assert result.event_execution is execution
+    assert result.proof is execution
     assert result.resolved_at == "l0_or_clean"
     assert result.attempts == 1 and llm.calls == 1
     assert seen == [{"plan": {"n": 1}}]
@@ -1497,7 +1497,7 @@ def test_post_validator_runs_once_per_l2_candidate_across_repairs():
                           cfg=OutputConfig(max_repair_attempts=2), metrics=metrics)
     result = asyncio.run(engine.complete_post_validated(request))
     assert calls == [1, 2]
-    assert result.event_execution is executions[2]
+    assert result.proof is executions[2]
     assert result.resolved_at == "l3_2" and result.attempts == 3
     assert metrics.payloads[0]["violations"] == ["post-validator"]
     assert "secret candidate detail" not in json.dumps(metrics.payloads)
@@ -1557,7 +1557,6 @@ def test_post_repair_context_byte_limit_accepts_exact_and_skips_overflow():
     PostValidationResult(("bad",), _execution(1)),
     PostValidationResult("bad", None),
     PostValidationResult((1,), None),
-    PostValidationResult((), object()),
 ])
 def test_post_validator_rejects_every_non_contract_shape(returned):
     llm = _FixedLLM('{"plan":{"n":1}}')

@@ -72,7 +72,7 @@ def referenced_profiles(cfg: "ResolvedConfig") -> tuple[list[str], list[str]]:
     if cfg.generate.form == "sequence":
         return _sequence_profiles(cfg)
     llm_names: list[str] = []
-    if cfg.segment.enabled and cfg.segment.strategy in ("llm", "hybrid"):
+    if cfg.segment.llm_referenced:
         llm_names.append(cfg.segment.llm)
     if cfg.stitch.enabled:
         llm_names.append(cfg.stitch.llm)

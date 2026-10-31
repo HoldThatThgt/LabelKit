@@ -15,7 +15,8 @@ from jsonschema import Draft202012Validator
 
 from labelkit.cli.parser import CliOverrides
 from labelkit.common.config import load
-from labelkit.common.contracts.generation import EventExecution, PostValidationResult
+from labelkit.common.contracts.generation import EventExecution
+from labelkit.common.contracts.post_validation import PostValidationResult
 from labelkit.common.observability.obslog import MetricsSink
 from labelkit.common.inference.schema_engine import SchemaEngine
 from labelkit.operators.dedup import DedupIndex
@@ -630,10 +631,10 @@ def test_state_post_validator_real_l3_reuses_execution(monkeypatch, tmp_path, ca
     event_key = injected_event_keys[0]
     result = resolved[event_key]
     assert result.resolved_at in {"l3_1", "l3_2"}
-    assert result.event_execution is consumed[event_key]
-    assert isinstance(result.event_execution, EventExecution)
+    assert result.proof is consumed[event_key]
+    assert isinstance(result.proof, EventExecution)
     with pytest.raises(FrozenInstanceError):
-        result.event_execution.state_before_hash = "changed"
+        result.proof.state_before_hash = "changed"
     assert report["generate"]["sequence"]["delivered_sequences"] == 1
     _assert_manifest(cfg, main, stream, report)
     _assert_deepseek_bodies(bodies)

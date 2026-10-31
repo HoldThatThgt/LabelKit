@@ -185,7 +185,8 @@ class DedupConfig:
 class StreamConfig:
     """v1.8（spec 5.2 [stream]）：输入侧排序 + 会话切分声明，由 M2 消费。
 
-    segment.enabled=false 时声明本节会产生一条 no-op 警告。sequence generation
+    segment.sequence_resolved 为假时本节不生效：segment.enabled=false 时声明本节产生一条
+    no-op 警告，segment.mode="image" 时声明本节是定向错误。sequence generation
     不消费本节，其工件时间线只由 SequenceGenerationConfig.timeline 持有。
     """
 
@@ -205,11 +206,11 @@ class StreamConfig:
 
 @dataclass(frozen=True)
 class SegmentConfig:
-    """v1.8（spec 5.2 [segment]）：M14 时序切分，也是流模式的总开关。"""
+    """v1.8（spec 5.2 [segment]）：M14 分割；enabled 只是阶段开关，流语义看 sequence_resolved。"""
 
     enabled: bool = False                         # 关 = v1.7 行为（除 _meta.stream 恒 null）
     strategy: Literal["rules", "llm", "hybrid"] = "hybrid"   # 边界判定策略
-    llm: str = "default"                          # 仅当 strategy ∈ {llm, hybrid} 时入引用集
+    llm: str = "default"                          # 仅当 llm_referenced 时入引用集
                                                   # UI 模态要求完整图像与视觉能力
     window: int = 20                              # 完整边界判决的帧数上限，至少 2
                                                   # 逐帧完整证据估算装窗；最小相邻对仍需终检
@@ -220,20 +221,40 @@ class SegmentConfig:
     vision_resolved: bool = False                 # v1.11（V1）解析**产物**——永非用户键
                                                   # （ConsoleConfig.mode_resolved 先例）：
                                                   # M1 在 load() 收尾以 dataclasses.replace
-                                                  # 冻结为 (modality=="ui") ∧ enabled ∧
-                                                  # strategy∈{llm,hybrid} ∧
-                                                  # llm_profiles[segment.llm].supports_vision。
+                                                  # 按模式冻结——流模式：(modality=="ui") ∧
+                                                  # enabled ∧ strategy∈{llm,hybrid} ∧
+                                                  # llm_profiles[segment.llm].supports_vision；
+                                                  # 图片模式：(modality=="ui") ∧ enabled ∧
+                                                  # instruction 非空 ∧ 同一视觉能力。
                                                   # 注意：旧用户键 `use_vision` 已在 v1.11
                                                   # **移除**——显式书写 [segment] use_vision
                                                   # 是带迁移指引的**定向** CONFIG_ERROR（V2），
                                                   # 而非未知键的前向兼容警告
+    mode: Literal["image", "sequence"] | None = None   # enabled = true 时必填；无默认语义、无别名
+    instruction: str = ""                              # 图片模式分割指令；空串 = 未写
+    box_parser: str | None = None                      # "hooks.py:fn" 引用；None = 不读伴随文件
+    companion_suffix: str | None = None                # 与 box_parser 同时出现，例如 ".xml"
+    resolved_box_parser: ResolvedHook | None = None    # 解析产物，永非用户键
+    sequence_resolved: bool = False                    # 解析产物，永非用户键
+
+    @property
+    def llm_referenced(self) -> bool:
+        """按 enabled 加 mode 判定 segment.llm 是否进入引用集合。
+
+        @return 图片模式写了 instruction，或流模式 strategy 为 llm / hybrid 时为 True；未启用或缺 mode 时为 False。
+        """
+        if not self.enabled:
+            return False
+        if self.mode == "image":
+            return bool(self.instruction.strip())
+        return self.mode == "sequence" and self.strategy in ("llm", "hybrid")
 
 
 @dataclass(frozen=True)
 class StitchConfig:
     """v1.9（spec 5.2 [stitch]）：M16 线索缝合（默认关，仅流模式）。"""
 
-    enabled: bool = False                         # true ⇒ segment.enabled（M1 约束，T17）
+    enabled: bool = False                         # true ⇒ segment.sequence_resolved（M1 约束，T17）
     llm: str = "default"                          # 判定档案；enabled 时入引用集——纯文本证据，
                                                   # **永不**进任何 vision 必需集（T16）
     max_open: int = 4                             # 开放线索池容量（挂起窗口均值 3 + 1 活跃，
@@ -261,7 +282,7 @@ class StitchConfig:
 class ExtractConfig:
     """v1.8（spec 5.2 [extract]）：M15 动作抽取，仅 UI 序列。"""
 
-    enabled: bool = False                         # 要求 segment.enabled + modality="ui"
+    enabled: bool = False                         # 要求 segment.sequence_resolved + modality="ui"
     llm: str = "default"                          # 恒在 vision 引用集内（S30）
     instruction: str = ""                         # 唯一可经 [class.<name>.extract] 覆盖的键
     include_diff: bool = True                     # 注入[树变更摘要]（可消融，S14）
@@ -468,6 +489,7 @@ class ClassView:
                                                   # declared 类的世界生成配置
     business_time_paths: tuple[str, ...] = ()     # 标注 Schema 中的业务时间 instance path
     time_bindings: tuple[TimeBindingSpec, ...] = ()  # sequence annotation 机械时间声明
+    region_ref_paths: tuple[str, ...] = ()        # v1.22 本类 Schema 的 x-labelkit-region-ref 路径，数组项写 *
 
 
 # ── 帧粒度（v1.12，spec §3.1 [frame.classify]/[frame.annotate]/[frame.class.*]）──
@@ -480,7 +502,7 @@ class FrameClassifyConfig:
     这两个键是定向 CONFIG_ERROR）。
     """
 
-    enabled: bool = False                         # true ⇒ segment.enabled = true（M1 约束）
+    enabled: bool = False                         # true ⇒ segment.sequence_resolved（M1 约束）
     llm: str = "default"                          # 判决 profile；enabled 时入引用集；
                                                   # 永不入 vision 必需集（vision 语义分列裁决——
                                                   # 成本控制面 = 指向纯文本 profile）
@@ -632,3 +654,5 @@ class ResolvedConfig:
                                                   # output/sample/state 冻结 hook 集
     model_user_schema: Mapping = field(default_factory=dict)  # 排除代码负责字段的冻结模型 Schema
     model_frame_schema: Mapping | None = None     # 帧模型 Schema；帧标注关闭时为 None
+    region_ref_paths: tuple[str, ...] = ()        # v1.22 全局 Schema 的 x-labelkit-region-ref 路径；
+                                                  # 取值规则同 class_effective_model_schema

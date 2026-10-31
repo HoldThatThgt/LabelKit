@@ -267,7 +267,8 @@ warning: project.toml:[verify].llm: verify.llm and annotate.llm use the same mod
 容错：max_concurrency=8（密钥池下仍为池内总上限）, timeout_s=120, max_retries=5, retry_base_delay_s=1.0
 密钥池：轮换（零等待）→ 驻留（受 run.max_park_s 约束，第 7 章）→ 熔断（最后一把密钥被禁用）；可观测性见第 16 章
 能力：supports_structured_output=false, supports_vision=false（UI 模态引用者必须 true；
-      segment.llm v1.11 起不入 vision 校验——附图随所引档能力自动推导）
+      segment.mode="sequence" 的 segment.llm v1.11 起不入 vision 校验——附图随所引档能力自动推导；
+      图片模式写了 instruction 时，segment.llm 同样要收图，见第 28 章）
 生成：max_output_tokens=4096（v1.11：截断响应终局化为记录级拒收；声明窗口后还挤占输入预算）,
       temperature=0.0, max_image_px=2048（升级天花板）, default_image_px=0（0=沿用 max_image_px）
 预算：普通流使用的 context_window 必须为正值；普通单记录的 0 表示预算关闭；

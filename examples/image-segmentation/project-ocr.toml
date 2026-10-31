@@ -1,0 +1,42 @@
+# 文档图片加 OCR JSON：伴随数据根本不是控件树。钩子不给框命名，框架按顺序补名 "1"…"N"，
+# 所以 region_id 字段必须声明为 string。输出转外接矩形，原多边形留在 _meta.regions。
+schema_version = 1
+
+[run]
+input = "./data/documents"
+output = "./out/ocr.jsonl"
+modality = "ui"
+batch_size = 4
+seed = 20261030
+
+[segment]
+enabled = true
+mode = "image"
+llm = "default"
+box_parser = "hooks.py:ocr_to_boxes"
+companion_suffix = ".ocr.json"
+instruction = """
+结合图片和 OCR 参考框生成候选区域，每个文字段落一个候选。参考框准确时直接复用。
+"""
+
+[quality]
+enabled = false
+
+[annotate]
+enabled = true
+llm = "default"
+postprocessor = "hooks.py:to_bounding_boxes"
+instruction = """
+判断每个候选文字段落属于哪个字段。通过 region_id 引用候选，label 写字段名。
+"""
+
+[verify]
+enabled = false
+
+[trace]
+enabled = false
+
+[output]
+schema_path = "schemas/region-boxes.json"
+meta_mode = "inline"
+rejects = "refs"

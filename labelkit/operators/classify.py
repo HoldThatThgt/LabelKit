@@ -75,6 +75,7 @@ _STRUCTURE_MULTI_REASON = '{"classes": [<类名>, ...], "reason": <一句话理�
 _LABEL_EXAMPLE_TMPL = "[类别示例·{name}] {example}"
 _LABEL_RECORD = "[待分类数据]"
 _LABEL_SCREENSHOT = "[屏幕截图]"
+_LABEL_IMAGE = "[图片]"
 _LABEL_UI_TREE = "[UI 控件树]"
 # 完整序列变体标签（CONTRACTS §10.8）。
 _LABEL_RECORD_SEQ = "[待分类数据·序列]"
@@ -348,6 +349,8 @@ def _ui_record_parts(record: Record, cfg: "ResolvedConfig",
     @param fit 本次调用的装填状态；预算关时为 None
     @return 当前记录 user 消息的部件元组
     """
+    if record.ui_tree is None:                  # v1.22 图片模式无树变体（§10.8）
+        return (Part(kind="text", text=_LABEL_IMAGE), Part(kind="image", image=record.image))
     tree_text = record.ui_tree.serialize(max_chars=cfg.input.ui_tree_max_chars)
     if slot_budget is not None and fit is not None:
         label_est = (budget.est_text(_LABEL_SCREENSHOT)
@@ -449,7 +452,7 @@ def _classify_prompt(record: Record, ctx: "RunContext", schema: dict,
     @raises ContextOverflowError 连单条记录都装不下（phase="precheck"，V10）
     """
     cfg = ctx.cfg
-    if record.kind == "sequence" and cfg.run.mode == "process" and cfg.segment.enabled:
+    if record.kind == "sequence" and cfg.run.mode == "process" and cfg.segment.sequence_resolved:
         prompt = _assemble_classify(record, cfg, with_reason)
         error = request_overflow(CapacityRequest(cfg.classify.llm, prompt, schema), ctx)
         if error is not None:
@@ -675,12 +678,12 @@ def _assemble_frame_classify(members: Sequence[Record], cfg: "ResolvedConfig",
     messages: list[Message] = [
         Message(role="system", parts=(Part(kind="text", text="\n".join(lines)),))]
 
-    if cfg.run.mode == "process" and cfg.segment.enabled:
+    if cfg.run.mode == "process" and cfg.segment.sequence_resolved:
         digests = tuple(record_evidence(member) for member in members)
     body = "\n".join(_FRAME_MEMBER_LINE.format(m=m, digest=digest)
                      for m, digest in enumerate(digests, start=1))
     parts: list[Part] = [Part(kind="text", text=f"{_LABEL_FRAME_MEMBERS}\n{body}")]
-    if fc.vision_resolved or (cfg.run.mode == "process" and cfg.segment.enabled):
+    if fc.vision_resolved or (cfg.run.mode == "process" and cfg.segment.sequence_resolved):
         for m, member in enumerate(members, start=1):
             if member.image is None:               # 防御：无图成员只留摘要行
                 continue
@@ -716,7 +719,7 @@ def _frame_prompt_fit(cfg: "ResolvedConfig", ctx: "RunContext",
     if prof.supports_structured_output:
         b -= budget.est_text(json.dumps(schema, ensure_ascii=False))
     cost = (ctx.llm.calibrator.cost(prof.name)
-            if cfg.frame_classify.vision_resolved or (cfg.run.mode == "process" and cfg.segment.enabled) else 0)
+            if cfg.frame_classify.vision_resolved or (cfg.run.mode == "process" and cfg.segment.sequence_resolved) else 0)
     return _PromptFit(input_budget=b, image_cost=cost)
 
 
@@ -1497,6 +1500,7 @@ class ClassifyStage:
                     capacity=item.capacity,
                     member_classifications=item.member_classifications,
                     member_annotations=item.member_annotations,
+                    regions=item.regions,
                 )
                 # 切分、缝合证据和最终任务名属于序列；兄弟信封保持相同边界身份。
                 for mark in ("segment_degraded", "seam_indexes",

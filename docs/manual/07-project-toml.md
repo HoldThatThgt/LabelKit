@@ -31,6 +31,12 @@ schema_inline = """
 
 没写的节全部取默认：dedup 开、quality 开（只打分不过滤）、classify 关、generate 关、verify 关、trace 关。**从最小配置出发按需添加**，比一开始就抄一份全量配置更不容易犯错。
 
+**图片模式是这句话的例外。**`segment.mode = "image"` 时 quality 仍然默认开启，但图片模式恒无控件树，默认 UI rubric 的树一致性条目对每条记录都没有意义，所以没有默认 rubric。图片工程不能省略 `[quality]`，要么 `quality.enabled = false`，要么显式指定 `quality.rubric`，否则报错退出（第 28 章 28.3）：
+
+```text
+project.toml:[quality].rubric: segment.mode = "image" has no default rubric; set quality.rubric or quality.enabled = false
+```
+
 ## 7.2 `[run]`：这次运行的骨骼
 
 | 键 | 类型 | 默认 | 详解 |
@@ -55,7 +61,7 @@ schema_inline = """
 | `on_missing_pair` | `"skip"` | UI 缺对策略：同上 |
 | `on_index_conflict` | `"fail"` | UI index 冲突策略：**默认 fail**（理由见第 5 章——冲突通常意味着目录被污染） |
 | `max_image_mb` | 20 | 单张截图大小上限，超限按坏记录跳过 |
-| `ui_tree_max_chars` | 30000 | 普通单记录的控件树渲染上限。普通流使用每个成员的完整可见规范化 UI 树，不因该值或预算裁剪树；是否需要容量拆分按完整请求判断。 |
+| `ui_tree_max_chars` | 30000 | 普通单记录的控件树渲染上限。普通流使用每个成员的完整可见规范化 UI 树，不因该值或预算裁剪树；是否需要容量拆分按完整请求判断。图片模式不构造控件树，显式书写是配置错误。 |
 
 ## 7.4 算子节速览
 
@@ -63,8 +69,8 @@ schema_inline = """
 
 | 节 | 开关默认 | 最常调的参数 | 去哪深入 |
 |---|---|---|---|
-| `[stream]` | —（随 segment 生效，v1.8） | `order_by`（时间序依据）、`key`（分区键）、`gap_s`/`gap_steps`（断会话规则） | 第 25 章 |
-| `[segment]` | 关（v1.8） | `strategy`（rules/llm/hybrid）、`window`（滑窗帧数）、`min_len`（最短段长） | 第 25 章 |
+| `[stream]` | —（随 `mode = "sequence"` 的 segment 生效，v1.8） | `order_by`（时间序依据）、`key`（分区键）、`gap_s`/`gap_steps`（断会话规则） | 第 25 章 |
+| `[segment]` | 关（v1.8） | `mode`（启用时必填：`"sequence"` 或 `"image"`，v1.22）；时序流：`strategy`（rules/llm/hybrid）、`window`（滑窗帧数）、`min_len`（最短段长）；图片：`instruction`、`box_parser`、`companion_suffix` | 第 25、28 章 |
 | `[stitch]` | 关（v1.9） | `max_open`（开放线索池容量）、`bias`（保守合取/纯 LLM）、`votes`（判定稳定化采样） | 第 26 章 |
 | `[dedup]` | **开** | `minhash_threshold`（0.85 近似判重线）、`scope`（global/batch）、`ui_dup_requires`（UI 判重口径） | 第 9 章 |
 | `[classify]` | 关（v1.7） | `[[classify.classes]]`（类别表，启用必填）、`fallback_class`（兜底类，启用必填）、`assignment`（single/multi 单多标签） | 第 24 章 |
@@ -81,7 +87,9 @@ schema_inline = """
 
 `[classify]` 是 v1.7 新增的分类算子节：按你声明的类别表对每条存活记录做 LLM 封闭集分类，类标签写进 `_meta.classification` 并驱动下游「按类条件化」。启用后另有一族按类覆盖节 **`[class.<name>.<section>]`**——对某个类别单独覆盖 quality / annotate / generate / verify（v1.8 起还有 extract 的 instruction）的白名单参数（按类 rubric、按类标注指令等），类未覆盖的键继承全局。完整键表、白名单与合并语义见第 24 章与 spec §5.2。
 
-v1.8/v1.9 新增的四节同属**流模式**一族：`[stream]` 声明输入的时间序与会话切分规则（排序依据、分区键、断开条件——它不是算子，随 `segment.enabled` 生效）；`[segment]` 是流模式的总开关，把候选会话经 LLM 边界精化切成语义完整的 episode 并剔除噪声帧；`[stitch]`（v1.9）把同一任务被穿插切开的 episode 碎片保守缝合成完整线索，并可救援过短被剔的收尾帧（要求 segment 开启）；`[extract]` 对 episode 的每对相邻帧推断结构化动作（仅 UI 模态，要求 segment 开启）。四节的逐键详解与完整示例见第 25、26 章。
+v1.8/v1.9 新增的四节同属**流模式**一族，流模式由 `segment.enabled = true` 加 `segment.mode = "sequence"` 开启：`[stream]` 声明输入的时间序与会话切分规则（排序依据、分区键、断开条件——它不是算子，随流模式生效）；`[segment]` 把候选会话经 LLM 边界精化切成语义完整的 episode 并剔除噪声帧；`[stitch]`（v1.9）把同一任务被穿插切开的 episode 碎片保守缝合成完整线索，并可救援过短被剔的收尾帧（要求流模式）；`[extract]` 对 episode 的每对相邻帧推断结构化动作（仅 UI 模态，要求流模式）。四节的逐键详解与完整示例见第 25、26 章。
+
+`[segment]` 的另一种语义是 `mode = "image"`（v1.22）：一张图片一个样本，segment 生成候选区域，没有会话和 episode。`[stream]`、`[stitch]`、`[extract]`、`[frame.classify]`、`[frame.annotate]` 在图片模式下都不可用，流模式的键（`strategy`、`window` 等）也不可写，见第 28 章。`segment.mode` 与 `run.mode`、`quality.mode` 是三个不同的键。
 
 sequence form 在 `[generate]` 选择 `declared` 或 `instruction_only`。配置加载后先编译
 `GenerationProgram` 和 `ScenarioPlan`，再读取凭据和运行内容调用。declared 用命名 pattern 与
@@ -98,8 +106,8 @@ v1.20 的业务时间配置属于 frame class 和 sequence class 本身。完整
 `resources`；`[[generate.pattern.<name>.containments]]` 声明严格包含关系。模型只生成非时间字段，Planner 与
 generic candidate finalizer 机械写入起点、终点和时长。配置形状和完整示例见第 27 章。
 
-`[frame.classify]` 只消费 process 流模式的 episode，因此始终要求 `segment.enabled=true`。`[frame.annotate]`
-有两个入口：process/flat 仍要求 segment，并在序列标注成功后处理成员；sequence form 已由生成计划提供成员和
+`[frame.classify]` 只消费 process 流模式的 episode，因此始终要求 `segment.enabled=true` 且 `segment.mode="sequence"`。`[frame.annotate]`
+有两个入口：process/flat 仍要求流模式 segment，并在序列标注成功后处理成员；sequence form 已由生成计划提供成员和
 inherited frame class，可脱离 segment，也可在 `annotate.enabled=false` 时直接运行。后一种组合必须开启
 pointwise quality，序列标注调用为零；任一应标注帧失败都会拒绝并重试整个 counterfactual set。帧产物同时进入
 main 的 `_meta.stream.members[]` 与对应 primary stream 行的 `_meta.annotation`。完整例子见
@@ -140,7 +148,7 @@ sequence annotation 的业务时间同样在完整 class Schema 标记，并在 
 
 | 键 | 默认 | 说明 |
 |---|---|---|
-| `meta_mode` | `"inline"` | `_meta` 的去处：`inline` = 随行内嵌（保留键 `_meta`）；`sidecar` = 主输出保持纯净、`_meta` 逐行写 `{stem}.meta.jsonl`（与主输出行序对齐、以 `_meta.id` 关联）；`none` = 丢弃元信息（**分数、溯源全没了，不推荐**；帧粒度任一启用时不得为 none——帧产物仅经 `_meta` 承载，第 25 章 25.6） |
+| `meta_mode` | `"inline"` | `_meta` 的去处：`inline` = 随行内嵌（保留键 `_meta`）；`sidecar` = 主输出保持纯净、`_meta` 逐行写 `{stem}.meta.jsonl`（与主输出行序对齐、以 `_meta.id` 关联）；`none` = 丢弃元信息（**分数、溯源全没了，不推荐**；帧粒度任一启用时不得为 none——帧产物仅经 `_meta` 承载，第 25 章 25.6；图片模式也不得为 none——候选与原多边形只由 `_meta.regions` 承载，第 28 章） |
 | `passthrough_fields` | `[]` | 从输入行原样透传的字段名列表，落在 `_meta.source.fields`。典型用途：带上 `source`、`ts` 等业务字段，下游无需回查输入文件 |
 | `rejects` | `"refs"` | 拒绝通道内容量：`none` = 不写拒绝通道文件；`refs` = 只写 id、来源引用、淘汰环节与原因（**不含数据内容**）；`full` = 另含记录原文——方便直接人工审查被淘汰了什么，但意味着输出目录里存了一份数据副本，注意保管 |
 

@@ -270,6 +270,7 @@ def _assemble(ctx: _LoadCtx, head: _ToolSide, products: _Products,
         class_views=products.class_views,
         user_schema=freeze_json(products.user_schema),
         model_user_schema=products.model_user_schema,
+        region_ref_paths=products.region_ref_paths,
         frame_classify=p.frame_classify,   # v1.12; vision_resolved 已冻结
         frame_annotate=p.frame_annotate,
         frame_class_views=products.frame_class_views,

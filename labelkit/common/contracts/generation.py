@@ -32,11 +32,11 @@ from labelkit.common.config.model import (
     ResolvedPaths,
 )
 from labelkit.common.contracts.stage import RunContext
-from labelkit.common.contracts.types import PipelineItem, Record, Usage
+from labelkit.common.contracts.types import PipelineItem, Record
 from labelkit.common.contracts.execution import TaskExecutor
 from labelkit.common.extensions.hooks import ResolvedHook
 from labelkit.common.observability.obslog import MetricsSink
-from labelkit.common.inference.llm_client import LLMClient, PromptBundle
+from labelkit.common.inference.llm_client import LLMClient
 
 
 JsonObject: TypeAlias = Mapping[str, object]
@@ -498,42 +498,6 @@ class StateTransitionInput(_ImmutableCarrier):
 
 
 @dataclass(frozen=True)
-class PostValidationResult(_ImmutableCarrier):
-    """M8 单次后置校验产生的违规或唯一执行证明。"""
-
-    violations: tuple[str, ...]                   # 可修复违规；成功时为空
-    event_execution: EventExecution | None        # 成功时唯一非空证明
-
-
-CallPostValidator: TypeAlias = Callable[
-    [Mapping[str, object]], PostValidationResult
-]
-
-
-@dataclass(frozen=True)
-class PostValidatedCallRequest(_ImmutableCarrier):
-    """一次带 request-local 后置校验器的 M8 调用。"""
-
-    profile: str                                  # 调用 profile
-    prompt: PromptBundle                          # 完整提示包
-    schema: JsonObject                            # 完整内部 Schema
-    scope: CallScope                              # 记账与 trace 范围
-    post_validator: CallPostValidator             # 仅本请求生效的后置验证器
-
-
-@dataclass(frozen=True)
-class ValidatedGenerationCall(_ImmutableCarrier):
-    """M8 后置验证成功且保留同一执行证明的结果。"""
-
-    object: JsonObject                            # 成功候选对象
-    event_execution: EventExecution               # 同一候选唯一执行证明
-    resolved_at: Literal["l0_or_clean", "l1", "l3_1", "l3_2"]  # 内部解析路径
-    usage: Usage                                  # 累计 token 用量
-    attempts: int                                 # 总 LLM 调用次数
-    model: str                                    # 首轮实际模型名
-
-
-@dataclass(frozen=True)
 class RenderEventRequest(_ImmutableCarrier):
     """FrameRenderer 的完整但不含状态正文的请求。"""
 
@@ -992,7 +956,4 @@ from labelkit.common.config import generation as _config_generation  # noqa: E40
 from labelkit.common.inference import schema_engine as _schema_engine  # noqa: E402
 
 _config_generation.GenerationParseContext = GenerationParseContext
-CallScope = _schema_engine.CallScope
 SchemaEngine = _schema_engine.SchemaEngine
-_schema_engine.PostValidatedCallRequest = PostValidatedCallRequest
-_schema_engine.ValidatedGenerationCall = ValidatedGenerationCall

@@ -247,7 +247,7 @@ def test_fit_text_edges_degenerate_floor_is_the_marker():
 @pytest.mark.parametrize("vision", [False, True])
 def test_min_window_is_required_adjacent_pair_not_a_summary_capacity_guarantee(window, context_window, vision):
     profile = _llm(context_window=context_window)
-    cfg = SimpleNamespace(segment=SegmentConfig(enabled=True, llm=profile.name, window=window,
+    cfg = SimpleNamespace(segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True, llm=profile.name, window=window,
                                                 context="完整上下文" * 400, vision_resolved=vision),
                           llm_profiles={profile.name: profile})
     assert min_window(cfg) == 2
@@ -322,9 +322,42 @@ def test_template_head_tokens_quality_and_generate_inline_literals():
     assert generate_sentence in system_text
 
 
+def test_template_head_segment_image_matches_operator():
+    """跨层等式：M1 静态预算用的头估算等于 segment 图片模式的冻结静态头（§10.2）。"""
+    from labelkit.operators.segment_image import _SYSTEM_STATIC
+
+    assert TEMPLATE_HEAD_TOKENS["segment_image"] == est_text(_SYSTEM_STATIC)
+
+
+def test_image_variants_leave_operator_template_heads_unchanged():
+    """图片变体只改当前记录消息：system 与 few-shot 不变，annotate 与 verify 的头估算也不变。"""
+    from labelkit.operators.annotate import _SCHEMA_SENTENCE
+    from labelkit.operators.verify import _SEQ_SYSTEM_DEFECT_TYPES
+
+    assert TEMPLATE_HEAD_TOKENS["annotate"] == 32 == est_text(_SCHEMA_SENTENCE)
+    assert TEMPLATE_HEAD_TOKENS["verify"] == 197 == est_text(_SEQ_SYSTEM_DEFECT_TYPES)
+
+
+def test_est_prompt_bills_original_and_overlay_with_the_unchanged_formula():
+    """原图与叠图都是 image part，按 n_images × image_cost 自然计费（CONTRACTS §7.4）。"""
+    from pathlib import Path
+
+    from labelkit.common.contracts.regions import RegionOverlayRef, RegionSet
+    from labelkit.common.contracts.types import ImageRef
+    from labelkit.common.inference.llm_client import Message, Part, PromptBundle
+
+    image = ImageRef(Path("image_1.png"), "png", 1)
+    overlay = RegionOverlayRef(image, RegionSet(10, 10, (), ()))
+    one = PromptBundle(messages=(Message(role="user", parts=(Part(kind="image", image=image),)),))
+    two = PromptBundle(messages=(Message(role="user", parts=(Part(kind="image", image=image),
+                                                             Part(kind="image", image=overlay))),))
+    assert est_prompt(two, None, None, image_cost=70) - est_prompt(one, None, None, image_cost=70) == 70
+    assert est_prompt(two, None, None, image_cost=70) == 2 * 70 + MSG_OVERHEAD_TOKENS
+
+
 def test_template_head_tokens_covers_only_legacy_operator_heads():
     # v1.18 六个生成家族改用 common 中的完整 PromptBundle 构造器，不再冻结整数头。
-    assert set(TEMPLATE_HEAD_TOKENS) == {"segment", "classify", "quality",
+    assert set(TEMPLATE_HEAD_TOKENS) == {"segment", "segment_image", "classify", "quality",
                                          "annotate", "verify", "generate",
                                          "stitch", "extract",
                                          "frame_classify", "frame_annotate"}

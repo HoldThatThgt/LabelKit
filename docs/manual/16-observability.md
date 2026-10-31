@@ -25,6 +25,7 @@
 | `ingest.disorder` | 流式单调性校验拒绝一条记录时（乱序或时间戳解析失败，v1.8 流模式）；skip 策略下每记录一事件、stderr 全运行只 WARN 一次 | 文件、行号（文本）/ index（UI）、原因（乱序 \| 时间戳解析失败） |
 | `segment.session` | 会话装配器闭合一个候选会话时（v1.8）。仅 trace、无 stderr 镜像；通道为 `"segment"`（发出方是接入层，但按事件名前缀归 segment 通道），不在默认订阅里 | session_id、首末帧、长度、断开原因（gap / key / max_len / max_span / eof / limit） |
 | `segment.boundary` | 每个滑窗边界裁决经校验通过后（v1.8）。仅 trace、无 stderr 镜像；通道 `"segment"` | session_id、窗口区间、成员 id、逐帧关系判决（封闭五词表）；**reason** 仅当订阅了 segment 通道时才请求并携带（零额外 token 原则，同 classify） |
+| `segment.regions` | 图片模式每条成功记录一个事件，含只用参考框的路径（v1.22，第 28 章 28.10）。仅 trace、无 stderr 镜像；通道 `"segment"`，不在默认订阅里 | regions、reused、drawn、width、height、attempts 六个整数，键序固定，各脱敏档都保留；恒有 `regions = reused + drawn`，只用参考框的路径 `attempts = 0`。不带几何和框名 |
 | `stitch.judge` | 每个缝合候选判定定案后（一遍与二遍都发；votes 分裂回落保守结局时也发，v1.9）。仅 trace、无 stderr 镜像；通道 `"stitch"` | session_id、candidate（episode/rescue 候选两型）、repass（false=一遍/true=二遍）、verdict、thread_ref、priors（机械先验命中腿 ⊆ {app_overlap, entity_overlap, same_page}）、merged（是否实际并入——LLM 判 resume 而先验未过时 verdict 与 merged 分离）、confidence（仅观测不进门槛）；task_name / reason 自 `refs` 档起携带；votes 分裂时另带 votes_split=true |
 | `stitch.thread` | 会话缝合定案后每条幸存线索一条（v1.9）。仅 trace、无 stderr 镜像；通道 `"stitch"` | session_id、thread_id、task_name、fragments 碎片跨度表（与 `_meta.stream.fragments` 同构）、seam_indexes 接缝位置 |
 | `dedup.duplicate` | 每次判重（判为 unique 不发事件） | kind、簇键、kept_id；近似重复另带**恰一项实测相似度**（文本 jaccard / 图像 hamming / 语义 cosine），exact 精确重复无相似度字段 |

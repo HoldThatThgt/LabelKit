@@ -8,10 +8,11 @@
 
 - 第一次使用：第 1～3 章。
 - 接入自己的数据：第 4～8 章。
-- 调整算子：第 9～14、24～26 章。
+- 调整算子：第 9～14、24～26、28 章。
 - 运行、观测与排障：第 15～18 章。
 - 从零合成独立样本：第 12、22 章。
 - 从零合成可验证序列：第 27 章；它讲 declared、instruction-only、counterfactual set、精确交付和 replay。
+- 给独立图片生成候选区域并按候选标注：第 28 章。
 
 ## 目录
 
@@ -28,7 +29,7 @@
 | 章 | 标题 | 一句话 |
 |---|---|---|
 | 4 | [记录、批、状态与流水线](04-concepts.md) | 状态机、守恒关系与合法组合 |
-| 5 | [准备你的数据](05-data-preparation.md) | 文本、UI 与时间序输入 |
+| 5 | [准备你的数据](05-data-preparation.md) | 文本、UI、时间序与图片模式输入 |
 
 ### Part III　配置与输出
 
@@ -52,6 +53,7 @@
 | 25 | [流模式 stream](25-stream.md) | session、episode、噪声与动作摘取 |
 | 26 | [线索缝合 stitch](26-thread.md) | 穿插任务的保守重组 |
 | 27 | [序列生成](27-sequence-generation.md) | pattern、世界状态、反事实、精确交付与 replay |
+| 28 | [图片模式 segment](28-image-segmentation.md) | 候选区域、box_parser、叠图与基于候选的标注 |
 
 ### Part V　运行与运维
 

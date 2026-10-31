@@ -13,6 +13,7 @@ order_by = "input_order"
 session_max_len = 64
 [segment]
 enabled = true
+mode = "sequence"
 strategy = "hybrid"
 window = 32
 min_len = 2

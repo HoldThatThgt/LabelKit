@@ -5,8 +5,9 @@
 **做：**持有经 M1 预校验的用户 Schema 和内部 Schema；为分类、分段、动作、评审、flat 生成及
 v1.18 sequence 的 seed/event-plan/frame-render/semantic/noise 调用提供统一 L0–L3 结构保证。内部 Schema
 由调用方按标准 draft 2020-12 JSON Schema 传入；schema engine 不认识任何 sequence 规划器专名。
-EventPlan 额外使用 `complete_post_validated`，把 L2 合法候选交给一次性后置验证器执行 patch、权限、
-state Schema 与 state validator，并把冻结 `EventExecution` 与合法对象一起返回。
+EventPlan 与 segment 图片模式额外使用通用接缝 `complete_post_validated`，把 L2 合法候选交给一次性后置验证器，
+并把不含语义的成功证明 `proof` 与合法对象一起返回：EventPlan 执行 patch、权限、state Schema 与 state validator，
+proof 是冻结 `EventExecution`；segment 图片模式检查几何，proof 是 `RegionSet`（3.8.5、3.18.5）。
 **不做：**不组装业务提示词（调用方传入完整 prompt）；不解释业务语义；不放行任何未通过校验的对象——这是它对全系统的硬契约。
 
 实现唯一位于 `labelkit/common/inference/schema_engine.py`。`common.runtime` 旧包不存在；M8 不导入
@@ -30,6 +31,7 @@ state Schema 与 state validator，并把冻结 `EventExecution` 与合法对象
 | L0 | profile `supports_structured_output=true` 时：OpenAI 兼容 provider 传 `response_format={"type":"json_schema", "json_schema":{...strict:true}}`；Anthropic provider 以单工具 `tool_choice` 强制工具调用、Schema 作为工具入参。L0 只是「使 L1/L3 少触发」的优化，不豁免 L2——供应商实现存在覆盖缺口（JSONSchemaBench 实测各引擎均有不支持的 Schema 特性 [24]），校验永远执行。 |
 | L1 | 顺序执行：① 剥离 Markdown 代码围栏；② 取首个花括号平衡子串；③ `json_repair.loads()`（工业库，处理截断/单引号/尾逗号/裸换行 [8]）。全部失败 ⇒ 直接进 L3。L1 为纯函数，无副作用、可单测穷举。 |
 | L2 | `Draft202012Validator.iter_errors()` 收集全部违规，每条含 JSON Pointer 路径、期望与实际。通过后进入可选用户回调或调用级后置验证；未通过进入 L3。enum 等错误统一渲染为英文、值受 trace/content 规则保护。 |
+| L2 引用检查（v1.22，可选） | `CallScope.region_ids` 非 `None` 时，按 `CallScope.region_ref_paths` 检查 `x-labelkit-region-ref` 标记的路径。层位：`complete_finalized` 中位于模型 Schema L2 之后、finalizer 之前；`complete_validated`（未配后处理）中位于 L2 之后、L2.5 之前。`null` 值与缺失的可选字段跳过。未知值产生可修复违规 `<concrete-pointer>: unknown region reference`（例如 `/items/0/region_id: unknown region reference`），不回显模型给出的值，进入 L3；自洽采样中该样本弃权。few-shot 干跑不做引用检查。 |
 | L2.5（v1.5，可选） | `output.validator` 配置时、且仅对用户 Schema 调用：L2 通过后执行用户回调 `fn(obj, record)`。返回非空违规列表 ⇒ 违规以 `(validator) <消息>` 形式并入违规清单、与 Schema 违规同路进入 L3 修复环（回调意见回喂模型自我修正——回调既是门卫也是修复环的教练）；返回空 ⇒ 通过。L3 每轮修复输出重走 L1→L2→L2.5。预算耗尽且剩余违规**全部**来自回调 ⇒ `SchemaViolation(callback_only=True)`，记录 kind = `callback_violation`（7.6），否则仍为 `schema_violation`。回调抛异常不吞：向上传播、按记录级 `internal_error` 收敛（3.5.3）。内部 Schema（裁决/评分/评审/生成/分类（v1.7）/分段窗口/动作/缺陷评审（v1.8）/缝合判定（v1.9））不经过 L2.5。 |
 | L3 | 普通记录的内部调用默认使用单条 user 修复消息。process 记录标注设置 CallScope.retain_repair_prompt=true，保留首轮实际提示词，但容量失败仍按普通路径短路为 SchemaViolation。process stream 设置 CallScope.complete_evidence=true，保留首轮全部消息、文本、树、图片及固定尺寸，再追加上一版模型空间输出与违规；finalized 调用先经 repair_projector 移除代码和框架负责字段。修复使用 output.repair_llm（缺省同调用方），重走 L1–L2，次数耗尽抛 SchemaViolation，实际调用均计 usage。process stream 的 ContextOverflowError 保留原 profile/phase/origin 上抛所属会话阶段，不转 SchemaViolation，不由 M8 提前喂熔断。普通记录修复超限保留既有短路 SchemaViolation 及 reactive-400 终态恰一次补喂语义。生成保留其独立完整修复合同。 |
 
@@ -73,6 +75,8 @@ class CallScope:
     repair_context_bytes: int | None = None  # 单轮新增 L3 消息正文集合 UTF-8 byte 上限
     complete_evidence: bool = False     # process stream 修复保留原完整请求并上抛容量错误
     retain_repair_prompt: bool = False  # 普通记录标注仅保留首轮实际请求，容量错误仍按普通路径处理
+    region_ids: frozenset[str] | None = None  # v1.22 图片模式：由框架从同一 RegionSet 派生；None ⇒ 不检查引用
+    region_ref_paths: tuple[str, ...] = ()    # v1.22：M1 冻结的 x-labelkit-region-ref 路径，数组项写 *
 
 class SchemaEngine:
     def __init__(self, user_schema: dict, llm: LLMClient, cfg: OutputConfig): ...
@@ -173,9 +177,9 @@ user:
 
 若第 2 次 L3 修复后仍未通过 L2，则预算耗尽，抛 `SchemaViolation(errors, raw_last_output)`：该记录 `status = "failed"`、错误码 `schema_violation`（7.6）入 rejects 通道，并计入 `resolved_at.rejected`。
 
-### 3.8.5 v1.18 调用级后置验证
+### 3.8.5 调用级通用后置验证（v1.18 引入，v1.22 泛化）
 
-既有 `complete_validated` 返回类型不变。需要执行状态转移的 EventPlan 使用独立内部入口：
+既有 `complete_validated` 返回类型不变。需要在每个结构合法候选上做语义判定并保留成功证明的调用使用通用内部入口；载体位于中立模块 `labelkit/common/contracts/post_validation.py`，接缝本身不含状态或几何语义，不保留别名或再导出：
 
 ```python
 CallPostValidator = Callable[[Mapping[str, object]], PostValidationResult]
@@ -183,32 +187,39 @@ CallPostValidator = Callable[[Mapping[str, object]], PostValidationResult]
 
 async def complete_post_validated(
     request: PostValidatedCallRequest,
-) -> ValidatedGenerationCall:
+) -> ValidatedPostCall:
     """对每个结构合法候选执行恰一次调用级后置验证。"""
 ```
 
 `PostValidatedCallRequest` 冻结 profile、prompt、Schema、`CallScope` 与后置验证器。每个首轮或 L3
 候选通过 L2 后恰调用一次：
 
-- 非空 `violations` 且 `event_execution is None` 是可修复结果，以
+- 非空 `violations` 且 `proof is None` 是可修复结果，以
   `(post-validator)` 前缀进入同一 L3 违规清单。
-- 空 `violations` 且携带 `EventExecution` 是唯一成功形态；结果随
-  `ValidatedGenerationCall` 返回，正式事件提交不得再次执行 patch 或 hook。
+- 空 `violations` 且 `proof` 非空是唯一成功形态；同一证明实例不复制，随 `ValidatedPostCall` 原样返回。
+  EventPlan 的 proof 是 `EventExecution`，`scenario.py` 对 `result.proof` 断言类型，不是则 `InternalError`，
+  正式事件提交不得再次执行 patch 或 hook；segment 图片模式的 proof 是 `RegionSet`。
 - 其他形状、非 string 违规、回调异常或错误返回类型分别归
-  `post_validator_invalid` / `post_validator_exception`，直接拒绝当前 slot attempt，不进入 L3。
-- EventPlan 的 L3 prompt 重放 `PostValidatedCallRequest.prompt` 的原始 system/user 消息，把上一候选作为
-  assistant 消息，再追加只含值受控 violations 的 user 修复消息。它只能复用首轮已经可见的
-  ActorView/visible state，不能追加 `EventExecution`、隐藏 state、hook 异常或任何新事实。普通
+  `post_validator_invalid` / `post_validator_exception`，不进入 L3：sequence 直接拒绝当前 slot attempt，
+  segment 图片模式归 `internal_error`（3.18.8）。
+- 修复轮恒经 `_build_post_repair_prompt` 重放 `PostValidatedCallRequest.prompt` 的原始 system/user 消息（含图片与 `image_px`），不读取 `retain_repair_prompt`；L3 轮数为 `min(max_repair_attempts, 2)`；修复轮溢出返回 `None`，以 `SchemaViolation` 结束（D11）。重放时把上一候选作为
+  assistant 消息，再追加只含值受控 violations 的 user 修复消息。EventPlan 只能复用首轮已经可见的
+  ActorView/visible state，不能追加 `EventExecution`、隐藏 state、hook 异常或任何新事实；segment 图片模式的违规不回显坐标或模型给出的值。普通
   `complete_validated` 继续使用 3.8.2 的单 user 修复形态。
-- `CallScope.repair_context_bytes` 为 null 时保持通用 M8 既有行为；v1.18 sequence 每个 family 显式传 32768。
+- `CallScope.repair_context_bytes` 为 null 时保持通用 M8 既有行为；v1.18 sequence 每个 family 显式传 32768，segment 图片调用为 null。
   普通 L3 对完整新 user 正文计费；EventPlan 对新增 assistant 原始输出与新增 user 修复正文之和计费。
   恰好上限可派发，多一 UTF-8 byte 在 M8 内记录 warning 后短路，零 provider call、不截断原输出。
 
-只有 EventPlan 使用该入口；ScenarioSeed、FrameRenderer、SemanticEvaluator 与 noise 继续调用
+只有 EventPlan 与 segment 图片模式使用该入口；ScenarioSeed、FrameRenderer、SemanticEvaluator 与 noise 继续调用
 `complete_validated`。后置验证器只存在于当前 request，M8 不保存跨调用状态，并行请求不会串用 state/hook。
-`ValidatedGenerationCall` 按字段顺序携带 `object`、`event_execution`、`resolved_at`、`usage`、
+`ValidatedPostCall` 按字段顺序携带 `object`、`proof`、`resolved_at`、`usage`、
 `attempts`、`model`；`resolved_at` 闭集只有 `l0_or_clean`、`l1`、`l3_1`、`l3_2`，用于标识当次
 成功对象的解析路径，不写入只属于用户 Schema annotate 的全局 `resolved_at` 计数。
+`PostValidatedCallRequest.schema` 与 `ValidatedPostCall.object` 在 `__post_init__` 深冻结，`proof` 不复制。
+`SchemaViolation` 新增只读键参 `usage: Usage | None = None`，只由 `_repair_post_validated` 在修复穷尽时写入累计用量，
+用于 `report.segment_image.usage`；其他路径不写，语义不变。
+
+内部 Schema 清单增 `segment_image_schema()`（3.18.5），待遇与其他内部 Schema 同族：不经过 L2.5、不计入 `report.schema_engine.resolved_at`。
 
 state validator 必须确定、无副作用，签名为
 `validate_state(StateTransitionInput) -> list[str]`。M1 用同一深拷贝输入连续调用两次并比较归一化违规字节。

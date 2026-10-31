@@ -21,6 +21,9 @@ from labelkit.common.errors import (
 )
 from labelkit.common.contracts.generation import DownstreamAttemptRequest, DownstreamAttemptResult
 from labelkit.common.contracts.execution import TaskGroupRequest, TaskSpec
+from labelkit.common.contracts.regions import (
+    RegionOverlayRef, RegionSet, render_candidates, render_material_note, render_reference_boxes,
+)
 from labelkit.common.contracts.types import (
     Annotation,
     PipelineItem,
@@ -95,6 +98,10 @@ _VERDICT_SEQ_SYSTEM_STRUCTURE = (
     '{"critiques": [{"aspect": <维度>, "opinion": <一句话意见>}, ...],\n'
     ' "verdict": "pass"|"fail"}')
 _LABEL_MEMBER_DIGESTS = "[成员帧摘要]"
+_LABEL_ORIGINAL_IMAGE = "[原图]"
+_LABEL_REGION_OVERLAY = "[候选区域叠图]"
+_LABEL_REFERENCE_BOXES = "[参考框]"
+_LABEL_CANDIDATES = "[候选区域]"
 
 DEFECT_KINDS = ("label_mismatch", "off_task_members", "missing_head",
                 "missing_tail", "missing_members", "wrong_stitch")
@@ -114,7 +121,7 @@ _TREE_MARKER_RE = re.compile(r"^…\(truncated (\d+) nodes\)$")
 class _PromptFit:
     """一次评审提示词的面板最小预算装填状态。"""
     input_budget: int       # 面板最小可用输入预算（token）
-    image_cost: int         # 单图成本（面板内最大标定读数；text 模态为 0）
+    image_cost: int         # 本次请求的全部图片成本（面板内最大标定读数 × 图片数；text 模态为 0）
     truncations: int = 0    # 本次装填实际发生的裁剪次数（进 budget.truncations.verify）
     overflow: bool = False  # 最小单元仍越预算（V10——调用方拒绝，请求从不发出）
 
@@ -130,6 +137,7 @@ class VerifyPromptOptions:
     member_positions: tuple[int, ...] = ()              # 普通流每个成员的明确输入出现位置。
     boundary_records: tuple[tuple[int, Record], ...] = ()  # 允许范围内实际引用的邻帧位置与完整证据。
     verdict_form: bool = False                          # 生成序列走 §10.16 判决形变体
+    regions: RegionSet | None = None                    # v1.22 图片模式：选择 §10.5 图片变体
 
 
 _DEFAULT_PROMPT_OPTIONS = VerifyPromptOptions()
@@ -639,10 +647,14 @@ def _build_single_record_prompt(record: Record, output: Mapping,
             system,
             Message(role="user", parts=(Part(kind="text", text=user_text),))))
 
-    head = f"[任务指令] {instruction}\n[原始数据]\n[屏幕截图]"
+    tree_less = record.ui_tree is None         # v1.22 图片模式恒无树：不序列化，不渲染空树段
+    head = f"[任务指令] {instruction}\n[原始数据]\n{'[原图]' if tree_less else '[屏幕截图]'}"
     result_text = f"[标注结果] {json.dumps(output, ensure_ascii=False)}"
-    tree = _fit_ui_tree(record, cfg, (system_text, head, result_text), fit)
-    tail = f"[UI 控件树]\n{tree}\n{result_text}"
+    if tree_less:
+        tail = result_text
+    else:
+        tree = _fit_ui_tree(record, cfg, (system_text, head, result_text), fit)
+        tail = f"[UI 控件树]\n{tree}\n{result_text}"
     if fit is not None:
         total = (budget.est_text(system_text) + budget.est_text(head)
                  + budget.est_text(tail) + 2 * budget.MSG_OVERHEAD_TOKENS
@@ -654,12 +666,50 @@ def _build_single_record_prompt(record: Record, output: Mapping,
     return PromptBundle(messages=(system, user))
 
 
+def _build_image_review_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
+                               texts: tuple[str, str], options: VerifyPromptOptions) -> "PromptBundle":
+    """§10.5 图片变体：沿用 §10.1 图片变体的记录渲染；全部文本都是固定块，从不裁剪。
+    @param record 图片模式样本
+    @param output 待评审的标注对象
+    @param cfg 已解析配置（segment.instruction 决定是否走模型路径）
+    @param texts (类有效任务指令, 类有效 extra_criteria)
+    @param options 携带 regions 与面板最小预算装填状态的装配项
+    @return 两条消息的提示词包
+    """
+    from labelkit.common.inference.llm_client import Message, Part, PromptBundle
+
+    instruction, extra_criteria = texts
+    regions = options.regions
+    system_text = verify_system_text(extra_criteria)
+    head = f"[任务指令] {instruction}\n[原始数据]\n{_LABEL_ORIGINAL_IMAGE}"
+    blocks = []
+    if regions.boxes and cfg.segment.instruction:   # D15 路径省略：每个候选本身就是一个参考框
+        blocks.append(f"{_LABEL_REFERENCE_BOXES}\n{render_reference_boxes(regions)}")
+    blocks.append(f"{_LABEL_CANDIDATES}\n{render_candidates(regions)}\n{render_material_note(regions)}\n"
+                  f"[标注结果] {json.dumps(output, ensure_ascii=False)}")
+    fit = options.fit
+    if fit is not None:
+        total = (budget.est_text(system_text) + budget.est_text(head) + budget.est_text(_LABEL_REGION_OVERLAY)
+                 + sum(budget.est_text(block) for block in blocks)
+                 + 2 * budget.MSG_OVERHEAD_TOKENS + fit.image_cost)
+        fit.overflow = total > fit.input_budget
+    parts = (Part(kind="text", text=head),
+             Part(kind="image", image=record.image),
+             Part(kind="text", text=_LABEL_REGION_OVERLAY),
+             Part(kind="image", image=RegionOverlayRef(record.image, regions)),
+             *(Part(kind="text", text=block) for block in blocks))
+    return PromptBundle(messages=(
+        Message(role="system", parts=(Part(kind="text", text=system_text),)),
+        Message(role="user", parts=parts)))
+
+
 def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
                         options: VerifyPromptOptions | None = None) -> "PromptBundle":
     """装配一对（记录, 标注结果）的 §10.5 judge 提示词，按记录形态与装配项选模板——三条互斥路线：
     序列 ∧ ``options.verdict_form`` → §10.16 生成判决形变体（whole-set delivery 路径传 True，
     普通 segmentation 驱动器不传）；普通序列 → §10.5 v1.8 缺陷
-    词表变体；单记录 → §10.5 经典变体（UI 按 §10.1/§10.2 携带截图与序列化控件树）。
+    词表变体；单记录 → §10.5 经典变体（UI 按 §10.1/§10.2 携带截图与序列化控件树），
+    ``options.regions`` 非 None 时取 §10.5 图片变体。
     @param record 被评审记录
     @param output 待评审的标注对象
     @param cfg 已解析配置
@@ -672,6 +722,8 @@ def build_verify_prompt(record: Record, output: Mapping, cfg: "ResolvedConfig",
         return _build_verdict_sequence_prompt(record, output, cfg, texts, opts.fit)
     if record.kind == "sequence":
         return _build_defect_sequence_prompt(record, output, cfg, texts, opts)
+    if opts.regions is not None:
+        return _build_image_review_prompt(record, output, cfg, texts, opts)
     return _build_single_record_prompt(record, output, cfg, texts, opts.fit)
 
 
@@ -746,6 +798,8 @@ def _excerpt_source(record: Record) -> str:
                 if record.members else "")
     if record.modality == "text":
         return record.text or ""
+    if record.ui_tree is None:                 # v1.22 图片模式：excerpt 来源冻结为空串
+        return ""
     return record.ui_tree.serialize()
 
 
@@ -920,7 +974,7 @@ class VerifyStage:
         if not eligible:
             return batch
         episodes = [item for item in eligible if item.record.kind == "sequence"]
-        if episodes and self.cfg.segment.enabled:
+        if episodes and self.cfg.segment.sequence_resolved:
             singles = [item for item in eligible if item.record.kind != "sequence"]
             await self._run_classic(singles, ctx)
             from labelkit.operators.stream_verify import StreamVerifyDriver
@@ -978,13 +1032,14 @@ class VerifyStage:
         return (list(vcfg.judges) or [vcfg.llm]), bool(vcfg.judges)
 
     def _panel_fit(self, ctx: "RunContext", record: Record,
-                   schema: Mapping) -> _PromptFit | None:
+                   schema: Mapping, regions: RegionSet | None = None) -> _PromptFit | None:
         """面板级装填预算：一轮只建一份提示词并广播，故按 V25② 取 min-over-panel——预算 = 各声明
         预算 judge 的 (input_budget − 其结构化输出 Schema 估值) 的最小值，单图成本 = 其中最大的
         标定读数（共享构建下取保守值）；未声明预算的面板成员不施加约束。
         @param ctx 运行上下文（标定器读数来源）
         @param record 被评审记录（决定是否计图像成本）
         @param schema 本轮结构化输出 Schema
+        @param regions 与 VerifyPromptOptions.regions 同一对象；非 None 时按原图与叠图两张计费
         @return 装填状态；None = 整面板预算关（与 v1.10 逐字节一致）
         """
         judges, _multi = self._judge_panel()
@@ -1002,7 +1057,7 @@ class VerifyStage:
             for p in declared)
         cost = (max(ctx.llm.calibrator.cost(p.name) for p in declared)
                 if record.modality == "ui" else 0)
-        return _PromptFit(input_budget=min_budget, image_cost=cost)
+        return _PromptFit(input_budget=min_budget, image_cost=cost if regions is None else 2 * cost)
 
     def _settle_fit(self, fit: _PromptFit | None, ctx: "RunContext") -> None:
         """结算装填：计裁剪次数；溢出即最小单元也放不下 → V10 记录级拒绝。
@@ -1073,12 +1128,14 @@ class VerifyStage:
         plans: list[_ClassicJudgePlan] = []
         for state in pending:
             try:
-                fit = self._panel_fit(ctx, state.item.record, VERDICT_SCHEMA)
+                regions = state.item.regions
+                fit = self._panel_fit(ctx, state.item.record, VERDICT_SCHEMA, regions)
                 prompt = build_verify_prompt(
                     state.item.record, state.annotation.output, ctx.cfg,
                     VerifyPromptOptions(
                         label=state.label, fit=fit,
                         verdict_form=state.item.record.kind == "sequence",
+                        regions=regions,
                     ),
                 )
                 self._settle_fit(fit, ctx)
@@ -1389,6 +1446,7 @@ class VerifyStage:
                 repair=repair,
                 label=state.label,
                 temporal_context=state.item.temporal_context,
+                regions=state.item.regions,
             ),
         )
 

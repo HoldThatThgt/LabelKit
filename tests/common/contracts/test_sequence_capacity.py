@@ -28,7 +28,7 @@ def _item():
 
 
 def _context(scope=None, *, size=2, stream=True, executor=None):
-    cfg = SimpleNamespace(segment=SimpleNamespace(enabled=stream), run=SimpleNamespace(batch_size=size))
+    cfg = SimpleNamespace(segment=SimpleNamespace(enabled=stream, sequence_resolved=stream), run=SimpleNamespace(batch_size=size))
     return RunContext(cfg, None, None, random.Random(7), 1, None, executor, "namespace", session_attempt=scope)
 
 

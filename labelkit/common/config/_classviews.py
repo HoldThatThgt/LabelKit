@@ -23,7 +23,9 @@ from labelkit.common.config._collect import (
     _Tbl,
 )
 from labelkit.common.config._postprocessing import (
+    check_region_refs,
     compile_postprocessor_model,
+    region_ref_paths,
     project_postprocessor_examples,
     require_postprocessor,
     resolve_config_postprocessor,
@@ -171,6 +173,7 @@ class _ViewInputs:
     rubric_is_inline: bool   # 全局准则是否来自内联表
     bases: _ClassBases       # 各节全局基线
     dryrun: _GlobalDryRun    # 全局 Schema/回调干跑面(可变)
+    image: bool = False      # segment.mode = "image" 生效；rule 81 的模式判定
 
 
 @dataclass(frozen=True)
@@ -813,6 +816,8 @@ def _build_class_views(col: _Collector, classify: ClassifyConfig, class_raw: Any
         # 装载该类的标注 Schema；未声明时回落全局 output.schema。
         schema_c = _load_class_schema(col, inputs.file, cname, merged.schema_path,
                                       merged.schema_inline)
+        # 回落全局的类不重复报错：全局 Schema 已由 [output] 检查。
+        check_region_refs(col, inputs.file, f"[class.{cname}.annotate]", schema_c, inputs.image)
         request = _ClassTemporalRequest(cname, sections, merged, schema_c)
         merged, compiled, time_bindings = _compile_class_temporal(col, inputs, request)
         _dryrun_class_examples(col, cname, merged, compiled, inputs)
@@ -827,7 +832,8 @@ def _build_class_views(col: _Collector, classify: ClassifyConfig, class_raw: Any
                                               if cname in specs else merged.description),
                                  sequence_generation=merged.sequence_generation,
                                  business_time_paths=compiled.business_time_paths,
-                                 time_bindings=time_bindings)
+                                 time_bindings=time_bindings,
+                                 region_ref_paths=region_ref_paths(compiled.full_schema))
     return views
 
 

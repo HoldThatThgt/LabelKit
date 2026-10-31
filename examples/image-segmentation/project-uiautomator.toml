@@ -1,0 +1,45 @@
+# 截图加 uiautomator XML：模型同时看到图片与 [参考框]，可以按 box_id 原样复用，也可以画新多边形。
+# verify 开启：评审与修复读取 segment 产出的同一候选，不会重新分割。
+schema_version = 1
+
+[run]
+input = "./data/screens-xml"
+output = "./out/uiautomator.jsonl"
+modality = "ui"
+batch_size = 4
+seed = 20261030
+
+[segment]
+enabled = true
+mode = "image"
+llm = "default"
+box_parser = "hooks.py:uiautomator_to_boxes"
+companion_suffix = ".xml"
+instruction = """
+结合图片和参考框生成候选区域。参考框准确时直接复用；参考框缺失或只有窗口外壳时，仍依据图片生成候选。
+"""
+
+[quality]
+enabled = false
+
+[annotate]
+enabled = true
+llm = "default"
+postprocessor = "hooks.py:keep_polygons"
+instruction = """
+判断每个候选控件的功能。通过 region_id 引用候选，label 写功能名称。
+"""
+
+[verify]
+enabled = true
+llm = "judge"
+policy = "repair"
+max_repair_rounds = 1
+
+[trace]
+enabled = false
+
+[output]
+schema_path = "schemas/region-polygons.json"
+meta_mode = "inline"
+rejects = "refs"

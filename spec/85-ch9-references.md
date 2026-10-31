@@ -271,3 +271,39 @@
 - [135] Google OR-Tools. `SatParameters` protocol. https://github.com/google/or-tools/blob/stable/ortools/sat/sat_parameters.proto（2026-08-27 访问）（CP-SAT 固定 worker、random seed 与 deterministic-time 预算的官方参数面；v1.21 仍只解码 OPTIMAL）
 
 - [136] Temporal Java SDK. `Workflow` replay-safe APIs. https://github.com/temporalio/sdk-java/blob/main/temporal-sdk/src/main/java/io/temporal/workflow/Workflow.java（2026-08-27 访问）（workflow replay-safe randomness 与普通随机源分离的工业实现；v1.21 先冻结交织计划，provider 与 slot retry 均不重抽）
+
+- [137] Set-of-Mark Prompting. https://arxiv.org/html/2310.11441v2（2026-10-30 访问）（v1.22 按编号选择候选的依据；真值掩膜结果说明最终质量受候选质量约束；最好配置为编号加半透明掩膜加框）
+
+- [138] List Items One by One（SoM-LLaVA）. https://arxiv.org/html/2404.16375v2（2026-10-30 访问）（开源小模型未经标记数据训练前很难读懂视觉标记，选择质量不能先验乐观）
+
+- [139] OmniParser. https://arxiv.org/html/2408.00203v1（2026-10-30 访问）（叠加编号框按编号选择，框外另给候选文字语义后选择正确率从 0.705 提到 0.938；v1.22 保留文本候选通道）
+
+- [140] UFO. https://arxiv.org/html/2402.07939v1（2026-10-30 访问）（同时提供干净截图与标注截图，是原图加叠图分开发送最接近的先例，没有消融数据）
+
+- [141] UGround. https://arxiv.org/html/2410.05243v1（2026-10-30 访问）（SoM 式选择受候选完整性约束；v1.22 候选遗漏由 segment 负责）
+
+- [142] SeeClick. https://arxiv.org/html/2401.10935v2（2026-10-30 访问）（0–1 比例坐标约定）
+
+- [143] Qwen2.5-VL 技术报告. https://arxiv.org/abs/2502.13923（2026-10-30 访问）（输出服务端缩放后图片的绝对像素）
+
+- [144] Qwen3-VL 技术报告. https://arxiv.org/abs/2511.21631（2026-10-30 访问）（0–1000 归一化坐标约定）
+
+- [145] GLM-V README. https://github.com/zai-org/GLM-V（2026-10-30 访问）（按宽、高归一化后乘 1000 的坐标约定）
+
+- [146] Claude 视觉坐标说明. https://platform.claude.com/docs/en/build-with-claude/vision-coordinates（2026-10-30 访问）（返回模型缩放后看到的像素坐标）
+
+- [147] OpenAI 图像输入指南. https://developers.openai.com/api/docs/guides/images-vision（2026-10-30 访问）（坐标保真度取决于请求的 `detail` 字段，LabelKit 不发送该字段）
+
+- [148] Text4Seg. https://arxiv.org/html/2410.09855v2（2026-10-30 访问）（LLM 难以把多边形坐标与形状对应；v1.22 孔洞与多部件用夹具测试）
+
+- [149] Gemini 2.5 图像分割示例. https://simonwillison.net/2025/Apr/18/gemini-image-segmentation/（2026-10-30 访问）（输出 0–1000 框加掩膜 PNG，不是多边形）
+
+- [150] Shapely 手册与发布信息. https://shapely.readthedocs.io/en/stable/manual.html ，https://pypi.org/project/shapely/（2026-10-30 访问）（Shapely 2.2.0，BSD-3，wheel 内置 GEOS 3.14.1；构造不检查合法性、隐式闭合环；OGC 下共边 MultiPolygon 非法）
+
+- [151] RFC 7946（GeoJSON）. https://www.rfc-editor.org/rfc/rfc7946（2026-10-30 访问）（v1.22 只采纳嵌套结构、环闭合与首环为外环）
+
+- [152] COCO 多边形不支持孔洞的讨论. https://github.com/facebookresearch/Detectron/issues/100（2026-10-30 访问）（孔洞超出常见多边形导出能力，输出形态由用户 Schema 决定）
+
+- [153] CVAT AI 工具与掩膜. https://docs.cvat.ai/docs/annotation/auto-annotation/ai-tools/（2026-10-30 访问）（多边形不支持孔洞，孔洞要走掩膜）
+
+- [154] Pillow ImageDraw / ImageFont. https://pillow.readthedocs.io/en/stable/reference/ImageDraw.html ，https://pillow.readthedocs.io/en/stable/reference/ImageFont.html（2026-10-30 访问）（`ImageDraw.polygon` 无孔洞参数，`load_default(size=...)` 需要 Pillow ≥ 10.1，字形栅格化随 FreeType 版本变化）

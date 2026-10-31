@@ -323,7 +323,7 @@ def test_rubric_selector_trajectory(tmp_path):
     assert meta["run"]["rubric"] == "default:trajectory"
 
     cfg = make_cfg(tmp_path, quality_rubric="",
-                   segment=SegmentConfig(enabled=True))
+                   segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True))
     run_emitter(cfg, [make_item()])
     meta = read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]
     assert meta["run"]["rubric"] == "default:trajectory"
@@ -433,7 +433,7 @@ def test_absorbed_third_route_neither_channel_but_counted(tmp_path):
     """§7.10 v1.8 third route: absorbed goes to NEITHER the main output NOR
     rejects — counted only (the generic per-status tally feeds M10's post-emit
     accounting)."""
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True))
     absorbed = [make_item(status="absorbed", record=make_record(f"{i:016x}", i),
                           annotated=False) for i in (1, 2, 3)]
     active = make_item(record=make_record("a" * 16, 9))
@@ -449,7 +449,7 @@ def test_dropped_noise_rejects_attribution_three_forms(tmp_path):
     """§9.2 v1.8: dropped_noise rows read the flipping stage's duck-typed
     noise_attribution mark — exactly three (stage, reason) combinations; these
     frames write no item.errors, so `errors` stays []."""
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True))
     noise = make_item(status="dropped_noise", record=make_record("1" * 16, 1),
                       annotated=False)
     noise.noise_attribution = ("segment", "noise")
@@ -478,7 +478,7 @@ def test_meta_stream_episode_full_structure_text(tmp_path):
     """§9.1 v1.8 `_meta.stream` episode shape (text modality): order_span in
     "file:line_no" presentation, per-member sources carrying line_no, default
     marks false/null, steps null while extract is off."""
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True))
     members = [make_record("1" * 16, 3), make_record("2" * 16, 5),
                make_record("3" * 16, 8)]
     item = make_item(record=make_seq_record(members))
@@ -517,7 +517,7 @@ def test_meta_stream_ui_order_span_marks_and_steps(tmp_path):
     pair_index (exactly one of line_no/pair_index per entry); the duck-typed
     session_split / stream_repaired / segment_degraded marks and the rendered
     transitions all surface."""
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True), modality="ui",
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True), modality="ui",
                    quality_rubric="default:ui")
     members = [make_ui_record("1" * 16, pair_index=2, source_file="a/uitree_2.jsonl"),
                make_ui_record("2" * 16, pair_index=5, source_file="b/uitree_5.jsonl")]
@@ -555,7 +555,7 @@ def test_meta_stream_ui_order_span_marks_and_steps(tmp_path):
 def test_meta_stream_null_for_single_record_even_in_stream_mode(tmp_path):
     """Frame records never reach the main output under stream — a single record
     getting there yields the defensive null, never a broken episode block."""
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True))
     run_emitter(cfg, [make_item()])
     assert read_jsonl(tmp_path / "out" / "res.jsonl")[0]["_meta"]["stream"] is None
 
@@ -566,7 +566,7 @@ def test_stitched_fourth_route_neither_channel_but_counted(tmp_path):
     """§7.10 v1.9 fourth route (T21): a stitched shell goes to NEITHER the main
     output NOR rejects — counted only; it must never hit the else→rejects
     fallback (which would pollute rejects and trip --strict)."""
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
                    stitch=StitchConfig(enabled=True))
     members = [make_record("1" * 16, 1), make_record("2" * 16, 4)]
     shell = make_item(status="stitched", record=make_seq_record(members),
@@ -584,7 +584,7 @@ def test_meta_stream_stitch_keys_present_only_when_enabled(tmp_path):
     """T16/m-11: thread_id (after episode_id) / fragments (before steps) / the
     per-step resumed flag appear ONLY when stitch is enabled; the resumed flag
     derives from detail.kind == "thread_seam", never from action_type."""
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
                    stitch=StitchConfig(enabled=True))
     members = [make_record("1" * 16, 3), make_record("2" * 16, 5),
                make_record("3" * 16, 8)]
@@ -625,7 +625,7 @@ def test_meta_stream_stitch_keys_present_only_when_enabled(tmp_path):
     out2 = tmp_path / "off" / "res.jsonl"
     out2.parent.mkdir(parents=True)
     cfg_off = make_cfg(tmp_path, output=str(out2),
-                       segment=SegmentConfig(enabled=True))
+                       segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True))
     item_off = make_item(record=make_seq_record(members))
     item_off.transitions = item.transitions
     run_emitter(cfg_off, [item_off])
@@ -642,7 +642,7 @@ def test_meta_stream_members_block_shape_and_frozen_position(tmp_path):
     """v1.12（spec §3.6）：members 位于 member_sources 之后、session_split 之前
     （位置冻结）；条目字段序冻结为 index, id, label, annotation, status；逐成员
     按 rec.members 序，index 0 基；label 缺键 ⇒ null，annotation 走三值判定。"""
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
                    frame_classify=frame_classify_cfg(),
                    frame_annotate=frame_annotate_cfg(),
                    frame_schema=FRAME_SCHEMA)
@@ -688,7 +688,7 @@ def test_members_key_presence_rules_per_switch(tmp_path):
     members = [make_record("1" * 16, 3), make_record("2" * 16, 5)]
 
     # 只开 frame.classify：条目只有 index, id, label
-    cfg_c = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+    cfg_c = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
                      frame_classify=frame_classify_cfg())
     item = make_item(record=make_seq_record(members))
     item.member_classifications = None         # dict None ⇒ 全员 label null
@@ -702,7 +702,7 @@ def test_members_key_presence_rules_per_switch(tmp_path):
     out2 = tmp_path / "ann" / "res.jsonl"
     out2.parent.mkdir(parents=True)
     cfg_a = make_cfg(tmp_path, output=str(out2),
-                     segment=SegmentConfig(enabled=True),
+                     segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
                      frame_annotate=frame_annotate_cfg(),
                      frame_schema=FRAME_SCHEMA)
     item2 = make_item(record=make_seq_record(members))
@@ -722,7 +722,7 @@ def test_members_key_presence_rules_per_switch(tmp_path):
 def test_members_position_frozen_with_stitch_keys(tmp_path):
     """v1.12：stitch 键共存时 members 位置不变——仍在 member_sources 之后、
     session_split 之前（thread_id/fragments 的 v1.9 键序照旧）。"""
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
                    stitch=StitchConfig(enabled=True),
                    frame_classify=frame_classify_cfg())
     members = [make_record("1" * 16, 3), make_record("2" * 16, 5)]
@@ -742,7 +742,7 @@ def test_member_status_matrix_and_prewrite_guard(tmp_path):
     ⇒ (null, failed)；合法对象 ⇒ (对象, annotated)；非法对象 ⇒ 写前
     validate_only(schema=帧 Schema) 兜底翻 (null, failed) 且 frame_annotate.failed
     计数，非法帧对象零落盘；成员失败不改信封状态、不写 item.errors。"""
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
                    frame_annotate=frame_annotate_cfg(), frame_schema=FRAME_SCHEMA)
     members = [make_record(str(i) * 16, i) for i in (1, 2, 3, 4)]
     item = make_item(record=make_seq_record(members))
@@ -774,7 +774,7 @@ def test_frame_annotate_discarded_counts_terminal_envelopes(tmp_path):
     """v1.12 沉没成本记账（spec §3.6）：终态非 active 且携带 member_annotations
     的序列信封按非 None 条目数累计 frame_annotate.discarded（仅计数）；active
     发射行与无帧产物的终态行不计；rejects 行键集零改动。"""
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
                    frame_annotate=frame_annotate_cfg(), frame_schema=FRAME_SCHEMA)
     members = [make_record("a1" * 8, 1), make_record("a2" * 8, 2)]
     ann = Annotation(output={"intent": "x", "entities": []}, model="m",
@@ -806,7 +806,7 @@ def test_frame_annotate_discarded_skips_clone_envelopes(tmp_path):
     """终审缺陷修复：扇出克隆共享同一 member_annotations dict——沉没成本记账
     只取首标签信封视角（克隆终态不重复计，否则共享产物被计 k 次）。"""
     from labelkit.common.contracts.types import Classification
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True),
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True),
                    frame_annotate=frame_annotate_cfg(), frame_schema=FRAME_SCHEMA)
     members = [make_record("a1" * 8, 1)]
     ann = Annotation(output={"intent": "x", "entities": []}, model="m",
@@ -834,7 +834,7 @@ def test_frame_all_off_stream_block_byte_equivalent_and_no_counting(tmp_path):
     """v1.12 全关字节等价：帧开关全关时 `_meta.stream` 无 members 键（键序 =
     v1.11，上方两处既有有序精确断言为锚），且即便信封误携帧产物字段也零计数、
     零渲染（开关门控先于字段读取）。"""
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True))
     members = [make_record("1" * 16, 3), make_record("2" * 16, 5)]
     item = make_item(record=make_seq_record(members))
     item.member_classifications = {
@@ -858,7 +858,7 @@ def test_meta_verification_defects_stream_only(tmp_path):
     a stray defects value."""
     defect = {"kind": "off_task_members", "members": ["2" * 16], "position": None,
               "detail": "成员 2 偏离任务"}
-    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True))
+    cfg = make_cfg(tmp_path, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True))
     clean = make_item(record=make_record("1" * 16, 1), verified=True)
     flagged = make_item(record=make_record("2" * 16, 2))
     flagged.verification = VerificationResult(verdict="pass", rounds=2,
@@ -886,7 +886,7 @@ def test_rejects_full_sequence_record_payload(tmp_path):
     """S25 (§9.2): the rejects full tier renders a sequence record as
     {"kind","member_ids","member_sources"}; a segmentation_invalid failure line
     carries no raw_last_output (known accepted gap since v1.7)."""
-    cfg = make_cfg(tmp_path, rejects="full", segment=SegmentConfig(enabled=True))
+    cfg = make_cfg(tmp_path, rejects="full", segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True))
     members = [make_record("1" * 16, 1), make_record("2" * 16, 4)]
     item = make_item(
         status="failed", record=make_seq_record(members), annotated=False,

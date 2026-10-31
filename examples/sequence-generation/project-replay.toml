@@ -21,6 +21,7 @@ session_max_span_s = 3600
 
 [segment]
 enabled = true
+mode = "sequence"
 strategy = "llm"
 llm = "default"
 window = 16

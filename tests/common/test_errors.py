@@ -7,6 +7,7 @@ from labelkit.common.errors import (
     EXIT_OK,
     EXIT_STRICT,
     CircuitBreakerTripped,
+    BoxParserError,
     ConfigError,
     DeliveryError,
     ErrorKind,
@@ -88,6 +89,13 @@ def test_delivery_error_exposes_only_fixed_identity_fields():
     assert str(exc) == "post_validator_invalid: slot=set-a:000001 attempts=3"
 
 
+def test_box_parser_error_carries_only_the_fixed_reason():
+    exc = BoxParserError("invalid_json", None, "hooks.py:parse")
+    assert isinstance(exc, InternalError)
+    assert (exc.reason, exc.box_index, exc.hook) == ("invalid_json", None, "hooks.py:parse")
+    assert str(exc) == "invalid_json"
+
+
 def test_error_kind_values_are_the_frozen_wire_codes():
     assert {member.name: member.value for member in ErrorKind} == {
         "BAD_INPUT_LINE": "bad_input_line",
@@ -97,6 +105,7 @@ def test_error_kind_values_are_the_frozen_wire_codes():
         "IMAGE_DECODE_ERROR": "image_decode_error",
         "CLASSIFICATION_INVALID": "classification_invalid",
         "SEGMENTATION_INVALID": "segmentation_invalid",
+        "COMPANION_INVALID": "companion_invalid",      # v1.22 图片模式
         "EXTRACTION_INVALID": "extraction_invalid",
         "STITCH_INVALID": "stitch_invalid",
         "JUDGMENT_INVALID": "judgment_invalid",

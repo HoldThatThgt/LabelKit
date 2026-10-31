@@ -71,7 +71,7 @@ sequence 教学工程的 default/judge 都固定为 DeepSeek anthropic route、`
 | `generate` | false | `form = "flat"` 时使用 seeds、styles、profiles 与数量字段 |
 | `annotate` | true | llm、instruction、examples、self-consistency |
 | `verify` | false | llm/judges、policy、repair rounds、extra criteria |
-| `segment` | false | strategy、window、noise filter、min length、context |
+| `segment` | false | mode（启用时必填）；sequence：strategy、window、noise filter、min length、context；image：instruction、box_parser、companion_suffix（第 28 章） |
 | `stitch` | false | max open、bias、rescue、repass、votes、stale gap |
 | `extract` | false | llm、instruction、tree diff、on error |
 | `frame.classify` | false | frame class closed set 与 fallback |
@@ -82,7 +82,8 @@ sequence 教学工程的 default/judge 都固定为 DeepSeek anthropic route、`
 - annotate 与 quality 至少开启一个；
 - verify 要求 annotate；
 - process 中 generate 要求 quality，且 generate 仅文本模态；
-- segment 仅 process、要求 annotate，并与 generate 互斥；
+- segment 仅 process，并与 generate 互斥；要求 annotate，只有 `mode = "image"` 且写了 instruction 时可以不开；
+- `mode = "image"` 时 stitch、extract、frame.classify、frame.annotate 必须关，且不能有 `[stream]`；
 - extract 要求 UI + segment；stitch 要求 segment；
 - frame classify/annotate 要求 segment 与非 none metadata；
 - threshold 与 top-ratio 选择互斥。
@@ -137,8 +138,12 @@ sequence 固定 inline metadata、no rejects，且不使用 sidecar。
 | `stream.gap_steps` | 0 | 序号差断 session |
 | `stream.session_max_len` | 200 | session 帧上限 |
 | `stream.session_max_span_s` | 0 | 时间跨度上限，0 关闭 |
-| `segment.strategy` | hybrid | rules / llm / hybrid |
-| `segment.llm` | default | 文本判定 profile |
+| `segment.mode` | 无，启用时必填 | sequence / image |
+| `segment.instruction` | 无，只用于 image | 写了才调用模型画候选；与 box_parser 至少有一个 |
+| `segment.box_parser` | 无，只用于 image | `hooks.py:fn`，把伴随文件转成参考框 |
+| `segment.companion_suffix` | 无，只用于 image | 与 box_parser 同时出现，如 `.xml` |
+| `segment.strategy` | hybrid，只用于 sequence | rules / llm / hybrid |
+| `segment.llm` | default | sequence：文本判定 profile；image：只在有 instruction 时引用 |
 | `segment.window` | 20 | 滑窗上限 |
 | `segment.noise_filter` | true | 剔除噪声帧 |
 | `segment.min_len` | 2 | LLM 精化段最短长度 |

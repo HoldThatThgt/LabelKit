@@ -36,6 +36,7 @@ order_by = "{order}"
 session_max_len = 64
 [segment]
 enabled = true
+mode = "sequence"
 strategy = "{strategy}"
 window = 32
 min_len = 2

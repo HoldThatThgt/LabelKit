@@ -40,6 +40,7 @@ EV_INGEST_INDEX_CONFLICT = "ingest.index_conflict"
 EV_INGEST_DISORDER = "ingest.disorder"       # v1.8 M2 流单调性（spec 7.2）
 EV_SEGMENT_SESSION = "segment.session"       # v1.8 M2 会话关闭（spec 7.2）；仅 trace
 EV_SEGMENT_BOUNDARY = "segment.boundary"     # v1.8 M14 窗口判决（spec 7.2）；仅 trace
+EV_SEGMENT_REGIONS = "segment.regions"       # v1.22 M14 图片模式每样本计数（§8.1）；仅 trace
 EV_STITCH_JUDGE = "stitch.judge"             # v1.9 M16 候选判决（spec 7.2）；仅 trace
 EV_STITCH_THREAD = "stitch.thread"           # v1.9 M16 碎片跨度表（spec 7.2）；仅 trace
 EV_DEDUP_DUPLICATE = "dedup.duplicate"

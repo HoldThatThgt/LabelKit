@@ -27,7 +27,7 @@ stitch 的做法：分段产物不动（episode 平面分区保持互斥、帧�
 | 多交叉 | A₁ → B → A₂ → D → A₃ | A = 三碎片线索（2 接缝），B/D 各单碎片 |
 | 噪声 + 救援 | A → B → 1 噪声帧 → A 的超短收尾段 | 噪声帧照旧剔除；短段命中救援并回 A |
 
-外加一条**负样本协议**：纯噪声会话必须产出零线索、零缝合——缝合器对着垃圾不能缝出东西来。开关是 `stitch.enabled = true`（默认关，要求 `segment.enabled = true`）；不开时主输出、rejects、report.json 与 v1.8 **逐字节等价**（例外恰两处：dry-run 估算行无条件多打 `stitch_calls=0`，stream×verify 的缺陷词表恒多一行 `wrong_stitch: 0`——词表是闭集，第 13 章）。
+外加一条**负样本协议**：纯噪声会话必须产出零线索、零缝合——缝合器对着垃圾不能缝出东西来。开关是 `stitch.enabled = true`（默认关，要求 `segment.enabled = true` 且 `segment.mode = "sequence"`）；不开时主输出、rejects、report.json 与 v1.8 **逐字节等价**（例外恰两处：dry-run 估算行无条件多打 `stitch_calls=0`，stream×verify 的缺陷词表恒多一行 `wrong_stitch: 0`——词表是闭集，第 13 章）。
 
 ## 26.2 快速上手：examples/stream 全流程
 
@@ -48,13 +48,14 @@ key = ["source_dir"]              # 分区键：每个场景子目录一个会�
 
 [segment]
 enabled = true
+mode = "sequence"
 strategy = "hybrid"
 window = 16                       # 窗上限，≥ 最长会话（15 帧）：预算装得下整段 ⇒ 每会话恰一窗（25.5）
 min_len = 2                       # 孤帧段以 below_min_len 落选 → 进 stitch 救援候选
 context = "…"                     # 交叉流的域上下文声明，全文与解读见 26.5
 
 [stitch]
-enabled = true                    # 线索缝合总开关（要求 segment.enabled）
+enabled = true                    # 线索缝合总开关（要求 segment.mode = "sequence"）
 llm = "default"                   # 纯文本判定：摘要卡证据，无视觉必需
 rescue_short = true               # below_min_len 短段按连续 run 重组先进候选池
 repass = true                     # 有界二遍复评修正一遍贪心漏缝
@@ -319,4 +320,4 @@ dry-run: no LLM calls made, no output written (report and trace only)
 
 **`votes` 是什么？该开吗？**判定稳定化采样：默认 `1`（单调用，不启用）；设为 ≥3 的**奇数**（偶数直接配置错误）时，同一判定采样 n 次，对 (verdict, thread_ref) 完整判定取**严格多数**——凑不齐严格多数（含 verdict 一致但 thread_ref 分裂）一律回落保守结局（episode 候选判 new、救援候选按未命中）。单个 SchemaViolation 样本只弃权，不会缩小原始 n 票分母；全部样本违规时，候选按既有 `on_error` 策略处置。它的定位是「口头置信度门槛的正规替代」：治**漂移**（同一判定跨运行摇摆），不治**偏差**（系统性过连接）——所以它跟机械先验合取不可互替、只能叠加。成本直白：判定调用 ×n（n=3 时 stitch 全口径占比仍 <8%，同前缀采样吃 prompt 缓存）。开的时机：同 seed 重跑时 `stitch.judge` 的判定翻转可测，再开——本例 fixture 实体证据充足，votes=1 就五缝五中（4 次 episode 并入 + 1 次救援命中，全部双腿先验）。
 
-最后一份检查清单，开 stitch 前过一遍：`segment.enabled = true` 且分段口径按穿插流调过（26.5 的穿插流声明）；`trace.channels` 加了 `"stitch"`；verify 开着的话 `extra_criteria` 写了构造约定（26.5 的构造事实说明）；留了纯噪声负样本会话当门禁；下游知道一行 = 一条线索、切片用 `fragments[].order_span` 而不是顶层包络、接缝步认 `resumed` 标志了吗？
+最后一份检查清单，开 stitch 前过一遍：`segment.enabled = true`、`segment.mode = "sequence"` 且分段口径按穿插流调过（26.5 的穿插流声明）；`trace.channels` 加了 `"stitch"`；verify 开着的话 `extra_criteria` 写了构造约定（26.5 的构造事实说明）；留了纯噪声负样本会话当门禁；下游知道一行 = 一条线索、切片用 `fragments[].order_span` 而不是顶层包络、接缝步认 `resumed` 标志了吗？

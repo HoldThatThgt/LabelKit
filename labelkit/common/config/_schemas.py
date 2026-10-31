@@ -19,6 +19,7 @@ from referencing import Registry, Resource
 from referencing.jsonschema import DRAFT202012
 
 from labelkit.common.config._collect import _Collector, _fmt, _Tbl
+from labelkit.common.config._postprocessing import check_region_refs
 from labelkit.common.extensions.hooks import _thaw_json, normalize_violations
 
 if TYPE_CHECKING:
@@ -192,6 +193,9 @@ def _load_generation_schema(
         ok = False
     if ok:
         ok = _check_schema_refs(col, site, key, schema)
+    if ok:
+        # 生成 Schema 不属于图片模式：rule 81a。
+        check_region_refs(col, request.file, f"[{request.section}]", schema, False)
     return schema if ok else None
 
 

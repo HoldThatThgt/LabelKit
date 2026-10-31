@@ -18,9 +18,9 @@ from labelkit.common.contracts.generation import (
     EventExecution,
     EventExecutionContext,
     EventPlan,
-    PostValidationResult,
     StateTransitionInput,
 )
+from labelkit.common.contracts.post_validation import PostValidationResult
 from labelkit.common.errors import InternalError, PostValidatorInvalidError
 from labelkit.common.extensions.hooks import clone_state_input, normalize_state_violations
 from labelkit.operators.generation.project import canonical_json, validate_planned_events

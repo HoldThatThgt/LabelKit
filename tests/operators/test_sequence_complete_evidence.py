@@ -188,7 +188,7 @@ def configuration(modality="text", *, context_window=131072, batch_size=2):
     profile = LLMProfile("default", "openai_compatible", "http://unused.invalid/v1", "unit", "UNUSED",
                          supports_vision=True, context_window=context_window, max_output_tokens=64)
     criterion = Criterion("complete", "内容完整", "哪条记录完整？", pointwise_levels=tuple(str(i) for i in range(6)))
-    return replace(cfg, segment=SegmentConfig(enabled=True), llm_profiles={"default": profile},
+    return replace(cfg, segment=SegmentConfig(enabled=True, mode="sequence", sequence_resolved=True), llm_profiles={"default": profile},
                    run=replace(cfg.run, batch_size=batch_size), quality=QualityConfig(mode="pointwise"),
                    rubric=Rubric("complete", (criterion,)), model_frame_schema=USER_SCHEMA, frame_schema=USER_SCHEMA)
 

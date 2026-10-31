@@ -2,8 +2,8 @@
 
 ### 3.2.1 职责与边界
 
-**做：**把输入路径物化为 `Record` 迭代器：文本模态逐行解析 JSONL 并抽取文本字段；UI 模态递归扫描、按 index 配对文件、解析 UI 树节点并构造惰性图像引用；为每条记录计算确定性 id；对坏数据执行跳过策略并计数。（v1.8）stream 模式（`segment.enabled = true`）下另担 `[stream]` 声明的输入侧排序、流式单调性校验与规则层会话化，向 M10 暴露会话流视图（3.2.8）。 
-**不做：**不加载图像像素（只 stat 文件并记录路径/尺寸）；不截断/清洗文本（原样保留，序列化截断是消费方在构造提示词时的职责）；不判重、不打分；`run.mode="generate_only"` 时本模块整体不参与（3.10.3）。
+**做：**把输入路径物化为 `Record` 迭代器：文本模态逐行解析 JSONL 并抽取文本字段；UI 模态递归扫描、按 index 配对文件、解析 UI 树节点并构造惰性图像引用；为每条记录计算确定性 id；对坏数据执行跳过策略并计数。（v1.8）stream 模式（`segment.sequence_resolved = true`）下另担 `[stream]` 声明的输入侧排序、流式单调性校验与规则层会话化，向 M10 暴露会话流视图（3.2.8）。（v1.22）图片模式（`segment.mode = "image"`）的发现与读取由 `labelkit/operators/ingest_image.py` 承担（3.2.10）。 
+**不做：**不加载图像像素（只 stat 文件并记录路径/尺寸；v1.22 图片模式另用 Pillow 惰性 `open` 只读文件头，不解码像素，3.2.10）；不截断/清洗文本（原样保留，序列化截断是消费方在构造提示词时的职责）；不判重、不打分；`run.mode="generate_only"` 时本模块整体不参与（3.10.3）。
 
 ### 3.2.2 输入 / 输出
 
@@ -156,7 +156,7 @@ FrameLayout [0,0,1080,2340]
 
 ### 3.2.8 时序流排序与会话化（v1.8）
 
-`segment.enabled = true`（stream 模式，2.3.1）时本模块承担 `[stream]` 节声明的输入侧排序、流式单调性校验与**规则层**会话化（配置键表见 5.2；边界的语义精化属 M14，3.14——会话化留 M2、装箱留 M10 的分工见 3.10.3）。产出面变化：M10 改消费 `sessions()` 会话流视图（3.2.3）而非 `records()`，切批改整会话装箱。
+`segment.sequence_resolved = true`（stream 模式，2.3.1）时本模块承担 `[stream]` 节声明的输入侧排序、流式单调性校验与**规则层**会话化（配置键表见 5.2；边界的语义精化属 M14，3.14——会话化留 M2、装箱留 M10 的分工见 3.10.3）。产出面变化：M10 改消费 `sessions()` 会话流视图（3.2.3）而非 `records()`，切批改整会话装箱。
 
 **排序键（`stream.order_by`）。**`"input_order"`（默认）：文本 = 文件名字典序 → 行号，UI = pair_index 升序（即现行 `records()` 顺序）。`"meta:<field>"`（仅文本模态，M1 校验 3.1.4）：`<field>` 为原始行对象上的点路径字段，时间戳解析规格见 6.1（S20）——数值 `v < 0 ∨ v ≥ 1e14` 解析失败、`v < 1e11` 判 epoch 秒、`[1e11, 1e14)` 判毫秒（÷1000）；字符串先试纯数字（走数值规则）再试 `datetime.fromisoformat`（3.11 起原生接受 `Z` 后缀），均败 = 解析失败；aware 值换算 UTC epoch、naive 值按 UTC 解释；内部序键 = float 秒。
 
@@ -195,3 +195,19 @@ replay 行携带 `replay_sequence_id`、`duplicate_of_sequence_id` 与 `duplicat
 descriptor、role 顺序和非时间 payload 必须与 source 相同，payload 时间则按 replay start/end/duration 重新绑定。
 M2 用 rebound payload 重算 replay event ID；旧式逐字 payload-copy 规则不存在。M2 验证这些 envelope 关系，但不会
 使用 generation truth 绕过 M14/M16 的普通内容判定。
+
+### 3.2.10 图片模式发现与伴随文件（v1.22）
+
+`Ingestor` 在 `segment.enabled ∧ mode == "image"` 时委托给新模块 `labelkit/operators/ingest_image.py`。非图片模式的配对与计数逐字节不变（`examples/ui` 仍为 `scanned=6 ingested=5 bad_input=1`）。无树输入只在图片模式生效；segment 关闭时纯图片仍无法摄取（D5）。
+
+| 规则 | 定义 |
+|---|---|
+| 图片 | 沿用 `image_<n>.(png\|jpg\|jpeg)`（扩展名大小写不敏感）与现行全局 index 命名空间：递归扫描，index 按十进制整数解析，跨子目录共用。同一 index 两张以上图片（含 png 与 jpg、跨子目录同名）是 `index_conflict`，遵循 `input.on_index_conflict`，所以 `source.pair_index` 唯一。任意文件名的图片目录不支持。 |
+| 伴随文件 | 只在注册了 `segment.box_parser` 时参与发现：文件名为 `image_<n>` 加 `segment.companion_suffix`（大小写严格匹配），与图片按 index 配对，可跨子目录。同一 index 两个以上伴随文件是 `index_conflict`。只有伴随文件、没有图片是缺对（`present = "companion"`），遵循 `input.on_missing_pair`。 |
+| 只有图片 | 写了 `segment.instruction` 时合法；没写时（D15）是缺对（`present = "image"`），计 `missing_pair` 与 `bad_input`，不产生 Record，不会写成空候选。 |
+| 控件树 | 图片模式不解析控件树，不构造 `UITree`。`uitree_<n>.jsonl` 没有特殊含义；原来的数据改名为 `image_<n>.jsonl` 并声明 `companion_suffix = ".jsonl"` 即可。 |
+| 忽略计数 | 既不是图片、也不是已声明伴随文件的文件计入 `IngestReport.ignored_files: int = 0`（未注册钩子时所有非图片文件都计入）。计数大于 0 时给一条只含计数、不含文件名的 WARN：`image mode: ignored %d file(s) that are neither images nor declared companion files`。不计入 `scanned` 与 `bad_input`，不参与守恒恒等式。 |
+| 文件头检查 | ingest 独占：沿用 `_check_image`（魔数、`input.max_image_mb`），再用 Pillow 惰性 `open` 只读文件头，不调用 `load()` / `verify()`。必须能识别格式，且 `width × height` 不超过 `Image.MAX_IMAGE_PIXELS`；`DecompressionBombError` 与 `DecompressionBombWarning` 都视为超限。图片方向不检查（D4）。失败走坏样本路径：计 `bad_input`，写英文错误日志，不产生 Record。 |
+| 伴随文件大小 | 不新增单文件上限：现行 `uitree_<n>.jsonl` 也没有字节上限，伴随字节与解析后的 `UITree` 同量级，随 `Record.companion` 驻留到批结束。 |
+
+**计划与记录。**`IngestPlan.pairs` 图片模式形态为 `(index, companion_path | None, image_path)`，`files` 按「伴随文件（若有）后图片」排列，与 id 拼接顺序一致；`session_lens` 恒为 `()`。记录 id 为 `sha256(companion_bytes + image_bytes)[:16]`，没有伴随文件或未注册钩子时 `companion_bytes = b""`；没有伴随文件与零字节伴随文件因此同 id，后者仍会调用钩子。`RecordRef.source_file` 取图片相对路径，`pair_index` 取 index，`line_no = None`。`Record.ui_tree = None`，`Record.raw = None`，`Record.image` 为 `ImageRef`，`Record.modality = "ui"`。伴随文件按原始字节读入 `Record.companion`，不解码、不解释，路径写入 `Record.companion_path`；M2 在已持有字节时计算 `Record.image_sha256` 与 `Record.companion_sha256` 并随 Record 冻结（4.1）。

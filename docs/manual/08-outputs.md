@@ -38,6 +38,7 @@ sequence `--dry-run` 只在 console 输出计划与估算，不创建、截断�
 - `_meta.annotation`：结构化标注的执行履历；
 - `_meta.verification`：评审结论与修复次数；
 - `_meta.stream`：process stream 的 session/episode/member 结构；
+- `_meta.regions`：图片模式的候选几何与参考框，只在 `segment.mode = "image"` 时出现（见下）；
 - `_meta.run`：配置摘要与运行观测。
 
 普通流的 `member_positions` 记录完整会话中的出现位置，重复内容 ID 不会折叠成员。
@@ -50,6 +51,68 @@ sequence `--dry-run` 只在 console 输出计划与估算，不创建、截断�
 ```bash
 jq -c 'del(._meta)' out/labels.jsonl > out/labels.clean.jsonl
 ```
+
+### 图片模式：`_meta.regions`（v1.22）
+
+`segment.mode = "image"` 时 `_meta` 多一个顶层键 `regions`，位于 `stream` 之后、`scores` 之前，`stream` 恒为 `null`。实跑的顶层键序：
+
+```text
+id, run, source, stream, regions, scores, dedup, classification, annotation, verification
+```
+
+这是通用信封里第一个顶层条件键：非图片模式没有这个键，非图片工程的输出字节不变。图片模式每条主输出的 `regions` 恒为对象，annotate 关闭的只分割运行也一样。
+
+`examples/image-segmentation/project-boxes.toml` 实跑写出的内容（只用参考框的路径，几何来自钩子，segment 不调用模型；这里只节选 `n1`）：
+
+```json
+"regions": {
+  "image": {"width": 540, "height": 960},
+  "boxes": [{"id": "n1", "bbox": [60, 300, 480, 380], "text": "Button Sign in"}],
+  "items": [
+    {"region_id": "n1",
+     "geometry": {"type": "Polygon",
+                  "coordinates": [[[60, 300], [480, 300], [480, 380], [60, 380], [60, 300]]]},
+     "box_id": "n1",
+     "source_box_ids": ["n1"]}
+  ]
+}
+```
+
+| 键 | 含义 |
+|---|---|
+| `image` | 原图存储像素宽高 |
+| `boxes` | 钩子返回并通过校验的参考框，`id` 恒为非空字符串（钩子全部留空时是框架补的 `"1"…"N"`）；未注册钩子或无伴随文件时为空数组 |
+| `items[].region_id` | 来自参考框：框名；模型新画：框架按出现顺序编号 `r1, r2, …`，复用区域不占编号 |
+| `items[].geometry` | GeoJSON 形状。单部件 `{"type": "Polygon", "coordinates": [外环, *内环]}`；多部件 `{"type": "MultiPolygon", "coordinates": [[外环, *内环], ...]}`。环闭合，顺序与顶点顺序不变 |
+| `items[].box_id` | 几何取自哪个参考框；模型画的多边形为 `null` |
+| `items[].source_box_ids` | 模型声明参考过的框（已去重）；`box_id` 非空时恒为 `[box_id]` |
+
+**单位与精度。**`geometry` 是原图像素，不取整。来自参考框的坐标保留钩子给出的数值类型，精度无损；模型画的多边形恒为浮点，顶点只能落在 0–1000 网格上，所以最细单位是 x 方向 `width / 1000` 像素、y 方向 `height / 1000` 像素。这是网格的分辨率，不是模型的实测精度：一次首轮真实运行里（一个模型、少量合成图片、原因没有证实），模型画的几何在横屏图上不稳定，当作几何使用前先对照原图核对（第 28 章 28.5）。
+
+**这个块是运行留下的唯一几何记录。**它记录这次运行得到的坐标，不证明这些坐标画得准。图片模式不新增任何输出文件，上面的产物矩阵不变。`output.meta_mode = "sidecar"` 时它写进 `{stem}.meta.jsonl`；`"none"` 是配置错误。叠图不落盘，运行结束后不能复现模型当时看到的叠图字节。
+
+空候选是合法结果：`"items": []` 与 `report.segment_image.empty` 计数，这条记录不进 rejects。
+
+**记录载荷。**annotate 关闭时的主输出行，以及 `output.rejects = "full"` 的 `record`，图片模式下实跑形态都是：
+
+```json
+{"image_path": ".../image_1.png", "companion_path": ".../image_1.xml"}
+```
+
+没有伴随文件时没有 `companion_path`。没有 `ui_tree` 键，也不内联伴随文件字节。
+
+**报表。**`report.segment_image` 只在图片模式出现，位于 `counts`（及 `estimate`）之后：
+
+| 键 | 语义 |
+|---|---|
+| `calls` | 提交的分割模型任务数，不含修复轮；只用参考框的路径恒为 0 |
+| `samples` | 进入 segment 阶段的活跃记录数 |
+| `boxes`、`regions` | 成功记录的参考框数、候选数之和 |
+| `empty` | 空候选的记录数 |
+| `failed` | `{错误码: 条数}`，例如 `{"companion_invalid": 1}`，无失败时 `{}` |
+| `usage` | 分割调用的 `prompt_tokens`、`completion_tokens`，含修复穷尽的调用；用来拆分 segment 与 annotate 共用同一 profile 时的成本 |
+
+`report.counts` 在图片模式多一个 `ignored_files`（第 5 章 5.6），不参与守恒式；非图片模式没有这个键。
 
 ## 8.3 sequence main truth
 
@@ -265,5 +328,5 @@ trace 与 rejects 正交。trace 高内容档可能含数据；stderr 永远不�
 
 ## 8.10 归档清单
 
-普通任务至少归档配置摘要、main、report 和必要的 rejects。sequence 任务把 main、stream、report 与 manifest
+普通任务至少归档配置摘要、main、report 和必要的 rejects。图片模式的几何只在 `_meta.regions`，配 sidecar 时记得一并归档 `{stem}.meta.jsonl`。sequence 任务把 main、stream、report 与 manifest
 作为一个不可拆分集合归档；failed report 单独归档为诊断证据。任何消费动作都应先过 manifest hash 校验。

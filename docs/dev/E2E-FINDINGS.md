@@ -13,6 +13,137 @@
 - API key value 只在内存中使用，不写日志、trace、main、stream、report、manifest、failed report 或 assertion repr。
 - 尚未运行的证据必须保留 `[PENDING-EVIDENCE:<name>]`，不能用规格期望冒充结果。
 
+## v1.22 segment.mode 重键真实门
+
+`segment.mode` 拆分与 52 处判断重键是流模式零行为变化的改动（`docs/dev/SPEC-image-region-segmentation.md` §7、§20.2）。
+离线侧已跑 `tests/orchestration/test_segment_mode_rekey.py`、8 个 dry-run golden 与 `tests/integration` 的 `--collect-only`；
+这些结果不代替下列真实门。2026-10-31 的真实重跑结果如下（工作区未提交，Windows 11，Python 3.12）。本地容量门没有可用端点，仍未运行：
+
+| 门 | 重跑内容 | 端点 | 结果 |
+|---|---|---|---|
+| `segment-mode-rekey-stream-llm` | `tests/integration/test_stream_llm.py` | z.ai glm-5.2 | 3 passed，1 failed。`test_defect_verdict_schema_roundtrip` 报 `SegmentConfig` 没有 `digest_max_chars`；未改动的 HEAD 上同样失败，不是重键回归 |
+| `segment-mode-rekey-stitch-llm` | `tests/integration/test_stitch_llm.py` | z.ai glm-5.2 | 4 passed |
+| `segment-mode-rekey-frame-llm` | `tests/integration/test_frame_llm.py` | z.ai glm-5.2 | 1 passed，2 failed。`test_annotate_member_real_text_product_passes_frame_schema` 与 `test_annotate_member_real_ui_single_frame_smoke` 的输出是 `{"x": "<JSON 字符串>"}`；HEAD 上同样失败，不是重键回归 |
+| `segment-mode-rekey-project-replay` | `examples/sequence-generation/project-replay.toml` 的运行与 `check_output.py --replay` | DeepSeek deepseek-v4-flash | 通过：退出 0，`sequence-generation artifacts: PASS`；scanned 27、episodes 9、dropped_noise 2、dropped_dup 1、emitted 8、failed 0。输入来自同日 `project.toml` 的真实生成（8 generated、8 emitted） |
+| `[PENDING-EVIDENCE:segment-mode-rekey-local-capacity]` | `tests/integration/test_sequence_context_capacity_local_llm.py` 本地容量门 | 本地 llama-server 与 `LABELKIT_LOCAL_KEY` | 未重跑 |
+
+三个失败节点在修复前后的两次工作区运行里都失败（各 `3 failed, 8 passed`），也在 `git archive HEAD` 的干净副本上失败（`3 failed in 26.61s`）。
+
+同日还发现两个与本特性无关的已有问题，都已在 HEAD 副本上确认或来自未改动代码，本轮未修：
+
+- `examples/sequence-generation/check_output.py`（不带参数）报 `Stream timestamps differ from the frozen teaching plan`：规划器在部分序列边界多加 1 ms，冻结表是 `.000000`。工作区与 HEAD 的 `project_digest` 相同（`sha256:80cbdb…`），失败也相同。
+- Windows 上输出文件已存在时，`labelkit run` 在交付阶段以 `WinError 183` 退出 4（`Path.rename` 不覆盖）。重跑前必须先挪走旧输出；否则 `check_output.py` 查到的是旧文件。
+
+## v1.22 segment 图片模式真实门
+
+只用 z.ai glm-5.2（`docs/dev/SPEC-image-region-segmentation.md` §20.1）。测试在 `tests/integration/test_segment_image_llm.py`，
+每个节点把传输、解析、语义正确、重复运行稳定分别写进 `out/verification-segment-image/`（不入库）。命令：
+`pytest -m "integration and zai" tests/integration/test_segment_image_llm.py -s`。
+
+**结论：门 3、4、5 两轮都通过；门 1 与门 2 未稳定通过，特性不能声称模型路径已验证。**第 1 道门的原话是“不通过时，本特性只能交付离线能力”：修正档案后的两次有效运行一过一不过，所以模型路径目前只算观察到可用、未达稳定通过。语义通过线一条都没有放低。
+
+第一轮在修复前（`3 failed, 5 passed in 1636.70s`），第二轮在修复后（`2 failed, 6 passed in 1899.02s`），两轮之间改了门的证据记录、解码失败分类与示例钩子，没有改 segment 提示词与投影。每轮内每个节点又重复 2 次。
+
+| 门 | 测试节点 | 第一轮 | 第二轮 |
+|---|---|---|---|
+| `zai-pixel-perception` | `test_zai_pixel_perception` | 失败（档案问题，见下） | 失败（档案问题）；修正后另跑两次：1 过 1 不过 |
+| `segment-image-zai` | `test_zai_segment_image_end_to_end` | 失败 | 失败 |
+| `segment-image-zai` | `test_zai_reference_box_inputs` | 通过 | 通过 |
+| `segment-image-zai` | `test_zai_boxes_only_path` | 通过 | 通过 |
+| `segment-image-zai` | `test_zai_scaled_request_and_verify_repair` | 失败 | 通过 |
+| `segment-image-overlay-ablation` | `test_zai_overlay_ablation` | 通过 | 通过 |
+| `segment-image-quality` | `test_zai_segmentation_quality` | 通过 | 通过 |
+| `segment-image-annotate-quality` | `test_zai_annotate_quality` | 通过 | 通过 |
+
+第一轮的门 4 召回分母漏掉失败样本（已修）；当轮没有失败样本，数字不受影响。第一轮的重复稳定性把两次都失败算作一致（已修），表中第一轮门 1 不给稳定性数字。
+
+### 门 1：`zai-pixel-perception`
+
+| 运行 | 档案 | 传输 | 解析 | 语义（位置+颜色，通过线 5/6） | 圆点 | 空棋盘对照 | 重复一致 |
+|---|---|---|---|---|---|---|---|
+| 第一轮 | `max_output_tokens = 256` | 13 次有 7 次重试耗尽 | 6 | 2/6 | 2/6 | 正确 | 无效数字 |
+| 第二轮 | 256 | 13 次有 9 次重试耗尽 | 4 | 2/6 | 2/6 | 没有得到回答 | 1/1 |
+| 修正后第 1 次 | 4096 | 13 次全部成功 | 13 | **6/6，通过** | 6/6 | 正确 | 5/6 |
+| 修正后第 2 次 | 4096 | 13 次全部成功 | 13 | **4/6，未通过** | 6/6 | 正确 | 3/6 |
+
+- **传输失败不是环境问题，是门的档案造成的。**错误是 `HTTP 500 api_error "Internal Network Failure"`。同一组 8 张棋盘、不重试、并行比较四种档案：`max_output_tokens = 256` 时 256 档 7 次 500、不设温度的 256 档 5 次 500；4096 档 0 次 500，不设温度的 4096 档 0 次 500、1 次超时。服务端为什么在小上限时报 500，没有证实。门的档案已改成 4096，与其余门一致。
+- **未通过那次**：颜色与圆点数 6/6 全对，错的两题行列都比答案小 1（`(3,1)` 答 `(2,0)`，`(2,3)` 答 `(1,2)`），提示词写的是从 1 开始数。这说明模型看到了像素，但位置作答不够稳定。
+
+### 门 2：`segment-image-zai`
+
+| 节点 | 传输 | 解析 | 语义 | 重复运行 |
+|---|---|---|---|---|
+| `test_zai_segment_image_end_to_end` | 无错误（第一轮 4、6 次调用；第二轮 6、5 次） | 全部退出 0，2 条输出 | 召回：第一轮 0.4、0.8；第二轮 0.2、0.6，通过线 0.5。标签关键词全部命中 | 不稳定：第二轮 `image_1` 一次 1/2、一次 0 个候选 |
+| `test_zai_reference_box_inputs` | 无错误 | 4 条输出 | 对齐框 3/3 复用；空数组与外壳框都继续分割 | 复用结果一致 |
+| `test_zai_boxes_only_path` | 无错误，segment 0 次调用 | 2 条输出 | 标签 3/3 | 选择一致 |
+| `test_zai_scaled_request_and_verify_repair` | 无错误，请求尺寸都是 2048 × 1475 | 全部退出 0 | 缩放：第一轮 0/3，第二轮两次 3/3（平均 IoU 0.85、0.89）。返工：verdict pass、2 轮、标签 3/3，同一候选块、同一 `RegionSet`、segment 0 次 | 第一轮到第二轮不一致；第二轮内一致 |
+
+### 门 3：`segment-image-overlay-ablation`
+
+固定候选，7 个用例。这组小样本上**没有看到叠图的可测收益**，两臂结果相同。叠图臂首次运行的 prompt token 更高（12137 对 9981、11412 对 9784），重复运行的差异方向不一致。
+
+| 臂 | 区域选择正确率 | 标签正确率 | 误读 | prompt token | 重复一致 |
+|---|---|---|---|---|---|
+| 带叠图 | 第一轮 0.857、1.0；第二轮 1.0、1.0 | 同左 | 0 | 12137、6127；11412、2812 | 6/7；7/7 |
+| 无叠图 | 第一轮 0.857、1.0；第二轮 1.0、1.0 | 同左 | 0 | 9981、3908；9784、4251 | 6/7；7/7 |
+
+### 门 4：`segment-image-quality`
+
+9 个样本、4 组，IoU 阈值 0.5，每轮重复 2 次。传输无错误，全部退出 0。
+
+| 运行 | 召回 | 平均 IoU | 多余候选 | 空候选率 | 截断率 | `segmentation_invalid` 率 |
+|---|---|---|---|---|---|---|
+| 第一轮 | 0.667、0.667 | 0.837、0.800 | 15、15 | 0、0 | 0、0 | 0、0 |
+| 第二轮 | 0.625、0.792 | 0.865、0.827 | 11、14 | 0.111、0 | 0、0 | 0、0 |
+
+分组看差异很大：第二轮 `pure_image` 召回 0.111 → 0.889，`hook_returns_shell` 0.833 → 0.333，`aligned_reference_boxes` 两次都是 1.0。两轮的命中集合都不一致（`identical_matched` 为 false）。分割的 completion token 按组平均每次最高约 1000，两轮都没有截断。
+
+### 门 5：`segment-image-annotate-quality`
+
+固定候选，8 个用例，传输无错误，8/8 解析。
+
+| 运行 | 区域选择正确率 | 标签正确率 | 误读 | 重复一致 |
+|---|---|---|---|---|
+| 第一轮 | 0.875、0.875 | 0.818、0.818 | 1、1 | 7/8 |
+| 第二轮 | 0.875、0.75 | 0.818、0.818 | 1、1 | 5/8 |
+
+### SPEC §20.3 站立假设的状态
+
+| 假设 | 状态 |
+|---|---|
+| ① glm-5.2 感知像素 | 观察到成立：修正档案后颜色与圆点 12/12、空棋盘对照 2/2。门的位置通过线一过一不过 |
+| ② 遵守 0–1000 网格 | **不能视为可靠成立。**横屏图上同一张图有时吻合、有时 y 被压缩（y 比值约 0.99 与 0.61；2601 × 1873 上约 0.74，也出现过 3/3）。提示词已写明按宽、高分别归一，x 基本吻合，请求尺寸比例正确，投影公式两轴对称，所以不像框架投影的问题；真正原因没有证实。竖屏样本目标同列，分不清 |
+| ③ 严格结构化输出接受 §10.3 嵌套 Schema | 这批样本成立：四次运行都没有以 `segmentation_invalid` 终局；有的样本用了修复轮（调用数多于样本数） |
+| ④ `max_output_tokens = 4096` 容纳典型候选 | 这批样本成立（最多约 7 个候选，截断率 0）。小上限不可用：256 时 z.ai 大量 HTTP 500 |
+| ⑤ 图片成本校准稳定 | 未单独评估。同一请求首轮与重复的 prompt token 差异很大（12137 与 6127），未查原因 |
+
+门的语义通过线（SPEC §22 第 29 条）在这些运行里没有调整。样本是少量合成图片，人工标注没有第二人复核，只用了一个模型；这些数字不能外推到真实照片或别的模型。
+
+### 2026-10-31 已运行的离线证据（不代替上述真实门）
+
+下面没有任何一项访问过端点，也没有证明任何模型能力。凡经过模型调用位置的运行，都用进程内替身（`LLMClient.complete` 的子类，返回固定 JSON）；
+替身的回答不是模型输出，所以只采集框架侧事实：配置校验、摄取计数、钩子结果、提示词材料、`_meta.regions` 形状、失败归类。
+脚本在会话临时目录、不入库，临时工程复制自 `examples/image-segmentation`。环境：Windows 11、Python 3.12、Pillow 12.3.0、shapely 2.2.0，工作区未提交。
+
+| 证据面 | 命令或输入边界 | 结果 |
+|---|---|---|
+| 示例工程 keyless | 无 `LABELKIT_*` 环境变量，6 个工程各跑 `labelkit validate` 与 `labelkit run --dry-run --console plain` | 全部退出 0。`total` 依次为 project 4、boxes 2、uiautomator 6、accessibility 3、ocr 2、fixed 2；boxes 的 `segment_calls=0`，其余 `segment_calls` 等于估算记录数 |
+| 只用参考框路径 | `project-boxes.toml`，真实 M1、ingest、`box_parser`、segment、dedup、emitter；annotate 由替身返回空 `items` | 退出 0；模型调用位置只有 2 次 annotate，segment 为 0；`report.segment_image` = calls 0、samples 2、boxes 3、regions 3、empty 1；`_meta` 键序 id、run、source、stream、regions、scores、dedup、classification、annotation、verification，`stream` 为 null；`n1` 几何等于钩子给的整数矩形；没有新增输出文件 |
+| 请求材料 | 同上；替身按 M9 方式取图 | 每个 annotate 请求依次为 `[原图]`、`[候选区域叠图]`、`[候选区域]`，两张图都是 540 × 960 PNG。`project-fixed.toml`（2601 × 1873）的原图与叠图都按 2048 × 1475 发送 |
+| 摄取与钩子失败 | 同一工程加入坏 XML、无伴随文件的图、无图的 XML、`notes.txt`、`uitree_1.jsonl` | `scanned=5 ingested=3 bad_input=2 failed=1 emitted=2 ignored_files=2`；坏 XML 为 `companion_invalid`，不计 `bad_input`，WARN 只含计数 |
+| 钩子缺陷 | 只给第 0 个框命名的钩子 | 两条记录都以 `internal_error` 失败，`errors = ["BoxParserError: invalid_box"]`，日志 `reason=invalid_box box_index=1`，没有数据，不调用模型；**退出码 0** |
+| 去重 | 真实 dedup | 逐字节相同的图 `exact`；改一个像素的图 `near_image`；截图相同、参考框文字不同时默认 `"both"` 保留；伴随字节不同而参考框相同 `near_both` |
+| 只分割 | `project-uiautomator.toml` 关 annotate 与 verify，`meta_mode = "sidecar"`，trace 订阅 segment；替身返回空候选 | dry-run `segment_calls=2 annotate_calls=0 total=2`；主输出每行只有 `image_path`、`companion_path`；`regions` 在 `.meta.jsonl`；`segment.regions` payload 全是计数；`rejects = "full"` 的 `record` 键同样只有这两个 |
+| 容量 | 改 `context_window` 重跑，替身不应收到请求 | annotate：8000、6000、5000 时都不发请求，`context_overflow`，`budget.overflow_records = 2`，12000 正常发出。segment：`project.toml` 配 6000 时 `context_overflow`，文本是共用检查的 `complete sequence evidence exceeds the input context budget` |
+| 引用修复 | 替身恒引用 `n1`，`image_2` 没有候选 | 首轮加两轮修复共 3 次请求后 `schema_violation`，`errors = ["/items/0/region_id: unknown region reference"]`，后处理未运行 |
+| 配置错误 | 对 `project.toml`、`project-boxes.toml` 逐项改坏后 `labelkit validate` | 缺 mode、时序流键、无 rubric、缺 `[quality]`、`meta_mode = "none"`、`[stream]`、stitch、语义去重、`ui_tree_max_chars`、`llm` 无 instruction、两者都没有、后缀非法、后缀缺失、`context_window = 0`、region-ref 标在 integer 上，全部退出 2 且文本与手册第 28 章一致；`max_repair_attempts = 3` 只警告 |
+| 方向与钩子片段 | 400 × 300、Orientation = 6 的 JPEG；手册 14.8 的单测文件 | `exif_transpose` 后 300 × 400、标签消失；单测文件 `3 passed` |
+| 回归 | `pytest -m 'not integration'`，覆盖 `test_image_examples`、`test_image_workflow`、`test_image_cli`、`test_segment_mode_rekey`、`test_segment_image`、`test_annotate_image`、`test_verify_image`、`test_emitter_image`、`test_ingest_image`、`test_dedup_image`、`test_region_context`、`test_image_bypass`、`test_segment_geometry`、`test_regions`、`test_region_overlay`、`test_box_parser`、`test_region_ref_engine`、`test_post_validation_seam`、`test_segment_mode_config` | 929 passed in 131.89s；`-m 'not integration'` 明确排除了真实门 |
+| 设计产物 | 用临时脚本导入 `tools/build_design_doc.py`，只覆盖 `CHROME` 为 Windows 路径，并把 `Path.write_text` 固定为 LF，运行 `--pdf` | HTML 与 243 页 PDF 重建成功，退出 0；Chrome 无头截图目视检查 3.18 节与图 3-10，目录锚点 `s3-18` 唯一。PDF 用 `pdftotext` 与首尾字节核对，3.18 在第 150–157 页。闭合门切片改过 `spec/301` 后按同样方式重建，再用 Windows 内置 `Windows.Data.Pdf` 把第 42、150、151、155、157 页光栅化后目视：3.18 标题、图 3-10、3.18.5 的 Schema 与违规表、3.18.8 失败表、3.1.2 的 `companion_suffix` 段落都完整可读，无裁切、无缺字。页数比之前 186 页多，含新增内容与 Windows 字体差异，未逐项拆分 |
+
+已知边界：替身不是端点，上表不覆盖服务端缩放、视觉理解、结构化输出兼容性、真实截断分布；`validate --probe` 需要密钥，本轮未运行，它也不验证视觉。
+第 4 道门的参考标注由实现 agent 看图并用前景外接框交叉核对，没有人工复核，图片是合成纯色示例，结果不能外推到真实照片或截图。
+
 ## 2026-09-20 通用推理与返工修复证据
 
 原主线 `5a359ca` 与 WorldMock 私有依赖候选 `e8f168f` 的逐项问题确认、候选评估及最小实现说明见

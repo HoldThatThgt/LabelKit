@@ -24,9 +24,15 @@ def build_stages(cfg: "ResolvedConfig") -> list["Stage"]:
 
     stages: list[Stage] = []
     if cfg.segment.enabled:
-        from labelkit.operators.segment import SegmentStage
+        # enabled 决定阶段在链；mode 只选阶段类，阶段名与链位不变（SPEC §7.2 第 40 行）。
+        if cfg.segment.mode == "image":
+            from labelkit.operators.segment_image import SegmentImageStage
 
-        stages.append(SegmentStage(cfg))
+            stages.append(SegmentImageStage(cfg))
+        else:
+            from labelkit.operators.segment import SegmentStage
+
+            stages.append(SegmentStage(cfg))
     if cfg.stitch.enabled:
         from labelkit.operators.stitch import StitchStage
 

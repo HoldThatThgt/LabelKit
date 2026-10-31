@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 
 from labelkit.common.config._temporal import inject_temporal_values, project_temporal_instance
 from labelkit.common.contracts.generation import SequenceTemporalContext
+from labelkit.common.contracts.regions import RegionSet, project_regions
 from labelkit.common.contracts.types import Record
 from labelkit.common.errors import InternalError
 from labelkit.common.extensions.postprocessing import (
@@ -31,7 +32,7 @@ class AnnotationFinalizer:
     """一次标注候选的工程后处理与框架时间定稿器。"""
 
     postprocessor: "ResolvedHook | None"            # 当前类生效的工程后处理函数
-    record: Mapping | None                          # 工程函数收到的原始记录；sequence 为 None
+    record: Mapping | None                          # 工程函数第二入参：raw；sequence 为 None；图片样本为样本上下文
     time_paths: tuple[str, ...]                     # 完整 Schema 中的框架时间路径
     time_values: tuple[tuple[str, object], ...]     # 路径到权威框架时间值
     temporal_context: SequenceTemporalContext | None  # 本次调用冻结的时间上下文
@@ -125,6 +126,17 @@ def class_schema_text(ctx: "RunContext", label: str | None) -> str:
     return json.dumps(_thaw_json(model_schema), ensure_ascii=False, separators=(", ", ": "))
 
 
+def class_region_ref_paths(cfg: "ResolvedConfig", label: str | None) -> tuple[str, ...]:
+    """读取记录类的区域引用路径，取值规则同 ``class_effective_model_schema``。
+
+    @param cfg 已解析配置。
+    @param label 记录分类标签。
+    @return x-labelkit-region-ref 路径，数组项写 ``*``。
+    """
+    view = _class_view(cfg, label)
+    return cfg.region_ref_paths if view is None else view.region_ref_paths
+
+
 def record_postprocessor(cfg: "ResolvedConfig", label: str | None) -> "ResolvedHook | None":
     """读取记录类继承完成后的工程后处理函数。
 
@@ -147,12 +159,22 @@ def frame_postprocessor(cfg: "ResolvedConfig", label: str | None) -> "ResolvedHo
     return cfg.frame_annotate.resolved_postprocessor if view is None else view.resolved_postprocessor
 
 
-def annotation_record_context(record: Record) -> Mapping | None:
-    """取得工程函数与记录级 validator 可见的原始记录。
+def annotation_record_context(record: Record, regions: RegionSet | None) -> Mapping | None:
+    """取得工程函数与记录级 validator 可见的第二入参。
 
     @param record 当前记录或成员帧。
-    @return 普通记录的 raw；sequence 恒为 None。
+    @param regions 图片样本的分割结果；其余路径为 None。
+    @return 图片样本为新构造的样本上下文；普通记录的 raw；sequence 恒为 None。
     """
+    if regions is not None:
+        projection = project_regions(regions)
+        return {
+            "sample_id": record.id,
+            "source": {"file": record.ref.source_file, "pair_index": record.ref.pair_index},
+            "image": projection["image"],
+            "boxes": projection["boxes"],
+            "regions": projection["items"],
+        }
     return None if record.kind == "sequence" else record.raw
 
 
@@ -161,6 +183,7 @@ def annotation_transforms(
     cfg: "ResolvedConfig",
     label: str | None,
     temporal_context: SequenceTemporalContext | None,
+    regions: RegionSet | None,
 ) -> tuple[AnnotationFinalizer, AnnotationProjector]:
     """构造一条记录调用共享的定稿器与模型空间投影器。
 
@@ -168,13 +191,14 @@ def annotation_transforms(
     @param cfg 已解析配置。
     @param label 记录分类标签。
     @param temporal_context sequence 的冻结时间上下文。
+    @param regions 图片样本的分割结果；其余路径为 None。
     @return 使用同一完整 Schema 与时间路径的变换对。
     """
     view = _class_view(cfg, label)
     paths = () if view is None else view.business_time_paths
     context, values = _annotation_time_values(record, cfg, label, temporal_context)
     finalizer = AnnotationFinalizer(
-        record_postprocessor(cfg, label), annotation_record_context(record),
+        record_postprocessor(cfg, label), annotation_record_context(record, regions),
         paths, tuple(values.items()), context,
     )
     return finalizer, AnnotationProjector(class_effective_schema(cfg, label), paths)
@@ -193,7 +217,7 @@ def frame_annotation_transforms(
     if cfg.frame_schema is None:
         annotation_contract_error("frame annotation schema is missing")
     finalizer = AnnotationFinalizer(
-        frame_postprocessor(cfg, label), annotation_record_context(member), (), (), None,
+        frame_postprocessor(cfg, label), annotation_record_context(member, None), (), (), None,
     )
     return finalizer, AnnotationProjector(cfg.frame_schema, ())
 

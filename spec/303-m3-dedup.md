@@ -18,7 +18,7 @@
 |---|---|---|
 | ① 精确 | 去重键 = `sha256(dedup_text)`。`dedup_text`：文本模态为抽取文本经 NFC 规范化、连续空白折叠为单空格、strip 后的字节；UI 模态为 UI 树规范序列化（4.3 节 `UITree.serialize()`，不含坐标抖动位——坐标按 `dedup.bounds_quantize_px`（默认 4px）量化后参与序列化）。哈希入 `set`，O(1) 查询。 | 哈希相等 |
 | ② 近似 | MinHash：`dedup_text` 的字符 n-gram（默认 n=5，对中英混合文本鲁棒；空白折叠后取滑窗）shingle 集合 → 128-permutation 签名 → `datasketch.MinHashLSH(threshold=0.85)` 查询候选 → 对候选精算签名估计 Jaccard，≥ 阈值判重。首见者入索引（first-writer-wins，保留簇内最早记录，与 Lee et al. 的 cluster-keep-one 策略一致 [3]）。 | 估计 Jaccard ≥ `dedup.minhash_threshold` |
-| ③ 图像（仅 UI 模态） | 截图缩放解码 → 64-bit pHash（imagehash 默认 DCT 实现）→ 与索引中全部已保留 pHash 求汉明距离（64-bit 异或 popcount，50 万条线性扫描 < 100ms/查询，可接受；实现里按 16-bit 前缀分桶加速）。 | 汉明距离 ≤ `dedup.image_phash_max_distance`（默认 8） |
+| ③ 图像（仅 UI 模态） | 截图缩放解码 → 64-bit pHash（imagehash 默认 DCT 实现；整数模式 `I`、`I;16`、`I;16L`、`I;16B` 且最大值超过 255 的图先按本图最大值线性缩放到 8 位，否则 `convert("L")` 会把这些值全部削成白色，其余图像原样哈希）→ 与索引中全部已保留 pHash 求汉明距离（64-bit 异或 popcount，50 万条线性扫描 < 100ms/查询，可接受；实现里按 16-bit 前缀分桶加速）。 | 汉明距离 ≤ `dedup.image_phash_max_distance`（默认 8） |
 | ④ 语义（可选） | `dedup.semantic = true` 时启用（默认 false，5.2）：`dedup_text` 经 `[embedding.<name>]` profile（由 `dedup.semantic_embedding` 引用）取得 L2 归一化句向量，再与全部已保留向量做矩阵化余弦点积。归并前对所有按 modality、`ui_dup_requires`、图像解码状态与 sequence 身份静态判定为 participating 的 item 投机并发取得 embedding；这包括随后可能被较低 ordinal 的 exact、MinHash、pHash 或 semantic 判决淘汰的 item。归并屏障仍按输入序执行①→②→③→④，只有真正到达④才消费预计算 vector。未使用 outcome 不修改 `PipelineItem` 或 `DedupIndex`，但调用 usage、provider result、breaker、latency 与 embedding failure 是运行事实。 | 余弦相似度 ≥ `dedup.semantic_threshold`（默认 0.95，SemDeDup 论文的高相似区间 [26]） |
 
 普通批次先同步冻结每个 active item 的 exact、MinHash、pHash、图像解码状态、sequence 身份与 embedding input；
@@ -34,6 +34,13 @@ UI 模态合成判定：`dedup.ui_dup_requires = "both"`（默认，树近似重
 `record.kind = "sequence"` 进入同一配方：成员逐条按单记录配方规范化，再按顺序以 `"\\x1e"`
 拼接。精确与 MinHash 在拼接文本上执行；sequence 没有顶层 image，pHash 自动跳过，
 `ui_dup_requires = "both"` 按 tree-only 降级；semantic 也使用完整拼接文本。
+
+**图片模式（v1.22）。**segment 位于链首，dedup 运行时参考框已经冻结。
+
+- 精确层：键为 canonical JSON `["labelkit:image", "exact", <image_sha256>, <companion_sha256 或 null>]`（`json.dumps(..., ensure_ascii=False, separators=(",", ":"))`，与 v1.20 编码域同一参数）。伴随文件相同、图片不同的样本不判重；不借用 `Record.exact_dedup_text`（设置它会走 exact_only 并跳过 pHash 层）。
+- 近重复：树侧证据改由参考框承担。用 `item.regions.boxes` 构造规范文本，每框一行 `[l,t,r,b] text`：坐标恒为 int（`q > 0` 时 `floor(c / q)`，`q = 0` 时 `floor(c)`，`q` 为 `dedup.bounds_quantize_px`），`text` 为 `json.dumps(box.text, ensure_ascii=False)`，不含 id，按钩子返回顺序以 `\n` 拼接，参与 MinHash。
+- 合成判定：`ui_dup_requires` 照常适用，默认 `"both"` 保留「同一界面模板、不同内容不误杀」。样本没有参考框时树侧缺席：`"both"` 对该记录退化为 `"image"`，`"tree"` 下只可能是精确重复（与图像解码失败时退化为 `"tree"` 对称）。纯图片样本的近重复只靠 pHash，同模板不同文字的图片可能被判重，可调 `image_phash_max_distance` 或关闭 dedup。
+- 语义层④不适用：`dedup.semantic = true` 是定向 CONFIG_ERROR（rule 78），embedding profile 不进入引用、凭据与探测集合。
 
 sequence exact delivery 不先污染全局索引。一个 counterfactual set 的所有 variant 按声明序放入
 `DedupGroupRequest`，组内配对变体相互豁免，只与已提交 set 比较。异步 `group_reserve` 计算 exact、MinHash

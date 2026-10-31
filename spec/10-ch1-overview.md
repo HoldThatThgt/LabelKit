@@ -27,7 +27,7 @@
 | Episode（序列记录 / 情节） | stream 模式的复合记录（v1.8）：M14 把同一目标导向活动的成员帧按序键收拢为一条 `kind = "sequence"` 的序列 Record（成员经 `members` 元组引用共享持有），作为一条普通记录走下游分类、打分、标注与评审（3.14、4.1）。 |
 | 会话（Session） | 摄取按时间间隔、分区键、长度与时长上限从固定输入文件组产生的有限记录序列。它是 process stream 的语义、状态寿命和提交单元，可以跨任意多个计算组。 |
 | 转移（Transition） | 序列内相邻两帧 ⟨s_i, s_{i+1}⟩ 之间发生的单个语义动作：M15 经 LLM 推断为结构化对象 {action_type, target, value, description} 写入 `item.transitions`，转移数 = 成员数 − 1（3.15、4.1）。 |
-| stream 模式 | `segment.enabled = true` 的运行形态（v1.8）：摄取按 `[stream]` 声明排序与会话化，链序为 segment → stitch → dedup → classify → extract → quality → annotate → verify（stitch 为 v1.9 增位，默认关）；默认关闭，关闭时数据产出与 v1.7 逐字段一致（`_meta.stream: null` 除外）（2.3.1、3.10.3）。 |
+| stream 模式 | `segment.sequence_resolved = true`（v1.22 起即 `segment.enabled = true` ∧ `segment.mode = "sequence"`）的运行形态（v1.8）：摄取按 `[stream]` 声明排序与会话化，链序为 segment → stitch → dedup → classify → extract → quality → annotate → verify（stitch 为 v1.9 增位，默认关）；默认关闭，关闭时数据产出与 v1.7 逐字段一致（`_meta.stream: null` 除外）（2.3.1、3.10.3）。 |
 | 线索（Thread） | v1.9 stream 模式的顶层工作单元：M16 把同一目标导向任务被穿插切开的碎片保守缝合所得（三级结构 thread ⊃ fragment ⊃ step），承载体仍是一条 `kind = "sequence"` 的序列记录（幸存信封 Record 重绑、id 不重算，`thread_id` = 幸存信封 record.id），作为一条普通记录走下游判重、分类、打分、标注与评审（3.16、4.1）。未被缝合的 episode 即单碎片线索；`stitch.enabled = false` 时线索与 episode 天然同值。 |
 | 碎片（Fragment） | 线索的成员分段（v1.9）：会话序上连续归属同一线索的成员帧区间——缝合前的一个 episode 或一个救援短段；以 `_meta.stream.fragments[]`{order_span, member_count, cause, source_episode} 溯源，cause ∈ "origin" \| "resumed" \| "rescued"（3.16、6.3）。 |
 | 序列生成（Sequence generation） | `generate.form = "sequence"` 的 v1.21 纯生成形态：M1 冻结 sequence 配置，M10 调用唯一 GenerationProgram compiler 与 ScenarioPlan planner，再以 delivery slot 为原子事务生成、判定并提交 primary sequence，同时交付可重放 stream 工件和成功 manifest（3.6、3.10、3.11）。 |
@@ -47,6 +47,12 @@
 | 重放序列（Replay sequence） | 只进入 stream 工件的完整 primary positive sequence 重放；非时间 payload、frame class、actual role、duration、resources、time descriptor 与顺序同源，全部 member 使用同一个正时间平移量，payload 时间由框架按 replay start 重新绑定，replay sequence/event ID 新生。 |
 | 成功 manifest | sequence 运行的唯一成功提交真值：最后原子替换，包含 run_id、delivery_digest 以及 main/stream/report 的路径、SHA-256 和行数；摘要不匹配时消费者必须拒绝固定路径文件。 |
 | 接缝（Seam） | 多碎片线索中相邻两碎片的拼接处（v1.9）。判据：拼接对的会话序间隙含 ≥1 个归属其他线索的帧（间隙仅含噪声帧/本线索救援帧时不是接缝，该对照常摘取，3.16.4）；接缝步由 M15 零 LLM 机械占位（`action_type="app_switch"`、`detail.kind="thread_seam"`、步行内 `resumed=true`，3.15.4），位置经 `seam_indexes` duck 标承载（左成员下标坐标，4.1）。 |
+| 图片模式 | `segment.enabled = true` ∧ `segment.mode = "image"` 的运行形态（v1.22）：一张图片一个样本，segment 逐样本生成候选区域并挂在 `PipelineItem.regions`，annotate 只按 `region_id` 选择与标注；限 `run.mode = "process"`、`run.modality = "ui"`（3.18）。 |
+| 候选区域（Candidate region） | 图片模式下 segment 产出的平面区域提议：一个或多个多边形部件（可含孔洞），几何真值是原图像素坐标，不取整；`region_id` 是框名或框架编号 `r<n>`（4.1.1、3.18.5）。 |
+| 伴随文件（Companion file） | 图片模式下与图片按 index 配对的可选文件，文件名为 `image_<n>` 加 `segment.companion_suffix`。LabelKit 不解释其内容，只把原始字节交给 `segment.box_parser` 钩子（3.2.10、3.18.4）。 |
+| 参考框（Reference box） | `segment.box_parser` 返回并经框架校验的轴对齐矩形（框名、`bbox`、`text`），可作为模型提示、被模型复用，或在没写 `segment.instruction` 时直接成为候选（3.18.4）。 |
+| 模型侧网格 | 图片模式 segment 输出与提示词坐标统一使用的 0–1000 整数网格，x 相对宽度、y 相对高度，两轴各自归一化（3.18.3）。 |
+| 候选区域叠图（Region overlay） | `RegionOverlayRef` 在 M9 编码请求时按与原图相同的逐轴缩放惰性渲染的半透明填充图，字节用完即弃，不落盘（3.18.6）。 |
 
 ## 1.3 设计原则
 
@@ -86,6 +92,7 @@
 | （v1.21 评审补充）按用户候选集和权重在 LabelKit 内部决定序列交织，不要求用户枚举 owner word | M1 交织配置闭包（3.1、5.2）+ M6 候选、权重、partner pool 与保序时间布局（3.6）+ M10 冻结计划与 retry（3.10）+ 载体与 report（4.2、6.4） |
 | （v1.10 评审补充）Console 实时面板（TUI）：交互终端下以双区内联面板实时呈现批进度、流水线段棋盘、状态账与 LLM 用量/密钥池/熔断（工业调研裁决品类：批处理工具不做全屏 TUI）；非 TTY / CI / jsonl 下保持 v1.9 行为（三层回归锚 7.8） | 7.7 三态 console 规格；`[console]` 配置 5.1 与 `--console`（2.4）；ProgressListener 五回调旁路（3.12.3）与 snapshot（3.9.2）；依赖面增 rich（2.6）；裁决 U1–U27 见 `docs/dev/SPEC-tui-console.md` §2 |
 | （v1.18 评审补充）序列生成内核：无输入时生成可独立验收的精确命名 pattern、positive/missing/reordered/interval-exceeded counterfactual 数据；逐事件执行 persistent world state 与 actor 读写/发布权限；instruction-only 在 LLM 前冻结数量、位置和时间；所有 slot 整组精确交付并以 manifest 提交 | M6 序列生成（3.6）+ M1 配置/编译（3.1、5.2）+ M8 post-validator（3.8）+ M3/M4/M5/M7 attempt-local 下游（3.3–3.7）+ M10 交付（3.10）+ M11 manifest（3.11）；唯一增量事实源 `docs/dev/SPEC-sequence-generation-redesign.md` |
+| （v1.22 评审补充）独立图片候选区域分割：segment 决定几何，annotate 按 region_id 选择与标注，后处理做确定性引用解析与格式转换；图片必需、伴随文件可选；候选数据可核对 | M14 图片模式（3.18）；`segment.mode` 与组合规则（3.1.4、5.2.2）；图片模式发现（3.2.10）；dedup 图片键（3.3.3）；annotate / verify 图片变体（3.5.7、3.7.6）；通用后校验接缝与引用检查（3.8.2、3.8.5）；`_meta.regions`（6.3）；非目标（8.1） |
 
 ## 1.5 算法与工程背书总表
 
@@ -160,6 +167,12 @@
 | Dedup reservation（v1.19） | counterfactual set 整组取得零正式突变的 reservation；轮到声明序 head 后对最新索引重验证，全部校验通过才在无 await 临界区消费并 commit（3.3、3.10） | 数据库式 reservation/validate/commit capability；运行事实不随 attempt 回滚 |
 | Manifest 提交协议（v1.18） | main、stream、report 各自写同目录 part、flush/fsync/replace，manifest 最后替换；commit-I/O 后消费者仅在 manifest 摘要全部匹配时接受（3.11） | 原子 rename 与内容摘要 manifest 是批数据发布的成熟提交协议；不虚构跨多文件原子 rename |
 | 双尺度硬门（v1.20） | record_units 与 stream_rows 各不超过 500000；最终 main+stream canonical UTF-8 retained_content_bytes 不超过 512 MiB。M11 先从最终 item 装配 source `SequenceRows`，replay 从其 primary rows 派生独立 rebound payload；primary 与全部匹配 replay 在同一个 checked delta 和 source positive commit 前精确计费（2.6、3.6、3.11） | 有界批处理必须同时约束对象数量和内容体积；同一 checked delta 保证 source 与 replay 的时间重绑、计费和提交原子一致 |
+| 空间定位与标注分立（v1.22） | segment 决定平面几何，annotate 只按 `region_id` 选择与标注；与「定位与描述分立（v1.8）」同构，不重新解释该行 | Set-of-Mark [137]、OmniParser [139]——取用：先给候选再按编号选择优于让标注模型生成坐标；OmniParser 在框外另给候选文字语义后选择正确率从 0.705 提到 0.938，所以文本候选通道保留 |
+| 候选质量约束（v1.22） | 候选遗漏在 segment 解决，annotate 不补画，verify 不触发重新分割 | Set-of-Mark [137]（换成真值掩膜后 mIoU 从 75.6 到 90.1）；UGround [141]——取用：编号选择受候选完整性约束 |
+| 原图与叠图分开发送（v1.22） | 每请求原图加叠图两张，禁止拼图；叠图是否有益由 z.ai 第 3 道门对照取证 | UFO [140]——取用：同时提供干净截图与标注截图，干净图让模型看清被标记遮住的内容，但没有消融数据；SoM-LLaVA [138]——取用：小模型难读视觉标记，选择质量不能先验乐观 |
+| 模型侧坐标网格（v1.22） | 0–1000 整数网格，框架按原图宽高投影，投影不取整 | Qwen3-VL [144]、GLM-V [145] 的原生约定；Qwen2.5-VL [143] 与 Claude [146] 返回缩放后像素，SeeClick [142] 用 0–1 比例，OpenAI [147] 的坐标保真度取决于请求字段——取用：只有归一化网格同时不受 LabelKit 缩放与服务端缩放影响 |
+| 叠图填充样式（v1.22） | 低不透明度半透明填充、1 像素同色轮廓、白字黑描边标识；字节级确定性只承诺在同一构建内 | Set-of-Mark [137]——取用：最好配置是编号加半透明掩膜加框，标记放在区域内部；Pillow [154]——取用：`ImageDraw.polygon` 无孔洞参数、`load_default(size=...)` 需要 Pillow ≥ 10.1、字形栅格化随 FreeType 版本变化 |
+| 几何合法性与格式（v1.22） | Shapely 校验、网格整数判定、无任何自动修复；对外用闭环嵌套坐标；孔洞与多部件用固定候选夹具测试，不宣称 VLM 能生成 | Shapely 2.2.0 [150]——取用：构造不检查合法性、隐式闭合，共边 MultiPolygon 非法；RFC 7946 [151]——取用嵌套结构与环闭合；COCO [152]、CVAT [153]——取用：常见标注格式不支持孔洞，输出形态由用户 Schema 决定；Text4Seg [148]、Gemini 2.5 [149]——取用：通用 VLM 大概率只给矩形或粗多边形 |
 ## 1.6 已对齐的设计决策
 
 以下多方案设计点已与需求方沟通对齐（对齐日期见各行，早期各轮为 2026-07-02），本文档按对齐结论展开：
@@ -178,6 +191,7 @@
 | 纯生成模式（v1.4 对齐，2026-07-02） | 支持两种形态 / 仅种子池 / 演进路线 / 明确非目标 | 支持，两种形态进规格：配置种子池 `seed_examples`（Self-Instruct 形态 [18]）与无种子条件化 + `standalone_count`（Persona Hub / Cosmopedia 形态 [34][35]），单遍执行不引入 O6 循环；工具定位由「数据加工器」扩展为「亦可从零起步的数据生产器」（1.1、2.1 同步修订）。 |
 | 多 API Key 负载均衡（v1.6 对齐，2026-07-03） | ① 范围：仅同 profile 多 key / 端点镜像池；② 熔断中止时 .part 交付与否；③ 全池冷却驻留超限的处置：直接硬熔断 / 记录失败累积；④ 配额型 403 的归类：密钥禁用 / 冷却 / 错误体嗅探；⑤ 报表中密钥身份：环境变量名 / 位置别名 | ① 仅**同 profile 多 key、单 endpoint**（密钥池，3.9.3）——端点镜像池明确排除：同模型不同部署在 temperature=0 下仍有数值漂移，会翻转 pairwise 裁决与语义去重边界判定、污染 7.5 同种子翻转率指标（决策溯源见 8.3 O7）；② 熔断中止**交付**已完成批（熔断交付，3.10.3、3.11.2、6.4）；③ 驻留超限（`run.max_park_s`，默认 3600s）按重试耗尽**记录失败并计入熔断窗口**，不直接硬熔断；④ 配额以 403 形态出现按认证禁用该密钥处理，不做 provider 特定的错误体嗅探；⑤ 报表 / trace 以**环境变量名**标识密钥（密钥值任何情况不落盘，7.4）。 |
 | 分类算子与按类条件化（v1.7 对齐，2026-07-07） | ① 模块编号：追加 M13 / 按流水线位置全量重编号；② fallback 语义：普通类成员且必填 / 隐式 `_unclassified` 特殊类；③ generate_only 按类配比：本版做 / 单独立项；④ 白名单是否放开 per-class `quality.llm` / `annotate.llm`；⑤ 纯打标模式：显式开关 / 零覆盖自然退化；⑥ 多标签中间档（仅打标不扇出）：本版加 / 留扩展位；⑦ dry-run multi 估算口径：乘数 1 下界 / `max_labels` 上界；⑧ `enabled=false` 而类配置在场：CONFIG_ERROR / warning；⑨ 手册新章编号：追加制 / 链序插入全书重排 | ① **追加 M13**（3.13，纯新增零重排成本，v1.3 重编号先例限于模块拆分）；② `classify.fallback_class` 为**普通类成员、enabled 时必填**（可配 per-class 参数，5.2）；③ **不做** generate_only 按类配比——generate_only 用全局指令、产物回流被分类后按类打分/标注（3.6.2），按类量目标与 8.3 O6 一并立项；④ v1 **不放开**（LLM 绑定属部署与成本面，白名单后续只增，5.2）；⑤ **不加开关**——不配任何 `[class.*]` 覆盖即自然退化为纯打标；⑥ **暂不加**，`assignment` 枚举留扩展位（8.4 演进候选）；⑦ 按标签**乘数 1 报下界** + stderr 注明（诚实不虚高，3.10.3 估算行）；⑧ **warning**（一次、点名被忽略的表——偏离提案的 CONFIG_ERROR，对齐 top_ratio 未生效等 no-op 键分级惯例，3.1.4）；⑨ **追加制** `docs/manual/24-classify.md`。另记评审改判三则：内部 Schema **不写 uniqueItems**（OpenAI strict 模式与部分约束解码网关硬拒该关键字，重复标签由 classify 代码在 M8 验证后确定性归一化，3.13.3）；fallback 留痕**不写 `item.errors`**（rejects 归因取 `errors[0]`，写入会在记录后续失败时污染归因——改放 `Classification.detail` + error 事件 + 计数器，3.13.4）；防呆分级由提案的 CONFIG_ERROR 改 **warning**（即 ⑧）。 |
+| 图片候选区域分割（v1.22 对齐，2026-10-30；规格 `docs/dev/SPEC-image-region-segmentation.md`） | D1 叠图是否落盘；D2 链中位置；D3 模型侧坐标；D4 EXIF 方向；D5 无树输入范围；D6 未知 region_id；D7 本地视觉端点证据；D8 版本标签；D9 只跑分割；D10 空 rubric；D11 溢出归因；D12 填充样式；D13 区域编号来源；D14 参考框形状；D15 不写 instruction 时参考框直通 | **D1** 否：只保留 `_meta.regions`，不新增输出通道，不声称可复现模型看到的叠图字节。**D2** 保留链首，链序元组不变。**D3** 0–1000 整数网格。**D4** 不处理方向：画布为存储像素网格，对齐由输入方负责。**D5** 仅图片模式：segment 关闭时纯图片仍无法摄取。**D6** `x-labelkit-region-ref` 注解，可修复。**D7** 否：只做 z.ai 门。**D8** v1.22。**D9** 允许，仅限写了 `instruction`。**D10** 图片模式 quality 开启而 rubric 为空一律报错。**D11** 沿用现行：首轮超限保证 `context_overflow`，修复轮溢出归 `schema_violation` / `segmentation_invalid`，多评委面板溢出按 `judge_error` 计反对票。**D12** 低不透明度半透明填充，极细轮廓。**D13** box_parser 给框命名，全部留空时框架补 `1…N`，只命名一部分则拒收，模型新画的多边形由框架编号 `r1…rN`。**D14** 只支持轴对齐矩形。**D15** 允许：参考框直接成为候选、不调用模型，偏离 issue「通过模型补充或修正候选」且伴随文件变为必需。 |
 
 **时序流语义分割与动作摘取（v1.8 对齐，2026-07-13）**：提案（`docs/dev/PROPOSAL-stream-segmentation.md`）§7 十四项开放决策点全部按默认裁决通过（①追加 M14/M15；②`[stream]` 独立节；③噪声帧进 rejects；④交错 episode 不做；⑤generate × stream 互斥；⑥序列 dedup ①②④级 + 跳③；⑦extract 文本模态不做；⑧超长会话硬切 + WARN；⑨`default:trajectory` 内置；⑩steps 恒在；⑪粒度旋钮不做；⑫修复范围 = 标签重标 + 成员收缩 + 噪声池回收、跨段只标记；⑬流式单调性校验 + `on_disorder`；⑭stream ⇒ annotate 必开）。在此之上，七域 fan-out 可行性审查（78 条发现、0 blocker）与两路深检索（refute：0 条论点被推翻；elevate：29 项外部事实钉死）的发现收敛为**三十二项设计裁决 S1–S32**，凡与提案原文不一致处以裁决为准，**详表见 `docs/dev/SPEC-stream-segmentation.md` §2**。逐条择要：
 

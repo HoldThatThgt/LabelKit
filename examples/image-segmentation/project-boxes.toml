@@ -1,0 +1,38 @@
+# 只用参考框（D15）：不写 instruction，segment 不调用模型，每个参考框按顺序直接成为矩形候选。
+# 钩子把只有外壳的 image_2.xml 转成空数组，该样本得到合法的空候选，annotate 照常运行。
+schema_version = 1
+
+[run]
+input = "./data/screens-xml"
+output = "./out/boxes.jsonl"
+modality = "ui"
+batch_size = 4
+seed = 20261030
+
+[segment]
+enabled = true
+mode = "image"
+box_parser = "hooks.py:uiautomator_to_boxes"
+companion_suffix = ".xml"
+
+[quality]
+enabled = false
+
+[annotate]
+enabled = true
+llm = "default"
+postprocessor = "hooks.py:to_bounding_boxes"
+instruction = """
+判断每个候选控件的功能。通过 region_id 引用候选，label 写功能名称。
+"""
+
+[verify]
+enabled = false
+
+[trace]
+enabled = false
+
+[output]
+schema_path = "schemas/region-boxes.json"
+meta_mode = "inline"
+rejects = "refs"

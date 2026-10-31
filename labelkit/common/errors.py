@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING, Literal
 
 if TYPE_CHECKING:
     from labelkit.common.contracts.sequence_capacity import SessionCapacityFailure
+    from labelkit.common.contracts.types import Usage
 
 
 class LabelKitError(Exception):
@@ -167,17 +168,19 @@ class SchemaViolation(LabelKitError):
     （callback_only=True，spec 3.8.2 L2.5）。"""
 
     def __init__(self, errors: list[str], raw_last_output: str, *,
-                 callback_only: bool = False):
+                 callback_only: bool = False, usage: Usage | None = None):
         """构造 Schema 违规错误。
 
         @param errors 渲染后的违规条目 "<json-pointer>: <message>"
         @param raw_last_output 最后一次 LLM 原始输出（用于 rejects 取证）
         @param callback_only 剩余违规是否全部来自 L2.5 用户回调
+        @param usage 累计用量；只由后校验接缝在修复穷尽时写入，其他路径为 None
         """
         # 渲染后的违规条目："<json-pointer>: <message>"
         self.errors = errors
         self.raw_last_output = raw_last_output
         self.callback_only = callback_only
+        self.usage = usage
         super().__init__("; ".join(errors))
 
 
@@ -195,6 +198,24 @@ class PostprocessorError(InternalError):
         @return 无。
         """
         super().__init__("postprocessor_error")
+
+
+class BoxParserError(InternalError):
+    """v1.22 segment.box_parser 钩子缺陷（CONTRACTS §6.4）。记录级 → 'failed'、
+    kind='internal_error'；不调用模型、不进修复；str() 只含固定原因。"""
+
+    def __init__(self, reason: Literal["exception", "return_type", "invalid_json", "invalid_box"],
+                 box_index: int | None, hook: str):
+        """构造不包含业务数据或原始函数异常的固定错误。
+
+        @param reason 固定英文原因
+        @param box_index 出错框的 0 基序号；不针对具体框时为 None
+        @param hook 钩子引用，绝不含钩子数据
+        """
+        self.reason = reason
+        self.box_index = box_index
+        self.hook = hook
+        super().__init__(reason)
 
 
 class DeliveryError(LabelKitError):
@@ -233,13 +254,18 @@ class ErrorKind(str, enum.Enum):
     MISSING_PAIR = "missing_pair"                            # M2，记录级
     INDEX_CONFLICT = "index_conflict"                        # M2，记录级
     IMAGE_TOO_LARGE = "image_too_large"                      # M2，记录级
-    IMAGE_DECODE_ERROR = "image_decode_error"                # M3 跳过 pHash；M5/M7 → failed
+    IMAGE_DECODE_ERROR = "image_decode_error"                # M3 跳过 pHash；M5/M7/M14 → failed
     CLASSIFICATION_INVALID = "classification_invalid"        # v1.7：M13，M8 修复穷尽——
                                                              # fallback 保留记录；"fail" → rejects
     SEGMENTATION_INVALID = "segmentation_invalid"            # v1.8：M14，M8 修复穷尽——
                                                              # "keep" = 整个会话作为一个 episode
                                                              # 存活（痕迹在 _meta.stream.degraded）；
-                                                             # "fail" = 会话成员 failed → rejects
+                                                             # "fail" = 会话成员 failed → rejects；
+                                                             # v1.22 图片模式：记录级，Schema 或几何
+                                                             # 修复穷尽、修复轮溢出 → failed → rejects
+    COMPANION_INVALID = "companion_invalid"                  # v1.22：M14 图片模式，记录级——box_parser
+                                                             # 返回 None → failed → rejects；不调用
+                                                             # 模型、不进修复、不计 bad_input
     EXTRACTION_INVALID = "extraction_invalid"                # v1.8：M15，M8 修复穷尽——
                                                              # "fallback" = 步骤记录取
                                                              # action_type="other"（痕迹在

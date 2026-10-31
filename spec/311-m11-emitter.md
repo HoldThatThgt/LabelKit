@@ -14,7 +14,8 @@ M1 冻结的 `ResolvedPaths`；组装 `_meta`、执行写前 Schema/双视图终
 | 通道 | 规格 |
 |---|---|
 | process / flat 主输出 | 运行期写同目录 `.part` 并逐批 flush；finalize 时 fsync + 原子 replace。只写 active 且通过最终 Schema 的记录。absorbed/stitched 只计数，其他非 active 状态按 rejects 策略路由；既有熔断部分交付和中断语义保持不变。 |
-| process stream 元数据 | segment/stitch/frame 开关决定既有 `_meta.stream`、members、fragment、defect 形态；成员标注写前逐项 `validate_only`。该面不承担 sequence 生成真值。 |
+| process stream 元数据 | `segment.sequence_resolved` 与 stitch/frame 开关决定既有 `_meta.stream`、members、fragment、defect 形态（`_stream_block`、`verification.defects`、rubric 选择都按 `sequence_resolved` 求值）；成员标注写前逐项 `validate_only`。该面不承担 sequence 生成真值。 |
+| 图片模式元数据（v1.22） | `_meta.regions` 是 §6.3 通用信封第一个顶层条件键，键位在 `"stream"` 之后、`"scores"` 之前，只在图片模式出现，每条主输出恒为对象；annotate 关闭的只分割运行同样输出。`_meta.stream` 在图片模式恒为 `null`。`_assemble_meta` 的 docstring 同步加注此例外。annotate 关闭时的主输出与 rejects `full` 档 `record` 载荷冻结为 `{"image_path": str}`，有伴随文件时追加 `"companion_path": str`（取自 `Record.companion_path`）；不含 `ui_tree` 键，不内联伴随字节。非图片 UI 模态仍为 `{ui_tree, image_path}`，字节不变。叠图不落盘，不新增输出通道（D1）。 |
 | process / flat rejects | `none` / `refs` / `full` 三档保持既有语义；refs 只写引用与 value-free error，full 是用户显式的数据内容调试面。sequence 配置强制 none 且从不打开该通道。 |
 | process / flat report | `<output-stem>.report.json`；聚合运行参数摘要、计数、质量、去重、Schema、usage、预算与耗时，不含业务数据。 |
 | sequence 内存阶段 | M6 先产生只服务于 dedup/downstream 的 `ProjectedSequence`；M11 再以最终 `PipelineItem` 组装 `SequenceRows`，replay 从 source 的最终 primary rows 保留非时间内容并按 constant shift 重绑时间。`PrimaryCandidateReconcileRequest` 通过后，`PreparedCandidate` 深度冻结当前 slot 的全部 sequence/replay rows、resource intervals 与 byte 证据。在全部 primary/noise/replay、`CrossViewFrontier` 和最终 `reconcile_views` 通过前，不打开 main、stream、success report 或 manifest；失败 attempt 同样不打开正式数据通道。M11 Schema 终检失败回滚整个当前 set attempt。 |
@@ -119,7 +120,7 @@ report/manifest，不写 main/stream，也不参与 Record ID。manifest 的 `co
           "project_file": "project.toml", "rubric": "default:text", "seed": 0},
   "source": {"file": "ime-2026-06.jsonl", "line_no": 1,
              "generated_from": [], "fields": {"source": "ime-log"}},  // passthrough_fields 落点
-  "stream": null,                                                     // v1.8 恒在键：未启用 segment = null（6.3）
+  "stream": null,                                                     // v1.8 恒在键：segment.sequence_resolved 为假 = null（6.3）
   "scores": {"writing_style": 0.72, "facts_trivia": 0.44, "educational_value": 0.61,
              "required_expertise": 0.35, "__aggregate__": 0.53,       // 等权均值 = 2.12/4
              "mode": "pairwise_bt", "batch_no": 1},
@@ -129,7 +130,7 @@ report/manifest，不写 main/stream，也不参与 Record ID。manifest 的 `co
 }}
 ```
 
-v1.8 序列行说明：stream 工程（`segment.enabled = true`）的主输出行以 episode 为单位，其 `_meta.stream` 携带完整成员溯源与步骤序列（episode_id / session_id / member_ids / member_sources / steps 等，结构与样例见 6.3），行仍以 `_meta.id`（= 序列 Record id）对齐。
+v1.8 序列行说明：stream 工程（`segment.sequence_resolved = true`）的主输出行以 episode 为单位，其 `_meta.stream` 携带完整成员溯源与步骤序列（episode_id / session_id / member_ids / member_sources / steps 等，结构与样例见 6.3），行仍以 `_meta.id`（= 序列 Record id）对齐。
 
 v1.12 members 块示例（摘自 `examples/mix` UI 主工程真跑主输出 `out/mix-labels.jsonl` 的一条 episode 行，实际为单行 JSONL，此处折行排版、长值截断；该工程 `frame.classify`（DeepSeek digest-only）与 `frame.annotate`（z.ai 视觉）双开、`[frame.class.transition.annotate].enabled = false`——index 4 成员即跳过类的 skipped 形态）：
 

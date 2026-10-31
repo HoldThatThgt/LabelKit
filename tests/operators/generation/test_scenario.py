@@ -15,8 +15,10 @@ from jsonschema import Draft202012Validator
 
 from labelkit.cli.parser import CliOverrides
 from labelkit.common.config import load
+from labelkit.common.config.model import OutputConfig
 from labelkit.common.contracts.generation import (
     EventDraft,
+    EventExecution,
     EventExecutionContext,
     GenerationServices,
     NoiseEvaluationRequest,
@@ -27,9 +29,11 @@ from labelkit.common.contracts.generation import (
     ScenarioSeedRequest,
     StateEvaluationRequest,
 )
+from labelkit.common.contracts.post_validation import PostValidationResult
+from labelkit.common.contracts.types import Usage
 from labelkit.common.errors import ContextOverflowError, InternalError, SchemaViolation
 from labelkit.common.extensions.hooks import ResolvedHook
-from labelkit.common.inference.schema_engine import event_plan_schema
+from labelkit.common.inference.schema_engine import SchemaEngine, event_plan_schema
 from labelkit.operators.generation import GenerationAttemptRejected
 from labelkit.operators.generation.evaluate import evaluate_state
 from labelkit.operators.generation.evaluate import evaluate_noise
@@ -180,7 +184,7 @@ class _OfflineSchemaEngine:
         for candidate in candidates:
             checked = request.post_validator(candidate)
             if not checked.violations:
-                return SimpleNamespace(object=candidate, event_execution=checked.event_execution)
+                return SimpleNamespace(object=candidate, proof=checked.proof)
         raise AssertionError("offline event candidates did not satisfy state contract")
 
     def _plan_candidates(self, user):
@@ -966,6 +970,93 @@ def test_event_plan_schema_failures_use_stable_rejection_kinds(
         asyncio.run(plan_event(context, 0, "nonce", services))
     assert caught.value.kind == expected_kind
     assert metrics.counters["generate.sequence.calls.baseline_event_plan_calls"] == 1
+
+
+class _EventPlanLLM:
+    """in-process LLM 桩：按队列返回 EventPlan 候选文本。"""
+
+    def __init__(self, *texts):
+        self.texts = list(texts)
+        self.calls = 0
+
+    async def complete(self, _profile, _prompt, response_schema=None):
+        """返回下一段候选文本；无真实服务端交互。"""
+        self.calls += 1
+        return SimpleNamespace(
+            text=self.texts.pop(0), structured=None, usage=Usage(3, 1), model="stub-model",
+        )
+
+
+def _real_seam_services(config, *texts):
+    """构造走真实 SchemaEngine 通用接缝的 services，只替换 LLM。"""
+    services, _engine, _metrics = _services(config)
+    llm = _EventPlanLLM(*texts)
+    return replace(services, schema_engine=SchemaEngine({}, llm=llm, cfg=OutputConfig())), llm
+
+
+def test_event_plan_returns_same_event_execution_through_generic_seam(
+    declared_config, declared_program, monkeypatch,
+):
+    """EventPlan 只走 complete_post_validated，proof 同一实例回到 plan_event 调用方。"""
+    plan = compile_scenario_plan(declared_program)
+    context = _declared_context(declared_program, plan)
+    services, llm = _real_seam_services(
+        declared_config, json.dumps(_OfflineSchemaEngine._request_candidate()))
+    original = scenario_module.post_validate_event_plan
+    proofs = []
+
+    def spy(candidate, event_context):
+        result = original(candidate, event_context)
+        proofs.append(result.proof)
+        return result
+
+    monkeypatch.setattr(scenario_module, "post_validate_event_plan", spy)
+    event_plan, execution = asyncio.run(plan_event(context, 0, "nonce", services))
+    assert llm.calls == 1
+    assert len(proofs) == 1
+    assert isinstance(execution, EventExecution)
+    assert execution is proofs[0]
+    assert event_plan.frame_class == "task_request"
+    assert event_plan.intent == "submit request"
+    assert execution.state_after["request"]["status"] == "pending"
+
+
+def test_event_plan_proof_must_be_event_execution(
+    declared_config, declared_program, monkeypatch, caplog,
+):
+    """接缝接受任意非空 proof；类型判定由 EventPlan 调用方以 InternalError 完成。"""
+    plan = compile_scenario_plan(declared_program)
+    context = _declared_context(declared_program, plan)
+    services, llm = _real_seam_services(
+        declared_config, json.dumps(_OfflineSchemaEngine._request_candidate()))
+    monkeypatch.setattr(
+        scenario_module, "post_validate_event_plan",
+        lambda _candidate, _context: PostValidationResult((), object()),
+    )
+    with pytest.raises(InternalError, match="^event plan post-validation proof is not an EventExecution$"):
+        asyncio.run(plan_event(context, 0, "nonce", services))
+    assert llm.calls == 1
+    assert "submit request" not in caplog.text
+
+
+def test_event_plan_state_violation_repairs_and_rejects_as_state_transition(
+    declared_config, declared_program,
+):
+    """真实接缝上状态违规进入 L3，穷尽后仍归 state_transition 拒绝桶。"""
+    plan = compile_scenario_plan(declared_program)
+    context = _declared_context(declared_program, plan)
+    bad = {
+        "frame_class": "task_request", "actor": "requester", "intent": "submit request",
+        "patch": [
+            {"op": "test", "path": "/request/status", "value": "not-the-current-status"},
+            {"op": "replace", "path": "/request/status", "value": "pending"},
+        ],
+    }
+    services, llm = _real_seam_services(declared_config, *([json.dumps(bad)] * 3))
+    with pytest.raises(GenerationAttemptRejected) as caught:
+        asyncio.run(plan_event(context, 0, "nonce", services))
+    assert caught.value.kind == "state_transition"
+    assert llm.calls == 3  # OutputConfig 默认 max_repair_attempts = 2：首轮加两轮 L3
 
 
 @pytest.mark.parametrize("binding_shape", ("missing", "duplicate", "extra"))

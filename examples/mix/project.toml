@@ -48,7 +48,8 @@ order_by = "input_order"          # UI 模态 = pair_index 升序（meta:* 仅�
 key = ["source_dir"]              # 分区键：每个会话子目录一个会话
 
 [segment]
-enabled = true                    # stream 模式总开关
+enabled = true                    # segment 阶段开关
+mode = "sequence"                 # 时序流分割（启用时必填）
 llm = "vision"                    # 完整成员树与图片证据
 strategy = "llm"                  # 滑窗 LLM 边界精化 + 逐帧噪声标记
 window = 8                        # ≥ 最长会话（6 帧）：每会话恰一窗

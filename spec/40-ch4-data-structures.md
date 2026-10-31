@@ -39,7 +39,8 @@ class RecordRef:
 @dataclass(frozen=True)
 class ImageRef:
     path: Path; format: Literal["png", "jpeg"]; size_bytes: int
-    def load_base64(self, max_px: int) -> tuple[str, str]:   # (media_type, b64) 用后即弃
+    def load_base64(self, max_px: int) -> tuple[str, str]:   # (media_type, b64) 用后即弃；
+                                      # v1.22：逐轴尺寸由 scaled_size 计算，见 4.1.1
 
 @dataclass(frozen=True)
 class UINode:
@@ -78,6 +79,12 @@ class Record:
                                       #   Record.id = event_id、raw = 完整 stream row、text =
                                       #   canonical_json(payload)。两类 ID 均为第 11 章冻结的 32-hex 公式，
                                       #   不复用 M2 的 16-hex 摄取公式
+    companion: bytes | None = None    # v1.22 只增：图片模式伴随文件原始字节，不解码、不解释；
+                                      #   未注册钩子或无伴随文件时为 None（3.2.10）
+    companion_path: str | None = None # v1.22 只增：伴随文件路径，与 str(record.image.path) 同形
+    image_sha256: str | None = None   # v1.22 只增：图片文件 sha256 完整十六进制；仅图片模式由 M2 写入
+    companion_sha256: str | None = None  # v1.22 只增：伴随文件 sha256 完整十六进制；无伴随文件时为 None
+                                      # 非图片模式这四个字段恒为默认值
 
 @dataclass(frozen=True)
 class Classification:                 # v1.7：M13 分类结果（3.13）
@@ -127,7 +134,80 @@ class PipelineItem:                   # 唯一可变信封；生命周期 = 普�
                                       #   占键 None = failed（成员标注不可修复）、缺键 = skipped
                                       #   （跳过类）、dict 本身 None = 帧 pass 未运行；克隆按引用
                                       #   共享（同上）；M7 手术同步随成员集删键/补跑（3.7.3）
+    regions: RegionSet | None = None  # v1.22 只增：图片模式 segment 写入（3.18）；None = 未运行图片分割
+                                      #   或分割失败；RegionSet(regions=()) = 合法空候选，二者不混用；
+                                      #   classify 扇出克隆按引用共享（3.13.4）
 ```
+
+### 4.1.1 图片候选载体（v1.22）
+
+新模块 `labelkit/common/contracts/regions.py`。载体只含 int、float、str、tuple，本身深不可变，不复用 `contracts/generation.py` 的 `_ImmutableCarrier`（该模块导入 `llm_client` 与 `schema_engine`，会形成导入环）。导入方向只允许 `regions.py → types.py`，`types.py` 只在 `TYPE_CHECKING` 下引用 `RegionSet`。Pillow 在函数内局部导入。
+
+```python
+@dataclass(frozen=True)
+class ReferenceBox:
+    """box_parser 钩子返回并经框架校验的一个参考框（原图像素，仅轴对齐矩形，D14）。"""
+
+    box_id: str                                        # 钩子给出的框名，全部留空时由框架按数组顺序补为 "1"…"N"
+    bbox: tuple[int | float, int | float, int | float, int | float]  # (l, t, r, b)，保留钩子给出的数值类型
+    text: str                                          # 钩子给模型看的描述，可为空
+
+
+@dataclass(frozen=True)
+class RegionPolygon:
+    """单个多边形部件：原图像素闭环外环与零到多个闭环内环。"""
+
+    exterior: tuple[tuple[int | float, int | float], ...]  # 闭环：≥4 个位置，首末相同
+    holes: tuple[tuple[tuple[int | float, int | float], ...], ...]  # 每个内环同样是闭环
+
+
+@dataclass(frozen=True)
+class CandidateRegion:
+    """一个候选区域：区域标识（框名或框架编号 r<n>）、几何部件、来源参考框与叠图标注点。"""
+
+    region_id: str                                     # 来自参考框：框名；模型新画：框架按出现顺序编号 r1, r2, …
+    polygons: tuple[RegionPolygon, ...]                # 1 个 = Polygon；多个 = MultiPolygon
+    box_id: str | None                                 # 几何取自哪个参考框（复用或 D15 直通）；模型画的多边形为 None
+    source_box_ids: tuple[str, ...]                    # 没有参考框时恒为空；box_id 非空时恒为 (box_id,)
+    label_anchor: tuple[float, float]                  # 原图像素点，仅用于渲染，不是几何真值
+
+
+@dataclass(frozen=True)
+class RegionSet:
+    """一个样本的完整分割结果；regions 为空元组表示合法的空候选。"""
+
+    width: int                                         # 原图存储像素宽（Pillow 只读文件头）
+    height: int
+    boxes: tuple[ReferenceBox, ...]                    # 未注册钩子或无伴随文件时为空
+    regions: tuple[CandidateRegion, ...]
+
+
+@dataclass(frozen=True)
+class RegionOverlayRef:
+    """原图加候选的惰性叠图引用；与 ImageRef 共享 load_base64 接口。"""
+
+    base: ImageRef
+    regions: RegionSet
+
+    def load_base64(self, max_px: int) -> tuple[str, str]:
+        """按与 base 相同的逐轴缩放渲染叠图，字节不保留。
+
+        @param max_px 本次请求的长边像素上限。
+        @return (media_type, b64)，media_type 恒为 image/png。
+        @raises OSError 文件不可读或 Pillow 解码失败（DecompressionBombError 与解码时的其他异常都转成它），由 image_decode_error 归类
+        """
+```
+
+同模块的公开函数（名称冻结）：
+
+| 函数 | 作用 |
+|---|---|
+| `render_reference_boxes(regions: RegionSet) -> str` | `[参考框]` 正文，每框一行 JSON（3.18.3） |
+| `render_candidates(regions: RegionSet) -> str` | `[候选区域]` JSON 正文（3.18.3） |
+| `render_material_note(regions: RegionSet) -> str` | 固定材料说明（3.5.7） |
+| `project_regions(regions: RegionSet) -> dict` | `{"image", "boxes", "items"}` JSON 投影，后处理上下文与 `_meta.regions` 共用（6.3） |
+
+`labelkit/common/contracts/types.py` 新增纯函数 `scaled_size(width: int, height: int, max_px: int) -> tuple[int, int]`（3.9.3）。新增显式传递字段：`AnnotatePromptOptions.regions`、`VerifyPromptOptions.regions`（`RegionSet | None = None`）；`CallScope.region_ids`、`CallScope.region_ref_paths`（3.8.3）；`IngestReport.ignored_files: int = 0`（3.2.10）。
 
 ## 4.2 阶段结果类型
 
@@ -258,9 +338,10 @@ LabelKitError
  ├─ ConfigError(errors: list[str])            # M1，退出码 2
  ├─ InputError                                 # M2 fail 策略触发，退出码 3
  ├─ ProviderRetryableError / ProviderFatalError# M9
- ├─ SchemaViolation(errors, raw_last_output)   # M8，记录级
+ ├─ SchemaViolation(errors, raw_last_output, *, usage=None)   # M8，记录级；v1.22 usage 只由修复穷尽写入
  ├─ DeliveryError                              # sequence slot 耗尽，退出码 1
  └─ InternalError                              # 不变量破坏（如 M11 终检失败）
+     └─ BoxParserError(reason, box_index, hook)  # v1.22：box_parser 钩子缺陷，str() 只含固定原因（3.18.4）
 ```
 
 **帧粒度与 Stage 契约（v1.12 零改动声明）**：帧级分类/标注（3.13.7、3.5.5）对本契约**零改动**——契约例外维持 ②a/②b/②c 三条原文，不新增例外条款：帧产物只写入信封自身的 `member_classifications` / `member_annotations` 两字段（属 ①④ 的正常字段写入），不改成员帧状态机（成员保持 `absorbed`）、不增删列表元素、不改链序与守恒恒等式（6.4）。**克隆共享语义补注**（②a 的 v1.12 侧注）：classify multi 扇出克隆对两字段**按引用共享**（与 `record` / `dedup` 同族，3.13.7 扇出共享行）——帧产物描述成员帧本身而非信封路由，原/克隆行渲染同一 dict；帧级两 pass 只在首标签信封上执行（克隆判据 = `classification.label != classification.labels[0]`，verify S8 同款），M7 帧产物同步亦无克隆分支（克隆信封永不手术，3.7.3）；手术后原/克隆行 members 分叉由既有 `repaired` 位消歧（6.3 补注）。
@@ -352,9 +433,9 @@ JSON-compatible 值，再以 `MappingProxyType` 对外暴露。字段顺序是�
 | `EventPlanRequest` | `mode`, `semantic_profile`, `slot_key`, `planned_event`, `role`, `generation_instruction`, `sequence_length`, `eligible_frame_classes`, `eligible_actors`, `actor_view`, `visible_state`, `state_schema`, `outcome_schema`, `history`, `actor_profiles`, `public_facts`, `attempt_index`, `variation_nonce` |
 | `EventExecutionContext` | `program`, `plan`, `slot`, `variant_name`, `event_index`, `scenario_seed`, `current_state`, `history` |
 | `StateTransitionInput` | `slot_key`, `variant`, `role`, `state_before`, `state_after`, `patch` |
-| `PostValidationResult` | `violations`, `event_execution` |
+| `PostValidationResult` | `violations`, `proof` |
 | `PostValidatedCallRequest` | `profile`, `prompt`, `schema`, `scope`, `post_validator` |
-| `ValidatedGenerationCall` | `object`, `event_execution`, `resolved_at`, `usage`, `attempts`, `model` |
+| `ValidatedPostCall` | `object`, `proof`, `resolved_at`, `usage`, `attempts`, `model` |
 | `RenderEventRequest` | `semantic_profile`, `slot_key`, `planned_event`, `event_plan`, `actor_view`, `publish_snapshot`, `state_before_hash`, `state_after_hash`, `binding_values`, `frame_spec`, `role`, `public_facts`, `attempt_index`, `utc_offset_minutes`, `limits` |
 | `StateEvaluationRequest` | `program`, `slot`, `pattern`, `variant`, `scenario_seed`, `events`, `baseline_events`, `final_state` |
 | `CouplingEvaluationRequest` | `variant`, `baseline_events`, `events`, `frame_classes` |

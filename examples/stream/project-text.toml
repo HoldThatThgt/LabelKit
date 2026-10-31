@@ -32,6 +32,7 @@ gap_s = 900                       # 相邻请求静默 > 15 分钟即断会话
 
 [segment]
 enabled = true
+mode = "sequence"
 strategy = "hybrid"
 window = 8                        # 最长会话 7 行 → 每会话恰一窗
 min_len = 2

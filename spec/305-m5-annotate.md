@@ -81,7 +81,7 @@ label 缺失或类表外未知类使用全局。完整 Schema 供最终验证与
 处理流仍通过 `complete_evidence=true` 同时保留完整证据并把容量错误交还会话阶段。
 UI 记录启用标注且允许 L3 修复时，生效 repair profile 必须支持 vision；缺省复用标注 profile。
 
-**处理序列的完整标注。**`run.mode="process"` 且 `segment.enabled=true` 时，序列请求固定包含：
+**处理序列的完整标注。**`run.mode="process"` 且 `segment.sequence_resolved=true` 时，序列请求固定包含：
 
 ```text
 system: 生效 instruction + 代码负责投影后的模型 Schema
@@ -253,3 +253,57 @@ declared sequence class 可以在完整 annotation Schema 的标量叶子上写
 
 该 binding 只存在于 generate-only sequence declared mode；普通 process、instruction-only、ordinary annotation 或
 annotate disabled 配置已由 M1 拒绝。M11 只复验最终值，不新增或修复 annotation 时间。
+
+### 3.5.7 图片模式（v1.22）
+
+分支判据是 `AnnotatePromptOptions.regions is not None`；`regions` 由 annotate 从信封填入，自洽采样与 L3 修复共用同一冻结 `RegionSet`。system 消息不变（用户指令 + Schema 句 + Schema），few-shot 消息不变，`TEMPLATE_HEAD_TOKENS["annotate"]` 不变。当前记录的 user 消息（CONTRACTS §10.1 冻结）：
+
+```text
+text part:  [原图]
+image part: record.image
+text part:  [候选区域叠图]
+image part: RegionOverlayRef(record.image, regions)
+text part:  [参考框]\n{render_reference_boxes(regions)}      ← 有参考框且写了 instruction 时；D15 路径省略
+text part:  [候选区域]\n{render_candidates(regions)}\n{render_material_note(regions)}
+```
+
+`render_material_note` 的文本（`{width}`、`{height}` 为原图存储像素，`×` 为 U+00D7）：
+
+```text
+原图与候选区域叠图来自同一样本；叠图中每个区域的标识就是该候选的 region_id；候选只是辅助信息，不要求全部选中。引用候选只能用 region_id；没有成为候选的参考框不能被引用。候选与参考框坐标为 0–1000 网格，画布为 {width}×{height} 像素。
+```
+
+最后一段恒为文本，修复后缀照旧追加在这里。不新增分类、筛选、合并或遮挡规则。渲染函数见 3.18.3。
+
+**容量。**
+
+- 两张图按 `n_images × image_cost` 自然计费，公式不改；`_PackScale`「普通记录至多一张图」的不变式注释改写。
+- 候选块与参考框块都是固定块，从不裁剪；`source_box_ids` 引用的框因此总在提示词里。`_trim_pack` 没有可裁槽位，放不下就以 `ContextOverflowError(phase="precheck")` 明确失败。任何情况下都不静默删减候选、原图或叠图。
+- 所有被引用 profile 须声明正的 `context_window`（rule 77），这是首轮超限必有明确容量错误的前提。
+- 修复轮溢出（D11）：由 M8 短路为 `SchemaViolation` 并恰一次喂熔断，记录以 `schema_violation` 失败。
+- 自洽采样可用。投票只覆盖顶层枚举、布尔、整数字段，`items[].region_id` 不参与投票，`agreement_ratio` 不反映区域选择的一致性。单个样本修复穷尽仍按 3.5.2 弃权。
+- 流成员路径（3.5.5）图片模式不可达，无树保护不改。
+
+**样本上下文。**`annotation_record_context(record, regions)` 在 `regions` 非 `None` 时返回框架绑定的 JSON，同时供给后处理函数与 `output.validator`（由同一次调用的结果构造）；文本、成员帧、序列记录维持原值。`annotation_transforms(record, cfg, label, temporal_context, regions)` 增加同一入参，帧路径传 `None`。钩子签名不变，每次拿到的都是新的深拷贝。键序冻结如下：
+
+```json
+{
+  "sample_id": "8f3c2a91d0b47e65",
+  "source": {"file": "image_7.png", "pair_index": 7},
+  "image": {"width": 1080, "height": 2340},
+  "boxes": [
+    {"id": "n12", "bbox": [43, 140, 821, 1264], "text": "Button 登录"}
+  ],
+  "regions": [
+    {"region_id": "n12",
+     "geometry": {"type": "Polygon",
+                  "coordinates": [[[43, 140], [821, 140], [821, 1264], [43, 1264], [43, 140]]]},
+     "box_id": "n12",
+     "source_box_ids": ["n12"]}
+  ]
+}
+```
+
+`sample_id` 即记录 id；`source.file` 相对 `run.input`；`boxes` 每项恒为 `{"id", "bbox", "text"}` 三键，`id` 恒为非空字符串；`regions[]` 与 `_meta.regions.items[]` 逐元素同形，由 `project_regions` 生成。上下文只提供路径字符串，不提供文件句柄或像素数据。启动探针与 few-shot 干跑仍以 `None` 调用 `output.validator`，图片模式的校验器与钩子必须处理 `record is None`；few-shot 输出里的 region_id 只做 Schema 检查，不做引用检查。`passthrough_fields` 仍读 `Record.raw`。
+
+**引用与格式转换。**未知 `region_id` 由 `x-labelkit-region-ref` 引用检查判为可修复违规（3.8.2，D6）；后处理异常仍是程序错误，不作为引用检查手段。重复引用、是否必须全选等语义属于业务规则，交给用户的校验器或钩子。保留多边形还是转外接矩形写在后处理钩子里（对 Polygon / MultiPolygon 各外环顶点取 min/max，与 Shapely `bounds` 结果相同）；LabelKit 不新增公开几何 API，也不新增配置。钩子返回值必须是 JSON 列表，不能是元组。

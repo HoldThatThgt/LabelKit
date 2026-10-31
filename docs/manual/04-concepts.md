@@ -100,13 +100,14 @@ sequence generation 按声明组提交：dedup 重验证、CrossView frontier、
 
 | 约束 | 理由 |
 |---|---|
-| `annotate` 与 `quality` **至少开一个** | 两个都关，这次运行既不打分也不标注，没有产出意义 |
+| `annotate` 与 `quality` **至少开一个**；例外是 `segment.mode = "image"` 且写了 `instruction`（v1.22，第 28 章 28.3） | 两个都关，这次运行既不打分也不标注，没有产出意义。例外的情形下 segment 自己就是产出阶段，候选写在 `_meta.regions`；只写 `box_parser` 的图片模式不调用模型，不放宽 |
 | `verify` 开 ⇒ `annotate` 必须开 | 没有标注就没有可评审的对象 |
 | `generate` 开 ⇒ 模态必须是 `text` | LLM 无法生成配套截图 |
 | `generate` 开 + process 模式 ⇒ `quality` 必须开 | 生成的种子来自「过质量门」的记录 |
 | `mode = "generate_only"` ⇒ `generate` 必须开，且 `run.input` 必须**不设** | 纯生成模式没有输入 |
 | `quality.threshold` 与 `quality.selection="top_ratio"` **互斥** | 两种淘汰机制不能同时生效 |
-| `segment` 开 ⇒ `mode = "process"` 且 `generate` 必须关且 `annotate` 必须开（v1.8） | 分段加工的是既有时序流，与生成互斥（序列合成属路线图）；episode 的产出物就是标注 |
+| `segment` 开 ⇒ `run.mode = "process"` 且 `generate` 必须关（v1.8）；`annotate` 必须开，只有 `segment.mode = "image"` 且写了 `instruction` 时可以不开（v1.22，第 28 章 28.3） | 分段加工的是既有输入（时序流或图片），与生成互斥（序列合成属路线图）；时序流 episode 的产出物就是标注，图片模式只写 `box_parser` 时 segment 不调用模型，产出只能靠 annotate |
+| `segment.mode = "image"` ⇒ `stitch`、`extract`、`frame.classify`、`frame.annotate` 必须关，且不能有 `[stream]` 节（v1.22） | 这些都消费时序流的会话与 episode，图片模式没有这些结构（第 28 章）。下面几行说的 `segment` 开都指 `segment.mode = "sequence"` |
 | `extract` 开 ⇒ `segment` 必须开且模态必须是 `ui`（v1.8） | 动作摘取的对象是屏幕帧序列——没有分段就没有 episode，文本序列 v1 不适用 |
 | `stitch` 开 ⇒ `segment` 必须开（v1.9） | 缝合的对象是分段产出的 episode 碎片——没有分段就没有可缝的东西（仅流模式可用） |
 | `stitch.votes` 若大于 1 必须为奇数（v1.9） | 偶数票可能平票，严格多数决失去意义 |
